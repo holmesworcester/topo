@@ -14,11 +14,8 @@ pub fn create_tables(conn: &Connection) -> SqliteResult<()> {
         -- Events we have and can share (full blob in store)
         CREATE TABLE IF NOT EXISTS shareable_events (
             id TEXT PRIMARY KEY,        -- Event ID (same as store.id)
-            prev_id TEXT,               -- Extracted prev_message_id for chain tracking
-            is_tip INTEGER DEFAULT 1,   -- 1 if no event depends on this one
             stored_at INTEGER NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS idx_shareable_tips ON shareable_events(is_tip) WHERE is_tip = 1;
 
         -- Events we want but don't have yet (from refs we've seen)
         CREATE TABLE IF NOT EXISTS wanted_events (

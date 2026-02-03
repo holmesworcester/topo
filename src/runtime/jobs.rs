@@ -1,7 +1,7 @@
 use tracing::{debug, warn};
 
 use crate::crypto::{hash_event, event_id_to_base64};
-use crate::db::{incoming::IncomingQueue, shareable::Shareable, store::Store, wanted::Wanted};
+use crate::db::{incoming::IncomingQueue, shareable::Shareable, store::Store};
 use crate::wire::{Envelope, ENVELOPE_SIZE};
 
 /// Run ingest job once (for single-threaded operation)
@@ -9,7 +9,6 @@ pub fn ingest_once(db: &rusqlite::Connection, batch_size: usize) {
     let incoming = IncomingQueue::new(db);
     let store = Store::new(db);
     let shareable = Shareable::new(db);
-    let wanted = Wanted::new(db);
 
     // Drain incoming queue
     let items = match incoming.drain(batch_size) {
@@ -26,11 +25,8 @@ pub fn ingest_once(db: &rusqlite::Connection, batch_size: usize) {
 
     debug!("Ingesting {} items", items.len());
 
-    // Parse and store each blob
+    // Store each blob
     let mut store_batch = Vec::new();
-    let mut shareable_batch = Vec::new();
-    let mut received_ids = Vec::new();
-    let mut prev_ids = Vec::new();
 
     for item in &items {
         if item.blob.len() != ENVELOPE_SIZE {
@@ -39,15 +35,7 @@ pub fn ingest_once(db: &rusqlite::Connection, batch_size: usize) {
         }
 
         let event_id = hash_event(&item.blob);
-        let prev_id = Envelope::extract_prev_id(&item.blob);
-
         store_batch.push((event_id, item.blob.clone()));
-        shareable_batch.push((event_id, prev_id));
-        received_ids.push(event_id);
-
-        if let Some(prev) = prev_id {
-            prev_ids.push(prev);
-        }
     }
 
     // Batch writes
@@ -55,22 +43,11 @@ pub fn ingest_once(db: &rusqlite::Connection, batch_size: usize) {
         warn!("Failed to store batch: {}", e);
     }
 
-    if let Err(e) = shareable.insert_batch(&shareable_batch) {
-        warn!("Failed to insert shareable batch: {}", e);
-    }
-
-    // Update wanted: remove received, add prev refs
-    if let Err(e) = wanted.delete_batch(&received_ids) {
-        warn!("Failed to delete from wanted: {}", e);
-    }
-
-    // Mark prev_ids as not tips and add them to wanted if missing
-    if let Err(e) = shareable.mark_not_tips_batch(&prev_ids) {
-        warn!("Failed to mark not tips: {}", e);
-    }
-
-    if let Err(e) = wanted.insert_batch_if_not_shareable(&prev_ids) {
-        warn!("Failed to add prev refs to wanted: {}", e);
+    // Insert into shareable
+    for (event_id, _) in &store_batch {
+        if let Err(e) = shareable.insert(event_id) {
+            warn!("Failed to insert shareable: {}", e);
+        }
     }
 
     debug!("Ingested {} events", items.len());
@@ -167,7 +144,6 @@ mod tests {
             [1u8; 32],
             [2u8; 32],
             [3u8; 32],
-            None,
             "Hello, world!".to_string(),
         );
         let blob = envelope.encode();
@@ -186,7 +162,7 @@ mod tests {
 
         // Verify event is shareable
         let shareable = Shareable::new(&conn);
-        assert!(shareable.exists(&event_id).unwrap());
+        assert_eq!(shareable.count().unwrap(), 1);
 
         // Run projection
         project_once(&conn, 100);

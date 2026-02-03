@@ -298,14 +298,9 @@ async fn run_sync_initiator(
             }
             Ok(Ok(SyncMessage::Event { blob })) => {
                 let event_id = hash_event(&blob);
-                let prev_id = Envelope::extract_prev_id(&blob);
 
                 let _ = store.put(&event_id, &blob);
-                let _ = shareable.insert(&event_id, prev_id.as_ref());
-
-                if let Some(prev) = prev_id {
-                    let _ = shareable.mark_not_tip(&prev);
-                }
+                let _ = shareable.insert(&event_id);
 
                 if need_requested.contains(&event_id) {
                     need_received.insert(event_id);
@@ -407,14 +402,9 @@ async fn run_sync_responder(
                 // Receiving an event from the initiator
                 idle_count = 0;
                 let event_id = hash_event(&blob);
-                let prev_id = Envelope::extract_prev_id(&blob);
 
                 let _ = store.put(&event_id, &blob);
-                let _ = shareable.insert(&event_id, prev_id.as_ref());
-
-                if let Some(prev) = prev_id {
-                    let _ = shareable.mark_not_tip(&prev);
-                }
+                let _ = shareable.insert(&event_id);
 
                 stats.events_received += 1;
             }
@@ -458,8 +448,6 @@ fn generate_events(db_path: &str, count: usize, channel_hex: &str) -> Result<(),
     let store = Store::new(&db);
     let shareable = Shareable::new(&db);
 
-    let mut prev_id: Option<[u8; 32]> = None;
-
     info!("Generating {} events...", count);
 
     for i in 0..count {
@@ -468,7 +456,6 @@ fn generate_events(db_path: &str, count: usize, channel_hex: &str) -> Result<(),
             signer_id,
             channel_id,
             author_id,
-            prev_id,
             content,
         );
 
@@ -476,14 +463,7 @@ fn generate_events(db_path: &str, count: usize, channel_hex: &str) -> Result<(),
         let event_id = hash_event(&blob);
 
         store.put(&event_id, &blob)?;
-        shareable.insert(&event_id, prev_id.as_ref())?;
-
-        // Mark previous as not a tip
-        if let Some(prev) = prev_id {
-            shareable.mark_not_tip(&prev)?;
-        }
-
-        prev_id = Some(event_id);
+        shareable.insert(&event_id)?;
     }
 
     info!("Generated {} events in {}", count, db_path);
@@ -497,14 +477,13 @@ fn show_stats(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sy
 
     let store_count: i64 = db.query_row("SELECT COUNT(*) FROM store", [], |row| row.get(0)).unwrap_or(0);
     let shareable_count: i64 = db.query_row("SELECT COUNT(*) FROM shareable_events", [], |row| row.get(0)).unwrap_or(0);
-    let tips_count: i64 = db.query_row("SELECT COUNT(*) FROM shareable_events WHERE is_tip = 1", [], |row| row.get(0)).unwrap_or(0);
     let wanted_count: i64 = db.query_row("SELECT COUNT(*) FROM wanted_events", [], |row| row.get(0)).unwrap_or(0);
     let incoming_count: i64 = db.query_row("SELECT COUNT(*) FROM incoming_queue WHERE processed = 0", [], |row| row.get(0)).unwrap_or(0);
     let messages_count: i64 = db.query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0)).unwrap_or(0);
 
     println!("Database: {}", db_path);
     println!("  Store:     {} events", store_count);
-    println!("  Shareable: {} events ({} tips)", shareable_count, tips_count);
+    println!("  Shareable: {} events", shareable_count);
     println!("  Wanted:    {} events", wanted_count);
     println!("  Incoming:  {} pending", incoming_count);
     println!("  Messages:  {} projected", messages_count);

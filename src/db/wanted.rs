@@ -151,7 +151,7 @@ mod tests {
 
         // If shareable, should not insert
         let id2 = hash_event(b"event2");
-        shareable.insert(&id2, None).unwrap();
+        shareable.insert(&id2).unwrap();
         assert!(!wanted.insert_if_not_shareable(&id2).unwrap());
     }
 

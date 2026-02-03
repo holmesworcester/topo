@@ -97,14 +97,13 @@ mod tests {
                 [i as u8; 32],
                 [1u8; 32],
                 [2u8; 32],
-                None,
                 format!("Test message {}", i),
             );
             let blob = envelope.encode();
             let event_id = hash_event(&blob);
 
             store.put(&event_id, &blob).unwrap();
-            shareable.insert(&event_id, None).unwrap();
+            shareable.insert(&event_id).unwrap();
         }
 
         let items = load_negentropy_items(&conn).unwrap();
