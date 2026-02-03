@@ -14,17 +14,6 @@ pub enum SyncMessage {
     Event { blob: Vec<u8> },
 }
 
-impl SyncMessage {
-    /// Get the wire size of this message
-    pub fn wire_size(&self) -> usize {
-        match self {
-            SyncMessage::NegOpen { msg } => 1 + 4 + msg.len(),
-            SyncMessage::NegMsg { msg } => 1 + 4 + msg.len(),
-            SyncMessage::HaveList { ids } => 1 + 4 + ids.len() * 32,
-            SyncMessage::Event { .. } => EVENT_SIZE,
-        }
-    }
-}
 
 /// Parse a sync message from bytes
 pub fn parse_sync_message(input: &[u8]) -> Result<(SyncMessage, usize), ParseError> {

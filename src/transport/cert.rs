@@ -28,11 +28,6 @@ pub fn generate_self_signed_cert(
     Ok((cert_der, key_der))
 }
 
-/// Extract the public key bytes from the signing key
-pub fn pubkey_bytes(signing_key: &SigningKey) -> [u8; 32] {
-    signing_key.verifying_key().to_bytes()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -57,10 +52,4 @@ mod tests {
         assert!(!key_der.secret_pkcs8_der().is_empty());
     }
 
-    #[test]
-    fn test_pubkey_bytes() {
-        let (signing_key, verifying_key) = generate_keypair();
-        let bytes = pubkey_bytes(&signing_key);
-        assert_eq!(bytes, verifying_key.to_bytes());
-    }
 }

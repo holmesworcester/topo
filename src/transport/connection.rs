@@ -28,15 +28,6 @@ impl Connection {
         Ok(())
     }
 
-    /// Send multiple sync messages
-    pub async fn send_batch(&mut self, msgs: &[SyncMessage]) -> Result<(), ConnectionError> {
-        for msg in msgs {
-            let data = encode_sync_message(msg);
-            self.send.write_all(&data).await?;
-        }
-        Ok(())
-    }
-
     /// Flush the send buffer
     pub async fn flush(&mut self) -> Result<(), ConnectionError> {
         self.send.flush().await?;
@@ -77,34 +68,6 @@ impl Connection {
         }
     }
 
-    /// Try to receive a message without blocking (returns None if no complete message)
-    pub fn try_recv(&mut self) -> Result<Option<SyncMessage>, ConnectionError> {
-        if self.recv_buffer.is_empty() {
-            return Ok(None);
-        }
-
-        match parse_sync_message(&self.recv_buffer) {
-            Ok((msg, consumed)) => {
-                self.recv_buffer.drain(..consumed);
-                Ok(Some(msg))
-            }
-            Err(ParseError::InsufficientData) => Ok(None),
-            Err(e) => Err(ConnectionError::Parse(e)),
-        }
-    }
-
-    /// Check if the send stream is ready for writing
-    pub async fn wait_writeable(&mut self) -> Result<(), ConnectionError> {
-        // Quinn's write is always ready when the stream is open
-        // This is a placeholder for potential future backpressure handling
-        Ok(())
-    }
-
-    /// Close the connection gracefully
-    pub async fn close(mut self) -> Result<(), ConnectionError> {
-        self.send.finish()?;
-        Ok(())
-    }
 }
 
 #[derive(Debug)]

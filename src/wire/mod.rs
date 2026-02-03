@@ -2,9 +2,7 @@ pub mod header;
 pub mod envelope;
 pub mod message;
 
-pub use header::WireHeader;
 pub use envelope::Envelope;
-pub use message::MessagePayload;
 
 /// Total envelope size (header + payload, no signatures)
 pub const ENVELOPE_SIZE: usize = 512;

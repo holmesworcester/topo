@@ -1,8 +1,6 @@
-pub mod incoming;
 pub mod schema;
 pub mod shareable;
 pub mod store;
-pub mod wanted;
 
 use rusqlite::{Connection, Result as SqliteResult};
 use std::path::Path;

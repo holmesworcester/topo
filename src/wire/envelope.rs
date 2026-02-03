@@ -1,6 +1,6 @@
 use nom::IResult;
 
-use super::{header::WireHeader, message::MessagePayload, ENVELOPE_SIZE, HEADER_SIZE, PAYLOAD_SIZE};
+use super::{header::WireHeader, message::MessagePayload, ENVELOPE_SIZE, HEADER_SIZE};
 use crate::crypto::{hash_event, EventId};
 
 /// Complete 512-byte envelope (header + payload)
@@ -58,6 +58,7 @@ impl Envelope {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire::PAYLOAD_SIZE;
 
     #[test]
     fn test_envelope_roundtrip() {

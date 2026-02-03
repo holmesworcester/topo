@@ -2,7 +2,7 @@ pub mod protocol;
 pub mod negentropy_adapter;
 
 pub use protocol::{SyncMessage, parse_sync_message, encode_sync_message};
-pub use negentropy_adapter::{load_negentropy_items, build_negentropy_storage, neg_id_to_event_id, NegentropyItem};
+pub use negentropy_adapter::{load_negentropy_items, build_negentropy_storage, neg_id_to_event_id};
 
 use crate::wire::ENVELOPE_SIZE;
 

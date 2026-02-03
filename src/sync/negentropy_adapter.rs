@@ -1,7 +1,7 @@
 //! Negentropy storage adapter for loading items from SQLite
 
 use negentropy::{Id, NegentropyStorageVector};
-use rusqlite::{Connection, params};
+use rusqlite::Connection;
 
 use crate::crypto::{event_id_from_base64, EventId};
 use crate::db::store::Store;
@@ -71,11 +71,6 @@ pub fn neg_id_to_event_id(id: &Id) -> EventId {
     *id.as_bytes()
 }
 
-/// Convert our EventId to negentropy Id
-pub fn event_id_to_neg_id(id: &EventId) -> Id {
-    Id::from_byte_array(*id)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,8 +132,9 @@ mod tests {
 
     #[test]
     fn test_id_conversion() {
+        use negentropy::Id;
         let event_id: EventId = [42u8; 32];
-        let neg_id = event_id_to_neg_id(&event_id);
+        let neg_id = Id::from_byte_array(event_id);
         let back = neg_id_to_event_id(&neg_id);
         assert_eq!(event_id, back);
     }

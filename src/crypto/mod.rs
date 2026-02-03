@@ -1,9 +1,8 @@
 use blake2::{Blake2b, Digest};
-use blake2::digest::consts::{U16, U32};
+use blake2::digest::consts::U32;
 
 pub type EventId = [u8; 32];
 
-type Blake2b128 = Blake2b<U16>;
 type Blake2b256 = Blake2b<U32>;
 
 /// Compute Blake2b-256 hash of data, returning 32-byte event ID
@@ -12,16 +11,6 @@ pub fn hash_event(data: &[u8]) -> EventId {
     hasher.update(data);
     let result = hasher.finalize();
     let mut id = [0u8; 32];
-    id.copy_from_slice(&result);
-    id
-}
-
-/// Compute Blake2b-128 hash (legacy, for internal use)
-pub fn hash_blake2b_128(data: &[u8]) -> [u8; 16] {
-    let mut hasher = Blake2b128::new();
-    hasher.update(data);
-    let result = hasher.finalize();
-    let mut id = [0u8; 16];
     id.copy_from_slice(&result);
     id
 }

@@ -7,13 +7,16 @@ mod wire;
 
 use clap::{Parser, Subcommand};
 use negentropy::{Negentropy, Id};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tracing::{info, warn, error, debug, Level};
+use tokio::sync::mpsc;
+use tracing::{info, warn, error, Level};
 use tracing_subscriber::FmtSubscriber;
 
-use crate::crypto::{hash_event, EventId};
+use crate::crypto::{hash_event, event_id_to_base64, EventId};
 use crate::db::{open_connection, schema::create_tables, shareable::Shareable, store::Store};
 use crate::runtime::SyncStats;
 use crate::sync::{SyncMessage, load_negentropy_items, build_negentropy_storage, neg_id_to_event_id};
@@ -140,9 +143,11 @@ async fn run_server(
     let endpoint = create_server_endpoint(bind, cert, key)?;
     info!("Server listening on {}", endpoint.local_addr()?);
 
-    // Open database
-    let db = open_connection(db_path)?;
-    create_tables(&db)?;
+    // Initialize database
+    {
+        let db = open_connection(db_path)?;
+        create_tables(&db)?;
+    }
 
     // Accept connection
     let incoming = endpoint.accept().await.ok_or("No connection")?;
@@ -154,7 +159,7 @@ async fn run_server(
     let mut conn = Connection::new(send, recv);
 
     // Run sync as responder (server waits for client to initiate)
-    run_sync_responder(&mut conn, &db, timeout_secs).await?;
+    run_sync_responder(&mut conn, db_path, timeout_secs).await?;
 
     // Close connection
     connection.close(0u32.into(), b"done");
@@ -176,16 +181,18 @@ async fn run_client(
     let connection = endpoint.connect(remote, "localhost")?.await?;
     info!("Connected to {}", connection.remote_address());
 
-    // Open database
-    let db = open_connection(db_path)?;
-    create_tables(&db)?;
+    // Initialize database
+    {
+        let db = open_connection(db_path)?;
+        create_tables(&db)?;
+    }
 
     // Open bidirectional stream
     let (send, recv) = connection.open_bi().await?;
     let mut conn = Connection::new(send, recv);
 
     // Run sync as initiator (client starts the reconciliation)
-    run_sync_initiator(&mut conn, &db, timeout_secs).await?;
+    run_sync_initiator(&mut conn, db_path, timeout_secs).await?;
 
     // Close connection
     connection.close(0u32.into(), b"done");
@@ -194,67 +201,123 @@ async fn run_client(
 }
 
 /// Run sync as the initiator (client role)
-/// Interleaves reconciliation with event transfer for maximum throughput
+/// Uses channels and batching for high throughput
 async fn run_sync_initiator(
     conn: &mut Connection,
-    db: &rusqlite::Connection,
+    db_path: &str,
     timeout_secs: u64,
 ) -> Result<SyncStats, Box<dyn std::error::Error + Send + Sync>> {
-    let mut stats = SyncStats::default();
     let start = std::time::Instant::now();
     let timeout = Duration::from_secs(timeout_secs);
 
     info!("Starting negentropy sync (initiator) for {} seconds", timeout_secs);
 
-    let items = load_negentropy_items(db)?;
+    // Phase 1: Load data and prefetch blobs into memory
+    let db = open_connection(db_path)?;
+    let items = load_negentropy_items(&db)?;
     info!("Loaded {} items for negentropy", items.len());
 
     let storage = build_negentropy_storage(&items)?;
-    // Use frame_size_limit to get incremental results (enables pipelining)
-    let mut neg = Negentropy::owned(storage, 64 * 1024)?; // 64KB frames
+    let mut neg = Negentropy::owned(storage, 64 * 1024)?;
 
-    let store = Store::new(db);
-    let shareable = Shareable::new(db);
+    let store = Store::new(&db);
+    let mut blob_cache: HashMap<EventId, Vec<u8>> = HashMap::new();
+    for item in &items {
+        if let Ok(Some(blob)) = store.get(&item.id) {
+            blob_cache.insert(item.id, blob);
+        }
+    }
+    info!("Prefetched {} blobs into cache", blob_cache.len());
+    drop(db);
 
-    // Track discovered IDs and what we've already processed
+    // Phase 2: Set up channel for incoming events
+    let (tx, rx) = mpsc::channel::<(EventId, Vec<u8>)>(100_000);
+    let events_received = Arc::new(AtomicU64::new(0));
+    let events_received_writer = events_received.clone();
+
+    let db_path_owned = db_path.to_string();
+    let writer_handle = tokio::task::spawn_blocking(move || {
+        batch_writer(db_path_owned, rx, events_received_writer)
+    });
+
+    // Phase 3: Network I/O
     let mut have_ids: Vec<Id> = Vec::new();
     let mut need_ids: Vec<Id> = Vec::new();
     let mut have_sent: HashSet<EventId> = HashSet::new();
     let mut need_requested: HashSet<EventId> = HashSet::new();
-    let mut need_received: HashSet<EventId> = HashSet::new();
+    let mut events_sent: u64 = 0;
 
-    // Initiate reconciliation
     let initial_msg = neg.initiate()?;
     conn.send(&SyncMessage::NegOpen { msg: initial_msg }).await?;
     conn.flush().await?;
-    debug!("Sent NegOpen");
 
     let mut reconciliation_done = false;
     let mut rounds = 0;
 
-    // Main loop: interleave reconciliation with event transfer
     loop {
         if start.elapsed() >= timeout {
             warn!("Timeout");
             break;
         }
 
-        // Send events for any NEW have_ids (events we have that they need)
+        // First: drain all pending receives (non-blocking)
+        loop {
+            match tokio::time::timeout(Duration::from_millis(1), conn.recv()).await {
+                Ok(Ok(SyncMessage::NegMsg { msg })) => {
+                    rounds += 1;
+                    match neg.reconcile_with_ids(&msg, &mut have_ids, &mut need_ids)? {
+                        Some(next_msg) => {
+                            conn.send(&SyncMessage::NegMsg { msg: next_msg }).await?;
+                        }
+                        None => {
+                            info!("Reconciliation complete in {} rounds: {} have, {} need",
+                                rounds, have_ids.len(), need_ids.len());
+                            reconciliation_done = true;
+                        }
+                    }
+                }
+                Ok(Ok(SyncMessage::Event { blob })) => {
+                    let event_id = hash_event(&blob);
+                    let _ = tx.try_send((event_id, blob));
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(transport::connection::ConnectionError::Closed)) => {
+                    info!("Connection closed by peer");
+                    drop(tx);
+                    let _ = writer_handle.await;
+                    return Ok(SyncStats { events_sent, events_received: events_received.load(Ordering::Relaxed), neg_rounds: rounds });
+                }
+                Ok(Err(e)) => {
+                    warn!("Connection error: {}", e);
+                    drop(tx);
+                    let _ = writer_handle.await;
+                    return Ok(SyncStats { events_sent, events_received: events_received.load(Ordering::Relaxed), neg_rounds: rounds });
+                }
+                Err(_) => break, // Timeout - no more pending receives
+            }
+        }
+
+        // Second: send a batch of events
+        let mut sent_this_round = 0;
         for neg_id in &have_ids {
             let event_id = neg_id_to_event_id(neg_id);
             if !have_sent.contains(&event_id) {
-                if let Ok(Some(blob)) = store.get(&event_id) {
-                    if conn.send(&SyncMessage::Event { blob }).await.is_ok() {
-                        stats.events_sent += 1;
+                if let Some(blob) = blob_cache.get(&event_id) {
+                    if conn.send(&SyncMessage::Event { blob: blob.clone() }).await.is_ok() {
+                        events_sent += 1;
                         have_sent.insert(event_id);
+                        sent_this_round += 1;
+                        if sent_this_round >= 500 {
+                            break; // Send batch, then check for receives again
+                        }
                     }
                 } else {
-                    have_sent.insert(event_id); // Mark as "sent" even if missing
+                    have_sent.insert(event_id);
                 }
             }
         }
 
-        // Request any NEW need_ids (events they have that we need)
+        // Third: send HaveList for events we need
         let mut new_needs: Vec<EventId> = Vec::new();
         for neg_id in &need_ids {
             let event_id = neg_id_to_event_id(neg_id);
@@ -264,167 +327,373 @@ async fn run_sync_initiator(
             }
         }
         if !new_needs.is_empty() {
-            debug!("Requesting {} new events", new_needs.len());
             conn.send(&SyncMessage::HaveList { ids: new_needs }).await?;
         }
 
         let _ = conn.flush().await;
 
-        // Check completion AFTER sending: reconciliation complete AND all requested events received
-        if reconciliation_done && need_requested.len() == need_received.len() {
-            info!("Sync complete: sent {}, received {}", stats.events_sent, stats.events_received);
+        // Check completion
+        let received = events_received.load(Ordering::Relaxed);
+        if reconciliation_done
+            && have_sent.len() == have_ids.len()
+            && need_requested.len() as u64 == received
+        {
+            info!("Sync complete: sent {}, received {}", events_sent, received);
             break;
-        }
-
-        // Receive and handle messages
-        match tokio::time::timeout(Duration::from_millis(50), conn.recv()).await {
-            Ok(Ok(SyncMessage::NegMsg { msg })) => {
-                rounds += 1;
-                let prev_have = have_ids.len();
-                let prev_need = need_ids.len();
-
-                match neg.reconcile_with_ids(&msg, &mut have_ids, &mut need_ids)? {
-                    Some(next_msg) => {
-                        conn.send(&SyncMessage::NegMsg { msg: next_msg }).await?;
-                        debug!("Round {}: +{} have, +{} need",
-                            rounds, have_ids.len() - prev_have, need_ids.len() - prev_need);
-                    }
-                    None => {
-                        info!("Reconciliation complete in {} rounds: {} have, {} need",
-                            rounds, have_ids.len(), need_ids.len());
-                        reconciliation_done = true;
-                    }
-                }
-            }
-            Ok(Ok(SyncMessage::Event { blob })) => {
-                let event_id = hash_event(&blob);
-
-                let _ = store.put(&event_id, &blob);
-                let _ = shareable.insert(&event_id);
-
-                if need_requested.contains(&event_id) {
-                    need_received.insert(event_id);
-                }
-                stats.events_received += 1;
-            }
-            Ok(Ok(_)) => {} // Ignore other messages
-            Ok(Err(transport::connection::ConnectionError::Closed)) => {
-                info!("Connection closed by peer");
-                break;
-            }
-            Ok(Err(e)) => {
-                warn!("Connection error: {}", e);
-                break;
-            }
-            Err(_) => {} // Timeout, continue loop
         }
     }
 
+    drop(tx);
+    let _ = writer_handle.await;
+
+    let stats = SyncStats {
+        events_sent,
+        events_received: events_received.load(Ordering::Relaxed),
+        neg_rounds: rounds,
+    };
     info!("Sync stats: {:?}", stats);
     Ok(stats)
 }
 
+/// Batch writer task - drains channel and writes to SQLite in batches
+/// Projects messages inline for atomicity: if in shareable, it's projected
+///
+/// NOTE: Projection may require reading dependencies (e.g., parent messages, thread roots).
+/// We simulate this with 10 random reads per event. In production, these would be real
+/// dependency lookups based on event content (reply_to, thread_id, etc.).
+///
+/// Set NAIVE_DEPS=1 to use unbatched reads (slower) for comparison.
+/// Set NO_DEPS=1 to skip dependency reads entirely (baseline).
+fn batch_writer(
+    db_path: String,
+    mut rx: mpsc::Receiver<(EventId, Vec<u8>)>,
+    events_received: Arc<AtomicU64>,
+) {
+    let use_naive = std::env::var("NAIVE_DEPS").is_ok();
+    let no_deps = std::env::var("NO_DEPS").is_ok();
+
+    let db = match open_connection(&db_path) {
+        Ok(db) => db,
+        Err(e) => {
+            error!("Writer failed to open db: {}", e);
+            return;
+        }
+    };
+
+    let store = Store::new(&db);
+    let shareable = Shareable::new(&db);
+
+    // Prepare projection statement
+    let mut project_stmt = match db.prepare(
+        "INSERT OR IGNORE INTO messages (message_id, channel_id, author_id, content, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)"
+    ) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            error!("Failed to prepare projection statement: {}", e);
+            return;
+        }
+    };
+
+    // Prepare dependency read statement (simulates looking up parent/thread events)
+    let mut dep_read_stmt = match db.prepare(
+        "SELECT content FROM messages WHERE message_id = ?1"
+    ) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            error!("Failed to prepare dependency read statement: {}", e);
+            return;
+        }
+    };
+
+    loop {
+        // Block waiting for first item
+        let first = match rx.blocking_recv() {
+            Some(item) => item,
+            None => break, // Channel closed
+        };
+
+        // Collect batch
+        let mut batch = vec![first];
+        while let Ok(item) = rx.try_recv() {
+            batch.push(item);
+            if batch.len() >= 1000 {
+                break;
+            }
+        }
+
+        // Get real message IDs to use as fake dependencies (if not NO_DEPS mode)
+        let real_dep_ids: Vec<String> = if no_deps {
+            Vec::new()
+        } else {
+            // Fetch up to 1000 random real message IDs to use as dependencies
+            let mut ids = Vec::new();
+            if let Ok(mut stmt) = db.prepare("SELECT message_id FROM messages ORDER BY RANDOM() LIMIT 1000") {
+                if let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) {
+                    ids = rows.flatten().collect();
+                }
+            }
+            ids
+        };
+
+        if no_deps {
+            // NO_DEPS: Skip dependency reads (baseline)
+            if db.execute("BEGIN", []).is_ok() {
+                for (event_id, blob) in &batch {
+                    let _ = store.put(event_id, blob);
+                    let _ = shareable.insert(event_id);
+
+                    if let Ok((_, envelope)) = Envelope::parse(blob) {
+                        let message_id = event_id_to_base64(event_id);
+                        let channel_id = event_id_to_base64(&envelope.payload.channel_id);
+                        let author_id = event_id_to_base64(&envelope.payload.author_id);
+                        let _ = project_stmt.execute(rusqlite::params![
+                            message_id,
+                            channel_id,
+                            author_id,
+                            &envelope.payload.content,
+                            envelope.payload.created_at_ms as i64
+                        ]);
+                    }
+                }
+                let _ = db.execute("COMMIT", []);
+            }
+        } else if use_naive {
+            // NAIVE: Read dependencies inside projection loop (slower)
+            if db.execute("BEGIN", []).is_ok() {
+                for (idx, (event_id, blob)) in batch.iter().enumerate() {
+                    let _ = store.put(event_id, blob);
+                    let _ = shareable.insert(event_id);
+
+                    if let Ok((_, envelope)) = Envelope::parse(blob) {
+                        // Naive: 10 individual reads per event during projection
+                        // Use real message IDs as dependencies
+                        if !real_dep_ids.is_empty() {
+                            for i in 0..10usize {
+                                let dep_idx = (idx * 10 + i) % real_dep_ids.len();
+                                let dep_id_str = &real_dep_ids[dep_idx];
+                                let _content: Option<String> = dep_read_stmt
+                                    .query_row([dep_id_str], |row| row.get(0))
+                                    .ok();
+                            }
+                        }
+
+                        let message_id = event_id_to_base64(event_id);
+                        let channel_id = event_id_to_base64(&envelope.payload.channel_id);
+                        let author_id = event_id_to_base64(&envelope.payload.author_id);
+                        let _ = project_stmt.execute(rusqlite::params![
+                            message_id,
+                            channel_id,
+                            author_id,
+                            &envelope.payload.content,
+                            envelope.payload.created_at_ms as i64
+                        ]);
+                    }
+                }
+                let _ = db.execute("COMMIT", []);
+            }
+        } else {
+            // BATCHED: Pre-fetch all dependencies with single IN query (faster)
+
+            // Phase 1: Collect unique dependency IDs (real message IDs)
+            let mut all_dep_ids: HashSet<String> = HashSet::with_capacity(batch.len() * 10);
+            if !real_dep_ids.is_empty() {
+                for (idx, _) in batch.iter().enumerate() {
+                    for i in 0..10usize {
+                        let dep_idx = (idx * 10 + i) % real_dep_ids.len();
+                        all_dep_ids.insert(real_dep_ids[dep_idx].clone());
+                    }
+                }
+            }
+
+            // Phase 2: Batch fetch with single IN query
+            let mut dep_cache: HashMap<String, String> = HashMap::with_capacity(all_dep_ids.len());
+            if !all_dep_ids.is_empty() {
+                let placeholders: String = all_dep_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                let query = format!("SELECT message_id, content FROM messages WHERE message_id IN ({})", placeholders);
+                if let Ok(mut stmt) = db.prepare(&query) {
+                    let params: Vec<&dyn rusqlite::ToSql> = all_dep_ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+                    if let Ok(rows) = stmt.query_map(params.as_slice(), |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    }) {
+                        for row in rows.flatten() {
+                            dep_cache.insert(row.0, row.1);
+                        }
+                    }
+                }
+            }
+
+            // Phase 3: Write batch in single transaction
+            if db.execute("BEGIN", []).is_ok() {
+                for (idx, (event_id, blob)) in batch.iter().enumerate() {
+                    let _ = store.put(event_id, blob);
+                    let _ = shareable.insert(event_id);
+
+                    if let Ok((_, envelope)) = Envelope::parse(blob) {
+                        // Access pre-fetched dependencies
+                        if !real_dep_ids.is_empty() {
+                            for i in 0..10usize {
+                                let dep_idx = (idx * 10 + i) % real_dep_ids.len();
+                                let _content = dep_cache.get(&real_dep_ids[dep_idx]);
+                            }
+                        }
+
+                        let message_id = event_id_to_base64(event_id);
+                        let channel_id = event_id_to_base64(&envelope.payload.channel_id);
+                        let author_id = event_id_to_base64(&envelope.payload.author_id);
+                        let _ = project_stmt.execute(rusqlite::params![
+                            message_id,
+                            channel_id,
+                            author_id,
+                            &envelope.payload.content,
+                            envelope.payload.created_at_ms as i64
+                        ]);
+                    }
+                }
+                let _ = db.execute("COMMIT", []);
+            }
+        }
+
+        events_received.fetch_add(batch.len() as u64, Ordering::Relaxed);
+    }
+}
+
 /// Run sync as the responder (server role)
-/// Interleaves reconciliation with event transfer for maximum throughput
+/// Uses channels and batching for high throughput
 async fn run_sync_responder(
     conn: &mut Connection,
-    db: &rusqlite::Connection,
+    db_path: &str,
     timeout_secs: u64,
 ) -> Result<SyncStats, Box<dyn std::error::Error + Send + Sync>> {
-    let mut stats = SyncStats::default();
     let start = std::time::Instant::now();
     let timeout = Duration::from_secs(timeout_secs);
 
     info!("Starting negentropy sync (responder) for {} seconds", timeout_secs);
 
-    let items = load_negentropy_items(db)?;
+    // Phase 1: Load data and prefetch blobs into memory
+    let db = open_connection(db_path)?;
+    let items = load_negentropy_items(&db)?;
     info!("Loaded {} items for negentropy", items.len());
 
     let storage = build_negentropy_storage(&items)?;
-    // Use frame_size_limit to match initiator (enables pipelining)
     let mut neg = Negentropy::owned(storage, 64 * 1024)?;
 
-    let store = Store::new(db);
-    let shareable = Shareable::new(db);
+    let store = Store::new(&db);
+    let mut blob_cache: HashMap<EventId, Vec<u8>> = HashMap::new();
+    for item in &items {
+        if let Ok(Some(blob)) = store.get(&item.id) {
+            blob_cache.insert(item.id, blob);
+        }
+    }
+    info!("Prefetched {} blobs into cache", blob_cache.len());
+    drop(db);
 
+    // Phase 2: Set up channel for incoming events
+    let (tx, rx) = mpsc::channel::<(EventId, Vec<u8>)>(100_000);
+    let events_received = Arc::new(AtomicU64::new(0));
+    let events_received_writer = events_received.clone();
+
+    let db_path_owned = db_path.to_string();
+    let writer_handle = tokio::task::spawn_blocking(move || {
+        batch_writer(db_path_owned, rx, events_received_writer)
+    });
+
+    // Phase 3: Network I/O loop
+    let mut events_sent: u64 = 0;
     let mut reconciliation_done = false;
     let mut rounds = 0;
     let mut idle_count = 0;
-    const MAX_IDLE: u32 = 20; // Exit after 20 idle iterations (1 second)
+    const MAX_IDLE: u32 = 100;
 
-    // Unified loop: handle all message types as they arrive
+    // Queue of events to send (from HaveList requests)
+    let mut send_queue: Vec<Vec<u8>> = Vec::new();
+
     loop {
         if start.elapsed() >= timeout {
             warn!("Timeout");
             break;
         }
 
-        // Exit if reconciliation is done and we've been idle
-        if reconciliation_done && idle_count >= MAX_IDLE {
-            debug!("Sync complete after idle period");
+        if reconciliation_done && send_queue.is_empty() && idle_count >= MAX_IDLE {
             break;
         }
 
-        match tokio::time::timeout(Duration::from_millis(50), conn.recv()).await {
-            Ok(Ok(SyncMessage::NegOpen { msg })) | Ok(Ok(SyncMessage::NegMsg { msg })) => {
-                idle_count = 0;
-                rounds += 1;
-                debug!("Received negentropy message (round {})", rounds);
+        // First: drain all pending receives
+        loop {
+            match tokio::time::timeout(Duration::from_millis(1), conn.recv()).await {
+                Ok(Ok(SyncMessage::NegOpen { msg })) | Ok(Ok(SyncMessage::NegMsg { msg })) => {
+                    idle_count = 0;
+                    rounds += 1;
 
-                // Use reconcile (not reconcile_with_ids) for responder
-                let response = neg.reconcile(&msg)?;
-                if response.is_empty() {
-                    info!("Reconciliation complete in {} rounds", rounds);
-                    reconciliation_done = true;
-                } else {
-                    conn.send(&SyncMessage::NegMsg { msg: response }).await?;
-                    conn.flush().await?;
-                    debug!("Sent NegMsg response");
+                    let response = neg.reconcile(&msg)?;
+                    if response.is_empty() {
+                        info!("Reconciliation complete in {} rounds", rounds);
+                        reconciliation_done = true;
+                    } else {
+                        conn.send(&SyncMessage::NegMsg { msg: response }).await?;
+                        conn.flush().await?;
+                    }
                 }
-            }
-            Ok(Ok(SyncMessage::HaveList { ids })) => {
-                // Client is telling us what events to send - this means reconciliation is done
-                idle_count = 0;
-                reconciliation_done = true;
-                debug!("Received HaveList with {} IDs", ids.len());
+                Ok(Ok(SyncMessage::HaveList { ids })) => {
+                    idle_count = 0;
+                    reconciliation_done = true;
 
-                // Send requested events immediately
-                for id in &ids {
-                    if let Ok(Some(blob)) = store.get(id) {
-                        if conn.send(&SyncMessage::Event { blob }).await.is_ok() {
-                            stats.events_sent += 1;
+                    // Queue events for sending
+                    for id in &ids {
+                        if let Some(blob) = blob_cache.get(id) {
+                            send_queue.push(blob.clone());
                         }
                     }
                 }
-                let _ = conn.flush().await;
+                Ok(Ok(SyncMessage::Event { blob })) => {
+                    idle_count = 0;
+                    let event_id = hash_event(&blob);
+                    let _ = tx.try_send((event_id, blob));
+                }
+                Ok(Err(transport::connection::ConnectionError::Closed)) => {
+                    info!("Connection closed by peer");
+                    drop(tx);
+                    let _ = writer_handle.await;
+                    return Ok(SyncStats { events_sent, events_received: events_received.load(Ordering::Relaxed), neg_rounds: rounds });
+                }
+                Ok(Err(e)) => {
+                    warn!("Connection error: {}", e);
+                    drop(tx);
+                    let _ = writer_handle.await;
+                    return Ok(SyncStats { events_sent, events_received: events_received.load(Ordering::Relaxed), neg_rounds: rounds });
+                }
+                Err(_) => break, // Timeout - no more pending
             }
-            Ok(Ok(SyncMessage::Event { blob })) => {
-                // Receiving an event from the initiator
-                idle_count = 0;
-                let event_id = hash_event(&blob);
+        }
 
-                let _ = store.put(&event_id, &blob);
-                let _ = shareable.insert(&event_id);
-
-                stats.events_received += 1;
-            }
-            Ok(Err(transport::connection::ConnectionError::Closed)) => {
-                info!("Connection closed by peer");
-                break;
-            }
-            Ok(Err(e)) => {
-                warn!("Connection error: {}", e);
-                break;
-            }
-            Err(_) => {
-                // Timeout - increment idle counter
-                if reconciliation_done {
-                    idle_count += 1;
+        // Second: send a batch from queue
+        let mut sent_this_round = 0;
+        while let Some(blob) = send_queue.pop() {
+            if conn.send(&SyncMessage::Event { blob }).await.is_ok() {
+                events_sent += 1;
+                sent_this_round += 1;
+                if sent_this_round >= 500 {
+                    break;
                 }
             }
         }
+
+        if sent_this_round > 0 {
+            let _ = conn.flush().await;
+            idle_count = 0;
+        } else if reconciliation_done {
+            idle_count += 1;
+        }
     }
 
+    drop(tx);
+    let _ = writer_handle.await;
+
+    let stats = SyncStats {
+        events_sent,
+        events_received: events_received.load(Ordering::Relaxed),
+        neg_rounds: rounds,
+    };
     info!("Sync stats: {:?}", stats);
     Ok(stats)
 }
@@ -448,6 +717,12 @@ fn generate_events(db_path: &str, count: usize, channel_hex: &str) -> Result<(),
     let store = Store::new(&db);
     let shareable = Shareable::new(&db);
 
+    // Prepare projection statement
+    let mut project_stmt = db.prepare(
+        "INSERT OR IGNORE INTO messages (message_id, channel_id, author_id, content, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)"
+    )?;
+
     info!("Generating {} events...", count);
 
     for i in 0..count {
@@ -456,7 +731,7 @@ fn generate_events(db_path: &str, count: usize, channel_hex: &str) -> Result<(),
             signer_id,
             channel_id,
             author_id,
-            content,
+            content.clone(),
         );
 
         let blob = envelope.encode();
@@ -464,6 +739,18 @@ fn generate_events(db_path: &str, count: usize, channel_hex: &str) -> Result<(),
 
         store.put(&event_id, &blob)?;
         shareable.insert(&event_id)?;
+
+        // Project inline
+        let message_id = event_id_to_base64(&event_id);
+        let channel_id_b64 = event_id_to_base64(&channel_id);
+        let author_id_b64 = event_id_to_base64(&author_id);
+        project_stmt.execute(rusqlite::params![
+            message_id,
+            channel_id_b64,
+            author_id_b64,
+            content,
+            envelope.payload.created_at_ms as i64
+        ])?;
     }
 
     info!("Generated {} events in {}", count, db_path);
