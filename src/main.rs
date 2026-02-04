@@ -20,7 +20,7 @@ use crate::crypto::{hash_event, event_id_to_base64, EventId};
 use crate::db::{open_connection, schema::create_tables, shareable::Shareable, store::Store};
 use crate::runtime::SyncStats;
 use crate::sync::{SyncMessage, load_negentropy_items, build_negentropy_storage, neg_id_to_event_id};
-use crate::transport::{Connection, create_client_endpoint, create_server_endpoint, generate_keypair, generate_self_signed_cert};
+use crate::transport::{Connection, DualConnection, create_client_endpoint, create_server_endpoint, generate_keypair, generate_self_signed_cert};
 use crate::wire::Envelope;
 
 #[derive(Parser)]
@@ -154,12 +154,14 @@ async fn run_server(
     let connection = incoming.await?;
     info!("Accepted connection from {}", connection.remote_address());
 
-    // Open bidirectional stream
-    let (send, recv) = connection.accept_bi().await?;
-    let mut conn = Connection::new(send, recv);
+    // Accept two bidirectional streams: control first, then data
+    let (control_send, control_recv) = connection.accept_bi().await?;
+    let (data_send, data_recv) = connection.accept_bi().await?;
+    let mut conn = DualConnection::new(control_send, control_recv, data_send, data_recv);
+    info!("Accepted control and data streams");
 
     // Run sync as responder (server waits for client to initiate)
-    run_sync_responder(&mut conn, db_path, timeout_secs).await?;
+    run_sync_responder_dual(&mut conn, db_path, timeout_secs).await?;
 
     // Close connection
     connection.close(0u32.into(), b"done");
@@ -187,12 +189,14 @@ async fn run_client(
         create_tables(&db)?;
     }
 
-    // Open bidirectional stream
-    let (send, recv) = connection.open_bi().await?;
-    let mut conn = Connection::new(send, recv);
+    // Open two bidirectional streams: control first, then data
+    let (control_send, control_recv) = connection.open_bi().await?;
+    let (data_send, data_recv) = connection.open_bi().await?;
+    let mut conn = DualConnection::new(control_send, control_recv, data_send, data_recv);
+    info!("Opened control and data streams");
 
     // Run sync as initiator (client starts the reconciliation)
-    run_sync_initiator(&mut conn, db_path, timeout_secs).await?;
+    run_sync_initiator_dual(&mut conn, db_path, timeout_secs).await?;
 
     // Close connection
     connection.close(0u32.into(), b"done");
@@ -730,6 +734,337 @@ async fn run_sync_responder(
         neg_rounds: rounds,
     };
     info!("Sync stats: {:?}", stats);
+    Ok(stats)
+}
+
+/// Run sync as the initiator (client role) with dual streams
+/// Control stream: NegOpen, NegMsg, HaveList
+/// Data stream: Event blobs
+async fn run_sync_initiator_dual(
+    conn: &mut DualConnection,
+    db_path: &str,
+    timeout_secs: u64,
+) -> Result<SyncStats, Box<dyn std::error::Error + Send + Sync>> {
+    let start = std::time::Instant::now();
+    let timeout = Duration::from_secs(timeout_secs);
+
+    info!("Starting negentropy sync (initiator, dual-stream) for {} seconds", timeout_secs);
+
+    // Phase 1: Load data and prefetch blobs into memory
+    let db = open_connection(db_path)?;
+    let items = load_negentropy_items(&db)?;
+    info!("Loaded {} items for negentropy", items.len());
+
+    let storage = build_negentropy_storage(&items)?;
+    let mut neg = Negentropy::owned(storage, 64 * 1024)?;
+
+    let store = Store::new(&db);
+    let mut blob_cache: HashMap<EventId, Vec<u8>> = HashMap::new();
+    for item in &items {
+        if let Ok(Some(blob)) = store.get(&item.id) {
+            blob_cache.insert(item.id, blob);
+        }
+    }
+    info!("Prefetched {} blobs into cache", blob_cache.len());
+    drop(db);
+
+    // Phase 2: Set up channel for incoming events
+    let (tx, rx) = mpsc::channel::<(EventId, Vec<u8>)>(100_000);
+    let events_received = Arc::new(AtomicU64::new(0));
+    let events_received_writer = events_received.clone();
+
+    let db_path_owned = db_path.to_string();
+    let writer_handle = tokio::task::spawn_blocking(move || {
+        batch_writer(db_path_owned, rx, events_received_writer)
+    });
+
+    // Phase 3: Network I/O with dual streams
+    let mut have_ids: Vec<Id> = Vec::new();
+    let mut need_ids: Vec<Id> = Vec::new();
+    let mut have_sent: HashSet<EventId> = HashSet::new();
+    let mut need_requested: HashSet<EventId> = HashSet::new();
+    let mut events_sent: u64 = 0;
+
+    // Send initial negentropy message on control stream
+    let initial_msg = neg.initiate()?;
+    conn.send_control(&SyncMessage::NegOpen { msg: initial_msg }).await?;
+    conn.flush_control().await?;
+
+    let mut reconciliation_done = false;
+    let mut rounds = 0;
+
+    loop {
+        if start.elapsed() >= timeout {
+            warn!("Timeout");
+            break;
+        }
+
+        // Receive from both streams using select!
+        tokio::select! {
+            biased;
+
+            // Control stream: NegMsg responses
+            result = tokio::time::timeout(Duration::from_millis(1), conn.control.recv()) => {
+                match result {
+                    Ok(Ok(SyncMessage::NegMsg { msg })) => {
+                        rounds += 1;
+                        match neg.reconcile_with_ids(&msg, &mut have_ids, &mut need_ids)? {
+                            Some(next_msg) => {
+                                conn.send_control(&SyncMessage::NegMsg { msg: next_msg }).await?;
+                                conn.flush_control().await?;
+                            }
+                            None => {
+                                info!("Reconciliation complete in {} rounds: {} have, {} need",
+                                    rounds, have_ids.len(), need_ids.len());
+                                reconciliation_done = true;
+                            }
+                        }
+                    }
+                    Ok(Ok(_)) => {}
+                    Ok(Err(transport::connection::ConnectionError::Closed)) => {
+                        info!("Control stream closed by peer");
+                        break;
+                    }
+                    Ok(Err(e)) => {
+                        warn!("Control stream error: {}", e);
+                        break;
+                    }
+                    Err(_) => {} // Timeout
+                }
+            }
+
+            // Data stream: incoming events
+            result = tokio::time::timeout(Duration::from_millis(1), conn.data.recv()) => {
+                match result {
+                    Ok(Ok(SyncMessage::Event { blob })) => {
+                        let event_id = hash_event(&blob);
+                        let _ = tx.try_send((event_id, blob));
+                    }
+                    Ok(Ok(_)) => {}
+                    Ok(Err(transport::connection::ConnectionError::Closed)) => {
+                        info!("Data stream closed by peer");
+                    }
+                    Ok(Err(e)) => {
+                        warn!("Data stream error: {}", e);
+                    }
+                    Err(_) => {} // Timeout
+                }
+            }
+        }
+
+        // Send a batch of events on data stream
+        let mut sent_this_round = 0;
+        for neg_id in &have_ids {
+            let event_id = neg_id_to_event_id(neg_id);
+            if !have_sent.contains(&event_id) {
+                if let Some(blob) = blob_cache.get(&event_id) {
+                    if conn.send_data(&SyncMessage::Event { blob: blob.clone() }).await.is_ok() {
+                        events_sent += 1;
+                        have_sent.insert(event_id);
+                        sent_this_round += 1;
+                        if sent_this_round >= 500 {
+                            break;
+                        }
+                    }
+                } else {
+                    have_sent.insert(event_id);
+                }
+            }
+        }
+
+        // Send HaveList for events we need on control stream
+        let mut new_needs: Vec<EventId> = Vec::new();
+        for neg_id in &need_ids {
+            let event_id = neg_id_to_event_id(neg_id);
+            if !need_requested.contains(&event_id) {
+                new_needs.push(event_id);
+                need_requested.insert(event_id);
+            }
+        }
+        if !new_needs.is_empty() {
+            conn.send_control(&SyncMessage::HaveList { ids: new_needs }).await?;
+            conn.flush_control().await?;
+        }
+
+        if sent_this_round > 0 {
+            let _ = conn.flush_data().await;
+        }
+
+        // Check completion
+        let received = events_received.load(Ordering::Relaxed);
+        if reconciliation_done
+            && have_sent.len() == have_ids.len()
+            && need_requested.len() as u64 == received
+        {
+            info!("Sync complete: sent {}, received {}", events_sent, received);
+            break;
+        }
+    }
+
+    drop(tx);
+    let _ = writer_handle.await;
+
+    let stats = SyncStats {
+        events_sent,
+        events_received: events_received.load(Ordering::Relaxed),
+        neg_rounds: rounds,
+    };
+    info!("Sync stats: {:?}", stats);
+    Ok(stats)
+}
+
+/// Run sync as the responder (server role) with dual streams
+async fn run_sync_responder_dual(
+    conn: &mut DualConnection,
+    db_path: &str,
+    timeout_secs: u64,
+) -> Result<SyncStats, Box<dyn std::error::Error + Send + Sync>> {
+    let start = std::time::Instant::now();
+    let timeout = Duration::from_secs(timeout_secs);
+
+    info!("Starting negentropy sync (responder, dual-stream) for {} seconds", timeout_secs);
+
+    // Phase 1: Load data and prefetch blobs into memory
+    let db = open_connection(db_path)?;
+    let items = load_negentropy_items(&db)?;
+    info!("Loaded {} items for negentropy", items.len());
+
+    let storage = build_negentropy_storage(&items)?;
+    let mut neg = Negentropy::owned(storage, 64 * 1024)?;
+
+    let store = Store::new(&db);
+    let mut blob_cache: HashMap<EventId, Vec<u8>> = HashMap::new();
+    for item in &items {
+        if let Ok(Some(blob)) = store.get(&item.id) {
+            blob_cache.insert(item.id, blob);
+        }
+    }
+    info!("Prefetched {} blobs into cache", blob_cache.len());
+    drop(db);
+
+    // Phase 2: Set up channel for incoming events
+    let (tx, rx) = mpsc::channel::<(EventId, Vec<u8>)>(100_000);
+    let events_received = Arc::new(AtomicU64::new(0));
+    let events_received_writer = events_received.clone();
+
+    let db_path_owned = db_path.to_string();
+    let writer_handle = tokio::task::spawn_blocking(move || {
+        batch_writer(db_path_owned, rx, events_received_writer)
+    });
+
+    // Phase 3: Network I/O loop with dual streams
+    let mut events_sent: u64 = 0;
+    let mut reconciliation_done = false;
+    let mut rounds = 0;
+    let mut idle_count = 0;
+    const MAX_IDLE: u32 = 100;
+
+    // Queue of events to send (from HaveList requests)
+    let mut send_queue: Vec<Vec<u8>> = Vec::new();
+
+    loop {
+        if start.elapsed() >= timeout {
+            warn!("Timeout");
+            break;
+        }
+
+        if reconciliation_done && send_queue.is_empty() && idle_count >= MAX_IDLE {
+            break;
+        }
+
+        // Receive from both streams using select!
+        tokio::select! {
+            biased;
+
+            // Control stream: NegOpen, NegMsg, HaveList
+            result = tokio::time::timeout(Duration::from_millis(1), conn.control.recv()) => {
+                match result {
+                    Ok(Ok(SyncMessage::NegOpen { msg })) | Ok(Ok(SyncMessage::NegMsg { msg })) => {
+                        idle_count = 0;
+                        rounds += 1;
+
+                        let response = neg.reconcile(&msg)?;
+                        if response.is_empty() {
+                            info!("Reconciliation complete in {} rounds", rounds);
+                            reconciliation_done = true;
+                        } else {
+                            conn.send_control(&SyncMessage::NegMsg { msg: response }).await?;
+                            conn.flush_control().await?;
+                        }
+                    }
+                    Ok(Ok(SyncMessage::HaveList { ids })) => {
+                        idle_count = 0;
+                        reconciliation_done = true;
+
+                        // Queue events for sending on data stream
+                        for id in &ids {
+                            if let Some(blob) = blob_cache.get(id) {
+                                send_queue.push(blob.clone());
+                            }
+                        }
+                    }
+                    Ok(Ok(_)) => {}
+                    Ok(Err(transport::connection::ConnectionError::Closed)) => {
+                        info!("Control stream closed by peer");
+                        break;
+                    }
+                    Ok(Err(e)) => {
+                        warn!("Control stream error: {}", e);
+                        break;
+                    }
+                    Err(_) => {} // Timeout
+                }
+            }
+
+            // Data stream: incoming events
+            result = tokio::time::timeout(Duration::from_millis(1), conn.data.recv()) => {
+                match result {
+                    Ok(Ok(SyncMessage::Event { blob })) => {
+                        idle_count = 0;
+                        let event_id = hash_event(&blob);
+                        let _ = tx.try_send((event_id, blob));
+                    }
+                    Ok(Ok(_)) => {}
+                    Ok(Err(transport::connection::ConnectionError::Closed)) => {
+                        info!("Data stream closed by peer");
+                    }
+                    Ok(Err(e)) => {
+                        warn!("Data stream error: {}", e);
+                    }
+                    Err(_) => {} // Timeout
+                }
+            }
+        }
+
+        // Send a batch from queue on data stream
+        let mut sent_this_round = 0;
+        while let Some(blob) = send_queue.pop() {
+            if conn.send_data(&SyncMessage::Event { blob }).await.is_ok() {
+                events_sent += 1;
+                sent_this_round += 1;
+                if sent_this_round >= 500 {
+                    break;
+                }
+            }
+        }
+
+        if sent_this_round > 0 {
+            let _ = conn.flush_data().await;
+            idle_count = 0;
+        } else if reconciliation_done {
+            idle_count += 1;
+        }
+    }
+
+    drop(tx);
+    let _ = writer_handle.await;
+
+    let stats = SyncStats {
+        events_sent,
+        events_received: events_received.load(Ordering::Relaxed),
+        neg_rounds: rounds,
+    };
+    info!("Sync stats (responder): {:?}", stats);
     Ok(stats)
 }
 

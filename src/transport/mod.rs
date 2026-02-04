@@ -2,7 +2,7 @@ pub mod cert;
 pub mod connection;
 
 pub use cert::{generate_keypair, generate_self_signed_cert};
-pub use connection::Connection;
+pub use connection::{Connection, DualConnection};
 
 use quinn::{ClientConfig, Endpoint, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};

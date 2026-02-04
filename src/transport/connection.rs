@@ -11,6 +11,52 @@ pub struct Connection {
     recv_buffer: Vec<u8>,
 }
 
+/// Dual-stream connection for separating control and data planes
+///
+/// Control stream: NegOpen, NegMsg, HaveList messages
+/// Data stream: Event blobs
+///
+/// This prevents large event transfers from blocking control messages.
+pub struct DualConnection {
+    pub control: Connection,
+    pub data: Connection,
+}
+
+impl DualConnection {
+    /// Create from two stream pairs (control first, data second)
+    pub fn new(
+        control_send: SendStream,
+        control_recv: RecvStream,
+        data_send: SendStream,
+        data_recv: RecvStream,
+    ) -> Self {
+        Self {
+            control: Connection::new(control_send, control_recv),
+            data: Connection::new(data_send, data_recv),
+        }
+    }
+
+    /// Send a control message (NegOpen, NegMsg, HaveList)
+    pub async fn send_control(&mut self, msg: &SyncMessage) -> Result<(), ConnectionError> {
+        self.control.send(msg).await
+    }
+
+    /// Send a data message (Event)
+    pub async fn send_data(&mut self, msg: &SyncMessage) -> Result<(), ConnectionError> {
+        self.data.send(msg).await
+    }
+
+    /// Flush control stream
+    pub async fn flush_control(&mut self) -> Result<(), ConnectionError> {
+        self.control.flush().await
+    }
+
+    /// Flush data stream
+    pub async fn flush_data(&mut self) -> Result<(), ConnectionError> {
+        self.data.flush().await
+    }
+}
+
 impl Connection {
     /// Create a new connection from quinn streams
     pub fn new(send: SendStream, recv: RecvStream) -> Self {
