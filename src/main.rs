@@ -6,7 +6,7 @@ mod transport;
 mod wire;
 
 use clap::{Parser, Subcommand};
-use negentropy::{Negentropy, Id};
+use negentropy::{Negentropy, Id, NegentropyStorageBase, Storage};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -19,7 +19,7 @@ use tracing_subscriber::FmtSubscriber;
 use crate::crypto::{hash_event, event_id_to_base64, EventId};
 use crate::db::{open_connection, schema::create_tables, shareable::Shareable, store::Store};
 use crate::runtime::SyncStats;
-use crate::sync::{SyncMessage, load_negentropy_items, build_negentropy_storage, neg_id_to_event_id};
+use crate::sync::{SyncMessage, load_negentropy_items, build_negentropy_storage, neg_id_to_event_id, NegentropyStorageSqlite};
 use crate::transport::{Connection, DualConnection, create_client_endpoint, create_server_endpoint, generate_keypair, generate_self_signed_cert};
 use crate::wire::Envelope;
 
@@ -745,6 +745,7 @@ async fn run_sync_responder(
 /// - Main task: control stream (negentropy) + data sending
 /// - Data receiver task: receives events, send().await for backpressure
 /// - Ingest worker (spawn_blocking): batch writes to SQLite
+/// - NO blob prefetch: fetches from SQLite on-demand
 async fn run_sync_initiator_dual(
     conn: &mut DualConnection,
     db_path: &str,
@@ -755,23 +756,20 @@ async fn run_sync_initiator_dual(
 
     info!("Starting negentropy sync (initiator, dual-stream) for {} seconds", timeout_secs);
 
-    // Phase 1: Load data and prefetch blobs into memory
+    // Phase 1: Set up SQLite-backed negentropy storage (no blob prefetch!)
     let db = open_connection(db_path)?;
-    let items = load_negentropy_items(&db)?;
-    info!("Loaded {} items for negentropy", items.len());
 
-    let storage = build_negentropy_storage(&items)?;
-    let mut neg = Negentropy::owned(storage, 64 * 1024)?;
+    // Rebuild block index for efficient negentropy queries
+    let neg_storage = NegentropyStorageSqlite::new(&db);
+    neg_storage.rebuild_blocks().map_err(|e| format!("Failed to rebuild blocks: {}", e))?;
 
+    let item_count = neg_storage.size().map_err(|e| format!("Failed to get size: {:?}", e))?;
+    info!("Loaded {} items for negentropy (SQLite-backed, no prefetch)", item_count);
+
+    let mut neg = Negentropy::new(Storage::Borrowed(&neg_storage), 64 * 1024)?;
+
+    // Store for on-demand blob fetching (no cache!)
     let store = Store::new(&db);
-    let mut blob_cache: HashMap<EventId, Vec<u8>> = HashMap::new();
-    for item in &items {
-        if let Ok(Some(blob)) = store.get(&item.id) {
-            blob_cache.insert(item.id, blob);
-        }
-    }
-    info!("Prefetched {} blobs into cache", blob_cache.len());
-    drop(db);
 
     // Phase 2: Set up bounded ingest channel (small for memory efficiency)
     // send().await provides backpressure when writer is slow
@@ -860,13 +858,14 @@ async fn run_sync_initiator_dual(
             }
         }
 
-        // Third: send a batch of events on data stream
+        // Third: send a batch of events on data stream (fetch from SQLite on-demand)
         let mut sent_this_round = 0;
         for neg_id in &have_ids {
             let event_id = neg_id_to_event_id(neg_id);
             if !have_sent.contains(&event_id) {
-                if let Some(blob) = blob_cache.get(&event_id) {
-                    if conn.send_data(&SyncMessage::Event { blob: blob.clone() }).await.is_ok() {
+                // Fetch blob from SQLite (no cache)
+                if let Ok(Some(blob)) = store.get(&event_id) {
+                    if conn.send_data(&SyncMessage::Event { blob }).await.is_ok() {
                         events_sent += 1;
                         have_sent.insert(event_id);
                         sent_this_round += 1;
@@ -875,6 +874,7 @@ async fn run_sync_initiator_dual(
                         }
                     }
                 } else {
+                    // Blob not found, skip
                     have_sent.insert(event_id);
                 }
             }
@@ -927,6 +927,7 @@ async fn run_sync_initiator_dual(
 /// - Main task: control stream (negentropy) + data sending
 /// - Ingest worker (spawn_blocking): batch writes to SQLite
 /// - Uses send().await for backpressure on ingest channel
+/// - NO blob prefetch: fetches from SQLite on-demand
 async fn run_sync_responder_dual(
     conn: &mut DualConnection,
     db_path: &str,
@@ -937,23 +938,20 @@ async fn run_sync_responder_dual(
 
     info!("Starting negentropy sync (responder, dual-stream) for {} seconds", timeout_secs);
 
-    // Phase 1: Load data and prefetch blobs into memory
+    // Phase 1: Set up SQLite-backed negentropy storage (no blob prefetch!)
     let db = open_connection(db_path)?;
-    let items = load_negentropy_items(&db)?;
-    info!("Loaded {} items for negentropy", items.len());
 
-    let storage = build_negentropy_storage(&items)?;
-    let mut neg = Negentropy::owned(storage, 64 * 1024)?;
+    // Rebuild block index for efficient negentropy queries
+    let neg_storage = NegentropyStorageSqlite::new(&db);
+    neg_storage.rebuild_blocks().map_err(|e| format!("Failed to rebuild blocks: {}", e))?;
 
+    let item_count = neg_storage.size().map_err(|e| format!("Failed to get size: {:?}", e))?;
+    info!("Loaded {} items for negentropy (SQLite-backed, no prefetch)", item_count);
+
+    let mut neg = Negentropy::new(Storage::Borrowed(&neg_storage), 64 * 1024)?;
+
+    // Store for on-demand blob fetching (no cache!)
     let store = Store::new(&db);
-    let mut blob_cache: HashMap<EventId, Vec<u8>> = HashMap::new();
-    for item in &items {
-        if let Ok(Some(blob)) = store.get(&item.id) {
-            blob_cache.insert(item.id, blob);
-        }
-    }
-    info!("Prefetched {} blobs into cache", blob_cache.len());
-    drop(db);
 
     // Phase 2: Set up bounded ingest channel (small for memory efficiency)
     let (ingest_tx, ingest_rx) = mpsc::channel::<(EventId, Vec<u8>)>(5000);
@@ -972,8 +970,8 @@ async fn run_sync_responder_dual(
     let mut idle_count = 0;
     const MAX_IDLE: u32 = 100;
 
-    // Queue of events to send (from HaveList requests)
-    let mut send_queue: Vec<Vec<u8>> = Vec::new();
+    // Queue of event IDs to send (from HaveList requests) - store IDs, not blobs!
+    let mut send_queue: Vec<EventId> = Vec::new();
 
     loop {
         if start.elapsed() >= timeout {
@@ -1004,11 +1002,9 @@ async fn run_sync_responder_dual(
                 idle_count = 0;
                 reconciliation_done = true;
 
-                // Queue events for sending on data stream
-                for id in &ids {
-                    if let Some(blob) = blob_cache.get(id) {
-                        send_queue.push(blob.clone());
-                    }
+                // Queue event IDs for sending (blobs fetched on-demand)
+                for id in ids {
+                    send_queue.push(id);
                 }
             }
             Ok(Ok(_)) => {}
@@ -1048,14 +1044,17 @@ async fn run_sync_responder_dual(
             }
         }
 
-        // Third: send a batch from queue on data stream
+        // Third: send a batch from queue on data stream (fetch blobs on-demand)
         let mut sent_this_round = 0;
-        while let Some(blob) = send_queue.pop() {
-            if conn.send_data(&SyncMessage::Event { blob }).await.is_ok() {
-                events_sent += 1;
-                sent_this_round += 1;
-                if sent_this_round >= 500 {
-                    break;
+        while let Some(event_id) = send_queue.pop() {
+            // Fetch blob from SQLite (no cache)
+            if let Ok(Some(blob)) = store.get(&event_id) {
+                if conn.send_data(&SyncMessage::Event { blob }).await.is_ok() {
+                    events_sent += 1;
+                    sent_this_round += 1;
+                    if sent_this_round >= 500 {
+                        break;
+                    }
                 }
             }
         }
