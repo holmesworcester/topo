@@ -6,7 +6,7 @@ pub fn create_tables(conn: &Connection) -> SqliteResult<()> {
         "
         -- Content-addressed blob store
         CREATE TABLE IF NOT EXISTS store (
-            id TEXT PRIMARY KEY,        -- Base64 Blake2b-128
+            id TEXT PRIMARY KEY,        -- Base64 Blake2b-256
             blob BLOB NOT NULL,
             stored_at INTEGER NOT NULL
         );
@@ -41,6 +41,27 @@ pub fn create_tables(conn: &Connection) -> SqliteResult<()> {
             created_at INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel_id, created_at DESC);
+
+        -- Negentropy items: sorted by (ts, id) for range-based reconciliation
+        CREATE TABLE IF NOT EXISTS neg_items (
+            ts INTEGER NOT NULL,        -- created_at_ms timestamp
+            id BLOB NOT NULL,           -- 32-byte event ID (raw, not base64)
+            PRIMARY KEY (ts, id)
+        ) WITHOUT ROWID;
+
+        -- Negentropy block index: sparse index every B items for O(1) index lookup
+        CREATE TABLE IF NOT EXISTS neg_blocks (
+            block_idx INTEGER PRIMARY KEY,  -- block number (item_index / B)
+            ts INTEGER NOT NULL,            -- timestamp of first item in block
+            id BLOB NOT NULL,               -- id of first item in block
+            count INTEGER NOT NULL          -- cumulative count up to this block
+        );
+
+        -- Negentropy metadata: tracks rebuild state
+        CREATE TABLE IF NOT EXISTS neg_meta (
+            key TEXT PRIMARY KEY,
+            value INTEGER NOT NULL
+        );
         ",
     )?;
     Ok(())
@@ -70,6 +91,9 @@ mod tests {
         assert!(tables.contains(&"wanted_events".to_string()));
         assert!(tables.contains(&"incoming_queue".to_string()));
         assert!(tables.contains(&"messages".to_string()));
+        assert!(tables.contains(&"neg_items".to_string()));
+        assert!(tables.contains(&"neg_blocks".to_string()));
+        assert!(tables.contains(&"neg_meta".to_string()));
     }
 
     #[test]

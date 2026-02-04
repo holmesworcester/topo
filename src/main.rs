@@ -406,6 +406,17 @@ fn batch_writer(
         }
     };
 
+    // Prepare neg_items insertion (raw 32-byte blob id)
+    let mut neg_items_stmt = match db.prepare(
+        "INSERT OR IGNORE INTO neg_items (ts, id) VALUES (?1, ?2)"
+    ) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            error!("Failed to prepare neg_items statement: {}", e);
+            return;
+        }
+    };
+
     loop {
         // Block waiting for first item
         let first = match rx.blocking_recv() {
@@ -444,6 +455,14 @@ fn batch_writer(
                     let _ = shareable.insert(event_id);
 
                     if let Ok((_, envelope)) = Envelope::parse(blob) {
+                        let created_at_ms = envelope.payload.created_at_ms;
+
+                        // Insert into neg_items (raw blob id)
+                        let _ = neg_items_stmt.execute(rusqlite::params![
+                            created_at_ms as i64,
+                            event_id.as_slice()
+                        ]);
+
                         let message_id = event_id_to_base64(event_id);
                         let channel_id = event_id_to_base64(&envelope.payload.channel_id);
                         let author_id = event_id_to_base64(&envelope.payload.author_id);
@@ -452,7 +471,7 @@ fn batch_writer(
                             channel_id,
                             author_id,
                             &envelope.payload.content,
-                            envelope.payload.created_at_ms as i64
+                            created_at_ms as i64
                         ]);
                     }
                 }
@@ -466,6 +485,14 @@ fn batch_writer(
                     let _ = shareable.insert(event_id);
 
                     if let Ok((_, envelope)) = Envelope::parse(blob) {
+                        let created_at_ms = envelope.payload.created_at_ms;
+
+                        // Insert into neg_items (raw blob id)
+                        let _ = neg_items_stmt.execute(rusqlite::params![
+                            created_at_ms as i64,
+                            event_id.as_slice()
+                        ]);
+
                         // Naive: 10 individual reads per event during projection
                         // Use real message IDs as dependencies
                         if !real_dep_ids.is_empty() {
@@ -486,7 +513,7 @@ fn batch_writer(
                             channel_id,
                             author_id,
                             &envelope.payload.content,
-                            envelope.payload.created_at_ms as i64
+                            created_at_ms as i64
                         ]);
                     }
                 }
@@ -530,6 +557,14 @@ fn batch_writer(
                     let _ = shareable.insert(event_id);
 
                     if let Ok((_, envelope)) = Envelope::parse(blob) {
+                        let created_at_ms = envelope.payload.created_at_ms;
+
+                        // Insert into neg_items (raw blob id)
+                        let _ = neg_items_stmt.execute(rusqlite::params![
+                            created_at_ms as i64,
+                            event_id.as_slice()
+                        ]);
+
                         // Access pre-fetched dependencies
                         if !real_dep_ids.is_empty() {
                             for i in 0..10usize {
@@ -546,7 +581,7 @@ fn batch_writer(
                             channel_id,
                             author_id,
                             &envelope.payload.content,
-                            envelope.payload.created_at_ms as i64
+                            created_at_ms as i64
                         ]);
                     }
                 }
@@ -723,6 +758,11 @@ fn generate_events(db_path: &str, count: usize, channel_hex: &str) -> Result<(),
          VALUES (?1, ?2, ?3, ?4, ?5)"
     )?;
 
+    // Prepare neg_items insertion (raw 32-byte blob id)
+    let mut neg_items_stmt = db.prepare(
+        "INSERT OR IGNORE INTO neg_items (ts, id) VALUES (?1, ?2)"
+    )?;
+
     info!("Generating {} events...", count);
 
     for i in 0..count {
@@ -736,9 +776,16 @@ fn generate_events(db_path: &str, count: usize, channel_hex: &str) -> Result<(),
 
         let blob = envelope.encode();
         let event_id = hash_event(&blob);
+        let created_at_ms = envelope.payload.created_at_ms;
 
         store.put(&event_id, &blob)?;
         shareable.insert(&event_id)?;
+
+        // Insert into neg_items for negentropy (raw blob id, not base64)
+        neg_items_stmt.execute(rusqlite::params![
+            created_at_ms as i64,
+            event_id.as_slice()
+        ])?;
 
         // Project inline
         let message_id = event_id_to_base64(&event_id);
@@ -749,7 +796,7 @@ fn generate_events(db_path: &str, count: usize, channel_hex: &str) -> Result<(),
             channel_id_b64,
             author_id_b64,
             content,
-            envelope.payload.created_at_ms as i64
+            created_at_ms as i64
         ])?;
     }
 
@@ -767,6 +814,7 @@ fn show_stats(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sy
     let wanted_count: i64 = db.query_row("SELECT COUNT(*) FROM wanted_events", [], |row| row.get(0)).unwrap_or(0);
     let incoming_count: i64 = db.query_row("SELECT COUNT(*) FROM incoming_queue WHERE processed = 0", [], |row| row.get(0)).unwrap_or(0);
     let messages_count: i64 = db.query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0)).unwrap_or(0);
+    let neg_items_count: i64 = db.query_row("SELECT COUNT(*) FROM neg_items", [], |row| row.get(0)).unwrap_or(0);
 
     println!("Database: {}", db_path);
     println!("  Store:     {} events", store_count);
@@ -774,6 +822,7 @@ fn show_stats(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sy
     println!("  Wanted:    {} events", wanted_count);
     println!("  Incoming:  {} pending", incoming_count);
     println!("  Messages:  {} projected", messages_count);
+    println!("  NegItems:  {} indexed", neg_items_count);
 
     Ok(())
 }
