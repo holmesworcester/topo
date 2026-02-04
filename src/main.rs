@@ -20,7 +20,17 @@ use crate::crypto::{hash_event, event_id_to_base64, EventId};
 use crate::db::{open_connection, schema::create_tables, shareable::Shareable, store::Store};
 use crate::runtime::SyncStats;
 use crate::sync::{SyncMessage, load_negentropy_items, build_negentropy_storage, neg_id_to_event_id, NegentropyStorageSqlite};
-use crate::transport::{Connection, DualConnection, create_client_endpoint, create_server_endpoint, generate_keypair, generate_self_signed_cert};
+use crate::transport::{
+    Connection,
+    DualConnection,
+    create_client_endpoint,
+    create_server_endpoint,
+    generate_self_signed_cert,
+    spki_from_base64,
+    spki_to_base64,
+    StaticPeerKeyStore,
+    SelfSignedCert,
+};
 use crate::wire::Envelope;
 
 #[derive(Parser)]
@@ -39,6 +49,10 @@ enum Commands {
         #[arg(short, long, default_value = "127.0.0.1:4433")]
         bind: SocketAddr,
 
+        /// Base64-encoded peer SPKI (public key) to accept
+        #[arg(long)]
+        peer_spki: String,
+
         /// Database path
         #[arg(short, long, default_value = "server.db")]
         db: String,
@@ -53,6 +67,10 @@ enum Commands {
         /// Remote address to connect to
         #[arg(short, long)]
         remote: SocketAddr,
+
+        /// Base64-encoded peer SPKI (public key) to accept
+        #[arg(long)]
+        peer_spki: String,
 
         /// Database path
         #[arg(short, long, default_value = "client.db")]
@@ -108,11 +126,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Listen { bind, db, timeout } => {
-            run_server(bind, &db, timeout).await?;
+        Commands::Listen { bind, peer_spki, db, timeout } => {
+            let peer_spki = spki_from_base64(&peer_spki)?;
+            run_server(bind, &db, timeout, peer_spki, None).await?;
         }
-        Commands::Connect { remote, db, timeout } => {
-            run_client(remote, &db, timeout).await?;
+        Commands::Connect { remote, peer_spki, db, timeout } => {
+            let peer_spki = spki_from_base64(&peer_spki)?;
+            run_client(remote, &db, timeout, peer_spki, None).await?;
         }
         Commands::Generate { db, count, channel } => {
             generate_events(&db, count, &channel)?;
@@ -132,15 +152,21 @@ async fn run_server(
     bind: SocketAddr,
     db_path: &str,
     timeout_secs: u64,
+    peer_spki: Vec<u8>,
+    identity: Option<SelfSignedCert>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("Starting server on {}", bind);
 
-    // Generate keypair and certificate
-    let (signing_key, _) = generate_keypair();
-    let (cert, key) = generate_self_signed_cert(&signing_key)?;
+    // Generate certificate (or use provided)
+    let identity = match identity {
+        Some(identity) => identity,
+        None => generate_self_signed_cert()?,
+    };
+    info!("Server SPKI (base64): {}", spki_to_base64(&identity.spki_der));
 
     // Create server endpoint
-    let endpoint = create_server_endpoint(bind, cert, key)?;
+    let peer_store = Arc::new(StaticPeerKeyStore::new(vec![peer_spki]));
+    let endpoint = create_server_endpoint(bind, identity.cert_der, identity.key_der, peer_store)?;
     info!("Server listening on {}", endpoint.local_addr()?);
 
     // Initialize database
@@ -173,11 +199,21 @@ async fn run_client(
     remote: SocketAddr,
     db_path: &str,
     timeout_secs: u64,
+    peer_spki: Vec<u8>,
+    identity: Option<SelfSignedCert>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("Connecting to {}", remote);
 
+    // Generate certificate (or use provided)
+    let identity = match identity {
+        Some(identity) => identity,
+        None => generate_self_signed_cert()?,
+    };
+    info!("Client SPKI (base64): {}", spki_to_base64(&identity.spki_der));
+
     // Create client endpoint
-    let endpoint = create_client_endpoint("0.0.0.0:0".parse()?)?;
+    let peer_store = Arc::new(StaticPeerKeyStore::new(vec![peer_spki]));
+    let endpoint = create_client_endpoint("0.0.0.0:0".parse()?, identity.cert_der, identity.key_der, peer_store)?;
 
     // Connect to server
     let connection = endpoint.connect(remote, "localhost")?.await?;
@@ -1200,6 +1236,11 @@ async fn run_demo(events_per_peer: usize, timeout_secs: u64) -> Result<(), Box<d
     let server_timeout = timeout_secs;
     let client_timeout = timeout_secs;
 
+    let server_identity = generate_self_signed_cert()?;
+    let client_identity = generate_self_signed_cert()?;
+    let server_spki = server_identity.spki_der.clone();
+    let client_spki = client_identity.spki_der.clone();
+
     // Start server task
     let server_handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -1210,7 +1251,13 @@ async fn run_demo(events_per_peer: usize, timeout_secs: u64) -> Result<(), Box<d
             let bind: SocketAddr = "127.0.0.1:4433".parse().unwrap();
             // Signal that server is starting
             let _ = tx.send(());
-            if let Err(e) = run_server(bind, "demo_server.db", server_timeout).await {
+            if let Err(e) = run_server(
+                bind,
+                "demo_server.db",
+                server_timeout,
+                client_spki,
+                Some(server_identity),
+            ).await {
                 error!("Server error: {}", e);
             }
         });
@@ -1228,7 +1275,13 @@ async fn run_demo(events_per_peer: usize, timeout_secs: u64) -> Result<(), Box<d
             .unwrap();
         rt.block_on(async move {
             let remote: SocketAddr = "127.0.0.1:4433".parse().unwrap();
-            if let Err(e) = run_client(remote, "demo_client.db", client_timeout).await {
+            if let Err(e) = run_client(
+                remote,
+                "demo_client.db",
+                client_timeout,
+                server_spki,
+                Some(client_identity),
+            ).await {
                 error!("Client error: {}", e);
             }
         });
