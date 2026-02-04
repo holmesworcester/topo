@@ -9,6 +9,7 @@ pub use negentropy_sqlite::{NegentropyStorageSqlite, BLOCK_SIZE};
 use crate::wire::ENVELOPE_SIZE;
 
 /// Sync message types
+pub const MSG_TYPE_PING: u8 = 0x00;       // Stream establishment / keep-alive
 pub const MSG_TYPE_NEG_OPEN: u8 = 0x10;   // Initial negentropy message
 pub const MSG_TYPE_NEG_MSG: u8 = 0x11;    // Negentropy response
 pub const MSG_TYPE_HAVE_LIST: u8 = 0x12;  // List of IDs client needs from server

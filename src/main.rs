@@ -161,7 +161,7 @@ async fn run_server(
     info!("Accepted control and data streams");
 
     // Run sync as responder (server waits for client to initiate)
-    run_sync_responder_dual(&mut conn, db_path, timeout_secs).await?;
+    run_sync_responder_dual(conn, db_path, timeout_secs).await?;
 
     // Close connection
     connection.close(0u32.into(), b"done");
@@ -194,15 +194,15 @@ async fn run_client(
     let (data_send, data_recv) = connection.open_bi().await?;
     let mut conn = DualConnection::new(control_send, control_recv, data_send, data_recv);
 
-    // Send markers on both streams to establish them (QUIC streams are lazy)
-    conn.control.send(&SyncMessage::HaveList { ids: vec![] }).await?;
-    conn.data.send(&SyncMessage::HaveList { ids: vec![] }).await?;
+    // Send ping on both streams to establish them (QUIC streams are lazy)
+    conn.control.send(&SyncMessage::Ping).await?;
+    conn.data.send(&SyncMessage::Ping).await?;
     conn.flush_control().await?;
     conn.flush_data().await?;
     info!("Opened and established control and data streams");
 
     // Run sync as initiator (client starts the reconciliation)
-    run_sync_initiator_dual(&mut conn, db_path, timeout_secs).await?;
+    run_sync_initiator_dual(conn, db_path, timeout_secs).await?;
 
     // Close connection
     connection.close(0u32.into(), b"done");
@@ -648,7 +648,7 @@ async fn run_sync_responder(
     let mut reconciliation_done = false;
     let mut rounds = 0;
     let mut idle_count = 0;
-    const MAX_IDLE: u32 = 100;
+    const MAX_IDLE: u32 = 10000; // Allow more idle rounds for large transfers
 
     // Queue of events to send (from HaveList requests)
     let mut send_queue: Vec<Vec<u8>> = Vec::new();
@@ -694,6 +694,9 @@ async fn run_sync_responder(
                     idle_count = 0;
                     let event_id = hash_event(&blob);
                     let _ = tx.try_send((event_id, blob));
+                }
+                Ok(Ok(SyncMessage::Ping)) => {
+                    // Ignore ping messages (used for stream establishment)
                 }
                 Ok(Err(transport::connection::ConnectionError::Closed)) => {
                     info!("Connection closed by peer");
@@ -753,7 +756,7 @@ async fn run_sync_responder(
 /// - Ingest worker (spawn_blocking): batch writes to SQLite
 /// - NO blob prefetch: fetches from SQLite on-demand
 async fn run_sync_initiator_dual(
-    conn: &mut DualConnection,
+    conn: DualConnection,
     db_path: &str,
     timeout_secs: u64,
 ) -> Result<SyncStats, Box<dyn std::error::Error + Send + Sync>> {
@@ -762,10 +765,8 @@ async fn run_sync_initiator_dual(
 
     info!("Starting negentropy sync (initiator, dual-stream) for {} seconds", timeout_secs);
 
-    // Phase 1: Set up SQLite-backed negentropy storage (no blob prefetch!)
+    // Phase 1: Set up SQLite-backed negentropy storage
     let db = open_connection(db_path)?;
-
-    // Rebuild block index for efficient negentropy queries
     let neg_storage = NegentropyStorageSqlite::new(&db);
     neg_storage.rebuild_blocks().map_err(|e| format!("Failed to rebuild blocks: {}", e))?;
 
@@ -773,159 +774,206 @@ async fn run_sync_initiator_dual(
     info!("Loaded {} items for negentropy (SQLite-backed, no prefetch)", item_count);
 
     let mut neg = Negentropy::new(Storage::Borrowed(&neg_storage), 64 * 1024)?;
-
-    // Store for on-demand blob fetching (no cache!)
     let store = Store::new(&db);
 
-    // Phase 2: Set up bounded ingest channel (small for memory efficiency)
-    // send().await provides backpressure when writer is slow
+    // Phase 2: Set up ingest channel with backpressure
     let (ingest_tx, ingest_rx) = mpsc::channel::<(EventId, Vec<u8>)>(5000);
     let events_received = Arc::new(AtomicU64::new(0));
     let events_received_writer = events_received.clone();
 
-    // Spawn ingest worker (writes to SQLite)
     let db_path_owned = db_path.to_string();
     let writer_handle = tokio::task::spawn_blocking(move || {
         batch_writer(db_path_owned, ingest_rx, events_received_writer)
     });
 
-    // Phase 3: Network I/O with dedicated tasks
+    // Split connection for concurrent send/recv
+    let split = conn.split();
+    let mut ctrl_send = split.control_send;
+    let mut ctrl_recv = split.control_recv;
+    let data_send = split.data_send;
+    let mut data_recv = split.data_recv;
+
+    // Phase 3: Spawn dedicated sender task to avoid send/recv deadlock
+    let (send_tx, mut send_rx) = mpsc::channel::<Vec<u8>>(1000);
+    let events_sent = Arc::new(AtomicU64::new(0));
+    let events_sent_sender = events_sent.clone();
+
+    let sender_handle = tokio::spawn(async move {
+        let mut data_send = data_send;
+        let mut batch = Vec::with_capacity(100);
+
+        loop {
+            // Collect a batch of events
+            match send_rx.recv().await {
+                Some(blob) => batch.push(blob),
+                None => break, // Channel closed
+            }
+
+            // Drain more if available (non-blocking)
+            while batch.len() < 100 {
+                match send_rx.try_recv() {
+                    Ok(blob) => batch.push(blob),
+                    Err(_) => break,
+                }
+            }
+
+            // Send the batch
+            for blob in batch.drain(..) {
+                if data_send.send(&SyncMessage::Event { blob }).await.is_ok() {
+                    events_sent_sender.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            data_send.flush().await.ok();
+        }
+    });
+
+    // Phase 4: State for sync
     let mut have_ids: Vec<Id> = Vec::new();
     let mut need_ids: Vec<Id> = Vec::new();
-    let mut have_sent: HashSet<EventId> = HashSet::new();
-    let mut need_requested: HashSet<EventId> = HashSet::new();
-    let mut events_sent: u64 = 0;
-
-    // Send initial negentropy message on control stream
-    let initial_msg = neg.initiate()?;
-    conn.send_control(&SyncMessage::NegOpen { msg: initial_msg }).await?;
-    conn.flush_control().await?;
-
+    let mut have_idx: usize = 0;
     let mut reconciliation_done = false;
     let mut rounds = 0;
+    let mut peer_done = false;
+    let mut sent_done = false;
 
-    // Main loop: handle control + send data
-    // Data receiving happens inline but uses send().await for backpressure
+    // Send initial negentropy message
+    let initial_msg = neg.initiate()?;
+    ctrl_send.send(&SyncMessage::NegOpen { msg: initial_msg }).await?;
+    ctrl_send.flush().await?;
+
+    // Main loop using select! for true concurrent I/O
     loop {
         if start.elapsed() >= timeout {
-            warn!("Timeout");
+            warn!("Timeout after {:?}", start.elapsed());
             break;
-        }
-
-        // First: check control stream for negentropy messages (non-blocking)
-        match tokio::time::timeout(Duration::from_millis(1), conn.control.recv()).await {
-            Ok(Ok(SyncMessage::NegMsg { msg })) => {
-                rounds += 1;
-                match neg.reconcile_with_ids(&msg, &mut have_ids, &mut need_ids)? {
-                    Some(next_msg) => {
-                        conn.send_control(&SyncMessage::NegMsg { msg: next_msg }).await?;
-                        conn.flush_control().await?;
-                    }
-                    None => {
-                        // Deduplicate IDs (negentropy accumulates across rounds, may have duplicates)
-                        let have_set: HashSet<_> = have_ids.iter().cloned().collect();
-                        let need_set: HashSet<_> = need_ids.iter().cloned().collect();
-                        have_ids = have_set.into_iter().collect();
-                        need_ids = need_set.into_iter().collect();
-
-                        info!("Reconciliation complete in {} rounds: {} have, {} need",
-                            rounds, have_ids.len(), need_ids.len());
-                        reconciliation_done = true;
-                    }
-                }
-            }
-            Ok(Ok(_)) => {}
-            Ok(Err(transport::connection::ConnectionError::Closed)) => {
-                info!("Control stream closed by peer");
-                break;
-            }
-            Ok(Err(e)) => {
-                warn!("Control stream error: {}", e);
-                break;
-            }
-            Err(_) => {} // Timeout
-        }
-
-        // Second: drain data stream, using send().await for backpressure
-        loop {
-            match tokio::time::timeout(Duration::from_millis(1), conn.data.recv()).await {
-                Ok(Ok(SyncMessage::Event { blob })) => {
-                    let event_id = hash_event(&blob);
-                    // send().await - blocks if channel is full (backpressure)
-                    if ingest_tx.send((event_id, blob)).await.is_err() {
-                        warn!("Ingest channel closed");
-                        break;
-                    }
-                }
-                Ok(Ok(_)) => {}
-                Ok(Err(transport::connection::ConnectionError::Closed)) => {
-                    info!("Data stream closed by peer");
-                    break;
-                }
-                Ok(Err(e)) => {
-                    warn!("Data stream error: {}", e);
-                    break;
-                }
-                Err(_) => break, // Timeout - no more pending
-            }
-        }
-
-        // Third: send a batch of events on data stream (fetch from SQLite on-demand)
-        let mut sent_this_round = 0;
-        for neg_id in &have_ids {
-            let event_id = neg_id_to_event_id(neg_id);
-            if !have_sent.contains(&event_id) {
-                // Fetch blob from SQLite (no cache)
-                if let Ok(Some(blob)) = store.get(&event_id) {
-                    if conn.send_data(&SyncMessage::Event { blob }).await.is_ok() {
-                        events_sent += 1;
-                        have_sent.insert(event_id);
-                        sent_this_round += 1;
-                        if sent_this_round >= 500 {
-                            break;
-                        }
-                    }
-                } else {
-                    // Blob not found, skip
-                    have_sent.insert(event_id);
-                }
-            }
-        }
-
-        // Fourth: send HaveList for events we need on control stream
-        let mut new_needs: Vec<EventId> = Vec::new();
-        for neg_id in &need_ids {
-            let event_id = neg_id_to_event_id(neg_id);
-            if !need_requested.contains(&event_id) {
-                new_needs.push(event_id);
-                need_requested.insert(event_id);
-            }
-        }
-        if !new_needs.is_empty() {
-            conn.send_control(&SyncMessage::HaveList { ids: new_needs }).await?;
-            conn.flush_control().await?;
-        }
-
-        if sent_this_round > 0 {
-            let _ = conn.flush_data().await;
         }
 
         // Check completion
         let received = events_received.load(Ordering::Relaxed);
-        if reconciliation_done
-            && have_sent.len() == have_ids.len()
-            && need_requested.len() as u64 == received
-        {
-            info!("Sync complete: sent {}, received {}", events_sent, received);
+        let all_sent = have_idx >= have_ids.len();
+        let all_received = need_ids.is_empty() || received >= need_ids.len() as u64;
+
+        if reconciliation_done && all_sent && all_received && peer_done {
+            info!("Sync complete: sent {}, received {}", events_sent.load(Ordering::Relaxed), received);
             break;
+        }
+
+        // Progress log every 5 seconds
+        if start.elapsed().as_secs() % 5 == 0 && start.elapsed().subsec_millis() < 10 {
+            info!("Progress: sent={}/{}, recv={}/{}, recon={}, peer_done={}",
+                have_idx, have_ids.len(), received, need_ids.len(), reconciliation_done, peer_done);
+        }
+
+        let has_pending_send = reconciliation_done && have_idx < have_ids.len();
+
+        tokio::select! {
+            biased;
+
+            // Always have a timeout to check completion conditions
+            _ = tokio::time::sleep(Duration::from_micros(100)) => {}
+
+            ctrl_result = ctrl_recv.recv() => {
+                match ctrl_result {
+                    Ok(SyncMessage::NegMsg { msg }) => {
+                        rounds += 1;
+                        match neg.reconcile_with_ids(&msg, &mut have_ids, &mut need_ids)? {
+                            Some(next_msg) => {
+                                ctrl_send.send(&SyncMessage::NegMsg { msg: next_msg }).await?;
+                                ctrl_send.flush().await?;
+                            }
+                            None => {
+                                let have_set: HashSet<_> = have_ids.iter().cloned().collect();
+                                let need_set: HashSet<_> = need_ids.iter().cloned().collect();
+                                have_ids = have_set.into_iter().collect();
+                                need_ids = need_set.into_iter().collect();
+
+                                info!("Reconciliation complete in {} rounds: {} have, {} need",
+                                    rounds, have_ids.len(), need_ids.len());
+                                reconciliation_done = true;
+
+                                if !need_ids.is_empty() {
+                                    let need_event_ids: Vec<EventId> = need_ids.iter()
+                                        .map(|id| neg_id_to_event_id(id))
+                                        .collect();
+                                    ctrl_send.send(&SyncMessage::HaveList { ids: need_event_ids }).await?;
+                                    ctrl_send.flush().await?;
+                                }
+                            }
+                        }
+                    }
+                    Ok(SyncMessage::HaveList { ids: _ }) => {
+                        peer_done = true;
+                    }
+                    Ok(_) => {}
+                    Err(transport::connection::ConnectionError::Closed) => {
+                        peer_done = true;
+                    }
+                    Err(e) => {
+                        warn!("Control error: {}", e);
+                        break;
+                    }
+                }
+            }
+
+            data_result = data_recv.recv() => {
+                match data_result {
+                    Ok(SyncMessage::Event { blob }) => {
+                        let event_id = hash_event(&blob);
+                        if ingest_tx.send((event_id, blob)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(transport::connection::ConnectionError::Closed) => {
+                        peer_done = true;
+                    }
+                    Err(e) => {
+                        warn!("Data error: {}", e);
+                        break;
+                    }
+                }
+            }
+
+        }
+
+        // Queue events to sender task (non-blocking via channel)
+        if has_pending_send {
+            // Send batch of events to sender task
+            let batch_end = (have_idx + 100).min(have_ids.len());
+            while have_idx < batch_end {
+                let neg_id = &have_ids[have_idx];
+                let event_id = neg_id_to_event_id(neg_id);
+                if let Ok(Some(blob)) = store.get(&event_id) {
+                    if send_tx.try_send(blob).is_err() {
+                        break; // Channel full, try again next iteration
+                    }
+                }
+                have_idx += 1;
+            }
+        }
+
+        // Signal done when we've sent all our events
+        if reconciliation_done && all_sent && !sent_done {
+            ctrl_send.send(&SyncMessage::HaveList { ids: vec![] }).await.ok();
+            ctrl_send.flush().await.ok();
+            sent_done = true;
         }
     }
 
+    // Send done signal if not already sent
+    if !sent_done {
+        ctrl_send.send(&SyncMessage::HaveList { ids: vec![] }).await.ok();
+        ctrl_send.flush().await.ok();
+    }
+
+    // Cleanup: close channels and wait for tasks
+    drop(send_tx);
     drop(ingest_tx);
+    let _ = sender_handle.await;
     let _ = writer_handle.await;
 
     let stats = SyncStats {
-        events_sent,
+        events_sent: events_sent.load(Ordering::Relaxed),
         events_received: events_received.load(Ordering::Relaxed),
         neg_rounds: rounds,
     };
@@ -936,12 +984,11 @@ async fn run_sync_initiator_dual(
 /// Run sync as the responder (server role) with dual streams
 ///
 /// Architecture:
-/// - Main task: control stream (negentropy) + data sending
+/// - Uses select! for concurrent control/data handling
 /// - Ingest worker (spawn_blocking): batch writes to SQLite
-/// - Uses send().await for backpressure on ingest channel
 /// - NO blob prefetch: fetches from SQLite on-demand
 async fn run_sync_responder_dual(
-    conn: &mut DualConnection,
+    conn: DualConnection,
     db_path: &str,
     timeout_secs: u64,
 ) -> Result<SyncStats, Box<dyn std::error::Error + Send + Sync>> {
@@ -950,10 +997,8 @@ async fn run_sync_responder_dual(
 
     info!("Starting negentropy sync (responder, dual-stream) for {} seconds", timeout_secs);
 
-    // Phase 1: Set up SQLite-backed negentropy storage (no blob prefetch!)
+    // Phase 1: Set up SQLite-backed negentropy storage
     let db = open_connection(db_path)?;
-
-    // Rebuild block index for efficient negentropy queries
     let neg_storage = NegentropyStorageSqlite::new(&db);
     neg_storage.rebuild_blocks().map_err(|e| format!("Failed to rebuild blocks: {}", e))?;
 
@@ -961,11 +1006,9 @@ async fn run_sync_responder_dual(
     info!("Loaded {} items for negentropy (SQLite-backed, no prefetch)", item_count);
 
     let mut neg = Negentropy::new(Storage::Borrowed(&neg_storage), 64 * 1024)?;
-
-    // Store for on-demand blob fetching (no cache!)
     let store = Store::new(&db);
 
-    // Phase 2: Set up bounded ingest channel (small for memory efficiency)
+    // Phase 2: Set up ingest channel with backpressure
     let (ingest_tx, ingest_rx) = mpsc::channel::<(EventId, Vec<u8>)>(5000);
     let events_received = Arc::new(AtomicU64::new(0));
     let events_received_writer = events_received.clone();
@@ -975,119 +1018,189 @@ async fn run_sync_responder_dual(
         batch_writer(db_path_owned, ingest_rx, events_received_writer)
     });
 
-    // Phase 3: Network I/O loop with dual streams
-    let mut events_sent: u64 = 0;
+    // Split connection for concurrent send/recv
+    let split = conn.split();
+    let mut ctrl_send = split.control_send;
+    let mut ctrl_recv = split.control_recv;
+    let data_send = split.data_send;
+    let mut data_recv = split.data_recv;
+
+    // Phase 3: Spawn dedicated sender task to avoid send/recv deadlock
+    let (send_tx, mut send_rx) = mpsc::channel::<Vec<u8>>(1000);
+    let events_sent = Arc::new(AtomicU64::new(0));
+    let events_sent_sender = events_sent.clone();
+
+    let sender_handle = tokio::spawn(async move {
+        let mut data_send = data_send;
+        let mut batch = Vec::with_capacity(100);
+
+        loop {
+            match send_rx.recv().await {
+                Some(blob) => batch.push(blob),
+                None => break,
+            }
+
+            while batch.len() < 100 {
+                match send_rx.try_recv() {
+                    Ok(blob) => batch.push(blob),
+                    Err(_) => break,
+                }
+            }
+
+            for blob in batch.drain(..) {
+                if data_send.send(&SyncMessage::Event { blob }).await.is_ok() {
+                    events_sent_sender.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            data_send.flush().await.ok();
+        }
+    });
+
+    // Phase 4: State for sync
     let mut reconciliation_done = false;
     let mut rounds = 0;
-    let mut idle_count = 0;
-    const MAX_IDLE: u32 = 100;
+    let mut peer_done = false;
+    let mut peer_done_time: Option<std::time::Instant> = None;
+    let mut last_event_time: Option<std::time::Instant> = None;
+    let mut sent_done = false;
 
-    // Queue of event IDs to send (from HaveList requests) - store IDs, not blobs!
+    // Queue of event IDs to send (from HaveList)
     let mut send_queue: Vec<EventId> = Vec::new();
+    let mut send_idx: usize = 0;
 
+    // Main loop using select! for true concurrent I/O
     loop {
         if start.elapsed() >= timeout {
-            warn!("Timeout");
+            warn!("Timeout after {:?}", start.elapsed());
             break;
         }
 
-        if reconciliation_done && send_queue.is_empty() && idle_count >= MAX_IDLE {
+        let all_sent = send_idx >= send_queue.len();
+        // Exit conditions:
+        // 1. Reconciliation is done
+        // 2. We've sent all our events
+        // 3. Peer signaled done
+        // 4. Either no events for 100ms (stream drained) OR waited 500ms after peer done
+        // Note: stream_quiet defaults to false (not true) - if we haven't received events yet, keep waiting
+        let stream_quiet = last_event_time.map_or(false, |t| t.elapsed() > Duration::from_millis(100));
+        let peer_wait_done = peer_done_time.map_or(false, |t| t.elapsed() > Duration::from_millis(500));
+        if reconciliation_done && all_sent && peer_done && (stream_quiet || peer_wait_done) {
+            info!("Sync complete: sent {}, received {}", events_sent.load(Ordering::Relaxed), events_received.load(Ordering::Relaxed));
             break;
         }
 
-        // First: check control stream (non-blocking)
-        match tokio::time::timeout(Duration::from_millis(1), conn.control.recv()).await {
-            Ok(Ok(SyncMessage::NegOpen { msg })) | Ok(Ok(SyncMessage::NegMsg { msg })) => {
-                idle_count = 0;
-                rounds += 1;
-
-                let response = neg.reconcile(&msg)?;
-                if response.is_empty() {
-                    info!("Reconciliation complete in {} rounds", rounds);
-                    reconciliation_done = true;
-                } else {
-                    conn.send_control(&SyncMessage::NegMsg { msg: response }).await?;
-                    conn.flush_control().await?;
-                }
-            }
-            Ok(Ok(SyncMessage::HaveList { ids })) => {
-                // Ignore empty HaveList (used for stream establishment)
-                if ids.is_empty() {
-                    continue;
-                }
-                idle_count = 0;
-                reconciliation_done = true;
-
-                // Queue event IDs for sending (blobs fetched on-demand)
-                for id in ids {
-                    send_queue.push(id);
-                }
-            }
-            Ok(Ok(_)) => {}
-            Ok(Err(transport::connection::ConnectionError::Closed)) => {
-                info!("Control stream closed by peer");
-                break;
-            }
-            Ok(Err(e)) => {
-                warn!("Control stream error: {}", e);
-                break;
-            }
-            Err(_) => {} // Timeout
+        // Progress log every 5 seconds
+        if start.elapsed().as_secs() % 5 == 0 && start.elapsed().subsec_millis() < 10 {
+            info!("Responder progress: sent={}/{}, recv={}, recon={}, peer_done={}",
+                send_idx, send_queue.len(), events_received.load(Ordering::Relaxed), reconciliation_done, peer_done);
         }
 
-        // Second: drain data stream with send().await for backpressure
-        loop {
-            match tokio::time::timeout(Duration::from_millis(1), conn.data.recv()).await {
-                Ok(Ok(SyncMessage::Event { blob })) => {
-                    idle_count = 0;
-                    let event_id = hash_event(&blob);
-                    // send().await - blocks if channel is full (backpressure)
-                    if ingest_tx.send((event_id, blob)).await.is_err() {
-                        warn!("Ingest channel closed");
-                        break;
+        let has_pending_send = !send_queue.is_empty() && send_idx < send_queue.len();
+
+        tokio::select! {
+            biased;
+
+            // Timeout to prevent blocking
+            _ = tokio::time::sleep(Duration::from_millis(1)) => {
+                // Continue to send code below
+            }
+
+            ctrl_result = ctrl_recv.recv() => {
+                match ctrl_result {
+                    Ok(SyncMessage::NegOpen { msg }) | Ok(SyncMessage::NegMsg { msg }) => {
+                        rounds += 1;
+                        let response = neg.reconcile(&msg)?;
+                        if response.is_empty() {
+                            info!("Reconciliation complete in {} rounds", rounds);
+                            reconciliation_done = true;
+                        } else {
+                            ctrl_send.send(&SyncMessage::NegMsg { msg: response }).await?;
+                            ctrl_send.flush().await?;
+                        }
                     }
-                }
-                Ok(Ok(_)) => {}
-                Ok(Err(transport::connection::ConnectionError::Closed)) => {
-                    info!("Data stream closed by peer");
-                    break;
-                }
-                Ok(Err(e)) => {
-                    warn!("Data stream error: {}", e);
-                    break;
-                }
-                Err(_) => break, // Timeout - no more pending
-            }
-        }
-
-        // Third: send a batch from queue on data stream (fetch blobs on-demand)
-        let mut sent_this_round = 0;
-        while let Some(event_id) = send_queue.pop() {
-            // Fetch blob from SQLite (no cache)
-            if let Ok(Some(blob)) = store.get(&event_id) {
-                if conn.send_data(&SyncMessage::Event { blob }).await.is_ok() {
-                    events_sent += 1;
-                    sent_this_round += 1;
-                    if sent_this_round >= 500 {
+                    Ok(SyncMessage::HaveList { ids }) => {
+                        if ids.is_empty() {
+                            peer_done = true;
+                            peer_done_time = Some(std::time::Instant::now());
+                        } else {
+                            reconciliation_done = true;
+                            for id in ids {
+                                send_queue.push(id);
+                            }
+                            info!("Received HaveList with {} items", send_queue.len() - send_idx);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(transport::connection::ConnectionError::Closed) => {
+                        peer_done = true;
+                        peer_done_time = Some(std::time::Instant::now());
+                    }
+                    Err(e) => {
+                        warn!("Control error: {}", e);
                         break;
                     }
                 }
             }
+
+            data_result = data_recv.recv() => {
+                match data_result {
+                    Ok(SyncMessage::Event { blob }) => {
+                        last_event_time = Some(std::time::Instant::now());
+                        let event_id = hash_event(&blob);
+                        if ingest_tx.send((event_id, blob)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(transport::connection::ConnectionError::Closed) => {
+                        peer_done = true;
+                        peer_done_time = Some(std::time::Instant::now());
+                    }
+                    Err(e) => {
+                        warn!("Data error: {}", e);
+                        break;
+                    }
+                }
+            }
+
         }
 
-        if sent_this_round > 0 {
-            let _ = conn.flush_data().await;
-            idle_count = 0;
-        } else if reconciliation_done {
-            idle_count += 1;
+        // Queue events to sender task (non-blocking via channel)
+        if has_pending_send {
+            let batch_end = (send_idx + 100).min(send_queue.len());
+            while send_idx < batch_end {
+                let event_id = &send_queue[send_idx];
+                if let Ok(Some(blob)) = store.get(event_id) {
+                    if send_tx.try_send(blob).is_err() {
+                        break; // Channel full, try again next iteration
+                    }
+                }
+                send_idx += 1;
+            }
+        }
+
+        // Signal done when we've sent all our events
+        if reconciliation_done && all_sent && !sent_done {
+            ctrl_send.send(&SyncMessage::HaveList { ids: vec![] }).await.ok();
+            ctrl_send.flush().await.ok();
+            sent_done = true;
         }
     }
 
+    // Send done signal if not already sent
+    if !sent_done {
+        ctrl_send.send(&SyncMessage::HaveList { ids: vec![] }).await.ok();
+        ctrl_send.flush().await.ok();
+    }
+
+    // Cleanup: close channels and wait for tasks
+    drop(send_tx);
     drop(ingest_tx);
+    let _ = sender_handle.await;
     let _ = writer_handle.await;
 
     let stats = SyncStats {
-        events_sent,
+        events_sent: events_sent.load(Ordering::Relaxed),
         events_received: events_received.load(Ordering::Relaxed),
         neg_rounds: rounds,
     };

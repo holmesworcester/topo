@@ -4,11 +4,30 @@ use tokio::io::AsyncWriteExt;
 use crate::sync::{parse_sync_message, encode_sync_message, SyncMessage};
 use crate::sync::protocol::ParseError;
 
+/// Send half of a connection
+pub struct SendHalf {
+    send: SendStream,
+}
+
+/// Receive half of a connection
+pub struct RecvHalf {
+    recv: RecvStream,
+    recv_buffer: Vec<u8>,
+}
+
 /// Bidirectional QUIC stream wrapper for sync protocol
 pub struct Connection {
     send: SendStream,
     recv: RecvStream,
     recv_buffer: Vec<u8>,
+}
+
+/// Split connection for concurrent send/recv in select!
+pub struct SplitDualConnection {
+    pub control_send: SendHalf,
+    pub control_recv: RecvHalf,
+    pub data_send: SendHalf,
+    pub data_recv: RecvHalf,
 }
 
 /// Dual-stream connection for separating control and data planes
@@ -36,6 +55,18 @@ impl DualConnection {
         }
     }
 
+    /// Split into separate send/recv halves for use with select!
+    pub fn split(self) -> SplitDualConnection {
+        let (ctrl_send, ctrl_recv) = self.control.split();
+        let (data_send, data_recv) = self.data.split();
+        SplitDualConnection {
+            control_send: ctrl_send,
+            control_recv: ctrl_recv,
+            data_send: data_send,
+            data_recv: data_recv,
+        }
+    }
+
     /// Send a control message (NegOpen, NegMsg, HaveList)
     pub async fn send_control(&mut self, msg: &SyncMessage) -> Result<(), ConnectionError> {
         self.control.send(msg).await
@@ -57,6 +88,49 @@ impl DualConnection {
     }
 }
 
+impl SendHalf {
+    /// Send a sync message
+    pub async fn send(&mut self, msg: &SyncMessage) -> Result<(), ConnectionError> {
+        let data = encode_sync_message(msg);
+        self.send.write_all(&data).await?;
+        Ok(())
+    }
+
+    /// Flush the send buffer
+    pub async fn flush(&mut self) -> Result<(), ConnectionError> {
+        self.send.flush().await?;
+        Ok(())
+    }
+}
+
+impl RecvHalf {
+    /// Receive a sync message (blocking)
+    pub async fn recv(&mut self) -> Result<SyncMessage, ConnectionError> {
+        loop {
+            if !self.recv_buffer.is_empty() {
+                match parse_sync_message(&self.recv_buffer) {
+                    Ok((msg, consumed)) => {
+                        self.recv_buffer.drain(..consumed);
+                        return Ok(msg);
+                    }
+                    Err(ParseError::InsufficientData) => {}
+                    Err(e) => return Err(ConnectionError::Parse(e)),
+                }
+            }
+
+            let mut buf = [0u8; 4096];
+            let chunk = self.recv.read(&mut buf).await?;
+
+            match chunk {
+                Some(n) if n > 0 => {
+                    self.recv_buffer.extend_from_slice(&buf[..n]);
+                }
+                _ => return Err(ConnectionError::Closed),
+            }
+        }
+    }
+}
+
 impl Connection {
     /// Create a new connection from quinn streams
     pub fn new(send: SendStream, recv: RecvStream) -> Self {
@@ -65,6 +139,14 @@ impl Connection {
             recv,
             recv_buffer: Vec::with_capacity(4096),
         }
+    }
+
+    /// Split into send and receive halves for concurrent use
+    pub fn split(self) -> (SendHalf, RecvHalf) {
+        (
+            SendHalf { send: self.send },
+            RecvHalf { recv: self.recv, recv_buffer: self.recv_buffer },
+        )
     }
 
     /// Send a sync message
@@ -113,7 +195,6 @@ impl Connection {
             }
         }
     }
-
 }
 
 #[derive(Debug)]

@@ -1,9 +1,11 @@
 use crate::wire::ENVELOPE_SIZE;
-use super::{MSG_TYPE_NEG_OPEN, MSG_TYPE_NEG_MSG, MSG_TYPE_HAVE_LIST, MSG_TYPE_EVENT, EVENT_SIZE};
+use super::{MSG_TYPE_PING, MSG_TYPE_NEG_OPEN, MSG_TYPE_NEG_MSG, MSG_TYPE_HAVE_LIST, MSG_TYPE_EVENT, EVENT_SIZE};
 
 /// Sync protocol messages
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncMessage {
+    /// Stream establishment / keep-alive ping
+    Ping,
     /// Initial negentropy reconciliation message
     NegOpen { msg: Vec<u8> },
     /// Negentropy reconciliation response
@@ -24,6 +26,10 @@ pub fn parse_sync_message(input: &[u8]) -> Result<(SyncMessage, usize), ParseErr
     let msg_type = input[0];
 
     match msg_type {
+        MSG_TYPE_PING => {
+            // Fixed size: type(1)
+            Ok((SyncMessage::Ping, 1))
+        }
         MSG_TYPE_NEG_OPEN | MSG_TYPE_NEG_MSG => {
             // Variable length: type(1) + len(4) + data(len)
             if input.len() < 5 {
@@ -75,6 +81,9 @@ pub fn parse_sync_message(input: &[u8]) -> Result<(SyncMessage, usize), ParseErr
 /// Encode a sync message to bytes
 pub fn encode_sync_message(msg: &SyncMessage) -> Vec<u8> {
     match msg {
+        SyncMessage::Ping => {
+            vec![MSG_TYPE_PING]
+        }
         SyncMessage::NegOpen { msg: data } => {
             let mut buf = Vec::with_capacity(5 + data.len());
             buf.push(MSG_TYPE_NEG_OPEN);
