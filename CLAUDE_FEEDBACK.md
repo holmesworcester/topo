@@ -1,24 +1,25 @@
 # Feedback on NEGENTROPY_SQLITE_PLAN.md (v3)
 
-## Status: APPROVED - Ready to Implement
+## Status: IMPLEMENTED
 
-All questions resolved by plan updates:
+### Completed Steps
 
-1. **32-byte IDs**: Core Decision #7 confirms alignment with negentropy::Id
-2. **Send timing**: Section 5 clarifies "Send during reconciliation" - don't wait
-3. **neg_blocks rebuild**: No OFFSET fallback - rebuild required before negentropy when `needs_rebuild=1`
-4. **Projection decoupling**: Ingest worker vs projection worker architecture clear
+1. ✅ Add `neg_items`, `neg_blocks`, `neg_meta` tables to schema
+2. ✅ Modify ingestion to populate `neg_items` (raw 32-byte blob id)
+3. ✅ Implement `NegentropyStorageSqlite` with block index (B=4096)
+4. ✅ Add two QUIC streams (control + data) via DualConnection
+5. ✅ Refactor sync loops with sequential control/data handling
+6. ✅ Replace `try_send` with `send().await` on ingest channel (5000 capacity)
+7. ⏸️ Decouple projection - DEFERRED (current inline projection works)
+8. ✅ Remove blob prefetch, use SQLite-backed negentropy
 
-## Implementation Order
+### Key Changes
 
-1. Add `neg_items`, `neg_blocks`, `neg_meta` tables to schema
-2. Modify ingestion to populate `neg_items` (raw 32-byte blob id)
-3. Implement `NegentropyStorageSqlite` with block index
-4. Add two QUIC streams (control + data)
-5. Refactor sync loops with dedicated sender/receiver tasks
-6. Replace `try_send` with `send().await` on ingest channel
-7. Decouple projection (incoming_queue consumer runs independently)
-8. Remove blob prefetch
-9. Test at scale (50k, 200k, 500k)
+- **Memory**: O(1) instead of O(n) for blob storage
+- **Backpressure**: `send().await` instead of `try_send` (no dropped events)
+- **Streams**: Control (NegOpen/NegMsg/HaveList) and Data (Event) separated
+- **Storage**: `NegentropyStorageSqlite` with block index for efficient queries
 
-Starting implementation.
+### Remaining
+
+9. Test at scale (50k, 200k, 500k) - requires QUIC network access
