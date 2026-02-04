@@ -229,7 +229,13 @@ async fn run_client(
     let (control_send, control_recv) = connection.open_bi().await?;
     let (data_send, data_recv) = connection.open_bi().await?;
     let mut conn = DualConnection::new(control_send, control_recv, data_send, data_recv);
-    info!("Opened control and data streams");
+
+    // Send markers on both streams to establish them (QUIC streams are lazy)
+    conn.control.send(&SyncMessage::HaveList { ids: vec![] }).await?;
+    conn.data.send(&SyncMessage::HaveList { ids: vec![] }).await?;
+    conn.flush_control().await?;
+    conn.flush_data().await?;
+    info!("Opened and established control and data streams");
 
     // Run sync as initiator (client starts the reconciliation)
     run_sync_initiator_dual(&mut conn, db_path, timeout_secs).await?;
@@ -852,6 +858,12 @@ async fn run_sync_initiator_dual(
                         conn.flush_control().await?;
                     }
                     None => {
+                        // Deduplicate IDs (negentropy accumulates across rounds, may have duplicates)
+                        let have_set: HashSet<_> = have_ids.iter().cloned().collect();
+                        let need_set: HashSet<_> = need_ids.iter().cloned().collect();
+                        have_ids = have_set.into_iter().collect();
+                        need_ids = need_set.into_iter().collect();
+
                         info!("Reconciliation complete in {} rounds: {} have, {} need",
                             rounds, have_ids.len(), need_ids.len());
                         reconciliation_done = true;
@@ -1035,6 +1047,10 @@ async fn run_sync_responder_dual(
                 }
             }
             Ok(Ok(SyncMessage::HaveList { ids })) => {
+                // Ignore empty HaveList (used for stream establishment)
+                if ids.is_empty() {
+                    continue;
+                }
                 idle_count = 0;
                 reconciliation_done = true;
 

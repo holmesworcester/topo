@@ -386,4 +386,92 @@ mod tests {
 
         assert_eq!(items.len(), 20);
     }
+
+    #[test]
+    fn test_same_timestamp_items() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+
+        // Insert items with SAME timestamp but different IDs (simulates rapid event generation)
+        let mut stmt = conn.prepare(
+            "INSERT INTO neg_items (ts, id) VALUES (?, ?)"
+        ).unwrap();
+
+        let ts = 1000i64; // Same timestamp for all
+        for i in 0..100 {
+            let mut id = [0u8; 32];
+            id[0..8].copy_from_slice(&(i as u64).to_le_bytes());
+            stmt.execute(rusqlite::params![ts, id.as_slice()]).unwrap();
+        }
+
+        let storage = NegentropyStorageSqlite::new(&conn);
+        storage.rebuild_blocks().unwrap();
+
+        // Verify all items are accessible
+        assert_eq!(storage.size().unwrap(), 100);
+
+        // Iterate all items
+        let mut count = 0;
+        storage.iterate(0, 100, &mut |_item, _idx| {
+            count += 1;
+            Ok(true)
+        }).unwrap();
+        assert_eq!(count, 100, "Should iterate all 100 items with same timestamp");
+
+        // Test find_lower_bound with items that have same ts but different id
+        let mut id50 = [0u8; 32];
+        id50[0..8].copy_from_slice(&50u64.to_le_bytes());
+        let bound = Bound {
+            item: Item::with_timestamp_and_id(1000, Id::from_byte_array(id50)),
+            id_len: 32,
+        };
+        let pos = storage.find_lower_bound(0, 100, &bound);
+        assert_eq!(pos, 50, "Should find item 50 at position 50");
+    }
+
+    /// Test that compares SQLite storage with in-memory storage
+    #[test]
+    fn test_compare_with_inmemory() {
+        use negentropy::NegentropyStorageVector;
+
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+
+        // Insert items with same timestamp pattern as real events
+        let mut stmt = conn.prepare(
+            "INSERT INTO neg_items (ts, id) VALUES (?, ?)"
+        ).unwrap();
+
+        let mut inmem = NegentropyStorageVector::with_capacity(1000);
+
+        // Use timestamps that cluster (like real rapid event generation)
+        for i in 0..1000 {
+            let ts = (i / 10) as i64; // 10 items per timestamp
+            let mut id = [0u8; 32];
+            id[0..8].copy_from_slice(&(i as u64).to_le_bytes());
+            stmt.execute(rusqlite::params![ts, id.as_slice()]).unwrap();
+            inmem.insert(ts as u64, Id::from_byte_array(id)).unwrap();
+        }
+        inmem.seal().unwrap();
+
+        let sqlite_storage = NegentropyStorageSqlite::new(&conn);
+        sqlite_storage.rebuild_blocks().unwrap();
+
+        // Compare sizes
+        assert_eq!(sqlite_storage.size().unwrap(), inmem.size().unwrap());
+
+        // Compare all items
+        for i in 0..1000 {
+            let sqlite_item = sqlite_storage.get_item(i).unwrap().unwrap();
+            let inmem_item = inmem.get_item(i).unwrap().unwrap();
+            assert_eq!(
+                sqlite_item.timestamp, inmem_item.timestamp,
+                "Timestamp mismatch at index {}", i
+            );
+            assert_eq!(
+                sqlite_item.id, inmem_item.id,
+                "ID mismatch at index {}", i
+            );
+        }
+    }
 }
