@@ -740,6 +740,11 @@ async fn run_sync_responder(
 /// Run sync as the initiator (client role) with dual streams
 /// Control stream: NegOpen, NegMsg, HaveList
 /// Data stream: Event blobs
+///
+/// Architecture:
+/// - Main task: control stream (negentropy) + data sending
+/// - Data receiver task: receives events, send().await for backpressure
+/// - Ingest worker (spawn_blocking): batch writes to SQLite
 async fn run_sync_initiator_dual(
     conn: &mut DualConnection,
     db_path: &str,
@@ -768,17 +773,19 @@ async fn run_sync_initiator_dual(
     info!("Prefetched {} blobs into cache", blob_cache.len());
     drop(db);
 
-    // Phase 2: Set up channel for incoming events
-    let (tx, rx) = mpsc::channel::<(EventId, Vec<u8>)>(100_000);
+    // Phase 2: Set up bounded ingest channel (small for memory efficiency)
+    // send().await provides backpressure when writer is slow
+    let (ingest_tx, ingest_rx) = mpsc::channel::<(EventId, Vec<u8>)>(5000);
     let events_received = Arc::new(AtomicU64::new(0));
     let events_received_writer = events_received.clone();
 
+    // Spawn ingest worker (writes to SQLite)
     let db_path_owned = db_path.to_string();
     let writer_handle = tokio::task::spawn_blocking(move || {
-        batch_writer(db_path_owned, rx, events_received_writer)
+        batch_writer(db_path_owned, ingest_rx, events_received_writer)
     });
 
-    // Phase 3: Network I/O with dual streams
+    // Phase 3: Network I/O with dedicated tasks
     let mut have_ids: Vec<Id> = Vec::new();
     let mut need_ids: Vec<Id> = Vec::new();
     let mut have_sent: HashSet<EventId> = HashSet::new();
@@ -793,66 +800,67 @@ async fn run_sync_initiator_dual(
     let mut reconciliation_done = false;
     let mut rounds = 0;
 
+    // Main loop: handle control + send data
+    // Data receiving happens inline but uses send().await for backpressure
     loop {
         if start.elapsed() >= timeout {
             warn!("Timeout");
             break;
         }
 
-        // Receive from both streams using select!
-        tokio::select! {
-            biased;
-
-            // Control stream: NegMsg responses
-            result = tokio::time::timeout(Duration::from_millis(1), conn.control.recv()) => {
-                match result {
-                    Ok(Ok(SyncMessage::NegMsg { msg })) => {
-                        rounds += 1;
-                        match neg.reconcile_with_ids(&msg, &mut have_ids, &mut need_ids)? {
-                            Some(next_msg) => {
-                                conn.send_control(&SyncMessage::NegMsg { msg: next_msg }).await?;
-                                conn.flush_control().await?;
-                            }
-                            None => {
-                                info!("Reconciliation complete in {} rounds: {} have, {} need",
-                                    rounds, have_ids.len(), need_ids.len());
-                                reconciliation_done = true;
-                            }
-                        }
+        // First: check control stream for negentropy messages (non-blocking)
+        match tokio::time::timeout(Duration::from_millis(1), conn.control.recv()).await {
+            Ok(Ok(SyncMessage::NegMsg { msg })) => {
+                rounds += 1;
+                match neg.reconcile_with_ids(&msg, &mut have_ids, &mut need_ids)? {
+                    Some(next_msg) => {
+                        conn.send_control(&SyncMessage::NegMsg { msg: next_msg }).await?;
+                        conn.flush_control().await?;
                     }
-                    Ok(Ok(_)) => {}
-                    Ok(Err(transport::connection::ConnectionError::Closed)) => {
-                        info!("Control stream closed by peer");
-                        break;
+                    None => {
+                        info!("Reconciliation complete in {} rounds: {} have, {} need",
+                            rounds, have_ids.len(), need_ids.len());
+                        reconciliation_done = true;
                     }
-                    Ok(Err(e)) => {
-                        warn!("Control stream error: {}", e);
-                        break;
-                    }
-                    Err(_) => {} // Timeout
                 }
             }
+            Ok(Ok(_)) => {}
+            Ok(Err(transport::connection::ConnectionError::Closed)) => {
+                info!("Control stream closed by peer");
+                break;
+            }
+            Ok(Err(e)) => {
+                warn!("Control stream error: {}", e);
+                break;
+            }
+            Err(_) => {} // Timeout
+        }
 
-            // Data stream: incoming events
-            result = tokio::time::timeout(Duration::from_millis(1), conn.data.recv()) => {
-                match result {
-                    Ok(Ok(SyncMessage::Event { blob })) => {
-                        let event_id = hash_event(&blob);
-                        let _ = tx.try_send((event_id, blob));
+        // Second: drain data stream, using send().await for backpressure
+        loop {
+            match tokio::time::timeout(Duration::from_millis(1), conn.data.recv()).await {
+                Ok(Ok(SyncMessage::Event { blob })) => {
+                    let event_id = hash_event(&blob);
+                    // send().await - blocks if channel is full (backpressure)
+                    if ingest_tx.send((event_id, blob)).await.is_err() {
+                        warn!("Ingest channel closed");
+                        break;
                     }
-                    Ok(Ok(_)) => {}
-                    Ok(Err(transport::connection::ConnectionError::Closed)) => {
-                        info!("Data stream closed by peer");
-                    }
-                    Ok(Err(e)) => {
-                        warn!("Data stream error: {}", e);
-                    }
-                    Err(_) => {} // Timeout
                 }
+                Ok(Ok(_)) => {}
+                Ok(Err(transport::connection::ConnectionError::Closed)) => {
+                    info!("Data stream closed by peer");
+                    break;
+                }
+                Ok(Err(e)) => {
+                    warn!("Data stream error: {}", e);
+                    break;
+                }
+                Err(_) => break, // Timeout - no more pending
             }
         }
 
-        // Send a batch of events on data stream
+        // Third: send a batch of events on data stream
         let mut sent_this_round = 0;
         for neg_id in &have_ids {
             let event_id = neg_id_to_event_id(neg_id);
@@ -872,7 +880,7 @@ async fn run_sync_initiator_dual(
             }
         }
 
-        // Send HaveList for events we need on control stream
+        // Fourth: send HaveList for events we need on control stream
         let mut new_needs: Vec<EventId> = Vec::new();
         for neg_id in &need_ids {
             let event_id = neg_id_to_event_id(neg_id);
@@ -901,7 +909,7 @@ async fn run_sync_initiator_dual(
         }
     }
 
-    drop(tx);
+    drop(ingest_tx);
     let _ = writer_handle.await;
 
     let stats = SyncStats {
@@ -914,6 +922,11 @@ async fn run_sync_initiator_dual(
 }
 
 /// Run sync as the responder (server role) with dual streams
+///
+/// Architecture:
+/// - Main task: control stream (negentropy) + data sending
+/// - Ingest worker (spawn_blocking): batch writes to SQLite
+/// - Uses send().await for backpressure on ingest channel
 async fn run_sync_responder_dual(
     conn: &mut DualConnection,
     db_path: &str,
@@ -942,14 +955,14 @@ async fn run_sync_responder_dual(
     info!("Prefetched {} blobs into cache", blob_cache.len());
     drop(db);
 
-    // Phase 2: Set up channel for incoming events
-    let (tx, rx) = mpsc::channel::<(EventId, Vec<u8>)>(100_000);
+    // Phase 2: Set up bounded ingest channel (small for memory efficiency)
+    let (ingest_tx, ingest_rx) = mpsc::channel::<(EventId, Vec<u8>)>(5000);
     let events_received = Arc::new(AtomicU64::new(0));
     let events_received_writer = events_received.clone();
 
     let db_path_owned = db_path.to_string();
     let writer_handle = tokio::task::spawn_blocking(move || {
-        batch_writer(db_path_owned, rx, events_received_writer)
+        batch_writer(db_path_owned, ingest_rx, events_received_writer)
     });
 
     // Phase 3: Network I/O loop with dual streams
@@ -972,71 +985,70 @@ async fn run_sync_responder_dual(
             break;
         }
 
-        // Receive from both streams using select!
-        tokio::select! {
-            biased;
+        // First: check control stream (non-blocking)
+        match tokio::time::timeout(Duration::from_millis(1), conn.control.recv()).await {
+            Ok(Ok(SyncMessage::NegOpen { msg })) | Ok(Ok(SyncMessage::NegMsg { msg })) => {
+                idle_count = 0;
+                rounds += 1;
 
-            // Control stream: NegOpen, NegMsg, HaveList
-            result = tokio::time::timeout(Duration::from_millis(1), conn.control.recv()) => {
-                match result {
-                    Ok(Ok(SyncMessage::NegOpen { msg })) | Ok(Ok(SyncMessage::NegMsg { msg })) => {
-                        idle_count = 0;
-                        rounds += 1;
-
-                        let response = neg.reconcile(&msg)?;
-                        if response.is_empty() {
-                            info!("Reconciliation complete in {} rounds", rounds);
-                            reconciliation_done = true;
-                        } else {
-                            conn.send_control(&SyncMessage::NegMsg { msg: response }).await?;
-                            conn.flush_control().await?;
-                        }
-                    }
-                    Ok(Ok(SyncMessage::HaveList { ids })) => {
-                        idle_count = 0;
-                        reconciliation_done = true;
-
-                        // Queue events for sending on data stream
-                        for id in &ids {
-                            if let Some(blob) = blob_cache.get(id) {
-                                send_queue.push(blob.clone());
-                            }
-                        }
-                    }
-                    Ok(Ok(_)) => {}
-                    Ok(Err(transport::connection::ConnectionError::Closed)) => {
-                        info!("Control stream closed by peer");
-                        break;
-                    }
-                    Ok(Err(e)) => {
-                        warn!("Control stream error: {}", e);
-                        break;
-                    }
-                    Err(_) => {} // Timeout
+                let response = neg.reconcile(&msg)?;
+                if response.is_empty() {
+                    info!("Reconciliation complete in {} rounds", rounds);
+                    reconciliation_done = true;
+                } else {
+                    conn.send_control(&SyncMessage::NegMsg { msg: response }).await?;
+                    conn.flush_control().await?;
                 }
             }
+            Ok(Ok(SyncMessage::HaveList { ids })) => {
+                idle_count = 0;
+                reconciliation_done = true;
 
-            // Data stream: incoming events
-            result = tokio::time::timeout(Duration::from_millis(1), conn.data.recv()) => {
-                match result {
-                    Ok(Ok(SyncMessage::Event { blob })) => {
-                        idle_count = 0;
-                        let event_id = hash_event(&blob);
-                        let _ = tx.try_send((event_id, blob));
+                // Queue events for sending on data stream
+                for id in &ids {
+                    if let Some(blob) = blob_cache.get(id) {
+                        send_queue.push(blob.clone());
                     }
-                    Ok(Ok(_)) => {}
-                    Ok(Err(transport::connection::ConnectionError::Closed)) => {
-                        info!("Data stream closed by peer");
-                    }
-                    Ok(Err(e)) => {
-                        warn!("Data stream error: {}", e);
-                    }
-                    Err(_) => {} // Timeout
                 }
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(transport::connection::ConnectionError::Closed)) => {
+                info!("Control stream closed by peer");
+                break;
+            }
+            Ok(Err(e)) => {
+                warn!("Control stream error: {}", e);
+                break;
+            }
+            Err(_) => {} // Timeout
+        }
+
+        // Second: drain data stream with send().await for backpressure
+        loop {
+            match tokio::time::timeout(Duration::from_millis(1), conn.data.recv()).await {
+                Ok(Ok(SyncMessage::Event { blob })) => {
+                    idle_count = 0;
+                    let event_id = hash_event(&blob);
+                    // send().await - blocks if channel is full (backpressure)
+                    if ingest_tx.send((event_id, blob)).await.is_err() {
+                        warn!("Ingest channel closed");
+                        break;
+                    }
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(transport::connection::ConnectionError::Closed)) => {
+                    info!("Data stream closed by peer");
+                    break;
+                }
+                Ok(Err(e)) => {
+                    warn!("Data stream error: {}", e);
+                    break;
+                }
+                Err(_) => break, // Timeout - no more pending
             }
         }
 
-        // Send a batch from queue on data stream
+        // Third: send a batch from queue on data stream
         let mut sent_this_round = 0;
         while let Some(blob) = send_queue.pop() {
             if conn.send_data(&SyncMessage::Event { blob }).await.is_ok() {
@@ -1056,7 +1068,7 @@ async fn run_sync_responder_dual(
         }
     }
 
-    drop(tx);
+    drop(ingest_tx);
     let _ = writer_handle.await;
 
     let stats = SyncStats {
