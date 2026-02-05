@@ -6,10 +6,11 @@ pub use cert::{generate_keypair, generate_self_signed_cert};
 pub use connection::{DualConnection, StreamConn};
 pub use sim::{create_sim_pair, SimConfig, SimConnection};
 
-use quinn::{ClientConfig, Endpoint, ServerConfig};
+use quinn::{ClientConfig, Endpoint, ServerConfig, TransportConfig};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Create a QUIC server endpoint
 pub fn create_server_endpoint(
@@ -21,9 +22,15 @@ pub fn create_server_endpoint(
         .with_no_client_auth()
         .with_single_cert(vec![cert_der], key_der.into())?;
 
-    let server_config = ServerConfig::with_crypto(Arc::new(
+    let mut server_config = ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)?,
     ));
+
+    // Configure longer idle timeout for sync operations
+    let mut transport = TransportConfig::default();
+    transport.max_idle_timeout(Some(Duration::from_secs(300).try_into().unwrap()));
+    transport.keep_alive_interval(Some(Duration::from_secs(10)));
+    server_config.transport_config(Arc::new(transport));
 
     let endpoint = Endpoint::server(server_config, bind_addr)?;
     Ok(endpoint)
@@ -39,9 +46,15 @@ pub fn create_client_endpoint(
         .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
         .with_no_client_auth();
 
-    let client_config = ClientConfig::new(Arc::new(
+    let mut client_config = ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?,
     ));
+
+    // Configure longer idle timeout for sync operations
+    let mut transport = TransportConfig::default();
+    transport.max_idle_timeout(Some(Duration::from_secs(300).try_into().unwrap()));
+    transport.keep_alive_interval(Some(Duration::from_secs(10)));
+    client_config.transport_config(Arc::new(transport));
 
     let mut endpoint = Endpoint::client(bind_addr)?;
     endpoint.set_default_client_config(client_config);
