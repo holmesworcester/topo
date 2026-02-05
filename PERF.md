@@ -40,6 +40,11 @@ Notes:
 | 500,000 | 0 | 3.74 | 107.87 MB |
 | 500,000 | 1 | 3.71 | 63.02 MB |
 
+## Projection Tradeoff
+- Decoupled projection improves sync throughput versus inline projection, especially at higher event counts.
+- The tradeoff is higher RSS: the projection worker and queue add memory overhead.
+- If memory is tighter than throughput, consider inline projection or reducing queue sizes.
+
 ## Memory Notes (24MB Target)
 - The biggest memory consumer is the in-flight event queue.
 - The sim runs both peers in one process, so RSS is roughly doubled.
