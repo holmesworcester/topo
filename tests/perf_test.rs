@@ -75,7 +75,7 @@ fn run_generate(db: &str, events: usize, channel: &str) -> bool {
         "generate",
         "--db",
         db,
-        "--events",
+        "--count",
         &events.to_string(),
         "--channel",
         channel,
@@ -176,27 +176,7 @@ fn perf_sim_throughput_10k() {
     assert!(run_generate("sim_server.db", 10_000, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
     assert!(run_generate("sim_client.db", 10_000, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
 
-    let mut cmd = Command::new("cargo");
-    cmd.args([
-        "run",
-        "--release",
-        "--",
-        "sim",
-        "--events",
-        "10000",
-        "--timeout",
-        "30",
-        "--latency-ms",
-        "10",
-        "--bandwidth-kib",
-        "50000",
-        "--no-generate",
-    ]);
-    let output = cmd.output().ok().map(|o| {
-        let stdout = String::from_utf8_lossy(&o.stdout);
-        let stderr = String::from_utf8_lossy(&o.stderr);
-        format!("{}{}", stdout, stderr)
-    }).unwrap_or_default();
+    let output = run_sim(10_000, 30, 10, 50_000).unwrap_or_default();
     println!("{}", output);
     assert!(output.contains("Throughput"), "Expected throughput output");
     assert!(output.contains("Peak RSS"), "Expected peak RSS output");

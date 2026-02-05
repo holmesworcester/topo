@@ -13,9 +13,33 @@ pub trait StreamConn {
     async fn recv(&mut self) -> Result<SyncMessage, ConnectionError>;
 }
 
+/// Async send-only stream abstraction for data plane.
+#[async_trait]
+pub trait StreamSend {
+    async fn send(&mut self, msg: &SyncMessage) -> Result<(), ConnectionError>;
+    async fn flush(&mut self) -> Result<(), ConnectionError>;
+}
+
+/// Async recv-only stream abstraction for data plane.
+#[async_trait]
+pub trait StreamRecv {
+    async fn recv(&mut self) -> Result<SyncMessage, ConnectionError>;
+}
+
 /// Bidirectional QUIC stream wrapper for sync protocol
 pub struct Connection {
     send: SendStream,
+    recv: RecvStream,
+    recv_buffer: Vec<u8>,
+}
+
+/// Send-only QUIC stream wrapper
+pub struct SendConnection {
+    send: SendStream,
+}
+
+/// Recv-only QUIC stream wrapper
+pub struct RecvConnection {
     recv: RecvStream,
     recv_buffer: Vec<u8>,
 }
@@ -26,13 +50,14 @@ pub struct Connection {
 /// Data stream: Event blobs
 ///
 /// This prevents large event transfers from blocking control messages.
-pub struct DualConnection<T: StreamConn = Connection> {
-    pub control: T,
-    pub data: T,
+pub struct DualConnection<C: StreamConn = Connection, S: StreamSend = SendConnection, R: StreamRecv = RecvConnection> {
+    pub control: C,
+    pub data_send: S,
+    pub data_recv: R,
 }
 
-impl DualConnection<Connection> {
-    /// Create from two stream pairs (control first, data second)
+impl DualConnection<Connection, SendConnection, RecvConnection> {
+    /// Create from two bi-directional stream pairs (control first, data second)
     pub fn new(
         control_send: SendStream,
         control_recv: RecvStream,
@@ -41,22 +66,13 @@ impl DualConnection<Connection> {
     ) -> Self {
         Self {
             control: Connection::new(control_send, control_recv),
-            data: Connection::new(data_send, data_recv),
+            data_send: SendConnection::new(data_send),
+            data_recv: RecvConnection::new(data_recv),
         }
     }
 }
 
-impl<T: StreamConn> DualConnection<T> {
-    /// Send a control message (NegOpen, NegMsg, HaveList)
-    pub async fn send_control(&mut self, msg: &SyncMessage) -> Result<(), ConnectionError> {
-        self.control.send(msg).await
-    }
-
-    /// Send a data message (Event)
-    pub async fn send_data(&mut self, msg: &SyncMessage) -> Result<(), ConnectionError> {
-        self.data.send(msg).await
-    }
-
+impl<C: StreamConn, S: StreamSend, R: StreamRecv> DualConnection<C, S, R> {
     /// Flush control stream
     pub async fn flush_control(&mut self) -> Result<(), ConnectionError> {
         self.control.flush().await
@@ -64,8 +80,9 @@ impl<T: StreamConn> DualConnection<T> {
 
     /// Flush data stream
     pub async fn flush_data(&mut self) -> Result<(), ConnectionError> {
-        self.data.flush().await
+        self.data_send.flush().await
     }
+
 }
 
 impl Connection {
@@ -126,6 +143,60 @@ impl Connection {
     }
 }
 
+impl SendConnection {
+    pub fn new(send: SendStream) -> Self {
+        Self { send }
+    }
+
+    pub async fn send(&mut self, msg: &SyncMessage) -> Result<(), ConnectionError> {
+        let data = encode_sync_message(msg);
+        self.send.write_all(&data).await?;
+        Ok(())
+    }
+
+    pub async fn flush(&mut self) -> Result<(), ConnectionError> {
+        self.send.flush().await?;
+        Ok(())
+    }
+}
+
+impl RecvConnection {
+    pub fn new(recv: RecvStream) -> Self {
+        Self {
+            recv,
+            recv_buffer: Vec::with_capacity(4096),
+        }
+    }
+
+    pub async fn recv(&mut self) -> Result<SyncMessage, ConnectionError> {
+        loop {
+            if !self.recv_buffer.is_empty() {
+                match parse_sync_message(&self.recv_buffer) {
+                    Ok((msg, consumed)) => {
+                        self.recv_buffer.drain(..consumed);
+                        return Ok(msg);
+                    }
+                    Err(ParseError::InsufficientData) => {}
+                    Err(e) => {
+                        return Err(ConnectionError::Parse(e));
+                    }
+                }
+            }
+
+            let mut buf = [0u8; 4096];
+            let chunk = self.recv.read(&mut buf).await?;
+            match chunk {
+                Some(n) if n > 0 => {
+                    self.recv_buffer.extend_from_slice(&buf[..n]);
+                }
+                _ => {
+                    return Err(ConnectionError::Closed);
+                }
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl StreamConn for Connection {
     async fn send(&mut self, msg: &SyncMessage) -> Result<(), ConnectionError> {
@@ -138,6 +209,24 @@ impl StreamConn for Connection {
 
     async fn recv(&mut self) -> Result<SyncMessage, ConnectionError> {
         Connection::recv(self).await
+    }
+}
+
+#[async_trait]
+impl StreamSend for SendConnection {
+    async fn send(&mut self, msg: &SyncMessage) -> Result<(), ConnectionError> {
+        SendConnection::send(self, msg).await
+    }
+
+    async fn flush(&mut self) -> Result<(), ConnectionError> {
+        SendConnection::flush(self).await
+    }
+}
+
+#[async_trait]
+impl StreamRecv for RecvConnection {
+    async fn recv(&mut self) -> Result<SyncMessage, ConnectionError> {
+        RecvConnection::recv(self).await
     }
 }
 

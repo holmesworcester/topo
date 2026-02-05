@@ -20,7 +20,19 @@ use crate::crypto::{hash_event, event_id_to_base64, EventId};
 use crate::db::{open_connection, schema::create_tables, shareable::Shareable, store::Store, outgoing::OutgoingQueue, wanted::WantedEvents};
 use crate::runtime::SyncStats;
 use crate::sync::{SyncMessage, neg_id_to_event_id, NegentropyStorageSqlite};
-use crate::transport::{DualConnection, StreamConn, create_client_endpoint, create_server_endpoint, create_sim_pair, generate_keypair, generate_self_signed_cert, SimConfig, SimConnection};
+use crate::transport::{
+    DualConnection,
+    StreamConn,
+    StreamRecv,
+    StreamSend,
+    create_client_endpoint,
+    create_server_endpoint,
+    create_sim_pair,
+    create_sim_split_pair,
+    generate_keypair,
+    generate_self_signed_cert,
+    SimConfig,
+};
 use crate::wire::Envelope;
 
 #[derive(Parser)]
@@ -184,11 +196,11 @@ async fn run_server(
     // Accept two bidirectional streams: control first, then data
     let (control_send, control_recv) = connection.accept_bi().await?;
     let (data_send, data_recv) = connection.accept_bi().await?;
-    let mut conn = DualConnection::new(control_send, control_recv, data_send, data_recv);
+    let conn = DualConnection::new(control_send, control_recv, data_send, data_recv);
     info!("Accepted control and data streams");
 
     // Run sync as responder (server waits for client to initiate)
-    run_sync_responder_dual(&mut conn, db_path, timeout_secs, &peer_id).await?;
+    run_sync_responder_dual(conn, db_path, timeout_secs, &peer_id).await?;
 
     // Close connection
     connection.close(0u32.into(), b"done");
@@ -224,13 +236,13 @@ async fn run_client(
 
     // Send markers on both streams to establish them (QUIC streams are lazy)
     conn.control.send(&SyncMessage::HaveList { ids: vec![] }).await?;
-    conn.data.send(&SyncMessage::HaveList { ids: vec![] }).await?;
+    conn.data_send.send(&SyncMessage::HaveList { ids: vec![] }).await?;
     conn.flush_control().await?;
     conn.flush_data().await?;
     info!("Opened and established control and data streams");
 
     // Run sync as initiator (client starts the reconciliation)
-    run_sync_initiator_dual(&mut conn, db_path, timeout_secs, &peer_id).await?;
+    run_sync_initiator_dual(conn, db_path, timeout_secs, &peer_id).await?;
 
     // Close connection
     connection.close(0u32.into(), b"done");
@@ -489,12 +501,22 @@ fn batch_writer(
 /// - Data receiver task: receives events, send().await for backpressure
 /// - Ingest worker (spawn_blocking): batch writes to SQLite
 /// - NO blob prefetch: fetches from SQLite on-demand
-async fn run_sync_initiator_dual<T: StreamConn>(
-    conn: &mut DualConnection<T>,
+async fn run_sync_initiator_dual<C, S, R>(
+    conn: DualConnection<C, S, R>,
     db_path: &str,
     timeout_secs: u64,
     peer_id: &str,
-) -> Result<SyncStats, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<SyncStats, Box<dyn std::error::Error + Send + Sync>>
+where
+    C: StreamConn,
+    S: StreamSend,
+    R: StreamRecv + Send + 'static,
+{
+    let DualConnection {
+        mut control,
+        mut data_send,
+        mut data_recv,
+    } = conn;
     let start = std::time::Instant::now();
     let timeout = Duration::from_secs(timeout_secs);
 
@@ -531,24 +553,58 @@ async fn run_sync_initiator_dual<T: StreamConn>(
     let (ingest_tx, ingest_rx) = mpsc::channel::<(EventId, Vec<u8>)>(ingest_cap);
     let events_received = Arc::new(AtomicU64::new(0));
     let events_received_writer = events_received.clone();
+    let bytes_received = Arc::new(AtomicU64::new(0));
 
     // Spawn ingest worker (writes to SQLite)
     let db_path_owned = db_path.to_string();
-    let writer_handle = tokio::task::spawn_blocking(move || {
-        batch_writer(db_path_owned, ingest_rx, events_received_writer)
-    });
+    let writer_handle =
+        tokio::task::spawn_blocking(move || batch_writer(db_path_owned, ingest_rx, events_received_writer));
 
     // Phase 3: Network I/O with dedicated tasks
     let mut have_ids: Vec<Id> = Vec::new();
     let mut need_ids: Vec<Id> = Vec::new();
     let mut events_sent: u64 = 0;
     let mut bytes_sent: u64 = 0;
-    let mut bytes_received: u64 = 0;
+    let bytes_received_worker = bytes_received.clone();
+
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let recv_handle = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+                msg = data_recv.recv() => {
+                    match msg {
+                        Ok(SyncMessage::Event { blob }) => {
+                            bytes_received_worker.fetch_add(blob.len() as u64, Ordering::Relaxed);
+                            let event_id = hash_event(&blob);
+                            if ingest_tx.send((event_id, blob)).await.is_err() {
+                                warn!("Ingest channel closed");
+                                break;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(transport::connection::ConnectionError::Closed) => {
+                            info!("Data stream closed by peer");
+                            break;
+                        }
+                        Err(e) => {
+                            warn!("Data stream error: {}", e);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
 
     // Send initial negentropy message on control stream
     let initial_msg = neg.initiate()?;
-    conn.send_control(&SyncMessage::NegOpen { msg: initial_msg }).await?;
-    conn.flush_control().await?;
+    control.send(&SyncMessage::NegOpen { msg: initial_msg }).await?;
+    control.flush().await?;
 
     let mut reconciliation_done = false;
     let mut rounds = 0;
@@ -567,13 +623,13 @@ async fn run_sync_initiator_dual<T: StreamConn>(
         }
 
         // First: check control stream for negentropy messages (non-blocking)
-        match tokio::time::timeout(Duration::from_millis(1), conn.control.recv()).await {
+        match tokio::time::timeout(Duration::from_millis(1), control.recv()).await {
             Ok(Ok(SyncMessage::NegMsg { msg })) => {
                 rounds += 1;
                 match neg.reconcile_with_ids(&msg, &mut have_ids, &mut need_ids)? {
                     Some(next_msg) => {
-                        conn.send_control(&SyncMessage::NegMsg { msg: next_msg }).await?;
-                        conn.flush_control().await?;
+                        control.send(&SyncMessage::NegMsg { msg: next_msg }).await?;
+                        control.flush().await?;
                     }
                     None => {
                         reconciliation_done = true;
@@ -602,14 +658,14 @@ async fn run_sync_initiator_dual<T: StreamConn>(
                             batch.push(event_id);
                         }
                         if batch.len() >= NEED_CHUNK {
-                            conn.send_control(&SyncMessage::HaveList { ids: batch }).await?;
-                            conn.flush_control().await?;
+                            control.send(&SyncMessage::HaveList { ids: batch }).await?;
+                            control.flush().await?;
                             batch = Vec::with_capacity(NEED_CHUNK);
                         }
                     }
                     if !batch.is_empty() {
-                        conn.send_control(&SyncMessage::HaveList { ids: batch }).await?;
-                        conn.flush_control().await?;
+                        control.send(&SyncMessage::HaveList { ids: batch }).await?;
+                        control.flush().await?;
                     }
                 }
 
@@ -634,31 +690,6 @@ async fn run_sync_initiator_dual<T: StreamConn>(
             Err(_) => {} // Timeout
         }
 
-        // Second: drain data stream, using send().await for backpressure
-        loop {
-            match tokio::time::timeout(Duration::from_millis(1), conn.data.recv()).await {
-                Ok(Ok(SyncMessage::Event { blob })) => {
-                    bytes_received += blob.len() as u64;
-                    let event_id = hash_event(&blob);
-                    // send().await - blocks if channel is full (backpressure)
-                    if ingest_tx.send((event_id, blob)).await.is_err() {
-                        warn!("Ingest channel closed");
-                        break;
-                    }
-                }
-                Ok(Ok(_)) => {}
-                Ok(Err(transport::connection::ConnectionError::Closed)) => {
-                    info!("Data stream closed by peer");
-                    break;
-                }
-                Ok(Err(e)) => {
-                    warn!("Data stream error: {}", e);
-                    break;
-                }
-                Err(_) => break, // Timeout - no more pending
-            }
-        }
-
         // Third: stream events from DB queue on data stream until blocked or empty
         let mut sent_this_round = 0;
         let mut blocked = false;
@@ -672,7 +703,7 @@ async fn run_sync_initiator_dual<T: StreamConn>(
             for (rowid, event_id) in batch {
                 if let Ok(Some(blob)) = store.get(&event_id) {
                     let blob_len = blob.len() as u64;
-                    if conn.send_data(&SyncMessage::Event { blob }).await.is_ok() {
+                    if data_send.send(&SyncMessage::Event { blob }).await.is_ok() {
                         events_sent += 1;
                         bytes_sent += blob_len;
                         sent_this_round += 1;
@@ -690,7 +721,7 @@ async fn run_sync_initiator_dual<T: StreamConn>(
         }
 
         if sent_this_round > 0 {
-            let _ = conn.flush_data().await;
+            let _ = data_send.flush().await;
         }
 
         // Check completion
@@ -712,7 +743,8 @@ async fn run_sync_initiator_dual<T: StreamConn>(
     }
     let _ = neg_db.execute("COMMIT", []);
     let _ = neg_db.execute("COMMIT", []);
-    drop(ingest_tx);
+    let _ = shutdown_tx.send(true);
+    let _ = recv_handle.await;
     let _ = writer_handle.await;
 
     let stats = SyncStats {
@@ -720,7 +752,7 @@ async fn run_sync_initiator_dual<T: StreamConn>(
         events_received: events_received.load(Ordering::Relaxed),
         neg_rounds: rounds,
         bytes_sent,
-        bytes_received,
+        bytes_received: bytes_received.load(Ordering::Relaxed),
         duration_ms: sync_start.elapsed().as_millis(),
     };
     info!("Sync stats: {:?}", stats);
@@ -734,12 +766,22 @@ async fn run_sync_initiator_dual<T: StreamConn>(
 /// - Ingest worker (spawn_blocking): batch writes to SQLite
 /// - Uses send().await for backpressure on ingest channel
 /// - NO blob prefetch: fetches from SQLite on-demand
-async fn run_sync_responder_dual<T: StreamConn>(
-    conn: &mut DualConnection<T>,
+async fn run_sync_responder_dual<C, S, R>(
+    conn: DualConnection<C, S, R>,
     db_path: &str,
     timeout_secs: u64,
     peer_id: &str,
-) -> Result<SyncStats, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<SyncStats, Box<dyn std::error::Error + Send + Sync>>
+where
+    C: StreamConn,
+    S: StreamSend,
+    R: StreamRecv + Send + 'static,
+{
+    let DualConnection {
+        mut control,
+        mut data_send,
+        mut data_recv,
+    } = conn;
     let start = std::time::Instant::now();
     let timeout = Duration::from_secs(timeout_secs);
 
@@ -773,16 +815,50 @@ async fn run_sync_responder_dual<T: StreamConn>(
     let (ingest_tx, ingest_rx) = mpsc::channel::<(EventId, Vec<u8>)>(ingest_cap);
     let events_received = Arc::new(AtomicU64::new(0));
     let events_received_writer = events_received.clone();
+    let bytes_received = Arc::new(AtomicU64::new(0));
 
     let db_path_owned = db_path.to_string();
-    let writer_handle = tokio::task::spawn_blocking(move || {
-        batch_writer(db_path_owned, ingest_rx, events_received_writer)
+    let writer_handle =
+        tokio::task::spawn_blocking(move || batch_writer(db_path_owned, ingest_rx, events_received_writer));
+
+    let bytes_received_worker = bytes_received.clone();
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let recv_handle = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+                msg = data_recv.recv() => {
+                    match msg {
+                        Ok(SyncMessage::Event { blob }) => {
+                            bytes_received_worker.fetch_add(blob.len() as u64, Ordering::Relaxed);
+                            let event_id = hash_event(&blob);
+                            if ingest_tx.send((event_id, blob)).await.is_err() {
+                                warn!("Ingest channel closed");
+                                break;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(transport::connection::ConnectionError::Closed) => {
+                            info!("Data stream closed by peer");
+                            break;
+                        }
+                        Err(e) => {
+                            warn!("Data stream error: {}", e);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
     });
 
     // Phase 3: Network I/O loop with dual streams
     let mut events_sent: u64 = 0;
     let mut bytes_sent: u64 = 0;
-    let mut bytes_received: u64 = 0;
     let mut reconciliation_done = false;
     let mut rounds = 0;
     let mut idle_count = 0;
@@ -805,7 +881,7 @@ async fn run_sync_responder_dual<T: StreamConn>(
         }
 
         // First: check control stream (non-blocking)
-        match tokio::time::timeout(Duration::from_millis(1), conn.control.recv()).await {
+        match tokio::time::timeout(Duration::from_millis(1), control.recv()).await {
             Ok(Ok(SyncMessage::NegOpen { msg })) | Ok(Ok(SyncMessage::NegMsg { msg })) => {
                 idle_count = 0;
                 rounds += 1;
@@ -815,8 +891,8 @@ async fn run_sync_responder_dual<T: StreamConn>(
                     info!("Reconciliation complete in {} rounds", rounds);
                     reconciliation_done = true;
                 } else {
-                    conn.send_control(&SyncMessage::NegMsg { msg: response }).await?;
-                    conn.flush_control().await?;
+                    control.send(&SyncMessage::NegMsg { msg: response }).await?;
+                    control.flush().await?;
                 }
             }
             Ok(Ok(SyncMessage::HaveList { ids })) => {
@@ -842,32 +918,6 @@ async fn run_sync_responder_dual<T: StreamConn>(
             Err(_) => {} // Timeout
         }
 
-        // Second: drain data stream with send().await for backpressure
-        loop {
-            match tokio::time::timeout(Duration::from_millis(1), conn.data.recv()).await {
-                Ok(Ok(SyncMessage::Event { blob })) => {
-                    idle_count = 0;
-                    bytes_received += blob.len() as u64;
-                    let event_id = hash_event(&blob);
-                    // send().await - blocks if channel is full (backpressure)
-                    if ingest_tx.send((event_id, blob)).await.is_err() {
-                        warn!("Ingest channel closed");
-                        break;
-                    }
-                }
-                Ok(Ok(_)) => {}
-                Ok(Err(transport::connection::ConnectionError::Closed)) => {
-                    info!("Data stream closed by peer");
-                    break;
-                }
-                Ok(Err(e)) => {
-                    warn!("Data stream error: {}", e);
-                    break;
-                }
-                Err(_) => break, // Timeout - no more pending
-            }
-        }
-
         // Third: stream events from DB queue on data stream until blocked or empty
         let mut sent_this_round = 0;
         let mut blocked = false;
@@ -879,14 +929,14 @@ async fn run_sync_responder_dual<T: StreamConn>(
 
             let mut sent_rowids: Vec<i64> = Vec::with_capacity(batch.len());
             for (rowid, event_id) in batch {
-            if let Ok(Some(blob)) = store.get(&event_id) {
-                let blob_len = blob.len() as u64;
-                if conn.send_data(&SyncMessage::Event { blob }).await.is_ok() {
-                    events_sent += 1;
-                    bytes_sent += blob_len;
-                    sent_this_round += 1;
-                    sent_rowids.push(rowid);
-                } else {
+                if let Ok(Some(blob)) = store.get(&event_id) {
+                    let blob_len = blob.len() as u64;
+                    if data_send.send(&SyncMessage::Event { blob }).await.is_ok() {
+                        events_sent += 1;
+                        bytes_sent += blob_len;
+                        sent_this_round += 1;
+                        sent_rowids.push(rowid);
+                    } else {
                         blocked = true;
                         break;
                     }
@@ -898,7 +948,7 @@ async fn run_sync_responder_dual<T: StreamConn>(
         }
 
         if sent_this_round > 0 {
-            let _ = conn.flush_data().await;
+            let _ = data_send.flush().await;
             idle_count = 0;
         } else if reconciliation_done {
             idle_count += 1;
@@ -908,7 +958,8 @@ async fn run_sync_responder_dual<T: StreamConn>(
     if completed {
         let _ = outgoing.clear_peer(peer_id);
     }
-    drop(ingest_tx);
+    let _ = shutdown_tx.send(true);
+    let _ = recv_handle.await;
     let _ = writer_handle.await;
 
     let stats = SyncStats {
@@ -916,7 +967,7 @@ async fn run_sync_responder_dual<T: StreamConn>(
         events_received: events_received.load(Ordering::Relaxed),
         neg_rounds: rounds,
         bytes_sent,
-        bytes_received,
+        bytes_received: bytes_received.load(Ordering::Relaxed),
         duration_ms: sync_start.elapsed().as_millis(),
     };
     info!("Sync stats (responder): {:?}", stats);
@@ -1172,23 +1223,25 @@ async fn run_sim(
 
     // Simulated dual streams: control and data
     let (server_ctrl, client_ctrl) = create_sim_pair(config);
-    let (server_data, client_data) = create_sim_pair(config);
+    let (server_data, client_data) = create_sim_split_pair(config);
 
-    let mut server_conn: DualConnection<SimConnection> = DualConnection {
+    let server_conn = DualConnection {
         control: server_ctrl,
-        data: server_data,
+        data_send: server_data.0,
+        data_recv: server_data.1,
     };
-    let mut client_conn: DualConnection<SimConnection> = DualConnection {
+    let client_conn = DualConnection {
         control: client_ctrl,
-        data: client_data,
+        data_send: client_data.0,
+        data_recv: client_data.1,
     };
 
     let server_fut = async move {
-        run_sync_responder_dual(&mut server_conn, "sim_server.db", timeout_secs, "sim-client").await
+        run_sync_responder_dual(server_conn, "sim_server.db", timeout_secs, "sim-client").await
     };
 
     let client_fut = async move {
-        run_sync_initiator_dual(&mut client_conn, "sim_client.db", timeout_secs, "sim-server").await
+        run_sync_initiator_dual(client_conn, "sim_client.db", timeout_secs, "sim-server").await
     };
 
     let (server_res, client_res) = tokio::join!(server_fut, client_fut);

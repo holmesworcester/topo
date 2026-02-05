@@ -89,8 +89,8 @@ by using `--no-generate` and prebuilt databases.
 
 ```bash
 # Generate DBs once (separate process)
-cargo run --release -- generate --db sim_server.db --events 100000 --channel aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-cargo run --release -- generate --db sim_client.db --events 100000 --channel bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+cargo run --release -- generate --db sim_server.db --count 100000 --channel aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+cargo run --release -- generate --db sim_client.db --count 100000 --channel bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 
 # Run sync-only (no generation)
 cargo run --release -- sim --events 100000 --timeout 120 --latency-ms 10 --bandwidth-kib 50000 --no-generate
@@ -138,5 +138,25 @@ Set `LOW_MEM=1` to enable:
 
 Example:
 ```bash
-LOW_MEM=1 cargo run --release -- sim --events 10000 --timeout 30 --latency-ms 10 --bandwidth-kib 50000 --no-generate
+LOW_MEM=1 cargo run --release -- sim --events 10000 --timeout 60 --latency-ms 1 --bandwidth-kib 50000 --no-generate
 ```
+
+#### Low-Mem Result (10k/peer, 50,000 KiB/s cap)
+
+```
+LOW_MEM=1 cargo run --release -- sim --events 10000 --timeout 120 --latency-ms 1 --bandwidth-kib 50000 --no-generate
+```
+
+Results:
+- Combined throughput: **~15.7 MiB/s**
+- Peak RSS (VmHWM): **~19.4 MiB**
+
+#### Low-Mem Result (10k/peer, effectively unconstrained)
+
+```
+LOW_MEM=1 cargo run --release -- sim --events 10000 --timeout 60 --latency-ms 1 --bandwidth-kib 1000000 --no-generate
+```
+
+Results:
+- Combined throughput: **~13.5 MiB/s**
+- Peak RSS (VmHWM): **~20.6 MiB**
