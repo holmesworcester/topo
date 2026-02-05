@@ -1,7 +1,6 @@
 use nom::IResult;
 
 use super::{header::WireHeader, message::MessagePayload, ENVELOPE_SIZE, HEADER_SIZE};
-use crate::crypto::{hash_event, EventId};
 
 /// Complete 512-byte envelope (header + payload)
 #[derive(Debug, Clone)]
@@ -27,9 +26,10 @@ impl Envelope {
     }
 
     /// Compute event ID (Blake2b-256 hash of full envelope)
-    pub fn compute_id(&self) -> EventId {
+    #[cfg(test)]
+    pub fn compute_id(&self) -> crate::crypto::EventId {
         let blob = self.encode();
-        hash_event(&blob)
+        crate::crypto::hash_event(&blob)
     }
 
     /// Create a new message envelope
@@ -44,15 +44,6 @@ impl Envelope {
         Self { header, payload }
     }
 
-    /// Extract created_at timestamp from blob without full parse (from header)
-    pub fn extract_created_at(blob: &[u8]) -> Option<u64> {
-        if blob.len() < ENVELOPE_SIZE {
-            return None;
-        }
-        // created_at_ms is at offset 6 in header
-        let bytes: [u8; 8] = blob[6..14].try_into().ok()?;
-        Some(u64::from_le_bytes(bytes))
-    }
 }
 
 #[cfg(test)]

@@ -1,12 +1,17 @@
 pub mod protocol;
-pub mod negentropy_adapter;
 pub mod negentropy_sqlite;
 
 pub use protocol::{SyncMessage, parse_sync_message, encode_sync_message};
-pub use negentropy_adapter::{load_negentropy_items, build_negentropy_storage, neg_id_to_event_id};
-pub use negentropy_sqlite::{NegentropyStorageSqlite, BLOCK_SIZE};
+pub use negentropy_sqlite::NegentropyStorageSqlite;
 
 use crate::wire::ENVELOPE_SIZE;
+use crate::crypto::EventId;
+use negentropy::Id;
+
+/// Convert negentropy Id to our EventId
+pub fn neg_id_to_event_id(id: &Id) -> EventId {
+    *id.as_bytes()
+}
 
 /// Sync message types
 pub const MSG_TYPE_NEG_OPEN: u8 = 0x10;   // Initial negentropy message

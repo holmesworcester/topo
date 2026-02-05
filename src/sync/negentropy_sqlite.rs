@@ -203,6 +203,11 @@ impl NegentropyStorageBase for NegentropyStorageSqlite<'_> {
     }
 
     fn find_lower_bound(&self, first: usize, last: usize, value: &Bound) -> usize {
+        // Handle "infinity" bound - negentropy uses u64::MAX to mean end of items
+        if value.item.timestamp >= i64::MAX as u64 {
+            return last;
+        }
+
         // Binary search using blocks for efficiency
         let target_ts = value.item.timestamp as i64;
         let target_id = value.item.id.as_bytes();

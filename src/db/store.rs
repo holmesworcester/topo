@@ -26,6 +26,7 @@ impl<'a> Store<'a> {
     }
 
     /// Store multiple blobs at once
+    #[cfg(test)]
     pub fn put_batch(&self, items: &[(EventId, Vec<u8>)]) -> SqliteResult<()> {
         let now = current_timestamp_ms();
         let mut stmt = self.conn.prepare(
@@ -57,6 +58,7 @@ impl<'a> Store<'a> {
     }
 
     /// Check if we have a blob
+    #[cfg(test)]
     pub fn exists(&self, id: &EventId) -> SqliteResult<bool> {
         let id_str = event_id_to_base64(id);
 

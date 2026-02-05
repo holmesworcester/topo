@@ -78,3 +78,65 @@ NO_DEPS=1    # Skip dependency reads (baseline)
 NAIVE_DEPS=1 # Use individual queries per dependency (slower)
 # default    # Use batched IN query (faster)
 ```
+
+## Simulated Dual-Stream (SQLite-backed, no prefetch)
+
+All numbers below are from the in-process simulator (no sockets) with constrained
+latency/bandwidth. These runs include projection + ingest, but **exclude DB generation**
+by using `--no-generate` and prebuilt databases.
+
+### How to Run (sync-only)
+
+```bash
+# Generate DBs once (separate process)
+cargo run --release -- generate --db sim_server.db --events 100000 --channel aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+cargo run --release -- generate --db sim_client.db --events 100000 --channel bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+
+# Run sync-only (no generation)
+cargo run --release -- sim --events 100000 --timeout 120 --latency-ms 10 --bandwidth-kib 50000 --no-generate
+```
+
+### Release Perf Observations (sync-only)
+
+| Events/peer | Rounds | Combined Throughput | Peak RSS (VmHWM) |
+|-------------|--------|---------------------|------------------|
+| 10,000 | ~11 | ~5.5 MiB/s | ~48–50 MiB |
+| 100,000 | ~99 | ~5.2 MiB/s | ~270–280 MiB |
+
+Notes:
+- Throughput is **data stream only** (event blobs).
+- `VmHWM` is peak RSS for the entire run (sync phase only, generation excluded).
+- These numbers are on `--release`; debug builds are significantly slower.
+
+## 24 MB Target (iOS NSE) — Memory Control Levers
+
+If we need to run within ~24 MB, the biggest wins are **SQLite cache/buffers** and
+**queue sizes**. None of these require dropping projection or correctness.
+
+Recommended adjustments:
+
+- Reduce SQLite cache per connection (`PRAGMA cache_size`), e.g. `-1024` (1 MiB).
+- Minimize number of open connections (one read snapshot + one writer).
+- Use small bounded channels (ingest queue of 500–1000).
+- Keep `have/need` chunked and spill to DB (already done).
+- Avoid large in-memory prefetch or blob caches (already done).
+- Consider `PRAGMA temp_store=FILE` for large temp operations.
+- Set `PRAGMA mmap_size=0` to avoid extra mapped memory.
+- Use `PRAGMA wal_autocheckpoint` and `PRAGMA journal_size_limit` to keep WAL small.
+
+Measurement guidance:
+- For sync-only memory, **exclude generation** using `--no-generate`.
+- On iOS, use `task_info` (resident size) instead of `/proc/self/status` (Linux only).
+
+### Low-Mem Profile (implemented)
+
+Set `LOW_MEM=1` to enable:
+- SQLite cache ~1 MiB per connection
+- `temp_store=FILE`, `mmap_size=0`
+- Smaller WAL/journal limits
+- Ingest channel capacity reduced to 1000
+
+Example:
+```bash
+LOW_MEM=1 cargo run --release -- sim --events 10000 --timeout 30 --latency-ms 10 --bandwidth-kib 50000 --no-generate
+```

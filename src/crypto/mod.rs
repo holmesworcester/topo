@@ -22,6 +22,7 @@ pub fn event_id_to_base64(id: &EventId) -> String {
 }
 
 /// Decode event ID from base64
+#[cfg(test)]
 pub fn event_id_from_base64(s: &str) -> Option<EventId> {
     use base64::Engine;
     let bytes = base64::engine::general_purpose::STANDARD.decode(s).ok()?;
