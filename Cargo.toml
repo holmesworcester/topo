@@ -17,6 +17,9 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
 clap = { version = "4", features = ["derive"] }
 thiserror = "1"
-negentropy = "0.5"
+negentropy = { path = "/tmp/negentropy" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+constrained-connection = "0.1.0"
+futures = "0.3"
+async-trait = "0.1"

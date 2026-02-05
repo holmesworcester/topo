@@ -1,75 +1,52 @@
 # Performance Benchmarks
 
-## Test Environment
-- SQLite on disk (WAL mode, NORMAL sync)
-- QUIC over localhost loopback
-- 50,000 events per peer (100,000 total)
-- 512-byte envelopes (~51 MB per direction)
+## What This Measures
+- End-to-end sync in the simulator: negentropy reconciliation + event transfer + projection.
+- SQLite on disk with WAL + NORMAL sync.
+- Envelope size ~512 bytes.
+- Two peers in a single process (sim mode), with a constrained link model.
 
-## Running Performance Tests
+## How To Run
 
 ```bash
-# Run full perf test suite
-cargo test --release perf_ -- --nocapture --ignored
+# Simulated sync (latency + bandwidth model)
+cargo run --release -- sim --events 100000 --timeout 200 --latency-ms 50 --bandwidth-kib 6250
 
-# Run specific test
-cargo test --release perf_sync_50k -- --nocapture --ignored
+# Low-memory profile (optional)
+LOW_MEM=1 cargo run --release -- sim --events 100000 --timeout 200 --latency-ms 50 --bandwidth-kib 6250
 ```
 
-## Sync Performance (50k events/peer)
+## Recent Results (Sim, 50ms RTT, 6250 KiB/s)
 
-| Phase | Time |
-|-------|------|
-| Event generation | ~1.4s per 50k |
-| Prefetch to memory | ~260ms per side |
-| Negentropy reconciliation | ~630ms (51 rounds) |
-| Event transfer + projection | varies (see below) |
+| Events/peer | Rounds | Throughput (MB/s) | Elapsed | Max RSS |
+|-------------|--------|-------------------|---------|---------|
+| 10,000 | 4 | 7.40 | 1.41s | 23.51 MB |
+| 100,000 | 8 | 7.93 | 13.12s | 40.89 MB |
 
-## Projection Dependency Read Modes
+Notes:
+- RSS is for **both peers combined** (single process). Per-peer RSS is roughly half.
+- Throughput includes reconciliation time.
 
-Each event projection reads 10 dependencies (real messages from the database).
-This simulates looking up parent messages, thread roots, mentioned users, etc.
+## Memory Notes (24MB Target)
+- The biggest memory consumer is the in-flight event queue.
+- The sim runs both peers in one process, so RSS is roughly doubled.
+- Use `LOW_MEM=1` to shrink queue caps and SQLite cache; tune `EVENT_CHAN_CAP` if needed.
 
-| Mode | Transfer Time | vs Baseline | Description |
-|------|---------------|-------------|-------------|
-| NO_DEPS | 1.32s | baseline | No dependency reads |
-| NAIVE | 2.70s | +105% | Individual query per dependency |
-| BATCHED | 1.91s | +44% | Single IN (...) query per batch |
+## Realism and Gaps
+This sim is great for relative comparisons but is **not** a real QUIC network:
+- No kernel network stack, no UDP/IP overhead, no real QUIC congestion control.
+- No packet loss, jitter, reordering, or path changes.
+- Single process means shared caches and no OS scheduling contention.
+- SQLite is local and warm; no disk contention or fsync spikes.
+- Crypto cost is not representative of production TLS + signature verification.
 
-**BATCHED is 42% faster than NAIVE** with real dependency data.
-
-### Why BATCHED is faster
-
-With real data to fetch:
-1. Single IN query avoids SQLite statement preparation overhead per read
-2. Fewer round trips through the query planner
-3. Better cache locality for index lookups
-
-## Throughput
-
-| Metric | Value |
-|--------|-------|
-| Events synced | 100,000 (50k each direction) |
-| Data transferred | ~102 MB total |
-| Sync time (no deps) | ~2s |
-| Effective throughput | ~50 MB/s |
-
-## Scaling
-
-| Events/peer | Reconciliation Rounds | Transfer Time |
-|-------------|----------------------|---------------|
-| 500 | 2 | <100ms |
-| 1,000 | 3 | ~30ms |
-| 50,000 | 51 | ~1.3s |
-
-## Key Optimizations
-
-1. **Prefetching**: Load all blobs into HashMap before sync starts
-2. **Channel + spawn_blocking**: Async network I/O, sync SQLite writes in separate thread
-3. **Batch transactions**: BEGIN/COMMIT around 1000-event batches
-4. **Batched dependency reads**: Single IN query for all deps per batch (42% faster)
-5. **Interleaved send/recv**: Drain receives before sending to avoid QUIC flow control deadlock
-6. **Inline projection**: Project in same transaction as store (atomic, <100ms latency)
+To make it more realistic:
+1. **Run real QUIC**: use the QUIC demo with two processes.
+2. **Add loss/jitter**: `tc netem` or container network shaping.
+3. **Separate hosts**: run peers on different machines or VMs.
+4. **Cold cache**: drop OS caches between runs; measure fsync-heavy settings.
+5. **CPU contention**: pin CPUs, add background load.
+6. **Real payloads**: use realistic event sizes and dependency graphs.
 
 ## Environment Variables
 
@@ -77,4 +54,17 @@ With real data to fetch:
 NO_DEPS=1    # Skip dependency reads (baseline)
 NAIVE_DEPS=1 # Use individual queries per dependency (slower)
 # default    # Use batched IN query (faster)
+
+# Negentropy tuning
+NEG_MAX_BYTES=1048576 # Max negentropy frame size (default 1 MiB)
+NEG_BLOCK_SIZE=1024   # Negentropy block size (default 1024 items)
+
+# Memory/queue tuning (LOW_MEM is optional)
+LOW_MEM=1            # Enable low-memory presets for queues and SQLite cache
+EVENT_CHAN_CAP=4096  # Max in-flight event blobs (default 4096)
+DB_CACHE_KIB=1024    # SQLite cache size (KiB, default 4096 or 1024 in LOW_MEM)
+IO_CTRL_CAP=256      # Control channel cap (default 1024 or 256 in LOW_MEM)
+IO_DATA_CAP=1024     # Data channel cap (default 8192 or 1024 in LOW_MEM)
+IO_IN_CAP=1024       # Inbound channel cap (default 8192 or 1024 in LOW_MEM)
+DATA_BATCH_BYTES=16384 # Data send batch bytes (default 65536 or 16384 in LOW_MEM)
 ```

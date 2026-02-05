@@ -6,22 +6,380 @@ mod transport;
 mod wire;
 
 use clap::{Parser, Subcommand};
-use negentropy::{Negentropy, Id};
+use negentropy::{Negentropy, Id, NegentropyStorageBase};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 use tracing::{info, warn, error, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use crate::crypto::{hash_event, event_id_to_base64, EventId};
-use crate::db::{open_connection, schema::create_tables, shareable::Shareable, store::Store};
+use crate::db::{
+    open_connection,
+    schema::create_tables,
+    shareable::Shareable,
+    store::Store,
+    wanted::WantedEvents,
+    outgoing::OutgoingQueue,
+    sent::SentEvents,
+};
 use crate::runtime::SyncStats;
-use crate::sync::{SyncMessage, load_negentropy_items, build_negentropy_storage, neg_id_to_event_id};
+use crate::sync::{
+    SyncMessage,
+    ensure_negentropy_index,
+    NegentropyStorageSqlite,
+    reset_negentropy_profile,
+    log_negentropy_profile,
+    neg_block_size,
+    neg_max_bytes,
+    neg_rebuild_threshold,
+    neg_id_to_event_id,
+    encode_sync_message,
+    sync_message_len,
+    NegentropyBatchInserter,
+};
 use crate::transport::{Connection, create_client_endpoint, create_server_endpoint, generate_keypair, generate_self_signed_cert};
+use crate::transport::{create_sim_pair, SimConfig, SimConnection, SyncConnection};
 use crate::wire::Envelope;
+
+const IO_CTRL_CAP: usize = 1024;
+const IO_DATA_CAP: usize = 8192;
+const IO_IN_CAP: usize = 8192;
+const EVENT_CHAN_CAP: usize = 4096;
+const DATA_BATCH_BYTES: usize = 64 * 1024;
+const DATA_FLUSH_MS: u64 = 2;
+const MEM_SAMPLE_MS: u64 = 500;
+
+fn low_mem_enabled() -> bool {
+    std::env::var("LOW_MEM")
+        .ok()
+        .map(|v| v != "0")
+        .unwrap_or(false)
+}
+
+fn env_usize(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+}
+
+fn io_ctrl_cap() -> usize {
+    env_usize("IO_CTRL_CAP").unwrap_or_else(|| if low_mem_enabled() { 256 } else { IO_CTRL_CAP })
+}
+
+fn io_data_cap() -> usize {
+    env_usize("IO_DATA_CAP").unwrap_or_else(|| if low_mem_enabled() { 1024 } else { IO_DATA_CAP })
+}
+
+fn io_in_cap() -> usize {
+    env_usize("IO_IN_CAP").unwrap_or_else(|| if low_mem_enabled() { 1024 } else { IO_IN_CAP })
+}
+
+fn data_batch_bytes() -> usize {
+    env_usize("DATA_BATCH_BYTES").unwrap_or_else(|| if low_mem_enabled() { 16 * 1024 } else { DATA_BATCH_BYTES })
+}
+
+fn event_chan_cap() -> usize {
+    env_usize("EVENT_CHAN_CAP")
+        .unwrap_or_else(|| if low_mem_enabled() { 1024 } else { EVENT_CHAN_CAP })
+}
+
+#[derive(Default)]
+struct ByteCounters {
+    sent: AtomicU64,
+    recv: AtomicU64,
+}
+
+impl ByteCounters {
+    fn add_sent(&self, n: usize) {
+        self.sent.fetch_add(n as u64, Ordering::Relaxed);
+    }
+
+    fn add_recv(&self, n: usize) {
+        self.recv.fetch_add(n as u64, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> (u64, u64) {
+        (
+            self.sent.load(Ordering::Relaxed),
+            self.recv.load(Ordering::Relaxed),
+        )
+    }
+}
+
+fn read_rss_bytes() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            let mut parts = rest.split_whitespace();
+            if let Some(kb_str) = parts.next() {
+                if let Ok(kb) = kb_str.parse::<u64>() {
+                    return Some(kb.saturating_mul(1024));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn update_max_rss(max: &AtomicU64, value: u64) {
+    let mut cur = max.load(Ordering::Relaxed);
+    while value > cur {
+        match max.compare_exchange(cur, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(next) => cur = next,
+        }
+    }
+}
+
+async fn enqueue_event(
+    tx: &mpsc::Sender<(EventId, Vec<u8>)>,
+    event_id: EventId,
+    blob: Vec<u8>,
+) {
+    match tx.try_send((event_id, blob)) {
+        Ok(()) => {}
+        Err(tokio::sync::mpsc::error::TrySendError::Full((event_id, blob))) => {
+            let _ = tx.send((event_id, blob)).await;
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+    }
+}
+
+struct SyncIo {
+    ctrl_tx: mpsc::Sender<SyncMessage>,
+    data_tx: mpsc::Sender<SyncMessage>,
+    inbound_rx: mpsc::Receiver<SyncMessage>,
+    _handle: tokio::task::JoinHandle<()>,
+}
+
+struct IoSingle {
+    tx: mpsc::Sender<SyncMessage>,
+    rx: mpsc::Receiver<SyncMessage>,
+    _handle: tokio::task::JoinHandle<()>,
+}
+
+fn start_io(
+    mut conn: Box<dyn SyncConnection>,
+) -> SyncIo {
+    let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<SyncMessage>(io_ctrl_cap());
+    let (data_tx, mut data_rx) = mpsc::channel::<SyncMessage>(io_data_cap());
+    let (in_tx, inbound_rx) = mpsc::channel::<SyncMessage>(io_in_cap());
+
+    let handle = tokio::spawn(async move {
+        let batch_bytes = data_batch_bytes();
+        let mut data_buf: Vec<u8> = Vec::with_capacity(batch_bytes * 2);
+        let mut last_flush = Instant::now();
+
+        loop {
+            if !data_buf.is_empty()
+                && (data_buf.len() >= batch_bytes
+                    || last_flush.elapsed() >= Duration::from_millis(DATA_FLUSH_MS))
+            {
+                if conn.send_bytes(&data_buf).await.is_err() {
+                    return;
+                }
+                let _ = conn.flush().await;
+                data_buf.clear();
+                last_flush = Instant::now();
+                continue;
+            }
+
+            tokio::select! {
+                msg = conn.recv() => {
+                    match msg {
+                        Ok(m) => {
+                            if in_tx.send(m).await.is_err() {
+                                return;
+                            }
+                        }
+                        Err(_) => return,
+                    }
+                }
+                Some(msg) = ctrl_rx.recv() => {
+                    let data = encode_sync_message(&msg);
+                    if conn.send_bytes(&data).await.is_err() {
+                        return;
+                    }
+                    let _ = conn.flush().await;
+                }
+                Some(msg) = data_rx.recv() => {
+                    let data = encode_sync_message(&msg);
+                    data_buf.extend_from_slice(&data);
+                }
+                _ = tokio::time::sleep(Duration::from_millis(DATA_FLUSH_MS)), if !data_buf.is_empty() => {
+                    if conn.send_bytes(&data_buf).await.is_err() {
+                        return;
+                    }
+                    let _ = conn.flush().await;
+                    data_buf.clear();
+                    last_flush = Instant::now();
+                }
+            }
+        }
+    });
+
+    SyncIo {
+        ctrl_tx,
+        data_tx,
+        inbound_rx,
+        _handle: handle,
+    }
+}
+
+fn start_ctrl_io(mut conn: Box<dyn SyncConnection>) -> IoSingle {
+    let (tx, mut out_rx) = mpsc::channel::<SyncMessage>(io_ctrl_cap());
+    let (in_tx, rx) = mpsc::channel::<SyncMessage>(io_in_cap());
+
+    let handle = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                msg = conn.recv() => {
+                    match msg {
+                        Ok(m) => {
+                            if in_tx.send(m).await.is_err() {
+                                return;
+                            }
+                        }
+                        Err(_) => return,
+                    }
+                }
+                Some(msg) = out_rx.recv() => {
+                    let data = encode_sync_message(&msg);
+                    if conn.send_bytes(&data).await.is_err() {
+                        return;
+                    }
+                    let _ = conn.flush().await;
+                }
+            }
+        }
+    });
+
+    IoSingle { tx, rx, _handle: handle }
+}
+
+fn start_data_io(mut conn: Box<dyn SyncConnection>) -> IoSingle {
+    let (tx, mut out_rx) = mpsc::channel::<SyncMessage>(io_data_cap());
+    let (in_tx, rx) = mpsc::channel::<SyncMessage>(io_in_cap());
+
+    let handle = tokio::spawn(async move {
+        let batch_bytes = data_batch_bytes();
+        let mut data_buf: Vec<u8> = Vec::with_capacity(batch_bytes * 2);
+        let mut last_flush = Instant::now();
+
+        loop {
+            if !data_buf.is_empty()
+                && (data_buf.len() >= batch_bytes
+                    || last_flush.elapsed() >= Duration::from_millis(DATA_FLUSH_MS))
+            {
+                if conn.send_bytes(&data_buf).await.is_err() {
+                    return;
+                }
+                let _ = conn.flush().await;
+                data_buf.clear();
+                last_flush = Instant::now();
+                continue;
+            }
+
+            tokio::select! {
+                biased;
+                Some(msg) = out_rx.recv() => {
+                    let data = encode_sync_message(&msg);
+                    data_buf.extend_from_slice(&data);
+                }
+                _ = tokio::time::sleep(Duration::from_millis(DATA_FLUSH_MS)), if !data_buf.is_empty() => {
+                    if conn.send_bytes(&data_buf).await.is_err() {
+                        return;
+                    }
+                    let _ = conn.flush().await;
+                    data_buf.clear();
+                    last_flush = Instant::now();
+                }
+                msg = conn.recv() => {
+                    match msg {
+                        Ok(m) => {
+                            if in_tx.send(m).await.is_err() {
+                                return;
+                            }
+                        }
+                        Err(_) => return,
+                    }
+                }
+            }
+        }
+    });
+
+    IoSingle { tx, rx, _handle: handle }
+}
+
+fn start_data_sender(mut conn: Box<dyn SyncConnection>) -> (mpsc::Sender<SyncMessage>, tokio::task::JoinHandle<()>) {
+    let (tx, mut out_rx) = mpsc::channel::<SyncMessage>(io_data_cap());
+
+    let handle = tokio::spawn(async move {
+        let batch_bytes = data_batch_bytes();
+        let mut data_buf: Vec<u8> = Vec::with_capacity(batch_bytes * 2);
+        let mut last_flush = Instant::now();
+
+        loop {
+            if !data_buf.is_empty()
+                && (data_buf.len() >= batch_bytes
+                    || last_flush.elapsed() >= Duration::from_millis(DATA_FLUSH_MS))
+            {
+                if conn.send_bytes(&data_buf).await.is_err() {
+                    return;
+                }
+                let _ = conn.flush().await;
+                data_buf.clear();
+                last_flush = Instant::now();
+                continue;
+            }
+
+            tokio::select! {
+                Some(msg) = out_rx.recv() => {
+                    let data = encode_sync_message(&msg);
+                    data_buf.extend_from_slice(&data);
+                }
+                _ = tokio::time::sleep(Duration::from_millis(DATA_FLUSH_MS)), if !data_buf.is_empty() => {
+                    if conn.send_bytes(&data_buf).await.is_err() {
+                        return;
+                    }
+                    let _ = conn.flush().await;
+                    data_buf.clear();
+                    last_flush = Instant::now();
+                }
+                else => {
+                    return;
+                }
+            }
+        }
+    });
+
+    (tx, handle)
+}
+
+fn start_data_receiver(mut conn: Box<dyn SyncConnection>) -> (mpsc::Receiver<SyncMessage>, tokio::task::JoinHandle<()>) {
+    let (in_tx, rx) = mpsc::channel::<SyncMessage>(io_in_cap());
+
+    let handle = tokio::spawn(async move {
+        loop {
+            match conn.recv().await {
+                Ok(m) => {
+                    if in_tx.send(m).await.is_err() {
+                        return;
+                    }
+                }
+                Err(_) => return,
+            }
+        }
+    });
+
+    (rx, handle)
+}
 
 #[derive(Parser)]
 #[command(name = "poc-7")]
@@ -95,6 +453,25 @@ enum Commands {
         #[arg(short, long, default_value = "10")]
         timeout: u64,
     },
+
+    /// Simulate network with latency and bandwidth (no real sockets)
+    Sim {
+        /// Number of events to generate per peer
+        #[arg(short, long, default_value = "50")]
+        events: usize,
+
+        /// Run duration in seconds
+        #[arg(short, long, default_value = "10")]
+        timeout: u64,
+
+        /// One-way latency in milliseconds
+        #[arg(long, default_value = "10")]
+        latency_ms: u64,
+
+        /// Bandwidth in KiB/s per direction
+        #[arg(long, default_value = "50000")]
+        bandwidth_kib: u64,
+    },
 }
 
 #[tokio::main]
@@ -122,6 +499,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
         Commands::Demo { events, timeout } => {
             run_demo(events, timeout).await?;
+        }
+        Commands::Sim { events, timeout, latency_ms, bandwidth_kib } => {
+            run_sim(events, timeout, latency_ms, bandwidth_kib).await?;
         }
     }
 
@@ -159,7 +539,7 @@ async fn run_server(
     let mut conn = Connection::new(send, recv);
 
     // Run sync as responder (server waits for client to initiate)
-    run_sync_responder(&mut conn, db_path, timeout_secs).await?;
+    run_sync_responder(Box::new(conn), db_path, timeout_secs, None).await?;
 
     // Close connection
     connection.close(0u32.into(), b"done");
@@ -192,7 +572,7 @@ async fn run_client(
     let mut conn = Connection::new(send, recv);
 
     // Run sync as initiator (client starts the reconciliation)
-    run_sync_initiator(&mut conn, db_path, timeout_secs).await?;
+    run_sync_initiator(Box::new(conn), db_path, timeout_secs, None).await?;
 
     // Close connection
     connection.close(0u32.into(), b"done");
@@ -203,35 +583,38 @@ async fn run_client(
 /// Run sync as the initiator (client role)
 /// Uses channels and batching for high throughput
 async fn run_sync_initiator(
-    conn: &mut Connection,
+    conn: Box<dyn SyncConnection>,
     db_path: &str,
     timeout_secs: u64,
+    bytes: Option<Arc<ByteCounters>>,
 ) -> Result<SyncStats, Box<dyn std::error::Error + Send + Sync>> {
     let start = std::time::Instant::now();
     let timeout = Duration::from_secs(timeout_secs);
+    let recon_only = std::env::var("RECON_ONLY").is_ok();
 
     info!("Starting negentropy sync (initiator) for {} seconds", timeout_secs);
 
-    // Phase 1: Load data and prefetch blobs into memory
+    // Phase 1: Initialize negentropy storage
     let db = open_connection(db_path)?;
-    let items = load_negentropy_items(&db)?;
-    info!("Loaded {} items for negentropy", items.len());
-
-    let storage = build_negentropy_storage(&items)?;
-    let mut neg = Negentropy::owned(storage, 64 * 1024)?;
+    let block_size = neg_block_size();
+    let rebuild_threshold = neg_rebuild_threshold(block_size);
+    let max_bytes = neg_max_bytes() as u64;
+    ensure_negentropy_index(&db, block_size, rebuild_threshold)?;
+    let storage = NegentropyStorageSqlite::new(&db, block_size)?;
+    let item_count = storage.size().unwrap_or(0);
+    info!("Negentropy items: {}", item_count);
+    let mut neg = Negentropy::borrowed(&storage, max_bytes)?;
 
     let store = Store::new(&db);
-    let mut blob_cache: HashMap<EventId, Vec<u8>> = HashMap::new();
-    for item in &items {
-        if let Ok(Some(blob)) = store.get(&item.id) {
-            blob_cache.insert(item.id, blob);
-        }
-    }
-    info!("Prefetched {} blobs into cache", blob_cache.len());
-    drop(db);
+    let wanted = WantedEvents::new(&db);
+    let outgoing = OutgoingQueue::new(&db);
+    let sent = SentEvents::new(&db);
+    let _ = outgoing.clear();
+    let _ = wanted.clear();
+    let _ = sent.clear();
 
     // Phase 2: Set up channel for incoming events
-    let (tx, rx) = mpsc::channel::<(EventId, Vec<u8>)>(100_000);
+    let (tx, rx) = mpsc::channel::<(EventId, Vec<u8>)>(event_chan_cap());
     let events_received = Arc::new(AtomicU64::new(0));
     let events_received_writer = events_received.clone();
 
@@ -243,18 +626,21 @@ async fn run_sync_initiator(
     // Phase 3: Network I/O
     let mut have_ids: Vec<Id> = Vec::new();
     let mut need_ids: Vec<Id> = Vec::new();
-    let mut have_sent: HashSet<EventId> = HashSet::new();
-    let mut need_requested: HashSet<EventId> = HashSet::new();
     let mut events_sent: u64 = 0;
 
+    let mut io = start_io(conn);
+
     let initial_msg = neg.initiate()?;
-    conn.send(&SyncMessage::NegOpen { msg: initial_msg }).await?;
-    conn.flush().await?;
+    let open_msg = SyncMessage::NegOpen { msg: initial_msg };
+    if let Some(b) = bytes.as_ref() {
+        b.add_sent(sync_message_len(&open_msg));
+    }
+    io.ctrl_tx.send(open_msg).await?;
 
     let mut reconciliation_done = false;
     let mut rounds = 0;
 
-    loop {
+    'sync_loop: loop {
         if start.elapsed() >= timeout {
             warn!("Timeout");
             break;
@@ -262,33 +648,77 @@ async fn run_sync_initiator(
 
         // First: drain all pending receives (non-blocking)
         loop {
-            match tokio::time::timeout(Duration::from_millis(1), conn.recv()).await {
-                Ok(Ok(SyncMessage::NegMsg { msg })) => {
-                    rounds += 1;
-                    match neg.reconcile_with_ids(&msg, &mut have_ids, &mut need_ids)? {
-                        Some(next_msg) => {
-                            conn.send(&SyncMessage::NegMsg { msg: next_msg }).await?;
+            match tokio::time::timeout(Duration::from_millis(1), io.inbound_rx.recv()).await {
+                Ok(Some(msg)) => {
+                    if let Some(b) = bytes.as_ref() {
+                        b.add_recv(sync_message_len(&msg));
+                    }
+                    match msg {
+                        SyncMessage::NegMsg { msg } => {
+                            rounds += 1;
+                            match neg.reconcile_with_ids(&msg, &mut have_ids, &mut need_ids)? {
+                                Some(next_msg) => {
+                                    let neg_msg = SyncMessage::NegMsg { msg: next_msg };
+                                    if let Some(b) = bytes.as_ref() {
+                                        b.add_sent(sync_message_len(&neg_msg));
+                                    }
+                                    io.ctrl_tx.send(neg_msg).await?;
+                                }
+                                None => {
+                                    info!(
+                                        "Reconciliation complete in {} rounds: {} have, {} need",
+                                        rounds,
+                                        have_ids.len(),
+                                        need_ids.len()
+                                    );
+                                    reconciliation_done = true;
+                                }
+                            }
+
+                            if !have_ids.is_empty() {
+                                let mut batch: Vec<EventId> = Vec::with_capacity(have_ids.len());
+                                for neg_id in &have_ids {
+                                    let event_id = neg_id_to_event_id(neg_id);
+                                    if sent.insert(&event_id).unwrap_or(false) {
+                                        batch.push(event_id);
+                                    }
+                                }
+                                let _ = outgoing.enqueue_batch(&batch);
+                                have_ids.clear();
+                            }
+
+                            if !need_ids.is_empty() {
+                                let mut new_needs: Vec<EventId> = Vec::with_capacity(need_ids.len());
+                                for neg_id in &need_ids {
+                                    let event_id = neg_id_to_event_id(neg_id);
+                                    if wanted.insert(&event_id).unwrap_or(false) {
+                                        new_needs.push(event_id);
+                                    }
+                                }
+                                if !new_needs.is_empty() {
+                                    let have_msg = SyncMessage::HaveList { ids: new_needs };
+                                    if let Some(b) = bytes.as_ref() {
+                                        b.add_sent(sync_message_len(&have_msg));
+                                    }
+                                    io.ctrl_tx.send(have_msg).await?;
+                                }
+                                need_ids.clear();
+                            }
+
+                            if reconciliation_done && recon_only {
+                                info!("Reconcile-only mode: stopping after reconciliation");
+                                break 'sync_loop;
+                            }
                         }
-                        None => {
-                            info!("Reconciliation complete in {} rounds: {} have, {} need",
-                                rounds, have_ids.len(), need_ids.len());
-                            reconciliation_done = true;
+                        SyncMessage::Event { blob } => {
+                            let event_id = hash_event(&blob);
+                            enqueue_event(&tx, event_id, blob).await;
                         }
+                        _ => {}
                     }
                 }
-                Ok(Ok(SyncMessage::Event { blob })) => {
-                    let event_id = hash_event(&blob);
-                    let _ = tx.try_send((event_id, blob));
-                }
-                Ok(Ok(_)) => {}
-                Ok(Err(transport::connection::ConnectionError::Closed)) => {
+                Ok(None) => {
                     info!("Connection closed by peer");
-                    drop(tx);
-                    let _ = writer_handle.await;
-                    return Ok(SyncStats { events_sent, events_received: events_received.load(Ordering::Relaxed), neg_rounds: rounds });
-                }
-                Ok(Err(e)) => {
-                    warn!("Connection error: {}", e);
                     drop(tx);
                     let _ = writer_handle.await;
                     return Ok(SyncStats { events_sent, events_received: events_received.load(Ordering::Relaxed), neg_rounds: rounds });
@@ -299,53 +729,253 @@ async fn run_sync_initiator(
 
         // Second: send a batch of events
         let mut sent_this_round = 0;
-        for neg_id in &have_ids {
-            let event_id = neg_id_to_event_id(neg_id);
-            if !have_sent.contains(&event_id) {
-                if let Some(blob) = blob_cache.get(&event_id) {
-                    if conn.send(&SyncMessage::Event { blob: blob.clone() }).await.is_ok() {
+        let batch = outgoing.dequeue_batch(500).unwrap_or_default();
+        let mut sent_ids: Vec<EventId> = Vec::with_capacity(batch.len());
+        for event_id in batch {
+            match store.get(&event_id) {
+                Ok(Some(blob)) => {
+                    let msg_len = 1 + blob.len();
+                    if io.data_tx.send(SyncMessage::Event { blob }).await.is_ok() {
+                        if let Some(b) = bytes.as_ref() {
+                            b.add_sent(msg_len);
+                        }
                         events_sent += 1;
-                        have_sent.insert(event_id);
+                        sent_ids.push(event_id);
                         sent_this_round += 1;
                         if sent_this_round >= 500 {
-                            break; // Send batch, then check for receives again
+                            break;
                         }
+                    } else {
+                        break;
                     }
-                } else {
-                    have_sent.insert(event_id);
+                }
+                Ok(None) => {
+                    sent_ids.push(event_id);
+                }
+                Err(e) => {
+                    warn!("Failed to load blob for {:?}: {}", event_id, e);
+                    sent_ids.push(event_id);
                 }
             }
         }
+        let _ = outgoing.remove_batch(&sent_ids);
 
-        // Third: send HaveList for events we need
-        let mut new_needs: Vec<EventId> = Vec::new();
-        for neg_id in &need_ids {
-            let event_id = neg_id_to_event_id(neg_id);
-            if !need_requested.contains(&event_id) {
-                new_needs.push(event_id);
-                need_requested.insert(event_id);
+        if reconciliation_done {
+            let pending_out = outgoing.count().unwrap_or(0);
+            let pending_in = wanted.count().unwrap_or(0);
+            if pending_out == 0 && pending_in == 0 {
+                info!("Sync complete: sent {}, received {}", events_sent, events_received.load(Ordering::Relaxed));
+                break;
             }
-        }
-        if !new_needs.is_empty() {
-            conn.send(&SyncMessage::HaveList { ids: new_needs }).await?;
-        }
-
-        let _ = conn.flush().await;
-
-        // Check completion
-        let received = events_received.load(Ordering::Relaxed);
-        if reconciliation_done
-            && have_sent.len() == have_ids.len()
-            && need_requested.len() as u64 == received
-        {
-            info!("Sync complete: sent {}, received {}", events_sent, received);
-            break;
         }
     }
 
     drop(tx);
     let _ = writer_handle.await;
+    let stats = SyncStats {
+        events_sent,
+        events_received: events_received.load(Ordering::Relaxed),
+        neg_rounds: rounds,
+    };
+    info!("Sync stats: {:?}", stats);
+    Ok(stats)
+}
 
+async fn run_sync_initiator_dual(
+    ctrl_conn: Box<dyn SyncConnection>,
+    data_out_conn: Box<dyn SyncConnection>,
+    data_in_conn: Box<dyn SyncConnection>,
+    db_path: &str,
+    timeout_secs: u64,
+    bytes: Option<Arc<ByteCounters>>,
+) -> Result<SyncStats, Box<dyn std::error::Error + Send + Sync>> {
+    let start = std::time::Instant::now();
+    let timeout = Duration::from_secs(timeout_secs);
+    let recon_only = std::env::var("RECON_ONLY").is_ok();
+
+    info!("Starting negentropy sync (initiator) for {} seconds", timeout_secs);
+
+    let db = open_connection(db_path)?;
+    let block_size = neg_block_size();
+    let rebuild_threshold = neg_rebuild_threshold(block_size);
+    let max_bytes = neg_max_bytes() as u64;
+    ensure_negentropy_index(&db, block_size, rebuild_threshold)?;
+    let storage = NegentropyStorageSqlite::new(&db, block_size)?;
+    let item_count = storage.size().unwrap_or(0);
+    info!("Negentropy items: {}", item_count);
+    let mut neg = Negentropy::borrowed(&storage, max_bytes)?;
+
+    let store = Store::new(&db);
+    let wanted = WantedEvents::new(&db);
+    let outgoing = OutgoingQueue::new(&db);
+    let sent = SentEvents::new(&db);
+    let _ = outgoing.clear();
+    let _ = wanted.clear();
+    let _ = sent.clear();
+
+    let (tx, rx) = mpsc::channel::<(EventId, Vec<u8>)>(event_chan_cap());
+    let events_received = Arc::new(AtomicU64::new(0));
+    let events_received_writer = events_received.clone();
+
+    let db_path_owned = db_path.to_string();
+    let writer_handle = tokio::task::spawn_blocking(move || {
+        batch_writer(db_path_owned, rx, events_received_writer)
+    });
+
+    let mut ctrl_io = start_ctrl_io(ctrl_conn);
+    let (data_tx, _data_send_handle) = start_data_sender(data_out_conn);
+    let (mut data_rx, _data_recv_handle) = start_data_receiver(data_in_conn);
+
+    let mut have_ids: Vec<Id> = Vec::new();
+    let mut need_ids: Vec<Id> = Vec::new();
+    let mut events_sent: u64 = 0;
+
+    let initial_msg = neg.initiate()?;
+    let open_msg = SyncMessage::NegOpen { msg: initial_msg };
+    if let Some(b) = bytes.as_ref() {
+        b.add_sent(sync_message_len(&open_msg));
+    }
+    ctrl_io.tx.send(open_msg).await?;
+
+    let mut reconciliation_done = false;
+    let mut rounds = 0;
+
+    'sync_loop: loop {
+        if start.elapsed() >= timeout {
+            warn!("Timeout");
+            break;
+        }
+
+        loop {
+            let recv_fut = async {
+                tokio::select! {
+                    msg = ctrl_io.rx.recv() => msg,
+                    msg = data_rx.recv() => msg,
+                }
+            };
+            match tokio::time::timeout(Duration::from_millis(1), recv_fut).await {
+                Ok(Some(msg)) => {
+                    if let Some(b) = bytes.as_ref() {
+                        b.add_recv(sync_message_len(&msg));
+                    }
+                    match msg {
+                        SyncMessage::NegMsg { msg } => {
+                            rounds += 1;
+                            match neg.reconcile_with_ids(&msg, &mut have_ids, &mut need_ids)? {
+                                Some(next_msg) => {
+                                    let neg_msg = SyncMessage::NegMsg { msg: next_msg };
+                                    if let Some(b) = bytes.as_ref() {
+                                        b.add_sent(sync_message_len(&neg_msg));
+                                    }
+                                    ctrl_io.tx.send(neg_msg).await?;
+                                }
+                                None => {
+                                    info!(
+                                        "Reconciliation complete in {} rounds: {} have, {} need",
+                                        rounds,
+                                        have_ids.len(),
+                                        need_ids.len()
+                                    );
+                                    reconciliation_done = true;
+                                }
+                            }
+
+                            if !have_ids.is_empty() {
+                                let mut batch: Vec<EventId> = Vec::with_capacity(have_ids.len());
+                                for neg_id in &have_ids {
+                                    let event_id = neg_id_to_event_id(neg_id);
+                                    if sent.insert(&event_id).unwrap_or(false) {
+                                        batch.push(event_id);
+                                    }
+                                }
+                                let _ = outgoing.enqueue_batch(&batch);
+                                have_ids.clear();
+                            }
+
+                            if !need_ids.is_empty() {
+                                let mut new_needs: Vec<EventId> = Vec::with_capacity(need_ids.len());
+                                for neg_id in &need_ids {
+                                    let event_id = neg_id_to_event_id(neg_id);
+                                    if wanted.insert(&event_id).unwrap_or(false) {
+                                        new_needs.push(event_id);
+                                    }
+                                }
+                                if !new_needs.is_empty() {
+                                    let have_msg = SyncMessage::HaveList { ids: new_needs };
+                                    if let Some(b) = bytes.as_ref() {
+                                        b.add_sent(sync_message_len(&have_msg));
+                                    }
+                                    ctrl_io.tx.send(have_msg).await?;
+                                }
+                                need_ids.clear();
+                            }
+
+                            if reconciliation_done && recon_only {
+                                info!("Reconcile-only mode: stopping after reconciliation");
+                                break 'sync_loop;
+                            }
+                        }
+                        SyncMessage::Event { blob } => {
+                            let event_id = hash_event(&blob);
+                            enqueue_event(&tx, event_id, blob).await;
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(None) => {
+                    info!("Connection closed by peer");
+                    drop(tx);
+                    let _ = writer_handle.await;
+                    return Ok(SyncStats { events_sent, events_received: events_received.load(Ordering::Relaxed), neg_rounds: rounds });
+                }
+                Err(_) => break,
+            }
+        }
+
+        let mut sent_this_round = 0;
+        let batch = outgoing.dequeue_batch(500).unwrap_or_default();
+        let mut sent_ids: Vec<EventId> = Vec::with_capacity(batch.len());
+        for event_id in batch {
+            match store.get(&event_id) {
+                Ok(Some(blob)) => {
+                    let msg_len = 1 + blob.len();
+                    if data_tx.send(SyncMessage::Event { blob }).await.is_ok() {
+                        if let Some(b) = bytes.as_ref() {
+                            b.add_sent(msg_len);
+                        }
+                        events_sent += 1;
+                        sent_ids.push(event_id);
+                        sent_this_round += 1;
+                        if sent_this_round >= 500 {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                Ok(None) => {
+                    sent_ids.push(event_id);
+                }
+                Err(e) => {
+                    warn!("Failed to load blob for {:?}: {}", event_id, e);
+                    sent_ids.push(event_id);
+                }
+            }
+        }
+        let _ = outgoing.remove_batch(&sent_ids);
+
+        if reconciliation_done {
+            let pending_out = outgoing.count().unwrap_or(0);
+            let pending_in = wanted.count().unwrap_or(0);
+            if pending_out == 0 && pending_in == 0 {
+                info!("Sync complete: sent {}, received {}", events_sent, events_received.load(Ordering::Relaxed));
+                break;
+            }
+        }
+    }
+
+    drop(tx);
+    let _ = writer_handle.await;
     let stats = SyncStats {
         events_sent,
         events_received: events_received.load(Ordering::Relaxed),
@@ -382,6 +1012,7 @@ fn batch_writer(
 
     let store = Store::new(&db);
     let shareable = Shareable::new(&db);
+    let wanted = WantedEvents::new(&db);
 
     // Prepare projection statement
     let mut project_stmt = match db.prepare(
@@ -438,10 +1069,27 @@ fn batch_writer(
 
         if no_deps {
             // NO_DEPS: Skip dependency reads (baseline)
+            let block_size = neg_block_size();
+            let mut neg_inserter = match NegentropyBatchInserter::new(&db, block_size) {
+                Ok(inserter) => Some(inserter),
+                Err(e) => {
+                    error!("Failed to init negentropy inserter: {}", e);
+                    None
+                }
+            };
             if db.execute("BEGIN", []).is_ok() {
                 for (event_id, blob) in &batch {
                     let _ = store.put(event_id, blob);
                     let _ = shareable.insert(event_id);
+                    let _ = wanted.remove(event_id);
+
+                    if let Some(ts) = Envelope::extract_created_at(blob) {
+                        if let Some(inserter) = neg_inserter.as_mut() {
+                            if let Err(e) = inserter.insert(ts, event_id) {
+                                error!("Failed to insert negentropy item: {}", e);
+                            }
+                        }
+                    }
 
                     if let Ok((_, envelope)) = Envelope::parse(blob) {
                         let message_id = event_id_to_base64(event_id);
@@ -456,14 +1104,36 @@ fn batch_writer(
                         ]);
                     }
                 }
+                if let Some(inserter) = neg_inserter {
+                    if let Err(e) = inserter.finish() {
+                        error!("Failed to finalize negentropy batch: {}", e);
+                    }
+                }
                 let _ = db.execute("COMMIT", []);
             }
         } else if use_naive {
             // NAIVE: Read dependencies inside projection loop (slower)
+            let block_size = neg_block_size();
+            let mut neg_inserter = match NegentropyBatchInserter::new(&db, block_size) {
+                Ok(inserter) => Some(inserter),
+                Err(e) => {
+                    error!("Failed to init negentropy inserter: {}", e);
+                    None
+                }
+            };
             if db.execute("BEGIN", []).is_ok() {
                 for (idx, (event_id, blob)) in batch.iter().enumerate() {
                     let _ = store.put(event_id, blob);
                     let _ = shareable.insert(event_id);
+                    let _ = wanted.remove(event_id);
+
+                    if let Some(ts) = Envelope::extract_created_at(blob) {
+                        if let Some(inserter) = neg_inserter.as_mut() {
+                            if let Err(e) = inserter.insert(ts, event_id) {
+                                error!("Failed to insert negentropy item: {}", e);
+                            }
+                        }
+                    }
 
                     if let Ok((_, envelope)) = Envelope::parse(blob) {
                         // Naive: 10 individual reads per event during projection
@@ -488,6 +1158,11 @@ fn batch_writer(
                             &envelope.payload.content,
                             envelope.payload.created_at_ms as i64
                         ]);
+                    }
+                }
+                if let Some(inserter) = neg_inserter {
+                    if let Err(e) = inserter.finish() {
+                        error!("Failed to finalize negentropy batch: {}", e);
                     }
                 }
                 let _ = db.execute("COMMIT", []);
@@ -524,10 +1199,27 @@ fn batch_writer(
             }
 
             // Phase 3: Write batch in single transaction
+            let block_size = neg_block_size();
+            let mut neg_inserter = match NegentropyBatchInserter::new(&db, block_size) {
+                Ok(inserter) => Some(inserter),
+                Err(e) => {
+                    error!("Failed to init negentropy inserter: {}", e);
+                    None
+                }
+            };
             if db.execute("BEGIN", []).is_ok() {
                 for (idx, (event_id, blob)) in batch.iter().enumerate() {
                     let _ = store.put(event_id, blob);
                     let _ = shareable.insert(event_id);
+                    let _ = wanted.remove(event_id);
+
+                    if let Some(ts) = Envelope::extract_created_at(blob) {
+                        if let Some(inserter) = neg_inserter.as_mut() {
+                            if let Err(e) = inserter.insert(ts, event_id) {
+                                error!("Failed to insert negentropy item: {}", e);
+                            }
+                        }
+                    }
 
                     if let Ok((_, envelope)) = Envelope::parse(blob) {
                         // Access pre-fetched dependencies
@@ -550,6 +1242,11 @@ fn batch_writer(
                         ]);
                     }
                 }
+                if let Some(inserter) = neg_inserter {
+                    if let Err(e) = inserter.finish() {
+                        error!("Failed to finalize negentropy batch: {}", e);
+                    }
+                }
                 let _ = db.execute("COMMIT", []);
             }
         }
@@ -561,35 +1258,36 @@ fn batch_writer(
 /// Run sync as the responder (server role)
 /// Uses channels and batching for high throughput
 async fn run_sync_responder(
-    conn: &mut Connection,
+    conn: Box<dyn SyncConnection>,
     db_path: &str,
     timeout_secs: u64,
+    bytes: Option<Arc<ByteCounters>>,
 ) -> Result<SyncStats, Box<dyn std::error::Error + Send + Sync>> {
     let start = std::time::Instant::now();
     let timeout = Duration::from_secs(timeout_secs);
+    let recon_only = std::env::var("RECON_ONLY").is_ok();
 
     info!("Starting negentropy sync (responder) for {} seconds", timeout_secs);
 
-    // Phase 1: Load data and prefetch blobs into memory
+    // Phase 1: Initialize negentropy storage
     let db = open_connection(db_path)?;
-    let items = load_negentropy_items(&db)?;
-    info!("Loaded {} items for negentropy", items.len());
-
-    let storage = build_negentropy_storage(&items)?;
-    let mut neg = Negentropy::owned(storage, 64 * 1024)?;
+    let block_size = neg_block_size();
+    let rebuild_threshold = neg_rebuild_threshold(block_size);
+    let max_bytes = neg_max_bytes() as u64;
+    ensure_negentropy_index(&db, block_size, rebuild_threshold)?;
+    let storage = NegentropyStorageSqlite::new(&db, block_size)?;
+    let item_count = storage.size().unwrap_or(0);
+    info!("Negentropy items: {}", item_count);
+    let mut neg = Negentropy::borrowed(&storage, max_bytes)?;
 
     let store = Store::new(&db);
-    let mut blob_cache: HashMap<EventId, Vec<u8>> = HashMap::new();
-    for item in &items {
-        if let Ok(Some(blob)) = store.get(&item.id) {
-            blob_cache.insert(item.id, blob);
-        }
-    }
-    info!("Prefetched {} blobs into cache", blob_cache.len());
-    drop(db);
+    let outgoing = OutgoingQueue::new(&db);
+    let sent = SentEvents::new(&db);
+    let _ = outgoing.clear();
+    let _ = sent.clear();
 
     // Phase 2: Set up channel for incoming events
-    let (tx, rx) = mpsc::channel::<(EventId, Vec<u8>)>(100_000);
+    let (tx, rx) = mpsc::channel::<(EventId, Vec<u8>)>(event_chan_cap());
     let events_received = Arc::new(AtomicU64::new(0));
     let events_received_writer = events_received.clone();
 
@@ -598,66 +1296,62 @@ async fn run_sync_responder(
         batch_writer(db_path_owned, rx, events_received_writer)
     });
 
+    let mut io = start_io(conn);
+
     // Phase 3: Network I/O loop
     let mut events_sent: u64 = 0;
-    let mut reconciliation_done = false;
     let mut rounds = 0;
-    let mut idle_count = 0;
-    const MAX_IDLE: u32 = 100;
 
-    // Queue of events to send (from HaveList requests)
-    let mut send_queue: Vec<Vec<u8>> = Vec::new();
-
-    loop {
+    'sync_loop: loop {
         if start.elapsed() >= timeout {
             warn!("Timeout");
             break;
         }
 
-        if reconciliation_done && send_queue.is_empty() && idle_count >= MAX_IDLE {
-            break;
-        }
 
         // First: drain all pending receives
         loop {
-            match tokio::time::timeout(Duration::from_millis(1), conn.recv()).await {
-                Ok(Ok(SyncMessage::NegOpen { msg })) | Ok(Ok(SyncMessage::NegMsg { msg })) => {
-                    idle_count = 0;
-                    rounds += 1;
-
-                    let response = neg.reconcile(&msg)?;
-                    if response.is_empty() {
-                        info!("Reconciliation complete in {} rounds", rounds);
-                        reconciliation_done = true;
-                    } else {
-                        conn.send(&SyncMessage::NegMsg { msg: response }).await?;
-                        conn.flush().await?;
+            match tokio::time::timeout(Duration::from_millis(1), io.inbound_rx.recv()).await {
+                Ok(Some(msg)) => {
+                    if let Some(b) = bytes.as_ref() {
+                        b.add_recv(sync_message_len(&msg));
                     }
-                }
-                Ok(Ok(SyncMessage::HaveList { ids })) => {
-                    idle_count = 0;
-                    reconciliation_done = true;
+                    match msg {
+                        SyncMessage::NegOpen { msg } | SyncMessage::NegMsg { msg } => {
+                            rounds += 1;
 
-                    // Queue events for sending
-                    for id in &ids {
-                        if let Some(blob) = blob_cache.get(id) {
-                            send_queue.push(blob.clone());
+                            let response = neg.reconcile(&msg)?;
+                            if response.is_empty() {
+                                info!("Reconciliation complete in {} rounds", rounds);
+                                if recon_only {
+                                    info!("Reconcile-only mode: stopping after reconciliation");
+                                    break 'sync_loop;
+                                }
+                            } else {
+                                let neg_msg = SyncMessage::NegMsg { msg: response };
+                                if let Some(b) = bytes.as_ref() {
+                                    b.add_sent(sync_message_len(&neg_msg));
+                                }
+                                io.ctrl_tx.send(neg_msg).await?;
+                            }
+                        }
+                        SyncMessage::HaveList { ids } => {
+                            let mut batch: Vec<EventId> = Vec::with_capacity(ids.len());
+                            for id in ids {
+                                if sent.insert(&id).unwrap_or(false) {
+                                    batch.push(id);
+                                }
+                            }
+                            let _ = outgoing.enqueue_batch(&batch);
+                        }
+                        SyncMessage::Event { blob } => {
+                            let event_id = hash_event(&blob);
+                            enqueue_event(&tx, event_id, blob).await;
                         }
                     }
                 }
-                Ok(Ok(SyncMessage::Event { blob })) => {
-                    idle_count = 0;
-                    let event_id = hash_event(&blob);
-                    let _ = tx.try_send((event_id, blob));
-                }
-                Ok(Err(transport::connection::ConnectionError::Closed)) => {
+                Ok(None) => {
                     info!("Connection closed by peer");
-                    drop(tx);
-                    let _ = writer_handle.await;
-                    return Ok(SyncStats { events_sent, events_received: events_received.load(Ordering::Relaxed), neg_rounds: rounds });
-                }
-                Ok(Err(e)) => {
-                    warn!("Connection error: {}", e);
                     drop(tx);
                     let _ = writer_handle.await;
                     return Ok(SyncStats { events_sent, events_received: events_received.load(Ordering::Relaxed), neg_rounds: rounds });
@@ -668,27 +1362,187 @@ async fn run_sync_responder(
 
         // Second: send a batch from queue
         let mut sent_this_round = 0;
-        while let Some(blob) = send_queue.pop() {
-            if conn.send(&SyncMessage::Event { blob }).await.is_ok() {
-                events_sent += 1;
-                sent_this_round += 1;
-                if sent_this_round >= 500 {
-                    break;
+        let batch = outgoing.dequeue_batch(500).unwrap_or_default();
+        let mut sent_ids: Vec<EventId> = Vec::with_capacity(batch.len());
+        for id in batch {
+            match store.get(&id) {
+                Ok(Some(blob)) => {
+                    let msg_len = 1 + blob.len();
+                    if io.data_tx.send(SyncMessage::Event { blob }).await.is_ok() {
+                        if let Some(b) = bytes.as_ref() {
+                            b.add_sent(msg_len);
+                        }
+                        events_sent += 1;
+                        sent_ids.push(id);
+                        sent_this_round += 1;
+                        if sent_this_round >= 500 {
+                            break;
+                        }
+                    }
                 }
+                Ok(None) => {
+                    sent_ids.push(id);
+                }
+                Err(e) => warn!("Failed to load blob for {:?}: {}", id, e),
             }
         }
+        let _ = outgoing.remove_batch(&sent_ids);
 
-        if sent_this_round > 0 {
-            let _ = conn.flush().await;
-            idle_count = 0;
-        } else if reconciliation_done {
-            idle_count += 1;
-        }
+        let _ = sent_this_round;
     }
 
     drop(tx);
     let _ = writer_handle.await;
+    let stats = SyncStats {
+        events_sent,
+        events_received: events_received.load(Ordering::Relaxed),
+        neg_rounds: rounds,
+    };
+    info!("Sync stats: {:?}", stats);
+    Ok(stats)
+}
 
+async fn run_sync_responder_dual(
+    ctrl_conn: Box<dyn SyncConnection>,
+    data_out_conn: Box<dyn SyncConnection>,
+    data_in_conn: Box<dyn SyncConnection>,
+    db_path: &str,
+    timeout_secs: u64,
+    bytes: Option<Arc<ByteCounters>>,
+) -> Result<SyncStats, Box<dyn std::error::Error + Send + Sync>> {
+    let start = std::time::Instant::now();
+    let timeout = Duration::from_secs(timeout_secs);
+    let recon_only = std::env::var("RECON_ONLY").is_ok();
+
+    info!("Starting negentropy sync (responder) for {} seconds", timeout_secs);
+
+    let db = open_connection(db_path)?;
+    let block_size = neg_block_size();
+    let rebuild_threshold = neg_rebuild_threshold(block_size);
+    let max_bytes = neg_max_bytes() as u64;
+    ensure_negentropy_index(&db, block_size, rebuild_threshold)?;
+    let storage = NegentropyStorageSqlite::new(&db, block_size)?;
+    let item_count = storage.size().unwrap_or(0);
+    info!("Negentropy items: {}", item_count);
+    let mut neg = Negentropy::borrowed(&storage, max_bytes)?;
+
+    let store = Store::new(&db);
+    let outgoing = OutgoingQueue::new(&db);
+    let sent = SentEvents::new(&db);
+    let _ = outgoing.clear();
+    let _ = sent.clear();
+
+    let (tx, rx) = mpsc::channel::<(EventId, Vec<u8>)>(event_chan_cap());
+    let events_received = Arc::new(AtomicU64::new(0));
+    let events_received_writer = events_received.clone();
+
+    let db_path_owned = db_path.to_string();
+    let writer_handle = tokio::task::spawn_blocking(move || {
+        batch_writer(db_path_owned, rx, events_received_writer)
+    });
+
+    let mut ctrl_io = start_ctrl_io(ctrl_conn);
+    let (data_tx, _data_send_handle) = start_data_sender(data_out_conn);
+    let (mut data_rx, _data_recv_handle) = start_data_receiver(data_in_conn);
+
+    let mut events_sent: u64 = 0;
+    let mut rounds = 0;
+
+    'sync_loop: loop {
+        if start.elapsed() >= timeout {
+            warn!("Timeout");
+            break;
+        }
+
+        loop {
+            let recv_fut = async {
+                tokio::select! {
+                    msg = ctrl_io.rx.recv() => msg,
+                    msg = data_rx.recv() => msg,
+                }
+            };
+            match tokio::time::timeout(Duration::from_millis(1), recv_fut).await {
+                Ok(Some(msg)) => {
+                    if let Some(b) = bytes.as_ref() {
+                        b.add_recv(sync_message_len(&msg));
+                    }
+                    match msg {
+                        SyncMessage::NegOpen { msg } | SyncMessage::NegMsg { msg } => {
+                            rounds += 1;
+
+                            let response = neg.reconcile(&msg)?;
+                            if response.is_empty() {
+                                info!("Reconciliation complete in {} rounds", rounds);
+                                if recon_only {
+                                    info!("Reconcile-only mode: stopping after reconciliation");
+                                    break 'sync_loop;
+                                }
+                            } else {
+                                let neg_msg = SyncMessage::NegMsg { msg: response };
+                                if let Some(b) = bytes.as_ref() {
+                                    b.add_sent(sync_message_len(&neg_msg));
+                                }
+                                ctrl_io.tx.send(neg_msg).await?;
+                            }
+                        }
+                        SyncMessage::HaveList { ids } => {
+                            let mut batch: Vec<EventId> = Vec::with_capacity(ids.len());
+                            for id in ids {
+                                if sent.insert(&id).unwrap_or(false) {
+                                    batch.push(id);
+                                }
+                            }
+                            let _ = outgoing.enqueue_batch(&batch);
+                        }
+                        SyncMessage::Event { blob } => {
+                            let event_id = hash_event(&blob);
+                            enqueue_event(&tx, event_id, blob).await;
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(None) => {
+                    info!("Connection closed by peer");
+                    drop(tx);
+                    let _ = writer_handle.await;
+                    return Ok(SyncStats { events_sent, events_received: events_received.load(Ordering::Relaxed), neg_rounds: rounds });
+                }
+                Err(_) => break,
+            }
+        }
+
+        let mut sent_this_round = 0;
+        let batch = outgoing.dequeue_batch(500).unwrap_or_default();
+        let mut sent_ids: Vec<EventId> = Vec::with_capacity(batch.len());
+        for id in batch {
+            match store.get(&id) {
+                Ok(Some(blob)) => {
+                    let msg_len = 1 + blob.len();
+                    if data_tx.send(SyncMessage::Event { blob }).await.is_ok() {
+                        if let Some(b) = bytes.as_ref() {
+                            b.add_sent(msg_len);
+                        }
+                        events_sent += 1;
+                        sent_ids.push(id);
+                        sent_this_round += 1;
+                        if sent_this_round >= 500 {
+                            break;
+                        }
+                    }
+                }
+                Ok(None) => {
+                    sent_ids.push(id);
+                }
+                Err(e) => warn!("Failed to load blob for {:?}: {}", id, e),
+            }
+        }
+        let _ = outgoing.remove_batch(&sent_ids);
+
+        let _ = sent_this_round;
+    }
+
+    drop(tx);
+    let _ = writer_handle.await;
     let stats = SyncStats {
         events_sent,
         events_received: events_received.load(Ordering::Relaxed),
@@ -716,6 +1570,8 @@ fn generate_events(db_path: &str, count: usize, channel_hex: &str) -> Result<(),
 
     let store = Store::new(&db);
     let shareable = Shareable::new(&db);
+    let block_size = neg_block_size();
+    let mut neg_inserter = NegentropyBatchInserter::new(&db, block_size)?;
 
     // Prepare projection statement
     let mut project_stmt = db.prepare(
@@ -739,6 +1595,7 @@ fn generate_events(db_path: &str, count: usize, channel_hex: &str) -> Result<(),
 
         store.put(&event_id, &blob)?;
         shareable.insert(&event_id)?;
+        neg_inserter.insert(envelope.header.created_at_ms, &event_id)?;
 
         // Project inline
         let message_id = event_id_to_base64(&event_id);
@@ -752,6 +1609,8 @@ fn generate_events(db_path: &str, count: usize, channel_hex: &str) -> Result<(),
             envelope.payload.created_at_ms as i64
         ])?;
     }
+
+    neg_inserter.finish()?;
 
     info!("Generated {} events in {}", count, db_path);
     show_stats(db_path)?;
@@ -863,6 +1722,161 @@ async fn run_demo(events_per_peer: usize, timeout_secs: u64) -> Result<(), Box<d
     println!("Server has {} events, Client has {} events", server_store, client_store);
 
     let expected = events_per_peer * 2; // Both peers should have all events
+    if server_store >= expected as i64 && client_store >= expected as i64 {
+        println!("SUCCESS: Both peers have all {} events!", expected);
+    } else {
+        println!("Sync incomplete - expected {} events each", expected);
+    }
+
+    Ok(())
+}
+
+async fn run_sim(
+    events_per_peer: usize,
+    timeout_secs: u64,
+    latency_ms: u64,
+    bandwidth_kib: u64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    info!("=== Simulated Sync Demo ===");
+    info!(
+        "Generating {} events per peer, latency {} ms, bandwidth {} KiB/s, timeout {} seconds",
+        events_per_peer, latency_ms, bandwidth_kib, timeout_secs
+    );
+
+    // Clean up old databases
+    let _ = std::fs::remove_file("sim_server.db");
+    let _ = std::fs::remove_file("sim_server.db-shm");
+    let _ = std::fs::remove_file("sim_server.db-wal");
+    let _ = std::fs::remove_file("sim_client.db");
+    let _ = std::fs::remove_file("sim_client.db-shm");
+    let _ = std::fs::remove_file("sim_client.db-wal");
+
+    info!("Generating events for server...");
+    generate_events("sim_server.db", events_per_peer, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")?;
+
+    info!("Generating events for client...");
+    generate_events("sim_client.db", events_per_peer, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")?;
+
+    let bandwidth_bytes = bandwidth_kib.saturating_mul(1024);
+    let config = SimConfig {
+        latency_ms,
+        bandwidth_bytes_per_sec: bandwidth_bytes.max(1),
+    };
+
+    let (server_ctrl, client_ctrl) = create_sim_pair(config);
+    // One-way data links to avoid full-duplex contention in the simulator
+    let (client_data_out, server_data_in) = create_sim_pair(config);
+    let (server_data_out, client_data_in) = create_sim_pair(config);
+
+    reset_negentropy_profile();
+    negentropy::reset_negentropy_algo_profile();
+    let bytes = Arc::new(ByteCounters::default());
+    let bytes_task = bytes.clone();
+    let rss_max = Arc::new(AtomicU64::new(0));
+    let rss_max_task = rss_max.clone();
+    let start = std::time::Instant::now();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let (mem_tx, mut mem_rx) = tokio::sync::oneshot::channel::<()>();
+            let mem_task = tokio::task::spawn_local(async move {
+                let mut interval = tokio::time::interval(Duration::from_millis(MEM_SAMPLE_MS));
+                loop {
+                    tokio::select! {
+                        _ = &mut mem_rx => break,
+                        _ = interval.tick() => {
+                            if let Some(rss) = read_rss_bytes() {
+                                update_max_rss(&rss_max_task, rss);
+                            }
+                        }
+                    }
+                }
+            });
+
+            let bytes_server = bytes_task.clone();
+            let bytes_client = bytes_task.clone();
+
+            let server_task = tokio::task::spawn_local(async move {
+                let ctrl: SimConnection = server_ctrl;
+                let data_out: SimConnection = server_data_out;
+                let data_in: SimConnection = server_data_in;
+                if let Err(e) = run_sync_responder_dual(
+                    Box::new(ctrl),
+                    Box::new(data_out),
+                    Box::new(data_in),
+                    "sim_server.db",
+                    timeout_secs,
+                    Some(bytes_server),
+                )
+                .await {
+                    error!("Sim server error: {}", e);
+                }
+            });
+
+            let client_task = tokio::task::spawn_local(async move {
+                let ctrl: SimConnection = client_ctrl;
+                let data_out: SimConnection = client_data_out;
+                let data_in: SimConnection = client_data_in;
+                if let Err(e) = run_sync_initiator_dual(
+                    Box::new(ctrl),
+                    Box::new(data_out),
+                    Box::new(data_in),
+                    "sim_client.db",
+                    timeout_secs,
+                    Some(bytes_client),
+                )
+                .await {
+                    error!("Sim client error: {}", e);
+                }
+            });
+
+            let _ = tokio::join!(server_task, client_task);
+            let _ = mem_tx.send(());
+            let _ = mem_task.await;
+        })
+        .await;
+
+    let elapsed = start.elapsed();
+    let (bytes_sent, bytes_recv) = bytes.snapshot();
+    let total_mb = (bytes_sent as f64) / (1024.0 * 1024.0);
+    let mb_per_sec = if elapsed.as_secs_f64() > 0.0 {
+        total_mb / elapsed.as_secs_f64()
+    } else {
+        0.0
+    };
+    info!(
+        "Sim throughput: {:.2} MB/s over {:.2}s (sent={} bytes, recv={} bytes)",
+        mb_per_sec,
+        elapsed.as_secs_f64(),
+        bytes_sent,
+        bytes_recv
+    );
+    let rss_max_bytes = rss_max.load(Ordering::Relaxed);
+    if rss_max_bytes > 0 {
+        info!("Sim max RSS: {:.2} MB", (rss_max_bytes as f64) / (1024.0 * 1024.0));
+    }
+
+    log_negentropy_profile("sim");
+    negentropy::log_negentropy_algo_profile("sim");
+
+    info!("=== Sim Demo Complete ===");
+
+    println!("\nServer database:");
+    show_stats("sim_server.db")?;
+
+    println!("\nClient database:");
+    show_stats("sim_client.db")?;
+
+    let server_db = open_connection("sim_server.db")?;
+    let client_db = open_connection("sim_client.db")?;
+
+    let server_store: i64 = server_db.query_row("SELECT COUNT(*) FROM store", [], |row| row.get(0))?;
+    let client_store: i64 = client_db.query_row("SELECT COUNT(*) FROM store", [], |row| row.get(0))?;
+
+    println!("\n=== Sim Sync Verification ===");
+    println!("Server has {} events, Client has {} events", server_store, client_store);
+
+    let expected = events_per_peer * 2;
     if server_store >= expected as i64 && client_store >= expected as i64 {
         println!("SUCCESS: Both peers have all {} events!", expected);
     } else {

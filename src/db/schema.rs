@@ -17,10 +17,64 @@ pub fn create_tables(conn: &Connection) -> SqliteResult<()> {
             stored_at INTEGER NOT NULL
         );
 
+        -- Negentropy items (timestamp, event id)
+        CREATE TABLE IF NOT EXISTS neg_items (
+            ts INTEGER NOT NULL,
+            id BLOB NOT NULL,
+            PRIMARY KEY (ts, id)
+        ) WITHOUT ROWID;
+
+        -- Negentropy block index (first item per block)
+        CREATE TABLE IF NOT EXISTS neg_blocks (
+            block_idx INTEGER PRIMARY KEY,
+            ts INTEGER NOT NULL,
+            id BLOB NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_neg_blocks_ts_id ON neg_blocks(ts, id);
+
+        -- Negentropy block accumulators (sum of ids per block)
+        CREATE TABLE IF NOT EXISTS neg_block_accum (
+            block_idx INTEGER PRIMARY KEY,
+            count INTEGER NOT NULL,
+            accum BLOB NOT NULL
+        );
+
+        -- Negentropy dense index (row number -> item)
+        CREATE TABLE IF NOT EXISTS neg_index (
+            idx INTEGER PRIMARY KEY,
+            ts INTEGER NOT NULL,
+            id BLOB NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_neg_index_ts_id ON neg_index(ts, id);
+
+        -- Negentropy state (single row)
+        CREATE TABLE IF NOT EXISTS neg_state (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            max_ts INTEGER NOT NULL,
+            max_id BLOB NOT NULL,
+            item_count INTEGER NOT NULL,
+            blocks_built_at INTEGER NOT NULL,
+            needs_rebuild INTEGER NOT NULL,
+            block_size INTEGER NOT NULL
+        );
+
         -- Events we want but don't have yet (from refs we've seen)
         CREATE TABLE IF NOT EXISTS wanted_events (
-            id TEXT PRIMARY KEY,        -- Event ID we need
+            id BLOB PRIMARY KEY,        -- Event ID we need
             first_seen_at INTEGER NOT NULL
+        );
+
+        -- Outgoing send queue (events requested by peer)
+        CREATE TABLE IF NOT EXISTS outgoing_queue (
+            id BLOB PRIMARY KEY,
+            queued_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_outgoing_queue_queued_at ON outgoing_queue(queued_at);
+
+        -- Sent events (dedupe across reconciliation rounds within a session)
+        CREATE TABLE IF NOT EXISTS sent_events (
+            id BLOB PRIMARY KEY,
+            sent_at INTEGER NOT NULL
         );
 
         -- Incoming queue for projection
@@ -67,7 +121,14 @@ mod tests {
 
         assert!(tables.contains(&"store".to_string()));
         assert!(tables.contains(&"shareable_events".to_string()));
+        assert!(tables.contains(&"neg_items".to_string()));
+        assert!(tables.contains(&"neg_blocks".to_string()));
+        assert!(tables.contains(&"neg_block_accum".to_string()));
+        assert!(tables.contains(&"neg_index".to_string()));
+        assert!(tables.contains(&"neg_state".to_string()));
         assert!(tables.contains(&"wanted_events".to_string()));
+        assert!(tables.contains(&"outgoing_queue".to_string()));
+        assert!(tables.contains(&"sent_events".to_string()));
         assert!(tables.contains(&"incoming_queue".to_string()));
         assert!(tables.contains(&"messages".to_string()));
     }

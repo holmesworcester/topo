@@ -3,6 +3,8 @@ use tokio::io::AsyncWriteExt;
 
 use crate::sync::{parse_sync_message, encode_sync_message, SyncMessage};
 use crate::sync::protocol::ParseError;
+use crate::transport::sync_conn::SyncConnection;
+use async_trait::async_trait;
 
 /// Bidirectional QUIC stream wrapper for sync protocol
 pub struct Connection {
@@ -68,6 +70,26 @@ impl Connection {
         }
     }
 
+}
+
+#[async_trait]
+impl SyncConnection for Connection {
+    async fn send(&mut self, msg: &SyncMessage) -> Result<(), ConnectionError> {
+        Connection::send(self, msg).await
+    }
+
+    async fn send_bytes(&mut self, bytes: &[u8]) -> Result<(), ConnectionError> {
+        self.send.write_all(bytes).await?;
+        Ok(())
+    }
+
+    async fn flush(&mut self) -> Result<(), ConnectionError> {
+        Connection::flush(self).await
+    }
+
+    async fn recv(&mut self) -> Result<SyncMessage, ConnectionError> {
+        Connection::recv(self).await
+    }
 }
 
 #[derive(Debug)]

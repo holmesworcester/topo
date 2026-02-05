@@ -1,6 +1,9 @@
 pub mod schema;
 pub mod shareable;
 pub mod store;
+pub mod wanted;
+pub mod outgoing;
+pub mod sent;
 
 use rusqlite::{Connection, Result as SqliteResult};
 use std::path::Path;
@@ -20,14 +23,25 @@ pub fn open_in_memory() -> SqliteResult<Connection> {
 }
 
 fn apply_pragmas(conn: &Connection) -> SqliteResult<()> {
+    let cache_kib = std::env::var("DB_CACHE_KIB")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or_else(|| {
+            let low_mem = std::env::var("LOW_MEM").ok().map(|v| v != "0").unwrap_or(false);
+            if low_mem { 1024 } else { 4096 }
+        });
+
     conn.execute_batch(
-        "
-        PRAGMA journal_mode = WAL;
-        PRAGMA synchronous = NORMAL;
-        PRAGMA cache_size = -64000;
-        PRAGMA busy_timeout = 5000;
-        PRAGMA foreign_keys = OFF;
-        ",
+        &format!(
+            "
+            PRAGMA journal_mode = WAL;
+            PRAGMA synchronous = NORMAL;
+            PRAGMA cache_size = -{cache_kib};
+            PRAGMA busy_timeout = 5000;
+            PRAGMA foreign_keys = OFF;
+            "
+        ),
     )?;
     Ok(())
 }

@@ -14,6 +14,15 @@ pub enum SyncMessage {
     Event { blob: Vec<u8> },
 }
 
+/// Return encoded length (bytes) for a sync message
+pub fn sync_message_len(msg: &SyncMessage) -> usize {
+    match msg {
+        SyncMessage::NegOpen { msg: data } | SyncMessage::NegMsg { msg: data } => 5 + data.len(),
+        SyncMessage::HaveList { ids } => 5 + ids.len() * 32,
+        SyncMessage::Event { .. } => EVENT_SIZE,
+    }
+}
+
 
 /// Parse a sync message from bytes
 pub fn parse_sync_message(input: &[u8]) -> Result<(SyncMessage, usize), ParseError> {
