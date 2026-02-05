@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn, error, Level};
 use tracing_subscriber::FmtSubscriber;
 
@@ -492,6 +492,49 @@ fn batch_writer(
     }
 }
 
+fn spawn_data_receiver<R>(
+    mut data_recv: R,
+    ingest_tx: mpsc::Sender<(EventId, Vec<u8>)>,
+    bytes_received: Arc<AtomicU64>,
+) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>)
+where
+    R: StreamRecv + Send + 'static,
+{
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+    let handle = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => {
+                    break;
+                }
+                msg = data_recv.recv() => {
+                    match msg {
+                        Ok(SyncMessage::Event { blob }) => {
+                            bytes_received.fetch_add(blob.len() as u64, Ordering::Relaxed);
+                            let event_id = hash_event(&blob);
+                            if ingest_tx.send((event_id, blob)).await.is_err() {
+                                warn!("Ingest channel closed");
+                                break;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(transport::connection::ConnectionError::Closed) => {
+                            info!("Data stream closed by peer");
+                            break;
+                        }
+                        Err(e) => {
+                            warn!("Data stream error: {}", e);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    (shutdown_tx, handle)
+}
+
 /// Run sync as the initiator (client role) with dual streams
 /// Control stream: NegOpen, NegMsg, HaveList
 /// Data stream: Event blobs
@@ -515,7 +558,7 @@ where
     let DualConnection {
         mut control,
         mut data_send,
-        mut data_recv,
+        data_recv,
     } = conn;
     let start = std::time::Instant::now();
     let timeout = Duration::from_secs(timeout_secs);
@@ -565,41 +608,8 @@ where
     let mut need_ids: Vec<Id> = Vec::new();
     let mut events_sent: u64 = 0;
     let mut bytes_sent: u64 = 0;
-    let bytes_received_worker = bytes_received.clone();
-
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
-    let recv_handle = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
-                        break;
-                    }
-                }
-                msg = data_recv.recv() => {
-                    match msg {
-                        Ok(SyncMessage::Event { blob }) => {
-                            bytes_received_worker.fetch_add(blob.len() as u64, Ordering::Relaxed);
-                            let event_id = hash_event(&blob);
-                            if ingest_tx.send((event_id, blob)).await.is_err() {
-                                warn!("Ingest channel closed");
-                                break;
-                            }
-                        }
-                        Ok(_) => {}
-                        Err(transport::connection::ConnectionError::Closed) => {
-                            info!("Data stream closed by peer");
-                            break;
-                        }
-                        Err(e) => {
-                            warn!("Data stream error: {}", e);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    });
+    let (shutdown_tx, recv_handle) =
+        spawn_data_receiver(data_recv, ingest_tx, bytes_received.clone());
 
     // Send initial negentropy message on control stream
     let initial_msg = neg.initiate()?;
@@ -742,8 +752,7 @@ where
         let _ = wanted.clear();
     }
     let _ = neg_db.execute("COMMIT", []);
-    let _ = neg_db.execute("COMMIT", []);
-    let _ = shutdown_tx.send(true);
+    let _ = shutdown_tx.send(());
     let _ = recv_handle.await;
     let _ = writer_handle.await;
 
@@ -780,7 +789,7 @@ where
     let DualConnection {
         mut control,
         mut data_send,
-        mut data_recv,
+        data_recv,
     } = conn;
     let start = std::time::Instant::now();
     let timeout = Duration::from_secs(timeout_secs);
@@ -821,40 +830,8 @@ where
     let writer_handle =
         tokio::task::spawn_blocking(move || batch_writer(db_path_owned, ingest_rx, events_received_writer));
 
-    let bytes_received_worker = bytes_received.clone();
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
-    let recv_handle = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
-                        break;
-                    }
-                }
-                msg = data_recv.recv() => {
-                    match msg {
-                        Ok(SyncMessage::Event { blob }) => {
-                            bytes_received_worker.fetch_add(blob.len() as u64, Ordering::Relaxed);
-                            let event_id = hash_event(&blob);
-                            if ingest_tx.send((event_id, blob)).await.is_err() {
-                                warn!("Ingest channel closed");
-                                break;
-                            }
-                        }
-                        Ok(_) => {}
-                        Err(transport::connection::ConnectionError::Closed) => {
-                            info!("Data stream closed by peer");
-                            break;
-                        }
-                        Err(e) => {
-                            warn!("Data stream error: {}", e);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    });
+    let (shutdown_tx, recv_handle) =
+        spawn_data_receiver(data_recv, ingest_tx, bytes_received.clone());
 
     // Phase 3: Network I/O loop with dual streams
     let mut events_sent: u64 = 0;
@@ -958,7 +935,8 @@ where
     if completed {
         let _ = outgoing.clear_peer(peer_id);
     }
-    let _ = shutdown_tx.send(true);
+    let _ = neg_db.execute("COMMIT", []);
+    let _ = shutdown_tx.send(());
     let _ = recv_handle.await;
     let _ = writer_handle.await;
 

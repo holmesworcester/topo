@@ -43,7 +43,13 @@ fn run_demo(events: usize, env_vars: &[(&str, &str)]) -> Option<(f64, f64)> {
 }
 
 /// Run the sim command and return stdout/stderr (for throughput + memory reporting).
-fn run_sim(events: usize, timeout: usize, latency_ms: usize, bandwidth_kib: usize) -> Option<String> {
+fn run_sim(
+    events: usize,
+    timeout: usize,
+    latency_ms: usize,
+    bandwidth_kib: usize,
+    no_generate: bool,
+) -> Option<String> {
     let mut cmd = Command::new("cargo");
     cmd.args([
         "run",
@@ -59,6 +65,9 @@ fn run_sim(events: usize, timeout: usize, latency_ms: usize, bandwidth_kib: usiz
         "--bandwidth-kib",
         &bandwidth_kib.to_string(),
     ]);
+    if no_generate {
+        cmd.arg("--no-generate");
+    }
 
     let output = cmd.output().ok()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -176,7 +185,7 @@ fn perf_sim_throughput_10k() {
     assert!(run_generate("sim_server.db", 10_000, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
     assert!(run_generate("sim_client.db", 10_000, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
 
-    let output = run_sim(10_000, 30, 10, 50_000).unwrap_or_default();
+    let output = run_sim(10_000, 30, 10, 50_000, true).unwrap_or_default();
     println!("{}", output);
     assert!(output.contains("Throughput"), "Expected throughput output");
     assert!(output.contains("Peak RSS"), "Expected peak RSS output");
