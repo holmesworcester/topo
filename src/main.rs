@@ -1,9 +1,9 @@
-mod crypto;
-mod db;
-mod runtime;
-mod sync;
-mod transport;
-mod wire;
+use poc7_lib::crypto;
+use poc7_lib::db;
+use poc7_lib::runtime;
+use poc7_lib::sync;
+use poc7_lib::transport;
+use poc7_lib::wire;
 
 use clap::{Parser, Subcommand};
 use negentropy::{Negentropy, Id, NegentropyStorageBase, Storage};
@@ -16,12 +16,12 @@ use tokio::sync::mpsc;
 use tracing::{info, warn, error, Level};
 use tracing_subscriber::FmtSubscriber;
 
-use crate::crypto::{hash_event, event_id_to_base64, EventId};
-use crate::db::{open_connection, schema::create_tables, shareable::Shareable, store::Store};
-use crate::runtime::SyncStats;
-use crate::sync::{SyncMessage, load_negentropy_items, build_negentropy_storage, neg_id_to_event_id, NegentropyStorageSqlite};
-use crate::transport::{Connection, DualConnection, create_client_endpoint, create_server_endpoint, generate_keypair, generate_self_signed_cert};
-use crate::wire::Envelope;
+use crypto::{hash_event, event_id_to_base64, EventId};
+use db::{open_connection, schema::create_tables, shareable::Shareable, store::Store, PendingSend, Wanted};
+use runtime::SyncStats;
+use sync::{SyncMessage, load_negentropy_items, build_negentropy_storage, neg_id_to_event_id, NegentropyStorageSqlite};
+use transport::{Connection, DualConnection, create_client_endpoint, create_server_endpoint, generate_keypair, generate_self_signed_cert};
+use wire::Envelope;
 
 #[derive(Parser)]
 #[command(name = "poc-7")]
@@ -827,14 +827,23 @@ async fn run_sync_initiator_dual(
         }
     });
 
-    // Phase 4: State for sync
-    let mut have_ids: Vec<Id> = Vec::new();
-    let mut need_ids: Vec<Id> = Vec::new();
-    let mut have_idx: usize = 0;
+    // Phase 4: Set up DB-backed ID storage (O(1) memory)
+    let pending_send = PendingSend::new(&db);
+    let wanted = Wanted::new(&db);
+    pending_send.clear()?;
+    wanted.clear()?;
+
+    // State for sync (counts instead of vectors)
+    let mut total_to_send: i64 = 0;
+    let mut total_to_recv: i64 = 0;
     let mut reconciliation_done = false;
     let mut rounds = 0;
     let mut peer_done = false;
     let mut sent_done = false;
+
+    // Temporary vectors for reconcile_with_ids (cleared after writing to DB)
+    let mut have_ids: Vec<Id> = Vec::new();
+    let mut need_ids: Vec<Id> = Vec::new();
 
     // Send initial negentropy message
     let initial_msg = neg.initiate()?;
@@ -850,21 +859,25 @@ async fn run_sync_initiator_dual(
 
         // Check completion
         let received = events_received.load(Ordering::Relaxed);
-        let all_sent = have_idx >= have_ids.len();
-        let all_received = need_ids.is_empty() || received >= need_ids.len() as u64;
+        let sent = events_sent.load(Ordering::Relaxed);
+        let pending_count = pending_send.count().unwrap_or(0);
+        // all_sent means events have actually been transmitted, not just queued
+        let all_sent = total_to_send == 0 || sent >= total_to_send as u64;
+        let all_received = total_to_recv == 0 || received >= total_to_recv as u64;
 
         if reconciliation_done && all_sent && all_received && peer_done {
-            info!("Sync complete: sent {}, received {}", events_sent.load(Ordering::Relaxed), received);
+            info!("Sync complete: sent {}, received {}", sent, received);
             break;
         }
 
         // Progress log every 5 seconds
         if start.elapsed().as_secs() % 5 == 0 && start.elapsed().subsec_millis() < 10 {
             info!("Progress: sent={}/{}, recv={}/{}, recon={}, peer_done={}",
-                have_idx, have_ids.len(), received, need_ids.len(), reconciliation_done, peer_done);
+                sent, total_to_send, received, total_to_recv, reconciliation_done, peer_done);
         }
 
-        let has_pending_send = reconciliation_done && have_idx < have_ids.len();
+        // Still have pending events to queue to sender
+        let has_pending_send = reconciliation_done && pending_count > 0;
 
         tokio::select! {
             biased;
@@ -882,20 +895,36 @@ async fn run_sync_initiator_dual(
                                 ctrl_send.flush().await?;
                             }
                             None => {
+                                // Deduplicate IDs
                                 let have_set: HashSet<_> = have_ids.iter().cloned().collect();
                                 let need_set: HashSet<_> = need_ids.iter().cloned().collect();
-                                have_ids = have_set.into_iter().collect();
-                                need_ids = need_set.into_iter().collect();
+
+                                // Convert to EventIds and write to database
+                                let have_event_ids: Vec<EventId> = have_set.iter()
+                                    .map(|id| neg_id_to_event_id(id))
+                                    .collect();
+                                let need_event_ids: Vec<EventId> = need_set.iter()
+                                    .map(|id| neg_id_to_event_id(id))
+                                    .collect();
+
+                                pending_send.insert_batch(&have_event_ids)?;
+                                wanted.insert_batch(&need_event_ids)?;
+
+                                total_to_send = have_event_ids.len() as i64;
+                                total_to_recv = need_event_ids.len() as i64;
 
                                 info!("Reconciliation complete in {} rounds: {} have, {} need",
-                                    rounds, have_ids.len(), need_ids.len());
+                                    rounds, total_to_send, total_to_recv);
                                 reconciliation_done = true;
 
-                                if !need_ids.is_empty() {
-                                    let need_event_ids: Vec<EventId> = need_ids.iter()
-                                        .map(|id| neg_id_to_event_id(id))
-                                        .collect();
-                                    ctrl_send.send(&SyncMessage::HaveList { ids: need_event_ids }).await?;
+                                // Clear vectors to free memory
+                                have_ids.clear();
+                                need_ids.clear();
+
+                                // Tell peer what we need
+                                if total_to_recv > 0 {
+                                    let need_ids_to_send: Vec<EventId> = need_event_ids;
+                                    ctrl_send.send(&SyncMessage::HaveList { ids: need_ids_to_send }).await?;
                                     ctrl_send.flush().await?;
                                 }
                             }
@@ -936,19 +965,24 @@ async fn run_sync_initiator_dual(
 
         }
 
-        // Queue events to sender task (non-blocking via channel)
+        // Queue events to sender task (from database)
         if has_pending_send {
-            // Send batch of events to sender task
-            let batch_end = (have_idx + 100).min(have_ids.len());
-            while have_idx < batch_end {
-                let neg_id = &have_ids[have_idx];
-                let event_id = neg_id_to_event_id(neg_id);
-                if let Ok(Some(blob)) = store.get(&event_id) {
-                    if send_tx.try_send(blob).is_err() {
-                        break; // Channel full, try again next iteration
+            // Get batch from database
+            if let Ok(batch) = pending_send.get_batch(100) {
+                let mut sent_ids = Vec::new();
+                for event_id in &batch {
+                    if let Ok(Some(blob)) = store.get(event_id) {
+                        if send_tx.try_send(blob).is_err() {
+                            break; // Channel full, try again next iteration
+                        }
+                        sent_ids.push(*event_id);
+                    } else {
+                        // Event not found, still mark as sent to avoid infinite loop
+                        sent_ids.push(*event_id);
                     }
                 }
-                have_idx += 1;
+                // Delete sent IDs from pending
+                pending_send.delete_batch(&sent_ids).ok();
             }
         }
 
@@ -1056,17 +1090,18 @@ async fn run_sync_responder_dual(
         }
     });
 
-    // Phase 4: State for sync
+    // Phase 4: Set up DB-backed ID storage (O(1) memory)
+    let pending_send = PendingSend::new(&db);
+    pending_send.clear()?;
+
+    // State for sync
+    let mut total_to_send: i64 = 0;
     let mut reconciliation_done = false;
     let mut rounds = 0;
     let mut peer_done = false;
     let mut peer_done_time: Option<std::time::Instant> = None;
     let mut last_event_time: Option<std::time::Instant> = None;
     let mut sent_done = false;
-
-    // Queue of event IDs to send (from HaveList)
-    let mut send_queue: Vec<EventId> = Vec::new();
-    let mut send_idx: usize = 0;
 
     // Main loop using select! for true concurrent I/O
     loop {
@@ -1075,27 +1110,31 @@ async fn run_sync_responder_dual(
             break;
         }
 
-        let all_sent = send_idx >= send_queue.len();
+        let pending_count = pending_send.count().unwrap_or(0);
+        let sent = events_sent.load(Ordering::Relaxed);
+        // all_sent means events have actually been transmitted, not just queued
+        let all_sent = total_to_send == 0 || sent >= total_to_send as u64;
         // Exit conditions:
         // 1. Reconciliation is done
-        // 2. We've sent all our events
+        // 2. We've sent all our events (actually transmitted, not just queued)
         // 3. Peer signaled done
         // 4. Either no events for 100ms (stream drained) OR waited 500ms after peer done
         // Note: stream_quiet defaults to false (not true) - if we haven't received events yet, keep waiting
-        let stream_quiet = last_event_time.map_or(false, |t| t.elapsed() > Duration::from_millis(100));
-        let peer_wait_done = peer_done_time.map_or(false, |t| t.elapsed() > Duration::from_millis(500));
+        let stream_quiet = last_event_time.map_or(false, |t| t.elapsed() > Duration::from_millis(500));
+        let peer_wait_done = peer_done_time.map_or(false, |t| t.elapsed() > Duration::from_millis(1000));
         if reconciliation_done && all_sent && peer_done && (stream_quiet || peer_wait_done) {
-            info!("Sync complete: sent {}, received {}", events_sent.load(Ordering::Relaxed), events_received.load(Ordering::Relaxed));
+            info!("Sync complete: sent {}, received {}", sent, events_received.load(Ordering::Relaxed));
             break;
         }
 
         // Progress log every 5 seconds
         if start.elapsed().as_secs() % 5 == 0 && start.elapsed().subsec_millis() < 10 {
             info!("Responder progress: sent={}/{}, recv={}, recon={}, peer_done={}",
-                send_idx, send_queue.len(), events_received.load(Ordering::Relaxed), reconciliation_done, peer_done);
+                sent, total_to_send, events_received.load(Ordering::Relaxed), reconciliation_done, peer_done);
         }
 
-        let has_pending_send = !send_queue.is_empty() && send_idx < send_queue.len();
+        // Still have pending events to queue to sender
+        let has_pending_send = reconciliation_done && pending_count > 0;
 
         tokio::select! {
             biased;
@@ -1124,10 +1163,10 @@ async fn run_sync_responder_dual(
                             peer_done_time = Some(std::time::Instant::now());
                         } else {
                             reconciliation_done = true;
-                            for id in ids {
-                                send_queue.push(id);
-                            }
-                            info!("Received HaveList with {} items", send_queue.len() - send_idx);
+                            // Write to database instead of in-memory queue
+                            pending_send.insert_batch(&ids)?;
+                            total_to_send = ids.len() as i64;
+                            info!("Received HaveList with {} items", total_to_send);
                         }
                     }
                     Ok(_) => {}
@@ -1165,17 +1204,22 @@ async fn run_sync_responder_dual(
 
         }
 
-        // Queue events to sender task (non-blocking via channel)
+        // Queue events to sender task (from database)
         if has_pending_send {
-            let batch_end = (send_idx + 100).min(send_queue.len());
-            while send_idx < batch_end {
-                let event_id = &send_queue[send_idx];
-                if let Ok(Some(blob)) = store.get(event_id) {
-                    if send_tx.try_send(blob).is_err() {
-                        break; // Channel full, try again next iteration
+            if let Ok(batch) = pending_send.get_batch(100) {
+                let mut sent_ids = Vec::new();
+                for event_id in &batch {
+                    if let Ok(Some(blob)) = store.get(event_id) {
+                        if send_tx.try_send(blob).is_err() {
+                            break; // Channel full, try again next iteration
+                        }
+                        sent_ids.push(*event_id);
+                    } else {
+                        // Event not found, still mark as sent
+                        sent_ids.push(*event_id);
                     }
                 }
-                send_idx += 1;
+                pending_send.delete_batch(&sent_ids).ok();
             }
         }
 

@@ -3,6 +3,14 @@ name = "poc-7"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "poc7_lib"
+path = "src/lib.rs"
+
+[[bin]]
+name = "poc-7"
+path = "src/main.rs"
+
 [dependencies]
 rusqlite = { version = "0.31", features = ["bundled"] }
 nom = "7.1"

@@ -687,6 +687,7 @@ dependencies = [
  "rcgen",
  "rusqlite",
  "rustls",
+ "rustls-webpki",
  "thiserror 1.0.69",
  "tokio",
  "tracing",

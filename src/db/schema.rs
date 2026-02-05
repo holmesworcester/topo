@@ -62,6 +62,13 @@ pub fn create_tables(conn: &Connection) -> SqliteResult<()> {
             key TEXT PRIMARY KEY,
             value INTEGER NOT NULL
         );
+
+        -- Pending events to send (from reconciliation have_ids)
+        CREATE TABLE IF NOT EXISTS pending_send (
+            id BLOB PRIMARY KEY,        -- 32-byte event ID (raw)
+            added_at INTEGER NOT NULL   -- timestamp for ordering
+        );
+        CREATE INDEX IF NOT EXISTS idx_pending_send_added ON pending_send(added_at);
         ",
     )?;
     Ok(())

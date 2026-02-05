@@ -1,6 +1,11 @@
 pub mod schema;
 pub mod shareable;
 pub mod store;
+pub mod pending_send;
+pub mod wanted;
+
+pub use pending_send::PendingSend;
+pub use wanted::Wanted;
 
 use rusqlite::{Connection, Result as SqliteResult};
 use std::path::Path;
