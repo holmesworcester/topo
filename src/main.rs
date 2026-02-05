@@ -853,6 +853,10 @@ async fn run_sync_initiator_dual(
     ctrl_send.send(&SyncMessage::NegOpen { msg: initial_msg }).await?;
     ctrl_send.flush().await?;
 
+    // Track pending count locally to avoid DB queries in hot loop
+    let mut pending_count: i64 = 0;
+    const SEND_BATCH_SIZE: usize = 1000;
+
     // Main loop using select! for true concurrent I/O
     loop {
         if start.elapsed() >= timeout {
@@ -863,7 +867,6 @@ async fn run_sync_initiator_dual(
         // Check completion
         let received = events_received.load(Ordering::Relaxed);
         let sent = events_sent.load(Ordering::Relaxed);
-        let pending_count = pending_send.count().unwrap_or(0);
         // all_sent means events have actually been transmitted, not just queued
         let all_sent = total_to_send == 0 || sent >= total_to_send as u64;
         let all_received = total_to_recv == 0 || received >= total_to_recv as u64;
@@ -933,6 +936,7 @@ async fn run_sync_initiator_dual(
                                 // Get counts from database (reflects deduplication)
                                 total_to_send = pending_send.count()?;
                                 total_to_recv = wanted.count()?;
+                                pending_count = total_to_send;
 
                                 info!("Reconciliation complete in {} rounds: {} have, {} need",
                                     rounds, total_to_send, total_to_recv);
@@ -1002,7 +1006,7 @@ async fn run_sync_initiator_dual(
         // Queue events to sender task (from database)
         if has_pending_send {
             // Get batch from database
-            if let Ok(batch) = pending_send.get_batch(100) {
+            if let Ok(batch) = pending_send.get_batch(SEND_BATCH_SIZE) {
                 let mut sent_ids = Vec::new();
                 for event_id in &batch {
                     if let Ok(Some(blob)) = store.get(event_id) {
@@ -1015,8 +1019,10 @@ async fn run_sync_initiator_dual(
                         sent_ids.push(*event_id);
                     }
                 }
-                // Delete sent IDs from pending
+                // Delete sent IDs from pending and update local count
+                let deleted = sent_ids.len() as i64;
                 pending_send.delete_batch(&sent_ids).ok();
+                pending_count -= deleted;
             }
         }
 
@@ -1138,6 +1144,10 @@ async fn run_sync_responder_dual(
     let mut last_event_time: Option<std::time::Instant> = None;
     let mut sent_done = false;
 
+    // Track pending count locally to avoid DB queries in hot loop
+    let mut pending_count: i64 = 0;
+    const SEND_BATCH_SIZE: usize = 1000;
+
     // Main loop using select! for true concurrent I/O
     loop {
         if start.elapsed() >= timeout {
@@ -1145,7 +1155,6 @@ async fn run_sync_responder_dual(
             break;
         }
 
-        let pending_count = pending_send.count().unwrap_or(0);
         let sent = events_sent.load(Ordering::Relaxed);
         let received = events_received.load(Ordering::Relaxed);
         // all_sent means events have actually been transmitted, not just queued
@@ -1205,6 +1214,7 @@ async fn run_sync_responder_dual(
                         // WillSend marks end of HaveList stream and start of data transfer
                         total_to_recv = count as i64;
                         total_to_send = pending_send.count()?;
+                        pending_count = total_to_send;
                         reconciliation_done = true;
                         info!("Peer will send {} events, we will send {}", count, total_to_send);
                     }
@@ -1245,7 +1255,7 @@ async fn run_sync_responder_dual(
 
         // Queue events to sender task (from database)
         if has_pending_send {
-            if let Ok(batch) = pending_send.get_batch(100) {
+            if let Ok(batch) = pending_send.get_batch(SEND_BATCH_SIZE) {
                 let mut sent_ids = Vec::new();
                 for event_id in &batch {
                     if let Ok(Some(blob)) = store.get(event_id) {
@@ -1258,7 +1268,10 @@ async fn run_sync_responder_dual(
                         sent_ids.push(*event_id);
                     }
                 }
+                // Delete sent IDs from pending and update local count
+                let deleted = sent_ids.len() as i64;
                 pending_send.delete_batch(&sent_ids).ok();
+                pending_count -= deleted;
             }
         }
 
