@@ -86,6 +86,13 @@ pub fn create_tables(conn: &Connection) -> SqliteResult<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_incoming_unprocessed ON incoming_queue(processed, received_at);
 
+        -- Projection queue (event IDs awaiting projection)
+        CREATE TABLE IF NOT EXISTS projection_queue (
+            id BLOB PRIMARY KEY,
+            queued_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_projection_queue_queued_at ON projection_queue(queued_at);
+
         -- Message projection table
         CREATE TABLE IF NOT EXISTS messages (
             message_id TEXT PRIMARY KEY,
@@ -130,6 +137,7 @@ mod tests {
         assert!(tables.contains(&"outgoing_queue".to_string()));
         assert!(tables.contains(&"sent_events".to_string()));
         assert!(tables.contains(&"incoming_queue".to_string()));
+        assert!(tables.contains(&"projection_queue".to_string()));
         assert!(tables.contains(&"messages".to_string()));
     }
 

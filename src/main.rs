@@ -10,7 +10,7 @@ use negentropy::{Negentropy, Id, NegentropyStorageBase};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -26,6 +26,7 @@ use crate::db::{
     wanted::WantedEvents,
     outgoing::OutgoingQueue,
     sent::SentEvents,
+    projection::ProjectionQueue,
 };
 use crate::runtime::SyncStats;
 use crate::sync::{
@@ -622,7 +623,21 @@ async fn run_sync_initiator(
     let writer_handle = tokio::task::spawn_blocking(move || {
         batch_writer(db_path_owned, rx, events_received_writer)
     });
-
+    let proj_inline = std::env::var("PROJ_INLINE").is_ok();
+    let proj_off = std::env::var("PROJ_OFF").is_ok();
+    let proj_stop = if !proj_inline && !proj_off {
+        Some(Arc::new(AtomicBool::new(false)))
+    } else {
+        None
+    };
+    let proj_handle = if let Some(stop) = proj_stop.clone() {
+        let db_path_proj = db_path.to_string();
+        Some(tokio::task::spawn_blocking(move || {
+            projection_worker(db_path_proj, stop)
+        }))
+    } else {
+        None
+    };
     // Phase 3: Network I/O
     let mut have_ids: Vec<Id> = Vec::new();
     let mut need_ids: Vec<Id> = Vec::new();
@@ -721,6 +736,12 @@ async fn run_sync_initiator(
                     info!("Connection closed by peer");
                     drop(tx);
                     let _ = writer_handle.await;
+                    if let Some(stop) = proj_stop.clone() {
+                        stop.store(true, Ordering::Relaxed);
+                    }
+                    if let Some(handle) = proj_handle {
+                        let _ = handle.await;
+                    }
                     return Ok(SyncStats { events_sent, events_received: events_received.load(Ordering::Relaxed), neg_rounds: rounds });
                 }
                 Err(_) => break, // Timeout - no more pending receives
@@ -772,6 +793,12 @@ async fn run_sync_initiator(
 
     drop(tx);
     let _ = writer_handle.await;
+    if let Some(stop) = proj_stop {
+        stop.store(true, Ordering::Relaxed);
+    }
+    if let Some(handle) = proj_handle {
+        let _ = handle.await;
+    }
     let stats = SyncStats {
         events_sent,
         events_received: events_received.load(Ordering::Relaxed),
@@ -821,6 +848,21 @@ async fn run_sync_initiator_dual(
     let writer_handle = tokio::task::spawn_blocking(move || {
         batch_writer(db_path_owned, rx, events_received_writer)
     });
+    let proj_inline = std::env::var("PROJ_INLINE").is_ok();
+    let proj_off = std::env::var("PROJ_OFF").is_ok();
+    let proj_stop = if !proj_inline && !proj_off {
+        Some(Arc::new(AtomicBool::new(false)))
+    } else {
+        None
+    };
+    let proj_handle = if let Some(stop) = proj_stop.clone() {
+        let db_path_proj = db_path.to_string();
+        Some(tokio::task::spawn_blocking(move || {
+            projection_worker(db_path_proj, stop)
+        }))
+    } else {
+        None
+    };
 
     let mut ctrl_io = start_ctrl_io(ctrl_conn);
     let (data_tx, _data_send_handle) = start_data_sender(data_out_conn);
@@ -926,6 +968,12 @@ async fn run_sync_initiator_dual(
                     info!("Connection closed by peer");
                     drop(tx);
                     let _ = writer_handle.await;
+                    if let Some(stop) = proj_stop.clone() {
+                        stop.store(true, Ordering::Relaxed);
+                    }
+                    if let Some(handle) = proj_handle {
+                        let _ = handle.await;
+                    }
                     return Ok(SyncStats { events_sent, events_received: events_received.load(Ordering::Relaxed), neg_rounds: rounds });
                 }
                 Err(_) => break,
@@ -976,6 +1024,12 @@ async fn run_sync_initiator_dual(
 
     drop(tx);
     let _ = writer_handle.await;
+    if let Some(stop) = proj_stop {
+        stop.store(true, Ordering::Relaxed);
+    }
+    if let Some(handle) = proj_handle {
+        let _ = handle.await;
+    }
     let stats = SyncStats {
         events_sent,
         events_received: events_received.load(Ordering::Relaxed),
@@ -1013,6 +1067,11 @@ fn batch_writer(
     let store = Store::new(&db);
     let shareable = Shareable::new(&db);
     let wanted = WantedEvents::new(&db);
+    let projection = ProjectionQueue::new(&db);
+    let proj_inline = std::env::var("PROJ_INLINE").is_ok();
+    let proj_off = std::env::var("PROJ_OFF").is_ok();
+    let neg_off = std::env::var("NEG_UPDATE_OFF").is_ok();
+    let shareable_off = std::env::var("SHAREABLE_OFF").is_ok();
 
     // Prepare projection statement
     let mut project_stmt = match db.prepare(
@@ -1053,6 +1112,101 @@ fn batch_writer(
             }
         }
 
+        if !proj_inline {
+            let block_size = neg_block_size();
+            let mut neg_inserter = if neg_off {
+                None
+            } else {
+                match NegentropyBatchInserter::new(&db, block_size) {
+                    Ok(inserter) => Some(inserter),
+                    Err(e) => {
+                        error!("Failed to init negentropy inserter: {}", e);
+                        None
+                    }
+                }
+            };
+            let mut proj_batch: Vec<EventId> = Vec::with_capacity(batch.len());
+            if db.execute("BEGIN", []).is_ok() {
+                for (event_id, blob) in &batch {
+                    let _ = store.put(event_id, blob);
+                    if !shareable_off {
+                        let _ = shareable.insert(event_id);
+                    }
+                    let _ = wanted.remove(event_id);
+
+                    if !neg_off {
+                        if let Some(ts) = Envelope::extract_created_at(blob) {
+                            if let Some(inserter) = neg_inserter.as_mut() {
+                                if let Err(e) = inserter.insert(ts, event_id) {
+                                    error!("Failed to insert negentropy item: {}", e);
+                                }
+                            }
+                        }
+                    }
+                    if !proj_off {
+                        proj_batch.push(*event_id);
+                    }
+                }
+                if let Some(inserter) = neg_inserter {
+                    if let Err(e) = inserter.finish() {
+                        error!("Failed to finalize negentropy batch: {}", e);
+                    }
+                }
+                let _ = db.execute("COMMIT", []);
+            }
+
+            if !proj_off {
+                let _ = projection.enqueue_batch(&proj_batch);
+            }
+
+            events_received.fetch_add(batch.len() as u64, Ordering::Relaxed);
+            continue;
+        }
+
+        if proj_off {
+            // Inline projection disabled; just store + neg + shareable
+            let block_size = neg_block_size();
+            let mut neg_inserter = if neg_off {
+                None
+            } else {
+                match NegentropyBatchInserter::new(&db, block_size) {
+                    Ok(inserter) => Some(inserter),
+                    Err(e) => {
+                        error!("Failed to init negentropy inserter: {}", e);
+                        None
+                    }
+                }
+            };
+            if db.execute("BEGIN", []).is_ok() {
+                for (event_id, blob) in &batch {
+                    let _ = store.put(event_id, blob);
+                    if !shareable_off {
+                        let _ = shareable.insert(event_id);
+                    }
+                    let _ = wanted.remove(event_id);
+
+                    if !neg_off {
+                        if let Some(ts) = Envelope::extract_created_at(blob) {
+                            if let Some(inserter) = neg_inserter.as_mut() {
+                                if let Err(e) = inserter.insert(ts, event_id) {
+                                    error!("Failed to insert negentropy item: {}", e);
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(inserter) = neg_inserter {
+                    if let Err(e) = inserter.finish() {
+                        error!("Failed to finalize negentropy batch: {}", e);
+                    }
+                }
+                let _ = db.execute("COMMIT", []);
+            }
+
+            events_received.fetch_add(batch.len() as u64, Ordering::Relaxed);
+            continue;
+        }
+
         // Get real message IDs to use as fake dependencies (if not NO_DEPS mode)
         let real_dep_ids: Vec<String> = if no_deps {
             Vec::new()
@@ -1070,23 +1224,31 @@ fn batch_writer(
         if no_deps {
             // NO_DEPS: Skip dependency reads (baseline)
             let block_size = neg_block_size();
-            let mut neg_inserter = match NegentropyBatchInserter::new(&db, block_size) {
-                Ok(inserter) => Some(inserter),
-                Err(e) => {
-                    error!("Failed to init negentropy inserter: {}", e);
-                    None
+            let mut neg_inserter = if neg_off {
+                None
+            } else {
+                match NegentropyBatchInserter::new(&db, block_size) {
+                    Ok(inserter) => Some(inserter),
+                    Err(e) => {
+                        error!("Failed to init negentropy inserter: {}", e);
+                        None
+                    }
                 }
             };
             if db.execute("BEGIN", []).is_ok() {
                 for (event_id, blob) in &batch {
                     let _ = store.put(event_id, blob);
-                    let _ = shareable.insert(event_id);
+                    if !shareable_off {
+                        let _ = shareable.insert(event_id);
+                    }
                     let _ = wanted.remove(event_id);
 
-                    if let Some(ts) = Envelope::extract_created_at(blob) {
-                        if let Some(inserter) = neg_inserter.as_mut() {
-                            if let Err(e) = inserter.insert(ts, event_id) {
-                                error!("Failed to insert negentropy item: {}", e);
+                    if !neg_off {
+                        if let Some(ts) = Envelope::extract_created_at(blob) {
+                            if let Some(inserter) = neg_inserter.as_mut() {
+                                if let Err(e) = inserter.insert(ts, event_id) {
+                                    error!("Failed to insert negentropy item: {}", e);
+                                }
                             }
                         }
                     }
@@ -1114,23 +1276,31 @@ fn batch_writer(
         } else if use_naive {
             // NAIVE: Read dependencies inside projection loop (slower)
             let block_size = neg_block_size();
-            let mut neg_inserter = match NegentropyBatchInserter::new(&db, block_size) {
-                Ok(inserter) => Some(inserter),
-                Err(e) => {
-                    error!("Failed to init negentropy inserter: {}", e);
-                    None
+            let mut neg_inserter = if neg_off {
+                None
+            } else {
+                match NegentropyBatchInserter::new(&db, block_size) {
+                    Ok(inserter) => Some(inserter),
+                    Err(e) => {
+                        error!("Failed to init negentropy inserter: {}", e);
+                        None
+                    }
                 }
             };
             if db.execute("BEGIN", []).is_ok() {
                 for (idx, (event_id, blob)) in batch.iter().enumerate() {
                     let _ = store.put(event_id, blob);
-                    let _ = shareable.insert(event_id);
+                    if !shareable_off {
+                        let _ = shareable.insert(event_id);
+                    }
                     let _ = wanted.remove(event_id);
 
-                    if let Some(ts) = Envelope::extract_created_at(blob) {
-                        if let Some(inserter) = neg_inserter.as_mut() {
-                            if let Err(e) = inserter.insert(ts, event_id) {
-                                error!("Failed to insert negentropy item: {}", e);
+                    if !neg_off {
+                        if let Some(ts) = Envelope::extract_created_at(blob) {
+                            if let Some(inserter) = neg_inserter.as_mut() {
+                                if let Err(e) = inserter.insert(ts, event_id) {
+                                    error!("Failed to insert negentropy item: {}", e);
+                                }
                             }
                         }
                     }
@@ -1200,23 +1370,31 @@ fn batch_writer(
 
             // Phase 3: Write batch in single transaction
             let block_size = neg_block_size();
-            let mut neg_inserter = match NegentropyBatchInserter::new(&db, block_size) {
-                Ok(inserter) => Some(inserter),
-                Err(e) => {
-                    error!("Failed to init negentropy inserter: {}", e);
-                    None
+            let mut neg_inserter = if neg_off {
+                None
+            } else {
+                match NegentropyBatchInserter::new(&db, block_size) {
+                    Ok(inserter) => Some(inserter),
+                    Err(e) => {
+                        error!("Failed to init negentropy inserter: {}", e);
+                        None
+                    }
                 }
             };
             if db.execute("BEGIN", []).is_ok() {
                 for (idx, (event_id, blob)) in batch.iter().enumerate() {
                     let _ = store.put(event_id, blob);
-                    let _ = shareable.insert(event_id);
+                    if !shareable_off {
+                        let _ = shareable.insert(event_id);
+                    }
                     let _ = wanted.remove(event_id);
 
-                    if let Some(ts) = Envelope::extract_created_at(blob) {
-                        if let Some(inserter) = neg_inserter.as_mut() {
-                            if let Err(e) = inserter.insert(ts, event_id) {
-                                error!("Failed to insert negentropy item: {}", e);
+                    if !neg_off {
+                        if let Some(ts) = Envelope::extract_created_at(blob) {
+                            if let Some(inserter) = neg_inserter.as_mut() {
+                                if let Err(e) = inserter.insert(ts, event_id) {
+                                    error!("Failed to insert negentropy item: {}", e);
+                                }
                             }
                         }
                     }
@@ -1252,6 +1430,205 @@ fn batch_writer(
         }
 
         events_received.fetch_add(batch.len() as u64, Ordering::Relaxed);
+    }
+}
+
+fn projection_worker(db_path: String, stop: Arc<AtomicBool>) {
+    let use_naive = std::env::var("NAIVE_DEPS").is_ok();
+    let no_deps = std::env::var("NO_DEPS").is_ok();
+
+    let db = match open_connection(&db_path) {
+        Ok(db) => db,
+        Err(e) => {
+            error!("Projection worker failed to open db: {}", e);
+            return;
+        }
+    };
+
+    let store = Store::new(&db);
+    let projection = ProjectionQueue::new(&db);
+
+    let mut project_stmt = match db.prepare(
+        "INSERT OR IGNORE INTO messages (message_id, channel_id, author_id, content, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+    ) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            error!("Projection worker failed to prepare projection statement: {}", e);
+            return;
+        }
+    };
+
+    let mut dep_read_stmt = match db.prepare("SELECT content FROM messages WHERE message_id = ?1") {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            error!("Projection worker failed to prepare dependency read statement: {}", e);
+            return;
+        }
+    };
+
+    loop {
+        let batch = match projection.dequeue_batch(1000) {
+            Ok(items) => items,
+            Err(e) => {
+                error!("Projection worker dequeue failed: {}", e);
+                return;
+            }
+        };
+
+        if batch.is_empty() {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+            continue;
+        }
+
+        let real_dep_ids: Vec<String> = if no_deps {
+            Vec::new()
+        } else {
+            let mut ids = Vec::new();
+            if let Ok(mut stmt) = db.prepare("SELECT message_id FROM messages ORDER BY RANDOM() LIMIT 1000") {
+                if let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) {
+                    ids = rows.flatten().collect();
+                }
+            }
+            ids
+        };
+
+        let mut dep_cache: HashMap<String, String> = HashMap::new();
+        if !no_deps && !use_naive {
+            let mut all_dep_ids: HashSet<String> = HashSet::with_capacity(batch.len() * 10);
+            if !real_dep_ids.is_empty() {
+                for (idx, _) in batch.iter().enumerate() {
+                    for i in 0..10usize {
+                        let dep_idx = (idx * 10 + i) % real_dep_ids.len();
+                        all_dep_ids.insert(real_dep_ids[dep_idx].clone());
+                    }
+                }
+            }
+
+            if !all_dep_ids.is_empty() {
+                let placeholders: String = all_dep_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                let query = format!("SELECT message_id, content FROM messages WHERE message_id IN ({})", placeholders);
+                if let Ok(mut stmt) = db.prepare(&query) {
+                    let params: Vec<&dyn rusqlite::ToSql> =
+                        all_dep_ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+                    if let Ok(rows) = stmt.query_map(params.as_slice(), |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    }) {
+                        for row in rows.flatten() {
+                            dep_cache.insert(row.0, row.1);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut last_lock_warn = Instant::now() - Duration::from_secs(2);
+        let mut lock_backoff_ms = 1u64;
+        let mut began = false;
+        loop {
+            match db.execute("BEGIN IMMEDIATE", []) {
+                Ok(_) => {
+                    began = true;
+                    lock_backoff_ms = 1;
+                    break;
+                }
+                Err(e) => {
+                    let is_busy = matches!(
+                        e,
+                        rusqlite::Error::SqliteFailure(err, _)
+                            if err.code == rusqlite::ErrorCode::DatabaseBusy
+                                || err.code == rusqlite::ErrorCode::DatabaseLocked
+                    );
+                    if is_busy {
+                        if last_lock_warn.elapsed() >= Duration::from_secs(1) {
+                            warn!("Projection worker waiting on writer lock");
+                            last_lock_warn = Instant::now();
+                        }
+                        std::thread::sleep(Duration::from_millis(lock_backoff_ms));
+                        lock_backoff_ms = (lock_backoff_ms * 2).min(50);
+                        continue;
+                    }
+                    warn!("Projection worker failed to start transaction: {}", e);
+                    std::thread::sleep(Duration::from_millis(5));
+                    break;
+                }
+            }
+        }
+
+        if !began {
+            continue;
+        }
+
+        let mut processed: Vec<EventId> = Vec::with_capacity(batch.len());
+        for (idx, event_id) in batch.iter().enumerate() {
+            let blob = match store.get(event_id) {
+                Ok(Some(blob)) => blob,
+                Ok(None) => {
+                    warn!("Projection worker missing blob for {:?}", event_id);
+                    processed.push(*event_id);
+                    continue;
+                }
+                Err(e) => {
+                    warn!("Projection worker failed to load blob for {:?}: {}", event_id, e);
+                    continue;
+                }
+            };
+
+            let envelope = match Envelope::parse(&blob) {
+                Ok((_, envelope)) => envelope,
+                Err(e) => {
+                    warn!("Projection worker failed to parse blob for {:?}: {}", event_id, e);
+                    processed.push(*event_id);
+                    continue;
+                }
+            };
+
+            if !no_deps {
+                if use_naive {
+                    if !real_dep_ids.is_empty() {
+                        for i in 0..10usize {
+                            let dep_idx = (idx * 10 + i) % real_dep_ids.len();
+                            let dep_id_str = &real_dep_ids[dep_idx];
+                            let _content: Option<String> = dep_read_stmt
+                                .query_row([dep_id_str], |row| row.get(0))
+                                .ok();
+                        }
+                    }
+                } else if !real_dep_ids.is_empty() {
+                    for i in 0..10usize {
+                        let dep_idx = (idx * 10 + i) % real_dep_ids.len();
+                        let _content = dep_cache.get(&real_dep_ids[dep_idx]);
+                    }
+                }
+            }
+
+            let message_id = event_id_to_base64(event_id);
+            let channel_id = event_id_to_base64(&envelope.payload.channel_id);
+            let author_id = event_id_to_base64(&envelope.payload.author_id);
+            match project_stmt.execute(rusqlite::params![
+                message_id,
+                channel_id,
+                author_id,
+                &envelope.payload.content,
+                envelope.payload.created_at_ms as i64
+            ]) {
+                Ok(_) => processed.push(*event_id),
+                Err(e) => warn!("Projection worker failed to insert {:?}: {}", event_id, e),
+            }
+        }
+
+        match db.execute("COMMIT", []) {
+            Ok(_) => {
+                let _ = projection.remove_batch(&processed);
+            }
+            Err(e) => {
+                warn!("Projection worker commit failed; leaving {} items queued: {}", processed.len(), e);
+                let _ = db.execute("ROLLBACK", []);
+            }
+        }
     }
 }
 
@@ -1295,6 +1672,21 @@ async fn run_sync_responder(
     let writer_handle = tokio::task::spawn_blocking(move || {
         batch_writer(db_path_owned, rx, events_received_writer)
     });
+    let proj_inline = std::env::var("PROJ_INLINE").is_ok();
+    let proj_off = std::env::var("PROJ_OFF").is_ok();
+    let proj_stop = if !proj_inline && !proj_off {
+        Some(Arc::new(AtomicBool::new(false)))
+    } else {
+        None
+    };
+    let proj_handle = if let Some(stop) = proj_stop.clone() {
+        let db_path_proj = db_path.to_string();
+        Some(tokio::task::spawn_blocking(move || {
+            projection_worker(db_path_proj, stop)
+        }))
+    } else {
+        None
+    };
 
     let mut io = start_io(conn);
 
@@ -1354,6 +1746,12 @@ async fn run_sync_responder(
                     info!("Connection closed by peer");
                     drop(tx);
                     let _ = writer_handle.await;
+                    if let Some(stop) = proj_stop.clone() {
+                        stop.store(true, Ordering::Relaxed);
+                    }
+                    if let Some(handle) = proj_handle {
+                        let _ = handle.await;
+                    }
                     return Ok(SyncStats { events_sent, events_received: events_received.load(Ordering::Relaxed), neg_rounds: rounds });
                 }
                 Err(_) => break, // Timeout - no more pending
@@ -1393,6 +1791,12 @@ async fn run_sync_responder(
 
     drop(tx);
     let _ = writer_handle.await;
+    if let Some(stop) = proj_stop {
+        stop.store(true, Ordering::Relaxed);
+    }
+    if let Some(handle) = proj_handle {
+        let _ = handle.await;
+    }
     let stats = SyncStats {
         events_sent,
         events_received: events_received.load(Ordering::Relaxed),
@@ -1440,6 +1844,21 @@ async fn run_sync_responder_dual(
     let writer_handle = tokio::task::spawn_blocking(move || {
         batch_writer(db_path_owned, rx, events_received_writer)
     });
+    let proj_inline = std::env::var("PROJ_INLINE").is_ok();
+    let proj_off = std::env::var("PROJ_OFF").is_ok();
+    let proj_stop = if !proj_inline && !proj_off {
+        Some(Arc::new(AtomicBool::new(false)))
+    } else {
+        None
+    };
+    let proj_handle = if let Some(stop) = proj_stop.clone() {
+        let db_path_proj = db_path.to_string();
+        Some(tokio::task::spawn_blocking(move || {
+            projection_worker(db_path_proj, stop)
+        }))
+    } else {
+        None
+    };
 
     let mut ctrl_io = start_ctrl_io(ctrl_conn);
     let (data_tx, _data_send_handle) = start_data_sender(data_out_conn);
@@ -1505,6 +1924,12 @@ async fn run_sync_responder_dual(
                     info!("Connection closed by peer");
                     drop(tx);
                     let _ = writer_handle.await;
+                    if let Some(stop) = proj_stop.clone() {
+                        stop.store(true, Ordering::Relaxed);
+                    }
+                    if let Some(handle) = proj_handle {
+                        let _ = handle.await;
+                    }
                     return Ok(SyncStats { events_sent, events_received: events_received.load(Ordering::Relaxed), neg_rounds: rounds });
                 }
                 Err(_) => break,
@@ -1543,6 +1968,12 @@ async fn run_sync_responder_dual(
 
     drop(tx);
     let _ = writer_handle.await;
+    if let Some(stop) = proj_stop {
+        stop.store(true, Ordering::Relaxed);
+    }
+    if let Some(handle) = proj_handle {
+        let _ = handle.await;
+    }
     let stats = SyncStats {
         events_sent,
         events_received: events_received.load(Ordering::Relaxed),

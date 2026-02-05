@@ -4,6 +4,7 @@ pub mod store;
 pub mod wanted;
 pub mod outgoing;
 pub mod sent;
+pub mod projection;
 
 use rusqlite::{Connection, Result as SqliteResult};
 use std::path::Path;
