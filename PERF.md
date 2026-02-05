@@ -71,10 +71,43 @@ With real data to fetch:
 5. **Interleaved send/recv**: Drain receives before sending to avoid QUIC flow control deadlock
 6. **Inline projection**: Project in same transaction as store (atomic, <100ms latency)
 
+## Memory Usage
+
+Memory is now **sub-linear** due to database-backed ID storage:
+
+| Events/peer | Peak Memory | Notes |
+|-------------|-------------|-------|
+| 10,000 | 33 MB | Baseline |
+| 100,000 | 31-54 MB | ~1.6x for 10x events |
+| 500,000 | 54 MB | Only 1.7x for 50x events |
+
+With `LOW_MEM=1` environment variable, SQLite cache is reduced from 4MB to 1MB.
+
+### Memory optimizations applied:
+1. **DB-backed send queues**: `pending_send` and `wanted_events` tables
+2. **Incremental ID processing**: Clear vectors each round, insert to DB immediately
+3. **Streaming HaveList**: Send in 5000-item batches instead of all at once
+4. **Configurable SQLite cache**: `DB_CACHE_KIB` or `LOW_MEM` environment variables
+
+## Large-Scale Sync Throughput
+
+| Events/peer | Reconciliation | Data Transfer | Total Sync | Throughput |
+|-------------|----------------|---------------|------------|------------|
+| 10,000 | 340ms (11 rounds) | 700ms | ~1s | ~10 MB/s |
+| 100,000 | 12s (99 rounds) | 12s | ~24s | ~4.3 MB/s |
+| 500,000 | ~5 min (491 rounds) | ~4 min | ~9 min | ~2 MB/s |
+
+Notes:
+- Throughput decreases at scale due to database contention
+- Reconciliation rounds scale with O(log n) events
+- All tests on localhost loopback with WAL mode SQLite
+
 ## Environment Variables
 
 ```bash
-NO_DEPS=1    # Skip dependency reads (baseline)
-NAIVE_DEPS=1 # Use individual queries per dependency (slower)
-# default    # Use batched IN query (faster)
+NO_DEPS=1      # Skip dependency reads (baseline)
+NAIVE_DEPS=1   # Use individual queries per dependency (slower)
+LOW_MEM=1      # Reduce SQLite cache to 1MB (default 4MB)
+DB_CACHE_KIB=N # Set SQLite cache to N kilobytes
+# default      # Use batched IN query (faster)
 ```
