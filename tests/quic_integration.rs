@@ -164,8 +164,9 @@ use negentropy::{Negentropy, Storage};
 use poc_7::db::{outgoing::OutgoingQueue, wanted::WantedEvents};
 use poc_7::sync::{neg_id_to_event_id, NegentropyStorageSqlite, SyncMessage};
 use poc_7::transport::{
-    connection::Connection, create_client_endpoint, create_server_endpoint, generate_keypair,
-    generate_self_signed_cert, DualConnection, StreamConn,
+    connection::{Connection, SendConnection, RecvConnection},
+    create_client_endpoint, create_server_endpoint, generate_keypair,
+    generate_self_signed_cert, DualConnection, StreamConn, StreamSend, StreamRecv,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
@@ -189,9 +190,9 @@ async fn run_server(
 
     let (control_send, control_recv) = connection.accept_bi().await?;
     let (data_send, data_recv) = connection.accept_bi().await?;
-    let mut conn = DualConnection::<Connection>::new(control_send, control_recv, data_send, data_recv);
+    let conn = DualConnection::new(control_send, control_recv, data_send, data_recv);
 
-    run_sync_responder(&mut conn, db_path, timeout_secs, &peer_id).await?;
+    run_sync_responder(conn, db_path, timeout_secs, &peer_id).await?;
 
     connection.close(0u32.into(), b"done");
     Ok(())
@@ -208,26 +209,36 @@ async fn run_client(
 
     let (control_send, control_recv) = connection.open_bi().await?;
     let (data_send, data_recv) = connection.open_bi().await?;
-    let mut conn = DualConnection::<Connection>::new(control_send, control_recv, data_send, data_recv);
+    let mut conn = DualConnection::new(control_send, control_recv, data_send, data_recv);
 
     // Send stream establishment markers
-    conn.send_control(&SyncMessage::HaveList { ids: vec![] }).await?;
-    conn.send_data(&SyncMessage::HaveList { ids: vec![] }).await?;
+    conn.control.send(&SyncMessage::HaveList { ids: vec![] }).await?;
+    conn.data_send.send(&SyncMessage::HaveList { ids: vec![] }).await?;
     conn.flush_control().await?;
     conn.flush_data().await?;
 
-    run_sync_initiator(&mut conn, db_path, timeout_secs, &peer_id).await?;
+    run_sync_initiator(conn, db_path, timeout_secs, &peer_id).await?;
 
     connection.close(0u32.into(), b"done");
     Ok(())
 }
 
-async fn run_sync_initiator<T: StreamConn>(
-    conn: &mut DualConnection<T>,
+async fn run_sync_initiator<C, S, R>(
+    conn: DualConnection<C, S, R>,
     db_path: &str,
     timeout_secs: u64,
     peer_id: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    C: StreamConn,
+    S: StreamSend,
+    R: StreamRecv + Send + 'static,
+{
+    let DualConnection {
+        mut control,
+        mut data_send,
+        data_recv,
+    } = conn;
     let timeout = Duration::from_secs(timeout_secs);
     let db = open_connection(db_path)?;
     let neg_db = open_connection(db_path)?;
@@ -253,12 +264,42 @@ async fn run_sync_initiator<T: StreamConn>(
         batch_writer(db_path_owned, ingest_rx, events_received_clone)
     });
 
+    // Spawn dedicated data receiver task
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let recv_handle = {
+        let mut data_recv = data_recv;
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                    msg = data_recv.recv() => {
+                        match msg {
+                            Ok(SyncMessage::Event { blob }) => {
+                                let event_id = hash_event(&blob);
+                                if ingest_tx.send((event_id, blob)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(_) => break,
+                        }
+                    }
+                }
+            }
+        })
+    };
+
     let mut have_ids = Vec::new();
     let mut need_ids = Vec::new();
 
     let initial_msg = neg.initiate()?;
-    conn.send_control(&SyncMessage::NegOpen { msg: initial_msg }).await?;
-    conn.flush_control().await?;
+    control.send(&SyncMessage::NegOpen { msg: initial_msg }).await?;
+    control.flush().await?;
 
     let mut reconciliation_done = false;
     let timeout_at = tokio::time::Instant::now() + timeout;
@@ -268,13 +309,13 @@ async fn run_sync_initiator<T: StreamConn>(
         tokio::select! {
             biased;
 
-            ctrl_result = conn.control.recv() => {
+            ctrl_result = control.recv() => {
                 match ctrl_result {
                     Ok(SyncMessage::NegMsg { msg }) => {
                         match neg.reconcile_with_ids(&msg, &mut have_ids, &mut need_ids)? {
                             Some(next_msg) => {
-                                conn.send_control(&SyncMessage::NegMsg { msg: next_msg }).await?;
-                                conn.flush_control().await?;
+                                control.send(&SyncMessage::NegMsg { msg: next_msg }).await?;
+                                control.flush().await?;
                             }
                             None => reconciliation_done = true,
                         }
@@ -293,21 +334,10 @@ async fn run_sync_initiator<T: StreamConn>(
                                 }
                             }
                             if !batch.is_empty() {
-                                conn.send_control(&SyncMessage::HaveList { ids: batch }).await?;
-                                conn.flush_control().await?;
+                                control.send(&SyncMessage::HaveList { ids: batch }).await?;
+                                control.flush().await?;
                             }
                         }
-                    }
-                    Ok(_) => {}
-                    Err(_) => break,
-                }
-            }
-
-            data_result = conn.data.recv() => {
-                match data_result {
-                    Ok(SyncMessage::Event { blob }) => {
-                        let event_id = hash_event(&blob);
-                        let _ = ingest_tx.send((event_id, blob)).await;
                     }
                     Ok(_) => {}
                     Err(_) => break,
@@ -322,14 +352,14 @@ async fn run_sync_initiator<T: StreamConn>(
                     let mut sent_rowids = Vec::new();
                     for (rowid, event_id) in batch {
                         if let Some(blob) = blobs.get(&event_id) {
-                            let _ = conn.send_data(&SyncMessage::Event { blob: blob.clone() }).await;
+                            let _ = data_send.send(&SyncMessage::Event { blob: blob.clone() }).await;
                             sent_rowids.push(rowid);
                         } else {
                             sent_rowids.push(rowid);
                         }
                     }
                     let _ = outgoing.mark_sent_batch(&sent_rowids);
-                    let _ = conn.flush_data().await;
+                    let _ = data_send.flush().await;
                 }
 
                 if reconciliation_done {
@@ -346,17 +376,28 @@ async fn run_sync_initiator<T: StreamConn>(
     }
 
     let _ = neg_db.execute("COMMIT", []);
-    drop(ingest_tx);
+    let _ = shutdown_tx.send(true);
+    let _ = recv_handle.await;
     let _ = writer_handle.await;
     Ok(())
 }
 
-async fn run_sync_responder<T: StreamConn>(
-    conn: &mut DualConnection<T>,
+async fn run_sync_responder<C, S, R>(
+    conn: DualConnection<C, S, R>,
     db_path: &str,
     timeout_secs: u64,
     peer_id: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    C: StreamConn,
+    S: StreamSend,
+    R: StreamRecv + Send + 'static,
+{
+    let DualConnection {
+        mut control,
+        mut data_send,
+        data_recv,
+    } = conn;
     let timeout = Duration::from_secs(timeout_secs);
     let db = open_connection(db_path)?;
     let neg_db = open_connection(db_path)?;
@@ -380,6 +421,36 @@ async fn run_sync_responder<T: StreamConn>(
         batch_writer(db_path_owned, ingest_rx, events_received_clone)
     });
 
+    // Spawn dedicated data receiver task
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let recv_handle = {
+        let mut data_recv = data_recv;
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                    msg = data_recv.recv() => {
+                        match msg {
+                            Ok(SyncMessage::Event { blob }) => {
+                                let event_id = hash_event(&blob);
+                                if ingest_tx.send((event_id, blob)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(_) => break,
+                        }
+                    }
+                }
+            }
+        })
+    };
+
     let mut reconciliation_done = false;
     let mut idle_count = 0;
     let timeout_at = tokio::time::Instant::now() + timeout;
@@ -389,7 +460,7 @@ async fn run_sync_responder<T: StreamConn>(
         tokio::select! {
             biased;
 
-            ctrl_result = conn.control.recv() => {
+            ctrl_result = control.recv() => {
                 match ctrl_result {
                     Ok(SyncMessage::NegOpen { msg }) | Ok(SyncMessage::NegMsg { msg }) => {
                         idle_count = 0;
@@ -397,8 +468,8 @@ async fn run_sync_responder<T: StreamConn>(
                         if response.is_empty() {
                             reconciliation_done = true;
                         } else {
-                            conn.send_control(&SyncMessage::NegMsg { msg: response }).await?;
-                            conn.flush_control().await?;
+                            control.send(&SyncMessage::NegMsg { msg: response }).await?;
+                            control.flush().await?;
                         }
                     }
                     Ok(SyncMessage::HaveList { ids }) => {
@@ -407,18 +478,6 @@ async fn run_sync_responder<T: StreamConn>(
                             reconciliation_done = true;
                             let _ = outgoing.enqueue_batch(peer_id, &ids);
                         }
-                    }
-                    Ok(_) => {}
-                    Err(_) => break,
-                }
-            }
-
-            data_result = conn.data.recv() => {
-                match data_result {
-                    Ok(SyncMessage::Event { blob }) => {
-                        idle_count = 0;
-                        let event_id = hash_event(&blob);
-                        let _ = ingest_tx.send((event_id, blob)).await;
                     }
                     Ok(_) => {}
                     Err(_) => break,
@@ -434,14 +493,14 @@ async fn run_sync_responder<T: StreamConn>(
                     let mut sent_rowids = Vec::new();
                     for (rowid, event_id) in batch {
                         if let Some(blob) = blobs.get(&event_id) {
-                            let _ = conn.send_data(&SyncMessage::Event { blob: blob.clone() }).await;
+                            let _ = data_send.send(&SyncMessage::Event { blob: blob.clone() }).await;
                             sent_rowids.push(rowid);
                         } else {
                             sent_rowids.push(rowid);
                         }
                     }
                     let _ = outgoing.mark_sent_batch(&sent_rowids);
-                    let _ = conn.flush_data().await;
+                    let _ = data_send.flush().await;
                 } else if reconciliation_done {
                     idle_count += 1;
                 }
@@ -459,7 +518,8 @@ async fn run_sync_responder<T: StreamConn>(
     }
 
     let _ = neg_db.execute("COMMIT", []);
-    drop(ingest_tx);
+    let _ = shutdown_tx.send(true);
+    let _ = recv_handle.await;
     let _ = writer_handle.await;
     Ok(())
 }

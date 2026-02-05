@@ -3,8 +3,8 @@ pub mod connection;
 pub mod sim;
 
 pub use cert::{generate_keypair, generate_self_signed_cert};
-pub use connection::{DualConnection, StreamConn};
-pub use sim::{create_sim_pair, SimConfig, SimConnection};
+pub use connection::{DualConnection, StreamConn, StreamRecv, StreamSend};
+pub use sim::{create_sim_pair, create_sim_split_pair, SimConfig, SimConnection, SimRecv, SimSend};
 
 use quinn::{ClientConfig, Endpoint, ServerConfig, TransportConfig};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
