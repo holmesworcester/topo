@@ -25,15 +25,25 @@ pub fn open_in_memory() -> SqliteResult<Connection> {
 }
 
 fn apply_pragmas(conn: &Connection) -> SqliteResult<()> {
-    conn.execute_batch(
+    // Configurable cache: DB_CACHE_KIB env var, or LOW_MEM mode (1MB), default 4MB
+    let cache_kib = std::env::var("DB_CACHE_KIB")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or_else(|| {
+            let low_mem = std::env::var("LOW_MEM").map(|v| v != "0").unwrap_or(false);
+            if low_mem { 1024 } else { 4096 }
+        });
+
+    conn.execute_batch(&format!(
         "
         PRAGMA journal_mode = WAL;
         PRAGMA synchronous = NORMAL;
-        PRAGMA cache_size = -8000;
+        PRAGMA cache_size = -{cache_kib};
         PRAGMA busy_timeout = 5000;
         PRAGMA foreign_keys = OFF;
-        ",
-    )?;
+        "
+    ))?;
     Ok(())
 }
 

@@ -944,12 +944,21 @@ async fn run_sync_initiator_dual(
                                 have_ids.shrink_to_fit();
                                 need_ids.shrink_to_fit();
 
-                                // Tell peer what we need and how many events we'll send
-                                if total_to_recv > 0 {
-                                    let need_ids_to_send: Vec<EventId> = wanted.get_all()?;
-                                    ctrl_send.send(&SyncMessage::HaveList { ids: need_ids_to_send }).await?;
+                                // Stream HaveList in chunks to avoid loading all IDs into memory
+                                // HaveLists tell peer what we need FROM them
+                                const HAVELIST_BATCH: usize = 5000;
+                                let mut offset = 0;
+                                loop {
+                                    let batch = wanted.get_batch(HAVELIST_BATCH, offset)?;
+                                    if batch.is_empty() {
+                                        break;
+                                    }
+                                    ctrl_send.send(&SyncMessage::HaveList { ids: batch }).await?;
+                                    offset += HAVELIST_BATCH;
                                 }
-                                // Tell peer how many events we will send (so they know when to stop waiting)
+
+                                // WillSend comes LAST - tells peer how many events we will send TO them
+                                // This also signals end of HaveList stream
                                 ctrl_send.send(&SyncMessage::WillSend { count: total_to_send as u64 }).await?;
                                 ctrl_send.flush().await?;
                             }
@@ -1184,19 +1193,20 @@ async fn run_sync_responder_dual(
                     }
                     Ok(SyncMessage::HaveList { ids }) => {
                         if ids.is_empty() {
+                            // Empty HaveList = peer done sending
                             peer_done = true;
                             peer_done_time = Some(std::time::Instant::now());
                         } else {
-                            reconciliation_done = true;
-                            // Write to database instead of in-memory queue
+                            // Accumulate HaveList batches to pending_send
                             pending_send.insert_batch(&ids)?;
-                            total_to_send = ids.len() as i64;
-                            info!("Received HaveList with {} items", total_to_send);
                         }
                     }
                     Ok(SyncMessage::WillSend { count }) => {
+                        // WillSend marks end of HaveList stream and start of data transfer
                         total_to_recv = count as i64;
-                        info!("Peer will send {} events", count);
+                        total_to_send = pending_send.count()?;
+                        reconciliation_done = true;
+                        info!("Peer will send {} events, we will send {}", count, total_to_send);
                     }
                     Ok(_) => {}
                     Err(transport::connection::ConnectionError::Closed) => {

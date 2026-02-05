@@ -60,12 +60,12 @@ impl<'a> Wanted<'a> {
         Ok(self.count()? == 0)
     }
 
-    /// Get all wanted event IDs
-    pub fn get_all(&self) -> SqliteResult<Vec<EventId>> {
+    /// Get a batch of wanted event IDs (for streaming)
+    pub fn get_batch(&self, limit: usize, offset: usize) -> SqliteResult<Vec<EventId>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT id FROM wanted_events"
+            "SELECT id FROM wanted_events ORDER BY first_seen_at LIMIT ? OFFSET ?"
         )?;
-        let rows = stmt.query_map([], |row| {
+        let rows = stmt.query_map(params![limit as i64, offset as i64], |row| {
             let id_b64: String = row.get(0)?;
             Ok(id_b64)
         })?;
