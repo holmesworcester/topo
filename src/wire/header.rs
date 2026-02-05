@@ -18,6 +18,7 @@ use super::{EventType, HEADER_SIZE};
 /// - ttl_ms: u32 LE (4 bytes)
 /// - signer_id: [u8; 32] (32 bytes)
 /// - reserved: [u8; 14] (14 bytes)
+///
 /// Total: 64 bytes
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireHeader {
@@ -126,8 +127,8 @@ mod tests {
     #[test]
     fn test_header_roundtrip() {
         let mut signer_id = [0u8; 32];
-        for i in 0..32 {
-            signer_id[i] = (i + 1) as u8;
+        for (i, byte) in signer_id.iter_mut().enumerate() {
+            *byte = (i + 1) as u8;
         }
 
         let header = WireHeader {

@@ -57,7 +57,7 @@ impl<'a> NegentropyStorageSqlite<'a> {
 
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
-            if row_idx % BLOCK_SIZE == 0 {
+            if row_idx.is_multiple_of(BLOCK_SIZE) {
                 let ts: i64 = row.get(0)?;
                 let id: Vec<u8> = row.get(1)?;
                 insert_stmt.execute(rusqlite::params![
@@ -113,7 +113,7 @@ impl NegentropyStorageBase for NegentropyStorageSqlite<'_> {
         // Otherwise query and cache
         let count: i64 = self.conn
             .query_row("SELECT COUNT(*) FROM neg_items", [], |row| row.get(0))
-            .map_err(|e| sql_err(e))?;
+            .map_err(sql_err)?;
 
         let size = count as usize;
         *self.cached_size.borrow_mut() = Some(size);
@@ -126,7 +126,7 @@ impl NegentropyStorageBase for NegentropyStorageSqlite<'_> {
 
         // Get block start key
         let (block_ts, block_id) = match self.get_block_start(block_idx)
-            .map_err(|e| sql_err(e))?
+            .map_err(sql_err)?
         {
             Some(v) => v,
             None => return Ok(None), // Block doesn't exist
@@ -135,7 +135,7 @@ impl NegentropyStorageBase for NegentropyStorageSqlite<'_> {
         // Fetch item at offset within block
         let mut stmt = self.conn.prepare_cached(
             "SELECT ts, id FROM neg_items WHERE (ts, id) >= (?, ?) ORDER BY ts, id LIMIT 1 OFFSET ?"
-        ).map_err(|e| sql_err(e))?;
+        ).map_err(sql_err)?;
 
         let result = stmt.query_row(
             rusqlite::params![block_ts, block_id, offset as i64],
@@ -169,7 +169,7 @@ impl NegentropyStorageBase for NegentropyStorageSqlite<'_> {
 
         // Get block start key
         let (block_ts, block_id) = match self.get_block_start(block_idx)
-            .map_err(|e| sql_err(e))?
+            .map_err(sql_err)?
         {
             Some(v) => v,
             None => return Ok(()), // No items
@@ -178,19 +178,19 @@ impl NegentropyStorageBase for NegentropyStorageSqlite<'_> {
         // Query items starting from begin position
         let mut stmt = self.conn.prepare_cached(
             "SELECT ts, id FROM neg_items WHERE (ts, id) >= (?, ?) ORDER BY ts, id LIMIT ? OFFSET ?"
-        ).map_err(|e| sql_err(e))?;
+        ).map_err(sql_err)?;
 
         let mut rows = stmt.query(rusqlite::params![
             block_ts,
             block_id,
             count as i64,
             offset_in_block as i64
-        ]).map_err(|e| sql_err(e))?;
+        ]).map_err(sql_err)?;
 
         let mut idx = begin;
-        while let Some(row) = rows.next().map_err(|e| sql_err(e))? {
-            let ts: i64 = row.get(0).map_err(|e| sql_err(e))?;
-            let id: Vec<u8> = row.get(1).map_err(|e| sql_err(e))?;
+        while let Some(row) = rows.next().map_err(sql_err)? {
+            let ts: i64 = row.get(0).map_err(sql_err)?;
+            let id: Vec<u8> = row.get(1).map_err(sql_err)?;
 
             let item = Self::to_item(ts, &id);
             if !cb(item, idx)? {

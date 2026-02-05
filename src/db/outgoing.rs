@@ -72,8 +72,7 @@ impl<'a> OutgoingQueue<'a> {
             return Ok(());
         }
 
-        let placeholders = std::iter::repeat("?")
-            .take(rowids.len())
+        let placeholders = std::iter::repeat_n("?", rowids.len())
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!("UPDATE outgoing_queue SET sent_at = ?1 WHERE id IN ({})", placeholders);

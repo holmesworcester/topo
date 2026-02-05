@@ -42,30 +42,6 @@ fn run_demo(events: usize, env_vars: &[(&str, &str)]) -> Option<(f64, f64)> {
     }
 }
 
-/// Run the sim command and return stdout/stderr (for throughput + memory reporting).
-fn run_sim(events: usize, timeout: usize, latency_ms: usize, bandwidth_kib: usize) -> Option<String> {
-    let mut cmd = Command::new("cargo");
-    cmd.args([
-        "run",
-        "--release",
-        "--",
-        "sim",
-        "--events",
-        &events.to_string(),
-        "--timeout",
-        &timeout.to_string(),
-        "--latency-ms",
-        &latency_ms.to_string(),
-        "--bandwidth-kib",
-        &bandwidth_kib.to_string(),
-    ]);
-
-    let output = cmd.output().ok()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    Some(format!("{}{}", stdout, stderr))
-}
-
 fn run_generate(db: &str, events: usize, channel: &str) -> bool {
     let mut cmd = Command::new("cargo");
     cmd.args([

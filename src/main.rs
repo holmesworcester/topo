@@ -1,10 +1,4 @@
-mod crypto;
-mod db;
-mod runtime;
-mod sync;
-mod transport;
-pub mod util;
-mod wire;
+use poc_7::{crypto, db, runtime, sync, transport, wire};
 
 use clap::{Parser, Subcommand};
 use negentropy::{Negentropy, Id, NegentropyStorageBase, Storage};
@@ -302,13 +296,7 @@ fn batch_writer(
         }
     };
 
-    loop {
-        // Block waiting for first item
-        let first = match rx.blocking_recv() {
-            Some(item) => item,
-            None => break, // Channel closed
-        };
-
+    while let Some(first) = rx.blocking_recv() {
         // Collect batch
         let mut batch = vec![first];
         while let Ok(item) = rx.try_recv() {
@@ -1003,7 +991,6 @@ fn show_stats(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sy
         [],
         |row| row.get(0),
     ).unwrap_or(0);
-    let incoming_count: i64 = db.query_row("SELECT COUNT(*) FROM incoming_queue WHERE processed = 0", [], |row| row.get(0)).unwrap_or(0);
     let messages_count: i64 = db.query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0)).unwrap_or(0);
     let neg_items_count: i64 = db.query_row("SELECT COUNT(*) FROM neg_items", [], |row| row.get(0)).unwrap_or(0);
 
@@ -1012,7 +999,6 @@ fn show_stats(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sy
     println!("  Shareable: {} events", shareable_count);
     println!("  Wanted:    {} events", wanted_count);
     println!("  Outgoing:  {} queued", outgoing_count);
-    println!("  Incoming:  {} pending", incoming_count);
     println!("  Messages:  {} projected", messages_count);
     println!("  NegItems:  {} indexed", neg_items_count);
 
