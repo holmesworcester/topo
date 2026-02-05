@@ -1,5 +1,5 @@
 use crate::wire::ENVELOPE_SIZE;
-use super::{MSG_TYPE_PING, MSG_TYPE_NEG_OPEN, MSG_TYPE_NEG_MSG, MSG_TYPE_HAVE_LIST, MSG_TYPE_EVENT, EVENT_SIZE};
+use super::{MSG_TYPE_PING, MSG_TYPE_NEG_OPEN, MSG_TYPE_NEG_MSG, MSG_TYPE_HAVE_LIST, MSG_TYPE_WILL_SEND, MSG_TYPE_EVENT, EVENT_SIZE};
 
 /// Sync protocol messages
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12,6 +12,8 @@ pub enum SyncMessage {
     NegMsg { msg: Vec<u8> },
     /// List of event IDs the client needs from server (32 bytes each)
     HaveList { ids: Vec<[u8; 32]> },
+    /// Tell peer how many events will be sent
+    WillSend { count: u64 },
     /// Send full event blob
     Event { blob: Vec<u8> },
 }
@@ -67,6 +69,17 @@ pub fn parse_sync_message(input: &[u8]) -> Result<(SyncMessage, usize), ParseErr
             }
             Ok((SyncMessage::HaveList { ids }, total_size))
         }
+        MSG_TYPE_WILL_SEND => {
+            // Fixed size: type(1) + count(8)
+            if input.len() < 9 {
+                return Err(ParseError::InsufficientData);
+            }
+            let count = u64::from_le_bytes([
+                input[1], input[2], input[3], input[4],
+                input[5], input[6], input[7], input[8],
+            ]);
+            Ok((SyncMessage::WillSend { count }, 9))
+        }
         MSG_TYPE_EVENT => {
             if input.len() < EVENT_SIZE {
                 return Err(ParseError::InsufficientData);
@@ -105,6 +118,12 @@ pub fn encode_sync_message(msg: &SyncMessage) -> Vec<u8> {
             for id in ids {
                 buf.extend_from_slice(id);
             }
+            buf
+        }
+        SyncMessage::WillSend { count } => {
+            let mut buf = Vec::with_capacity(9);
+            buf.push(MSG_TYPE_WILL_SEND);
+            buf.extend_from_slice(&count.to_le_bytes());
             buf
         }
         SyncMessage::Event { blob } => {

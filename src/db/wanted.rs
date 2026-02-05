@@ -59,6 +59,30 @@ impl<'a> Wanted<'a> {
     pub fn is_empty(&self) -> SqliteResult<bool> {
         Ok(self.count()? == 0)
     }
+
+    /// Get all wanted event IDs
+    pub fn get_all(&self) -> SqliteResult<Vec<EventId>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id FROM wanted_events"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let id_b64: String = row.get(0)?;
+            Ok(id_b64)
+        })?;
+
+        let mut result = Vec::new();
+        for row in rows {
+            let id_b64 = row?;
+            if let Ok(bytes) = base64::decode(&id_b64) {
+                if bytes.len() == 32 {
+                    let mut id = [0u8; 32];
+                    id.copy_from_slice(&bytes);
+                    result.push(id);
+                }
+            }
+        }
+        Ok(result)
+    }
 }
 
 #[cfg(test)]

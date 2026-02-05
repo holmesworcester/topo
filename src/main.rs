@@ -698,6 +698,9 @@ async fn run_sync_responder(
                 Ok(Ok(SyncMessage::Ping)) => {
                     // Ignore ping messages (used for stream establishment)
                 }
+                Ok(Ok(SyncMessage::WillSend { count: _ })) => {
+                    // Non-dual responder doesn't need this
+                }
                 Ok(Err(transport::connection::ConnectionError::Closed)) => {
                     info!("Connection closed by peer");
                     drop(tx);
@@ -889,29 +892,47 @@ async fn run_sync_initiator_dual(
                 match ctrl_result {
                     Ok(SyncMessage::NegMsg { msg }) => {
                         rounds += 1;
+                        // Clear vectors before each round to avoid accumulation
+                        have_ids.clear();
+                        need_ids.clear();
+
                         match neg.reconcile_with_ids(&msg, &mut have_ids, &mut need_ids)? {
                             Some(next_msg) => {
+                                // Insert this round's IDs directly to database (dedup via INSERT OR IGNORE)
+                                if !have_ids.is_empty() {
+                                    let event_ids: Vec<EventId> = have_ids.iter()
+                                        .map(|id| neg_id_to_event_id(id))
+                                        .collect();
+                                    pending_send.insert_batch(&event_ids)?;
+                                }
+                                if !need_ids.is_empty() {
+                                    let event_ids: Vec<EventId> = need_ids.iter()
+                                        .map(|id| neg_id_to_event_id(id))
+                                        .collect();
+                                    wanted.insert_batch(&event_ids)?;
+                                }
+
                                 ctrl_send.send(&SyncMessage::NegMsg { msg: next_msg }).await?;
                                 ctrl_send.flush().await?;
                             }
                             None => {
-                                // Deduplicate IDs
-                                let have_set: HashSet<_> = have_ids.iter().cloned().collect();
-                                let need_set: HashSet<_> = need_ids.iter().cloned().collect();
+                                // Final round - insert remaining IDs
+                                if !have_ids.is_empty() {
+                                    let event_ids: Vec<EventId> = have_ids.iter()
+                                        .map(|id| neg_id_to_event_id(id))
+                                        .collect();
+                                    pending_send.insert_batch(&event_ids)?;
+                                }
+                                if !need_ids.is_empty() {
+                                    let event_ids: Vec<EventId> = need_ids.iter()
+                                        .map(|id| neg_id_to_event_id(id))
+                                        .collect();
+                                    wanted.insert_batch(&event_ids)?;
+                                }
 
-                                // Convert to EventIds and write to database
-                                let have_event_ids: Vec<EventId> = have_set.iter()
-                                    .map(|id| neg_id_to_event_id(id))
-                                    .collect();
-                                let need_event_ids: Vec<EventId> = need_set.iter()
-                                    .map(|id| neg_id_to_event_id(id))
-                                    .collect();
-
-                                pending_send.insert_batch(&have_event_ids)?;
-                                wanted.insert_batch(&need_event_ids)?;
-
-                                total_to_send = have_event_ids.len() as i64;
-                                total_to_recv = need_event_ids.len() as i64;
+                                // Get counts from database (reflects deduplication)
+                                total_to_send = pending_send.count()?;
+                                total_to_recv = wanted.count()?;
 
                                 info!("Reconciliation complete in {} rounds: {} have, {} need",
                                     rounds, total_to_send, total_to_recv);
@@ -920,13 +941,17 @@ async fn run_sync_initiator_dual(
                                 // Clear vectors to free memory
                                 have_ids.clear();
                                 need_ids.clear();
+                                have_ids.shrink_to_fit();
+                                need_ids.shrink_to_fit();
 
-                                // Tell peer what we need
+                                // Tell peer what we need and how many events we'll send
                                 if total_to_recv > 0 {
-                                    let need_ids_to_send: Vec<EventId> = need_event_ids;
+                                    let need_ids_to_send: Vec<EventId> = wanted.get_all()?;
                                     ctrl_send.send(&SyncMessage::HaveList { ids: need_ids_to_send }).await?;
-                                    ctrl_send.flush().await?;
                                 }
+                                // Tell peer how many events we will send (so they know when to stop waiting)
+                                ctrl_send.send(&SyncMessage::WillSend { count: total_to_send as u64 }).await?;
+                                ctrl_send.flush().await?;
                             }
                         }
                     }
@@ -1096,6 +1121,7 @@ async fn run_sync_responder_dual(
 
     // State for sync
     let mut total_to_send: i64 = 0;
+    let mut total_to_recv: i64 = 0;  // Learned from HaveList received from initiator (count of events we need to receive)
     let mut reconciliation_done = false;
     let mut rounds = 0;
     let mut peer_done = false;
@@ -1112,18 +1138,17 @@ async fn run_sync_responder_dual(
 
         let pending_count = pending_send.count().unwrap_or(0);
         let sent = events_sent.load(Ordering::Relaxed);
+        let received = events_received.load(Ordering::Relaxed);
         // all_sent means events have actually been transmitted, not just queued
         let all_sent = total_to_send == 0 || sent >= total_to_send as u64;
+        let all_received = total_to_recv == 0 || received >= total_to_recv as u64;
         // Exit conditions:
         // 1. Reconciliation is done
         // 2. We've sent all our events (actually transmitted, not just queued)
-        // 3. Peer signaled done
-        // 4. Either no events for 100ms (stream drained) OR waited 500ms after peer done
-        // Note: stream_quiet defaults to false (not true) - if we haven't received events yet, keep waiting
-        let stream_quiet = last_event_time.map_or(false, |t| t.elapsed() > Duration::from_millis(500));
-        let peer_wait_done = peer_done_time.map_or(false, |t| t.elapsed() > Duration::from_millis(1000));
-        if reconciliation_done && all_sent && peer_done && (stream_quiet || peer_wait_done) {
-            info!("Sync complete: sent {}, received {}", sent, events_received.load(Ordering::Relaxed));
+        // 3. We've received all expected events
+        // 4. Peer signaled done
+        if reconciliation_done && all_sent && all_received && peer_done {
+            info!("Sync complete: sent {}, received {}", sent, received);
             break;
         }
 
@@ -1168,6 +1193,10 @@ async fn run_sync_responder_dual(
                             total_to_send = ids.len() as i64;
                             info!("Received HaveList with {} items", total_to_send);
                         }
+                    }
+                    Ok(SyncMessage::WillSend { count }) => {
+                        total_to_recv = count as i64;
+                        info!("Peer will send {} events", count);
                     }
                     Ok(_) => {}
                     Err(transport::connection::ConnectionError::Closed) => {
@@ -1357,6 +1386,7 @@ async fn run_demo(events_per_peer: usize, timeout_secs: u64) -> Result<(), Box<d
     let _ = std::fs::remove_file("demo_client.db");
     let _ = std::fs::remove_file("demo_client.db-shm");
     let _ = std::fs::remove_file("demo_client.db-wal");
+
 
     // Generate events for server (32 hex chars = 16 bytes)
     info!("Generating events for server...");

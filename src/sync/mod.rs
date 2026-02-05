@@ -13,6 +13,7 @@ pub const MSG_TYPE_PING: u8 = 0x00;       // Stream establishment / keep-alive
 pub const MSG_TYPE_NEG_OPEN: u8 = 0x10;   // Initial negentropy message
 pub const MSG_TYPE_NEG_MSG: u8 = 0x11;    // Negentropy response
 pub const MSG_TYPE_HAVE_LIST: u8 = 0x12;  // List of IDs client needs from server
+pub const MSG_TYPE_WILL_SEND: u8 = 0x13;  // Count of events that will be sent
 pub const MSG_TYPE_EVENT: u8 = 0x03;      // Event blob
 
 /// Message sizes
