@@ -183,7 +183,7 @@ Files likely to change:
   Add `neg_items`, `neg_blocks` tables.
 - `main.rs`  
   Replace prefetch logic. Add two streams. Add dedicated send/recv loops. Remove `try_send`.
-- `sync/negentropy_adapter.rs`  
+- (adapter removed; negentropy integration lives in `sync/negentropy_sqlite.rs`)  
   Replace vector loading with `NegentropyStorageSqlite`.
 - New file: `sync/negentropy_sqlite.rs`  
   Implement the storage adapter.
