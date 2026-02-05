@@ -569,7 +569,7 @@ async fn run_server(
 
     // Open bidirectional stream
     let (send, recv) = connection.accept_bi().await?;
-    let mut conn = Connection::new(send, recv);
+    let conn = Connection::new(send, recv);
 
     // Run sync as responder (server waits for client to initiate)
     run_sync_responder(Box::new(conn), db_path, timeout_secs, None).await?;
@@ -616,7 +616,7 @@ async fn run_client(
 
     // Open bidirectional stream
     let (send, recv) = connection.open_bi().await?;
-    let mut conn = Connection::new(send, recv);
+    let conn = Connection::new(send, recv);
 
     // Run sync as initiator (client starts the reconciliation)
     run_sync_initiator(Box::new(conn), db_path, timeout_secs, None).await?;
@@ -775,7 +775,7 @@ async fn run_sync_initiator(
                             let event_id = hash_event(&blob);
                             enqueue_event(&tx, event_id, blob).await;
                         }
-                        _ => {}
+                        SyncMessage::NegOpen { .. } | SyncMessage::HaveList { .. } => {}
                     }
                 }
                 Ok(None) => {
@@ -1007,7 +1007,7 @@ async fn run_sync_initiator_dual(
                             let event_id = hash_event(&blob);
                             enqueue_event(&tx, event_id, blob).await;
                         }
-                        _ => {}
+                        SyncMessage::NegOpen { .. } | SyncMessage::HaveList { .. } => {}
                     }
                 }
                 Ok(None) => {
@@ -1578,7 +1578,6 @@ fn projection_worker(db_path: String, stop: Arc<AtomicBool>) {
             match db.execute("BEGIN IMMEDIATE", []) {
                 Ok(_) => {
                     began = true;
-                    lock_backoff_ms = 1;
                     break;
                 }
                 Err(e) => {
@@ -1963,7 +1962,6 @@ async fn run_sync_responder_dual(
                             let event_id = hash_event(&blob);
                             enqueue_event(&tx, event_id, blob).await;
                         }
-                        _ => {}
                     }
                 }
                 Ok(None) => {

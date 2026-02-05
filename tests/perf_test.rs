@@ -3,7 +3,6 @@
 //! Run with: cargo test --release perf_ -- --nocapture --ignored
 
 use std::process::Command;
-use std::time::Instant;
 
 /// Run the demo command and extract timing
 fn run_demo(events: usize, env_vars: &[(&str, &str)]) -> Option<(f64, f64)> {

@@ -3,7 +3,7 @@ pub mod connection;
 pub mod sim;
 pub mod sync_conn;
 
-pub use cert::{generate_self_signed_cert, spki_from_base64, spki_to_base64, SelfSignedCert};
+pub use cert::{generate_self_signed_cert, spki_from_base64, spki_to_base64};
 pub use connection::Connection;
 pub use sim::{create_sim_pair, SimConfig, SimConnection};
 pub use sync_conn::SyncConnection;
@@ -11,7 +11,7 @@ pub use sync_conn::SyncConnection;
 use quinn::{ClientConfig, Endpoint, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use rustls::{CertificateError, DistinguishedName};
-use rustls_webpki::EndEntityCert;
+use webpki::EndEntityCert;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -91,11 +91,16 @@ pub fn create_client_endpoint(
     Ok(endpoint)
 }
 
-#[derive(Debug)]
 struct PinnedCertVerifier {
     peer_store: Arc<dyn PeerKeyStore>,
     supported: rustls::crypto::WebPkiSupportedAlgorithms,
     root_hints: Vec<DistinguishedName>,
+}
+
+impl std::fmt::Debug for PinnedCertVerifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PinnedCertVerifier").finish()
+    }
 }
 
 impl PinnedCertVerifier {
@@ -157,7 +162,7 @@ impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
     }
 }
 
-impl rustls::verify::ClientCertVerifier for PinnedCertVerifier {
+impl rustls::server::danger::ClientCertVerifier for PinnedCertVerifier {
     fn offer_client_auth(&self) -> bool {
         true
     }
@@ -175,9 +180,9 @@ impl rustls::verify::ClientCertVerifier for PinnedCertVerifier {
         end_entity: &CertificateDer<'_>,
         _intermediates: &[CertificateDer<'_>],
         _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::verify::ClientCertVerified, rustls::Error> {
+    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
         self.verify_spki(end_entity)?;
-        Ok(rustls::verify::ClientCertVerified::assertion())
+        Ok(rustls::server::danger::ClientCertVerified::assertion())
     }
 
     fn verify_tls12_signature(
@@ -185,7 +190,7 @@ impl rustls::verify::ClientCertVerifier for PinnedCertVerifier {
         message: &[u8],
         cert: &CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::verify::HandshakeSignatureValid, rustls::Error> {
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         rustls::crypto::verify_tls12_signature(message, cert, dss, &self.supported)
     }
 
@@ -194,7 +199,7 @@ impl rustls::verify::ClientCertVerifier for PinnedCertVerifier {
         message: &[u8],
         cert: &CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::verify::HandshakeSignatureValid, rustls::Error> {
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         rustls::crypto::verify_tls13_signature(message, cert, dss, &self.supported)
     }
 

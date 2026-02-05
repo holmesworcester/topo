@@ -4,7 +4,6 @@ pub mod negentropy_adapter;
 pub use protocol::{SyncMessage, parse_sync_message, encode_sync_message, sync_message_len};
 pub use negentropy_adapter::{
     ensure_negentropy_index,
-    build_negentropy_storage_from_db,
     neg_id_to_event_id,
     NegentropyBatchInserter,
     NegentropyStorageSqlite,
@@ -13,9 +12,6 @@ pub use negentropy_adapter::{
     neg_block_size,
     neg_max_bytes,
     neg_rebuild_threshold,
-    NEG_BLOCK_SIZE,
-    NEG_MAX_BYTES,
-    NEG_REBUILD_MULT,
 };
 
 use crate::wire::ENVELOPE_SIZE;

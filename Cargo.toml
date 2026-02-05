@@ -9,7 +9,6 @@ nom = "7.1"
 quinn = "0.11"
 tokio = { version = "1", features = ["full"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-rustls-webpki = "0.102"
 blake2 = "0.10"
 base64 = "0.21"
 rcgen = "0.12"
@@ -24,3 +23,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 constrained-connection = "0.1.0"
 futures = "0.3"
 async-trait = "0.1"
+rustls-webpki = "0.102"

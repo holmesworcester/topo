@@ -1,7 +1,7 @@
 use base64::Engine;
 use rcgen::generate_simple_self_signed;
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
-use rustls_webpki::EndEntityCert;
+use webpki::EndEntityCert;
 
 pub struct SelfSignedCert {
     pub cert_der: CertificateDer<'static>,

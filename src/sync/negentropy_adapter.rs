@@ -907,13 +907,11 @@ mod tests {
         }
         let mut have_ids_vec = Vec::new();
         let mut need_ids_vec = Vec::new();
-        let mut msg = msg_vec;
         let mut last_resp_vec = resp_vec;
         loop {
             match neg_a_vec.reconcile_with_ids(&last_resp_vec, &mut have_ids_vec, &mut need_ids_vec).unwrap() {
                 Some(next) => {
-                    msg = next;
-                    last_resp_vec = neg_b_vec.reconcile(&msg).unwrap();
+                    last_resp_vec = neg_b_vec.reconcile(&next).unwrap();
                 }
                 None => break,
             }
@@ -924,13 +922,11 @@ mod tests {
         assert_eq!(fp_a.to_bytes(), fp_a_vec.to_bytes());
         assert_eq!(fp_b.to_bytes(), fp_b_vec.to_bytes());
 
-        let mut msg = msg_sql;
         let mut last_resp = resp_sql;
         loop {
             match neg_a.reconcile_with_ids(&last_resp, &mut have_ids, &mut need_ids).unwrap() {
                 Some(next) => {
-                    msg = next;
-                    last_resp = neg_b.reconcile(&msg).unwrap();
+                    last_resp = neg_b.reconcile(&next).unwrap();
                 }
                 None => break,
             }
