@@ -776,7 +776,7 @@ async fn run_sync_responder_dual<T: StreamConn>(
     let mut send_interval = tokio::time::interval(Duration::from_millis(5));
     send_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    loop {
+        loop {
         tokio::select! {
             biased;
 
@@ -784,11 +784,11 @@ async fn run_sync_responder_dual<T: StreamConn>(
             ctrl_result = conn.control.recv() => {
                 match ctrl_result {
                     Ok(SyncMessage::NegOpen { msg }) | Ok(SyncMessage::NegMsg { msg }) => {
-                        idle_count = 0;
+                                                idle_count = 0;
                         rounds += 1;
 
-                        let response = neg.reconcile(&msg)?;
-                        if response.is_empty() {
+                                                let response = neg.reconcile(&msg)?;
+                                                if response.is_empty() {
                             info!("Reconciliation complete in {} rounds", rounds);
                             reconciliation_done = true;
                         } else {
@@ -1063,9 +1063,9 @@ async fn run_demo(events_per_peer: usize, timeout_secs: u64) -> Result<(), Box<d
         });
     });
 
-    // Wait for server to signal it's ready
+    // Wait for server to signal it's ready, then give it time to initialize
     let _ = rx.await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Start client task
     let client_handle = std::thread::spawn(move || {
@@ -1156,24 +1156,38 @@ async fn run_sim(
     let (server_ctrl, client_ctrl) = create_sim_pair(config);
     let (server_data, client_data) = create_sim_pair(config);
 
-    let mut server_conn: DualConnection<SimConnection> = DualConnection {
-        control: server_ctrl,
-        data: server_data,
-    };
-    let mut client_conn: DualConnection<SimConnection> = DualConnection {
-        control: client_ctrl,
-        data: client_data,
-    };
+    // Use separate threads like demo mode (rusqlite::Connection is !Send)
+    let server_handle = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let mut server_conn: DualConnection<SimConnection> = DualConnection {
+                control: server_ctrl,
+                data: server_data,
+            };
+            run_sync_responder_dual(&mut server_conn, "sim_server.db", timeout_secs, "sim-client").await
+        })
+    });
 
-    let server_fut = async move {
-        run_sync_responder_dual(&mut server_conn, "sim_server.db", timeout_secs, "sim-client").await
-    };
+    let client_handle = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let mut client_conn: DualConnection<SimConnection> = DualConnection {
+                control: client_ctrl,
+                data: client_data,
+            };
+            run_sync_initiator_dual(&mut client_conn, "sim_client.db", timeout_secs, "sim-server").await
+        })
+    });
 
-    let client_fut = async move {
-        run_sync_initiator_dual(&mut client_conn, "sim_client.db", timeout_secs, "sim-server").await
-    };
+    let server_res = server_handle.join().unwrap();
+    let client_res = client_handle.join().unwrap();
 
-    let (server_res, client_res) = tokio::join!(server_fut, client_fut);
     let server_stats = match server_res {
         Ok(stats) => Some(stats),
         Err(e) => {

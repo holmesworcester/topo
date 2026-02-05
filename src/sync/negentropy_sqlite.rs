@@ -121,7 +121,7 @@ impl NegentropyStorageBase for NegentropyStorageSqlite<'_> {
     }
 
     fn get_item(&self, i: usize) -> Result<Option<Item>, NegError> {
-        let block_idx = i / BLOCK_SIZE;
+                let block_idx = i / BLOCK_SIZE;
         let offset = i % BLOCK_SIZE;
 
         // Get block start key
@@ -159,7 +159,7 @@ impl NegentropyStorageBase for NegentropyStorageSqlite<'_> {
         end: usize,
         cb: &mut dyn FnMut(Item, usize) -> Result<bool, NegError>,
     ) -> Result<(), NegError> {
-        if begin >= end {
+                if begin >= end {
             return Ok(());
         }
 
@@ -203,7 +203,7 @@ impl NegentropyStorageBase for NegentropyStorageSqlite<'_> {
     }
 
     fn find_lower_bound(&self, first: usize, last: usize, value: &Bound) -> usize {
-        // Handle "infinity" bound - negentropy uses u64::MAX to mean end of items
+                // Handle "infinity" bound - negentropy uses u64::MAX to mean end of items
         if value.item.timestamp >= i64::MAX as u64 {
             return last;
         }
