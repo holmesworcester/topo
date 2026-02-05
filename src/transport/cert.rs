@@ -1,31 +1,44 @@
-use ed25519_dalek::{SigningKey, VerifyingKey};
-use rand::rngs::OsRng;
+use base64::Engine;
 use rcgen::generate_simple_self_signed;
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+use rustls_webpki::EndEntityCert;
 
-/// Generate a new Ed25519 keypair
-pub fn generate_keypair() -> (SigningKey, VerifyingKey) {
-    let signing_key = SigningKey::generate(&mut OsRng);
-    let verifying_key = signing_key.verifying_key();
-    (signing_key, verifying_key)
+pub struct SelfSignedCert {
+    pub cert_der: CertificateDer<'static>,
+    pub key_der: PrivatePkcs8KeyDer<'static>,
+    pub spki_der: Vec<u8>,
 }
 
 /// Generate a self-signed certificate with a new keypair
 /// Returns the certificate and private key in PKCS#8 format
 pub fn generate_self_signed_cert(
-    _signing_key: &SigningKey,
-) -> Result<
-    (CertificateDer<'static>, PrivatePkcs8KeyDer<'static>),
-    Box<dyn std::error::Error + Send + Sync>,
-> {
+)-> Result<SelfSignedCert, Box<dyn std::error::Error + Send + Sync>> {
     // Use rcgen's simple self-signed generator
     let subject_alt_names = vec!["localhost".to_string()];
     let cert = generate_simple_self_signed(subject_alt_names)?;
 
     let cert_der = CertificateDer::from(cert.serialize_der()?);
     let key_der = PrivatePkcs8KeyDer::from(cert.serialize_private_key_der());
+    let spki_der = EndEntityCert::try_from(&cert_der)?
+        .subject_public_key_info()
+        .as_ref()
+        .to_vec();
 
-    Ok((cert_der, key_der))
+    Ok(SelfSignedCert {
+        cert_der,
+        key_der,
+        spki_der,
+    })
+}
+
+pub fn spki_to_base64(spki_der: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(spki_der)
+}
+
+pub fn spki_from_base64(
+    spki_b64: &str,
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(base64::engine::general_purpose::STANDARD.decode(spki_b64)?)
 }
 
 #[cfg(test)]
@@ -33,23 +46,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_generate_keypair() {
-        let (signing, verifying) = generate_keypair();
-        assert_eq!(signing.verifying_key(), verifying);
-    }
-
-    #[test]
     fn test_generate_cert() {
-        let (signing_key, _) = generate_keypair();
-        let result = generate_self_signed_cert(&signing_key);
+        let result = generate_self_signed_cert();
         if let Err(ref e) = result {
             eprintln!("Error: {:?}", e);
         }
         assert!(result.is_ok(), "Failed to generate cert: {:?}", result.err());
 
-        let (cert_der, key_der) = result.unwrap();
-        assert!(!cert_der.is_empty());
-        assert!(!key_der.secret_pkcs8_der().is_empty());
+        let cert = result.unwrap();
+        assert!(!cert.cert_der.is_empty());
+        assert!(!cert.key_der.secret_pkcs8_der().is_empty());
+        assert!(!cert.spki_der.is_empty());
     }
 
 }

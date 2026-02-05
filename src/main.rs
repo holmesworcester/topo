@@ -43,7 +43,16 @@ use crate::sync::{
     sync_message_len,
     NegentropyBatchInserter,
 };
-use crate::transport::{Connection, create_client_endpoint, create_server_endpoint, generate_keypair, generate_self_signed_cert};
+use crate::transport::{
+    Connection,
+    create_client_endpoint,
+    create_server_endpoint,
+    generate_self_signed_cert,
+    spki_from_base64,
+    spki_to_base64,
+    PeerKeyStore,
+    StaticPeerKeyStore,
+};
 use crate::transport::{create_sim_pair, SimConfig, SimConnection, SyncConnection};
 use crate::wire::Envelope;
 
@@ -398,6 +407,10 @@ enum Commands {
         #[arg(short, long, default_value = "127.0.0.1:4433")]
         bind: SocketAddr,
 
+        /// Base64-encoded peer SPKI (public key) to accept (enables mTLS pinning)
+        #[arg(long)]
+        peer_spki: Option<String>,
+
         /// Database path
         #[arg(short, long, default_value = "server.db")]
         db: String,
@@ -412,6 +425,10 @@ enum Commands {
         /// Remote address to connect to
         #[arg(short, long)]
         remote: SocketAddr,
+
+        /// Base64-encoded peer SPKI (public key) to accept (enables mTLS pinning)
+        #[arg(long)]
+        peer_spki: Option<String>,
 
         /// Database path
         #[arg(short, long, default_value = "client.db")]
@@ -486,11 +503,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Listen { bind, db, timeout } => {
-            run_server(bind, &db, timeout).await?;
+        Commands::Listen { bind, peer_spki, db, timeout } => {
+            let peer_spki = match peer_spki {
+                Some(spki_b64) => Some(spki_from_base64(&spki_b64)?),
+                None => None,
+            };
+            run_server(bind, &db, timeout, peer_spki).await?;
         }
-        Commands::Connect { remote, db, timeout } => {
-            run_client(remote, &db, timeout).await?;
+        Commands::Connect { remote, peer_spki, db, timeout } => {
+            let peer_spki = match peer_spki {
+                Some(spki_b64) => Some(spki_from_base64(&spki_b64)?),
+                None => None,
+            };
+            run_client(remote, &db, timeout, peer_spki).await?;
         }
         Commands::Generate { db, count, channel } => {
             generate_events(&db, count, &channel)?;
@@ -513,15 +538,22 @@ async fn run_server(
     bind: SocketAddr,
     db_path: &str,
     timeout_secs: u64,
+    peer_spki: Option<Vec<u8>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("Starting server on {}", bind);
 
-    // Generate keypair and certificate
-    let (signing_key, _) = generate_keypair();
-    let (cert, key) = generate_self_signed_cert(&signing_key)?;
+    // Generate certificate identity
+    let identity = generate_self_signed_cert()?;
+    info!("Server SPKI (base64): {}", spki_to_base64(&identity.spki_der));
 
     // Create server endpoint
-    let endpoint = create_server_endpoint(bind, cert, key)?;
+    let peer_store: Option<Arc<dyn PeerKeyStore>> = peer_spki.map(|spki| {
+        Arc::new(StaticPeerKeyStore::new(vec![spki])) as Arc<dyn PeerKeyStore>
+    });
+    if peer_store.is_none() {
+        warn!("mTLS pinning disabled: accepting any peer certificate");
+    }
+    let endpoint = create_server_endpoint(bind, identity.cert_der, identity.key_der, peer_store)?;
     info!("Server listening on {}", endpoint.local_addr()?);
 
     // Initialize database
@@ -552,11 +584,25 @@ async fn run_client(
     remote: SocketAddr,
     db_path: &str,
     timeout_secs: u64,
+    peer_spki: Option<Vec<u8>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("Connecting to {}", remote);
 
     // Create client endpoint
-    let endpoint = create_client_endpoint("0.0.0.0:0".parse()?)?;
+    let identity = generate_self_signed_cert()?;
+    info!("Client SPKI (base64): {}", spki_to_base64(&identity.spki_der));
+    let peer_store: Option<Arc<dyn PeerKeyStore>> = peer_spki.map(|spki| {
+        Arc::new(StaticPeerKeyStore::new(vec![spki])) as Arc<dyn PeerKeyStore>
+    });
+    if peer_store.is_none() {
+        warn!("mTLS pinning disabled: accepting any peer certificate");
+    }
+    let endpoint = create_client_endpoint(
+        "0.0.0.0:0".parse()?,
+        identity.cert_der,
+        identity.key_der,
+        peer_store,
+    )?;
 
     // Connect to server
     let connection = endpoint.connect(remote, "localhost")?.await?;
@@ -2105,7 +2151,7 @@ async fn run_demo(events_per_peer: usize, timeout_secs: u64) -> Result<(), Box<d
             let bind: SocketAddr = "127.0.0.1:4433".parse().unwrap();
             // Signal that server is starting
             let _ = tx.send(());
-            if let Err(e) = run_server(bind, "demo_server.db", server_timeout).await {
+            if let Err(e) = run_server(bind, "demo_server.db", server_timeout, None).await {
                 error!("Server error: {}", e);
             }
         });
@@ -2123,7 +2169,7 @@ async fn run_demo(events_per_peer: usize, timeout_secs: u64) -> Result<(), Box<d
             .unwrap();
         rt.block_on(async move {
             let remote: SocketAddr = "127.0.0.1:4433".parse().unwrap();
-            if let Err(e) = run_client(remote, "demo_client.db", client_timeout).await {
+            if let Err(e) = run_client(remote, "demo_client.db", client_timeout, None).await {
                 error!("Client error: {}", e);
             }
         });
