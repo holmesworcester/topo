@@ -1,7 +1,7 @@
 use rusqlite::{Connection, Result as SqliteResult, params};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::crypto::{event_id_to_base64, EventId};
+use crate::util::current_timestamp_ms;
 
 /// Content-addressed blob storage
 pub struct Store<'a> {
@@ -26,6 +26,7 @@ impl<'a> Store<'a> {
     }
 
     /// Store multiple blobs at once
+    #[cfg(test)]
     pub fn put_batch(&self, items: &[(EventId, Vec<u8>)]) -> SqliteResult<()> {
         let now = current_timestamp_ms();
         let mut stmt = self.conn.prepare(
@@ -40,6 +41,7 @@ impl<'a> Store<'a> {
     }
 
     /// Get a blob by its event ID
+    #[allow(dead_code)]
     pub fn get(&self, id: &EventId) -> SqliteResult<Option<Vec<u8>>> {
         let id_str = event_id_to_base64(id);
 
@@ -56,7 +58,44 @@ impl<'a> Store<'a> {
         }
     }
 
+    /// Get multiple blobs by event IDs in a single query
+    /// Returns a HashMap mapping EventId -> blob for found items
+    pub fn get_batch(&self, ids: &[EventId]) -> SqliteResult<std::collections::HashMap<EventId, Vec<u8>>> {
+        use std::collections::HashMap;
+
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let id_strs: Vec<String> = ids.iter().map(event_id_to_base64).collect();
+        let placeholders: String = id_strs.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let query = format!("SELECT id, blob FROM store WHERE id IN ({})", placeholders);
+
+        let mut stmt = self.conn.prepare(&query)?;
+        let params: Vec<&dyn rusqlite::ToSql> = id_strs.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+
+        let mut result = HashMap::with_capacity(ids.len());
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+
+        // Build reverse lookup from base64 string to original EventId
+        let id_lookup: HashMap<String, EventId> = ids.iter()
+            .map(|id| (event_id_to_base64(id), *id))
+            .collect();
+
+        for row in rows {
+            let (id_str, blob) = row?;
+            if let Some(&event_id) = id_lookup.get(&id_str) {
+                result.insert(event_id, blob);
+            }
+        }
+
+        Ok(result)
+    }
+
     /// Check if we have a blob
+    #[cfg(test)]
     pub fn exists(&self, id: &EventId) -> SqliteResult<bool> {
         let id_str = event_id_to_base64(id);
 
@@ -68,13 +107,6 @@ impl<'a> Store<'a> {
 
         Ok(count > 0)
     }
-}
-
-fn current_timestamp_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64
 }
 
 #[cfg(test)]

@@ -1,8 +1,17 @@
+use async_trait::async_trait;
 use quinn::{RecvStream, SendStream};
 use tokio::io::AsyncWriteExt;
 
-use crate::sync::{parse_sync_message, encode_sync_message, SyncMessage};
+use crate::sync::{encode_sync_message, parse_sync_message, SyncMessage};
 use crate::sync::protocol::ParseError;
+
+/// Async stream connection abstraction for sync protocol.
+#[async_trait]
+pub trait StreamConn {
+    async fn send(&mut self, msg: &SyncMessage) -> Result<(), ConnectionError>;
+    async fn flush(&mut self) -> Result<(), ConnectionError>;
+    async fn recv(&mut self) -> Result<SyncMessage, ConnectionError>;
+}
 
 /// Bidirectional QUIC stream wrapper for sync protocol
 pub struct Connection {
@@ -17,12 +26,12 @@ pub struct Connection {
 /// Data stream: Event blobs
 ///
 /// This prevents large event transfers from blocking control messages.
-pub struct DualConnection {
-    pub control: Connection,
-    pub data: Connection,
+pub struct DualConnection<T: StreamConn = Connection> {
+    pub control: T,
+    pub data: T,
 }
 
-impl DualConnection {
+impl DualConnection<Connection> {
     /// Create from two stream pairs (control first, data second)
     pub fn new(
         control_send: SendStream,
@@ -35,7 +44,9 @@ impl DualConnection {
             data: Connection::new(data_send, data_recv),
         }
     }
+}
 
+impl<T: StreamConn> DualConnection<T> {
     /// Send a control message (NegOpen, NegMsg, HaveList)
     pub async fn send_control(&mut self, msg: &SyncMessage) -> Result<(), ConnectionError> {
         self.control.send(msg).await
@@ -113,7 +124,21 @@ impl Connection {
             }
         }
     }
+}
 
+#[async_trait]
+impl StreamConn for Connection {
+    async fn send(&mut self, msg: &SyncMessage) -> Result<(), ConnectionError> {
+        Connection::send(self, msg).await
+    }
+
+    async fn flush(&mut self) -> Result<(), ConnectionError> {
+        Connection::flush(self).await
+    }
+
+    async fn recv(&mut self) -> Result<SyncMessage, ConnectionError> {
+        Connection::recv(self).await
+    }
 }
 
 #[derive(Debug)]

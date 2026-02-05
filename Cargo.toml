@@ -20,4 +20,7 @@ thiserror = "1"
 negentropy = "0.5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+constrained-connection = "0.1.0"
+futures = "0.3"
+async-trait = "0.1"
 rustls-webpki = "0.103.9"

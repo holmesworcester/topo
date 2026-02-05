@@ -26,6 +26,7 @@ impl<'a> Shareable<'a> {
     }
 
     /// Count total shareable events
+    #[cfg(test)]
     pub fn count(&self) -> SqliteResult<i64> {
         self.conn.query_row(
             "SELECT COUNT(*) FROM shareable_events",

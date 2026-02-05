@@ -3,7 +3,6 @@
 //! Run with: cargo test --release perf_ -- --nocapture --ignored
 
 use std::process::Command;
-use std::time::Instant;
 
 /// Run the demo command and extract timing
 fn run_demo(events: usize, env_vars: &[(&str, &str)]) -> Option<(f64, f64)> {
@@ -41,6 +40,47 @@ fn run_demo(events: usize, env_vars: &[(&str, &str)]) -> Option<(f64, f64)> {
         (Some(r), Some(s)) => Some((r, s)),
         _ => None,
     }
+}
+
+/// Run the sim command and return stdout/stderr (for throughput + memory reporting).
+fn run_sim(events: usize, timeout: usize, latency_ms: usize, bandwidth_kib: usize) -> Option<String> {
+    let mut cmd = Command::new("cargo");
+    cmd.args([
+        "run",
+        "--release",
+        "--",
+        "sim",
+        "--events",
+        &events.to_string(),
+        "--timeout",
+        &timeout.to_string(),
+        "--latency-ms",
+        &latency_ms.to_string(),
+        "--bandwidth-kib",
+        &bandwidth_kib.to_string(),
+    ]);
+
+    let output = cmd.output().ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Some(format!("{}{}", stdout, stderr))
+}
+
+fn run_generate(db: &str, events: usize, channel: &str) -> bool {
+    let mut cmd = Command::new("cargo");
+    cmd.args([
+        "run",
+        "--release",
+        "--",
+        "generate",
+        "--db",
+        db,
+        "--events",
+        &events.to_string(),
+        "--channel",
+        channel,
+    ]);
+    cmd.status().map(|s| s.success()).unwrap_or(false)
 }
 
 fn extract_timestamp(line: &str) -> Option<f64> {
@@ -125,5 +165,40 @@ fn perf_sync_scaling() {
         }
     }
 
+    println!("\n=== Test Complete ===\n");
+}
+
+#[test]
+#[ignore] // Run with: cargo test --release perf_sim_ -- --nocapture --ignored
+fn perf_sim_throughput_10k() {
+    println!("\n=== Sim Throughput Test: 10k events/peer ===\n");
+    // Generate DBs in separate processes so VmHWM only reflects sync.
+    assert!(run_generate("sim_server.db", 10_000, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+    assert!(run_generate("sim_client.db", 10_000, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+
+    let mut cmd = Command::new("cargo");
+    cmd.args([
+        "run",
+        "--release",
+        "--",
+        "sim",
+        "--events",
+        "10000",
+        "--timeout",
+        "30",
+        "--latency-ms",
+        "10",
+        "--bandwidth-kib",
+        "50000",
+        "--no-generate",
+    ]);
+    let output = cmd.output().ok().map(|o| {
+        let stdout = String::from_utf8_lossy(&o.stdout);
+        let stderr = String::from_utf8_lossy(&o.stderr);
+        format!("{}{}", stdout, stderr)
+    }).unwrap_or_default();
+    println!("{}", output);
+    assert!(output.contains("Throughput"), "Expected throughput output");
+    assert!(output.contains("Peak RSS"), "Expected peak RSS output");
     println!("\n=== Test Complete ===\n");
 }
