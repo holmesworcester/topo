@@ -22,10 +22,23 @@ LOW_MEM=1 cargo run --release -- sim --events 100000 --timeout 200 --latency-ms 
 |-------------|--------|-------------------|---------|---------|
 | 10,000 | 4 | 7.40 | 1.41s | 23.51 MB |
 | 100,000 | 8 | 7.93 | 13.12s | 40.89 MB |
+| 200,000 | 15 | 5.32 | 39.10s | 48.68 MB |
+| 300,000 | 21 | 4.65 | 67.07s | 53.55 MB |
+| 500,000 | 34 | 3.71 | 140.02s | 63.02 MB |
 
 Notes:
 - RSS is for **both peers combined** (single process). Per-peer RSS is roughly half.
 - Throughput includes reconciliation time.
+- 200k/300k/500k numbers above are with `LOW_MEM=1` unless stated otherwise.
+
+## Baseline vs LOW_MEM (Sim, 50ms RTT, 6250 KiB/s)
+
+| Events/peer | LOW_MEM | Throughput (MB/s) | Max RSS |
+|-------------|---------|-------------------|---------|
+| 200,000 | 0 | 5.88 | 86.05 MB |
+| 200,000 | 1 | 5.32 | 48.68 MB |
+| 500,000 | 0 | 3.74 | 107.87 MB |
+| 500,000 | 1 | 3.71 | 63.02 MB |
 
 ## Memory Notes (24MB Target)
 - The biggest memory consumer is the in-flight event queue.
