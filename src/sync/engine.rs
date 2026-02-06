@@ -193,10 +193,14 @@ pub fn batch_writer(
                                 }
                             }
 
+                            let recorded_at = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap()
+                                .as_millis() as i64;
                             let _ = recorded_stmt.execute(rusqlite::params![
                                 &recorded_by,
                                 &event_id_b64,
-                                created_at_ms as i64,
+                                recorded_at,
                                 "quic_recv"
                             ]);
                         }

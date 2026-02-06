@@ -6,9 +6,9 @@ use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use poc_7::crypto::{hash_event, event_id_to_base64};
-use poc_7::db::{open_connection, schema::create_tables};
+use poc_7::db::{open_connection, schema::{create_tables, backfill_legacy_messages, count_legacy_messages}};
 use poc_7::events::{self, MessageEvent, ParsedEvent};
-use poc_7::identity::{cert_paths_from_db, local_identity_from_db};
+use poc_7::identity::{cert_paths_from_db, load_identity_from_db, local_identity_from_db};
 use poc_7::sync::engine::{accept_loop, connect_loop};
 use poc_7::transport::{
     AllowedPeers,
@@ -85,6 +85,12 @@ enum Commands {
         channel: String,
     },
 
+    /// Backfill legacy messages (from Phase 0 migration) to the local identity
+    BackfillIdentity {
+        #[arg(short, long, default_value = "server.db")]
+        db: String,
+    },
+
     /// Assert a predicate holds right now (exit 0 = pass, exit 1 = fail)
     AssertNow {
         /// Predicate: "field op value" (e.g. "store_count >= 10")
@@ -142,6 +148,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Commands::Generate { count, db, channel } => {
             generate_messages(&db, count, &channel)?;
         }
+        Commands::BackfillIdentity { db } => {
+            backfill_identity(&db)?;
+        }
         Commands::AssertNow { predicate, db } => {
             let code = run_assert_now(&db, &predicate)?;
             std::process::exit(code);
@@ -164,6 +173,22 @@ fn run_identity(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + 
     let (cert_der, _) = load_or_generate_cert(&cert_path, &key_path)?;
     let fp = extract_spki_fingerprint(cert_der.as_ref())?;
     println!("{}", hex::encode(fp));
+    Ok(())
+}
+
+fn backfill_identity(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let recorded_by = local_identity_from_db(db_path)?;
+    let db = open_connection(db_path)?;
+    create_tables(&db)?;
+
+    let legacy_count = count_legacy_messages(&db)?;
+    if legacy_count == 0 {
+        println!("No legacy messages to backfill.");
+        return Ok(());
+    }
+
+    let updated = backfill_legacy_messages(&db, &recorded_by)?;
+    println!("Backfilled {} legacy messages to identity {}", updated, &recorded_by[..16]);
     Ok(())
 }
 
@@ -245,7 +270,7 @@ fn days_to_ymd(days: i64) -> (i64, u32, u32) {
 }
 
 fn show_messages(db_path: &str, limit: usize) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let recorded_by = local_identity_from_db(db_path)?;
+    let recorded_by = load_identity_from_db(db_path)?;
     let db = open_connection(db_path)?;
     create_tables(&db)?;
 
@@ -364,10 +389,14 @@ fn send_message(db_path: &str, channel_hex: &str, content: &str) -> Result<(), B
         rusqlite::params![event_id_b64, "message", blob.as_slice(), "shared", created_at_ms as i64, current_timestamp_ms() as i64],
     )?;
 
+    let recorded_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
     db.execute(
         "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
          VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![&recorded_by, &event_id_b64, created_at_ms as i64, "local_create"],
+        rusqlite::params![&recorded_by, &event_id_b64, recorded_at, "local_create"],
     )?;
 
     println!("Sent: {}", content);
@@ -376,7 +405,7 @@ fn send_message(db_path: &str, channel_hex: &str, content: &str) -> Result<(), B
 }
 
 fn show_status(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let recorded_by = local_identity_from_db(db_path)?;
+    let recorded_by = load_identity_from_db(db_path)?;
     let db = open_connection(db_path)?;
     create_tables(&db)?;
 
@@ -398,12 +427,17 @@ fn show_status(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + S
         |row| row.get(0),
     ).unwrap_or(0);
 
+    let legacy_count = count_legacy_messages(&db)?;
+
     println!("STATUS ({}):", db_path);
     println!("  Events:    {} total", events_count);
     println!("  Messages:  {} projected", messages_count);
     println!("  Reactions: {} projected", reactions_count);
     println!("  Recorded:  {} events", recorded_events_count);
     println!("  NegItems:  {} indexed", neg_items_count);
+    if legacy_count > 0 {
+        println!("  Legacy:    {} unscoped messages (run 'backfill-identity' to assign)", legacy_count);
+    }
 
     Ok(())
 }
@@ -451,7 +485,11 @@ fn generate_messages(db_path: &str, count: usize, channel_hex: &str) -> Result<(
         let author_id_b64 = event_id_to_base64(&author_id);
         msg_stmt.execute(rusqlite::params![event_id_b64, channel_id_b64, author_id_b64, content, created_at_ms as i64, &recorded_by])?;
         events_stmt.execute(rusqlite::params![event_id_b64, "message", blob.as_slice(), "shared", created_at_ms as i64, current_timestamp_ms() as i64])?;
-        rec_stmt.execute(rusqlite::params![&recorded_by, &event_id_b64, created_at_ms as i64, "local_create"])?;
+        let recorded_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        rec_stmt.execute(rusqlite::params![&recorded_by, &event_id_b64, recorded_at, "local_create"])?;
     }
     db.execute("COMMIT", [])?;
 
@@ -551,7 +589,7 @@ fn run_assert_now(
     db_path: &str,
     predicate_str: &str,
 ) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
-    let recorded_by = local_identity_from_db(db_path)?;
+    let recorded_by = load_identity_from_db(db_path)?;
     let (field, op, expected) = parse_predicate(predicate_str)
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
     let db = open_connection(db_path)?;
@@ -574,7 +612,7 @@ fn run_assert_eventually(
     timeout_ms: u64,
     interval_ms: u64,
 ) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
-    let recorded_by = local_identity_from_db(db_path)?;
+    let recorded_by = load_identity_from_db(db_path)?;
     let (field, op, expected) = parse_predicate(predicate_str)
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
     let db = open_connection(db_path)?;

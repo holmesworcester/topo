@@ -121,11 +121,15 @@ impl Peer {
             rusqlite::params![event_id_b64, "message", blob.as_slice(), "shared", created_at_ms as i64, current_timestamp_ms() as i64],
         ).expect("failed to insert into events");
 
-        // Insert into recorded_events
+        // Insert into recorded_events (use local wall clock, not event created_at)
+        let recorded_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
         db.execute(
             "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
              VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![&self.identity, &event_id_b64, created_at_ms as i64, "local_create"],
+            rusqlite::params![&self.identity, &event_id_b64, recorded_at, "local_create"],
         ).expect("failed to insert recorded_event");
 
         event_id
@@ -167,10 +171,14 @@ impl Peer {
             rusqlite::params![event_id_b64, "reaction", blob.as_slice(), "shared", created_at_ms as i64, current_timestamp_ms() as i64],
         ).expect("failed to insert into events");
 
+        let recorded_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
         db.execute(
             "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
              VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![&self.identity, &event_id_b64, created_at_ms as i64, "local_create"],
+            rusqlite::params![&self.identity, &event_id_b64, recorded_at, "local_create"],
         ).expect("failed to insert recorded_event");
 
         event_id
@@ -226,8 +234,12 @@ impl Peer {
                 event_id_b64, "message", blob.as_slice(), "shared", created_at_ms as i64, current_timestamp_ms() as i64
             ]).expect("events insert");
 
+            let recorded_at = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64;
             rec_stmt.execute(rusqlite::params![
-                &self.identity, &event_id_b64, created_at_ms as i64, "local_create"
+                &self.identity, &event_id_b64, recorded_at, "local_create"
             ]).expect("recorded_events insert");
         }
         db.execute("COMMIT", []).expect("failed to commit");

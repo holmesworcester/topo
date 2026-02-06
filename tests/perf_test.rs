@@ -2,7 +2,7 @@
 //!
 //! Run with: cargo test --release --test perf_test -- --nocapture
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use poc_7::testutil::{Peer, start_peers, assert_eventually, sync_until_converged};
 
 fn test_channel() -> [u8; 32] {
@@ -248,9 +248,12 @@ fn inject_messages_batched(
             events_stmt.execute(rusqlite::params![
                 message_id, "message", blob.as_slice(), "shared", created_at_ms as i64, created_at_ms as i64
             ]).expect("events insert");
-
+            let recorded_at = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64;
             rec_stmt.execute(rusqlite::params![
-                recorded_by, &message_id, created_at_ms as i64, "local_create"
+                recorded_by, &message_id, recorded_at, "local_create"
             ]).expect("recorded_events insert");
         }
         db.execute("COMMIT", []).expect("failed to commit");

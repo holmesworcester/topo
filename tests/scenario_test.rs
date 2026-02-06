@@ -6,6 +6,7 @@ use poc_7::transport::{
     extract_spki_fingerprint, load_or_generate_cert, peer_identity_from_connection,
 };
 use poc_7::identity::cert_paths_from_db;
+use poc_7::db::open_connection;
 
 fn test_channel() -> [u8; 32] {
     let mut ch = [0u8; 32];
@@ -241,6 +242,196 @@ async fn test_zero_loss_stress() {
         assert!(alice_ids.contains(id), "alice missing bob event {}", id);
         assert!(bob_ids.contains(id), "bob lost own event {}", id);
     }
+}
+
+#[tokio::test]
+async fn test_recorded_at_monotonicity() {
+    let channel = test_channel();
+    let alice = Peer::new("alice", channel);
+    let bob = Peer::new("bob", channel);
+
+    // Alice creates messages with small delays to ensure different created_at
+    alice.create_message("first");
+    std::thread::sleep(Duration::from_millis(10));
+    alice.create_message("second");
+    std::thread::sleep(Duration::from_millis(10));
+    alice.create_message("third");
+
+    // Sync to Bob — Bob's recorded_at should use local wall clock, not event created_at
+    let sync = start_peers(&alice, &bob);
+
+    assert_eventually(
+        || bob.store_count() == 3,
+        Duration::from_secs(15),
+        "bob should have 3 events",
+    ).await;
+
+    drop(sync);
+
+    // Verify recorded_at is monotonically non-decreasing for each peer
+    for peer in [&alice, &bob] {
+        let db = open_connection(&peer.db_path).expect("open db");
+        let timestamps: Vec<i64> = db
+            .prepare("SELECT recorded_at FROM recorded_events WHERE peer_id = ?1 ORDER BY id")
+            .unwrap()
+            .query_map(rusqlite::params![&peer.identity], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(timestamps.len() >= 3, "expected >= 3 recorded events for {}", peer.name);
+
+        for window in timestamps.windows(2) {
+            assert!(
+                window[1] >= window[0],
+                "recorded_at not monotonic for {}: {} < {}",
+                peer.name,
+                window[1],
+                window[0],
+            );
+        }
+    }
+
+    // Bob's recorded_at for received events should be >= Alice's local create times
+    // (since Bob received them after Alice created them)
+    let alice_db = open_connection(&alice.db_path).expect("open alice db");
+    let alice_max_recorded: i64 = alice_db
+        .query_row(
+            "SELECT MAX(recorded_at) FROM recorded_events WHERE peer_id = ?1",
+            rusqlite::params![&alice.identity],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    let bob_db = open_connection(&bob.db_path).expect("open bob db");
+    let bob_min_recv: i64 = bob_db
+        .query_row(
+            "SELECT MIN(recorded_at) FROM recorded_events WHERE peer_id = ?1 AND source = 'quic_recv'",
+            rusqlite::params![&bob.identity],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    assert!(
+        bob_min_recv >= alice_max_recorded,
+        "Bob's earliest receive recorded_at ({}) should be >= Alice's latest create recorded_at ({})",
+        bob_min_recv,
+        alice_max_recorded,
+    );
+}
+
+#[tokio::test]
+async fn test_cross_workspace_isolation() {
+    // Two independent workspace sets:
+    // Set A: peerA1 + peerA2 (sync with each other)
+    // Set B: peerB1 + peerB2 (sync with each other)
+    // Verify no cross-set contamination.
+    let mut channel_a = [0u8; 32];
+    channel_a[0..6].copy_from_slice(b"workA\0");
+    let mut channel_b = [0u8; 32];
+    channel_b[0..6].copy_from_slice(b"workB\0");
+
+    let peer_a1 = Peer::new("peerA1", channel_a);
+    let peer_a2 = Peer::new("peerA2", channel_a);
+    let peer_b1 = Peer::new("peerB1", channel_b);
+    let peer_b2 = Peer::new("peerB2", channel_b);
+
+    // Create messages in each workspace
+    peer_a1.batch_create_messages(5);
+    peer_a2.batch_create_messages(3);
+    peer_b1.batch_create_messages(4);
+    peer_b2.batch_create_messages(2);
+
+    // Sync workspace A peers
+    let sync_a = start_peers(&peer_a1, &peer_a2);
+    assert_eventually(
+        || peer_a1.store_count() == 8 && peer_a2.store_count() == 8,
+        Duration::from_secs(15),
+        "workspace A peers should converge to 8 events",
+    ).await;
+    drop(sync_a);
+
+    // Sync workspace B peers
+    let sync_b = start_peers(&peer_b1, &peer_b2);
+    assert_eventually(
+        || peer_b1.store_count() == 6 && peer_b2.store_count() == 6,
+        Duration::from_secs(15),
+        "workspace B peers should converge to 6 events",
+    ).await;
+    drop(sync_b);
+
+    // Verify store counts: each workspace has its own events only
+    assert_eq!(peer_a1.store_count(), 8);
+    assert_eq!(peer_a2.store_count(), 8);
+    assert_eq!(peer_b1.store_count(), 6);
+    assert_eq!(peer_b2.store_count(), 6);
+
+    // Verify recorded_events scoping: no cross-workspace rows
+    // A peers should have 8 recorded_events each (5 local + 3 from sync, or 3 local + 5 from sync)
+    assert_eq!(peer_a1.recorded_events_count(), 8);
+    assert_eq!(peer_a2.recorded_events_count(), 8);
+    assert_eq!(peer_b1.recorded_events_count(), 6);
+    assert_eq!(peer_b2.recorded_events_count(), 6);
+
+    // Verify scoped messages: each peer sees only its workspace's messages
+    assert_eq!(peer_a1.scoped_message_count(), 8);
+    assert_eq!(peer_a2.scoped_message_count(), 8);
+    assert_eq!(peer_b1.scoped_message_count(), 6);
+    assert_eq!(peer_b2.scoped_message_count(), 6);
+
+    // Cross-check: assert zero overlap in event IDs between workspace A and B stores.
+    // This is a stronger isolation proof than checking peer_id (which is always local).
+    use std::collections::HashSet;
+
+    let a1_db = open_connection(&peer_a1.db_path).expect("open a1 db");
+    let a_event_ids: HashSet<String> = a1_db
+        .prepare("SELECT id FROM store")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<HashSet<_>, _>>()
+        .unwrap();
+
+    let b1_db = open_connection(&peer_b1.db_path).expect("open b1 db");
+    let b_event_ids: HashSet<String> = b1_db
+        .prepare("SELECT id FROM store")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<HashSet<_>, _>>()
+        .unwrap();
+
+    let overlap: Vec<&String> = a_event_ids.intersection(&b_event_ids).collect();
+    assert!(
+        overlap.is_empty(),
+        "workspace A and B should have zero overlapping event IDs, found {} shared: {:?}",
+        overlap.len(),
+        &overlap[..overlap.len().min(5)],
+    );
+
+    // Also verify message_ids don't overlap across workspaces
+    let a_msg_ids: HashSet<String> = a1_db
+        .prepare("SELECT message_id FROM messages")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<HashSet<_>, _>>()
+        .unwrap();
+
+    let b_msg_ids: HashSet<String> = b1_db
+        .prepare("SELECT message_id FROM messages")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<HashSet<_>, _>>()
+        .unwrap();
+
+    let msg_overlap: Vec<&String> = a_msg_ids.intersection(&b_msg_ids).collect();
+    assert!(
+        msg_overlap.is_empty(),
+        "workspace A and B should have zero overlapping message IDs, found {} shared",
+        msg_overlap.len(),
+    );
 }
 
 #[tokio::test]
