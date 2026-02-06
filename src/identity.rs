@@ -12,7 +12,24 @@ pub fn cert_paths_from_db(db_path: &str) -> (PathBuf, PathBuf) {
     (cert_path, key_path)
 }
 
-/// Compute the local peer identity (hex SPKI fingerprint) from the DB-derived cert path.
+/// Load local peer identity from existing cert files. Fails if cert is missing.
+/// Use this for read/query commands that should not silently generate a new identity.
+pub fn load_identity_from_db(db_path: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let (cert_path, key_path) = cert_paths_from_db(db_path);
+    if !cert_path.exists() || !key_path.exists() {
+        return Err(format!(
+            "Identity not found: cert or key missing at {} / {}. Run 'identity' or 'send' first to generate.",
+            cert_path.display(),
+            key_path.display(),
+        ).into());
+    }
+    let cert_bytes = std::fs::read(&cert_path)?;
+    let fp = extract_spki_fingerprint(&cert_bytes)?;
+    Ok(hex::encode(fp))
+}
+
+/// Compute the local peer identity (hex SPKI fingerprint), generating cert if needed.
+/// Use this for bootstrap commands (identity, send, generate, sync).
 pub fn local_identity_from_db(db_path: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let (cert_path, key_path) = cert_paths_from_db(db_path);
     let (cert_der, _) = load_or_generate_cert(&cert_path, &key_path)?;

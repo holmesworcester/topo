@@ -1,13 +1,13 @@
 use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use poc_7::crypto::{hash_event, event_id_to_base64};
 use poc_7::db::{open_connection, schema::create_tables, shareable::Shareable, store::Store};
-use poc_7::identity::{cert_paths_from_db, local_identity_from_db};
+use poc_7::identity::{cert_paths_from_db, load_identity_from_db, local_identity_from_db};
 use poc_7::sync::engine::{accept_loop, connect_loop};
 use poc_7::transport::{
     AllowedPeers,
@@ -245,7 +245,7 @@ fn days_to_ymd(days: i64) -> (i64, u32, u32) {
 }
 
 fn show_messages(db_path: &str, limit: usize) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let recorded_by = local_identity_from_db(db_path)?;
+    let recorded_by = load_identity_from_db(db_path)?;
     let db = open_connection(db_path)?;
     create_tables(&db)?;
 
@@ -350,10 +350,14 @@ fn send_message(db_path: &str, channel_hex: &str, content: &str) -> Result<(), B
         rusqlite::params![message_id, channel_id_b64, author_id_b64, content, created_at_ms as i64, &recorded_by],
     )?;
 
+    let recorded_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
     db.execute(
         "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
          VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![&recorded_by, &message_id, created_at_ms as i64, "local_create"],
+        rusqlite::params![&recorded_by, &message_id, recorded_at, "local_create"],
     )?;
 
     println!("Sent: {}", content);
@@ -362,7 +366,7 @@ fn send_message(db_path: &str, channel_hex: &str, content: &str) -> Result<(), B
 }
 
 fn show_status(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let recorded_by = local_identity_from_db(db_path)?;
+    let recorded_by = load_identity_from_db(db_path)?;
     let db = open_connection(db_path)?;
     create_tables(&db)?;
 
@@ -427,7 +431,11 @@ fn generate_messages(db_path: &str, count: usize, channel_hex: &str) -> Result<(
         let channel_id_b64 = event_id_to_base64(&channel_id);
         let author_id_b64 = event_id_to_base64(&author_id);
         msg_stmt.execute(rusqlite::params![message_id, channel_id_b64, author_id_b64, content, created_at_ms as i64, &recorded_by])?;
-        rec_stmt.execute(rusqlite::params![&recorded_by, &message_id, created_at_ms as i64, "local_create"])?;
+        let recorded_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        rec_stmt.execute(rusqlite::params![&recorded_by, &message_id, recorded_at, "local_create"])?;
     }
     db.execute("COMMIT", [])?;
 
@@ -524,7 +532,7 @@ fn run_assert_now(
     db_path: &str,
     predicate_str: &str,
 ) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
-    let recorded_by = local_identity_from_db(db_path)?;
+    let recorded_by = load_identity_from_db(db_path)?;
     let (field, op, expected) = parse_predicate(predicate_str)
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
     let db = open_connection(db_path)?;
@@ -547,7 +555,7 @@ fn run_assert_eventually(
     timeout_ms: u64,
     interval_ms: u64,
 ) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
-    let recorded_by = local_identity_from_db(db_path)?;
+    let recorded_by = load_identity_from_db(db_path)?;
     let (field, op, expected) = parse_predicate(predicate_str)
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
     let db = open_connection(db_path)?;

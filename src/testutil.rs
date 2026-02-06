@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::crypto::{hash_event, event_id_to_base64, EventId};
 use crate::db::{open_connection, schema::create_tables, shareable::Shareable, store::Store};
@@ -111,11 +111,15 @@ impl Peer {
             rusqlite::params![message_id, channel_id_b64, author_id_b64, content, created_at_ms as i64, &self.identity],
         ).expect("failed to insert message");
 
-        // Insert into recorded_events
+        // Insert into recorded_events (use local wall clock, not event created_at)
+        let recorded_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
         db.execute(
             "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
              VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![&self.identity, &message_id, created_at_ms as i64, "local_create"],
+            rusqlite::params![&self.identity, &message_id, recorded_at, "local_create"],
         ).expect("failed to insert recorded_event");
 
         event_id
@@ -167,8 +171,12 @@ impl Peer {
                 message_id, channel_id_b64, author_id_b64, content, created_at_ms as i64, &self.identity
             ]).expect("messages insert");
 
+            let recorded_at = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64;
             rec_stmt.execute(rusqlite::params![
-                &self.identity, &message_id, created_at_ms as i64, "local_create"
+                &self.identity, &message_id, recorded_at, "local_create"
             ]).expect("recorded_events insert");
         }
         db.execute("COMMIT", []).expect("failed to commit");

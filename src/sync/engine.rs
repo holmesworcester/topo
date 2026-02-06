@@ -9,7 +9,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use negentropy::{Negentropy, Id, NegentropyStorageBase, Storage};
 use tokio::sync::{mpsc, oneshot};
@@ -133,10 +133,14 @@ pub fn batch_writer(
                         &recorded_by
                     ]);
 
+                    let recorded_at = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as i64;
                     let _ = recorded_stmt.execute(rusqlite::params![
                         &recorded_by,
                         &message_id,
-                        created_at_ms as i64,
+                        recorded_at,
                         "quic_recv"
                     ]);
                 }
