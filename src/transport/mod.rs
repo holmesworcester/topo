@@ -46,7 +46,12 @@ pub fn create_client_endpoint(
     Ok(endpoint)
 }
 
-/// Skip server certificate verification (for self-signed certs in testing)
+/// Placeholder: accepts any certificate without verification.
+///
+/// TODO: Replace with proper certificate verification. Options:
+/// - Trust-on-first-use (TOFU): pin peer's cert on first connection
+/// - Out-of-band key exchange: share cert fingerprints manually
+/// Requires persistent peer identity (keypair saved to disk) first.
 #[derive(Debug)]
 struct SkipServerVerification;
 

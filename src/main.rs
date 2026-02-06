@@ -3,16 +3,16 @@ use std::net::SocketAddr;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
-use poc_7::db::{open_connection, schema::create_tables};
-use poc_7::sync::SyncMessage;
-use poc_7::sync::engine::{run_sync_initiator_dual, run_sync_responder_dual};
+use poc_7::crypto::{hash_event, event_id_to_base64};
+use poc_7::db::{open_connection, schema::create_tables, shareable::Shareable, store::Store};
+use poc_7::sync::engine::{accept_loop, connect_loop};
 use poc_7::transport::{
-    DualConnection,
     create_client_endpoint,
     create_server_endpoint,
     generate_keypair,
     generate_self_signed_cert,
 };
+use poc_7::wire::Envelope;
 
 #[derive(Parser)]
 #[command(name = "poc-7")]
@@ -24,124 +24,398 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run as a listening server
-    Listen {
-        /// Address to bind to
+    /// Run continuous sync (Ctrl-C to stop)
+    Sync {
+        /// Listen address
         #[arg(short, long, default_value = "127.0.0.1:4433")]
         bind: SocketAddr,
-
-        /// Database path
+        /// Peer to connect to (if omitted, just listens)
+        #[arg(short = 'r', long)]
+        connect: Option<SocketAddr>,
         #[arg(short, long, default_value = "server.db")]
         db: String,
-
-        /// Run duration in seconds
-        #[arg(short, long, default_value = "30")]
-        timeout: u64,
     },
 
-    /// Connect to a remote peer
-    Connect {
-        /// Remote address to connect to
-        #[arg(short, long)]
-        remote: SocketAddr,
-
-        /// Database path
-        #[arg(short, long, default_value = "client.db")]
+    /// List messages
+    Messages {
+        #[arg(short, long, default_value = "server.db")]
         db: String,
+        /// Max messages to show (0 = all)
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+    },
 
-        /// Run duration in seconds
-        #[arg(short, long, default_value = "30")]
-        timeout: u64,
+    /// Send a message
+    Send {
+        /// Message content
+        content: String,
+        #[arg(short, long, default_value = "server.db")]
+        db: String,
+        /// Channel ID hex (16 bytes)
+        #[arg(short = 'C', long, default_value = "0102030405060708090a0b0c0d0e0f10")]
+        channel: String,
+    },
+
+    /// Show database status
+    Status {
+        #[arg(short, long, default_value = "server.db")]
+        db: String,
+    },
+
+    /// Generate test messages
+    Generate {
+        #[arg(short, long, default_value = "100")]
+        count: usize,
+        #[arg(short, long, default_value = "server.db")]
+        db: String,
+        #[arg(short = 'C', long, default_value = "0102030405060708090a0b0c0d0e0f10")]
+        channel: String,
     },
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::INFO)
-        .finish();
-    tracing::subscriber::set_global_default(subscriber)?;
-
     let cli = Cli::parse();
 
-    match cli.command {
-        Commands::Listen { bind, db, timeout } => {
-            run_listen(bind, &db, timeout).await?;
+    // Only init tracing for network commands (avoid polluting message output)
+    match &cli.command {
+        Commands::Sync { .. } => {
+            let subscriber = FmtSubscriber::builder()
+                .with_max_level(Level::INFO)
+                .finish();
+            let _ = tracing::subscriber::set_global_default(subscriber);
         }
-        Commands::Connect { remote, db, timeout } => {
-            run_connect(remote, &db, timeout).await?;
+        _ => {}
+    }
+
+    match cli.command {
+        Commands::Sync { bind, connect, db } => {
+            run_sync(bind, connect, &db).await?;
+        }
+        Commands::Messages { db, limit } => {
+            show_messages(&db, limit)?;
+        }
+        Commands::Send { content, db, channel } => {
+            send_message(&db, &channel, &content)?;
+        }
+        Commands::Status { db } => {
+            show_status(&db)?;
+        }
+        Commands::Generate { count, db, channel } => {
+            generate_messages(&db, count, &channel)?;
         }
     }
 
     Ok(())
 }
 
-async fn run_listen(
+// ---------------------------------------------------------------------------
+// Message UI
+// ---------------------------------------------------------------------------
+
+fn short_id(b64: &str) -> &str {
+    &b64[..b64.len().min(8)]
+}
+
+fn format_timestamp(ms: i64) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let age_ms = now - ms;
+
+    if age_ms < 0 {
+        return format_absolute(ms);
+    }
+
+    let secs = age_ms / 1000;
+    if secs < 60 {
+        return format!("{}s ago", secs);
+    }
+    let mins = secs / 60;
+    if mins < 60 {
+        return format!("{}m ago", mins);
+    }
+    let hours = mins / 60;
+    if hours < 24 {
+        return format!("{}h ago", hours);
+    }
+    let days = hours / 24;
+    if days < 7 {
+        return format!("{}d ago", days);
+    }
+
+    format_absolute(ms)
+}
+
+fn format_absolute(ms: i64) -> String {
+    use std::time::{UNIX_EPOCH, Duration};
+    let dt = UNIX_EPOCH + Duration::from_millis(ms as u64);
+    // Format as "Jan 15 10:30"
+    let secs = dt.duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let days_since_epoch = secs / 86400;
+    let time_of_day = secs % 86400;
+    let hours = time_of_day / 3600;
+    let minutes = (time_of_day % 3600) / 60;
+
+    // Simple month/day calculation
+    let (_year, month, day) = days_to_ymd(days_since_epoch as i64);
+    let month_name = match month {
+        1 => "Jan", 2 => "Feb", 3 => "Mar", 4 => "Apr",
+        5 => "May", 6 => "Jun", 7 => "Jul", 8 => "Aug",
+        9 => "Sep", 10 => "Oct", 11 => "Nov", 12 => "Dec",
+        _ => "???",
+    };
+    format!("{} {} {:02}:{:02}", month_name, day, hours, minutes)
+}
+
+fn days_to_ymd(days: i64) -> (i64, u32, u32) {
+    // Civil days from epoch to y/m/d (simplified)
+    let z = days + 719468;
+    let era = z / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m as u32, d as u32)
+}
+
+fn show_messages(db_path: &str, limit: usize) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let db = open_connection(db_path)?;
+    create_tables(&db)?;
+
+    let limit_clause = if limit > 0 {
+        format!("LIMIT {}", limit)
+    } else {
+        String::new()
+    };
+
+    let query = format!(
+        "SELECT message_id, author_id, content, created_at
+         FROM messages ORDER BY created_at ASC {}",
+        limit_clause
+    );
+
+    let mut stmt = db.prepare(&query)?;
+    let rows: Vec<(String, String, String, i64)> = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+        ))
+    })?.collect::<Result<Vec<_>, _>>()?;
+
+    let total: i64 = db.query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))?;
+
+    if rows.is_empty() {
+        println!("MESSAGES ({}):", db_path);
+        println!("  (no messages)");
+        return Ok(());
+    }
+
+    println!("MESSAGES ({}, {} total):", db_path, total);
+    println!();
+
+    let mut last_author = String::new();
+    for (i, (_, author_id, content, created_at)) in rows.iter().enumerate() {
+        let ts = format_timestamp(*created_at);
+        let author = short_id(author_id);
+
+        if *author_id != last_author {
+            // New author group
+            if i > 0 { println!(); }
+            println!("  {} [{}]", author, ts);
+            println!("    {}. {}", i + 1, content);
+            last_author = author_id.clone();
+        } else {
+            // Same author, continuation
+            println!("    {}. {}", i + 1, content);
+        }
+    }
+    println!();
+
+    Ok(())
+}
+
+fn parse_channel_hex(channel_hex: &str) -> Result<[u8; 32], Box<dyn std::error::Error + Send + Sync>> {
+    let channel_bytes = hex::decode(channel_hex)?;
+    if channel_bytes.len() > 32 {
+        return Err("Channel ID must be at most 32 bytes".into());
+    }
+    let mut channel_id = [0u8; 32];
+    channel_id[..channel_bytes.len()].copy_from_slice(&channel_bytes);
+    Ok(channel_id)
+}
+
+fn send_message(db_path: &str, channel_hex: &str, content: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let db = open_connection(db_path)?;
+    create_tables(&db)?;
+
+    let channel_id = parse_channel_hex(channel_hex)?;
+    let author_id: [u8; 32] = rand::random();
+
+    let envelope = Envelope::new_message(channel_id, author_id, content.to_string());
+    let blob = envelope.encode();
+    let event_id = hash_event(&blob);
+    let created_at_ms = envelope.payload.created_at_ms;
+
+    let store = Store::new(&db);
+    let shareable = Shareable::new(&db);
+
+    store.put(&event_id, &blob)?;
+    shareable.insert(&event_id)?;
+
+    db.execute(
+        "INSERT OR IGNORE INTO neg_items (ts, id) VALUES (?1, ?2)",
+        rusqlite::params![created_at_ms as i64, event_id.as_slice()],
+    )?;
+
+    let message_id = event_id_to_base64(&event_id);
+    let channel_id_b64 = event_id_to_base64(&channel_id);
+    let author_id_b64 = event_id_to_base64(&author_id);
+    db.execute(
+        "INSERT OR IGNORE INTO messages (message_id, channel_id, author_id, content, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![message_id, channel_id_b64, author_id_b64, content, created_at_ms as i64],
+    )?;
+
+    println!("Sent: {}", content);
+
+    Ok(())
+}
+
+fn show_status(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let db = open_connection(db_path)?;
+    create_tables(&db)?;
+
+    let store_count: i64 = db.query_row("SELECT COUNT(*) FROM store", [], |row| row.get(0)).unwrap_or(0);
+    let messages_count: i64 = db.query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0)).unwrap_or(0);
+    let neg_items_count: i64 = db.query_row("SELECT COUNT(*) FROM neg_items", [], |row| row.get(0)).unwrap_or(0);
+    let shareable_count: i64 = db.query_row("SELECT COUNT(*) FROM shareable_events", [], |row| row.get(0)).unwrap_or(0);
+
+    println!("STATUS ({}):", db_path);
+    println!("  Store:     {} events", store_count);
+    println!("  Messages:  {} projected", messages_count);
+    println!("  Shareable: {} events", shareable_count);
+    println!("  NegItems:  {} indexed", neg_items_count);
+
+    Ok(())
+}
+
+fn generate_messages(db_path: &str, count: usize, channel_hex: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let db = open_connection(db_path)?;
+    create_tables(&db)?;
+
+    let channel_id = parse_channel_hex(channel_hex)?;
+    let author_id: [u8; 32] = rand::random();
+
+    let store = Store::new(&db);
+    let shareable = Shareable::new(&db);
+
+    let mut neg_stmt = db.prepare("INSERT OR IGNORE INTO neg_items (ts, id) VALUES (?1, ?2)")?;
+    let mut msg_stmt = db.prepare(
+        "INSERT OR IGNORE INTO messages (message_id, channel_id, author_id, content, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)"
+    )?;
+
+    db.execute("BEGIN", [])?;
+    for i in 0..count {
+        let content = format!("Message {}", i);
+        let envelope = Envelope::new_message(channel_id, author_id, content.clone());
+        let blob = envelope.encode();
+        let event_id = hash_event(&blob);
+        let created_at_ms = envelope.payload.created_at_ms;
+
+        store.put(&event_id, &blob)?;
+        shareable.insert(&event_id)?;
+        neg_stmt.execute(rusqlite::params![created_at_ms as i64, event_id.as_slice()])?;
+
+        let message_id = event_id_to_base64(&event_id);
+        let channel_id_b64 = event_id_to_base64(&channel_id);
+        let author_id_b64 = event_id_to_base64(&author_id);
+        msg_stmt.execute(rusqlite::params![message_id, channel_id_b64, author_id_b64, content, created_at_ms as i64])?;
+    }
+    db.execute("COMMIT", [])?;
+
+    println!("Generated {} messages in {}", count, db_path);
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Network (sync)
+// ---------------------------------------------------------------------------
+
+async fn run_sync(
     bind: SocketAddr,
+    connect: Option<SocketAddr>,
     db_path: &str,
-    timeout_secs: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    info!("Starting server on {}", bind);
+    // Initialize DB before spawning concurrent loops (avoids create_tables race)
+    {
+        let db = open_connection(db_path)?;
+        create_tables(&db)?;
+    }
 
     let (signing_key, _) = generate_keypair();
     let (cert, key) = generate_self_signed_cert(&signing_key)?;
 
-    let endpoint = create_server_endpoint(bind, cert, key)?;
-    info!("Server listening on {}", endpoint.local_addr()?);
+    let server_endpoint = create_server_endpoint(bind, cert, key)?;
+    info!("Listening on {}", server_endpoint.local_addr()?);
 
-    {
-        let db = open_connection(db_path)?;
-        create_tables(&db)?;
+    let db_owned = db_path.to_string();
+    let accept_handle = tokio::task::spawn_blocking({
+        let db = db_owned.clone();
+        move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                if let Err(e) = accept_loop(&db, server_endpoint).await {
+                    tracing::warn!("accept_loop exited: {}", e);
+                }
+            });
+        }
+    });
+
+    if let Some(remote) = connect {
+        let client_endpoint = create_client_endpoint("0.0.0.0:0".parse()?)?;
+        let db = db_owned.clone();
+        let connect_handle = tokio::task::spawn_blocking(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                if let Err(e) = connect_loop(&db, client_endpoint, remote).await {
+                    tracing::warn!("connect_loop exited: {}", e);
+                }
+            });
+        });
+
+        tokio::select! {
+            _ = accept_handle => {}
+            _ = connect_handle => {}
+            _ = tokio::signal::ctrl_c() => {
+                info!("Ctrl-C received, shutting down");
+            }
+        }
+    } else {
+        tokio::select! {
+            _ = accept_handle => {}
+            _ = tokio::signal::ctrl_c() => {
+                info!("Ctrl-C received, shutting down");
+            }
+        }
     }
-
-    let incoming = endpoint.accept().await.ok_or("No connection")?;
-    let connection = incoming.await?;
-    let peer_id = connection.remote_address().to_string();
-    info!("Accepted connection from {}", peer_id);
-
-    let (control_send, control_recv) = connection.accept_bi().await?;
-    let (data_send, data_recv) = connection.accept_bi().await?;
-    let conn = DualConnection::new(control_send, control_recv, data_send, data_recv);
-    info!("Accepted control and data streams");
-
-    run_sync_responder_dual(conn, db_path, timeout_secs, &peer_id).await?;
-
-    connection.close(0u32.into(), b"done");
-
-    Ok(())
-}
-
-async fn run_connect(
-    remote: SocketAddr,
-    db_path: &str,
-    timeout_secs: u64,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    info!("Connecting to {}", remote);
-
-    let endpoint = create_client_endpoint("0.0.0.0:0".parse()?)?;
-
-    let connection = endpoint.connect(remote, "localhost")?.await?;
-    let peer_id = connection.remote_address().to_string();
-    info!("Connected to {}", peer_id);
-
-    {
-        let db = open_connection(db_path)?;
-        create_tables(&db)?;
-    }
-
-    let (control_send, control_recv) = connection.open_bi().await?;
-    let (data_send, data_recv) = connection.open_bi().await?;
-    let mut conn = DualConnection::new(control_send, control_recv, data_send, data_recv);
-
-    conn.control.send(&SyncMessage::HaveList { ids: vec![] }).await?;
-    conn.data_send.send(&SyncMessage::HaveList { ids: vec![] }).await?;
-    conn.flush_control().await?;
-    conn.flush_data().await?;
-    info!("Opened and established control and data streams");
-
-    run_sync_initiator_dual(conn, db_path, timeout_secs, &peer_id).await?;
-
-    connection.close(0u32.into(), b"done");
 
     Ok(())
 }

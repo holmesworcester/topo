@@ -1,3 +1,12 @@
+// TODO: Shutdown race — when one side finishes sending, it closes the stream
+// before the peer has drained its receive buffer, causing ~0.1% data loss at
+// 500k scale. Fix: add a shutdown handshake (initiator sends Done on control,
+// responder drains queues and sends DoneAck, initiator then closes).
+//
+// TODO: Peer authentication — peer_id is currently just the socket address
+// (connection.remote_address()). Any client can connect without proving
+// identity. Requires persistent peer keypairs + cert verification.
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -531,82 +540,128 @@ where
     Ok(stats)
 }
 
-/// Run continuous sync sessions between two peers over a persistent QUIC connection.
+/// Accept incoming connections and run responder sync sessions.
 ///
-/// Both peers are equal. Each session is a complete negentropy reconciliation
-/// from a fresh DB snapshot. Sessions are strictly serialized.
-pub async fn sync_loop(
-    listener_db: String,
-    connector_db: String,
-    listener_endpoint: quinn::Endpoint,
-    connector_endpoint: quinn::Endpoint,
-    listener_addr: SocketAddr,
+/// Outer loop reconnects on connection drop. Inner loop runs repeated
+/// sync sessions on the same connection.
+pub async fn accept_loop(
+    db_path: &str,
+    endpoint: quinn::Endpoint,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Ensure both DBs are initialized
     {
-        let db = open_connection(&listener_db)?;
-        create_tables(&db)?;
-    }
-    {
-        let db = open_connection(&connector_db)?;
+        let db = open_connection(db_path)?;
         create_tables(&db)?;
     }
 
-    // Connect and accept must happen concurrently (handshake requires both sides)
-    let connect_fut = connector_endpoint.connect(listener_addr, "localhost")?;
-    let (connection, listener_connection) = tokio::try_join!(
-        async {
-            connect_fut.await.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
-        },
-        async {
-            let incoming = listener_endpoint.accept().await
-                .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> { "No connection".into() })?;
-            incoming.await.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
-        },
-    )?;
-    info!("QUIC connection established");
-
-    let peer_id_connector = "connector";
-    let peer_id_listener = "listener";
-
-    // Loop: run repeated sync sessions
     loop {
-        // Connector opens streams and sends markers first (QUIC streams are lazy -
-        // they only materialize on the receiver when data is sent)
-        let (ctrl_send_c, ctrl_recv_c) = connection.open_bi().await?;
-        let (data_send_c, data_recv_c) = connection.open_bi().await?;
-        let mut conn_initiator = DualConnection::new(ctrl_send_c, ctrl_recv_c, data_send_c, data_recv_c);
+        info!("Waiting for incoming connection...");
+        let incoming = match endpoint.accept().await {
+            Some(inc) => inc,
+            None => {
+                info!("Endpoint closed, stopping accept_loop");
+                return Ok(());
+            }
+        };
+        let connection = match incoming.await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("Failed to accept connection: {}", e);
+                continue;
+            }
+        };
+        let peer_id = connection.remote_address().to_string();
+        info!("Accepted connection from {}", peer_id);
 
-        // Send markers to materialize streams on the listener side
-        conn_initiator.control.send(&SyncMessage::HaveList { ids: vec![] }).await?;
-        conn_initiator.data_send.send(&SyncMessage::HaveList { ids: vec![] }).await?;
-        conn_initiator.flush_control().await?;
-        conn_initiator.flush_data().await?;
+        // Inner loop: repeated sync sessions on this connection
+        loop {
+            let (ctrl_send, ctrl_recv) = match connection.accept_bi().await {
+                Ok(streams) => streams,
+                Err(e) => {
+                    info!("Connection dropped (control accept): {}", e);
+                    break;
+                }
+            };
+            let (data_send, data_recv) = match connection.accept_bi().await {
+                Ok(streams) => streams,
+                Err(e) => {
+                    info!("Connection dropped (data accept): {}", e);
+                    break;
+                }
+            };
+            let conn = DualConnection::new(ctrl_send, ctrl_recv, data_send, data_recv);
 
-        // Now listener can accept the materialized streams
-        let (ctrl_send_l, ctrl_recv_l) = listener_connection.accept_bi().await
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
-        let (data_send_l, data_recv_l) = listener_connection.accept_bi().await
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
-        let conn_responder = DualConnection::new(ctrl_send_l, ctrl_recv_l, data_send_l, data_recv_l);
+            if let Err(e) = run_sync_responder_dual(conn, db_path, 60, &peer_id).await {
+                warn!("Responder session error: {}", e);
+            }
 
-        // Run one complete sync session: initiator + responder in parallel
-        let connector_db_clone = connector_db.clone();
-        let listener_db_clone = listener_db.clone();
-
-        let (init_res, resp_res) = tokio::join!(
-            run_sync_initiator_dual(conn_initiator, &connector_db_clone, 60, peer_id_listener),
-            run_sync_responder_dual(conn_responder, &listener_db_clone, 60, peer_id_connector),
-        );
-
-        if let Err(e) = &init_res {
-            warn!("Initiator session error: {}", e);
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        if let Err(e) = &resp_res {
-            warn!("Responder session error: {}", e);
-        }
+    }
+}
 
-        // Sleep before next session
-        tokio::time::sleep(Duration::from_millis(100)).await;
+/// Connect to a remote peer and run initiator sync sessions.
+///
+/// Outer loop reconnects on connection drop. Inner loop runs repeated
+/// sync sessions on the same connection.
+pub async fn connect_loop(
+    db_path: &str,
+    endpoint: quinn::Endpoint,
+    remote: SocketAddr,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    {
+        let db = open_connection(db_path)?;
+        create_tables(&db)?;
+    }
+
+    loop {
+        info!("Connecting to {}...", remote);
+        let connection = match endpoint.connect(remote, "localhost") {
+            Ok(connecting) => match connecting.await {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("Failed to connect to {}: {}", remote, e);
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+            },
+            Err(e) => {
+                warn!("Failed to initiate connection to {}: {}", remote, e);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+        };
+        let peer_id = connection.remote_address().to_string();
+        info!("Connected to {}", peer_id);
+
+        // Inner loop: repeated sync sessions on this connection
+        loop {
+            let (ctrl_send, ctrl_recv) = match connection.open_bi().await {
+                Ok(streams) => streams,
+                Err(e) => {
+                    info!("Connection dropped (control open): {}", e);
+                    break;
+                }
+            };
+            let (data_send, data_recv) = match connection.open_bi().await {
+                Ok(streams) => streams,
+                Err(e) => {
+                    info!("Connection dropped (data open): {}", e);
+                    break;
+                }
+            };
+            let mut conn = DualConnection::new(ctrl_send, ctrl_recv, data_send, data_recv);
+
+            // Send markers to materialize lazy QUIC streams on the receiver
+            conn.control.send(&SyncMessage::HaveList { ids: vec![] }).await?;
+            conn.data_send.send(&SyncMessage::HaveList { ids: vec![] }).await?;
+            conn.flush_control().await?;
+            conn.flush_data().await?;
+
+            if let Err(e) = run_sync_initiator_dual(conn, db_path, 60, &peer_id).await {
+                warn!("Initiator session error: {}", e);
+            }
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 }

@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use crate::crypto::{hash_event, event_id_to_base64, EventId};
 use crate::db::{open_connection, schema::create_tables, shareable::Shareable, store::Store};
-use crate::sync::engine::sync_loop;
+use crate::sync::engine::{accept_loop, connect_loop};
 use crate::transport::{
     create_client_endpoint,
     create_server_endpoint,
@@ -43,7 +43,6 @@ impl std::fmt::Display for SyncMetrics {
 pub struct Peer {
     pub name: String,
     pub db_path: String,
-    pub signer_id: [u8; 32],
     pub author_id: [u8; 32],
     pub channel_id: [u8; 32],
     _tempdir: tempfile::TempDir,
@@ -59,13 +58,11 @@ impl Peer {
         let db = open_connection(&db_path).expect("failed to open db");
         create_tables(&db).expect("failed to create tables");
 
-        let signer_id: [u8; 32] = rand::random();
         let author_id: [u8; 32] = rand::random();
 
         Self {
             name: name.to_string(),
             db_path,
-            signer_id,
             author_id,
             channel_id,
             _tempdir: tempdir,
@@ -76,7 +73,6 @@ impl Peer {
     /// Returns the event ID.
     pub fn create_message(&self, content: &str) -> EventId {
         let envelope = Envelope::new_message(
-            self.signer_id,
             self.channel_id,
             self.author_id,
             content.to_string(),
@@ -130,7 +126,6 @@ impl Peer {
         for i in 0..count {
             let content = format!("Message {} from {}", i, self.name);
             let envelope = Envelope::new_message(
-                self.signer_id,
                 self.channel_id,
                 self.author_id,
                 content.clone(),
@@ -175,15 +170,15 @@ impl Peer {
 
 /// Start continuous sync between two peers.
 ///
-/// Runs sync_loop on a dedicated thread with its own single-threaded
-/// tokio runtime (rusqlite::Connection is not Send, so we can't use
-/// tokio::spawn on the multi-threaded runtime).
+/// Spawns two threads — one running accept_loop (peer A listens),
+/// one running connect_loop (peer B connects). Each thread has its own
+/// single-threaded tokio runtime (rusqlite::Connection is not Send).
 ///
-/// Returns a JoinHandle whose thread can be stopped by dropping.
-pub fn start_sync(
+/// Returns two JoinHandles (accept, connect).
+pub fn start_peers(
     peer_a: &Peer,
     peer_b: &Peer,
-) -> std::thread::JoinHandle<()> {
+) -> (std::thread::JoinHandle<()>, std::thread::JoinHandle<()>) {
     let (signing_key, _) = generate_keypair();
     let (cert, key) = generate_self_signed_cert(&signing_key).expect("failed to generate cert");
 
@@ -199,26 +194,34 @@ pub fn start_sync(
         "0.0.0.0:0".parse().unwrap(),
     ).expect("failed to create client endpoint");
 
-    let listener_db = peer_a.db_path.clone();
-    let connector_db = peer_b.db_path.clone();
+    let a_db = peer_a.db_path.clone();
+    let b_db = peer_b.db_path.clone();
 
-    std::thread::spawn(move || {
+    let a_handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         rt.block_on(async move {
-            if let Err(e) = sync_loop(
-                listener_db,
-                connector_db,
-                listener_endpoint,
-                connector_endpoint,
-                listener_addr,
-            ).await {
-                tracing::warn!("sync_loop exited: {}", e);
+            if let Err(e) = accept_loop(&a_db, listener_endpoint).await {
+                tracing::warn!("accept_loop exited: {}", e);
             }
         });
-    })
+    });
+
+    let b_handle = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            if let Err(e) = connect_loop(&b_db, connector_endpoint, listener_addr).await {
+                tracing::warn!("connect_loop exited: {}", e);
+            }
+        });
+    });
+
+    (a_handle, b_handle)
 }
 
 /// Start sync, wait for convergence, return metrics.
@@ -237,7 +240,7 @@ pub async fn sync_until_converged(
         (expected_count - a_before) + (expected_count - b_before);
 
     let start = Instant::now();
-    let sync = start_sync(peer_a, peer_b);
+    let sync = start_peers(peer_a, peer_b);
 
     assert_eventually(
         || peer_a.store_count() == expected_count && peer_b.store_count() == expected_count,

@@ -34,12 +34,11 @@ impl Envelope {
 
     /// Create a new message envelope
     pub fn new_message(
-        signer_id: [u8; 32],
         channel_id: [u8; 32],
         author_id: [u8; 32],
         content: String,
     ) -> Self {
-        let header = WireHeader::new_message(signer_id);
+        let header = WireHeader::new_message();
         let payload = MessagePayload::new(channel_id, author_id, content);
         Self { header, payload }
     }
@@ -54,7 +53,6 @@ mod tests {
     #[test]
     fn test_envelope_roundtrip() {
         let envelope = Envelope::new_message(
-            [1u8; 32],
             [2u8; 32],
             [3u8; 32],
             "Hello!".to_string(),
@@ -72,7 +70,6 @@ mod tests {
     #[test]
     fn test_envelope_id_deterministic() {
         let envelope = Envelope::new_message(
-            [1u8; 32],
             [2u8; 32],
             [3u8; 32],
             "Test".to_string(),

@@ -1,193 +1,237 @@
 //! Performance benchmarks for sync system
 //!
-//! Run with: cargo test --release perf_ -- --nocapture --ignored
+//! Run with: cargo test --release --test perf_test -- --nocapture
 
-use std::process::Command;
+use std::time::{Duration, Instant};
+use poc_7::testutil::{Peer, start_peers, assert_eventually, sync_until_converged};
 
-/// Run the demo command and extract timing
-fn run_demo(events: usize, env_vars: &[(&str, &str)]) -> Option<(f64, f64)> {
-    let mut cmd = Command::new("cargo");
-    cmd.args(["run", "--release", "--", "demo", "--events", &events.to_string(), "--timeout", "120"]);
+fn test_channel() -> [u8; 32] {
+    let mut ch = [0u8; 32];
+    ch[0..4].copy_from_slice(b"perf");
+    ch
+}
 
-    for (key, val) in env_vars {
-        cmd.env(key, val);
-    }
-
-    let output = cmd.output().ok()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined = format!("{}{}", stdout, stderr);
-
-    // Parse reconciliation time
-    let mut reconciliation_time: Option<f64> = None;
-    let mut sync_complete_time: Option<f64> = None;
-
-    for line in combined.lines() {
-        if line.contains("Reconciliation complete") {
-            // Extract timestamp from log line like [2026-02-03T10:17:07.021474Z]
-            if let Some(ts) = extract_timestamp(line) {
-                reconciliation_time = Some(ts);
-            }
-        }
-        if line.contains("Sync stats:") && !line.contains("responder") {
-            if let Some(ts) = extract_timestamp(line) {
-                sync_complete_time = Some(ts);
-            }
+/// Read peak resident set size from /proc/self/status (Linux only).
+fn peak_rss_mib() -> f64 {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    for line in status.lines() {
+        if line.starts_with("VmHWM:") {
+            // Format: "VmHWM:    12345 kB"
+            let kb: f64 = line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.0);
+            return kb / 1024.0;
         }
     }
-
-    match (reconciliation_time, sync_complete_time) {
-        (Some(r), Some(s)) => Some((r, s)),
-        _ => None,
-    }
+    0.0
 }
 
-/// Run the sim command and return stdout/stderr (for throughput + memory reporting).
-fn run_sim(
-    events: usize,
-    timeout: usize,
-    latency_ms: usize,
-    bandwidth_kib: usize,
-    no_generate: bool,
-) -> Option<String> {
-    let mut cmd = Command::new("cargo");
-    cmd.args([
-        "run",
-        "--release",
-        "--",
-        "sim",
-        "--events",
-        &events.to_string(),
-        "--timeout",
-        &timeout.to_string(),
-        "--latency-ms",
-        &latency_ms.to_string(),
-        "--bandwidth-kib",
-        &bandwidth_kib.to_string(),
-    ]);
-    if no_generate {
-        cmd.arg("--no-generate");
-    }
+/// 50k one-way sync: generate on one side, sync to empty peer.
+/// Reports MB/s, events/s, wall time, and peak memory.
+#[tokio::test]
+async fn perf_sync_50k() {
+    let channel = test_channel();
+    let alice = Peer::new("alice", channel);
+    let bob = Peer::new("bob", channel);
 
-    let output = cmd.output().ok()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    Some(format!("{}{}", stdout, stderr))
+    let gen_start = Instant::now();
+    alice.batch_create_messages(50_000);
+    let gen_secs = gen_start.elapsed().as_secs_f64();
+    eprintln!("Generated 50k events in {:.2}s", gen_secs);
+
+    let rss_before = peak_rss_mib();
+
+    let metrics = sync_until_converged(
+        &alice, &bob, 50_000, Duration::from_secs(300),
+    ).await;
+
+    let rss_after = peak_rss_mib();
+
+    assert_eq!(alice.store_count(), 50_000);
+    assert_eq!(bob.store_count(), 50_000);
+
+    eprintln!();
+    eprintln!("=== 50k one-way sync ===");
+    eprintln!("  Wall time:    {:.2}s", metrics.wall_secs);
+    eprintln!("  Events:       {}", metrics.events_transferred);
+    eprintln!("  Events/s:     {:.0}", metrics.events_per_sec);
+    eprintln!("  Throughput:   {:.2} MiB/s", metrics.throughput_mib_s);
+    eprintln!("  Peak RSS:     {:.1} MiB (before: {:.1}, after: {:.1})",
+        rss_after, rss_before, rss_after);
+    eprintln!();
 }
 
-fn run_generate(db: &str, events: usize, channel: &str) -> bool {
-    let mut cmd = Command::new("cargo");
-    cmd.args([
-        "run",
-        "--release",
-        "--",
-        "generate",
-        "--db",
-        db,
-        "--count",
-        &events.to_string(),
-        "--channel",
-        channel,
-    ]);
-    cmd.status().map(|s| s.success()).unwrap_or(false)
+/// 10k bidirectional sync: generate on one side, sync to empty peer.
+/// Reports MB/s, events/s, wall time, and peak memory.
+#[tokio::test]
+async fn perf_sync_10k() {
+    let channel = test_channel();
+    let alice = Peer::new("alice", channel);
+    let bob = Peer::new("bob", channel);
+
+    let gen_start = Instant::now();
+    alice.batch_create_messages(5_000);
+    bob.batch_create_messages(5_000);
+    let gen_secs = gen_start.elapsed().as_secs_f64();
+    eprintln!("Generated 10k events (5k each) in {:.2}s", gen_secs);
+
+    let rss_before = peak_rss_mib();
+
+    let metrics = sync_until_converged(
+        &alice, &bob, 10_000, Duration::from_secs(120),
+    ).await;
+
+    let rss_after = peak_rss_mib();
+
+    assert_eq!(alice.store_count(), 10_000);
+    assert_eq!(bob.store_count(), 10_000);
+
+    eprintln!();
+    eprintln!("=== 10k bidirectional sync ===");
+    eprintln!("  Wall time:    {:.2}s", metrics.wall_secs);
+    eprintln!("  Events:       {}", metrics.events_transferred);
+    eprintln!("  Events/s:     {:.0}", metrics.events_per_sec);
+    eprintln!("  Throughput:   {:.2} MiB/s", metrics.throughput_mib_s);
+    eprintln!("  Peak RSS:     {:.1} MiB (before: {:.1}, after: {:.1})",
+        rss_after, rss_before, rss_after);
+    eprintln!();
 }
 
-fn extract_timestamp(line: &str) -> Option<f64> {
-    // Format: [2026-02-03T10:17:07.021474Z]
-    let start = line.find('T')? + 1;
-    let end = line.find('Z')?;
-    let time_str = &line[start..end];
+/// 10k continuous: start sync first, then inject 5k messages on each side
+/// while sync is running. Measures how well sync keeps up with ongoing writes.
+#[tokio::test]
+async fn perf_continuous_10k() {
+    let channel = test_channel();
+    let alice = Peer::new("alice", channel);
+    let bob = Peer::new("bob", channel);
 
-    let parts: Vec<&str> = time_str.split(':').collect();
-    if parts.len() != 3 {
-        return None;
-    }
+    let rss_before = peak_rss_mib();
 
-    let hours: f64 = parts[0].parse().ok()?;
-    let mins: f64 = parts[1].parse().ok()?;
-    let secs: f64 = parts[2].parse().ok()?;
+    // Start sync with empty peers
+    let sync = start_peers(&alice, &bob);
 
-    Some(hours * 3600.0 + mins * 60.0 + secs)
+    // Give sync a moment to connect
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let start = Instant::now();
+
+    // Inject 5k messages on each side in batches while sync runs.
+    // Using batch_create_messages would lock the DB for too long,
+    // so we do smaller batches to let sync interleave.
+    let alice_db = alice.db_path.clone();
+    let alice_author = alice.author_id;
+    let alice_channel = alice.channel_id;
+    let bob_db = bob.db_path.clone();
+    let bob_author = bob.author_id;
+    let bob_channel = bob.channel_id;
+
+    let alice_writer = std::thread::spawn(move || {
+        inject_messages_batched(&alice_db, alice_channel, alice_author, "alice", 5_000, 100);
+    });
+
+    let bob_writer = std::thread::spawn(move || {
+        inject_messages_batched(&bob_db, bob_channel, bob_author, "bob", 5_000, 100);
+    });
+
+    alice_writer.join().expect("alice writer panicked");
+    bob_writer.join().expect("bob writer panicked");
+
+    let inject_secs = start.elapsed().as_secs_f64();
+    eprintln!("Injected 10k events (5k each) in {:.2}s", inject_secs);
+
+    // Wait for convergence
+    assert_eventually(
+        || alice.store_count() == 10_000 && bob.store_count() == 10_000,
+        Duration::from_secs(120),
+        &format!(
+            "convergence to 10000 events (a={}, b={})",
+            alice.store_count(),
+            bob.store_count(),
+        ),
+    ).await;
+
+    let wall_secs = start.elapsed().as_secs_f64();
+    let rss_after = peak_rss_mib();
+
+    drop(sync);
+
+    let events_transferred = 10_000u64; // 5k each direction
+    let bytes_transferred = events_transferred * 512;
+    let events_per_sec = events_transferred as f64 / wall_secs;
+    let throughput_mib_s = (bytes_transferred as f64) / (1024.0 * 1024.0) / wall_secs.max(0.001);
+
+    assert_eq!(alice.store_count(), 10_000);
+    assert_eq!(bob.store_count(), 10_000);
+    assert_eq!(alice.message_count(), 10_000);
+    assert_eq!(bob.message_count(), 10_000);
+
+    eprintln!();
+    eprintln!("=== 10k continuous sync (inject while syncing) ===");
+    eprintln!("  Wall time:    {:.2}s (inject: {:.2}s)", wall_secs, inject_secs);
+    eprintln!("  Events:       {}", events_transferred);
+    eprintln!("  Events/s:     {:.0}", events_per_sec);
+    eprintln!("  Throughput:   {:.2} MiB/s", throughput_mib_s);
+    eprintln!("  Peak RSS:     {:.1} MiB (before: {:.1}, after: {:.1})",
+        rss_after, rss_before, rss_after);
+    eprintln!();
 }
 
-#[test]
-#[ignore] // Run with: cargo test --release perf_sync -- --nocapture --ignored
-fn perf_sync_50k() {
-    println!("\n=== Performance Test: 50k events/peer ===\n");
+/// Insert messages in small batches, yielding between batches so sync can interleave.
+fn inject_messages_batched(
+    db_path: &str,
+    channel_id: [u8; 32],
+    author_id: [u8; 32],
+    name: &str,
+    total: usize,
+    batch_size: usize,
+) {
+    use poc_7::crypto::{hash_event, event_id_to_base64};
+    use poc_7::db::{open_connection, shareable::Shareable, store::Store};
+    use poc_7::wire::Envelope;
 
-    let events = 50000;
+    let db = open_connection(db_path).expect("failed to open db");
+    let store = Store::new(&db);
+    let shareable = Shareable::new(&db);
 
-    // Baseline (no dependency reads)
-    println!("Running NO_DEPS baseline...");
-    let baseline = run_demo(events, &[("NO_DEPS", "1")]);
+    let mut neg_stmt = db.prepare(
+        "INSERT OR IGNORE INTO neg_items (ts, id) VALUES (?1, ?2)"
+    ).expect("failed to prepare neg_items stmt");
+    let mut msg_stmt = db.prepare(
+        "INSERT OR IGNORE INTO messages (message_id, channel_id, author_id, content, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)"
+    ).expect("failed to prepare messages stmt");
 
-    // Naive (individual queries)
-    println!("Running NAIVE (individual queries)...");
-    let naive = run_demo(events, &[("NAIVE_DEPS", "1")]);
+    let mut i = 0;
+    while i < total {
+        let end = (i + batch_size).min(total);
+        db.execute("BEGIN", []).expect("failed to begin");
+        for j in i..end {
+            let content = format!("Msg {} from {}", j, name);
+            let envelope = Envelope::new_message(channel_id, author_id, content.clone());
+            let blob = envelope.encode();
+            let event_id = hash_event(&blob);
+            let created_at_ms = envelope.payload.created_at_ms;
 
-    // Batched (IN query)
-    println!("Running BATCHED (IN query)...");
-    let batched = run_demo(events, &[]);
+            store.put(&event_id, &blob).expect("store.put");
+            shareable.insert(&event_id).expect("shareable.insert");
 
-    println!("\n=== Results ===\n");
-    println!("| Mode | Transfer Time | vs Baseline |");
-    println!("|------|---------------|-------------|");
+            neg_stmt.execute(rusqlite::params![
+                created_at_ms as i64,
+                event_id.as_slice()
+            ]).expect("neg_items insert");
 
-    if let Some((recon, sync)) = baseline {
-        let transfer = sync - recon;
-        println!("| NO_DEPS (baseline) | {:.2}s | - |", transfer);
-
-        if let Some((r2, s2)) = naive {
-            let t2 = s2 - r2;
-            let overhead = ((t2 / transfer) - 1.0) * 100.0;
-            println!("| NAIVE | {:.2}s | +{:.0}% |", t2, overhead);
+            let message_id = event_id_to_base64(&event_id);
+            let channel_id_b64 = event_id_to_base64(&channel_id);
+            let author_id_b64 = event_id_to_base64(&author_id);
+            msg_stmt.execute(rusqlite::params![
+                message_id, channel_id_b64, author_id_b64, content, created_at_ms as i64
+            ]).expect("messages insert");
         }
-
-        if let Some((r3, s3)) = batched {
-            let t3 = s3 - r3;
-            let overhead = ((t3 / transfer) - 1.0) * 100.0;
-            println!("| BATCHED | {:.2}s | +{:.0}% |", t3, overhead);
-        }
+        db.execute("COMMIT", []).expect("failed to commit");
+        i = end;
+        // Yield briefly so sync can grab the DB
+        std::thread::sleep(Duration::from_millis(1));
     }
-
-    if let (Some((_, _)), Some((r2, s2)), Some((r3, s3))) = (baseline, naive, batched) {
-        let naive_time = s2 - r2;
-        let batched_time = s3 - r3;
-        let speedup = ((naive_time / batched_time) - 1.0) * 100.0;
-        println!("\nBATCHED is {:.0}% faster than NAIVE", speedup);
-    }
-
-    println!("\n=== Test Complete ===\n");
-}
-
-#[test]
-#[ignore]
-fn perf_sync_scaling() {
-    println!("\n=== Scaling Test ===\n");
-    println!("| Events/peer | Transfer Time |");
-    println!("|-------------|---------------|");
-
-    for events in [1000, 5000, 10000, 25000] {
-        if let Some((recon, sync)) = run_demo(events, &[("NO_DEPS", "1")]) {
-            let transfer = sync - recon;
-            println!("| {} | {:.2}s |", events, transfer);
-        }
-    }
-
-    println!("\n=== Test Complete ===\n");
-}
-
-#[test]
-#[ignore] // Run with: cargo test --release perf_sim_ -- --nocapture --ignored
-fn perf_sim_throughput_10k() {
-    println!("\n=== Sim Throughput Test: 10k events/peer ===\n");
-    // Generate DBs in separate processes so VmHWM only reflects sync.
-    assert!(run_generate("sim_server.db", 10_000, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
-    assert!(run_generate("sim_client.db", 10_000, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
-
-    let output = run_sim(10_000, 30, 10, 50_000, true).unwrap_or_default();
-    println!("{}", output);
-    assert!(output.contains("Throughput"), "Expected throughput output");
-    assert!(output.contains("Peak RSS"), "Expected peak RSS output");
-    println!("\n=== Test Complete ===\n");
 }

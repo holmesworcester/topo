@@ -1,5 +1,5 @@
 use std::time::{Duration, Instant};
-use poc_7::testutil::{Peer, start_sync, assert_eventually, sync_until_converged};
+use poc_7::testutil::{Peer, start_peers, assert_eventually, sync_until_converged};
 
 fn test_channel() -> [u8; 32] {
     let mut ch = [0u8; 32];
@@ -19,7 +19,7 @@ async fn test_two_peer_bidirectional_sync() {
     assert_eq!(alice.store_count(), 2);
     assert_eq!(bob.store_count(), 1);
 
-    let sync = start_sync(&alice, &bob);
+    let sync = start_peers(&alice, &bob);
 
     assert_eventually(
         || alice.store_count() == 3 && bob.store_count() == 3,
@@ -43,7 +43,7 @@ async fn test_one_way_sync() {
     assert_eq!(alice.store_count(), 10);
     assert_eq!(bob.store_count(), 0);
 
-    let sync = start_sync(&alice, &bob);
+    let sync = start_peers(&alice, &bob);
 
     assert_eventually(
         || bob.store_count() == 10,
@@ -60,7 +60,7 @@ async fn test_concurrent_create_and_sync() {
     let alice = Peer::new("alice", channel);
     let bob = Peer::new("bob", channel);
 
-    let sync = start_sync(&alice, &bob);
+    let sync = start_peers(&alice, &bob);
 
     // Give sync loop a moment to connect
     tokio::time::sleep(Duration::from_millis(500)).await;
