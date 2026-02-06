@@ -442,16 +442,25 @@ The system is accepted only if these invariants hold:
 
 1. replay invariance:
    - replaying canonical events yields the same projected state.
-2. reproject invariance:
+2. replay idempotency:
+   - replaying the same canonical set a second time (2x replay) yields no additional state changes.
+3. reverse-order replay invariance:
+   - replaying canonical events in reverse order yields the same projected state.
+4. reproject invariance:
    - dropping projections and reprojection yields the same state.
-3. reorder invariance:
+5. reorder invariance:
    - out-of-order ingest converges to the same state.
-4. source isomorphism:
+6. source isomorphism:
    - `local_create`, `wire_receive`, and replay converge through the same `project_one` path.
-5. tenant isolation:
+7. tenant isolation:
    - no cross-tenant leakage under scoped queries.
 
 Operational queue rows are excluded from end-state equality fingerprints.
+
+Harness policy:
+1. replay invariants (`once`, `twice`, `reverse-order`) are standard checks in the scenario harness.
+2. they run after every scenario test that mutates canonical event store rows.
+3. checks are computed from deterministic table-state fingerprints over event-store-derived state.
 
 ---
 

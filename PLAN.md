@@ -407,6 +407,20 @@ Why this rule exists:
 - preserves `poc-6`-style tenant scoping guarantees,
 - prevents assistants from inventing per-tenant table proliferation.
 
+## 5.7 Replay-idempotency harness baseline (required)
+
+Phase 1 must introduce a standard event-store replay harness and make it mandatory for scenario coverage.
+
+Required checks per tenant scope (`recorded_by`):
+1. replay-once: rebuild projection state from canonical event store order and compare with baseline.
+2. replay-twice idempotency: run replay again on already replayed state; no additional changes.
+3. reverse-order replay: replay canonical events in reverse order; final projected state matches baseline.
+
+Harness policy:
+1. these checks run automatically after every scenario test that writes canonical events.
+2. source of truth is canonical event store rows (`events` + scoped subjective state), not transient in-memory state.
+3. comparisons use deterministic table-state fingerprints (same mechanism as replay/reproject/reorder invariants).
+
 ---
 
 ## 6. Phase 2: Projector Core Before Full Queues
@@ -981,9 +995,14 @@ Not in scope yet:
 ## 12.4 Replay/reproject/reorder invariants
 
 1. Replay invariance: replay from canonical events yields same projected end state.
-2. Reproject invariance: wipe projections and reproject yields same state.
-3. Reorder invariance: out-of-order ingest converges to same state.
-4. Operational queues are excluded from end-state equality checks.
+2. Replay idempotency: replaying again on already replayed state (2x replay) yields no state change.
+3. Reverse-order replay invariance: replaying canonical events in reverse order yields same end state.
+4. Reproject invariance: wipe projections and reproject yields same state.
+5. Reorder invariance: out-of-order ingest converges to same state.
+6. Operational queues are excluded from end-state equality checks.
+
+Harness rule:
+- run these replay/reproject/reorder checks automatically after every scenario test that mutates the event store.
 
 Use deterministic table-state fingerprints for comparisons.
 
@@ -1106,14 +1125,20 @@ Must implement:
 2. length-prefixed sync framing with variable event lengths by type.
 3. minimal `recorded_events` journaling and endpoint observation table.
 4. tenant wrapper APIs for subjective reads/writes.
+5. standard replay harness with mandatory checks:
+   - replay once,
+   - replay twice (idempotency),
+   - reverse-order replay.
+6. scenario test runner hook that executes replay harness after each scenario test touching canonical events.
 
 Common mistakes:
 - retaining fixed `ENVELOPE_SIZE` assumptions in parser/send path.
 - inferring dependencies from ad-hoc code instead of schema metadata.
+- treating replay checks as optional/manual instead of default harness behavior.
 
 Definition of done:
 - at least two event types decode via schema-driven parsers,
-- replay from canonical events yields same projected state.
+- replay invariants pass in standard harness (`once`, `twice`, `reverse-order`) after every scenario test.
 
 ## 15.5 Phase `2` implementation checklist (projector + blocked deps)
 
