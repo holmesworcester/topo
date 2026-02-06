@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
+use std::time::{Duration, Instant};
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
@@ -71,6 +72,28 @@ enum Commands {
         #[arg(short = 'C', long, default_value = "0102030405060708090a0b0c0d0e0f10")]
         channel: String,
     },
+
+    /// Assert a predicate holds right now (exit 0 = pass, exit 1 = fail)
+    AssertNow {
+        /// Predicate: "field op value" (e.g. "store_count >= 10")
+        predicate: String,
+        #[arg(short, long, default_value = "server.db")]
+        db: String,
+    },
+
+    /// Assert a predicate eventually holds (exit 0 = pass, exit 1 = timeout)
+    AssertEventually {
+        /// Predicate: "field op value" (e.g. "message_count == 50")
+        predicate: String,
+        #[arg(short, long, default_value = "server.db")]
+        db: String,
+        /// Timeout in milliseconds
+        #[arg(long, default_value = "10000")]
+        timeout_ms: u64,
+        /// Poll interval in milliseconds
+        #[arg(long, default_value = "200")]
+        interval_ms: u64,
+    },
 }
 
 #[tokio::main]
@@ -103,6 +126,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
         Commands::Generate { count, db, channel } => {
             generate_messages(&db, count, &channel)?;
+        }
+        Commands::AssertNow { predicate, db } => {
+            let code = run_assert_now(&db, &predicate)?;
+            std::process::exit(code);
+        }
+        Commands::AssertEventually { predicate, db, timeout_ms, interval_ms } => {
+            let code = run_assert_eventually(&db, &predicate, timeout_ms, interval_ms)?;
+            std::process::exit(code);
         }
     }
 
@@ -347,6 +378,132 @@ fn generate_messages(db_path: &str, count: usize, channel_hex: &str) -> Result<(
     println!("Generated {} messages in {}", count, db_path);
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Assert commands
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy)]
+enum Op {
+    Eq,
+    Ne,
+    Ge,
+    Le,
+    Gt,
+    Lt,
+}
+
+impl Op {
+    fn eval(self, actual: i64, expected: i64) -> bool {
+        match self {
+            Op::Eq => actual == expected,
+            Op::Ne => actual != expected,
+            Op::Ge => actual >= expected,
+            Op::Le => actual <= expected,
+            Op::Gt => actual > expected,
+            Op::Lt => actual < expected,
+        }
+    }
+
+    fn symbol(self) -> &'static str {
+        match self {
+            Op::Eq => "==",
+            Op::Ne => "!=",
+            Op::Ge => ">=",
+            Op::Le => "<=",
+            Op::Gt => ">",
+            Op::Lt => "<",
+        }
+    }
+}
+
+fn parse_predicate(s: &str) -> Result<(String, Op, i64), String> {
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    if parts.len() != 3 {
+        return Err(format!(
+            "predicate must be \"field op value\", got {} parts: {:?}",
+            parts.len(), s
+        ));
+    }
+    let field = parts[0].to_string();
+    let op = match parts[1] {
+        "==" => Op::Eq,
+        "!=" => Op::Ne,
+        ">=" => Op::Ge,
+        "<=" => Op::Le,
+        ">" => Op::Gt,
+        "<" => Op::Lt,
+        other => return Err(format!("unknown operator: {}", other)),
+    };
+    let value: i64 = parts[2]
+        .parse()
+        .map_err(|e| format!("invalid value '{}': {}", parts[2], e))?;
+    Ok((field, op, value))
+}
+
+fn query_field(db: &rusqlite::Connection, field: &str) -> Result<i64, String> {
+    let sql = match field {
+        "store_count" => "SELECT COUNT(*) FROM store",
+        "message_count" => "SELECT COUNT(*) FROM messages",
+        "shareable_count" => "SELECT COUNT(*) FROM shareable_events",
+        "neg_items_count" => "SELECT COUNT(*) FROM neg_items",
+        other => return Err(format!("unknown field: {}", other)),
+    };
+    db.query_row(sql, [], |row| row.get(0))
+        .map_err(|e| format!("query failed: {}", e))
+}
+
+fn run_assert_now(
+    db_path: &str,
+    predicate_str: &str,
+) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
+    let (field, op, expected) = parse_predicate(predicate_str)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+    let db = open_connection(db_path)?;
+    create_tables(&db)?;
+    let actual = query_field(&db, &field)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+
+    if op.eval(actual, expected) {
+        println!("PASS: {} = {} (expected {} {})", field, actual, op.symbol(), expected);
+        Ok(0)
+    } else {
+        println!("FAIL: {} = {} (expected {} {})", field, actual, op.symbol(), expected);
+        Ok(1)
+    }
+}
+
+fn run_assert_eventually(
+    db_path: &str,
+    predicate_str: &str,
+    timeout_ms: u64,
+    interval_ms: u64,
+) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
+    let (field, op, expected) = parse_predicate(predicate_str)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+    let db = open_connection(db_path)?;
+    create_tables(&db)?;
+    let start = Instant::now();
+    let timeout = Duration::from_millis(timeout_ms);
+    let interval = Duration::from_millis(interval_ms);
+
+    loop {
+        let actual = query_field(&db, &field)
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+        if op.eval(actual, expected) {
+            println!("PASS: {} = {} (expected {} {})", field, actual, op.symbol(), expected);
+            return Ok(0);
+        }
+        if start.elapsed() >= timeout {
+            println!(
+                "TIMEOUT: {} = {} (expected {} {}) after {}ms",
+                field, actual, op.symbol(), expected, timeout_ms
+            );
+            return Ok(1);
+        }
+        std::thread::sleep(interval);
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -8,11 +8,16 @@ This document is ordered exactly as we should build it.
 2. `Phase 0`: mTLS + QUIC transport baseline finalized.
 3. `Phase 1`: Event schema, identity semantics, multitenant recording model.
 4. `Phase 2`: Projector core and dependency blocking (without full queue complexity).
-5. `Phase 3`: Encrypted events using the same dependency/projector model, tested first with per-instance PSK.
-6. `Phase 4`: Durable queue architecture (`ingress`, `project`, `egress`) and workers.
-7. `Phase 5`: Non-identity special-case projector logic (deletion/emitted-events).
-8. `Phase 6`: Performance hardening, observability, and scaling passes.
-9. `Phase 7`: TLA-first minimal identity layer for trust-anchor cascade, removal, and sender-subjective encryption.
+5. `Phase 2.5`: Shared signer substrate (`signed_by` dependency blocking + signature verification ordering).
+6. `Phase 3`: Encrypted events using the same dependency/projector model, tested first with per-instance PSK.
+7. `Phase 4`: Durable queue architecture (`ingress`, `project`, `egress`) and workers.
+8. `Phase 5`: Non-identity special-case projector logic (deletion/emitted-events).
+9. `Phase 6`: Performance hardening, observability, and scaling passes.
+10. `Phase 7`: TLA-first minimal identity layer for trust-anchor cascade, removal, and sender-subjective encryption.
+
+Scheduling note:
+- `signed_by` dependency blocking + signature verification ordering is tackled in Phase 2.5 (right after Phase 2).
+- Phase 2.5 must be complete before starting identity projectors in Phase 7.
 
 ## 1.1 `codex-simplified` baseline gap audit (current state)
 
@@ -34,11 +39,14 @@ Current code in `poc-7` (post-move from `codex-simplified`) is a useful sync pro
    - no `project_queue` / `egress_queue` lease-retry helpers shared across workers.
 7. Identity/trust-anchor/removal model not implemented:
    - no split invite types (`user_invite`, `device_invite`) and no TLA-derived identity projector guards.
+8. No shared signer substrate yet:
+   - no uniform `signed_by` dependency blocking + signature verification ordering across event types.
 
 Gap-to-phase mapping:
 - wire framing + schema normalization -> `Phase 1`
 - strict pinned mTLS -> `Phase 0`
 - projector entrypoint + dep/blocking core -> `Phase 2`
+- shared signer dependency + signature pipeline -> `Phase 2.5`
 - encryption adapter + key deps -> `Phase 3`
 - queue/worker architecture -> `Phase 4`
 - deletion/emits explicit rules -> `Phase 5`
@@ -48,6 +56,7 @@ Gap-to-phase mapping:
 
 ## 2. Core Simplifications To Preserve
 
+- Terminology: use `workspace` (event + domain term) for the peer set and shared context; reserve "network" for transport/networking.
 - Connection/sync state is protocol/runtime state, not canonical events.
 - Canonical events are durable, replayable, and mostly projector-autowritable.
 - Local-only events remain canonical events, selected by `event_type` policy.
@@ -77,6 +86,12 @@ These are required, not optional:
    - `project_queue` and `egress_queue` share generic claim/lease/retry/backoff helper code.
 6. Isomorphism requirement.
    - once canonical event bytes are persisted, source differences disappear (`local_create == wire_receive == replay`) for projection logic.
+7. Shared projection tables with tenant-scoped autowrite.
+   - all peers write into the same per-event projection tables (no per-peer table fanout).
+   - subjective/projected rows carry tenant scope and use composite identity (`peer_id`, `event_id`) semantics.
+8. Emitted-event self-projection rule.
+   - projector side effects should emit canonical events; each emitted event projects to its own event table via its own projector/autowrite path.
+   - direct cross-event table writes are rare operational exceptions only.
 
 ---
 
@@ -105,6 +120,14 @@ Build this before queue complexity.
 - Two daemons exchange chat events over QUIC.
 - CLI can create/query/assert deterministically in scripts.
 - Real-time feel is acceptable with current simple path.
+
+### Status: COMPLETE
+
+Phase -1 is functionally complete. All deliverables are met:
+- `sync`, `send`, `messages`, `status`, `generate` CLI commands work.
+- `assert-now` and `assert-eventually` commands enable deterministic scripting.
+- CLI integration tests use assert commands (no ad-hoc wait helpers).
+- JSON output is not required; human-readable output is sufficient.
 
 ---
 
@@ -143,18 +166,32 @@ Do not use as final security model:
 1. Every peer has a persistent cert identity per profile:
    - certificate DER
    - private key PKCS#8 DER
-   - extracted SPKI bytes (for pinning / peer identity)
-2. Pin peers by SPKI bytes, not by socket address.
-3. Enforce pinning on both sides:
+   - extracted SPKI bytes (for pinning / identity lookup)
+2. Phase 0 trust source is CLI/profile supplied peer pubkeys:
+   - daemon startup config supplies allowed remote cert public keys (SPKI pins).
+   - no dependency on identity-event projection for initial mTLS allowlist.
+3. Pin peers by expected SPKI from this configured allowlist, not by socket address.
+4. Enforce pinning on both sides:
    - server verifies client cert SPKI against pinned store
    - client verifies server cert SPKI against pinned store
-4. No production fallback to `SkipServerVerification`.
-5. Derive stable transport peer identity from SPKI (for example `peer_transport_id = hash(spki_der)`), and use that in endpoint observation tables.
+5. No production fallback to `SkipServerVerification`.
+6. Use long-lived cert keys for peer authentication in transport:
+   - QUIC uses TLS 1.3 handshake key agreement, so session keys still get forward secrecy.
+7. Connection identity mapping for metadata/projection context:
+   - `recorded_by` = local identity bound to the local cert/private key used for this daemon/profile.
+   - `via_peer_id` = remote identity resolved from authenticated remote cert SPKI mapping.
+8. Scope for this phase: invited-member allowlist only.
+   - do not implement removal/disconnection policy yet.
+9. Identity-phase migration rule:
+   - once Phase 7 identity model lands, replace/augment CLI allowlist with projected mapping from identity events (`peer_id -> cert SPKI`).
 
 ## 4.3 Implementation checklist (assistant-safe)
 
 1. Port cert helper types/functions from mtls branch (`SelfSignedCert`, base64 SPKI helpers).
-2. Add `PeerKeyStore` trait + concrete store (static/in-memory first; profile-backed later).
+2. Add `PeerKeyStore` trait + concrete store (static/in-memory first; profile-backed later):
+   - Phase 0 source: CLI/profile allowlist of permitted SPKI pins.
+   - identity phase source: projected mapping `peer_id -> expected SPKI`.
+   - reverse lookup by `SPKI -> peer_id` once identity mapping exists.
 3. Add `PinnedCertVerifier` implementing:
    - `rustls::client::danger::ServerCertVerifier`
    - `rustls::verify::ClientCertVerifier` (or `rustls::server::danger::ClientCertVerifier` depending on rustls version in branch)
@@ -167,14 +204,19 @@ Do not use as final security model:
 6. Add positive and negative tests:
    - pinned peer connects successfully
    - unpinned peer is rejected
-7. Plumb validated peer transport identity into sync session context (`via_peer_id`) for metadata projection.
+7. Plumb authenticated connection identity into sync session context:
+   - local `recorded_by` from local cert profile identity.
+   - remote `via_peer_id` from verified remote cert SPKI lookup (or pre-identity stable key id derived from SPKI).
+8. Reject connections where verified cert SPKI is not in the active allowlist source (CLI/profile list now, identity-projected mapping later).
 
 ## 4.4 Common mTLS mistakes to avoid
 
 - Do not generate a new certificate each startup for the same profile in daemon mode.
 - Do not identify peers by `remote_address()` for policy decisions.
 - Do not leave optional insecure mode on by default.
+- Do not invent a second transport-only peer identifier when `peer_id` mapping already exists.
 - Do not couple event-level authorization to transport identity; transport and event signatures are complementary.
+- Do not delay Phase 0 on identity projection plumbing; use CLI/profile SPKI allowlist first.
 
 ---
 
@@ -188,6 +230,11 @@ Define event shape once and drive these from it:
 - validation
 - projector auto-row mapping metadata
 - dependency extraction metadata (`is_event_ref`, `required`)
+
+Signature/dependency rule (required):
+- signed events must declare `signed_by_peer_id` (or equivalent signer-id field) in schema metadata.
+- signer-id field is treated as a normal required dependency.
+- if signer dependency is missing, event blocks in `blocked_event_deps` before signature verification is attempted.
 
 Field encoding kinds:
 - `fixed_bytes(N)`
@@ -218,6 +265,8 @@ This supports large events like `file_slice` while keeping deterministic signing
 - `recorded_by`: local tenant peer identity that recorded/projected the event.
 - Both are `peer_id` typed values and intentionally separate.
 - No `recorded_via` field.
+- `recorded_by` is derived from authenticated local connection/profile identity, not from event payload claims.
+- Remote transport identity for metadata is `via_peer_id`, resolved from verified cert SPKI -> `peer_id`.
 
 ## 5.4 Event classes
 
@@ -284,6 +333,33 @@ CREATE INDEX idx_peer_endpoint_last_seen
 - `recorded_events` is the per-event receive journal (`recorded_at` ~= local `received_at`).
 - Endpoint/IP metadata is intentionally separate in `peer_endpoint_observations` for frequent TTL purge and intro hinting.
 
+## 5.6 Table creation and naming conventions (required)
+
+Table lifecycle:
+1. Use a migration runner with ordered schema versions (`schema_migrations` table).
+2. Core tables are created by core migrations (`events`, queues, `recorded_events`, etc.).
+3. Event projection tables are created by event-module migrations registered in the event registry.
+4. Startup must run migration + registry/schema consistency checks and fail fast on mismatch.
+
+Naming and ownership:
+1. Do not infer table names by pluralization heuristics.
+2. Each event module declares explicit constants/metadata:
+   - `event_type` (for example `message`)
+   - `projection_table` (for example `messages`)
+3. Default shape is one event module -> one projection table -> one autowrite mapping.
+4. Exceptions are explicit and documented (deletion/tombstones, join tables, operational queue tables).
+
+Multitenant scoping in shared tables:
+1. Keep one shared physical table per event type (no per-peer table fanout).
+2. Subjective/projected rows must include tenant scope key (`peer_id` / `recorded_by`).
+3. Use composite keys/indexes with tenant first (for example `(peer_id, event_id)`).
+4. For subjective autowrite tables, default uniqueness is exactly one row per `(peer_id, event_id)` unless the event spec explicitly defines a different shape.
+
+Why this rule exists:
+- keeps schema ergonomic and queryable,
+- preserves `poc-6`-style tenant scoping guarantees,
+- prevents assistants from inventing per-tenant table proliferation.
+
 ---
 
 ## 6. Phase 2: Projector Core Before Full Queues
@@ -319,6 +395,20 @@ Entry-point requirement:
 
 - Most event types use predicate + auto-write.
 - Auto-write is typically `INSERT OR IGNORE` of flat event fields + metadata.
+- Auto-write is tenant-scoped in shared tables (`peer_id`/`recorded_by` included in subjective rows and keys).
+- Validation order for signed events is fixed:
+  1. dependency extraction/check (including signer dependency),
+  2. signature verification using resolved signer key,
+  3. authorization/policy predicate checks,
+  4. autowrite/effects.
+
+### Emitted-event rule (required)
+
+When a projector emits event `X`:
+1. emit canonical event `X` only (to `events` + normal queue flow),
+2. let `X` project through `X`'s own projector/autowrite into `X`'s table.
+
+Do not directly write into another event type's projection table as a side effect, except for rare non-event operational writes explicitly documented in that projector.
 
 ### Explicit exceptions
 
@@ -344,6 +434,8 @@ Rules:
 - Extract refs from schema-marked fields on each projection attempt.
 - If required refs are present: continue projection.
 - If any required refs are missing: write rows in `blocked_event_deps` and return `Block`.
+- Signer refs (`signed_by_peer_id` or equivalent) are dependency refs and use the same blocking/unblocking path.
+- Signature verification is attempted only after signer deps and other required deps are available.
 - Do not persist full `event_dependencies` yet.
 - Use one dependency resolver for all event families (content, identity, encrypted wrappers, invites).
 - Dependency extraction is driven by event schema metadata only (`is_event_ref`, `required`, conditional requirement flags).
@@ -405,11 +497,23 @@ Usually not required at this stage, but useful if blocker behavior gets ambiguou
 - verify multi-blocker convergence and no-lost-unblock behavior,
 - then map those guards directly into projector dependency checks.
 
+## 6.6 Phase 2.5: Shared signer substrate (required before identity)
+
+Implement one signer pipeline for all signed event types:
+1. signer field (`signed_by_peer_id` or equivalent) is schema-declared dependency metadata.
+2. missing signer dependency uses normal blocking/unblocking (`blocked_event_deps`).
+3. signature verification runs only after dependency resolution.
+4. invalid signature is `Reject`, never `Block`.
+5. signer verification helper path is shared across event families (no identity-specific signer path later).
+
+This phase should be completed immediately after Phase 2 and before Phase 3/Phase 7 work.
+
 ---
 
 ## 7. Phase 3: Encrypted Events With The Same Model
 
 Goal: encrypted events behave like normal events for dependencies and projection.
+Precondition: Phase 2.5 signer substrate is already active.
 
 ## 7.1 Registry integration
 
@@ -477,7 +581,7 @@ This isolates queue/projection/dependency correctness from identity/envelope com
 
 ## 8. Phase 4: Durable Queues and Workers
 
-Add full queue machinery after identity + projection + encryption semantics are stable.
+Add full queue machinery after projection + signer + encryption semantics are stable.
 
 ## 8.1 Queue tables
 
@@ -598,7 +702,7 @@ Must be atomic:
 3. unblock updates + requeue.
 
 Need not be atomic with projection:
-- network send,
+- transport send,
 - cleanup/purge,
 - metrics/logging.
 
@@ -652,14 +756,19 @@ Recommended initial size policy:
 ## 11. Phase 7: Minimal Identity Layer + Crude Sender-Subjective Encryption
 
 This is a final functional phase after the core projection/queue path is stable.
+Prerequisite: Phase 2.5 signer substrate is complete before identity projector implementation begins.
 
 ## 11.1 Phase gate: TLA+ causal model first
 
 Before writing identity/removal/encryption projectors in Rust:
-1. Build/update a TLA+ model of causal relationships and guards for this phase.
-2. Model split invite types (`user_invite`, `device_invite`) and trust-anchor semantics.
-3. Verify bootstrap/self-invite, join, device-link, and removal safety invariants.
-4. Freeze a projector-spec mapping table: each projector predicate/check maps to a named TLA guard.
+1. Confirm signer pipeline from Phase 2.5 is active:
+   - missing `signed_by` dependency blocks,
+   - unblocked signer enables signature verification,
+   - invalid signature rejects (not block).
+2. Build/update a TLA+ model of causal relationships and guards for this phase.
+3. Model split invite types (`user_invite`, `device_invite`) and trust-anchor semantics.
+4. Verify bootstrap/self-invite, join, device-link, and removal safety invariants.
+5. Freeze a projector-spec mapping table: each projector predicate/check maps to a named TLA guard.
 
 Projector implementations should mirror TLA conditions as directly as possible.
 
@@ -677,7 +786,7 @@ Only include identity and policy needed for:
 Use separate types:
 - `user_invite` (invites a user identity)
 - `device_invite` (invites/links a peer device to a user)
-- `invite_accepted` (records accepted link data + `network_id`)
+- `invite_accepted` (records accepted link data + `workspace_id`)
 
 Do not use one `invite` type with `mode=user|peer`.
 
@@ -688,15 +797,15 @@ Implementation requirement:
 ## 11.4 Trust-anchor cascade requirements (from `poc-6`/TLA model)
 
 Required behavior:
-- `invite_accepted` records trust anchor intent for `network_id` (per `recorded_by` peer scope).
-- `network` is not valid until corresponding trust anchor exists.
+- `invite_accepted` records trust anchor intent for `workspace_id` (per `recorded_by` peer scope).
+- `workspace` is not valid until corresponding trust anchor exists.
 - invites are never force-valid; they validate only through signer/dependency chain.
 
 Self-invite bootstrap sequence must stay explicit:
-1. create `network` event (integrity self-sign only).
-2. create bootstrap `user_invite` signed by network authority.
-3. accept invite locally -> `invite_accepted(network_id=...)`.
-4. normal cascade unblocks: `network -> user_invite -> user -> device_invite -> peer_shared`.
+1. create `workspace` event (integrity self-sign only).
+2. create bootstrap `user_invite` signed by workspace authority.
+3. accept invite locally -> `invite_accepted(workspace_id=...)`.
+4. normal cascade unblocks: `workspace -> user_invite -> user -> device_invite -> peer_shared`.
 
 ## 11.5 Crude sender-keys model (phase-1 style, no key history yet)
 
@@ -752,6 +861,10 @@ Not in scope yet:
 - Valid/block/reject decisions per event type.
 - Blocked-only dependency behavior with multiple blockers.
 - Set-based unblock correctness.
+- Signer substrate invariants:
+  - missing signer dependency blocks,
+  - invalid signature rejects,
+  - valid signature passes and continues policy checks.
 - Encrypted wrapper flow, including nested-encryption rejection.
 - Source-isomorphism checks: `local_create`, `wire_receive`, and `replay` converge through the same `project_one` semantics and yield identical projected state.
 
@@ -794,13 +907,13 @@ Behavior tests:
 
 ## 13. What We Remove From `poc-6`
 
-- Loopback/network simulator paths in production runtime.
+- Loopback/simulator paths in production runtime.
 - Connection/sync canonical event types.
 - Ad-hoc bootstrap reprojection paths that bypass blocker logic.
 
 Keep:
 - local-only canonical events where replay matters,
-- network-intro/holepunch related canonical events if needed,
+- transport-intro/holepunch related canonical events if needed,
 - recorded-event model for replayability and tenant-scoped history.
 
 ---
@@ -810,10 +923,11 @@ Keep:
 Fastest coherent milestone:
 
 1. Finish Phase `-1`, `0`, `1`, and `2` with a small event set.
-2. Add Phase `3` encrypted wrapper with PSK test harness for one core content path.
-3. Add minimal Phase `4` queues.
-4. Add deletion special-case behavior after baseline sync is stable.
-5. Add final Phase `7` identity + invite cascade + sender-subjective key wraps.
+2. Complete Phase `2.5` signer substrate.
+3. Add Phase `3` encrypted wrapper with PSK test harness for one core content path.
+4. Add minimal Phase `4` queues.
+5. Add deletion special-case behavior after baseline sync is stable.
+6. Add final Phase `7` identity + invite cascade + sender-subjective key wraps.
 
 ---
 
@@ -832,6 +946,12 @@ Use this section as the implementation contract. If code conflicts with this sec
 4. No fixed global event blob size after Phase 1.
 5. No queue-specific retry logic duplication:
    - shared claim/lease/retry/backoff helpers only.
+6. No per-tenant table fanout:
+   - shared projection tables with tenant-scoped keys/indices only.
+7. No cross-table direct projection for emitted events:
+   - emitted events must project via their own event projector/autowrite path.
+8. No alternate signer pipeline:
+   - all signed event types use the same dependency-then-signature-verification ordering.
 
 ## 15.2 Phase `-1` implementation checklist (CLI + daemon)
 
@@ -853,8 +973,13 @@ Definition of done:
 Must implement:
 1. persistent cert identity per profile.
 2. pinned-cert verifier on both client and server.
-3. peer identity derived from certificate SPKI, not socket address.
-4. unit/integration tests for allowed and denied peers.
+3. Phase 0 allowlist source is CLI/profile supplied cert SPKI pins, not socket address.
+4. session context binds:
+   - local `recorded_by` from local cert profile identity.
+   - remote `via_peer_id` from verified cert SPKI mapping (identity-backed once Phase 7 lands).
+5. unit/integration tests for allowed and denied peers.
+6. migration note implemented:
+   - Phase 7 switches allowlist source to projected identity events (`peer_id -> cert SPKI`).
 
 Common mistakes:
 - using generated ephemeral cert each restart in daemon mode.
@@ -862,7 +987,7 @@ Common mistakes:
 
 Definition of done:
 - unpinned peer connection fails at handshake,
-- pinned peer sync succeeds repeatedly across daemon restarts.
+- pinned invited peer sync succeeds repeatedly across daemon restarts.
 
 ## 15.4 Phase `1` implementation checklist (schema + wire + recording)
 
@@ -895,6 +1020,24 @@ Common mistakes:
 Definition of done:
 - out-of-order events with multiple blockers converge correctly,
 - imperative command chains (`a=create_sync(); b=create_sync(depends_on=a)`) work without waits.
+
+## 15.5A Phase `2.5` implementation checklist (signer substrate)
+
+Must implement:
+1. schema metadata for signer dependency (`signed_by_peer_id` or equivalent).
+2. signer dependency blocking via `blocked_event_deps`.
+3. signature verification after dependency resolution and before policy checks.
+4. invalid signature -> `Reject` (not `Block`).
+5. shared signer helper path across all signed event families.
+
+Common mistakes:
+- verifying signatures before dependency resolution.
+- creating identity-specific signature paths that diverge from core projector flow.
+
+Definition of done:
+- signer-missing blocks then unblocks when signer arrives,
+- invalid signatures deterministically reject,
+- signed cleartext and signed encrypted-wrapper events follow the same signer pipeline.
 
 ## 15.6 Phase `3` implementation checklist (encrypted adapter)
 
@@ -961,6 +1104,7 @@ Must implement:
 3. split invite events (`user_invite`, `device_invite`) with shared helper core.
 4. sender-subjective O(n) key wrapping baseline (no key history yet).
 5. removal excludes removed peers from subsequent wraps.
+6. preserve Phase 2.5 signer pipeline (do not add identity-specific signature fast paths).
 
 Common mistakes:
 - implementing projector rules before guard/model freeze.
@@ -977,10 +1121,11 @@ Recommended PR sequence:
 2. wire framing + schema registry scaffolding.
 3. projector entrypoint + dependency resolver + blocked deps.
 4. create_sync API contract and tests.
-5. encrypted adapter + PSK tests.
-6. queue/worker architecture and shared queue helper extraction.
-7. deletion special-case projector.
-8. TLA model update + identity phase implementation.
+5. signer substrate (Phase 2.5): signer dep blocking + signature ordering tests.
+6. encrypted adapter + PSK tests.
+7. queue/worker architecture and shared queue helper extraction.
+8. deletion special-case projector.
+9. TLA model update + identity phase implementation.
 
 Rule:
 - each PR must include at least one failing test made to pass by that PR.

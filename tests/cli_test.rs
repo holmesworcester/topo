@@ -1,5 +1,5 @@
 use std::process::{Command, Child, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 fn bin() -> String {
     env!("CARGO_BIN_EXE_poc-7").to_string()
@@ -41,28 +41,40 @@ fn send_message(db: &str, content: &str) {
     assert!(output.status.success(), "send failed: {}", String::from_utf8_lossy(&output.stderr));
 }
 
-fn get_status(db: &str) -> (i64, i64) {
+fn assert_now(db: &str, predicate: &str) {
     let output = Command::new(bin())
-        .arg("status")
+        .arg("assert-now")
+        .arg(predicate)
         .arg("--db")
         .arg(db)
         .output()
-        .expect("failed to run status");
+        .expect("failed to run assert-now");
     let text = String::from_utf8_lossy(&output.stdout);
-    let store = parse_status_line(&text, "Store:");
-    let messages = parse_status_line(&text, "Messages:");
-    (store, messages)
+    assert!(
+        output.status.success(),
+        "assert-now failed: {} ({})",
+        predicate,
+        text.trim()
+    );
 }
 
-fn parse_status_line(text: &str, label: &str) -> i64 {
-    for line in text.lines() {
-        if let Some(rest) = line.trim().strip_prefix(label) {
-            // "  3 events" -> 3
-            let num_str = rest.trim().split_whitespace().next().unwrap_or("0");
-            return num_str.parse().unwrap_or(0);
-        }
-    }
-    0
+fn assert_eventually(db: &str, predicate: &str, timeout_ms: u64) {
+    let output = Command::new(bin())
+        .arg("assert-eventually")
+        .arg(predicate)
+        .arg("--db")
+        .arg(db)
+        .arg("--timeout-ms")
+        .arg(timeout_ms.to_string())
+        .output()
+        .expect("failed to run assert-eventually");
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "assert-eventually timed out: {} ({})",
+        predicate,
+        text.trim()
+    );
 }
 
 fn get_messages(db: &str) -> Vec<String> {
@@ -89,31 +101,13 @@ fn get_messages(db: &str) -> Vec<String> {
         .collect()
 }
 
-/// Wait until a peer has the expected store count, polling status.
-fn wait_for_count(db: &str, expected: i64, timeout: Duration) {
-    let start = Instant::now();
-    loop {
-        let (store, _) = get_status(db);
-        if store >= expected {
-            return;
-        }
-        if start.elapsed() >= timeout {
-            let (store, messages) = get_status(db);
-            panic!(
-                "Timed out waiting for {} to have {} events (has store={}, messages={})",
-                db, expected, store, messages
-            );
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-}
 
 #[test]
 fn test_cli_bidirectional_sync() {
     let tmpdir = tempfile::tempdir().unwrap();
     let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
     let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
-    let timeout = Duration::from_secs(15);
+    let timeout_ms = 15000;
 
     let alice_port = random_port();
     let bob_port = random_port();
@@ -128,24 +122,22 @@ fn test_cli_bidirectional_sync() {
 
     // Alice sends a message
     send_message(&alice_db, "Hello from Alice");
-    wait_for_count(&bob_db, 1, timeout);
+    assert_eventually(&bob_db, "store_count >= 1", timeout_ms);
 
     // Bob sends a message
     send_message(&bob_db, "Hey Alice!");
-    wait_for_count(&alice_db, 2, timeout);
+    assert_eventually(&alice_db, "store_count >= 2", timeout_ms);
 
     // Alice sends another
     send_message(&alice_db, "How are you?");
-    wait_for_count(&bob_db, 3, timeout);
-    wait_for_count(&alice_db, 3, timeout);
+    assert_eventually(&bob_db, "store_count >= 3", timeout_ms);
+    assert_eventually(&alice_db, "store_count >= 3", timeout_ms);
 
     // Verify both peers have all 3 messages
-    let (alice_store, alice_msgs) = get_status(&alice_db);
-    let (bob_store, bob_msgs) = get_status(&bob_db);
-    assert_eq!(alice_store, 3, "alice store count");
-    assert_eq!(alice_msgs, 3, "alice message count");
-    assert_eq!(bob_store, 3, "bob store count");
-    assert_eq!(bob_msgs, 3, "bob message count");
+    assert_now(&alice_db, "store_count == 3");
+    assert_now(&alice_db, "message_count == 3");
+    assert_now(&bob_db, "store_count == 3");
+    assert_now(&bob_db, "message_count == 3");
 
     // Verify message content
     let alice_messages = get_messages(&alice_db);
@@ -173,7 +165,7 @@ fn test_cli_ongoing_sync() {
     let tmpdir = tempfile::tempdir().unwrap();
     let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
     let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
-    let timeout = Duration::from_secs(15);
+    let timeout_ms = 15000;
 
     let alice_port = random_port();
     let bob_port = random_port();
@@ -186,27 +178,25 @@ fn test_cli_ongoing_sync() {
 
     // Round 1: Alice sends
     send_message(&alice_db, "Round 1");
-    wait_for_count(&bob_db, 1, timeout);
+    assert_eventually(&bob_db, "store_count >= 1", timeout_ms);
 
     // Round 2: Bob sends while sync runs
     send_message(&bob_db, "Round 2");
-    wait_for_count(&alice_db, 2, timeout);
+    assert_eventually(&alice_db, "store_count >= 2", timeout_ms);
 
     // Round 3: Both send
     send_message(&alice_db, "Round 3a");
     send_message(&bob_db, "Round 3b");
-    wait_for_count(&alice_db, 4, timeout);
-    wait_for_count(&bob_db, 4, timeout);
+    assert_eventually(&alice_db, "store_count >= 4", timeout_ms);
+    assert_eventually(&bob_db, "store_count >= 4", timeout_ms);
 
     // Round 4: One more after a pause
     std::thread::sleep(Duration::from_secs(1));
     send_message(&alice_db, "Round 4");
-    wait_for_count(&bob_db, 5, timeout);
+    assert_eventually(&bob_db, "store_count >= 5", timeout_ms);
 
-    let (alice_store, _) = get_status(&alice_db);
-    let (bob_store, _) = get_status(&bob_db);
-    assert_eq!(alice_store, 5);
-    assert_eq!(bob_store, 5);
+    assert_now(&alice_db, "store_count == 5");
+    assert_now(&bob_db, "store_count == 5");
 
     let _ = alice.kill();
     let _ = bob.kill();
@@ -223,9 +213,8 @@ fn test_cli_send_and_messages() {
     send_message(&db, "First message");
     send_message(&db, "Second message");
 
-    let (store, msgs) = get_status(&db);
-    assert_eq!(store, 2);
-    assert_eq!(msgs, 2);
+    assert_now(&db, "store_count == 2");
+    assert_now(&db, "message_count == 2");
 
     let messages = get_messages(&db);
     assert_eq!(messages.len(), 2);
