@@ -1,5 +1,6 @@
 pub mod protocol;
 pub mod negentropy_sqlite;
+pub mod engine;
 
 pub use protocol::{SyncMessage, parse_sync_message, encode_sync_message};
 pub use negentropy_sqlite::NegentropyStorageSqlite;
