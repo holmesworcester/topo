@@ -2,161 +2,96 @@
 
 ## Test Environment
 - SQLite on disk (WAL mode, NORMAL sync)
-- QUIC over localhost loopback
-- 50,000 events per peer (100,000 total)
-- 512-byte envelopes (~51 MB per direction)
+- In-process sim transport (no real QUIC sockets)
+- 512-byte envelopes
+- Linux x86_64, release build
 
 ## Running Performance Tests
 
 ```bash
-# Run full perf test suite
-cargo test --release perf_ -- --nocapture --ignored
+# Run all perf tests
+cargo test --release --test perf_test -- --nocapture
 
-# Run specific test
-cargo test --release perf_sync_50k -- --nocapture --ignored
+# Run a specific test
+cargo test --release --test perf_test perf_sync_50k -- --nocapture
 ```
 
-## Sync Performance (50k events/peer)
+## Results (2026-02-06)
 
-| Phase | Time |
-|-------|------|
-| Event generation | ~1.4s per 50k |
-| Prefetch to memory | ~260ms per side |
-| Negentropy reconciliation | ~630ms (51 rounds) |
-| Event transfer + projection | varies (see below) |
+### 50k one-way sync
 
-## Projection Dependency Read Modes
-
-Each event projection reads 10 dependencies (real messages from the database).
-This simulates looking up parent messages, thread roots, mentioned users, etc.
-
-| Mode | Transfer Time | vs Baseline | Description |
-|------|---------------|-------------|-------------|
-| NO_DEPS | 1.32s | baseline | No dependency reads |
-| NAIVE | 2.70s | +105% | Individual query per dependency |
-| BATCHED | 1.91s | +44% | Single IN (...) query per batch |
-
-**BATCHED is 42% faster than NAIVE** with real dependency data.
-
-### Why BATCHED is faster
-
-With real data to fetch:
-1. Single IN query avoids SQLite statement preparation overhead per read
-2. Fewer round trips through the query planner
-3. Better cache locality for index lookups
-
-## Throughput
+One peer generates 50k events, syncs to an empty peer.
 
 | Metric | Value |
 |--------|-------|
-| Events synced | 100,000 (50k each direction) |
-| Data transferred | ~102 MB total |
-| Sync time (no deps) | ~2s |
-| Effective throughput | ~50 MB/s |
+| Event generation | 0.33s |
+| Sync wall time | 1.22s |
+| Events/s | 40,831 |
+| Throughput | 19.94 MiB/s |
+| Peak RSS | 71.1 MiB |
 
-## Scaling
+### 10k bidirectional sync
 
-| Events/peer | Reconciliation Rounds | Transfer Time |
-|-------------|----------------------|---------------|
-| 500 | 2 | <100ms |
-| 1,000 | 3 | ~30ms |
-| 50,000 | 51 | ~1.3s |
+Each peer generates 5k events, syncs both directions.
 
-## Key Optimizations
+| Metric | Value |
+|--------|-------|
+| Event generation | 0.07s |
+| Sync wall time | 0.20s |
+| Events/s | 49,137 |
+| Throughput | 23.99 MiB/s |
+| Peak RSS | 26.2 MiB |
 
-1. **Prefetching**: Load all blobs into HashMap before sync starts
-2. **Channel + spawn_blocking**: Async network I/O, sync SQLite writes in separate thread
-3. **Batch transactions**: BEGIN/COMMIT around 1000-event batches
-4. **Batched dependency reads**: Single IN query for all deps per batch (42% faster)
-5. **Interleaved send/recv**: Drain receives before sending to avoid QUIC flow control deadlock
-6. **Inline projection**: Project in same transaction as store (atomic, <100ms latency)
+### 10k continuous sync (inject while syncing)
+
+Sync starts with empty peers, then 5k events injected on each side
+in 100-event batches while sync is running.
+
+| Metric | Value |
+|--------|-------|
+| Inject time | 0.11s |
+| Total wall time | 1.53s |
+| Events/s | 6,551 |
+| Throughput | 3.20 MiB/s |
+| Peak RSS | 27.6 MiB |
+
+## Key Design Points
+
+1. **No blob prefetch**: blobs fetched on demand, not cached in memory
+2. **Channel + spawn_blocking**: async network I/O, sync SQLite writes in separate thread
+3. **Batch transactions**: BEGIN/COMMIT around event batches
+4. **Interleaved send/recv**: drain receives before sending to avoid flow control deadlock
+5. **Inline projection**: project in same transaction as store
 
 ## Environment Variables
 
 ```bash
-NO_DEPS=1    # Skip dependency reads (baseline)
-NAIVE_DEPS=1 # Use individual queries per dependency (slower)
-# default    # Use batched IN query (faster)
+LOW_MEM=1  # Reduce SQLite cache, smaller channels (target ~24 MiB RSS)
 ```
 
-## Simulated Dual-Stream (SQLite-backed, no prefetch)
+## 24 MiB Target (iOS NSE) — Memory Control Levers
 
-All numbers below are from the in-process simulator (no sockets) with constrained
-latency/bandwidth. These runs include projection + ingest, but **exclude DB generation**
-by using `--no-generate` and prebuilt databases.
-
-### How to Run (sync-only)
-
-```bash
-# Generate DBs once (separate process)
-cargo run --release -- generate --db sim_server.db --count 100000 --channel aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-cargo run --release -- generate --db sim_client.db --count 100000 --channel bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-
-# Run sync-only (no generation)
-cargo run --release -- sim --events 100000 --timeout 120 --latency-ms 10 --bandwidth-kib 50000 --no-generate
-```
-
-### Release Perf Observations (sync-only)
-
-| Events/peer | Rounds | Combined Throughput | Peak RSS (VmHWM) |
-|-------------|--------|---------------------|------------------|
-| 10,000 | ~11 | ~5.5 MiB/s | ~48–50 MiB |
-| 100,000 | ~99 | ~5.2 MiB/s | ~270–280 MiB |
-
-Notes:
-- Throughput is **data stream only** (event blobs).
-- `VmHWM` is peak RSS for the entire run (sync phase only, generation excluded).
-- These numbers are on `--release`; debug builds are significantly slower.
-
-## 24 MB Target (iOS NSE) — Memory Control Levers
-
-If we need to run within ~24 MB, the biggest wins are **SQLite cache/buffers** and
-**queue sizes**. None of these require dropping projection or correctness.
-
-Recommended adjustments:
-
-- Reduce SQLite cache per connection (`PRAGMA cache_size`), e.g. `-1024` (1 MiB).
-- Minimize number of open connections (one read snapshot + one writer).
-- Use small bounded channels (ingest queue of 500–1000).
-- Keep `have/need` chunked and spill to DB (already done).
-- Avoid large in-memory prefetch or blob caches (already done).
-- Consider `PRAGMA temp_store=FILE` for large temp operations.
-- Set `PRAGMA mmap_size=0` to avoid extra mapped memory.
-- Use `PRAGMA wal_autocheckpoint` and `PRAGMA journal_size_limit` to keep WAL small.
-
-Measurement guidance:
-- For sync-only memory, **exclude generation** using `--no-generate`.
-- On iOS, use `task_info` (resident size) instead of `/proc/self/status` (Linux only).
-
-### Low-Mem Profile (implemented)
-
-Set `LOW_MEM=1` to enable:
+`LOW_MEM=1` enables:
 - SQLite cache ~1 MiB per connection
 - `temp_store=FILE`, `mmap_size=0`
 - Smaller WAL/journal limits
 - Ingest channel capacity reduced to 1000
 
-Example:
+Additional tuning options:
+- `PRAGMA cache_size = -1024` (1 MiB)
+- Minimize open connections (one read snapshot + one writer)
+- `PRAGMA wal_autocheckpoint` and `PRAGMA journal_size_limit` to keep WAL small
+
+## CLI Tools for Manual Testing
+
 ```bash
-LOW_MEM=1 cargo run --release -- sim --events 10000 --timeout 60 --latency-ms 1 --bandwidth-kib 50000 --no-generate
+# Generate test messages
+cargo run --release -- generate --count 50000 --db test.db
+
+# Run sync between two terminals
+cargo run --release -- sync --bind 127.0.0.1:4433 --db server.db
+cargo run --release -- sync --bind 127.0.0.1:4434 --connect 127.0.0.1:4433 --db client.db
+
+# Check status
+cargo run --release -- status --db server.db
 ```
-
-#### Low-Mem Result (10k/peer, 50,000 KiB/s cap)
-
-```
-LOW_MEM=1 cargo run --release -- sim --events 10000 --timeout 120 --latency-ms 1 --bandwidth-kib 50000 --no-generate
-```
-
-Results:
-- Combined throughput: **~15.7 MiB/s**
-- Peak RSS (VmHWM): **~19.4 MiB**
-
-#### Low-Mem Result (10k/peer, effectively unconstrained)
-
-```
-LOW_MEM=1 cargo run --release -- sim --events 10000 --timeout 60 --latency-ms 1 --bandwidth-kib 1000000 --no-generate
-```
-
-Results:
-- Combined throughput: **~13.5 MiB/s**
-- Peak RSS (VmHWM): **~20.6 MiB**
