@@ -14,6 +14,36 @@ This document is ordered exactly as we should build it.
 8. `Phase 6`: Performance hardening, observability, and scaling passes.
 9. `Phase 7`: TLA-first minimal identity layer for trust-anchor cascade, removal, and sender-subjective encryption.
 
+## 1.1 `codex-simplified` baseline gap audit (current state)
+
+Current code in `poc-7` (post-move from `codex-simplified`) is a useful sync prototype, but has deliberate gaps relative to this plan:
+
+1. Fixed-size wire/event assumptions:
+   - `src/wire/mod.rs` uses fixed `ENVELOPE_SIZE = 512`.
+   - `src/sync/protocol.rs` uses fixed `EVENT_SIZE = 1 + ENVELOPE_SIZE`.
+2. mTLS is not yet pinned/strict:
+   - `src/transport/mod.rs` uses permissive server-cert verification (`SkipServerVerification`) and no mandatory peer pinning.
+3. Projection pipeline is still message-specific and sync-engine-coupled:
+   - `src/sync/engine.rs` does inline parse/project for message rows.
+   - no global `project_one(recorded_by,event_id)` entrypoint yet.
+4. No dependency blocking model yet:
+   - no `blocked_event_deps` / unblock/requeue flow.
+5. No per-tenant receive journal yet:
+   - no `recorded_events(recorded_by,event_id,recorded_at,source)` in active code path.
+6. No queue family from this plan yet:
+   - no `project_queue` / `egress_queue` lease-retry helpers shared across workers.
+7. Identity/trust-anchor/removal model not implemented:
+   - no split invite types (`user_invite`, `device_invite`) and no TLA-derived identity projector guards.
+
+Gap-to-phase mapping:
+- wire framing + schema normalization -> `Phase 1`
+- strict pinned mTLS -> `Phase 0`
+- projector entrypoint + dep/blocking core -> `Phase 2`
+- encryption adapter + key deps -> `Phase 3`
+- queue/worker architecture -> `Phase 4`
+- deletion/emits explicit rules -> `Phase 5`
+- trust-anchor/invite/removal/sender-keys -> `Phase 7`
+
 ---
 
 ## 2. Core Simplifications To Preserve
@@ -95,6 +125,57 @@ Build this before queue complexity.
 - Reconnect/retry behavior is stable across daemon restarts.
 - mTLS identity is plumbed into peer/session context.
 
+## 4.1 mTLS reference model to follow
+
+Primary model (use this first):
+- `/tmp/poc-7-mtls/src/transport/mod.rs`
+- `/tmp/poc-7-mtls/src/transport/cert.rs`
+
+Secondary reference (CLI + optional pin flags, less strict):
+- `/home/holmes/poc-7=codex-attempt/src/transport/mod.rs`
+- `/home/holmes/poc-7=codex-attempt/src/main.rs`
+
+Do not use as final security model:
+- permissive verifier pattern in current `poc-7/src/transport/mod.rs`.
+
+## 4.2 Required mTLS design
+
+1. Every peer has a persistent cert identity per profile:
+   - certificate DER
+   - private key PKCS#8 DER
+   - extracted SPKI bytes (for pinning / peer identity)
+2. Pin peers by SPKI bytes, not by socket address.
+3. Enforce pinning on both sides:
+   - server verifies client cert SPKI against pinned store
+   - client verifies server cert SPKI against pinned store
+4. No production fallback to `SkipServerVerification`.
+5. Derive stable transport peer identity from SPKI (for example `peer_transport_id = hash(spki_der)`), and use that in endpoint observation tables.
+
+## 4.3 Implementation checklist (assistant-safe)
+
+1. Port cert helper types/functions from mtls branch (`SelfSignedCert`, base64 SPKI helpers).
+2. Add `PeerKeyStore` trait + concrete store (static/in-memory first; profile-backed later).
+3. Add `PinnedCertVerifier` implementing:
+   - `rustls::client::danger::ServerCertVerifier`
+   - `rustls::verify::ClientCertVerifier` (or `rustls::server::danger::ClientCertVerifier` depending on rustls version in branch)
+4. Server endpoint:
+   - use `.with_client_cert_verifier(...)`
+   - use `.with_single_cert(...)`
+5. Client endpoint:
+   - use custom cert verifier with pinned store
+   - use `.with_client_auth_cert(...)`
+6. Add positive and negative tests:
+   - pinned peer connects successfully
+   - unpinned peer is rejected
+7. Plumb validated peer transport identity into sync session context (`via_peer_id`) for metadata projection.
+
+## 4.4 Common mTLS mistakes to avoid
+
+- Do not generate a new certificate each startup for the same profile in daemon mode.
+- Do not identify peers by `remote_address()` for policy decisions.
+- Do not leave optional insecure mode on by default.
+- Do not couple event-level authorization to transport identity; transport and event signatures are complementary.
+
 ---
 
 ## 5. Phase 1: Event Schema, Identity, and Multitenancy
@@ -122,6 +203,14 @@ Field encoding kinds:
 - Length-prefixed framing for sync transport.
 
 This supports large events like `file_slice` while keeping deterministic signing/parsing.
+
+`codex-simplified` migration note:
+- current code paths using global fixed sizes (`ENVELOPE_SIZE`, `EVENT_SIZE`) must be treated as temporary.
+- replace with:
+  1. sync frame header carrying message type + payload length,
+  2. event decoder dispatch by `event_type` schema,
+  3. per-type bounds checks from schema max lengths.
+- do not keep any global fixed event blob size constant once Phase 1 is complete.
 
 ## 5.3 Identity semantics (explicit)
 
@@ -725,3 +814,173 @@ Fastest coherent milestone:
 3. Add minimal Phase `4` queues.
 4. Add deletion special-case behavior after baseline sync is stable.
 5. Add final Phase `7` identity + invite cascade + sender-subjective key wraps.
+
+---
+
+## 15. Assistant Execution Playbook (High-detail)
+
+Use this section as the implementation contract. If code conflicts with this section, update code to match this section unless user overrides.
+
+## 15.1 Cross-phase non-negotiables
+
+1. No alternate projection path:
+   - all projection must converge on `project_one(recorded_by,event_id)`.
+2. No alternate dependency resolver:
+   - dependency refs come from schema metadata only.
+3. No insecure transport default:
+   - pinned mTLS required unless explicitly running dedicated test mode.
+4. No fixed global event blob size after Phase 1.
+5. No queue-specific retry logic duplication:
+   - shared claim/lease/retry/backoff helpers only.
+
+## 15.2 Phase `-1` implementation checklist (CLI + daemon)
+
+Must implement:
+1. daemon process with profile-scoped db path and control socket.
+2. non-interactive CLI for create/query/assert operations.
+3. stable JSON output and non-zero exit on assertion failure.
+
+Common mistakes:
+- embedding business logic in CLI command handlers instead of daemon API.
+- relying on sleep/wait commands rather than assertion semantics.
+
+Definition of done:
+- two daemons exchange at least one message via real QUIC,
+- `assert-eventually` based scripts run deterministically.
+
+## 15.3 Phase `0` implementation checklist (mTLS baseline)
+
+Must implement:
+1. persistent cert identity per profile.
+2. pinned-cert verifier on both client and server.
+3. peer identity derived from certificate SPKI, not socket address.
+4. unit/integration tests for allowed and denied peers.
+
+Common mistakes:
+- using generated ephemeral cert each restart in daemon mode.
+- leaving permissive cert verifier as default behavior.
+
+Definition of done:
+- unpinned peer connection fails at handshake,
+- pinned peer sync succeeds repeatedly across daemon restarts.
+
+## 15.4 Phase `1` implementation checklist (schema + wire + recording)
+
+Must implement:
+1. event registry metadata describing fields and dependency refs.
+2. length-prefixed sync framing with variable event lengths by type.
+3. minimal `recorded_events` journaling and endpoint observation table.
+4. tenant wrapper APIs for subjective reads/writes.
+
+Common mistakes:
+- retaining fixed `ENVELOPE_SIZE` assumptions in parser/send path.
+- inferring dependencies from ad-hoc code instead of schema metadata.
+
+Definition of done:
+- at least two event types decode via schema-driven parsers,
+- replay from canonical events yields same projected state.
+
+## 15.5 Phase `2` implementation checklist (projector + blocked deps)
+
+Must implement:
+1. `project_one(recorded_by,event_id)` entrypoint.
+2. blocked-only dependency persistence (`blocked_event_deps`).
+3. set-based unblock and requeue SQL.
+4. `create_event_sync` success-only-on-valid contract.
+
+Common mistakes:
+- adding a separate local create fast-path projector.
+- storing full dependency graph prematurely.
+
+Definition of done:
+- out-of-order events with multiple blockers converge correctly,
+- imperative command chains (`a=create_sync(); b=create_sync(depends_on=a)`) work without waits.
+
+## 15.6 Phase `3` implementation checklist (encrypted adapter)
+
+Must implement:
+1. encrypted wrapper as a normal registry type.
+2. materialization adapter (decrypt -> inner `EventView` -> normal projector).
+3. nested encrypted rejection.
+4. PSK harness tests before identity wrapping.
+
+Common mistakes:
+- introducing a separate persisted plaintext queue too early.
+- introducing separate dependency logic for key blockers.
+
+Definition of done:
+- missing key blocks, wrong key rejects, correct key projects,
+- reorder/replay invariants hold for encrypted events.
+
+## 15.7 Phase `4` implementation checklist (durable queues/workers)
+
+Must implement:
+1. queue tables (`ingress`, `project`, `egress`) with transactional boundaries.
+2. shared queue helper functions for claim/lease/retry.
+3. egress creation from reconciliation and request-list producers.
+4. queue cleanup + TTL maintenance jobs.
+
+Common mistakes:
+- using one generic jobs table for all queues.
+- mixing canonical durable rows and operational queue rows in one table.
+
+Definition of done:
+- crash/restart recovers and completes pending work,
+- retries/backoff and lease recovery are observable and deterministic.
+
+## 15.8 Phase `5` implementation checklist (special projectors)
+
+Must implement:
+1. explicit deletion/tombstone/cascade projector.
+2. explicit deterministic emitted-event handling.
+
+Common mistakes:
+- forcing deletion into generic auto-write logic.
+
+Definition of done:
+- deletion-before-target and target-before-deletion converge identically.
+
+## 15.9 Phase `6` implementation checklist (hardening)
+
+Must implement:
+1. batch/index tuning driven by measurements.
+2. queue health metrics (`age`, `attempts`, blocked counts).
+3. endpoint observation TTL purging.
+
+Common mistakes:
+- premature micro-optimizations before invariant/test stability.
+
+Definition of done:
+- long-running sync remains stable and bounded in memory/storage.
+
+## 15.10 Phase `7` implementation checklist (TLA-first identity)
+
+Must implement:
+1. TLA model updated first for split invites and trust-anchor guards.
+2. projector predicate mapping table from TLA guards.
+3. split invite events (`user_invite`, `device_invite`) with shared helper core.
+4. sender-subjective O(n) key wrapping baseline (no key history yet).
+5. removal excludes removed peers from subsequent wraps.
+
+Common mistakes:
+- implementing projector rules before guard/model freeze.
+- re-introducing multimodal invite event (`mode=*`).
+
+Definition of done:
+- TLA invariants pass for bootstrap, join, device-link, and removal flows,
+- Rust behavior matches TLA guard mapping in tests.
+
+## 15.11 PR slicing guidance (to reduce assistant mistakes)
+
+Recommended PR sequence:
+1. transport mTLS hardening only.
+2. wire framing + schema registry scaffolding.
+3. projector entrypoint + dependency resolver + blocked deps.
+4. create_sync API contract and tests.
+5. encrypted adapter + PSK tests.
+6. queue/worker architecture and shared queue helper extraction.
+7. deletion special-case projector.
+8. TLA model update + identity phase implementation.
+
+Rule:
+- each PR must include at least one failing test made to pass by that PR.
