@@ -9,6 +9,8 @@ use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tracing::warn;
 
 /// Set of allowed peer fingerprints (BLAKE2b-256 of SPKI).
 #[derive(Debug, Clone)]
@@ -45,10 +47,12 @@ impl AllowedPeers {
 /// Verifies peer certificates by checking SPKI fingerprint against an allowed set.
 /// Implements both ServerCertVerifier (client verifies server) and
 /// ClientCertVerifier (server verifies client).
+/// Tracks rejection counts for observability.
 #[derive(Debug)]
 pub struct PinnedCertVerifier {
     allowed: Arc<AllowedPeers>,
     crypto_provider: Arc<rustls::crypto::CryptoProvider>,
+    rejections: AtomicU64,
 }
 
 impl PinnedCertVerifier {
@@ -56,7 +60,13 @@ impl PinnedCertVerifier {
         Self {
             allowed,
             crypto_provider: Arc::new(rustls::crypto::ring::default_provider()),
+            rejections: AtomicU64::new(0),
         }
+    }
+
+    /// Number of certificate rejections since creation.
+    pub fn rejection_count(&self) -> u64 {
+        self.rejections.load(Ordering::Relaxed)
     }
 
     fn check_fingerprint(&self, cert_der: &CertificateDer<'_>) -> Result<(), rustls::Error> {
@@ -65,6 +75,12 @@ impl PinnedCertVerifier {
         if self.allowed.contains(&fp) {
             Ok(())
         } else {
+            let count = self.rejections.fetch_add(1, Ordering::Relaxed) + 1;
+            warn!(
+                fingerprint = %hex::encode(fp),
+                total_rejections = count,
+                "rejected peer certificate: fingerprint not in allowed set"
+            );
             Err(rustls::Error::General(format!(
                 "peer fingerprint {} not in allowed set",
                 hex::encode(fp)

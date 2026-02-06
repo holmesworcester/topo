@@ -1,10 +1,9 @@
-// TODO: Shutdown race — when one side finishes sending, it closes the stream
-// before the peer has drained its receive buffer, causing ~0.1% data loss at
-// 500k scale. Fix: add a shutdown handshake (initiator sends Done on control,
-// responder drains queues and sends DoneAck, initiator then closes).
-//
 // Peer authentication: peer_id is the hex-encoded SPKI fingerprint from
 // the peer's TLS certificate, verified via PinnedCertVerifier during handshake.
+//
+// Shutdown: initiator sends Done on control after flushing outgoing data,
+// responder drains its own queue and replies DoneAck. Both sides close
+// only after the handshake completes, preventing data loss.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -264,6 +263,7 @@ where
     const NEED_CHUNK: usize = 1000;
 
     let mut completed = false;
+    let mut done_sent = false;
     let sync_start = Instant::now();
 
     loop {
@@ -327,6 +327,11 @@ where
                     );
                 }
             }
+            Ok(Ok(SyncMessage::DoneAck)) => {
+                info!("Received DoneAck from responder");
+                completed = true;
+                break;
+            }
             Ok(Ok(_)) => {}
             Ok(Err(ConnectionError::Closed)) => {
                 info!("Control stream closed by peer");
@@ -372,15 +377,16 @@ where
             let _ = data_send.flush().await;
         }
 
-        let received = events_received.load(Ordering::Relaxed);
-        let _ = received; // suppress unused warning
-        if reconciliation_done {
+        // Once reconciliation is done and outgoing queue is drained, send Done
+        if reconciliation_done && !done_sent {
             let pending_out = outgoing.count_pending(peer_id).unwrap_or(0);
-            let pending_in = wanted.count().unwrap_or(0);
-            if pending_out == 0 && pending_in == 0 {
-                info!("Sync complete: sent {}, received {}", events_sent, events_received.load(Ordering::Relaxed));
-                completed = true;
-                break;
+            if pending_out == 0 {
+                let _ = data_send.flush().await;
+                control.send(&SyncMessage::Done).await?;
+                control.flush().await?;
+                done_sent = true;
+                info!("Sent Done, waiting for DoneAck (sent {}, received {})",
+                    events_sent, events_received.load(Ordering::Relaxed));
             }
         }
     }
@@ -463,10 +469,8 @@ where
 
     let mut events_sent: u64 = 0;
     let mut bytes_sent: u64 = 0;
-    let mut reconciliation_done = false;
     let mut rounds = 0;
-    let mut idle_count = 0;
-    const MAX_IDLE: u32 = 100;
+    let mut peer_done = false;
     let mut completed = false;
     let sync_start = Instant::now();
 
@@ -476,23 +480,13 @@ where
             break;
         }
 
-        if reconciliation_done {
-            let pending_out = outgoing.count_pending(peer_id).unwrap_or(0);
-            if pending_out == 0 && idle_count >= MAX_IDLE {
-                completed = true;
-                break;
-            }
-        }
-
         match tokio::time::timeout(Duration::from_millis(1), control.recv()).await {
             Ok(Ok(SyncMessage::NegOpen { msg })) | Ok(Ok(SyncMessage::NegMsg { msg })) => {
-                idle_count = 0;
                 rounds += 1;
 
                 let response = neg.reconcile(&msg)?;
                 if response.is_empty() {
                     info!("Reconciliation complete in {} rounds", rounds);
-                    reconciliation_done = true;
                 } else {
                     control.send(&SyncMessage::NegMsg { msg: response }).await?;
                     control.flush().await?;
@@ -502,10 +496,12 @@ where
                 if ids.is_empty() {
                     continue;
                 }
-                idle_count = 0;
-                reconciliation_done = true;
 
                 let _ = outgoing.enqueue_batch(peer_id, &ids);
+            }
+            Ok(Ok(SyncMessage::Done)) => {
+                info!("Received Done from initiator");
+                peer_done = true;
             }
             Ok(Ok(_)) => {}
             Ok(Err(ConnectionError::Closed)) => {
@@ -549,9 +545,20 @@ where
 
         if sent_this_round > 0 {
             let _ = data_send.flush().await;
-            idle_count = 0;
-        } else if reconciliation_done {
-            idle_count += 1;
+        }
+
+        // After peer signalled Done and our outgoing queue is drained, send DoneAck
+        if peer_done {
+            let pending_out = outgoing.count_pending(peer_id).unwrap_or(0);
+            if pending_out == 0 {
+                let _ = data_send.flush().await;
+                control.send(&SyncMessage::DoneAck).await?;
+                control.flush().await?;
+                info!("Sent DoneAck (sent {}, received {})",
+                    events_sent, events_received.load(Ordering::Relaxed));
+                completed = true;
+                break;
+            }
         }
     }
 

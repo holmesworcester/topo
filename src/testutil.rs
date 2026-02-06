@@ -198,6 +198,17 @@ impl Peer {
         ).unwrap_or(0)
     }
 
+    /// Return sorted set of all store IDs (base64-encoded).
+    pub fn store_ids(&self) -> std::collections::BTreeSet<String> {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        let mut stmt = db.prepare("SELECT id FROM store ORDER BY id").expect("prepare");
+        let ids = stmt.query_map([], |row| row.get::<_, String>(0))
+            .expect("query")
+            .collect::<Result<std::collections::BTreeSet<_>, _>>()
+            .expect("collect");
+        ids
+    }
+
     /// Count messages scoped to this peer's recorded_by identity.
     pub fn scoped_message_count(&self) -> i64 {
         let db = open_connection(&self.db_path).expect("failed to open db");

@@ -284,3 +284,33 @@ fn test_cli_unpinned_peer_rejected() {
     let _ = alice.wait();
     let _ = bob.wait();
 }
+
+#[test]
+fn test_cli_empty_pin_peer_fails() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = tmpdir.path().join("empty_pin.db").to_str().unwrap().to_string();
+    let port = random_port();
+
+    // Start sync with no --pin-peer flags — should fail immediately
+    let output = Command::new(bin())
+        .arg("sync")
+        .arg("--bind")
+        .arg(format!("127.0.0.1:{}", port))
+        .arg("--db")
+        .arg(&db)
+        .output()
+        .expect("failed to run sync");
+
+    assert!(
+        !output.status.success(),
+        "sync with empty pin set should fail, but exited with {:?}",
+        output.status.code()
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--pin-peer") || stderr.contains("pin-peer"),
+        "error should mention --pin-peer, got: {}",
+        stderr
+    );
+}

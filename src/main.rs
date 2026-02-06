@@ -584,6 +584,11 @@ async fn run_sync(
     db_path: &str,
     pin_peers: &[String],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if pin_peers.is_empty() {
+        return Err("--pin-peer is required: at least one peer fingerprint must be specified. \
+            Use `poc-7 identity --db <peer-db>` to get a peer's fingerprint.".into());
+    }
+
     // Initialize DB before spawning concurrent loops (avoids create_tables race)
     {
         let db = open_connection(db_path)?;

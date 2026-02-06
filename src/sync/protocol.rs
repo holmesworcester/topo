@@ -1,5 +1,5 @@
 use crate::wire::ENVELOPE_SIZE;
-use super::{MSG_TYPE_NEG_OPEN, MSG_TYPE_NEG_MSG, MSG_TYPE_HAVE_LIST, MSG_TYPE_EVENT, EVENT_SIZE};
+use super::{MSG_TYPE_NEG_OPEN, MSG_TYPE_NEG_MSG, MSG_TYPE_HAVE_LIST, MSG_TYPE_EVENT, MSG_TYPE_DONE, MSG_TYPE_DONE_ACK, EVENT_SIZE};
 
 /// Sync protocol messages
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12,6 +12,10 @@ pub enum SyncMessage {
     HaveList { ids: Vec<[u8; 32]> },
     /// Send full event blob
     Event { blob: Vec<u8> },
+    /// Initiator signals all outgoing events have been sent
+    Done,
+    /// Responder acknowledges Done after draining its own queues
+    DoneAck,
 }
 
 
@@ -68,6 +72,8 @@ pub fn parse_sync_message(input: &[u8]) -> Result<(SyncMessage, usize), ParseErr
             let blob = input[1..1 + ENVELOPE_SIZE].to_vec();
             Ok((SyncMessage::Event { blob }, EVENT_SIZE))
         }
+        MSG_TYPE_DONE => Ok((SyncMessage::Done, 1)),
+        MSG_TYPE_DONE_ACK => Ok((SyncMessage::DoneAck, 1)),
         _ => Err(ParseError::UnknownType(msg_type)),
     }
 }
@@ -104,6 +110,8 @@ pub fn encode_sync_message(msg: &SyncMessage) -> Vec<u8> {
             buf.extend_from_slice(blob);
             buf
         }
+        SyncMessage::Done => vec![MSG_TYPE_DONE],
+        SyncMessage::DoneAck => vec![MSG_TYPE_DONE_ACK],
     }
 }
 
@@ -172,6 +180,26 @@ mod tests {
     fn test_parse_unknown_type() {
         let result = parse_sync_message(&[0xFF, 0, 0, 0, 0]);
         assert_eq!(result, Err(ParseError::UnknownType(0xFF)));
+    }
+
+    #[test]
+    fn test_done_roundtrip() {
+        let msg = SyncMessage::Done;
+        let encoded = encode_sync_message(&msg);
+        assert_eq!(encoded.len(), 1);
+        let (parsed, consumed) = parse_sync_message(&encoded).unwrap();
+        assert_eq!(consumed, 1);
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn test_done_ack_roundtrip() {
+        let msg = SyncMessage::DoneAck;
+        let encoded = encode_sync_message(&msg);
+        assert_eq!(encoded.len(), 1);
+        let (parsed, consumed) = parse_sync_message(&encoded).unwrap();
+        assert_eq!(consumed, 1);
+        assert_eq!(parsed, msg);
     }
 
     #[test]
