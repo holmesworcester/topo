@@ -45,13 +45,27 @@ pub fn create_tables(conn: &Connection) -> SqliteResult<()> {
 
         -- Message projection table
         CREATE TABLE IF NOT EXISTS messages (
-            message_id TEXT PRIMARY KEY,
+            message_id TEXT NOT NULL,
             channel_id TEXT NOT NULL,
             author_id TEXT NOT NULL,
             content TEXT NOT NULL,
-            created_at INTEGER NOT NULL
+            created_at INTEGER NOT NULL,
+            recorded_by TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (recorded_by, message_id)
         );
         CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_messages_recorded ON messages(recorded_by, created_at DESC);
+
+        -- Per-tenant receive/create journal
+        CREATE TABLE IF NOT EXISTS recorded_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            peer_id TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            recorded_at INTEGER NOT NULL,
+            source TEXT NOT NULL,
+            UNIQUE(peer_id, event_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_recorded_peer_order ON recorded_events(peer_id, id);
 
         -- Negentropy items: sorted by (ts, id) for range-based reconciliation
         CREATE TABLE IF NOT EXISTS neg_items (
@@ -106,6 +120,7 @@ mod tests {
         assert!(tables.contains(&"neg_items".to_string()));
         assert!(tables.contains(&"neg_blocks".to_string()));
         assert!(tables.contains(&"neg_meta".to_string()));
+        assert!(tables.contains(&"recorded_events".to_string()));
     }
 
     #[test]

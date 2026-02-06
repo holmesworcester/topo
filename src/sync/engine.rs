@@ -29,11 +29,23 @@ use crate::transport::{
 use crate::transport::connection::ConnectionError;
 use crate::wire::Envelope;
 
+fn low_mem_mode() -> bool {
+    read_bool_env("LOW_MEM_IOS") || read_bool_env("LOW_MEM")
+}
+
+fn read_bool_env(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(v) => v != "0" && v.to_lowercase() != "false",
+        Err(_) => false,
+    }
+}
+
 /// Batch writer task - drains channel and writes to SQLite in batches.
 /// Naive projection: receive batches -> BEGIN -> store.put + shareable.insert
 /// + wanted.remove + neg_items + messages -> COMMIT.
 pub fn batch_writer(
     db_path: String,
+    recorded_by: String,
     mut rx: mpsc::Receiver<(EventId, Vec<u8>)>,
     events_received: Arc<AtomicU64>,
 ) {
@@ -50,8 +62,8 @@ pub fn batch_writer(
     let wanted = WantedEvents::new(&db);
 
     let mut project_stmt = match db.prepare(
-        "INSERT OR IGNORE INTO messages (message_id, channel_id, author_id, content, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)"
+        "INSERT OR IGNORE INTO messages (message_id, channel_id, author_id, content, created_at, recorded_by)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
     ) {
         Ok(stmt) => stmt,
         Err(e) => {
@@ -66,6 +78,17 @@ pub fn batch_writer(
         Ok(stmt) => stmt,
         Err(e) => {
             error!("Failed to prepare neg_items statement: {}", e);
+            return;
+        }
+    };
+
+    let mut recorded_stmt = match db.prepare(
+        "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
+         VALUES (?1, ?2, ?3, ?4)"
+    ) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            error!("Failed to prepare recorded_events statement: {}", e);
             return;
         }
     };
@@ -106,7 +129,15 @@ pub fn batch_writer(
                         channel_id,
                         author_id,
                         &envelope.payload.content,
-                        created_at_ms as i64
+                        created_at_ms as i64,
+                        &recorded_by
+                    ]);
+
+                    let _ = recorded_stmt.execute(rusqlite::params![
+                        &recorded_by,
+                        &message_id,
+                        created_at_ms as i64,
+                        "quic_recv"
                     ]);
                 }
             }
@@ -168,6 +199,7 @@ pub async fn run_sync_initiator_dual<C, S, R>(
     db_path: &str,
     timeout_secs: u64,
     peer_id: &str,
+    recorded_by: &str,
 ) -> Result<SyncStats, Box<dyn std::error::Error + Send + Sync>>
 where
     C: StreamConn,
@@ -204,15 +236,16 @@ where
 
     let store = Store::new(&db);
 
-    let ingest_cap = if std::env::var("LOW_MEM").is_ok() { 1000 } else { 5000 };
+    let ingest_cap = if low_mem_mode() { 1000 } else { 5000 };
     let (ingest_tx, ingest_rx) = mpsc::channel::<(EventId, Vec<u8>)>(ingest_cap);
     let events_received = Arc::new(AtomicU64::new(0));
     let events_received_writer = events_received.clone();
     let bytes_received = Arc::new(AtomicU64::new(0));
 
     let db_path_owned = db_path.to_string();
+    let recorded_by_owned = recorded_by.to_string();
     let writer_handle =
-        tokio::task::spawn_blocking(move || batch_writer(db_path_owned, ingest_rx, events_received_writer));
+        tokio::task::spawn_blocking(move || batch_writer(db_path_owned, recorded_by_owned, ingest_rx, events_received_writer));
 
     let mut have_ids: Vec<Id> = Vec::new();
     let mut need_ids: Vec<Id> = Vec::new();
@@ -379,6 +412,7 @@ pub async fn run_sync_responder_dual<C, S, R>(
     db_path: &str,
     timeout_secs: u64,
     peer_id: &str,
+    recorded_by: &str,
 ) -> Result<SyncStats, Box<dyn std::error::Error + Send + Sync>>
 where
     C: StreamConn,
@@ -413,15 +447,16 @@ where
 
     let store = Store::new(&db);
 
-    let ingest_cap = if std::env::var("LOW_MEM").is_ok() { 1000 } else { 5000 };
+    let ingest_cap = if low_mem_mode() { 1000 } else { 5000 };
     let (ingest_tx, ingest_rx) = mpsc::channel::<(EventId, Vec<u8>)>(ingest_cap);
     let events_received = Arc::new(AtomicU64::new(0));
     let events_received_writer = events_received.clone();
     let bytes_received = Arc::new(AtomicU64::new(0));
 
     let db_path_owned = db_path.to_string();
+    let recorded_by_owned = recorded_by.to_string();
     let writer_handle =
-        tokio::task::spawn_blocking(move || batch_writer(db_path_owned, ingest_rx, events_received_writer));
+        tokio::task::spawn_blocking(move || batch_writer(db_path_owned, recorded_by_owned, ingest_rx, events_received_writer));
 
     let (shutdown_tx, recv_handle) =
         spawn_data_receiver(data_recv, ingest_tx, bytes_received.clone());
@@ -546,6 +581,7 @@ where
 /// sync sessions on the same connection.
 pub async fn accept_loop(
     db_path: &str,
+    recorded_by: &str,
     endpoint: quinn::Endpoint,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     {
@@ -596,7 +632,7 @@ pub async fn accept_loop(
             };
             let conn = DualConnection::new(ctrl_send, ctrl_recv, data_send, data_recv);
 
-            if let Err(e) = run_sync_responder_dual(conn, db_path, 60, &peer_id).await {
+            if let Err(e) = run_sync_responder_dual(conn, db_path, 60, &peer_id, recorded_by).await {
                 warn!("Responder session error: {}", e);
             }
 
@@ -611,6 +647,7 @@ pub async fn accept_loop(
 /// sync sessions on the same connection.
 pub async fn connect_loop(
     db_path: &str,
+    recorded_by: &str,
     endpoint: quinn::Endpoint,
     remote: SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -670,7 +707,7 @@ pub async fn connect_loop(
             conn.flush_control().await?;
             conn.flush_data().await?;
 
-            if let Err(e) = run_sync_initiator_dual(conn, db_path, 60, &peer_id).await {
+            if let Err(e) = run_sync_initiator_dual(conn, db_path, 60, &peer_id, recorded_by).await {
                 warn!("Initiator session error: {}", e);
             }
 

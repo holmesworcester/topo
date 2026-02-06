@@ -111,6 +111,50 @@ async fn test_sync_10k() {
 }
 
 #[tokio::test]
+async fn test_recorded_events_isolation() {
+    let channel = test_channel();
+    let alice = Peer::new("alice", channel);
+    let bob = Peer::new("bob", channel);
+
+    // Create messages locally
+    alice.batch_create_messages(3);
+    bob.batch_create_messages(2);
+
+    // Verify local recorded_events before sync
+    assert_eq!(alice.recorded_events_count(), 3);
+    assert_eq!(bob.recorded_events_count(), 2);
+    assert_eq!(alice.scoped_message_count(), 3);
+    assert_eq!(bob.scoped_message_count(), 2);
+
+    // Sync
+    let sync = start_peers(&alice, &bob);
+
+    assert_eventually(
+        || alice.store_count() == 5 && bob.store_count() == 5,
+        Duration::from_secs(15),
+        "both peers should have 5 events",
+    ).await;
+
+    drop(sync);
+
+    // After sync: store has all events, messages has all events
+    assert_eq!(alice.store_count(), 5);
+    assert_eq!(bob.store_count(), 5);
+    assert_eq!(alice.message_count(), 5);
+    assert_eq!(bob.message_count(), 5);
+
+    // recorded_events: local creates + received via sync
+    // Alice created 3 locally, received 2 via sync = 5
+    // Bob created 2 locally, received 3 via sync = 5
+    assert_eq!(alice.recorded_events_count(), 5);
+    assert_eq!(bob.recorded_events_count(), 5);
+
+    // scoped_message_count matches total (all recorded by this peer)
+    assert_eq!(alice.scoped_message_count(), 5);
+    assert_eq!(bob.scoped_message_count(), 5);
+}
+
+#[tokio::test]
 async fn test_sync_50k() {
     let channel = test_channel();
     let alice = Peer::new("alice", channel);

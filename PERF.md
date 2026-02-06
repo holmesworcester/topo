@@ -66,12 +66,12 @@ in 100-event batches while sync is running.
 ## Environment Variables
 
 ```bash
-LOW_MEM=1  # Reduce SQLite cache, smaller channels (target ~24 MiB RSS)
+LOW_MEM_IOS=1  # iOS NSE low-memory mode (target <=24 MiB RSS)
 ```
 
 ## 24 MiB Target (iOS NSE) — Memory Control Levers
 
-`LOW_MEM=1` enables:
+`LOW_MEM_IOS=1` enables:
 - SQLite cache ~1 MiB per connection
 - `temp_store=FILE`, `mmap_size=0`
 - Smaller WAL/journal limits

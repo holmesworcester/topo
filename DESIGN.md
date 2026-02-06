@@ -460,7 +460,9 @@ Operational queue rows are excluded from end-state equality fingerprints.
 1. use SQLite WAL mode and prepared statements,
 2. batch worker operations with measured sizing,
 3. keep queue purge policies explicit and predictable,
-4. monitor blocked counts, queue age, retries, lease churn.
+4. monitor blocked counts, queue age, retries, lease churn,
+5. provide `low_mem_ios` mode targeting `<= 24 MiB` steady-state RSS (iOS NSE),
+6. in `low_mem_ios`, enforce strict in-flight bounds and prefer reduced throughput over memory spikes.
 
 Initial event-size policy:
 

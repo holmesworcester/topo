@@ -3,13 +3,14 @@ use std::time::{Duration, Instant};
 
 use crate::crypto::{hash_event, event_id_to_base64, EventId};
 use crate::db::{open_connection, schema::create_tables, shareable::Shareable, store::Store};
+use crate::identity::{cert_paths_from_db, local_identity_from_db};
 use crate::sync::engine::{accept_loop, connect_loop};
 use crate::transport::{
     AllowedPeers,
     create_client_endpoint,
     create_server_endpoint,
     extract_spki_fingerprint,
-    generate_self_signed_cert,
+    load_or_generate_cert,
 };
 use crate::wire::Envelope;
 
@@ -45,6 +46,7 @@ impl std::fmt::Display for SyncMetrics {
 pub struct Peer {
     pub name: String,
     pub db_path: String,
+    pub identity: String,
     pub author_id: [u8; 32],
     pub channel_id: [u8; 32],
     _tempdir: tempfile::TempDir,
@@ -60,11 +62,13 @@ impl Peer {
         let db = open_connection(&db_path).expect("failed to open db");
         create_tables(&db).expect("failed to create tables");
 
+        let identity = local_identity_from_db(&db_path).expect("failed to compute identity");
         let author_id: [u8; 32] = rand::random();
 
         Self {
             name: name.to_string(),
             db_path,
+            identity,
             author_id,
             channel_id,
             _tempdir: tempdir,
@@ -102,10 +106,17 @@ impl Peer {
         let channel_id_b64 = event_id_to_base64(&self.channel_id);
         let author_id_b64 = event_id_to_base64(&self.author_id);
         db.execute(
-            "INSERT OR IGNORE INTO messages (message_id, channel_id, author_id, content, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![message_id, channel_id_b64, author_id_b64, content, created_at_ms as i64],
+            "INSERT OR IGNORE INTO messages (message_id, channel_id, author_id, content, created_at, recorded_by)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![message_id, channel_id_b64, author_id_b64, content, created_at_ms as i64, &self.identity],
         ).expect("failed to insert message");
+
+        // Insert into recorded_events
+        db.execute(
+            "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![&self.identity, &message_id, created_at_ms as i64, "local_create"],
+        ).expect("failed to insert recorded_event");
 
         event_id
     }
@@ -120,9 +131,13 @@ impl Peer {
             "INSERT OR IGNORE INTO neg_items (ts, id) VALUES (?1, ?2)"
         ).expect("failed to prepare neg_items stmt");
         let mut msg_stmt = db.prepare(
-            "INSERT OR IGNORE INTO messages (message_id, channel_id, author_id, content, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)"
+            "INSERT OR IGNORE INTO messages (message_id, channel_id, author_id, content, created_at, recorded_by)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
         ).expect("failed to prepare messages stmt");
+        let mut rec_stmt = db.prepare(
+            "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
+             VALUES (?1, ?2, ?3, ?4)"
+        ).expect("failed to prepare recorded_events stmt");
 
         db.execute("BEGIN", []).expect("failed to begin");
         for i in 0..count {
@@ -149,8 +164,12 @@ impl Peer {
             let channel_id_b64 = event_id_to_base64(&self.channel_id);
             let author_id_b64 = event_id_to_base64(&self.author_id);
             msg_stmt.execute(rusqlite::params![
-                message_id, channel_id_b64, author_id_b64, content, created_at_ms as i64
+                message_id, channel_id_b64, author_id_b64, content, created_at_ms as i64, &self.identity
             ]).expect("messages insert");
+
+            rec_stmt.execute(rusqlite::params![
+                &self.identity, &message_id, created_at_ms as i64, "local_create"
+            ]).expect("recorded_events insert");
         }
         db.execute("COMMIT", []).expect("failed to commit");
     }
@@ -162,15 +181,38 @@ impl Peer {
             .unwrap_or(0)
     }
 
-    /// Count rows in the messages projection table.
+    /// Count rows in the messages projection table (all, unscoped).
     pub fn message_count(&self) -> i64 {
         let db = open_connection(&self.db_path).expect("failed to open db");
         db.query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
             .unwrap_or(0)
     }
+
+    /// Count rows in recorded_events scoped to this peer's identity.
+    pub fn recorded_events_count(&self) -> i64 {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        db.query_row(
+            "SELECT COUNT(*) FROM recorded_events WHERE peer_id = ?1",
+            rusqlite::params![&self.identity],
+            |row| row.get(0),
+        ).unwrap_or(0)
+    }
+
+    /// Count messages scoped to this peer's recorded_by identity.
+    pub fn scoped_message_count(&self) -> i64 {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        db.query_row(
+            "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
+            rusqlite::params![&self.identity],
+            |row| row.get(0),
+        ).unwrap_or(0)
+    }
 }
 
 /// Start continuous sync between two peers with mutual mTLS pinning.
+///
+/// Uses each peer's persisted cert (from cert_paths_from_db) so that
+/// the transport identity matches the recording identity.
 ///
 /// Spawns two threads — one running accept_loop (peer A listens),
 /// one running connect_loop (peer B connects). Each thread has its own
@@ -181,9 +223,13 @@ pub fn start_peers(
     peer_a: &Peer,
     peer_b: &Peer,
 ) -> (std::thread::JoinHandle<()>, std::thread::JoinHandle<()>) {
-    // Generate a cert for each peer
-    let (cert_a, key_a) = generate_self_signed_cert().expect("failed to generate cert for peer A");
-    let (cert_b, key_b) = generate_self_signed_cert().expect("failed to generate cert for peer B");
+    // Load certs from each peer's DB-derived path (persisted, not ephemeral)
+    let (cert_path_a, key_path_a) = cert_paths_from_db(&peer_a.db_path);
+    let (cert_a, key_a) = load_or_generate_cert(&cert_path_a, &key_path_a)
+        .expect("failed to load cert for peer A");
+    let (cert_path_b, key_path_b) = cert_paths_from_db(&peer_b.db_path);
+    let (cert_b, key_b) = load_or_generate_cert(&cert_path_b, &key_path_b)
+        .expect("failed to load cert for peer B");
 
     // Extract fingerprints
     let fp_a = extract_spki_fingerprint(cert_a.as_ref()).expect("failed to extract fp for A");
@@ -210,7 +256,9 @@ pub fn start_peers(
     ).expect("failed to create client endpoint");
 
     let a_db = peer_a.db_path.clone();
+    let a_identity = peer_a.identity.clone();
     let b_db = peer_b.db_path.clone();
+    let b_identity = peer_b.identity.clone();
 
     let a_handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -218,7 +266,7 @@ pub fn start_peers(
             .build()
             .unwrap();
         rt.block_on(async move {
-            if let Err(e) = accept_loop(&a_db, listener_endpoint).await {
+            if let Err(e) = accept_loop(&a_db, &a_identity, listener_endpoint).await {
                 tracing::warn!("accept_loop exited: {}", e);
             }
         });
@@ -230,7 +278,7 @@ pub fn start_peers(
             .build()
             .unwrap();
         rt.block_on(async move {
-            if let Err(e) = connect_loop(&b_db, connector_endpoint, listener_addr).await {
+            if let Err(e) = connect_loop(&b_db, &b_identity, connector_endpoint, listener_addr).await {
                 tracing::warn!("connect_loop exited: {}", e);
             }
         });

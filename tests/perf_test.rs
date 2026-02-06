@@ -123,16 +123,18 @@ async fn perf_continuous_10k() {
     let alice_db = alice.db_path.clone();
     let alice_author = alice.author_id;
     let alice_channel = alice.channel_id;
+    let alice_identity = alice.identity.clone();
     let bob_db = bob.db_path.clone();
     let bob_author = bob.author_id;
     let bob_channel = bob.channel_id;
+    let bob_identity = bob.identity.clone();
 
     let alice_writer = std::thread::spawn(move || {
-        inject_messages_batched(&alice_db, alice_channel, alice_author, "alice", 5_000, 100);
+        inject_messages_batched(&alice_db, alice_channel, alice_author, "alice", 5_000, 100, &alice_identity);
     });
 
     let bob_writer = std::thread::spawn(move || {
-        inject_messages_batched(&bob_db, bob_channel, bob_author, "bob", 5_000, 100);
+        inject_messages_batched(&bob_db, bob_channel, bob_author, "bob", 5_000, 100, &bob_identity);
     });
 
     alice_writer.join().expect("alice writer panicked");
@@ -186,6 +188,7 @@ fn inject_messages_batched(
     name: &str,
     total: usize,
     batch_size: usize,
+    recorded_by: &str,
 ) {
     use poc_7::crypto::{hash_event, event_id_to_base64};
     use poc_7::db::{open_connection, shareable::Shareable, store::Store};
@@ -199,9 +202,13 @@ fn inject_messages_batched(
         "INSERT OR IGNORE INTO neg_items (ts, id) VALUES (?1, ?2)"
     ).expect("failed to prepare neg_items stmt");
     let mut msg_stmt = db.prepare(
-        "INSERT OR IGNORE INTO messages (message_id, channel_id, author_id, content, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)"
+        "INSERT OR IGNORE INTO messages (message_id, channel_id, author_id, content, created_at, recorded_by)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
     ).expect("failed to prepare messages stmt");
+    let mut rec_stmt = db.prepare(
+        "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
+         VALUES (?1, ?2, ?3, ?4)"
+    ).expect("failed to prepare recorded_events stmt");
 
     let mut i = 0;
     while i < total {
@@ -226,8 +233,12 @@ fn inject_messages_batched(
             let channel_id_b64 = event_id_to_base64(&channel_id);
             let author_id_b64 = event_id_to_base64(&author_id);
             msg_stmt.execute(rusqlite::params![
-                message_id, channel_id_b64, author_id_b64, content, created_at_ms as i64
+                message_id, channel_id_b64, author_id_b64, content, created_at_ms as i64, recorded_by
             ]).expect("messages insert");
+
+            rec_stmt.execute(rusqlite::params![
+                recorded_by, &message_id, created_at_ms as i64, "local_create"
+            ]).expect("recorded_events insert");
         }
         db.execute("COMMIT", []).expect("failed to commit");
         i = end;

@@ -239,6 +239,7 @@ fn test_cli_send_and_messages() {
 
     assert_now(&db, "store_count == 2");
     assert_now(&db, "message_count == 2");
+    assert_now(&db, "recorded_events_count == 2");
 
     let messages = get_messages(&db);
     assert_eq!(messages.len(), 2);

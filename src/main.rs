@@ -1,6 +1,5 @@
 use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{info, Level};
@@ -8,6 +7,7 @@ use tracing_subscriber::FmtSubscriber;
 
 use poc_7::crypto::{hash_event, event_id_to_base64};
 use poc_7::db::{open_connection, schema::create_tables, shareable::Shareable, store::Store};
+use poc_7::identity::{cert_paths_from_db, local_identity_from_db};
 use poc_7::sync::engine::{accept_loop, connect_loop};
 use poc_7::transport::{
     AllowedPeers,
@@ -159,16 +159,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 // Identity
 // ---------------------------------------------------------------------------
 
-/// Derive cert/key file paths from a DB path (e.g. "alice.db" -> "alice.cert.der", "alice.key.der")
-fn cert_paths_from_db(db_path: &str) -> (std::path::PathBuf, std::path::PathBuf) {
-    let base = Path::new(db_path);
-    let stem = base.file_stem().unwrap_or_default().to_str().unwrap_or("peer");
-    let dir = base.parent().unwrap_or_else(|| Path::new("."));
-    let cert_path = dir.join(format!("{}.cert.der", stem));
-    let key_path = dir.join(format!("{}.key.der", stem));
-    (cert_path, key_path)
-}
-
 fn run_identity(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (cert_path, key_path) = cert_paths_from_db(db_path);
     let (cert_der, _) = load_or_generate_cert(&cert_path, &key_path)?;
@@ -255,6 +245,7 @@ fn days_to_ymd(days: i64) -> (i64, u32, u32) {
 }
 
 fn show_messages(db_path: &str, limit: usize) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let recorded_by = local_identity_from_db(db_path)?;
     let db = open_connection(db_path)?;
     create_tables(&db)?;
 
@@ -266,12 +257,12 @@ fn show_messages(db_path: &str, limit: usize) -> Result<(), Box<dyn std::error::
 
     let query = format!(
         "SELECT message_id, author_id, content, created_at
-         FROM messages ORDER BY created_at ASC {}",
+         FROM messages WHERE recorded_by = ?1 ORDER BY created_at ASC {}",
         limit_clause
     );
 
     let mut stmt = db.prepare(&query)?;
-    let rows: Vec<(String, String, String, i64)> = stmt.query_map([], |row| {
+    let rows: Vec<(String, String, String, i64)> = stmt.query_map(rusqlite::params![&recorded_by], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
@@ -280,7 +271,11 @@ fn show_messages(db_path: &str, limit: usize) -> Result<(), Box<dyn std::error::
         ))
     })?.collect::<Result<Vec<_>, _>>()?;
 
-    let total: i64 = db.query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))?;
+    let total: i64 = db.query_row(
+        "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
+        rusqlite::params![&recorded_by],
+        |row| row.get(0),
+    )?;
 
     if rows.is_empty() {
         println!("MESSAGES ({}):", db_path);
@@ -323,6 +318,7 @@ fn parse_channel_hex(channel_hex: &str) -> Result<[u8; 32], Box<dyn std::error::
 }
 
 fn send_message(db_path: &str, channel_hex: &str, content: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let recorded_by = local_identity_from_db(db_path)?;
     let db = open_connection(db_path)?;
     create_tables(&db)?;
 
@@ -349,9 +345,15 @@ fn send_message(db_path: &str, channel_hex: &str, content: &str) -> Result<(), B
     let channel_id_b64 = event_id_to_base64(&channel_id);
     let author_id_b64 = event_id_to_base64(&author_id);
     db.execute(
-        "INSERT OR IGNORE INTO messages (message_id, channel_id, author_id, content, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        rusqlite::params![message_id, channel_id_b64, author_id_b64, content, created_at_ms as i64],
+        "INSERT OR IGNORE INTO messages (message_id, channel_id, author_id, content, created_at, recorded_by)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![message_id, channel_id_b64, author_id_b64, content, created_at_ms as i64, &recorded_by],
+    )?;
+
+    db.execute(
+        "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
+         VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![&recorded_by, &message_id, created_at_ms as i64, "local_create"],
     )?;
 
     println!("Sent: {}", content);
@@ -360,17 +362,28 @@ fn send_message(db_path: &str, channel_hex: &str, content: &str) -> Result<(), B
 }
 
 fn show_status(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let recorded_by = local_identity_from_db(db_path)?;
     let db = open_connection(db_path)?;
     create_tables(&db)?;
 
     let store_count: i64 = db.query_row("SELECT COUNT(*) FROM store", [], |row| row.get(0)).unwrap_or(0);
-    let messages_count: i64 = db.query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0)).unwrap_or(0);
+    let messages_count: i64 = db.query_row(
+        "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
+        rusqlite::params![&recorded_by],
+        |row| row.get(0),
+    ).unwrap_or(0);
     let neg_items_count: i64 = db.query_row("SELECT COUNT(*) FROM neg_items", [], |row| row.get(0)).unwrap_or(0);
     let shareable_count: i64 = db.query_row("SELECT COUNT(*) FROM shareable_events", [], |row| row.get(0)).unwrap_or(0);
+    let recorded_events_count: i64 = db.query_row(
+        "SELECT COUNT(*) FROM recorded_events WHERE peer_id = ?1",
+        rusqlite::params![&recorded_by],
+        |row| row.get(0),
+    ).unwrap_or(0);
 
     println!("STATUS ({}):", db_path);
     println!("  Store:     {} events", store_count);
     println!("  Messages:  {} projected", messages_count);
+    println!("  Recorded:  {} events", recorded_events_count);
     println!("  Shareable: {} events", shareable_count);
     println!("  NegItems:  {} indexed", neg_items_count);
 
@@ -378,6 +391,7 @@ fn show_status(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + S
 }
 
 fn generate_messages(db_path: &str, count: usize, channel_hex: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let recorded_by = local_identity_from_db(db_path)?;
     let db = open_connection(db_path)?;
     create_tables(&db)?;
 
@@ -389,8 +403,12 @@ fn generate_messages(db_path: &str, count: usize, channel_hex: &str) -> Result<(
 
     let mut neg_stmt = db.prepare("INSERT OR IGNORE INTO neg_items (ts, id) VALUES (?1, ?2)")?;
     let mut msg_stmt = db.prepare(
-        "INSERT OR IGNORE INTO messages (message_id, channel_id, author_id, content, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)"
+        "INSERT OR IGNORE INTO messages (message_id, channel_id, author_id, content, created_at, recorded_by)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+    )?;
+    let mut rec_stmt = db.prepare(
+        "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
+         VALUES (?1, ?2, ?3, ?4)"
     )?;
 
     db.execute("BEGIN", [])?;
@@ -408,7 +426,8 @@ fn generate_messages(db_path: &str, count: usize, channel_hex: &str) -> Result<(
         let message_id = event_id_to_base64(&event_id);
         let channel_id_b64 = event_id_to_base64(&channel_id);
         let author_id_b64 = event_id_to_base64(&author_id);
-        msg_stmt.execute(rusqlite::params![message_id, channel_id_b64, author_id_b64, content, created_at_ms as i64])?;
+        msg_stmt.execute(rusqlite::params![message_id, channel_id_b64, author_id_b64, content, created_at_ms as i64, &recorded_by])?;
+        rec_stmt.execute(rusqlite::params![&recorded_by, &message_id, created_at_ms as i64, "local_create"])?;
     }
     db.execute("COMMIT", [])?;
 
@@ -479,27 +498,38 @@ fn parse_predicate(s: &str) -> Result<(String, Op, i64), String> {
     Ok((field, op, value))
 }
 
-fn query_field(db: &rusqlite::Connection, field: &str) -> Result<i64, String> {
-    let sql = match field {
-        "store_count" => "SELECT COUNT(*) FROM store",
-        "message_count" => "SELECT COUNT(*) FROM messages",
-        "shareable_count" => "SELECT COUNT(*) FROM shareable_events",
-        "neg_items_count" => "SELECT COUNT(*) FROM neg_items",
-        other => return Err(format!("unknown field: {}", other)),
-    };
-    db.query_row(sql, [], |row| row.get(0))
-        .map_err(|e| format!("query failed: {}", e))
+fn query_field(db: &rusqlite::Connection, field: &str, recorded_by: &str) -> Result<i64, String> {
+    match field {
+        "store_count" => db.query_row("SELECT COUNT(*) FROM store", [], |row| row.get(0))
+            .map_err(|e| format!("query failed: {}", e)),
+        "message_count" => db.query_row(
+            "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
+            rusqlite::params![recorded_by],
+            |row| row.get(0),
+        ).map_err(|e| format!("query failed: {}", e)),
+        "shareable_count" => db.query_row("SELECT COUNT(*) FROM shareable_events", [], |row| row.get(0))
+            .map_err(|e| format!("query failed: {}", e)),
+        "neg_items_count" => db.query_row("SELECT COUNT(*) FROM neg_items", [], |row| row.get(0))
+            .map_err(|e| format!("query failed: {}", e)),
+        "recorded_events_count" => db.query_row(
+            "SELECT COUNT(*) FROM recorded_events WHERE peer_id = ?1",
+            rusqlite::params![recorded_by],
+            |row| row.get(0),
+        ).map_err(|e| format!("query failed: {}", e)),
+        other => Err(format!("unknown field: {}", other)),
+    }
 }
 
 fn run_assert_now(
     db_path: &str,
     predicate_str: &str,
 ) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
+    let recorded_by = local_identity_from_db(db_path)?;
     let (field, op, expected) = parse_predicate(predicate_str)
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
     let db = open_connection(db_path)?;
     create_tables(&db)?;
-    let actual = query_field(&db, &field)
+    let actual = query_field(&db, &field, &recorded_by)
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
 
     if op.eval(actual, expected) {
@@ -517,6 +547,7 @@ fn run_assert_eventually(
     timeout_ms: u64,
     interval_ms: u64,
 ) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
+    let recorded_by = local_identity_from_db(db_path)?;
     let (field, op, expected) = parse_predicate(predicate_str)
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
     let db = open_connection(db_path)?;
@@ -526,7 +557,7 @@ fn run_assert_eventually(
     let interval = Duration::from_millis(interval_ms);
 
     loop {
-        let actual = query_field(&db, &field)
+        let actual = query_field(&db, &field, &recorded_by)
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
         if op.eval(actual, expected) {
             println!("PASS: {} = {} (expected {} {})", field, actual, op.symbol(), expected);
@@ -561,12 +592,17 @@ async fn run_sync(
 
     let (cert_path, key_path) = cert_paths_from_db(db_path);
     let (cert, key) = load_or_generate_cert(&cert_path, &key_path)?;
+    let recorded_by = {
+        let fp = extract_spki_fingerprint(cert.as_ref())?;
+        hex::encode(fp)
+    };
     let allowed_peers = Arc::new(AllowedPeers::from_hex_strings(pin_peers)?);
 
     let server_endpoint = create_server_endpoint(bind, cert.clone(), key.clone_key(), allowed_peers.clone())?;
     info!("Listening on {}", server_endpoint.local_addr()?);
 
     let db_owned = db_path.to_string();
+    let recorded_by_clone = recorded_by.clone();
     let accept_handle = tokio::task::spawn_blocking({
         let db = db_owned.clone();
         move || {
@@ -575,7 +611,7 @@ async fn run_sync(
                 .build()
                 .unwrap();
             rt.block_on(async move {
-                if let Err(e) = accept_loop(&db, server_endpoint).await {
+                if let Err(e) = accept_loop(&db, &recorded_by_clone, server_endpoint).await {
                     tracing::warn!("accept_loop exited: {}", e);
                 }
             });
@@ -590,13 +626,14 @@ async fn run_sync(
             allowed_peers,
         )?;
         let db = db_owned.clone();
+        let recorded_by_clone = recorded_by.clone();
         let connect_handle = tokio::task::spawn_blocking(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .unwrap();
             rt.block_on(async move {
-                if let Err(e) = connect_loop(&db, client_endpoint, remote).await {
+                if let Err(e) = connect_loop(&db, &recorded_by_clone, client_endpoint, remote).await {
                     tracing::warn!("connect_loop exited: {}", e);
                 }
             });

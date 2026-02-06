@@ -14,7 +14,7 @@ This document is ordered exactly as we should build it.
 8. `Phase 3`: Encrypted events using the same dependency/projector model, tested first with per-instance PSK.
 9. `Phase 4`: Durable queue architecture (`ingress`, `project`, `egress`) and workers.
 10. `Phase 5`: Non-identity special-case projector logic (deletion/emitted-events).
-11. `Phase 6`: Performance hardening, observability, and scaling passes.
+11. `Phase 6`: Performance hardening, observability, scaling, and low-memory iOS mode.
 12. `Phase 7`: TLA-first minimal identity layer for trust-anchor cascade, removal, and sender-subjective encryption.
 
 Scheduling note:
@@ -831,6 +831,14 @@ Start simple, then tune.
 - Enable WAL and prepared statements.
 - Keep queue purges explicit and predictable.
 - Add invariants/metrics for blocked counts, retry growth, and queue age.
+- Add a dedicated `low_mem_ios` runtime mode for iOS NSE constraints.
+
+`low_mem_ios` requirements:
+- target steady-state RSS at or below `24 MiB` during sustained sync/projection.
+- keep memory bounded with strict in-flight caps (queue claims, decode buffers, batch sizes).
+- prefer one writer connection + minimal readers; avoid large in-memory caches/prefetch.
+- degrade throughput before violating memory ceiling (memory safety over speed).
+- validate at scale (`>= 1_000_000` canonical events on disk) with stable memory.
 
 Recommended initial size policy:
 - `EVENT_MAX_BLOB_BYTES = 1_048_576` (1 MiB soft cap)
@@ -1201,12 +1209,16 @@ Must implement:
 1. batch/index tuning driven by measurements.
 2. queue health metrics (`age`, `attempts`, blocked counts).
 3. endpoint observation TTL purging.
+4. `low_mem_ios` mode with explicit knobs (SQLite cache, channel/batch limits, worker concurrency caps).
+5. long-run memory test at million-event scale showing `<= 24 MiB` steady-state RSS target in low-memory mode.
 
 Common mistakes:
 - premature micro-optimizations before invariant/test stability.
+- optimizing throughput in low-memory mode at the cost of memory bound violations.
 
 Definition of done:
 - long-running sync remains stable and bounded in memory/storage.
+- low-memory mode is reliable and repeatable under iOS NSE-style memory limits.
 
 ## 15.10 Phase `7` implementation checklist (TLA-first identity)
 
