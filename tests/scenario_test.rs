@@ -379,13 +379,13 @@ async fn test_cross_workspace_isolation() {
     assert_eq!(peer_b1.scoped_message_count(), 6);
     assert_eq!(peer_b2.scoped_message_count(), 6);
 
-    // Cross-check: assert zero overlap in event IDs between workspace A and B stores.
+    // Cross-check: assert zero overlap in event IDs between workspace A and B events.
     // This is a stronger isolation proof than checking peer_id (which is always local).
     use std::collections::HashSet;
 
     let a1_db = open_connection(&peer_a1.db_path).expect("open a1 db");
     let a_event_ids: HashSet<String> = a1_db
-        .prepare("SELECT id FROM store")
+        .prepare("SELECT event_id FROM events")
         .unwrap()
         .query_map([], |row| row.get::<_, String>(0))
         .unwrap()
@@ -394,7 +394,7 @@ async fn test_cross_workspace_isolation() {
 
     let b1_db = open_connection(&peer_b1.db_path).expect("open b1 db");
     let b_event_ids: HashSet<String> = b1_db
-        .prepare("SELECT id FROM store")
+        .prepare("SELECT event_id FROM events")
         .unwrap()
         .query_map([], |row| row.get::<_, String>(0))
         .unwrap()

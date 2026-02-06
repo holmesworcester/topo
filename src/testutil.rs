@@ -289,7 +289,9 @@ impl Peer {
     /// Return sorted set of all store IDs (base64-encoded).
     pub fn store_ids(&self) -> std::collections::BTreeSet<String> {
         let db = open_connection(&self.db_path).expect("failed to open db");
-        let mut stmt = db.prepare("SELECT id FROM store ORDER BY id").expect("prepare");
+        let mut stmt = db
+            .prepare("SELECT event_id FROM events ORDER BY event_id")
+            .expect("prepare");
         let ids = stmt.query_map([], |row| row.get::<_, String>(0))
             .expect("query")
             .collect::<Result<std::collections::BTreeSet<_>, _>>()

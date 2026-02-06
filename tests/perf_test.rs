@@ -2,7 +2,7 @@
 //!
 //! Run with: cargo test --release --test perf_test -- --nocapture
 
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use poc_7::testutil::{Peer, start_peers, assert_eventually, sync_until_converged};
 
 fn test_channel() -> [u8; 32] {
