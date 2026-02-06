@@ -24,6 +24,7 @@ We split concerns aggressively:
 3. Projection is the only way canonical events affect application state.
 4. Blocking/unblocking is uniform across normal and encrypted events.
 5. Multitenancy is first-class with `recorded_by` scoping on shared tables.
+6. Policy-appropriate blocked rows after sync are normal, not failure.
 
 ---
 
@@ -39,6 +40,11 @@ We split concerns aggressively:
    - non-canonical transport/sync frames only.
 
 Shareability is event-type policy, not a separate storage system.
+
+Blocked-event normalcy rule:
+1. blocked events are still canonical/shareable facts in the log,
+2. some events are expected to remain blocked for a tenant (for example encrypted content or key-share events where that tenant is not a recipient),
+3. post-sync blocked presence must be interpreted with policy context, not as automatic failure.
 
 ## 1.2 Event format
 

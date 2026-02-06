@@ -72,6 +72,10 @@ Gap-to-phase mapping:
 - Event format stays flat. No universal `deps` field and no universal `payload` object.
 - Any schema field that references `event_id` is a dependency source.
 - Use one blocker mechanism for everything, including missing keys for encrypted events.
+- Blocked-event normalcy rule:
+  - blocked events are still canonical/shareable facts and can be expected end-states for some tenants.
+  - after a sync session, appropriately blocked events do not indicate protocol failure.
+  - expected examples include encrypted content for non-recipients and key-share events for non-recipients.
 - No per-event transit wrapper. QUIC + mTLS secures the channel.
 - Use separate tables for permanent canonical data vs operational queues.
 - Use separate invite event types (`user_invite`, `device_invite`), not one multimodal invite with `mode=*`.
@@ -102,6 +106,8 @@ These are required, not optional:
 8. Emitted-event self-projection rule.
    - projector side effects should emit canonical events; each emitted event projects to its own event table via its own projector/autowrite path.
    - direct cross-event table writes are rare operational exceptions only.
+9. Blocked-is-not-failure requirement.
+   - blocked rows that are policy-appropriate for a tenant (for example non-recipient encrypted/key-share events) are expected and must not be treated as sync failure.
 
 ---
 
@@ -648,6 +654,7 @@ Start encryption correctness with a deliberately crude harness before identity k
 
 1. Give each test daemon/instance a configured AES PSK (same PSK for happy-path suites; mismatched PSK for negative suites).
 2. Materialize this as a local key event during test setup, and reference that key via normal `key_event_id` dependency fields.
+   - the materialized key event must be recorded/projected in the correct tenant scope (`recorded_by` for that test peer/workspace).
 3. Run encrypted projection through the exact same block/unblock flow as other events:
    - missing key event -> `Block`
    - key present + decrypt/auth failure -> `Reject`
@@ -936,12 +943,20 @@ Not in scope yet:
 3. Wrong PSK/decrypt failure: event is rejected, not blocked.
 4. Reorder: ciphertext before key events converges after unblock.
 5. Replay/reproject: same final state from canonical events.
+6. Tenant-scoped PSK materialization: each local PSK key event is recorded by the intended `recorded_by` tenant only.
+7. Two-set isolation harness:
+   - set A: peer+peer+PSK_A,
+   - set B: peer+peer+PSK_B,
+   - verify no decrypt/projection crossover and no cross-tenant read leakage.
 
 ## 12.3 Projection correctness tests
 
 - Valid/block/reject decisions per event type.
 - Blocked-only dependency behavior with multiple blockers.
 - Set-based unblock correctness.
+- Blocked-normalcy invariants:
+  - policy-appropriate blocked rows may remain after sync and are not test failures by themselves.
+  - non-recipient encrypted messages/key-shares are expected blocked cases.
 - Signer substrate invariants:
   - missing signer dependency blocks,
   - invalid signature rejects,
