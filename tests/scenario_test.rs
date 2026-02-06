@@ -1,5 +1,11 @@
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use poc_7::testutil::{Peer, start_peers, assert_eventually, sync_until_converged, verify_projection_invariants};
+use poc_7::transport::{
+    AllowedPeers, create_client_endpoint, create_server_endpoint,
+    extract_spki_fingerprint, load_or_generate_cert, peer_identity_from_connection,
+};
+use poc_7::identity::cert_paths_from_db;
 
 fn test_channel() -> [u8; 32] {
     let mut ch = [0u8; 32];
@@ -196,6 +202,47 @@ async fn test_reaction_sync() {
     verify_projection_invariants(&bob);
 }
 
+/// Stress test: high-volume bidirectional sync verifying exact event ID equality.
+/// This checks the Done/DoneAck handshake prevents data loss at scale.
+#[tokio::test]
+async fn test_zero_loss_stress() {
+    let channel = test_channel();
+    let alice = Peer::new("alice", channel);
+    let bob = Peer::new("bob", channel);
+
+    alice.batch_create_messages(5_000);
+    bob.batch_create_messages(5_000);
+
+    let alice_ids_before = alice.store_ids();
+    let bob_ids_before = bob.store_ids();
+    assert_eq!(alice_ids_before.len(), 5_000);
+    assert_eq!(bob_ids_before.len(), 5_000);
+
+    let metrics = sync_until_converged(
+        &alice, &bob, 10_000, Duration::from_secs(120),
+    ).await;
+
+    eprintln!("zero-loss stress: {}", metrics);
+
+    let alice_ids = alice.store_ids();
+    let bob_ids = bob.store_ids();
+
+    // Exact set equality, not just counts
+    assert_eq!(alice_ids.len(), 10_000, "alice store count mismatch");
+    assert_eq!(bob_ids.len(), 10_000, "bob store count mismatch");
+    assert_eq!(alice_ids, bob_ids, "event ID sets differ between peers");
+
+    // Verify all original events survived
+    for id in &alice_ids_before {
+        assert!(alice_ids.contains(id), "alice lost own event {}", id);
+        assert!(bob_ids.contains(id), "bob missing alice event {}", id);
+    }
+    for id in &bob_ids_before {
+        assert!(alice_ids.contains(id), "alice missing bob event {}", id);
+        assert!(bob_ids.contains(id), "bob lost own event {}", id);
+    }
+}
+
 #[tokio::test]
 async fn test_sync_50k() {
     let channel = test_channel();
@@ -215,4 +262,64 @@ async fn test_sync_50k() {
 
     assert_eq!(alice.store_count(), 50_000);
     assert_eq!(bob.store_count(), 50_000);
+}
+
+/// Integration test: verify peer_identity_from_connection returns the correct
+/// SPKI fingerprint across a live QUIC mTLS handshake.
+#[tokio::test]
+async fn test_peer_identity_extraction_live_handshake() {
+    let channel = test_channel();
+    let alice = Peer::new("alice", channel);
+    let bob = Peer::new("bob", channel);
+
+    let (cert_path_a, key_path_a) = cert_paths_from_db(&alice.db_path);
+    let (cert_a, key_a) = load_or_generate_cert(&cert_path_a, &key_path_a).unwrap();
+    let (cert_path_b, key_path_b) = cert_paths_from_db(&bob.db_path);
+    let (cert_b, key_b) = load_or_generate_cert(&cert_path_b, &key_path_b).unwrap();
+
+    let fp_a = extract_spki_fingerprint(cert_a.as_ref()).unwrap();
+    let fp_b = extract_spki_fingerprint(cert_b.as_ref()).unwrap();
+    let expected_a = hex::encode(fp_a);
+    let expected_b = hex::encode(fp_b);
+
+    let allowed_for_a = Arc::new(AllowedPeers::from_fingerprints(vec![fp_b]));
+    let allowed_for_b = Arc::new(AllowedPeers::from_fingerprints(vec![fp_a]));
+
+    let server_ep = create_server_endpoint(
+        "127.0.0.1:0".parse().unwrap(),
+        cert_a, key_a, allowed_for_a,
+    ).unwrap();
+    let addr = server_ep.local_addr().unwrap();
+
+    let client_ep = create_client_endpoint(
+        "0.0.0.0:0".parse().unwrap(),
+        cert_b, key_b, allowed_for_b,
+    ).unwrap();
+
+    // Client connects, server accepts
+    let (client_conn, server_conn) = tokio::join!(
+        async {
+            client_ep.connect(addr, "localhost").unwrap().await.unwrap()
+        },
+        async {
+            server_ep.accept().await.unwrap().await.unwrap()
+        }
+    );
+
+    // Extract identities from live connections
+    let client_sees_server = peer_identity_from_connection(&client_conn);
+    let server_sees_client = peer_identity_from_connection(&server_conn);
+
+    assert_eq!(
+        client_sees_server.as_deref(), Some(expected_a.as_str()),
+        "client should see server's (Alice's) fingerprint"
+    );
+    assert_eq!(
+        server_sees_client.as_deref(), Some(expected_b.as_str()),
+        "server should see client's (Bob's) fingerprint"
+    );
+
+    // Verify they match the Peer identities computed from DB
+    assert_eq!(client_sees_server.unwrap(), alice.identity);
+    assert_eq!(server_sees_client.unwrap(), bob.identity);
 }

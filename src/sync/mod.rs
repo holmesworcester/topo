@@ -18,3 +18,6 @@ pub const MSG_TYPE_NEG_OPEN: u8 = 0x10;   // Initial negentropy message
 pub const MSG_TYPE_NEG_MSG: u8 = 0x11;    // Negentropy response
 pub const MSG_TYPE_HAVE_LIST: u8 = 0x12;  // List of IDs client needs from server
 pub const MSG_TYPE_EVENT: u8 = 0x03;      // Event blob (variable length)
+pub const MSG_TYPE_DONE: u8 = 0x20;      // Initiator signals all events sent
+pub const MSG_TYPE_DONE_ACK: u8 = 0x21;  // Responder acknowledges done
+pub const MSG_TYPE_DATA_DONE: u8 = 0x22; // Sent on data stream: no more events will follow
