@@ -1,8 +1,9 @@
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::crypto::{hash_event, event_id_to_base64, EventId};
-use crate::db::{open_connection, schema::create_tables, shareable::Shareable, store::Store};
+use crate::db::{open_connection, schema::create_tables};
+use crate::events::{self, MessageEvent, ReactionEvent, ParsedEvent, registry};
 use crate::identity::{cert_paths_from_db, local_identity_from_db};
 use crate::sync::engine::{accept_loop, connect_loop};
 use crate::transport::{
@@ -12,7 +13,13 @@ use crate::transport::{
     extract_spki_fingerprint,
     load_or_generate_cert,
 };
-use crate::wire::Envelope;
+
+fn current_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
 
 /// Timing breakdown returned after sync completes.
 #[derive(Debug, Clone)]
@@ -23,7 +30,7 @@ pub struct SyncMetrics {
     pub events_transferred: u64,
     /// Events per second (events_transferred / wall_secs).
     pub events_per_sec: f64,
-    /// Total bytes transferred (events * 512 bytes each).
+    /// Total bytes transferred.
     pub bytes_transferred: u64,
     /// Throughput in MiB/s.
     pub throughput_mib_s: f64,
@@ -78,22 +85,18 @@ impl Peer {
     /// Create a message and insert it into all relevant tables.
     /// Returns the event ID.
     pub fn create_message(&self, content: &str) -> EventId {
-        let envelope = Envelope::new_message(
-            self.channel_id,
-            self.author_id,
-            content.to_string(),
-        );
-
-        let blob = envelope.encode();
+        let created_at_ms = current_timestamp_ms();
+        let msg_event = MessageEvent {
+            created_at_ms,
+            channel_id: self.channel_id,
+            author_id: self.author_id,
+            content: content.to_string(),
+        };
+        let blob = events::encode_event(&ParsedEvent::Message(msg_event))
+            .expect("failed to encode message");
         let event_id = hash_event(&blob);
-        let created_at_ms = envelope.payload.created_at_ms;
 
         let db = open_connection(&self.db_path).expect("failed to open db");
-        let store = Store::new(&db);
-        let shareable = Shareable::new(&db);
-
-        store.put(&event_id, &blob).expect("failed to store event");
-        shareable.insert(&event_id).expect("failed to insert shareable");
 
         // Insert into neg_items
         db.execute(
@@ -102,20 +105,72 @@ impl Peer {
         ).expect("failed to insert neg_items");
 
         // Insert into messages projection
-        let message_id = event_id_to_base64(&event_id);
+        let event_id_b64 = event_id_to_base64(&event_id);
         let channel_id_b64 = event_id_to_base64(&self.channel_id);
         let author_id_b64 = event_id_to_base64(&self.author_id);
         db.execute(
             "INSERT OR IGNORE INTO messages (message_id, channel_id, author_id, content, created_at, recorded_by)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![message_id, channel_id_b64, author_id_b64, content, created_at_ms as i64, &self.identity],
+            rusqlite::params![event_id_b64, channel_id_b64, author_id_b64, content, created_at_ms as i64, &self.identity],
         ).expect("failed to insert message");
+
+        // Insert into events table
+        db.execute(
+            "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![event_id_b64, "message", blob.as_slice(), "shared", created_at_ms as i64, current_timestamp_ms() as i64],
+        ).expect("failed to insert into events");
 
         // Insert into recorded_events
         db.execute(
             "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
              VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![&self.identity, &message_id, created_at_ms as i64, "local_create"],
+            rusqlite::params![&self.identity, &event_id_b64, created_at_ms as i64, "local_create"],
+        ).expect("failed to insert recorded_event");
+
+        event_id
+    }
+
+    /// Create a reaction targeting a message event.
+    /// Returns the reaction event ID.
+    pub fn create_reaction(&self, target_event_id: &EventId, emoji: &str) -> EventId {
+        let created_at_ms = current_timestamp_ms();
+        let rxn_event = ReactionEvent {
+            created_at_ms,
+            target_event_id: *target_event_id,
+            author_id: self.author_id,
+            emoji: emoji.to_string(),
+        };
+        let blob = events::encode_event(&ParsedEvent::Reaction(rxn_event))
+            .expect("failed to encode reaction");
+        let event_id = hash_event(&blob);
+
+        let db = open_connection(&self.db_path).expect("failed to open db");
+
+        db.execute(
+            "INSERT OR IGNORE INTO neg_items (ts, id) VALUES (?1, ?2)",
+            rusqlite::params![created_at_ms as i64, event_id.as_slice()],
+        ).expect("failed to insert neg_items");
+
+        let event_id_b64 = event_id_to_base64(&event_id);
+        let target_id_b64 = event_id_to_base64(target_event_id);
+        let author_id_b64 = event_id_to_base64(&self.author_id);
+        db.execute(
+            "INSERT OR IGNORE INTO reactions (event_id, target_event_id, author_id, emoji, created_at, recorded_by)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![event_id_b64, target_id_b64, author_id_b64, emoji, created_at_ms as i64, &self.identity],
+        ).expect("failed to insert reaction");
+
+        db.execute(
+            "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![event_id_b64, "reaction", blob.as_slice(), "shared", created_at_ms as i64, current_timestamp_ms() as i64],
+        ).expect("failed to insert into events");
+
+        db.execute(
+            "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![&self.identity, &event_id_b64, created_at_ms as i64, "local_create"],
         ).expect("failed to insert recorded_event");
 
         event_id
@@ -124,8 +179,6 @@ impl Peer {
     /// Create multiple messages. Uses a transaction for speed at scale.
     pub fn batch_create_messages(&self, count: usize) {
         let db = open_connection(&self.db_path).expect("failed to open db");
-        let store = Store::new(&db);
-        let shareable = Shareable::new(&db);
 
         let mut neg_stmt = db.prepare(
             "INSERT OR IGNORE INTO neg_items (ts, id) VALUES (?1, ?2)"
@@ -138,46 +191,52 @@ impl Peer {
             "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
              VALUES (?1, ?2, ?3, ?4)"
         ).expect("failed to prepare recorded_events stmt");
+        let mut events_stmt = db.prepare(
+            "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+        ).expect("failed to prepare events stmt");
 
         db.execute("BEGIN", []).expect("failed to begin");
         for i in 0..count {
             let content = format!("Message {} from {}", i, self.name);
-            let envelope = Envelope::new_message(
-                self.channel_id,
-                self.author_id,
-                content.clone(),
-            );
-
-            let blob = envelope.encode();
+            let created_at_ms = current_timestamp_ms();
+            let msg_event = MessageEvent {
+                created_at_ms,
+                channel_id: self.channel_id,
+                author_id: self.author_id,
+                content: content.clone(),
+            };
+            let blob = events::encode_event(&ParsedEvent::Message(msg_event))
+                .expect("failed to encode message");
             let event_id = hash_event(&blob);
-            let created_at_ms = envelope.payload.created_at_ms;
-
-            store.put(&event_id, &blob).expect("store.put");
-            shareable.insert(&event_id).expect("shareable.insert");
 
             neg_stmt.execute(rusqlite::params![
                 created_at_ms as i64,
                 event_id.as_slice()
             ]).expect("neg_items insert");
 
-            let message_id = event_id_to_base64(&event_id);
+            let event_id_b64 = event_id_to_base64(&event_id);
             let channel_id_b64 = event_id_to_base64(&self.channel_id);
             let author_id_b64 = event_id_to_base64(&self.author_id);
             msg_stmt.execute(rusqlite::params![
-                message_id, channel_id_b64, author_id_b64, content, created_at_ms as i64, &self.identity
+                event_id_b64, channel_id_b64, author_id_b64, content, created_at_ms as i64, &self.identity
             ]).expect("messages insert");
 
+            events_stmt.execute(rusqlite::params![
+                event_id_b64, "message", blob.as_slice(), "shared", created_at_ms as i64, current_timestamp_ms() as i64
+            ]).expect("events insert");
+
             rec_stmt.execute(rusqlite::params![
-                &self.identity, &message_id, created_at_ms as i64, "local_create"
+                &self.identity, &event_id_b64, created_at_ms as i64, "local_create"
             ]).expect("recorded_events insert");
         }
         db.execute("COMMIT", []).expect("failed to commit");
     }
 
-    /// Count events in the store table.
+    /// Count events in the events table.
     pub fn store_count(&self) -> i64 {
         let db = open_connection(&self.db_path).expect("failed to open db");
-        db.query_row("SELECT COUNT(*) FROM store", [], |row| row.get(0))
+        db.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
             .unwrap_or(0)
     }
 
@@ -185,6 +244,23 @@ impl Peer {
     pub fn message_count(&self) -> i64 {
         let db = open_connection(&self.db_path).expect("failed to open db");
         db.query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            .unwrap_or(0)
+    }
+
+    /// Count rows in the reactions projection table scoped to this peer.
+    pub fn reaction_count(&self) -> i64 {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        db.query_row(
+            "SELECT COUNT(*) FROM reactions WHERE recorded_by = ?1",
+            rusqlite::params![&self.identity],
+            |row| row.get(0),
+        ).unwrap_or(0)
+    }
+
+    /// Count rows in the events table.
+    pub fn events_table_count(&self) -> i64 {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        db.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
             .unwrap_or(0)
     }
 
@@ -209,21 +285,175 @@ impl Peer {
     }
 }
 
+/// Replay all event blobs from the events table through registry-based projection.
+/// Clears projection tables, then re-projects all events.
+/// Returns (message_count, reaction_count) after replay.
+fn replay_projection(db: &rusqlite::Connection, recorded_by: &str) -> (i64, i64) {
+    // Clear projection tables for this tenant
+    db.execute("DELETE FROM messages WHERE recorded_by = ?1", rusqlite::params![recorded_by])
+        .expect("failed to clear messages");
+    db.execute("DELETE FROM reactions WHERE recorded_by = ?1", rusqlite::params![recorded_by])
+        .expect("failed to clear reactions");
+
+    // Read all blobs from events table
+    let mut stmt = db.prepare("SELECT event_id, blob FROM events ORDER BY created_at ASC, event_id ASC")
+        .expect("failed to prepare events query");
+    let rows: Vec<(String, Vec<u8>)> = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+    }).expect("failed to query events")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("failed to collect events");
+
+    let reg = registry();
+
+    for (event_id_b64, blob) in &rows {
+        if let Some(type_code) = events::extract_event_type(blob) {
+            if let Some(meta) = reg.lookup(type_code) {
+                if let Ok(parsed) = (meta.parse)(blob) {
+                    match &parsed {
+                        ParsedEvent::Message(msg) => {
+                            let channel_id_b64 = event_id_to_base64(&msg.channel_id);
+                            let author_id_b64 = event_id_to_base64(&msg.author_id);
+                            db.execute(
+                                "INSERT OR IGNORE INTO messages (message_id, channel_id, author_id, content, created_at, recorded_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                                rusqlite::params![event_id_b64, channel_id_b64, author_id_b64, &msg.content, msg.created_at_ms as i64, recorded_by],
+                            ).expect("failed to project message");
+                        }
+                        ParsedEvent::Reaction(rxn) => {
+                            let target_id_b64 = event_id_to_base64(&rxn.target_event_id);
+                            let author_id_b64 = event_id_to_base64(&rxn.author_id);
+                            db.execute(
+                                "INSERT OR IGNORE INTO reactions (event_id, target_event_id, author_id, emoji, created_at, recorded_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                                rusqlite::params![event_id_b64, target_id_b64, author_id_b64, &rxn.emoji, rxn.created_at_ms as i64, recorded_by],
+                            ).expect("failed to project reaction");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let msg_count: i64 = db.query_row(
+        "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
+        rusqlite::params![recorded_by],
+        |row| row.get(0),
+    ).unwrap_or(0);
+    let rxn_count: i64 = db.query_row(
+        "SELECT COUNT(*) FROM reactions WHERE recorded_by = ?1",
+        rusqlite::params![recorded_by],
+        |row| row.get(0),
+    ).unwrap_or(0);
+
+    (msg_count, rxn_count)
+}
+
+/// Replay events in reverse order through the projector.
+fn replay_projection_reverse(db: &rusqlite::Connection, recorded_by: &str) -> (i64, i64) {
+    db.execute("DELETE FROM messages WHERE recorded_by = ?1", rusqlite::params![recorded_by])
+        .expect("failed to clear messages");
+    db.execute("DELETE FROM reactions WHERE recorded_by = ?1", rusqlite::params![recorded_by])
+        .expect("failed to clear reactions");
+
+    let mut stmt = db.prepare("SELECT event_id, blob FROM events ORDER BY created_at DESC, event_id DESC")
+        .expect("failed to prepare events query");
+    let rows: Vec<(String, Vec<u8>)> = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+    }).expect("failed to query events")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("failed to collect events");
+
+    let reg = registry();
+
+    for (event_id_b64, blob) in &rows {
+        if let Some(type_code) = events::extract_event_type(blob) {
+            if let Some(meta) = reg.lookup(type_code) {
+                if let Ok(parsed) = (meta.parse)(blob) {
+                    match &parsed {
+                        ParsedEvent::Message(msg) => {
+                            let channel_id_b64 = event_id_to_base64(&msg.channel_id);
+                            let author_id_b64 = event_id_to_base64(&msg.author_id);
+                            db.execute(
+                                "INSERT OR IGNORE INTO messages (message_id, channel_id, author_id, content, created_at, recorded_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                                rusqlite::params![event_id_b64, channel_id_b64, author_id_b64, &msg.content, msg.created_at_ms as i64, recorded_by],
+                            ).expect("failed to project message");
+                        }
+                        ParsedEvent::Reaction(rxn) => {
+                            let target_id_b64 = event_id_to_base64(&rxn.target_event_id);
+                            let author_id_b64 = event_id_to_base64(&rxn.author_id);
+                            db.execute(
+                                "INSERT OR IGNORE INTO reactions (event_id, target_event_id, author_id, emoji, created_at, recorded_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                                rusqlite::params![event_id_b64, target_id_b64, author_id_b64, &rxn.emoji, rxn.created_at_ms as i64, recorded_by],
+                            ).expect("failed to project reaction");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let msg_count: i64 = db.query_row(
+        "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
+        rusqlite::params![recorded_by],
+        |row| row.get(0),
+    ).unwrap_or(0);
+    let rxn_count: i64 = db.query_row(
+        "SELECT COUNT(*) FROM reactions WHERE recorded_by = ?1",
+        rusqlite::params![recorded_by],
+        |row| row.get(0),
+    ).unwrap_or(0);
+
+    (msg_count, rxn_count)
+}
+
+/// Verify projection invariants for a peer:
+/// 1. Forward replay matches original state
+/// 2. Double replay (idempotency) matches
+/// 3. Reverse-order replay matches (order-independence)
+pub fn verify_projection_invariants(peer: &Peer) {
+    let db = open_connection(&peer.db_path).expect("failed to open db");
+
+    // Capture original counts
+    let orig_msg: i64 = db.query_row(
+        "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
+        rusqlite::params![&peer.identity],
+        |row| row.get(0),
+    ).unwrap_or(0);
+    let orig_rxn: i64 = db.query_row(
+        "SELECT COUNT(*) FROM reactions WHERE recorded_by = ?1",
+        rusqlite::params![&peer.identity],
+        |row| row.get(0),
+    ).unwrap_or(0);
+
+    // 1. Forward replay
+    let (fwd_msg, fwd_rxn) = replay_projection(&db, &peer.identity);
+    assert_eq!(fwd_msg, orig_msg,
+        "Forward replay message count mismatch: expected {}, got {}", orig_msg, fwd_msg);
+    assert_eq!(fwd_rxn, orig_rxn,
+        "Forward replay reaction count mismatch: expected {}, got {}", orig_rxn, fwd_rxn);
+
+    // 2. Idempotency: replay again over existing projected state (double replay)
+    let (double_msg, double_rxn) = replay_projection(&db, &peer.identity);
+    assert_eq!(double_msg, orig_msg,
+        "Double replay message count mismatch: expected {}, got {}", orig_msg, double_msg);
+    assert_eq!(double_rxn, orig_rxn,
+        "Double replay reaction count mismatch: expected {}, got {}", orig_rxn, double_rxn);
+
+    // 3. Reverse-order replay
+    let (rev_msg, rev_rxn) = replay_projection_reverse(&db, &peer.identity);
+    assert_eq!(rev_msg, orig_msg,
+        "Reverse replay message count mismatch: expected {}, got {}", orig_msg, rev_msg);
+    assert_eq!(rev_rxn, orig_rxn,
+        "Reverse replay reaction count mismatch: expected {}, got {}", orig_rxn, rev_rxn);
+
+    // Restore forward projection for subsequent assertions
+    let _ = replay_projection(&db, &peer.identity);
+}
+
 /// Start continuous sync between two peers with mutual mTLS pinning.
-///
-/// Uses each peer's persisted cert (from cert_paths_from_db) so that
-/// the transport identity matches the recording identity.
-///
-/// Spawns two threads — one running accept_loop (peer A listens),
-/// one running connect_loop (peer B connects). Each thread has its own
-/// single-threaded tokio runtime (rusqlite::Connection is not Send).
-///
-/// Returns two JoinHandles (accept, connect).
 pub fn start_peers(
     peer_a: &Peer,
     peer_b: &Peer,
 ) -> (std::thread::JoinHandle<()>, std::thread::JoinHandle<()>) {
-    // Load certs from each peer's DB-derived path (persisted, not ephemeral)
     let (cert_path_a, key_path_a) = cert_paths_from_db(&peer_a.db_path);
     let (cert_a, key_a) = load_or_generate_cert(&cert_path_a, &key_path_a)
         .expect("failed to load cert for peer A");
@@ -231,11 +461,9 @@ pub fn start_peers(
     let (cert_b, key_b) = load_or_generate_cert(&cert_path_b, &key_path_b)
         .expect("failed to load cert for peer B");
 
-    // Extract fingerprints
     let fp_a = extract_spki_fingerprint(cert_a.as_ref()).expect("failed to extract fp for A");
     let fp_b = extract_spki_fingerprint(cert_b.as_ref()).expect("failed to extract fp for B");
 
-    // Build mutual AllowedPeers: A allows B, B allows A
     let allowed_for_a = Arc::new(AllowedPeers::from_fingerprints(vec![fp_b]));
     let allowed_for_b = Arc::new(AllowedPeers::from_fingerprints(vec![fp_a]));
 
@@ -288,9 +516,6 @@ pub fn start_peers(
 }
 
 /// Start sync, wait for convergence, return metrics.
-///
-/// Both peers should already have their events loaded before calling this.
-/// `expected_count` is the total events each peer should end up with.
 pub async fn sync_until_converged(
     peer_a: &Peer,
     peer_b: &Peer,
@@ -320,7 +545,8 @@ pub async fn sync_until_converged(
     drop(sync);
 
     let events_transferred = events_to_transfer as u64;
-    let bytes_transferred = events_transferred * 512;
+    // Variable-length events — estimate ~100 bytes per event
+    let bytes_transferred = events_transferred * 100;
     let events_per_sec = if wall_secs > 0.0 { events_transferred as f64 / wall_secs } else { 0.0 };
     let throughput_mib_s = (bytes_transferred as f64) / (1024.0 * 1024.0) / wall_secs.max(0.001);
 

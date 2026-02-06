@@ -9,14 +9,15 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use negentropy::{Negentropy, Id, NegentropyStorageBase, Storage};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn, error};
 
 use crate::crypto::{hash_event, event_id_to_base64, EventId};
-use crate::db::{open_connection, schema::create_tables, shareable::Shareable, store::Store, outgoing::OutgoingQueue, wanted::WantedEvents};
+use crate::db::{open_connection, schema::create_tables, store::Store, outgoing::OutgoingQueue, wanted::WantedEvents};
+use crate::events::{self, ParsedEvent, registry};
 use crate::runtime::SyncStats;
 use crate::sync::{SyncMessage, neg_id_to_event_id, NegentropyStorageSqlite};
 use crate::transport::{
@@ -27,7 +28,6 @@ use crate::transport::{
     peer_identity_from_connection,
 };
 use crate::transport::connection::ConnectionError;
-use crate::wire::Envelope;
 
 fn low_mem_mode() -> bool {
     read_bool_env("LOW_MEM_IOS") || read_bool_env("LOW_MEM")
@@ -40,9 +40,15 @@ fn read_bool_env(name: &str) -> bool {
     }
 }
 
+fn current_timestamp_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
 /// Batch writer task - drains channel and writes to SQLite in batches.
-/// Naive projection: receive batches -> BEGIN -> store.put + shareable.insert
-/// + wanted.remove + neg_items + messages -> COMMIT.
+/// Uses registry-based dispatch for event parsing and projection.
 pub fn batch_writer(
     db_path: String,
     recorded_by: String,
@@ -57,17 +63,26 @@ pub fn batch_writer(
         }
     };
 
-    let store = Store::new(&db);
-    let shareable = Shareable::new(&db);
     let wanted = WantedEvents::new(&db);
 
-    let mut project_stmt = match db.prepare(
+    let mut project_msg_stmt = match db.prepare(
         "INSERT OR IGNORE INTO messages (message_id, channel_id, author_id, content, created_at, recorded_by)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
     ) {
         Ok(stmt) => stmt,
         Err(e) => {
-            error!("Failed to prepare projection statement: {}", e);
+            error!("Failed to prepare messages projection statement: {}", e);
+            return;
+        }
+    };
+
+    let mut project_rxn_stmt = match db.prepare(
+        "INSERT OR IGNORE INTO reactions (event_id, target_event_id, author_id, emoji, created_at, recorded_by)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+    ) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            error!("Failed to prepare reactions projection statement: {}", e);
             return;
         }
     };
@@ -93,6 +108,19 @@ pub fn batch_writer(
         }
     };
 
+    let mut events_stmt = match db.prepare(
+        "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+    ) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            error!("Failed to prepare events statement: {}", e);
+            return;
+        }
+    };
+
+    let reg = registry();
+
     loop {
         let first = match rx.blocking_recv() {
             Some(item) => item,
@@ -109,36 +137,67 @@ pub fn batch_writer(
 
         if db.execute("BEGIN", []).is_ok() {
             for (event_id, blob) in &batch {
-                let _ = store.put(event_id, blob);
-                let _ = shareable.insert(event_id);
                 let _ = wanted.remove(event_id);
 
-                if let Ok((_, envelope)) = Envelope::parse(blob) {
-                    let created_at_ms = envelope.payload.created_at_ms;
+                let event_id_b64 = event_id_to_base64(event_id);
 
+                // Extract common prefix for neg_items without full parse
+                if let Some(created_at_ms) = events::extract_created_at_ms(blob) {
                     let _ = neg_items_stmt.execute(rusqlite::params![
                         created_at_ms as i64,
                         event_id.as_slice()
                     ]);
 
-                    let message_id = event_id_to_base64(event_id);
-                    let channel_id = event_id_to_base64(&envelope.payload.channel_id);
-                    let author_id = event_id_to_base64(&envelope.payload.author_id);
-                    let _ = project_stmt.execute(rusqlite::params![
-                        message_id,
-                        channel_id,
-                        author_id,
-                        &envelope.payload.content,
-                        created_at_ms as i64,
-                        &recorded_by
-                    ]);
+                    // Full registry-based parse for projection
+                    if let Some(type_code) = events::extract_event_type(blob) {
+                        if let Some(meta) = reg.lookup(type_code) {
+                            // Write to events table
+                            let _ = events_stmt.execute(rusqlite::params![
+                                &event_id_b64,
+                                meta.type_name,
+                                blob.as_slice(),
+                                meta.share_scope.as_str(),
+                                created_at_ms as i64,
+                                current_timestamp_ms()
+                            ]);
 
-                    let _ = recorded_stmt.execute(rusqlite::params![
-                        &recorded_by,
-                        &message_id,
-                        created_at_ms as i64,
-                        "quic_recv"
-                    ]);
+                            if let Ok(parsed) = (meta.parse)(blob) {
+                                match &parsed {
+                                    ParsedEvent::Message(msg) => {
+                                        let channel_id_b64 = event_id_to_base64(&msg.channel_id);
+                                        let author_id_b64 = event_id_to_base64(&msg.author_id);
+                                        let _ = project_msg_stmt.execute(rusqlite::params![
+                                            &event_id_b64,
+                                            channel_id_b64,
+                                            author_id_b64,
+                                            &msg.content,
+                                            created_at_ms as i64,
+                                            &recorded_by
+                                        ]);
+                                    }
+                                    ParsedEvent::Reaction(rxn) => {
+                                        let target_id_b64 = event_id_to_base64(&rxn.target_event_id);
+                                        let author_id_b64 = event_id_to_base64(&rxn.author_id);
+                                        let _ = project_rxn_stmt.execute(rusqlite::params![
+                                            &event_id_b64,
+                                            target_id_b64,
+                                            author_id_b64,
+                                            &rxn.emoji,
+                                            created_at_ms as i64,
+                                            &recorded_by
+                                        ]);
+                                    }
+                                }
+                            }
+
+                            let _ = recorded_stmt.execute(rusqlite::params![
+                                &recorded_by,
+                                &event_id_b64,
+                                created_at_ms as i64,
+                                "quic_recv"
+                            ]);
+                        }
+                    }
                 }
             }
             let _ = db.execute("COMMIT", []);

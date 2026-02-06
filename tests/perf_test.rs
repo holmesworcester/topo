@@ -160,7 +160,7 @@ async fn perf_continuous_10k() {
     drop(sync);
 
     let events_transferred = 10_000u64; // 5k each direction
-    let bytes_transferred = events_transferred * 512;
+    let bytes_transferred = events_transferred * 100; // variable-length estimate
     let events_per_sec = events_transferred as f64 / wall_secs;
     let throughput_mib_s = (bytes_transferred as f64) / (1024.0 * 1024.0) / wall_secs.max(0.001);
 
@@ -190,13 +190,12 @@ fn inject_messages_batched(
     batch_size: usize,
     recorded_by: &str,
 ) {
+    use std::time::{SystemTime, UNIX_EPOCH};
     use poc_7::crypto::{hash_event, event_id_to_base64};
-    use poc_7::db::{open_connection, shareable::Shareable, store::Store};
-    use poc_7::wire::Envelope;
+    use poc_7::db::open_connection;
+    use poc_7::events::{self, MessageEvent, ParsedEvent};
 
     let db = open_connection(db_path).expect("failed to open db");
-    let store = Store::new(&db);
-    let shareable = Shareable::new(&db);
 
     let mut neg_stmt = db.prepare(
         "INSERT OR IGNORE INTO neg_items (ts, id) VALUES (?1, ?2)"
@@ -209,6 +208,10 @@ fn inject_messages_batched(
         "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
          VALUES (?1, ?2, ?3, ?4)"
     ).expect("failed to prepare recorded_events stmt");
+    let mut events_stmt = db.prepare(
+        "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+    ).expect("failed to prepare events stmt");
 
     let mut i = 0;
     while i < total {
@@ -216,13 +219,19 @@ fn inject_messages_batched(
         db.execute("BEGIN", []).expect("failed to begin");
         for j in i..end {
             let content = format!("Msg {} from {}", j, name);
-            let envelope = Envelope::new_message(channel_id, author_id, content.clone());
-            let blob = envelope.encode();
+            let created_at_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            let msg_event = MessageEvent {
+                created_at_ms,
+                channel_id,
+                author_id,
+                content: content.clone(),
+            };
+            let blob = events::encode_event(&ParsedEvent::Message(msg_event))
+                .expect("failed to encode message");
             let event_id = hash_event(&blob);
-            let created_at_ms = envelope.payload.created_at_ms;
-
-            store.put(&event_id, &blob).expect("store.put");
-            shareable.insert(&event_id).expect("shareable.insert");
 
             neg_stmt.execute(rusqlite::params![
                 created_at_ms as i64,
@@ -235,6 +244,10 @@ fn inject_messages_batched(
             msg_stmt.execute(rusqlite::params![
                 message_id, channel_id_b64, author_id_b64, content, created_at_ms as i64, recorded_by
             ]).expect("messages insert");
+
+            events_stmt.execute(rusqlite::params![
+                message_id, "message", blob.as_slice(), "shared", created_at_ms as i64, created_at_ms as i64
+            ]).expect("events insert");
 
             rec_stmt.execute(rusqlite::params![
                 recorded_by, &message_id, created_at_ms as i64, "local_create"

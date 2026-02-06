@@ -5,6 +5,9 @@ use tokio::io::AsyncWriteExt;
 use crate::sync::{encode_sync_message, parse_sync_message, SyncMessage};
 use crate::sync::protocol::ParseError;
 
+/// Max recv buffer size (2 MiB) to prevent unbounded growth
+const MAX_RECV_BUFFER: usize = 2 * 1024 * 1024;
+
 /// Async stream connection abstraction for sync protocol.
 #[async_trait]
 pub trait StreamConn {
@@ -127,6 +130,10 @@ impl Connection {
                 }
             }
 
+            if self.recv_buffer.len() > MAX_RECV_BUFFER {
+                return Err(ConnectionError::Parse(ParseError::EventTooLarge(self.recv_buffer.len())));
+            }
+
             // Read more data
             let mut buf = [0u8; 4096];
             let chunk = self.recv.read(&mut buf).await?;
@@ -181,6 +188,10 @@ impl RecvConnection {
                         return Err(ConnectionError::Parse(e));
                     }
                 }
+            }
+
+            if self.recv_buffer.len() > MAX_RECV_BUFFER {
+                return Err(ConnectionError::Parse(ParseError::EventTooLarge(self.recv_buffer.len())));
             }
 
             let mut buf = [0u8; 4096];

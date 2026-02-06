@@ -1,5 +1,5 @@
-use crate::wire::ENVELOPE_SIZE;
-use super::{MSG_TYPE_NEG_OPEN, MSG_TYPE_NEG_MSG, MSG_TYPE_HAVE_LIST, MSG_TYPE_EVENT, EVENT_SIZE};
+use crate::events::EVENT_MAX_BLOB_BYTES;
+use super::{MSG_TYPE_NEG_OPEN, MSG_TYPE_NEG_MSG, MSG_TYPE_HAVE_LIST, MSG_TYPE_EVENT};
 
 /// Sync protocol messages
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -10,7 +10,7 @@ pub enum SyncMessage {
     NegMsg { msg: Vec<u8> },
     /// List of event IDs the client needs from server (32 bytes each)
     HaveList { ids: Vec<[u8; 32]> },
-    /// Send full event blob
+    /// Send full event blob (variable length)
     Event { blob: Vec<u8> },
 }
 
@@ -62,11 +62,20 @@ pub fn parse_sync_message(input: &[u8]) -> Result<(SyncMessage, usize), ParseErr
             Ok((SyncMessage::HaveList { ids }, total_size))
         }
         MSG_TYPE_EVENT => {
-            if input.len() < EVENT_SIZE {
+            // Variable length: type(1) + len(4) + blob(len)
+            if input.len() < 5 {
                 return Err(ParseError::InsufficientData);
             }
-            let blob = input[1..1 + ENVELOPE_SIZE].to_vec();
-            Ok((SyncMessage::Event { blob }, EVENT_SIZE))
+            let len = u32::from_le_bytes([input[1], input[2], input[3], input[4]]) as usize;
+            if len > EVENT_MAX_BLOB_BYTES {
+                return Err(ParseError::EventTooLarge(len));
+            }
+            let total_size = 5 + len;
+            if input.len() < total_size {
+                return Err(ParseError::InsufficientData);
+            }
+            let blob = input[5..total_size].to_vec();
+            Ok((SyncMessage::Event { blob }, total_size))
         }
         _ => Err(ParseError::UnknownType(msg_type)),
     }
@@ -99,8 +108,9 @@ pub fn encode_sync_message(msg: &SyncMessage) -> Vec<u8> {
             buf
         }
         SyncMessage::Event { blob } => {
-            let mut buf = Vec::with_capacity(EVENT_SIZE);
+            let mut buf = Vec::with_capacity(5 + blob.len());
             buf.push(MSG_TYPE_EVENT);
+            buf.extend_from_slice(&(blob.len() as u32).to_le_bytes());
             buf.extend_from_slice(blob);
             buf
         }
@@ -111,6 +121,7 @@ pub fn encode_sync_message(msg: &SyncMessage) -> Vec<u8> {
 pub enum ParseError {
     InsufficientData,
     UnknownType(u8),
+    EventTooLarge(usize),
 }
 
 impl std::fmt::Display for ParseError {
@@ -118,6 +129,7 @@ impl std::fmt::Display for ParseError {
         match self {
             ParseError::InsufficientData => write!(f, "insufficient data"),
             ParseError::UnknownType(t) => write!(f, "unknown message type: {}", t),
+            ParseError::EventTooLarge(len) => write!(f, "event too large: {} bytes", len),
         }
     }
 }
@@ -152,14 +164,39 @@ mod tests {
 
     #[test]
     fn test_event_roundtrip() {
-        let blob = vec![3u8; ENVELOPE_SIZE];
+        let blob = vec![3u8; 100];
         let msg = SyncMessage::Event { blob: blob.clone() };
         let encoded = encode_sync_message(&msg);
-        assert_eq!(encoded.len(), EVENT_SIZE);
+        assert_eq!(encoded.len(), 5 + 100); // type(1) + len(4) + blob(100)
 
         let (parsed, consumed) = parse_sync_message(&encoded).unwrap();
-        assert_eq!(consumed, EVENT_SIZE);
+        assert_eq!(consumed, 105);
         assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn test_event_variable_sizes() {
+        for size in [0, 1, 75, 100, 512, 1000, 10000] {
+            let blob = vec![0xABu8; size];
+            let msg = SyncMessage::Event { blob: blob.clone() };
+            let encoded = encode_sync_message(&msg);
+            assert_eq!(encoded.len(), 5 + size);
+            let (parsed, consumed) = parse_sync_message(&encoded).unwrap();
+            assert_eq!(consumed, 5 + size);
+            assert_eq!(parsed, msg);
+        }
+    }
+
+    #[test]
+    fn test_event_too_large() {
+        let len = EVENT_MAX_BLOB_BYTES + 1;
+        // Craft a header that claims a too-large length
+        let mut buf = vec![MSG_TYPE_EVENT];
+        buf.extend_from_slice(&(len as u32).to_le_bytes());
+        // Don't need actual data — parser should reject based on length
+        buf.extend_from_slice(&vec![0u8; len]);
+        let result = parse_sync_message(&buf);
+        assert_eq!(result, Err(ParseError::EventTooLarge(len)));
     }
 
     #[test]
@@ -172,10 +209,5 @@ mod tests {
     fn test_parse_unknown_type() {
         let result = parse_sync_message(&[0xFF, 0, 0, 0, 0]);
         assert_eq!(result, Err(ParseError::UnknownType(0xFF)));
-    }
-
-    #[test]
-    fn test_message_sizes() {
-        assert_eq!(EVENT_SIZE, 513);
     }
 }

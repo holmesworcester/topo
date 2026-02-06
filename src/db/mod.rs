@@ -1,7 +1,9 @@
+pub mod migrations;
 pub mod schema;
 pub mod shareable;
 pub mod store;
 pub mod outgoing;
+pub mod tenant;
 pub mod wanted;
 
 use rusqlite::{Connection, Result as SqliteResult};

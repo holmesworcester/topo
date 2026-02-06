@@ -1,5 +1,7 @@
 use rusqlite::{Connection, Result as SqliteResult};
 
+use super::migrations::run_migrations;
+
 /// Create all tables for the sync system
 pub fn create_tables(conn: &Connection) -> SqliteResult<()> {
     conn.execute_batch(
@@ -89,6 +91,7 @@ pub fn create_tables(conn: &Connection) -> SqliteResult<()> {
         );
         ",
     )?;
+    run_migrations(conn)?;
     Ok(())
 }
 

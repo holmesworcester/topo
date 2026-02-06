@@ -1,5 +1,5 @@
 use std::time::{Duration, Instant};
-use poc_7::testutil::{Peer, start_peers, assert_eventually, sync_until_converged};
+use poc_7::testutil::{Peer, start_peers, assert_eventually, sync_until_converged, verify_projection_invariants};
 
 fn test_channel() -> [u8; 32] {
     let mut ch = [0u8; 32];
@@ -31,6 +31,9 @@ async fn test_two_peer_bidirectional_sync() {
     assert_eq!(bob.message_count(), 3);
 
     drop(sync);
+
+    verify_projection_invariants(&alice);
+    verify_projection_invariants(&bob);
 }
 
 #[tokio::test]
@@ -144,14 +147,53 @@ async fn test_recorded_events_isolation() {
     assert_eq!(bob.message_count(), 5);
 
     // recorded_events: local creates + received via sync
-    // Alice created 3 locally, received 2 via sync = 5
-    // Bob created 2 locally, received 3 via sync = 5
     assert_eq!(alice.recorded_events_count(), 5);
     assert_eq!(bob.recorded_events_count(), 5);
 
     // scoped_message_count matches total (all recorded by this peer)
     assert_eq!(alice.scoped_message_count(), 5);
     assert_eq!(bob.scoped_message_count(), 5);
+
+    verify_projection_invariants(&alice);
+    verify_projection_invariants(&bob);
+}
+
+#[tokio::test]
+async fn test_reaction_sync() {
+    let channel = test_channel();
+    let alice = Peer::new("alice", channel);
+    let bob = Peer::new("bob", channel);
+
+    // Alice creates messages, Bob adds reactions
+    let msg1 = alice.create_message("Hello!");
+    let msg2 = alice.create_message("World!");
+    bob.create_reaction(&msg1, "\u{1f44d}");
+    bob.create_reaction(&msg2, "\u{2764}\u{fe0f}");
+
+    // Alice: 2 messages, 0 reactions; Bob: 0 messages, 2 reactions
+    assert_eq!(alice.store_count(), 2);
+    assert_eq!(bob.store_count(), 2);
+    assert_eq!(alice.message_count(), 2);
+    assert_eq!(bob.reaction_count(), 2);
+
+    let sync = start_peers(&alice, &bob);
+
+    assert_eventually(
+        || alice.store_count() == 4 && bob.store_count() == 4,
+        Duration::from_secs(15),
+        "both peers should have 4 events (2 messages + 2 reactions)",
+    ).await;
+
+    drop(sync);
+
+    // Both should have 2 messages and 2 reactions projected
+    assert_eq!(alice.message_count(), 2);
+    assert_eq!(bob.message_count(), 2);
+    assert_eq!(alice.reaction_count(), 2);
+    assert_eq!(bob.reaction_count(), 2);
+
+    verify_projection_invariants(&alice);
+    verify_projection_invariants(&bob);
 }
 
 #[tokio::test]

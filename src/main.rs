@@ -1,12 +1,13 @@
 use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use poc_7::crypto::{hash_event, event_id_to_base64};
-use poc_7::db::{open_connection, schema::create_tables, shareable::Shareable, store::Store};
+use poc_7::db::{open_connection, schema::create_tables};
+use poc_7::events::{self, MessageEvent, ParsedEvent};
 use poc_7::identity::{cert_paths_from_db, local_identity_from_db};
 use poc_7::sync::engine::{accept_loop, connect_loop};
 use poc_7::transport::{
@@ -16,7 +17,6 @@ use poc_7::transport::{
     extract_spki_fingerprint,
     load_or_generate_cert,
 };
-use poc_7::wire::Envelope;
 
 #[derive(Parser)]
 #[command(name = "poc-7")]
@@ -317,6 +317,13 @@ fn parse_channel_hex(channel_hex: &str) -> Result<[u8; 32], Box<dyn std::error::
     Ok(channel_id)
 }
 
+fn current_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
 fn send_message(db_path: &str, channel_hex: &str, content: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let recorded_by = local_identity_from_db(db_path)?;
     let db = open_connection(db_path)?;
@@ -324,36 +331,43 @@ fn send_message(db_path: &str, channel_hex: &str, content: &str) -> Result<(), B
 
     let channel_id = parse_channel_hex(channel_hex)?;
     let author_id: [u8; 32] = rand::random();
+    let created_at_ms = current_timestamp_ms();
 
-    let envelope = Envelope::new_message(channel_id, author_id, content.to_string());
-    let blob = envelope.encode();
+    let msg_event = MessageEvent {
+        created_at_ms,
+        channel_id,
+        author_id,
+        content: content.to_string(),
+    };
+    let blob = events::encode_event(&ParsedEvent::Message(msg_event))
+        .map_err(|e| format!("encode error: {}", e))?;
     let event_id = hash_event(&blob);
-    let created_at_ms = envelope.payload.created_at_ms;
-
-    let store = Store::new(&db);
-    let shareable = Shareable::new(&db);
-
-    store.put(&event_id, &blob)?;
-    shareable.insert(&event_id)?;
 
     db.execute(
         "INSERT OR IGNORE INTO neg_items (ts, id) VALUES (?1, ?2)",
         rusqlite::params![created_at_ms as i64, event_id.as_slice()],
     )?;
 
-    let message_id = event_id_to_base64(&event_id);
+    let event_id_b64 = event_id_to_base64(&event_id);
     let channel_id_b64 = event_id_to_base64(&channel_id);
     let author_id_b64 = event_id_to_base64(&author_id);
     db.execute(
         "INSERT OR IGNORE INTO messages (message_id, channel_id, author_id, content, created_at, recorded_by)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        rusqlite::params![message_id, channel_id_b64, author_id_b64, content, created_at_ms as i64, &recorded_by],
+        rusqlite::params![event_id_b64, channel_id_b64, author_id_b64, content, created_at_ms as i64, &recorded_by],
+    )?;
+
+    // Write to events table
+    db.execute(
+        "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![event_id_b64, "message", blob.as_slice(), "shared", created_at_ms as i64, current_timestamp_ms() as i64],
     )?;
 
     db.execute(
         "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
          VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![&recorded_by, &message_id, created_at_ms as i64, "local_create"],
+        rusqlite::params![&recorded_by, &event_id_b64, created_at_ms as i64, "local_create"],
     )?;
 
     println!("Sent: {}", content);
@@ -366,14 +380,18 @@ fn show_status(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + S
     let db = open_connection(db_path)?;
     create_tables(&db)?;
 
-    let store_count: i64 = db.query_row("SELECT COUNT(*) FROM store", [], |row| row.get(0)).unwrap_or(0);
+    let events_count: i64 = db.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0)).unwrap_or(0);
     let messages_count: i64 = db.query_row(
         "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
         rusqlite::params![&recorded_by],
         |row| row.get(0),
     ).unwrap_or(0);
+    let reactions_count: i64 = db.query_row(
+        "SELECT COUNT(*) FROM reactions WHERE recorded_by = ?1",
+        rusqlite::params![&recorded_by],
+        |row| row.get(0),
+    ).unwrap_or(0);
     let neg_items_count: i64 = db.query_row("SELECT COUNT(*) FROM neg_items", [], |row| row.get(0)).unwrap_or(0);
-    let shareable_count: i64 = db.query_row("SELECT COUNT(*) FROM shareable_events", [], |row| row.get(0)).unwrap_or(0);
     let recorded_events_count: i64 = db.query_row(
         "SELECT COUNT(*) FROM recorded_events WHERE peer_id = ?1",
         rusqlite::params![&recorded_by],
@@ -381,10 +399,10 @@ fn show_status(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + S
     ).unwrap_or(0);
 
     println!("STATUS ({}):", db_path);
-    println!("  Store:     {} events", store_count);
+    println!("  Events:    {} total", events_count);
     println!("  Messages:  {} projected", messages_count);
+    println!("  Reactions: {} projected", reactions_count);
     println!("  Recorded:  {} events", recorded_events_count);
-    println!("  Shareable: {} events", shareable_count);
     println!("  NegItems:  {} indexed", neg_items_count);
 
     Ok(())
@@ -398,9 +416,6 @@ fn generate_messages(db_path: &str, count: usize, channel_hex: &str) -> Result<(
     let channel_id = parse_channel_hex(channel_hex)?;
     let author_id: [u8; 32] = rand::random();
 
-    let store = Store::new(&db);
-    let shareable = Shareable::new(&db);
-
     let mut neg_stmt = db.prepare("INSERT OR IGNORE INTO neg_items (ts, id) VALUES (?1, ?2)")?;
     let mut msg_stmt = db.prepare(
         "INSERT OR IGNORE INTO messages (message_id, channel_id, author_id, content, created_at, recorded_by)
@@ -410,24 +425,33 @@ fn generate_messages(db_path: &str, count: usize, channel_hex: &str) -> Result<(
         "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
          VALUES (?1, ?2, ?3, ?4)"
     )?;
+    let mut events_stmt = db.prepare(
+        "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+    )?;
 
     db.execute("BEGIN", [])?;
     for i in 0..count {
         let content = format!("Message {}", i);
-        let envelope = Envelope::new_message(channel_id, author_id, content.clone());
-        let blob = envelope.encode();
+        let created_at_ms = current_timestamp_ms();
+        let msg_event = MessageEvent {
+            created_at_ms,
+            channel_id,
+            author_id,
+            content: content.clone(),
+        };
+        let blob = events::encode_event(&ParsedEvent::Message(msg_event))
+            .map_err(|e| format!("encode error: {}", e))?;
         let event_id = hash_event(&blob);
-        let created_at_ms = envelope.payload.created_at_ms;
 
-        store.put(&event_id, &blob)?;
-        shareable.insert(&event_id)?;
         neg_stmt.execute(rusqlite::params![created_at_ms as i64, event_id.as_slice()])?;
 
-        let message_id = event_id_to_base64(&event_id);
+        let event_id_b64 = event_id_to_base64(&event_id);
         let channel_id_b64 = event_id_to_base64(&channel_id);
         let author_id_b64 = event_id_to_base64(&author_id);
-        msg_stmt.execute(rusqlite::params![message_id, channel_id_b64, author_id_b64, content, created_at_ms as i64, &recorded_by])?;
-        rec_stmt.execute(rusqlite::params![&recorded_by, &message_id, created_at_ms as i64, "local_create"])?;
+        msg_stmt.execute(rusqlite::params![event_id_b64, channel_id_b64, author_id_b64, content, created_at_ms as i64, &recorded_by])?;
+        events_stmt.execute(rusqlite::params![event_id_b64, "message", blob.as_slice(), "shared", created_at_ms as i64, current_timestamp_ms() as i64])?;
+        rec_stmt.execute(rusqlite::params![&recorded_by, &event_id_b64, created_at_ms as i64, "local_create"])?;
     }
     db.execute("COMMIT", [])?;
 
@@ -500,15 +524,18 @@ fn parse_predicate(s: &str) -> Result<(String, Op, i64), String> {
 
 fn query_field(db: &rusqlite::Connection, field: &str, recorded_by: &str) -> Result<i64, String> {
     match field {
-        "store_count" => db.query_row("SELECT COUNT(*) FROM store", [], |row| row.get(0))
+        "store_count" | "events_count" => db.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
             .map_err(|e| format!("query failed: {}", e)),
         "message_count" => db.query_row(
             "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
             rusqlite::params![recorded_by],
             |row| row.get(0),
         ).map_err(|e| format!("query failed: {}", e)),
-        "shareable_count" => db.query_row("SELECT COUNT(*) FROM shareable_events", [], |row| row.get(0))
-            .map_err(|e| format!("query failed: {}", e)),
+        "reaction_count" => db.query_row(
+            "SELECT COUNT(*) FROM reactions WHERE recorded_by = ?1",
+            rusqlite::params![recorded_by],
+            |row| row.get(0),
+        ).map_err(|e| format!("query failed: {}", e)),
         "neg_items_count" => db.query_row("SELECT COUNT(*) FROM neg_items", [], |row| row.get(0))
             .map_err(|e| format!("query failed: {}", e)),
         "recorded_events_count" => db.query_row(
