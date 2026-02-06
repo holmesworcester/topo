@@ -3,9 +3,8 @@
 // 500k scale. Fix: add a shutdown handshake (initiator sends Done on control,
 // responder drains queues and sends DoneAck, initiator then closes).
 //
-// TODO: Peer authentication — peer_id is currently just the socket address
-// (connection.remote_address()). Any client can connect without proving
-// identity. Requires persistent peer keypairs + cert verification.
+// Peer authentication: peer_id is the hex-encoded SPKI fingerprint from
+// the peer's TLS certificate, verified via PinnedCertVerifier during handshake.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -25,6 +24,7 @@ use crate::transport::{
     StreamConn,
     StreamRecv,
     StreamSend,
+    peer_identity_from_connection,
 };
 use crate::transport::connection::ConnectionError;
 use crate::wire::Envelope;
@@ -569,7 +569,13 @@ pub async fn accept_loop(
                 continue;
             }
         };
-        let peer_id = connection.remote_address().to_string();
+        let peer_id = match peer_identity_from_connection(&connection) {
+            Some(id) => id,
+            None => {
+                warn!("Rejected connection: could not extract peer identity");
+                continue;
+            }
+        };
         info!("Accepted connection from {}", peer_id);
 
         // Inner loop: repeated sync sessions on this connection
@@ -630,7 +636,14 @@ pub async fn connect_loop(
                 continue;
             }
         };
-        let peer_id = connection.remote_address().to_string();
+        let peer_id = match peer_identity_from_connection(&connection) {
+            Some(id) => id,
+            None => {
+                warn!("Could not extract peer identity, retrying...");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+        };
         info!("Connected to {}", peer_id);
 
         // Inner loop: repeated sync sessions on this connection

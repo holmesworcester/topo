@@ -1,5 +1,7 @@
 use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
+use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
@@ -8,10 +10,11 @@ use poc_7::crypto::{hash_event, event_id_to_base64};
 use poc_7::db::{open_connection, schema::create_tables, shareable::Shareable, store::Store};
 use poc_7::sync::engine::{accept_loop, connect_loop};
 use poc_7::transport::{
+    AllowedPeers,
     create_client_endpoint,
     create_server_endpoint,
-    generate_keypair,
-    generate_self_signed_cert,
+    extract_spki_fingerprint,
+    load_or_generate_cert,
 };
 use poc_7::wire::Envelope;
 
@@ -33,6 +36,15 @@ enum Commands {
         /// Peer to connect to (if omitted, just listens)
         #[arg(short = 'r', long)]
         connect: Option<SocketAddr>,
+        #[arg(short, long, default_value = "server.db")]
+        db: String,
+        /// Allowed peer fingerprints (hex, repeatable)
+        #[arg(long = "pin-peer")]
+        pin_peer: Vec<String>,
+    },
+
+    /// Print local SPKI fingerprint (generates cert if needed)
+    Identity {
         #[arg(short, long, default_value = "server.db")]
         db: String,
     },
@@ -112,8 +124,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     match cli.command {
-        Commands::Sync { bind, connect, db } => {
-            run_sync(bind, connect, &db).await?;
+        Commands::Sync { bind, connect, db, pin_peer } => {
+            run_sync(bind, connect, &db, &pin_peer).await?;
+        }
+        Commands::Identity { db } => {
+            run_identity(&db)?;
         }
         Commands::Messages { db, limit } => {
             show_messages(&db, limit)?;
@@ -137,6 +152,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     }
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Identity
+// ---------------------------------------------------------------------------
+
+/// Derive cert/key file paths from a DB path (e.g. "alice.db" -> "alice.cert.der", "alice.key.der")
+fn cert_paths_from_db(db_path: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let base = Path::new(db_path);
+    let stem = base.file_stem().unwrap_or_default().to_str().unwrap_or("peer");
+    let dir = base.parent().unwrap_or_else(|| Path::new("."));
+    let cert_path = dir.join(format!("{}.cert.der", stem));
+    let key_path = dir.join(format!("{}.key.der", stem));
+    (cert_path, key_path)
+}
+
+fn run_identity(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let (cert_path, key_path) = cert_paths_from_db(db_path);
+    let (cert_der, _) = load_or_generate_cert(&cert_path, &key_path)?;
+    let fp = extract_spki_fingerprint(cert_der.as_ref())?;
+    println!("{}", hex::encode(fp));
     Ok(())
 }
 
@@ -514,6 +551,7 @@ async fn run_sync(
     bind: SocketAddr,
     connect: Option<SocketAddr>,
     db_path: &str,
+    pin_peers: &[String],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Initialize DB before spawning concurrent loops (avoids create_tables race)
     {
@@ -521,10 +559,11 @@ async fn run_sync(
         create_tables(&db)?;
     }
 
-    let (signing_key, _) = generate_keypair();
-    let (cert, key) = generate_self_signed_cert(&signing_key)?;
+    let (cert_path, key_path) = cert_paths_from_db(db_path);
+    let (cert, key) = load_or_generate_cert(&cert_path, &key_path)?;
+    let allowed_peers = Arc::new(AllowedPeers::from_hex_strings(pin_peers)?);
 
-    let server_endpoint = create_server_endpoint(bind, cert, key)?;
+    let server_endpoint = create_server_endpoint(bind, cert.clone(), key.clone_key(), allowed_peers.clone())?;
     info!("Listening on {}", server_endpoint.local_addr()?);
 
     let db_owned = db_path.to_string();
@@ -544,7 +583,12 @@ async fn run_sync(
     });
 
     if let Some(remote) = connect {
-        let client_endpoint = create_client_endpoint("0.0.0.0:0".parse()?)?;
+        let client_endpoint = create_client_endpoint(
+            "0.0.0.0:0".parse()?,
+            cert,
+            key,
+            allowed_peers,
+        )?;
         let db = db_owned.clone();
         let connect_handle = tokio::task::spawn_blocking(move || {
             let rt = tokio::runtime::Builder::new_current_thread()

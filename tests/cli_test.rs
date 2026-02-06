@@ -13,7 +13,19 @@ fn random_port() -> u16 {
     listener.local_addr().unwrap().port()
 }
 
-fn start_sync(db: &str, bind_port: u16, connect_port: Option<u16>) -> Child {
+/// Get the SPKI fingerprint for a given DB path (generates cert if needed).
+fn get_identity(db: &str) -> String {
+    let output = Command::new(bin())
+        .arg("identity")
+        .arg("--db")
+        .arg(db)
+        .output()
+        .expect("failed to run identity");
+    assert!(output.status.success(), "identity failed: {}", String::from_utf8_lossy(&output.stderr));
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn start_sync(db: &str, bind_port: u16, connect_port: Option<u16>, pin_peers: &[&str]) -> Child {
     let mut cmd = Command::new(bin());
     cmd.arg("sync")
         .arg("--bind")
@@ -25,6 +37,10 @@ fn start_sync(db: &str, bind_port: u16, connect_port: Option<u16>) -> Child {
 
     if let Some(port) = connect_port {
         cmd.arg("--connect").arg(format!("127.0.0.1:{}", port));
+    }
+
+    for fp in pin_peers {
+        cmd.arg("--pin-peer").arg(fp);
     }
 
     cmd.spawn().expect("failed to start sync process")
@@ -112,12 +128,16 @@ fn test_cli_bidirectional_sync() {
     let alice_port = random_port();
     let bob_port = random_port();
 
-    // Start Alice (just listens)
-    let mut alice = start_sync(&alice_db, alice_port, None);
+    // Get fingerprints for mutual pinning
+    let alice_fp = get_identity(&alice_db);
+    let bob_fp = get_identity(&bob_db);
+
+    // Start Alice (just listens, pins Bob)
+    let mut alice = start_sync(&alice_db, alice_port, None, &[&bob_fp]);
     std::thread::sleep(Duration::from_millis(500));
 
-    // Start Bob (listens + connects to Alice)
-    let mut bob = start_sync(&bob_db, bob_port, Some(alice_port));
+    // Start Bob (listens + connects to Alice, pins Alice)
+    let mut bob = start_sync(&bob_db, bob_port, Some(alice_port), &[&alice_fp]);
     std::thread::sleep(Duration::from_secs(1));
 
     // Alice sends a message
@@ -170,10 +190,14 @@ fn test_cli_ongoing_sync() {
     let alice_port = random_port();
     let bob_port = random_port();
 
+    // Get fingerprints for mutual pinning
+    let alice_fp = get_identity(&alice_db);
+    let bob_fp = get_identity(&bob_db);
+
     // Start both peers with no initial messages
-    let mut alice = start_sync(&alice_db, alice_port, None);
+    let mut alice = start_sync(&alice_db, alice_port, None, &[&bob_fp]);
     std::thread::sleep(Duration::from_millis(500));
-    let mut bob = start_sync(&bob_db, bob_port, Some(alice_port));
+    let mut bob = start_sync(&bob_db, bob_port, Some(alice_port), &[&alice_fp]);
     std::thread::sleep(Duration::from_secs(1));
 
     // Round 1: Alice sends
@@ -220,4 +244,42 @@ fn test_cli_send_and_messages() {
     assert_eq!(messages.len(), 2);
     assert!(messages.contains(&"First message".to_string()));
     assert!(messages.contains(&"Second message".to_string()));
+}
+
+#[test]
+fn test_cli_unpinned_peer_rejected() {
+    // Alice starts without pinning Bob's fingerprint.
+    // Bob connects but should not be able to sync.
+    let tmpdir = tempfile::tempdir().unwrap();
+    let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
+    let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
+
+    let alice_port = random_port();
+    let bob_port = random_port();
+
+    // Get fingerprints
+    let alice_fp = get_identity(&alice_db);
+    let _bob_fp = get_identity(&bob_db);
+
+    // Alice starts with a bogus pin (does NOT pin Bob)
+    let bogus_fp = "0000000000000000000000000000000000000000000000000000000000000000";
+    let mut alice = start_sync(&alice_db, alice_port, None, &[bogus_fp]);
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Bob pins Alice correctly and connects
+    let mut bob = start_sync(&bob_db, bob_port, Some(alice_port), &[&alice_fp]);
+    std::thread::sleep(Duration::from_secs(1));
+
+    // Bob sends a message
+    send_message(&bob_db, "Should not arrive");
+    // Give some time for sync to try
+    std::thread::sleep(Duration::from_secs(3));
+
+    // Alice should NOT have received Bob's message (Bob's cert is not pinned by Alice)
+    assert_now(&alice_db, "store_count == 0");
+
+    let _ = alice.kill();
+    let _ = bob.kill();
+    let _ = alice.wait();
+    let _ = bob.wait();
 }

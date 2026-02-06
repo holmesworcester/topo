@@ -1,12 +1,14 @@
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::crypto::{hash_event, event_id_to_base64, EventId};
 use crate::db::{open_connection, schema::create_tables, shareable::Shareable, store::Store};
 use crate::sync::engine::{accept_loop, connect_loop};
 use crate::transport::{
+    AllowedPeers,
     create_client_endpoint,
     create_server_endpoint,
-    generate_keypair,
+    extract_spki_fingerprint,
     generate_self_signed_cert,
 };
 use crate::wire::Envelope;
@@ -168,7 +170,7 @@ impl Peer {
     }
 }
 
-/// Start continuous sync between two peers.
+/// Start continuous sync between two peers with mutual mTLS pinning.
 ///
 /// Spawns two threads — one running accept_loop (peer A listens),
 /// one running connect_loop (peer B connects). Each thread has its own
@@ -179,19 +181,32 @@ pub fn start_peers(
     peer_a: &Peer,
     peer_b: &Peer,
 ) -> (std::thread::JoinHandle<()>, std::thread::JoinHandle<()>) {
-    let (signing_key, _) = generate_keypair();
-    let (cert, key) = generate_self_signed_cert(&signing_key).expect("failed to generate cert");
+    // Generate a cert for each peer
+    let (cert_a, key_a) = generate_self_signed_cert().expect("failed to generate cert for peer A");
+    let (cert_b, key_b) = generate_self_signed_cert().expect("failed to generate cert for peer B");
+
+    // Extract fingerprints
+    let fp_a = extract_spki_fingerprint(cert_a.as_ref()).expect("failed to extract fp for A");
+    let fp_b = extract_spki_fingerprint(cert_b.as_ref()).expect("failed to extract fp for B");
+
+    // Build mutual AllowedPeers: A allows B, B allows A
+    let allowed_for_a = Arc::new(AllowedPeers::from_fingerprints(vec![fp_b]));
+    let allowed_for_b = Arc::new(AllowedPeers::from_fingerprints(vec![fp_a]));
 
     let listener_endpoint = create_server_endpoint(
         "127.0.0.1:0".parse().unwrap(),
-        cert,
-        key,
+        cert_a,
+        key_a,
+        allowed_for_a,
     ).expect("failed to create server endpoint");
 
     let listener_addr = listener_endpoint.local_addr().expect("failed to get listener addr");
 
     let connector_endpoint = create_client_endpoint(
         "0.0.0.0:0".parse().unwrap(),
+        cert_b,
+        key_b,
+        allowed_for_b,
     ).expect("failed to create client endpoint");
 
     let a_db = peer_a.db_path.clone();

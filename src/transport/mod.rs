@@ -1,22 +1,187 @@
 pub mod cert;
 pub mod connection;
 
-pub use cert::{generate_keypair, generate_self_signed_cert};
+pub use cert::{generate_keypair, generate_self_signed_cert, load_or_generate_cert, extract_spki_fingerprint};
 pub use connection::{DualConnection, StreamConn, StreamRecv, StreamSend};
 
 use quinn::{ClientConfig, Endpoint, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-/// Create a QUIC server endpoint
+/// Set of allowed peer fingerprints (BLAKE2b-256 of SPKI).
+#[derive(Debug, Clone)]
+pub struct AllowedPeers {
+    fingerprints: HashSet<[u8; 32]>,
+}
+
+impl AllowedPeers {
+    /// Build from a list of hex-encoded fingerprints.
+    pub fn from_hex_strings(hexes: &[String]) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let mut fingerprints = HashSet::new();
+        for h in hexes {
+            let bytes = hex::decode(h)?;
+            if bytes.len() != 32 {
+                return Err(format!("fingerprint must be 32 bytes, got {}", bytes.len()).into());
+            }
+            let mut fp = [0u8; 32];
+            fp.copy_from_slice(&bytes);
+            fingerprints.insert(fp);
+        }
+        Ok(Self { fingerprints })
+    }
+
+    /// Build from raw fingerprints.
+    pub fn from_fingerprints(fps: Vec<[u8; 32]>) -> Self {
+        Self { fingerprints: fps.into_iter().collect() }
+    }
+
+    pub fn contains(&self, fp: &[u8; 32]) -> bool {
+        self.fingerprints.contains(fp)
+    }
+}
+
+/// Verifies peer certificates by checking SPKI fingerprint against an allowed set.
+/// Implements both ServerCertVerifier (client verifies server) and
+/// ClientCertVerifier (server verifies client).
+#[derive(Debug)]
+pub struct PinnedCertVerifier {
+    allowed: Arc<AllowedPeers>,
+    crypto_provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl PinnedCertVerifier {
+    pub fn new(allowed: Arc<AllowedPeers>) -> Self {
+        Self {
+            allowed,
+            crypto_provider: Arc::new(rustls::crypto::ring::default_provider()),
+        }
+    }
+
+    fn check_fingerprint(&self, cert_der: &CertificateDer<'_>) -> Result<(), rustls::Error> {
+        let fp = extract_spki_fingerprint(cert_der.as_ref())
+            .map_err(|e| rustls::Error::General(format!("SPKI extraction failed: {}", e)))?;
+        if self.allowed.contains(&fp) {
+            Ok(())
+        } else {
+            Err(rustls::Error::General(format!(
+                "peer fingerprint {} not in allowed set",
+                hex::encode(fp)
+            )))
+        }
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        self.check_fingerprint(end_entity)?;
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.crypto_provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.crypto_provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.crypto_provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+impl rustls::server::danger::ClientCertVerifier for PinnedCertVerifier {
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        self.check_fingerprint(end_entity)?;
+        Ok(rustls::server::danger::ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.crypto_provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.crypto_provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.crypto_provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// Create a QUIC server endpoint with mTLS (requires client cert, verifies against allowed peers).
 pub fn create_server_endpoint(
     bind_addr: SocketAddr,
     cert_der: CertificateDer<'static>,
     key_der: PrivatePkcs8KeyDer<'static>,
+    allowed_peers: Arc<AllowedPeers>,
 ) -> Result<Endpoint, Box<dyn std::error::Error + Send + Sync>> {
+    let verifier = Arc::new(PinnedCertVerifier::new(allowed_peers));
+
     let server_crypto = rustls::ServerConfig::builder()
-        .with_no_client_auth()
+        .with_client_cert_verifier(verifier)
         .with_single_cert(vec![cert_der], key_der.into())?;
 
     let server_config = ServerConfig::with_crypto(Arc::new(
@@ -27,15 +192,19 @@ pub fn create_server_endpoint(
     Ok(endpoint)
 }
 
-/// Create a QUIC client endpoint
+/// Create a QUIC client endpoint with mTLS (presents client cert, verifies server against allowed peers).
 pub fn create_client_endpoint(
     bind_addr: SocketAddr,
+    cert_der: CertificateDer<'static>,
+    key_der: PrivatePkcs8KeyDer<'static>,
+    allowed_peers: Arc<AllowedPeers>,
 ) -> Result<Endpoint, Box<dyn std::error::Error + Send + Sync>> {
-    // Client config that skips certificate verification (for self-signed certs)
+    let verifier = Arc::new(PinnedCertVerifier::new(allowed_peers));
+
     let crypto = rustls::ClientConfig::builder()
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
-        .with_no_client_auth();
+        .with_custom_certificate_verifier(verifier)
+        .with_client_auth_cert(vec![cert_der], key_der.into())?;
 
     let client_config = ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?,
@@ -46,57 +215,45 @@ pub fn create_client_endpoint(
     Ok(endpoint)
 }
 
-/// Placeholder: accepts any certificate without verification.
-///
-/// TODO: Replace with proper certificate verification. Options:
-/// - Trust-on-first-use (TOFU): pin peer's cert on first connection
-/// - Out-of-band key exchange: share cert fingerprints manually
-/// Requires persistent peer identity (keypair saved to disk) first.
-#[derive(Debug)]
-struct SkipServerVerification;
+/// Extract peer identity from a QUIC connection's TLS session.
+/// Returns the hex-encoded SPKI fingerprint of the peer's certificate.
+pub fn peer_identity_from_connection(conn: &quinn::Connection) -> Option<String> {
+    let certs = conn.peer_identity()?;
+    let certs = certs.downcast::<Vec<CertificateDer<'static>>>().ok()?;
+    let first = certs.first()?;
+    let fp = extract_spki_fingerprint(first.as_ref()).ok()?;
+    Some(hex::encode(fp))
+}
 
-impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pinned_verifier_accepts_allowed_cert() {
+        let (cert, _) = generate_self_signed_cert().unwrap();
+        let fp = extract_spki_fingerprint(cert.as_ref()).unwrap();
+        let allowed = Arc::new(AllowedPeers::from_fingerprints(vec![fp]));
+        let verifier = PinnedCertVerifier::new(allowed);
+        assert!(verifier.check_fingerprint(&cert).is_ok());
     }
 
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    #[test]
+    fn test_pinned_verifier_rejects_unknown_cert() {
+        let (cert, _) = generate_self_signed_cert().unwrap();
+        let (other_cert, _) = generate_self_signed_cert().unwrap();
+        let fp = extract_spki_fingerprint(other_cert.as_ref()).unwrap();
+        let allowed = Arc::new(AllowedPeers::from_fingerprints(vec![fp]));
+        let verifier = PinnedCertVerifier::new(allowed);
+        assert!(verifier.check_fingerprint(&cert).is_err());
     }
 
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![
-            rustls::SignatureScheme::RSA_PKCS1_SHA256,
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::RSA_PKCS1_SHA384,
-            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
-            rustls::SignatureScheme::RSA_PKCS1_SHA512,
-            rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
-            rustls::SignatureScheme::RSA_PSS_SHA256,
-            rustls::SignatureScheme::RSA_PSS_SHA384,
-            rustls::SignatureScheme::RSA_PSS_SHA512,
-            rustls::SignatureScheme::ED25519,
-        ]
+    #[test]
+    fn test_allowed_peers_from_hex() {
+        let (cert, _) = generate_self_signed_cert().unwrap();
+        let fp = extract_spki_fingerprint(cert.as_ref()).unwrap();
+        let hex_str = hex::encode(fp);
+        let allowed = AllowedPeers::from_hex_strings(&[hex_str]).unwrap();
+        assert!(allowed.contains(&fp));
     }
 }
