@@ -6,18 +6,23 @@ This document is ordered exactly as we should build it.
 
 1. `Phase -1`: CLI + daemon around the current simple prototype.
 2. `Phase 0`: mTLS + QUIC transport baseline finalized.
-3. `Phase 1`: Event schema, identity semantics, multitenant recording model.
-4. `Phase 2`: Projector core and dependency blocking (without full queue complexity).
-5. `Phase 2.5`: Shared signer substrate (`signed_by` dependency blocking + signature verification ordering).
-6. `Phase 3`: Encrypted events using the same dependency/projector model, tested first with per-instance PSK.
-7. `Phase 4`: Durable queue architecture (`ingress`, `project`, `egress`) and workers.
-8. `Phase 5`: Non-identity special-case projector logic (deletion/emitted-events).
-9. `Phase 6`: Performance hardening, observability, and scaling passes.
-10. `Phase 7`: TLA-first minimal identity layer for trust-anchor cascade, removal, and sender-subjective encryption.
+3. `Phase 0.5`: Provisional multi-workspace/tenant routing smoke test (CLI-supplied key material).
+4. `Phase 1`: Event schema, recording semantics, and multitenancy foundation.
+5. `Phase 2`: Projector core and dependency blocking (without full queue complexity).
+6. `Phase 2.5`: Shared signer substrate (`signed_by` dependency blocking + signature verification ordering).
+7. `Phase 2.6`: Multitenancy scoped-projection/query gate (with signer substrate active).
+8. `Phase 3`: Encrypted events using the same dependency/projector model, tested first with per-instance PSK.
+9. `Phase 4`: Durable queue architecture (`ingress`, `project`, `egress`) and workers.
+10. `Phase 5`: Non-identity special-case projector logic (deletion/emitted-events).
+11. `Phase 6`: Performance hardening, observability, and scaling passes.
+12. `Phase 7`: TLA-first minimal identity layer for trust-anchor cascade, removal, and sender-subjective encryption.
 
 Scheduling note:
-- `signed_by` dependency blocking + signature verification ordering is tackled in Phase 2.5 (right after Phase 2).
-- Phase 2.5 must be complete before starting identity projectors in Phase 7.
+- two-tier multitenancy plan:
+  - Phase 0.5 proves provisional transport/workspace separation and CLI workspace views.
+  - Phase 2.6 proves scoped projection/query separation once projector + signer substrate exist.
+- `signed_by` dependency blocking + signature verification ordering is tackled in Phase 2.5.
+- Phase 2.5 and Phase 2.6 must be complete before starting identity projectors in Phase 7.
 
 ## 1.1 `codex-simplified` baseline gap audit (current state)
 
@@ -41,12 +46,16 @@ Current code in `poc-7` (post-move from `codex-simplified`) is a useful sync pro
    - no split invite types (`user_invite`, `device_invite`) and no TLA-derived identity projector guards.
 8. No shared signer substrate yet:
    - no uniform `signed_by` dependency blocking + signature verification ordering across event types.
+9. No two-tier multitenancy verification yet:
+   - no Phase 0.5 routing smoke coverage and no post-projector scoped-projection gate.
 
 Gap-to-phase mapping:
 - wire framing + schema normalization -> `Phase 1`
 - strict pinned mTLS -> `Phase 0`
+- provisional workspace routing smoke -> `Phase 0.5`
 - projector entrypoint + dep/blocking core -> `Phase 2`
 - shared signer dependency + signature pipeline -> `Phase 2.5`
+- scoped multitenancy projection/query gate -> `Phase 2.6`
 - encryption adapter + key deps -> `Phase 3`
 - queue/worker architecture -> `Phase 4`
 - deletion/emits explicit rules -> `Phase 5`
@@ -141,7 +150,9 @@ Phase -1 is functionally complete. All deliverables are met:
 ### Invariants
 
 - No transit event wrapping layer in this model.
-- Event-level signatures still enforce event authenticity/authorization.
+- Phase 0 does not require event signature/dependency implementation.
+- Event signature/dependency enforcement is delivered in Phase 2.5 (`signed_by` blocking + signature verification ordering).
+- Transport authentication must remain separate from event authorization semantics.
 
 ### Exit criteria
 
@@ -220,21 +231,42 @@ Do not use as final security model:
 
 ---
 
-## 5. Phase 1: Event Schema, Identity, and Multitenancy
+## 4.5 Phase 0.5: Provisional Multi-Workspace Routing Smoke
+
+Goal: validate basic workspace/tenant separation early, before deep projector/identity complexity.
+
+### Deliverables
+
+1. Start two provisional workspace/tenant contexts from CLI/profile supplied key material.
+2. Route transport ingress into the correct tenant scope (`recorded_by`) for each context.
+3. Expose CLI workspace selector/scope so reads show each workspace independently.
+4. Demonstrate separate `recorded_events` history per workspace with no cross-display.
+
+### Scope boundaries
+
+- This is a routing/scope smoke phase, not full identity semantics.
+- It uses the same temporary trust source as Phase 0 (CLI/profile allowlist), not identity events.
+- Signature/dependency enforcement is still deferred to Phase 2.5.
+
+### Exit criteria
+
+1. Two workspace contexts can run concurrently and exchange events in isolation.
+2. Event created/received in workspace A does not appear in workspace B scoped CLI queries.
+3. Basic scoped DB checks pass for `recorded_events` and at least one projected table.
+
+---
+
+## 5. Phase 1: Event Schema, Recording Semantics, and Multitenancy Foundation
 
 ## 5.1 Single-source event schema
 
 Define event shape once and drive these from it:
 - wire encode/decode
-- signing bytes
-- validation
+- canonical signing bytes metadata (consumed by signer substrate in Phase 2.5)
+- signer metadata fields (`signed_by`, `signer_type`, `signature`)
+- validation scaffolding
 - projector auto-row mapping metadata
 - dependency extraction metadata (`is_event_ref`, `required`)
-
-Signature/dependency rule (required):
-- signed events must declare `signed_by_peer_id` (or equivalent signer-id field) in schema metadata.
-- signer-id field is treated as a normal required dependency.
-- if signer dependency is missing, event blocks in `blocked_event_deps` before signature verification is attempted.
 
 Field encoding kinds:
 - `fixed_bytes(N)`
@@ -257,13 +289,18 @@ This supports large events like `file_slice` while keeping deterministic signing
   1. sync frame header carrying message type + payload length,
   2. event decoder dispatch by `event_type` schema,
   3. per-type bounds checks from schema max lengths.
+- `payload_len` is a framing delimiter, not semantic authority:
+  - for fixed-size event types it must exactly match schema size,
+  - for variable-size types decoder must consume exactly `payload_len`,
+  - any mismatch rejects the frame.
 - do not keep any global fixed event blob size constant once Phase 1 is complete.
 
-## 5.3 Identity semantics (explicit)
+## 5.3 Signer and recording semantics (explicit)
 
-- `author_peer_id`: canonical event author/signer.
+- `signed_by`: canonical signer reference (event id).
+- `signer_type`: signer keyspace discriminator (`peer | user | workspace | invite`).
 - `recorded_by`: local tenant peer identity that recorded/projected the event.
-- Both are `peer_id` typed values and intentionally separate.
+- `signed_by`/`signer_type` and `recorded_by` are intentionally separate concerns.
 - No `recorded_via` field.
 - `recorded_by` is derived from authenticated local connection/profile identity, not from event payload claims.
 - Remote transport identity for metadata is `via_peer_id`, resolved from verified cert SPKI -> `peer_id`.
@@ -318,12 +355,14 @@ CREATE TABLE peer_endpoint_observations (
     via_peer_id TEXT NOT NULL,
     origin_ip TEXT NOT NULL,
     origin_port INTEGER NOT NULL,
-    first_seen_at INTEGER NOT NULL,
-    last_seen_at INTEGER NOT NULL,
-    PRIMARY KEY (recorded_by, via_peer_id, origin_ip, origin_port)
+    observed_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    PRIMARY KEY (recorded_by, via_peer_id, origin_ip, origin_port, observed_at)
 );
-CREATE INDEX idx_peer_endpoint_last_seen
-    ON peer_endpoint_observations(recorded_by, via_peer_id, last_seen_at);
+CREATE INDEX idx_peer_endpoint_expires
+    ON peer_endpoint_observations(recorded_by, via_peer_id, expires_at);
+CREATE INDEX idx_peer_endpoint_lookup
+    ON peer_endpoint_observations(recorded_by, via_peer_id, origin_ip, origin_port);
 ```
 
 ### Tenant-safety rule
@@ -331,7 +370,8 @@ CREATE INDEX idx_peer_endpoint_last_seen
 - Subjective tables are keyed by tenant identity first (`peer_id`/`recorded_by`).
 - Query/projection APIs should use a tenant-bound wrapper (`TenantDb { peer_id, tx }`) rather than raw DB handles.
 - `recorded_events` is the per-event receive journal (`recorded_at` ~= local `received_at`).
-- Endpoint/IP metadata is intentionally separate in `peer_endpoint_observations` for frequent TTL purge and intro hinting.
+- Endpoint/IP metadata is intentionally separate and append-only in `peer_endpoint_observations` for frequent TTL purge and intro hinting.
+- If needed, `first_seen`/`last_seen` are derived by `MIN(observed_at)`/`MAX(observed_at)` queries, not stored via in-place updates.
 
 ## 5.6 Table creation and naming conventions (required)
 
@@ -391,6 +431,18 @@ Entry-point requirement:
 - `local_create`, `wire_receive`, `replay`, and unblock retries must all invoke `project_one`.
 - no alternate projection code paths for specific ingestion sources.
 
+DRY split (required):
+- Shared projection pipeline code owns:
+  1. canonical event load/decode dispatch,
+  2. dependency extraction + missing-dependency block writes,
+  3. signer resolution + signature verification ordering (Phase 2.5),
+  4. terminal state writes (`valid`/`block`/`reject`) + queue transitions,
+  5. generic effect application (`auto_row`, `emit_events`, common write helpers).
+- Per-event projector code owns only:
+  1. event-specific predicate/policy checks,
+  2. event-specific effect declaration (`ProjectorEffects`) for the shared applier.
+- Per-event projector code must not implement its own dependency walker, signer verifier, queue handling, or terminal-state writer.
+
 ### Default behavior
 
 - Most event types use predicate + auto-write.
@@ -434,7 +486,7 @@ Rules:
 - Extract refs from schema-marked fields on each projection attempt.
 - If required refs are present: continue projection.
 - If any required refs are missing: write rows in `blocked_event_deps` and return `Block`.
-- Signer refs (`signed_by_peer_id` or equivalent) are dependency refs and use the same blocking/unblocking path.
+- Signer refs (`signed_by` + `signer_type`) are dependency metadata and use the same blocking/unblocking path.
 - Signature verification is attempted only after signer deps and other required deps are available.
 - Do not persist full `event_dependencies` yet.
 - Use one dependency resolver for all event families (content, identity, encrypted wrappers, invites).
@@ -500,25 +552,43 @@ Usually not required at this stage, but useful if blocker behavior gets ambiguou
 ## 6.6 Phase 2.5: Shared signer substrate (required before identity)
 
 Implement one signer pipeline for all signed event types:
-1. signer field (`signed_by_peer_id` or equivalent) is schema-declared dependency metadata.
+1. signer metadata is schema-declared (`signed_by`, `signer_type`, `signature`).
 2. missing signer dependency uses normal blocking/unblocking (`blocked_event_deps`).
-3. signature verification runs only after dependency resolution.
+3. resolve signer key by (`signer_type`, `signed_by`) only after dependency resolution.
 4. invalid signature is `Reject`, never `Block`.
 5. signer verification helper path is shared across event families (no identity-specific signer path later).
 
 This phase should be completed immediately after Phase 2 and before Phase 3/Phase 7 work.
+
+## 6.7 Phase 2.6: Multitenancy Scoped Projection/Query Gate (Tier 2)
+
+Goal: validate full tenant/workspace scoping after projector + signer substrate are active.
+
+Required checks:
+1. Run two workspace/tenant contexts in one DB with shared physical projection tables.
+2. Project overlapping event shapes in both tenants and verify subjective rows remain isolated by tenant key (`peer_id`/`recorded_by`).
+3. Confirm signer pipeline behavior remains tenant-scoped (missing/invalid signer in tenant A does not leak effects into tenant B).
+4. Verify CLI workspace selection only reads tenant-scoped data.
+5. Add/keep a DB scoping checker that fails on unscoped reads/writes.
+
+Exit criteria:
+1. Cross-tenant leak tests fail correctly when scope guards are removed.
+2. Re-enable scope guards and pass full scoped projection/query suite.
+3. This gate passes before identity projector implementation (Phase 7).
 
 ---
 
 ## 7. Phase 3: Encrypted Events With The Same Model
 
 Goal: encrypted events behave like normal events for dependencies and projection.
-Precondition: Phase 2.5 signer substrate is already active.
+Precondition: Phase 2.5 signer substrate and Phase 2.6 multitenancy gate are already active.
 
 ## 7.1 Registry integration
 
 - Encrypted wrapper is a normal event type in the same event registry.
-- It uses flat fields, for example: `key_event_id`, `ciphertext`, `nonce`, `auth_tag`, optional clear `inner_type_code`.
+- It uses flat fields, for example: `key_event_id`, `inner_type_code`, `ciphertext`, `nonce`, `auth_tag`.
+- `inner_type_code` is mandatory (fixed-width) for this phase.
+- Do not make `inner_type_code` optional while `ciphertext` remains variable-length.
 - No separate encryption registry.
 
 ## 7.2 Materialization model (definition)
@@ -548,11 +618,12 @@ Rule:
 4. Verify signature/auth over canonical encrypted bytes.
 5. Decrypt ciphertext using key from `key_event_id`.
 6. Decode inner event with normal registry.
-7. If inner type is encrypted wrapper: reject.
-8. Extract inner deps from inner schema metadata.
-9. If inner deps missing: write `blocked_event_deps` using outer `event_id` and return `Block`.
-10. Call the normal projector for the inner type.
-11. Mark outer event `valid` only after inner projection succeeds.
+7. Verify decoded inner type matches outer `inner_type_code`; mismatch -> `Reject(inner_type_mismatch)`.
+8. If inner type is encrypted wrapper: reject.
+9. Extract inner deps from inner schema metadata.
+10. If inner deps missing: write `blocked_event_deps` using outer `event_id` and return `Block`.
+11. Call the normal projector for the inner type.
+12. Mark outer event `valid` only after inner projection succeeds.
 
 ## 7.5 Plaintext storage policy
 
@@ -639,7 +710,7 @@ Separate queue tables stay simpler operationally.
 
 ## 8.3 Worker stages
 
-1. `ingress worker`: QUIC frame -> canonical event insert -> record by tenant -> upsert endpoint observation -> enqueue project.
+1. `ingress worker`: QUIC frame -> canonical event insert -> record by tenant -> insert endpoint observation row (append-only) -> enqueue project.
 2. `project worker`: claim row -> project path (`valid`/`block`/`reject`) -> dequeue.
 3. `egress worker`: dequeue by `connection_id` -> send frame -> mark `sent_at`/retry.
 4. `cleanup worker`: purge stale ingress/sent egress rows, reclaim expired leases, TTL-purge old endpoint observations.
@@ -711,13 +782,13 @@ Need not be atomic with projection:
 Use `INSERT OR IGNORE` for:
 - immutable canonical events,
 - idempotent projection materialization,
-- queue dedupe insertions.
+- queue dedupe insertions,
+- append-only endpoint observation rows.
 
 Use `ON CONFLICT DO UPDATE` for:
 - mutable cursor/checkpoint state,
 - lease/heartbeat/retry metadata,
-- sync state snapshots,
-- endpoint observation refresh (`last_seen_at`).
+- sync state snapshots.
 
 Avoid broad `INSERT OR REPLACE`.
 
@@ -866,6 +937,9 @@ Not in scope yet:
   - invalid signature rejects,
   - valid signature passes and continues policy checks.
 - Encrypted wrapper flow, including nested-encryption rejection.
+- Encrypted wrapper `inner_type_code` invariants:
+  - mandatory field present for every encrypted wrapper event,
+  - mismatch between outer `inner_type_code` and decrypted inner type rejects.
 - Source-isomorphism checks: `local_create`, `wire_receive`, and `replay` converge through the same `project_one` semantics and yield identical projected state.
 
 ## 12.4 Replay/reproject/reorder invariants
@@ -1012,6 +1086,9 @@ Must implement:
 2. blocked-only dependency persistence (`blocked_event_deps`).
 3. set-based unblock and requeue SQL.
 4. `create_event_sync` success-only-on-valid contract.
+5. explicit DRY split enforcement:
+   - shared pipeline handles deps/signer/queues/terminal writes,
+   - per-event projector handles predicate + effect declaration only.
 
 Common mistakes:
 - adding a separate local create fast-path projector.
@@ -1024,9 +1101,9 @@ Definition of done:
 ## 15.5A Phase `2.5` implementation checklist (signer substrate)
 
 Must implement:
-1. schema metadata for signer dependency (`signed_by_peer_id` or equivalent).
+1. schema metadata for signer fields (`signed_by`, `signer_type`, `signature`).
 2. signer dependency blocking via `blocked_event_deps`.
-3. signature verification after dependency resolution and before policy checks.
+3. signer resolution + signature verification after dependency resolution and before policy checks.
 4. invalid signature -> `Reject` (not `Block`).
 5. shared signer helper path across all signed event families.
 
@@ -1043,13 +1120,16 @@ Definition of done:
 
 Must implement:
 1. encrypted wrapper as a normal registry type.
-2. materialization adapter (decrypt -> inner `EventView` -> normal projector).
-3. nested encrypted rejection.
-4. PSK harness tests before identity wrapping.
+2. mandatory `inner_type_code` field in encrypted wrapper schema.
+3. materialization adapter (decrypt -> inner `EventView` -> normal projector).
+4. enforce `inner_type_code` == decoded inner type.
+5. nested encrypted rejection.
+6. PSK harness tests before identity wrapping.
 
 Common mistakes:
 - introducing a separate persisted plaintext queue too early.
 - introducing separate dependency logic for key blockers.
+- making `inner_type_code` optional while relying on variable-length ciphertext framing.
 
 Definition of done:
 - missing key blocks, wrong key rejects, correct key projects,
