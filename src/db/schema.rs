@@ -24,9 +24,12 @@ fn needs_messages_migration(conn: &Connection) -> SqliteResult<bool> {
 
 /// Migrate Phase 0 messages table to Phase 0.5 schema.
 /// Adds recorded_by column with empty string default, rebuilds PK to (recorded_by, message_id).
+/// Wrapped in an explicit transaction for atomicity.
 fn migrate_messages_v1_to_v2(conn: &Connection) -> SqliteResult<()> {
     conn.execute_batch(
         "
+        BEGIN IMMEDIATE;
+
         -- Create the new messages table with (recorded_by, message_id) PK
         CREATE TABLE messages_v2 (
             message_id TEXT NOT NULL,
@@ -52,9 +55,29 @@ fn migrate_messages_v1_to_v2(conn: &Connection) -> SqliteResult<()> {
         -- Recreate indexes on the new table
         CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel_id, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_messages_recorded ON messages(recorded_by, created_at DESC);
+
+        COMMIT;
         ",
     )?;
     Ok(())
+}
+
+/// Backfill legacy rows (recorded_by = '') to the given identity.
+/// Returns the number of rows updated.
+pub fn backfill_legacy_messages(conn: &Connection, recorded_by: &str) -> SqliteResult<usize> {
+    conn.execute(
+        "UPDATE messages SET recorded_by = ?1 WHERE recorded_by = ''",
+        rusqlite::params![recorded_by],
+    )
+}
+
+/// Count legacy rows that have not been backfilled (recorded_by = '').
+pub fn count_legacy_messages(conn: &Connection) -> SqliteResult<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM messages WHERE recorded_by = ''",
+        [],
+        |row| row.get(0),
+    )
 }
 
 /// Create all tables for the sync system, migrating from Phase 0 if needed.
@@ -270,5 +293,56 @@ mod tests {
         create_tables(&conn).unwrap();
         // After create_tables, messages exists with recorded_by — no migration needed
         assert!(!needs_messages_migration(&conn).unwrap());
+    }
+
+    #[test]
+    fn test_backfill_legacy_messages() {
+        let conn = open_in_memory().unwrap();
+
+        // Create Phase 0 schema and insert data
+        conn.execute_batch(
+            "
+            CREATE TABLE messages (
+                message_id TEXT PRIMARY KEY,
+                channel_id TEXT NOT NULL,
+                author_id TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            ",
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO messages VALUES ('msg1', 'ch1', 'auth1', 'Hello', 1000)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO messages VALUES ('msg2', 'ch1', 'auth2', 'World', 2000)",
+            [],
+        ).unwrap();
+
+        // Migrate
+        create_tables(&conn).unwrap();
+
+        // Legacy rows exist
+        assert_eq!(count_legacy_messages(&conn).unwrap(), 2);
+
+        // Backfill to a concrete identity
+        let updated = backfill_legacy_messages(&conn, "peer_abc123").unwrap();
+        assert_eq!(updated, 2);
+
+        // No more legacy rows
+        assert_eq!(count_legacy_messages(&conn).unwrap(), 0);
+
+        // Messages are now visible under the backfilled identity
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE recorded_by = 'peer_abc123'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count, 2);
+
+        // Backfill again is a no-op
+        let updated = backfill_legacy_messages(&conn, "peer_abc123").unwrap();
+        assert_eq!(updated, 0);
     }
 }

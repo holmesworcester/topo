@@ -6,7 +6,7 @@ use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use poc_7::crypto::{hash_event, event_id_to_base64};
-use poc_7::db::{open_connection, schema::create_tables, shareable::Shareable, store::Store};
+use poc_7::db::{open_connection, schema::{create_tables, backfill_legacy_messages, count_legacy_messages}, shareable::Shareable, store::Store};
 use poc_7::identity::{cert_paths_from_db, load_identity_from_db, local_identity_from_db};
 use poc_7::sync::engine::{accept_loop, connect_loop};
 use poc_7::transport::{
@@ -85,6 +85,12 @@ enum Commands {
         channel: String,
     },
 
+    /// Backfill legacy messages (from Phase 0 migration) to the local identity
+    BackfillIdentity {
+        #[arg(short, long, default_value = "server.db")]
+        db: String,
+    },
+
     /// Assert a predicate holds right now (exit 0 = pass, exit 1 = fail)
     AssertNow {
         /// Predicate: "field op value" (e.g. "store_count >= 10")
@@ -142,6 +148,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Commands::Generate { count, db, channel } => {
             generate_messages(&db, count, &channel)?;
         }
+        Commands::BackfillIdentity { db } => {
+            backfill_identity(&db)?;
+        }
         Commands::AssertNow { predicate, db } => {
             let code = run_assert_now(&db, &predicate)?;
             std::process::exit(code);
@@ -164,6 +173,22 @@ fn run_identity(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + 
     let (cert_der, _) = load_or_generate_cert(&cert_path, &key_path)?;
     let fp = extract_spki_fingerprint(cert_der.as_ref())?;
     println!("{}", hex::encode(fp));
+    Ok(())
+}
+
+fn backfill_identity(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let recorded_by = local_identity_from_db(db_path)?;
+    let db = open_connection(db_path)?;
+    create_tables(&db)?;
+
+    let legacy_count = count_legacy_messages(&db)?;
+    if legacy_count == 0 {
+        println!("No legacy messages to backfill.");
+        return Ok(());
+    }
+
+    let updated = backfill_legacy_messages(&db, &recorded_by)?;
+    println!("Backfilled {} legacy messages to identity {}", updated, &recorded_by[..16]);
     Ok(())
 }
 
@@ -384,12 +409,17 @@ fn show_status(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + S
         |row| row.get(0),
     ).unwrap_or(0);
 
+    let legacy_count = count_legacy_messages(&db)?;
+
     println!("STATUS ({}):", db_path);
     println!("  Store:     {} events", store_count);
     println!("  Messages:  {} projected", messages_count);
     println!("  Recorded:  {} events", recorded_events_count);
     println!("  Shareable: {} events", shareable_count);
     println!("  NegItems:  {} indexed", neg_items_count);
+    if legacy_count > 0 {
+        println!("  Legacy:    {} unscoped messages (run 'backfill-identity' to assign)", legacy_count);
+    }
 
     Ok(())
 }

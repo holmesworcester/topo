@@ -290,22 +290,59 @@ async fn test_cross_workspace_isolation() {
     assert_eq!(peer_b1.scoped_message_count(), 6);
     assert_eq!(peer_b2.scoped_message_count(), 6);
 
-    // Cross-check: A peers have zero B events in their recorded_events
+    // Cross-check: assert zero overlap in event IDs between workspace A and B stores.
+    // This is a stronger isolation proof than checking peer_id (which is always local).
+    use std::collections::HashSet;
+
     let a1_db = open_connection(&peer_a1.db_path).expect("open a1 db");
-    let a1_has_b_events: i64 = a1_db.query_row(
-        "SELECT COUNT(*) FROM recorded_events WHERE peer_id IN (?1, ?2)",
-        rusqlite::params![&peer_b1.identity, &peer_b2.identity],
-        |row| row.get(0),
-    ).unwrap();
-    assert_eq!(a1_has_b_events, 0, "peerA1 should have no events from workspace B");
+    let a_event_ids: HashSet<String> = a1_db
+        .prepare("SELECT id FROM store")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<HashSet<_>, _>>()
+        .unwrap();
 
     let b1_db = open_connection(&peer_b1.db_path).expect("open b1 db");
-    let b1_has_a_events: i64 = b1_db.query_row(
-        "SELECT COUNT(*) FROM recorded_events WHERE peer_id IN (?1, ?2)",
-        rusqlite::params![&peer_a1.identity, &peer_a2.identity],
-        |row| row.get(0),
-    ).unwrap();
-    assert_eq!(b1_has_a_events, 0, "peerB1 should have no events from workspace A");
+    let b_event_ids: HashSet<String> = b1_db
+        .prepare("SELECT id FROM store")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<HashSet<_>, _>>()
+        .unwrap();
+
+    let overlap: Vec<&String> = a_event_ids.intersection(&b_event_ids).collect();
+    assert!(
+        overlap.is_empty(),
+        "workspace A and B should have zero overlapping event IDs, found {} shared: {:?}",
+        overlap.len(),
+        &overlap[..overlap.len().min(5)],
+    );
+
+    // Also verify message_ids don't overlap across workspaces
+    let a_msg_ids: HashSet<String> = a1_db
+        .prepare("SELECT message_id FROM messages")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<HashSet<_>, _>>()
+        .unwrap();
+
+    let b_msg_ids: HashSet<String> = b1_db
+        .prepare("SELECT message_id FROM messages")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<HashSet<_>, _>>()
+        .unwrap();
+
+    let msg_overlap: Vec<&String> = a_msg_ids.intersection(&b_msg_ids).collect();
+    assert!(
+        msg_overlap.is_empty(),
+        "workspace A and B should have zero overlapping message IDs, found {} shared",
+        msg_overlap.len(),
+    );
 }
 
 #[tokio::test]
