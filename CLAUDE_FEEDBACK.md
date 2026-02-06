@@ -155,3 +155,58 @@ need_ids = need_set.into_iter().collect();
 ```
 
 This was causing `have_ids.len()` to report 12312 when only 5000 unique items existed.
+
+---
+
+## Issue: SQLite Storage Bug with "Infinity" Bounds (FIXED)
+
+### Symptoms
+
+Unit tests with disjoint datasets showed ~18% item loss:
+
+```
+InMem_A + SQLite_B: have=5000, need=4097  (SQLite responder FAILS)
+SQLite_A + InMem_B: have=5000, need=5000  (SQLite initiator OK)
+```
+
+The bug only manifested when SQLite storage was used as the **responder**.
+
+### Root Cause
+
+The `find_lower_bound` function had two bugs:
+
+1. **Integer overflow**: Negentropy uses `u64::MAX` (18446744073709551615) as an "infinity" bound meaning "end of all items". The code cast this to `i64`, causing overflow to -1:
+   ```rust
+   let target_ts = value.item.timestamp as i64;  // u64::MAX → -1
+   ```
+
+2. **Limited scan range**: The scan was limited to `BLOCK_SIZE + 1` items, so when the block lookup returned wrong results (due to overflow), the function returned 4097 instead of `last` (5000).
+
+### Debug Output
+
+```
+find_lower_bound(2284, 5000, ts=18446744073709551615) -> 4097  // WRONG, should be 5000
+```
+
+### Fix
+
+Added early return for "infinity" bounds and removed the scan limit:
+
+```rust
+fn find_lower_bound(&self, first: usize, last: usize, value: &Bound) -> usize {
+    // Handle "infinity" bound - negentropy uses u64::MAX to mean "end of all items"
+    if value.item.timestamp >= i64::MAX as u64 {
+        return last;
+    }
+    // ... rest of implementation with unbounded scan
+}
+```
+
+### Result
+
+All 51 tests pass. SQLite storage now works correctly as both initiator and responder:
+
+```
+InMem_A + SQLite_B: have=5000, need=5000 ✓
+SQLite_A + InMem_B: have=5000, need=5000 ✓
+```
