@@ -1,9 +1,13 @@
 // Peer authentication: peer_id is the hex-encoded SPKI fingerprint from
 // the peer's TLS certificate, verified via PinnedCertVerifier during handshake.
 //
-// Shutdown: initiator sends Done on control after flushing outgoing data,
-// responder drains its own queue and replies DoneAck. Both sides close
-// only after the handshake completes, preventing data loss.
+// Shutdown protocol (prevents data loss under cross-stream reordering):
+// 1. Each side sends DataDone on the data stream after flushing all events.
+// 2. Initiator sends Done on control after its DataDone.
+// 3. Responder receives Done, finishes sending, sends DataDone on data,
+//    waits for initiator's DataDone to be consumed, then sends DoneAck.
+// 4. Initiator receives DoneAck, waits for responder's DataDone, exits.
+// Both sides gate exit on data-plane drain confirmation, not just control.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -147,16 +151,22 @@ pub fn batch_writer(
     }
 }
 
+/// Spawn data receiver task. Returns:
+/// - `shutdown_tx`: forced shutdown (timeout fallback only)
+/// - `data_drained_rx`: signals when peer's DataDone marker is received (all data consumed)
+/// - `JoinHandle`: task handle
 pub fn spawn_data_receiver<R>(
     mut data_recv: R,
     ingest_tx: mpsc::Sender<(EventId, Vec<u8>)>,
     bytes_received: Arc<AtomicU64>,
-) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>)
+) -> (oneshot::Sender<()>, oneshot::Receiver<()>, tokio::task::JoinHandle<()>)
 where
     R: StreamRecv + Send + 'static,
 {
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+    let (data_done_tx, data_done_rx) = oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
+        let mut data_done_tx = Some(data_done_tx);
         loop {
             tokio::select! {
                 _ = &mut shutdown_rx => {
@@ -171,6 +181,13 @@ where
                                 warn!("Ingest channel closed");
                                 break;
                             }
+                        }
+                        Ok(SyncMessage::DataDone) => {
+                            info!("Received DataDone from peer — all data consumed");
+                            if let Some(tx) = data_done_tx.take() {
+                                let _ = tx.send(());
+                            }
+                            break;
                         }
                         Ok(_) => {}
                         Err(ConnectionError::Closed) => {
@@ -187,7 +204,7 @@ where
         }
     });
 
-    (shutdown_tx, handle)
+    (shutdown_tx, data_done_rx, handle)
 }
 
 /// Run sync as the initiator (client role) with dual streams.
@@ -250,8 +267,8 @@ where
     let mut need_ids: Vec<Id> = Vec::new();
     let mut events_sent: u64 = 0;
     let mut bytes_sent: u64 = 0;
-    let (shutdown_tx, recv_handle) =
-        spawn_data_receiver(data_recv, ingest_tx, bytes_received.clone());
+    let (shutdown_tx, data_drained_rx, recv_handle) =
+        spawn_data_receiver(data_recv, ingest_tx.clone(), bytes_received.clone());
 
     let initial_msg = neg.initiate()?;
     control.send(&SyncMessage::NegOpen { msg: initial_msg }).await?;
@@ -377,15 +394,18 @@ where
             let _ = data_send.flush().await;
         }
 
-        // Once reconciliation is done and outgoing queue is drained, send Done
+        // Once reconciliation is done and outgoing queue is drained,
+        // send DataDone on data stream then Done on control.
         if reconciliation_done && !done_sent {
             let pending_out = outgoing.count_pending(peer_id).unwrap_or(0);
             if pending_out == 0 {
                 let _ = data_send.flush().await;
+                data_send.send(&SyncMessage::DataDone).await?;
+                data_send.flush().await?;
                 control.send(&SyncMessage::Done).await?;
                 control.flush().await?;
                 done_sent = true;
-                info!("Sent Done, waiting for DoneAck (sent {}, received {})",
+                info!("Sent DataDone+Done, waiting for DoneAck (sent {}, received {})",
                     events_sent, events_received.load(Ordering::Relaxed));
             }
         }
@@ -396,8 +416,21 @@ where
         let _ = wanted.clear();
     }
     let _ = neg_db.execute("COMMIT", []);
+
+    // Wait for inbound data drain: data receiver exits on peer's DataDone.
+    // Use timeout fallback to avoid hanging if peer misbehaves.
+    if completed {
+        let drain_timeout = Duration::from_secs(5);
+        match tokio::time::timeout(drain_timeout, data_drained_rx).await {
+            Ok(Ok(())) => info!("Inbound data fully drained"),
+            Ok(Err(_)) => info!("Data drain channel dropped (receiver already exited)"),
+            Err(_) => warn!("Timed out waiting for inbound data drain"),
+        }
+    }
     let _ = shutdown_tx.send(());
     let _ = recv_handle.await;
+    // Drop ingest_tx so batch_writer sees channel close and drains
+    drop(ingest_tx);
     let _ = writer_handle.await;
 
     let stats = SyncStats {
@@ -464,8 +497,8 @@ where
     let writer_handle =
         tokio::task::spawn_blocking(move || batch_writer(db_path_owned, recorded_by_owned, ingest_rx, events_received_writer));
 
-    let (shutdown_tx, recv_handle) =
-        spawn_data_receiver(data_recv, ingest_tx, bytes_received.clone());
+    let (shutdown_tx, data_drained_rx, recv_handle) =
+        spawn_data_receiver(data_recv, ingest_tx.clone(), bytes_received.clone());
 
     let mut events_sent: u64 = 0;
     let mut bytes_sent: u64 = 0;
@@ -547,11 +580,26 @@ where
             let _ = data_send.flush().await;
         }
 
-        // After peer signalled Done and our outgoing queue is drained, send DoneAck
+        // After peer signalled Done and our outgoing queue is drained:
+        // 1. Send DataDone on data stream (signals peer's data receiver)
+        // 2. Wait for peer's DataDone to be consumed by our data receiver
+        // 3. Only then send DoneAck on control
         if peer_done {
             let pending_out = outgoing.count_pending(peer_id).unwrap_or(0);
             if pending_out == 0 {
+                // Signal peer's data receiver that we're done sending events
                 let _ = data_send.flush().await;
+                data_send.send(&SyncMessage::DataDone).await?;
+                data_send.flush().await?;
+
+                // Wait for our data receiver to confirm peer's DataDone
+                let drain_timeout = Duration::from_secs(5);
+                match tokio::time::timeout(drain_timeout, data_drained_rx).await {
+                    Ok(Ok(())) => info!("Inbound data fully drained"),
+                    Ok(Err(_)) => info!("Data drain channel dropped (receiver already exited)"),
+                    Err(_) => warn!("Timed out waiting for inbound data drain"),
+                }
+
                 control.send(&SyncMessage::DoneAck).await?;
                 control.flush().await?;
                 info!("Sent DoneAck (sent {}, received {})",
@@ -568,6 +616,8 @@ where
     let _ = neg_db.execute("COMMIT", []);
     let _ = shutdown_tx.send(());
     let _ = recv_handle.await;
+    // Drop ingest_tx so batch_writer sees channel close and drains
+    drop(ingest_tx);
     let _ = writer_handle.await;
 
     let stats = SyncStats {

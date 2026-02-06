@@ -49,6 +49,10 @@ pub fn load_or_generate_cert(
         let cert_der = CertificateDer::from(cert_bytes);
         let key_der = PrivatePkcs8KeyDer::from(key_bytes);
         validate_cert_key_match(&cert_der, &key_der)?;
+        #[cfg(unix)]
+        if let Err(e) = set_owner_only_permissions(key_path) {
+            eprintln!("warning: could not normalize key permissions on {}: {}", key_path.display(), e);
+        }
         Ok((cert_der, key_der))
     } else {
         let (cert_der, key_der) = generate_self_signed_cert()?;
@@ -79,43 +83,33 @@ fn set_owner_only_permissions(path: &Path) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
-/// Validate that the certificate's SPKI matches the private key's public component.
+/// Validate that the certificate's public key matches the private key.
+///
+/// Derives the public key from the private key via rcgen and compares the
+/// raw SPKI bytes against those in the certificate. This catches mismatched
+/// cert/key files and file corruption.
 fn validate_cert_key_match(
     cert_der: &CertificateDer<'_>,
     key_der: &PrivatePkcs8KeyDer<'_>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Extract SPKI from certificate
     let (_, cert) = X509Certificate::from_der(cert_der.as_ref())
-        .map_err(|e| format!("failed to parse certificate for validation: {}", e))?;
+        .map_err(|e| format!("failed to parse certificate: {}", e))?;
     let cert_spki = cert.public_key().raw;
 
-    // Parse the PKCS#8 private key to extract its public key.
-    // PKCS#8 wraps the algorithm identifier + private key; for the algorithms
-    // rcgen uses (ECDSA P-256 / Ed25519), we derive the public key and compare
-    // the SPKI bytes from the certificate.
-    let any_key = rustls::crypto::ring::sign::any_supported_type(
-        &key_der.clone_key().into(),
-    ).map_err(|e| format!("failed to parse private key: {}", e))?;
+    // Derive public key from private key via rcgen
+    let key_pair = rcgen::KeyPair::from_der(key_der.secret_pkcs8_der())
+        .map_err(|e| format!("failed to parse private key: {}", e))?;
+    let key_spki = key_pair.public_key_der();
 
-    // Generate a self-signed cert from this key to extract its SPKI for comparison.
-    // Instead, we can use a simpler approach: re-extract SPKI fingerprints and compare.
-    // But the most reliable method is to compare the raw SPKI bytes directly.
-    // rustls signing keys don't expose public key bytes directly, so we compare
-    // fingerprints from the cert against a freshly-extracted one.
-    let cert_fp = extract_spki_fingerprint(cert_der.as_ref())?;
-
-    // Verify the key is usable by signing a test message and verifying with the cert's public key.
-    let message = b"cert-key-match-validation";
-    let signer = any_key.choose_scheme(&[
-        rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-        rustls::SignatureScheme::ED25519,
-    ]).ok_or("no compatible signature scheme")?;
-
-    // If signing succeeds with the private key, the key is at minimum a valid key.
-    // Combined with a consistent SPKI fingerprint on reload, this catches file corruption
-    // and cert/key mismatches in practice.
-    let _ = signer.sign(message)?;
-    let _ = cert_spki; // used above in SPKI extraction path
-    let _ = cert_fp;
+    if cert_spki != key_spki.as_slice() {
+        return Err(format!(
+            "cert/key mismatch: certificate SPKI ({} bytes) does not match \
+             private key's public component ({} bytes)",
+            cert_spki.len(),
+            key_spki.len(),
+        ).into());
+    }
 
     Ok(())
 }
@@ -217,16 +211,11 @@ mod tests {
         let (_cert2, key2) = generate_self_signed_cert().unwrap();
         std::fs::write(&key_path, key2.secret_pkcs8_der()).unwrap();
 
-        // Loading should detect the mismatch (cert public key vs private key)
-        // The validation may succeed or fail depending on key type compatibility,
-        // but at minimum the fingerprint would differ from what the cert declares.
-        // We verify that load succeeds (key is valid on its own) but the SPKI
-        // fingerprints no longer match what we'd expect.
+        // Loading must detect the mismatch: cert SPKI != private key's public SPKI
         let result = load_or_generate_cert(&cert_path, &key_path);
-        // With different key types this will error; with same type but different
-        // keys the signing test passes but the identity is wrong.
-        // The important thing is that validate_cert_key_match runs without panic.
-        let _ = result;
+        assert!(result.is_err(), "expected error for mismatched cert/key pair");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("cert/key mismatch"), "error should mention mismatch: {}", err);
     }
 
     #[cfg(unix)]

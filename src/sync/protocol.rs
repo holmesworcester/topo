@@ -1,5 +1,5 @@
 use crate::wire::ENVELOPE_SIZE;
-use super::{MSG_TYPE_NEG_OPEN, MSG_TYPE_NEG_MSG, MSG_TYPE_HAVE_LIST, MSG_TYPE_EVENT, MSG_TYPE_DONE, MSG_TYPE_DONE_ACK, EVENT_SIZE};
+use super::{MSG_TYPE_NEG_OPEN, MSG_TYPE_NEG_MSG, MSG_TYPE_HAVE_LIST, MSG_TYPE_EVENT, MSG_TYPE_DONE, MSG_TYPE_DONE_ACK, MSG_TYPE_DATA_DONE, EVENT_SIZE};
 
 /// Sync protocol messages
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16,6 +16,8 @@ pub enum SyncMessage {
     Done,
     /// Responder acknowledges Done after draining its own queues
     DoneAck,
+    /// Sent on data stream to signal no more events will follow
+    DataDone,
 }
 
 
@@ -74,6 +76,7 @@ pub fn parse_sync_message(input: &[u8]) -> Result<(SyncMessage, usize), ParseErr
         }
         MSG_TYPE_DONE => Ok((SyncMessage::Done, 1)),
         MSG_TYPE_DONE_ACK => Ok((SyncMessage::DoneAck, 1)),
+        MSG_TYPE_DATA_DONE => Ok((SyncMessage::DataDone, 1)),
         _ => Err(ParseError::UnknownType(msg_type)),
     }
 }
@@ -112,6 +115,7 @@ pub fn encode_sync_message(msg: &SyncMessage) -> Vec<u8> {
         }
         SyncMessage::Done => vec![MSG_TYPE_DONE],
         SyncMessage::DoneAck => vec![MSG_TYPE_DONE_ACK],
+        SyncMessage::DataDone => vec![MSG_TYPE_DATA_DONE],
     }
 }
 
@@ -195,6 +199,16 @@ mod tests {
     #[test]
     fn test_done_ack_roundtrip() {
         let msg = SyncMessage::DoneAck;
+        let encoded = encode_sync_message(&msg);
+        assert_eq!(encoded.len(), 1);
+        let (parsed, consumed) = parse_sync_message(&encoded).unwrap();
+        assert_eq!(consumed, 1);
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn test_data_done_roundtrip() {
+        let msg = SyncMessage::DataDone;
         let encoded = encode_sync_message(&msg);
         assert_eq!(encoded.len(), 1);
         let (parsed, consumed) = parse_sync_message(&encoded).unwrap();

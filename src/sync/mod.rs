@@ -21,6 +21,7 @@ pub const MSG_TYPE_HAVE_LIST: u8 = 0x12;  // List of IDs client needs from serve
 pub const MSG_TYPE_EVENT: u8 = 0x03;      // Event blob
 pub const MSG_TYPE_DONE: u8 = 0x20;      // Initiator signals all events sent
 pub const MSG_TYPE_DONE_ACK: u8 = 0x21;  // Responder acknowledges done
+pub const MSG_TYPE_DATA_DONE: u8 = 0x22; // Sent on data stream: no more events will follow
 
 /// Message sizes
 /// NEG_OPEN, NEG_MSG, HAVE_LIST are variable length: type(1) + len(4) + data(len)
