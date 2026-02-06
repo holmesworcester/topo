@@ -75,6 +75,7 @@ Gap-to-phase mapping:
 - No per-event transit wrapper. QUIC + mTLS secures the channel.
 - Use separate tables for permanent canonical data vs operational queues.
 - Use separate invite event types (`user_invite`, `device_invite`), not one multimodal invite with `mode=*`.
+- Deterministic emitted event types stay inside the emitted-event rule flow but are unsigned for determinism (`no signed_by/signer_type/signature`).
 
 ## 2.1 Locked design requirements (explicit)
 
@@ -462,10 +463,17 @@ When a projector emits event `X`:
 
 Do not directly write into another event type's projection table as a side effect, except for rare non-event operational writes explicitly documented in that projector.
 
+Deterministic emitted-event exception (still under this rule):
+1. deterministic emitted event types remain canonical events and still follow `emit -> persist -> self-project`.
+2. for deterministic event ids/bytes, these types are unsigned:
+   - schema omits `signed_by`, `signer_type`, and `signature`,
+   - signer dependency/signature stages are skipped for those types only.
+3. validation for these types is deterministic-derivation checks from dependencies/context, not signature checks.
+
 ### Explicit exceptions
 
 - `message_deletion` and deletion cascade rules.
-- deterministic emitted-event patterns (for example key material derivations).
+- deterministic emitted-event patterns (for example key material derivations) using the unsigned deterministic exception above.
 - identity-specific exceptions (`invite_accepted`, removal enforcement) are deferred to Phase 7.
 
 ## 6.2 Dependency handling (blocked-only first)
@@ -487,7 +495,7 @@ Rules:
 - If required refs are present: continue projection.
 - If any required refs are missing: write rows in `blocked_event_deps` and return `Block`.
 - Signer refs (`signed_by` + `signer_type`) are dependency metadata and use the same blocking/unblocking path.
-- Signature verification is attempted only after signer deps and other required deps are available.
+- Signature verification is attempted only after signer deps and other required deps are available (signed event types only).
 - Do not persist full `event_dependencies` yet.
 - Use one dependency resolver for all event families (content, identity, encrypted wrappers, invites).
 - Dependency extraction is driven by event schema metadata only (`is_event_ref`, `required`, conditional requirement flags).
@@ -556,7 +564,8 @@ Implement one signer pipeline for all signed event types:
 2. missing signer dependency uses normal blocking/unblocking (`blocked_event_deps`).
 3. resolve signer key by (`signer_type`, `signed_by`) only after dependency resolution.
 4. invalid signature is `Reject`, never `Block`.
-5. signer verification helper path is shared across event families (no identity-specific signer path later).
+5. signer verification helper path is shared across signed event families (no identity-specific signer path later).
+6. deterministic emitted event types are explicitly schema-marked unsigned (`signer_required=false`) and excluded from signer-stage enforcement.
 
 This phase should be completed immediately after Phase 2 and before Phase 3/Phase 7 work.
 
@@ -800,6 +809,7 @@ These should not be forced into generic auto-write behavior.
 
 1. `message_deletion` and cascade/tombstone semantics.
 2. deterministic emitted-event flows where projection emits another event.
+   - these flows still obey emitted-event rule and are unsigned by schema policy for determinism.
 
 Deletion is special and should remain explicit.
 
@@ -936,6 +946,9 @@ Not in scope yet:
   - missing signer dependency blocks,
   - invalid signature rejects,
   - valid signature passes and continues policy checks.
+- Deterministic emitted unsigned invariants:
+  - emitted deterministic types omit signer fields by schema,
+  - deterministic derivation checks gate validity instead of signature checks.
 - Encrypted wrapper flow, including nested-encryption rejection.
 - Encrypted wrapper `inner_type_code` invariants:
   - mandatory field present for every encrypted wrapper event,
@@ -1106,6 +1119,9 @@ Must implement:
 3. signer resolution + signature verification after dependency resolution and before policy checks.
 4. invalid signature -> `Reject` (not `Block`).
 5. shared signer helper path across all signed event families.
+6. deterministic unsigned exemption:
+   - schema flag (for example `signer_required=false`) for deterministic emitted types,
+   - signer pipeline skips only those explicitly marked types.
 
 Common mistakes:
 - verifying signatures before dependency resolution.
@@ -1114,7 +1130,8 @@ Common mistakes:
 Definition of done:
 - signer-missing blocks then unblocks when signer arrives,
 - invalid signatures deterministically reject,
-- signed cleartext and signed encrypted-wrapper events follow the same signer pipeline.
+- signed cleartext and signed encrypted-wrapper events follow the same signer pipeline,
+- deterministic emitted unsigned events validate via deterministic derivation checks and remain replay/reproject stable.
 
 ## 15.6 Phase `3` implementation checklist (encrypted adapter)
 

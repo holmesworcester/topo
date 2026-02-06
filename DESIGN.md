@@ -62,6 +62,11 @@ Field definitions are fixed; total event size is variable by event type.
 3. signature verification resolves signer key by (`signer_type`, `signed_by`) after dependency resolution,
 4. transport security is separate and complementary to event signatures.
 
+Deterministic emitted-event exception:
+1. deterministic emitted event types are canonical but unsigned for deterministic bytes/ids,
+2. those types omit `signed_by`, `signer_type`, and `signature` by schema,
+3. they are validated by deterministic-derivation checks instead of signature checks.
+
 No per-event transit wrapper is used.
 
 ## 1.4 Sync frame header (`payload_len`) rationale
@@ -208,6 +213,11 @@ If projector `A` emits event `B`:
 2. allow `B` to project through `B`'s own projector/autowrite table.
 
 Projectors should not directly write into another event type's projection table except rare, explicitly documented operational exceptions.
+
+Deterministic emitted-event rule detail:
+1. deterministic emitted event types still use the same emitted-event flow (`emit -> persist -> self-project`),
+2. they use schema-marked unsigned mode for determinism (no signer fields),
+3. shared pipeline applies deterministic derivation checks for those types in place of signer checks.
 
 ## 4.4 Explicit special cases
 
