@@ -28,6 +28,15 @@ impl ParsedEvent {
         }
     }
 
+    /// Extract dependency event IDs from schema-marked fields.
+    /// Returns (field_name, raw_32_byte_id) pairs.
+    pub fn dep_field_values(&self) -> Vec<(&'static str, [u8; 32])> {
+        match self {
+            ParsedEvent::Message(_) => vec![],
+            ParsedEvent::Reaction(r) => vec![("target_event_id", r.target_event_id)],
+        }
+    }
+
     pub fn event_type_code(&self) -> u8 {
         match self {
             ParsedEvent::Message(_) => EVENT_TYPE_MESSAGE,
@@ -191,6 +200,32 @@ mod tests {
         });
         let blob = encode_event(&msg).unwrap();
         assert_eq!(extract_created_at_ms(&blob), Some(42424242424242));
+    }
+
+    #[test]
+    fn test_dep_field_values_message() {
+        let msg = ParsedEvent::Message(MessageEvent {
+            created_at_ms: 100,
+            channel_id: [1u8; 32],
+            author_id: [2u8; 32],
+            content: "hello".to_string(),
+        });
+        assert!(msg.dep_field_values().is_empty());
+    }
+
+    #[test]
+    fn test_dep_field_values_reaction() {
+        let target = [42u8; 32];
+        let rxn = ParsedEvent::Reaction(ReactionEvent {
+            created_at_ms: 200,
+            target_event_id: target,
+            author_id: [3u8; 32],
+            emoji: "\u{1f44d}".to_string(),
+        });
+        let deps = rxn.dep_field_values();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].0, "target_event_id");
+        assert_eq!(deps[0].1, target);
     }
 
     #[test]

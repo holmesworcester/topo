@@ -20,7 +20,8 @@ use tracing::{info, warn, error};
 
 use crate::crypto::{hash_event, event_id_to_base64, EventId};
 use crate::db::{open_connection, schema::create_tables, store::Store, outgoing::OutgoingQueue, wanted::WantedEvents};
-use crate::events::{self, ParsedEvent, registry};
+use crate::events::{self, registry};
+use crate::projection::pipeline::project_one;
 use crate::runtime::SyncStats;
 use crate::sync::{SyncMessage, neg_id_to_event_id, NegentropyStorageSqlite};
 use crate::transport::{
@@ -51,7 +52,8 @@ fn current_timestamp_ms() -> i64 {
 }
 
 /// Batch writer task - drains channel and writes to SQLite in batches.
-/// Uses registry-based dispatch for event parsing and projection.
+/// Writes event blob/neg_items/recorded_events, then delegates projection
+/// to `project_one` which handles deps, terminal state, and cascading.
 pub fn batch_writer(
     db_path: String,
     recorded_by: String,
@@ -67,28 +69,6 @@ pub fn batch_writer(
     };
 
     let wanted = WantedEvents::new(&db);
-
-    let mut project_msg_stmt = match db.prepare(
-        "INSERT OR IGNORE INTO messages (message_id, channel_id, author_id, content, created_at, recorded_by)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
-    ) {
-        Ok(stmt) => stmt,
-        Err(e) => {
-            error!("Failed to prepare messages projection statement: {}", e);
-            return;
-        }
-    };
-
-    let mut project_rxn_stmt = match db.prepare(
-        "INSERT OR IGNORE INTO reactions (event_id, target_event_id, author_id, emoji, created_at, recorded_by)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
-    ) {
-        Ok(stmt) => stmt,
-        Err(e) => {
-            error!("Failed to prepare reactions projection statement: {}", e);
-            return;
-        }
-    };
 
     let mut neg_items_stmt = match db.prepare(
         "INSERT OR IGNORE INTO neg_items (ts, id) VALUES (?1, ?2)"
@@ -139,22 +119,21 @@ pub fn batch_writer(
         }
 
         if db.execute("BEGIN", []).is_ok() {
+            // First pass: write blob storage, neg_items, recorded_events
+            let mut event_ids_to_project: Vec<EventId> = Vec::with_capacity(batch.len());
             for (event_id, blob) in &batch {
                 let _ = wanted.remove(event_id);
 
                 let event_id_b64 = event_id_to_base64(event_id);
 
-                // Extract common prefix for neg_items without full parse
                 if let Some(created_at_ms) = events::extract_created_at_ms(blob) {
                     let _ = neg_items_stmt.execute(rusqlite::params![
                         created_at_ms as i64,
                         event_id.as_slice()
                     ]);
 
-                    // Full registry-based parse for projection
                     if let Some(type_code) = events::extract_event_type(blob) {
                         if let Some(meta) = reg.lookup(type_code) {
-                            // Write to events table
                             let _ = events_stmt.execute(rusqlite::params![
                                 &event_id_b64,
                                 meta.type_name,
@@ -163,35 +142,6 @@ pub fn batch_writer(
                                 created_at_ms as i64,
                                 current_timestamp_ms()
                             ]);
-
-                            if let Ok(parsed) = (meta.parse)(blob) {
-                                match &parsed {
-                                    ParsedEvent::Message(msg) => {
-                                        let channel_id_b64 = event_id_to_base64(&msg.channel_id);
-                                        let author_id_b64 = event_id_to_base64(&msg.author_id);
-                                        let _ = project_msg_stmt.execute(rusqlite::params![
-                                            &event_id_b64,
-                                            channel_id_b64,
-                                            author_id_b64,
-                                            &msg.content,
-                                            created_at_ms as i64,
-                                            &recorded_by
-                                        ]);
-                                    }
-                                    ParsedEvent::Reaction(rxn) => {
-                                        let target_id_b64 = event_id_to_base64(&rxn.target_event_id);
-                                        let author_id_b64 = event_id_to_base64(&rxn.author_id);
-                                        let _ = project_rxn_stmt.execute(rusqlite::params![
-                                            &event_id_b64,
-                                            target_id_b64,
-                                            author_id_b64,
-                                            &rxn.emoji,
-                                            created_at_ms as i64,
-                                            &recorded_by
-                                        ]);
-                                    }
-                                }
-                            }
 
                             let recorded_at = SystemTime::now()
                                 .duration_since(UNIX_EPOCH)
@@ -203,11 +153,20 @@ pub fn batch_writer(
                                 recorded_at,
                                 "quic_recv"
                             ]);
+
+                            event_ids_to_project.push(*event_id);
                         }
                     }
                 }
             }
             let _ = db.execute("COMMIT", []);
+
+            // Second pass: project each event (handles deps + cascade)
+            for event_id in &event_ids_to_project {
+                if let Err(e) = project_one(&db, &recorded_by, event_id) {
+                    warn!("projection error for {}: {}", event_id_to_base64(event_id), e);
+                }
+            }
         }
 
         events_received.fetch_add(batch.len() as u64, Ordering::Relaxed);

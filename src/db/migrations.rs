@@ -57,6 +57,20 @@ static MIGRATIONS: &[Migration] = &[
             CREATE INDEX IF NOT EXISTS idx_reactions_target ON reactions(recorded_by, target_event_id);
         ",
     },
+    Migration {
+        version: 2,
+        name: "add_blocked_event_deps",
+        sql: "
+            CREATE TABLE IF NOT EXISTS blocked_event_deps (
+                peer_id TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                blocker_event_id TEXT NOT NULL,
+                PRIMARY KEY (peer_id, event_id, blocker_event_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_blocked_by_dep
+                ON blocked_event_deps(peer_id, blocker_event_id);
+        ",
+    },
 ];
 
 fn ensure_schema_migrations(conn: &Connection) -> SqliteResult<()> {
@@ -123,6 +137,50 @@ mod tests {
     }
 
     #[test]
+    fn test_migration_2_blocked_event_deps() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+
+        // Table exists
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(tables.contains(&"blocked_event_deps".to_string()));
+
+        // Can insert and query
+        conn.execute(
+            "INSERT INTO blocked_event_deps (peer_id, event_id, blocker_event_id) VALUES ('p1', 'e1', 'b1')",
+            [],
+        ).unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM blocked_event_deps WHERE peer_id = 'p1'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count, 1);
+
+        // Idempotent — running migrations again doesn't fail
+        run_migrations(&conn).unwrap();
+        let count2: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM blocked_event_deps", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count2, 1);
+
+        // Migration version recorded
+        let versions: Vec<i64> = conn
+            .prepare("SELECT version FROM schema_migrations ORDER BY version")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(versions.contains(&2));
+    }
+
+    #[test]
     fn test_migration_idempotent() {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
@@ -132,6 +190,6 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(count, 2);
     }
 }

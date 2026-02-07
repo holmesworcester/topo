@@ -191,70 +191,28 @@ fn inject_messages_batched(
     recorded_by: &str,
 ) {
     use std::time::{SystemTime, UNIX_EPOCH};
-    use poc_7::crypto::{hash_event, event_id_to_base64};
     use poc_7::db::open_connection;
-    use poc_7::events::{self, MessageEvent, ParsedEvent};
+    use poc_7::events::{MessageEvent, ParsedEvent};
+    use poc_7::projection::create::create_event_sync;
 
     let db = open_connection(db_path).expect("failed to open db");
-
-    let mut neg_stmt = db.prepare(
-        "INSERT OR IGNORE INTO neg_items (ts, id) VALUES (?1, ?2)"
-    ).expect("failed to prepare neg_items stmt");
-    let mut msg_stmt = db.prepare(
-        "INSERT OR IGNORE INTO messages (message_id, channel_id, author_id, content, created_at, recorded_by)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
-    ).expect("failed to prepare messages stmt");
-    let mut rec_stmt = db.prepare(
-        "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
-         VALUES (?1, ?2, ?3, ?4)"
-    ).expect("failed to prepare recorded_events stmt");
-    let mut events_stmt = db.prepare(
-        "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
-    ).expect("failed to prepare events stmt");
 
     let mut i = 0;
     while i < total {
         let end = (i + batch_size).min(total);
         db.execute("BEGIN", []).expect("failed to begin");
         for j in i..end {
-            let content = format!("Msg {} from {}", j, name);
             let created_at_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_millis() as u64;
-            let msg_event = MessageEvent {
+            let msg = ParsedEvent::Message(MessageEvent {
                 created_at_ms,
                 channel_id,
                 author_id,
-                content: content.clone(),
-            };
-            let blob = events::encode_event(&ParsedEvent::Message(msg_event))
-                .expect("failed to encode message");
-            let event_id = hash_event(&blob);
-
-            neg_stmt.execute(rusqlite::params![
-                created_at_ms as i64,
-                event_id.as_slice()
-            ]).expect("neg_items insert");
-
-            let message_id = event_id_to_base64(&event_id);
-            let channel_id_b64 = event_id_to_base64(&channel_id);
-            let author_id_b64 = event_id_to_base64(&author_id);
-            msg_stmt.execute(rusqlite::params![
-                message_id, channel_id_b64, author_id_b64, content, created_at_ms as i64, recorded_by
-            ]).expect("messages insert");
-
-            events_stmt.execute(rusqlite::params![
-                message_id, "message", blob.as_slice(), "shared", created_at_ms as i64, created_at_ms as i64
-            ]).expect("events insert");
-            let recorded_at = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as i64;
-            rec_stmt.execute(rusqlite::params![
-                recorded_by, &message_id, recorded_at, "local_create"
-            ]).expect("recorded_events insert");
+                content: format!("Msg {} from {}", j, name),
+            });
+            create_event_sync(&db, recorded_by, &msg).expect("create_event_sync failed");
         }
         db.execute("COMMIT", []).expect("failed to commit");
         i = end;

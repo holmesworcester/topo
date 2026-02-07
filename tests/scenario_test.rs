@@ -177,11 +177,12 @@ async fn test_reaction_sync() {
     bob.create_reaction(&msg1, "\u{1f44d}");
     bob.create_reaction(&msg2, "\u{2764}\u{fe0f}");
 
-    // Alice: 2 messages, 0 reactions; Bob: 0 messages, 2 reactions
+    // Alice: 2 messages, 0 reactions; Bob: 2 events stored but reactions blocked
+    // (Bob doesn't have Alice's messages yet, so reactions can't project)
     assert_eq!(alice.store_count(), 2);
     assert_eq!(bob.store_count(), 2);
     assert_eq!(alice.message_count(), 2);
-    assert_eq!(bob.reaction_count(), 2);
+    assert_eq!(bob.reaction_count(), 0); // blocked until targets arrive
 
     let sync = start_peers(&alice, &bob);
 
@@ -513,4 +514,110 @@ async fn test_peer_identity_extraction_live_handshake() {
     // Verify they match the Peer identities computed from DB
     assert_eq!(client_sees_server.unwrap(), alice.identity);
     assert_eq!(server_sees_client.unwrap(), bob.identity);
+}
+
+/// Test out-of-order reaction sync: Bob creates a reaction targeting Alice's message,
+/// then syncs. The reaction arrives blocked, and auto-projects once the message arrives.
+#[tokio::test]
+async fn test_out_of_order_reaction_sync() {
+    let channel = test_channel();
+    let alice = Peer::new("alice", channel);
+    let bob = Peer::new("bob", channel);
+
+    // Alice creates a message
+    let msg_id = alice.create_message("Hello from Alice");
+
+    // Bob creates a reaction targeting Alice's message (Bob doesn't have the message yet)
+    bob.create_reaction(&msg_id, "\u{1f44d}");
+
+    // Bob: reaction is stored but blocked (target not in his DB)
+    assert_eq!(bob.store_count(), 1);
+    assert_eq!(bob.reaction_count(), 0); // blocked
+
+    // Alice has the message
+    assert_eq!(alice.store_count(), 1);
+    assert_eq!(alice.message_count(), 1);
+
+    // Sync — both get each other's events
+    let sync = start_peers(&alice, &bob);
+
+    assert_eventually(
+        || alice.store_count() == 2 && bob.store_count() == 2,
+        Duration::from_secs(15),
+        "both peers should have 2 events",
+    ).await;
+
+    drop(sync);
+
+    // After sync: Bob now has the message, so the reaction should be auto-projected
+    assert_eq!(bob.message_count(), 1);
+    assert_eq!(bob.reaction_count(), 1); // auto-unblocked
+
+    // Alice received the reaction and has the message, so she can project it too
+    assert_eq!(alice.message_count(), 1);
+    assert_eq!(alice.reaction_count(), 1);
+
+    // Verify valid_events counts
+    let bob_db = open_connection(&bob.db_path).expect("open bob db");
+    let bob_valid: i64 = bob_db.query_row(
+        "SELECT COUNT(*) FROM valid_events WHERE peer_id = ?1",
+        rusqlite::params![&bob.identity],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(bob_valid, 2, "Bob should have 2 valid events");
+
+    verify_projection_invariants(&alice);
+    verify_projection_invariants(&bob);
+}
+
+/// Test that multiple reactions targeting different messages all resolve correctly
+/// when the messages arrive via sync.
+#[tokio::test]
+async fn test_multi_dep_blocking_sync() {
+    let channel = test_channel();
+    let alice = Peer::new("alice", channel);
+    let bob = Peer::new("bob", channel);
+
+    // Alice creates 3 messages
+    let msg1 = alice.create_message("First");
+    let msg2 = alice.create_message("Second");
+    let msg3 = alice.create_message("Third");
+
+    // Bob creates reactions targeting all 3 (none of which are in his DB)
+    bob.create_reaction(&msg1, "\u{1f44d}");
+    bob.create_reaction(&msg2, "\u{2764}\u{fe0f}");
+    bob.create_reaction(&msg3, "\u{1f525}");
+
+    // Bob: 3 events stored but all blocked
+    assert_eq!(bob.store_count(), 3);
+    assert_eq!(bob.reaction_count(), 0);
+
+    // Sync
+    let sync = start_peers(&alice, &bob);
+
+    assert_eventually(
+        || alice.store_count() == 6 && bob.store_count() == 6,
+        Duration::from_secs(15),
+        "both peers should have 6 events (3 messages + 3 reactions)",
+    ).await;
+
+    drop(sync);
+
+    // All reactions should be unblocked and projected
+    assert_eq!(alice.message_count(), 3);
+    assert_eq!(bob.message_count(), 3);
+    assert_eq!(alice.reaction_count(), 3);
+    assert_eq!(bob.reaction_count(), 3);
+
+    // Verify no remaining blocked deps
+    let bob_db = open_connection(&bob.db_path).expect("open bob db");
+    let blocked: i64 = bob_db.query_row(
+        "SELECT COUNT(*) FROM blocked_event_deps WHERE peer_id = ?1",
+        rusqlite::params![&bob.identity],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(blocked, 0, "no remaining blocked deps after sync");
+
+    verify_projection_invariants(&alice);
+    verify_projection_invariants(&bob);
 }

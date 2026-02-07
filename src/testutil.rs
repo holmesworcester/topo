@@ -1,10 +1,12 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::crypto::{hash_event, event_id_to_base64, EventId};
+use crate::crypto::EventId;
 use crate::db::{open_connection, schema::create_tables};
-use crate::events::{self, MessageEvent, ReactionEvent, ParsedEvent, registry};
+use crate::events::{MessageEvent, ReactionEvent, ParsedEvent};
 use crate::identity::{cert_paths_from_db, local_identity_from_db};
+use crate::projection::create::create_event_sync;
+use crate::projection::pipeline::project_one;
 use crate::sync::engine::{accept_loop, connect_loop};
 use crate::transport::{
     AllowedPeers,
@@ -85,162 +87,41 @@ impl Peer {
     /// Create a message and insert it into all relevant tables.
     /// Returns the event ID.
     pub fn create_message(&self, content: &str) -> EventId {
-        let created_at_ms = current_timestamp_ms();
-        let msg_event = MessageEvent {
-            created_at_ms,
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        let msg = ParsedEvent::Message(MessageEvent {
+            created_at_ms: current_timestamp_ms(),
             channel_id: self.channel_id,
             author_id: self.author_id,
             content: content.to_string(),
-        };
-        let blob = events::encode_event(&ParsedEvent::Message(msg_event))
-            .expect("failed to encode message");
-        let event_id = hash_event(&blob);
-
-        let db = open_connection(&self.db_path).expect("failed to open db");
-
-        // Insert into neg_items
-        db.execute(
-            "INSERT OR IGNORE INTO neg_items (ts, id) VALUES (?1, ?2)",
-            rusqlite::params![created_at_ms as i64, event_id.as_slice()],
-        ).expect("failed to insert neg_items");
-
-        // Insert into messages projection
-        let event_id_b64 = event_id_to_base64(&event_id);
-        let channel_id_b64 = event_id_to_base64(&self.channel_id);
-        let author_id_b64 = event_id_to_base64(&self.author_id);
-        db.execute(
-            "INSERT OR IGNORE INTO messages (message_id, channel_id, author_id, content, created_at, recorded_by)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![event_id_b64, channel_id_b64, author_id_b64, content, created_at_ms as i64, &self.identity],
-        ).expect("failed to insert message");
-
-        // Insert into events table
-        db.execute(
-            "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![event_id_b64, "message", blob.as_slice(), "shared", created_at_ms as i64, current_timestamp_ms() as i64],
-        ).expect("failed to insert into events");
-
-        // Insert into recorded_events (use local wall clock, not event created_at)
-        let recorded_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
-        db.execute(
-            "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
-             VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![&self.identity, &event_id_b64, recorded_at, "local_create"],
-        ).expect("failed to insert recorded_event");
-
-        event_id
+        });
+        create_event_sync(&db, &self.identity, &msg).expect("failed to create message")
     }
 
     /// Create a reaction targeting a message event.
     /// Returns the reaction event ID.
     pub fn create_reaction(&self, target_event_id: &EventId, emoji: &str) -> EventId {
-        let created_at_ms = current_timestamp_ms();
-        let rxn_event = ReactionEvent {
-            created_at_ms,
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        let rxn = ParsedEvent::Reaction(ReactionEvent {
+            created_at_ms: current_timestamp_ms(),
             target_event_id: *target_event_id,
             author_id: self.author_id,
             emoji: emoji.to_string(),
-        };
-        let blob = events::encode_event(&ParsedEvent::Reaction(rxn_event))
-            .expect("failed to encode reaction");
-        let event_id = hash_event(&blob);
-
-        let db = open_connection(&self.db_path).expect("failed to open db");
-
-        db.execute(
-            "INSERT OR IGNORE INTO neg_items (ts, id) VALUES (?1, ?2)",
-            rusqlite::params![created_at_ms as i64, event_id.as_slice()],
-        ).expect("failed to insert neg_items");
-
-        let event_id_b64 = event_id_to_base64(&event_id);
-        let target_id_b64 = event_id_to_base64(target_event_id);
-        let author_id_b64 = event_id_to_base64(&self.author_id);
-        db.execute(
-            "INSERT OR IGNORE INTO reactions (event_id, target_event_id, author_id, emoji, created_at, recorded_by)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![event_id_b64, target_id_b64, author_id_b64, emoji, created_at_ms as i64, &self.identity],
-        ).expect("failed to insert reaction");
-
-        db.execute(
-            "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![event_id_b64, "reaction", blob.as_slice(), "shared", created_at_ms as i64, current_timestamp_ms() as i64],
-        ).expect("failed to insert into events");
-
-        let recorded_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
-        db.execute(
-            "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
-             VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![&self.identity, &event_id_b64, recorded_at, "local_create"],
-        ).expect("failed to insert recorded_event");
-
-        event_id
+        });
+        create_event_sync(&db, &self.identity, &rxn).expect("failed to create reaction")
     }
 
     /// Create multiple messages. Uses a transaction for speed at scale.
     pub fn batch_create_messages(&self, count: usize) {
         let db = open_connection(&self.db_path).expect("failed to open db");
-
-        let mut neg_stmt = db.prepare(
-            "INSERT OR IGNORE INTO neg_items (ts, id) VALUES (?1, ?2)"
-        ).expect("failed to prepare neg_items stmt");
-        let mut msg_stmt = db.prepare(
-            "INSERT OR IGNORE INTO messages (message_id, channel_id, author_id, content, created_at, recorded_by)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
-        ).expect("failed to prepare messages stmt");
-        let mut rec_stmt = db.prepare(
-            "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
-             VALUES (?1, ?2, ?3, ?4)"
-        ).expect("failed to prepare recorded_events stmt");
-        let mut events_stmt = db.prepare(
-            "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
-        ).expect("failed to prepare events stmt");
-
         db.execute("BEGIN", []).expect("failed to begin");
         for i in 0..count {
-            let content = format!("Message {} from {}", i, self.name);
-            let created_at_ms = current_timestamp_ms();
-            let msg_event = MessageEvent {
-                created_at_ms,
+            let msg = ParsedEvent::Message(MessageEvent {
+                created_at_ms: current_timestamp_ms(),
                 channel_id: self.channel_id,
                 author_id: self.author_id,
-                content: content.clone(),
-            };
-            let blob = events::encode_event(&ParsedEvent::Message(msg_event))
-                .expect("failed to encode message");
-            let event_id = hash_event(&blob);
-
-            neg_stmt.execute(rusqlite::params![
-                created_at_ms as i64,
-                event_id.as_slice()
-            ]).expect("neg_items insert");
-
-            let event_id_b64 = event_id_to_base64(&event_id);
-            let channel_id_b64 = event_id_to_base64(&self.channel_id);
-            let author_id_b64 = event_id_to_base64(&self.author_id);
-            msg_stmt.execute(rusqlite::params![
-                event_id_b64, channel_id_b64, author_id_b64, content, created_at_ms as i64, &self.identity
-            ]).expect("messages insert");
-
-            events_stmt.execute(rusqlite::params![
-                event_id_b64, "message", blob.as_slice(), "shared", created_at_ms as i64, current_timestamp_ms() as i64
-            ]).expect("events insert");
-
-            let recorded_at = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as i64;
-            rec_stmt.execute(rusqlite::params![
-                &self.identity, &event_id_b64, recorded_at, "local_create"
-            ]).expect("recorded_events insert");
+                content: format!("Message {} from {}", i, self.name),
+            });
+            create_event_sync(&db, &self.identity, &msg).expect("failed to create message");
         }
         db.execute("COMMIT", []).expect("failed to commit");
     }
@@ -310,109 +191,41 @@ impl Peer {
     }
 }
 
-/// Replay all event blobs from the events table through registry-based projection.
-/// Clears projection tables, then re-projects all events.
+/// Replay all event blobs from the events table through project_one.
+/// Clears projection tables and valid_events, then re-projects all events.
 /// Returns (message_count, reaction_count) after replay.
 fn replay_projection(db: &rusqlite::Connection, recorded_by: &str) -> (i64, i64) {
-    // Clear projection tables for this tenant
-    db.execute("DELETE FROM messages WHERE recorded_by = ?1", rusqlite::params![recorded_by])
-        .expect("failed to clear messages");
-    db.execute("DELETE FROM reactions WHERE recorded_by = ?1", rusqlite::params![recorded_by])
-        .expect("failed to clear reactions");
-
-    // Read all blobs from events table
-    let mut stmt = db.prepare("SELECT event_id, blob FROM events ORDER BY created_at ASC, event_id ASC")
-        .expect("failed to prepare events query");
-    let rows: Vec<(String, Vec<u8>)> = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-    }).expect("failed to query events")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("failed to collect events");
-
-    let reg = registry();
-
-    for (event_id_b64, blob) in &rows {
-        if let Some(type_code) = events::extract_event_type(blob) {
-            if let Some(meta) = reg.lookup(type_code) {
-                if let Ok(parsed) = (meta.parse)(blob) {
-                    match &parsed {
-                        ParsedEvent::Message(msg) => {
-                            let channel_id_b64 = event_id_to_base64(&msg.channel_id);
-                            let author_id_b64 = event_id_to_base64(&msg.author_id);
-                            db.execute(
-                                "INSERT OR IGNORE INTO messages (message_id, channel_id, author_id, content, created_at, recorded_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                                rusqlite::params![event_id_b64, channel_id_b64, author_id_b64, &msg.content, msg.created_at_ms as i64, recorded_by],
-                            ).expect("failed to project message");
-                        }
-                        ParsedEvent::Reaction(rxn) => {
-                            let target_id_b64 = event_id_to_base64(&rxn.target_event_id);
-                            let author_id_b64 = event_id_to_base64(&rxn.author_id);
-                            db.execute(
-                                "INSERT OR IGNORE INTO reactions (event_id, target_event_id, author_id, emoji, created_at, recorded_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                                rusqlite::params![event_id_b64, target_id_b64, author_id_b64, &rxn.emoji, rxn.created_at_ms as i64, recorded_by],
-                            ).expect("failed to project reaction");
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let msg_count: i64 = db.query_row(
-        "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
-        rusqlite::params![recorded_by],
-        |row| row.get(0),
-    ).unwrap_or(0);
-    let rxn_count: i64 = db.query_row(
-        "SELECT COUNT(*) FROM reactions WHERE recorded_by = ?1",
-        rusqlite::params![recorded_by],
-        |row| row.get(0),
-    ).unwrap_or(0);
-
-    (msg_count, rxn_count)
+    replay_projection_impl(db, recorded_by, "ORDER BY created_at ASC, event_id ASC")
 }
 
 /// Replay events in reverse order through the projector.
 fn replay_projection_reverse(db: &rusqlite::Connection, recorded_by: &str) -> (i64, i64) {
+    replay_projection_impl(db, recorded_by, "ORDER BY created_at DESC, event_id DESC")
+}
+
+fn replay_projection_impl(db: &rusqlite::Connection, recorded_by: &str, order: &str) -> (i64, i64) {
+    use crate::crypto::event_id_from_base64;
+
+    // Clear projection tables + valid_events for this tenant
     db.execute("DELETE FROM messages WHERE recorded_by = ?1", rusqlite::params![recorded_by])
         .expect("failed to clear messages");
     db.execute("DELETE FROM reactions WHERE recorded_by = ?1", rusqlite::params![recorded_by])
         .expect("failed to clear reactions");
+    db.execute("DELETE FROM valid_events WHERE peer_id = ?1", rusqlite::params![recorded_by])
+        .expect("failed to clear valid_events");
+    db.execute("DELETE FROM blocked_event_deps WHERE peer_id = ?1", rusqlite::params![recorded_by])
+        .expect("failed to clear blocked_event_deps");
 
-    let mut stmt = db.prepare("SELECT event_id, blob FROM events ORDER BY created_at DESC, event_id DESC")
-        .expect("failed to prepare events query");
-    let rows: Vec<(String, Vec<u8>)> = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-    }).expect("failed to query events")
+    let query = format!("SELECT event_id FROM events {}", order);
+    let mut stmt = db.prepare(&query).expect("failed to prepare events query");
+    let event_ids: Vec<String> = stmt.query_map([], |row| row.get::<_, String>(0))
+        .expect("failed to query events")
         .collect::<Result<Vec<_>, _>>()
         .expect("failed to collect events");
 
-    let reg = registry();
-
-    for (event_id_b64, blob) in &rows {
-        if let Some(type_code) = events::extract_event_type(blob) {
-            if let Some(meta) = reg.lookup(type_code) {
-                if let Ok(parsed) = (meta.parse)(blob) {
-                    match &parsed {
-                        ParsedEvent::Message(msg) => {
-                            let channel_id_b64 = event_id_to_base64(&msg.channel_id);
-                            let author_id_b64 = event_id_to_base64(&msg.author_id);
-                            db.execute(
-                                "INSERT OR IGNORE INTO messages (message_id, channel_id, author_id, content, created_at, recorded_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                                rusqlite::params![event_id_b64, channel_id_b64, author_id_b64, &msg.content, msg.created_at_ms as i64, recorded_by],
-                            ).expect("failed to project message");
-                        }
-                        ParsedEvent::Reaction(rxn) => {
-                            let target_id_b64 = event_id_to_base64(&rxn.target_event_id);
-                            let author_id_b64 = event_id_to_base64(&rxn.author_id);
-                            db.execute(
-                                "INSERT OR IGNORE INTO reactions (event_id, target_event_id, author_id, emoji, created_at, recorded_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                                rusqlite::params![event_id_b64, target_id_b64, author_id_b64, &rxn.emoji, rxn.created_at_ms as i64, recorded_by],
-                            ).expect("failed to project reaction");
-                        }
-                    }
-                }
-            }
+    for eid_b64 in &event_ids {
+        if let Some(eid) = event_id_from_base64(eid_b64) {
+            let _ = project_one(db, recorded_by, &eid);
         }
     }
 

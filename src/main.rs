@@ -5,10 +5,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
-use poc_7::crypto::{hash_event, event_id_to_base64};
 use poc_7::db::{open_connection, schema::{create_tables, backfill_legacy_messages, count_legacy_messages}};
-use poc_7::events::{self, MessageEvent, ParsedEvent};
+use poc_7::events::{MessageEvent, ParsedEvent};
 use poc_7::identity::{cert_paths_from_db, load_identity_from_db, local_identity_from_db};
+use poc_7::projection::create::create_event_sync;
 use poc_7::sync::engine::{accept_loop, connect_loop};
 use poc_7::transport::{
     AllowedPeers,
@@ -356,48 +356,15 @@ fn send_message(db_path: &str, channel_hex: &str, content: &str) -> Result<(), B
 
     let channel_id = parse_channel_hex(channel_hex)?;
     let author_id: [u8; 32] = rand::random();
-    let created_at_ms = current_timestamp_ms();
 
-    let msg_event = MessageEvent {
-        created_at_ms,
+    let msg = ParsedEvent::Message(MessageEvent {
+        created_at_ms: current_timestamp_ms(),
         channel_id,
         author_id,
         content: content.to_string(),
-    };
-    let blob = events::encode_event(&ParsedEvent::Message(msg_event))
-        .map_err(|e| format!("encode error: {}", e))?;
-    let event_id = hash_event(&blob);
-
-    db.execute(
-        "INSERT OR IGNORE INTO neg_items (ts, id) VALUES (?1, ?2)",
-        rusqlite::params![created_at_ms as i64, event_id.as_slice()],
-    )?;
-
-    let event_id_b64 = event_id_to_base64(&event_id);
-    let channel_id_b64 = event_id_to_base64(&channel_id);
-    let author_id_b64 = event_id_to_base64(&author_id);
-    db.execute(
-        "INSERT OR IGNORE INTO messages (message_id, channel_id, author_id, content, created_at, recorded_by)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        rusqlite::params![event_id_b64, channel_id_b64, author_id_b64, content, created_at_ms as i64, &recorded_by],
-    )?;
-
-    // Write to events table
-    db.execute(
-        "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        rusqlite::params![event_id_b64, "message", blob.as_slice(), "shared", created_at_ms as i64, current_timestamp_ms() as i64],
-    )?;
-
-    let recorded_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64;
-    db.execute(
-        "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
-         VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![&recorded_by, &event_id_b64, recorded_at, "local_create"],
-    )?;
+    });
+    create_event_sync(&db, &recorded_by, &msg)
+        .map_err(|e| format!("create event error: {}", e))?;
 
     println!("Sent: {}", content);
 
@@ -450,46 +417,16 @@ fn generate_messages(db_path: &str, count: usize, channel_hex: &str) -> Result<(
     let channel_id = parse_channel_hex(channel_hex)?;
     let author_id: [u8; 32] = rand::random();
 
-    let mut neg_stmt = db.prepare("INSERT OR IGNORE INTO neg_items (ts, id) VALUES (?1, ?2)")?;
-    let mut msg_stmt = db.prepare(
-        "INSERT OR IGNORE INTO messages (message_id, channel_id, author_id, content, created_at, recorded_by)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
-    )?;
-    let mut rec_stmt = db.prepare(
-        "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
-         VALUES (?1, ?2, ?3, ?4)"
-    )?;
-    let mut events_stmt = db.prepare(
-        "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
-    )?;
-
     db.execute("BEGIN", [])?;
     for i in 0..count {
-        let content = format!("Message {}", i);
-        let created_at_ms = current_timestamp_ms();
-        let msg_event = MessageEvent {
-            created_at_ms,
+        let msg = ParsedEvent::Message(MessageEvent {
+            created_at_ms: current_timestamp_ms(),
             channel_id,
             author_id,
-            content: content.clone(),
-        };
-        let blob = events::encode_event(&ParsedEvent::Message(msg_event))
-            .map_err(|e| format!("encode error: {}", e))?;
-        let event_id = hash_event(&blob);
-
-        neg_stmt.execute(rusqlite::params![created_at_ms as i64, event_id.as_slice()])?;
-
-        let event_id_b64 = event_id_to_base64(&event_id);
-        let channel_id_b64 = event_id_to_base64(&channel_id);
-        let author_id_b64 = event_id_to_base64(&author_id);
-        msg_stmt.execute(rusqlite::params![event_id_b64, channel_id_b64, author_id_b64, content, created_at_ms as i64, &recorded_by])?;
-        events_stmt.execute(rusqlite::params![event_id_b64, "message", blob.as_slice(), "shared", created_at_ms as i64, current_timestamp_ms() as i64])?;
-        let recorded_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
-        rec_stmt.execute(rusqlite::params![&recorded_by, &event_id_b64, recorded_at, "local_create"])?;
+            content: format!("Message {}", i),
+        });
+        create_event_sync(&db, &recorded_by, &msg)
+            .map_err(|e| format!("create event error: {}", e))?;
     }
     db.execute("COMMIT", [])?;
 

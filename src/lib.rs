@@ -2,6 +2,7 @@ pub mod crypto;
 pub mod db;
 pub mod events;
 pub mod identity;
+pub mod projection;
 pub mod runtime;
 pub mod sync;
 pub mod transport;
