@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use poc_7::testutil::{Peer, start_peers, assert_eventually, sync_until_converged, verify_projection_invariants};
-use poc_7::crypto::event_id_to_base64;
+use poc_7::crypto::{event_id_to_base64, event_id_from_base64};
 use poc_7::transport::{
     AllowedPeers, create_client_endpoint, create_server_endpoint,
     extract_spki_fingerprint, load_or_generate_cert, peer_identity_from_connection,
@@ -117,8 +117,14 @@ async fn test_sync_10k() {
 
     assert_eq!(alice.store_count(), 10_000);
     assert_eq!(bob.store_count(), 10_000);
+
+    // Wait for projection queue to drain (batch_writer projects asynchronously via project_queue)
+    assert_eventually(
+        || bob.message_count() == 10_000,
+        Duration::from_secs(30),
+        &format!("bob projection to complete (bob.message_count={})", bob.message_count()),
+    ).await;
     assert_eq!(alice.message_count(), 10_000);
-    assert_eq!(bob.message_count(), 10_000);
 }
 
 #[tokio::test]
@@ -455,6 +461,13 @@ async fn test_sync_50k() {
 
     assert_eq!(alice.store_count(), 50_000);
     assert_eq!(bob.store_count(), 50_000);
+
+    // Wait for projection queue to drain
+    assert_eventually(
+        || bob.message_count() == 50_000,
+        Duration::from_secs(120),
+        &format!("bob projection to complete (bob.message_count={})", bob.message_count()),
+    ).await;
 }
 
 /// Integration test: verify peer_identity_from_connection returns the correct
@@ -963,4 +976,172 @@ async fn test_encrypted_replay_invariants() {
 
     // Run invariant checks (forward, double, reverse)
     verify_projection_invariants(&alice);
+}
+
+/// Integration test: simulate crash recovery by manually enqueuing events into project_queue,
+/// then calling recovery (recover_expired + drain). All events should be projected.
+#[tokio::test]
+async fn test_project_queue_crash_recovery() {
+    use poc_7::db::project_queue::ProjectQueue;
+    use poc_7::projection::pipeline::project_one;
+
+    let channel = test_channel();
+    let alice = Peer::new("alice", channel);
+
+    // Create messages via create_event_sync (bypasses queue, projects inline)
+    let msg1 = alice.create_message("Recovery message 1");
+    let msg2 = alice.create_message("Recovery message 2");
+    let msg3 = alice.create_message("Recovery message 3");
+
+    assert_eq!(alice.store_count(), 3);
+    assert_eq!(alice.scoped_message_count(), 3);
+
+    // Now simulate a crash scenario: clear projection state and re-enqueue to project_queue
+    let db = open_connection(&alice.db_path).expect("open db");
+    db.execute("DELETE FROM messages WHERE recorded_by = ?1", rusqlite::params![&alice.identity]).unwrap();
+    db.execute("DELETE FROM valid_events WHERE peer_id = ?1", rusqlite::params![&alice.identity]).unwrap();
+    db.execute("DELETE FROM blocked_event_deps WHERE peer_id = ?1", rusqlite::params![&alice.identity]).unwrap();
+    db.execute("DELETE FROM rejected_events WHERE peer_id = ?1", rusqlite::params![&alice.identity]).unwrap();
+
+    // Enqueue the events into project_queue (simulating what batch_writer does)
+    let pq = ProjectQueue::new(&db);
+    for eid in &[msg1, msg2, msg3] {
+        let eid_b64 = event_id_to_base64(eid);
+        pq.enqueue(&alice.identity, &eid_b64).unwrap();
+    }
+
+    // Verify nothing projected yet
+    let msg_count: i64 = db.query_row(
+        "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
+        rusqlite::params![&alice.identity], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(msg_count, 0);
+
+    // Run recovery: recover expired leases + drain
+    let recovered = pq.recover_expired().unwrap();
+    // Items were just enqueued (no lease set), so nothing to recover
+    assert_eq!(recovered, 0);
+
+    let drained = pq.drain(&alice.identity, |conn, eid_b64| {
+        if let Some(eid) = event_id_from_base64(eid_b64) {
+            let _ = project_one(conn, &alice.identity, &eid);
+        }
+    }).unwrap();
+    assert_eq!(drained, 3);
+
+    // Verify all messages projected
+    let msg_count: i64 = db.query_row(
+        "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
+        rusqlite::params![&alice.identity], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(msg_count, 3);
+
+    // Verify valid_events
+    let valid_count: i64 = db.query_row(
+        "SELECT COUNT(*) FROM valid_events WHERE peer_id = ?1",
+        rusqlite::params![&alice.identity], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(valid_count, 3);
+
+    // Queue should be empty
+    assert_eq!(pq.count_pending(&alice.identity).unwrap(), 0);
+}
+
+/// Integration test: verify project_queue drain works end-to-end with create_event_sync events.
+#[tokio::test]
+async fn test_project_queue_drain_after_batch() {
+    use poc_7::db::project_queue::ProjectQueue;
+    use poc_7::projection::pipeline::project_one;
+
+    let channel = test_channel();
+    let alice = Peer::new("alice", channel);
+
+    // Create events (projected inline by create_event_sync)
+    alice.batch_create_messages(5);
+    assert_eq!(alice.store_count(), 5);
+    assert_eq!(alice.scoped_message_count(), 5);
+
+    // Enqueue to project_queue — guard should prevent re-enqueue (already valid)
+    let db = open_connection(&alice.db_path).expect("open db");
+    let pq = ProjectQueue::new(&db);
+
+    let event_ids: Vec<String> = db.prepare("SELECT event_id FROM events")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    let refs: Vec<&str> = event_ids.iter().map(|s| s.as_str()).collect();
+    let inserted = pq.enqueue_batch(&alice.identity, &refs).unwrap();
+    assert_eq!(inserted, 0, "guard should prevent re-enqueue of already-valid events");
+
+    // Drain should process nothing (queue empty)
+    let drained = pq.drain(&alice.identity, |conn, eid_b64| {
+        if let Some(eid) = event_id_from_base64(eid_b64) {
+            let _ = project_one(conn, &alice.identity, &eid);
+        }
+    }).unwrap();
+    assert_eq!(drained, 0);
+
+    // State unchanged
+    assert_eq!(alice.scoped_message_count(), 5);
+}
+
+/// Integration test: egress_queue lifecycle — enqueue, claim, send, cleanup.
+#[tokio::test]
+async fn test_egress_queue_lifecycle() {
+    use poc_7::db::egress_queue::EgressQueue;
+
+    let channel = test_channel();
+    let alice = Peer::new("alice", channel);
+
+    // Create some events to get event IDs
+    let msg1 = alice.create_message("Egress msg 1");
+    let msg2 = alice.create_message("Egress msg 2");
+    let msg3 = alice.create_message("Egress msg 3");
+
+    let db = open_connection(&alice.db_path).expect("open db");
+    let eq = EgressQueue::new(&db);
+
+    let conn_id = "test-connection-1";
+
+    // Enqueue events
+    let enqueued = eq.enqueue_events(conn_id, &[msg1, msg2, msg3]).unwrap();
+    assert_eq!(enqueued, 3);
+
+    // Count pending
+    let pending = eq.count_pending(conn_id).unwrap();
+    assert_eq!(pending, 3);
+
+    // Claim batch
+    let claimed = eq.claim_batch(conn_id, 10, 30_000).unwrap();
+    assert_eq!(claimed.len(), 3);
+
+    // Mark sent
+    let rowids: Vec<i64> = claimed.iter().map(|(rowid, _)| *rowid).collect();
+    eq.mark_sent(&rowids).unwrap();
+
+    // Count pending after sending
+    let pending = eq.count_pending(conn_id).unwrap();
+    assert_eq!(pending, 0);
+
+    // Cleanup sent (all recent, so none purged with large cutoff)
+    let purged = eq.cleanup_sent(0).unwrap();
+    // sent_at = now, cutoff = now - 0 = now, so nothing older than now
+    assert_eq!(purged, 0);
+
+    // Backdate and cleanup
+    db.execute("UPDATE egress_queue SET sent_at = sent_at - 600000", []).unwrap();
+    let purged = eq.cleanup_sent(0).unwrap();
+    assert_eq!(purged, 3);
+
+    // Re-enqueue should work (dedup index only blocks unsent)
+    let enqueued = eq.enqueue_events(conn_id, &[msg1, msg2]).unwrap();
+    assert_eq!(enqueued, 2);
+
+    // Clear connection
+    eq.clear_connection(conn_id).unwrap();
+    let pending = eq.count_pending(conn_id).unwrap();
+    assert_eq!(pending, 0);
 }

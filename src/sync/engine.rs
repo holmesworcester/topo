@@ -18,8 +18,8 @@ use negentropy::{Negentropy, Id, NegentropyStorageBase, Storage};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn, error};
 
-use crate::crypto::{hash_event, event_id_to_base64, EventId};
-use crate::db::{open_connection, schema::create_tables, store::Store, outgoing::OutgoingQueue, wanted::WantedEvents};
+use crate::crypto::{hash_event, event_id_to_base64, event_id_from_base64, EventId};
+use crate::db::{open_connection, schema::create_tables, store::Store, egress_queue::EgressQueue, wanted::WantedEvents, project_queue::ProjectQueue};
 use crate::events::{self, registry};
 use crate::projection::pipeline::project_one;
 use crate::runtime::SyncStats;
@@ -52,8 +52,8 @@ fn current_timestamp_ms() -> i64 {
 }
 
 /// Batch writer task - drains channel and writes to SQLite in batches.
-/// Writes event blob/neg_items/recorded_events, then delegates projection
-/// to `project_one` which handles deps, terminal state, and cascading.
+/// Writes event blob/neg_items/recorded_events, enqueues into project_queue,
+/// then drains the queue via `project_one` for crash-recoverable projection.
 pub fn batch_writer(
     db_path: String,
     recorded_by: String,
@@ -103,6 +103,21 @@ pub fn batch_writer(
     };
 
     let reg = registry();
+    let pq = ProjectQueue::new(&db);
+
+    let mut enqueue_stmt = match db.prepare(
+        "INSERT OR IGNORE INTO project_queue (peer_id, event_id, available_at)
+         SELECT ?1, ?2, ?3
+         WHERE NOT EXISTS (SELECT 1 FROM valid_events WHERE peer_id=?1 AND event_id=?2)
+         AND NOT EXISTS (SELECT 1 FROM rejected_events WHERE peer_id=?1 AND event_id=?2)
+         AND NOT EXISTS (SELECT 1 FROM blocked_event_deps WHERE peer_id=?1 AND event_id=?2)"
+    ) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            error!("Failed to prepare enqueue statement: {}", e);
+            return;
+        }
+    };
 
     loop {
         let first = match rx.blocking_recv() {
@@ -119,8 +134,7 @@ pub fn batch_writer(
         }
 
         if db.execute("BEGIN", []).is_ok() {
-            // First pass: write blob storage, neg_items, recorded_events
-            let mut event_ids_to_project: Vec<EventId> = Vec::with_capacity(batch.len());
+            // First pass: write blob storage, neg_items, recorded_events, enqueue for projection
             let mut event_ids_to_remove: Vec<EventId> = Vec::with_capacity(batch.len());
             for (event_id, blob) in &batch {
                 event_ids_to_remove.push(*event_id);
@@ -164,7 +178,14 @@ pub fn batch_writer(
                                 continue;
                             }
 
-                            event_ids_to_project.push(*event_id);
+                            // Enqueue for durable projection (atomicity boundary 1)
+                            if let Err(e) = enqueue_stmt.execute(rusqlite::params![
+                                &recorded_by,
+                                &event_id_b64,
+                                current_timestamp_ms()
+                            ]) {
+                                warn!("project_queue enqueue error for {}: {}", event_id_b64, e);
+                            }
                         }
                     }
                 }
@@ -176,11 +197,15 @@ pub fn batch_writer(
                         let _ = wanted.remove(event_id);
                     }
 
-                    // Second pass: project each event (handles deps + cascade)
-                    for event_id in &event_ids_to_project {
-                        if let Err(e) = project_one(&db, &recorded_by, event_id) {
-                            warn!("projection error for {}: {}", event_id_to_base64(event_id), e);
+                    // Second pass: drain project_queue
+                    if let Err(e) = pq.drain(&recorded_by, |conn, event_id_b64| {
+                        if let Some(eid) = event_id_from_base64(event_id_b64) {
+                            if let Err(e) = project_one(conn, &recorded_by, &eid) {
+                                warn!("projection error for {}: {}", event_id_b64, e);
+                            }
                         }
+                    }) {
+                        warn!("project_queue drain error: {}", e);
                     }
                 }
                 Err(e) => {
@@ -278,9 +303,9 @@ where
     let db = open_connection(db_path)?;
     let neg_db = open_connection(db_path)?;
 
-    let outgoing = OutgoingQueue::new(&db);
+    let egress = EgressQueue::new(&db);
     let wanted = WantedEvents::new(&db);
-    let _ = outgoing.clear_peer(peer_id);
+    let _ = egress.clear_connection(peer_id);
     let _ = wanted.clear();
 
     let neg_storage = NegentropyStorageSqlite::new(&neg_db);
@@ -350,12 +375,12 @@ where
                     for neg_id in have_ids.drain(..) {
                         batch.push(neg_id_to_event_id(&neg_id));
                         if batch.len() >= HAVE_CHUNK {
-                            let _ = outgoing.enqueue_batch(peer_id, &batch);
+                            let _ = egress.enqueue_events(peer_id, &batch);
                             batch.clear();
                         }
                     }
                     if !batch.is_empty() {
-                        let _ = outgoing.enqueue_batch(peer_id, &batch);
+                        let _ = egress.enqueue_events(peer_id, &batch);
                     }
                 }
 
@@ -379,7 +404,7 @@ where
                 }
 
                 if reconciliation_done {
-                    let pending_out = outgoing.count_pending(peer_id).unwrap_or(0);
+                    let pending_out = egress.count_pending(peer_id).unwrap_or(0);
                     let pending_in = wanted.count().unwrap_or(0);
                     info!(
                         "Reconciliation complete in {} rounds: outgoing={}, wanted={}",
@@ -408,7 +433,7 @@ where
         let mut sent_this_round = 0;
         let mut blocked = false;
         while !blocked {
-            let batch = outgoing.dequeue_batch(peer_id, 500).unwrap_or_default();
+            let batch = egress.claim_batch(peer_id, 500, 30_000).unwrap_or_default();
             if batch.is_empty() {
                 break;
             }
@@ -430,17 +455,17 @@ where
                     sent_rowids.push(rowid);
                 }
             }
-            let _ = outgoing.mark_sent_batch(&sent_rowids);
+            let _ = egress.mark_sent(&sent_rowids);
         }
 
         if sent_this_round > 0 {
             let _ = data_send.flush().await;
         }
 
-        // Once reconciliation is done and outgoing queue is drained,
+        // Once reconciliation is done and egress queue is drained,
         // send DataDone on data stream then Done on control.
         if reconciliation_done && !done_sent {
-            let pending_out = outgoing.count_pending(peer_id).unwrap_or(0);
+            let pending_out = egress.count_pending(peer_id).unwrap_or(0);
             if pending_out == 0 {
                 let _ = data_send.flush().await;
                 data_send.send(&SyncMessage::DataDone).await?;
@@ -455,8 +480,9 @@ where
     }
 
     if completed {
-        let _ = outgoing.clear_peer(peer_id);
+        let _ = egress.clear_connection(peer_id);
         let _ = wanted.clear();
+        let _ = egress.cleanup_sent(300_000);
     }
     let _ = neg_db.execute("COMMIT", []);
 
@@ -514,8 +540,8 @@ where
     let db = open_connection(db_path)?;
     let neg_db = open_connection(db_path)?;
 
-    let outgoing = OutgoingQueue::new(&db);
-    let _ = outgoing.clear_peer(peer_id);
+    let egress = EgressQueue::new(&db);
+    let _ = egress.clear_connection(peer_id);
 
     let neg_storage = NegentropyStorageSqlite::new(&neg_db);
     neg_storage.rebuild_blocks().map_err(|e| format!("Failed to rebuild blocks: {}", e))?;
@@ -573,7 +599,7 @@ where
                     continue;
                 }
 
-                let _ = outgoing.enqueue_batch(peer_id, &ids);
+                let _ = egress.enqueue_events(peer_id, &ids);
             }
             Ok(Ok(SyncMessage::Done)) => {
                 info!("Received Done from initiator");
@@ -594,7 +620,7 @@ where
         let mut sent_this_round = 0;
         let mut blocked = false;
         while !blocked {
-            let batch = outgoing.dequeue_batch(peer_id, 500).unwrap_or_default();
+            let batch = egress.claim_batch(peer_id, 500, 30_000).unwrap_or_default();
             if batch.is_empty() {
                 break;
             }
@@ -616,19 +642,19 @@ where
                     sent_rowids.push(rowid);
                 }
             }
-            let _ = outgoing.mark_sent_batch(&sent_rowids);
+            let _ = egress.mark_sent(&sent_rowids);
         }
 
         if sent_this_round > 0 {
             let _ = data_send.flush().await;
         }
 
-        // After peer signalled Done and our outgoing queue is drained:
+        // After peer signalled Done and our egress queue is drained:
         // 1. Send DataDone on data stream (signals peer's data receiver)
         // 2. Wait for peer's DataDone to be consumed by our data receiver
         // 3. Only then send DoneAck on control
         if peer_done {
-            let pending_out = outgoing.count_pending(peer_id).unwrap_or(0);
+            let pending_out = egress.count_pending(peer_id).unwrap_or(0);
             if pending_out == 0 {
                 // Signal peer's data receiver that we're done sending events
                 let _ = data_send.flush().await;
@@ -654,7 +680,8 @@ where
     }
 
     if completed {
-        let _ = outgoing.clear_peer(peer_id);
+        let _ = egress.clear_connection(peer_id);
+        let _ = egress.cleanup_sent(300_000);
     }
     let _ = neg_db.execute("COMMIT", []);
     let _ = shutdown_tx.send(());
@@ -687,6 +714,20 @@ pub async fn accept_loop(
     {
         let db = open_connection(db_path)?;
         create_tables(&db)?;
+        let pq = ProjectQueue::new(&db);
+        let recovered = pq.recover_expired().unwrap_or(0);
+        if recovered > 0 {
+            info!("Recovered {} expired project_queue leases", recovered);
+        }
+        let recorded_by_str = recorded_by.to_string();
+        let drained = pq.drain(&recorded_by_str, |conn, event_id_b64| {
+            if let Some(eid) = event_id_from_base64(event_id_b64) {
+                let _ = project_one(conn, &recorded_by_str, &eid);
+            }
+        }).unwrap_or(0);
+        if drained > 0 {
+            info!("Processed {} pending project_queue items from previous session", drained);
+        }
     }
 
     loop {
@@ -754,6 +795,20 @@ pub async fn connect_loop(
     {
         let db = open_connection(db_path)?;
         create_tables(&db)?;
+        let pq = ProjectQueue::new(&db);
+        let recovered = pq.recover_expired().unwrap_or(0);
+        if recovered > 0 {
+            info!("Recovered {} expired project_queue leases", recovered);
+        }
+        let recorded_by_str = recorded_by.to_string();
+        let drained = pq.drain(&recorded_by_str, |conn, event_id_b64| {
+            if let Some(eid) = event_id_from_base64(event_id_b64) {
+                let _ = project_one(conn, &recorded_by_str, &eid);
+            }
+        }).unwrap_or(0);
+        if drained > 0 {
+            info!("Processed {} pending project_queue items from previous session", drained);
+        }
     }
 
     loop {
