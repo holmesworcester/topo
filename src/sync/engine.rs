@@ -133,89 +133,108 @@ pub fn batch_writer(
             }
         }
 
-        if db.execute("BEGIN", []).is_ok() {
-            // First pass: write blob storage, neg_items, recorded_events, enqueue for projection
-            let mut event_ids_to_remove: Vec<EventId> = Vec::with_capacity(batch.len());
-            for (event_id, blob) in &batch {
-                event_ids_to_remove.push(*event_id);
-
-                let event_id_b64 = event_id_to_base64(event_id);
-
-                if let Some(created_at_ms) = events::extract_created_at_ms(blob) {
-                    if let Err(e) = neg_items_stmt.execute(rusqlite::params![
-                        created_at_ms as i64,
-                        event_id.as_slice()
-                    ]) {
-                        warn!("neg_items insert error for {}: {}", event_id_b64, e);
-                        continue;
-                    }
-
-                    if let Some(type_code) = events::extract_event_type(blob) {
-                        if let Some(meta) = reg.lookup(type_code) {
-                            if let Err(e) = events_stmt.execute(rusqlite::params![
-                                &event_id_b64,
-                                meta.type_name,
-                                blob.as_slice(),
-                                meta.share_scope.as_str(),
-                                created_at_ms as i64,
-                                current_timestamp_ms()
-                            ]) {
-                                warn!("events insert error for {}: {}", event_id_b64, e);
-                                continue;
-                            }
-
-                            let recorded_at = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap()
-                                .as_millis() as i64;
-                            if let Err(e) = recorded_stmt.execute(rusqlite::params![
-                                &recorded_by,
-                                &event_id_b64,
-                                recorded_at,
-                                "quic_recv"
-                            ]) {
-                                warn!("recorded_events insert error for {}: {}", event_id_b64, e);
-                                continue;
-                            }
-
-                            // Enqueue for durable projection (atomicity boundary 1)
-                            if let Err(e) = enqueue_stmt.execute(rusqlite::params![
-                                &recorded_by,
-                                &event_id_b64,
-                                current_timestamp_ms()
-                            ]) {
-                                warn!("project_queue enqueue error for {}: {}", event_id_b64, e);
-                            }
-                        }
-                    }
-                }
-            }
-            match db.execute("COMMIT", []) {
-                Ok(_) => {
-                    // Remove from wanted only after durable commit
-                    for event_id in &event_ids_to_remove {
-                        let _ = wanted.remove(event_id);
-                    }
-
-                    // Second pass: drain project_queue
-                    if let Err(e) = pq.drain(&recorded_by, |conn, event_id_b64| {
-                        if let Some(eid) = event_id_from_base64(event_id_b64) {
-                            if let Err(e) = project_one(conn, &recorded_by, &eid) {
-                                warn!("projection error for {}: {}", event_id_b64, e);
-                            }
-                        }
-                    }) {
-                        warn!("project_queue drain error: {}", e);
-                    }
-                }
+        // BEGIN with retry+backoff — do not drain batch on failure
+        let mut begin_ok = false;
+        for attempt in 0..3 {
+            match db.execute("BEGIN", []) {
+                Ok(_) => { begin_ok = true; break; }
                 Err(e) => {
-                    warn!("COMMIT failed: {}", e);
-                    continue; // retry in next batch
+                    warn!("BEGIN failed (attempt {}): {}", attempt + 1, e);
+                    // Ensure no leftover transaction state
+                    let _ = db.execute("ROLLBACK", []);
+                    std::thread::sleep(Duration::from_millis(50 * (1 << attempt)));
                 }
             }
         }
+        if !begin_ok {
+            error!("BEGIN failed after retries, preserving {} items for next batch", batch.len());
+            // Items remain in wanted — they will be re-requested on next sync
+            continue;
+        }
 
-        events_received.fetch_add(batch.len() as u64, Ordering::Relaxed);
+        // First pass: write blob storage, neg_items, recorded_events, enqueue for projection
+        let mut event_ids_persisted: Vec<EventId> = Vec::with_capacity(batch.len());
+        for (event_id, blob) in &batch {
+            let event_id_b64 = event_id_to_base64(event_id);
+
+            if let Some(created_at_ms) = events::extract_created_at_ms(blob) {
+                if let Err(e) = neg_items_stmt.execute(rusqlite::params![
+                    created_at_ms as i64,
+                    event_id.as_slice()
+                ]) {
+                    warn!("neg_items insert error for {}: {}", event_id_b64, e);
+                    continue;
+                }
+
+                if let Some(type_code) = events::extract_event_type(blob) {
+                    if let Some(meta) = reg.lookup(type_code) {
+                        if let Err(e) = events_stmt.execute(rusqlite::params![
+                            &event_id_b64,
+                            meta.type_name,
+                            blob.as_slice(),
+                            meta.share_scope.as_str(),
+                            created_at_ms as i64,
+                            current_timestamp_ms()
+                        ]) {
+                            warn!("events insert error for {}: {}", event_id_b64, e);
+                            continue;
+                        }
+
+                        let recorded_at = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_millis() as i64;
+                        if let Err(e) = recorded_stmt.execute(rusqlite::params![
+                            &recorded_by,
+                            &event_id_b64,
+                            recorded_at,
+                            "quic_recv"
+                        ]) {
+                            warn!("recorded_events insert error for {}: {}", event_id_b64, e);
+                            continue;
+                        }
+
+                        // Enqueue for durable projection (atomicity boundary 1)
+                        if let Err(e) = enqueue_stmt.execute(rusqlite::params![
+                            &recorded_by,
+                            &event_id_b64,
+                            current_timestamp_ms()
+                        ]) {
+                            warn!("project_queue enqueue error for {}: {}", event_id_b64, e);
+                        }
+
+                        event_ids_persisted.push(*event_id);
+                    }
+                }
+            }
+        }
+        match db.execute("COMMIT", []) {
+            Ok(_) => {
+                // Remove from wanted only for successfully persisted items
+                for event_id in &event_ids_persisted {
+                    let _ = wanted.remove(event_id);
+                }
+
+                // Second pass: drain project_queue
+                if let Err(e) = pq.drain(&recorded_by, |conn, event_id_b64| {
+                    if let Some(eid) = event_id_from_base64(event_id_b64) {
+                        if let Err(e) = project_one(conn, &recorded_by, &eid) {
+                            warn!("projection error for {}: {}", event_id_b64, e);
+                        }
+                    }
+                }) {
+                    warn!("project_queue drain error: {}", e);
+                }
+            }
+            Err(e) => {
+                warn!("COMMIT failed, rolling back: {}", e);
+                let _ = db.execute("ROLLBACK", []);
+                // Items remain in wanted — they will be re-requested on next sync
+                continue;
+            }
+        }
+
+        events_received.fetch_add(event_ids_persisted.len() as u64, Ordering::Relaxed);
     }
 }
 
