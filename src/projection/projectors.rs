@@ -1,7 +1,7 @@
 use rusqlite::Connection;
 
 use crate::crypto::event_id_to_base64;
-use crate::events::{MessageEvent, PeerKeyEvent, ReactionEvent, SignedMemoEvent};
+use crate::events::{MessageEvent, PeerKeyEvent, ReactionEvent, SecretKeyEvent, SignedMemoEvent};
 
 /// Project a Message event into the messages table. Returns Ok(true) if written.
 pub fn project_message(
@@ -66,6 +66,26 @@ pub fn project_peer_key(
             event_id_b64,
             public_key_hex,
             pk.created_at_ms as i64,
+            recorded_by
+        ],
+    )?;
+    Ok(rows > 0)
+}
+
+/// Project a SecretKey event into the secret_keys table. Returns Ok(true) if written.
+pub fn project_secret_key(
+    conn: &Connection,
+    recorded_by: &str,
+    event_id_b64: &str,
+    sk: &SecretKeyEvent,
+) -> Result<bool, rusqlite::Error> {
+    let rows = conn.execute(
+        "INSERT OR IGNORE INTO secret_keys (event_id, key_bytes, created_at, recorded_by)
+         VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![
+            event_id_b64,
+            sk.key_bytes.as_slice(),
+            sk.created_at_ms as i64,
             recorded_by
         ],
     )?;

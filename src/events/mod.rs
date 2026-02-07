@@ -1,21 +1,27 @@
+pub mod encrypted;
 pub mod message;
 pub mod peer_key;
 pub mod reaction;
 pub mod registry;
+pub mod secret_key;
 pub mod signed_memo;
 
 use std::sync::OnceLock;
 
+pub use encrypted::EncryptedEvent;
 pub use message::MessageEvent;
 pub use peer_key::PeerKeyEvent;
 pub use reaction::ReactionEvent;
 pub use registry::{EventRegistry, EventTypeMeta, ShareScope};
+pub use secret_key::SecretKeyEvent;
 pub use signed_memo::SignedMemoEvent;
 
 pub const EVENT_TYPE_MESSAGE: u8 = 1;
 pub const EVENT_TYPE_REACTION: u8 = 2;
 pub const EVENT_TYPE_PEER_KEY: u8 = 3;
 pub const EVENT_TYPE_SIGNED_MEMO: u8 = 4;
+pub const EVENT_TYPE_ENCRYPTED: u8 = 5;
+pub const EVENT_TYPE_SECRET_KEY: u8 = 6;
 
 /// Max event blob size: 1 MiB
 pub const EVENT_MAX_BLOB_BYTES: usize = 1024 * 1024;
@@ -26,6 +32,8 @@ pub enum ParsedEvent {
     Reaction(ReactionEvent),
     PeerKey(PeerKeyEvent),
     SignedMemo(SignedMemoEvent),
+    Encrypted(EncryptedEvent),
+    SecretKey(SecretKeyEvent),
 }
 
 impl ParsedEvent {
@@ -35,6 +43,8 @@ impl ParsedEvent {
             ParsedEvent::Reaction(r) => r.created_at_ms,
             ParsedEvent::PeerKey(p) => p.created_at_ms,
             ParsedEvent::SignedMemo(s) => s.created_at_ms,
+            ParsedEvent::Encrypted(e) => e.created_at_ms,
+            ParsedEvent::SecretKey(s) => s.created_at_ms,
         }
     }
 
@@ -46,6 +56,8 @@ impl ParsedEvent {
             ParsedEvent::Reaction(r) => vec![("target_event_id", r.target_event_id)],
             ParsedEvent::PeerKey(_) => vec![],
             ParsedEvent::SignedMemo(s) => vec![("signed_by", s.signed_by)],
+            ParsedEvent::Encrypted(e) => vec![("key_event_id", e.key_event_id)],
+            ParsedEvent::SecretKey(_) => vec![],
         }
     }
 
@@ -55,6 +67,8 @@ impl ParsedEvent {
             ParsedEvent::Reaction(_) => EVENT_TYPE_REACTION,
             ParsedEvent::PeerKey(_) => EVENT_TYPE_PEER_KEY,
             ParsedEvent::SignedMemo(_) => EVENT_TYPE_SIGNED_MEMO,
+            ParsedEvent::Encrypted(_) => EVENT_TYPE_ENCRYPTED,
+            ParsedEvent::SecretKey(_) => EVENT_TYPE_SECRET_KEY,
         }
     }
 
@@ -63,7 +77,11 @@ impl ParsedEvent {
     pub fn signer_fields(&self) -> Option<([u8; 32], u8)> {
         match self {
             ParsedEvent::SignedMemo(m) => Some((m.signed_by, m.signer_type)),
-            _ => None,
+            ParsedEvent::Message(_)
+            | ParsedEvent::Reaction(_)
+            | ParsedEvent::PeerKey(_)
+            | ParsedEvent::Encrypted(_)
+            | ParsedEvent::SecretKey(_) => None,
         }
     }
 }
@@ -118,6 +136,8 @@ pub fn registry() -> &'static EventRegistry {
             &reaction::REACTION_TYPE_META,
             &peer_key::PEER_KEY_META,
             &signed_memo::SIGNED_MEMO_META,
+            &encrypted::ENCRYPTED_META,
+            &secret_key::SECRET_KEY_META,
         ])
     })
 }

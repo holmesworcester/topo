@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use poc_7::testutil::{Peer, start_peers, assert_eventually, sync_until_converged, verify_projection_invariants};
+use poc_7::crypto::event_id_to_base64;
 use poc_7::transport::{
     AllowedPeers, create_client_endpoint, create_server_endpoint,
     extract_spki_fingerprint, load_or_generate_cert, peer_identity_from_connection,
@@ -852,4 +853,114 @@ async fn test_cross_tenant_dep_scoping_after_sync() {
     // Run projection invariants for both
     verify_projection_invariants(&alice);
     verify_projection_invariants(&bob);
+}
+
+/// Integration test: Alice creates a PSK + encrypted message → syncs to Bob → Bob projects.
+#[tokio::test]
+async fn test_encrypted_event_sync() {
+    let channel = test_channel();
+    let alice = Peer::new("alice", channel);
+    let bob = Peer::new("bob", channel);
+
+    // Alice creates a secret key + encrypted message
+    let key_bytes: [u8; 32] = rand::random();
+    let sk_eid = alice.create_secret_key(key_bytes);
+    let _enc_eid = alice.create_encrypted_message(&sk_eid, "Hello encrypted world");
+
+    assert_eq!(alice.store_count(), 2);
+    assert_eq!(alice.secret_key_count(), 1);
+    // The encrypted event projects into messages table
+    assert_eq!(alice.scoped_message_count(), 1);
+
+    // Sync to Bob
+    let sync = start_peers(&alice, &bob);
+
+    assert_eventually(
+        || bob.store_count() == 2,
+        Duration::from_secs(15),
+        "bob should have 2 events (SecretKey + Encrypted)",
+    ).await;
+
+    drop(sync);
+
+    // Bob should have projected both: secret key into secret_keys, inner message into messages
+    assert_eq!(bob.secret_key_count(), 1);
+    assert_eq!(bob.scoped_message_count(), 1);
+
+    verify_projection_invariants(&alice);
+    verify_projection_invariants(&bob);
+}
+
+/// Integration test: Encrypted event syncs before key → blocks → key syncs → cascade unblocks.
+#[tokio::test]
+async fn test_encrypted_out_of_order_sync() {
+    let channel = test_channel();
+    let alice = Peer::new("alice", channel);
+    let bob = Peer::new("bob", channel);
+
+    // Alice creates the key + encrypted message
+    let key_bytes: [u8; 32] = rand::random();
+    let sk_eid = alice.create_secret_key(key_bytes);
+    let _enc_eid = alice.create_encrypted_message(&sk_eid, "Out of order encrypted");
+
+    // Also create a normal message to verify mixed events work
+    alice.create_message("Normal message");
+
+    // Bob creates a message too
+    bob.create_message("Bob's message");
+
+    assert_eq!(alice.store_count(), 3); // sk, encrypted, message
+    assert_eq!(bob.store_count(), 1);
+
+    // Sync
+    let sync = start_peers(&alice, &bob);
+
+    assert_eventually(
+        || alice.store_count() == 4 && bob.store_count() == 4,
+        Duration::from_secs(15),
+        "both peers should have 4 events",
+    ).await;
+
+    drop(sync);
+
+    // Bob should have auto-unblocked the encrypted message (if it arrived before key)
+    assert_eq!(bob.secret_key_count(), 1);
+    assert_eq!(bob.scoped_message_count(), 3); // encrypted inner + normal + bob's
+    assert_eq!(alice.scoped_message_count(), 3);
+
+    // No remaining blocked deps
+    let bob_db = open_connection(&bob.db_path).expect("open bob db");
+    let blocked: i64 = bob_db.query_row(
+        "SELECT COUNT(*) FROM blocked_event_deps WHERE peer_id = ?1",
+        rusqlite::params![&bob.identity],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(blocked, 0, "no remaining blocked deps after sync");
+
+    verify_projection_invariants(&alice);
+    verify_projection_invariants(&bob);
+}
+
+/// Integration test: mixed cleartext + encrypted events → verify_projection_invariants.
+#[tokio::test]
+async fn test_encrypted_replay_invariants() {
+    let channel = test_channel();
+    let alice = Peer::new("alice", channel);
+
+    // Create a mix of cleartext and encrypted events
+    let key_bytes: [u8; 32] = rand::random();
+    let sk_eid = alice.create_secret_key(key_bytes);
+
+    alice.create_message("Cleartext 1");
+    alice.create_encrypted_message(&sk_eid, "Encrypted 1");
+    alice.create_message("Cleartext 2");
+    alice.create_encrypted_message(&sk_eid, "Encrypted 2");
+
+    // Verify counts
+    assert_eq!(alice.store_count(), 5); // sk + 2 cleartext + 2 encrypted
+    assert_eq!(alice.secret_key_count(), 1);
+    assert_eq!(alice.scoped_message_count(), 4); // 2 cleartext + 2 encrypted inner messages
+
+    // Run invariant checks (forward, double, reverse)
+    verify_projection_invariants(&alice);
 }

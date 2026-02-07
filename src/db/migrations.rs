@@ -94,6 +94,19 @@ static MIGRATIONS: &[Migration] = &[
             );
         ",
     },
+    Migration {
+        version: 4,
+        name: "add_secret_keys",
+        sql: "
+            CREATE TABLE IF NOT EXISTS secret_keys (
+                event_id TEXT NOT NULL,
+                key_bytes BLOB NOT NULL,
+                created_at INTEGER NOT NULL,
+                recorded_by TEXT NOT NULL,
+                PRIMARY KEY (recorded_by, event_id)
+            );
+        ",
+    },
 ];
 
 fn ensure_schema_migrations(conn: &Connection) -> SqliteResult<()> {
@@ -213,6 +226,6 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 3);
+        assert_eq!(count, 4);
     }
 }

@@ -3,6 +3,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::crypto::{hash_event, event_id_to_base64, EventId};
 use crate::events::{self, ParsedEvent, registry};
+use crate::events::EncryptedEvent;
+use crate::projection::encrypted::encrypt_event_blob;
 use crate::projection::signer::sign_event_bytes;
 use super::decision::ProjectionDecision;
 use super::pipeline::project_one;
@@ -138,6 +140,57 @@ pub fn create_signed_event_sync(
 
     let created_at_ms = event.created_at_ms() as i64;
     store_blob_and_project(conn, recorded_by, &blob, meta, created_at_ms)
+}
+
+/// Create an encrypted event: resolve key from secret_keys, encode inner event,
+/// encrypt, build EncryptedEvent wrapper, then store and project.
+pub fn create_encrypted_event_sync(
+    conn: &Connection,
+    recorded_by: &str,
+    key_event_id: &EventId,
+    inner_event: &ParsedEvent,
+) -> Result<EventId, CreateEventError> {
+    // 1. Resolve key from secret_keys table
+    let key_b64 = event_id_to_base64(key_event_id);
+    let key_bytes: Vec<u8> = conn.query_row(
+        "SELECT key_bytes FROM secret_keys WHERE recorded_by = ?1 AND event_id = ?2",
+        rusqlite::params![recorded_by, &key_b64],
+        |row| row.get(0),
+    ).map_err(|e| CreateEventError::DbError(format!("key lookup: {}", e)))?;
+
+    if key_bytes.len() != 32 {
+        return Err(CreateEventError::EncodeError(
+            format!("secret key wrong length: {}", key_bytes.len()),
+        ));
+    }
+    let mut key_arr = [0u8; 32];
+    key_arr.copy_from_slice(&key_bytes);
+
+    // 2. Encode inner event
+    let inner_blob = events::encode_event(inner_event)
+        .map_err(|e| CreateEventError::EncodeError(e.to_string()))?;
+
+    // 3. Encrypt
+    let (nonce, ciphertext, auth_tag) = encrypt_event_blob(&key_arr, &inner_blob)
+        .map_err(|e| CreateEventError::EncodeError(e.to_string()))?;
+
+    // 4. Build EncryptedEvent wrapper
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+
+    let wrapper = ParsedEvent::Encrypted(EncryptedEvent {
+        created_at_ms: now_ms,
+        key_event_id: *key_event_id,
+        inner_type_code: inner_event.event_type_code(),
+        nonce,
+        ciphertext,
+        auth_tag,
+    });
+
+    // 5. Use existing create_event_sync for the wrapper
+    create_event_sync(conn, recorded_by, &wrapper)
 }
 
 #[cfg(test)]

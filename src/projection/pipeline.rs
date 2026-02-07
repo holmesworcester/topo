@@ -4,7 +4,8 @@ use rusqlite::Connection;
 use crate::crypto::{event_id_to_base64, event_id_from_base64, EventId};
 use crate::events::{self, ParsedEvent, registry};
 use super::decision::ProjectionDecision;
-use super::projectors::{project_message, project_reaction, project_peer_key, project_signed_memo};
+use super::encrypted::project_encrypted;
+use super::projectors::{project_message, project_reaction, project_peer_key, project_secret_key, project_signed_memo};
 use super::signer::{resolve_signer_key, verify_ed25519_signature};
 
 /// Record a rejected event durably so it is not re-processed on replay or cascade.
@@ -74,6 +75,12 @@ fn apply_projection(
         }
         ParsedEvent::SignedMemo(memo) => {
             project_signed_memo(conn, recorded_by, event_id_b64, memo)?;
+        }
+        ParsedEvent::Encrypted(enc) => {
+            return project_encrypted(conn, recorded_by, event_id_b64, enc);
+        }
+        ParsedEvent::SecretKey(sk) => {
+            project_secret_key(conn, recorded_by, event_id_b64, sk)?;
         }
     }
 
@@ -165,9 +172,16 @@ pub fn project_one(
 
     // 6. Apply projection (signer verification + projector dispatch)
     let decision = apply_projection(conn, recorded_by, &event_id_b64, &blob, &parsed)?;
-    if let ProjectionDecision::Reject { ref reason } = &decision {
-        record_rejection(conn, recorded_by, &event_id_b64, reason);
-        return Ok(decision);
+    match &decision {
+        ProjectionDecision::Reject { ref reason } => {
+            record_rejection(conn, recorded_by, &event_id_b64, reason);
+            return Ok(decision);
+        }
+        ProjectionDecision::Block { .. } => {
+            // Inner deps missing (encrypted events); don't mark valid
+            return Ok(decision);
+        }
+        _ => {}
     }
 
     // 7. Write terminal state
@@ -265,10 +279,16 @@ fn unblock_dependents(
 
                     // Apply projection (signer verification + projector dispatch)
                     let decision = apply_projection(conn, recorded_by, &eid_b64, &blob, &parsed)?;
-                    if let ProjectionDecision::Reject { ref reason } = &decision {
-                        record_rejection(conn, recorded_by, &eid_b64, reason);
-                        // Rejected events don't become valid and don't cascade
-                        continue;
+                    match &decision {
+                        ProjectionDecision::Reject { ref reason } => {
+                            record_rejection(conn, recorded_by, &eid_b64, reason);
+                            continue;
+                        }
+                        ProjectionDecision::Block { .. } => {
+                            // Inner deps still missing; leave event blocked, don't cascade
+                            continue;
+                        }
+                        _ => {}
                     }
 
                     conn.execute(
@@ -292,7 +312,8 @@ mod tests {
     use super::*;
     use crate::crypto::hash_event;
     use crate::db::{open_in_memory, schema::create_tables};
-    use crate::events::{self, MessageEvent, ReactionEvent, PeerKeyEvent, SignedMemoEvent, ParsedEvent};
+    use crate::events::{self, MessageEvent, ReactionEvent, PeerKeyEvent, SecretKeyEvent, SignedMemoEvent, EncryptedEvent, ParsedEvent, EVENT_TYPE_MESSAGE, EVENT_TYPE_ENCRYPTED};
+    use crate::projection::encrypted::encrypt_event_blob;
     use crate::projection::signer::sign_event_bytes;
     use ed25519_dalek::SigningKey;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1016,5 +1037,379 @@ mod tests {
         ).unwrap();
         assert_eq!(count_b_msgs, 2);
         assert_eq!(count_b_rxns, 1);
+    }
+
+    // ===== Encrypted event helpers =====
+
+    fn make_secret_key(key_bytes: [u8; 32]) -> (ParsedEvent, Vec<u8>) {
+        let sk = ParsedEvent::SecretKey(SecretKeyEvent {
+            created_at_ms: now_ms(),
+            key_bytes,
+        });
+        let blob = events::encode_event(&sk).unwrap();
+        (sk, blob)
+    }
+
+    fn make_encrypted_event(key_bytes: &[u8; 32], inner_blob: &[u8], inner_type_code: u8, key_event_id: &EventId) -> (ParsedEvent, Vec<u8>) {
+        let (nonce, ciphertext, auth_tag) = encrypt_event_blob(key_bytes, inner_blob).unwrap();
+        let enc = ParsedEvent::Encrypted(EncryptedEvent {
+            created_at_ms: now_ms(),
+            key_event_id: *key_event_id,
+            inner_type_code,
+            nonce,
+            ciphertext,
+            auth_tag,
+        });
+        let blob = events::encode_event(&enc).unwrap();
+        (enc, blob)
+    }
+
+    #[test]
+    fn test_project_secret_key_valid() {
+        let conn = setup();
+        let recorded_by = "peer1";
+        let key_bytes: [u8; 32] = rand::random();
+        let (_sk, blob) = make_secret_key(key_bytes);
+        let eid = insert_event_raw(&conn, recorded_by, &blob);
+
+        let result = project_one(&conn, recorded_by, &eid).unwrap();
+        assert_eq!(result, ProjectionDecision::Valid);
+
+        // Verify in secret_keys table
+        let eid_b64 = event_id_to_base64(&eid);
+        let stored_key: Vec<u8> = conn.query_row(
+            "SELECT key_bytes FROM secret_keys WHERE event_id = ?1 AND recorded_by = ?2",
+            rusqlite::params![&eid_b64, recorded_by],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(stored_key, key_bytes.as_slice());
+    }
+
+    #[test]
+    fn test_encrypted_message_valid() {
+        let conn = setup();
+        let recorded_by = "peer1";
+        let key_bytes: [u8; 32] = rand::random();
+
+        // Create and project secret key
+        let (_sk, sk_blob) = make_secret_key(key_bytes);
+        let sk_eid = insert_event_raw(&conn, recorded_by, &sk_blob);
+        let r = project_one(&conn, recorded_by, &sk_eid).unwrap();
+        assert_eq!(r, ProjectionDecision::Valid);
+
+        // Create inner message
+        let (_msg, msg_blob) = make_message("encrypted hello");
+
+        // Encrypt it
+        let (_enc, enc_blob) = make_encrypted_event(&key_bytes, &msg_blob, EVENT_TYPE_MESSAGE, &sk_eid);
+        let enc_eid = insert_event_raw(&conn, recorded_by, &enc_blob);
+
+        let result = project_one(&conn, recorded_by, &enc_eid).unwrap();
+        assert_eq!(result, ProjectionDecision::Valid);
+
+        // Verify inner message is in messages table (using encrypted event_id)
+        let enc_b64 = event_id_to_base64(&enc_eid);
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE message_id = ?1 AND recorded_by = ?2",
+            rusqlite::params![&enc_b64, recorded_by],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_encrypted_blocks_on_missing_key() {
+        let conn = setup();
+        let recorded_by = "peer1";
+        let key_bytes: [u8; 32] = rand::random();
+
+        // Pre-compute key event_id without inserting
+        let (_sk, sk_blob) = make_secret_key(key_bytes);
+        let sk_eid = hash_event(&sk_blob);
+
+        // Create encrypted event referencing the missing key
+        let (_msg, msg_blob) = make_message("blocked encrypted");
+        let (_enc, enc_blob) = make_encrypted_event(&key_bytes, &msg_blob, EVENT_TYPE_MESSAGE, &sk_eid);
+        let enc_eid = insert_event_raw(&conn, recorded_by, &enc_blob);
+
+        let result = project_one(&conn, recorded_by, &enc_eid).unwrap();
+        match result {
+            ProjectionDecision::Block { missing } => {
+                assert_eq!(missing.len(), 1);
+                assert_eq!(missing[0], sk_eid);
+            }
+            other => panic!("expected Block, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_encrypted_unblocks_when_key_arrives() {
+        let conn = setup();
+        let recorded_by = "peer1";
+        let key_bytes: [u8; 32] = rand::random();
+
+        // Pre-compute key event_id
+        let (_sk, sk_blob) = make_secret_key(key_bytes);
+        let sk_eid = hash_event(&sk_blob);
+
+        // Insert encrypted event first (before key)
+        let (_msg, msg_blob) = make_message("out of order encrypted");
+        let (_enc, enc_blob) = make_encrypted_event(&key_bytes, &msg_blob, EVENT_TYPE_MESSAGE, &sk_eid);
+        let enc_eid = insert_event_raw(&conn, recorded_by, &enc_blob);
+
+        // Project → Block
+        let result = project_one(&conn, recorded_by, &enc_eid).unwrap();
+        assert!(matches!(result, ProjectionDecision::Block { .. }));
+
+        // Now insert and project the secret key
+        insert_event_raw(&conn, recorded_by, &sk_blob);
+        let r = project_one(&conn, recorded_by, &sk_eid).unwrap();
+        assert_eq!(r, ProjectionDecision::Valid);
+
+        // Encrypted event should have been cascade-unblocked
+        let enc_b64 = event_id_to_base64(&enc_eid);
+        let valid: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &enc_b64],
+            |row| row.get(0),
+        ).unwrap();
+        assert!(valid, "encrypted event should be auto-projected after key arrives");
+
+        // Verify inner message was projected
+        let msg_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE message_id = ?1 AND recorded_by = ?2",
+            rusqlite::params![&enc_b64, recorded_by],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(msg_count, 1);
+    }
+
+    #[test]
+    fn test_encrypted_wrong_key_rejects() {
+        let conn = setup();
+        let recorded_by = "peer1";
+        let key_a: [u8; 32] = rand::random();
+        let key_b: [u8; 32] = rand::random();
+
+        // Create and project key B
+        let (_sk_b, sk_b_blob) = make_secret_key(key_b);
+        let sk_b_eid = insert_event_raw(&conn, recorded_by, &sk_b_blob);
+        project_one(&conn, recorded_by, &sk_b_eid).unwrap();
+
+        // Encrypt with key A but reference key B
+        let (_msg, msg_blob) = make_message("wrong key test");
+        let (_enc, enc_blob) = make_encrypted_event(&key_a, &msg_blob, EVENT_TYPE_MESSAGE, &sk_b_eid);
+        let enc_eid = insert_event_raw(&conn, recorded_by, &enc_blob);
+
+        let result = project_one(&conn, recorded_by, &enc_eid).unwrap();
+        match result {
+            ProjectionDecision::Reject { reason } => {
+                assert!(reason.contains("decryption failed"), "reason: {}", reason);
+            }
+            other => panic!("expected Reject, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_encrypted_inner_type_mismatch_rejects() {
+        let conn = setup();
+        let recorded_by = "peer1";
+        let key_bytes: [u8; 32] = rand::random();
+
+        // Create and project key
+        let (_sk, sk_blob) = make_secret_key(key_bytes);
+        let sk_eid = insert_event_raw(&conn, recorded_by, &sk_blob);
+        project_one(&conn, recorded_by, &sk_eid).unwrap();
+
+        // Create a message but declare inner_type_code=2 (reaction)
+        let (_msg, msg_blob) = make_message("type mismatch");
+        let (_enc, enc_blob) = make_encrypted_event(&key_bytes, &msg_blob, 2, &sk_eid);
+        let enc_eid = insert_event_raw(&conn, recorded_by, &enc_blob);
+
+        let result = project_one(&conn, recorded_by, &enc_eid).unwrap();
+        match result {
+            ProjectionDecision::Reject { reason } => {
+                assert!(reason.contains("inner type mismatch"), "reason: {}", reason);
+            }
+            other => panic!("expected Reject, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_encrypted_nested_rejects() {
+        let conn = setup();
+        let recorded_by = "peer1";
+        let key_bytes: [u8; 32] = rand::random();
+
+        // Create and project key
+        let (_sk, sk_blob) = make_secret_key(key_bytes);
+        let sk_eid = insert_event_raw(&conn, recorded_by, &sk_blob);
+        project_one(&conn, recorded_by, &sk_eid).unwrap();
+
+        // Create inner encrypted event
+        let (_msg, msg_blob) = make_message("nested inner");
+        let (_inner_enc, inner_enc_blob) = make_encrypted_event(&key_bytes, &msg_blob, EVENT_TYPE_MESSAGE, &sk_eid);
+
+        // Encrypt the encrypted event
+        let (_outer_enc, outer_enc_blob) = make_encrypted_event(&key_bytes, &inner_enc_blob, EVENT_TYPE_ENCRYPTED, &sk_eid);
+        let outer_eid = insert_event_raw(&conn, recorded_by, &outer_enc_blob);
+
+        let result = project_one(&conn, recorded_by, &outer_eid).unwrap();
+        match result {
+            ProjectionDecision::Reject { reason } => {
+                assert!(reason.contains("nested encryption"), "reason: {}", reason);
+            }
+            other => panic!("expected Reject, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_encrypted_inner_dep_blocks() {
+        let conn = setup();
+        let recorded_by = "peer1";
+        let key_bytes: [u8; 32] = rand::random();
+
+        // Create and project key
+        let (_sk, sk_blob) = make_secret_key(key_bytes);
+        let sk_eid = insert_event_raw(&conn, recorded_by, &sk_blob);
+        project_one(&conn, recorded_by, &sk_eid).unwrap();
+
+        // Create encrypted reaction with missing target
+        let fake_target = [88u8; 32];
+        let (_rxn, rxn_blob) = make_reaction(&fake_target, "\u{1f44d}");
+        let (_enc, enc_blob) = make_encrypted_event(&key_bytes, &rxn_blob, 2, &sk_eid);
+        let enc_eid = insert_event_raw(&conn, recorded_by, &enc_blob);
+
+        let result = project_one(&conn, recorded_by, &enc_eid).unwrap();
+        match result {
+            ProjectionDecision::Block { missing } => {
+                assert_eq!(missing.len(), 1);
+                assert_eq!(missing[0], fake_target);
+            }
+            other => panic!("expected Block on inner dep, got {:?}", other),
+        }
+
+        // Verify NOT in valid_events
+        let enc_b64 = event_id_to_base64(&enc_eid);
+        let valid: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &enc_b64],
+            |row| row.get(0),
+        ).unwrap();
+        assert!(!valid);
+    }
+
+    #[test]
+    fn test_encrypted_inner_dep_unblocks() {
+        let conn = setup();
+        let recorded_by = "peer1";
+        let key_bytes: [u8; 32] = rand::random();
+
+        // Create and project key
+        let (_sk, sk_blob) = make_secret_key(key_bytes);
+        let sk_eid = insert_event_raw(&conn, recorded_by, &sk_blob);
+        project_one(&conn, recorded_by, &sk_eid).unwrap();
+
+        // Create target message (pre-compute but don't insert yet)
+        let (_msg, msg_blob) = make_message("target for encrypted rxn");
+        let msg_eid = hash_event(&msg_blob);
+
+        // Create encrypted reaction targeting the message
+        let (_rxn, rxn_blob) = make_reaction(&msg_eid, "\u{2764}\u{fe0f}");
+        let (_enc, enc_blob) = make_encrypted_event(&key_bytes, &rxn_blob, 2, &sk_eid);
+        let enc_eid = insert_event_raw(&conn, recorded_by, &enc_blob);
+
+        // Project → Block on inner dep (message)
+        let result = project_one(&conn, recorded_by, &enc_eid).unwrap();
+        assert!(matches!(result, ProjectionDecision::Block { .. }));
+
+        // Now insert and project the message
+        insert_event_raw(&conn, recorded_by, &msg_blob);
+        let r = project_one(&conn, recorded_by, &msg_eid).unwrap();
+        assert_eq!(r, ProjectionDecision::Valid);
+
+        // Encrypted reaction should have been cascade-unblocked
+        let enc_b64 = event_id_to_base64(&enc_eid);
+        let valid: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &enc_b64],
+            |row| row.get(0),
+        ).unwrap();
+        assert!(valid, "encrypted reaction should be auto-projected after target message arrives");
+    }
+
+    #[test]
+    fn test_encrypted_rejection_recorded_durably() {
+        let conn = setup();
+        let recorded_by = "peer1";
+        let key_a: [u8; 32] = rand::random();
+        let key_b: [u8; 32] = rand::random();
+
+        // Create and project key B
+        let (_sk_b, sk_b_blob) = make_secret_key(key_b);
+        let sk_b_eid = insert_event_raw(&conn, recorded_by, &sk_b_blob);
+        project_one(&conn, recorded_by, &sk_b_eid).unwrap();
+
+        // Encrypt with key A, reference key B → decryption fails
+        let (_msg, msg_blob) = make_message("will be rejected");
+        let (_enc, enc_blob) = make_encrypted_event(&key_a, &msg_blob, EVENT_TYPE_MESSAGE, &sk_b_eid);
+        let enc_eid = insert_event_raw(&conn, recorded_by, &enc_blob);
+
+        let result = project_one(&conn, recorded_by, &enc_eid).unwrap();
+        assert!(matches!(result, ProjectionDecision::Reject { .. }));
+
+        // Verify in rejected_events
+        let enc_b64 = event_id_to_base64(&enc_eid);
+        let reason: String = conn.query_row(
+            "SELECT reason FROM rejected_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &enc_b64],
+            |row| row.get(0),
+        ).unwrap();
+        assert!(reason.contains("decryption failed"));
+    }
+
+    #[test]
+    fn test_encrypted_cross_tenant_isolation() {
+        let conn = setup();
+        let tenant_a = "tenant_a";
+        let tenant_b = "tenant_b";
+        let key_bytes: [u8; 32] = rand::random();
+
+        // Create and project key for tenant_a only
+        let (_sk, sk_blob) = make_secret_key(key_bytes);
+        let sk_eid = insert_event_raw(&conn, tenant_a, &sk_blob);
+        let r = project_one(&conn, tenant_a, &sk_eid).unwrap();
+        assert_eq!(r, ProjectionDecision::Valid);
+
+        // Create encrypted message referencing that key
+        let (_msg, msg_blob) = make_message("tenant-scoped encryption");
+        let (_enc, enc_blob) = make_encrypted_event(&key_bytes, &msg_blob, EVENT_TYPE_MESSAGE, &sk_eid);
+        let enc_eid = insert_event_raw(&conn, tenant_a, &enc_blob);
+
+        // Project for tenant_a → Valid
+        let r_a = project_one(&conn, tenant_a, &enc_eid).unwrap();
+        assert_eq!(r_a, ProjectionDecision::Valid);
+
+        // Record for tenant_b (also record the sk_blob event)
+        let enc_b64 = event_id_to_base64(&enc_eid);
+        let sk_b64 = event_id_to_base64(&sk_eid);
+        conn.execute(
+            "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source) VALUES (?1, ?2, ?3, 'test')",
+            rusqlite::params![tenant_b, &enc_b64, now_ms() as i64],
+        ).unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source) VALUES (?1, ?2, ?3, 'test')",
+            rusqlite::params![tenant_b, &sk_b64, now_ms() as i64],
+        ).unwrap();
+
+        // Project encrypted event for tenant_b → Block (key not valid for B)
+        let r_b = project_one(&conn, tenant_b, &enc_eid).unwrap();
+        match r_b {
+            ProjectionDecision::Block { missing } => {
+                assert_eq!(missing.len(), 1);
+                assert_eq!(missing[0], sk_eid);
+            }
+            other => panic!("expected Block for tenant_b, got {:?}", other),
+        }
     }
 }
