@@ -107,6 +107,51 @@ static MIGRATIONS: &[Migration] = &[
             );
         ",
     },
+    Migration {
+        version: 5,
+        name: "add_queue_tables",
+        sql: "
+            CREATE TABLE IF NOT EXISTS project_queue (
+                peer_id TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                available_at INTEGER NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                lease_until INTEGER,
+                PRIMARY KEY (peer_id, event_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS egress_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                connection_id TEXT NOT NULL,
+                frame_type TEXT NOT NULL DEFAULT 'event',
+                event_id BLOB,
+                payload BLOB,
+                enqueued_at INTEGER NOT NULL,
+                available_at INTEGER NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                lease_until INTEGER,
+                sent_at INTEGER,
+                dedupe_key TEXT
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_egress_pending_event
+                ON egress_queue(connection_id, event_id)
+                WHERE frame_type = 'event' AND sent_at IS NULL;
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_egress_dedupe
+                ON egress_queue(dedupe_key)
+                WHERE dedupe_key IS NOT NULL AND sent_at IS NULL;
+
+            CREATE TABLE IF NOT EXISTS ingress_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                peer_id TEXT NOT NULL,
+                from_addr TEXT,
+                received_at INTEGER NOT NULL,
+                frame BLOB NOT NULL,
+                processed INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_ingress_unprocessed
+                ON ingress_queue(processed, received_at);
+        ",
+    },
 ];
 
 fn ensure_schema_migrations(conn: &Connection) -> SqliteResult<()> {
@@ -226,6 +271,6 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 4);
+        assert_eq!(count, 5);
     }
 }

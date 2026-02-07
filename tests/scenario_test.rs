@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use poc_7::testutil::{Peer, start_peers, assert_eventually, sync_until_converged, verify_projection_invariants};
-use poc_7::crypto::event_id_to_base64;
+use poc_7::crypto::event_id_from_base64;
 use poc_7::transport::{
     AllowedPeers, create_client_endpoint, create_server_endpoint,
     extract_spki_fingerprint, load_or_generate_cert, peer_identity_from_connection,
@@ -963,4 +963,186 @@ async fn test_encrypted_replay_invariants() {
 
     // Run invariant checks (forward, double, reverse)
     verify_projection_invariants(&alice);
+}
+
+/// Integration test: simulate crash recovery by manually enqueuing into project_queue
+/// (as if batch_writer committed but didn't drain), then recover.
+#[tokio::test]
+async fn test_project_queue_crash_recovery() {
+    use poc_7::db::project_queue::ProjectQueue;
+    use poc_7::projection::pipeline::project_one;
+
+    let channel = test_channel();
+    let alice = Peer::new("alice", channel);
+
+    // Create events normally (they'll be projected immediately by create_event_sync)
+    alice.create_message("Message 1");
+    alice.create_message("Message 2");
+    alice.create_message("Message 3");
+
+    assert_eq!(alice.scoped_message_count(), 3);
+
+    // Now simulate: clear projection state (valid_events + messages) and enqueue into project_queue
+    // This mimics a crash after batch_writer COMMIT but before drain
+    let db = open_connection(&alice.db_path).expect("open db");
+
+    // Get all event_ids for this peer
+    let event_ids: Vec<String> = db
+        .prepare("SELECT event_id FROM recorded_events WHERE peer_id = ?1")
+        .unwrap()
+        .query_map(rusqlite::params![&alice.identity], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(event_ids.len(), 3);
+
+    // Clear projection state
+    db.execute("DELETE FROM messages WHERE recorded_by = ?1", rusqlite::params![&alice.identity]).unwrap();
+    db.execute("DELETE FROM valid_events WHERE peer_id = ?1", rusqlite::params![&alice.identity]).unwrap();
+    db.execute("DELETE FROM blocked_event_deps WHERE peer_id = ?1", rusqlite::params![&alice.identity]).unwrap();
+    db.execute("DELETE FROM rejected_events WHERE peer_id = ?1", rusqlite::params![&alice.identity]).unwrap();
+
+    // Enqueue into project_queue (simulating what batch_writer does)
+    let pq = ProjectQueue::new(&db);
+    for eid in &event_ids {
+        pq.enqueue(&alice.identity, eid).unwrap();
+    }
+
+    let pending = pq.count_pending(&alice.identity).unwrap();
+    assert_eq!(pending, 3, "should have 3 pending items in project_queue");
+
+    // Messages should be gone
+    let msg_count: i64 = db.query_row(
+        "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
+        rusqlite::params![&alice.identity], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(msg_count, 0);
+
+    // Now simulate recovery: drain the project_queue
+    let identity = alice.identity.clone();
+    let drained = pq.drain(&identity, |conn, event_id_b64| {
+        if let Some(eid) = event_id_from_base64(event_id_b64) {
+            let _ = project_one(conn, &identity, &eid);
+        }
+    }).unwrap();
+    assert_eq!(drained, 3, "should have drained 3 items");
+
+    // Messages should be recovered
+    let msg_count_after: i64 = db.query_row(
+        "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
+        rusqlite::params![&alice.identity], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(msg_count_after, 3, "all 3 messages should be projected after recovery");
+
+    // project_queue should be empty
+    let remaining = pq.count_pending(&alice.identity).unwrap();
+    assert_eq!(remaining, 0);
+}
+
+/// Integration test: verify project_queue drain works end-to-end with created events.
+#[tokio::test]
+async fn test_project_queue_drain_after_batch() {
+    use poc_7::db::project_queue::ProjectQueue;
+    use poc_7::projection::pipeline::project_one;
+
+    let channel = test_channel();
+    let alice = Peer::new("alice", channel);
+
+    // Create events (projected inline by create_event_sync)
+    alice.create_message("Alpha");
+    alice.create_message("Beta");
+
+    assert_eq!(alice.scoped_message_count(), 2);
+
+    // Manually enqueue already-projected events — drain should skip them
+    // (they're already in valid_events so enqueue guard rejects)
+    let db = open_connection(&alice.db_path).expect("open db");
+    let pq = ProjectQueue::new(&db);
+
+    let event_ids: Vec<String> = db
+        .prepare("SELECT event_id FROM valid_events WHERE peer_id = ?1")
+        .unwrap()
+        .query_map(rusqlite::params![&alice.identity], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    let mut enqueued = 0;
+    for eid in &event_ids {
+        if pq.enqueue(&alice.identity, eid).unwrap() {
+            enqueued += 1;
+        }
+    }
+    assert_eq!(enqueued, 0, "guard should prevent enqueuing already-valid events");
+
+    // Drain should be a no-op since nothing is in the queue
+    let identity = alice.identity.clone();
+    let drained = pq.drain(&identity, |conn, event_id_b64| {
+        if let Some(eid) = event_id_from_base64(event_id_b64) {
+            let _ = project_one(conn, &identity, &eid);
+        }
+    }).unwrap();
+    assert_eq!(drained, 0);
+
+    // Original projection state preserved
+    assert_eq!(alice.scoped_message_count(), 2);
+}
+
+/// Integration test: egress_queue lifecycle — enqueue, claim, send, cleanup.
+#[tokio::test]
+async fn test_egress_queue_lifecycle() {
+    use poc_7::db::egress_queue::EgressQueue;
+
+    let channel = test_channel();
+    let alice = Peer::new("alice", channel);
+
+    // Create some events
+    alice.create_message("Egress test 1");
+    alice.create_message("Egress test 2");
+    alice.create_message("Egress test 3");
+
+    let db = open_connection(&alice.db_path).expect("open db");
+    let egress = EgressQueue::new(&db);
+
+    // Get event IDs (raw bytes)
+    let event_blobs: Vec<Vec<u8>> = db
+        .prepare("SELECT event_id FROM events")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .filter_map(|b64| event_id_from_base64(&b64).map(|id| id.to_vec()))
+        .collect();
+    assert_eq!(event_blobs.len(), 3);
+
+    let mut event_ids: Vec<[u8; 32]> = Vec::new();
+    for blob in &event_blobs {
+        let mut id = [0u8; 32];
+        id.copy_from_slice(blob);
+        event_ids.push(id);
+    }
+
+    // Enqueue
+    let inserted = egress.enqueue_events("test_conn", &event_ids).unwrap();
+    assert_eq!(inserted, 3);
+    assert_eq!(egress.count_pending("test_conn").unwrap(), 3);
+
+    // Claim
+    let claimed = egress.claim_batch("test_conn", 10, 30_000).unwrap();
+    assert_eq!(claimed.len(), 3);
+
+    // Mark sent
+    let rowids: Vec<i64> = claimed.iter().map(|(r, _)| *r).collect();
+    egress.mark_sent(&rowids).unwrap();
+    assert_eq!(egress.count_pending("test_conn").unwrap(), 0);
+
+    // Backdate and cleanup
+    db.execute("UPDATE egress_queue SET sent_at = sent_at - 600000", []).unwrap();
+    let cleaned = egress.cleanup_sent(300_000).unwrap();
+    assert_eq!(cleaned, 3);
+
+    // Clear connection
+    egress.enqueue_events("test_conn", &event_ids).unwrap();
+    egress.clear_connection("test_conn").unwrap();
+    assert_eq!(egress.count_pending("test_conn").unwrap(), 0);
 }

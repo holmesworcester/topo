@@ -5,6 +5,9 @@ pub mod store;
 pub mod outgoing;
 pub mod tenant;
 pub mod wanted;
+pub mod queue;
+pub mod project_queue;
+pub mod egress_queue;
 
 use rusqlite::{Connection, Result as SqliteResult};
 use std::path::Path;
