@@ -855,35 +855,42 @@ async fn test_cross_tenant_dep_scoping_after_sync() {
     verify_projection_invariants(&bob);
 }
 
-/// Integration test: Alice creates a PSK + encrypted message → syncs to Bob → Bob projects.
+/// Integration test: Alice creates PSK + encrypted message, both peers materialize PSK locally.
+/// Only the encrypted event syncs; SecretKey (ShareScope::Local) does not.
 #[tokio::test]
 async fn test_encrypted_event_sync() {
     let channel = test_channel();
     let alice = Peer::new("alice", channel);
     let bob = Peer::new("bob", channel);
 
-    // Alice creates a secret key + encrypted message
+    // Both peers materialize the same PSK locally (deterministic)
     let key_bytes: [u8; 32] = rand::random();
-    let sk_eid = alice.create_secret_key(key_bytes);
+    let fixed_ts = 1000000u64;
+    let sk_eid = alice.create_secret_key_deterministic(key_bytes, fixed_ts);
+    let _sk_eid_bob = bob.create_secret_key_deterministic(key_bytes, fixed_ts);
+
+    // Alice creates an encrypted message using the shared PSK
     let _enc_eid = alice.create_encrypted_message(&sk_eid, "Hello encrypted world");
 
+    // Alice: 2 events (SK + encrypted), Bob: 1 event (SK)
     assert_eq!(alice.store_count(), 2);
     assert_eq!(alice.secret_key_count(), 1);
-    // The encrypted event projects into messages table
     assert_eq!(alice.scoped_message_count(), 1);
+    assert_eq!(bob.store_count(), 1);
+    assert_eq!(bob.secret_key_count(), 1);
 
-    // Sync to Bob
+    // Sync: only encrypted event syncs (SK is local-only)
     let sync = start_peers(&alice, &bob);
 
     assert_eventually(
         || bob.store_count() == 2,
         Duration::from_secs(15),
-        "bob should have 2 events (SecretKey + Encrypted)",
+        "bob should have 2 events (his own SK + synced encrypted)",
     ).await;
 
     drop(sync);
 
-    // Bob should have projected both: secret key into secret_keys, inner message into messages
+    // Bob should have projected: his own secret key + decrypted inner message
     assert_eq!(bob.secret_key_count(), 1);
     assert_eq!(bob.scoped_message_count(), 1);
 
@@ -891,39 +898,42 @@ async fn test_encrypted_event_sync() {
     verify_projection_invariants(&bob);
 }
 
-/// Integration test: Encrypted event syncs before key → blocks → key syncs → cascade unblocks.
+/// Integration test: Both peers materialize PSK locally, encrypted event syncs, mixed with normal msgs.
 #[tokio::test]
 async fn test_encrypted_out_of_order_sync() {
     let channel = test_channel();
     let alice = Peer::new("alice", channel);
     let bob = Peer::new("bob", channel);
 
-    // Alice creates the key + encrypted message
+    // Both peers materialize the same PSK locally (deterministic)
     let key_bytes: [u8; 32] = rand::random();
-    let sk_eid = alice.create_secret_key(key_bytes);
-    let _enc_eid = alice.create_encrypted_message(&sk_eid, "Out of order encrypted");
+    let fixed_ts = 2000000u64;
+    let sk_eid = alice.create_secret_key_deterministic(key_bytes, fixed_ts);
+    let _sk_eid_bob = bob.create_secret_key_deterministic(key_bytes, fixed_ts);
 
-    // Also create a normal message to verify mixed events work
+    // Alice creates encrypted message + normal message
+    let _enc_eid = alice.create_encrypted_message(&sk_eid, "Out of order encrypted");
     alice.create_message("Normal message");
 
     // Bob creates a message too
     bob.create_message("Bob's message");
 
-    assert_eq!(alice.store_count(), 3); // sk, encrypted, message
-    assert_eq!(bob.store_count(), 1);
+    // Alice: 3 events (SK + encrypted + msg), Bob: 2 events (SK + msg)
+    assert_eq!(alice.store_count(), 3);
+    assert_eq!(bob.store_count(), 2);
 
-    // Sync
+    // Sync: SK is local-only, only encrypted + normal messages sync
     let sync = start_peers(&alice, &bob);
 
     assert_eventually(
         || alice.store_count() == 4 && bob.store_count() == 4,
         Duration::from_secs(15),
-        "both peers should have 4 events",
+        "both peers should have 4 events (SK + encrypted + 2 messages each)",
     ).await;
 
     drop(sync);
 
-    // Bob should have auto-unblocked the encrypted message (if it arrived before key)
+    // Bob should have projected the encrypted inner message
     assert_eq!(bob.secret_key_count(), 1);
     assert_eq!(bob.scoped_message_count(), 3); // encrypted inner + normal + bob's
     assert_eq!(alice.scoped_message_count(), 3);
@@ -963,4 +973,194 @@ async fn test_encrypted_replay_invariants() {
 
     // Run invariant checks (forward, double, reverse)
     verify_projection_invariants(&alice);
+}
+
+/// Gap 1: Verify SecretKey events (ShareScope::Local) are never sent to remote peers.
+#[tokio::test]
+async fn test_local_only_events_not_synced() {
+    let channel = test_channel();
+    let alice = Peer::new("alice", channel);
+    let bob = Peer::new("bob", channel);
+
+    // Both peers materialize the same PSK locally
+    let key_bytes: [u8; 32] = rand::random();
+    let fixed_ts = 3000000u64;
+    let sk_eid = alice.create_secret_key_deterministic(key_bytes, fixed_ts);
+    let sk_eid_bob = bob.create_secret_key_deterministic(key_bytes, fixed_ts);
+    assert_eq!(sk_eid, sk_eid_bob, "deterministic PSK should produce same event_id");
+
+    // Alice creates encrypted message + normal message
+    let _enc_eid = alice.create_encrypted_message(&sk_eid, "Encrypted for local-only test");
+    alice.create_message("Normal message from Alice");
+
+    // Alice: 3 events (SK + encrypted + msg), Bob: 1 event (SK)
+    assert_eq!(alice.store_count(), 3);
+    assert_eq!(bob.store_count(), 1);
+
+    // Alice's SK should NOT be in neg_items (local-only)
+    assert_eq!(alice.neg_items_count(), 2, "Alice should have 2 neg_items (encrypted + msg, not SK)");
+    assert_eq!(bob.neg_items_count(), 0, "Bob should have 0 neg_items (SK is local-only)");
+
+    // Sync
+    let sync = start_peers(&alice, &bob);
+
+    assert_eventually(
+        || bob.store_count() == 3,
+        Duration::from_secs(15),
+        "bob should have 3 events (his SK + synced encrypted + synced msg)",
+    ).await;
+
+    drop(sync);
+
+    // Bob should NOT have received Alice's SK event — his store has his own SK
+    // (both have same event_id since deterministic, so store_count is 3 not 4)
+    assert_eq!(bob.secret_key_count(), 1);
+    assert_eq!(bob.scoped_message_count(), 2); // encrypted inner + normal msg
+
+    // Verify Alice's SK event_id IS in bob's events (because bob created his own copy)
+    let sk_b64 = event_id_to_base64(&sk_eid);
+    assert!(bob.has_event(&sk_b64), "bob should have the SK event (his own local copy)");
+
+    verify_projection_invariants(&alice);
+    verify_projection_invariants(&bob);
+}
+
+/// Gap 2: Two-set PSK isolation — mismatched PSKs cannot decrypt each other's messages.
+#[tokio::test]
+async fn test_psk_two_set_isolation() {
+    let channel = test_channel();
+    let alice = Peer::new("alice", channel);
+    let bob = Peer::new("bob", channel);
+
+    // Alice and Bob use DIFFERENT PSKs
+    let key_a: [u8; 32] = rand::random();
+    let key_b: [u8; 32] = rand::random();
+    let sk_eid_alice = alice.create_secret_key(key_a);
+    let _sk_eid_bob = bob.create_secret_key(key_b);
+
+    // Alice encrypts with her key
+    let _enc_eid = alice.create_encrypted_message(&sk_eid_alice, "Alice secret");
+
+    // Alice also creates a normal message
+    alice.create_message("Alice cleartext");
+
+    // Alice: 3 events (SK + encrypted + msg), Bob: 1 event (SK)
+    assert_eq!(alice.store_count(), 3);
+    assert_eq!(bob.store_count(), 1);
+
+    // Sync: encrypted event and normal msg sync to Bob
+    let sync = start_peers(&alice, &bob);
+
+    assert_eventually(
+        || bob.store_count() == 3,
+        Duration::from_secs(15),
+        "bob should have 3 events (his SK + synced encrypted + synced msg)",
+    ).await;
+
+    drop(sync);
+
+    // Bob should have the cleartext message projected
+    // But the encrypted message should be REJECTED (wrong key) or blocked
+    // Since Bob's SK has different key_bytes, the encrypted event references
+    // Alice's SK event_id which Bob doesn't have locally → blocks on missing dep
+    assert_eq!(bob.scoped_message_count(), 1, "bob should only see the cleartext message");
+
+    // Verify the encrypted event is blocked (not projected into messages)
+    let bob_db = open_connection(&bob.db_path).expect("open bob db");
+    let blocked: i64 = bob_db.query_row(
+        "SELECT COUNT(*) FROM blocked_event_deps WHERE peer_id = ?1",
+        rusqlite::params![&bob.identity],
+        |row| row.get(0),
+    ).unwrap();
+    assert!(blocked >= 1, "encrypted event should be blocked on missing key dep");
+}
+
+/// Gap 3: Encrypted inner event with unsupported signer_type rejects durably (not hard error).
+#[tokio::test]
+async fn test_encrypted_inner_unsupported_signer_rejects_durably() {
+    use poc_7::events::{
+        SignedMemoEvent, EncryptedEvent, ParsedEvent,
+        encode_event, EVENT_TYPE_SIGNED_MEMO,
+    };
+    use poc_7::projection::encrypted::encrypt_event_blob;
+    use poc_7::crypto::hash_event;
+    use poc_7::projection::pipeline::project_one;
+
+    let channel = test_channel();
+    let alice = Peer::new("alice", channel);
+
+    // Create and project a secret key
+    let key_bytes: [u8; 32] = rand::random();
+    let sk_eid = alice.create_secret_key(key_bytes);
+
+    // Create a PeerKey so it can satisfy the signed_by dep check
+    let dummy_pk = alice.create_peer_key([99u8; 32]);
+
+    // Create an inner SignedMemo with signer_type=255 (unsupported)
+    // signed_by references the PeerKey (so dep check passes), but signer_type is invalid
+    let inner = ParsedEvent::SignedMemo(SignedMemoEvent {
+        created_at_ms: 999999u64,
+        signed_by: dummy_pk,
+        signer_type: 255, // unsupported
+        content: "bad signer type".to_string(),
+        signature: [0u8; 64],
+    });
+    let inner_blob = encode_event(&inner).unwrap();
+
+    // Encrypt it
+    let (nonce, ciphertext, auth_tag) = encrypt_event_blob(&key_bytes, &inner_blob).unwrap();
+    let wrapper = ParsedEvent::Encrypted(EncryptedEvent {
+        created_at_ms: 999999u64,
+        key_event_id: sk_eid,
+        inner_type_code: EVENT_TYPE_SIGNED_MEMO,
+        nonce,
+        ciphertext,
+        auth_tag,
+    });
+    let wrapper_blob = encode_event(&wrapper).unwrap();
+
+    // Insert the encrypted event manually
+    let db = open_connection(&alice.db_path).expect("open db");
+    let enc_eid = hash_event(&wrapper_blob);
+    let enc_b64 = event_id_to_base64(&enc_eid);
+    let ts = 999999i64;
+    db.execute(
+        "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
+         VALUES (?1, ?2, ?3, 'shared', ?4, ?5)",
+        rusqlite::params![&enc_b64, "encrypted", &wrapper_blob, ts, ts],
+    ).unwrap();
+    db.execute(
+        "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
+         VALUES (?1, ?2, ?3, 'test')",
+        rusqlite::params![&alice.identity, &enc_b64, ts],
+    ).unwrap();
+
+    // Project: should get Reject (not hard Err) because signer_type=255 is invalid
+    let result = project_one(&db, &alice.identity, &enc_eid).unwrap();
+    match result {
+        poc_7::projection::decision::ProjectionDecision::Reject { reason } => {
+            assert!(
+                reason.contains("unsupported signer_type") || reason.contains("signer resolution invalid"),
+                "unexpected rejection reason: {}",
+                reason
+            );
+        }
+        other => panic!("expected Reject, got {:?}", other),
+    }
+
+    // Verify rejected_events table has a row
+    let rej_count: i64 = db.query_row(
+        "SELECT COUNT(*) FROM rejected_events WHERE peer_id = ?1 AND event_id = ?2",
+        rusqlite::params![&alice.identity, &enc_b64],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(rej_count, 1, "rejected event should be recorded durably");
+
+    // Second call should return AlreadyProcessed (not re-Reject)
+    let result2 = project_one(&db, &alice.identity, &enc_eid).unwrap();
+    assert_eq!(
+        result2,
+        poc_7::projection::decision::ProjectionDecision::AlreadyProcessed,
+        "rejected event should not be re-processed"
+    );
 }

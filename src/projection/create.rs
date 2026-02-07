@@ -2,7 +2,7 @@ use rusqlite::Connection;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::crypto::{hash_event, event_id_to_base64, EventId};
-use crate::events::{self, ParsedEvent, registry};
+use crate::events::{self, ParsedEvent, registry, ShareScope};
 use crate::events::EncryptedEvent;
 use crate::projection::encrypted::encrypt_event_blob;
 use crate::projection::signer::sign_event_bytes;
@@ -64,11 +64,13 @@ fn store_blob_and_project(
         ],
     ).map_err(|e| CreateEventError::DbError(e.to_string()))?;
 
-    // Write to neg_items
-    conn.execute(
-        "INSERT OR IGNORE INTO neg_items (ts, id) VALUES (?1, ?2)",
-        rusqlite::params![created_at_ms, event_id.as_slice()],
-    ).map_err(|e| CreateEventError::DbError(e.to_string()))?;
+    // Write to neg_items (only for shared events — local events must not sync)
+    if meta.share_scope == ShareScope::Shared {
+        conn.execute(
+            "INSERT OR IGNORE INTO neg_items (ts, id) VALUES (?1, ?2)",
+            rusqlite::params![created_at_ms, event_id.as_slice()],
+        ).map_err(|e| CreateEventError::DbError(e.to_string()))?;
+    }
 
     // Write to recorded_events
     conn.execute(

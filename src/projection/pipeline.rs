@@ -6,7 +6,7 @@ use crate::events::{self, ParsedEvent, registry};
 use super::decision::ProjectionDecision;
 use super::encrypted::project_encrypted;
 use super::projectors::{project_message, project_reaction, project_peer_key, project_secret_key, project_signed_memo};
-use super::signer::{resolve_signer_key, verify_ed25519_signature};
+use super::signer::{resolve_signer_key, verify_ed25519_signature, SignerResolution};
 
 /// Record a rejected event durably so it is not re-processed on replay or cascade.
 fn record_rejection(conn: &Connection, recorded_by: &str, event_id_b64: &str, reason: &str) {
@@ -37,14 +37,19 @@ fn apply_projection(
     if meta.signer_required {
         let (signer_event_id, signer_type) = parsed.signer_fields()
             .ok_or("signer_required but no signer_fields")?;
-        let pubkey = resolve_signer_key(conn, signer_type, &signer_event_id)?;
-        match pubkey {
-            None => {
+        let resolution = resolve_signer_key(conn, recorded_by, signer_type, &signer_event_id)?;
+        match resolution {
+            SignerResolution::NotFound => {
                 return Ok(ProjectionDecision::Reject {
                     reason: "signer key not found".to_string(),
                 });
             }
-            Some(key) => {
+            SignerResolution::Invalid(msg) => {
+                return Ok(ProjectionDecision::Reject {
+                    reason: format!("signer resolution invalid: {}", msg),
+                });
+            }
+            SignerResolution::Found(key) => {
                 let sig_len = meta.signature_byte_len;
                 if blob.len() < sig_len {
                     return Ok(ProjectionDecision::Reject {
