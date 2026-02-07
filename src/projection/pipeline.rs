@@ -198,10 +198,16 @@ fn unblock_dependents(
 
     while let Some(blocker) = worklist.pop() {
         // Remove all blocked_event_deps rows where this event was the blocker
-        conn.execute(
+        let deleted = conn.execute(
             "DELETE FROM blocked_event_deps WHERE peer_id = ?1 AND blocker_event_id = ?2",
             rusqlite::params![recorded_by, &blocker],
         )?;
+
+        // If nothing was blocked on this event, no deps changed — skip the
+        // expensive candidate scan.
+        if deleted == 0 {
+            continue;
+        }
 
         // Find events that now have zero remaining blockers
         let mut stmt = conn.prepare(
