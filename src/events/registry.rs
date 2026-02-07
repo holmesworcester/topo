@@ -23,6 +23,8 @@ pub struct EventTypeMeta {
     pub projection_table: &'static str,
     pub share_scope: ShareScope,
     pub dep_fields: &'static [&'static str],
+    pub signer_required: bool,
+    pub signature_byte_len: usize,
     pub parse: fn(&[u8]) -> Result<ParsedEvent, EventError>,
     pub encode: fn(&ParsedEvent) -> Result<Vec<u8>, EventError>,
 }

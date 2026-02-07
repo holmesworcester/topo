@@ -621,3 +621,181 @@ async fn test_multi_dep_blocking_sync() {
     verify_projection_invariants(&alice);
     verify_projection_invariants(&bob);
 }
+
+/// Integration test: Alice creates a PeerKey + SignedMemo, Bob syncs, both valid.
+#[tokio::test]
+async fn test_signed_event_sync() {
+    use ed25519_dalek::SigningKey;
+
+    let channel = test_channel();
+    let alice = Peer::new("alice", channel);
+    let bob = Peer::new("bob", channel);
+
+    let mut rng = rand::thread_rng();
+    let signing_key = SigningKey::generate(&mut rng);
+    let public_key = signing_key.verifying_key().to_bytes();
+
+    // Alice creates PeerKey + SignedMemo
+    let pk_eid = alice.create_peer_key(public_key);
+    let _memo_eid = alice.create_signed_memo(&pk_eid, &signing_key, "Hello signed world");
+
+    assert_eq!(alice.store_count(), 2);
+    assert_eq!(alice.peer_key_count(), 1);
+    assert_eq!(alice.signed_memo_count(), 1);
+
+    // Sync to Bob
+    let sync = start_peers(&alice, &bob);
+
+    assert_eventually(
+        || bob.store_count() == 2,
+        Duration::from_secs(15),
+        "bob should have 2 events (PeerKey + SignedMemo)",
+    ).await;
+
+    drop(sync);
+
+    // Both should have valid projections
+    assert_eq!(bob.peer_key_count(), 1);
+    assert_eq!(bob.signed_memo_count(), 1);
+
+    verify_projection_invariants(&alice);
+    verify_projection_invariants(&bob);
+}
+
+/// Integration test: Bob gets signed memo before signer key, auto-unblocks after sync.
+#[tokio::test]
+async fn test_signed_event_out_of_order_sync() {
+    use ed25519_dalek::SigningKey;
+
+    let channel = test_channel();
+    let alice = Peer::new("alice", channel);
+    let bob = Peer::new("bob", channel);
+
+    let mut rng = rand::thread_rng();
+    let signing_key = SigningKey::generate(&mut rng);
+    let public_key = signing_key.verifying_key().to_bytes();
+
+    // Alice creates PeerKey + SignedMemo + a message
+    let pk_eid = alice.create_peer_key(public_key);
+    let _memo_eid = alice.create_signed_memo(&pk_eid, &signing_key, "Out of order memo");
+    alice.create_message("Normal message");
+
+    // Bob creates a message too
+    bob.create_message("Bob's message");
+
+    assert_eq!(alice.store_count(), 3); // pk, memo, msg
+    assert_eq!(bob.store_count(), 1);
+
+    // Sync
+    let sync = start_peers(&alice, &bob);
+
+    assert_eventually(
+        || alice.store_count() == 4 && bob.store_count() == 4,
+        Duration::from_secs(15),
+        "both peers should have 4 events",
+    ).await;
+
+    drop(sync);
+
+    // Bob should have auto-unblocked the signed memo
+    assert_eq!(bob.peer_key_count(), 1);
+    assert_eq!(bob.signed_memo_count(), 1);
+    assert_eq!(bob.message_count(), 2);
+
+    // No remaining blocked deps
+    let bob_db = open_connection(&bob.db_path).expect("open bob db");
+    let blocked: i64 = bob_db.query_row(
+        "SELECT COUNT(*) FROM blocked_event_deps WHERE peer_id = ?1",
+        rusqlite::params![&bob.identity],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(blocked, 0, "no remaining blocked deps after sync");
+
+    verify_projection_invariants(&alice);
+    verify_projection_invariants(&bob);
+}
+
+/// Integration test: wrong-key memo rejected on remote peer.
+#[tokio::test]
+async fn test_invalid_signature_rejected_after_sync() {
+    use ed25519_dalek::SigningKey;
+    use poc_7::crypto::event_id_to_base64;
+
+    let channel = test_channel();
+    let alice = Peer::new("alice", channel);
+    let bob = Peer::new("bob", channel);
+
+    let mut rng = rand::thread_rng();
+    let signing_key = SigningKey::generate(&mut rng);
+    let wrong_key = SigningKey::generate(&mut rng);
+    let public_key = signing_key.verifying_key().to_bytes();
+
+    // Alice creates a PeerKey with signing_key's public key
+    let pk_eid = alice.create_peer_key(public_key);
+
+    // Alice creates a signed memo but signs with the WRONG key (simulating corruption)
+    // We need to do this manually since create_signed_memo uses proper signing
+    {
+        use poc_7::events::{SignedMemoEvent, ParsedEvent, encode_event};
+        use poc_7::projection::signer::sign_event_bytes;
+        use poc_7::crypto::hash_event;
+
+        let db = open_connection(&alice.db_path).expect("open alice db");
+        let memo = ParsedEvent::SignedMemo(SignedMemoEvent {
+            created_at_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64,
+            signed_by: pk_eid,
+            signer_type: 0,
+            content: "bad signature memo".to_string(),
+            signature: [0u8; 64],
+        });
+        let mut blob = encode_event(&memo).unwrap();
+
+        // Sign with wrong key
+        let sig_len = 64;
+        let blob_len = blob.len();
+        let signing_bytes = &blob[..blob_len - sig_len];
+        let sig = sign_event_bytes(&wrong_key, signing_bytes);
+        blob[blob_len - sig_len..].copy_from_slice(&sig);
+
+        // Store directly (bypassing create_signed_event_sync validation)
+        let event_id = hash_event(&blob);
+        let event_id_b64 = event_id_to_base64(&event_id);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+
+        db.execute(
+            "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
+             VALUES (?1, ?2, ?3, 'shared', ?4, ?5)",
+            rusqlite::params![&event_id_b64, "signed_memo", &blob, now_ms, now_ms],
+        ).unwrap();
+        db.execute(
+            "INSERT OR IGNORE INTO neg_items (ts, id) VALUES (?1, ?2)",
+            rusqlite::params![now_ms, event_id.as_slice()],
+        ).unwrap();
+        db.execute(
+            "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
+             VALUES (?1, ?2, ?3, 'local_create')",
+            rusqlite::params![&alice.identity, &event_id_b64, now_ms],
+        ).unwrap();
+        // Don't project — it would be rejected. The blob will sync via negentropy.
+    }
+
+    // Alice has 2 events: PeerKey + the bad-sig memo
+    assert_eq!(alice.store_count(), 2);
+
+    // Sync to Bob
+    let sync = start_peers(&alice, &bob);
+
+    assert_eventually(
+        || bob.store_count() == 2,
+        Duration::from_secs(15),
+        "bob should have 2 events (PeerKey + bad-sig memo) in store",
+    ).await;
+
+    drop(sync);
+
+    // Bob should have the PeerKey projected but NOT the bad-sig memo
+    assert_eq!(bob.peer_key_count(), 1);
+    assert_eq!(bob.signed_memo_count(), 0, "bad-signature memo should be rejected, not projected");
+}

@@ -80,6 +80,8 @@ pub static MESSAGE_META: EventTypeMeta = EventTypeMeta {
     projection_table: "messages",
     share_scope: ShareScope::Shared,
     dep_fields: &[],
+    signer_required: false,
+    signature_byte_len: 0,
     parse: parse_message,
     encode: encode_message,
 };

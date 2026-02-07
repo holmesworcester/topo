@@ -1,7 +1,7 @@
 use rusqlite::Connection;
 
 use crate::crypto::event_id_to_base64;
-use crate::events::{MessageEvent, ReactionEvent};
+use crate::events::{MessageEvent, PeerKeyEvent, ReactionEvent, SignedMemoEvent};
 
 /// Project a Message event into the messages table. Returns Ok(true) if written.
 pub fn project_message(
@@ -45,6 +45,50 @@ pub fn project_reaction(
             author_id_b64,
             &rxn.emoji,
             rxn.created_at_ms as i64,
+            recorded_by
+        ],
+    )?;
+    Ok(rows > 0)
+}
+
+/// Project a PeerKey event into the peer_keys table. Returns Ok(true) if written.
+pub fn project_peer_key(
+    conn: &Connection,
+    recorded_by: &str,
+    event_id_b64: &str,
+    pk: &PeerKeyEvent,
+) -> Result<bool, rusqlite::Error> {
+    let public_key_hex = hex::encode(pk.public_key);
+    let rows = conn.execute(
+        "INSERT OR IGNORE INTO peer_keys (event_id, public_key, created_at, recorded_by)
+         VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![
+            event_id_b64,
+            public_key_hex,
+            pk.created_at_ms as i64,
+            recorded_by
+        ],
+    )?;
+    Ok(rows > 0)
+}
+
+/// Project a SignedMemo event into the signed_memos table. Returns Ok(true) if written.
+pub fn project_signed_memo(
+    conn: &Connection,
+    recorded_by: &str,
+    event_id_b64: &str,
+    memo: &SignedMemoEvent,
+) -> Result<bool, rusqlite::Error> {
+    let signed_by_b64 = event_id_to_base64(&memo.signed_by);
+    let rows = conn.execute(
+        "INSERT OR IGNORE INTO signed_memos (event_id, signed_by, signer_type, content, created_at, recorded_by)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![
+            event_id_b64,
+            signed_by_b64,
+            memo.signer_type as i64,
+            &memo.content,
+            memo.created_at_ms as i64,
             recorded_by
         ],
     )?;

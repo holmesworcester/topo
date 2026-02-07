@@ -3,9 +3,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::crypto::EventId;
 use crate::db::{open_connection, schema::create_tables};
-use crate::events::{MessageEvent, ReactionEvent, ParsedEvent};
+use crate::events::{MessageEvent, ReactionEvent, PeerKeyEvent, SignedMemoEvent, ParsedEvent};
 use crate::identity::{cert_paths_from_db, local_identity_from_db};
-use crate::projection::create::create_event_sync;
+use crate::projection::create::{create_event_sync, create_signed_event_sync};
 use crate::projection::pipeline::project_one;
 use crate::sync::engine::{accept_loop, connect_loop};
 use crate::transport::{
@@ -110,6 +110,37 @@ impl Peer {
         create_event_sync(&db, &self.identity, &rxn).expect("failed to create reaction")
     }
 
+    /// Create a PeerKey event publishing an Ed25519 public key.
+    /// Returns the event ID.
+    pub fn create_peer_key(&self, public_key: [u8; 32]) -> EventId {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        let pk = ParsedEvent::PeerKey(PeerKeyEvent {
+            created_at_ms: current_timestamp_ms(),
+            public_key,
+        });
+        create_event_sync(&db, &self.identity, &pk).expect("failed to create peer_key")
+    }
+
+    /// Create a SignedMemo event with proper Ed25519 signature.
+    /// Returns the event ID.
+    pub fn create_signed_memo(
+        &self,
+        signer_key_eid: &EventId,
+        signing_key: &ed25519_dalek::SigningKey,
+        content: &str,
+    ) -> EventId {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        let memo = ParsedEvent::SignedMemo(SignedMemoEvent {
+            created_at_ms: current_timestamp_ms(),
+            signed_by: *signer_key_eid,
+            signer_type: 0,
+            content: content.to_string(),
+            signature: [0u8; 64], // placeholder, overwritten by create_signed_event_sync
+        });
+        create_signed_event_sync(&db, &self.identity, &memo, signing_key)
+            .expect("failed to create signed_memo")
+    }
+
     /// Create multiple messages. Uses a transaction for speed at scale.
     pub fn batch_create_messages(&self, count: usize) {
         let db = open_connection(&self.db_path).expect("failed to open db");
@@ -145,6 +176,26 @@ impl Peer {
         let db = open_connection(&self.db_path).expect("failed to open db");
         db.query_row(
             "SELECT COUNT(*) FROM reactions WHERE recorded_by = ?1",
+            rusqlite::params![&self.identity],
+            |row| row.get(0),
+        ).unwrap_or(0)
+    }
+
+    /// Count rows in the peer_keys projection table scoped to this peer.
+    pub fn peer_key_count(&self) -> i64 {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        db.query_row(
+            "SELECT COUNT(*) FROM peer_keys WHERE recorded_by = ?1",
+            rusqlite::params![&self.identity],
+            |row| row.get(0),
+        ).unwrap_or(0)
+    }
+
+    /// Count rows in the signed_memos projection table scoped to this peer.
+    pub fn signed_memo_count(&self) -> i64 {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        db.query_row(
+            "SELECT COUNT(*) FROM signed_memos WHERE recorded_by = ?1",
             rusqlite::params![&self.identity],
             |row| row.get(0),
         ).unwrap_or(0)
@@ -193,17 +244,17 @@ impl Peer {
 
 /// Replay all event blobs from the events table through project_one.
 /// Clears projection tables and valid_events, then re-projects all events.
-/// Returns (message_count, reaction_count) after replay.
-fn replay_projection(db: &rusqlite::Connection, recorded_by: &str) -> (i64, i64) {
+/// Returns (message_count, reaction_count, peer_key_count, signed_memo_count) after replay.
+fn replay_projection(db: &rusqlite::Connection, recorded_by: &str) -> (i64, i64, i64, i64) {
     replay_projection_impl(db, recorded_by, "ORDER BY created_at ASC, event_id ASC")
 }
 
 /// Replay events in reverse order through the projector.
-fn replay_projection_reverse(db: &rusqlite::Connection, recorded_by: &str) -> (i64, i64) {
+fn replay_projection_reverse(db: &rusqlite::Connection, recorded_by: &str) -> (i64, i64, i64, i64) {
     replay_projection_impl(db, recorded_by, "ORDER BY created_at DESC, event_id DESC")
 }
 
-fn replay_projection_impl(db: &rusqlite::Connection, recorded_by: &str, order: &str) -> (i64, i64) {
+fn replay_projection_impl(db: &rusqlite::Connection, recorded_by: &str, order: &str) -> (i64, i64, i64, i64) {
     use crate::crypto::event_id_from_base64;
 
     // Clear projection tables + valid_events for this tenant
@@ -211,6 +262,10 @@ fn replay_projection_impl(db: &rusqlite::Connection, recorded_by: &str, order: &
         .expect("failed to clear messages");
     db.execute("DELETE FROM reactions WHERE recorded_by = ?1", rusqlite::params![recorded_by])
         .expect("failed to clear reactions");
+    db.execute("DELETE FROM peer_keys WHERE recorded_by = ?1", rusqlite::params![recorded_by])
+        .expect("failed to clear peer_keys");
+    db.execute("DELETE FROM signed_memos WHERE recorded_by = ?1", rusqlite::params![recorded_by])
+        .expect("failed to clear signed_memos");
     db.execute("DELETE FROM valid_events WHERE peer_id = ?1", rusqlite::params![recorded_by])
         .expect("failed to clear valid_events");
     db.execute("DELETE FROM blocked_event_deps WHERE peer_id = ?1", rusqlite::params![recorded_by])
@@ -239,8 +294,18 @@ fn replay_projection_impl(db: &rusqlite::Connection, recorded_by: &str, order: &
         rusqlite::params![recorded_by],
         |row| row.get(0),
     ).unwrap_or(0);
+    let pk_count: i64 = db.query_row(
+        "SELECT COUNT(*) FROM peer_keys WHERE recorded_by = ?1",
+        rusqlite::params![recorded_by],
+        |row| row.get(0),
+    ).unwrap_or(0);
+    let sm_count: i64 = db.query_row(
+        "SELECT COUNT(*) FROM signed_memos WHERE recorded_by = ?1",
+        rusqlite::params![recorded_by],
+        |row| row.get(0),
+    ).unwrap_or(0);
 
-    (msg_count, rxn_count)
+    (msg_count, rxn_count, pk_count, sm_count)
 }
 
 /// Verify projection invariants for a peer:
@@ -261,27 +326,49 @@ pub fn verify_projection_invariants(peer: &Peer) {
         rusqlite::params![&peer.identity],
         |row| row.get(0),
     ).unwrap_or(0);
+    let orig_pk: i64 = db.query_row(
+        "SELECT COUNT(*) FROM peer_keys WHERE recorded_by = ?1",
+        rusqlite::params![&peer.identity],
+        |row| row.get(0),
+    ).unwrap_or(0);
+    let orig_sm: i64 = db.query_row(
+        "SELECT COUNT(*) FROM signed_memos WHERE recorded_by = ?1",
+        rusqlite::params![&peer.identity],
+        |row| row.get(0),
+    ).unwrap_or(0);
 
     // 1. Forward replay
-    let (fwd_msg, fwd_rxn) = replay_projection(&db, &peer.identity);
+    let (fwd_msg, fwd_rxn, fwd_pk, fwd_sm) = replay_projection(&db, &peer.identity);
     assert_eq!(fwd_msg, orig_msg,
         "Forward replay message count mismatch: expected {}, got {}", orig_msg, fwd_msg);
     assert_eq!(fwd_rxn, orig_rxn,
         "Forward replay reaction count mismatch: expected {}, got {}", orig_rxn, fwd_rxn);
+    assert_eq!(fwd_pk, orig_pk,
+        "Forward replay peer_key count mismatch: expected {}, got {}", orig_pk, fwd_pk);
+    assert_eq!(fwd_sm, orig_sm,
+        "Forward replay signed_memo count mismatch: expected {}, got {}", orig_sm, fwd_sm);
 
     // 2. Idempotency: replay again over existing projected state (double replay)
-    let (double_msg, double_rxn) = replay_projection(&db, &peer.identity);
+    let (double_msg, double_rxn, double_pk, double_sm) = replay_projection(&db, &peer.identity);
     assert_eq!(double_msg, orig_msg,
         "Double replay message count mismatch: expected {}, got {}", orig_msg, double_msg);
     assert_eq!(double_rxn, orig_rxn,
         "Double replay reaction count mismatch: expected {}, got {}", orig_rxn, double_rxn);
+    assert_eq!(double_pk, orig_pk,
+        "Double replay peer_key count mismatch: expected {}, got {}", orig_pk, double_pk);
+    assert_eq!(double_sm, orig_sm,
+        "Double replay signed_memo count mismatch: expected {}, got {}", orig_sm, double_sm);
 
     // 3. Reverse-order replay
-    let (rev_msg, rev_rxn) = replay_projection_reverse(&db, &peer.identity);
+    let (rev_msg, rev_rxn, rev_pk, rev_sm) = replay_projection_reverse(&db, &peer.identity);
     assert_eq!(rev_msg, orig_msg,
         "Reverse replay message count mismatch: expected {}, got {}", orig_msg, rev_msg);
     assert_eq!(rev_rxn, orig_rxn,
         "Reverse replay reaction count mismatch: expected {}, got {}", orig_rxn, rev_rxn);
+    assert_eq!(rev_pk, orig_pk,
+        "Reverse replay peer_key count mismatch: expected {}, got {}", orig_pk, rev_pk);
+    assert_eq!(rev_sm, orig_sm,
+        "Reverse replay signed_memo count mismatch: expected {}, got {}", orig_sm, rev_sm);
 
     // Restore forward projection for subsequent assertions
     let _ = replay_projection(&db, &peer.identity);

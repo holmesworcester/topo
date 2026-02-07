@@ -1,9 +1,70 @@
 use rusqlite::Connection;
 
 use crate::crypto::{event_id_to_base64, event_id_from_base64, EventId};
-use crate::events::{self, ParsedEvent};
+use crate::events::{self, ParsedEvent, registry};
 use super::decision::ProjectionDecision;
-use super::projectors::{project_message, project_reaction};
+use super::projectors::{project_message, project_reaction, project_peer_key, project_signed_memo};
+use super::signer::{resolve_signer_key, verify_ed25519_signature};
+
+/// Shared projection helper: verify signer (if required), dispatch to per-event
+/// projector, return Valid or Reject. Caller is responsible for dep checks.
+fn apply_projection(
+    conn: &Connection,
+    recorded_by: &str,
+    event_id_b64: &str,
+    blob: &[u8],
+    parsed: &ParsedEvent,
+) -> Result<ProjectionDecision, Box<dyn std::error::Error>> {
+    let meta = registry().lookup(parsed.event_type_code())
+        .ok_or_else(|| format!("unknown type code {}", parsed.event_type_code()))?;
+
+    // Signer verification (if required)
+    if meta.signer_required {
+        let (signer_event_id, signer_type) = parsed.signer_fields()
+            .ok_or("signer_required but no signer_fields")?;
+        let pubkey = resolve_signer_key(conn, signer_type, &signer_event_id)?;
+        match pubkey {
+            None => {
+                return Ok(ProjectionDecision::Reject {
+                    reason: "signer key not found".to_string(),
+                });
+            }
+            Some(key) => {
+                let sig_len = meta.signature_byte_len;
+                if blob.len() < sig_len {
+                    return Ok(ProjectionDecision::Reject {
+                        reason: "blob too short for signature".to_string(),
+                    });
+                }
+                let signing_bytes = &blob[..blob.len() - sig_len];
+                let sig_bytes = &blob[blob.len() - sig_len..];
+                if !verify_ed25519_signature(&key, signing_bytes, sig_bytes) {
+                    return Ok(ProjectionDecision::Reject {
+                        reason: "invalid signature".to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    // Per-event projector dispatch
+    match parsed {
+        ParsedEvent::Message(msg) => {
+            project_message(conn, recorded_by, event_id_b64, msg)?;
+        }
+        ParsedEvent::Reaction(rxn) => {
+            project_reaction(conn, recorded_by, event_id_b64, rxn)?;
+        }
+        ParsedEvent::PeerKey(pk) => {
+            project_peer_key(conn, recorded_by, event_id_b64, pk)?;
+        }
+        ParsedEvent::SignedMemo(memo) => {
+            project_signed_memo(conn, recorded_by, event_id_b64, memo)?;
+        }
+    }
+
+    Ok(ProjectionDecision::Valid)
+}
 
 /// Central projection entrypoint. Given an event_id that is already stored in the
 /// `events` table, parse it, check dependencies, project into terminal tables,
@@ -78,14 +139,10 @@ pub fn project_one(
         return Ok(ProjectionDecision::Block { missing });
     }
 
-    // 6. Call per-event projector
-    match &parsed {
-        ParsedEvent::Message(msg) => {
-            project_message(conn, recorded_by, &event_id_b64, msg)?;
-        }
-        ParsedEvent::Reaction(rxn) => {
-            project_reaction(conn, recorded_by, &event_id_b64, rxn)?;
-        }
+    // 6. Apply projection (signer verification + projector dispatch)
+    let decision = apply_projection(conn, recorded_by, &event_id_b64, &blob, &parsed)?;
+    if let ProjectionDecision::Reject { .. } = &decision {
+        return Ok(decision);
     }
 
     // 7. Write terminal state
@@ -136,7 +193,7 @@ fn unblock_dependents(
 
         for eid_b64 in unblocked {
             if event_id_from_base64(&eid_b64).is_some() {
-                // Project inline (no recursion) — just the core projection logic
+                // Check not already valid
                 let already: bool = conn.query_row(
                     "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
                     rusqlite::params![recorded_by, &eid_b64],
@@ -172,13 +229,11 @@ fn unblock_dependents(
                         continue;
                     }
 
-                    match &parsed {
-                        ParsedEvent::Message(msg) => {
-                            project_message(conn, recorded_by, &eid_b64, msg)?;
-                        }
-                        ParsedEvent::Reaction(rxn) => {
-                            project_reaction(conn, recorded_by, &eid_b64, rxn)?;
-                        }
+                    // Apply projection (signer verification + projector dispatch)
+                    let decision = apply_projection(conn, recorded_by, &eid_b64, &blob, &parsed)?;
+                    if let ProjectionDecision::Reject { .. } = &decision {
+                        // Rejected events don't become valid and don't cascade
+                        continue;
                     }
 
                     conn.execute(
@@ -201,7 +256,9 @@ mod tests {
     use super::*;
     use crate::crypto::hash_event;
     use crate::db::{open_in_memory, schema::create_tables};
-    use crate::events::{self, MessageEvent, ReactionEvent, ParsedEvent};
+    use crate::events::{self, MessageEvent, ReactionEvent, PeerKeyEvent, SignedMemoEvent, ParsedEvent};
+    use crate::projection::signer::sign_event_bytes;
+    use ed25519_dalek::SigningKey;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn now_ms() -> u64 {
@@ -215,7 +272,9 @@ mod tests {
         let event_id_b64 = event_id_to_base64(&event_id);
         let ts = now_ms();
         let type_code = blob[0];
-        let type_name = if type_code == 1 { "message" } else { "reaction" };
+        let type_name = registry().lookup(type_code)
+            .map(|m| m.type_name)
+            .unwrap_or("unknown");
 
         conn.execute(
             "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
@@ -255,6 +314,38 @@ mod tests {
         });
         let blob = events::encode_event(&rxn).unwrap();
         (rxn, blob)
+    }
+
+    fn make_peer_key(public_key: [u8; 32]) -> (ParsedEvent, Vec<u8>) {
+        let pk = ParsedEvent::PeerKey(PeerKeyEvent {
+            created_at_ms: now_ms(),
+            public_key,
+        });
+        let blob = events::encode_event(&pk).unwrap();
+        (pk, blob)
+    }
+
+    fn make_signed_memo(signing_key: &SigningKey, signer_event_id: &EventId, content: &str) -> (ParsedEvent, Vec<u8>) {
+        let memo = SignedMemoEvent {
+            created_at_ms: now_ms(),
+            signed_by: *signer_event_id,
+            signer_type: 0,
+            content: content.to_string(),
+            signature: [0u8; 64], // placeholder
+        };
+        let event = ParsedEvent::SignedMemo(memo);
+        let mut blob = events::encode_event(&event).unwrap();
+
+        // Sign: signing_bytes = blob[..len-64], overwrite last 64 bytes
+        let sig_len = 64;
+        let blob_len = blob.len();
+        let signing_bytes = &blob[..blob_len - sig_len];
+        let sig = sign_event_bytes(signing_key, signing_bytes);
+        blob[blob_len - sig_len..].copy_from_slice(&sig);
+
+        // Re-parse to get the event with correct signature
+        let parsed = events::parse_event(&blob).unwrap();
+        (parsed, blob)
     }
 
     fn setup() -> Connection {
@@ -459,5 +550,169 @@ mod tests {
             rusqlite::params![recorded_by, &rxn2_b64], |row| row.get(0),
         ).unwrap();
         assert!(r2_valid2);
+    }
+
+    #[test]
+    fn test_project_peer_key_valid() {
+        let conn = setup();
+        let recorded_by = "peer1";
+        let mut rng = rand::thread_rng();
+        let signing_key = SigningKey::generate(&mut rng);
+        let public_key = signing_key.verifying_key().to_bytes();
+
+        let (_pk, blob) = make_peer_key(public_key);
+        let eid = insert_event_raw(&conn, recorded_by, &blob);
+
+        let result = project_one(&conn, recorded_by, &eid).unwrap();
+        assert_eq!(result, ProjectionDecision::Valid);
+
+        // Verify in peer_keys table
+        let eid_b64 = event_id_to_base64(&eid);
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM peer_keys WHERE event_id = ?1 AND recorded_by = ?2",
+            rusqlite::params![&eid_b64, recorded_by],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_project_signed_memo_valid() {
+        let conn = setup();
+        let recorded_by = "peer1";
+        let mut rng = rand::thread_rng();
+        let signing_key = SigningKey::generate(&mut rng);
+        let public_key = signing_key.verifying_key().to_bytes();
+
+        // First create and project the PeerKey event
+        let (_pk, pk_blob) = make_peer_key(public_key);
+        let pk_eid = insert_event_raw(&conn, recorded_by, &pk_blob);
+        let pk_result = project_one(&conn, recorded_by, &pk_eid).unwrap();
+        assert_eq!(pk_result, ProjectionDecision::Valid);
+
+        // Now create a signed memo referencing the PeerKey
+        let (_memo, memo_blob) = make_signed_memo(&signing_key, &pk_eid, "hello signed");
+        let memo_eid = insert_event_raw(&conn, recorded_by, &memo_blob);
+
+        let result = project_one(&conn, recorded_by, &memo_eid).unwrap();
+        assert_eq!(result, ProjectionDecision::Valid);
+
+        // Verify in signed_memos table
+        let memo_b64 = event_id_to_base64(&memo_eid);
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM signed_memos WHERE event_id = ?1 AND recorded_by = ?2",
+            rusqlite::params![&memo_b64, recorded_by],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_signed_memo_blocks_on_missing_signer() {
+        let conn = setup();
+        let recorded_by = "peer1";
+        let mut rng = rand::thread_rng();
+        let signing_key = SigningKey::generate(&mut rng);
+
+        // Create a memo referencing a non-existent PeerKey
+        let fake_signer_id = [99u8; 32];
+        let (_memo, memo_blob) = make_signed_memo(&signing_key, &fake_signer_id, "blocked memo");
+        let memo_eid = insert_event_raw(&conn, recorded_by, &memo_blob);
+
+        let result = project_one(&conn, recorded_by, &memo_eid).unwrap();
+        match result {
+            ProjectionDecision::Block { missing } => {
+                assert_eq!(missing.len(), 1);
+                assert_eq!(missing[0], fake_signer_id);
+            }
+            other => panic!("expected Block, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_signed_memo_unblocks_when_signer_arrives() {
+        let conn = setup();
+        let recorded_by = "peer1";
+        let mut rng = rand::thread_rng();
+        let signing_key = SigningKey::generate(&mut rng);
+        let public_key = signing_key.verifying_key().to_bytes();
+
+        // Pre-compute the PeerKey event_id without inserting
+        let (_pk, pk_blob) = make_peer_key(public_key);
+        let pk_eid = hash_event(&pk_blob);
+
+        // Create and insert signed memo (before signer arrives)
+        let (_memo, memo_blob) = make_signed_memo(&signing_key, &pk_eid, "out of order");
+        let memo_eid = insert_event_raw(&conn, recorded_by, &memo_blob);
+
+        // Project memo — should block on missing signer
+        let result = project_one(&conn, recorded_by, &memo_eid).unwrap();
+        assert!(matches!(result, ProjectionDecision::Block { .. }));
+
+        // Now insert and project the signer PeerKey
+        insert_event_raw(&conn, recorded_by, &pk_blob);
+        let pk_result = project_one(&conn, recorded_by, &pk_eid).unwrap();
+        assert_eq!(pk_result, ProjectionDecision::Valid);
+
+        // Memo should have been auto-unblocked via cascade
+        let memo_b64 = event_id_to_base64(&memo_eid);
+        let valid: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &memo_b64],
+            |row| row.get(0),
+        ).unwrap();
+        assert!(valid, "signed memo should be auto-projected after signer key arrives");
+
+        // Verify in signed_memos table
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM signed_memos WHERE event_id = ?1 AND recorded_by = ?2",
+            rusqlite::params![&memo_b64, recorded_by],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_signed_memo_invalid_signature_rejects() {
+        let conn = setup();
+        let recorded_by = "peer1";
+        let mut rng = rand::thread_rng();
+        let signing_key = SigningKey::generate(&mut rng);
+        let wrong_key = SigningKey::generate(&mut rng);
+        let public_key = signing_key.verifying_key().to_bytes();
+
+        // Create PeerKey with signing_key's public key
+        let (_pk, pk_blob) = make_peer_key(public_key);
+        let pk_eid = insert_event_raw(&conn, recorded_by, &pk_blob);
+        project_one(&conn, recorded_by, &pk_eid).unwrap();
+
+        // Sign the memo with the WRONG key
+        let (_memo, memo_blob) = make_signed_memo(&wrong_key, &pk_eid, "bad signature");
+        let memo_eid = insert_event_raw(&conn, recorded_by, &memo_blob);
+
+        let result = project_one(&conn, recorded_by, &memo_eid).unwrap();
+        match result {
+            ProjectionDecision::Reject { reason } => {
+                assert!(reason.contains("invalid signature"), "reason: {}", reason);
+            }
+            other => panic!("expected Reject, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_unsigned_types_skip_signer_check() {
+        // Regression: ensure Message and Reaction still project normally
+        let conn = setup();
+        let recorded_by = "peer1";
+
+        let (_msg, msg_blob) = make_message("no signer needed");
+        let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
+        let r1 = project_one(&conn, recorded_by, &msg_eid).unwrap();
+        assert_eq!(r1, ProjectionDecision::Valid);
+
+        let (_rxn, rxn_blob) = make_reaction(&msg_eid, "\u{1f44d}");
+        let rxn_eid = insert_event_raw(&conn, recorded_by, &rxn_blob);
+        let r2 = project_one(&conn, recorded_by, &rxn_eid).unwrap();
+        assert_eq!(r2, ProjectionDecision::Valid);
     }
 }

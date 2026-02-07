@@ -3,6 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::crypto::{hash_event, event_id_to_base64, EventId};
 use crate::events::{self, ParsedEvent, registry};
+use crate::projection::signer::sign_event_bytes;
 use super::decision::ProjectionDecision;
 use super::pipeline::project_one;
 
@@ -31,24 +32,17 @@ impl std::fmt::Display for CreateEventError {
 
 impl std::error::Error for CreateEventError {}
 
-/// Create a new event: encode, hash, write to events/neg_items/recorded_events,
-/// then project via `project_one`. Returns the event_id on success.
-pub fn create_event_sync(
+/// Shared helper: hash blob, write to events/neg_items/recorded_events, project via project_one.
+fn store_blob_and_project(
     conn: &Connection,
     recorded_by: &str,
-    event: &ParsedEvent,
+    blob: &[u8],
+    meta: &events::EventTypeMeta,
+    created_at_ms: i64,
 ) -> Result<EventId, CreateEventError> {
-    let blob = events::encode_event(event)
-        .map_err(|e| CreateEventError::EncodeError(e.to_string()))?;
-    let event_id = hash_event(&blob);
+    let event_id = hash_event(blob);
     let event_id_b64 = event_id_to_base64(&event_id);
 
-    let type_code = event.event_type_code();
-    let reg = registry();
-    let meta = reg.lookup(type_code)
-        .ok_or_else(|| CreateEventError::EncodeError(format!("unknown type code {}", type_code)))?;
-
-    let created_at_ms = event.created_at_ms() as i64;
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -61,7 +55,7 @@ pub fn create_event_sync(
         rusqlite::params![
             &event_id_b64,
             meta.type_name,
-            blob.as_slice(),
+            blob,
             meta.share_scope.as_str(),
             created_at_ms,
             now_ms
@@ -95,11 +89,63 @@ pub fn create_event_sync(
     }
 }
 
+/// Create a new event: encode, hash, write to events/neg_items/recorded_events,
+/// then project via `project_one`. Returns the event_id on success.
+pub fn create_event_sync(
+    conn: &Connection,
+    recorded_by: &str,
+    event: &ParsedEvent,
+) -> Result<EventId, CreateEventError> {
+    let blob = events::encode_event(event)
+        .map_err(|e| CreateEventError::EncodeError(e.to_string()))?;
+
+    let type_code = event.event_type_code();
+    let reg = registry();
+    let meta = reg.lookup(type_code)
+        .ok_or_else(|| CreateEventError::EncodeError(format!("unknown type code {}", type_code)))?;
+
+    let created_at_ms = event.created_at_ms() as i64;
+    store_blob_and_project(conn, recorded_by, &blob, meta, created_at_ms)
+}
+
+/// Create a signed event: encode with zero-placeholder signature, sign the
+/// canonical bytes, overwrite signature, then store and project.
+pub fn create_signed_event_sync(
+    conn: &Connection,
+    recorded_by: &str,
+    event: &ParsedEvent,
+    signing_key: &ed25519_dalek::SigningKey,
+) -> Result<EventId, CreateEventError> {
+    let mut blob = events::encode_event(event)
+        .map_err(|e| CreateEventError::EncodeError(e.to_string()))?;
+
+    let type_code = event.event_type_code();
+    let reg = registry();
+    let meta = reg.lookup(type_code)
+        .ok_or_else(|| CreateEventError::EncodeError(format!("unknown type code {}", type_code)))?;
+
+    if meta.signature_byte_len == 0 {
+        return Err(CreateEventError::EncodeError(
+            "create_signed_event_sync called for unsigned type".to_string(),
+        ));
+    }
+
+    let sig_len = meta.signature_byte_len;
+    let blob_len = blob.len();
+    let signing_bytes = &blob[..blob_len - sig_len];
+    let sig = sign_event_bytes(signing_key, signing_bytes);
+    blob[blob_len - sig_len..].copy_from_slice(&sig);
+
+    let created_at_ms = event.created_at_ms() as i64;
+    store_blob_and_project(conn, recorded_by, &blob, meta, created_at_ms)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::{open_in_memory, schema::create_tables};
-    use crate::events::{MessageEvent, ReactionEvent};
+    use crate::events::{MessageEvent, ReactionEvent, PeerKeyEvent, SignedMemoEvent};
+    use ed25519_dalek::SigningKey;
 
     fn now_ms() -> u64 {
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
@@ -230,5 +276,47 @@ mod tests {
             rusqlite::params![recorded_by, &eid_b64], |row| row.get(0),
         ).unwrap();
         assert_eq!(blocked, 1);
+    }
+
+    #[test]
+    fn test_create_signed_event_sync() {
+        let conn = setup();
+        let recorded_by = "peer1";
+        let mut rng = rand::thread_rng();
+        let signing_key = SigningKey::generate(&mut rng);
+        let public_key = signing_key.verifying_key().to_bytes();
+
+        // Create PeerKey first
+        let pk_event = ParsedEvent::PeerKey(PeerKeyEvent {
+            created_at_ms: now_ms(),
+            public_key,
+        });
+        let pk_eid = create_event_sync(&conn, recorded_by, &pk_event).unwrap();
+
+        // Create signed memo
+        let memo = ParsedEvent::SignedMemo(SignedMemoEvent {
+            created_at_ms: now_ms(),
+            signed_by: pk_eid,
+            signer_type: 0,
+            content: "signed content".to_string(),
+            signature: [0u8; 64], // placeholder, will be overwritten
+        });
+
+        let memo_eid = create_signed_event_sync(&conn, recorded_by, &memo, &signing_key).unwrap();
+        let memo_b64 = event_id_to_base64(&memo_eid);
+
+        // Should be valid
+        let valid: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &memo_b64], |row| row.get(0),
+        ).unwrap();
+        assert!(valid);
+
+        // Should be in signed_memos table
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM signed_memos WHERE event_id = ?1 AND recorded_by = ?2",
+            rusqlite::params![&memo_b64, recorded_by], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count, 1);
     }
 }

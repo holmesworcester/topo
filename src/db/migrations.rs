@@ -71,6 +71,29 @@ static MIGRATIONS: &[Migration] = &[
                 ON blocked_event_deps(peer_id, blocker_event_id);
         ",
     },
+    Migration {
+        version: 3,
+        name: "add_peer_keys_and_signed_memos",
+        sql: "
+            CREATE TABLE IF NOT EXISTS peer_keys (
+                event_id TEXT NOT NULL,
+                public_key TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                recorded_by TEXT NOT NULL,
+                PRIMARY KEY (recorded_by, event_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS signed_memos (
+                event_id TEXT NOT NULL,
+                signed_by TEXT NOT NULL,
+                signer_type INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                recorded_by TEXT NOT NULL,
+                PRIMARY KEY (recorded_by, event_id)
+            );
+        ",
+    },
 ];
 
 fn ensure_schema_migrations(conn: &Connection) -> SqliteResult<()> {
@@ -190,6 +213,6 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 2);
+        assert_eq!(count, 3);
     }
 }
