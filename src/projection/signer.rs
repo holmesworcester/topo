@@ -3,38 +3,64 @@ use rusqlite::Connection;
 use crate::crypto::event_id_to_base64;
 use crate::events::{self, ParsedEvent};
 
-/// Resolve the public key for a signer event.
-/// For signer_type=0 (peer), loads the event blob, parses as PeerKeyEvent,
-/// and returns the public key. Returns None if the event is not found.
+/// Result of resolving a signer key from the database.
+#[derive(Debug, PartialEq)]
+pub enum SignerResolution {
+    /// Key successfully resolved.
+    Found([u8; 32]),
+    /// Signer event not found (or not valid for this tenant).
+    NotFound,
+    /// Signer data is invalid (unsupported type, wrong event type, parse error).
+    Invalid(String),
+}
+
+/// Resolve the public key for a signer event, scoped to the given tenant.
+/// For signer_type=0 (peer), loads the event blob via valid_events JOIN,
+/// parses as PeerKeyEvent, and returns the public key.
+///
+/// Returns `Err` only for real DB errors. Data-level problems (unsupported
+/// signer_type, missing event, wrong event type, parse failures) are
+/// returned as `SignerResolution::Invalid` or `SignerResolution::NotFound`.
 pub fn resolve_signer_key(
     conn: &Connection,
+    recorded_by: &str,
     signer_type: u8,
     signer_event_id: &[u8; 32],
-) -> Result<Option<[u8; 32]>, Box<dyn std::error::Error>> {
+) -> Result<SignerResolution, Box<dyn std::error::Error>> {
     match signer_type {
         0 => {
-            // Peer signer: load from events table
+            // Peer signer: load from events table, scoped to tenant via valid_events
             let eid_b64 = event_id_to_base64(signer_event_id);
             let blob: Vec<u8> = match conn.query_row(
-                "SELECT blob FROM events WHERE event_id = ?1",
-                rusqlite::params![&eid_b64],
+                "SELECT e.blob FROM events e
+                 INNER JOIN valid_events v ON e.event_id = v.event_id
+                 WHERE v.peer_id = ?1 AND e.event_id = ?2",
+                rusqlite::params![recorded_by, &eid_b64],
                 |row| row.get(0),
             ) {
                 Ok(b) => b,
-                Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+                Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(SignerResolution::NotFound),
                 Err(e) => return Err(e.into()),
             };
 
-            let parsed = events::parse_event(&blob)?;
+            let parsed = match events::parse_event(&blob) {
+                Ok(p) => p,
+                Err(e) => {
+                    return Ok(SignerResolution::Invalid(format!("parse error: {}", e)));
+                }
+            };
             match parsed {
-                ParsedEvent::PeerKey(pk) => Ok(Some(pk.public_key)),
-                other => Err(format!(
+                ParsedEvent::PeerKey(pk) => Ok(SignerResolution::Found(pk.public_key)),
+                other => Ok(SignerResolution::Invalid(format!(
                     "signer event is not a PeerKeyEvent, got type_code={}",
                     other.event_type_code()
-                ).into()),
+                ))),
             }
         }
-        _ => Err(format!("unsupported signer_type: {}", signer_type).into()),
+        _ => Ok(SignerResolution::Invalid(format!(
+            "unsupported signer_type: {}",
+            signer_type
+        ))),
     }
 }
 
@@ -81,7 +107,8 @@ mod tests {
         conn
     }
 
-    fn insert_event_blob(conn: &rusqlite::Connection, blob: &[u8]) -> [u8; 32] {
+    /// Insert a blob into events + valid_events + recorded_events for the given tenant.
+    fn insert_event_blob(conn: &rusqlite::Connection, recorded_by: &str, blob: &[u8]) -> [u8; 32] {
         let event_id = hash_event(blob);
         let event_id_b64 = event_id_to_base64(&event_id);
         let ts = now_ms() as i64;
@@ -89,6 +116,15 @@ mod tests {
             "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
              VALUES (?1, ?2, ?3, 'shared', ?4, ?5)",
             rusqlite::params![&event_id_b64, "peer_key", blob, ts, ts],
+        ).unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO valid_events (peer_id, event_id) VALUES (?1, ?2)",
+            rusqlite::params![recorded_by, &event_id_b64],
+        ).unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
+             VALUES (?1, ?2, ?3, 'test')",
+            rusqlite::params![recorded_by, &event_id_b64, ts],
         ).unwrap();
         event_id
     }
@@ -127,6 +163,7 @@ mod tests {
     #[test]
     fn test_resolve_signer_key_found() {
         let conn = setup();
+        let recorded_by = "peer1";
         let mut rng = rand::thread_rng();
         let signing_key = SigningKey::generate(&mut rng);
         let public_key = signing_key.verifying_key().to_bytes();
@@ -136,23 +173,25 @@ mod tests {
             public_key,
         });
         let blob = encode_event(&pk_event).unwrap();
-        let event_id = insert_event_blob(&conn, &blob);
+        let event_id = insert_event_blob(&conn, recorded_by, &blob);
 
-        let result = resolve_signer_key(&conn, 0, &event_id).unwrap();
-        assert_eq!(result, Some(public_key));
+        let result = resolve_signer_key(&conn, recorded_by, 0, &event_id).unwrap();
+        assert_eq!(result, SignerResolution::Found(public_key));
     }
 
     #[test]
     fn test_resolve_signer_key_not_found() {
         let conn = setup();
+        let recorded_by = "peer1";
         let fake_id = [99u8; 32];
-        let result = resolve_signer_key(&conn, 0, &fake_id).unwrap();
-        assert_eq!(result, None);
+        let result = resolve_signer_key(&conn, recorded_by, 0, &fake_id).unwrap();
+        assert_eq!(result, SignerResolution::NotFound);
     }
 
     #[test]
     fn test_resolve_signer_key_wrong_event_type() {
         let conn = setup();
+        let recorded_by = "peer1";
         use crate::events::MessageEvent;
         let msg = ParsedEvent::Message(MessageEvent {
             created_at_ms: now_ms(),
@@ -161,18 +200,54 @@ mod tests {
             content: "not a key".to_string(),
         });
         let blob = encode_event(&msg).unwrap();
-        let event_id = hash_event(&blob);
-        let event_id_b64 = event_id_to_base64(&event_id);
-        let ts = now_ms() as i64;
-        conn.execute(
-            "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
-             VALUES (?1, ?2, ?3, 'shared', ?4, ?5)",
-            rusqlite::params![&event_id_b64, "message", &blob, ts, ts],
-        ).unwrap();
+        let event_id = insert_event_blob(&conn, recorded_by, &blob);
 
-        let result = resolve_signer_key(&conn, 0, &event_id);
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("not a PeerKeyEvent"));
+        let result = resolve_signer_key(&conn, recorded_by, 0, &event_id).unwrap();
+        match result {
+            SignerResolution::Invalid(msg) => {
+                assert!(msg.contains("not a PeerKeyEvent"), "msg: {}", msg);
+            }
+            other => panic!("expected Invalid, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_resolve_signer_key_unsupported_type() {
+        let conn = setup();
+        let recorded_by = "peer1";
+        let fake_id = [1u8; 32];
+        let result = resolve_signer_key(&conn, recorded_by, 255, &fake_id).unwrap();
+        match result {
+            SignerResolution::Invalid(msg) => {
+                assert!(msg.contains("unsupported signer_type: 255"), "msg: {}", msg);
+            }
+            other => panic!("expected Invalid, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_resolve_signer_key_tenant_scoped() {
+        let conn = setup();
+        let tenant_a = "tenant_a";
+        let tenant_b = "tenant_b";
+        let mut rng = rand::thread_rng();
+        let signing_key = SigningKey::generate(&mut rng);
+        let public_key = signing_key.verifying_key().to_bytes();
+
+        let pk_event = ParsedEvent::PeerKey(PeerKeyEvent {
+            created_at_ms: now_ms(),
+            public_key,
+        });
+        let blob = encode_event(&pk_event).unwrap();
+        // Insert and validate for tenant_a only
+        let event_id = insert_event_blob(&conn, tenant_a, &blob);
+
+        // tenant_a should find it
+        let result_a = resolve_signer_key(&conn, tenant_a, 0, &event_id).unwrap();
+        assert_eq!(result_a, SignerResolution::Found(public_key));
+
+        // tenant_b should NOT find it (not in valid_events for tenant_b)
+        let result_b = resolve_signer_key(&conn, tenant_b, 0, &event_id).unwrap();
+        assert_eq!(result_b, SignerResolution::NotFound);
     }
 }
