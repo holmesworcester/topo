@@ -206,7 +206,7 @@ pub fn batch_writer(
             }
         }
 
-        events_received.fetch_add(batch.len() as u64, Ordering::Relaxed);
+        events_received.fetch_add(event_ids_to_project.len() as u64, Ordering::Relaxed);
     }
 }
 

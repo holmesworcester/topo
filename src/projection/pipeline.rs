@@ -36,7 +36,7 @@ fn apply_projection(
     if meta.signer_required {
         let (signer_event_id, signer_type) = parsed.signer_fields()
             .ok_or("signer_required but no signer_fields")?;
-        let pubkey = match resolve_signer_key(conn, signer_type, &signer_event_id) {
+        let pubkey = match resolve_signer_key(conn, signer_type, &signer_event_id, recorded_by) {
             Ok(key) => key,
             Err(SignerError::ContentError(msg)) => {
                 return Ok(ProjectionDecision::Reject { reason: msg });
