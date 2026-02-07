@@ -270,10 +270,17 @@ fn replay_projection_impl(db: &rusqlite::Connection, recorded_by: &str, order: &
         .expect("failed to clear valid_events");
     db.execute("DELETE FROM blocked_event_deps WHERE peer_id = ?1", rusqlite::params![recorded_by])
         .expect("failed to clear blocked_event_deps");
+    db.execute("DELETE FROM rejected_events WHERE peer_id = ?1", rusqlite::params![recorded_by])
+        .expect("failed to clear rejected_events");
 
-    let query = format!("SELECT event_id FROM events {}", order);
+    let query = format!(
+        "SELECT e.event_id FROM events e
+         WHERE e.event_id IN (SELECT event_id FROM recorded_events WHERE peer_id = ?1)
+         {}",
+        order
+    );
     let mut stmt = db.prepare(&query).expect("failed to prepare events query");
-    let event_ids: Vec<String> = stmt.query_map([], |row| row.get::<_, String>(0))
+    let event_ids: Vec<String> = stmt.query_map(rusqlite::params![recorded_by], |row| row.get::<_, String>(0))
         .expect("failed to query events")
         .collect::<Result<Vec<_>, _>>()
         .expect("failed to collect events");

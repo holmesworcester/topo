@@ -1,3 +1,4 @@
+use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::Connection;
 
 use crate::crypto::{event_id_to_base64, event_id_from_base64, EventId};
@@ -5,6 +6,19 @@ use crate::events::{self, ParsedEvent, registry};
 use super::decision::ProjectionDecision;
 use super::projectors::{project_message, project_reaction, project_peer_key, project_signed_memo};
 use super::signer::{resolve_signer_key, verify_ed25519_signature};
+
+/// Record a rejected event durably so it is not re-processed on replay or cascade.
+fn record_rejection(conn: &Connection, recorded_by: &str, event_id_b64: &str, reason: &str) {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let _ = conn.execute(
+        "INSERT OR IGNORE INTO rejected_events (peer_id, event_id, reason, rejected_at)
+         VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![recorded_by, event_id_b64, reason, now_ms],
+    );
+}
 
 /// Shared projection helper: verify signer (if required), dispatch to per-event
 /// projector, return Valid or Reject. Caller is responsible for dep checks.
@@ -76,13 +90,23 @@ pub fn project_one(
 ) -> Result<ProjectionDecision, Box<dyn std::error::Error>> {
     let event_id_b64 = event_id_to_base64(event_id);
 
-    // 1. Check terminal state — already processed?
+    // 1. Check terminal state — already processed (valid)?
     let already: bool = conn.query_row(
         "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
         rusqlite::params![recorded_by, &event_id_b64],
         |row| row.get(0),
     )?;
     if already {
+        return Ok(ProjectionDecision::AlreadyProcessed);
+    }
+
+    // 1b. Check terminal state — already rejected?
+    let already_rejected: bool = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM rejected_events WHERE peer_id = ?1 AND event_id = ?2",
+        rusqlite::params![recorded_by, &event_id_b64],
+        |row| row.get(0),
+    )?;
+    if already_rejected {
         return Ok(ProjectionDecision::AlreadyProcessed);
     }
 
@@ -94,9 +118,9 @@ pub fn project_one(
     ) {
         Ok(b) => b,
         Err(rusqlite::Error::QueryReturnedNoRows) => {
-            return Ok(ProjectionDecision::Reject {
-                reason: format!("event {} not found in events table", event_id_b64),
-            });
+            let reason = format!("event {} not found in events table", event_id_b64);
+            record_rejection(conn, recorded_by, &event_id_b64, &reason);
+            return Ok(ProjectionDecision::Reject { reason });
         }
         Err(e) => return Err(e.into()),
     };
@@ -105,9 +129,9 @@ pub fn project_one(
     let parsed = match events::parse_event(&blob) {
         Ok(p) => p,
         Err(e) => {
-            return Ok(ProjectionDecision::Reject {
-                reason: format!("parse error: {}", e),
-            });
+            let reason = format!("parse error: {}", e);
+            record_rejection(conn, recorded_by, &event_id_b64, &reason);
+            return Ok(ProjectionDecision::Reject { reason });
         }
     };
 
@@ -116,12 +140,12 @@ pub fn project_one(
     let mut missing = Vec::new();
     for (_field_name, dep_id) in &deps {
         let dep_b64 = event_id_to_base64(dep_id);
-        let dep_exists: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM events WHERE event_id = ?1",
-            rusqlite::params![&dep_b64],
+        let dep_valid: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &dep_b64],
             |row| row.get(0),
         )?;
-        if !dep_exists {
+        if !dep_valid {
             missing.push(*dep_id);
         }
     }
@@ -141,7 +165,8 @@ pub fn project_one(
 
     // 6. Apply projection (signer verification + projector dispatch)
     let decision = apply_projection(conn, recorded_by, &event_id_b64, &blob, &parsed)?;
-    if let ProjectionDecision::Reject { .. } = &decision {
+    if let ProjectionDecision::Reject { ref reason } = &decision {
+        record_rejection(conn, recorded_by, &event_id_b64, reason);
         return Ok(decision);
     }
 
@@ -182,6 +207,9 @@ fn unblock_dependents(
              AND e.event_id NOT IN (
                  SELECT event_id FROM valid_events WHERE peer_id = ?1
              )
+             AND e.event_id NOT IN (
+                 SELECT event_id FROM rejected_events WHERE peer_id = ?1
+             )
              AND e.event_id IN (
                  SELECT event_id FROM recorded_events WHERE peer_id = ?1
              )"
@@ -209,18 +237,24 @@ fn unblock_dependents(
                     |row| row.get(0),
                 )?;
 
-                if let Ok(parsed) = events::parse_event(&blob) {
+                match events::parse_event(&blob) {
+                    Err(e) => {
+                        let reason = format!("parse error: {}", e);
+                        record_rejection(conn, recorded_by, &eid_b64, &reason);
+                        continue;
+                    }
+                    Ok(parsed) => {
                     // Check deps are satisfied (should be, but verify)
                     let deps = parsed.dep_field_values();
                     let mut still_missing = false;
                     for (_field, dep_id) in &deps {
                         let dep_b64 = event_id_to_base64(dep_id);
-                        let exists: bool = conn.query_row(
-                            "SELECT COUNT(*) > 0 FROM events WHERE event_id = ?1",
-                            rusqlite::params![&dep_b64],
+                        let dep_valid: bool = conn.query_row(
+                            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+                            rusqlite::params![recorded_by, &dep_b64],
                             |row| row.get(0),
                         )?;
-                        if !exists {
+                        if !dep_valid {
                             still_missing = true;
                             break;
                         }
@@ -231,7 +265,8 @@ fn unblock_dependents(
 
                     // Apply projection (signer verification + projector dispatch)
                     let decision = apply_projection(conn, recorded_by, &eid_b64, &blob, &parsed)?;
-                    if let ProjectionDecision::Reject { .. } = &decision {
+                    if let ProjectionDecision::Reject { ref reason } = &decision {
+                        record_rejection(conn, recorded_by, &eid_b64, reason);
                         // Rejected events don't become valid and don't cascade
                         continue;
                     }
@@ -243,6 +278,7 @@ fn unblock_dependents(
 
                     // This newly projected event may unblock further events
                     worklist.push(eid_b64);
+                    }
                 }
             }
         }
@@ -714,5 +750,271 @@ mod tests {
         let rxn_eid = insert_event_raw(&conn, recorded_by, &rxn_blob);
         let r2 = project_one(&conn, recorded_by, &rxn_eid).unwrap();
         assert_eq!(r2, ProjectionDecision::Valid);
+    }
+
+    #[test]
+    fn test_dep_global_existence_not_sufficient() {
+        // A dep existing globally (for tenant_a) must NOT satisfy tenant_b's dep check
+        let conn = setup();
+        let tenant_a = "tenant_a";
+        let tenant_b = "tenant_b";
+
+        // Tenant A creates and projects a message
+        let (_msg, msg_blob) = make_message("target for A");
+        let msg_eid = insert_event_raw(&conn, tenant_a, &msg_blob);
+        let r = project_one(&conn, tenant_a, &msg_eid).unwrap();
+        assert_eq!(r, ProjectionDecision::Valid);
+
+        // Tenant B creates a reaction targeting A's message
+        let (_rxn, rxn_blob) = make_reaction(&msg_eid, "\u{1f44d}");
+        let rxn_eid = insert_event_raw(&conn, tenant_b, &rxn_blob);
+
+        // Tenant B projects the reaction — should BLOCK because the message is not
+        // in valid_events for tenant_b, even though the blob exists in global events table
+        let r2 = project_one(&conn, tenant_b, &rxn_eid).unwrap();
+        match r2 {
+            ProjectionDecision::Block { missing } => {
+                assert_eq!(missing.len(), 1);
+                assert_eq!(missing[0], msg_eid);
+            }
+            other => panic!("expected Block, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cross_tenant_projection_isolation() {
+        // Both tenants project the same message blob — each gets independent valid_events
+        let conn = setup();
+        let tenant_a = "tenant_a";
+        let tenant_b = "tenant_b";
+
+        let (_msg, msg_blob) = make_message("shared message");
+        let msg_eid = insert_event_raw(&conn, tenant_a, &msg_blob);
+        // Also record for tenant_b
+        let eid_b64 = event_id_to_base64(&msg_eid);
+        conn.execute(
+            "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
+             VALUES (?1, ?2, ?3, 'test')",
+            rusqlite::params![tenant_b, &eid_b64, now_ms() as i64],
+        ).unwrap();
+
+        // Project for both tenants
+        let r_a = project_one(&conn, tenant_a, &msg_eid).unwrap();
+        assert_eq!(r_a, ProjectionDecision::Valid);
+        let r_b = project_one(&conn, tenant_b, &msg_eid).unwrap();
+        assert_eq!(r_b, ProjectionDecision::Valid);
+
+        // 2 rows in messages (one per tenant), 1 row in events (shared blob)
+        let msg_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE message_id = ?1",
+            rusqlite::params![&eid_b64],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(msg_count, 2);
+
+        let event_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE event_id = ?1",
+            rusqlite::params![&eid_b64],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(event_count, 1);
+
+        // Each tenant has independent valid_events entry
+        for tenant in [tenant_a, tenant_b] {
+            let valid: bool = conn.query_row(
+                "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![tenant, &eid_b64],
+                |row| row.get(0),
+            ).unwrap();
+            assert!(valid, "tenant {} should have valid_events entry", tenant);
+        }
+    }
+
+    #[test]
+    fn test_cross_tenant_signer_isolation() {
+        // PeerKey projected for tenant_a only; signed memo should block for tenant_b
+        let conn = setup();
+        let tenant_a = "tenant_a";
+        let tenant_b = "tenant_b";
+        let mut rng = rand::thread_rng();
+        let signing_key = SigningKey::generate(&mut rng);
+        let public_key = signing_key.verifying_key().to_bytes();
+
+        // Create and project PeerKey for tenant_a only
+        let (_pk, pk_blob) = make_peer_key(public_key);
+        let pk_eid = insert_event_raw(&conn, tenant_a, &pk_blob);
+        let r = project_one(&conn, tenant_a, &pk_eid).unwrap();
+        assert_eq!(r, ProjectionDecision::Valid);
+
+        // Create signed memo (correct signature)
+        let (_memo, memo_blob) = make_signed_memo(&signing_key, &pk_eid, "tenant isolation test");
+        let memo_eid = insert_event_raw(&conn, tenant_a, &memo_blob);
+
+        // Project for tenant_a — should be Valid
+        let r_a = project_one(&conn, tenant_a, &memo_eid).unwrap();
+        assert_eq!(r_a, ProjectionDecision::Valid);
+
+        // Also record the memo + pk for tenant_b
+        let memo_b64 = event_id_to_base64(&memo_eid);
+        let pk_b64 = event_id_to_base64(&pk_eid);
+        conn.execute(
+            "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source) VALUES (?1, ?2, ?3, 'test')",
+            rusqlite::params![tenant_b, &memo_b64, now_ms() as i64],
+        ).unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source) VALUES (?1, ?2, ?3, 'test')",
+            rusqlite::params![tenant_b, &pk_b64, now_ms() as i64],
+        ).unwrap();
+
+        // Project memo for tenant_b — should BLOCK (signer dep not valid for B)
+        let r_b = project_one(&conn, tenant_b, &memo_eid).unwrap();
+        match r_b {
+            ProjectionDecision::Block { missing } => {
+                assert_eq!(missing.len(), 1);
+                assert_eq!(missing[0], pk_eid);
+            }
+            other => panic!("expected Block for tenant_b, got {:?}", other),
+        }
+
+        // Verify: signed_memos has 1 row for A, 0 for B
+        let sm_a: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM signed_memos WHERE recorded_by = ?1",
+            rusqlite::params![tenant_a], |row| row.get(0),
+        ).unwrap();
+        let sm_b: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM signed_memos WHERE recorded_by = ?1",
+            rusqlite::params![tenant_b], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(sm_a, 1);
+        assert_eq!(sm_b, 0);
+    }
+
+    #[test]
+    fn test_rejection_recorded_durably() {
+        let conn = setup();
+        let recorded_by = "peer1";
+        let mut rng = rand::thread_rng();
+        let signing_key = SigningKey::generate(&mut rng);
+        let wrong_key = SigningKey::generate(&mut rng);
+        let public_key = signing_key.verifying_key().to_bytes();
+
+        // Create PeerKey with signing_key's public key
+        let (_pk, pk_blob) = make_peer_key(public_key);
+        let pk_eid = insert_event_raw(&conn, recorded_by, &pk_blob);
+        project_one(&conn, recorded_by, &pk_eid).unwrap();
+
+        // Sign memo with wrong key
+        let (_memo, memo_blob) = make_signed_memo(&wrong_key, &pk_eid, "bad sig");
+        let memo_eid = insert_event_raw(&conn, recorded_by, &memo_blob);
+
+        let result = project_one(&conn, recorded_by, &memo_eid).unwrap();
+        match result {
+            ProjectionDecision::Reject { ref reason } => {
+                assert!(reason.contains("invalid signature"), "reason: {}", reason);
+            }
+            other => panic!("expected Reject, got {:?}", other),
+        }
+
+        // Verify row exists in rejected_events
+        let memo_b64 = event_id_to_base64(&memo_eid);
+        let rej_reason: String = conn.query_row(
+            "SELECT reason FROM rejected_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &memo_b64],
+            |row| row.get(0),
+        ).unwrap();
+        assert!(rej_reason.contains("invalid signature"));
+    }
+
+    #[test]
+    fn test_rejected_event_not_retried() {
+        let conn = setup();
+        let recorded_by = "peer1";
+        let mut rng = rand::thread_rng();
+        let signing_key = SigningKey::generate(&mut rng);
+        let wrong_key = SigningKey::generate(&mut rng);
+        let public_key = signing_key.verifying_key().to_bytes();
+
+        // Create PeerKey, sign memo with wrong key
+        let (_pk, pk_blob) = make_peer_key(public_key);
+        let pk_eid = insert_event_raw(&conn, recorded_by, &pk_blob);
+        project_one(&conn, recorded_by, &pk_eid).unwrap();
+
+        let (_memo, memo_blob) = make_signed_memo(&wrong_key, &pk_eid, "bad sig again");
+        let memo_eid = insert_event_raw(&conn, recorded_by, &memo_blob);
+
+        // First call: Reject
+        let r1 = project_one(&conn, recorded_by, &memo_eid).unwrap();
+        assert!(matches!(r1, ProjectionDecision::Reject { .. }));
+
+        // Second call: AlreadyProcessed (not Reject again)
+        let r2 = project_one(&conn, recorded_by, &memo_eid).unwrap();
+        assert_eq!(r2, ProjectionDecision::AlreadyProcessed);
+    }
+
+    #[test]
+    fn test_two_tenant_contexts_single_db() {
+        let conn = setup();
+        let tenant_a = "tenant_a";
+        let tenant_b = "tenant_b";
+
+        // Each tenant creates a message
+        let (_msg_a, msg_a_blob) = make_message("hello from A");
+        let msg_a_eid = insert_event_raw(&conn, tenant_a, &msg_a_blob);
+        let (_msg_b, msg_b_blob) = make_message("hello from B");
+        let msg_b_eid = insert_event_raw(&conn, tenant_b, &msg_b_blob);
+
+        // Project each for their tenant
+        let r_a = project_one(&conn, tenant_a, &msg_a_eid).unwrap();
+        assert_eq!(r_a, ProjectionDecision::Valid);
+        let r_b = project_one(&conn, tenant_b, &msg_b_eid).unwrap();
+        assert_eq!(r_b, ProjectionDecision::Valid);
+
+        // Each sees only 1 message (isolated)
+        let count_a: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
+            rusqlite::params![tenant_a], |row| row.get(0),
+        ).unwrap();
+        let count_b: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
+            rusqlite::params![tenant_b], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count_a, 1);
+        assert_eq!(count_b, 1);
+
+        // Tenant B reacts to tenant A's message — blocks (dep not valid for B)
+        let (_rxn, rxn_blob) = make_reaction(&msg_a_eid, "\u{1f44d}");
+        let rxn_eid = insert_event_raw(&conn, tenant_b, &rxn_blob);
+        let r_rxn = project_one(&conn, tenant_b, &rxn_eid).unwrap();
+        assert!(matches!(r_rxn, ProjectionDecision::Block { .. }));
+
+        // Now record and project tenant_a's message for tenant_b
+        let msg_a_b64 = event_id_to_base64(&msg_a_eid);
+        conn.execute(
+            "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source) VALUES (?1, ?2, ?3, 'test')",
+            rusqlite::params![tenant_b, &msg_a_b64, now_ms() as i64],
+        ).unwrap();
+        let r_msg_for_b = project_one(&conn, tenant_b, &msg_a_eid).unwrap();
+        assert_eq!(r_msg_for_b, ProjectionDecision::Valid);
+
+        // Cascade should have unblocked the reaction for tenant_b
+        let rxn_b64 = event_id_to_base64(&rxn_eid);
+        let rxn_valid: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![tenant_b, &rxn_b64],
+            |row| row.get(0),
+        ).unwrap();
+        assert!(rxn_valid, "reaction should be auto-projected after dep arrives for tenant_b");
+
+        // Tenant B now has 2 messages + 1 reaction
+        let count_b_msgs: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
+            rusqlite::params![tenant_b], |row| row.get(0),
+        ).unwrap();
+        let count_b_rxns: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM reactions WHERE recorded_by = ?1",
+            rusqlite::params![tenant_b], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count_b_msgs, 2);
+        assert_eq!(count_b_rxns, 1);
     }
 }

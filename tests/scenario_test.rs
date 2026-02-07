@@ -799,3 +799,57 @@ async fn test_invalid_signature_rejected_after_sync() {
     assert_eq!(bob.peer_key_count(), 1);
     assert_eq!(bob.signed_memo_count(), 0, "bad-signature memo should be rejected, not projected");
 }
+
+/// Integration test: verify valid_events are tenant-scoped after sync.
+/// Alice creates message + reaction, syncs to Bob. Both converge to 2 events.
+/// valid_events are per-tenant, and projection invariants hold.
+#[tokio::test]
+async fn test_cross_tenant_dep_scoping_after_sync() {
+    let channel = test_channel();
+    let alice = Peer::new("alice", channel);
+    let bob = Peer::new("bob", channel);
+
+    // Alice creates a message and a reaction targeting it
+    let msg_id = alice.create_message("Cross-tenant scoping test");
+    alice.create_reaction(&msg_id, "\u{2705}");
+
+    assert_eq!(alice.store_count(), 2);
+    assert_eq!(alice.message_count(), 1);
+    assert_eq!(alice.reaction_count(), 1);
+
+    // Sync to Bob
+    let sync = start_peers(&alice, &bob);
+
+    assert_eventually(
+        || alice.store_count() == 2 && bob.store_count() == 2,
+        Duration::from_secs(15),
+        "both peers should have 2 events (message + reaction)",
+    ).await;
+
+    drop(sync);
+
+    // Both have projected correctly
+    assert_eq!(bob.message_count(), 1);
+    assert_eq!(bob.reaction_count(), 1);
+
+    // Verify valid_events are tenant-scoped: each peer has its own valid_events rows
+    let alice_db = open_connection(&alice.db_path).expect("open alice db");
+    let bob_db = open_connection(&bob.db_path).expect("open bob db");
+
+    let alice_valid: i64 = alice_db.query_row(
+        "SELECT COUNT(*) FROM valid_events WHERE peer_id = ?1",
+        rusqlite::params![&alice.identity],
+        |row| row.get(0),
+    ).unwrap();
+    let bob_valid: i64 = bob_db.query_row(
+        "SELECT COUNT(*) FROM valid_events WHERE peer_id = ?1",
+        rusqlite::params![&bob.identity],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(alice_valid, 2, "Alice should have 2 valid_events");
+    assert_eq!(bob_valid, 2, "Bob should have 2 valid_events");
+
+    // Run projection invariants for both
+    verify_projection_invariants(&alice);
+    verify_projection_invariants(&bob);
+}

@@ -121,50 +121,71 @@ pub fn batch_writer(
         if db.execute("BEGIN", []).is_ok() {
             // First pass: write blob storage, neg_items, recorded_events
             let mut event_ids_to_project: Vec<EventId> = Vec::with_capacity(batch.len());
+            let mut event_ids_to_remove: Vec<EventId> = Vec::with_capacity(batch.len());
             for (event_id, blob) in &batch {
-                let _ = wanted.remove(event_id);
+                event_ids_to_remove.push(*event_id);
 
                 let event_id_b64 = event_id_to_base64(event_id);
 
                 if let Some(created_at_ms) = events::extract_created_at_ms(blob) {
-                    let _ = neg_items_stmt.execute(rusqlite::params![
+                    if let Err(e) = neg_items_stmt.execute(rusqlite::params![
                         created_at_ms as i64,
                         event_id.as_slice()
-                    ]);
+                    ]) {
+                        warn!("neg_items insert error for {}: {}", event_id_b64, e);
+                        continue;
+                    }
 
                     if let Some(type_code) = events::extract_event_type(blob) {
                         if let Some(meta) = reg.lookup(type_code) {
-                            let _ = events_stmt.execute(rusqlite::params![
+                            if let Err(e) = events_stmt.execute(rusqlite::params![
                                 &event_id_b64,
                                 meta.type_name,
                                 blob.as_slice(),
                                 meta.share_scope.as_str(),
                                 created_at_ms as i64,
                                 current_timestamp_ms()
-                            ]);
+                            ]) {
+                                warn!("events insert error for {}: {}", event_id_b64, e);
+                                continue;
+                            }
 
                             let recorded_at = SystemTime::now()
                                 .duration_since(UNIX_EPOCH)
                                 .unwrap()
                                 .as_millis() as i64;
-                            let _ = recorded_stmt.execute(rusqlite::params![
+                            if let Err(e) = recorded_stmt.execute(rusqlite::params![
                                 &recorded_by,
                                 &event_id_b64,
                                 recorded_at,
                                 "quic_recv"
-                            ]);
+                            ]) {
+                                warn!("recorded_events insert error for {}: {}", event_id_b64, e);
+                                continue;
+                            }
 
                             event_ids_to_project.push(*event_id);
                         }
                     }
                 }
             }
-            let _ = db.execute("COMMIT", []);
+            match db.execute("COMMIT", []) {
+                Ok(_) => {
+                    // Remove from wanted only after durable commit
+                    for event_id in &event_ids_to_remove {
+                        let _ = wanted.remove(event_id);
+                    }
 
-            // Second pass: project each event (handles deps + cascade)
-            for event_id in &event_ids_to_project {
-                if let Err(e) = project_one(&db, &recorded_by, event_id) {
-                    warn!("projection error for {}: {}", event_id_to_base64(event_id), e);
+                    // Second pass: project each event (handles deps + cascade)
+                    for event_id in &event_ids_to_project {
+                        if let Err(e) = project_one(&db, &recorded_by, event_id) {
+                            warn!("projection error for {}: {}", event_id_to_base64(event_id), e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("COMMIT failed: {}", e);
+                    continue; // retry in next batch
                 }
             }
         }
