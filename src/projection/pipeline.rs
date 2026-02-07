@@ -5,7 +5,7 @@ use crate::crypto::{event_id_to_base64, event_id_from_base64, EventId};
 use crate::events::{self, ParsedEvent, registry};
 use super::decision::ProjectionDecision;
 use super::projectors::{project_message, project_reaction, project_peer_key, project_signed_memo};
-use super::signer::{resolve_signer_key, verify_ed25519_signature};
+use super::signer::{resolve_signer_key, verify_ed25519_signature, SignerResolution};
 
 /// Record a rejected event durably so it is not re-processed on replay or cascade.
 fn record_rejection(conn: &Connection, recorded_by: &str, event_id_b64: &str, reason: &str) {
@@ -36,14 +36,19 @@ fn apply_projection(
     if meta.signer_required {
         let (signer_event_id, signer_type) = parsed.signer_fields()
             .ok_or("signer_required but no signer_fields")?;
-        let pubkey = resolve_signer_key(conn, signer_type, &signer_event_id)?;
-        match pubkey {
-            None => {
+        let resolution = resolve_signer_key(conn, recorded_by, signer_type, &signer_event_id)?;
+        match resolution {
+            SignerResolution::NotFound => {
                 return Ok(ProjectionDecision::Reject {
                     reason: "signer key not found".to_string(),
                 });
             }
-            Some(key) => {
+            SignerResolution::Invalid(msg) => {
+                return Ok(ProjectionDecision::Reject {
+                    reason: format!("signer resolution failed: {}", msg),
+                });
+            }
+            SignerResolution::Found(key) => {
                 let sig_len = meta.signature_byte_len;
                 if blob.len() < sig_len {
                     return Ok(ProjectionDecision::Reject {
@@ -1016,5 +1021,74 @@ mod tests {
         ).unwrap();
         assert_eq!(count_b_msgs, 2);
         assert_eq!(count_b_rxns, 1);
+    }
+
+    #[test]
+    fn test_unsupported_signer_type_rejects() {
+        let conn = setup();
+        let recorded_by = "peer1";
+        let mut rng = rand::thread_rng();
+        let signing_key = SigningKey::generate(&mut rng);
+        let public_key = signing_key.verifying_key().to_bytes();
+
+        // Create and project the PeerKey so the dep is satisfied
+        let (_pk, pk_blob) = make_peer_key(public_key);
+        let pk_eid = insert_event_raw(&conn, recorded_by, &pk_blob);
+        project_one(&conn, recorded_by, &pk_eid).unwrap();
+
+        // Create a signed memo but mutate signer_type byte to 255
+        let (_memo, mut memo_blob) = make_signed_memo(&signing_key, &pk_eid, "bad signer type");
+        // signer_type is at byte offset 41 in the wire format
+        memo_blob[41] = 255;
+        // Re-hash since blob changed
+        let memo_eid = insert_event_raw(&conn, recorded_by, &memo_blob);
+
+        let result = project_one(&conn, recorded_by, &memo_eid).unwrap();
+        match result {
+            ProjectionDecision::Reject { reason } => {
+                assert!(reason.contains("unsupported signer_type"), "reason: {}", reason);
+            }
+            other => panic!("expected Reject, got {:?}", other),
+        }
+
+        // Verify rejected_events row exists
+        let memo_b64 = event_id_to_base64(&memo_eid);
+        let rej_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM rejected_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &memo_b64],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(rej_count, 1);
+    }
+
+    #[test]
+    fn test_rejected_events_recorded_for_invalid_sig() {
+        let conn = setup();
+        let recorded_by = "peer1";
+        let mut rng = rand::thread_rng();
+        let signing_key = SigningKey::generate(&mut rng);
+        let wrong_key = SigningKey::generate(&mut rng);
+        let public_key = signing_key.verifying_key().to_bytes();
+
+        // Create PeerKey with signing_key's public key
+        let (_pk, pk_blob) = make_peer_key(public_key);
+        let pk_eid = insert_event_raw(&conn, recorded_by, &pk_blob);
+        project_one(&conn, recorded_by, &pk_eid).unwrap();
+
+        // Sign the memo with the WRONG key
+        let (_memo, memo_blob) = make_signed_memo(&wrong_key, &pk_eid, "bad sig memo");
+        let memo_eid = insert_event_raw(&conn, recorded_by, &memo_blob);
+
+        let result = project_one(&conn, recorded_by, &memo_eid).unwrap();
+        assert!(matches!(result, ProjectionDecision::Reject { .. }));
+
+        // Verify rejected_events row exists with correct reason
+        let memo_b64 = event_id_to_base64(&memo_eid);
+        let rej_reason: String = conn.query_row(
+            "SELECT reason FROM rejected_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &memo_b64],
+            |row| row.get(0),
+        ).unwrap();
+        assert!(rej_reason.contains("invalid signature"), "reason: {}", rej_reason);
     }
 }
