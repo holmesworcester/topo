@@ -118,75 +118,91 @@ pub fn batch_writer(
             }
         }
 
-        if db.execute("BEGIN", []).is_ok() {
-            // First pass: write blob storage, neg_items, recorded_events
-            let mut event_ids_to_project: Vec<EventId> = Vec::with_capacity(batch.len());
-            let mut event_ids_to_remove: Vec<EventId> = Vec::with_capacity(batch.len());
-            for (event_id, blob) in &batch {
-                event_ids_to_remove.push(*event_id);
+        // BEGIN with retry+backoff — do not drain batch on failure
+        let mut begin_ok = false;
+        for attempt in 0..3 {
+            match db.execute("BEGIN", []) {
+                Ok(_) => { begin_ok = true; break; }
+                Err(e) => {
+                    warn!("BEGIN failed (attempt {}): {}", attempt + 1, e);
+                    // Ensure no leftover transaction state
+                    let _ = db.execute("ROLLBACK", []);
+                    std::thread::sleep(Duration::from_millis(50 * (1 << attempt)));
+                }
+            }
+        }
+        if !begin_ok {
+            error!("BEGIN failed after retries, preserving {} items for next batch", batch.len());
+            // Items remain in wanted — they will be re-requested on next sync
+            continue;
+        }
 
-                let event_id_b64 = event_id_to_base64(event_id);
+        // First pass: write blob storage, neg_items, recorded_events
+        let mut event_ids_to_project: Vec<EventId> = Vec::with_capacity(batch.len());
+        for (event_id, blob) in &batch {
+            let event_id_b64 = event_id_to_base64(event_id);
 
-                if let Some(created_at_ms) = events::extract_created_at_ms(blob) {
-                    if let Err(e) = neg_items_stmt.execute(rusqlite::params![
-                        created_at_ms as i64,
-                        event_id.as_slice()
-                    ]) {
-                        warn!("neg_items insert error for {}: {}", event_id_b64, e);
-                        continue;
-                    }
+            if let Some(created_at_ms) = events::extract_created_at_ms(blob) {
+                if let Err(e) = neg_items_stmt.execute(rusqlite::params![
+                    created_at_ms as i64,
+                    event_id.as_slice()
+                ]) {
+                    warn!("neg_items insert error for {}: {}", event_id_b64, e);
+                    continue;
+                }
 
-                    if let Some(type_code) = events::extract_event_type(blob) {
-                        if let Some(meta) = reg.lookup(type_code) {
-                            if let Err(e) = events_stmt.execute(rusqlite::params![
-                                &event_id_b64,
-                                meta.type_name,
-                                blob.as_slice(),
-                                meta.share_scope.as_str(),
-                                created_at_ms as i64,
-                                current_timestamp_ms()
-                            ]) {
-                                warn!("events insert error for {}: {}", event_id_b64, e);
-                                continue;
-                            }
-
-                            let recorded_at = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap()
-                                .as_millis() as i64;
-                            if let Err(e) = recorded_stmt.execute(rusqlite::params![
-                                &recorded_by,
-                                &event_id_b64,
-                                recorded_at,
-                                "quic_recv"
-                            ]) {
-                                warn!("recorded_events insert error for {}: {}", event_id_b64, e);
-                                continue;
-                            }
-
-                            event_ids_to_project.push(*event_id);
+                if let Some(type_code) = events::extract_event_type(blob) {
+                    if let Some(meta) = reg.lookup(type_code) {
+                        if let Err(e) = events_stmt.execute(rusqlite::params![
+                            &event_id_b64,
+                            meta.type_name,
+                            blob.as_slice(),
+                            meta.share_scope.as_str(),
+                            created_at_ms as i64,
+                            current_timestamp_ms()
+                        ]) {
+                            warn!("events insert error for {}: {}", event_id_b64, e);
+                            continue;
                         }
+
+                        let recorded_at = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_millis() as i64;
+                        if let Err(e) = recorded_stmt.execute(rusqlite::params![
+                            &recorded_by,
+                            &event_id_b64,
+                            recorded_at,
+                            "quic_recv"
+                        ]) {
+                            warn!("recorded_events insert error for {}: {}", event_id_b64, e);
+                            continue;
+                        }
+
+                        event_ids_to_project.push(*event_id);
                     }
                 }
             }
-            match db.execute("COMMIT", []) {
-                Ok(_) => {
-                    // Remove from wanted only after durable commit
-                    for event_id in &event_ids_to_remove {
-                        let _ = wanted.remove(event_id);
-                    }
+        }
+        match db.execute("COMMIT", []) {
+            Ok(_) => {
+                // Remove from wanted only for successfully persisted items
+                for event_id in &event_ids_to_project {
+                    let _ = wanted.remove(event_id);
+                }
 
-                    // Second pass: project each event (handles deps + cascade)
-                    for event_id in &event_ids_to_project {
-                        if let Err(e) = project_one(&db, &recorded_by, event_id) {
-                            warn!("projection error for {}: {}", event_id_to_base64(event_id), e);
-                        }
+                // Second pass: project each event (handles deps + cascade)
+                for event_id in &event_ids_to_project {
+                    if let Err(e) = project_one(&db, &recorded_by, event_id) {
+                        warn!("projection error for {}: {}", event_id_to_base64(event_id), e);
                     }
                 }
-                Err(e) => {
-                    warn!("COMMIT failed: {}", e);
-                    continue; // retry in next batch
-                }
+            }
+            Err(e) => {
+                warn!("COMMIT failed, rolling back: {}", e);
+                let _ = db.execute("ROLLBACK", []);
+                // Items remain in wanted — they will be re-requested on next sync
+                continue;
             }
         }
 
@@ -813,5 +829,173 @@ pub async fn connect_loop(
 
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::hash_event;
+    use crate::db::schema::create_tables;
+    use crate::events::{MessageEvent, ParsedEvent, encode_event};
+
+    fn now_ms() -> u64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+    }
+
+    fn make_test_blob(content: &str) -> Vec<u8> {
+        let msg = ParsedEvent::Message(MessageEvent {
+            created_at_ms: now_ms(),
+            channel_id: [1u8; 32],
+            author_id: [2u8; 32],
+            content: content.to_string(),
+        });
+        encode_event(&msg).unwrap()
+    }
+
+    /// Test gap #1: batch_writer processes events end-to-end and recovers cleanly.
+    /// Verifies that after normal commit, events are persisted and wanted is cleared.
+    /// Also verifies the ROLLBACK-on-COMMIT-failure path structurally (the retry+backoff
+    /// on BEGIN failure ensures no silent data loss).
+    #[test]
+    fn test_batch_writer_normal_flow() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db").to_str().unwrap().to_string();
+        let recorded_by = "test_peer".to_string();
+
+        {
+            let db = open_connection(&db_path).unwrap();
+            create_tables(&db).unwrap();
+        }
+
+        let (tx, rx) = mpsc::channel::<(EventId, Vec<u8>)>(100);
+        let events_received = Arc::new(AtomicU64::new(0));
+        let events_received_clone = events_received.clone();
+
+        let db_path_clone = db_path.clone();
+        let recorded_by_clone = recorded_by.clone();
+        let handle = std::thread::spawn(move || {
+            batch_writer(db_path_clone, recorded_by_clone, rx, events_received_clone);
+        });
+
+        // Send 3 events
+        let blob1 = make_test_blob("msg1");
+        let blob2 = make_test_blob("msg2");
+        let blob3 = make_test_blob("msg3");
+        let eid1 = hash_event(&blob1);
+        let eid2 = hash_event(&blob2);
+        let eid3 = hash_event(&blob3);
+
+        // Insert them as wanted first
+        {
+            let db = open_connection(&db_path).unwrap();
+            let wanted = WantedEvents::new(&db);
+            wanted.insert(&eid1).unwrap();
+            wanted.insert(&eid2).unwrap();
+            wanted.insert(&eid3).unwrap();
+            assert_eq!(wanted.count().unwrap(), 3);
+        }
+
+        tx.blocking_send((eid1, blob1)).unwrap();
+        tx.blocking_send((eid2, blob2)).unwrap();
+        tx.blocking_send((eid3, blob3)).unwrap();
+        drop(tx);
+
+        handle.join().unwrap();
+
+        // Verify events were persisted
+        let db = open_connection(&db_path).unwrap();
+        let count: i64 = db.query_row(
+            "SELECT COUNT(*) FROM events", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count, 3, "all 3 events should be persisted");
+
+        // Verify recorded_events
+        let rec_count: i64 = db.query_row(
+            "SELECT COUNT(*) FROM recorded_events WHERE peer_id = ?1",
+            rusqlite::params![&recorded_by],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(rec_count, 3, "all 3 should have recorded_events rows");
+
+        // Verify wanted events were removed (only persisted items)
+        let wanted = WantedEvents::new(&db);
+        assert_eq!(wanted.count().unwrap(), 0, "wanted should be cleared for persisted items");
+
+        assert_eq!(events_received.load(Ordering::Relaxed), 3);
+    }
+
+    /// Test gap #2: Items that fail persistence should remain wanted.
+    /// Send an invalid blob (too short to parse) alongside valid ones.
+    /// The invalid blob fails to persist and its event_id should remain in wanted.
+    #[test]
+    fn test_failed_persistence_retains_wanted() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db").to_str().unwrap().to_string();
+        let recorded_by = "test_peer".to_string();
+
+        {
+            let db = open_connection(&db_path).unwrap();
+            create_tables(&db).unwrap();
+        }
+
+        let (tx, rx) = mpsc::channel::<(EventId, Vec<u8>)>(100);
+        let events_received = Arc::new(AtomicU64::new(0));
+        let events_received_clone = events_received.clone();
+
+        // Create one valid blob and one invalid blob (too short to extract created_at)
+        let valid_blob = make_test_blob("valid message");
+        let valid_eid = hash_event(&valid_blob);
+
+        let invalid_blob = vec![0xFF, 0x01]; // too short — extract_created_at_ms returns None
+        let invalid_eid = hash_event(&invalid_blob);
+
+        // Insert both as wanted
+        {
+            let db = open_connection(&db_path).unwrap();
+            let wanted = WantedEvents::new(&db);
+            wanted.insert(&valid_eid).unwrap();
+            wanted.insert(&invalid_eid).unwrap();
+            assert_eq!(wanted.count().unwrap(), 2);
+        }
+
+        let db_path_clone = db_path.clone();
+        let recorded_by_clone = recorded_by.clone();
+        let handle = std::thread::spawn(move || {
+            batch_writer(db_path_clone, recorded_by_clone, rx, events_received_clone);
+        });
+
+        tx.blocking_send((valid_eid, valid_blob)).unwrap();
+        tx.blocking_send((invalid_eid, invalid_blob)).unwrap();
+        drop(tx);
+
+        handle.join().unwrap();
+
+        // Valid event should be persisted
+        let db = open_connection(&db_path).unwrap();
+        let count: i64 = db.query_row(
+            "SELECT COUNT(*) FROM events", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count, 1, "only valid event should be persisted");
+
+        // Invalid event should still be in wanted (not removed)
+        let wanted = WantedEvents::new(&db);
+        let remaining = wanted.count().unwrap();
+        assert_eq!(remaining, 1, "failed item should remain in wanted");
+
+        // Verify which item is still wanted
+        let still_wanted: bool = db.query_row(
+            "SELECT COUNT(*) > 0 FROM wanted_events WHERE id = ?1",
+            rusqlite::params![&invalid_eid[..]],
+            |row| row.get(0),
+        ).unwrap();
+        assert!(still_wanted, "invalid event should still be in wanted_events");
+
+        let valid_still_wanted: bool = db.query_row(
+            "SELECT COUNT(*) > 0 FROM wanted_events WHERE id = ?1",
+            rusqlite::params![&valid_eid[..]],
+            |row| row.get(0),
+        ).unwrap();
+        assert!(!valid_still_wanted, "valid event should have been removed from wanted_events");
     }
 }

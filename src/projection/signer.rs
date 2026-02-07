@@ -3,14 +3,40 @@ use rusqlite::Connection;
 use crate::crypto::event_id_to_base64;
 use crate::events::{self, ParsedEvent};
 
+/// Distinguishes content errors (malformed/unsupported signer data, terminal reject)
+/// from infrastructure errors (DB failures, retriable).
+#[derive(Debug)]
+pub enum SignerError {
+    /// Content error: unsupported signer type, wrong event kind, parse failure.
+    /// Should map to ProjectionDecision::Reject.
+    ContentError(String),
+    /// Infrastructure error: DB failure, etc. Should propagate as hard Err.
+    InfraError(Box<dyn std::error::Error>),
+}
+
+impl std::fmt::Display for SignerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SignerError::ContentError(msg) => write!(f, "signer content error: {}", msg),
+            SignerError::InfraError(e) => write!(f, "signer infra error: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for SignerError {}
+
 /// Resolve the public key for a signer event.
 /// For signer_type=0 (peer), loads the event blob, parses as PeerKeyEvent,
 /// and returns the public key. Returns None if the event is not found.
+///
+/// Returns `SignerError::ContentError` for unsupported signer types or
+/// malformed signer events (should map to Reject).
+/// Returns `SignerError::InfraError` for DB failures (should propagate as Err).
 pub fn resolve_signer_key(
     conn: &Connection,
     signer_type: u8,
     signer_event_id: &[u8; 32],
-) -> Result<Option<[u8; 32]>, Box<dyn std::error::Error>> {
+) -> Result<Option<[u8; 32]>, SignerError> {
     match signer_type {
         0 => {
             // Peer signer: load from events table
@@ -22,19 +48,26 @@ pub fn resolve_signer_key(
             ) {
                 Ok(b) => b,
                 Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
-                Err(e) => return Err(e.into()),
+                Err(e) => return Err(SignerError::InfraError(e.into())),
             };
 
-            let parsed = events::parse_event(&blob)?;
+            let parsed = match events::parse_event(&blob) {
+                Ok(p) => p,
+                Err(e) => return Err(SignerError::ContentError(
+                    format!("signer event parse error: {}", e)
+                )),
+            };
             match parsed {
                 ParsedEvent::PeerKey(pk) => Ok(Some(pk.public_key)),
-                other => Err(format!(
+                other => Err(SignerError::ContentError(format!(
                     "signer event is not a PeerKeyEvent, got type_code={}",
                     other.event_type_code()
-                ).into()),
+                ))),
             }
         }
-        _ => Err(format!("unsupported signer_type: {}", signer_type).into()),
+        _ => Err(SignerError::ContentError(
+            format!("unsupported signer_type: {}", signer_type)
+        )),
     }
 }
 
@@ -172,7 +205,11 @@ mod tests {
 
         let result = resolve_signer_key(&conn, 0, &event_id);
         assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("not a PeerKeyEvent"));
+        match result.unwrap_err() {
+            SignerError::ContentError(msg) => {
+                assert!(msg.contains("not a PeerKeyEvent"), "msg: {}", msg);
+            }
+            other => panic!("expected ContentError, got: {}", other),
+        }
     }
 }

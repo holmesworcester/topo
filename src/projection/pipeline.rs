@@ -5,7 +5,7 @@ use crate::crypto::{event_id_to_base64, event_id_from_base64, EventId};
 use crate::events::{self, ParsedEvent, registry};
 use super::decision::ProjectionDecision;
 use super::projectors::{project_message, project_reaction, project_peer_key, project_signed_memo};
-use super::signer::{resolve_signer_key, verify_ed25519_signature};
+use super::signer::{resolve_signer_key, verify_ed25519_signature, SignerError};
 
 /// Record a rejected event durably so it is not re-processed on replay or cascade.
 fn record_rejection(conn: &Connection, recorded_by: &str, event_id_b64: &str, reason: &str) {
@@ -36,7 +36,15 @@ fn apply_projection(
     if meta.signer_required {
         let (signer_event_id, signer_type) = parsed.signer_fields()
             .ok_or("signer_required but no signer_fields")?;
-        let pubkey = resolve_signer_key(conn, signer_type, &signer_event_id)?;
+        let pubkey = match resolve_signer_key(conn, signer_type, &signer_event_id) {
+            Ok(key) => key,
+            Err(SignerError::ContentError(msg)) => {
+                return Ok(ProjectionDecision::Reject { reason: msg });
+            }
+            Err(SignerError::InfraError(e)) => {
+                return Err(e);
+            }
+        };
         match pubkey {
             None => {
                 return Ok(ProjectionDecision::Reject {
@@ -947,6 +955,103 @@ mod tests {
         assert!(matches!(r1, ProjectionDecision::Reject { .. }));
 
         // Second call: AlreadyProcessed (not Reject again)
+        let r2 = project_one(&conn, recorded_by, &memo_eid).unwrap();
+        assert_eq!(r2, ProjectionDecision::AlreadyProcessed);
+    }
+
+    /// Test gap #3: Invalid signer-type produces terminal Reject + durable rejected_events
+    /// row, not a repeated hard Err.
+    #[test]
+    fn test_unsupported_signer_type_rejects_terminally() {
+        let conn = setup();
+        let recorded_by = "peer1";
+        let mut rng = rand::thread_rng();
+        let signing_key = SigningKey::generate(&mut rng);
+        let public_key = signing_key.verifying_key().to_bytes();
+
+        // Create PeerKey so the signer event exists
+        let (_pk, pk_blob) = make_peer_key(public_key);
+        let pk_eid = insert_event_raw(&conn, recorded_by, &pk_blob);
+        project_one(&conn, recorded_by, &pk_eid).unwrap();
+
+        // Create a signed memo with signer_type=99 (unsupported)
+        let memo = events::SignedMemoEvent {
+            created_at_ms: now_ms(),
+            signed_by: pk_eid,
+            signer_type: 99, // unsupported
+            content: "unsupported signer type".to_string(),
+            signature: [0u8; 64],
+        };
+        let event = ParsedEvent::SignedMemo(memo);
+        let blob = events::encode_event(&event).unwrap();
+        let memo_eid = insert_event_raw(&conn, recorded_by, &blob);
+
+        // First call: should Reject (not Err)
+        let r1 = project_one(&conn, recorded_by, &memo_eid).unwrap();
+        match &r1 {
+            ProjectionDecision::Reject { reason } => {
+                assert!(reason.contains("unsupported signer_type"), "reason: {}", reason);
+            }
+            other => panic!("expected Reject for unsupported signer_type, got {:?}", other),
+        }
+
+        // Verify durable rejected_events row
+        let memo_b64 = event_id_to_base64(&memo_eid);
+        let rej_reason: String = conn.query_row(
+            "SELECT reason FROM rejected_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &memo_b64],
+            |row| row.get(0),
+        ).unwrap();
+        assert!(rej_reason.contains("unsupported signer_type"));
+
+        // Second call: AlreadyProcessed (not Err, not Reject again)
+        let r2 = project_one(&conn, recorded_by, &memo_eid).unwrap();
+        assert_eq!(r2, ProjectionDecision::AlreadyProcessed);
+    }
+
+    /// Test gap #3b: Signer event that parses as wrong type (e.g. Message instead of PeerKey)
+    /// produces terminal Reject, not hard Err.
+    #[test]
+    fn test_wrong_signer_event_kind_rejects_terminally() {
+        let conn = setup();
+        let recorded_by = "peer1";
+
+        // Create a Message event (not a PeerKey)
+        let (_msg, msg_blob) = make_message("I am not a key");
+        let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
+        project_one(&conn, recorded_by, &msg_eid).unwrap();
+
+        // Create a signed memo that references the Message as its signer
+        let memo = events::SignedMemoEvent {
+            created_at_ms: now_ms(),
+            signed_by: msg_eid,
+            signer_type: 0,
+            content: "wrong signer kind".to_string(),
+            signature: [0u8; 64],
+        };
+        let event = ParsedEvent::SignedMemo(memo);
+        let blob = events::encode_event(&event).unwrap();
+        let memo_eid = insert_event_raw(&conn, recorded_by, &blob);
+
+        // Should Reject (not Err)
+        let r1 = project_one(&conn, recorded_by, &memo_eid).unwrap();
+        match &r1 {
+            ProjectionDecision::Reject { reason } => {
+                assert!(reason.contains("not a PeerKeyEvent"), "reason: {}", reason);
+            }
+            other => panic!("expected Reject for wrong signer event kind, got {:?}", other),
+        }
+
+        // Verify durable rejected_events row
+        let memo_b64 = event_id_to_base64(&memo_eid);
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM rejected_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &memo_b64],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count, 1, "should have durable rejected_events row");
+
+        // Second call: AlreadyProcessed
         let r2 = project_one(&conn, recorded_by, &memo_eid).unwrap();
         assert_eq!(r2, ProjectionDecision::AlreadyProcessed);
     }
