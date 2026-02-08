@@ -1,0 +1,149 @@
+# Projector Spec — TLA+ to Rust Mapping (Frozen)
+
+Changes to this document require TLA+ model re-verification.
+
+## Event Type Registry
+
+| Code | Rust Type | TLA+ Name | Wire Size | Share Scope | Signer Required | Sig Len | Signer Type |
+|------|-----------|-----------|-----------|-------------|-----------------|---------|-------------|
+| 1 | Message | Message | variable | Shared | No | 0 | — |
+| 2 | Reaction | MessageReaction | variable | Shared | No | 0 | — |
+| 3 | PeerKey | Peer | 41B | Shared | No | 0 | — |
+| 4 | SignedMemo | — | variable | Shared | Yes | 64 | 0 (peer) |
+| 5 | Encrypted | Encrypted | variable | Local | No | 0 | — |
+| 6 | SecretKey | SecretKey | 41B | Local | No | 0 | — |
+| 7 | MessageDeletion | MessageDeletion | 73B | Shared | No | 0 | — |
+| 8 | Network | Network | 73B | Shared | No | 0 | — |
+| 9 | InviteAccepted | InviteAccepted | 73B | Local | No | 0 | — |
+| 10 | UserInviteBoot | UserInviteBoot | 170B | Shared | Yes | 64 | 1 (network) |
+| 11 | UserInviteOngoing | UserInviteOngoing | 170B | Shared | Yes | 64 | 5 (peer_shared) |
+| 12 | DeviceInviteFirst | DeviceInviteFirst | 138B | Shared | Yes | 64 | 4 (user) |
+| 13 | DeviceInviteOngoing | DeviceInviteOngoing | 138B | Shared | Yes | 64 | 5 (peer_shared) |
+| 14 | UserBoot | UserBoot | 138B | Shared | Yes | 64 | 2 (user_invite) |
+| 15 | UserOngoing | UserOngoing | 138B | Shared | Yes | 64 | 2 (user_invite) |
+| 16 | PeerSharedFirst | PeerSharedFirst | 138B | Shared | Yes | 64 | 3 (device_invite) |
+| 17 | PeerSharedOngoing | PeerSharedOngoing | 138B | Shared | Yes | 64 | 3 (device_invite) |
+| 18 | AdminBoot | AdminBoot | 170B | Shared | Yes | 64 | 1 (network) |
+| 19 | AdminOngoing | AdminOngoing | 170B | Shared | Yes | 64 | 5 (peer_shared) |
+| 20 | UserRemoved | UserRemoved | 138B | Shared | Yes | 64 | 5 (peer_shared) |
+| 21 | PeerRemoved | PeerRemoved | 138B | Shared | Yes | 64 | 5 (peer_shared) |
+| 22 | SecretShared | SecretShared | 202B | Shared | Yes | 64 | 5 (peer_shared) |
+
+## Signer Type Resolution
+
+| signer_type | Resolves From | Valid Event Type Codes | Key Extraction |
+|-------------|--------------|------------------------|----------------|
+| 0 | PeerKey | 3 | public_key at [9..41] |
+| 1 | Network | 8 | public_key at [9..41] |
+| 2 | UserInvite (Boot/Ongoing) | 10, 11 | public_key at [9..41] |
+| 3 | DeviceInvite (First/Ongoing) | 12, 13 | public_key at [9..41] |
+| 4 | User (Boot/Ongoing) | 14, 15 | public_key at [9..41] |
+| 5 | PeerShared (First/Ongoing) | 16, 17 | public_key at [9..41] |
+
+## Dependencies (TLA+ RawDeps → Rust dep_field_values)
+
+| Code | TLA+ RawDeps | Rust dep_fields |
+|------|-------------|-----------------|
+| 1 | — | [] |
+| 2 | {target_event_id} | [target_event_id] |
+| 3 | {} | [] |
+| 4 | {signed_by} | [signed_by] |
+| 5 | {key_event_id} | [key_event_id] |
+| 6 | {} | [] |
+| 7 | {target_event_id} | [target_event_id] |
+| 8 | {} | [] |
+| 9 | {} | [] |
+| 10 | {signed_by} | [signed_by] (network_id is reference, not dep) |
+| 11 | {admin_event_id, signed_by} | [admin_event_id, signed_by] |
+| 12 | {signed_by} | [signed_by] |
+| 13 | {signed_by} | [signed_by] |
+| 14 | {signed_by} | [signed_by] |
+| 15 | {signed_by} | [signed_by] |
+| 16 | {signed_by} | [signed_by] |
+| 17 | {signed_by} | [signed_by] |
+| 18 | {user_event_id, signed_by} | [user_event_id, signed_by] |
+| 19 | {admin_boot_event_id, signed_by} | [admin_boot_event_id, signed_by] |
+| 20 | {target_event_id, signed_by} | [target_event_id, signed_by] |
+| 21 | {target_event_id, signed_by} | [target_event_id, signed_by] |
+| 22 | {key_event_id, recipient_event_id, signed_by} | [key_event_id, recipient_event_id, signed_by] |
+
+## Guards (TLA+ Guard → Rust pipeline check)
+
+| Guard | TLA+ Definition | Rust Check | Applies To |
+|-------|----------------|------------|------------|
+| TrustAnchorMatch | trustAnchor[p] = NetId(e) | trust_anchors.network_id = event.network_id; Block if no anchor | type 8 (Network) |
+| HasRecordedInvite | ∃ ie ∈ {10,11,12,13}: ie ∈ recorded[p] | recorded_events has invite type for peer; Block if none | type 9 (InviteAccepted) |
+
+## Projection Tables
+
+| Code | Projector Function | Projection Table | Special Logic |
+|------|-------------------|------------------|---------------|
+| 1 | project_message | messages | — |
+| 2 | project_reaction | reactions | skip if target deleted |
+| 3 | project_peer_key | peer_keys | — |
+| 4 | project_signed_memo | signed_memos | — |
+| 5 | project_encrypted | (dispatches inner) | decrypt + inner dispatch |
+| 6 | project_secret_key | secret_keys | — |
+| 7 | project_message_deletion | deleted_messages | author auth + cascade |
+| 8 | project_network | networks | TrustAnchorMatch guard |
+| 9 | project_invite_accepted | invite_accepted | HasRecordedInvite guard; writes trust_anchors |
+| 10 | project_user_invite | user_invites | captures invite_network_bindings |
+| 11 | project_user_invite | user_invites | — |
+| 12 | project_device_invite | device_invites | — |
+| 13 | project_device_invite | device_invites | — |
+| 14 | project_user | users | — |
+| 15 | project_user | users | — |
+| 16 | project_peer_shared | peers_shared | — |
+| 17 | project_peer_shared | peers_shared | — |
+| 18 | project_admin | admins | — |
+| 19 | project_admin | admins | — |
+| 20 | project_user_removed | removed_entities | — |
+| 21 | project_peer_removed | removed_entities | — |
+| 22 | project_secret_shared | secret_shared | — |
+
+## Wire Formats
+
+### 73B fixed (Network, InviteAccepted)
+```
+Network (8):         type_code(1) | created_at_ms(8) | public_key(32) | network_id(32)  = 73B
+InviteAccepted (9):  type_code(1) | created_at_ms(8) | invite_event_id(32) | network_id(32)  = 73B
+```
+
+### 138B signed (DeviceInvite, User, PeerShared, Removal)
+```
+type_code(1) | created_at_ms(8) | public_key_or_target(32) | signed_by(32) | signer_type(1) | signature(64)  = 138B
+```
+- Types 12-17: field at [9..41] is public_key
+- Types 20-21: field at [9..41] is target_event_id
+
+### 170B signed (UserInvite, Admin)
+```
+type_code(1) | created_at_ms(8) | public_key(32) | extra_dep_id(32) | signed_by(32) | signer_type(1) | signature(64)  = 170B
+```
+- Type 10: extra_dep_id = network_id (reference for inviteNet capture, not a dep)
+- Type 11: extra_dep_id = admin_event_id (dep)
+- Type 18: extra_dep_id = user_event_id (dep)
+- Type 19: extra_dep_id = admin_boot_event_id (dep)
+
+### 202B signed (SecretShared)
+```
+type_code(1) | created_at_ms(8) | key_event_id(32) | recipient_event_id(32) | wrapped_key(32) | signed_by(32) | signer_type(1) | signature(64)  = 202B
+```
+
+## TLA+ Invariants → Rust Test Assertions
+
+| TLA+ Invariant | Rust Test |
+|----------------|-----------|
+| InvDeps | verify_projection_invariants: all valid events have deps valid |
+| InvSigner | Signer verification in apply_projection |
+| InvNetAnchor | test_foreign_network_excluded: foreign network blocked |
+| InvSingleNetwork | At most one network row per peer in networks table |
+| InvTrustAnchorMatchesInvite | test_bootstrap_sequence: trust_anchors matches invite_network_bindings |
+| InvTrustAnchorSource | invite_accepted must be valid for trust anchor to be set |
+| InvInviteAcceptedRecorded | HasRecordedInvite guard in pipeline |
+| InvUserInviteChain | test_bootstrap_sequence: UserBoot requires UserInviteBoot valid |
+| InvDeviceInviteChain | test_bootstrap_sequence: PeerSharedFirst requires DeviceInviteFirst valid |
+| InvAdminChain | test_bootstrap_sequence: AdminOngoing requires AdminBoot valid |
+| InvForeignNetExcluded | test_foreign_network_excluded |
+| InvRemovalAdmin | test_removal_enforcement: removal requires admin context |
+| InvAllValidRequireNetwork | test_bootstrap_sequence: non-local events require network valid |

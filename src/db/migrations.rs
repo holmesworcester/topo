@@ -176,6 +176,89 @@ static MIGRATIONS: &[Migration] = &[
                 ON peer_endpoint_observations(recorded_by, via_peer_id, origin_ip, origin_port);
         ",
     },
+    Migration {
+        version: 8,
+        name: "add_identity_tables",
+        sql: "
+            CREATE TABLE IF NOT EXISTS trust_anchors (
+                peer_id TEXT NOT NULL PRIMARY KEY,
+                network_id TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS invite_network_bindings (
+                peer_id TEXT NOT NULL PRIMARY KEY,
+                network_id TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS networks (
+                recorded_by TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                network_id TEXT NOT NULL,
+                public_key BLOB NOT NULL,
+                PRIMARY KEY (recorded_by, event_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS invite_accepted (
+                recorded_by TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                invite_event_id TEXT NOT NULL,
+                network_id TEXT NOT NULL,
+                PRIMARY KEY (recorded_by, event_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS user_invites (
+                recorded_by TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                public_key BLOB NOT NULL,
+                PRIMARY KEY (recorded_by, event_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS device_invites (
+                recorded_by TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                public_key BLOB NOT NULL,
+                PRIMARY KEY (recorded_by, event_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS users (
+                recorded_by TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                public_key BLOB NOT NULL,
+                PRIMARY KEY (recorded_by, event_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS peers_shared (
+                recorded_by TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                public_key BLOB NOT NULL,
+                PRIMARY KEY (recorded_by, event_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS admins (
+                recorded_by TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                public_key BLOB NOT NULL,
+                PRIMARY KEY (recorded_by, event_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS removed_entities (
+                recorded_by TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                target_event_id TEXT NOT NULL,
+                removal_type TEXT NOT NULL,
+                PRIMARY KEY (recorded_by, event_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS secret_shared (
+                recorded_by TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                key_event_id TEXT NOT NULL,
+                recipient_event_id TEXT NOT NULL,
+                wrapped_key BLOB NOT NULL,
+                PRIMARY KEY (recorded_by, event_id)
+            );
+        ",
+    },
 ];
 
 fn ensure_schema_migrations(conn: &Connection) -> SqliteResult<()> {
@@ -295,6 +378,6 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 7);
+        assert_eq!(count, 8);
     }
 }

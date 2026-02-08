@@ -7,6 +7,7 @@ use crate::events::EncryptedEvent;
 use crate::projection::encrypted::encrypt_event_blob;
 use crate::projection::signer::sign_event_bytes;
 use super::decision::ProjectionDecision;
+use super::identity::capture_invite_network_binding;
 use super::pipeline::project_one;
 
 #[derive(Debug)]
@@ -78,6 +79,10 @@ fn store_blob_and_project(
          VALUES (?1, ?2, ?3, ?4)",
         rusqlite::params![recorded_by, &event_id_b64, now_ms, "local_create"],
     ).map_err(|e| CreateEventError::DbError(e.to_string()))?;
+
+    // Capture invite_network_bindings from invite blobs (before projection)
+    capture_invite_network_binding(conn, recorded_by, blob)
+        .map_err(|e| CreateEventError::DbError(e.to_string()))?;
 
     // Project
     let decision = project_one(conn, recorded_by, &event_id)

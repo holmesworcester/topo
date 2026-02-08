@@ -177,6 +177,26 @@ pub fn project_encrypted(
             // Already rejected above (nested encryption)
             unreachable!();
         }
+        // Identity events cannot appear inside encrypted wrappers
+        ParsedEvent::Network(_)
+        | ParsedEvent::InviteAccepted(_)
+        | ParsedEvent::UserInviteBoot(_)
+        | ParsedEvent::UserInviteOngoing(_)
+        | ParsedEvent::DeviceInviteFirst(_)
+        | ParsedEvent::DeviceInviteOngoing(_)
+        | ParsedEvent::UserBoot(_)
+        | ParsedEvent::UserOngoing(_)
+        | ParsedEvent::PeerSharedFirst(_)
+        | ParsedEvent::PeerSharedOngoing(_)
+        | ParsedEvent::AdminBoot(_)
+        | ParsedEvent::AdminOngoing(_)
+        | ParsedEvent::UserRemoved(_)
+        | ParsedEvent::PeerRemoved(_)
+        | ParsedEvent::SecretShared(_) => {
+            return Ok(ProjectionDecision::Reject {
+                reason: "identity events cannot appear inside encrypted wrappers".to_string(),
+            });
+        }
     }
 
     // 9. Return Valid

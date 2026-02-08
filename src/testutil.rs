@@ -3,9 +3,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::crypto::EventId;
 use crate::db::{open_connection, schema::create_tables};
-use crate::events::{MessageEvent, MessageDeletionEvent, ReactionEvent, PeerKeyEvent, SecretKeyEvent, SignedMemoEvent, ParsedEvent};
+use crate::events::{
+    MessageEvent, MessageDeletionEvent, ReactionEvent, PeerKeyEvent, SecretKeyEvent,
+    SignedMemoEvent, ParsedEvent,
+    NetworkEvent, InviteAcceptedEvent, UserInviteBootEvent,
+    DeviceInviteFirstEvent, UserBootEvent,
+    PeerSharedFirstEvent, AdminBootEvent,
+    UserRemovedEvent, PeerRemovedEvent, SecretSharedEvent,
+};
 use crate::identity::{cert_paths_from_db, local_identity_from_db};
-use crate::projection::create::{create_event_sync, create_signed_event_sync, create_encrypted_event_sync};
+use crate::projection::create::{create_event_sync, create_signed_event_sync, create_encrypted_event_sync, CreateEventError};
 use crate::projection::pipeline::project_one;
 use crate::sync::engine::{accept_loop, connect_loop};
 use crate::transport::{
@@ -204,6 +211,223 @@ impl Peer {
             .expect("failed to create encrypted deletion")
     }
 
+    // --- Identity event helpers ---
+
+    /// Create a Network event. Returns the event ID.
+    pub fn create_network(&self, network_id: [u8; 32], public_key: [u8; 32]) -> EventId {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        let net = ParsedEvent::Network(NetworkEvent {
+            created_at_ms: current_timestamp_ms(),
+            public_key,
+            network_id,
+        });
+        create_event_sync(&db, &self.identity, &net).expect("failed to create network")
+    }
+
+    /// Try to create a Network event. Returns Result to allow handling rejection.
+    pub fn try_create_network(&self, network_id: [u8; 32], public_key: [u8; 32]) -> Result<EventId, CreateEventError> {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        let net = ParsedEvent::Network(NetworkEvent {
+            created_at_ms: current_timestamp_ms(),
+            public_key,
+            network_id,
+        });
+        create_event_sync(&db, &self.identity, &net)
+    }
+
+    /// Create an InviteAccepted event (local). Returns the event ID.
+    pub fn create_invite_accepted(&self, invite_event_id: &EventId, network_id: [u8; 32]) -> EventId {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        let ia = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
+            created_at_ms: current_timestamp_ms(),
+            invite_event_id: *invite_event_id,
+            network_id,
+        });
+        create_event_sync(&db, &self.identity, &ia).expect("failed to create invite_accepted")
+    }
+
+    /// Create a UserInviteBoot event (signed by network key). Returns the event ID.
+    pub fn create_user_invite_boot(
+        &self,
+        signing_key: &ed25519_dalek::SigningKey,
+        network_event_id: &EventId,
+        network_id: [u8; 32],
+    ) -> EventId {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        let public_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng())
+            .verifying_key().to_bytes();
+        let evt = ParsedEvent::UserInviteBoot(UserInviteBootEvent {
+            created_at_ms: current_timestamp_ms(),
+            public_key,
+            network_id,
+            signed_by: *network_event_id,
+            signer_type: 1,
+            signature: [0u8; 64],
+        });
+        create_signed_event_sync(&db, &self.identity, &evt, signing_key)
+            .expect("failed to create user_invite_boot")
+    }
+
+    /// Create a UserInviteBoot with a specific public key. Returns the event ID.
+    pub fn create_user_invite_boot_with_key(
+        &self,
+        invite_public_key: [u8; 32],
+        signing_key: &ed25519_dalek::SigningKey,
+        network_event_id: &EventId,
+        network_id: [u8; 32],
+    ) -> EventId {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        let evt = ParsedEvent::UserInviteBoot(UserInviteBootEvent {
+            created_at_ms: current_timestamp_ms(),
+            public_key: invite_public_key,
+            network_id,
+            signed_by: *network_event_id,
+            signer_type: 1,
+            signature: [0u8; 64],
+        });
+        create_signed_event_sync(&db, &self.identity, &evt, signing_key)
+            .expect("failed to create user_invite_boot")
+    }
+
+    /// Create a UserBoot event (signed by UserInvite key). Returns the event ID.
+    pub fn create_user_boot(
+        &self,
+        user_public_key: [u8; 32],
+        signing_key: &ed25519_dalek::SigningKey,
+        user_invite_event_id: &EventId,
+    ) -> EventId {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        let evt = ParsedEvent::UserBoot(UserBootEvent {
+            created_at_ms: current_timestamp_ms(),
+            public_key: user_public_key,
+            signed_by: *user_invite_event_id,
+            signer_type: 2,
+            signature: [0u8; 64],
+        });
+        create_signed_event_sync(&db, &self.identity, &evt, signing_key)
+            .expect("failed to create user_boot")
+    }
+
+    /// Create a DeviceInviteFirst event (signed by User key). Returns the event ID.
+    pub fn create_device_invite_first(
+        &self,
+        device_invite_public_key: [u8; 32],
+        signing_key: &ed25519_dalek::SigningKey,
+        user_event_id: &EventId,
+    ) -> EventId {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        let evt = ParsedEvent::DeviceInviteFirst(DeviceInviteFirstEvent {
+            created_at_ms: current_timestamp_ms(),
+            public_key: device_invite_public_key,
+            signed_by: *user_event_id,
+            signer_type: 4,
+            signature: [0u8; 64],
+        });
+        create_signed_event_sync(&db, &self.identity, &evt, signing_key)
+            .expect("failed to create device_invite_first")
+    }
+
+    /// Create a PeerSharedFirst event (signed by DeviceInvite key). Returns the event ID.
+    pub fn create_peer_shared_first(
+        &self,
+        peer_shared_public_key: [u8; 32],
+        signing_key: &ed25519_dalek::SigningKey,
+        device_invite_event_id: &EventId,
+    ) -> EventId {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        let evt = ParsedEvent::PeerSharedFirst(PeerSharedFirstEvent {
+            created_at_ms: current_timestamp_ms(),
+            public_key: peer_shared_public_key,
+            signed_by: *device_invite_event_id,
+            signer_type: 3,
+            signature: [0u8; 64],
+        });
+        create_signed_event_sync(&db, &self.identity, &evt, signing_key)
+            .expect("failed to create peer_shared_first")
+    }
+
+    /// Create an AdminBoot event (signed by Network key, dep on User). Returns the event ID.
+    pub fn create_admin_boot(
+        &self,
+        admin_public_key: [u8; 32],
+        signing_key: &ed25519_dalek::SigningKey,
+        user_event_id: &EventId,
+        network_event_id: &EventId,
+    ) -> EventId {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        let evt = ParsedEvent::AdminBoot(AdminBootEvent {
+            created_at_ms: current_timestamp_ms(),
+            public_key: admin_public_key,
+            user_event_id: *user_event_id,
+            signed_by: *network_event_id,
+            signer_type: 1,
+            signature: [0u8; 64],
+        });
+        create_signed_event_sync(&db, &self.identity, &evt, signing_key)
+            .expect("failed to create admin_boot")
+    }
+
+    /// Create a UserRemoved event (signed by PeerShared key — admin). Returns the event ID.
+    pub fn create_user_removed(
+        &self,
+        signing_key: &ed25519_dalek::SigningKey,
+        target_event_id: &EventId,
+        peer_shared_event_id: &EventId,
+    ) -> EventId {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        let evt = ParsedEvent::UserRemoved(UserRemovedEvent {
+            created_at_ms: current_timestamp_ms(),
+            target_event_id: *target_event_id,
+            signed_by: *peer_shared_event_id,
+            signer_type: 5,
+            signature: [0u8; 64],
+        });
+        create_signed_event_sync(&db, &self.identity, &evt, signing_key)
+            .expect("failed to create user_removed")
+    }
+
+    /// Create a PeerRemoved event (signed by PeerShared key — admin). Returns the event ID.
+    pub fn create_peer_removed(
+        &self,
+        signing_key: &ed25519_dalek::SigningKey,
+        target_event_id: &EventId,
+        peer_shared_event_id: &EventId,
+    ) -> EventId {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        let evt = ParsedEvent::PeerRemoved(PeerRemovedEvent {
+            created_at_ms: current_timestamp_ms(),
+            target_event_id: *target_event_id,
+            signed_by: *peer_shared_event_id,
+            signer_type: 5,
+            signature: [0u8; 64],
+        });
+        create_signed_event_sync(&db, &self.identity, &evt, signing_key)
+            .expect("failed to create peer_removed")
+    }
+
+    /// Create a SecretShared event (signed by PeerShared key). Returns the event ID.
+    pub fn create_secret_shared(
+        &self,
+        signing_key: &ed25519_dalek::SigningKey,
+        key_event_id: &EventId,
+        recipient_event_id: &EventId,
+        wrapped_key: [u8; 32],
+        peer_shared_event_id: &EventId,
+    ) -> EventId {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        let evt = ParsedEvent::SecretShared(SecretSharedEvent {
+            created_at_ms: current_timestamp_ms(),
+            key_event_id: *key_event_id,
+            recipient_event_id: *recipient_event_id,
+            wrapped_key,
+            signed_by: *peer_shared_event_id,
+            signer_type: 5,
+            signature: [0u8; 64],
+        });
+        create_signed_event_sync(&db, &self.identity, &evt, signing_key)
+            .expect("failed to create secret_shared")
+    }
+
     /// Create multiple messages. Uses a transaction for speed at scale.
     pub fn batch_create_messages(&self, count: usize) {
         let db = open_connection(&self.db_path).expect("failed to open db");
@@ -370,6 +594,18 @@ fn replay_projection_impl(db: &rusqlite::Connection, recorded_by: &str, order: &
         .expect("failed to clear secret_keys");
     db.execute("DELETE FROM deleted_messages WHERE recorded_by = ?1", rusqlite::params![recorded_by])
         .expect("failed to clear deleted_messages");
+    // Identity tables
+    db.execute("DELETE FROM networks WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
+    db.execute("DELETE FROM invite_accepted WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
+    db.execute("DELETE FROM user_invites WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
+    db.execute("DELETE FROM device_invites WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
+    db.execute("DELETE FROM users WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
+    db.execute("DELETE FROM peers_shared WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
+    db.execute("DELETE FROM admins WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
+    db.execute("DELETE FROM removed_entities WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
+    db.execute("DELETE FROM secret_shared WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
+    db.execute("DELETE FROM trust_anchors WHERE peer_id = ?1", rusqlite::params![recorded_by]).ok();
+    db.execute("DELETE FROM invite_network_bindings WHERE peer_id = ?1", rusqlite::params![recorded_by]).ok();
     db.execute("DELETE FROM valid_events WHERE peer_id = ?1", rusqlite::params![recorded_by])
         .expect("failed to clear valid_events");
     db.execute("DELETE FROM blocked_event_deps WHERE peer_id = ?1", rusqlite::params![recorded_by])

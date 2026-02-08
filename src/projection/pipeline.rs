@@ -90,6 +90,24 @@ fn apply_projection(
         ParsedEvent::MessageDeletion(del) => {
             return project_message_deletion(conn, recorded_by, event_id_b64, del);
         }
+        // Identity events: dispatch to identity projectors (placeholder — full impl in identity.rs)
+        ParsedEvent::Network(_)
+        | ParsedEvent::InviteAccepted(_)
+        | ParsedEvent::UserInviteBoot(_)
+        | ParsedEvent::UserInviteOngoing(_)
+        | ParsedEvent::DeviceInviteFirst(_)
+        | ParsedEvent::DeviceInviteOngoing(_)
+        | ParsedEvent::UserBoot(_)
+        | ParsedEvent::UserOngoing(_)
+        | ParsedEvent::PeerSharedFirst(_)
+        | ParsedEvent::PeerSharedOngoing(_)
+        | ParsedEvent::AdminBoot(_)
+        | ParsedEvent::AdminOngoing(_)
+        | ParsedEvent::UserRemoved(_)
+        | ParsedEvent::PeerRemoved(_)
+        | ParsedEvent::SecretShared(_) => {
+            return super::identity::apply_identity_projection(conn, recorded_by, event_id_b64, parsed);
+        }
     }
 
     Ok(ProjectionDecision::Valid)
@@ -200,6 +218,14 @@ pub fn project_one(
 
     // 8. Unblock dependents (iterative to avoid stack overflow)
     unblock_dependents(conn, recorded_by, &event_id_b64)?;
+
+    // 9. Guard cascade: if InviteAccepted just projected, retry guard-blocked events
+    //    (e.g., Network events waiting for trust anchor).
+    //    This is separate from dep-based cascading because guard blocks don't use
+    //    blocked_event_deps — they return Block with empty missing list.
+    if matches!(parsed, ParsedEvent::InviteAccepted(_)) {
+        super::identity::retry_guard_blocked_events(conn, recorded_by)?;
+    }
 
     Ok(ProjectionDecision::Valid)
 }
