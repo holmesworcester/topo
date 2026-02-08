@@ -875,13 +875,19 @@ async fn test_encrypted_event_sync() {
     let alice = Peer::new("alice", channel);
     let bob = Peer::new("bob", channel);
 
-    // Alice creates a secret key + encrypted message
+    // Materialize the same PSK locally on both peers (local-only key event, not synced).
     let key_bytes: [u8; 32] = rand::random();
-    let sk_eid = alice.create_secret_key(key_bytes);
-    let _enc_eid = alice.create_encrypted_message(&sk_eid, "Hello encrypted world");
+    let fixed_ts = 4_000_000u64;
+    let sk_eid_alice = alice.create_secret_key_deterministic(key_bytes, fixed_ts);
+    let sk_eid_bob = bob.create_secret_key_deterministic(key_bytes, fixed_ts);
+    assert_eq!(sk_eid_alice, sk_eid_bob, "deterministic PSK materialization should match");
+
+    let _enc_eid = alice.create_encrypted_message(&sk_eid_alice, "Hello encrypted world");
 
     assert_eq!(alice.store_count(), 2);
     assert_eq!(alice.secret_key_count(), 1);
+    assert_eq!(bob.store_count(), 1);
+    assert_eq!(bob.secret_key_count(), 1);
     // The encrypted event projects into messages table
     assert_eq!(alice.scoped_message_count(), 1);
 
@@ -891,12 +897,12 @@ async fn test_encrypted_event_sync() {
     assert_eventually(
         || bob.store_count() == 2,
         Duration::from_secs(15),
-        "bob should have 2 events (SecretKey + Encrypted)",
+        "bob should have 2 events (local SecretKey + synced Encrypted)",
     ).await;
 
     drop(sync);
 
-    // Bob should have projected both: secret key into secret_keys, inner message into messages
+    // Bob has his local secret key and should project the encrypted inner message.
     assert_eq!(bob.secret_key_count(), 1);
     assert_eq!(bob.scoped_message_count(), 1);
 
@@ -911,44 +917,64 @@ async fn test_encrypted_out_of_order_sync() {
     let alice = Peer::new("alice", channel);
     let bob = Peer::new("bob", channel);
 
-    // Alice creates the key + encrypted message
+    // Alice creates key + encrypted message.
     let key_bytes: [u8; 32] = rand::random();
-    let sk_eid = alice.create_secret_key(key_bytes);
+    let fixed_ts = 5_000_000u64;
+    let sk_eid = alice.create_secret_key_deterministic(key_bytes, fixed_ts);
     let _enc_eid = alice.create_encrypted_message(&sk_eid, "Out of order encrypted");
 
     // Also create a normal message to verify mixed events work
     alice.create_message("Normal message");
 
-    // Bob creates a message too
+    // Bob creates a message too, but does NOT have the key yet.
     bob.create_message("Bob's message");
 
     assert_eq!(alice.store_count(), 3); // sk, encrypted, message
     assert_eq!(bob.store_count(), 1);
 
-    // Sync
-    let sync = start_peers(&alice, &bob);
+    // Sync phase 1: ciphertext arrives before key materialization on Bob.
+    let sync1 = start_peers(&alice, &bob);
 
     assert_eventually(
-        || alice.store_count() == 4 && bob.store_count() == 4,
+        || alice.store_count() == 4 && bob.store_count() == 3,
         Duration::from_secs(15),
-        "both peers should have 4 events",
+        "phase 1: bob should have his message + alice message + encrypted wrapper",
     ).await;
 
-    drop(sync);
+    drop(sync1);
 
-    // Bob should have auto-unblocked the encrypted message (if it arrived before key)
-    assert_eq!(bob.secret_key_count(), 1);
-    assert_eq!(bob.scoped_message_count(), 3); // encrypted inner + normal + bob's
-    assert_eq!(alice.scoped_message_count(), 3);
-
-    // No remaining blocked deps
+    // Bob should be blocked on missing key after phase 1.
+    assert_eq!(bob.secret_key_count(), 0);
+    assert_eq!(bob.scoped_message_count(), 2); // cleartext normal + bob's local message
     let bob_db = open_connection(&bob.db_path).expect("open bob db");
-    let blocked: i64 = bob_db.query_row(
+    let blocked_before: i64 = bob_db.query_row(
         "SELECT COUNT(*) FROM blocked_event_deps WHERE peer_id = ?1",
         rusqlite::params![&bob.identity],
         |row| row.get(0),
     ).unwrap();
-    assert_eq!(blocked, 0, "no remaining blocked deps after sync");
+    assert!(blocked_before >= 1, "encrypted wrapper should be blocked until key appears");
+
+    // Materialize the matching key locally on Bob; this should unblock and project.
+    let sk_eid_bob = bob.create_secret_key_deterministic(key_bytes, fixed_ts);
+    assert_eq!(sk_eid_bob, sk_eid, "bob key materialization should match alice key event id");
+
+    assert_eventually(
+        || bob.store_count() == 4 && bob.scoped_message_count() == 3,
+        Duration::from_secs(10),
+        "phase 2: local key materialization should unblock encrypted projection",
+    ).await;
+
+    // No remaining blocked deps after key appears.
+    let blocked_after: i64 = bob_db.query_row(
+        "SELECT COUNT(*) FROM blocked_event_deps WHERE peer_id = ?1",
+        rusqlite::params![&bob.identity],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(blocked_after, 0, "no remaining blocked deps after local key materialization");
+
+    assert_eq!(alice.scoped_message_count(), 3);
+    assert_eq!(bob.secret_key_count(), 1);
+    assert_eq!(bob.scoped_message_count(), 3); // encrypted inner + normal + bob's
 
     verify_projection_invariants(&alice);
     verify_projection_invariants(&bob);
@@ -1130,14 +1156,13 @@ async fn test_egress_queue_lifecycle() {
     let pending = eq.count_pending(conn_id).unwrap();
     assert_eq!(pending, 0);
 
-    // Cleanup sent (all recent, so none purged with large cutoff)
-    let purged = eq.cleanup_sent(0).unwrap();
-    // sent_at = now, cutoff = now - 0 = now, so nothing older than now
+    // Cleanup sent with a large age threshold; recent rows should not be purged.
+    let purged = eq.cleanup_sent(300_000).unwrap();
     assert_eq!(purged, 0);
 
     // Backdate and cleanup
     db.execute("UPDATE egress_queue SET sent_at = sent_at - 600000", []).unwrap();
-    let purged = eq.cleanup_sent(0).unwrap();
+    let purged = eq.cleanup_sent(300_000).unwrap();
     assert_eq!(purged, 3);
 
     // Re-enqueue should work (dedup index only blocks unsent)
