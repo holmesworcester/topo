@@ -79,6 +79,8 @@ Gap-to-phase mapping:
 - No per-event transit wrapper. QUIC + mTLS secures the channel.
 - Use separate tables for permanent canonical data vs operational queues.
 - Use separate invite event types (`user_invite`, `device_invite`), not one multimodal invite with `mode=*`.
+- `invite_accepted` is local trust-anchor binding; it is not guarded by generic "invite presence" checks.
+- Trust-anchor guards apply to root network/workspace events (foreign root ids must not become valid).
 - Deterministic emitted event types stay inside the emitted-event rule flow but are unsigned for determinism (`no signed_by/signer_type/signature`).
 
 ## 2.1 Locked design requirements (explicit)
@@ -108,6 +110,10 @@ These are required, not optional:
    - direct cross-event table writes are rare operational exceptions only.
 9. Blocked-is-not-failure requirement.
    - blocked rows that are policy-appropriate for a tenant (for example non-recipient encrypted/key-share events) are expected and must not be treated as sync failure.
+10. Guard-placement requirement.
+   - `invite_accepted` is a local anchor-binding event, not a global invite-presence gate.
+   - trust-anchor gating belongs on root network/workspace event validity.
+   - do not use pre-projection raw-blob capture tables as authority for trust-anchor binding.
 
 ---
 
@@ -897,9 +903,13 @@ Before writing identity/removal/encryption projectors in Rust:
 2. Build/update a TLA+ model of causal relationships and guards for this phase.
 3. Model split invite types (`user_invite`, `device_invite`) and trust-anchor semantics.
 4. **Model network binding**: network events must be parameterized by network id, and the trust anchor must bind to a specific network. The model must prove that foreign network events (for networks the peer did not accept an invite for) can never become valid. Without this, the model cannot distinguish between valid and invalid network events, making it insufficiently expressive for multi-network scenarios. See `InvNetAnchor`, `InvSingleNetwork`, `InvForeignNetExcluded` invariants.
-5. **Model invite-derived trust anchor binding**: the trust anchor must bind deterministically to the network referenced by the invite, not by a free nondeterministic choice at `invite_accepted` time. The model captures which network an invite references when the first invite is recorded (`inviteNet` variable); `invite_accepted` then reads `inviteNet` to set the trust anchor. This ensures the binding mechanism is faithful to the real protocol where the invite blob carries a `network_id`. See `InvTrustAnchorMatchesInvite` invariant.
-6. Verify bootstrap/self-invite, join, device-link, and removal safety invariants.
-7. Freeze a projector-spec mapping table: each projector predicate/check maps to a named TLA guard.
+5. **Model deterministic trust-anchor binding from explicit accepted-invite data**: `invite_accepted` binds trust anchor directly from validated event fields (for example accepted `network_id`/workspace root id), not from pre-projection blob-capture side channels.
+6. **Model guard placement explicitly**: trust-anchor guard applies to root network/workspace events; `invite_accepted` itself must not depend on a global `HasRecordedInvite`-style guard.
+7. Verify bootstrap/self-invite, join, device-link, and removal safety invariants.
+8. Freeze a projector-spec mapping table: each projector predicate/check maps to a named TLA guard.
+9. Record TLA scope boundary for this phase:
+   - current identity-causality models may abstract away transport TLS credential/session-key lifecycle.
+   - this abstraction must be tracked explicitly and followed by a transport-key model extension milestone before final identity/transport convergence sign-off.
 
 Projector implementations should mirror TLA conditions as directly as possible.
 
@@ -930,7 +940,9 @@ Implementation requirement:
 
 Required behavior:
 - `invite_accepted` records trust anchor intent for `workspace_id` (per `recorded_by` peer scope).
-- `workspace` is not valid until corresponding trust anchor exists.
+- `invite_accepted` is a local binding step and should not be blocked by a global "recorded invite exists" guard.
+- root `workspace`/network events are not valid until corresponding trust anchor exists and matches the root id.
+- trust-anchor binding must come from validated projector input fields, not pre-projection capture tables.
 - invites are never force-valid; they validate only through signer/dependency chain.
 
 Self-invite bootstrap sequence must stay explicit:
@@ -972,6 +984,17 @@ Not in scope yet:
 - Extend/adjust model events for split invites (`user_invite`, `device_invite`).
 - For each identity-phase projector, include a referenced guard list in comments/docs.
 - Treat divergence between projector logic and TLA guards as a spec bug that must be resolved before adding behavior.
+
+## 11.8 TLA transport-scope gap (must be explicit)
+
+Current TLA models are identity/event-causality models first. They may intentionally abstract over transport internals.
+
+Required explicit note for future work:
+- current models do not fully encode mTLS transit credential lifecycle (for example local TLS cert/private-key event state materialization, projected SPKI trust-set state transitions, and cert rotation rules).
+- TLS handshake/session key derivation can remain abstracted, but credential/trust state transitions must be modeled.
+
+Follow-up requirement:
+- add a transport-credential TLA extension (new module or integrated extension) and map its guards/transitions into projector/runtime checks before claiming full identity-transport convergence.
 
 ---
 
@@ -1289,14 +1312,22 @@ Must implement:
 6. preserve Phase 2.5 signer pipeline (do not add identity-specific signature fast paths).
 7. transport mTLS trust source switched to projected identity graph policy (retrofit completed; no CLI/file pin authority in steady state).
 8. local TLS cert/public/private key material modeled as events and materialized from projected local event state.
+9. guard placement correction:
+   - `invite_accepted` is local trust-anchor binding and does not use `HasRecordedInvite`-style global guard.
+   - trust-anchor guard applies on root network/workspace events only.
+10. remove/avoid pre-projection trust-binding capture paths (for example raw-blob `invite_network_bindings` capture) as authority.
+11. TLA transport-credential scope extension plan exists and is linked (credential/trust transitions modeled; handshake/session keys may remain abstract).
 
 Common mistakes:
 - implementing projector rules before guard/model freeze.
 - re-introducing multimodal invite event (`mode=*`).
+- keeping obsolete `invite_accepted` guard logic after model correction.
+- forgetting to track the transport-credential TLA scope gap explicitly.
 
 Definition of done:
 - TLA invariants pass for bootstrap, join, device-link, and removal flows,
 - Rust behavior matches TLA guard mapping in tests.
+- transport-credential modeling gap is either closed in TLA or explicitly tracked as open with linked follow-up artifact.
 
 ## 15.11 PR slicing guidance (to reduce assistant mistakes)
 
