@@ -810,9 +810,10 @@ pub async fn accept_loop(
         };
         info!("Accepted connection from {}", peer_id);
 
-        // Record endpoint observation
+        // Record endpoint observation and periodically purge expired ones
         {
             let remote = connection.remote_address();
+            let now = current_timestamp_ms();
             if let Ok(db) = open_connection(db_path) {
                 let _ = record_endpoint_observation(
                     &db,
@@ -820,9 +821,13 @@ pub async fn accept_loop(
                     &peer_id,
                     &remote.ip().to_string(),
                     remote.port(),
-                    current_timestamp_ms(),
+                    now,
                     ENDPOINT_TTL_MS,
                 );
+                let purged = purge_expired_endpoints(&db, now).unwrap_or(0);
+                if purged > 0 {
+                    info!("Purged {} expired endpoint observations", purged);
+                }
             }
         }
 
@@ -916,9 +921,10 @@ pub async fn connect_loop(
         };
         info!("Connected to {}", peer_id);
 
-        // Record endpoint observation
+        // Record endpoint observation and periodically purge expired ones
         {
             let remote_addr = connection.remote_address();
+            let now = current_timestamp_ms();
             if let Ok(db) = open_connection(db_path) {
                 let _ = record_endpoint_observation(
                     &db,
@@ -926,9 +932,13 @@ pub async fn connect_loop(
                     &peer_id,
                     &remote_addr.ip().to_string(),
                     remote_addr.port(),
-                    current_timestamp_ms(),
+                    now,
                     ENDPOINT_TTL_MS,
                 );
+                let purged = purge_expired_endpoints(&db, now).unwrap_or(0);
+                if purged > 0 {
+                    info!("Purged {} expired endpoint observations", purged);
+                }
             }
         }
 

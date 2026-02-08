@@ -12,12 +12,12 @@ pub fn blocked_event_count(conn: &Connection, peer_id: &str) -> SqliteResult<i64
 /// Purge expired endpoint observations. Returns number deleted.
 pub fn purge_expired_endpoints(conn: &Connection, now_ms: i64) -> SqliteResult<usize> {
     conn.execute(
-        "DELETE FROM peer_endpoint_observations WHERE expires_at < ?1",
+        "DELETE FROM peer_endpoint_observations WHERE expires_at <= ?1",
         params![now_ms],
     )
 }
 
-/// Record a peer endpoint observation with INSERT OR REPLACE.
+/// Record a peer endpoint observation with INSERT OR IGNORE.
 pub fn record_endpoint_observation(
     conn: &Connection,
     recorded_by: &str,
@@ -131,6 +131,23 @@ mod tests {
             [], |row| row.get(0),
         ).unwrap();
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_purge_exactly_expired() {
+        let conn = setup();
+
+        // Insert observation that expires exactly at 2000
+        conn.execute(
+            "INSERT INTO peer_endpoint_observations
+             (recorded_by, via_peer_id, origin_ip, origin_port, observed_at, expires_at)
+             VALUES ('me', 'peer1', '1.2.3.4', 5000, 1000, 2000)",
+            [],
+        ).unwrap();
+
+        // Purge at exactly 2000 — should delete (expires_at <= now)
+        let purged = purge_expired_endpoints(&conn, 2000).unwrap();
+        assert_eq!(purged, 1);
     }
 
     #[test]
