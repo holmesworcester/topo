@@ -16,6 +16,13 @@ EXTENDS Naturals, FiniteSets
 \*   user_removed    — removes a user (and transitively excludes peers)
 \*   peer_removed    — removes a specific peer device
 \*
+\* Network binding refinement:
+\*   Network events are parameterized by network id. The trust anchor
+\*   binds to a specific network when invite_accepted projects.
+\*   Guard checks that a network event's id matches the peer's binding.
+\*   This ensures only the invited network can become valid; foreign
+\*   network events are structurally excluded.
+\*
 \* Key semantic: after a peer observes a removal, new secret_shared events
 \*   must NOT wrap to the removed peer (InvRemovalExclusion).
 \*
@@ -23,17 +30,23 @@ EXTENDS Naturals, FiniteSets
 \* polymorphic signer/dependency rules explicit.
 \*
 \* CONSTANTS:
-\*   ActiveEvents — subset of FullEvents to bound state space
+\*   ActiveEvents — subset of FullEventTypes to bound state space
+\*                  (include "network" to enable network event instances)
 \*   Peers — set of peer identifiers for per-peer perspectives
+\*   Networks — set of network identifiers (>= 2 to test binding exclusion)
 
-CONSTANTS ActiveEvents, Peers
+CONSTANTS ActiveEvents, Peers, Networks
 
 VARIABLES recorded, valid, trustAnchor, removed
 
 \* ---- Event type constants ----
 
-\* Identity / bootstrap
+\* Abstract network marker used in RawDeps/SignerDep to indicate
+\* "requires a network event". Not itself an event instance.
+\* Concrete network events are the network id strings from Networks.
 Net == "network"
+
+\* Identity / bootstrap
 InviteAccepted == "invite_accepted"
 
 \* Split invite types (user_invite replaces invite(mode=user))
@@ -74,10 +87,19 @@ Encrypted == "encrypted"
 UserRemoved == "user_removed"
 PeerRemoved == "peer_removed"
 
+\* ---- Network events (parameterized by network id) ----
+\* Network events are the network id strings themselves.
+\* Networks must not overlap with FullEventTypes (checked by ASSUME below).
+
+AllNetEvents == Networks
+IsNetEvent(e) == e \in Networks
+NetId(e) == e
+
 \* ---- Event sets ----
 
-FullEvents == {
-    Net, InviteAccepted,
+\* Singleton event types (not parameterized by network)
+FullEventTypes == {
+    InviteAccepted,
     UserInviteBoot, UserInviteOngoing,
     DeviceInviteFirst, DeviceInviteOngoing,
     UserBoot, UserOngoing,
@@ -89,13 +111,20 @@ FullEvents == {
     UserRemoved, PeerRemoved
 }
 
+\* Full event universe (singleton types + parameterized network events)
+FullEvents == FullEventTypes \cup AllNetEvents
+
 \* Local-only events (no network dep, no trust anchor gate).
 \* Encrypted is local because it's a cryptographic wrapper; its network
 \* requirement comes from the inner event, not the wrapper itself.
 LocalRoots == {InviteAccepted, Peer, SecretKey, Encrypted}
 
-\* Events that require network to be valid (everything except local roots)
-NetGuardedEvents == (FullEvents \ LocalRoots)
+\* Singleton event types that require network to be valid
+NetGuardedEvents == FullEventTypes \ LocalRoots
+
+\* Active events: singleton types from config + network instances if enabled
+EVENTS == (ActiveEvents \cap FullEventTypes)
+         \cup (IF Net \in ActiveEvents THEN AllNetEvents ELSE {})
 
 \* Identity event categories
 UserInviteEvents == {UserInviteBoot, UserInviteOngoing}
@@ -103,7 +132,7 @@ DeviceInviteEvents == {DeviceInviteFirst, DeviceInviteOngoing}
 AdminEvents == {AdminBoot, AdminOngoing}
 
 IdentityEvents == {
-    Net, InviteAccepted,
+    InviteAccepted,
     UserInviteBoot, UserInviteOngoing,
     DeviceInviteFirst, DeviceInviteOngoing,
     UserBoot, UserOngoing,
@@ -111,24 +140,24 @@ IdentityEvents == {
     AdminBoot, AdminOngoing,
     Peer,
     UserRemoved, PeerRemoved
-}
+} \cup AllNetEvents
 
 ContentEvents == {Channel, Message, MessageReaction, MessageDeletion}
 EncryptionEvents == {SecretKey, SecretShared, Encrypted}
 
-ASSUME ActiveEvents \subseteq FullEvents
+ASSUME (ActiveEvents \ {Net}) \subseteq FullEventTypes
 ASSUME Peers /= {}
-
-EVENTS == ActiveEvents
+ASSUME Networks /= {}
+ASSUME Networks \cap FullEventTypes = {}
 
 \* ---- Dependency rules ----
-\* RawDeps: structural dependencies (content references).
-\* SignerDep: signer must be valid (whose key verifies the signature).
-\* Combined: Deps(e) = (RawDeps(e) \cup SignerDep(e)) \cap EVENTS
+\* RawDeps and SignerDep use the abstract Net marker for network dependency.
+\* ResolveNet translates Net to the peer's bound network event instance.
 
 RawDeps(e) ==
-    CASE e = Net -> {}
-       [] e = InviteAccepted -> {}
+    IF IsNetEvent(e) THEN {}
+    ELSE
+    CASE e = InviteAccepted -> {}
 
        \* user_invite: bootstrap depends on network; ongoing depends on admin
        [] e = UserInviteBoot -> {}
@@ -172,6 +201,8 @@ RawDeps(e) ==
 
 \* SignerDep: whose public key must be valid to verify the event's signature.
 SignerDep(e) ==
+    IF IsNetEvent(e) THEN {}
+    ELSE
     CASE \* user_invite: bootstrap signed by network; ongoing signed by admin peer
          e = UserInviteBoot -> {Net}
        [] e = UserInviteOngoing -> {PeerSharedOngoing}
@@ -207,13 +238,27 @@ SignerDep(e) ==
 
        [] OTHER -> {}
 
-\* Combined dependencies: structural + signer, filtered to active events.
-Deps(e) == (RawDeps(e) \cup SignerDep(e)) \cap EVENTS
+\* Resolve abstract Net marker to the peer's bound network event.
+\* Non-Net deps pass through filtered by EVENTS.
+\* If peer is unbound and event needs network, an unsatisfiable
+\* placeholder blocks projection.
+ResolveNet(p, deps) ==
+    LET needsNet == Net \in deps
+        nonNet == (deps \ {Net}) \cap EVENTS
+        netDep == IF needsNet THEN
+                    IF trustAnchor[p] /= "none"
+                    THEN {trustAnchor[p]}
+                    ELSE {"__unbound__"}
+                  ELSE {}
+    IN nonNet \cup netDep
+
+\* Combined peer-resolved dependencies: structural + signer.
+PeerDeps(p, e) == ResolveNet(p, RawDeps(e) \cup SignerDep(e))
 
 \* ---- Guards ----
 
-\* Network validity is gated by an invite_accepted trust anchor (per peer).
-Guard(p, e) == IF e = Net THEN trustAnchor[p] ELSE TRUE
+\* Network events require matching trust anchor binding.
+Guard(p, e) == IF IsNetEvent(e) THEN trustAnchor[p] = NetId(e) ELSE TRUE
 
 \* invite_accepted requires that at least one invite event has been recorded.
 HasRecordedInvite(p) ==
@@ -227,7 +272,7 @@ HasRecordedInvite(p) ==
 Init ==
     /\ recorded = [p \in Peers |-> {}]
     /\ valid = [p \in Peers |-> {}]
-    /\ trustAnchor = [p \in Peers |-> FALSE]
+    /\ trustAnchor = [p \in Peers |-> "none"]
     /\ removed = [p \in Peers |-> {}]
 
 Record(p, e) ==
@@ -239,16 +284,16 @@ Record(p, e) ==
 
 Project(p, e) ==
     /\ p \in Peers
+    /\ e \in EVENTS
     /\ e \in recorded[p]
     /\ e \notin valid[p]
-    /\ Deps(e) \subseteq valid[p]
+    /\ PeerDeps(p, e) \subseteq valid[p]
     /\ Guard(p, e)
     /\ IF e = InviteAccepted THEN HasRecordedInvite(p) ELSE TRUE
     /\ valid' = [valid EXCEPT ![p] = @ \cup {e}]
-    /\ trustAnchor' =
-        IF e = InviteAccepted
-        THEN [trustAnchor EXCEPT ![p] = TRUE]
-        ELSE trustAnchor
+    /\ IF e = InviteAccepted
+       THEN \E n \in Networks: trustAnchor' = [trustAnchor EXCEPT ![p] = n]
+       ELSE trustAnchor' = trustAnchor
     /\ removed' =
         IF e = UserRemoved
         THEN [removed EXCEPT ![p] = @ \cup {"user_target"}]
@@ -274,27 +319,35 @@ TypeOK ==
     /\ recorded \in [Peers -> SUBSET EVENTS]
     /\ valid \in [Peers -> SUBSET EVENTS]
     /\ \A p \in Peers: valid[p] \subseteq recorded[p]
-    /\ trustAnchor \in [Peers -> {TRUE, FALSE}]
+    /\ trustAnchor \in [Peers -> Networks \cup {"none"}]
     /\ removed \in [Peers -> SUBSET {"user_target", "peer_target"}]
 
-\* Every valid event has all its dependencies valid.
+\* Every valid event has all its peer-resolved dependencies valid.
 InvDeps ==
     \A p \in Peers:
-        \A e \in valid[p]: Deps(e) \subseteq valid[p]
+        \A e \in valid[p]: PeerDeps(p, e) \subseteq valid[p]
 
-\* Every valid event has its signer dependency valid.
+\* Every valid event has its signer dependency valid (peer-resolved).
 InvSigner ==
     \A p \in Peers:
-        \A e \in valid[p]: (SignerDep(e) \cap EVENTS) \subseteq valid[p]
+        \A e \in valid[p]: ResolveNet(p, SignerDep(e)) \subseteq valid[p]
 
-\* Network validity requires trust anchor.
+\* Network event validity requires matching trust anchor.
 InvNetAnchor ==
-    \A p \in Peers: (Net \in valid[p]) => trustAnchor[p]
+    \A p \in Peers:
+        \A n \in Networks:
+            (n \in valid[p]) => trustAnchor[p] = n
+
+\* At most one network can be valid per peer.
+InvSingleNetwork ==
+    \A p \in Peers:
+        \A n1, n2 \in Networks:
+            (n1 \in valid[p] /\ n2 \in valid[p]) => n1 = n2
 
 \* Trust anchor requires invite_accepted to be valid.
 InvTrustAnchorSource ==
     IF InviteAccepted \in EVENTS
-    THEN \A p \in Peers: trustAnchor[p] => (InviteAccepted \in valid[p])
+    THEN \A p \in Peers: (trustAnchor[p] /= "none") => (InviteAccepted \in valid[p])
     ELSE TRUE
 
 \* invite_accepted requires at least one invite event recorded.
@@ -305,12 +358,12 @@ InvInviteAcceptedRecorded ==
             (\E ie \in ((UserInviteEvents \cup DeviceInviteEvents) \cap EVENTS): ie \in recorded[p])
     ELSE TRUE
 
-\* All non-local events that are valid require network to be valid.
+\* All non-local singleton events that are valid require some network to be valid.
 InvAllValidRequireNetwork ==
-    IF Net \in EVENTS
+    IF AllNetEvents \cap EVENTS /= {}
     THEN \A p \in Peers:
         \A e \in valid[p]:
-            (e \notin NetGuardedEvents) \/ (e = Net) \/ (Net \in valid[p])
+            e \in LocalRoots \/ IsNetEvent(e) \/ (\E ne \in AllNetEvents: ne \in valid[p])
     ELSE TRUE
 
 \* User invite chain: user requires its invite to be valid.
@@ -362,8 +415,8 @@ InvRemovalExclusion ==
 
 \* Channel requires network.
 InvChannelNetwork ==
-    IF Channel \in EVENTS /\ Net \in EVENTS
-    THEN \A p \in Peers: (Channel \in valid[p]) => (Net \in valid[p])
+    IF Channel \in EVENTS /\ AllNetEvents \cap EVENTS /= {}
+    THEN \A p \in Peers: (Channel \in valid[p]) => (\E ne \in AllNetEvents: ne \in valid[p])
     ELSE TRUE
 
 \* Message requires channel.
