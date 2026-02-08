@@ -3,6 +3,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const BACKOFF_BASE_MS: i64 = 1000;
 pub const BACKOFF_MAX_ATTEMPTS: u32 = 10;
 
+/// Queue health snapshot for observability.
+#[derive(Debug, Clone)]
+pub struct QueueHealth {
+    pub pending: i64,
+    pub max_attempts: i64,
+    pub oldest_age_ms: i64,
+}
+
 pub fn current_timestamp_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

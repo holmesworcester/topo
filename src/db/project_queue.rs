@@ -1,6 +1,6 @@
 use rusqlite::{Connection, Result as SqliteResult, params};
 
-use super::queue::{current_timestamp_ms, backoff_ms, recover_expired_leases};
+use super::queue::{current_timestamp_ms, backoff_ms, recover_expired_leases, QueueHealth};
 
 pub struct ProjectQueue<'a> {
     conn: &'a Connection,
@@ -158,18 +158,47 @@ impl<'a> ProjectQueue<'a> {
         recover_expired_leases(self.conn, "project_queue", now)
     }
 
+    /// Queue health snapshot for observability.
+    pub fn health(&self, peer_id: &str) -> SqliteResult<QueueHealth> {
+        let now = current_timestamp_ms();
+        let pending: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM project_queue WHERE peer_id = ?1",
+            params![peer_id],
+            |row| row.get(0),
+        )?;
+        let max_attempts: i64 = self.conn.query_row(
+            "SELECT COALESCE(MAX(attempts), 0) FROM project_queue WHERE peer_id = ?1",
+            params![peer_id],
+            |row| row.get(0),
+        )?;
+        let oldest_age_ms: i64 = self.conn.query_row(
+            "SELECT COALESCE(?2 - MIN(available_at), 0) FROM project_queue WHERE peer_id = ?1",
+            params![peer_id, now],
+            |row| row.get(0),
+        )?;
+        Ok(QueueHealth { pending, max_attempts, oldest_age_ms })
+    }
+
     /// Claim-process-done loop. Processes all pending items for a peer.
     /// For each item: project_fn runs (which may insert into valid_events, blocked_event_deps,
     /// projection tables, and cascade-unblock dependents). Successfully processed items are
     /// dequeued; failed items are retried with exponential backoff.
     /// Returns number of items successfully processed.
-    pub fn drain<F>(&self, peer_id: &str, mut project_fn: F) -> SqliteResult<usize>
+    pub fn drain<F>(&self, peer_id: &str, project_fn: F) -> SqliteResult<usize>
+    where
+        F: FnMut(&Connection, &str) -> Result<(), Box<dyn std::error::Error>>,
+    {
+        self.drain_with_limit(peer_id, 100, project_fn)
+    }
+
+    /// Like `drain` but with a configurable claim batch size.
+    pub fn drain_with_limit<F>(&self, peer_id: &str, batch_size: usize, mut project_fn: F) -> SqliteResult<usize>
     where
         F: FnMut(&Connection, &str) -> Result<(), Box<dyn std::error::Error>>,
     {
         let mut total = 0;
         loop {
-            let batch = self.claim_batch(peer_id, 100, 30_000)?;
+            let batch = self.claim_batch(peer_id, batch_size, 30_000)?;
             if batch.is_empty() {
                 break;
             }
@@ -488,5 +517,35 @@ mod tests {
             [], |row| row.get(0),
         ).unwrap();
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_queue_health() {
+        let conn = setup();
+        let pq = ProjectQueue::new(&conn);
+
+        // Empty queue health
+        let h = pq.health("peer1").unwrap();
+        assert_eq!(h.pending, 0);
+        assert_eq!(h.max_attempts, 0);
+        assert_eq!(h.oldest_age_ms, 0);
+
+        // Enqueue items
+        pq.enqueue("peer1", "event_a").unwrap();
+        pq.enqueue("peer1", "event_b").unwrap();
+
+        let h = pq.health("peer1").unwrap();
+        assert_eq!(h.pending, 2);
+        assert_eq!(h.max_attempts, 0);
+        // oldest_age_ms should be very small (just enqueued)
+        assert!(h.oldest_age_ms >= 0);
+
+        // Retry one item to bump attempts
+        pq.claim_batch("peer1", 1, 30_000).unwrap();
+        pq.mark_retry("peer1", "event_a").unwrap();
+
+        let h = pq.health("peer1").unwrap();
+        assert_eq!(h.pending, 2); // both still in queue
+        assert_eq!(h.max_attempts, 1); // event_a retried once
     }
 }

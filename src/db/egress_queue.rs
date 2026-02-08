@@ -1,7 +1,7 @@
 use rusqlite::{Connection, Result as SqliteResult, params};
 
 use crate::crypto::EventId;
-use super::queue::{current_timestamp_ms, backoff_ms, recover_expired_leases};
+use super::queue::{current_timestamp_ms, backoff_ms, recover_expired_leases, QueueHealth};
 
 pub struct EgressQueue<'a> {
     conn: &'a Connection,
@@ -147,6 +147,27 @@ impl<'a> EgressQueue<'a> {
             params![connection_id],
         )?;
         Ok(())
+    }
+
+    /// Queue health snapshot for observability.
+    pub fn health(&self, connection_id: &str) -> SqliteResult<QueueHealth> {
+        let now = current_timestamp_ms();
+        let pending: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM egress_queue WHERE connection_id = ?1 AND sent_at IS NULL",
+            params![connection_id],
+            |row| row.get(0),
+        )?;
+        let max_attempts: i64 = self.conn.query_row(
+            "SELECT COALESCE(MAX(attempts), 0) FROM egress_queue WHERE connection_id = ?1 AND sent_at IS NULL",
+            params![connection_id],
+            |row| row.get(0),
+        )?;
+        let oldest_age_ms: i64 = self.conn.query_row(
+            "SELECT COALESCE(?2 - MIN(available_at), 0) FROM egress_queue WHERE connection_id = ?1 AND sent_at IS NULL",
+            params![connection_id, now],
+            |row| row.get(0),
+        )?;
+        Ok(QueueHealth { pending, max_attempts, oldest_age_ms })
     }
 
     /// Recover expired leases, making them claimable again.
@@ -335,5 +356,43 @@ mod tests {
         // Should now be claimable again
         let claimed2 = eq.claim_batch("conn1", 10, 30_000).unwrap();
         assert_eq!(claimed2.len(), 1);
+    }
+
+    #[test]
+    fn test_egress_health() {
+        let conn = setup();
+        let eq = EgressQueue::new(&conn);
+
+        // Empty queue health
+        let h = eq.health("conn1").unwrap();
+        assert_eq!(h.pending, 0);
+        assert_eq!(h.max_attempts, 0);
+        assert_eq!(h.oldest_age_ms, 0);
+
+        // Enqueue items
+        let ids = vec![make_event_id(1), make_event_id(2), make_event_id(3)];
+        eq.enqueue_events("conn1", &ids).unwrap();
+
+        let h = eq.health("conn1").unwrap();
+        assert_eq!(h.pending, 3);
+        assert_eq!(h.max_attempts, 0);
+        assert!(h.oldest_age_ms >= 0);
+
+        // Claim, retry one
+        let claimed = eq.claim_batch("conn1", 1, 30_000).unwrap();
+        let rowid = claimed[0].0;
+        eq.mark_retry(rowid).unwrap();
+
+        let h = eq.health("conn1").unwrap();
+        assert_eq!(h.pending, 3); // all still unsent
+        assert_eq!(h.max_attempts, 1); // one retried
+
+        // Mark two as sent
+        let claimed = eq.claim_batch("conn1", 2, 30_000).unwrap();
+        let rowids: Vec<i64> = claimed.iter().map(|(r, _)| *r).collect();
+        eq.mark_sent(&rowids).unwrap();
+
+        let h = eq.health("conn1").unwrap();
+        assert_eq!(h.pending, 1); // only the retried one remains unsent
     }
 }

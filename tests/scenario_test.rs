@@ -1445,6 +1445,72 @@ async fn test_psk_two_set_isolation() {
     assert!(blocked >= 1, "encrypted event should be blocked on missing key dep");
 }
 
+/// Integration test: Alice and Bob sync, verify peer_endpoint_observations are recorded.
+/// Purge with far-future cutoff removes them; purge with past cutoff keeps them.
+#[tokio::test]
+async fn test_endpoint_observations_recorded() {
+    use poc_7::db::health::purge_expired_endpoints;
+
+    let channel = test_channel();
+    let alice = Peer::new("alice", channel);
+    let bob = Peer::new("bob", channel);
+
+    // Create some data so sync has something to do
+    alice.create_message("endpoint obs test");
+
+    let sync = start_peers(&alice, &bob);
+
+    assert_eventually(
+        || bob.store_count() == 1,
+        Duration::from_secs(15),
+        "bob should have 1 event",
+    ).await;
+
+    drop(sync);
+
+    // Check endpoint observations were recorded
+    let alice_db = open_connection(&alice.db_path).expect("open alice db");
+    let bob_db = open_connection(&bob.db_path).expect("open bob db");
+
+    let alice_obs: i64 = alice_db.query_row(
+        "SELECT COUNT(*) FROM peer_endpoint_observations WHERE recorded_by = ?1",
+        rusqlite::params![&alice.identity],
+        |row| row.get(0),
+    ).unwrap();
+
+    let bob_obs: i64 = bob_db.query_row(
+        "SELECT COUNT(*) FROM peer_endpoint_observations WHERE recorded_by = ?1",
+        rusqlite::params![&bob.identity],
+        |row| row.get(0),
+    ).unwrap();
+
+    // Both should have recorded at least one observation
+    assert!(alice_obs >= 1, "alice should have endpoint observations, got {}", alice_obs);
+    assert!(bob_obs >= 1, "bob should have endpoint observations, got {}", bob_obs);
+
+    // Purge with past cutoff (0) should keep all (all have future expires_at)
+    let purged = purge_expired_endpoints(&alice_db, 0).unwrap();
+    assert_eq!(purged, 0, "purge with past cutoff should keep all");
+
+    let still_there: i64 = alice_db.query_row(
+        "SELECT COUNT(*) FROM peer_endpoint_observations WHERE recorded_by = ?1",
+        rusqlite::params![&alice.identity],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(still_there, alice_obs, "observations should still be there after past-cutoff purge");
+
+    // Purge with far-future cutoff should remove all
+    let purged = purge_expired_endpoints(&alice_db, i64::MAX).unwrap();
+    assert!(purged >= 1, "purge with far-future cutoff should remove observations");
+
+    let remaining: i64 = alice_db.query_row(
+        "SELECT COUNT(*) FROM peer_endpoint_observations WHERE recorded_by = ?1",
+        rusqlite::params![&alice.identity],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(remaining, 0, "no observations should remain after far-future purge");
+}
+
 /// Gap 3: Encrypted inner event with unsupported signer_type rejects durably (not hard error).
 #[tokio::test]
 async fn test_encrypted_inner_unsupported_signer_rejects_durably() {

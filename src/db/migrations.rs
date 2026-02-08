@@ -166,6 +166,16 @@ static MIGRATIONS: &[Migration] = &[
             );
         ",
     },
+    Migration {
+        version: 7,
+        name: "add_peer_endpoint_indexes",
+        sql: "
+            CREATE INDEX IF NOT EXISTS idx_peer_endpoint_expires
+                ON peer_endpoint_observations(recorded_by, via_peer_id, expires_at);
+            CREATE INDEX IF NOT EXISTS idx_peer_endpoint_lookup
+                ON peer_endpoint_observations(recorded_by, via_peer_id, origin_ip, origin_port);
+        ",
+    },
 ];
 
 fn ensure_schema_migrations(conn: &Connection) -> SqliteResult<()> {
@@ -285,6 +295,6 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 6);
+        assert_eq!(count, 7);
     }
 }

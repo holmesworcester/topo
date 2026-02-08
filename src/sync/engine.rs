@@ -20,6 +20,7 @@ use tracing::{info, warn, error};
 
 use crate::crypto::{hash_event, event_id_to_base64, event_id_from_base64, EventId};
 use crate::db::{open_connection, schema::create_tables, store::Store, egress_queue::EgressQueue, wanted::WantedEvents, project_queue::ProjectQueue};
+use crate::db::health::{purge_expired_endpoints, record_endpoint_observation};
 use crate::events::{self, registry, ShareScope};
 use crate::projection::pipeline::project_one;
 use crate::runtime::SyncStats;
@@ -49,6 +50,19 @@ fn current_timestamp_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64
+}
+
+/// Endpoint observation TTL: 24 hours in milliseconds.
+const ENDPOINT_TTL_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// Batch writer drain batch size: 100 normal, 50 in low_mem.
+fn drain_batch_size() -> usize {
+    if low_mem_mode() { 50 } else { 100 }
+}
+
+/// Batch writer write batch cap: 1000 normal, 500 in low_mem.
+fn write_batch_cap() -> usize {
+    if low_mem_mode() { 500 } else { 1000 }
 }
 
 /// Batch writer task - drains channel and writes to SQLite in batches.
@@ -125,10 +139,11 @@ pub fn batch_writer(
             None => break,
         };
 
+        let cap = write_batch_cap();
         let mut batch = vec![first];
         while let Ok(item) = rx.try_recv() {
             batch.push(item);
-            if batch.len() >= 1000 {
+            if batch.len() >= cap {
                 break;
             }
         }
@@ -219,7 +234,8 @@ pub fn batch_writer(
                 }
 
                 // Second pass: drain project_queue
-                if let Err(e) = pq.drain(&recorded_by, |conn, event_id_b64| {
+                let batch_sz = drain_batch_size();
+                if let Err(e) = pq.drain_with_limit(&recorded_by, batch_sz, |conn, event_id_b64| {
                     if let Some(eid) = event_id_from_base64(event_id_b64) {
                         project_one(conn, &recorded_by, &eid)
                             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
@@ -227,6 +243,11 @@ pub fn batch_writer(
                     Ok(())
                 }) {
                     warn!("project_queue drain error: {}", e);
+                }
+                if let Ok(h) = pq.health(&recorded_by) {
+                    if h.pending > 0 || h.max_attempts > 0 {
+                        tracing::debug!(pending=%h.pending, max_attempts=%h.max_attempts, oldest_age_ms=%h.oldest_age_ms, "project_queue health");
+                    }
                 }
             }
             Err(e) => {
@@ -432,6 +453,11 @@ where
                         "Reconciliation complete in {} rounds: outgoing={}, wanted={}",
                         rounds, pending_out, pending_in
                     );
+                    if let Ok(h) = egress.health(peer_id) {
+                        if h.pending > 0 || h.max_attempts > 0 {
+                            tracing::debug!(pending=%h.pending, max_attempts=%h.max_attempts, oldest_age_ms=%h.oldest_age_ms, "egress_queue health");
+                        }
+                    }
                 }
             }
             Ok(Ok(SyncMessage::DoneAck)) => {
@@ -736,13 +762,18 @@ pub async fn accept_loop(
     {
         let db = open_connection(db_path)?;
         create_tables(&db)?;
+        let purged = purge_expired_endpoints(&db, current_timestamp_ms()).unwrap_or(0);
+        if purged > 0 {
+            info!("Purged {} expired endpoint observations", purged);
+        }
         let pq = ProjectQueue::new(&db);
         let recovered = pq.recover_expired().unwrap_or(0);
         if recovered > 0 {
             info!("Recovered {} expired project_queue leases", recovered);
         }
         let recorded_by_str = recorded_by.to_string();
-        let drained = pq.drain(&recorded_by_str, |conn, event_id_b64| {
+        let batch_sz = drain_batch_size();
+        let drained = pq.drain_with_limit(&recorded_by_str, batch_sz, |conn, event_id_b64| {
             if let Some(eid) = event_id_from_base64(event_id_b64) {
                 project_one(conn, &recorded_by_str, &eid)
                     .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
@@ -778,6 +809,22 @@ pub async fn accept_loop(
             }
         };
         info!("Accepted connection from {}", peer_id);
+
+        // Record endpoint observation
+        {
+            let remote = connection.remote_address();
+            if let Ok(db) = open_connection(db_path) {
+                let _ = record_endpoint_observation(
+                    &db,
+                    recorded_by,
+                    &peer_id,
+                    &remote.ip().to_string(),
+                    remote.port(),
+                    current_timestamp_ms(),
+                    ENDPOINT_TTL_MS,
+                );
+            }
+        }
 
         // Inner loop: repeated sync sessions on this connection
         loop {
@@ -819,13 +866,18 @@ pub async fn connect_loop(
     {
         let db = open_connection(db_path)?;
         create_tables(&db)?;
+        let purged = purge_expired_endpoints(&db, current_timestamp_ms()).unwrap_or(0);
+        if purged > 0 {
+            info!("Purged {} expired endpoint observations", purged);
+        }
         let pq = ProjectQueue::new(&db);
         let recovered = pq.recover_expired().unwrap_or(0);
         if recovered > 0 {
             info!("Recovered {} expired project_queue leases", recovered);
         }
         let recorded_by_str = recorded_by.to_string();
-        let drained = pq.drain(&recorded_by_str, |conn, event_id_b64| {
+        let batch_sz = drain_batch_size();
+        let drained = pq.drain_with_limit(&recorded_by_str, batch_sz, |conn, event_id_b64| {
             if let Some(eid) = event_id_from_base64(event_id_b64) {
                 project_one(conn, &recorded_by_str, &eid)
                     .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
@@ -863,6 +915,22 @@ pub async fn connect_loop(
             }
         };
         info!("Connected to {}", peer_id);
+
+        // Record endpoint observation
+        {
+            let remote_addr = connection.remote_address();
+            if let Ok(db) = open_connection(db_path) {
+                let _ = record_endpoint_observation(
+                    &db,
+                    recorded_by,
+                    &peer_id,
+                    &remote_addr.ip().to_string(),
+                    remote_addr.port(),
+                    current_timestamp_ms(),
+                    ENDPOINT_TTL_MS,
+                );
+            }
+        }
 
         // Inner loop: repeated sync sessions on this connection
         loop {
