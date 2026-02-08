@@ -91,11 +91,15 @@ fn project_invite_accepted(
     let network_id_b64 = event_id_to_base64(&ia.network_id);
 
     // Check existing trust anchor BEFORE any writes — reject on mismatch
-    let existing_anchor: Option<String> = conn.query_row(
+    let existing_anchor: Option<String> = match conn.query_row(
         "SELECT network_id FROM trust_anchors WHERE peer_id = ?1",
         rusqlite::params![recorded_by],
         |row| row.get(0),
-    ).ok();
+    ) {
+        Ok(v) => Some(v),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(e) => return Err(e.into()),
+    };
 
     if let Some(ref stored) = existing_anchor {
         if stored != &network_id_b64 {
