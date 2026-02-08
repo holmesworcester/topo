@@ -1634,6 +1634,7 @@ async fn test_encrypted_inner_unsupported_signer_rejects_durably() {
 // =============================================================================
 
 /// Helper: create a full bootstrap chain for a peer, returning all key material and event IDs.
+#[allow(dead_code)]
 struct BootstrapChain {
     network_key: ed25519_dalek::SigningKey,
     network_eid: [u8; 32],
@@ -1961,7 +1962,7 @@ fn test_out_of_order_identity() {
 fn test_foreign_network_excluded() {
     let channel = test_channel();
     let alice = Peer::new("alice", channel);
-    let chain = bootstrap_peer(&alice);
+    let _chain = bootstrap_peer(&alice);
 
     let db = open_connection(&alice.db_path).unwrap();
 
@@ -2007,7 +2008,7 @@ fn test_removal_enforcement() {
     // Create a "Bob" user event to be removed
     // For simplicity, create a second user_boot (as if Bob joined)
     let bob_user_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
-    let bob_user_pubkey = bob_user_key.verifying_key().to_bytes();
+    let _bob_user_pubkey = bob_user_key.verifying_key().to_bytes();
     // We'll create a second UserInviteOngoing for Bob, signed by Alice's PeerShared
     let db = open_connection(&alice.db_path).unwrap();
 
@@ -2456,4 +2457,376 @@ fn test_true_out_of_order_identity_chain() {
         |row| row.get(0),
     ).unwrap();
     assert!(user_valid, "user_boot should be valid after full chain");
+}
+
+// =============================================================================
+// Multi-peer identity scenario tests
+// =============================================================================
+
+/// Helper: bootstrap Bob as a new user joining Alice's network.
+/// Alice creates a UserInviteOngoing for Bob, Bob accepts and builds his own chain.
+/// Returns Bob's BootstrapChain (reuses BootstrapChain struct for consistency).
+#[allow(dead_code)]
+struct JoinChain {
+    invite_key: ed25519_dalek::SigningKey,
+    user_invite_eid: [u8; 32],
+    user_key: ed25519_dalek::SigningKey,
+    user_eid: [u8; 32],
+    device_invite_key: ed25519_dalek::SigningKey,
+    device_invite_eid: [u8; 32],
+    peer_shared_key: ed25519_dalek::SigningKey,
+    peer_shared_eid: [u8; 32],
+    invite_accepted_eid: [u8; 32],
+}
+
+fn join_network(
+    joiner: &Peer,
+    alice_chain: &BootstrapChain,
+    alice: &Peer,
+) -> JoinChain {
+    use ed25519_dalek::SigningKey;
+
+    let mut rng = rand::thread_rng();
+
+    // Alice creates a UserInviteOngoing for the joiner (signed by Alice's PeerShared)
+    let invite_key = SigningKey::generate(&mut rng);
+    let invite_pubkey = invite_key.verifying_key().to_bytes();
+    let user_invite_eid = alice.create_user_invite_ongoing(
+        invite_pubkey,
+        &alice_chain.peer_shared_key,
+        &alice_chain.peer_shared_eid,
+        &alice_chain.admin_eid,
+    );
+
+    // Joiner accepts the invite (local event, binds trust anchor to Alice's network_id)
+    let invite_accepted_eid = joiner.create_invite_accepted(&user_invite_eid, alice_chain.network_id);
+
+    // Joiner creates UserBoot (signed by the invite key Alice gave)
+    let user_key = SigningKey::generate(&mut rng);
+    let user_pubkey = user_key.verifying_key().to_bytes();
+    let user_eid = joiner.create_user_boot(user_pubkey, &invite_key, &user_invite_eid);
+
+    // Joiner creates DeviceInviteFirst (signed by joiner's user key)
+    let device_invite_key = SigningKey::generate(&mut rng);
+    let device_invite_pubkey = device_invite_key.verifying_key().to_bytes();
+    let device_invite_eid = joiner.create_device_invite_first(
+        device_invite_pubkey,
+        &user_key,
+        &user_eid,
+    );
+
+    // Joiner creates PeerSharedFirst (signed by device invite)
+    let peer_shared_key = SigningKey::generate(&mut rng);
+    let peer_shared_pubkey = peer_shared_key.verifying_key().to_bytes();
+    let peer_shared_eid = joiner.create_peer_shared_first(
+        peer_shared_pubkey,
+        &device_invite_key,
+        &device_invite_eid,
+    );
+
+    JoinChain {
+        invite_key,
+        user_invite_eid,
+        user_key,
+        user_eid,
+        device_invite_key,
+        device_invite_eid,
+        peer_shared_key,
+        peer_shared_eid,
+        invite_accepted_eid,
+    }
+}
+
+/// Two-peer identity bootstrap + join: Alice bootstraps, invites Bob, Bob joins,
+/// they sync, and both peers converge on the same identity state.
+#[tokio::test]
+async fn test_two_peer_identity_join_and_sync() {
+    let channel = test_channel();
+    let alice = Peer::new("alice", channel);
+    let bob = Peer::new("bob", channel);
+
+    // Alice bootstraps her full identity chain
+    let alice_chain = bootstrap_peer(&alice);
+
+    // Alice creates a UserInviteOngoing for Bob
+    // Bob needs the invite to exist on Alice's side; sync will deliver it
+    let _bob_join = join_network(&bob, &alice_chain, &alice);
+
+    // Sync — shared events flow between peers
+    let sync = start_peers(&alice, &bob);
+
+    // Wait for convergence on projected identity state, not raw event counts
+    assert_eventually(
+        || alice.peer_shared_count() == 2 && bob.peer_shared_count() == 2,
+        Duration::from_secs(15),
+        "both peers should converge on 2 peers_shared",
+    ).await;
+
+    drop(sync);
+
+    // Both peers should have projected the same identity state:
+    // - 1 network
+    // - 2 user_invites (boot + ongoing)
+    // - 2 users (Alice's + Bob's)
+    // - 2 device_invites
+    // - 2 peers_shared
+    // - 1 admin (Alice's)
+    assert_eq!(alice.network_count(), 1, "Alice should have 1 network");
+    assert_eq!(bob.network_count(), 1, "Bob should have 1 network");
+
+    assert_eq!(alice.user_invite_count(), 2, "Alice: boot + ongoing invites");
+    assert_eq!(bob.user_invite_count(), 2, "Bob: boot + ongoing invites");
+
+    assert_eq!(alice.user_count(), 2, "Alice sees 2 users");
+    assert_eq!(bob.user_count(), 2, "Bob sees 2 users");
+
+    assert_eq!(alice.device_invite_count(), 2, "Alice sees 2 device invites");
+    assert_eq!(bob.device_invite_count(), 2, "Bob sees 2 device invites");
+
+    assert_eq!(alice.peer_shared_count(), 2, "Alice sees 2 peers_shared");
+    assert_eq!(bob.peer_shared_count(), 2, "Bob sees 2 peers_shared");
+
+    assert_eq!(alice.admin_count(), 1, "Alice sees 1 admin");
+    assert_eq!(bob.admin_count(), 1, "Bob sees 1 admin");
+
+    // Replay invariants hold for both peers
+    verify_projection_invariants(&alice);
+    verify_projection_invariants(&bob);
+}
+
+/// Identity chain events arrive out of order via sync and cascade to valid.
+/// Bob creates his own events but they depend on Alice's chain. Sync delivers
+/// Alice's events, which unblock Bob's chain via cascade.
+#[tokio::test]
+async fn test_identity_cascade_via_sync() {
+    let channel = test_channel();
+    let alice = Peer::new("alice", channel);
+    let bob = Peer::new("bob", channel);
+
+    // Alice bootstraps
+    let alice_chain = bootstrap_peer(&alice);
+
+    // Alice creates an invite for Bob on her side
+    let mut rng = rand::thread_rng();
+    let invite_key = ed25519_dalek::SigningKey::generate(&mut rng);
+    let invite_pubkey = invite_key.verifying_key().to_bytes();
+    let user_invite_eid = alice.create_user_invite_ongoing(
+        invite_pubkey,
+        &alice_chain.peer_shared_key,
+        &alice_chain.peer_shared_eid,
+        &alice_chain.admin_eid,
+    );
+
+    // Bob accepts the invite locally — this sets his trust anchor
+    let _ia_eid = bob.create_invite_accepted(&user_invite_eid, alice_chain.network_id);
+
+    // Bob creates UserBoot signed by the invite — but the invite event is on
+    // Alice's side, not Bob's. So this will block on the signed_by dep.
+    let _user_key = ed25519_dalek::SigningKey::generate(&mut rng);
+    let user_pubkey = _user_key.verifying_key().to_bytes();
+    let user_eid = bob.create_user_boot(user_pubkey, &invite_key, &user_invite_eid);
+    let user_eid_b64 = event_id_to_base64(&user_eid);
+
+    // Confirm UserBoot is blocked before sync
+    assert_eq!(bob.user_count(), 0, "Bob's UserBoot should be blocked (missing signer dep)");
+    assert!(bob.blocked_dep_count() > 0, "Bob should have blocked deps");
+
+    // Sync — Alice's events flow to Bob, unblocking the cascade
+    let sync = start_peers(&alice, &bob);
+
+    // Wait for Bob's specific UserBoot event to become valid, not just any user
+    assert_eventually(
+        || {
+            let db = open_connection(&bob.db_path).unwrap();
+            let valid: bool = db.query_row(
+                "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![&bob.identity, &user_eid_b64],
+                |row| row.get(0),
+            ).unwrap_or(false);
+            valid
+        },
+        Duration::from_secs(15),
+        "Bob's specific UserBoot should cascade to valid after sync",
+    ).await;
+
+    drop(sync);
+
+    // Bob should now have Alice's full identity chain projected plus his own user
+    assert_eq!(bob.network_count(), 1, "Bob should have Alice's network");
+    assert_eq!(bob.user_invite_count(), 2, "Bob should have both invites");
+    assert_eq!(bob.user_count(), 2, "Both Alice's and Bob's users should be valid");
+
+    verify_projection_invariants(&bob);
+}
+
+/// After identity join, Alice and Bob can exchange messages. Tests that the
+/// full trust chain enables the messaging layer to work across peers.
+#[tokio::test]
+async fn test_identity_then_messaging() {
+    let channel = test_channel();
+    let alice = Peer::new("alice", channel);
+    let bob = Peer::new("bob", channel);
+
+    // Both peers establish identity
+    let alice_chain = bootstrap_peer(&alice);
+    let _bob_join = join_network(&bob, &alice_chain, &alice);
+
+    // Sync identity events first
+    let sync = start_peers(&alice, &bob);
+    assert_eventually(
+        || alice.peer_shared_count() == 2 && bob.peer_shared_count() == 2,
+        Duration::from_secs(15),
+        "identity should converge",
+    ).await;
+    drop(sync);
+
+    // Now both peers send messages
+    alice.create_message("Hello from Alice");
+    bob.create_message("Hello from Bob");
+
+    // Sync messages
+    let sync = start_peers(&alice, &bob);
+    assert_eventually(
+        || alice.scoped_message_count() == 2 && bob.scoped_message_count() == 2,
+        Duration::from_secs(15),
+        "messages should converge after identity sync",
+    ).await;
+    drop(sync);
+
+    verify_projection_invariants(&alice);
+    verify_projection_invariants(&bob);
+}
+
+/// Alice bootstraps on two devices (Phone and Laptop). Phone creates a DeviceInviteOngoing
+/// for Laptop, Laptop joins with PeerSharedOngoing, both sync and converge.
+#[tokio::test]
+async fn test_device_link_via_sync() {
+    use poc_7::events::{DeviceInviteOngoingEvent, PeerSharedOngoingEvent, ParsedEvent};
+    use poc_7::projection::create::{create_signed_event_sync, event_id_or_blocked};
+
+    let channel = test_channel();
+    let phone = Peer::new("phone", channel);
+    let laptop = Peer::new("laptop", channel);
+
+    let mut rng = rand::thread_rng();
+
+    // Phone bootstraps full identity chain
+    let phone_chain = bootstrap_peer(&phone);
+
+    // Phone creates a DeviceInviteOngoing for Laptop (signed by Phone's User key)
+    let laptop_di_key = ed25519_dalek::SigningKey::generate(&mut rng);
+    let laptop_di_pubkey = laptop_di_key.verifying_key().to_bytes();
+    let db = open_connection(&phone.db_path).unwrap();
+    let di_evt = ParsedEvent::DeviceInviteOngoing(DeviceInviteOngoingEvent {
+        created_at_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64,
+        public_key: laptop_di_pubkey,
+        signed_by: phone_chain.user_eid,
+        signer_type: 4,
+        signature: [0u8; 64],
+    });
+    let laptop_di_eid = create_signed_event_sync(
+        &db, &phone.identity, &di_evt, &phone_chain.user_key,
+    ).expect("create device_invite_ongoing");
+    drop(db);
+
+    // Laptop accepts the invite (local, sets trust anchor)
+    let _ia_eid = laptop.create_invite_accepted(&laptop_di_eid, phone_chain.network_id);
+
+    // Laptop creates PeerSharedOngoing (signed by the device invite key Phone gave).
+    // This will be blocked because the signed_by dep (DeviceInviteOngoing) is on Phone.
+    // event_id_or_blocked extracts the event_id even when blocked.
+    let laptop_ps_key = ed25519_dalek::SigningKey::generate(&mut rng);
+    let laptop_ps_pubkey = laptop_ps_key.verifying_key().to_bytes();
+    let db = open_connection(&laptop.db_path).unwrap();
+    let ps_evt = ParsedEvent::PeerSharedOngoing(PeerSharedOngoingEvent {
+        created_at_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64,
+        public_key: laptop_ps_pubkey,
+        signed_by: laptop_di_eid,
+        signer_type: 3,
+        signature: [0u8; 64],
+    });
+    let _laptop_ps_eid = event_id_or_blocked(create_signed_event_sync(
+        &db, &laptop.identity, &ps_evt, &laptop_di_key,
+    )).expect("create peer_shared_ongoing");
+    drop(db);
+
+    // Laptop's PeerSharedOngoing is blocked — signed_by dep (DeviceInviteOngoing) is on Phone
+    assert_eq!(laptop.peer_shared_count(), 0, "Laptop's peer_shared should be blocked before sync");
+
+    // Sync — Phone's events flow to Laptop, unblocking Laptop's chain
+    let sync = start_peers(&phone, &laptop);
+
+    assert_eventually(
+        || phone.peer_shared_count() == 2 && laptop.peer_shared_count() == 2,
+        Duration::from_secs(15),
+        "both devices should see 2 peers_shared after sync",
+    ).await;
+
+    drop(sync);
+
+    // Both devices share the same network and identity state
+    assert_eq!(phone.network_count(), 1);
+    assert_eq!(laptop.network_count(), 1);
+    assert_eq!(phone.device_invite_count(), 2, "Phone: first + ongoing");
+    assert_eq!(laptop.device_invite_count(), 2, "Laptop: first + ongoing");
+
+    verify_projection_invariants(&phone);
+    verify_projection_invariants(&laptop);
+}
+
+/// Alice and Bob are on different networks. When they sync, Bob's network events
+/// are rejected by Alice's trust anchor, and vice versa. Neither peer's identity
+/// state is corrupted.
+#[tokio::test]
+async fn test_foreign_network_rejected_via_sync() {
+    let channel = test_channel();
+    let alice = Peer::new("alice", channel);
+    let bob = Peer::new("bob", channel);
+
+    // Both bootstrap independently on DIFFERENT networks
+    let alice_chain = bootstrap_peer(&alice);
+    let bob_chain = bootstrap_peer(&bob);
+
+    // Sanity: different network_ids
+    assert_ne!(alice_chain.network_id, bob_chain.network_id,
+        "networks should differ");
+
+    // Before sync: each peer has exactly 1 network projected
+    assert_eq!(alice.network_count(), 1);
+    assert_eq!(bob.network_count(), 1);
+
+    // Sync — shared events flow between peers
+    let sync = start_peers(&alice, &bob);
+
+    // Wait for events to transfer — gate on rejected events appearing
+    // (foreign network events get rejected by the trust anchor guard)
+    assert_eventually(
+        || alice.rejected_event_count() > 0 && bob.rejected_event_count() > 0,
+        Duration::from_secs(15),
+        "both peers should have rejected foreign network events",
+    ).await;
+
+    drop(sync);
+
+    // Each peer should still have exactly 1 network projected — the foreign
+    // network event is rejected by the trust anchor guard, not accepted.
+    assert_eq!(alice.network_count(), 1,
+        "Alice should still have exactly 1 network (foreign rejected)");
+    assert_eq!(bob.network_count(), 1,
+        "Bob should still have exactly 1 network (foreign rejected)");
+
+    // Foreign identity events should be rejected, not just blocked
+    assert!(alice.rejected_event_count() > 0,
+        "Alice should have rejected foreign network events");
+    assert!(bob.rejected_event_count() > 0,
+        "Bob should have rejected foreign network events");
+
+    // Each peer's own identity state is unaffected
+    assert_eq!(alice.user_count(), 1, "Alice's own user unchanged");
+    assert_eq!(bob.user_count(), 1, "Bob's own user unchanged");
+
+    verify_projection_invariants(&alice);
+    verify_projection_invariants(&bob);
 }

@@ -6,7 +6,7 @@ use crate::db::{open_connection, schema::create_tables};
 use crate::events::{
     MessageEvent, MessageDeletionEvent, ReactionEvent, PeerKeyEvent, SecretKeyEvent,
     SignedMemoEvent, ParsedEvent,
-    NetworkEvent, InviteAcceptedEvent, UserInviteBootEvent,
+    NetworkEvent, InviteAcceptedEvent, UserInviteBootEvent, UserInviteOngoingEvent,
     DeviceInviteFirstEvent, UserBootEvent,
     PeerSharedFirstEvent, AdminBootEvent,
     UserRemovedEvent, PeerRemovedEvent, SecretSharedEvent,
@@ -304,6 +304,28 @@ impl Peer {
             .expect("failed to create user_invite_boot")
     }
 
+    /// Create a UserInviteOngoing event (signed by PeerShared key, dep on admin).
+    /// Used when an existing admin invites a new user.
+    pub fn create_user_invite_ongoing(
+        &self,
+        invite_public_key: [u8; 32],
+        signing_key: &ed25519_dalek::SigningKey,
+        peer_shared_event_id: &EventId,
+        admin_event_id: &EventId,
+    ) -> EventId {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        let evt = ParsedEvent::UserInviteOngoing(UserInviteOngoingEvent {
+            created_at_ms: current_timestamp_ms(),
+            public_key: invite_public_key,
+            admin_event_id: *admin_event_id,
+            signed_by: *peer_shared_event_id,
+            signer_type: 5,
+            signature: [0u8; 64],
+        });
+        event_id_or_blocked(create_signed_event_sync(&db, &self.identity, &evt, signing_key))
+            .expect("failed to create user_invite_ongoing")
+    }
+
     /// Create a UserBoot event (signed by UserInvite key). Returns the event ID.
     pub fn create_user_boot(
         &self,
@@ -594,6 +616,118 @@ impl Peer {
         let db = open_connection(&self.db_path).expect("failed to open db");
         db.query_row(
             "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
+            rusqlite::params![&self.identity],
+            |row| row.get(0),
+        ).unwrap_or(0)
+    }
+
+    // --- Identity projection count helpers ---
+
+    /// Count valid events for this peer.
+    pub fn valid_event_count(&self) -> i64 {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        db.query_row(
+            "SELECT COUNT(*) FROM valid_events WHERE peer_id = ?1",
+            rusqlite::params![&self.identity],
+            |row| row.get(0),
+        ).unwrap_or(0)
+    }
+
+    /// Count rejected events for this peer.
+    pub fn rejected_event_count(&self) -> i64 {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        db.query_row(
+            "SELECT COUNT(*) FROM rejected_events WHERE peer_id = ?1",
+            rusqlite::params![&self.identity],
+            |row| row.get(0),
+        ).unwrap_or(0)
+    }
+
+    /// Count blocked event deps for this peer.
+    pub fn blocked_dep_count(&self) -> i64 {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        db.query_row(
+            "SELECT COUNT(DISTINCT event_id) FROM blocked_event_deps WHERE peer_id = ?1",
+            rusqlite::params![&self.identity],
+            |row| row.get(0),
+        ).unwrap_or(0)
+    }
+
+    /// Count networks projected for this peer.
+    pub fn network_count(&self) -> i64 {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        db.query_row(
+            "SELECT COUNT(*) FROM networks WHERE recorded_by = ?1",
+            rusqlite::params![&self.identity],
+            |row| row.get(0),
+        ).unwrap_or(0)
+    }
+
+    /// Count user invites projected for this peer.
+    pub fn user_invite_count(&self) -> i64 {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        db.query_row(
+            "SELECT COUNT(*) FROM user_invites WHERE recorded_by = ?1",
+            rusqlite::params![&self.identity],
+            |row| row.get(0),
+        ).unwrap_or(0)
+    }
+
+    /// Count users projected for this peer.
+    pub fn user_count(&self) -> i64 {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        db.query_row(
+            "SELECT COUNT(*) FROM users WHERE recorded_by = ?1",
+            rusqlite::params![&self.identity],
+            |row| row.get(0),
+        ).unwrap_or(0)
+    }
+
+    /// Count device invites projected for this peer.
+    pub fn device_invite_count(&self) -> i64 {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        db.query_row(
+            "SELECT COUNT(*) FROM device_invites WHERE recorded_by = ?1",
+            rusqlite::params![&self.identity],
+            |row| row.get(0),
+        ).unwrap_or(0)
+    }
+
+    /// Count peers_shared projected for this peer.
+    pub fn peer_shared_count(&self) -> i64 {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        db.query_row(
+            "SELECT COUNT(*) FROM peers_shared WHERE recorded_by = ?1",
+            rusqlite::params![&self.identity],
+            |row| row.get(0),
+        ).unwrap_or(0)
+    }
+
+    /// Count admins projected for this peer.
+    pub fn admin_count(&self) -> i64 {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        db.query_row(
+            "SELECT COUNT(*) FROM admins WHERE recorded_by = ?1",
+            rusqlite::params![&self.identity],
+            |row| row.get(0),
+        ).unwrap_or(0)
+    }
+
+    /// Count invite_accepted projected for this peer.
+    pub fn invite_accepted_count(&self) -> i64 {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        db.query_row(
+            "SELECT COUNT(*) FROM invite_accepted WHERE recorded_by = ?1",
+            rusqlite::params![&self.identity],
+            |row| row.get(0),
+        ).unwrap_or(0)
+    }
+
+    /// Count transport_keys projected for this peer.
+    pub fn transport_key_count(&self) -> i64 {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        db.query_row(
+            "SELECT COUNT(*) FROM transport_keys WHERE recorded_by = ?1",
             rusqlite::params![&self.identity],
             |row| row.get(0),
         ).unwrap_or(0)
