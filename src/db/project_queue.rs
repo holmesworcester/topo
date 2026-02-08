@@ -160,11 +160,12 @@ impl<'a> ProjectQueue<'a> {
 
     /// Claim-process-done loop. Processes all pending items for a peer.
     /// For each item: project_fn runs (which may insert into valid_events, blocked_event_deps,
-    /// projection tables, and cascade-unblock dependents), then the item is dequeued.
-    /// Returns number of items processed.
+    /// projection tables, and cascade-unblock dependents). Successfully processed items are
+    /// dequeued; failed items are retried with exponential backoff.
+    /// Returns number of items successfully processed.
     pub fn drain<F>(&self, peer_id: &str, mut project_fn: F) -> SqliteResult<usize>
     where
-        F: FnMut(&Connection, &str),
+        F: FnMut(&Connection, &str) -> Result<(), Box<dyn std::error::Error>>,
     {
         let mut total = 0;
         loop {
@@ -172,20 +173,35 @@ impl<'a> ProjectQueue<'a> {
             if batch.is_empty() {
                 break;
             }
-            // Process all items first
+            // Process items and track which succeeded vs failed
+            let mut succeeded: Vec<&str> = Vec::with_capacity(batch.len());
+            let mut failed: Vec<&str> = Vec::new();
             for event_id_b64 in &batch {
-                project_fn(self.conn, event_id_b64);
+                match project_fn(self.conn, event_id_b64) {
+                    Ok(()) => succeeded.push(event_id_b64),
+                    Err(_) => failed.push(event_id_b64),
+                }
             }
-            // Then batch-delete from queue in a single transaction
-            self.conn.execute("BEGIN", [])?;
-            let mut del_stmt = self.conn.prepare(
-                "DELETE FROM project_queue WHERE peer_id = ?1 AND event_id = ?2",
-            )?;
-            for event_id_b64 in &batch {
-                del_stmt.execute(params![peer_id, event_id_b64])?;
+            // Batch-delete successful items
+            if !succeeded.is_empty() {
+                self.conn.execute("BEGIN", [])?;
+                let mut del_stmt = self.conn.prepare(
+                    "DELETE FROM project_queue WHERE peer_id = ?1 AND event_id = ?2",
+                )?;
+                for event_id_b64 in &succeeded {
+                    del_stmt.execute(params![peer_id, event_id_b64])?;
+                }
+                self.conn.execute("COMMIT", [])?;
             }
-            self.conn.execute("COMMIT", [])?;
-            total += batch.len();
+            // Retry failed items with backoff
+            for event_id_b64 in &failed {
+                let _ = self.mark_retry(peer_id, event_id_b64);
+            }
+            total += succeeded.len();
+            // If entire batch failed, stop draining to avoid infinite loop
+            if succeeded.is_empty() && !batch.is_empty() {
+                break;
+            }
         }
         Ok(total)
     }
@@ -366,6 +382,7 @@ mod tests {
         let mut processed = Vec::new();
         let count = pq.drain("peer1", |_conn, eid| {
             processed.push(eid.to_string());
+            Ok(())
         }).unwrap();
 
         assert_eq!(count, 3);
@@ -380,6 +397,75 @@ mod tests {
             [], |row| row.get(0),
         ).unwrap();
         assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn test_drain_retries_failed_items() {
+        let conn = setup();
+        let pq = ProjectQueue::new(&conn);
+
+        pq.enqueue("peer1", "event_a").unwrap();
+        pq.enqueue("peer1", "event_b").unwrap();
+        pq.enqueue("peer1", "event_c").unwrap();
+
+        // Callback that fails for event_b
+        let mut processed = Vec::new();
+        let count = pq.drain("peer1", |_conn, eid| {
+            if eid == "event_b" {
+                return Err("simulated failure".into());
+            }
+            processed.push(eid.to_string());
+            Ok(())
+        }).unwrap();
+
+        // event_a and event_c succeeded
+        assert_eq!(count, 2);
+        assert!(processed.contains(&"event_a".to_string()));
+        assert!(processed.contains(&"event_c".to_string()));
+
+        // event_b should still be in the queue with incremented attempts
+        let attempts: i64 = conn.query_row(
+            "SELECT attempts FROM project_queue WHERE peer_id = 'peer1' AND event_id = 'event_b'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert!(attempts >= 1, "failed item should have incremented attempts");
+
+        // event_b should have a future available_at (backoff)
+        let available_at: i64 = conn.query_row(
+            "SELECT available_at FROM project_queue WHERE peer_id = 'peer1' AND event_id = 'event_b'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert!(available_at > current_timestamp_ms(), "failed item should be delayed by backoff");
+
+        // Successfully completed items should be gone
+        let remaining: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM project_queue WHERE peer_id = 'peer1'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(remaining, 1, "only the failed item should remain");
+    }
+
+    #[test]
+    fn test_drain_stops_on_all_failures() {
+        let conn = setup();
+        let pq = ProjectQueue::new(&conn);
+
+        pq.enqueue("peer1", "event_a").unwrap();
+        pq.enqueue("peer1", "event_b").unwrap();
+
+        // Callback that always fails
+        let count = pq.drain("peer1", |_conn, _eid| {
+            Err("always fail".into())
+        }).unwrap();
+
+        assert_eq!(count, 0, "no items should be counted as processed");
+
+        // Both items should remain in queue
+        let remaining: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM project_queue WHERE peer_id = 'peer1'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(remaining, 2, "all items should remain after total failure");
     }
 
     #[test]

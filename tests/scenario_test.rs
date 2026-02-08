@@ -1024,8 +1024,10 @@ async fn test_project_queue_crash_recovery() {
 
     let drained = pq.drain(&alice.identity, |conn, eid_b64| {
         if let Some(eid) = event_id_from_base64(eid_b64) {
-            let _ = project_one(conn, &alice.identity, &eid);
+            project_one(conn, &alice.identity, &eid)
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
         }
+        Ok(())
     }).unwrap();
     assert_eq!(drained, 3);
 
@@ -1079,8 +1081,10 @@ async fn test_project_queue_drain_after_batch() {
     // Drain should process nothing (queue empty)
     let drained = pq.drain(&alice.identity, |conn, eid_b64| {
         if let Some(eid) = event_id_from_base64(eid_b64) {
-            let _ = project_one(conn, &alice.identity, &eid);
+            project_one(conn, &alice.identity, &eid)
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
         }
+        Ok(())
     }).unwrap();
     assert_eq!(drained, 0);
 

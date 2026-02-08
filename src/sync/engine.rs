@@ -221,10 +221,10 @@ pub fn batch_writer(
                 // Second pass: drain project_queue
                 if let Err(e) = pq.drain(&recorded_by, |conn, event_id_b64| {
                     if let Some(eid) = event_id_from_base64(event_id_b64) {
-                        if let Err(e) = project_one(conn, &recorded_by, &eid) {
-                            warn!("projection error for {}: {}", event_id_b64, e);
-                        }
+                        project_one(conn, &recorded_by, &eid)
+                            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
                     }
+                    Ok(())
                 }) {
                     warn!("project_queue drain error: {}", e);
                 }
@@ -341,7 +341,6 @@ where
     let mut neg = Negentropy::new(Storage::Borrowed(&neg_storage), 64 * 1024)?;
 
     let store = Store::new(&db);
-    let reg = registry();
 
     let ingest_cap = if low_mem_mode() { 1000 } else { 5000 };
     let (ingest_tx, ingest_rx) = mpsc::channel::<(EventId, Vec<u8>)>(ingest_cap);
@@ -463,17 +462,7 @@ where
 
             let mut sent_rowids: Vec<i64> = Vec::with_capacity(batch.len());
             for (rowid, event_id) in batch {
-                if let Ok(Some(blob)) = store.get(&event_id) {
-                    // Defense-in-depth: skip local-only events
-                    if let Some(type_code) = events::extract_event_type(&blob) {
-                        if let Some(meta) = reg.lookup(type_code) {
-                            if meta.share_scope == ShareScope::Local {
-                                sent_rowids.push(rowid);
-                                continue;
-                            }
-                        }
-                    }
-
+                if let Ok(Some(blob)) = store.get_shared(&event_id) {
                     let blob_len = blob.len() as u64;
                     if data_send.send(&SyncMessage::Event { blob }).await.is_ok() {
                         events_sent += 1;
@@ -587,7 +576,6 @@ where
     let mut neg = Negentropy::new(Storage::Borrowed(&neg_storage), 64 * 1024)?;
 
     let store = Store::new(&db);
-    let reg = registry();
 
     let ingest_cap = if low_mem_mode() { 1000 } else { 5000 };
     let (ingest_tx, ingest_rx) = mpsc::channel::<(EventId, Vec<u8>)>(ingest_cap);
@@ -661,17 +649,7 @@ where
 
             let mut sent_rowids: Vec<i64> = Vec::with_capacity(batch.len());
             for (rowid, event_id) in batch {
-                if let Ok(Some(blob)) = store.get(&event_id) {
-                    // Defense-in-depth: skip local-only events
-                    if let Some(type_code) = events::extract_event_type(&blob) {
-                        if let Some(meta) = reg.lookup(type_code) {
-                            if meta.share_scope == ShareScope::Local {
-                                sent_rowids.push(rowid);
-                                continue;
-                            }
-                        }
-                    }
-
+                if let Ok(Some(blob)) = store.get_shared(&event_id) {
                     let blob_len = blob.len() as u64;
                     if data_send.send(&SyncMessage::Event { blob }).await.is_ok() {
                         events_sent += 1;
@@ -766,8 +744,10 @@ pub async fn accept_loop(
         let recorded_by_str = recorded_by.to_string();
         let drained = pq.drain(&recorded_by_str, |conn, event_id_b64| {
             if let Some(eid) = event_id_from_base64(event_id_b64) {
-                let _ = project_one(conn, &recorded_by_str, &eid);
+                project_one(conn, &recorded_by_str, &eid)
+                    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
             }
+            Ok(())
         }).unwrap_or(0);
         if drained > 0 {
             info!("Processed {} pending project_queue items from previous session", drained);
@@ -847,8 +827,10 @@ pub async fn connect_loop(
         let recorded_by_str = recorded_by.to_string();
         let drained = pq.drain(&recorded_by_str, |conn, event_id_b64| {
             if let Some(eid) = event_id_from_base64(event_id_b64) {
-                let _ = project_one(conn, &recorded_by_str, &eid);
+                project_one(conn, &recorded_by_str, &eid)
+                    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
             }
+            Ok(())
         }).unwrap_or(0);
         if drained > 0 {
             info!("Processed {} pending project_queue items from previous session", drained);
