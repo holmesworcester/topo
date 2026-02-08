@@ -152,6 +152,18 @@ impl Peer {
         create_event_sync(&db, &self.identity, &sk).expect("failed to create secret_key")
     }
 
+    /// Create a SecretKey event with deterministic key bytes and timestamp.
+    /// Two peers calling this with the same args produce the same blob -> same event_id.
+    /// This is used for PSK materialization in tests where both peers need the same key.
+    pub fn create_secret_key_deterministic(&self, key_bytes: [u8; 32], created_at_ms: u64) -> EventId {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        let sk = ParsedEvent::SecretKey(SecretKeyEvent {
+            created_at_ms,
+            key_bytes,
+        });
+        create_event_sync(&db, &self.identity, &sk).expect("failed to create secret_key")
+    }
+
     /// Create an encrypted message. Encrypts the given content as a message event
     /// using the key referenced by key_event_id.
     /// Returns the encrypted event ID.
@@ -260,6 +272,23 @@ impl Peer {
             rusqlite::params![&self.identity],
             |row| row.get(0),
         ).unwrap_or(0)
+    }
+
+    /// Count rows in the neg_items table (events advertised for sync).
+    pub fn neg_items_count(&self) -> i64 {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        db.query_row("SELECT COUNT(*) FROM neg_items", [], |row| row.get(0))
+            .unwrap_or(0)
+    }
+
+    /// Check if a specific event_id (base64) exists in the events table.
+    pub fn has_event(&self, event_id_b64: &str) -> bool {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        db.query_row(
+            "SELECT COUNT(*) > 0 FROM events WHERE event_id = ?1",
+            rusqlite::params![event_id_b64],
+            |row| row.get(0),
+        ).unwrap_or(false)
     }
 
     /// Count rows in the deleted_messages projection table scoped to this peer.
