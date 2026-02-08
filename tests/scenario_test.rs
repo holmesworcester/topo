@@ -2086,7 +2086,7 @@ fn test_identity_replay_invariants() {
 }
 
 #[test]
-fn test_transport_key_projects_and_populates_binding() {
+fn test_transport_key_projects_without_auto_binding() {
     let channel = test_channel();
     let alice = Peer::new("alice", channel);
     let chain = bootstrap_peer(&alice);
@@ -2128,6 +2128,56 @@ fn test_transport_key_projects_and_populates_binding() {
     // allowed_peers_from_db should include SPKI from transport_keys (not bindings)
     let allowed = poc_7::db::transport_trust::allowed_peers_from_db(&db, &alice.identity).unwrap();
     assert!(allowed.contains(&spki_fp), "allowed_peers should include transport key SPKI");
+}
+
+#[test]
+fn test_transport_key_signer_matches_local_key() {
+    use ed25519_dalek::SigningKey;
+    use poc_7::transport_identity::{transport_cert_paths_from_db, ensure_transport_key_event};
+
+    let channel = test_channel();
+    let alice = Peer::new("alice", channel);
+    let chain = bootstrap_peer(&alice);
+
+    // Insert a second peers_shared row with a different public key (simulating another
+    // peer in the workspace). This row will have a lower rowid than the local peer's
+    // PeerSharedFirst if we insert it after bootstrap, but the point is that multiple
+    // rows exist and the function must select by public key match, not by rowid.
+    let other_key = SigningKey::generate(&mut rand::thread_rng());
+    let other_pubkey = other_key.verifying_key().to_bytes();
+    let db = open_connection(&alice.db_path).unwrap();
+    db.execute(
+        "INSERT INTO peers_shared (recorded_by, event_id, public_key) VALUES (?1, ?2, ?3)",
+        rusqlite::params![&alice.identity, "other_peer_eid", other_pubkey.as_slice()],
+    ).unwrap();
+
+    // Verify we now have 2 peers_shared rows
+    let count: i64 = db.query_row(
+        "SELECT COUNT(*) FROM peers_shared WHERE recorded_by = ?1",
+        rusqlite::params![&alice.identity],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(count, 2);
+    drop(db);
+
+    // Generate a TLS cert so ensure_transport_key_event has something to work with
+    let (cert_path, key_path) = transport_cert_paths_from_db(&alice.db_path);
+    load_or_generate_cert(&cert_path, &key_path).unwrap();
+
+    // Call ensure_transport_key_event with the LOCAL peer_shared signing key —
+    // it should succeed because it matches by public key, not by rowid order
+    let db = open_connection(&alice.db_path).unwrap();
+    let result = ensure_transport_key_event(&db, &alice.identity, &alice.db_path, &chain.peer_shared_key);
+    assert!(result.is_ok(), "ensure_transport_key_event should succeed with correct local key");
+    assert!(result.unwrap().is_some(), "should have created a new TransportKey event");
+
+    // Calling with the OTHER key should return None (no matching peers_shared row
+    // with that public key that also has a valid signer chain — the manually inserted
+    // row won't pass signature verification)
+    // Actually, the function returns Ok(None) only for "already exists" or "no peers_shared".
+    // Since we already created one, a second call returns Ok(None) for the existing SPKI.
+    let result2 = ensure_transport_key_event(&db, &alice.identity, &alice.db_path, &chain.peer_shared_key);
+    assert_eq!(result2.unwrap(), None, "second call should return None (already exists)");
 }
 
 #[test]

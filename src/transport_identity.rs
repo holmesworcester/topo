@@ -73,11 +73,13 @@ pub fn ensure_transport_key_event(
         return Ok(None);
     }
 
-    // Find the first PeerShared event for this peer — needed as signer.
-    // ORDER BY rowid ASC ensures deterministic selection.
+    // Find the PeerShared event whose public key matches the provided signing key.
+    // This ensures the selected signed_by event corresponds to the local identity,
+    // not an arbitrary peer in the workspace.
+    let local_pubkey = signing_key.verifying_key().to_bytes();
     let peer_shared_eid: Option<[u8; 32]> = match conn.query_row(
-        "SELECT event_id FROM peers_shared WHERE recorded_by = ?1 ORDER BY rowid ASC LIMIT 1",
-        rusqlite::params![recorded_by],
+        "SELECT event_id FROM peers_shared WHERE recorded_by = ?1 AND public_key = ?2 LIMIT 1",
+        rusqlite::params![recorded_by, local_pubkey.as_slice()],
         |row| row.get::<_, String>(0),
     ) {
         Ok(eid_b64) => crate::crypto::event_id_from_base64(&eid_b64),
