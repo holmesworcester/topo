@@ -152,6 +152,20 @@ static MIGRATIONS: &[Migration] = &[
                 ON ingress_queue(processed, received_at);
         ",
     },
+    Migration {
+        version: 6,
+        name: "add_deleted_messages",
+        sql: "
+            CREATE TABLE IF NOT EXISTS deleted_messages (
+                recorded_by TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                deletion_event_id TEXT NOT NULL,
+                author_id TEXT NOT NULL,
+                deleted_at INTEGER NOT NULL,
+                PRIMARY KEY (recorded_by, message_id)
+            );
+        ",
+    },
 ];
 
 fn ensure_schema_migrations(conn: &Connection) -> SqliteResult<()> {
@@ -271,6 +285,6 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 5);
+        assert_eq!(count, 6);
     }
 }

@@ -5,7 +5,7 @@ use crate::crypto::{event_id_to_base64, event_id_from_base64, EventId};
 use crate::events::{self, ParsedEvent, registry};
 use super::decision::ProjectionDecision;
 use super::encrypted::project_encrypted;
-use super::projectors::{project_message, project_reaction, project_peer_key, project_secret_key, project_signed_memo};
+use super::projectors::{project_message, project_message_deletion, project_reaction, project_peer_key, project_secret_key, project_signed_memo};
 use super::signer::{resolve_signer_key, verify_ed25519_signature};
 
 /// Record a rejected event durably so it is not re-processed on replay or cascade.
@@ -81,6 +81,9 @@ fn apply_projection(
         }
         ParsedEvent::SecretKey(sk) => {
             project_secret_key(conn, recorded_by, event_id_b64, sk)?;
+        }
+        ParsedEvent::MessageDeletion(del) => {
+            return project_message_deletion(conn, recorded_by, event_id_b64, del);
         }
     }
 
@@ -206,32 +209,55 @@ fn unblock_dependents(
     let mut worklist = vec![blocker_b64.to_string()];
 
     while let Some(blocker) = worklist.pop() {
+        // Collect candidate event_ids that were blocked on this blocker BEFORE deleting
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT event_id FROM blocked_event_deps
+             WHERE peer_id = ?1 AND blocker_event_id = ?2"
+        )?;
+        let candidates: Vec<String> = stmt.query_map(
+            rusqlite::params![recorded_by, &blocker],
+            |row| row.get::<_, String>(0),
+        )?.collect::<Result<Vec<_>, _>>()?;
+
+        if candidates.is_empty() {
+            continue;
+        }
+
         // Remove all blocked_event_deps rows where this event was the blocker
         conn.execute(
             "DELETE FROM blocked_event_deps WHERE peer_id = ?1 AND blocker_event_id = ?2",
             rusqlite::params![recorded_by, &blocker],
         )?;
 
-        // Find events that now have zero remaining blockers
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT e.event_id FROM events e
-             WHERE e.event_id NOT IN (
-                 SELECT event_id FROM blocked_event_deps WHERE peer_id = ?1
-             )
-             AND e.event_id NOT IN (
-                 SELECT event_id FROM valid_events WHERE peer_id = ?1
-             )
-             AND e.event_id NOT IN (
-                 SELECT event_id FROM rejected_events WHERE peer_id = ?1
-             )
-             AND e.event_id IN (
-                 SELECT event_id FROM recorded_events WHERE peer_id = ?1
-             )"
-        )?;
-        let unblocked: Vec<String> = stmt.query_map(
-            rusqlite::params![recorded_by],
-            |row| row.get::<_, String>(0),
-        )?.collect::<Result<Vec<_>, _>>()?;
+        // From candidates, find those with zero remaining blockers and not yet processed
+        let mut unblocked = Vec::new();
+        for eid_b64 in &candidates {
+            let still_blocked: bool = conn.query_row(
+                "SELECT COUNT(*) > 0 FROM blocked_event_deps WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, eid_b64],
+                |row| row.get(0),
+            )?;
+            if still_blocked {
+                continue;
+            }
+            let already_valid: bool = conn.query_row(
+                "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, eid_b64],
+                |row| row.get(0),
+            )?;
+            if already_valid {
+                continue;
+            }
+            let already_rejected: bool = conn.query_row(
+                "SELECT COUNT(*) > 0 FROM rejected_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, eid_b64],
+                |row| row.get(0),
+            )?;
+            if already_rejected {
+                continue;
+            }
+            unblocked.push(eid_b64.clone());
+        }
 
         for eid_b64 in unblocked {
             if event_id_from_base64(&eid_b64).is_some() {
@@ -312,7 +338,7 @@ mod tests {
     use super::*;
     use crate::crypto::hash_event;
     use crate::db::{open_in_memory, schema::create_tables};
-    use crate::events::{self, MessageEvent, ReactionEvent, PeerKeyEvent, SecretKeyEvent, SignedMemoEvent, EncryptedEvent, ParsedEvent, EVENT_TYPE_MESSAGE, EVENT_TYPE_ENCRYPTED};
+    use crate::events::{self, MessageEvent, MessageDeletionEvent, ReactionEvent, PeerKeyEvent, SecretKeyEvent, SignedMemoEvent, EncryptedEvent, ParsedEvent, EVENT_TYPE_MESSAGE, EVENT_TYPE_ENCRYPTED};
     use crate::projection::encrypted::encrypt_event_blob;
     use crate::projection::signer::sign_event_bytes;
     use ed25519_dalek::SigningKey;
@@ -1411,5 +1437,323 @@ mod tests {
             }
             other => panic!("expected Block for tenant_b, got {:?}", other),
         }
+    }
+
+    // ===== Message deletion helpers =====
+
+    fn make_deletion(target: &EventId, author_id: [u8; 32]) -> (ParsedEvent, Vec<u8>) {
+        let del = ParsedEvent::MessageDeletion(MessageDeletionEvent {
+            created_at_ms: now_ms(),
+            target_event_id: *target,
+            author_id,
+        });
+        let blob = events::encode_event(&del).unwrap();
+        (del, blob)
+    }
+
+    #[test]
+    fn test_project_message_deletion_valid() {
+        let conn = setup();
+        let recorded_by = "peer1";
+
+        // Create and project a message
+        let (_msg, msg_blob) = make_message("to be deleted");
+        let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
+        let r = project_one(&conn, recorded_by, &msg_eid).unwrap();
+        assert_eq!(r, ProjectionDecision::Valid);
+
+        // Create and project the deletion
+        let (_del, del_blob) = make_deletion(&msg_eid, [2u8; 32]); // author_id matches message
+        let del_eid = insert_event_raw(&conn, recorded_by, &del_blob);
+        let result = project_one(&conn, recorded_by, &del_eid).unwrap();
+        assert_eq!(result, ProjectionDecision::Valid);
+
+        // Message should be removed
+        let msg_b64 = event_id_to_base64(&msg_eid);
+        let msg_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1 AND message_id = ?2",
+            rusqlite::params![recorded_by, &msg_b64],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(msg_count, 0);
+
+        // Tombstone should exist
+        let del_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM deleted_messages WHERE recorded_by = ?1 AND message_id = ?2",
+            rusqlite::params![recorded_by, &msg_b64],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(del_count, 1);
+
+        // Deletion event should be in valid_events
+        let del_b64 = event_id_to_base64(&del_eid);
+        let valid: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &del_b64],
+            |row| row.get(0),
+        ).unwrap();
+        assert!(valid);
+    }
+
+    #[test]
+    fn test_deletion_cascades_reactions() {
+        let conn = setup();
+        let recorded_by = "peer1";
+
+        // Create message + 2 reactions
+        let (_msg, msg_blob) = make_message("with reactions");
+        let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
+        project_one(&conn, recorded_by, &msg_eid).unwrap();
+
+        let (_rxn1, rxn1_blob) = make_reaction(&msg_eid, "\u{1f44d}");
+        let rxn1_eid = insert_event_raw(&conn, recorded_by, &rxn1_blob);
+        project_one(&conn, recorded_by, &rxn1_eid).unwrap();
+
+        let (_rxn2, rxn2_blob) = make_reaction(&msg_eid, "\u{2764}\u{fe0f}");
+        let rxn2_eid = insert_event_raw(&conn, recorded_by, &rxn2_blob);
+        project_one(&conn, recorded_by, &rxn2_eid).unwrap();
+
+        // Verify 2 reactions exist
+        let rxn_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM reactions WHERE recorded_by = ?1",
+            rusqlite::params![recorded_by],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(rxn_count, 2);
+
+        // Delete the message
+        let (_del, del_blob) = make_deletion(&msg_eid, [2u8; 32]);
+        let del_eid = insert_event_raw(&conn, recorded_by, &del_blob);
+        let result = project_one(&conn, recorded_by, &del_eid).unwrap();
+        assert_eq!(result, ProjectionDecision::Valid);
+
+        // Reactions should be cascaded away
+        let rxn_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM reactions WHERE recorded_by = ?1",
+            rusqlite::params![recorded_by],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(rxn_count, 0);
+
+        // Tombstone exists
+        let del_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM deleted_messages WHERE recorded_by = ?1",
+            rusqlite::params![recorded_by],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(del_count, 1);
+    }
+
+    #[test]
+    fn test_deletion_blocks_on_missing_target() {
+        let conn = setup();
+        let recorded_by = "peer1";
+
+        let fake_target = [77u8; 32];
+        let (_del, del_blob) = make_deletion(&fake_target, [2u8; 32]);
+        let del_eid = insert_event_raw(&conn, recorded_by, &del_blob);
+
+        let result = project_one(&conn, recorded_by, &del_eid).unwrap();
+        match result {
+            ProjectionDecision::Block { missing } => {
+                assert_eq!(missing.len(), 1);
+                assert_eq!(missing[0], fake_target);
+            }
+            other => panic!("expected Block, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_deletion_unblocks_when_target_arrives() {
+        let conn = setup();
+        let recorded_by = "peer1";
+
+        // Pre-compute message blob and eid
+        let (_msg, msg_blob) = make_message("will arrive later");
+        let msg_eid = hash_event(&msg_blob);
+
+        // Create deletion first (before message exists)
+        let (_del, del_blob) = make_deletion(&msg_eid, [2u8; 32]);
+        let del_eid = insert_event_raw(&conn, recorded_by, &del_blob);
+
+        // Project deletion — should block
+        let result = project_one(&conn, recorded_by, &del_eid).unwrap();
+        assert!(matches!(result, ProjectionDecision::Block { .. }));
+
+        // Now insert and project the message
+        insert_event_raw(&conn, recorded_by, &msg_blob);
+        let r = project_one(&conn, recorded_by, &msg_eid).unwrap();
+        assert_eq!(r, ProjectionDecision::Valid);
+
+        // Deletion should have been cascade-unblocked and executed
+        let del_b64 = event_id_to_base64(&del_eid);
+        let valid: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &del_b64],
+            |row| row.get(0),
+        ).unwrap();
+        assert!(valid, "deletion should be auto-projected after target arrives");
+
+        // Message should be deleted (tombstoned)
+        let msg_b64 = event_id_to_base64(&msg_eid);
+        let msg_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1 AND message_id = ?2",
+            rusqlite::params![recorded_by, &msg_b64],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(msg_count, 0);
+
+        let tombstone: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM deleted_messages WHERE recorded_by = ?1 AND message_id = ?2",
+            rusqlite::params![recorded_by, &msg_b64],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(tombstone, 1);
+    }
+
+    #[test]
+    fn test_deletion_wrong_author_rejects() {
+        let conn = setup();
+        let recorded_by = "peer1";
+
+        // Create message with author_id = [2u8; 32]
+        let (_msg, msg_blob) = make_message("wrong author test");
+        let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
+        project_one(&conn, recorded_by, &msg_eid).unwrap();
+
+        // Create deletion with different author_id
+        let (_del, del_blob) = make_deletion(&msg_eid, [99u8; 32]); // wrong author
+        let del_eid = insert_event_raw(&conn, recorded_by, &del_blob);
+
+        let result = project_one(&conn, recorded_by, &del_eid).unwrap();
+        match result {
+            ProjectionDecision::Reject { reason } => {
+                assert!(reason.contains("deletion author does not match"), "reason: {}", reason);
+            }
+            other => panic!("expected Reject, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_deletion_idempotent() {
+        let conn = setup();
+        let recorded_by = "peer1";
+
+        // Create and project message
+        let (_msg, msg_blob) = make_message("delete me twice");
+        let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
+        project_one(&conn, recorded_by, &msg_eid).unwrap();
+
+        // First deletion
+        let (_del1, del1_blob) = make_deletion(&msg_eid, [2u8; 32]);
+        let del1_eid = insert_event_raw(&conn, recorded_by, &del1_blob);
+        let r1 = project_one(&conn, recorded_by, &del1_eid).unwrap();
+        assert_eq!(r1, ProjectionDecision::Valid);
+
+        // Second deletion (same target, different event)
+        // Since the message is already tombstoned, the projector returns AlreadyProcessed
+        let del2 = ParsedEvent::MessageDeletion(MessageDeletionEvent {
+            created_at_ms: now_ms() + 1,
+            target_event_id: msg_eid,
+            author_id: [2u8; 32],
+        });
+        let del2_blob = events::encode_event(&del2).unwrap();
+        let del2_eid = insert_event_raw(&conn, recorded_by, &del2_blob);
+        let r2 = project_one(&conn, recorded_by, &del2_eid).unwrap();
+        // Second deletion finds tombstone already exists → AlreadyProcessed from projector,
+        // which means apply_projection returns AlreadyProcessed, pipeline treats it as Valid
+        assert!(matches!(r2, ProjectionDecision::Valid));
+
+        // Only one tombstone
+        let del_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM deleted_messages WHERE recorded_by = ?1",
+            rusqlite::params![recorded_by],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(del_count, 1);
+    }
+
+    #[test]
+    fn test_reaction_after_deletion_skipped() {
+        let conn = setup();
+        let recorded_by = "peer1";
+
+        // Create and project message
+        let (_msg, msg_blob) = make_message("will be deleted");
+        let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
+        project_one(&conn, recorded_by, &msg_eid).unwrap();
+
+        // Delete message
+        let (_del, del_blob) = make_deletion(&msg_eid, [2u8; 32]);
+        let del_eid = insert_event_raw(&conn, recorded_by, &del_blob);
+        project_one(&conn, recorded_by, &del_eid).unwrap();
+
+        // Now create a reaction targeting the deleted message
+        let (_rxn, rxn_blob) = make_reaction(&msg_eid, "\u{1f44d}");
+        let rxn_eid = insert_event_raw(&conn, recorded_by, &rxn_blob);
+        let result = project_one(&conn, recorded_by, &rxn_eid).unwrap();
+
+        // The reaction is structurally valid (target dep exists in valid_events),
+        // but project_reaction skips it because the message is deleted
+        assert_eq!(result, ProjectionDecision::Valid);
+
+        // No reactions in the table
+        let rxn_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM reactions WHERE recorded_by = ?1",
+            rusqlite::params![recorded_by],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(rxn_count, 0);
+    }
+
+    #[test]
+    fn test_deletion_convergence() {
+        let conn = setup();
+        let recorded_by = "peer1";
+
+        // === Forward order: msg → rxn → del ===
+        let (_msg, msg_blob) = make_message("convergence test");
+        let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
+        project_one(&conn, recorded_by, &msg_eid).unwrap();
+
+        let (_rxn, rxn_blob) = make_reaction(&msg_eid, "\u{1f44d}");
+        let rxn_eid = insert_event_raw(&conn, recorded_by, &rxn_blob);
+        project_one(&conn, recorded_by, &rxn_eid).unwrap();
+
+        let (_del, del_blob) = make_deletion(&msg_eid, [2u8; 32]);
+        let del_eid = insert_event_raw(&conn, recorded_by, &del_blob);
+        project_one(&conn, recorded_by, &del_eid).unwrap();
+
+        // Capture forward state
+        let fwd_msg: i64 = conn.query_row("SELECT COUNT(*) FROM messages WHERE recorded_by = ?1", rusqlite::params![recorded_by], |row| row.get(0)).unwrap();
+        let fwd_rxn: i64 = conn.query_row("SELECT COUNT(*) FROM reactions WHERE recorded_by = ?1", rusqlite::params![recorded_by], |row| row.get(0)).unwrap();
+        let fwd_del: i64 = conn.query_row("SELECT COUNT(*) FROM deleted_messages WHERE recorded_by = ?1", rusqlite::params![recorded_by], |row| row.get(0)).unwrap();
+
+        assert_eq!(fwd_msg, 0, "message should be deleted");
+        assert_eq!(fwd_rxn, 0, "reactions should be cascaded");
+        assert_eq!(fwd_del, 1, "tombstone should exist");
+
+        // === Reverse order: clear and replay del → rxn → msg ===
+        conn.execute("DELETE FROM messages WHERE recorded_by = ?1", rusqlite::params![recorded_by]).unwrap();
+        conn.execute("DELETE FROM reactions WHERE recorded_by = ?1", rusqlite::params![recorded_by]).unwrap();
+        conn.execute("DELETE FROM deleted_messages WHERE recorded_by = ?1", rusqlite::params![recorded_by]).unwrap();
+        conn.execute("DELETE FROM valid_events WHERE peer_id = ?1", rusqlite::params![recorded_by]).unwrap();
+        conn.execute("DELETE FROM blocked_event_deps WHERE peer_id = ?1", rusqlite::params![recorded_by]).unwrap();
+        conn.execute("DELETE FROM rejected_events WHERE peer_id = ?1", rusqlite::params![recorded_by]).unwrap();
+
+        // Project in reverse order: del first (blocks), then rxn (blocks), then msg (unblocks all)
+        project_one(&conn, recorded_by, &del_eid).unwrap();
+        project_one(&conn, recorded_by, &rxn_eid).unwrap();
+        project_one(&conn, recorded_by, &msg_eid).unwrap();
+
+        // Capture reverse state
+        let rev_msg: i64 = conn.query_row("SELECT COUNT(*) FROM messages WHERE recorded_by = ?1", rusqlite::params![recorded_by], |row| row.get(0)).unwrap();
+        let rev_rxn: i64 = conn.query_row("SELECT COUNT(*) FROM reactions WHERE recorded_by = ?1", rusqlite::params![recorded_by], |row| row.get(0)).unwrap();
+        let rev_del: i64 = conn.query_row("SELECT COUNT(*) FROM deleted_messages WHERE recorded_by = ?1", rusqlite::params![recorded_by], |row| row.get(0)).unwrap();
+
+        // Both orders produce the same result
+        assert_eq!(rev_msg, fwd_msg, "message count mismatch: fwd={}, rev={}", fwd_msg, rev_msg);
+        assert_eq!(rev_rxn, fwd_rxn, "reaction count mismatch: fwd={}, rev={}", fwd_rxn, rev_rxn);
+        assert_eq!(rev_del, fwd_del, "tombstone count mismatch: fwd={}, rev={}", fwd_del, rev_del);
     }
 }

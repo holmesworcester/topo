@@ -1145,3 +1145,200 @@ async fn test_egress_queue_lifecycle() {
     let pending = eq.count_pending(conn_id).unwrap();
     assert_eq!(pending, 0);
 }
+
+/// Integration test: Alice creates message + reactions, syncs to Bob. Alice deletes message.
+/// Bob syncs again. Verify: Bob has tombstone, no message, no reactions.
+#[tokio::test]
+async fn test_deletion_sync() {
+    let channel = test_channel();
+    let alice = Peer::new("alice", channel);
+    let bob = Peer::new("bob", channel);
+
+    // Alice creates a message and a reaction targeting it
+    let msg_id = alice.create_message("Delete me");
+    alice.create_reaction(&msg_id, "\u{1f44d}");
+
+    assert_eq!(alice.store_count(), 2);
+    assert_eq!(alice.message_count(), 1);
+    assert_eq!(alice.reaction_count(), 1);
+
+    // Sync to Bob — both get the message + reaction
+    let sync = start_peers(&alice, &bob);
+
+    assert_eventually(
+        || alice.store_count() == 2 && bob.store_count() == 2,
+        Duration::from_secs(15),
+        "both peers should have 2 events (message + reaction)",
+    ).await;
+
+    drop(sync);
+
+    assert_eq!(bob.message_count(), 1);
+    assert_eq!(bob.reaction_count(), 1);
+
+    // Alice deletes the message
+    alice.create_message_deletion(&msg_id);
+
+    assert_eq!(alice.store_count(), 3);
+    assert_eq!(alice.message_count(), 0); // deleted
+    assert_eq!(alice.reaction_count(), 0); // cascaded
+    assert_eq!(alice.deleted_message_count(), 1); // tombstone
+
+    // Sync again — Bob gets the deletion event
+    let sync2 = start_peers(&alice, &bob);
+
+    assert_eventually(
+        || bob.store_count() == 3,
+        Duration::from_secs(15),
+        "bob should have 3 events (message + reaction + deletion)",
+    ).await;
+
+    drop(sync2);
+
+    // Wait for projection to complete
+    assert_eventually(
+        || bob.deleted_message_count() == 1,
+        Duration::from_secs(10),
+        "bob should have tombstone after deletion sync",
+    ).await;
+
+    // Bob should have: 0 messages, 0 reactions, 1 tombstone
+    assert_eq!(bob.message_count(), 0, "bob: message should be deleted");
+    assert_eq!(bob.reaction_count(), 0, "bob: reactions should be cascaded");
+    assert_eq!(bob.deleted_message_count(), 1, "bob: tombstone should exist");
+
+    verify_projection_invariants(&alice);
+    verify_projection_invariants(&bob);
+}
+
+/// Integration test: Alice creates a message and then a deletion targeting it.
+/// Bob syncs and gets both events. Regardless of receive order, Bob converges
+/// to the same final state: 0 messages, 1 tombstone.
+/// This also tests that if Bob receives the deletion first (blocked), the
+/// cascade-unblock when the message arrives produces the correct state.
+#[tokio::test]
+async fn test_deletion_before_target_sync() {
+    let channel = test_channel();
+    let alice = Peer::new("alice", channel);
+    let bob = Peer::new("bob", channel);
+
+    // Alice creates a message and then deletes it
+    let msg_id = alice.create_message("Delete me via sync");
+    alice.create_message_deletion(&msg_id);
+
+    assert_eq!(alice.store_count(), 2); // message + deletion
+    assert_eq!(alice.message_count(), 0); // deleted
+    assert_eq!(alice.deleted_message_count(), 1); // tombstone
+
+    // Sync — Bob gets both events (order depends on negentropy)
+    let sync = start_peers(&alice, &bob);
+
+    assert_eventually(
+        || bob.store_count() == 2,
+        Duration::from_secs(15),
+        "bob should have 2 events (message + deletion)",
+    ).await;
+
+    drop(sync);
+
+    // Wait for projection cascade to complete on Bob
+    assert_eventually(
+        || bob.deleted_message_count() == 1,
+        Duration::from_secs(10),
+        "bob should have tombstone after sync",
+    ).await;
+
+    // Bob should converge to same state as Alice: 0 messages, 1 tombstone
+    assert_eq!(bob.message_count(), 0, "bob: message should be deleted");
+    assert_eq!(bob.deleted_message_count(), 1, "bob: tombstone");
+
+    verify_projection_invariants(&alice);
+    verify_projection_invariants(&bob);
+}
+
+/// Integration test: Create encrypted message, then encrypted deletion targeting it.
+/// Verify cascade works through encryption layer.
+#[tokio::test]
+async fn test_encrypted_deletion() {
+    let channel = test_channel();
+    let alice = Peer::new("alice", channel);
+
+    // Create a secret key
+    let key_bytes: [u8; 32] = rand::random();
+    let sk_eid = alice.create_secret_key(key_bytes);
+
+    // Create an encrypted message
+    let _enc_msg_eid = alice.create_encrypted_message(&sk_eid, "Encrypted delete me");
+
+    assert_eq!(alice.store_count(), 2); // sk + encrypted msg
+    assert_eq!(alice.secret_key_count(), 1);
+    assert_eq!(alice.scoped_message_count(), 1); // inner message projected
+
+    // Get the inner message's event_id from the messages table
+    let alice_db = open_connection(&alice.db_path).expect("open alice db");
+    let inner_msg_id: String = alice_db.query_row(
+        "SELECT message_id FROM messages WHERE recorded_by = ?1",
+        rusqlite::params![&alice.identity],
+        |row| row.get(0),
+    ).unwrap();
+    let inner_msg_eid = event_id_from_base64(&inner_msg_id).expect("parse inner msg id");
+    drop(alice_db);
+
+    // Create an encrypted deletion targeting the inner message
+    alice.create_encrypted_deletion(&sk_eid, &inner_msg_eid);
+
+    assert_eq!(alice.store_count(), 3); // sk + encrypted msg + encrypted del
+    assert_eq!(alice.scoped_message_count(), 0); // inner message deleted
+    assert_eq!(alice.deleted_message_count(), 1); // tombstone from encrypted deletion
+
+    verify_projection_invariants(&alice);
+}
+
+/// Integration test: After deletion sync, verify_projection_invariants on both peers.
+#[tokio::test]
+async fn test_deletion_replay_invariants() {
+    let channel = test_channel();
+    let alice = Peer::new("alice", channel);
+    let bob = Peer::new("bob", channel);
+
+    // Create a mix of messages, reactions, and deletions
+    let msg1 = alice.create_message("Keep me");
+    let msg2 = alice.create_message("Delete me");
+    alice.create_reaction(&msg1, "\u{2764}\u{fe0f}");
+    alice.create_reaction(&msg2, "\u{1f44d}");
+
+    // Delete msg2 (cascades its reaction too)
+    alice.create_message_deletion(&msg2);
+
+    assert_eq!(alice.store_count(), 5); // 2 msgs + 2 rxns + 1 del
+    assert_eq!(alice.message_count(), 1); // msg1 survives
+    assert_eq!(alice.reaction_count(), 1); // msg1's reaction survives
+    assert_eq!(alice.deleted_message_count(), 1); // msg2 tombstone
+
+    // Sync to Bob
+    let sync = start_peers(&alice, &bob);
+
+    assert_eventually(
+        || bob.store_count() == 5,
+        Duration::from_secs(15),
+        "bob should have all 5 events",
+    ).await;
+
+    drop(sync);
+
+    // Wait for projection to complete
+    assert_eventually(
+        || bob.deleted_message_count() == 1 && bob.message_count() == 1,
+        Duration::from_secs(10),
+        "bob should converge to same state as alice",
+    ).await;
+
+    // Verify identical state
+    assert_eq!(bob.message_count(), 1);
+    assert_eq!(bob.reaction_count(), 1);
+    assert_eq!(bob.deleted_message_count(), 1);
+
+    // Run full replay invariants on both
+    verify_projection_invariants(&alice);
+    verify_projection_invariants(&bob);
+}

@@ -1,5 +1,6 @@
 pub mod encrypted;
 pub mod message;
+pub mod message_deletion;
 pub mod peer_key;
 pub mod reaction;
 pub mod registry;
@@ -10,6 +11,7 @@ use std::sync::OnceLock;
 
 pub use encrypted::EncryptedEvent;
 pub use message::MessageEvent;
+pub use message_deletion::MessageDeletionEvent;
 pub use peer_key::PeerKeyEvent;
 pub use reaction::ReactionEvent;
 pub use registry::{EventRegistry, EventTypeMeta, ShareScope};
@@ -22,6 +24,7 @@ pub const EVENT_TYPE_PEER_KEY: u8 = 3;
 pub const EVENT_TYPE_SIGNED_MEMO: u8 = 4;
 pub const EVENT_TYPE_ENCRYPTED: u8 = 5;
 pub const EVENT_TYPE_SECRET_KEY: u8 = 6;
+pub const EVENT_TYPE_MESSAGE_DELETION: u8 = 7;
 
 /// Max event blob size: 1 MiB
 pub const EVENT_MAX_BLOB_BYTES: usize = 1024 * 1024;
@@ -34,6 +37,7 @@ pub enum ParsedEvent {
     SignedMemo(SignedMemoEvent),
     Encrypted(EncryptedEvent),
     SecretKey(SecretKeyEvent),
+    MessageDeletion(MessageDeletionEvent),
 }
 
 impl ParsedEvent {
@@ -45,6 +49,7 @@ impl ParsedEvent {
             ParsedEvent::SignedMemo(s) => s.created_at_ms,
             ParsedEvent::Encrypted(e) => e.created_at_ms,
             ParsedEvent::SecretKey(s) => s.created_at_ms,
+            ParsedEvent::MessageDeletion(d) => d.created_at_ms,
         }
     }
 
@@ -58,6 +63,7 @@ impl ParsedEvent {
             ParsedEvent::SignedMemo(s) => vec![("signed_by", s.signed_by)],
             ParsedEvent::Encrypted(e) => vec![("key_event_id", e.key_event_id)],
             ParsedEvent::SecretKey(_) => vec![],
+            ParsedEvent::MessageDeletion(d) => vec![("target_event_id", d.target_event_id)],
         }
     }
 
@@ -69,6 +75,7 @@ impl ParsedEvent {
             ParsedEvent::SignedMemo(_) => EVENT_TYPE_SIGNED_MEMO,
             ParsedEvent::Encrypted(_) => EVENT_TYPE_ENCRYPTED,
             ParsedEvent::SecretKey(_) => EVENT_TYPE_SECRET_KEY,
+            ParsedEvent::MessageDeletion(_) => EVENT_TYPE_MESSAGE_DELETION,
         }
     }
 
@@ -81,7 +88,8 @@ impl ParsedEvent {
             | ParsedEvent::Reaction(_)
             | ParsedEvent::PeerKey(_)
             | ParsedEvent::Encrypted(_)
-            | ParsedEvent::SecretKey(_) => None,
+            | ParsedEvent::SecretKey(_)
+            | ParsedEvent::MessageDeletion(_) => None,
         }
     }
 }
@@ -138,6 +146,7 @@ pub fn registry() -> &'static EventRegistry {
             &signed_memo::SIGNED_MEMO_META,
             &encrypted::ENCRYPTED_META,
             &secret_key::SECRET_KEY_META,
+            &message_deletion::MESSAGE_DELETION_META,
         ])
     })
 }
@@ -225,6 +234,21 @@ mod tests {
     }
 
     #[test]
+    fn test_message_deletion_roundtrip() {
+        let del = MessageDeletionEvent {
+            created_at_ms: 3333333333333,
+            target_event_id: [8u8; 32],
+            author_id: [9u8; 32],
+        };
+
+        let event = ParsedEvent::MessageDeletion(del.clone());
+        let blob = encode_event(&event).unwrap();
+        assert_eq!(blob.len(), 73);
+        let parsed = parse_event(&blob).unwrap();
+        assert_eq!(parsed, event);
+    }
+
+    #[test]
     fn test_registry_lookup() {
         let reg = registry();
         let msg_meta = reg.lookup(EVENT_TYPE_MESSAGE).unwrap();
@@ -244,6 +268,10 @@ mod tests {
         assert_eq!(sm_meta.projection_table, "signed_memos");
         assert!(sm_meta.signer_required);
         assert_eq!(sm_meta.signature_byte_len, 64);
+
+        let del_meta = reg.lookup(EVENT_TYPE_MESSAGE_DELETION).unwrap();
+        assert_eq!(del_meta.type_name, "message_deletion");
+        assert_eq!(del_meta.projection_table, "deleted_messages");
 
         assert!(reg.lookup(99).is_none());
     }
@@ -337,6 +365,20 @@ mod tests {
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].0, "signed_by");
         assert_eq!(deps[0].1, signer_id);
+    }
+
+    #[test]
+    fn test_dep_field_values_message_deletion() {
+        let target = [55u8; 32];
+        let del = ParsedEvent::MessageDeletion(MessageDeletionEvent {
+            created_at_ms: 400,
+            target_event_id: target,
+            author_id: [10u8; 32],
+        });
+        let deps = del.dep_field_values();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].0, "target_event_id");
+        assert_eq!(deps[0].1, target);
     }
 
     #[test]
