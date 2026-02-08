@@ -868,9 +868,13 @@ async fn test_cross_tenant_dep_scoping_after_sync() {
     verify_projection_invariants(&bob);
 }
 
-/// Integration test: Alice creates a PSK + encrypted message → syncs to Bob → Bob projects.
+/// Integration test: PSK encrypted message sync. Both peers share the same key event
+/// (out-of-band distribution). SecretKey events are local-only (share_scope=Local)
+/// and do NOT sync via negentropy.
 #[tokio::test]
 async fn test_encrypted_event_sync() {
+    use poc_7::projection::pipeline::project_one;
+
     let channel = test_channel();
     let alice = Peer::new("alice", channel);
     let bob = Peer::new("bob", channel);
@@ -882,21 +886,44 @@ async fn test_encrypted_event_sync() {
 
     assert_eq!(alice.store_count(), 2);
     assert_eq!(alice.secret_key_count(), 1);
-    // The encrypted event projects into messages table
     assert_eq!(alice.scoped_message_count(), 1);
 
-    // Sync to Bob
+    // Simulate out-of-band PSK distribution: copy Alice's SecretKey event to Bob
+    {
+        let alice_db = open_connection(&alice.db_path).expect("open alice db");
+        let bob_db = open_connection(&bob.db_path).expect("open bob db");
+        let sk_b64 = event_id_to_base64(&sk_eid);
+        let blob: Vec<u8> = alice_db.query_row(
+            "SELECT blob FROM events WHERE event_id = ?1", rusqlite::params![&sk_b64], |row| row.get(0),
+        ).unwrap();
+        let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+        bob_db.execute(
+            "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
+             VALUES (?1, ?2, ?3, 'local', ?4, ?5)",
+            rusqlite::params![&sk_b64, "secret_key", &blob, now_ms, now_ms],
+        ).unwrap();
+        bob_db.execute(
+            "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
+             VALUES (?1, ?2, ?3, 'psk_import')",
+            rusqlite::params![&bob.identity, &sk_b64, now_ms],
+        ).unwrap();
+        let _ = project_one(&bob_db, &bob.identity, &sk_eid);
+    }
+    assert_eq!(bob.store_count(), 1); // just the PSK
+    assert_eq!(bob.secret_key_count(), 1);
+
+    // Sync — only the encrypted event (shared) syncs
     let sync = start_peers(&alice, &bob);
 
     assert_eventually(
         || bob.store_count() == 2,
         Duration::from_secs(15),
-        "bob should have 2 events (SecretKey + Encrypted)",
+        "bob should have 2 events (imported SecretKey + synced Encrypted)",
     ).await;
 
     drop(sync);
 
-    // Bob should have projected both: secret key into secret_keys, inner message into messages
+    // Bob should have projected the decrypted inner message
     assert_eq!(bob.secret_key_count(), 1);
     assert_eq!(bob.scoped_message_count(), 1);
 
@@ -904,39 +931,63 @@ async fn test_encrypted_event_sync() {
     verify_projection_invariants(&bob);
 }
 
-/// Integration test: Encrypted event syncs before key → blocks → key syncs → cascade unblocks.
+/// Integration test: PSK encrypted event sync with mixed event types.
+/// SecretKey is local-only — distributed out-of-band to Bob.
 #[tokio::test]
 async fn test_encrypted_out_of_order_sync() {
+    use poc_7::projection::pipeline::project_one;
+
     let channel = test_channel();
     let alice = Peer::new("alice", channel);
     let bob = Peer::new("bob", channel);
 
-    // Alice creates the key + encrypted message
+    // Alice creates the key + encrypted message + normal message
     let key_bytes: [u8; 32] = rand::random();
     let sk_eid = alice.create_secret_key(key_bytes);
     let _enc_eid = alice.create_encrypted_message(&sk_eid, "Out of order encrypted");
-
-    // Also create a normal message to verify mixed events work
     alice.create_message("Normal message");
 
     // Bob creates a message too
     bob.create_message("Bob's message");
 
-    assert_eq!(alice.store_count(), 3); // sk, encrypted, message
-    assert_eq!(bob.store_count(), 1);
+    // Simulate out-of-band PSK distribution: copy Alice's SecretKey event to Bob
+    {
+        let alice_db = open_connection(&alice.db_path).expect("open alice db");
+        let bob_db = open_connection(&bob.db_path).expect("open bob db");
+        let sk_b64 = event_id_to_base64(&sk_eid);
+        let blob: Vec<u8> = alice_db.query_row(
+            "SELECT blob FROM events WHERE event_id = ?1", rusqlite::params![&sk_b64], |row| row.get(0),
+        ).unwrap();
+        let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+        bob_db.execute(
+            "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
+             VALUES (?1, ?2, ?3, 'local', ?4, ?5)",
+            rusqlite::params![&sk_b64, "secret_key", &blob, now_ms, now_ms],
+        ).unwrap();
+        bob_db.execute(
+            "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
+             VALUES (?1, ?2, ?3, 'psk_import')",
+            rusqlite::params![&bob.identity, &sk_b64, now_ms],
+        ).unwrap();
+        let _ = project_one(&bob_db, &bob.identity, &sk_eid);
+    }
 
-    // Sync
+    // Alice: 3 (sk, encrypted, message), Bob: 2 (imported sk, own message)
+    assert_eq!(alice.store_count(), 3);
+    assert_eq!(bob.store_count(), 2);
+
+    // Sync — only shared events sync (encrypted + messages), not secret keys
     let sync = start_peers(&alice, &bob);
 
     assert_eventually(
         || alice.store_count() == 4 && bob.store_count() == 4,
         Duration::from_secs(15),
-        "both peers should have 4 events",
+        "both peers should have 4 events (local sk + synced shared events)",
     ).await;
 
     drop(sync);
 
-    // Bob should have auto-unblocked the encrypted message (if it arrived before key)
+    // Both should have decrypted the encrypted message
     assert_eq!(bob.secret_key_count(), 1);
     assert_eq!(bob.scoped_message_count(), 3); // encrypted inner + normal + bob's
     assert_eq!(alice.scoped_message_count(), 3);
@@ -1024,8 +1075,10 @@ async fn test_project_queue_crash_recovery() {
 
     let drained = pq.drain(&alice.identity, |conn, eid_b64| {
         if let Some(eid) = event_id_from_base64(eid_b64) {
-            let _ = project_one(conn, &alice.identity, &eid);
+            project_one(conn, &alice.identity, &eid)
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
         }
+        Ok(())
     }).unwrap();
     assert_eq!(drained, 3);
 
@@ -1079,8 +1132,10 @@ async fn test_project_queue_drain_after_batch() {
     // Drain should process nothing (queue empty)
     let drained = pq.drain(&alice.identity, |conn, eid_b64| {
         if let Some(eid) = event_id_from_base64(eid_b64) {
-            let _ = project_one(conn, &alice.identity, &eid);
+            project_one(conn, &alice.identity, &eid)
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
         }
+        Ok(())
     }).unwrap();
     assert_eq!(drained, 0);
 
@@ -1126,14 +1181,13 @@ async fn test_egress_queue_lifecycle() {
     let pending = eq.count_pending(conn_id).unwrap();
     assert_eq!(pending, 0);
 
-    // Cleanup sent (all recent, so none purged with large cutoff)
-    let purged = eq.cleanup_sent(0).unwrap();
-    // sent_at = now, cutoff = now - 0 = now, so nothing older than now
+    // Cleanup sent with large threshold — recent items should NOT be purged
+    let purged = eq.cleanup_sent(300_000).unwrap();
     assert_eq!(purged, 0);
 
-    // Backdate and cleanup
+    // Backdate and cleanup with smaller threshold
     db.execute("UPDATE egress_queue SET sent_at = sent_at - 600000", []).unwrap();
-    let purged = eq.cleanup_sent(0).unwrap();
+    let purged = eq.cleanup_sent(300_000).unwrap();
     assert_eq!(purged, 3);
 
     // Re-enqueue should work (dedup index only blocks unsent)
@@ -1144,4 +1198,151 @@ async fn test_egress_queue_lifecycle() {
     eq.clear_connection(conn_id).unwrap();
     let pending = eq.count_pending(conn_id).unwrap();
     assert_eq!(pending, 0);
+}
+
+/// Test gap 1: Local-only events (e.g. SecretKey with share_scope=Local) must NOT appear
+/// in neg_items and must NOT be sent to peers via the egress send path.
+#[tokio::test]
+async fn test_local_only_events_excluded_from_neg_items() {
+    use poc_7::db::store::Store;
+
+    let channel = test_channel();
+    let alice = Peer::new("alice", channel);
+
+    // Create a shared message and a local-only secret key
+    let _msg_eid = alice.create_message("Shared message");
+    let key_bytes: [u8; 32] = rand::random();
+    let sk_eid = alice.create_secret_key(key_bytes);
+
+    // Both events should be in the events table
+    assert_eq!(alice.store_count(), 2);
+
+    // Verify the secret key is stored with share_scope=local
+    let db = open_connection(&alice.db_path).expect("open db");
+    let sk_eid_b64 = event_id_to_base64(&sk_eid);
+    let share_scope: String = db.query_row(
+        "SELECT share_scope FROM events WHERE event_id = ?1",
+        rusqlite::params![&sk_eid_b64],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(share_scope, "local", "secret key should have local share_scope");
+
+    // Verify neg_items does NOT contain the secret key's event_id
+    let sk_in_neg: i64 = db.query_row(
+        "SELECT COUNT(*) FROM neg_items WHERE id = ?1",
+        rusqlite::params![sk_eid.as_slice()],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(sk_in_neg, 0, "local-only event should not be in neg_items");
+
+    // Verify the shared message IS in neg_items
+    let total_neg: i64 = db.query_row(
+        "SELECT COUNT(*) FROM neg_items",
+        [],
+        |row| row.get(0),
+    ).unwrap();
+    assert!(total_neg >= 1, "shared events should be in neg_items");
+
+    // Verify get_shared returns None for local-only events (defense-in-depth on send path)
+    let store = Store::new(&db);
+    assert!(
+        store.get_shared(&sk_eid).unwrap().is_none(),
+        "get_shared should return None for local-only events"
+    );
+}
+
+/// Test gap 2: Verify local-only events don't leak through sync to a peer.
+#[tokio::test]
+async fn test_local_only_events_not_synced_to_peer() {
+    let channel = test_channel();
+    let alice = Peer::new("alice", channel);
+    let bob = Peer::new("bob", channel);
+
+    // Alice creates a message (shared) + secret key (local)
+    alice.create_message("Hello from Alice");
+    let key_bytes: [u8; 32] = rand::random();
+    alice.create_secret_key(key_bytes);
+
+    assert_eq!(alice.store_count(), 2);
+
+    // Sync
+    let sync = start_peers(&alice, &bob);
+
+    assert_eventually(
+        || bob.store_count() >= 1,
+        Duration::from_secs(15),
+        "bob should receive at least the shared message",
+    ).await;
+
+    // Give extra time for any potential secret key to sync (it shouldn't)
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    drop(sync);
+
+    // Bob should only have the shared message, not the secret key
+    assert_eq!(bob.store_count(), 1, "bob should only have the shared message, not the local-only secret key");
+    assert_eq!(bob.secret_key_count(), 0, "bob should not have any secret keys from alice");
+}
+
+/// Test gap 3: project_queue drain callback error → item remains queued/retriable.
+/// (Integration-level test complementing the unit test in project_queue.rs)
+#[tokio::test]
+async fn test_project_queue_drain_retries_on_failure() {
+    use poc_7::db::project_queue::ProjectQueue;
+
+    let channel = test_channel();
+    let alice = Peer::new("alice", channel);
+
+    // Create events to get valid event IDs in the events table
+    let msg1 = alice.create_message("Recovery msg 1");
+    let msg2 = alice.create_message("Recovery msg 2");
+    let msg3 = alice.create_message("Recovery msg 3");
+    let msg1_b64 = event_id_to_base64(&msg1);
+    let msg2_b64 = event_id_to_base64(&msg2);
+    let msg3_b64 = event_id_to_base64(&msg3);
+
+    // Directly test the queue retry mechanism (not projection)
+    let db = open_connection(&alice.db_path).expect("open db");
+    let pq = ProjectQueue::new(&db);
+
+    // Enqueue items directly (guard allows since they aren't already in project_queue)
+    // First remove from valid_events so the enqueue guard doesn't block
+    db.execute("DELETE FROM valid_events WHERE peer_id = ?1", rusqlite::params![&alice.identity]).unwrap();
+    pq.enqueue(&alice.identity, &msg1_b64).unwrap();
+    pq.enqueue(&alice.identity, &msg2_b64).unwrap();
+    pq.enqueue(&alice.identity, &msg3_b64).unwrap();
+
+    // Drain with a callback that fails for msg2 (without calling project_one to avoid cascade)
+    let mut succeeded_items = Vec::new();
+    let count = pq.drain(&alice.identity, |_conn, eid_b64| {
+        if eid_b64 == msg2_b64 {
+            return Err("simulated projection failure".into());
+        }
+        succeeded_items.push(eid_b64.to_string());
+        Ok(())
+    }).unwrap();
+
+    // msg1 and msg3 should have succeeded, msg2 failed
+    assert_eq!(count, 2, "two items should have been successfully drained");
+    assert!(succeeded_items.contains(&msg1_b64));
+    assert!(succeeded_items.contains(&msg3_b64));
+
+    // msg2 should still be in project_queue with incremented attempts
+    let remaining: i64 = db.query_row(
+        "SELECT COUNT(*) FROM project_queue WHERE peer_id = ?1",
+        rusqlite::params![&alice.identity], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(remaining, 1, "only the failed item should remain in queue");
+
+    let remaining_eid: String = db.query_row(
+        "SELECT event_id FROM project_queue WHERE peer_id = ?1",
+        rusqlite::params![&alice.identity], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(remaining_eid, msg2_b64, "the remaining item should be msg2");
+
+    let attempts: i64 = db.query_row(
+        "SELECT attempts FROM project_queue WHERE peer_id = ?1 AND event_id = ?2",
+        rusqlite::params![&alice.identity, &msg2_b64], |row| row.get(0),
+    ).unwrap();
+    assert!(attempts >= 1, "failed item should have retry attempts incremented");
 }

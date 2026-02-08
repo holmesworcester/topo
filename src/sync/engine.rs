@@ -133,15 +133,35 @@ pub fn batch_writer(
             }
         }
 
-        if db.execute("BEGIN", []).is_ok() {
+        // Bounded BEGIN retry with backoff
+        let mut begin_ok = false;
+        for attempt in 0..3u32 {
+            match db.execute("BEGIN", []) {
+                Ok(_) => { begin_ok = true; break; }
+                Err(e) => {
+                    warn!("BEGIN failed (attempt {}): {}", attempt + 1, e);
+                    std::thread::sleep(Duration::from_millis(10 * (1 << attempt)));
+                }
+            }
+        }
+        if begin_ok {
             // First pass: write blob storage, neg_items, recorded_events, enqueue for projection
             let mut event_ids_to_remove: Vec<EventId> = Vec::with_capacity(batch.len());
             for (event_id, blob) in &batch {
-                event_ids_to_remove.push(*event_id);
-
                 let event_id_b64 = event_id_to_base64(event_id);
 
-                if let Some(created_at_ms) = events::extract_created_at_ms(blob) {
+                let Some(created_at_ms) = events::extract_created_at_ms(blob) else {
+                    continue;
+                };
+                let Some(type_code) = events::extract_event_type(blob) else {
+                    continue;
+                };
+                let Some(meta) = reg.lookup(type_code) else {
+                    continue;
+                };
+
+                // Only advertise shared events via negentropy
+                if meta.share_scope == events::ShareScope::Shared {
                     if let Err(e) = neg_items_stmt.execute(rusqlite::params![
                         created_at_ms as i64,
                         event_id.as_slice()
@@ -149,46 +169,45 @@ pub fn batch_writer(
                         warn!("neg_items insert error for {}: {}", event_id_b64, e);
                         continue;
                     }
-
-                    if let Some(type_code) = events::extract_event_type(blob) {
-                        if let Some(meta) = reg.lookup(type_code) {
-                            if let Err(e) = events_stmt.execute(rusqlite::params![
-                                &event_id_b64,
-                                meta.type_name,
-                                blob.as_slice(),
-                                meta.share_scope.as_str(),
-                                created_at_ms as i64,
-                                current_timestamp_ms()
-                            ]) {
-                                warn!("events insert error for {}: {}", event_id_b64, e);
-                                continue;
-                            }
-
-                            let recorded_at = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap()
-                                .as_millis() as i64;
-                            if let Err(e) = recorded_stmt.execute(rusqlite::params![
-                                &recorded_by,
-                                &event_id_b64,
-                                recorded_at,
-                                "quic_recv"
-                            ]) {
-                                warn!("recorded_events insert error for {}: {}", event_id_b64, e);
-                                continue;
-                            }
-
-                            // Enqueue for durable projection (atomicity boundary 1)
-                            if let Err(e) = enqueue_stmt.execute(rusqlite::params![
-                                &recorded_by,
-                                &event_id_b64,
-                                current_timestamp_ms()
-                            ]) {
-                                warn!("project_queue enqueue error for {}: {}", event_id_b64, e);
-                            }
-                        }
-                    }
                 }
+
+                if let Err(e) = events_stmt.execute(rusqlite::params![
+                    &event_id_b64,
+                    meta.type_name,
+                    blob.as_slice(),
+                    meta.share_scope.as_str(),
+                    created_at_ms as i64,
+                    current_timestamp_ms()
+                ]) {
+                    warn!("events insert error for {}: {}", event_id_b64, e);
+                    continue;
+                }
+
+                let recorded_at = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as i64;
+                if let Err(e) = recorded_stmt.execute(rusqlite::params![
+                    &recorded_by,
+                    &event_id_b64,
+                    recorded_at,
+                    "quic_recv"
+                ]) {
+                    warn!("recorded_events insert error for {}: {}", event_id_b64, e);
+                    continue;
+                }
+
+                // Enqueue for durable projection (atomicity boundary 1)
+                if let Err(e) = enqueue_stmt.execute(rusqlite::params![
+                    &recorded_by,
+                    &event_id_b64,
+                    current_timestamp_ms()
+                ]) {
+                    warn!("project_queue enqueue error for {}: {}", event_id_b64, e);
+                }
+
+                // Only mark for wanted removal after successful persistence
+                event_ids_to_remove.push(*event_id);
             }
             match db.execute("COMMIT", []) {
                 Ok(_) => {
@@ -200,16 +219,17 @@ pub fn batch_writer(
                     // Second pass: drain project_queue
                     if let Err(e) = pq.drain(&recorded_by, |conn, event_id_b64| {
                         if let Some(eid) = event_id_from_base64(event_id_b64) {
-                            if let Err(e) = project_one(conn, &recorded_by, &eid) {
-                                warn!("projection error for {}: {}", event_id_b64, e);
-                            }
+                            project_one(conn, &recorded_by, &eid)
+                                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
                         }
+                        Ok(())
                     }) {
                         warn!("project_queue drain error: {}", e);
                     }
                 }
                 Err(e) => {
                     warn!("COMMIT failed: {}", e);
+                    let _ = db.execute("ROLLBACK", []);
                     continue; // retry in next batch
                 }
             }
@@ -440,7 +460,7 @@ where
 
             let mut sent_rowids: Vec<i64> = Vec::with_capacity(batch.len());
             for (rowid, event_id) in batch {
-                if let Ok(Some(blob)) = store.get(&event_id) {
+                if let Ok(Some(blob)) = store.get_shared(&event_id) {
                     let blob_len = blob.len() as u64;
                     if data_send.send(&SyncMessage::Event { blob }).await.is_ok() {
                         events_sent += 1;
@@ -627,7 +647,7 @@ where
 
             let mut sent_rowids: Vec<i64> = Vec::with_capacity(batch.len());
             for (rowid, event_id) in batch {
-                if let Ok(Some(blob)) = store.get(&event_id) {
+                if let Ok(Some(blob)) = store.get_shared(&event_id) {
                     let blob_len = blob.len() as u64;
                     if data_send.send(&SyncMessage::Event { blob }).await.is_ok() {
                         events_sent += 1;
@@ -722,8 +742,10 @@ pub async fn accept_loop(
         let recorded_by_str = recorded_by.to_string();
         let drained = pq.drain(&recorded_by_str, |conn, event_id_b64| {
             if let Some(eid) = event_id_from_base64(event_id_b64) {
-                let _ = project_one(conn, &recorded_by_str, &eid);
+                project_one(conn, &recorded_by_str, &eid)
+                    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
             }
+            Ok(())
         }).unwrap_or(0);
         if drained > 0 {
             info!("Processed {} pending project_queue items from previous session", drained);
@@ -803,8 +825,10 @@ pub async fn connect_loop(
         let recorded_by_str = recorded_by.to_string();
         let drained = pq.drain(&recorded_by_str, |conn, event_id_b64| {
             if let Some(eid) = event_id_from_base64(event_id_b64) {
-                let _ = project_one(conn, &recorded_by_str, &eid);
+                project_one(conn, &recorded_by_str, &eid)
+                    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
             }
+            Ok(())
         }).unwrap_or(0);
         if drained > 0 {
             info!("Processed {} pending project_queue items from previous session", drained);

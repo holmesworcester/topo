@@ -64,11 +64,13 @@ fn store_blob_and_project(
         ],
     ).map_err(|e| CreateEventError::DbError(e.to_string()))?;
 
-    // Write to neg_items
-    conn.execute(
-        "INSERT OR IGNORE INTO neg_items (ts, id) VALUES (?1, ?2)",
-        rusqlite::params![created_at_ms, event_id.as_slice()],
-    ).map_err(|e| CreateEventError::DbError(e.to_string()))?;
+    // Write to neg_items only for shared events (local-only events must not sync)
+    if meta.share_scope == events::ShareScope::Shared {
+        conn.execute(
+            "INSERT OR IGNORE INTO neg_items (ts, id) VALUES (?1, ?2)",
+            rusqlite::params![created_at_ms, event_id.as_slice()],
+        ).map_err(|e| CreateEventError::DbError(e.to_string()))?;
+    }
 
     // Write to recorded_events
     conn.execute(
