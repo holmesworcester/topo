@@ -2117,15 +2117,15 @@ fn test_transport_key_projects_and_populates_binding() {
     ).unwrap();
     assert_eq!(stored_spki, spki_fp.to_vec());
 
-    // Verify peer_transport_bindings was auto-populated
+    // peer_transport_bindings should NOT be auto-populated by projection
     let binding_count: i64 = db.query_row(
         "SELECT COUNT(*) FROM peer_transport_bindings WHERE recorded_by = ?1",
         rusqlite::params![&alice.identity],
         |row| row.get(0),
     ).unwrap();
-    assert_eq!(binding_count, 1, "peer_transport_bindings should have 1 entry");
+    assert_eq!(binding_count, 0, "peer_transport_bindings should NOT be auto-populated");
 
-    // Verify allowed_peers_from_db includes the SPKI from transport_keys
+    // allowed_peers_from_db should include SPKI from transport_keys (not bindings)
     let allowed = poc_7::db::transport_trust::allowed_peers_from_db(&db, &alice.identity).unwrap();
     assert!(allowed.contains(&spki_fp), "allowed_peers should include transport key SPKI");
 }

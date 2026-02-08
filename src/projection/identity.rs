@@ -265,24 +265,18 @@ fn project_secret_shared(
     Ok(ProjectionDecision::Valid)
 }
 
-/// Project TransportKey: insert into transport_keys and auto-populate peer_transport_bindings.
+/// Project TransportKey: insert into transport_keys.
 fn project_transport_key(
     conn: &Connection,
     recorded_by: &str,
     event_id_b64: &str,
     tk: &crate::events::TransportKeyEvent,
 ) -> Result<ProjectionDecision, Box<dyn std::error::Error>> {
-    // Insert into transport_keys projection table
     conn.execute(
         "INSERT OR IGNORE INTO transport_keys (recorded_by, event_id, spki_fingerprint)
          VALUES (?1, ?2, ?3)",
         rusqlite::params![recorded_by, event_id_b64, tk.spki_fingerprint.as_slice()],
     )?;
-
-    // Auto-populate peer_transport_bindings from the event's SPKI fingerprint.
-    // The peer_id is the hex-encoded SPKI fingerprint.
-    let peer_id = hex::encode(tk.spki_fingerprint);
-    crate::db::transport_trust::record_transport_binding(conn, recorded_by, &peer_id, &tk.spki_fingerprint)?;
 
     Ok(ProjectionDecision::Valid)
 }

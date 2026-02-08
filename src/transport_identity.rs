@@ -73,9 +73,10 @@ pub fn ensure_transport_key_event(
         return Ok(None);
     }
 
-    // Find a PeerShared event for this peer — needed as signer
+    // Find the first PeerShared event for this peer — needed as signer.
+    // ORDER BY rowid ASC ensures deterministic selection.
     let peer_shared_eid: Option<[u8; 32]> = match conn.query_row(
-        "SELECT event_id FROM peers_shared WHERE recorded_by = ?1 LIMIT 1",
+        "SELECT event_id FROM peers_shared WHERE recorded_by = ?1 ORDER BY rowid ASC LIMIT 1",
         rusqlite::params![recorded_by],
         |row| row.get::<_, String>(0),
     ) {
