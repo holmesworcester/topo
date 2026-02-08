@@ -144,14 +144,17 @@ async fn perf_continuous_10k() {
     let inject_secs = start.elapsed().as_secs_f64();
     eprintln!("Injected 10k events (5k each) in {:.2}s", inject_secs);
 
-    // Wait for convergence
+    // Wait for convergence (store + projection)
     assert_eventually(
-        || alice.store_count() == 10_000 && bob.store_count() == 10_000,
+        || alice.store_count() == 10_000 && bob.store_count() == 10_000
+            && alice.message_count() == 10_000 && bob.message_count() == 10_000,
         Duration::from_secs(120),
         &format!(
-            "convergence to 10000 events (a={}, b={})",
+            "convergence to 10000 events (store: a={}, b={}; projected: a={}, b={})",
             alice.store_count(),
             bob.store_count(),
+            alice.message_count(),
+            bob.message_count(),
         ),
     ).await;
 

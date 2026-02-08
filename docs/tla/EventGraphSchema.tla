@@ -17,9 +17,9 @@ EXTENDS Naturals, FiniteSets
 \*   peer_removed    — removes a specific peer device
 \*
 \* Network binding refinement:
-\*   Network events are parameterized by network id. Invite events
-\*   carry a network reference (captured in inviteNet on first recording).
-\*   invite_accepted deterministically binds trustAnchor to inviteNet.
+\*   Network events are parameterized by network id.
+\*   invite_accepted binds trustAnchor directly from its own network_id field
+\*   (first-write-wins; conflicting invite_accepted is rejected).
 \*   Guard checks that a network event's id matches the peer's binding.
 \*   This ensures only the invited network can become valid; foreign
 \*   network events are structurally excluded.
@@ -38,7 +38,7 @@ EXTENDS Naturals, FiniteSets
 
 CONSTANTS ActiveEvents, Peers, Networks
 
-VARIABLES recorded, valid, trustAnchor, removed, inviteNet
+VARIABLES recorded, valid, trustAnchor, removed, inviteCarriedNet
 
 \* ---- Event type constants ----
 
@@ -261,13 +261,6 @@ PeerDeps(p, e) == ResolveNet(p, RawDeps(e) \cup SignerDep(e))
 \* Network events require matching trust anchor binding.
 Guard(p, e) == IF IsNetEvent(e) THEN trustAnchor[p] = NetId(e) ELSE TRUE
 
-\* invite_accepted requires that at least one invite event has been recorded.
-HasRecordedInvite(p) ==
-    LET invEvents == (UserInviteEvents \cup DeviceInviteEvents) \cap EVENTS
-    IN IF invEvents = {}
-       THEN TRUE
-       ELSE \E ie \in invEvents: ie \in recorded[p]
-
 \* ---- State machine ----
 
 Init ==
@@ -275,24 +268,25 @@ Init ==
     /\ valid = [p \in Peers |-> {}]
     /\ trustAnchor = [p \in Peers |-> "none"]
     /\ removed = [p \in Peers |-> {}]
-    /\ inviteNet = [p \in Peers |-> "none"]
+    /\ inviteCarriedNet = [p \in Peers |-> "none"]
 
-\* AllInviteEvents: events whose blob carries a network_id reference.
-\* Recording one of these captures which network it's for.
-AllInviteEvents == (UserInviteEvents \cup DeviceInviteEvents) \cap EVENTS
-
+\* Record captures the event-carried network_id at ingress time.
+\* For invite_accepted, the event carries a specific network_id chosen
+\* nondeterministically here (models the fact that any network could be
+\* referenced). The choice is fixed at record time, not projection time.
 Record(p, e) ==
     /\ p \in Peers
     /\ e \in EVENTS
     /\ e \notin recorded[p]
     /\ recorded' = [recorded EXCEPT ![p] = @ \cup {e}]
-    \* First invite recorded for this peer captures the network reference.
-    \* Subsequent invites are for the same network (locked on first set).
-    /\ IF e \in AllInviteEvents /\ inviteNet[p] = "none"
-       THEN \E n \in Networks: inviteNet' = [inviteNet EXCEPT ![p] = n]
-       ELSE inviteNet' = inviteNet
+    /\ IF e = InviteAccepted /\ inviteCarriedNet[p] = "none"
+       THEN \E n \in Networks: inviteCarriedNet' = [inviteCarriedNet EXCEPT ![p] = n]
+       ELSE UNCHANGED inviteCarriedNet
     /\ UNCHANGED <<valid, trustAnchor, removed>>
 
+\* invite_accepted binds the trust anchor from its event-carried network_id.
+\* First-write-wins: if trust anchor is already set to a different network,
+\* invite_accepted is rejected (cannot project).
 Project(p, e) ==
     /\ p \in Peers
     /\ e \in EVENTS
@@ -300,12 +294,15 @@ Project(p, e) ==
     /\ e \notin valid[p]
     /\ PeerDeps(p, e) \subseteq valid[p]
     /\ Guard(p, e)
-    /\ IF e = InviteAccepted THEN HasRecordedInvite(p) ELSE TRUE
+    \* Mismatch rejection: invite_accepted blocked if anchor already set differently
+    /\ IF e = InviteAccepted /\ trustAnchor[p] /= "none"
+       THEN trustAnchor[p] = inviteCarriedNet[p]
+       ELSE TRUE
     /\ valid' = [valid EXCEPT ![p] = @ \cup {e}]
-    \* Trust anchor binding is deterministic from the invite's network.
+    \* Trust anchor binding: deterministic from event-carried network_id.
     /\ trustAnchor' =
-        IF e = InviteAccepted /\ inviteNet[p] /= "none"
-        THEN [trustAnchor EXCEPT ![p] = inviteNet[p]]
+        IF e = InviteAccepted /\ trustAnchor[p] = "none"
+        THEN [trustAnchor EXCEPT ![p] = inviteCarriedNet[p]]
         ELSE trustAnchor
     /\ removed' =
         IF e = UserRemoved
@@ -313,10 +310,10 @@ Project(p, e) ==
         ELSE IF e = PeerRemoved
         THEN [removed EXCEPT ![p] = @ \cup {"peer_target"}]
         ELSE removed
-    /\ UNCHANGED <<recorded, inviteNet>>
+    /\ UNCHANGED <<recorded, inviteCarriedNet>>
 
 Stutter ==
-    UNCHANGED <<recorded, valid, trustAnchor, removed, inviteNet>>
+    UNCHANGED <<recorded, valid, trustAnchor, removed, inviteCarriedNet>>
 
 Next ==
     \/ \E p \in Peers, e \in EVENTS: Record(p, e)
@@ -324,7 +321,7 @@ Next ==
     \/ Stutter
 
 Spec ==
-    Init /\ [][Next]_<<recorded, valid, trustAnchor, removed, inviteNet>>
+    Init /\ [][Next]_<<recorded, valid, trustAnchor, removed, inviteCarriedNet>>
 
 \* ---- Invariants ----
 
@@ -334,7 +331,7 @@ TypeOK ==
     /\ \A p \in Peers: valid[p] \subseteq recorded[p]
     /\ trustAnchor \in [Peers -> Networks \cup {"none"}]
     /\ removed \in [Peers -> SUBSET {"user_target", "peer_target"}]
-    /\ inviteNet \in [Peers -> Networks \cup {"none"}]
+    /\ inviteCarriedNet \in [Peers -> Networks \cup {"none"}]
 
 \* Every valid event has all its peer-resolved dependencies valid.
 InvDeps ==
@@ -358,24 +355,16 @@ InvSingleNetwork ==
         \A n1, n2 \in Networks:
             (n1 \in valid[p] /\ n2 \in valid[p]) => n1 = n2
 
-\* Trust anchor binding is deterministic from the invite's network reference.
-InvTrustAnchorMatchesInvite ==
-    \A p \in Peers:
-        (trustAnchor[p] /= "none") => (trustAnchor[p] = inviteNet[p])
-
 \* Trust anchor requires invite_accepted to be valid.
 InvTrustAnchorSource ==
     IF InviteAccepted \in EVENTS
     THEN \A p \in Peers: (trustAnchor[p] /= "none") => (InviteAccepted \in valid[p])
     ELSE TRUE
 
-\* invite_accepted requires at least one invite event recorded.
-InvInviteAcceptedRecorded ==
-    IF InviteAccepted \in EVENTS /\ ((UserInviteEvents \cup DeviceInviteEvents) \cap EVENTS) /= {}
-    THEN \A p \in Peers:
-        (InviteAccepted \in valid[p]) =>
-            (\E ie \in ((UserInviteEvents \cup DeviceInviteEvents) \cap EVENTS): ie \in recorded[p])
-    ELSE TRUE
+\* Trust anchor always matches the event-carried network_id.
+InvTrustAnchorMatchesCarried ==
+    \A p \in Peers:
+        (trustAnchor[p] /= "none") => (trustAnchor[p] = inviteCarriedNet[p])
 
 \* All non-local singleton events that are valid require some network to be valid.
 InvAllValidRequireNetwork ==

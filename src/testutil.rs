@@ -250,6 +250,17 @@ impl Peer {
         create_event_sync(&db, &self.identity, &ia).expect("failed to create invite_accepted")
     }
 
+    /// Try to create an InviteAccepted event. Returns Result to allow handling rejection.
+    pub fn try_create_invite_accepted(&self, invite_event_id: &EventId, network_id: [u8; 32]) -> Result<EventId, CreateEventError> {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        let ia = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
+            created_at_ms: current_timestamp_ms(),
+            invite_event_id: *invite_event_id,
+            network_id,
+        });
+        create_event_sync(&db, &self.identity, &ia)
+    }
+
     /// Create a UserInviteBoot event (signed by network key). Returns the event ID.
     pub fn create_user_invite_boot(
         &self,

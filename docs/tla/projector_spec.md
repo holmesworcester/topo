@@ -85,7 +85,7 @@ Changes to this document require TLA+ model re-verification.
 | 6 | project_secret_key | secret_keys | — |
 | 7 | project_message_deletion | deleted_messages | author auth + cascade |
 | 8 | project_network | networks | TrustAnchorMatch guard |
-| 9 | project_invite_accepted | invite_accepted | writes trust_anchors (immutable) |
+| 9 | project_invite_accepted | invite_accepted | writes trust_anchors (first-write-wins immutable) |
 | 10 | project_user_invite | user_invites | — |
 | 11 | project_user_invite | user_invites | — |
 | 12 | project_device_invite | device_invites | — |

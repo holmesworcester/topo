@@ -81,9 +81,10 @@ fn project_network(
     }
 }
 
-/// Local trust-anchor binding from invite_accepted.
-/// No invite-presence guard — invite_accepted is a local acceptance event
-/// that directly sets the trust anchor from its network_id field.
+/// Local trust-anchor binding step.
+/// Binds directly from InviteAcceptedEvent fields (no global invite-presence guard,
+/// no pre-projection capture table). Uses first-write-wins (INSERT OR IGNORE)
+/// for trust anchor immutability; rejects on mismatch.
 fn project_invite_accepted(
     conn: &Connection,
     recorded_by: &str,
@@ -93,8 +94,8 @@ fn project_invite_accepted(
     let invite_eid_b64 = event_id_to_base64(&ia.invite_event_id);
     let network_id_b64 = event_id_to_base64(&ia.network_id);
 
-    // Verify the stored anchor first so rejected events do not materialize.
-    let anchor: Option<String> = match conn.query_row(
+    // Check existing trust anchor BEFORE any writes — reject on mismatch.
+    let existing_anchor: Option<String> = match conn.query_row(
         "SELECT network_id FROM trust_anchors WHERE peer_id = ?1",
         rusqlite::params![recorded_by],
         |row| row.get::<_, String>(0),
@@ -104,29 +105,28 @@ fn project_invite_accepted(
         Err(e) => return Err(e.into()),
     };
 
-    match anchor {
-        Some(stored_anchor) if stored_anchor != network_id_b64 => {
+    if let Some(ref stored) = existing_anchor {
+        if stored != &network_id_b64 {
             return Ok(ProjectionDecision::Reject {
                 reason: format!(
-                    "trust anchor mismatch: stored={}, event={}",
-                    stored_anchor, network_id_b64
+                    "invite_accepted network_id {} conflicts with existing trust anchor {}",
+                    network_id_b64, stored
                 ),
             });
         }
-        Some(_) => {}
-        None => {
-            conn.execute(
-                "INSERT OR IGNORE INTO trust_anchors (peer_id, network_id) VALUES (?1, ?2)",
-                rusqlite::params![recorded_by, &network_id_b64],
-            )?;
-        }
     }
 
-    // Write invite_accepted projection table
+    // Mismatch check passed — write projection table.
     conn.execute(
         "INSERT OR IGNORE INTO invite_accepted (recorded_by, event_id, invite_event_id, network_id)
          VALUES (?1, ?2, ?3, ?4)",
         rusqlite::params![recorded_by, event_id_b64, &invite_eid_b64, &network_id_b64],
+    )?;
+
+    // Write trust anchor (first-write-wins).
+    conn.execute(
+        "INSERT OR IGNORE INTO trust_anchors (peer_id, network_id) VALUES (?1, ?2)",
+        rusqlite::params![recorded_by, &network_id_b64],
     )?;
 
     Ok(ProjectionDecision::Valid)

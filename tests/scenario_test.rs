@@ -2242,3 +2242,218 @@ fn test_transport_key_replay_invariants() {
     // Verify replay invariants (forward, double, reverse)
     verify_projection_invariants(&alice);
 }
+
+
+// =============================================================================
+// Phase 7 logic fixes: corrected guard and binding semantics
+// =============================================================================
+
+/// invite_accepted projects without any prior invite event recorded.
+/// This verifies the HasRecordedInvite guard has been removed.
+#[test]
+fn test_invite_accepted_no_prior_invite_required() {
+    let channel = test_channel();
+    let alice = Peer::new("alice", channel);
+    let db = open_connection(&alice.db_path).unwrap();
+
+    let network_id: [u8; 32] = rand::random();
+    let fake_invite_eid: [u8; 32] = rand::random();
+
+    // Create invite_accepted BEFORE any invite event exists.
+    // Under old semantics this would Block; under corrected semantics it should project.
+    let ia_eid = alice.create_invite_accepted(&fake_invite_eid, network_id);
+
+    let ia_b64 = event_id_to_base64(&ia_eid);
+    let valid: bool = db.query_row(
+        "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+        rusqlite::params![&alice.identity, &ia_b64],
+        |row| row.get(0),
+    ).unwrap();
+    assert!(valid, "invite_accepted should be valid without prior invite event (no HasRecordedInvite guard)");
+
+    // Trust anchor should be set from the event's own network_id
+    let anchor: String = db.query_row(
+        "SELECT network_id FROM trust_anchors WHERE peer_id = ?1",
+        rusqlite::params![&alice.identity],
+        |row| row.get(0),
+    ).expect("trust anchor should exist");
+    let expected_nid = event_id_to_base64(&network_id);
+    assert_eq!(anchor, expected_nid, "trust anchor should match invite_accepted event's network_id");
+}
+
+/// Trust anchor immutability: second invite_accepted with conflicting network_id is rejected.
+#[test]
+fn test_trust_anchor_immutability() {
+    let channel = test_channel();
+    let alice = Peer::new("alice", channel);
+    let db = open_connection(&alice.db_path).unwrap();
+
+    let network_id_1: [u8; 32] = rand::random();
+    let network_id_2: [u8; 32] = rand::random();
+    let fake_invite_1: [u8; 32] = rand::random();
+    let fake_invite_2: [u8; 32] = rand::random();
+
+    // First invite_accepted sets the trust anchor
+    let ia1_eid = alice.create_invite_accepted(&fake_invite_1, network_id_1);
+    let ia1_b64 = event_id_to_base64(&ia1_eid);
+    let valid1: bool = db.query_row(
+        "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+        rusqlite::params![&alice.identity, &ia1_b64],
+        |row| row.get(0),
+    ).unwrap();
+    assert!(valid1, "first invite_accepted should be valid");
+
+    // Second invite_accepted with different network_id should be rejected
+    let result = alice.try_create_invite_accepted(&fake_invite_2, network_id_2);
+    match result {
+        Err(ref e) => {
+            let msg = format!("{}", e);
+            assert!(
+                msg.contains("rejected") || msg.contains("conflicts"),
+                "expected rejection for conflicting trust anchor, got: {}",
+                msg
+            );
+        }
+        Ok(eid) => {
+            let eid_b64 = event_id_to_base64(&eid);
+            let rejected: bool = db.query_row(
+                "SELECT COUNT(*) > 0 FROM rejected_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![&alice.identity, &eid_b64],
+                |row| row.get(0),
+            ).unwrap();
+            assert!(rejected, "conflicting invite_accepted should be in rejected_events");
+        }
+    }
+
+    // Trust anchor should still be the first one
+    let anchor: String = db.query_row(
+        "SELECT network_id FROM trust_anchors WHERE peer_id = ?1",
+        rusqlite::params![&alice.identity],
+        |row| row.get(0),
+    ).expect("trust anchor should still exist");
+    let expected_nid = event_id_to_base64(&network_id_1);
+    assert_eq!(anchor, expected_nid, "trust anchor should not have changed");
+}
+
+/// No pre-projection blob capture influence: manually inserting a malformed
+/// invite-like blob into events should not alter trust binding state.
+#[test]
+fn test_no_blob_capture_trust_influence() {
+    let channel = test_channel();
+    let alice = Peer::new("alice", channel);
+    let db = open_connection(&alice.db_path).unwrap();
+
+    // Manually craft a blob that looks like a UserInviteBoot (type 10) with a specific
+    // network_id, and insert it directly into the events table (simulating raw ingress).
+    // Under old semantics, capture_invite_network_binding would have extracted the
+    // network_id and written it to invite_network_bindings. Under corrected semantics,
+    // this should have no effect on trust state.
+    let fake_network_id: [u8; 32] = [0xAA; 32];
+    let mut fake_blob = vec![10u8]; // type code for UserInviteBoot
+    fake_blob.extend_from_slice(&[0u8; 40]); // created_at_ms(8) + public_key(32)
+    fake_blob.extend_from_slice(&fake_network_id); // network_id at [41..73]
+    fake_blob.extend_from_slice(&[0u8; 97]); // rest of the 170B blob
+
+    let fake_eid = poc_7::crypto::hash_event(&fake_blob);
+    let fake_b64 = event_id_to_base64(&fake_eid);
+
+    db.execute(
+        "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
+         VALUES (?1, 'user_invite_boot', ?2, 'shared', 0, 0)",
+        rusqlite::params![&fake_b64, &fake_blob],
+    ).unwrap();
+    db.execute(
+        "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
+         VALUES (?1, ?2, 0, 'test')",
+        rusqlite::params![&alice.identity, &fake_b64],
+    ).unwrap();
+
+    // invite_network_bindings should be empty (no capture happened)
+    let binding_count: i64 = db.query_row(
+        "SELECT COUNT(*) FROM invite_network_bindings WHERE peer_id = ?1",
+        rusqlite::params![&alice.identity],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(binding_count, 0, "no pre-projection blob capture should occur");
+
+    // Trust anchor should be unset
+    let anchor_count: i64 = db.query_row(
+        "SELECT COUNT(*) FROM trust_anchors WHERE peer_id = ?1",
+        rusqlite::params![&alice.identity],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(anchor_count, 0, "trust anchor should not be set by raw blob presence");
+}
+
+/// True out-of-order identity chain: record invite_accepted BEFORE its referenced
+/// invite event, then record network, then invite event -> cascade resolves everything.
+#[test]
+fn test_true_out_of_order_identity_chain() {
+    let channel = test_channel();
+    let alice = Peer::new("alice", channel);
+    let db = open_connection(&alice.db_path).unwrap();
+
+    use ed25519_dalek::SigningKey;
+    let mut rng = rand::thread_rng();
+
+    let network_key = SigningKey::generate(&mut rng);
+    let network_pubkey = network_key.verifying_key().to_bytes();
+    let network_id: [u8; 32] = rand::random();
+
+    // Step 1: Create invite_accepted FIRST (before network or invite exist).
+    // Under corrected semantics, this sets the trust anchor immediately.
+    let invite_key = SigningKey::generate(&mut rng);
+    let invite_pubkey = invite_key.verifying_key().to_bytes();
+
+    let dummy_invite_eid = [42u8; 32];
+    let ia_eid = alice.create_invite_accepted(&dummy_invite_eid, network_id);
+
+    let ia_b64 = event_id_to_base64(&ia_eid);
+    let ia_valid: bool = db.query_row(
+        "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+        rusqlite::params![&alice.identity, &ia_b64],
+        |row| row.get(0),
+    ).unwrap();
+    assert!(ia_valid, "invite_accepted should be immediately valid (no HasRecordedInvite guard)");
+
+    // Step 2: Create network event. Should cascade-unblock via guard retry
+    // since trust anchor is now set.
+    let network_eid = alice.create_network(network_id, network_pubkey);
+
+    let net_b64 = event_id_to_base64(&network_eid);
+    let net_valid: bool = db.query_row(
+        "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+        rusqlite::params![&alice.identity, &net_b64],
+        |row| row.get(0),
+    ).unwrap();
+    assert!(net_valid, "network event should be valid (trust anchor matches)");
+
+    // Step 3: Create UserInviteBoot (signed by network)
+    let user_invite_eid = alice.create_user_invite_boot_with_key(
+        invite_pubkey,
+        &network_key,
+        &network_eid,
+        network_id,
+    );
+
+    let ui_b64 = event_id_to_base64(&user_invite_eid);
+    let ui_valid: bool = db.query_row(
+        "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+        rusqlite::params![&alice.identity, &ui_b64],
+        |row| row.get(0),
+    ).unwrap();
+    assert!(ui_valid, "user_invite_boot should be valid (network is valid signer)");
+
+    // Step 4: Create UserBoot (signed by invite key)
+    let user_key = SigningKey::generate(&mut rng);
+    let user_pubkey = user_key.verifying_key().to_bytes();
+    let user_eid = alice.create_user_boot(user_pubkey, &invite_key, &user_invite_eid);
+
+    let user_b64 = event_id_to_base64(&user_eid);
+    let user_valid: bool = db.query_row(
+        "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+        rusqlite::params![&alice.identity, &user_b64],
+        |row| row.get(0),
+    ).unwrap();
+    assert!(user_valid, "user_boot should be valid after full chain");
+}

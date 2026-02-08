@@ -302,6 +302,17 @@ static MIGRATIONS: &[Migration] = &[
                 ON networks (recorded_by, network_id);
         ",
     },
+    Migration {
+        version: 12,
+        name: "retire_invite_network_bindings",
+        sql: "
+            -- invite_network_bindings is no longer used by runtime logic.
+            -- Trust anchor binding now derives directly from invite_accepted event fields.
+            -- Table is retained for backward compatibility; no runtime code reads or writes it.
+            -- No destructive cleanup: existing rows are harmless and preserved for forensics.
+            SELECT 1;
+        ",
+    },
 ];
 
 fn ensure_schema_migrations(conn: &Connection) -> SqliteResult<()> {
@@ -421,6 +432,6 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 11);
+        assert_eq!(count, 12);
     }
 }
