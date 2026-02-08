@@ -5,7 +5,7 @@ use crate::crypto::{event_id_to_base64, event_id_from_base64, EventId};
 use crate::events::{self, ParsedEvent, registry};
 use super::decision::ProjectionDecision;
 use super::encrypted::project_encrypted;
-use super::projectors::{project_message, project_reaction, project_peer_key, project_secret_key, project_signed_memo};
+use super::projectors::{project_message, project_message_deletion, project_reaction, project_peer_key, project_secret_key, project_signed_memo};
 use super::signer::{resolve_signer_key, verify_ed25519_signature};
 
 /// Record a rejected event durably so it is not re-processed on replay or cascade.
@@ -81,6 +81,9 @@ fn apply_projection(
         }
         ParsedEvent::SecretKey(sk) => {
             project_secret_key(conn, recorded_by, event_id_b64, sk)?;
+        }
+        ParsedEvent::MessageDeletion(del) => {
+            return project_message_deletion(conn, recorded_by, event_id_b64, del);
         }
     }
 
