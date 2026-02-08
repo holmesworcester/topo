@@ -139,17 +139,28 @@ pub fn project_message_deletion(
     let target_b64 = event_id_to_base64(&del.target_event_id);
     let del_author_b64 = event_id_to_base64(&del.author_id);
 
-    // Check if already tombstoned
-    let already_deleted: bool = conn.query_row(
-        "SELECT COUNT(*) > 0 FROM deleted_messages WHERE recorded_by = ?1 AND message_id = ?2",
+    // Check if already tombstoned — if so, verify author against tombstone before accepting
+    let tombstone_author: Option<String> = match conn.query_row(
+        "SELECT author_id FROM deleted_messages WHERE recorded_by = ?1 AND message_id = ?2",
         rusqlite::params![recorded_by, &target_b64],
-        |row| row.get(0),
-    )?;
-    if already_deleted {
+        |row| row.get::<_, String>(0),
+    ) {
+        Ok(a) => Some(a),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(e) => return Err(e.into()),
+    };
+
+    if let Some(ref stored_author) = tombstone_author {
+        // Tombstone exists — still enforce author match
+        if stored_author != &del_author_b64 {
+            return Ok(ProjectionDecision::Reject {
+                reason: "deletion author does not match message author".to_string(),
+            });
+        }
         return Ok(ProjectionDecision::AlreadyProcessed);
     }
 
-    // Look up target message
+    // No tombstone — look up target message for authorization
     let msg_author: Option<String> = match conn.query_row(
         "SELECT author_id FROM messages WHERE recorded_by = ?1 AND message_id = ?2",
         rusqlite::params![recorded_by, &target_b64],
@@ -167,7 +178,6 @@ pub fn project_message_deletion(
             });
         }
         Some(author_b64) => {
-            // Authorization: deletion author must match message author
             if author_b64 != del_author_b64 {
                 return Ok(ProjectionDecision::Reject {
                     reason: "deletion author does not match message author".to_string(),
