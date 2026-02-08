@@ -259,6 +259,35 @@ static MIGRATIONS: &[Migration] = &[
             );
         ",
     },
+    Migration {
+        version: 9,
+        name: "add_peer_transport_bindings",
+        sql: "
+            CREATE TABLE IF NOT EXISTS peer_transport_bindings (
+                recorded_by TEXT NOT NULL,
+                peer_id TEXT NOT NULL,
+                spki_fingerprint BLOB NOT NULL,
+                bound_at INTEGER NOT NULL,
+                PRIMARY KEY (recorded_by, peer_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_transport_bindings_spki
+                ON peer_transport_bindings(recorded_by, spki_fingerprint);
+        ",
+    },
+    Migration {
+        version: 10,
+        name: "add_transport_keys",
+        sql: "
+            CREATE TABLE IF NOT EXISTS transport_keys (
+                recorded_by TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                spki_fingerprint BLOB NOT NULL,
+                PRIMARY KEY (recorded_by, event_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_transport_keys_spki
+                ON transport_keys(recorded_by, spki_fingerprint);
+        ",
+    },
 ];
 
 fn ensure_schema_migrations(conn: &Connection) -> SqliteResult<()> {
@@ -378,6 +407,6 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 8);
+        assert_eq!(count, 10);
     }
 }

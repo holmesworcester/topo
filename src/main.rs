@@ -5,9 +5,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
-use poc_7::db::{open_connection, schema::{create_tables, backfill_legacy_messages, count_legacy_messages}};
+use poc_7::db::{open_connection, schema::{create_tables, backfill_legacy_messages, count_legacy_messages}, transport_trust::allowed_peers_combined};
 use poc_7::events::{MessageEvent, ParsedEvent};
-use poc_7::identity::{cert_paths_from_db, load_identity_from_db, local_identity_from_db};
+use poc_7::transport_identity::{transport_cert_paths_from_db, load_transport_peer_id_from_db, ensure_transport_peer_id_from_db};
 use poc_7::projection::create::create_event_sync;
 use poc_7::sync::engine::{accept_loop, connect_loop};
 use poc_7::transport::{
@@ -43,8 +43,9 @@ enum Commands {
         pin_peer: Vec<String>,
     },
 
-    /// Print local SPKI fingerprint (generates cert if needed)
-    Identity {
+    /// Print local transport identity — SPKI fingerprint from TLS cert (generates cert if needed)
+    #[command(name = "transport-identity", alias = "identity")]
+    TransportIdentity {
         #[arg(short, long, default_value = "server.db")]
         db: String,
     },
@@ -85,8 +86,9 @@ enum Commands {
         channel: String,
     },
 
-    /// Backfill legacy messages (from Phase 0 migration) to the local identity
-    BackfillIdentity {
+    /// Backfill legacy messages to the local transport identity (cert/key/SPKI)
+    #[command(name = "backfill-transport-identity", alias = "backfill-identity")]
+    BackfillTransportIdentity {
         #[arg(short, long, default_value = "server.db")]
         db: String,
     },
@@ -133,7 +135,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Commands::Sync { bind, connect, db, pin_peer } => {
             run_sync(bind, connect, &db, &pin_peer).await?;
         }
-        Commands::Identity { db } => {
+        Commands::TransportIdentity { db } => {
             run_identity(&db)?;
         }
         Commands::Messages { db, limit } => {
@@ -148,7 +150,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Commands::Generate { count, db, channel } => {
             generate_messages(&db, count, &channel)?;
         }
-        Commands::BackfillIdentity { db } => {
+        Commands::BackfillTransportIdentity { db } => {
             backfill_identity(&db)?;
         }
         Commands::AssertNow { predicate, db } => {
@@ -169,7 +171,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 // ---------------------------------------------------------------------------
 
 fn run_identity(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let (cert_path, key_path) = cert_paths_from_db(db_path);
+    let (cert_path, key_path) = transport_cert_paths_from_db(db_path);
     let (cert_der, _) = load_or_generate_cert(&cert_path, &key_path)?;
     let fp = extract_spki_fingerprint(cert_der.as_ref())?;
     println!("{}", hex::encode(fp));
@@ -177,7 +179,7 @@ fn run_identity(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + 
 }
 
 fn backfill_identity(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let recorded_by = local_identity_from_db(db_path)?;
+    let recorded_by = ensure_transport_peer_id_from_db(db_path)?;
     let db = open_connection(db_path)?;
     create_tables(&db)?;
 
@@ -270,7 +272,7 @@ fn days_to_ymd(days: i64) -> (i64, u32, u32) {
 }
 
 fn show_messages(db_path: &str, limit: usize) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let recorded_by = load_identity_from_db(db_path)?;
+    let recorded_by = load_transport_peer_id_from_db(db_path)?;
     let db = open_connection(db_path)?;
     create_tables(&db)?;
 
@@ -350,7 +352,7 @@ fn current_timestamp_ms() -> u64 {
 }
 
 fn send_message(db_path: &str, channel_hex: &str, content: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let recorded_by = local_identity_from_db(db_path)?;
+    let recorded_by = ensure_transport_peer_id_from_db(db_path)?;
     let db = open_connection(db_path)?;
     create_tables(&db)?;
 
@@ -372,7 +374,7 @@ fn send_message(db_path: &str, channel_hex: &str, content: &str) -> Result<(), B
 }
 
 fn show_status(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let recorded_by = load_identity_from_db(db_path)?;
+    let recorded_by = load_transport_peer_id_from_db(db_path)?;
     let db = open_connection(db_path)?;
     create_tables(&db)?;
 
@@ -410,7 +412,7 @@ fn show_status(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + S
 }
 
 fn generate_messages(db_path: &str, count: usize, channel_hex: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let recorded_by = local_identity_from_db(db_path)?;
+    let recorded_by = ensure_transport_peer_id_from_db(db_path)?;
     let db = open_connection(db_path)?;
     create_tables(&db)?;
 
@@ -526,7 +528,7 @@ fn run_assert_now(
     db_path: &str,
     predicate_str: &str,
 ) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
-    let recorded_by = load_identity_from_db(db_path)?;
+    let recorded_by = load_transport_peer_id_from_db(db_path)?;
     let (field, op, expected) = parse_predicate(predicate_str)
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
     let db = open_connection(db_path)?;
@@ -549,7 +551,7 @@ fn run_assert_eventually(
     timeout_ms: u64,
     interval_ms: u64,
 ) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
-    let recorded_by = load_identity_from_db(db_path)?;
+    let recorded_by = load_transport_peer_id_from_db(db_path)?;
     let (field, op, expected) = parse_predicate(predicate_str)
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
     let db = open_connection(db_path)?;
@@ -586,24 +588,35 @@ async fn run_sync(
     db_path: &str,
     pin_peers: &[String],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if pin_peers.is_empty() {
-        return Err("--pin-peer is required: at least one peer fingerprint must be specified. \
-            Use `poc-7 identity --db <peer-db>` to get a peer's fingerprint.".into());
-    }
-
     // Initialize DB before spawning concurrent loops (avoids create_tables race)
     {
         let db = open_connection(db_path)?;
         create_tables(&db)?;
     }
 
-    let (cert_path, key_path) = cert_paths_from_db(db_path);
+    let (cert_path, key_path) = transport_cert_paths_from_db(db_path);
     let (cert, key) = load_or_generate_cert(&cert_path, &key_path)?;
     let recorded_by = {
         let fp = extract_spki_fingerprint(cert.as_ref())?;
         hex::encode(fp)
     };
-    let allowed_peers = Arc::new(AllowedPeers::from_hex_strings(pin_peers)?);
+
+    // Build combined trust: CLI pins (bootstrap) + projected transport bindings
+    let cli_pins = AllowedPeers::from_hex_strings(pin_peers)?;
+    let allowed_peers = {
+        let db = open_connection(db_path)?;
+        let combined = allowed_peers_combined(&db, &recorded_by, &cli_pins)?;
+        if combined.is_empty() {
+            return Err("No allowed peers: provide --pin-peer for bootstrap, or ensure identity events have synced. \
+                Use `poc-7 transport-identity --db <peer-db>` to get a peer's fingerprint.".into());
+        }
+        let cli_count = cli_pins.len();
+        let total = combined.len();
+        if total > cli_count {
+            info!("Trust sources: {} from CLI pins, {} from projected bindings", cli_count, total - cli_count);
+        }
+        Arc::new(combined)
+    };
 
     let server_endpoint = create_server_endpoint(bind, cert.clone(), key.clone_key(), allowed_peers.clone())?;
     info!("Listening on {}", server_endpoint.local_addr()?);

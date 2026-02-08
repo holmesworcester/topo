@@ -10,8 +10,9 @@ use crate::events::{
     DeviceInviteFirstEvent, UserBootEvent,
     PeerSharedFirstEvent, AdminBootEvent,
     UserRemovedEvent, PeerRemovedEvent, SecretSharedEvent,
+    TransportKeyEvent,
 };
-use crate::identity::{cert_paths_from_db, local_identity_from_db};
+use crate::transport_identity::{transport_cert_paths_from_db, ensure_transport_peer_id_from_db};
 use crate::projection::create::{create_event_sync, create_signed_event_sync, create_encrypted_event_sync, CreateEventError};
 use crate::projection::pipeline::project_one;
 use crate::sync::engine::{accept_loop, connect_loop};
@@ -78,7 +79,7 @@ impl Peer {
         let db = open_connection(&db_path).expect("failed to open db");
         create_tables(&db).expect("failed to create tables");
 
-        let identity = local_identity_from_db(&db_path).expect("failed to compute identity");
+        let identity = ensure_transport_peer_id_from_db(&db_path).expect("failed to compute identity");
         let author_id: [u8; 32] = rand::random();
 
         Self {
@@ -428,6 +429,25 @@ impl Peer {
             .expect("failed to create secret_shared")
     }
 
+    /// Create a TransportKey event (signed by PeerShared key). Returns the event ID.
+    pub fn create_transport_key(
+        &self,
+        spki_fingerprint: [u8; 32],
+        signing_key: &ed25519_dalek::SigningKey,
+        peer_shared_event_id: &EventId,
+    ) -> EventId {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        let evt = ParsedEvent::TransportKey(TransportKeyEvent {
+            created_at_ms: current_timestamp_ms(),
+            spki_fingerprint,
+            signed_by: *peer_shared_event_id,
+            signer_type: 5,
+            signature: [0u8; 64],
+        });
+        create_signed_event_sync(&db, &self.identity, &evt, signing_key)
+            .expect("failed to create transport_key")
+    }
+
     /// Create multiple messages. Uses a transaction for speed at scale.
     pub fn batch_create_messages(&self, count: usize) {
         let db = open_connection(&self.db_path).expect("failed to open db");
@@ -606,6 +626,8 @@ fn replay_projection_impl(db: &rusqlite::Connection, recorded_by: &str, order: &
     db.execute("DELETE FROM secret_shared WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
     db.execute("DELETE FROM trust_anchors WHERE peer_id = ?1", rusqlite::params![recorded_by]).ok();
     db.execute("DELETE FROM invite_network_bindings WHERE peer_id = ?1", rusqlite::params![recorded_by]).ok();
+    db.execute("DELETE FROM peer_transport_bindings WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
+    db.execute("DELETE FROM transport_keys WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
     db.execute("DELETE FROM valid_events WHERE peer_id = ?1", rusqlite::params![recorded_by])
         .expect("failed to clear valid_events");
     db.execute("DELETE FROM blocked_event_deps WHERE peer_id = ?1", rusqlite::params![recorded_by])
@@ -759,10 +781,10 @@ pub fn start_peers(
     peer_a: &Peer,
     peer_b: &Peer,
 ) -> (std::thread::JoinHandle<()>, std::thread::JoinHandle<()>) {
-    let (cert_path_a, key_path_a) = cert_paths_from_db(&peer_a.db_path);
+    let (cert_path_a, key_path_a) = transport_cert_paths_from_db(&peer_a.db_path);
     let (cert_a, key_a) = load_or_generate_cert(&cert_path_a, &key_path_a)
         .expect("failed to load cert for peer A");
-    let (cert_path_b, key_path_b) = cert_paths_from_db(&peer_b.db_path);
+    let (cert_path_b, key_path_b) = transport_cert_paths_from_db(&peer_b.db_path);
     let (cert_b, key_b) = load_or_generate_cert(&cert_path_b, &key_path_b)
         .expect("failed to load cert for peer B");
 

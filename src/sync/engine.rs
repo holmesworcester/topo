@@ -21,6 +21,7 @@ use tracing::{info, warn, error};
 use crate::crypto::{hash_event, event_id_to_base64, event_id_from_base64, EventId};
 use crate::db::{open_connection, schema::create_tables, store::Store, egress_queue::EgressQueue, wanted::WantedEvents, project_queue::ProjectQueue};
 use crate::db::health::{purge_expired_endpoints, record_endpoint_observation};
+use crate::db::transport_trust::record_transport_binding;
 use crate::events::{self, registry, ShareScope};
 use crate::projection::identity::capture_invite_network_binding;
 use crate::projection::pipeline::project_one;
@@ -816,7 +817,7 @@ pub async fn accept_loop(
         };
         info!("Accepted connection from {}", peer_id);
 
-        // Record endpoint observation and periodically purge expired ones
+        // Record endpoint observation, transport binding, and purge expired
         {
             let remote = connection.remote_address();
             let now = current_timestamp_ms();
@@ -830,6 +831,14 @@ pub async fn accept_loop(
                     now,
                     ENDPOINT_TTL_MS,
                 );
+                // Record transport binding (peer_id is hex SPKI fingerprint)
+                if let Ok(spki_bytes) = hex::decode(&peer_id) {
+                    if spki_bytes.len() == 32 {
+                        let mut fp = [0u8; 32];
+                        fp.copy_from_slice(&spki_bytes);
+                        let _ = record_transport_binding(&db, recorded_by, &peer_id, &fp);
+                    }
+                }
                 let purged = purge_expired_endpoints(&db, now).unwrap_or(0);
                 if purged > 0 {
                     info!("Purged {} expired endpoint observations", purged);
@@ -927,7 +936,7 @@ pub async fn connect_loop(
         };
         info!("Connected to {}", peer_id);
 
-        // Record endpoint observation and periodically purge expired ones
+        // Record endpoint observation, transport binding, and purge expired
         {
             let remote_addr = connection.remote_address();
             let now = current_timestamp_ms();
@@ -941,6 +950,14 @@ pub async fn connect_loop(
                     now,
                     ENDPOINT_TTL_MS,
                 );
+                // Record transport binding (peer_id is hex SPKI fingerprint)
+                if let Ok(spki_bytes) = hex::decode(&peer_id) {
+                    if spki_bytes.len() == 32 {
+                        let mut fp = [0u8; 32];
+                        fp.copy_from_slice(&spki_bytes);
+                        let _ = record_transport_binding(&db, recorded_by, &peer_id, &fp);
+                    }
+                }
                 let purged = purge_expired_endpoints(&db, now).unwrap_or(0);
                 if purged > 0 {
                     info!("Purged {} expired endpoint observations", purged);

@@ -95,34 +95,46 @@ Safety rule:
 
 # 2. Transport and Session Identity
 
+Two separate identity scopes exist:
+
+1. **Transport identity** (mTLS scope): cert/key material, SPKI fingerprints, `peer_id` derived from BLAKE2b-256 of X.509 SPKI. Managed by the `transport_identity` module.
+2. **Event-graph identity** (identity layer scope): Ed25519 keys, signer chains, trust anchors, and identity events (types 8-22). Managed by the `projection/identity` module.
+
+These key spaces are separate. A `TransportKey` event (type 23) binds them: it attests a specific SPKI fingerprint under a PeerShared identity.
+
 ## 2.1 QUIC + mTLS
 
 All peer transport uses QUIC with strict pinned mTLS.
 
 Rules:
 1. each daemon profile has persistent cert/private key material,
-2. peer allow/deny policy is based on expected certificate SPKI pins,
+2. peer allow/deny policy is based on expected certificate SPKI pins (CLI `--pin-peer`) or projected transport bindings from the identity graph,
 3. no permissive verifier in production mode.
 
-## 2.2 Identity binding
+## 2.2 Transport identity binding
 
-Peer identity is event-defined:
+Transport peer identity is SPKI-derived:
 
-1. `peer_id = hash(peer_identity_event)`,
-2. identity state maintains mapping `peer_id -> allowed cert SPKI`,
-3. reverse lookup `SPKI -> peer_id` binds authenticated sessions.
+1. `peer_id = hex(BLAKE2b-256(cert_SPKI))`,
+2. the `peer_transport_bindings` table records observed connections,
+3. `TransportKey` events (type 23) provide event-graph-attested SPKI bindings.
 
-In this prototype stage, identity public key and cert SPKI key material are aligned (long-lived identity key).
-QUIC/TLS 1.3 still provides forward-secret session keys via handshake key agreement.
+## 2.3 Event-graph identity binding
 
-## 2.3 Recording identity semantics
+Event-graph identity is event-defined:
+
+1. identity state maintains signer chains from network root to peer,
+2. `TransportKey` events bridge event-graph identity to transport SPKI fingerprints,
+3. projected identity determines which peers are allowed to sync.
+
+## 2.4 Recording identity semantics
 
 1. `signed_by`: canonical signer event reference used for signature/policy checks.
-2. `signer_type`: signer keyspace discriminator (`peer | user | workspace | invite`).
-3. `recorded_by`: local tenant peer identity that recorded/projected the event.
+2. `signer_type`: signer keyspace discriminator (`peer_key | network | user_invite | device_invite | user | peer_shared`).
+3. `recorded_by`: local tenant transport peer identity that recorded/projected the event.
 4. `via_peer_id`: authenticated remote transport peer for ingress metadata.
 
-`recorded_by` is derived from authenticated local daemon/profile identity, not from event payload claims.
+`recorded_by` is derived from authenticated local daemon/profile transport identity, not from event payload claims.
 
 ---
 

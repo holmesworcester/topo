@@ -42,6 +42,23 @@ impl AllowedPeers {
     pub fn contains(&self, fp: &[u8; 32]) -> bool {
         self.fingerprints.contains(fp)
     }
+
+    /// Return a new AllowedPeers that is the union of self and other.
+    pub fn union(&self, other: &AllowedPeers) -> AllowedPeers {
+        let mut combined = self.fingerprints.clone();
+        for fp in &other.fingerprints {
+            combined.insert(*fp);
+        }
+        AllowedPeers { fingerprints: combined }
+    }
+
+    pub fn len(&self) -> usize {
+        self.fingerprints.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.fingerprints.is_empty()
+    }
 }
 
 /// Verifies peer certificates by checking SPKI fingerprint against an allowed set.

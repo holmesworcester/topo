@@ -90,7 +90,7 @@ fn apply_projection(
         ParsedEvent::MessageDeletion(del) => {
             return project_message_deletion(conn, recorded_by, event_id_b64, del);
         }
-        // Identity events: dispatch to identity projectors (placeholder — full impl in identity.rs)
+        // Identity events: dispatch to identity projectors
         ParsedEvent::Network(_)
         | ParsedEvent::InviteAccepted(_)
         | ParsedEvent::UserInviteBoot(_)
@@ -105,7 +105,8 @@ fn apply_projection(
         | ParsedEvent::AdminOngoing(_)
         | ParsedEvent::UserRemoved(_)
         | ParsedEvent::PeerRemoved(_)
-        | ParsedEvent::SecretShared(_) => {
+        | ParsedEvent::SecretShared(_)
+        | ParsedEvent::TransportKey(_) => {
             return super::identity::apply_identity_projection(conn, recorded_by, event_id_b64, parsed);
         }
     }
