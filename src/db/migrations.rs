@@ -288,6 +288,20 @@ static MIGRATIONS: &[Migration] = &[
                 ON transport_keys(recorded_by, spki_fingerprint);
         ",
     },
+    Migration {
+        version: 11,
+        name: "enforce_single_network_per_peer",
+        sql: "
+            DELETE FROM networks
+             WHERE rowid NOT IN (
+                 SELECT MIN(rowid)
+                 FROM networks
+                 GROUP BY recorded_by, network_id
+             );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_networks_single_per_peer
+                ON networks (recorded_by, network_id);
+        ",
+    },
 ];
 
 fn ensure_schema_migrations(conn: &Connection) -> SqliteResult<()> {
@@ -407,6 +421,6 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 10);
+        assert_eq!(count, 11);
     }
 }

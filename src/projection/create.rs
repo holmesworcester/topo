@@ -7,7 +7,6 @@ use crate::events::EncryptedEvent;
 use crate::projection::encrypted::encrypt_event_blob;
 use crate::projection::signer::sign_event_bytes;
 use super::decision::ProjectionDecision;
-use super::identity::capture_invite_network_binding;
 use super::pipeline::project_one;
 
 #[derive(Debug)]
@@ -34,6 +33,16 @@ impl std::fmt::Display for CreateEventError {
 }
 
 impl std::error::Error for CreateEventError {}
+
+/// Extract event_id from Ok or Blocked (event is stored in both cases).
+/// Returns Err only for true failures (encode, db, rejected).
+pub fn event_id_or_blocked(result: Result<EventId, CreateEventError>) -> Result<EventId, CreateEventError> {
+    match result {
+        Ok(eid) => Ok(eid),
+        Err(CreateEventError::Blocked { event_id, .. }) => Ok(event_id),
+        Err(e) => Err(e),
+    }
+}
 
 /// Shared helper: hash blob, write to events/neg_items/recorded_events, project via project_one.
 fn store_blob_and_project(
@@ -80,18 +89,16 @@ fn store_blob_and_project(
         rusqlite::params![recorded_by, &event_id_b64, now_ms, "local_create"],
     ).map_err(|e| CreateEventError::DbError(e.to_string()))?;
 
-    // Capture invite_network_bindings from invite blobs (before projection)
-    capture_invite_network_binding(conn, recorded_by, blob)
-        .map_err(|e| CreateEventError::DbError(e.to_string()))?;
-
     // Project
     let decision = project_one(conn, recorded_by, &event_id)
         .map_err(|e| CreateEventError::DbError(e.to_string()))?;
 
     match decision {
         ProjectionDecision::Valid
-        | ProjectionDecision::AlreadyProcessed
-        | ProjectionDecision::Block { .. } => Ok(event_id),
+        | ProjectionDecision::AlreadyProcessed => Ok(event_id),
+        ProjectionDecision::Block { missing } => {
+            Err(CreateEventError::Blocked { event_id, missing })
+        }
         ProjectionDecision::Reject { reason } => {
             Err(CreateEventError::Rejected { event_id, reason })
         }
@@ -313,8 +320,14 @@ mod tests {
             emoji: "\u{1f44d}".to_string(),
         });
 
-        // Event is created (stored) but blocked — returns Ok with event_id
-        let eid = create_event_sync(&conn, recorded_by, &rxn).unwrap();
+        // Event is stored but blocked — returns Blocked error with event_id
+        let err = create_event_sync(&conn, recorded_by, &rxn).unwrap_err();
+        let (eid, missing) = match err {
+            CreateEventError::Blocked { event_id, missing } => (event_id, missing),
+            other => panic!("expected Blocked, got: {}", other),
+        };
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0], fake_target);
         let eid_b64 = event_id_to_base64(&eid);
 
         // Should be in events table but NOT in valid_events

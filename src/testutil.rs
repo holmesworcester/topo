@@ -13,7 +13,7 @@ use crate::events::{
     TransportKeyEvent,
 };
 use crate::transport_identity::{transport_cert_paths_from_db, ensure_transport_peer_id_from_db};
-use crate::projection::create::{create_event_sync, create_signed_event_sync, create_encrypted_event_sync, CreateEventError};
+use crate::projection::create::{create_event_sync, create_signed_event_sync, create_encrypted_event_sync, event_id_or_blocked, CreateEventError};
 use crate::projection::pipeline::project_one;
 use crate::sync::engine::{accept_loop, connect_loop};
 use crate::transport::{
@@ -115,7 +115,8 @@ impl Peer {
             author_id: self.author_id,
             emoji: emoji.to_string(),
         });
-        create_event_sync(&db, &self.identity, &rxn).expect("failed to create reaction")
+        event_id_or_blocked(create_event_sync(&db, &self.identity, &rxn))
+            .expect("failed to create reaction")
     }
 
     /// Create a PeerKey event publishing an Ed25519 public key.
@@ -196,7 +197,8 @@ impl Peer {
             target_event_id: *target_event_id,
             author_id: self.author_id,
         });
-        create_event_sync(&db, &self.identity, &del).expect("failed to create message_deletion")
+        event_id_or_blocked(create_event_sync(&db, &self.identity, &del))
+            .expect("failed to create message_deletion")
     }
 
     /// Create an encrypted MessageDeletion event.
@@ -222,7 +224,8 @@ impl Peer {
             public_key,
             network_id,
         });
-        create_event_sync(&db, &self.identity, &net).expect("failed to create network")
+        event_id_or_blocked(create_event_sync(&db, &self.identity, &net))
+            .expect("failed to create network")
     }
 
     /// Try to create a Network event. Returns Result to allow handling rejection.
@@ -265,7 +268,7 @@ impl Peer {
             signer_type: 1,
             signature: [0u8; 64],
         });
-        create_signed_event_sync(&db, &self.identity, &evt, signing_key)
+        event_id_or_blocked(create_signed_event_sync(&db, &self.identity, &evt, signing_key))
             .expect("failed to create user_invite_boot")
     }
 
@@ -286,7 +289,7 @@ impl Peer {
             signer_type: 1,
             signature: [0u8; 64],
         });
-        create_signed_event_sync(&db, &self.identity, &evt, signing_key)
+        event_id_or_blocked(create_signed_event_sync(&db, &self.identity, &evt, signing_key))
             .expect("failed to create user_invite_boot")
     }
 
@@ -305,7 +308,7 @@ impl Peer {
             signer_type: 2,
             signature: [0u8; 64],
         });
-        create_signed_event_sync(&db, &self.identity, &evt, signing_key)
+        event_id_or_blocked(create_signed_event_sync(&db, &self.identity, &evt, signing_key))
             .expect("failed to create user_boot")
     }
 
@@ -324,7 +327,7 @@ impl Peer {
             signer_type: 4,
             signature: [0u8; 64],
         });
-        create_signed_event_sync(&db, &self.identity, &evt, signing_key)
+        event_id_or_blocked(create_signed_event_sync(&db, &self.identity, &evt, signing_key))
             .expect("failed to create device_invite_first")
     }
 
@@ -343,7 +346,7 @@ impl Peer {
             signer_type: 3,
             signature: [0u8; 64],
         });
-        create_signed_event_sync(&db, &self.identity, &evt, signing_key)
+        event_id_or_blocked(create_signed_event_sync(&db, &self.identity, &evt, signing_key))
             .expect("failed to create peer_shared_first")
     }
 
@@ -364,7 +367,7 @@ impl Peer {
             signer_type: 1,
             signature: [0u8; 64],
         });
-        create_signed_event_sync(&db, &self.identity, &evt, signing_key)
+        event_id_or_blocked(create_signed_event_sync(&db, &self.identity, &evt, signing_key))
             .expect("failed to create admin_boot")
     }
 
@@ -383,7 +386,7 @@ impl Peer {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        create_signed_event_sync(&db, &self.identity, &evt, signing_key)
+        event_id_or_blocked(create_signed_event_sync(&db, &self.identity, &evt, signing_key))
             .expect("failed to create user_removed")
     }
 
@@ -402,7 +405,7 @@ impl Peer {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        create_signed_event_sync(&db, &self.identity, &evt, signing_key)
+        event_id_or_blocked(create_signed_event_sync(&db, &self.identity, &evt, signing_key))
             .expect("failed to create peer_removed")
     }
 
@@ -425,7 +428,7 @@ impl Peer {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        create_signed_event_sync(&db, &self.identity, &evt, signing_key)
+        event_id_or_blocked(create_signed_event_sync(&db, &self.identity, &evt, signing_key))
             .expect("failed to create secret_shared")
     }
 

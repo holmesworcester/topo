@@ -1806,52 +1806,155 @@ fn test_bootstrap_sequence() {
 
 #[test]
 fn test_out_of_order_identity() {
-    // Record UserBoot before UserInviteBoot — should block, then cascade
+    // Record UserBoot BEFORE UserInviteBoot — UserBoot blocks on missing dep,
+    // then cascades when the full invite chain is created afterward.
     let channel = test_channel();
     let alice = Peer::new("alice", channel);
     let db = open_connection(&alice.db_path).unwrap();
 
     use ed25519_dalek::SigningKey;
-    let mut rng = rand::thread_rng();
+    use poc_7::events::{encode_event, ParsedEvent, NetworkEvent, UserInviteBootEvent, UserBootEvent};
+    use poc_7::projection::signer::sign_event_bytes;
+    use poc_7::projection::pipeline::project_one;
+    use poc_7::crypto::hash_event;
+    use poc_7::events::registry;
 
+    let mut rng = rand::thread_rng();
     let network_key = SigningKey::generate(&mut rng);
     let network_pubkey = network_key.verifying_key().to_bytes();
     let network_id: [u8; 32] = rand::random();
-
-    // Create Network event first
-    let network_eid = alice.create_network(network_id, network_pubkey);
-
-    // Create invite key pair
     let invite_key = SigningKey::generate(&mut rng);
     let invite_pubkey = invite_key.verifying_key().to_bytes();
-
-    // Create UserBoot WITHOUT UserInvite first — needs the invite_eid that doesn't exist yet
-    // We need to build the blob manually since create_user_boot needs the invite to exist
     let user_key = SigningKey::generate(&mut rng);
     let user_pubkey = user_key.verifying_key().to_bytes();
 
-    // First create UserInviteBoot (will cascade-unblock UserBoot if created after)
-    let user_invite_eid = alice.create_user_invite_boot_with_key(
-        invite_pubkey,
-        &network_key,
-        &network_eid,
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    let reg = registry();
+
+    // Pre-build Network blob to get network_eid
+    let net_blob = encode_event(&ParsedEvent::Network(NetworkEvent {
+        created_at_ms: now_ms,
+        public_key: network_pubkey,
         network_id,
-    );
+    })).unwrap();
+    let network_eid = hash_event(&net_blob);
 
-    // Create InviteAccepted to set trust anchor
-    let _ia_eid = alice.create_invite_accepted(&user_invite_eid, network_id);
+    // Pre-build UserInviteBoot blob (signed by network) to get user_invite_eid
+    let mut uib_blob = encode_event(&ParsedEvent::UserInviteBoot(UserInviteBootEvent {
+        created_at_ms: now_ms + 1,
+        public_key: invite_pubkey,
+        network_id,
+        signed_by: network_eid,
+        signer_type: 1,
+        signature: [0u8; 64],
+    })).unwrap();
+    let sig_offset = uib_blob.len() - 64;
+    let sig = sign_event_bytes(&network_key, &uib_blob[..sig_offset]);
+    uib_blob[sig_offset..].copy_from_slice(&sig);
+    let user_invite_eid = hash_event(&uib_blob);
 
-    // Now the UserInviteBoot should be valid (invite recorded → invite_accepted → trust anchor → network valid → signed by network validated)
-    // Create UserBoot — should cascade from user_invite being valid
-    let user_eid = alice.create_user_boot(user_pubkey, &invite_key, &user_invite_eid);
+    // Build UserBoot blob (signed by invite_key, signed_by = user_invite_eid)
+    let mut ub_blob = encode_event(&ParsedEvent::UserBoot(UserBootEvent {
+        created_at_ms: now_ms + 2,
+        public_key: user_pubkey,
+        signed_by: user_invite_eid,
+        signer_type: 2,
+        signature: [0u8; 64],
+    })).unwrap();
+    let sig_offset = ub_blob.len() - 64;
+    let sig = sign_event_bytes(&invite_key, &ub_blob[..sig_offset]);
+    ub_blob[sig_offset..].copy_from_slice(&sig);
+    let user_eid = hash_event(&ub_blob);
 
+    // Insert UserBoot RAW first (truly out-of-order!)
     let user_b64 = event_id_to_base64(&user_eid);
-    let valid: bool = db.query_row(
+    let ub_meta = reg.lookup(ub_blob[0]).unwrap();
+    db.execute(
+        "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![&user_b64, ub_meta.type_name, &ub_blob, ub_meta.share_scope.as_str(), (now_ms + 2) as i64, now_ms as i64],
+    ).unwrap();
+    db.execute(
+        "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source) VALUES (?1, ?2, ?3, 'test')",
+        rusqlite::params![&alice.identity, &user_b64, now_ms as i64],
+    ).unwrap();
+
+    // Project UserBoot — should Block (signed_by dep user_invite_eid not valid)
+    let result = project_one(&db, &alice.identity, &user_eid).unwrap();
+    assert!(
+        matches!(result, poc_7::projection::decision::ProjectionDecision::Block { .. }),
+        "UserBoot should block when UserInviteBoot is not yet present, got {:?}", result,
+    );
+    let valid_before: bool = db.query_row(
         "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
         rusqlite::params![&alice.identity, &user_b64],
         |row| row.get(0),
     ).unwrap();
-    assert!(valid, "UserBoot should be valid after cascade");
+    assert!(!valid_before, "UserBoot should not be valid before invite chain");
+
+    // Insert Network raw + project → Block (no trust anchor yet)
+    let net_b64 = event_id_to_base64(&network_eid);
+    let net_meta = reg.lookup(net_blob[0]).unwrap();
+    db.execute(
+        "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![&net_b64, net_meta.type_name, &net_blob, net_meta.share_scope.as_str(), now_ms as i64, now_ms as i64],
+    ).unwrap();
+    db.execute(
+        "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source) VALUES (?1, ?2, ?3, 'test')",
+        rusqlite::params![&alice.identity, &net_b64, now_ms as i64],
+    ).unwrap();
+    let net_result = project_one(&db, &alice.identity, &network_eid).unwrap();
+    assert!(
+        matches!(net_result, poc_7::projection::decision::ProjectionDecision::Block { .. }),
+        "Network should block (no trust anchor yet), got {:?}", net_result,
+    );
+
+    // Insert UserInviteBoot raw + project → Block (signed_by = network_eid not valid)
+    let uib_b64 = event_id_to_base64(&user_invite_eid);
+    let uib_meta = reg.lookup(uib_blob[0]).unwrap();
+    db.execute(
+        "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![&uib_b64, uib_meta.type_name, &uib_blob, uib_meta.share_scope.as_str(), (now_ms + 1) as i64, now_ms as i64],
+    ).unwrap();
+    db.execute(
+        "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source) VALUES (?1, ?2, ?3, 'test')",
+        rusqlite::params![&alice.identity, &uib_b64, now_ms as i64],
+    ).unwrap();
+    let uib_result = project_one(&db, &alice.identity, &user_invite_eid).unwrap();
+    assert!(
+        matches!(uib_result, poc_7::projection::decision::ProjectionDecision::Block { .. }),
+        "UserInviteBoot should block (network dep not valid), got {:?}", uib_result,
+    );
+
+    // Create InviteAccepted → sets trust anchor, triggers retry_guard_blocked_events
+    // which re-projects Network → Valid → cascades UserInviteBoot → Valid → cascades UserBoot → Valid
+    let _ia_eid = alice.create_invite_accepted(&user_invite_eid, network_id);
+
+    // Assert full cascade completed — UserBoot should now be valid
+    let valid_after: bool = db.query_row(
+        "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+        rusqlite::params![&alice.identity, &user_b64],
+        |row| row.get(0),
+    ).unwrap();
+    assert!(valid_after, "UserBoot should be valid after cascade from invite chain");
+
+    // Verify intermediate events are also valid
+    let net_valid: bool = db.query_row(
+        "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+        rusqlite::params![&alice.identity, &net_b64],
+        |row| row.get(0),
+    ).unwrap();
+    assert!(net_valid, "Network should be valid after trust anchor set");
+
+    let uib_valid: bool = db.query_row(
+        "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+        rusqlite::params![&alice.identity, &uib_b64],
+        |row| row.get(0),
+    ).unwrap();
+    assert!(uib_valid, "UserInviteBoot should be valid after cascade");
 }
 
 #[test]

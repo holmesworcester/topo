@@ -23,7 +23,6 @@ use crate::db::{open_connection, schema::create_tables, store::Store, egress_que
 use crate::db::health::{purge_expired_endpoints, record_endpoint_observation};
 use crate::db::transport_trust::record_transport_binding;
 use crate::events::{self, registry, ShareScope};
-use crate::projection::identity::capture_invite_network_binding;
 use crate::projection::pipeline::project_one;
 use crate::runtime::SyncStats;
 use crate::sync::{SyncMessage, neg_id_to_event_id, NegentropyStorageSqlite};
@@ -212,11 +211,6 @@ pub fn batch_writer(
                         ]) {
                             warn!("recorded_events insert error for {}: {}", event_id_b64, e);
                             continue;
-                        }
-
-                        // Capture invite_network_bindings (before projection)
-                        if let Err(e) = capture_invite_network_binding(&db, &recorded_by, blob) {
-                            warn!("invite_network_binding capture error for {}: {}", event_id_b64, e);
                         }
 
                         // Enqueue for durable projection (atomicity boundary 1)
