@@ -7,7 +7,7 @@ use crate::crypto::event_id_to_base64;
 use crate::events::{self, EncryptedEvent, ParsedEvent, EVENT_TYPE_ENCRYPTED};
 use super::decision::ProjectionDecision;
 use super::projectors::{project_message, project_reaction, project_peer_key, project_secret_key, project_signed_memo};
-use super::signer::{resolve_signer_key, verify_ed25519_signature};
+use super::signer::{resolve_signer_key, verify_ed25519_signature, SignerResolution};
 
 /// Project an encrypted event: decrypt, parse inner, check inner deps, dispatch to inner projector.
 /// Returns Valid, Block, or Reject.
@@ -123,14 +123,19 @@ pub fn project_encrypted(
     if inner_meta.signer_required {
         let (signer_event_id, signer_type) = inner_parsed.signer_fields()
             .ok_or("inner type signer_required but no signer_fields")?;
-        let pubkey = resolve_signer_key(conn, signer_type, &signer_event_id)?;
-        match pubkey {
-            None => {
+        let resolution = resolve_signer_key(conn, recorded_by, signer_type, &signer_event_id)?;
+        match resolution {
+            SignerResolution::NotFound => {
                 return Ok(ProjectionDecision::Reject {
                     reason: "inner event signer key not found".to_string(),
                 });
             }
-            Some(key) => {
+            SignerResolution::Invalid(msg) => {
+                return Ok(ProjectionDecision::Reject {
+                    reason: format!("inner event signer resolution invalid: {}", msg),
+                });
+            }
+            SignerResolution::Found(key) => {
                 let sig_len = inner_meta.signature_byte_len;
                 if plaintext.len() < sig_len {
                     return Ok(ProjectionDecision::Reject {

@@ -20,7 +20,7 @@ use tracing::{info, warn, error};
 
 use crate::crypto::{hash_event, event_id_to_base64, event_id_from_base64, EventId};
 use crate::db::{open_connection, schema::create_tables, store::Store, egress_queue::EgressQueue, wanted::WantedEvents, project_queue::ProjectQueue};
-use crate::events::{self, registry};
+use crate::events::{self, registry, ShareScope};
 use crate::projection::pipeline::project_one;
 use crate::runtime::SyncStats;
 use crate::sync::{SyncMessage, neg_id_to_event_id, NegentropyStorageSqlite};
@@ -158,16 +158,19 @@ pub fn batch_writer(
             let event_id_b64 = event_id_to_base64(event_id);
 
             if let Some(created_at_ms) = events::extract_created_at_ms(blob) {
-                if let Err(e) = neg_items_stmt.execute(rusqlite::params![
-                    created_at_ms as i64,
-                    event_id.as_slice()
-                ]) {
-                    warn!("neg_items insert error for {}: {}", event_id_b64, e);
-                    continue;
-                }
-
                 if let Some(type_code) = events::extract_event_type(blob) {
                     if let Some(meta) = reg.lookup(type_code) {
+                        // Only insert into neg_items for shared events (defense-in-depth)
+                        if meta.share_scope == ShareScope::Shared {
+                            if let Err(e) = neg_items_stmt.execute(rusqlite::params![
+                                created_at_ms as i64,
+                                event_id.as_slice()
+                            ]) {
+                                warn!("neg_items insert error for {}: {}", event_id_b64, e);
+                                continue;
+                            }
+                        }
+
                         if let Err(e) = events_stmt.execute(rusqlite::params![
                             &event_id_b64,
                             meta.type_name,
@@ -338,6 +341,7 @@ where
     let mut neg = Negentropy::new(Storage::Borrowed(&neg_storage), 64 * 1024)?;
 
     let store = Store::new(&db);
+    let reg = registry();
 
     let ingest_cap = if low_mem_mode() { 1000 } else { 5000 };
     let (ingest_tx, ingest_rx) = mpsc::channel::<(EventId, Vec<u8>)>(ingest_cap);
@@ -460,6 +464,16 @@ where
             let mut sent_rowids: Vec<i64> = Vec::with_capacity(batch.len());
             for (rowid, event_id) in batch {
                 if let Ok(Some(blob)) = store.get(&event_id) {
+                    // Defense-in-depth: skip local-only events
+                    if let Some(type_code) = events::extract_event_type(&blob) {
+                        if let Some(meta) = reg.lookup(type_code) {
+                            if meta.share_scope == ShareScope::Local {
+                                sent_rowids.push(rowid);
+                                continue;
+                            }
+                        }
+                    }
+
                     let blob_len = blob.len() as u64;
                     if data_send.send(&SyncMessage::Event { blob }).await.is_ok() {
                         events_sent += 1;
@@ -573,6 +587,7 @@ where
     let mut neg = Negentropy::new(Storage::Borrowed(&neg_storage), 64 * 1024)?;
 
     let store = Store::new(&db);
+    let reg = registry();
 
     let ingest_cap = if low_mem_mode() { 1000 } else { 5000 };
     let (ingest_tx, ingest_rx) = mpsc::channel::<(EventId, Vec<u8>)>(ingest_cap);
@@ -647,6 +662,16 @@ where
             let mut sent_rowids: Vec<i64> = Vec::with_capacity(batch.len());
             for (rowid, event_id) in batch {
                 if let Ok(Some(blob)) = store.get(&event_id) {
+                    // Defense-in-depth: skip local-only events
+                    if let Some(type_code) = events::extract_event_type(&blob) {
+                        if let Some(meta) = reg.lookup(type_code) {
+                            if meta.share_scope == ShareScope::Local {
+                                sent_rowids.push(rowid);
+                                continue;
+                            }
+                        }
+                    }
+
                     let blob_len = blob.len() as u64;
                     if data_send.send(&SyncMessage::Event { blob }).await.is_ok() {
                         events_sent += 1;

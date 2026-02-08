@@ -1422,6 +1422,8 @@ mod tests {
             }
             other => panic!("expected Block for tenant_b, got {:?}", other),
         }
+    }
+
     #[test]
     fn test_unsupported_signer_type_rejects() {
         let conn = setup();
