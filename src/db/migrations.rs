@@ -259,6 +259,14 @@ static MIGRATIONS: &[Migration] = &[
             );
         ",
     },
+    Migration {
+        version: 9,
+        name: "enforce_single_network_per_peer",
+        sql: "
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_networks_single_per_peer
+                ON networks (recorded_by, network_id);
+        ",
+    },
 ];
 
 fn ensure_schema_migrations(conn: &Connection) -> SqliteResult<()> {
@@ -378,6 +386,6 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 8);
+        assert_eq!(count, 9);
     }
 }
