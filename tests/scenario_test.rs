@@ -1634,6 +1634,7 @@ async fn test_encrypted_inner_unsupported_signer_rejects_durably() {
 // =============================================================================
 
 /// Helper: create a full bootstrap chain for a peer, returning all key material and event IDs.
+#[allow(dead_code)]
 struct BootstrapChain {
     network_key: ed25519_dalek::SigningKey,
     network_eid: [u8; 32],
@@ -1961,7 +1962,7 @@ fn test_out_of_order_identity() {
 fn test_foreign_network_excluded() {
     let channel = test_channel();
     let alice = Peer::new("alice", channel);
-    let chain = bootstrap_peer(&alice);
+    let _chain = bootstrap_peer(&alice);
 
     let db = open_connection(&alice.db_path).unwrap();
 
@@ -2007,7 +2008,7 @@ fn test_removal_enforcement() {
     // Create a "Bob" user event to be removed
     // For simplicity, create a second user_boot (as if Bob joined)
     let bob_user_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
-    let bob_user_pubkey = bob_user_key.verifying_key().to_bytes();
+    let _bob_user_pubkey = bob_user_key.verifying_key().to_bytes();
     // We'll create a second UserInviteOngoing for Bob, signed by Alice's PeerShared
     let db = open_connection(&alice.db_path).unwrap();
 
@@ -2465,6 +2466,7 @@ fn test_true_out_of_order_identity_chain() {
 /// Helper: bootstrap Bob as a new user joining Alice's network.
 /// Alice creates a UserInviteOngoing for Bob, Bob accepts and builds his own chain.
 /// Returns Bob's BootstrapChain (reuses BootstrapChain struct for consistency).
+#[allow(dead_code)]
 struct JoinChain {
     invite_key: ed25519_dalek::SigningKey,
     user_invite_eid: [u8; 32],
@@ -2548,32 +2550,16 @@ async fn test_two_peer_identity_join_and_sync() {
 
     // Alice creates a UserInviteOngoing for Bob
     // Bob needs the invite to exist on Alice's side; sync will deliver it
-    let bob_join = join_network(&bob, &alice_chain, &alice);
-
-    // Before sync: Alice has her 8 identity events + Bob's invite (9 shared events)
-    // Bob has his identity chain events but some are blocked (UserBoot depends on
-    // UserInviteOngoing which exists on Alice, not Bob yet)
-    // InviteAccepted is local-only, so it won't sync.
-
-    // Count Alice's events before sync
-    let alice_before = alice.store_count();
-    let bob_before = bob.store_count();
+    let _bob_join = join_network(&bob, &alice_chain, &alice);
 
     // Sync — shared events flow between peers
     let sync = start_peers(&alice, &bob);
 
-    // Wait for convergence: both peers should have the same number of shared events.
-    // Alice's shared: Network, UserInviteBoot, UserBoot, DeviceInviteFirst,
-    //   PeerSharedFirst, AdminBoot, UserInviteOngoing = 7
-    // Bob's shared: UserBoot, DeviceInviteFirst, PeerSharedFirst = 3
-    // Total shared = 10 distinct shared events
-    // Plus each peer has local-only events (InviteAccepted) that don't sync.
-    let total_shared = 10;
-
+    // Wait for convergence on projected identity state, not raw event counts
     assert_eventually(
-        || alice.store_count() >= total_shared && bob.store_count() >= total_shared,
+        || alice.peer_shared_count() == 2 && bob.peer_shared_count() == 2,
         Duration::from_secs(15),
-        "both peers should converge on shared identity events",
+        "both peers should converge on 2 peers_shared",
     ).await;
 
     drop(sync);
@@ -2636,9 +2622,10 @@ async fn test_identity_cascade_via_sync() {
 
     // Bob creates UserBoot signed by the invite — but the invite event is on
     // Alice's side, not Bob's. So this will block on the signed_by dep.
-    let user_key = ed25519_dalek::SigningKey::generate(&mut rng);
-    let user_pubkey = user_key.verifying_key().to_bytes();
+    let _user_key = ed25519_dalek::SigningKey::generate(&mut rng);
+    let user_pubkey = _user_key.verifying_key().to_bytes();
     let user_eid = bob.create_user_boot(user_pubkey, &invite_key, &user_invite_eid);
+    let user_eid_b64 = event_id_to_base64(&user_eid);
 
     // Confirm UserBoot is blocked before sync
     assert_eq!(bob.user_count(), 0, "Bob's UserBoot should be blocked (missing signer dep)");
@@ -2647,18 +2634,27 @@ async fn test_identity_cascade_via_sync() {
     // Sync — Alice's events flow to Bob, unblocking the cascade
     let sync = start_peers(&alice, &bob);
 
+    // Wait for Bob's specific UserBoot event to become valid, not just any user
     assert_eventually(
-        || bob.user_count() >= 1,
+        || {
+            let db = open_connection(&bob.db_path).unwrap();
+            let valid: bool = db.query_row(
+                "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![&bob.identity, &user_eid_b64],
+                |row| row.get(0),
+            ).unwrap_or(false);
+            valid
+        },
         Duration::from_secs(15),
-        "Bob's UserBoot should cascade to valid after sync",
+        "Bob's specific UserBoot should cascade to valid after sync",
     ).await;
 
     drop(sync);
 
-    // Bob should now have Alice's full identity chain projected
+    // Bob should now have Alice's full identity chain projected plus his own user
     assert_eq!(bob.network_count(), 1, "Bob should have Alice's network");
     assert_eq!(bob.user_invite_count(), 2, "Bob should have both invites");
-    assert!(bob.user_count() >= 1, "Bob's user should be valid");
+    assert_eq!(bob.user_count(), 2, "Both Alice's and Bob's users should be valid");
 
     verify_projection_invariants(&bob);
 }
@@ -2804,11 +2800,12 @@ async fn test_foreign_network_rejected_via_sync() {
     // Sync — shared events flow between peers
     let sync = start_peers(&alice, &bob);
 
-    // Wait for events to transfer
+    // Wait for events to transfer — gate on rejected events appearing
+    // (foreign network events get rejected by the trust anchor guard)
     assert_eventually(
-        || alice.store_count() > 8 && bob.store_count() > 8,
+        || alice.rejected_event_count() > 0 && bob.rejected_event_count() > 0,
         Duration::from_secs(15),
-        "events should transfer between peers",
+        "both peers should have rejected foreign network events",
     ).await;
 
     drop(sync);
