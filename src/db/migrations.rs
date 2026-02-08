@@ -260,14 +260,14 @@ static MIGRATIONS: &[Migration] = &[
         ",
     },
     Migration {
-        version: 9,
+        version: 12,
         name: "retire_invite_network_bindings",
         sql: "
             -- invite_network_bindings is no longer used by runtime logic.
             -- Trust anchor binding now derives directly from invite_accepted event fields.
-            -- Table is retained for backward compatibility with older databases.
-            -- Mark as deprecated: no runtime code reads or writes this table.
-            DELETE FROM invite_network_bindings;
+            -- Table is retained for backward compatibility; no runtime code reads or writes it.
+            -- No destructive cleanup: existing rows are harmless and preserved for forensics.
+            SELECT 1;
         ",
     },
 ];

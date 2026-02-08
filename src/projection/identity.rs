@@ -90,33 +90,36 @@ fn project_invite_accepted(
     let invite_eid_b64 = event_id_to_base64(&ia.invite_event_id);
     let network_id_b64 = event_id_to_base64(&ia.network_id);
 
-    // Write invite_accepted projection table
+    // Check existing trust anchor BEFORE any writes — reject on mismatch
+    let existing_anchor: Option<String> = conn.query_row(
+        "SELECT network_id FROM trust_anchors WHERE peer_id = ?1",
+        rusqlite::params![recorded_by],
+        |row| row.get(0),
+    ).ok();
+
+    if let Some(ref stored) = existing_anchor {
+        if stored != &network_id_b64 {
+            return Ok(ProjectionDecision::Reject {
+                reason: format!(
+                    "invite_accepted network_id {} conflicts with existing trust anchor {}",
+                    network_id_b64, stored
+                ),
+            });
+        }
+    }
+
+    // Mismatch check passed — write projection table
     conn.execute(
         "INSERT OR IGNORE INTO invite_accepted (recorded_by, event_id, invite_event_id, network_id)
          VALUES (?1, ?2, ?3, ?4)",
         rusqlite::params![recorded_by, event_id_b64, &invite_eid_b64, &network_id_b64],
     )?;
 
-    // Write trust_anchors — first-write-wins (INSERT OR IGNORE) + mismatch check
+    // Write trust anchor (first-write-wins)
     conn.execute(
         "INSERT OR IGNORE INTO trust_anchors (peer_id, network_id) VALUES (?1, ?2)",
         rusqlite::params![recorded_by, &network_id_b64],
     )?;
-
-    // Verify the stored anchor matches (detect conflicting invite_accepted events)
-    let stored_anchor: String = conn.query_row(
-        "SELECT network_id FROM trust_anchors WHERE peer_id = ?1",
-        rusqlite::params![recorded_by],
-        |row| row.get(0),
-    )?;
-    if stored_anchor != network_id_b64 {
-        return Ok(ProjectionDecision::Reject {
-            reason: format!(
-                "invite_accepted network_id {} conflicts with existing trust anchor {}",
-                network_id_b64, stored_anchor
-            ),
-        });
-    }
 
     Ok(ProjectionDecision::Valid)
 }

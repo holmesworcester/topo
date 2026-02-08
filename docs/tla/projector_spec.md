@@ -10,7 +10,7 @@ Changes to this document require TLA+ model re-verification.
 | 2 | Reaction | MessageReaction | variable | Shared | No | 0 | — |
 | 3 | PeerKey | Peer | 41B | Shared | No | 0 | — |
 | 4 | SignedMemo | — | variable | Shared | Yes | 64 | 0 (peer) |
-| 5 | Encrypted | Encrypted | variable | Local | No | 0 | — |
+| 5 | Encrypted | Encrypted | variable | Shared | No | 0 | — |
 | 6 | SecretKey | SecretKey | 41B | Local | No | 0 | — |
 | 7 | MessageDeletion | MessageDeletion | 73B | Shared | No | 0 | — |
 | 8 | Network | Network | 73B | Shared | No | 0 | — |

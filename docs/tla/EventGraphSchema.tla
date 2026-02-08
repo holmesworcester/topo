@@ -38,7 +38,7 @@ EXTENDS Naturals, FiniteSets
 
 CONSTANTS ActiveEvents, Peers, Networks
 
-VARIABLES recorded, valid, trustAnchor, removed
+VARIABLES recorded, valid, trustAnchor, removed, inviteCarriedNet
 
 \* ---- Event type constants ----
 
@@ -268,18 +268,25 @@ Init ==
     /\ valid = [p \in Peers |-> {}]
     /\ trustAnchor = [p \in Peers |-> "none"]
     /\ removed = [p \in Peers |-> {}]
+    /\ inviteCarriedNet = [p \in Peers |-> "none"]
 
+\* Record captures the event-carried network_id at ingress time.
+\* For invite_accepted, the event carries a specific network_id chosen
+\* nondeterministically here (models the fact that any network could be
+\* referenced). The choice is fixed at record time, not projection time.
 Record(p, e) ==
     /\ p \in Peers
     /\ e \in EVENTS
     /\ e \notin recorded[p]
     /\ recorded' = [recorded EXCEPT ![p] = @ \cup {e}]
+    /\ IF e = InviteAccepted /\ inviteCarriedNet[p] = "none"
+       THEN \E n \in Networks: inviteCarriedNet' = [inviteCarriedNet EXCEPT ![p] = n]
+       ELSE UNCHANGED inviteCarriedNet
     /\ UNCHANGED <<valid, trustAnchor, removed>>
 
-\* invite_accepted binds the trust anchor directly from its own network_id field.
-\* Nondeterministically choose which network the invite references (models
-\* the fact that the event carries its own network_id). First-write-wins:
-\* if trust anchor is already set, a conflicting invite_accepted is rejected.
+\* invite_accepted binds the trust anchor from its event-carried network_id.
+\* First-write-wins: if trust anchor is already set to a different network,
+\* invite_accepted is rejected (cannot project).
 Project(p, e) ==
     /\ p \in Peers
     /\ e \in EVENTS
@@ -287,13 +294,15 @@ Project(p, e) ==
     /\ e \notin valid[p]
     /\ PeerDeps(p, e) \subseteq valid[p]
     /\ Guard(p, e)
+    \* Mismatch rejection: invite_accepted blocked if anchor already set differently
+    /\ IF e = InviteAccepted /\ trustAnchor[p] /= "none"
+       THEN trustAnchor[p] = inviteCarriedNet[p]
+       ELSE TRUE
     /\ valid' = [valid EXCEPT ![p] = @ \cup {e}]
-    \* Trust anchor binding: invite_accepted sets it directly.
-    \* First-write-wins: subsequent invite_accepted with mismatching
-    \* network_id would be rejected (modeled here by choosing any network).
+    \* Trust anchor binding: deterministic from event-carried network_id.
     /\ trustAnchor' =
         IF e = InviteAccepted /\ trustAnchor[p] = "none"
-        THEN \E n \in Networks: [trustAnchor EXCEPT ![p] = n]
+        THEN [trustAnchor EXCEPT ![p] = inviteCarriedNet[p]]
         ELSE trustAnchor
     /\ removed' =
         IF e = UserRemoved
@@ -301,10 +310,10 @@ Project(p, e) ==
         ELSE IF e = PeerRemoved
         THEN [removed EXCEPT ![p] = @ \cup {"peer_target"}]
         ELSE removed
-    /\ UNCHANGED <<recorded>>
+    /\ UNCHANGED <<recorded, inviteCarriedNet>>
 
 Stutter ==
-    UNCHANGED <<recorded, valid, trustAnchor, removed>>
+    UNCHANGED <<recorded, valid, trustAnchor, removed, inviteCarriedNet>>
 
 Next ==
     \/ \E p \in Peers, e \in EVENTS: Record(p, e)
@@ -312,7 +321,7 @@ Next ==
     \/ Stutter
 
 Spec ==
-    Init /\ [][Next]_<<recorded, valid, trustAnchor, removed>>
+    Init /\ [][Next]_<<recorded, valid, trustAnchor, removed, inviteCarriedNet>>
 
 \* ---- Invariants ----
 
@@ -322,6 +331,7 @@ TypeOK ==
     /\ \A p \in Peers: valid[p] \subseteq recorded[p]
     /\ trustAnchor \in [Peers -> Networks \cup {"none"}]
     /\ removed \in [Peers -> SUBSET {"user_target", "peer_target"}]
+    /\ inviteCarriedNet \in [Peers -> Networks \cup {"none"}]
 
 \* Every valid event has all its peer-resolved dependencies valid.
 InvDeps ==
@@ -350,6 +360,11 @@ InvTrustAnchorSource ==
     IF InviteAccepted \in EVENTS
     THEN \A p \in Peers: (trustAnchor[p] /= "none") => (InviteAccepted \in valid[p])
     ELSE TRUE
+
+\* Trust anchor always matches the event-carried network_id.
+InvTrustAnchorMatchesCarried ==
+    \A p \in Peers:
+        (trustAnchor[p] /= "none") => (trustAnchor[p] = inviteCarriedNet[p])
 
 \* All non-local singleton events that are valid require some network to be valid.
 InvAllValidRequireNetwork ==
