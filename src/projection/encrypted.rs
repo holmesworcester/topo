@@ -184,7 +184,7 @@ pub fn project_encrypted(
             unreachable!();
         }
         // Identity events cannot appear inside encrypted wrappers
-        ParsedEvent::Network(_)
+        ParsedEvent::Workspace(_)
         | ParsedEvent::InviteAccepted(_)
         | ParsedEvent::UserInviteBoot(_)
         | ParsedEvent::UserInviteOngoing(_)

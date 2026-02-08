@@ -182,18 +182,18 @@ static MIGRATIONS: &[Migration] = &[
         sql: "
             CREATE TABLE IF NOT EXISTS trust_anchors (
                 peer_id TEXT NOT NULL PRIMARY KEY,
-                network_id TEXT NOT NULL
+                workspace_id TEXT NOT NULL
             );
 
-            CREATE TABLE IF NOT EXISTS invite_network_bindings (
+            CREATE TABLE IF NOT EXISTS invite_workspace_bindings (
                 peer_id TEXT NOT NULL PRIMARY KEY,
-                network_id TEXT NOT NULL
+                workspace_id TEXT NOT NULL
             );
 
-            CREATE TABLE IF NOT EXISTS networks (
+            CREATE TABLE IF NOT EXISTS workspaces (
                 recorded_by TEXT NOT NULL,
                 event_id TEXT NOT NULL,
-                network_id TEXT NOT NULL,
+                workspace_id TEXT NOT NULL,
                 public_key BLOB NOT NULL,
                 PRIMARY KEY (recorded_by, event_id)
             );
@@ -202,7 +202,7 @@ static MIGRATIONS: &[Migration] = &[
                 recorded_by TEXT NOT NULL,
                 event_id TEXT NOT NULL,
                 invite_event_id TEXT NOT NULL,
-                network_id TEXT NOT NULL,
+                workspace_id TEXT NOT NULL,
                 PRIMARY KEY (recorded_by, event_id)
             );
 
@@ -290,23 +290,23 @@ static MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 11,
-        name: "enforce_single_network_per_peer",
+        name: "enforce_single_workspace_per_peer",
         sql: "
-            DELETE FROM networks
+            DELETE FROM workspaces
              WHERE rowid NOT IN (
                  SELECT MIN(rowid)
-                 FROM networks
-                 GROUP BY recorded_by, network_id
+                 FROM workspaces
+                 GROUP BY recorded_by, workspace_id
              );
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_networks_single_per_peer
-                ON networks (recorded_by, network_id);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_workspaces_single_per_peer
+                ON workspaces (recorded_by, workspace_id);
         ",
     },
     Migration {
         version: 12,
-        name: "retire_invite_network_bindings",
+        name: "retire_invite_workspace_bindings",
         sql: "
-            -- invite_network_bindings is no longer used by runtime logic.
+            -- invite_workspace_bindings is no longer used by runtime logic.
             -- Trust anchor binding now derives directly from invite_accepted event fields.
             -- Table is retained for backward compatibility; no runtime code reads or writes it.
             -- No destructive cleanup: existing rows are harmless and preserved for forensics.

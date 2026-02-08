@@ -5,7 +5,7 @@ pub mod file_slice;
 pub mod invite_accepted;
 pub mod message;
 pub mod message_deletion;
-pub mod network;
+pub mod workspace;
 pub mod peer_key;
 pub mod peer_removed;
 pub mod peer_shared;
@@ -30,7 +30,7 @@ pub use invite_accepted::InviteAcceptedEvent;
 pub use message::MessageEvent;
 pub use message_attachment::MessageAttachmentEvent;
 pub use message_deletion::MessageDeletionEvent;
-pub use network::NetworkEvent;
+pub use workspace::WorkspaceEvent;
 pub use peer_key::PeerKeyEvent;
 pub use peer_removed::PeerRemovedEvent;
 pub use peer_shared::{PeerSharedFirstEvent, PeerSharedOngoingEvent};
@@ -51,7 +51,7 @@ pub const EVENT_TYPE_SIGNED_MEMO: u8 = 4;
 pub const EVENT_TYPE_ENCRYPTED: u8 = 5;
 pub const EVENT_TYPE_SECRET_KEY: u8 = 6;
 pub const EVENT_TYPE_MESSAGE_DELETION: u8 = 7;
-pub const EVENT_TYPE_NETWORK: u8 = 8;
+pub const EVENT_TYPE_WORKSPACE: u8 = 8;
 pub const EVENT_TYPE_INVITE_ACCEPTED: u8 = 9;
 pub const EVENT_TYPE_USER_INVITE_BOOT: u8 = 10;
 pub const EVENT_TYPE_USER_INVITE_ONGOING: u8 = 11;
@@ -82,7 +82,7 @@ pub enum ParsedEvent {
     Encrypted(EncryptedEvent),
     SecretKey(SecretKeyEvent),
     MessageDeletion(MessageDeletionEvent),
-    Network(NetworkEvent),
+    Workspace(WorkspaceEvent),
     InviteAccepted(InviteAcceptedEvent),
     UserInviteBoot(UserInviteBootEvent),
     UserInviteOngoing(UserInviteOngoingEvent),
@@ -112,7 +112,7 @@ impl ParsedEvent {
             ParsedEvent::Encrypted(e) => e.created_at_ms,
             ParsedEvent::SecretKey(s) => s.created_at_ms,
             ParsedEvent::MessageDeletion(d) => d.created_at_ms,
-            ParsedEvent::Network(n) => n.created_at_ms,
+            ParsedEvent::Workspace(w) => w.created_at_ms,
             ParsedEvent::InviteAccepted(a) => a.created_at_ms,
             ParsedEvent::UserInviteBoot(u) => u.created_at_ms,
             ParsedEvent::UserInviteOngoing(u) => u.created_at_ms,
@@ -144,9 +144,9 @@ impl ParsedEvent {
             ParsedEvent::Encrypted(e) => vec![("key_event_id", e.key_event_id)],
             ParsedEvent::SecretKey(_) => vec![],
             ParsedEvent::MessageDeletion(d) => vec![("target_event_id", d.target_event_id)],
-            ParsedEvent::Network(_) => vec![],
+            ParsedEvent::Workspace(_) => vec![],
             ParsedEvent::InviteAccepted(_) => vec![],
-            // UserInviteBoot: signed_by is a dep (network_id is reference, not dep)
+            // UserInviteBoot: signed_by is a dep (workspace_id is reference, not dep)
             ParsedEvent::UserInviteBoot(u) => vec![("signed_by", u.signed_by)],
             ParsedEvent::UserInviteOngoing(u) => vec![
                 ("admin_event_id", u.admin_event_id),
@@ -197,7 +197,7 @@ impl ParsedEvent {
             ParsedEvent::Encrypted(_) => EVENT_TYPE_ENCRYPTED,
             ParsedEvent::SecretKey(_) => EVENT_TYPE_SECRET_KEY,
             ParsedEvent::MessageDeletion(_) => EVENT_TYPE_MESSAGE_DELETION,
-            ParsedEvent::Network(_) => EVENT_TYPE_NETWORK,
+            ParsedEvent::Workspace(_) => EVENT_TYPE_WORKSPACE,
             ParsedEvent::InviteAccepted(_) => EVENT_TYPE_INVITE_ACCEPTED,
             ParsedEvent::UserInviteBoot(_) => EVENT_TYPE_USER_INVITE_BOOT,
             ParsedEvent::UserInviteOngoing(_) => EVENT_TYPE_USER_INVITE_ONGOING,
@@ -244,7 +244,7 @@ impl ParsedEvent {
             | ParsedEvent::Encrypted(_)
             | ParsedEvent::SecretKey(_)
             | ParsedEvent::MessageDeletion(_)
-            | ParsedEvent::Network(_)
+            | ParsedEvent::Workspace(_)
             | ParsedEvent::InviteAccepted(_)
             | ParsedEvent::MessageAttachment(_) => None,
         }
@@ -306,7 +306,7 @@ pub fn registry() -> &'static EventRegistry {
             &encrypted::ENCRYPTED_META,
             &secret_key::SECRET_KEY_META,
             &message_deletion::MESSAGE_DELETION_META,
-            &network::NETWORK_META,
+            &workspace::WORKSPACE_META,
             &invite_accepted::INVITE_ACCEPTED_META,
             &user_invite::USER_INVITE_BOOT_META,
             &user_invite::USER_INVITE_ONGOING_META,
@@ -426,13 +426,13 @@ mod tests {
     }
 
     #[test]
-    fn test_network_roundtrip() {
-        let net = NetworkEvent {
+    fn test_workspace_roundtrip() {
+        let ws = WorkspaceEvent {
             created_at_ms: 4444444444444,
             public_key: [10u8; 32],
-            network_id: [11u8; 32],
+            workspace_id: [11u8; 32],
         };
-        let event = ParsedEvent::Network(net);
+        let event = ParsedEvent::Workspace(ws);
         let blob = encode_event(&event).unwrap();
         assert_eq!(blob.len(), 73);
         let parsed = parse_event(&blob).unwrap();
@@ -444,7 +444,7 @@ mod tests {
         let ia = InviteAcceptedEvent {
             created_at_ms: 5555555555555,
             invite_event_id: [12u8; 32],
-            network_id: [13u8; 32],
+            workspace_id: [13u8; 32],
         };
         let event = ParsedEvent::InviteAccepted(ia);
         let blob = encode_event(&event).unwrap();
@@ -458,7 +458,7 @@ mod tests {
         let e = UserInviteBootEvent {
             created_at_ms: 100,
             public_key: [14u8; 32],
-            network_id: [15u8; 32],
+            workspace_id: [15u8; 32],
             signed_by: [16u8; 32],
             signer_type: 1,
             signature: [17u8; 64],
@@ -709,9 +709,9 @@ mod tests {
         assert_eq!(del_meta.projection_table, "deleted_messages");
 
         // Identity types
-        let net_meta = reg.lookup(EVENT_TYPE_NETWORK).unwrap();
-        assert_eq!(net_meta.type_name, "network");
-        assert!(!net_meta.signer_required);
+        let ws_meta = reg.lookup(EVENT_TYPE_WORKSPACE).unwrap();
+        assert_eq!(ws_meta.type_name, "workspace");
+        assert!(!ws_meta.signer_required);
 
         let ia_meta = reg.lookup(EVENT_TYPE_INVITE_ACCEPTED).unwrap();
         assert_eq!(ia_meta.share_scope, ShareScope::Local);
@@ -855,17 +855,17 @@ mod tests {
         });
         assert!(pk.signer_fields().is_none());
 
-        let net = ParsedEvent::Network(NetworkEvent {
+        let ws = ParsedEvent::Workspace(WorkspaceEvent {
             created_at_ms: 100,
             public_key: [0u8; 32],
-            network_id: [0u8; 32],
+            workspace_id: [0u8; 32],
         });
-        assert!(net.signer_fields().is_none());
+        assert!(ws.signer_fields().is_none());
 
         let ia = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
             created_at_ms: 100,
             invite_event_id: [0u8; 32],
-            network_id: [0u8; 32],
+            workspace_id: [0u8; 32],
         });
         assert!(ia.signer_fields().is_none());
     }
@@ -934,13 +934,13 @@ mod tests {
         .unwrap();
         assert_eq!(extract_event_type(&memo_blob), Some(EVENT_TYPE_SIGNED_MEMO));
 
-        let net_blob = encode_event(&ParsedEvent::Network(NetworkEvent {
+        let ws_blob = encode_event(&ParsedEvent::Workspace(WorkspaceEvent {
             created_at_ms: 0,
             public_key: [0u8; 32],
-            network_id: [0u8; 32],
+            workspace_id: [0u8; 32],
         }))
         .unwrap();
-        assert_eq!(extract_event_type(&net_blob), Some(EVENT_TYPE_NETWORK));
+        assert_eq!(extract_event_type(&ws_blob), Some(EVENT_TYPE_WORKSPACE));
     }
 
     #[test]
