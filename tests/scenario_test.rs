@@ -6,7 +6,7 @@ use poc_7::transport::{
     AllowedPeers, create_client_endpoint, create_server_endpoint,
     extract_spki_fingerprint, load_or_generate_cert, peer_identity_from_connection,
 };
-use poc_7::identity::cert_paths_from_db;
+use poc_7::transport_identity::transport_cert_paths_from_db;
 use poc_7::db::open_connection;
 
 fn test_channel() -> [u8; 32] {
@@ -478,9 +478,9 @@ async fn test_peer_identity_extraction_live_handshake() {
     let alice = Peer::new("alice", channel);
     let bob = Peer::new("bob", channel);
 
-    let (cert_path_a, key_path_a) = cert_paths_from_db(&alice.db_path);
+    let (cert_path_a, key_path_a) = transport_cert_paths_from_db(&alice.db_path);
     let (cert_a, key_a) = load_or_generate_cert(&cert_path_a, &key_path_a).unwrap();
-    let (cert_path_b, key_path_b) = cert_paths_from_db(&bob.db_path);
+    let (cert_path_b, key_path_b) = transport_cert_paths_from_db(&bob.db_path);
     let (cert_b, key_b) = load_or_generate_cert(&cert_path_b, &key_path_b).unwrap();
 
     let fp_a = extract_spki_fingerprint(cert_a.as_ref()).unwrap();
@@ -2080,6 +2080,114 @@ fn test_identity_replay_invariants() {
 
     // Also create some content
     alice.create_message("hello after bootstrap");
+
+    // Verify replay invariants (forward, double, reverse)
+    verify_projection_invariants(&alice);
+}
+
+#[test]
+fn test_transport_key_projects_and_populates_binding() {
+    let channel = test_channel();
+    let alice = Peer::new("alice", channel);
+    let chain = bootstrap_peer(&alice);
+
+    // Create a TransportKey event signed by PeerShared
+    let spki_fp: [u8; 32] = [0xAB; 32];
+    let _tk_eid = alice.create_transport_key(
+        spki_fp,
+        &chain.peer_shared_key,
+        &chain.peer_shared_eid,
+    );
+
+    let db = open_connection(&alice.db_path).unwrap();
+
+    // Verify transport_keys projection table populated
+    let tk_count: i64 = db.query_row(
+        "SELECT COUNT(*) FROM transport_keys WHERE recorded_by = ?1",
+        rusqlite::params![&alice.identity],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(tk_count, 1, "transport_keys should have 1 entry");
+
+    // Verify SPKI fingerprint matches
+    let stored_spki: Vec<u8> = db.query_row(
+        "SELECT spki_fingerprint FROM transport_keys WHERE recorded_by = ?1",
+        rusqlite::params![&alice.identity],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(stored_spki, spki_fp.to_vec());
+
+    // Verify peer_transport_bindings was auto-populated
+    let binding_count: i64 = db.query_row(
+        "SELECT COUNT(*) FROM peer_transport_bindings WHERE recorded_by = ?1",
+        rusqlite::params![&alice.identity],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(binding_count, 1, "peer_transport_bindings should have 1 entry");
+
+    // Verify allowed_peers_from_db includes the SPKI from transport_keys
+    let allowed = poc_7::db::transport_trust::allowed_peers_from_db(&db, &alice.identity).unwrap();
+    assert!(allowed.contains(&spki_fp), "allowed_peers should include transport key SPKI");
+}
+
+#[test]
+fn test_transport_key_invalid_sig_rejected() {
+    use ed25519_dalek::SigningKey;
+
+    let channel = test_channel();
+    let alice = Peer::new("alice", channel);
+    let chain = bootstrap_peer(&alice);
+
+    // Create a TransportKey with wrong signing key (not the peer_shared key)
+    let wrong_key = SigningKey::generate(&mut rand::thread_rng());
+    let spki_fp: [u8; 32] = [0xCD; 32];
+
+    // This should fail because the wrong key doesn't match peer_shared's public key
+    let result = std::panic::catch_unwind(|| {
+        alice.create_transport_key(
+            spki_fp,
+            &wrong_key,
+            &chain.peer_shared_eid,
+        );
+    });
+
+    // create_signed_event_sync verifies the signature during projection,
+    // so it should either panic or the event should be rejected
+    if result.is_ok() {
+        // If it didn't panic, check that the event was rejected
+        let db = open_connection(&alice.db_path).unwrap();
+        let tk_count: i64 = db.query_row(
+            "SELECT COUNT(*) FROM transport_keys WHERE recorded_by = ?1",
+            rusqlite::params![&alice.identity],
+            |row| row.get(0),
+        ).unwrap();
+        let rejected_count: i64 = db.query_row(
+            "SELECT COUNT(*) FROM rejected_events WHERE peer_id = ?1",
+            rusqlite::params![&alice.identity],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(tk_count, 0, "invalid-sig transport key should not project");
+        assert!(rejected_count > 0, "invalid-sig transport key should be rejected");
+    }
+    // If it panicked, that's also acceptable — signature verification failed
+}
+
+#[test]
+fn test_transport_key_replay_invariants() {
+    let channel = test_channel();
+    let alice = Peer::new("alice", channel);
+    let chain = bootstrap_peer(&alice);
+
+    // Create a TransportKey event
+    let spki_fp: [u8; 32] = [0xEF; 32];
+    alice.create_transport_key(
+        spki_fp,
+        &chain.peer_shared_key,
+        &chain.peer_shared_eid,
+    );
+
+    // Also create some content
+    alice.create_message("after transport key");
 
     // Verify replay invariants (forward, double, reverse)
     verify_projection_invariants(&alice);

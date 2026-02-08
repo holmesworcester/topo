@@ -30,6 +30,7 @@ pub fn apply_identity_projection(
         ParsedEvent::UserRemoved(r) => project_user_removed(conn, recorded_by, event_id_b64, &r.target_event_id),
         ParsedEvent::PeerRemoved(r) => project_peer_removed(conn, recorded_by, event_id_b64, &r.target_event_id),
         ParsedEvent::SecretShared(s) => project_secret_shared(conn, recorded_by, event_id_b64, s),
+        ParsedEvent::TransportKey(t) => project_transport_key(conn, recorded_by, event_id_b64, t),
         _ => Ok(ProjectionDecision::Reject {
             reason: "not an identity event".to_string(),
         }),
@@ -92,34 +93,41 @@ fn project_invite_accepted(
     let invite_eid_b64 = event_id_to_base64(&ia.invite_event_id);
     let network_id_b64 = event_id_to_base64(&ia.network_id);
 
+    // Verify the stored anchor first so rejected events do not materialize.
+    let anchor: Option<String> = match conn.query_row(
+        "SELECT network_id FROM trust_anchors WHERE peer_id = ?1",
+        rusqlite::params![recorded_by],
+        |row| row.get::<_, String>(0),
+    ) {
+        Ok(v) => Some(v),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(e) => return Err(e.into()),
+    };
+
+    match anchor {
+        Some(stored_anchor) if stored_anchor != network_id_b64 => {
+            return Ok(ProjectionDecision::Reject {
+                reason: format!(
+                    "trust anchor mismatch: stored={}, event={}",
+                    stored_anchor, network_id_b64
+                ),
+            });
+        }
+        Some(_) => {}
+        None => {
+            conn.execute(
+                "INSERT OR IGNORE INTO trust_anchors (peer_id, network_id) VALUES (?1, ?2)",
+                rusqlite::params![recorded_by, &network_id_b64],
+            )?;
+        }
+    }
+
     // Write invite_accepted projection table
     conn.execute(
         "INSERT OR IGNORE INTO invite_accepted (recorded_by, event_id, invite_event_id, network_id)
          VALUES (?1, ?2, ?3, ?4)",
         rusqlite::params![recorded_by, event_id_b64, &invite_eid_b64, &network_id_b64],
     )?;
-
-    // Write trust_anchors — immutable, first-write-wins.
-    // INSERT OR IGNORE: if anchor already exists, check for mismatch and reject.
-    conn.execute(
-        "INSERT OR IGNORE INTO trust_anchors (peer_id, network_id) VALUES (?1, ?2)",
-        rusqlite::params![recorded_by, &network_id_b64],
-    )?;
-
-    // Verify the stored anchor matches (reject on mismatch)
-    let stored_anchor: String = conn.query_row(
-        "SELECT network_id FROM trust_anchors WHERE peer_id = ?1",
-        rusqlite::params![recorded_by],
-        |row| row.get(0),
-    )?;
-    if stored_anchor != network_id_b64 {
-        return Ok(ProjectionDecision::Reject {
-            reason: format!(
-                "trust anchor mismatch: stored={}, event={}",
-                stored_anchor, network_id_b64
-            ),
-        });
-    }
 
     Ok(ProjectionDecision::Valid)
 }
@@ -257,6 +265,27 @@ fn project_secret_shared(
     Ok(ProjectionDecision::Valid)
 }
 
+/// Project TransportKey: insert into transport_keys and auto-populate peer_transport_bindings.
+fn project_transport_key(
+    conn: &Connection,
+    recorded_by: &str,
+    event_id_b64: &str,
+    tk: &crate::events::TransportKeyEvent,
+) -> Result<ProjectionDecision, Box<dyn std::error::Error>> {
+    // Insert into transport_keys projection table
+    conn.execute(
+        "INSERT OR IGNORE INTO transport_keys (recorded_by, event_id, spki_fingerprint)
+         VALUES (?1, ?2, ?3)",
+        rusqlite::params![recorded_by, event_id_b64, tk.spki_fingerprint.as_slice()],
+    )?;
+
+    // Auto-populate peer_transport_bindings from the event's SPKI fingerprint.
+    // The peer_id is the hex-encoded SPKI fingerprint.
+    let peer_id = hex::encode(tk.spki_fingerprint);
+    crate::db::transport_trust::record_transport_binding(conn, recorded_by, &peer_id, &tk.spki_fingerprint)?;
+
+    Ok(ProjectionDecision::Valid)
+}
 /// After guard state changes (e.g., trust anchor set by invite_accepted),
 /// find events that are recorded but stuck in guard-blocked limbo
 /// (not valid, not rejected, not in blocked_event_deps) and re-project them.

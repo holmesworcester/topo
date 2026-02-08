@@ -13,6 +13,7 @@ pub mod registry;
 pub mod secret_key;
 pub mod secret_shared;
 pub mod signed_memo;
+pub mod transport_key;
 pub mod user;
 pub mod user_invite;
 pub mod user_removed;
@@ -36,6 +37,7 @@ pub use secret_shared::SecretSharedEvent;
 pub use signed_memo::SignedMemoEvent;
 pub use user::{UserBootEvent, UserOngoingEvent};
 pub use user_invite::{UserInviteBootEvent, UserInviteOngoingEvent};
+pub use transport_key::TransportKeyEvent;
 pub use user_removed::UserRemovedEvent;
 
 pub const EVENT_TYPE_MESSAGE: u8 = 1;
@@ -60,6 +62,7 @@ pub const EVENT_TYPE_ADMIN_ONGOING: u8 = 19;
 pub const EVENT_TYPE_USER_REMOVED: u8 = 20;
 pub const EVENT_TYPE_PEER_REMOVED: u8 = 21;
 pub const EVENT_TYPE_SECRET_SHARED: u8 = 22;
+pub const EVENT_TYPE_TRANSPORT_KEY: u8 = 23;
 
 /// Max event blob size: 1 MiB
 pub const EVENT_MAX_BLOB_BYTES: usize = 1024 * 1024;
@@ -88,6 +91,7 @@ pub enum ParsedEvent {
     UserRemoved(UserRemovedEvent),
     PeerRemoved(PeerRemovedEvent),
     SecretShared(SecretSharedEvent),
+    TransportKey(TransportKeyEvent),
 }
 
 impl ParsedEvent {
@@ -115,6 +119,7 @@ impl ParsedEvent {
             ParsedEvent::UserRemoved(r) => r.created_at_ms,
             ParsedEvent::PeerRemoved(r) => r.created_at_ms,
             ParsedEvent::SecretShared(s) => s.created_at_ms,
+            ParsedEvent::TransportKey(t) => t.created_at_ms,
         }
     }
 
@@ -164,6 +169,7 @@ impl ParsedEvent {
                 ("recipient_event_id", s.recipient_event_id),
                 ("signed_by", s.signed_by),
             ],
+            ParsedEvent::TransportKey(t) => vec![("signed_by", t.signed_by)],
         }
     }
 
@@ -191,6 +197,7 @@ impl ParsedEvent {
             ParsedEvent::UserRemoved(_) => EVENT_TYPE_USER_REMOVED,
             ParsedEvent::PeerRemoved(_) => EVENT_TYPE_PEER_REMOVED,
             ParsedEvent::SecretShared(_) => EVENT_TYPE_SECRET_SHARED,
+            ParsedEvent::TransportKey(_) => EVENT_TYPE_TRANSPORT_KEY,
         }
     }
 
@@ -212,6 +219,7 @@ impl ParsedEvent {
             ParsedEvent::UserRemoved(r) => Some((r.signed_by, r.signer_type)),
             ParsedEvent::PeerRemoved(r) => Some((r.signed_by, r.signer_type)),
             ParsedEvent::SecretShared(s) => Some((s.signed_by, s.signer_type)),
+            ParsedEvent::TransportKey(t) => Some((t.signed_by, t.signer_type)),
             ParsedEvent::Message(_)
             | ParsedEvent::Reaction(_)
             | ParsedEvent::PeerKey(_)
@@ -292,6 +300,7 @@ pub fn registry() -> &'static EventRegistry {
             &user_removed::USER_REMOVED_META,
             &peer_removed::PEER_REMOVED_META,
             &secret_shared::SECRET_SHARED_META,
+            &transport_key::TRANSPORT_KEY_META,
         ])
     })
 }
@@ -631,6 +640,22 @@ mod tests {
         let event = ParsedEvent::SecretShared(e);
         let blob = encode_event(&event).unwrap();
         assert_eq!(blob.len(), 202);
+        let parsed = parse_event(&blob).unwrap();
+        assert_eq!(parsed, event);
+    }
+
+    #[test]
+    fn test_transport_key_roundtrip() {
+        let e = TransportKeyEvent {
+            created_at_ms: 1400,
+            spki_fingerprint: [59u8; 32],
+            signed_by: [60u8; 32],
+            signer_type: 5,
+            signature: [61u8; 64],
+        };
+        let event = ParsedEvent::TransportKey(e);
+        let blob = encode_event(&event).unwrap();
+        assert_eq!(blob.len(), 138);
         let parsed = parse_event(&blob).unwrap();
         assert_eq!(parsed, event);
     }
