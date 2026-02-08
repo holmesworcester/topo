@@ -72,7 +72,6 @@ Changes to this document require TLA+ model re-verification.
 | Guard | TLA+ Definition | Rust Check | Applies To |
 |-------|----------------|------------|------------|
 | TrustAnchorMatch | trustAnchor[p] = NetId(e) | trust_anchors.network_id = event.network_id; Block if no anchor | type 8 (Network) |
-| HasRecordedInvite | ∃ ie ∈ {10,11,12,13}: ie ∈ recorded[p] | recorded_events has invite type for peer; Block if none | type 9 (InviteAccepted) |
 
 ## Projection Tables
 
@@ -86,8 +85,8 @@ Changes to this document require TLA+ model re-verification.
 | 6 | project_secret_key | secret_keys | — |
 | 7 | project_message_deletion | deleted_messages | author auth + cascade |
 | 8 | project_network | networks | TrustAnchorMatch guard |
-| 9 | project_invite_accepted | invite_accepted | HasRecordedInvite guard; writes trust_anchors |
-| 10 | project_user_invite | user_invites | captures invite_network_bindings |
+| 9 | project_invite_accepted | invite_accepted | writes trust_anchors (first-write-wins) |
+| 10 | project_user_invite | user_invites | — |
 | 11 | project_user_invite | user_invites | — |
 | 12 | project_device_invite | device_invites | — |
 | 13 | project_device_invite | device_invites | — |
@@ -120,7 +119,7 @@ type_code(1) | created_at_ms(8) | public_key_or_target(32) | signed_by(32) | sig
 ```
 type_code(1) | created_at_ms(8) | public_key(32) | extra_dep_id(32) | signed_by(32) | signer_type(1) | signature(64)  = 170B
 ```
-- Type 10: extra_dep_id = network_id (reference for inviteNet capture, not a dep)
+- Type 10: extra_dep_id = network_id (reference, not a dep)
 - Type 11: extra_dep_id = admin_event_id (dep)
 - Type 18: extra_dep_id = user_event_id (dep)
 - Type 19: extra_dep_id = admin_boot_event_id (dep)
@@ -138,9 +137,7 @@ type_code(1) | created_at_ms(8) | key_event_id(32) | recipient_event_id(32) | wr
 | InvSigner | Signer verification in apply_projection |
 | InvNetAnchor | test_foreign_network_excluded: foreign network blocked |
 | InvSingleNetwork | At most one network row per peer in networks table |
-| InvTrustAnchorMatchesInvite | test_bootstrap_sequence: trust_anchors matches invite_network_bindings |
 | InvTrustAnchorSource | invite_accepted must be valid for trust anchor to be set |
-| InvInviteAcceptedRecorded | HasRecordedInvite guard in pipeline |
 | InvUserInviteChain | test_bootstrap_sequence: UserBoot requires UserInviteBoot valid |
 | InvDeviceInviteChain | test_bootstrap_sequence: PeerSharedFirst requires DeviceInviteFirst valid |
 | InvAdminChain | test_bootstrap_sequence: AdminOngoing requires AdminBoot valid |

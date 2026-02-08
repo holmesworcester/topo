@@ -77,7 +77,10 @@ fn project_network(
     }
 }
 
-/// HasRecordedInvite guard + trust anchor binding.
+/// Local trust-anchor binding step.
+/// Binds directly from InviteAcceptedEvent fields (no global invite-presence guard,
+/// no pre-projection capture table). Uses first-write-wins (INSERT OR IGNORE)
+/// for trust anchor immutability; rejects on mismatch.
 fn project_invite_accepted(
     conn: &Connection,
     recorded_by: &str,
@@ -87,52 +90,38 @@ fn project_invite_accepted(
     let invite_eid_b64 = event_id_to_base64(&ia.invite_event_id);
     let network_id_b64 = event_id_to_base64(&ia.network_id);
 
-    // HasRecordedInvite guard: check that at least one invite event (types 10-13) is recorded
-    let has_invite: bool = conn.query_row(
-        "SELECT COUNT(*) > 0 FROM recorded_events re
-         INNER JOIN events e ON re.event_id = e.event_id
-         WHERE re.peer_id = ?1 AND e.event_type IN ('user_invite_boot', 'user_invite_ongoing', 'device_invite_first', 'device_invite_ongoing')",
-        rusqlite::params![recorded_by],
-        |row| row.get(0),
-    )?;
-
-    if !has_invite {
-        return Ok(ProjectionDecision::Block { missing: vec![] });
-    }
-
-    // Check invite_network_bindings for this peer (captured in recording path)
-    let bound_network: Option<String> = match conn.query_row(
-        "SELECT network_id FROM invite_network_bindings WHERE peer_id = ?1",
-        rusqlite::params![recorded_by],
-        |row| row.get::<_, String>(0),
-    ) {
-        Ok(n) => Some(n),
-        Err(rusqlite::Error::QueryReturnedNoRows) => None,
-        Err(e) => return Err(e.into()),
-    };
-
-    // Use the bound network if available, otherwise use the event's network_id
-    let effective_network = bound_network.unwrap_or_else(|| network_id_b64.clone());
-
     // Write invite_accepted projection table
     conn.execute(
         "INSERT OR IGNORE INTO invite_accepted (recorded_by, event_id, invite_event_id, network_id)
          VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![recorded_by, event_id_b64, &invite_eid_b64, &effective_network],
+        rusqlite::params![recorded_by, event_id_b64, &invite_eid_b64, &network_id_b64],
     )?;
 
-    // Write trust_anchors — deterministic binding from inviteNet
+    // Write trust_anchors — first-write-wins (INSERT OR IGNORE) + mismatch check
     conn.execute(
-        "INSERT OR REPLACE INTO trust_anchors (peer_id, network_id) VALUES (?1, ?2)",
-        rusqlite::params![recorded_by, &effective_network],
+        "INSERT OR IGNORE INTO trust_anchors (peer_id, network_id) VALUES (?1, ?2)",
+        rusqlite::params![recorded_by, &network_id_b64],
     )?;
+
+    // Verify the stored anchor matches (detect conflicting invite_accepted events)
+    let stored_anchor: String = conn.query_row(
+        "SELECT network_id FROM trust_anchors WHERE peer_id = ?1",
+        rusqlite::params![recorded_by],
+        |row| row.get(0),
+    )?;
+    if stored_anchor != network_id_b64 {
+        return Ok(ProjectionDecision::Reject {
+            reason: format!(
+                "invite_accepted network_id {} conflicts with existing trust anchor {}",
+                network_id_b64, stored_anchor
+            ),
+        });
+    }
 
     Ok(ProjectionDecision::Valid)
 }
 
 /// Project UserInviteBoot: insert into user_invites.
-/// NOTE: invite_network_bindings capture happens in recording path (capture_invite_network_binding),
-/// not here, because it must be available before invite_accepted projects.
 fn project_user_invite_boot(
     conn: &Connection,
     recorded_by: &str,
@@ -263,32 +252,6 @@ fn project_secret_shared(
         rusqlite::params![recorded_by, event_id_b64, &key_b64, &recipient_b64, ss.wrapped_key.as_slice()],
     )?;
     Ok(ProjectionDecision::Valid)
-}
-
-/// Capture invite_network_bindings from invite event blobs during recording.
-/// Called from store_blob_and_project (recording path), before projection.
-/// For UserInviteBoot (type 10), extracts network_id from blob[41..73].
-/// INSERT OR IGNORE: first invite sets the binding.
-pub fn capture_invite_network_binding(
-    conn: &Connection,
-    recorded_by: &str,
-    blob: &[u8],
-) -> Result<(), Box<dyn std::error::Error>> {
-    if blob.is_empty() {
-        return Ok(());
-    }
-    let type_code = blob[0];
-    // Only UserInviteBoot carries network_id directly
-    if type_code == crate::events::EVENT_TYPE_USER_INVITE_BOOT && blob.len() >= 73 {
-        let mut network_id = [0u8; 32];
-        network_id.copy_from_slice(&blob[41..73]);
-        let network_id_b64 = event_id_to_base64(&network_id);
-        conn.execute(
-            "INSERT OR IGNORE INTO invite_network_bindings (peer_id, network_id) VALUES (?1, ?2)",
-            rusqlite::params![recorded_by, &network_id_b64],
-        )?;
-    }
-    Ok(())
 }
 
 /// After guard state changes (e.g., trust anchor set by invite_accepted),
