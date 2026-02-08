@@ -17,8 +17,9 @@ EXTENDS Naturals, FiniteSets
 \*   peer_removed    — removes a specific peer device
 \*
 \* Network binding refinement:
-\*   Network events are parameterized by network id. The trust anchor
-\*   binds to a specific network when invite_accepted projects.
+\*   Network events are parameterized by network id. Invite events
+\*   carry a network reference (captured in inviteNet on first recording).
+\*   invite_accepted deterministically binds trustAnchor to inviteNet.
 \*   Guard checks that a network event's id matches the peer's binding.
 \*   This ensures only the invited network can become valid; foreign
 \*   network events are structurally excluded.
@@ -37,7 +38,7 @@ EXTENDS Naturals, FiniteSets
 
 CONSTANTS ActiveEvents, Peers, Networks
 
-VARIABLES recorded, valid, trustAnchor, removed
+VARIABLES recorded, valid, trustAnchor, removed, inviteNet
 
 \* ---- Event type constants ----
 
@@ -274,12 +275,22 @@ Init ==
     /\ valid = [p \in Peers |-> {}]
     /\ trustAnchor = [p \in Peers |-> "none"]
     /\ removed = [p \in Peers |-> {}]
+    /\ inviteNet = [p \in Peers |-> "none"]
+
+\* AllInviteEvents: events whose blob carries a network_id reference.
+\* Recording one of these captures which network it's for.
+AllInviteEvents == (UserInviteEvents \cup DeviceInviteEvents) \cap EVENTS
 
 Record(p, e) ==
     /\ p \in Peers
     /\ e \in EVENTS
     /\ e \notin recorded[p]
     /\ recorded' = [recorded EXCEPT ![p] = @ \cup {e}]
+    \* First invite recorded for this peer captures the network reference.
+    \* Subsequent invites are for the same network (locked on first set).
+    /\ IF e \in AllInviteEvents /\ inviteNet[p] = "none"
+       THEN \E n \in Networks: inviteNet' = [inviteNet EXCEPT ![p] = n]
+       ELSE inviteNet' = inviteNet
     /\ UNCHANGED <<valid, trustAnchor, removed>>
 
 Project(p, e) ==
@@ -291,19 +302,21 @@ Project(p, e) ==
     /\ Guard(p, e)
     /\ IF e = InviteAccepted THEN HasRecordedInvite(p) ELSE TRUE
     /\ valid' = [valid EXCEPT ![p] = @ \cup {e}]
-    /\ IF e = InviteAccepted
-       THEN \E n \in Networks: trustAnchor' = [trustAnchor EXCEPT ![p] = n]
-       ELSE trustAnchor' = trustAnchor
+    \* Trust anchor binding is deterministic from the invite's network.
+    /\ trustAnchor' =
+        IF e = InviteAccepted /\ inviteNet[p] /= "none"
+        THEN [trustAnchor EXCEPT ![p] = inviteNet[p]]
+        ELSE trustAnchor
     /\ removed' =
         IF e = UserRemoved
         THEN [removed EXCEPT ![p] = @ \cup {"user_target"}]
         ELSE IF e = PeerRemoved
         THEN [removed EXCEPT ![p] = @ \cup {"peer_target"}]
         ELSE removed
-    /\ UNCHANGED <<recorded>>
+    /\ UNCHANGED <<recorded, inviteNet>>
 
 Stutter ==
-    UNCHANGED <<recorded, valid, trustAnchor, removed>>
+    UNCHANGED <<recorded, valid, trustAnchor, removed, inviteNet>>
 
 Next ==
     \/ \E p \in Peers, e \in EVENTS: Record(p, e)
@@ -311,7 +324,7 @@ Next ==
     \/ Stutter
 
 Spec ==
-    Init /\ [][Next]_<<recorded, valid, trustAnchor, removed>>
+    Init /\ [][Next]_<<recorded, valid, trustAnchor, removed, inviteNet>>
 
 \* ---- Invariants ----
 
@@ -321,6 +334,7 @@ TypeOK ==
     /\ \A p \in Peers: valid[p] \subseteq recorded[p]
     /\ trustAnchor \in [Peers -> Networks \cup {"none"}]
     /\ removed \in [Peers -> SUBSET {"user_target", "peer_target"}]
+    /\ inviteNet \in [Peers -> Networks \cup {"none"}]
 
 \* Every valid event has all its peer-resolved dependencies valid.
 InvDeps ==
@@ -343,6 +357,11 @@ InvSingleNetwork ==
     \A p \in Peers:
         \A n1, n2 \in Networks:
             (n1 \in valid[p] /\ n2 \in valid[p]) => n1 = n2
+
+\* Trust anchor binding is deterministic from the invite's network reference.
+InvTrustAnchorMatchesInvite ==
+    \A p \in Peers:
+        (trustAnchor[p] /= "none") => (trustAnchor[p] = inviteNet[p])
 
 \* Trust anchor requires invite_accepted to be valid.
 InvTrustAnchorSource ==

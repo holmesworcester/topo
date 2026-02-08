@@ -878,8 +878,9 @@ Before writing identity/removal/encryption projectors in Rust:
 2. Build/update a TLA+ model of causal relationships and guards for this phase.
 3. Model split invite types (`user_invite`, `device_invite`) and trust-anchor semantics.
 4. **Model network binding**: network events must be parameterized by network id, and the trust anchor must bind to a specific network. The model must prove that foreign network events (for networks the peer did not accept an invite for) can never become valid. Without this, the model cannot distinguish between valid and invalid network events, making it insufficiently expressive for multi-network scenarios. See `InvNetAnchor`, `InvSingleNetwork`, `InvForeignNetExcluded` invariants.
-5. Verify bootstrap/self-invite, join, device-link, and removal safety invariants.
-6. Freeze a projector-spec mapping table: each projector predicate/check maps to a named TLA guard.
+5. **Model invite-derived trust anchor binding**: the trust anchor must bind deterministically to the network referenced by the invite, not by a free nondeterministic choice at `invite_accepted` time. The model captures which network an invite references when the first invite is recorded (`inviteNet` variable); `invite_accepted` then reads `inviteNet` to set the trust anchor. This ensures the binding mechanism is faithful to the real protocol where the invite blob carries a `network_id`. See `InvTrustAnchorMatchesInvite` invariant.
+6. Verify bootstrap/self-invite, join, device-link, and removal safety invariants.
+7. Freeze a projector-spec mapping table: each projector predicate/check maps to a named TLA guard.
 
 Projector implementations should mirror TLA conditions as directly as possible.
 

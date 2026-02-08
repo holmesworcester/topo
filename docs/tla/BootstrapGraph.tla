@@ -10,9 +10,13 @@ EXTENDS Naturals
 \* Network binding refinement:
 \*   A ForeignNet event is included alongside Net. Both are network
 \*   events, but the trust anchor binds to Net's id (via the invite).
+\*   The inviteNet variable captures the network reference when the
+\*   first invite is recorded. invite_accepted then deterministically
+\*   reads inviteNet to set the trust anchor (no free nondeterminism).
 \*   The Guard mechanism checks that the network event's id matches
 \*   the binding, structurally excluding ForeignNet from ever becoming
-\*   valid. InvForeignNetExcluded verifies this property.
+\*   valid. InvForeignNetExcluded and InvTrustAnchorMatchesInvite
+\*   verify these properties.
 \*
 \* Focuses on:
 \* - dependency ordering (dep edges)
@@ -23,7 +27,7 @@ EXTENDS Naturals
 \* - connection upgrade from invite-labeled to peer-labeled
 \*
 \* Bootstrap sequence:
-\*   1. invite_accepted (local, binds trust anchor to "main" network)
+\*   1. invite_accepted (local, binds trust anchor to inviteNet)
 \*   2. network (gated by trust anchor matching "main")
 \*   3. user_invite_boot (signed_by: network, dep: network)
 \*   4. user_alice (signed_by: user_invite_boot, dep: user_invite_boot)
@@ -33,12 +37,12 @@ EXTENDS Naturals
 \*
 \* Ongoing join (Bob, invited by Alice):
 \*   8. user_invite_ongoing (signed_by: peer_shared_alice, dep: peer_shared_alice + admin_boot)
-\*   9. invite_accepted_bob (local, binds trust anchor to "main")
+\*   9. invite_accepted_bob (local, binds trust anchor to inviteNet)
 \*  10. user_bob (signed_by: user_invite_ongoing, dep: user_invite_ongoing)
 \*  11. device_invite_bob (signed_by: user_bob, dep: user_bob)
 \*  12. peer_shared_bob (signed_by: device_invite_bob, dep: device_invite_bob)
 
-VARIABLES recorded, valid, trustAnchor, connReq, connAck, connInvite, connPeer
+VARIABLES recorded, valid, trustAnchor, connReq, connAck, connInvite, connPeer, inviteNet
 
 \* Event constants
 Net == "network"
@@ -102,6 +106,8 @@ Guard(e) ==
     IF e \in {Net, ForeignNet} THEN trustAnchor = NetworkIdOf(e)
     ELSE TRUE
 
+AllInviteEvents == {UserInviteBoot, UserInviteOngoing, DeviceInviteAlice, DeviceInviteBob}
+
 Init ==
     /\ recorded = {}
     /\ valid = {}
@@ -110,11 +116,17 @@ Init ==
     /\ connAck = FALSE
     /\ connInvite = FALSE
     /\ connPeer = FALSE
+    /\ inviteNet = "none"
 
 Record(e) ==
     /\ e \in EVENTS
     /\ e \notin recorded
     /\ recorded' = recorded \cup {e}
+    \* First invite recorded captures the network reference ("main").
+    \* In this concrete model the invite always references the "main" network.
+    /\ IF e \in AllInviteEvents /\ inviteNet = "none"
+       THEN inviteNet' = "main"
+       ELSE inviteNet' = inviteNet
     /\ UNCHANGED <<valid, trustAnchor, connReq, connAck, connInvite, connPeer>>
 
 Project(e) ==
@@ -123,11 +135,12 @@ Project(e) ==
     /\ Deps(e) \subseteq valid
     /\ Guard(e)
     /\ valid' = valid \cup {e}
+    \* Trust anchor binding is deterministic from the invite's network.
     /\ trustAnchor' =
-        IF e \in {InviteAcceptedAlice, InviteAcceptedBob}
-        THEN "main"
+        IF e \in {InviteAcceptedAlice, InviteAcceptedBob} /\ inviteNet /= "none"
+        THEN inviteNet
         ELSE trustAnchor
-    /\ UNCHANGED <<recorded, connReq, connAck, connInvite, connPeer>>
+    /\ UNCHANGED <<recorded, connReq, connAck, connInvite, connPeer, inviteNet>>
 
 \* Bootstrap connection request: authenticated by invite signature.
 ConnectReqByInvite ==
@@ -135,21 +148,21 @@ ConnectReqByInvite ==
     /\ InviteAcceptedBob \in valid
     /\ UserInviteOngoing \in recorded
     /\ connReq' = TRUE
-    /\ UNCHANGED <<recorded, valid, trustAnchor, connAck, connInvite, connPeer>>
+    /\ UNCHANGED <<recorded, valid, trustAnchor, connAck, connInvite, connPeer, inviteNet>>
 
 \* Connection acknowledgment: only after request is accepted.
 ConnectAck ==
     /\ connReq
     /\ ~connAck
     /\ connAck' = TRUE
-    /\ UNCHANGED <<recorded, valid, trustAnchor, connReq, connInvite, connPeer>>
+    /\ UNCHANGED <<recorded, valid, trustAnchor, connReq, connInvite, connPeer, inviteNet>>
 
 \* Bootstrap connection active (invite-labeled) after ack.
 ConnectByInvite ==
     /\ ~connInvite
     /\ connAck
     /\ connInvite' = TRUE
-    /\ UNCHANGED <<recorded, valid, trustAnchor, connReq, connAck, connPeer>>
+    /\ UNCHANGED <<recorded, valid, trustAnchor, connReq, connAck, connPeer, inviteNet>>
 
 \* Upgrade to peer_shared-labeled connection once both peers are known.
 UpgradeToPeer ==
@@ -158,10 +171,10 @@ UpgradeToPeer ==
     /\ PeerSharedAlice \in valid
     /\ PeerSharedBob \in valid
     /\ connPeer' = TRUE
-    /\ UNCHANGED <<recorded, valid, trustAnchor, connReq, connAck, connInvite>>
+    /\ UNCHANGED <<recorded, valid, trustAnchor, connReq, connAck, connInvite, inviteNet>>
 
 Stutter ==
-    UNCHANGED <<recorded, valid, trustAnchor, connReq, connAck, connInvite, connPeer>>
+    UNCHANGED <<recorded, valid, trustAnchor, connReq, connAck, connInvite, connPeer, inviteNet>>
 
 Next ==
     \/ \E e \in EVENTS: Record(e)
@@ -173,7 +186,7 @@ Next ==
     \/ Stutter
 
 Spec ==
-    Init /\ [][Next]_<<recorded, valid, trustAnchor, connReq, connAck, connInvite, connPeer>>
+    Init /\ [][Next]_<<recorded, valid, trustAnchor, connReq, connAck, connInvite, connPeer, inviteNet>>
 
 \* ---- Invariants ----
 
@@ -182,6 +195,7 @@ TypeOK ==
     /\ valid \subseteq EVENTS
     /\ valid \subseteq recorded
     /\ trustAnchor \in {"none", "main", "foreign"}
+    /\ inviteNet \in {"none", "main"}
     /\ connReq \in {TRUE, FALSE}
     /\ connAck \in {TRUE, FALSE}
     /\ connInvite \in {TRUE, FALSE}
@@ -232,5 +246,9 @@ InvDeviceInviteChain ==
 \* Admin chain: admin_boot requires network and user.
 InvAdminChain ==
     AdminBootAlice \in valid => (Net \in valid /\ UserAlice \in valid)
+
+\* Trust anchor binding is deterministic from the invite's network reference.
+InvTrustAnchorMatchesInvite ==
+    (trustAnchor /= "none") => (trustAnchor = inviteNet)
 
 ====
