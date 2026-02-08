@@ -152,6 +152,121 @@ static MIGRATIONS: &[Migration] = &[
                 ON ingress_queue(processed, received_at);
         ",
     },
+    Migration {
+        version: 6,
+        name: "add_deleted_messages",
+        sql: "
+            CREATE TABLE IF NOT EXISTS deleted_messages (
+                recorded_by TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                deletion_event_id TEXT NOT NULL,
+                author_id TEXT NOT NULL,
+                deleted_at INTEGER NOT NULL,
+                PRIMARY KEY (recorded_by, message_id)
+            );
+        ",
+    },
+    Migration {
+        version: 7,
+        name: "add_peer_endpoint_indexes",
+        sql: "
+            CREATE INDEX IF NOT EXISTS idx_peer_endpoint_expires
+                ON peer_endpoint_observations(recorded_by, via_peer_id, expires_at);
+            CREATE INDEX IF NOT EXISTS idx_peer_endpoint_lookup
+                ON peer_endpoint_observations(recorded_by, via_peer_id, origin_ip, origin_port);
+        ",
+    },
+    Migration {
+        version: 8,
+        name: "add_identity_tables",
+        sql: "
+            CREATE TABLE IF NOT EXISTS trust_anchors (
+                peer_id TEXT NOT NULL PRIMARY KEY,
+                network_id TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS invite_network_bindings (
+                peer_id TEXT NOT NULL PRIMARY KEY,
+                network_id TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS networks (
+                recorded_by TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                network_id TEXT NOT NULL,
+                public_key BLOB NOT NULL,
+                PRIMARY KEY (recorded_by, event_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS invite_accepted (
+                recorded_by TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                invite_event_id TEXT NOT NULL,
+                network_id TEXT NOT NULL,
+                PRIMARY KEY (recorded_by, event_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS user_invites (
+                recorded_by TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                public_key BLOB NOT NULL,
+                PRIMARY KEY (recorded_by, event_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS device_invites (
+                recorded_by TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                public_key BLOB NOT NULL,
+                PRIMARY KEY (recorded_by, event_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS users (
+                recorded_by TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                public_key BLOB NOT NULL,
+                PRIMARY KEY (recorded_by, event_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS peers_shared (
+                recorded_by TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                public_key BLOB NOT NULL,
+                PRIMARY KEY (recorded_by, event_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS admins (
+                recorded_by TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                public_key BLOB NOT NULL,
+                PRIMARY KEY (recorded_by, event_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS removed_entities (
+                recorded_by TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                target_event_id TEXT NOT NULL,
+                removal_type TEXT NOT NULL,
+                PRIMARY KEY (recorded_by, event_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS secret_shared (
+                recorded_by TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                key_event_id TEXT NOT NULL,
+                recipient_event_id TEXT NOT NULL,
+                wrapped_key BLOB NOT NULL,
+                PRIMARY KEY (recorded_by, event_id)
+            );
+        ",
+    },
+    Migration {
+        version: 9,
+        name: "enforce_single_network_per_peer",
+        sql: "
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_networks_single_per_peer
+                ON networks (recorded_by, network_id);
+        ",
+    },
 ];
 
 fn ensure_schema_migrations(conn: &Connection) -> SqliteResult<()> {
@@ -271,6 +386,6 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 5);
+        assert_eq!(count, 9);
     }
 }

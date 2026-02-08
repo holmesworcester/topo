@@ -3,9 +3,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::crypto::EventId;
 use crate::db::{open_connection, schema::create_tables};
-use crate::events::{MessageEvent, ReactionEvent, PeerKeyEvent, SecretKeyEvent, SignedMemoEvent, ParsedEvent};
+use crate::events::{
+    MessageEvent, MessageDeletionEvent, ReactionEvent, PeerKeyEvent, SecretKeyEvent,
+    SignedMemoEvent, ParsedEvent,
+    NetworkEvent, InviteAcceptedEvent, UserInviteBootEvent,
+    DeviceInviteFirstEvent, UserBootEvent,
+    PeerSharedFirstEvent, AdminBootEvent,
+    UserRemovedEvent, PeerRemovedEvent, SecretSharedEvent,
+};
 use crate::identity::{cert_paths_from_db, local_identity_from_db};
-use crate::projection::create::{create_event_sync, create_signed_event_sync, create_encrypted_event_sync};
+use crate::projection::create::{create_event_sync, create_signed_event_sync, create_encrypted_event_sync, event_id_or_blocked, CreateEventError};
 use crate::projection::pipeline::project_one;
 use crate::sync::engine::{accept_loop, connect_loop};
 use crate::transport::{
@@ -107,7 +114,8 @@ impl Peer {
             author_id: self.author_id,
             emoji: emoji.to_string(),
         });
-        create_event_sync(&db, &self.identity, &rxn).expect("failed to create reaction")
+        event_id_or_blocked(create_event_sync(&db, &self.identity, &rxn))
+            .expect("failed to create reaction")
     }
 
     /// Create a PeerKey event publishing an Ed25519 public key.
@@ -153,7 +161,7 @@ impl Peer {
     }
 
     /// Create a SecretKey event with deterministic key bytes and timestamp.
-    /// Two peers calling this with the same args produce the same blob → same event_id.
+    /// Two peers calling this with the same args produce the same blob -> same event_id.
     /// This is used for PSK materialization in tests where both peers need the same key.
     pub fn create_secret_key_deterministic(&self, key_bytes: [u8; 32], created_at_ms: u64) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
@@ -177,6 +185,250 @@ impl Peer {
         });
         create_encrypted_event_sync(&db, &self.identity, key_event_id, &inner)
             .expect("failed to create encrypted message")
+    }
+
+    /// Create a MessageDeletion event targeting the given message event.
+    /// Returns the deletion event ID.
+    pub fn create_message_deletion(&self, target_event_id: &EventId) -> EventId {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        let del = ParsedEvent::MessageDeletion(MessageDeletionEvent {
+            created_at_ms: current_timestamp_ms(),
+            target_event_id: *target_event_id,
+            author_id: self.author_id,
+        });
+        event_id_or_blocked(create_event_sync(&db, &self.identity, &del))
+            .expect("failed to create message_deletion")
+    }
+
+    /// Create an encrypted MessageDeletion event.
+    /// Returns the encrypted event ID.
+    pub fn create_encrypted_deletion(&self, key_event_id: &EventId, target_event_id: &EventId) -> EventId {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        let inner = ParsedEvent::MessageDeletion(MessageDeletionEvent {
+            created_at_ms: current_timestamp_ms(),
+            target_event_id: *target_event_id,
+            author_id: self.author_id,
+        });
+        create_encrypted_event_sync(&db, &self.identity, key_event_id, &inner)
+            .expect("failed to create encrypted deletion")
+    }
+
+    // --- Identity event helpers ---
+
+    /// Create a Network event. Returns the event ID.
+    pub fn create_network(&self, network_id: [u8; 32], public_key: [u8; 32]) -> EventId {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        let net = ParsedEvent::Network(NetworkEvent {
+            created_at_ms: current_timestamp_ms(),
+            public_key,
+            network_id,
+        });
+        event_id_or_blocked(create_event_sync(&db, &self.identity, &net))
+            .expect("failed to create network")
+    }
+
+    /// Try to create a Network event. Returns Result to allow handling rejection.
+    pub fn try_create_network(&self, network_id: [u8; 32], public_key: [u8; 32]) -> Result<EventId, CreateEventError> {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        let net = ParsedEvent::Network(NetworkEvent {
+            created_at_ms: current_timestamp_ms(),
+            public_key,
+            network_id,
+        });
+        create_event_sync(&db, &self.identity, &net)
+    }
+
+    /// Create an InviteAccepted event (local). Returns the event ID.
+    pub fn create_invite_accepted(&self, invite_event_id: &EventId, network_id: [u8; 32]) -> EventId {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        let ia = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
+            created_at_ms: current_timestamp_ms(),
+            invite_event_id: *invite_event_id,
+            network_id,
+        });
+        create_event_sync(&db, &self.identity, &ia).expect("failed to create invite_accepted")
+    }
+
+    /// Create a UserInviteBoot event (signed by network key). Returns the event ID.
+    pub fn create_user_invite_boot(
+        &self,
+        signing_key: &ed25519_dalek::SigningKey,
+        network_event_id: &EventId,
+        network_id: [u8; 32],
+    ) -> EventId {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        let public_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng())
+            .verifying_key().to_bytes();
+        let evt = ParsedEvent::UserInviteBoot(UserInviteBootEvent {
+            created_at_ms: current_timestamp_ms(),
+            public_key,
+            network_id,
+            signed_by: *network_event_id,
+            signer_type: 1,
+            signature: [0u8; 64],
+        });
+        event_id_or_blocked(create_signed_event_sync(&db, &self.identity, &evt, signing_key))
+            .expect("failed to create user_invite_boot")
+    }
+
+    /// Create a UserInviteBoot with a specific public key. Returns the event ID.
+    pub fn create_user_invite_boot_with_key(
+        &self,
+        invite_public_key: [u8; 32],
+        signing_key: &ed25519_dalek::SigningKey,
+        network_event_id: &EventId,
+        network_id: [u8; 32],
+    ) -> EventId {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        let evt = ParsedEvent::UserInviteBoot(UserInviteBootEvent {
+            created_at_ms: current_timestamp_ms(),
+            public_key: invite_public_key,
+            network_id,
+            signed_by: *network_event_id,
+            signer_type: 1,
+            signature: [0u8; 64],
+        });
+        event_id_or_blocked(create_signed_event_sync(&db, &self.identity, &evt, signing_key))
+            .expect("failed to create user_invite_boot")
+    }
+
+    /// Create a UserBoot event (signed by UserInvite key). Returns the event ID.
+    pub fn create_user_boot(
+        &self,
+        user_public_key: [u8; 32],
+        signing_key: &ed25519_dalek::SigningKey,
+        user_invite_event_id: &EventId,
+    ) -> EventId {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        let evt = ParsedEvent::UserBoot(UserBootEvent {
+            created_at_ms: current_timestamp_ms(),
+            public_key: user_public_key,
+            signed_by: *user_invite_event_id,
+            signer_type: 2,
+            signature: [0u8; 64],
+        });
+        event_id_or_blocked(create_signed_event_sync(&db, &self.identity, &evt, signing_key))
+            .expect("failed to create user_boot")
+    }
+
+    /// Create a DeviceInviteFirst event (signed by User key). Returns the event ID.
+    pub fn create_device_invite_first(
+        &self,
+        device_invite_public_key: [u8; 32],
+        signing_key: &ed25519_dalek::SigningKey,
+        user_event_id: &EventId,
+    ) -> EventId {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        let evt = ParsedEvent::DeviceInviteFirst(DeviceInviteFirstEvent {
+            created_at_ms: current_timestamp_ms(),
+            public_key: device_invite_public_key,
+            signed_by: *user_event_id,
+            signer_type: 4,
+            signature: [0u8; 64],
+        });
+        event_id_or_blocked(create_signed_event_sync(&db, &self.identity, &evt, signing_key))
+            .expect("failed to create device_invite_first")
+    }
+
+    /// Create a PeerSharedFirst event (signed by DeviceInvite key). Returns the event ID.
+    pub fn create_peer_shared_first(
+        &self,
+        peer_shared_public_key: [u8; 32],
+        signing_key: &ed25519_dalek::SigningKey,
+        device_invite_event_id: &EventId,
+    ) -> EventId {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        let evt = ParsedEvent::PeerSharedFirst(PeerSharedFirstEvent {
+            created_at_ms: current_timestamp_ms(),
+            public_key: peer_shared_public_key,
+            signed_by: *device_invite_event_id,
+            signer_type: 3,
+            signature: [0u8; 64],
+        });
+        event_id_or_blocked(create_signed_event_sync(&db, &self.identity, &evt, signing_key))
+            .expect("failed to create peer_shared_first")
+    }
+
+    /// Create an AdminBoot event (signed by Network key, dep on User). Returns the event ID.
+    pub fn create_admin_boot(
+        &self,
+        admin_public_key: [u8; 32],
+        signing_key: &ed25519_dalek::SigningKey,
+        user_event_id: &EventId,
+        network_event_id: &EventId,
+    ) -> EventId {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        let evt = ParsedEvent::AdminBoot(AdminBootEvent {
+            created_at_ms: current_timestamp_ms(),
+            public_key: admin_public_key,
+            user_event_id: *user_event_id,
+            signed_by: *network_event_id,
+            signer_type: 1,
+            signature: [0u8; 64],
+        });
+        event_id_or_blocked(create_signed_event_sync(&db, &self.identity, &evt, signing_key))
+            .expect("failed to create admin_boot")
+    }
+
+    /// Create a UserRemoved event (signed by PeerShared key — admin). Returns the event ID.
+    pub fn create_user_removed(
+        &self,
+        signing_key: &ed25519_dalek::SigningKey,
+        target_event_id: &EventId,
+        peer_shared_event_id: &EventId,
+    ) -> EventId {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        let evt = ParsedEvent::UserRemoved(UserRemovedEvent {
+            created_at_ms: current_timestamp_ms(),
+            target_event_id: *target_event_id,
+            signed_by: *peer_shared_event_id,
+            signer_type: 5,
+            signature: [0u8; 64],
+        });
+        event_id_or_blocked(create_signed_event_sync(&db, &self.identity, &evt, signing_key))
+            .expect("failed to create user_removed")
+    }
+
+    /// Create a PeerRemoved event (signed by PeerShared key — admin). Returns the event ID.
+    pub fn create_peer_removed(
+        &self,
+        signing_key: &ed25519_dalek::SigningKey,
+        target_event_id: &EventId,
+        peer_shared_event_id: &EventId,
+    ) -> EventId {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        let evt = ParsedEvent::PeerRemoved(PeerRemovedEvent {
+            created_at_ms: current_timestamp_ms(),
+            target_event_id: *target_event_id,
+            signed_by: *peer_shared_event_id,
+            signer_type: 5,
+            signature: [0u8; 64],
+        });
+        event_id_or_blocked(create_signed_event_sync(&db, &self.identity, &evt, signing_key))
+            .expect("failed to create peer_removed")
+    }
+
+    /// Create a SecretShared event (signed by PeerShared key). Returns the event ID.
+    pub fn create_secret_shared(
+        &self,
+        signing_key: &ed25519_dalek::SigningKey,
+        key_event_id: &EventId,
+        recipient_event_id: &EventId,
+        wrapped_key: [u8; 32],
+        peer_shared_event_id: &EventId,
+    ) -> EventId {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        let evt = ParsedEvent::SecretShared(SecretSharedEvent {
+            created_at_ms: current_timestamp_ms(),
+            key_event_id: *key_event_id,
+            recipient_event_id: *recipient_event_id,
+            wrapped_key,
+            signed_by: *peer_shared_event_id,
+            signer_type: 5,
+            signature: [0u8; 64],
+        });
+        event_id_or_blocked(create_signed_event_sync(&db, &self.identity, &evt, signing_key))
+            .expect("failed to create secret_shared")
     }
 
     /// Create multiple messages. Uses a transaction for speed at scale.
@@ -266,6 +518,16 @@ impl Peer {
         ).unwrap_or(false)
     }
 
+    /// Count rows in the deleted_messages projection table scoped to this peer.
+    pub fn deleted_message_count(&self) -> i64 {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        db.query_row(
+            "SELECT COUNT(*) FROM deleted_messages WHERE recorded_by = ?1",
+            rusqlite::params![&self.identity],
+            |row| row.get(0),
+        ).unwrap_or(0)
+    }
+
     /// Count rows in the events table.
     pub fn events_table_count(&self) -> i64 {
         let db = open_connection(&self.db_path).expect("failed to open db");
@@ -309,17 +571,17 @@ impl Peer {
 
 /// Replay all event blobs from the events table through project_one.
 /// Clears projection tables and valid_events, then re-projects all events.
-/// Returns (message_count, reaction_count, peer_key_count, signed_memo_count, secret_key_count) after replay.
-fn replay_projection(db: &rusqlite::Connection, recorded_by: &str) -> (i64, i64, i64, i64, i64) {
+/// Returns (message_count, reaction_count, peer_key_count, signed_memo_count, secret_key_count, deleted_message_count) after replay.
+fn replay_projection(db: &rusqlite::Connection, recorded_by: &str) -> (i64, i64, i64, i64, i64, i64) {
     replay_projection_impl(db, recorded_by, "ORDER BY created_at ASC, event_id ASC")
 }
 
 /// Replay events in reverse order through the projector.
-fn replay_projection_reverse(db: &rusqlite::Connection, recorded_by: &str) -> (i64, i64, i64, i64, i64) {
+fn replay_projection_reverse(db: &rusqlite::Connection, recorded_by: &str) -> (i64, i64, i64, i64, i64, i64) {
     replay_projection_impl(db, recorded_by, "ORDER BY created_at DESC, event_id DESC")
 }
 
-fn replay_projection_impl(db: &rusqlite::Connection, recorded_by: &str, order: &str) -> (i64, i64, i64, i64, i64) {
+fn replay_projection_impl(db: &rusqlite::Connection, recorded_by: &str, order: &str) -> (i64, i64, i64, i64, i64, i64) {
     use crate::crypto::event_id_from_base64;
 
     // Clear projection tables + valid_events for this tenant
@@ -333,6 +595,20 @@ fn replay_projection_impl(db: &rusqlite::Connection, recorded_by: &str, order: &
         .expect("failed to clear signed_memos");
     db.execute("DELETE FROM secret_keys WHERE recorded_by = ?1", rusqlite::params![recorded_by])
         .expect("failed to clear secret_keys");
+    db.execute("DELETE FROM deleted_messages WHERE recorded_by = ?1", rusqlite::params![recorded_by])
+        .expect("failed to clear deleted_messages");
+    // Identity tables
+    db.execute("DELETE FROM networks WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
+    db.execute("DELETE FROM invite_accepted WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
+    db.execute("DELETE FROM user_invites WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
+    db.execute("DELETE FROM device_invites WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
+    db.execute("DELETE FROM users WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
+    db.execute("DELETE FROM peers_shared WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
+    db.execute("DELETE FROM admins WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
+    db.execute("DELETE FROM removed_entities WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
+    db.execute("DELETE FROM secret_shared WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
+    db.execute("DELETE FROM trust_anchors WHERE peer_id = ?1", rusqlite::params![recorded_by]).ok();
+    db.execute("DELETE FROM invite_network_bindings WHERE peer_id = ?1", rusqlite::params![recorded_by]).ok();
     db.execute("DELETE FROM valid_events WHERE peer_id = ?1", rusqlite::params![recorded_by])
         .expect("failed to clear valid_events");
     db.execute("DELETE FROM blocked_event_deps WHERE peer_id = ?1", rusqlite::params![recorded_by])
@@ -384,8 +660,13 @@ fn replay_projection_impl(db: &rusqlite::Connection, recorded_by: &str, order: &
         rusqlite::params![recorded_by],
         |row| row.get(0),
     ).unwrap_or(0);
+    let del_count: i64 = db.query_row(
+        "SELECT COUNT(*) FROM deleted_messages WHERE recorded_by = ?1",
+        rusqlite::params![recorded_by],
+        |row| row.get(0),
+    ).unwrap_or(0);
 
-    (msg_count, rxn_count, pk_count, sm_count, sk_count)
+    (msg_count, rxn_count, pk_count, sm_count, sk_count, del_count)
 }
 
 /// Verify projection invariants for a peer:
@@ -421,9 +702,14 @@ pub fn verify_projection_invariants(peer: &Peer) {
         rusqlite::params![&peer.identity],
         |row| row.get(0),
     ).unwrap_or(0);
+    let orig_del: i64 = db.query_row(
+        "SELECT COUNT(*) FROM deleted_messages WHERE recorded_by = ?1",
+        rusqlite::params![&peer.identity],
+        |row| row.get(0),
+    ).unwrap_or(0);
 
     // 1. Forward replay
-    let (fwd_msg, fwd_rxn, fwd_pk, fwd_sm, fwd_sk) = replay_projection(&db, &peer.identity);
+    let (fwd_msg, fwd_rxn, fwd_pk, fwd_sm, fwd_sk, fwd_del) = replay_projection(&db, &peer.identity);
     assert_eq!(fwd_msg, orig_msg,
         "Forward replay message count mismatch: expected {}, got {}", orig_msg, fwd_msg);
     assert_eq!(fwd_rxn, orig_rxn,
@@ -434,9 +720,11 @@ pub fn verify_projection_invariants(peer: &Peer) {
         "Forward replay signed_memo count mismatch: expected {}, got {}", orig_sm, fwd_sm);
     assert_eq!(fwd_sk, orig_sk,
         "Forward replay secret_key count mismatch: expected {}, got {}", orig_sk, fwd_sk);
+    assert_eq!(fwd_del, orig_del,
+        "Forward replay deleted_message count mismatch: expected {}, got {}", orig_del, fwd_del);
 
     // 2. Idempotency: replay again over existing projected state (double replay)
-    let (double_msg, double_rxn, double_pk, double_sm, double_sk) = replay_projection(&db, &peer.identity);
+    let (double_msg, double_rxn, double_pk, double_sm, double_sk, double_del) = replay_projection(&db, &peer.identity);
     assert_eq!(double_msg, orig_msg,
         "Double replay message count mismatch: expected {}, got {}", orig_msg, double_msg);
     assert_eq!(double_rxn, orig_rxn,
@@ -447,9 +735,11 @@ pub fn verify_projection_invariants(peer: &Peer) {
         "Double replay signed_memo count mismatch: expected {}, got {}", orig_sm, double_sm);
     assert_eq!(double_sk, orig_sk,
         "Double replay secret_key count mismatch: expected {}, got {}", orig_sk, double_sk);
+    assert_eq!(double_del, orig_del,
+        "Double replay deleted_message count mismatch: expected {}, got {}", orig_del, double_del);
 
     // 3. Reverse-order replay
-    let (rev_msg, rev_rxn, rev_pk, rev_sm, rev_sk) = replay_projection_reverse(&db, &peer.identity);
+    let (rev_msg, rev_rxn, rev_pk, rev_sm, rev_sk, rev_del) = replay_projection_reverse(&db, &peer.identity);
     assert_eq!(rev_msg, orig_msg,
         "Reverse replay message count mismatch: expected {}, got {}", orig_msg, rev_msg);
     assert_eq!(rev_rxn, orig_rxn,
@@ -460,6 +750,8 @@ pub fn verify_projection_invariants(peer: &Peer) {
         "Reverse replay signed_memo count mismatch: expected {}, got {}", orig_sm, rev_sm);
     assert_eq!(rev_sk, orig_sk,
         "Reverse replay secret_key count mismatch: expected {}, got {}", orig_sk, rev_sk);
+    assert_eq!(rev_del, orig_del,
+        "Reverse replay deleted_message count mismatch: expected {}, got {}", orig_del, rev_del);
 
     // Restore forward projection for subsequent assertions
     let _ = replay_projection(&db, &peer.identity);

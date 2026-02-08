@@ -1,7 +1,6 @@
 use rusqlite::Connection;
 
 use crate::crypto::event_id_to_base64;
-use crate::events::{self, ParsedEvent};
 
 /// Result of resolving a signer key from the database.
 #[derive(Debug, PartialEq)]
@@ -27,41 +26,55 @@ pub fn resolve_signer_key(
     signer_type: u8,
     signer_event_id: &[u8; 32],
 ) -> Result<SignerResolution, Box<dyn std::error::Error>> {
-    match signer_type {
-        0 => {
-            // Peer signer: load from events table, scoped to tenant via valid_events
-            let eid_b64 = event_id_to_base64(signer_event_id);
-            let blob: Vec<u8> = match conn.query_row(
-                "SELECT e.blob FROM events e
-                 INNER JOIN valid_events v ON e.event_id = v.event_id
-                 WHERE v.peer_id = ?1 AND e.event_id = ?2",
-                rusqlite::params![recorded_by, &eid_b64],
-                |row| row.get(0),
-            ) {
-                Ok(b) => b,
-                Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(SignerResolution::NotFound),
-                Err(e) => return Err(e.into()),
-            };
-
-            let parsed = match events::parse_event(&blob) {
-                Ok(p) => p,
-                Err(e) => {
-                    return Ok(SignerResolution::Invalid(format!("parse error: {}", e)));
-                }
-            };
-            match parsed {
-                ParsedEvent::PeerKey(pk) => Ok(SignerResolution::Found(pk.public_key)),
-                other => Ok(SignerResolution::Invalid(format!(
-                    "signer event is not a PeerKeyEvent, got type_code={}",
-                    other.event_type_code()
-                ))),
-            }
+    // Valid type codes for each signer_type
+    let valid_type_codes: &[u8] = match signer_type {
+        0 => &[3],          // PeerKey
+        1 => &[8],          // Network
+        2 => &[10, 11],     // UserInviteBoot, UserInviteOngoing
+        3 => &[12, 13],     // DeviceInviteFirst, DeviceInviteOngoing
+        4 => &[14, 15],     // UserBoot, UserOngoing
+        5 => &[16, 17],     // PeerSharedFirst, PeerSharedOngoing
+        _ => {
+            return Ok(SignerResolution::Invalid(format!(
+                "unsupported signer_type: {}",
+                signer_type
+            )));
         }
-        _ => Ok(SignerResolution::Invalid(format!(
-            "unsupported signer_type: {}",
-            signer_type
-        ))),
+    };
+
+    let eid_b64 = event_id_to_base64(signer_event_id);
+    let blob: Vec<u8> = match conn.query_row(
+        "SELECT e.blob FROM events e
+         INNER JOIN valid_events v ON e.event_id = v.event_id
+         WHERE v.peer_id = ?1 AND e.event_id = ?2",
+        rusqlite::params![recorded_by, &eid_b64],
+        |row| row.get(0),
+    ) {
+        Ok(b) => b,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(SignerResolution::NotFound),
+        Err(e) => return Err(e.into()),
+    };
+
+    // All identity events (and PeerKey) have public_key at blob[9..41].
+    // Minimum blob size for key extraction: 41 bytes.
+    if blob.len() < 41 {
+        return Ok(SignerResolution::Invalid(format!(
+            "signer blob too short: {} bytes",
+            blob.len()
+        )));
     }
+
+    let actual_type_code = blob[0];
+    if !valid_type_codes.contains(&actual_type_code) {
+        return Ok(SignerResolution::Invalid(format!(
+            "signer event type_code={} not valid for signer_type={}",
+            actual_type_code, signer_type
+        )));
+    }
+
+    let mut public_key = [0u8; 32];
+    public_key.copy_from_slice(&blob[9..41]);
+    Ok(SignerResolution::Found(public_key))
 }
 
 /// Verify an Ed25519 signature over the given message bytes.
@@ -205,7 +218,7 @@ mod tests {
         let result = resolve_signer_key(&conn, recorded_by, 0, &event_id).unwrap();
         match result {
             SignerResolution::Invalid(msg) => {
-                assert!(msg.contains("not a PeerKeyEvent"), "msg: {}", msg);
+                assert!(msg.contains("not valid for signer_type=0"), "msg: {}", msg);
             }
             other => panic!("expected Invalid, got {:?}", other),
         }

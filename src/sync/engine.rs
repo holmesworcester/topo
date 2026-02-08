@@ -20,6 +20,7 @@ use tracing::{info, warn, error};
 
 use crate::crypto::{hash_event, event_id_to_base64, event_id_from_base64, EventId};
 use crate::db::{open_connection, schema::create_tables, store::Store, egress_queue::EgressQueue, wanted::WantedEvents, project_queue::ProjectQueue};
+use crate::db::health::{purge_expired_endpoints, record_endpoint_observation};
 use crate::events::{self, registry, ShareScope};
 use crate::projection::pipeline::project_one;
 use crate::runtime::SyncStats;
@@ -49,6 +50,19 @@ fn current_timestamp_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64
+}
+
+/// Endpoint observation TTL: 24 hours in milliseconds.
+const ENDPOINT_TTL_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// Batch writer drain batch size: 100 normal, 50 in low_mem.
+fn drain_batch_size() -> usize {
+    if low_mem_mode() { 50 } else { 100 }
+}
+
+/// Batch writer write batch cap: 1000 normal, 500 in low_mem.
+fn write_batch_cap() -> usize {
+    if low_mem_mode() { 500 } else { 1000 }
 }
 
 /// Batch writer task - drains channel and writes to SQLite in batches.
@@ -125,10 +139,11 @@ pub fn batch_writer(
             None => break,
         };
 
+        let cap = write_batch_cap();
         let mut batch = vec![first];
         while let Ok(item) = rx.try_recv() {
             batch.push(item);
-            if batch.len() >= 1000 {
+            if batch.len() >= cap {
                 break;
             }
         }
@@ -219,14 +234,20 @@ pub fn batch_writer(
                 }
 
                 // Second pass: drain project_queue
-                if let Err(e) = pq.drain(&recorded_by, |conn, event_id_b64| {
+                let batch_sz = drain_batch_size();
+                if let Err(e) = pq.drain_with_limit(&recorded_by, batch_sz, |conn, event_id_b64| {
                     if let Some(eid) = event_id_from_base64(event_id_b64) {
-                        if let Err(e) = project_one(conn, &recorded_by, &eid) {
-                            warn!("projection error for {}: {}", event_id_b64, e);
-                        }
+                        project_one(conn, &recorded_by, &eid)
+                            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
                     }
+                    Ok(())
                 }) {
                     warn!("project_queue drain error: {}", e);
+                }
+                if let Ok(h) = pq.health(&recorded_by) {
+                    if h.pending > 0 || h.max_attempts > 0 {
+                        tracing::debug!(pending=%h.pending, max_attempts=%h.max_attempts, oldest_age_ms=%h.oldest_age_ms, "project_queue health");
+                    }
                 }
             }
             Err(e) => {
@@ -341,7 +362,6 @@ where
     let mut neg = Negentropy::new(Storage::Borrowed(&neg_storage), 64 * 1024)?;
 
     let store = Store::new(&db);
-    let reg = registry();
 
     let ingest_cap = if low_mem_mode() { 1000 } else { 5000 };
     let (ingest_tx, ingest_rx) = mpsc::channel::<(EventId, Vec<u8>)>(ingest_cap);
@@ -433,6 +453,11 @@ where
                         "Reconciliation complete in {} rounds: outgoing={}, wanted={}",
                         rounds, pending_out, pending_in
                     );
+                    if let Ok(h) = egress.health(peer_id) {
+                        if h.pending > 0 || h.max_attempts > 0 {
+                            tracing::debug!(pending=%h.pending, max_attempts=%h.max_attempts, oldest_age_ms=%h.oldest_age_ms, "egress_queue health");
+                        }
+                    }
                 }
             }
             Ok(Ok(SyncMessage::DoneAck)) => {
@@ -463,17 +488,7 @@ where
 
             let mut sent_rowids: Vec<i64> = Vec::with_capacity(batch.len());
             for (rowid, event_id) in batch {
-                if let Ok(Some(blob)) = store.get(&event_id) {
-                    // Defense-in-depth: skip local-only events
-                    if let Some(type_code) = events::extract_event_type(&blob) {
-                        if let Some(meta) = reg.lookup(type_code) {
-                            if meta.share_scope == ShareScope::Local {
-                                sent_rowids.push(rowid);
-                                continue;
-                            }
-                        }
-                    }
-
+                if let Ok(Some(blob)) = store.get_shared(&event_id) {
                     let blob_len = blob.len() as u64;
                     if data_send.send(&SyncMessage::Event { blob }).await.is_ok() {
                         events_sent += 1;
@@ -587,7 +602,6 @@ where
     let mut neg = Negentropy::new(Storage::Borrowed(&neg_storage), 64 * 1024)?;
 
     let store = Store::new(&db);
-    let reg = registry();
 
     let ingest_cap = if low_mem_mode() { 1000 } else { 5000 };
     let (ingest_tx, ingest_rx) = mpsc::channel::<(EventId, Vec<u8>)>(ingest_cap);
@@ -661,17 +675,7 @@ where
 
             let mut sent_rowids: Vec<i64> = Vec::with_capacity(batch.len());
             for (rowid, event_id) in batch {
-                if let Ok(Some(blob)) = store.get(&event_id) {
-                    // Defense-in-depth: skip local-only events
-                    if let Some(type_code) = events::extract_event_type(&blob) {
-                        if let Some(meta) = reg.lookup(type_code) {
-                            if meta.share_scope == ShareScope::Local {
-                                sent_rowids.push(rowid);
-                                continue;
-                            }
-                        }
-                    }
-
+                if let Ok(Some(blob)) = store.get_shared(&event_id) {
                     let blob_len = blob.len() as u64;
                     if data_send.send(&SyncMessage::Event { blob }).await.is_ok() {
                         events_sent += 1;
@@ -758,16 +762,23 @@ pub async fn accept_loop(
     {
         let db = open_connection(db_path)?;
         create_tables(&db)?;
+        let purged = purge_expired_endpoints(&db, current_timestamp_ms()).unwrap_or(0);
+        if purged > 0 {
+            info!("Purged {} expired endpoint observations", purged);
+        }
         let pq = ProjectQueue::new(&db);
         let recovered = pq.recover_expired().unwrap_or(0);
         if recovered > 0 {
             info!("Recovered {} expired project_queue leases", recovered);
         }
         let recorded_by_str = recorded_by.to_string();
-        let drained = pq.drain(&recorded_by_str, |conn, event_id_b64| {
+        let batch_sz = drain_batch_size();
+        let drained = pq.drain_with_limit(&recorded_by_str, batch_sz, |conn, event_id_b64| {
             if let Some(eid) = event_id_from_base64(event_id_b64) {
-                let _ = project_one(conn, &recorded_by_str, &eid);
+                project_one(conn, &recorded_by_str, &eid)
+                    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
             }
+            Ok(())
         }).unwrap_or(0);
         if drained > 0 {
             info!("Processed {} pending project_queue items from previous session", drained);
@@ -798,6 +809,27 @@ pub async fn accept_loop(
             }
         };
         info!("Accepted connection from {}", peer_id);
+
+        // Record endpoint observation and periodically purge expired ones
+        {
+            let remote = connection.remote_address();
+            let now = current_timestamp_ms();
+            if let Ok(db) = open_connection(db_path) {
+                let _ = record_endpoint_observation(
+                    &db,
+                    recorded_by,
+                    &peer_id,
+                    &remote.ip().to_string(),
+                    remote.port(),
+                    now,
+                    ENDPOINT_TTL_MS,
+                );
+                let purged = purge_expired_endpoints(&db, now).unwrap_or(0);
+                if purged > 0 {
+                    info!("Purged {} expired endpoint observations", purged);
+                }
+            }
+        }
 
         // Inner loop: repeated sync sessions on this connection
         loop {
@@ -839,16 +871,23 @@ pub async fn connect_loop(
     {
         let db = open_connection(db_path)?;
         create_tables(&db)?;
+        let purged = purge_expired_endpoints(&db, current_timestamp_ms()).unwrap_or(0);
+        if purged > 0 {
+            info!("Purged {} expired endpoint observations", purged);
+        }
         let pq = ProjectQueue::new(&db);
         let recovered = pq.recover_expired().unwrap_or(0);
         if recovered > 0 {
             info!("Recovered {} expired project_queue leases", recovered);
         }
         let recorded_by_str = recorded_by.to_string();
-        let drained = pq.drain(&recorded_by_str, |conn, event_id_b64| {
+        let batch_sz = drain_batch_size();
+        let drained = pq.drain_with_limit(&recorded_by_str, batch_sz, |conn, event_id_b64| {
             if let Some(eid) = event_id_from_base64(event_id_b64) {
-                let _ = project_one(conn, &recorded_by_str, &eid);
+                project_one(conn, &recorded_by_str, &eid)
+                    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
             }
+            Ok(())
         }).unwrap_or(0);
         if drained > 0 {
             info!("Processed {} pending project_queue items from previous session", drained);
@@ -881,6 +920,27 @@ pub async fn connect_loop(
             }
         };
         info!("Connected to {}", peer_id);
+
+        // Record endpoint observation and periodically purge expired ones
+        {
+            let remote_addr = connection.remote_address();
+            let now = current_timestamp_ms();
+            if let Ok(db) = open_connection(db_path) {
+                let _ = record_endpoint_observation(
+                    &db,
+                    recorded_by,
+                    &peer_id,
+                    &remote_addr.ip().to_string(),
+                    remote_addr.port(),
+                    now,
+                    ENDPOINT_TTL_MS,
+                );
+                let purged = purge_expired_endpoints(&db, now).unwrap_or(0);
+                if purged > 0 {
+                    info!("Purged {} expired endpoint observations", purged);
+                }
+            }
+        }
 
         // Inner loop: repeated sync sessions on this connection
         loop {

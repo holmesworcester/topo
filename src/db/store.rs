@@ -29,6 +29,24 @@ impl<'a> Store<'a> {
         }
     }
 
+    /// Get a blob only if its share_scope is 'shared'. Defense-in-depth gate
+    /// preventing local-only events (e.g. secret keys) from being sent to peers.
+    pub fn get_shared(&self, id: &EventId) -> SqliteResult<Option<Vec<u8>>> {
+        let id_str = event_id_to_base64(id);
+
+        let result = self.conn.query_row(
+            "SELECT blob FROM events WHERE event_id = ?1 AND share_scope = 'shared'",
+            params![id_str],
+            |row| row.get(0),
+        );
+
+        match result {
+            Ok(blob) => Ok(Some(blob)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Check if we have a blob
     #[cfg(test)]
     pub fn exists(&self, id: &EventId) -> SqliteResult<bool> {

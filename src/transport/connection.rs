@@ -5,8 +5,18 @@ use tokio::io::AsyncWriteExt;
 use crate::sync::{encode_sync_message, parse_sync_message, SyncMessage};
 use crate::sync::protocol::ParseError;
 
-/// Max recv buffer size (2 MiB) to prevent unbounded growth
-const MAX_RECV_BUFFER: usize = 2 * 1024 * 1024;
+/// Max recv buffer size to prevent unbounded growth.
+/// 2 MiB normally, 512 KiB in low_mem mode.
+fn max_recv_buffer() -> usize {
+    if low_mem_mode() { 512 * 1024 } else { 2 * 1024 * 1024 }
+}
+
+fn low_mem_mode() -> bool {
+    match std::env::var("LOW_MEM_IOS").or_else(|_| std::env::var("LOW_MEM")) {
+        Ok(v) => v != "0" && v.to_lowercase() != "false",
+        Err(_) => false,
+    }
+}
 
 /// Async stream connection abstraction for sync protocol.
 #[async_trait]
@@ -130,7 +140,7 @@ impl Connection {
                 }
             }
 
-            if self.recv_buffer.len() > MAX_RECV_BUFFER {
+            if self.recv_buffer.len() > max_recv_buffer() {
                 return Err(ConnectionError::Parse(ParseError::EventTooLarge(self.recv_buffer.len())));
             }
 
@@ -190,7 +200,7 @@ impl RecvConnection {
                 }
             }
 
-            if self.recv_buffer.len() > MAX_RECV_BUFFER {
+            if self.recv_buffer.len() > max_recv_buffer() {
                 return Err(ConnectionError::Parse(ParseError::EventTooLarge(self.recv_buffer.len())));
             }
 

@@ -185,31 +185,43 @@ Do not use as final security model:
    - certificate DER
    - private key PKCS#8 DER
    - extracted SPKI bytes (for pinning / identity lookup)
-2. Phase 0 trust source is CLI/profile supplied peer pubkeys:
+2. Current Phase 0 implementation status (transitional):
    - daemon startup config supplies allowed remote cert public keys (SPKI pins).
-   - no dependency on identity-event projection for initial mTLS allowlist.
-3. Pin peers by expected SPKI from this configured allowlist, not by socket address.
-4. Enforce pinning on both sides:
+   - local cert/key are file-backed per profile.
+3. Required end-state trust source:
+   - transport allow/deny must be derived from projected identity graph state, not CLI/file pin lists.
+   - trust inputs are not only `invite`/`invite_accepted`; they include the full identity policy graph (for example peer/user/device/admin/removal state).
+4. TODO (retrofit completed Phase 0 implementation before Phase 7 is done):
+   - remove CLI/profile SPKI allowlist as trust authority.
+   - keep CLI pin input only as optional diagnostics/bootstrap import helper.
+   - keep file cert/key only as optional cache/materialization artifact, not authority.
+5. Pin peers by expected SPKI from active projected trust state, not by socket address.
+6. Enforce pinning on both sides:
    - server verifies client cert SPKI against pinned store
    - client verifies server cert SPKI against pinned store
-5. No production fallback to `SkipServerVerification`.
-6. Use long-lived cert keys for peer authentication in transport:
+7. No production fallback to `SkipServerVerification`.
+8. Use long-lived cert keys for peer authentication in transport:
    - QUIC uses TLS 1.3 handshake key agreement, so session keys still get forward secrecy.
-7. Connection identity mapping for metadata/projection context:
+9. Connection identity mapping for metadata/projection context:
    - `recorded_by` = local identity bound to the local cert/private key used for this daemon/profile.
    - `via_peer_id` = remote identity resolved from authenticated remote cert SPKI mapping.
-8. Scope for this phase: invited-member allowlist only.
+10. Scope for this phase: invited-member allowlist only.
    - do not implement removal/disconnection policy yet.
-9. Identity-phase migration rule:
-   - once Phase 7 identity model lands, replace/augment CLI allowlist with projected mapping from identity events (`peer_id -> cert SPKI`).
+11. Identity-phase migration rule:
+   - once Phase 7 identity model lands, transport policy runs from projected identity events (`peer_id -> cert SPKI`) and related projected policy rows.
+12. TLS key material modeling rule (end-state):
+   - local TLS cert/public/private key material is represented by local events with normal dependency ordering.
+   - runtime may materialize active TLS objects from projected event state.
+   - persisted files are optional cache, not policy authority.
 
 ## 4.3 Implementation checklist (assistant-safe)
 
 1. Port cert helper types/functions from mtls branch (`SelfSignedCert`, base64 SPKI helpers).
-2. Add `PeerKeyStore` trait + concrete store (static/in-memory first; profile-backed later):
-   - Phase 0 source: CLI/profile allowlist of permitted SPKI pins.
-   - identity phase source: projected mapping `peer_id -> expected SPKI`.
+2. Add `PeerKeyStore` trait + concrete store:
+   - transitional source: CLI/profile allowlist of permitted SPKI pins (completed Phase 0 behavior).
+   - required source: projected identity mapping (`peer_id -> expected SPKI`) and related projected policy state.
    - reverse lookup by `SPKI -> peer_id` once identity mapping exists.
+   - TODO (retrofit completed Phase 0 behavior): switch verifier default from transitional source to projected source.
 3. Add `PinnedCertVerifier` implementing:
    - `rustls::client::danger::ServerCertVerifier`
    - `rustls::verify::ClientCertVerifier` (or `rustls::server::danger::ClientCertVerifier` depending on rustls version in branch)
@@ -225,7 +237,10 @@ Do not use as final security model:
 7. Plumb authenticated connection identity into sync session context:
    - local `recorded_by` from local cert profile identity.
    - remote `via_peer_id` from verified remote cert SPKI lookup (or pre-identity stable key id derived from SPKI).
-8. Reject connections where verified cert SPKI is not in the active allowlist source (CLI/profile list now, identity-projected mapping later).
+8. Reject connections where verified cert SPKI is not in the active allowlist source (projected source in end-state; transitional source only until retrofit is complete).
+9. Add local TLS credential materialization path from projected local key events.
+   - if file serialization exists, treat it as cache of projected state.
+   - reject startup when cache conflicts with projected key state.
 
 ## 4.4 Common mTLS mistakes to avoid
 
@@ -234,7 +249,8 @@ Do not use as final security model:
 - Do not leave optional insecure mode on by default.
 - Do not invent a second transport-only peer identifier when `peer_id` mapping already exists.
 - Do not couple event-level authorization to transport identity; transport and event signatures are complementary.
-- Do not delay Phase 0 on identity projection plumbing; use CLI/profile SPKI allowlist first.
+- Do not forget the mandatory retrofit: transitional CLI/profile SPKI allowlist must be removed as policy authority once identity projection lands.
+- Do not treat file cert/key storage as trust authority.
 
 ---
 
@@ -851,8 +867,11 @@ Start simple, then tune.
 - target steady-state RSS at or below `24 MiB` during sustained sync/projection.
 - keep memory bounded with strict in-flight caps (queue claims, decode buffers, batch sizes).
 - prefer one writer connection + minimal readers; avoid large in-memory caches/prefetch.
+- do not keep full trust/key sets in memory in low-memory mode.
+- use SQL canonical trust/key tables with indexed point lookups and a bounded hot cache only.
 - degrade throughput before violating memory ceiling (memory safety over speed).
 - validate at scale (`>= 1_000_000` canonical events on disk) with stable memory.
+- include large-identity-set validation (for example `>= 100_000` peer trust keys) while preserving memory ceiling.
 
 Recommended initial size policy:
 - `EVENT_MAX_BLOB_BYTES = 1_048_576` (1 MiB soft cap)
@@ -877,8 +896,10 @@ Before writing identity/removal/encryption projectors in Rust:
    - invalid signature rejects (not block).
 2. Build/update a TLA+ model of causal relationships and guards for this phase.
 3. Model split invite types (`user_invite`, `device_invite`) and trust-anchor semantics.
-4. Verify bootstrap/self-invite, join, device-link, and removal safety invariants.
-5. Freeze a projector-spec mapping table: each projector predicate/check maps to a named TLA guard.
+4. **Model network binding**: network events must be parameterized by network id, and the trust anchor must bind to a specific network. The model must prove that foreign network events (for networks the peer did not accept an invite for) can never become valid. Without this, the model cannot distinguish between valid and invalid network events, making it insufficiently expressive for multi-network scenarios. See `InvNetAnchor`, `InvSingleNetwork`, `InvForeignNetExcluded` invariants.
+5. **Model invite-derived trust anchor binding**: the trust anchor must bind deterministically to the network referenced by the invite, not by a free nondeterministic choice at `invite_accepted` time. The model captures which network an invite references when the first invite is recorded (`inviteNet` variable); `invite_accepted` then reads `inviteNet` to set the trust anchor. This ensures the binding mechanism is faithful to the real protocol where the invite blob carries a `network_id`. See `InvTrustAnchorMatchesInvite` invariant.
+6. Verify bootstrap/self-invite, join, device-link, and removal safety invariants.
+7. Freeze a projector-spec mapping table: each projector predicate/check maps to a named TLA guard.
 
 Projector implementations should mirror TLA conditions as directly as possible.
 
@@ -890,6 +911,7 @@ Only include identity and policy needed for:
 - device linking
 - removal enforcement
 - recipient selection for encrypted message key wraps
+- transport mTLS trust policy derived from projected identity graph state (including peer/user/device/admin/removal projections), not static CLI/file pin sources
 
 ## 11.3 Split invite event types (no mode switch)
 
@@ -926,6 +948,12 @@ Use the sender-subjective O(n) baseline from `docs/group-encryption-design-aspec
 - encrypted content event references the key event id through normal dependency fields,
 - each sender wraps to all perceived eligible members for each message (intentionally crude).
 - use the same key-wrap event type/projector path introduced in Phase 3 PSK mode.
+
+Key modeling requirements for this phase:
+- All protocol-level key material that projectors depend on must be represented as events and resolved by event-id dependencies (for example sender `secret` keys and recipient key-wrap events). Do not introduce out-of-band key stores for event-graph key dependencies.
+- This requirement also applies to transport TLS keying in end-state: cert/public-key trust mapping and local TLS private key material are event-backed state with dependency ordering.
+- Runtime file artifacts for TLS keys/certs are optional cache/materialization outputs only; they are not authoritative policy state.
+- For fanout to many recipients, produce one canonical encrypted content event and many recipient-specific key-wrap events for the same key/decrypt target; recipients that are eligible and have key material must decrypt to the same plaintext event bytes (deterministic materialization target across recipients).
 
 Not in scope yet:
 - key history availability/backfill guarantees,
@@ -1102,13 +1130,16 @@ Definition of done:
 Must implement:
 1. persistent cert identity per profile.
 2. pinned-cert verifier on both client and server.
-3. Phase 0 allowlist source is CLI/profile supplied cert SPKI pins, not socket address.
+3. Transitional allowlist source in completed Phase 0 is CLI/profile supplied cert SPKI pins, not socket address.
 4. session context binds:
    - local `recorded_by` from local cert profile identity.
    - remote `via_peer_id` from verified cert SPKI mapping (identity-backed once Phase 7 lands).
 5. unit/integration tests for allowed and denied peers.
 6. migration note implemented:
    - Phase 7 switches allowlist source to projected identity events (`peer_id -> cert SPKI`).
+7. TODO (mandatory retrofit before final Phase 7 sign-off):
+   - remove CLI/file pin authority and run transport trust solely from projected identity graph state.
+   - represent local TLS cert/private key material as event-backed state; file artifacts remain cache only.
 
 Common mistakes:
 - using generated ephemeral cert each restart in daemon mode.
@@ -1236,6 +1267,8 @@ Must implement:
 3. endpoint observation TTL purging.
 4. `low_mem_ios` mode with explicit knobs (SQLite cache, channel/batch limits, worker concurrency caps).
 5. long-run memory test at million-event scale showing `<= 24 MiB` steady-state RSS target in low-memory mode.
+6. low-memory trust lookup path that avoids full in-memory keyset loading (SQL indexed lookup + bounded hot cache).
+7. large-identity-set memory test (for example `>= 100_000` peer trust keys) within low-memory ceiling.
 
 Common mistakes:
 - premature micro-optimizations before invariant/test stability.
@@ -1254,6 +1287,8 @@ Must implement:
 4. sender-subjective O(n) key wrapping baseline (no key history yet).
 5. removal excludes removed peers from subsequent wraps.
 6. preserve Phase 2.5 signer pipeline (do not add identity-specific signature fast paths).
+7. transport mTLS trust source switched to projected identity graph policy (retrofit completed; no CLI/file pin authority in steady state).
+8. local TLS cert/public/private key material modeled as events and materialized from projected local event state.
 
 Common mistakes:
 - implementing projector rules before guard/model freeze.
