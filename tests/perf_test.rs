@@ -1,6 +1,7 @@
 //! Performance benchmarks for sync system
 //!
 //! Run with: cargo test --release --test perf_test -- --nocapture
+//! Slow tests: cargo test --release --test perf_test -- --nocapture --ignored
 
 use std::time::{Duration, Instant};
 use poc_7::testutil::{Peer, start_peers, assert_eventually, sync_until_converged};
@@ -175,6 +176,114 @@ async fn perf_continuous_10k() {
     eprintln!("  Events:       {}", events_transferred);
     eprintln!("  Events/s:     {:.0}", events_per_sec);
     eprintln!("  Throughput:   {:.2} MiB/s", throughput_mib_s);
+    eprintln!("  Peak RSS:     {:.1} MiB (before: {:.1}, after: {:.1})",
+        rss_after, rss_before, rss_after);
+    eprintln!();
+}
+
+/// 100k one-way sync.
+#[tokio::test]
+#[ignore]
+async fn perf_sync_100k() {
+    let channel = test_channel();
+    let alice = Peer::new("alice", channel);
+    let bob = Peer::new("bob", channel);
+
+    let gen_start = Instant::now();
+    alice.batch_create_messages(100_000);
+    let gen_secs = gen_start.elapsed().as_secs_f64();
+    eprintln!("Generated 100k events in {:.2}s", gen_secs);
+
+    let rss_before = peak_rss_mib();
+
+    let metrics = sync_until_converged(
+        &alice, &bob, 100_000, Duration::from_secs(600),
+    ).await;
+
+    let rss_after = peak_rss_mib();
+
+    assert_eq!(alice.store_count(), 100_000);
+    assert_eq!(bob.store_count(), 100_000);
+
+    eprintln!();
+    eprintln!("=== 100k one-way sync ===");
+    eprintln!("  Generation:   {:.2}s", gen_secs);
+    eprintln!("  Wall time:    {:.2}s", metrics.wall_secs);
+    eprintln!("  Events:       {}", metrics.events_transferred);
+    eprintln!("  Events/s:     {:.0}", metrics.events_per_sec);
+    eprintln!("  Throughput:   {:.2} MiB/s", metrics.throughput_mib_s);
+    eprintln!("  Peak RSS:     {:.1} MiB (before: {:.1}, after: {:.1})",
+        rss_after, rss_before, rss_after);
+    eprintln!();
+}
+
+/// 200k one-way sync.
+#[tokio::test]
+#[ignore]
+async fn perf_sync_200k() {
+    let channel = test_channel();
+    let alice = Peer::new("alice", channel);
+    let bob = Peer::new("bob", channel);
+
+    let gen_start = Instant::now();
+    alice.batch_create_messages(200_000);
+    let gen_secs = gen_start.elapsed().as_secs_f64();
+    eprintln!("Generated 200k events in {:.2}s", gen_secs);
+
+    let rss_before = peak_rss_mib();
+
+    let metrics = sync_until_converged(
+        &alice, &bob, 200_000, Duration::from_secs(600),
+    ).await;
+
+    let rss_after = peak_rss_mib();
+
+    assert_eq!(alice.store_count(), 200_000);
+    assert_eq!(bob.store_count(), 200_000);
+
+    eprintln!();
+    eprintln!("=== 200k one-way sync ===");
+    eprintln!("  Generation:   {:.2}s", gen_secs);
+    eprintln!("  Wall time:    {:.2}s", metrics.wall_secs);
+    eprintln!("  Events:       {}", metrics.events_transferred);
+    eprintln!("  Events/s:     {:.0}", metrics.events_per_sec);
+    eprintln!("  Throughput:   {:.2} MiB/s", metrics.throughput_mib_s);
+    eprintln!("  Peak RSS:     {:.1} MiB (before: {:.1}, after: {:.1})",
+        rss_after, rss_before, rss_after);
+    eprintln!();
+}
+
+/// 500k one-way sync.
+#[tokio::test]
+#[ignore]
+async fn perf_sync_500k() {
+    let channel = test_channel();
+    let alice = Peer::new("alice", channel);
+    let bob = Peer::new("bob", channel);
+
+    let gen_start = Instant::now();
+    alice.batch_create_messages(500_000);
+    let gen_secs = gen_start.elapsed().as_secs_f64();
+    eprintln!("Generated 500k events in {:.2}s", gen_secs);
+
+    let rss_before = peak_rss_mib();
+
+    let metrics = sync_until_converged(
+        &alice, &bob, 500_000, Duration::from_secs(1200),
+    ).await;
+
+    let rss_after = peak_rss_mib();
+
+    assert_eq!(alice.store_count(), 500_000);
+    assert_eq!(bob.store_count(), 500_000);
+
+    eprintln!();
+    eprintln!("=== 500k one-way sync ===");
+    eprintln!("  Generation:   {:.2}s", gen_secs);
+    eprintln!("  Wall time:    {:.2}s", metrics.wall_secs);
+    eprintln!("  Events:       {}", metrics.events_transferred);
+    eprintln!("  Events/s:     {:.0}", metrics.events_per_sec);
+    eprintln!("  Throughput:   {:.2} MiB/s", metrics.throughput_mib_s);
     eprintln!("  Peak RSS:     {:.1} MiB (before: {:.1}, after: {:.1})",
         rss_after, rss_before, rss_after);
     eprintln!();
