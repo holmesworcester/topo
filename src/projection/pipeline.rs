@@ -1801,6 +1801,150 @@ mod tests {
     }
 
     #[test]
+    fn test_emit_cross_tenant_records_and_projects() {
+        use crate::projection::emit::emit_deterministic_event;
+
+        let conn = setup();
+        let tenant_a = "tenant_a";
+        let tenant_b = "tenant_b";
+
+        // Create a deterministic message event
+        let msg = ParsedEvent::Message(MessageEvent {
+            created_at_ms: 1000,
+            channel_id: [1u8; 32],
+            author_id: [2u8; 32],
+            content: "deterministic".to_string(),
+        });
+
+        // Tenant A emits it
+        let eid_a = emit_deterministic_event(&conn, tenant_a, &msg).unwrap();
+        let eid_b64 = event_id_to_base64(&eid_a);
+
+        // Tenant B emits the same deterministic event
+        let eid_b = emit_deterministic_event(&conn, tenant_b, &msg).unwrap();
+        assert_eq!(eid_a, eid_b, "same deterministic event should produce same event_id");
+
+        // Global events table: 1 row
+        let event_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE event_id = ?1",
+            rusqlite::params![&eid_b64],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(event_count, 1);
+
+        // recorded_events: 2 rows (one per tenant)
+        let rec_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM recorded_events WHERE event_id = ?1",
+            rusqlite::params![&eid_b64],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(rec_count, 2);
+
+        // valid_events: 2 rows (one per tenant)
+        for tenant in [tenant_a, tenant_b] {
+            let valid: bool = conn.query_row(
+                "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![tenant, &eid_b64],
+                |row| row.get(0),
+            ).unwrap();
+            assert!(valid, "tenant {} should have valid_events entry", tenant);
+        }
+
+        // messages: 2 rows (one per tenant)
+        let msg_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE message_id = ?1",
+            rusqlite::params![&eid_b64],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(msg_count, 2, "both tenants should have projected message");
+    }
+
+    #[test]
+    fn test_emit_local_share_scope_no_neg_items() {
+        use crate::projection::emit::emit_deterministic_event;
+
+        let conn = setup();
+        let recorded_by = "peer1";
+
+        // SecretKeyEvent has ShareScope::Local
+        let sk = ParsedEvent::SecretKey(SecretKeyEvent {
+            created_at_ms: 2000,
+            key_bytes: [42u8; 32],
+        });
+
+        let eid = emit_deterministic_event(&conn, recorded_by, &sk).unwrap();
+        let eid_b64 = event_id_to_base64(&eid);
+
+        // events table should have the event
+        let event_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE event_id = ?1",
+            rusqlite::params![&eid_b64],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(event_count, 1);
+
+        // recorded_events should have the entry
+        let rec_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM recorded_events WHERE event_id = ?1 AND peer_id = ?2",
+            rusqlite::params![&eid_b64, recorded_by],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(rec_count, 1);
+
+        // neg_items should have 0 rows (ShareScope::Local)
+        let neg_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM neg_items",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(neg_count, 0, "local-scope events must not be inserted into neg_items");
+    }
+
+    #[test]
+    fn test_post_tombstone_wrong_author_deletion_rejects() {
+        let conn = setup();
+        let recorded_by = "peer1";
+
+        // Create and project a message (author_id = [2u8; 32])
+        let (_msg, msg_blob) = make_message("post-tombstone auth test");
+        let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
+        project_one(&conn, recorded_by, &msg_eid).unwrap();
+
+        // Delete with correct author → Valid
+        let (_del1, del1_blob) = make_deletion(&msg_eid, [2u8; 32]);
+        let del1_eid = insert_event_raw(&conn, recorded_by, &del1_blob);
+        let r1 = project_one(&conn, recorded_by, &del1_eid).unwrap();
+        assert_eq!(r1, ProjectionDecision::Valid);
+
+        // Second deletion with wrong author_id = [99u8; 32]
+        let del2 = ParsedEvent::MessageDeletion(MessageDeletionEvent {
+            created_at_ms: now_ms() + 1,
+            target_event_id: msg_eid,
+            author_id: [99u8; 32],
+        });
+        let del2_blob = events::encode_event(&del2).unwrap();
+        let del2_eid = insert_event_raw(&conn, recorded_by, &del2_blob);
+        let r2 = project_one(&conn, recorded_by, &del2_eid).unwrap();
+
+        // Should be Reject, NOT AlreadyProcessed or Valid
+        match r2 {
+            ProjectionDecision::Reject { reason } => {
+                assert!(reason.contains("deletion author does not match"), "reason: {}", reason);
+            }
+            other => panic!("expected Reject for wrong-author post-tombstone deletion, got {:?}", other),
+        }
+
+        // rejected_events should have an entry for the wrong-author deletion
+        let del2_b64 = event_id_to_base64(&del2_eid);
+        let rej_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM rejected_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &del2_b64],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(rej_count, 1);
+    }
+
+    #[test]
     fn test_rejected_events_recorded_for_invalid_sig() {
         let conn = setup();
         let recorded_by = "peer1";
