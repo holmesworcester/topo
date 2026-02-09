@@ -346,6 +346,13 @@ static MIGRATIONS: &[Migration] = &[
             CREATE INDEX IF NOT EXISTS idx_file_slices_event ON file_slices(recorded_by, event_id);
         ",
     },
+    Migration {
+        version: 14,
+        name: "add_signer_event_id_to_message_attachments",
+        sql: "
+            ALTER TABLE message_attachments ADD COLUMN signer_event_id TEXT NOT NULL DEFAULT '';
+        ",
+    },
 ];
 
 fn ensure_schema_migrations(conn: &Connection) -> SqliteResult<()> {
@@ -465,6 +472,6 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 13);
+        assert_eq!(count, 14);
     }
 }

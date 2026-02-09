@@ -7,13 +7,28 @@ pub struct MessageEvent {
     pub channel_id: [u8; 32],
     pub author_id: [u8; 32],
     pub content: String,
+    pub signed_by: [u8; 32],
+    pub signer_type: u8,
+    pub signature: [u8; 64],
 }
 
+/// Wire format (min 172 bytes, signed):
+/// [0]            type=1
+/// [1..9]         created_at_ms (u64 LE)
+/// [9..41]        channel_id (32 bytes)
+/// [41..73]       author_id (32 bytes)
+/// [73..75]       content_len (u16 LE)
+/// [75..75+N]     content (UTF-8)
+/// --- signature trailer (97 bytes) ---
+/// [75+N..75+N+32]  signed_by (32 bytes)
+/// [75+N+32]        signer_type (1 byte)
+/// [75+N+33..75+N+97] signature (64 bytes)
 pub fn parse_message(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    // Minimum: event_type(1) + created_at_ms(8) + channel_id(32) + author_id(32) + content_len(2) = 75
-    if blob.len() < 75 {
+    // Minimum: type(1) + created_at_ms(8) + channel_id(32) + author_id(32) + content_len(2)
+    //        + signed_by(32) + signer_type(1) + signature(64) = 172
+    if blob.len() < 172 {
         return Err(EventError::TooShort {
-            expected: 75,
+            expected: 172,
             actual: blob.len(),
         });
     }
@@ -33,20 +48,33 @@ pub fn parse_message(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     author_id.copy_from_slice(&blob[41..73]);
 
     let content_len = u16::from_le_bytes(blob[73..75].try_into().unwrap()) as usize;
-    if blob.len() < 75 + content_len {
+    let expected_len = 75 + content_len + 97; // 97 = signed_by(32) + signer_type(1) + signature(64)
+    if blob.len() < expected_len {
         return Err(EventError::TooShort {
-            expected: 75 + content_len,
+            expected: expected_len,
             actual: blob.len(),
         });
     }
 
     let content = String::from_utf8_lossy(&blob[75..75 + content_len]).to_string();
 
+    let trailer_start = 75 + content_len;
+    let mut signed_by = [0u8; 32];
+    signed_by.copy_from_slice(&blob[trailer_start..trailer_start + 32]);
+
+    let signer_type = blob[trailer_start + 32];
+
+    let mut signature = [0u8; 64];
+    signature.copy_from_slice(&blob[trailer_start + 33..trailer_start + 97]);
+
     Ok(ParsedEvent::Message(MessageEvent {
         created_at_ms,
         channel_id,
         author_id,
         content,
+        signed_by,
+        signer_type,
+        signature,
     }))
 }
 
@@ -61,7 +89,7 @@ pub fn encode_message(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         return Err(EventError::ContentTooLong(content_bytes.len()));
     }
 
-    let total = 75 + content_bytes.len();
+    let total = 75 + content_bytes.len() + 97;
     let mut buf = Vec::with_capacity(total);
 
     buf.push(EVENT_TYPE_MESSAGE);
@@ -70,6 +98,9 @@ pub fn encode_message(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     buf.extend_from_slice(&msg.author_id);
     buf.extend_from_slice(&(content_bytes.len() as u16).to_le_bytes());
     buf.extend_from_slice(content_bytes);
+    buf.extend_from_slice(&msg.signed_by);
+    buf.push(msg.signer_type);
+    buf.extend_from_slice(&msg.signature);
 
     Ok(buf)
 }
@@ -79,9 +110,9 @@ pub static MESSAGE_META: EventTypeMeta = EventTypeMeta {
     type_name: "message",
     projection_table: "messages",
     share_scope: ShareScope::Shared,
-    dep_fields: &[],
-    signer_required: false,
-    signature_byte_len: 0,
+    dep_fields: &["signed_by"],
+    signer_required: true,
+    signature_byte_len: 64,
     parse: parse_message,
     encode: encode_message,
 };

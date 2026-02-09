@@ -78,6 +78,8 @@ Channel == "channel"
 Message == "message"
 MessageReaction == "message_reaction"
 MessageDeletion == "message_deletion"
+MessageAttachment == "message_attachment"
+FileSlice == "file_slice"
 
 \* Sender-subjective encryption
 SecretKey == "secret_key"
@@ -108,6 +110,7 @@ FullEventTypes == {
     AdminBoot, AdminOngoing,
     Peer,
     Channel, Message, MessageReaction, MessageDeletion,
+    MessageAttachment, FileSlice,
     SecretKey, SecretShared, Encrypted,
     UserRemoved, PeerRemoved
 }
@@ -143,7 +146,7 @@ IdentityEvents == {
     UserRemoved, PeerRemoved
 } \cup AllNetEvents
 
-ContentEvents == {Channel, Message, MessageReaction, MessageDeletion}
+ContentEvents == {Channel, Message, MessageReaction, MessageDeletion, MessageAttachment, FileSlice}
 EncryptionEvents == {SecretKey, SecretShared, Encrypted}
 
 ASSUME (ActiveEvents \ {Net}) \subseteq FullEventTypes
@@ -187,6 +190,8 @@ RawDeps(e) ==
        [] e = Message -> {Channel, UserOngoing}
        [] e = MessageReaction -> {Message}
        [] e = MessageDeletion -> {Message}
+       [] e = MessageAttachment -> {Message, SecretKey}
+       [] e = FileSlice -> {}
 
        \* Encryption: secret_key is local; secret_shared depends on key + recipient peer;
        \* encrypted depends on secret_key
@@ -229,6 +234,8 @@ SignerDep(e) ==
        [] e = Message -> {PeerSharedOngoing}
        [] e = MessageReaction -> {PeerSharedOngoing}
        [] e = MessageDeletion -> {PeerSharedOngoing}
+       [] e = MessageAttachment -> {PeerSharedOngoing}
+       [] e = FileSlice -> {PeerSharedOngoing}
 
        \* Encryption: secret_shared signed by sender peer
        [] e = SecretShared -> {PeerSharedOngoing}
@@ -443,6 +450,15 @@ InvEncryptedKey ==
 InvSecretSharedKey ==
     IF SecretShared \in EVENTS /\ SecretKey \in EVENTS
     THEN \A p \in Peers: (SecretShared \in valid[p]) => (SecretKey \in valid[p])
+    ELSE TRUE
+
+\* File slice authorization: if both FileSlice and MessageAttachment are valid,
+\* they must share the same signer (modeled abstractly: both require PeerSharedOngoing).
+InvFileSliceAuth ==
+    IF FileSlice \in EVENTS /\ MessageAttachment \in EVENTS
+    THEN \A p \in Peers:
+        (FileSlice \in valid[p] /\ MessageAttachment \in valid[p])
+            => (PeerSharedOngoing \in valid[p] \/ PeerSharedFirst \in valid[p])
     ELSE TRUE
 
 ====

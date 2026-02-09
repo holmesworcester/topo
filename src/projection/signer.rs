@@ -28,7 +28,7 @@ pub fn resolve_signer_key(
 ) -> Result<SignerResolution, Box<dyn std::error::Error>> {
     // Valid type codes for each signer_type
     let valid_type_codes: &[u8] = match signer_type {
-        0 => &[3],          // PeerKey
+        0 => &[3],          // PeerKey (DEPRECATED — retained for parsing old events; new events use signer_type 5)
         1 => &[8],          // Workspace
         2 => &[10, 11],     // UserInviteBoot, UserInviteOngoing
         3 => &[12, 13],     // DeviceInviteFirst, DeviceInviteOngoing
@@ -211,6 +211,9 @@ mod tests {
             channel_id: [1u8; 32],
             author_id: [2u8; 32],
             content: "not a key".to_string(),
+            signed_by: [0u8; 32],
+            signer_type: 5,
+            signature: [0u8; 64],
         });
         let blob = encode_event(&msg).unwrap();
         let event_id = insert_event_blob(&conn, recorded_by, &blob);

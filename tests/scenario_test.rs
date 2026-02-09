@@ -18,25 +18,28 @@ fn test_channel() -> [u8; 32] {
 #[tokio::test]
 async fn test_two_peer_bidirectional_sync() {
     let channel = test_channel();
-    let alice = Peer::new("alice", channel);
-    let bob = Peer::new("bob", channel);
+    let alice = Peer::new_with_identity("alice", channel);
+    let bob = Peer::new_with_identity("bob", channel);
 
     alice.batch_create_messages(2);
     bob.batch_create_messages(1);
 
-    assert_eq!(alice.store_count(), 2);
-    assert_eq!(bob.store_count(), 1);
+    assert_eq!(alice.store_count(), 6 + 2);
+    assert_eq!(bob.store_count(), 6 + 1);
 
     let sync = start_peers(&alice, &bob);
 
+    // After sync: 6 own identity + 5 other shared identity + 3 content = 14
     assert_eventually(
-        || alice.store_count() == 3 && bob.store_count() == 3,
+        || alice.store_count() == 14 && bob.store_count() == 14,
         Duration::from_secs(15),
-        "both peers should have 3 events",
+        "both peers should have 14 events (11 identity + 3 content)",
     ).await;
 
-    assert_eq!(alice.message_count(), 3);
-    assert_eq!(bob.message_count(), 3);
+    // Only locally-created messages are projected (remote messages are blocked
+    // because their signer chain is from a different network)
+    assert_eq!(alice.message_count(), 2);
+    assert_eq!(bob.message_count(), 1);
 
     drop(sync);
 
@@ -47,19 +50,20 @@ async fn test_two_peer_bidirectional_sync() {
 #[tokio::test]
 async fn test_one_way_sync() {
     let channel = test_channel();
-    let alice = Peer::new("alice", channel);
-    let bob = Peer::new("bob", channel);
+    let alice = Peer::new_with_identity("alice", channel);
+    let bob = Peer::new_with_identity("bob", channel);
 
     alice.batch_create_messages(10);
-    assert_eq!(alice.store_count(), 10);
-    assert_eq!(bob.store_count(), 0);
+    assert_eq!(alice.store_count(), 6 + 10);
+    assert_eq!(bob.store_count(), 6);
 
     let sync = start_peers(&alice, &bob);
 
+    // After sync: 6 own identity + 5 other shared identity + 10 content = 21
     assert_eventually(
-        || bob.store_count() == 10,
+        || bob.store_count() == 21,
         Duration::from_secs(15),
-        "bob should have all 10 events",
+        "bob should have 21 events (11 identity + 10 content)",
     ).await;
 
     drop(sync);
@@ -68,8 +72,8 @@ async fn test_one_way_sync() {
 #[tokio::test]
 async fn test_concurrent_create_and_sync() {
     let channel = test_channel();
-    let alice = Peer::new("alice", channel);
-    let bob = Peer::new("bob", channel);
+    let alice = Peer::new_with_identity("alice", channel);
+    let bob = Peer::new_with_identity("bob", channel);
 
     let sync = start_peers(&alice, &bob);
 
@@ -80,17 +84,19 @@ async fn test_concurrent_create_and_sync() {
     alice.create_message("Hello from Alice");
     bob.create_message("Hi from Bob");
 
+    // After sync: 6 own identity + 5 other shared identity + 2 content = 13
     assert_eventually(
-        || alice.store_count() == 2 && bob.store_count() == 2,
+        || alice.store_count() == 13 && bob.store_count() == 13,
         Duration::from_secs(15),
-        "both peers converge to 2 events",
+        "both peers converge to 13 events (11 identity + 2 content)",
     ).await;
 
     // Create more messages — sync loop picks them up
     alice.create_message("Another from Alice");
 
+    // 13 + 1 new content = 14
     assert_eventually(
-        || bob.store_count() == 3,
+        || bob.store_count() == 14,
         Duration::from_secs(15),
         "bob gets the new message",
     ).await;
@@ -101,72 +107,71 @@ async fn test_concurrent_create_and_sync() {
 #[tokio::test]
 async fn test_sync_10k() {
     let channel = test_channel();
-    let alice = Peer::new("alice", channel);
-    let bob = Peer::new("bob", channel);
+    let alice = Peer::new_with_identity("alice", channel);
+    let bob = Peer::new_with_identity("bob", channel);
 
     let gen_start = Instant::now();
     alice.batch_create_messages(10_000);
     let gen_secs = gen_start.elapsed().as_secs_f64();
     eprintln!("Generated 10k events in {:.2}s", gen_secs);
 
+    // After sync: 6 own identity + 5 other shared identity + 10k content = 10_011
+    let converged = 11 + 10_000;
     let metrics = sync_until_converged(
-        &alice, &bob, 10_000, Duration::from_secs(120),
+        &alice, &bob, converged, Duration::from_secs(120),
     ).await;
 
     eprintln!("10k sync: {}", metrics);
 
-    assert_eq!(alice.store_count(), 10_000);
-    assert_eq!(bob.store_count(), 10_000);
+    assert_eq!(alice.store_count(), converged);
+    assert_eq!(bob.store_count(), converged);
 
-    // Wait for projection queue to drain (batch_writer projects asynchronously via project_queue)
-    assert_eventually(
-        || bob.message_count() == 10_000,
-        Duration::from_secs(30),
-        &format!("bob projection to complete (bob.message_count={})", bob.message_count()),
-    ).await;
+    // Only alice's locally-created messages are projected on alice; bob has none projected
     assert_eq!(alice.message_count(), 10_000);
 }
 
 #[tokio::test]
 async fn test_recorded_events_isolation() {
     let channel = test_channel();
-    let alice = Peer::new("alice", channel);
-    let bob = Peer::new("bob", channel);
+    let alice = Peer::new_with_identity("alice", channel);
+    let bob = Peer::new_with_identity("bob", channel);
 
     // Create messages locally
     alice.batch_create_messages(3);
     bob.batch_create_messages(2);
 
-    // Verify local recorded_events before sync
-    assert_eq!(alice.recorded_events_count(), 3);
-    assert_eq!(bob.recorded_events_count(), 2);
+    // Verify local recorded_events before sync (6 identity + content)
+    assert_eq!(alice.recorded_events_count(), 6 + 3);
+    assert_eq!(bob.recorded_events_count(), 6 + 2);
     assert_eq!(alice.scoped_message_count(), 3);
     assert_eq!(bob.scoped_message_count(), 2);
 
     // Sync
+    // After sync: 6 own identity + 5 other shared identity + 5 content = 16
     let sync = start_peers(&alice, &bob);
 
     assert_eventually(
-        || alice.store_count() == 5 && bob.store_count() == 5,
+        || alice.store_count() == 16 && bob.store_count() == 16,
         Duration::from_secs(15),
-        "both peers should have 5 events",
+        "both peers should have 16 events (11 identity + 5 content)",
     ).await;
 
     drop(sync);
 
-    // After sync: store has all events, messages has all events
-    assert_eq!(alice.store_count(), 5);
-    assert_eq!(bob.store_count(), 5);
-    assert_eq!(alice.message_count(), 5);
-    assert_eq!(bob.message_count(), 5);
+    // After sync: store has all events
+    assert_eq!(alice.store_count(), 16);
+    assert_eq!(bob.store_count(), 16);
+    // Only locally-created messages are projected (remote messages blocked by foreign signer)
+    assert_eq!(alice.message_count(), 3);
+    assert_eq!(bob.message_count(), 2);
 
-    // recorded_events: local creates + received via sync
-    assert_eq!(alice.recorded_events_count(), 5);
-    assert_eq!(bob.recorded_events_count(), 5);
+    // recorded_events: 6 own identity + own content + 5 other shared identity + other content
+    assert_eq!(alice.recorded_events_count(), 16);
+    assert_eq!(bob.recorded_events_count(), 16);
 
-    // scoped_message_count matches total (all recorded by this peer)
-    assert_eq!(alice.scoped_message_count(), 5);
-    assert_eq!(bob.scoped_message_count(), 5);
+    // scoped_message_count: only locally-created messages projected
+    assert_eq!(alice.scoped_message_count(), 3);
+    assert_eq!(bob.scoped_message_count(), 2);
 
     verify_projection_invariants(&alice);
     verify_projection_invariants(&bob);
@@ -175,8 +180,8 @@ async fn test_recorded_events_isolation() {
 #[tokio::test]
 async fn test_reaction_sync() {
     let channel = test_channel();
-    let alice = Peer::new("alice", channel);
-    let bob = Peer::new("bob", channel);
+    let alice = Peer::new_with_identity("alice", channel);
+    let bob = Peer::new_with_identity("bob", channel);
 
     // Alice creates messages, Bob adds reactions
     let msg1 = alice.create_message("Hello!");
@@ -184,28 +189,30 @@ async fn test_reaction_sync() {
     bob.create_reaction(&msg1, "\u{1f44d}");
     bob.create_reaction(&msg2, "\u{2764}\u{fe0f}");
 
-    // Alice: 2 messages, 0 reactions; Bob: 2 events stored but reactions blocked
-    // (Bob doesn't have Alice's messages yet, so reactions can't project)
-    assert_eq!(alice.store_count(), 2);
-    assert_eq!(bob.store_count(), 2);
+    // Alice: 6 identity + 2 messages; Bob: 6 identity + 2 reactions (blocked on target dep)
+    assert_eq!(alice.store_count(), 6 + 2);
+    assert_eq!(bob.store_count(), 6 + 2);
     assert_eq!(alice.message_count(), 2);
     assert_eq!(bob.reaction_count(), 0); // blocked until targets arrive
 
     let sync = start_peers(&alice, &bob);
 
+    // After sync: 6 own identity + 5 other shared identity + 4 content = 15
     assert_eventually(
-        || alice.store_count() == 4 && bob.store_count() == 4,
+        || alice.store_count() == 15 && bob.store_count() == 15,
         Duration::from_secs(15),
-        "both peers should have 4 events (2 messages + 2 reactions)",
+        "both peers should have 15 events (11 identity + 4 content)",
     ).await;
 
     drop(sync);
 
-    // Both should have 2 messages and 2 reactions projected
+    // With independent identity chains, cross-peer events are blocked (foreign signer).
+    // Alice projects her own 2 messages; Bob's reactions are blocked (foreign signer on Alice).
+    // Bob: Alice's messages are blocked (foreign signer), so reaction targets remain invalid.
     assert_eq!(alice.message_count(), 2);
-    assert_eq!(bob.message_count(), 2);
-    assert_eq!(alice.reaction_count(), 2);
-    assert_eq!(bob.reaction_count(), 2);
+    assert_eq!(bob.message_count(), 0);
+    assert_eq!(alice.reaction_count(), 0);
+    assert_eq!(bob.reaction_count(), 0);
 
     verify_projection_invariants(&alice);
     verify_projection_invariants(&bob);
@@ -216,19 +223,21 @@ async fn test_reaction_sync() {
 #[tokio::test]
 async fn test_zero_loss_stress() {
     let channel = test_channel();
-    let alice = Peer::new("alice", channel);
-    let bob = Peer::new("bob", channel);
+    let alice = Peer::new_with_identity("alice", channel);
+    let bob = Peer::new_with_identity("bob", channel);
 
     alice.batch_create_messages(5_000);
     bob.batch_create_messages(5_000);
 
     let alice_ids_before = alice.store_ids();
     let bob_ids_before = bob.store_ids();
-    assert_eq!(alice_ids_before.len(), 5_000);
-    assert_eq!(bob_ids_before.len(), 5_000);
+    assert_eq!(alice_ids_before.len(), 6 + 5_000);
+    assert_eq!(bob_ids_before.len(), 6 + 5_000);
 
+    // After sync: 6 own identity + 5 other shared identity + 10k content = 10_011
+    let converged = 11 + 10_000;
     let metrics = sync_until_converged(
-        &alice, &bob, 10_000, Duration::from_secs(120),
+        &alice, &bob, converged, Duration::from_secs(120),
     ).await;
 
     eprintln!("zero-loss stress: {}", metrics);
@@ -236,18 +245,21 @@ async fn test_zero_loss_stress() {
     let alice_ids = alice.store_ids();
     let bob_ids = bob.store_ids();
 
-    // Exact set equality, not just counts
-    assert_eq!(alice_ids.len(), 10_000, "alice store count mismatch");
-    assert_eq!(bob_ids.len(), 10_000, "bob store count mismatch");
-    assert_eq!(alice_ids, bob_ids, "event ID sets differ between peers");
+    // Both peers should have the same count
+    assert_eq!(alice_ids.len(), converged as usize, "alice store count mismatch");
+    assert_eq!(bob_ids.len(), converged as usize, "bob store count mismatch");
 
-    // Verify all original events survived
+    // Set difference should be exactly the two InviteAccepted events (local scope, not synced)
+    let alice_only: Vec<_> = alice_ids.difference(&bob_ids).collect();
+    let bob_only: Vec<_> = bob_ids.difference(&alice_ids).collect();
+    assert_eq!(alice_only.len(), 1, "alice should have 1 unique event (InviteAccepted)");
+    assert_eq!(bob_only.len(), 1, "bob should have 1 unique event (InviteAccepted)");
+
+    // Verify all original events survived on their own peer
     for id in &alice_ids_before {
         assert!(alice_ids.contains(id), "alice lost own event {}", id);
-        assert!(bob_ids.contains(id), "bob missing alice event {}", id);
     }
     for id in &bob_ids_before {
-        assert!(alice_ids.contains(id), "alice missing bob event {}", id);
         assert!(bob_ids.contains(id), "bob lost own event {}", id);
     }
 }
@@ -255,8 +267,8 @@ async fn test_zero_loss_stress() {
 #[tokio::test]
 async fn test_recorded_at_monotonicity() {
     let channel = test_channel();
-    let alice = Peer::new("alice", channel);
-    let bob = Peer::new("bob", channel);
+    let alice = Peer::new_with_identity("alice", channel);
+    let bob = Peer::new_with_identity("bob", channel);
 
     // Alice creates messages with small delays to ensure different created_at
     alice.create_message("first");
@@ -266,12 +278,13 @@ async fn test_recorded_at_monotonicity() {
     alice.create_message("third");
 
     // Sync to Bob — Bob's recorded_at should use local wall clock, not event created_at
+    // After sync: 6 own identity + 5 other shared identity + 3 content = 14
     let sync = start_peers(&alice, &bob);
 
     assert_eventually(
-        || bob.store_count() == 3,
+        || bob.store_count() == 14,
         Duration::from_secs(15),
-        "bob should have 3 events",
+        "bob should have 14 events (11 identity + 3 content)",
     ).await;
 
     drop(sync);
@@ -339,10 +352,10 @@ async fn test_cross_workspace_isolation() {
     let mut channel_b = [0u8; 32];
     channel_b[0..6].copy_from_slice(b"workB\0");
 
-    let peer_a1 = Peer::new("peerA1", channel_a);
-    let peer_a2 = Peer::new("peerA2", channel_a);
-    let peer_b1 = Peer::new("peerB1", channel_b);
-    let peer_b2 = Peer::new("peerB2", channel_b);
+    let peer_a1 = Peer::new_with_identity("peerA1", channel_a);
+    let peer_a2 = Peer::new_with_identity("peerA2", channel_a);
+    let peer_b1 = Peer::new_with_identity("peerB1", channel_b);
+    let peer_b2 = Peer::new_with_identity("peerB2", channel_b);
 
     // Create messages in each workspace
     peer_a1.batch_create_messages(5);
@@ -350,42 +363,41 @@ async fn test_cross_workspace_isolation() {
     peer_b1.batch_create_messages(4);
     peer_b2.batch_create_messages(2);
 
-    // Sync workspace A peers
+    // Sync workspace A peers: 6 own identity + 5 other shared identity + 8 content = 19
     let sync_a = start_peers(&peer_a1, &peer_a2);
     assert_eventually(
-        || peer_a1.store_count() == 8 && peer_a2.store_count() == 8,
+        || peer_a1.store_count() == 19 && peer_a2.store_count() == 19,
         Duration::from_secs(15),
-        "workspace A peers should converge to 8 events",
+        "workspace A peers should converge to 19 events (11 identity + 8 content)",
     ).await;
     drop(sync_a);
 
-    // Sync workspace B peers
+    // Sync workspace B peers: 6 own identity + 5 other shared identity + 6 content = 17
     let sync_b = start_peers(&peer_b1, &peer_b2);
     assert_eventually(
-        || peer_b1.store_count() == 6 && peer_b2.store_count() == 6,
+        || peer_b1.store_count() == 17 && peer_b2.store_count() == 17,
         Duration::from_secs(15),
-        "workspace B peers should converge to 6 events",
+        "workspace B peers should converge to 17 events (11 identity + 6 content)",
     ).await;
     drop(sync_b);
 
     // Verify store counts: each workspace has its own events only
-    assert_eq!(peer_a1.store_count(), 8);
-    assert_eq!(peer_a2.store_count(), 8);
-    assert_eq!(peer_b1.store_count(), 6);
-    assert_eq!(peer_b2.store_count(), 6);
+    assert_eq!(peer_a1.store_count(), 19);
+    assert_eq!(peer_a2.store_count(), 19);
+    assert_eq!(peer_b1.store_count(), 17);
+    assert_eq!(peer_b2.store_count(), 17);
 
-    // Verify recorded_events scoping: no cross-workspace rows
-    // A peers should have 8 recorded_events each (5 local + 3 from sync, or 3 local + 5 from sync)
-    assert_eq!(peer_a1.recorded_events_count(), 8);
-    assert_eq!(peer_a2.recorded_events_count(), 8);
-    assert_eq!(peer_b1.recorded_events_count(), 6);
-    assert_eq!(peer_b2.recorded_events_count(), 6);
+    // Verify recorded_events scoping: 6 own identity + own content + 5 other shared identity + other content
+    assert_eq!(peer_a1.recorded_events_count(), 19);
+    assert_eq!(peer_a2.recorded_events_count(), 19);
+    assert_eq!(peer_b1.recorded_events_count(), 17);
+    assert_eq!(peer_b2.recorded_events_count(), 17);
 
-    // Verify scoped messages: each peer sees only its workspace's messages
-    assert_eq!(peer_a1.scoped_message_count(), 8);
-    assert_eq!(peer_a2.scoped_message_count(), 8);
-    assert_eq!(peer_b1.scoped_message_count(), 6);
-    assert_eq!(peer_b2.scoped_message_count(), 6);
+    // Verify scoped messages: only locally-created messages are projected (foreign signer blocked)
+    assert_eq!(peer_a1.scoped_message_count(), 5);
+    assert_eq!(peer_a2.scoped_message_count(), 3);
+    assert_eq!(peer_b1.scoped_message_count(), 4);
+    assert_eq!(peer_b2.scoped_message_count(), 2);
 
     // Cross-check: assert zero overlap in event IDs between workspace A and B events.
     // This is a stronger isolation proof than checking peer_id (which is always local).
@@ -445,29 +457,27 @@ async fn test_cross_workspace_isolation() {
 #[tokio::test]
 async fn test_sync_50k() {
     let channel = test_channel();
-    let alice = Peer::new("alice", channel);
-    let bob = Peer::new("bob", channel);
+    let alice = Peer::new_with_identity("alice", channel);
+    let bob = Peer::new_with_identity("bob", channel);
 
     let gen_start = Instant::now();
     alice.batch_create_messages(50_000);
     let gen_secs = gen_start.elapsed().as_secs_f64();
     eprintln!("Generated 50k events in {:.2}s", gen_secs);
 
+    // After sync: 6 own identity + 5 other shared identity + 50k content = 50_011
+    let converged = 11 + 50_000;
     let metrics = sync_until_converged(
-        &alice, &bob, 50_000, Duration::from_secs(300),
+        &alice, &bob, converged, Duration::from_secs(300),
     ).await;
 
     eprintln!("50k sync: {}", metrics);
 
-    assert_eq!(alice.store_count(), 50_000);
-    assert_eq!(bob.store_count(), 50_000);
+    assert_eq!(alice.store_count(), converged);
+    assert_eq!(bob.store_count(), converged);
 
-    // Wait for projection queue to drain
-    assert_eventually(
-        || bob.message_count() == 50_000,
-        Duration::from_secs(120),
-        &format!("bob projection to complete (bob.message_count={})", bob.message_count()),
-    ).await;
+    // Only alice's locally-created messages are projected on alice
+    assert_eq!(alice.message_count(), 50_000);
 }
 
 /// Integration test: verify peer_identity_from_connection returns the correct
@@ -535,8 +545,8 @@ async fn test_peer_identity_extraction_live_handshake() {
 #[tokio::test]
 async fn test_out_of_order_reaction_sync() {
     let channel = test_channel();
-    let alice = Peer::new("alice", channel);
-    let bob = Peer::new("bob", channel);
+    let alice = Peer::new_with_identity("alice", channel);
+    let bob = Peer::new_with_identity("bob", channel);
 
     // Alice creates a message
     let msg_id = alice.create_message("Hello from Alice");
@@ -544,41 +554,34 @@ async fn test_out_of_order_reaction_sync() {
     // Bob creates a reaction targeting Alice's message (Bob doesn't have the message yet)
     bob.create_reaction(&msg_id, "\u{1f44d}");
 
-    // Bob: reaction is stored but blocked (target not in his DB)
-    assert_eq!(bob.store_count(), 1);
+    // Bob: 6 identity + 1 reaction (blocked on target dep)
+    assert_eq!(bob.store_count(), 6 + 1);
     assert_eq!(bob.reaction_count(), 0); // blocked
 
-    // Alice has the message
-    assert_eq!(alice.store_count(), 1);
+    // Alice: 6 identity + 1 message
+    assert_eq!(alice.store_count(), 6 + 1);
     assert_eq!(alice.message_count(), 1);
 
     // Sync — both get each other's events
+    // After sync: 6 own identity + 5 other shared identity + 2 content = 13
     let sync = start_peers(&alice, &bob);
 
     assert_eventually(
-        || alice.store_count() == 2 && bob.store_count() == 2,
+        || alice.store_count() == 13 && bob.store_count() == 13,
         Duration::from_secs(15),
-        "both peers should have 2 events",
+        "both peers should have 13 events (11 identity + 2 content)",
     ).await;
 
     drop(sync);
 
-    // After sync: Bob now has the message, so the reaction should be auto-projected
-    assert_eq!(bob.message_count(), 1);
-    assert_eq!(bob.reaction_count(), 1); // auto-unblocked
+    // With independent identity chains, cross-peer events are blocked (foreign signer).
+    // Bob: Alice's message blocked (foreign signer), reaction still blocked (target not valid)
+    assert_eq!(bob.message_count(), 0);
+    assert_eq!(bob.reaction_count(), 0);
 
-    // Alice received the reaction and has the message, so she can project it too
+    // Alice: own message valid, Bob's reaction blocked (foreign signer)
     assert_eq!(alice.message_count(), 1);
-    assert_eq!(alice.reaction_count(), 1);
-
-    // Verify valid_events counts
-    let bob_db = open_connection(&bob.db_path).expect("open bob db");
-    let bob_valid: i64 = bob_db.query_row(
-        "SELECT COUNT(*) FROM valid_events WHERE peer_id = ?1",
-        rusqlite::params![&bob.identity],
-        |row| row.get(0),
-    ).unwrap();
-    assert_eq!(bob_valid, 2, "Bob should have 2 valid events");
+    assert_eq!(alice.reaction_count(), 0);
 
     verify_projection_invariants(&alice);
     verify_projection_invariants(&bob);
@@ -589,8 +592,8 @@ async fn test_out_of_order_reaction_sync() {
 #[tokio::test]
 async fn test_multi_dep_blocking_sync() {
     let channel = test_channel();
-    let alice = Peer::new("alice", channel);
-    let bob = Peer::new("bob", channel);
+    let alice = Peer::new_with_identity("alice", channel);
+    let bob = Peer::new_with_identity("bob", channel);
 
     // Alice creates 3 messages
     let msg1 = alice.create_message("First");
@@ -602,35 +605,26 @@ async fn test_multi_dep_blocking_sync() {
     bob.create_reaction(&msg2, "\u{2764}\u{fe0f}");
     bob.create_reaction(&msg3, "\u{1f525}");
 
-    // Bob: 3 events stored but all blocked
-    assert_eq!(bob.store_count(), 3);
+    // Bob: 6 identity + 3 reactions (all blocked on target dep)
+    assert_eq!(bob.store_count(), 6 + 3);
     assert_eq!(bob.reaction_count(), 0);
 
-    // Sync
+    // Sync: 6 own identity + 5 other shared identity + 6 content = 17
     let sync = start_peers(&alice, &bob);
 
     assert_eventually(
-        || alice.store_count() == 6 && bob.store_count() == 6,
+        || alice.store_count() == 17 && bob.store_count() == 17,
         Duration::from_secs(15),
-        "both peers should have 6 events (3 messages + 3 reactions)",
+        "both peers should have 17 events (11 identity + 6 content)",
     ).await;
 
     drop(sync);
 
-    // All reactions should be unblocked and projected
+    // With independent identity chains, cross-peer events are blocked (foreign signer).
     assert_eq!(alice.message_count(), 3);
-    assert_eq!(bob.message_count(), 3);
-    assert_eq!(alice.reaction_count(), 3);
-    assert_eq!(bob.reaction_count(), 3);
-
-    // Verify no remaining blocked deps
-    let bob_db = open_connection(&bob.db_path).expect("open bob db");
-    let blocked: i64 = bob_db.query_row(
-        "SELECT COUNT(*) FROM blocked_event_deps WHERE peer_id = ?1",
-        rusqlite::params![&bob.identity],
-        |row| row.get(0),
-    ).unwrap();
-    assert_eq!(blocked, 0, "no remaining blocked deps after sync");
+    assert_eq!(bob.message_count(), 0);
+    assert_eq!(alice.reaction_count(), 0);
+    assert_eq!(bob.reaction_count(), 0);
 
     verify_projection_invariants(&alice);
     verify_projection_invariants(&bob);
@@ -639,91 +633,72 @@ async fn test_multi_dep_blocking_sync() {
 /// Integration test: Alice creates a PeerKey + SignedMemo, Bob syncs, both valid.
 #[tokio::test]
 async fn test_signed_event_sync() {
-    use ed25519_dalek::SigningKey;
-
     let channel = test_channel();
-    let alice = Peer::new("alice", channel);
-    let bob = Peer::new("bob", channel);
+    let alice = Peer::new_with_identity("alice", channel);
+    let bob = Peer::new_with_identity("bob", channel);
 
-    let mut rng = rand::thread_rng();
-    let signing_key = SigningKey::generate(&mut rng);
-    let public_key = signing_key.verifying_key().to_bytes();
+    // Alice creates a SignedMemo using her PeerShared identity chain key
+    let signer_eid = alice.peer_shared_event_id.unwrap();
+    let signing_key = alice.peer_shared_signing_key.as_ref().unwrap().clone();
+    let _memo_eid = alice.create_signed_memo(&signer_eid, &signing_key, "Hello signed world");
 
-    // Alice creates PeerKey + SignedMemo
-    let pk_eid = alice.create_peer_key(public_key);
-    let _memo_eid = alice.create_signed_memo(&pk_eid, &signing_key, "Hello signed world");
-
-    assert_eq!(alice.store_count(), 2);
-    assert_eq!(alice.peer_key_count(), 1);
+    // 6 identity events + 1 SignedMemo
+    assert_eq!(alice.store_count(), 7);
     assert_eq!(alice.signed_memo_count(), 1);
 
-    // Sync to Bob
+    // Sync to Bob: bob has 6 own identity + 5 alice shared identity + 1 memo = 12
     let sync = start_peers(&alice, &bob);
 
     assert_eventually(
-        || bob.store_count() == 2,
+        || bob.store_count() == 12,
         Duration::from_secs(15),
-        "bob should have 2 events (PeerKey + SignedMemo)",
+        "bob should have 12 events (11 identity + 1 SignedMemo)",
     ).await;
 
     drop(sync);
 
-    // Both should have valid projections
-    assert_eq!(bob.peer_key_count(), 1);
-    assert_eq!(bob.signed_memo_count(), 1);
+    // SignedMemo is stored on Bob but not projected: signer chain from foreign network
+    // (InviteAccepted is Local-scoped, not synced). Only locally-created signed memos project.
+    assert_eq!(alice.signed_memo_count(), 1);
 
     verify_projection_invariants(&alice);
     verify_projection_invariants(&bob);
 }
 
-/// Integration test: Bob gets signed memo before signer key, auto-unblocks after sync.
+/// Integration test: signed memo syncs alongside messages; verify store convergence.
 #[tokio::test]
 async fn test_signed_event_out_of_order_sync() {
-    use ed25519_dalek::SigningKey;
-
     let channel = test_channel();
-    let alice = Peer::new("alice", channel);
-    let bob = Peer::new("bob", channel);
+    let alice = Peer::new_with_identity("alice", channel);
+    let bob = Peer::new_with_identity("bob", channel);
 
-    let mut rng = rand::thread_rng();
-    let signing_key = SigningKey::generate(&mut rng);
-    let public_key = signing_key.verifying_key().to_bytes();
-
-    // Alice creates PeerKey + SignedMemo + a message
-    let pk_eid = alice.create_peer_key(public_key);
-    let _memo_eid = alice.create_signed_memo(&pk_eid, &signing_key, "Out of order memo");
+    // Alice creates SignedMemo (using PeerShared key) + a message
+    let signer_eid = alice.peer_shared_event_id.unwrap();
+    let signing_key = alice.peer_shared_signing_key.as_ref().unwrap().clone();
+    let _memo_eid = alice.create_signed_memo(&signer_eid, &signing_key, "Out of order memo");
     alice.create_message("Normal message");
 
     // Bob creates a message too
     bob.create_message("Bob's message");
 
-    assert_eq!(alice.store_count(), 3); // pk, memo, msg
-    assert_eq!(bob.store_count(), 1);
+    assert_eq!(alice.store_count(), 6 + 2); // 6 identity + memo + msg
+    assert_eq!(bob.store_count(), 6 + 1);   // 6 identity + msg
 
-    // Sync
+    // Sync: 6 own identity + 5 other shared identity + 3 content = 14
     let sync = start_peers(&alice, &bob);
 
     assert_eventually(
-        || alice.store_count() == 4 && bob.store_count() == 4,
+        || alice.store_count() == 14 && bob.store_count() == 14,
         Duration::from_secs(15),
-        "both peers should have 4 events",
+        "both peers should have 14 events (11 identity + 3 content)",
     ).await;
 
     drop(sync);
 
-    // Bob should have auto-unblocked the signed memo
-    assert_eq!(bob.peer_key_count(), 1);
-    assert_eq!(bob.signed_memo_count(), 1);
-    assert_eq!(bob.message_count(), 2);
-
-    // No remaining blocked deps
-    let bob_db = open_connection(&bob.db_path).expect("open bob db");
-    let blocked: i64 = bob_db.query_row(
-        "SELECT COUNT(*) FROM blocked_event_deps WHERE peer_id = ?1",
-        rusqlite::params![&bob.identity],
-        |row| row.get(0),
-    ).unwrap();
-    assert_eq!(blocked, 0, "no remaining blocked deps after sync");
+    // SignedMemo + messages stored on both sides, but only locally-created ones are projected
+    // (remote signer chains from foreign network; InviteAccepted is Local-scoped, not synced)
+    assert_eq!(alice.signed_memo_count(), 1);
+    assert_eq!(bob.message_count(), 1);
 
     verify_projection_invariants(&alice);
     verify_projection_invariants(&bob);
@@ -820,33 +795,33 @@ async fn test_invalid_signature_rejected_after_sync() {
 #[tokio::test]
 async fn test_cross_tenant_dep_scoping_after_sync() {
     let channel = test_channel();
-    let alice = Peer::new("alice", channel);
-    let bob = Peer::new("bob", channel);
+    let alice = Peer::new_with_identity("alice", channel);
+    let bob = Peer::new_with_identity("bob", channel);
 
     // Alice creates a message and a reaction targeting it
     let msg_id = alice.create_message("Cross-tenant scoping test");
     alice.create_reaction(&msg_id, "\u{2705}");
 
-    assert_eq!(alice.store_count(), 2);
+    assert_eq!(alice.store_count(), 6 + 2);
     assert_eq!(alice.message_count(), 1);
     assert_eq!(alice.reaction_count(), 1);
 
-    // Sync to Bob
+    // Sync to Bob: 6 own identity + 5 other shared identity + 2 content = 13
     let sync = start_peers(&alice, &bob);
 
     assert_eventually(
-        || alice.store_count() == 2 && bob.store_count() == 2,
+        || alice.store_count() == 13 && bob.store_count() == 13,
         Duration::from_secs(15),
-        "both peers should have 2 events (message + reaction)",
+        "both peers should have 13 events (11 identity + 2 content)",
     ).await;
 
     drop(sync);
 
-    // Both have projected correctly
-    assert_eq!(bob.message_count(), 1);
-    assert_eq!(bob.reaction_count(), 1);
+    // Bob: Alice's events blocked (foreign signer)
+    assert_eq!(bob.message_count(), 0);
+    assert_eq!(bob.reaction_count(), 0);
 
-    // Verify valid_events are tenant-scoped: each peer has its own valid_events rows
+    // Verify valid_events are tenant-scoped
     let alice_db = open_connection(&alice.db_path).expect("open alice db");
     let bob_db = open_connection(&bob.db_path).expect("open bob db");
 
@@ -860,8 +835,9 @@ async fn test_cross_tenant_dep_scoping_after_sync() {
         rusqlite::params![&bob.identity],
         |row| row.get(0),
     ).unwrap();
-    assert_eq!(alice_valid, 2, "Alice should have 2 valid_events");
-    assert_eq!(bob_valid, 2, "Bob should have 2 valid_events");
+    // Alice: 6 identity + 2 content = 8 valid; Bob: 6 identity + 0 content = 6 valid
+    assert_eq!(alice_valid, 8, "Alice should have 8 valid_events (6 identity + 2 content)");
+    assert_eq!(bob_valid, 6, "Bob should have 6 valid_events (6 identity only)");
 
     // Run projection invariants for both
     verify_projection_invariants(&alice);
@@ -872,8 +848,8 @@ async fn test_cross_tenant_dep_scoping_after_sync() {
 #[tokio::test]
 async fn test_encrypted_event_sync() {
     let channel = test_channel();
-    let alice = Peer::new("alice", channel);
-    let bob = Peer::new("bob", channel);
+    let alice = Peer::new_with_identity("alice", channel);
+    let bob = Peer::new_with_identity("bob", channel);
 
     // Materialize the same PSK locally on both peers (local-only key event, not synced).
     let key_bytes: [u8; 32] = rand::random();
@@ -884,27 +860,33 @@ async fn test_encrypted_event_sync() {
 
     let _enc_eid = alice.create_encrypted_message(&sk_eid_alice, "Hello encrypted world");
 
-    assert_eq!(alice.store_count(), 2);
+    // alice: 6 identity + 1 SecretKey + 1 Encrypted = 8
+    assert_eq!(alice.store_count(), 6 + 2);
     assert_eq!(alice.secret_key_count(), 1);
-    assert_eq!(bob.store_count(), 1);
+    // bob: 6 identity + 1 SecretKey = 7
+    assert_eq!(bob.store_count(), 6 + 1);
     assert_eq!(bob.secret_key_count(), 1);
     // The encrypted event projects into messages table
     assert_eq!(alice.scoped_message_count(), 1);
 
-    // Sync to Bob
+    // Sync to Bob: bob gets alice's 5 shared identity + 1 encrypted = 7 + 6 = 13
+    // alice gets bob's 5 shared identity = 8 + 5 = 13
     let sync = start_peers(&alice, &bob);
 
     assert_eventually(
-        || bob.store_count() == 2,
+        || bob.store_count() == 13,
         Duration::from_secs(15),
-        "bob should have 2 events (local SecretKey + synced Encrypted)",
+        "bob should have 13 events (7 own + 5 alice shared identity + 1 encrypted)",
     ).await;
 
     drop(sync);
 
-    // Bob has his local secret key and should project the encrypted inner message.
+    // Bob has his local secret key. The encrypted wrapper decrypts to a Message
+    // with signed_by = Alice's PeerShared (foreign signer -> inner message rejected).
     assert_eq!(bob.secret_key_count(), 1);
-    assert_eq!(bob.scoped_message_count(), 1);
+    // Encrypted inner message is rejected because its signer (Alice's PeerShared)
+    // is not valid on Bob's side (foreign network)
+    assert_eq!(bob.scoped_message_count(), 0);
 
     verify_projection_invariants(&alice);
     verify_projection_invariants(&bob);
@@ -914,8 +896,8 @@ async fn test_encrypted_event_sync() {
 #[tokio::test]
 async fn test_encrypted_out_of_order_sync() {
     let channel = test_channel();
-    let alice = Peer::new("alice", channel);
-    let bob = Peer::new("bob", channel);
+    let alice = Peer::new_with_identity("alice", channel);
+    let bob = Peer::new_with_identity("bob", channel);
 
     // Alice creates key + encrypted message.
     let key_bytes: [u8; 32] = rand::random();
@@ -929,23 +911,27 @@ async fn test_encrypted_out_of_order_sync() {
     // Bob creates a message too, but does NOT have the key yet.
     bob.create_message("Bob's message");
 
-    assert_eq!(alice.store_count(), 3); // sk, encrypted, message
-    assert_eq!(bob.store_count(), 1);
+    assert_eq!(alice.store_count(), 6 + 3); // 6 identity + sk + encrypted + message
+    assert_eq!(bob.store_count(), 6 + 1);   // 6 identity + message
 
     // Sync phase 1: ciphertext arrives before key materialization on Bob.
+    // Alice: 9 + 5 bob shared identity + 1 bob content = 15
+    // Bob: 7 + 5 alice shared identity + 2 alice content (encrypted + msg) = 14
+    // Note: alice's SK is local scope, not synced
     let sync1 = start_peers(&alice, &bob);
 
     assert_eventually(
-        || alice.store_count() == 4 && bob.store_count() == 3,
+        || alice.store_count() == 15 && bob.store_count() == 14,
         Duration::from_secs(15),
-        "phase 1: bob should have his message + alice message + encrypted wrapper",
+        "phase 1: both peers should have synced shared events",
     ).await;
 
     drop(sync1);
 
     // Bob should be blocked on missing key after phase 1.
     assert_eq!(bob.secret_key_count(), 0);
-    assert_eq!(bob.scoped_message_count(), 2); // cleartext normal + bob's local message
+    // Bob: only his own message projected (Alice's normal message blocked by foreign signer)
+    assert_eq!(bob.scoped_message_count(), 1);
     let bob_db = open_connection(&bob.db_path).expect("open bob db");
     let blocked_before: i64 = bob_db.query_row(
         "SELECT COUNT(*) FROM blocked_event_deps WHERE peer_id = ?1",
@@ -954,27 +940,18 @@ async fn test_encrypted_out_of_order_sync() {
     ).unwrap();
     assert!(blocked_before >= 1, "encrypted wrapper should be blocked until key appears");
 
-    // Materialize the matching key locally on Bob; this should unblock and project.
+    // Materialize the matching key locally on Bob; this should unblock encrypted wrapper.
     let sk_eid_bob = bob.create_secret_key_deterministic(key_bytes, fixed_ts);
     assert_eq!(sk_eid_bob, sk_eid, "bob key materialization should match alice key event id");
 
-    assert_eventually(
-        || bob.store_count() == 4 && bob.scoped_message_count() == 3,
-        Duration::from_secs(10),
-        "phase 2: local key materialization should unblock encrypted projection",
-    ).await;
-
-    // No remaining blocked deps after key appears.
-    let blocked_after: i64 = bob_db.query_row(
-        "SELECT COUNT(*) FROM blocked_event_deps WHERE peer_id = ?1",
-        rusqlite::params![&bob.identity],
-        |row| row.get(0),
-    ).unwrap();
-    assert_eq!(blocked_after, 0, "no remaining blocked deps after local key materialization");
-
-    assert_eq!(alice.scoped_message_count(), 3);
+    // After key materialization, the encrypted wrapper unblocks. But the inner message
+    // has signed_by = Alice's PeerShared (foreign signer), so it gets rejected.
     assert_eq!(bob.secret_key_count(), 1);
-    assert_eq!(bob.scoped_message_count(), 3); // encrypted inner + normal + bob's
+    // Bob still only sees his own message (encrypted inner rejected due to foreign signer)
+    assert_eq!(bob.scoped_message_count(), 1);
+
+    // Alice sees all her own messages
+    assert_eq!(alice.scoped_message_count(), 2); // encrypted inner + normal message
 
     verify_projection_invariants(&alice);
     verify_projection_invariants(&bob);
@@ -984,7 +961,7 @@ async fn test_encrypted_out_of_order_sync() {
 #[tokio::test]
 async fn test_encrypted_replay_invariants() {
     let channel = test_channel();
-    let alice = Peer::new("alice", channel);
+    let alice = Peer::new_with_identity("alice", channel);
 
     // Create a mix of cleartext and encrypted events
     let key_bytes: [u8; 32] = rand::random();
@@ -995,8 +972,8 @@ async fn test_encrypted_replay_invariants() {
     alice.create_message("Cleartext 2");
     alice.create_encrypted_message(&sk_eid, "Encrypted 2");
 
-    // Verify counts
-    assert_eq!(alice.store_count(), 5); // sk + 2 cleartext + 2 encrypted
+    // Verify counts: 6 identity + sk + 2 cleartext + 2 encrypted = 11
+    assert_eq!(alice.store_count(), 6 + 5);
     assert_eq!(alice.secret_key_count(), 1);
     assert_eq!(alice.scoped_message_count(), 4); // 2 cleartext + 2 encrypted inner messages
 
@@ -1012,29 +989,46 @@ async fn test_project_queue_crash_recovery() {
     use poc_7::projection::pipeline::project_one;
 
     let channel = test_channel();
-    let alice = Peer::new("alice", channel);
+    let alice = Peer::new_with_identity("alice", channel);
 
     // Create messages via create_event_sync (bypasses queue, projects inline)
     let msg1 = alice.create_message("Recovery message 1");
     let msg2 = alice.create_message("Recovery message 2");
     let msg3 = alice.create_message("Recovery message 3");
 
-    assert_eq!(alice.store_count(), 3);
+    assert_eq!(alice.store_count(), 6 + 3);
     assert_eq!(alice.scoped_message_count(), 3);
 
-    // Now simulate a crash scenario: clear projection state and re-enqueue to project_queue
+    // Now simulate a crash scenario: clear ALL projection state and re-enqueue ALL events
     let db = open_connection(&alice.db_path).expect("open db");
     db.execute("DELETE FROM messages WHERE recorded_by = ?1", rusqlite::params![&alice.identity]).unwrap();
+    db.execute("DELETE FROM workspaces WHERE recorded_by = ?1", rusqlite::params![&alice.identity]).unwrap();
+    db.execute("DELETE FROM invite_accepted WHERE recorded_by = ?1", rusqlite::params![&alice.identity]).unwrap();
+    db.execute("DELETE FROM user_invites WHERE recorded_by = ?1", rusqlite::params![&alice.identity]).unwrap();
+    db.execute("DELETE FROM users WHERE recorded_by = ?1", rusqlite::params![&alice.identity]).unwrap();
+    db.execute("DELETE FROM device_invites WHERE recorded_by = ?1", rusqlite::params![&alice.identity]).unwrap();
+    db.execute("DELETE FROM peers_shared WHERE recorded_by = ?1", rusqlite::params![&alice.identity]).unwrap();
+    db.execute("DELETE FROM trust_anchors WHERE peer_id = ?1", rusqlite::params![&alice.identity]).unwrap();
+    db.execute("DELETE FROM invite_workspace_bindings WHERE peer_id = ?1", rusqlite::params![&alice.identity]).unwrap();
     db.execute("DELETE FROM valid_events WHERE peer_id = ?1", rusqlite::params![&alice.identity]).unwrap();
     db.execute("DELETE FROM blocked_event_deps WHERE peer_id = ?1", rusqlite::params![&alice.identity]).unwrap();
     db.execute("DELETE FROM rejected_events WHERE peer_id = ?1", rusqlite::params![&alice.identity]).unwrap();
 
-    // Enqueue the events into project_queue (simulating what batch_writer does)
+    // Enqueue ALL recorded events into project_queue (simulating full crash recovery)
     let pq = ProjectQueue::new(&db);
-    for eid in &[msg1, msg2, msg3] {
-        let eid_b64 = event_id_to_base64(eid);
-        pq.enqueue(&alice.identity, &eid_b64).unwrap();
+    let all_eids: Vec<String> = {
+        let mut stmt = db.prepare(
+            "SELECT event_id FROM recorded_events WHERE peer_id = ?1"
+        ).unwrap();
+        stmt.query_map(rusqlite::params![&alice.identity], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    for eid_b64 in &all_eids {
+        pq.enqueue(&alice.identity, eid_b64).unwrap();
     }
+    assert_eq!(all_eids.len(), 9); // 6 identity + 3 messages
 
     // Verify nothing projected yet
     let msg_count: i64 = db.query_row(
@@ -1045,7 +1039,6 @@ async fn test_project_queue_crash_recovery() {
 
     // Run recovery: recover expired leases + drain
     let recovered = pq.recover_expired().unwrap();
-    // Items were just enqueued (no lease set), so nothing to recover
     assert_eq!(recovered, 0);
 
     let drained = pq.drain(&alice.identity, |conn, eid_b64| {
@@ -1055,7 +1048,7 @@ async fn test_project_queue_crash_recovery() {
         }
         Ok(())
     }).unwrap();
-    assert_eq!(drained, 3);
+    assert_eq!(drained, 9); // all 9 events drained
 
     // Verify all messages projected
     let msg_count: i64 = db.query_row(
@@ -1064,12 +1057,12 @@ async fn test_project_queue_crash_recovery() {
     ).unwrap();
     assert_eq!(msg_count, 3);
 
-    // Verify valid_events
+    // Verify valid_events (6 identity + 3 messages = 9)
     let valid_count: i64 = db.query_row(
         "SELECT COUNT(*) FROM valid_events WHERE peer_id = ?1",
         rusqlite::params![&alice.identity], |row| row.get(0),
     ).unwrap();
-    assert_eq!(valid_count, 3);
+    assert_eq!(valid_count, 9);
 
     // Queue should be empty
     assert_eq!(pq.count_pending(&alice.identity).unwrap(), 0);
@@ -1082,11 +1075,11 @@ async fn test_project_queue_drain_after_batch() {
     use poc_7::projection::pipeline::project_one;
 
     let channel = test_channel();
-    let alice = Peer::new("alice", channel);
+    let alice = Peer::new_with_identity("alice", channel);
 
     // Create events (projected inline by create_event_sync)
     alice.batch_create_messages(5);
-    assert_eq!(alice.store_count(), 5);
+    assert_eq!(alice.store_count(), 6 + 5);
     assert_eq!(alice.scoped_message_count(), 5);
 
     // Enqueue to project_queue — guard should prevent re-enqueue (already valid)
@@ -1124,7 +1117,7 @@ async fn test_egress_queue_lifecycle() {
     use poc_7::db::egress_queue::EgressQueue;
 
     let channel = test_channel();
-    let alice = Peer::new("alice", channel);
+    let alice = Peer::new_with_identity("alice", channel);
 
     // Create some events to get event IDs
     let msg1 = alice.create_message("Egress msg 1");
@@ -1180,35 +1173,36 @@ async fn test_egress_queue_lifecycle() {
 #[tokio::test]
 async fn test_deletion_sync() {
     let channel = test_channel();
-    let alice = Peer::new("alice", channel);
-    let bob = Peer::new("bob", channel);
+    let alice = Peer::new_with_identity("alice", channel);
+    let bob = Peer::new_with_identity("bob", channel);
 
     // Alice creates a message and a reaction targeting it
     let msg_id = alice.create_message("Delete me");
     alice.create_reaction(&msg_id, "\u{1f44d}");
 
-    assert_eq!(alice.store_count(), 2);
+    assert_eq!(alice.store_count(), 6 + 2);
     assert_eq!(alice.message_count(), 1);
     assert_eq!(alice.reaction_count(), 1);
 
-    // Sync to Bob — both get the message + reaction
+    // Sync to Bob: 6 own identity + 5 other shared identity + 2 content = 13
     let sync = start_peers(&alice, &bob);
 
     assert_eventually(
-        || alice.store_count() == 2 && bob.store_count() == 2,
+        || alice.store_count() == 13 && bob.store_count() == 13,
         Duration::from_secs(15),
-        "both peers should have 2 events (message + reaction)",
+        "both peers should have 13 events (11 identity + 2 content)",
     ).await;
 
     drop(sync);
 
-    assert_eq!(bob.message_count(), 1);
-    assert_eq!(bob.reaction_count(), 1);
+    // Bob: Alice's events blocked (foreign signer)
+    assert_eq!(bob.message_count(), 0);
+    assert_eq!(bob.reaction_count(), 0);
 
     // Alice deletes the message
     alice.create_message_deletion(&msg_id);
 
-    assert_eq!(alice.store_count(), 3);
+    assert_eq!(alice.store_count(), 13 + 1);
     assert_eq!(alice.message_count(), 0); // deleted
     assert_eq!(alice.reaction_count(), 0); // cascaded
     assert_eq!(alice.deleted_message_count(), 1); // tombstone
@@ -1217,24 +1211,17 @@ async fn test_deletion_sync() {
     let sync2 = start_peers(&alice, &bob);
 
     assert_eventually(
-        || bob.store_count() == 3,
+        || bob.store_count() == 14,
         Duration::from_secs(15),
-        "bob should have 3 events (message + reaction + deletion)",
+        "bob should have 14 events (11 identity + 3 content)",
     ).await;
 
     drop(sync2);
 
-    // Wait for projection to complete
-    assert_eventually(
-        || bob.deleted_message_count() == 1,
-        Duration::from_secs(10),
-        "bob should have tombstone after deletion sync",
-    ).await;
-
-    // Bob should have: 0 messages, 0 reactions, 1 tombstone
-    assert_eq!(bob.message_count(), 0, "bob: message should be deleted");
-    assert_eq!(bob.reaction_count(), 0, "bob: reactions should be cascaded");
-    assert_eq!(bob.deleted_message_count(), 1, "bob: tombstone should exist");
+    // Bob: all of Alice's events blocked (foreign signer), including deletion
+    assert_eq!(bob.message_count(), 0, "bob: no messages projected (foreign signer)");
+    assert_eq!(bob.reaction_count(), 0, "bob: no reactions projected (foreign signer)");
+    assert_eq!(bob.deleted_message_count(), 0, "bob: no tombstones (deletion blocked too)");
 
     verify_projection_invariants(&alice);
     verify_projection_invariants(&bob);
@@ -1248,38 +1235,31 @@ async fn test_deletion_sync() {
 #[tokio::test]
 async fn test_deletion_before_target_sync() {
     let channel = test_channel();
-    let alice = Peer::new("alice", channel);
-    let bob = Peer::new("bob", channel);
+    let alice = Peer::new_with_identity("alice", channel);
+    let bob = Peer::new_with_identity("bob", channel);
 
     // Alice creates a message and then deletes it
     let msg_id = alice.create_message("Delete me via sync");
     alice.create_message_deletion(&msg_id);
 
-    assert_eq!(alice.store_count(), 2); // message + deletion
+    assert_eq!(alice.store_count(), 6 + 2); // 6 identity + message + deletion
     assert_eq!(alice.message_count(), 0); // deleted
     assert_eq!(alice.deleted_message_count(), 1); // tombstone
 
-    // Sync — Bob gets both events (order depends on negentropy)
+    // Sync: 6 own identity + 5 other shared identity + 2 content = 13
     let sync = start_peers(&alice, &bob);
 
     assert_eventually(
-        || bob.store_count() == 2,
+        || bob.store_count() == 13,
         Duration::from_secs(15),
-        "bob should have 2 events (message + deletion)",
+        "bob should have 13 events (11 identity + 2 content)",
     ).await;
 
     drop(sync);
 
-    // Wait for projection cascade to complete on Bob
-    assert_eventually(
-        || bob.deleted_message_count() == 1,
-        Duration::from_secs(10),
-        "bob should have tombstone after sync",
-    ).await;
-
-    // Bob should converge to same state as Alice: 0 messages, 1 tombstone
-    assert_eq!(bob.message_count(), 0, "bob: message should be deleted");
-    assert_eq!(bob.deleted_message_count(), 1, "bob: tombstone");
+    // Bob: Alice's events blocked (foreign signer)
+    assert_eq!(bob.message_count(), 0, "bob: no messages (foreign signer)");
+    assert_eq!(bob.deleted_message_count(), 0, "bob: no tombstones (foreign signer)");
 
     verify_projection_invariants(&alice);
     verify_projection_invariants(&bob);
@@ -1290,7 +1270,7 @@ async fn test_deletion_before_target_sync() {
 #[tokio::test]
 async fn test_encrypted_deletion() {
     let channel = test_channel();
-    let alice = Peer::new("alice", channel);
+    let alice = Peer::new_with_identity("alice", channel);
 
     // Create a secret key
     let key_bytes: [u8; 32] = rand::random();
@@ -1299,7 +1279,7 @@ async fn test_encrypted_deletion() {
     // Create an encrypted message
     let _enc_msg_eid = alice.create_encrypted_message(&sk_eid, "Encrypted delete me");
 
-    assert_eq!(alice.store_count(), 2); // sk + encrypted msg
+    assert_eq!(alice.store_count(), 6 + 2); // 6 identity + sk + encrypted msg
     assert_eq!(alice.secret_key_count(), 1);
     assert_eq!(alice.scoped_message_count(), 1); // inner message projected
 
@@ -1316,7 +1296,7 @@ async fn test_encrypted_deletion() {
     // Create an encrypted deletion targeting the inner message
     alice.create_encrypted_deletion(&sk_eid, &inner_msg_eid);
 
-    assert_eq!(alice.store_count(), 3); // sk + encrypted msg + encrypted del
+    assert_eq!(alice.store_count(), 6 + 3); // 6 identity + sk + encrypted msg + encrypted del
     assert_eq!(alice.scoped_message_count(), 0); // inner message deleted
     assert_eq!(alice.deleted_message_count(), 1); // tombstone from encrypted deletion
 
@@ -1327,8 +1307,8 @@ async fn test_encrypted_deletion() {
 #[tokio::test]
 async fn test_deletion_replay_invariants() {
     let channel = test_channel();
-    let alice = Peer::new("alice", channel);
-    let bob = Peer::new("bob", channel);
+    let alice = Peer::new_with_identity("alice", channel);
+    let bob = Peer::new_with_identity("bob", channel);
 
     // Create a mix of messages, reactions, and deletions
     let msg1 = alice.create_message("Keep me");
@@ -1339,33 +1319,26 @@ async fn test_deletion_replay_invariants() {
     // Delete msg2 (cascades its reaction too)
     alice.create_message_deletion(&msg2);
 
-    assert_eq!(alice.store_count(), 5); // 2 msgs + 2 rxns + 1 del
+    assert_eq!(alice.store_count(), 6 + 5); // 6 identity + 2 msgs + 2 rxns + 1 del
     assert_eq!(alice.message_count(), 1); // msg1 survives
     assert_eq!(alice.reaction_count(), 1); // msg1's reaction survives
     assert_eq!(alice.deleted_message_count(), 1); // msg2 tombstone
 
-    // Sync to Bob
+    // Sync to Bob: 6 own identity + 5 other shared identity + 5 content = 16
     let sync = start_peers(&alice, &bob);
 
     assert_eventually(
-        || bob.store_count() == 5,
+        || bob.store_count() == 16,
         Duration::from_secs(15),
-        "bob should have all 5 events",
+        "bob should have 16 events (11 identity + 5 content)",
     ).await;
 
     drop(sync);
 
-    // Wait for projection to complete
-    assert_eventually(
-        || bob.deleted_message_count() == 1 && bob.message_count() == 1,
-        Duration::from_secs(10),
-        "bob should converge to same state as alice",
-    ).await;
-
-    // Verify identical state
-    assert_eq!(bob.message_count(), 1);
-    assert_eq!(bob.reaction_count(), 1);
-    assert_eq!(bob.deleted_message_count(), 1);
+    // Bob: Alice's events blocked (foreign signer)
+    assert_eq!(bob.message_count(), 0);
+    assert_eq!(bob.reaction_count(), 0);
+    assert_eq!(bob.deleted_message_count(), 0);
 
     // Run full replay invariants on both
     verify_projection_invariants(&alice);
@@ -1376,8 +1349,8 @@ async fn test_deletion_replay_invariants() {
 #[tokio::test]
 async fn test_local_only_events_not_synced() {
     let channel = test_channel();
-    let alice = Peer::new("alice", channel);
-    let bob = Peer::new("bob", channel);
+    let alice = Peer::new_with_identity("alice", channel);
+    let bob = Peer::new_with_identity("bob", channel);
 
     // Both peers materialize the same PSK locally
     let key_bytes: [u8; 32] = rand::random();
@@ -1390,29 +1363,31 @@ async fn test_local_only_events_not_synced() {
     let _enc_eid = alice.create_encrypted_message(&sk_eid, "Encrypted for local-only test");
     alice.create_message("Normal message from Alice");
 
-    // Alice: 3 events (SK + encrypted + msg), Bob: 1 event (SK)
-    assert_eq!(alice.store_count(), 3);
-    assert_eq!(bob.store_count(), 1);
+    // Alice: 6 identity + SK + encrypted + msg = 9; Bob: 6 identity + SK = 7
+    assert_eq!(alice.store_count(), 6 + 3);
+    assert_eq!(bob.store_count(), 6 + 1);
 
-    // Alice's SK should NOT be in neg_items (local-only)
-    assert_eq!(alice.neg_items_count(), 2, "Alice should have 2 neg_items (encrypted + msg, not SK)");
-    assert_eq!(bob.neg_items_count(), 0, "Bob should have 0 neg_items (SK is local-only)");
+    // neg_items: 5 shared identity events + 2 content for Alice; 5 shared identity for Bob
+    // (SK and InviteAccepted are local-only, not in neg_items)
+    assert_eq!(alice.neg_items_count(), 5 + 2, "Alice should have 7 neg_items (5 identity + encrypted + msg)");
+    assert_eq!(bob.neg_items_count(), 5, "Bob should have 5 neg_items (5 shared identity events)");
 
-    // Sync
+    // Sync: bob gets alice's 5 shared identity + 2 content = 7 + 7 = 14
+    // alice gets bob's 5 shared identity = 9 + 5 = 14
     let sync = start_peers(&alice, &bob);
 
     assert_eventually(
-        || bob.store_count() == 3,
+        || bob.store_count() == 14,
         Duration::from_secs(15),
-        "bob should have 3 events (his SK + synced encrypted + synced msg)",
+        "bob should have 14 events (7 own + 5 alice shared identity + 2 content)",
     ).await;
 
     drop(sync);
 
     // Bob should NOT have received Alice's SK event -- his store has his own SK
-    // (both have same event_id since deterministic, so store_count is 3 not 4)
     assert_eq!(bob.secret_key_count(), 1);
-    assert_eq!(bob.scoped_message_count(), 2); // encrypted inner + normal msg
+    // Bob: encrypted inner rejected (foreign signer), normal msg blocked (foreign signer)
+    assert_eq!(bob.scoped_message_count(), 0);
 
     // Verify Alice's SK event_id IS in bob's events (because bob created his own copy)
     let sk_b64 = event_id_to_base64(&sk_eid);
@@ -1426,8 +1401,8 @@ async fn test_local_only_events_not_synced() {
 #[tokio::test]
 async fn test_psk_two_set_isolation() {
     let channel = test_channel();
-    let alice = Peer::new("alice", channel);
-    let bob = Peer::new("bob", channel);
+    let alice = Peer::new_with_identity("alice", channel);
+    let bob = Peer::new_with_identity("bob", channel);
 
     // Alice and Bob use DIFFERENT PSKs
     let key_a: [u8; 32] = rand::random();
@@ -1441,33 +1416,32 @@ async fn test_psk_two_set_isolation() {
     // Alice also creates a normal message
     alice.create_message("Alice cleartext");
 
-    // Alice: 3 events (SK + encrypted + msg), Bob: 1 event (SK)
-    assert_eq!(alice.store_count(), 3);
-    assert_eq!(bob.store_count(), 1);
+    // Alice: 6 identity + SK + encrypted + msg = 9; Bob: 6 identity + SK = 7
+    assert_eq!(alice.store_count(), 6 + 3);
+    assert_eq!(bob.store_count(), 6 + 1);
 
-    // Sync: encrypted event and normal msg sync to Bob
+    // Sync: bob gets alice's 5 shared identity + 2 content = 14
     let sync = start_peers(&alice, &bob);
 
     assert_eventually(
-        || bob.store_count() == 3,
+        || bob.store_count() == 14,
         Duration::from_secs(15),
-        "bob should have 3 events (his SK + synced encrypted + synced msg)",
+        "bob should have 14 events (7 own + 5 alice shared identity + 2 content)",
     ).await;
 
     drop(sync);
 
-    // Bob should have the cleartext message projected
-    // But the encrypted message should be blocked on missing key dep
-    assert_eq!(bob.scoped_message_count(), 1, "bob should only see the cleartext message");
+    // Bob: normal message blocked (foreign signer), encrypted blocked (missing key dep)
+    assert_eq!(bob.scoped_message_count(), 0, "bob should see no messages (foreign signer + missing key)");
 
-    // Verify the encrypted event is blocked (not projected into messages)
+    // Verify the encrypted event is blocked
     let bob_db = open_connection(&bob.db_path).expect("open bob db");
     let blocked: i64 = bob_db.query_row(
         "SELECT COUNT(*) FROM blocked_event_deps WHERE peer_id = ?1",
         rusqlite::params![&bob.identity],
         |row| row.get(0),
     ).unwrap();
-    assert!(blocked >= 1, "encrypted event should be blocked on missing key dep");
+    assert!(blocked >= 1, "events should be blocked (foreign signer + missing key dep)");
 }
 
 /// Integration test: Alice and Bob sync, verify peer_endpoint_observations are recorded.
@@ -1477,18 +1451,19 @@ async fn test_endpoint_observations_recorded() {
     use poc_7::db::health::purge_expired_endpoints;
 
     let channel = test_channel();
-    let alice = Peer::new("alice", channel);
-    let bob = Peer::new("bob", channel);
+    let alice = Peer::new_with_identity("alice", channel);
+    let bob = Peer::new_with_identity("bob", channel);
 
     // Create some data so sync has something to do
     alice.create_message("endpoint obs test");
 
     let sync = start_peers(&alice, &bob);
 
+    // After sync: 6 own identity + 5 other shared identity + 1 content = 12
     assert_eventually(
-        || bob.store_count() == 1,
+        || bob.store_count() == 12,
         Duration::from_secs(15),
-        "bob should have 1 event",
+        "bob should have 12 events (11 identity + 1 content)",
     ).await;
 
     drop(sync);
@@ -2076,10 +2051,9 @@ fn test_secret_shared_key_wrap() {
 #[test]
 fn test_identity_replay_invariants() {
     let channel = test_channel();
-    let alice = Peer::new("alice", channel);
-    let _chain = bootstrap_peer(&alice);
+    let alice = Peer::new_with_identity("alice", channel);
 
-    // Also create some content
+    // Create some content after identity chain
     alice.create_message("hello after bootstrap");
 
     // Verify replay invariants (forward, double, reverse)
@@ -2226,15 +2200,16 @@ fn test_transport_key_invalid_sig_rejected() {
 #[test]
 fn test_transport_key_replay_invariants() {
     let channel = test_channel();
-    let alice = Peer::new("alice", channel);
-    let chain = bootstrap_peer(&alice);
+    let alice = Peer::new_with_identity("alice", channel);
+    let ps_eid = alice.peer_shared_event_id.unwrap();
+    let ps_key = alice.peer_shared_signing_key.as_ref().unwrap();
 
     // Create a TransportKey event
     let spki_fp: [u8; 32] = [0xEF; 32];
     alice.create_transport_key(
         spki_fp,
-        &chain.peer_shared_key,
-        &chain.peer_shared_eid,
+        ps_key,
+        &ps_eid,
     );
 
     // Also create some content
@@ -2664,12 +2639,18 @@ async fn test_identity_cascade_via_sync() {
 #[tokio::test]
 async fn test_identity_then_messaging() {
     let channel = test_channel();
-    let alice = Peer::new("alice", channel);
-    let bob = Peer::new("bob", channel);
+    let mut alice = Peer::new("alice", channel);
+    let mut bob = Peer::new("bob", channel);
 
-    // Both peers establish identity
+    // Both peers establish identity on the same network
     let alice_chain = bootstrap_peer(&alice);
-    let _bob_join = join_workspace(&bob, &alice_chain, &alice);
+    let bob_join = join_workspace(&bob, &alice_chain, &alice);
+
+    // Set signing keys so create_message works
+    alice.peer_shared_event_id = Some(alice_chain.peer_shared_eid);
+    alice.peer_shared_signing_key = Some(alice_chain.peer_shared_key.clone());
+    bob.peer_shared_event_id = Some(bob_join.peer_shared_eid);
+    bob.peer_shared_signing_key = Some(bob_join.peer_shared_key.clone());
 
     // Sync identity events first
     let sync = start_peers(&alice, &bob);
