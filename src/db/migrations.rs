@@ -182,18 +182,18 @@ static MIGRATIONS: &[Migration] = &[
         sql: "
             CREATE TABLE IF NOT EXISTS trust_anchors (
                 peer_id TEXT NOT NULL PRIMARY KEY,
-                network_id TEXT NOT NULL
+                workspace_id TEXT NOT NULL
             );
 
-            CREATE TABLE IF NOT EXISTS invite_network_bindings (
+            CREATE TABLE IF NOT EXISTS invite_workspace_bindings (
                 peer_id TEXT NOT NULL PRIMARY KEY,
-                network_id TEXT NOT NULL
+                workspace_id TEXT NOT NULL
             );
 
-            CREATE TABLE IF NOT EXISTS networks (
+            CREATE TABLE IF NOT EXISTS workspaces (
                 recorded_by TEXT NOT NULL,
                 event_id TEXT NOT NULL,
-                network_id TEXT NOT NULL,
+                workspace_id TEXT NOT NULL,
                 public_key BLOB NOT NULL,
                 PRIMARY KEY (recorded_by, event_id)
             );
@@ -202,7 +202,7 @@ static MIGRATIONS: &[Migration] = &[
                 recorded_by TEXT NOT NULL,
                 event_id TEXT NOT NULL,
                 invite_event_id TEXT NOT NULL,
-                network_id TEXT NOT NULL,
+                workspace_id TEXT NOT NULL,
                 PRIMARY KEY (recorded_by, event_id)
             );
 
@@ -290,27 +290,60 @@ static MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 11,
-        name: "enforce_single_network_per_peer",
+        name: "enforce_single_workspace_per_peer",
         sql: "
-            DELETE FROM networks
+            DELETE FROM workspaces
              WHERE rowid NOT IN (
                  SELECT MIN(rowid)
-                 FROM networks
-                 GROUP BY recorded_by, network_id
+                 FROM workspaces
+                 GROUP BY recorded_by, workspace_id
              );
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_networks_single_per_peer
-                ON networks (recorded_by, network_id);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_workspaces_single_per_peer
+                ON workspaces (recorded_by, workspace_id);
         ",
     },
     Migration {
         version: 12,
-        name: "retire_invite_network_bindings",
+        name: "retire_invite_workspace_bindings",
         sql: "
-            -- invite_network_bindings is no longer used by runtime logic.
+            -- invite_workspace_bindings is no longer used by runtime logic.
             -- Trust anchor binding now derives directly from invite_accepted event fields.
             -- Table is retained for backward compatibility; no runtime code reads or writes it.
             -- No destructive cleanup: existing rows are harmless and preserved for forensics.
             SELECT 1;
+        ",
+    },
+    Migration {
+        version: 13,
+        name: "add_file_attachment_tables",
+        sql: "
+            CREATE TABLE IF NOT EXISTS message_attachments (
+                recorded_by TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                file_id TEXT NOT NULL,
+                blob_bytes INTEGER NOT NULL,
+                total_slices INTEGER NOT NULL,
+                slice_bytes INTEGER NOT NULL,
+                root_hash BLOB NOT NULL,
+                key_event_id TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                mime_type TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (recorded_by, event_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_msg_att_message ON message_attachments(recorded_by, message_id);
+            CREATE INDEX IF NOT EXISTS idx_msg_att_file ON message_attachments(recorded_by, file_id);
+
+            CREATE TABLE IF NOT EXISTS file_slices (
+                recorded_by TEXT NOT NULL,
+                file_id TEXT NOT NULL,
+                slice_number INTEGER NOT NULL,
+                event_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (recorded_by, file_id, slice_number)
+            );
+            CREATE INDEX IF NOT EXISTS idx_file_slices_event ON file_slices(recorded_by, event_id);
         ",
     },
 ];
@@ -432,6 +465,6 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 12);
+        assert_eq!(count, 13);
     }
 }
