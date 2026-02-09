@@ -5,7 +5,7 @@ use crate::crypto::{event_id_to_base64, event_id_from_base64, EventId};
 use crate::events::{self, ParsedEvent, registry};
 use super::decision::ProjectionDecision;
 use super::encrypted::project_encrypted;
-use super::projectors::{project_message, project_message_deletion, project_reaction, project_peer_key, project_secret_key, project_signed_memo};
+use super::projectors::{project_message, project_message_attachment, project_message_deletion, project_file_slice, project_reaction, project_peer_key, project_secret_key, project_signed_memo};
 use super::signer::{resolve_signer_key, verify_ed25519_signature, SignerResolution};
 
 /// Record a rejected event durably so it is not re-processed on replay or cascade.
@@ -89,6 +89,12 @@ fn apply_projection(
         }
         ParsedEvent::MessageDeletion(del) => {
             return project_message_deletion(conn, recorded_by, event_id_b64, del);
+        }
+        ParsedEvent::MessageAttachment(att) => {
+            project_message_attachment(conn, recorded_by, event_id_b64, att)?;
+        }
+        ParsedEvent::FileSlice(fs) => {
+            return Ok(project_file_slice(conn, recorded_by, event_id_b64, fs)?);
         }
         // Identity events: dispatch to identity projectors
         ParsedEvent::Network(_)
@@ -370,7 +376,7 @@ mod tests {
     use super::*;
     use crate::crypto::hash_event;
     use crate::db::{open_in_memory, schema::create_tables};
-    use crate::events::{self, MessageEvent, MessageDeletionEvent, ReactionEvent, PeerKeyEvent, SecretKeyEvent, SignedMemoEvent, EncryptedEvent, ParsedEvent, EVENT_TYPE_MESSAGE, EVENT_TYPE_ENCRYPTED};
+    use crate::events::{self, MessageEvent, MessageAttachmentEvent, MessageDeletionEvent, FileSliceEvent, ReactionEvent, PeerKeyEvent, SecretKeyEvent, SignedMemoEvent, EncryptedEvent, ParsedEvent, EVENT_TYPE_MESSAGE, EVENT_TYPE_ENCRYPTED};
     use crate::projection::encrypted::encrypt_event_blob;
     use crate::projection::signer::sign_event_bytes;
     use ed25519_dalek::SigningKey;
@@ -2000,5 +2006,406 @@ mod tests {
             |row| row.get(0),
         ).unwrap();
         assert!(rej_reason.contains("invalid signature"), "reason: {}", rej_reason);
+    }
+
+    // === File attachment helpers ===
+
+    fn make_file_slice(signing_key: &SigningKey, signer_event_id: &EventId, file_id: [u8; 32], slice_number: u32, ciphertext: &[u8]) -> (ParsedEvent, Vec<u8>) {
+        let fs = FileSliceEvent {
+            created_at_ms: now_ms(),
+            file_id,
+            slice_number,
+            ciphertext: ciphertext.to_vec(),
+            signed_by: *signer_event_id,
+            signer_type: 0,
+            signature: [0u8; 64], // placeholder
+        };
+        let event = ParsedEvent::FileSlice(fs);
+        let mut blob = events::encode_event(&event).unwrap();
+
+        // Sign: signing_bytes = blob[..len-64], overwrite last 64 bytes
+        let sig_len = 64;
+        let blob_len = blob.len();
+        let signing_bytes = &blob[..blob_len - sig_len];
+        let sig = sign_event_bytes(signing_key, signing_bytes);
+        blob[blob_len - sig_len..].copy_from_slice(&sig);
+
+        let parsed = events::parse_event(&blob).unwrap();
+        (parsed, blob)
+    }
+
+    fn make_message_attachment(message_id: &EventId, key_event_id: &EventId) -> (ParsedEvent, Vec<u8>) {
+        let att = ParsedEvent::MessageAttachment(MessageAttachmentEvent {
+            created_at_ms: now_ms(),
+            message_id: *message_id,
+            file_id: [42u8; 32],
+            blob_bytes: 1024,
+            total_slices: 1,
+            slice_bytes: 1024,
+            root_hash: [0xABu8; 32],
+            key_event_id: *key_event_id,
+            filename: "test.bin".to_string(),
+            mime_type: "application/octet-stream".to_string(),
+        });
+        let blob = events::encode_event(&att).unwrap();
+        (att, blob)
+    }
+
+    #[test]
+    fn test_file_slice_valid() {
+        let conn = setup();
+        let recorded_by = "peer1";
+        let mut rng = rand::thread_rng();
+        let signing_key = SigningKey::generate(&mut rng);
+        let public_key = signing_key.verifying_key().to_bytes();
+
+        // Create PeerKey as signer
+        let (_pk, pk_blob) = make_peer_key(public_key);
+        let pk_eid = insert_event_raw(&conn, recorded_by, &pk_blob);
+        assert_eq!(project_one(&conn, recorded_by, &pk_eid).unwrap(), ProjectionDecision::Valid);
+
+        // Create FileSlice
+        let file_id = [99u8; 32];
+        let (_fs, fs_blob) = make_file_slice(&signing_key, &pk_eid, file_id, 0, b"encrypted data");
+        let fs_eid = insert_event_raw(&conn, recorded_by, &fs_blob);
+        let result = project_one(&conn, recorded_by, &fs_eid).unwrap();
+        assert_eq!(result, ProjectionDecision::Valid);
+
+        // Verify in file_slices table
+        let fs_b64 = event_id_to_base64(&fs_eid);
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM file_slices WHERE recorded_by = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &fs_b64],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_file_slice_blocks_on_missing_signer() {
+        let conn = setup();
+        let recorded_by = "peer1";
+        let mut rng = rand::thread_rng();
+        let signing_key = SigningKey::generate(&mut rng);
+
+        // Use a fake signer event_id that doesn't exist
+        let fake_signer = [77u8; 32];
+        let file_id = [99u8; 32];
+        let (_fs, fs_blob) = make_file_slice(&signing_key, &fake_signer, file_id, 0, b"data");
+        let fs_eid = insert_event_raw(&conn, recorded_by, &fs_blob);
+        let result = project_one(&conn, recorded_by, &fs_eid).unwrap();
+        assert!(matches!(result, ProjectionDecision::Block { .. }));
+    }
+
+    #[test]
+    fn test_file_slice_unblocks_when_signer_arrives() {
+        let conn = setup();
+        let recorded_by = "peer1";
+        let mut rng = rand::thread_rng();
+        let signing_key = SigningKey::generate(&mut rng);
+        let public_key = signing_key.verifying_key().to_bytes();
+
+        // Create PeerKey blob but don't insert yet — get its event_id by hashing
+        let (_pk, pk_blob) = make_peer_key(public_key);
+        let pk_eid = crate::crypto::hash_event(&pk_blob);
+
+        // Create FileSlice referencing the not-yet-existing signer
+        let file_id = [99u8; 32];
+        let (_fs, fs_blob) = make_file_slice(&signing_key, &pk_eid, file_id, 0, b"data");
+        let fs_eid = insert_event_raw(&conn, recorded_by, &fs_blob);
+
+        // Should block
+        let result = project_one(&conn, recorded_by, &fs_eid).unwrap();
+        assert!(matches!(result, ProjectionDecision::Block { .. }));
+
+        // Now insert the signer
+        let pk_eid2 = insert_event_raw(&conn, recorded_by, &pk_blob);
+        assert_eq!(pk_eid, pk_eid2);
+        let result = project_one(&conn, recorded_by, &pk_eid).unwrap();
+        assert_eq!(result, ProjectionDecision::Valid);
+
+        // FileSlice should have been cascade-unblocked
+        let fs_b64 = event_id_to_base64(&fs_eid);
+        let valid: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &fs_b64],
+            |row| row.get(0),
+        ).unwrap();
+        assert!(valid, "file_slice should have been cascade-unblocked");
+    }
+
+    #[test]
+    fn test_file_slice_invalid_signature_rejects() {
+        let conn = setup();
+        let recorded_by = "peer1";
+        let mut rng = rand::thread_rng();
+        let signing_key = SigningKey::generate(&mut rng);
+        let wrong_key = SigningKey::generate(&mut rng);
+        let public_key = signing_key.verifying_key().to_bytes();
+
+        // Create PeerKey with signing_key's public key
+        let (_pk, pk_blob) = make_peer_key(public_key);
+        let pk_eid = insert_event_raw(&conn, recorded_by, &pk_blob);
+        project_one(&conn, recorded_by, &pk_eid).unwrap();
+
+        // Sign file_slice with the WRONG key
+        let file_id = [99u8; 32];
+        let (_fs, fs_blob) = make_file_slice(&wrong_key, &pk_eid, file_id, 0, b"data");
+        let fs_eid = insert_event_raw(&conn, recorded_by, &fs_blob);
+        let result = project_one(&conn, recorded_by, &fs_eid).unwrap();
+        assert!(matches!(result, ProjectionDecision::Reject { .. }));
+    }
+
+    #[test]
+    fn test_multiple_slices_same_file() {
+        let conn = setup();
+        let recorded_by = "peer1";
+        let mut rng = rand::thread_rng();
+        let signing_key = SigningKey::generate(&mut rng);
+        let public_key = signing_key.verifying_key().to_bytes();
+
+        let (_pk, pk_blob) = make_peer_key(public_key);
+        let pk_eid = insert_event_raw(&conn, recorded_by, &pk_blob);
+        project_one(&conn, recorded_by, &pk_eid).unwrap();
+
+        let file_id = [99u8; 32];
+        for i in 0..5u32 {
+            let (_fs, fs_blob) = make_file_slice(&signing_key, &pk_eid, file_id, i, format!("slice {}", i).as_bytes());
+            let fs_eid = insert_event_raw(&conn, recorded_by, &fs_blob);
+            let result = project_one(&conn, recorded_by, &fs_eid).unwrap();
+            assert_eq!(result, ProjectionDecision::Valid, "slice {} should be valid", i);
+        }
+
+        // Verify all 5 slices in table
+        let file_id_b64 = crate::crypto::event_id_to_base64(&file_id);
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM file_slices WHERE recorded_by = ?1 AND file_id = ?2",
+            rusqlite::params![recorded_by, &file_id_b64],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count, 5);
+    }
+
+    #[test]
+    fn test_file_slice_tenant_isolation() {
+        let conn = setup();
+        let mut rng = rand::thread_rng();
+        let signing_key = SigningKey::generate(&mut rng);
+        let public_key = signing_key.verifying_key().to_bytes();
+
+        // Setup signer for both tenants
+        let (_pk, pk_blob) = make_peer_key(public_key);
+        let pk_eid_a = insert_event_raw(&conn, "tenant_a", &pk_blob);
+        let pk_eid_b = insert_event_raw(&conn, "tenant_b", &pk_blob);
+        project_one(&conn, "tenant_a", &pk_eid_a).unwrap();
+        project_one(&conn, "tenant_b", &pk_eid_b).unwrap();
+
+        let file_id = [99u8; 32];
+        let (_fs, fs_blob) = make_file_slice(&signing_key, &pk_eid_a, file_id, 0, b"data");
+        let fs_eid = insert_event_raw(&conn, "tenant_a", &fs_blob);
+        project_one(&conn, "tenant_a", &fs_eid).unwrap();
+
+        // Tenant B should not see tenant A's slice
+        let file_id_b64 = crate::crypto::event_id_to_base64(&file_id);
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM file_slices WHERE recorded_by = 'tenant_b' AND file_id = ?1",
+            rusqlite::params![&file_id_b64],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_project_attachment_valid() {
+        let conn = setup();
+        let recorded_by = "peer1";
+
+        // Create message (dep)
+        let (_msg, msg_blob) = make_message("hello attachment");
+        let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
+        project_one(&conn, recorded_by, &msg_eid).unwrap();
+
+        // Create SecretKey (dep)
+        let sk = ParsedEvent::SecretKey(SecretKeyEvent {
+            created_at_ms: now_ms(),
+            key_bytes: [0xAA; 32],
+        });
+        let sk_blob = events::encode_event(&sk).unwrap();
+        let sk_eid = insert_event_raw(&conn, recorded_by, &sk_blob);
+        project_one(&conn, recorded_by, &sk_eid).unwrap();
+
+        // Create attachment referencing both deps
+        let (_att, att_blob) = make_message_attachment(&msg_eid, &sk_eid);
+        let att_eid = insert_event_raw(&conn, recorded_by, &att_blob);
+        let result = project_one(&conn, recorded_by, &att_eid).unwrap();
+        assert_eq!(result, ProjectionDecision::Valid);
+
+        // Verify in table
+        let att_b64 = event_id_to_base64(&att_eid);
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM message_attachments WHERE recorded_by = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &att_b64],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_attachment_blocks_on_missing_message() {
+        let conn = setup();
+        let recorded_by = "peer1";
+
+        // Create SecretKey but NOT message
+        let sk = ParsedEvent::SecretKey(SecretKeyEvent {
+            created_at_ms: now_ms(),
+            key_bytes: [0xAA; 32],
+        });
+        let sk_blob = events::encode_event(&sk).unwrap();
+        let sk_eid = insert_event_raw(&conn, recorded_by, &sk_blob);
+        project_one(&conn, recorded_by, &sk_eid).unwrap();
+
+        let fake_msg_id = [88u8; 32];
+        let (_att, att_blob) = make_message_attachment(&fake_msg_id, &sk_eid);
+        let att_eid = insert_event_raw(&conn, recorded_by, &att_blob);
+        let result = project_one(&conn, recorded_by, &att_eid).unwrap();
+        assert!(matches!(result, ProjectionDecision::Block { .. }));
+    }
+
+    #[test]
+    fn test_attachment_blocks_on_missing_key() {
+        let conn = setup();
+        let recorded_by = "peer1";
+
+        // Create message but NOT secret key
+        let (_msg, msg_blob) = make_message("hello");
+        let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
+        project_one(&conn, recorded_by, &msg_eid).unwrap();
+
+        let fake_key_id = [77u8; 32];
+        let (_att, att_blob) = make_message_attachment(&msg_eid, &fake_key_id);
+        let att_eid = insert_event_raw(&conn, recorded_by, &att_blob);
+        let result = project_one(&conn, recorded_by, &att_eid).unwrap();
+        assert!(matches!(result, ProjectionDecision::Block { .. }));
+    }
+
+    #[test]
+    fn test_attachment_blocks_on_both_missing() {
+        let conn = setup();
+        let recorded_by = "peer1";
+
+        let fake_msg_id = [88u8; 32];
+        let fake_key_id = [77u8; 32];
+        let (_att, att_blob) = make_message_attachment(&fake_msg_id, &fake_key_id);
+        let att_eid = insert_event_raw(&conn, recorded_by, &att_blob);
+        let result = project_one(&conn, recorded_by, &att_eid).unwrap();
+        match result {
+            ProjectionDecision::Block { ref missing } => {
+                assert_eq!(missing.len(), 2, "should block on both missing deps");
+            }
+            _ => panic!("expected Block, got {:?}", result),
+        }
+    }
+
+    #[test]
+    fn test_attachment_cascade_unblock() {
+        let conn = setup();
+        let recorded_by = "peer1";
+
+        // Pre-compute the message and key event IDs
+        let (_msg, msg_blob) = make_message("hello cascade");
+        let msg_eid = crate::crypto::hash_event(&msg_blob);
+
+        let sk = ParsedEvent::SecretKey(SecretKeyEvent {
+            created_at_ms: now_ms(),
+            key_bytes: [0xBB; 32],
+        });
+        let sk_blob = events::encode_event(&sk).unwrap();
+        let sk_eid = crate::crypto::hash_event(&sk_blob);
+
+        // Insert attachment first (both deps missing → blocks)
+        let (_att, att_blob) = make_message_attachment(&msg_eid, &sk_eid);
+        let att_eid = insert_event_raw(&conn, recorded_by, &att_blob);
+        let result = project_one(&conn, recorded_by, &att_eid).unwrap();
+        assert!(matches!(result, ProjectionDecision::Block { .. }));
+
+        // Insert message dep — still blocked (key missing)
+        let msg_eid2 = insert_event_raw(&conn, recorded_by, &msg_blob);
+        assert_eq!(msg_eid, msg_eid2);
+        project_one(&conn, recorded_by, &msg_eid).unwrap();
+
+        // Attachment still not valid
+        let att_b64 = event_id_to_base64(&att_eid);
+        let valid: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &att_b64],
+            |row| row.get(0),
+        ).unwrap();
+        assert!(!valid, "attachment should still be blocked");
+
+        // Insert key dep — should cascade-unblock attachment
+        let sk_eid2 = insert_event_raw(&conn, recorded_by, &sk_blob);
+        assert_eq!(sk_eid, sk_eid2);
+        project_one(&conn, recorded_by, &sk_eid).unwrap();
+
+        // Attachment should now be valid
+        let valid2: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &att_b64],
+            |row| row.get(0),
+        ).unwrap();
+        assert!(valid2, "attachment should have been cascade-unblocked");
+    }
+
+    #[test]
+    fn test_file_slice_idempotent_replay() {
+        let conn = setup();
+        let recorded_by = "peer1";
+        let mut rng = rand::thread_rng();
+        let signing_key = SigningKey::generate(&mut rng);
+        let public_key = signing_key.verifying_key().to_bytes();
+
+        let (_pk, pk_blob) = make_peer_key(public_key);
+        let pk_eid = insert_event_raw(&conn, recorded_by, &pk_blob);
+        project_one(&conn, recorded_by, &pk_eid).unwrap();
+
+        let file_id = [99u8; 32];
+        let (_fs, fs_blob) = make_file_slice(&signing_key, &pk_eid, file_id, 0, b"data");
+        let fs_eid = insert_event_raw(&conn, recorded_by, &fs_blob);
+
+        // First projection
+        let result = project_one(&conn, recorded_by, &fs_eid).unwrap();
+        assert_eq!(result, ProjectionDecision::Valid);
+
+        // Replay — should return AlreadyProcessed (already in valid_events)
+        let result2 = project_one(&conn, recorded_by, &fs_eid).unwrap();
+        assert_eq!(result2, ProjectionDecision::AlreadyProcessed);
+    }
+
+    #[test]
+    fn test_file_slice_duplicate_slot_conflict_rejects() {
+        let conn = setup();
+        let recorded_by = "peer1";
+        let mut rng = rand::thread_rng();
+        let signing_key = SigningKey::generate(&mut rng);
+        let public_key = signing_key.verifying_key().to_bytes();
+
+        let (_pk, pk_blob) = make_peer_key(public_key);
+        let pk_eid = insert_event_raw(&conn, recorded_by, &pk_blob);
+        project_one(&conn, recorded_by, &pk_eid).unwrap();
+
+        let file_id = [99u8; 32];
+
+        // First slice at slot 0
+        let (_fs1, fs1_blob) = make_file_slice(&signing_key, &pk_eid, file_id, 0, b"first");
+        let fs1_eid = insert_event_raw(&conn, recorded_by, &fs1_blob);
+        let result = project_one(&conn, recorded_by, &fs1_eid).unwrap();
+        assert_eq!(result, ProjectionDecision::Valid);
+
+        // Second, DIFFERENT slice at same slot 0 — should reject
+        let (_fs2, fs2_blob) = make_file_slice(&signing_key, &pk_eid, file_id, 0, b"second");
+        let fs2_eid = insert_event_raw(&conn, recorded_by, &fs2_blob);
+        let result2 = project_one(&conn, recorded_by, &fs2_eid).unwrap();
+        assert!(matches!(result2, ProjectionDecision::Reject { .. }),
+            "duplicate slot with different event_id should reject, got {:?}", result2);
     }
 }

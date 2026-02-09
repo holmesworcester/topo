@@ -489,9 +489,10 @@ Initial event-size policy:
 
 1. `EVENT_MAX_BLOB_BYTES = 1 MiB` soft cap,
 2. `FILE_SLICE_TARGET_BYTES = 256 KiB`,
-3. `FILE_SLICE_MAX_BYTES = 1 MiB` hard cap.
+3. `FILE_SLICE_MAX_BYTES = 1_048_430` (`EVENT_MAX_BLOB_BYTES - 146 bytes wire overhead`).
 
-`file_slice` events are signed and validated like other canonical events.
+`file_slice` events (type 25, signed) are signed and validated like other canonical events.
+`message_attachment` events (type 24, unsigned) are file descriptors with deps on `message_id` and `key_event_id`.
 
 ---
 

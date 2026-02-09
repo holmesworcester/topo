@@ -1,6 +1,7 @@
 pub mod admin;
 pub mod device_invite;
 pub mod encrypted;
+pub mod file_slice;
 pub mod invite_accepted;
 pub mod message;
 pub mod message_deletion;
@@ -11,6 +12,7 @@ pub mod peer_shared;
 pub mod reaction;
 pub mod registry;
 pub mod secret_key;
+pub mod message_attachment;
 pub mod secret_shared;
 pub mod signed_memo;
 pub mod transport_key;
@@ -23,8 +25,10 @@ use std::sync::OnceLock;
 pub use admin::{AdminBootEvent, AdminOngoingEvent};
 pub use device_invite::{DeviceInviteFirstEvent, DeviceInviteOngoingEvent};
 pub use encrypted::EncryptedEvent;
+pub use file_slice::FileSliceEvent;
 pub use invite_accepted::InviteAcceptedEvent;
 pub use message::MessageEvent;
+pub use message_attachment::MessageAttachmentEvent;
 pub use message_deletion::MessageDeletionEvent;
 pub use network::NetworkEvent;
 pub use peer_key::PeerKeyEvent;
@@ -63,6 +67,8 @@ pub const EVENT_TYPE_USER_REMOVED: u8 = 20;
 pub const EVENT_TYPE_PEER_REMOVED: u8 = 21;
 pub const EVENT_TYPE_SECRET_SHARED: u8 = 22;
 pub const EVENT_TYPE_TRANSPORT_KEY: u8 = 23;
+pub const EVENT_TYPE_MESSAGE_ATTACHMENT: u8 = 24;
+pub const EVENT_TYPE_FILE_SLICE: u8 = 25;
 
 /// Max event blob size: 1 MiB
 pub const EVENT_MAX_BLOB_BYTES: usize = 1024 * 1024;
@@ -92,6 +98,8 @@ pub enum ParsedEvent {
     PeerRemoved(PeerRemovedEvent),
     SecretShared(SecretSharedEvent),
     TransportKey(TransportKeyEvent),
+    MessageAttachment(MessageAttachmentEvent),
+    FileSlice(FileSliceEvent),
 }
 
 impl ParsedEvent {
@@ -120,6 +128,8 @@ impl ParsedEvent {
             ParsedEvent::PeerRemoved(r) => r.created_at_ms,
             ParsedEvent::SecretShared(s) => s.created_at_ms,
             ParsedEvent::TransportKey(t) => t.created_at_ms,
+            ParsedEvent::MessageAttachment(a) => a.created_at_ms,
+            ParsedEvent::FileSlice(f) => f.created_at_ms,
         }
     }
 
@@ -170,6 +180,11 @@ impl ParsedEvent {
                 ("signed_by", s.signed_by),
             ],
             ParsedEvent::TransportKey(t) => vec![("signed_by", t.signed_by)],
+            ParsedEvent::MessageAttachment(a) => vec![
+                ("message_id", a.message_id),
+                ("key_event_id", a.key_event_id),
+            ],
+            ParsedEvent::FileSlice(f) => vec![("signed_by", f.signed_by)],
         }
     }
 
@@ -198,6 +213,8 @@ impl ParsedEvent {
             ParsedEvent::PeerRemoved(_) => EVENT_TYPE_PEER_REMOVED,
             ParsedEvent::SecretShared(_) => EVENT_TYPE_SECRET_SHARED,
             ParsedEvent::TransportKey(_) => EVENT_TYPE_TRANSPORT_KEY,
+            ParsedEvent::MessageAttachment(_) => EVENT_TYPE_MESSAGE_ATTACHMENT,
+            ParsedEvent::FileSlice(_) => EVENT_TYPE_FILE_SLICE,
         }
     }
 
@@ -220,6 +237,7 @@ impl ParsedEvent {
             ParsedEvent::PeerRemoved(r) => Some((r.signed_by, r.signer_type)),
             ParsedEvent::SecretShared(s) => Some((s.signed_by, s.signer_type)),
             ParsedEvent::TransportKey(t) => Some((t.signed_by, t.signer_type)),
+            ParsedEvent::FileSlice(f) => Some((f.signed_by, f.signer_type)),
             ParsedEvent::Message(_)
             | ParsedEvent::Reaction(_)
             | ParsedEvent::PeerKey(_)
@@ -227,7 +245,8 @@ impl ParsedEvent {
             | ParsedEvent::SecretKey(_)
             | ParsedEvent::MessageDeletion(_)
             | ParsedEvent::Network(_)
-            | ParsedEvent::InviteAccepted(_) => None,
+            | ParsedEvent::InviteAccepted(_)
+            | ParsedEvent::MessageAttachment(_) => None,
         }
     }
 }
@@ -238,6 +257,7 @@ pub enum EventError {
     WrongType { expected: u8, actual: u8 },
     WrongVariant,
     ContentTooLong(usize),
+    InvalidMetadata(&'static str),
     UnknownType(u8),
 }
 
@@ -252,6 +272,7 @@ impl std::fmt::Display for EventError {
             }
             EventError::WrongVariant => write!(f, "wrong ParsedEvent variant for encoder"),
             EventError::ContentTooLong(len) => write!(f, "content too long: {} bytes", len),
+            EventError::InvalidMetadata(msg) => write!(f, "invalid metadata: {}", msg),
             EventError::UnknownType(t) => write!(f, "unknown event type: {}", t),
         }
     }
@@ -301,6 +322,8 @@ pub fn registry() -> &'static EventRegistry {
             &peer_removed::PEER_REMOVED_META,
             &secret_shared::SECRET_SHARED_META,
             &transport_key::TRANSPORT_KEY_META,
+            &message_attachment::MESSAGE_ATTACHMENT_META,
+            &file_slice::FILE_SLICE_META,
         ])
     })
 }
@@ -918,5 +941,280 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(extract_event_type(&net_blob), Some(EVENT_TYPE_NETWORK));
+    }
+
+    #[test]
+    fn test_message_attachment_roundtrip() {
+        let att = MessageAttachmentEvent {
+            created_at_ms: 5000000000000,
+            message_id: [10u8; 32],
+            file_id: [11u8; 32],
+            blob_bytes: 204800,
+            total_slices: 4,
+            slice_bytes: 65536,
+            root_hash: [12u8; 32],
+            key_event_id: [13u8; 32],
+            filename: "photo.jpg".to_string(),
+            mime_type: "image/jpeg".to_string(),
+        };
+        let event = ParsedEvent::MessageAttachment(att);
+        let blob = encode_event(&event).unwrap();
+        let parsed = parse_event(&blob).unwrap();
+        assert_eq!(parsed, event);
+    }
+
+    #[test]
+    fn test_message_attachment_roundtrip_empty_strings() {
+        let att = MessageAttachmentEvent {
+            created_at_ms: 100,
+            message_id: [0u8; 32],
+            file_id: [0u8; 32],
+            blob_bytes: 0,
+            total_slices: 0,
+            slice_bytes: 0,
+            root_hash: [0u8; 32],
+            key_event_id: [0u8; 32],
+            filename: "".to_string(),
+            mime_type: "".to_string(),
+        };
+        let event = ParsedEvent::MessageAttachment(att);
+        let blob = encode_event(&event).unwrap();
+        assert_eq!(blob.len(), 157); // minimum with empty strings
+        let parsed = parse_event(&blob).unwrap();
+        assert_eq!(parsed, event);
+    }
+
+    #[test]
+    fn test_file_slice_roundtrip() {
+        let fs = FileSliceEvent {
+            created_at_ms: 6000000000000,
+            file_id: [20u8; 32],
+            slice_number: 3,
+            ciphertext: vec![0xAB; 128],
+            signed_by: [21u8; 32],
+            signer_type: 0,
+            signature: [22u8; 64],
+        };
+        let event = ParsedEvent::FileSlice(fs);
+        let blob = encode_event(&event).unwrap();
+        let parsed = parse_event(&blob).unwrap();
+        assert_eq!(parsed, event);
+        // Verify trailing signature layout: last 64 bytes are signature
+        assert_eq!(&blob[blob.len() - 64..], &[22u8; 64]);
+    }
+
+    #[test]
+    fn test_file_slice_large_ciphertext() {
+        let ciphertext = vec![0xCD; 65536]; // 64 KiB
+        let fs = FileSliceEvent {
+            created_at_ms: 7000000000000,
+            file_id: [30u8; 32],
+            slice_number: 0,
+            ciphertext,
+            signed_by: [31u8; 32],
+            signer_type: 0,
+            signature: [32u8; 64],
+        };
+        let event = ParsedEvent::FileSlice(fs);
+        let blob = encode_event(&event).unwrap();
+        assert_eq!(blob.len(), 49 + 65536 + 97); // header + ciphertext + trailer
+        let parsed = parse_event(&blob).unwrap();
+        assert_eq!(parsed, event);
+    }
+
+    #[test]
+    fn test_message_attachment_dep_field_values() {
+        let msg_id = [50u8; 32];
+        let key_id = [51u8; 32];
+        let att = ParsedEvent::MessageAttachment(MessageAttachmentEvent {
+            created_at_ms: 100,
+            message_id: msg_id,
+            file_id: [0u8; 32],
+            blob_bytes: 0,
+            total_slices: 0,
+            slice_bytes: 0,
+            root_hash: [0u8; 32],
+            key_event_id: key_id,
+            filename: "".to_string(),
+            mime_type: "".to_string(),
+        });
+        let deps = att.dep_field_values();
+        assert_eq!(deps.len(), 2);
+        assert_eq!(deps[0].0, "message_id");
+        assert_eq!(deps[0].1, msg_id);
+        assert_eq!(deps[1].0, "key_event_id");
+        assert_eq!(deps[1].1, key_id);
+    }
+
+    #[test]
+    fn test_file_slice_dep_field_values() {
+        let signer = [60u8; 32];
+        let fs = ParsedEvent::FileSlice(FileSliceEvent {
+            created_at_ms: 100,
+            file_id: [0u8; 32],
+            slice_number: 0,
+            ciphertext: vec![],
+            signed_by: signer,
+            signer_type: 0,
+            signature: [0u8; 64],
+        });
+        let deps = fs.dep_field_values();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].0, "signed_by");
+        assert_eq!(deps[0].1, signer);
+    }
+
+    #[test]
+    fn test_file_slice_signer_fields() {
+        let signer = [70u8; 32];
+        let fs = ParsedEvent::FileSlice(FileSliceEvent {
+            created_at_ms: 100,
+            file_id: [0u8; 32],
+            slice_number: 0,
+            ciphertext: vec![],
+            signed_by: signer,
+            signer_type: 3,
+            signature: [0u8; 64],
+        });
+        let (id, st) = fs.signer_fields().unwrap();
+        assert_eq!(id, signer);
+        assert_eq!(st, 3);
+    }
+
+    #[test]
+    fn test_message_attachment_signer_fields() {
+        let att = ParsedEvent::MessageAttachment(MessageAttachmentEvent {
+            created_at_ms: 100,
+            message_id: [0u8; 32],
+            file_id: [0u8; 32],
+            blob_bytes: 0,
+            total_slices: 0,
+            slice_bytes: 0,
+            root_hash: [0u8; 32],
+            key_event_id: [0u8; 32],
+            filename: "".to_string(),
+            mime_type: "".to_string(),
+        });
+        assert!(att.signer_fields().is_none());
+    }
+
+    #[test]
+    fn test_registry_lookup_message_attachment() {
+        let reg = registry();
+        let meta = reg.lookup(EVENT_TYPE_MESSAGE_ATTACHMENT).unwrap();
+        assert_eq!(meta.type_name, "message_attachment");
+        assert_eq!(meta.projection_table, "message_attachments");
+        assert!(!meta.signer_required);
+        assert_eq!(meta.signature_byte_len, 0);
+        assert_eq!(meta.dep_fields, &["message_id", "key_event_id"]);
+    }
+
+    #[test]
+    fn test_registry_lookup_file_slice() {
+        let reg = registry();
+        let meta = reg.lookup(EVENT_TYPE_FILE_SLICE).unwrap();
+        assert_eq!(meta.type_name, "file_slice");
+        assert_eq!(meta.projection_table, "file_slices");
+        assert!(meta.signer_required);
+        assert_eq!(meta.signature_byte_len, 64);
+        assert_eq!(meta.dep_fields, &["signed_by"]);
+    }
+
+    #[test]
+    fn test_message_attachment_rejects_zero_slices_nonzero_bytes() {
+        let att = MessageAttachmentEvent {
+            created_at_ms: 100,
+            message_id: [0u8; 32],
+            file_id: [0u8; 32],
+            blob_bytes: 100,
+            total_slices: 0,
+            slice_bytes: 50,
+            root_hash: [0u8; 32],
+            key_event_id: [0u8; 32],
+            filename: "".to_string(),
+            mime_type: "".to_string(),
+        };
+        let event = ParsedEvent::MessageAttachment(att);
+        let err = encode_event(&event).unwrap_err();
+        assert!(matches!(err, EventError::InvalidMetadata(_)));
+    }
+
+    #[test]
+    fn test_message_attachment_rejects_zero_slice_bytes() {
+        let att = MessageAttachmentEvent {
+            created_at_ms: 100,
+            message_id: [0u8; 32],
+            file_id: [0u8; 32],
+            blob_bytes: 100,
+            total_slices: 2,
+            slice_bytes: 0,
+            root_hash: [0u8; 32],
+            key_event_id: [0u8; 32],
+            filename: "".to_string(),
+            mime_type: "".to_string(),
+        };
+        let event = ParsedEvent::MessageAttachment(att);
+        let err = encode_event(&event).unwrap_err();
+        assert!(matches!(err, EventError::InvalidMetadata(_)));
+    }
+
+    #[test]
+    fn test_message_attachment_rejects_inconsistent_slice_count() {
+        let att = MessageAttachmentEvent {
+            created_at_ms: 100,
+            message_id: [0u8; 32],
+            file_id: [0u8; 32],
+            blob_bytes: 100,
+            total_slices: 3,
+            slice_bytes: 50,
+            root_hash: [0u8; 32],
+            key_event_id: [0u8; 32],
+            filename: "".to_string(),
+            mime_type: "".to_string(),
+        };
+        // expected = ceil(100/50) = 2, but total_slices = 3
+        let event = ParsedEvent::MessageAttachment(att);
+        let err = encode_event(&event).unwrap_err();
+        assert!(matches!(err, EventError::InvalidMetadata(_)));
+    }
+
+    #[test]
+    fn test_message_attachment_rejects_zero_slice_bytes_with_slices() {
+        // Regression: blob_bytes==0, total_slices>0, slice_bytes==0 must not panic (divide-by-zero)
+        let att = MessageAttachmentEvent {
+            created_at_ms: 100,
+            message_id: [0u8; 32],
+            file_id: [0u8; 32],
+            blob_bytes: 0,
+            total_slices: 1,
+            slice_bytes: 0,
+            root_hash: [0u8; 32],
+            key_event_id: [0u8; 32],
+            filename: "".to_string(),
+            mime_type: "".to_string(),
+        };
+        let event = ParsedEvent::MessageAttachment(att);
+        let err = encode_event(&event).unwrap_err();
+        assert!(matches!(err, EventError::InvalidMetadata(_)));
+    }
+
+    #[test]
+    fn test_message_attachment_zero_byte_file_ok() {
+        let att = MessageAttachmentEvent {
+            created_at_ms: 100,
+            message_id: [0u8; 32],
+            file_id: [0u8; 32],
+            blob_bytes: 0,
+            total_slices: 0,
+            slice_bytes: 0,
+            root_hash: [0u8; 32],
+            key_event_id: [0u8; 32],
+            filename: "empty.txt".to_string(),
+            mime_type: "text/plain".to_string(),
+        };
+        let event = ParsedEvent::MessageAttachment(att);
+        let blob = encode_event(&event).unwrap();
+        let parsed = parse_event(&blob).unwrap();
+        assert_eq!(parsed, event);
     }
 }

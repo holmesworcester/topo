@@ -313,6 +313,39 @@ static MIGRATIONS: &[Migration] = &[
             SELECT 1;
         ",
     },
+    Migration {
+        version: 13,
+        name: "add_file_attachment_tables",
+        sql: "
+            CREATE TABLE IF NOT EXISTS message_attachments (
+                recorded_by TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                file_id TEXT NOT NULL,
+                blob_bytes INTEGER NOT NULL,
+                total_slices INTEGER NOT NULL,
+                slice_bytes INTEGER NOT NULL,
+                root_hash BLOB NOT NULL,
+                key_event_id TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                mime_type TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (recorded_by, event_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_msg_att_message ON message_attachments(recorded_by, message_id);
+            CREATE INDEX IF NOT EXISTS idx_msg_att_file ON message_attachments(recorded_by, file_id);
+
+            CREATE TABLE IF NOT EXISTS file_slices (
+                recorded_by TEXT NOT NULL,
+                file_id TEXT NOT NULL,
+                slice_number INTEGER NOT NULL,
+                event_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (recorded_by, file_id, slice_number)
+            );
+            CREATE INDEX IF NOT EXISTS idx_file_slices_event ON file_slices(recorded_by, event_id);
+        ",
+    },
 ];
 
 fn ensure_schema_migrations(conn: &Connection) -> SqliteResult<()> {
@@ -432,6 +465,6 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 12);
+        assert_eq!(count, 13);
     }
 }
