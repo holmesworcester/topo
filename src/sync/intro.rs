@@ -141,6 +141,9 @@ async fn send_intro_to_peer(
     let connection = tokio::time::timeout(Duration::from_secs(5), connecting).await
         .map_err(|_| "connection timeout")??;
     send_intro_offer(&connection, offer).await?;
+    // Brief yield to let the QUIC stack flush the uni stream data before closing.
+    // connection.close() is immediate and discards unsent data.
+    tokio::time::sleep(Duration::from_millis(50)).await;
     connection.close(0u32.into(), b"intro-sent");
     Ok(())
 }
