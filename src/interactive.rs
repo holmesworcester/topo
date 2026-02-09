@@ -193,12 +193,12 @@ impl Session {
 const COMMANDS: &[&str] = &[
     "accept-invite", "accept-link", "accounts", "ban", "channel", "channels",
     "delete", "exit", "help", "identity", "invite", "keys", "link", "messages",
-    "networks", "new-channel", "new-network", "quit", "react", "reactions",
-    "send", "status", "switch", "users",
+    "new-channel", "new-workspace", "quit", "react", "reactions",
+    "send", "status", "switch", "users", "workspaces",
 ];
 
 const COMMAND_FLAGS: &[(&str, &[&str])] = &[
-    ("new-network", &["--name", "--username", "--devicename"]),
+    ("new-workspace", &["--name", "--username", "--devicename"]),
     ("accept-invite", &["--username", "--devicename", "--invite"]),
     ("accept-link", &["--devicename", "--invite"]),
     ("keys", &["--summary"]),
@@ -282,7 +282,7 @@ fn dispatch(
     let args = &parts[1..];
 
     match cmd {
-        "new-network" => cmd_new_network(session, args, out)?,
+        "new-workspace" => cmd_new_network(session, args, out)?,
         "send" => cmd_send(session, args, out)?,
         "messages" => cmd_messages(session, out)?,
         "react" => cmd_react(session, args, out)?,
@@ -299,7 +299,7 @@ fn dispatch(
         "channel" => cmd_channel(session, args, out)?,
         "users" => cmd_users(session, out)?,
         "keys" => cmd_keys(session, args, out)?,
-        "networks" => cmd_networks(session, out)?,
+        "workspaces" => cmd_networks(session, out)?,
         "status" => cmd_status(session, out)?,
         "identity" => cmd_identity(session, out)?,
         "ban" => cmd_ban(session, args, out)?,
@@ -456,7 +456,7 @@ fn cmd_new_network(
 
     writeln!(
         out,
-        "Created network '{}' with user {} ({}) {} {}",
+        "Created workspace '{}' with user {} ({}) {} {}",
         name, username, devicename, user_id, peer_id
     )?;
 
@@ -470,7 +470,7 @@ fn cmd_send(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let account = session
         .active_account()
-        .ok_or("No active account. Run 'new-network' first.")?;
+        .ok_or("No active account. Run 'new-workspace' first.")?;
 
     let content = args.join(" ");
     if content.is_empty() {
@@ -499,7 +499,7 @@ fn cmd_messages(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let account = session
         .active_account()
-        .ok_or("No active account. Run 'new-network' first.")?;
+        .ok_or("No active account. Run 'new-workspace' first.")?;
 
     let conn = open_connection(&account.db_path)?;
     let channel_b64 = base64_encode(&account.active_channel);
@@ -1173,7 +1173,7 @@ fn cmd_networks(
     let conn = open_connection(&account.db_path)?;
 
     let mut stmt = conn.prepare(
-        "SELECT event_id, network_id FROM networks WHERE recorded_by = ?1",
+        "SELECT event_id, workspace_id FROM workspaces WHERE recorded_by = ?1",
     )?;
     let networks: Vec<(String, String)> = stmt
         .query_map(rusqlite::params![&account.identity], |row| {
@@ -1181,12 +1181,12 @@ fn cmd_networks(
         })?
         .collect::<Result<Vec<_>, _>>()?;
 
-    writeln!(out, "NETWORKS:")?;
+    writeln!(out, "WORKSPACES:")?;
     if networks.is_empty() {
         writeln!(out, "  (none)")?;
     } else {
         for (i, (eid, net_id_b64)) in networks.iter().enumerate() {
-            // Try to decode network_id from base64 and interpret as UTF-8 name
+            // Try to decode workspace_id from base64 and interpret as UTF-8 name
             let name = if let Ok(bytes) = base64::Engine::decode(
                 &base64::engine::general_purpose::STANDARD,
                 net_id_b64,
@@ -1254,7 +1254,7 @@ fn cmd_status(
     writeln!(out, "  Events:    {}", events_count)?;
     writeln!(out, "  Messages:  {}", messages_count)?;
     writeln!(out, "  Reactions: {}", reactions_count)?;
-    writeln!(out, "  Network:   {}", network_name)?;
+    writeln!(out, "  Workspace: {}", network_name)?;
     writeln!(out, "  Channel:   {}", ch_name)?;
 
     Ok(())
@@ -1346,8 +1346,8 @@ fn cmd_ban(
 fn cmd_help(out: &mut impl Write) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     writeln!(out, "COMMANDS:")?;
     writeln!(out)?;
-    writeln!(out, "  Network setup:")?;
-    writeln!(out, "    new-network --name <name> --username <username> --devicename <device>")?;
+    writeln!(out, "  Workspace setup:")?;
+    writeln!(out, "    new-workspace --name <name> --username <username> --devicename <device>")?;
     writeln!(out)?;
     writeln!(out, "  Joining/linking:")?;
     writeln!(out, "    invite                           Create invite for new user")?;
@@ -1358,7 +1358,7 @@ fn cmd_help(out: &mut impl Write) -> Result<(), Box<dyn std::error::Error + Send
     writeln!(out, "  Account management:")?;
     writeln!(out, "    switch <n>                       Select account #n")?;
     writeln!(out, "    accounts                         List all accounts")?;
-    writeln!(out, "    users                            List all users in network")?;
+    writeln!(out, "    users                            List all users in workspace")?;
     writeln!(out, "    identity                         Show identity info")?;
     writeln!(out)?;
     writeln!(out, "  Channels:")?;
@@ -1378,7 +1378,7 @@ fn cmd_help(out: &mut impl Write) -> Result<(), Box<dyn std::error::Error + Send
     writeln!(out)?;
     writeln!(out, "  Other:")?;
     writeln!(out, "    keys [--summary]                 Show cryptographic keys")?;
-    writeln!(out, "    networks                         List networks")?;
+    writeln!(out, "    workspaces                       List workspaces")?;
     writeln!(out, "    status                           Show database stats")?;
     writeln!(out, "    help                             Show this help")?;
     writeln!(out, "    quit                             Exit")?;

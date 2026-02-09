@@ -942,7 +942,7 @@ fn cli_networks(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + 
     create_tables(&db)?;
 
     let mut stmt = db.prepare(
-        "SELECT event_id, network_id FROM networks WHERE recorded_by = ?1",
+        "SELECT event_id, workspace_id FROM workspaces WHERE recorded_by = ?1",
     )?;
     let networks: Vec<(String, String)> = stmt
         .query_map(rusqlite::params![&recorded_by], |row| {
@@ -950,7 +950,7 @@ fn cli_networks(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + 
         })?
         .collect::<Result<Vec<_>, _>>()?;
 
-    println!("NETWORKS ({}):", db_path);
+    println!("WORKSPACES ({}):", db_path);
     if networks.is_empty() {
         println!("  (none)");
     } else {

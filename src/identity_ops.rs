@@ -84,10 +84,10 @@ pub fn bootstrap_network(
     // 1. Network event (unsigned) — guard-blocked until trust anchor exists
     let network_key = SigningKey::generate(&mut rng);
     let network_pub = network_key.verifying_key().to_bytes();
-    let net_evt = ParsedEvent::Network(NetworkEvent {
+    let net_evt = ParsedEvent::Workspace(WorkspaceEvent {
         created_at_ms: now_ms(),
         public_key: network_pub,
-        network_id,
+        workspace_id: network_id,
     });
     let network_event_id = event_id_or_blocked(create_event_sync(conn, recorded_by, &net_evt))?;
 
@@ -97,7 +97,7 @@ pub fn bootstrap_network(
     let uib_evt = ParsedEvent::UserInviteBoot(UserInviteBootEvent {
         created_at_ms: now_ms(),
         public_key: invite_pub,
-        network_id,
+        workspace_id: network_id,
         signed_by: network_event_id,
         signer_type: 1,
         signature: [0u8; 64],
@@ -106,11 +106,11 @@ pub fn bootstrap_network(
         event_id_or_blocked(create_signed_event_sync(conn, recorded_by, &uib_evt, &network_key))?;
 
     // 3. InviteAccepted (local event) — binds trust anchor, triggers guard cascade
-    //    that unblocks Network -> UserInviteBoot -> and all downstream events
+    //    that unblocks Workspace -> UserInviteBoot -> and all downstream events
     let ia_evt = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
         created_at_ms: now_ms(),
         invite_event_id: user_invite_event_id,
-        network_id,
+        workspace_id: network_id,
     });
     let _invite_accepted_event_id = create_event_sync(conn, recorded_by, &ia_evt)?;
 
@@ -213,7 +213,7 @@ pub fn create_user_invite(
     let evt = ParsedEvent::UserInviteBoot(UserInviteBootEvent {
         created_at_ms: now_ms(),
         public_key: invite_pub,
-        network_id,
+        workspace_id: network_id,
         signed_by: *network_event_id,
         signer_type: 1,
         signature: [0u8; 64],
@@ -250,7 +250,7 @@ pub fn accept_user_invite(
     let ia_evt = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
         created_at_ms: now_ms(),
         invite_event_id: *invite_event_id,
-        network_id,
+        workspace_id: network_id,
     });
     let invite_accepted_event_id = create_event_sync(conn, recorded_by, &ia_evt)?;
 
@@ -368,7 +368,7 @@ pub fn accept_device_link(
     let ia_evt = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
         created_at_ms: now_ms(),
         invite_event_id: *device_invite_event_id,
-        network_id,
+        workspace_id: network_id,
     });
     let invite_accepted_event_id = create_event_sync(conn, recorded_by, &ia_evt)?;
 

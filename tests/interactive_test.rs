@@ -58,7 +58,7 @@ fn assert_not_contains(output: &str, needle: &str, context: &str) {
 #[test]
 fn test_single_user_messaging() {
     let (out, err) = run_interactive(
-        "new-network --name test --username alice --devicename desktop\n\
+        "new-workspace --name test --username alice --devicename desktop\n\
          send hello world\n\
          send second message\n\
          messages\n\
@@ -67,8 +67,8 @@ fn test_single_user_messaging() {
     );
     assert!(err.is_empty(), "stderr should be empty, got: {}", err);
 
-    assert_contains(&out, "Created network 'test'", "new-network");
-    assert_contains(&out, "alice (desktop)", "new-network user info");
+    assert_contains(&out, "Created workspace 'test'", "new-workspace");
+    assert_contains(&out, "alice (desktop)", "new-workspace user info");
     assert_contains(&out, "Sent: hello world", "first send");
     assert_contains(&out, "Sent: second message", "second send");
     assert_contains(&out, "MESSAGES (#general):", "messages header");
@@ -77,14 +77,14 @@ fn test_single_user_messaging() {
     assert_contains(&out, "STATUS (alice):", "status header");
     assert_contains(&out, "Events:", "status events");
     assert_contains(&out, "Messages:  2", "status messages count");
-    assert_contains(&out, "Network:   test", "status network");
+    assert_contains(&out, "Workspace: test", "status network");
     assert_contains(&out, "Channel:   #general", "status channel");
 }
 
 #[test]
 fn test_two_user_messaging() {
     let (out, err) = run_interactive(
-        "new-network --name chat --username alice --devicename laptop\n\
+        "new-workspace --name chat --username alice --devicename laptop\n\
          invite\n\
          accept-invite --username bob --devicename phone --invite 1\n\
          send hello from bob\n\
@@ -97,7 +97,7 @@ fn test_two_user_messaging() {
     );
     assert!(err.is_empty(), "stderr should be empty, got: {}", err);
 
-    assert_contains(&out, "Created network 'chat'", "new-network");
+    assert_contains(&out, "Created workspace 'chat'", "new-workspace");
     assert_contains(&out, "Created invite #1", "invite");
     assert_contains(&out, "Accepted invite #1 as bob", "accept-invite");
     assert_contains(&out, "Sent: hello from bob", "bob send");
@@ -112,7 +112,7 @@ fn test_two_user_messaging() {
 #[test]
 fn test_list_commands() {
     let (out, err) = run_interactive(
-        "new-network --name test --username alice --devicename desktop\n\
+        "new-workspace --name test --username alice --devicename desktop\n\
          accounts\n\
          channels\n\
          users\n\
@@ -131,7 +131,7 @@ fn test_list_commands() {
 #[test]
 fn test_create_channel_and_send() {
     let (out, err) = run_interactive(
-        "new-network --name test --username alice --devicename desktop\n\
+        "new-workspace --name test --username alice --devicename desktop\n\
          new-channel random\n\
          channels\n\
          channel 2\n\
@@ -154,7 +154,7 @@ fn test_create_channel_and_send() {
 #[test]
 fn test_reactions() {
     let (out, err) = run_interactive(
-        "new-network --name test --username alice --devicename desktop\n\
+        "new-workspace --name test --username alice --devicename desktop\n\
          send test message\n\
          react 1 thumbsup\n\
          reactions 1\n\
@@ -170,7 +170,7 @@ fn test_reactions() {
 #[test]
 fn test_delete_message() {
     let (out, err) = run_interactive(
-        "new-network --name test --username alice --devicename desktop\n\
+        "new-workspace --name test --username alice --devicename desktop\n\
          send keep this\n\
          send delete this\n\
          messages\n\
@@ -194,7 +194,7 @@ fn test_delete_message() {
 #[test]
 fn test_link_device() {
     let (out, err) = run_interactive(
-        "new-network --name test --username alice --devicename desktop\n\
+        "new-workspace --name test --username alice --devicename desktop\n\
          link\n\
          accept-link --devicename phone --invite 1\n\
          accounts\n\
@@ -213,7 +213,7 @@ fn test_link_device() {
 #[test]
 fn test_invite_accept_flow() {
     let (out, err) = run_interactive(
-        "new-network --name mynet --username alice --devicename desktop\n\
+        "new-workspace --name mynet --username alice --devicename desktop\n\
          invite\n\
          accept-invite --username bob --devicename laptop --invite 1\n\
          accounts\n\
@@ -235,7 +235,7 @@ fn test_invite_accept_flow() {
 #[test]
 fn test_identity_display() {
     let (out, err) = run_interactive(
-        "new-network --name test --username alice --devicename desktop\n\
+        "new-workspace --name test --username alice --devicename desktop\n\
          identity\n\
          keys --summary\n\
          quit\n",
@@ -260,9 +260,9 @@ fn test_help_covers_all_commands() {
 
     assert_contains(&out, "COMMANDS:", "help header");
     let expected_commands = [
-        "new-network", "send", "messages", "react", "reactions", "delete",
+        "new-workspace", "send", "messages", "react", "reactions", "delete",
         "invite", "accept-invite", "link", "accept-link", "switch", "accounts",
-        "channels", "new-channel", "channel", "users", "keys", "networks",
+        "channels", "new-channel", "channel", "users", "keys", "workspaces",
         "status", "identity", "ban", "help", "quit",
     ];
     for cmd in &expected_commands {
@@ -283,8 +283,8 @@ fn test_all_commands_no_crash() {
          channels\n\
          users\n\
          keys\n\
-         networks\n\
-         new-network --name test --username alice --devicename desktop\n\
+         workspaces\n\
+         new-workspace --name test --username alice --devicename desktop\n\
          send test\n\
          messages\n\
          react 1 star\n\
@@ -300,7 +300,7 @@ fn test_all_commands_no_crash() {
          users\n\
          keys --summary\n\
          keys\n\
-         networks\n\
+         workspaces\n\
          invite\n\
          link\n\
          switch 1\n\
@@ -309,21 +309,21 @@ fn test_all_commands_no_crash() {
 
     // Should have completed without crashing
     assert_contains(&out, "COMMANDS:", "help ran");
-    assert_contains(&out, "Created network", "new-network ran");
+    assert_contains(&out, "Created workspace", "new-workspace ran");
     assert_contains(&out, "Sent: test", "send ran");
 }
 
 #[test]
-fn test_networks_display() {
+fn test_workspaces_display() {
     let (out, err) = run_interactive(
-        "new-network --name mynetwork --username alice --devicename desktop\n\
-         networks\n\
+        "new-workspace --name mynetwork --username alice --devicename desktop\n\
+         workspaces\n\
          quit\n",
     );
     assert!(err.is_empty(), "stderr should be empty, got: {}", err);
 
-    assert_contains(&out, "NETWORKS:", "networks header");
-    assert_contains(&out, "1. mynetwork", "network name displayed");
+    assert_contains(&out, "WORKSPACES:", "workspaces header");
+    assert_contains(&out, "1. mynetwork", "workspace name displayed");
 }
 
 #[test]
@@ -343,7 +343,7 @@ fn test_unknown_command() {
 #[test]
 fn test_delete_then_verify_stable_author() {
     let (out, err) = run_interactive(
-        "new-network --name test --username alice --devicename desktop\n\
+        "new-workspace --name test --username alice --devicename desktop\n\
          send msg-one\n\
          send msg-two\n\
          send msg-three\n\
@@ -366,7 +366,7 @@ fn test_delete_then_verify_stable_author() {
 #[test]
 fn test_invite_accept_produces_valid_identity() {
     let (out, err) = run_interactive(
-        "new-network --name test --username alice --devicename desktop\n\
+        "new-workspace --name test --username alice --devicename desktop\n\
          invite\n\
          accept-invite --username bob --devicename phone --invite 1\n\
          keys --summary\n\
@@ -393,7 +393,7 @@ fn test_invite_accept_produces_valid_identity() {
 #[test]
 fn test_copy_event_chain_shared_only() {
     let (out, err) = run_interactive(
-        "new-network --name test --username alice --devicename desktop\n\
+        "new-workspace --name test --username alice --devicename desktop\n\
          status\n\
          invite\n\
          accept-invite --username bob --devicename phone --invite 1\n\
