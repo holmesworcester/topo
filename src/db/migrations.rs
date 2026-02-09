@@ -348,43 +348,9 @@ static MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 14,
-        name: "rename_channel_id_to_network_event_id",
-        // Handled specially in run_migrations: renames channel_id→network_event_id
-        // only if the old column exists (pre-existing DBs). Fresh DBs already have
-        // the correct column name from CREATE TABLE in schema.rs.
-        sql: "SELECT 1;",
-    },
-    Migration {
-        version: 15,
-        name: "rename_network_event_id_to_workspace_event_id",
-        // Handled specially in run_migrations: renames network_event_id→workspace_event_id
-        // only if the old column exists (pre-existing DBs). Fresh DBs already have
-        // the correct column name from CREATE TABLE in schema.rs.
-        sql: "SELECT 1;",
-    },
-    Migration {
-        version: 16,
-        name: "add_intro_attempts",
+        name: "add_signer_event_id_to_message_attachments",
         sql: "
-            CREATE TABLE IF NOT EXISTS intro_attempts (
-                recorded_by TEXT NOT NULL,
-                intro_id BLOB NOT NULL,
-                introduced_by_peer_id TEXT NOT NULL,
-                other_peer_id TEXT NOT NULL,
-                origin_ip TEXT NOT NULL,
-                origin_port INTEGER NOT NULL,
-                observed_at INTEGER NOT NULL,
-                expires_at INTEGER NOT NULL,
-                status TEXT NOT NULL DEFAULT 'received',
-                error TEXT,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL,
-                PRIMARY KEY (recorded_by, intro_id)
-            );
-            CREATE INDEX IF NOT EXISTS idx_intro_attempts_status
-                ON intro_attempts(recorded_by, status);
-            CREATE INDEX IF NOT EXISTS idx_intro_attempts_peer
-                ON intro_attempts(recorded_by, other_peer_id);
+            ALTER TABLE message_attachments ADD COLUMN signer_event_id TEXT NOT NULL DEFAULT '';
         ",
     },
 ];
@@ -536,6 +502,6 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 16);
+        assert_eq!(count, 14);
     }
 }

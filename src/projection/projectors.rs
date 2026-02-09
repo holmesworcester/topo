@@ -221,9 +221,10 @@ pub fn project_message_attachment(
     let message_id_b64 = event_id_to_base64(&att.message_id);
     let file_id_b64 = event_id_to_base64(&att.file_id);
     let key_event_id_b64 = event_id_to_base64(&att.key_event_id);
+    let signer_event_id_b64 = event_id_to_base64(&att.signed_by);
     let rows = conn.execute(
-        "INSERT OR IGNORE INTO message_attachments (recorded_by, event_id, message_id, file_id, blob_bytes, total_slices, slice_bytes, root_hash, key_event_id, filename, mime_type, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        "INSERT OR IGNORE INTO message_attachments (recorded_by, event_id, message_id, file_id, blob_bytes, total_slices, slice_bytes, root_hash, key_event_id, filename, mime_type, created_at, signer_event_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         rusqlite::params![
             recorded_by,
             event_id_b64,
@@ -237,14 +238,18 @@ pub fn project_message_attachment(
             &att.filename,
             &att.mime_type,
             att.created_at_ms as i64,
+            signer_event_id_b64,
         ],
     )?;
     Ok(rows > 0)
 }
 
 /// Project a FileSlice event into the file_slices table (index only, no ciphertext).
+/// Authorization: if a MessageAttachment descriptor exists for this file_id,
+/// the file_slice signer must match the descriptor's signer. If no descriptor
+/// exists yet, the file_slice is guard-blocked (Block with empty missing).
 /// Returns Ok(ProjectionDecision::Valid) on success or idempotent replay.
-/// Returns Ok(ProjectionDecision::Reject) if a different event_id already claims this slot.
+/// Returns Ok(ProjectionDecision::Reject) if signer mismatch or slot conflict.
 pub fn project_file_slice(
     conn: &Connection,
     recorded_by: &str,
@@ -252,6 +257,38 @@ pub fn project_file_slice(
     fs: &FileSliceEvent,
 ) -> Result<ProjectionDecision, rusqlite::Error> {
     let file_id_b64 = event_id_to_base64(&fs.file_id);
+    let slice_signer_b64 = event_id_to_base64(&fs.signed_by);
+
+    // Authorization: check attachment descriptor for this file_id
+    let descriptor_signer: Option<String> = match conn.query_row(
+        "SELECT signer_event_id FROM message_attachments WHERE recorded_by = ?1 AND file_id = ?2",
+        rusqlite::params![recorded_by, &file_id_b64],
+        |row| row.get::<_, String>(0),
+    ) {
+        Ok(s) => Some(s),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(e) => return Err(e),
+    };
+
+    match descriptor_signer {
+        None => {
+            // No descriptor yet — guard-block until MessageAttachment arrives
+            return Ok(ProjectionDecision::Block { missing: vec![] });
+        }
+        Some(ref desc_signer) if desc_signer == &slice_signer_b64 => {
+            // Signer matches — proceed to project
+        }
+        Some(ref desc_signer) => {
+            // Signer mismatch — reject
+            return Ok(ProjectionDecision::Reject {
+                reason: format!(
+                    "file_slice signer {} does not match attachment descriptor signer {}",
+                    slice_signer_b64, desc_signer
+                ),
+            });
+        }
+    }
+
     let rows = conn.execute(
         "INSERT OR IGNORE INTO file_slices (recorded_by, file_id, slice_number, event_id, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5)",

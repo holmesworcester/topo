@@ -137,13 +137,13 @@ impl ParsedEvent {
     /// Returns (field_name, raw_32_byte_id) pairs.
     pub fn dep_field_values(&self) -> Vec<(&'static str, [u8; 32])> {
         match self {
-            ParsedEvent::Message(m) => vec![("workspace_event_id", m.workspace_event_id)],
-            ParsedEvent::Reaction(r) => vec![("target_event_id", r.target_event_id)],
+            ParsedEvent::Message(m) => vec![("signed_by", m.signed_by)],
+            ParsedEvent::Reaction(r) => vec![("target_event_id", r.target_event_id), ("signed_by", r.signed_by)],
             ParsedEvent::PeerKey(_) => vec![],
             ParsedEvent::SignedMemo(s) => vec![("signed_by", s.signed_by)],
             ParsedEvent::Encrypted(e) => vec![("key_event_id", e.key_event_id)],
             ParsedEvent::SecretKey(_) => vec![],
-            ParsedEvent::MessageDeletion(d) => vec![("target_event_id", d.target_event_id)],
+            ParsedEvent::MessageDeletion(d) => vec![("target_event_id", d.target_event_id), ("signed_by", d.signed_by)],
             ParsedEvent::Workspace(_) => vec![],
             ParsedEvent::InviteAccepted(_) => vec![],
             // UserInviteBoot: signed_by is a dep (workspace_id is reference, not dep)
@@ -183,6 +183,7 @@ impl ParsedEvent {
             ParsedEvent::MessageAttachment(a) => vec![
                 ("message_id", a.message_id),
                 ("key_event_id", a.key_event_id),
+                ("signed_by", a.signed_by),
             ],
             ParsedEvent::FileSlice(f) => vec![("signed_by", f.signed_by)],
         }
@@ -238,15 +239,15 @@ impl ParsedEvent {
             ParsedEvent::SecretShared(s) => Some((s.signed_by, s.signer_type)),
             ParsedEvent::TransportKey(t) => Some((t.signed_by, t.signer_type)),
             ParsedEvent::FileSlice(f) => Some((f.signed_by, f.signer_type)),
-            ParsedEvent::Message(_)
-            | ParsedEvent::Reaction(_)
-            | ParsedEvent::PeerKey(_)
+            ParsedEvent::Message(m) => Some((m.signed_by, m.signer_type)),
+            ParsedEvent::Reaction(r) => Some((r.signed_by, r.signer_type)),
+            ParsedEvent::MessageDeletion(d) => Some((d.signed_by, d.signer_type)),
+            ParsedEvent::MessageAttachment(a) => Some((a.signed_by, a.signer_type)),
+            ParsedEvent::PeerKey(_)
             | ParsedEvent::Encrypted(_)
             | ParsedEvent::SecretKey(_)
-            | ParsedEvent::MessageDeletion(_)
             | ParsedEvent::Workspace(_)
-            | ParsedEvent::InviteAccepted(_)
-            | ParsedEvent::MessageAttachment(_) => None,
+            | ParsedEvent::InviteAccepted(_) => None,
         }
     }
 }
@@ -356,6 +357,9 @@ mod tests {
             workspace_event_id: [1u8; 32],
             author_id: [2u8; 32],
             content: "Hello, world!".to_string(),
+            signed_by: [0u8; 32],
+            signer_type: 5,
+            signature: [0u8; 64],
         };
 
         let event = ParsedEvent::Message(msg.clone());
@@ -371,6 +375,9 @@ mod tests {
             target_event_id: [3u8; 32],
             author_id: [4u8; 32],
             emoji: "\u{1f44d}".to_string(),
+            signed_by: [0u8; 32],
+            signer_type: 5,
+            signature: [0u8; 64],
         };
 
         let event = ParsedEvent::Reaction(rxn.clone());
@@ -398,7 +405,7 @@ mod tests {
         let memo = SignedMemoEvent {
             created_at_ms: 2222222222222,
             signed_by: [6u8; 32],
-            signer_type: 0,
+            signer_type: 5,
             content: "signed content".to_string(),
             signature: [7u8; 64],
         };
@@ -416,11 +423,14 @@ mod tests {
             created_at_ms: 3333333333333,
             target_event_id: [8u8; 32],
             author_id: [9u8; 32],
+            signed_by: [0u8; 32],
+            signer_type: 5,
+            signature: [0u8; 64],
         };
 
         let event = ParsedEvent::MessageDeletion(del.clone());
         let blob = encode_event(&event).unwrap();
-        assert_eq!(blob.len(), 73);
+        assert_eq!(blob.len(), 170);
         let parsed = parse_event(&blob).unwrap();
         assert_eq!(parsed, event);
     }
@@ -689,10 +699,14 @@ mod tests {
         let msg_meta = reg.lookup(EVENT_TYPE_MESSAGE).unwrap();
         assert_eq!(msg_meta.type_name, "message");
         assert_eq!(msg_meta.projection_table, "messages");
+        assert!(msg_meta.signer_required);
+        assert_eq!(msg_meta.signature_byte_len, 64);
 
         let rxn_meta = reg.lookup(EVENT_TYPE_REACTION).unwrap();
         assert_eq!(rxn_meta.type_name, "reaction");
         assert_eq!(rxn_meta.projection_table, "reactions");
+        assert!(rxn_meta.signer_required);
+        assert_eq!(rxn_meta.signature_byte_len, 64);
 
         let pk_meta = reg.lookup(EVENT_TYPE_PEER_KEY).unwrap();
         assert_eq!(pk_meta.type_name, "peer_key");
@@ -707,6 +721,8 @@ mod tests {
         let del_meta = reg.lookup(EVENT_TYPE_MESSAGE_DELETION).unwrap();
         assert_eq!(del_meta.type_name, "message_deletion");
         assert_eq!(del_meta.projection_table, "deleted_messages");
+        assert!(del_meta.signer_required);
+        assert_eq!(del_meta.signature_byte_len, 64);
 
         // Identity types
         let ws_meta = reg.lookup(EVENT_TYPE_WORKSPACE).unwrap();
@@ -734,9 +750,12 @@ mod tests {
             workspace_event_id: [0u8; 32],
             author_id: [0u8; 32],
             content: "".to_string(),
+            signed_by: [0u8; 32],
+            signer_type: 5,
+            signature: [0u8; 64],
         });
         let blob = encode_event(&msg).unwrap();
-        assert_eq!(blob.len(), 75); // minimum
+        assert_eq!(blob.len(), 172); // minimum
         let parsed = parse_event(&blob).unwrap();
         assert_eq!(parsed, msg);
 
@@ -747,9 +766,12 @@ mod tests {
             workspace_event_id: [0u8; 32],
             author_id: [0u8; 32],
             content: big_content.clone(),
+            signed_by: [0u8; 32],
+            signer_type: 5,
+            signature: [0u8; 64],
         });
         let blob2 = encode_event(&msg2).unwrap();
-        assert_eq!(blob2.len(), 75 + 1000);
+        assert_eq!(blob2.len(), 172 + 1000);
         let parsed2 = parse_event(&blob2).unwrap();
         assert_eq!(parsed2, msg2);
     }
@@ -761,6 +783,9 @@ mod tests {
             workspace_event_id: [0u8; 32],
             author_id: [0u8; 32],
             content: "test".to_string(),
+            signed_by: [0u8; 32],
+            signer_type: 5,
+            signature: [0u8; 64],
         });
         let blob = encode_event(&msg).unwrap();
         assert_eq!(extract_created_at_ms(&blob), Some(42424242424242));
@@ -774,11 +799,13 @@ mod tests {
             workspace_event_id: workspace_id,
             author_id: [2u8; 32],
             content: "hello".to_string(),
+            signed_by: [0u8; 32],
+            signer_type: 5,
+            signature: [0u8; 64],
         });
         let deps = msg.dep_field_values();
         assert_eq!(deps.len(), 1);
-        assert_eq!(deps[0].0, "workspace_event_id");
-        assert_eq!(deps[0].1, workspace_id);
+        assert_eq!(deps[0].0, "signed_by");
     }
 
     #[test]
@@ -789,11 +816,15 @@ mod tests {
             target_event_id: target,
             author_id: [3u8; 32],
             emoji: "\u{1f44d}".to_string(),
+            signed_by: [0u8; 32],
+            signer_type: 5,
+            signature: [0u8; 64],
         });
         let deps = rxn.dep_field_values();
-        assert_eq!(deps.len(), 1);
+        assert_eq!(deps.len(), 2);
         assert_eq!(deps[0].0, "target_event_id");
         assert_eq!(deps[0].1, target);
+        assert_eq!(deps[1].0, "signed_by");
     }
 
     #[test]
@@ -811,7 +842,7 @@ mod tests {
         let memo = ParsedEvent::SignedMemo(SignedMemoEvent {
             created_at_ms: 300,
             signed_by: signer_id,
-            signer_type: 0,
+            signer_type: 5,
             content: "test".to_string(),
             signature: [0u8; 64],
         });
@@ -828,31 +859,19 @@ mod tests {
             created_at_ms: 400,
             target_event_id: target,
             author_id: [10u8; 32],
+            signed_by: [0u8; 32],
+            signer_type: 5,
+            signature: [0u8; 64],
         });
         let deps = del.dep_field_values();
-        assert_eq!(deps.len(), 1);
+        assert_eq!(deps.len(), 2);
         assert_eq!(deps[0].0, "target_event_id");
         assert_eq!(deps[0].1, target);
+        assert_eq!(deps[1].0, "signed_by");
     }
 
     #[test]
     fn test_signer_fields_unsigned() {
-        let msg = ParsedEvent::Message(MessageEvent {
-            created_at_ms: 100,
-            workspace_event_id: [0u8; 32],
-            author_id: [0u8; 32],
-            content: "".to_string(),
-        });
-        assert!(msg.signer_fields().is_none());
-
-        let rxn = ParsedEvent::Reaction(ReactionEvent {
-            created_at_ms: 100,
-            target_event_id: [0u8; 32],
-            author_id: [0u8; 32],
-            emoji: "x".to_string(),
-        });
-        assert!(rxn.signer_fields().is_none());
-
         let pk = ParsedEvent::PeerKey(PeerKeyEvent {
             created_at_ms: 100,
             public_key: [0u8; 32],
@@ -880,13 +899,28 @@ mod tests {
         let memo = ParsedEvent::SignedMemo(SignedMemoEvent {
             created_at_ms: 300,
             signed_by: signer_id,
-            signer_type: 0,
+            signer_type: 5,
             content: "test".to_string(),
             signature: [0u8; 64],
         });
         let (id, st) = memo.signer_fields().unwrap();
         assert_eq!(id, signer_id);
-        assert_eq!(st, 0);
+        assert_eq!(st, 5);
+
+        // Message signed type
+        let msg_signer = [77u8; 32];
+        let msg = ParsedEvent::Message(MessageEvent {
+            created_at_ms: 100,
+            channel_id: [0u8; 32],
+            author_id: [0u8; 32],
+            content: "".to_string(),
+            signed_by: msg_signer,
+            signer_type: 5,
+            signature: [0u8; 64],
+        });
+        let (id, st) = msg.signer_fields().unwrap();
+        assert_eq!(id, msg_signer);
+        assert_eq!(st, 5);
 
         // Identity signed types
         let ub = ParsedEvent::UserBoot(UserBootEvent {
@@ -908,6 +942,9 @@ mod tests {
             workspace_event_id: [0u8; 32],
             author_id: [0u8; 32],
             content: "".to_string(),
+            signed_by: [0u8; 32],
+            signer_type: 5,
+            signature: [0u8; 64],
         }))
         .unwrap();
         assert_eq!(extract_event_type(&msg_blob), Some(EVENT_TYPE_MESSAGE));
@@ -917,6 +954,9 @@ mod tests {
             target_event_id: [0u8; 32],
             author_id: [0u8; 32],
             emoji: "x".to_string(),
+            signed_by: [0u8; 32],
+            signer_type: 5,
+            signature: [0u8; 64],
         }))
         .unwrap();
         assert_eq!(extract_event_type(&rxn_blob), Some(EVENT_TYPE_REACTION));
@@ -931,7 +971,7 @@ mod tests {
         let memo_blob = encode_event(&ParsedEvent::SignedMemo(SignedMemoEvent {
             created_at_ms: 0,
             signed_by: [0u8; 32],
-            signer_type: 0,
+            signer_type: 5,
             content: "".to_string(),
             signature: [0u8; 64],
         }))
@@ -960,6 +1000,9 @@ mod tests {
             key_event_id: [13u8; 32],
             filename: "photo.jpg".to_string(),
             mime_type: "image/jpeg".to_string(),
+            signed_by: [0u8; 32],
+            signer_type: 5,
+            signature: [0u8; 64],
         };
         let event = ParsedEvent::MessageAttachment(att);
         let blob = encode_event(&event).unwrap();
@@ -980,10 +1023,13 @@ mod tests {
             key_event_id: [0u8; 32],
             filename: "".to_string(),
             mime_type: "".to_string(),
+            signed_by: [0u8; 32],
+            signer_type: 5,
+            signature: [0u8; 64],
         };
         let event = ParsedEvent::MessageAttachment(att);
         let blob = encode_event(&event).unwrap();
-        assert_eq!(blob.len(), 157); // minimum with empty strings
+        assert_eq!(blob.len(), 254); // minimum with empty strings
         let parsed = parse_event(&blob).unwrap();
         assert_eq!(parsed, event);
     }
@@ -996,7 +1042,7 @@ mod tests {
             slice_number: 3,
             ciphertext: vec![0xAB; 128],
             signed_by: [21u8; 32],
-            signer_type: 0,
+            signer_type: 5,
             signature: [22u8; 64],
         };
         let event = ParsedEvent::FileSlice(fs);
@@ -1016,7 +1062,7 @@ mod tests {
             slice_number: 0,
             ciphertext,
             signed_by: [31u8; 32],
-            signer_type: 0,
+            signer_type: 5,
             signature: [32u8; 64],
         };
         let event = ParsedEvent::FileSlice(fs);
@@ -1030,6 +1076,7 @@ mod tests {
     fn test_message_attachment_dep_field_values() {
         let msg_id = [50u8; 32];
         let key_id = [51u8; 32];
+        let signer = [52u8; 32];
         let att = ParsedEvent::MessageAttachment(MessageAttachmentEvent {
             created_at_ms: 100,
             message_id: msg_id,
@@ -1041,13 +1088,18 @@ mod tests {
             key_event_id: key_id,
             filename: "".to_string(),
             mime_type: "".to_string(),
+            signed_by: signer,
+            signer_type: 5,
+            signature: [0u8; 64],
         });
         let deps = att.dep_field_values();
-        assert_eq!(deps.len(), 2);
+        assert_eq!(deps.len(), 3);
         assert_eq!(deps[0].0, "message_id");
         assert_eq!(deps[0].1, msg_id);
         assert_eq!(deps[1].0, "key_event_id");
         assert_eq!(deps[1].1, key_id);
+        assert_eq!(deps[2].0, "signed_by");
+        assert_eq!(deps[2].1, signer);
     }
 
     #[test]
@@ -1059,7 +1111,7 @@ mod tests {
             slice_number: 0,
             ciphertext: vec![],
             signed_by: signer,
-            signer_type: 0,
+            signer_type: 5,
             signature: [0u8; 64],
         });
         let deps = fs.dep_field_values();
@@ -1087,6 +1139,7 @@ mod tests {
 
     #[test]
     fn test_message_attachment_signer_fields() {
+        let signer = [88u8; 32];
         let att = ParsedEvent::MessageAttachment(MessageAttachmentEvent {
             created_at_ms: 100,
             message_id: [0u8; 32],
@@ -1098,8 +1151,13 @@ mod tests {
             key_event_id: [0u8; 32],
             filename: "".to_string(),
             mime_type: "".to_string(),
+            signed_by: signer,
+            signer_type: 5,
+            signature: [0u8; 64],
         });
-        assert!(att.signer_fields().is_none());
+        let (id, st) = att.signer_fields().unwrap();
+        assert_eq!(id, signer);
+        assert_eq!(st, 5);
     }
 
     #[test]
@@ -1108,9 +1166,9 @@ mod tests {
         let meta = reg.lookup(EVENT_TYPE_MESSAGE_ATTACHMENT).unwrap();
         assert_eq!(meta.type_name, "message_attachment");
         assert_eq!(meta.projection_table, "message_attachments");
-        assert!(!meta.signer_required);
-        assert_eq!(meta.signature_byte_len, 0);
-        assert_eq!(meta.dep_fields, &["message_id", "key_event_id"]);
+        assert!(meta.signer_required);
+        assert_eq!(meta.signature_byte_len, 64);
+        assert_eq!(meta.dep_fields, &["message_id", "key_event_id", "signed_by"]);
     }
 
     #[test]
@@ -1137,6 +1195,9 @@ mod tests {
             key_event_id: [0u8; 32],
             filename: "".to_string(),
             mime_type: "".to_string(),
+            signed_by: [0u8; 32],
+            signer_type: 5,
+            signature: [0u8; 64],
         };
         let event = ParsedEvent::MessageAttachment(att);
         let err = encode_event(&event).unwrap_err();
@@ -1156,6 +1217,9 @@ mod tests {
             key_event_id: [0u8; 32],
             filename: "".to_string(),
             mime_type: "".to_string(),
+            signed_by: [0u8; 32],
+            signer_type: 5,
+            signature: [0u8; 64],
         };
         let event = ParsedEvent::MessageAttachment(att);
         let err = encode_event(&event).unwrap_err();
@@ -1175,6 +1239,9 @@ mod tests {
             key_event_id: [0u8; 32],
             filename: "".to_string(),
             mime_type: "".to_string(),
+            signed_by: [0u8; 32],
+            signer_type: 5,
+            signature: [0u8; 64],
         };
         // expected = ceil(100/50) = 2, but total_slices = 3
         let event = ParsedEvent::MessageAttachment(att);
@@ -1196,6 +1263,9 @@ mod tests {
             key_event_id: [0u8; 32],
             filename: "".to_string(),
             mime_type: "".to_string(),
+            signed_by: [0u8; 32],
+            signer_type: 5,
+            signature: [0u8; 64],
         };
         let event = ParsedEvent::MessageAttachment(att);
         let err = encode_event(&event).unwrap_err();
@@ -1215,6 +1285,9 @@ mod tests {
             key_event_id: [0u8; 32],
             filename: "empty.txt".to_string(),
             mime_type: "text/plain".to_string(),
+            signed_by: [0u8; 32],
+            signer_type: 5,
+            signature: [0u8; 64],
         };
         let event = ParsedEvent::MessageAttachment(att);
         let blob = encode_event(&event).unwrap();

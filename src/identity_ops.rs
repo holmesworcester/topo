@@ -68,11 +68,11 @@ pub enum InviteType {
 }
 
 /// Bootstrap a full workspace identity chain following the canonical sequence from scenario tests:
-/// Network -> UserInviteBoot -> InviteAccepted (trust anchor) -> UserBoot ->
+/// Workspace -> UserInviteBoot -> InviteAccepted (trust anchor) -> UserBoot ->
 /// DeviceInviteFirst -> PeerSharedFirst -> AdminBoot -> TransportKey.
 ///
 /// InviteAccepted must come early to bind the trust anchor, which triggers a
-/// guard-cascade that unblocks the Network event and all its dependents.
+/// guard-cascade that unblocks the Workspace event and all its dependents.
 pub fn bootstrap_workspace(
     conn: &Connection,
     recorded_by: &str,
@@ -81,7 +81,7 @@ pub fn bootstrap_workspace(
 ) -> Result<IdentityChain, Box<dyn std::error::Error + Send + Sync>> {
     let mut rng = rand::thread_rng();
 
-    // 1. Network event (unsigned) — guard-blocked until trust anchor exists
+    // 1. Workspace event (unsigned) — guard-blocked until trust anchor exists
     let workspace_key = SigningKey::generate(&mut rng);
     let workspace_pub = workspace_key.verifying_key().to_bytes();
     let net_evt = ParsedEvent::Workspace(WorkspaceEvent {
@@ -91,7 +91,7 @@ pub fn bootstrap_workspace(
     });
     let workspace_event_id = event_id_or_blocked(create_event_sync(conn, recorded_by, &net_evt))?;
 
-    // 2. UserInviteBoot (signed by workspace_key) — blocked until Network is valid
+    // 2. UserInviteBoot (signed by workspace_key) — blocked until Workspace is valid
     let invite_key = SigningKey::generate(&mut rng);
     let invite_pub = invite_key.verifying_key().to_bytes();
     let uib_evt = ParsedEvent::UserInviteBoot(UserInviteBootEvent {
@@ -235,7 +235,7 @@ pub fn create_user_invite(
 /// PeerSharedFirst -> TransportKey.
 ///
 /// InviteAccepted must come first to bind the trust anchor and trigger the guard cascade
-/// that makes the copied Network/UserInviteBoot events valid.
+/// that makes the copied Workspace/UserInviteBoot events valid.
 pub fn accept_user_invite(
     conn: &Connection,
     recorded_by: &str,

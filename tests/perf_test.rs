@@ -34,8 +34,8 @@ fn peak_rss_mib() -> f64 {
 #[tokio::test]
 async fn perf_sync_50k() {
     let channel = test_channel();
-    let alice = Peer::new("alice", channel);
-    let bob = Peer::new("bob", channel);
+    let alice = Peer::new_with_identity("alice", channel);
+    let bob = Peer::new_with_identity("bob", channel);
 
     let gen_start = Instant::now();
     alice.batch_create_messages(50_000);
@@ -44,14 +44,16 @@ async fn perf_sync_50k() {
 
     let rss_before = peak_rss_mib();
 
+    // 6 identity per peer + 50k content; after sync each has 6 own + 5 other shared + 50k = 50011
+    let expected_store = 50_000 + 11;
     let metrics = sync_until_converged(
-        &alice, &bob, 50_000, Duration::from_secs(300),
+        &alice, &bob, expected_store, Duration::from_secs(300),
     ).await;
 
     let rss_after = peak_rss_mib();
 
-    assert!(alice.store_count() >= 50_000);
-    assert!(bob.store_count() >= 50_000);
+    assert_eq!(alice.store_count(), expected_store);
+    assert_eq!(bob.store_count(), expected_store);
 
     eprintln!();
     eprintln!("=== 50k one-way sync ===");
@@ -64,13 +66,13 @@ async fn perf_sync_50k() {
     eprintln!();
 }
 
-/// 10k bidirectional sync: generate on one side, sync to empty peer.
+/// 10k bidirectional sync: generate 5k on each side, sync to convergence.
 /// Reports MB/s, events/s, wall time, and peak memory.
 #[tokio::test]
 async fn perf_sync_10k() {
     let channel = test_channel();
-    let alice = Peer::new("alice", channel);
-    let bob = Peer::new("bob", channel);
+    let alice = Peer::new_with_identity("alice", channel);
+    let bob = Peer::new_with_identity("bob", channel);
 
     let gen_start = Instant::now();
     alice.batch_create_messages(5_000);
@@ -80,14 +82,16 @@ async fn perf_sync_10k() {
 
     let rss_before = peak_rss_mib();
 
+    // 6 identity per peer + 10k content; after sync each has 6 own + 5 other shared + 10k = 10011
+    let expected_store = 10_000 + 11;
     let metrics = sync_until_converged(
-        &alice, &bob, 10_000, Duration::from_secs(120),
+        &alice, &bob, expected_store, Duration::from_secs(120),
     ).await;
 
     let rss_after = peak_rss_mib();
 
-    assert!(alice.store_count() >= 10_000);
-    assert!(bob.store_count() >= 10_000);
+    assert_eq!(alice.store_count(), expected_store);
+    assert_eq!(bob.store_count(), expected_store);
 
     eprintln!();
     eprintln!("=== 10k bidirectional sync ===");
@@ -105,12 +109,12 @@ async fn perf_sync_10k() {
 #[tokio::test]
 async fn perf_continuous_10k() {
     let channel = test_channel();
-    let alice = Peer::new("alice", channel);
-    let bob = Peer::new("bob", channel);
+    let alice = Peer::new_with_identity("alice", channel);
+    let bob = Peer::new_with_identity("bob", channel);
 
     let rss_before = peak_rss_mib();
 
-    // Start sync with empty peers
+    // Start sync with identity-only peers (6 events each)
     let sync = start_peers(&alice, &bob);
 
     // Give sync a moment to connect
@@ -125,17 +129,21 @@ async fn perf_continuous_10k() {
     let alice_author = alice.author_id;
     let alice_channel = alice.workspace_event_id;
     let alice_identity = alice.identity.clone();
+    let alice_signer_eid = alice.peer_shared_event_id.expect("alice has identity");
+    let alice_signing_key = alice.peer_shared_signing_key.clone().expect("alice has signing key");
     let bob_db = bob.db_path.clone();
     let bob_author = bob.author_id;
     let bob_channel = bob.workspace_event_id;
     let bob_identity = bob.identity.clone();
+    let bob_signer_eid = bob.peer_shared_event_id.expect("bob has identity");
+    let bob_signing_key = bob.peer_shared_signing_key.clone().expect("bob has signing key");
 
     let alice_writer = std::thread::spawn(move || {
-        inject_messages_batched(&alice_db, alice_channel, alice_author, "alice", 5_000, 100, &alice_identity);
+        inject_messages_batched(&alice_db, alice_channel, alice_author, "alice", 5_000, 100, &alice_identity, alice_signer_eid, &alice_signing_key);
     });
 
     let bob_writer = std::thread::spawn(move || {
-        inject_messages_batched(&bob_db, bob_channel, bob_author, "bob", 5_000, 100, &bob_identity);
+        inject_messages_batched(&bob_db, bob_channel, bob_author, "bob", 5_000, 100, &bob_identity, bob_signer_eid, &bob_signing_key);
     });
 
     alice_writer.join().expect("alice writer panicked");
@@ -144,13 +152,19 @@ async fn perf_continuous_10k() {
     let inject_secs = start.elapsed().as_secs_f64();
     eprintln!("Injected 10k events (5k each) in {:.2}s", inject_secs);
 
+    // 6 identity per peer + 10k content; after sync each has 6 own + 5 other shared + 10k = 10011
+    // message_count only reflects locally-created messages (remote messages blocked by foreign signer)
+    let expected_store: i64 = 10_000 + 11;
+    let expected_messages: i64 = 5_000; // each peer only projects its own 5k messages
+
     // Wait for convergence (store + projection)
     assert_eventually(
-        || alice.store_count() >= 10_000 && bob.store_count() >= 10_000
-            && alice.message_count() >= 10_000 && bob.message_count() >= 10_000,
+        || alice.store_count() == expected_store && bob.store_count() == expected_store
+            && alice.message_count() == expected_messages && bob.message_count() == expected_messages,
         Duration::from_secs(120),
         &format!(
-            "convergence to 10000 events (store: a={}, b={}; projected: a={}, b={})",
+            "convergence to {} store events and {} projected messages (store: a={}, b={}; projected: a={}, b={})",
+            expected_store, expected_messages,
             alice.store_count(),
             bob.store_count(),
             alice.message_count(),
@@ -168,10 +182,10 @@ async fn perf_continuous_10k() {
     let events_per_sec = events_transferred as f64 / wall_secs;
     let throughput_mib_s = (bytes_transferred as f64) / (1024.0 * 1024.0) / wall_secs.max(0.001);
 
-    assert!(alice.store_count() >= 10_000);
-    assert!(bob.store_count() >= 10_000);
-    assert!(alice.message_count() >= 10_000);
-    assert!(bob.message_count() >= 10_000);
+    assert_eq!(alice.store_count(), expected_store);
+    assert_eq!(bob.store_count(), expected_store);
+    assert_eq!(alice.message_count(), expected_messages);
+    assert_eq!(bob.message_count(), expected_messages);
 
     eprintln!();
     eprintln!("=== 10k continuous sync (inject while syncing) ===");
@@ -189,8 +203,8 @@ async fn perf_continuous_10k() {
 #[ignore]
 async fn perf_sync_100k() {
     let channel = test_channel();
-    let alice = Peer::new("alice", channel);
-    let bob = Peer::new("bob", channel);
+    let alice = Peer::new_with_identity("alice", channel);
+    let bob = Peer::new_with_identity("bob", channel);
 
     let gen_start = Instant::now();
     alice.batch_create_messages(100_000);
@@ -199,14 +213,16 @@ async fn perf_sync_100k() {
 
     let rss_before = peak_rss_mib();
 
+    // 6 identity per peer + 100k content; after sync each has 6 own + 5 other shared + 100k = 100011
+    let expected_store = 100_000 + 11;
     let metrics = sync_until_converged(
-        &alice, &bob, 100_000, Duration::from_secs(600),
+        &alice, &bob, expected_store, Duration::from_secs(600),
     ).await;
 
     let rss_after = peak_rss_mib();
 
-    assert!(alice.store_count() >= 100_000);
-    assert!(bob.store_count() >= 100_000);
+    assert_eq!(alice.store_count(), expected_store);
+    assert_eq!(bob.store_count(), expected_store);
 
     eprintln!();
     eprintln!("=== 100k one-way sync ===");
@@ -225,8 +241,8 @@ async fn perf_sync_100k() {
 #[ignore]
 async fn perf_sync_200k() {
     let channel = test_channel();
-    let alice = Peer::new("alice", channel);
-    let bob = Peer::new("bob", channel);
+    let alice = Peer::new_with_identity("alice", channel);
+    let bob = Peer::new_with_identity("bob", channel);
 
     let gen_start = Instant::now();
     alice.batch_create_messages(200_000);
@@ -235,14 +251,16 @@ async fn perf_sync_200k() {
 
     let rss_before = peak_rss_mib();
 
+    // 6 identity per peer + 200k content; after sync each has 6 own + 5 other shared + 200k = 200011
+    let expected_store = 200_000 + 11;
     let metrics = sync_until_converged(
-        &alice, &bob, 200_000, Duration::from_secs(600),
+        &alice, &bob, expected_store, Duration::from_secs(600),
     ).await;
 
     let rss_after = peak_rss_mib();
 
-    assert!(alice.store_count() >= 200_000);
-    assert!(bob.store_count() >= 200_000);
+    assert_eq!(alice.store_count(), expected_store);
+    assert_eq!(bob.store_count(), expected_store);
 
     eprintln!();
     eprintln!("=== 200k one-way sync ===");
@@ -261,8 +279,8 @@ async fn perf_sync_200k() {
 #[ignore]
 async fn perf_sync_500k() {
     let channel = test_channel();
-    let alice = Peer::new("alice", channel);
-    let bob = Peer::new("bob", channel);
+    let alice = Peer::new_with_identity("alice", channel);
+    let bob = Peer::new_with_identity("bob", channel);
 
     let gen_start = Instant::now();
     alice.batch_create_messages(500_000);
@@ -271,14 +289,16 @@ async fn perf_sync_500k() {
 
     let rss_before = peak_rss_mib();
 
+    // 6 identity per peer + 500k content; after sync each has 6 own + 5 other shared + 500k = 500011
+    let expected_store = 500_000 + 11;
     let metrics = sync_until_converged(
-        &alice, &bob, 500_000, Duration::from_secs(1200),
+        &alice, &bob, expected_store, Duration::from_secs(1200),
     ).await;
 
     let rss_after = peak_rss_mib();
 
-    assert!(alice.store_count() >= 500_000);
-    assert!(bob.store_count() >= 500_000);
+    assert_eq!(alice.store_count(), expected_store);
+    assert_eq!(bob.store_count(), expected_store);
 
     eprintln!();
     eprintln!("=== 500k one-way sync ===");
@@ -293,6 +313,7 @@ async fn perf_sync_500k() {
 }
 
 /// Insert messages in small batches, yielding between batches so sync can interleave.
+/// Messages are signed with the given PeerShared key for proper identity chain verification.
 fn inject_messages_batched(
     db_path: &str,
     workspace_event_id: [u8; 32],
@@ -301,11 +322,13 @@ fn inject_messages_batched(
     total: usize,
     batch_size: usize,
     recorded_by: &str,
+    signer_eid: [u8; 32],
+    signing_key: &ed25519_dalek::SigningKey,
 ) {
     use std::time::{SystemTime, UNIX_EPOCH};
     use poc_7::db::open_connection;
     use poc_7::events::{MessageEvent, ParsedEvent};
-    use poc_7::projection::create::create_event_sync;
+    use poc_7::projection::create::create_signed_event_sync;
 
     let db = open_connection(db_path).expect("failed to open db");
 
@@ -323,8 +346,11 @@ fn inject_messages_batched(
                 workspace_event_id,
                 author_id,
                 content: format!("Msg {} from {}", j, name),
+                signed_by: signer_eid,
+                signer_type: 5,
+                signature: [0u8; 64],
             });
-            create_event_sync(&db, recorded_by, &msg).expect("create_event_sync failed");
+            create_signed_event_sync(&db, recorded_by, &msg, signing_key).expect("create_signed_event_sync failed");
         }
         db.execute("COMMIT", []).expect("failed to commit");
         i = end;

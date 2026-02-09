@@ -483,13 +483,18 @@ fn cmd_send(
         .ok_or("No workspace created. Run 'new-workspace' first.")?;
 
     let conn = open_connection(&account.db_path)?;
+    let peer_shared_eid = account.peer_shared_event_id.ok_or("No signing key. Run 'new-workspace' first.")?;
+    let peer_shared_key = account.peer_shared_key.as_ref().ok_or("No signing key.")?.clone();
     let msg = ParsedEvent::Message(MessageEvent {
         created_at_ms: now_ms(),
         workspace_event_id,
         author_id: account.author_id,
         content: content.clone(),
+        signed_by: peer_shared_eid,
+        signer_type: 5,
+        signature: [0u8; 64],
     });
-    let eid = create_event_sync(&conn, &account.identity, &msg)?;
+    let eid = create_signed_event_sync(&conn, &account.identity, &msg, &peer_shared_key)?;
     let eid_b64 = event_id_to_base64(&eid);
 
     writeln!(out, "Sent: {} ({})", content, &eid_b64[..8])?;
@@ -623,13 +628,18 @@ fn cmd_react(
     let conn = open_connection(&account.db_path)?;
     let target_event_id = get_message_event_id_by_num(&conn, &account.identity, msg_num)?;
 
+    let peer_shared_eid = account.peer_shared_event_id.ok_or("No signing key.")?;
+    let peer_shared_key = account.peer_shared_key.as_ref().ok_or("No signing key.")?.clone();
     let rxn = ParsedEvent::Reaction(ReactionEvent {
         created_at_ms: now_ms(),
         target_event_id,
         author_id: account.author_id,
         emoji: emoji.to_string(),
+        signed_by: peer_shared_eid,
+        signer_type: 5,
+        signature: [0u8; 64],
     });
-    event_id_or_blocked(create_event_sync(&conn, &account.identity, &rxn))?;
+    event_id_or_blocked(create_signed_event_sync(&conn, &account.identity, &rxn, &peer_shared_key))?;
 
     writeln!(out, "Reacted {} to message {}", emoji, msg_num)?;
 
@@ -696,12 +706,17 @@ fn cmd_delete(
     let conn = open_connection(&account.db_path)?;
     let target_event_id = get_message_event_id_by_num(&conn, &account.identity, msg_num)?;
 
+    let peer_shared_eid = account.peer_shared_event_id.ok_or("No signing key.")?;
+    let peer_shared_key = account.peer_shared_key.as_ref().ok_or("No signing key.")?.clone();
     let del = ParsedEvent::MessageDeletion(MessageDeletionEvent {
         created_at_ms: now_ms(),
         target_event_id,
         author_id: account.author_id,
+        signed_by: peer_shared_eid,
+        signer_type: 5,
+        signature: [0u8; 64],
     });
-    event_id_or_blocked(create_event_sync(&conn, &account.identity, &del))?;
+    event_id_or_blocked(create_signed_event_sync(&conn, &account.identity, &del, &peer_shared_key))?;
 
     writeln!(out, "Deleted message {}", msg_num)?;
 
@@ -723,8 +738,8 @@ fn cmd_invite(
         .clone();
     let workspace_event_id = account
         .workspace_event_id
-        .ok_or("No workspace event ID.")?;
-    let workspace_id = account.workspace_id.ok_or("No workspace ID.")?;
+        .ok_or("No network event ID.")?;
+    let workspace_id = account.workspace_id.ok_or("No network ID.")?;
 
     let conn = open_connection(&account.db_path)?;
     let invite = identity_ops::create_user_invite(
@@ -814,8 +829,8 @@ fn cmd_link(
         .ok_or("No user key.")?
         .clone();
     let user_event_id = account.user_event_id.ok_or("No user event ID.")?;
-    let workspace_id = account.workspace_id.ok_or("No workspace ID.")?;
-    let workspace_event_id = account.workspace_event_id.ok_or("No workspace event ID.")?;
+    let workspace_id = account.workspace_id.ok_or("No network ID.")?;
+    let workspace_event_id = account.workspace_event_id.ok_or("No network event ID.")?;
 
     let conn = open_connection(&account.db_path)?;
     let invite = identity_ops::create_device_link_invite(
@@ -1229,7 +1244,7 @@ fn cmd_status(
         .unwrap_or(0);
 
     // Network name
-    let workspace_name = account
+    let network_name = account
         .workspace_id
         .map(|nid| {
             String::from_utf8_lossy(&nid)

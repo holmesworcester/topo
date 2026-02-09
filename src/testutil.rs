@@ -22,6 +22,7 @@ use crate::transport::{
     extract_spki_fingerprint,
     load_or_generate_cert,
 };
+use ed25519_dalek::SigningKey;
 
 fn current_timestamp_ms() -> u64 {
     SystemTime::now()
@@ -64,18 +65,17 @@ pub struct Peer {
     pub db_path: String,
     pub identity: String,
     pub author_id: [u8; 32],
-    pub workspace_event_id: [u8; 32],
+    pub channel_id: [u8; 32],
+    /// PeerShared event_id used as signer for content events.
+    pub peer_shared_event_id: Option<EventId>,
+    /// PeerShared signing key for signing content events.
+    pub peer_shared_signing_key: Option<SigningKey>,
     _tempdir: tempfile::TempDir,
 }
 
 impl Peer {
-    /// Create a new peer with a fresh temp database.
-    /// The `workspace_id` parameter is used to create a workspace event;
-    /// `workspace_event_id` is set to the workspace event's content-addressed hash.
-    pub fn new(name: &str, workspace_id: [u8; 32]) -> Self {
-        use crate::crypto::{hash_event, event_id_to_base64};
-        use crate::events;
-
+    /// Create a new peer with a fresh temp database (no identity chain).
+    pub fn new(name: &str, channel_id: [u8; 32]) -> Self {
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         let db_path = tempdir.path().join(format!("{}.db", name))
             .to_str().unwrap().to_string();
@@ -125,13 +125,116 @@ impl Peer {
             db_path,
             identity,
             author_id,
-            workspace_event_id: ws_eid,
+            channel_id,
+            peer_shared_event_id: None,
+            peer_shared_signing_key: None,
             _tempdir: tempdir,
         }
     }
 
+    /// Create a new peer with a full identity chain (Workspace → InviteAccepted →
+    /// UserInviteBoot → UserBoot → DeviceInviteFirst → PeerSharedFirst).
+    /// Content events (Message, Reaction, etc.) are signed with the PeerShared key.
+    pub fn new_with_identity(name: &str, channel_id: [u8; 32]) -> Self {
+        let mut peer = Self::new(name, channel_id);
+        peer.bootstrap_identity_chain();
+        peer
+    }
+
+    /// Bootstrap a full identity chain for this peer.
+    fn bootstrap_identity_chain(&mut self) {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        let mut rng = rand::thread_rng();
+
+        // 1. Workspace
+        let workspace_key = SigningKey::generate(&mut rng);
+        let workspace_pub = workspace_key.verifying_key().to_bytes();
+        let workspace_id: [u8; 32] = rand::random();
+        let net = ParsedEvent::Workspace(WorkspaceEvent {
+            created_at_ms: current_timestamp_ms(),
+            public_key: workspace_pub,
+            workspace_id,
+        });
+        let net_eid = event_id_or_blocked(create_event_sync(&db, &self.identity, &net))
+            .expect("failed to create workspace");
+
+        // 2. InviteAccepted (binds trust anchor)
+        let ia = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
+            created_at_ms: current_timestamp_ms(),
+            invite_event_id: net_eid,
+            workspace_id,
+        });
+        let _ia_eid = create_event_sync(&db, &self.identity, &ia)
+            .expect("failed to create invite_accepted");
+
+        // Re-project Workspace (now trust anchor exists)
+        project_one(&db, &self.identity, &net_eid).unwrap();
+
+        // 3. UserInviteBoot (signed by workspace key)
+        let invite_key = SigningKey::generate(&mut rng);
+        let uib = ParsedEvent::UserInviteBoot(UserInviteBootEvent {
+            created_at_ms: current_timestamp_ms(),
+            public_key: invite_key.verifying_key().to_bytes(),
+            workspace_id,
+            signed_by: net_eid,
+            signer_type: 1,
+            signature: [0u8; 64],
+        });
+        let uib_eid = create_signed_event_sync(&db, &self.identity, &uib, &workspace_key)
+            .expect("failed to create user_invite_boot");
+
+        // 4. UserBoot (signed by invite key)
+        let user_key = SigningKey::generate(&mut rng);
+        let ub = ParsedEvent::UserBoot(UserBootEvent {
+            created_at_ms: current_timestamp_ms(),
+            public_key: user_key.verifying_key().to_bytes(),
+            signed_by: uib_eid,
+            signer_type: 2,
+            signature: [0u8; 64],
+        });
+        let ub_eid = create_signed_event_sync(&db, &self.identity, &ub, &invite_key)
+            .expect("failed to create user_boot");
+
+        // 5. DeviceInviteFirst (signed by user key)
+        let device_invite_key = SigningKey::generate(&mut rng);
+        let dif = ParsedEvent::DeviceInviteFirst(DeviceInviteFirstEvent {
+            created_at_ms: current_timestamp_ms(),
+            public_key: device_invite_key.verifying_key().to_bytes(),
+            signed_by: ub_eid,
+            signer_type: 4,
+            signature: [0u8; 64],
+        });
+        let dif_eid = create_signed_event_sync(&db, &self.identity, &dif, &user_key)
+            .expect("failed to create device_invite_first");
+
+        // 6. PeerSharedFirst (signed by device_invite key)
+        let peer_shared_key = SigningKey::generate(&mut rng);
+        let psf = ParsedEvent::PeerSharedFirst(PeerSharedFirstEvent {
+            created_at_ms: current_timestamp_ms(),
+            public_key: peer_shared_key.verifying_key().to_bytes(),
+            signed_by: dif_eid,
+            signer_type: 3,
+            signature: [0u8; 64],
+        });
+        let psf_eid = create_signed_event_sync(&db, &self.identity, &psf, &device_invite_key)
+            .expect("failed to create peer_shared_first");
+
+        self.peer_shared_event_id = Some(psf_eid);
+        self.peer_shared_signing_key = Some(peer_shared_key);
+    }
+
+    /// Get the PeerShared signer event_id. Panics if no identity chain.
+    fn signer_eid(&self) -> EventId {
+        self.peer_shared_event_id.expect("Peer has no identity chain; use new_with_identity()")
+    }
+
+    /// Get a reference to the PeerShared signing key. Panics if no identity chain.
+    fn signing_key(&self) -> &SigningKey {
+        self.peer_shared_signing_key.as_ref().expect("Peer has no identity chain; use new_with_identity()")
+    }
+
     /// Create a message and insert it into all relevant tables.
-    /// Returns the event ID.
+    /// Returns the event ID. Requires identity chain (use new_with_identity).
     pub fn create_message(&self, content: &str) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
         let msg = ParsedEvent::Message(MessageEvent {
@@ -139,12 +242,16 @@ impl Peer {
             workspace_event_id: self.workspace_event_id,
             author_id: self.author_id,
             content: content.to_string(),
+            signed_by: self.signer_eid(),
+            signer_type: 5,
+            signature: [0u8; 64],
         });
-        create_event_sync(&db, &self.identity, &msg).expect("failed to create message")
+        create_signed_event_sync(&db, &self.identity, &msg, self.signing_key())
+            .expect("failed to create message")
     }
 
     /// Create a reaction targeting a message event.
-    /// Returns the reaction event ID.
+    /// Returns the reaction event ID. Requires identity chain.
     pub fn create_reaction(&self, target_event_id: &EventId, emoji: &str) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
         let rxn = ParsedEvent::Reaction(ReactionEvent {
@@ -152,13 +259,16 @@ impl Peer {
             target_event_id: *target_event_id,
             author_id: self.author_id,
             emoji: emoji.to_string(),
+            signed_by: self.signer_eid(),
+            signer_type: 5,
+            signature: [0u8; 64],
         });
-        event_id_or_blocked(create_event_sync(&db, &self.identity, &rxn))
+        event_id_or_blocked(create_signed_event_sync(&db, &self.identity, &rxn, self.signing_key()))
             .expect("failed to create reaction")
     }
 
-    /// Create a PeerKey event publishing an Ed25519 public key.
-    /// Returns the event ID.
+    /// DEPRECATED: Create a PeerKey event. New code should use identity chain
+    /// (PeerSharedFirst) via `new_with_identity()` instead. Retained for backward-compat tests.
     pub fn create_peer_key(&self, public_key: [u8; 32]) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
         let pk = ParsedEvent::PeerKey(PeerKeyEvent {
@@ -180,7 +290,7 @@ impl Peer {
         let memo = ParsedEvent::SignedMemo(SignedMemoEvent {
             created_at_ms: current_timestamp_ms(),
             signed_by: *signer_key_eid,
-            signer_type: 0,
+            signer_type: 5,
             content: content.to_string(),
             signature: [0u8; 64], // placeholder, overwritten by create_signed_event_sync
         });
@@ -211,9 +321,8 @@ impl Peer {
         create_event_sync(&db, &self.identity, &sk).expect("failed to create secret_key")
     }
 
-    /// Create an encrypted message. Encrypts the given content as a message event
-    /// using the key referenced by key_event_id.
-    /// Returns the encrypted event ID.
+    /// Create an encrypted message. The inner message is signed with the PeerShared key,
+    /// then encrypted. Returns the encrypted event ID. Requires identity chain.
     pub fn create_encrypted_message(&self, key_event_id: &EventId, content: &str) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
         let inner = ParsedEvent::Message(MessageEvent {
@@ -221,35 +330,54 @@ impl Peer {
             workspace_event_id: self.workspace_event_id,
             author_id: self.author_id,
             content: content.to_string(),
+            signed_by: self.signer_eid(),
+            signer_type: 5,
+            signature: [0u8; 64],
         });
-        create_encrypted_event_sync(&db, &self.identity, key_event_id, &inner)
-            .expect("failed to create encrypted message")
+        // Sign the inner event, then encrypt the signed blob
+        self.create_encrypted_signed_event_sync(&db, key_event_id, &inner)
+    }
+
+    /// Sign an inner event, encrypt the signed blob, wrap in EncryptedEvent, store + project.
+    fn create_encrypted_signed_event_sync(
+        &self,
+        db: &rusqlite::Connection,
+        key_event_id: &EventId,
+        inner_event: &ParsedEvent,
+    ) -> EventId {
+        create_encrypted_event_sync(db, &self.identity, key_event_id, inner_event, Some(self.signing_key()))
+            .expect("failed to create encrypted signed event")
     }
 
     /// Create a MessageDeletion event targeting the given message event.
-    /// Returns the deletion event ID.
+    /// Returns the deletion event ID. Requires identity chain.
     pub fn create_message_deletion(&self, target_event_id: &EventId) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
         let del = ParsedEvent::MessageDeletion(MessageDeletionEvent {
             created_at_ms: current_timestamp_ms(),
             target_event_id: *target_event_id,
             author_id: self.author_id,
+            signed_by: self.signer_eid(),
+            signer_type: 5,
+            signature: [0u8; 64],
         });
-        event_id_or_blocked(create_event_sync(&db, &self.identity, &del))
+        event_id_or_blocked(create_signed_event_sync(&db, &self.identity, &del, self.signing_key()))
             .expect("failed to create message_deletion")
     }
 
     /// Create an encrypted MessageDeletion event.
-    /// Returns the encrypted event ID.
+    /// Returns the encrypted event ID. Requires identity chain.
     pub fn create_encrypted_deletion(&self, key_event_id: &EventId, target_event_id: &EventId) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
         let inner = ParsedEvent::MessageDeletion(MessageDeletionEvent {
             created_at_ms: current_timestamp_ms(),
             target_event_id: *target_event_id,
             author_id: self.author_id,
+            signed_by: self.signer_eid(),
+            signer_type: 5,
+            signature: [0u8; 64],
         });
-        create_encrypted_event_sync(&db, &self.identity, key_event_id, &inner)
-            .expect("failed to create encrypted deletion")
+        self.create_encrypted_signed_event_sync(&db, key_event_id, &inner)
     }
 
     // --- Identity event helpers ---
@@ -523,6 +651,7 @@ impl Peer {
     }
 
     /// Create multiple messages. Uses a transaction for speed at scale.
+    /// Requires identity chain.
     pub fn batch_create_messages(&self, count: usize) {
         let db = open_connection(&self.db_path).expect("failed to open db");
         db.execute("BEGIN", []).expect("failed to begin");
@@ -532,8 +661,12 @@ impl Peer {
                 workspace_event_id: self.workspace_event_id,
                 author_id: self.author_id,
                 content: format!("Message {} from {}", i, self.name),
+                signed_by: self.signer_eid(),
+                signer_type: 5,
+                signature: [0u8; 64],
             });
-            create_event_sync(&db, &self.identity, &msg).expect("failed to create message");
+            create_signed_event_sync(&db, &self.identity, &msg, self.signing_key())
+                .expect("failed to create message");
         }
         db.execute("COMMIT", []).expect("failed to commit");
     }
