@@ -409,6 +409,8 @@ Table lifecycle:
 2. Core tables are created by core migrations (`events`, queues, `recorded_events`, etc.).
 3. Event projection tables are created by event-module migrations registered in the event registry.
 4. Startup must run migration + registry/schema consistency checks and fail fast on mismatch.
+5. Prototype schema epoch is explicit (`schema_epoch`) and checked at startup.
+6. No backward compatibility is provided across prototype epochs: if an old DB is detected (legacy `schema_migrations` without current epoch marker), startup must fail with a clear "recreate DB" error.
 
 Naming and ownership:
 1. Do not infer table names by pluralization heuristics.

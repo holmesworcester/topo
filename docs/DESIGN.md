@@ -171,7 +171,9 @@ This preserves `poc-6`-style scoped reads/writes while keeping the schema ergono
 1. schema creation runs through ordered migrations,
 2. event modules register their projection table migrations,
 3. startup performs migration + registry/schema consistency checks and fails fast on mismatch,
-4. each event module declares explicit `event_type` and `projection_table`; no inferred naming heuristics.
+4. prototype schema epoch is explicit (`schema_epoch`) and enforced at startup,
+5. legacy DB layouts from prior prototype epochs are intentionally rejected (no backward migration; recreate DB),
+6. each event module declares explicit `event_type` and `projection_table`; no inferred naming heuristics.
 
 ---
 
