@@ -65,7 +65,7 @@ Gap-to-phase mapping:
 
 ## 2. Core Simplifications To Preserve
 
-- Terminology: use `workspace` (event + domain term) for the peer set and shared context; reserve "network" for transport/networking.
+- Terminology: `workspace` is the event and domain term for the peer set and shared context; "network" refers only to transport/networking.
 - Connection/sync state is protocol/runtime state, not canonical events.
 - Canonical events are durable, replayable, and mostly projector-autowritable.
 - Local-only events remain canonical events, selected by `event_type` policy.
@@ -80,7 +80,7 @@ Gap-to-phase mapping:
 - Use separate tables for permanent canonical data vs operational queues.
 - Use separate invite event types (`user_invite`, `device_invite`), not one multimodal invite with `mode=*`.
 - `invite_accepted` is local trust-anchor binding; it is not guarded by generic "invite presence" checks.
-- Trust-anchor guards apply to root network/workspace events (foreign root ids must not become valid).
+- Trust-anchor guards apply to root workspace events (foreign root ids must not become valid).
 - Deterministic emitted event types stay inside the emitted-event rule flow but are unsigned for determinism (`no signed_by/signer_type/signature`).
 
 ## 2.1 Locked design requirements (explicit)
@@ -112,7 +112,7 @@ These are required, not optional:
    - blocked rows that are policy-appropriate for a tenant (for example non-recipient encrypted/key-share events) are expected and must not be treated as sync failure.
 10. Guard-placement requirement.
    - `invite_accepted` is a local anchor-binding event, not a global invite-presence gate.
-   - trust-anchor gating belongs on root network/workspace event validity.
+   - trust-anchor gating belongs on root workspace event validity.
    - do not use pre-projection raw-blob capture tables as authority for trust-anchor binding.
 
 ---
@@ -409,6 +409,8 @@ Table lifecycle:
 2. Core tables are created by core migrations (`events`, queues, `recorded_events`, etc.).
 3. Event projection tables are created by event-module migrations registered in the event registry.
 4. Startup must run migration + registry/schema consistency checks and fail fast on mismatch.
+5. Prototype schema epoch is explicit (`schema_epoch`) and checked at startup.
+6. No backward compatibility is provided across prototype epochs: if an old DB is detected (legacy `schema_migrations` without current epoch marker), startup must fail with a clear "recreate DB" error.
 
 Naming and ownership:
 1. Do not infer table names by pluralization heuristics.
@@ -939,9 +941,9 @@ Before writing identity/removal/encryption projectors in Rust:
    - invalid signature rejects (not block).
 2. Build/update a TLA+ model of causal relationships and guards for this phase.
 3. Model split invite types (`user_invite`, `device_invite`) and trust-anchor semantics.
-4. **Model network binding**: network events must be parameterized by network id, and the trust anchor must bind to a specific network. The model must prove that foreign network events (for networks the peer did not accept an invite for) can never become valid. Without this, the model cannot distinguish between valid and invalid network events, making it insufficiently expressive for multi-network scenarios. See `InvNetAnchor`, `InvSingleNetwork`, `InvForeignNetExcluded` invariants.
-5. **Model deterministic trust-anchor binding from explicit accepted-invite data**: `invite_accepted` binds trust anchor directly from validated event fields (for example accepted `network_id`/workspace root id), not from pre-projection blob-capture side channels.
-6. **Model guard placement explicitly**: trust-anchor guard applies to root network/workspace events; `invite_accepted` itself must not depend on a global `HasRecordedInvite`-style guard.
+4. **Model workspace binding**: workspace events must be parameterized by workspace id, and the trust anchor must bind to a specific workspace. The model must prove that foreign workspace events (for workspaces the peer did not accept an invite for) can never become valid. Without this, the model cannot distinguish between valid and invalid workspace events, making it insufficiently expressive for multi-workspace scenarios. See `InvNetAnchor`, `InvSingleWorkspace`, `InvForeignNetExcluded` invariants.
+5. **Model invite-derived trust anchor binding**: the trust anchor must bind deterministically to the workspace referenced by the invite, not by a free nondeterministic choice at `invite_accepted` time. The model captures which workspace an invite references when the first invite is recorded (`inviteNet` variable); `invite_accepted` then reads `inviteNet` to set the trust anchor. This ensures the binding mechanism is faithful to the real protocol where the invite blob carries a `workspace_id`. See `InvTrustAnchorMatchesInvite` invariant.
+6. **Model guard placement explicitly**: trust-anchor guard applies to root workspace events; `invite_accepted` itself must not depend on a global `HasRecordedInvite`-style guard.
 7. Verify bootstrap/self-invite, join, device-link, and removal safety invariants.
 8. Freeze a projector-spec mapping table: each projector predicate/check maps to a named TLA guard.
 9. Record TLA scope boundary for this phase:
@@ -978,7 +980,7 @@ Implementation requirement:
 Required behavior:
 - `invite_accepted` records trust anchor intent for `workspace_id` (per `recorded_by` peer scope).
 - `invite_accepted` is a local binding step and should not be blocked by a global "recorded invite exists" guard.
-- root `workspace`/network events are not valid until corresponding trust anchor exists and matches the root id.
+- root `workspace` events are not valid until corresponding trust anchor exists and matches the root id.
 - trust-anchor binding must come from validated projector input fields, not pre-projection capture tables.
 - invites are never force-valid; they validate only through signer/dependency chain.
 
@@ -1351,8 +1353,8 @@ Must implement:
 8. local TLS cert/public/private key material modeled as events and materialized from projected local event state.
 9. guard placement correction:
    - `invite_accepted` is local trust-anchor binding and does not use `HasRecordedInvite`-style global guard.
-   - trust-anchor guard applies on root network/workspace events only.
-10. remove/avoid pre-projection trust-binding capture paths (for example raw-blob `invite_network_bindings` capture) as authority.
+   - trust-anchor guard applies on root workspace events only.
+10. remove/avoid pre-projection trust-binding capture paths (for example raw-blob `invite_workspace_bindings` capture) as authority.
 11. TLA transport-credential scope extension plan exists and is linked (credential/trust transitions modeled; handshake/session keys may remain abstract).
 
 Common mistakes:

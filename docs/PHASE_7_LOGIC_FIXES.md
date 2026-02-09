@@ -3,7 +3,7 @@
 This plan aligns runtime, tests, and TLA artifacts with the corrected Phase 7 semantics:
 
 1. `invite_accepted` is local trust-anchor binding.
-2. Trust-anchor guard applies to root `network/workspace` event validity.
+2. Trust-anchor guard applies to root `workspace` event validity.
 3. No `HasRecordedInvite`-style global guard on `invite_accepted`.
 4. No pre-projection raw-blob trust-binding capture authority.
 5. TLA scope gap for transport credential lifecycle is explicit and tracked.
@@ -15,7 +15,7 @@ This plan aligns runtime, tests, and TLA artifacts with the corrected Phase 7 se
 ### 1.1 Guard placement
 
 - `invite_accepted`: local anchor-binding step.
-- `network/workspace` root event: guard with trust-anchor match.
+- `workspace` root event: guard with trust-anchor match.
 - Foreign root ids must reject (or remain non-valid) under anchor mismatch.
 
 ### 1.2 Trust binding source
@@ -41,12 +41,12 @@ Files:
 
 Required edits:
 1. Remove `HasRecordedInvite` guard behavior from `project_invite_accepted`.
-2. Remove `invite_network_bindings` fallback path from `project_invite_accepted`.
+2. Remove `invite_workspace_bindings` fallback path from `project_invite_accepted`.
 3. Bind trust anchor directly from `InviteAcceptedEvent` fields.
 4. Make trust-anchor write semantics deterministic and safe:
    - prefer immutable first-write semantics (`INSERT OR IGNORE`) plus mismatch handling,
    - avoid silent overwrite (`INSERT OR REPLACE`) unless explicitly intended and proven safe.
-5. Keep/reconfirm guard-cascade reproject behavior for network events after `invite_accepted`.
+5. Keep/reconfirm guard-cascade reproject behavior for workspace events after `invite_accepted`.
 
 ## 2.2 Recording-path cleanup
 
@@ -65,12 +65,12 @@ File:
 - `src/db/migrations.rs`
 
 Required edits:
-1. Add a migration to retire `invite_network_bindings` from active logic.
+1. Add a migration to retire `invite_workspace_bindings` from active logic.
 2. Keep backward-compatible read behavior if old DBs contain the table.
 3. If retained for compatibility, mark as deprecated and unused by runtime logic.
 
 Optional hardening (if adopted in same PR):
-1. enforce single active root network row semantics per tenant (or explicitly document plurality).
+1. enforce single active root workspace row semantics per tenant (or explicitly document plurality).
 2. enforce trust-anchor immutability policy at schema/query level.
 
 ---
@@ -87,7 +87,7 @@ Required edits:
 1. Remove/replace `HasRecordedInvite` guard for `invite_accepted`.
 2. Remove/replace invite-binding capture assumptions (for example `inviteNet` capture path as authority).
 3. Model anchor binding as direct consequence of validated `invite_accepted` semantics.
-4. Keep trust-anchor guard on root network/workspace events.
+4. Keep trust-anchor guard on root workspace events.
 5. Re-freeze projector mapping doc to match runtime after changes.
 
 Transport scope follow-up artifact:
@@ -107,7 +107,7 @@ Files:
 
 Required tests:
 1. `invite_accepted` does not depend on global invite-presence guard.
-2. root network/workspace guard enforces trust-anchor match.
+2. root workspace guard enforces trust-anchor match.
 3. no pre-projection blob capture influence:
    - malformed/invalid invite-like blob cannot alter trust binding.
 4. true out-of-order identity chain test (actually records dependent before dependency).
@@ -137,6 +137,6 @@ Each PR should include at least one failing test made to pass.
 Phase-7 logic fix effort is done when:
 1. No `HasRecordedInvite` runtime guard remains for `invite_accepted`.
 2. No pre-projection trust-binding capture path is used by runtime authority.
-3. Network/workspace root trust guard behavior is explicit and tested.
+3. Workspace root trust guard behavior is explicit and tested.
 4. TLA/spec artifacts match runtime behavior.
 5. Transport credential TLA scope gap is either closed or explicitly tracked with linked artifact and acceptance notes.

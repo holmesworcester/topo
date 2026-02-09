@@ -1636,9 +1636,9 @@ async fn test_encrypted_inner_unsupported_signer_rejects_durably() {
 /// Helper: create a full bootstrap chain for a peer, returning all key material and event IDs.
 #[allow(dead_code)]
 struct BootstrapChain {
-    network_key: ed25519_dalek::SigningKey,
-    network_eid: [u8; 32],
-    network_id: [u8; 32],
+    workspace_key: ed25519_dalek::SigningKey,
+    workspace_eid: [u8; 32],
+    workspace_id: [u8; 32],
     invite_key: ed25519_dalek::SigningKey,
     user_invite_eid: [u8; 32],
     user_key: ed25519_dalek::SigningKey,
@@ -1656,25 +1656,25 @@ fn bootstrap_peer(peer: &Peer) -> BootstrapChain {
     use ed25519_dalek::SigningKey;
 
     let mut rng = rand::thread_rng();
-    let network_key = SigningKey::generate(&mut rng);
-    let network_pubkey = network_key.verifying_key().to_bytes();
-    let network_id: [u8; 32] = rand::random();
+    let workspace_key = SigningKey::generate(&mut rng);
+    let workspace_pubkey = workspace_key.verifying_key().to_bytes();
+    let workspace_id: [u8; 32] = rand::random();
 
-    // 1. Network event
-    let network_eid = peer.create_network(network_id, network_pubkey);
+    // 1. Workspace event
+    let workspace_eid = peer.create_workspace(workspace_id, workspace_pubkey);
 
-    // 2. UserInviteBoot (signed by network)
+    // 2. UserInviteBoot (signed by workspace)
     let invite_key = SigningKey::generate(&mut rng);
     let invite_pubkey = invite_key.verifying_key().to_bytes();
     let user_invite_eid = peer.create_user_invite_boot_with_key(
         invite_pubkey,
-        &network_key,
-        &network_eid,
-        network_id,
+        &workspace_key,
+        &workspace_eid,
+        workspace_id,
     );
 
     // 3. InviteAccepted (local, binds trust anchor)
-    let invite_accepted_eid = peer.create_invite_accepted(&user_invite_eid, network_id);
+    let invite_accepted_eid = peer.create_invite_accepted(&user_invite_eid, workspace_id);
 
     // 4. UserBoot (signed by user_invite)
     let user_key = SigningKey::generate(&mut rng);
@@ -1699,20 +1699,20 @@ fn bootstrap_peer(peer: &Peer) -> BootstrapChain {
         &device_invite_eid,
     );
 
-    // 7. AdminBoot (signed by network, dep on user)
+    // 7. AdminBoot (signed by workspace, dep on user)
     let admin_key = SigningKey::generate(&mut rng);
     let admin_pubkey = admin_key.verifying_key().to_bytes();
     let admin_eid = peer.create_admin_boot(
         admin_pubkey,
-        &network_key,
+        &workspace_key,
         &user_eid,
-        &network_eid,
+        &workspace_eid,
     );
 
     BootstrapChain {
-        network_key,
-        network_eid,
-        network_id,
+        workspace_key,
+        workspace_eid,
+        workspace_id,
         invite_key,
         user_invite_eid,
         user_key,
@@ -1737,12 +1737,12 @@ fn test_bootstrap_sequence() {
 
     // Verify trust anchor was set correctly
     let anchor: String = db.query_row(
-        "SELECT network_id FROM trust_anchors WHERE peer_id = ?1",
+        "SELECT workspace_id FROM trust_anchors WHERE peer_id = ?1",
         rusqlite::params![&alice.identity],
         |row| row.get(0),
     ).expect("trust anchor should exist");
-    let expected_nid = event_id_to_base64(&chain.network_id);
-    assert_eq!(anchor, expected_nid, "trust anchor should match network_id");
+    let expected_nid = event_id_to_base64(&chain.workspace_id);
+    assert_eq!(anchor, expected_nid, "trust anchor should match workspace_id");
 
     // Verify all events are valid
     let valid_count: i64 = db.query_row(
@@ -1751,16 +1751,16 @@ fn test_bootstrap_sequence() {
         |row| row.get(0),
     ).unwrap();
     // 7 identity events + invite_accepted (local) = 8
-    // Network might be blocked initially and unblocked by invite_accepted cascade
+    // Workspace might be blocked initially and unblocked by invite_accepted cascade
     assert!(valid_count >= 7, "at least 7 identity events should be valid, got {}", valid_count);
 
     // Verify projection tables
     let net_count: i64 = db.query_row(
-        "SELECT COUNT(*) FROM networks WHERE recorded_by = ?1",
+        "SELECT COUNT(*) FROM workspaces WHERE recorded_by = ?1",
         rusqlite::params![&alice.identity],
         |row| row.get(0),
     ).unwrap();
-    assert_eq!(net_count, 1, "exactly one network should be projected");
+    assert_eq!(net_count, 1, "exactly one workspace should be projected");
 
     let user_invite_count: i64 = db.query_row(
         "SELECT COUNT(*) FROM user_invites WHERE recorded_by = ?1",
@@ -1814,16 +1814,16 @@ fn test_out_of_order_identity() {
     let db = open_connection(&alice.db_path).unwrap();
 
     use ed25519_dalek::SigningKey;
-    use poc_7::events::{encode_event, ParsedEvent, NetworkEvent, UserInviteBootEvent, UserBootEvent};
+    use poc_7::events::{encode_event, ParsedEvent, WorkspaceEvent, UserInviteBootEvent, UserBootEvent};
     use poc_7::projection::signer::sign_event_bytes;
     use poc_7::projection::pipeline::project_one;
     use poc_7::crypto::hash_event;
     use poc_7::events::registry;
 
     let mut rng = rand::thread_rng();
-    let network_key = SigningKey::generate(&mut rng);
-    let network_pubkey = network_key.verifying_key().to_bytes();
-    let network_id: [u8; 32] = rand::random();
+    let workspace_key = SigningKey::generate(&mut rng);
+    let workspace_pubkey = workspace_key.verifying_key().to_bytes();
+    let workspace_id: [u8; 32] = rand::random();
     let invite_key = SigningKey::generate(&mut rng);
     let invite_pubkey = invite_key.verifying_key().to_bytes();
     let user_key = SigningKey::generate(&mut rng);
@@ -1833,25 +1833,25 @@ fn test_out_of_order_identity() {
         .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
     let reg = registry();
 
-    // Pre-build Network blob to get network_eid
-    let net_blob = encode_event(&ParsedEvent::Network(NetworkEvent {
+    // Pre-build Workspace blob to get workspace_eid
+    let net_blob = encode_event(&ParsedEvent::Workspace(WorkspaceEvent {
         created_at_ms: now_ms,
-        public_key: network_pubkey,
-        network_id,
+        public_key: workspace_pubkey,
+        workspace_id,
     })).unwrap();
-    let network_eid = hash_event(&net_blob);
+    let workspace_eid = hash_event(&net_blob);
 
-    // Pre-build UserInviteBoot blob (signed by network) to get user_invite_eid
+    // Pre-build UserInviteBoot blob (signed by workspace) to get user_invite_eid
     let mut uib_blob = encode_event(&ParsedEvent::UserInviteBoot(UserInviteBootEvent {
         created_at_ms: now_ms + 1,
         public_key: invite_pubkey,
-        network_id,
-        signed_by: network_eid,
+        workspace_id,
+        signed_by: workspace_eid,
         signer_type: 1,
         signature: [0u8; 64],
     })).unwrap();
     let sig_offset = uib_blob.len() - 64;
-    let sig = sign_event_bytes(&network_key, &uib_blob[..sig_offset]);
+    let sig = sign_event_bytes(&workspace_key, &uib_blob[..sig_offset]);
     uib_blob[sig_offset..].copy_from_slice(&sig);
     let user_invite_eid = hash_event(&uib_blob);
 
@@ -1894,8 +1894,8 @@ fn test_out_of_order_identity() {
     ).unwrap();
     assert!(!valid_before, "UserBoot should not be valid before invite chain");
 
-    // Insert Network raw + project → Block (no trust anchor yet)
-    let net_b64 = event_id_to_base64(&network_eid);
+    // Insert Workspace raw + project → Block (no trust anchor yet)
+    let net_b64 = event_id_to_base64(&workspace_eid);
     let net_meta = reg.lookup(net_blob[0]).unwrap();
     db.execute(
         "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
@@ -1906,13 +1906,13 @@ fn test_out_of_order_identity() {
         "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source) VALUES (?1, ?2, ?3, 'test')",
         rusqlite::params![&alice.identity, &net_b64, now_ms as i64],
     ).unwrap();
-    let net_result = project_one(&db, &alice.identity, &network_eid).unwrap();
+    let net_result = project_one(&db, &alice.identity, &workspace_eid).unwrap();
     assert!(
         matches!(net_result, poc_7::projection::decision::ProjectionDecision::Block { .. }),
-        "Network should block (no trust anchor yet), got {:?}", net_result,
+        "Workspace should block (no trust anchor yet), got {:?}", net_result,
     );
 
-    // Insert UserInviteBoot raw + project → Block (signed_by = network_eid not valid)
+    // Insert UserInviteBoot raw + project → Block (signed_by = workspace_eid not valid)
     let uib_b64 = event_id_to_base64(&user_invite_eid);
     let uib_meta = reg.lookup(uib_blob[0]).unwrap();
     db.execute(
@@ -1927,12 +1927,12 @@ fn test_out_of_order_identity() {
     let uib_result = project_one(&db, &alice.identity, &user_invite_eid).unwrap();
     assert!(
         matches!(uib_result, poc_7::projection::decision::ProjectionDecision::Block { .. }),
-        "UserInviteBoot should block (network dep not valid), got {:?}", uib_result,
+        "UserInviteBoot should block (workspace dep not valid), got {:?}", uib_result,
     );
 
     // Create InviteAccepted → sets trust anchor, triggers retry_guard_blocked_events
-    // which re-projects Network → Valid → cascades UserInviteBoot → Valid → cascades UserBoot → Valid
-    let _ia_eid = alice.create_invite_accepted(&user_invite_eid, network_id);
+    // which re-projects Workspace → Valid → cascades UserInviteBoot → Valid → cascades UserBoot → Valid
+    let _ia_eid = alice.create_invite_accepted(&user_invite_eid, workspace_id);
 
     // Assert full cascade completed — UserBoot should now be valid
     let valid_after: bool = db.query_row(
@@ -1948,7 +1948,7 @@ fn test_out_of_order_identity() {
         rusqlite::params![&alice.identity, &net_b64],
         |row| row.get(0),
     ).unwrap();
-    assert!(net_valid, "Network should be valid after trust anchor set");
+    assert!(net_valid, "Workspace should be valid after trust anchor set");
 
     let uib_valid: bool = db.query_row(
         "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
@@ -1959,18 +1959,18 @@ fn test_out_of_order_identity() {
 }
 
 #[test]
-fn test_foreign_network_excluded() {
+fn test_foreign_workspace_excluded() {
     let channel = test_channel();
     let alice = Peer::new("alice", channel);
     let _chain = bootstrap_peer(&alice);
 
     let db = open_connection(&alice.db_path).unwrap();
 
-    // Create a second network event with different network_id — should be rejected
+    // Create a second workspace event with different workspace_id — should be rejected
     let foreign_id: [u8; 32] = rand::random();
     let foreign_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
     let foreign_pubkey = foreign_key.verifying_key().to_bytes();
-    let result = alice.try_create_network(foreign_id, foreign_pubkey);
+    let result = alice.try_create_workspace(foreign_id, foreign_pubkey);
 
     // Should be rejected (trust anchor mismatch)
     match result {
@@ -1986,17 +1986,17 @@ fn test_foreign_network_excluded() {
                 rusqlite::params![&alice.identity, &foreign_b64],
                 |row| row.get(0),
             ).unwrap();
-            assert!(!foreign_valid, "foreign network event should NOT be valid");
+            assert!(!foreign_valid, "foreign workspace event should NOT be valid");
         }
     }
 
     // The event is in rejected_events (stored before rejection)
     let rejected_count: i64 = db.query_row(
-        "SELECT COUNT(*) FROM rejected_events WHERE peer_id = ?1 AND reason LIKE '%network_id%'",
+        "SELECT COUNT(*) FROM rejected_events WHERE peer_id = ?1 AND reason LIKE '%workspace_id%'",
         rusqlite::params![&alice.identity],
         |row| row.get(0),
     ).unwrap();
-    assert!(rejected_count > 0, "foreign network event should be rejected");
+    assert!(rejected_count > 0, "foreign workspace event should be rejected");
 }
 
 #[test]
@@ -2257,12 +2257,12 @@ fn test_invite_accepted_no_prior_invite_required() {
     let alice = Peer::new("alice", channel);
     let db = open_connection(&alice.db_path).unwrap();
 
-    let network_id: [u8; 32] = rand::random();
+    let workspace_id: [u8; 32] = rand::random();
     let fake_invite_eid: [u8; 32] = rand::random();
 
     // Create invite_accepted BEFORE any invite event exists.
     // Under old semantics this would Block; under corrected semantics it should project.
-    let ia_eid = alice.create_invite_accepted(&fake_invite_eid, network_id);
+    let ia_eid = alice.create_invite_accepted(&fake_invite_eid, workspace_id);
 
     let ia_b64 = event_id_to_base64(&ia_eid);
     let valid: bool = db.query_row(
@@ -2272,30 +2272,30 @@ fn test_invite_accepted_no_prior_invite_required() {
     ).unwrap();
     assert!(valid, "invite_accepted should be valid without prior invite event (no HasRecordedInvite guard)");
 
-    // Trust anchor should be set from the event's own network_id
+    // Trust anchor should be set from the event's own workspace_id
     let anchor: String = db.query_row(
-        "SELECT network_id FROM trust_anchors WHERE peer_id = ?1",
+        "SELECT workspace_id FROM trust_anchors WHERE peer_id = ?1",
         rusqlite::params![&alice.identity],
         |row| row.get(0),
     ).expect("trust anchor should exist");
-    let expected_nid = event_id_to_base64(&network_id);
-    assert_eq!(anchor, expected_nid, "trust anchor should match invite_accepted event's network_id");
+    let expected_nid = event_id_to_base64(&workspace_id);
+    assert_eq!(anchor, expected_nid, "trust anchor should match invite_accepted event's workspace_id");
 }
 
-/// Trust anchor immutability: second invite_accepted with conflicting network_id is rejected.
+/// Trust anchor immutability: second invite_accepted with conflicting workspace_id is rejected.
 #[test]
 fn test_trust_anchor_immutability() {
     let channel = test_channel();
     let alice = Peer::new("alice", channel);
     let db = open_connection(&alice.db_path).unwrap();
 
-    let network_id_1: [u8; 32] = rand::random();
-    let network_id_2: [u8; 32] = rand::random();
+    let workspace_id_1: [u8; 32] = rand::random();
+    let workspace_id_2: [u8; 32] = rand::random();
     let fake_invite_1: [u8; 32] = rand::random();
     let fake_invite_2: [u8; 32] = rand::random();
 
     // First invite_accepted sets the trust anchor
-    let ia1_eid = alice.create_invite_accepted(&fake_invite_1, network_id_1);
+    let ia1_eid = alice.create_invite_accepted(&fake_invite_1, workspace_id_1);
     let ia1_b64 = event_id_to_base64(&ia1_eid);
     let valid1: bool = db.query_row(
         "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
@@ -2304,8 +2304,8 @@ fn test_trust_anchor_immutability() {
     ).unwrap();
     assert!(valid1, "first invite_accepted should be valid");
 
-    // Second invite_accepted with different network_id should be rejected
-    let result = alice.try_create_invite_accepted(&fake_invite_2, network_id_2);
+    // Second invite_accepted with different workspace_id should be rejected
+    let result = alice.try_create_invite_accepted(&fake_invite_2, workspace_id_2);
     match result {
         Err(ref e) => {
             let msg = format!("{}", e);
@@ -2328,11 +2328,11 @@ fn test_trust_anchor_immutability() {
 
     // Trust anchor should still be the first one
     let anchor: String = db.query_row(
-        "SELECT network_id FROM trust_anchors WHERE peer_id = ?1",
+        "SELECT workspace_id FROM trust_anchors WHERE peer_id = ?1",
         rusqlite::params![&alice.identity],
         |row| row.get(0),
     ).expect("trust anchor should still exist");
-    let expected_nid = event_id_to_base64(&network_id_1);
+    let expected_nid = event_id_to_base64(&workspace_id_1);
     assert_eq!(anchor, expected_nid, "trust anchor should not have changed");
 }
 
@@ -2345,14 +2345,14 @@ fn test_no_blob_capture_trust_influence() {
     let db = open_connection(&alice.db_path).unwrap();
 
     // Manually craft a blob that looks like a UserInviteBoot (type 10) with a specific
-    // network_id, and insert it directly into the events table (simulating raw ingress).
-    // Under old semantics, capture_invite_network_binding would have extracted the
-    // network_id and written it to invite_network_bindings. Under corrected semantics,
+    // workspace_id, and insert it directly into the events table (simulating raw ingress).
+    // Under old semantics, capture_invite_workspace_binding would have extracted the
+    // workspace_id and written it to invite_workspace_bindings. Under corrected semantics,
     // this should have no effect on trust state.
-    let fake_network_id: [u8; 32] = [0xAA; 32];
+    let fake_workspace_id: [u8; 32] = [0xAA; 32];
     let mut fake_blob = vec![10u8]; // type code for UserInviteBoot
     fake_blob.extend_from_slice(&[0u8; 40]); // created_at_ms(8) + public_key(32)
-    fake_blob.extend_from_slice(&fake_network_id); // network_id at [41..73]
+    fake_blob.extend_from_slice(&fake_workspace_id); // workspace_id at [41..73]
     fake_blob.extend_from_slice(&[0u8; 97]); // rest of the 170B blob
 
     let fake_eid = poc_7::crypto::hash_event(&fake_blob);
@@ -2369,9 +2369,9 @@ fn test_no_blob_capture_trust_influence() {
         rusqlite::params![&alice.identity, &fake_b64],
     ).unwrap();
 
-    // invite_network_bindings should be empty (no capture happened)
+    // invite_workspace_bindings should be empty (no capture happened)
     let binding_count: i64 = db.query_row(
-        "SELECT COUNT(*) FROM invite_network_bindings WHERE peer_id = ?1",
+        "SELECT COUNT(*) FROM invite_workspace_bindings WHERE peer_id = ?1",
         rusqlite::params![&alice.identity],
         |row| row.get(0),
     ).unwrap();
@@ -2387,7 +2387,7 @@ fn test_no_blob_capture_trust_influence() {
 }
 
 /// True out-of-order identity chain: record invite_accepted BEFORE its referenced
-/// invite event, then record network, then invite event -> cascade resolves everything.
+/// invite event, then record workspace, then invite event -> cascade resolves everything.
 #[test]
 fn test_true_out_of_order_identity_chain() {
     let channel = test_channel();
@@ -2397,17 +2397,17 @@ fn test_true_out_of_order_identity_chain() {
     use ed25519_dalek::SigningKey;
     let mut rng = rand::thread_rng();
 
-    let network_key = SigningKey::generate(&mut rng);
-    let network_pubkey = network_key.verifying_key().to_bytes();
-    let network_id: [u8; 32] = rand::random();
+    let workspace_key = SigningKey::generate(&mut rng);
+    let workspace_pubkey = workspace_key.verifying_key().to_bytes();
+    let workspace_id: [u8; 32] = rand::random();
 
-    // Step 1: Create invite_accepted FIRST (before network or invite exist).
+    // Step 1: Create invite_accepted FIRST (before workspace or invite exist).
     // Under corrected semantics, this sets the trust anchor immediately.
     let invite_key = SigningKey::generate(&mut rng);
     let invite_pubkey = invite_key.verifying_key().to_bytes();
 
     let dummy_invite_eid = [42u8; 32];
-    let ia_eid = alice.create_invite_accepted(&dummy_invite_eid, network_id);
+    let ia_eid = alice.create_invite_accepted(&dummy_invite_eid, workspace_id);
 
     let ia_b64 = event_id_to_base64(&ia_eid);
     let ia_valid: bool = db.query_row(
@@ -2417,24 +2417,24 @@ fn test_true_out_of_order_identity_chain() {
     ).unwrap();
     assert!(ia_valid, "invite_accepted should be immediately valid (no HasRecordedInvite guard)");
 
-    // Step 2: Create network event. Should cascade-unblock via guard retry
+    // Step 2: Create workspace event. Should cascade-unblock via guard retry
     // since trust anchor is now set.
-    let network_eid = alice.create_network(network_id, network_pubkey);
+    let workspace_eid = alice.create_workspace(workspace_id, workspace_pubkey);
 
-    let net_b64 = event_id_to_base64(&network_eid);
+    let net_b64 = event_id_to_base64(&workspace_eid);
     let net_valid: bool = db.query_row(
         "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
         rusqlite::params![&alice.identity, &net_b64],
         |row| row.get(0),
     ).unwrap();
-    assert!(net_valid, "network event should be valid (trust anchor matches)");
+    assert!(net_valid, "workspace event should be valid (trust anchor matches)");
 
-    // Step 3: Create UserInviteBoot (signed by network)
+    // Step 3: Create UserInviteBoot (signed by workspace)
     let user_invite_eid = alice.create_user_invite_boot_with_key(
         invite_pubkey,
-        &network_key,
-        &network_eid,
-        network_id,
+        &workspace_key,
+        &workspace_eid,
+        workspace_id,
     );
 
     let ui_b64 = event_id_to_base64(&user_invite_eid);
@@ -2443,7 +2443,7 @@ fn test_true_out_of_order_identity_chain() {
         rusqlite::params![&alice.identity, &ui_b64],
         |row| row.get(0),
     ).unwrap();
-    assert!(ui_valid, "user_invite_boot should be valid (network is valid signer)");
+    assert!(ui_valid, "user_invite_boot should be valid (workspace is valid signer)");
 
     // Step 4: Create UserBoot (signed by invite key)
     let user_key = SigningKey::generate(&mut rng);
@@ -2463,7 +2463,7 @@ fn test_true_out_of_order_identity_chain() {
 // Multi-peer identity scenario tests
 // =============================================================================
 
-/// Helper: bootstrap Bob as a new user joining Alice's network.
+/// Helper: bootstrap Bob as a new user joining Alice's workspace.
 /// Alice creates a UserInviteOngoing for Bob, Bob accepts and builds his own chain.
 /// Returns Bob's BootstrapChain (reuses BootstrapChain struct for consistency).
 #[allow(dead_code)]
@@ -2479,7 +2479,7 @@ struct JoinChain {
     invite_accepted_eid: [u8; 32],
 }
 
-fn join_network(
+fn join_workspace(
     joiner: &Peer,
     alice_chain: &BootstrapChain,
     alice: &Peer,
@@ -2498,8 +2498,8 @@ fn join_network(
         &alice_chain.admin_eid,
     );
 
-    // Joiner accepts the invite (local event, binds trust anchor to Alice's network_id)
-    let invite_accepted_eid = joiner.create_invite_accepted(&user_invite_eid, alice_chain.network_id);
+    // Joiner accepts the invite (local event, binds trust anchor to Alice's workspace_id)
+    let invite_accepted_eid = joiner.create_invite_accepted(&user_invite_eid, alice_chain.workspace_id);
 
     // Joiner creates UserBoot (signed by the invite key Alice gave)
     let user_key = SigningKey::generate(&mut rng);
@@ -2550,7 +2550,7 @@ async fn test_two_peer_identity_join_and_sync() {
 
     // Alice creates a UserInviteOngoing for Bob
     // Bob needs the invite to exist on Alice's side; sync will deliver it
-    let _bob_join = join_network(&bob, &alice_chain, &alice);
+    let _bob_join = join_workspace(&bob, &alice_chain, &alice);
 
     // Sync — shared events flow between peers
     let sync = start_peers(&alice, &bob);
@@ -2565,14 +2565,14 @@ async fn test_two_peer_identity_join_and_sync() {
     drop(sync);
 
     // Both peers should have projected the same identity state:
-    // - 1 network
+    // - 1 workspace
     // - 2 user_invites (boot + ongoing)
     // - 2 users (Alice's + Bob's)
     // - 2 device_invites
     // - 2 peers_shared
     // - 1 admin (Alice's)
-    assert_eq!(alice.network_count(), 1, "Alice should have 1 network");
-    assert_eq!(bob.network_count(), 1, "Bob should have 1 network");
+    assert_eq!(alice.workspace_count(), 1, "Alice should have 1 workspace");
+    assert_eq!(bob.workspace_count(), 1, "Bob should have 1 workspace");
 
     assert_eq!(alice.user_invite_count(), 2, "Alice: boot + ongoing invites");
     assert_eq!(bob.user_invite_count(), 2, "Bob: boot + ongoing invites");
@@ -2618,7 +2618,7 @@ async fn test_identity_cascade_via_sync() {
     );
 
     // Bob accepts the invite locally — this sets his trust anchor
-    let _ia_eid = bob.create_invite_accepted(&user_invite_eid, alice_chain.network_id);
+    let _ia_eid = bob.create_invite_accepted(&user_invite_eid, alice_chain.workspace_id);
 
     // Bob creates UserBoot signed by the invite — but the invite event is on
     // Alice's side, not Bob's. So this will block on the signed_by dep.
@@ -2652,7 +2652,7 @@ async fn test_identity_cascade_via_sync() {
     drop(sync);
 
     // Bob should now have Alice's full identity chain projected plus his own user
-    assert_eq!(bob.network_count(), 1, "Bob should have Alice's network");
+    assert_eq!(bob.workspace_count(), 1, "Bob should have Alice's workspace");
     assert_eq!(bob.user_invite_count(), 2, "Bob should have both invites");
     assert_eq!(bob.user_count(), 2, "Both Alice's and Bob's users should be valid");
 
@@ -2669,7 +2669,7 @@ async fn test_identity_then_messaging() {
 
     // Both peers establish identity
     let alice_chain = bootstrap_peer(&alice);
-    let _bob_join = join_network(&bob, &alice_chain, &alice);
+    let _bob_join = join_workspace(&bob, &alice_chain, &alice);
 
     // Sync identity events first
     let sync = start_peers(&alice, &bob);
@@ -2731,7 +2731,7 @@ async fn test_device_link_via_sync() {
     drop(db);
 
     // Laptop accepts the invite (local, sets trust anchor)
-    let _ia_eid = laptop.create_invite_accepted(&laptop_di_eid, phone_chain.network_id);
+    let _ia_eid = laptop.create_invite_accepted(&laptop_di_eid, phone_chain.workspace_id);
 
     // Laptop creates PeerSharedOngoing (signed by the device invite key Phone gave).
     // This will be blocked because the signed_by dep (DeviceInviteOngoing) is on Phone.
@@ -2766,9 +2766,9 @@ async fn test_device_link_via_sync() {
 
     drop(sync);
 
-    // Both devices share the same network and identity state
-    assert_eq!(phone.network_count(), 1);
-    assert_eq!(laptop.network_count(), 1);
+    // Both devices share the same workspace and identity state
+    assert_eq!(phone.workspace_count(), 1);
+    assert_eq!(laptop.workspace_count(), 1);
     assert_eq!(phone.device_invite_count(), 2, "Phone: first + ongoing");
     assert_eq!(laptop.device_invite_count(), 2, "Laptop: first + ongoing");
 
@@ -2776,52 +2776,52 @@ async fn test_device_link_via_sync() {
     verify_projection_invariants(&laptop);
 }
 
-/// Alice and Bob are on different networks. When they sync, Bob's network events
+/// Alice and Bob are on different workspaces. When they sync, Bob's workspace events
 /// are rejected by Alice's trust anchor, and vice versa. Neither peer's identity
 /// state is corrupted.
 #[tokio::test]
-async fn test_foreign_network_rejected_via_sync() {
+async fn test_foreign_workspace_rejected_via_sync() {
     let channel = test_channel();
     let alice = Peer::new("alice", channel);
     let bob = Peer::new("bob", channel);
 
-    // Both bootstrap independently on DIFFERENT networks
+    // Both bootstrap independently on DIFFERENT workspaces
     let alice_chain = bootstrap_peer(&alice);
     let bob_chain = bootstrap_peer(&bob);
 
-    // Sanity: different network_ids
-    assert_ne!(alice_chain.network_id, bob_chain.network_id,
-        "networks should differ");
+    // Sanity: different workspace_ids
+    assert_ne!(alice_chain.workspace_id, bob_chain.workspace_id,
+        "workspaces should differ");
 
-    // Before sync: each peer has exactly 1 network projected
-    assert_eq!(alice.network_count(), 1);
-    assert_eq!(bob.network_count(), 1);
+    // Before sync: each peer has exactly 1 workspace projected
+    assert_eq!(alice.workspace_count(), 1);
+    assert_eq!(bob.workspace_count(), 1);
 
     // Sync — shared events flow between peers
     let sync = start_peers(&alice, &bob);
 
     // Wait for events to transfer — gate on rejected events appearing
-    // (foreign network events get rejected by the trust anchor guard)
+    // (foreign workspace events get rejected by the trust anchor guard)
     assert_eventually(
         || alice.rejected_event_count() > 0 && bob.rejected_event_count() > 0,
         Duration::from_secs(15),
-        "both peers should have rejected foreign network events",
+        "both peers should have rejected foreign workspace events",
     ).await;
 
     drop(sync);
 
-    // Each peer should still have exactly 1 network projected — the foreign
-    // network event is rejected by the trust anchor guard, not accepted.
-    assert_eq!(alice.network_count(), 1,
-        "Alice should still have exactly 1 network (foreign rejected)");
-    assert_eq!(bob.network_count(), 1,
-        "Bob should still have exactly 1 network (foreign rejected)");
+    // Each peer should still have exactly 1 workspace projected — the foreign
+    // workspace event is rejected by the trust anchor guard, not accepted.
+    assert_eq!(alice.workspace_count(), 1,
+        "Alice should still have exactly 1 workspace (foreign rejected)");
+    assert_eq!(bob.workspace_count(), 1,
+        "Bob should still have exactly 1 workspace (foreign rejected)");
 
     // Foreign identity events should be rejected, not just blocked
     assert!(alice.rejected_event_count() > 0,
-        "Alice should have rejected foreign network events");
+        "Alice should have rejected foreign workspace events");
     assert!(bob.rejected_event_count() > 0,
-        "Bob should have rejected foreign network events");
+        "Bob should have rejected foreign workspace events");
 
     // Each peer's own identity state is unaffected
     assert_eq!(alice.user_count(), 1, "Alice's own user unchanged");

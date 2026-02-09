@@ -4,8 +4,8 @@ use crate::crypto::{event_id_to_base64, event_id_from_base64};
 use crate::events::ParsedEvent;
 use super::decision::ProjectionDecision;
 
-// Note: invite_network_bindings table is retained in migration for schema compat,
-// but is no longer written or read. Trust anchor is set directly from invite_accepted's network_id.
+// Note: invite_workspace_bindings table is retained in migration for schema compat,
+// but is no longer written or read. Trust anchor is set directly from invite_accepted's workspace_id.
 
 /// Dispatch identity event projections. Called from apply_projection in pipeline.rs.
 pub fn apply_identity_projection(
@@ -15,7 +15,7 @@ pub fn apply_identity_projection(
     parsed: &ParsedEvent,
 ) -> Result<ProjectionDecision, Box<dyn std::error::Error>> {
     match parsed {
-        ParsedEvent::Network(net) => project_network(conn, recorded_by, event_id_b64, net),
+        ParsedEvent::Workspace(ws) => project_workspace(conn, recorded_by, event_id_b64, ws),
         ParsedEvent::InviteAccepted(ia) => project_invite_accepted(conn, recorded_by, event_id_b64, ia),
         ParsedEvent::UserInviteBoot(ui) => project_user_invite_boot(conn, recorded_by, event_id_b64, ui),
         ParsedEvent::UserInviteOngoing(ui) => project_user_invite(conn, recorded_by, event_id_b64, &ui.public_key),
@@ -37,19 +37,19 @@ pub fn apply_identity_projection(
     }
 }
 
-/// Network guard: trust_anchors must match event's network_id.
+/// Workspace guard: trust_anchors must match event's workspace_id.
 /// Returns Block if no trust anchor yet, Reject if mismatch.
-fn project_network(
+fn project_workspace(
     conn: &Connection,
     recorded_by: &str,
     event_id_b64: &str,
-    net: &crate::events::NetworkEvent,
+    ws: &crate::events::WorkspaceEvent,
 ) -> Result<ProjectionDecision, Box<dyn std::error::Error>> {
-    let network_id_b64 = event_id_to_base64(&net.network_id);
+    let workspace_id_b64 = event_id_to_base64(&ws.workspace_id);
 
     // Check trust anchor
     let anchor: Option<String> = match conn.query_row(
-        "SELECT network_id FROM trust_anchors WHERE peer_id = ?1",
+        "SELECT workspace_id FROM trust_anchors WHERE peer_id = ?1",
         rusqlite::params![recorded_by],
         |row| row.get::<_, String>(0),
     ) {
@@ -63,19 +63,19 @@ fn project_network(
             // No trust anchor yet — block until invite_accepted sets it
             Ok(ProjectionDecision::Block { missing: vec![] })
         }
-        Some(ref anchor_nid) if anchor_nid == &network_id_b64 => {
+        Some(ref anchor_wid) if anchor_wid == &workspace_id_b64 => {
             // Trust anchor matches — project
             conn.execute(
-                "INSERT OR IGNORE INTO networks (recorded_by, event_id, network_id, public_key)
+                "INSERT OR IGNORE INTO workspaces (recorded_by, event_id, workspace_id, public_key)
                  VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![recorded_by, event_id_b64, &network_id_b64, net.public_key.as_slice()],
+                rusqlite::params![recorded_by, event_id_b64, &workspace_id_b64, ws.public_key.as_slice()],
             )?;
             Ok(ProjectionDecision::Valid)
         }
         Some(_) => {
-            // Foreign network — reject
+            // Foreign workspace — reject
             Ok(ProjectionDecision::Reject {
-                reason: "network_id does not match trust anchor".to_string(),
+                reason: "workspace_id does not match trust anchor".to_string(),
             })
         }
     }
@@ -92,11 +92,11 @@ fn project_invite_accepted(
     ia: &crate::events::InviteAcceptedEvent,
 ) -> Result<ProjectionDecision, Box<dyn std::error::Error>> {
     let invite_eid_b64 = event_id_to_base64(&ia.invite_event_id);
-    let network_id_b64 = event_id_to_base64(&ia.network_id);
+    let workspace_id_b64 = event_id_to_base64(&ia.workspace_id);
 
     // Check existing trust anchor BEFORE any writes — reject on mismatch.
     let existing_anchor: Option<String> = match conn.query_row(
-        "SELECT network_id FROM trust_anchors WHERE peer_id = ?1",
+        "SELECT workspace_id FROM trust_anchors WHERE peer_id = ?1",
         rusqlite::params![recorded_by],
         |row| row.get::<_, String>(0),
     ) {
@@ -106,11 +106,11 @@ fn project_invite_accepted(
     };
 
     if let Some(ref stored) = existing_anchor {
-        if stored != &network_id_b64 {
+        if stored != &workspace_id_b64 {
             return Ok(ProjectionDecision::Reject {
                 reason: format!(
-                    "invite_accepted network_id {} conflicts with existing trust anchor {}",
-                    network_id_b64, stored
+                    "invite_accepted workspace_id {} conflicts with existing trust anchor {}",
+                    workspace_id_b64, stored
                 ),
             });
         }
@@ -118,15 +118,15 @@ fn project_invite_accepted(
 
     // Mismatch check passed — write projection table.
     conn.execute(
-        "INSERT OR IGNORE INTO invite_accepted (recorded_by, event_id, invite_event_id, network_id)
+        "INSERT OR IGNORE INTO invite_accepted (recorded_by, event_id, invite_event_id, workspace_id)
          VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![recorded_by, event_id_b64, &invite_eid_b64, &network_id_b64],
+        rusqlite::params![recorded_by, event_id_b64, &invite_eid_b64, &workspace_id_b64],
     )?;
 
     // Write trust anchor (first-write-wins).
     conn.execute(
-        "INSERT OR IGNORE INTO trust_anchors (peer_id, network_id) VALUES (?1, ?2)",
-        rusqlite::params![recorded_by, &network_id_b64],
+        "INSERT OR IGNORE INTO trust_anchors (peer_id, workspace_id) VALUES (?1, ?2)",
+        rusqlite::params![recorded_by, &workspace_id_b64],
     )?;
 
     Ok(ProjectionDecision::Valid)
@@ -148,7 +148,7 @@ fn project_user_invite_boot(
     Ok(ProjectionDecision::Valid)
 }
 
-/// Project UserInvite (ongoing variant — no network capture needed).
+/// Project UserInvite (ongoing variant — no workspace capture needed).
 fn project_user_invite(
     conn: &Connection,
     recorded_by: &str,

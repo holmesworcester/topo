@@ -29,7 +29,7 @@ pub fn resolve_signer_key(
     // Valid type codes for each signer_type
     let valid_type_codes: &[u8] = match signer_type {
         0 => &[3],          // PeerKey
-        1 => &[8],          // Network
+        1 => &[8],          // Workspace
         2 => &[10, 11],     // UserInviteBoot, UserInviteOngoing
         3 => &[12, 13],     // DeviceInviteFirst, DeviceInviteOngoing
         4 => &[14, 15],     // UserBoot, UserOngoing

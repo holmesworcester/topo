@@ -97,7 +97,7 @@ fn apply_projection(
             return Ok(project_file_slice(conn, recorded_by, event_id_b64, fs)?);
         }
         // Identity events: dispatch to identity projectors
-        ParsedEvent::Network(_)
+        ParsedEvent::Workspace(_)
         | ParsedEvent::InviteAccepted(_)
         | ParsedEvent::UserInviteBoot(_)
         | ParsedEvent::UserInviteOngoing(_)
@@ -227,7 +227,7 @@ pub fn project_one(
     unblock_dependents(conn, recorded_by, &event_id_b64)?;
 
     // 9. Guard cascade: if InviteAccepted just projected, retry guard-blocked events
-    //    (e.g., Network events waiting for trust anchor).
+    //    (e.g., Workspace events waiting for trust anchor).
     //    This is separate from dep-based cascading because guard blocks don't use
     //    blocked_event_deps — they return Block with empty missing list.
     if matches!(parsed, ParsedEvent::InviteAccepted(_)) {

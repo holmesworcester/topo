@@ -13,9 +13,9 @@ Changes to this document require TLA+ model re-verification.
 | 5 | Encrypted | Encrypted | variable | Shared | No | 0 | — |
 | 6 | SecretKey | SecretKey | 41B | Local | No | 0 | — |
 | 7 | MessageDeletion | MessageDeletion | 73B | Shared | No | 0 | — |
-| 8 | Network | Network | 73B | Shared | No | 0 | — |
+| 8 | Workspace | Workspace | 73B | Shared | No | 0 | — |
 | 9 | InviteAccepted | InviteAccepted | 73B | Local | No | 0 | — |
-| 10 | UserInviteBoot | UserInviteBoot | 170B | Shared | Yes | 64 | 1 (network) |
+| 10 | UserInviteBoot | UserInviteBoot | 170B | Shared | Yes | 64 | 1 (workspace) |
 | 11 | UserInviteOngoing | UserInviteOngoing | 170B | Shared | Yes | 64 | 5 (peer_shared) |
 | 12 | DeviceInviteFirst | DeviceInviteFirst | 138B | Shared | Yes | 64 | 4 (user) |
 | 13 | DeviceInviteOngoing | DeviceInviteOngoing | 138B | Shared | Yes | 64 | 5 (peer_shared) |
@@ -23,7 +23,7 @@ Changes to this document require TLA+ model re-verification.
 | 15 | UserOngoing | UserOngoing | 138B | Shared | Yes | 64 | 2 (user_invite) |
 | 16 | PeerSharedFirst | PeerSharedFirst | 138B | Shared | Yes | 64 | 3 (device_invite) |
 | 17 | PeerSharedOngoing | PeerSharedOngoing | 138B | Shared | Yes | 64 | 3 (device_invite) |
-| 18 | AdminBoot | AdminBoot | 170B | Shared | Yes | 64 | 1 (network) |
+| 18 | AdminBoot | AdminBoot | 170B | Shared | Yes | 64 | 1 (workspace) |
 | 19 | AdminOngoing | AdminOngoing | 170B | Shared | Yes | 64 | 5 (peer_shared) |
 | 20 | UserRemoved | UserRemoved | 138B | Shared | Yes | 64 | 5 (peer_shared) |
 | 21 | PeerRemoved | PeerRemoved | 138B | Shared | Yes | 64 | 5 (peer_shared) |
@@ -34,7 +34,7 @@ Changes to this document require TLA+ model re-verification.
 | signer_type | Resolves From | Valid Event Type Codes | Key Extraction |
 |-------------|--------------|------------------------|----------------|
 | 0 | PeerKey | 3 | public_key at [9..41] |
-| 1 | Network | 8 | public_key at [9..41] |
+| 1 | Workspace | 8 | public_key at [9..41] |
 | 2 | UserInvite (Boot/Ongoing) | 10, 11 | public_key at [9..41] |
 | 3 | DeviceInvite (First/Ongoing) | 12, 13 | public_key at [9..41] |
 | 4 | User (Boot/Ongoing) | 14, 15 | public_key at [9..41] |
@@ -53,7 +53,7 @@ Changes to this document require TLA+ model re-verification.
 | 7 | {target_event_id} | [target_event_id] |
 | 8 | {} | [] |
 | 9 | {} | [] |
-| 10 | {signed_by} | [signed_by] (network_id is reference, not dep) |
+| 10 | {signed_by} | [signed_by] (workspace_id is reference, not dep) |
 | 11 | {admin_event_id, signed_by} | [admin_event_id, signed_by] |
 | 12 | {signed_by} | [signed_by] |
 | 13 | {signed_by} | [signed_by] |
@@ -71,7 +71,7 @@ Changes to this document require TLA+ model re-verification.
 
 | Guard | TLA+ Definition | Rust Check | Applies To |
 |-------|----------------|------------|------------|
-| TrustAnchorMatch | trustAnchor[p] = NetId(e) | trust_anchors.network_id = event.network_id; Block if no anchor | type 8 (Network) |
+| TrustAnchorMatch | trustAnchor[p] = NetId(e) | trust_anchors.workspace_id = event.workspace_id; Block if no anchor | type 8 (Workspace) |
 
 ## Projection Tables
 
@@ -84,7 +84,7 @@ Changes to this document require TLA+ model re-verification.
 | 5 | project_encrypted | (dispatches inner) | decrypt + inner dispatch |
 | 6 | project_secret_key | secret_keys | — |
 | 7 | project_message_deletion | deleted_messages | author auth + cascade |
-| 8 | project_network | networks | TrustAnchorMatch guard |
+| 8 | project_workspace | workspaces | TrustAnchorMatch guard |
 | 9 | project_invite_accepted | invite_accepted | writes trust_anchors (first-write-wins immutable) |
 | 10 | project_user_invite | user_invites | — |
 | 11 | project_user_invite | user_invites | — |
@@ -102,10 +102,10 @@ Changes to this document require TLA+ model re-verification.
 
 ## Wire Formats
 
-### 73B fixed (Network, InviteAccepted)
+### 73B fixed (Workspace, InviteAccepted)
 ```
-Network (8):         type_code(1) | created_at_ms(8) | public_key(32) | network_id(32)  = 73B
-InviteAccepted (9):  type_code(1) | created_at_ms(8) | invite_event_id(32) | network_id(32)  = 73B
+Workspace (8):       type_code(1) | created_at_ms(8) | public_key(32) | workspace_id(32)  = 73B
+InviteAccepted (9):  type_code(1) | created_at_ms(8) | invite_event_id(32) | workspace_id(32)  = 73B
 ```
 
 ### 138B signed (DeviceInvite, User, PeerShared, Removal)
@@ -119,7 +119,7 @@ type_code(1) | created_at_ms(8) | public_key_or_target(32) | signed_by(32) | sig
 ```
 type_code(1) | created_at_ms(8) | public_key(32) | extra_dep_id(32) | signed_by(32) | signer_type(1) | signature(64)  = 170B
 ```
-- Type 10: extra_dep_id = network_id (reference, not a dep)
+- Type 10: extra_dep_id = workspace_id (reference, not a dep)
 - Type 11: extra_dep_id = admin_event_id (dep)
 - Type 18: extra_dep_id = user_event_id (dep)
 - Type 19: extra_dep_id = admin_boot_event_id (dep)
@@ -135,13 +135,13 @@ type_code(1) | created_at_ms(8) | key_event_id(32) | recipient_event_id(32) | wr
 |----------------|-----------|
 | InvDeps | verify_projection_invariants: all valid events have deps valid |
 | InvSigner | Signer verification in apply_projection |
-| InvNetAnchor | test_foreign_network_excluded: foreign network blocked |
-| InvSingleNetwork | At most one network row per peer in networks table |
+| InvNetAnchor | test_foreign_workspace_excluded: foreign workspace blocked |
+| InvSingleWorkspace | At most one workspace row per peer in workspaces table |
 | InvTrustAnchorImmutable | test_bootstrap_sequence: trust anchor is immutable once set; mismatch rejected |
 | InvTrustAnchorSource | invite_accepted must be valid for trust anchor to be set |
 | InvUserInviteChain | test_bootstrap_sequence: UserBoot requires UserInviteBoot valid |
 | InvDeviceInviteChain | test_bootstrap_sequence: PeerSharedFirst requires DeviceInviteFirst valid |
 | InvAdminChain | test_bootstrap_sequence: AdminOngoing requires AdminBoot valid |
-| InvForeignNetExcluded | test_foreign_network_excluded |
+| InvForeignNetExcluded | test_foreign_workspace_excluded |
 | InvRemovalAdmin | test_removal_enforcement: removal requires admin context |
-| InvAllValidRequireNetwork | test_bootstrap_sequence: non-local events require network valid |
+| InvAllValidRequireWorkspace | test_bootstrap_sequence: non-local events require workspace valid |

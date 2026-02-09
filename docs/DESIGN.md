@@ -4,7 +4,7 @@ This document describes the target protocol and runtime shape after completing a
 It is intentionally practical: one coherent model, one projection path, one dependency mechanism, and operational behavior that is easy to test with real QUIC daemons.
 
 Terminology note:
-use `workspace` for the logical peer set and shared protocol context; reserve "network" for transport/networking concerns.
+`workspace` is the term for the logical peer set and shared protocol context; "network" refers only to transport/networking concerns.
 
 ## Why?
 
@@ -123,14 +123,14 @@ Transport peer identity is SPKI-derived:
 
 Event-graph identity is event-defined:
 
-1. identity state maintains signer chains from network root to peer,
+1. identity state maintains signer chains from workspace root to peer,
 2. `TransportKey` events bridge event-graph identity to transport SPKI fingerprints,
 3. projected identity determines which peers are allowed to sync.
 
 ## 2.4 Recording identity semantics
 
 1. `signed_by`: canonical signer event reference used for signature/policy checks.
-2. `signer_type`: signer keyspace discriminator (`peer_key | network | user_invite | device_invite | user | peer_shared`).
+2. `signer_type`: signer keyspace discriminator (`peer_key | workspace | user_invite | device_invite | user | peer_shared`).
 3. `recorded_by`: local tenant transport peer identity that recorded/projected the event.
 4. `via_peer_id`: authenticated remote transport peer for ingress metadata.
 
@@ -171,7 +171,9 @@ This preserves `poc-6`-style scoped reads/writes while keeping the schema ergono
 1. schema creation runs through ordered migrations,
 2. event modules register their projection table migrations,
 3. startup performs migration + registry/schema consistency checks and fails fast on mismatch,
-4. each event module declares explicit `event_type` and `projection_table`; no inferred naming heuristics.
+4. prototype schema epoch is explicit (`schema_epoch`) and enforced at startup,
+5. legacy DB layouts from prior prototype epochs are intentionally rejected (no backward migration; recreate DB),
+6. each event module declares explicit `event_type` and `projection_table`; no inferred naming heuristics.
 
 ---
 

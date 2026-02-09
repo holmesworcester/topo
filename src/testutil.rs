@@ -6,7 +6,7 @@ use crate::db::{open_connection, schema::create_tables};
 use crate::events::{
     MessageEvent, MessageDeletionEvent, ReactionEvent, PeerKeyEvent, SecretKeyEvent,
     SignedMemoEvent, ParsedEvent,
-    NetworkEvent, InviteAcceptedEvent, UserInviteBootEvent, UserInviteOngoingEvent,
+    WorkspaceEvent, InviteAcceptedEvent, UserInviteBootEvent, UserInviteOngoingEvent,
     DeviceInviteFirstEvent, UserBootEvent,
     PeerSharedFirstEvent, AdminBootEvent,
     UserRemovedEvent, PeerRemovedEvent, SecretSharedEvent,
@@ -216,57 +216,57 @@ impl Peer {
 
     // --- Identity event helpers ---
 
-    /// Create a Network event. Returns the event ID.
-    pub fn create_network(&self, network_id: [u8; 32], public_key: [u8; 32]) -> EventId {
+    /// Create a Workspace event. Returns the event ID.
+    pub fn create_workspace(&self, workspace_id: [u8; 32], public_key: [u8; 32]) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
-        let net = ParsedEvent::Network(NetworkEvent {
+        let ws = ParsedEvent::Workspace(WorkspaceEvent {
             created_at_ms: current_timestamp_ms(),
             public_key,
-            network_id,
+            workspace_id,
         });
-        event_id_or_blocked(create_event_sync(&db, &self.identity, &net))
-            .expect("failed to create network")
+        event_id_or_blocked(create_event_sync(&db, &self.identity, &ws))
+            .expect("failed to create workspace")
     }
 
-    /// Try to create a Network event. Returns Result to allow handling rejection.
-    pub fn try_create_network(&self, network_id: [u8; 32], public_key: [u8; 32]) -> Result<EventId, CreateEventError> {
+    /// Try to create a Workspace event. Returns Result to allow handling rejection.
+    pub fn try_create_workspace(&self, workspace_id: [u8; 32], public_key: [u8; 32]) -> Result<EventId, CreateEventError> {
         let db = open_connection(&self.db_path).expect("failed to open db");
-        let net = ParsedEvent::Network(NetworkEvent {
+        let ws = ParsedEvent::Workspace(WorkspaceEvent {
             created_at_ms: current_timestamp_ms(),
             public_key,
-            network_id,
+            workspace_id,
         });
-        create_event_sync(&db, &self.identity, &net)
+        create_event_sync(&db, &self.identity, &ws)
     }
 
     /// Create an InviteAccepted event (local). Returns the event ID.
-    pub fn create_invite_accepted(&self, invite_event_id: &EventId, network_id: [u8; 32]) -> EventId {
+    pub fn create_invite_accepted(&self, invite_event_id: &EventId, workspace_id: [u8; 32]) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
         let ia = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
             created_at_ms: current_timestamp_ms(),
             invite_event_id: *invite_event_id,
-            network_id,
+            workspace_id,
         });
         create_event_sync(&db, &self.identity, &ia).expect("failed to create invite_accepted")
     }
 
     /// Try to create an InviteAccepted event. Returns Result to allow handling rejection.
-    pub fn try_create_invite_accepted(&self, invite_event_id: &EventId, network_id: [u8; 32]) -> Result<EventId, CreateEventError> {
+    pub fn try_create_invite_accepted(&self, invite_event_id: &EventId, workspace_id: [u8; 32]) -> Result<EventId, CreateEventError> {
         let db = open_connection(&self.db_path).expect("failed to open db");
         let ia = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
             created_at_ms: current_timestamp_ms(),
             invite_event_id: *invite_event_id,
-            network_id,
+            workspace_id,
         });
         create_event_sync(&db, &self.identity, &ia)
     }
 
-    /// Create a UserInviteBoot event (signed by network key). Returns the event ID.
+    /// Create a UserInviteBoot event (signed by workspace key). Returns the event ID.
     pub fn create_user_invite_boot(
         &self,
         signing_key: &ed25519_dalek::SigningKey,
-        network_event_id: &EventId,
-        network_id: [u8; 32],
+        workspace_event_id: &EventId,
+        workspace_id: [u8; 32],
     ) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
         let public_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng())
@@ -274,8 +274,8 @@ impl Peer {
         let evt = ParsedEvent::UserInviteBoot(UserInviteBootEvent {
             created_at_ms: current_timestamp_ms(),
             public_key,
-            network_id,
-            signed_by: *network_event_id,
+            workspace_id,
+            signed_by: *workspace_event_id,
             signer_type: 1,
             signature: [0u8; 64],
         });
@@ -288,15 +288,15 @@ impl Peer {
         &self,
         invite_public_key: [u8; 32],
         signing_key: &ed25519_dalek::SigningKey,
-        network_event_id: &EventId,
-        network_id: [u8; 32],
+        workspace_event_id: &EventId,
+        workspace_id: [u8; 32],
     ) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
         let evt = ParsedEvent::UserInviteBoot(UserInviteBootEvent {
             created_at_ms: current_timestamp_ms(),
             public_key: invite_public_key,
-            network_id,
-            signed_by: *network_event_id,
+            workspace_id,
+            signed_by: *workspace_event_id,
             signer_type: 1,
             signature: [0u8; 64],
         });
@@ -383,20 +383,20 @@ impl Peer {
             .expect("failed to create peer_shared_first")
     }
 
-    /// Create an AdminBoot event (signed by Network key, dep on User). Returns the event ID.
+    /// Create an AdminBoot event (signed by Workspace key, dep on User). Returns the event ID.
     pub fn create_admin_boot(
         &self,
         admin_public_key: [u8; 32],
         signing_key: &ed25519_dalek::SigningKey,
         user_event_id: &EventId,
-        network_event_id: &EventId,
+        workspace_event_id: &EventId,
     ) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
         let evt = ParsedEvent::AdminBoot(AdminBootEvent {
             created_at_ms: current_timestamp_ms(),
             public_key: admin_public_key,
             user_event_id: *user_event_id,
-            signed_by: *network_event_id,
+            signed_by: *workspace_event_id,
             signer_type: 1,
             signature: [0u8; 64],
         });
@@ -653,11 +653,11 @@ impl Peer {
         ).unwrap_or(0)
     }
 
-    /// Count networks projected for this peer.
-    pub fn network_count(&self) -> i64 {
+    /// Count workspaces projected for this peer.
+    pub fn workspace_count(&self) -> i64 {
         let db = open_connection(&self.db_path).expect("failed to open db");
         db.query_row(
-            "SELECT COUNT(*) FROM networks WHERE recorded_by = ?1",
+            "SELECT COUNT(*) FROM workspaces WHERE recorded_by = ?1",
             rusqlite::params![&self.identity],
             |row| row.get(0),
         ).unwrap_or(0)
@@ -763,7 +763,7 @@ fn replay_projection_impl(db: &rusqlite::Connection, recorded_by: &str, order: &
     db.execute("DELETE FROM deleted_messages WHERE recorded_by = ?1", rusqlite::params![recorded_by])
         .expect("failed to clear deleted_messages");
     // Identity tables
-    db.execute("DELETE FROM networks WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
+    db.execute("DELETE FROM workspaces WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
     db.execute("DELETE FROM invite_accepted WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
     db.execute("DELETE FROM user_invites WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
     db.execute("DELETE FROM device_invites WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
@@ -773,7 +773,7 @@ fn replay_projection_impl(db: &rusqlite::Connection, recorded_by: &str, order: &
     db.execute("DELETE FROM removed_entities WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
     db.execute("DELETE FROM secret_shared WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
     db.execute("DELETE FROM trust_anchors WHERE peer_id = ?1", rusqlite::params![recorded_by]).ok();
-    db.execute("DELETE FROM invite_network_bindings WHERE peer_id = ?1", rusqlite::params![recorded_by]).ok();
+    db.execute("DELETE FROM invite_workspace_bindings WHERE peer_id = ?1", rusqlite::params![recorded_by]).ok();
     db.execute("DELETE FROM peer_transport_bindings WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
     db.execute("DELETE FROM transport_keys WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
     db.execute("DELETE FROM valid_events WHERE peer_id = ?1", rusqlite::params![recorded_by])

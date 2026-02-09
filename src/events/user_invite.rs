@@ -5,9 +5,9 @@ use super::{EventError, ParsedEvent, EVENT_TYPE_USER_INVITE_BOOT, EVENT_TYPE_USE
 pub struct UserInviteBootEvent {
     pub created_at_ms: u64,
     pub public_key: [u8; 32],    // Ed25519 key for this invite
-    pub network_id: [u8; 32],    // reference (for inviteNet capture), NOT a dep
-    pub signed_by: [u8; 32],     // signer event_id (Network event)
-    pub signer_type: u8,         // 1 = network
+    pub workspace_id: [u8; 32],    // reference (for workspace capture), NOT a dep
+    pub signed_by: [u8; 32],     // signer event_id (Workspace event)
+    pub signer_type: u8,         // 1 = workspace
     pub signature: [u8; 64],
 }
 
@@ -25,7 +25,7 @@ pub struct UserInviteOngoingEvent {
 /// [0]        type_code = 10
 /// [1..9]     created_at_ms (u64 LE)
 /// [9..41]    public_key (32 bytes)
-/// [41..73]   network_id (32 bytes) — reference, not dep
+/// [41..73]   workspace_id (32 bytes) — reference, not dep
 /// [73..105]  signed_by (32 bytes)
 /// [105]      signer_type (1 byte)
 /// [106..170] signature (64 bytes)
@@ -40,8 +40,8 @@ pub fn parse_user_invite_boot(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     let created_at_ms = u64::from_le_bytes(blob[1..9].try_into().unwrap());
     let mut public_key = [0u8; 32];
     public_key.copy_from_slice(&blob[9..41]);
-    let mut network_id = [0u8; 32];
-    network_id.copy_from_slice(&blob[41..73]);
+    let mut workspace_id = [0u8; 32];
+    workspace_id.copy_from_slice(&blob[41..73]);
     let mut signed_by = [0u8; 32];
     signed_by.copy_from_slice(&blob[73..105]);
     let signer_type = blob[105];
@@ -51,7 +51,7 @@ pub fn parse_user_invite_boot(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     Ok(ParsedEvent::UserInviteBoot(UserInviteBootEvent {
         created_at_ms,
         public_key,
-        network_id,
+        workspace_id,
         signed_by,
         signer_type,
         signature,
@@ -67,7 +67,7 @@ pub fn encode_user_invite_boot(event: &ParsedEvent) -> Result<Vec<u8>, EventErro
     buf.push(EVENT_TYPE_USER_INVITE_BOOT);
     buf.extend_from_slice(&e.created_at_ms.to_le_bytes());
     buf.extend_from_slice(&e.public_key);
-    buf.extend_from_slice(&e.network_id);
+    buf.extend_from_slice(&e.workspace_id);
     buf.extend_from_slice(&e.signed_by);
     buf.push(e.signer_type);
     buf.extend_from_slice(&e.signature);

@@ -6,8 +6,8 @@ pub struct AdminBootEvent {
     pub created_at_ms: u64,
     pub public_key: [u8; 32],
     pub user_event_id: [u8; 32],  // dep: User event
-    pub signed_by: [u8; 32],      // signer event_id (Network event)
-    pub signer_type: u8,          // 1 = network
+    pub signed_by: [u8; 32],      // signer event_id (Workspace event)
+    pub signer_type: u8,          // 1 = workspace
     pub signature: [u8; 64],
 }
 
