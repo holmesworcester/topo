@@ -353,6 +353,24 @@ static MIGRATIONS: &[Migration] = &[
             ALTER TABLE message_attachments ADD COLUMN signer_event_id TEXT NOT NULL DEFAULT '';
         ",
     },
+    Migration {
+        version: 15,
+        name: "file_slice_guard_queue_and_descriptor_link",
+        sql: "
+            ALTER TABLE file_slices ADD COLUMN descriptor_event_id TEXT NOT NULL DEFAULT '';
+            CREATE INDEX IF NOT EXISTS idx_file_slices_descriptor
+                ON file_slices(recorded_by, descriptor_event_id);
+
+            CREATE TABLE IF NOT EXISTS file_slice_guard_blocks (
+                peer_id TEXT NOT NULL,
+                file_id TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                PRIMARY KEY (peer_id, event_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_file_slice_guard_blocks_file
+                ON file_slice_guard_blocks(peer_id, file_id);
+        ",
+    },
 ];
 
 fn ensure_schema_migrations(conn: &Connection) -> SqliteResult<()> {
@@ -468,17 +486,22 @@ mod tests {
             "INSERT INTO blocked_event_deps (peer_id, event_id, blocker_event_id) VALUES ('p1', 'e1', 'b1')",
             [],
         ).unwrap();
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM blocked_event_deps WHERE peer_id = 'p1'",
-            [], |row| row.get(0),
-        ).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM blocked_event_deps WHERE peer_id = 'p1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 1);
 
         // Idempotent — running migrations again doesn't fail
         run_migrations(&conn).unwrap();
-        let count2: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM blocked_event_deps", [], |row| row.get(0),
-        ).unwrap();
+        let count2: i64 = conn
+            .query_row("SELECT COUNT(*) FROM blocked_event_deps", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
         assert_eq!(count2, 1);
 
         // Migration version recorded
@@ -500,8 +523,10 @@ mod tests {
         run_migrations(&conn).unwrap();
 
         let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
             .unwrap();
-        assert_eq!(count, 14);
+        assert_eq!(count, 15);
     }
 }

@@ -1,12 +1,15 @@
-use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::Connection;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::crypto::{event_id_to_base64, event_id_from_base64, EventId};
-use crate::events::{self, ParsedEvent, registry};
 use super::decision::ProjectionDecision;
 use super::encrypted::project_encrypted;
-use super::projectors::{project_message, project_message_attachment, project_message_deletion, project_file_slice, project_reaction, project_peer_key, project_secret_key, project_signed_memo};
+use super::projectors::{
+    project_file_slice, project_message, project_message_attachment, project_message_deletion,
+    project_peer_key, project_reaction, project_secret_key, project_signed_memo,
+};
 use super::signer::{resolve_signer_key, verify_ed25519_signature, SignerResolution};
+use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
+use crate::events::{self, registry, ParsedEvent};
 
 /// Check that each dep's type code matches the allowed types for that dep field.
 /// Returns Some(reason) if a type mismatch is found, None if all pass.
@@ -65,12 +68,14 @@ fn apply_projection(
     blob: &[u8],
     parsed: &ParsedEvent,
 ) -> Result<ProjectionDecision, Box<dyn std::error::Error>> {
-    let meta = registry().lookup(parsed.event_type_code())
+    let meta = registry()
+        .lookup(parsed.event_type_code())
         .ok_or_else(|| format!("unknown type code {}", parsed.event_type_code()))?;
 
     // Signer verification (if required)
     if meta.signer_required {
-        let (signer_event_id, signer_type) = parsed.signer_fields()
+        let (signer_event_id, signer_type) = parsed
+            .signer_fields()
             .ok_or("signer_required but no signer_fields")?;
         let resolution = resolve_signer_key(conn, recorded_by, signer_type, &signer_event_id)?;
         match resolution {
@@ -148,7 +153,12 @@ fn apply_projection(
         | ParsedEvent::PeerRemoved(_)
         | ParsedEvent::SecretShared(_)
         | ParsedEvent::TransportKey(_) => {
-            return super::identity::apply_identity_projection(conn, recorded_by, event_id_b64, parsed);
+            return super::identity::apply_identity_projection(
+                conn,
+                recorded_by,
+                event_id_b64,
+                parsed,
+            );
         }
     }
 
@@ -279,42 +289,46 @@ pub fn project_one(
         super::identity::retry_guard_blocked_events(conn, recorded_by)?;
     }
 
-    // 10. Guard cascade: if MessageAttachment just projected, retry guard-blocked
-    //     file_slice events that were waiting for their descriptor.
-    if matches!(parsed, ParsedEvent::MessageAttachment(_)) {
-        retry_file_slice_guard_blocks(conn, recorded_by)?;
+    // 10. Guard cascade: if MessageAttachment just projected, retry only the
+    //     file_slice events that were guard-blocked for this specific file_id.
+    if let ParsedEvent::MessageAttachment(att) = parsed {
+        let file_id_b64 = event_id_to_base64(&att.file_id);
+        retry_file_slice_guard_blocks_for_file(conn, recorded_by, &file_id_b64)?;
     }
 
     Ok(ProjectionDecision::Valid)
 }
 
-/// After a MessageAttachment projects, retry file_slice events that were
-/// guard-blocked waiting for their descriptor (Block with empty missing).
-fn retry_file_slice_guard_blocks(
+/// After a MessageAttachment projects, retry only file_slice events that were
+/// guard-blocked waiting for this file descriptor.
+fn retry_file_slice_guard_blocks_for_file(
     conn: &Connection,
     recorded_by: &str,
+    file_id_b64: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Find file_slice events that are recorded but not valid, not rejected,
-    // and have no entries in blocked_event_deps (guard-blocked, not dep-blocked).
+    // Targeted lookup avoids scanning all historical file_slice events.
     let mut stmt = conn.prepare(
-        "SELECT re.event_id FROM recorded_events re
-         INNER JOIN events e ON e.event_id = re.event_id
-         WHERE re.peer_id = ?1
-           AND e.event_type = 'file_slice'
-           AND re.event_id NOT IN (SELECT event_id FROM valid_events WHERE peer_id = ?1)
-           AND re.event_id NOT IN (SELECT event_id FROM rejected_events WHERE peer_id = ?1)
-           AND re.event_id NOT IN (SELECT DISTINCT event_id FROM blocked_event_deps WHERE peer_id = ?1)"
+        "SELECT event_id
+         FROM file_slice_guard_blocks
+         WHERE peer_id = ?1 AND file_id = ?2",
     )?;
-    let candidates: Vec<String> = stmt.query_map(
-        rusqlite::params![recorded_by],
-        |row| row.get::<_, String>(0),
-    )?.collect::<Result<Vec<_>, _>>()?;
+    let candidates: Vec<String> = stmt
+        .query_map(rusqlite::params![recorded_by, file_id_b64], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
     drop(stmt);
 
     for eid_b64 in candidates {
         if let Some(event_id) = event_id_from_base64(&eid_b64) {
             let _ = project_one(conn, recorded_by, &event_id)?;
         }
+        // Descriptor exists now; subsequent blocking (if any) should be represented
+        // as normal dep-block rows, not descriptor-guard state.
+        conn.execute(
+            "DELETE FROM file_slice_guard_blocks WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &eid_b64],
+        )?;
     }
     Ok(())
 }
@@ -332,12 +346,13 @@ pub fn unblock_dependents(
         // Collect candidate event_ids that were blocked on this blocker BEFORE deleting
         let mut stmt = conn.prepare(
             "SELECT DISTINCT event_id FROM blocked_event_deps
-             WHERE peer_id = ?1 AND blocker_event_id = ?2"
+             WHERE peer_id = ?1 AND blocker_event_id = ?2",
         )?;
-        let candidates: Vec<String> = stmt.query_map(
-            rusqlite::params![recorded_by, &blocker],
-            |row| row.get::<_, String>(0),
-        )?.collect::<Result<Vec<_>, _>>()?;
+        let candidates: Vec<String> = stmt
+            .query_map(rusqlite::params![recorded_by, &blocker], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
 
         if candidates.is_empty() {
             continue;
@@ -404,57 +419,60 @@ pub fn unblock_dependents(
                         continue;
                     }
                     Ok(parsed) => {
-                    // Check deps are satisfied (should be, but verify)
-                    let deps = parsed.dep_field_values();
-                    let mut still_missing = false;
-                    for (_field, dep_id) in &deps {
-                        let dep_b64 = event_id_to_base64(dep_id);
-                        let dep_valid: bool = conn.query_row(
+                        // Check deps are satisfied (should be, but verify)
+                        let deps = parsed.dep_field_values();
+                        let mut still_missing = false;
+                        for (_field, dep_id) in &deps {
+                            let dep_b64 = event_id_to_base64(dep_id);
+                            let dep_valid: bool = conn.query_row(
                             "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
                             rusqlite::params![recorded_by, &dep_b64],
                             |row| row.get(0),
                         )?;
-                        if !dep_valid {
-                            still_missing = true;
-                            break;
-                        }
-                    }
-                    if still_missing {
-                        continue;
-                    }
-
-                    // Dep type checking
-                    let meta = registry().lookup(parsed.event_type_code());
-                    if let Some(meta) = meta {
-                        if !meta.dep_field_type_codes.is_empty() {
-                            if let Some(reason) = check_dep_types(conn, &deps, meta.dep_field_type_codes)? {
-                                record_rejection(conn, recorded_by, &eid_b64, &reason);
-                                continue;
+                            if !dep_valid {
+                                still_missing = true;
+                                break;
                             }
                         }
-                    }
-
-                    // Apply projection (signer verification + projector dispatch)
-                    let decision = apply_projection(conn, recorded_by, &eid_b64, &blob, &parsed)?;
-                    match &decision {
-                        ProjectionDecision::Reject { ref reason } => {
-                            record_rejection(conn, recorded_by, &eid_b64, reason);
+                        if still_missing {
                             continue;
                         }
-                        ProjectionDecision::Block { .. } => {
-                            // Inner deps still missing; leave event blocked, don't cascade
-                            continue;
-                        }
-                        _ => {}
-                    }
 
-                    conn.execute(
+                        // Dep type checking
+                        let meta = registry().lookup(parsed.event_type_code());
+                        if let Some(meta) = meta {
+                            if !meta.dep_field_type_codes.is_empty() {
+                                if let Some(reason) =
+                                    check_dep_types(conn, &deps, meta.dep_field_type_codes)?
+                                {
+                                    record_rejection(conn, recorded_by, &eid_b64, &reason);
+                                    continue;
+                                }
+                            }
+                        }
+
+                        // Apply projection (signer verification + projector dispatch)
+                        let decision =
+                            apply_projection(conn, recorded_by, &eid_b64, &blob, &parsed)?;
+                        match &decision {
+                            ProjectionDecision::Reject { ref reason } => {
+                                record_rejection(conn, recorded_by, &eid_b64, reason);
+                                continue;
+                            }
+                            ProjectionDecision::Block { .. } => {
+                                // Inner deps still missing; leave event blocked, don't cascade
+                                continue;
+                            }
+                            _ => {}
+                        }
+
+                        conn.execute(
                         "INSERT OR IGNORE INTO valid_events (peer_id, event_id) VALUES (?1, ?2)",
                         rusqlite::params![recorded_by, &eid_b64],
                     )?;
 
-                    // This newly projected event may unblock further events
-                    worklist.push(eid_b64);
+                        // This newly projected event may unblock further events
+                        worklist.push(eid_b64);
                     }
                 }
             }
@@ -469,14 +487,21 @@ mod tests {
     use super::*;
     use crate::crypto::hash_event;
     use crate::db::{open_in_memory, schema::create_tables};
-    use crate::events::{self, MessageEvent, MessageAttachmentEvent, MessageDeletionEvent, FileSliceEvent, ReactionEvent, PeerKeyEvent, SecretKeyEvent, SignedMemoEvent, EncryptedEvent, WorkspaceEvent, ParsedEvent, EVENT_TYPE_MESSAGE, EVENT_TYPE_ENCRYPTED};
+    use crate::events::{
+        self, EncryptedEvent, FileSliceEvent, MessageAttachmentEvent, MessageDeletionEvent, MessageEvent,
+        ParsedEvent, PeerKeyEvent, ReactionEvent, SecretKeyEvent, SignedMemoEvent, WorkspaceEvent,
+        EVENT_TYPE_ENCRYPTED, EVENT_TYPE_MESSAGE,
+    };
     use crate::projection::encrypted::encrypt_event_blob;
     use crate::projection::signer::sign_event_bytes;
     use ed25519_dalek::SigningKey;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn now_ms() -> u64 {
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
     }
 
     /// Insert a blob into events + neg_items + recorded_events (simulating what
@@ -486,7 +511,8 @@ mod tests {
         let event_id_b64 = event_id_to_base64(&event_id);
         let ts = now_ms();
         let type_code = blob[0];
-        let type_name = registry().lookup(type_code)
+        let type_name = registry()
+            .lookup(type_code)
             .map(|m| m.type_name)
             .unwrap_or("unknown");
 
@@ -498,19 +524,21 @@ mod tests {
         conn.execute(
             "INSERT OR IGNORE INTO neg_items (ts, id) VALUES (?1, ?2)",
             rusqlite::params![ts as i64, event_id.as_slice()],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
              VALUES (?1, ?2, ?3, 'test')",
             rusqlite::params![recorded_by, &event_id_b64, ts as i64],
-        ).unwrap();
+        )
+        .unwrap();
 
         event_id
     }
 
     use crate::events::{
-        WorkspaceEvent, InviteAcceptedEvent, UserInviteBootEvent,
-        DeviceInviteFirstEvent, UserBootEvent, PeerSharedFirstEvent,
+        DeviceInviteFirstEvent, InviteAcceptedEvent, PeerSharedFirstEvent, UserBootEvent,
+        UserInviteBootEvent, WorkspaceEvent,
     };
 
     /// Create a minimal identity chain and return (peer_shared_event_id, signing_key).
@@ -613,7 +641,9 @@ mod tests {
     /// Returns (signer_eid, signing_key, chain_blobs) where chain_blobs
     /// are in dependency order (Network, InviteAccepted, UserInviteBoot, etc.).
     /// Caller must insert_event_raw + project_one each blob in order.
-    fn build_identity_chain_deferred(recorded_by: &str) -> (EventId, SigningKey, Vec<(EventId, Vec<u8>)>) {
+    fn build_identity_chain_deferred(
+        recorded_by: &str,
+    ) -> (EventId, SigningKey, Vec<(EventId, Vec<u8>)>) {
         let mut rng = rand::thread_rng();
 
         // 1. Workspace
@@ -713,7 +743,11 @@ mod tests {
     }
 
     /// Insert and project all events from a deferred identity chain.
-    fn insert_and_project_identity_chain(conn: &Connection, recorded_by: &str, chain_blobs: &[(EventId, Vec<u8>)]) {
+    fn insert_and_project_identity_chain(
+        conn: &Connection,
+        recorded_by: &str,
+        chain_blobs: &[(EventId, Vec<u8>)],
+    ) {
         for (eid, blob) in chain_blobs {
             insert_event_raw(conn, recorded_by, blob);
             project_one(conn, recorded_by, eid).unwrap();
@@ -728,7 +762,11 @@ mod tests {
     }
 
     /// Create a signed message event blob. Returns (parsed, blob).
-    fn make_message_signed(signing_key: &SigningKey, signer_eid: &EventId, content: &str) -> (ParsedEvent, Vec<u8>) {
+    fn make_message_signed(
+        signing_key: &SigningKey,
+        signer_eid: &EventId,
+        content: &str,
+    ) -> (ParsedEvent, Vec<u8>) {
         let msg = MessageEvent {
             created_at_ms: now_ms(),
             workspace_event_id: *workspace_event_id,
@@ -765,7 +803,12 @@ mod tests {
     }
 
     /// Create a signed reaction event blob.
-    fn make_reaction_signed(signing_key: &SigningKey, signer_eid: &EventId, target: &EventId, emoji: &str) -> (ParsedEvent, Vec<u8>) {
+    fn make_reaction_signed(
+        signing_key: &SigningKey,
+        signer_eid: &EventId,
+        target: &EventId,
+        emoji: &str,
+    ) -> (ParsedEvent, Vec<u8>) {
         let rxn = ReactionEvent {
             created_at_ms: now_ms(),
             target_event_id: *target,
@@ -783,13 +826,23 @@ mod tests {
     }
 
     /// Convenience: create identity chain + signed reaction.
-    fn make_reaction(conn: &Connection, recorded_by: &str, target: &EventId, emoji: &str) -> (ParsedEvent, Vec<u8>) {
+    fn make_reaction(
+        conn: &Connection,
+        recorded_by: &str,
+        target: &EventId,
+        emoji: &str,
+    ) -> (ParsedEvent, Vec<u8>) {
         let (signer_eid, signing_key) = make_identity_chain(conn, recorded_by);
         make_reaction_signed(&signing_key, &signer_eid, target, emoji)
     }
 
     /// Create a signed deletion event blob.
-    fn make_deletion_signed(signing_key: &SigningKey, signer_eid: &EventId, target: &EventId, author_id: [u8; 32]) -> (ParsedEvent, Vec<u8>) {
+    fn make_deletion_signed(
+        signing_key: &SigningKey,
+        signer_eid: &EventId,
+        target: &EventId,
+        author_id: [u8; 32],
+    ) -> (ParsedEvent, Vec<u8>) {
         let del = MessageDeletionEvent {
             created_at_ms: now_ms(),
             target_event_id: *target,
@@ -806,7 +859,12 @@ mod tests {
     }
 
     /// Create a signed attachment event blob.
-    fn make_attachment_signed(signing_key: &SigningKey, signer_eid: &EventId, message_id: &EventId, key_event_id: &EventId) -> (ParsedEvent, Vec<u8>) {
+    fn make_attachment_signed(
+        signing_key: &SigningKey,
+        signer_eid: &EventId,
+        message_id: &EventId,
+        key_event_id: &EventId,
+    ) -> (ParsedEvent, Vec<u8>) {
         let att = MessageAttachmentEvent {
             created_at_ms: now_ms(),
             message_id: *message_id,
@@ -838,7 +896,11 @@ mod tests {
         (pk, blob)
     }
 
-    fn make_signed_memo(signing_key: &SigningKey, signer_event_id: &EventId, content: &str) -> (ParsedEvent, Vec<u8>) {
+    fn make_signed_memo(
+        signing_key: &SigningKey,
+        signer_event_id: &EventId,
+        content: &str,
+    ) -> (ParsedEvent, Vec<u8>) {
         let memo = SignedMemoEvent {
             created_at_ms: now_ms(),
             signed_by: *signer_event_id,
@@ -871,19 +933,23 @@ mod tests {
 
         // Verify in messages table
         let eid_b64 = event_id_to_base64(&eid);
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM messages WHERE message_id = ?1 AND recorded_by = ?2",
-            rusqlite::params![&eid_b64, recorded_by],
-            |row| row.get(0),
-        ).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE message_id = ?1 AND recorded_by = ?2",
+                rusqlite::params![&eid_b64, recorded_by],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 1);
 
         // Verify in valid_events
-        let valid: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, &eid_b64],
-            |row| row.get(0),
-        ).unwrap();
+        let valid: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, &eid_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert!(valid);
     }
 
@@ -902,18 +968,21 @@ mod tests {
         project_one(&conn, recorded_by, &msg_eid).unwrap();
 
         // Create reaction targeting it
-        let (_rxn, rxn_blob) = make_reaction_signed(&signing_key, &signer_eid, &msg_eid, "\u{1f44d}");
+        let (_rxn, rxn_blob) =
+            make_reaction_signed(&signing_key, &signer_eid, &msg_eid, "\u{1f44d}");
         let rxn_eid = insert_event_raw(&conn, recorded_by, &rxn_blob);
 
         let result = project_one(&conn, recorded_by, &rxn_eid).unwrap();
         assert_eq!(result, ProjectionDecision::Valid);
 
         let rxn_b64 = event_id_to_base64(&rxn_eid);
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM reactions WHERE event_id = ?1 AND recorded_by = ?2",
-            rusqlite::params![&rxn_b64, recorded_by],
-            |row| row.get(0),
-        ).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM reactions WHERE event_id = ?1 AND recorded_by = ?2",
+                rusqlite::params![&rxn_b64, recorded_by],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 1);
     }
 
@@ -937,20 +1006,24 @@ mod tests {
         }
 
         // Verify in blocked_event_deps
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM blocked_event_deps WHERE peer_id = ?1",
-            rusqlite::params![recorded_by],
-            |row| row.get(0),
-        ).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM blocked_event_deps WHERE peer_id = ?1",
+                rusqlite::params![recorded_by],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert!(count >= 1);
 
         // Verify NOT in valid_events
         let rxn_b64 = event_id_to_base64(&rxn_eid);
-        let valid: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, &rxn_b64],
-            |row| row.get(0),
-        ).unwrap();
+        let valid: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, &rxn_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert!(!valid);
     }
 
@@ -968,7 +1041,8 @@ mod tests {
         let msg_eid = hash_event(&msg_blob);
 
         // Create reaction targeting it — insert reaction first (out of order)
-        let (_rxn, rxn_blob) = make_reaction_signed(&signing_key, &signer_eid, &msg_eid, "\u{2764}\u{fe0f}");
+        let (_rxn, rxn_blob) =
+            make_reaction_signed(&signing_key, &signer_eid, &msg_eid, "\u{2764}\u{fe0f}");
         let rxn_eid = insert_event_raw(&conn, recorded_by, &rxn_blob);
 
         // Project reaction — should block
@@ -983,19 +1057,26 @@ mod tests {
 
         // Reaction should have been auto-unblocked
         let rxn_b64 = event_id_to_base64(&rxn_eid);
-        let valid: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, &rxn_b64],
-            |row| row.get(0),
-        ).unwrap();
-        assert!(valid, "reaction should be auto-projected after target arrives");
+        let valid: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, &rxn_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            valid,
+            "reaction should be auto-projected after target arrives"
+        );
 
         // No remaining blocked deps
-        let blocked: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM blocked_event_deps WHERE peer_id = ?1",
-            rusqlite::params![recorded_by],
-            |row| row.get(0),
-        ).unwrap();
+        let blocked: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM blocked_event_deps WHERE peer_id = ?1",
+                rusqlite::params![recorded_by],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(blocked, 0);
     }
 
@@ -1029,16 +1110,24 @@ mod tests {
         let msg2_eid = hash_event(&msg2_blob);
 
         // Create reaction targeting msg1 — insert without msg1 in events
-        let (_rxn1, rxn1_blob) = make_reaction_signed(&signing_key, &signer_eid, &msg1_eid, "\u{1f44d}");
+        let (_rxn1, rxn1_blob) =
+            make_reaction_signed(&signing_key, &signer_eid, &msg1_eid, "\u{1f44d}");
         let rxn1_eid = insert_event_raw(&conn, recorded_by, &rxn1_blob);
 
         // Create reaction targeting msg2 — insert without msg2 in events
-        let (_rxn2, rxn2_blob) = make_reaction_signed(&signing_key, &signer_eid, &msg2_eid, "\u{2764}\u{fe0f}");
+        let (_rxn2, rxn2_blob) =
+            make_reaction_signed(&signing_key, &signer_eid, &msg2_eid, "\u{2764}\u{fe0f}");
         let rxn2_eid = insert_event_raw(&conn, recorded_by, &rxn2_blob);
 
         // Both should block
-        assert!(matches!(project_one(&conn, recorded_by, &rxn1_eid).unwrap(), ProjectionDecision::Block { .. }));
-        assert!(matches!(project_one(&conn, recorded_by, &rxn2_eid).unwrap(), ProjectionDecision::Block { .. }));
+        assert!(matches!(
+            project_one(&conn, recorded_by, &rxn1_eid).unwrap(),
+            ProjectionDecision::Block { .. }
+        ));
+        assert!(matches!(
+            project_one(&conn, recorded_by, &rxn2_eid).unwrap(),
+            ProjectionDecision::Block { .. }
+        ));
 
         // Insert msg1 — rxn1 unblocks, rxn2 stays blocked
         insert_event_raw(&conn, recorded_by, &msg1_blob);
@@ -1046,26 +1135,35 @@ mod tests {
 
         let rxn1_b64 = event_id_to_base64(&rxn1_eid);
         let rxn2_b64 = event_id_to_base64(&rxn2_eid);
-        let r1_valid: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, &rxn1_b64], |row| row.get(0),
-        ).unwrap();
+        let r1_valid: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, &rxn1_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert!(r1_valid);
 
-        let r2_valid: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, &rxn2_b64], |row| row.get(0),
-        ).unwrap();
+        let r2_valid: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, &rxn2_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert!(!r2_valid);
 
         // Insert msg2 — rxn2 unblocks
         insert_event_raw(&conn, recorded_by, &msg2_blob);
         project_one(&conn, recorded_by, &msg2_eid).unwrap();
 
-        let r2_valid2: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, &rxn2_b64], |row| row.get(0),
-        ).unwrap();
+        let r2_valid2: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, &rxn2_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert!(r2_valid2);
     }
 
@@ -1085,11 +1183,13 @@ mod tests {
 
         // Verify in peer_keys table
         let eid_b64 = event_id_to_base64(&eid);
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM peer_keys WHERE event_id = ?1 AND recorded_by = ?2",
-            rusqlite::params![&eid_b64, recorded_by],
-            |row| row.get(0),
-        ).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM peer_keys WHERE event_id = ?1 AND recorded_by = ?2",
+                rusqlite::params![&eid_b64, recorded_by],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 1);
     }
 
@@ -1110,11 +1210,13 @@ mod tests {
 
         // Verify in signed_memos table
         let memo_b64 = event_id_to_base64(&memo_eid);
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM signed_memos WHERE event_id = ?1 AND recorded_by = ?2",
-            rusqlite::params![&memo_b64, recorded_by],
-            |row| row.get(0),
-        ).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM signed_memos WHERE event_id = ?1 AND recorded_by = ?2",
+                rusqlite::params![&memo_b64, recorded_by],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 1);
     }
 
@@ -1161,19 +1263,26 @@ mod tests {
 
         // Memo should have been auto-unblocked via cascade
         let memo_b64 = event_id_to_base64(&memo_eid);
-        let valid: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, &memo_b64],
-            |row| row.get(0),
-        ).unwrap();
-        assert!(valid, "signed memo should be auto-projected after signer key arrives");
+        let valid: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, &memo_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            valid,
+            "signed memo should be auto-projected after signer key arrives"
+        );
 
         // Verify in signed_memos table
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM signed_memos WHERE event_id = ?1 AND recorded_by = ?2",
-            rusqlite::params![&memo_b64, recorded_by],
-            |row| row.get(0),
-        ).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM signed_memos WHERE event_id = ?1 AND recorded_by = ?2",
+                rusqlite::params![&memo_b64, recorded_by],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 1);
     }
 
@@ -1216,7 +1325,8 @@ mod tests {
         let r1 = project_one(&conn, recorded_by, &msg_eid).unwrap();
         assert_eq!(r1, ProjectionDecision::Valid);
 
-        let (_rxn, rxn_blob) = make_reaction_signed(&signing_key, &signer_eid, &msg_eid, "\u{1f44d}");
+        let (_rxn, rxn_blob) =
+            make_reaction_signed(&signing_key, &signer_eid, &msg_eid, "\u{1f44d}");
         let rxn_eid = insert_event_raw(&conn, recorded_by, &rxn_blob);
         let r2 = project_one(&conn, recorded_by, &rxn_eid).unwrap();
         assert_eq!(r2, ProjectionDecision::Valid);
@@ -1296,41 +1406,50 @@ mod tests {
 
         // For tenant_b, create its own identity chain and message
         let (signer_eid_b, signing_key_b) = make_identity_chain(&conn, tenant_b);
-        let (_msg_b, msg_b_blob) = make_message_signed(&signing_key_b, &signer_eid_b, "shared message b");
+        let (_msg_b, msg_b_blob) =
+            make_message_signed(&signing_key_b, &signer_eid_b, "shared message b");
         let msg_b_eid = insert_event_raw(&conn, tenant_b, &msg_b_blob);
         let r_b = project_one(&conn, tenant_b, &msg_b_eid).unwrap();
         assert_eq!(r_b, ProjectionDecision::Valid);
 
         // Each tenant has a message in the messages table
         let msg_a_b64 = event_id_to_base64(&msg_eid);
-        let msg_a_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM messages WHERE message_id = ?1",
-            rusqlite::params![&msg_a_b64],
-            |row| row.get(0),
-        ).unwrap();
+        let msg_a_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE message_id = ?1",
+                rusqlite::params![&msg_a_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(msg_a_count, 1);
 
         let msg_b_b64 = event_id_to_base64(&msg_b_eid);
-        let msg_b_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM messages WHERE message_id = ?1",
-            rusqlite::params![&msg_b_b64],
-            |row| row.get(0),
-        ).unwrap();
+        let msg_b_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE message_id = ?1",
+                rusqlite::params![&msg_b_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(msg_b_count, 1);
 
         // Each tenant has independent valid_events entries
-        let a_valid: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![tenant_a, &msg_a_b64],
-            |row| row.get(0),
-        ).unwrap();
+        let a_valid: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![tenant_a, &msg_a_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert!(a_valid, "tenant_a should have valid_events entry");
 
-        let b_valid: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![tenant_b, &msg_b_b64],
-            |row| row.get(0),
-        ).unwrap();
+        let b_valid: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![tenant_b, &msg_b_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert!(b_valid, "tenant_b should have valid_events entry");
     }
 
@@ -1345,7 +1464,8 @@ mod tests {
         let (signer_eid, signing_key) = make_identity_chain(&conn, tenant_a);
 
         // Create signed memo (correct signature)
-        let (_memo, memo_blob) = make_signed_memo(&signing_key, &signer_eid, "tenant isolation test");
+        let (_memo, memo_blob) =
+            make_signed_memo(&signing_key, &signer_eid, "tenant isolation test");
         let memo_eid = insert_event_raw(&conn, tenant_a, &memo_blob);
 
         // Project for tenant_a — should be Valid
@@ -1375,14 +1495,20 @@ mod tests {
         }
 
         // Verify: signed_memos has 1 row for A, 0 for B
-        let sm_a: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM signed_memos WHERE recorded_by = ?1",
-            rusqlite::params![tenant_a], |row| row.get(0),
-        ).unwrap();
-        let sm_b: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM signed_memos WHERE recorded_by = ?1",
-            rusqlite::params![tenant_b], |row| row.get(0),
-        ).unwrap();
+        let sm_a: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM signed_memos WHERE recorded_by = ?1",
+                rusqlite::params![tenant_a],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let sm_b: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM signed_memos WHERE recorded_by = ?1",
+                rusqlite::params![tenant_b],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(sm_a, 1);
         assert_eq!(sm_b, 0);
     }
@@ -1411,11 +1537,13 @@ mod tests {
 
         // Verify row exists in rejected_events
         let memo_b64 = event_id_to_base64(&memo_eid);
-        let rej_reason: String = conn.query_row(
-            "SELECT reason FROM rejected_events WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, &memo_b64],
-            |row| row.get(0),
-        ).unwrap();
+        let rej_reason: String = conn
+            .query_row(
+                "SELECT reason FROM rejected_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, &memo_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert!(rej_reason.contains("invalid signature"));
     }
 
@@ -1466,14 +1594,20 @@ mod tests {
         assert_eq!(r_b, ProjectionDecision::Valid);
 
         // Each sees only 1 message (isolated)
-        let count_a: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
-            rusqlite::params![tenant_a], |row| row.get(0),
-        ).unwrap();
-        let count_b: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
-            rusqlite::params![tenant_b], |row| row.get(0),
-        ).unwrap();
+        let count_a: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
+                rusqlite::params![tenant_a],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let count_b: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
+                rusqlite::params![tenant_b],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(count_a, 1);
         assert_eq!(count_b, 1);
 
@@ -1499,23 +1633,34 @@ mod tests {
         let r_msg_for_b = project_one(&conn, tenant_b, &msg_a_eid).unwrap();
         // The message's signed_by references tenant_a's identity chain which is not valid for tenant_b.
         // So it will block. This is correct cross-tenant isolation behavior.
-        assert!(matches!(r_msg_for_b, ProjectionDecision::Block { .. }),
-            "message should block for tenant_b due to missing signer, got {:?}", r_msg_for_b);
+        assert!(
+            matches!(r_msg_for_b, ProjectionDecision::Block { .. }),
+            "message should block for tenant_b due to missing signer, got {:?}",
+            r_msg_for_b
+        );
 
         // Reaction also still blocked (its target is not valid for tenant_b)
         let rxn_b64 = event_id_to_base64(&rxn_eid);
-        let rxn_valid: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![tenant_b, &rxn_b64],
-            |row| row.get(0),
-        ).unwrap();
-        assert!(!rxn_valid, "reaction should remain blocked since message is not valid for tenant_b");
+        let rxn_valid: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![tenant_b, &rxn_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !rxn_valid,
+            "reaction should remain blocked since message is not valid for tenant_b"
+        );
 
         // Tenant B has 1 message (its own)
-        let count_b_msgs: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
-            rusqlite::params![tenant_b], |row| row.get(0),
-        ).unwrap();
+        let count_b_msgs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
+                rusqlite::params![tenant_b],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(count_b_msgs, 1);
     }
 
@@ -1530,7 +1675,12 @@ mod tests {
         (sk, blob)
     }
 
-    fn make_encrypted_event(key_bytes: &[u8; 32], inner_blob: &[u8], inner_type_code: u8, key_event_id: &EventId) -> (ParsedEvent, Vec<u8>) {
+    fn make_encrypted_event(
+        key_bytes: &[u8; 32],
+        inner_blob: &[u8],
+        inner_type_code: u8,
+        key_event_id: &EventId,
+    ) -> (ParsedEvent, Vec<u8>) {
         let (nonce, ciphertext, auth_tag) = encrypt_event_blob(key_bytes, inner_blob).unwrap();
         let enc = ParsedEvent::Encrypted(EncryptedEvent {
             created_at_ms: now_ms(),
@@ -1557,11 +1707,13 @@ mod tests {
 
         // Verify in secret_keys table
         let eid_b64 = event_id_to_base64(&eid);
-        let stored_key: Vec<u8> = conn.query_row(
-            "SELECT key_bytes FROM secret_keys WHERE event_id = ?1 AND recorded_by = ?2",
-            rusqlite::params![&eid_b64, recorded_by],
-            |row| row.get(0),
-        ).unwrap();
+        let stored_key: Vec<u8> = conn
+            .query_row(
+                "SELECT key_bytes FROM secret_keys WHERE event_id = ?1 AND recorded_by = ?2",
+                rusqlite::params![&eid_b64, recorded_by],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(stored_key, key_bytes.as_slice());
     }
 
@@ -1585,7 +1737,8 @@ mod tests {
         let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "encrypted hello");
 
         // Encrypt it
-        let (_enc, enc_blob) = make_encrypted_event(&key_bytes, &msg_blob, EVENT_TYPE_MESSAGE, &sk_eid);
+        let (_enc, enc_blob) =
+            make_encrypted_event(&key_bytes, &msg_blob, EVENT_TYPE_MESSAGE, &sk_eid);
         let enc_eid = insert_event_raw(&conn, recorded_by, &enc_blob);
 
         let result = project_one(&conn, recorded_by, &enc_eid).unwrap();
@@ -1593,11 +1746,13 @@ mod tests {
 
         // Verify inner message is in messages table (using encrypted event_id)
         let enc_b64 = event_id_to_base64(&enc_eid);
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM messages WHERE message_id = ?1 AND recorded_by = ?2",
-            rusqlite::params![&enc_b64, recorded_by],
-            |row| row.get(0),
-        ).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE message_id = ?1 AND recorded_by = ?2",
+                rusqlite::params![&enc_b64, recorded_by],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 1);
     }
 
@@ -1616,7 +1771,8 @@ mod tests {
 
         // Create encrypted event referencing the missing key
         let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "blocked encrypted");
-        let (_enc, enc_blob) = make_encrypted_event(&key_bytes, &msg_blob, EVENT_TYPE_MESSAGE, &sk_eid);
+        let (_enc, enc_blob) =
+            make_encrypted_event(&key_bytes, &msg_blob, EVENT_TYPE_MESSAGE, &sk_eid);
         let enc_eid = insert_event_raw(&conn, recorded_by, &enc_blob);
 
         let result = project_one(&conn, recorded_by, &enc_eid).unwrap();
@@ -1644,8 +1800,10 @@ mod tests {
         let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
 
         // Insert encrypted event first (before key)
-        let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "out of order encrypted");
-        let (_enc, enc_blob) = make_encrypted_event(&key_bytes, &msg_blob, EVENT_TYPE_MESSAGE, &sk_eid);
+        let (_msg, msg_blob) =
+            make_message_signed(&signing_key, &signer_eid, "out of order encrypted");
+        let (_enc, enc_blob) =
+            make_encrypted_event(&key_bytes, &msg_blob, EVENT_TYPE_MESSAGE, &sk_eid);
         let enc_eid = insert_event_raw(&conn, recorded_by, &enc_blob);
 
         // Project → Block
@@ -1659,19 +1817,26 @@ mod tests {
 
         // Encrypted event should have been cascade-unblocked
         let enc_b64 = event_id_to_base64(&enc_eid);
-        let valid: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, &enc_b64],
-            |row| row.get(0),
-        ).unwrap();
-        assert!(valid, "encrypted event should be auto-projected after key arrives");
+        let valid: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, &enc_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            valid,
+            "encrypted event should be auto-projected after key arrives"
+        );
 
         // Verify inner message was projected
-        let msg_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM messages WHERE message_id = ?1 AND recorded_by = ?2",
-            rusqlite::params![&enc_b64, recorded_by],
-            |row| row.get(0),
-        ).unwrap();
+        let msg_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE message_id = ?1 AND recorded_by = ?2",
+                rusqlite::params![&enc_b64, recorded_by],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(msg_count, 1);
     }
 
@@ -1692,7 +1857,8 @@ mod tests {
 
         // Encrypt with key A but reference key B
         let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "wrong key test");
-        let (_enc, enc_blob) = make_encrypted_event(&key_a, &msg_blob, EVENT_TYPE_MESSAGE, &sk_b_eid);
+        let (_enc, enc_blob) =
+            make_encrypted_event(&key_a, &msg_blob, EVENT_TYPE_MESSAGE, &sk_b_eid);
         let enc_eid = insert_event_raw(&conn, recorded_by, &enc_blob);
 
         let result = project_one(&conn, recorded_by, &enc_eid).unwrap();
@@ -1748,10 +1914,12 @@ mod tests {
 
         // Create inner encrypted event
         let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "nested inner");
-        let (_inner_enc, inner_enc_blob) = make_encrypted_event(&key_bytes, &msg_blob, EVENT_TYPE_MESSAGE, &sk_eid);
+        let (_inner_enc, inner_enc_blob) =
+            make_encrypted_event(&key_bytes, &msg_blob, EVENT_TYPE_MESSAGE, &sk_eid);
 
         // Encrypt the encrypted event
-        let (_outer_enc, outer_enc_blob) = make_encrypted_event(&key_bytes, &inner_enc_blob, EVENT_TYPE_ENCRYPTED, &sk_eid);
+        let (_outer_enc, outer_enc_blob) =
+            make_encrypted_event(&key_bytes, &inner_enc_blob, EVENT_TYPE_ENCRYPTED, &sk_eid);
         let outer_eid = insert_event_raw(&conn, recorded_by, &outer_enc_blob);
 
         let result = project_one(&conn, recorded_by, &outer_eid).unwrap();
@@ -1779,7 +1947,8 @@ mod tests {
 
         // Create encrypted reaction with missing target
         let fake_target = [88u8; 32];
-        let (_rxn, rxn_blob) = make_reaction_signed(&signing_key, &signer_eid, &fake_target, "\u{1f44d}");
+        let (_rxn, rxn_blob) =
+            make_reaction_signed(&signing_key, &signer_eid, &fake_target, "\u{1f44d}");
         let (_enc, enc_blob) = make_encrypted_event(&key_bytes, &rxn_blob, 2, &sk_eid);
         let enc_eid = insert_event_raw(&conn, recorded_by, &enc_blob);
 
@@ -1793,11 +1962,13 @@ mod tests {
 
         // Verify NOT in valid_events
         let enc_b64 = event_id_to_base64(&enc_eid);
-        let valid: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, &enc_b64],
-            |row| row.get(0),
-        ).unwrap();
+        let valid: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, &enc_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert!(!valid);
     }
 
@@ -1817,11 +1988,13 @@ mod tests {
         let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
 
         // Create target message (pre-compute but don't insert yet)
-        let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "target for encrypted rxn");
+        let (_msg, msg_blob) =
+            make_message_signed(&signing_key, &signer_eid, "target for encrypted rxn");
         let msg_eid = hash_event(&msg_blob);
 
         // Create encrypted reaction targeting the message
-        let (_rxn, rxn_blob) = make_reaction_signed(&signing_key, &signer_eid, &msg_eid, "\u{2764}\u{fe0f}");
+        let (_rxn, rxn_blob) =
+            make_reaction_signed(&signing_key, &signer_eid, &msg_eid, "\u{2764}\u{fe0f}");
         let (_enc, enc_blob) = make_encrypted_event(&key_bytes, &rxn_blob, 2, &sk_eid);
         let enc_eid = insert_event_raw(&conn, recorded_by, &enc_blob);
 
@@ -1836,12 +2009,17 @@ mod tests {
 
         // Encrypted reaction should have been cascade-unblocked
         let enc_b64 = event_id_to_base64(&enc_eid);
-        let valid: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, &enc_b64],
-            |row| row.get(0),
-        ).unwrap();
-        assert!(valid, "encrypted reaction should be auto-projected after target message arrives");
+        let valid: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, &enc_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            valid,
+            "encrypted reaction should be auto-projected after target message arrives"
+        );
     }
 
     #[test]
@@ -1861,7 +2039,8 @@ mod tests {
 
         // Encrypt with key A, reference key B → decryption fails
         let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "will be rejected");
-        let (_enc, enc_blob) = make_encrypted_event(&key_a, &msg_blob, EVENT_TYPE_MESSAGE, &sk_b_eid);
+        let (_enc, enc_blob) =
+            make_encrypted_event(&key_a, &msg_blob, EVENT_TYPE_MESSAGE, &sk_b_eid);
         let enc_eid = insert_event_raw(&conn, recorded_by, &enc_blob);
 
         let result = project_one(&conn, recorded_by, &enc_eid).unwrap();
@@ -1869,11 +2048,13 @@ mod tests {
 
         // Verify in rejected_events
         let enc_b64 = event_id_to_base64(&enc_eid);
-        let reason: String = conn.query_row(
-            "SELECT reason FROM rejected_events WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, &enc_b64],
-            |row| row.get(0),
-        ).unwrap();
+        let reason: String = conn
+            .query_row(
+                "SELECT reason FROM rejected_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, &enc_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert!(reason.contains("decryption failed"));
     }
 
@@ -1895,8 +2076,10 @@ mod tests {
         let (signer_eid, signing_key) = make_identity_chain(&conn, tenant_a);
 
         // Create encrypted message referencing that key
-        let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "tenant-scoped encryption");
-        let (_enc, enc_blob) = make_encrypted_event(&key_bytes, &msg_blob, EVENT_TYPE_MESSAGE, &sk_eid);
+        let (_msg, msg_blob) =
+            make_message_signed(&signing_key, &signer_eid, "tenant-scoped encryption");
+        let (_enc, enc_blob) =
+            make_encrypted_event(&key_bytes, &msg_blob, EVENT_TYPE_MESSAGE, &sk_eid);
         let enc_eid = insert_event_raw(&conn, tenant_a, &enc_blob);
 
         // Project for tenant_a → Valid
@@ -1929,7 +2112,12 @@ mod tests {
     // ===== Message deletion helpers =====
 
     /// Convenience: create identity chain + signed deletion.
-    fn make_deletion(conn: &Connection, recorded_by: &str, target: &EventId, author_id: [u8; 32]) -> (ParsedEvent, Vec<u8>) {
+    fn make_deletion(
+        conn: &Connection,
+        recorded_by: &str,
+        target: &EventId,
+        author_id: [u8; 32],
+    ) -> (ParsedEvent, Vec<u8>) {
         let (signer_eid, signing_key) = make_identity_chain(conn, recorded_by);
         make_deletion_signed(&signing_key, &signer_eid, target, author_id)
     }
@@ -1957,28 +2145,34 @@ mod tests {
 
         // Message should be removed
         let msg_b64 = event_id_to_base64(&msg_eid);
-        let msg_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1 AND message_id = ?2",
-            rusqlite::params![recorded_by, &msg_b64],
-            |row| row.get(0),
-        ).unwrap();
+        let msg_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1 AND message_id = ?2",
+                rusqlite::params![recorded_by, &msg_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(msg_count, 0);
 
         // Tombstone should exist
-        let del_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM deleted_messages WHERE recorded_by = ?1 AND message_id = ?2",
-            rusqlite::params![recorded_by, &msg_b64],
-            |row| row.get(0),
-        ).unwrap();
+        let del_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM deleted_messages WHERE recorded_by = ?1 AND message_id = ?2",
+                rusqlite::params![recorded_by, &msg_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(del_count, 1);
 
         // Deletion event should be in valid_events
         let del_b64 = event_id_to_base64(&del_eid);
-        let valid: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, &del_b64],
-            |row| row.get(0),
-        ).unwrap();
+        let valid: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, &del_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert!(valid);
     }
 
@@ -1996,20 +2190,24 @@ mod tests {
         let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
         project_one(&conn, recorded_by, &msg_eid).unwrap();
 
-        let (_rxn1, rxn1_blob) = make_reaction_signed(&signing_key, &signer_eid, &msg_eid, "\u{1f44d}");
+        let (_rxn1, rxn1_blob) =
+            make_reaction_signed(&signing_key, &signer_eid, &msg_eid, "\u{1f44d}");
         let rxn1_eid = insert_event_raw(&conn, recorded_by, &rxn1_blob);
         project_one(&conn, recorded_by, &rxn1_eid).unwrap();
 
-        let (_rxn2, rxn2_blob) = make_reaction_signed(&signing_key, &signer_eid, &msg_eid, "\u{2764}\u{fe0f}");
+        let (_rxn2, rxn2_blob) =
+            make_reaction_signed(&signing_key, &signer_eid, &msg_eid, "\u{2764}\u{fe0f}");
         let rxn2_eid = insert_event_raw(&conn, recorded_by, &rxn2_blob);
         project_one(&conn, recorded_by, &rxn2_eid).unwrap();
 
         // Verify 2 reactions exist
-        let rxn_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM reactions WHERE recorded_by = ?1",
-            rusqlite::params![recorded_by],
-            |row| row.get(0),
-        ).unwrap();
+        let rxn_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM reactions WHERE recorded_by = ?1",
+                rusqlite::params![recorded_by],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(rxn_count, 2);
 
         // Delete the message
@@ -2019,19 +2217,23 @@ mod tests {
         assert_eq!(result, ProjectionDecision::Valid);
 
         // Reactions should be cascaded away
-        let rxn_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM reactions WHERE recorded_by = ?1",
-            rusqlite::params![recorded_by],
-            |row| row.get(0),
-        ).unwrap();
+        let rxn_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM reactions WHERE recorded_by = ?1",
+                rusqlite::params![recorded_by],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(rxn_count, 0);
 
         // Tombstone exists
-        let del_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM deleted_messages WHERE recorded_by = ?1",
-            rusqlite::params![recorded_by],
-            |row| row.get(0),
-        ).unwrap();
+        let del_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM deleted_messages WHERE recorded_by = ?1",
+                rusqlite::params![recorded_by],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(del_count, 1);
     }
 
@@ -2081,27 +2283,36 @@ mod tests {
 
         // Deletion should have been cascade-unblocked and executed
         let del_b64 = event_id_to_base64(&del_eid);
-        let valid: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, &del_b64],
-            |row| row.get(0),
-        ).unwrap();
-        assert!(valid, "deletion should be auto-projected after target arrives");
+        let valid: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, &del_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            valid,
+            "deletion should be auto-projected after target arrives"
+        );
 
         // Message should be deleted (tombstoned)
         let msg_b64 = event_id_to_base64(&msg_eid);
-        let msg_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1 AND message_id = ?2",
-            rusqlite::params![recorded_by, &msg_b64],
-            |row| row.get(0),
-        ).unwrap();
+        let msg_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1 AND message_id = ?2",
+                rusqlite::params![recorded_by, &msg_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(msg_count, 0);
 
-        let tombstone: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM deleted_messages WHERE recorded_by = ?1 AND message_id = ?2",
-            rusqlite::params![recorded_by, &msg_b64],
-            |row| row.get(0),
-        ).unwrap();
+        let tombstone: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM deleted_messages WHERE recorded_by = ?1 AND message_id = ?2",
+                rusqlite::params![recorded_by, &msg_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(tombstone, 1);
     }
 
@@ -2120,13 +2331,18 @@ mod tests {
         project_one(&conn, recorded_by, &msg_eid).unwrap();
 
         // Create deletion with different author_id
-        let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [99u8; 32]); // wrong author
+        let (_del, del_blob) =
+            make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [99u8; 32]); // wrong author
         let del_eid = insert_event_raw(&conn, recorded_by, &del_blob);
 
         let result = project_one(&conn, recorded_by, &del_eid).unwrap();
         match result {
             ProjectionDecision::Reject { reason } => {
-                assert!(reason.contains("deletion author does not match"), "reason: {}", reason);
+                assert!(
+                    reason.contains("deletion author does not match"),
+                    "reason: {}",
+                    reason
+                );
             }
             other => panic!("expected Reject, got {:?}", other),
         }
@@ -2147,13 +2363,15 @@ mod tests {
         project_one(&conn, recorded_by, &msg_eid).unwrap();
 
         // First deletion
-        let (_del1, del1_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [2u8; 32]);
+        let (_del1, del1_blob) =
+            make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [2u8; 32]);
         let del1_eid = insert_event_raw(&conn, recorded_by, &del1_blob);
         let r1 = project_one(&conn, recorded_by, &del1_eid).unwrap();
         assert_eq!(r1, ProjectionDecision::Valid);
 
         // Second deletion (same target, different event) — also signed
-        let (_del2, del2_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [2u8; 32]);
+        let (_del2, del2_blob) =
+            make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [2u8; 32]);
         let del2_eid = insert_event_raw(&conn, recorded_by, &del2_blob);
         let r2 = project_one(&conn, recorded_by, &del2_eid).unwrap();
         // Second deletion finds tombstone already exists → AlreadyProcessed from projector,
@@ -2161,11 +2379,13 @@ mod tests {
         assert!(matches!(r2, ProjectionDecision::Valid));
 
         // Only one tombstone
-        let del_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM deleted_messages WHERE recorded_by = ?1",
-            rusqlite::params![recorded_by],
-            |row| row.get(0),
-        ).unwrap();
+        let del_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM deleted_messages WHERE recorded_by = ?1",
+                rusqlite::params![recorded_by],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(del_count, 1);
     }
 
@@ -2189,7 +2409,8 @@ mod tests {
         project_one(&conn, recorded_by, &del_eid).unwrap();
 
         // Now create a reaction targeting the deleted message
-        let (_rxn, rxn_blob) = make_reaction_signed(&signing_key, &signer_eid, &msg_eid, "\u{1f44d}");
+        let (_rxn, rxn_blob) =
+            make_reaction_signed(&signing_key, &signer_eid, &msg_eid, "\u{1f44d}");
         let rxn_eid = insert_event_raw(&conn, recorded_by, &rxn_blob);
         let result = project_one(&conn, recorded_by, &rxn_eid).unwrap();
 
@@ -2198,11 +2419,13 @@ mod tests {
         assert_eq!(result, ProjectionDecision::Valid);
 
         // No reactions in the table
-        let rxn_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM reactions WHERE recorded_by = ?1",
-            rusqlite::params![recorded_by],
-            |row| row.get(0),
-        ).unwrap();
+        let rxn_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM reactions WHERE recorded_by = ?1",
+                rusqlite::params![recorded_by],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(rxn_count, 0);
     }
 
@@ -2220,7 +2443,8 @@ mod tests {
         let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
         project_one(&conn, recorded_by, &msg_eid).unwrap();
 
-        let (_rxn, rxn_blob) = make_reaction_signed(&signing_key, &signer_eid, &msg_eid, "\u{1f44d}");
+        let (_rxn, rxn_blob) =
+            make_reaction_signed(&signing_key, &signer_eid, &msg_eid, "\u{1f44d}");
         let rxn_eid = insert_event_raw(&conn, recorded_by, &rxn_blob);
         project_one(&conn, recorded_by, &rxn_eid).unwrap();
 
@@ -2229,9 +2453,27 @@ mod tests {
         project_one(&conn, recorded_by, &del_eid).unwrap();
 
         // Capture forward state
-        let fwd_msg: i64 = conn.query_row("SELECT COUNT(*) FROM messages WHERE recorded_by = ?1", rusqlite::params![recorded_by], |row| row.get(0)).unwrap();
-        let fwd_rxn: i64 = conn.query_row("SELECT COUNT(*) FROM reactions WHERE recorded_by = ?1", rusqlite::params![recorded_by], |row| row.get(0)).unwrap();
-        let fwd_del: i64 = conn.query_row("SELECT COUNT(*) FROM deleted_messages WHERE recorded_by = ?1", rusqlite::params![recorded_by], |row| row.get(0)).unwrap();
+        let fwd_msg: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
+                rusqlite::params![recorded_by],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let fwd_rxn: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM reactions WHERE recorded_by = ?1",
+                rusqlite::params![recorded_by],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let fwd_del: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM deleted_messages WHERE recorded_by = ?1",
+                rusqlite::params![recorded_by],
+                |row| row.get(0),
+            )
+            .unwrap();
 
         assert_eq!(fwd_msg, 0, "message should be deleted");
         assert_eq!(fwd_rxn, 0, "reactions should be cascaded");
@@ -2242,14 +2484,38 @@ mod tests {
         let msg_b64 = event_id_to_base64(&msg_eid);
         let rxn_b64 = event_id_to_base64(&rxn_eid);
         let del_b64 = event_id_to_base64(&del_eid);
-        conn.execute("DELETE FROM messages WHERE recorded_by = ?1", rusqlite::params![recorded_by]).unwrap();
-        conn.execute("DELETE FROM reactions WHERE recorded_by = ?1", rusqlite::params![recorded_by]).unwrap();
-        conn.execute("DELETE FROM deleted_messages WHERE recorded_by = ?1", rusqlite::params![recorded_by]).unwrap();
+        conn.execute(
+            "DELETE FROM messages WHERE recorded_by = ?1",
+            rusqlite::params![recorded_by],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM reactions WHERE recorded_by = ?1",
+            rusqlite::params![recorded_by],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM deleted_messages WHERE recorded_by = ?1",
+            rusqlite::params![recorded_by],
+        )
+        .unwrap();
         for eid_b64 in [&msg_b64, &rxn_b64, &del_b64] {
-            conn.execute("DELETE FROM valid_events WHERE peer_id = ?1 AND event_id = ?2", rusqlite::params![recorded_by, eid_b64]).unwrap();
+            conn.execute(
+                "DELETE FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, eid_b64],
+            )
+            .unwrap();
         }
-        conn.execute("DELETE FROM blocked_event_deps WHERE peer_id = ?1", rusqlite::params![recorded_by]).unwrap();
-        conn.execute("DELETE FROM rejected_events WHERE peer_id = ?1", rusqlite::params![recorded_by]).unwrap();
+        conn.execute(
+            "DELETE FROM blocked_event_deps WHERE peer_id = ?1",
+            rusqlite::params![recorded_by],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM rejected_events WHERE peer_id = ?1",
+            rusqlite::params![recorded_by],
+        )
+        .unwrap();
 
         // Re-insert workspace event as valid (it was cleared above)
         let net_b64 = event_id_to_base64(&net_eid);
@@ -2264,14 +2530,44 @@ mod tests {
         project_one(&conn, recorded_by, &msg_eid).unwrap();
 
         // Capture reverse state
-        let rev_msg: i64 = conn.query_row("SELECT COUNT(*) FROM messages WHERE recorded_by = ?1", rusqlite::params![recorded_by], |row| row.get(0)).unwrap();
-        let rev_rxn: i64 = conn.query_row("SELECT COUNT(*) FROM reactions WHERE recorded_by = ?1", rusqlite::params![recorded_by], |row| row.get(0)).unwrap();
-        let rev_del: i64 = conn.query_row("SELECT COUNT(*) FROM deleted_messages WHERE recorded_by = ?1", rusqlite::params![recorded_by], |row| row.get(0)).unwrap();
+        let rev_msg: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
+                rusqlite::params![recorded_by],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let rev_rxn: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM reactions WHERE recorded_by = ?1",
+                rusqlite::params![recorded_by],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let rev_del: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM deleted_messages WHERE recorded_by = ?1",
+                rusqlite::params![recorded_by],
+                |row| row.get(0),
+            )
+            .unwrap();
 
         // Both orders produce the same result
-        assert_eq!(rev_msg, fwd_msg, "message count mismatch: fwd={}, rev={}", fwd_msg, rev_msg);
-        assert_eq!(rev_rxn, fwd_rxn, "reaction count mismatch: fwd={}, rev={}", fwd_rxn, rev_rxn);
-        assert_eq!(rev_del, fwd_del, "tombstone count mismatch: fwd={}, rev={}", fwd_del, rev_del);
+        assert_eq!(
+            rev_msg, fwd_msg,
+            "message count mismatch: fwd={}, rev={}",
+            fwd_msg, rev_msg
+        );
+        assert_eq!(
+            rev_rxn, fwd_rxn,
+            "reaction count mismatch: fwd={}, rev={}",
+            fwd_rxn, rev_rxn
+        );
+        assert_eq!(
+            rev_del, fwd_del,
+            "tombstone count mismatch: fwd={}, rev={}",
+            fwd_del, rev_del
+        );
     }
 
     #[test]
@@ -2297,18 +2593,24 @@ mod tests {
         let result = project_one(&conn, recorded_by, &memo_eid).unwrap();
         match result {
             ProjectionDecision::Reject { reason } => {
-                assert!(reason.contains("unsupported signer_type"), "reason: {}", reason);
+                assert!(
+                    reason.contains("unsupported signer_type"),
+                    "reason: {}",
+                    reason
+                );
             }
             other => panic!("expected Reject, got {:?}", other),
         }
 
         // Verify rejected_events row exists
         let memo_b64 = event_id_to_base64(&memo_eid);
-        let rej_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM rejected_events WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, &memo_b64],
-            |row| row.get(0),
-        ).unwrap();
+        let rej_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM rejected_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, &memo_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(rej_count, 1);
     }
 
@@ -2344,40 +2646,51 @@ mod tests {
 
         // Tenant B emits the same deterministic event
         let eid_b = emit_deterministic_event(&conn, tenant_b, &sk).unwrap();
-        assert_eq!(eid_a, eid_b, "same deterministic event should produce same event_id");
+        assert_eq!(
+            eid_a, eid_b,
+            "same deterministic event should produce same event_id"
+        );
 
         // Global events table: 1 row
-        let event_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM events WHERE event_id = ?1",
-            rusqlite::params![&eid_b64],
-            |row| row.get(0),
-        ).unwrap();
+        let event_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE event_id = ?1",
+                rusqlite::params![&eid_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(event_count, 1);
 
         // recorded_events: 2 rows (one per tenant)
-        let rec_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM recorded_events WHERE event_id = ?1",
-            rusqlite::params![&eid_b64],
-            |row| row.get(0),
-        ).unwrap();
+        let rec_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM recorded_events WHERE event_id = ?1",
+                rusqlite::params![&eid_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(rec_count, 2);
 
         // valid_events: 2 rows (one per tenant)
         for tenant in [tenant_a, tenant_b] {
-            let valid: bool = conn.query_row(
-                "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-                rusqlite::params![tenant, &eid_b64],
-                |row| row.get(0),
-            ).unwrap();
+            let valid: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+                    rusqlite::params![tenant, &eid_b64],
+                    |row| row.get(0),
+                )
+                .unwrap();
             assert!(valid, "tenant {} should have valid_events entry", tenant);
         }
 
         // secret_keys: 2 rows (one per tenant)
-        let sk_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM secret_keys WHERE event_id = ?1",
-            rusqlite::params![&eid_b64],
-            |row| row.get(0),
-        ).unwrap();
+        let sk_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM secret_keys WHERE event_id = ?1",
+                rusqlite::params![&eid_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(sk_count, 2, "both tenants should have projected secret_key");
     }
 
@@ -2398,28 +2711,33 @@ mod tests {
         let eid_b64 = event_id_to_base64(&eid);
 
         // events table should have the event
-        let event_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM events WHERE event_id = ?1",
-            rusqlite::params![&eid_b64],
-            |row| row.get(0),
-        ).unwrap();
+        let event_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE event_id = ?1",
+                rusqlite::params![&eid_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(event_count, 1);
 
         // recorded_events should have the entry
-        let rec_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM recorded_events WHERE event_id = ?1 AND peer_id = ?2",
-            rusqlite::params![&eid_b64, recorded_by],
-            |row| row.get(0),
-        ).unwrap();
+        let rec_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM recorded_events WHERE event_id = ?1 AND peer_id = ?2",
+                rusqlite::params![&eid_b64, recorded_by],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(rec_count, 1);
 
         // neg_items should have 0 rows (ShareScope::Local)
-        let neg_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM neg_items",
-            [],
-            |row| row.get(0),
-        ).unwrap();
-        assert_eq!(neg_count, 0, "local-scope events must not be inserted into neg_items");
+        let neg_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM neg_items", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            neg_count, 0,
+            "local-scope events must not be inserted into neg_items"
+        );
     }
 
     #[test]
@@ -2432,36 +2750,48 @@ mod tests {
         let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
 
         // Create and project a message (author_id = [2u8; 32])
-        let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "post-tombstone auth test");
+        let (_msg, msg_blob) =
+            make_message_signed(&signing_key, &signer_eid, "post-tombstone auth test");
         let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
         project_one(&conn, recorded_by, &msg_eid).unwrap();
 
         // Delete with correct author → Valid
-        let (_del1, del1_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [2u8; 32]);
+        let (_del1, del1_blob) =
+            make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [2u8; 32]);
         let del1_eid = insert_event_raw(&conn, recorded_by, &del1_blob);
         let r1 = project_one(&conn, recorded_by, &del1_eid).unwrap();
         assert_eq!(r1, ProjectionDecision::Valid);
 
         // Second deletion with wrong author_id = [99u8; 32] — also signed
-        let (_del2, del2_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [99u8; 32]);
+        let (_del2, del2_blob) =
+            make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [99u8; 32]);
         let del2_eid = insert_event_raw(&conn, recorded_by, &del2_blob);
         let r2 = project_one(&conn, recorded_by, &del2_eid).unwrap();
 
         // Should be Reject, NOT AlreadyProcessed or Valid
         match r2 {
             ProjectionDecision::Reject { reason } => {
-                assert!(reason.contains("deletion author does not match"), "reason: {}", reason);
+                assert!(
+                    reason.contains("deletion author does not match"),
+                    "reason: {}",
+                    reason
+                );
             }
-            other => panic!("expected Reject for wrong-author post-tombstone deletion, got {:?}", other),
+            other => panic!(
+                "expected Reject for wrong-author post-tombstone deletion, got {:?}",
+                other
+            ),
         }
 
         // rejected_events should have an entry for the wrong-author deletion
         let del2_b64 = event_id_to_base64(&del2_eid);
-        let rej_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM rejected_events WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, &del2_b64],
-            |row| row.get(0),
-        ).unwrap();
+        let rej_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM rejected_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, &del2_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(rej_count, 1);
     }
 
@@ -2484,17 +2814,29 @@ mod tests {
 
         // Verify rejected_events row exists with correct reason
         let memo_b64 = event_id_to_base64(&memo_eid);
-        let rej_reason: String = conn.query_row(
-            "SELECT reason FROM rejected_events WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, &memo_b64],
-            |row| row.get(0),
-        ).unwrap();
-        assert!(rej_reason.contains("invalid signature"), "reason: {}", rej_reason);
+        let rej_reason: String = conn
+            .query_row(
+                "SELECT reason FROM rejected_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, &memo_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            rej_reason.contains("invalid signature"),
+            "reason: {}",
+            rej_reason
+        );
     }
 
     // === File attachment helpers ===
 
-    fn make_file_slice(signing_key: &SigningKey, signer_event_id: &EventId, file_id: [u8; 32], slice_number: u32, ciphertext: &[u8]) -> (ParsedEvent, Vec<u8>) {
+    fn make_file_slice(
+        signing_key: &SigningKey,
+        signer_event_id: &EventId,
+        file_id: [u8; 32],
+        slice_number: u32,
+        ciphertext: &[u8],
+    ) -> (ParsedEvent, Vec<u8>) {
         let fs = FileSliceEvent {
             created_at_ms: now_ms(),
             file_id,
@@ -2512,7 +2854,12 @@ mod tests {
     }
 
     /// Convenience: create identity chain + signed attachment.
-    fn make_message_attachment(conn: &Connection, recorded_by: &str, message_id: &EventId, key_event_id: &EventId) -> (ParsedEvent, Vec<u8>) {
+    fn make_message_attachment(
+        conn: &Connection,
+        recorded_by: &str,
+        message_id: &EventId,
+        key_event_id: &EventId,
+    ) -> (ParsedEvent, Vec<u8>) {
         let (signer_eid, signing_key) = make_identity_chain(conn, recorded_by);
         let att = MessageAttachmentEvent {
             created_at_ms: now_ms(),
@@ -2547,7 +2894,8 @@ mod tests {
         file_id: [u8; 32],
     ) -> EventId {
         // Create message (dep for attachment)
-        let (_msg, msg_blob) = make_message_signed(signing_key, signer_eid, "parent msg for descriptor");
+        let (_msg, msg_blob) =
+            make_message_signed(signing_key, signer_eid, "parent msg for descriptor");
         let msg_eid = insert_event_raw(conn, recorded_by, &msg_blob);
         project_one(conn, recorded_by, &msg_eid).unwrap();
 
@@ -2582,7 +2930,11 @@ mod tests {
         let att_blob = blob;
         let att_eid = insert_event_raw(conn, recorded_by, &att_blob);
         let result = project_one(conn, recorded_by, &att_eid).unwrap();
-        assert_eq!(result, ProjectionDecision::Valid, "descriptor should project Valid");
+        assert_eq!(
+            result,
+            ProjectionDecision::Valid,
+            "descriptor should project Valid"
+        );
         att_eid
     }
 
@@ -2599,18 +2951,21 @@ mod tests {
         setup_descriptor_for_file(&conn, recorded_by, &signing_key, &signer_eid, file_id);
 
         // Create FileSlice
-        let (_fs, fs_blob) = make_file_slice(&signing_key, &signer_eid, file_id, 0, b"encrypted data");
+        let (_fs, fs_blob) =
+            make_file_slice(&signing_key, &signer_eid, file_id, 0, b"encrypted data");
         let fs_eid = insert_event_raw(&conn, recorded_by, &fs_blob);
         let result = project_one(&conn, recorded_by, &fs_eid).unwrap();
         assert_eq!(result, ProjectionDecision::Valid);
 
         // Verify in file_slices table
         let fs_b64 = event_id_to_base64(&fs_eid);
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM file_slices WHERE recorded_by = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, &fs_b64],
-            |row| row.get(0),
-        ).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM file_slices WHERE recorded_by = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, &fs_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 1);
     }
 
@@ -2653,23 +3008,33 @@ mod tests {
 
         // File slice should NOT yet be valid (guard-blocked on missing descriptor)
         let fs_b64 = event_id_to_base64(&fs_eid);
-        let valid_before_descriptor: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, &fs_b64],
-            |row| row.get(0),
-        ).unwrap();
-        assert!(!valid_before_descriptor, "file_slice should still be guard-blocked before descriptor");
+        let valid_before_descriptor: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, &fs_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !valid_before_descriptor,
+            "file_slice should still be guard-blocked before descriptor"
+        );
 
         // Now create the descriptor — this should cascade-unblock the file_slice
         setup_descriptor_for_file(&conn, recorded_by, &signing_key, &signer_eid, file_id);
 
         // FileSlice should now be cascade-unblocked
-        let valid: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, &fs_b64],
-            |row| row.get(0),
-        ).unwrap();
-        assert!(valid, "file_slice should have been cascade-unblocked after descriptor");
+        let valid: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, &fs_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            valid,
+            "file_slice should have been cascade-unblocked after descriptor"
+        );
     }
 
     #[test]
@@ -2707,19 +3072,32 @@ mod tests {
         setup_descriptor_for_file(&conn, recorded_by, &signing_key, &signer_eid, file_id);
 
         for i in 0..5u32 {
-            let (_fs, fs_blob) = make_file_slice(&signing_key, &signer_eid, file_id, i, format!("slice {}", i).as_bytes());
+            let (_fs, fs_blob) = make_file_slice(
+                &signing_key,
+                &signer_eid,
+                file_id,
+                i,
+                format!("slice {}", i).as_bytes(),
+            );
             let fs_eid = insert_event_raw(&conn, recorded_by, &fs_blob);
             let result = project_one(&conn, recorded_by, &fs_eid).unwrap();
-            assert_eq!(result, ProjectionDecision::Valid, "slice {} should be valid", i);
+            assert_eq!(
+                result,
+                ProjectionDecision::Valid,
+                "slice {} should be valid",
+                i
+            );
         }
 
         // Verify all 5 slices in table
         let file_id_b64 = crate::crypto::event_id_to_base64(&file_id);
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM file_slices WHERE recorded_by = ?1 AND file_id = ?2",
-            rusqlite::params![recorded_by, &file_id_b64],
-            |row| row.get(0),
-        ).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM file_slices WHERE recorded_by = ?1 AND file_id = ?2",
+                rusqlite::params![recorded_by, &file_id_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 5);
     }
 
@@ -2744,11 +3122,13 @@ mod tests {
 
         // Tenant B should not see tenant A's slice
         let file_id_b64 = crate::crypto::event_id_to_base64(&file_id);
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM file_slices WHERE recorded_by = 'tenant_b' AND file_id = ?1",
-            rusqlite::params![&file_id_b64],
-            |row| row.get(0),
-        ).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM file_slices WHERE recorded_by = 'tenant_b' AND file_id = ?1",
+                rusqlite::params![&file_id_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 0);
     }
 
@@ -2783,11 +3163,13 @@ mod tests {
 
         // Verify in table
         let att_b64 = event_id_to_base64(&att_eid);
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM message_attachments WHERE recorded_by = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, &att_b64],
-            |row| row.get(0),
-        ).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM message_attachments WHERE recorded_by = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, &att_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 1);
     }
 
@@ -2826,7 +3208,8 @@ mod tests {
         project_one(&conn, recorded_by, &msg_eid).unwrap();
 
         let fake_key_id = [77u8; 32];
-        let (_att, att_blob) = make_attachment_signed(&signing_key, &signer_eid, &msg_eid, &fake_key_id);
+        let (_att, att_blob) =
+            make_attachment_signed(&signing_key, &signer_eid, &msg_eid, &fake_key_id);
         let att_eid = insert_event_raw(&conn, recorded_by, &att_blob);
         let result = project_one(&conn, recorded_by, &att_eid).unwrap();
         assert!(matches!(result, ProjectionDecision::Block { .. }));
@@ -2839,14 +3222,21 @@ mod tests {
 
         let fake_msg_id = [88u8; 32];
         let fake_key_id = [77u8; 32];
-        let (_att, att_blob) = make_message_attachment(&conn, recorded_by, &fake_msg_id, &fake_key_id);
+        let (_att, att_blob) =
+            make_message_attachment(&conn, recorded_by, &fake_msg_id, &fake_key_id);
         let att_eid = insert_event_raw(&conn, recorded_by, &att_blob);
         let result = project_one(&conn, recorded_by, &att_eid).unwrap();
         match result {
             ProjectionDecision::Block { ref missing } => {
                 // Should block on at least the 2 fake deps (message_id + key_event_id)
-                assert!(missing.contains(&fake_msg_id), "should block on missing message_id");
-                assert!(missing.contains(&fake_key_id), "should block on missing key_event_id");
+                assert!(
+                    missing.contains(&fake_msg_id),
+                    "should block on missing message_id"
+                );
+                assert!(
+                    missing.contains(&fake_key_id),
+                    "should block on missing key_event_id"
+                );
             }
             _ => panic!("expected Block, got {:?}", result),
         }
@@ -2885,11 +3275,13 @@ mod tests {
 
         // Attachment still not valid
         let att_b64 = event_id_to_base64(&att_eid);
-        let valid: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, &att_b64],
-            |row| row.get(0),
-        ).unwrap();
+        let valid: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, &att_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert!(!valid, "attachment should still be blocked");
 
         // Insert key dep — should cascade-unblock attachment
@@ -2898,11 +3290,13 @@ mod tests {
         project_one(&conn, recorded_by, &sk_eid).unwrap();
 
         // Attachment should now be valid
-        let valid2: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, &att_b64],
-            |row| row.get(0),
-        ).unwrap();
+        let valid2: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, &att_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert!(valid2, "attachment should have been cascade-unblocked");
     }
 
@@ -2952,8 +3346,11 @@ mod tests {
         let (_fs2, fs2_blob) = make_file_slice(&signing_key, &signer_eid, file_id, 0, b"second");
         let fs2_eid = insert_event_raw(&conn, recorded_by, &fs2_blob);
         let result2 = project_one(&conn, recorded_by, &fs2_eid).unwrap();
-        assert!(matches!(result2, ProjectionDecision::Reject { .. }),
-            "duplicate slot with different event_id should reject, got {:?}", result2);
+        assert!(
+            matches!(result2, ProjectionDecision::Reject { .. }),
+            "duplicate slot with different event_id should reject, got {:?}",
+            result2
+        );
     }
 
     #[test]
@@ -3090,10 +3487,14 @@ mod tests {
         setup_descriptor_for_file(&conn, recorded_by, &peer_key_a, &signer_a_eid, file_id);
 
         // Create file_slice signed by signer B (different from descriptor's signer A)
-        let (_fs, fs_blob) = make_file_slice(&peer_key_b, &signer_b_eid, file_id, 0, b"unauthorized data");
+        let (_fs, fs_blob) =
+            make_file_slice(&peer_key_b, &signer_b_eid, file_id, 0, b"unauthorized data");
         let fs_eid = insert_event_raw(&conn, recorded_by, &fs_blob);
         let result = project_one(&conn, recorded_by, &fs_eid).unwrap();
-        assert!(matches!(result, ProjectionDecision::Reject { .. }),
-            "file_slice with wrong signer should be rejected, got {:?}", result);
+        assert!(
+            matches!(result, ProjectionDecision::Reject { .. }),
+            "file_slice with wrong signer should be rejected, got {:?}",
+            result
+        );
     }
 }
