@@ -6,9 +6,9 @@ use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use poc_7::db::{open_connection, schema::{create_tables, backfill_legacy_messages, count_legacy_messages}, transport_trust::allowed_peers_combined};
-use poc_7::events::{MessageEvent, ParsedEvent};
+use poc_7::events::{MessageEvent, ReactionEvent, MessageDeletionEvent, ParsedEvent};
 use poc_7::transport_identity::{transport_cert_paths_from_db, load_transport_peer_id_from_db, ensure_transport_peer_id_from_db};
-use poc_7::projection::create::create_event_sync;
+use poc_7::projection::create::{create_event_sync, event_id_or_blocked};
 use poc_7::sync::engine::{accept_loop, connect_loop};
 use poc_7::transport::{
     AllowedPeers,
@@ -114,6 +114,57 @@ enum Commands {
         #[arg(long, default_value = "200")]
         interval_ms: u64,
     },
+
+    /// Interactive REPL mode with multi-account support
+    Interactive,
+
+    /// Create a reaction to a message
+    React {
+        /// Emoji to react with
+        emoji: String,
+        /// Target event ID (hex)
+        #[arg(long)]
+        target: String,
+        #[arg(short, long, default_value = "server.db")]
+        db: String,
+    },
+
+    /// Delete a message
+    #[command(name = "delete-message")]
+    DeleteMessage {
+        /// Target message event ID (hex)
+        #[arg(long)]
+        target: String,
+        #[arg(short, long, default_value = "server.db")]
+        db: String,
+    },
+
+    /// List reactions
+    Reactions {
+        #[arg(short, long, default_value = "server.db")]
+        db: String,
+    },
+
+    /// List users from projection
+    Users {
+        #[arg(short, long, default_value = "server.db")]
+        db: String,
+    },
+
+    /// List keys from projection
+    Keys {
+        #[arg(short, long, default_value = "server.db")]
+        db: String,
+        /// Show summary only
+        #[arg(long)]
+        summary: bool,
+    },
+
+    /// List networks from projection
+    Networks {
+        #[arg(short, long, default_value = "server.db")]
+        db: String,
+    },
 }
 
 #[tokio::main]
@@ -161,6 +212,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let code = run_assert_eventually(&db, &predicate, timeout_ms, interval_ms)?;
             std::process::exit(code);
         }
+        Commands::Interactive => {
+            poc_7::interactive::run_interactive()?;
+        }
+        Commands::React { emoji, target, db } => {
+            cli_react(&db, &target, &emoji)?;
+        }
+        Commands::DeleteMessage { target, db } => {
+            cli_delete_message(&db, &target)?;
+        }
+        Commands::Reactions { db } => {
+            cli_reactions(&db)?;
+        }
+        Commands::Users { db } => {
+            cli_users(&db)?;
+        }
+        Commands::Keys { db, summary } => {
+            cli_keys(&db, summary)?;
+        }
+        Commands::Networks { db } => {
+            cli_networks(&db)?;
+        }
     }
 
     Ok(())
@@ -200,6 +272,14 @@ fn backfill_identity(db_path: &str) -> Result<(), Box<dyn std::error::Error + Se
 
 fn short_id(b64: &str) -> &str {
     &b64[..b64.len().min(8)]
+}
+
+fn base64_to_hex(b64: &str) -> String {
+    use base64::Engine;
+    match base64::engine::general_purpose::STANDARD.decode(b64) {
+        Ok(bytes) => hex::encode(bytes),
+        Err(_) => b64.to_string(),
+    }
 }
 
 fn format_timestamp(ms: i64) -> String {
@@ -314,19 +394,24 @@ fn show_messages(db_path: &str, limit: usize) -> Result<(), Box<dyn std::error::
     println!();
 
     let mut last_author = String::new();
-    for (i, (_, author_id, content, created_at)) in rows.iter().enumerate() {
+    for (i, (msg_id_b64, author_id, content, created_at)) in rows.iter().enumerate() {
         let ts = format_timestamp(*created_at);
         let author = short_id(author_id);
+
+        // Convert base64 message_id to hex for use with --target
+        let msg_id_hex = base64_to_hex(msg_id_b64);
 
         if *author_id != last_author {
             // New author group
             if i > 0 { println!(); }
             println!("  {} [{}]", author, ts);
             println!("    {}. {}", i + 1, content);
+            println!("       id: {}", msg_id_hex);
             last_author = author_id.clone();
         } else {
             // Same author, continuation
             println!("    {}. {}", i + 1, content);
+            println!("       id: {}", msg_id_hex);
         }
     }
     println!();
@@ -351,13 +436,28 @@ fn current_timestamp_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// Derive a stable 32-byte author_id from the transport peer identity string.
+/// This ensures send and delete-message use the same author, so deletion
+/// author-matching works correctly.
+fn stable_author_id(peer_id: &str) -> [u8; 32] {
+    use blake2::{Blake2b, Digest};
+    use blake2::digest::consts::U32;
+    let mut hasher = Blake2b::<U32>::new();
+    hasher.update(b"author-id:");
+    hasher.update(peer_id.as_bytes());
+    let hash = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&hash);
+    out
+}
+
 fn send_message(db_path: &str, channel_hex: &str, content: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let recorded_by = ensure_transport_peer_id_from_db(db_path)?;
     let db = open_connection(db_path)?;
     create_tables(&db)?;
 
     let channel_id = parse_channel_hex(channel_hex)?;
-    let author_id: [u8; 32] = rand::random();
+    let author_id = stable_author_id(&recorded_by);
 
     let msg = ParsedEvent::Message(MessageEvent {
         created_at_ms: current_timestamp_ms(),
@@ -672,6 +772,196 @@ async fn run_sync(
             _ = tokio::signal::ctrl_c() => {
                 info!("Ctrl-C received, shutting down");
             }
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// New non-interactive subcommands
+// ---------------------------------------------------------------------------
+
+fn parse_hex_event_id(hex_str: &str) -> Result<[u8; 32], Box<dyn std::error::Error + Send + Sync>> {
+    let bytes = hex::decode(hex_str)?;
+    if bytes.len() != 32 {
+        return Err(format!("Event ID must be 32 bytes, got {}", bytes.len()).into());
+    }
+    let mut eid = [0u8; 32];
+    eid.copy_from_slice(&bytes);
+    Ok(eid)
+}
+
+fn cli_react(db_path: &str, target_hex: &str, emoji: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let recorded_by = ensure_transport_peer_id_from_db(db_path)?;
+    let db = open_connection(db_path)?;
+    create_tables(&db)?;
+
+    let target_event_id = parse_hex_event_id(target_hex)?;
+    let author_id = stable_author_id(&recorded_by);
+
+    let rxn = ParsedEvent::Reaction(ReactionEvent {
+        created_at_ms: current_timestamp_ms(),
+        target_event_id,
+        author_id,
+        emoji: emoji.to_string(),
+    });
+    let eid = event_id_or_blocked(create_event_sync(&db, &recorded_by, &rxn))?;
+    println!("Reacted {} ({})", emoji, hex::encode(&eid[..4]));
+
+    Ok(())
+}
+
+fn cli_delete_message(db_path: &str, target_hex: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let recorded_by = ensure_transport_peer_id_from_db(db_path)?;
+    let db = open_connection(db_path)?;
+    create_tables(&db)?;
+
+    let target_event_id = parse_hex_event_id(target_hex)?;
+    let author_id = stable_author_id(&recorded_by);
+
+    let del = ParsedEvent::MessageDeletion(MessageDeletionEvent {
+        created_at_ms: current_timestamp_ms(),
+        target_event_id,
+        author_id,
+    });
+    event_id_or_blocked(create_event_sync(&db, &recorded_by, &del))?;
+    println!("Deleted message {}", &target_hex[..target_hex.len().min(16)]);
+
+    Ok(())
+}
+
+fn cli_reactions(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let recorded_by = load_transport_peer_id_from_db(db_path)?;
+    let db = open_connection(db_path)?;
+    create_tables(&db)?;
+
+    let mut stmt = db.prepare(
+        "SELECT event_id, target_event_id, emoji FROM reactions WHERE recorded_by = ?1",
+    )?;
+    let rows: Vec<(String, String, String)> = stmt
+        .query_map(rusqlite::params![&recorded_by], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    println!("REACTIONS ({}):", db_path);
+    if rows.is_empty() {
+        println!("  (none)");
+    } else {
+        for (eid, target, emoji) in &rows {
+            println!("  {} -> {} {}", short_id(eid), short_id(target), emoji);
+        }
+    }
+
+    Ok(())
+}
+
+fn cli_users(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let recorded_by = load_transport_peer_id_from_db(db_path)?;
+    let db = open_connection(db_path)?;
+    create_tables(&db)?;
+
+    let mut stmt = db.prepare(
+        "SELECT event_id FROM users WHERE recorded_by = ?1",
+    )?;
+    let users: Vec<String> = stmt
+        .query_map(rusqlite::params![&recorded_by], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    println!("USERS ({}):", db_path);
+    if users.is_empty() {
+        println!("  (none)");
+    } else {
+        for (i, eid) in users.iter().enumerate() {
+            println!("  {}. user_{}", i + 1, short_id(eid));
+        }
+    }
+
+    Ok(())
+}
+
+fn cli_keys(db_path: &str, summary: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let recorded_by = load_transport_peer_id_from_db(db_path)?;
+    let db = open_connection(db_path)?;
+    create_tables(&db)?;
+
+    let user_count: i64 = db.query_row(
+        "SELECT COUNT(*) FROM users WHERE recorded_by = ?1",
+        rusqlite::params![&recorded_by], |row| row.get(0),
+    ).unwrap_or(0);
+    let peer_count: i64 = db.query_row(
+        "SELECT COUNT(*) FROM peers_shared WHERE recorded_by = ?1",
+        rusqlite::params![&recorded_by], |row| row.get(0),
+    ).unwrap_or(0);
+    let admin_count: i64 = db.query_row(
+        "SELECT COUNT(*) FROM admins WHERE recorded_by = ?1",
+        rusqlite::params![&recorded_by], |row| row.get(0),
+    ).unwrap_or(0);
+    let transport_count: i64 = db.query_row(
+        "SELECT COUNT(*) FROM transport_keys WHERE recorded_by = ?1",
+        rusqlite::params![&recorded_by], |row| row.get(0),
+    ).unwrap_or(0);
+
+    println!("KEYS ({}):", db_path);
+    println!("  Users: {}", user_count);
+    println!("  Peers: {}", peer_count);
+    println!("  Admins: {}", admin_count);
+    println!("  TransportKeys: {}", transport_count);
+
+    if !summary {
+        let mut stmt = db.prepare("SELECT event_id FROM users WHERE recorded_by = ?1")?;
+        let users: Vec<String> = stmt
+            .query_map(rusqlite::params![&recorded_by], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        for eid in &users {
+            println!("    user {}", short_id(eid));
+        }
+
+        let mut stmt = db.prepare("SELECT event_id FROM peers_shared WHERE recorded_by = ?1")?;
+        let peers: Vec<String> = stmt
+            .query_map(rusqlite::params![&recorded_by], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        for eid in &peers {
+            println!("    peer {}", short_id(eid));
+        }
+    }
+
+    Ok(())
+}
+
+fn cli_networks(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let recorded_by = load_transport_peer_id_from_db(db_path)?;
+    let db = open_connection(db_path)?;
+    create_tables(&db)?;
+
+    let mut stmt = db.prepare(
+        "SELECT event_id, network_id FROM networks WHERE recorded_by = ?1",
+    )?;
+    let networks: Vec<(String, String)> = stmt
+        .query_map(rusqlite::params![&recorded_by], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    println!("NETWORKS ({}):", db_path);
+    if networks.is_empty() {
+        println!("  (none)");
+    } else {
+        use base64::Engine;
+        for (i, (eid, net_id_b64)) in networks.iter().enumerate() {
+            let name = if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(net_id_b64) {
+                String::from_utf8_lossy(&bytes).trim_end_matches('\0').to_string()
+            } else {
+                net_id_b64.clone()
+            };
+            println!("  {}. {} ({})", i + 1, name, short_id(eid));
         }
     }
 

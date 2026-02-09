@@ -2,6 +2,8 @@ pub mod crypto;
 pub mod db;
 pub mod events;
 pub mod identity;
+pub mod identity_ops;
+pub mod interactive;
 pub mod projection;
 pub mod runtime;
 pub mod sync;

@@ -44,6 +44,13 @@ pub fn event_id_or_blocked(result: Result<EventId, CreateEventError>) -> Result<
     }
 }
 
+/// Require the event to be Valid (not Blocked). Use this for post-anchor events
+/// in accept_user_invite / accept_device_link where Blocked means a prerequisite
+/// chain is broken and the account will not be usable.
+pub fn require_valid_event_id(result: Result<EventId, CreateEventError>) -> Result<EventId, CreateEventError> {
+    result
+}
+
 /// Shared helper: hash blob, write to events/neg_items/recorded_events, project via project_one.
 fn store_blob_and_project(
     conn: &Connection,
