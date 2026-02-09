@@ -26,5 +26,7 @@ rustls-webpki = "0.103.9"
 x509-parser = "0.16"
 
 tempfile = "3"
+rustyline = "14"
+dirs-next = "2"
 
 [dev-dependencies]
