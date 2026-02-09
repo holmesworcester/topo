@@ -6,16 +6,9 @@ use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use poc_7::db::{open_connection, schema::{create_tables, backfill_legacy_messages, count_legacy_messages}, transport_trust::allowed_peers_combined};
-use poc_7::events::{
-    MessageEvent, ReactionEvent, MessageDeletionEvent, ParsedEvent,
-    WorkspaceEvent, InviteAcceptedEvent, UserInviteBootEvent,
-    UserBootEvent, DeviceInviteFirstEvent, PeerSharedFirstEvent,
-};
-use poc_7::crypto::EventId;
+use poc_7::events::{MessageEvent, ReactionEvent, MessageDeletionEvent, ParsedEvent};
 use poc_7::transport_identity::{transport_cert_paths_from_db, load_transport_peer_id_from_db, ensure_transport_peer_id_from_db};
-use poc_7::projection::create::{create_event_sync, create_signed_event_sync, event_id_or_blocked};
-use poc_7::projection::pipeline::project_one;
-use ed25519_dalek::SigningKey;
+use poc_7::projection::create::{create_event_sync, event_id_or_blocked};
 use poc_7::sync::engine::{accept_loop, connect_loop};
 use poc_7::transport::{
     AllowedPeers,
@@ -458,122 +451,11 @@ fn stable_author_id(peer_id: &str) -> [u8; 32] {
     out
 }
 
-/// Ensure an identity chain exists in the database. If peers_shared has no entry,
-/// bootstrap Workspace → InviteAccepted → UserInviteBoot → UserBoot → DeviceInviteFirst → PeerSharedFirst.
-/// Returns (peer_shared_event_id, peer_shared_signing_key).
-fn ensure_identity_chain(
-    db: &rusqlite::Connection,
-    recorded_by: &str,
-) -> Result<(EventId, SigningKey), Box<dyn std::error::Error + Send + Sync>> {
-    // Check if a PeerShared entry already exists
-    let existing: Option<(String, Vec<u8>)> = db.query_row(
-        "SELECT event_id, public_key FROM peers_shared WHERE recorded_by = ?1 LIMIT 1",
-        rusqlite::params![recorded_by],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
-    ).ok();
-
-    if let Some((eid_b64, _pub_key)) = existing {
-        // Identity chain exists. We need the signing key which we can't recover from the DB.
-        // For CLI usage, we store the signing key in a separate table.
-        let key_bytes: Vec<u8> = db.query_row(
-            "SELECT signing_key FROM local_signing_keys WHERE event_id = ?1",
-            rusqlite::params![&eid_b64],
-            |row| row.get(0),
-        ).map_err(|_| "identity chain exists but signing key not found in local_signing_keys")?;
-        let key_arr: [u8; 32] = key_bytes.try_into().map_err(|_| "bad signing key length")?;
-        let signing_key = SigningKey::from_bytes(&key_arr);
-        let eid = poc_7::crypto::event_id_from_base64(&eid_b64).ok_or("bad event_id")?;
-        return Ok((eid, signing_key));
-    }
-
-    // Bootstrap new identity chain
-    let mut rng = rand::thread_rng();
-
-    let workspace_key = SigningKey::generate(&mut rng);
-    let workspace_id: [u8; 32] = rand::random();
-    let ws = ParsedEvent::Workspace(WorkspaceEvent {
-        created_at_ms: current_timestamp_ms(),
-        public_key: workspace_key.verifying_key().to_bytes(),
-        workspace_id,
-    });
-    let ws_eid = event_id_or_blocked(create_event_sync(db, recorded_by, &ws))
-        .map_err(|e| format!("{}", e))?;
-
-    let ia = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
-        created_at_ms: current_timestamp_ms(),
-        invite_event_id: ws_eid,
-        workspace_id,
-    });
-    let _ia_eid = create_event_sync(db, recorded_by, &ia)
-        .map_err(|e| format!("{}", e))?;
-    project_one(db, recorded_by, &ws_eid)
-        .map_err(|e| format!("{}", e))?;
-
-    let invite_key = SigningKey::generate(&mut rng);
-    let uib = ParsedEvent::UserInviteBoot(UserInviteBootEvent {
-        created_at_ms: current_timestamp_ms(),
-        public_key: invite_key.verifying_key().to_bytes(),
-        workspace_id,
-        signed_by: ws_eid,
-        signer_type: 1,
-        signature: [0u8; 64],
-    });
-    let uib_eid = create_signed_event_sync(db, recorded_by, &uib, &workspace_key)
-        .map_err(|e| format!("{}", e))?;
-
-    let user_key = SigningKey::generate(&mut rng);
-    let ub = ParsedEvent::UserBoot(UserBootEvent {
-        created_at_ms: current_timestamp_ms(),
-        public_key: user_key.verifying_key().to_bytes(),
-        signed_by: uib_eid,
-        signer_type: 2,
-        signature: [0u8; 64],
-    });
-    let ub_eid = create_signed_event_sync(db, recorded_by, &ub, &invite_key)
-        .map_err(|e| format!("{}", e))?;
-
-    let device_invite_key = SigningKey::generate(&mut rng);
-    let dif = ParsedEvent::DeviceInviteFirst(DeviceInviteFirstEvent {
-        created_at_ms: current_timestamp_ms(),
-        public_key: device_invite_key.verifying_key().to_bytes(),
-        signed_by: ub_eid,
-        signer_type: 4,
-        signature: [0u8; 64],
-    });
-    let dif_eid = create_signed_event_sync(db, recorded_by, &dif, &user_key)
-        .map_err(|e| format!("{}", e))?;
-
-    let peer_shared_key = SigningKey::generate(&mut rng);
-    let psf = ParsedEvent::PeerSharedFirst(PeerSharedFirstEvent {
-        created_at_ms: current_timestamp_ms(),
-        public_key: peer_shared_key.verifying_key().to_bytes(),
-        signed_by: dif_eid,
-        signer_type: 3,
-        signature: [0u8; 64],
-    });
-    let psf_eid = create_signed_event_sync(db, recorded_by, &psf, &device_invite_key)
-        .map_err(|e| format!("{}", e))?;
-
-    // Store signing key for future CLI invocations
-    let psf_b64 = poc_7::crypto::event_id_to_base64(&psf_eid);
-    db.execute(
-        "CREATE TABLE IF NOT EXISTS local_signing_keys (event_id TEXT PRIMARY KEY, signing_key BLOB NOT NULL)",
-        [],
-    )?;
-    db.execute(
-        "INSERT OR REPLACE INTO local_signing_keys (event_id, signing_key) VALUES (?1, ?2)",
-        rusqlite::params![&psf_b64, peer_shared_key.to_bytes().as_slice()],
-    )?;
-
-    Ok((psf_eid, peer_shared_key))
-}
-
 fn send_message(db_path: &str, channel_hex: &str, content: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let recorded_by = ensure_transport_peer_id_from_db(db_path)?;
     let db = open_connection(db_path)?;
     create_tables(&db)?;
 
-    let (signer_eid, signing_key) = ensure_identity_chain(&db, &recorded_by)?;
     let channel_id = parse_channel_hex(channel_hex)?;
     let author_id = stable_author_id(&recorded_by);
 
@@ -582,11 +464,8 @@ fn send_message(db_path: &str, channel_hex: &str, content: &str) -> Result<(), B
         channel_id,
         author_id,
         content: content.to_string(),
-        signed_by: signer_eid,
-        signer_type: 5,
-        signature: [0u8; 64],
     });
-    create_signed_event_sync(&db, &recorded_by, &msg, &signing_key)
+    create_event_sync(&db, &recorded_by, &msg)
         .map_err(|e| format!("create event error: {}", e))?;
 
     println!("Sent: {}", content);
@@ -637,7 +516,6 @@ fn generate_messages(db_path: &str, count: usize, channel_hex: &str) -> Result<(
     let db = open_connection(db_path)?;
     create_tables(&db)?;
 
-    let (signer_eid, signing_key) = ensure_identity_chain(&db, &recorded_by)?;
     let channel_id = parse_channel_hex(channel_hex)?;
     let author_id: [u8; 32] = rand::random();
 
@@ -648,11 +526,8 @@ fn generate_messages(db_path: &str, count: usize, channel_hex: &str) -> Result<(
             channel_id,
             author_id,
             content: format!("Message {}", i),
-            signed_by: signer_eid,
-            signer_type: 5,
-            signature: [0u8; 64],
         });
-        create_signed_event_sync(&db, &recorded_by, &msg, &signing_key)
+        create_event_sync(&db, &recorded_by, &msg)
             .map_err(|e| format!("create event error: {}", e))?;
     }
     db.execute("COMMIT", [])?;
@@ -922,7 +797,6 @@ fn cli_react(db_path: &str, target_hex: &str, emoji: &str) -> Result<(), Box<dyn
     let db = open_connection(db_path)?;
     create_tables(&db)?;
 
-    let (signer_eid, signing_key) = ensure_identity_chain(&db, &recorded_by)?;
     let target_event_id = parse_hex_event_id(target_hex)?;
     let author_id = stable_author_id(&recorded_by);
 
@@ -931,11 +805,8 @@ fn cli_react(db_path: &str, target_hex: &str, emoji: &str) -> Result<(), Box<dyn
         target_event_id,
         author_id,
         emoji: emoji.to_string(),
-        signed_by: signer_eid,
-        signer_type: 5,
-        signature: [0u8; 64],
     });
-    let eid = event_id_or_blocked(create_signed_event_sync(&db, &recorded_by, &rxn, &signing_key))?;
+    let eid = event_id_or_blocked(create_event_sync(&db, &recorded_by, &rxn))?;
     println!("Reacted {} ({})", emoji, hex::encode(&eid[..4]));
 
     Ok(())
@@ -946,7 +817,6 @@ fn cli_delete_message(db_path: &str, target_hex: &str) -> Result<(), Box<dyn std
     let db = open_connection(db_path)?;
     create_tables(&db)?;
 
-    let (signer_eid, signing_key) = ensure_identity_chain(&db, &recorded_by)?;
     let target_event_id = parse_hex_event_id(target_hex)?;
     let author_id = stable_author_id(&recorded_by);
 
@@ -954,11 +824,8 @@ fn cli_delete_message(db_path: &str, target_hex: &str) -> Result<(), Box<dyn std
         created_at_ms: current_timestamp_ms(),
         target_event_id,
         author_id,
-        signed_by: signer_eid,
-        signer_type: 5,
-        signature: [0u8; 64],
     });
-    event_id_or_blocked(create_signed_event_sync(&db, &recorded_by, &del, &signing_key))?;
+    event_id_or_blocked(create_event_sync(&db, &recorded_by, &del))?;
     println!("Deleted message {}", &target_hex[..target_hex.len().min(16)]);
 
     Ok(())

@@ -13,12 +13,9 @@ pub struct MessageAttachmentEvent {
     pub key_event_id: [u8; 32],    // dep: decrypt key
     pub filename: String,
     pub mime_type: String,
-    pub signed_by: [u8; 32],
-    pub signer_type: u8,
-    pub signature: [u8; 64],
 }
 
-/// Wire format (min 254 bytes, signed):
+/// Wire format (min 157 bytes, unsigned):
 /// [0]            type=24
 /// [1..9]         created_at_ms (u64 LE)
 /// [9..41]        message_id (32 bytes)
@@ -32,17 +29,13 @@ pub struct MessageAttachmentEvent {
 /// [155..155+N]   filename (UTF-8)
 /// [155+N..157+N] mime_len (u16 LE)
 /// [157+N..157+N+M] mime_type (UTF-8)
-/// --- signature trailer (97 bytes) ---
-/// [157+N+M..157+N+M+32]  signed_by (32 bytes)
-/// [157+N+M+32]            signer_type (1 byte)
-/// [157+N+M+33..157+N+M+97] signature (64 bytes)
 pub fn parse_message_attachment(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     // Minimum: type(1) + created_at(8) + message_id(32) + file_id(32) + blob_bytes(8)
     //        + total_slices(4) + slice_bytes(4) + root_hash(32) + key_event_id(32)
-    //        + filename_len(2) + mime_len(2) + signed_by(32) + signer_type(1) + signature(64) = 254
-    if blob.len() < 254 {
+    //        + filename_len(2) + mime_len(2) = 157
+    if blob.len() < 157 {
         return Err(EventError::TooShort {
-            expected: 254,
+            expected: 157,
             actual: blob.len(),
         });
     }
@@ -72,9 +65,9 @@ pub fn parse_message_attachment(blob: &[u8]) -> Result<ParsedEvent, EventError> 
     key_event_id.copy_from_slice(&blob[121..153]);
 
     let filename_len = u16::from_le_bytes(blob[153..155].try_into().unwrap()) as usize;
-    if blob.len() < 157 + filename_len + 97 {
+    if blob.len() < 157 + filename_len {
         return Err(EventError::TooShort {
-            expected: 157 + filename_len + 97,
+            expected: 157 + filename_len,
             actual: blob.len(),
         });
     }
@@ -88,23 +81,13 @@ pub fn parse_message_attachment(blob: &[u8]) -> Result<ParsedEvent, EventError> 
         });
     }
     let mime_len = u16::from_le_bytes(blob[mime_offset..mime_offset + 2].try_into().unwrap()) as usize;
-    let expected_total = mime_offset + 2 + mime_len + 97;
-    if blob.len() < expected_total {
+    if blob.len() < mime_offset + 2 + mime_len {
         return Err(EventError::TooShort {
-            expected: expected_total,
+            expected: mime_offset + 2 + mime_len,
             actual: blob.len(),
         });
     }
     let mime_type = String::from_utf8_lossy(&blob[mime_offset + 2..mime_offset + 2 + mime_len]).to_string();
-
-    let trailer_start = mime_offset + 2 + mime_len;
-    let mut signed_by = [0u8; 32];
-    signed_by.copy_from_slice(&blob[trailer_start..trailer_start + 32]);
-
-    let signer_type = blob[trailer_start + 32];
-
-    let mut signature = [0u8; 64];
-    signature.copy_from_slice(&blob[trailer_start + 33..trailer_start + 97]);
 
     validate_attachment_metadata(blob_bytes, total_slices, slice_bytes)?;
 
@@ -119,9 +102,6 @@ pub fn parse_message_attachment(blob: &[u8]) -> Result<ParsedEvent, EventError> 
         key_event_id,
         filename,
         mime_type,
-        signed_by,
-        signer_type,
-        signature,
     }))
 }
 
@@ -160,7 +140,7 @@ pub fn encode_message_attachment(event: &ParsedEvent) -> Result<Vec<u8>, EventEr
         return Err(EventError::ContentTooLong(mime_bytes.len()));
     }
 
-    let total = 157 + filename_bytes.len() + mime_bytes.len() + 97;
+    let total = 157 + filename_bytes.len() + mime_bytes.len();
     let mut buf = Vec::with_capacity(total);
 
     buf.push(EVENT_TYPE_MESSAGE_ATTACHMENT);
@@ -176,9 +156,6 @@ pub fn encode_message_attachment(event: &ParsedEvent) -> Result<Vec<u8>, EventEr
     buf.extend_from_slice(filename_bytes);
     buf.extend_from_slice(&(mime_bytes.len() as u16).to_le_bytes());
     buf.extend_from_slice(mime_bytes);
-    buf.extend_from_slice(&att.signed_by);
-    buf.push(att.signer_type);
-    buf.extend_from_slice(&att.signature);
 
     Ok(buf)
 }
@@ -188,9 +165,9 @@ pub static MESSAGE_ATTACHMENT_META: EventTypeMeta = EventTypeMeta {
     type_name: "message_attachment",
     projection_table: "message_attachments",
     share_scope: ShareScope::Shared,
-    dep_fields: &["message_id", "key_event_id", "signed_by"],
-    signer_required: true,
-    signature_byte_len: 64,
+    dep_fields: &["message_id", "key_event_id"],
+    signer_required: false,
+    signature_byte_len: 0,
     parse: parse_message_attachment,
     encode: encode_message_attachment,
 };

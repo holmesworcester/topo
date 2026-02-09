@@ -140,34 +140,37 @@ fn test_cli_bidirectional_sync() {
     let mut bob = start_sync(&bob_db, bob_port, Some(alice_port), &[&alice_fp]);
     std::thread::sleep(Duration::from_secs(1));
 
-    // Alice sends 2 messages, Bob sends 1
+    // Alice sends a message
     send_message(&alice_db, "Hello from Alice");
-    send_message(&alice_db, "How are you?");
+    assert_eventually(&bob_db, "store_count >= 1", timeout_ms);
+
+    // Bob sends a message
     send_message(&bob_db, "Hey Alice!");
+    assert_eventually(&alice_db, "store_count >= 2", timeout_ms);
 
-    // Wait for sync: each peer should have 14 events total
-    // (6 own identity + 5 remote shared identity + 2 alice msgs + 1 bob msg)
-    // Note: remote messages are stored but blocked (foreign signer chain),
-    // so only locally-created messages appear in message_count.
-    assert_eventually(&alice_db, "store_count >= 14", timeout_ms);
-    assert_eventually(&bob_db, "store_count >= 14", timeout_ms);
+    // Alice sends another
+    send_message(&alice_db, "How are you?");
+    assert_eventually(&bob_db, "store_count >= 3", timeout_ms);
+    assert_eventually(&alice_db, "store_count >= 3", timeout_ms);
 
-    assert_now(&alice_db, "store_count == 14");
-    assert_now(&bob_db, "store_count == 14");
+    // Verify both peers have all 3 messages
+    assert_now(&alice_db, "store_count == 3");
+    assert_now(&alice_db, "message_count == 3");
+    assert_now(&bob_db, "store_count == 3");
+    assert_now(&bob_db, "message_count == 3");
 
-    // Only locally-created messages are projected (remote signer chain is foreign)
-    assert_now(&alice_db, "message_count == 2");
-    assert_now(&bob_db, "message_count == 1");
-
-    // Verify local message content
+    // Verify message content
     let alice_messages = get_messages(&alice_db);
-    assert_eq!(alice_messages.len(), 2);
-    assert!(alice_messages.contains(&"Hello from Alice".to_string()));
-    assert!(alice_messages.contains(&"How are you?".to_string()));
-
     let bob_messages = get_messages(&bob_db);
-    assert_eq!(bob_messages.len(), 1);
-    assert!(bob_messages.contains(&"Hey Alice!".to_string()));
+    assert!(alice_messages.contains(&"Hello from Alice".to_string()));
+    assert!(alice_messages.contains(&"Hey Alice!".to_string()));
+    assert!(alice_messages.contains(&"How are you?".to_string()));
+    assert_eq!(alice_messages.len(), 3);
+    assert_eq!(bob_messages.len(), 3);
+    // Bob should have the same messages (order may differ by timestamp)
+    for msg in &alice_messages {
+        assert!(bob_messages.contains(msg), "bob missing: {}", msg);
+    }
 
     // Cleanup
     let _ = alice.kill();
@@ -197,22 +200,27 @@ fn test_cli_ongoing_sync() {
     let mut bob = start_sync(&bob_db, bob_port, Some(alice_port), &[&alice_fp]);
     std::thread::sleep(Duration::from_secs(1));
 
-    // Alice sends 3, Bob sends 2 (5 total messages)
+    // Round 1: Alice sends
     send_message(&alice_db, "Round 1");
+    assert_eventually(&bob_db, "store_count >= 1", timeout_ms);
+
+    // Round 2: Bob sends while sync runs
     send_message(&bob_db, "Round 2");
+    assert_eventually(&alice_db, "store_count >= 2", timeout_ms);
+
+    // Round 3: Both send
     send_message(&alice_db, "Round 3a");
     send_message(&bob_db, "Round 3b");
+    assert_eventually(&alice_db, "store_count >= 4", timeout_ms);
+    assert_eventually(&bob_db, "store_count >= 4", timeout_ms);
 
+    // Round 4: One more after a pause
     std::thread::sleep(Duration::from_secs(1));
     send_message(&alice_db, "Round 4");
+    assert_eventually(&bob_db, "store_count >= 5", timeout_ms);
 
-    // Wait for sync: each peer should have 16 events total
-    // (6 own identity + 5 remote shared identity + 3 alice msgs + 2 bob msgs)
-    assert_eventually(&alice_db, "store_count >= 16", timeout_ms);
-    assert_eventually(&bob_db, "store_count >= 16", timeout_ms);
-
-    assert_now(&alice_db, "store_count == 16");
-    assert_now(&bob_db, "store_count == 16");
+    assert_now(&alice_db, "store_count == 5");
+    assert_now(&bob_db, "store_count == 5");
 
     let _ = alice.kill();
     let _ = bob.kill();
@@ -229,10 +237,9 @@ fn test_cli_send_and_messages() {
     send_message(&db, "First message");
     send_message(&db, "Second message");
 
-    // 6 identity chain events + 2 messages = 8
-    assert_now(&db, "store_count == 8");
+    assert_now(&db, "store_count == 2");
     assert_now(&db, "message_count == 2");
-    assert_now(&db, "recorded_events_count == 8");
+    assert_now(&db, "recorded_events_count == 2");
 
     let messages = get_messages(&db);
     assert_eq!(messages.len(), 2);
