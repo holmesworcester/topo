@@ -166,6 +166,7 @@ pub static MESSAGE_ATTACHMENT_META: EventTypeMeta = EventTypeMeta {
     projection_table: "message_attachments",
     share_scope: ShareScope::Shared,
     dep_fields: &["message_id", "key_event_id"],
+    dep_field_type_codes: &[&[1], &[6]],
     signer_required: false,
     signature_byte_len: 0,
     parse: parse_message_attachment,

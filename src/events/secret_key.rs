@@ -55,6 +55,7 @@ pub static SECRET_KEY_META: EventTypeMeta = EventTypeMeta {
     projection_table: "secret_keys",
     share_scope: ShareScope::Local,
     dep_fields: &[],
+    dep_field_type_codes: &[],
     signer_required: false,
     signature_byte_len: 0,
     parse: parse_secret_key,

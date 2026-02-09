@@ -12,7 +12,7 @@ use poc_7::crypto::{event_id_to_base64, hash_event, EventId};
 use poc_7::db::{open_connection, schema::create_tables};
 use poc_7::events::{
     self, FileSliceEvent, MessageAttachmentEvent, MessageEvent, ParsedEvent, PeerKeyEvent,
-    SecretKeyEvent,
+    SecretKeyEvent, WorkspaceEvent,
 };
 use poc_7::projection::pipeline::project_one;
 use poc_7::projection::signer::sign_event_bytes;
@@ -70,10 +70,25 @@ fn create_prereqs(
     conn: &Connection,
     recorded_by: &str,
 ) -> (EventId, EventId, EventId, SigningKey) {
+    // Network (workspace) event — required dep for messages
+    let ws = ParsedEvent::Workspace(WorkspaceEvent {
+        created_at_ms: now_ms(),
+        public_key: [0xAA; 32],
+        workspace_id: [0xBB; 32],
+    });
+    let ws_blob = events::encode_event(&ws).unwrap();
+    let ws_eid = insert_event_raw(conn, recorded_by, &ws_blob);
+    let ws_b64 = event_id_to_base64(&ws_eid);
+    // Bypass trust anchor guard — mark valid directly
+    conn.execute(
+        "INSERT OR IGNORE INTO valid_events (peer_id, event_id) VALUES (?1, ?2)",
+        rusqlite::params![recorded_by, &ws_b64],
+    ).unwrap();
+
     // Message
     let msg = ParsedEvent::Message(MessageEvent {
         created_at_ms: now_ms(),
-        channel_id: [1u8; 32],
+        network_event_id: ws_eid,
         author_id: [2u8; 32],
         content: "file parent".to_string(),
     });

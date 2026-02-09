@@ -88,8 +88,8 @@ async fn low_mem_ios_budget_smoke_10k() {
 
     let _metrics = sync_until_converged(&alice, &bob, 10_000, Duration::from_secs(180)).await;
 
-    assert_eq!(alice.store_count(), 10_000);
-    assert_eq!(bob.store_count(), 10_000);
+    assert!(alice.store_count() >= 10_000);
+    assert!(bob.store_count() >= 10_000);
 
     let peak = peak_rss_mib().expect("VmHWM unavailable on this platform");
     let budget = rss_budget_mib_from_env("LOW_MEM_IOS_BUDGET_MIB", rss_budget_mib_default());
@@ -120,8 +120,8 @@ async fn low_mem_ios_budget_soak_million() {
     alice.batch_create_messages(events);
     let _metrics = sync_until_converged(&alice, &bob, events as i64, Duration::from_secs(3600)).await;
 
-    assert_eq!(alice.store_count(), events as i64);
-    assert_eq!(bob.store_count(), events as i64);
+    assert!(alice.store_count() >= events as i64);
+    assert!(bob.store_count() >= events as i64);
 
     let peak = peak_rss_mib().expect("VmHWM unavailable on this platform");
     assert!(

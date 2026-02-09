@@ -55,6 +55,7 @@ pub static PEER_KEY_META: EventTypeMeta = EventTypeMeta {
     projection_table: "peer_keys",
     share_scope: ShareScope::Shared,
     dep_fields: &[],
+    dep_field_type_codes: &[],
     signer_required: false,
     signature_byte_len: 0,
     parse: parse_peer_key,

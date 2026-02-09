@@ -137,7 +137,7 @@ impl ParsedEvent {
     /// Returns (field_name, raw_32_byte_id) pairs.
     pub fn dep_field_values(&self) -> Vec<(&'static str, [u8; 32])> {
         match self {
-            ParsedEvent::Message(_) => vec![],
+            ParsedEvent::Message(m) => vec![("network_event_id", m.network_event_id)],
             ParsedEvent::Reaction(r) => vec![("target_event_id", r.target_event_id)],
             ParsedEvent::PeerKey(_) => vec![],
             ParsedEvent::SignedMemo(s) => vec![("signed_by", s.signed_by)],
@@ -353,7 +353,7 @@ mod tests {
     fn test_message_roundtrip() {
         let msg = MessageEvent {
             created_at_ms: 1234567890123,
-            channel_id: [1u8; 32],
+            network_event_id: [1u8; 32],
             author_id: [2u8; 32],
             content: "Hello, world!".to_string(),
         };
@@ -731,7 +731,7 @@ mod tests {
         // Empty content
         let msg = ParsedEvent::Message(MessageEvent {
             created_at_ms: 100,
-            channel_id: [0u8; 32],
+            network_event_id: [0u8; 32],
             author_id: [0u8; 32],
             content: "".to_string(),
         });
@@ -744,7 +744,7 @@ mod tests {
         let big_content = "x".repeat(1000);
         let msg2 = ParsedEvent::Message(MessageEvent {
             created_at_ms: 200,
-            channel_id: [0u8; 32],
+            network_event_id: [0u8; 32],
             author_id: [0u8; 32],
             content: big_content.clone(),
         });
@@ -758,7 +758,7 @@ mod tests {
     fn test_extract_created_at_ms() {
         let msg = ParsedEvent::Message(MessageEvent {
             created_at_ms: 42424242424242,
-            channel_id: [0u8; 32],
+            network_event_id: [0u8; 32],
             author_id: [0u8; 32],
             content: "test".to_string(),
         });
@@ -768,13 +768,17 @@ mod tests {
 
     #[test]
     fn test_dep_field_values_message() {
+        let network_id = [1u8; 32];
         let msg = ParsedEvent::Message(MessageEvent {
             created_at_ms: 100,
-            channel_id: [1u8; 32],
+            network_event_id: network_id,
             author_id: [2u8; 32],
             content: "hello".to_string(),
         });
-        assert!(msg.dep_field_values().is_empty());
+        let deps = msg.dep_field_values();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].0, "network_event_id");
+        assert_eq!(deps[0].1, network_id);
     }
 
     #[test]
@@ -835,7 +839,7 @@ mod tests {
     fn test_signer_fields_unsigned() {
         let msg = ParsedEvent::Message(MessageEvent {
             created_at_ms: 100,
-            channel_id: [0u8; 32],
+            network_event_id: [0u8; 32],
             author_id: [0u8; 32],
             content: "".to_string(),
         });
@@ -901,7 +905,7 @@ mod tests {
     fn test_extract_event_type() {
         let msg_blob = encode_event(&ParsedEvent::Message(MessageEvent {
             created_at_ms: 0,
-            channel_id: [0u8; 32],
+            network_event_id: [0u8; 32],
             author_id: [0u8; 32],
             content: "".to_string(),
         }))

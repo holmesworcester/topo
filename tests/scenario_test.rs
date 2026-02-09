@@ -24,15 +24,15 @@ async fn test_two_peer_bidirectional_sync() {
     alice.batch_create_messages(2);
     bob.batch_create_messages(1);
 
-    assert_eq!(alice.store_count(), 2);
-    assert_eq!(bob.store_count(), 1);
+    assert_eq!(alice.store_count(), 3);  // 2 messages + 1 workspace
+    assert_eq!(bob.store_count(), 2);   // 1 message + 1 workspace
 
     let sync = start_peers(&alice, &bob);
 
     assert_eventually(
-        || alice.store_count() == 3 && bob.store_count() == 3,
+        || alice.store_count() == 4 && bob.store_count() == 4,
         Duration::from_secs(15),
-        "both peers should have 3 events",
+        "both peers should have 4 events (3 messages + 1 workspace)",
     ).await;
 
     assert_eq!(alice.message_count(), 3);
@@ -51,15 +51,15 @@ async fn test_one_way_sync() {
     let bob = Peer::new("bob", channel);
 
     alice.batch_create_messages(10);
-    assert_eq!(alice.store_count(), 10);
-    assert_eq!(bob.store_count(), 0);
+    assert_eq!(alice.store_count(), 11);  // 10 messages + 1 workspace
+    assert_eq!(bob.store_count(), 1);     // 1 workspace
 
     let sync = start_peers(&alice, &bob);
 
     assert_eventually(
-        || bob.store_count() == 10,
+        || bob.store_count() == 11,
         Duration::from_secs(15),
-        "bob should have all 10 events",
+        "bob should have all 11 events (10 messages + 1 workspace)",
     ).await;
 
     drop(sync);
@@ -81,18 +81,18 @@ async fn test_concurrent_create_and_sync() {
     bob.create_message("Hi from Bob");
 
     assert_eventually(
-        || alice.store_count() == 2 && bob.store_count() == 2,
+        || alice.store_count() == 3 && bob.store_count() == 3,
         Duration::from_secs(15),
-        "both peers converge to 2 events",
+        "both peers converge to 3 events (2 messages + 1 workspace)",
     ).await;
 
     // Create more messages — sync loop picks them up
     alice.create_message("Another from Alice");
 
     assert_eventually(
-        || bob.store_count() == 3,
+        || bob.store_count() == 4,
         Duration::from_secs(15),
-        "bob gets the new message",
+        "bob gets the new message (3 messages + 1 workspace)",
     ).await;
 
     drop(sync);
@@ -115,8 +115,8 @@ async fn test_sync_10k() {
 
     eprintln!("10k sync: {}", metrics);
 
-    assert_eq!(alice.store_count(), 10_000);
-    assert_eq!(bob.store_count(), 10_000);
+    assert_eq!(alice.store_count(), 10_001);  // 10k messages + 1 workspace
+    assert_eq!(bob.store_count(), 10_001);
 
     // Wait for projection queue to drain (batch_writer projects asynchronously via project_queue)
     assert_eventually(
@@ -137,9 +137,9 @@ async fn test_recorded_events_isolation() {
     alice.batch_create_messages(3);
     bob.batch_create_messages(2);
 
-    // Verify local recorded_events before sync
-    assert_eq!(alice.recorded_events_count(), 3);
-    assert_eq!(bob.recorded_events_count(), 2);
+    // Verify local recorded_events before sync (includes workspace event)
+    assert_eq!(alice.recorded_events_count(), 4);  // 3 messages + 1 workspace
+    assert_eq!(bob.recorded_events_count(), 3);    // 2 messages + 1 workspace
     assert_eq!(alice.scoped_message_count(), 3);
     assert_eq!(bob.scoped_message_count(), 2);
 
@@ -147,22 +147,22 @@ async fn test_recorded_events_isolation() {
     let sync = start_peers(&alice, &bob);
 
     assert_eventually(
-        || alice.store_count() == 5 && bob.store_count() == 5,
+        || alice.store_count() == 6 && bob.store_count() == 6,
         Duration::from_secs(15),
-        "both peers should have 5 events",
+        "both peers should have 6 events (5 messages + 1 workspace)",
     ).await;
 
     drop(sync);
 
     // After sync: store has all events, messages has all events
-    assert_eq!(alice.store_count(), 5);
-    assert_eq!(bob.store_count(), 5);
+    assert_eq!(alice.store_count(), 6);  // 5 messages + 1 workspace
+    assert_eq!(bob.store_count(), 6);
     assert_eq!(alice.message_count(), 5);
     assert_eq!(bob.message_count(), 5);
 
-    // recorded_events: local creates + received via sync
-    assert_eq!(alice.recorded_events_count(), 5);
-    assert_eq!(bob.recorded_events_count(), 5);
+    // recorded_events: local creates + received via sync + workspace
+    assert_eq!(alice.recorded_events_count(), 6);  // 5 messages + 1 workspace
+    assert_eq!(bob.recorded_events_count(), 6);
 
     // scoped_message_count matches total (all recorded by this peer)
     assert_eq!(alice.scoped_message_count(), 5);
@@ -184,19 +184,19 @@ async fn test_reaction_sync() {
     bob.create_reaction(&msg1, "\u{1f44d}");
     bob.create_reaction(&msg2, "\u{2764}\u{fe0f}");
 
-    // Alice: 2 messages, 0 reactions; Bob: 2 events stored but reactions blocked
+    // Alice: 2 messages + 1 ws, 0 reactions; Bob: 2 reactions + 1 ws but reactions blocked
     // (Bob doesn't have Alice's messages yet, so reactions can't project)
-    assert_eq!(alice.store_count(), 2);
-    assert_eq!(bob.store_count(), 2);
+    assert_eq!(alice.store_count(), 3);  // 2 messages + 1 workspace
+    assert_eq!(bob.store_count(), 3);    // 2 reactions + 1 workspace
     assert_eq!(alice.message_count(), 2);
     assert_eq!(bob.reaction_count(), 0); // blocked until targets arrive
 
     let sync = start_peers(&alice, &bob);
 
     assert_eventually(
-        || alice.store_count() == 4 && bob.store_count() == 4,
+        || alice.store_count() == 5 && bob.store_count() == 5,
         Duration::from_secs(15),
-        "both peers should have 4 events (2 messages + 2 reactions)",
+        "both peers should have 5 events (2 messages + 2 reactions + 1 workspace)",
     ).await;
 
     drop(sync);
@@ -224,11 +224,11 @@ async fn test_zero_loss_stress() {
 
     let alice_ids_before = alice.store_ids();
     let bob_ids_before = bob.store_ids();
-    assert_eq!(alice_ids_before.len(), 5_000);
-    assert_eq!(bob_ids_before.len(), 5_000);
+    assert_eq!(alice_ids_before.len(), 5_001);  // 5k messages + 1 workspace
+    assert_eq!(bob_ids_before.len(), 5_001);
 
     let metrics = sync_until_converged(
-        &alice, &bob, 10_000, Duration::from_secs(120),
+        &alice, &bob, 10_001, Duration::from_secs(120),
     ).await;
 
     eprintln!("zero-loss stress: {}", metrics);
@@ -237,8 +237,8 @@ async fn test_zero_loss_stress() {
     let bob_ids = bob.store_ids();
 
     // Exact set equality, not just counts
-    assert_eq!(alice_ids.len(), 10_000, "alice store count mismatch");
-    assert_eq!(bob_ids.len(), 10_000, "bob store count mismatch");
+    assert_eq!(alice_ids.len(), 10_001, "alice store count mismatch");  // 10k messages + 1 workspace
+    assert_eq!(bob_ids.len(), 10_001, "bob store count mismatch");
     assert_eq!(alice_ids, bob_ids, "event ID sets differ between peers");
 
     // Verify all original events survived
@@ -269,9 +269,9 @@ async fn test_recorded_at_monotonicity() {
     let sync = start_peers(&alice, &bob);
 
     assert_eventually(
-        || bob.store_count() == 3,
+        || bob.store_count() == 4,
         Duration::from_secs(15),
-        "bob should have 3 events",
+        "bob should have 4 events (3 messages + 1 workspace)",
     ).await;
 
     drop(sync);
@@ -353,33 +353,32 @@ async fn test_cross_workspace_isolation() {
     // Sync workspace A peers
     let sync_a = start_peers(&peer_a1, &peer_a2);
     assert_eventually(
-        || peer_a1.store_count() == 8 && peer_a2.store_count() == 8,
+        || peer_a1.store_count() == 9 && peer_a2.store_count() == 9,
         Duration::from_secs(15),
-        "workspace A peers should converge to 8 events",
+        "workspace A peers should converge to 9 events (8 messages + 1 workspace)",
     ).await;
     drop(sync_a);
 
     // Sync workspace B peers
     let sync_b = start_peers(&peer_b1, &peer_b2);
     assert_eventually(
-        || peer_b1.store_count() == 6 && peer_b2.store_count() == 6,
+        || peer_b1.store_count() == 7 && peer_b2.store_count() == 7,
         Duration::from_secs(15),
-        "workspace B peers should converge to 6 events",
+        "workspace B peers should converge to 7 events (6 messages + 1 workspace)",
     ).await;
     drop(sync_b);
 
-    // Verify store counts: each workspace has its own events only
-    assert_eq!(peer_a1.store_count(), 8);
-    assert_eq!(peer_a2.store_count(), 8);
-    assert_eq!(peer_b1.store_count(), 6);
-    assert_eq!(peer_b2.store_count(), 6);
+    // Verify store counts: each workspace has its own events only (+1 workspace each)
+    assert_eq!(peer_a1.store_count(), 9);
+    assert_eq!(peer_a2.store_count(), 9);
+    assert_eq!(peer_b1.store_count(), 7);
+    assert_eq!(peer_b2.store_count(), 7);
 
-    // Verify recorded_events scoping: no cross-workspace rows
-    // A peers should have 8 recorded_events each (5 local + 3 from sync, or 3 local + 5 from sync)
-    assert_eq!(peer_a1.recorded_events_count(), 8);
-    assert_eq!(peer_a2.recorded_events_count(), 8);
-    assert_eq!(peer_b1.recorded_events_count(), 6);
-    assert_eq!(peer_b2.recorded_events_count(), 6);
+    // Verify recorded_events scoping: no cross-workspace rows (+1 workspace each)
+    assert_eq!(peer_a1.recorded_events_count(), 9);
+    assert_eq!(peer_a2.recorded_events_count(), 9);
+    assert_eq!(peer_b1.recorded_events_count(), 7);
+    assert_eq!(peer_b2.recorded_events_count(), 7);
 
     // Verify scoped messages: each peer sees only its workspace's messages
     assert_eq!(peer_a1.scoped_message_count(), 8);
@@ -459,8 +458,8 @@ async fn test_sync_50k() {
 
     eprintln!("50k sync: {}", metrics);
 
-    assert_eq!(alice.store_count(), 50_000);
-    assert_eq!(bob.store_count(), 50_000);
+    assert_eq!(alice.store_count(), 50_001);  // 50k messages + 1 workspace
+    assert_eq!(bob.store_count(), 50_001);
 
     // Wait for projection queue to drain
     assert_eventually(
@@ -545,20 +544,20 @@ async fn test_out_of_order_reaction_sync() {
     bob.create_reaction(&msg_id, "\u{1f44d}");
 
     // Bob: reaction is stored but blocked (target not in his DB)
-    assert_eq!(bob.store_count(), 1);
+    assert_eq!(bob.store_count(), 2);    // 1 reaction + 1 workspace
     assert_eq!(bob.reaction_count(), 0); // blocked
 
     // Alice has the message
-    assert_eq!(alice.store_count(), 1);
+    assert_eq!(alice.store_count(), 2);  // 1 message + 1 workspace
     assert_eq!(alice.message_count(), 1);
 
     // Sync — both get each other's events
     let sync = start_peers(&alice, &bob);
 
     assert_eventually(
-        || alice.store_count() == 2 && bob.store_count() == 2,
+        || alice.store_count() == 3 && bob.store_count() == 3,
         Duration::from_secs(15),
-        "both peers should have 2 events",
+        "both peers should have 3 events (1 message + 1 reaction + 1 workspace)",
     ).await;
 
     drop(sync);
@@ -578,7 +577,7 @@ async fn test_out_of_order_reaction_sync() {
         rusqlite::params![&bob.identity],
         |row| row.get(0),
     ).unwrap();
-    assert_eq!(bob_valid, 2, "Bob should have 2 valid events");
+    assert_eq!(bob_valid, 3, "Bob should have 3 valid events (msg + rxn + workspace)");
 
     verify_projection_invariants(&alice);
     verify_projection_invariants(&bob);
@@ -602,17 +601,17 @@ async fn test_multi_dep_blocking_sync() {
     bob.create_reaction(&msg2, "\u{2764}\u{fe0f}");
     bob.create_reaction(&msg3, "\u{1f525}");
 
-    // Bob: 3 events stored but all blocked
-    assert_eq!(bob.store_count(), 3);
+    // Bob: 3 reactions + 1 workspace stored but reactions all blocked
+    assert_eq!(bob.store_count(), 4);    // 3 reactions + 1 workspace
     assert_eq!(bob.reaction_count(), 0);
 
     // Sync
     let sync = start_peers(&alice, &bob);
 
     assert_eventually(
-        || alice.store_count() == 6 && bob.store_count() == 6,
+        || alice.store_count() == 7 && bob.store_count() == 7,
         Duration::from_secs(15),
-        "both peers should have 6 events (3 messages + 3 reactions)",
+        "both peers should have 7 events (3 messages + 3 reactions + 1 workspace)",
     ).await;
 
     drop(sync);
@@ -653,7 +652,7 @@ async fn test_signed_event_sync() {
     let pk_eid = alice.create_peer_key(public_key);
     let _memo_eid = alice.create_signed_memo(&pk_eid, &signing_key, "Hello signed world");
 
-    assert_eq!(alice.store_count(), 2);
+    assert_eq!(alice.store_count(), 3);  // 2 events + 1 workspace
     assert_eq!(alice.peer_key_count(), 1);
     assert_eq!(alice.signed_memo_count(), 1);
 
@@ -661,9 +660,9 @@ async fn test_signed_event_sync() {
     let sync = start_peers(&alice, &bob);
 
     assert_eventually(
-        || bob.store_count() == 2,
+        || bob.store_count() == 3,
         Duration::from_secs(15),
-        "bob should have 2 events (PeerKey + SignedMemo)",
+        "bob should have 3 events (PeerKey + SignedMemo + workspace)",
     ).await;
 
     drop(sync);
@@ -697,16 +696,16 @@ async fn test_signed_event_out_of_order_sync() {
     // Bob creates a message too
     bob.create_message("Bob's message");
 
-    assert_eq!(alice.store_count(), 3); // pk, memo, msg
-    assert_eq!(bob.store_count(), 1);
+    assert_eq!(alice.store_count(), 4); // pk, memo, msg + 1 workspace
+    assert_eq!(bob.store_count(), 2);  // 1 msg + 1 workspace
 
     // Sync
     let sync = start_peers(&alice, &bob);
 
     assert_eventually(
-        || alice.store_count() == 4 && bob.store_count() == 4,
+        || alice.store_count() == 5 && bob.store_count() == 5,
         Duration::from_secs(15),
-        "both peers should have 4 events",
+        "both peers should have 5 events (pk + memo + 2 msgs + workspace)",
     ).await;
 
     drop(sync);
@@ -795,16 +794,16 @@ async fn test_invalid_signature_rejected_after_sync() {
         // Don't project — it would be rejected. The blob will sync via negentropy.
     }
 
-    // Alice has 2 events: PeerKey + the bad-sig memo
-    assert_eq!(alice.store_count(), 2);
+    // Alice has 3 events: PeerKey + the bad-sig memo + workspace
+    assert_eq!(alice.store_count(), 3);
 
     // Sync to Bob
     let sync = start_peers(&alice, &bob);
 
     assert_eventually(
-        || bob.store_count() == 2,
+        || bob.store_count() == 3,
         Duration::from_secs(15),
-        "bob should have 2 events (PeerKey + bad-sig memo) in store",
+        "bob should have 3 events (PeerKey + bad-sig memo + workspace) in store",
     ).await;
 
     drop(sync);
@@ -827,7 +826,7 @@ async fn test_cross_tenant_dep_scoping_after_sync() {
     let msg_id = alice.create_message("Cross-tenant scoping test");
     alice.create_reaction(&msg_id, "\u{2705}");
 
-    assert_eq!(alice.store_count(), 2);
+    assert_eq!(alice.store_count(), 3);  // message + reaction + workspace
     assert_eq!(alice.message_count(), 1);
     assert_eq!(alice.reaction_count(), 1);
 
@@ -835,9 +834,9 @@ async fn test_cross_tenant_dep_scoping_after_sync() {
     let sync = start_peers(&alice, &bob);
 
     assert_eventually(
-        || alice.store_count() == 2 && bob.store_count() == 2,
+        || alice.store_count() == 3 && bob.store_count() == 3,
         Duration::from_secs(15),
-        "both peers should have 2 events (message + reaction)",
+        "both peers should have 3 events (message + reaction + workspace)",
     ).await;
 
     drop(sync);
@@ -860,8 +859,8 @@ async fn test_cross_tenant_dep_scoping_after_sync() {
         rusqlite::params![&bob.identity],
         |row| row.get(0),
     ).unwrap();
-    assert_eq!(alice_valid, 2, "Alice should have 2 valid_events");
-    assert_eq!(bob_valid, 2, "Bob should have 2 valid_events");
+    assert_eq!(alice_valid, 3, "Alice should have 3 valid_events (msg + rxn + workspace)");
+    assert_eq!(bob_valid, 3, "Bob should have 3 valid_events (msg + rxn + workspace)");
 
     // Run projection invariants for both
     verify_projection_invariants(&alice);
@@ -884,9 +883,9 @@ async fn test_encrypted_event_sync() {
 
     let _enc_eid = alice.create_encrypted_message(&sk_eid_alice, "Hello encrypted world");
 
-    assert_eq!(alice.store_count(), 2);
+    assert_eq!(alice.store_count(), 3);  // sk + encrypted + workspace
     assert_eq!(alice.secret_key_count(), 1);
-    assert_eq!(bob.store_count(), 1);
+    assert_eq!(bob.store_count(), 2);   // sk + workspace
     assert_eq!(bob.secret_key_count(), 1);
     // The encrypted event projects into messages table
     assert_eq!(alice.scoped_message_count(), 1);
@@ -895,9 +894,9 @@ async fn test_encrypted_event_sync() {
     let sync = start_peers(&alice, &bob);
 
     assert_eventually(
-        || bob.store_count() == 2,
+        || bob.store_count() == 3,
         Duration::from_secs(15),
-        "bob should have 2 events (local SecretKey + synced Encrypted)",
+        "bob should have 3 events (local SecretKey + synced Encrypted + workspace)",
     ).await;
 
     drop(sync);
@@ -929,16 +928,16 @@ async fn test_encrypted_out_of_order_sync() {
     // Bob creates a message too, but does NOT have the key yet.
     bob.create_message("Bob's message");
 
-    assert_eq!(alice.store_count(), 3); // sk, encrypted, message
-    assert_eq!(bob.store_count(), 1);
+    assert_eq!(alice.store_count(), 4); // sk, encrypted, message + workspace
+    assert_eq!(bob.store_count(), 2);  // message + workspace
 
     // Sync phase 1: ciphertext arrives before key materialization on Bob.
     let sync1 = start_peers(&alice, &bob);
 
     assert_eventually(
-        || alice.store_count() == 4 && bob.store_count() == 3,
+        || alice.store_count() == 5 && bob.store_count() == 4,
         Duration::from_secs(15),
-        "phase 1: bob should have his message + alice message + encrypted wrapper",
+        "phase 1: bob should have his message + alice message + encrypted wrapper + workspace",
     ).await;
 
     drop(sync1);
@@ -959,9 +958,9 @@ async fn test_encrypted_out_of_order_sync() {
     assert_eq!(sk_eid_bob, sk_eid, "bob key materialization should match alice key event id");
 
     assert_eventually(
-        || bob.store_count() == 4 && bob.scoped_message_count() == 3,
+        || bob.store_count() == 5 && bob.scoped_message_count() == 3,
         Duration::from_secs(10),
-        "phase 2: local key materialization should unblock encrypted projection",
+        "phase 2: local key materialization should unblock encrypted projection (4 events + workspace)",
     ).await;
 
     // No remaining blocked deps after key appears.
@@ -996,7 +995,7 @@ async fn test_encrypted_replay_invariants() {
     alice.create_encrypted_message(&sk_eid, "Encrypted 2");
 
     // Verify counts
-    assert_eq!(alice.store_count(), 5); // sk + 2 cleartext + 2 encrypted
+    assert_eq!(alice.store_count(), 6); // sk + 2 cleartext + 2 encrypted + workspace
     assert_eq!(alice.secret_key_count(), 1);
     assert_eq!(alice.scoped_message_count(), 4); // 2 cleartext + 2 encrypted inner messages
 
@@ -1019,7 +1018,7 @@ async fn test_project_queue_crash_recovery() {
     let msg2 = alice.create_message("Recovery message 2");
     let msg3 = alice.create_message("Recovery message 3");
 
-    assert_eq!(alice.store_count(), 3);
+    assert_eq!(alice.store_count(), 4);  // 3 messages + 1 workspace
     assert_eq!(alice.scoped_message_count(), 3);
 
     // Now simulate a crash scenario: clear projection state and re-enqueue to project_queue
@@ -1028,6 +1027,13 @@ async fn test_project_queue_crash_recovery() {
     db.execute("DELETE FROM valid_events WHERE peer_id = ?1", rusqlite::params![&alice.identity]).unwrap();
     db.execute("DELETE FROM blocked_event_deps WHERE peer_id = ?1", rusqlite::params![&alice.identity]).unwrap();
     db.execute("DELETE FROM rejected_events WHERE peer_id = ?1", rusqlite::params![&alice.identity]).unwrap();
+
+    // Re-seed the Peer::new workspace event as valid (it was inserted directly, not via projector)
+    let ws_b64 = event_id_to_base64(&alice.network_event_id);
+    db.execute(
+        "INSERT OR IGNORE INTO valid_events (peer_id, event_id) VALUES (?1, ?2)",
+        rusqlite::params![&alice.identity, &ws_b64],
+    ).unwrap();
 
     // Enqueue the events into project_queue (simulating what batch_writer does)
     let pq = ProjectQueue::new(&db);
@@ -1064,12 +1070,12 @@ async fn test_project_queue_crash_recovery() {
     ).unwrap();
     assert_eq!(msg_count, 3);
 
-    // Verify valid_events
+    // Verify valid_events (3 messages + 1 workspace)
     let valid_count: i64 = db.query_row(
         "SELECT COUNT(*) FROM valid_events WHERE peer_id = ?1",
         rusqlite::params![&alice.identity], |row| row.get(0),
     ).unwrap();
-    assert_eq!(valid_count, 3);
+    assert_eq!(valid_count, 4);
 
     // Queue should be empty
     assert_eq!(pq.count_pending(&alice.identity).unwrap(), 0);
@@ -1086,7 +1092,7 @@ async fn test_project_queue_drain_after_batch() {
 
     // Create events (projected inline by create_event_sync)
     alice.batch_create_messages(5);
-    assert_eq!(alice.store_count(), 5);
+    assert_eq!(alice.store_count(), 6);  // 5 messages + 1 workspace
     assert_eq!(alice.scoped_message_count(), 5);
 
     // Enqueue to project_queue — guard should prevent re-enqueue (already valid)
@@ -1187,7 +1193,7 @@ async fn test_deletion_sync() {
     let msg_id = alice.create_message("Delete me");
     alice.create_reaction(&msg_id, "\u{1f44d}");
 
-    assert_eq!(alice.store_count(), 2);
+    assert_eq!(alice.store_count(), 3);  // message + reaction + workspace
     assert_eq!(alice.message_count(), 1);
     assert_eq!(alice.reaction_count(), 1);
 
@@ -1195,9 +1201,9 @@ async fn test_deletion_sync() {
     let sync = start_peers(&alice, &bob);
 
     assert_eventually(
-        || alice.store_count() == 2 && bob.store_count() == 2,
+        || alice.store_count() == 3 && bob.store_count() == 3,
         Duration::from_secs(15),
-        "both peers should have 2 events (message + reaction)",
+        "both peers should have 3 events (message + reaction + workspace)",
     ).await;
 
     drop(sync);
@@ -1208,7 +1214,7 @@ async fn test_deletion_sync() {
     // Alice deletes the message
     alice.create_message_deletion(&msg_id);
 
-    assert_eq!(alice.store_count(), 3);
+    assert_eq!(alice.store_count(), 4);  // message + reaction + deletion + workspace
     assert_eq!(alice.message_count(), 0); // deleted
     assert_eq!(alice.reaction_count(), 0); // cascaded
     assert_eq!(alice.deleted_message_count(), 1); // tombstone
@@ -1217,9 +1223,9 @@ async fn test_deletion_sync() {
     let sync2 = start_peers(&alice, &bob);
 
     assert_eventually(
-        || bob.store_count() == 3,
+        || bob.store_count() == 4,
         Duration::from_secs(15),
-        "bob should have 3 events (message + reaction + deletion)",
+        "bob should have 4 events (message + reaction + deletion + workspace)",
     ).await;
 
     drop(sync2);
@@ -1255,7 +1261,7 @@ async fn test_deletion_before_target_sync() {
     let msg_id = alice.create_message("Delete me via sync");
     alice.create_message_deletion(&msg_id);
 
-    assert_eq!(alice.store_count(), 2); // message + deletion
+    assert_eq!(alice.store_count(), 3); // message + deletion + workspace
     assert_eq!(alice.message_count(), 0); // deleted
     assert_eq!(alice.deleted_message_count(), 1); // tombstone
 
@@ -1263,9 +1269,9 @@ async fn test_deletion_before_target_sync() {
     let sync = start_peers(&alice, &bob);
 
     assert_eventually(
-        || bob.store_count() == 2,
+        || bob.store_count() == 3,
         Duration::from_secs(15),
-        "bob should have 2 events (message + deletion)",
+        "bob should have 3 events (message + deletion + workspace)",
     ).await;
 
     drop(sync);
@@ -1299,7 +1305,7 @@ async fn test_encrypted_deletion() {
     // Create an encrypted message
     let _enc_msg_eid = alice.create_encrypted_message(&sk_eid, "Encrypted delete me");
 
-    assert_eq!(alice.store_count(), 2); // sk + encrypted msg
+    assert_eq!(alice.store_count(), 3); // sk + encrypted msg + workspace
     assert_eq!(alice.secret_key_count(), 1);
     assert_eq!(alice.scoped_message_count(), 1); // inner message projected
 
@@ -1316,7 +1322,7 @@ async fn test_encrypted_deletion() {
     // Create an encrypted deletion targeting the inner message
     alice.create_encrypted_deletion(&sk_eid, &inner_msg_eid);
 
-    assert_eq!(alice.store_count(), 3); // sk + encrypted msg + encrypted del
+    assert_eq!(alice.store_count(), 4); // sk + encrypted msg + encrypted del + workspace
     assert_eq!(alice.scoped_message_count(), 0); // inner message deleted
     assert_eq!(alice.deleted_message_count(), 1); // tombstone from encrypted deletion
 
@@ -1339,7 +1345,7 @@ async fn test_deletion_replay_invariants() {
     // Delete msg2 (cascades its reaction too)
     alice.create_message_deletion(&msg2);
 
-    assert_eq!(alice.store_count(), 5); // 2 msgs + 2 rxns + 1 del
+    assert_eq!(alice.store_count(), 6); // 2 msgs + 2 rxns + 1 del + 1 workspace
     assert_eq!(alice.message_count(), 1); // msg1 survives
     assert_eq!(alice.reaction_count(), 1); // msg1's reaction survives
     assert_eq!(alice.deleted_message_count(), 1); // msg2 tombstone
@@ -1348,9 +1354,9 @@ async fn test_deletion_replay_invariants() {
     let sync = start_peers(&alice, &bob);
 
     assert_eventually(
-        || bob.store_count() == 5,
+        || bob.store_count() == 6,
         Duration::from_secs(15),
-        "bob should have all 5 events",
+        "bob should have all 6 events (5 content + 1 workspace)",
     ).await;
 
     drop(sync);
@@ -1390,21 +1396,21 @@ async fn test_local_only_events_not_synced() {
     let _enc_eid = alice.create_encrypted_message(&sk_eid, "Encrypted for local-only test");
     alice.create_message("Normal message from Alice");
 
-    // Alice: 3 events (SK + encrypted + msg), Bob: 1 event (SK)
-    assert_eq!(alice.store_count(), 3);
-    assert_eq!(bob.store_count(), 1);
+    // Alice: 4 events (SK + encrypted + msg + workspace), Bob: 2 events (SK + workspace)
+    assert_eq!(alice.store_count(), 4);
+    assert_eq!(bob.store_count(), 2);
 
-    // Alice's SK should NOT be in neg_items (local-only)
-    assert_eq!(alice.neg_items_count(), 2, "Alice should have 2 neg_items (encrypted + msg, not SK)");
-    assert_eq!(bob.neg_items_count(), 0, "Bob should have 0 neg_items (SK is local-only)");
+    // Alice's SK should NOT be in neg_items (local-only), but workspace IS in neg_items
+    assert_eq!(alice.neg_items_count(), 3, "Alice should have 3 neg_items (encrypted + msg + workspace, not SK)");
+    assert_eq!(bob.neg_items_count(), 1, "Bob should have 1 neg_item (workspace only, SK is local-only)");
 
     // Sync
     let sync = start_peers(&alice, &bob);
 
     assert_eventually(
-        || bob.store_count() == 3,
+        || bob.store_count() == 4,
         Duration::from_secs(15),
-        "bob should have 3 events (his SK + synced encrypted + synced msg)",
+        "bob should have 4 events (his SK + synced encrypted + synced msg + workspace)",
     ).await;
 
     drop(sync);
@@ -1441,17 +1447,17 @@ async fn test_psk_two_set_isolation() {
     // Alice also creates a normal message
     alice.create_message("Alice cleartext");
 
-    // Alice: 3 events (SK + encrypted + msg), Bob: 1 event (SK)
-    assert_eq!(alice.store_count(), 3);
-    assert_eq!(bob.store_count(), 1);
+    // Alice: 4 events (SK + encrypted + msg + workspace), Bob: 2 events (SK + workspace)
+    assert_eq!(alice.store_count(), 4);
+    assert_eq!(bob.store_count(), 2);
 
     // Sync: encrypted event and normal msg sync to Bob
     let sync = start_peers(&alice, &bob);
 
     assert_eventually(
-        || bob.store_count() == 3,
+        || bob.store_count() == 4,
         Duration::from_secs(15),
-        "bob should have 3 events (his SK + synced encrypted + synced msg)",
+        "bob should have 4 events (his SK + synced encrypted + synced msg + workspace)",
     ).await;
 
     drop(sync);
@@ -1486,9 +1492,9 @@ async fn test_endpoint_observations_recorded() {
     let sync = start_peers(&alice, &bob);
 
     assert_eventually(
-        || bob.store_count() == 1,
+        || bob.store_count() == 2,
         Duration::from_secs(15),
-        "bob should have 1 event",
+        "bob should have 2 events (1 message + 1 workspace)",
     ).await;
 
     drop(sync);
@@ -1750,9 +1756,9 @@ fn test_bootstrap_sequence() {
         rusqlite::params![&alice.identity],
         |row| row.get(0),
     ).unwrap();
-    // 7 identity events + invite_accepted (local) = 8
+    // 7 identity events + invite_accepted (local) + 1 Peer::new workspace = 9
     // Workspace might be blocked initially and unblocked by invite_accepted cascade
-    assert!(valid_count >= 7, "at least 7 identity events should be valid, got {}", valid_count);
+    assert!(valid_count >= 8, "at least 8 events should be valid (7 identity + Peer::new ws), got {}", valid_count);
 
     // Verify projection tables
     let net_count: i64 = db.query_row(
@@ -1760,7 +1766,7 @@ fn test_bootstrap_sequence() {
         rusqlite::params![&alice.identity],
         |row| row.get(0),
     ).unwrap();
-    assert_eq!(net_count, 1, "exactly one workspace should be projected");
+    assert_eq!(net_count, 2, "two workspaces should be projected (Peer::new deterministic + bootstrap)");
 
     let user_invite_count: i64 = db.query_row(
         "SELECT COUNT(*) FROM user_invites WHERE recorded_by = ?1",
@@ -2571,8 +2577,8 @@ async fn test_two_peer_identity_join_and_sync() {
     // - 2 device_invites
     // - 2 peers_shared
     // - 1 admin (Alice's)
-    assert_eq!(alice.workspace_count(), 1, "Alice should have 1 workspace");
-    assert_eq!(bob.workspace_count(), 1, "Bob should have 1 workspace");
+    assert_eq!(alice.workspace_count(), 2, "Alice should have 2 workspaces (Peer::new + bootstrap)");
+    assert_eq!(bob.workspace_count(), 2, "Bob should have 2 workspaces (Peer::new + bootstrap)");
 
     assert_eq!(alice.user_invite_count(), 2, "Alice: boot + ongoing invites");
     assert_eq!(bob.user_invite_count(), 2, "Bob: boot + ongoing invites");
@@ -2652,7 +2658,7 @@ async fn test_identity_cascade_via_sync() {
     drop(sync);
 
     // Bob should now have Alice's full identity chain projected plus his own user
-    assert_eq!(bob.workspace_count(), 1, "Bob should have Alice's workspace");
+    assert_eq!(bob.workspace_count(), 2, "Bob should have Alice's workspace + Peer::new workspace");
     assert_eq!(bob.user_invite_count(), 2, "Bob should have both invites");
     assert_eq!(bob.user_count(), 2, "Both Alice's and Bob's users should be valid");
 
@@ -2766,9 +2772,9 @@ async fn test_device_link_via_sync() {
 
     drop(sync);
 
-    // Both devices share the same workspace and identity state
-    assert_eq!(phone.workspace_count(), 1);
-    assert_eq!(laptop.workspace_count(), 1);
+    // Both devices share the same workspace and identity state (+1 from Peer::new)
+    assert_eq!(phone.workspace_count(), 2);
+    assert_eq!(laptop.workspace_count(), 2);
     assert_eq!(phone.device_invite_count(), 2, "Phone: first + ongoing");
     assert_eq!(laptop.device_invite_count(), 2, "Laptop: first + ongoing");
 
@@ -2793,9 +2799,9 @@ async fn test_foreign_workspace_rejected_via_sync() {
     assert_ne!(alice_chain.workspace_id, bob_chain.workspace_id,
         "workspaces should differ");
 
-    // Before sync: each peer has exactly 1 workspace projected
-    assert_eq!(alice.workspace_count(), 1);
-    assert_eq!(bob.workspace_count(), 1);
+    // Before sync: each peer has 2 workspaces projected (Peer::new + bootstrap)
+    assert_eq!(alice.workspace_count(), 2);
+    assert_eq!(bob.workspace_count(), 2);
 
     // Sync — shared events flow between peers
     let sync = start_peers(&alice, &bob);
@@ -2810,12 +2816,12 @@ async fn test_foreign_workspace_rejected_via_sync() {
 
     drop(sync);
 
-    // Each peer should still have exactly 1 workspace projected — the foreign
-    // workspace event is rejected by the trust anchor guard, not accepted.
-    assert_eq!(alice.workspace_count(), 1,
-        "Alice should still have exactly 1 workspace (foreign rejected)");
-    assert_eq!(bob.workspace_count(), 1,
-        "Bob should still have exactly 1 workspace (foreign rejected)");
+    // Each peer should still have 2 workspaces projected (Peer::new + own bootstrap) —
+    // the foreign bootstrap workspace event is rejected by the trust anchor guard.
+    assert_eq!(alice.workspace_count(), 2,
+        "Alice should still have exactly 2 workspaces (foreign rejected)");
+    assert_eq!(bob.workspace_count(), 2,
+        "Bob should still have exactly 2 workspaces (foreign rejected)");
 
     // Foreign identity events should be rejected, not just blocked
     assert!(alice.rejected_event_count() > 0,

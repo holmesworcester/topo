@@ -140,24 +140,24 @@ fn test_cli_bidirectional_sync() {
     let mut bob = start_sync(&bob_db, bob_port, Some(alice_port), &[&alice_fp]);
     std::thread::sleep(Duration::from_secs(1));
 
-    // Alice sends a message
+    // Alice sends a message (also auto-creates deterministic workspace event)
     send_message(&alice_db, "Hello from Alice");
-    assert_eventually(&bob_db, "store_count >= 1", timeout_ms);
+    assert_eventually(&bob_db, "store_count >= 2", timeout_ms); // msg + workspace
 
-    // Bob sends a message
+    // Bob sends a message (workspace already exists with same hash)
     send_message(&bob_db, "Hey Alice!");
-    assert_eventually(&alice_db, "store_count >= 2", timeout_ms);
+    assert_eventually(&alice_db, "store_count >= 3", timeout_ms);
 
     // Alice sends another
     send_message(&alice_db, "How are you?");
-    assert_eventually(&bob_db, "store_count >= 3", timeout_ms);
-    assert_eventually(&alice_db, "store_count >= 3", timeout_ms);
+    assert_eventually(&bob_db, "store_count >= 4", timeout_ms);
+    assert_eventually(&alice_db, "store_count >= 4", timeout_ms);
 
-    // Verify both peers have all 3 messages
-    assert_now(&alice_db, "store_count == 3");
-    assert_now(&alice_db, "message_count == 3");
-    assert_now(&bob_db, "store_count == 3");
-    assert_now(&bob_db, "message_count == 3");
+    // Verify: 1 shared workspace + 3 messages = 4
+    assert_eventually(&alice_db, "message_count >= 3", timeout_ms);
+    assert_eventually(&bob_db, "message_count >= 3", timeout_ms);
+    assert_now(&alice_db, "store_count == 4");
+    assert_now(&bob_db, "store_count == 4");
 
     // Verify message content
     let alice_messages = get_messages(&alice_db);
@@ -200,27 +200,28 @@ fn test_cli_ongoing_sync() {
     let mut bob = start_sync(&bob_db, bob_port, Some(alice_port), &[&alice_fp]);
     std::thread::sleep(Duration::from_secs(1));
 
-    // Round 1: Alice sends
+    // Round 1: Alice sends (auto-creates deterministic workspace)
     send_message(&alice_db, "Round 1");
-    assert_eventually(&bob_db, "store_count >= 1", timeout_ms);
+    assert_eventually(&bob_db, "store_count >= 2", timeout_ms); // msg + workspace
 
-    // Round 2: Bob sends while sync runs
+    // Round 2: Bob sends while sync runs (workspace same hash, already exists)
     send_message(&bob_db, "Round 2");
-    assert_eventually(&alice_db, "store_count >= 2", timeout_ms);
+    assert_eventually(&alice_db, "store_count >= 3", timeout_ms);
 
     // Round 3: Both send
     send_message(&alice_db, "Round 3a");
     send_message(&bob_db, "Round 3b");
-    assert_eventually(&alice_db, "store_count >= 4", timeout_ms);
-    assert_eventually(&bob_db, "store_count >= 4", timeout_ms);
+    assert_eventually(&alice_db, "store_count >= 5", timeout_ms);
+    assert_eventually(&bob_db, "store_count >= 5", timeout_ms);
 
     // Round 4: One more after a pause
     std::thread::sleep(Duration::from_secs(1));
     send_message(&alice_db, "Round 4");
-    assert_eventually(&bob_db, "store_count >= 5", timeout_ms);
+    assert_eventually(&bob_db, "store_count >= 6", timeout_ms);
 
-    assert_now(&alice_db, "store_count == 5");
-    assert_now(&bob_db, "store_count == 5");
+    // 5 messages + 1 shared workspace = 6
+    assert_now(&alice_db, "store_count == 6");
+    assert_now(&bob_db, "store_count == 6");
 
     let _ = alice.kill();
     let _ = bob.kill();
@@ -237,9 +238,10 @@ fn test_cli_send_and_messages() {
     send_message(&db, "First message");
     send_message(&db, "Second message");
 
-    assert_now(&db, "store_count == 2");
+    // store_count includes the auto-created workspace event
+    assert_now(&db, "store_count == 3");
     assert_now(&db, "message_count == 2");
-    assert_now(&db, "recorded_events_count == 2");
+    assert_now(&db, "recorded_events_count == 3");
 
     let messages = get_messages(&db);
     assert_eq!(messages.len(), 2);

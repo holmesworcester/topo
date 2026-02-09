@@ -4,13 +4,13 @@ use super::{EventError, ParsedEvent, EVENT_TYPE_MESSAGE};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageEvent {
     pub created_at_ms: u64,
-    pub channel_id: [u8; 32],
+    pub network_event_id: [u8; 32],
     pub author_id: [u8; 32],
     pub content: String,
 }
 
 pub fn parse_message(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    // Minimum: event_type(1) + created_at_ms(8) + channel_id(32) + author_id(32) + content_len(2) = 75
+    // Minimum: event_type(1) + created_at_ms(8) + network_event_id(32) + author_id(32) + content_len(2) = 75
     if blob.len() < 75 {
         return Err(EventError::TooShort {
             expected: 75,
@@ -26,8 +26,8 @@ pub fn parse_message(blob: &[u8]) -> Result<ParsedEvent, EventError> {
 
     let created_at_ms = u64::from_le_bytes(blob[1..9].try_into().unwrap());
 
-    let mut channel_id = [0u8; 32];
-    channel_id.copy_from_slice(&blob[9..41]);
+    let mut network_event_id = [0u8; 32];
+    network_event_id.copy_from_slice(&blob[9..41]);
 
     let mut author_id = [0u8; 32];
     author_id.copy_from_slice(&blob[41..73]);
@@ -44,7 +44,7 @@ pub fn parse_message(blob: &[u8]) -> Result<ParsedEvent, EventError> {
 
     Ok(ParsedEvent::Message(MessageEvent {
         created_at_ms,
-        channel_id,
+        network_event_id,
         author_id,
         content,
     }))
@@ -66,7 +66,7 @@ pub fn encode_message(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
 
     buf.push(EVENT_TYPE_MESSAGE);
     buf.extend_from_slice(&msg.created_at_ms.to_le_bytes());
-    buf.extend_from_slice(&msg.channel_id);
+    buf.extend_from_slice(&msg.network_event_id);
     buf.extend_from_slice(&msg.author_id);
     buf.extend_from_slice(&(content_bytes.len() as u16).to_le_bytes());
     buf.extend_from_slice(content_bytes);
@@ -79,7 +79,8 @@ pub static MESSAGE_META: EventTypeMeta = EventTypeMeta {
     type_name: "message",
     projection_table: "messages",
     share_scope: ShareScope::Shared,
-    dep_fields: &[],
+    dep_fields: &["network_event_id"],
+    dep_field_type_codes: &[&[8]],
     signer_required: false,
     signature_byte_len: 0,
     parse: parse_message,
