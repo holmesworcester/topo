@@ -18,8 +18,7 @@ use crate::projection::pipeline::project_one;
 use crate::sync::engine::{accept_loop, connect_loop};
 use crate::transport::{
     AllowedPeers,
-    create_client_endpoint,
-    create_server_endpoint,
+    create_dual_endpoint,
     extract_spki_fingerprint,
     load_or_generate_cert,
 };
@@ -942,21 +941,21 @@ pub fn start_peers(
     let allowed_for_a = Arc::new(AllowedPeers::from_fingerprints(vec![fp_b]));
     let allowed_for_b = Arc::new(AllowedPeers::from_fingerprints(vec![fp_a]));
 
-    let listener_endpoint = create_server_endpoint(
+    let listener_endpoint = create_dual_endpoint(
         "127.0.0.1:0".parse().unwrap(),
         cert_a,
         key_a,
         allowed_for_a,
-    ).expect("failed to create server endpoint");
+    ).expect("failed to create dual endpoint for A");
 
     let listener_addr = listener_endpoint.local_addr().expect("failed to get listener addr");
 
-    let connector_endpoint = create_client_endpoint(
-        "0.0.0.0:0".parse().unwrap(),
+    let connector_endpoint = create_dual_endpoint(
+        "127.0.0.1:0".parse().unwrap(),
         cert_b,
         key_b,
         allowed_for_b,
-    ).expect("failed to create client endpoint");
+    ).expect("failed to create dual endpoint for B");
 
     let a_db = peer_a.db_path.clone();
     let a_identity = peer_a.identity.clone();
@@ -969,7 +968,7 @@ pub fn start_peers(
             .build()
             .unwrap();
         rt.block_on(async move {
-            if let Err(e) = accept_loop(&a_db, &a_identity, listener_endpoint).await {
+            if let Err(e) = accept_loop(&a_db, &a_identity, listener_endpoint, None).await {
                 tracing::warn!("accept_loop exited: {}", e);
             }
         });
@@ -981,7 +980,7 @@ pub fn start_peers(
             .build()
             .unwrap();
         rt.block_on(async move {
-            if let Err(e) = connect_loop(&b_db, &b_identity, connector_endpoint, listener_addr).await {
+            if let Err(e) = connect_loop(&b_db, &b_identity, connector_endpoint, listener_addr, None).await {
                 tracing::warn!("connect_loop exited: {}", e);
             }
         });

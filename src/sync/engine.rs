@@ -759,6 +759,7 @@ pub async fn accept_loop(
     db_path: &str,
     recorded_by: &str,
     endpoint: quinn::Endpoint,
+    allowed_peers: Option<crate::transport::AllowedPeers>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     {
         let db = open_connection(db_path)?;
@@ -840,6 +841,20 @@ pub async fn accept_loop(
             }
         }
 
+        // Spawn intro listener for uni-streams on this connection
+        let _intro_handle = if let Some(ref ap) = allowed_peers {
+            Some(crate::sync::punch::spawn_intro_listener(
+                connection.clone(),
+                db_path.to_string(),
+                recorded_by.to_string(),
+                peer_id.clone(),
+                endpoint.clone(),
+                ap.clone(),
+            ))
+        } else {
+            None
+        };
+
         // Inner loop: repeated sync sessions on this connection
         loop {
             let (ctrl_send, ctrl_recv) = match connection.accept_bi().await {
@@ -876,6 +891,7 @@ pub async fn connect_loop(
     recorded_by: &str,
     endpoint: quinn::Endpoint,
     remote: SocketAddr,
+    allowed_peers: Option<crate::transport::AllowedPeers>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     {
         let db = open_connection(db_path)?;
@@ -958,6 +974,20 @@ pub async fn connect_loop(
                 }
             }
         }
+
+        // Spawn intro listener for uni-streams on this connection
+        let _intro_handle = if let Some(ref ap) = allowed_peers {
+            Some(crate::sync::punch::spawn_intro_listener(
+                connection.clone(),
+                db_path.to_string(),
+                recorded_by.to_string(),
+                peer_id.clone(),
+                endpoint.clone(),
+                ap.clone(),
+            ))
+        } else {
+            None
+        };
 
         // Inner loop: repeated sync sessions on this connection
         loop {

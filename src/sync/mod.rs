@@ -1,6 +1,8 @@
 pub mod protocol;
 pub mod negentropy_sqlite;
 pub mod engine;
+pub mod intro;
+pub mod punch;
 
 pub use protocol::{SyncMessage, parse_sync_message, encode_sync_message};
 pub use negentropy_sqlite::NegentropyStorageSqlite;
@@ -21,3 +23,4 @@ pub const MSG_TYPE_EVENT: u8 = 0x03;      // Event blob (variable length)
 pub const MSG_TYPE_DONE: u8 = 0x20;      // Initiator signals all events sent
 pub const MSG_TYPE_DONE_ACK: u8 = 0x21;  // Responder acknowledges done
 pub const MSG_TYPE_DATA_DONE: u8 = 0x22; // Sent on data stream: no more events will follow
+pub const MSG_TYPE_INTRO_OFFER: u8 = 0x30; // Intro offer for hole punching
