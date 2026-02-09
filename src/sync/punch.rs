@@ -114,17 +114,20 @@ pub async fn handle_intro_offer(
     // Transition to dialing
     update_status(db_path, recorded_by, &intro_id, "dialing", None);
 
-    info!("Attempting hole punch to {} at {}", &other_peer_hex[..16], addr);
+    info!("Attempting hole punch to {} at {} (local_addr={:?})",
+        &other_peer_hex[..16], addr, endpoint.local_addr());
 
     // Paced dial attempts within the attempt window
     let window = Duration::from_millis(attempt_window_ms as u64);
     let pace = Duration::from_millis(200); // send a packet every 200ms
     let start = std::time::Instant::now();
+    let mut attempt = 0u32;
 
     loop {
         if start.elapsed() >= window {
             break;
         }
+        attempt += 1;
 
         match endpoint.connect(addr, "localhost") {
             Ok(connecting) => {
@@ -151,11 +154,13 @@ pub async fn handle_intro_offer(
                         ).await;
                         return;
                     }
-                    Ok(Err(_e)) => {
-                        // Connection attempt failed, try again
+                    Ok(Err(e)) => {
+                        info!("Punch attempt #{} connect error: {}", attempt, e);
                     }
                     Err(_) => {
-                        // Timeout on this attempt, try again
+                        if attempt <= 3 {
+                            info!("Punch attempt #{} timed out (200ms)", attempt);
+                        }
                     }
                 }
             }
@@ -213,6 +218,11 @@ async fn run_sync_on_punched_connection(
 
 /// Spawn a background task that listens for uni-directional streams on a
 /// QUIC connection and processes IntroOffer messages.
+///
+/// Must be called from within a `tokio::task::LocalSet` context (both
+/// `accept_loop` and `connect_loop` provide one). Uses `spawn_local`
+/// so the punch handler can hold `!Send` types (rusqlite) across awaits
+/// while sharing the same endpoint I/O driver as the parent runtime.
 pub fn spawn_intro_listener(
     connection: quinn::Connection,
     db_path: String,
@@ -221,7 +231,7 @@ pub fn spawn_intro_listener(
     endpoint: quinn::Endpoint,
     allowed_peers: AllowedPeers,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    tokio::task::spawn_local(async move {
         loop {
             let mut recv = match connection.accept_uni().await {
                 Ok(r) => r,
@@ -251,21 +261,16 @@ pub fn spawn_intro_listener(
                     let endpoint = endpoint.clone();
                     let allowed = allowed_peers.clone();
 
-                    // Spawn punch attempt in a blocking task (required because
-                    // run_sync_initiator_dual uses rusqlite which isn't Send)
-                    tokio::task::spawn_blocking(move || {
-                        let rt = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()
-                            .unwrap();
-                        rt.block_on(async move {
-                            handle_intro_offer(
-                                &db_path, &recorded_by, &introduced_by, endpoint,
-                                &allowed, intro_id, other_peer_id, origin_family,
-                                origin_ip, origin_port, observed_at_ms, expires_at_ms,
-                                attempt_window_ms,
-                            ).await;
-                        });
+                    // Spawn punch attempt as a local task — runs on the same
+                    // LocalSet / runtime that owns the endpoint I/O driver,
+                    // so endpoint.connect() can properly send/receive UDP.
+                    tokio::task::spawn_local(async move {
+                        handle_intro_offer(
+                            &db_path, &recorded_by, &introduced_by, endpoint,
+                            &allowed, intro_id, other_peer_id, origin_family,
+                            origin_ip, origin_port, observed_at_ms, expires_at_ms,
+                            attempt_window_ms,
+                        ).await;
                     });
                 }
                 Ok(_) => {

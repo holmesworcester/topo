@@ -40,6 +40,18 @@ enum Commands {
         /// Allowed peer fingerprints (hex, repeatable)
         #[arg(long = "pin-peer")]
         pin_peer: Vec<String>,
+        /// Enable intro worker (sends IntroOffers on same endpoint for NAT compat)
+        #[arg(long)]
+        intro_worker: bool,
+        /// Intro worker scan interval in ms
+        #[arg(long, default_value = "5000")]
+        intro_interval_ms: u64,
+        /// Intro TTL in ms
+        #[arg(long, default_value = "30000")]
+        intro_ttl_ms: u64,
+        /// Intro attempt window in ms
+        #[arg(long, default_value = "4000")]
+        intro_window_ms: u32,
     },
 
     /// Print local transport identity — SPKI fingerprint from TLS cert (generates cert if needed)
@@ -232,8 +244,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     match cli.command {
-        Commands::Sync { bind, connect, db, pin_peer } => {
-            run_sync(bind, connect, &db, &pin_peer).await?;
+        Commands::Sync { bind, connect, db, pin_peer,
+                          intro_worker, intro_interval_ms, intro_ttl_ms, intro_window_ms } => {
+            run_sync(bind, connect, &db, &pin_peer,
+                     intro_worker, intro_interval_ms, intro_ttl_ms, intro_window_ms).await?;
         }
         Commands::TransportIdentity { db } => {
             run_identity(&db)?;
@@ -745,6 +759,10 @@ async fn run_sync(
     connect: Option<SocketAddr>,
     db_path: &str,
     pin_peers: &[String],
+    intro_worker: bool,
+    intro_interval_ms: u64,
+    intro_ttl_ms: u64,
+    intro_window_ms: u32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Initialize DB before spawning concurrent loops (avoids create_tables race)
     {
@@ -800,6 +818,31 @@ async fn run_sync(
         }
     });
 
+    // Optional: spawn intro worker on the SAME endpoint (shares UDP socket for NAT compat)
+    let intro_handle = if intro_worker {
+        info!("Intro worker enabled (interval={}ms, ttl={}ms, window={}ms)",
+            intro_interval_ms, intro_ttl_ms, intro_window_ms);
+        let intro_ep = endpoint.clone();
+        let db = db_owned.clone();
+        let rb = recorded_by.clone();
+        Some(tokio::task::spawn_blocking(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                if let Err(e) = poc_7::sync::intro::run_intro_worker(
+                    &intro_ep, &db, &rb,
+                    intro_interval_ms, intro_ttl_ms, intro_window_ms,
+                ).await {
+                    tracing::warn!("intro_worker exited: {}", e);
+                }
+            });
+        }))
+    } else {
+        None
+    };
+
     if let Some(remote) = connect {
         let connect_endpoint = endpoint.clone();
         let connect_allowed = allowed_peers_inner.clone();
@@ -820,6 +863,7 @@ async fn run_sync(
         tokio::select! {
             _ = accept_handle => {}
             _ = connect_handle => {}
+            _ = async { if let Some(h) = intro_handle { h.await.ok(); } else { std::future::pending::<()>().await; } } => {}
             _ = tokio::signal::ctrl_c() => {
                 info!("Ctrl-C received, shutting down");
             }
@@ -827,6 +871,7 @@ async fn run_sync(
     } else {
         tokio::select! {
             _ = accept_handle => {}
+            _ = async { if let Some(h) = intro_handle { h.await.ok(); } else { std::future::pending::<()>().await; } } => {}
             _ = tokio::signal::ctrl_c() => {
                 info!("Ctrl-C received, shutting down");
             }
