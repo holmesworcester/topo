@@ -127,7 +127,65 @@ Event-graph identity is event-defined:
 2. `TransportKey` events bridge event-graph identity to transport SPKI fingerprints,
 3. projected identity determines which peers are allowed to sync.
 
-## 2.4 Recording identity semantics
+## 2.4 NAT traversal and hole punch
+
+Direct peer-to-peer connectivity through NAT is a transport optimization, not a canonical protocol concern.
+
+Principles:
+1. Hole punch is opportunistic — relay sync through an intermediary peer is always the fallback.
+2. Introduction data (endpoint observations, IntroOffers) is runtime protocol state, not canonical events.
+3. The introducer role is a behavior of any peer that has active connections to multiple other peers — it is not a special node type.
+4. Punch success depends on NAT behavior (EIM = endpoint-independent mapping). Symmetric/port-dependent NATs will not work with the current approach.
+
+### Endpoint observations
+
+When a peer accepts a QUIC connection, it records the remote peer's observed `(ip, port)` in the `peer_endpoint_observations` table with a TTL.
+
+Rules:
+1. Observations are append-only with `INSERT OR IGNORE`.
+2. Freshness is determined by `MAX(observed_at)` query, not in-place update.
+3. Observations expire via `expires_at` and are periodically purged.
+4. Observations are scoped by `recorded_by` (the observer) and `via_peer_id` (the observed peer).
+
+### Introduction protocol
+
+An introducer sends `IntroOffer` messages to two peers so they can attempt a direct connection:
+
+1. The introducer looks up the freshest non-expired endpoint observation for each peer.
+2. It sends each peer an `IntroOffer` containing the other peer's `(peer_id, ip, port, observed_at, expires_at, attempt_window_ms)`.
+3. IntroOffers are sent on uni-directional QUIC streams (not bi-directional sync streams).
+4. IntroOffers are 88 bytes fixed-size and contain a 16-byte random `intro_id` for deduplication.
+
+Receiver validation:
+1. Expired offers are dropped and recorded as `expired`.
+2. Offers for untrusted peers (not in `AllowedPeers`) are rejected.
+3. Duplicate `intro_id` values are silently skipped.
+
+### Hole punch dial protocol
+
+After receiving a valid IntroOffer, the peer attempts paced QUIC connections to the introduced peer's observed address:
+
+1. Dial attempts are paced at 200ms intervals within the `attempt_window_ms` (default 4s).
+2. Each attempt uses `endpoint.connect()` on the same QUIC endpoint (sharing the UDP socket and local port).
+3. On successful connection, the peer verifies the remote peer's identity matches the expected `other_peer_id`.
+4. On identity match, a normal sync session runs on the punched connection.
+5. The attempt lifecycle is recorded in `intro_attempts` with status transitions: `received → dialing → connected | failed | expired | rejected`.
+
+NAT traversal relies on simultaneous open: both peers dial each other at roughly the same time, creating outgoing NAT mappings that allow the other's packets through.
+
+### Intro worker
+
+The intro worker is an opt-in continuous process that automates introductions:
+
+1. Enabled via `--intro-worker` flag on the `sync` command (or as standalone `intro-worker` command).
+2. Runs on the same QUIC endpoint as the sync loop (shares UDP socket for NAT compatibility).
+3. Periodically scans for all peer pairs with non-expired endpoint observations.
+4. Introduces every eligible pair by sending IntroOffers to both.
+5. Configurable: `--intro-interval-ms`, `--intro-ttl-ms`, `--intro-window-ms`.
+
+Current selection criteria: all peers with fresh observations are introduced to all other peers with fresh observations. No reputation, preference, or rate-limiting logic exists yet.
+
+## 2.5 Recording identity semantics
 
 1. `signed_by`: canonical signer event reference used for signature/policy checks.
 2. `signer_type`: signer keyspace discriminator (`peer_key | workspace | user_invite | device_invite | user | peer_shared`).
