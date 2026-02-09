@@ -1,7 +1,7 @@
 use rusqlite::Connection;
 
 use crate::crypto::event_id_to_base64;
-use crate::events::{MessageEvent, MessageDeletionEvent, PeerKeyEvent, ReactionEvent, SecretKeyEvent, SignedMemoEvent};
+use crate::events::{MessageEvent, MessageAttachmentEvent, MessageDeletionEvent, FileSliceEvent, PeerKeyEvent, ReactionEvent, SecretKeyEvent, SignedMemoEvent};
 use super::decision::ProjectionDecision;
 
 /// Project a Message event into the messages table. Returns Ok(true) if written.
@@ -210,4 +210,76 @@ pub fn project_message_deletion(
     )?;
 
     Ok(ProjectionDecision::Valid)
+}
+
+pub fn project_message_attachment(
+    conn: &Connection,
+    recorded_by: &str,
+    event_id_b64: &str,
+    att: &MessageAttachmentEvent,
+) -> Result<bool, rusqlite::Error> {
+    let message_id_b64 = event_id_to_base64(&att.message_id);
+    let file_id_b64 = event_id_to_base64(&att.file_id);
+    let key_event_id_b64 = event_id_to_base64(&att.key_event_id);
+    let rows = conn.execute(
+        "INSERT OR IGNORE INTO message_attachments (recorded_by, event_id, message_id, file_id, blob_bytes, total_slices, slice_bytes, root_hash, key_event_id, filename, mime_type, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        rusqlite::params![
+            recorded_by,
+            event_id_b64,
+            message_id_b64,
+            file_id_b64,
+            att.blob_bytes as i64,
+            att.total_slices as i64,
+            att.slice_bytes as i64,
+            att.root_hash.as_slice(),
+            key_event_id_b64,
+            &att.filename,
+            &att.mime_type,
+            att.created_at_ms as i64,
+        ],
+    )?;
+    Ok(rows > 0)
+}
+
+/// Project a FileSlice event into the file_slices table (index only, no ciphertext).
+/// Returns Ok(ProjectionDecision::Valid) on success or idempotent replay.
+/// Returns Ok(ProjectionDecision::Reject) if a different event_id already claims this slot.
+pub fn project_file_slice(
+    conn: &Connection,
+    recorded_by: &str,
+    event_id_b64: &str,
+    fs: &FileSliceEvent,
+) -> Result<ProjectionDecision, rusqlite::Error> {
+    let file_id_b64 = event_id_to_base64(&fs.file_id);
+    let rows = conn.execute(
+        "INSERT OR IGNORE INTO file_slices (recorded_by, file_id, slice_number, event_id, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![
+            recorded_by,
+            file_id_b64,
+            fs.slice_number as i64,
+            event_id_b64,
+            fs.created_at_ms as i64,
+        ],
+    )?;
+    if rows > 0 {
+        return Ok(ProjectionDecision::Valid);
+    }
+    // Row already exists — check if same event_id (idempotent replay) or conflict
+    let existing_event_id: String = conn.query_row(
+        "SELECT event_id FROM file_slices WHERE recorded_by = ?1 AND file_id = ?2 AND slice_number = ?3",
+        rusqlite::params![recorded_by, file_id_b64, fs.slice_number as i64],
+        |row| row.get(0),
+    )?;
+    if existing_event_id == event_id_b64 {
+        Ok(ProjectionDecision::Valid) // idempotent replay
+    } else {
+        Ok(ProjectionDecision::Reject {
+            reason: format!(
+                "duplicate file_slice: slot ({}, {}, {}) already claimed by event {}",
+                recorded_by, file_id_b64, fs.slice_number, existing_event_id
+            ),
+        })
+    }
 }

@@ -882,9 +882,46 @@ Start simple, then tune.
 Recommended initial size policy:
 - `EVENT_MAX_BLOB_BYTES = 1_048_576` (1 MiB soft cap)
 - `FILE_SLICE_TARGET_BYTES = 262_144` (256 KiB)
-- `FILE_SLICE_MAX_BYTES = 1_048_576` (1 MiB hard cap)
+- `FILE_SLICE_MAX_BYTES = 1_048_430` (`EVENT_MAX_BLOB_BYTES(1_048_576) - wire_overhead(146)`)
 
 `file_slice` events can be much larger than legacy simulator limits and are signed/verified like other events.
+The `FILE_SLICE_MAX_BYTES` constant is derived so that the maximum encoded `file_slice` event
+(ciphertext + type byte + timestamps + file_id + slice_number + signer trailer) fits within
+`EVENT_MAX_BLOB_BYTES`.
+
+### 10.1 File attachment event types
+
+Two new event types (migration 13):
+- `message_attachment` (type 24, unsigned): Descriptor linking a file to a message.
+  Deps: `message_id`, `key_event_id`. Fields include `blob_bytes`, `total_slices`, `slice_bytes`,
+  `root_hash`, `filename`, `mime_type`.
+- `file_slice` (type 25, signed): Individual encrypted chunk of a file.
+  Dep: `signed_by`. Fields include `file_id`, `slice_number`, `ciphertext`.
+
+Primary key for `file_slices`: `(recorded_by, file_id, slice_number)` — optimized for
+sequential IO locality when reassembling files.
+
+### 10.2 Metadata validation
+
+`message_attachment` events are validated at parse time:
+- `blob_bytes > 0` requires `total_slices > 0`
+- `total_slices > 0` requires `slice_bytes > 0`
+- `total_slices` must equal `ceil(blob_bytes / slice_bytes)`
+- Zero-byte files (`blob_bytes == 0, total_slices == 0, slice_bytes == 0`) are valid.
+
+### 10.3 Duplicate slice conflict handling
+
+`file_slice` projection uses `INSERT OR IGNORE` with post-insert conflict detection:
+- If insert succeeds (rows > 0): `Valid`
+- If insert is ignored: check existing row's `event_id`
+  - Same `event_id`: idempotent replay → `Valid`
+  - Different `event_id`: conflict → `Reject` with durable rejection record
+
+### 10.4 Future Work: Integrity and Conflict Resolution
+
+1. **Merkle-proof extension**: Attachment carries `merkle_root`, each `file_slice` carries proof path,
+   projector verifies proof against descriptor root. Overhead ~`log2(N) * 32` bytes per slice proof.
+2. **Full DAG encoding**: Deferred unless needed. Too heavy for current phase.
 
 ---
 

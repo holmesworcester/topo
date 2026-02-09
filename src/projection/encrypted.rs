@@ -6,7 +6,7 @@ use aes_gcm::aead::Aead;
 use crate::crypto::event_id_to_base64;
 use crate::events::{self, EncryptedEvent, ParsedEvent, EVENT_TYPE_ENCRYPTED};
 use super::decision::ProjectionDecision;
-use super::projectors::{project_message, project_message_deletion, project_reaction, project_peer_key, project_secret_key, project_signed_memo};
+use super::projectors::{project_message, project_message_attachment, project_message_deletion, project_file_slice, project_reaction, project_peer_key, project_secret_key, project_signed_memo};
 use super::signer::{resolve_signer_key, verify_ed25519_signature, SignerResolution};
 
 /// Project an encrypted event: decrypt, parse inner, check inner deps, dispatch to inner projector.
@@ -172,6 +172,12 @@ pub fn project_encrypted(
         }
         ParsedEvent::MessageDeletion(del) => {
             return project_message_deletion(conn, recorded_by, event_id_b64, del);
+        }
+        ParsedEvent::MessageAttachment(att) => {
+            project_message_attachment(conn, recorded_by, event_id_b64, att)?;
+        }
+        ParsedEvent::FileSlice(fs) => {
+            return Ok(project_file_slice(conn, recorded_by, event_id_b64, fs)?);
         }
         ParsedEvent::Encrypted(_) => {
             // Already rejected above (nested encryption)
