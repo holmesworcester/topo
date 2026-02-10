@@ -164,7 +164,7 @@ fn create_prereqs(
     // Signed message
     let msg = ParsedEvent::Message(MessageEvent {
         created_at_ms: now_ms(),
-        workspace_event_id: ws_eid,
+        workspace_event_id: [1u8; 32],
         author_id: [2u8; 32],
         content: "file parent".to_string(),
         signed_by: signer_eid,

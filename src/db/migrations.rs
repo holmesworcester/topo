@@ -394,37 +394,7 @@ pub fn run_migrations(conn: &Connection) -> SqliteResult<()> {
         )?;
 
         if !already_applied {
-            // Migration 14: conditionally rename channel_id → network_event_id
-            if migration.version == 14 {
-                let has_channel_id: bool = conn.query_row(
-                    "SELECT COUNT(*) > 0 FROM pragma_table_info('messages') WHERE name='channel_id'",
-                    [],
-                    |row| row.get(0),
-                )?;
-                if has_channel_id {
-                    conn.execute_batch(
-                        "ALTER TABLE messages RENAME COLUMN channel_id TO network_event_id;
-                         DROP INDEX IF EXISTS idx_messages_channel;
-                         CREATE INDEX IF NOT EXISTS idx_messages_network ON messages(network_event_id, created_at DESC);"
-                    )?;
-                }
-            } else if migration.version == 15 {
-                // Migration 15: conditionally rename network_event_id → workspace_event_id
-                let has_network_event_id: bool = conn.query_row(
-                    "SELECT COUNT(*) > 0 FROM pragma_table_info('messages') WHERE name='network_event_id'",
-                    [],
-                    |row| row.get(0),
-                )?;
-                if has_network_event_id {
-                    conn.execute_batch(
-                        "ALTER TABLE messages RENAME COLUMN network_event_id TO workspace_event_id;
-                         DROP INDEX IF EXISTS idx_messages_network;
-                         CREATE INDEX IF NOT EXISTS idx_messages_workspace ON messages(workspace_event_id, created_at DESC);"
-                    )?;
-                }
-            } else {
-                conn.execute_batch(migration.sql)?;
-            }
+            conn.execute_batch(migration.sql)?;
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()

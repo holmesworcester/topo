@@ -538,8 +538,27 @@ mod tests {
 
     use crate::events::{
         DeviceInviteFirstEvent, InviteAcceptedEvent, PeerSharedFirstEvent, UserBootEvent,
-        UserInviteBootEvent, WorkspaceEvent,
+        UserInviteBootEvent,
     };
+
+    /// Create a Workspace event, insert it, and mark it valid for this tenant.
+    /// Returns the event_id suitable for tests that need an existing workspace row.
+    fn setup_workspace_event(conn: &Connection, recorded_by: &str) -> EventId {
+        let ws = ParsedEvent::Workspace(WorkspaceEvent {
+            created_at_ms: now_ms(),
+            public_key: [0xAA; 32],
+            workspace_id: [0xBB; 32],
+        });
+        let blob = events::encode_event(&ws).unwrap();
+        let eid = insert_event_raw(conn, recorded_by, &blob);
+        let eid_b64 = event_id_to_base64(&eid);
+        conn.execute(
+            "INSERT OR IGNORE INTO valid_events (peer_id, event_id) VALUES (?1, ?2)",
+            rusqlite::params![recorded_by, &eid_b64],
+        )
+        .unwrap();
+        eid
+    }
 
     /// Create a minimal identity chain and return (peer_shared_event_id, signing_key).
     /// Projects all identity events through the pipeline so the signer is in valid_events.

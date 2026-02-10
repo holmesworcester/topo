@@ -731,7 +731,7 @@ fn ensure_identity_chain(
 
 fn send_message(
     db_path: &str,
-    channel_hex: &str,
+    workspace_hex: &str,
     content: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let recorded_by = ensure_transport_peer_id_from_db(db_path)?;
@@ -739,7 +739,7 @@ fn send_message(
     create_tables(&db)?;
 
     let (signer_eid, signing_key) = ensure_identity_chain(&db, &recorded_by)?;
-    let channel_id = parse_channel_hex(channel_hex)?;
+    let workspace_event_id = parse_workspace_hex(workspace_hex)?;
     let author_id = stable_author_id(&recorded_by);
 
     let msg = ParsedEvent::Message(MessageEvent {

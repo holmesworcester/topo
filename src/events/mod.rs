@@ -911,7 +911,7 @@ mod tests {
         let msg_signer = [77u8; 32];
         let msg = ParsedEvent::Message(MessageEvent {
             created_at_ms: 100,
-            channel_id: [0u8; 32],
+            workspace_event_id: [0u8; 32],
             author_id: [0u8; 32],
             content: "".to_string(),
             signed_by: msg_signer,

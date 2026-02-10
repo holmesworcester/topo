@@ -1265,7 +1265,7 @@ fn cmd_status(
     writeln!(out, "  Events:    {}", events_count)?;
     writeln!(out, "  Messages:  {}", messages_count)?;
     writeln!(out, "  Reactions: {}", reactions_count)?;
-    writeln!(out, "  Workspace: {}", workspace_name)?;
+    writeln!(out, "  Workspace: {}", network_name)?;
     writeln!(out, "  Channel:   {}", ch_name)?;
 
     Ok(())

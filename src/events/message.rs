@@ -111,6 +111,7 @@ pub static MESSAGE_META: EventTypeMeta = EventTypeMeta {
     projection_table: "messages",
     share_scope: ShareScope::Shared,
     dep_fields: &["signed_by"],
+    dep_field_type_codes: &[&[]],
     signer_required: true,
     signature_byte_len: 64,
     parse: parse_message,

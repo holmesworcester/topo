@@ -254,6 +254,15 @@ mod tests {
         conn
     }
 
+    fn setup_workspace_event(conn: &Connection, recorded_by: &str) -> EventId {
+        let ws = ParsedEvent::Workspace(WorkspaceEvent {
+            created_at_ms: now_ms(),
+            public_key: [0xAA; 32],
+            workspace_id: [0xBB; 32],
+        });
+        event_id_or_blocked(create_event_sync(conn, recorded_by, &ws)).unwrap()
+    }
+
     /// Helper: sign a blob in-place (overwrite last 64 bytes).
     fn sign_blob(key: &SigningKey, blob: &mut Vec<u8>) {
         let len = blob.len();
