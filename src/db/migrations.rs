@@ -387,6 +387,15 @@ static MIGRATIONS: &[Migration] = &[
                 ON intro_attempts(recorded_by, other_peer_id);
         ",
     },
+    Migration {
+        version: 17,
+        name: "add_covering_index_blocked_deps",
+        sql: "
+            CREATE INDEX IF NOT EXISTS idx_blocked_by_dep_covering
+                ON blocked_event_deps(peer_id, blocker_event_id, event_id);
+            DROP INDEX IF EXISTS idx_blocked_by_dep;
+        ",
+    },
 ];
 
 fn ensure_schema_migrations(conn: &Connection) -> SqliteResult<()> {
@@ -536,6 +545,6 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 16);
+        assert_eq!(count, 17);
     }
 }

@@ -171,6 +171,11 @@ pub fn create_tables(conn: &Connection) -> SqliteResult<()> {
         migrate_messages_v1_to_v2(conn)?;
     }
 
+    // Run column-rename migrations before DDL so that existing DBs with
+    // `network_event_id` get renamed to `workspace_event_id` before the
+    // CREATE INDEX references the new column name.
+    run_migrations(conn)?;
+
     conn.execute_batch(
         "
         -- Content-addressed blob store
@@ -258,7 +263,6 @@ pub fn create_tables(conn: &Connection) -> SqliteResult<()> {
         );
         ",
     )?;
-    run_migrations(conn)?;
     Ok(())
 }
 
