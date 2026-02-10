@@ -769,19 +769,6 @@ mod tests {
     ) -> (ParsedEvent, Vec<u8>) {
         let msg = MessageEvent {
             created_at_ms: now_ms(),
-            workspace_event_id: *workspace_event_id,
-            author_id: [2u8; 32],
-            content: content.to_string(),
-        });
-        let blob = events::encode_event(&msg).unwrap();
-        (msg, blob)
-    }
-
-    fn make_message(content: &str) -> (ParsedEvent, Vec<u8>) {
-        // NOTE: This creates a message with a non-existent workspace_event_id dep.
-        // Tests using this must either set up the dep or expect Block.
-        let msg = ParsedEvent::Message(MessageEvent {
-            created_at_ms: now_ms(),
             workspace_event_id: [1u8; 32],
             author_id: [2u8; 32],
             content: content.to_string(),
