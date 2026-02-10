@@ -11,14 +11,14 @@ pub fn project_message(
     event_id_b64: &str,
     msg: &MessageEvent,
 ) -> Result<bool, rusqlite::Error> {
-    let network_event_id_b64 = event_id_to_base64(&msg.network_event_id);
+    let workspace_event_id_b64 = event_id_to_base64(&msg.workspace_event_id);
     let author_id_b64 = event_id_to_base64(&msg.author_id);
     let rows = conn.execute(
-        "INSERT OR IGNORE INTO messages (message_id, network_event_id, author_id, content, created_at, recorded_by)
+        "INSERT OR IGNORE INTO messages (message_id, workspace_event_id, author_id, content, created_at, recorded_by)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         rusqlite::params![
             event_id_b64,
-            network_event_id_b64,
+            workspace_event_id_b64,
             author_id_b64,
             &msg.content,
             msg.created_at_ms as i64,

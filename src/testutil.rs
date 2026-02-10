@@ -65,14 +65,14 @@ pub struct Peer {
     pub db_path: String,
     pub identity: String,
     pub author_id: [u8; 32],
-    pub network_event_id: [u8; 32],
+    pub workspace_event_id: [u8; 32],
     _tempdir: tempfile::TempDir,
 }
 
 impl Peer {
     /// Create a new peer with a fresh temp database.
     /// The `workspace_id` parameter is used to create a workspace event;
-    /// `network_event_id` is set to the workspace event's content-addressed hash.
+    /// `workspace_event_id` is set to the workspace event's content-addressed hash.
     pub fn new(name: &str, workspace_id: [u8; 32]) -> Self {
         use crate::crypto::{hash_event, event_id_to_base64};
         use crate::events;
@@ -126,7 +126,7 @@ impl Peer {
             db_path,
             identity,
             author_id,
-            network_event_id: ws_eid,
+            workspace_event_id: ws_eid,
             _tempdir: tempdir,
         }
     }
@@ -137,7 +137,7 @@ impl Peer {
         let db = open_connection(&self.db_path).expect("failed to open db");
         let msg = ParsedEvent::Message(MessageEvent {
             created_at_ms: current_timestamp_ms(),
-            network_event_id: self.network_event_id,
+            workspace_event_id: self.workspace_event_id,
             author_id: self.author_id,
             content: content.to_string(),
         });
@@ -219,7 +219,7 @@ impl Peer {
         let db = open_connection(&self.db_path).expect("failed to open db");
         let inner = ParsedEvent::Message(MessageEvent {
             created_at_ms: current_timestamp_ms(),
-            network_event_id: self.network_event_id,
+            workspace_event_id: self.workspace_event_id,
             author_id: self.author_id,
             content: content.to_string(),
         });
@@ -530,7 +530,7 @@ impl Peer {
         for i in 0..count {
             let msg = ParsedEvent::Message(MessageEvent {
                 created_at_ms: current_timestamp_ms(),
-                network_event_id: self.network_event_id,
+                workspace_event_id: self.workspace_event_id,
                 author_id: self.author_id,
                 content: format!("Message {} from {}", i, self.name),
             });

@@ -1029,7 +1029,7 @@ async fn test_project_queue_crash_recovery() {
     db.execute("DELETE FROM rejected_events WHERE peer_id = ?1", rusqlite::params![&alice.identity]).unwrap();
 
     // Re-seed the Peer::new workspace event as valid (it was inserted directly, not via projector)
-    let ws_b64 = event_id_to_base64(&alice.network_event_id);
+    let ws_b64 = event_id_to_base64(&alice.workspace_event_id);
     db.execute(
         "INSERT OR IGNORE INTO valid_events (peer_id, event_id) VALUES (?1, ?2)",
         rusqlite::params![&alice.identity, &ws_b64],

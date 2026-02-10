@@ -47,7 +47,7 @@ Changes to this document require TLA+ model re-verification.
 
 | Code | TLA+ RawDeps | Rust dep_fields |
 |------|-------------|-----------------|
-| 1 | {Net} | [network_event_id] |
+| 1 | {Workspace} | [workspace_event_id] |
 | 2 | {target_event_id} | [target_event_id] |
 | 3 | {} | [] |
 | 4 | {signed_by} | [signed_by] |
@@ -77,7 +77,7 @@ Changes to this document require TLA+ model re-verification.
 
 | Guard | TLA+ Definition | Rust Check | Applies To |
 |-------|----------------|------------|------------|
-| TrustAnchorMatch | trustAnchor[p] = NetId(e) | trust_anchors.workspace_id = event.workspace_id; Block if no anchor | type 8 (Workspace) |
+| TrustAnchorMatch | trustAnchor[p] = WorkspaceEventId(e) | trust_anchors.workspace_id = event.workspace_id; Block if no anchor | type 8 (Workspace) |
 
 ## Projection Tables
 
@@ -144,15 +144,15 @@ type_code(1) | created_at_ms(8) | key_event_id(32) | recipient_event_id(32) | wr
 |----------------|-----------|
 | InvDeps | verify_projection_invariants: all valid events have deps valid |
 | InvSigner | Signer verification in apply_projection |
-| InvNetAnchor | test_foreign_workspace_excluded: foreign workspace blocked |
+| InvWorkspaceAnchor | test_foreign_workspace_excluded: foreign workspace blocked |
 | InvSingleWorkspace | At most one workspace row per peer in workspaces table |
 | InvTrustAnchorImmutable | test_bootstrap_sequence: trust anchor is immutable once set; mismatch rejected |
 | InvTrustAnchorSource | invite_accepted must be valid for trust anchor to be set |
 | InvUserInviteChain | test_bootstrap_sequence: UserBoot requires UserInviteBoot valid |
 | InvDeviceInviteChain | test_bootstrap_sequence: PeerSharedFirst requires DeviceInviteFirst valid |
 | InvAdminChain | test_bootstrap_sequence: AdminOngoing requires AdminBoot valid |
-| InvForeignNetExcluded | test_foreign_workspace_excluded |
+| InvForeignWorkspaceExcluded | test_foreign_workspace_excluded |
 | InvRemovalAdmin | test_removal_enforcement: removal requires admin context |
 | InvAllValidRequireWorkspace | test_bootstrap_sequence: non-local events require workspace valid |
-| InvMessageNetwork | Message projection requires workspace (network_event_id dep) |
+| InvMessageWorkspace | Message projection requires workspace (workspace_event_id dep) |
 | InvRemovalExclusion | project_secret_shared: reject if recipient removed |

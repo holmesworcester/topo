@@ -354,6 +354,14 @@ static MIGRATIONS: &[Migration] = &[
         // the correct column name from CREATE TABLE in schema.rs.
         sql: "SELECT 1;",
     },
+    Migration {
+        version: 15,
+        name: "rename_network_event_id_to_workspace_event_id",
+        // Handled specially in run_migrations: renames network_event_id→workspace_event_id
+        // only if the old column exists (pre-existing DBs). Fresh DBs already have
+        // the correct column name from CREATE TABLE in schema.rs.
+        sql: "SELECT 1;",
+    },
 ];
 
 fn ensure_schema_migrations(conn: &Connection) -> SqliteResult<()> {
@@ -389,6 +397,20 @@ pub fn run_migrations(conn: &Connection) -> SqliteResult<()> {
                         "ALTER TABLE messages RENAME COLUMN channel_id TO network_event_id;
                          DROP INDEX IF EXISTS idx_messages_channel;
                          CREATE INDEX IF NOT EXISTS idx_messages_network ON messages(network_event_id, created_at DESC);"
+                    )?;
+                }
+            } else if migration.version == 15 {
+                // Migration 15: conditionally rename network_event_id → workspace_event_id
+                let has_network_event_id: bool = conn.query_row(
+                    "SELECT COUNT(*) > 0 FROM pragma_table_info('messages') WHERE name='network_event_id'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if has_network_event_id {
+                    conn.execute_batch(
+                        "ALTER TABLE messages RENAME COLUMN network_event_id TO workspace_event_id;
+                         DROP INDEX IF EXISTS idx_messages_network;
+                         CREATE INDEX IF NOT EXISTS idx_messages_workspace ON messages(workspace_event_id, created_at DESC);"
                     )?;
                 }
             } else {
@@ -489,6 +511,6 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 14);
+        assert_eq!(count, 15);
     }
 }

@@ -66,9 +66,9 @@ enum Commands {
         content: String,
         #[arg(short, long, default_value = "server.db")]
         db: String,
-        /// Network event ID hex (32 bytes)
+        /// Workspace event ID hex (32 bytes)
         #[arg(short = 'n', long, default_value = "0102030405060708090a0b0c0d0e0f10")]
-        network: String,
+        workspace: String,
     },
 
     /// Show database status
@@ -84,7 +84,7 @@ enum Commands {
         #[arg(short, long, default_value = "server.db")]
         db: String,
         #[arg(short = 'n', long, default_value = "0102030405060708090a0b0c0d0e0f10")]
-        network: String,
+        workspace: String,
     },
 
     /// Backfill legacy messages to the local transport identity (cert/key/SPKI)
@@ -161,7 +161,7 @@ enum Commands {
         summary: bool,
     },
 
-    /// List networks from projection
+    /// List workspaces from projection
     Networks {
         #[arg(short, long, default_value = "server.db")]
         db: String,
@@ -172,7 +172,7 @@ enum Commands {
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cli = Cli::parse();
 
-    // Only init tracing for network commands (avoid polluting message output)
+    // Only init tracing for sync commands (avoid polluting message output)
     match &cli.command {
         Commands::Sync { .. } => {
             let subscriber = FmtSubscriber::builder()
@@ -193,14 +193,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Commands::Messages { db, limit } => {
             show_messages(&db, limit)?;
         }
-        Commands::Send { content, db, network } => {
-            send_message(&db, &network, &content)?;
+        Commands::Send { content, db, workspace } => {
+            send_message(&db, &workspace, &content)?;
         }
         Commands::Status { db } => {
             show_status(&db)?;
         }
-        Commands::Generate { count, db, network } => {
-            generate_messages(&db, count, &network)?;
+        Commands::Generate { count, db, workspace } => {
+            generate_messages(&db, count, &workspace)?;
         }
         Commands::BackfillTransportIdentity { db } => {
             backfill_identity(&db)?;
@@ -232,7 +232,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             cli_keys(&db, summary)?;
         }
         Commands::Networks { db } => {
-            cli_networks(&db)?;
+            cli_workspaces(&db)?;
         }
     }
 
@@ -420,14 +420,14 @@ fn show_messages(db_path: &str, limit: usize) -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
-fn parse_network_hex(network_hex: &str) -> Result<[u8; 32], Box<dyn std::error::Error + Send + Sync>> {
-    let network_bytes = hex::decode(network_hex)?;
-    if network_bytes.len() > 32 {
-        return Err("Network event ID must be at most 32 bytes".into());
+fn parse_workspace_hex(workspace_hex: &str) -> Result<[u8; 32], Box<dyn std::error::Error + Send + Sync>> {
+    let workspace_bytes = hex::decode(workspace_hex)?;
+    if workspace_bytes.len() > 32 {
+        return Err("Workspace event ID must be at most 32 bytes".into());
     }
-    let mut network_event_id = [0u8; 32];
-    network_event_id[..network_bytes.len()].copy_from_slice(&network_bytes);
-    Ok(network_event_id)
+    let mut workspace_event_id = [0u8; 32];
+    workspace_event_id[..workspace_bytes.len()].copy_from_slice(&workspace_bytes);
+    Ok(workspace_event_id)
 }
 
 fn current_timestamp_ms() -> u64 {
@@ -453,11 +453,11 @@ fn stable_author_id(peer_id: &str) -> [u8; 32] {
 }
 
 /// Ensure a workspace event exists and is valid for this peer.
-/// Returns the workspace event's event ID (to be used as network_event_id in messages).
+/// Returns the workspace event's event ID (to be used as workspace_event_id in messages).
 /// Creates a deterministic workspace event if none exists. Bypasses trust anchor guard
 /// for local creation. Deterministic means all peers with the same workspace_id will
 /// produce the same event blob and thus the same event hash.
-fn ensure_network_event(
+fn ensure_workspace_event(
     db: &rusqlite::Connection,
     recorded_by: &str,
     workspace_id: &[u8; 32],
@@ -520,21 +520,21 @@ fn ensure_network_event(
     Ok(event_id)
 }
 
-fn send_message(db_path: &str, network_hex: &str, content: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn send_message(db_path: &str, workspace_hex: &str, content: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let recorded_by = ensure_transport_peer_id_from_db(db_path)?;
     let db = open_connection(db_path)?;
     create_tables(&db)?;
 
-    let workspace_id = parse_network_hex(network_hex)?;
+    let workspace_id = parse_workspace_hex(workspace_hex)?;
 
-    // Ensure workspace event exists and is valid; use its hash as network_event_id
-    let network_event_id = ensure_network_event(&db, &recorded_by, &workspace_id)?;
+    // Ensure workspace event exists and is valid; use its hash as workspace_event_id
+    let workspace_event_id = ensure_workspace_event(&db, &recorded_by, &workspace_id)?;
 
     let author_id = stable_author_id(&recorded_by);
 
     let msg = ParsedEvent::Message(MessageEvent {
         created_at_ms: current_timestamp_ms(),
-        network_event_id,
+        workspace_event_id,
         author_id,
         content: content.to_string(),
     });
@@ -584,20 +584,20 @@ fn show_status(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + S
     Ok(())
 }
 
-fn generate_messages(db_path: &str, count: usize, network_hex: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn generate_messages(db_path: &str, count: usize, workspace_hex: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let recorded_by = ensure_transport_peer_id_from_db(db_path)?;
     let db = open_connection(db_path)?;
     create_tables(&db)?;
 
-    let workspace_id = parse_network_hex(network_hex)?;
-    let network_event_id = ensure_network_event(&db, &recorded_by, &workspace_id)?;
+    let workspace_id = parse_workspace_hex(workspace_hex)?;
+    let workspace_event_id = ensure_workspace_event(&db, &recorded_by, &workspace_id)?;
     let author_id: [u8; 32] = rand::random();
 
     db.execute("BEGIN", [])?;
     for i in 0..count {
         let msg = ParsedEvent::Message(MessageEvent {
             created_at_ms: current_timestamp_ms(),
-            network_event_id,
+            workspace_event_id,
             author_id,
             content: format!("Message {}", i),
         });
@@ -1010,7 +1010,7 @@ fn cli_keys(db_path: &str, summary: bool) -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
-fn cli_networks(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn cli_workspaces(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let recorded_by = load_transport_peer_id_from_db(db_path)?;
     let db = open_connection(db_path)?;
     create_tables(&db)?;
@@ -1018,22 +1018,22 @@ fn cli_networks(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + 
     let mut stmt = db.prepare(
         "SELECT event_id, workspace_id FROM workspaces WHERE recorded_by = ?1",
     )?;
-    let networks: Vec<(String, String)> = stmt
+    let workspaces: Vec<(String, String)> = stmt
         .query_map(rusqlite::params![&recorded_by], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?
         .collect::<Result<Vec<_>, _>>()?;
 
     println!("WORKSPACES ({}):", db_path);
-    if networks.is_empty() {
+    if workspaces.is_empty() {
         println!("  (none)");
     } else {
         use base64::Engine;
-        for (i, (eid, net_id_b64)) in networks.iter().enumerate() {
-            let name = if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(net_id_b64) {
+        for (i, (eid, ws_id_b64)) in workspaces.iter().enumerate() {
+            let name = if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(ws_id_b64) {
                 String::from_utf8_lossy(&bytes).trim_end_matches('\0').to_string()
             } else {
-                net_id_b64.clone()
+                ws_id_b64.clone()
             };
             println!("  {}. {} ({})", i + 1, name, short_id(eid));
         }

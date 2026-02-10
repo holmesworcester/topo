@@ -8,13 +8,13 @@ EXTENDS Naturals
 \*   device_invite (was invite(mode=peer))
 \*
 \* Workspace binding refinement:
-\*   A ForeignNet event is included alongside Net. Both are workspace
-\*   events, but the trust anchor binds to Net's id.
+\*   A ForeignWorkspace event is included alongside Workspace. Both are workspace
+\*   events, but the trust anchor binds to Workspace's id.
 \*   invite_accepted binds the trust anchor directly from its own
 \*   workspace_id field (first-write-wins; no pre-projection capture).
 \*   The Guard mechanism checks that the workspace event's id matches
-\*   the binding, structurally excluding ForeignNet from ever becoming
-\*   valid. InvForeignNetExcluded verifies this property.
+\*   the binding, structurally excluding ForeignWorkspace from ever becoming
+\*   valid. InvForeignWorkspaceExcluded verifies this property.
 \*
 \* Focuses on:
 \* - dependency ordering (dep edges)
@@ -43,8 +43,8 @@ EXTENDS Naturals
 VARIABLES recorded, valid, trustAnchor, connReq, connAck, connInvite, connPeer
 
 \* Event constants
-Net == "workspace"
-ForeignNet == "foreign_workspace"
+Workspace == "workspace"
+ForeignWorkspace == "foreign_workspace"
 InviteAcceptedAlice == "invite_accepted_alice"
 UserInviteBoot == "user_invite_bootstrap"
 UserAlice == "user_alice"
@@ -59,7 +59,7 @@ DeviceInviteBob == "device_invite_bob"
 PeerSharedBob == "peer_shared_bob"
 
 EVENTS == {
-    Net, ForeignNet, InviteAcceptedAlice, UserInviteBoot, UserAlice, AdminBootAlice,
+    Workspace, ForeignWorkspace, InviteAcceptedAlice, UserInviteBoot, UserAlice, AdminBootAlice,
     DeviceInviteAlice, PeerSharedAlice,
     UserInviteOngoing, InviteAcceptedBob, UserBob, DeviceInviteBob, PeerSharedBob
 }
@@ -67,22 +67,22 @@ EVENTS == {
 \* Workspace identity: each workspace event has a distinct workspace id.
 \* The trust anchor binds to a specific workspace id.
 WorkspaceIdOf(e) ==
-    IF e = Net THEN "main"
-    ELSE IF e = ForeignNet THEN "foreign"
+    IF e = Workspace THEN "main"
+    ELSE IF e = ForeignWorkspace THEN "foreign"
     ELSE "none"
 
 \* Combined dependency + signer edges.
 \* Each event lists the set of events that must be valid before it can project.
 Deps(e) ==
-    CASE e = Net -> {}
-       [] e = ForeignNet -> {}
+    CASE e = Workspace -> {}
+       [] e = ForeignWorkspace -> {}
        [] e = InviteAcceptedAlice -> {}
        \* user_invite(bootstrap): signed_by workspace, dep on workspace
-       [] e = UserInviteBoot -> {Net}
+       [] e = UserInviteBoot -> {Workspace}
        \* user: signed_by user_invite, dep on user_invite
        [] e = UserAlice -> {UserInviteBoot}
        \* admin(bootstrap): signed_by workspace, dep on workspace + user
-       [] e = AdminBootAlice -> {Net, UserAlice}
+       [] e = AdminBootAlice -> {Workspace, UserAlice}
        \* device_invite(first): signed_by user, dep on user
        [] e = DeviceInviteAlice -> {UserAlice}
        \* peer_shared: signed_by device_invite, dep on device_invite
@@ -101,7 +101,7 @@ Deps(e) ==
 \* Guard: workspace events require matching trust anchor binding.
 \* trustAnchor records the bound workspace id ("none" = unbound).
 Guard(e) ==
-    IF e \in {Net, ForeignNet} THEN trustAnchor = WorkspaceIdOf(e)
+    IF e \in {Workspace, ForeignWorkspace} THEN trustAnchor = WorkspaceIdOf(e)
     ELSE TRUE
 
 Init ==
@@ -199,15 +199,15 @@ InvDeps ==
         Deps(e) \subseteq valid
 
 \* Workspace validity requires matching trust anchor.
-InvNetAnchor ==
-    /\ (Net \in valid => trustAnchor = "main")
-    /\ (ForeignNet \in valid => trustAnchor = "foreign")
+InvWorkspaceAnchor ==
+    /\ (Workspace \in valid => trustAnchor = "main")
+    /\ (ForeignWorkspace \in valid => trustAnchor = "foreign")
 
 \* Foreign workspace event can never become valid.
 \* This is the key binding property: the invite determines which
 \* workspace the peer accepts, and only that workspace can project.
-InvForeignNetExcluded ==
-    ForeignNet \notin valid
+InvForeignWorkspaceExcluded ==
+    ForeignWorkspace \notin valid
 
 \* Connection request requires invite_accepted valid and user_invite recorded.
 InvConnReq ==
@@ -237,6 +237,6 @@ InvDeviceInviteChain ==
 
 \* Admin chain: admin_boot requires workspace and user.
 InvAdminChain ==
-    AdminBootAlice \in valid => (Net \in valid /\ UserAlice \in valid)
+    AdminBootAlice \in valid => (Workspace \in valid /\ UserAlice \in valid)
 
 ====

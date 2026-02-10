@@ -232,8 +232,8 @@ mod tests {
     }
 
     /// Create a Workspace event, insert it, and mark it valid (bypassing trust anchor
-    /// guard). Returns the event_id suitable for use as network_event_id in messages.
-    fn setup_network_event(conn: &Connection, recorded_by: &str) -> EventId {
+    /// guard). Returns the event_id suitable for use as workspace_event_id in messages.
+    fn setup_workspace_event(conn: &Connection, recorded_by: &str) -> EventId {
         let ws = ParsedEvent::Workspace(WorkspaceEvent {
             created_at_ms: now_ms(),
             public_key: [0xAA; 32],
@@ -267,11 +267,11 @@ mod tests {
     fn test_create_message_sync() {
         let conn = setup();
         let recorded_by = "peer1";
-        let net_eid = setup_network_event(&conn, recorded_by);
+        let net_eid = setup_workspace_event(&conn, recorded_by);
 
         let msg = ParsedEvent::Message(MessageEvent {
             created_at_ms: now_ms(),
-            network_event_id: net_eid,
+            workspace_event_id: net_eid,
             author_id: [2u8; 32],
             content: "hello".to_string(),
         });
@@ -306,7 +306,7 @@ mod tests {
         ).unwrap();
         assert_eq!(neg, 1);
 
-        // recorded_events (2: one for network event setup, one for the message)
+        // recorded_events (2: one for workspace event setup, one for the message)
         let rec: i64 = conn.query_row(
             "SELECT COUNT(*) FROM recorded_events WHERE peer_id = ?1",
             rusqlite::params![recorded_by], |row| row.get(0),
@@ -318,11 +318,11 @@ mod tests {
     fn test_create_reaction_chain() {
         let conn = setup();
         let recorded_by = "peer1";
-        let net_eid = setup_network_event(&conn, recorded_by);
+        let net_eid = setup_workspace_event(&conn, recorded_by);
 
         let msg = ParsedEvent::Message(MessageEvent {
             created_at_ms: now_ms(),
-            network_event_id: net_eid,
+            workspace_event_id: net_eid,
             author_id: [2u8; 32],
             content: "target".to_string(),
         });

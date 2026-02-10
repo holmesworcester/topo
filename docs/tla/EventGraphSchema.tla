@@ -38,14 +38,14 @@ EXTENDS Naturals, FiniteSets
 
 CONSTANTS ActiveEvents, Peers, Workspaces
 
-VARIABLES recorded, valid, trustAnchor, removed, inviteCarriedNet
+VARIABLES recorded, valid, trustAnchor, removed, inviteCarriedWorkspace
 
 \* ---- Event type constants ----
 
 \* Abstract workspace marker used in RawDeps/SignerDep to indicate
 \* "requires a workspace event". Not itself an event instance.
 \* Concrete workspace events are the workspace id strings from Workspaces.
-Net == "workspace"
+Workspace == "workspace"
 
 \* Identity / bootstrap
 InviteAccepted == "invite_accepted"
@@ -91,9 +91,9 @@ PeerRemoved == "peer_removed"
 \* Workspace events are the workspace id strings themselves.
 \* Workspaces must not overlap with FullEventTypes (checked by ASSUME below).
 
-AllNetEvents == Workspaces
-IsNetEvent(e) == e \in Workspaces
-NetId(e) == e
+AllWorkspaceEvents == Workspaces
+IsWorkspaceEvent(e) == e \in Workspaces
+WorkspaceEventId(e) == e
 
 \* ---- Event sets ----
 
@@ -112,7 +112,7 @@ FullEventTypes == {
 }
 
 \* Full event universe (singleton types + parameterized workspace events)
-FullEvents == FullEventTypes \cup AllNetEvents
+FullEvents == FullEventTypes \cup AllWorkspaceEvents
 
 \* Local-only events (no workspace dep, no trust anchor gate).
 \* Encrypted is local because it's a cryptographic wrapper; its workspace
@@ -120,11 +120,11 @@ FullEvents == FullEventTypes \cup AllNetEvents
 LocalRoots == {InviteAccepted, Peer, SecretKey, Encrypted}
 
 \* Singleton event types that require workspace to be valid
-NetGuardedEvents == FullEventTypes \ LocalRoots
+WorkspaceGuardedEvents == FullEventTypes \ LocalRoots
 
 \* Active events: singleton types from config + workspace instances if enabled
 EVENTS == (ActiveEvents \cap FullEventTypes)
-         \cup (IF Net \in ActiveEvents THEN AllNetEvents ELSE {})
+         \cup (IF Workspace \in ActiveEvents THEN AllWorkspaceEvents ELSE {})
 
 \* Identity event categories
 UserInviteEvents == {UserInviteBoot, UserInviteOngoing}
@@ -140,22 +140,22 @@ IdentityEvents == {
     AdminBoot, AdminOngoing,
     Peer,
     UserRemoved, PeerRemoved
-} \cup AllNetEvents
+} \cup AllWorkspaceEvents
 
 ContentEvents == {Message, MessageReaction, MessageDeletion}
 EncryptionEvents == {SecretKey, SecretShared, Encrypted}
 
-ASSUME (ActiveEvents \ {Net}) \subseteq FullEventTypes
+ASSUME (ActiveEvents \ {Workspace}) \subseteq FullEventTypes
 ASSUME Peers /= {}
 ASSUME Workspaces /= {}
 ASSUME Workspaces \cap FullEventTypes = {}
 
 \* ---- Dependency rules ----
-\* RawDeps and SignerDep use the abstract Net marker for workspace dependency.
-\* ResolveNet translates Net to the peer's bound workspace event instance.
+\* RawDeps and SignerDep use the abstract Workspace marker for workspace dependency.
+\* ResolveWorkspace translates Workspace to the peer's bound workspace event instance.
 
 RawDeps(e) ==
-    IF IsNetEvent(e) THEN {}
+    IF IsWorkspaceEvent(e) THEN {}
     ELSE
     CASE e = InviteAccepted -> {}
 
@@ -176,13 +176,13 @@ RawDeps(e) ==
        [] e = PeerSharedOngoing -> {}
 
        \* admin: bootstrap depends on workspace + user; ongoing depends on workspace + admin_boot
-       [] e = AdminBoot -> {Net}
-       [] e = AdminOngoing -> {Net, AdminBoot}
+       [] e = AdminBoot -> {Workspace}
+       [] e = AdminOngoing -> {Workspace, AdminBoot}
 
        [] e = Peer -> {}
 
        \* Content: message depends on workspace; reaction/deletion depend on message
-       [] e = Message -> {Net}
+       [] e = Message -> {Workspace}
        [] e = MessageReaction -> {Message}
        [] e = MessageDeletion -> {Message}
 
@@ -200,10 +200,10 @@ RawDeps(e) ==
 
 \* SignerDep: whose public key must be valid to verify the event's signature.
 SignerDep(e) ==
-    IF IsNetEvent(e) THEN {}
+    IF IsWorkspaceEvent(e) THEN {}
     ELSE
     CASE \* user_invite: bootstrap signed by workspace; ongoing signed by admin peer
-         e = UserInviteBoot -> {Net}
+         e = UserInviteBoot -> {Workspace}
        [] e = UserInviteOngoing -> {PeerSharedOngoing}
 
        \* device_invite: first signed by user; ongoing signed by linked peer
@@ -219,7 +219,7 @@ SignerDep(e) ==
        [] e = PeerSharedOngoing -> {DeviceInviteOngoing}
 
        \* admin: bootstrap signed by workspace; ongoing signed by admin peer
-       [] e = AdminBoot -> {Net}
+       [] e = AdminBoot -> {Workspace}
        [] e = AdminOngoing -> {PeerSharedOngoing}
 
        \* Content: signed by a linked peer
@@ -236,27 +236,27 @@ SignerDep(e) ==
 
        [] OTHER -> {}
 
-\* Resolve abstract Net marker to the peer's bound workspace event.
-\* Non-Net deps pass through filtered by EVENTS.
+\* Resolve abstract Workspace marker to the peer's bound workspace event.
+\* Non-Workspace deps pass through filtered by EVENTS.
 \* If peer is unbound and event needs workspace, an unsatisfiable
 \* placeholder blocks projection.
-ResolveNet(p, deps) ==
-    LET needsNet == Net \in deps
-        nonNet == (deps \ {Net}) \cap EVENTS
-        netDep == IF needsNet THEN
+ResolveWorkspace(p, deps) ==
+    LET needsWorkspace == Workspace \in deps
+        nonWorkspace == (deps \ {Workspace}) \cap EVENTS
+        workspaceDep == IF needsWorkspace THEN
                     IF trustAnchor[p] /= "none"
                     THEN {trustAnchor[p]}
                     ELSE {"__unbound__"}
                   ELSE {}
-    IN nonNet \cup netDep
+    IN nonWorkspace \cup workspaceDep
 
 \* Combined peer-resolved dependencies: structural + signer.
-PeerDeps(p, e) == ResolveNet(p, RawDeps(e) \cup SignerDep(e))
+PeerDeps(p, e) == ResolveWorkspace(p, RawDeps(e) \cup SignerDep(e))
 
 \* ---- Guards ----
 
 \* Workspace events require matching trust anchor binding.
-Guard(p, e) == IF IsNetEvent(e) THEN trustAnchor[p] = NetId(e) ELSE TRUE
+Guard(p, e) == IF IsWorkspaceEvent(e) THEN trustAnchor[p] = WorkspaceEventId(e) ELSE TRUE
 
 \* ---- State machine ----
 
@@ -265,7 +265,7 @@ Init ==
     /\ valid = [p \in Peers |-> {}]
     /\ trustAnchor = [p \in Peers |-> "none"]
     /\ removed = [p \in Peers |-> {}]
-    /\ inviteCarriedNet = [p \in Peers |-> "none"]
+    /\ inviteCarriedWorkspace = [p \in Peers |-> "none"]
 
 \* Record captures the event-carried workspace_id at ingress time.
 \* For invite_accepted, the event carries a specific workspace_id chosen
@@ -276,9 +276,9 @@ Record(p, e) ==
     /\ e \in EVENTS
     /\ e \notin recorded[p]
     /\ recorded' = [recorded EXCEPT ![p] = @ \cup {e}]
-    /\ IF e = InviteAccepted /\ inviteCarriedNet[p] = "none"
-       THEN \E n \in Workspaces: inviteCarriedNet' = [inviteCarriedNet EXCEPT ![p] = n]
-       ELSE UNCHANGED inviteCarriedNet
+    /\ IF e = InviteAccepted /\ inviteCarriedWorkspace[p] = "none"
+       THEN \E n \in Workspaces: inviteCarriedWorkspace' = [inviteCarriedWorkspace EXCEPT ![p] = n]
+       ELSE UNCHANGED inviteCarriedWorkspace
     /\ UNCHANGED <<valid, trustAnchor, removed>>
 
 \* invite_accepted binds the trust anchor from its event-carried workspace_id.
@@ -293,13 +293,13 @@ Project(p, e) ==
     /\ Guard(p, e)
     \* Mismatch rejection: invite_accepted blocked if anchor already set differently
     /\ IF e = InviteAccepted /\ trustAnchor[p] /= "none"
-       THEN trustAnchor[p] = inviteCarriedNet[p]
+       THEN trustAnchor[p] = inviteCarriedWorkspace[p]
        ELSE TRUE
     /\ valid' = [valid EXCEPT ![p] = @ \cup {e}]
     \* Trust anchor binding: deterministic from event-carried workspace_id.
     /\ trustAnchor' =
         IF e = InviteAccepted /\ trustAnchor[p] = "none"
-        THEN [trustAnchor EXCEPT ![p] = inviteCarriedNet[p]]
+        THEN [trustAnchor EXCEPT ![p] = inviteCarriedWorkspace[p]]
         ELSE trustAnchor
     /\ removed' =
         IF e = UserRemoved
@@ -307,10 +307,10 @@ Project(p, e) ==
         ELSE IF e = PeerRemoved
         THEN [removed EXCEPT ![p] = @ \cup {"peer_target"}]
         ELSE removed
-    /\ UNCHANGED <<recorded, inviteCarriedNet>>
+    /\ UNCHANGED <<recorded, inviteCarriedWorkspace>>
 
 Stutter ==
-    UNCHANGED <<recorded, valid, trustAnchor, removed, inviteCarriedNet>>
+    UNCHANGED <<recorded, valid, trustAnchor, removed, inviteCarriedWorkspace>>
 
 Next ==
     \/ \E p \in Peers, e \in EVENTS: Record(p, e)
@@ -318,7 +318,7 @@ Next ==
     \/ Stutter
 
 Spec ==
-    Init /\ [][Next]_<<recorded, valid, trustAnchor, removed, inviteCarriedNet>>
+    Init /\ [][Next]_<<recorded, valid, trustAnchor, removed, inviteCarriedWorkspace>>
 
 \* ---- Invariants ----
 
@@ -328,7 +328,7 @@ TypeOK ==
     /\ \A p \in Peers: valid[p] \subseteq recorded[p]
     /\ trustAnchor \in [Peers -> Workspaces \cup {"none"}]
     /\ removed \in [Peers -> SUBSET {"user_target", "peer_target"}]
-    /\ inviteCarriedNet \in [Peers -> Workspaces \cup {"none"}]
+    /\ inviteCarriedWorkspace \in [Peers -> Workspaces \cup {"none"}]
 
 \* Every valid event has all its peer-resolved dependencies valid.
 InvDeps ==
@@ -338,10 +338,10 @@ InvDeps ==
 \* Every valid event has its signer dependency valid (peer-resolved).
 InvSigner ==
     \A p \in Peers:
-        \A e \in valid[p]: ResolveNet(p, SignerDep(e)) \subseteq valid[p]
+        \A e \in valid[p]: ResolveWorkspace(p, SignerDep(e)) \subseteq valid[p]
 
 \* Workspace event validity requires matching trust anchor.
-InvNetAnchor ==
+InvWorkspaceAnchor ==
     \A p \in Peers:
         \A n \in Workspaces:
             (n \in valid[p]) => trustAnchor[p] = n
@@ -361,14 +361,14 @@ InvTrustAnchorSource ==
 \* Trust anchor always matches the event-carried workspace_id.
 InvTrustAnchorMatchesCarried ==
     \A p \in Peers:
-        (trustAnchor[p] /= "none") => (trustAnchor[p] = inviteCarriedNet[p])
+        (trustAnchor[p] /= "none") => (trustAnchor[p] = inviteCarriedWorkspace[p])
 
 \* All non-local singleton events that are valid require some workspace to be valid.
 InvAllValidRequireWorkspace ==
-    IF AllNetEvents \cap EVENTS /= {}
+    IF AllWorkspaceEvents \cap EVENTS /= {}
     THEN \A p \in Peers:
         \A e \in valid[p]:
-            e \in LocalRoots \/ IsNetEvent(e) \/ (\E ne \in AllNetEvents: ne \in valid[p])
+            e \in LocalRoots \/ IsWorkspaceEvent(e) \/ (\E ne \in AllWorkspaceEvents: ne \in valid[p])
     ELSE TRUE
 
 \* User invite chain: user requires its invite to be valid.
@@ -419,9 +419,9 @@ InvRemovalExclusion ==
     ELSE TRUE
 
 \* Message requires workspace (network event).
-InvMessageNetwork ==
-    IF Message \in EVENTS /\ AllNetEvents \cap EVENTS /= {}
-    THEN \A p \in Peers: (Message \in valid[p]) => (\E ne \in AllNetEvents: ne \in valid[p])
+InvMessageWorkspace ==
+    IF Message \in EVENTS /\ AllWorkspaceEvents \cap EVENTS /= {}
+    THEN \A p \in Peers: (Message \in valid[p]) => (\E ne \in AllWorkspaceEvents: ne \in valid[p])
     ELSE TRUE
 
 \* Encrypted content requires secret_key.

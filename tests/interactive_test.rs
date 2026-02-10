@@ -147,7 +147,7 @@ fn test_create_channel_and_send() {
     assert_contains(&out, "2 #random", "channels list");
     assert_contains(&out, "Switched to channel #2: random", "channel switch");
     assert_contains(&out, "1. [alice] in random", "message in random channel");
-    // Messages are workspace-wide (network_event_id = workspace dep, not per-channel filter),
+    // Messages are workspace-wide (workspace_event_id = workspace dep, not per-channel filter),
     // so after switching back to general, the message is still visible.
     assert_contains(&out, "1. [alice] in random", "message visible from general too");
 }

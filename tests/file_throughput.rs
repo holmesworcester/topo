@@ -88,7 +88,7 @@ fn create_prereqs(
     // Message
     let msg = ParsedEvent::Message(MessageEvent {
         created_at_ms: now_ms(),
-        network_event_id: ws_eid,
+        workspace_event_id: ws_eid,
         author_id: [2u8; 32],
         content: "file parent".to_string(),
     });

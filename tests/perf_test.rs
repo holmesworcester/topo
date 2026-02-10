@@ -123,11 +123,11 @@ async fn perf_continuous_10k() {
     // so we do smaller batches to let sync interleave.
     let alice_db = alice.db_path.clone();
     let alice_author = alice.author_id;
-    let alice_channel = alice.network_event_id;
+    let alice_channel = alice.workspace_event_id;
     let alice_identity = alice.identity.clone();
     let bob_db = bob.db_path.clone();
     let bob_author = bob.author_id;
-    let bob_channel = bob.network_event_id;
+    let bob_channel = bob.workspace_event_id;
     let bob_identity = bob.identity.clone();
 
     let alice_writer = std::thread::spawn(move || {
@@ -295,7 +295,7 @@ async fn perf_sync_500k() {
 /// Insert messages in small batches, yielding between batches so sync can interleave.
 fn inject_messages_batched(
     db_path: &str,
-    network_event_id: [u8; 32],
+    workspace_event_id: [u8; 32],
     author_id: [u8; 32],
     name: &str,
     total: usize,
@@ -320,7 +320,7 @@ fn inject_messages_batched(
                 .as_millis() as u64;
             let msg = ParsedEvent::Message(MessageEvent {
                 created_at_ms,
-                network_event_id,
+                workspace_event_id,
                 author_id,
                 content: format!("Msg {} from {}", j, name),
             });
