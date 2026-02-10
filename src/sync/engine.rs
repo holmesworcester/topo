@@ -9,9 +9,8 @@
 // 4. Initiator receives DoneAck, waits for responder's DataDone, exits.
 // Both sides gate exit on data-plane drain confirmation, not just control.
 
-use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -267,15 +266,10 @@ pub fn batch_writer(
 /// - `shutdown_tx`: forced shutdown (timeout fallback only)
 /// - `data_drained_rx`: signals when peer's DataDone marker is received (all data consumed)
 /// - `JoinHandle`: task handle
-///
-/// When `dedup` is provided, events already claimed by another concurrent session
-/// are skipped (no redundant batch_writer processing). Cost: one mutex lock + hash
-/// insert per event — negligible.
 pub fn spawn_data_receiver<R>(
     mut data_recv: R,
     ingest_tx: mpsc::Sender<(EventId, Vec<u8>)>,
     bytes_received: Arc<AtomicU64>,
-    dedup: Option<Arc<Mutex<HashSet<EventId>>>>,
 ) -> (oneshot::Sender<()>, oneshot::Receiver<()>, tokio::task::JoinHandle<()>)
 where
     R: StreamRecv + Send + 'static,
@@ -294,11 +288,6 @@ where
                         Ok(SyncMessage::Event { blob }) => {
                             bytes_received.fetch_add(blob.len() as u64, Ordering::Relaxed);
                             let event_id = hash_event(&blob);
-                            if let Some(ref set) = dedup {
-                                if !set.lock().unwrap().insert(event_id) {
-                                    continue;
-                                }
-                            }
                             if ingest_tx.send((event_id, blob)).await.is_err() {
                                 warn!("Ingest channel closed");
                                 break;
@@ -542,7 +531,7 @@ where
     let mut events_sent: u64 = 0;
     let mut bytes_sent: u64 = 0;
     let (shutdown_tx, data_drained_rx, recv_handle) =
-        spawn_data_receiver(data_recv, ingest_tx.clone(), bytes_received.clone(), None);
+        spawn_data_receiver(data_recv, ingest_tx.clone(), bytes_received.clone());
 
     let initial_msg = neg.initiate()?;
     control.send(&SyncMessage::NegOpen { msg: initial_msg }).await?;
@@ -779,9 +768,6 @@ where
 
 /// Run sync as the responder (server role) with dual streams.
 ///
-/// When `dedup` is provided, events already claimed by another concurrent
-/// session are skipped at the data receiver level.
-///
 /// When `shared_ingest` is provided, events are sent to the shared channel
 /// instead of spawning a per-session batch_writer. This eliminates SQLite
 /// write contention when multiple sources sync concurrently.
@@ -791,7 +777,6 @@ pub async fn run_sync_responder_dual<C, S, R>(
     timeout_secs: u64,
     peer_id: &str,
     recorded_by: &str,
-    dedup: Option<Arc<Mutex<HashSet<EventId>>>>,
     shared_ingest: Option<mpsc::Sender<(EventId, Vec<u8>)>>,
 ) -> Result<SyncStats, Box<dyn std::error::Error + Send + Sync>>
 where
@@ -843,7 +828,7 @@ where
     };
 
     let (shutdown_tx, data_drained_rx, recv_handle) =
-        spawn_data_receiver(data_recv, ingest_tx.clone(), bytes_received.clone(), dedup);
+        spawn_data_receiver(data_recv, ingest_tx.clone(), bytes_received.clone());
 
     let mut events_sent: u64 = 0;
     let mut bytes_sent: u64 = 0;
@@ -989,7 +974,7 @@ pub async fn accept_loop(
     db_path: &str,
     recorded_by: &str,
     endpoint: quinn::Endpoint,
-    allowed_peers: Option<crate::transport::AllowedPeers>,
+    _allowed_peers: Option<crate::transport::AllowedPeers>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     {
         let db = open_connection(db_path)?;
@@ -1113,7 +1098,7 @@ pub async fn accept_loop(
 
                     if let Err(e) = run_sync_responder_dual(
                         conn, &db_path_owned, 60, &peer_id, &recorded_by_owned,
-                        None, Some(ingest_clone.clone()),
+                        Some(ingest_clone.clone()),
                     ).await {
                         warn!("Responder session error: {}", e);
                     }
