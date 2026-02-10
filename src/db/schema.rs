@@ -115,7 +115,7 @@ fn migrate_messages_v1_to_v2(conn: &Connection) -> SqliteResult<()> {
         -- Create the new messages table with (recorded_by, message_id) PK
         CREATE TABLE messages_v2 (
             message_id TEXT NOT NULL,
-            workspace_event_id TEXT NOT NULL,
+            workspace_id TEXT NOT NULL,
             author_id TEXT NOT NULL,
             content TEXT NOT NULL,
             created_at INTEGER NOT NULL,
@@ -124,7 +124,7 @@ fn migrate_messages_v1_to_v2(conn: &Connection) -> SqliteResult<()> {
         );
 
         -- Backfill from old table with empty recorded_by sentinel
-        INSERT INTO messages_v2 (message_id, workspace_event_id, author_id, content, created_at, recorded_by)
+        INSERT INTO messages_v2 (message_id, workspace_id, author_id, content, created_at, recorded_by)
             SELECT message_id, channel_id, author_id, content, created_at, ''
             FROM messages;
 
@@ -135,7 +135,7 @@ fn migrate_messages_v1_to_v2(conn: &Connection) -> SqliteResult<()> {
         ALTER TABLE messages_v2 RENAME TO messages;
 
         -- Recreate indexes on the new table
-        CREATE INDEX IF NOT EXISTS idx_messages_workspace ON messages(workspace_event_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_messages_workspace ON messages(workspace_id, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_messages_recorded ON messages(recorded_by, created_at DESC);
 
         COMMIT;
@@ -215,14 +215,14 @@ pub fn create_tables(conn: &Connection) -> SqliteResult<()> {
         -- Message projection table
         CREATE TABLE IF NOT EXISTS messages (
             message_id TEXT NOT NULL,
-            workspace_event_id TEXT NOT NULL,
+            workspace_id TEXT NOT NULL,
             author_id TEXT NOT NULL,
             content TEXT NOT NULL,
             created_at INTEGER NOT NULL,
             recorded_by TEXT NOT NULL DEFAULT '',
             PRIMARY KEY (recorded_by, message_id)
         );
-        CREATE INDEX IF NOT EXISTS idx_messages_workspace ON messages(workspace_event_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_messages_workspace ON messages(workspace_id, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_messages_recorded ON messages(recorded_by, created_at DESC);
 
         -- Per-tenant receive/create journal
@@ -398,7 +398,7 @@ mod tests {
 
         // Verify PK is now (recorded_by, message_id) by inserting same message_id with different recorded_by
         conn.execute(
-            "INSERT INTO messages (message_id, workspace_event_id, author_id, content, created_at, recorded_by)
+            "INSERT INTO messages (message_id, workspace_id, author_id, content, created_at, recorded_by)
              VALUES ('msg1', 'ch1', 'auth1', 'Hello', 1000, 'peer_abc')",
             [],
         ).unwrap();

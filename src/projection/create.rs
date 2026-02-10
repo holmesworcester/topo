@@ -258,7 +258,6 @@ mod tests {
         let ws = ParsedEvent::Workspace(WorkspaceEvent {
             created_at_ms: now_ms(),
             public_key: [0xAA; 32],
-            workspace_id: [0xBB; 32],
         });
         event_id_or_blocked(create_event_sync(conn, recorded_by, &ws)).unwrap()
     }
@@ -277,11 +276,9 @@ mod tests {
 
         let workspace_key = SigningKey::generate(&mut rng);
         let workspace_pub = workspace_key.verifying_key().to_bytes();
-        let workspace_id: [u8; 32] = rand::random();
         let net_event = ParsedEvent::Workspace(WorkspaceEvent {
             created_at_ms: now_ms(),
             public_key: workspace_pub,
-            workspace_id,
         });
         let net_blob = events::encode_event(&net_event).unwrap();
         let net_eid = create_event_sync(conn, recorded_by, &net_event);
@@ -291,7 +288,7 @@ mod tests {
         let ia_event = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
             created_at_ms: now_ms(),
             invite_event_id: net_eid,
-            workspace_id,
+            workspace_id: net_eid,
         });
         let _ia_eid = create_event_sync(conn, recorded_by, &ia_event).unwrap();
 
@@ -302,7 +299,7 @@ mod tests {
         let uib = ParsedEvent::UserInviteBoot(UserInviteBootEvent {
             created_at_ms: now_ms(),
             public_key: invite_key.verifying_key().to_bytes(),
-            workspace_id,
+            workspace_id: net_eid,
             signed_by: net_eid,
             signer_type: 1,
             signature: [0u8; 64],
@@ -352,7 +349,7 @@ mod tests {
 
         let msg = ParsedEvent::Message(MessageEvent {
             created_at_ms: now_ms(),
-            workspace_event_id: net_eid,
+            workspace_id: net_eid,
             author_id: [2u8; 32],
             content: "hello".to_string(),
             signed_by: signer_eid,
@@ -395,7 +392,7 @@ mod tests {
 
         let msg = ParsedEvent::Message(MessageEvent {
             created_at_ms: now_ms(),
-            workspace_event_id: net_eid,
+            workspace_id: net_eid,
             author_id: [2u8; 32],
             content: "target".to_string(),
             signed_by: signer_eid,

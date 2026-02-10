@@ -48,15 +48,15 @@ impl<'a> TenantDb<'a> {
     pub fn insert_message(
         &self,
         message_id: &str,
-        workspace_event_id: &str,
+        workspace_id: &str,
         author_id: &str,
         content: &str,
         created_at: i64,
     ) -> SqliteResult<()> {
         self.conn.execute(
-            "INSERT OR IGNORE INTO messages (message_id, workspace_event_id, author_id, content, created_at, recorded_by)
+            "INSERT OR IGNORE INTO messages (message_id, workspace_id, author_id, content, created_at, recorded_by)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![message_id, workspace_event_id, author_id, content, created_at, self.peer_id],
+            params![message_id, workspace_id, author_id, content, created_at, self.peer_id],
         )?;
         Ok(())
     }

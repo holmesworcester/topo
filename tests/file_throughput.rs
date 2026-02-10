@@ -79,14 +79,13 @@ fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (EventId, Signin
     let mut rng = rand::thread_rng();
 
     let workspace_key = SigningKey::generate(&mut rng);
-    let workspace_id: [u8; 32] = rand::random();
     let net = ParsedEvent::Workspace(WorkspaceEvent {
         created_at_ms: now_ms(),
         public_key: workspace_key.verifying_key().to_bytes(),
-        workspace_id,
     });
     let net_blob = events::encode_event(&net).unwrap();
     let net_eid = insert_event_raw(conn, recorded_by, &net_blob);
+    let workspace_id = net_eid;
 
     let ia = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
         created_at_ms: now_ms(),
@@ -164,7 +163,7 @@ fn create_prereqs(
     // Signed message
     let msg = ParsedEvent::Message(MessageEvent {
         created_at_ms: now_ms(),
-        workspace_event_id: [1u8; 32],
+        workspace_id: [1u8; 32],
         author_id: [2u8; 32],
         content: "file parent".to_string(),
         signed_by: signer_eid,

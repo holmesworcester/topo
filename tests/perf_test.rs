@@ -127,13 +127,13 @@ async fn perf_continuous_10k() {
     // so we do smaller batches to let sync interleave.
     let alice_db = alice.db_path.clone();
     let alice_author = alice.author_id;
-    let alice_channel = alice.workspace_event_id;
+    let alice_channel = alice.workspace_id;
     let alice_identity = alice.identity.clone();
     let alice_signer_eid = alice.peer_shared_event_id.expect("alice has identity");
     let alice_signing_key = alice.peer_shared_signing_key.clone().expect("alice has signing key");
     let bob_db = bob.db_path.clone();
     let bob_author = bob.author_id;
-    let bob_channel = bob.workspace_event_id;
+    let bob_channel = bob.workspace_id;
     let bob_identity = bob.identity.clone();
     let bob_signer_eid = bob.peer_shared_event_id.expect("bob has identity");
     let bob_signing_key = bob.peer_shared_signing_key.clone().expect("bob has signing key");
@@ -316,7 +316,7 @@ async fn perf_sync_500k() {
 /// Messages are signed with the given PeerShared key for proper identity chain verification.
 fn inject_messages_batched(
     db_path: &str,
-    workspace_event_id: [u8; 32],
+    workspace_id: [u8; 32],
     author_id: [u8; 32],
     name: &str,
     total: usize,
@@ -343,7 +343,7 @@ fn inject_messages_batched(
                 .as_millis() as u64;
             let msg = ParsedEvent::Message(MessageEvent {
                 created_at_ms,
-                workspace_event_id,
+                workspace_id,
                 author_id,
                 content: format!("Msg {} from {}", j, name),
                 signed_by: signer_eid,

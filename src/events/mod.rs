@@ -354,7 +354,7 @@ mod tests {
     fn test_message_roundtrip() {
         let msg = MessageEvent {
             created_at_ms: 1234567890123,
-            workspace_event_id: [1u8; 32],
+            workspace_id: [1u8; 32],
             author_id: [2u8; 32],
             content: "Hello, world!".to_string(),
             signed_by: [0u8; 32],
@@ -440,11 +440,10 @@ mod tests {
         let ws = WorkspaceEvent {
             created_at_ms: 4444444444444,
             public_key: [10u8; 32],
-            workspace_id: [11u8; 32],
         };
         let event = ParsedEvent::Workspace(ws);
         let blob = encode_event(&event).unwrap();
-        assert_eq!(blob.len(), 73);
+        assert_eq!(blob.len(), 41);
         let parsed = parse_event(&blob).unwrap();
         assert_eq!(parsed, event);
     }
@@ -747,7 +746,7 @@ mod tests {
         // Empty content
         let msg = ParsedEvent::Message(MessageEvent {
             created_at_ms: 100,
-            workspace_event_id: [0u8; 32],
+            workspace_id: [0u8; 32],
             author_id: [0u8; 32],
             content: "".to_string(),
             signed_by: [0u8; 32],
@@ -763,7 +762,7 @@ mod tests {
         let big_content = "x".repeat(1000);
         let msg2 = ParsedEvent::Message(MessageEvent {
             created_at_ms: 200,
-            workspace_event_id: [0u8; 32],
+            workspace_id: [0u8; 32],
             author_id: [0u8; 32],
             content: big_content.clone(),
             signed_by: [0u8; 32],
@@ -780,7 +779,7 @@ mod tests {
     fn test_extract_created_at_ms() {
         let msg = ParsedEvent::Message(MessageEvent {
             created_at_ms: 42424242424242,
-            workspace_event_id: [0u8; 32],
+            workspace_id: [0u8; 32],
             author_id: [0u8; 32],
             content: "test".to_string(),
             signed_by: [0u8; 32],
@@ -796,7 +795,7 @@ mod tests {
         let workspace_id = [1u8; 32];
         let msg = ParsedEvent::Message(MessageEvent {
             created_at_ms: 100,
-            workspace_event_id: workspace_id,
+            workspace_id: workspace_id,
             author_id: [2u8; 32],
             content: "hello".to_string(),
             signed_by: [0u8; 32],
@@ -881,7 +880,6 @@ mod tests {
         let ws = ParsedEvent::Workspace(WorkspaceEvent {
             created_at_ms: 100,
             public_key: [0u8; 32],
-            workspace_id: [0u8; 32],
         });
         assert!(ws.signer_fields().is_none());
 
@@ -911,7 +909,7 @@ mod tests {
         let msg_signer = [77u8; 32];
         let msg = ParsedEvent::Message(MessageEvent {
             created_at_ms: 100,
-            workspace_event_id: [0u8; 32],
+            workspace_id: [0u8; 32],
             author_id: [0u8; 32],
             content: "".to_string(),
             signed_by: msg_signer,
@@ -939,7 +937,7 @@ mod tests {
     fn test_extract_event_type() {
         let msg_blob = encode_event(&ParsedEvent::Message(MessageEvent {
             created_at_ms: 0,
-            workspace_event_id: [0u8; 32],
+            workspace_id: [0u8; 32],
             author_id: [0u8; 32],
             content: "".to_string(),
             signed_by: [0u8; 32],
@@ -981,7 +979,6 @@ mod tests {
         let ws_blob = encode_event(&ParsedEvent::Workspace(WorkspaceEvent {
             created_at_ms: 0,
             public_key: [0u8; 32],
-            workspace_id: [0u8; 32],
         }))
         .unwrap();
         assert_eq!(extract_event_type(&ws_blob), Some(EVENT_TYPE_WORKSPACE));

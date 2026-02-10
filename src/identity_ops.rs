@@ -18,7 +18,7 @@ fn now_ms() -> u64 {
 
 /// Result of bootstrapping a full workspace identity chain.
 pub struct IdentityChain {
-    pub workspace_event_id: EventId,
+    pub workspace_id: EventId,
     pub workspace_key: SigningKey,
     pub user_invite_event_id: EventId,
     pub invite_key: SigningKey,
@@ -57,8 +57,7 @@ pub struct LinkChain {
 pub struct InviteData {
     pub invite_event_id: EventId,
     pub invite_key: SigningKey,
-    pub workspace_id: [u8; 32],
-    pub workspace_event_id: EventId,
+    pub workspace_id: EventId,
     pub invite_type: InviteType,
 }
 
@@ -76,7 +75,6 @@ pub enum InviteType {
 pub fn bootstrap_workspace(
     conn: &Connection,
     recorded_by: &str,
-    workspace_id: [u8; 32],
     db_path: &str,
 ) -> Result<IdentityChain, Box<dyn std::error::Error + Send + Sync>> {
     let mut rng = rand::thread_rng();
@@ -87,9 +85,8 @@ pub fn bootstrap_workspace(
     let net_evt = ParsedEvent::Workspace(WorkspaceEvent {
         created_at_ms: now_ms(),
         public_key: workspace_pub,
-        workspace_id: workspace_id,
     });
-    let workspace_event_id = event_id_or_blocked(create_event_sync(conn, recorded_by, &net_evt))?;
+    let workspace_id = event_id_or_blocked(create_event_sync(conn, recorded_by, &net_evt))?;
 
     // 2. UserInviteBoot (signed by workspace_key) — blocked until Workspace is valid
     let invite_key = SigningKey::generate(&mut rng);
@@ -98,7 +95,7 @@ pub fn bootstrap_workspace(
         created_at_ms: now_ms(),
         public_key: invite_pub,
         workspace_id: workspace_id,
-        signed_by: workspace_event_id,
+        signed_by: workspace_id,
         signer_type: 1,
         signature: [0u8; 64],
     });
@@ -164,7 +161,7 @@ pub fn bootstrap_workspace(
         created_at_ms: now_ms(),
         public_key: admin_pub,
         user_event_id,
-        signed_by: workspace_event_id,
+        signed_by: workspace_id,
         signer_type: 1,
         signature: [0u8; 64],
     });
@@ -181,7 +178,7 @@ pub fn bootstrap_workspace(
     )?;
 
     Ok(IdentityChain {
-        workspace_event_id,
+        workspace_id,
         workspace_key,
         user_invite_event_id,
         invite_key,
@@ -203,8 +200,7 @@ pub fn create_user_invite(
     conn: &Connection,
     recorded_by: &str,
     workspace_key: &SigningKey,
-    workspace_event_id: &EventId,
-    workspace_id: [u8; 32],
+    workspace_id: &EventId,
 ) -> Result<InviteData, Box<dyn std::error::Error + Send + Sync>> {
     let mut rng = rand::thread_rng();
     let invite_key = SigningKey::generate(&mut rng);
@@ -213,8 +209,8 @@ pub fn create_user_invite(
     let evt = ParsedEvent::UserInviteBoot(UserInviteBootEvent {
         created_at_ms: now_ms(),
         public_key: invite_pub,
-        workspace_id: workspace_id,
-        signed_by: *workspace_event_id,
+        workspace_id: *workspace_id,
+        signed_by: *workspace_id,
         signer_type: 1,
         signature: [0u8; 64],
     });
@@ -225,8 +221,7 @@ pub fn create_user_invite(
     Ok(InviteData {
         invite_event_id,
         invite_key,
-        workspace_id,
-        workspace_event_id: *workspace_event_id,
+        workspace_id: *workspace_id,
         invite_type: InviteType::User,
     })
 }
@@ -241,7 +236,7 @@ pub fn accept_user_invite(
     recorded_by: &str,
     invite_key: &SigningKey,
     invite_event_id: &EventId,
-    workspace_id: [u8; 32],
+    workspace_id: EventId,
     db_path: &str,
 ) -> Result<JoinChain, Box<dyn std::error::Error + Send + Sync>> {
     let mut rng = rand::thread_rng();
@@ -324,8 +319,7 @@ pub fn create_device_link_invite(
     recorded_by: &str,
     user_key: &SigningKey,
     user_event_id: &EventId,
-    workspace_id: [u8; 32],
-    workspace_event_id: &EventId,
+    workspace_id: &EventId,
 ) -> Result<InviteData, Box<dyn std::error::Error + Send + Sync>> {
     let mut rng = rand::thread_rng();
     let device_invite_key = SigningKey::generate(&mut rng);
@@ -345,8 +339,7 @@ pub fn create_device_link_invite(
     Ok(InviteData {
         invite_event_id,
         invite_key: device_invite_key,
-        workspace_id,
-        workspace_event_id: *workspace_event_id,
+        workspace_id: *workspace_id,
         invite_type: InviteType::DeviceLink {
             user_event_id: *user_event_id,
         },
@@ -359,7 +352,7 @@ pub fn accept_device_link(
     recorded_by: &str,
     device_invite_key: &SigningKey,
     device_invite_event_id: &EventId,
-    workspace_id: [u8; 32],
+    workspace_id: EventId,
     db_path: &str,
 ) -> Result<LinkChain, Box<dyn std::error::Error + Send + Sync>> {
     let mut rng = rand::thread_rng();

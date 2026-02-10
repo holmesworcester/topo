@@ -4,7 +4,7 @@ use super::{EventError, ParsedEvent, EVENT_TYPE_MESSAGE};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageEvent {
     pub created_at_ms: u64,
-    pub workspace_event_id: [u8; 32],
+    pub workspace_id: [u8; 32],
     pub author_id: [u8; 32],
     pub content: String,
     pub signed_by: [u8; 32],
@@ -41,8 +41,8 @@ pub fn parse_message(blob: &[u8]) -> Result<ParsedEvent, EventError> {
 
     let created_at_ms = u64::from_le_bytes(blob[1..9].try_into().unwrap());
 
-    let mut workspace_event_id = [0u8; 32];
-    workspace_event_id.copy_from_slice(&blob[9..41]);
+    let mut workspace_id = [0u8; 32];
+    workspace_id.copy_from_slice(&blob[9..41]);
 
     let mut author_id = [0u8; 32];
     author_id.copy_from_slice(&blob[41..73]);
@@ -69,7 +69,7 @@ pub fn parse_message(blob: &[u8]) -> Result<ParsedEvent, EventError> {
 
     Ok(ParsedEvent::Message(MessageEvent {
         created_at_ms,
-        workspace_event_id,
+        workspace_id,
         author_id,
         content,
         signed_by,
@@ -94,7 +94,7 @@ pub fn encode_message(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
 
     buf.push(EVENT_TYPE_MESSAGE);
     buf.extend_from_slice(&msg.created_at_ms.to_le_bytes());
-    buf.extend_from_slice(&msg.workspace_event_id);
+    buf.extend_from_slice(&msg.workspace_id);
     buf.extend_from_slice(&msg.author_id);
     buf.extend_from_slice(&(content_bytes.len() as u16).to_le_bytes());
     buf.extend_from_slice(content_bytes);

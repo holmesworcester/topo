@@ -547,7 +547,6 @@ mod tests {
         let ws = ParsedEvent::Workspace(WorkspaceEvent {
             created_at_ms: now_ms(),
             public_key: [0xAA; 32],
-            workspace_id: [0xBB; 32],
         });
         let blob = events::encode_event(&ws).unwrap();
         let eid = insert_event_raw(conn, recorded_by, &blob);
@@ -568,11 +567,9 @@ mod tests {
         // 1. Workspace
         let workspace_key = SigningKey::generate(&mut rng);
         let workspace_pub = workspace_key.verifying_key().to_bytes();
-        let workspace_id: [u8; 32] = rand::random();
         let net_event = ParsedEvent::Workspace(WorkspaceEvent {
             created_at_ms: now_ms(),
             public_key: workspace_pub,
-            workspace_id,
         });
         let net_blob = events::encode_event(&net_event).unwrap();
         let net_eid = insert_event_raw(conn, recorded_by, &net_blob);
@@ -581,7 +578,7 @@ mod tests {
         let ia_event = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
             created_at_ms: now_ms(),
             invite_event_id: net_eid,
-            workspace_id,
+            workspace_id: net_eid,
         });
         let ia_blob = events::encode_event(&ia_event).unwrap();
         let ia_eid = insert_event_raw(conn, recorded_by, &ia_blob);
@@ -594,7 +591,7 @@ mod tests {
         let uib = UserInviteBootEvent {
             created_at_ms: now_ms(),
             public_key: invite_pub,
-            workspace_id,
+            workspace_id: net_eid,
             signed_by: net_eid,
             signer_type: 1,
             signature: [0u8; 64],
@@ -668,11 +665,9 @@ mod tests {
         // 1. Workspace
         let workspace_key = SigningKey::generate(&mut rng);
         let workspace_pub = workspace_key.verifying_key().to_bytes();
-        let workspace_id: [u8; 32] = rand::random();
         let net_event = ParsedEvent::Workspace(WorkspaceEvent {
             created_at_ms: now_ms(),
             public_key: workspace_pub,
-            workspace_id,
         });
         let net_blob = events::encode_event(&net_event).unwrap();
         let net_eid = hash_event(&net_blob);
@@ -681,7 +676,7 @@ mod tests {
         let ia_event = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
             created_at_ms: now_ms(),
             invite_event_id: net_eid,
-            workspace_id,
+            workspace_id: net_eid,
         });
         let ia_blob = events::encode_event(&ia_event).unwrap();
         let ia_eid = hash_event(&ia_blob);
@@ -692,7 +687,7 @@ mod tests {
         let uib = UserInviteBootEvent {
             created_at_ms: now_ms(),
             public_key: invite_pub,
-            workspace_id,
+            workspace_id: net_eid,
             signed_by: net_eid,
             signer_type: 1,
             signature: [0u8; 64],
@@ -788,7 +783,7 @@ mod tests {
     ) -> (ParsedEvent, Vec<u8>) {
         let msg = MessageEvent {
             created_at_ms: now_ms(),
-            workspace_event_id: [1u8; 32],
+            workspace_id: [1u8; 32],
             author_id: [2u8; 32],
             content: content.to_string(),
             signed_by: *signer_eid,
@@ -1377,7 +1372,7 @@ mod tests {
         // Same workspace event must be valid for tenant_b too since they share the blob
         setup_workspace_event(&conn, tenant_b);
         // Use tenant_a's net_eid so both share the same message blob
-        // But we need the SAME workspace_event_id in both tenants' valid_events.
+        // But we need the SAME workspace_id in both tenants' valid_events.
         // Since setup_workspace_event creates different workspace events per tenant,
         // we must manually mark tenant_a's workspace event valid for tenant_b too.
         let net_b64 = event_id_to_base64(&net_eid_a);
@@ -3371,11 +3366,9 @@ mod tests {
         // 1. Workspace
         let workspace_key = SigningKey::generate(&mut rng);
         let workspace_pub = workspace_key.verifying_key().to_bytes();
-        let workspace_id: [u8; 32] = rand::random();
         let net_event = ParsedEvent::Workspace(WorkspaceEvent {
             created_at_ms: now_ms(),
             public_key: workspace_pub,
-            workspace_id,
         });
         let net_blob = events::encode_event(&net_event).unwrap();
         let net_eid = insert_event_raw(&conn, recorded_by, &net_blob);
@@ -3384,7 +3377,7 @@ mod tests {
         let ia_event = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
             created_at_ms: now_ms(),
             invite_event_id: net_eid,
-            workspace_id,
+            workspace_id: net_eid,
         });
         let ia_blob = events::encode_event(&ia_event).unwrap();
         let ia_eid = insert_event_raw(&conn, recorded_by, &ia_blob);
@@ -3397,7 +3390,7 @@ mod tests {
         let uib = UserInviteBootEvent {
             created_at_ms: now_ms(),
             public_key: invite_pub,
-            workspace_id,
+            workspace_id: net_eid,
             signed_by: net_eid,
             signer_type: 1,
             signature: [0u8; 64],

@@ -208,7 +208,7 @@ mod tests {
         use crate::events::MessageEvent;
         let msg = ParsedEvent::Message(MessageEvent {
             created_at_ms: now_ms(),
-            workspace_event_id: [1u8; 32],
+            workspace_id: [1u8; 32],
             author_id: [2u8; 32],
             content: "not a key".to_string(),
             signed_by: [0u8; 32],

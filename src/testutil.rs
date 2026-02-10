@@ -66,7 +66,7 @@ pub struct Peer {
     pub identity: String,
     pub author_id: [u8; 32],
     pub channel_id: [u8; 32],
-    pub workspace_event_id: EventId,
+    pub workspace_id: EventId,
     /// PeerShared event_id used as signer for content events.
     pub peer_shared_event_id: Option<EventId>,
     /// PeerShared signing key for signing content events.
@@ -93,7 +93,7 @@ impl Peer {
             identity,
             author_id,
             channel_id,
-            workspace_event_id: channel_id,
+            workspace_id: channel_id,
             peer_shared_event_id: None,
             peer_shared_signing_key: None,
             _tempdir: tempdir,
@@ -117,20 +117,19 @@ impl Peer {
         // 1. Workspace
         let workspace_key = SigningKey::generate(&mut rng);
         let workspace_pub = workspace_key.verifying_key().to_bytes();
-        let workspace_id: [u8; 32] = rand::random();
         let net = ParsedEvent::Workspace(WorkspaceEvent {
             created_at_ms: current_timestamp_ms(),
             public_key: workspace_pub,
-            workspace_id,
         });
         let net_eid = event_id_or_blocked(create_event_sync(&db, &self.identity, &net))
             .expect("failed to create workspace");
+        self.workspace_id = net_eid;
 
         // 2. InviteAccepted (binds trust anchor)
         let ia = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
             created_at_ms: current_timestamp_ms(),
             invite_event_id: net_eid,
-            workspace_id,
+            workspace_id: net_eid,
         });
         let _ia_eid = create_event_sync(&db, &self.identity, &ia)
             .expect("failed to create invite_accepted");
@@ -143,7 +142,7 @@ impl Peer {
         let uib = ParsedEvent::UserInviteBoot(UserInviteBootEvent {
             created_at_ms: current_timestamp_ms(),
             public_key: invite_key.verifying_key().to_bytes(),
-            workspace_id,
+            workspace_id: net_eid,
             signed_by: net_eid,
             signer_type: 1,
             signature: [0u8; 64],
@@ -207,7 +206,7 @@ impl Peer {
         let db = open_connection(&self.db_path).expect("failed to open db");
         let msg = ParsedEvent::Message(MessageEvent {
             created_at_ms: current_timestamp_ms(),
-            workspace_event_id: self.workspace_event_id,
+            workspace_id: self.workspace_id,
             author_id: self.author_id,
             content: content.to_string(),
             signed_by: self.signer_eid(),
@@ -295,7 +294,7 @@ impl Peer {
         let db = open_connection(&self.db_path).expect("failed to open db");
         let inner = ParsedEvent::Message(MessageEvent {
             created_at_ms: current_timestamp_ms(),
-            workspace_event_id: self.workspace_event_id,
+            workspace_id: self.workspace_id,
             author_id: self.author_id,
             content: content.to_string(),
             signed_by: self.signer_eid(),
@@ -351,24 +350,22 @@ impl Peer {
     // --- Identity event helpers ---
 
     /// Create a Workspace event. Returns the event ID.
-    pub fn create_workspace(&self, workspace_id: [u8; 32], public_key: [u8; 32]) -> EventId {
+    pub fn create_workspace(&self, public_key: [u8; 32]) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
         let ws = ParsedEvent::Workspace(WorkspaceEvent {
             created_at_ms: current_timestamp_ms(),
             public_key,
-            workspace_id,
         });
         event_id_or_blocked(create_event_sync(&db, &self.identity, &ws))
             .expect("failed to create workspace")
     }
 
     /// Try to create a Workspace event. Returns Result to allow handling rejection.
-    pub fn try_create_workspace(&self, workspace_id: [u8; 32], public_key: [u8; 32]) -> Result<EventId, CreateEventError> {
+    pub fn try_create_workspace(&self, public_key: [u8; 32]) -> Result<EventId, CreateEventError> {
         let db = open_connection(&self.db_path).expect("failed to open db");
         let ws = ParsedEvent::Workspace(WorkspaceEvent {
             created_at_ms: current_timestamp_ms(),
             public_key,
-            workspace_id,
         });
         create_event_sync(&db, &self.identity, &ws)
     }
@@ -399,8 +396,7 @@ impl Peer {
     pub fn create_user_invite_boot(
         &self,
         signing_key: &ed25519_dalek::SigningKey,
-        workspace_event_id: &EventId,
-        workspace_id: [u8; 32],
+        workspace_id: &EventId,
     ) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
         let public_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng())
@@ -408,8 +404,8 @@ impl Peer {
         let evt = ParsedEvent::UserInviteBoot(UserInviteBootEvent {
             created_at_ms: current_timestamp_ms(),
             public_key,
-            workspace_id,
-            signed_by: *workspace_event_id,
+            workspace_id: *workspace_id,
+            signed_by: *workspace_id,
             signer_type: 1,
             signature: [0u8; 64],
         });
@@ -422,15 +418,14 @@ impl Peer {
         &self,
         invite_public_key: [u8; 32],
         signing_key: &ed25519_dalek::SigningKey,
-        workspace_event_id: &EventId,
-        workspace_id: [u8; 32],
+        workspace_id: &EventId,
     ) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
         let evt = ParsedEvent::UserInviteBoot(UserInviteBootEvent {
             created_at_ms: current_timestamp_ms(),
             public_key: invite_public_key,
-            workspace_id,
-            signed_by: *workspace_event_id,
+            workspace_id: *workspace_id,
+            signed_by: *workspace_id,
             signer_type: 1,
             signature: [0u8; 64],
         });
@@ -523,14 +518,14 @@ impl Peer {
         admin_public_key: [u8; 32],
         signing_key: &ed25519_dalek::SigningKey,
         user_event_id: &EventId,
-        workspace_event_id: &EventId,
+        workspace_id: &EventId,
     ) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
         let evt = ParsedEvent::AdminBoot(AdminBootEvent {
             created_at_ms: current_timestamp_ms(),
             public_key: admin_public_key,
             user_event_id: *user_event_id,
-            signed_by: *workspace_event_id,
+            signed_by: *workspace_id,
             signer_type: 1,
             signature: [0u8; 64],
         });
@@ -626,7 +621,7 @@ impl Peer {
         for i in 0..count {
             let msg = ParsedEvent::Message(MessageEvent {
                 created_at_ms: current_timestamp_ms(),
-                workspace_event_id: self.workspace_event_id,
+                workspace_id: self.workspace_id,
                 author_id: self.author_id,
                 content: format!("Message {} from {}", i, self.name),
                 signed_by: self.signer_eid(),
@@ -947,7 +942,7 @@ fn replay_projection_impl(db: &rusqlite::Connection, recorded_by: &str, order: &
                         db.execute(
                             "INSERT OR IGNORE INTO workspaces (recorded_by, event_id, workspace_id, public_key)
                              VALUES (?1, ?2, ?3, ?4)",
-                            rusqlite::params![recorded_by, ws_b64, ws.workspace_id.as_slice(), ws.public_key.as_slice()],
+                            rusqlite::params![recorded_by, ws_b64, ws_b64, ws.public_key.as_slice()],
                         ).expect("seed ws projection");
                     }
                 }

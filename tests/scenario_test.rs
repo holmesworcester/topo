@@ -1633,10 +1633,10 @@ fn bootstrap_peer(peer: &Peer) -> BootstrapChain {
     let mut rng = rand::thread_rng();
     let workspace_key = SigningKey::generate(&mut rng);
     let workspace_pubkey = workspace_key.verifying_key().to_bytes();
-    let workspace_id: [u8; 32] = rand::random();
 
     // 1. Workspace event
-    let workspace_eid = peer.create_workspace(workspace_id, workspace_pubkey);
+    let workspace_eid = peer.create_workspace(workspace_pubkey);
+    let workspace_id = workspace_eid;
 
     // 2. UserInviteBoot (signed by workspace)
     let invite_key = SigningKey::generate(&mut rng);
@@ -1645,7 +1645,6 @@ fn bootstrap_peer(peer: &Peer) -> BootstrapChain {
         invite_pubkey,
         &workspace_key,
         &workspace_eid,
-        workspace_id,
     );
 
     // 3. InviteAccepted (local, binds trust anchor)
@@ -1725,9 +1724,12 @@ fn test_bootstrap_sequence() {
         rusqlite::params![&alice.identity],
         |row| row.get(0),
     ).unwrap();
-    // 7 identity events + invite_accepted (local) + 1 Peer::new workspace = 9
-    // Workspace might be blocked initially and unblocked by invite_accepted cascade
-    assert!(valid_count >= 8, "at least 8 events should be valid (7 identity + Peer::new ws), got {}", valid_count);
+    // At least the bootstrap chain should be valid.
+    assert!(
+        valid_count >= 7,
+        "at least 7 identity events should be valid, got {}",
+        valid_count
+    );
 
     // Verify projection tables
     let net_count: i64 = db.query_row(
@@ -1735,7 +1737,7 @@ fn test_bootstrap_sequence() {
         rusqlite::params![&alice.identity],
         |row| row.get(0),
     ).unwrap();
-    assert_eq!(net_count, 2, "two workspaces should be projected (Peer::new deterministic + bootstrap)");
+    assert_eq!(net_count, 1, "one trust-anchored workspace should be projected");
 
     let user_invite_count: i64 = db.query_row(
         "SELECT COUNT(*) FROM user_invites WHERE recorded_by = ?1",
@@ -1798,7 +1800,6 @@ fn test_out_of_order_identity() {
     let mut rng = rand::thread_rng();
     let workspace_key = SigningKey::generate(&mut rng);
     let workspace_pubkey = workspace_key.verifying_key().to_bytes();
-    let workspace_id: [u8; 32] = rand::random();
     let invite_key = SigningKey::generate(&mut rng);
     let invite_pubkey = invite_key.verifying_key().to_bytes();
     let user_key = SigningKey::generate(&mut rng);
@@ -1812,9 +1813,9 @@ fn test_out_of_order_identity() {
     let net_blob = encode_event(&ParsedEvent::Workspace(WorkspaceEvent {
         created_at_ms: now_ms,
         public_key: workspace_pubkey,
-        workspace_id,
     })).unwrap();
     let workspace_eid = hash_event(&net_blob);
+    let workspace_id = workspace_eid;
 
     // Pre-build UserInviteBoot blob (signed by workspace) to get user_invite_eid
     let mut uib_blob = encode_event(&ParsedEvent::UserInviteBoot(UserInviteBootEvent {
@@ -1942,10 +1943,9 @@ fn test_foreign_workspace_excluded() {
     let db = open_connection(&alice.db_path).unwrap();
 
     // Create a second workspace event with different workspace_id — should be rejected
-    let foreign_id: [u8; 32] = rand::random();
     let foreign_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
     let foreign_pubkey = foreign_key.verifying_key().to_bytes();
-    let result = alice.try_create_workspace(foreign_id, foreign_pubkey);
+    let result = alice.try_create_workspace(foreign_pubkey);
 
     // Should be rejected (trust anchor mismatch)
     match result {
@@ -2370,11 +2370,21 @@ fn test_true_out_of_order_identity_chain() {
     let db = open_connection(&alice.db_path).unwrap();
 
     use ed25519_dalek::SigningKey;
+    use poc_7::crypto::hash_event;
+    use poc_7::events::{encode_event, ParsedEvent, WorkspaceEvent};
+    use poc_7::projection::create::{create_event_sync, event_id_or_blocked};
     let mut rng = rand::thread_rng();
 
     let workspace_key = SigningKey::generate(&mut rng);
     let workspace_pubkey = workspace_key.verifying_key().to_bytes();
-    let workspace_id: [u8; 32] = rand::random();
+    let workspace_event = ParsedEvent::Workspace(WorkspaceEvent {
+        created_at_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64,
+        public_key: workspace_pubkey,
+    });
+    let workspace_id = hash_event(&encode_event(&workspace_event).unwrap());
 
     // Step 1: Create invite_accepted FIRST (before workspace or invite exist).
     // Under corrected semantics, this sets the trust anchor immediately.
@@ -2392,9 +2402,9 @@ fn test_true_out_of_order_identity_chain() {
     ).unwrap();
     assert!(ia_valid, "invite_accepted should be immediately valid (no HasRecordedInvite guard)");
 
-    // Step 2: Create workspace event. Should cascade-unblock via guard retry
-    // since trust anchor is now set.
-    let workspace_eid = alice.create_workspace(workspace_id, workspace_pubkey);
+    // Step 2: Create the precomputed workspace event (same event_id as trust anchor).
+    let workspace_eid = event_id_or_blocked(create_event_sync(&db, &alice.identity, &workspace_event))
+        .expect("workspace should create once trust anchor exists");
 
     let net_b64 = event_id_to_base64(&workspace_eid);
     let net_valid: bool = db.query_row(
@@ -2409,7 +2419,6 @@ fn test_true_out_of_order_identity_chain() {
         invite_pubkey,
         &workspace_key,
         &workspace_eid,
-        workspace_id,
     );
 
     let ui_b64 = event_id_to_base64(&user_invite_eid);
@@ -2546,8 +2555,8 @@ async fn test_two_peer_identity_join_and_sync() {
     // - 2 device_invites
     // - 2 peers_shared
     // - 1 admin (Alice's)
-    assert_eq!(alice.workspace_count(), 2, "Alice should have 2 workspaces (Peer::new + bootstrap)");
-    assert_eq!(bob.workspace_count(), 2, "Bob should have 2 workspaces (Peer::new + bootstrap)");
+    assert_eq!(alice.workspace_count(), 1, "Alice should have 1 trust-anchored workspace");
+    assert_eq!(bob.workspace_count(), 1, "Bob should have 1 trust-anchored workspace");
 
     assert_eq!(alice.user_invite_count(), 2, "Alice: boot + ongoing invites");
     assert_eq!(bob.user_invite_count(), 2, "Bob: boot + ongoing invites");
@@ -2627,7 +2636,7 @@ async fn test_identity_cascade_via_sync() {
     drop(sync);
 
     // Bob should now have Alice's full identity chain projected plus his own user
-    assert_eq!(bob.workspace_count(), 2, "Bob should have Alice's workspace + Peer::new workspace");
+    assert_eq!(bob.workspace_count(), 1, "Bob should have Alice's workspace");
     assert_eq!(bob.user_invite_count(), 2, "Bob should have both invites");
     assert_eq!(bob.user_count(), 2, "Both Alice's and Bob's users should be valid");
 
@@ -2747,9 +2756,9 @@ async fn test_device_link_via_sync() {
 
     drop(sync);
 
-    // Both devices share the same workspace and identity state (+1 from Peer::new)
-    assert_eq!(phone.workspace_count(), 2);
-    assert_eq!(laptop.workspace_count(), 2);
+    // Both devices share the same trust-anchored workspace and identity state.
+    assert_eq!(phone.workspace_count(), 1);
+    assert_eq!(laptop.workspace_count(), 1);
     assert_eq!(phone.device_invite_count(), 2, "Phone: first + ongoing");
     assert_eq!(laptop.device_invite_count(), 2, "Laptop: first + ongoing");
 
@@ -2774,9 +2783,9 @@ async fn test_foreign_workspace_rejected_via_sync() {
     assert_ne!(alice_chain.workspace_id, bob_chain.workspace_id,
         "workspaces should differ");
 
-    // Before sync: each peer has 2 workspaces projected (Peer::new + bootstrap)
-    assert_eq!(alice.workspace_count(), 2);
-    assert_eq!(bob.workspace_count(), 2);
+    // Before sync: each peer has only its own trust-anchored workspace projected.
+    assert_eq!(alice.workspace_count(), 1);
+    assert_eq!(bob.workspace_count(), 1);
 
     // Sync — shared events flow between peers
     let sync = start_peers(&alice, &bob);
@@ -2791,12 +2800,12 @@ async fn test_foreign_workspace_rejected_via_sync() {
 
     drop(sync);
 
-    // Each peer should still have 2 workspaces projected (Peer::new + own bootstrap) —
+    // Each peer should still have only its own workspace projected —
     // the foreign bootstrap workspace event is rejected by the trust anchor guard.
-    assert_eq!(alice.workspace_count(), 2,
-        "Alice should still have exactly 2 workspaces (foreign rejected)");
-    assert_eq!(bob.workspace_count(), 2,
-        "Bob should still have exactly 2 workspaces (foreign rejected)");
+    assert_eq!(alice.workspace_count(), 1,
+        "Alice should still have exactly 1 workspace (foreign rejected)");
+    assert_eq!(bob.workspace_count(), 1,
+        "Bob should still have exactly 1 workspace (foreign rejected)");
 
     // Foreign identity events should be rejected, not just blocked
     assert!(alice.rejected_event_count() > 0,

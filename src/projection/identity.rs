@@ -37,7 +37,7 @@ pub fn apply_identity_projection(
     }
 }
 
-/// Workspace guard: trust_anchors must match event's workspace_id.
+/// Workspace guard: trust_anchors must match the Workspace event_id.
 /// Returns Block if no trust anchor yet, Reject if mismatch.
 fn project_workspace(
     conn: &Connection,
@@ -45,7 +45,7 @@ fn project_workspace(
     event_id_b64: &str,
     ws: &crate::events::WorkspaceEvent,
 ) -> Result<ProjectionDecision, Box<dyn std::error::Error>> {
-    let workspace_id_b64 = event_id_to_base64(&ws.workspace_id);
+    let workspace_id_b64 = event_id_b64.to_string();
 
     // Check trust anchor
     let anchor: Option<String> = match conn.query_row(

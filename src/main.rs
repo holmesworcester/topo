@@ -504,9 +504,9 @@ fn parse_workspace_hex(workspace_hex: &str) -> Result<[u8; 32], Box<dyn std::err
     if workspace_bytes.len() > 32 {
         return Err("Workspace event ID must be at most 32 bytes".into());
     }
-    let mut workspace_event_id = [0u8; 32];
-    workspace_event_id[..workspace_bytes.len()].copy_from_slice(&workspace_bytes);
-    Ok(workspace_event_id)
+    let mut workspace_id = [0u8; 32];
+    workspace_id[..workspace_bytes.len()].copy_from_slice(&workspace_bytes);
+    Ok(workspace_id)
 }
 
 fn current_timestamp_ms() -> u64 {
@@ -660,11 +660,9 @@ fn ensure_identity_chain(
     let mut rng = rand::thread_rng();
 
     let workspace_key = SigningKey::generate(&mut rng);
-    let workspace_id: [u8; 32] = rand::random();
     let ws = ParsedEvent::Workspace(WorkspaceEvent {
         created_at_ms: current_timestamp_ms(),
         public_key: workspace_key.verifying_key().to_bytes(),
-        workspace_id,
     });
     let ws_eid = event_id_or_blocked(create_event_sync(db, recorded_by, &ws))
         .map_err(|e| format!("{}", e))?;
@@ -672,7 +670,7 @@ fn ensure_identity_chain(
     let ia = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
         created_at_ms: current_timestamp_ms(),
         invite_event_id: ws_eid,
-        workspace_id,
+        workspace_id: ws_eid,
     });
     let _ia_eid = create_event_sync(db, recorded_by, &ia).map_err(|e| format!("{}", e))?;
     project_one(db, recorded_by, &ws_eid).map_err(|e| format!("{}", e))?;
@@ -681,7 +679,7 @@ fn ensure_identity_chain(
     let uib = ParsedEvent::UserInviteBoot(UserInviteBootEvent {
         created_at_ms: current_timestamp_ms(),
         public_key: invite_key.verifying_key().to_bytes(),
-        workspace_id,
+        workspace_id: ws_eid,
         signed_by: ws_eid,
         signer_type: 1,
         signature: [0u8; 64],
@@ -739,12 +737,12 @@ fn send_message(
     create_tables(&db)?;
 
     let (signer_eid, signing_key) = ensure_identity_chain(&db, &recorded_by)?;
-    let workspace_event_id = parse_workspace_hex(workspace_hex)?;
+    let workspace_id = parse_workspace_hex(workspace_hex)?;
     let author_id = stable_author_id(&recorded_by);
 
     let msg = ParsedEvent::Message(MessageEvent {
         created_at_ms: current_timestamp_ms(),
-        workspace_event_id,
+        workspace_id,
         author_id,
         content: content.to_string(),
         signed_by: signer_eid,
@@ -816,14 +814,14 @@ fn generate_messages(db_path: &str, count: usize, workspace_hex: &str) -> Result
     create_tables(&db)?;
 
     let (signer_eid, signing_key) = ensure_identity_chain(&db, &recorded_by)?;
-    let workspace_event_id = parse_workspace_hex(workspace_hex)?;
+    let workspace_id = parse_workspace_hex(workspace_hex)?;
     let author_id: [u8; 32] = rand::random();
 
     db.execute("BEGIN", [])?;
     for i in 0..count {
         let msg = ParsedEvent::Message(MessageEvent {
             created_at_ms: current_timestamp_ms(),
-            workspace_event_id,
+            workspace_id,
             author_id,
             content: format!("Message {}", i),
             signed_by: signer_eid,
