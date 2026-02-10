@@ -139,7 +139,8 @@ Principles:
 
 ### Endpoint observations
 
-When a peer accepts a QUIC connection, it records the remote peer's observed `(ip, port)` in the `peer_endpoint_observations` table with a TTL.
+When a peer accepts or establishes a QUIC connection, it records the remote peer's observed `(ip, port)` in the `peer_endpoint_observations` table with a TTL.
+After a successful hole-punched connection, it also records the punched peer's observed endpoint so that peer can be introduced to others later.
 
 Rules:
 1. Observations are append-only with `INSERT OR IGNORE`.
@@ -173,17 +174,27 @@ After receiving a valid IntroOffer, the peer attempts paced QUIC connections to 
 
 NAT traversal relies on simultaneous open: both peers dial each other at roughly the same time, creating outgoing NAT mappings that allow the other's packets through.
 
-### Intro worker
+### Explicit intro API
 
-The intro worker is an opt-in continuous process that automates introductions:
+Introductions are explicit and one-shot:
 
-1. Enabled via `--intro-worker` flag on the `sync` command (or as standalone `intro-worker` command).
-2. Runs on the same QUIC endpoint as the sync loop (shares UDP socket for NAT compatibility).
-3. Periodically scans for all peer pairs with non-expired endpoint observations.
-4. Introduces every eligible pair by sending IntroOffers to both.
-5. Configurable: `--intro-interval-ms`, `--intro-ttl-ms`, `--intro-window-ms`.
+1. An operator (or external job) calls `poc-7 intro --peer-a <fpA> --peer-b <fpB>`.
+2. The command looks up freshest non-expired endpoint observations for both peers.
+3. It sends IntroOffers to both peers on the same QUIC endpoint socket.
+4. The daemon does not run background peer-pair selection or automatic intro scheduling.
 
-Current selection criteria: all peers with fresh observations are introduced to all other peers with fresh observations. No reputation, preference, or rate-limiting logic exists yet.
+Selection logic ("who to intro, when to retry") is intentionally outside the core protocol for now.
+
+### Testing
+
+Test the feature with both local integration tests and Linux netns NAT simulation:
+
+1. `cargo test --test holepunch_test`
+2. `cargo test test_record_endpoint_observation`
+3. `cargo build --release`
+4. `sudo tests/netns_nat_test.sh --cone` (expected pass)
+5. `sudo tests/netns_nat_test.sh --symmetric` (expected fail)
+6. `sudo tests/netns_nat_test.sh --cleanup`
 
 ## 2.5 Recording identity semantics
 
