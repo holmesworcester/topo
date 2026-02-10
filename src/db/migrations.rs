@@ -362,6 +362,31 @@ static MIGRATIONS: &[Migration] = &[
         // the correct column name from CREATE TABLE in schema.rs.
         sql: "SELECT 1;",
     },
+    Migration {
+        version: 16,
+        name: "add_intro_attempts",
+        sql: "
+            CREATE TABLE IF NOT EXISTS intro_attempts (
+                recorded_by TEXT NOT NULL,
+                intro_id BLOB NOT NULL,
+                introduced_by_peer_id TEXT NOT NULL,
+                other_peer_id TEXT NOT NULL,
+                origin_ip TEXT NOT NULL,
+                origin_port INTEGER NOT NULL,
+                observed_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'received',
+                error TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (recorded_by, intro_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_intro_attempts_status
+                ON intro_attempts(recorded_by, status);
+            CREATE INDEX IF NOT EXISTS idx_intro_attempts_peer
+                ON intro_attempts(recorded_by, other_peer_id);
+        ",
+    },
 ];
 
 fn ensure_schema_migrations(conn: &Connection) -> SqliteResult<()> {
@@ -511,6 +536,6 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 15);
+        assert_eq!(count, 16);
     }
 }

@@ -13,8 +13,7 @@ use poc_7::projection::pipeline::unblock_dependents;
 use poc_7::sync::engine::{accept_loop, connect_loop};
 use poc_7::transport::{
     AllowedPeers,
-    create_client_endpoint,
-    create_server_endpoint,
+    create_dual_endpoint,
     extract_spki_fingerprint,
     load_or_generate_cert,
 };
@@ -166,6 +165,38 @@ enum Commands {
         #[arg(short, long, default_value = "server.db")]
         db: String,
     },
+
+    /// Send intro offers to two peers so they can hole-punch a direct connection
+    Intro {
+        #[arg(short, long, default_value = "server.db")]
+        db: String,
+        /// Peer A hex SPKI fingerprint
+        #[arg(long)]
+        peer_a: String,
+        /// Peer B hex SPKI fingerprint
+        #[arg(long)]
+        peer_b: String,
+        /// Allowed peer fingerprints (hex, repeatable)
+        #[arg(long = "pin-peer")]
+        pin_peer: Vec<String>,
+        /// Intro TTL in milliseconds
+        #[arg(long, default_value = "30000")]
+        ttl_ms: u64,
+        /// Attempt window in milliseconds
+        #[arg(long, default_value = "4000")]
+        attempt_window_ms: u32,
+    },
+
+    /// Show intro attempt records
+    #[command(name = "intro-attempts")]
+    IntroAttempts {
+        #[arg(short, long, default_value = "server.db")]
+        db: String,
+        /// Filter by peer SPKI fingerprint (hex)
+        #[arg(long)]
+        peer: Option<String>,
+    },
+
 }
 
 #[tokio::main]
@@ -174,7 +205,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Only init tracing for sync commands (avoid polluting message output)
     match &cli.command {
-        Commands::Sync { .. } => {
+        Commands::Sync { .. } | Commands::Intro { .. } => {
             let subscriber = FmtSubscriber::builder()
                 .with_max_level(Level::INFO)
                 .finish();
@@ -233,6 +264,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
         Commands::Networks { db } => {
             cli_workspaces(&db)?;
+        }
+        Commands::Intro { db, peer_a, peer_b, pin_peer, ttl_ms, attempt_window_ms } => {
+            cli_intro(&db, &peer_a, &peer_b, &pin_peer, ttl_ms, attempt_window_ms).await?;
+        }
+        Commands::IntroAttempts { db, peer } => {
+            cli_intro_attempts(&db, peer.as_deref())?;
         }
     }
 
@@ -792,11 +829,15 @@ async fn run_sync(
         Arc::new(combined)
     };
 
-    let server_endpoint = create_server_endpoint(bind, cert.clone(), key.clone_key(), allowed_peers.clone())?;
-    info!("Listening on {}", server_endpoint.local_addr()?);
+    // Single dual-role endpoint: same UDP socket for accept + connect (required for hole punching)
+    let allowed_peers_inner = (*allowed_peers).clone();
+    let endpoint = create_dual_endpoint(bind, cert, key, allowed_peers)?;
+    info!("Listening on {}", endpoint.local_addr()?);
 
     let db_owned = db_path.to_string();
     let recorded_by_clone = recorded_by.clone();
+    let accept_endpoint = endpoint.clone();
+    let accept_allowed = allowed_peers_inner.clone();
     let accept_handle = tokio::task::spawn_blocking({
         let db = db_owned.clone();
         move || {
@@ -805,7 +846,7 @@ async fn run_sync(
                 .build()
                 .unwrap();
             rt.block_on(async move {
-                if let Err(e) = accept_loop(&db, &recorded_by_clone, server_endpoint).await {
+                if let Err(e) = accept_loop(&db, &recorded_by_clone, accept_endpoint, Some(accept_allowed)).await {
                     tracing::warn!("accept_loop exited: {}", e);
                 }
             });
@@ -813,12 +854,8 @@ async fn run_sync(
     });
 
     if let Some(remote) = connect {
-        let client_endpoint = create_client_endpoint(
-            "0.0.0.0:0".parse()?,
-            cert,
-            key,
-            allowed_peers,
-        )?;
+        let connect_endpoint = endpoint.clone();
+        let connect_allowed = allowed_peers_inner.clone();
         let db = db_owned.clone();
         let recorded_by_clone = recorded_by.clone();
         let connect_handle = tokio::task::spawn_blocking(move || {
@@ -827,7 +864,7 @@ async fn run_sync(
                 .build()
                 .unwrap();
             rt.block_on(async move {
-                if let Err(e) = connect_loop(&db, &recorded_by_clone, client_endpoint, remote).await {
+                if let Err(e) = connect_loop(&db, &recorded_by_clone, connect_endpoint, remote, Some(connect_allowed)).await {
                     tracing::warn!("connect_loop exited: {}", e);
                 }
             });
@@ -1037,6 +1074,106 @@ fn cli_workspaces(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send 
             };
             println!("  {}. {} ({})", i + 1, name, short_id(eid));
         }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Intro commands
+// ---------------------------------------------------------------------------
+
+async fn cli_intro(
+    db_path: &str,
+    peer_a: &str,
+    peer_b: &str,
+    pin_peers: &[String],
+    ttl_ms: u64,
+    attempt_window_ms: u32,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let db = open_connection(db_path)?;
+    create_tables(&db)?;
+    drop(db);
+
+    let (cert_path, key_path) = transport_cert_paths_from_db(db_path);
+    let (cert, key) = load_or_generate_cert(&cert_path, &key_path)?;
+    let recorded_by = {
+        let fp = extract_spki_fingerprint(cert.as_ref())?;
+        hex::encode(fp)
+    };
+
+    // Build allowed peers: must include both target peers
+    let mut all_pins = pin_peers.to_vec();
+    if !all_pins.contains(&peer_a.to_string()) {
+        all_pins.push(peer_a.to_string());
+    }
+    if !all_pins.contains(&peer_b.to_string()) {
+        all_pins.push(peer_b.to_string());
+    }
+    let cli_pins = AllowedPeers::from_hex_strings(&all_pins)?;
+    let db = open_connection(db_path)?;
+    let allowed = allowed_peers_combined(&db, &recorded_by, &cli_pins)?;
+    drop(db);
+
+    let endpoint = create_dual_endpoint(
+        "0.0.0.0:0".parse()?,
+        cert,
+        key,
+        Arc::new(allowed),
+    )?;
+
+    let result = poc_7::sync::intro::run_intro(
+        &endpoint, db_path, &recorded_by,
+        peer_a, peer_b, ttl_ms, attempt_window_ms,
+    ).await?;
+
+    if result.sent_to_a && result.sent_to_b {
+        println!("Intro sent to both peers");
+    } else {
+        for e in &result.errors {
+            eprintln!("Error: {}", e);
+        }
+        if !result.sent_to_a && !result.sent_to_b {
+            std::process::exit(1);
+        }
+    }
+
+    endpoint.close(0u32.into(), b"done");
+    Ok(())
+}
+
+fn cli_intro_attempts(
+    db_path: &str,
+    peer: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let db = open_connection(db_path)?;
+    create_tables(&db)?;
+
+    let recorded_by = {
+        let (cert_path, key_path) = transport_cert_paths_from_db(db_path);
+        let (cert, _) = load_or_generate_cert(&cert_path, &key_path)?;
+        let fp = extract_spki_fingerprint(cert.as_ref())?;
+        hex::encode(fp)
+    };
+
+    let rows = poc_7::db::intro::list_intro_attempts(&db, &recorded_by, peer)?;
+    if rows.is_empty() {
+        println!("No intro attempts recorded.");
+        return Ok(());
+    }
+
+    for r in &rows {
+        let intro_id_hex = hex::encode(&r.intro_id);
+        println!("  intro_id:  {}...", &intro_id_hex[..16]);
+        println!("  peer:      {}", &r.other_peer_id[..16]);
+        println!("  via:       {}", &r.introduced_by_peer_id[..16]);
+        println!("  endpoint:  {}:{}", r.origin_ip, r.origin_port);
+        println!("  status:    {}", r.status);
+        if let Some(ref err) = r.error {
+            println!("  error:     {}", err);
+        }
+        println!("  created:   {}", r.created_at);
+        println!();
     }
 
     Ok(())

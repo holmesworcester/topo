@@ -1383,3 +1383,108 @@ Recommended PR sequence:
 
 Rule:
 - each PR must include at least one failing test made to pass by that PR.
+
+---
+
+## 16. NAT Traversal and Hole Punch (Transport Extension)
+
+This section documents the hole-punch implementation on the `quic-holepunch` branch and guidance for future builders.
+
+### 16.1 Current implementation status
+
+Implemented and tested:
+1. `IntroOffer` wire message (88 bytes fixed, type `0x30`) on uni-directional QUIC streams.
+2. Endpoint observation recording in `peer_endpoint_observations` from accept/connect loops and successful punched connections.
+3. One-shot intro dispatch via the `intro` CLI command (no background intro worker in daemon).
+4. Punch handler with paced QUIC dial, identity verification, and sync-on-success.
+5. `intro_attempts` table tracking full lifecycle (`received -> dialing -> connected | failed | expired | rejected`).
+6. CLI surface: `sync`, `intro` (one-shot), and `intro-attempts` (diagnostic).
+7. Linux netns/NAT integration test (`tests/netns_nat_test.sh`) with cone and symmetric modes.
+
+### 16.2 Architecture decisions
+
+1. **Shared endpoint**: Intro offer handling and punch dialing run on the same QUIC endpoint as sync. This is required for NAT compatibility because punch packets must originate from the same UDP socket/port that the NAT has already mapped.
+
+2. **spawn_local for punch handlers**: Punch attempts use `tokio::task::spawn_local` on a `LocalSet` instead of `tokio::spawn` or `spawn_blocking`. This is because:
+   - Quinn endpoints are tied to a specific runtime's I/O driver.
+   - Rusqlite connections are `!Send`.
+   - `spawn_local` satisfies both constraints by running on the same runtime/thread.
+
+3. **No canonical intro events**: IntroOffers and punch attempts are runtime protocol state, not canonical events. They are recorded in operational tables (`peer_endpoint_observations`, `intro_attempts`) with TTL-based cleanup.
+
+4. **Introducer is a role, not a node type**: Any trusted peer with endpoint observations for two peers can issue an explicit intro call. There is no dedicated relay/TURN server in the current design.
+
+5. **Concurrent accept_loop**: The accept loop spawns each connection handler as a `spawn_local` task so the introducer can serve multiple peers simultaneously rather than blocking on one connection's sync session.
+
+### 16.3 NAT compatibility requirements
+
+The current implementation works with EIM (Endpoint-Independent Mapping) NATs, which are the most common home router type:
+
+1. **Port preservation**: The NAT must use the same external port for all destinations from a given internal `(ip, port)`. This is the defining property of EIM.
+2. **Simultaneous open**: Both peers must send packets to each other within a short window so that each creates an outgoing NAT mapping before the other's packets arrive.
+3. **No phantom conntrack entries**: On Linux, unsolicited incoming packets can create conntrack entries that interfere with port-preserving masquerade. The netns test uses `raw` table `notrack` + `INPUT` chain drops to prevent this. Real routers vary in whether they exhibit this behavior.
+
+NAT types that will NOT work:
+- Symmetric/port-dependent NATs (different external port per destination).
+- NATs with very short UDP timeout (< attempt window).
+- CGN (Carrier-Grade NAT) with unpredictable mapping behavior.
+
+### 16.4 Explicit intro flow
+
+The current intro flow is intentionally minimal:
+1. An operator/controller calls `poc-7 intro --peer-a <fpA> --peer-b <fpB>`.
+2. The introducer resolves freshest non-expired endpoint observations for both peers.
+3. It sends one `IntroOffer` to each peer over uni-directional QUIC streams.
+4. Receivers validate trust/expiry/dedup, then run paced dial attempts inside `attempt_window_ms`.
+5. On success, peers record `connected` in `intro_attempts`, persist observed endpoint metadata, and run direct sync.
+
+There is no built-in pair selection scheduler in the daemon. Selection policy and retry cadence belong in a higher-level connection job.
+
+### 16.5 How to test
+
+Run from repo root:
+1. `cargo test --test holepunch_test`
+2. `cargo test test_record_endpoint_observation`
+3. `cargo build --release`
+4. `sudo tests/netns_nat_test.sh --cone` (expected: PASS)
+5. `sudo tests/netns_nat_test.sh --symmetric` (expected: FAIL, by design)
+6. `sudo tests/netns_nat_test.sh --cleanup`
+
+Notes:
+1. The netns script requires `ip`, `nft`, and root privileges.
+2. In cone mode, script success means at least one peer reports `intro_attempts` status `connected`.
+3. In symmetric mode, failure is the expected result and validates NAT-type sensitivity.
+4. On unexpected mismatch, the script dumps nft rulesets, conntrack state (if present), and recent daemon logs.
+
+### 16.6 Key implementation files
+
+- `src/sync/punch.rs`: IntroOffer receiver, punch dial loop, identity verification, sync-on-punched-connection, punched-peer endpoint observation persistence.
+- `src/sync/intro.rs`: one-shot intro send and endpoint lookup.
+- `src/sync/engine.rs`: `accept_loop_inner` and `connect_loop_inner` with LocalSet, endpoint observation recording, `spawn_intro_listener` call sites.
+- `src/main.rs`: CLI commands (`Intro`, `IntroAttempts`) and `sync` command wiring.
+- `src/db/intro.rs`: `intro_attempts` table operations (insert, update status, query, dedup check) and freshest endpoint query.
+- `src/db/health.rs`: `record_endpoint_observation`, `purge_expired_endpoints`.
+- `tests/netns_nat_test.sh`: Linux netns NAT integration test (requires root/sudo).
+- `tests/holepunch_test.rs`: localhost integration tests for trust/expiry/happy-path intro and punch behavior.
+
+### 16.7 Future work for builders
+
+1. **Connection job for intro scheduling**: Add an external or embedded scheduler that decides who to intro and when (rate limits, retry backoff, target degree, freshness thresholds).
+2. **STUN integration**: Add STUN client discovery to improve mapped endpoint freshness and reduce stale-observation failures.
+3. **TURN fallback**: For symmetric NATs where hole punch cannot work, relay traffic through an introducer/TURN role.
+4. **Connection quality tracking**: Track latency/stability of direct paths and prefer direct links over relay links when healthy.
+5. **Multi-path sync**: Use relay and direct paths together for redundancy and throughput.
+6. **IPv6 traversal coverage**: Expand test coverage for IPv6 intro and direct dialing.
+7. **Intro protocol hardening**: Optionally sign IntroOffers so trust is portable beyond the authenticated transport channel.
+
+### 16.8 Common pitfalls for builders
+
+1. **Cross-runtime endpoint I/O**: Quinn endpoints are bound to a specific tokio runtime's I/O driver. If you `spawn_blocking` with a new runtime and try to `endpoint.connect()`, the QUIC handshake will never complete because the UDP I/O is driven by the original runtime. Use `spawn_local` on the same `LocalSet` instead.
+
+2. **Phantom conntrack on Linux**: When testing with nftables masquerade, unsolicited incoming UDP packets create conntrack entries even if they're dropped by the forward/input filter. These phantom entries cause masquerade to remap source ports, breaking EIM. Prevent with `raw` table `notrack` for new WAN-incoming packets and `INPUT` chain drops before conntrack confirm.
+
+3. **QUIC endpoint must be dual-mode**: The same endpoint must be both client and server (via `create_dual_endpoint`) so that when A dials B and B dials A simultaneously, both sides can accept the other's connection.
+
+4. **Intro timing matters**: Both peers must receive IntroOffers and start dialing within each other's attempt windows. A controller may need repeated one-shot `intro` calls when peers are unstable.
+
+5. **LocalSet is required**: Both `accept_loop` and `connect_loop` wrap their inner logic in a `LocalSet::run_until()` to provide the context needed by `spawn_local` in `spawn_intro_listener`. Forgetting this causes a panic at runtime.

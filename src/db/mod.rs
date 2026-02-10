@@ -10,6 +10,7 @@ pub mod project_queue;
 pub mod egress_queue;
 pub mod health;
 pub mod transport_trust;
+pub mod intro;
 
 use rusqlite::{Connection, Result as SqliteResult};
 use std::path::Path;
