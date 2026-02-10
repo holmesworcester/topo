@@ -1,5 +1,5 @@
 use std::time::{SystemTime, UNIX_EPOCH};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::crypto::{event_id_to_base64, EventId};
 use crate::events::{self, ParsedEvent, registry};
@@ -240,14 +240,15 @@ pub fn project_one(
     Ok(ProjectionDecision::Valid)
 }
 
-/// Find events that become fully unblocked when blocker X is resolved.
+/// Enqueue events that become fully unblocked when blocker X is resolved.
 /// Deletes X's dep edges (using RETURNING to collect candidates in one pass),
-/// then filters for those with zero remaining blockers.
-fn collect_newly_unblocked(
+/// filters for those with zero remaining blockers, and inserts them into the
+/// cascade_worklist temp table (DB-backed, not in-memory).
+fn enqueue_newly_unblocked(
     conn: &Connection,
     recorded_by: &str,
     blocker_b64: &str,
-) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error>> {
     // Delete blocker dep edges and collect candidate event_ids in one operation.
     // Using DELETE ... RETURNING avoids a separate SELECT that causes pathological
     // B-tree performance when interleaved with DELETEs on the same table.
@@ -265,11 +266,10 @@ fn collect_newly_unblocked(
     };
 
     if candidates.is_empty() {
-        return Ok(Vec::new());
+        return Ok(());
     }
 
-    // Filter: keep only candidates with zero remaining blockers
-    let mut unblocked = Vec::with_capacity(candidates.len());
+    // Filter: keep only candidates with zero remaining blockers, enqueue into temp table
     for eid_b64 in candidates {
         let still_blocked: bool = conn.prepare_cached(
             "SELECT EXISTS(SELECT 1 FROM blocked_event_deps WHERE peer_id = ?1 AND event_id = ?2)",
@@ -278,24 +278,43 @@ fn collect_newly_unblocked(
             |row| row.get(0),
         )?;
         if !still_blocked {
-            unblocked.push(eid_b64);
+            conn.prepare_cached(
+                "INSERT INTO cascade_worklist (event_id) VALUES (?1)",
+            )?.execute(rusqlite::params![&eid_b64])?;
         }
     }
 
-    Ok(unblocked)
+    Ok(())
 }
 
 /// After projecting an event, find and cascade-project any events that were
-/// blocked waiting on it. Uses DELETE ... RETURNING for efficient unblock
-/// detection and prepare_cached for statement reuse.
+/// blocked waiting on it. Uses a DB-backed temp table as the worklist so
+/// memory stays O(1) regardless of cascade depth. Uses DELETE ... RETURNING
+/// for efficient unblock detection and prepare_cached for statement reuse.
 fn unblock_dependents(
     conn: &Connection,
     recorded_by: &str,
     blocker_b64: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut worklist = collect_newly_unblocked(conn, recorded_by, blocker_b64)?;
+    conn.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS cascade_worklist (event_id TEXT NOT NULL)",
+    )?;
 
-    while let Some(eid_b64) = worklist.pop() {
+    enqueue_newly_unblocked(conn, recorded_by, blocker_b64)?;
+
+    loop {
+        // Claim one item from the DB-backed worklist
+        let eid_b64: Option<String> = conn.prepare_cached(
+            "DELETE FROM cascade_worklist
+             WHERE rowid = (SELECT MIN(rowid) FROM cascade_worklist)
+             RETURNING event_id",
+        )?.query_row([], |row| row.get::<_, String>(0)).optional()?;
+
+        let eid_b64 = match eid_b64 {
+            Some(e) => e,
+            None => break,
+        };
+
         let blob: Vec<u8> = conn.prepare_cached(
             "SELECT blob FROM events WHERE event_id = ?1",
         )?.query_row(
@@ -336,8 +355,7 @@ fn unblock_dependents(
                 )?.execute(rusqlite::params![recorded_by, &eid_b64])?;
 
                 // This newly valid event may unblock further events
-                let mut newly_unblocked = collect_newly_unblocked(conn, recorded_by, &eid_b64)?;
-                worklist.append(&mut newly_unblocked);
+                enqueue_newly_unblocked(conn, recorded_by, &eid_b64)?;
             }
         }
     }
