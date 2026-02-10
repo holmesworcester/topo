@@ -85,6 +85,7 @@ pub static REACTION_TYPE_META: EventTypeMeta = EventTypeMeta {
     projection_table: "reactions",
     share_scope: ShareScope::Shared,
     dep_fields: &["target_event_id"],
+    dep_field_type_codes: &[&[1]],
     signer_required: false,
     signature_byte_len: 0,
     parse: parse_reaction,

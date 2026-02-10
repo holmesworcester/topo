@@ -23,6 +23,9 @@ pub struct EventTypeMeta {
     pub projection_table: &'static str,
     pub share_scope: ShareScope,
     pub dep_fields: &'static [&'static str],
+    /// Parallel to dep_fields: valid type codes for each dep.
+    /// Empty slice means any type is allowed (no type check).
+    pub dep_field_type_codes: &'static [&'static [u8]],
     pub signer_required: bool,
     pub signature_byte_len: usize,
     pub parse: fn(&[u8]) -> Result<ParsedEvent, EventError>,

@@ -8,6 +8,41 @@ use super::encrypted::project_encrypted;
 use super::projectors::{project_message, project_message_attachment, project_message_deletion, project_file_slice, project_reaction, project_peer_key, project_secret_key, project_signed_memo};
 use super::signer::{resolve_signer_key, verify_ed25519_signature, SignerResolution};
 
+/// Check that each dep's type code matches the allowed types for that dep field.
+/// Returns Some(reason) if a type mismatch is found, None if all pass.
+fn check_dep_types(
+    conn: &Connection,
+    deps: &[(&str, EventId)],
+    type_codes: &[&[u8]],
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    for (i, (field_name, dep_id)) in deps.iter().enumerate() {
+        let allowed = type_codes.get(i).copied().unwrap_or(&[]);
+        if allowed.is_empty() {
+            continue;
+        }
+        let dep_b64 = event_id_to_base64(dep_id);
+        let dep_blob: Vec<u8> = match conn.query_row(
+            "SELECT blob FROM events WHERE event_id = ?1",
+            rusqlite::params![&dep_b64],
+            |row| row.get(0),
+        ) {
+            Ok(b) => b,
+            Err(_) => continue, // dep doesn't exist yet; dep-existence check handles this
+        };
+        if dep_blob.is_empty() {
+            continue;
+        }
+        let actual_type = dep_blob[0];
+        if !allowed.contains(&actual_type) {
+            return Ok(Some(format!(
+                "dep {} has type code {} but expected one of {:?}",
+                field_name, actual_type, allowed
+            )));
+        }
+    }
+    Ok(None)
+}
+
 /// Record a rejected event durably so it is not re-processed on replay or cascade.
 fn record_rejection(conn: &Connection, recorded_by: &str, event_id_b64: &str, reason: &str) {
     let now_ms = SystemTime::now()
@@ -203,6 +238,16 @@ pub fn project_one(
         return Ok(ProjectionDecision::Block { missing });
     }
 
+    // 5b. Dep type checking — verify each dep's type code matches expectations
+    let meta = registry().lookup(parsed.event_type_code())
+        .ok_or_else(|| format!("unknown type code {}", parsed.event_type_code()))?;
+    if !meta.dep_field_type_codes.is_empty() {
+        if let Some(reason) = check_dep_types(conn, &deps, meta.dep_field_type_codes)? {
+            record_rejection(conn, recorded_by, &event_id_b64, &reason);
+            return Ok(ProjectionDecision::Reject { reason });
+        }
+    }
+
     // 6. Apply projection (signer verification + projector dispatch)
     let decision = apply_projection(conn, recorded_by, &event_id_b64, &blob, &parsed)?;
     match &decision {
@@ -239,7 +284,7 @@ pub fn project_one(
 
 /// After projecting an event, find and cascade-project any events that were
 /// blocked waiting on it. Uses an iterative worklist to avoid stack overflow.
-fn unblock_dependents(
+pub fn unblock_dependents(
     conn: &Connection,
     recorded_by: &str,
     blocker_b64: &str,
@@ -341,6 +386,17 @@ fn unblock_dependents(
                         continue;
                     }
 
+                    // Dep type checking
+                    let meta = registry().lookup(parsed.event_type_code());
+                    if let Some(meta) = meta {
+                        if !meta.dep_field_type_codes.is_empty() {
+                            if let Some(reason) = check_dep_types(conn, &deps, meta.dep_field_type_codes)? {
+                                record_rejection(conn, recorded_by, &eid_b64, &reason);
+                                continue;
+                            }
+                        }
+                    }
+
                     // Apply projection (signer verification + projector dispatch)
                     let decision = apply_projection(conn, recorded_by, &eid_b64, &blob, &parsed)?;
                     match &decision {
@@ -376,7 +432,7 @@ mod tests {
     use super::*;
     use crate::crypto::hash_event;
     use crate::db::{open_in_memory, schema::create_tables};
-    use crate::events::{self, MessageEvent, MessageAttachmentEvent, MessageDeletionEvent, FileSliceEvent, ReactionEvent, PeerKeyEvent, SecretKeyEvent, SignedMemoEvent, EncryptedEvent, ParsedEvent, EVENT_TYPE_MESSAGE, EVENT_TYPE_ENCRYPTED};
+    use crate::events::{self, MessageEvent, MessageAttachmentEvent, MessageDeletionEvent, FileSliceEvent, ReactionEvent, PeerKeyEvent, SecretKeyEvent, SignedMemoEvent, EncryptedEvent, WorkspaceEvent, ParsedEvent, EVENT_TYPE_MESSAGE, EVENT_TYPE_ENCRYPTED};
     use crate::projection::encrypted::encrypt_event_blob;
     use crate::projection::signer::sign_event_bytes;
     use ed25519_dalek::SigningKey;
@@ -415,10 +471,42 @@ mod tests {
         event_id
     }
 
-    fn make_message(content: &str) -> (ParsedEvent, Vec<u8>) {
+    /// Create a Workspace event, insert it, and mark it valid (bypassing trust anchor
+    /// guard). Returns the event_id suitable for use as network_event_id in messages.
+    fn setup_network_event(conn: &Connection, recorded_by: &str) -> EventId {
+        let ws = ParsedEvent::Workspace(WorkspaceEvent {
+            created_at_ms: now_ms(),
+            public_key: [0xAA; 32],
+            workspace_id: [0xBB; 32],
+        });
+        let blob = events::encode_event(&ws).unwrap();
+        let eid = insert_event_raw(conn, recorded_by, &blob);
+        // Bypass trust anchor guard — directly mark valid for test convenience
+        let eid_b64 = event_id_to_base64(&eid);
+        conn.execute(
+            "INSERT OR IGNORE INTO valid_events (peer_id, event_id) VALUES (?1, ?2)",
+            rusqlite::params![recorded_by, &eid_b64],
+        ).unwrap();
+        eid
+    }
+
+    fn make_message_with_network(network_event_id: &EventId, content: &str) -> (ParsedEvent, Vec<u8>) {
         let msg = ParsedEvent::Message(MessageEvent {
             created_at_ms: now_ms(),
-            channel_id: [1u8; 32],
+            network_event_id: *network_event_id,
+            author_id: [2u8; 32],
+            content: content.to_string(),
+        });
+        let blob = events::encode_event(&msg).unwrap();
+        (msg, blob)
+    }
+
+    fn make_message(content: &str) -> (ParsedEvent, Vec<u8>) {
+        // NOTE: This creates a message with a non-existent network_event_id dep.
+        // Tests using this must either set up the dep or expect Block.
+        let msg = ParsedEvent::Message(MessageEvent {
+            created_at_ms: now_ms(),
+            network_event_id: [1u8; 32],
             author_id: [2u8; 32],
             content: content.to_string(),
         });
@@ -479,7 +567,8 @@ mod tests {
     fn test_project_message_valid() {
         let conn = setup();
         let recorded_by = "peer1";
-        let (_msg, blob) = make_message("hello");
+        let net_eid = setup_network_event(&conn, recorded_by);
+        let (_msg, blob) = make_message_with_network(&net_eid, "hello");
         let eid = insert_event_raw(&conn, recorded_by, &blob);
 
         let result = project_one(&conn, recorded_by, &eid).unwrap();
@@ -507,9 +596,10 @@ mod tests {
     fn test_project_reaction_valid() {
         let conn = setup();
         let recorded_by = "peer1";
+        let net_eid = setup_network_event(&conn, recorded_by);
 
         // Create target message first
-        let (_msg, msg_blob) = make_message("target");
+        let (_msg, msg_blob) = make_message_with_network(&net_eid, "target");
         let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
         project_one(&conn, recorded_by, &msg_eid).unwrap();
 
@@ -570,9 +660,10 @@ mod tests {
     fn test_project_unblock_cascade() {
         let conn = setup();
         let recorded_by = "peer1";
+        let net_eid = setup_network_event(&conn, recorded_by);
 
         // Create message blob but don't insert yet
-        let (_msg, msg_blob) = make_message("target");
+        let (_msg, msg_blob) = make_message_with_network(&net_eid, "target");
         let msg_eid = hash_event(&msg_blob);
 
         // Create reaction targeting it — insert reaction first (out of order)
@@ -611,7 +702,8 @@ mod tests {
     fn test_already_processed() {
         let conn = setup();
         let recorded_by = "peer1";
-        let (_msg, blob) = make_message("hello");
+        let net_eid = setup_network_event(&conn, recorded_by);
+        let (_msg, blob) = make_message_with_network(&net_eid, "hello");
         let eid = insert_event_raw(&conn, recorded_by, &blob);
 
         let r1 = project_one(&conn, recorded_by, &eid).unwrap();
@@ -625,11 +717,12 @@ mod tests {
     fn test_multi_blocker() {
         let conn = setup();
         let recorded_by = "peer1";
+        let net_eid = setup_network_event(&conn, recorded_by);
 
         // Create two messages (targets)
-        let (_msg1, msg1_blob) = make_message("target1");
+        let (_msg1, msg1_blob) = make_message_with_network(&net_eid, "target1");
         let msg1_eid = hash_event(&msg1_blob);
-        let (_msg2, msg2_blob) = make_message("target2");
+        let (_msg2, msg2_blob) = make_message_with_network(&net_eid, "target2");
         let msg2_eid = hash_event(&msg2_blob);
 
         // Create reaction targeting msg1 — insert without msg1 in events
@@ -825,8 +918,9 @@ mod tests {
         // Regression: ensure Message and Reaction still project normally
         let conn = setup();
         let recorded_by = "peer1";
+        let net_eid = setup_network_event(&conn, recorded_by);
 
-        let (_msg, msg_blob) = make_message("no signer needed");
+        let (_msg, msg_blob) = make_message_with_network(&net_eid, "no signer needed");
         let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
         let r1 = project_one(&conn, recorded_by, &msg_eid).unwrap();
         assert_eq!(r1, ProjectionDecision::Valid);
@@ -843,9 +937,10 @@ mod tests {
         let conn = setup();
         let tenant_a = "tenant_a";
         let tenant_b = "tenant_b";
+        let net_eid_a = setup_network_event(&conn, tenant_a);
 
         // Tenant A creates and projects a message
-        let (_msg, msg_blob) = make_message("target for A");
+        let (_msg, msg_blob) = make_message_with_network(&net_eid_a, "target for A");
         let msg_eid = insert_event_raw(&conn, tenant_a, &msg_blob);
         let r = project_one(&conn, tenant_a, &msg_eid).unwrap();
         assert_eq!(r, ProjectionDecision::Valid);
@@ -872,8 +967,24 @@ mod tests {
         let conn = setup();
         let tenant_a = "tenant_a";
         let tenant_b = "tenant_b";
+        let net_eid_a = setup_network_event(&conn, tenant_a);
+        // Same network event must be valid for tenant_b too since they share the blob
+        setup_network_event(&conn, tenant_b);
+        // Use tenant_a's net_eid so both share the same message blob
+        // But we need the SAME network_event_id in both tenants' valid_events.
+        // Since setup_network_event creates different workspace events per tenant,
+        // we must manually mark tenant_a's workspace event valid for tenant_b too.
+        let net_b64 = event_id_to_base64(&net_eid_a);
+        conn.execute(
+            "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source) VALUES (?1, ?2, ?3, 'test')",
+            rusqlite::params![tenant_b, &net_b64, now_ms() as i64],
+        ).unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO valid_events (peer_id, event_id) VALUES (?1, ?2)",
+            rusqlite::params![tenant_b, &net_b64],
+        ).unwrap();
 
-        let (_msg, msg_blob) = make_message("shared message");
+        let (_msg, msg_blob) = make_message_with_network(&net_eid_a, "shared message");
         let msg_eid = insert_event_raw(&conn, tenant_a, &msg_blob);
         // Also record for tenant_b
         let eid_b64 = event_id_to_base64(&msg_eid);
@@ -1041,11 +1152,13 @@ mod tests {
         let conn = setup();
         let tenant_a = "tenant_a";
         let tenant_b = "tenant_b";
+        let net_eid_a = setup_network_event(&conn, tenant_a);
+        let net_eid_b = setup_network_event(&conn, tenant_b);
 
         // Each tenant creates a message
-        let (_msg_a, msg_a_blob) = make_message("hello from A");
+        let (_msg_a, msg_a_blob) = make_message_with_network(&net_eid_a, "hello from A");
         let msg_a_eid = insert_event_raw(&conn, tenant_a, &msg_a_blob);
-        let (_msg_b, msg_b_blob) = make_message("hello from B");
+        let (_msg_b, msg_b_blob) = make_message_with_network(&net_eid_b, "hello from B");
         let msg_b_eid = insert_event_raw(&conn, tenant_b, &msg_b_blob);
 
         // Project each for their tenant
@@ -1071,6 +1184,17 @@ mod tests {
         let rxn_eid = insert_event_raw(&conn, tenant_b, &rxn_blob);
         let r_rxn = project_one(&conn, tenant_b, &rxn_eid).unwrap();
         assert!(matches!(r_rxn, ProjectionDecision::Block { .. }));
+
+        // Make tenant_a's network event valid for tenant_b (so the message dep is satisfied)
+        let net_a_b64 = event_id_to_base64(&net_eid_a);
+        conn.execute(
+            "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source) VALUES (?1, ?2, ?3, 'test')",
+            rusqlite::params![tenant_b, &net_a_b64, now_ms() as i64],
+        ).unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO valid_events (peer_id, event_id) VALUES (?1, ?2)",
+            rusqlite::params![tenant_b, &net_a_b64],
+        ).unwrap();
 
         // Now record and project tenant_a's message for tenant_b
         let msg_a_b64 = event_id_to_base64(&msg_a_eid);
@@ -1153,6 +1277,7 @@ mod tests {
     fn test_encrypted_message_valid() {
         let conn = setup();
         let recorded_by = "peer1";
+        let net_eid = setup_network_event(&conn, recorded_by);
         let key_bytes: [u8; 32] = rand::random();
 
         // Create and project secret key
@@ -1162,7 +1287,7 @@ mod tests {
         assert_eq!(r, ProjectionDecision::Valid);
 
         // Create inner message
-        let (_msg, msg_blob) = make_message("encrypted hello");
+        let (_msg, msg_blob) = make_message_with_network(&net_eid, "encrypted hello");
 
         // Encrypt it
         let (_enc, enc_blob) = make_encrypted_event(&key_bytes, &msg_blob, EVENT_TYPE_MESSAGE, &sk_eid);
@@ -1210,6 +1335,7 @@ mod tests {
     fn test_encrypted_unblocks_when_key_arrives() {
         let conn = setup();
         let recorded_by = "peer1";
+        let net_eid = setup_network_event(&conn, recorded_by);
         let key_bytes: [u8; 32] = rand::random();
 
         // Pre-compute key event_id
@@ -1217,7 +1343,7 @@ mod tests {
         let sk_eid = hash_event(&sk_blob);
 
         // Insert encrypted event first (before key)
-        let (_msg, msg_blob) = make_message("out of order encrypted");
+        let (_msg, msg_blob) = make_message_with_network(&net_eid, "out of order encrypted");
         let (_enc, enc_blob) = make_encrypted_event(&key_bytes, &msg_blob, EVENT_TYPE_MESSAGE, &sk_eid);
         let enc_eid = insert_event_raw(&conn, recorded_by, &enc_blob);
 
@@ -1367,6 +1493,7 @@ mod tests {
     fn test_encrypted_inner_dep_unblocks() {
         let conn = setup();
         let recorded_by = "peer1";
+        let net_eid = setup_network_event(&conn, recorded_by);
         let key_bytes: [u8; 32] = rand::random();
 
         // Create and project key
@@ -1375,7 +1502,7 @@ mod tests {
         project_one(&conn, recorded_by, &sk_eid).unwrap();
 
         // Create target message (pre-compute but don't insert yet)
-        let (_msg, msg_blob) = make_message("target for encrypted rxn");
+        let (_msg, msg_blob) = make_message_with_network(&net_eid, "target for encrypted rxn");
         let msg_eid = hash_event(&msg_blob);
 
         // Create encrypted reaction targeting the message
@@ -1437,6 +1564,7 @@ mod tests {
         let conn = setup();
         let tenant_a = "tenant_a";
         let tenant_b = "tenant_b";
+        let net_eid_a = setup_network_event(&conn, tenant_a);
         let key_bytes: [u8; 32] = rand::random();
 
         // Create and project key for tenant_a only
@@ -1446,7 +1574,7 @@ mod tests {
         assert_eq!(r, ProjectionDecision::Valid);
 
         // Create encrypted message referencing that key
-        let (_msg, msg_blob) = make_message("tenant-scoped encryption");
+        let (_msg, msg_blob) = make_message_with_network(&net_eid_a, "tenant-scoped encryption");
         let (_enc, enc_blob) = make_encrypted_event(&key_bytes, &msg_blob, EVENT_TYPE_MESSAGE, &sk_eid);
         let enc_eid = insert_event_raw(&conn, tenant_a, &enc_blob);
 
@@ -1493,9 +1621,10 @@ mod tests {
     fn test_project_message_deletion_valid() {
         let conn = setup();
         let recorded_by = "peer1";
+        let net_eid = setup_network_event(&conn, recorded_by);
 
         // Create and project a message
-        let (_msg, msg_blob) = make_message("to be deleted");
+        let (_msg, msg_blob) = make_message_with_network(&net_eid, "to be deleted");
         let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
         let r = project_one(&conn, recorded_by, &msg_eid).unwrap();
         assert_eq!(r, ProjectionDecision::Valid);
@@ -1537,9 +1666,10 @@ mod tests {
     fn test_deletion_cascades_reactions() {
         let conn = setup();
         let recorded_by = "peer1";
+        let net_eid = setup_network_event(&conn, recorded_by);
 
         // Create message + 2 reactions
-        let (_msg, msg_blob) = make_message("with reactions");
+        let (_msg, msg_blob) = make_message_with_network(&net_eid, "with reactions");
         let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
         project_one(&conn, recorded_by, &msg_eid).unwrap();
 
@@ -1605,9 +1735,10 @@ mod tests {
     fn test_deletion_unblocks_when_target_arrives() {
         let conn = setup();
         let recorded_by = "peer1";
+        let net_eid = setup_network_event(&conn, recorded_by);
 
         // Pre-compute message blob and eid
-        let (_msg, msg_blob) = make_message("will arrive later");
+        let (_msg, msg_blob) = make_message_with_network(&net_eid, "will arrive later");
         let msg_eid = hash_event(&msg_blob);
 
         // Create deletion first (before message exists)
@@ -1653,9 +1784,10 @@ mod tests {
     fn test_deletion_wrong_author_rejects() {
         let conn = setup();
         let recorded_by = "peer1";
+        let net_eid = setup_network_event(&conn, recorded_by);
 
         // Create message with author_id = [2u8; 32]
-        let (_msg, msg_blob) = make_message("wrong author test");
+        let (_msg, msg_blob) = make_message_with_network(&net_eid, "wrong author test");
         let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
         project_one(&conn, recorded_by, &msg_eid).unwrap();
 
@@ -1676,9 +1808,10 @@ mod tests {
     fn test_deletion_idempotent() {
         let conn = setup();
         let recorded_by = "peer1";
+        let net_eid = setup_network_event(&conn, recorded_by);
 
         // Create and project message
-        let (_msg, msg_blob) = make_message("delete me twice");
+        let (_msg, msg_blob) = make_message_with_network(&net_eid, "delete me twice");
         let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
         project_one(&conn, recorded_by, &msg_eid).unwrap();
 
@@ -1715,9 +1848,10 @@ mod tests {
     fn test_reaction_after_deletion_skipped() {
         let conn = setup();
         let recorded_by = "peer1";
+        let net_eid = setup_network_event(&conn, recorded_by);
 
         // Create and project message
-        let (_msg, msg_blob) = make_message("will be deleted");
+        let (_msg, msg_blob) = make_message_with_network(&net_eid, "will be deleted");
         let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
         project_one(&conn, recorded_by, &msg_eid).unwrap();
 
@@ -1748,9 +1882,10 @@ mod tests {
     fn test_deletion_convergence() {
         let conn = setup();
         let recorded_by = "peer1";
+        let net_eid = setup_network_event(&conn, recorded_by);
 
         // === Forward order: msg → rxn → del ===
-        let (_msg, msg_blob) = make_message("convergence test");
+        let (_msg, msg_blob) = make_message_with_network(&net_eid, "convergence test");
         let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
         project_one(&conn, recorded_by, &msg_eid).unwrap();
 
@@ -1778,6 +1913,13 @@ mod tests {
         conn.execute("DELETE FROM valid_events WHERE peer_id = ?1", rusqlite::params![recorded_by]).unwrap();
         conn.execute("DELETE FROM blocked_event_deps WHERE peer_id = ?1", rusqlite::params![recorded_by]).unwrap();
         conn.execute("DELETE FROM rejected_events WHERE peer_id = ?1", rusqlite::params![recorded_by]).unwrap();
+
+        // Re-insert network event as valid (it was cleared above)
+        let net_b64 = event_id_to_base64(&net_eid);
+        conn.execute(
+            "INSERT OR IGNORE INTO valid_events (peer_id, event_id) VALUES (?1, ?2)",
+            rusqlite::params![recorded_by, &net_b64],
+        ).unwrap();
 
         // Project in reverse order: del first (blocks), then rxn (blocks), then msg (unblocks all)
         project_one(&conn, recorded_by, &del_eid).unwrap();
@@ -1840,11 +1982,22 @@ mod tests {
         let conn = setup();
         let tenant_a = "tenant_a";
         let tenant_b = "tenant_b";
+        let net_eid = setup_network_event(&conn, tenant_a);
+        // Also mark valid for tenant_b
+        let net_b64 = event_id_to_base64(&net_eid);
+        conn.execute(
+            "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source) VALUES (?1, ?2, ?3, 'test')",
+            rusqlite::params![tenant_b, &net_b64, now_ms() as i64],
+        ).unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO valid_events (peer_id, event_id) VALUES (?1, ?2)",
+            rusqlite::params![tenant_b, &net_b64],
+        ).unwrap();
 
         // Create a deterministic message event
         let msg = ParsedEvent::Message(MessageEvent {
             created_at_ms: 1000,
-            channel_id: [1u8; 32],
+            network_event_id: net_eid,
             author_id: [2u8; 32],
             content: "deterministic".to_string(),
         });
@@ -1937,9 +2090,10 @@ mod tests {
     fn test_post_tombstone_wrong_author_deletion_rejects() {
         let conn = setup();
         let recorded_by = "peer1";
+        let net_eid = setup_network_event(&conn, recorded_by);
 
         // Create and project a message (author_id = [2u8; 32])
-        let (_msg, msg_blob) = make_message("post-tombstone auth test");
+        let (_msg, msg_blob) = make_message_with_network(&net_eid, "post-tombstone auth test");
         let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
         project_one(&conn, recorded_by, &msg_eid).unwrap();
 
@@ -2219,9 +2373,10 @@ mod tests {
     fn test_project_attachment_valid() {
         let conn = setup();
         let recorded_by = "peer1";
+        let net_eid = setup_network_event(&conn, recorded_by);
 
         // Create message (dep)
-        let (_msg, msg_blob) = make_message("hello attachment");
+        let (_msg, msg_blob) = make_message_with_network(&net_eid, "hello attachment");
         let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
         project_one(&conn, recorded_by, &msg_eid).unwrap();
 
@@ -2310,9 +2465,10 @@ mod tests {
     fn test_attachment_cascade_unblock() {
         let conn = setup();
         let recorded_by = "peer1";
+        let net_eid = setup_network_event(&conn, recorded_by);
 
         // Pre-compute the message and key event IDs
-        let (_msg, msg_blob) = make_message("hello cascade");
+        let (_msg, msg_blob) = make_message_with_network(&net_eid, "hello cascade");
         let msg_eid = crate::crypto::hash_event(&msg_blob);
 
         let sk = ParsedEvent::SecretKey(SecretKeyEvent {

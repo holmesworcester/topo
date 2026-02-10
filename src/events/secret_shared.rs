@@ -76,6 +76,7 @@ pub static SECRET_SHARED_META: EventTypeMeta = EventTypeMeta {
     projection_table: "secret_shared",
     share_scope: ShareScope::Shared,
     dep_fields: &["key_event_id", "recipient_event_id", "signed_by"],
+    dep_field_type_codes: &[&[6], &[16, 17], &[]],
     signer_required: true,
     signature_byte_len: 64,
     parse: parse_secret_shared,

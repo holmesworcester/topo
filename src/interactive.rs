@@ -478,10 +478,14 @@ fn cmd_send(
         return Ok(());
     }
 
+    let network_event_id = account
+        .network_event_id
+        .ok_or("No workspace created. Run 'new-workspace' first.")?;
+
     let conn = open_connection(&account.db_path)?;
     let msg = ParsedEvent::Message(MessageEvent {
         created_at_ms: now_ms(),
-        channel_id: account.active_channel,
+        network_event_id,
         author_id: account.author_id,
         content: content.clone(),
     });
@@ -502,8 +506,6 @@ fn cmd_messages(
         .ok_or("No active account. Run 'new-workspace' first.")?;
 
     let conn = open_connection(&account.db_path)?;
-    let channel_b64 = base64_encode(&account.active_channel);
-
     // Build author_id -> username map from all accounts in session
     let author_map: HashMap<String, String> = session
         .accounts
@@ -513,13 +515,13 @@ fn cmd_messages(
 
     let mut stmt = conn.prepare(
         "SELECT message_id, author_id, content, created_at
-         FROM messages WHERE recorded_by = ?1 AND channel_id = ?2
+         FROM messages WHERE recorded_by = ?1
          ORDER BY created_at ASC, rowid ASC",
     )?;
 
     let rows: Vec<(String, String, String, i64)> = stmt
         .query_map(
-            rusqlite::params![&account.identity, &channel_b64],
+            rusqlite::params![&account.identity],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -619,9 +621,7 @@ fn cmd_react(
         .ok_or("No active account.")?;
 
     let conn = open_connection(&account.db_path)?;
-    let channel_b64 = base64_encode(&account.active_channel);
-
-    let target_event_id = get_message_event_id_by_num(&conn, &account.identity, &channel_b64, msg_num)?;
+    let target_event_id = get_message_event_id_by_num(&conn, &account.identity, msg_num)?;
 
     let rxn = ParsedEvent::Reaction(ReactionEvent {
         created_at_ms: now_ms(),
@@ -653,9 +653,7 @@ fn cmd_reactions(
         .ok_or("No active account.")?;
 
     let conn = open_connection(&account.db_path)?;
-    let channel_b64 = base64_encode(&account.active_channel);
-
-    let target_event_id = get_message_event_id_by_num(&conn, &account.identity, &channel_b64, msg_num)?;
+    let target_event_id = get_message_event_id_by_num(&conn, &account.identity, msg_num)?;
     let target_b64 = event_id_to_base64(&target_event_id);
 
     let mut stmt = conn.prepare(
@@ -696,9 +694,7 @@ fn cmd_delete(
         .ok_or("No active account.")?;
 
     let conn = open_connection(&account.db_path)?;
-    let channel_b64 = base64_encode(&account.active_channel);
-
-    let target_event_id = get_message_event_id_by_num(&conn, &account.identity, &channel_b64, msg_num)?;
+    let target_event_id = get_message_event_id_by_num(&conn, &account.identity, msg_num)?;
 
     let del = ParsedEvent::MessageDeletion(MessageDeletionEvent {
         created_at_ms: now_ms(),
@@ -1398,14 +1394,13 @@ fn base64_encode(data: &[u8]) -> String {
 fn get_message_event_id_by_num(
     conn: &rusqlite::Connection,
     recorded_by: &str,
-    channel_b64: &str,
     msg_num: usize,
 ) -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
     let mut stmt = conn.prepare(
-        "SELECT message_id FROM messages WHERE recorded_by = ?1 AND channel_id = ?2 ORDER BY created_at ASC, rowid ASC",
+        "SELECT message_id FROM messages WHERE recorded_by = ?1 ORDER BY created_at ASC, rowid ASC",
     )?;
     let ids: Vec<String> = stmt
-        .query_map(rusqlite::params![recorded_by, channel_b64], |row| {
+        .query_map(rusqlite::params![recorded_by], |row| {
             row.get::<_, String>(0)
         })?
         .collect::<Result<Vec<_>, _>>()?;

@@ -218,7 +218,7 @@ pub fn create_encrypted_event_sync(
 mod tests {
     use super::*;
     use crate::db::{open_in_memory, schema::create_tables};
-    use crate::events::{MessageEvent, ReactionEvent, PeerKeyEvent, SignedMemoEvent};
+    use crate::events::{MessageEvent, ReactionEvent, PeerKeyEvent, SignedMemoEvent, WorkspaceEvent};
     use ed25519_dalek::SigningKey;
 
     fn now_ms() -> u64 {
@@ -231,14 +231,47 @@ mod tests {
         conn
     }
 
+    /// Create a Workspace event, insert it, and mark it valid (bypassing trust anchor
+    /// guard). Returns the event_id suitable for use as network_event_id in messages.
+    fn setup_network_event(conn: &Connection, recorded_by: &str) -> EventId {
+        let ws = ParsedEvent::Workspace(WorkspaceEvent {
+            created_at_ms: now_ms(),
+            public_key: [0xAA; 32],
+            workspace_id: [0xBB; 32],
+        });
+        let blob = events::encode_event(&ws).unwrap();
+        let eid = hash_event(&blob);
+        let eid_b64 = event_id_to_base64(&eid);
+        let ts = now_ms() as i64;
+        let reg = events::registry();
+        let meta = reg.lookup(ws.event_type_code()).unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![&eid_b64, meta.type_name, &blob, meta.share_scope.as_str(), ts, ts],
+        ).unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
+             VALUES (?1, ?2, ?3, 'test')",
+            rusqlite::params![recorded_by, &eid_b64, ts],
+        ).unwrap();
+        // Bypass trust anchor guard — directly mark valid for test convenience
+        conn.execute(
+            "INSERT OR IGNORE INTO valid_events (peer_id, event_id) VALUES (?1, ?2)",
+            rusqlite::params![recorded_by, &eid_b64],
+        ).unwrap();
+        eid
+    }
+
     #[test]
     fn test_create_message_sync() {
         let conn = setup();
         let recorded_by = "peer1";
+        let net_eid = setup_network_event(&conn, recorded_by);
 
         let msg = ParsedEvent::Message(MessageEvent {
             created_at_ms: now_ms(),
-            channel_id: [1u8; 32],
+            network_event_id: net_eid,
             author_id: [2u8; 32],
             content: "hello".to_string(),
         });
@@ -273,22 +306,23 @@ mod tests {
         ).unwrap();
         assert_eq!(neg, 1);
 
-        // recorded_events
+        // recorded_events (2: one for network event setup, one for the message)
         let rec: i64 = conn.query_row(
             "SELECT COUNT(*) FROM recorded_events WHERE peer_id = ?1",
             rusqlite::params![recorded_by], |row| row.get(0),
         ).unwrap();
-        assert_eq!(rec, 1);
+        assert_eq!(rec, 2);
     }
 
     #[test]
     fn test_create_reaction_chain() {
         let conn = setup();
         let recorded_by = "peer1";
+        let net_eid = setup_network_event(&conn, recorded_by);
 
         let msg = ParsedEvent::Message(MessageEvent {
             created_at_ms: now_ms(),
-            channel_id: [1u8; 32],
+            network_event_id: net_eid,
             author_id: [2u8; 32],
             content: "target".to_string(),
         });

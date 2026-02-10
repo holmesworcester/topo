@@ -6,9 +6,10 @@ use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use poc_7::db::{open_connection, schema::{create_tables, backfill_legacy_messages, count_legacy_messages}, transport_trust::allowed_peers_combined};
-use poc_7::events::{MessageEvent, ReactionEvent, MessageDeletionEvent, ParsedEvent};
+use poc_7::events::{MessageEvent, ReactionEvent, MessageDeletionEvent, WorkspaceEvent, ParsedEvent};
 use poc_7::transport_identity::{transport_cert_paths_from_db, load_transport_peer_id_from_db, ensure_transport_peer_id_from_db};
 use poc_7::projection::create::{create_event_sync, event_id_or_blocked};
+use poc_7::projection::pipeline::unblock_dependents;
 use poc_7::sync::engine::{accept_loop, connect_loop};
 use poc_7::transport::{
     AllowedPeers,
@@ -65,9 +66,9 @@ enum Commands {
         content: String,
         #[arg(short, long, default_value = "server.db")]
         db: String,
-        /// Channel ID hex (16 bytes)
-        #[arg(short = 'C', long, default_value = "0102030405060708090a0b0c0d0e0f10")]
-        channel: String,
+        /// Network event ID hex (32 bytes)
+        #[arg(short = 'n', long, default_value = "0102030405060708090a0b0c0d0e0f10")]
+        network: String,
     },
 
     /// Show database status
@@ -82,8 +83,8 @@ enum Commands {
         count: usize,
         #[arg(short, long, default_value = "server.db")]
         db: String,
-        #[arg(short = 'C', long, default_value = "0102030405060708090a0b0c0d0e0f10")]
-        channel: String,
+        #[arg(short = 'n', long, default_value = "0102030405060708090a0b0c0d0e0f10")]
+        network: String,
     },
 
     /// Backfill legacy messages to the local transport identity (cert/key/SPKI)
@@ -192,14 +193,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Commands::Messages { db, limit } => {
             show_messages(&db, limit)?;
         }
-        Commands::Send { content, db, channel } => {
-            send_message(&db, &channel, &content)?;
+        Commands::Send { content, db, network } => {
+            send_message(&db, &network, &content)?;
         }
         Commands::Status { db } => {
             show_status(&db)?;
         }
-        Commands::Generate { count, db, channel } => {
-            generate_messages(&db, count, &channel)?;
+        Commands::Generate { count, db, network } => {
+            generate_messages(&db, count, &network)?;
         }
         Commands::BackfillTransportIdentity { db } => {
             backfill_identity(&db)?;
@@ -419,14 +420,14 @@ fn show_messages(db_path: &str, limit: usize) -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
-fn parse_channel_hex(channel_hex: &str) -> Result<[u8; 32], Box<dyn std::error::Error + Send + Sync>> {
-    let channel_bytes = hex::decode(channel_hex)?;
-    if channel_bytes.len() > 32 {
-        return Err("Channel ID must be at most 32 bytes".into());
+fn parse_network_hex(network_hex: &str) -> Result<[u8; 32], Box<dyn std::error::Error + Send + Sync>> {
+    let network_bytes = hex::decode(network_hex)?;
+    if network_bytes.len() > 32 {
+        return Err("Network event ID must be at most 32 bytes".into());
     }
-    let mut channel_id = [0u8; 32];
-    channel_id[..channel_bytes.len()].copy_from_slice(&channel_bytes);
-    Ok(channel_id)
+    let mut network_event_id = [0u8; 32];
+    network_event_id[..network_bytes.len()].copy_from_slice(&network_bytes);
+    Ok(network_event_id)
 }
 
 fn current_timestamp_ms() -> u64 {
@@ -451,17 +452,89 @@ fn stable_author_id(peer_id: &str) -> [u8; 32] {
     out
 }
 
-fn send_message(db_path: &str, channel_hex: &str, content: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+/// Ensure a workspace event exists and is valid for this peer.
+/// Returns the workspace event's event ID (to be used as network_event_id in messages).
+/// Creates a deterministic workspace event if none exists. Bypasses trust anchor guard
+/// for local creation. Deterministic means all peers with the same workspace_id will
+/// produce the same event blob and thus the same event hash.
+fn ensure_network_event(
+    db: &rusqlite::Connection,
+    recorded_by: &str,
+    workspace_id: &[u8; 32],
+) -> Result<poc_7::crypto::EventId, Box<dyn std::error::Error + Send + Sync>> {
+    use poc_7::crypto::{event_id_to_base64, hash_event};
+    use poc_7::events;
+
+    // Check if a workspace event already exists and is valid for this peer
+    let existing: Option<String> = db.query_row(
+        "SELECT event_id FROM workspaces WHERE recorded_by = ?1 LIMIT 1",
+        rusqlite::params![recorded_by],
+        |row| row.get(0),
+    ).ok();
+
+    if let Some(eid_b64) = existing {
+        if let Some(eid) = poc_7::crypto::event_id_from_base64(&eid_b64) {
+            return Ok(eid);
+        }
+    }
+
+    // Create a deterministic workspace event (fixed timestamp + content = same hash on all peers)
+    let ws = ParsedEvent::Workspace(WorkspaceEvent {
+        created_at_ms: 0,
+        public_key: [0u8; 32],
+        workspace_id: *workspace_id,
+    });
+    let blob = events::encode_event(&ws).map_err(|e| format!("encode: {}", e))?;
+    let event_id = hash_event(&blob);
+    let eid_b64 = event_id_to_base64(&event_id);
+    let now = current_timestamp_ms() as i64;
+
+    // Store the event blob
+    db.execute(
+        "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
+         VALUES (?1, ?2, ?3, 'shared', ?4, ?5)",
+        rusqlite::params![&eid_b64, "workspace", blob.as_slice(), now, now],
+    )?;
+    db.execute(
+        "INSERT OR IGNORE INTO neg_items (ts, id) VALUES (?1, ?2)",
+        rusqlite::params![now, event_id.as_slice()],
+    )?;
+    db.execute(
+        "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
+         VALUES (?1, ?2, ?3, 'local')",
+        rusqlite::params![recorded_by, &eid_b64, now],
+    )?;
+    // Bypass trust anchor guard — mark valid directly
+    db.execute(
+        "INSERT OR IGNORE INTO valid_events (peer_id, event_id) VALUES (?1, ?2)",
+        rusqlite::params![recorded_by, &eid_b64],
+    )?;
+    db.execute(
+        "INSERT OR IGNORE INTO workspaces (recorded_by, event_id, workspace_id, public_key)
+         VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![recorded_by, &eid_b64, workspace_id.as_slice(), &[0u8; 32] as &[u8]],
+    )?;
+    // Cascade-project any events that were blocked waiting on this workspace
+    unblock_dependents(db, recorded_by, &eid_b64)
+        .map_err(|e| format!("unblock failed: {}", e))?;
+    Ok(event_id)
+}
+
+fn send_message(db_path: &str, network_hex: &str, content: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let recorded_by = ensure_transport_peer_id_from_db(db_path)?;
     let db = open_connection(db_path)?;
     create_tables(&db)?;
 
-    let channel_id = parse_channel_hex(channel_hex)?;
+    let workspace_id = parse_network_hex(network_hex)?;
+
+    // Ensure workspace event exists and is valid; use its hash as network_event_id
+    let network_event_id = ensure_network_event(&db, &recorded_by, &workspace_id)?;
+
     let author_id = stable_author_id(&recorded_by);
 
     let msg = ParsedEvent::Message(MessageEvent {
         created_at_ms: current_timestamp_ms(),
-        channel_id,
+        network_event_id,
         author_id,
         content: content.to_string(),
     });
@@ -511,19 +584,20 @@ fn show_status(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + S
     Ok(())
 }
 
-fn generate_messages(db_path: &str, count: usize, channel_hex: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn generate_messages(db_path: &str, count: usize, network_hex: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let recorded_by = ensure_transport_peer_id_from_db(db_path)?;
     let db = open_connection(db_path)?;
     create_tables(&db)?;
 
-    let channel_id = parse_channel_hex(channel_hex)?;
+    let workspace_id = parse_network_hex(network_hex)?;
+    let network_event_id = ensure_network_event(&db, &recorded_by, &workspace_id)?;
     let author_id: [u8; 32] = rand::random();
 
     db.execute("BEGIN", [])?;
     for i in 0..count {
         let msg = ParsedEvent::Message(MessageEvent {
             created_at_ms: current_timestamp_ms(),
-            channel_id,
+            network_event_id,
             author_id,
             content: format!("Message {}", i),
         });

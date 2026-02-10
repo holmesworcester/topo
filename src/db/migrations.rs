@@ -346,6 +346,14 @@ static MIGRATIONS: &[Migration] = &[
             CREATE INDEX IF NOT EXISTS idx_file_slices_event ON file_slices(recorded_by, event_id);
         ",
     },
+    Migration {
+        version: 14,
+        name: "rename_channel_id_to_network_event_id",
+        // Handled specially in run_migrations: renames channel_id→network_event_id
+        // only if the old column exists (pre-existing DBs). Fresh DBs already have
+        // the correct column name from CREATE TABLE in schema.rs.
+        sql: "SELECT 1;",
+    },
 ];
 
 fn ensure_schema_migrations(conn: &Connection) -> SqliteResult<()> {
@@ -369,7 +377,23 @@ pub fn run_migrations(conn: &Connection) -> SqliteResult<()> {
         )?;
 
         if !already_applied {
-            conn.execute_batch(migration.sql)?;
+            // Migration 14: conditionally rename channel_id → network_event_id
+            if migration.version == 14 {
+                let has_channel_id: bool = conn.query_row(
+                    "SELECT COUNT(*) > 0 FROM pragma_table_info('messages') WHERE name='channel_id'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if has_channel_id {
+                    conn.execute_batch(
+                        "ALTER TABLE messages RENAME COLUMN channel_id TO network_event_id;
+                         DROP INDEX IF EXISTS idx_messages_channel;
+                         CREATE INDEX IF NOT EXISTS idx_messages_network ON messages(network_event_id, created_at DESC);"
+                    )?;
+                }
+            } else {
+                conn.execute_batch(migration.sql)?;
+            }
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -465,6 +489,6 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 13);
+        assert_eq!(count, 14);
     }
 }
