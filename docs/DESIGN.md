@@ -63,7 +63,7 @@ Field definitions are fixed; total event size is variable by event type.
 1. canonical event bytes are content-addressed (`event_id` from canonical bytes),
 2. signed events carry canonical signer fields:
    - `signed_by` (event-id reference),
-   - `signer_type` (`peer | user | workspace | invite`),
+   - `signer_type` (`peer_key | workspace | user_invite | device_invite | user | peer_shared`),
    - `signature`,
 3. signature verification resolves signer key by (`signer_type`, `signed_by`) after dependency resolution,
 4. transport security is separate and complementary to event signatures.
