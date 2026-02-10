@@ -185,37 +185,11 @@ pub fn create_tables(conn: &Connection) -> SqliteResult<()> {
             stored_at INTEGER NOT NULL
         );
 
-        -- Events we have and can share (full blob in store)
-        CREATE TABLE IF NOT EXISTS shareable_events (
-            id TEXT PRIMARY KEY,        -- Event ID (same as store.id)
-            stored_at INTEGER NOT NULL
-        );
-
         -- Events we want but don't have yet (from refs we've seen)
         CREATE TABLE IF NOT EXISTS wanted_events (
             id BLOB PRIMARY KEY,        -- 32-byte Event ID
             first_seen_at INTEGER NOT NULL
         );
-
-        -- Outgoing send queue (events requested by peer)
-        CREATE TABLE IF NOT EXISTS outgoing_queue (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            peer_id TEXT NOT NULL,
-            event_id BLOB NOT NULL,
-            enqueued_at INTEGER NOT NULL,
-            sent_at INTEGER,
-            UNIQUE(peer_id, event_id)
-        );
-        CREATE INDEX IF NOT EXISTS idx_outgoing_peer ON outgoing_queue(peer_id, enqueued_at);
-
-        -- Incoming queue for projection
-        CREATE TABLE IF NOT EXISTS incoming_queue (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            blob BLOB NOT NULL,
-            received_at INTEGER NOT NULL,
-            processed INTEGER DEFAULT 0
-        );
-        CREATE INDEX IF NOT EXISTS idx_incoming_unprocessed ON incoming_queue(processed, received_at);
 
         -- Message projection table
         CREATE TABLE IF NOT EXISTS messages (
@@ -286,11 +260,8 @@ mod tests {
             .unwrap();
 
         assert!(tables.contains(&"store".to_string()));
-        assert!(tables.contains(&"shareable_events".to_string()));
         assert!(tables.contains(&"wanted_events".to_string()));
-        assert!(tables.contains(&"incoming_queue".to_string()));
         assert!(tables.contains(&"messages".to_string()));
-        assert!(tables.contains(&"outgoing_queue".to_string()));
         assert!(tables.contains(&"neg_items".to_string()));
         assert!(tables.contains(&"neg_blocks".to_string()));
         assert!(tables.contains(&"neg_meta".to_string()));
