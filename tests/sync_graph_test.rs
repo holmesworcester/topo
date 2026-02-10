@@ -11,7 +11,8 @@
 
 use std::time::{Duration, Instant};
 use poc_7::testutil::{
-    Peer, start_chain, sync_until_converged, assert_eventually,
+    Peer, start_chain, start_multi_source, start_sink_download,
+    sync_until_converged, assert_eventually, clone_events_to,
 };
 
 fn test_channel() -> [u8; 32] {
@@ -271,4 +272,374 @@ async fn multi_source_b0_8x_6250() {
 #[ignore]
 async fn multi_source_b0_1x_50k() {
     run_multi_source_bench(1, 50_000).await;
+}
+
+// ---------------------------------------------------------------------------
+// Family B1: Multi-source concurrent (overlapping data)
+// ---------------------------------------------------------------------------
+
+/// Run a concurrent multi-source catchup benchmark (B1).
+///
+/// All sources have identical data (cloned from S0). The sink runs
+/// `accept_loop_concurrent` and sources run `connect_loop` (repeated sessions).
+/// Over multiple negentropy rounds, sources discover the sink already has events
+/// from other sources and skip redundant transfers — the dedup ratio converges
+/// toward 1.0x naturally.
+async fn run_multi_source_concurrent_bench(source_count: usize, events_per_source: usize) {
+    let channel = test_channel();
+    let sources: Vec<Peer> = (0..source_count)
+        .map(|i| Peer::new(&format!("cs{}", i), channel))
+        .collect();
+    let sink = Peer::new("csink", channel);
+
+    // Generate events at S0 only
+    let gen_start = Instant::now();
+    sources[0].batch_create_messages(events_per_source);
+    let gen_secs = gen_start.elapsed().as_secs_f64();
+    let total_unique = events_per_source as i64;
+    eprintln!(
+        "Generated {} events at S0 in {:.2}s, cloning to {} sources...",
+        total_unique, gen_secs, source_count - 1
+    );
+
+    // Clone S0's data to all other sources (overlapping data)
+    if source_count > 1 {
+        let targets: Vec<&Peer> = sources[1..].iter().collect();
+        clone_events_to(&sources[0], &targets);
+        for i in 1..source_count {
+            assert_eq!(sources[i].store_count(), total_unique,
+                "S{} should have {} events after clone", i, total_unique);
+        }
+        eprintln!("  Cloned to S1..S{}", source_count - 1);
+    }
+
+    let rss_before = peak_rss_mib();
+    let start = Instant::now();
+
+    // Start concurrent sink + all sources with connect_loop (repeated sessions)
+    let handles = start_multi_source(&sources, &sink);
+
+    // Wait for sink to converge (scale timeout with event count)
+    let timeout_secs = if events_per_source >= 100_000 { 600 } else { 120 };
+    let progress_start = Instant::now();
+    let last_progress = std::cell::Cell::new(Instant::now());
+    assert_eventually(
+        || {
+            let count = sink.store_count();
+            if last_progress.get().elapsed() >= Duration::from_secs(10) {
+                eprintln!("  [progress] sink has {} / {} events ({:.0}s elapsed)",
+                    count, total_unique, progress_start.elapsed().as_secs_f64());
+                last_progress.set(Instant::now());
+            }
+            count == total_unique
+        },
+        Duration::from_secs(timeout_secs),
+        &format!(
+            "concurrent sink convergence to {} events",
+            total_unique,
+        ),
+    ).await;
+
+    let wall_ms = start.elapsed().as_millis() as u64;
+    let rss_after = peak_rss_mib();
+    let events_per_sec = total_unique as f64 / (wall_ms as f64 / 1000.0);
+
+    // Drop handles to stop all loops
+    drop(handles);
+
+    assert_eq!(sink.store_count(), total_unique);
+
+    eprintln!();
+    eprintln!(
+        "=== Multi-source B1 concurrent: {} sources x {} events (overlapping) ===",
+        source_count, events_per_source,
+    );
+    eprintln!("  Unique events:    {}", total_unique);
+    eprintln!("  Catchup wall:     {} ms", wall_ms);
+    eprintln!("  Events/s:         {:.0}", events_per_sec);
+    eprintln!("  Sink store:       {}", sink.store_count());
+    eprintln!("  Peak RSS:         {:.1} MiB (before: {:.1})", rss_after, rss_before);
+    eprintln!();
+}
+
+/// B1 smoke: 2 sources, 5k overlapping events.
+#[tokio::test]
+async fn multi_source_b1_2x_5k() {
+    run_multi_source_concurrent_bench(2, 5_000).await;
+}
+
+/// B1: 4 sources, 5k overlapping events.
+#[tokio::test]
+#[ignore]
+async fn multi_source_b1_4x_5k() {
+    run_multi_source_concurrent_bench(4, 5_000).await;
+}
+
+/// B1: 8 sources, 6.25k overlapping events.
+#[tokio::test]
+#[ignore]
+async fn multi_source_b1_8x_6250() {
+    run_multi_source_concurrent_bench(8, 6_250).await;
+}
+
+/// B1 ~10MB: 1 source, 100k events (solo baseline).
+#[tokio::test]
+#[ignore]
+async fn multi_source_b1_1x_100k() {
+    run_multi_source_concurrent_bench(1, 100_000).await;
+}
+
+/// B1 ~10MB: 2 sources, 100k overlapping events.
+#[tokio::test]
+#[ignore]
+async fn multi_source_b1_2x_100k() {
+    run_multi_source_concurrent_bench(2, 100_000).await;
+}
+
+/// B1 ~10MB: 4 sources, 100k overlapping events.
+#[tokio::test]
+#[ignore]
+async fn multi_source_b1_4x_100k() {
+    run_multi_source_concurrent_bench(4, 100_000).await;
+}
+
+/// B1 ~10MB: 8 sources, 100k overlapping events.
+#[tokio::test]
+#[ignore]
+async fn multi_source_b1_8x_100k() {
+    run_multi_source_concurrent_bench(8, 100_000).await;
+}
+
+/// B1 ~100MB: 8 sources, ~1M overlapping events (≈96 bytes/event × 1M ≈ 96MB unique data).
+#[tokio::test]
+#[ignore]
+async fn multi_source_b1_8x_100mb() {
+    run_multi_source_concurrent_bench(8, 1_000_000).await;
+}
+
+/// B1 diagnostic: 1 source, 1M events — isolates scale from concurrency.
+#[tokio::test]
+#[ignore]
+async fn multi_source_b1_1x_1m_diag() {
+    run_multi_source_concurrent_bench(1, 1_000_000).await;
+}
+
+// ---------------------------------------------------------------------------
+// Family B2: Multi-source concurrent (partitioned / non-overlapping data)
+// ---------------------------------------------------------------------------
+
+/// Run a concurrent multi-source benchmark with partitioned data (B2).
+///
+/// Each source generates its own unique events (total_events / source_count each).
+/// No overlap between sources — every event exists at exactly one source.
+/// The sink must collect all events from all sources concurrently.
+///
+/// This models the "swarming" scenario: each peer has a different piece of the
+/// total dataset. Negentropy sessions discover non-overlapping have_ids, so
+/// there is zero redundant transfer and no dedup overhead.
+async fn run_multi_source_partitioned_bench(source_count: usize, total_events: usize) {
+    let channel = test_channel();
+    let events_per_source = total_events / source_count;
+    let sources: Vec<Peer> = (0..source_count)
+        .map(|i| Peer::new(&format!("ps{}", i), channel))
+        .collect();
+    let sink = Peer::new("psink", channel);
+
+    // Each source generates its own unique events
+    let gen_start = Instant::now();
+    for (i, source) in sources.iter().enumerate() {
+        source.batch_create_messages(events_per_source);
+        eprintln!("  S{}: generated {} events", i, events_per_source);
+    }
+    let gen_secs = gen_start.elapsed().as_secs_f64();
+    let total_unique = (source_count * events_per_source) as i64;
+    eprintln!(
+        "Generated {} total unique events across {} sources in {:.2}s ({} each, no overlap)",
+        total_unique, source_count, gen_secs, events_per_source,
+    );
+
+    let rss_before = peak_rss_mib();
+    let start = Instant::now();
+
+    let handles = start_multi_source(&sources, &sink);
+
+    let timeout_secs = if total_events >= 100_000 { 600 } else { 120 };
+    let progress_start = Instant::now();
+    let last_progress = std::cell::Cell::new(Instant::now());
+    assert_eventually(
+        || {
+            let count = sink.store_count();
+            if last_progress.get().elapsed() >= Duration::from_secs(10) {
+                eprintln!("  [progress] sink has {} / {} events ({:.0}s elapsed)",
+                    count, total_unique, progress_start.elapsed().as_secs_f64());
+                last_progress.set(Instant::now());
+            }
+            count == total_unique
+        },
+        Duration::from_secs(timeout_secs),
+        &format!("partitioned sink convergence to {} events", total_unique),
+    ).await;
+
+    let wall_ms = start.elapsed().as_millis() as u64;
+    let rss_after = peak_rss_mib();
+    let events_per_sec = total_unique as f64 / (wall_ms as f64 / 1000.0);
+    let mb_per_sec = events_per_sec * 100.0 / 1_000_000.0;
+
+    drop(handles);
+    assert_eq!(sink.store_count(), total_unique);
+
+    eprintln!();
+    eprintln!(
+        "=== Multi-source B2 partitioned: {} sources x {} events = {} total (no overlap) ===",
+        source_count, events_per_source, total_unique,
+    );
+    eprintln!("  Unique events:    {}", total_unique);
+    eprintln!("  Catchup wall:     {} ms", wall_ms);
+    eprintln!("  Events/s:         {:.0}", events_per_sec);
+    eprintln!("  MB/s:             {:.2}", mb_per_sec);
+    eprintln!("  Sink store:       {}", sink.store_count());
+    eprintln!("  Peak RSS:         {:.1} MiB (before: {:.1})", rss_after, rss_before);
+    eprintln!();
+}
+
+/// B2: 1 source, 100k events (solo baseline for partitioned comparison).
+#[tokio::test]
+#[ignore]
+async fn multi_source_b2_1x_100k() {
+    run_multi_source_partitioned_bench(1, 100_000).await;
+}
+
+/// B2: 2 sources, 50k each = 100k total.
+#[tokio::test]
+#[ignore]
+async fn multi_source_b2_2x_100k() {
+    run_multi_source_partitioned_bench(2, 100_000).await;
+}
+
+/// B2: 4 sources, 25k each = 100k total.
+#[tokio::test]
+#[ignore]
+async fn multi_source_b2_4x_100k() {
+    run_multi_source_partitioned_bench(4, 100_000).await;
+}
+
+/// B2: 8 sources, 12.5k each = 100k total.
+#[tokio::test]
+#[ignore]
+async fn multi_source_b2_8x_100k() {
+    run_multi_source_partitioned_bench(8, 100_000).await;
+}
+
+// ---------------------------------------------------------------------------
+// Family B3: Sink-driven download with coordinated round-based assignment
+// ---------------------------------------------------------------------------
+
+/// Run a sink-driven download benchmark (B3).
+///
+/// All sources have identical data (cloned from S0). The sink connects to all
+/// sources as initiator, using coordinated round-based assignment to split
+/// downloads across sources. A coordinator thread collects need_ids from all
+/// peers, assigns events via greedy load balancing (least-loaded peer that
+/// has the event). Undelivered events re-appear in the next round.
+async fn run_sink_download_bench(source_count: usize, events_per_source: usize) {
+    let channel = test_channel();
+    let sources: Vec<Peer> = (0..source_count)
+        .map(|i| Peer::new(&format!("ds{}", i), channel))
+        .collect();
+    let sink = Peer::new("dsink", channel);
+
+    // Generate events at S0 only
+    let gen_start = Instant::now();
+    sources[0].batch_create_messages(events_per_source);
+    let gen_secs = gen_start.elapsed().as_secs_f64();
+    let total_unique = events_per_source as i64;
+    eprintln!(
+        "Generated {} events at S0 in {:.2}s, cloning to {} sources...",
+        total_unique, gen_secs, source_count - 1
+    );
+
+    // Clone S0's data to all other sources (overlapping data)
+    if source_count > 1 {
+        let targets: Vec<&Peer> = sources[1..].iter().collect();
+        clone_events_to(&sources[0], &targets);
+        eprintln!("  Cloned to S1..S{}", source_count - 1);
+    }
+
+    let rss_before = peak_rss_mib();
+    let start = Instant::now();
+
+    // Sink-driven download: sink connects to all sources with claimed set
+    let handles = start_sink_download(&sources, &sink);
+
+    let timeout_secs = if events_per_source >= 100_000 { 600 } else { 120 };
+    let progress_start = Instant::now();
+    let last_progress = std::cell::Cell::new(Instant::now());
+    assert_eventually(
+        || {
+            let count = sink.store_count();
+            if last_progress.get().elapsed() >= Duration::from_secs(10) {
+                eprintln!("  [progress] sink has {} / {} events ({:.0}s elapsed)",
+                    count, total_unique, progress_start.elapsed().as_secs_f64());
+                last_progress.set(Instant::now());
+            }
+            count == total_unique
+        },
+        Duration::from_secs(timeout_secs),
+        &format!("sink download convergence to {} events", total_unique),
+    ).await;
+
+    let wall_ms = start.elapsed().as_millis() as u64;
+    let rss_after = peak_rss_mib();
+    let events_per_sec = total_unique as f64 / (wall_ms as f64 / 1000.0);
+    let mb_per_sec = events_per_sec * 100.0 / 1_000_000.0;
+
+    drop(handles);
+    assert_eq!(sink.store_count(), total_unique);
+
+    eprintln!();
+    eprintln!(
+        "=== Multi-source B3 sink-download: {} sources x {} events (coordinated rounds) ===",
+        source_count, events_per_source,
+    );
+    eprintln!("  Unique events:    {}", total_unique);
+    eprintln!("  Catchup wall:     {} ms", wall_ms);
+    eprintln!("  Events/s:         {:.0}", events_per_sec);
+    eprintln!("  MB/s:             {:.2}", mb_per_sec);
+    eprintln!("  Sink store:       {}", sink.store_count());
+    eprintln!("  Peak RSS:         {:.1} MiB (before: {:.1})", rss_after, rss_before);
+    eprintln!();
+}
+
+/// B3 smoke: 2 sources, 5k overlapping events.
+#[tokio::test]
+async fn multi_source_b3_2x_5k() {
+    run_sink_download_bench(2, 5_000).await;
+}
+
+/// B3: 1 source, 100k events (solo baseline).
+#[tokio::test]
+#[ignore]
+async fn multi_source_b3_1x_100k() {
+    run_sink_download_bench(1, 100_000).await;
+}
+
+/// B3: 2 sources, 100k overlapping events.
+#[tokio::test]
+#[ignore]
+async fn multi_source_b3_2x_100k() {
+    run_sink_download_bench(2, 100_000).await;
+}
+
+/// B3: 4 sources, 100k overlapping events.
+#[tokio::test]
+#[ignore]
+async fn multi_source_b3_4x_100k() {
+    run_sink_download_bench(4, 100_000).await;
+}
+
+/// B3: 8 sources, 100k overlapping events.
+#[tokio::test]
+#[ignore]
+async fn multi_source_b3_8x_100k() {
+    run_sink_download_bench(8, 100_000).await;
 }

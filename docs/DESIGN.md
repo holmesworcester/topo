@@ -469,6 +469,29 @@ Can be eventual:
 2. queue cleanup/purge,
 3. metrics/logging.
 
+## 7.6 Multi-source download coordination
+
+When a sink downloads from multiple sources concurrently, a coordinator thread
+assigns events to peers using round-based greedy load balancing:
+
+1. **Discovery**: each peer runs negentropy with its source, discovering need_ids
+   (events the sink needs). Push (have_ids) proceeds immediately.
+2. **Report**: after reconciliation, each peer sends its need_ids to the coordinator
+   via a per-peer channel.
+3. **Assignment**: the coordinator collects reports (500ms window after first report),
+   builds an event-to-peer availability map, sorts by availability ascending
+   (unique events first), and assigns each event to the least-loaded peer that has it.
+4. **Transfer**: each peer receives its assigned subset and sends HaveList only for
+   those events. Events flow into a shared batch_writer.
+5. **Forget**: assignments are discarded after each round. Next round starts fresh.
+
+Key properties:
+- Events available from one peer are assigned to that peer (no choice).
+- Events available from many peers are spread evenly across them.
+- Slow peers' undelivered events re-appear as need_ids next round and get reassigned.
+- Push path (egress streaming) continues during coordination wait.
+- Per-peer channels prevent round-mixing between fast and slow peers.
+
 ---
 
 # 8. CLI and Daemon Contract
