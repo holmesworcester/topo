@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod bench_dep;
 pub mod device_invite;
 pub mod encrypted;
 pub mod file_slice;
@@ -23,6 +24,7 @@ pub mod user_removed;
 use std::sync::OnceLock;
 
 pub use admin::{AdminBootEvent, AdminOngoingEvent};
+pub use bench_dep::BenchDepEvent;
 pub use device_invite::{DeviceInviteFirstEvent, DeviceInviteOngoingEvent};
 pub use encrypted::EncryptedEvent;
 pub use file_slice::FileSliceEvent;
@@ -69,6 +71,7 @@ pub const EVENT_TYPE_SECRET_SHARED: u8 = 22;
 pub const EVENT_TYPE_TRANSPORT_KEY: u8 = 23;
 pub const EVENT_TYPE_MESSAGE_ATTACHMENT: u8 = 24;
 pub const EVENT_TYPE_FILE_SLICE: u8 = 25;
+pub const EVENT_TYPE_BENCH_DEP: u8 = 26;
 
 /// Max event blob size: 1 MiB
 pub const EVENT_MAX_BLOB_BYTES: usize = 1024 * 1024;
@@ -100,6 +103,7 @@ pub enum ParsedEvent {
     TransportKey(TransportKeyEvent),
     MessageAttachment(MessageAttachmentEvent),
     FileSlice(FileSliceEvent),
+    BenchDep(BenchDepEvent),
 }
 
 impl ParsedEvent {
@@ -130,6 +134,7 @@ impl ParsedEvent {
             ParsedEvent::TransportKey(t) => t.created_at_ms,
             ParsedEvent::MessageAttachment(a) => a.created_at_ms,
             ParsedEvent::FileSlice(f) => f.created_at_ms,
+            ParsedEvent::BenchDep(b) => b.created_at_ms,
         }
     }
 
@@ -185,6 +190,7 @@ impl ParsedEvent {
                 ("key_event_id", a.key_event_id),
             ],
             ParsedEvent::FileSlice(f) => vec![("signed_by", f.signed_by)],
+            ParsedEvent::BenchDep(b) => b.dep_ids.iter().map(|id| ("dep_id", *id)).collect(),
         }
     }
 
@@ -215,6 +221,7 @@ impl ParsedEvent {
             ParsedEvent::TransportKey(_) => EVENT_TYPE_TRANSPORT_KEY,
             ParsedEvent::MessageAttachment(_) => EVENT_TYPE_MESSAGE_ATTACHMENT,
             ParsedEvent::FileSlice(_) => EVENT_TYPE_FILE_SLICE,
+            ParsedEvent::BenchDep(_) => EVENT_TYPE_BENCH_DEP,
         }
     }
 
@@ -246,7 +253,8 @@ impl ParsedEvent {
             | ParsedEvent::MessageDeletion(_)
             | ParsedEvent::Workspace(_)
             | ParsedEvent::InviteAccepted(_)
-            | ParsedEvent::MessageAttachment(_) => None,
+            | ParsedEvent::MessageAttachment(_)
+            | ParsedEvent::BenchDep(_) => None,
         }
     }
 }
@@ -324,6 +332,7 @@ pub fn registry() -> &'static EventRegistry {
             &transport_key::TRANSPORT_KEY_META,
             &message_attachment::MESSAGE_ATTACHMENT_META,
             &file_slice::FILE_SLICE_META,
+            &bench_dep::BENCH_DEP_META,
         ])
     })
 }

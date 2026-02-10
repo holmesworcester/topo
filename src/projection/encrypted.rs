@@ -199,7 +199,8 @@ pub fn project_encrypted(
         | ParsedEvent::UserRemoved(_)
         | ParsedEvent::PeerRemoved(_)
         | ParsedEvent::SecretShared(_)
-        | ParsedEvent::TransportKey(_) => {
+        | ParsedEvent::TransportKey(_)
+        | ParsedEvent::BenchDep(_) => {
             return Ok(ProjectionDecision::Reject {
                 reason: "identity events cannot appear inside encrypted wrappers".to_string(),
             });
