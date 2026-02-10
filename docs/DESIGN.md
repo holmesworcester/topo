@@ -329,14 +329,17 @@ Blocked edges are recorded in:
 We do not require a full persisted dependency graph for baseline projection.
 Dependencies are extracted per attempt from schema metadata.
 
-## 5.2 Set-based unblock
+## 5.2 SQL-first cascade unblock
 
-Unblocking uses set-based SQL:
+Unblocking uses a SQL-first cascade path:
 
-1. clear edges where blocker became valid,
-2. requeue candidates with no remaining blockers.
+1. clear blocker rows with `DELETE ... RETURNING event_id`,
+2. for returned candidates, keep only those with zero remaining blocker rows,
+3. enqueue runnable candidates into a DB temp worklist (`cascade_worklist`),
+4. project by popping from that worklist; newly valid events repeat step 1.
 
-This is Kahn-compatible with multiple blockers and avoids per-row imperative unblock loops.
+This remains Kahn-compatible with multiple blockers while avoiding a separate
+durable candidate table or ad-hoc in-memory recursion.
 
 ## 5.3 Event creation API
 

@@ -540,6 +540,7 @@ Rules:
 - If any required refs are missing: write rows in `blocked_event_deps` and return `Block`.
 - Signer refs (`signed_by` + `signer_type`) are dependency metadata and use the same blocking/unblocking path.
 - Signature verification is attempted only after signer deps and other required deps are available (signed event types only).
+- Do not add a second blocked-state counter table; blockedness is derived from `blocked_event_deps` rows.
 - Do not persist full `event_dependencies` yet.
 - Use one dependency resolver for all event families (content, identity, encrypted wrappers, invites).
 - Dependency extraction is driven by event schema metadata only (`is_event_ref`, `required`, conditional requirement flags).
@@ -549,28 +550,27 @@ When full dependency table is justified later:
 - heavy dependency introspection,
 - or proven perf bottleneck from repeated lookups.
 
-## 6.3 Set-based unblock (Kahn-compatible with multiple blockers)
+## 6.3 SQL-first cascade unblock (Kahn-compatible with multiple blockers)
 
 - An event can have N blocker rows.
 - It is runnable when no blocker rows remain.
 
-Use set-based SQL when blocker `X` becomes valid:
+Use SQL-first unblock when blocker `X` becomes valid:
 
 ```sql
 DELETE FROM blocked_event_deps
 WHERE peer_id = ? AND blocker_event_id = ?;
-
-INSERT OR IGNORE INTO project_queue (peer_id, event_id, available_at)
-SELECT DISTINCT c.peer_id, c.event_id, ?
-FROM blocked_event_deps_candidates c
-WHERE NOT EXISTS (
-    SELECT 1
-    FROM blocked_event_deps b
-    WHERE b.peer_id = c.peer_id AND b.event_id = c.event_id
-);
 ```
 
-Set-based SQL means operating on sets of rows at once instead of per-event loops. It is helpful for unblock/requeue because one newly valid event can unblock many dependents.
+Implementation shape:
+- Use `DELETE ... RETURNING event_id` to collect candidates in one pass.
+- For each returned candidate, check if blocker rows still exist (`EXISTS` on `blocked_event_deps`).
+- Enqueue newly unblocked candidates into a DB temp worklist (`cascade_worklist`), then project by popping rows from that worklist.
+- When a projected event becomes `Valid`, run the same unblock step for that event id.
+- If projection returns `Block { missing }` (for example encrypted inner deps), reinsert missing rows into `blocked_event_deps` for the same outer `event_id`.
+
+Do not use a durable `blocked_event_deps_candidates` scratch table for this path.
+Do not route in-call cascade fanout through `project_queue`.
 
 ## 6.4 Event creation API (simple and testable)
 
@@ -1238,7 +1238,7 @@ Definition of done:
 Must implement:
 1. `project_one(recorded_by,event_id)` entrypoint.
 2. blocked-only dependency persistence (`blocked_event_deps`).
-3. set-based unblock and requeue SQL.
+3. SQL-first cascade unblock via `DELETE ... RETURNING` plus DB-backed temp worklist.
 4. `create_event_sync` success-only-on-valid contract.
 5. explicit DRY split enforcement:
    - shared pipeline handles deps/signer/queues/terminal writes,
