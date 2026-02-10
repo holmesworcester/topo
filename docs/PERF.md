@@ -1,5 +1,7 @@
 # Performance Benchmarks
 
+> **Status: Active** — Current benchmark results and testing guide.
+
 ## Test Environment
 - SQLite on disk (WAL mode, NORMAL sync)
 - In-process sim transport (no real QUIC sockets)

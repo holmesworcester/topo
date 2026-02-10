@@ -1,5 +1,7 @@
 # Quiet Rust Prototype Protocol (Post-PLAN End State)
 
+> **Status: Active** — Target protocol design describing the post-PLAN end state.
+
 This document describes the target protocol and runtime shape after completing all phases in `PLAN.md`.
 It is intentionally practical: one coherent model, one projection path, one dependency mechanism, and operational behavior that is easy to test with real QUIC daemons.
 

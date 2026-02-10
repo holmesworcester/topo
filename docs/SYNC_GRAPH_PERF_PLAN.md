@@ -1,5 +1,7 @@
 # Sync Graph Performance Plan
 
+> **Status: Active** — Performance measurement and improvement plan for graph-topology sync.
+
 ## Goal
 Measure and improve sync behavior in graph-like topologies, with focus on:
 1. propagation across a peer chain (hop-by-hop spread),

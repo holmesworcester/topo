@@ -1,5 +1,7 @@
 # Performance Analysis: Sync Scaling & Memory
 
+> **Status: Active** — Scaling analysis and architecture guidance for memory-constrained targets.
+
 Benchmarked on master (`78cdf82`), 2026-02-07.
 
 ## Benchmark Results
