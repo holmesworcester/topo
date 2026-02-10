@@ -242,8 +242,8 @@ pub fn project_one(
 
 /// Enqueue events that become fully unblocked when blocker X is resolved.
 /// Deletes X's dep edges (using RETURNING to collect candidates in one pass),
-/// filters for those with zero remaining blockers, and inserts them into the
-/// cascade_worklist temp table (DB-backed, not in-memory).
+/// filters for those with zero remaining blockers, and inserts them into a
+/// peer-scoped cascade_worklist temp table (DB-backed, not in-memory).
 fn enqueue_newly_unblocked(
     conn: &Connection,
     recorded_by: &str,
@@ -279,8 +279,8 @@ fn enqueue_newly_unblocked(
         )?;
         if !still_blocked {
             conn.prepare_cached(
-                "INSERT INTO cascade_worklist (event_id) VALUES (?1)",
-            )?.execute(rusqlite::params![&eid_b64])?;
+                "INSERT INTO cascade_worklist (peer_id, event_id) VALUES (?1, ?2)",
+            )?.execute(rusqlite::params![recorded_by, &eid_b64])?;
         }
     }
 
@@ -297,13 +297,17 @@ fn unblock_dependents(
     blocker_b64: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     conn.execute_batch(
-        "CREATE TEMP TABLE IF NOT EXISTS cascade_worklist (event_id TEXT NOT NULL)",
+        "CREATE TEMP TABLE IF NOT EXISTS cascade_worklist (
+            peer_id TEXT NOT NULL,
+            event_id TEXT NOT NULL
+        )",
     )?;
+    conn.execute("DELETE FROM cascade_worklist", [])?;
 
     enqueue_newly_unblocked(conn, recorded_by, blocker_b64)?;
 
     loop {
-        // Claim one item from the DB-backed worklist
+        // Claim one item from the DB-backed worklist.
         let eid_b64: Option<String> = conn.prepare_cached(
             "DELETE FROM cascade_worklist
              WHERE rowid = (SELECT MIN(rowid) FROM cascade_worklist)
