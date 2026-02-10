@@ -6,10 +6,16 @@ use std::time::Duration;
 
 use tracing::{info, warn};
 
-use crate::db::{open_connection, intro::{insert_intro_attempt, update_intro_status, intro_already_seen}};
+use crate::db::{
+    open_connection,
+    health::record_endpoint_observation,
+    intro::{insert_intro_attempt, intro_already_seen, update_intro_status},
+};
 use crate::sync::{SyncMessage, parse_sync_message};
 use crate::sync::engine::run_sync_initiator_dual;
 use crate::transport::{AllowedPeers, DualConnection, peer_identity_from_connection};
+
+const ENDPOINT_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// Read an IntroOffer from a uni-directional recv stream.
 pub async fn read_intro_from_uni(
@@ -147,6 +153,26 @@ pub async fn handle_intro_offer(
 
                         info!("Hole punch succeeded! Direct connection to {}", &other_peer_hex[..16]);
                         update_status(db_path, recorded_by, &intro_id, "connected", None);
+
+                        // Preserve endpoint observations for peers reached via punched links.
+                        // This enables future explicit intro calls between peers that were
+                        // discovered through successful hole-punched connectivity.
+                        let remote = connection.remote_address();
+                        if let Ok(db) = open_connection(db_path) {
+                            let now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_millis() as i64;
+                            let _ = record_endpoint_observation(
+                                &db,
+                                recorded_by,
+                                &other_peer_hex,
+                                &remote.ip().to_string(),
+                                remote.port(),
+                                now_ms,
+                                ENDPOINT_TTL_MS,
+                            );
+                        }
 
                         // Run normal sync on the direct connection
                         run_sync_on_punched_connection(

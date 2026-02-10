@@ -40,18 +40,6 @@ enum Commands {
         /// Allowed peer fingerprints (hex, repeatable)
         #[arg(long = "pin-peer")]
         pin_peer: Vec<String>,
-        /// Enable intro worker (sends IntroOffers on same endpoint for NAT compat)
-        #[arg(long)]
-        intro_worker: bool,
-        /// Intro worker scan interval in ms
-        #[arg(long, default_value = "5000")]
-        intro_interval_ms: u64,
-        /// Intro TTL in ms
-        #[arg(long, default_value = "30000")]
-        intro_ttl_ms: u64,
-        /// Intro attempt window in ms
-        #[arg(long, default_value = "4000")]
-        intro_window_ms: u32,
     },
 
     /// Print local transport identity — SPKI fingerprint from TLS cert (generates cert if needed)
@@ -208,24 +196,6 @@ enum Commands {
         peer: Option<String>,
     },
 
-    /// Run continuous intro worker that introduces peer pairs with fresh endpoint observations
-    #[command(name = "intro-worker")]
-    IntroWorker {
-        #[arg(short, long, default_value = "server.db")]
-        db: String,
-        /// Allowed peer fingerprints (hex, repeatable)
-        #[arg(long = "pin-peer")]
-        pin_peer: Vec<String>,
-        /// Scan interval in milliseconds
-        #[arg(long, default_value = "5000")]
-        interval_ms: u64,
-        /// Intro TTL in milliseconds
-        #[arg(long, default_value = "30000")]
-        ttl_ms: u64,
-        /// Attempt window in milliseconds
-        #[arg(long, default_value = "4000")]
-        attempt_window_ms: u32,
-    },
 }
 
 #[tokio::main]
@@ -234,7 +204,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Only init tracing for network commands (avoid polluting message output)
     match &cli.command {
-        Commands::Sync { .. } | Commands::Intro { .. } | Commands::IntroWorker { .. } => {
+        Commands::Sync { .. } | Commands::Intro { .. } => {
             let subscriber = FmtSubscriber::builder()
                 .with_max_level(Level::INFO)
                 .finish();
@@ -244,10 +214,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     match cli.command {
-        Commands::Sync { bind, connect, db, pin_peer,
-                          intro_worker, intro_interval_ms, intro_ttl_ms, intro_window_ms } => {
-            run_sync(bind, connect, &db, &pin_peer,
-                     intro_worker, intro_interval_ms, intro_ttl_ms, intro_window_ms).await?;
+        Commands::Sync { bind, connect, db, pin_peer } => {
+            run_sync(bind, connect, &db, &pin_peer).await?;
         }
         Commands::TransportIdentity { db } => {
             run_identity(&db)?;
@@ -301,9 +269,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
         Commands::IntroAttempts { db, peer } => {
             cli_intro_attempts(&db, peer.as_deref())?;
-        }
-        Commands::IntroWorker { db, pin_peer, interval_ms, ttl_ms, attempt_window_ms } => {
-            cli_intro_worker(&db, &pin_peer, interval_ms, ttl_ms, attempt_window_ms).await?;
         }
     }
 
@@ -759,10 +724,6 @@ async fn run_sync(
     connect: Option<SocketAddr>,
     db_path: &str,
     pin_peers: &[String],
-    intro_worker: bool,
-    intro_interval_ms: u64,
-    intro_ttl_ms: u64,
-    intro_window_ms: u32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Initialize DB before spawning concurrent loops (avoids create_tables race)
     {
@@ -818,31 +779,6 @@ async fn run_sync(
         }
     });
 
-    // Optional: spawn intro worker on the SAME endpoint (shares UDP socket for NAT compat)
-    let intro_handle = if intro_worker {
-        info!("Intro worker enabled (interval={}ms, ttl={}ms, window={}ms)",
-            intro_interval_ms, intro_ttl_ms, intro_window_ms);
-        let intro_ep = endpoint.clone();
-        let db = db_owned.clone();
-        let rb = recorded_by.clone();
-        Some(tokio::task::spawn_blocking(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            rt.block_on(async move {
-                if let Err(e) = poc_7::sync::intro::run_intro_worker(
-                    &intro_ep, &db, &rb,
-                    intro_interval_ms, intro_ttl_ms, intro_window_ms,
-                ).await {
-                    tracing::warn!("intro_worker exited: {}", e);
-                }
-            });
-        }))
-    } else {
-        None
-    };
-
     if let Some(remote) = connect {
         let connect_endpoint = endpoint.clone();
         let connect_allowed = allowed_peers_inner.clone();
@@ -863,7 +799,6 @@ async fn run_sync(
         tokio::select! {
             _ = accept_handle => {}
             _ = connect_handle => {}
-            _ = async { if let Some(h) = intro_handle { h.await.ok(); } else { std::future::pending::<()>().await; } } => {}
             _ = tokio::signal::ctrl_c() => {
                 info!("Ctrl-C received, shutting down");
             }
@@ -871,7 +806,6 @@ async fn run_sync(
     } else {
         tokio::select! {
             _ = accept_handle => {}
-            _ = async { if let Some(h) = intro_handle { h.await.ok(); } else { std::future::pending::<()>().await; } } => {}
             _ = tokio::signal::ctrl_c() => {
                 info!("Ctrl-C received, shutting down");
             }
@@ -1168,51 +1102,5 @@ fn cli_intro_attempts(
         println!();
     }
 
-    Ok(())
-}
-
-async fn cli_intro_worker(
-    db_path: &str,
-    pin_peers: &[String],
-    interval_ms: u64,
-    ttl_ms: u64,
-    attempt_window_ms: u32,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let db = open_connection(db_path)?;
-    create_tables(&db)?;
-    drop(db);
-
-    let (cert_path, key_path) = transport_cert_paths_from_db(db_path);
-    let (cert, key) = load_or_generate_cert(&cert_path, &key_path)?;
-    let recorded_by = {
-        let fp = extract_spki_fingerprint(cert.as_ref())?;
-        hex::encode(fp)
-    };
-
-    let cli_pins = AllowedPeers::from_hex_strings(pin_peers)?;
-    let db = open_connection(db_path)?;
-    let allowed = allowed_peers_combined(&db, &recorded_by, &cli_pins)?;
-    drop(db);
-
-    let endpoint = create_dual_endpoint(
-        "0.0.0.0:0".parse()?,
-        cert,
-        key,
-        Arc::new(allowed),
-    )?;
-
-    tokio::select! {
-        result = poc_7::sync::intro::run_intro_worker(
-            &endpoint, db_path, &recorded_by,
-            interval_ms, ttl_ms, attempt_window_ms,
-        ) => {
-            result?;
-        }
-        _ = tokio::signal::ctrl_c() => {
-            info!("Ctrl-C received, shutting down intro worker");
-        }
-    }
-
-    endpoint.close(0u32.into(), b"shutdown");
     Ok(())
 }
