@@ -80,16 +80,18 @@ async fn low_mem_ios_budget_smoke_10k() {
     let _env = EnvGuard::enable_low_mem_ios();
 
     let channel = test_channel(b"lm01");
-    let alice = Peer::new("alice_lowmem_smoke", channel);
-    let bob = Peer::new("bob_lowmem_smoke", channel);
+    let alice = Peer::new_with_identity("alice_lowmem_smoke", channel);
+    let bob = Peer::new_with_identity("bob_lowmem_smoke", channel);
 
     alice.batch_create_messages(5_000);
     bob.batch_create_messages(5_000);
 
-    let _metrics = sync_until_converged(&alice, &bob, 10_000, Duration::from_secs(180)).await;
+    // 6 identity per peer + 10k content; after sync each has 6 own + 5 other shared + 10k = 10011
+    let expected_store = 10_000 + 11;
+    let _metrics = sync_until_converged(&alice, &bob, expected_store, Duration::from_secs(180)).await;
 
-    assert!(alice.store_count() >= 10_000);
-    assert!(bob.store_count() >= 10_000);
+    assert_eq!(alice.store_count(), expected_store);
+    assert_eq!(bob.store_count(), expected_store);
 
     let peak = peak_rss_mib().expect("VmHWM unavailable on this platform");
     let budget = rss_budget_mib_from_env("LOW_MEM_IOS_BUDGET_MIB", rss_budget_mib_default());
@@ -114,14 +116,16 @@ async fn low_mem_ios_budget_soak_million() {
     let budget = rss_budget_mib_from_env("LOW_MEM_IOS_SOAK_BUDGET_MIB", 24.0);
 
     let channel = test_channel(b"lm02");
-    let alice = Peer::new("alice_lowmem_soak", channel);
-    let bob = Peer::new("bob_lowmem_soak", channel);
+    let alice = Peer::new_with_identity("alice_lowmem_soak", channel);
+    let bob = Peer::new_with_identity("bob_lowmem_soak", channel);
 
     alice.batch_create_messages(events);
-    let _metrics = sync_until_converged(&alice, &bob, events as i64, Duration::from_secs(3600)).await;
+    // 6 identity per peer + N content; after sync each has 6 own + 5 other shared + N = N + 11
+    let expected_store = events as i64 + 11;
+    let _metrics = sync_until_converged(&alice, &bob, expected_store, Duration::from_secs(3600)).await;
 
-    assert!(alice.store_count() >= events as i64);
-    assert!(bob.store_count() >= events as i64);
+    assert_eq!(alice.store_count(), expected_store);
+    assert_eq!(bob.store_count(), expected_store);
 
     let peak = peak_rss_mib().expect("VmHWM unavailable on this platform");
     assert!(

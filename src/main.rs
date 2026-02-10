@@ -1,21 +1,33 @@
 use clap::{Parser, Subcommand};
+use rusqlite::OptionalExtension;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
-use poc_7::db::{open_connection, schema::{create_tables, backfill_legacy_messages, count_legacy_messages}, transport_trust::allowed_peers_combined};
-use poc_7::events::{MessageEvent, ReactionEvent, MessageDeletionEvent, WorkspaceEvent, ParsedEvent};
-use poc_7::transport_identity::{transport_cert_paths_from_db, load_transport_peer_id_from_db, ensure_transport_peer_id_from_db};
-use poc_7::projection::create::{create_event_sync, event_id_or_blocked};
-use poc_7::projection::pipeline::unblock_dependents;
+use ed25519_dalek::SigningKey;
+use poc_7::crypto::EventId;
+use poc_7::db::{
+    open_connection,
+    schema::{backfill_legacy_messages, count_legacy_messages, create_tables},
+    transport_trust::allowed_peers_combined,
+};
+use poc_7::events::{
+    DeviceInviteFirstEvent, InviteAcceptedEvent, MessageDeletionEvent, MessageEvent, ParsedEvent,
+    PeerSharedFirstEvent, ReactionEvent, UserBootEvent, UserInviteBootEvent, WorkspaceEvent,
+};
+use poc_7::projection::create::{create_event_sync, create_signed_event_sync, event_id_or_blocked};
+use poc_7::projection::pipeline::project_one;
 use poc_7::sync::engine::{accept_loop, connect_loop};
 use poc_7::transport::{
     AllowedPeers,
     create_dual_endpoint,
     extract_spki_fingerprint,
     load_or_generate_cert,
+};
+use poc_7::transport_identity::{
+    ensure_transport_peer_id_from_db, load_transport_peer_id_from_db, transport_cert_paths_from_db,
 };
 
 #[derive(Parser)]
@@ -215,7 +227,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     match cli.command {
-        Commands::Sync { bind, connect, db, pin_peer } => {
+        Commands::Sync {
+            bind,
+            connect,
+            db,
+            pin_peer,
+        } => {
             run_sync(bind, connect, &db, &pin_peer).await?;
         }
         Commands::TransportIdentity { db } => {
@@ -240,7 +257,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let code = run_assert_now(&db, &predicate)?;
             std::process::exit(code);
         }
-        Commands::AssertEventually { predicate, db, timeout_ms, interval_ms } => {
+        Commands::AssertEventually {
+            predicate,
+            db,
+            timeout_ms,
+            interval_ms,
+        } => {
             let code = run_assert_eventually(&db, &predicate, timeout_ms, interval_ms)?;
             std::process::exit(code);
         }
@@ -300,7 +322,11 @@ fn backfill_identity(db_path: &str) -> Result<(), Box<dyn std::error::Error + Se
     }
 
     let updated = backfill_legacy_messages(&db, &recorded_by)?;
-    println!("Backfilled {} legacy messages to identity {}", updated, &recorded_by[..16]);
+    println!(
+        "Backfilled {} legacy messages to identity {}",
+        updated,
+        &recorded_by[..16]
+    );
     Ok(())
 }
 
@@ -354,7 +380,7 @@ fn format_timestamp(ms: i64) -> String {
 }
 
 fn format_absolute(ms: i64) -> String {
-    use std::time::{UNIX_EPOCH, Duration};
+    use std::time::{Duration, UNIX_EPOCH};
     let dt = UNIX_EPOCH + Duration::from_millis(ms as u64);
     // Format as "Jan 15 10:30"
     let secs = dt.duration_since(UNIX_EPOCH).unwrap().as_secs();
@@ -366,9 +392,18 @@ fn format_absolute(ms: i64) -> String {
     // Simple month/day calculation
     let (_year, month, day) = days_to_ymd(days_since_epoch as i64);
     let month_name = match month {
-        1 => "Jan", 2 => "Feb", 3 => "Mar", 4 => "Apr",
-        5 => "May", 6 => "Jun", 7 => "Jul", 8 => "Aug",
-        9 => "Sep", 10 => "Oct", 11 => "Nov", 12 => "Dec",
+        1 => "Jan",
+        2 => "Feb",
+        3 => "Mar",
+        4 => "Apr",
+        5 => "May",
+        6 => "Jun",
+        7 => "Jul",
+        8 => "Aug",
+        9 => "Sep",
+        10 => "Oct",
+        11 => "Nov",
+        12 => "Dec",
         _ => "???",
     };
     format!("{} {} {:02}:{:02}", month_name, day, hours, minutes)
@@ -389,7 +424,10 @@ fn days_to_ymd(days: i64) -> (i64, u32, u32) {
     (y, m as u32, d as u32)
 }
 
-fn show_messages(db_path: &str, limit: usize) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn show_messages(
+    db_path: &str,
+    limit: usize,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let recorded_by = load_transport_peer_id_from_db(db_path)?;
     let db = open_connection(db_path)?;
     create_tables(&db)?;
@@ -407,14 +445,16 @@ fn show_messages(db_path: &str, limit: usize) -> Result<(), Box<dyn std::error::
     );
 
     let mut stmt = db.prepare(&query)?;
-    let rows: Vec<(String, String, String, i64)> = stmt.query_map(rusqlite::params![&recorded_by], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, i64>(3)?,
-        ))
-    })?.collect::<Result<Vec<_>, _>>()?;
+    let rows: Vec<(String, String, String, i64)> = stmt
+        .query_map(rusqlite::params![&recorded_by], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
 
     let total: i64 = db.query_row(
         "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
@@ -441,7 +481,9 @@ fn show_messages(db_path: &str, limit: usize) -> Result<(), Box<dyn std::error::
 
         if *author_id != last_author {
             // New author group
-            if i > 0 { println!(); }
+            if i > 0 {
+                println!();
+            }
             println!("  {} [{}]", author, ts);
             println!("    {}. {}", i + 1, content);
             println!("       id: {}", msg_id_hex);
@@ -462,9 +504,9 @@ fn parse_workspace_hex(workspace_hex: &str) -> Result<[u8; 32], Box<dyn std::err
     if workspace_bytes.len() > 32 {
         return Err("Workspace event ID must be at most 32 bytes".into());
     }
-    let mut workspace_event_id = [0u8; 32];
-    workspace_event_id[..workspace_bytes.len()].copy_from_slice(&workspace_bytes);
-    Ok(workspace_event_id)
+    let mut workspace_id = [0u8; 32];
+    workspace_id[..workspace_bytes.len()].copy_from_slice(&workspace_bytes);
+    Ok(workspace_id)
 }
 
 fn current_timestamp_ms() -> u64 {
@@ -478,8 +520,8 @@ fn current_timestamp_ms() -> u64 {
 /// This ensures send and delete-message use the same author, so deletion
 /// author-matching works correctly.
 fn stable_author_id(peer_id: &str) -> [u8; 32] {
-    use blake2::{Blake2b, Digest};
     use blake2::digest::consts::U32;
+    use blake2::{Blake2b, Digest};
     let mut hasher = Blake2b::<U32>::new();
     hasher.update(b"author-id:");
     hasher.update(peer_id.as_bytes());
@@ -489,93 +531,225 @@ fn stable_author_id(peer_id: &str) -> [u8; 32] {
     out
 }
 
-/// Ensure a workspace event exists and is valid for this peer.
-/// Returns the workspace event's event ID (to be used as workspace_event_id in messages).
-/// Creates a deterministic workspace event if none exists. Bypasses trust anchor guard
-/// for local creation. Deterministic means all peers with the same workspace_id will
-/// produce the same event blob and thus the same event hash.
-fn ensure_workspace_event(
+fn ensure_local_signer_tables(
     db: &rusqlite::Connection,
-    recorded_by: &str,
-    workspace_id: &[u8; 32],
-) -> Result<poc_7::crypto::EventId, Box<dyn std::error::Error + Send + Sync>> {
-    use poc_7::crypto::{event_id_to_base64, hash_event};
-    use poc_7::events;
-
-    // Check if a workspace event already exists and is valid for this peer
-    let existing: Option<String> = db.query_row(
-        "SELECT event_id FROM workspaces WHERE recorded_by = ?1 LIMIT 1",
-        rusqlite::params![recorded_by],
-        |row| row.get(0),
-    ).ok();
-
-    if let Some(eid_b64) = existing {
-        if let Some(eid) = poc_7::crypto::event_id_from_base64(&eid_b64) {
-            return Ok(eid);
-        }
-    }
-
-    // Create a deterministic workspace event (fixed timestamp + content = same hash on all peers)
-    let ws = ParsedEvent::Workspace(WorkspaceEvent {
-        created_at_ms: 0,
-        public_key: [0u8; 32],
-        workspace_id: *workspace_id,
-    });
-    let blob = events::encode_event(&ws).map_err(|e| format!("encode: {}", e))?;
-    let event_id = hash_event(&blob);
-    let eid_b64 = event_id_to_base64(&event_id);
-    let now = current_timestamp_ms() as i64;
-
-    // Store the event blob
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Canonical local signer pointer for this transport identity.
     db.execute(
-        "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
-         VALUES (?1, ?2, ?3, 'shared', ?4, ?5)",
-        rusqlite::params![&eid_b64, "workspace", blob.as_slice(), now, now],
+        "CREATE TABLE IF NOT EXISTS local_peer_signers (
+            recorded_by TEXT PRIMARY KEY,
+            event_id TEXT NOT NULL,
+            signing_key BLOB NOT NULL,
+            updated_at INTEGER NOT NULL
+        )",
+        [],
     )?;
+    // Legacy table retained for backward compatibility with older builds.
     db.execute(
-        "INSERT OR IGNORE INTO neg_items (ts, id) VALUES (?1, ?2)",
-        rusqlite::params![now, event_id.as_slice()],
+        "CREATE TABLE IF NOT EXISTS local_signing_keys (event_id TEXT PRIMARY KEY, signing_key BLOB NOT NULL)",
+        [],
     )?;
-    db.execute(
-        "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
-         VALUES (?1, ?2, ?3, 'local')",
-        rusqlite::params![recorded_by, &eid_b64, now],
-    )?;
-    // Bypass trust anchor guard — mark valid directly
-    db.execute(
-        "INSERT OR IGNORE INTO valid_events (peer_id, event_id) VALUES (?1, ?2)",
-        rusqlite::params![recorded_by, &eid_b64],
-    )?;
-    db.execute(
-        "INSERT OR IGNORE INTO workspaces (recorded_by, event_id, workspace_id, public_key)
-         VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![recorded_by, &eid_b64, workspace_id.as_slice(), &[0u8; 32] as &[u8]],
-    )?;
-    // Cascade-project any events that were blocked waiting on this workspace
-    unblock_dependents(db, recorded_by, &eid_b64)
-        .map_err(|e| format!("unblock failed: {}", e))?;
-    Ok(event_id)
+    Ok(())
 }
 
-fn send_message(db_path: &str, workspace_hex: &str, content: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn decode_signing_key(
+    key_bytes: Vec<u8>,
+) -> Result<SigningKey, Box<dyn std::error::Error + Send + Sync>> {
+    let key_arr: [u8; 32] = key_bytes
+        .try_into()
+        .map_err(|_| "bad signing key length in local signer table")?;
+    Ok(SigningKey::from_bytes(&key_arr))
+}
+
+fn persist_local_peer_signer(
+    db: &rusqlite::Connection,
+    recorded_by: &str,
+    event_id_b64: &str,
+    signing_key: &SigningKey,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ensure_local_signer_tables(db)?;
+    let now = current_timestamp_ms() as i64;
+    db.execute(
+        "INSERT INTO local_peer_signers (recorded_by, event_id, signing_key, updated_at)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(recorded_by)
+         DO UPDATE SET event_id = excluded.event_id,
+                       signing_key = excluded.signing_key,
+                       updated_at = excluded.updated_at",
+        rusqlite::params![
+            recorded_by,
+            event_id_b64,
+            signing_key.to_bytes().as_slice(),
+            now
+        ],
+    )?;
+    // Keep legacy rows up to date so downgrades remain usable.
+    db.execute(
+        "INSERT OR REPLACE INTO local_signing_keys (event_id, signing_key) VALUES (?1, ?2)",
+        rusqlite::params![event_id_b64, signing_key.to_bytes().as_slice()],
+    )?;
+    Ok(())
+}
+
+fn load_local_peer_signer(
+    db: &rusqlite::Connection,
+    recorded_by: &str,
+) -> Result<Option<(EventId, SigningKey)>, Box<dyn std::error::Error + Send + Sync>> {
+    ensure_local_signer_tables(db)?;
+
+    // Preferred source: explicit local signer mapping for this transport identity.
+    if let Some((eid_b64, key_bytes)) = db
+        .query_row(
+            "SELECT l.event_id, l.signing_key
+             FROM local_peer_signers l
+             INNER JOIN peers_shared p
+               ON p.recorded_by = l.recorded_by AND p.event_id = l.event_id
+             WHERE l.recorded_by = ?1
+             LIMIT 1",
+            rusqlite::params![recorded_by],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
+        .optional()?
+    {
+        let signing_key = decode_signing_key(key_bytes)?;
+        let eid = poc_7::crypto::event_id_from_base64(&eid_b64)
+            .ok_or("bad local peer signer event_id")?;
+        return Ok(Some((eid, signing_key)));
+    }
+
+    // Backward-compat: recover from legacy local_signing_keys rows if possible.
+    let legacy: Option<(String, Vec<u8>)> = db
+        .query_row(
+            "SELECT l.event_id, l.signing_key
+             FROM local_signing_keys l
+             INNER JOIN peers_shared p
+               ON p.recorded_by = ?1 AND p.event_id = l.event_id
+             ORDER BY p.rowid DESC
+             LIMIT 1",
+            rusqlite::params![recorded_by],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
+        .optional()?;
+
+    if let Some((eid_b64, key_bytes)) = legacy {
+        let signing_key = decode_signing_key(key_bytes)?;
+        let eid = poc_7::crypto::event_id_from_base64(&eid_b64)
+            .ok_or("bad legacy local signer event_id")?;
+        persist_local_peer_signer(db, recorded_by, &eid_b64, &signing_key)?;
+        return Ok(Some((eid, signing_key)));
+    }
+
+    Ok(None)
+}
+
+/// Ensure a local identity chain exists for this transport identity.
+/// Uses explicit local signer state and never selects from peers_shared by insertion order.
+/// If no local signer mapping exists, bootstrap:
+/// Workspace → InviteAccepted → UserInviteBoot → UserBoot → DeviceInviteFirst → PeerSharedFirst.
+/// Returns (peer_shared_event_id, peer_shared_signing_key).
+fn ensure_identity_chain(
+    db: &rusqlite::Connection,
+    recorded_by: &str,
+) -> Result<(EventId, SigningKey), Box<dyn std::error::Error + Send + Sync>> {
+    // Only trust explicit local signer mappings, never arbitrary peers_shared rows.
+    if let Some((eid, signing_key)) = load_local_peer_signer(db, recorded_by)? {
+        return Ok((eid, signing_key));
+    }
+
+    // Bootstrap new identity chain
+    let mut rng = rand::thread_rng();
+
+    let workspace_key = SigningKey::generate(&mut rng);
+    let ws = ParsedEvent::Workspace(WorkspaceEvent {
+        created_at_ms: current_timestamp_ms(),
+        public_key: workspace_key.verifying_key().to_bytes(),
+    });
+    let ws_eid = event_id_or_blocked(create_event_sync(db, recorded_by, &ws))
+        .map_err(|e| format!("{}", e))?;
+
+    let ia = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
+        created_at_ms: current_timestamp_ms(),
+        invite_event_id: ws_eid,
+        workspace_id: ws_eid,
+    });
+    let _ia_eid = create_event_sync(db, recorded_by, &ia).map_err(|e| format!("{}", e))?;
+    project_one(db, recorded_by, &ws_eid).map_err(|e| format!("{}", e))?;
+
+    let invite_key = SigningKey::generate(&mut rng);
+    let uib = ParsedEvent::UserInviteBoot(UserInviteBootEvent {
+        created_at_ms: current_timestamp_ms(),
+        public_key: invite_key.verifying_key().to_bytes(),
+        workspace_id: ws_eid,
+        signed_by: ws_eid,
+        signer_type: 1,
+        signature: [0u8; 64],
+    });
+    let uib_eid = create_signed_event_sync(db, recorded_by, &uib, &workspace_key)
+        .map_err(|e| format!("{}", e))?;
+
+    let user_key = SigningKey::generate(&mut rng);
+    let ub = ParsedEvent::UserBoot(UserBootEvent {
+        created_at_ms: current_timestamp_ms(),
+        public_key: user_key.verifying_key().to_bytes(),
+        signed_by: uib_eid,
+        signer_type: 2,
+        signature: [0u8; 64],
+    });
+    let ub_eid = create_signed_event_sync(db, recorded_by, &ub, &invite_key)
+        .map_err(|e| format!("{}", e))?;
+
+    let device_invite_key = SigningKey::generate(&mut rng);
+    let dif = ParsedEvent::DeviceInviteFirst(DeviceInviteFirstEvent {
+        created_at_ms: current_timestamp_ms(),
+        public_key: device_invite_key.verifying_key().to_bytes(),
+        signed_by: ub_eid,
+        signer_type: 4,
+        signature: [0u8; 64],
+    });
+    let dif_eid =
+        create_signed_event_sync(db, recorded_by, &dif, &user_key).map_err(|e| format!("{}", e))?;
+
+    let peer_shared_key = SigningKey::generate(&mut rng);
+    let psf = ParsedEvent::PeerSharedFirst(PeerSharedFirstEvent {
+        created_at_ms: current_timestamp_ms(),
+        public_key: peer_shared_key.verifying_key().to_bytes(),
+        signed_by: dif_eid,
+        signer_type: 3,
+        signature: [0u8; 64],
+    });
+    let psf_eid = create_signed_event_sync(db, recorded_by, &psf, &device_invite_key)
+        .map_err(|e| format!("{}", e))?;
+
+    // Store signing key for future CLI invocations
+    let psf_b64 = poc_7::crypto::event_id_to_base64(&psf_eid);
+    persist_local_peer_signer(db, recorded_by, &psf_b64, &peer_shared_key)?;
+
+    Ok((psf_eid, peer_shared_key))
+}
+
+fn send_message(
+    db_path: &str,
+    workspace_hex: &str,
+    content: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let recorded_by = ensure_transport_peer_id_from_db(db_path)?;
     let db = open_connection(db_path)?;
     create_tables(&db)?;
 
+    let (signer_eid, signing_key) = ensure_identity_chain(&db, &recorded_by)?;
     let workspace_id = parse_workspace_hex(workspace_hex)?;
-
-    // Ensure workspace event exists and is valid; use its hash as workspace_event_id
-    let workspace_event_id = ensure_workspace_event(&db, &recorded_by, &workspace_id)?;
-
     let author_id = stable_author_id(&recorded_by);
 
     let msg = ParsedEvent::Message(MessageEvent {
         created_at_ms: current_timestamp_ms(),
-        workspace_event_id,
+        workspace_id,
         author_id,
         content: content.to_string(),
+        signed_by: signer_eid,
+        signer_type: 5,
+        signature: [0u8; 64],
     });
-    create_event_sync(&db, &recorded_by, &msg)
+    create_signed_event_sync(&db, &recorded_by, &msg, &signing_key)
         .map_err(|e| format!("create event error: {}", e))?;
 
     println!("Sent: {}", content);
@@ -588,23 +762,33 @@ fn show_status(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + S
     let db = open_connection(db_path)?;
     create_tables(&db)?;
 
-    let events_count: i64 = db.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0)).unwrap_or(0);
-    let messages_count: i64 = db.query_row(
-        "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
-        rusqlite::params![&recorded_by],
-        |row| row.get(0),
-    ).unwrap_or(0);
-    let reactions_count: i64 = db.query_row(
-        "SELECT COUNT(*) FROM reactions WHERE recorded_by = ?1",
-        rusqlite::params![&recorded_by],
-        |row| row.get(0),
-    ).unwrap_or(0);
-    let neg_items_count: i64 = db.query_row("SELECT COUNT(*) FROM neg_items", [], |row| row.get(0)).unwrap_or(0);
-    let recorded_events_count: i64 = db.query_row(
-        "SELECT COUNT(*) FROM recorded_events WHERE peer_id = ?1",
-        rusqlite::params![&recorded_by],
-        |row| row.get(0),
-    ).unwrap_or(0);
+    let events_count: i64 = db
+        .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+        .unwrap_or(0);
+    let messages_count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
+            rusqlite::params![&recorded_by],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let reactions_count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM reactions WHERE recorded_by = ?1",
+            rusqlite::params![&recorded_by],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let neg_items_count: i64 = db
+        .query_row("SELECT COUNT(*) FROM neg_items", [], |row| row.get(0))
+        .unwrap_or(0);
+    let recorded_events_count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM recorded_events WHERE peer_id = ?1",
+            rusqlite::params![&recorded_by],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
 
     let legacy_count = count_legacy_messages(&db)?;
 
@@ -615,7 +799,10 @@ fn show_status(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + S
     println!("  Recorded:  {} events", recorded_events_count);
     println!("  NegItems:  {} indexed", neg_items_count);
     if legacy_count > 0 {
-        println!("  Legacy:    {} unscoped messages (run 'backfill-identity' to assign)", legacy_count);
+        println!(
+            "  Legacy:    {} unscoped messages (run 'backfill-identity' to assign)",
+            legacy_count
+        );
     }
 
     Ok(())
@@ -626,19 +813,22 @@ fn generate_messages(db_path: &str, count: usize, workspace_hex: &str) -> Result
     let db = open_connection(db_path)?;
     create_tables(&db)?;
 
+    let (signer_eid, signing_key) = ensure_identity_chain(&db, &recorded_by)?;
     let workspace_id = parse_workspace_hex(workspace_hex)?;
-    let workspace_event_id = ensure_workspace_event(&db, &recorded_by, &workspace_id)?;
     let author_id: [u8; 32] = rand::random();
 
     db.execute("BEGIN", [])?;
     for i in 0..count {
         let msg = ParsedEvent::Message(MessageEvent {
             created_at_ms: current_timestamp_ms(),
-            workspace_event_id,
+            workspace_id,
             author_id,
             content: format!("Message {}", i),
+            signed_by: signer_eid,
+            signer_type: 5,
+            signature: [0u8; 64],
         });
-        create_event_sync(&db, &recorded_by, &msg)
+        create_signed_event_sync(&db, &recorded_by, &msg, &signing_key)
             .map_err(|e| format!("create event error: {}", e))?;
     }
     db.execute("COMMIT", [])?;
@@ -691,7 +881,8 @@ fn parse_predicate(s: &str) -> Result<(String, Op, i64), String> {
     if parts.len() != 3 {
         return Err(format!(
             "predicate must be \"field op value\", got {} parts: {:?}",
-            parts.len(), s
+            parts.len(),
+            s
         ));
     }
     let field = parts[0].to_string();
@@ -712,25 +903,33 @@ fn parse_predicate(s: &str) -> Result<(String, Op, i64), String> {
 
 fn query_field(db: &rusqlite::Connection, field: &str, recorded_by: &str) -> Result<i64, String> {
     match field {
-        "store_count" | "events_count" => db.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+        "store_count" | "events_count" => db
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
             .map_err(|e| format!("query failed: {}", e)),
-        "message_count" => db.query_row(
-            "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
-            rusqlite::params![recorded_by],
-            |row| row.get(0),
-        ).map_err(|e| format!("query failed: {}", e)),
-        "reaction_count" => db.query_row(
-            "SELECT COUNT(*) FROM reactions WHERE recorded_by = ?1",
-            rusqlite::params![recorded_by],
-            |row| row.get(0),
-        ).map_err(|e| format!("query failed: {}", e)),
-        "neg_items_count" => db.query_row("SELECT COUNT(*) FROM neg_items", [], |row| row.get(0))
+        "message_count" => db
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
+                rusqlite::params![recorded_by],
+                |row| row.get(0),
+            )
             .map_err(|e| format!("query failed: {}", e)),
-        "recorded_events_count" => db.query_row(
-            "SELECT COUNT(*) FROM recorded_events WHERE peer_id = ?1",
-            rusqlite::params![recorded_by],
-            |row| row.get(0),
-        ).map_err(|e| format!("query failed: {}", e)),
+        "reaction_count" => db
+            .query_row(
+                "SELECT COUNT(*) FROM reactions WHERE recorded_by = ?1",
+                rusqlite::params![recorded_by],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("query failed: {}", e)),
+        "neg_items_count" => db
+            .query_row("SELECT COUNT(*) FROM neg_items", [], |row| row.get(0))
+            .map_err(|e| format!("query failed: {}", e)),
+        "recorded_events_count" => db
+            .query_row(
+                "SELECT COUNT(*) FROM recorded_events WHERE peer_id = ?1",
+                rusqlite::params![recorded_by],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("query failed: {}", e)),
         other => Err(format!("unknown field: {}", other)),
     }
 }
@@ -748,10 +947,22 @@ fn run_assert_now(
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
 
     if op.eval(actual, expected) {
-        println!("PASS: {} = {} (expected {} {})", field, actual, op.symbol(), expected);
+        println!(
+            "PASS: {} = {} (expected {} {})",
+            field,
+            actual,
+            op.symbol(),
+            expected
+        );
         Ok(0)
     } else {
-        println!("FAIL: {} = {} (expected {} {})", field, actual, op.symbol(), expected);
+        println!(
+            "FAIL: {} = {} (expected {} {})",
+            field,
+            actual,
+            op.symbol(),
+            expected
+        );
         Ok(1)
     }
 }
@@ -775,13 +986,23 @@ fn run_assert_eventually(
         let actual = query_field(&db, &field, &recorded_by)
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
         if op.eval(actual, expected) {
-            println!("PASS: {} = {} (expected {} {})", field, actual, op.symbol(), expected);
+            println!(
+                "PASS: {} = {} (expected {} {})",
+                field,
+                actual,
+                op.symbol(),
+                expected
+            );
             return Ok(0);
         }
         if start.elapsed() >= timeout {
             println!(
                 "TIMEOUT: {} = {} (expected {} {}) after {}ms",
-                field, actual, op.symbol(), expected, timeout_ms
+                field,
+                actual,
+                op.symbol(),
+                expected,
+                timeout_ms
             );
             return Ok(1);
         }
@@ -824,7 +1045,11 @@ async fn run_sync(
         let cli_count = cli_pins.len();
         let total = combined.len();
         if total > cli_count {
-            info!("Trust sources: {} from CLI pins, {} from projected bindings", cli_count, total - cli_count);
+            info!(
+                "Trust sources: {} from CLI pins, {} from projected bindings",
+                cli_count,
+                total - cli_count
+            );
         }
         Arc::new(combined)
     };
@@ -903,11 +1128,16 @@ fn parse_hex_event_id(hex_str: &str) -> Result<[u8; 32], Box<dyn std::error::Err
     Ok(eid)
 }
 
-fn cli_react(db_path: &str, target_hex: &str, emoji: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn cli_react(
+    db_path: &str,
+    target_hex: &str,
+    emoji: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let recorded_by = ensure_transport_peer_id_from_db(db_path)?;
     let db = open_connection(db_path)?;
     create_tables(&db)?;
 
+    let (signer_eid, signing_key) = ensure_identity_chain(&db, &recorded_by)?;
     let target_event_id = parse_hex_event_id(target_hex)?;
     let author_id = stable_author_id(&recorded_by);
 
@@ -916,18 +1146,30 @@ fn cli_react(db_path: &str, target_hex: &str, emoji: &str) -> Result<(), Box<dyn
         target_event_id,
         author_id,
         emoji: emoji.to_string(),
+        signed_by: signer_eid,
+        signer_type: 5,
+        signature: [0u8; 64],
     });
-    let eid = event_id_or_blocked(create_event_sync(&db, &recorded_by, &rxn))?;
+    let eid = event_id_or_blocked(create_signed_event_sync(
+        &db,
+        &recorded_by,
+        &rxn,
+        &signing_key,
+    ))?;
     println!("Reacted {} ({})", emoji, hex::encode(&eid[..4]));
 
     Ok(())
 }
 
-fn cli_delete_message(db_path: &str, target_hex: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn cli_delete_message(
+    db_path: &str,
+    target_hex: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let recorded_by = ensure_transport_peer_id_from_db(db_path)?;
     let db = open_connection(db_path)?;
     create_tables(&db)?;
 
+    let (signer_eid, signing_key) = ensure_identity_chain(&db, &recorded_by)?;
     let target_event_id = parse_hex_event_id(target_hex)?;
     let author_id = stable_author_id(&recorded_by);
 
@@ -935,9 +1177,20 @@ fn cli_delete_message(db_path: &str, target_hex: &str) -> Result<(), Box<dyn std
         created_at_ms: current_timestamp_ms(),
         target_event_id,
         author_id,
+        signed_by: signer_eid,
+        signer_type: 5,
+        signature: [0u8; 64],
     });
-    event_id_or_blocked(create_event_sync(&db, &recorded_by, &del))?;
-    println!("Deleted message {}", &target_hex[..target_hex.len().min(16)]);
+    event_id_or_blocked(create_signed_event_sync(
+        &db,
+        &recorded_by,
+        &del,
+        &signing_key,
+    ))?;
+    println!(
+        "Deleted message {}",
+        &target_hex[..target_hex.len().min(16)]
+    );
 
     Ok(())
 }
@@ -947,9 +1200,8 @@ fn cli_reactions(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send +
     let db = open_connection(db_path)?;
     create_tables(&db)?;
 
-    let mut stmt = db.prepare(
-        "SELECT event_id, target_event_id, emoji FROM reactions WHERE recorded_by = ?1",
-    )?;
+    let mut stmt = db
+        .prepare("SELECT event_id, target_event_id, emoji FROM reactions WHERE recorded_by = ?1")?;
     let rows: Vec<(String, String, String)> = stmt
         .query_map(rusqlite::params![&recorded_by], |row| {
             Ok((
@@ -977,9 +1229,7 @@ fn cli_users(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + Syn
     let db = open_connection(db_path)?;
     create_tables(&db)?;
 
-    let mut stmt = db.prepare(
-        "SELECT event_id FROM users WHERE recorded_by = ?1",
-    )?;
+    let mut stmt = db.prepare("SELECT event_id FROM users WHERE recorded_by = ?1")?;
     let users: Vec<String> = stmt
         .query_map(rusqlite::params![&recorded_by], |row| {
             row.get::<_, String>(0)
@@ -1003,22 +1253,34 @@ fn cli_keys(db_path: &str, summary: bool) -> Result<(), Box<dyn std::error::Erro
     let db = open_connection(db_path)?;
     create_tables(&db)?;
 
-    let user_count: i64 = db.query_row(
-        "SELECT COUNT(*) FROM users WHERE recorded_by = ?1",
-        rusqlite::params![&recorded_by], |row| row.get(0),
-    ).unwrap_or(0);
-    let peer_count: i64 = db.query_row(
-        "SELECT COUNT(*) FROM peers_shared WHERE recorded_by = ?1",
-        rusqlite::params![&recorded_by], |row| row.get(0),
-    ).unwrap_or(0);
-    let admin_count: i64 = db.query_row(
-        "SELECT COUNT(*) FROM admins WHERE recorded_by = ?1",
-        rusqlite::params![&recorded_by], |row| row.get(0),
-    ).unwrap_or(0);
-    let transport_count: i64 = db.query_row(
-        "SELECT COUNT(*) FROM transport_keys WHERE recorded_by = ?1",
-        rusqlite::params![&recorded_by], |row| row.get(0),
-    ).unwrap_or(0);
+    let user_count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM users WHERE recorded_by = ?1",
+            rusqlite::params![&recorded_by],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let peer_count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM peers_shared WHERE recorded_by = ?1",
+            rusqlite::params![&recorded_by],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let admin_count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM admins WHERE recorded_by = ?1",
+            rusqlite::params![&recorded_by],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let transport_count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM transport_keys WHERE recorded_by = ?1",
+            rusqlite::params![&recorded_by],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
 
     println!("KEYS ({}):", db_path);
     println!("  Users: {}", user_count);
@@ -1029,7 +1291,9 @@ fn cli_keys(db_path: &str, summary: bool) -> Result<(), Box<dyn std::error::Erro
     if !summary {
         let mut stmt = db.prepare("SELECT event_id FROM users WHERE recorded_by = ?1")?;
         let users: Vec<String> = stmt
-            .query_map(rusqlite::params![&recorded_by], |row| row.get::<_, String>(0))?
+            .query_map(rusqlite::params![&recorded_by], |row| {
+                row.get::<_, String>(0)
+            })?
             .collect::<Result<Vec<_>, _>>()?;
         for eid in &users {
             println!("    user {}", short_id(eid));
@@ -1037,7 +1301,9 @@ fn cli_keys(db_path: &str, summary: bool) -> Result<(), Box<dyn std::error::Erro
 
         let mut stmt = db.prepare("SELECT event_id FROM peers_shared WHERE recorded_by = ?1")?;
         let peers: Vec<String> = stmt
-            .query_map(rusqlite::params![&recorded_by], |row| row.get::<_, String>(0))?
+            .query_map(rusqlite::params![&recorded_by], |row| {
+                row.get::<_, String>(0)
+            })?
             .collect::<Result<Vec<_>, _>>()?;
         for eid in &peers {
             println!("    peer {}", short_id(eid));

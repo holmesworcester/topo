@@ -348,43 +348,27 @@ static MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 14,
-        name: "rename_channel_id_to_network_event_id",
-        // Handled specially in run_migrations: renames channel_id→network_event_id
-        // only if the old column exists (pre-existing DBs). Fresh DBs already have
-        // the correct column name from CREATE TABLE in schema.rs.
-        sql: "SELECT 1;",
+        name: "add_signer_event_id_to_message_attachments",
+        sql: "
+            ALTER TABLE message_attachments ADD COLUMN signer_event_id TEXT NOT NULL DEFAULT '';
+        ",
     },
     Migration {
         version: 15,
-        name: "rename_network_event_id_to_workspace_event_id",
-        // Handled specially in run_migrations: renames network_event_id→workspace_event_id
-        // only if the old column exists (pre-existing DBs). Fresh DBs already have
-        // the correct column name from CREATE TABLE in schema.rs.
-        sql: "SELECT 1;",
-    },
-    Migration {
-        version: 16,
-        name: "add_intro_attempts",
+        name: "file_slice_guard_queue_and_descriptor_link",
         sql: "
-            CREATE TABLE IF NOT EXISTS intro_attempts (
-                recorded_by TEXT NOT NULL,
-                intro_id BLOB NOT NULL,
-                introduced_by_peer_id TEXT NOT NULL,
-                other_peer_id TEXT NOT NULL,
-                origin_ip TEXT NOT NULL,
-                origin_port INTEGER NOT NULL,
-                observed_at INTEGER NOT NULL,
-                expires_at INTEGER NOT NULL,
-                status TEXT NOT NULL DEFAULT 'received',
-                error TEXT,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL,
-                PRIMARY KEY (recorded_by, intro_id)
+            ALTER TABLE file_slices ADD COLUMN descriptor_event_id TEXT NOT NULL DEFAULT '';
+            CREATE INDEX IF NOT EXISTS idx_file_slices_descriptor
+                ON file_slices(recorded_by, descriptor_event_id);
+
+            CREATE TABLE IF NOT EXISTS file_slice_guard_blocks (
+                peer_id TEXT NOT NULL,
+                file_id TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                PRIMARY KEY (peer_id, event_id)
             );
-            CREATE INDEX IF NOT EXISTS idx_intro_attempts_status
-                ON intro_attempts(recorded_by, status);
-            CREATE INDEX IF NOT EXISTS idx_intro_attempts_peer
-                ON intro_attempts(recorded_by, other_peer_id);
+            CREATE INDEX IF NOT EXISTS idx_file_slice_guard_blocks_file
+                ON file_slice_guard_blocks(peer_id, file_id);
         ",
     },
     Migration {
@@ -419,37 +403,7 @@ pub fn run_migrations(conn: &Connection) -> SqliteResult<()> {
         )?;
 
         if !already_applied {
-            // Migration 14: conditionally rename channel_id → network_event_id
-            if migration.version == 14 {
-                let has_channel_id: bool = conn.query_row(
-                    "SELECT COUNT(*) > 0 FROM pragma_table_info('messages') WHERE name='channel_id'",
-                    [],
-                    |row| row.get(0),
-                )?;
-                if has_channel_id {
-                    conn.execute_batch(
-                        "ALTER TABLE messages RENAME COLUMN channel_id TO network_event_id;
-                         DROP INDEX IF EXISTS idx_messages_channel;
-                         CREATE INDEX IF NOT EXISTS idx_messages_network ON messages(network_event_id, created_at DESC);"
-                    )?;
-                }
-            } else if migration.version == 15 {
-                // Migration 15: conditionally rename network_event_id → workspace_event_id
-                let has_network_event_id: bool = conn.query_row(
-                    "SELECT COUNT(*) > 0 FROM pragma_table_info('messages') WHERE name='network_event_id'",
-                    [],
-                    |row| row.get(0),
-                )?;
-                if has_network_event_id {
-                    conn.execute_batch(
-                        "ALTER TABLE messages RENAME COLUMN network_event_id TO workspace_event_id;
-                         DROP INDEX IF EXISTS idx_messages_network;
-                         CREATE INDEX IF NOT EXISTS idx_messages_workspace ON messages(workspace_event_id, created_at DESC);"
-                    )?;
-                }
-            } else {
-                conn.execute_batch(migration.sql)?;
-            }
+            conn.execute_batch(migration.sql)?;
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -511,17 +465,22 @@ mod tests {
             "INSERT INTO blocked_event_deps (peer_id, event_id, blocker_event_id) VALUES ('p1', 'e1', 'b1')",
             [],
         ).unwrap();
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM blocked_event_deps WHERE peer_id = 'p1'",
-            [], |row| row.get(0),
-        ).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM blocked_event_deps WHERE peer_id = 'p1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 1);
 
         // Idempotent — running migrations again doesn't fail
         run_migrations(&conn).unwrap();
-        let count2: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM blocked_event_deps", [], |row| row.get(0),
-        ).unwrap();
+        let count2: i64 = conn
+            .query_row("SELECT COUNT(*) FROM blocked_event_deps", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
         assert_eq!(count2, 1);
 
         // Migration version recorded
@@ -543,7 +502,9 @@ mod tests {
         run_migrations(&conn).unwrap();
 
         let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(count, 17);
     }

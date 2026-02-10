@@ -10,7 +10,7 @@ use crate::events::*;
 use crate::identity_ops::{
     self, IdentityChain, InviteData, InviteType, JoinChain, LinkChain,
 };
-use crate::projection::create::{create_event_sync, create_signed_event_sync, event_id_or_blocked};
+use crate::projection::create::{create_signed_event_sync, event_id_or_blocked};
 use crate::transport_identity::ensure_transport_peer_id_from_db;
 
 use rustyline::completion::{Completer, Pair};
@@ -33,8 +33,8 @@ struct Account {
     identity: String,
     /// Signing keys indexed by event_id base64
     signing_keys: HashMap<String, SigningKey>,
-    workspace_event_id: Option<EventId>,
-    workspace_id: Option<[u8; 32]>,
+    workspace_id: Option<EventId>,
+    workspace_name: Option<String>,
     workspace_key: Option<SigningKey>,
     user_event_id: Option<EventId>,
     user_key: Option<SigningKey>,
@@ -70,8 +70,8 @@ impl Account {
             db_path,
             identity,
             signing_keys: HashMap::new(),
-            workspace_event_id: None,
             workspace_id: None,
+            workspace_name: None,
             workspace_key: None,
             user_event_id: None,
             user_key: None,
@@ -86,7 +86,7 @@ impl Account {
     }
 
     fn store_chain_keys(&mut self, chain: &IdentityChain) {
-        self.workspace_event_id = Some(chain.workspace_event_id);
+        self.workspace_id = Some(chain.workspace_id);
         self.workspace_key = Some(chain.workspace_key.clone());
         self.user_event_id = Some(chain.user_event_id);
         self.user_key = Some(chain.user_key.clone());
@@ -94,7 +94,7 @@ impl Account {
         self.peer_shared_key = Some(chain.peer_shared_key.clone());
 
         let keys_to_store = [
-            (chain.workspace_event_id, chain.workspace_key.clone()),
+            (chain.workspace_id, chain.workspace_key.clone()),
             (chain.user_invite_event_id, chain.invite_key.clone()),
             (chain.user_event_id, chain.user_key.clone()),
             (chain.device_invite_event_id, chain.device_invite_key.clone()),
@@ -435,19 +435,10 @@ fn cmd_new_workspace(
     let devicename = parse_named_arg(args, "--devicename").unwrap_or("device");
 
     let mut account = Account::new(username, devicename);
-    let workspace_id: [u8; 32] = {
-        let mut id = [0u8; 32];
-        let name_bytes = name.as_bytes();
-        let copy_len = name_bytes.len().min(32);
-        id[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
-        id
-    };
-
     let conn = open_connection(&account.db_path)?;
-    let chain = identity_ops::bootstrap_workspace(&conn, &account.identity, workspace_id, &account.db_path)?;
-
-    account.workspace_id = Some(workspace_id);
+    let chain = identity_ops::bootstrap_workspace(&conn, &account.identity, &account.db_path)?;
     account.store_chain_keys(&chain);
+    account.workspace_name = Some(name.to_string());
 
     let user_id = account.short_user_id();
     let peer_id = account.short_peer_id();
@@ -478,18 +469,23 @@ fn cmd_send(
         return Ok(());
     }
 
-    let workspace_event_id = account
-        .workspace_event_id
+    let workspace_id = account
+        .workspace_id
         .ok_or("No workspace created. Run 'new-workspace' first.")?;
 
     let conn = open_connection(&account.db_path)?;
+    let peer_shared_eid = account.peer_shared_event_id.ok_or("No signing key. Run 'new-workspace' first.")?;
+    let peer_shared_key = account.peer_shared_key.as_ref().ok_or("No signing key.")?.clone();
     let msg = ParsedEvent::Message(MessageEvent {
         created_at_ms: now_ms(),
-        workspace_event_id,
+        workspace_id,
         author_id: account.author_id,
         content: content.clone(),
+        signed_by: peer_shared_eid,
+        signer_type: 5,
+        signature: [0u8; 64],
     });
-    let eid = create_event_sync(&conn, &account.identity, &msg)?;
+    let eid = create_signed_event_sync(&conn, &account.identity, &msg, &peer_shared_key)?;
     let eid_b64 = event_id_to_base64(&eid);
 
     writeln!(out, "Sent: {} ({})", content, &eid_b64[..8])?;
@@ -623,13 +619,18 @@ fn cmd_react(
     let conn = open_connection(&account.db_path)?;
     let target_event_id = get_message_event_id_by_num(&conn, &account.identity, msg_num)?;
 
+    let peer_shared_eid = account.peer_shared_event_id.ok_or("No signing key.")?;
+    let peer_shared_key = account.peer_shared_key.as_ref().ok_or("No signing key.")?.clone();
     let rxn = ParsedEvent::Reaction(ReactionEvent {
         created_at_ms: now_ms(),
         target_event_id,
         author_id: account.author_id,
         emoji: emoji.to_string(),
+        signed_by: peer_shared_eid,
+        signer_type: 5,
+        signature: [0u8; 64],
     });
-    event_id_or_blocked(create_event_sync(&conn, &account.identity, &rxn))?;
+    event_id_or_blocked(create_signed_event_sync(&conn, &account.identity, &rxn, &peer_shared_key))?;
 
     writeln!(out, "Reacted {} to message {}", emoji, msg_num)?;
 
@@ -696,12 +697,17 @@ fn cmd_delete(
     let conn = open_connection(&account.db_path)?;
     let target_event_id = get_message_event_id_by_num(&conn, &account.identity, msg_num)?;
 
+    let peer_shared_eid = account.peer_shared_event_id.ok_or("No signing key.")?;
+    let peer_shared_key = account.peer_shared_key.as_ref().ok_or("No signing key.")?.clone();
     let del = ParsedEvent::MessageDeletion(MessageDeletionEvent {
         created_at_ms: now_ms(),
         target_event_id,
         author_id: account.author_id,
+        signed_by: peer_shared_eid,
+        signer_type: 5,
+        signature: [0u8; 64],
     });
-    event_id_or_blocked(create_event_sync(&conn, &account.identity, &del))?;
+    event_id_or_blocked(create_signed_event_sync(&conn, &account.identity, &del, &peer_shared_key))?;
 
     writeln!(out, "Deleted message {}", msg_num)?;
 
@@ -721,18 +727,16 @@ fn cmd_invite(
         .as_ref()
         .ok_or("No workspace key. Only workspace creators can invite.")?
         .clone();
-    let workspace_event_id = account
-        .workspace_event_id
-        .ok_or("No workspace event ID.")?;
-    let workspace_id = account.workspace_id.ok_or("No workspace ID.")?;
+    let workspace_id = account
+        .workspace_id
+        .ok_or("No network event ID.")?;
 
     let conn = open_connection(&account.db_path)?;
     let invite = identity_ops::create_user_invite(
         &conn,
         &account.identity,
         &workspace_key,
-        &workspace_event_id,
-        workspace_id,
+        &workspace_id,
     )?;
 
     let invite_num = session.invites.len() + 1;
@@ -764,11 +768,15 @@ fn cmd_accept_invite(
     let invite_key = invite.invite_key.clone();
     let invite_event_id = invite.invite_event_id;
     let workspace_id = invite.workspace_id;
-    let workspace_event_id = invite.workspace_event_id;
+    let workspace_name = session
+        .accounts
+        .iter()
+        .find(|a| a.workspace_id == Some(workspace_id))
+        .and_then(|a| a.workspace_name.clone());
 
     let mut account = Account::new(username, devicename);
     account.workspace_id = Some(workspace_id);
-    account.workspace_event_id = Some(workspace_event_id);
+    account.workspace_name = workspace_name;
 
     let conn = open_connection(&account.db_path)?;
 
@@ -814,8 +822,7 @@ fn cmd_link(
         .ok_or("No user key.")?
         .clone();
     let user_event_id = account.user_event_id.ok_or("No user event ID.")?;
-    let workspace_id = account.workspace_id.ok_or("No workspace ID.")?;
-    let workspace_event_id = account.workspace_event_id.ok_or("No workspace event ID.")?;
+    let workspace_id = account.workspace_id.ok_or("No network event ID.")?;
 
     let conn = open_connection(&account.db_path)?;
     let invite = identity_ops::create_device_link_invite(
@@ -823,8 +830,7 @@ fn cmd_link(
         &account.identity,
         &user_key,
         &user_event_id,
-        workspace_id,
-        &workspace_event_id,
+        &workspace_id,
     )?;
 
     let invite_num = session.invites.len() + 1;
@@ -855,7 +861,11 @@ fn cmd_accept_link(
     let device_invite_key = invite.invite_key.clone();
     let device_invite_event_id = invite.invite_event_id;
     let workspace_id = invite.workspace_id;
-    let workspace_event_id = invite.workspace_event_id;
+    let workspace_name = session
+        .accounts
+        .iter()
+        .find(|a| a.workspace_id == Some(workspace_id))
+        .and_then(|a| a.workspace_name.clone());
 
     // Get the username from the inviting account for the device link
     let username = match &invite.invite_type {
@@ -877,7 +887,7 @@ fn cmd_accept_link(
 
     let mut account = Account::new(&username, devicename);
     account.workspace_id = Some(workspace_id);
-    account.workspace_event_id = Some(workspace_event_id);
+    account.workspace_name = workspace_name;
 
     let conn = open_connection(&account.db_path)?;
 
@@ -1181,19 +1191,23 @@ fn cmd_workspaces(
     if workspaces.is_empty() {
         writeln!(out, "  (none)")?;
     } else {
-        for (i, (eid, net_id_b64)) in workspaces.iter().enumerate() {
-            // Try to decode workspace_id from base64 and interpret as UTF-8 name
-            let name = if let Ok(bytes) = base64::Engine::decode(
-                &base64::engine::general_purpose::STANDARD,
-                net_id_b64,
-            ) {
-                String::from_utf8_lossy(&bytes)
-                    .trim_end_matches('\0')
-                    .to_string()
+        let active_workspace_id = account.workspace_id.map(|id| event_id_to_base64(&id));
+        for (i, (eid, workspace_id_b64)) in workspaces.iter().enumerate() {
+            let label = if active_workspace_id.as_deref() == Some(workspace_id_b64.as_str()) {
+                account
+                    .workspace_name
+                    .clone()
+                    .unwrap_or_else(|| workspace_id_b64.clone())
             } else {
-                net_id_b64.clone()
+                workspace_id_b64.clone()
             };
-            writeln!(out, "  {}. {} ({})", i + 1, name, &eid[..eid.len().min(8)])?;
+            writeln!(
+                out,
+                "  {}. {} ({})",
+                i + 1,
+                label,
+                &eid[..eid.len().min(8)]
+            )?;
         }
     }
 
@@ -1229,13 +1243,10 @@ fn cmd_status(
         .unwrap_or(0);
 
     // Network name
-    let workspace_name = account
-        .workspace_id
-        .map(|nid| {
-            String::from_utf8_lossy(&nid)
-                .trim_end_matches('\0')
-                .to_string()
-        })
+    let network_name = account
+        .workspace_name
+        .clone()
+        .or_else(|| account.workspace_id.map(|nid| event_id_to_base64(&nid)))
         .unwrap_or_else(|| "(none)".to_string());
 
     // Channel name
@@ -1250,7 +1261,7 @@ fn cmd_status(
     writeln!(out, "  Events:    {}", events_count)?;
     writeln!(out, "  Messages:  {}", messages_count)?;
     writeln!(out, "  Reactions: {}", reactions_count)?;
-    writeln!(out, "  Workspace: {}", workspace_name)?;
+    writeln!(out, "  Workspace: {}", network_name)?;
     writeln!(out, "  Channel:   {}", ch_name)?;
 
     Ok(())
@@ -1423,13 +1434,13 @@ fn copy_event_chain(
     target_recorded_by: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let invite = &session.invites[invite_idx];
-    let workspace_event_id = invite.workspace_event_id;
+    let workspace_id = invite.workspace_id;
 
     // Find the source account that has the workspace event
     let source_account = session
         .accounts
         .iter()
-        .find(|a| a.workspace_event_id == Some(workspace_event_id))
+        .find(|a| a.workspace_id == Some(workspace_id))
         .ok_or("Cannot find source account for invite")?;
 
     let source_conn = open_connection(&source_account.db_path)?;
