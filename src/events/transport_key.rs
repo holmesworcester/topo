@@ -64,6 +64,7 @@ pub static TRANSPORT_KEY_META: EventTypeMeta = EventTypeMeta {
     projection_table: "transport_keys",
     share_scope: ShareScope::Shared,
     dep_fields: &["signed_by"],
+    dep_field_type_codes: &[&[]],
     signer_required: true,
     signature_byte_len: 64,
     parse: parse_transport_key,

@@ -1,9 +1,6 @@
 use super::registry::{EventTypeMeta, ShareScope};
 use super::{EventError, ParsedEvent, EVENT_TYPE_PEER_KEY};
 
-/// DEPRECATED: PeerKey (signer_type 0) is superseded by PeerShared identity chain keys
-/// (signer_type 5). New events should use PeerSharedFirst/PeerSharedOngoing as signers.
-/// PeerKey is retained for parsing old events and backward compatibility.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerKeyEvent {
     pub created_at_ms: u64,
@@ -58,6 +55,7 @@ pub static PEER_KEY_META: EventTypeMeta = EventTypeMeta {
     projection_table: "peer_keys",
     share_scope: ShareScope::Shared,
     dep_fields: &[],
+    dep_field_type_codes: &[],
     signer_required: false,
     signature_byte_len: 0,
     parse: parse_peer_key,

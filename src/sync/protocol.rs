@@ -1,5 +1,5 @@
 use crate::events::EVENT_MAX_BLOB_BYTES;
-use super::{MSG_TYPE_NEG_OPEN, MSG_TYPE_NEG_MSG, MSG_TYPE_HAVE_LIST, MSG_TYPE_EVENT, MSG_TYPE_DONE, MSG_TYPE_DONE_ACK, MSG_TYPE_DATA_DONE};
+use super::{MSG_TYPE_NEG_OPEN, MSG_TYPE_NEG_MSG, MSG_TYPE_HAVE_LIST, MSG_TYPE_EVENT, MSG_TYPE_DONE, MSG_TYPE_DONE_ACK, MSG_TYPE_DATA_DONE, MSG_TYPE_INTRO_OFFER};
 
 /// Sync protocol messages
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,6 +18,17 @@ pub enum SyncMessage {
     DoneAck,
     /// Sent on data stream to signal no more events will follow
     DataDone,
+    /// Intro offer for QUIC hole punching via a third peer
+    IntroOffer {
+        intro_id: [u8; 16],
+        other_peer_id: [u8; 32],
+        origin_family: u8,
+        origin_ip: [u8; 16],
+        origin_port: u16,
+        observed_at_ms: u64,
+        expires_at_ms: u64,
+        attempt_window_ms: u32,
+    },
 }
 
 
@@ -86,6 +97,46 @@ pub fn parse_sync_message(input: &[u8]) -> Result<(SyncMessage, usize), ParseErr
         MSG_TYPE_DONE => Ok((SyncMessage::Done, 1)),
         MSG_TYPE_DONE_ACK => Ok((SyncMessage::DoneAck, 1)),
         MSG_TYPE_DATA_DONE => Ok((SyncMessage::DataDone, 1)),
+        MSG_TYPE_INTRO_OFFER => {
+            // Fixed layout: type(1) + intro_id(16) + other_peer_id(32)
+            //   + origin_family(1) + origin_ip(16) + origin_port(2)
+            //   + observed_at_ms(8) + expires_at_ms(8) + attempt_window_ms(4) = 88
+            const INTRO_OFFER_SIZE: usize = 1 + 16 + 32 + 1 + 16 + 2 + 8 + 8 + 4;
+            if input.len() < INTRO_OFFER_SIZE {
+                return Err(ParseError::InsufficientData);
+            }
+            let mut pos = 1;
+            let mut intro_id = [0u8; 16];
+            intro_id.copy_from_slice(&input[pos..pos + 16]);
+            pos += 16;
+            let mut other_peer_id = [0u8; 32];
+            other_peer_id.copy_from_slice(&input[pos..pos + 32]);
+            pos += 32;
+            let origin_family = input[pos];
+            pos += 1;
+            let mut origin_ip = [0u8; 16];
+            origin_ip.copy_from_slice(&input[pos..pos + 16]);
+            pos += 16;
+            let origin_port = u16::from_le_bytes([input[pos], input[pos + 1]]);
+            pos += 2;
+            let observed_at_ms = u64::from_le_bytes(input[pos..pos + 8].try_into().unwrap());
+            pos += 8;
+            let expires_at_ms = u64::from_le_bytes(input[pos..pos + 8].try_into().unwrap());
+            pos += 8;
+            let attempt_window_ms = u32::from_le_bytes(input[pos..pos + 4].try_into().unwrap());
+            pos += 4;
+            debug_assert_eq!(pos, INTRO_OFFER_SIZE);
+            Ok((SyncMessage::IntroOffer {
+                intro_id,
+                other_peer_id,
+                origin_family,
+                origin_ip,
+                origin_port,
+                observed_at_ms,
+                expires_at_ms,
+                attempt_window_ms,
+            }, INTRO_OFFER_SIZE))
+        }
         _ => Err(ParseError::UnknownType(msg_type)),
     }
 }
@@ -126,6 +177,28 @@ pub fn encode_sync_message(msg: &SyncMessage) -> Vec<u8> {
         SyncMessage::Done => vec![MSG_TYPE_DONE],
         SyncMessage::DoneAck => vec![MSG_TYPE_DONE_ACK],
         SyncMessage::DataDone => vec![MSG_TYPE_DATA_DONE],
+        SyncMessage::IntroOffer {
+            intro_id,
+            other_peer_id,
+            origin_family,
+            origin_ip,
+            origin_port,
+            observed_at_ms,
+            expires_at_ms,
+            attempt_window_ms,
+        } => {
+            let mut buf = Vec::with_capacity(88);
+            buf.push(MSG_TYPE_INTRO_OFFER);
+            buf.extend_from_slice(intro_id);
+            buf.extend_from_slice(other_peer_id);
+            buf.push(*origin_family);
+            buf.extend_from_slice(origin_ip);
+            buf.extend_from_slice(&origin_port.to_le_bytes());
+            buf.extend_from_slice(&observed_at_ms.to_le_bytes());
+            buf.extend_from_slice(&expires_at_ms.to_le_bytes());
+            buf.extend_from_slice(&attempt_window_ms.to_le_bytes());
+            buf
+        }
     }
 }
 
@@ -250,5 +323,61 @@ mod tests {
         let (parsed, consumed) = parse_sync_message(&encoded).unwrap();
         assert_eq!(consumed, 1);
         assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn test_intro_offer_roundtrip() {
+        let msg = SyncMessage::IntroOffer {
+            intro_id: [0xAA; 16],
+            other_peer_id: [0xBB; 32],
+            origin_family: 4,
+            origin_ip: {
+                // IPv4 192.168.1.100 mapped to 16-byte field
+                let mut ip = [0u8; 16];
+                ip[12] = 192; ip[13] = 168; ip[14] = 1; ip[15] = 100;
+                ip
+            },
+            origin_port: 12345,
+            observed_at_ms: 1700000000000,
+            expires_at_ms: 1700000030000,
+            attempt_window_ms: 4000,
+        };
+        let encoded = encode_sync_message(&msg);
+        assert_eq!(encoded.len(), 88); // type(1) + fixed payload(87)
+        let (parsed, consumed) = parse_sync_message(&encoded).unwrap();
+        assert_eq!(consumed, 88);
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn test_intro_offer_ipv6_roundtrip() {
+        let msg = SyncMessage::IntroOffer {
+            intro_id: [0x01; 16],
+            other_peer_id: [0x02; 32],
+            origin_family: 6,
+            origin_ip: [0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            origin_port: 443,
+            observed_at_ms: u64::MAX - 1,
+            expires_at_ms: u64::MAX,
+            attempt_window_ms: 10000,
+        };
+        let encoded = encode_sync_message(&msg);
+        assert_eq!(encoded.len(), 88);
+        let (parsed, consumed) = parse_sync_message(&encoded).unwrap();
+        assert_eq!(consumed, 88);
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn test_intro_offer_insufficient_data() {
+        // Just the type byte, no payload
+        let result = parse_sync_message(&[MSG_TYPE_INTRO_OFFER]);
+        assert_eq!(result, Err(ParseError::InsufficientData));
+
+        // Partial payload (50 of 87 needed)
+        let mut buf = vec![MSG_TYPE_INTRO_OFFER];
+        buf.extend_from_slice(&[0u8; 50]);
+        let result = parse_sync_message(&buf);
+        assert_eq!(result, Err(ParseError::InsufficientData));
     }
 }

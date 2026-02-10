@@ -759,6 +759,7 @@ pub async fn accept_loop(
     db_path: &str,
     recorded_by: &str,
     endpoint: quinn::Endpoint,
+    allowed_peers: Option<crate::transport::AllowedPeers>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     {
         let db = open_connection(db_path)?;
@@ -786,6 +787,18 @@ pub async fn accept_loop(
         }
     }
 
+    // Use LocalSet so connection handlers (which use rusqlite, !Send) can be
+    // spawned concurrently on the current-thread runtime.
+    let local = tokio::task::LocalSet::new();
+    local.run_until(accept_loop_inner(db_path, recorded_by, endpoint, allowed_peers)).await
+}
+
+async fn accept_loop_inner(
+    db_path: &str,
+    recorded_by: &str,
+    endpoint: quinn::Endpoint,
+    allowed_peers: Option<crate::transport::AllowedPeers>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     loop {
         info!("Waiting for incoming connection...");
         let incoming = match endpoint.accept().await {
@@ -840,30 +853,53 @@ pub async fn accept_loop(
             }
         }
 
-        // Inner loop: repeated sync sessions on this connection
-        loop {
-            let (ctrl_send, ctrl_recv) = match connection.accept_bi().await {
-                Ok(streams) => streams,
-                Err(e) => {
-                    info!("Connection dropped (control accept): {}", e);
-                    break;
-                }
+        // Spawn connection handler as a local task so accept loop can
+        // keep accepting new connections (required for multi-peer / introducer).
+        // spawn_local because run_sync_responder_dual uses rusqlite (!Send).
+        let conn_db = db_path.to_string();
+        let conn_rb = recorded_by.to_string();
+        let conn_ep = endpoint.clone();
+        let conn_ap = allowed_peers.clone();
+        tokio::task::spawn_local(async move {
+            // Spawn intro listener for uni-streams on this connection
+            let _intro_handle = if let Some(ref ap) = conn_ap {
+                Some(crate::sync::punch::spawn_intro_listener(
+                    connection.clone(),
+                    conn_db.clone(),
+                    conn_rb.clone(),
+                    peer_id.clone(),
+                    conn_ep,
+                    ap.clone(),
+                ))
+            } else {
+                None
             };
-            let (data_send, data_recv) = match connection.accept_bi().await {
-                Ok(streams) => streams,
-                Err(e) => {
-                    info!("Connection dropped (data accept): {}", e);
-                    break;
-                }
-            };
-            let conn = DualConnection::new(ctrl_send, ctrl_recv, data_send, data_recv);
 
-            if let Err(e) = run_sync_responder_dual(conn, db_path, 60, &peer_id, recorded_by).await {
-                warn!("Responder session error: {}", e);
+            // Inner loop: repeated sync sessions on this connection
+            loop {
+                let (ctrl_send, ctrl_recv) = match connection.accept_bi().await {
+                    Ok(streams) => streams,
+                    Err(e) => {
+                        info!("Connection dropped (control accept): {}", e);
+                        break;
+                    }
+                };
+                let (data_send, data_recv) = match connection.accept_bi().await {
+                    Ok(streams) => streams,
+                    Err(e) => {
+                        info!("Connection dropped (data accept): {}", e);
+                        break;
+                    }
+                };
+                let conn = DualConnection::new(ctrl_send, ctrl_recv, data_send, data_recv);
+
+                if let Err(e) = run_sync_responder_dual(conn, &conn_db, 60, &peer_id, &conn_rb).await {
+                    warn!("Responder session error: {}", e);
+                }
+
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
-
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+        });
     }
 }
 
@@ -876,6 +912,7 @@ pub async fn connect_loop(
     recorded_by: &str,
     endpoint: quinn::Endpoint,
     remote: SocketAddr,
+    allowed_peers: Option<crate::transport::AllowedPeers>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     {
         let db = open_connection(db_path)?;
@@ -903,6 +940,19 @@ pub async fn connect_loop(
         }
     }
 
+    // Use LocalSet so the intro listener (spawn_intro_listener uses spawn_local)
+    // can run on the same runtime that drives the endpoint I/O.
+    let local = tokio::task::LocalSet::new();
+    local.run_until(connect_loop_inner(db_path, recorded_by, endpoint, remote, allowed_peers)).await
+}
+
+async fn connect_loop_inner(
+    db_path: &str,
+    recorded_by: &str,
+    endpoint: quinn::Endpoint,
+    remote: SocketAddr,
+    allowed_peers: Option<crate::transport::AllowedPeers>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     loop {
         info!("Connecting to {}...", remote);
         let connection = match endpoint.connect(remote, "localhost") {
@@ -958,6 +1008,20 @@ pub async fn connect_loop(
                 }
             }
         }
+
+        // Spawn intro listener for uni-streams on this connection
+        let _intro_handle = if let Some(ref ap) = allowed_peers {
+            Some(crate::sync::punch::spawn_intro_listener(
+                connection.clone(),
+                db_path.to_string(),
+                recorded_by.to_string(),
+                peer_id.clone(),
+                endpoint.clone(),
+                ap.clone(),
+            ))
+        } else {
+            None
+        };
 
         // Inner loop: repeated sync sessions on this connection
         loop {

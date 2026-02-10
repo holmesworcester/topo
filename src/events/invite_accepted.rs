@@ -62,6 +62,7 @@ pub static INVITE_ACCEPTED_META: EventTypeMeta = EventTypeMeta {
     projection_table: "invite_accepted",
     share_scope: ShareScope::Local,
     dep_fields: &[],
+    dep_field_type_codes: &[],
     signer_required: false,
     signature_byte_len: 0,
     parse: parse_invite_accepted,

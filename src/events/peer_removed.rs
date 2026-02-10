@@ -64,6 +64,7 @@ pub static PEER_REMOVED_META: EventTypeMeta = EventTypeMeta {
     projection_table: "removed_entities",
     share_scope: ShareScope::Shared,
     dep_fields: &["target_event_id", "signed_by"],
+    dep_field_type_codes: &[&[16, 17], &[]],
     signer_required: true,
     signature_byte_len: 64,
     parse: parse_peer_removed,

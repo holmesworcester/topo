@@ -257,6 +257,20 @@ fn project_secret_shared(
 ) -> Result<ProjectionDecision, Box<dyn std::error::Error>> {
     let key_b64 = event_id_to_base64(&ss.key_event_id);
     let recipient_b64 = event_id_to_base64(&ss.recipient_event_id);
+
+    // InvRemovalExclusion: reject if recipient has been removed
+    let recipient_removed: bool = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM removed_entities
+         WHERE recorded_by = ?1 AND target_event_id = ?2",
+        rusqlite::params![recorded_by, &recipient_b64],
+        |row| row.get(0),
+    )?;
+    if recipient_removed {
+        return Ok(ProjectionDecision::Reject {
+            reason: format!("recipient {} has been removed", recipient_b64),
+        });
+    }
+
     conn.execute(
         "INSERT OR IGNORE INTO secret_shared (recorded_by, event_id, key_event_id, recipient_event_id, wrapped_key)
          VALUES (?1, ?2, ?3, ?4, ?5)",

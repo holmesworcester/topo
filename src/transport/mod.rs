@@ -248,6 +248,41 @@ pub fn create_client_endpoint(
     Ok(endpoint)
 }
 
+/// Create a dual-role QUIC endpoint that can both accept and connect.
+/// Both roles use mTLS with the same identity and trust set.
+/// This is required for hole punching: the same UDP socket must be used
+/// for outbound connect() and inbound accept() so NAT mappings align.
+pub fn create_dual_endpoint(
+    bind_addr: SocketAddr,
+    cert_der: CertificateDer<'static>,
+    key_der: PrivatePkcs8KeyDer<'static>,
+    allowed_peers: Arc<AllowedPeers>,
+) -> Result<Endpoint, Box<dyn std::error::Error + Send + Sync>> {
+    // Server-side config (for accepting incoming connections)
+    let server_verifier = Arc::new(PinnedCertVerifier::new(allowed_peers.clone()));
+    let server_crypto = rustls::ServerConfig::builder()
+        .with_client_cert_verifier(server_verifier)
+        .with_single_cert(vec![cert_der.clone()], key_der.clone_key().into())?;
+    let server_config = ServerConfig::with_crypto(Arc::new(
+        quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)?,
+    ));
+
+    // Client-side config (for outbound connections)
+    let client_verifier = Arc::new(PinnedCertVerifier::new(allowed_peers));
+    let client_crypto = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(client_verifier)
+        .with_client_auth_cert(vec![cert_der], key_der.into())?;
+    let client_config = ClientConfig::new(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)?,
+    ));
+
+    // Create server endpoint (binds the socket), then add client config
+    let mut endpoint = Endpoint::server(server_config, bind_addr)?;
+    endpoint.set_default_client_config(client_config);
+    Ok(endpoint)
+}
+
 /// Extract peer identity from a QUIC connection's TLS session.
 /// Returns the hex-encoded SPKI fingerprint of the peer's certificate.
 pub fn peer_identity_from_connection(conn: &quinn::Connection) -> Option<String> {

@@ -62,6 +62,7 @@ pub static WORKSPACE_META: EventTypeMeta = EventTypeMeta {
     projection_table: "workspaces",
     share_scope: ShareScope::Shared,
     dep_fields: &[],
+    dep_field_type_codes: &[],
     signer_required: false,
     signature_byte_len: 0,
     parse: parse_workspace,

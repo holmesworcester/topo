@@ -28,6 +28,9 @@ Changes to this document require TLA+ model re-verification.
 | 20 | UserRemoved | UserRemoved | 138B | Shared | Yes | 64 | 5 (peer_shared) |
 | 21 | PeerRemoved | PeerRemoved | 138B | Shared | Yes | 64 | 5 (peer_shared) |
 | 22 | SecretShared | SecretShared | 202B | Shared | Yes | 64 | 5 (peer_shared) |
+| 23 | TransportKey | — | 41B | Shared | No | 0 | — |
+| 24 | MessageAttachment | — | variable | Shared | No | 0 | — |
+| 25 | FileSlice | — | variable | Shared | Yes | 64 | 5 (peer_shared) |
 
 ## Signer Type Resolution
 
@@ -44,7 +47,7 @@ Changes to this document require TLA+ model re-verification.
 
 | Code | TLA+ RawDeps | Rust dep_fields |
 |------|-------------|-----------------|
-| 1 | — | [] |
+| 1 | {Workspace} | [workspace_event_id] |
 | 2 | {target_event_id} | [target_event_id] |
 | 3 | {} | [] |
 | 4 | {signed_by} | [signed_by] |
@@ -66,12 +69,15 @@ Changes to this document require TLA+ model re-verification.
 | 20 | {target_event_id, signed_by} | [target_event_id, signed_by] |
 | 21 | {target_event_id, signed_by} | [target_event_id, signed_by] |
 | 22 | {key_event_id, recipient_event_id, signed_by} | [key_event_id, recipient_event_id, signed_by] |
+| 23 | {} | [] |
+| 24 | {message_id, key_event_id} | [message_id, key_event_id] |
+| 25 | {signed_by} | [signed_by] |
 
 ## Guards (TLA+ Guard → Rust pipeline check)
 
 | Guard | TLA+ Definition | Rust Check | Applies To |
 |-------|----------------|------------|------------|
-| TrustAnchorMatch | trustAnchor[p] = NetId(e) | trust_anchors.workspace_id = event.workspace_id; Block if no anchor | type 8 (Workspace) |
+| TrustAnchorMatch | trustAnchor[p] = WorkspaceEventId(e) | trust_anchors.workspace_id = event.workspace_id; Block if no anchor | type 8 (Workspace) |
 
 ## Projection Tables
 
@@ -99,6 +105,9 @@ Changes to this document require TLA+ model re-verification.
 | 20 | project_user_removed | removed_entities | — |
 | 21 | project_peer_removed | removed_entities | — |
 | 22 | project_secret_shared | secret_shared | — |
+| 23 | project_transport_key | transport_keys | — |
+| 24 | project_message_attachment | message_attachments | — |
+| 25 | project_file_slice | file_slices | signature verification |
 
 ## Wire Formats
 
@@ -135,13 +144,15 @@ type_code(1) | created_at_ms(8) | key_event_id(32) | recipient_event_id(32) | wr
 |----------------|-----------|
 | InvDeps | verify_projection_invariants: all valid events have deps valid |
 | InvSigner | Signer verification in apply_projection |
-| InvNetAnchor | test_foreign_workspace_excluded: foreign workspace blocked |
+| InvWorkspaceAnchor | test_foreign_workspace_excluded: foreign workspace blocked |
 | InvSingleWorkspace | At most one workspace row per peer in workspaces table |
 | InvTrustAnchorImmutable | test_bootstrap_sequence: trust anchor is immutable once set; mismatch rejected |
 | InvTrustAnchorSource | invite_accepted must be valid for trust anchor to be set |
 | InvUserInviteChain | test_bootstrap_sequence: UserBoot requires UserInviteBoot valid |
 | InvDeviceInviteChain | test_bootstrap_sequence: PeerSharedFirst requires DeviceInviteFirst valid |
 | InvAdminChain | test_bootstrap_sequence: AdminOngoing requires AdminBoot valid |
-| InvForeignNetExcluded | test_foreign_workspace_excluded |
+| InvForeignWorkspaceExcluded | test_foreign_workspace_excluded |
 | InvRemovalAdmin | test_removal_enforcement: removal requires admin context |
 | InvAllValidRequireWorkspace | test_bootstrap_sequence: non-local events require workspace valid |
+| InvMessageWorkspace | Message projection requires workspace (workspace_event_id dep) |
+| InvRemovalExclusion | project_secret_shared: reject if recipient removed |

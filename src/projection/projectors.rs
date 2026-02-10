@@ -14,14 +14,14 @@ pub fn project_message(
     event_id_b64: &str,
     msg: &MessageEvent,
 ) -> Result<bool, rusqlite::Error> {
-    let channel_id_b64 = event_id_to_base64(&msg.channel_id);
+    let workspace_event_id_b64 = event_id_to_base64(&msg.workspace_event_id);
     let author_id_b64 = event_id_to_base64(&msg.author_id);
     let rows = conn.execute(
-        "INSERT OR IGNORE INTO messages (message_id, channel_id, author_id, content, created_at, recorded_by)
+        "INSERT OR IGNORE INTO messages (message_id, workspace_event_id, author_id, content, created_at, recorded_by)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         rusqlite::params![
             event_id_b64,
-            channel_id_b64,
+            workspace_event_id_b64,
             author_id_b64,
             &msg.content,
             msg.created_at_ms as i64,
@@ -224,10 +224,9 @@ pub fn project_message_attachment(
     let message_id_b64 = event_id_to_base64(&att.message_id);
     let file_id_b64 = event_id_to_base64(&att.file_id);
     let key_event_id_b64 = event_id_to_base64(&att.key_event_id);
-    let signer_event_id_b64 = event_id_to_base64(&att.signed_by);
     let rows = conn.execute(
-        "INSERT OR IGNORE INTO message_attachments (recorded_by, event_id, message_id, file_id, blob_bytes, total_slices, slice_bytes, root_hash, key_event_id, filename, mime_type, created_at, signer_event_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        "INSERT OR IGNORE INTO message_attachments (recorded_by, event_id, message_id, file_id, blob_bytes, total_slices, slice_bytes, root_hash, key_event_id, filename, mime_type, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         rusqlite::params![
             recorded_by,
             event_id_b64,
@@ -241,18 +240,14 @@ pub fn project_message_attachment(
             &att.filename,
             &att.mime_type,
             att.created_at_ms as i64,
-            signer_event_id_b64,
         ],
     )?;
     Ok(rows > 0)
 }
 
 /// Project a FileSlice event into the file_slices table (index only, no ciphertext).
-/// Authorization: if a MessageAttachment descriptor exists for this file_id,
-/// the file_slice signer must match the descriptor's signer. If no descriptor
-/// exists yet, the file_slice is guard-blocked (Block with empty missing).
 /// Returns Ok(ProjectionDecision::Valid) on success or idempotent replay.
-/// Returns Ok(ProjectionDecision::Reject) if signer mismatch or slot conflict.
+/// Returns Ok(ProjectionDecision::Reject) if a different event_id already claims this slot.
 pub fn project_file_slice(
     conn: &Connection,
     recorded_by: &str,

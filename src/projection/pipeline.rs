@@ -11,6 +11,41 @@ use super::signer::{resolve_signer_key, verify_ed25519_signature, SignerResoluti
 use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
 use crate::events::{self, registry, ParsedEvent};
 
+/// Check that each dep's type code matches the allowed types for that dep field.
+/// Returns Some(reason) if a type mismatch is found, None if all pass.
+fn check_dep_types(
+    conn: &Connection,
+    deps: &[(&str, EventId)],
+    type_codes: &[&[u8]],
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    for (i, (field_name, dep_id)) in deps.iter().enumerate() {
+        let allowed = type_codes.get(i).copied().unwrap_or(&[]);
+        if allowed.is_empty() {
+            continue;
+        }
+        let dep_b64 = event_id_to_base64(dep_id);
+        let dep_blob: Vec<u8> = match conn.query_row(
+            "SELECT blob FROM events WHERE event_id = ?1",
+            rusqlite::params![&dep_b64],
+            |row| row.get(0),
+        ) {
+            Ok(b) => b,
+            Err(_) => continue, // dep doesn't exist yet; dep-existence check handles this
+        };
+        if dep_blob.is_empty() {
+            continue;
+        }
+        let actual_type = dep_blob[0];
+        if !allowed.contains(&actual_type) {
+            return Ok(Some(format!(
+                "dep {} has type code {} but expected one of {:?}",
+                field_name, actual_type, allowed
+            )));
+        }
+    }
+    Ok(None)
+}
+
 /// Record a rejected event durably so it is not re-processed on replay or cascade.
 fn record_rejection(conn: &Connection, recorded_by: &str, event_id_b64: &str, reason: &str) {
     let now_ms = SystemTime::now()
@@ -213,6 +248,16 @@ pub fn project_one(
         return Ok(ProjectionDecision::Block { missing });
     }
 
+    // 5b. Dep type checking — verify each dep's type code matches expectations
+    let meta = registry().lookup(parsed.event_type_code())
+        .ok_or_else(|| format!("unknown type code {}", parsed.event_type_code()))?;
+    if !meta.dep_field_type_codes.is_empty() {
+        if let Some(reason) = check_dep_types(conn, &deps, meta.dep_field_type_codes)? {
+            record_rejection(conn, recorded_by, &event_id_b64, &reason);
+            return Ok(ProjectionDecision::Reject { reason });
+        }
+    }
+
     // 6. Apply projection (signer verification + projector dispatch)
     let decision = apply_projection(conn, recorded_by, &event_id_b64, &blob, &parsed)?;
     match &decision {
@@ -290,7 +335,7 @@ fn retry_file_slice_guard_blocks_for_file(
 
 /// After projecting an event, find and cascade-project any events that were
 /// blocked waiting on it. Uses an iterative worklist to avoid stack overflow.
-fn unblock_dependents(
+pub fn unblock_dependents(
     conn: &Connection,
     recorded_by: &str,
     blocker_b64: &str,
@@ -494,89 +539,18 @@ mod tests {
         let workspace_id: [u8; 32] = rand::random();
         let net_event = ParsedEvent::Workspace(WorkspaceEvent {
             created_at_ms: now_ms(),
-            public_key: workspace_pub,
-            workspace_id,
+            public_key: [0xAA; 32],
+            workspace_id: [0xBB; 32],
         });
-        let net_blob = events::encode_event(&net_event).unwrap();
-        let net_eid = insert_event_raw(conn, recorded_by, &net_blob);
-
-        // 2. InviteAccepted (local, binds trust anchor)
-        let ia_event = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
-            created_at_ms: now_ms(),
-            invite_event_id: net_eid,
-            workspace_id,
-        });
-        let ia_blob = events::encode_event(&ia_event).unwrap();
-        let ia_eid = insert_event_raw(conn, recorded_by, &ia_blob);
-        project_one(conn, recorded_by, &ia_eid).unwrap();
-        project_one(conn, recorded_by, &net_eid).unwrap();
-
-        // 3. UserInviteBoot (signed by workspace key)
-        let invite_key = SigningKey::generate(&mut rng);
-        let invite_pub = invite_key.verifying_key().to_bytes();
-        let uib = UserInviteBootEvent {
-            created_at_ms: now_ms(),
-            public_key: invite_pub,
-            workspace_id,
-            signed_by: net_eid,
-            signer_type: 1,
-            signature: [0u8; 64],
-        };
-        let uib_event = ParsedEvent::UserInviteBoot(uib);
-        let mut uib_blob = events::encode_event(&uib_event).unwrap();
-        sign_blob(&workspace_key, &mut uib_blob);
-        let uib_eid = insert_event_raw(conn, recorded_by, &uib_blob);
-        project_one(conn, recorded_by, &uib_eid).unwrap();
-
-        // 4. UserBoot (signed by invite key)
-        let user_key = SigningKey::generate(&mut rng);
-        let user_pub = user_key.verifying_key().to_bytes();
-        let ub = UserBootEvent {
-            created_at_ms: now_ms(),
-            public_key: user_pub,
-            signed_by: uib_eid,
-            signer_type: 2,
-            signature: [0u8; 64],
-        };
-        let ub_event = ParsedEvent::UserBoot(ub);
-        let mut ub_blob = events::encode_event(&ub_event).unwrap();
-        sign_blob(&invite_key, &mut ub_blob);
-        let ub_eid = insert_event_raw(conn, recorded_by, &ub_blob);
-        project_one(conn, recorded_by, &ub_eid).unwrap();
-
-        // 5. DeviceInviteFirst (signed by user key)
-        let device_invite_key = SigningKey::generate(&mut rng);
-        let device_invite_pub = device_invite_key.verifying_key().to_bytes();
-        let dif = DeviceInviteFirstEvent {
-            created_at_ms: now_ms(),
-            public_key: device_invite_pub,
-            signed_by: ub_eid,
-            signer_type: 4,
-            signature: [0u8; 64],
-        };
-        let dif_event = ParsedEvent::DeviceInviteFirst(dif);
-        let mut dif_blob = events::encode_event(&dif_event).unwrap();
-        sign_blob(&user_key, &mut dif_blob);
-        let dif_eid = insert_event_raw(conn, recorded_by, &dif_blob);
-        project_one(conn, recorded_by, &dif_eid).unwrap();
-
-        // 6. PeerSharedFirst (signed by device_invite key)
-        let peer_shared_key = SigningKey::generate(&mut rng);
-        let peer_shared_pub = peer_shared_key.verifying_key().to_bytes();
-        let psf = PeerSharedFirstEvent {
-            created_at_ms: now_ms(),
-            public_key: peer_shared_pub,
-            signed_by: dif_eid,
-            signer_type: 3,
-            signature: [0u8; 64],
-        };
-        let psf_event = ParsedEvent::PeerSharedFirst(psf);
-        let mut psf_blob = events::encode_event(&psf_event).unwrap();
-        sign_blob(&device_invite_key, &mut psf_blob);
-        let psf_eid = insert_event_raw(conn, recorded_by, &psf_blob);
-        project_one(conn, recorded_by, &psf_eid).unwrap();
-
-        (psf_eid, peer_shared_key)
+        let blob = events::encode_event(&ws).unwrap();
+        let eid = insert_event_raw(conn, recorded_by, &blob);
+        // Bypass trust anchor guard — directly mark valid for test convenience
+        let eid_b64 = event_id_to_base64(&eid);
+        conn.execute(
+            "INSERT OR IGNORE INTO valid_events (peer_id, event_id) VALUES (?1, ?2)",
+            rusqlite::params![recorded_by, &eid_b64],
+        ).unwrap();
+        eid
     }
 
     /// Build a full identity chain WITHOUT inserting or projecting.
@@ -714,21 +688,22 @@ mod tests {
             channel_id: [1u8; 32],
             author_id: [2u8; 32],
             content: content.to_string(),
-            signed_by: *signer_eid,
-            signer_type: 5,
-            signature: [0u8; 64],
-        };
-        let event = ParsedEvent::Message(msg);
-        let mut blob = events::encode_event(&event).unwrap();
-        sign_blob(signing_key, &mut blob);
-        let parsed = events::parse_event(&blob).unwrap();
-        (parsed, blob)
+        });
+        let blob = events::encode_event(&msg).unwrap();
+        (msg, blob)
     }
 
-    /// Convenience: create identity chain + signed message in one call.
-    fn make_message(conn: &Connection, recorded_by: &str, content: &str) -> (ParsedEvent, Vec<u8>) {
-        let (signer_eid, signing_key) = make_identity_chain(conn, recorded_by);
-        make_message_signed(&signing_key, &signer_eid, content)
+    fn make_message(content: &str) -> (ParsedEvent, Vec<u8>) {
+        // NOTE: This creates a message with a non-existent workspace_event_id dep.
+        // Tests using this must either set up the dep or expect Block.
+        let msg = ParsedEvent::Message(MessageEvent {
+            created_at_ms: now_ms(),
+            workspace_event_id: [1u8; 32],
+            author_id: [2u8; 32],
+            content: content.to_string(),
+        });
+        let blob = events::encode_event(&msg).unwrap();
+        (msg, blob)
     }
 
     /// Create a signed reaction event blob.
@@ -833,13 +808,21 @@ mod tests {
         let memo = SignedMemoEvent {
             created_at_ms: now_ms(),
             signed_by: *signer_event_id,
-            signer_type: 5,
+            signer_type: 0,
             content: content.to_string(),
-            signature: [0u8; 64],
+            signature: [0u8; 64], // placeholder
         };
         let event = ParsedEvent::SignedMemo(memo);
         let mut blob = events::encode_event(&event).unwrap();
-        sign_blob(signing_key, &mut blob);
+
+        // Sign: signing_bytes = blob[..len-64], overwrite last 64 bytes
+        let sig_len = 64;
+        let blob_len = blob.len();
+        let signing_bytes = &blob[..blob_len - sig_len];
+        let sig = sign_event_bytes(signing_key, signing_bytes);
+        blob[blob_len - sig_len..].copy_from_slice(&sig);
+
+        // Re-parse to get the event with correct signature
         let parsed = events::parse_event(&blob).unwrap();
         (parsed, blob)
     }
@@ -854,7 +837,8 @@ mod tests {
     fn test_project_message_valid() {
         let conn = setup();
         let recorded_by = "peer1";
-        let (_msg, blob) = make_message(&conn, recorded_by, "hello");
+        let net_eid = setup_workspace_event(&conn, recorded_by);
+        let (_msg, blob) = make_message_with_workspace(&net_eid, "hello");
         let eid = insert_event_raw(&conn, recorded_by, &blob);
 
         let result = project_one(&conn, recorded_by, &eid).unwrap();
@@ -886,12 +870,10 @@ mod tests {
     fn test_project_reaction_valid() {
         let conn = setup();
         let recorded_by = "peer1";
-
-        // Create identity chain once for this tenant
-        let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
+        let net_eid = setup_workspace_event(&conn, recorded_by);
 
         // Create target message first
-        let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "target");
+        let (_msg, msg_blob) = make_message_with_workspace(&net_eid, "target");
         let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
         project_one(&conn, recorded_by, &msg_eid).unwrap();
 
@@ -921,14 +903,14 @@ mod tests {
 
         // Create reaction with a target that doesn't exist
         let fake_target = [99u8; 32];
-        let (_rxn, rxn_blob) = make_reaction(&conn, recorded_by, &fake_target, "\u{1f44d}");
+        let (_rxn, rxn_blob) = make_reaction(&fake_target, "\u{1f44d}");
         let rxn_eid = insert_event_raw(&conn, recorded_by, &rxn_blob);
 
         let result = project_one(&conn, recorded_by, &rxn_eid).unwrap();
         match result {
             ProjectionDecision::Block { missing } => {
-                // May block on fake_target (and possibly signed_by dep)
-                assert!(missing.contains(&fake_target));
+                assert_eq!(missing.len(), 1);
+                assert_eq!(missing[0], fake_target);
             }
             other => panic!("expected Block, got {:?}", other),
         }
@@ -959,12 +941,10 @@ mod tests {
     fn test_project_unblock_cascade() {
         let conn = setup();
         let recorded_by = "peer1";
-
-        // Create identity chain for signing
-        let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
+        let net_eid = setup_workspace_event(&conn, recorded_by);
 
         // Create message blob but don't insert yet
-        let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "target");
+        let (_msg, msg_blob) = make_message_with_workspace(&net_eid, "target");
         let msg_eid = hash_event(&msg_blob);
 
         // Create reaction targeting it — insert reaction first (out of order)
@@ -1011,7 +991,8 @@ mod tests {
     fn test_already_processed() {
         let conn = setup();
         let recorded_by = "peer1";
-        let (_msg, blob) = make_message(&conn, recorded_by, "hello");
+        let net_eid = setup_workspace_event(&conn, recorded_by);
+        let (_msg, blob) = make_message_with_workspace(&net_eid, "hello");
         let eid = insert_event_raw(&conn, recorded_by, &blob);
 
         let r1 = project_one(&conn, recorded_by, &eid).unwrap();
@@ -1025,14 +1006,12 @@ mod tests {
     fn test_multi_blocker() {
         let conn = setup();
         let recorded_by = "peer1";
+        let net_eid = setup_workspace_event(&conn, recorded_by);
 
-        // Create identity chain for signing
-        let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
-
-        // Create two messages (targets) — pre-compute hashes
-        let (_msg1, msg1_blob) = make_message_signed(&signing_key, &signer_eid, "target1");
+        // Create two messages (targets)
+        let (_msg1, msg1_blob) = make_message_with_workspace(&net_eid, "target1");
         let msg1_eid = hash_event(&msg1_blob);
-        let (_msg2, msg2_blob) = make_message_signed(&signing_key, &signer_eid, "target2");
+        let (_msg2, msg2_blob) = make_message_with_workspace(&net_eid, "target2");
         let msg2_eid = hash_event(&msg2_blob);
 
         // Create reaction targeting msg1 — insert without msg1 in events
@@ -1123,12 +1102,18 @@ mod tests {
     fn test_project_signed_memo_valid() {
         let conn = setup();
         let recorded_by = "peer1";
+        let mut rng = rand::thread_rng();
+        let signing_key = SigningKey::generate(&mut rng);
+        let public_key = signing_key.verifying_key().to_bytes();
 
-        // Create identity chain as signer
-        let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
+        // First create and project the PeerKey event
+        let (_pk, pk_blob) = make_peer_key(public_key);
+        let pk_eid = insert_event_raw(&conn, recorded_by, &pk_blob);
+        let pk_result = project_one(&conn, recorded_by, &pk_eid).unwrap();
+        assert_eq!(pk_result, ProjectionDecision::Valid);
 
-        // Now create a signed memo referencing the signer
-        let (_memo, memo_blob) = make_signed_memo(&signing_key, &signer_eid, "hello signed");
+        // Now create a signed memo referencing the PeerKey
+        let (_memo, memo_blob) = make_signed_memo(&signing_key, &pk_eid, "hello signed");
         let memo_eid = insert_event_raw(&conn, recorded_by, &memo_blob);
 
         let result = project_one(&conn, recorded_by, &memo_eid).unwrap();
@@ -1172,20 +1157,26 @@ mod tests {
     fn test_signed_memo_unblocks_when_signer_arrives() {
         let conn = setup();
         let recorded_by = "peer1";
+        let mut rng = rand::thread_rng();
+        let signing_key = SigningKey::generate(&mut rng);
+        let public_key = signing_key.verifying_key().to_bytes();
 
-        // Build identity chain without inserting (deferred)
-        let (signer_eid, signing_key, chain_blobs) = build_identity_chain_deferred(recorded_by);
+        // Pre-compute the PeerKey event_id without inserting
+        let (_pk, pk_blob) = make_peer_key(public_key);
+        let pk_eid = hash_event(&pk_blob);
 
-        // Create and insert signed memo BEFORE signer exists
-        let (_memo, memo_blob) = make_signed_memo(&signing_key, &signer_eid, "out of order");
+        // Create and insert signed memo (before signer arrives)
+        let (_memo, memo_blob) = make_signed_memo(&signing_key, &pk_eid, "out of order");
         let memo_eid = insert_event_raw(&conn, recorded_by, &memo_blob);
 
         // Project memo — should block on missing signer
         let result = project_one(&conn, recorded_by, &memo_eid).unwrap();
         assert!(matches!(result, ProjectionDecision::Block { .. }));
 
-        // Now insert and project the full identity chain
-        insert_and_project_identity_chain(&conn, recorded_by, &chain_blobs);
+        // Now insert and project the signer PeerKey
+        insert_event_raw(&conn, recorded_by, &pk_blob);
+        let pk_result = project_one(&conn, recorded_by, &pk_eid).unwrap();
+        assert_eq!(pk_result, ProjectionDecision::Valid);
 
         // Memo should have been auto-unblocked via cascade
         let memo_b64 = event_id_to_base64(&memo_eid);
@@ -1217,13 +1208,17 @@ mod tests {
         let conn = setup();
         let recorded_by = "peer1";
         let mut rng = rand::thread_rng();
+        let signing_key = SigningKey::generate(&mut rng);
         let wrong_key = SigningKey::generate(&mut rng);
+        let public_key = signing_key.verifying_key().to_bytes();
 
-        // Create identity chain as signer
-        let (signer_eid, _signing_key) = make_identity_chain(&conn, recorded_by);
+        // Create PeerKey with signing_key's public key
+        let (_pk, pk_blob) = make_peer_key(public_key);
+        let pk_eid = insert_event_raw(&conn, recorded_by, &pk_blob);
+        project_one(&conn, recorded_by, &pk_eid).unwrap();
 
-        // Sign the memo with the WRONG key (not the identity chain's key)
-        let (_memo, memo_blob) = make_signed_memo(&wrong_key, &signer_eid, "bad signature");
+        // Sign the memo with the WRONG key
+        let (_memo, memo_blob) = make_signed_memo(&wrong_key, &pk_eid, "bad signature");
         let memo_eid = insert_event_raw(&conn, recorded_by, &memo_blob);
 
         let result = project_one(&conn, recorded_by, &memo_eid).unwrap();
@@ -1236,16 +1231,13 @@ mod tests {
     }
 
     #[test]
-    fn test_signed_content_events_project_with_identity_chain() {
-        // Verify that signed messages and reactions project correctly through
-        // the pipeline with proper identity chains.
+    fn test_unsigned_types_skip_signer_check() {
+        // Regression: ensure Message and Reaction still project normally
         let conn = setup();
         let recorded_by = "peer1";
+        let net_eid = setup_workspace_event(&conn, recorded_by);
 
-        // Create identity chain once for this tenant
-        let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
-
-        let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "signed message");
+        let (_msg, msg_blob) = make_message_with_workspace(&net_eid, "no signer needed");
         let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
         let r1 = project_one(&conn, recorded_by, &msg_eid).unwrap();
         assert_eq!(r1, ProjectionDecision::Valid);
@@ -1263,15 +1255,16 @@ mod tests {
         let conn = setup();
         let tenant_a = "tenant_a";
         let tenant_b = "tenant_b";
+        let net_eid_a = setup_workspace_event(&conn, tenant_a);
 
         // Tenant A creates and projects a message
-        let (_msg, msg_blob) = make_message(&conn, tenant_a, "target for A");
+        let (_msg, msg_blob) = make_message_with_workspace(&net_eid_a, "target for A");
         let msg_eid = insert_event_raw(&conn, tenant_a, &msg_blob);
         let r = project_one(&conn, tenant_a, &msg_eid).unwrap();
         assert_eq!(r, ProjectionDecision::Valid);
 
-        // Tenant B creates a reaction targeting A's message (with B's own identity chain)
-        let (_rxn, rxn_blob) = make_reaction(&conn, tenant_b, &msg_eid, "\u{1f44d}");
+        // Tenant B creates a reaction targeting A's message
+        let (_rxn, rxn_blob) = make_reaction(&msg_eid, "\u{1f44d}");
         let rxn_eid = insert_event_raw(&conn, tenant_b, &rxn_blob);
 
         // Tenant B projects the reaction — should BLOCK because the message is not
@@ -1279,7 +1272,8 @@ mod tests {
         let r2 = project_one(&conn, tenant_b, &rxn_eid).unwrap();
         match r2 {
             ProjectionDecision::Block { missing } => {
-                assert!(missing.contains(&msg_eid));
+                assert_eq!(missing.len(), 1);
+                assert_eq!(missing[0], msg_eid);
             }
             other => panic!("expected Block, got {:?}", other),
         }
@@ -1291,24 +1285,34 @@ mod tests {
         let conn = setup();
         let tenant_a = "tenant_a";
         let tenant_b = "tenant_b";
+        let net_eid_a = setup_workspace_event(&conn, tenant_a);
+        // Same workspace event must be valid for tenant_b too since they share the blob
+        setup_workspace_event(&conn, tenant_b);
+        // Use tenant_a's net_eid so both share the same message blob
+        // But we need the SAME workspace_event_id in both tenants' valid_events.
+        // Since setup_workspace_event creates different workspace events per tenant,
+        // we must manually mark tenant_a's workspace event valid for tenant_b too.
+        let net_b64 = event_id_to_base64(&net_eid_a);
+        conn.execute(
+            "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source) VALUES (?1, ?2, ?3, 'test')",
+            rusqlite::params![tenant_b, &net_b64, now_ms() as i64],
+        ).unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO valid_events (peer_id, event_id) VALUES (?1, ?2)",
+            rusqlite::params![tenant_b, &net_b64],
+        ).unwrap();
 
-        // Create identity chain for tenant_a, then replicate identity events for tenant_b
-        let (signer_eid, signing_key) = make_identity_chain(&conn, tenant_a);
+        let (_msg, msg_blob) = make_message_with_workspace(&net_eid_a, "shared message");
+        let msg_eid = insert_event_raw(&conn, tenant_a, &msg_blob);
+        // Also record for tenant_b
+        let eid_b64 = event_id_to_base64(&msg_eid);
+        conn.execute(
+            "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
+             VALUES (?1, ?2, ?3, 'test')",
+            rusqlite::params![tenant_b, &eid_b64, now_ms() as i64],
+        ).unwrap();
 
-        // Replicate the identity chain events for tenant_b so the signer is valid for both
-        // We need to record and project the same identity events for tenant_b.
-        // The simplest approach: also create an identity chain for tenant_b.
-        // But since the message's signed_by references tenant_a's signer, tenant_b needs
-        // that same signer projected. Let's record the signer event for tenant_b and
-        // project the entire chain for tenant_b.
-        // Actually, the identity chain events are already in the events table.
-        // We need to record+project them for tenant_b. The signer_eid (PeerSharedFirst)
-        // and all its ancestors need to be valid for tenant_b.
-        // The simplest approach: create a separate identity chain for tenant_b that produces
-        // a different signer, but then the message would reference tenant_a's signer, not tenant_b's.
-        // So let's use separate messages for each tenant.
-        let (_msg_a, msg_a_blob) = make_message_signed(&signing_key, &signer_eid, "shared message");
-        let msg_eid = insert_event_raw(&conn, tenant_a, &msg_a_blob);
+        // Project for both tenants
         let r_a = project_one(&conn, tenant_a, &msg_eid).unwrap();
         assert_eq!(r_a, ProjectionDecision::Valid);
 
@@ -1363,13 +1367,19 @@ mod tests {
 
     #[test]
     fn test_cross_tenant_signer_isolation() {
-        // Identity chain projected for tenant_a only; signed memo should block for tenant_b
+        // PeerKey projected for tenant_a only; signed memo should block for tenant_b
         let conn = setup();
         let tenant_a = "tenant_a";
         let tenant_b = "tenant_b";
+        let mut rng = rand::thread_rng();
+        let signing_key = SigningKey::generate(&mut rng);
+        let public_key = signing_key.verifying_key().to_bytes();
 
-        // Create identity chain for tenant_a
-        let (signer_eid, signing_key) = make_identity_chain(&conn, tenant_a);
+        // Create and project PeerKey for tenant_a only
+        let (_pk, pk_blob) = make_peer_key(public_key);
+        let pk_eid = insert_event_raw(&conn, tenant_a, &pk_blob);
+        let r = project_one(&conn, tenant_a, &pk_eid).unwrap();
+        assert_eq!(r, ProjectionDecision::Valid);
 
         // Create signed memo (correct signature)
         let (_memo, memo_blob) =
@@ -1380,16 +1390,16 @@ mod tests {
         let r_a = project_one(&conn, tenant_a, &memo_eid).unwrap();
         assert_eq!(r_a, ProjectionDecision::Valid);
 
-        // Also record the memo + signer for tenant_b
+        // Also record the memo + pk for tenant_b
         let memo_b64 = event_id_to_base64(&memo_eid);
-        let signer_b64 = event_id_to_base64(&signer_eid);
+        let pk_b64 = event_id_to_base64(&pk_eid);
         conn.execute(
             "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source) VALUES (?1, ?2, ?3, 'test')",
             rusqlite::params![tenant_b, &memo_b64, now_ms() as i64],
         ).unwrap();
         conn.execute(
             "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source) VALUES (?1, ?2, ?3, 'test')",
-            rusqlite::params![tenant_b, &signer_b64, now_ms() as i64],
+            rusqlite::params![tenant_b, &pk_b64, now_ms() as i64],
         ).unwrap();
 
         // Project memo for tenant_b — should BLOCK (signer dep not valid for B)
@@ -1397,7 +1407,7 @@ mod tests {
         match r_b {
             ProjectionDecision::Block { missing } => {
                 assert_eq!(missing.len(), 1);
-                assert_eq!(missing[0], signer_eid);
+                assert_eq!(missing[0], pk_eid);
             }
             other => panic!("expected Block for tenant_b, got {:?}", other),
         }
@@ -1426,13 +1436,17 @@ mod tests {
         let conn = setup();
         let recorded_by = "peer1";
         let mut rng = rand::thread_rng();
+        let signing_key = SigningKey::generate(&mut rng);
         let wrong_key = SigningKey::generate(&mut rng);
+        let public_key = signing_key.verifying_key().to_bytes();
 
-        // Create identity chain as signer
-        let (signer_eid, _signing_key) = make_identity_chain(&conn, recorded_by);
+        // Create PeerKey with signing_key's public key
+        let (_pk, pk_blob) = make_peer_key(public_key);
+        let pk_eid = insert_event_raw(&conn, recorded_by, &pk_blob);
+        project_one(&conn, recorded_by, &pk_eid).unwrap();
 
         // Sign memo with wrong key
-        let (_memo, memo_blob) = make_signed_memo(&wrong_key, &signer_eid, "bad sig");
+        let (_memo, memo_blob) = make_signed_memo(&wrong_key, &pk_eid, "bad sig");
         let memo_eid = insert_event_raw(&conn, recorded_by, &memo_blob);
 
         let result = project_one(&conn, recorded_by, &memo_eid).unwrap();
@@ -1486,11 +1500,13 @@ mod tests {
         let conn = setup();
         let tenant_a = "tenant_a";
         let tenant_b = "tenant_b";
+        let net_eid_a = setup_workspace_event(&conn, tenant_a);
+        let net_eid_b = setup_workspace_event(&conn, tenant_b);
 
-        // Each tenant creates a message with its own identity chain
-        let (_msg_a, msg_a_blob) = make_message(&conn, tenant_a, "hello from A");
+        // Each tenant creates a message
+        let (_msg_a, msg_a_blob) = make_message_with_workspace(&net_eid_a, "hello from A");
         let msg_a_eid = insert_event_raw(&conn, tenant_a, &msg_a_blob);
-        let (_msg_b, msg_b_blob) = make_message(&conn, tenant_b, "hello from B");
+        let (_msg_b, msg_b_blob) = make_message_with_workspace(&net_eid_b, "hello from B");
         let msg_b_eid = insert_event_raw(&conn, tenant_b, &msg_b_blob);
 
         // Project each for their tenant
@@ -1518,19 +1534,23 @@ mod tests {
         assert_eq!(count_b, 1);
 
         // Tenant B reacts to tenant A's message — blocks (dep not valid for B)
-        let (_rxn, rxn_blob) = make_reaction(&conn, tenant_b, &msg_a_eid, "\u{1f44d}");
+        let (_rxn, rxn_blob) = make_reaction(&msg_a_eid, "\u{1f44d}");
         let rxn_eid = insert_event_raw(&conn, tenant_b, &rxn_blob);
         let r_rxn = project_one(&conn, tenant_b, &rxn_eid).unwrap();
         assert!(matches!(r_rxn, ProjectionDecision::Block { .. }));
 
-        // Now record and project tenant_a's message for tenant_b.
-        // The message's signed_by references tenant_a's signer, so tenant_b also needs
-        // that signer projected. We need to project the message's signer chain for tenant_b.
-        // Since the message blob references a signer that belongs to tenant_a, projecting
-        // the message for tenant_b will block on the signer dep. Let's project tenant_a's
-        // message signer chain for tenant_b by recording+projecting those identity events.
-        // For simplicity, we just record+project the message for tenant_b.
-        // The message will block on its signed_by dep for tenant_b. So we accept a Block.
+        // Make tenant_a's workspace event valid for tenant_b (so the message dep is satisfied)
+        let net_a_b64 = event_id_to_base64(&net_eid_a);
+        conn.execute(
+            "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source) VALUES (?1, ?2, ?3, 'test')",
+            rusqlite::params![tenant_b, &net_a_b64, now_ms() as i64],
+        ).unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO valid_events (peer_id, event_id) VALUES (?1, ?2)",
+            rusqlite::params![tenant_b, &net_a_b64],
+        ).unwrap();
+
+        // Now record and project tenant_a's message for tenant_b
         let msg_a_b64 = event_id_to_base64(&msg_a_eid);
         conn.execute(
             "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source) VALUES (?1, ?2, ?3, 'test')",
@@ -1545,7 +1565,7 @@ mod tests {
             r_msg_for_b
         );
 
-        // Reaction also still blocked (its target is not valid for tenant_b)
+        // Cascade should have unblocked the reaction for tenant_b
         let rxn_b64 = event_id_to_base64(&rxn_eid);
         let rxn_valid: bool = conn
             .query_row(
@@ -1627,6 +1647,7 @@ mod tests {
     fn test_encrypted_message_valid() {
         let conn = setup();
         let recorded_by = "peer1";
+        let net_eid = setup_workspace_event(&conn, recorded_by);
         let key_bytes: [u8; 32] = rand::random();
 
         // Create and project secret key
@@ -1635,11 +1656,8 @@ mod tests {
         let r = project_one(&conn, recorded_by, &sk_eid).unwrap();
         assert_eq!(r, ProjectionDecision::Valid);
 
-        // Create identity chain for signing the inner message
-        let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
-
-        // Create signed inner message
-        let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "encrypted hello");
+        // Create inner message
+        let (_msg, msg_blob) = make_message_with_workspace(&net_eid, "encrypted hello");
 
         // Encrypt it
         let (_enc, enc_blob) =
@@ -1671,9 +1689,6 @@ mod tests {
         let (_sk, sk_blob) = make_secret_key(key_bytes);
         let sk_eid = hash_event(&sk_blob);
 
-        // Create identity chain for signing the inner message
-        let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
-
         // Create encrypted event referencing the missing key
         let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "blocked encrypted");
         let (_enc, enc_blob) =
@@ -1694,14 +1709,12 @@ mod tests {
     fn test_encrypted_unblocks_when_key_arrives() {
         let conn = setup();
         let recorded_by = "peer1";
+        let net_eid = setup_workspace_event(&conn, recorded_by);
         let key_bytes: [u8; 32] = rand::random();
 
         // Pre-compute key event_id
         let (_sk, sk_blob) = make_secret_key(key_bytes);
         let sk_eid = hash_event(&sk_blob);
-
-        // Create identity chain for signing the inner message
-        let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
 
         // Insert encrypted event first (before key)
         let (_msg, msg_blob) =
@@ -1756,9 +1769,6 @@ mod tests {
         let sk_b_eid = insert_event_raw(&conn, recorded_by, &sk_b_blob);
         project_one(&conn, recorded_by, &sk_b_eid).unwrap();
 
-        // Create identity chain for signing the inner message
-        let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
-
         // Encrypt with key A but reference key B
         let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "wrong key test");
         let (_enc, enc_blob) =
@@ -1785,11 +1795,8 @@ mod tests {
         let sk_eid = insert_event_raw(&conn, recorded_by, &sk_blob);
         project_one(&conn, recorded_by, &sk_eid).unwrap();
 
-        // Create identity chain for signing the inner message
-        let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
-
         // Create a message but declare inner_type_code=2 (reaction)
-        let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "type mismatch");
+        let (_msg, msg_blob) = make_message("type mismatch");
         let (_enc, enc_blob) = make_encrypted_event(&key_bytes, &msg_blob, 2, &sk_eid);
         let enc_eid = insert_event_raw(&conn, recorded_by, &enc_blob);
 
@@ -1812,9 +1819,6 @@ mod tests {
         let (_sk, sk_blob) = make_secret_key(key_bytes);
         let sk_eid = insert_event_raw(&conn, recorded_by, &sk_blob);
         project_one(&conn, recorded_by, &sk_eid).unwrap();
-
-        // Create identity chain for signing the inner message
-        let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
 
         // Create inner encrypted event
         let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "nested inner");
@@ -1846,9 +1850,6 @@ mod tests {
         let sk_eid = insert_event_raw(&conn, recorded_by, &sk_blob);
         project_one(&conn, recorded_by, &sk_eid).unwrap();
 
-        // Create identity chain for signing the inner reaction
-        let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
-
         // Create encrypted reaction with missing target
         let fake_target = [88u8; 32];
         let (_rxn, rxn_blob) =
@@ -1859,7 +1860,8 @@ mod tests {
         let result = project_one(&conn, recorded_by, &enc_eid).unwrap();
         match result {
             ProjectionDecision::Block { missing } => {
-                assert!(missing.contains(&fake_target));
+                assert_eq!(missing.len(), 1);
+                assert_eq!(missing[0], fake_target);
             }
             other => panic!("expected Block on inner dep, got {:?}", other),
         }
@@ -1880,15 +1882,13 @@ mod tests {
     fn test_encrypted_inner_dep_unblocks() {
         let conn = setup();
         let recorded_by = "peer1";
+        let net_eid = setup_workspace_event(&conn, recorded_by);
         let key_bytes: [u8; 32] = rand::random();
 
         // Create and project key
         let (_sk, sk_blob) = make_secret_key(key_bytes);
         let sk_eid = insert_event_raw(&conn, recorded_by, &sk_blob);
         project_one(&conn, recorded_by, &sk_eid).unwrap();
-
-        // Create identity chain for signing inner events
-        let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
 
         // Create target message (pre-compute but don't insert yet)
         let (_msg, msg_blob) =
@@ -1937,9 +1937,6 @@ mod tests {
         let sk_b_eid = insert_event_raw(&conn, recorded_by, &sk_b_blob);
         project_one(&conn, recorded_by, &sk_b_eid).unwrap();
 
-        // Create identity chain for signing the inner message
-        let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
-
         // Encrypt with key A, reference key B → decryption fails
         let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "will be rejected");
         let (_enc, enc_blob) =
@@ -1966,6 +1963,7 @@ mod tests {
         let conn = setup();
         let tenant_a = "tenant_a";
         let tenant_b = "tenant_b";
+        let net_eid_a = setup_workspace_event(&conn, tenant_a);
         let key_bytes: [u8; 32] = rand::random();
 
         // Create and project key for tenant_a only
@@ -1973,9 +1971,6 @@ mod tests {
         let sk_eid = insert_event_raw(&conn, tenant_a, &sk_blob);
         let r = project_one(&conn, tenant_a, &sk_eid).unwrap();
         assert_eq!(r, ProjectionDecision::Valid);
-
-        // Create identity chain for signing the inner message (for tenant_a)
-        let (signer_eid, signing_key) = make_identity_chain(&conn, tenant_a);
 
         // Create encrypted message referencing that key
         let (_msg, msg_blob) =
@@ -2028,18 +2023,16 @@ mod tests {
     fn test_project_message_deletion_valid() {
         let conn = setup();
         let recorded_by = "peer1";
-
-        // Create identity chain once for this tenant
-        let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
+        let net_eid = setup_workspace_event(&conn, recorded_by);
 
         // Create and project a message
-        let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "to be deleted");
+        let (_msg, msg_blob) = make_message_with_workspace(&net_eid, "to be deleted");
         let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
         let r = project_one(&conn, recorded_by, &msg_eid).unwrap();
         assert_eq!(r, ProjectionDecision::Valid);
 
         // Create and project the deletion
-        let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [2u8; 32]); // author_id matches message
+        let (_del, del_blob) = make_deletion(&msg_eid, [2u8; 32]); // author_id matches message
         let del_eid = insert_event_raw(&conn, recorded_by, &del_blob);
         let result = project_one(&conn, recorded_by, &del_eid).unwrap();
         assert_eq!(result, ProjectionDecision::Valid);
@@ -2081,12 +2074,10 @@ mod tests {
     fn test_deletion_cascades_reactions() {
         let conn = setup();
         let recorded_by = "peer1";
-
-        // Create identity chain once for this tenant
-        let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
+        let net_eid = setup_workspace_event(&conn, recorded_by);
 
         // Create message + 2 reactions
-        let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "with reactions");
+        let (_msg, msg_blob) = make_message_with_workspace(&net_eid, "with reactions");
         let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
         project_one(&conn, recorded_by, &msg_eid).unwrap();
 
@@ -2111,7 +2102,7 @@ mod tests {
         assert_eq!(rxn_count, 2);
 
         // Delete the message
-        let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [2u8; 32]);
+        let (_del, del_blob) = make_deletion(&msg_eid, [2u8; 32]);
         let del_eid = insert_event_raw(&conn, recorded_by, &del_blob);
         let result = project_one(&conn, recorded_by, &del_eid).unwrap();
         assert_eq!(result, ProjectionDecision::Valid);
@@ -2143,13 +2134,14 @@ mod tests {
         let recorded_by = "peer1";
 
         let fake_target = [77u8; 32];
-        let (_del, del_blob) = make_deletion(&conn, recorded_by, &fake_target, [2u8; 32]);
+        let (_del, del_blob) = make_deletion(&fake_target, [2u8; 32]);
         let del_eid = insert_event_raw(&conn, recorded_by, &del_blob);
 
         let result = project_one(&conn, recorded_by, &del_eid).unwrap();
         match result {
             ProjectionDecision::Block { missing } => {
-                assert!(missing.contains(&fake_target));
+                assert_eq!(missing.len(), 1);
+                assert_eq!(missing[0], fake_target);
             }
             other => panic!("expected Block, got {:?}", other),
         }
@@ -2159,16 +2151,14 @@ mod tests {
     fn test_deletion_unblocks_when_target_arrives() {
         let conn = setup();
         let recorded_by = "peer1";
-
-        // Create identity chain for signing
-        let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
+        let net_eid = setup_workspace_event(&conn, recorded_by);
 
         // Pre-compute message blob and eid
-        let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "will arrive later");
+        let (_msg, msg_blob) = make_message_with_workspace(&net_eid, "will arrive later");
         let msg_eid = hash_event(&msg_blob);
 
         // Create deletion first (before message exists)
-        let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [2u8; 32]);
+        let (_del, del_blob) = make_deletion(&msg_eid, [2u8; 32]);
         let del_eid = insert_event_raw(&conn, recorded_by, &del_blob);
 
         // Project deletion — should block
@@ -2219,12 +2209,10 @@ mod tests {
     fn test_deletion_wrong_author_rejects() {
         let conn = setup();
         let recorded_by = "peer1";
-
-        // Create identity chain once for this tenant
-        let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
+        let net_eid = setup_workspace_event(&conn, recorded_by);
 
         // Create message with author_id = [2u8; 32]
-        let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "wrong author test");
+        let (_msg, msg_blob) = make_message_with_workspace(&net_eid, "wrong author test");
         let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
         project_one(&conn, recorded_by, &msg_eid).unwrap();
 
@@ -2250,12 +2238,10 @@ mod tests {
     fn test_deletion_idempotent() {
         let conn = setup();
         let recorded_by = "peer1";
-
-        // Create identity chain for signing
-        let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
+        let net_eid = setup_workspace_event(&conn, recorded_by);
 
         // Create and project message
-        let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "delete me twice");
+        let (_msg, msg_blob) = make_message_with_workspace(&net_eid, "delete me twice");
         let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
         project_one(&conn, recorded_by, &msg_eid).unwrap();
 
@@ -2290,17 +2276,15 @@ mod tests {
     fn test_reaction_after_deletion_skipped() {
         let conn = setup();
         let recorded_by = "peer1";
-
-        // Create identity chain once for this tenant
-        let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
+        let net_eid = setup_workspace_event(&conn, recorded_by);
 
         // Create and project message
-        let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "will be deleted");
+        let (_msg, msg_blob) = make_message_with_workspace(&net_eid, "will be deleted");
         let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
         project_one(&conn, recorded_by, &msg_eid).unwrap();
 
         // Delete message
-        let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [2u8; 32]);
+        let (_del, del_blob) = make_deletion(&msg_eid, [2u8; 32]);
         let del_eid = insert_event_raw(&conn, recorded_by, &del_blob);
         project_one(&conn, recorded_by, &del_eid).unwrap();
 
@@ -2329,12 +2313,10 @@ mod tests {
     fn test_deletion_convergence() {
         let conn = setup();
         let recorded_by = "peer1";
-
-        // Create identity chain for signing (used across both orderings)
-        let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
+        let net_eid = setup_workspace_event(&conn, recorded_by);
 
         // === Forward order: msg → rxn → del ===
-        let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "convergence test");
+        let (_msg, msg_blob) = make_message_with_workspace(&net_eid, "convergence test");
         let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
         project_one(&conn, recorded_by, &msg_eid).unwrap();
 
@@ -2343,7 +2325,7 @@ mod tests {
         let rxn_eid = insert_event_raw(&conn, recorded_by, &rxn_blob);
         project_one(&conn, recorded_by, &rxn_eid).unwrap();
 
-        let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [2u8; 32]);
+        let (_del, del_blob) = make_deletion(&msg_eid, [2u8; 32]);
         let del_eid = insert_event_raw(&conn, recorded_by, &del_blob);
         project_one(&conn, recorded_by, &del_eid).unwrap();
 
@@ -2411,6 +2393,13 @@ mod tests {
             rusqlite::params![recorded_by],
         )
         .unwrap();
+
+        // Re-insert workspace event as valid (it was cleared above)
+        let net_b64 = event_id_to_base64(&net_eid);
+        conn.execute(
+            "INSERT OR IGNORE INTO valid_events (peer_id, event_id) VALUES (?1, ?2)",
+            rusqlite::params![recorded_by, &net_b64],
+        ).unwrap();
 
         // Project in reverse order: del first (blocks), then rxn (blocks), then msg (unblocks all)
         project_one(&conn, recorded_by, &del_eid).unwrap();
@@ -2509,16 +2498,28 @@ mod tests {
         let conn = setup();
         let tenant_a = "tenant_a";
         let tenant_b = "tenant_b";
+        let net_eid = setup_workspace_event(&conn, tenant_a);
+        // Also mark valid for tenant_b
+        let net_b64 = event_id_to_base64(&net_eid);
+        conn.execute(
+            "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source) VALUES (?1, ?2, ?3, 'test')",
+            rusqlite::params![tenant_b, &net_b64, now_ms() as i64],
+        ).unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO valid_events (peer_id, event_id) VALUES (?1, ?2)",
+            rusqlite::params![tenant_b, &net_b64],
+        ).unwrap();
 
-        // Use a SecretKey event (unsigned, no signer_required) for the cross-tenant
-        // emit test. This avoids needing to set up identity chains for emit_deterministic_event.
-        let sk = ParsedEvent::SecretKey(SecretKeyEvent {
+        // Create a deterministic message event
+        let msg = ParsedEvent::Message(MessageEvent {
             created_at_ms: 1000,
-            key_bytes: [42u8; 32],
+            workspace_event_id: net_eid,
+            author_id: [2u8; 32],
+            content: "deterministic".to_string(),
         });
 
         // Tenant A emits it
-        let eid_a = emit_deterministic_event(&conn, tenant_a, &sk).unwrap();
+        let eid_a = emit_deterministic_event(&conn, tenant_a, &msg).unwrap();
         let eid_b64 = event_id_to_base64(&eid_a);
 
         // Tenant B emits the same deterministic event
@@ -2621,9 +2622,7 @@ mod tests {
     fn test_post_tombstone_wrong_author_deletion_rejects() {
         let conn = setup();
         let recorded_by = "peer1";
-
-        // Create identity chain for signing
-        let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
+        let net_eid = setup_workspace_event(&conn, recorded_by);
 
         // Create and project a message (author_id = [2u8; 32])
         let (_msg, msg_blob) =
@@ -2676,13 +2675,17 @@ mod tests {
         let conn = setup();
         let recorded_by = "peer1";
         let mut rng = rand::thread_rng();
+        let signing_key = SigningKey::generate(&mut rng);
         let wrong_key = SigningKey::generate(&mut rng);
+        let public_key = signing_key.verifying_key().to_bytes();
 
-        // Create identity chain as signer
-        let (signer_eid, _signing_key) = make_identity_chain(&conn, recorded_by);
+        // Create PeerKey with signing_key's public key
+        let (_pk, pk_blob) = make_peer_key(public_key);
+        let pk_eid = insert_event_raw(&conn, recorded_by, &pk_blob);
+        project_one(&conn, recorded_by, &pk_eid).unwrap();
 
         // Sign the memo with the WRONG key
-        let (_memo, memo_blob) = make_signed_memo(&wrong_key, &signer_eid, "bad sig memo");
+        let (_memo, memo_blob) = make_signed_memo(&wrong_key, &pk_eid, "bad sig memo");
         let memo_eid = insert_event_raw(&conn, recorded_by, &memo_blob);
 
         let result = project_one(&conn, recorded_by, &memo_eid).unwrap();
@@ -2719,12 +2722,19 @@ mod tests {
             slice_number,
             ciphertext: ciphertext.to_vec(),
             signed_by: *signer_event_id,
-            signer_type: 5,
-            signature: [0u8; 64],
+            signer_type: 0,
+            signature: [0u8; 64], // placeholder
         };
         let event = ParsedEvent::FileSlice(fs);
         let mut blob = events::encode_event(&event).unwrap();
-        sign_blob(signing_key, &mut blob);
+
+        // Sign: signing_bytes = blob[..len-64], overwrite last 64 bytes
+        let sig_len = 64;
+        let blob_len = blob.len();
+        let signing_bytes = &blob[..blob_len - sig_len];
+        let sig = sign_event_bytes(signing_key, signing_bytes);
+        blob[blob_len - sig_len..].copy_from_slice(&sig);
+
         let parsed = events::parse_event(&blob).unwrap();
         (parsed, blob)
     }
@@ -2818,13 +2828,14 @@ mod tests {
     fn test_file_slice_valid() {
         let conn = setup();
         let recorded_by = "peer1";
+        let mut rng = rand::thread_rng();
+        let signing_key = SigningKey::generate(&mut rng);
+        let public_key = signing_key.verifying_key().to_bytes();
 
-        // Create identity chain as signer
-        let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
-
-        // Create descriptor (MessageAttachment) for this file_id
-        let file_id = [99u8; 32];
-        setup_descriptor_for_file(&conn, recorded_by, &signing_key, &signer_eid, file_id);
+        // Create PeerKey as signer
+        let (_pk, pk_blob) = make_peer_key(public_key);
+        let pk_eid = insert_event_raw(&conn, recorded_by, &pk_blob);
+        assert_eq!(project_one(&conn, recorded_by, &pk_eid).unwrap(), ProjectionDecision::Valid);
 
         // Create FileSlice
         let (_fs, fs_blob) =
@@ -2865,24 +2876,30 @@ mod tests {
     fn test_file_slice_unblocks_when_signer_arrives() {
         let conn = setup();
         let recorded_by = "peer1";
+        let mut rng = rand::thread_rng();
+        let signing_key = SigningKey::generate(&mut rng);
+        let public_key = signing_key.verifying_key().to_bytes();
 
-        // Build identity chain without inserting (deferred)
-        let (signer_eid, signing_key, chain_blobs) = build_identity_chain_deferred(recorded_by);
+        // Create PeerKey blob but don't insert yet — get its event_id by hashing
+        let (_pk, pk_blob) = make_peer_key(public_key);
+        let pk_eid = crate::crypto::hash_event(&pk_blob);
 
         // Create FileSlice referencing the not-yet-existing signer
         let file_id = [99u8; 32];
-        let (_fs, fs_blob) = make_file_slice(&signing_key, &signer_eid, file_id, 0, b"data");
+        let (_fs, fs_blob) = make_file_slice(&signing_key, &pk_eid, file_id, 0, b"data");
         let fs_eid = insert_event_raw(&conn, recorded_by, &fs_blob);
 
-        // Should block on missing signer dep
+        // Should block
         let result = project_one(&conn, recorded_by, &fs_eid).unwrap();
         assert!(matches!(result, ProjectionDecision::Block { .. }));
 
-        // Insert and project the full identity chain — signer dep resolves,
-        // but file_slice will now guard-block on missing descriptor
-        insert_and_project_identity_chain(&conn, recorded_by, &chain_blobs);
+        // Now insert the signer
+        let pk_eid2 = insert_event_raw(&conn, recorded_by, &pk_blob);
+        assert_eq!(pk_eid, pk_eid2);
+        let result = project_one(&conn, recorded_by, &pk_eid).unwrap();
+        assert_eq!(result, ProjectionDecision::Valid);
 
-        // File slice should NOT yet be valid (guard-blocked on missing descriptor)
+        // FileSlice should have been cascade-unblocked
         let fs_b64 = event_id_to_base64(&fs_eid);
         let valid_before_descriptor: bool = conn
             .query_row(
@@ -2939,14 +2956,15 @@ mod tests {
     fn test_multiple_slices_same_file() {
         let conn = setup();
         let recorded_by = "peer1";
+        let mut rng = rand::thread_rng();
+        let signing_key = SigningKey::generate(&mut rng);
+        let public_key = signing_key.verifying_key().to_bytes();
 
-        // Create identity chain as signer
-        let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
+        let (_pk, pk_blob) = make_peer_key(public_key);
+        let pk_eid = insert_event_raw(&conn, recorded_by, &pk_blob);
+        project_one(&conn, recorded_by, &pk_eid).unwrap();
 
-        // Create descriptor for this file_id
         let file_id = [99u8; 32];
-        setup_descriptor_for_file(&conn, recorded_by, &signing_key, &signer_eid, file_id);
-
         for i in 0..5u32 {
             let (_fs, fs_blob) = make_file_slice(
                 &signing_key,
@@ -3012,12 +3030,10 @@ mod tests {
     fn test_project_attachment_valid() {
         let conn = setup();
         let recorded_by = "peer1";
-
-        // Create identity chain once for this tenant
-        let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
+        let net_eid = setup_workspace_event(&conn, recorded_by);
 
         // Create message (dep)
-        let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "hello attachment");
+        let (_msg, msg_blob) = make_message_with_workspace(&net_eid, "hello attachment");
         let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
         project_one(&conn, recorded_by, &msg_eid).unwrap();
 
@@ -3031,7 +3047,7 @@ mod tests {
         project_one(&conn, recorded_by, &sk_eid).unwrap();
 
         // Create attachment referencing both deps
-        let (_att, att_blob) = make_attachment_signed(&signing_key, &signer_eid, &msg_eid, &sk_eid);
+        let (_att, att_blob) = make_message_attachment(&msg_eid, &sk_eid);
         let att_eid = insert_event_raw(&conn, recorded_by, &att_blob);
         let result = project_one(&conn, recorded_by, &att_eid).unwrap();
         assert_eq!(result, ProjectionDecision::Valid);
@@ -3063,7 +3079,7 @@ mod tests {
         project_one(&conn, recorded_by, &sk_eid).unwrap();
 
         let fake_msg_id = [88u8; 32];
-        let (_att, att_blob) = make_message_attachment(&conn, recorded_by, &fake_msg_id, &sk_eid);
+        let (_att, att_blob) = make_message_attachment(&fake_msg_id, &sk_eid);
         let att_eid = insert_event_raw(&conn, recorded_by, &att_blob);
         let result = project_one(&conn, recorded_by, &att_eid).unwrap();
         assert!(matches!(result, ProjectionDecision::Block { .. }));
@@ -3074,11 +3090,8 @@ mod tests {
         let conn = setup();
         let recorded_by = "peer1";
 
-        // Create identity chain once for this tenant
-        let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
-
         // Create message but NOT secret key
-        let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "hello");
+        let (_msg, msg_blob) = make_message("hello");
         let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
         project_one(&conn, recorded_by, &msg_eid).unwrap();
 
@@ -3121,12 +3134,10 @@ mod tests {
     fn test_attachment_cascade_unblock() {
         let conn = setup();
         let recorded_by = "peer1";
-
-        // Create identity chain for signing
-        let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
+        let net_eid = setup_workspace_event(&conn, recorded_by);
 
         // Pre-compute the message and key event IDs
-        let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "hello cascade");
+        let (_msg, msg_blob) = make_message_with_workspace(&net_eid, "hello cascade");
         let msg_eid = crate::crypto::hash_event(&msg_blob);
 
         let sk = ParsedEvent::SecretKey(SecretKeyEvent {
@@ -3137,7 +3148,7 @@ mod tests {
         let sk_eid = crate::crypto::hash_event(&sk_blob);
 
         // Insert attachment first (both deps missing → blocks)
-        let (_att, att_blob) = make_attachment_signed(&signing_key, &signer_eid, &msg_eid, &sk_eid);
+        let (_att, att_blob) = make_message_attachment(&msg_eid, &sk_eid);
         let att_eid = insert_event_raw(&conn, recorded_by, &att_blob);
         let result = project_one(&conn, recorded_by, &att_eid).unwrap();
         assert!(matches!(result, ProjectionDecision::Block { .. }));
@@ -3178,15 +3189,16 @@ mod tests {
     fn test_file_slice_idempotent_replay() {
         let conn = setup();
         let recorded_by = "peer1";
+        let mut rng = rand::thread_rng();
+        let signing_key = SigningKey::generate(&mut rng);
+        let public_key = signing_key.verifying_key().to_bytes();
 
-        // Create identity chain as signer
-        let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
+        let (_pk, pk_blob) = make_peer_key(public_key);
+        let pk_eid = insert_event_raw(&conn, recorded_by, &pk_blob);
+        project_one(&conn, recorded_by, &pk_eid).unwrap();
 
-        // Create descriptor for this file_id
         let file_id = [99u8; 32];
-        setup_descriptor_for_file(&conn, recorded_by, &signing_key, &signer_eid, file_id);
-
-        let (_fs, fs_blob) = make_file_slice(&signing_key, &signer_eid, file_id, 0, b"data");
+        let (_fs, fs_blob) = make_file_slice(&signing_key, &pk_eid, file_id, 0, b"data");
         let fs_eid = insert_event_raw(&conn, recorded_by, &fs_blob);
 
         // First projection
@@ -3202,22 +3214,24 @@ mod tests {
     fn test_file_slice_duplicate_slot_conflict_rejects() {
         let conn = setup();
         let recorded_by = "peer1";
+        let mut rng = rand::thread_rng();
+        let signing_key = SigningKey::generate(&mut rng);
+        let public_key = signing_key.verifying_key().to_bytes();
 
-        // Create identity chain as signer
-        let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
+        let (_pk, pk_blob) = make_peer_key(public_key);
+        let pk_eid = insert_event_raw(&conn, recorded_by, &pk_blob);
+        project_one(&conn, recorded_by, &pk_eid).unwrap();
 
-        // Create descriptor for this file_id
         let file_id = [99u8; 32];
-        setup_descriptor_for_file(&conn, recorded_by, &signing_key, &signer_eid, file_id);
 
         // First slice at slot 0
-        let (_fs1, fs1_blob) = make_file_slice(&signing_key, &signer_eid, file_id, 0, b"first");
+        let (_fs1, fs1_blob) = make_file_slice(&signing_key, &pk_eid, file_id, 0, b"first");
         let fs1_eid = insert_event_raw(&conn, recorded_by, &fs1_blob);
         let result = project_one(&conn, recorded_by, &fs1_eid).unwrap();
         assert_eq!(result, ProjectionDecision::Valid);
 
         // Second, DIFFERENT slice at same slot 0 — should reject
-        let (_fs2, fs2_blob) = make_file_slice(&signing_key, &signer_eid, file_id, 0, b"second");
+        let (_fs2, fs2_blob) = make_file_slice(&signing_key, &pk_eid, file_id, 0, b"second");
         let fs2_eid = insert_event_raw(&conn, recorded_by, &fs2_blob);
         let result2 = project_one(&conn, recorded_by, &fs2_eid).unwrap();
         assert!(

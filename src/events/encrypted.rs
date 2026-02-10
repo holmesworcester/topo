@@ -100,6 +100,7 @@ pub static ENCRYPTED_META: EventTypeMeta = EventTypeMeta {
     projection_table: "",
     share_scope: ShareScope::Shared,
     dep_fields: &["key_event_id"],
+    dep_field_type_codes: &[&[6]],
     signer_required: false,
     signature_byte_len: 0,
     parse: parse_encrypted,

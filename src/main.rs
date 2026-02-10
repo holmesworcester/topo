@@ -75,9 +75,9 @@ enum Commands {
         content: String,
         #[arg(short, long, default_value = "server.db")]
         db: String,
-        /// Channel ID hex (16 bytes)
-        #[arg(short = 'C', long, default_value = "0102030405060708090a0b0c0d0e0f10")]
-        channel: String,
+        /// Workspace event ID hex (32 bytes)
+        #[arg(short = 'n', long, default_value = "0102030405060708090a0b0c0d0e0f10")]
+        workspace: String,
     },
 
     /// Show database status
@@ -92,8 +92,8 @@ enum Commands {
         count: usize,
         #[arg(short, long, default_value = "server.db")]
         db: String,
-        #[arg(short = 'C', long, default_value = "0102030405060708090a0b0c0d0e0f10")]
-        channel: String,
+        #[arg(short = 'n', long, default_value = "0102030405060708090a0b0c0d0e0f10")]
+        workspace: String,
     },
 
     /// Backfill legacy messages to the local transport identity (cert/key/SPKI)
@@ -170,20 +170,52 @@ enum Commands {
         summary: bool,
     },
 
-    /// List networks from projection
+    /// List workspaces from projection
     Networks {
         #[arg(short, long, default_value = "server.db")]
         db: String,
     },
+
+    /// Send intro offers to two peers so they can hole-punch a direct connection
+    Intro {
+        #[arg(short, long, default_value = "server.db")]
+        db: String,
+        /// Peer A hex SPKI fingerprint
+        #[arg(long)]
+        peer_a: String,
+        /// Peer B hex SPKI fingerprint
+        #[arg(long)]
+        peer_b: String,
+        /// Allowed peer fingerprints (hex, repeatable)
+        #[arg(long = "pin-peer")]
+        pin_peer: Vec<String>,
+        /// Intro TTL in milliseconds
+        #[arg(long, default_value = "30000")]
+        ttl_ms: u64,
+        /// Attempt window in milliseconds
+        #[arg(long, default_value = "4000")]
+        attempt_window_ms: u32,
+    },
+
+    /// Show intro attempt records
+    #[command(name = "intro-attempts")]
+    IntroAttempts {
+        #[arg(short, long, default_value = "server.db")]
+        db: String,
+        /// Filter by peer SPKI fingerprint (hex)
+        #[arg(long)]
+        peer: Option<String>,
+    },
+
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cli = Cli::parse();
 
-    // Only init tracing for network commands (avoid polluting message output)
+    // Only init tracing for sync commands (avoid polluting message output)
     match &cli.command {
-        Commands::Sync { .. } => {
+        Commands::Sync { .. } | Commands::Intro { .. } => {
             let subscriber = FmtSubscriber::builder()
                 .with_max_level(Level::INFO)
                 .finish();
@@ -217,8 +249,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Commands::Status { db } => {
             show_status(&db)?;
         }
-        Commands::Generate { count, db, channel } => {
-            generate_messages(&db, count, &channel)?;
+        Commands::Generate { count, db, workspace } => {
+            generate_messages(&db, count, &workspace)?;
         }
         Commands::BackfillTransportIdentity { db } => {
             backfill_identity(&db)?;
@@ -255,7 +287,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             cli_keys(&db, summary)?;
         }
         Commands::Networks { db } => {
-            cli_networks(&db)?;
+            cli_workspaces(&db)?;
+        }
+        Commands::Intro { db, peer_a, peer_b, pin_peer, ttl_ms, attempt_window_ms } => {
+            cli_intro(&db, &peer_a, &peer_b, &pin_peer, ttl_ms, attempt_window_ms).await?;
+        }
+        Commands::IntroAttempts { db, peer } => {
+            cli_intro_attempts(&db, peer.as_deref())?;
         }
     }
 
@@ -470,9 +508,9 @@ fn parse_channel_hex(
     if channel_bytes.len() > 32 {
         return Err("Channel ID must be at most 32 bytes".into());
     }
-    let mut channel_id = [0u8; 32];
-    channel_id[..channel_bytes.len()].copy_from_slice(&channel_bytes);
-    Ok(channel_id)
+    let mut workspace_event_id = [0u8; 32];
+    workspace_event_id[..workspace_bytes.len()].copy_from_slice(&workspace_bytes);
+    Ok(workspace_event_id)
 }
 
 fn current_timestamp_ms() -> u64 {
@@ -622,18 +660,16 @@ fn ensure_identity_chain(
         return Ok((eid, signing_key));
     }
 
-    // Bootstrap new identity chain
-    let mut rng = rand::thread_rng();
-
-    let workspace_key = SigningKey::generate(&mut rng);
-    let workspace_id: [u8; 32] = rand::random();
+    // Create a deterministic workspace event (fixed timestamp + content = same hash on all peers)
     let ws = ParsedEvent::Workspace(WorkspaceEvent {
-        created_at_ms: current_timestamp_ms(),
-        public_key: workspace_key.verifying_key().to_bytes(),
-        workspace_id,
+        created_at_ms: 0,
+        public_key: [0u8; 32],
+        workspace_id: *workspace_id,
     });
-    let ws_eid = event_id_or_blocked(create_event_sync(db, recorded_by, &ws))
-        .map_err(|e| format!("{}", e))?;
+    let blob = events::encode_event(&ws).map_err(|e| format!("encode: {}", e))?;
+    let event_id = hash_event(&blob);
+    let eid_b64 = event_id_to_base64(&event_id);
+    let now = current_timestamp_ms() as i64;
 
     let ia = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
         created_at_ms: current_timestamp_ms(),
@@ -704,20 +740,20 @@ fn send_message(
     let db = open_connection(db_path)?;
     create_tables(&db)?;
 
-    let (signer_eid, signing_key) = ensure_identity_chain(&db, &recorded_by)?;
-    let channel_id = parse_channel_hex(channel_hex)?;
+    let workspace_id = parse_workspace_hex(workspace_hex)?;
+
+    // Ensure workspace event exists and is valid; use its hash as workspace_event_id
+    let workspace_event_id = ensure_workspace_event(&db, &recorded_by, &workspace_id)?;
+
     let author_id = stable_author_id(&recorded_by);
 
     let msg = ParsedEvent::Message(MessageEvent {
         created_at_ms: current_timestamp_ms(),
-        channel_id,
+        workspace_event_id,
         author_id,
         content: content.to_string(),
-        signed_by: signer_eid,
-        signer_type: 5,
-        signature: [0u8; 64],
     });
-    create_signed_event_sync(&db, &recorded_by, &msg, &signing_key)
+    create_event_sync(&db, &recorded_by, &msg)
         .map_err(|e| format!("create event error: {}", e))?;
 
     println!("Sent: {}", content);
@@ -785,22 +821,19 @@ fn generate_messages(
     let db = open_connection(db_path)?;
     create_tables(&db)?;
 
-    let (signer_eid, signing_key) = ensure_identity_chain(&db, &recorded_by)?;
-    let channel_id = parse_channel_hex(channel_hex)?;
+    let workspace_id = parse_workspace_hex(workspace_hex)?;
+    let workspace_event_id = ensure_workspace_event(&db, &recorded_by, &workspace_id)?;
     let author_id: [u8; 32] = rand::random();
 
     db.execute("BEGIN", [])?;
     for i in 0..count {
         let msg = ParsedEvent::Message(MessageEvent {
             created_at_ms: current_timestamp_ms(),
-            channel_id,
+            workspace_event_id,
             author_id,
             content: format!("Message {}", i),
-            signed_by: signer_eid,
-            signer_type: 5,
-            signature: [0u8; 64],
         });
-        create_signed_event_sync(&db, &recorded_by, &msg, &signing_key)
+        create_event_sync(&db, &recorded_by, &msg)
             .map_err(|e| format!("create event error: {}", e))?;
     }
     db.execute("COMMIT", [])?;
@@ -1032,6 +1065,8 @@ async fn run_sync(
 
     let db_owned = db_path.to_string();
     let recorded_by_clone = recorded_by.clone();
+    let accept_endpoint = endpoint.clone();
+    let accept_allowed = allowed_peers_inner.clone();
     let accept_handle = tokio::task::spawn_blocking({
         let db = db_owned.clone();
         move || {
@@ -1040,7 +1075,7 @@ async fn run_sync(
                 .build()
                 .unwrap();
             rt.block_on(async move {
-                if let Err(e) = accept_loop(&db, &recorded_by_clone, server_endpoint).await {
+                if let Err(e) = accept_loop(&db, &recorded_by_clone, accept_endpoint, Some(accept_allowed)).await {
                     tracing::warn!("accept_loop exited: {}", e);
                 }
             });
@@ -1107,7 +1142,6 @@ fn cli_react(
     let db = open_connection(db_path)?;
     create_tables(&db)?;
 
-    let (signer_eid, signing_key) = ensure_identity_chain(&db, &recorded_by)?;
     let target_event_id = parse_hex_event_id(target_hex)?;
     let author_id = stable_author_id(&recorded_by);
 
@@ -1116,9 +1150,6 @@ fn cli_react(
         target_event_id,
         author_id,
         emoji: emoji.to_string(),
-        signed_by: signer_eid,
-        signer_type: 5,
-        signature: [0u8; 64],
     });
     let eid = event_id_or_blocked(create_signed_event_sync(
         &db,
@@ -1139,7 +1170,6 @@ fn cli_delete_message(
     let db = open_connection(db_path)?;
     create_tables(&db)?;
 
-    let (signer_eid, signing_key) = ensure_identity_chain(&db, &recorded_by)?;
     let target_event_id = parse_hex_event_id(target_hex)?;
     let author_id = stable_author_id(&recorded_by);
 
@@ -1147,9 +1177,6 @@ fn cli_delete_message(
         created_at_ms: current_timestamp_ms(),
         target_event_id,
         author_id,
-        signed_by: signer_eid,
-        signer_type: 5,
-        signature: [0u8; 64],
     });
     event_id_or_blocked(create_signed_event_sync(
         &db,
@@ -1283,7 +1310,7 @@ fn cli_keys(db_path: &str, summary: bool) -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
-fn cli_networks(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn cli_workspaces(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let recorded_by = load_transport_peer_id_from_db(db_path)?;
     let db = open_connection(db_path)?;
     create_tables(&db)?;
@@ -1297,7 +1324,7 @@ fn cli_networks(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + 
         .collect::<Result<Vec<_>, _>>()?;
 
     println!("WORKSPACES ({}):", db_path);
-    if networks.is_empty() {
+    if workspaces.is_empty() {
         println!("  (none)");
     } else {
         use base64::Engine;
@@ -1312,6 +1339,106 @@ fn cli_networks(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + 
                 };
             println!("  {}. {} ({})", i + 1, name, short_id(eid));
         }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Intro commands
+// ---------------------------------------------------------------------------
+
+async fn cli_intro(
+    db_path: &str,
+    peer_a: &str,
+    peer_b: &str,
+    pin_peers: &[String],
+    ttl_ms: u64,
+    attempt_window_ms: u32,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let db = open_connection(db_path)?;
+    create_tables(&db)?;
+    drop(db);
+
+    let (cert_path, key_path) = transport_cert_paths_from_db(db_path);
+    let (cert, key) = load_or_generate_cert(&cert_path, &key_path)?;
+    let recorded_by = {
+        let fp = extract_spki_fingerprint(cert.as_ref())?;
+        hex::encode(fp)
+    };
+
+    // Build allowed peers: must include both target peers
+    let mut all_pins = pin_peers.to_vec();
+    if !all_pins.contains(&peer_a.to_string()) {
+        all_pins.push(peer_a.to_string());
+    }
+    if !all_pins.contains(&peer_b.to_string()) {
+        all_pins.push(peer_b.to_string());
+    }
+    let cli_pins = AllowedPeers::from_hex_strings(&all_pins)?;
+    let db = open_connection(db_path)?;
+    let allowed = allowed_peers_combined(&db, &recorded_by, &cli_pins)?;
+    drop(db);
+
+    let endpoint = create_dual_endpoint(
+        "0.0.0.0:0".parse()?,
+        cert,
+        key,
+        Arc::new(allowed),
+    )?;
+
+    let result = poc_7::sync::intro::run_intro(
+        &endpoint, db_path, &recorded_by,
+        peer_a, peer_b, ttl_ms, attempt_window_ms,
+    ).await?;
+
+    if result.sent_to_a && result.sent_to_b {
+        println!("Intro sent to both peers");
+    } else {
+        for e in &result.errors {
+            eprintln!("Error: {}", e);
+        }
+        if !result.sent_to_a && !result.sent_to_b {
+            std::process::exit(1);
+        }
+    }
+
+    endpoint.close(0u32.into(), b"done");
+    Ok(())
+}
+
+fn cli_intro_attempts(
+    db_path: &str,
+    peer: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let db = open_connection(db_path)?;
+    create_tables(&db)?;
+
+    let recorded_by = {
+        let (cert_path, key_path) = transport_cert_paths_from_db(db_path);
+        let (cert, _) = load_or_generate_cert(&cert_path, &key_path)?;
+        let fp = extract_spki_fingerprint(cert.as_ref())?;
+        hex::encode(fp)
+    };
+
+    let rows = poc_7::db::intro::list_intro_attempts(&db, &recorded_by, peer)?;
+    if rows.is_empty() {
+        println!("No intro attempts recorded.");
+        return Ok(());
+    }
+
+    for r in &rows {
+        let intro_id_hex = hex::encode(&r.intro_id);
+        println!("  intro_id:  {}...", &intro_id_hex[..16]);
+        println!("  peer:      {}", &r.other_peer_id[..16]);
+        println!("  via:       {}", &r.introduced_by_peer_id[..16]);
+        println!("  endpoint:  {}:{}", r.origin_ip, r.origin_port);
+        println!("  status:    {}", r.status);
+        if let Some(ref err) = r.error {
+            println!("  error:     {}", err);
+        }
+        println!("  created:   {}", r.created_at);
+        println!();
     }
 
     Ok(())
