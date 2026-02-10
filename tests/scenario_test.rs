@@ -316,9 +316,9 @@ async fn test_recorded_at_monotonicity() {
     // Bob's recorded_at for received events should be >= Alice's local create times
     // (since Bob received them after Alice created them)
     let alice_db = open_connection(&alice.db_path).expect("open alice db");
-    let alice_max_recorded: i64 = alice_db
+    let alice_max_local_create: i64 = alice_db
         .query_row(
-            "SELECT MAX(recorded_at) FROM recorded_events WHERE peer_id = ?1",
+            "SELECT MAX(recorded_at) FROM recorded_events WHERE peer_id = ?1 AND source = 'local_create'",
             rusqlite::params![&alice.identity],
             |row| row.get(0),
         )
@@ -334,10 +334,10 @@ async fn test_recorded_at_monotonicity() {
         .unwrap();
 
     assert!(
-        bob_min_recv >= alice_max_recorded,
-        "Bob's earliest receive recorded_at ({}) should be >= Alice's latest create recorded_at ({})",
+        bob_min_recv >= alice_max_local_create,
+        "Bob's earliest receive recorded_at ({}) should be >= Alice's latest local_create recorded_at ({})",
         bob_min_recv,
-        alice_max_recorded,
+        alice_max_local_create,
     );
 }
 
@@ -713,6 +713,8 @@ async fn test_invalid_signature_rejected_after_sync() {
     let channel = test_channel();
     let alice = Peer::new("alice", channel);
     let bob = Peer::new("bob", channel);
+    let alice_initial_store = alice.store_count();
+    let bob_initial_store = bob.store_count();
 
     let mut rng = rand::thread_rng();
     let signing_key = SigningKey::generate(&mut rng);
@@ -770,16 +772,16 @@ async fn test_invalid_signature_rejected_after_sync() {
         // Don't project — it would be rejected. The blob will sync via negentropy.
     }
 
-    // Alice has 3 events: PeerKey + the bad-sig memo + workspace
-    assert_eq!(alice.store_count(), 3);
+    // Peer::new() does not bootstrap identity/workspace; only the 2 manually inserted events are expected.
+    assert_eq!(alice.store_count(), alice_initial_store + 2);
 
     // Sync to Bob
     let sync = start_peers(&alice, &bob);
 
     assert_eventually(
-        || bob.store_count() == 3,
+        || bob.store_count() == bob_initial_store + 2,
         Duration::from_secs(15),
-        "bob should have 3 events (PeerKey + bad-sig memo + workspace) in store",
+        "bob should have exactly the two synced events (PeerKey + bad-sig memo) in store",
     ).await;
 
     drop(sync);
