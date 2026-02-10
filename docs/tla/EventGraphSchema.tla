@@ -74,7 +74,6 @@ AdminOngoing == "admin_ongoing"
 Peer == "peer"
 
 \* Content
-Channel == "channel"
 Message == "message"
 MessageReaction == "message_reaction"
 MessageDeletion == "message_deletion"
@@ -107,7 +106,7 @@ FullEventTypes == {
     PeerSharedFirst, PeerSharedOngoing,
     AdminBoot, AdminOngoing,
     Peer,
-    Channel, Message, MessageReaction, MessageDeletion,
+    Message, MessageReaction, MessageDeletion,
     SecretKey, SecretShared, Encrypted,
     UserRemoved, PeerRemoved
 }
@@ -143,7 +142,7 @@ IdentityEvents == {
     UserRemoved, PeerRemoved
 } \cup AllNetEvents
 
-ContentEvents == {Channel, Message, MessageReaction, MessageDeletion}
+ContentEvents == {Message, MessageReaction, MessageDeletion}
 EncryptionEvents == {SecretKey, SecretShared, Encrypted}
 
 ASSUME (ActiveEvents \ {Net}) \subseteq FullEventTypes
@@ -182,9 +181,8 @@ RawDeps(e) ==
 
        [] e = Peer -> {}
 
-       \* Content: channel depends on workspace; message depends on channel + user
-       [] e = Channel -> {Net}
-       [] e = Message -> {Channel, UserOngoing}
+       \* Content: message depends on workspace; reaction/deletion depend on message
+       [] e = Message -> {Net}
        [] e = MessageReaction -> {Message}
        [] e = MessageDeletion -> {Message}
 
@@ -225,7 +223,6 @@ SignerDep(e) ==
        [] e = AdminOngoing -> {PeerSharedOngoing}
 
        \* Content: signed by a linked peer
-       [] e = Channel -> {PeerSharedOngoing}
        [] e = Message -> {PeerSharedOngoing}
        [] e = MessageReaction -> {PeerSharedOngoing}
        [] e = MessageDeletion -> {PeerSharedOngoing}
@@ -421,16 +418,10 @@ InvRemovalExclusion ==
                       \* A more refined model would track per-wrap recipients.
     ELSE TRUE
 
-\* Channel requires workspace.
-InvChannelWorkspace ==
-    IF Channel \in EVENTS /\ AllNetEvents \cap EVENTS /= {}
-    THEN \A p \in Peers: (Channel \in valid[p]) => (\E ne \in AllNetEvents: ne \in valid[p])
-    ELSE TRUE
-
-\* Message requires channel.
-InvMessageChannel ==
-    IF Message \in EVENTS /\ Channel \in EVENTS
-    THEN \A p \in Peers: (Message \in valid[p]) => (Channel \in valid[p])
+\* Message requires workspace (network event).
+InvMessageNetwork ==
+    IF Message \in EVENTS /\ AllNetEvents \cap EVENTS /= {}
+    THEN \A p \in Peers: (Message \in valid[p]) => (\E ne \in AllNetEvents: ne \in valid[p])
     ELSE TRUE
 
 \* Encrypted content requires secret_key.
