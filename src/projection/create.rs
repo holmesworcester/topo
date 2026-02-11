@@ -237,7 +237,7 @@ mod tests {
     use super::*;
     use crate::db::{open_in_memory, schema::create_tables};
     use crate::events::{
-        MessageEvent, ReactionEvent, PeerKeyEvent, SignedMemoEvent,
+        MessageEvent, ReactionEvent, SignedMemoEvent,
         WorkspaceEvent, InviteAcceptedEvent, UserInviteBootEvent,
         UserBootEvent, DeviceInviteFirstEvent, PeerSharedFirstEvent,
     };

@@ -6,7 +6,7 @@ use aes_gcm::aead::Aead;
 use crate::crypto::event_id_to_base64;
 use crate::events::{self, EncryptedEvent, ParsedEvent, EVENT_TYPE_ENCRYPTED};
 use super::decision::ProjectionDecision;
-use super::projectors::{project_message, project_message_attachment, project_message_deletion, project_file_slice, project_reaction, project_peer_key, project_secret_key, project_signed_memo};
+use super::projectors::{project_message, project_message_attachment, project_message_deletion, project_file_slice, project_reaction, project_secret_key, project_signed_memo};
 use super::signer::{resolve_signer_key, verify_ed25519_signature, SignerResolution};
 
 /// Project an encrypted event: decrypt, parse inner, check inner deps, dispatch to inner projector.
@@ -161,8 +161,10 @@ pub fn project_encrypted(
         ParsedEvent::Reaction(rxn) => {
             project_reaction(conn, recorded_by, event_id_b64, rxn)?;
         }
-        ParsedEvent::PeerKey(pk) => {
-            project_peer_key(conn, recorded_by, event_id_b64, pk)?;
+        ParsedEvent::PeerKey(_) => {
+            return Ok(ProjectionDecision::Reject {
+                reason: "peer_key events are deprecated; use peer_shared signer chain".to_string(),
+            });
         }
         ParsedEvent::SignedMemo(memo) => {
             project_signed_memo(conn, recorded_by, event_id_b64, memo)?;

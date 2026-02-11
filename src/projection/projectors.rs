@@ -3,7 +3,7 @@ use rusqlite::Connection;
 use super::decision::ProjectionDecision;
 use crate::crypto::event_id_to_base64;
 use crate::events::{
-    FileSliceEvent, MessageAttachmentEvent, MessageDeletionEvent, MessageEvent, PeerKeyEvent,
+    FileSliceEvent, MessageAttachmentEvent, MessageDeletionEvent, MessageEvent,
     ReactionEvent, SecretKeyEvent, SignedMemoEvent,
 };
 
@@ -61,27 +61,6 @@ pub fn project_reaction(
             author_id_b64,
             &rxn.emoji,
             rxn.created_at_ms as i64,
-            recorded_by
-        ],
-    )?;
-    Ok(rows > 0)
-}
-
-/// Project a PeerKey event into the peer_keys table. Returns Ok(true) if written.
-pub fn project_peer_key(
-    conn: &Connection,
-    recorded_by: &str,
-    event_id_b64: &str,
-    pk: &PeerKeyEvent,
-) -> Result<bool, rusqlite::Error> {
-    let public_key_hex = hex::encode(pk.public_key);
-    let rows = conn.execute(
-        "INSERT OR IGNORE INTO peer_keys (event_id, public_key, created_at, recorded_by)
-         VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![
-            event_id_b64,
-            public_key_hex,
-            pk.created_at_ms as i64,
             recorded_by
         ],
     )?;

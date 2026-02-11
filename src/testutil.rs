@@ -1037,17 +1037,17 @@ pub fn replicate_all_events(src: &Peer, dest: &Peer) {
 
 /// Replay all event blobs from the events table through project_one.
 /// Clears projection tables and valid_events, then re-projects all events.
-/// Returns (message_count, reaction_count, peer_key_count, signed_memo_count, secret_key_count, deleted_message_count) after replay.
-fn replay_projection(db: &rusqlite::Connection, recorded_by: &str) -> (i64, i64, i64, i64, i64, i64) {
+/// Returns (message_count, reaction_count, signed_memo_count, secret_key_count, deleted_message_count) after replay.
+fn replay_projection(db: &rusqlite::Connection, recorded_by: &str) -> (i64, i64, i64, i64, i64) {
     replay_projection_impl(db, recorded_by, "ORDER BY created_at ASC, event_id ASC")
 }
 
 /// Replay events in reverse order through the projector.
-fn replay_projection_reverse(db: &rusqlite::Connection, recorded_by: &str) -> (i64, i64, i64, i64, i64, i64) {
+fn replay_projection_reverse(db: &rusqlite::Connection, recorded_by: &str) -> (i64, i64, i64, i64, i64) {
     replay_projection_impl(db, recorded_by, "ORDER BY created_at DESC, event_id DESC")
 }
 
-fn replay_projection_impl(db: &rusqlite::Connection, recorded_by: &str, order: &str) -> (i64, i64, i64, i64, i64, i64) {
+fn replay_projection_impl(db: &rusqlite::Connection, recorded_by: &str, order: &str) -> (i64, i64, i64, i64, i64) {
     use crate::crypto::event_id_from_base64;
 
     // Clear projection tables + valid_events for this tenant
@@ -1055,8 +1055,6 @@ fn replay_projection_impl(db: &rusqlite::Connection, recorded_by: &str, order: &
         .expect("failed to clear messages");
     db.execute("DELETE FROM reactions WHERE recorded_by = ?1", rusqlite::params![recorded_by])
         .expect("failed to clear reactions");
-    db.execute("DELETE FROM peer_keys WHERE recorded_by = ?1", rusqlite::params![recorded_by])
-        .expect("failed to clear peer_keys");
     db.execute("DELETE FROM signed_memos WHERE recorded_by = ?1", rusqlite::params![recorded_by])
         .expect("failed to clear signed_memos");
     db.execute("DELETE FROM secret_keys WHERE recorded_by = ?1", rusqlite::params![recorded_by])
@@ -1113,11 +1111,6 @@ fn replay_projection_impl(db: &rusqlite::Connection, recorded_by: &str, order: &
         rusqlite::params![recorded_by],
         |row| row.get(0),
     ).unwrap_or(0);
-    let pk_count: i64 = db.query_row(
-        "SELECT COUNT(*) FROM peer_keys WHERE recorded_by = ?1",
-        rusqlite::params![recorded_by],
-        |row| row.get(0),
-    ).unwrap_or(0);
     let sm_count: i64 = db.query_row(
         "SELECT COUNT(*) FROM signed_memos WHERE recorded_by = ?1",
         rusqlite::params![recorded_by],
@@ -1134,7 +1127,7 @@ fn replay_projection_impl(db: &rusqlite::Connection, recorded_by: &str, order: &
         |row| row.get(0),
     ).unwrap_or(0);
 
-    (msg_count, rxn_count, pk_count, sm_count, sk_count, del_count)
+    (msg_count, rxn_count, sm_count, sk_count, del_count)
 }
 
 /// Verify projection invariants for a peer:
@@ -1155,11 +1148,6 @@ pub fn verify_projection_invariants(peer: &Peer) {
         rusqlite::params![&peer.identity],
         |row| row.get(0),
     ).unwrap_or(0);
-    let orig_pk: i64 = db.query_row(
-        "SELECT COUNT(*) FROM peer_keys WHERE recorded_by = ?1",
-        rusqlite::params![&peer.identity],
-        |row| row.get(0),
-    ).unwrap_or(0);
     let orig_sm: i64 = db.query_row(
         "SELECT COUNT(*) FROM signed_memos WHERE recorded_by = ?1",
         rusqlite::params![&peer.identity],
@@ -1177,13 +1165,11 @@ pub fn verify_projection_invariants(peer: &Peer) {
     ).unwrap_or(0);
 
     // 1. Forward replay
-    let (fwd_msg, fwd_rxn, fwd_pk, fwd_sm, fwd_sk, fwd_del) = replay_projection(&db, &peer.identity);
+    let (fwd_msg, fwd_rxn, fwd_sm, fwd_sk, fwd_del) = replay_projection(&db, &peer.identity);
     assert_eq!(fwd_msg, orig_msg,
         "Forward replay message count mismatch: expected {}, got {}", orig_msg, fwd_msg);
     assert_eq!(fwd_rxn, orig_rxn,
         "Forward replay reaction count mismatch: expected {}, got {}", orig_rxn, fwd_rxn);
-    assert_eq!(fwd_pk, orig_pk,
-        "Forward replay peer_key count mismatch: expected {}, got {}", orig_pk, fwd_pk);
     assert_eq!(fwd_sm, orig_sm,
         "Forward replay signed_memo count mismatch: expected {}, got {}", orig_sm, fwd_sm);
     assert_eq!(fwd_sk, orig_sk,
@@ -1192,13 +1178,11 @@ pub fn verify_projection_invariants(peer: &Peer) {
         "Forward replay deleted_message count mismatch: expected {}, got {}", orig_del, fwd_del);
 
     // 2. Idempotency: replay again over existing projected state (double replay)
-    let (double_msg, double_rxn, double_pk, double_sm, double_sk, double_del) = replay_projection(&db, &peer.identity);
+    let (double_msg, double_rxn, double_sm, double_sk, double_del) = replay_projection(&db, &peer.identity);
     assert_eq!(double_msg, orig_msg,
         "Double replay message count mismatch: expected {}, got {}", orig_msg, double_msg);
     assert_eq!(double_rxn, orig_rxn,
         "Double replay reaction count mismatch: expected {}, got {}", orig_rxn, double_rxn);
-    assert_eq!(double_pk, orig_pk,
-        "Double replay peer_key count mismatch: expected {}, got {}", orig_pk, double_pk);
     assert_eq!(double_sm, orig_sm,
         "Double replay signed_memo count mismatch: expected {}, got {}", orig_sm, double_sm);
     assert_eq!(double_sk, orig_sk,
@@ -1207,13 +1191,11 @@ pub fn verify_projection_invariants(peer: &Peer) {
         "Double replay deleted_message count mismatch: expected {}, got {}", orig_del, double_del);
 
     // 3. Reverse-order replay
-    let (rev_msg, rev_rxn, rev_pk, rev_sm, rev_sk, rev_del) = replay_projection_reverse(&db, &peer.identity);
+    let (rev_msg, rev_rxn, rev_sm, rev_sk, rev_del) = replay_projection_reverse(&db, &peer.identity);
     assert_eq!(rev_msg, orig_msg,
         "Reverse replay message count mismatch: expected {}, got {}", orig_msg, rev_msg);
     assert_eq!(rev_rxn, orig_rxn,
         "Reverse replay reaction count mismatch: expected {}, got {}", orig_rxn, rev_rxn);
-    assert_eq!(rev_pk, orig_pk,
-        "Reverse replay peer_key count mismatch: expected {}, got {}", orig_pk, rev_pk);
     assert_eq!(rev_sm, orig_sm,
         "Reverse replay signed_memo count mismatch: expected {}, got {}", orig_sm, rev_sm);
     assert_eq!(rev_sk, orig_sk,

@@ -4,7 +4,7 @@ use super::decision::ProjectionDecision;
 use super::encrypted::project_encrypted;
 use super::projectors::{
     project_file_slice, project_message, project_message_attachment, project_message_deletion,
-    project_peer_key, project_reaction, project_secret_key, project_signed_memo,
+    project_reaction, project_secret_key, project_signed_memo,
 };
 use super::signer::{resolve_signer_key, verify_ed25519_signature, SignerResolution};
 use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
@@ -114,8 +114,10 @@ fn apply_projection(
         ParsedEvent::Reaction(rxn) => {
             project_reaction(conn, recorded_by, event_id_b64, rxn)?;
         }
-        ParsedEvent::PeerKey(pk) => {
-            project_peer_key(conn, recorded_by, event_id_b64, pk)?;
+        ParsedEvent::PeerKey(_) => {
+            return Ok(ProjectionDecision::Reject {
+                reason: "peer_key events are deprecated; use peer_shared signer chain".to_string(),
+            });
         }
         ParsedEvent::SignedMemo(memo) => {
             project_signed_memo(conn, recorded_by, event_id_b64, memo)?;
@@ -1161,7 +1163,7 @@ mod tests {
     }
 
     #[test]
-    fn test_project_peer_key_valid() {
+    fn test_project_peer_key_rejected() {
         let conn = setup();
         let recorded_by = "peer1";
         let mut rng = rand::thread_rng();
@@ -1172,9 +1174,14 @@ mod tests {
         let eid = insert_event_raw(&conn, recorded_by, &blob);
 
         let result = project_one(&conn, recorded_by, &eid).unwrap();
-        assert_eq!(result, ProjectionDecision::Valid);
+        match result {
+            ProjectionDecision::Reject { reason } => {
+                assert!(reason.contains("peer_key events are deprecated"), "reason: {}", reason);
+            }
+            other => panic!("expected Reject, got {:?}", other),
+        }
 
-        // Verify in peer_keys table
+        // Deprecated path should not write peer_keys projection rows.
         let eid_b64 = event_id_to_base64(&eid);
         let count: i64 = conn
             .query_row(
@@ -1183,7 +1190,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(count, 0);
     }
 
     #[test]
@@ -1545,16 +1552,11 @@ mod tests {
         let conn = setup();
         let recorded_by = "peer1";
         let mut rng = rand::thread_rng();
-        let signing_key = SigningKey::generate(&mut rng);
         let wrong_key = SigningKey::generate(&mut rng);
-        let public_key = signing_key.verifying_key().to_bytes();
 
-        // Create PeerKey, sign memo with wrong key
-        let (_pk, pk_blob) = make_peer_key(public_key);
-        let pk_eid = insert_event_raw(&conn, recorded_by, &pk_blob);
-        project_one(&conn, recorded_by, &pk_eid).unwrap();
-
-        let (_memo, memo_blob) = make_signed_memo(&wrong_key, &pk_eid, "bad sig again");
+        // Sign memo with wrong key against existing identity-chain signer.
+        let (real_signer_eid, _real_signing_key) = make_identity_chain(&conn, recorded_by);
+        let (_memo, memo_blob) = make_signed_memo(&wrong_key, &real_signer_eid, "bad sig again");
         let memo_eid = insert_event_raw(&conn, recorded_by, &memo_blob);
 
         // First call: Reject
@@ -2569,15 +2571,10 @@ mod tests {
         let recorded_by = "peer1";
         let mut rng = rand::thread_rng();
         let signing_key = SigningKey::generate(&mut rng);
-        let public_key = signing_key.verifying_key().to_bytes();
-
-        // Create and project the PeerKey so the dep is satisfied
-        let (_pk, pk_blob) = make_peer_key(public_key);
-        let pk_eid = insert_event_raw(&conn, recorded_by, &pk_blob);
-        project_one(&conn, recorded_by, &pk_eid).unwrap();
+        let (signer_eid, _signing_key) = make_identity_chain(&conn, recorded_by);
 
         // Create a signed memo but mutate signer_type byte to 255
-        let (_memo, mut memo_blob) = make_signed_memo(&signing_key, &pk_eid, "bad signer type");
+        let (_memo, mut memo_blob) = make_signed_memo(&signing_key, &signer_eid, "bad signer type");
         // signer_type is at byte offset 41 in the wire format
         memo_blob[41] = 255;
         // Re-hash since blob changed
@@ -3035,18 +3032,13 @@ mod tests {
         let conn = setup();
         let recorded_by = "peer1";
         let mut rng = rand::thread_rng();
-        let signing_key = SigningKey::generate(&mut rng);
         let wrong_key = SigningKey::generate(&mut rng);
-        let public_key = signing_key.verifying_key().to_bytes();
-
-        // Create PeerKey with signing_key's public key
-        let (_pk, pk_blob) = make_peer_key(public_key);
-        let pk_eid = insert_event_raw(&conn, recorded_by, &pk_blob);
-        project_one(&conn, recorded_by, &pk_eid).unwrap();
+        let (signer_eid, signer_key) = make_identity_chain(&conn, recorded_by);
 
         // Sign file_slice with the WRONG key
         let file_id = [99u8; 32];
-        let (_fs, fs_blob) = make_file_slice(&wrong_key, &pk_eid, file_id, 0, b"data");
+        let (_fs, fs_blob) = make_file_slice(&wrong_key, &signer_eid, file_id, 0, b"data");
+        setup_descriptor_for_file(&conn, recorded_by, &signer_key, &signer_eid, file_id);
         let fs_eid = insert_event_raw(&conn, recorded_by, &fs_blob);
         let result = project_one(&conn, recorded_by, &fs_eid).unwrap();
         assert!(matches!(result, ProjectionDecision::Reject { .. }));
