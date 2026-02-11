@@ -372,6 +372,27 @@ static MIGRATIONS: &[Migration] = &[
         ",
     },
     Migration {
+        version: 16,
+        name: "add_intro_attempts",
+        sql: "
+            CREATE TABLE IF NOT EXISTS intro_attempts (
+                recorded_by TEXT NOT NULL,
+                intro_id BLOB NOT NULL,
+                introduced_by_peer_id TEXT NOT NULL,
+                other_peer_id TEXT NOT NULL,
+                origin_ip TEXT NOT NULL,
+                origin_port INTEGER NOT NULL,
+                observed_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                error TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (recorded_by, intro_id)
+            );
+        ",
+    },
+    Migration {
         version: 17,
         name: "add_covering_index_blocked_deps",
         sql: "

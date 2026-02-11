@@ -6,11 +6,7 @@
 use std::time::{Duration, Instant};
 use poc_7::testutil::{Peer, start_peers, assert_eventually, sync_until_converged};
 
-fn test_channel() -> [u8; 32] {
-    let mut ch = [0u8; 32];
-    ch[0..4].copy_from_slice(b"perf");
-    ch
-}
+
 
 /// Read peak resident set size from /proc/self/status (Linux only).
 fn peak_rss_mib() -> f64 {
@@ -33,9 +29,8 @@ fn peak_rss_mib() -> f64 {
 /// Reports MB/s, events/s, wall time, and peak memory.
 #[tokio::test]
 async fn perf_sync_50k() {
-    let channel = test_channel();
-    let alice = Peer::new_with_identity("alice", channel);
-    let bob = Peer::new_with_identity("bob", channel);
+    let alice = Peer::new_with_identity("alice");
+    let bob = Peer::new_with_identity("bob");
 
     let gen_start = Instant::now();
     alice.batch_create_messages(50_000);
@@ -70,9 +65,8 @@ async fn perf_sync_50k() {
 /// Reports MB/s, events/s, wall time, and peak memory.
 #[tokio::test]
 async fn perf_sync_10k() {
-    let channel = test_channel();
-    let alice = Peer::new_with_identity("alice", channel);
-    let bob = Peer::new_with_identity("bob", channel);
+    let alice = Peer::new_with_identity("alice");
+    let bob = Peer::new_with_identity("bob");
 
     let gen_start = Instant::now();
     alice.batch_create_messages(5_000);
@@ -108,9 +102,8 @@ async fn perf_sync_10k() {
 /// while sync is running. Measures how well sync keeps up with ongoing writes.
 #[tokio::test]
 async fn perf_continuous_10k() {
-    let channel = test_channel();
-    let alice = Peer::new_with_identity("alice", channel);
-    let bob = Peer::new_with_identity("bob", channel);
+    let alice = Peer::new_with_identity("alice");
+    let bob = Peer::new_with_identity("bob");
 
     let rss_before = peak_rss_mib();
 
@@ -202,9 +195,8 @@ async fn perf_continuous_10k() {
 #[tokio::test]
 #[ignore]
 async fn perf_sync_100k() {
-    let channel = test_channel();
-    let alice = Peer::new_with_identity("alice", channel);
-    let bob = Peer::new_with_identity("bob", channel);
+    let alice = Peer::new_with_identity("alice");
+    let bob = Peer::new_with_identity("bob");
 
     let gen_start = Instant::now();
     alice.batch_create_messages(100_000);
@@ -240,9 +232,8 @@ async fn perf_sync_100k() {
 #[tokio::test]
 #[ignore]
 async fn perf_sync_200k() {
-    let channel = test_channel();
-    let alice = Peer::new_with_identity("alice", channel);
-    let bob = Peer::new_with_identity("bob", channel);
+    let alice = Peer::new_with_identity("alice");
+    let bob = Peer::new_with_identity("bob");
 
     let gen_start = Instant::now();
     alice.batch_create_messages(200_000);
@@ -278,9 +269,8 @@ async fn perf_sync_200k() {
 #[tokio::test]
 #[ignore]
 async fn perf_sync_500k() {
-    let channel = test_channel();
-    let alice = Peer::new_with_identity("alice", channel);
-    let bob = Peer::new_with_identity("bob", channel);
+    let alice = Peer::new_with_identity("alice");
+    let bob = Peer::new_with_identity("bob");
 
     let gen_start = Instant::now();
     alice.batch_create_messages(500_000);

@@ -172,7 +172,7 @@ pub fn create_tables(conn: &Connection) -> SqliteResult<()> {
     }
 
     // Run column-rename migrations before DDL so that existing DBs with
-    // `network_event_id` get renamed to `workspace_event_id` before the
+    // `network_event_id` get renamed to `workspace_id` before the
     // CREATE INDEX references the new column name.
     run_migrations(conn)?;
 

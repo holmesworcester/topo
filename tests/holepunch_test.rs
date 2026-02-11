@@ -12,32 +12,13 @@ use std::time::Duration;
 
 use poc_7::db::open_connection;
 use poc_7::db::intro::{list_intro_attempts, freshest_endpoint};
+use poc_7::db::transport_trust::allowed_peers_from_db;
 use poc_7::sync::engine::{accept_loop, connect_loop};
 use poc_7::sync::intro::{run_intro, send_intro_offer, build_intro_offer};
 use poc_7::testutil::{Peer, assert_eventually};
 use poc_7::transport::{
-    AllowedPeers, create_dual_endpoint, extract_spki_fingerprint, load_or_generate_cert,
+    AllowedPeers, create_dual_endpoint,
 };
-use poc_7::transport_identity::transport_cert_paths_from_db;
-
-fn test_channel() -> [u8; 32] {
-    let mut ch = [0u8; 32];
-    ch[0..4].copy_from_slice(b"hpnc");
-    ch
-}
-
-/// Helper: load cert/key and extract fingerprint for a peer.
-fn peer_cert_and_fp(peer: &Peer) -> (
-    rustls::pki_types::CertificateDer<'static>,
-    rustls::pki_types::PrivatePkcs8KeyDer<'static>,
-    [u8; 32],
-) {
-    let (cert_path, key_path) = transport_cert_paths_from_db(&peer.db_path);
-    let (cert, key) = load_or_generate_cert(&cert_path, &key_path)
-        .expect("load cert");
-    let fp = extract_spki_fingerprint(cert.as_ref()).expect("extract fp");
-    (cert, key, fp)
-}
 
 /// Start an accept_loop + connect_loop pair between two peers with
 /// allowed_peers passed through for intro listener support.
@@ -48,8 +29,8 @@ fn start_peers_with_intro(
     listener_trusts: Vec<[u8; 32]>,
     connector_trusts: Vec<[u8; 32]>,
 ) -> (std::thread::JoinHandle<()>, std::thread::JoinHandle<()>, std::net::SocketAddr) {
-    let (cert_l, key_l, _) = peer_cert_and_fp(listener);
-    let (cert_c, key_c, _) = peer_cert_and_fp(connector);
+    let (cert_l, key_l) = listener.cert_and_key();
+    let (cert_c, key_c) = connector.cert_and_key();
 
     let allowed_l = Arc::new(AllowedPeers::from_fingerprints(listener_trusts.clone()));
     let allowed_c = Arc::new(AllowedPeers::from_fingerprints(connector_trusts.clone()));
@@ -92,37 +73,55 @@ fn start_peers_with_intro(
     (l_handle, c_handle, addr_l)
 }
 
+/// Functional intro test. Phase 1 uses pinning bootstrap; Phase 2 uses
+/// identity-derived trust via TransportKey events.
+///
+/// All three peers share the same workspace so identity chains validate
+/// across peers through normal sync (TransportKey events project correctly).
+///
 /// Three-peer intro happy path:
-/// 1. A <-> I, B <-> I sync (gives I endpoint observations for A and B)
+/// 1. A <-> I, B <-> I sync (gives I endpoint observations for A and B,
+///    and relays identity chains so TransportKey events project at each peer)
 /// 2. I sends IntroOffer to A and B
-/// 3. A and B dial each other and sync messages directly
+/// 3. A and B dial each other using identity-derived trust and sync messages
 #[tokio::test]
 async fn test_three_peer_intro_happy_path() {
-    let channel = test_channel();
-    let intro = Peer::new("introducer", channel);
-    let peer_a = Peer::new("peer_a", channel);
-    let peer_b = Peer::new("peer_b", channel);
+    // Intro creates the workspace; A and B join it so all share one trust root.
+    let intro = Peer::new_with_identity("introducer");
+    let peer_a = Peer::new_in_workspace("peer_a", &intro);
+    let peer_b = Peer::new_in_workspace("peer_b", &intro);
+
+    // Publish TransportKey events binding each peer's TLS cert to its identity chain
+    intro.publish_transport_key();
+    peer_a.publish_transport_key();
+    peer_b.publish_transport_key();
 
     // Each peer creates unique messages
     peer_a.create_message("hello from A");
     peer_b.create_message("hello from B");
     intro.create_message("hello from I");
 
-    let (_, _, fp_i) = peer_cert_and_fp(&intro);
-    let (_, _, fp_a) = peer_cert_and_fp(&peer_a);
-    let (_, _, fp_b) = peer_cert_and_fp(&peer_b);
+    let fp_i = intro.spki_fingerprint();
+    let fp_a = peer_a.spki_fingerprint();
+    let fp_b = peer_b.spki_fingerprint();
 
-    // --- Phase 1: Sync I<->A and I<->B so I records endpoint observations ---
+    // --- Phase 1: Relay sync I<->A and I<->B (pinning bootstrap) ---
+    // Uses manual fingerprint pinning for the initial connections.
+    // After sync, each peer has the others' identity chains validated
+    // (shared workspace means remote chains resolve through the common
+    // Workspace event), so TransportKey events project into transport_keys.
 
-    // I trusts A+B, A trusts I, B trusts I
     let sync_ia = start_peers_with_intro(
         &intro, &peer_a,
         vec![fp_a, fp_b],  // I trusts A and B
         vec![fp_i],        // A trusts I
     );
-    // Wait for I and A to converge
+    // Intro has 8 own events (6 identity + 1 TransportKey + 1 message).
+    // A has 8 events (W copied + 5 identity + 1 TransportKey + 1 message).
+    // After I<->A sync: each gets the other's 6 shared events = 14 total.
+    // (Workspace event is shared, already present at both.)
     assert_eventually(
-        || intro.store_count() >= 2 && peer_a.store_count() >= 2,
+        || intro.store_count() >= 14 && peer_a.store_count() >= 14,
         Duration::from_secs(10),
         &format!("I<->A sync (I={}, A={})", intro.store_count(), peer_a.store_count()),
     ).await;
@@ -132,16 +131,20 @@ async fn test_three_peer_intro_happy_path() {
         vec![fp_a, fp_b],  // I trusts A and B
         vec![fp_i],        // B trusts I
     );
-    // Wait for I and B to converge (all 3 messages via I)
+    // I now has all 3 peers' shared events. B gets I's + A's (relayed).
     assert_eventually(
-        || intro.store_count() >= 3 && peer_b.store_count() >= 2,
+        || intro.store_count() >= 20 && peer_b.store_count() >= 14,
         Duration::from_secs(10),
         &format!("I<->B sync (I={}, B={})", intro.store_count(), peer_b.store_count()),
     ).await;
 
-    // Wait for full convergence: all 3 peers should have all 3 messages
+    // Wait for full convergence: all 3 peers should have all shared events.
+    // 1 shared Workspace + 7 shared per peer (UIB+UB+DIF+PSF+TK+Msg + IA is local) = 20.
+    // Note: each peer has 8 in events table (Workspace + 6 identity + TK + Msg)
+    // but only 7 are in neg_items (IA is local). Unique shared events across
+    // all 3 peers: 1 Workspace + 3*6 = 19 shared. Total in events = 19 + 1 own IA = 20.
     assert_eventually(
-        || peer_a.store_count() >= 3 && peer_b.store_count() >= 3 && intro.store_count() >= 3,
+        || peer_a.store_count() >= 20 && peer_b.store_count() >= 20 && intro.store_count() >= 20,
         Duration::from_secs(15),
         &format!("full convergence (I={}, A={}, B={})",
             intro.store_count(), peer_a.store_count(), peer_b.store_count()),
@@ -172,14 +175,32 @@ async fn test_three_peer_intro_happy_path() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // --- Phase 2: I sends IntroOffer to A and B ---
-    // A and B now need to be listening. Start them with intro listeners enabled.
+    // After Phase 1, remote identity chains validated through the shared workspace,
+    // so TransportKey events projected at each peer. A and B now use
+    // identity-derived trust (transport_keys table) instead of manual fingerprints.
 
-    // Create endpoints for A and B that trust each other + I
-    let (cert_a, key_a, _) = peer_cert_and_fp(&peer_a);
-    let (cert_b, key_b, _) = peer_cert_and_fp(&peer_b);
+    let (cert_a, key_a) = peer_a.cert_and_key();
+    let (cert_b, key_b) = peer_b.cert_and_key();
 
-    let allowed_a = Arc::new(AllowedPeers::from_fingerprints(vec![fp_i, fp_b]));
-    let allowed_b = Arc::new(AllowedPeers::from_fingerprints(vec![fp_i, fp_a]));
+    // Build allowed peers from projected TransportKey events
+    let db_a_conn = open_connection(&peer_a.db_path).expect("open A db");
+    let allowed_a_peers = allowed_peers_from_db(&db_a_conn, &peer_a.identity)
+        .expect("allowed peers for A");
+    assert!(!allowed_a_peers.is_empty(), "A should have identity-derived trust after sync");
+    assert!(allowed_a_peers.contains(&fp_b), "A should trust B via TransportKey");
+    assert!(allowed_a_peers.contains(&fp_i), "A should trust I via TransportKey");
+    drop(db_a_conn);
+
+    let db_b_conn = open_connection(&peer_b.db_path).expect("open B db");
+    let allowed_b_peers = allowed_peers_from_db(&db_b_conn, &peer_b.identity)
+        .expect("allowed peers for B");
+    assert!(!allowed_b_peers.is_empty(), "B should have identity-derived trust after sync");
+    assert!(allowed_b_peers.contains(&fp_a), "B should trust A via TransportKey");
+    assert!(allowed_b_peers.contains(&fp_i), "B should trust I via TransportKey");
+    drop(db_b_conn);
+
+    let allowed_a = Arc::new(allowed_a_peers);
+    let allowed_b = Arc::new(allowed_b_peers);
 
     let ep_a = create_dual_endpoint(
         "127.0.0.1:0".parse().unwrap(), cert_a, key_a, allowed_a.clone(),
@@ -193,10 +214,13 @@ async fn test_three_peer_intro_happy_path() {
 
     eprintln!("A listening on {}, B listening on {}", addr_a, addr_b);
 
-    // Start accept loops for A and B with intro listeners
+    // Start accept loops for A and B with intro listeners (identity-derived trust)
     let a_db = peer_a.db_path.clone();
     let a_id = peer_a.identity.clone();
-    let a_allowed = AllowedPeers::from_fingerprints(vec![fp_i, fp_b]);
+    let a_db_conn = open_connection(&peer_a.db_path).expect("open A db");
+    let a_allowed = allowed_peers_from_db(&a_db_conn, &peer_a.identity)
+        .expect("allowed peers for A intro");
+    drop(a_db_conn);
     let a_ep = ep_a.clone();
     let a_handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -210,7 +234,10 @@ async fn test_three_peer_intro_happy_path() {
 
     let b_db = peer_b.db_path.clone();
     let b_id = peer_b.identity.clone();
-    let b_allowed = AllowedPeers::from_fingerprints(vec![fp_i, fp_a]);
+    let b_db_conn = open_connection(&peer_b.db_path).expect("open B db");
+    let b_allowed = allowed_peers_from_db(&b_db_conn, &peer_b.identity)
+        .expect("allowed peers for B intro");
+    drop(b_db_conn);
     let b_ep = ep_b.clone();
     let b_handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -242,8 +269,8 @@ async fn test_three_peer_intro_happy_path() {
         ).expect("record ep_b");
     }
 
-    // I creates an endpoint to send intros from
-    let (cert_i, key_i, _) = peer_cert_and_fp(&intro);
+    // I creates an endpoint to send intros from (manual pinning — I is the introducer)
+    let (cert_i, key_i) = intro.cert_and_key();
     let allowed_i = Arc::new(AllowedPeers::from_fingerprints(vec![fp_a, fp_b]));
     let ep_i = create_dual_endpoint(
         "127.0.0.1:0".parse().unwrap(), cert_i, key_i, allowed_i,
@@ -266,14 +293,13 @@ async fn test_three_peer_intro_happy_path() {
     // B creates a new message that A should get
     peer_b.create_message("direct from B after intro");
 
-    // Wait for at least one intro attempt to be recorded and for the punch
-    // to trigger a sync session
+    // After Phase 1 each peer had 20 events. Each created 1 new message = 21.
+    // After punch sync each gets the other's new message = 22.
     assert_eventually(
         || {
             let a_count = peer_a.store_count();
             let b_count = peer_b.store_count();
-            // A should get B's new message (5 total) and B should get A's (5 total)
-            a_count >= 5 && b_count >= 5
+            a_count >= 22 && b_count >= 22
         },
         Duration::from_secs(15),
         &format!("A<->B punch sync (A={}, B={})", peer_a.store_count(), peer_b.store_count()),
@@ -315,18 +341,18 @@ async fn test_three_peer_intro_happy_path() {
     drop(b_handle);
 }
 
-/// Stale intro rejected: expired expires_at_ms should result in status='expired'.
+/// TRUST BOUNDARY TEST: Stale intro rejected.
+/// Expired expires_at_ms should result in status='expired'.
 #[tokio::test]
 async fn test_stale_intro_rejected() {
-    let channel = test_channel();
-    let intro = Peer::new("stale_introducer", channel);
-    let peer_a = Peer::new("stale_a", channel);
+    let intro = Peer::new("stale_introducer");
+    let peer_a = Peer::new("stale_a");
 
-    let (_, _, fp_i) = peer_cert_and_fp(&intro);
-    let (_, _, fp_a) = peer_cert_and_fp(&peer_a);
+    let fp_i = intro.spki_fingerprint();
+    let fp_a = peer_a.spki_fingerprint();
 
     // Create an endpoint for A that trusts I
-    let (cert_a, key_a, _) = peer_cert_and_fp(&peer_a);
+    let (cert_a, key_a) = peer_a.cert_and_key();
     let allowed_a = Arc::new(AllowedPeers::from_fingerprints(vec![fp_i]));
     let ep_a = create_dual_endpoint(
         "127.0.0.1:0".parse().unwrap(), cert_a, key_a, allowed_a,
@@ -357,7 +383,7 @@ async fn test_stale_intro_rejected() {
     ).expect("build stale offer");
 
     // Connect to A and send the stale intro
-    let (cert_i, key_i, _) = peer_cert_and_fp(&intro);
+    let (cert_i, key_i) = intro.cert_and_key();
     let allowed_i = Arc::new(AllowedPeers::from_fingerprints(vec![fp_a]));
     let ep_i = create_dual_endpoint(
         "127.0.0.1:0".parse().unwrap(), cert_i, key_i, allowed_i,
@@ -390,17 +416,17 @@ async fn test_stale_intro_rejected() {
     ep_i.close(0u32.into(), b"done");
 }
 
-/// Untrusted target rejected: other_peer_id not in allowed set.
+/// TRUST BOUNDARY TEST: Untrusted target rejected.
+/// other_peer_id not in allowed set.
 #[tokio::test]
 async fn test_untrusted_peer_intro_rejected() {
-    let channel = test_channel();
-    let intro = Peer::new("untrust_introducer", channel);
-    let peer_a = Peer::new("untrust_a", channel);
+    let intro = Peer::new("untrust_introducer");
+    let peer_a = Peer::new("untrust_a");
 
-    let (_, _, fp_i) = peer_cert_and_fp(&intro);
-    let (_, _, fp_a) = peer_cert_and_fp(&peer_a);
+    let fp_i = intro.spki_fingerprint();
+    let fp_a = peer_a.spki_fingerprint();
 
-    let (cert_a, key_a, _) = peer_cert_and_fp(&peer_a);
+    let (cert_a, key_a) = peer_a.cert_and_key();
     // A only trusts I, not the introduced peer
     let allowed_a = Arc::new(AllowedPeers::from_fingerprints(vec![fp_i]));
     let ep_a = create_dual_endpoint(
@@ -435,7 +461,7 @@ async fn test_untrusted_peer_intro_rejected() {
         4000,
     ).expect("build offer");
 
-    let (cert_i, key_i, _) = peer_cert_and_fp(&intro);
+    let (cert_i, key_i) = intro.cert_and_key();
     let allowed_i = Arc::new(AllowedPeers::from_fingerprints(vec![fp_a]));
     let ep_i = create_dual_endpoint(
         "127.0.0.1:0".parse().unwrap(), cert_i, key_i, allowed_i,

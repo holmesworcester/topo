@@ -9,17 +9,12 @@ use poc_7::transport::{
 use poc_7::transport_identity::transport_cert_paths_from_db;
 use poc_7::db::open_connection;
 
-fn test_channel() -> [u8; 32] {
-    let mut ch = [0u8; 32];
-    ch[0..4].copy_from_slice(b"test");
-    ch
-}
+
 
 #[tokio::test]
 async fn test_two_peer_bidirectional_sync() {
-    let channel = test_channel();
-    let alice = Peer::new_with_identity("alice", channel);
-    let bob = Peer::new_with_identity("bob", channel);
+    let alice = Peer::new_with_identity("alice");
+    let bob = Peer::new_with_identity("bob");
 
     alice.batch_create_messages(2);
     bob.batch_create_messages(1);
@@ -49,9 +44,8 @@ async fn test_two_peer_bidirectional_sync() {
 
 #[tokio::test]
 async fn test_one_way_sync() {
-    let channel = test_channel();
-    let alice = Peer::new_with_identity("alice", channel);
-    let bob = Peer::new_with_identity("bob", channel);
+    let alice = Peer::new_with_identity("alice");
+    let bob = Peer::new_with_identity("bob");
 
     alice.batch_create_messages(10);
     assert_eq!(alice.store_count(), 6 + 10);
@@ -71,9 +65,8 @@ async fn test_one_way_sync() {
 
 #[tokio::test]
 async fn test_concurrent_create_and_sync() {
-    let channel = test_channel();
-    let alice = Peer::new_with_identity("alice", channel);
-    let bob = Peer::new_with_identity("bob", channel);
+    let alice = Peer::new_with_identity("alice");
+    let bob = Peer::new_with_identity("bob");
 
     let sync = start_peers(&alice, &bob);
 
@@ -106,9 +99,8 @@ async fn test_concurrent_create_and_sync() {
 
 #[tokio::test]
 async fn test_sync_10k() {
-    let channel = test_channel();
-    let alice = Peer::new_with_identity("alice", channel);
-    let bob = Peer::new_with_identity("bob", channel);
+    let alice = Peer::new_with_identity("alice");
+    let bob = Peer::new_with_identity("bob");
 
     let gen_start = Instant::now();
     alice.batch_create_messages(10_000);
@@ -132,9 +124,8 @@ async fn test_sync_10k() {
 
 #[tokio::test]
 async fn test_recorded_events_isolation() {
-    let channel = test_channel();
-    let alice = Peer::new_with_identity("alice", channel);
-    let bob = Peer::new_with_identity("bob", channel);
+    let alice = Peer::new_with_identity("alice");
+    let bob = Peer::new_with_identity("bob");
 
     // Create messages locally
     alice.batch_create_messages(3);
@@ -179,9 +170,8 @@ async fn test_recorded_events_isolation() {
 
 #[tokio::test]
 async fn test_reaction_sync() {
-    let channel = test_channel();
-    let alice = Peer::new_with_identity("alice", channel);
-    let bob = Peer::new_with_identity("bob", channel);
+    let alice = Peer::new_with_identity("alice");
+    let bob = Peer::new_with_identity("bob");
 
     // Alice creates messages, Bob adds reactions
     let msg1 = alice.create_message("Hello!");
@@ -222,9 +212,8 @@ async fn test_reaction_sync() {
 /// This checks the Done/DoneAck handshake prevents data loss at scale.
 #[tokio::test]
 async fn test_zero_loss_stress() {
-    let channel = test_channel();
-    let alice = Peer::new_with_identity("alice", channel);
-    let bob = Peer::new_with_identity("bob", channel);
+    let alice = Peer::new_with_identity("alice");
+    let bob = Peer::new_with_identity("bob");
 
     alice.batch_create_messages(5_000);
     bob.batch_create_messages(5_000);
@@ -266,9 +255,8 @@ async fn test_zero_loss_stress() {
 
 #[tokio::test]
 async fn test_recorded_at_monotonicity() {
-    let channel = test_channel();
-    let alice = Peer::new_with_identity("alice", channel);
-    let bob = Peer::new_with_identity("bob", channel);
+    let alice = Peer::new_with_identity("alice");
+    let bob = Peer::new_with_identity("bob");
 
     // Alice creates messages with small delays to ensure different created_at
     alice.create_message("first");
@@ -347,15 +335,10 @@ async fn test_cross_workspace_isolation() {
     // Set A: peerA1 + peerA2 (sync with each other)
     // Set B: peerB1 + peerB2 (sync with each other)
     // Verify no cross-set contamination.
-    let mut channel_a = [0u8; 32];
-    channel_a[0..6].copy_from_slice(b"workA\0");
-    let mut channel_b = [0u8; 32];
-    channel_b[0..6].copy_from_slice(b"workB\0");
-
-    let peer_a1 = Peer::new_with_identity("peerA1", channel_a);
-    let peer_a2 = Peer::new_with_identity("peerA2", channel_a);
-    let peer_b1 = Peer::new_with_identity("peerB1", channel_b);
-    let peer_b2 = Peer::new_with_identity("peerB2", channel_b);
+    let peer_a1 = Peer::new_with_identity("peerA1");
+    let peer_a2 = Peer::new_with_identity("peerA2");
+    let peer_b1 = Peer::new_with_identity("peerB1");
+    let peer_b2 = Peer::new_with_identity("peerB2");
 
     // Create messages in each workspace
     peer_a1.batch_create_messages(5);
@@ -456,9 +439,8 @@ async fn test_cross_workspace_isolation() {
 
 #[tokio::test]
 async fn test_sync_50k() {
-    let channel = test_channel();
-    let alice = Peer::new_with_identity("alice", channel);
-    let bob = Peer::new_with_identity("bob", channel);
+    let alice = Peer::new_with_identity("alice");
+    let bob = Peer::new_with_identity("bob");
 
     let gen_start = Instant::now();
     alice.batch_create_messages(50_000);
@@ -484,9 +466,8 @@ async fn test_sync_50k() {
 /// SPKI fingerprint across a live QUIC mTLS handshake.
 #[tokio::test]
 async fn test_peer_identity_extraction_live_handshake() {
-    let channel = test_channel();
-    let alice = Peer::new("alice", channel);
-    let bob = Peer::new("bob", channel);
+    let alice = Peer::new("alice");
+    let bob = Peer::new("bob");
 
     let (cert_path_a, key_path_a) = transport_cert_paths_from_db(&alice.db_path);
     let (cert_a, key_a) = load_or_generate_cert(&cert_path_a, &key_path_a).unwrap();
@@ -544,9 +525,8 @@ async fn test_peer_identity_extraction_live_handshake() {
 /// then syncs. The reaction arrives blocked, and auto-projects once the message arrives.
 #[tokio::test]
 async fn test_out_of_order_reaction_sync() {
-    let channel = test_channel();
-    let alice = Peer::new_with_identity("alice", channel);
-    let bob = Peer::new_with_identity("bob", channel);
+    let alice = Peer::new_with_identity("alice");
+    let bob = Peer::new_with_identity("bob");
 
     // Alice creates a message
     let msg_id = alice.create_message("Hello from Alice");
@@ -591,9 +571,8 @@ async fn test_out_of_order_reaction_sync() {
 /// when the messages arrive via sync.
 #[tokio::test]
 async fn test_multi_dep_blocking_sync() {
-    let channel = test_channel();
-    let alice = Peer::new_with_identity("alice", channel);
-    let bob = Peer::new_with_identity("bob", channel);
+    let alice = Peer::new_with_identity("alice");
+    let bob = Peer::new_with_identity("bob");
 
     // Alice creates 3 messages
     let msg1 = alice.create_message("First");
@@ -633,9 +612,8 @@ async fn test_multi_dep_blocking_sync() {
 /// Integration test: Alice creates a PeerKey + SignedMemo, Bob syncs, both valid.
 #[tokio::test]
 async fn test_signed_event_sync() {
-    let channel = test_channel();
-    let alice = Peer::new_with_identity("alice", channel);
-    let bob = Peer::new_with_identity("bob", channel);
+    let alice = Peer::new_with_identity("alice");
+    let bob = Peer::new_with_identity("bob");
 
     // Alice creates a SignedMemo using her PeerShared identity chain key
     let signer_eid = alice.peer_shared_event_id.unwrap();
@@ -668,9 +646,8 @@ async fn test_signed_event_sync() {
 /// Integration test: signed memo syncs alongside messages; verify store convergence.
 #[tokio::test]
 async fn test_signed_event_out_of_order_sync() {
-    let channel = test_channel();
-    let alice = Peer::new_with_identity("alice", channel);
-    let bob = Peer::new_with_identity("bob", channel);
+    let alice = Peer::new_with_identity("alice");
+    let bob = Peer::new_with_identity("bob");
 
     // Alice creates SignedMemo (using PeerShared key) + a message
     let signer_eid = alice.peer_shared_event_id.unwrap();
@@ -710,9 +687,8 @@ async fn test_invalid_signature_rejected_after_sync() {
     use ed25519_dalek::SigningKey;
     use poc_7::crypto::event_id_to_base64;
 
-    let channel = test_channel();
-    let alice = Peer::new("alice", channel);
-    let bob = Peer::new("bob", channel);
+    let alice = Peer::new("alice");
+    let bob = Peer::new("bob");
     let alice_initial_store = alice.store_count();
     let bob_initial_store = bob.store_count();
 
@@ -796,9 +772,8 @@ async fn test_invalid_signature_rejected_after_sync() {
 /// valid_events are per-tenant, and projection invariants hold.
 #[tokio::test]
 async fn test_cross_tenant_dep_scoping_after_sync() {
-    let channel = test_channel();
-    let alice = Peer::new_with_identity("alice", channel);
-    let bob = Peer::new_with_identity("bob", channel);
+    let alice = Peer::new_with_identity("alice");
+    let bob = Peer::new_with_identity("bob");
 
     // Alice creates a message and a reaction targeting it
     let msg_id = alice.create_message("Cross-tenant scoping test");
@@ -849,9 +824,8 @@ async fn test_cross_tenant_dep_scoping_after_sync() {
 /// Integration test: Alice creates a PSK + encrypted message → syncs to Bob → Bob projects.
 #[tokio::test]
 async fn test_encrypted_event_sync() {
-    let channel = test_channel();
-    let alice = Peer::new_with_identity("alice", channel);
-    let bob = Peer::new_with_identity("bob", channel);
+    let alice = Peer::new_with_identity("alice");
+    let bob = Peer::new_with_identity("bob");
 
     // Materialize the same PSK locally on both peers (local-only key event, not synced).
     let key_bytes: [u8; 32] = rand::random();
@@ -897,9 +871,8 @@ async fn test_encrypted_event_sync() {
 /// Integration test: Encrypted event syncs before key → blocks → key syncs → cascade unblocks.
 #[tokio::test]
 async fn test_encrypted_out_of_order_sync() {
-    let channel = test_channel();
-    let alice = Peer::new_with_identity("alice", channel);
-    let bob = Peer::new_with_identity("bob", channel);
+    let alice = Peer::new_with_identity("alice");
+    let bob = Peer::new_with_identity("bob");
 
     // Alice creates key + encrypted message.
     let key_bytes: [u8; 32] = rand::random();
@@ -962,8 +935,7 @@ async fn test_encrypted_out_of_order_sync() {
 /// Integration test: mixed cleartext + encrypted events → verify_projection_invariants.
 #[tokio::test]
 async fn test_encrypted_replay_invariants() {
-    let channel = test_channel();
-    let alice = Peer::new_with_identity("alice", channel);
+    let alice = Peer::new_with_identity("alice");
 
     // Create a mix of cleartext and encrypted events
     let key_bytes: [u8; 32] = rand::random();
@@ -990,8 +962,7 @@ async fn test_project_queue_crash_recovery() {
     use poc_7::db::project_queue::ProjectQueue;
     use poc_7::projection::pipeline::project_one;
 
-    let channel = test_channel();
-    let alice = Peer::new_with_identity("alice", channel);
+    let alice = Peer::new_with_identity("alice");
 
     // Create messages via create_event_sync (bypasses queue, projects inline)
     let msg1 = alice.create_message("Recovery message 1");
@@ -1076,8 +1047,7 @@ async fn test_project_queue_drain_after_batch() {
     use poc_7::db::project_queue::ProjectQueue;
     use poc_7::projection::pipeline::project_one;
 
-    let channel = test_channel();
-    let alice = Peer::new_with_identity("alice", channel);
+    let alice = Peer::new_with_identity("alice");
 
     // Create events (projected inline by create_event_sync)
     alice.batch_create_messages(5);
@@ -1118,8 +1088,7 @@ async fn test_project_queue_drain_after_batch() {
 async fn test_egress_queue_lifecycle() {
     use poc_7::db::egress_queue::EgressQueue;
 
-    let channel = test_channel();
-    let alice = Peer::new_with_identity("alice", channel);
+    let alice = Peer::new_with_identity("alice");
 
     // Create some events to get event IDs
     let msg1 = alice.create_message("Egress msg 1");
@@ -1174,9 +1143,8 @@ async fn test_egress_queue_lifecycle() {
 /// Bob syncs again. Verify: Bob has tombstone, no message, no reactions.
 #[tokio::test]
 async fn test_deletion_sync() {
-    let channel = test_channel();
-    let alice = Peer::new_with_identity("alice", channel);
-    let bob = Peer::new_with_identity("bob", channel);
+    let alice = Peer::new_with_identity("alice");
+    let bob = Peer::new_with_identity("bob");
 
     // Alice creates a message and a reaction targeting it
     let msg_id = alice.create_message("Delete me");
@@ -1236,9 +1204,8 @@ async fn test_deletion_sync() {
 /// cascade-unblock when the message arrives produces the correct state.
 #[tokio::test]
 async fn test_deletion_before_target_sync() {
-    let channel = test_channel();
-    let alice = Peer::new_with_identity("alice", channel);
-    let bob = Peer::new_with_identity("bob", channel);
+    let alice = Peer::new_with_identity("alice");
+    let bob = Peer::new_with_identity("bob");
 
     // Alice creates a message and then deletes it
     let msg_id = alice.create_message("Delete me via sync");
@@ -1271,8 +1238,7 @@ async fn test_deletion_before_target_sync() {
 /// Verify cascade works through encryption layer.
 #[tokio::test]
 async fn test_encrypted_deletion() {
-    let channel = test_channel();
-    let alice = Peer::new_with_identity("alice", channel);
+    let alice = Peer::new_with_identity("alice");
 
     // Create a secret key
     let key_bytes: [u8; 32] = rand::random();
@@ -1308,9 +1274,8 @@ async fn test_encrypted_deletion() {
 /// Integration test: After deletion sync, verify_projection_invariants on both peers.
 #[tokio::test]
 async fn test_deletion_replay_invariants() {
-    let channel = test_channel();
-    let alice = Peer::new_with_identity("alice", channel);
-    let bob = Peer::new_with_identity("bob", channel);
+    let alice = Peer::new_with_identity("alice");
+    let bob = Peer::new_with_identity("bob");
 
     // Create a mix of messages, reactions, and deletions
     let msg1 = alice.create_message("Keep me");
@@ -1350,9 +1315,8 @@ async fn test_deletion_replay_invariants() {
 /// Gap 1: Verify SecretKey events (ShareScope::Local) are never sent to remote peers.
 #[tokio::test]
 async fn test_local_only_events_not_synced() {
-    let channel = test_channel();
-    let alice = Peer::new_with_identity("alice", channel);
-    let bob = Peer::new_with_identity("bob", channel);
+    let alice = Peer::new_with_identity("alice");
+    let bob = Peer::new_with_identity("bob");
 
     // Both peers materialize the same PSK locally
     let key_bytes: [u8; 32] = rand::random();
@@ -1402,9 +1366,8 @@ async fn test_local_only_events_not_synced() {
 /// Gap 2: Two-set PSK isolation -- mismatched PSKs cannot decrypt each other's messages.
 #[tokio::test]
 async fn test_psk_two_set_isolation() {
-    let channel = test_channel();
-    let alice = Peer::new_with_identity("alice", channel);
-    let bob = Peer::new_with_identity("bob", channel);
+    let alice = Peer::new_with_identity("alice");
+    let bob = Peer::new_with_identity("bob");
 
     // Alice and Bob use DIFFERENT PSKs
     let key_a: [u8; 32] = rand::random();
@@ -1452,9 +1415,8 @@ async fn test_psk_two_set_isolation() {
 async fn test_endpoint_observations_recorded() {
     use poc_7::db::health::purge_expired_endpoints;
 
-    let channel = test_channel();
-    let alice = Peer::new_with_identity("alice", channel);
-    let bob = Peer::new_with_identity("bob", channel);
+    let alice = Peer::new_with_identity("alice");
+    let bob = Peer::new_with_identity("bob");
 
     // Create some data so sync has something to do
     alice.create_message("endpoint obs test");
@@ -1523,8 +1485,7 @@ async fn test_encrypted_inner_unsupported_signer_rejects_durably() {
     use poc_7::projection::encrypted::encrypt_event_blob;
     use poc_7::projection::pipeline::project_one;
 
-    let channel = test_channel();
-    let alice = Peer::new("alice", channel);
+    let alice = Peer::new("alice");
 
     // Create and project a secret key
     let key_bytes: [u8; 32] = rand::random();
@@ -1705,8 +1666,7 @@ fn bootstrap_peer(peer: &Peer) -> BootstrapChain {
 
 #[test]
 fn test_bootstrap_sequence() {
-    let channel = test_channel();
-    let alice = Peer::new("alice", channel);
+    let alice = Peer::new("alice");
     let chain = bootstrap_peer(&alice);
 
     let db = open_connection(&alice.db_path).unwrap();
@@ -1788,8 +1748,7 @@ fn test_bootstrap_sequence() {
 fn test_out_of_order_identity() {
     // Record UserBoot BEFORE UserInviteBoot — UserBoot blocks on missing dep,
     // then cascades when the full invite chain is created afterward.
-    let channel = test_channel();
-    let alice = Peer::new("alice", channel);
+    let alice = Peer::new("alice");
     let db = open_connection(&alice.db_path).unwrap();
 
     use ed25519_dalek::SigningKey;
@@ -1938,8 +1897,7 @@ fn test_out_of_order_identity() {
 
 #[test]
 fn test_foreign_workspace_excluded() {
-    let channel = test_channel();
-    let alice = Peer::new("alice", channel);
+    let alice = Peer::new("alice");
     let _chain = bootstrap_peer(&alice);
 
     let db = open_connection(&alice.db_path).unwrap();
@@ -1978,8 +1936,7 @@ fn test_foreign_workspace_excluded() {
 
 #[test]
 fn test_removal_enforcement() {
-    let channel = test_channel();
-    let alice = Peer::new("alice", channel);
+    let alice = Peer::new("alice");
     let chain = bootstrap_peer(&alice);
 
     // Create a "Bob" user event to be removed
@@ -2015,8 +1972,7 @@ fn test_removal_enforcement() {
 
 #[test]
 fn test_secret_shared_key_wrap() {
-    let channel = test_channel();
-    let alice = Peer::new("alice", channel);
+    let alice = Peer::new("alice");
     let chain = bootstrap_peer(&alice);
 
     // Create SecretKey
@@ -2052,8 +2008,7 @@ fn test_secret_shared_key_wrap() {
 
 #[test]
 fn test_identity_replay_invariants() {
-    let channel = test_channel();
-    let alice = Peer::new_with_identity("alice", channel);
+    let alice = Peer::new_with_identity("alice");
 
     // Create some content after identity chain
     alice.create_message("hello after bootstrap");
@@ -2064,8 +2019,7 @@ fn test_identity_replay_invariants() {
 
 #[test]
 fn test_transport_key_projects_without_auto_binding() {
-    let channel = test_channel();
-    let alice = Peer::new("alice", channel);
+    let alice = Peer::new("alice");
     let chain = bootstrap_peer(&alice);
 
     // Create a TransportKey event signed by PeerShared
@@ -2112,8 +2066,7 @@ fn test_transport_key_signer_matches_local_key() {
     use ed25519_dalek::SigningKey;
     use poc_7::transport_identity::{transport_cert_paths_from_db, ensure_transport_key_event};
 
-    let channel = test_channel();
-    let alice = Peer::new("alice", channel);
+    let alice = Peer::new("alice");
     let chain = bootstrap_peer(&alice);
 
     // Insert a second peers_shared row with a different public key (simulating another
@@ -2161,8 +2114,7 @@ fn test_transport_key_signer_matches_local_key() {
 fn test_transport_key_invalid_sig_rejected() {
     use ed25519_dalek::SigningKey;
 
-    let channel = test_channel();
-    let alice = Peer::new("alice", channel);
+    let alice = Peer::new("alice");
     let chain = bootstrap_peer(&alice);
 
     // Create a TransportKey with wrong signing key (not the peer_shared key)
@@ -2201,8 +2153,7 @@ fn test_transport_key_invalid_sig_rejected() {
 
 #[test]
 fn test_transport_key_replay_invariants() {
-    let channel = test_channel();
-    let alice = Peer::new_with_identity("alice", channel);
+    let alice = Peer::new_with_identity("alice");
     let ps_eid = alice.peer_shared_event_id.unwrap();
     let ps_key = alice.peer_shared_signing_key.as_ref().unwrap();
 
@@ -2230,8 +2181,7 @@ fn test_transport_key_replay_invariants() {
 /// This verifies the HasRecordedInvite guard has been removed.
 #[test]
 fn test_invite_accepted_no_prior_invite_required() {
-    let channel = test_channel();
-    let alice = Peer::new("alice", channel);
+    let alice = Peer::new("alice");
     let db = open_connection(&alice.db_path).unwrap();
 
     let workspace_id: [u8; 32] = rand::random();
@@ -2262,8 +2212,7 @@ fn test_invite_accepted_no_prior_invite_required() {
 /// Trust anchor immutability: second invite_accepted with conflicting workspace_id is rejected.
 #[test]
 fn test_trust_anchor_immutability() {
-    let channel = test_channel();
-    let alice = Peer::new("alice", channel);
+    let alice = Peer::new("alice");
     let db = open_connection(&alice.db_path).unwrap();
 
     let workspace_id_1: [u8; 32] = rand::random();
@@ -2317,8 +2266,7 @@ fn test_trust_anchor_immutability() {
 /// invite-like blob into events should not alter trust binding state.
 #[test]
 fn test_no_blob_capture_trust_influence() {
-    let channel = test_channel();
-    let alice = Peer::new("alice", channel);
+    let alice = Peer::new("alice");
     let db = open_connection(&alice.db_path).unwrap();
 
     // Manually craft a blob that looks like a UserInviteBoot (type 10) with a specific
@@ -2367,8 +2315,7 @@ fn test_no_blob_capture_trust_influence() {
 /// invite event, then record workspace, then invite event -> cascade resolves everything.
 #[test]
 fn test_true_out_of_order_identity_chain() {
-    let channel = test_channel();
-    let alice = Peer::new("alice", channel);
+    let alice = Peer::new("alice");
     let db = open_connection(&alice.db_path).unwrap();
 
     use ed25519_dalek::SigningKey;
@@ -2527,9 +2474,8 @@ fn join_workspace(
 /// they sync, and both peers converge on the same identity state.
 #[tokio::test]
 async fn test_two_peer_identity_join_and_sync() {
-    let channel = test_channel();
-    let alice = Peer::new("alice", channel);
-    let bob = Peer::new("bob", channel);
+    let alice = Peer::new("alice");
+    let bob = Peer::new("bob");
 
     // Alice bootstraps her full identity chain
     let alice_chain = bootstrap_peer(&alice);
@@ -2585,9 +2531,8 @@ async fn test_two_peer_identity_join_and_sync() {
 /// Alice's events, which unblock Bob's chain via cascade.
 #[tokio::test]
 async fn test_identity_cascade_via_sync() {
-    let channel = test_channel();
-    let alice = Peer::new("alice", channel);
-    let bob = Peer::new("bob", channel);
+    let alice = Peer::new("alice");
+    let bob = Peer::new("bob");
 
     // Alice bootstraps
     let alice_chain = bootstrap_peer(&alice);
@@ -2649,9 +2594,8 @@ async fn test_identity_cascade_via_sync() {
 /// full trust chain enables the messaging layer to work across peers.
 #[tokio::test]
 async fn test_identity_then_messaging() {
-    let channel = test_channel();
-    let mut alice = Peer::new("alice", channel);
-    let mut bob = Peer::new("bob", channel);
+    let mut alice = Peer::new("alice");
+    let mut bob = Peer::new("bob");
 
     // Both peers establish identity on the same network
     let alice_chain = bootstrap_peer(&alice);
@@ -2696,9 +2640,8 @@ async fn test_device_link_via_sync() {
     use poc_7::events::{DeviceInviteOngoingEvent, PeerSharedOngoingEvent, ParsedEvent};
     use poc_7::projection::create::{create_signed_event_sync, event_id_or_blocked};
 
-    let channel = test_channel();
-    let phone = Peer::new("phone", channel);
-    let laptop = Peer::new("laptop", channel);
+    let phone = Peer::new("phone");
+    let laptop = Peer::new("laptop");
 
     let mut rng = rand::thread_rng();
 
@@ -2773,9 +2716,8 @@ async fn test_device_link_via_sync() {
 /// state is corrupted.
 #[tokio::test]
 async fn test_foreign_workspace_rejected_via_sync() {
-    let channel = test_channel();
-    let alice = Peer::new("alice", channel);
-    let bob = Peer::new("bob", channel);
+    let alice = Peer::new("alice");
+    let bob = Peer::new("bob");
 
     // Both bootstrap independently on DIFFERENT workspaces
     let alice_chain = bootstrap_peer(&alice);

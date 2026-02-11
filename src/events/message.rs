@@ -15,7 +15,7 @@ pub struct MessageEvent {
 /// Wire format (min 172 bytes, signed):
 /// [0]            type=1
 /// [1..9]         created_at_ms (u64 LE)
-/// [9..41]        channel_id (32 bytes)
+/// [9..41]        workspace_id (32 bytes)
 /// [41..73]       author_id (32 bytes)
 /// [73..75]       content_len (u16 LE)
 /// [75..75+N]     content (UTF-8)
@@ -24,7 +24,7 @@ pub struct MessageEvent {
 /// [75+N+32]        signer_type (1 byte)
 /// [75+N+33..75+N+97] signature (64 bytes)
 pub fn parse_message(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    // Minimum: type(1) + created_at_ms(8) + channel_id(32) + author_id(32) + content_len(2)
+    // Minimum: type(1) + created_at_ms(8) + workspace_id(32) + author_id(32) + content_len(2)
     //        + signed_by(32) + signer_type(1) + signature(64) = 172
     if blob.len() < 172 {
         return Err(EventError::TooShort {

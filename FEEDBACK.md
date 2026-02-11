@@ -1,35 +1,24 @@
-# Feedback: `quic-holepunch` (latest)
+# Feedback: Stream 2 Identity Compatibility Cleanup Plan
 
-## Snapshot
-- Branch: `quic-holepunch` (`/home/holmes/poc-7-quic-holepunch`)
-- Relative to `origin/master`: `0 behind / 6 ahead`
-- Latest reviewed commits:
-  - `b0737e2` (`--intro-worker` integration, `spawn_local` architecture updates, NAT netns script)
-  - `dd7a47d` (DESIGN/PLAN documentation expansion)
-- Validation run on February 9, 2026:
-  - `cargo test --test holepunch_test -- --nocapture` -> 3 passed
-  - `bash -n tests/netns_nat_test.sh` -> syntax OK
-  - Note: full netns NAT script was not executed in this run.
+## Decision
+Approved with merged changes.
 
-## What Is Strong
-1. `--intro-worker` integration into `sync` closes a real operational gap for long-lived introducers (`src/main.rs:821`).
-2. Moving intro handling to `spawn_local` + `LocalSet` is the right direction for `!Send` state and listener concurrency (`src/sync/engine.rs:790`, `src/sync/punch.rs:231`).
-3. New NAT script is thorough and debuggable (namespace topology, nft rules, diagnostic dumps on failure) (`tests/netns_nat_test.sh`).
-4. Docs now explain architecture, NAT assumptions, and pitfalls clearly enough for future contributors (`docs/DESIGN.md:130`, `docs/PLAN.md:1393`).
+## Merged Improvements
+1. Added explicit dependency coordination with Stream 1 for alias callers in:
+   - `tests/cli_test.rs`
+   - `tests/netns_nat_test.sh`
+2. Split alias cleanup into two phases:
+   - Phase A: wording/help normalization
+   - Phase B: alias retirement only after dependent caller updates merge
+3. Strengthened acceptance criteria so alias outcome must be explicit:
+   - aliases removed with caller updates in the same wave, or
+   - aliases retained with a documented follow-up owner
+4. Added validation command to detect residual alias consumers:
+   - `rg -n 'arg\("identity"\)|\bidentity --db\b|backfill-identity' tests src docs`
 
-## Findings
-1. Documentation mismatch in wire type.
-   - `PLAN.md` says IntroOffer is "type 7" (`docs/PLAN.md:1396`), but code uses `0x30` (`src/sync/mod.rs:26`).
-   - Recommendation: update docs to `0x30` to avoid protocol confusion.
-2. Runtime model inconsistency between docs and integrated intro-worker path.
-   - Docs warn that cross-runtime `endpoint.connect()` via `spawn_blocking` can deadlock handshake (`docs/PLAN.md:1477`).
-   - `sync --intro-worker` currently runs intro worker in `spawn_blocking` with a new runtime and calls `run_intro_worker(... endpoint ...)` (`src/main.rs:828`).
-   - Recommendation: either run intro worker on the same LocalSet/runtime as endpoint I/O, or explicitly document why this call path is safe.
-3. Test gap for the new integrated mode.
-   - Existing tests validate one-shot intro and punch flow (`tests/holepunch_test.rs`), but there is no automated test covering `sync --intro-worker` behavior directly.
-   - Recommendation: add one integration test that exercises the integrated worker mode end-to-end.
+## Remaining Expectations
+1. Stream 1 and Stream 2 must agree on ownership for caller updates before Phase B.
+2. If Stream 2 ships only Phase A, track Phase B with a named owner and follow-up item.
 
-## Recommendation
-1. This branch remains the best merge candidate.
-2. Fix the two consistency items (protocol type doc + runtime model note/refactor) before final merge.
-3. Add automated coverage for integrated `--intro-worker` mode to lock in the newest behavior.
+## Merge Readiness
+Plan is merge-ready with the updates now in `docs/cleanup/02_identity_compat_cleanup_plan.md`.

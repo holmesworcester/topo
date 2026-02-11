@@ -7,11 +7,7 @@ use std::time::Duration;
 
 use poc_7::testutil::{Peer, sync_until_converged};
 
-fn test_channel(tag: &[u8; 4]) -> [u8; 32] {
-    let mut ch = [0u8; 32];
-    ch[0..4].copy_from_slice(tag);
-    ch
-}
+
 
 fn peak_rss_mib() -> Option<f64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
@@ -79,9 +75,8 @@ fn rss_budget_mib_from_env(var: &str, default: f64) -> f64 {
 async fn low_mem_ios_budget_smoke_10k() {
     let _env = EnvGuard::enable_low_mem_ios();
 
-    let channel = test_channel(b"lm01");
-    let alice = Peer::new_with_identity("alice_lowmem_smoke", channel);
-    let bob = Peer::new_with_identity("bob_lowmem_smoke", channel);
+    let alice = Peer::new_with_identity("alice_lowmem_smoke");
+    let bob = Peer::new_with_identity("bob_lowmem_smoke");
 
     alice.batch_create_messages(5_000);
     bob.batch_create_messages(5_000);
@@ -115,9 +110,8 @@ async fn low_mem_ios_budget_soak_million() {
         .unwrap_or(1_000_000);
     let budget = rss_budget_mib_from_env("LOW_MEM_IOS_SOAK_BUDGET_MIB", 24.0);
 
-    let channel = test_channel(b"lm02");
-    let alice = Peer::new_with_identity("alice_lowmem_soak", channel);
-    let bob = Peer::new_with_identity("bob_lowmem_soak", channel);
+    let alice = Peer::new_with_identity("alice_lowmem_soak");
+    let bob = Peer::new_with_identity("bob_lowmem_soak");
 
     alice.batch_create_messages(events);
     // 6 identity per peer + N content; after sync each has 6 own + 5 other shared + N = N + 11

@@ -118,6 +118,7 @@ fn get_messages(db: &str) -> Vec<String> {
 }
 
 
+/// Functional sync test. Uses --pin-peer for CLI bootstrap (not testing pinning policy).
 #[test]
 fn test_cli_bidirectional_sync() {
     let tmpdir = tempfile::tempdir().unwrap();
@@ -176,6 +177,7 @@ fn test_cli_bidirectional_sync() {
     let _ = bob.wait();
 }
 
+/// Functional sync test. Uses --pin-peer for CLI bootstrap (not testing pinning policy).
 #[test]
 fn test_cli_ongoing_sync() {
     // Verify sync picks up new messages over time (not just initial state)
@@ -240,6 +242,7 @@ fn test_cli_send_and_messages() {
     assert!(messages.contains(&"Second message".to_string()));
 }
 
+/// PINNING POLICY TEST: unpinned peer is rejected.
 #[test]
 fn test_cli_unpinned_peer_rejected() {
     // Alice starts without pinning Bob's fingerprint.
@@ -278,6 +281,7 @@ fn test_cli_unpinned_peer_rejected() {
     let _ = bob.wait();
 }
 
+/// PINNING POLICY TEST: empty pin set is rejected at startup.
 #[test]
 fn test_cli_empty_pin_peer_fails() {
     let tmpdir = tempfile::tempdir().unwrap();

@@ -261,6 +261,9 @@ log "B = ${FP_B:0:16}..."
 # ---------------------------------------------------------------------------
 # Start daemons
 # ---------------------------------------------------------------------------
+# --pin-peer is the standard CLI bootstrap mechanism for initial trust.
+# In production, identity-derived trust (TransportKey events) supplements
+# or replaces pinning after the first sync.
 log "Starting introducer I..."
 ip netns exec "${PREFIX}_i" env RUST_LOG=info "$BIN" sync \
     --bind 10.100.0.1:4433 \
