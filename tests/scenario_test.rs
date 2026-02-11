@@ -687,21 +687,18 @@ async fn test_invalid_signature_rejected_after_sync() {
     use ed25519_dalek::SigningKey;
     use poc_7::crypto::event_id_to_base64;
 
-    let alice = Peer::new("alice");
-    let bob = Peer::new("bob");
+    let alice = Peer::new_with_identity("alice");
+    let bob = Peer::new_with_identity("bob");
     let alice_initial_store = alice.store_count();
     let bob_initial_store = bob.store_count();
 
     let mut rng = rand::thread_rng();
-    let signing_key = SigningKey::generate(&mut rng);
     let wrong_key = SigningKey::generate(&mut rng);
-    let public_key = signing_key.verifying_key().to_bytes();
-
-    // Alice creates a PeerKey with signing_key's public key
-    let pk_eid = alice.create_peer_key(public_key);
+    let signer_eid = alice.peer_shared_event_id.unwrap();
 
     // Alice creates a signed memo but signs with the WRONG key (simulating corruption)
     // We need to do this manually since create_signed_memo uses proper signing
+    let bad_memo_event_id_b64: String;
     {
         use poc_7::events::{SignedMemoEvent, ParsedEvent, encode_event};
         use poc_7::projection::signer::sign_event_bytes;
@@ -711,8 +708,8 @@ async fn test_invalid_signature_rejected_after_sync() {
         let memo = ParsedEvent::SignedMemo(SignedMemoEvent {
             created_at_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64,
-            signed_by: pk_eid,
-            signer_type: 0,
+            signed_by: signer_eid,
+            signer_type: 5,
             content: "bad signature memo".to_string(),
             signature: [0u8; 64],
         });
@@ -745,25 +742,24 @@ async fn test_invalid_signature_rejected_after_sync() {
              VALUES (?1, ?2, ?3, 'local_create')",
             rusqlite::params![&alice.identity, &event_id_b64, now_ms],
         ).unwrap();
+        bad_memo_event_id_b64 = event_id_b64;
         // Don't project — it would be rejected. The blob will sync via negentropy.
     }
 
-    // Peer::new() does not bootstrap identity/workspace; only the 2 manually inserted events are expected.
-    assert_eq!(alice.store_count(), alice_initial_store + 2);
+    assert_eq!(alice.store_count(), alice_initial_store + 1);
 
     // Sync to Bob
     let sync = start_peers(&alice, &bob);
 
     assert_eventually(
-        || bob.store_count() == bob_initial_store + 2,
+        || bob.store_count() >= bob_initial_store + 6 && bob.has_event(&bad_memo_event_id_b64),
         Duration::from_secs(15),
-        "bob should have exactly the two synced events (PeerKey + bad-sig memo) in store",
+        "bob should receive alice identity chain plus bad-signature memo in store",
     ).await;
 
     drop(sync);
 
-    // Bob should have the PeerKey projected but NOT the bad-sig memo
-    assert_eq!(bob.peer_key_count(), 1);
+    // Bob should NOT project the bad-signature memo.
     assert_eq!(bob.signed_memo_count(), 0, "bad-signature memo should be rejected, not projected");
 }
 
@@ -1485,20 +1481,17 @@ async fn test_encrypted_inner_unsupported_signer_rejects_durably() {
     use poc_7::projection::encrypted::encrypt_event_blob;
     use poc_7::projection::pipeline::project_one;
 
-    let alice = Peer::new("alice");
+    let alice = Peer::new_with_identity("alice");
 
     // Create and project a secret key
     let key_bytes: [u8; 32] = rand::random();
     let sk_eid = alice.create_secret_key(key_bytes);
 
-    // Create a PeerKey so it can satisfy the signed_by dep check
-    let dummy_pk = alice.create_peer_key([99u8; 32]);
-
     // Create an inner SignedMemo with signer_type=255 (unsupported)
-    // signed_by references the PeerKey (so dep check passes), but signer_type is invalid
+    // signed_by references an existing PeerShared signer event, but signer_type is invalid
     let inner = ParsedEvent::SignedMemo(SignedMemoEvent {
         created_at_ms: 999999u64,
-        signed_by: dummy_pk,
+        signed_by: alice.peer_shared_event_id.unwrap(),
         signer_type: 255, // unsupported
         content: "bad signer type".to_string(),
         signature: [0u8; 64],

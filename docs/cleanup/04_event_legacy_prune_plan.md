@@ -1,27 +1,26 @@
-# Stream 4: Legacy Event Surface Pruning (`peer_key`, `bench_dep`)
+# Stream 4: Legacy Event Surface Pruning (`peer_key`)
 
 ## Goal
 
-Shrink protocol and projection complexity by removing or quarantining legacy event artifacts that remain from prototype/perf scaffolding.
+Shrink protocol and projection complexity by retiring deprecated `peer_key` paths while keeping prototyping/perf scaffolding intact.
 
 ## Scope
 
-1. Remove `bench_dep` from production event registry path.
-2. Retire or sharply isolate deprecated `peer_key` flow.
-3. Update tests that currently rely on these legacy types.
+1. Retire deprecated `peer_key` flow.
+2. Update tests that currently rely on `peer_key`.
+3. Keep `bench_dep` unchanged during active prototyping.
 
 ## Owned Files
 
 1. `src/events/peer_key.rs`
-2. `src/events/bench_dep.rs`
-3. `src/events/mod.rs`
-4. `src/projection/signer.rs`
-5. `src/projection/projectors.rs`
-6. `src/projection/pipeline.rs`
-7. `src/projection/encrypted.rs`
+2. `src/events/mod.rs`
+3. `src/projection/signer.rs`
+4. `src/projection/projectors.rs`
+5. `src/projection/pipeline.rs`
+6. `src/projection/encrypted.rs`
+7. `src/testutil.rs`
 8. `tests/scenario_test.rs`
-9. `tests/topo_cascade_test.rs`
-10. `tests/file_throughput.rs`
+9. `tests/holepunch_test.rs`
 
 ## Dependencies
 
@@ -34,23 +33,20 @@ Shrink protocol and projection complexity by removing or quarantining legacy eve
 
 ## Work Items
 
-1. `bench_dep`:
-   - remove from production registry and `ParsedEvent` if possible.
-   - move topo/perf scaffolding to test-local type or dedicated benchmark-only module.
-2. `peer_key`:
+1. `peer_key`:
    - decide one of:
      - full removal from runtime, or
      - parse-only compatibility with no new production creation path.
    - align signer resolution to identity chain signers (`peer_shared`) as default path.
-3. Update affected tests:
+2. Update affected tests:
    - scenario tests using `create_peer_key`.
-   - throughput/topo tests relying on legacy event codes.
-4. Remove unreachable/unused imports and helper functions created by legacy flow.
+   - holepunch tests creating synthetic `peer_key` events as sync fixtures.
+3. Remove unreachable/unused imports and helper functions created by legacy flow.
 
 ## Acceptance Criteria
 
-1. `bench_dep` is not part of production event path.
-2. Deprecated `peer_key` flow is either removed or tightly compatibility-scoped.
+1. Deprecated `peer_key` flow is either removed or tightly compatibility-scoped.
+2. `bench_dep` remains available for topo/perf prototype tests.
 3. No warnings for unused legacy helper code introduced by old paths.
 4. `cargo check --all-targets` passes.
 5. Core projection/sync tests still pass.
@@ -61,18 +57,19 @@ Shrink protocol and projection complexity by removing or quarantining legacy eve
 cargo check --all-targets
 cargo test projection::pipeline::tests -- --nocapture
 cargo test --test scenario_test -- --nocapture
-cargo test --test topo_cascade_test -- --nocapture
+cargo test --test holepunch_test -- --nocapture
 ```
 
 ## Risks
 
 1. High blast radius across parser/projection/tests.
 2. Backward-compat concerns for existing serialized events.
+3. Accidental impact to `bench_dep` perf scaffolding.
 
 ## Mitigations
 
 1. Land in steps:
-   - Step A: `bench_dep` isolation
-   - Step B: `peer_key` migration
+   - Step A: test harness migration off `create_peer_key`
+   - Step B: runtime/projection `peer_key` retirement
 2. Keep explicit compatibility tests if parse-only support is retained.
-
+3. Leave `bench_dep` code paths untouched unless explicitly requested.

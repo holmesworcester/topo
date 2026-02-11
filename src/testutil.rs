@@ -4,7 +4,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::crypto::EventId;
 use crate::db::{open_connection, schema::create_tables};
 use crate::events::{
-    MessageEvent, MessageDeletionEvent, ReactionEvent, PeerKeyEvent, SecretKeyEvent,
+    MessageEvent, MessageDeletionEvent, ReactionEvent, SecretKeyEvent,
     SignedMemoEvent, ParsedEvent,
     WorkspaceEvent, InviteAcceptedEvent, UserInviteBootEvent, UserInviteOngoingEvent,
     DeviceInviteFirstEvent, UserBootEvent,
@@ -371,17 +371,6 @@ impl Peer {
         });
         event_id_or_blocked(create_signed_event_sync(&db, &self.identity, &rxn, self.signing_key()))
             .expect("failed to create reaction")
-    }
-
-    /// DEPRECATED: Create a PeerKey event. New code should use identity chain
-    /// (PeerSharedFirst) via `new_with_identity()` instead. Retained for backward-compat tests.
-    pub fn create_peer_key(&self, public_key: [u8; 32]) -> EventId {
-        let db = open_connection(&self.db_path).expect("failed to open db");
-        let pk = ParsedEvent::PeerKey(PeerKeyEvent {
-            created_at_ms: current_timestamp_ms(),
-            public_key,
-        });
-        create_event_sync(&db, &self.identity, &pk).expect("failed to create peer_key")
     }
 
     /// Create a SignedMemo event with proper Ed25519 signature.
@@ -792,16 +781,6 @@ impl Peer {
         let db = open_connection(&self.db_path).expect("failed to open db");
         db.query_row(
             "SELECT COUNT(*) FROM reactions WHERE recorded_by = ?1",
-            rusqlite::params![&self.identity],
-            |row| row.get(0),
-        ).unwrap_or(0)
-    }
-
-    /// Count rows in the peer_keys projection table scoped to this peer.
-    pub fn peer_key_count(&self) -> i64 {
-        let db = open_connection(&self.db_path).expect("failed to open db");
-        db.query_row(
-            "SELECT COUNT(*) FROM peer_keys WHERE recorded_by = ?1",
             rusqlite::params![&self.identity],
             |row| row.get(0),
         ).unwrap_or(0)

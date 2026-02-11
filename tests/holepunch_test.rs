@@ -97,9 +97,9 @@ async fn test_three_peer_intro_happy_path() {
     peer_b.publish_transport_key();
 
     // Each peer creates a unique event to sync.
-    peer_a.create_peer_key([0xA1; 32]);
-    peer_b.create_peer_key([0xB2; 32]);
-    intro.create_peer_key([0xC3; 32]);
+    peer_a.create_message("peer_a bootstrap message");
+    peer_b.create_message("peer_b bootstrap message");
+    intro.create_message("introducer bootstrap message");
 
     let fp_i = intro.spki_fingerprint();
     let fp_a = peer_a.spki_fingerprint();
@@ -289,8 +289,8 @@ async fn test_three_peer_intro_happy_path() {
 
     // --- Phase 3: Wait for A and B to process intros and sync ---
     // A and B create new events that should sync via punched connection.
-    peer_a.create_peer_key([0xD4; 32]);
-    peer_b.create_peer_key([0xE5; 32]);
+    peer_a.create_message("peer_a post-intro message");
+    peer_b.create_message("peer_b post-intro message");
 
     // After Phase 1 each peer had 20 events. Each created 1 new message = 21.
     // After punch sync each gets the other's new message = 22.
