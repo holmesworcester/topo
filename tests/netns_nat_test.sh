@@ -246,9 +246,9 @@ DB_I="$TMPDIR/i.db"
 DB_A="$TMPDIR/a.db"
 DB_B="$TMPDIR/b.db"
 
-FP_I=$("$BIN" identity --db "$DB_I" 2>/dev/null)
-FP_A=$("$BIN" identity --db "$DB_A" 2>/dev/null)
-FP_B=$("$BIN" identity --db "$DB_B" 2>/dev/null)
+FP_I=$("$BIN" transport-identity --db "$DB_I" 2>/dev/null)
+FP_A=$("$BIN" transport-identity --db "$DB_A" 2>/dev/null)
+FP_B=$("$BIN" transport-identity --db "$DB_B" 2>/dev/null)
 
 log "I = ${FP_I:0:16}..."
 log "A = ${FP_A:0:16}..."

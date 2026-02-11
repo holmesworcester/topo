@@ -56,7 +56,7 @@ enum Commands {
     },
 
     /// Print local transport identity — SPKI fingerprint from TLS cert (generates cert if needed)
-    #[command(name = "transport-identity", alias = "identity")]
+    #[command(name = "transport-identity")]
     TransportIdentity {
         #[arg(short, long, default_value = "server.db")]
         db: String,
@@ -99,7 +99,7 @@ enum Commands {
     },
 
     /// Backfill legacy messages to the local transport identity (cert/key/SPKI)
-    #[command(name = "backfill-transport-identity", alias = "backfill-identity")]
+    #[command(name = "backfill-transport-identity")]
     BackfillTransportIdentity {
         #[arg(short, long, default_value = "server.db")]
         db: String,
@@ -800,7 +800,7 @@ fn show_status(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + S
     println!("  NegItems:  {} indexed", neg_items_count);
     if legacy_count > 0 {
         println!(
-            "  Legacy:    {} unscoped messages (run 'backfill-identity' to assign)",
+            "  Legacy:    {} unscoped messages (run 'backfill-transport-identity' to assign)",
             legacy_count
         );
     }

@@ -16,12 +16,12 @@ fn random_port() -> u16 {
 /// Get the SPKI fingerprint for a given DB path (generates cert if needed).
 fn get_identity(db: &str) -> String {
     let output = Command::new(bin())
-        .arg("identity")
+        .arg("transport-identity")
         .arg("--db")
         .arg(db)
         .output()
-        .expect("failed to run identity");
-    assert!(output.status.success(), "identity failed: {}", String::from_utf8_lossy(&output.stderr));
+        .expect("failed to run transport-identity");
+    assert!(output.status.success(), "transport-identity failed: {}", String::from_utf8_lossy(&output.stderr));
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
