@@ -1,5 +1,7 @@
 # Simplification Plan For Rust `poc-7`
 
+> **Status: Active** — Authoritative implementation plan for all phases.
+
 ## 1. Implementation Order (Authoritative)
 
 This document is ordered exactly as we should build it.
@@ -28,11 +30,8 @@ Scheduling note:
 
 Current code in `poc-7` (post-move from `codex-simplified`) is a useful sync prototype, but has deliberate gaps relative to this plan:
 
-1. Fixed-size wire/event assumptions:
-   - `src/wire/mod.rs` uses fixed `ENVELOPE_SIZE = 512`.
-   - `src/sync/protocol.rs` uses fixed `EVENT_SIZE = 1 + ENVELOPE_SIZE`.
-2. mTLS is not yet pinned/strict:
-   - `src/transport/mod.rs` uses permissive server-cert verification (`SkipServerVerification`) and no mandatory peer pinning.
+1. ~~Fixed-size wire/event assumptions~~ **RESOLVED**: wire protocol moved to `src/sync/protocol.rs` with variable-length framing and `EVENT_MAX_BLOB_BYTES = 1 MiB` cap. No global fixed envelope size remains.
+2. ~~mTLS is not yet pinned/strict~~ **RESOLVED**: `src/transport/mod.rs` now uses `PinnedCertVerifier` with BLAKE2b-256 SPKI fingerprint pinning on both client and server sides. No permissive verifier remains in production paths.
 3. Projection pipeline is still message-specific and sync-engine-coupled:
    - `src/sync/engine.rs` does inline parse/project for message rows.
    - no global `project_one(recorded_by,event_id)` entrypoint yet.
@@ -172,18 +171,13 @@ Phase -1 is functionally complete. All deliverables are met:
 - Reconnect/retry behavior is stable across daemon restarts.
 - mTLS identity is plumbed into peer/session context.
 
-## 4.1 mTLS reference model to follow
+## 4.1 mTLS implementation (current state)
 
-Primary model (use this first):
-- `/tmp/poc-7-mtls/src/transport/mod.rs`
-- `/tmp/poc-7-mtls/src/transport/cert.rs`
+Phase 0 mTLS is implemented in the main codebase:
+- `src/transport/mod.rs`: `PinnedCertVerifier` with BLAKE2b-256 SPKI fingerprint pinning (both client and server).
+- `src/transport/cert.rs`: self-signed certificate generation and SPKI extraction helpers.
 
-Secondary reference (CLI + optional pin flags, less strict):
-- `/home/holmes/poc-7=codex-attempt/src/transport/mod.rs`
-- `/home/holmes/poc-7=codex-attempt/src/main.rs`
-
-Do not use as final security model:
-- permissive verifier pattern in current `poc-7/src/transport/mod.rs`.
+Historical reference branches (`poc-7-mtls`, `poc-7=codex-attempt`) are no longer needed for implementation guidance.
 
 ## 4.2 Required mTLS design
 

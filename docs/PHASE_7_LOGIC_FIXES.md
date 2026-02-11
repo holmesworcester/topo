@@ -1,5 +1,7 @@
 # Phase 7 Logic Fixes Plan
 
+> **Status: Active** — Open work plan for correcting Phase 7 guard placement and trust-binding semantics.
+
 This plan aligns runtime, tests, and TLA artifacts with the corrected Phase 7 semantics:
 
 1. `invite_accepted` is local trust-anchor binding.
