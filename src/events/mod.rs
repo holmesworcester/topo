@@ -7,7 +7,6 @@ pub mod invite_accepted;
 pub mod message;
 pub mod message_deletion;
 pub mod workspace;
-pub mod peer_key;
 pub mod peer_removed;
 pub mod peer_shared;
 pub mod reaction;
@@ -33,7 +32,6 @@ pub use message::MessageEvent;
 pub use message_attachment::MessageAttachmentEvent;
 pub use message_deletion::MessageDeletionEvent;
 pub use workspace::WorkspaceEvent;
-pub use peer_key::PeerKeyEvent;
 pub use peer_removed::PeerRemovedEvent;
 pub use peer_shared::{PeerSharedFirstEvent, PeerSharedOngoingEvent};
 pub use reaction::ReactionEvent;
@@ -48,7 +46,6 @@ pub use user_removed::UserRemovedEvent;
 
 pub const EVENT_TYPE_MESSAGE: u8 = 1;
 pub const EVENT_TYPE_REACTION: u8 = 2;
-pub const EVENT_TYPE_PEER_KEY: u8 = 3;
 pub const EVENT_TYPE_SIGNED_MEMO: u8 = 4;
 pub const EVENT_TYPE_ENCRYPTED: u8 = 5;
 pub const EVENT_TYPE_SECRET_KEY: u8 = 6;
@@ -80,7 +77,6 @@ pub const EVENT_MAX_BLOB_BYTES: usize = 1024 * 1024;
 pub enum ParsedEvent {
     Message(MessageEvent),
     Reaction(ReactionEvent),
-    PeerKey(PeerKeyEvent),
     SignedMemo(SignedMemoEvent),
     Encrypted(EncryptedEvent),
     SecretKey(SecretKeyEvent),
@@ -111,7 +107,6 @@ impl ParsedEvent {
         match self {
             ParsedEvent::Message(m) => m.created_at_ms,
             ParsedEvent::Reaction(r) => r.created_at_ms,
-            ParsedEvent::PeerKey(p) => p.created_at_ms,
             ParsedEvent::SignedMemo(s) => s.created_at_ms,
             ParsedEvent::Encrypted(e) => e.created_at_ms,
             ParsedEvent::SecretKey(s) => s.created_at_ms,
@@ -144,7 +139,6 @@ impl ParsedEvent {
         match self {
             ParsedEvent::Message(m) => vec![("signed_by", m.signed_by)],
             ParsedEvent::Reaction(r) => vec![("target_event_id", r.target_event_id), ("signed_by", r.signed_by)],
-            ParsedEvent::PeerKey(_) => vec![],
             ParsedEvent::SignedMemo(s) => vec![("signed_by", s.signed_by)],
             ParsedEvent::Encrypted(e) => vec![("key_event_id", e.key_event_id)],
             ParsedEvent::SecretKey(_) => vec![],
@@ -199,7 +193,6 @@ impl ParsedEvent {
         match self {
             ParsedEvent::Message(_) => EVENT_TYPE_MESSAGE,
             ParsedEvent::Reaction(_) => EVENT_TYPE_REACTION,
-            ParsedEvent::PeerKey(_) => EVENT_TYPE_PEER_KEY,
             ParsedEvent::SignedMemo(_) => EVENT_TYPE_SIGNED_MEMO,
             ParsedEvent::Encrypted(_) => EVENT_TYPE_ENCRYPTED,
             ParsedEvent::SecretKey(_) => EVENT_TYPE_SECRET_KEY,
@@ -250,8 +243,7 @@ impl ParsedEvent {
             ParsedEvent::Reaction(r) => Some((r.signed_by, r.signer_type)),
             ParsedEvent::MessageDeletion(d) => Some((d.signed_by, d.signer_type)),
             ParsedEvent::MessageAttachment(a) => Some((a.signed_by, a.signer_type)),
-            ParsedEvent::PeerKey(_)
-            | ParsedEvent::Encrypted(_)
+            ParsedEvent::Encrypted(_)
             | ParsedEvent::SecretKey(_)
             | ParsedEvent::Workspace(_)
             | ParsedEvent::InviteAccepted(_)
@@ -310,7 +302,6 @@ pub fn registry() -> &'static EventRegistry {
         EventRegistry::new(&[
             &message::MESSAGE_META,
             &reaction::REACTION_TYPE_META,
-            &peer_key::PEER_KEY_META,
             &signed_memo::SIGNED_MEMO_META,
             &encrypted::ENCRYPTED_META,
             &secret_key::SECRET_KEY_META,
@@ -391,20 +382,6 @@ mod tests {
 
         let event = ParsedEvent::Reaction(rxn.clone());
         let blob = encode_event(&event).unwrap();
-        let parsed = parse_event(&blob).unwrap();
-        assert_eq!(parsed, event);
-    }
-
-    #[test]
-    fn test_peer_key_roundtrip() {
-        let pk = PeerKeyEvent {
-            created_at_ms: 1111111111111,
-            public_key: [5u8; 32],
-        };
-
-        let event = ParsedEvent::PeerKey(pk.clone());
-        let blob = encode_event(&event).unwrap();
-        assert_eq!(blob.len(), 41);
         let parsed = parse_event(&blob).unwrap();
         assert_eq!(parsed, event);
     }
@@ -716,10 +693,6 @@ mod tests {
         assert!(rxn_meta.signer_required);
         assert_eq!(rxn_meta.signature_byte_len, 64);
 
-        let pk_meta = reg.lookup(EVENT_TYPE_PEER_KEY).unwrap();
-        assert_eq!(pk_meta.type_name, "peer_key");
-        assert_eq!(pk_meta.projection_table, "peer_keys");
-
         let sm_meta = reg.lookup(EVENT_TYPE_SIGNED_MEMO).unwrap();
         assert_eq!(sm_meta.type_name, "signed_memo");
         assert_eq!(sm_meta.projection_table, "signed_memos");
@@ -836,15 +809,6 @@ mod tests {
     }
 
     #[test]
-    fn test_dep_field_values_peer_key() {
-        let pk = ParsedEvent::PeerKey(PeerKeyEvent {
-            created_at_ms: 100,
-            public_key: [1u8; 32],
-        });
-        assert!(pk.dep_field_values().is_empty());
-    }
-
-    #[test]
     fn test_dep_field_values_signed_memo() {
         let signer_id = [42u8; 32];
         let memo = ParsedEvent::SignedMemo(SignedMemoEvent {
@@ -880,12 +844,6 @@ mod tests {
 
     #[test]
     fn test_signer_fields_unsigned() {
-        let pk = ParsedEvent::PeerKey(PeerKeyEvent {
-            created_at_ms: 100,
-            public_key: [0u8; 32],
-        });
-        assert!(pk.signer_fields().is_none());
-
         let ws = ParsedEvent::Workspace(WorkspaceEvent {
             created_at_ms: 100,
             public_key: [0u8; 32],
@@ -967,13 +925,6 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(extract_event_type(&rxn_blob), Some(EVENT_TYPE_REACTION));
-
-        let pk_blob = encode_event(&ParsedEvent::PeerKey(PeerKeyEvent {
-            created_at_ms: 0,
-            public_key: [0u8; 32],
-        }))
-        .unwrap();
-        assert_eq!(extract_event_type(&pk_blob), Some(EVENT_TYPE_PEER_KEY));
 
         let memo_blob = encode_event(&ParsedEvent::SignedMemo(SignedMemoEvent {
             created_at_ms: 0,

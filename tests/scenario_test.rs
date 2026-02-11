@@ -609,7 +609,7 @@ async fn test_multi_dep_blocking_sync() {
     verify_projection_invariants(&bob);
 }
 
-/// Integration test: Alice creates a PeerKey + SignedMemo, Bob syncs, both valid.
+/// Integration test: Alice creates SignedMemo + message, Bob syncs, both valid.
 #[tokio::test]
 async fn test_signed_event_sync() {
     let alice = Peer::new_with_identity("alice");

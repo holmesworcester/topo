@@ -73,16 +73,8 @@ static MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 3,
-        name: "add_peer_keys_and_signed_memos",
+        name: "add_signed_memos",
         sql: "
-            CREATE TABLE IF NOT EXISTS peer_keys (
-                event_id TEXT NOT NULL,
-                public_key TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                recorded_by TEXT NOT NULL,
-                PRIMARY KEY (recorded_by, event_id)
-            );
-
             CREATE TABLE IF NOT EXISTS signed_memos (
                 event_id TEXT NOT NULL,
                 signed_by TEXT NOT NULL,

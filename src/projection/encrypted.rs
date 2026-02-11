@@ -161,11 +161,6 @@ pub fn project_encrypted(
         ParsedEvent::Reaction(rxn) => {
             project_reaction(conn, recorded_by, event_id_b64, rxn)?;
         }
-        ParsedEvent::PeerKey(_) => {
-            return Ok(ProjectionDecision::Reject {
-                reason: "peer_key events are deprecated; use peer_shared signer chain".to_string(),
-            });
-        }
         ParsedEvent::SignedMemo(memo) => {
             project_signed_memo(conn, recorded_by, event_id_b64, memo)?;
         }

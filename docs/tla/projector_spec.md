@@ -85,7 +85,7 @@ Changes to this document require TLA+ model re-verification.
 |------|-------------------|------------------|---------------|
 | 1 | project_message | messages | — |
 | 2 | project_reaction | reactions | skip if target deleted |
-| 3 | project_peer_key | peer_keys | — |
+| 3 | retired (peer_key) | — | rejected as unknown type |
 | 4 | project_signed_memo | signed_memos | — |
 | 5 | project_encrypted | (dispatches inner) | decrypt + inner dispatch |
 | 6 | project_secret_key | secret_keys | — |

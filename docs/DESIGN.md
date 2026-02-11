@@ -65,7 +65,7 @@ Field definitions are fixed; total event size is variable by event type.
 1. canonical event bytes are content-addressed (`event_id` from canonical bytes),
 2. signed events carry canonical signer fields:
    - `signed_by` (event-id reference),
-   - `signer_type` (`peer_key | workspace | user_invite | device_invite | user | peer_shared`),
+   - `signer_type` (`workspace | user_invite | device_invite | user | peer_shared`),
    - `signature`,
 3. signature verification resolves signer key by (`signer_type`, `signed_by`) after dependency resolution,
 4. transport security is separate and complementary to event signatures.
@@ -216,7 +216,7 @@ Test the feature with both local integration tests and Linux netns NAT simulatio
 ## 2.5 Recording identity semantics
 
 1. `signed_by`: canonical signer event reference used for signature/policy checks.
-2. `signer_type`: signer keyspace discriminator (`peer_key | workspace | user_invite | device_invite | user | peer_shared`).
+2. `signer_type`: signer keyspace discriminator (`workspace | user_invite | device_invite | user | peer_shared`).
 3. `recorded_by`: local tenant transport peer identity that recorded/projected the event.
 4. `via_peer_id`: authenticated remote transport peer for ingress metadata.
 

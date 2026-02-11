@@ -114,11 +114,6 @@ fn apply_projection(
         ParsedEvent::Reaction(rxn) => {
             project_reaction(conn, recorded_by, event_id_b64, rxn)?;
         }
-        ParsedEvent::PeerKey(_) => {
-            return Ok(ProjectionDecision::Reject {
-                reason: "peer_key events are deprecated; use peer_shared signer chain".to_string(),
-            });
-        }
         ParsedEvent::SignedMemo(memo) => {
             project_signed_memo(conn, recorded_by, event_id_b64, memo)?;
         }
@@ -483,7 +478,7 @@ mod tests {
     use crate::db::{open_in_memory, schema::create_tables};
     use crate::events::{
         self, EncryptedEvent, FileSliceEvent, MessageAttachmentEvent, MessageDeletionEvent, MessageEvent,
-        ParsedEvent, PeerKeyEvent, ReactionEvent, SecretKeyEvent, SignedMemoEvent, WorkspaceEvent,
+        ParsedEvent, ReactionEvent, SecretKeyEvent, SignedMemoEvent, WorkspaceEvent,
         EVENT_TYPE_ENCRYPTED, EVENT_TYPE_MESSAGE,
     };
     use crate::projection::encrypted::encrypt_event_blob;
@@ -882,15 +877,6 @@ mod tests {
         (parsed, blob)
     }
 
-    fn make_peer_key(public_key: [u8; 32]) -> (ParsedEvent, Vec<u8>) {
-        let pk = ParsedEvent::PeerKey(PeerKeyEvent {
-            created_at_ms: now_ms(),
-            public_key,
-        });
-        let blob = events::encode_event(&pk).unwrap();
-        (pk, blob)
-    }
-
     fn make_signed_memo(
         signing_key: &SigningKey,
         signer_event_id: &EventId,
@@ -1163,34 +1149,23 @@ mod tests {
     }
 
     #[test]
-    fn test_project_peer_key_rejected() {
+    fn test_legacy_peer_key_blob_rejected() {
         let conn = setup();
         let recorded_by = "peer1";
-        let mut rng = rand::thread_rng();
-        let signing_key = SigningKey::generate(&mut rng);
-        let public_key = signing_key.verifying_key().to_bytes();
-
-        let (_pk, blob) = make_peer_key(public_key);
+        // Legacy peer_key wire format: [type=3][created_at][public_key]
+        let mut blob = Vec::with_capacity(41);
+        blob.push(3);
+        blob.extend_from_slice(&now_ms().to_le_bytes());
+        blob.extend_from_slice(&[42u8; 32]);
         let eid = insert_event_raw(&conn, recorded_by, &blob);
 
         let result = project_one(&conn, recorded_by, &eid).unwrap();
         match result {
             ProjectionDecision::Reject { reason } => {
-                assert!(reason.contains("peer_key events are deprecated"), "reason: {}", reason);
+                assert!(reason.contains("unknown event type: 3"), "reason: {}", reason);
             }
             other => panic!("expected Reject, got {:?}", other),
         }
-
-        // Deprecated path should not write peer_keys projection rows.
-        let eid_b64 = event_id_to_base64(&eid);
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM peer_keys WHERE event_id = ?1 AND recorded_by = ?2",
-                rusqlite::params![&eid_b64, recorded_by],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(count, 0);
     }
 
     #[test]
@@ -3411,8 +3386,8 @@ mod tests {
         project_one(&conn, recorded_by, &dif_a_eid).unwrap();
 
         // 6a. PeerSharedFirst A (signed by device_invite_a)
-        let peer_key_a = SigningKey::generate(&mut rng);
-        let peer_pub_a = peer_key_a.verifying_key().to_bytes();
+        let signer_key_a = SigningKey::generate(&mut rng);
+        let peer_pub_a = signer_key_a.verifying_key().to_bytes();
         let psf_a = PeerSharedFirstEvent {
             created_at_ms: now_ms(),
             public_key: peer_pub_a,
@@ -3443,8 +3418,8 @@ mod tests {
         project_one(&conn, recorded_by, &dif_b_eid).unwrap();
 
         // 6b. PeerSharedFirst B (signed by device_invite_b)
-        let peer_key_b = SigningKey::generate(&mut rng);
-        let peer_pub_b = peer_key_b.verifying_key().to_bytes();
+        let signer_key_b = SigningKey::generate(&mut rng);
+        let peer_pub_b = signer_key_b.verifying_key().to_bytes();
         let psf_b = PeerSharedFirstEvent {
             created_at_ms: now_ms(),
             public_key: peer_pub_b,
@@ -3460,11 +3435,11 @@ mod tests {
 
         // Create descriptor with signer A
         let file_id = [99u8; 32];
-        setup_descriptor_for_file(&conn, recorded_by, &peer_key_a, &signer_a_eid, file_id);
+        setup_descriptor_for_file(&conn, recorded_by, &signer_key_a, &signer_a_eid, file_id);
 
         // Create file_slice signed by signer B (different from descriptor's signer A)
         let (_fs, fs_blob) =
-            make_file_slice(&peer_key_b, &signer_b_eid, file_id, 0, b"unauthorized data");
+            make_file_slice(&signer_key_b, &signer_b_eid, file_id, 0, b"unauthorized data");
         let fs_eid = insert_event_raw(&conn, recorded_by, &fs_blob);
         let result = project_one(&conn, recorded_by, &fs_eid).unwrap();
         assert!(
