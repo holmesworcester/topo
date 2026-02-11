@@ -184,7 +184,7 @@ fn create_prereqs(
     let sk_eid = insert_event_raw(conn, recorded_by, &sk_blob);
     project_one(conn, recorded_by, &sk_eid).unwrap();
 
-    // Return signer_eid (PeerShared) instead of old peer_key eid
+    // Return signer_eid from the PeerShared chain.
     (msg_eid, sk_eid, signer_eid, signing_key)
 }
 
@@ -192,7 +192,7 @@ fn run_file_throughput(file_size_bytes: usize, slice_size: usize) {
     let (conn, _tmp) = setup();
     let recorded_by = "peer1";
 
-    let (msg_eid, sk_eid, pk_eid, signing_key) = create_prereqs(&conn, recorded_by);
+    let (msg_eid, sk_eid, signer_eid, signing_key) = create_prereqs(&conn, recorded_by);
 
     let total_slices = (file_size_bytes + slice_size - 1) / slice_size;
     let file_id = [0xF0; 32];
@@ -209,7 +209,7 @@ fn run_file_throughput(file_size_bytes: usize, slice_size: usize) {
         key_event_id: sk_eid,
         filename: "bench.bin".to_string(),
         mime_type: "application/octet-stream".to_string(),
-        signed_by: pk_eid,
+        signed_by: signer_eid,
         signer_type: 5,
         signature: [0u8; 64],
     });
@@ -236,7 +236,7 @@ fn run_file_throughput(file_size_bytes: usize, slice_size: usize) {
             file_id,
             slice_number: i,
             ciphertext: ciphertext_template[..ct_len].to_vec(),
-            signed_by: pk_eid,
+            signed_by: signer_eid,
             signer_type: 5,
             signature: [0u8; 64],
         };
