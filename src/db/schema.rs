@@ -185,6 +185,12 @@ pub fn create_tables(conn: &Connection) -> SqliteResult<()> {
             stored_at INTEGER NOT NULL
         );
 
+        -- Events we have and can advertise/share by event id.
+        CREATE TABLE IF NOT EXISTS shareable_events (
+            id TEXT PRIMARY KEY,        -- Event ID (same as store.id)
+            stored_at INTEGER NOT NULL
+        );
+
         -- Events we want but don't have yet (from refs we've seen)
         CREATE TABLE IF NOT EXISTS wanted_events (
             id BLOB PRIMARY KEY,        -- 32-byte Event ID
@@ -260,6 +266,7 @@ mod tests {
             .unwrap();
 
         assert!(tables.contains(&"store".to_string()));
+        assert!(tables.contains(&"shareable_events".to_string()));
         assert!(tables.contains(&"wanted_events".to_string()));
         assert!(tables.contains(&"messages".to_string()));
         assert!(tables.contains(&"neg_items".to_string()));
