@@ -1227,7 +1227,7 @@ mod tests {
         let mut rng = rand::thread_rng();
         let signing_key = SigningKey::generate(&mut rng);
 
-        // Create a memo referencing a non-existent PeerKey
+        // Create a memo referencing a non-existent signer event
         let fake_signer_id = [99u8; 32];
         let (_memo, memo_blob) = make_signed_memo(&signing_key, &fake_signer_id, "blocked memo");
         let memo_eid = insert_event_raw(&conn, recorded_by, &memo_blob);
@@ -3089,19 +3089,12 @@ mod tests {
     #[test]
     fn test_file_slice_tenant_isolation() {
         let conn = setup();
-        let mut rng = rand::thread_rng();
-        let signing_key = SigningKey::generate(&mut rng);
-        let public_key = signing_key.verifying_key().to_bytes();
-
-        // Setup signer for both tenants
-        let (_pk, pk_blob) = make_peer_key(public_key);
-        let pk_eid_a = insert_event_raw(&conn, "tenant_a", &pk_blob);
-        let pk_eid_b = insert_event_raw(&conn, "tenant_b", &pk_blob);
-        project_one(&conn, "tenant_a", &pk_eid_a).unwrap();
-        project_one(&conn, "tenant_b", &pk_eid_b).unwrap();
+        let (signer_eid_a, signing_key_a) = make_identity_chain(&conn, "tenant_a");
+        let (_signer_eid_b, _signing_key_b) = make_identity_chain(&conn, "tenant_b");
 
         let file_id = [99u8; 32];
-        let (_fs, fs_blob) = make_file_slice(&signing_key, &pk_eid_a, file_id, 0, b"data");
+        setup_descriptor_for_file(&conn, "tenant_a", &signing_key_a, &signer_eid_a, file_id);
+        let (_fs, fs_blob) = make_file_slice(&signing_key_a, &signer_eid_a, file_id, 0, b"data");
         let fs_eid = insert_event_raw(&conn, "tenant_a", &fs_blob);
         project_one(&conn, "tenant_a", &fs_eid).unwrap();
 
