@@ -13,7 +13,7 @@ blake2 = "0.10"
 base64 = "0.21"
 rcgen = "0.12"
 hex = "0.4"
-ed25519-dalek = { version = "2", features = ["rand_core"] }
+ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8"] }
 aes-gcm = "0.10"
 rand = "0.8"
 clap = { version = "4", features = ["derive"] }
@@ -28,5 +28,7 @@ x509-parser = "0.16"
 tempfile = "3"
 rustyline = "14"
 dirs-next = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [dev-dependencies]

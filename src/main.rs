@@ -11,7 +11,7 @@ use poc_7::crypto::EventId;
 use poc_7::db::{
     open_connection,
     schema::{backfill_legacy_messages, count_legacy_messages, create_tables},
-    transport_trust::allowed_peers_combined,
+    transport_trust::{allowed_peers_combined, is_peer_allowed},
 };
 use poc_7::events::{
     DeviceInviteFirstEvent, InviteAcceptedEvent, MessageDeletionEvent, MessageEvent, ParsedEvent,
@@ -21,10 +21,8 @@ use poc_7::projection::create::{create_event_sync, create_signed_event_sync, eve
 use poc_7::projection::pipeline::project_one;
 use poc_7::sync::engine::{accept_loop, connect_loop};
 use poc_7::transport::{
-    AllowedPeers,
-    create_dual_endpoint,
-    extract_spki_fingerprint,
-    load_or_generate_cert,
+    create_dual_endpoint, create_dual_endpoint_dynamic, extract_spki_fingerprint,
+    load_or_generate_cert, AllowedPeers,
 };
 use poc_7::transport_identity::{
     ensure_transport_peer_id_from_db, load_transport_peer_id_from_db, transport_cert_paths_from_db,
@@ -50,7 +48,7 @@ enum Commands {
         connect: Option<SocketAddr>,
         #[arg(short, long, default_value = "server.db")]
         db: String,
-        /// Allowed peer fingerprints (hex, repeatable)
+        /// Optional fallback peer fingerprints (hex, repeatable)
         #[arg(long = "pin-peer")]
         pin_peer: Vec<String>,
     },
@@ -188,7 +186,7 @@ enum Commands {
         /// Peer B hex SPKI fingerprint
         #[arg(long)]
         peer_b: String,
-        /// Allowed peer fingerprints (hex, repeatable)
+        /// Optional fallback peer fingerprints (hex, repeatable)
         #[arg(long = "pin-peer")]
         pin_peer: Vec<String>,
         /// Intro TTL in milliseconds
@@ -208,7 +206,6 @@ enum Commands {
         #[arg(long)]
         peer: Option<String>,
     },
-
 }
 
 #[tokio::main]
@@ -241,13 +238,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Commands::Messages { db, limit } => {
             show_messages(&db, limit)?;
         }
-        Commands::Send { content, db, workspace } => {
+        Commands::Send {
+            content,
+            db,
+            workspace,
+        } => {
             send_message(&db, &workspace, &content)?;
         }
         Commands::Status { db } => {
             show_status(&db)?;
         }
-        Commands::Generate { count, db, workspace } => {
+        Commands::Generate {
+            count,
+            db,
+            workspace,
+        } => {
             generate_messages(&db, count, &workspace)?;
         }
         Commands::BackfillTransportIdentity { db } => {
@@ -287,7 +292,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Commands::Networks { db } => {
             cli_workspaces(&db)?;
         }
-        Commands::Intro { db, peer_a, peer_b, pin_peer, ttl_ms, attempt_window_ms } => {
+        Commands::Intro {
+            db,
+            peer_a,
+            peer_b,
+            pin_peer,
+            ttl_ms,
+            attempt_window_ms,
+        } => {
             cli_intro(&db, &peer_a, &peer_b, &pin_peer, ttl_ms, attempt_window_ms).await?;
         }
         Commands::IntroAttempts { db, peer } => {
@@ -499,7 +511,9 @@ fn show_messages(
     Ok(())
 }
 
-fn parse_workspace_hex(workspace_hex: &str) -> Result<[u8; 32], Box<dyn std::error::Error + Send + Sync>> {
+fn parse_workspace_hex(
+    workspace_hex: &str,
+) -> Result<[u8; 32], Box<dyn std::error::Error + Send + Sync>> {
     let workspace_bytes = hex::decode(workspace_hex)?;
     if workspace_bytes.len() > 32 {
         return Err("Workspace event ID must be at most 32 bytes".into());
@@ -808,7 +822,11 @@ fn show_status(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + S
     Ok(())
 }
 
-fn generate_messages(db_path: &str, count: usize, workspace_hex: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn generate_messages(
+    db_path: &str,
+    count: usize,
+    workspace_hex: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let recorded_by = ensure_transport_peer_id_from_db(db_path)?;
     let db = open_connection(db_path)?;
     create_tables(&db)?;
@@ -1033,30 +1051,38 @@ async fn run_sync(
         hex::encode(fp)
     };
 
-    // Build combined trust: CLI pins (bootstrap) + projected transport bindings
+    // Build combined trust: CLI pins + SQL trust rows
+    // (projected transport_keys + accepted-invite bootstrap trust).
     let cli_pins = AllowedPeers::from_hex_strings(pin_peers)?;
-    let allowed_peers = {
+    {
         let db = open_connection(db_path)?;
         let combined = allowed_peers_combined(&db, &recorded_by, &cli_pins)?;
         if combined.is_empty() {
-            return Err("No allowed peers: provide --pin-peer for bootstrap, or ensure identity events have synced. \
+            return Err("No allowed peers: provide --pin-peer for bootstrap, accept an invite link, or ensure identity events have synced. \
                 Use `poc-7 transport-identity --db <peer-db>` to get a peer's fingerprint.".into());
         }
         let cli_count = cli_pins.len();
         let total = combined.len();
         if total > cli_count {
             info!(
-                "Trust sources: {} from CLI pins, {} from projected bindings",
+                "Trust sources: {} from CLI pins, {} from SQL trust rows",
                 cli_count,
                 total - cli_count
             );
         }
-        Arc::new(combined)
-    };
+    }
 
-    // Single dual-role endpoint: same UDP socket for accept + connect (required for hole punching)
-    let allowed_peers_inner = (*allowed_peers).clone();
-    let endpoint = create_dual_endpoint(bind, cert, key, allowed_peers)?;
+    // Single dual-role endpoint: same UDP socket for accept + connect (required
+    // for hole punching). Trust is resolved from SQL at handshake time.
+    let db_path_for_lookup = db_path.to_string();
+    let recorded_by_for_lookup = recorded_by.clone();
+    let cli_pins_for_lookup = cli_pins.clone();
+    let dynamic_allow = Arc::new(move |peer_fp: &[u8; 32]| {
+        let db = open_connection(&db_path_for_lookup)?;
+        is_peer_allowed(&db, &recorded_by_for_lookup, peer_fp, &cli_pins_for_lookup)
+    });
+    let endpoint = create_dual_endpoint_dynamic(bind, cert, key, dynamic_allow)?;
+    let allowed_peers_inner = cli_pins.clone();
     info!("Listening on {}", endpoint.local_addr()?);
 
     let db_owned = db_path.to_string();
@@ -1071,7 +1097,14 @@ async fn run_sync(
                 .build()
                 .unwrap();
             rt.block_on(async move {
-                if let Err(e) = accept_loop(&db, &recorded_by_clone, accept_endpoint, Some(accept_allowed)).await {
+                if let Err(e) = accept_loop(
+                    &db,
+                    &recorded_by_clone,
+                    accept_endpoint,
+                    Some(accept_allowed),
+                )
+                .await
+                {
                     tracing::warn!("accept_loop exited: {}", e);
                 }
             });
@@ -1089,7 +1122,15 @@ async fn run_sync(
                 .build()
                 .unwrap();
             rt.block_on(async move {
-                if let Err(e) = connect_loop(&db, &recorded_by_clone, connect_endpoint, remote, Some(connect_allowed)).await {
+                if let Err(e) = connect_loop(
+                    &db,
+                    &recorded_by_clone,
+                    connect_endpoint,
+                    remote,
+                    Some(connect_allowed),
+                )
+                .await
+                {
                     tracing::warn!("connect_loop exited: {}", e);
                 }
             });
@@ -1318,9 +1359,8 @@ fn cli_workspaces(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send 
     let db = open_connection(db_path)?;
     create_tables(&db)?;
 
-    let mut stmt = db.prepare(
-        "SELECT event_id, workspace_id FROM workspaces WHERE recorded_by = ?1",
-    )?;
+    let mut stmt =
+        db.prepare("SELECT event_id, workspace_id FROM workspaces WHERE recorded_by = ?1")?;
     let workspaces: Vec<(String, String)> = stmt
         .query_map(rusqlite::params![&recorded_by], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -1333,11 +1373,14 @@ fn cli_workspaces(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send 
     } else {
         use base64::Engine;
         for (i, (eid, ws_id_b64)) in workspaces.iter().enumerate() {
-            let name = if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(ws_id_b64) {
-                String::from_utf8_lossy(&bytes).trim_end_matches('\0').to_string()
-            } else {
-                ws_id_b64.clone()
-            };
+            let name =
+                if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(ws_id_b64) {
+                    String::from_utf8_lossy(&bytes)
+                        .trim_end_matches('\0')
+                        .to_string()
+                } else {
+                    ws_id_b64.clone()
+                };
             println!("  {}. {} ({})", i + 1, name, short_id(eid));
         }
     }
@@ -1381,17 +1424,18 @@ async fn cli_intro(
     let allowed = allowed_peers_combined(&db, &recorded_by, &cli_pins)?;
     drop(db);
 
-    let endpoint = create_dual_endpoint(
-        "0.0.0.0:0".parse()?,
-        cert,
-        key,
-        Arc::new(allowed),
-    )?;
+    let endpoint = create_dual_endpoint("0.0.0.0:0".parse()?, cert, key, Arc::new(allowed))?;
 
     let result = poc_7::sync::intro::run_intro(
-        &endpoint, db_path, &recorded_by,
-        peer_a, peer_b, ttl_ms, attempt_window_ms,
-    ).await?;
+        &endpoint,
+        db_path,
+        &recorded_by,
+        peer_a,
+        peer_b,
+        ttl_ms,
+        attempt_window_ms,
+    )
+    .await?;
 
     if result.sent_to_a && result.sent_to_b {
         println!("Intro sent to both peers");

@@ -20,6 +20,8 @@ EXTENDS Naturals, FiniteSets
 \*   Workspace events are parameterized by workspace id.
 \*   invite_accepted binds trustAnchor directly from its own workspace_id field
 \*   (first-write-wins; conflicting invite_accepted is rejected).
+\*   invite_accepted also carries bootstrap transport trust metadata
+\*   (inviter peer identity from invite link), projected to bootstrapTrustPeer.
 \*   Guard checks that a workspace event's id matches the peer's binding.
 \*   This ensures only the invited workspace can become valid; foreign
 \*   workspace events are structurally excluded.
@@ -38,7 +40,10 @@ EXTENDS Naturals, FiniteSets
 
 CONSTANTS ActiveEvents, Peers, Workspaces
 
-VARIABLES recorded, valid, trustAnchor, removed, inviteCarriedWorkspace
+VARIABLES recorded, valid, trustAnchor, removed,
+          inviteCarriedWorkspace, inviteCarriedBootstrapPeer, bootstrapTrustPeer,
+          inviteCarriedPendingPeer, pendingBootstrapTrustPeer,
+          transportKeyCarriedPeer, transportKeyTrustPeer
 
 \* ---- Event type constants ----
 
@@ -74,11 +79,15 @@ AdminOngoing == "admin_ongoing"
 Peer == "peer"
 
 \* Content
+Channel == "channel"
 Message == "message"
 MessageReaction == "message_reaction"
 MessageDeletion == "message_deletion"
 MessageAttachment == "message_attachment"
 FileSlice == "file_slice"
+
+\* Transport trust
+TransportKey == "transport_key"
 
 \* Sender-subjective encryption
 SecretKey == "secret_key"
@@ -110,6 +119,7 @@ FullEventTypes == {
     Peer,
     Channel, Message, MessageReaction, MessageDeletion,
     MessageAttachment, FileSlice,
+    TransportKey,
     SecretKey, SecretShared, Encrypted,
     UserRemoved, PeerRemoved
 }
@@ -132,6 +142,7 @@ EVENTS == (ActiveEvents \cap FullEventTypes)
 \* Identity event categories
 UserInviteEvents == {UserInviteBoot, UserInviteOngoing}
 DeviceInviteEvents == {DeviceInviteFirst, DeviceInviteOngoing}
+InviteEvents == UserInviteEvents \cup DeviceInviteEvents
 AdminEvents == {AdminBoot, AdminOngoing}
 
 IdentityEvents == {
@@ -142,6 +153,7 @@ IdentityEvents == {
     PeerSharedFirst, PeerSharedOngoing,
     AdminBoot, AdminOngoing,
     Peer,
+    TransportKey,
     UserRemoved, PeerRemoved
 } \cup AllWorkspaceEvents
 
@@ -190,6 +202,7 @@ RawDeps(e) ==
        [] e = MessageDeletion -> {Message}
        [] e = MessageAttachment -> {Message, SecretKey}
        [] e = FileSlice -> {}
+       [] e = TransportKey -> {}
 
        \* Encryption: secret_key is local; secret_shared depends on key + recipient peer;
        \* encrypted depends on secret_key
@@ -233,6 +246,7 @@ SignerDep(e) ==
        [] e = MessageDeletion -> {PeerSharedOngoing}
        [] e = MessageAttachment -> {PeerSharedOngoing}
        [] e = FileSlice -> {PeerSharedOngoing}
+       [] e = TransportKey -> {PeerSharedOngoing}
 
        \* Encryption: secret_shared signed by sender peer
        [] e = SecretShared -> {PeerSharedOngoing}
@@ -265,6 +279,30 @@ PeerDeps(p, e) == ResolveWorkspace(p, RawDeps(e) \cup SignerDep(e))
 \* Workspace events require matching trust anchor binding.
 Guard(p, e) == IF IsWorkspaceEvent(e) THEN trustAnchor[p] = WorkspaceEventId(e) ELSE TRUE
 
+\* poc-6 alignment: invite_accepted projects only after at least one invite
+\* event is recorded for this peer perspective.
+HasRecordedInvite(p) ==
+    IF (InviteEvents \cap EVENTS) = {}
+    THEN TRUE
+    ELSE \E ie \in (InviteEvents \cap EVENTS): ie \in recorded[p]
+
+\* Trusted peer set abstraction used by runtime transport checks.
+\* This models the union of:
+\* - projected transport_keys
+\* - accepted invite bootstrap trust
+\* - pending invite bootstrap trust
+BootstrapTrustSet(p) ==
+    IF bootstrapTrustPeer[p] = "none" THEN {} ELSE {bootstrapTrustPeer[p]}
+
+PendingBootstrapTrustSet(p) ==
+    IF pendingBootstrapTrustPeer[p] = "none" THEN {} ELSE {pendingBootstrapTrustPeer[p]}
+
+TransportKeyTrustSet(p) ==
+    IF transportKeyTrustPeer[p] = "none" THEN {} ELSE {transportKeyTrustPeer[p]}
+
+TrustedPeerSet(p) ==
+    BootstrapTrustSet(p) \cup PendingBootstrapTrustSet(p) \cup TransportKeyTrustSet(p)
+
 \* ---- State machine ----
 
 Init ==
@@ -273,6 +311,12 @@ Init ==
     /\ trustAnchor = [p \in Peers |-> "none"]
     /\ removed = [p \in Peers |-> {}]
     /\ inviteCarriedWorkspace = [p \in Peers |-> "none"]
+    /\ inviteCarriedBootstrapPeer = [p \in Peers |-> "none"]
+    /\ bootstrapTrustPeer = [p \in Peers |-> "none"]
+    /\ inviteCarriedPendingPeer = [p \in Peers |-> "none"]
+    /\ pendingBootstrapTrustPeer = [p \in Peers |-> "none"]
+    /\ transportKeyCarriedPeer = [p \in Peers |-> "none"]
+    /\ transportKeyTrustPeer = [p \in Peers |-> "none"]
 
 \* Record captures the event-carried workspace_id at ingress time.
 \* For invite_accepted, the event carries a specific workspace_id chosen
@@ -286,7 +330,21 @@ Record(p, e) ==
     /\ IF e = InviteAccepted /\ inviteCarriedWorkspace[p] = "none"
        THEN \E n \in Workspaces: inviteCarriedWorkspace' = [inviteCarriedWorkspace EXCEPT ![p] = n]
        ELSE UNCHANGED inviteCarriedWorkspace
-    /\ UNCHANGED <<valid, trustAnchor, removed>>
+    /\ IF e = InviteAccepted /\ inviteCarriedBootstrapPeer[p] = "none"
+       THEN \E bp \in Peers:
+            inviteCarriedBootstrapPeer' = [inviteCarriedBootstrapPeer EXCEPT ![p] = bp]
+       ELSE UNCHANGED inviteCarriedBootstrapPeer
+    /\ IF e \in InviteEvents /\ inviteCarriedPendingPeer[p] = "none"
+       THEN \E pp \in Peers:
+            /\ inviteCarriedPendingPeer' = [inviteCarriedPendingPeer EXCEPT ![p] = pp]
+            /\ pendingBootstrapTrustPeer' = [pendingBootstrapTrustPeer EXCEPT ![p] = pp]
+       ELSE /\ UNCHANGED inviteCarriedPendingPeer
+            /\ UNCHANGED pendingBootstrapTrustPeer
+    /\ IF e = TransportKey /\ transportKeyCarriedPeer[p] = "none"
+       THEN \E tp \in Peers:
+            transportKeyCarriedPeer' = [transportKeyCarriedPeer EXCEPT ![p] = tp]
+       ELSE UNCHANGED transportKeyCarriedPeer
+    /\ UNCHANGED <<valid, trustAnchor, removed, bootstrapTrustPeer, transportKeyTrustPeer>>
 
 \* invite_accepted binds the trust anchor from its event-carried workspace_id.
 \* First-write-wins: if trust anchor is already set to a different workspace,
@@ -298,9 +356,19 @@ Project(p, e) ==
     /\ e \notin valid[p]
     /\ PeerDeps(p, e) \subseteq valid[p]
     /\ Guard(p, e)
+    /\ IF e = InviteAccepted THEN HasRecordedInvite(p) ELSE TRUE
     \* Mismatch rejection: invite_accepted blocked if anchor already set differently
     /\ IF e = InviteAccepted /\ trustAnchor[p] /= "none"
        THEN trustAnchor[p] = inviteCarriedWorkspace[p]
+       ELSE TRUE
+    \* invite_accepted bootstrap trust is seeded from invite_accepted and
+    \* consumed when equivalent transport_key trust appears.
+    /\ IF e = InviteAccepted /\ bootstrapTrustPeer[p] /= "none"
+       THEN bootstrapTrustPeer[p] = inviteCarriedBootstrapPeer[p]
+       ELSE TRUE
+    \* transport_key trust is first-write-wins and immutable.
+    /\ IF e = TransportKey /\ transportKeyTrustPeer[p] /= "none"
+       THEN transportKeyTrustPeer[p] = transportKeyCarriedPeer[p]
        ELSE TRUE
     /\ valid' = [valid EXCEPT ![p] = @ \cup {e}]
     \* Trust anchor binding: deterministic from event-carried workspace_id.
@@ -314,10 +382,28 @@ Project(p, e) ==
         ELSE IF e = PeerRemoved
         THEN [removed EXCEPT ![p] = @ \cup {"peer_target"}]
         ELSE removed
-    /\ UNCHANGED <<recorded, inviteCarriedWorkspace>>
+    /\ bootstrapTrustPeer' =
+        IF e = InviteAccepted /\ bootstrapTrustPeer[p] = "none"
+        THEN [bootstrapTrustPeer EXCEPT ![p] = inviteCarriedBootstrapPeer[p]]
+        ELSE IF e = TransportKey /\ bootstrapTrustPeer[p] = transportKeyCarriedPeer[p]
+        THEN [bootstrapTrustPeer EXCEPT ![p] = "none"]
+        ELSE bootstrapTrustPeer
+    /\ transportKeyTrustPeer' =
+        IF e = TransportKey /\ transportKeyTrustPeer[p] = "none"
+        THEN [transportKeyTrustPeer EXCEPT ![p] = transportKeyCarriedPeer[p]]
+        ELSE transportKeyTrustPeer
+    /\ pendingBootstrapTrustPeer' =
+        IF e = TransportKey /\ pendingBootstrapTrustPeer[p] = transportKeyCarriedPeer[p]
+        THEN [pendingBootstrapTrustPeer EXCEPT ![p] = "none"]
+        ELSE pendingBootstrapTrustPeer
+    /\ UNCHANGED <<recorded, inviteCarriedWorkspace, inviteCarriedBootstrapPeer,
+                  inviteCarriedPendingPeer, transportKeyCarriedPeer>>
 
 Stutter ==
-    UNCHANGED <<recorded, valid, trustAnchor, removed, inviteCarriedWorkspace>>
+    UNCHANGED <<recorded, valid, trustAnchor, removed,
+                inviteCarriedWorkspace, inviteCarriedBootstrapPeer, bootstrapTrustPeer,
+                inviteCarriedPendingPeer, pendingBootstrapTrustPeer,
+                transportKeyCarriedPeer, transportKeyTrustPeer>>
 
 Next ==
     \/ \E p \in Peers, e \in EVENTS: Record(p, e)
@@ -325,7 +411,10 @@ Next ==
     \/ Stutter
 
 Spec ==
-    Init /\ [][Next]_<<recorded, valid, trustAnchor, removed, inviteCarriedWorkspace>>
+    Init /\ [][Next]_<<recorded, valid, trustAnchor, removed,
+                       inviteCarriedWorkspace, inviteCarriedBootstrapPeer, bootstrapTrustPeer,
+                       inviteCarriedPendingPeer, pendingBootstrapTrustPeer,
+                       transportKeyCarriedPeer, transportKeyTrustPeer>>
 
 \* ---- Invariants ----
 
@@ -336,6 +425,12 @@ TypeOK ==
     /\ trustAnchor \in [Peers -> Workspaces \cup {"none"}]
     /\ removed \in [Peers -> SUBSET {"user_target", "peer_target"}]
     /\ inviteCarriedWorkspace \in [Peers -> Workspaces \cup {"none"}]
+    /\ inviteCarriedBootstrapPeer \in [Peers -> Peers \cup {"none"}]
+    /\ bootstrapTrustPeer \in [Peers -> Peers \cup {"none"}]
+    /\ inviteCarriedPendingPeer \in [Peers -> Peers \cup {"none"}]
+    /\ pendingBootstrapTrustPeer \in [Peers -> Peers \cup {"none"}]
+    /\ transportKeyCarriedPeer \in [Peers -> Peers \cup {"none"}]
+    /\ transportKeyTrustPeer \in [Peers -> Peers \cup {"none"}]
 
 \* Every valid event has all its peer-resolved dependencies valid.
 InvDeps ==
@@ -365,10 +460,75 @@ InvTrustAnchorSource ==
     THEN \A p \in Peers: (trustAnchor[p] /= "none") => (InviteAccepted \in valid[p])
     ELSE TRUE
 
+\* poc-6 alignment: invite_accepted validity implies invite material was recorded.
+InvInviteAcceptedRecorded ==
+    IF InviteAccepted \in EVENTS /\ (InviteEvents \cap EVENTS) /= {}
+    THEN \A p \in Peers:
+        (InviteAccepted \in valid[p]) =>
+            (\E ie \in (InviteEvents \cap EVENTS): ie \in recorded[p])
+    ELSE TRUE
+
 \* Trust anchor always matches the event-carried workspace_id.
 InvTrustAnchorMatchesCarried ==
     \A p \in Peers:
         (trustAnchor[p] /= "none") => (trustAnchor[p] = inviteCarriedWorkspace[p])
+
+\* Bootstrap transport trust comes from invite_accepted.
+InvBootstrapTrustSource ==
+    IF InviteAccepted \in EVENTS
+    THEN \A p \in Peers: (bootstrapTrustPeer[p] /= "none") => (InviteAccepted \in valid[p])
+    ELSE TRUE
+
+\* Bootstrap trust must match invite-carried bootstrap peer identity.
+InvBootstrapTrustMatchesCarried ==
+    \A p \in Peers:
+        (bootstrapTrustPeer[p] /= "none") =>
+            (bootstrapTrustPeer[p] = inviteCarriedBootstrapPeer[p])
+
+\* Bootstrap trust is consumed once equivalent transport-key trust exists.
+InvBootstrapTrustConsumedByTransportKey ==
+    IF TransportKey \in EVENTS
+    THEN \A p \in Peers:
+        ~(
+            transportKeyTrustPeer[p] /= "none"
+            /\ bootstrapTrustPeer[p] = transportKeyTrustPeer[p]
+        )
+    ELSE TRUE
+
+\* Pending invite bootstrap trust comes from recorded invite events.
+InvPendingBootstrapTrustSource ==
+    IF (InviteEvents \cap EVENTS) /= {}
+    THEN \A p \in Peers:
+        (pendingBootstrapTrustPeer[p] /= "none") =>
+            (\E ie \in (InviteEvents \cap EVENTS): ie \in recorded[p])
+    ELSE TRUE
+
+\* Pending bootstrap trust matches invite-carried invitee identity.
+InvPendingBootstrapTrustMatchesCarried ==
+    \A p \in Peers:
+        (pendingBootstrapTrustPeer[p] /= "none") =>
+            (pendingBootstrapTrustPeer[p] = inviteCarriedPendingPeer[p])
+
+\* Transport-key trust comes only from valid transport_key events.
+InvTransportKeyTrustSource ==
+    IF TransportKey \in EVENTS
+    THEN \A p \in Peers:
+        (transportKeyTrustPeer[p] /= "none") => (TransportKey \in valid[p])
+    ELSE TRUE
+
+\* Transport-key trust matches the event-carried peer identity.
+InvTransportKeyTrustMatchesCarried ==
+    \A p \in Peers:
+        (transportKeyTrustPeer[p] /= "none") =>
+            (transportKeyTrustPeer[p] = transportKeyCarriedPeer[p])
+
+\* Trusted peer set members are exactly from modeled trust sources.
+InvTrustedPeerSetMembers ==
+    \A p \in Peers:
+        \A q \in TrustedPeerSet(p):
+            q = bootstrapTrustPeer[p]
+            \/ q = pendingBootstrapTrustPeer[p]
+            \/ q = transportKeyTrustPeer[p]
 
 \* All non-local singleton events that are valid require some workspace to be valid.
 InvAllValidRequireWorkspace ==

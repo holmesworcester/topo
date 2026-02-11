@@ -401,6 +401,96 @@ static MIGRATIONS: &[Migration] = &[
             DROP INDEX IF EXISTS idx_blocked_by_dep;
         ",
     },
+    Migration {
+        version: 18,
+        name: "add_invite_bootstrap_trust",
+        sql: "
+            CREATE TABLE IF NOT EXISTS invite_bootstrap_trust (
+                recorded_by TEXT NOT NULL,
+                invite_accepted_event_id TEXT NOT NULL,
+                invite_event_id TEXT NOT NULL,
+                workspace_id TEXT NOT NULL,
+                bootstrap_addr TEXT NOT NULL,
+                bootstrap_spki_fingerprint BLOB NOT NULL,
+                accepted_at INTEGER NOT NULL,
+                PRIMARY KEY (recorded_by, invite_accepted_event_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_invite_bootstrap_spki
+                ON invite_bootstrap_trust(recorded_by, bootstrap_spki_fingerprint);
+        ",
+    },
+    Migration {
+        version: 19,
+        name: "add_pending_invite_bootstrap_trust",
+        sql: "
+            CREATE TABLE IF NOT EXISTS pending_invite_bootstrap_trust (
+                recorded_by TEXT NOT NULL,
+                invite_event_id TEXT NOT NULL,
+                workspace_id TEXT NOT NULL,
+                expected_bootstrap_spki_fingerprint BLOB NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                consumed_at INTEGER,
+                PRIMARY KEY (recorded_by, invite_event_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_pending_invite_bootstrap_spki
+                ON pending_invite_bootstrap_trust(recorded_by, expected_bootstrap_spki_fingerprint);
+            CREATE INDEX IF NOT EXISTS idx_pending_invite_bootstrap_live
+                ON pending_invite_bootstrap_trust(recorded_by, consumed_at, expires_at);
+        ",
+    },
+    Migration {
+        version: 20,
+        name: "add_intro_attempts",
+        sql: "
+            CREATE TABLE IF NOT EXISTS intro_attempts (
+                recorded_by TEXT NOT NULL,
+                intro_id BLOB NOT NULL,
+                introduced_by_peer_id TEXT NOT NULL,
+                other_peer_id TEXT NOT NULL,
+                origin_ip TEXT NOT NULL,
+                origin_port INTEGER NOT NULL,
+                observed_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                error TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (recorded_by, intro_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_intro_attempts_peer
+                ON intro_attempts(recorded_by, other_peer_id, created_at DESC);
+        ",
+    },
+    Migration {
+        version: 21,
+        name: "bound_invite_bootstrap_trust_lifecycle",
+        sql: "
+            ALTER TABLE invite_bootstrap_trust ADD COLUMN expires_at INTEGER;
+            ALTER TABLE invite_bootstrap_trust ADD COLUMN consumed_at INTEGER;
+            UPDATE invite_bootstrap_trust
+               SET expires_at = accepted_at + 86400000
+             WHERE expires_at IS NULL;
+            CREATE INDEX IF NOT EXISTS idx_invite_bootstrap_live
+                ON invite_bootstrap_trust(recorded_by, consumed_at, expires_at);
+        ",
+    },
+    Migration {
+        version: 22,
+        name: "rename_consumed_to_superseded",
+        sql: "
+            ALTER TABLE pending_invite_bootstrap_trust
+                RENAME COLUMN consumed_at TO superseded_at;
+            ALTER TABLE invite_bootstrap_trust
+                RENAME COLUMN consumed_at TO superseded_at;
+            DROP INDEX IF EXISTS idx_pending_invite_bootstrap_live;
+            CREATE INDEX IF NOT EXISTS idx_pending_invite_bootstrap_live
+                ON pending_invite_bootstrap_trust(recorded_by, superseded_at, expires_at);
+            DROP INDEX IF EXISTS idx_invite_bootstrap_live;
+            CREATE INDEX IF NOT EXISTS idx_invite_bootstrap_live
+                ON invite_bootstrap_trust(recorded_by, superseded_at, expires_at);
+        ",
+    },
 ];
 
 fn ensure_schema_migrations(conn: &Connection) -> SqliteResult<()> {
@@ -462,7 +552,10 @@ mod tests {
         assert!(tables.contains(&"valid_events".to_string()));
         assert!(tables.contains(&"rejected_events".to_string()));
         assert!(tables.contains(&"peer_endpoint_observations".to_string()));
+        assert!(tables.contains(&"intro_attempts".to_string()));
         assert!(tables.contains(&"reactions".to_string()));
+        assert!(tables.contains(&"invite_bootstrap_trust".to_string()));
+        assert!(tables.contains(&"pending_invite_bootstrap_trust".to_string()));
         assert!(tables.contains(&"schema_migrations".to_string()));
     }
 
@@ -522,11 +615,11 @@ mod tests {
         // Run again — should not fail
         run_migrations(&conn).unwrap();
 
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+        let max_version: i64 = conn
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(count, 17);
+        assert_eq!(max_version, 22);
     }
 }

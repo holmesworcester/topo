@@ -110,7 +110,11 @@ All peer transport uses QUIC with strict pinned mTLS.
 
 Rules:
 1. each daemon profile has persistent cert/private key material,
-2. peer allow/deny policy is based on expected certificate SPKI pins (CLI `--pin-peer`) or projected transport bindings from the identity graph,
+2. peer allow/deny policy is based on SQL trust state:
+   - `transport_keys` projected from identity events (steady-state),
+   - `invite_bootstrap_trust` rows written when invite links are accepted (bootstrap),
+   - `pending_invite_bootstrap_trust` rows written by inviters before invitee first dial,
+   - optional CLI `--pin-peer` overlays for diagnostics/bootstrap fallback,
 3. no permissive verifier in production mode.
 
 ## 2.2 Transport identity binding
@@ -119,7 +123,18 @@ Transport peer identity is SPKI-derived:
 
 1. `peer_id = hex(BLAKE2b-256(cert_SPKI))`,
 2. the `peer_transport_bindings` table records observed connections,
-3. `TransportKey` events (type 23) provide event-graph-attested SPKI bindings.
+3. `TransportKey` events (type 23) provide event-graph-attested SPKI bindings,
+4. `invite_bootstrap_trust` stores accepted invite-link bootstrap tuples
+   (`bootstrap_addr`, inviter SPKI) used before transport-key convergence,
+5. `pending_invite_bootstrap_trust` stores inviter-side expected invitee SPKI
+   until converged transport-key trust consumes it,
+6. accepted/pending bootstrap rows are time-bounded and auto-consumed when
+   matching steady-state `transport_keys` trust is present.
+
+Runtime rule: handshake verification queries SQL trust state per connection
+creation; projected peer keys are not treated as in-memory authority.
+Conceptually:
+`TrustedPeerSet = transport_keys U invite_bootstrap_trust U pending_invite_bootstrap_trust`.
 
 ## 2.3 Event-graph identity binding
 
@@ -494,6 +509,7 @@ Use split event types:
 No multimodal `invite(mode=...)` type.
 
 Implementation uses shared invite helper logic with per-type policy tables.
+Interactive CLI keeps real invite links (`quiet://invite/...`, `quiet://link/...`) in frontend state; session-local invite numbers are aliases to those links.
 
 ## 9.3 Trust-anchor cascade
 
@@ -502,7 +518,9 @@ Implementation uses shared invite helper logic with per-type policy tables.
 Required semantics:
 1. workspace is not valid until trust anchor exists,
 2. invites are not force-valid,
-3. normal signer/dependency chain still governs validity.
+3. normal signer/dependency chain still governs validity,
+4. accepted invite-link metadata writes bootstrap transport trust rows
+   (`invite_bootstrap_trust`) keyed by local peer scope.
 
 Self-invite bootstrap stays explicit:
 

@@ -148,6 +148,15 @@ type_code(1) | created_at_ms(8) | key_event_id(32) | recipient_event_id(32) | wr
 | InvSingleWorkspace | At most one workspace row per peer in workspaces table |
 | InvTrustAnchorImmutable | test_bootstrap_sequence: trust anchor is immutable once set; mismatch rejected |
 | InvTrustAnchorSource | invite_accepted must be valid for trust anchor to be set |
+| InvInviteAcceptedRecorded | invite_accepted can become valid only when invite material is recorded in the same peer scope |
+| InvBootstrapTrustSource | bootstrap transport trust (`invite_bootstrap_trust`) is derived only from valid `invite_accepted` |
+| InvBootstrapTrustMatchesCarried | bootstrap trust identity matches invite-carried bootstrap identity fields |
+| InvBootstrapTrustConsumedByTransportKey | bootstrap trust is consumed when equivalent transport-key trust appears |
+| InvPendingBootstrapTrustSource | pending bootstrap trust (`pending_invite_bootstrap_trust`) is derived only from recorded invite events |
+| InvPendingBootstrapTrustMatchesCarried | pending bootstrap trust identity matches invite-carried pending peer identity fields |
+| InvTransportKeyTrustSource | transport-key trust (`transport_keys`) is derived only from valid `transport_key` events |
+| InvTransportKeyTrustMatchesCarried | transport-key trust identity matches transport-key carried identity fields |
+| InvTrustedPeerSetMembers | `TrustedPeerSet` members come only from bootstrap trust, pending bootstrap trust, or transport-key trust |
 | InvUserInviteChain | test_bootstrap_sequence: UserBoot requires UserInviteBoot valid |
 | InvDeviceInviteChain | test_bootstrap_sequence: PeerSharedFirst requires DeviceInviteFirst valid |
 | InvAdminChain | test_bootstrap_sequence: AdminOngoing requires AdminBoot valid |

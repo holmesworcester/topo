@@ -78,7 +78,9 @@ Gap-to-phase mapping:
 - No per-event transit wrapper. QUIC + mTLS secures the channel.
 - Use separate tables for permanent canonical data vs operational queues.
 - Use separate invite event types (`user_invite`, `device_invite`), not one multimodal invite with `mode=*`.
-- `invite_accepted` is local trust-anchor binding; it is not guarded by generic "invite presence" checks.
+- `invite_accepted` is local trust-anchor binding and follows `poc-6` guard semantics:
+  - it requires invite material to be recorded in the same peer scope (`HasRecordedInvite`),
+  - it is not gated by the root-workspace trust-anchor guard itself.
 - Trust-anchor guards apply to root workspace events (foreign root ids must not become valid).
 - Deterministic emitted event types stay inside the emitted-event rule flow but are unsigned for determinism (`no signed_by/signer_type/signature`).
 
@@ -189,7 +191,13 @@ Historical reference branches (`poc-7-mtls`, `poc-7=codex-attempt`) are no longe
    - daemon startup config supplies allowed remote cert public keys (SPKI pins).
    - local cert/key are file-backed per profile.
 3. Required end-state trust source:
-   - transport allow/deny must be derived from projected identity graph state, not CLI/file pin lists.
+   - transport allow/deny must be derived from SQL trust state rooted in identity:
+     - projected `transport_keys` (steady-state),
+     - accepted invite-link bootstrap rows (`invite_bootstrap_trust`),
+     - inviter-side pending invite bootstrap rows (`pending_invite_bootstrap_trust`),
+     - bootstrap rows are TTL-bounded and consumed when matching steady-state trust appears,
+     - not CLI/file pin lists as authority.
+   - shorthand model term: `TrustedPeerSet = transport_keys U invite_bootstrap_trust U pending_invite_bootstrap_trust`.
    - trust inputs are not only `invite`/`invite_accepted`; they include the full identity policy graph (for example peer/user/device/admin/removal state).
 4. TODO (retrofit completed Phase 0 implementation before Phase 7 is done):
    - remove CLI/profile SPKI allowlist as trust authority.
@@ -937,7 +945,9 @@ Before writing identity/removal/encryption projectors in Rust:
 3. Model split invite types (`user_invite`, `device_invite`) and trust-anchor semantics.
 4. **Model workspace binding**: workspace events must be parameterized by workspace id, and the trust anchor must bind to a specific workspace. The model must prove that foreign workspace events (for workspaces the peer did not accept an invite for) can never become valid. Without this, the model cannot distinguish between valid and invalid workspace events, making it insufficiently expressive for multi-workspace scenarios. See `InvWorkspaceAnchor`, `InvSingleWorkspace`, `InvForeignWorkspaceExcluded` invariants.
 5. **Model invite-derived trust anchor binding**: the trust anchor must bind deterministically to the workspace referenced by the invite, not by a free nondeterministic choice at `invite_accepted` time. The model captures which workspace an invite references when the first invite is recorded (`inviteCarriedWorkspace` variable); `invite_accepted` then reads `inviteCarriedWorkspace` to set the trust anchor. This ensures the binding mechanism is faithful to the real protocol where the invite blob carries a `workspace_id`. See `InvTrustAnchorMatchesCarried` invariant.
-6. **Model guard placement explicitly**: trust-anchor guard applies to root workspace events; `invite_accepted` itself must not depend on a global `HasRecordedInvite`-style guard.
+6. **Model guard placement explicitly (poc-6 parity)**:
+   - trust-anchor guard applies to root workspace events,
+   - `invite_accepted` uses invite-presence gating (`HasRecordedInvite`) rather than workspace-root gating.
 7. Verify bootstrap/self-invite, join, device-link, and removal safety invariants.
 8. Freeze a projector-spec mapping table: each projector predicate/check maps to a named TLA guard.
 9. Record TLA scope boundary for this phase:
@@ -954,14 +964,15 @@ Only include identity and policy needed for:
 - device linking
 - removal enforcement
 - recipient selection for encrypted message key wraps
-- transport mTLS trust policy derived from projected identity graph state (including peer/user/device/admin/removal projections), not static CLI/file pin sources
+- transport mTLS trust policy derived from identity-backed SQL trust state
+  (projected `transport_keys` + accepted-invite bootstrap trust), not static CLI/file pin sources
 
 ## 11.3 Split invite event types (no mode switch)
 
 Use separate types:
 - `user_invite` (invites a user identity)
 - `device_invite` (invites/links a peer device to a user)
-- `invite_accepted` (records accepted link data + `workspace_id`)
+- `invite_accepted` (records trust-anchor binding; local SQL also stores accepted invite-link bootstrap metadata)
 
 Do not use one `invite` type with `mode=user|peer`.
 
@@ -973,16 +984,40 @@ Implementation requirement:
 
 Required behavior:
 - `invite_accepted` records trust anchor intent for `workspace_id` (per `recorded_by` peer scope).
-- `invite_accepted` is a local binding step and should not be blocked by a global "recorded invite exists" guard.
+- `invite_accepted` is a local binding step and requires invite material to be recorded in the same peer scope (`HasRecordedInvite`), matching `poc-6` TLA semantics.
 - root `workspace` events are not valid until corresponding trust anchor exists and matches the root id.
 - trust-anchor binding must come from validated projector input fields, not pre-projection capture tables.
 - invites are never force-valid; they validate only through signer/dependency chain.
+- accepted invite links store bootstrap transport trust tuples in SQL:
+  - inviter address from invite link,
+  - inviter SPKI fingerprint for that address,
+  - looked up by sync on each connection/handshake (no in-memory-only trust authority).
 
 Self-invite bootstrap sequence must stay explicit:
 1. create `workspace` event (integrity self-sign only).
 2. create bootstrap `user_invite` signed by workspace authority.
 3. accept invite locally -> `invite_accepted(workspace_id=...)`.
 4. normal cascade unblocks: `workspace -> user_invite -> user -> device_invite -> peer_shared`.
+
+## 11.4.1 Poc-6-aligned high-level bootstrap migration plan
+
+Use `poc-6` as reference behavior for end-to-end test setup:
+1. Alice creates workspace + identity chain via high-level bootstrap API.
+2. Alice creates invite link (contains bootstrap address + inviter transport key identity metadata).
+3. Bob accepts invite link via high-level accept API:
+   - records local `invite_accepted`,
+   - writes trust anchor binding (`workspace_id`),
+   - stores accepted-invite bootstrap transport trust tuple in SQL.
+4. Sync bootstrap trust is read from SQL at connection creation (no in-memory-only trust authority).
+5. Connection state follows `poc-6` ordering:
+   - invite-auth request (`connReq`) -> ack (`connAck`) ->
+   - invite-labeled connection (`connInvite`) ->
+   - peer-labeled upgraded connection (`connPeer`).
+6. Tests migrate to this flow:
+   - remove direct SPKI pin setup from test harnesses,
+   - remove synthetic low-level bootstrap stubs where high-level APIs exist,
+   - require invite-link acceptance path for multi-peer bootstrap.
+7. Keep low-level tests only for explicit adversarial/property coverage, not baseline bootstrap.
 
 ## 11.5 Crude sender-keys model (phase-1 style, no key history yet)
 
@@ -1346,7 +1381,7 @@ Must implement:
 7. transport mTLS trust source switched to projected identity graph policy (retrofit completed; no CLI/file pin authority in steady state).
 8. local TLS cert/public/private key material modeled as events and materialized from projected local event state.
 9. guard placement correction:
-   - `invite_accepted` is local trust-anchor binding and does not use `HasRecordedInvite`-style global guard.
+   - `invite_accepted` is local trust-anchor binding and requires invite-presence gating (`HasRecordedInvite`) per peer scope.
    - trust-anchor guard applies on root workspace events only.
 10. remove/avoid pre-projection trust-binding capture paths (for example raw-blob `invite_workspace_bindings` capture) as authority.
 11. TLA transport-credential scope extension plan exists and is linked (credential/trust transitions modeled; handshake/session keys may remain abstract).
@@ -1354,7 +1389,7 @@ Must implement:
 Common mistakes:
 - implementing projector rules before guard/model freeze.
 - re-introducing multimodal invite event (`mode=*`).
-- keeping obsolete `invite_accepted` guard logic after model correction.
+- dropping the required `invite_accepted` invite-presence guard (`HasRecordedInvite`) after model correction.
 - forgetting to track the transport-credential TLA scope gap explicitly.
 
 Definition of done:

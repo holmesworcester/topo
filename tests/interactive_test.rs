@@ -1,20 +1,27 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+use poc_7::invite_link::parse_invite_link;
+
 fn bin() -> String {
     env!("CARGO_BIN_EXE_poc-7").to_string()
 }
 
 /// Run the interactive REPL with the given commands piped to stdin.
 /// Returns (stdout, stderr) as strings.
-fn run_interactive(commands: &str) -> (String, String) {
-    let mut child = Command::new(bin())
-        .arg("interactive")
+fn run_interactive_with_bootstrap_env(
+    commands: &str,
+    bootstrap_addr: Option<&str>,
+) -> (String, String) {
+    let mut cmd = Command::new(bin());
+    cmd.arg("interactive")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("failed to spawn interactive");
+        .stderr(Stdio::piped());
+    if let Some(addr) = bootstrap_addr {
+        cmd.env("POC7_BOOTSTRAP_ADDR", addr);
+    }
+    let mut child = cmd.spawn().expect("failed to spawn interactive");
 
     {
         let stdin = child.stdin.as_mut().expect("failed to open stdin");
@@ -29,6 +36,10 @@ fn run_interactive(commands: &str) -> (String, String) {
     (stdout, stderr)
 }
 
+fn run_interactive(commands: &str) -> (String, String) {
+    run_interactive_with_bootstrap_env(commands, Some("127.0.0.1:4433"))
+}
+
 /// Assert the output contains a string, with context on failure.
 fn assert_contains(output: &str, needle: &str, context: &str) {
     assert!(
@@ -38,6 +49,13 @@ fn assert_contains(output: &str, needle: &str, context: &str) {
         needle,
         output
     );
+}
+
+fn extract_first_link(output: &str) -> Option<String> {
+    output
+        .lines()
+        .find_map(|line| line.trim_start().strip_prefix("link: "))
+        .map(|s| s.to_string())
 }
 
 /// Assert the output does NOT contain a string.
@@ -99,6 +117,7 @@ fn test_two_user_messaging() {
 
     assert_contains(&out, "Created workspace 'chat'", "new-workspace");
     assert_contains(&out, "Created invite #1", "invite");
+    assert_contains(&out, "link: quiet://invite/", "invite link");
     assert_contains(&out, "Accepted invite #1 as bob", "accept-invite");
     assert_contains(&out, "Sent: hello from bob", "bob send");
     assert_contains(&out, "Switched to account 1", "switch to alice");
@@ -149,7 +168,11 @@ fn test_create_channel_and_send() {
     assert_contains(&out, "1. [alice] in random", "message in random channel");
     // Messages are workspace-wide (workspace_id = workspace dep, not per-channel filter),
     // so after switching back to general, the message is still visible.
-    assert_contains(&out, "1. [alice] in random", "message visible from general too");
+    assert_contains(
+        &out,
+        "1. [alice] in random",
+        "message visible from general too",
+    );
 }
 
 #[test]
@@ -188,8 +211,16 @@ fn test_delete_message() {
     // The second "messages" output should only have "keep this"
     // Split on "Deleted message 2" to check after deletion
     let after_delete = out.split("Deleted message 2").nth(1).unwrap_or("");
-    assert_contains(after_delete, "1. [alice] keep this", "after delete - kept message");
-    assert_not_contains(after_delete, "delete this", "after delete - deleted message gone");
+    assert_contains(
+        after_delete,
+        "1. [alice] keep this",
+        "after delete - kept message",
+    );
+    assert_not_contains(
+        after_delete,
+        "delete this",
+        "after delete - deleted message gone",
+    );
 }
 
 #[test]
@@ -204,11 +235,16 @@ fn test_link_device() {
     assert!(err.is_empty(), "stderr should be empty, got: {}", err);
 
     assert_contains(&out, "Created device link invite #1", "link");
+    assert_contains(&out, "link: quiet://link/", "device link url");
     assert_contains(&out, "Accepted device link #1", "accept-link");
     assert_contains(&out, "ACCOUNTS:", "accounts header");
     // Should have 2 accounts
     assert_contains(&out, "1 alice (desktop)", "account 1");
-    assert_contains(&out, "2 alice (phone)", "account 2 - same user, different device");
+    assert_contains(
+        &out,
+        "2 alice (phone)",
+        "account 2 - same user, different device",
+    );
 }
 
 #[test]
@@ -224,13 +260,50 @@ fn test_invite_accept_flow() {
     assert!(err.is_empty(), "stderr should be empty, got: {}", err);
 
     assert_contains(&out, "Created invite #1", "invite created");
-    assert_contains(&out, "Accepted invite #1 as bob (laptop)", "invite accepted");
+    assert_contains(&out, "link: quiet://invite/", "invite link");
+    assert_contains(
+        &out,
+        "Accepted invite #1 as bob (laptop)",
+        "invite accepted",
+    );
     assert_contains(&out, "ACCOUNTS:", "accounts");
     assert_contains(&out, "alice (desktop)", "alice in accounts");
     assert_contains(&out, "bob (laptop)", "bob in accounts");
     // Bob's db should have its own user
     assert_contains(&out, "USERS:", "users header");
     assert_contains(&out, "1. user_", "user listed");
+}
+
+#[test]
+fn test_invite_uses_explicit_bootstrap_addr() {
+    let (out, err) = run_interactive_with_bootstrap_env(
+        "new-workspace --name net --username alice --devicename desktop\n\
+         invite --bootstrap 10.44.0.2:7443\n\
+         quit\n",
+        None,
+    );
+    assert!(err.is_empty(), "stderr should be empty, got: {}", err);
+    assert_contains(&out, "Created invite #1", "invite created");
+
+    let link = extract_first_link(&out).expect("invite link line should be present");
+    let parsed = parse_invite_link(&link).expect("invite link should parse");
+    assert_eq!(parsed.bootstrap_addr, "10.44.0.2:7443");
+}
+
+#[test]
+fn test_invite_requires_bootstrap_addr_when_unset() {
+    let (out, err) = run_interactive_with_bootstrap_env(
+        "new-workspace --name net --username alice --devicename desktop\n\
+         invite\n\
+         quit\n",
+        None,
+    );
+    assert!(err.is_empty(), "stderr should be empty, got: {}", err);
+    assert_contains(
+        &out,
+        "Missing bootstrap endpoint. Pass --bootstrap <host:port> or set POC7_BOOTSTRAP_ADDR.",
+        "invite missing bootstrap",
+    );
 }
 
 #[test]
@@ -261,10 +334,29 @@ fn test_help_covers_all_commands() {
 
     assert_contains(&out, "COMMANDS:", "help header");
     let expected_commands = [
-        "new-workspace", "send", "messages", "react", "reactions", "delete",
-        "invite", "accept-invite", "link", "accept-link", "switch", "accounts",
-        "channels", "new-channel", "channel", "users", "keys", "workspaces",
-        "status", "identity", "ban", "help", "quit",
+        "new-workspace",
+        "send",
+        "messages",
+        "react",
+        "reactions",
+        "delete",
+        "invite",
+        "accept-invite",
+        "link",
+        "accept-link",
+        "switch",
+        "accounts",
+        "channels",
+        "new-channel",
+        "channel",
+        "users",
+        "keys",
+        "workspaces",
+        "status",
+        "identity",
+        "ban",
+        "help",
+        "quit",
     ];
     for cmd in &expected_commands {
         assert_contains(&out, cmd, &format!("help lists '{}'", cmd));
@@ -405,7 +497,10 @@ fn test_copy_event_chain_shared_only() {
 
     // Split output at bob's acceptance to get alice's status and bob's status separately
     let parts: Vec<&str> = out.split("Accepted invite #1 as bob").collect();
-    assert!(parts.len() >= 2, "should have output before and after accept");
+    assert!(
+        parts.len() >= 2,
+        "should have output before and after accept"
+    );
 
     let alice_status = parts[0];
     let bob_status = parts[1];

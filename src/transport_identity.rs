@@ -4,12 +4,19 @@ use rusqlite::Connection;
 
 use crate::events::{ParsedEvent, TransportKeyEvent};
 use crate::projection::create::create_signed_event_sync;
-use crate::transport::{extract_spki_fingerprint, load_or_generate_cert};
+use crate::transport::{
+    extract_spki_fingerprint, generate_self_signed_cert_from_signing_key, load_or_generate_cert,
+    write_cert_and_key,
+};
 
 /// Derive cert/key file paths from a DB path (e.g. "alice.db" -> "alice.cert.der", "alice.key.der")
 pub fn transport_cert_paths_from_db(db_path: &str) -> (PathBuf, PathBuf) {
     let base = Path::new(db_path);
-    let stem = base.file_stem().unwrap_or_default().to_str().unwrap_or("peer");
+    let stem = base
+        .file_stem()
+        .unwrap_or_default()
+        .to_str()
+        .unwrap_or("peer");
     let dir = base.parent().unwrap_or_else(|| Path::new("."));
     let cert_path = dir.join(format!("{}.cert.der", stem));
     let key_path = dir.join(format!("{}.key.der", stem));
@@ -18,7 +25,9 @@ pub fn transport_cert_paths_from_db(db_path: &str) -> (PathBuf, PathBuf) {
 
 /// Load local transport peer identity from existing cert files. Fails if cert is missing.
 /// Use this for read/query commands that should not silently generate a new identity.
-pub fn load_transport_peer_id_from_db(db_path: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+pub fn load_transport_peer_id_from_db(
+    db_path: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let (cert_path, key_path) = transport_cert_paths_from_db(db_path);
     if !cert_path.exists() || !key_path.exists() {
         return Err(format!(
@@ -34,9 +43,34 @@ pub fn load_transport_peer_id_from_db(db_path: &str) -> Result<String, Box<dyn s
 
 /// Compute the local transport peer identity (hex SPKI fingerprint), generating cert if needed.
 /// Use this for bootstrap commands (transport-identity, send, generate, sync).
-pub fn ensure_transport_peer_id_from_db(db_path: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+pub fn ensure_transport_peer_id_from_db(
+    db_path: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let (cert_path, key_path) = transport_cert_paths_from_db(db_path);
     let (cert_der, _) = load_or_generate_cert(&cert_path, &key_path)?;
+    let fp = extract_spki_fingerprint(cert_der.as_ref())?;
+    Ok(hex::encode(fp))
+}
+
+/// Derive the expected bootstrap transport SPKI fingerprint for an invitee from
+/// the invite signing key material.
+pub fn expected_invite_bootstrap_spki_from_invite_key(
+    invite_key: &ed25519_dalek::SigningKey,
+) -> Result<[u8; 32], Box<dyn std::error::Error + Send + Sync>> {
+    let (cert_der, _) = generate_self_signed_cert_from_signing_key(invite_key)?;
+    extract_spki_fingerprint(cert_der.as_ref())
+}
+
+/// Install a deterministic transport cert/key derived from the invite signing
+/// key. This makes invitee transport identity predictable from invite material
+/// so inviter-side bootstrap trust can be precomputed without CLI pinning.
+pub fn install_invite_bootstrap_transport_identity(
+    db_path: &str,
+    invite_key: &ed25519_dalek::SigningKey,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let (cert_path, key_path) = transport_cert_paths_from_db(db_path);
+    let (cert_der, key_der) = generate_self_signed_cert_from_signing_key(invite_key)?;
+    write_cert_and_key(&cert_path, &key_path, &cert_der, &key_der)?;
     let fp = extract_spki_fingerprint(cert_der.as_ref())?;
     Ok(hex::encode(fp))
 }
@@ -109,4 +143,34 @@ pub fn ensure_transport_key_event(
         .map_err(|e| format!("failed to create transport key event: {:?}", e))?;
 
     Ok(Some(event_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+
+    #[test]
+    fn test_expected_invite_bootstrap_spki_is_deterministic() {
+        let invite_key = SigningKey::from_bytes(&[9u8; 32]);
+        let fp1 = expected_invite_bootstrap_spki_from_invite_key(&invite_key).unwrap();
+        let fp2 = expected_invite_bootstrap_spki_from_invite_key(&invite_key).unwrap();
+        assert_eq!(fp1, fp2);
+    }
+
+    #[test]
+    fn test_install_invite_bootstrap_transport_identity_roundtrip() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let db_path = tmpdir.path().join("peer.db");
+        let db_path = db_path.to_str().unwrap();
+        let invite_key = SigningKey::from_bytes(&[7u8; 32]);
+
+        let installed = install_invite_bootstrap_transport_identity(db_path, &invite_key).unwrap();
+        let loaded = load_transport_peer_id_from_db(db_path).unwrap();
+        assert_eq!(installed, loaded);
+
+        let expected =
+            hex::encode(expected_invite_bootstrap_spki_from_invite_key(&invite_key).unwrap());
+        assert_eq!(loaded, expected);
+    }
 }

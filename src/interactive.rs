@@ -7,16 +7,18 @@ use ed25519_dalek::SigningKey;
 use crate::crypto::{event_id_to_base64, EventId};
 use crate::db::{open_connection, schema::create_tables};
 use crate::events::*;
-use crate::identity_ops::{
-    self, IdentityChain, InviteData, InviteType, JoinChain, LinkChain,
-};
+use crate::identity_ops::{self, IdentityChain, InviteType, JoinChain, LinkChain};
+use crate::invite_link::{create_invite_link, parse_invite_link, InviteLinkKind};
 use crate::projection::create::{create_signed_event_sync, event_id_or_blocked};
-use crate::transport_identity::ensure_transport_peer_id_from_db;
+use crate::transport_identity::{
+    ensure_transport_peer_id_from_db, expected_invite_bootstrap_spki_from_invite_key,
+    install_invite_bootstrap_transport_identity,
+};
 
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
-use rustyline::hint::Hinter;
 use rustyline::highlight::Highlighter;
+use rustyline::hint::Hinter;
 use rustyline::validate::Validator;
 use rustyline::{Config, Context, Editor, Helper};
 
@@ -64,7 +66,8 @@ impl Account {
             ensure_transport_peer_id_from_db(&db_path).expect("failed to compute identity");
 
         let mut default_channel = [0u8; 32];
-        default_channel[..16].copy_from_slice(&hex::decode("0102030405060708090a0b0c0d0e0f10").unwrap());
+        default_channel[..16]
+            .copy_from_slice(&hex::decode("0102030405060708090a0b0c0d0e0f10").unwrap());
 
         Account {
             db_path,
@@ -97,7 +100,10 @@ impl Account {
             (chain.workspace_id, chain.workspace_key.clone()),
             (chain.user_invite_event_id, chain.invite_key.clone()),
             (chain.user_event_id, chain.user_key.clone()),
-            (chain.device_invite_event_id, chain.device_invite_key.clone()),
+            (
+                chain.device_invite_event_id,
+                chain.device_invite_key.clone(),
+            ),
             (chain.peer_shared_event_id, chain.peer_shared_key.clone()),
             (chain.admin_event_id, chain.admin_key.clone()),
         ];
@@ -155,17 +161,22 @@ struct ChannelInfo {
     id: [u8; 32],
 }
 
+struct FrontendInvite {
+    link: String,
+}
+
 struct Session {
     accounts: Vec<Account>,
     active: usize,
-    invites: Vec<InviteData>,
+    invites: Vec<FrontendInvite>,
     channels: Vec<ChannelInfo>,
 }
 
 impl Session {
     fn new() -> Self {
         let mut default_channel = [0u8; 32];
-        default_channel[..16].copy_from_slice(&hex::decode("0102030405060708090a0b0c0d0e0f10").unwrap());
+        default_channel[..16]
+            .copy_from_slice(&hex::decode("0102030405060708090a0b0c0d0e0f10").unwrap());
         Session {
             accounts: Vec::new(),
             active: 0,
@@ -184,6 +195,20 @@ impl Session {
     fn active_account_mut(&mut self) -> Option<&mut Account> {
         self.accounts.get_mut(self.active)
     }
+
+    fn add_invite(&mut self, link: String) -> usize {
+        self.invites.push(FrontendInvite { link });
+        self.invites.len()
+    }
+
+    fn invite_link_by_number(&self, invite_num: usize) -> Option<&str> {
+        if invite_num == 0 {
+            return None;
+        }
+        self.invites
+            .get(invite_num - 1)
+            .map(|entry| entry.link.as_str())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -191,15 +216,37 @@ impl Session {
 // ---------------------------------------------------------------------------
 
 const COMMANDS: &[&str] = &[
-    "accept-invite", "accept-link", "accounts", "ban", "channel", "channels",
-    "delete", "exit", "help", "identity", "invite", "keys", "link", "messages",
-    "new-channel", "new-workspace", "quit", "react", "reactions",
-    "send", "status", "switch", "users", "workspaces",
+    "accept-invite",
+    "accept-link",
+    "accounts",
+    "ban",
+    "channel",
+    "channels",
+    "delete",
+    "exit",
+    "help",
+    "identity",
+    "invite",
+    "keys",
+    "link",
+    "messages",
+    "new-channel",
+    "new-workspace",
+    "quit",
+    "react",
+    "reactions",
+    "send",
+    "status",
+    "switch",
+    "users",
+    "workspaces",
 ];
 
 const COMMAND_FLAGS: &[(&str, &[&str])] = &[
     ("new-workspace", &["--name", "--username", "--devicename"]),
+    ("invite", &["--bootstrap"]),
     ("accept-invite", &["--username", "--devicename", "--invite"]),
+    ("link", &["--bootstrap"]),
     ("accept-link", &["--devicename", "--invite"]),
     ("keys", &["--summary"]),
 ];
@@ -288,9 +335,9 @@ fn dispatch(
         "react" => cmd_react(session, args, out)?,
         "reactions" => cmd_reactions(session, args, out)?,
         "delete" => cmd_delete(session, args, out)?,
-        "invite" => cmd_invite(session, out)?,
+        "invite" => cmd_invite(session, args, out)?,
         "accept-invite" => cmd_accept_invite(session, args, out)?,
-        "link" => cmd_link(session, out)?,
+        "link" => cmd_link(session, args, out)?,
         "accept-link" => cmd_accept_link(session, args, out)?,
         "switch" => cmd_switch(session, args, out)?,
         "accounts" => cmd_accounts(session, out)?,
@@ -334,10 +381,7 @@ fn run_interactive_tty() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     rl.set_helper(Some(CliHelper));
 
     // Ensure tab triggers completion
-    rl.bind_sequence(
-        rustyline::KeyEvent::from('\t'),
-        rustyline::Cmd::Complete,
-    );
+    rl.bind_sequence(rustyline::KeyEvent::from('\t'), rustyline::Cmd::Complete);
 
     let history_path = dirs_next::home_dir()
         .map(|h| h.join(".poc7_cli_history"))
@@ -425,6 +469,48 @@ fn parse_named_arg<'a>(args: &'a [&str], name: &str) -> Option<&'a str> {
     None
 }
 
+fn resolve_bootstrap_addr(args: &[&str]) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(addr) = parse_named_arg(args, "--bootstrap") {
+        if !addr.trim().is_empty() {
+            return Ok(addr.to_string());
+        }
+    }
+    if let Ok(addr) = std::env::var("POC7_BOOTSTRAP_ADDR") {
+        if !addr.trim().is_empty() {
+            return Ok(addr);
+        }
+    }
+    Err("Missing bootstrap endpoint. Pass --bootstrap <host:port> or set POC7_BOOTSTRAP_ADDR.".into())
+}
+
+fn resolve_invite_ref(
+    session: &Session,
+    invite_ref: &str,
+) -> Result<(String, Option<usize>), Box<dyn std::error::Error + Send + Sync>> {
+    if invite_ref.chars().all(|c| c.is_ascii_digit()) {
+        let invite_num: usize = invite_ref.parse().map_err(|_| "Invalid invite number")?;
+        let link = session.invite_link_by_number(invite_num).ok_or_else(|| {
+            format!(
+                "Invalid invite number {}. Available: 1-{}",
+                invite_num,
+                session.invites.len()
+            )
+        })?;
+        return Ok((link.to_string(), Some(invite_num)));
+    }
+    Ok((invite_ref.to_string(), None))
+}
+
+fn decode_spki_hex(spki_hex: &str) -> Result<[u8; 32], Box<dyn std::error::Error + Send + Sync>> {
+    let raw = hex::decode(spki_hex)?;
+    if raw.len() != 32 {
+        return Err(format!("SPKI fingerprint must be 32 bytes, got {}", raw.len()).into());
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&raw);
+    Ok(out)
+}
+
 fn cmd_new_workspace(
     session: &mut Session,
     args: &[&str],
@@ -474,8 +560,14 @@ fn cmd_send(
         .ok_or("No workspace created. Run 'new-workspace' first.")?;
 
     let conn = open_connection(&account.db_path)?;
-    let peer_shared_eid = account.peer_shared_event_id.ok_or("No signing key. Run 'new-workspace' first.")?;
-    let peer_shared_key = account.peer_shared_key.as_ref().ok_or("No signing key.")?.clone();
+    let peer_shared_eid = account
+        .peer_shared_event_id
+        .ok_or("No signing key. Run 'new-workspace' first.")?;
+    let peer_shared_key = account
+        .peer_shared_key
+        .as_ref()
+        .ok_or("No signing key.")?
+        .clone();
     let msg = ParsedEvent::Message(MessageEvent {
         created_at_ms: now_ms(),
         workspace_id,
@@ -516,24 +608,20 @@ fn cmd_messages(
     )?;
 
     let rows: Vec<(String, String, String, i64)> = stmt
-        .query_map(
-            rusqlite::params![&account.identity],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                ))
-            },
-        )?
+        .query_map(rusqlite::params![&account.identity], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?
         .collect::<Result<Vec<_>, _>>()?;
 
     // Check deleted messages
     let deleted_targets: Vec<String> = {
-        let mut del_stmt = conn.prepare(
-            "SELECT message_id FROM deleted_messages WHERE recorded_by = ?1",
-        )?;
+        let mut del_stmt =
+            conn.prepare("SELECT message_id FROM deleted_messages WHERE recorded_by = ?1")?;
         let result = del_stmt
             .query_map(rusqlite::params![&account.identity], |row| {
                 row.get::<_, String>(0)
@@ -612,15 +700,17 @@ fn cmd_react(
     let msg_num: usize = args[0].parse().map_err(|_| "Invalid message number")?;
     let emoji = args[1];
 
-    let account = session
-        .active_account()
-        .ok_or("No active account.")?;
+    let account = session.active_account().ok_or("No active account.")?;
 
     let conn = open_connection(&account.db_path)?;
     let target_event_id = get_message_event_id_by_num(&conn, &account.identity, msg_num)?;
 
     let peer_shared_eid = account.peer_shared_event_id.ok_or("No signing key.")?;
-    let peer_shared_key = account.peer_shared_key.as_ref().ok_or("No signing key.")?.clone();
+    let peer_shared_key = account
+        .peer_shared_key
+        .as_ref()
+        .ok_or("No signing key.")?
+        .clone();
     let rxn = ParsedEvent::Reaction(ReactionEvent {
         created_at_ms: now_ms(),
         target_event_id,
@@ -630,7 +720,12 @@ fn cmd_react(
         signer_type: 5,
         signature: [0u8; 64],
     });
-    event_id_or_blocked(create_signed_event_sync(&conn, &account.identity, &rxn, &peer_shared_key))?;
+    event_id_or_blocked(create_signed_event_sync(
+        &conn,
+        &account.identity,
+        &rxn,
+        &peer_shared_key,
+    ))?;
 
     writeln!(out, "Reacted {} to message {}", emoji, msg_num)?;
 
@@ -649,17 +744,14 @@ fn cmd_reactions(
 
     let msg_num: usize = args[0].parse().map_err(|_| "Invalid message number")?;
 
-    let account = session
-        .active_account()
-        .ok_or("No active account.")?;
+    let account = session.active_account().ok_or("No active account.")?;
 
     let conn = open_connection(&account.db_path)?;
     let target_event_id = get_message_event_id_by_num(&conn, &account.identity, msg_num)?;
     let target_b64 = event_id_to_base64(&target_event_id);
 
-    let mut stmt = conn.prepare(
-        "SELECT emoji FROM reactions WHERE recorded_by = ?1 AND target_event_id = ?2",
-    )?;
+    let mut stmt = conn
+        .prepare("SELECT emoji FROM reactions WHERE recorded_by = ?1 AND target_event_id = ?2")?;
     let emojis: Vec<String> = stmt
         .query_map(rusqlite::params![&account.identity, &target_b64], |row| {
             row.get::<_, String>(0)
@@ -690,15 +782,17 @@ fn cmd_delete(
 
     let msg_num: usize = args[0].parse().map_err(|_| "Invalid message number")?;
 
-    let account = session
-        .active_account()
-        .ok_or("No active account.")?;
+    let account = session.active_account().ok_or("No active account.")?;
 
     let conn = open_connection(&account.db_path)?;
     let target_event_id = get_message_event_id_by_num(&conn, &account.identity, msg_num)?;
 
     let peer_shared_eid = account.peer_shared_event_id.ok_or("No signing key.")?;
-    let peer_shared_key = account.peer_shared_key.as_ref().ok_or("No signing key.")?.clone();
+    let peer_shared_key = account
+        .peer_shared_key
+        .as_ref()
+        .ok_or("No signing key.")?
+        .clone();
     let del = ParsedEvent::MessageDeletion(MessageDeletionEvent {
         created_at_ms: now_ms(),
         target_event_id,
@@ -707,7 +801,12 @@ fn cmd_delete(
         signer_type: 5,
         signature: [0u8; 64],
     });
-    event_id_or_blocked(create_signed_event_sync(&conn, &account.identity, &del, &peer_shared_key))?;
+    event_id_or_blocked(create_signed_event_sync(
+        &conn,
+        &account.identity,
+        &del,
+        &peer_shared_key,
+    ))?;
 
     writeln!(out, "Deleted message {}", msg_num)?;
 
@@ -716,33 +815,37 @@ fn cmd_delete(
 
 fn cmd_invite(
     session: &mut Session,
+    args: &[&str],
     out: &mut impl Write,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let account = session
-        .active_account()
-        .ok_or("No active account.")?;
+    let account = session.active_account().ok_or("No active account.")?;
 
     let workspace_key = account
         .workspace_key
         .as_ref()
         .ok_or("No workspace key. Only workspace creators can invite.")?
         .clone();
-    let workspace_id = account
-        .workspace_id
-        .ok_or("No network event ID.")?;
+    let workspace_id = account.workspace_id.ok_or("No network event ID.")?;
 
     let conn = open_connection(&account.db_path)?;
-    let invite = identity_ops::create_user_invite(
+    let invite =
+        identity_ops::create_user_invite(&conn, &account.identity, &workspace_key, &workspace_id)?;
+    let pending_spki = expected_invite_bootstrap_spki_from_invite_key(&invite.invite_key)?;
+    crate::db::transport_trust::record_pending_invite_bootstrap_trust(
         &conn,
         &account.identity,
-        &workspace_key,
-        &workspace_id,
+        &event_id_to_base64(&invite.invite_event_id),
+        &event_id_to_base64(&workspace_id),
+        &pending_spki,
     )?;
 
-    let invite_num = session.invites.len() + 1;
-    session.invites.push(invite);
+    let bootstrap_spki = decode_spki_hex(&account.identity)?;
+    let bootstrap_addr = resolve_bootstrap_addr(args)?;
+    let invite_link = create_invite_link(&invite, &bootstrap_addr, &bootstrap_spki)?;
+    let invite_num = session.add_invite(invite_link.clone());
 
     writeln!(out, "Created invite #{}", invite_num)?;
+    writeln!(out, "  link: {}", invite_link)?;
 
     Ok(())
 }
@@ -754,18 +857,31 @@ fn cmd_accept_invite(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let username = parse_named_arg(args, "--username").unwrap_or("user");
     let devicename = parse_named_arg(args, "--devicename").unwrap_or("device");
-    let invite_num: usize = parse_named_arg(args, "--invite")
-        .unwrap_or("1")
-        .parse()
-        .map_err(|_| "Invalid invite number")?;
-
-    if invite_num == 0 || invite_num > session.invites.len() {
-        writeln!(out, "Invalid invite number {}. Available: 1-{}", invite_num, session.invites.len())?;
+    let invite_ref = parse_named_arg(args, "--invite").unwrap_or("1");
+    let (invite_link, invite_num) = match resolve_invite_ref(session, invite_ref) {
+        Ok(v) => v,
+        Err(e) => {
+            writeln!(out, "{}", e)?;
+            return Ok(());
+        }
+    };
+    let invite = match parse_invite_link(&invite_link) {
+        Ok(v) => v,
+        Err(e) => {
+            writeln!(out, "Invalid invite link: {}", e)?;
+            return Ok(());
+        }
+    };
+    if invite.kind != InviteLinkKind::User {
+        writeln!(out, "This is not a user invite link.")?;
+        writeln!(
+            out,
+            "  hint: use 'accept-link' for quiet://link/... invites"
+        )?;
         return Ok(());
     }
 
-    let invite = &session.invites[invite_num - 1];
-    let invite_key = invite.invite_key.clone();
+    let invite_key = invite.invite_signing_key();
     let invite_event_id = invite.invite_event_id;
     let workspace_id = invite.workspace_id;
     let workspace_name = session
@@ -775,13 +891,14 @@ fn cmd_accept_invite(
         .and_then(|a| a.workspace_name.clone());
 
     let mut account = Account::new(username, devicename);
+    account.identity = install_invite_bootstrap_transport_identity(&account.db_path, &invite_key)?;
     account.workspace_id = Some(workspace_id);
     account.workspace_name = workspace_name;
 
     let conn = open_connection(&account.db_path)?;
 
-    // Copy the invite event blob to the new account's database
-    copy_event_chain(session, invite_num - 1, &conn, &account.identity)?;
+    // Copy shared chain needed to validate and project the invite.
+    copy_event_chain(session, workspace_id, &conn, &account.identity)?;
 
     let join = identity_ops::accept_user_invite(
         &conn,
@@ -792,17 +909,30 @@ fn cmd_accept_invite(
         &account.db_path,
     )?;
 
+    crate::db::transport_trust::record_invite_bootstrap_trust(
+        &conn,
+        &account.identity,
+        &event_id_to_base64(&join.invite_accepted_event_id),
+        &event_id_to_base64(&invite_event_id),
+        &event_id_to_base64(&workspace_id),
+        &invite.bootstrap_addr,
+        &invite.bootstrap_spki_fingerprint,
+    )?;
+
     account.store_join_keys(&join);
 
     let user_id = account.short_user_id();
     let peer_id = account.short_peer_id();
     session.accounts.push(account);
     session.active = session.accounts.len() - 1;
+    let invite_label = invite_num
+        .map(|n| format!("#{}", n))
+        .unwrap_or_else(|| "link".to_string());
 
     writeln!(
         out,
-        "Accepted invite #{} as {} ({}) {} {}",
-        invite_num, username, devicename, user_id, peer_id
+        "Accepted invite {} as {} ({}) {} {}",
+        invite_label, username, devicename, user_id, peer_id
     )?;
 
     Ok(())
@@ -810,17 +940,12 @@ fn cmd_accept_invite(
 
 fn cmd_link(
     session: &mut Session,
+    args: &[&str],
     out: &mut impl Write,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let account = session
-        .active_account()
-        .ok_or("No active account.")?;
+    let account = session.active_account().ok_or("No active account.")?;
 
-    let user_key = account
-        .user_key
-        .as_ref()
-        .ok_or("No user key.")?
-        .clone();
+    let user_key = account.user_key.as_ref().ok_or("No user key.")?.clone();
     let user_event_id = account.user_event_id.ok_or("No user event ID.")?;
     let workspace_id = account.workspace_id.ok_or("No network event ID.")?;
 
@@ -832,11 +957,22 @@ fn cmd_link(
         &user_event_id,
         &workspace_id,
     )?;
+    let pending_spki = expected_invite_bootstrap_spki_from_invite_key(&invite.invite_key)?;
+    crate::db::transport_trust::record_pending_invite_bootstrap_trust(
+        &conn,
+        &account.identity,
+        &event_id_to_base64(&invite.invite_event_id),
+        &event_id_to_base64(&workspace_id),
+        &pending_spki,
+    )?;
 
-    let invite_num = session.invites.len() + 1;
-    session.invites.push(invite);
+    let bootstrap_spki = decode_spki_hex(&account.identity)?;
+    let bootstrap_addr = resolve_bootstrap_addr(args)?;
+    let invite_link = create_invite_link(&invite, &bootstrap_addr, &bootstrap_spki)?;
+    let invite_num = session.add_invite(invite_link.clone());
 
     writeln!(out, "Created device link invite #{}", invite_num)?;
+    writeln!(out, "  link: {}", invite_link)?;
 
     Ok(())
 }
@@ -847,18 +983,31 @@ fn cmd_accept_link(
     out: &mut impl Write,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let devicename = parse_named_arg(args, "--devicename").unwrap_or("device2");
-    let invite_num: usize = parse_named_arg(args, "--invite")
-        .unwrap_or("1")
-        .parse()
-        .map_err(|_| "Invalid invite number")?;
-
-    if invite_num == 0 || invite_num > session.invites.len() {
-        writeln!(out, "Invalid invite number {}. Available: 1-{}", invite_num, session.invites.len())?;
+    let invite_ref = parse_named_arg(args, "--invite").unwrap_or("1");
+    let (invite_link, invite_num) = match resolve_invite_ref(session, invite_ref) {
+        Ok(v) => v,
+        Err(e) => {
+            writeln!(out, "{}", e)?;
+            return Ok(());
+        }
+    };
+    let invite = match parse_invite_link(&invite_link) {
+        Ok(v) => v,
+        Err(e) => {
+            writeln!(out, "Invalid invite link: {}", e)?;
+            return Ok(());
+        }
+    };
+    if invite.kind != InviteLinkKind::DeviceLink {
+        writeln!(out, "This is not a device link invite.")?;
+        writeln!(
+            out,
+            "  hint: use 'accept-invite' for quiet://invite/... links"
+        )?;
         return Ok(());
     }
 
-    let invite = &session.invites[invite_num - 1];
-    let device_invite_key = invite.invite_key.clone();
+    let device_invite_key = invite.invite_signing_key();
     let device_invite_event_id = invite.invite_event_id;
     let workspace_id = invite.workspace_id;
     let workspace_name = session
@@ -867,10 +1016,10 @@ fn cmd_accept_link(
         .find(|a| a.workspace_id == Some(workspace_id))
         .and_then(|a| a.workspace_name.clone());
 
-    // Get the username from the inviting account for the device link
+    // Get the username from the inviting account for the device link.
     let username = match &invite.invite_type {
         InviteType::DeviceLink { .. } => {
-            // Find the account that created this invite by checking who has the matching user_event_id
+            // Find the account that created this invite by checking matching user_event_id.
             let mut found_name = "user".to_string();
             for acct in &session.accounts {
                 if let InviteType::DeviceLink { user_event_id } = &invite.invite_type {
@@ -886,13 +1035,15 @@ fn cmd_accept_link(
     };
 
     let mut account = Account::new(&username, devicename);
+    account.identity =
+        install_invite_bootstrap_transport_identity(&account.db_path, &device_invite_key)?;
     account.workspace_id = Some(workspace_id);
     account.workspace_name = workspace_name;
 
     let conn = open_connection(&account.db_path)?;
 
-    // Copy the event chain to the new account's database
-    copy_event_chain(session, invite_num - 1, &conn, &account.identity)?;
+    // Copy shared chain needed to validate and project the invite.
+    copy_event_chain(session, workspace_id, &conn, &account.identity)?;
 
     let link = identity_ops::accept_device_link(
         &conn,
@@ -903,16 +1054,29 @@ fn cmd_accept_link(
         &account.db_path,
     )?;
 
+    crate::db::transport_trust::record_invite_bootstrap_trust(
+        &conn,
+        &account.identity,
+        &event_id_to_base64(&link.invite_accepted_event_id),
+        &event_id_to_base64(&device_invite_event_id),
+        &event_id_to_base64(&workspace_id),
+        &invite.bootstrap_addr,
+        &invite.bootstrap_spki_fingerprint,
+    )?;
+
     account.store_link_keys(&link);
 
     let peer_id = account.short_peer_id();
     session.accounts.push(account);
     session.active = session.accounts.len() - 1;
+    let invite_label = invite_num
+        .map(|n| format!("#{}", n))
+        .unwrap_or_else(|| "link".to_string());
 
     writeln!(
         out,
-        "Accepted device link #{} as {} ({}) {}",
-        invite_num, username, devicename, peer_id
+        "Accepted device link {} as {} ({}) {}",
+        invite_label, username, devicename, peer_id
     )?;
 
     Ok(())
@@ -930,7 +1094,11 @@ fn cmd_switch(
 
     let num: usize = args[0].parse().map_err(|_| "Invalid account number")?;
     if num == 0 || num > session.accounts.len() {
-        writeln!(out, "Invalid account number. Available: 1-{}", session.accounts.len())?;
+        writeln!(
+            out,
+            "Invalid account number. Available: 1-{}",
+            session.accounts.len()
+        )?;
         return Ok(());
     }
 
@@ -1025,7 +1193,11 @@ fn cmd_channel(
 
     let num: usize = args[0].parse().map_err(|_| "Invalid channel number")?;
     if num == 0 || num > session.channels.len() {
-        writeln!(out, "Invalid channel number. Available: 1-{}", session.channels.len())?;
+        writeln!(
+            out,
+            "Invalid channel number. Available: 1-{}",
+            session.channels.len()
+        )?;
         return Ok(());
     }
 
@@ -1045,15 +1217,11 @@ fn cmd_users(
     session: &Session,
     out: &mut impl Write,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let account = session
-        .active_account()
-        .ok_or("No active account.")?;
+    let account = session.active_account().ok_or("No active account.")?;
 
     let conn = open_connection(&account.db_path)?;
 
-    let mut stmt = conn.prepare(
-        "SELECT event_id, public_key FROM users WHERE recorded_by = ?1",
-    )?;
+    let mut stmt = conn.prepare("SELECT event_id, public_key FROM users WHERE recorded_by = ?1")?;
     let users: Vec<(String, Vec<u8>)> = stmt
         .query_map(rusqlite::params![&account.identity], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
@@ -1077,9 +1245,7 @@ fn cmd_keys(
     args: &[&str],
     out: &mut impl Write,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let account = session
-        .active_account()
-        .ok_or("No active account.")?;
+    let account = session.active_account().ok_or("No active account.")?;
 
     let summary = args.contains(&"--summary");
     let conn = open_connection(&account.db_path)?;
@@ -1123,9 +1289,7 @@ fn cmd_keys(
         writeln!(out, "KEYS:")?;
 
         // Users
-        let mut stmt = conn.prepare(
-            "SELECT event_id FROM users WHERE recorded_by = ?1",
-        )?;
+        let mut stmt = conn.prepare("SELECT event_id FROM users WHERE recorded_by = ?1")?;
         let users: Vec<String> = stmt
             .query_map(rusqlite::params![&account.identity], |row| {
                 row.get::<_, String>(0)
@@ -1137,9 +1301,7 @@ fn cmd_keys(
         }
 
         // Peers
-        let mut stmt = conn.prepare(
-            "SELECT event_id FROM peers_shared WHERE recorded_by = ?1",
-        )?;
+        let mut stmt = conn.prepare("SELECT event_id FROM peers_shared WHERE recorded_by = ?1")?;
         let peers: Vec<String> = stmt
             .query_map(rusqlite::params![&account.identity], |row| {
                 row.get::<_, String>(0)
@@ -1151,9 +1313,7 @@ fn cmd_keys(
         }
 
         // Admins
-        let mut stmt = conn.prepare(
-            "SELECT event_id FROM admins WHERE recorded_by = ?1",
-        )?;
+        let mut stmt = conn.prepare("SELECT event_id FROM admins WHERE recorded_by = ?1")?;
         let admins: Vec<String> = stmt
             .query_map(rusqlite::params![&account.identity], |row| {
                 row.get::<_, String>(0)
@@ -1172,15 +1332,12 @@ fn cmd_workspaces(
     session: &Session,
     out: &mut impl Write,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let account = session
-        .active_account()
-        .ok_or("No active account.")?;
+    let account = session.active_account().ok_or("No active account.")?;
 
     let conn = open_connection(&account.db_path)?;
 
-    let mut stmt = conn.prepare(
-        "SELECT event_id, workspace_id FROM workspaces WHERE recorded_by = ?1",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT event_id, workspace_id FROM workspaces WHERE recorded_by = ?1")?;
     let workspaces: Vec<(String, String)> = stmt
         .query_map(rusqlite::params![&account.identity], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -1201,13 +1358,7 @@ fn cmd_workspaces(
             } else {
                 workspace_id_b64.clone()
             };
-            writeln!(
-                out,
-                "  {}. {} ({})",
-                i + 1,
-                label,
-                &eid[..eid.len().min(8)]
-            )?;
+            writeln!(out, "  {}. {} ({})", i + 1, label, &eid[..eid.len().min(8)])?;
         }
     }
 
@@ -1218,9 +1369,7 @@ fn cmd_status(
     session: &Session,
     out: &mut impl Write,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let account = session
-        .active_account()
-        .ok_or("No active account.")?;
+    let account = session.active_account().ok_or("No active account.")?;
 
     let conn = open_connection(&account.db_path)?;
 
@@ -1271,9 +1420,7 @@ fn cmd_identity(
     session: &Session,
     out: &mut impl Write,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let account = session
-        .active_account()
-        .ok_or("No active account.")?;
+    let account = session.active_account().ok_or("No active account.")?;
 
     writeln!(out, "IDENTITY:")?;
     writeln!(out, "  Transport: {}", account.identity)?;
@@ -1295,9 +1442,7 @@ fn cmd_ban(
 
     let user_num: usize = args[0].parse().map_err(|_| "Invalid user number")?;
 
-    let account = session
-        .active_account()
-        .ok_or("No active account.")?;
+    let account = session.active_account().ok_or("No active account.")?;
 
     let peer_shared_key = account
         .peer_shared_key
@@ -1311,9 +1456,7 @@ fn cmd_ban(
     let conn = open_connection(&account.db_path)?;
 
     // Look up the user event by number
-    let mut stmt = conn.prepare(
-        "SELECT event_id FROM users WHERE recorded_by = ?1",
-    )?;
+    let mut stmt = conn.prepare("SELECT event_id FROM users WHERE recorded_by = ?1")?;
     let users: Vec<String> = stmt
         .query_map(rusqlite::params![&account.identity], |row| {
             row.get::<_, String>(0)
@@ -1326,8 +1469,8 @@ fn cmd_ban(
     }
 
     let target_eid_b64 = &users[user_num - 1];
-    let target_event_id = crate::crypto::event_id_from_base64(target_eid_b64)
-        .ok_or("Invalid event ID")?;
+    let target_event_id =
+        crate::crypto::event_id_from_base64(target_eid_b64).ok_or("Invalid event ID")?;
 
     // Find peer_shared events associated with this user
     // For now, create UserRemoved targeting the user event
@@ -1354,39 +1497,90 @@ fn cmd_help(out: &mut impl Write) -> Result<(), Box<dyn std::error::Error + Send
     writeln!(out, "COMMANDS:")?;
     writeln!(out)?;
     writeln!(out, "  Workspace setup:")?;
-    writeln!(out, "    new-workspace --name <name> --username <username> --devicename <device>")?;
+    writeln!(
+        out,
+        "    new-workspace --name <name> --username <username> --devicename <device>"
+    )?;
     writeln!(out)?;
     writeln!(out, "  Joining/linking:")?;
-    writeln!(out, "    invite                           Create invite for new user")?;
-    writeln!(out, "    accept-invite --username <name> --devicename <device> --invite <n>")?;
-    writeln!(out, "    link                             Create device link invite")?;
-    writeln!(out, "    accept-link --devicename <device> --invite <n>")?;
+    writeln!(
+        out,
+        "    invite --bootstrap <host:port>  Create invite for new user"
+    )?;
+    writeln!(
+        out,
+        "    accept-invite --username <name> --devicename <device> --invite <n|link>"
+    )?;
+    writeln!(
+        out,
+        "    link --bootstrap <host:port>    Create device link invite"
+    )?;
+    writeln!(
+        out,
+        "    accept-link --devicename <device> --invite <n|link>"
+    )?;
     writeln!(out)?;
     writeln!(out, "  Account management:")?;
-    writeln!(out, "    switch <n>                       Select account #n")?;
-    writeln!(out, "    accounts                         List all accounts")?;
-    writeln!(out, "    users                            List all users in workspace")?;
-    writeln!(out, "    identity                         Show identity info")?;
+    writeln!(
+        out,
+        "    switch <n>                       Select account #n"
+    )?;
+    writeln!(
+        out,
+        "    accounts                         List all accounts"
+    )?;
+    writeln!(
+        out,
+        "    users                            List all users in workspace"
+    )?;
+    writeln!(
+        out,
+        "    identity                         Show identity info"
+    )?;
     writeln!(out)?;
     writeln!(out, "  Channels:")?;
-    writeln!(out, "    channel <n>                      Select channel #n")?;
-    writeln!(out, "    new-channel <name>               Create new channel")?;
-    writeln!(out, "    channels                         List all channels")?;
+    writeln!(
+        out,
+        "    channel <n>                      Select channel #n"
+    )?;
+    writeln!(
+        out,
+        "    new-channel <name>               Create new channel"
+    )?;
+    writeln!(
+        out,
+        "    channels                         List all channels"
+    )?;
     writeln!(out)?;
     writeln!(out, "  Messaging:")?;
     writeln!(out, "    send <message>                   Send message")?;
     writeln!(out, "    messages                         List messages")?;
-    writeln!(out, "    delete <n>                       Delete message #n")?;
-    writeln!(out, "    react <n> <emoji>                React to message #n")?;
-    writeln!(out, "    reactions <n>                    Show reactions on message #n")?;
+    writeln!(
+        out,
+        "    delete <n>                       Delete message #n"
+    )?;
+    writeln!(
+        out,
+        "    react <n> <emoji>                React to message #n"
+    )?;
+    writeln!(
+        out,
+        "    reactions <n>                    Show reactions on message #n"
+    )?;
     writeln!(out)?;
     writeln!(out, "  Admin:")?;
     writeln!(out, "    ban <n>                          Remove user #n")?;
     writeln!(out)?;
     writeln!(out, "  Other:")?;
-    writeln!(out, "    keys [--summary]                 Show cryptographic keys")?;
+    writeln!(
+        out,
+        "    keys [--summary]                 Show cryptographic keys"
+    )?;
     writeln!(out, "    workspaces                       List workspaces")?;
-    writeln!(out, "    status                           Show database stats")?;
+    writeln!(
+        out,
+        "    status                           Show database stats"
+    )?;
     writeln!(out, "    help                             Show this help")?;
     writeln!(out, "    quit                             Exit")?;
 
@@ -1417,7 +1611,12 @@ fn get_message_event_id_by_num(
         .collect::<Result<Vec<_>, _>>()?;
 
     if msg_num == 0 || msg_num > ids.len() {
-        return Err(format!("Invalid message number {}. Available: 1-{}", msg_num, ids.len()).into());
+        return Err(format!(
+            "Invalid message number {}. Available: 1-{}",
+            msg_num,
+            ids.len()
+        )
+        .into());
     }
 
     crate::crypto::event_id_from_base64(&ids[msg_num - 1])
@@ -1429,19 +1628,16 @@ fn get_message_event_id_by_num(
 /// Only copies shared events (not local-only) and fails fast on projection errors.
 fn copy_event_chain(
     session: &Session,
-    invite_idx: usize,
+    workspace_id: EventId,
     target_conn: &rusqlite::Connection,
     target_recorded_by: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let invite = &session.invites[invite_idx];
-    let workspace_id = invite.workspace_id;
-
-    // Find the source account that has the workspace event
+    // Find the source account that has this workspace event.
     let source_account = session
         .accounts
         .iter()
         .find(|a| a.workspace_id == Some(workspace_id))
-        .ok_or("Cannot find source account for invite")?;
+        .ok_or("Cannot find source account for invite workspace")?;
 
     let source_conn = open_connection(&source_account.db_path)?;
 

@@ -10,6 +10,7 @@ use crate::db::{
     open_connection,
     health::record_endpoint_observation,
     intro::{insert_intro_attempt, intro_already_seen, update_intro_status},
+    transport_trust::is_peer_allowed,
 };
 use crate::sync::{SyncMessage, parse_sync_message};
 use crate::sync::engine::run_sync_initiator_dual;
@@ -82,8 +83,12 @@ pub async fn handle_intro_offer(
         return;
     }
 
-    // Validate trust
-    if !allowed_peers.contains(&other_peer_id) {
+    // Validate trust from SQL plus optional CLI fallback pins.
+    let trusted = match open_connection(db_path) {
+        Ok(db) => is_peer_allowed(&db, recorded_by, &other_peer_id, allowed_peers).unwrap_or(false),
+        Err(_) => allowed_peers.contains(&other_peer_id),
+    };
+    if !trusted {
         info!("IntroOffer for untrusted peer {}, rejecting", &other_peer_hex[..16]);
         let _ = try_record_intro(
             db_path, recorded_by, &intro_id, introduced_by, &other_peer_hex,

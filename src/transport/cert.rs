@@ -1,8 +1,9 @@
-use blake2::{Blake2b, Digest};
 use blake2::digest::consts::U32;
+use blake2::{Blake2b, Digest};
+use ed25519_dalek::pkcs8::EncodePrivateKey;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
-use rcgen::generate_simple_self_signed;
+use rcgen::{generate_simple_self_signed, Certificate, CertificateParams, KeyPair, PKCS_ED25519};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use std::io::Write;
 use std::path::Path;
@@ -30,6 +31,34 @@ pub fn generate_self_signed_cert() -> Result<
     Ok((cert_der, key_der))
 }
 
+/// Generate a deterministic self-signed Ed25519 certificate from an existing
+/// signing key. This is used for invite bootstrap identities so both inviter
+/// and invitee can derive the same expected transport SPKI fingerprint.
+pub fn generate_self_signed_cert_from_signing_key(
+    signing_key: &SigningKey,
+) -> Result<
+    (CertificateDer<'static>, PrivatePkcs8KeyDer<'static>),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
+    let pkcs8 = signing_key.to_pkcs8_der()?;
+    let key_bytes = pkcs8.as_bytes().to_vec();
+
+    let key_pair = KeyPair::from_der(&key_bytes)
+        .map_err(|e| format!("failed to parse invite signing key as PKCS#8: {}", e))?;
+
+    let mut params = CertificateParams::new(vec!["localhost".to_string()]);
+    params.alg = &PKCS_ED25519;
+    params.key_pair = Some(key_pair);
+
+    let cert = Certificate::from_params(params)
+        .map_err(|e| format!("failed to build deterministic certificate params: {}", e))?;
+    let cert_der = CertificateDer::from(cert.serialize_der()?);
+    let key_der = PrivatePkcs8KeyDer::from(key_bytes);
+
+    validate_cert_key_match(&cert_der, &key_der)?;
+    Ok((cert_der, key_der))
+}
+
 /// Load a cert/key from disk, or generate and save new ones.
 ///
 /// Persistence hardening:
@@ -51,17 +80,32 @@ pub fn load_or_generate_cert(
         validate_cert_key_match(&cert_der, &key_der)?;
         #[cfg(unix)]
         if let Err(e) = set_owner_only_permissions(key_path) {
-            eprintln!("warning: could not normalize key permissions on {}: {}", key_path.display(), e);
+            eprintln!(
+                "warning: could not normalize key permissions on {}: {}",
+                key_path.display(),
+                e
+            );
         }
         Ok((cert_der, key_der))
     } else {
         let (cert_der, key_der) = generate_self_signed_cert()?;
-        atomic_write(cert_path, cert_der.as_ref())?;
-        atomic_write(key_path, key_der.secret_pkcs8_der())?;
-        #[cfg(unix)]
-        set_owner_only_permissions(key_path)?;
+        write_cert_and_key(cert_path, key_path, &cert_der, &key_der)?;
         Ok((cert_der, key_der))
     }
+}
+
+/// Persist certificate and private key atomically.
+pub fn write_cert_and_key(
+    cert_path: &Path,
+    key_path: &Path,
+    cert_der: &CertificateDer<'_>,
+    key_der: &PrivatePkcs8KeyDer<'_>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    atomic_write(cert_path, cert_der.as_ref())?;
+    atomic_write(key_path, key_der.secret_pkcs8_der())?;
+    #[cfg(unix)]
+    set_owner_only_permissions(key_path)?;
+    Ok(())
 }
 
 /// Write data atomically: write to a temporary sibling file, fsync, then rename.
@@ -108,14 +152,17 @@ fn validate_cert_key_match(
              private key's public component ({} bytes)",
             cert_spki.len(),
             key_spki.len(),
-        ).into());
+        )
+        .into());
     }
 
     Ok(())
 }
 
 /// Extract SPKI from a DER-encoded certificate and hash it with BLAKE2b-256.
-pub fn extract_spki_fingerprint(cert_der: &[u8]) -> Result<[u8; 32], Box<dyn std::error::Error + Send + Sync>> {
+pub fn extract_spki_fingerprint(
+    cert_der: &[u8],
+) -> Result<[u8; 32], Box<dyn std::error::Error + Send + Sync>> {
     let (_, cert) = X509Certificate::from_der(cert_der)
         .map_err(|e| format!("failed to parse X.509 certificate: {}", e))?;
     let spki_bytes = cert.public_key().raw;
@@ -140,11 +187,28 @@ mod tests {
     #[test]
     fn test_generate_cert() {
         let result = generate_self_signed_cert();
-        assert!(result.is_ok(), "Failed to generate cert: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to generate cert: {:?}",
+            result.err()
+        );
 
         let (cert_der, key_der) = result.unwrap();
         assert!(!cert_der.is_empty());
         assert!(!key_der.secret_pkcs8_der().is_empty());
+    }
+
+    #[test]
+    fn test_deterministic_cert_from_signing_key() {
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        let (cert1, key1) = generate_self_signed_cert_from_signing_key(&key).unwrap();
+        let (cert2, key2) = generate_self_signed_cert_from_signing_key(&key).unwrap();
+
+        let fp1 = extract_spki_fingerprint(cert1.as_ref()).unwrap();
+        let fp2 = extract_spki_fingerprint(cert2.as_ref()).unwrap();
+        assert_eq!(fp1, fp2);
+        assert_eq!(cert1.as_ref(), cert2.as_ref());
+        assert_eq!(key1.secret_pkcs8_der(), key2.secret_pkcs8_der());
     }
 
     #[test]
@@ -213,9 +277,16 @@ mod tests {
 
         // Loading must detect the mismatch: cert SPKI != private key's public SPKI
         let result = load_or_generate_cert(&cert_path, &key_path);
-        assert!(result.is_err(), "expected error for mismatched cert/key pair");
+        assert!(
+            result.is_err(),
+            "expected error for mismatched cert/key pair"
+        );
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("cert/key mismatch"), "error should mention mismatch: {}", err);
+        assert!(
+            err.contains("cert/key mismatch"),
+            "error should mention mismatch: {}",
+            err
+        );
     }
 
     #[cfg(unix)]
@@ -231,6 +302,10 @@ mod tests {
 
         let metadata = std::fs::metadata(&key_path).unwrap();
         let mode = metadata.permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "private key should be owner-only (0600), got {:o}", mode);
+        assert_eq!(
+            mode, 0o600,
+            "private key should be owner-only (0600), got {:o}",
+            mode
+        );
     }
 }

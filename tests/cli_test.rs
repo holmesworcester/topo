@@ -1,5 +1,11 @@
-use std::process::{Command, Child, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::Duration;
+
+use poc_7::db::{
+    open_connection,
+    schema::create_tables,
+    transport_trust::{record_invite_bootstrap_trust, record_pending_invite_bootstrap_trust},
+};
 
 fn bin() -> String {
     env!("CARGO_BIN_EXE_poc-7").to_string()
@@ -21,7 +27,11 @@ fn get_identity(db: &str) -> String {
         .arg(db)
         .output()
         .expect("failed to run transport-identity");
-    assert!(output.status.success(), "transport-identity failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "transport-identity failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
@@ -54,7 +64,11 @@ fn send_message(db: &str, content: &str) {
         .arg(db)
         .output()
         .expect("failed to run send");
-    assert!(output.status.success(), "send failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "send failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn assert_now(db: &str, predicate: &str) {
@@ -117,6 +131,51 @@ fn get_messages(db: &str) -> Vec<String> {
         .collect()
 }
 
+fn seed_invite_bootstrap_trust(
+    db: &str,
+    recorded_by: &str,
+    trusted_peer_fp_hex: &str,
+    bootstrap_addr: &str,
+) {
+    let conn = open_connection(db).expect("failed to open db for bootstrap trust seed");
+    create_tables(&conn).expect("failed to create schema for bootstrap trust seed");
+
+    let raw = hex::decode(trusted_peer_fp_hex).expect("trusted peer fingerprint must be valid hex");
+    assert_eq!(raw.len(), 32, "trusted peer fingerprint must be 32 bytes");
+    let mut fp = [0u8; 32];
+    fp.copy_from_slice(&raw);
+
+    record_invite_bootstrap_trust(
+        &conn,
+        recorded_by,
+        "ia_bootstrap",
+        "invite_bootstrap",
+        "workspace_bootstrap",
+        bootstrap_addr,
+        &fp,
+    )
+    .expect("failed to insert invite bootstrap trust row");
+}
+
+fn seed_pending_invite_bootstrap_trust(db: &str, recorded_by: &str, expected_peer_fp_hex: &str) {
+    let conn = open_connection(db).expect("failed to open db for pending bootstrap trust seed");
+    create_tables(&conn).expect("failed to create schema for pending bootstrap trust seed");
+
+    let raw =
+        hex::decode(expected_peer_fp_hex).expect("expected peer fingerprint must be valid hex");
+    assert_eq!(raw.len(), 32, "expected peer fingerprint must be 32 bytes");
+    let mut fp = [0u8; 32];
+    fp.copy_from_slice(&raw);
+
+    record_pending_invite_bootstrap_trust(
+        &conn,
+        recorded_by,
+        "invite_pending_bootstrap",
+        "workspace_bootstrap",
+        &fp,
+    )
+    .expect("failed to insert pending bootstrap trust row");
+}
 
 /// Functional sync test. Uses --pin-peer for CLI bootstrap (not testing pinning policy).
 #[test]
@@ -285,7 +344,12 @@ fn test_cli_unpinned_peer_rejected() {
 #[test]
 fn test_cli_empty_pin_peer_fails() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let db = tmpdir.path().join("empty_pin.db").to_str().unwrap().to_string();
+    let db = tmpdir
+        .path()
+        .join("empty_pin.db")
+        .to_str()
+        .unwrap()
+        .to_string();
     let port = random_port();
 
     // Start sync with no --pin-peer flags — should fail immediately
@@ -310,4 +374,55 @@ fn test_cli_empty_pin_peer_fails() {
         "error should mention --pin-peer, got: {}",
         stderr
     );
+}
+
+#[test]
+fn test_cli_sync_bootstrap_from_accepted_invite_data() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let alice_db = tmpdir
+        .path()
+        .join("alice_bootstrap.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let bob_db = tmpdir
+        .path()
+        .join("bob_bootstrap.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let timeout_ms = 15000;
+
+    let alice_port = random_port();
+    let bob_port = random_port();
+
+    let alice_fp = get_identity(&alice_db);
+    let bob_fp = get_identity(&bob_db);
+
+    // Simulate accepted invite link state:
+    // Bob trusts Alice from accepted invite metadata.
+    seed_invite_bootstrap_trust(
+        &bob_db,
+        &bob_fp,
+        &alice_fp,
+        &format!("127.0.0.1:{}", alice_port),
+    );
+    // Alice trusts Bob from pending invite bootstrap metadata.
+    seed_pending_invite_bootstrap_trust(&alice_db, &alice_fp, &bob_fp);
+
+    // No CLI pins required when bootstrap trust is present in SQL.
+    let mut alice = start_sync(&alice_db, alice_port, None, &[]);
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Bob connects with no --pin-peer flags; trust is read from SQL.
+    let mut bob = start_sync(&bob_db, bob_port, Some(alice_port), &[]);
+    std::thread::sleep(Duration::from_secs(1));
+
+    send_message(&bob_db, "bootstrap trust from invite data");
+    assert_eventually(&alice_db, "store_count >= 1", timeout_ms);
+
+    let _ = alice.kill();
+    let _ = bob.kill();
+    let _ = alice.wait();
+    let _ = bob.wait();
 }
