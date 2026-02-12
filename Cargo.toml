@@ -33,9 +33,21 @@ serde_json = "1"
 
 [dev-dependencies]
 
-# Crypto deps are ~90x slower in debug mode; optimize them even in tests.
+# Crypto deps are orders of magnitude slower in debug mode; optimize them even in tests.
 [profile.dev.package.ed25519-dalek]
 opt-level = 3
 
 [profile.dev.package.curve25519-dalek]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3
+
+[profile.dev.package.aes-gcm]
+opt-level = 3
+
+[profile.dev.package.aes]
 opt-level = 3
