@@ -10,7 +10,7 @@ use ed25519_dalek::SigningKey;
 use poc_7::crypto::EventId;
 use poc_7::db::{
     open_connection,
-    schema::{backfill_legacy_messages, count_legacy_messages, create_tables},
+    schema::create_tables,
     transport_trust::{allowed_peers_combined, is_peer_allowed},
 };
 use poc_7::events::{
@@ -94,13 +94,6 @@ enum Commands {
         db: String,
         #[arg(short = 'n', long, default_value = "0102030405060708090a0b0c0d0e0f10")]
         workspace: String,
-    },
-
-    /// Backfill legacy messages to the local transport identity (cert/key/SPKI)
-    #[command(name = "backfill-transport-identity")]
-    BackfillTransportIdentity {
-        #[arg(short, long, default_value = "server.db")]
-        db: String,
     },
 
     /// Assert a predicate holds right now (exit 0 = pass, exit 1 = fail)
@@ -255,9 +248,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         } => {
             generate_messages(&db, count, &workspace)?;
         }
-        Commands::BackfillTransportIdentity { db } => {
-            backfill_identity(&db)?;
-        }
         Commands::AssertNow { predicate, db } => {
             let code = run_assert_now(&db, &predicate)?;
             std::process::exit(code);
@@ -319,26 +309,6 @@ fn run_identity(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + 
     let (cert_der, _) = load_or_generate_cert(&cert_path, &key_path)?;
     let fp = extract_spki_fingerprint(cert_der.as_ref())?;
     println!("{}", hex::encode(fp));
-    Ok(())
-}
-
-fn backfill_identity(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let recorded_by = ensure_transport_peer_id_from_db(db_path)?;
-    let db = open_connection(db_path)?;
-    create_tables(&db)?;
-
-    let legacy_count = count_legacy_messages(&db)?;
-    if legacy_count == 0 {
-        println!("No legacy messages to backfill.");
-        return Ok(());
-    }
-
-    let updated = backfill_legacy_messages(&db, &recorded_by)?;
-    println!(
-        "Backfilled {} legacy messages to identity {}",
-        updated,
-        &recorded_by[..16]
-    );
     Ok(())
 }
 
@@ -548,7 +518,6 @@ fn stable_author_id(peer_id: &str) -> [u8; 32] {
 fn ensure_local_signer_tables(
     db: &rusqlite::Connection,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Canonical local signer pointer for this transport identity.
     db.execute(
         "CREATE TABLE IF NOT EXISTS local_peer_signers (
             recorded_by TEXT PRIMARY KEY,
@@ -556,11 +525,6 @@ fn ensure_local_signer_tables(
             signing_key BLOB NOT NULL,
             updated_at INTEGER NOT NULL
         )",
-        [],
-    )?;
-    // Legacy table retained for backward compatibility with older builds.
-    db.execute(
-        "CREATE TABLE IF NOT EXISTS local_signing_keys (event_id TEXT PRIMARY KEY, signing_key BLOB NOT NULL)",
         [],
     )?;
     Ok(())
@@ -597,11 +561,6 @@ fn persist_local_peer_signer(
             now
         ],
     )?;
-    // Keep legacy rows up to date so downgrades remain usable.
-    db.execute(
-        "INSERT OR REPLACE INTO local_signing_keys (event_id, signing_key) VALUES (?1, ?2)",
-        rusqlite::params![event_id_b64, signing_key.to_bytes().as_slice()],
-    )?;
     Ok(())
 }
 
@@ -628,28 +587,6 @@ fn load_local_peer_signer(
         let signing_key = decode_signing_key(key_bytes)?;
         let eid = poc_7::crypto::event_id_from_base64(&eid_b64)
             .ok_or("bad local peer signer event_id")?;
-        return Ok(Some((eid, signing_key)));
-    }
-
-    // Backward-compat: recover from legacy local_signing_keys rows if possible.
-    let legacy: Option<(String, Vec<u8>)> = db
-        .query_row(
-            "SELECT l.event_id, l.signing_key
-             FROM local_signing_keys l
-             INNER JOIN peers_shared p
-               ON p.recorded_by = ?1 AND p.event_id = l.event_id
-             ORDER BY p.rowid DESC
-             LIMIT 1",
-            rusqlite::params![recorded_by],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
-        )
-        .optional()?;
-
-    if let Some((eid_b64, key_bytes)) = legacy {
-        let signing_key = decode_signing_key(key_bytes)?;
-        let eid = poc_7::crypto::event_id_from_base64(&eid_b64)
-            .ok_or("bad legacy local signer event_id")?;
-        persist_local_peer_signer(db, recorded_by, &eid_b64, &signing_key)?;
         return Ok(Some((eid, signing_key)));
     }
 
@@ -804,20 +741,12 @@ fn show_status(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + S
         )
         .unwrap_or(0);
 
-    let legacy_count = count_legacy_messages(&db)?;
-
     println!("STATUS ({}):", db_path);
     println!("  Events:    {} total", events_count);
     println!("  Messages:  {} projected", messages_count);
     println!("  Reactions: {} projected", reactions_count);
     println!("  Recorded:  {} events", recorded_events_count);
     println!("  NegItems:  {} indexed", neg_items_count);
-    if legacy_count > 0 {
-        println!(
-            "  Legacy:    {} unscoped messages (run 'backfill-transport-identity' to assign)",
-            legacy_count
-        );
-    }
 
     Ok(())
 }

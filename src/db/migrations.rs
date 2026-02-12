@@ -177,11 +177,6 @@ static MIGRATIONS: &[Migration] = &[
                 workspace_id TEXT NOT NULL
             );
 
-            CREATE TABLE IF NOT EXISTS invite_workspace_bindings (
-                peer_id TEXT NOT NULL PRIMARY KEY,
-                workspace_id TEXT NOT NULL
-            );
-
             CREATE TABLE IF NOT EXISTS workspaces (
                 recorded_by TEXT NOT NULL,
                 event_id TEXT NOT NULL,
@@ -298,10 +293,7 @@ static MIGRATIONS: &[Migration] = &[
         version: 12,
         name: "retire_invite_workspace_bindings",
         sql: "
-            -- invite_workspace_bindings is no longer used by runtime logic.
-            -- Trust anchor binding now derives directly from invite_accepted event fields.
-            -- Table is retained for backward compatibility; no runtime code reads or writes it.
-            -- No destructive cleanup: existing rows are harmless and preserved for forensics.
+            -- Historical no-op migration retained for ordering compatibility.
             SELECT 1;
         ",
     },
@@ -483,6 +475,15 @@ static MIGRATIONS: &[Migration] = &[
                 ON invite_bootstrap_trust(recorded_by, superseded_at, expires_at);
         ",
     },
+    Migration {
+        version: 23,
+        name: "drop_retired_compat_tables",
+        sql: "
+            DROP TABLE IF EXISTS shareable_events;
+            DROP TABLE IF EXISTS invite_workspace_bindings;
+            DROP TABLE IF EXISTS local_signing_keys;
+        ",
+    },
 ];
 
 fn ensure_schema_migrations(conn: &Connection) -> SqliteResult<()> {
@@ -601,6 +602,60 @@ mod tests {
     }
 
     #[test]
+    fn test_migration_23_drops_retired_tables() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+
+        conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS shareable_events (
+                id TEXT PRIMARY KEY,
+                stored_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS invite_workspace_bindings (
+                peer_id TEXT PRIMARY KEY,
+                workspace_id TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS local_signing_keys (
+                event_id TEXT PRIMARY KEY,
+                signing_key BLOB NOT NULL
+            );
+            ",
+        )
+        .unwrap();
+        conn.execute("DELETE FROM schema_migrations WHERE version = 23", [])
+            .unwrap();
+
+        run_migrations(&conn).unwrap();
+
+        let has_shareable_events: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='shareable_events'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let has_invite_workspace_bindings: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='invite_workspace_bindings'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let has_local_signing_keys: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='local_signing_keys'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert!(!has_shareable_events);
+        assert!(!has_invite_workspace_bindings);
+        assert!(!has_local_signing_keys);
+    }
+
+    #[test]
     fn test_migration_idempotent() {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
@@ -612,6 +667,6 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(max_version, 22);
+        assert_eq!(max_version, 23);
     }
 }

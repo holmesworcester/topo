@@ -19,7 +19,14 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn, error};
 
 use crate::crypto::{hash_event, event_id_to_base64, event_id_from_base64, EventId};
-use crate::db::{open_connection, schema::create_tables, store::Store, egress_queue::EgressQueue, wanted::WantedEvents, project_queue::ProjectQueue};
+use crate::db::{
+    egress_queue::EgressQueue,
+    open_connection,
+    project_queue::ProjectQueue,
+    schema::create_tables,
+    store::{Store, SQL_INSERT_EVENT, SQL_INSERT_NEG_ITEM, SQL_INSERT_RECORDED_EVENT},
+    wanted::WantedEvents,
+};
 use crate::db::health::{purge_expired_endpoints, record_endpoint_observation};
 use crate::db::transport_trust::record_transport_binding;
 use crate::events::{self, registry, ShareScope};
@@ -85,9 +92,7 @@ pub fn batch_writer(
 
     let wanted = WantedEvents::new(&db);
 
-    let mut neg_items_stmt = match db.prepare(
-        "INSERT OR IGNORE INTO neg_items (ts, id) VALUES (?1, ?2)"
-    ) {
+    let mut neg_items_stmt = match db.prepare(SQL_INSERT_NEG_ITEM) {
         Ok(stmt) => stmt,
         Err(e) => {
             error!("Failed to prepare neg_items statement: {}", e);
@@ -95,10 +100,7 @@ pub fn batch_writer(
         }
     };
 
-    let mut recorded_stmt = match db.prepare(
-        "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
-         VALUES (?1, ?2, ?3, ?4)"
-    ) {
+    let mut recorded_stmt = match db.prepare(SQL_INSERT_RECORDED_EVENT) {
         Ok(stmt) => stmt,
         Err(e) => {
             error!("Failed to prepare recorded_events statement: {}", e);
@@ -106,10 +108,7 @@ pub fn batch_writer(
         }
     };
 
-    let mut events_stmt = match db.prepare(
-        "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
-    ) {
+    let mut events_stmt = match db.prepare(SQL_INSERT_EVENT) {
         Ok(stmt) => stmt,
         Err(e) => {
             error!("Failed to prepare events statement: {}", e);

@@ -1,6 +1,67 @@
 use rusqlite::{Connection, Result as SqliteResult, params};
 
 use crate::crypto::{event_id_to_base64, EventId};
+use crate::events::ShareScope;
+
+pub const SQL_INSERT_EVENT: &str =
+    "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6)";
+pub const SQL_INSERT_NEG_ITEM: &str =
+    "INSERT OR IGNORE INTO neg_items (ts, id) VALUES (?1, ?2)";
+pub const SQL_INSERT_RECORDED_EVENT: &str =
+    "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
+     VALUES (?1, ?2, ?3, ?4)";
+
+pub fn insert_event(
+    conn: &Connection,
+    event_id: &EventId,
+    event_type: &str,
+    blob: &[u8],
+    share_scope: ShareScope,
+    created_at_ms: i64,
+    inserted_at_ms: i64,
+) -> SqliteResult<()> {
+    let event_id_b64 = event_id_to_base64(event_id);
+    conn.execute(
+        SQL_INSERT_EVENT,
+        params![
+            &event_id_b64,
+            event_type,
+            blob,
+            share_scope.as_str(),
+            created_at_ms,
+            inserted_at_ms
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn insert_neg_item_if_shared(
+    conn: &Connection,
+    share_scope: ShareScope,
+    created_at_ms: i64,
+    event_id: &EventId,
+) -> SqliteResult<()> {
+    if share_scope == ShareScope::Shared {
+        conn.execute(SQL_INSERT_NEG_ITEM, params![created_at_ms, event_id.as_slice()])?;
+    }
+    Ok(())
+}
+
+pub fn insert_recorded_event(
+    conn: &Connection,
+    peer_id: &str,
+    event_id: &EventId,
+    recorded_at_ms: i64,
+    source: &str,
+) -> SqliteResult<()> {
+    let event_id_b64 = event_id_to_base64(event_id);
+    conn.execute(
+        SQL_INSERT_RECORDED_EVENT,
+        params![peer_id, &event_id_b64, recorded_at_ms, source],
+    )?;
+    Ok(())
+}
 
 /// Content-addressed blob storage backed by the `events` table.
 pub struct Store<'a> {

@@ -2,7 +2,8 @@ use rusqlite::Connection;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::crypto::{hash_event, event_id_to_base64, EventId};
-use crate::events::{self, ParsedEvent, registry, ShareScope};
+use crate::db::store::{insert_event, insert_neg_item_if_shared, insert_recorded_event};
+use crate::events::{self, ParsedEvent, registry};
 use crate::events::EncryptedEvent;
 use crate::projection::encrypted::encrypt_event_blob;
 use crate::projection::signer::sign_event_bytes;
@@ -61,41 +62,28 @@ fn store_blob_and_project(
     created_at_ms: i64,
 ) -> Result<EventId, CreateEventError> {
     let event_id = hash_event(blob);
-    let event_id_b64 = event_id_to_base64(&event_id);
 
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64;
 
-    // Write to events table
-    conn.execute(
-        "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        rusqlite::params![
-            &event_id_b64,
-            meta.type_name,
-            blob,
-            meta.share_scope.as_str(),
-            created_at_ms,
-            now_ms
-        ],
-    ).map_err(|e| CreateEventError::DbError(e.to_string()))?;
+    insert_event(
+        conn,
+        &event_id,
+        meta.type_name,
+        blob,
+        meta.share_scope,
+        created_at_ms,
+        now_ms,
+    )
+    .map_err(|e| CreateEventError::DbError(e.to_string()))?;
 
-    // Write to neg_items (only for shared events — local events must not sync)
-    if meta.share_scope == ShareScope::Shared {
-        conn.execute(
-            "INSERT OR IGNORE INTO neg_items (ts, id) VALUES (?1, ?2)",
-            rusqlite::params![created_at_ms, event_id.as_slice()],
-        ).map_err(|e| CreateEventError::DbError(e.to_string()))?;
-    }
+    insert_neg_item_if_shared(conn, meta.share_scope, created_at_ms, &event_id)
+        .map_err(|e| CreateEventError::DbError(e.to_string()))?;
 
-    // Write to recorded_events
-    conn.execute(
-        "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
-         VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![recorded_by, &event_id_b64, now_ms, "local_create"],
-    ).map_err(|e| CreateEventError::DbError(e.to_string()))?;
+    insert_recorded_event(conn, recorded_by, &event_id, now_ms, "local_create")
+        .map_err(|e| CreateEventError::DbError(e.to_string()))?;
 
     // Project
     let decision = project_one(conn, recorded_by, &event_id)

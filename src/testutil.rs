@@ -229,11 +229,7 @@ impl Peer {
             rusqlite::params![&peer.identity, &ws_b64, now_ms],
         ).expect("failed to record workspace event");
 
-        // Add to shareable_events + neg_items so this peer advertises the workspace
-        db.execute(
-            "INSERT OR IGNORE INTO shareable_events (id, stored_at) VALUES (?1, ?2)",
-            rusqlite::params![&ws_b64, now_ms],
-        ).expect("failed to add workspace to shareable_events");
+        // Add to neg_items so this peer advertises the workspace.
         db.execute(
             "INSERT OR IGNORE INTO neg_items (ts, id) VALUES (?1, ?2)",
             rusqlite::params![created_at, &creator.workspace_id[..]],
@@ -1072,7 +1068,6 @@ fn replay_projection_impl(db: &rusqlite::Connection, recorded_by: &str, order: &
     db.execute("DELETE FROM removed_entities WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
     db.execute("DELETE FROM secret_shared WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
     db.execute("DELETE FROM trust_anchors WHERE peer_id = ?1", rusqlite::params![recorded_by]).ok();
-    db.execute("DELETE FROM invite_workspace_bindings WHERE peer_id = ?1", rusqlite::params![recorded_by]).ok();
     db.execute("DELETE FROM peer_transport_bindings WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
     db.execute("DELETE FROM transport_keys WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
     db.execute("DELETE FROM valid_events WHERE peer_id = ?1", rusqlite::params![recorded_by])

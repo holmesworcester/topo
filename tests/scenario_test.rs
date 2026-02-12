@@ -978,7 +978,6 @@ async fn test_project_queue_crash_recovery() {
     db.execute("DELETE FROM device_invites WHERE recorded_by = ?1", rusqlite::params![&alice.identity]).unwrap();
     db.execute("DELETE FROM peers_shared WHERE recorded_by = ?1", rusqlite::params![&alice.identity]).unwrap();
     db.execute("DELETE FROM trust_anchors WHERE peer_id = ?1", rusqlite::params![&alice.identity]).unwrap();
-    db.execute("DELETE FROM invite_workspace_bindings WHERE peer_id = ?1", rusqlite::params![&alice.identity]).unwrap();
     db.execute("DELETE FROM valid_events WHERE peer_id = ?1", rusqlite::params![&alice.identity]).unwrap();
     db.execute("DELETE FROM blocked_event_deps WHERE peer_id = ?1", rusqlite::params![&alice.identity]).unwrap();
     db.execute("DELETE FROM rejected_events WHERE peer_id = ?1", rusqlite::params![&alice.identity]).unwrap();
@@ -2264,9 +2263,8 @@ fn test_no_blob_capture_trust_influence() {
 
     // Manually craft a blob that looks like a UserInviteBoot (type 10) with a specific
     // workspace_id, and insert it directly into the events table (simulating raw ingress).
-    // Under old semantics, capture_invite_workspace_binding would have extracted the
-    // workspace_id and written it to invite_workspace_bindings. Under corrected semantics,
-    // this should have no effect on trust state.
+    // Under old semantics, a pre-projection capture path could influence trust state.
+    // Under corrected semantics, this should have no effect.
     let fake_workspace_id: [u8; 32] = [0xAA; 32];
     let mut fake_blob = vec![10u8]; // type code for UserInviteBoot
     fake_blob.extend_from_slice(&[0u8; 40]); // created_at_ms(8) + public_key(32)
@@ -2286,14 +2284,6 @@ fn test_no_blob_capture_trust_influence() {
          VALUES (?1, ?2, 0, 'test')",
         rusqlite::params![&alice.identity, &fake_b64],
     ).unwrap();
-
-    // invite_workspace_bindings should be empty (no capture happened)
-    let binding_count: i64 = db.query_row(
-        "SELECT COUNT(*) FROM invite_workspace_bindings WHERE peer_id = ?1",
-        rusqlite::params![&alice.identity],
-        |row| row.get(0),
-    ).unwrap();
-    assert_eq!(binding_count, 0, "no pre-projection blob capture should occur");
 
     // Trust anchor should be unset
     let anchor_count: i64 = db.query_row(

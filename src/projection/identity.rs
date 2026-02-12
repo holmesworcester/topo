@@ -4,8 +4,7 @@ use crate::crypto::{event_id_to_base64, event_id_from_base64};
 use crate::events::ParsedEvent;
 use super::decision::ProjectionDecision;
 
-// Note: invite_workspace_bindings table is retained in migration for schema compat,
-// but is no longer written or read. Trust anchor is set directly from invite_accepted's workspace_id.
+// Trust anchor is set directly from invite_accepted.workspace_id.
 
 /// Dispatch identity event projections. Called from apply_projection in pipeline.rs.
 pub fn apply_identity_projection(
