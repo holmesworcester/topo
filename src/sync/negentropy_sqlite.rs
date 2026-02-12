@@ -35,13 +35,29 @@ impl<'a> NegentropyStorageSqlite<'a> {
         }
     }
 
-    /// Rebuild the neg_blocks index from neg_items
+    /// Ensure the per-connection TEMP table exists for session block index.
+    /// TEMP tables are connection-private — no contention between concurrent sessions.
+    fn ensure_session_table(&self) -> Result<(), rusqlite::Error> {
+        self.conn.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS session_blocks (
+                block_idx INTEGER PRIMARY KEY,
+                ts INTEGER NOT NULL,
+                id BLOB NOT NULL,
+                count INTEGER NOT NULL
+            )"
+        )?;
+        Ok(())
+    }
+
+    /// Rebuild the block index from neg_items into a per-connection TEMP table.
     ///
     /// This is O(N) but streaming and memory-flat.
     /// Call before sync when items have been inserted.
     pub fn rebuild_blocks(&self) -> Result<(), rusqlite::Error> {
-        // Clear existing blocks
-        self.conn.execute("DELETE FROM neg_blocks", [])?;
+        self.ensure_session_table()?;
+
+        // Clear existing session blocks
+        self.conn.execute("DELETE FROM session_blocks", [])?;
 
         // Stream through all items and insert every BLOCK_SIZE-th one
         let mut stmt = self.conn.prepare(
@@ -49,7 +65,7 @@ impl<'a> NegentropyStorageSqlite<'a> {
         )?;
 
         let mut insert_stmt = self.conn.prepare(
-            "INSERT INTO neg_blocks (block_idx, ts, id, count) VALUES (?1, ?2, ?3, ?4)"
+            "INSERT INTO session_blocks (block_idx, ts, id, count) VALUES (?1, ?2, ?3, ?4)"
         )?;
 
         let mut row_idx: usize = 0;
@@ -80,7 +96,7 @@ impl<'a> NegentropyStorageSqlite<'a> {
     /// Get the (ts, id) key for a given block index
     fn get_block_start(&self, block_idx: usize) -> Result<Option<(i64, Vec<u8>)>, rusqlite::Error> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT ts, id FROM neg_blocks WHERE block_idx = ?"
+            "SELECT ts, id FROM session_blocks WHERE block_idx = ?"
         )?;
 
         let result = stmt.query_row([block_idx as i64], |row| {
@@ -216,7 +232,7 @@ impl NegentropyStorageBase for NegentropyStorageSqlite<'_> {
         let result: Result<usize, rusqlite::Error> = (|| {
             // Find the last block with start key <= target
             let mut stmt = self.conn.prepare_cached(
-                "SELECT block_idx, count FROM neg_blocks WHERE (ts, id) <= (?, ?) ORDER BY block_idx DESC LIMIT 1"
+                "SELECT block_idx, count FROM session_blocks WHERE (ts, id) <= (?, ?) ORDER BY block_idx DESC LIMIT 1"
             )?;
 
             let (block_idx, block_start_count): (i64, i64) = stmt.query_row(
@@ -298,9 +314,9 @@ mod tests {
         let storage = NegentropyStorageSqlite::new(&conn);
         storage.rebuild_blocks().unwrap();
 
-        // Should have 2 blocks
+        // Should have 2 blocks (in session_blocks TEMP table)
         let block_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM neg_blocks", [], |row| row.get(0)
+            "SELECT COUNT(*) FROM session_blocks", [], |row| row.get(0)
         ).unwrap();
         assert_eq!(block_count, 2);
     }

@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -19,12 +20,17 @@ use crate::events::{
 use crate::transport_identity::{transport_cert_paths_from_db, ensure_transport_peer_id_from_db};
 use crate::projection::create::{create_event_sync, create_signed_event_sync, create_encrypted_event_sync, event_id_or_blocked, CreateEventError};
 use crate::projection::pipeline::project_one;
-use crate::sync::engine::{accept_loop, connect_loop};
+use crate::sync::SyncMessage;
+use crate::sync::engine::{accept_loop, connect_loop, download_from_sources, run_sync_initiator_dual, SYNC_SESSION_TIMEOUT_SECS};
 use crate::transport::{
     AllowedPeers,
+    DualConnection,
+    create_client_endpoint,
     create_dual_endpoint,
+    create_server_endpoint,
     extract_spki_fingerprint,
     load_or_generate_cert,
+    peer_identity_from_connection,
 };
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use ed25519_dalek::SigningKey;
@@ -764,8 +770,12 @@ impl Peer {
     }
 
     /// Count events in the events table.
+    /// Returns -1 if the database can't be opened (transient contention).
     pub fn store_count(&self) -> i64 {
-        let db = open_connection(&self.db_path).expect("failed to open db");
+        let db = match open_connection(&self.db_path) {
+            Ok(db) => db,
+            Err(_) => return -1,
+        };
         db.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
             .unwrap_or(0)
     }
@@ -984,6 +994,28 @@ impl Peer {
             rusqlite::params![&self.identity],
             |row| row.get(0),
         ).unwrap_or(0)
+    }
+
+    /// Get the recorded_at timestamp for a specific event (by base64 event_id).
+    pub fn recorded_at_for_event(&self, event_id_b64: &str) -> Option<i64> {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        db.query_row(
+            "SELECT recorded_at FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![&self.identity, event_id_b64],
+            |row| row.get(0),
+        ).ok()
+    }
+
+    /// Get a random sample of event IDs (base64) from the events table.
+    pub fn sample_event_ids(&self, count: usize) -> Vec<String> {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        let mut stmt = db.prepare(
+            "SELECT event_id FROM events ORDER BY RANDOM() LIMIT ?1"
+        ).expect("prepare");
+        stmt.query_map(rusqlite::params![count as i64], |row| row.get::<_, String>(0))
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect")
     }
 }
 
@@ -1400,5 +1432,404 @@ where
             panic!("assert_eventually timed out: {}", msg);
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Start a chain topology: P0 <-> P1 <-> ... <-> P_{n-1}.
+///
+/// Each adjacent pair has a bidirectional sync link:
+/// - P_i runs accept_loop (server) for P_{i+1}
+/// - P_{i+1} runs connect_loop (client) to P_i
+///
+/// Returns thread handles for all accept and connect loops.
+pub fn start_chain(peers: &[Peer]) -> Vec<std::thread::JoinHandle<()>> {
+    let n = peers.len();
+    assert!(n >= 2, "chain requires at least 2 peers");
+
+    // Extract fingerprints for all peers (needed before creating endpoints)
+    let mut fingerprints: Vec<[u8; 32]> = Vec::new();
+    for peer in peers {
+        let (cert_path, key_path) = transport_cert_paths_from_db(&peer.db_path);
+        let (cert, _) = load_or_generate_cert(&cert_path, &key_path)
+            .expect("failed to load cert for fingerprint");
+        let fp = extract_spki_fingerprint(cert.as_ref())
+            .expect("failed to extract fingerprint");
+        fingerprints.push(fp);
+    }
+
+    // Create server endpoints for peers 0..n-2 (each accepts from its right neighbor)
+    let mut server_addrs: Vec<SocketAddr> = Vec::new();
+    let mut server_endpoints: Vec<quinn::Endpoint> = Vec::new();
+    for i in 0..n-1 {
+        let (cert_path, key_path) = transport_cert_paths_from_db(&peers[i].db_path);
+        let (cert, key) = load_or_generate_cert(&cert_path, &key_path)
+            .expect("failed to load cert for server");
+        let allowed = Arc::new(AllowedPeers::from_fingerprints(vec![fingerprints[i+1]]));
+        let endpoint = create_server_endpoint(
+            "127.0.0.1:0".parse().unwrap(),
+            cert, key, allowed,
+        ).expect("failed to create chain server endpoint");
+        let addr = endpoint.local_addr().expect("failed to get local addr");
+        server_addrs.push(addr);
+        server_endpoints.push(endpoint);
+    }
+
+    // Create client endpoints for peers 1..n-1 (each connects to its left neighbor)
+    let mut client_endpoints: Vec<quinn::Endpoint> = Vec::new();
+    for i in 1..n {
+        let (cert_path, key_path) = transport_cert_paths_from_db(&peers[i].db_path);
+        let (cert, key) = load_or_generate_cert(&cert_path, &key_path)
+            .expect("failed to load cert for client");
+        let allowed = Arc::new(AllowedPeers::from_fingerprints(vec![fingerprints[i-1]]));
+        let endpoint = create_client_endpoint(
+            "0.0.0.0:0".parse().unwrap(),
+            cert, key, allowed,
+        ).expect("failed to create chain client endpoint");
+        client_endpoints.push(endpoint);
+    }
+
+    let mut handles = Vec::new();
+
+    // Spawn accept_loop for peers 0..n-2
+    for (i, endpoint) in server_endpoints.into_iter().enumerate() {
+        let db_path = peers[i].db_path.clone();
+        let identity = peers[i].identity.clone();
+        handles.push(std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                if let Err(e) = accept_loop(&db_path, &identity, endpoint, None).await {
+                    tracing::warn!("chain accept_loop[{}] exited: {}", i, e);
+                }
+            });
+        }));
+    }
+
+    // Spawn connect_loop for peers 1..n-1
+    for (idx, endpoint) in client_endpoints.into_iter().enumerate() {
+        let i = idx + 1;
+        let db_path = peers[i].db_path.clone();
+        let identity = peers[i].identity.clone();
+        let remote = server_addrs[idx];
+        handles.push(std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                if let Err(e) = connect_loop(&db_path, &identity, endpoint, remote, None).await {
+                    tracing::warn!("chain connect_loop[{}] exited: {}", i, e);
+                }
+            });
+        }));
+    }
+
+    handles
+}
+
+/// Start a multi-source topology: sources S0..Sn all connect to a single sink.
+///
+/// The sink runs accept_loop (serialized — one connection at a time with current code).
+/// Each source runs connect_loop to the sink.
+///
+/// Returns thread handles for sink accept and all source connect loops.
+pub fn start_multi_source(sources: &[Peer], sink: &Peer) -> Vec<std::thread::JoinHandle<()>> {
+    assert!(!sources.is_empty(), "need at least one source");
+
+    // Extract source fingerprints
+    let mut source_fps: Vec<[u8; 32]> = Vec::new();
+    for source in sources {
+        let (cert_path, key_path) = transport_cert_paths_from_db(&source.db_path);
+        let (cert, _) = load_or_generate_cert(&cert_path, &key_path)
+            .expect("failed to load source cert");
+        let fp = extract_spki_fingerprint(cert.as_ref())
+            .expect("failed to extract source fingerprint");
+        source_fps.push(fp);
+    }
+
+    // Sink server endpoint allows all sources
+    let (sink_cert_path, sink_key_path) = transport_cert_paths_from_db(&sink.db_path);
+    let (sink_cert, sink_key) = load_or_generate_cert(&sink_cert_path, &sink_key_path)
+        .expect("failed to load sink cert");
+    let sink_fp = extract_spki_fingerprint(sink_cert.as_ref())
+        .expect("failed to extract sink fingerprint");
+
+    let allowed_for_sink = Arc::new(AllowedPeers::from_fingerprints(source_fps));
+    let server_endpoint = create_server_endpoint(
+        "127.0.0.1:0".parse().unwrap(),
+        sink_cert, sink_key, allowed_for_sink,
+    ).expect("failed to create sink server endpoint");
+    let sink_addr = server_endpoint.local_addr().expect("failed to get sink addr");
+
+    let mut handles = Vec::new();
+
+    // Spawn accept_loop for sink
+    let sink_db = sink.db_path.clone();
+    let sink_identity = sink.identity.clone();
+    handles.push(std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            if let Err(e) = accept_loop(&sink_db, &sink_identity, server_endpoint, None).await {
+                tracing::warn!("sink accept_loop exited: {}", e);
+            }
+        });
+    }));
+
+    // Spawn connect_loop for each source
+    for (i, source) in sources.iter().enumerate() {
+        let (cert_path, key_path) = transport_cert_paths_from_db(&source.db_path);
+        let (cert, key) = load_or_generate_cert(&cert_path, &key_path)
+            .expect("failed to load source cert");
+        let allowed = Arc::new(AllowedPeers::from_fingerprints(vec![sink_fp]));
+        let endpoint = create_client_endpoint(
+            "0.0.0.0:0".parse().unwrap(),
+            cert, key, allowed,
+        ).expect("failed to create source client endpoint");
+
+        let db_path = source.db_path.clone();
+        let identity = source.identity.clone();
+        handles.push(std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                if let Err(e) = connect_loop(&db_path, &identity, endpoint, sink_addr, None).await {
+                    tracing::warn!("source connect_loop[{}] exited: {}", i, e);
+                }
+            });
+        }));
+    }
+
+    handles
+}
+
+/// Start a sink-driven download topology: sink connects to all sources.
+///
+/// Each source runs accept_loop (responder). The sink runs download_from_sources
+/// (initiator) connecting to all sources simultaneously with coordinated
+/// round-based assignment. A coordinator thread assigns events to peers using
+/// greedy load balancing; undelivered events get reassigned next round.
+///
+/// Returns thread handles for all source accept_loops and the sink download task.
+pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::JoinHandle<()>> {
+    assert!(!sources.is_empty(), "need at least one source");
+
+    // Extract sink fingerprint for sources to allow
+    let (sink_cert_path, sink_key_path) = transport_cert_paths_from_db(&sink.db_path);
+    let (sink_cert, sink_key) = load_or_generate_cert(&sink_cert_path, &sink_key_path)
+        .expect("failed to load sink cert");
+    let sink_fp = extract_spki_fingerprint(sink_cert.as_ref())
+        .expect("failed to extract sink fingerprint");
+
+    let mut handles = Vec::new();
+    let mut source_addrs = Vec::new();
+
+    // Start accept_loop for each source
+    for source in sources {
+        let (cert_path, key_path) = transport_cert_paths_from_db(&source.db_path);
+        let (cert, key) = load_or_generate_cert(&cert_path, &key_path)
+            .expect("failed to load source cert");
+
+        let allowed = Arc::new(AllowedPeers::from_fingerprints(vec![sink_fp]));
+        let server_endpoint = create_server_endpoint(
+            "127.0.0.1:0".parse().unwrap(),
+            cert, key, allowed,
+        ).expect("failed to create source server endpoint");
+        let addr = server_endpoint.local_addr().expect("failed to get source addr");
+        source_addrs.push(addr);
+
+        let db_path = source.db_path.clone();
+        let identity = source.identity.clone();
+        handles.push(std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                if let Err(e) = accept_loop(&db_path, &identity, server_endpoint, None).await {
+                    tracing::warn!("source accept_loop exited: {}", e);
+                }
+            });
+        }));
+    }
+
+    // Build per-source client endpoints for the sink
+    let mut endpoint_pairs = Vec::new();
+    for (i, source) in sources.iter().enumerate() {
+        let (cert_path, key_path) = transport_cert_paths_from_db(&source.db_path);
+        let (cert, _) = load_or_generate_cert(&cert_path, &key_path)
+            .expect("failed to load source cert");
+        let source_fp = extract_spki_fingerprint(cert.as_ref())
+            .expect("failed to extract source fingerprint");
+
+        let allowed = Arc::new(AllowedPeers::from_fingerprints(vec![source_fp]));
+        let client_endpoint = create_client_endpoint(
+            "0.0.0.0:0".parse().unwrap(),
+            sink_cert.clone(), sink_key.clone_key(), allowed,
+        ).expect("failed to create sink client endpoint");
+
+        endpoint_pairs.push((client_endpoint, source_addrs[i]));
+    }
+
+    // Spawn download_from_sources for the sink
+    let sink_db = sink.db_path.clone();
+    let sink_identity = sink.identity.clone();
+    handles.push(std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            if let Err(e) = download_from_sources(
+                &sink_db, &sink_identity, endpoint_pairs,
+            ).await {
+                tracing::warn!("sink download_from_sources exited: {}", e);
+            }
+        });
+    }));
+
+    handles
+}
+
+/// Connect to a remote peer, run one sync session, and close the connection.
+///
+/// Used for B0 multi-source baseline testing where sources connect sequentially
+/// (one session each) to a sink running accept_loop.
+pub async fn connect_sync_once(
+    db_path: &str,
+    identity: &str,
+    remote_addr: SocketAddr,
+    remote_fp: [u8; 32],
+) -> Result<crate::runtime::SyncStats, Box<dyn std::error::Error + Send + Sync>> {
+    let (cert_path, key_path) = transport_cert_paths_from_db(db_path);
+    let (cert, key) = load_or_generate_cert(&cert_path, &key_path)?;
+    let allowed = Arc::new(AllowedPeers::from_fingerprints(vec![remote_fp]));
+    let endpoint = create_client_endpoint("0.0.0.0:0".parse().unwrap(), cert, key, allowed)?;
+
+    let connection = endpoint.connect(remote_addr, "localhost")?.await?;
+    let peer_id = peer_identity_from_connection(&connection)
+        .ok_or_else(|| "could not extract peer identity".to_string())?;
+
+    let (ctrl_send, ctrl_recv) = connection.open_bi().await?;
+    let (data_send, data_recv) = connection.open_bi().await?;
+    let mut conn = DualConnection::new(ctrl_send, ctrl_recv, data_send, data_recv);
+
+    // Send markers to materialize lazy QUIC streams on the receiver
+    conn.control.send(&SyncMessage::HaveList { ids: vec![] }).await?;
+    conn.data_send.send(&SyncMessage::HaveList { ids: vec![] }).await?;
+    conn.flush_control().await?;
+    conn.flush_data().await?;
+
+    let stats = run_sync_initiator_dual(
+        conn, db_path, SYNC_SESSION_TIMEOUT_SECS, &peer_id, identity, None, None,
+    ).await?;
+
+    connection.close(0u32.into(), b"done");
+    endpoint.close(0u32.into(), b"done");
+
+    Ok(stats)
+}
+
+/// Start a sink's accept_loop and return the handle and listen address.
+/// `allowed_fps` is the list of source fingerprints allowed to connect.
+pub fn start_sink_accept(
+    sink: &Peer,
+    allowed_fps: Vec<[u8; 32]>,
+) -> (std::thread::JoinHandle<()>, SocketAddr) {
+    let (cert_path, key_path) = transport_cert_paths_from_db(&sink.db_path);
+    let (cert, key) = load_or_generate_cert(&cert_path, &key_path)
+        .expect("failed to load sink cert");
+    let allowed = Arc::new(AllowedPeers::from_fingerprints(allowed_fps));
+    let endpoint = create_server_endpoint(
+        "127.0.0.1:0".parse().unwrap(),
+        cert, key, allowed,
+    ).expect("failed to create sink server endpoint");
+    let addr = endpoint.local_addr().expect("failed to get sink addr");
+
+    let db_path = sink.db_path.clone();
+    let identity = sink.identity.clone();
+    let handle = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            if let Err(e) = accept_loop(&db_path, &identity, endpoint, None).await {
+                tracing::warn!("sink accept_loop exited: {}", e);
+            }
+        });
+    });
+
+    (handle, addr)
+}
+
+/// Extract the SPKI fingerprint for a peer (from its cert file).
+pub fn peer_fingerprint(peer: &Peer) -> [u8; 32] {
+    let (cert_path, key_path) = transport_cert_paths_from_db(&peer.db_path);
+    let (cert, _) = load_or_generate_cert(&cert_path, &key_path)
+        .expect("failed to load cert");
+    extract_spki_fingerprint(cert.as_ref())
+        .expect("failed to extract fingerprint")
+}
+
+/// Copy all events and neg_items from a source peer's database to target peers.
+///
+/// This creates identical data at each target so that concurrent sync tests can
+/// verify dedup behavior when multiple sources offer the same events.
+pub fn clone_events_to(source: &Peer, targets: &[&Peer]) {
+    let src_db = open_connection(&source.db_path).expect("failed to open source db");
+
+    // Read all events
+    let mut events_stmt = src_db.prepare(
+        "SELECT event_id, event_type, blob, share_scope, created_at, inserted_at FROM events"
+    ).expect("failed to prepare events query");
+    let events: Vec<(String, String, Vec<u8>, String, i64, i64)> = events_stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })
+        .expect("failed to query events")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("failed to collect events");
+
+    // Read all neg_items
+    let mut neg_stmt = src_db.prepare("SELECT ts, id FROM neg_items").expect("failed to prepare neg_items query");
+    let neg_items: Vec<(i64, Vec<u8>)> = neg_stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })
+        .expect("failed to query neg_items")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("failed to collect neg_items");
+
+    for target in targets {
+        let tgt_db = open_connection(&target.db_path).expect("failed to open target db");
+        tgt_db.execute("BEGIN", []).expect("failed to begin");
+
+        for (event_id, event_type, blob, share_scope, created_at, inserted_at) in &events {
+            tgt_db.execute(
+                "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![event_id, event_type, blob.as_slice(), share_scope, created_at, inserted_at],
+            ).expect("failed to insert event");
+        }
+
+        for (ts, id) in &neg_items {
+            tgt_db.execute(
+                "INSERT OR IGNORE INTO neg_items (ts, id) VALUES (?1, ?2)",
+                rusqlite::params![ts, id.as_slice()],
+            ).expect("failed to insert neg_item");
+        }
+
+        tgt_db.execute("COMMIT", []).expect("failed to commit");
     }
 }

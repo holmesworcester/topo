@@ -848,6 +848,11 @@ Use `ON CONFLICT DO UPDATE` for:
 
 Avoid broad `INSERT OR REPLACE`.
 
+Do not add in-memory dedup sets in front of `INSERT OR IGNORE` writers:
+- pre-writer dedup causes data loss if the writer transaction rolls back (event marked "seen" but never persisted; peer retransmissions silently dropped),
+- the set grows without bound in long-running daemons,
+- redundant `INSERT OR IGNORE` from concurrent sessions is cheap and self-correcting.
+
 ---
 
 ## 9. Phase 5: Special Cases That Stay Explicit
@@ -926,6 +931,43 @@ sequential IO locality when reassembling files.
 1. **Merkle-proof extension**: Attachment carries `merkle_root`, each `file_slice` carries proof path,
    projector verifies proof against descriptor root. Overhead ~`log2(N) * 32` bytes per slice proof.
 2. **Full DAG encoding**: Deferred unless needed. Too heavy for current phase.
+
+### 10.5 Multi-source download
+
+Multi-source download allows a sink to pull events from N sources concurrently.
+
+A naive approach — running N independent negentropy sessions, each with its own
+`batch_writer` — fails at scale: N writers contend on SQLite WAL locks, overlapping
+need_ids cause redundant downloads, and a slow source blocks its events until timeout.
+
+Required changes from the 1:1 sync model:
+
+1. **Shared batch_writer.** One writer thread with all sessions feeding a single `mpsc`
+   channel. Eliminates SQLite write contention entirely. Duplicate filtering is handled
+   solely by `INSERT OR IGNORE` — see section 8.8 for why in-memory dedup sets must not
+   be placed before the writer.
+2. **Thread-per-connection.** Each connection spawns a `std::thread` with a dedicated
+   single-threaded tokio runtime. Isolates connection failures and allows sharing the
+   `mpsc::Sender` to the batch_writer across connections.
+3. **Coordinator thread for pull assignment.** After negentropy reconciliation, each peer
+   reports its discovered need_ids to a coordinator that assigns each event to the
+   least-loaded peer that has it (greedy load balancing, unique-events-first ordering).
+4. **Push uncoordinated, pull coordinated.** Have_ids (outbound) stream immediately — no
+   coordinator involvement. Only need_ids (inbound) go through assignment. Push runs at
+   full speed during the coordination window.
+5. **Round-based reassignment.** Assignments are discarded after each round. Undelivered
+   events re-appear as need_ids next round and get reassigned to a different peer.
+6. **Short collection window (~20ms).** Coordinator waits briefly after the first peer
+   reports. Stragglers report next round. Prevents convoy effects from slow reconciliation.
+7. **Incremental egress enqueue.** Have_ids buffered and drained in batches per main loop
+   iteration so event streaming is not starved by large reconciliation results.
+8. **Negentropy snapshot ordering.** `BEGIN` must precede `rebuild_blocks()` so the storage
+   sees a consistent read snapshot while concurrent writes proceed in the batch_writer.
+
+Test families (in `sync_graph_test.rs`):
+- **Family A (chain):** N-peer chain propagation (tail convergence, per-hop latency).
+- **Family B (multi-source):** 1–8 concurrent sources with varying event counts.
+  B0 = serialized baseline, B1 = coordinator-assigned, B2/B3 = variants.
 
 ---
 

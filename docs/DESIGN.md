@@ -469,6 +469,89 @@ Can be eventual:
 2. queue cleanup/purge,
 3. metrics/logging.
 
+## 7.6 Multi-source download coordination
+
+When a sink downloads from multiple sources concurrently, a coordinator thread
+assigns events to peers using round-based greedy load balancing:
+
+1. **Discovery**: each peer runs negentropy with its source, discovering need_ids
+   (events the sink needs). Push (have_ids) proceeds immediately.
+2. **Report**: after reconciliation, each peer sends its need_ids to the coordinator
+   via a per-peer channel.
+3. **Assignment**: the coordinator collects reports (short collection window after
+   first report), builds an event-to-peer availability map, sorts by availability
+   ascending (unique events first), and assigns each event to the least-loaded peer
+   that has it.
+4. **Transfer**: each peer receives its assigned subset and sends HaveList only for
+   those events. Events flow into a shared batch_writer.
+5. **Forget**: assignments are discarded after each round. Next round starts fresh.
+
+Key properties:
+- Events available from one peer are assigned to that peer (no choice).
+- Events available from many peers are spread evenly across them.
+- Slow peers' undelivered events re-appear as need_ids next round and get reassigned.
+- Push path (egress streaming) continues during coordination wait.
+- Per-peer channels prevent round-mixing between fast and slow peers.
+
+### Implementation decisions
+
+A naive negentropy implementation runs one session per peer pair: each session
+has its own `batch_writer` thread for persistence, and after reconciliation it
+sends HaveList for all need_ids and streams all have_ids directly. This works
+for 1:1 sync but breaks down when a sink pulls from N sources concurrently:
+
+1. N independent `batch_writer` threads all write to the same SQLite DB,
+   causing WAL contention and lock timeouts.
+2. Multiple sources discover the same need_ids. Without coordination each
+   source sends the full set, wasting bandwidth proportional to overlap.
+3. If one source is slow, its events are delayed until its session completes.
+   No other source can pick up the slack.
+
+The multi-source design addresses each of these:
+
+**Shared batch_writer.** All concurrent sessions feed events into a single
+shared `mpsc` channel consumed by one `batch_writer` thread. This eliminates
+write contention entirely — only one thread ever holds the SQLite write lock.
+Do not add an in-memory dedup set in front of the shared writer:
+- Pre-writer dedup causes data loss if the writer transaction rolls back
+  (event marked "seen" but never persisted; peer retransmissions silently dropped).
+- The set grows without bound for long-running daemons (~90 bytes per EventId).
+- `INSERT OR IGNORE` in `batch_writer` handles duplicates correctly and cheaply.
+
+**Coordinator for pull, not push.** Each peer still pushes all have_ids
+(events the remote needs from us) without coordination — the push path runs
+at full speed. Only the pull path (need_ids — events we want) goes through
+coordinator assignment. After reconciliation, each peer reports its discovered
+need_ids to the coordinator thread, which assigns each event to the
+least-loaded peer that has it. This eliminates redundant downloads of the same
+event from multiple sources.
+
+**Round-based reassignment.** Assignments are discarded after each round. If a
+peer fails to deliver its assigned events (slow, disconnected), those events
+re-appear as need_ids in the next negentropy round and get reassigned to a
+different peer. No permanent affinity between events and peers.
+
+**Short collection window (~20ms).** The coordinator waits briefly after the
+first peer reports, then assigns. Stragglers report next round and get fresh
+assignments. This prevents convoy effects where all peers run at the speed
+of the slowest reconciliation.
+
+**Thread-per-connection.** Each incoming connection spawns a `std::thread`
+with a dedicated single-threaded tokio runtime. This isolates connection
+failures, avoids `!Send` constraints from `rusqlite` leaking into the async
+task graph, and allows each connection to share the `mpsc::Sender` to the
+shared batch_writer.
+
+**Incremental egress enqueue.** Have_ids from reconciliation are buffered and
+drained incrementally per main loop iteration rather than enqueued in one burst.
+This interleaves egress enqueue with event streaming so the data stream is not
+starved while processing large reconciliation results.
+
+**Negentropy snapshot ordering.** `BEGIN` must precede `rebuild_blocks()` so
+the negentropy storage sees a consistent read snapshot of the events table.
+Without this, concurrent writes from the batch_writer can produce an
+inconsistent view during block rebuilding.
+
 ---
 
 # 8. CLI and Daemon Contract

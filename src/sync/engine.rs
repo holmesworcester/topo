@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use negentropy::{Negentropy, Id, NegentropyStorageBase, Storage};
+use negentropy::{Negentropy, Id, Storage};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn, error};
 
@@ -60,8 +60,74 @@ fn current_timestamp_ms() -> i64 {
         .as_millis() as i64
 }
 
+// ---------------------------------------------------------------------------
+// Tuning constants
+// ---------------------------------------------------------------------------
+
 /// Endpoint observation TTL: 24 hours in milliseconds.
 const ENDPOINT_TTL_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// Negentropy frame size limit. Controls the maximum message size for
+/// set reconciliation rounds. Larger = fewer rounds, more memory per round.
+const NEGENTROPY_FRAME_SIZE: u64 = 64 * 1024;
+
+/// Max event IDs sent per HaveList message during reconciliation.
+/// Limits wire message size for the "I have these events" announcements.
+const HAVE_CHUNK: usize = 1000;
+
+/// Max event IDs sent per NeedList/HaveList request during reconciliation.
+/// Limits wire message size for the "I need these events" announcements.
+const NEED_CHUNK: usize = 1000;
+
+/// Max events to enqueue into the egress queue per main-loop iteration.
+/// Keeps the loop responsive by interleaving reconciliation with streaming.
+const ENQUEUE_BATCH: usize = 5000;
+
+/// Max events per egress claim (one send batch to the data stream).
+const EGRESS_CLAIM_COUNT: usize = 500;
+
+/// Lease duration (ms) for claimed egress events. If not sent within this
+/// window, events become available for re-claim. 30s is generous — avoids
+/// spurious re-sends while allowing recovery from stuck sessions.
+const EGRESS_CLAIM_LEASE_MS: i64 = 30_000;
+
+/// Negentropy session timeout for initiator and responder (seconds).
+pub const SYNC_SESSION_TIMEOUT_SECS: u64 = 60;
+
+/// Time to wait for inbound data stream drain at session end.
+const DATA_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Sleep between consecutive sync sessions on the same connection.
+/// Prevents busy-looping when sessions complete instantly.
+const SESSION_GAP: Duration = Duration::from_millis(100);
+
+/// Sleep after a failed QUIC connection attempt before retrying.
+const CONNECT_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+/// Max age (ms) for sent egress entries before cleanup.
+const EGRESS_SENT_TTL_MS: i64 = 300_000;
+
+/// Non-blocking poll timeout for the control stream receive.
+/// Effectively a busy-poll interval — the main loop does useful egress
+/// work between polls so 1ms doesn't waste CPU in practice.
+const CONTROL_POLL_TIMEOUT: Duration = Duration::from_millis(1);
+
+// -- Coordinator timing (B-coordinated / download_from_sources) --
+
+/// How long the coordinator waits (after the first peer reports) for
+/// remaining peers to finish reconciliation and report their need_ids.
+/// Must exceed typical network RTT (50-200ms) so that all peers can
+/// participate in each round's assignment. Peers that miss the window
+/// get assigned work in the next round.
+const COORDINATOR_COLLECTION_WINDOW: Duration = Duration::from_millis(500);
+
+/// Coordinator busy-poll interval while waiting for the first peer report.
+const COORDINATOR_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Coordinator poll interval within the collection window.
+const COORDINATOR_COLLECTION_POLL: Duration = Duration::from_millis(2);
+
+// -- Batch writer sizing --
 
 /// Batch writer drain batch size: 100 normal, 50 in low_mem.
 fn drain_batch_size() -> usize {
@@ -71,6 +137,16 @@ fn drain_batch_size() -> usize {
 /// Batch writer write batch cap: 1000 normal, 500 in low_mem.
 fn write_batch_cap() -> usize {
     if low_mem_mode() { 500 } else { 1000 }
+}
+
+/// Async channel capacity for per-session ingest (initiator/responder).
+fn session_ingest_cap() -> usize {
+    if low_mem_mode() { 1000 } else { 5000 }
+}
+
+/// Async channel capacity for shared ingest (accept_loop / download_from_sources).
+fn shared_ingest_cap() -> usize {
+    if low_mem_mode() { 1000 } else { 10000 }
 }
 
 /// Batch writer task - drains channel and writes to SQLite in batches.
@@ -318,15 +394,163 @@ where
     (shutdown_tx, data_done_rx, handle)
 }
 
+/// Per-peer coordination handles for coordinated multi-source download.
+///
+/// Held by the peer thread, reused across sessions. The peer sends its
+/// discovered need_ids to the coordinator via `report_tx`, then polls
+/// `assign_rx` for its assigned subset.
+pub struct PeerCoord {
+    pub peer_idx: usize,
+    pub report_tx: std::sync::mpsc::Sender<Vec<EventId>>,
+    pub assign_rx: std::sync::mpsc::Receiver<Vec<EventId>>,
+}
+
+/// Assign events to peers using greedy load balancing.
+///
+/// Takes `(peer_idx, Vec<EventId>)` pairs from all reporting peers.
+/// Builds an `event_id -> Vec<peer_idx>` availability map, sorts by
+/// availability ascending (unique events first), then assigns each event
+/// to the least-loaded peer that has it.
+///
+/// Returns indexed `Vec` where `result[peer_idx]` = events assigned to that peer.
+fn assign_events(reports: &[(usize, Vec<EventId>)], total_peers: usize) -> Vec<Vec<EventId>> {
+    use std::collections::HashMap;
+
+    // Build event -> available peers map
+    let mut availability: HashMap<EventId, Vec<usize>> = HashMap::new();
+    for (peer_idx, events) in reports {
+        for eid in events {
+            availability.entry(*eid).or_default().push(*peer_idx);
+        }
+    }
+
+    // Sort by availability ascending (unique events assigned first)
+    let mut events_sorted: Vec<(EventId, Vec<usize>)> = availability.into_iter().collect();
+    events_sorted.sort_by_key(|(_, peers)| peers.len());
+
+    // Greedy assignment: least-loaded peer that has the event
+    let mut loads = vec![0usize; total_peers];
+    let mut assignments: Vec<Vec<EventId>> = vec![Vec::new(); total_peers];
+
+    for (eid, peers) in events_sorted {
+        // Pick peer with minimum load among those that have this event
+        let best = peers.iter()
+            .copied()
+            .min_by_key(|&p| loads[p])
+            .unwrap(); // peers is non-empty by construction
+        assignments[best].push(eid);
+        loads[best] += 1;
+    }
+
+    assignments
+}
+
+/// Coordinator thread for multi-source download rounds.
+///
+/// Each iteration is one round:
+/// 1. Block until the first peer reports its need_ids.
+/// 2. Start a 500ms collection window for remaining peers.
+/// 3. Call assign_events with collected reports.
+/// 4. Send assigned Vec<EventId> to each reporting peer.
+/// 5. Send empty Vec to non-reporting peers (unblocks their session).
+fn run_coordinator(
+    report_rxs: Vec<std::sync::mpsc::Receiver<Vec<EventId>>>,
+    assign_txs: Vec<std::sync::mpsc::Sender<Vec<EventId>>>,
+) {
+    let total_peers = report_rxs.len();
+    loop {
+        // Phase 1: Block until at least one peer reports
+        let mut reports: Vec<Option<Vec<EventId>>> = vec![None; total_peers];
+        let mut reported_count = 0;
+        let mut any_alive = false;
+
+        // Busy-poll until we get the first report (or all peers are dead)
+        loop {
+            let mut all_disconnected = true;
+            for (i, rx) in report_rxs.iter().enumerate() {
+                if reports[i].is_some() { continue; }
+                match rx.try_recv() {
+                    Ok(need_ids) => {
+                        reports[i] = Some(need_ids);
+                        reported_count += 1;
+                        any_alive = true;
+                        all_disconnected = false;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        all_disconnected = false;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+                }
+            }
+            if reported_count > 0 || all_disconnected { break; }
+            std::thread::sleep(COORDINATOR_POLL_INTERVAL);
+        }
+
+        if !any_alive && reported_count == 0 {
+            // All peers disconnected
+            return;
+        }
+
+        // Phase 2: Collection window for remaining peers.
+        // After the first report arrives, wait for others to finish reconciliation.
+        // 500ms accommodates real-network RTTs (50-200ms) while keeping round
+        // cadence reasonable. Stragglers report in the next round.
+        let deadline = Instant::now() + COORDINATOR_COLLECTION_WINDOW;
+        while reported_count < total_peers && Instant::now() < deadline {
+            for (i, rx) in report_rxs.iter().enumerate() {
+                if reports[i].is_some() { continue; }
+                match rx.try_recv() {
+                    Ok(need_ids) => {
+                        reports[i] = Some(need_ids);
+                        reported_count += 1;
+                    }
+                    Err(_) => {}
+                }
+            }
+            if reported_count < total_peers {
+                std::thread::sleep(COORDINATOR_COLLECTION_POLL);
+            }
+        }
+
+        // Phase 3: Assign events
+        let collected: Vec<(usize, Vec<EventId>)> = reports.iter().enumerate()
+            .filter_map(|(i, r)| r.as_ref().map(|ids| (i, ids.clone())))
+            .collect();
+        let assignments = assign_events(&collected, total_peers);
+
+        // Phase 4: Send assignments only to peers that reported this round.
+        // Non-reporting peers are still in reconciliation or between sessions;
+        // sending to them would queue a stale assignment consumed by the wrong session.
+        for (i, tx) in assign_txs.iter().enumerate() {
+            if reports[i].is_some() {
+                let assigned = assignments[i].clone();
+                if tx.send(assigned).is_err() {
+                    // Peer disconnected; continue with remaining peers
+                }
+            }
+        }
+    }
+}
+
 /// Run sync as the initiator (client role) with dual streams.
 /// Control stream: NegOpen, NegMsg, HaveList
 /// Data stream: Event blobs
+///
+/// Push (have_ids): always sends everything the peer needs.
+/// Pull (need_ids): when `coordination` is set, buffers need_ids and sends
+/// them to the coordinator for load-balanced assignment across peers.
+/// When coordination is None, requests all need_ids directly.
+///
+/// When `shared_ingest` is provided, events are sent to the shared channel
+/// instead of spawning a per-session batch_writer.
 pub async fn run_sync_initiator_dual<C, S, R>(
     conn: DualConnection<C, S, R>,
     db_path: &str,
     timeout_secs: u64,
     peer_id: &str,
     recorded_by: &str,
+    coordination: Option<&PeerCoord>,
+    shared_ingest: Option<mpsc::Sender<(EventId, Vec<u8>)>>,
 ) -> Result<SyncStats, Box<dyn std::error::Error + Send + Sync>>
 where
     C: StreamConn,
@@ -352,27 +576,31 @@ where
     let _ = wanted.clear();
 
     let neg_storage = NegentropyStorageSqlite::new(&neg_db);
-    neg_storage.rebuild_blocks().map_err(|e| format!("Failed to rebuild blocks: {}", e))?;
 
     neg_db.execute("BEGIN", []).map_err(|e| format!("Failed to begin snapshot: {}", e))?;
+    neg_storage.rebuild_blocks().map_err(|e| format!("Failed to rebuild blocks: {}", e))?;
 
-    let item_count = neg_storage.size().map_err(|e| format!("Failed to get size: {:?}", e))?;
-    info!("Loaded {} items for negentropy (SQLite-backed)", item_count);
-
-    let mut neg = Negentropy::new(Storage::Borrowed(&neg_storage), 64 * 1024)?;
+    let mut neg = Negentropy::new(Storage::Borrowed(&neg_storage), NEGENTROPY_FRAME_SIZE)?;
 
     let store = Store::new(&db);
 
-    let ingest_cap = if low_mem_mode() { 1000 } else { 5000 };
-    let (ingest_tx, ingest_rx) = mpsc::channel::<(EventId, Vec<u8>)>(ingest_cap);
     let events_received = Arc::new(AtomicU64::new(0));
-    let events_received_writer = events_received.clone();
     let bytes_received = Arc::new(AtomicU64::new(0));
 
-    let db_path_owned = db_path.to_string();
-    let recorded_by_owned = recorded_by.to_string();
-    let writer_handle =
-        tokio::task::spawn_blocking(move || batch_writer(db_path_owned, recorded_by_owned, ingest_rx, events_received_writer));
+    // Use shared ingest channel if provided, otherwise create per-session batch_writer
+    let (ingest_tx, writer_handle) = if let Some(shared_tx) = shared_ingest {
+        (shared_tx, None)
+    } else {
+        let ingest_cap = session_ingest_cap();
+        let (tx, rx) = mpsc::channel::<(EventId, Vec<u8>)>(ingest_cap);
+        let events_received_writer = events_received.clone();
+        let db_path_owned = db_path.to_string();
+        let recorded_by_owned = recorded_by.to_string();
+        let handle = tokio::task::spawn_blocking(move || {
+            batch_writer(db_path_owned, recorded_by_owned, rx, events_received_writer)
+        });
+        (tx, Some(handle))
+    };
 
     let mut have_ids: Vec<Id> = Vec::new();
     let mut need_ids: Vec<Id> = Vec::new();
@@ -387,12 +615,17 @@ where
 
     let mut reconciliation_done = false;
     let mut rounds = 0;
-    const HAVE_CHUNK: usize = 1000;
-    const NEED_CHUNK: usize = 1000;
 
     let mut completed = false;
     let mut done_sent = false;
     let sync_start = Instant::now();
+    // Pending have_ids buffer: populated by reconciliation, drained incrementally
+    let mut pending_have: Vec<EventId> = Vec::new();
+
+    // Coordination state: buffer need_ids during reconciliation, send to coordinator after
+    let mut coordinated_need_ids: Vec<EventId> = Vec::new();
+    let mut coordination_pending = coordination.is_some(); // waiting for assignment
+    let mut coordination_reported = false; // already sent report to coordinator
 
     loop {
         if start.elapsed() >= timeout {
@@ -400,7 +633,7 @@ where
             break;
         }
 
-        match tokio::time::timeout(Duration::from_millis(1), control.recv()).await {
+        match tokio::time::timeout(CONTROL_POLL_TIMEOUT, control.recv()).await {
             Ok(Ok(SyncMessage::NegMsg { msg })) => {
                 rounds += 1;
                 match neg.reconcile_with_ids(&msg, &mut have_ids, &mut need_ids)? {
@@ -409,53 +642,42 @@ where
                         control.flush().await?;
                     }
                     None => {
+                        info!("Reconciliation complete in {} rounds", rounds);
                         reconciliation_done = true;
                     }
                 }
 
+                // Convert have_ids to EventIds and add to pending buffer
                 if !have_ids.is_empty() {
-                    let mut batch: Vec<EventId> = Vec::with_capacity(HAVE_CHUNK);
+                    pending_have.reserve(have_ids.len());
                     for neg_id in have_ids.drain(..) {
-                        batch.push(neg_id_to_event_id(&neg_id));
-                        if batch.len() >= HAVE_CHUNK {
-                            let _ = egress.enqueue_events(peer_id, &batch);
-                            batch.clear();
-                        }
-                    }
-                    if !batch.is_empty() {
-                        let _ = egress.enqueue_events(peer_id, &batch);
+                        pending_have.push(neg_id_to_event_id(&neg_id));
                     }
                 }
 
                 if !need_ids.is_empty() {
-                    let mut batch: Vec<EventId> = Vec::with_capacity(NEED_CHUNK);
-                    for neg_id in need_ids.drain(..) {
-                        let event_id = neg_id_to_event_id(&neg_id);
-                        if wanted.insert(&event_id).unwrap_or(false) {
-                            batch.push(event_id);
+                    if coordination.is_some() {
+                        // Buffer need_ids for coordinator assignment
+                        for neg_id in need_ids.drain(..) {
+                            coordinated_need_ids.push(neg_id_to_event_id(&neg_id));
                         }
-                        if batch.len() >= NEED_CHUNK {
+                    } else {
+                        // No coordination: send HaveList immediately
+                        let mut batch: Vec<EventId> = Vec::with_capacity(NEED_CHUNK);
+                        for neg_id in need_ids.drain(..) {
+                            let event_id = neg_id_to_event_id(&neg_id);
+                            if wanted.insert(&event_id).unwrap_or(false) {
+                                batch.push(event_id);
+                            }
+                            if batch.len() >= NEED_CHUNK {
+                                control.send(&SyncMessage::HaveList { ids: batch }).await?;
+                                control.flush().await?;
+                                batch = Vec::with_capacity(NEED_CHUNK);
+                            }
+                        }
+                        if !batch.is_empty() {
                             control.send(&SyncMessage::HaveList { ids: batch }).await?;
                             control.flush().await?;
-                            batch = Vec::with_capacity(NEED_CHUNK);
-                        }
-                    }
-                    if !batch.is_empty() {
-                        control.send(&SyncMessage::HaveList { ids: batch }).await?;
-                        control.flush().await?;
-                    }
-                }
-
-                if reconciliation_done {
-                    let pending_out = egress.count_pending(peer_id).unwrap_or(0);
-                    let pending_in = wanted.count().unwrap_or(0);
-                    info!(
-                        "Reconciliation complete in {} rounds: outgoing={}, wanted={}",
-                        rounds, pending_out, pending_in
-                    );
-                    if let Ok(h) = egress.health(peer_id) {
-                        if h.pending > 0 || h.max_attempts > 0 {
-                            tracing::debug!(pending=%h.pending, max_attempts=%h.max_attempts, oldest_age_ms=%h.oldest_age_ms, "egress_queue health");
                         }
                     }
                 }
@@ -477,11 +699,63 @@ where
             Err(_) => {}
         }
 
+        // Coordination: after reconciliation, send need_ids to coordinator
+        if let Some(coord) = coordination {
+            if reconciliation_done && !coordination_reported {
+                let report = std::mem::take(&mut coordinated_need_ids);
+                info!("Reporting {} need_ids to coordinator (peer {})", report.len(), coord.peer_idx);
+                let _ = coord.report_tx.send(report);
+                coordination_reported = true;
+            }
+
+            // Poll for assignment (non-blocking so push path continues)
+            if coordination_pending && coordination_reported {
+                match coord.assign_rx.try_recv() {
+                    Ok(assigned) => {
+                        info!("Received {} assigned events from coordinator (peer {})",
+                            assigned.len(), coord.peer_idx);
+                        // Send HaveList for assigned events
+                        let mut batch: Vec<EventId> = Vec::with_capacity(NEED_CHUNK);
+                        for event_id in assigned {
+                            if wanted.insert(&event_id).unwrap_or(false) {
+                                batch.push(event_id);
+                            }
+                            if batch.len() >= NEED_CHUNK {
+                                let _ = control.send(&SyncMessage::HaveList { ids: batch }).await;
+                                let _ = control.flush().await;
+                                batch = Vec::with_capacity(NEED_CHUNK);
+                            }
+                        }
+                        if !batch.is_empty() {
+                            let _ = control.send(&SyncMessage::HaveList { ids: batch }).await;
+                            let _ = control.flush().await;
+                        }
+                        coordination_pending = false;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        // Coordinator gone; proceed without assignment
+                        coordination_pending = false;
+                    }
+                }
+            }
+        }
+
+        // Incrementally enqueue pending have_ids to egress queue.
+        // Processes up to ENQUEUE_BATCH per iteration so streaming can interleave.
+        if !pending_have.is_empty() {
+            let drain_count = pending_have.len().min(ENQUEUE_BATCH);
+            let to_enqueue: Vec<EventId> = pending_have.drain(..drain_count).collect();
+            for chunk in to_enqueue.chunks(HAVE_CHUNK) {
+                let _ = egress.enqueue_events(peer_id, chunk);
+            }
+        }
+
         // Stream events from DB queue on data stream
         let mut sent_this_round = 0;
         let mut blocked = false;
         while !blocked {
-            let batch = egress.claim_batch(peer_id, 500, 30_000).unwrap_or_default();
+            let batch = egress.claim_batch(peer_id, EGRESS_CLAIM_COUNT, EGRESS_CLAIM_LEASE_MS).unwrap_or_default();
             if batch.is_empty() {
                 break;
             }
@@ -510,9 +784,9 @@ where
             let _ = data_send.flush().await;
         }
 
-        // Once reconciliation is done and egress queue is drained,
-        // send DataDone on data stream then Done on control.
-        if reconciliation_done && !done_sent {
+        // Once reconciliation is done, coordination resolved, pending_have drained,
+        // and egress queue empty, send DataDone on data stream then Done on control.
+        if reconciliation_done && !coordination_pending && pending_have.is_empty() && !done_sent {
             let pending_out = egress.count_pending(peer_id).unwrap_or(0);
             if pending_out == 0 {
                 let _ = data_send.flush().await;
@@ -530,14 +804,14 @@ where
     if completed {
         let _ = egress.clear_connection(peer_id);
         let _ = wanted.clear();
-        let _ = egress.cleanup_sent(300_000);
+        let _ = egress.cleanup_sent(EGRESS_SENT_TTL_MS);
     }
     let _ = neg_db.execute("COMMIT", []);
 
     // Wait for inbound data drain: data receiver exits on peer's DataDone.
     // Use timeout fallback to avoid hanging if peer misbehaves.
     if completed {
-        let drain_timeout = Duration::from_secs(5);
+        let drain_timeout = DATA_DRAIN_TIMEOUT;
         match tokio::time::timeout(drain_timeout, data_drained_rx).await {
             Ok(Ok(())) => info!("Inbound data fully drained"),
             Ok(Err(_)) => info!("Data drain channel dropped (receiver already exited)"),
@@ -548,7 +822,9 @@ where
     let _ = recv_handle.await;
     // Drop ingest_tx so batch_writer sees channel close and drains
     drop(ingest_tx);
-    let _ = writer_handle.await;
+    if let Some(handle) = writer_handle {
+        let _ = handle.await;
+    }
 
     let stats = SyncStats {
         events_sent,
@@ -563,12 +839,17 @@ where
 }
 
 /// Run sync as the responder (server role) with dual streams.
+///
+/// When `shared_ingest` is provided, events are sent to the shared channel
+/// instead of spawning a per-session batch_writer. This eliminates SQLite
+/// write contention when multiple sources sync concurrently.
 pub async fn run_sync_responder_dual<C, S, R>(
     conn: DualConnection<C, S, R>,
     db_path: &str,
     timeout_secs: u64,
     peer_id: &str,
     recorded_by: &str,
+    shared_ingest: Option<mpsc::Sender<(EventId, Vec<u8>)>>,
 ) -> Result<SyncStats, Box<dyn std::error::Error + Send + Sync>>
 where
     C: StreamConn,
@@ -592,27 +873,31 @@ where
     let _ = egress.clear_connection(peer_id);
 
     let neg_storage = NegentropyStorageSqlite::new(&neg_db);
-    neg_storage.rebuild_blocks().map_err(|e| format!("Failed to rebuild blocks: {}", e))?;
 
     neg_db.execute("BEGIN", []).map_err(|e| format!("Failed to begin snapshot: {}", e))?;
+    neg_storage.rebuild_blocks().map_err(|e| format!("Failed to rebuild blocks: {}", e))?;
 
-    let item_count = neg_storage.size().map_err(|e| format!("Failed to get size: {:?}", e))?;
-    info!("Loaded {} items for negentropy (SQLite-backed)", item_count);
-
-    let mut neg = Negentropy::new(Storage::Borrowed(&neg_storage), 64 * 1024)?;
+    let mut neg = Negentropy::new(Storage::Borrowed(&neg_storage), NEGENTROPY_FRAME_SIZE)?;
 
     let store = Store::new(&db);
 
-    let ingest_cap = if low_mem_mode() { 1000 } else { 5000 };
-    let (ingest_tx, ingest_rx) = mpsc::channel::<(EventId, Vec<u8>)>(ingest_cap);
     let events_received = Arc::new(AtomicU64::new(0));
-    let events_received_writer = events_received.clone();
     let bytes_received = Arc::new(AtomicU64::new(0));
 
-    let db_path_owned = db_path.to_string();
-    let recorded_by_owned = recorded_by.to_string();
-    let writer_handle =
-        tokio::task::spawn_blocking(move || batch_writer(db_path_owned, recorded_by_owned, ingest_rx, events_received_writer));
+    // Use shared ingest channel if provided, otherwise create per-session batch_writer
+    let (ingest_tx, writer_handle) = if let Some(shared_tx) = shared_ingest {
+        (shared_tx, None)
+    } else {
+        let ingest_cap = session_ingest_cap();
+        let (tx, rx) = mpsc::channel::<(EventId, Vec<u8>)>(ingest_cap);
+        let events_received_writer = events_received.clone();
+        let db_path_owned = db_path.to_string();
+        let recorded_by_owned = recorded_by.to_string();
+        let handle = tokio::task::spawn_blocking(move || {
+            batch_writer(db_path_owned, recorded_by_owned, rx, events_received_writer)
+        });
+        (tx, Some(handle))
+    };
 
     let (shutdown_tx, data_drained_rx, recv_handle) =
         spawn_data_receiver(data_recv, ingest_tx.clone(), bytes_received.clone());
@@ -630,7 +915,7 @@ where
             break;
         }
 
-        match tokio::time::timeout(Duration::from_millis(1), control.recv()).await {
+        match tokio::time::timeout(CONTROL_POLL_TIMEOUT, control.recv()).await {
             Ok(Ok(SyncMessage::NegOpen { msg })) | Ok(Ok(SyncMessage::NegMsg { msg })) => {
                 rounds += 1;
 
@@ -668,7 +953,7 @@ where
         let mut sent_this_round = 0;
         let mut blocked = false;
         while !blocked {
-            let batch = egress.claim_batch(peer_id, 500, 30_000).unwrap_or_default();
+            let batch = egress.claim_batch(peer_id, EGRESS_CLAIM_COUNT, EGRESS_CLAIM_LEASE_MS).unwrap_or_default();
             if batch.is_empty() {
                 break;
             }
@@ -710,7 +995,7 @@ where
                 data_send.flush().await?;
 
                 // Wait for our data receiver to confirm peer's DataDone
-                let drain_timeout = Duration::from_secs(5);
+                let drain_timeout = DATA_DRAIN_TIMEOUT;
                 match tokio::time::timeout(drain_timeout, data_drained_rx).await {
                     Ok(Ok(())) => info!("Inbound data fully drained"),
                     Ok(Err(_)) => info!("Data drain channel dropped (receiver already exited)"),
@@ -729,14 +1014,16 @@ where
 
     if completed {
         let _ = egress.clear_connection(peer_id);
-        let _ = egress.cleanup_sent(300_000);
+        let _ = egress.cleanup_sent(EGRESS_SENT_TTL_MS);
     }
     let _ = neg_db.execute("COMMIT", []);
     let _ = shutdown_tx.send(());
     let _ = recv_handle.await;
     // Drop ingest_tx so batch_writer sees channel close and drains
     drop(ingest_tx);
-    let _ = writer_handle.await;
+    if let Some(handle) = writer_handle {
+        let _ = handle.await;
+    }
 
     let stats = SyncStats {
         events_sent,
@@ -752,13 +1039,14 @@ where
 
 /// Accept incoming connections and run responder sync sessions.
 ///
-/// Outer loop reconnects on connection drop. Inner loop runs repeated
-/// sync sessions on the same connection.
+/// Each incoming connection is handled on its own thread so multiple sources
+/// can sync simultaneously. A shared ingress dedup set prevents redundant
+/// batch_writer processing when multiple sources offer the same event.
 pub async fn accept_loop(
     db_path: &str,
     recorded_by: &str,
     endpoint: quinn::Endpoint,
-    allowed_peers: Option<crate::transport::AllowedPeers>,
+    _allowed_peers: Option<crate::transport::AllowedPeers>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     {
         let db = open_connection(db_path)?;
@@ -786,24 +1074,26 @@ pub async fn accept_loop(
         }
     }
 
-    // Use LocalSet so connection handlers (which use rusqlite, !Send) can be
-    // spawned concurrently on the current-thread runtime.
-    let local = tokio::task::LocalSet::new();
-    local.run_until(accept_loop_inner(db_path, recorded_by, endpoint, allowed_peers)).await
-}
+    // Shared batch_writer: single writer thread for all concurrent responder sessions.
+    // Eliminates SQLite WAL contention from multiple writers hitting the same DB.
+    let ingest_cap = shared_ingest_cap();
+    let (shared_ingest_tx, shared_ingest_rx) = mpsc::channel::<(EventId, Vec<u8>)>(ingest_cap);
+    let shared_events_received = Arc::new(AtomicU64::new(0));
+    let writer_events = shared_events_received.clone();
+    let writer_db_path = db_path.to_string();
+    let writer_recorded_by = recorded_by.to_string();
+    let _writer_handle = std::thread::spawn(move || {
+        batch_writer(writer_db_path, writer_recorded_by, shared_ingest_rx, writer_events);
+    });
 
-async fn accept_loop_inner(
-    db_path: &str,
-    recorded_by: &str,
-    endpoint: quinn::Endpoint,
-    allowed_peers: Option<crate::transport::AllowedPeers>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     loop {
         info!("Waiting for incoming connection...");
         let incoming = match endpoint.accept().await {
             Some(inc) => inc,
             None => {
                 info!("Endpoint closed, stopping accept_loop");
+                // Drop sender so batch_writer exits
+                drop(shared_ingest_tx);
                 return Ok(());
             }
         };
@@ -837,7 +1127,6 @@ async fn accept_loop_inner(
                     now,
                     ENDPOINT_TTL_MS,
                 );
-                // Record transport binding (peer_id is hex SPKI fingerprint)
                 if let Ok(spki_bytes) = hex::decode(&peer_id) {
                     if spki_bytes.len() == 32 {
                         let mut fp = [0u8; 32];
@@ -852,52 +1141,43 @@ async fn accept_loop_inner(
             }
         }
 
-        // Spawn connection handler as a local task so accept loop can
-        // keep accepting new connections (required for multi-peer / introducer).
-        // spawn_local because run_sync_responder_dual uses rusqlite (!Send).
-        let conn_db = db_path.to_string();
-        let conn_rb = recorded_by.to_string();
-        let conn_ep = endpoint.clone();
-        let conn_ap = allowed_peers.clone();
-        tokio::task::spawn_local(async move {
-            // Spawn intro listener for uni-streams on this connection
-            let _intro_handle = if let Some(ref ap) = conn_ap {
-                Some(crate::sync::punch::spawn_intro_listener(
-                    connection.clone(),
-                    conn_db.clone(),
-                    conn_rb.clone(),
-                    peer_id.clone(),
-                    conn_ep,
-                    ap.clone(),
-                ))
-            } else {
-                None
-            };
+        // Spawn a thread for this connection so multiple sources sync concurrently.
+        let db_path_owned = db_path.to_string();
+        let recorded_by_owned = recorded_by.to_string();
+        let ingest_clone = shared_ingest_tx.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                loop {
+                    let (ctrl_send, ctrl_recv) = match connection.accept_bi().await {
+                        Ok(streams) => streams,
+                        Err(e) => {
+                            info!("Connection dropped (control accept): {}", e);
+                            break;
+                        }
+                    };
+                    let (data_send, data_recv) = match connection.accept_bi().await {
+                        Ok(streams) => streams,
+                        Err(e) => {
+                            info!("Connection dropped (data accept): {}", e);
+                            break;
+                        }
+                    };
+                    let conn = DualConnection::new(ctrl_send, ctrl_recv, data_send, data_recv);
 
-            // Inner loop: repeated sync sessions on this connection
-            loop {
-                let (ctrl_send, ctrl_recv) = match connection.accept_bi().await {
-                    Ok(streams) => streams,
-                    Err(e) => {
-                        info!("Connection dropped (control accept): {}", e);
-                        break;
+                    if let Err(e) = run_sync_responder_dual(
+                        conn, &db_path_owned, SYNC_SESSION_TIMEOUT_SECS, &peer_id, &recorded_by_owned,
+                        Some(ingest_clone.clone()),
+                    ).await {
+                        warn!("Responder session error: {}", e);
                     }
-                };
-                let (data_send, data_recv) = match connection.accept_bi().await {
-                    Ok(streams) => streams,
-                    Err(e) => {
-                        info!("Connection dropped (data accept): {}", e);
-                        break;
-                    }
-                };
-                let conn = DualConnection::new(ctrl_send, ctrl_recv, data_send, data_recv);
 
-                if let Err(e) = run_sync_responder_dual(conn, &conn_db, 60, &peer_id, &conn_rb).await {
-                    warn!("Responder session error: {}", e);
+                    tokio::time::sleep(SESSION_GAP).await;
                 }
-
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
+            });
         });
     }
 }
@@ -959,13 +1239,13 @@ async fn connect_loop_inner(
                 Ok(c) => c,
                 Err(e) => {
                     warn!("Failed to connect to {}: {}", remote, e);
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    tokio::time::sleep(CONNECT_RETRY_DELAY).await;
                     continue;
                 }
             },
             Err(e) => {
                 warn!("Failed to initiate connection to {}: {}", remote, e);
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                tokio::time::sleep(CONNECT_RETRY_DELAY).await;
                 continue;
             }
         };
@@ -973,7 +1253,7 @@ async fn connect_loop_inner(
             Some(id) => id,
             None => {
                 warn!("Could not extract peer identity, retrying...");
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                tokio::time::sleep(CONNECT_RETRY_DELAY).await;
                 continue;
             }
         };
@@ -1046,11 +1326,154 @@ async fn connect_loop_inner(
             conn.flush_control().await?;
             conn.flush_data().await?;
 
-            if let Err(e) = run_sync_initiator_dual(conn, db_path, 60, &peer_id, recorded_by).await {
+            if let Err(e) = run_sync_initiator_dual(
+                conn, db_path, SYNC_SESSION_TIMEOUT_SECS, &peer_id, recorded_by, None, None,
+            ).await {
                 warn!("Initiator session error: {}", e);
             }
 
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(SESSION_GAP).await;
         }
     }
+}
+
+/// Download from multiple sources concurrently (sink as initiator).
+///
+/// Uses coordinated round-based assignment: each sync round, peers report
+/// their discovered need_ids to a coordinator thread, which assigns events
+/// to peers using greedy load balancing (least-loaded peer that has the event).
+/// Undelivered events re-appear as need_ids in the next round and get
+/// reassigned — slow peers don't block downloads permanently.
+///
+/// A shared batch_writer handles all incoming events from all sources.
+pub async fn download_from_sources(
+    db_path: &str,
+    recorded_by: &str,
+    endpoints: Vec<(quinn::Endpoint, SocketAddr)>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    {
+        let db = open_connection(db_path)?;
+        create_tables(&db)?;
+    }
+
+    let total = endpoints.len();
+
+    // Shared batch_writer: single writer for all source connections
+    let ingest_cap = shared_ingest_cap();
+    let (shared_tx, shared_rx) = mpsc::channel::<(EventId, Vec<u8>)>(ingest_cap);
+    let shared_events = Arc::new(AtomicU64::new(0));
+    let writer_events = shared_events.clone();
+    let writer_db_path = db_path.to_string();
+    let writer_recorded_by = recorded_by.to_string();
+    let _writer_handle = std::thread::spawn(move || {
+        batch_writer(writer_db_path, writer_recorded_by, shared_rx, writer_events);
+    });
+
+    // Create per-peer coordination channels
+    let mut peer_coords = Vec::new();
+    let mut report_rxs = Vec::new();
+    let mut assign_txs = Vec::new();
+
+    for i in 0..total {
+        let (report_tx, report_rx) = std::sync::mpsc::channel::<Vec<EventId>>();
+        let (assign_tx, assign_rx) = std::sync::mpsc::channel::<Vec<EventId>>();
+        peer_coords.push(PeerCoord {
+            peer_idx: i,
+            report_tx,
+            assign_rx,
+        });
+        report_rxs.push(report_rx);
+        assign_txs.push(assign_tx);
+    }
+
+    // Spawn coordinator thread
+    let _coord_handle = std::thread::spawn(move || {
+        run_coordinator(report_rxs, assign_txs);
+    });
+
+    let mut handles = Vec::new();
+
+    for (peer_coord, (endpoint, remote)) in peer_coords.into_iter().zip(endpoints.into_iter()) {
+        let db_path = db_path.to_string();
+        let recorded_by = recorded_by.to_string();
+        let ingest_tx = shared_tx.clone();
+
+        handles.push(std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                loop {
+                    let connection = match endpoint.connect(remote, "localhost") {
+                        Ok(connecting) => match connecting.await {
+                            Ok(c) => c,
+                            Err(e) => {
+                                warn!("Failed to connect to {}: {}", remote, e);
+                                tokio::time::sleep(CONNECT_RETRY_DELAY).await;
+                                continue;
+                            }
+                        },
+                        Err(e) => {
+                            warn!("Failed to initiate connection to {}: {}", remote, e);
+                            tokio::time::sleep(CONNECT_RETRY_DELAY).await;
+                            continue;
+                        }
+                    };
+                    let peer_id = match peer_identity_from_connection(&connection) {
+                        Some(id) => id,
+                        None => {
+                            warn!("Could not extract peer identity, retrying...");
+                            tokio::time::sleep(CONNECT_RETRY_DELAY).await;
+                            continue;
+                        }
+                    };
+                    info!("Connected to {} for download", peer_id);
+
+                    // Inner loop: repeated sync sessions
+                    loop {
+                        let (ctrl_send, ctrl_recv) = match connection.open_bi().await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                info!("Connection dropped (control): {}", e);
+                                break;
+                            }
+                        };
+                        let (data_send, data_recv) = match connection.open_bi().await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                info!("Connection dropped (data): {}", e);
+                                break;
+                            }
+                        };
+                        let mut conn = DualConnection::new(
+                            ctrl_send, ctrl_recv, data_send, data_recv,
+                        );
+
+                        let _ = conn.control.send(&SyncMessage::HaveList { ids: vec![] }).await;
+                        let _ = conn.data_send.send(&SyncMessage::HaveList { ids: vec![] }).await;
+                        let _ = conn.flush_control().await;
+                        let _ = conn.flush_data().await;
+
+                        if let Err(e) = run_sync_initiator_dual(
+                            conn, &db_path, SYNC_SESSION_TIMEOUT_SECS, &peer_id, &recorded_by,
+                            Some(&peer_coord), Some(ingest_tx.clone()),
+                        ).await {
+                            warn!("Download session error: {}", e);
+                        }
+
+                        tokio::time::sleep(SESSION_GAP).await;
+                    }
+                }
+            });
+        }));
+    }
+
+    // Drop our copy so writer exits when all sessions drop theirs
+    drop(shared_tx);
+
+    for handle in handles {
+        let _ = handle.join();
+    }
+    Ok(())
 }

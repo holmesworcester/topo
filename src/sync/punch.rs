@@ -236,7 +236,7 @@ async fn run_sync_on_punched_connection(
     let _ = conn.flush_control().await;
     let _ = conn.flush_data().await;
 
-    match run_sync_initiator_dual(conn, db_path, 60, peer_id, recorded_by).await {
+    match run_sync_initiator_dual(conn, db_path, 60, peer_id, recorded_by, None, None).await {
         Ok(stats) => {
             info!("Punched sync complete: sent={}, recv={}, rounds={}",
                 stats.events_sent, stats.events_received, stats.neg_rounds);
