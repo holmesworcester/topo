@@ -60,8 +60,74 @@ fn current_timestamp_ms() -> i64 {
         .as_millis() as i64
 }
 
+// ---------------------------------------------------------------------------
+// Tuning constants
+// ---------------------------------------------------------------------------
+
 /// Endpoint observation TTL: 24 hours in milliseconds.
 const ENDPOINT_TTL_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// Negentropy frame size limit. Controls the maximum message size for
+/// set reconciliation rounds. Larger = fewer rounds, more memory per round.
+const NEGENTROPY_FRAME_SIZE: u64 = 64 * 1024;
+
+/// Max event IDs sent per HaveList message during reconciliation.
+/// Limits wire message size for the "I have these events" announcements.
+const HAVE_CHUNK: usize = 1000;
+
+/// Max event IDs sent per NeedList/HaveList request during reconciliation.
+/// Limits wire message size for the "I need these events" announcements.
+const NEED_CHUNK: usize = 1000;
+
+/// Max events to enqueue into the egress queue per main-loop iteration.
+/// Keeps the loop responsive by interleaving reconciliation with streaming.
+const ENQUEUE_BATCH: usize = 5000;
+
+/// Max events per egress claim (one send batch to the data stream).
+const EGRESS_CLAIM_COUNT: usize = 500;
+
+/// Lease duration (ms) for claimed egress events. If not sent within this
+/// window, events become available for re-claim. 30s is generous — avoids
+/// spurious re-sends while allowing recovery from stuck sessions.
+const EGRESS_CLAIM_LEASE_MS: i64 = 30_000;
+
+/// Negentropy session timeout for initiator and responder (seconds).
+pub const SYNC_SESSION_TIMEOUT_SECS: u64 = 60;
+
+/// Time to wait for inbound data stream drain at session end.
+const DATA_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Sleep between consecutive sync sessions on the same connection.
+/// Prevents busy-looping when sessions complete instantly.
+const SESSION_GAP: Duration = Duration::from_millis(100);
+
+/// Sleep after a failed QUIC connection attempt before retrying.
+const CONNECT_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+/// Max age (ms) for sent egress entries before cleanup.
+const EGRESS_SENT_TTL_MS: i64 = 300_000;
+
+/// Non-blocking poll timeout for the control stream receive.
+/// Effectively a busy-poll interval — the main loop does useful egress
+/// work between polls so 1ms doesn't waste CPU in practice.
+const CONTROL_POLL_TIMEOUT: Duration = Duration::from_millis(1);
+
+// -- Coordinator timing (B-coordinated / download_from_sources) --
+
+/// How long the coordinator waits (after the first peer reports) for
+/// remaining peers to finish reconciliation and report their need_ids.
+/// Must exceed typical network RTT (50-200ms) so that all peers can
+/// participate in each round's assignment. Peers that miss the window
+/// get assigned work in the next round.
+const COORDINATOR_COLLECTION_WINDOW: Duration = Duration::from_millis(500);
+
+/// Coordinator busy-poll interval while waiting for the first peer report.
+const COORDINATOR_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Coordinator poll interval within the collection window.
+const COORDINATOR_COLLECTION_POLL: Duration = Duration::from_millis(2);
+
+// -- Batch writer sizing --
 
 /// Batch writer drain batch size: 100 normal, 50 in low_mem.
 fn drain_batch_size() -> usize {
@@ -71,6 +137,16 @@ fn drain_batch_size() -> usize {
 /// Batch writer write batch cap: 1000 normal, 500 in low_mem.
 fn write_batch_cap() -> usize {
     if low_mem_mode() { 500 } else { 1000 }
+}
+
+/// Async channel capacity for per-session ingest (initiator/responder).
+fn session_ingest_cap() -> usize {
+    if low_mem_mode() { 1000 } else { 5000 }
+}
+
+/// Async channel capacity for shared ingest (accept_loop / download_from_sources).
+fn shared_ingest_cap() -> usize {
+    if low_mem_mode() { 1000 } else { 10000 }
 }
 
 /// Batch writer task - drains channel and writes to SQLite in batches.
@@ -407,7 +483,7 @@ fn run_coordinator(
                 }
             }
             if reported_count > 0 || all_disconnected { break; }
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(COORDINATOR_POLL_INTERVAL);
         }
 
         if !any_alive && reported_count == 0 {
@@ -415,11 +491,11 @@ fn run_coordinator(
             return;
         }
 
-        // Phase 2: Short collection window for remaining peers.
-        // After the first report arrives, collect any others that are immediately
-        // ready. Very short window (20ms) avoids convoy effects — fast peers
-        // shouldn't stall for slow ones. Stragglers report in the next round.
-        let deadline = Instant::now() + Duration::from_millis(20);
+        // Phase 2: Collection window for remaining peers.
+        // After the first report arrives, wait for others to finish reconciliation.
+        // 500ms accommodates real-network RTTs (50-200ms) while keeping round
+        // cadence reasonable. Stragglers report in the next round.
+        let deadline = Instant::now() + COORDINATOR_COLLECTION_WINDOW;
         while reported_count < total_peers && Instant::now() < deadline {
             for (i, rx) in report_rxs.iter().enumerate() {
                 if reports[i].is_some() { continue; }
@@ -432,7 +508,7 @@ fn run_coordinator(
                 }
             }
             if reported_count < total_peers {
-                std::thread::sleep(Duration::from_millis(2));
+                std::thread::sleep(COORDINATOR_COLLECTION_POLL);
             }
         }
 
@@ -504,7 +580,7 @@ where
     neg_db.execute("BEGIN", []).map_err(|e| format!("Failed to begin snapshot: {}", e))?;
     neg_storage.rebuild_blocks().map_err(|e| format!("Failed to rebuild blocks: {}", e))?;
 
-    let mut neg = Negentropy::new(Storage::Borrowed(&neg_storage), 64 * 1024)?;
+    let mut neg = Negentropy::new(Storage::Borrowed(&neg_storage), NEGENTROPY_FRAME_SIZE)?;
 
     let store = Store::new(&db);
 
@@ -515,7 +591,7 @@ where
     let (ingest_tx, writer_handle) = if let Some(shared_tx) = shared_ingest {
         (shared_tx, None)
     } else {
-        let ingest_cap = if low_mem_mode() { 1000 } else { 5000 };
+        let ingest_cap = session_ingest_cap();
         let (tx, rx) = mpsc::channel::<(EventId, Vec<u8>)>(ingest_cap);
         let events_received_writer = events_received.clone();
         let db_path_owned = db_path.to_string();
@@ -539,10 +615,6 @@ where
 
     let mut reconciliation_done = false;
     let mut rounds = 0;
-    const HAVE_CHUNK: usize = 1000;
-    const NEED_CHUNK: usize = 1000;
-    /// Max events to enqueue per main loop iteration (allows interleaving with streaming)
-    const ENQUEUE_BATCH: usize = 5000;
 
     let mut completed = false;
     let mut done_sent = false;
@@ -561,7 +633,7 @@ where
             break;
         }
 
-        match tokio::time::timeout(Duration::from_millis(1), control.recv()).await {
+        match tokio::time::timeout(CONTROL_POLL_TIMEOUT, control.recv()).await {
             Ok(Ok(SyncMessage::NegMsg { msg })) => {
                 rounds += 1;
                 match neg.reconcile_with_ids(&msg, &mut have_ids, &mut need_ids)? {
@@ -683,7 +755,7 @@ where
         let mut sent_this_round = 0;
         let mut blocked = false;
         while !blocked {
-            let batch = egress.claim_batch(peer_id, 500, 30_000).unwrap_or_default();
+            let batch = egress.claim_batch(peer_id, EGRESS_CLAIM_COUNT, EGRESS_CLAIM_LEASE_MS).unwrap_or_default();
             if batch.is_empty() {
                 break;
             }
@@ -732,14 +804,14 @@ where
     if completed {
         let _ = egress.clear_connection(peer_id);
         let _ = wanted.clear();
-        let _ = egress.cleanup_sent(300_000);
+        let _ = egress.cleanup_sent(EGRESS_SENT_TTL_MS);
     }
     let _ = neg_db.execute("COMMIT", []);
 
     // Wait for inbound data drain: data receiver exits on peer's DataDone.
     // Use timeout fallback to avoid hanging if peer misbehaves.
     if completed {
-        let drain_timeout = Duration::from_secs(5);
+        let drain_timeout = DATA_DRAIN_TIMEOUT;
         match tokio::time::timeout(drain_timeout, data_drained_rx).await {
             Ok(Ok(())) => info!("Inbound data fully drained"),
             Ok(Err(_)) => info!("Data drain channel dropped (receiver already exited)"),
@@ -805,7 +877,7 @@ where
     neg_db.execute("BEGIN", []).map_err(|e| format!("Failed to begin snapshot: {}", e))?;
     neg_storage.rebuild_blocks().map_err(|e| format!("Failed to rebuild blocks: {}", e))?;
 
-    let mut neg = Negentropy::new(Storage::Borrowed(&neg_storage), 64 * 1024)?;
+    let mut neg = Negentropy::new(Storage::Borrowed(&neg_storage), NEGENTROPY_FRAME_SIZE)?;
 
     let store = Store::new(&db);
 
@@ -816,7 +888,7 @@ where
     let (ingest_tx, writer_handle) = if let Some(shared_tx) = shared_ingest {
         (shared_tx, None)
     } else {
-        let ingest_cap = if low_mem_mode() { 1000 } else { 5000 };
+        let ingest_cap = session_ingest_cap();
         let (tx, rx) = mpsc::channel::<(EventId, Vec<u8>)>(ingest_cap);
         let events_received_writer = events_received.clone();
         let db_path_owned = db_path.to_string();
@@ -843,7 +915,7 @@ where
             break;
         }
 
-        match tokio::time::timeout(Duration::from_millis(1), control.recv()).await {
+        match tokio::time::timeout(CONTROL_POLL_TIMEOUT, control.recv()).await {
             Ok(Ok(SyncMessage::NegOpen { msg })) | Ok(Ok(SyncMessage::NegMsg { msg })) => {
                 rounds += 1;
 
@@ -881,7 +953,7 @@ where
         let mut sent_this_round = 0;
         let mut blocked = false;
         while !blocked {
-            let batch = egress.claim_batch(peer_id, 500, 30_000).unwrap_or_default();
+            let batch = egress.claim_batch(peer_id, EGRESS_CLAIM_COUNT, EGRESS_CLAIM_LEASE_MS).unwrap_or_default();
             if batch.is_empty() {
                 break;
             }
@@ -923,7 +995,7 @@ where
                 data_send.flush().await?;
 
                 // Wait for our data receiver to confirm peer's DataDone
-                let drain_timeout = Duration::from_secs(5);
+                let drain_timeout = DATA_DRAIN_TIMEOUT;
                 match tokio::time::timeout(drain_timeout, data_drained_rx).await {
                     Ok(Ok(())) => info!("Inbound data fully drained"),
                     Ok(Err(_)) => info!("Data drain channel dropped (receiver already exited)"),
@@ -942,7 +1014,7 @@ where
 
     if completed {
         let _ = egress.clear_connection(peer_id);
-        let _ = egress.cleanup_sent(300_000);
+        let _ = egress.cleanup_sent(EGRESS_SENT_TTL_MS);
     }
     let _ = neg_db.execute("COMMIT", []);
     let _ = shutdown_tx.send(());
@@ -1004,7 +1076,7 @@ pub async fn accept_loop(
 
     // Shared batch_writer: single writer thread for all concurrent responder sessions.
     // Eliminates SQLite WAL contention from multiple writers hitting the same DB.
-    let ingest_cap = if low_mem_mode() { 1000 } else { 10000 };
+    let ingest_cap = shared_ingest_cap();
     let (shared_ingest_tx, shared_ingest_rx) = mpsc::channel::<(EventId, Vec<u8>)>(ingest_cap);
     let shared_events_received = Arc::new(AtomicU64::new(0));
     let writer_events = shared_events_received.clone();
@@ -1097,13 +1169,13 @@ pub async fn accept_loop(
                     let conn = DualConnection::new(ctrl_send, ctrl_recv, data_send, data_recv);
 
                     if let Err(e) = run_sync_responder_dual(
-                        conn, &db_path_owned, 60, &peer_id, &recorded_by_owned,
+                        conn, &db_path_owned, SYNC_SESSION_TIMEOUT_SECS, &peer_id, &recorded_by_owned,
                         Some(ingest_clone.clone()),
                     ).await {
                         warn!("Responder session error: {}", e);
                     }
 
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    tokio::time::sleep(SESSION_GAP).await;
                 }
             });
         });
@@ -1167,13 +1239,13 @@ async fn connect_loop_inner(
                 Ok(c) => c,
                 Err(e) => {
                     warn!("Failed to connect to {}: {}", remote, e);
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    tokio::time::sleep(CONNECT_RETRY_DELAY).await;
                     continue;
                 }
             },
             Err(e) => {
                 warn!("Failed to initiate connection to {}: {}", remote, e);
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                tokio::time::sleep(CONNECT_RETRY_DELAY).await;
                 continue;
             }
         };
@@ -1181,7 +1253,7 @@ async fn connect_loop_inner(
             Some(id) => id,
             None => {
                 warn!("Could not extract peer identity, retrying...");
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                tokio::time::sleep(CONNECT_RETRY_DELAY).await;
                 continue;
             }
         };
@@ -1255,12 +1327,12 @@ async fn connect_loop_inner(
             conn.flush_data().await?;
 
             if let Err(e) = run_sync_initiator_dual(
-                conn, db_path, 60, &peer_id, recorded_by, None, None,
+                conn, db_path, SYNC_SESSION_TIMEOUT_SECS, &peer_id, recorded_by, None, None,
             ).await {
                 warn!("Initiator session error: {}", e);
             }
 
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(SESSION_GAP).await;
         }
     }
 }
@@ -1287,7 +1359,7 @@ pub async fn download_from_sources(
     let total = endpoints.len();
 
     // Shared batch_writer: single writer for all source connections
-    let ingest_cap = if low_mem_mode() { 1000 } else { 10000 };
+    let ingest_cap = shared_ingest_cap();
     let (shared_tx, shared_rx) = mpsc::channel::<(EventId, Vec<u8>)>(ingest_cap);
     let shared_events = Arc::new(AtomicU64::new(0));
     let writer_events = shared_events.clone();
@@ -1338,13 +1410,13 @@ pub async fn download_from_sources(
                             Ok(c) => c,
                             Err(e) => {
                                 warn!("Failed to connect to {}: {}", remote, e);
-                                tokio::time::sleep(Duration::from_secs(1)).await;
+                                tokio::time::sleep(CONNECT_RETRY_DELAY).await;
                                 continue;
                             }
                         },
                         Err(e) => {
                             warn!("Failed to initiate connection to {}: {}", remote, e);
-                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            tokio::time::sleep(CONNECT_RETRY_DELAY).await;
                             continue;
                         }
                     };
@@ -1352,7 +1424,7 @@ pub async fn download_from_sources(
                         Some(id) => id,
                         None => {
                             warn!("Could not extract peer identity, retrying...");
-                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            tokio::time::sleep(CONNECT_RETRY_DELAY).await;
                             continue;
                         }
                     };
@@ -1384,13 +1456,13 @@ pub async fn download_from_sources(
                         let _ = conn.flush_data().await;
 
                         if let Err(e) = run_sync_initiator_dual(
-                            conn, &db_path, 60, &peer_id, &recorded_by,
+                            conn, &db_path, SYNC_SESSION_TIMEOUT_SECS, &peer_id, &recorded_by,
                             Some(&peer_coord), Some(ingest_tx.clone()),
                         ).await {
                             warn!("Download session error: {}", e);
                         }
 
-                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        tokio::time::sleep(SESSION_GAP).await;
                     }
                 }
             });

@@ -21,7 +21,7 @@ use crate::transport_identity::{transport_cert_paths_from_db, ensure_transport_p
 use crate::projection::create::{create_event_sync, create_signed_event_sync, create_encrypted_event_sync, event_id_or_blocked, CreateEventError};
 use crate::projection::pipeline::project_one;
 use crate::sync::SyncMessage;
-use crate::sync::engine::{accept_loop, connect_loop, download_from_sources, run_sync_initiator_dual};
+use crate::sync::engine::{accept_loop, connect_loop, download_from_sources, run_sync_initiator_dual, SYNC_SESSION_TIMEOUT_SECS};
 use crate::transport::{
     AllowedPeers,
     DualConnection,
@@ -1724,7 +1724,7 @@ pub async fn connect_sync_once(
     conn.flush_data().await?;
 
     let stats = run_sync_initiator_dual(
-        conn, db_path, 60, &peer_id, identity, None, None,
+        conn, db_path, SYNC_SESSION_TIMEOUT_SECS, &peer_id, identity, None, None,
     ).await?;
 
     connection.close(0u32.into(), b"done");
