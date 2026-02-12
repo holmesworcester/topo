@@ -298,12 +298,55 @@ impl<'a> ProjectQueue<'a> {
 mod tests {
     use super::super::queue::current_timestamp_ms;
     use super::*;
+    use crate::crypto::{event_id_from_base64, event_id_to_base64, hash_event, EventId};
     use crate::db::{open_in_memory, schema::create_tables};
+    use crate::events::{self, BenchDepEvent, ParsedEvent};
+    use crate::projection::pipeline::project_one;
 
     fn setup() -> Connection {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
         conn
+    }
+
+    fn now_ms_u64() -> u64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    }
+
+    fn insert_event_for_projection(conn: &Connection, peer_id: &str, event: &ParsedEvent) -> EventId {
+        let blob = events::encode_event(event).unwrap();
+        let event_id = hash_event(&blob);
+        let event_id_b64 = event_id_to_base64(&event_id);
+        let ts = now_ms_u64() as i64;
+        let type_code = blob[0];
+        let type_name = events::registry()
+            .lookup(type_code)
+            .map(|m| m.type_name)
+            .unwrap_or("unknown");
+
+        conn.execute(
+            "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
+             VALUES (?1, ?2, ?3, 'shared', ?4, ?5)",
+            params![&event_id_b64, type_name, blob, ts, ts],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO neg_items (ts, id) VALUES (?1, ?2)",
+            params![ts, event_id.as_slice()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
+             VALUES (?1, ?2, ?3, 'test')",
+            params![peer_id, &event_id_b64, ts],
+        )
+        .unwrap();
+
+        event_id
     }
 
     #[test]
@@ -633,6 +676,91 @@ mod tests {
             )
             .unwrap();
         assert_eq!(remaining, 2, "all items should remain after total failure");
+    }
+
+    #[test]
+    fn test_drain_same_batch_unblock_ordered_child_then_parent() {
+        let conn = setup();
+        let pq = ProjectQueue::new(&conn);
+        let peer_id = "peer1";
+
+        // Build a two-event chain: child depends on parent.
+        let parent = ParsedEvent::BenchDep(BenchDepEvent {
+            created_at_ms: now_ms_u64(),
+            dep_ids: vec![],
+            payload: [0x11; 16],
+        });
+        let parent_id = insert_event_for_projection(&conn, peer_id, &parent);
+
+        let child = ParsedEvent::BenchDep(BenchDepEvent {
+            created_at_ms: now_ms_u64(),
+            dep_ids: vec![parent_id],
+            payload: [0x22; 16],
+        });
+        let child_id = insert_event_for_projection(&conn, peer_id, &child);
+
+        let parent_b64 = event_id_to_base64(&parent_id);
+        let child_b64 = event_id_to_base64(&child_id);
+
+        // Enqueue both and force child to be claimed before parent.
+        assert!(pq.enqueue(peer_id, &child_b64).unwrap());
+        assert!(pq.enqueue(peer_id, &parent_b64).unwrap());
+        conn.execute(
+            "UPDATE project_queue SET available_at = 1000 WHERE peer_id = ?1 AND event_id = ?2",
+            params![peer_id, &child_b64],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE project_queue SET available_at = 2000 WHERE peer_id = ?1 AND event_id = ?2",
+            params![peer_id, &parent_b64],
+        )
+        .unwrap();
+
+        let drained = pq
+            .drain_with_limit(peer_id, 10, |conn, eid_b64| {
+                if let Some(eid) = event_id_from_base64(eid_b64) {
+                    project_one(conn, peer_id, &eid)
+                        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(drained, 2);
+
+        let parent_valid: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+                params![peer_id, &parent_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let child_valid: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+                params![peer_id, &child_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(parent_valid, 1);
+        assert_eq!(child_valid, 1);
+
+        let blocked_deps_left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM blocked_event_deps WHERE peer_id = ?1",
+                params![peer_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let blocked_events_left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM blocked_events WHERE peer_id = ?1",
+                params![peer_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(blocked_deps_left, 0);
+        assert_eq!(blocked_events_left, 0);
+        assert_eq!(pq.count_pending(peer_id).unwrap(), 0);
     }
 
     #[test]
