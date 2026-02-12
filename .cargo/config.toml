@@ -1,0 +1,9 @@
+[alias]
+perf = "test --release --test perf_test -- --nocapture"
+perf-all = "test --release --test perf_test -- --nocapture --include-ignored"
+perf-file = "test --release --test file_throughput -- --nocapture"
+perf-file-all = "test --release --test file_throughput -- --nocapture --include-ignored"
+perf-topo = "test --release --test topo_cascade_test -- --nocapture"
+perf-topo-all = "test --release --test topo_cascade_test -- --nocapture --include-ignored"
+perf-lowmem = "test --release --test low_mem_test -- --nocapture"
+perf-lowmem-all = "test --release --test low_mem_test -- --nocapture --include-ignored"
