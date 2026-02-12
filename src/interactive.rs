@@ -4,8 +4,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::SigningKey;
 
-use crate::crypto::{event_id_to_base64, EventId};
-use crate::db::{open_connection, schema::create_tables};
+use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
+use crate::db::{
+    open_connection,
+    schema::create_tables,
+    store::{insert_event, insert_neg_item_if_shared, insert_recorded_event, parse_share_scope},
+};
 use crate::events::*;
 use crate::identity_ops::{self, IdentityChain, InviteType, JoinChain, LinkChain};
 use crate::invite_link::{create_invite_link, parse_invite_link, InviteLinkKind};
@@ -1659,34 +1663,41 @@ fn copy_event_chain(
         })?
         .collect::<Result<Vec<_>, _>>()?;
 
-    for (event_id, event_type, blob, share_scope, created_at, inserted_at) in &events {
-        target_conn.execute(
-            "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![event_id, event_type, blob, share_scope, created_at, inserted_at],
-        )?;
+    for (event_id, event_type, blob, share_scope_str, created_at, inserted_at) in &events {
+        let eid = event_id_from_base64(event_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Invalid event_id in source DB: {}", event_id),
+            )
+        })?;
+        let share_scope = parse_share_scope(share_scope_str).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Invalid share_scope in source DB: {}", share_scope_str),
+            )
+        })?;
 
-        if let Some(eid) = crate::crypto::event_id_from_base64(event_id) {
-            target_conn.execute(
-                "INSERT OR IGNORE INTO neg_items (ts, id) VALUES (?1, ?2)",
-                rusqlite::params![created_at, eid.as_slice()],
-            )?;
-        }
+        insert_event(
+            target_conn,
+            &eid,
+            event_type,
+            blob,
+            share_scope,
+            *created_at,
+            *inserted_at,
+        )?;
+        insert_neg_item_if_shared(target_conn, share_scope, *created_at, &eid)?;
 
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
-        target_conn.execute(
-            "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
-             VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![target_recorded_by, event_id, now_ms, "copy"],
-        )?;
+        insert_recorded_event(target_conn, target_recorded_by, &eid, now_ms, "copy")?;
     }
 
     // Project all copied events, failing on errors
     for (event_id, _, _, _, _, _) in &events {
-        if let Some(eid) = crate::crypto::event_id_from_base64(event_id) {
+        if let Some(eid) = event_id_from_base64(event_id) {
             crate::projection::pipeline::project_one(target_conn, target_recorded_by, &eid)
                 .map_err(|e| format!("projection failed for event {}: {}", &event_id[..8], e))?;
         }

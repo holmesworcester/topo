@@ -82,76 +82,9 @@ fn enforce_schema_epoch(conn: &Connection) -> SqliteResult<()> {
     Ok(())
 }
 
-/// Check if the messages table has the old Phase 0 schema (no recorded_by column).
-fn needs_messages_migration(conn: &Connection) -> SqliteResult<bool> {
-    // If messages table doesn't exist yet, no migration needed (fresh DB).
-    let table_exists: bool = conn.query_row(
-        "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='messages'",
-        [],
-        |row| row.get(0),
-    )?;
-    if !table_exists {
-        return Ok(false);
-    }
-
-    // Check if recorded_by column exists
-    let has_recorded_by: bool = conn.query_row(
-        "SELECT COUNT(*) > 0 FROM pragma_table_info('messages') WHERE name='recorded_by'",
-        [],
-        |row| row.get(0),
-    )?;
-
-    Ok(!has_recorded_by)
-}
-
-/// Migrate Phase 0 messages table to Phase 0.5 schema.
-/// Adds recorded_by column with empty string default, rebuilds PK to (recorded_by, message_id).
-/// Wrapped in an explicit transaction for atomicity.
-fn migrate_messages_v1_to_v2(conn: &Connection) -> SqliteResult<()> {
-    conn.execute_batch(
-        "
-        BEGIN IMMEDIATE;
-
-        -- Create the new messages table with (recorded_by, message_id) PK
-        CREATE TABLE messages_v2 (
-            message_id TEXT NOT NULL,
-            workspace_id TEXT NOT NULL,
-            author_id TEXT NOT NULL,
-            content TEXT NOT NULL,
-            created_at INTEGER NOT NULL,
-            recorded_by TEXT NOT NULL DEFAULT '',
-            PRIMARY KEY (recorded_by, message_id)
-        );
-
-        -- Backfill from old table with empty recorded_by sentinel
-        INSERT INTO messages_v2 (message_id, workspace_id, author_id, content, created_at, recorded_by)
-            SELECT message_id, channel_id, author_id, content, created_at, ''
-            FROM messages;
-
-        -- Drop old table and indexes
-        DROP TABLE messages;
-
-        -- Rename new table
-        ALTER TABLE messages_v2 RENAME TO messages;
-
-        -- Recreate indexes on the new table
-        CREATE INDEX IF NOT EXISTS idx_messages_workspace ON messages(workspace_id, created_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_messages_recorded ON messages(recorded_by, created_at DESC);
-
-        COMMIT;
-        ",
-    )?;
-    Ok(())
-}
-
-/// Create all tables for the sync system, migrating from Phase 0 if needed.
+/// Create all tables for the sync system.
 pub fn create_tables(conn: &Connection) -> SqliteResult<()> {
     enforce_schema_epoch(conn)?;
-
-    // Check and run migration before CREATE TABLE IF NOT EXISTS
-    if needs_messages_migration(conn)? {
-        migrate_messages_v1_to_v2(conn)?;
-    }
 
     // Run column-rename migrations before DDL so that existing DBs with
     // `network_event_id` get renamed to `workspace_id` before the
@@ -294,86 +227,6 @@ mod tests {
             "unexpected error: {}",
             msg
         );
-    }
-
-    #[test]
-    fn test_migrate_phase0_messages_to_phase05() {
-        let conn = open_in_memory().unwrap();
-
-        // Create Phase 0 schema: messages with message_id PK, no recorded_by
-        conn.execute_batch(
-            "
-            CREATE TABLE messages (
-                message_id TEXT PRIMARY KEY,
-                channel_id TEXT NOT NULL,
-                author_id TEXT NOT NULL,
-                content TEXT NOT NULL,
-                created_at INTEGER NOT NULL
-            );
-            CREATE INDEX idx_messages_channel ON messages(channel_id, created_at DESC);
-            ",
-        ).unwrap();
-
-        // Insert some Phase 0 data
-        conn.execute(
-            "INSERT INTO messages (message_id, channel_id, author_id, content, created_at)
-             VALUES ('msg1', 'ch1', 'auth1', 'Hello', 1000)",
-            [],
-        ).unwrap();
-        conn.execute(
-            "INSERT INTO messages (message_id, channel_id, author_id, content, created_at)
-             VALUES ('msg2', 'ch1', 'auth2', 'World', 2000)",
-            [],
-        ).unwrap();
-
-        // Run create_tables — should detect old schema and migrate
-        create_tables(&conn).unwrap();
-
-        // Verify new schema has recorded_by column
-        let has_recorded_by: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM pragma_table_info('messages') WHERE name='recorded_by'",
-            [],
-            |row| row.get(0),
-        ).unwrap();
-        assert!(has_recorded_by);
-
-        // Verify data was preserved with empty recorded_by sentinel
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM messages WHERE recorded_by = ''",
-            [],
-            |row| row.get(0),
-        ).unwrap();
-        assert_eq!(count, 2);
-
-        // Verify content is intact
-        let content: String = conn.query_row(
-            "SELECT content FROM messages WHERE message_id = 'msg1'",
-            [],
-            |row| row.get(0),
-        ).unwrap();
-        assert_eq!(content, "Hello");
-
-        // Verify PK is now (recorded_by, message_id) by inserting same message_id with different recorded_by
-        conn.execute(
-            "INSERT INTO messages (message_id, workspace_id, author_id, content, created_at, recorded_by)
-             VALUES ('msg1', 'ch1', 'auth1', 'Hello', 1000, 'peer_abc')",
-            [],
-        ).unwrap();
-        let total: i64 = conn.query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0)).unwrap();
-        assert_eq!(total, 3);
-
-        // Verify idempotent — calling create_tables again should not fail
-        create_tables(&conn).unwrap();
-    }
-
-    #[test]
-    fn test_no_migration_on_fresh_db() {
-        let conn = open_in_memory().unwrap();
-        // Fresh DB — no messages table yet
-        assert!(!needs_messages_migration(&conn).unwrap());
-        create_tables(&conn).unwrap();
-        // After create_tables, messages exists with recorded_by — no migration needed
-        assert!(!needs_messages_migration(&conn).unwrap());
     }
 
 }

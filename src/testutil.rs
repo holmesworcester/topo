@@ -1,8 +1,12 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::crypto::EventId;
-use crate::db::{open_connection, schema::create_tables};
+use crate::crypto::{event_id_from_base64, EventId};
+use crate::db::{
+    open_connection,
+    schema::create_tables,
+    store::{insert_event, insert_neg_item_if_shared, insert_recorded_event, parse_share_scope},
+};
 use crate::events::{
     MessageEvent, MessageDeletionEvent, ReactionEvent, SecretKeyEvent,
     SignedMemoEvent, ParsedEvent,
@@ -216,24 +220,25 @@ impl Peer {
             ).expect("workspace event not found in creator");
         drop(creator_db);
 
-        db.execute(
-            "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![&ws_b64, &event_type, &blob, &share_scope, &created_at, &inserted_at],
-        ).expect("failed to insert workspace event");
+        let scope = parse_share_scope(&share_scope).expect("invalid workspace share_scope");
+        insert_event(
+            &db,
+            &creator.workspace_id,
+            &event_type,
+            &blob,
+            scope,
+            created_at,
+            inserted_at,
+        )
+        .expect("failed to insert workspace event");
 
         let now_ms = current_timestamp_ms() as i64;
-        db.execute(
-            "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
-             VALUES (?1, ?2, ?3, 'test')",
-            rusqlite::params![&peer.identity, &ws_b64, now_ms],
-        ).expect("failed to record workspace event");
+        insert_recorded_event(&db, &peer.identity, &creator.workspace_id, now_ms, "test")
+            .expect("failed to record workspace event");
 
         // Add to neg_items so this peer advertises the workspace.
-        db.execute(
-            "INSERT OR IGNORE INTO neg_items (ts, id) VALUES (?1, ?2)",
-            rusqlite::params![created_at, &creator.workspace_id[..]],
-        ).expect("failed to add workspace to neg_items");
+        insert_neg_item_if_shared(&db, scope, created_at, &creator.workspace_id)
+            .expect("failed to add workspace to neg_items");
 
         // Project workspace (guard-blocked: no trust anchor yet)
         let _ = project_one(&db, &peer.identity, &creator.workspace_id);
@@ -1009,25 +1014,25 @@ pub fn replicate_all_events(src: &Peer, dest: &Peer) {
 
     let now_ms = current_timestamp_ms() as i64;
 
-    for (event_id, event_type, blob, share_scope, created_at, inserted_at) in &rows {
-        // Insert into events table (skip if already present)
-        dest_db.execute(
-            "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![event_id, event_type, blob, share_scope, created_at, inserted_at],
-        ).expect("failed to insert event");
+    for (event_id, event_type, blob, share_scope_str, created_at, inserted_at) in &rows {
+        let eid = event_id_from_base64(event_id).expect("invalid event_id in source events table");
+        let share_scope = parse_share_scope(share_scope_str).expect("invalid share_scope in source events table");
 
-        // Record in recorded_events journal
-        dest_db.execute(
-            "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
-             VALUES (?1, ?2, ?3, 'test')",
-            rusqlite::params![&dest.identity, event_id, now_ms],
-        ).expect("failed to insert recorded_event");
+        insert_event(
+            &dest_db,
+            &eid,
+            event_type,
+            blob,
+            share_scope,
+            *created_at,
+            *inserted_at,
+        )
+        .expect("failed to insert event");
+        insert_recorded_event(&dest_db, &dest.identity, &eid, now_ms, "test")
+            .expect("failed to insert recorded_event");
 
         // Project the event
-        if let Some(eid) = crate::crypto::event_id_from_base64(event_id) {
-            let _ = project_one(&dest_db, &dest.identity, &eid);
-        }
+        let _ = project_one(&dest_db, &dest.identity, &eid);
     }
 }
 

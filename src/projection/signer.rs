@@ -102,7 +102,11 @@ pub fn sign_event_bytes(signing_key: &ed25519_dalek::SigningKey, signing_bytes: 
 mod tests {
     use super::*;
     use crate::crypto::hash_event;
-    use crate::db::{open_in_memory, schema::create_tables};
+    use crate::db::{
+        open_in_memory,
+        schema::create_tables,
+        store::{insert_event, insert_recorded_event},
+    };
     use crate::events::{PeerSharedFirstEvent, ParsedEvent, encode_event};
     use ed25519_dalek::SigningKey;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -127,20 +131,21 @@ mod tests {
             .map(|m| m.type_name)
             .unwrap_or("unknown");
         let ts = now_ms() as i64;
-        conn.execute(
-            "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
-             VALUES (?1, ?2, ?3, 'shared', ?4, ?5)",
-            rusqlite::params![&event_id_b64, type_name, blob, ts, ts],
-        ).unwrap();
+        insert_event(
+            conn,
+            &event_id,
+            type_name,
+            blob,
+            crate::events::ShareScope::Shared,
+            ts,
+            ts,
+        )
+        .unwrap();
         conn.execute(
             "INSERT OR IGNORE INTO valid_events (peer_id, event_id) VALUES (?1, ?2)",
             rusqlite::params![recorded_by, &event_id_b64],
         ).unwrap();
-        conn.execute(
-            "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
-             VALUES (?1, ?2, ?3, 'test')",
-            rusqlite::params![recorded_by, &event_id_b64, ts],
-        ).unwrap();
+        insert_recorded_event(conn, recorded_by, &event_id, ts, "test").unwrap();
         event_id
     }
 

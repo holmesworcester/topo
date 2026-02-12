@@ -475,7 +475,11 @@ pub fn unblock_dependents(
 mod tests {
     use super::*;
     use crate::crypto::hash_event;
-    use crate::db::{open_in_memory, schema::create_tables};
+    use crate::db::{
+        open_in_memory,
+        schema::create_tables,
+        store::{insert_event, insert_neg_item_if_shared, insert_recorded_event},
+    };
     use crate::events::{
         self, EncryptedEvent, FileSliceEvent, MessageAttachmentEvent, MessageDeletionEvent, MessageEvent,
         ParsedEvent, ReactionEvent, SecretKeyEvent, SignedMemoEvent, WorkspaceEvent,
@@ -497,7 +501,6 @@ mod tests {
     /// batch_writer or create_event_sync does before calling project_one).
     fn insert_event_raw(conn: &Connection, recorded_by: &str, blob: &[u8]) -> EventId {
         let event_id = hash_event(blob);
-        let event_id_b64 = event_id_to_base64(&event_id);
         let ts = now_ms();
         let type_code = blob[0];
         let type_name = registry()
@@ -505,22 +508,24 @@ mod tests {
             .map(|m| m.type_name)
             .unwrap_or("unknown");
 
-        conn.execute(
-            "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
-             VALUES (?1, ?2, ?3, 'shared', ?4, ?5)",
-            rusqlite::params![&event_id_b64, type_name, blob, ts as i64, ts as i64],
-        ).unwrap();
-        conn.execute(
-            "INSERT OR IGNORE INTO neg_items (ts, id) VALUES (?1, ?2)",
-            rusqlite::params![ts as i64, event_id.as_slice()],
+        insert_event(
+            conn,
+            &event_id,
+            type_name,
+            blob,
+            crate::events::ShareScope::Shared,
+            ts as i64,
+            ts as i64,
         )
         .unwrap();
-        conn.execute(
-            "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
-             VALUES (?1, ?2, ?3, 'test')",
-            rusqlite::params![recorded_by, &event_id_b64, ts as i64],
+        insert_neg_item_if_shared(
+            conn,
+            crate::events::ShareScope::Shared,
+            ts as i64,
+            &event_id,
         )
         .unwrap();
+        insert_recorded_event(conn, recorded_by, &event_id, ts as i64, "test").unwrap();
 
         event_id
     }
@@ -1350,10 +1355,7 @@ mod tests {
         // Since setup_workspace_event creates different workspace events per tenant,
         // we must manually mark tenant_a's workspace event valid for tenant_b too.
         let net_b64 = event_id_to_base64(&net_eid_a);
-        conn.execute(
-            "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source) VALUES (?1, ?2, ?3, 'test')",
-            rusqlite::params![tenant_b, &net_b64, now_ms() as i64],
-        ).unwrap();
+        insert_recorded_event(&conn, tenant_b, &net_eid_a, now_ms() as i64, "test").unwrap();
         conn.execute(
             "INSERT OR IGNORE INTO valid_events (peer_id, event_id) VALUES (?1, ?2)",
             rusqlite::params![tenant_b, &net_b64],
@@ -1448,16 +1450,8 @@ mod tests {
         assert_eq!(r_a, ProjectionDecision::Valid);
 
         // Also record the memo + signer for tenant_b
-        let memo_b64 = event_id_to_base64(&memo_eid);
-        let signer_b64 = event_id_to_base64(&signer_eid);
-        conn.execute(
-            "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source) VALUES (?1, ?2, ?3, 'test')",
-            rusqlite::params![tenant_b, &memo_b64, now_ms() as i64],
-        ).unwrap();
-        conn.execute(
-            "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source) VALUES (?1, ?2, ?3, 'test')",
-            rusqlite::params![tenant_b, &signer_b64, now_ms() as i64],
-        ).unwrap();
+        insert_recorded_event(&conn, tenant_b, &memo_eid, now_ms() as i64, "test").unwrap();
+        insert_recorded_event(&conn, tenant_b, &signer_eid, now_ms() as i64, "test").unwrap();
 
         // Project memo for tenant_b — should BLOCK (signer dep not valid for B)
         let r_b = project_one(&conn, tenant_b, &memo_eid).unwrap();
@@ -1595,11 +1589,7 @@ mod tests {
         // message signer chain for tenant_b by recording+projecting those identity events.
         // For simplicity, we just record+project the message for tenant_b.
         // The message will block on its signed_by dep for tenant_b. So we accept a Block.
-        let msg_a_b64 = event_id_to_base64(&msg_a_eid);
-        conn.execute(
-            "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source) VALUES (?1, ?2, ?3, 'test')",
-            rusqlite::params![tenant_b, &msg_a_b64, now_ms() as i64],
-        ).unwrap();
+        insert_recorded_event(&conn, tenant_b, &msg_a_eid, now_ms() as i64, "test").unwrap();
         let r_msg_for_b = project_one(&conn, tenant_b, &msg_a_eid).unwrap();
         // The message's signed_by references tenant_a's identity chain which is not valid for tenant_b.
         // So it will block. This is correct cross-tenant isolation behavior.
@@ -2057,16 +2047,8 @@ mod tests {
         assert_eq!(r_a, ProjectionDecision::Valid);
 
         // Record for tenant_b (also record the sk_blob event)
-        let enc_b64 = event_id_to_base64(&enc_eid);
-        let sk_b64 = event_id_to_base64(&sk_eid);
-        conn.execute(
-            "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source) VALUES (?1, ?2, ?3, 'test')",
-            rusqlite::params![tenant_b, &enc_b64, now_ms() as i64],
-        ).unwrap();
-        conn.execute(
-            "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source) VALUES (?1, ?2, ?3, 'test')",
-            rusqlite::params![tenant_b, &sk_b64, now_ms() as i64],
-        ).unwrap();
+        insert_recorded_event(&conn, tenant_b, &enc_eid, now_ms() as i64, "test").unwrap();
+        insert_recorded_event(&conn, tenant_b, &sk_eid, now_ms() as i64, "test").unwrap();
 
         // Project encrypted event for tenant_b → Block (key not valid for B)
         let r_b = project_one(&conn, tenant_b, &enc_eid).unwrap();
@@ -2589,10 +2571,7 @@ mod tests {
         let net_eid = setup_workspace_event(&conn, tenant_a);
         // Also mark valid for tenant_b
         let net_b64 = event_id_to_base64(&net_eid);
-        conn.execute(
-            "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source) VALUES (?1, ?2, ?3, 'test')",
-            rusqlite::params![tenant_b, &net_b64, now_ms() as i64],
-        ).unwrap();
+        insert_recorded_event(&conn, tenant_b, &net_eid, now_ms() as i64, "test").unwrap();
         conn.execute(
             "INSERT OR IGNORE INTO valid_events (peer_id, event_id) VALUES (?1, ?2)",
             rusqlite::params![tenant_b, &net_b64],

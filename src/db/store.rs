@@ -12,6 +12,14 @@ pub const SQL_INSERT_RECORDED_EVENT: &str =
     "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
      VALUES (?1, ?2, ?3, ?4)";
 
+pub fn parse_share_scope(scope: &str) -> Option<ShareScope> {
+    match scope {
+        "shared" => Some(ShareScope::Shared),
+        "local" => Some(ShareScope::Local),
+        _ => None,
+    }
+}
+
 pub fn insert_event(
     conn: &Connection,
     event_id: &EventId,
