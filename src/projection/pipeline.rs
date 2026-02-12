@@ -1,5 +1,5 @@
 use std::time::{SystemTime, UNIX_EPOCH};
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 use super::decision::ProjectionDecision;
 use super::encrypted::project_encrypted;
 use super::projectors::{
@@ -234,8 +234,10 @@ pub fn project_one(
         }
     }
 
-    // 5. If missing deps — write to blocked_event_deps
+    // 5. If missing deps — write to blocked_event_deps + blocked_events header
     if !missing.is_empty() {
+        missing.sort_unstable();
+        missing.dedup();
         for dep_id in &missing {
             let dep_b64 = event_id_to_base64(dep_id);
             conn.execute(
@@ -244,6 +246,11 @@ pub fn project_one(
                 rusqlite::params![recorded_by, &event_id_b64, &dep_b64],
             )?;
         }
+        conn.execute(
+            "INSERT OR IGNORE INTO blocked_events (peer_id, event_id, deps_remaining)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![recorded_by, &event_id_b64, missing.len() as i64],
+        )?;
         return Ok(ProjectionDecision::Block { missing });
     }
 
@@ -332,141 +339,159 @@ fn retry_file_slice_guard_blocks_for_file(
     Ok(())
 }
 
-/// Enqueue events that become fully unblocked when blocker X is resolved.
-/// Deletes X's dep edges (using RETURNING to collect candidates in one pass),
-/// filters for those with zero remaining blockers, and inserts them into a
-/// peer-scoped cascade_worklist temp table (DB-backed, not in-memory).
-fn enqueue_newly_unblocked(
+/// After projecting an event, find and cascade-project any events that were
+/// blocked waiting on it. Uses Kahn's algorithm with a deps_remaining counter
+/// for O(N) scaling: blocked_event_deps is read-only during the cascade (no
+/// per-step DELETEs), only the small blocked_events table gets counter
+/// decrements, and deps are bulk-cleaned after the cascade completes.
+fn unblock_dependents(
     conn: &Connection,
     recorded_by: &str,
     blocker_b64: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Delete blocker dep edges and collect candidate event_ids in one operation.
-    // Using DELETE ... RETURNING avoids a separate SELECT that causes pathological
-    // B-tree performance when interleaved with DELETEs on the same table.
-    let candidates: Vec<String> = {
-        let mut stmt = conn.prepare_cached(
-            "DELETE FROM blocked_event_deps
-             WHERE peer_id = ?1 AND blocker_event_id = ?2
-             RETURNING event_id",
-        )?;
-        let result: Vec<String> = stmt
-            .query_map(rusqlite::params![recorded_by, blocker_b64], |row| {
-                row.get::<_, String>(0)
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        result
-    };
-
-    if candidates.is_empty() {
-        return Ok(());
+    // Wrap entire cascade in a savepoint for batched WAL writes
+    conn.execute_batch("SAVEPOINT unblock_cascade")?;
+    let result = unblock_dependents_inner(conn, recorded_by, blocker_b64);
+    match &result {
+        Ok(()) => conn.execute_batch("RELEASE unblock_cascade")?,
+        Err(_) => { let _ = conn.execute_batch("ROLLBACK TO unblock_cascade; RELEASE unblock_cascade"); }
     }
-
-    // Filter: keep only candidates with zero remaining blockers, enqueue into temp table
-    for eid_b64 in candidates {
-        let still_blocked: bool = conn
-            .prepare_cached(
-                "SELECT EXISTS(SELECT 1 FROM blocked_event_deps WHERE peer_id = ?1 AND event_id = ?2)",
-            )?
-            .query_row(rusqlite::params![recorded_by, &eid_b64], |row| row.get(0))?;
-        if !still_blocked {
-            conn.prepare_cached("INSERT INTO cascade_worklist (peer_id, event_id) VALUES (?1, ?2)")?
-                .execute(rusqlite::params![recorded_by, &eid_b64])?;
-        }
-    }
-
-    Ok(())
+    result
 }
 
-/// After projecting an event, find and cascade-project any events that were
-/// blocked waiting on it. Uses a DB-backed temp table as the worklist so
-/// memory stays O(1) regardless of cascade depth. Uses DELETE ... RETURNING
-/// for efficient unblock detection and prepare_cached for statement reuse.
-pub fn unblock_dependents(
+fn unblock_dependents_inner(
     conn: &Connection,
     recorded_by: &str,
     blocker_b64: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    conn.execute_batch(
-        "CREATE TEMP TABLE IF NOT EXISTS cascade_worklist (
-            peer_id TEXT NOT NULL,
-            event_id TEXT NOT NULL
-        )",
-    )?;
-    conn.execute("DELETE FROM cascade_worklist", [])?;
+    // Kahn's algorithm. Only the worklist lives on the heap.
+    // blocked_event_deps is READ-ONLY during cascade (no per-step DELETEs).
+    // Only blocked_events (small table) gets counter decrements.
+    // Bulk cleanup of blocked_event_deps happens once at the end.
 
-    enqueue_newly_unblocked(conn, recorded_by, blocker_b64)?;
+    let mut worklist = vec![blocker_b64.to_string()];
 
-    loop {
-        // Claim one item from the DB-backed worklist.
-        let eid_b64: Option<String> = conn.prepare_cached(
-            "DELETE FROM cascade_worklist
-             WHERE rowid = (SELECT MIN(rowid) FROM cascade_worklist)
-             RETURNING event_id",
-        )?.query_row([], |row| row.get::<_, String>(0)).optional()?;
-
-        let eid_b64 = match eid_b64 {
-            Some(e) => e,
-            None => break,
+    while let Some(blocker) = worklist.pop() {
+        // 1. Find events blocked on this blocker (covering index lookup, read-only)
+        let candidates: Vec<String> = {
+            let mut stmt = conn.prepare_cached(
+                "SELECT event_id FROM blocked_event_deps
+                 WHERE peer_id = ?1 AND blocker_event_id = ?2",
+            )?;
+            let mut rows = stmt.query(rusqlite::params![recorded_by, &blocker])?;
+            let mut result = Vec::new();
+            while let Some(row) = rows.next()? {
+                result.push(row.get::<_, String>(0)?);
+            }
+            result
         };
 
-        let blob: Vec<u8> = conn.prepare_cached(
-            "SELECT blob FROM events WHERE event_id = ?1",
-        )?.query_row(
-            rusqlite::params![&eid_b64],
-            |row| row.get(0),
-        )?;
+        if candidates.is_empty() {
+            continue;
+        }
 
-        match events::parse_event(&blob) {
-            Err(e) => {
-                let reason = format!("parse error: {}", e);
-                record_rejection(conn, recorded_by, &eid_b64, &reason);
+        // 2. Decrement counter for each candidate
+        for eid_b64 in &candidates {
+            conn.prepare_cached(
+                "UPDATE blocked_events SET deps_remaining = deps_remaining - 1
+                 WHERE peer_id = ?1 AND event_id = ?2 AND deps_remaining > 0",
+            )?.execute(rusqlite::params![recorded_by, eid_b64])?;
+
+            let remaining: i64 = match conn.prepare_cached(
+                "SELECT deps_remaining FROM blocked_events
+                 WHERE peer_id = ?1 AND event_id = ?2",
+            )?.query_row(
+                rusqlite::params![recorded_by, eid_b64],
+                |row| row.get(0),
+            ) {
+                Ok(v) => v,
+                Err(rusqlite::Error::QueryReturnedNoRows) => continue, // already processed
+                Err(e) => return Err(e.into()),
+            };
+
+            if remaining > 0 {
                 continue;
             }
-            Ok(parsed) => {
-                let deps = parsed.dep_field_values();
 
-                // Dep type checking (same policy as project_one).
-                let meta = registry().lookup(parsed.event_type_code());
-                if let Some(meta) = meta {
-                    if !meta.dep_field_type_codes.is_empty() {
-                        if let Some(reason) = check_dep_types(conn, &deps, meta.dep_field_type_codes)? {
-                            record_rejection(conn, recorded_by, &eid_b64, &reason);
+            // 3. Ready — clean up header row
+            conn.prepare_cached(
+                "DELETE FROM blocked_events WHERE peer_id = ?1 AND event_id = ?2",
+            )?.execute(rusqlite::params![recorded_by, eid_b64])?;
+
+            // 4. Project this event
+            let blob: Vec<u8> = conn.prepare_cached(
+                "SELECT blob FROM events WHERE event_id = ?1",
+            )?.query_row(
+                rusqlite::params![eid_b64],
+                |row| row.get(0),
+            )?;
+
+            match events::parse_event(&blob) {
+                Err(e) => {
+                    let reason = format!("parse error: {}", e);
+                    record_rejection(conn, recorded_by, eid_b64, &reason);
+                    continue;
+                }
+                Ok(parsed) => {
+                    let deps = parsed.dep_field_values();
+
+                    // Dep type checking (same policy as project_one).
+                    let meta = registry().lookup(parsed.event_type_code());
+                    if let Some(meta) = meta {
+                        if !meta.dep_field_type_codes.is_empty() {
+                            if let Some(reason) = check_dep_types(conn, &deps, meta.dep_field_type_codes)? {
+                                record_rejection(conn, recorded_by, eid_b64, &reason);
+                                continue;
+                            }
+                        }
+                    }
+
+                    let decision = apply_projection(conn, recorded_by, eid_b64, &blob, &parsed)?;
+                    match &decision {
+                        ProjectionDecision::Reject { ref reason } => {
+                            record_rejection(conn, recorded_by, eid_b64, reason);
                             continue;
                         }
-                    }
-                }
-
-                let decision = apply_projection(conn, recorded_by, &eid_b64, &blob, &parsed)?;
-                match &decision {
-                    ProjectionDecision::Reject { ref reason } => {
-                        record_rejection(conn, recorded_by, &eid_b64, reason);
-                        continue;
-                    }
-                    ProjectionDecision::Block { ref missing } => {
-                        // Inner deps still missing (e.g. encrypted events);
-                        // re-insert into blocked_event_deps
-                        for dep_id in missing {
-                            let dep_b64 = event_id_to_base64(dep_id);
+                        ProjectionDecision::Block { ref missing } => {
+                            // Re-block with new deps (e.g., encrypted event inner deps)
+                            let mut unique_blockers = missing.clone();
+                            unique_blockers.sort_unstable();
+                            unique_blockers.dedup();
+                            for dep_id in &unique_blockers {
+                                let dep_b64 = event_id_to_base64(dep_id);
+                                conn.prepare_cached(
+                                    "INSERT OR IGNORE INTO blocked_event_deps (peer_id, event_id, blocker_event_id)
+                                     VALUES (?1, ?2, ?3)",
+                                )?.execute(rusqlite::params![recorded_by, eid_b64, &dep_b64])?;
+                            }
                             conn.prepare_cached(
-                                "INSERT OR IGNORE INTO blocked_event_deps (peer_id, event_id, blocker_event_id)
+                                "INSERT OR IGNORE INTO blocked_events (peer_id, event_id, deps_remaining)
                                  VALUES (?1, ?2, ?3)",
-                            )?.execute(rusqlite::params![recorded_by, &eid_b64, &dep_b64])?;
+                            )?.execute(rusqlite::params![recorded_by, eid_b64, unique_blockers.len() as i64])?;
+                            continue;
                         }
-                        continue;
+                        _ => {}
                     }
-                    _ => {}
+
+                    conn.prepare_cached(
+                        "INSERT OR IGNORE INTO valid_events (peer_id, event_id) VALUES (?1, ?2)",
+                    )?.execute(rusqlite::params![recorded_by, eid_b64])?;
+
+                    worklist.push(eid_b64.clone());
                 }
-
-                conn.prepare_cached(
-                    "INSERT OR IGNORE INTO valid_events (peer_id, event_id) VALUES (?1, ?2)",
-                )?.execute(rusqlite::params![recorded_by, &eid_b64])?;
-
-                // This newly valid event may unblock further events
-                enqueue_newly_unblocked(conn, recorded_by, &eid_b64)?;
             }
         }
     }
+
+    // Bulk cleanup: remove resolved dep edges from blocked_event_deps.
+    conn.prepare_cached(
+        "DELETE FROM blocked_event_deps WHERE peer_id = ?1
+         AND event_id IN (SELECT event_id FROM valid_events WHERE peer_id = ?1)",
+    )?.execute(rusqlite::params![recorded_by])?;
+    conn.prepare_cached(
+        "DELETE FROM blocked_event_deps WHERE peer_id = ?1
+         AND event_id IN (SELECT event_id FROM rejected_events WHERE peer_id = ?1)",
+    )?.execute(rusqlite::params![recorded_by])?;
 
     Ok(())
 }
@@ -481,9 +506,9 @@ mod tests {
         store::{insert_event, insert_neg_item_if_shared, insert_recorded_event},
     };
     use crate::events::{
-        self, EncryptedEvent, FileSliceEvent, MessageAttachmentEvent, MessageDeletionEvent, MessageEvent,
-        ParsedEvent, ReactionEvent, SecretKeyEvent, SignedMemoEvent, WorkspaceEvent,
-        EVENT_TYPE_ENCRYPTED, EVENT_TYPE_MESSAGE,
+        self, BenchDepEvent, EncryptedEvent, FileSliceEvent, MessageAttachmentEvent,
+        MessageDeletionEvent, MessageEvent, ParsedEvent, ReactionEvent, SecretKeyEvent,
+        SignedMemoEvent, WorkspaceEvent, EVENT_TYPE_ENCRYPTED, EVENT_TYPE_MESSAGE,
     };
     use crate::projection::encrypted::encrypt_event_blob;
     use crate::projection::signer::sign_event_bytes;
@@ -1064,6 +1089,73 @@ mod tests {
             )
             .unwrap();
         assert_eq!(blocked, 0);
+    }
+
+    #[test]
+    fn test_duplicate_dep_ids_unblock_correctly() {
+        // Regression: if an event has the same dep_id in multiple dep fields,
+        // deps_remaining must reflect the unique blocker count, not the raw
+        // vec length, or the event gets permanently stuck.
+        let conn = setup();
+        let recorded_by = "peer1";
+
+        // E_root: no deps
+        let root = ParsedEvent::BenchDep(BenchDepEvent {
+            created_at_ms: now_ms(),
+            dep_ids: vec![],
+            payload: [0xAA; 16],
+        });
+        let root_blob = events::encode_event(&root).unwrap();
+        let root_eid = hash_event(&root_blob);
+
+        // E_dup: depends on E_root TWICE (duplicate dep IDs)
+        let dup = ParsedEvent::BenchDep(BenchDepEvent {
+            created_at_ms: now_ms(),
+            dep_ids: vec![root_eid, root_eid],
+            payload: [0xBB; 16],
+        });
+        let dup_blob = events::encode_event(&dup).unwrap();
+        let dup_eid = hash_event(&dup_blob);
+
+        // Insert both, project E_dup first (out of order) — should block
+        insert_event_raw(&conn, recorded_by, &root_blob);
+        insert_event_raw(&conn, recorded_by, &dup_blob);
+        let result = project_one(&conn, recorded_by, &dup_eid).unwrap();
+        assert!(matches!(result, ProjectionDecision::Block { .. }));
+
+        // deps_remaining must be 1 (unique), not 2 (raw)
+        let dup_b64 = event_id_to_base64(&dup_eid);
+        let deps_remaining: i64 = conn
+            .query_row(
+                "SELECT deps_remaining FROM blocked_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, &dup_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(deps_remaining, 1, "deps_remaining should be unique blocker count");
+
+        // Now project E_root — cascade should unblock E_dup
+        let result = project_one(&conn, recorded_by, &root_eid).unwrap();
+        assert_eq!(result, ProjectionDecision::Valid);
+
+        let valid: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, &dup_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(valid, "event with duplicate deps should be unblocked after blocker resolves");
+
+        // No stuck blocked_events rows
+        let stuck: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM blocked_events WHERE peer_id = ?1",
+                rusqlite::params![recorded_by],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stuck, 0);
     }
 
     #[test]

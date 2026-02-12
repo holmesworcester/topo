@@ -1111,6 +1111,7 @@ fn replay_projection_impl(db: &rusqlite::Connection, recorded_by: &str, order: &
         .expect("failed to clear valid_events");
     db.execute("DELETE FROM blocked_event_deps WHERE peer_id = ?1", rusqlite::params![recorded_by])
         .expect("failed to clear blocked_event_deps");
+    db.execute("DELETE FROM blocked_events WHERE peer_id = ?1", rusqlite::params![recorded_by]).ok();
     db.execute("DELETE FROM rejected_events WHERE peer_id = ?1", rusqlite::params![recorded_by])
         .expect("failed to clear rejected_events");
     db.execute("DELETE FROM project_queue WHERE peer_id = ?1", rusqlite::params![recorded_by]).ok();

@@ -189,6 +189,19 @@ fn run_topo_cascade(n: usize) {
         blocked_remaining
     );
 
+    let blocked_events_remaining: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM blocked_events WHERE peer_id = ?1",
+            rusqlite::params![recorded_by],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        blocked_events_remaining, 0,
+        "expected 0 blocked_events remaining, got {}",
+        blocked_events_remaining
+    );
+
     let cascade_rate = blocked_count as f64 / cascade_secs.max(0.001);
 
     eprintln!();

@@ -491,6 +491,18 @@ static MIGRATIONS: &[Migration] = &[
             DROP TABLE IF EXISTS store;
         ",
     },
+    Migration {
+        version: 25,
+        name: "add_blocked_events_header",
+        sql: "
+            CREATE TABLE IF NOT EXISTS blocked_events (
+                peer_id TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                deps_remaining INTEGER NOT NULL,
+                PRIMARY KEY (peer_id, event_id)
+            );
+        ",
+    },
 ];
 
 fn ensure_schema_migrations(conn: &Connection) -> SqliteResult<()> {
@@ -704,6 +716,6 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(max_version, 24);
+        assert_eq!(max_version, 25);
     }
 }

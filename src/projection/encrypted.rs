@@ -104,7 +104,9 @@ pub fn project_encrypted(
     }
 
     if !missing.is_empty() {
-        // Write blocked_event_deps using OUTER event_id
+        // Write blocked_event_deps + blocked_events header using OUTER event_id
+        missing.sort_unstable();
+        missing.dedup();
         for dep_id in &missing {
             let dep_b64 = event_id_to_base64(dep_id);
             conn.execute(
@@ -113,6 +115,11 @@ pub fn project_encrypted(
                 rusqlite::params![recorded_by, event_id_b64, &dep_b64],
             )?;
         }
+        conn.execute(
+            "INSERT OR IGNORE INTO blocked_events (peer_id, event_id, deps_remaining)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![recorded_by, event_id_b64, missing.len() as i64],
+        )?;
         return Ok(ProjectionDecision::Block { missing });
     }
 
