@@ -484,6 +484,13 @@ static MIGRATIONS: &[Migration] = &[
             DROP TABLE IF EXISTS local_signing_keys;
         ",
     },
+    Migration {
+        version: 24,
+        name: "drop_unused_store_table",
+        sql: "
+            DROP TABLE IF EXISTS store;
+        ",
+    },
 ];
 
 fn ensure_schema_migrations(conn: &Connection) -> SqliteResult<()> {
@@ -656,6 +663,36 @@ mod tests {
     }
 
     #[test]
+    fn test_migration_24_drops_store_table() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+
+        conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS store (
+                id TEXT PRIMARY KEY,
+                blob BLOB NOT NULL,
+                stored_at INTEGER NOT NULL
+            );
+            ",
+        )
+        .unwrap();
+        conn.execute("DELETE FROM schema_migrations WHERE version = 24", [])
+            .unwrap();
+
+        run_migrations(&conn).unwrap();
+
+        let has_store: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='store'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!has_store);
+    }
+
+    #[test]
     fn test_migration_idempotent() {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
@@ -667,6 +704,6 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(max_version, 23);
+        assert_eq!(max_version, 24);
     }
 }
