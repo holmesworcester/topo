@@ -353,6 +353,7 @@ fn cascade_unblocked_inner(
     // Only blocked_events (small table) gets counter decrements.
     // Bulk cleanup of blocked_event_deps happens once after the loop.
     let mut worklist = vec![blocker_b64.to_string()];
+    let mut did_unblock = false;
 
     while let Some(blocker) = worklist.pop() {
         // 1. Find events blocked on this blocker (covering index lookup, read-only)
@@ -397,6 +398,7 @@ fn cascade_unblocked_inner(
             }
 
             // 3. Ready — clean up header row
+            did_unblock = true;
             conn.prepare_cached(
                 "DELETE FROM blocked_events WHERE peer_id = ?1 AND event_id = ?2",
             )?.execute(rusqlite::params![recorded_by, eid_b64])?;
@@ -428,16 +430,29 @@ fn cascade_unblocked_inner(
     }
 
     // Bulk cleanup: remove resolved dep edges from blocked_event_deps.
-    conn.prepare_cached(
-        "DELETE FROM blocked_event_deps WHERE peer_id = ?1
-         AND event_id IN (SELECT event_id FROM valid_events WHERE peer_id = ?1)",
-    )?.execute(rusqlite::params![recorded_by])?;
-    conn.prepare_cached(
-        "DELETE FROM blocked_event_deps WHERE peer_id = ?1
-         AND event_id IN (SELECT event_id FROM rejected_events WHERE peer_id = ?1)",
-    )?.execute(rusqlite::params![recorded_by])?;
+    // Only needed when events actually transitioned out of blocked state during
+    // this cascade. Skipping when did_unblock is false avoids O(N²) cost: these
+    // DELETE ... IN (SELECT ...) queries scan valid_events/rejected_events which
+    // grow with every projected event, and cascade_unblocked is called for every
+    // projection — so running them unconditionally is quadratic in event count.
+    //
+    // Safety: if no events were unblocked, no new rows moved to valid/rejected
+    // during this cascade, so the cleanup is a guaranteed no-op. Previous cascade
+    // calls that DID unblock events ran their own cleanup, so no stale rows
+    // accumulate across calls.
+    if did_unblock {
+        conn.prepare_cached(
+            "DELETE FROM blocked_event_deps WHERE peer_id = ?1
+             AND event_id IN (SELECT event_id FROM valid_events WHERE peer_id = ?1)",
+        )?.execute(rusqlite::params![recorded_by])?;
+        conn.prepare_cached(
+            "DELETE FROM blocked_event_deps WHERE peer_id = ?1
+             AND event_id IN (SELECT event_id FROM rejected_events WHERE peer_id = ?1)",
+        )?.execute(rusqlite::params![recorded_by])?;
+    }
 
     // --- Phase 2: Guard retries (AFTER bulk cleanup so queries work correctly) ---
+    let mut guard_retries_ran = false;
 
     // Guard cascade: if InviteAccepted projected, retry workspace guard blocks.
     // Only Workspace uses trust-anchor guarding today, so keep the candidate
@@ -461,6 +476,9 @@ fn cascade_unblocked_inner(
             }
             result
         };
+        if !guard_candidates.is_empty() {
+            guard_retries_ran = true;
+        }
         for eid_b64 in guard_candidates {
             if let Some(event_id) = event_id_from_base64(&eid_b64) {
                 // Use project_one (full entrypoint) for proper recursive cascade
@@ -483,6 +501,9 @@ fn cascade_unblocked_inner(
             }
             result
         };
+        if !fs_candidates.is_empty() {
+            guard_retries_ran = true;
+        }
         for eid_b64 in fs_candidates {
             if let Some(event_id) = event_id_from_base64(&eid_b64) {
                 let _ = project_one(conn, recorded_by, &event_id)?;
@@ -492,6 +513,22 @@ fn cascade_unblocked_inner(
                 rusqlite::params![recorded_by, &eid_b64],
             )?;
         }
+    }
+
+    // Post-phase-2 cleanup: guard retries may have projected events that still
+    // had stale dep rows from their earlier dep-blocking phase. For example, a
+    // file_slice that was dep-blocked → unblocked → guard-blocked → retried here
+    // as Valid still has its original blocked_event_deps rows. Clean them up now.
+    // This runs rarely (only when guard retries fire), so no O(N²) concern.
+    if guard_retries_ran {
+        conn.prepare_cached(
+            "DELETE FROM blocked_event_deps WHERE peer_id = ?1
+             AND event_id IN (SELECT event_id FROM valid_events WHERE peer_id = ?1)",
+        )?.execute(rusqlite::params![recorded_by])?;
+        conn.prepare_cached(
+            "DELETE FROM blocked_event_deps WHERE peer_id = ?1
+             AND event_id IN (SELECT event_id FROM rejected_events WHERE peer_id = ?1)",
+        )?.execute(rusqlite::params![recorded_by])?;
     }
 
     Ok(())
