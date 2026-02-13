@@ -8,7 +8,7 @@
 //! When the `discovery` feature is enabled, each tenant also advertises
 //! via mDNS and auto-connects to discovered remote peers.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -143,13 +143,24 @@ pub async fn run_node(
                             let db_path_disc = db_path.to_string();
                             let tenant_id = tenant.peer_id.clone();
                             std::thread::spawn(move || {
-                                let mut active_peers: HashSet<String> = HashSet::new();
+                                // Track peer_id -> last known addr. Same addr = skip (dedupe).
+                                // Different addr = spawn new connect_loop (old one will fail
+                                // naturally when the stale endpoint stops responding).
+                                let mut known_peers: HashMap<String, std::net::SocketAddr> = HashMap::new();
                                 while let Ok(peer) = rx.recv() {
-                                    // Deduplicate: skip if we already have a connect_loop
-                                    // running for this remote peer_id.
-                                    if !active_peers.insert(peer.peer_id.clone()) {
-                                        continue;
+                                    match known_peers.get(&peer.peer_id) {
+                                        Some(prev_addr) if *prev_addr == peer.addr => continue,
+                                        Some(prev_addr) => {
+                                            info!(
+                                                "mDNS: tenant {} peer {} changed addr {} -> {}",
+                                                &tenant_id[..16],
+                                                &peer.peer_id[..16.min(peer.peer_id.len())],
+                                                prev_addr, peer.addr
+                                            );
+                                        }
+                                        None => {}
                                     }
+                                    known_peers.insert(peer.peer_id.clone(), peer.addr);
                                     info!(
                                         "mDNS: tenant {} connecting to discovered peer {} at {}",
                                         &tenant_id[..16], &peer.peer_id[..16.min(peer.peer_id.len())], peer.addr

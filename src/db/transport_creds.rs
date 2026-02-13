@@ -52,8 +52,7 @@ pub fn load_sole_local_creds(
     }
     if count > 1 {
         return Err(format!(
-            "Multiple local identities found ({}). Use --node mode for multi-tenant operation, \
-             or specify an explicit peer_id.",
+            "Multiple local identities found ({}). Use --node mode for multi-tenant operation.",
             count
         ).into());
     }

@@ -1830,6 +1830,121 @@ impl SharedDbNode {
         peer
     }
 
+    /// Add a new tenant that joins an existing tenant's workspace (same DB).
+    /// The creator tenant must have a workspace_signing_key.
+    pub fn add_tenant_in_workspace(&mut self, name: &str, creator_index: usize) {
+        use crate::projection::pipeline::project_one;
+
+        let creator = &self.tenants[creator_index];
+        let workspace_id = creator.workspace_id;
+        let workspace_key = creator.workspace_signing_key.as_ref()
+            .expect("creator has no workspace_signing_key")
+            .clone();
+
+        // Create a new transport identity in the shared DB
+        let (cert, key) = crate::transport::generate_self_signed_cert()
+            .expect("failed to generate cert");
+        let fp = extract_spki_fingerprint(cert.as_ref()).expect("failed to extract SPKI");
+        let tenant_identity = hex::encode(fp);
+
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        crate::db::transport_creds::store_local_creds(
+            &db,
+            &tenant_identity,
+            cert.as_ref(),
+            key.secret_pkcs8_der(),
+        ).expect("failed to store creds");
+
+        let author_id: [u8; 32] = rand::random();
+        let dummy_tempdir = tempfile::tempdir().expect("failed to create dummy tempdir");
+
+        let mut peer = Peer {
+            name: name.to_string(),
+            db_path: self.db_path.clone(),
+            identity: tenant_identity.clone(),
+            author_id,
+            workspace_id,
+            peer_shared_event_id: None,
+            peer_shared_signing_key: None,
+            workspace_signing_key: None,
+            _tempdir: dummy_tempdir,
+        };
+
+        // The Workspace event already exists in the shared DB (created by creator).
+        // Record it for this tenant and project.
+        let now_ms = current_timestamp_ms() as i64;
+        insert_recorded_event(&db, &tenant_identity, &workspace_id, now_ms, "test")
+            .expect("failed to record workspace event");
+        let _ = project_one(&db, &tenant_identity, &workspace_id);
+
+        // InviteAccepted: sets trust anchor
+        let ia = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
+            created_at_ms: current_timestamp_ms(),
+            invite_event_id: workspace_id,
+            workspace_id,
+        });
+        create_event_sync(&db, &tenant_identity, &ia)
+            .expect("failed to create invite_accepted");
+
+        // Re-project Workspace (now trust anchor exists)
+        project_one(&db, &tenant_identity, &workspace_id).unwrap();
+
+        // UserInviteBoot (signed by workspace key from creator)
+        let mut rng = rand::thread_rng();
+        let invite_key = SigningKey::generate(&mut rng);
+        let uib = ParsedEvent::UserInviteBoot(UserInviteBootEvent {
+            created_at_ms: current_timestamp_ms(),
+            public_key: invite_key.verifying_key().to_bytes(),
+            workspace_id,
+            signed_by: workspace_id,
+            signer_type: 1,
+            signature: [0u8; 64],
+        });
+        let uib_eid = create_signed_event_sync(&db, &tenant_identity, &uib, &workspace_key)
+            .expect("failed to create user_invite_boot");
+
+        // UserBoot (signed by invite key)
+        let user_key = SigningKey::generate(&mut rng);
+        let ub = ParsedEvent::UserBoot(UserBootEvent {
+            created_at_ms: current_timestamp_ms(),
+            public_key: user_key.verifying_key().to_bytes(),
+            signed_by: uib_eid,
+            signer_type: 2,
+            signature: [0u8; 64],
+        });
+        let ub_eid = create_signed_event_sync(&db, &tenant_identity, &ub, &invite_key)
+            .expect("failed to create user_boot");
+
+        // DeviceInviteFirst (signed by user key)
+        let device_invite_key = SigningKey::generate(&mut rng);
+        let dif = ParsedEvent::DeviceInviteFirst(DeviceInviteFirstEvent {
+            created_at_ms: current_timestamp_ms(),
+            public_key: device_invite_key.verifying_key().to_bytes(),
+            signed_by: ub_eid,
+            signer_type: 4,
+            signature: [0u8; 64],
+        });
+        let dif_eid = create_signed_event_sync(&db, &tenant_identity, &dif, &user_key)
+            .expect("failed to create device_invite_first");
+
+        // PeerSharedFirst (signed by device_invite key)
+        let peer_shared_key = SigningKey::generate(&mut rng);
+        let psf = ParsedEvent::PeerSharedFirst(PeerSharedFirstEvent {
+            created_at_ms: current_timestamp_ms(),
+            public_key: peer_shared_key.verifying_key().to_bytes(),
+            signed_by: dif_eid,
+            signer_type: 3,
+            signature: [0u8; 64],
+        });
+        let psf_eid = create_signed_event_sync(&db, &tenant_identity, &psf, &device_invite_key)
+            .expect("failed to create peer_shared_first");
+
+        peer.peer_shared_event_id = Some(psf_eid);
+        peer.peer_shared_signing_key = Some(peer_shared_key);
+
+        self.tenants.push(peer);
+    }
+
     /// Get the list of tenant peer_ids.
     pub fn tenant_ids(&self) -> Vec<String> {
         self.tenants.iter().map(|t| t.identity.clone()).collect()

@@ -2946,3 +2946,58 @@ async fn test_svc_node_status() {
 
     node.verify_all_invariants();
 }
+
+/// Two tenants in the same workspace on the same node: verify that canonical
+/// events overlap across peer_ids (both tenants see the shared workspace event)
+/// while projection invariants still hold.
+#[tokio::test]
+async fn test_shared_db_same_workspace_two_tenants() {
+    let mut node = SharedDbNode::new(1);
+    let creator_workspace = node.tenants[0].workspace_id;
+
+    // Second tenant joins the first tenant's workspace
+    node.add_tenant_in_workspace("tenant-1-same-ws", 0);
+
+    let t0 = &node.tenants[0];
+    let t1 = &node.tenants[1];
+
+    assert_eq!(t0.workspace_id, t1.workspace_id,
+        "both tenants should share the same workspace");
+    assert_ne!(t0.identity, t1.identity,
+        "tenants should have distinct identities");
+
+    // Both tenants create messages
+    t0.batch_create_messages(2);
+    t1.batch_create_messages(3);
+
+    let db = open_connection(&node.db_path).unwrap();
+
+    // Both tenants should have recorded the shared Workspace event
+    let t0_has_ws: bool = db.query_row(
+        "SELECT COUNT(*) > 0 FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
+        rusqlite::params![&t0.identity, &poc_7::crypto::event_id_to_base64(&creator_workspace)],
+        |row| row.get(0),
+    ).unwrap();
+    let t1_has_ws: bool = db.query_row(
+        "SELECT COUNT(*) > 0 FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
+        rusqlite::params![&t1.identity, &poc_7::crypto::event_id_to_base64(&creator_workspace)],
+        |row| row.get(0),
+    ).unwrap();
+    assert!(t0_has_ws, "tenant 0 should have recorded the workspace event");
+    assert!(t1_has_ws, "tenant 1 should have recorded the workspace event");
+
+    // The workspace event_id should appear in both tenants' recorded_events —
+    // this is the legitimate overlap that the workspace-aware leakage check allows.
+    let ws_b64 = poc_7::crypto::event_id_to_base64(&creator_workspace);
+    let tenants_with_ws: i64 = db.query_row(
+        "SELECT COUNT(DISTINCT peer_id) FROM recorded_events WHERE event_id = ?1",
+        rusqlite::params![&ws_b64],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(tenants_with_ws, 2,
+        "workspace event should be recorded by both tenants");
+
+    // Projection invariants should hold — verify_all_invariants uses the
+    // workspace-aware check that allows overlap for same-workspace tenants.
+    node.verify_all_invariants();
+}
