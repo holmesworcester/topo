@@ -255,6 +255,7 @@ impl ParsedEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EventError {
     TooShort { expected: usize, actual: usize },
+    TrailingData { expected: usize, actual: usize },
     WrongType { expected: u8, actual: u8 },
     WrongVariant,
     ContentTooLong(usize),
@@ -267,6 +268,9 @@ impl std::fmt::Display for EventError {
         match self {
             EventError::TooShort { expected, actual } => {
                 write!(f, "blob too short: expected {} bytes, got {}", expected, actual)
+            }
+            EventError::TrailingData { expected, actual } => {
+                write!(f, "blob has trailing data: expected exactly {} bytes, got {}", expected, actual)
             }
             EventError::WrongType { expected, actual } => {
                 write!(f, "wrong event type: expected {}, got {}", expected, actual)
@@ -1250,5 +1254,167 @@ mod tests {
         let blob = encode_event(&event).unwrap();
         let parsed = parse_event(&blob).unwrap();
         assert_eq!(parsed, event);
+    }
+
+    // --- Strict parse-length enforcement tests ---
+
+    #[test]
+    fn test_fixed_size_rejects_trailing_data() {
+        // Workspace (41 bytes fixed)
+        let ws = ParsedEvent::Workspace(WorkspaceEvent {
+            created_at_ms: 100,
+            public_key: [0u8; 32],
+        });
+        let mut blob = encode_event(&ws).unwrap();
+        assert_eq!(blob.len(), 41);
+        blob.push(0xFF);
+        let err = parse_event(&blob).unwrap_err();
+        assert!(matches!(err, EventError::TrailingData { expected: 41, actual: 42 }));
+
+        // SecretKey (41 bytes fixed)
+        let sk = ParsedEvent::SecretKey(SecretKeyEvent {
+            created_at_ms: 100,
+            key_bytes: [0u8; 32],
+        });
+        let mut blob = encode_event(&sk).unwrap();
+        blob.push(0xFF);
+        let err = parse_event(&blob).unwrap_err();
+        assert!(matches!(err, EventError::TrailingData { expected: 41, actual: 42 }));
+
+        // InviteAccepted (73 bytes fixed)
+        let ia = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
+            created_at_ms: 100,
+            invite_event_id: [0u8; 32],
+            workspace_id: [0u8; 32],
+        });
+        let mut blob = encode_event(&ia).unwrap();
+        blob.push(0xFF);
+        let err = parse_event(&blob).unwrap_err();
+        assert!(matches!(err, EventError::TrailingData { expected: 73, actual: 74 }));
+
+        // UserBoot (138 bytes fixed)
+        let ub = ParsedEvent::UserBoot(UserBootEvent {
+            created_at_ms: 100,
+            public_key: [0u8; 32],
+            signed_by: [0u8; 32],
+            signer_type: 2,
+            signature: [0u8; 64],
+        });
+        let mut blob = encode_event(&ub).unwrap();
+        blob.push(0xFF);
+        let err = parse_event(&blob).unwrap_err();
+        assert!(matches!(err, EventError::TrailingData { expected: 138, actual: 139 }));
+
+        // AdminBoot (170 bytes fixed)
+        let ab = ParsedEvent::AdminBoot(AdminBootEvent {
+            created_at_ms: 100,
+            public_key: [0u8; 32],
+            user_event_id: [0u8; 32],
+            signed_by: [0u8; 32],
+            signer_type: 1,
+            signature: [0u8; 64],
+        });
+        let mut blob = encode_event(&ab).unwrap();
+        blob.push(0xFF);
+        let err = parse_event(&blob).unwrap_err();
+        assert!(matches!(err, EventError::TrailingData { expected: 170, actual: 171 }));
+
+        // SecretShared (202 bytes fixed)
+        let ss = ParsedEvent::SecretShared(SecretSharedEvent {
+            created_at_ms: 100,
+            key_event_id: [0u8; 32],
+            recipient_event_id: [0u8; 32],
+            wrapped_key: [0u8; 32],
+            signed_by: [0u8; 32],
+            signer_type: 5,
+            signature: [0u8; 64],
+        });
+        let mut blob = encode_event(&ss).unwrap();
+        blob.push(0xFF);
+        let err = parse_event(&blob).unwrap_err();
+        assert!(matches!(err, EventError::TrailingData { expected: 202, actual: 203 }));
+    }
+
+    #[test]
+    fn test_variable_size_rejects_trailing_data() {
+        // Message (variable)
+        let msg = ParsedEvent::Message(MessageEvent {
+            created_at_ms: 100,
+            workspace_id: [0u8; 32],
+            author_id: [0u8; 32],
+            content: "hi".to_string(),
+            signed_by: [0u8; 32],
+            signer_type: 5,
+            signature: [0u8; 64],
+        });
+        let mut blob = encode_event(&msg).unwrap();
+        let expected_len = blob.len();
+        blob.push(0xFF);
+        let err = parse_event(&blob).unwrap_err();
+        assert!(matches!(err, EventError::TrailingData { expected, actual }
+            if expected == expected_len && actual == expected_len + 1));
+
+        // Reaction (variable)
+        let rxn = ParsedEvent::Reaction(ReactionEvent {
+            created_at_ms: 100,
+            target_event_id: [0u8; 32],
+            author_id: [0u8; 32],
+            emoji: "\u{1f44d}".to_string(),
+            signed_by: [0u8; 32],
+            signer_type: 5,
+            signature: [0u8; 64],
+        });
+        let mut blob = encode_event(&rxn).unwrap();
+        let expected_len = blob.len();
+        blob.push(0xFF);
+        let err = parse_event(&blob).unwrap_err();
+        assert!(matches!(err, EventError::TrailingData { expected, actual }
+            if expected == expected_len && actual == expected_len + 1));
+
+        // Encrypted (variable)
+        let enc = ParsedEvent::Encrypted(EncryptedEvent {
+            created_at_ms: 100,
+            key_event_id: [0u8; 32],
+            inner_type_code: 1,
+            nonce: [0u8; 12],
+            ciphertext: vec![0xAB; 50],
+            auth_tag: [0u8; 16],
+        });
+        let mut blob = encode_event(&enc).unwrap();
+        let expected_len = blob.len();
+        blob.push(0xFF);
+        let err = parse_event(&blob).unwrap_err();
+        assert!(matches!(err, EventError::TrailingData { expected, actual }
+            if expected == expected_len && actual == expected_len + 1));
+
+        // FileSlice (variable)
+        let fs = ParsedEvent::FileSlice(FileSliceEvent {
+            created_at_ms: 100,
+            file_id: [0u8; 32],
+            slice_number: 0,
+            ciphertext: vec![0xCD; 64],
+            signed_by: [0u8; 32],
+            signer_type: 5,
+            signature: [0u8; 64],
+        });
+        let mut blob = encode_event(&fs).unwrap();
+        let expected_len = blob.len();
+        blob.push(0xFF);
+        let err = parse_event(&blob).unwrap_err();
+        assert!(matches!(err, EventError::TrailingData { expected, actual }
+            if expected == expected_len && actual == expected_len + 1));
+
+        // BenchDep (variable)
+        let bd = ParsedEvent::BenchDep(BenchDepEvent {
+            created_at_ms: 100,
+            dep_ids: vec![[1u8; 32], [2u8; 32]],
+            payload: [0u8; 16],
+        });
+        let mut blob = encode_event(&bd).unwrap();
+        let expected_len = blob.len();
+        blob.push(0xFF);
+        let err = parse_event(&blob).unwrap_err();
+        assert!(matches!(err, EventError::TrailingData { expected, actual }
+            if expected == expected_len && actual == expected_len + 1));
     }
 }

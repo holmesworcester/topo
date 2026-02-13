@@ -30,6 +30,9 @@ pub fn parse_peer_shared_first(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if blob.len() < 138 {
         return Err(EventError::TooShort { expected: 138, actual: blob.len() });
     }
+    if blob.len() > 138 {
+        return Err(EventError::TrailingData { expected: 138, actual: blob.len() });
+    }
     if blob[0] != EVENT_TYPE_PEER_SHARED_FIRST {
         return Err(EventError::WrongType { expected: EVENT_TYPE_PEER_SHARED_FIRST, actual: blob[0] });
     }
@@ -77,6 +80,9 @@ pub fn encode_peer_shared_first(event: &ParsedEvent) -> Result<Vec<u8>, EventErr
 pub fn parse_peer_shared_ongoing(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if blob.len() < 138 {
         return Err(EventError::TooShort { expected: 138, actual: blob.len() });
+    }
+    if blob.len() > 138 {
+        return Err(EventError::TrailingData { expected: 138, actual: blob.len() });
     }
     if blob[0] != EVENT_TYPE_PEER_SHARED_ONGOING {
         return Err(EventError::WrongType { expected: EVENT_TYPE_PEER_SHARED_ONGOING, actual: blob[0] });

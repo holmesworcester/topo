@@ -63,6 +63,12 @@ pub fn parse_file_slice(blob: &[u8]) -> Result<ParsedEvent, EventError> {
             actual: blob.len(),
         });
     }
+    if blob.len() > expected_len {
+        return Err(EventError::TrailingData {
+            expected: expected_len,
+            actual: blob.len(),
+        });
+    }
 
     let ciphertext = blob[49..49 + ciphertext_len].to_vec();
 

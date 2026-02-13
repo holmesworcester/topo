@@ -1,6 +1,11 @@
 use crate::events::EVENT_MAX_BLOB_BYTES;
 use super::{MSG_TYPE_NEG_OPEN, MSG_TYPE_NEG_MSG, MSG_TYPE_HAVE_LIST, MSG_TYPE_EVENT, MSG_TYPE_DONE, MSG_TYPE_DONE_ACK, MSG_TYPE_DATA_DONE, MSG_TYPE_INTRO_OFFER};
 
+/// Max negentropy message payload: 4 MiB (generous for large reconciliation rounds)
+const MAX_NEG_MSG_BYTES: usize = 4 * 1024 * 1024;
+/// Max number of event IDs in a HaveList message
+const MAX_HAVE_LIST_IDS: usize = 100_000;
+
 /// Sync protocol messages
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncMessage {
@@ -47,6 +52,9 @@ pub fn parse_sync_message(input: &[u8]) -> Result<(SyncMessage, usize), ParseErr
                 return Err(ParseError::InsufficientData);
             }
             let len = u32::from_le_bytes([input[1], input[2], input[3], input[4]]) as usize;
+            if len > MAX_NEG_MSG_BYTES {
+                return Err(ParseError::NegMessageTooLarge(len));
+            }
             let total_size = 5 + len;
             if input.len() < total_size {
                 return Err(ParseError::InsufficientData);
@@ -65,6 +73,9 @@ pub fn parse_sync_message(input: &[u8]) -> Result<(SyncMessage, usize), ParseErr
                 return Err(ParseError::InsufficientData);
             }
             let count = u32::from_le_bytes([input[1], input[2], input[3], input[4]]) as usize;
+            if count > MAX_HAVE_LIST_IDS {
+                return Err(ParseError::TooManyIds(count));
+            }
             let total_size = 5 + count * 32;
             if input.len() < total_size {
                 return Err(ParseError::InsufficientData);
@@ -207,6 +218,8 @@ pub enum ParseError {
     InsufficientData,
     UnknownType(u8),
     EventTooLarge(usize),
+    NegMessageTooLarge(usize),
+    TooManyIds(usize),
 }
 
 impl std::fmt::Display for ParseError {
@@ -215,6 +228,8 @@ impl std::fmt::Display for ParseError {
             ParseError::InsufficientData => write!(f, "insufficient data"),
             ParseError::UnknownType(t) => write!(f, "unknown message type: {}", t),
             ParseError::EventTooLarge(len) => write!(f, "event too large: {} bytes", len),
+            ParseError::NegMessageTooLarge(len) => write!(f, "negentropy message too large: {} bytes", len),
+            ParseError::TooManyIds(count) => write!(f, "too many IDs in have_list: {}", count),
         }
     }
 }
@@ -379,5 +394,56 @@ mod tests {
         buf.extend_from_slice(&[0u8; 50]);
         let result = parse_sync_message(&buf);
         assert_eq!(result, Err(ParseError::InsufficientData));
+    }
+
+    #[test]
+    fn test_neg_message_too_large() {
+        let oversized_len = (MAX_NEG_MSG_BYTES + 1) as u32;
+        let mut buf = vec![MSG_TYPE_NEG_OPEN];
+        buf.extend_from_slice(&oversized_len.to_le_bytes());
+        buf.extend_from_slice(&vec![0u8; MAX_NEG_MSG_BYTES + 1]);
+        let result = parse_sync_message(&buf);
+        assert_eq!(result, Err(ParseError::NegMessageTooLarge(MAX_NEG_MSG_BYTES + 1)));
+
+        // Also test NEG_MSG
+        buf[0] = MSG_TYPE_NEG_MSG;
+        let result = parse_sync_message(&buf);
+        assert_eq!(result, Err(ParseError::NegMessageTooLarge(MAX_NEG_MSG_BYTES + 1)));
+    }
+
+    #[test]
+    fn test_neg_message_at_limit_ok() {
+        let max_len = MAX_NEG_MSG_BYTES as u32;
+        let mut buf = vec![MSG_TYPE_NEG_OPEN];
+        buf.extend_from_slice(&max_len.to_le_bytes());
+        buf.extend_from_slice(&vec![0u8; MAX_NEG_MSG_BYTES]);
+        let (msg, consumed) = parse_sync_message(&buf).unwrap();
+        assert_eq!(consumed, 5 + MAX_NEG_MSG_BYTES);
+        assert!(matches!(msg, SyncMessage::NegOpen { .. }));
+    }
+
+    #[test]
+    fn test_have_list_too_many_ids() {
+        let oversized_count = (MAX_HAVE_LIST_IDS + 1) as u32;
+        let mut buf = vec![MSG_TYPE_HAVE_LIST];
+        buf.extend_from_slice(&oversized_count.to_le_bytes());
+        // Don't need full data — parser should reject based on count
+        let result = parse_sync_message(&buf);
+        assert_eq!(result, Err(ParseError::TooManyIds(MAX_HAVE_LIST_IDS + 1)));
+    }
+
+    #[test]
+    fn test_have_list_at_limit_ok() {
+        let max_count = MAX_HAVE_LIST_IDS as u32;
+        let mut buf = vec![MSG_TYPE_HAVE_LIST];
+        buf.extend_from_slice(&max_count.to_le_bytes());
+        buf.extend_from_slice(&vec![0u8; MAX_HAVE_LIST_IDS * 32]);
+        let (msg, consumed) = parse_sync_message(&buf).unwrap();
+        assert_eq!(consumed, 5 + MAX_HAVE_LIST_IDS * 32);
+        if let SyncMessage::HaveList { ids } = msg {
+            assert_eq!(ids.len(), MAX_HAVE_LIST_IDS);
+        } else {
+            panic!("expected HaveList");
+        }
     }
 }

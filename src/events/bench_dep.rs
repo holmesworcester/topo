@@ -40,6 +40,12 @@ pub fn parse_bench_dep(blob: &[u8]) -> Result<ParsedEvent, EventError> {
             actual: blob.len(),
         });
     }
+    if blob.len() > expected_len {
+        return Err(EventError::TrailingData {
+            expected: expected_len,
+            actual: blob.len(),
+        });
+    }
 
     let mut dep_ids = Vec::with_capacity(dep_count);
     for i in 0..dep_count {

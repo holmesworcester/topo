@@ -53,6 +53,12 @@ pub fn parse_encrypted(blob: &[u8]) -> Result<ParsedEvent, EventError> {
             actual: blob.len(),
         });
     }
+    if blob.len() > expected_len {
+        return Err(EventError::TrailingData {
+            expected: expected_len,
+            actual: blob.len(),
+        });
+    }
 
     let ciphertext = blob[56..56 + ciphertext_len].to_vec();
 

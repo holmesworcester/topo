@@ -30,6 +30,9 @@ pub fn parse_user_boot(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if blob.len() < 138 {
         return Err(EventError::TooShort { expected: 138, actual: blob.len() });
     }
+    if blob.len() > 138 {
+        return Err(EventError::TrailingData { expected: 138, actual: blob.len() });
+    }
     if blob[0] != EVENT_TYPE_USER_BOOT {
         return Err(EventError::WrongType { expected: EVENT_TYPE_USER_BOOT, actual: blob[0] });
     }
@@ -77,6 +80,9 @@ pub fn encode_user_boot(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
 pub fn parse_user_ongoing(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if blob.len() < 138 {
         return Err(EventError::TooShort { expected: 138, actual: blob.len() });
+    }
+    if blob.len() > 138 {
+        return Err(EventError::TrailingData { expected: 138, actual: blob.len() });
     }
     if blob[0] != EVENT_TYPE_USER_ONGOING {
         return Err(EventError::WrongType { expected: EVENT_TYPE_USER_ONGOING, actual: blob[0] });

@@ -20,6 +20,12 @@ pub fn parse_invite_accepted(blob: &[u8]) -> Result<ParsedEvent, EventError> {
             actual: blob.len(),
         });
     }
+    if blob.len() > 73 {
+        return Err(EventError::TrailingData {
+            expected: 73,
+            actual: blob.len(),
+        });
+    }
     if blob[0] != EVENT_TYPE_INVITE_ACCEPTED {
         return Err(EventError::WrongType {
             expected: EVENT_TYPE_INVITE_ACCEPTED,

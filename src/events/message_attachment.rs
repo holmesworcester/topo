@@ -95,6 +95,12 @@ pub fn parse_message_attachment(blob: &[u8]) -> Result<ParsedEvent, EventError> 
             actual: blob.len(),
         });
     }
+    if blob.len() > expected_total {
+        return Err(EventError::TrailingData {
+            expected: expected_total,
+            actual: blob.len(),
+        });
+    }
     let mime_type = String::from_utf8_lossy(&blob[mime_offset + 2..mime_offset + 2 + mime_len]).to_string();
 
     let trailer_start = mime_offset + 2 + mime_len;

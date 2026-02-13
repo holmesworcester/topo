@@ -25,6 +25,9 @@ pub fn parse_secret_shared(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if blob.len() < 202 {
         return Err(EventError::TooShort { expected: 202, actual: blob.len() });
     }
+    if blob.len() > 202 {
+        return Err(EventError::TrailingData { expected: 202, actual: blob.len() });
+    }
     if blob[0] != EVENT_TYPE_SECRET_SHARED {
         return Err(EventError::WrongType { expected: EVENT_TYPE_SECRET_SHARED, actual: blob[0] });
     }

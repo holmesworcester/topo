@@ -27,6 +27,12 @@ pub fn parse_message_deletion(blob: &[u8]) -> Result<ParsedEvent, EventError> {
             actual: blob.len(),
         });
     }
+    if blob.len() > 170 {
+        return Err(EventError::TrailingData {
+            expected: 170,
+            actual: blob.len(),
+        });
+    }
     if blob[0] != EVENT_TYPE_MESSAGE_DELETION {
         return Err(EventError::WrongType {
             expected: EVENT_TYPE_MESSAGE_DELETION,
