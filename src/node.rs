@@ -9,12 +9,54 @@
 //! via mDNS and auto-connects to discovered remote peers.
 
 use std::collections::{HashMap, HashSet};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use tracing::{info, warn, error};
+
+/// Dispatch decision for a discovered peer.
+#[derive(Debug, PartialEq)]
+enum DiscoveryAction {
+    /// Same peer at same address — skip (dedupe).
+    Skip,
+    /// New peer — spawn connect_loop.
+    Connect,
+    /// Known peer at new address — cancel old loop, spawn new one.
+    Reconnect,
+}
+
+/// Tracks discovered peers and manages cancellation of stale connect_loops.
+/// Extracted for testability.
+struct PeerDispatcher {
+    known: HashMap<String, (SocketAddr, tokio::sync::watch::Sender<()>)>,
+}
+
+impl PeerDispatcher {
+    fn new() -> Self {
+        Self { known: HashMap::new() }
+    }
+
+    /// Evaluate a discovery event. Returns the action to take and (for Connect/Reconnect)
+    /// a watch::Receiver that will be signalled when this entry is superseded.
+    fn dispatch(&mut self, peer_id: &str, addr: SocketAddr) -> (DiscoveryAction, Option<tokio::sync::watch::Receiver<()>>) {
+        if let Some((prev_addr, _)) = self.known.get(peer_id) {
+            if *prev_addr == addr {
+                return (DiscoveryAction::Skip, None);
+            }
+        }
+        let action = if self.known.contains_key(peer_id) {
+            DiscoveryAction::Reconnect
+        } else {
+            DiscoveryAction::Connect
+        };
+        // Drop old sender (if any) to cancel the old connect_loop
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(());
+        self.known.insert(peer_id.to_string(), (addr, cancel_tx));
+        (action, Some(cancel_rx))
+    }
+}
 
 use crate::db::{open_connection, schema::create_tables};
 use crate::db::transport_creds::discover_local_tenants;
@@ -143,29 +185,29 @@ pub async fn run_node(
                             let db_path_disc = db_path.to_string();
                             let tenant_id = tenant.peer_id.clone();
                             std::thread::spawn(move || {
-                                // Track peer_id -> (addr, cancel_sender). Same addr = skip.
-                                // Different addr = cancel old loop (drop sender), spawn new one.
-                                // At most one active connect_loop per remote peer.
-                                let mut known_peers: HashMap<String, (std::net::SocketAddr, tokio::sync::watch::Sender<()>)> = HashMap::new();
+                                let mut dispatcher = PeerDispatcher::new();
                                 while let Ok(peer) = rx.recv() {
-                                    if let Some((prev_addr, _)) = known_peers.get(&peer.peer_id) {
-                                        if *prev_addr == peer.addr {
-                                            continue; // same addr, dedupe
+                                    let (action, cancel_rx) = dispatcher.dispatch(&peer.peer_id, peer.addr);
+                                    match action {
+                                        DiscoveryAction::Skip => continue,
+                                        DiscoveryAction::Reconnect => {
+                                            info!(
+                                                "mDNS: tenant {} peer {} addr changed, reconnecting at {}",
+                                                &tenant_id[..16],
+                                                &peer.peer_id[..16.min(peer.peer_id.len())],
+                                                peer.addr
+                                            );
                                         }
-                                        info!(
-                                            "mDNS: tenant {} peer {} changed addr {} -> {}, cancelling old loop",
-                                            &tenant_id[..16],
-                                            &peer.peer_id[..16.min(peer.peer_id.len())],
-                                            prev_addr, peer.addr
-                                        );
+                                        DiscoveryAction::Connect => {
+                                            info!(
+                                                "mDNS: tenant {} connecting to discovered peer {} at {}",
+                                                &tenant_id[..16],
+                                                &peer.peer_id[..16.min(peer.peer_id.len())],
+                                                peer.addr
+                                            );
+                                        }
                                     }
-                                    // Drop old sender (if any) to cancel the old connect_loop
-                                    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(());
-                                    known_peers.insert(peer.peer_id.clone(), (peer.addr, cancel_tx));
-                                    info!(
-                                        "mDNS: tenant {} connecting to discovered peer {} at {}",
-                                        &tenant_id[..16], &peer.peer_id[..16.min(peer.peer_id.len())], peer.addr
-                                    );
+                                    let mut cancel = cancel_rx.unwrap();
                                     let ep = ep_clone.clone();
                                     let db = db_path_disc.clone();
                                     let tid = tenant_id.clone();
@@ -175,12 +217,10 @@ pub async fn run_node(
                                             .build()
                                             .unwrap();
                                         rt.block_on(async move {
-                                            let mut cancel = cancel_rx;
                                             tokio::select! {
                                                 _ = crate::sync::engine::connect_loop(
                                                     &db, &tid, ep, peer.addr, None,
                                                 ) => {}
-                                                // Sender dropped = address changed, exit
                                                 _ = cancel.changed() => {}
                                             }
                                         });
@@ -234,4 +274,112 @@ pub async fn run_node(
 
     // Endpoints will be dropped when threads exit
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::SocketAddr;
+
+    fn addr(port: u16) -> SocketAddr {
+        SocketAddr::new("127.0.0.1".parse().unwrap(), port)
+    }
+
+    #[test]
+    fn test_dispatch_new_peer_returns_connect() {
+        let mut d = PeerDispatcher::new();
+        let (action, rx) = d.dispatch("peer-a", addr(1000));
+        assert_eq!(action, DiscoveryAction::Connect);
+        assert!(rx.is_some(), "should return cancel receiver");
+    }
+
+    #[test]
+    fn test_dispatch_same_addr_returns_skip() {
+        let mut d = PeerDispatcher::new();
+        d.dispatch("peer-a", addr(1000));
+
+        let (action, rx) = d.dispatch("peer-a", addr(1000));
+        assert_eq!(action, DiscoveryAction::Skip);
+        assert!(rx.is_none());
+    }
+
+    #[test]
+    fn test_dispatch_different_addr_returns_reconnect() {
+        let mut d = PeerDispatcher::new();
+        d.dispatch("peer-a", addr(1000));
+
+        let (action, rx) = d.dispatch("peer-a", addr(2000));
+        assert_eq!(action, DiscoveryAction::Reconnect);
+        assert!(rx.is_some());
+    }
+
+    #[test]
+    fn test_dispatch_addr_change_cancels_old_receiver() {
+        let mut d = PeerDispatcher::new();
+        let (_, old_rx) = d.dispatch("peer-a", addr(1000));
+        let mut old_rx = old_rx.unwrap();
+
+        // Address changes — old sender should be dropped
+        let (action, _new_rx) = d.dispatch("peer-a", addr(2000));
+        assert_eq!(action, DiscoveryAction::Reconnect);
+
+        // Old receiver should detect sender was dropped (changed returns Err)
+        // Use a runtime to check the async method
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let result = old_rx.changed().await;
+            assert!(result.is_err(), "old receiver should see sender dropped");
+        });
+    }
+
+    #[test]
+    fn test_dispatch_repeated_churn_only_one_active() {
+        let mut d = PeerDispatcher::new();
+        let mut receivers = Vec::new();
+
+        // Simulate 10 address changes for the same peer
+        for port in 1000..1010 {
+            let (action, rx) = d.dispatch("peer-a", addr(port));
+            assert_ne!(action, DiscoveryAction::Skip);
+            if let Some(rx) = rx {
+                receivers.push(rx);
+            }
+        }
+
+        // Only the last receiver should be live (sender not dropped)
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            // All but the last should be cancelled
+            for mut rx in receivers.drain(..receivers.len() - 1) {
+                let result = rx.changed().await;
+                assert!(result.is_err(), "old receiver should be cancelled");
+            }
+        });
+
+        // Exactly one entry in the map
+        assert_eq!(d.known.len(), 1);
+        assert_eq!(d.known.get("peer-a").unwrap().0, addr(1009));
+    }
+
+    #[test]
+    fn test_dispatch_multiple_peers_independent() {
+        let mut d = PeerDispatcher::new();
+
+        let (a1, _) = d.dispatch("peer-a", addr(1000));
+        let (b1, _) = d.dispatch("peer-b", addr(2000));
+        assert_eq!(a1, DiscoveryAction::Connect);
+        assert_eq!(b1, DiscoveryAction::Connect);
+
+        // Changing peer-a doesn't affect peer-b
+        let (a2, _) = d.dispatch("peer-a", addr(1001));
+        let (b2, _) = d.dispatch("peer-b", addr(2000));
+        assert_eq!(a2, DiscoveryAction::Reconnect);
+        assert_eq!(b2, DiscoveryAction::Skip);
+    }
 }
