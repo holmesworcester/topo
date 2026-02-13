@@ -63,7 +63,7 @@ use crate::db::transport_creds::discover_local_tenants;
 use crate::db::transport_trust::is_peer_allowed;
 use crate::sync::engine::{IngestItem, accept_loop_with_ingest, batch_writer};
 use crate::transport::{
-    AllowedPeers, create_dual_endpoint_dynamic, extract_spki_fingerprint,
+    create_dual_endpoint_dynamic, extract_spki_fingerprint,
 };
 
 /// Run the multi-tenant node.
@@ -132,14 +132,13 @@ pub async fn run_node(
         // Build per-tenant dynamic trust closure
         let db_path_trust = db_path.to_string();
         let recorded_by = tenant.peer_id.clone();
-        let empty_cli_pins = AllowedPeers::from_hex_strings(&[] as &[String])?;
         let dynamic_allow: Arc<
             dyn Fn(&[u8; 32]) -> Result<bool, Box<dyn std::error::Error + Send + Sync>>
                 + Send
                 + Sync,
         > = Arc::new(move |peer_fp: &[u8; 32]| {
             let db = open_connection(&db_path_trust)?;
-            is_peer_allowed(&db, &recorded_by, peer_fp, &empty_cli_pins)
+            is_peer_allowed(&db, &recorded_by, peer_fp)
         });
 
         // Create QUIC endpoint with auto-assigned port
@@ -219,7 +218,7 @@ pub async fn run_node(
                                         rt.block_on(async move {
                                             tokio::select! {
                                                 _ = crate::sync::engine::connect_loop(
-                                                    &db, &tid, ep, peer.addr, None,
+                                                    &db, &tid, ep, peer.addr,
                                                 ) => {}
                                                 _ = cancel.changed() => {}
                                             }

@@ -1072,7 +1072,7 @@ pub async fn accept_loop(
         batch_writer(writer_db_path, shared_ingest_rx, writer_events);
     });
 
-    accept_loop_with_ingest(db_path, recorded_by, endpoint, allowed_peers, shared_ingest_tx).await
+    accept_loop_with_ingest(db_path, recorded_by, endpoint, None, shared_ingest_tx).await
 }
 
 /// Accept incoming connections using an externally-provided ingest channel.

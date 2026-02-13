@@ -3025,7 +3025,7 @@ async fn test_mdns_two_peers_discover_and_sync() {
     let _a_handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all().build().unwrap();
-        rt.block_on(async { let _ = accept_loop(&a_db, &a_id, ep_a, None).await; });
+        rt.block_on(async { let _ = accept_loop(&a_db, &a_id, ep_a).await; });
     });
 
     let b_db = bob.db_path.clone();
@@ -3034,7 +3034,7 @@ async fn test_mdns_two_peers_discover_and_sync() {
     let _b_handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all().build().unwrap();
-        rt.block_on(async { let _ = connect_loop(&b_db, &b_id, ep_b, remote, None).await; });
+        rt.block_on(async { let _ = connect_loop(&b_db, &b_id, ep_b, remote).await; });
     });
 
     // Wait for sync convergence using marker events
@@ -3195,7 +3195,7 @@ async fn test_mdns_multitenant_self_filtering_and_sync() {
     let _t0_handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all().build().unwrap();
-        rt.block_on(async { let _ = accept_loop(&t0_db, &t0_id, ep_t0, None).await; });
+        rt.block_on(async { let _ = accept_loop(&t0_db, &t0_id, ep_t0).await; });
     });
 
     let ext_db = ext.db_path.clone();
@@ -3204,7 +3204,7 @@ async fn test_mdns_multitenant_self_filtering_and_sync() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all().build().unwrap();
         rt.block_on(async {
-            let _ = connect_loop(&ext_db, &ext_identity, ep_ext, t0_connect_addr, None).await;
+            let _ = connect_loop(&ext_db, &ext_identity, ep_ext, t0_connect_addr).await;
         });
     });
 
