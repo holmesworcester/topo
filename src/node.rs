@@ -143,24 +143,25 @@ pub async fn run_node(
                             let db_path_disc = db_path.to_string();
                             let tenant_id = tenant.peer_id.clone();
                             std::thread::spawn(move || {
-                                // Track peer_id -> last known addr. Same addr = skip (dedupe).
-                                // Different addr = spawn new connect_loop (old one will fail
-                                // naturally when the stale endpoint stops responding).
-                                let mut known_peers: HashMap<String, std::net::SocketAddr> = HashMap::new();
+                                // Track peer_id -> (addr, cancel_sender). Same addr = skip.
+                                // Different addr = cancel old loop (drop sender), spawn new one.
+                                // At most one active connect_loop per remote peer.
+                                let mut known_peers: HashMap<String, (std::net::SocketAddr, tokio::sync::watch::Sender<()>)> = HashMap::new();
                                 while let Ok(peer) = rx.recv() {
-                                    match known_peers.get(&peer.peer_id) {
-                                        Some(prev_addr) if *prev_addr == peer.addr => continue,
-                                        Some(prev_addr) => {
-                                            info!(
-                                                "mDNS: tenant {} peer {} changed addr {} -> {}",
-                                                &tenant_id[..16],
-                                                &peer.peer_id[..16.min(peer.peer_id.len())],
-                                                prev_addr, peer.addr
-                                            );
+                                    if let Some((prev_addr, _)) = known_peers.get(&peer.peer_id) {
+                                        if *prev_addr == peer.addr {
+                                            continue; // same addr, dedupe
                                         }
-                                        None => {}
+                                        info!(
+                                            "mDNS: tenant {} peer {} changed addr {} -> {}, cancelling old loop",
+                                            &tenant_id[..16],
+                                            &peer.peer_id[..16.min(peer.peer_id.len())],
+                                            prev_addr, peer.addr
+                                        );
                                     }
-                                    known_peers.insert(peer.peer_id.clone(), peer.addr);
+                                    // Drop old sender (if any) to cancel the old connect_loop
+                                    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(());
+                                    known_peers.insert(peer.peer_id.clone(), (peer.addr, cancel_tx));
                                     info!(
                                         "mDNS: tenant {} connecting to discovered peer {} at {}",
                                         &tenant_id[..16], &peer.peer_id[..16.min(peer.peer_id.len())], peer.addr
@@ -174,10 +175,14 @@ pub async fn run_node(
                                             .build()
                                             .unwrap();
                                         rt.block_on(async move {
-                                            let _ = crate::sync::engine::connect_loop(
-                                                &db, &tid, ep, peer.addr, None,
-                                            )
-                                            .await;
+                                            let mut cancel = cancel_rx;
+                                            tokio::select! {
+                                                _ = crate::sync::engine::connect_loop(
+                                                    &db, &tid, ep, peer.addr, None,
+                                                ) => {}
+                                                // Sender dropped = address changed, exit
+                                                _ = cancel.changed() => {}
+                                            }
                                         });
                                     });
                                 }
