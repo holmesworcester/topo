@@ -2304,7 +2304,7 @@ fn test_true_out_of_order_identity_chain() {
     use ed25519_dalek::SigningKey;
     use poc_7::crypto::hash_event;
     use poc_7::events::{encode_event, ParsedEvent, WorkspaceEvent};
-    use poc_7::projection::create::{create_event_sync, event_id_or_blocked};
+    use poc_7::projection::create::create_event_staged;
     let mut rng = rand::thread_rng();
 
     let workspace_key = SigningKey::generate(&mut rng);
@@ -2335,7 +2335,7 @@ fn test_true_out_of_order_identity_chain() {
     assert!(ia_valid, "invite_accepted should be immediately valid (no HasRecordedInvite guard)");
 
     // Step 2: Create the precomputed workspace event (same event_id as trust anchor).
-    let workspace_eid = event_id_or_blocked(create_event_sync(&db, &alice.identity, &workspace_event))
+    let workspace_eid = create_event_staged(&db, &alice.identity, &workspace_event)
         .expect("workspace should create once trust anchor exists");
 
     let net_b64 = event_id_to_base64(&workspace_eid);
@@ -2621,7 +2621,7 @@ async fn test_identity_then_messaging() {
 #[tokio::test]
 async fn test_device_link_via_sync() {
     use poc_7::events::{DeviceInviteOngoingEvent, PeerSharedOngoingEvent, ParsedEvent};
-    use poc_7::projection::create::{create_signed_event_sync, event_id_or_blocked};
+    use poc_7::projection::create::{create_signed_event_sync, create_signed_event_staged};
 
     let phone = Peer::new("phone");
     let laptop = Peer::new("laptop");
@@ -2653,7 +2653,7 @@ async fn test_device_link_via_sync() {
 
     // Laptop creates PeerSharedOngoing (signed by the device invite key Phone gave).
     // This will be blocked because the signed_by dep (DeviceInviteOngoing) is on Phone.
-    // event_id_or_blocked extracts the event_id even when blocked.
+    // Use staged API since blocking is expected (dep will arrive via sync).
     let laptop_ps_key = ed25519_dalek::SigningKey::generate(&mut rng);
     let laptop_ps_pubkey = laptop_ps_key.verifying_key().to_bytes();
     let db = open_connection(&laptop.db_path).unwrap();
@@ -2665,9 +2665,9 @@ async fn test_device_link_via_sync() {
         signer_type: 3,
         signature: [0u8; 64],
     });
-    let _laptop_ps_eid = event_id_or_blocked(create_signed_event_sync(
+    let _laptop_ps_eid = create_signed_event_staged(
         &db, &laptop.identity, &ps_evt, &laptop_di_key,
-    )).expect("create peer_shared_ongoing");
+    ).expect("create peer_shared_ongoing");
     drop(db);
 
     // Laptop's PeerSharedOngoing is blocked — signed_by dep (DeviceInviteOngoing) is on Phone

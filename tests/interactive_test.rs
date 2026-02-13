@@ -454,7 +454,7 @@ fn test_delete_then_verify_stable_author() {
     assert_not_contains(after_delete, "msg-two", "msg-two removed");
 }
 
-/// Verify that accept-invite with require_valid_event_id properly creates a usable account
+/// Verify that accept-invite with strict create API properly creates a usable account
 /// (post-anchor events are Valid, not just Blocked).
 #[test]
 fn test_invite_accept_produces_valid_identity() {

@@ -4,7 +4,7 @@ use rusqlite::Connection;
 use crate::crypto::EventId;
 use crate::events::*;
 use crate::projection::create::{
-    create_event_sync, create_signed_event_sync, event_id_or_blocked, require_valid_event_id,
+    create_event_sync, create_event_staged, create_signed_event_sync, create_signed_event_staged,
 };
 use crate::transport::extract_spki_fingerprint;
 use crate::transport_identity::transport_cert_paths_from_db;
@@ -90,7 +90,7 @@ pub fn bootstrap_workspace(
         created_at_ms: now_ms(),
         public_key: workspace_pub,
     });
-    let workspace_id = event_id_or_blocked(create_event_sync(conn, recorded_by, &net_evt))?;
+    let workspace_id = create_event_staged(conn, recorded_by, &net_evt)?;
 
     // 2. UserInviteBoot (signed by workspace_key) — blocked until Workspace is valid
     let invite_key = SigningKey::generate(&mut rng);
@@ -103,12 +103,12 @@ pub fn bootstrap_workspace(
         signer_type: 1,
         signature: [0u8; 64],
     });
-    let user_invite_event_id = event_id_or_blocked(create_signed_event_sync(
+    let user_invite_event_id = create_signed_event_staged(
         conn,
         recorded_by,
         &uib_evt,
         &workspace_key,
-    ))?;
+    )?;
 
     // 3. InviteAccepted (local event) — binds trust anchor, triggers guard cascade
     //    that unblocks Workspace -> UserInviteBoot -> and all downstream events
@@ -129,12 +129,12 @@ pub fn bootstrap_workspace(
         signer_type: 2,
         signature: [0u8; 64],
     });
-    let user_event_id = event_id_or_blocked(create_signed_event_sync(
+    let user_event_id = create_signed_event_sync(
         conn,
         recorded_by,
         &ub_evt,
         &invite_key,
-    ))?;
+    )?;
 
     // 5. DeviceInviteFirst (signed by user_key)
     let device_invite_key = SigningKey::generate(&mut rng);
@@ -146,12 +146,12 @@ pub fn bootstrap_workspace(
         signer_type: 4,
         signature: [0u8; 64],
     });
-    let device_invite_event_id = event_id_or_blocked(create_signed_event_sync(
+    let device_invite_event_id = create_signed_event_sync(
         conn,
         recorded_by,
         &dif_evt,
         &user_key,
-    ))?;
+    )?;
 
     // 6. PeerSharedFirst (signed by device_invite_key)
     let peer_shared_key = SigningKey::generate(&mut rng);
@@ -163,12 +163,12 @@ pub fn bootstrap_workspace(
         signer_type: 3,
         signature: [0u8; 64],
     });
-    let peer_shared_event_id = event_id_or_blocked(create_signed_event_sync(
+    let peer_shared_event_id = create_signed_event_sync(
         conn,
         recorded_by,
         &psf_evt,
         &device_invite_key,
-    ))?;
+    )?;
 
     // 7. AdminBoot (signed by workspace_key, dep: user_event)
     let admin_key = SigningKey::generate(&mut rng);
@@ -181,12 +181,12 @@ pub fn bootstrap_workspace(
         signer_type: 1,
         signature: [0u8; 64],
     });
-    let admin_event_id = event_id_or_blocked(create_signed_event_sync(
+    let admin_event_id = create_signed_event_sync(
         conn,
         recorded_by,
         &ab_evt,
         &workspace_key,
-    ))?;
+    )?;
 
     // 8. TransportKey (signed by peer_shared_key)
     let transport_key_event_id = create_transport_key_if_possible(
@@ -235,12 +235,12 @@ pub fn create_user_invite(
         signature: [0u8; 64],
     });
 
-    let invite_event_id = event_id_or_blocked(create_signed_event_sync(
+    let invite_event_id = create_signed_event_sync(
         conn,
         recorded_by,
         &evt,
         workspace_key,
-    ))?;
+    )?;
 
     Ok(InviteData {
         invite_event_id,
@@ -283,12 +283,12 @@ pub fn accept_user_invite(
         signer_type: 2,
         signature: [0u8; 64],
     });
-    let user_event_id = require_valid_event_id(create_signed_event_sync(
+    let user_event_id = create_signed_event_sync(
         conn,
         recorded_by,
         &ub_evt,
         invite_key,
-    ))?;
+    )?;
 
     // 3. DeviceInviteFirst (signed by user_key)
     let device_invite_key = SigningKey::generate(&mut rng);
@@ -300,12 +300,12 @@ pub fn accept_user_invite(
         signer_type: 4,
         signature: [0u8; 64],
     });
-    let device_invite_event_id = require_valid_event_id(create_signed_event_sync(
+    let device_invite_event_id = create_signed_event_sync(
         conn,
         recorded_by,
         &dif_evt,
         &user_key,
-    ))?;
+    )?;
 
     // 4. PeerSharedFirst (signed by device_invite_key)
     let peer_shared_key = SigningKey::generate(&mut rng);
@@ -317,12 +317,12 @@ pub fn accept_user_invite(
         signer_type: 3,
         signature: [0u8; 64],
     });
-    let peer_shared_event_id = require_valid_event_id(create_signed_event_sync(
+    let peer_shared_event_id = create_signed_event_sync(
         conn,
         recorded_by,
         &psf_evt,
         &device_invite_key,
-    ))?;
+    )?;
 
     // 5. TransportKey (signed by peer_shared_key)
     let transport_key_event_id = create_transport_key_if_possible(
@@ -365,8 +365,7 @@ pub fn create_device_link_invite(
         signature: [0u8; 64],
     });
 
-    let invite_event_id =
-        event_id_or_blocked(create_signed_event_sync(conn, recorded_by, &evt, user_key))?;
+    let invite_event_id = create_signed_event_sync(conn, recorded_by, &evt, user_key)?;
 
     Ok(InviteData {
         invite_event_id,
@@ -407,12 +406,12 @@ pub fn accept_device_link(
         signer_type: 3,
         signature: [0u8; 64],
     });
-    let peer_shared_event_id = require_valid_event_id(create_signed_event_sync(
+    let peer_shared_event_id = create_signed_event_sync(
         conn,
         recorded_by,
         &psf_evt,
         device_invite_key,
-    ))?;
+    )?;
 
     // 3. TransportKey (signed by peer_shared_key)
     let transport_key_event_id = create_transport_key_if_possible(
