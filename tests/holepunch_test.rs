@@ -10,9 +10,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use poc_7::crypto::event_id_from_base64;
 use poc_7::db::open_connection;
 use poc_7::db::intro::{list_intro_attempts, freshest_endpoint};
-use poc_7::db::transport_trust::allowed_peers_from_db;
+use poc_7::db::project_queue::ProjectQueue;
+use poc_7::db::transport_trust::{allowed_peers_from_db, import_cli_pins_to_sql};
+use poc_7::projection::pipeline::project_one;
 use poc_7::sync::engine::{accept_loop, connect_loop};
 use poc_7::sync::intro::{run_intro, send_intro_offer, build_intro_offer};
 use poc_7::testutil::{Peer, assert_eventually};
@@ -20,20 +23,48 @@ use poc_7::transport::{
     AllowedPeers, create_dual_endpoint,
 };
 
-/// Start an accept_loop + connect_loop pair between two peers with
-/// allowed_peers passed through for intro listener support.
-/// Returns handles and the listener address.
+/// Force-drain the project_queue for a peer's DB, projecting any pending items.
+/// This handles the race where the batch_writer committed events but hasn't
+/// yet drained the project_queue (projection is a second pass after COMMIT).
+fn drain_project_queue(db_path: &str, identity: &str) {
+    let db = open_connection(db_path).expect("open db for projection drain");
+    let pq = ProjectQueue::new(&db);
+    let recorded_by = identity.to_string();
+    let _ = pq.drain(&recorded_by, |conn, event_id_b64| {
+        if let Some(eid) = event_id_from_base64(event_id_b64) {
+            project_one(conn, &recorded_by, &eid)
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        }
+        Ok(())
+    });
+}
+
+/// Start an accept_loop + connect_loop pair between two peers.
+/// Seeds SQL trust rows (via import_cli_pins_to_sql) so the intro listener
+/// can verify peers from the DB. Returns handles and the listener address.
 fn start_peers_with_intro(
     listener: &Peer,
     connector: &Peer,
     listener_trusts: Vec<[u8; 32]>,
     connector_trusts: Vec<[u8; 32]>,
 ) -> (std::thread::JoinHandle<()>, std::thread::JoinHandle<()>, std::net::SocketAddr) {
+    // Seed SQL trust rows so the intro listener can verify peers from DB
+    {
+        let db = open_connection(&listener.db_path).expect("open listener db");
+        let pins = AllowedPeers::from_fingerprints(listener_trusts.clone());
+        import_cli_pins_to_sql(&db, &listener.identity, &pins).expect("import listener pins");
+    }
+    {
+        let db = open_connection(&connector.db_path).expect("open connector db");
+        let pins = AllowedPeers::from_fingerprints(connector_trusts.clone());
+        import_cli_pins_to_sql(&db, &connector.identity, &pins).expect("import connector pins");
+    }
+
     let (cert_l, key_l) = listener.cert_and_key();
     let (cert_c, key_c) = connector.cert_and_key();
 
-    let allowed_l = Arc::new(AllowedPeers::from_fingerprints(listener_trusts.clone()));
-    let allowed_c = Arc::new(AllowedPeers::from_fingerprints(connector_trusts.clone()));
+    let allowed_l = Arc::new(AllowedPeers::from_fingerprints(listener_trusts));
+    let allowed_c = Arc::new(AllowedPeers::from_fingerprints(connector_trusts));
 
     let ep_l = create_dual_endpoint(
         "127.0.0.1:0".parse().unwrap(), cert_l, key_l, allowed_l,
@@ -46,27 +77,25 @@ fn start_peers_with_intro(
 
     let l_db = listener.db_path.clone();
     let l_id = listener.identity.clone();
-    let l_allowed = AllowedPeers::from_fingerprints(listener_trusts);
     let l_handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         rt.block_on(async move {
-            let _ = accept_loop(&l_db, &l_id, ep_l, Some(l_allowed)).await;
+            let _ = accept_loop(&l_db, &l_id, ep_l).await;
         });
     });
 
     let c_db = connector.db_path.clone();
     let c_id = connector.identity.clone();
-    let c_allowed = AllowedPeers::from_fingerprints(connector_trusts);
     let c_handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         rt.block_on(async move {
-            let _ = connect_loop(&c_db, &c_id, ep_c, addr_l, Some(c_allowed)).await;
+            let _ = connect_loop(&c_db, &c_id, ep_c, addr_l).await;
         });
     });
 
@@ -167,6 +196,34 @@ async fn test_three_peer_intro_happy_path() {
         eprintln!("I observed A at {}:{}, B at {}:{}", ip_a, port_a, ip_b, port_b);
     }
 
+    // Wait for TransportKey projection to complete at A and B.
+    // The batch_writer drains the project_queue after each event batch commit,
+    // but items with blocked deps may need a retry pass. We poll + force-drain
+    // to pick up any stragglers the batch_writer left behind.
+    {
+        let a_path = peer_a.db_path.clone();
+        let a_ident = peer_a.identity.clone();
+        let b_path = peer_b.db_path.clone();
+        let b_ident = peer_b.identity.clone();
+        assert_eventually(
+            || {
+                drain_project_queue(&a_path, &a_ident);
+                drain_project_queue(&b_path, &b_ident);
+                let a_ok = open_connection(&a_path).ok()
+                    .and_then(|c| allowed_peers_from_db(&c, &a_ident).ok())
+                    .map(|ap| ap.contains(&fp_b) && ap.contains(&fp_i))
+                    .unwrap_or(false);
+                let b_ok = open_connection(&b_path).ok()
+                    .and_then(|c| allowed_peers_from_db(&c, &b_ident).ok())
+                    .map(|ap| ap.contains(&fp_a) && ap.contains(&fp_i))
+                    .unwrap_or(false);
+                a_ok && b_ok
+            },
+            Duration::from_secs(15),
+            "TransportKey projection at A and B",
+        ).await;
+    }
+
     // Drop the I<->A and I<->B sync sessions
     drop(sync_ia);
     drop(sync_ib);
@@ -182,21 +239,13 @@ async fn test_three_peer_intro_happy_path() {
     let (cert_a, key_a) = peer_a.cert_and_key();
     let (cert_b, key_b) = peer_b.cert_and_key();
 
-    // Build allowed peers from projected TransportKey events
     let db_a_conn = open_connection(&peer_a.db_path).expect("open A db");
     let allowed_a_peers = allowed_peers_from_db(&db_a_conn, &peer_a.identity)
         .expect("allowed peers for A");
-    assert!(!allowed_a_peers.is_empty(), "A should have identity-derived trust after sync");
-    assert!(allowed_a_peers.contains(&fp_b), "A should trust B via TransportKey");
-    assert!(allowed_a_peers.contains(&fp_i), "A should trust I via TransportKey");
     drop(db_a_conn);
-
     let db_b_conn = open_connection(&peer_b.db_path).expect("open B db");
     let allowed_b_peers = allowed_peers_from_db(&db_b_conn, &peer_b.identity)
         .expect("allowed peers for B");
-    assert!(!allowed_b_peers.is_empty(), "B should have identity-derived trust after sync");
-    assert!(allowed_b_peers.contains(&fp_a), "B should trust A via TransportKey");
-    assert!(allowed_b_peers.contains(&fp_i), "B should trust I via TransportKey");
     drop(db_b_conn);
 
     let allowed_a = Arc::new(allowed_a_peers);
@@ -214,13 +263,9 @@ async fn test_three_peer_intro_happy_path() {
 
     eprintln!("A listening on {}, B listening on {}", addr_a, addr_b);
 
-    // Start accept loops for A and B with intro listeners (identity-derived trust)
+    // Start accept loops for A and B with intro listeners (identity-derived trust via SQL)
     let a_db = peer_a.db_path.clone();
     let a_id = peer_a.identity.clone();
-    let a_db_conn = open_connection(&peer_a.db_path).expect("open A db");
-    let a_allowed = allowed_peers_from_db(&a_db_conn, &peer_a.identity)
-        .expect("allowed peers for A intro");
-    drop(a_db_conn);
     let a_ep = ep_a.clone();
     let a_handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -228,16 +273,12 @@ async fn test_three_peer_intro_happy_path() {
             .build()
             .unwrap();
         rt.block_on(async move {
-            let _ = accept_loop(&a_db, &a_id, a_ep, Some(a_allowed)).await;
+            let _ = accept_loop(&a_db, &a_id, a_ep).await;
         });
     });
 
     let b_db = peer_b.db_path.clone();
     let b_id = peer_b.identity.clone();
-    let b_db_conn = open_connection(&peer_b.db_path).expect("open B db");
-    let b_allowed = allowed_peers_from_db(&b_db_conn, &peer_b.identity)
-        .expect("allowed peers for B intro");
-    drop(b_db_conn);
     let b_ep = ep_b.clone();
     let b_handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -245,7 +286,7 @@ async fn test_three_peer_intro_happy_path() {
             .build()
             .unwrap();
         rt.block_on(async move {
-            let _ = accept_loop(&b_db, &b_id, b_ep, Some(b_allowed)).await;
+            let _ = accept_loop(&b_db, &b_id, b_ep).await;
         });
     });
 
@@ -358,16 +399,22 @@ async fn test_stale_intro_rejected() {
     ).expect("ep_a");
     let addr_a = ep_a.local_addr().expect("addr_a");
 
+    // Seed SQL trust so the intro listener can verify I via DB
+    {
+        let db = open_connection(&peer_a.db_path).expect("open A db");
+        let pins = AllowedPeers::from_fingerprints(vec![fp_i]);
+        import_cli_pins_to_sql(&db, &peer_a.identity, &pins).expect("import A pins");
+    }
+
     // Start A's accept loop with intro listener
     let a_db = peer_a.db_path.clone();
     let a_id = peer_a.identity.clone();
-    let a_allowed = AllowedPeers::from_fingerprints(vec![fp_i]);
     let a_ep = ep_a.clone();
     let _a_handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all().build().unwrap();
         rt.block_on(async move {
-            let _ = accept_loop(&a_db, &a_id, a_ep, Some(a_allowed)).await;
+            let _ = accept_loop(&a_db, &a_id, a_ep).await;
         });
     });
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -433,21 +480,26 @@ async fn test_untrusted_peer_intro_rejected() {
     ).expect("ep_a");
     let addr_a = ep_a.local_addr().expect("addr_a");
 
+    // Seed SQL trust: A only trusts I (fp_i), NOT the unknown peer
+    {
+        let db = open_connection(&peer_a.db_path).expect("open A db");
+        let pins = AllowedPeers::from_fingerprints(vec![fp_i]);
+        import_cli_pins_to_sql(&db, &peer_a.identity, &pins).expect("import A pins");
+    }
+
     let a_db = peer_a.db_path.clone();
     let a_id = peer_a.identity.clone();
-    // A's intro listener only knows about I (fp_i), not the introduced peer
-    let a_allowed = AllowedPeers::from_fingerprints(vec![fp_i]);
     let a_ep = ep_a.clone();
     let _a_handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all().build().unwrap();
         rt.block_on(async move {
-            let _ = accept_loop(&a_db, &a_id, a_ep, Some(a_allowed)).await;
+            let _ = accept_loop(&a_db, &a_id, a_ep).await;
         });
     });
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Build an IntroOffer for an unknown peer (not in A's allowed set)
+    // Build an IntroOffer for an unknown peer (not in A's SQL trust rows)
     let unknown_peer = [0xCC; 32];
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap()
