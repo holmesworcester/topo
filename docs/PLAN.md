@@ -18,6 +18,7 @@ This document is ordered exactly as we should build it.
 10. `Phase 5`: Non-identity special-case projector logic (deletion/emitted-events).
 11. `Phase 6`: Performance hardening, observability, scaling, and low-memory iOS mode.
 12. `Phase 7`: TLA-first minimal identity layer for trust-anchor cascade, removal, and sender-subjective encryption.
+13. `Phase 8`: Functional multitenancy — one node hosting N tenant identities in a shared DB with per-tenant QUIC endpoints and mDNS discovery.
 
 Scheduling note:
 - two-tier multitenancy plan:
@@ -25,6 +26,7 @@ Scheduling note:
   - Phase 2.6 proves scoped projection/query separation once projector + signer substrate exist.
 - `signed_by` dependency blocking + signature verification ordering is tackled in Phase 2.5.
 - Phase 2.5 and Phase 2.6 must be complete before starting identity projectors in Phase 7.
+- Phase 8 depends on Phase 7 identity flows (bootstrap_workspace, accept_user_invite) being stable.
 
 ## 1.1 `codex-simplified` baseline gap audit (current state)
 
@@ -1566,3 +1568,528 @@ Notes:
 4. **Intro timing matters**: Both peers must receive IntroOffers and start dialing within each other's attempt windows. A controller may need repeated one-shot `intro` calls when peers are unstable.
 
 5. **LocalSet is required**: Both `accept_loop` and `connect_loop` wrap their inner logic in a `LocalSet::run_until()` to provide the context needed by `spawn_local` in `spawn_intro_listener`. Forgetting this causes a panic at runtime.
+
+---
+
+## 17. Phase 8: Functional Multitenancy
+
+### Status: COMPLETE
+
+One node hosting N local tenant identities in a shared SQLite DB, each with its own QUIC endpoint, workspace binding, and trust policy. The DB itself is the tenant registry — no explicit registration step. Tenants are discovered by joining `trust_anchors` with `local_transport_creds`.
+
+### Key insight
+
+The DB already IS the tenant registry. `trust_anchors(peer_id, workspace_id)` contains every local identity that has accepted an invite (populated by `invite_accepted`, which is local-only). All projection tables scope by `(recorded_by, event_id)`. The only missing pieces were: (a) storing TLS cert/key material per tenant in the DB, and (b) a node daemon that reads this state and spins up per-tenant QUIC endpoints.
+
+---
+
+## 17.1 DB-Only TLS Credential Storage
+
+Cert/key DER blobs live exclusively in SQLite. No `.cert.der` / `.key.der` files on disk. The identity bootstrap projection pipeline (which creates TransportKey events) stores credentials in the DB as part of the same flow.
+
+### 17.1.1 Migration 26: `local_transport_creds`
+
+```sql
+CREATE TABLE local_transport_creds (
+    peer_id TEXT PRIMARY KEY,
+    cert_der BLOB NOT NULL,
+    key_der BLOB NOT NULL,
+    created_at INTEGER NOT NULL
+);
+```
+
+Auto-populated during the identity bootstrap flow that creates TransportKey events. Added in `src/db/migrations.rs`.
+
+### 17.1.2 `src/db/transport_creds.rs`
+
+CRUD operations for the `local_transport_creds` table:
+
+```rust
+pub fn store_local_creds(conn, peer_id, cert_der, key_der) -> Result<()>
+pub fn load_local_creds(conn, peer_id) -> Result<Option<(Vec<u8>, Vec<u8>)>>
+pub fn load_sole_local_creds(conn) -> Result<Option<(String, Vec<u8>, Vec<u8>)>>
+pub fn list_local_peers(conn) -> Result<Vec<String>>
+pub fn discover_local_tenants(conn) -> Result<Vec<TenantInfo>>
+```
+
+`TenantInfo` carries `peer_id`, `workspace_id`, `cert_der`, `key_der`.
+
+`load_sole_local_creds` returns the single local credential when exactly one exists; errors if multiple exist. Used by single-tenant CLI mode to avoid ambiguity.
+
+`discover_local_tenants` is the core multi-tenant query:
+
+```sql
+SELECT t.peer_id, t.workspace_id, c.cert_der, c.key_der
+FROM trust_anchors t
+JOIN local_transport_creds c ON t.peer_id = c.peer_id
+```
+
+This returns every local identity that has (a) accepted an invite and (b) has TLS material. No registration needed.
+
+### 17.1.3 Filesystem cert elimination
+
+**Removed:**
+- `transport_cert_paths_from_db()` — file path derivation
+- `write_cert_and_key()` — file writes
+- `load_or_generate_cert()` — file-based load/generate
+- `atomic_write()` and `set_owner_only_permissions()` — dead code
+- File-based tests in `cert.rs`
+
+**Kept:**
+- `generate_self_signed_cert()` — generates in memory
+- `generate_self_signed_cert_from_signing_key()` — deterministic generation for invites
+- `extract_spki_fingerprint()` — computes BLAKE2b-256 of SPKI
+- `validate_cert_key_match()` — validates cert/key consistency
+
+### 17.1.4 Refactored `src/transport_identity.rs`
+
+All functions switched from file I/O to DB queries. Functions take `&Connection` instead of `db_path: &str` at the core, with convenience wrappers that open connections:
+
+```rust
+// Core (take &Connection):
+pub fn load_transport_peer_id(conn) -> Result<String>
+pub fn ensure_transport_peer_id(conn) -> Result<String>
+pub fn ensure_transport_cert(conn) -> Result<(String, CertificateDer, PrivatePkcs8KeyDer)>
+pub fn load_transport_cert(conn, peer_id) -> Result<(CertificateDer, PrivatePkcs8KeyDer)>
+
+// Convenience (open connection from db_path):
+pub fn load_transport_peer_id_from_db(db_path) -> Result<String>
+pub fn ensure_transport_peer_id_from_db(db_path) -> Result<String>
+pub fn ensure_transport_cert_from_db(db_path) -> Result<(String, CertificateDer, PrivatePkcs8KeyDer)>
+
+// Invite bootstrap (deterministic cert from invite key):
+pub fn expected_invite_bootstrap_spki_from_invite_key(invite_key) -> [u8; 32]
+pub fn install_invite_bootstrap_transport_identity(db_path, invite_key) -> Result<String>
+
+// TransportKey event creation:
+pub fn ensure_transport_key_event(conn, recorded_by, signing_key) -> Result<Option<[u8; 32]>>
+```
+
+`ensure_transport_key_event` looks up the local cert for `recorded_by`, creates a TransportKey event binding the cert's SPKI fingerprint to the PeerShared identity. Returns `None` if TransportKey already exists.
+
+### 17.1.5 Caller updates
+
+All cert-loading sites across the codebase were updated from file-based to DB-based:
+
+| File | Sites | Change |
+|------|-------|--------|
+| `src/main.rs` | 4 | `load_or_generate_cert` → `ensure_transport_cert_from_db` |
+| `src/service.rs` | 4 | same, conn already available in service context |
+| `src/identity_ops.rs` | 1 | `std::fs::read(cert_path)` → DB query |
+| `src/testutil.rs` | ~15 | all Peer methods use `ensure_transport_cert` |
+| `src/transport/mod.rs` | exports | removed file-based, added DB-based |
+
+### Exit criteria (Phase 17.1)
+
+`cargo test` passes. Zero cert files on disk. All cert material in `local_transport_creds` table. `discover_local_tenants` returns the right peers.
+
+---
+
+## 17.2 Production Identity Flows
+
+Manual identity chain construction in test helpers was replaced with production `identity_ops` functions. This ensures tests exercise the same code paths as the real daemon.
+
+### 17.2.1 `src/identity_ops.rs`
+
+Three high-level flows:
+
+**Bootstrap (creator):**
+```rust
+pub fn bootstrap_workspace(conn, recorded_by) -> Result<IdentityChain>
+```
+Creates: Workspace → UserInviteBoot → InviteAccepted (trust anchor) → UserBoot → DeviceInviteFirst → PeerSharedFirst → AdminBoot → TransportKey (8 events).
+
+**Invite (admin):**
+```rust
+pub fn create_user_invite(conn, recorded_by, workspace_key, workspace_id) -> Result<InviteData>
+```
+Creates UserInviteBoot event signed by workspace key. Returns `InviteData { invite_event_id, invite_key, workspace_id, invite_type }`.
+
+**Accept (joiner):**
+```rust
+pub fn accept_user_invite(conn, recorded_by, invite_key, invite_event_id, workspace_id) -> Result<JoinChain>
+```
+Creates: InviteAccepted → UserBoot → DeviceInviteFirst → PeerSharedFirst → TransportKey. Joiner must pre-copy Workspace + UserInviteBoot events into their DB before calling this.
+
+**Device link:**
+```rust
+pub fn create_device_link_invite(conn, recorded_by, user_key, user_event_id, workspace_id) -> Result<InviteData>
+pub fn accept_device_link(conn, recorded_by, device_invite_key, device_invite_event_id, workspace_id) -> Result<LinkChain>
+```
+
+All functions take `&Connection` and `recorded_by`, enabling multi-tenant operation on shared DBs.
+
+### 17.2.2 Result types
+
+```rust
+pub struct IdentityChain {
+    pub workspace_id: [u8; 32],
+    pub workspace_key: SigningKey,
+    pub peer_shared_event_id: [u8; 32],
+    pub peer_shared_key: SigningKey,
+    // ... plus all intermediate event IDs and keys
+}
+
+pub struct JoinChain {
+    pub peer_shared_event_id: [u8; 32],
+    pub peer_shared_key: SigningKey,
+    pub invite_accepted_event_id: [u8; 32],
+    pub transport_key_event_id: Option<[u8; 32]>,
+    // ... plus intermediate keys
+}
+```
+
+---
+
+## 17.3 Multi-Tenant Batch Writer
+
+The sync engine's ingest channel was changed from a 2-tuple to a 3-tuple carrying the tenant identity.
+
+### 17.3.1 `IngestItem` type
+
+```rust
+pub type IngestItem = (EventId, Vec<u8>, String);  // (event_id, blob, recorded_by)
+```
+
+### 17.3.2 `batch_writer` signature
+
+```rust
+pub fn batch_writer(
+    db_path: String,
+    mut rx: mpsc::Receiver<IngestItem>,
+    events_received: Arc<AtomicU64>,
+)
+```
+
+The `recorded_by: String` parameter was removed. Per-item `recorded_by` is extracted from each `IngestItem` for:
+- `recorded_events` INSERT
+- `project_queue` enqueue
+- Per-tenant projection drain
+
+Drain phase groups items by tenant and drains per tenant:
+```rust
+let tenants: HashSet<String> = batch.iter().map(|(_, _, rb)| rb.clone()).collect();
+for rb in &tenants {
+    pq.drain_with_limit(rb, batch_sz, |conn, eid_b64| { ... });
+}
+```
+
+### 17.3.3 `spawn_data_receiver`
+
+```rust
+pub fn spawn_data_receiver<R>(
+    data_recv: R,
+    ingest_tx: Sender<IngestItem>,
+    bytes_received: Arc<AtomicU64>,
+    recorded_by: String,
+)
+```
+
+Tags every received event with `recorded_by` before sending to the shared ingest channel. This ensures no event enters the shared writer without tenant identification.
+
+### 17.3.4 `accept_loop_with_ingest`
+
+```rust
+pub async fn accept_loop_with_ingest(
+    db_path: &str,
+    recorded_by: &str,
+    endpoint: Endpoint,
+    allowed_peers: Option<AllowedPeers>,
+    shared_ingest_tx: Sender<IngestItem>,
+) -> Result<()>
+```
+
+Extracted from `accept_loop` to accept an external shared ingest channel. The existing `accept_loop` becomes a wrapper that spawns a local `batch_writer` and delegates.
+
+---
+
+## 17.4 Node Daemon
+
+### 17.4.1 `src/node.rs`
+
+```rust
+pub async fn run_node(
+    db_path: &str,
+    bind_ip: IpAddr,
+) -> Result<(), Box<dyn Error + Send + Sync>>
+```
+
+Flow:
+1. Open shared DB, `create_tables()`.
+2. `discover_local_tenants(&db)` — JOIN `trust_anchors` with `local_transport_creds`.
+3. Fail if empty: "No local identities found."
+4. Spawn ONE shared `batch_writer` thread.
+5. Per tenant:
+   - Deserialize cert/key DER into rustls types.
+   - Verify SPKI fingerprint matches `peer_id`.
+   - Create QUIC endpoint via `create_dual_endpoint_dynamic` on `(bind_ip, 0)` (auto-assign port).
+   - Build per-tenant dynamic trust closure scoped to that `recorded_by`.
+   - Spawn `accept_loop_with_ingest` with shared ingest channel.
+   - Log actual bound port.
+6. Ctrl-C → close all endpoints.
+
+### 17.4.2 Per-tenant dynamic trust
+
+Each tenant's QUIC endpoint gets a closure that checks transport trust in real-time:
+
+```rust
+let is_allowed = move |peer_fp: &str| -> bool {
+    is_peer_allowed(&db_path, &recorded_by, peer_fp, &allowed_peers)
+};
+```
+
+This queries `trust_anchors` and `transport_keys` for that specific `recorded_by`, enabling isolated trust policies per tenant within the same process.
+
+### 17.4.3 `PeerDispatcher`
+
+Tracks discovered peer addresses and manages connection lifecycle:
+
+```rust
+pub struct PeerDispatcher {
+    known: HashMap<String, (SocketAddr, watch::Sender<()>)>,
+}
+```
+
+`DiscoveryAction` enum routes decisions: `Skip` (already connected at same address), `Connect` (new peer), `Reconnect` (address changed — cancel old `connect_loop` via `watch` channel, spawn new one).
+
+### 17.4.4 CLI integration
+
+`src/bin/p7d.rs` has a `--node` flag. When set, calls `node::run_node()` instead of single-tenant `svc_sync()`. RPC server still runs alongside for queries.
+
+---
+
+## 17.5 mDNS/DNS-SD Discovery
+
+### 17.5.1 `src/discovery.rs` (feature-gated: `discovery`)
+
+```toml
+# Cargo.toml
+mdns-sd = { version = "0.11", optional = true }
+
+[features]
+default = ["discovery"]
+discovery = ["mdns-sd"]
+```
+
+### 17.5.2 `TenantDiscovery`
+
+```rust
+pub struct TenantDiscovery {
+    peer_id: String,
+    daemon: ServiceDaemon,
+    local_peer_ids: HashSet<String>,
+}
+
+impl TenantDiscovery {
+    pub fn new(peer_id, port, local_peer_ids) -> Result<Self>
+    pub fn browse(&self) -> Result<Receiver<DiscoveredPeer>>
+}
+```
+
+Each tenant advertises under `_quiet-p7._udp.local.` with:
+- Instance name: `p7-{peer_id_truncated_to_59_chars}` (DNS labels max 63 bytes).
+- TXT property: `peer_id={full_64_hex_chars}` for exact matching.
+- Explicit local non-loopback IPv4 address (discovered via UDP socket connect to 8.8.8.8).
+
+`local_peer_ids` (the full set of all tenants on this node) filters out self-discoveries and other local tenants. This prevents unnecessary local connections.
+
+### 17.5.3 Integration in `node.rs`
+
+After creating each tenant's endpoint, node creates `TenantDiscovery` with the actual bound port. On trusted discovery, `PeerDispatcher` routes to `connect_loop`. Feature-gated with `#[cfg(feature = "discovery")]`.
+
+### 17.5.4 DNS label truncation
+
+Peer IDs are 64 hex chars. With the `p7-` prefix (3 chars), using all 64 would produce a 67-char label exceeding the 63-byte DNS limit. The instance name truncates to 59 chars of the peer ID (62 total with prefix). The full peer ID is always available in the TXT property for exact matching.
+
+---
+
+## 17.6 Test Infrastructure
+
+### 17.6.1 `SharedDbNode` test helper
+
+```rust
+pub struct SharedDbNode {
+    pub db_path: String,
+    pub tenants: Vec<Peer>,
+    _tempdir: TempDir,
+}
+```
+
+Creates N tenants in one shared DB. Each tenant gets:
+- Unique self-signed cert (stored via `store_local_creds`).
+- Full identity chain via `bootstrap_identity_chain()`.
+- Own `workspace_id`, `peer_shared_event_id`, `peer_shared_signing_key`.
+
+```rust
+impl SharedDbNode {
+    pub fn new(n: usize) -> Self           // N independent-workspace tenants
+    pub fn add_tenant_in_workspace(        // join existing tenant's workspace
+        &mut self, name: &str, creator_index: usize,
+    )
+    pub fn verify_all_invariants(&self)    // cross-tenant leakage check
+}
+```
+
+`add_tenant_in_workspace` uses the production invite flow:
+1. Generate distinct cert for new tenant, store in shared DB.
+2. Creator issues invite via `create_user_invite`.
+3. Copy prerequisite events (Workspace + UserInviteBoot) from creator to joiner.
+4. Joiner accepts via `accept_user_invite` → full identity chain + TransportKey.
+
+### 17.6.2 `Peer` construction
+
+Three constructors matching different test needs:
+
+| Constructor | Identity | Workspace | Use case |
+|-------------|----------|-----------|----------|
+| `Peer::new(name)` | Transport only | None | Manual identity tests |
+| `Peer::new_with_identity(name)` | Full bootstrap | Own | Independent peer tests |
+| `Peer::new_in_workspace(name, creator)` | Join flow | Creator's | Same-workspace tests |
+
+`new_with_identity` calls `bootstrap_workspace` (production flow). `new_in_workspace` calls `create_user_invite` + `accept_user_invite` (production flow), copying prerequisite events between DBs.
+
+### 17.6.3 Closure-based `sync_until_converged`
+
+```rust
+pub async fn sync_until_converged<F: Fn() -> bool>(
+    peer_a: &Peer,
+    peer_b: &Peer,
+    check: F,
+    timeout: Duration,
+) -> SyncMetrics
+```
+
+Replaced the old `expected_count: i64` parameter with a generic closure. Metrics (events transferred, throughput) are computed from before/after `store_count()` internally.
+
+### 17.6.4 Application-level convergence pattern
+
+Tests use `has_event()` on specific event IDs for convergence detection, and meaningful projection counts for assertions:
+
+```rust
+// Convergence: sample a specific event, wait for it to arrive
+let sample = alice.sample_event_ids(1)[0].clone();
+let metrics = sync_until_converged(
+    &alice, &bob,
+    || bob.has_event(&sample),
+    Duration::from_secs(120),
+).await;
+
+// Assertion: application-level data, not raw event counts
+assert_eq!(alice.message_count(), 5_000);
+assert_eq!(bob.message_count(), 5_000);
+```
+
+This pattern is resilient to identity chain size changes (6 events → 8 events → future changes). Tests never assert on `store_count()`, `recorded_events_count()`, or `neg_items_count()`.
+
+For bidirectional zero-loss verification, sample multiple events from both sides:
+```rust
+let alice_samples = alice.sample_event_ids(50);
+let bob_samples = bob.sample_event_ids(50);
+sync_until_converged(&alice, &bob,
+    || alice_samples.iter().all(|s| bob.has_event(s))
+        && bob_samples.iter().all(|s| alice.has_event(s)),
+    Duration::from_secs(120),
+).await;
+```
+
+### 17.6.5 Cross-tenant leakage detection
+
+```rust
+pub fn assert_no_cross_tenant_leakage(
+    db_path: &str,
+    tenant_workspaces: &[(String, [u8; 32])],
+)
+```
+
+Checks:
+1. `recorded_events` and `valid_events` are pairwise disjoint for tenants in different workspaces.
+2. No unexpected `recorded_by` values in projection tables (messages, reactions, signed_memos, secret_keys).
+3. Overlaps expected for same-workspace tenants (after sync).
+
+Wired into `SharedDbNode::verify_all_invariants()` and run after every multi-tenant scenario test.
+
+---
+
+## 17.7 Scenario Tests
+
+Tests in `tests/scenario_test.rs`:
+
+| Test | Topology | Verifies |
+|------|----------|----------|
+| `test_shared_db_same_workspace_two_tenants` | 2 tenants, same workspace, 1 DB | Messages project for both tenants |
+| `test_shared_db_two_tenants_different_workspaces` | 2 tenants, different workspaces, 1 DB | Zero cross-workspace event overlap |
+| `test_shared_db_no_cross_tenant_leakage` | 2 tenants, shared DB | Projection table isolation |
+| `test_shared_db_sync_with_external_peer` | 1 node tenant + 1 standalone peer | Node tenant syncs with external peer |
+| `test_shared_db_tenant_discovery` | 2+ tenants, shared DB | `discover_local_tenants` returns correct set |
+| `test_cross_tenant_dep_scoping_after_sync` | 2 tenants, shared DB, sync | Dependency blocking scoped by recorded_by |
+| `test_svc_node_status` | 2 tenants | `svc_node_status` returns correct tenant list |
+| `test_mdns_two_peers_discover_and_sync` | 2 standalone peers | mDNS advertise/browse/sync |
+| `test_mdns_multitenant_self_filtering_and_sync` | Node with 2 tenants + external peer | Self-filtering, external peer sync |
+
+Tests in `tests/mdns_smoke.rs`:
+| Test | Verifies |
+|------|----------|
+| `mdns_advertise_and_browse` | Basic mDNS register/resolve round-trip |
+
+---
+
+## 17.8 Implementation Files
+
+| File | Action | Phase |
+|------|--------|-------|
+| `src/db/migrations.rs` | Migration 26: `local_transport_creds` | 17.1 |
+| `src/db/transport_creds.rs` | **New** — store/load/list/discover creds from DB | 17.1 |
+| `src/db/mod.rs` | Export `transport_creds` | 17.1 |
+| `src/transport/cert.rs` | Remove file I/O, keep generation + fingerprint | 17.1 |
+| `src/transport/mod.rs` | Update re-exports | 17.1 |
+| `src/transport_identity.rs` | Rewrite: `&Connection` instead of file paths, DB-only | 17.1 |
+| `src/identity_ops.rs` | Add `bootstrap_workspace`, `create_user_invite`, `accept_user_invite`, `create_device_link_invite`, `accept_device_link` | 17.2 |
+| `src/main.rs` | Update 4 cert-loading sites | 17.1 |
+| `src/service.rs` | Update 4 cert-loading sites, add `svc_node_status` | 17.1, 17.4 |
+| `src/sync/engine.rs` | `IngestItem` 3-tuple, `accept_loop_with_ingest`, `PeerDispatcher` | 17.3 |
+| `src/node.rs` | **New** — `run_node` multi-tenant daemon | 17.4 |
+| `src/discovery.rs` | **New** — mDNS per-tenant discovery | 17.5 |
+| `src/lib.rs` | Export `node`, `discovery` | 17.4, 17.5 |
+| `Cargo.toml` | `mdns-sd` dep + `discovery` feature | 17.5 |
+| `src/testutil.rs` | `SharedDbNode`, closure-based `sync_until_converged`, `new_in_workspace`, `add_tenant_in_workspace`, leakage checks | 17.6 |
+| `tests/scenario_test.rs` | Multi-tenant + mDNS scenario tests, application-level assertions | 17.7 |
+| `tests/mdns_smoke.rs` | **New** — mDNS integration test | 17.7 |
+| `tests/perf_test.rs` | Closure-based convergence, application-level assertions | 17.6 |
+| `tests/low_mem_test.rs` | Same | 17.6 |
+| `tests/sync_graph_test.rs` | Same | 17.6 |
+
+---
+
+## 17.9 Assistant Execution Playbook (Phase 8)
+
+### Must implement
+
+1. `local_transport_creds` table with store/load/list/discover operations.
+2. `discover_local_tenants` query joining `trust_anchors` with `local_transport_creds`.
+3. All cert operations via DB, zero filesystem cert paths.
+4. `IngestItem` 3-tuple `(event_id, blob, recorded_by)` everywhere in sync engine.
+5. `accept_loop_with_ingest` accepting external shared ingest channel.
+6. `run_node` per-tenant QUIC endpoint spawning with shared batch writer.
+7. Per-tenant dynamic trust closure from `trust_anchors`/`transport_keys`.
+8. mDNS per-tenant advertise + browse with self-filtering.
+9. `SharedDbNode` test helper using production identity flows.
+10. Application-level test assertions (never `store_count`, always `message_count`/`has_event`/etc.).
+
+### Common mistakes
+
+- **Filesystem cert remnants**: Do not read or write `.cert.der` / `.key.der` files. All cert material lives in `local_transport_creds`.
+- **Hardcoded event counts in tests**: Identity chain size may change. Test convergence with `has_event()` on specific event IDs, assert with `message_count()` / `peer_shared_count()` / etc.
+- **Single-sample convergence for large syncs**: A single `has_event` sample may pass after only partial transfer. For zero-loss or high-volume tests, sample 50+ events from both sides.
+- **Global neg_items**: All tenants share one `neg_items` table. A remote peer connecting to tenant A's endpoint will see event IDs from all tenants during negentropy. This is acceptable for single-operator nodes.
+- **DNS label overflow**: Peer IDs are 64 hex chars. Instance names must stay under 63 bytes. Truncate peer ID in instance name; use TXT property for full ID.
+- **Self-discovery in mDNS**: Pass the full set of local tenant peer IDs to `TenantDiscovery::new` so it can filter them all out, not just its own.
+- **Forgetting per-tenant drain**: `batch_writer` must group ingested items by `recorded_by` and drain `project_queue` per tenant. A single drain call with one `recorded_by` misses events from other tenants in the same batch.
+
+### Definition of done
+
+- `p7d --node` discovers tenants from DB, starts per-tenant QUIC endpoints, syncs with external peers.
+- Two tenants on same node in different workspaces have zero event overlap after sync.
+- Two tenants on same node in same workspace both project synced messages.
+- mDNS self-filtering prevents local-only connections; external peers discovered and synced.
+- Cross-tenant leakage check passes after every multi-tenant scenario test.
+- All test files use application-level convergence and assertions (no `store_count`).

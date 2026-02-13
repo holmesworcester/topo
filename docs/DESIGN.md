@@ -213,6 +213,23 @@ Test the feature with both local integration tests and Linux netns NAT simulatio
 5. `sudo tests/netns_nat_test.sh --symmetric` (expected fail)
 6. `sudo tests/netns_nat_test.sh --cleanup`
 
+## 2.4.1 Identity bootstrap operations
+
+High-level identity operations provide imperative APIs for workspace creation, invites, and device linking. These compose the low-level event creation primitives into correct sequences.
+
+**Bootstrap** (`bootstrap_workspace`): creates the full 8-event chain for a new workspace owner:
+Workspace → UserInviteBoot → InviteAccepted (trust anchor) → UserBoot → DeviceInviteFirst → PeerSharedFirst → AdminBoot → TransportKey.
+
+**Invite** (`create_user_invite`): admin creates a UserInviteBoot event and returns portable invite data (event ID + signing key + workspace ID).
+
+**Accept** (`accept_user_invite`): joiner consumes invite data and creates:
+InviteAccepted (trust anchor) → UserBoot → DeviceInviteFirst → PeerSharedFirst → TransportKey.
+Prerequisite: the joiner's DB must already contain the Workspace and UserInviteBoot events (copied from the inviter before or during sync).
+
+**Device link** (`create_device_link_invite` / `accept_device_link`): similar to user invite but creates a shorter chain (PeerSharedFirst + TransportKey only, skipping user/device_invite creation).
+
+All functions take `&Connection` and `recorded_by`, enabling multi-tenant operation where multiple identities share a single database.
+
 ## 2.5 Recording identity semantics
 
 1. `signed_by`: canonical signer event reference used for signature/policy checks.
@@ -253,6 +270,60 @@ Rules:
 This preserves `poc-6`-style scoped reads/writes while keeping the schema ergonomic.
 
 **Known limitation:** The `neg_items` table (negentropy reconciliation index) is global — not scoped by tenant. A remote peer connecting to tenant A's endpoint will see event IDs from all tenants during negentropy, including tenant B in a different workspace. This is acceptable because multi-tenant nodes are single-operator (one person with multiple workspace memberships on one device). The operator already has direct DB access, and the stronger deanonymization signal — multiple tenants sharing the same IP address and mDNS advertisements — exists at the network layer regardless. Real pseudonym isolation requires separate nodes on separate network paths.
+
+## 3.2.1 Functional multitenancy: one node, N tenants
+
+A single node process can host N tenant identities in one shared SQLite database, each with its own QUIC endpoint, workspace binding, and trust policy.
+
+The DB is the tenant registry. No explicit tenant registration step is required. The node discovers its tenants by joining two tables:
+
+```sql
+SELECT t.peer_id, t.workspace_id, c.cert_der, c.key_der
+FROM trust_anchors t
+JOIN local_transport_creds c ON t.peer_id = c.peer_id
+```
+
+`trust_anchors` is populated by `invite_accepted` (local-only, part of the identity bootstrap). `local_transport_creds` is populated during identity bootstrap when TransportKey events are created. Any identity that has both a workspace binding and TLS material is a local tenant.
+
+### Node daemon architecture
+
+The node daemon (`run_node`) operates as follows:
+
+1. Discover all local tenants from the DB.
+2. Create one QUIC endpoint per tenant with OS-assigned port.
+3. Create one shared `batch_writer` thread that all tenants feed into.
+4. Per tenant: spawn `accept_loop_with_ingest` with a dynamic trust closure scoped to that tenant's `recorded_by`.
+5. Optionally: per-tenant mDNS advertisement and peer discovery.
+
+### Per-tenant dynamic trust
+
+Each tenant's QUIC endpoint verifies incoming connections against that tenant's own trust state. The trust closure queries `transport_keys` and `trust_anchors` for the specific `recorded_by`, so tenant A's endpoint only accepts peers trusted by tenant A. Tenants in different workspaces have disjoint trust sets.
+
+### Shared batch writer with tenant routing
+
+All tenants share a single `batch_writer` thread to avoid SQLite write contention. Each ingested event carries a `recorded_by` field (the 3-tuple `IngestItem = (event_id, blob, recorded_by)`). The batch writer:
+
+1. Inserts events into the shared `events` table.
+2. Records each event in `recorded_events` under the correct `recorded_by`.
+3. Enqueues into `project_queue` under the correct `recorded_by`.
+4. Drains `project_queue` per tenant (grouping by `recorded_by`).
+
+This eliminates write contention while preserving per-tenant projection isolation.
+
+### TLS credential storage
+
+Transport cert/key DER blobs live exclusively in the `local_transport_creds` SQLite table. No cert files exist on disk. Credentials are stored during identity bootstrap and loaded at endpoint creation time. This keeps all node state in one database file.
+
+## 3.2.2 LAN peer discovery (mDNS/DNS-SD)
+
+Multi-tenant nodes advertise each tenant on the local network under the `_quiet-p7._udp.local.` service type. Each tenant registers a separate mDNS service instance with its actual bound port and full `peer_id` in a TXT property.
+
+Discovery rules:
+1. **Self-filtering**: the browser receives the full set of local tenant peer IDs and filters them out, preventing unnecessary local connections.
+2. **Trust gating**: discovered peers are only dialed if they pass the tenant's dynamic trust check.
+3. **Address churn**: when a previously-discovered peer re-advertises at a different address, the old `connect_loop` is cancelled via a `watch` channel and a new one is spawned.
+
+DNS label constraint: peer IDs (64 hex chars) are truncated to 59 chars in the mDNS instance name (62 total with `p7-` prefix, under the 63-byte DNS label limit). The full peer ID is always in the TXT property for exact matching.
 
 ## 3.3 Table lifecycle and naming
 
@@ -655,6 +726,27 @@ Harness policy:
 1. replay invariants (`once`, `twice`, `reverse-order`) are standard checks in the scenario harness.
 2. they run after every scenario test that mutates canonical event store rows.
 3. checks are computed from deterministic table-state fingerprints over event-store-derived state.
+
+## 10.1 Application-level test assertions
+
+Sync tests assert on application-meaningful data, never on raw event counts.
+
+Why: the identity bootstrap chain produces a variable number of events (currently 8: Workspace, UserInviteBoot, InviteAccepted, UserBoot, DeviceInviteFirst, PeerSharedFirst, AdminBoot, TransportKey). This number has changed across development and may change again. Tests that hardcode `store_count() == 6 + N` break silently when the identity chain grows.
+
+Rules:
+1. **Convergence detection** uses `has_event(event_id)` on a specific known event, not `store_count >= N`.
+2. **Assertions** use projection-level counts: `message_count()`, `reaction_count()`, `peer_shared_count()`, `user_count()`, etc.
+3. **Never assert** on `store_count()`, `recorded_events_count()`, or `neg_items_count()` — these include identity overhead that varies.
+4. **High-volume convergence** samples multiple events (50+) from both sides to avoid premature convergence (a single sample can pass after only partial transfer).
+5. **Performance benchmarks** use the same pattern: sample event IDs from the sender, check arrival at the receiver via `has_event()`.
+
+The `sync_until_converged` helper takes a closure for convergence detection:
+
+```rust
+sync_until_converged(&alice, &bob, || bob.has_event(&sample), timeout).await;
+```
+
+This makes tests resilient to identity chain structure changes while still verifying that the application-level data (messages, reactions, identities) converged correctly.
 
 ---
 
