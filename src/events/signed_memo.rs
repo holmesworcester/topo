@@ -48,6 +48,12 @@ pub fn parse_signed_memo(blob: &[u8]) -> Result<ParsedEvent, EventError> {
             actual: blob.len(),
         });
     }
+    if blob.len() > expected_len {
+        return Err(EventError::TrailingData {
+            expected: expected_len,
+            actual: blob.len(),
+        });
+    }
 
     let content = String::from_utf8_lossy(&blob[44..44 + content_len]).to_string();
 

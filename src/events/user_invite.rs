@@ -33,6 +33,9 @@ pub fn parse_user_invite_boot(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if blob.len() < 170 {
         return Err(EventError::TooShort { expected: 170, actual: blob.len() });
     }
+    if blob.len() > 170 {
+        return Err(EventError::TrailingData { expected: 170, actual: blob.len() });
+    }
     if blob[0] != EVENT_TYPE_USER_INVITE_BOOT {
         return Err(EventError::WrongType { expected: EVENT_TYPE_USER_INVITE_BOOT, actual: blob[0] });
     }
@@ -85,6 +88,9 @@ pub fn encode_user_invite_boot(event: &ParsedEvent) -> Result<Vec<u8>, EventErro
 pub fn parse_user_invite_ongoing(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if blob.len() < 170 {
         return Err(EventError::TooShort { expected: 170, actual: blob.len() });
+    }
+    if blob.len() > 170 {
+        return Err(EventError::TrailingData { expected: 170, actual: blob.len() });
     }
     if blob[0] != EVENT_TYPE_USER_INVITE_ONGOING {
         return Err(EventError::WrongType { expected: EVENT_TYPE_USER_INVITE_ONGOING, actual: blob[0] });

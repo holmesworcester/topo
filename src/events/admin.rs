@@ -33,6 +33,9 @@ pub fn parse_admin_boot(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if blob.len() < 170 {
         return Err(EventError::TooShort { expected: 170, actual: blob.len() });
     }
+    if blob.len() > 170 {
+        return Err(EventError::TrailingData { expected: 170, actual: blob.len() });
+    }
     if blob[0] != EVENT_TYPE_ADMIN_BOOT {
         return Err(EventError::WrongType { expected: EVENT_TYPE_ADMIN_BOOT, actual: blob[0] });
     }
@@ -85,6 +88,9 @@ pub fn encode_admin_boot(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
 pub fn parse_admin_ongoing(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if blob.len() < 170 {
         return Err(EventError::TooShort { expected: 170, actual: blob.len() });
+    }
+    if blob.len() > 170 {
+        return Err(EventError::TrailingData { expected: 170, actual: blob.len() });
     }
     if blob[0] != EVENT_TYPE_ADMIN_ONGOING {
         return Err(EventError::WrongType { expected: EVENT_TYPE_ADMIN_ONGOING, actual: blob[0] });

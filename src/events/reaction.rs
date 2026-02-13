@@ -53,6 +53,12 @@ pub fn parse_reaction(blob: &[u8]) -> Result<ParsedEvent, EventError> {
             actual: blob.len(),
         });
     }
+    if blob.len() > expected_len {
+        return Err(EventError::TrailingData {
+            expected: expected_len,
+            actual: blob.len(),
+        });
+    }
 
     let emoji = String::from_utf8_lossy(&blob[75..75 + emoji_len]).to_string();
 

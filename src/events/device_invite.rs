@@ -30,6 +30,9 @@ pub fn parse_device_invite_first(blob: &[u8]) -> Result<ParsedEvent, EventError>
     if blob.len() < 138 {
         return Err(EventError::TooShort { expected: 138, actual: blob.len() });
     }
+    if blob.len() > 138 {
+        return Err(EventError::TrailingData { expected: 138, actual: blob.len() });
+    }
     if blob[0] != EVENT_TYPE_DEVICE_INVITE_FIRST {
         return Err(EventError::WrongType { expected: EVENT_TYPE_DEVICE_INVITE_FIRST, actual: blob[0] });
     }
@@ -77,6 +80,9 @@ pub fn encode_device_invite_first(event: &ParsedEvent) -> Result<Vec<u8>, EventE
 pub fn parse_device_invite_ongoing(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if blob.len() < 138 {
         return Err(EventError::TooShort { expected: 138, actual: blob.len() });
+    }
+    if blob.len() > 138 {
+        return Err(EventError::TrailingData { expected: 138, actual: blob.len() });
     }
     if blob[0] != EVENT_TYPE_DEVICE_INVITE_ONGOING {
         return Err(EventError::WrongType { expected: EVENT_TYPE_DEVICE_INVITE_ONGOING, actual: blob[0] });

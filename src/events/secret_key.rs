@@ -18,6 +18,12 @@ pub fn parse_secret_key(blob: &[u8]) -> Result<ParsedEvent, EventError> {
             actual: blob.len(),
         });
     }
+    if blob.len() > 41 {
+        return Err(EventError::TrailingData {
+            expected: 41,
+            actual: blob.len(),
+        });
+    }
     if blob[0] != EVENT_TYPE_SECRET_KEY {
         return Err(EventError::WrongType {
             expected: EVENT_TYPE_SECRET_KEY,

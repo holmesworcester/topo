@@ -21,6 +21,9 @@ pub fn parse_peer_removed(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if blob.len() < 138 {
         return Err(EventError::TooShort { expected: 138, actual: blob.len() });
     }
+    if blob.len() > 138 {
+        return Err(EventError::TrailingData { expected: 138, actual: blob.len() });
+    }
     if blob[0] != EVENT_TYPE_PEER_REMOVED {
         return Err(EventError::WrongType { expected: EVENT_TYPE_PEER_REMOVED, actual: blob[0] });
     }

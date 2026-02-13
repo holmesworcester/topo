@@ -55,6 +55,12 @@ pub fn parse_message(blob: &[u8]) -> Result<ParsedEvent, EventError> {
             actual: blob.len(),
         });
     }
+    if blob.len() > expected_len {
+        return Err(EventError::TrailingData {
+            expected: expected_len,
+            actual: blob.len(),
+        });
+    }
 
     let content = String::from_utf8_lossy(&blob[75..75 + content_len]).to_string();
 

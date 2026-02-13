@@ -21,6 +21,9 @@ pub fn parse_transport_key(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if blob.len() < 138 {
         return Err(EventError::TooShort { expected: 138, actual: blob.len() });
     }
+    if blob.len() > 138 {
+        return Err(EventError::TrailingData { expected: 138, actual: blob.len() });
+    }
     if blob[0] != EVENT_TYPE_TRANSPORT_KEY {
         return Err(EventError::WrongType { expected: EVENT_TYPE_TRANSPORT_KEY, actual: blob[0] });
     }
