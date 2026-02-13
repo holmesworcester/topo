@@ -255,6 +255,80 @@ pub fn is_peer_allowed(
     Ok(allowed != 0)
 }
 
+/// Count the total number of distinct trusted peer fingerprints from SQL
+/// trust sources (transport_keys + accepted/pending invite bootstrap trust).
+/// Returns the deduplicated count without materializing the full set.
+pub fn trusted_peer_count(
+    conn: &Connection,
+    recorded_by: &str,
+) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+    supersede_pending_bootstrap_if_steady_trust_exists(conn, recorded_by)?;
+    supersede_accepted_bootstrap_if_steady_trust_exists(conn, recorded_by)?;
+    let now = now_ms_i64();
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM (
+            SELECT DISTINCT spki_fingerprint
+              FROM transport_keys
+             WHERE recorded_by = ?1
+               AND length(spki_fingerprint) = 32
+            UNION
+            SELECT DISTINCT bootstrap_spki_fingerprint AS spki_fingerprint
+              FROM invite_bootstrap_trust
+              WHERE recorded_by = ?1
+                AND length(bootstrap_spki_fingerprint) = 32
+                AND superseded_at IS NULL
+                AND expires_at > ?2
+            UNION
+            SELECT DISTINCT expected_bootstrap_spki_fingerprint AS spki_fingerprint
+              FROM pending_invite_bootstrap_trust
+              WHERE recorded_by = ?1
+                AND length(expected_bootstrap_spki_fingerprint) = 32
+                AND superseded_at IS NULL
+                AND expires_at > ?2
+        )",
+        rusqlite::params![recorded_by, now],
+        |row| row.get(0),
+    )?;
+    Ok(count)
+}
+
+/// Check whether any trusted peer fingerprints exist in SQL trust sources
+/// without materializing the full set. Uses EXISTS for early exit.
+pub fn has_any_trusted_peer(
+    conn: &Connection,
+    recorded_by: &str,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    supersede_pending_bootstrap_if_steady_trust_exists(conn, recorded_by)?;
+    supersede_accepted_bootstrap_if_steady_trust_exists(conn, recorded_by)?;
+    let now = now_ms_i64();
+    let has_any: i64 = conn.query_row(
+        "SELECT
+            EXISTS(
+                SELECT 1
+                  FROM transport_keys
+                 WHERE recorded_by = ?1
+                   AND length(spki_fingerprint) = 32
+            )
+            OR EXISTS(
+                SELECT 1 FROM invite_bootstrap_trust
+                WHERE recorded_by = ?1
+                  AND length(bootstrap_spki_fingerprint) = 32
+                  AND superseded_at IS NULL
+                  AND expires_at > ?2
+            )
+            OR EXISTS(
+                SELECT 1 FROM pending_invite_bootstrap_trust
+                WHERE recorded_by = ?1
+                  AND length(expected_bootstrap_spki_fingerprint) = 32
+                  AND superseded_at IS NULL
+                  AND expires_at > ?2
+            )",
+        rusqlite::params![recorded_by, now],
+        |row| row.get(0),
+    )?;
+    Ok(has_any != 0)
+}
+
 /// Build AllowedPeers from CLI pin-peer flags plus SQL trust rows
 /// (projected transport_keys + accepted/pending invite bootstrap trust).
 pub fn allowed_peers_combined(
@@ -681,5 +755,130 @@ mod tests {
         // Should have exactly 1 entry (malformed skipped)
         let zero_fp: [u8; 32] = [0u8; 32];
         assert!(!allowed.contains(&zero_fp));
+    }
+
+    #[test]
+    fn test_trusted_peer_count() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+
+        let recorded_by = "aaaa";
+        let spki_tk: [u8; 32] = [1u8; 32];
+        let spki_bootstrap: [u8; 32] = [2u8; 32];
+        let spki_pending: [u8; 32] = [3u8; 32];
+        let spki_dup: [u8; 32] = [1u8; 32]; // same as spki_tk — dedup test
+
+        // Empty → count should be 0
+        assert_eq!(trusted_peer_count(&conn, recorded_by).unwrap(), 0);
+
+        // Add transport_keys row
+        conn.execute(
+            "INSERT INTO transport_keys (recorded_by, event_id, spki_fingerprint) VALUES (?1, ?2, ?3)",
+            rusqlite::params![recorded_by, "evt1", spki_tk.as_slice()],
+        ).unwrap();
+        assert_eq!(trusted_peer_count(&conn, recorded_by).unwrap(), 1);
+
+        // Add accepted invite bootstrap trust
+        record_invite_bootstrap_trust(
+            &conn, recorded_by, "ia1", "invite1", "ws1", "127.0.0.1:4433", &spki_bootstrap,
+        ).unwrap();
+        assert_eq!(trusted_peer_count(&conn, recorded_by).unwrap(), 2);
+
+        // Add pending invite bootstrap trust
+        record_pending_invite_bootstrap_trust(
+            &conn, recorded_by, "invite2", "ws2", &spki_pending,
+        ).unwrap();
+        assert_eq!(trusted_peer_count(&conn, recorded_by).unwrap(), 3);
+
+        // Add a duplicate SPKI via another transport_keys row — count stays 3
+        conn.execute(
+            "INSERT INTO transport_keys (recorded_by, event_id, spki_fingerprint) VALUES (?1, ?2, ?3)",
+            rusqlite::params![recorded_by, "evt_dup", spki_dup.as_slice()],
+        ).unwrap();
+        assert_eq!(trusted_peer_count(&conn, recorded_by).unwrap(), 3);
+
+        // Cross-tenant isolation: different recorded_by sees 0
+        assert_eq!(trusted_peer_count(&conn, "other_peer").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_has_any_trusted_peer() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+
+        let recorded_by = "aaaa";
+
+        // Empty → false
+        assert!(!has_any_trusted_peer(&conn, recorded_by).unwrap());
+
+        // transport_keys only → true
+        let spki_tk: [u8; 32] = [10u8; 32];
+        conn.execute(
+            "INSERT INTO transport_keys (recorded_by, event_id, spki_fingerprint) VALUES (?1, ?2, ?3)",
+            rusqlite::params![recorded_by, "evt_tk", spki_tk.as_slice()],
+        ).unwrap();
+        assert!(has_any_trusted_peer(&conn, recorded_by).unwrap());
+
+        // Start fresh for bootstrap-only test
+        let rb_boot = "boot_only";
+        assert!(!has_any_trusted_peer(&conn, rb_boot).unwrap());
+        let spki_boot: [u8; 32] = [20u8; 32];
+        record_invite_bootstrap_trust(
+            &conn, rb_boot, "ia_boot", "inv_boot", "ws_boot", "127.0.0.1:4433", &spki_boot,
+        ).unwrap();
+        assert!(has_any_trusted_peer(&conn, rb_boot).unwrap());
+
+        // Pending-only test
+        let rb_pend = "pending_only";
+        assert!(!has_any_trusted_peer(&conn, rb_pend).unwrap());
+        let spki_pend: [u8; 32] = [30u8; 32];
+        record_pending_invite_bootstrap_trust(
+            &conn, rb_pend, "inv_pend", "ws_pend", &spki_pend,
+        ).unwrap();
+        assert!(has_any_trusted_peer(&conn, rb_pend).unwrap());
+    }
+
+    #[test]
+    fn test_trusted_peer_count_ignores_malformed_spki_rows() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+
+        let recorded_by = "malformed_count";
+
+        conn.execute(
+            "INSERT INTO transport_keys (recorded_by, event_id, spki_fingerprint) VALUES (?1, ?2, ?3)",
+            rusqlite::params![recorded_by, "evt_short", &[9u8; 16][..]],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO invite_bootstrap_trust
+             (recorded_by, invite_accepted_event_id, invite_event_id, workspace_id, bootstrap_addr, bootstrap_spki_fingerprint, accepted_at, expires_at, superseded_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)",
+            rusqlite::params![
+                recorded_by,
+                "ia_short",
+                "invite_short",
+                "ws",
+                "127.0.0.1:4433",
+                &[7u8; 31][..],
+                now_ms_i64(),
+                now_ms_i64() + 60_000,
+            ],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO pending_invite_bootstrap_trust
+             (recorded_by, invite_event_id, workspace_id, expected_bootstrap_spki_fingerprint, created_at, expires_at, superseded_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+            rusqlite::params![
+                recorded_by,
+                "invite_short_pending",
+                "ws",
+                &[8u8; 8][..],
+                now_ms_i64(),
+                now_ms_i64() + 60_000,
+            ],
+        ).unwrap();
+
+        assert_eq!(trusted_peer_count(&conn, recorded_by).unwrap(), 0);
+        assert!(!has_any_trusted_peer(&conn, recorded_by).unwrap());
     }
 }
