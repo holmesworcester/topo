@@ -503,6 +503,19 @@ static MIGRATIONS: &[Migration] = &[
             );
         ",
     },
+    Migration {
+        version: 26,
+        name: "add_local_transport_credentials",
+        sql: "
+            CREATE TABLE IF NOT EXISTS local_transport_credentials (
+                id INTEGER PRIMARY KEY,
+                cert_der BLOB NOT NULL,
+                key_der BLOB NOT NULL,
+                spki_fingerprint BLOB NOT NULL UNIQUE,
+                created_at INTEGER NOT NULL
+            );
+        ",
+    },
 ];
 
 fn ensure_schema_migrations(conn: &Connection) -> SqliteResult<()> {
@@ -716,6 +729,6 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(max_version, 25);
+        assert_eq!(max_version, 26);
     }
 }

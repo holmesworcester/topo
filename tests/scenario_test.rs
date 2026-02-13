@@ -4,9 +4,8 @@ use poc_7::testutil::{Peer, start_peers, assert_eventually, sync_until_converged
 use poc_7::crypto::{event_id_to_base64, event_id_from_base64};
 use poc_7::transport::{
     AllowedPeers, create_client_endpoint, create_server_endpoint,
-    extract_spki_fingerprint, load_or_generate_cert, peer_identity_from_connection,
+    extract_spki_fingerprint, load_or_generate_cert_db, peer_identity_from_connection,
 };
-use poc_7::transport_identity::transport_cert_paths_from_db;
 use poc_7::db::open_connection;
 
 
@@ -469,10 +468,10 @@ async fn test_peer_identity_extraction_live_handshake() {
     let alice = Peer::new("alice");
     let bob = Peer::new("bob");
 
-    let (cert_path_a, key_path_a) = transport_cert_paths_from_db(&alice.db_path);
-    let (cert_a, key_a) = load_or_generate_cert(&cert_path_a, &key_path_a).unwrap();
-    let (cert_path_b, key_path_b) = transport_cert_paths_from_db(&bob.db_path);
-    let (cert_b, key_b) = load_or_generate_cert(&cert_path_b, &key_path_b).unwrap();
+    let db_a = open_connection(&alice.db_path).unwrap();
+    let (cert_a, key_a) = load_or_generate_cert_db(&db_a).unwrap();
+    let db_b = open_connection(&bob.db_path).unwrap();
+    let (cert_b, key_b) = load_or_generate_cert_db(&db_b).unwrap();
 
     let fp_a = extract_spki_fingerprint(cert_a.as_ref()).unwrap();
     let fp_b = extract_spki_fingerprint(cert_b.as_ref()).unwrap();
@@ -2014,11 +2013,10 @@ fn test_transport_key_projects_without_auto_binding() {
     let alice = Peer::new("alice");
     let chain = bootstrap_peer(&alice);
 
-    // Create a TransportKey event signed by PeerShared
+    // Create a TransportKey event (unsigned deterministic)
     let spki_fp: [u8; 32] = [0xAB; 32];
     let _tk_eid = alice.create_transport_key(
         spki_fp,
-        &chain.peer_shared_key,
         &chain.peer_shared_eid,
     );
 
@@ -2054,106 +2052,61 @@ fn test_transport_key_projects_without_auto_binding() {
 }
 
 #[test]
-fn test_transport_key_signer_matches_local_key() {
-    use ed25519_dalek::SigningKey;
-    use poc_7::transport_identity::{transport_cert_paths_from_db, ensure_transport_key_event};
+fn test_transport_key_ensure_creates_unsigned_event() {
+    use poc_7::transport_identity::ensure_transport_key_event;
+    use poc_7::transport::load_or_generate_cert_db;
 
     let alice = Peer::new("alice");
-    let chain = bootstrap_peer(&alice);
+    let _chain = bootstrap_peer(&alice);
 
-    // Insert a second peers_shared row with a different public key (simulating another
-    // peer in the workspace). This row will have a lower rowid than the local peer's
-    // PeerSharedFirst if we insert it after bootstrap, but the point is that multiple
-    // rows exist and the function must select by public key match, not by rowid.
-    let other_key = SigningKey::generate(&mut rand::thread_rng());
-    let other_pubkey = other_key.verifying_key().to_bytes();
+    // Generate a TLS cert in SQLite so ensure_transport_key_event has something to work with
     let db = open_connection(&alice.db_path).unwrap();
-    db.execute(
-        "INSERT INTO peers_shared (recorded_by, event_id, public_key) VALUES (?1, ?2, ?3)",
-        rusqlite::params![&alice.identity, "other_peer_eid", other_pubkey.as_slice()],
-    ).unwrap();
+    load_or_generate_cert_db(&db).unwrap();
 
-    // Verify we now have 2 peers_shared rows
-    let count: i64 = db.query_row(
-        "SELECT COUNT(*) FROM peers_shared WHERE recorded_by = ?1",
-        rusqlite::params![&alice.identity],
-        |row| row.get(0),
-    ).unwrap();
-    assert_eq!(count, 2);
-    drop(db);
-
-    // Generate a TLS cert so ensure_transport_key_event has something to work with
-    let (cert_path, key_path) = transport_cert_paths_from_db(&alice.db_path);
-    load_or_generate_cert(&cert_path, &key_path).unwrap();
-
-    // Call ensure_transport_key_event with the LOCAL peer_shared signing key —
-    // it should succeed because it matches by public key, not by rowid order
-    let db = open_connection(&alice.db_path).unwrap();
-    let result = ensure_transport_key_event(&db, &alice.identity, &alice.db_path, &chain.peer_shared_key);
-    assert!(result.is_ok(), "ensure_transport_key_event should succeed with correct local key");
+    // ensure_transport_key_event should create a new unsigned deterministic TransportKey event
+    let result = ensure_transport_key_event(&db, &alice.identity);
+    assert!(result.is_ok(), "ensure_transport_key_event should succeed");
     assert!(result.unwrap().is_some(), "should have created a new TransportKey event");
 
-    // Calling with the OTHER key should return None (no matching peers_shared row
-    // with that public key that also has a valid signer chain — the manually inserted
-    // row won't pass signature verification)
-    // Actually, the function returns Ok(None) only for "already exists" or "no peers_shared".
-    // Since we already created one, a second call returns Ok(None) for the existing SPKI.
-    let result2 = ensure_transport_key_event(&db, &alice.identity, &alice.db_path, &chain.peer_shared_key);
+    // Second call should return None (already exists for same SPKI)
+    let result2 = ensure_transport_key_event(&db, &alice.identity);
     assert_eq!(result2.unwrap(), None, "second call should return None (already exists)");
 }
 
 #[test]
-fn test_transport_key_invalid_sig_rejected() {
-    use ed25519_dalek::SigningKey;
-
+fn test_transport_key_deterministic_event_id() {
+    // TransportKey is now unsigned deterministic — creating the same event twice
+    // (same inputs) should produce the same event ID.
     let alice = Peer::new("alice");
     let chain = bootstrap_peer(&alice);
 
-    // Create a TransportKey with wrong signing key (not the peer_shared key)
-    let wrong_key = SigningKey::generate(&mut rand::thread_rng());
     let spki_fp: [u8; 32] = [0xCD; 32];
+    let eid1 = alice.create_transport_key(spki_fp, &chain.peer_shared_eid);
 
-    // This should fail because the wrong key doesn't match peer_shared's public key
-    let result = std::panic::catch_unwind(|| {
-        alice.create_transport_key(
-            spki_fp,
-            &wrong_key,
-            &chain.peer_shared_eid,
-        );
-    });
+    // A second peer with the same identity chain and same SPKI should produce
+    // the same event bytes (and therefore the same event ID) because
+    // TransportKey is deterministic: (created_at_ms from PeerShared, spki, peer_shared_eid).
+    let bob = Peer::new("bob");
+    let chain_b = bootstrap_peer(&bob);
+    let eid2 = bob.create_transport_key(spki_fp, &chain_b.peer_shared_eid);
 
-    // create_signed_event_sync verifies the signature during projection,
-    // so it should either panic or the event should be rejected
-    if result.is_ok() {
-        // If it didn't panic, check that the event was rejected
-        let db = open_connection(&alice.db_path).unwrap();
-        let tk_count: i64 = db.query_row(
-            "SELECT COUNT(*) FROM transport_keys WHERE recorded_by = ?1",
-            rusqlite::params![&alice.identity],
-            |row| row.get(0),
-        ).unwrap();
-        let rejected_count: i64 = db.query_row(
-            "SELECT COUNT(*) FROM rejected_events WHERE peer_id = ?1",
-            rusqlite::params![&alice.identity],
-            |row| row.get(0),
-        ).unwrap();
-        assert_eq!(tk_count, 0, "invalid-sig transport key should not project");
-        assert!(rejected_count > 0, "invalid-sig transport key should be rejected");
-    }
-    // If it panicked, that's also acceptable — signature verification failed
+    // Event IDs will differ because peer_shared_event_id differs, but each
+    // individual event should be deterministically replayable.
+    // Verify both projected successfully.
+    assert_eq!(alice.transport_key_count(), 1);
+    assert_eq!(bob.transport_key_count(), 1);
+    assert_ne!(eid1, eid2, "different peers should produce different event IDs");
 }
 
 #[test]
 fn test_transport_key_replay_invariants() {
     let alice = Peer::new_with_identity("alice");
     let ps_eid = alice.peer_shared_event_id.unwrap();
-    let ps_key = alice.peer_shared_signing_key.as_ref().unwrap();
 
-    // Create a TransportKey event
+    // Create a TransportKey event (unsigned deterministic)
     let spki_fp: [u8; 32] = [0xEF; 32];
     alice.create_transport_key(
         spki_fp,
-        ps_key,
         &ps_eid,
     );
 

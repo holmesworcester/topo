@@ -178,7 +178,7 @@ impl ParsedEvent {
                 ("recipient_event_id", s.recipient_event_id),
                 ("signed_by", s.signed_by),
             ],
-            ParsedEvent::TransportKey(t) => vec![("signed_by", t.signed_by)],
+            ParsedEvent::TransportKey(t) => vec![("peer_shared_event_id", t.peer_shared_event_id)],
             ParsedEvent::MessageAttachment(a) => vec![
                 ("message_id", a.message_id),
                 ("key_event_id", a.key_event_id),
@@ -237,7 +237,6 @@ impl ParsedEvent {
             ParsedEvent::UserRemoved(r) => Some((r.signed_by, r.signer_type)),
             ParsedEvent::PeerRemoved(r) => Some((r.signed_by, r.signer_type)),
             ParsedEvent::SecretShared(s) => Some((s.signed_by, s.signer_type)),
-            ParsedEvent::TransportKey(t) => Some((t.signed_by, t.signer_type)),
             ParsedEvent::FileSlice(f) => Some((f.signed_by, f.signer_type)),
             ParsedEvent::Message(m) => Some((m.signed_by, m.signer_type)),
             ParsedEvent::Reaction(r) => Some((r.signed_by, r.signer_type)),
@@ -247,6 +246,7 @@ impl ParsedEvent {
             | ParsedEvent::SecretKey(_)
             | ParsedEvent::Workspace(_)
             | ParsedEvent::InviteAccepted(_)
+            | ParsedEvent::TransportKey(_)
             | ParsedEvent::BenchDep(_) => None,
         }
     }
@@ -667,13 +667,11 @@ mod tests {
         let e = TransportKeyEvent {
             created_at_ms: 1400,
             spki_fingerprint: [59u8; 32],
-            signed_by: [60u8; 32],
-            signer_type: 5,
-            signature: [61u8; 64],
+            peer_shared_event_id: [60u8; 32],
         };
         let event = ParsedEvent::TransportKey(e);
         let blob = encode_event(&event).unwrap();
-        assert_eq!(blob.len(), 138);
+        assert_eq!(blob.len(), 73);
         let parsed = parse_event(&blob).unwrap();
         assert_eq!(parsed, event);
     }

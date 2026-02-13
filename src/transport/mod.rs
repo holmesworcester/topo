@@ -3,7 +3,9 @@ pub mod connection;
 
 pub use cert::{
     extract_spki_fingerprint, generate_keypair, generate_self_signed_cert,
-    generate_self_signed_cert_from_signing_key, load_or_generate_cert, write_cert_and_key,
+    generate_self_signed_cert_from_signing_key, load_cert_from_db, load_or_generate_cert,
+    load_or_generate_cert_db, store_cert_in_db, store_invite_bootstrap_cert_in_db,
+    write_cert_and_key,
 };
 pub use connection::{DualConnection, StreamConn, StreamRecv, StreamSend};
 

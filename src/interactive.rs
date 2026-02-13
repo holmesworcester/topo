@@ -15,7 +15,7 @@ use crate::identity_ops::{self, IdentityChain, InviteType, JoinChain, LinkChain}
 use crate::invite_link::{create_invite_link, parse_invite_link, InviteLinkKind};
 use crate::projection::create::{create_signed_event_sync, event_id_or_blocked};
 use crate::transport_identity::{
-    ensure_transport_peer_id_from_db, expected_invite_bootstrap_spki_from_invite_key,
+    ensure_transport_peer_id, expected_invite_bootstrap_spki_from_invite_key,
     install_invite_bootstrap_transport_identity,
 };
 
@@ -67,7 +67,7 @@ impl Account {
         create_tables(&db).expect("failed to create tables");
 
         let identity =
-            ensure_transport_peer_id_from_db(&db_path).expect("failed to compute identity");
+            ensure_transport_peer_id(&db).expect("failed to compute identity");
 
         let mut default_channel = [0u8; 32];
         default_channel[..16]
@@ -526,7 +526,7 @@ fn cmd_new_workspace(
 
     let mut account = Account::new(username, devicename);
     let conn = open_connection(&account.db_path)?;
-    let chain = identity_ops::bootstrap_workspace(&conn, &account.identity, &account.db_path)?;
+    let chain = identity_ops::bootstrap_workspace(&conn, &account.identity)?;
     account.store_chain_keys(&chain);
     account.workspace_name = Some(name.to_string());
 
@@ -895,11 +895,10 @@ fn cmd_accept_invite(
         .and_then(|a| a.workspace_name.clone());
 
     let mut account = Account::new(username, devicename);
-    account.identity = install_invite_bootstrap_transport_identity(&account.db_path, &invite_key)?;
+    let conn = open_connection(&account.db_path)?;
+    account.identity = install_invite_bootstrap_transport_identity(&conn, &invite_key)?;
     account.workspace_id = Some(workspace_id);
     account.workspace_name = workspace_name;
-
-    let conn = open_connection(&account.db_path)?;
 
     // Copy shared chain needed to validate and project the invite.
     copy_event_chain(session, workspace_id, &conn, &account.identity)?;
@@ -910,7 +909,6 @@ fn cmd_accept_invite(
         &invite_key,
         &invite_event_id,
         workspace_id,
-        &account.db_path,
     )?;
 
     crate::db::transport_trust::record_invite_bootstrap_trust(
@@ -1039,12 +1037,11 @@ fn cmd_accept_link(
     };
 
     let mut account = Account::new(&username, devicename);
+    let conn = open_connection(&account.db_path)?;
     account.identity =
-        install_invite_bootstrap_transport_identity(&account.db_path, &device_invite_key)?;
+        install_invite_bootstrap_transport_identity(&conn, &device_invite_key)?;
     account.workspace_id = Some(workspace_id);
     account.workspace_name = workspace_name;
-
-    let conn = open_connection(&account.db_path)?;
 
     // Copy shared chain needed to validate and project the invite.
     copy_event_chain(session, workspace_id, &conn, &account.identity)?;
@@ -1055,7 +1052,6 @@ fn cmd_accept_link(
         &device_invite_key,
         &device_invite_event_id,
         workspace_id,
-        &account.db_path,
     )?;
 
     crate::db::transport_trust::record_invite_bootstrap_trust(

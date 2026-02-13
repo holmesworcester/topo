@@ -22,11 +22,9 @@ use poc_7::projection::pipeline::project_one;
 use poc_7::sync::engine::{accept_loop, connect_loop};
 use poc_7::transport::{
     create_dual_endpoint, create_dual_endpoint_dynamic, extract_spki_fingerprint,
-    load_or_generate_cert, AllowedPeers,
+    load_or_generate_cert_db, AllowedPeers,
 };
-use poc_7::transport_identity::{
-    ensure_transport_peer_id_from_db, load_transport_peer_id_from_db, transport_cert_paths_from_db,
-};
+use poc_7::transport_identity::{ensure_transport_peer_id, load_transport_peer_id};
 
 #[derive(Parser)]
 #[command(name = "poc-7")]
@@ -305,8 +303,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 // ---------------------------------------------------------------------------
 
 fn run_identity(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let (cert_path, key_path) = transport_cert_paths_from_db(db_path);
-    let (cert_der, _) = load_or_generate_cert(&cert_path, &key_path)?;
+    let db = open_connection(db_path)?;
+    create_tables(&db)?;
+    let (cert_der, _) = load_or_generate_cert_db(&db)?;
     let fp = extract_spki_fingerprint(cert_der.as_ref())?;
     println!("{}", hex::encode(fp));
     Ok(())
@@ -410,8 +409,8 @@ fn show_messages(
     db_path: &str,
     limit: usize,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let recorded_by = load_transport_peer_id_from_db(db_path)?;
     let db = open_connection(db_path)?;
+    let recorded_by = load_transport_peer_id(&db)?;
     create_tables(&db)?;
 
     let limit_clause = if limit > 0 {
@@ -683,8 +682,9 @@ fn send_message(
     workspace_hex: &str,
     content: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let recorded_by = ensure_transport_peer_id_from_db(db_path)?;
     let db = open_connection(db_path)?;
+    create_tables(&db)?;
+    let recorded_by = ensure_transport_peer_id(&db)?;
     create_tables(&db)?;
 
     let (signer_eid, signing_key) = ensure_identity_chain(&db, &recorded_by)?;
@@ -709,8 +709,8 @@ fn send_message(
 }
 
 fn show_status(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let recorded_by = load_transport_peer_id_from_db(db_path)?;
     let db = open_connection(db_path)?;
+    let recorded_by = load_transport_peer_id(&db)?;
     create_tables(&db)?;
 
     let events_count: i64 = db
@@ -756,8 +756,9 @@ fn generate_messages(
     count: usize,
     workspace_hex: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let recorded_by = ensure_transport_peer_id_from_db(db_path)?;
     let db = open_connection(db_path)?;
+    create_tables(&db)?;
+    let recorded_by = ensure_transport_peer_id(&db)?;
     create_tables(&db)?;
 
     let (signer_eid, signing_key) = ensure_identity_chain(&db, &recorded_by)?;
@@ -885,11 +886,11 @@ fn run_assert_now(
     db_path: &str,
     predicate_str: &str,
 ) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
-    let recorded_by = load_transport_peer_id_from_db(db_path)?;
-    let (field, op, expected) = parse_predicate(predicate_str)
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
     let db = open_connection(db_path)?;
     create_tables(&db)?;
+    let recorded_by = load_transport_peer_id(&db)?;
+    let (field, op, expected) = parse_predicate(predicate_str)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
     let actual = query_field(&db, &field, &recorded_by)
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
 
@@ -920,11 +921,11 @@ fn run_assert_eventually(
     timeout_ms: u64,
     interval_ms: u64,
 ) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
-    let recorded_by = load_transport_peer_id_from_db(db_path)?;
-    let (field, op, expected) = parse_predicate(predicate_str)
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
     let db = open_connection(db_path)?;
     create_tables(&db)?;
+    let recorded_by = load_transport_peer_id(&db)?;
+    let (field, op, expected) = parse_predicate(predicate_str)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
     let start = Instant::now();
     let timeout = Duration::from_millis(timeout_ms);
     let interval = Duration::from_millis(interval_ms);
@@ -968,16 +969,12 @@ async fn run_sync(
     pin_peers: &[String],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Initialize DB before spawning concurrent loops (avoids create_tables race)
-    {
+    let (cert, key, recorded_by) = {
         let db = open_connection(db_path)?;
         create_tables(&db)?;
-    }
-
-    let (cert_path, key_path) = transport_cert_paths_from_db(db_path);
-    let (cert, key) = load_or_generate_cert(&cert_path, &key_path)?;
-    let recorded_by = {
+        let (cert, key) = load_or_generate_cert_db(&db)?;
         let fp = extract_spki_fingerprint(cert.as_ref())?;
-        hex::encode(fp)
+        (cert, key, hex::encode(fp))
     };
 
     // Build combined trust: CLI pins + SQL trust rows
@@ -1103,8 +1100,9 @@ fn cli_react(
     target_hex: &str,
     emoji: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let recorded_by = ensure_transport_peer_id_from_db(db_path)?;
     let db = open_connection(db_path)?;
+    create_tables(&db)?;
+    let recorded_by = ensure_transport_peer_id(&db)?;
     create_tables(&db)?;
 
     let (signer_eid, signing_key) = ensure_identity_chain(&db, &recorded_by)?;
@@ -1135,8 +1133,9 @@ fn cli_delete_message(
     db_path: &str,
     target_hex: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let recorded_by = ensure_transport_peer_id_from_db(db_path)?;
     let db = open_connection(db_path)?;
+    create_tables(&db)?;
+    let recorded_by = ensure_transport_peer_id(&db)?;
     create_tables(&db)?;
 
     let (signer_eid, signing_key) = ensure_identity_chain(&db, &recorded_by)?;
@@ -1166,8 +1165,8 @@ fn cli_delete_message(
 }
 
 fn cli_reactions(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let recorded_by = load_transport_peer_id_from_db(db_path)?;
     let db = open_connection(db_path)?;
+    let recorded_by = load_transport_peer_id(&db)?;
     create_tables(&db)?;
 
     let mut stmt = db
@@ -1195,8 +1194,8 @@ fn cli_reactions(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send +
 }
 
 fn cli_users(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let recorded_by = load_transport_peer_id_from_db(db_path)?;
     let db = open_connection(db_path)?;
+    let recorded_by = load_transport_peer_id(&db)?;
     create_tables(&db)?;
 
     let mut stmt = db.prepare("SELECT event_id FROM users WHERE recorded_by = ?1")?;
@@ -1219,8 +1218,8 @@ fn cli_users(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + Syn
 }
 
 fn cli_keys(db_path: &str, summary: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let recorded_by = load_transport_peer_id_from_db(db_path)?;
     let db = open_connection(db_path)?;
+    let recorded_by = load_transport_peer_id(&db)?;
     create_tables(&db)?;
 
     let user_count: i64 = db
@@ -1284,8 +1283,8 @@ fn cli_keys(db_path: &str, summary: bool) -> Result<(), Box<dyn std::error::Erro
 }
 
 fn cli_workspaces(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let recorded_by = load_transport_peer_id_from_db(db_path)?;
     let db = open_connection(db_path)?;
+    let recorded_by = load_transport_peer_id(&db)?;
     create_tables(&db)?;
 
     let mut stmt =
@@ -1329,15 +1328,12 @@ async fn cli_intro(
     ttl_ms: u64,
     attempt_window_ms: u32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let db = open_connection(db_path)?;
-    create_tables(&db)?;
-    drop(db);
-
-    let (cert_path, key_path) = transport_cert_paths_from_db(db_path);
-    let (cert, key) = load_or_generate_cert(&cert_path, &key_path)?;
-    let recorded_by = {
+    let (cert, key, recorded_by) = {
+        let db = open_connection(db_path)?;
+        create_tables(&db)?;
+        let (cert, key) = load_or_generate_cert_db(&db)?;
         let fp = extract_spki_fingerprint(cert.as_ref())?;
-        hex::encode(fp)
+        (cert, key, hex::encode(fp))
     };
 
     // Build allowed peers: must include both target peers
@@ -1389,8 +1385,7 @@ fn cli_intro_attempts(
     create_tables(&db)?;
 
     let recorded_by = {
-        let (cert_path, key_path) = transport_cert_paths_from_db(db_path);
-        let (cert, _) = load_or_generate_cert(&cert_path, &key_path)?;
+        let (cert, _) = load_or_generate_cert_db(&db)?;
         let fp = extract_spki_fingerprint(cert.as_ref())?;
         hex::encode(fp)
     };
