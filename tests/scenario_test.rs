@@ -1,12 +1,11 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use poc_7::testutil::{Peer, start_peers, assert_eventually, sync_until_converged, verify_projection_invariants};
+use poc_7::testutil::{Peer, SharedDbNode, start_peers, assert_eventually, sync_until_converged, verify_projection_invariants};
 use poc_7::crypto::{event_id_to_base64, event_id_from_base64};
 use poc_7::transport::{
     AllowedPeers, create_client_endpoint, create_server_endpoint,
-    extract_spki_fingerprint, load_or_generate_cert, peer_identity_from_connection,
+    extract_spki_fingerprint, peer_identity_from_connection,
 };
-use poc_7::transport_identity::transport_cert_paths_from_db;
 use poc_7::db::open_connection;
 
 
@@ -469,13 +468,11 @@ async fn test_peer_identity_extraction_live_handshake() {
     let alice = Peer::new("alice");
     let bob = Peer::new("bob");
 
-    let (cert_path_a, key_path_a) = transport_cert_paths_from_db(&alice.db_path);
-    let (cert_a, key_a) = load_or_generate_cert(&cert_path_a, &key_path_a).unwrap();
-    let (cert_path_b, key_path_b) = transport_cert_paths_from_db(&bob.db_path);
-    let (cert_b, key_b) = load_or_generate_cert(&cert_path_b, &key_path_b).unwrap();
+    let (cert_a, key_a) = alice.cert_and_key();
+    let (cert_b, key_b) = bob.cert_and_key();
 
-    let fp_a = extract_spki_fingerprint(cert_a.as_ref()).unwrap();
-    let fp_b = extract_spki_fingerprint(cert_b.as_ref()).unwrap();
+    let fp_a = alice.spki_fingerprint();
+    let fp_b = bob.spki_fingerprint();
     let expected_a = hex::encode(fp_a);
     let expected_b = hex::encode(fp_b);
 
@@ -2056,7 +2053,7 @@ fn test_transport_key_projects_without_auto_binding() {
 #[test]
 fn test_transport_key_signer_matches_local_key() {
     use ed25519_dalek::SigningKey;
-    use poc_7::transport_identity::{transport_cert_paths_from_db, ensure_transport_key_event};
+    use poc_7::transport_identity::ensure_transport_key_event;
 
     let alice = Peer::new("alice");
     let chain = bootstrap_peer(&alice);
@@ -2082,14 +2079,12 @@ fn test_transport_key_signer_matches_local_key() {
     assert_eq!(count, 2);
     drop(db);
 
-    // Generate a TLS cert so ensure_transport_key_event has something to work with
-    let (cert_path, key_path) = transport_cert_paths_from_db(&alice.db_path);
-    load_or_generate_cert(&cert_path, &key_path).unwrap();
+    // TLS cert already exists in DB from Peer::new() — ensure_transport_key_event reads from DB
 
     // Call ensure_transport_key_event with the LOCAL peer_shared signing key —
     // it should succeed because it matches by public key, not by rowid order
     let db = open_connection(&alice.db_path).unwrap();
-    let result = ensure_transport_key_event(&db, &alice.identity, &alice.db_path, &chain.peer_shared_key);
+    let result = ensure_transport_key_event(&db, &alice.identity, &chain.peer_shared_key);
     assert!(result.is_ok(), "ensure_transport_key_event should succeed with correct local key");
     assert!(result.unwrap().is_some(), "should have created a new TransportKey event");
 
@@ -2098,7 +2093,7 @@ fn test_transport_key_signer_matches_local_key() {
     // row won't pass signature verification)
     // Actually, the function returns Ok(None) only for "already exists" or "no peers_shared".
     // Since we already created one, a second call returns Ok(None) for the existing SPKI.
-    let result2 = ensure_transport_key_event(&db, &alice.identity, &alice.db_path, &chain.peer_shared_key);
+    let result2 = ensure_transport_key_event(&db, &alice.identity, &chain.peer_shared_key);
     assert_eq!(result2.unwrap(), None, "second call should return None (already exists)");
 }
 
@@ -2746,4 +2741,208 @@ async fn test_foreign_workspace_rejected_via_sync() {
 
     verify_projection_invariants(&alice);
     verify_projection_invariants(&bob);
+}
+
+// ---------------------------------------------------------------------------
+// Multi-tenant node tests (Phase 5)
+// ---------------------------------------------------------------------------
+
+/// Two tenants on the same node, different workspaces: verify complete isolation.
+/// Events created by tenant A should never appear in tenant B's projection.
+#[tokio::test]
+async fn test_shared_db_two_tenants_different_workspaces() {
+    let node = SharedDbNode::new(2);
+    let t0 = &node.tenants[0];
+    let t1 = &node.tenants[1];
+
+    // Each tenant has its own workspace
+    assert_ne!(t0.workspace_id, t1.workspace_id,
+        "tenants should have distinct workspaces");
+    assert_ne!(t0.identity, t1.identity,
+        "tenants should have distinct identities");
+
+    // Create messages per tenant
+    t0.batch_create_messages(3);
+    t1.batch_create_messages(2);
+
+    // Verify each tenant's message count (via recorded_events scoping)
+    let db = open_connection(&node.db_path).unwrap();
+    let t0_recorded: i64 = db.query_row(
+        "SELECT COUNT(*) FROM recorded_events WHERE peer_id = ?1",
+        [&t0.identity],
+        |row| row.get(0),
+    ).unwrap();
+    let t1_recorded: i64 = db.query_row(
+        "SELECT COUNT(*) FROM recorded_events WHERE peer_id = ?1",
+        [&t1.identity],
+        |row| row.get(0),
+    ).unwrap();
+
+    // Each tenant: 6 identity events + N messages
+    assert_eq!(t0_recorded, 6 + 3, "tenant 0 should have 9 recorded events");
+    assert_eq!(t1_recorded, 6 + 2, "tenant 1 should have 8 recorded events");
+
+    // Verify projection isolation: valid_events per tenant
+    let t0_valid: i64 = db.query_row(
+        "SELECT COUNT(*) FROM valid_events WHERE peer_id = ?1",
+        [&t0.identity],
+        |row| row.get(0),
+    ).unwrap();
+    let t1_valid: i64 = db.query_row(
+        "SELECT COUNT(*) FROM valid_events WHERE peer_id = ?1",
+        [&t1.identity],
+        |row| row.get(0),
+    ).unwrap();
+
+    // Identity chain (6 events) + messages should all be valid
+    assert!(t0_valid >= 6 + 3, "tenant 0 valid events: {} (expected >= 9)", t0_valid);
+    assert!(t1_valid >= 6 + 2, "tenant 1 valid events: {} (expected >= 8)", t1_valid);
+
+    // Verify per-tenant projection invariants + no cross-tenant leakage
+    node.verify_all_invariants();
+}
+
+/// SharedDbNode tenant discovery: verify discover_local_tenants returns all tenants.
+#[tokio::test]
+async fn test_shared_db_tenant_discovery() {
+    let node = SharedDbNode::new(3);
+
+    let db = open_connection(&node.db_path).unwrap();
+    let tenants = poc_7::db::transport_creds::discover_local_tenants(&db).unwrap();
+
+    assert_eq!(tenants.len(), 3, "should discover all 3 tenants");
+
+    // Verify each discovered tenant has matching cert data
+    for tenant_info in &tenants {
+        let fp = extract_spki_fingerprint(&tenant_info.cert_der).unwrap();
+        let expected_id = hex::encode(fp);
+        assert_eq!(expected_id, tenant_info.peer_id,
+            "SPKI fingerprint should match peer_id");
+    }
+
+    // Verify all tenant IDs are unique
+    let ids: Vec<&str> = tenants.iter().map(|t| t.peer_id.as_str()).collect();
+    let unique: std::collections::HashSet<&str> = ids.iter().copied().collect();
+    assert_eq!(ids.len(), unique.len(), "all tenant IDs should be unique");
+}
+
+/// No cross-tenant leakage: events created by one tenant should not have
+/// recorded_events rows with another tenant's peer_id.
+#[tokio::test]
+async fn test_shared_db_no_cross_tenant_leakage() {
+    let node = SharedDbNode::new(2);
+    let t0 = &node.tenants[0];
+    let t1 = &node.tenants[1];
+
+    t0.batch_create_messages(5);
+    t1.batch_create_messages(5);
+
+    let db = open_connection(&node.db_path).unwrap();
+
+    // Get event_ids recorded by t0
+    let t0_events: Vec<String> = {
+        let mut stmt = db.prepare(
+            "SELECT event_id FROM recorded_events WHERE peer_id = ?1"
+        ).unwrap();
+        stmt.query_map([&t0.identity], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+
+    // Get event_ids recorded by t1
+    let t1_events: Vec<String> = {
+        let mut stmt = db.prepare(
+            "SELECT event_id FROM recorded_events WHERE peer_id = ?1"
+        ).unwrap();
+        stmt.query_map([&t1.identity], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+
+    // Verify no overlap — each tenant's recorded events are entirely its own.
+    // Events blobs are shared in the events table, but recorded_events and
+    // valid_events are scoped by peer_id.
+    let t0_set: std::collections::HashSet<&str> = t0_events.iter().map(|s| s.as_str()).collect();
+    let t1_set: std::collections::HashSet<&str> = t1_events.iter().map(|s| s.as_str()).collect();
+    let overlap: Vec<&&str> = t0_set.intersection(&t1_set).collect();
+    assert!(overlap.is_empty(),
+        "recorded_events should have zero overlap between tenants, but found {}: {:?}",
+        overlap.len(), overlap);
+
+    // Verify valid_events are also isolated
+    let t0_valid: Vec<String> = {
+        let mut stmt = db.prepare(
+            "SELECT event_id FROM valid_events WHERE peer_id = ?1"
+        ).unwrap();
+        stmt.query_map([&t0.identity], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    let t1_valid: Vec<String> = {
+        let mut stmt = db.prepare(
+            "SELECT event_id FROM valid_events WHERE peer_id = ?1"
+        ).unwrap();
+        stmt.query_map([&t1.identity], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    let t0_valid_set: std::collections::HashSet<&str> = t0_valid.iter().map(|s| s.as_str()).collect();
+    let t1_valid_set: std::collections::HashSet<&str> = t1_valid.iter().map(|s| s.as_str()).collect();
+    let valid_overlap: Vec<&&str> = t0_valid_set.intersection(&t1_valid_set).collect();
+    assert!(valid_overlap.is_empty(),
+        "valid_events should have zero overlap between tenants, but found {}: {:?}",
+        valid_overlap.len(), valid_overlap);
+
+    // Also verify via the comprehensive helper
+    node.verify_all_invariants();
+}
+
+/// Node + external peer: a SharedDbNode tenant syncs with a standalone Peer.
+#[tokio::test]
+async fn test_shared_db_sync_with_external_peer() {
+    let node = SharedDbNode::new(1);
+    let tenant = &node.tenants[0];
+
+    // External standalone peer
+    let external = Peer::new_with_identity("external");
+
+    // Create messages on both sides
+    tenant.batch_create_messages(2);
+    external.batch_create_messages(3);
+
+    // Start sync between tenant and external peer.
+    // The tenant uses the shared db_path, external uses its own.
+    let _sync = start_peers(tenant, &external);
+
+    // After sync: each side should have both identity chains + all messages
+    // tenant: 6 own identity + 5 shared from external + 2 own messages + 3 external messages = 16
+    // external: 6 own identity + 5 shared from tenant + 3 own messages + 2 tenant messages = 16
+    let expected_total = 16;
+    assert_eventually(
+        || tenant.store_count() >= expected_total && external.store_count() >= expected_total,
+        Duration::from_secs(15),
+        "tenant and external should converge",
+    ).await;
+
+    node.verify_all_invariants();
+    verify_projection_invariants(&external);
+}
+
+/// svc_node_status returns the correct tenant list.
+#[tokio::test]
+async fn test_svc_node_status() {
+    let node = SharedDbNode::new(2);
+
+    let status = poc_7::service::svc_node_status(&node.db_path).unwrap();
+    assert_eq!(status.len(), 2, "should report 2 tenants");
+
+    let ids: Vec<&str> = status.iter().map(|t| t.peer_id.as_str()).collect();
+    assert!(ids.contains(&node.tenants[0].identity.as_str()));
+    assert!(ids.contains(&node.tenants[1].identity.as_str()));
+
+    node.verify_all_invariants();
 }

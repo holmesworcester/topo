@@ -526,7 +526,7 @@ fn cmd_new_workspace(
 
     let mut account = Account::new(username, devicename);
     let conn = open_connection(&account.db_path)?;
-    let chain = identity_ops::bootstrap_workspace(&conn, &account.identity, &account.db_path)?;
+    let chain = identity_ops::bootstrap_workspace(&conn, &account.identity)?;
     account.store_chain_keys(&chain);
     account.workspace_name = Some(name.to_string());
 
@@ -910,7 +910,6 @@ fn cmd_accept_invite(
         &invite_key,
         &invite_event_id,
         workspace_id,
-        &account.db_path,
     )?;
 
     crate::db::transport_trust::record_invite_bootstrap_trust(
@@ -1055,7 +1054,6 @@ fn cmd_accept_link(
         &device_invite_key,
         &device_invite_event_id,
         workspace_id,
-        &account.db_path,
     )?;
 
     crate::db::transport_trust::record_invite_bootstrap_trust(

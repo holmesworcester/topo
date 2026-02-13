@@ -2,6 +2,9 @@
 //!
 //! Owns the database, runs sync, and listens on a local Unix socket for RPC commands.
 //! One daemon per profile/peer.
+//!
+//! With `--node`: multi-tenant mode. Discovers all local identities from the DB
+//! and starts a per-tenant QUIC endpoint sharing a single batch writer.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -38,6 +41,11 @@ struct Args {
     /// Custom RPC socket path (default: <db>.p7d.sock)
     #[arg(long)]
     socket: Option<String>,
+
+    /// Multi-tenant node mode: discover all local identities and start
+    /// per-tenant QUIC endpoints with a shared batch writer.
+    #[arg(long)]
+    node: bool,
 }
 
 #[tokio::main]
@@ -76,8 +84,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     info!("p7d started (db={}, socket={})", args.db, socket_path.display());
 
-    // Run sync as the main task (or just wait for Ctrl-C if no peers).
-    if !args.pin_peer.is_empty() || args.connect.is_some() {
+    if args.node {
+        // Multi-tenant node mode
+        let bind_ip = args.bind.ip();
+        poc_7::node::run_node(&args.db, bind_ip).await?;
+    } else if !args.pin_peer.is_empty() || args.connect.is_some() {
+        // Single-tenant sync mode
         service::svc_sync(args.bind, args.connect, &args.db, &args.pin_peer).await?;
     } else {
         // No peers configured — just serve RPC and wait for shutdown.

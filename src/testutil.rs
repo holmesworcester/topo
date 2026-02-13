@@ -17,7 +17,7 @@ use crate::events::{
     UserRemovedEvent, PeerRemovedEvent, SecretSharedEvent,
     TransportKeyEvent,
 };
-use crate::transport_identity::{transport_cert_paths_from_db, ensure_transport_peer_id_from_db};
+use crate::transport_identity::{ensure_transport_peer_id, ensure_transport_cert};
 use crate::projection::create::{create_event_sync, create_event_staged, create_signed_event_sync, create_signed_event_staged, create_encrypted_event_sync, CreateEventError};
 use crate::projection::pipeline::project_one;
 use crate::sync::SyncMessage;
@@ -29,7 +29,6 @@ use crate::transport::{
     create_dual_endpoint,
     create_server_endpoint,
     extract_spki_fingerprint,
-    load_or_generate_cert,
     peer_identity_from_connection,
 };
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
@@ -96,7 +95,7 @@ impl Peer {
         let db = open_connection(&db_path).expect("failed to open db");
         create_tables(&db).expect("failed to create tables");
 
-        let identity = ensure_transport_peer_id_from_db(&db_path).expect("failed to compute identity");
+        let identity = ensure_transport_peer_id(&db).expect("failed to compute identity");
         let author_id: [u8; 32] = rand::random();
 
         Self {
@@ -329,8 +328,9 @@ impl Peer {
 
     /// Load (or generate) the transport certificate and private key for this peer.
     pub fn cert_and_key(&self) -> (CertificateDer<'static>, PrivatePkcs8KeyDer<'static>) {
-        let (cp, kp) = transport_cert_paths_from_db(&self.db_path);
-        load_or_generate_cert(&cp, &kp).expect("failed to load cert")
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        let (_, cert, key) = ensure_transport_cert(&db).expect("failed to load cert");
+        (cert, key)
     }
 
     /// Extract the SPKI fingerprint (SHA-256) from this peer's transport certificate.
@@ -1450,21 +1450,14 @@ pub fn start_chain(peers: &[Peer]) -> Vec<std::thread::JoinHandle<()>> {
     // Extract fingerprints for all peers (needed before creating endpoints)
     let mut fingerprints: Vec<[u8; 32]> = Vec::new();
     for peer in peers {
-        let (cert_path, key_path) = transport_cert_paths_from_db(&peer.db_path);
-        let (cert, _) = load_or_generate_cert(&cert_path, &key_path)
-            .expect("failed to load cert for fingerprint");
-        let fp = extract_spki_fingerprint(cert.as_ref())
-            .expect("failed to extract fingerprint");
-        fingerprints.push(fp);
+        fingerprints.push(peer.spki_fingerprint());
     }
 
     // Create server endpoints for peers 0..n-2 (each accepts from its right neighbor)
     let mut server_addrs: Vec<SocketAddr> = Vec::new();
     let mut server_endpoints: Vec<quinn::Endpoint> = Vec::new();
     for i in 0..n-1 {
-        let (cert_path, key_path) = transport_cert_paths_from_db(&peers[i].db_path);
-        let (cert, key) = load_or_generate_cert(&cert_path, &key_path)
-            .expect("failed to load cert for server");
+        let (cert, key) = peers[i].cert_and_key();
         let allowed = Arc::new(AllowedPeers::from_fingerprints(vec![fingerprints[i+1]]));
         let endpoint = create_server_endpoint(
             "127.0.0.1:0".parse().unwrap(),
@@ -1478,9 +1471,7 @@ pub fn start_chain(peers: &[Peer]) -> Vec<std::thread::JoinHandle<()>> {
     // Create client endpoints for peers 1..n-1 (each connects to its left neighbor)
     let mut client_endpoints: Vec<quinn::Endpoint> = Vec::new();
     for i in 1..n {
-        let (cert_path, key_path) = transport_cert_paths_from_db(&peers[i].db_path);
-        let (cert, key) = load_or_generate_cert(&cert_path, &key_path)
-            .expect("failed to load cert for client");
+        let (cert, key) = peers[i].cert_and_key();
         let allowed = Arc::new(AllowedPeers::from_fingerprints(vec![fingerprints[i-1]]));
         let endpoint = create_client_endpoint(
             "0.0.0.0:0".parse().unwrap(),
@@ -1542,20 +1533,12 @@ pub fn start_multi_source(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Joi
     // Extract source fingerprints
     let mut source_fps: Vec<[u8; 32]> = Vec::new();
     for source in sources {
-        let (cert_path, key_path) = transport_cert_paths_from_db(&source.db_path);
-        let (cert, _) = load_or_generate_cert(&cert_path, &key_path)
-            .expect("failed to load source cert");
-        let fp = extract_spki_fingerprint(cert.as_ref())
-            .expect("failed to extract source fingerprint");
-        source_fps.push(fp);
+        source_fps.push(source.spki_fingerprint());
     }
 
     // Sink server endpoint allows all sources
-    let (sink_cert_path, sink_key_path) = transport_cert_paths_from_db(&sink.db_path);
-    let (sink_cert, sink_key) = load_or_generate_cert(&sink_cert_path, &sink_key_path)
-        .expect("failed to load sink cert");
-    let sink_fp = extract_spki_fingerprint(sink_cert.as_ref())
-        .expect("failed to extract sink fingerprint");
+    let (sink_cert, sink_key) = sink.cert_and_key();
+    let sink_fp = sink.spki_fingerprint();
 
     let allowed_for_sink = Arc::new(AllowedPeers::from_fingerprints(source_fps));
     let server_endpoint = create_server_endpoint(
@@ -1583,9 +1566,7 @@ pub fn start_multi_source(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Joi
 
     // Spawn connect_loop for each source
     for (i, source) in sources.iter().enumerate() {
-        let (cert_path, key_path) = transport_cert_paths_from_db(&source.db_path);
-        let (cert, key) = load_or_generate_cert(&cert_path, &key_path)
-            .expect("failed to load source cert");
+        let (cert, key) = source.cert_and_key();
         let allowed = Arc::new(AllowedPeers::from_fingerprints(vec![sink_fp]));
         let endpoint = create_client_endpoint(
             "0.0.0.0:0".parse().unwrap(),
@@ -1622,20 +1603,15 @@ pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Jo
     assert!(!sources.is_empty(), "need at least one source");
 
     // Extract sink fingerprint for sources to allow
-    let (sink_cert_path, sink_key_path) = transport_cert_paths_from_db(&sink.db_path);
-    let (sink_cert, sink_key) = load_or_generate_cert(&sink_cert_path, &sink_key_path)
-        .expect("failed to load sink cert");
-    let sink_fp = extract_spki_fingerprint(sink_cert.as_ref())
-        .expect("failed to extract sink fingerprint");
+    let (sink_cert, sink_key) = sink.cert_and_key();
+    let sink_fp = sink.spki_fingerprint();
 
     let mut handles = Vec::new();
     let mut source_addrs = Vec::new();
 
     // Start accept_loop for each source
     for source in sources {
-        let (cert_path, key_path) = transport_cert_paths_from_db(&source.db_path);
-        let (cert, key) = load_or_generate_cert(&cert_path, &key_path)
-            .expect("failed to load source cert");
+        let (cert, key) = source.cert_and_key();
 
         let allowed = Arc::new(AllowedPeers::from_fingerprints(vec![sink_fp]));
         let server_endpoint = create_server_endpoint(
@@ -1663,11 +1639,7 @@ pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Jo
     // Build per-source client endpoints for the sink
     let mut endpoint_pairs = Vec::new();
     for (i, source) in sources.iter().enumerate() {
-        let (cert_path, key_path) = transport_cert_paths_from_db(&source.db_path);
-        let (cert, _) = load_or_generate_cert(&cert_path, &key_path)
-            .expect("failed to load source cert");
-        let source_fp = extract_spki_fingerprint(cert.as_ref())
-            .expect("failed to extract source fingerprint");
+        let source_fp = source.spki_fingerprint();
 
         let allowed = Arc::new(AllowedPeers::from_fingerprints(vec![source_fp]));
         let client_endpoint = create_client_endpoint(
@@ -1705,8 +1677,9 @@ pub async fn connect_sync_once(
     remote_addr: SocketAddr,
     remote_fp: [u8; 32],
 ) -> Result<crate::runtime::SyncStats, Box<dyn std::error::Error + Send + Sync>> {
-    let (cert_path, key_path) = transport_cert_paths_from_db(db_path);
-    let (cert, key) = load_or_generate_cert(&cert_path, &key_path)?;
+    let (_, cert, key) = ensure_transport_cert(
+        &open_connection(db_path)?
+    )?;
     let allowed = Arc::new(AllowedPeers::from_fingerprints(vec![remote_fp]));
     let endpoint = create_client_endpoint("0.0.0.0:0".parse().unwrap(), cert, key, allowed)?;
 
@@ -1740,9 +1713,7 @@ pub fn start_sink_accept(
     sink: &Peer,
     allowed_fps: Vec<[u8; 32]>,
 ) -> (std::thread::JoinHandle<()>, SocketAddr) {
-    let (cert_path, key_path) = transport_cert_paths_from_db(&sink.db_path);
-    let (cert, key) = load_or_generate_cert(&cert_path, &key_path)
-        .expect("failed to load sink cert");
+    let (cert, key) = sink.cert_and_key();
     let allowed = Arc::new(AllowedPeers::from_fingerprints(allowed_fps));
     let endpoint = create_server_endpoint(
         "127.0.0.1:0".parse().unwrap(),
@@ -1767,13 +1738,189 @@ pub fn start_sink_accept(
     (handle, addr)
 }
 
-/// Extract the SPKI fingerprint for a peer (from its cert file).
+/// Extract the SPKI fingerprint for a peer.
 pub fn peer_fingerprint(peer: &Peer) -> [u8; 32] {
-    let (cert_path, key_path) = transport_cert_paths_from_db(&peer.db_path);
-    let (cert, _) = load_or_generate_cert(&cert_path, &key_path)
-        .expect("failed to load cert");
-    extract_spki_fingerprint(cert.as_ref())
-        .expect("failed to extract fingerprint")
+    peer.spki_fingerprint()
+}
+
+/// A multi-tenant node: multiple peers sharing a single database.
+///
+/// Each tenant has its own transport identity but they all use the same DB file.
+/// This mirrors the production `run_node` setup where tenant discovery comes from
+/// the join of `trust_anchors` and `local_transport_creds`.
+pub struct SharedDbNode {
+    pub db_path: String,
+    pub tenants: Vec<Peer>,
+    _tempdir: tempfile::TempDir,
+}
+
+impl SharedDbNode {
+    /// Create a shared-DB node with N tenants, each bootstrapped with a full identity chain.
+    pub fn new(n: usize) -> Self {
+        assert!(n >= 1, "need at least 1 tenant");
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        let db_path = tempdir.path().join("shared.db").to_str().unwrap().to_string();
+
+        // Initialize DB once
+        {
+            let db = open_connection(&db_path).expect("failed to open shared db");
+            create_tables(&db).expect("failed to create tables");
+        }
+
+        let mut tenants = Vec::with_capacity(n);
+        for i in 0..n {
+            let name = format!("tenant-{}", i);
+            // Create a Peer that uses the shared db_path
+            let peer = Self::create_tenant(&db_path, &name);
+            tenants.push(peer);
+        }
+
+        Self {
+            db_path,
+            tenants,
+            _tempdir: tempdir,
+        }
+    }
+
+    /// Create a single tenant within the shared DB.
+    fn create_tenant(db_path: &str, name: &str) -> Peer {
+        // Ensure tables exist (idempotent)
+        let db = open_connection(db_path).expect("failed to open db");
+        create_tables(&db).expect("failed to create tables");
+        drop(db);
+
+        // We need a separate identity for each tenant. The first call to
+        // ensure_transport_peer_id generates one cert; subsequent tenants
+        // need distinct certs. Generate a new cert for this tenant.
+        let (cert, key) = crate::transport::generate_self_signed_cert()
+            .expect("failed to generate cert");
+        let fp = extract_spki_fingerprint(cert.as_ref()).expect("failed to extract SPKI");
+        let tenant_identity = hex::encode(fp);
+
+        // Store this tenant's creds in the shared DB
+        let db = open_connection(db_path).expect("failed to open db");
+        crate::db::transport_creds::store_local_creds(
+            &db,
+            &tenant_identity,
+            cert.as_ref(),
+            key.secret_pkcs8_der(),
+        ).expect("failed to store creds");
+
+        let author_id: [u8; 32] = rand::random();
+
+        // Build a Peer struct pointing to the shared db
+        // We need a dummy tempdir since Peer owns one, but for SharedDbNode
+        // the real DB is in the node's tempdir
+        let dummy_tempdir = tempfile::tempdir().expect("failed to create dummy tempdir");
+
+        let mut peer = Peer {
+            name: name.to_string(),
+            db_path: db_path.to_string(),
+            identity: tenant_identity,
+            author_id,
+            workspace_id: [0u8; 32],
+            peer_shared_event_id: None,
+            peer_shared_signing_key: None,
+            workspace_signing_key: None,
+            _tempdir: dummy_tempdir,
+        };
+
+        // Bootstrap full identity chain
+        peer.bootstrap_identity_chain();
+        peer
+    }
+
+    /// Get the list of tenant peer_ids.
+    pub fn tenant_ids(&self) -> Vec<String> {
+        self.tenants.iter().map(|t| t.identity.clone()).collect()
+    }
+
+    /// Verify projection invariants for all tenants and assert no cross-tenant leakage.
+    pub fn verify_all_invariants(&self) {
+        for tenant in &self.tenants {
+            verify_projection_invariants(tenant);
+        }
+        assert_no_cross_tenant_leakage(&self.db_path, &self.tenant_ids());
+    }
+}
+
+/// Assert that no cross-tenant leakage exists in the shared database.
+///
+/// Checks that:
+/// 1. recorded_events rows for each tenant reference only that tenant's events
+/// 2. valid_events rows are fully partitioned by peer_id
+/// 3. No unexpected peer_ids appear in projection tables
+pub fn assert_no_cross_tenant_leakage(db_path: &str, tenant_ids: &[String]) {
+    let db = open_connection(db_path).expect("failed to open db");
+
+    // Collect recorded event_ids per tenant
+    let mut recorded_per_tenant: std::collections::HashMap<String, std::collections::HashSet<String>> = std::collections::HashMap::new();
+    for tid in tenant_ids {
+        let mut stmt = db.prepare(
+            "SELECT event_id FROM recorded_events WHERE peer_id = ?1"
+        ).expect("failed to prepare stmt");
+        let events: std::collections::HashSet<String> = stmt
+            .query_map([tid], |row| row.get::<_, String>(0))
+            .expect("failed to query")
+            .collect::<Result<std::collections::HashSet<_>, _>>()
+            .expect("failed to collect");
+        recorded_per_tenant.insert(tid.clone(), events);
+    }
+
+    // Verify pairwise disjointness of recorded_events
+    let ids: Vec<&String> = tenant_ids.iter().collect();
+    for i in 0..ids.len() {
+        for j in (i + 1)..ids.len() {
+            let a = recorded_per_tenant.get(ids[i]).unwrap();
+            let b = recorded_per_tenant.get(ids[j]).unwrap();
+            let overlap: Vec<&String> = a.intersection(b).collect();
+            assert!(overlap.is_empty(),
+                "Cross-tenant leakage in recorded_events between {} and {}: {:?}",
+                &ids[i][..16], &ids[j][..16], overlap);
+        }
+    }
+
+    // Verify valid_events are also partitioned
+    let mut valid_per_tenant: std::collections::HashMap<String, std::collections::HashSet<String>> = std::collections::HashMap::new();
+    for tid in tenant_ids {
+        let mut stmt = db.prepare(
+            "SELECT event_id FROM valid_events WHERE peer_id = ?1"
+        ).expect("failed to prepare stmt");
+        let events: std::collections::HashSet<String> = stmt
+            .query_map([tid], |row| row.get::<_, String>(0))
+            .expect("failed to query")
+            .collect::<Result<std::collections::HashSet<_>, _>>()
+            .expect("failed to collect");
+        valid_per_tenant.insert(tid.clone(), events);
+    }
+
+    for i in 0..ids.len() {
+        for j in (i + 1)..ids.len() {
+            let a = valid_per_tenant.get(ids[i]).unwrap();
+            let b = valid_per_tenant.get(ids[j]).unwrap();
+            let overlap: Vec<&String> = a.intersection(b).collect();
+            assert!(overlap.is_empty(),
+                "Cross-tenant leakage in valid_events between {} and {}: {:?}",
+                &ids[i][..16], &ids[j][..16], overlap);
+        }
+    }
+
+    // Verify no unexpected peer_ids in projection tables
+    let known_ids: std::collections::HashSet<&str> = tenant_ids.iter().map(|s| s.as_str()).collect();
+    for table in &["messages", "reactions", "signed_memos", "secret_keys", "deleted_messages"] {
+        let query = format!("SELECT DISTINCT recorded_by FROM {}", table);
+        let mut stmt = db.prepare(&query).expect("failed to prepare");
+        let found_ids: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("failed to query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("failed to collect");
+        for found_id in &found_ids {
+            assert!(known_ids.contains(found_id.as_str()),
+                "Unknown peer_id '{}...' in {} table",
+                &found_id[..16.min(found_id.len())], table);
+        }
+    }
 }
 
 /// Copy all events and neg_items from a source peer's database to target peers.
