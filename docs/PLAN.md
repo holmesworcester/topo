@@ -718,8 +718,11 @@ CREATE TABLE ingress_queue (
     peer_id TEXT NOT NULL,
     from_addr TEXT,
     received_at INTEGER NOT NULL,
-    frame BLOB NOT NULL
+    frame BLOB NOT NULL,
+    processed INTEGER NOT NULL DEFAULT 0
 );
+CREATE INDEX idx_ingress_unprocessed
+    ON ingress_queue(processed, received_at);
 
 CREATE TABLE project_queue (
     peer_id TEXT NOT NULL,
@@ -753,7 +756,8 @@ CREATE UNIQUE INDEX idx_egress_dedupe
 
 Keep canonical and queue data separate:
 - permanent: `events`, `recorded_events`, projection outputs
-- operational/transient: `ingress_queue`, `project_queue`, `blocked_event_deps`, `egress_queue`
+- operational/transient: `project_queue`, `blocked_event_deps`, `egress_queue`
+- reserved/optional staging: `ingress_queue` (schema-present, currently not on runtime ingest hot path)
 
 ## 8.2 Why not one generic jobs table
 
@@ -766,10 +770,11 @@ Separate queue tables stay simpler operationally.
 
 ## 8.3 Worker stages
 
-1. `ingress worker`: QUIC frame -> canonical event insert -> record by tenant -> insert endpoint observation row (append-only) -> enqueue project.
+1. `ingest receiver path` (current runtime): QUIC frame -> ingest channel -> transactional canonical insert -> record by tenant -> enqueue project.
 2. `project worker`: claim row -> project path (`valid`/`block`/`reject`) -> dequeue.
 3. `egress worker`: dequeue by `connection_id` -> send frame -> mark `sent_at`/retry.
-4. `cleanup worker`: purge stale ingress/sent egress rows, reclaim expired leases, TTL-purge old endpoint observations.
+4. `cleanup worker`: purge stale ingress rows (if ingress staging is used) and sent egress rows, reclaim expired leases, TTL-purge old endpoint observations.
+5. `ingress_queue` is reserved for optional future staging/diagnostics; no active worker currently drains it.
 
 Queue DRY requirement:
 - implement generic queue helper traits/functions once (`claim_batch`, `renew_lease`, `mark_done`, `mark_retry/backoff`).
@@ -901,8 +906,8 @@ The `FILE_SLICE_MAX_BYTES` constant is derived so that the maximum encoded `file
 ### 10.1 File attachment event types
 
 Two new event types (migration 13):
-- `message_attachment` (type 24, unsigned): Descriptor linking a file to a message.
-  Deps: `message_id`, `key_event_id`. Fields include `blob_bytes`, `total_slices`, `slice_bytes`,
+- `message_attachment` (type 24, signed): Descriptor linking a file to a message.
+  Deps: `message_id`, `key_event_id`, `signed_by`. Fields include `blob_bytes`, `total_slices`, `slice_bytes`,
   `root_hash`, `filename`, `mime_type`.
 - `file_slice` (type 25, signed): Individual encrypted chunk of a file.
   Dep: `signed_by`. Fields include `file_id`, `slice_number`, `ciphertext`.
@@ -917,6 +922,7 @@ sequential IO locality when reassembling files.
 - `total_slices > 0` requires `slice_bytes > 0`
 - `total_slices` must equal `ceil(blob_bytes / slice_bytes)`
 - Zero-byte files (`blob_bytes == 0, total_slices == 0, slice_bytes == 0`) are valid.
+- Signer metadata (`signed_by`, `signer_type`, `signature`) is required and then validated by the shared signer pipeline after dependency resolution.
 
 ### 10.3 Duplicate slice conflict handling
 
@@ -1367,10 +1373,11 @@ Definition of done:
 ## 15.7 Phase `4` implementation checklist (durable queues/workers)
 
 Must implement:
-1. queue tables (`ingress`, `project`, `egress`) with transactional boundaries.
+1. queue tables (`project`, `egress`) with transactional boundaries; keep `ingress_queue` optional/reserved unless actively wired.
 2. shared queue helper functions for claim/lease/retry.
 3. egress creation from reconciliation and request-list producers.
 4. queue cleanup + TTL maintenance jobs.
+5. ingest path writes canonical rows + `project_queue` enqueue atomically before projection drain.
 
 Common mistakes:
 - using one generic jobs table for all queues.

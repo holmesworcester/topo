@@ -418,17 +418,20 @@ Materialization is an adapter step, not a second projection system.
 
 Operational queues:
 
-1. `ingress_queue` for raw received transport frames,
-2. `project_queue(peer_id, event_id, available_at, attempts, lease_until)`,
-3. `egress_queue(connection_id, frame_type, event_id, payload, attempts, lease_until, sent_at, dedupe_key)`.
+1. `project_queue(peer_id, event_id, available_at, attempts, lease_until)`,
+2. `egress_queue(connection_id, frame_type, event_id, payload, attempts, lease_until, sent_at, dedupe_key)`,
+3. `ingress_queue` exists in schema as reserved compatibility/diagnostic staging, but current runtime ingest does not enqueue/dequeue through it.
 
 Canonical tables and queue tables stay separate.
 
 ## 7.2 Workers
 
-1. ingress worker:
-   - frame decode, canonical insert, recording metadata, append endpoint observation row, project enqueue.
-2. project worker:
+Current runtime ingest/worker shape:
+1. sync ingest receiver path:
+   - receive `SyncMessage::Event` blobs,
+   - decode + canonical insert (`events`, `neg_items`, `recorded_events`) + `project_queue` enqueue in one transaction,
+   - commit, then drain `project_queue`.
+2. project worker/drain:
    - claim, project (`valid|block|reject`), dequeue.
 3. egress worker:
    - claim per connection, send frame, mark sent or retry.
@@ -669,7 +672,7 @@ Initial event-size policy:
 3. `FILE_SLICE_MAX_BYTES = 1_048_430` (`EVENT_MAX_BLOB_BYTES - 146 bytes wire overhead`).
 
 `file_slice` events (type 25, signed) are signed and validated like other canonical events.
-`message_attachment` events (type 24, unsigned) are file descriptors with deps on `message_id` and `key_event_id`.
+`message_attachment` events (type 24, signed) are file descriptors with deps on `message_id`, `key_event_id`, and `signed_by`.
 
 ---
 
