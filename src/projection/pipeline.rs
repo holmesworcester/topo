@@ -330,14 +330,9 @@ fn cascade_unblocked(
     blocker_b64: &str,
     initial_parsed: Option<&ParsedEvent>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Wrap entire cascade in a savepoint for batched WAL writes
-    conn.execute_batch("SAVEPOINT cascade_unblocked")?;
-    let result = cascade_unblocked_inner(conn, recorded_by, blocker_b64, initial_parsed);
-    match &result {
-        Ok(()) => conn.execute_batch("RELEASE cascade_unblocked")?,
-        Err(_) => { let _ = conn.execute_batch("ROLLBACK TO cascade_unblocked; RELEASE cascade_unblocked"); }
-    }
-    result
+    // Run cascade directly so partial blocker/index writes are preserved when
+    // transient write contention causes a retry.
+    cascade_unblocked_inner(conn, recorded_by, blocker_b64, initial_parsed)
 }
 
 fn cascade_unblocked_inner(

@@ -193,8 +193,8 @@ impl<'a> ProjectQueue<'a> {
 
     /// Like `drain` but with a configurable claim batch size.
     ///
-    /// Each item's projection and queue-row deletion are wrapped in a savepoint,
-    /// so they either both commit or both roll back — no split state.
+    /// Projection runs in autocommit mode. On failure we keep projection side
+    /// effects (for example blocked dependency rows) and only schedule retry.
     pub fn drain_with_limit<F>(&self, peer_id: &str, batch_size: usize, mut project_fn: F) -> SqliteResult<usize>
     where
         F: FnMut(&Connection, &str) -> Result<(), Box<dyn std::error::Error>>,
@@ -207,23 +207,15 @@ impl<'a> ProjectQueue<'a> {
             }
             let mut succeeded = 0usize;
             for event_id_b64 in &batch {
-                self.conn.execute_batch("SAVEPOINT project_item")?;
                 match project_fn(self.conn, event_id_b64) {
                     Ok(()) => {
-                        // Delete queue row inside the same savepoint
                         self.conn.execute(
                             "DELETE FROM project_queue WHERE peer_id = ?1 AND event_id = ?2",
                             params![peer_id, event_id_b64],
                         )?;
-                        // Commit both projection effects + dequeue atomically
-                        self.conn.execute_batch("RELEASE project_item")?;
                         succeeded += 1;
                     }
                     Err(_) => {
-                        // Roll back any partial projection writes, then release
-                        let _ = self.conn.execute_batch(
-                            "ROLLBACK TO project_item; RELEASE project_item"
-                        );
                         let _ = self.mark_retry(peer_id, event_id_b64);
                     }
                 }
@@ -534,7 +526,7 @@ mod tests {
     }
 
     #[test]
-    fn test_drain_rollback_on_projector_failure() {
+    fn test_drain_preserves_projection_writes_on_projector_failure() {
         let conn = setup();
         let pq = ProjectQueue::new(&conn);
 
@@ -562,12 +554,12 @@ mod tests {
         ).unwrap();
         assert!(valid_a, "event_a projection should be committed");
 
-        // event_b's partial write to valid_events should be rolled back
+        // event_b's projection write should persist even though projector errored
         let valid_b: bool = conn.query_row(
             "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = 'peer1' AND event_id = 'event_b'",
             [], |row| row.get(0),
         ).unwrap();
-        assert!(!valid_b, "event_b projection should be rolled back");
+        assert!(valid_b, "event_b projection write should persist");
 
         // event_b should remain in the queue for retry
         let queue_b: bool = conn.query_row(
@@ -582,6 +574,50 @@ mod tests {
             [], |row| row.get(0),
         ).unwrap();
         assert!(!queue_a, "event_a should be dequeued");
+    }
+
+    #[test]
+    fn test_drain_failure_preserves_blocked_event_deps() {
+        let conn = setup();
+        let pq = ProjectQueue::new(&conn);
+
+        pq.enqueue("peer1", "event_blocked").unwrap();
+
+        let count = pq.drain("peer1", |conn, eid| {
+            conn.execute(
+                "INSERT INTO blocked_event_deps (peer_id, event_id, blocker_event_id)
+                 VALUES ('peer1', ?1, 'missing_dep')",
+                params![eid],
+            )?;
+            Err("simulated failure after blocker write".into())
+        }).unwrap();
+
+        assert_eq!(count, 0, "failed projection should not count as success");
+
+        let blocked_exists: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM blocked_event_deps
+             WHERE peer_id = 'peer1' AND event_id = 'event_blocked' AND blocker_event_id = 'missing_dep'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert!(
+            blocked_exists,
+            "blocked_event_deps row must persist to preserve cascade-unblock state"
+        );
+
+        let queue_exists: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM project_queue WHERE peer_id = 'peer1' AND event_id = 'event_blocked'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert!(queue_exists, "failed item should remain queued for retry");
+
+        let attempts: i64 = conn.query_row(
+            "SELECT attempts FROM project_queue WHERE peer_id = 'peer1' AND event_id = 'event_blocked'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert!(attempts >= 1, "failed item should increment attempts");
     }
 
     #[test]
