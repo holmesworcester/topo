@@ -1046,7 +1046,7 @@ pub async fn accept_loop(
     db_path: &str,
     recorded_by: &str,
     endpoint: quinn::Endpoint,
-    _allowed_peers: Option<crate::transport::AllowedPeers>,
+    allowed_peers: Option<crate::transport::AllowedPeers>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     {
         let db = open_connection(db_path)?;
@@ -1142,15 +1142,32 @@ pub async fn accept_loop(
         }
 
         // Spawn a thread for this connection so multiple sources sync concurrently.
+        // Uses LocalSet so the intro listener (spawn_local) can run alongside
+        // the responder sync sessions on the same runtime.
         let db_path_owned = db_path.to_string();
         let recorded_by_owned = recorded_by.to_string();
         let ingest_clone = shared_ingest_tx.clone();
+        let intro_allowed = allowed_peers.clone();
+        let intro_endpoint = endpoint.clone();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .unwrap();
-            rt.block_on(async move {
+            let local = tokio::task::LocalSet::new();
+            rt.block_on(local.run_until(async move {
+                // Spawn intro listener for uni-streams on this connection
+                if let Some(ap) = intro_allowed {
+                    crate::sync::punch::spawn_intro_listener(
+                        connection.clone(),
+                        db_path_owned.clone(),
+                        recorded_by_owned.clone(),
+                        peer_id.clone(),
+                        intro_endpoint,
+                        ap,
+                    );
+                }
+
                 loop {
                     let (ctrl_send, ctrl_recv) = match connection.accept_bi().await {
                         Ok(streams) => streams,
@@ -1177,7 +1194,7 @@ pub async fn accept_loop(
 
                     tokio::time::sleep(SESSION_GAP).await;
                 }
-            });
+            }));
         });
     }
 }
