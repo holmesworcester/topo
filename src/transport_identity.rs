@@ -1,7 +1,7 @@
 use rusqlite::Connection;
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 
-use crate::db::transport_creds::{load_any_local_creds, load_local_creds, store_local_creds};
+use crate::db::transport_creds::{load_sole_local_creds, load_local_creds, store_local_creds};
 use crate::events::{ParsedEvent, TransportKeyEvent};
 use crate::projection::create::create_signed_event_sync;
 use crate::transport::{
@@ -18,7 +18,7 @@ use crate::transport::{
 pub fn load_transport_peer_id(
     conn: &Connection,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    match load_any_local_creds(conn)? {
+    match load_sole_local_creds(conn)? {
         Some((peer_id, _, _)) => Ok(peer_id),
         None => Err(
             "Transport identity not found in database. Run 'transport-identity' or 'send' first to generate."
@@ -32,7 +32,7 @@ pub fn load_transport_peer_id(
 pub fn ensure_transport_peer_id(
     conn: &Connection,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    if let Some((peer_id, _, _)) = load_any_local_creds(conn)? {
+    if let Some((peer_id, _, _)) = load_sole_local_creds(conn)? {
         return Ok(peer_id);
     }
     let (cert_der, key_der) = generate_self_signed_cert()?;
@@ -50,7 +50,7 @@ pub fn ensure_transport_cert(
     (String, CertificateDer<'static>, PrivatePkcs8KeyDer<'static>),
     Box<dyn std::error::Error + Send + Sync>,
 > {
-    if let Some((peer_id, cert_bytes, key_bytes)) = load_any_local_creds(conn)? {
+    if let Some((peer_id, cert_bytes, key_bytes)) = load_sole_local_creds(conn)? {
         let cert_der = CertificateDer::from(cert_bytes);
         let key_der = PrivatePkcs8KeyDer::from(key_bytes);
         return Ok((peer_id, cert_der, key_der));
@@ -171,9 +171,8 @@ pub fn ensure_transport_key_event(
 ) -> Result<Option<[u8; 32]>, Box<dyn std::error::Error + Send + Sync>> {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    let creds = load_any_local_creds(conn)?;
-    let (_, cert_bytes, _) = match creds {
-        Some(c) => c,
+    let cert_bytes = match load_local_creds(conn, recorded_by)? {
+        Some((cert, _)) => cert,
         None => return Ok(None),
     };
 

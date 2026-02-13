@@ -143,9 +143,13 @@ pub async fn run_node(
                             let db_path_disc = db_path.to_string();
                             let tenant_id = tenant.peer_id.clone();
                             std::thread::spawn(move || {
-                                // Each discovered peer gets its own thread+runtime
-                                // because connect_loop uses LocalSet (not Send).
+                                let mut active_peers: HashSet<String> = HashSet::new();
                                 while let Ok(peer) = rx.recv() {
+                                    // Deduplicate: skip if we already have a connect_loop
+                                    // running for this remote peer_id.
+                                    if !active_peers.insert(peer.peer_id.clone()) {
+                                        continue;
+                                    }
                                     info!(
                                         "mDNS: tenant {} connecting to discovered peer {} at {}",
                                         &tenant_id[..16], &peer.peer_id[..16.min(peer.peer_id.len())], peer.addr

@@ -1840,22 +1840,30 @@ impl SharedDbNode {
         for tenant in &self.tenants {
             verify_projection_invariants(tenant);
         }
-        assert_no_cross_tenant_leakage(&self.db_path, &self.tenant_ids());
+        let tenant_workspaces: Vec<(String, String)> = self.tenants.iter()
+            .map(|t| (t.identity.clone(), hex::encode(t.workspace_id)))
+            .collect();
+        assert_no_cross_tenant_leakage(&self.db_path, &tenant_workspaces);
     }
 }
 
 /// Assert that no cross-tenant leakage exists in the shared database.
 ///
-/// Checks that:
-/// 1. recorded_events rows for each tenant reference only that tenant's events
-/// 2. valid_events rows are fully partitioned by peer_id
-/// 3. No unexpected peer_ids appear in projection tables
-pub fn assert_no_cross_tenant_leakage(db_path: &str, tenant_ids: &[String]) {
+/// `tenant_workspaces` is a list of (peer_id, workspace_id) pairs. Checks:
+/// 1. For tenants in different workspaces: recorded_events and valid_events
+///    event_id sets are pairwise disjoint (no cross-workspace leakage).
+///    For tenants in the same workspace: overlap is expected after sync.
+/// 2. No unexpected peer_ids appear in recorded_events, valid_events, or
+///    projection tables.
+pub fn assert_no_cross_tenant_leakage(db_path: &str, tenant_workspaces: &[(String, String)]) {
     let db = open_connection(db_path).expect("failed to open db");
 
+    let tenant_ids: Vec<&str> = tenant_workspaces.iter().map(|(id, _)| id.as_str()).collect();
+    let known_ids: std::collections::HashSet<&str> = tenant_ids.iter().copied().collect();
+
     // Collect recorded event_ids per tenant
-    let mut recorded_per_tenant: std::collections::HashMap<String, std::collections::HashSet<String>> = std::collections::HashMap::new();
-    for tid in tenant_ids {
+    let mut recorded_per_tenant: std::collections::HashMap<&str, std::collections::HashSet<String>> = std::collections::HashMap::new();
+    for tid in &tenant_ids {
         let mut stmt = db.prepare(
             "SELECT event_id FROM recorded_events WHERE peer_id = ?1"
         ).expect("failed to prepare stmt");
@@ -1864,25 +1872,29 @@ pub fn assert_no_cross_tenant_leakage(db_path: &str, tenant_ids: &[String]) {
             .expect("failed to query")
             .collect::<Result<std::collections::HashSet<_>, _>>()
             .expect("failed to collect");
-        recorded_per_tenant.insert(tid.clone(), events);
+        recorded_per_tenant.insert(tid, events);
     }
 
-    // Verify pairwise disjointness of recorded_events
-    let ids: Vec<&String> = tenant_ids.iter().collect();
-    for i in 0..ids.len() {
-        for j in (i + 1)..ids.len() {
-            let a = recorded_per_tenant.get(ids[i]).unwrap();
-            let b = recorded_per_tenant.get(ids[j]).unwrap();
+    // Verify pairwise disjointness of recorded_events for tenants in DIFFERENT workspaces
+    for i in 0..tenant_workspaces.len() {
+        for j in (i + 1)..tenant_workspaces.len() {
+            let (id_a, ws_a) = &tenant_workspaces[i];
+            let (id_b, ws_b) = &tenant_workspaces[j];
+            if ws_a == ws_b {
+                continue; // same workspace — overlap is expected after sync
+            }
+            let a = recorded_per_tenant.get(id_a.as_str()).unwrap();
+            let b = recorded_per_tenant.get(id_b.as_str()).unwrap();
             let overlap: Vec<&String> = a.intersection(b).collect();
             assert!(overlap.is_empty(),
-                "Cross-tenant leakage in recorded_events between {} and {}: {:?}",
-                &ids[i][..16], &ids[j][..16], overlap);
+                "Cross-workspace leakage in recorded_events between {} and {}: {:?}",
+                &id_a[..16], &id_b[..16], overlap);
         }
     }
 
-    // Verify valid_events are also partitioned
-    let mut valid_per_tenant: std::collections::HashMap<String, std::collections::HashSet<String>> = std::collections::HashMap::new();
-    for tid in tenant_ids {
+    // Collect valid event_ids per tenant
+    let mut valid_per_tenant: std::collections::HashMap<&str, std::collections::HashSet<String>> = std::collections::HashMap::new();
+    for tid in &tenant_ids {
         let mut stmt = db.prepare(
             "SELECT event_id FROM valid_events WHERE peer_id = ?1"
         ).expect("failed to prepare stmt");
@@ -1891,22 +1903,42 @@ pub fn assert_no_cross_tenant_leakage(db_path: &str, tenant_ids: &[String]) {
             .expect("failed to query")
             .collect::<Result<std::collections::HashSet<_>, _>>()
             .expect("failed to collect");
-        valid_per_tenant.insert(tid.clone(), events);
+        valid_per_tenant.insert(tid, events);
     }
 
-    for i in 0..ids.len() {
-        for j in (i + 1)..ids.len() {
-            let a = valid_per_tenant.get(ids[i]).unwrap();
-            let b = valid_per_tenant.get(ids[j]).unwrap();
+    for i in 0..tenant_workspaces.len() {
+        for j in (i + 1)..tenant_workspaces.len() {
+            let (id_a, ws_a) = &tenant_workspaces[i];
+            let (id_b, ws_b) = &tenant_workspaces[j];
+            if ws_a == ws_b {
+                continue; // same workspace — overlap is expected after sync
+            }
+            let a = valid_per_tenant.get(id_a.as_str()).unwrap();
+            let b = valid_per_tenant.get(id_b.as_str()).unwrap();
             let overlap: Vec<&String> = a.intersection(b).collect();
             assert!(overlap.is_empty(),
-                "Cross-tenant leakage in valid_events between {} and {}: {:?}",
-                &ids[i][..16], &ids[j][..16], overlap);
+                "Cross-workspace leakage in valid_events between {} and {}: {:?}",
+                &id_a[..16], &id_b[..16], overlap);
+        }
+    }
+
+    // Verify no unexpected peer_ids in key scoped tables
+    for table in &["recorded_events", "valid_events"] {
+        let query = format!("SELECT DISTINCT peer_id FROM {}", table);
+        let mut stmt = db.prepare(&query).expect("failed to prepare");
+        let found_ids: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("failed to query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("failed to collect");
+        for found_id in &found_ids {
+            assert!(known_ids.contains(found_id.as_str()),
+                "Unknown peer_id '{}...' in {} table",
+                &found_id[..16.min(found_id.len())], table);
         }
     }
 
     // Verify no unexpected peer_ids in projection tables
-    let known_ids: std::collections::HashSet<&str> = tenant_ids.iter().map(|s| s.as_str()).collect();
     for table in &["messages", "reactions", "signed_memos", "secret_keys", "deleted_messages"] {
         let query = format!("SELECT DISTINCT recorded_by FROM {}", table);
         let mut stmt = db.prepare(&query).expect("failed to prepare");

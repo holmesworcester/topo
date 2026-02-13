@@ -6,7 +6,7 @@ use crate::events::*;
 use crate::projection::create::{
     create_event_sync, create_event_staged, create_signed_event_sync, create_signed_event_staged,
 };
-use crate::db::transport_creds::load_any_local_creds;
+use crate::db::transport_creds::load_local_creds;
 use crate::transport::extract_spki_fingerprint;
 
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -431,9 +431,8 @@ fn create_transport_key_if_possible(
     peer_shared_key: &SigningKey,
     peer_shared_event_id: &EventId,
 ) -> Result<Option<EventId>, Box<dyn std::error::Error + Send + Sync>> {
-    let creds = load_any_local_creds(conn)?;
-    let (_, cert_bytes, _) = match creds {
-        Some(c) => c,
+    let cert_bytes = match load_local_creds(conn, recorded_by)? {
+        Some((cert, _)) => cert,
         None => return Ok(None),
     };
 

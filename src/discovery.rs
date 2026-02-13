@@ -40,9 +40,8 @@ mod inner {
         ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
             let daemon = ServiceDaemon::new()?;
 
-            // Instance name: first 16 hex chars of peer_id for readability
-            let label = &peer_id[..16.min(peer_id.len())];
-            let instance = format!("p7-{}", label);
+            // Instance name: full peer_id to avoid collisions
+            let instance = format!("p7-{}", peer_id);
 
             let host = format!("{}.local.", hostname());
             let properties = [("peer_id", peer_id)];
@@ -99,9 +98,13 @@ mod inner {
                                 continue;
                             }
 
-                            // Extract address
+                            // Extract address: prefer non-loopback, non-link-local
                             let addrs: Vec<&IpAddr> = info.get_addresses().iter().collect();
-                            if let Some(ip) = addrs.first() {
+                            let best_ip = addrs.iter()
+                                .find(|ip| !ip.is_loopback() && !is_link_local(ip))
+                                .or_else(|| addrs.iter().find(|ip| !ip.is_loopback()))
+                                .or(addrs.first());
+                            if let Some(ip) = best_ip {
                                 let addr = SocketAddr::new(**ip, info.get_port());
                                 info!(
                                     "mDNS: tenant {} discovered peer {} at {}",
@@ -130,6 +133,19 @@ mod inner {
     impl Drop for TenantDiscovery {
         fn drop(&mut self) {
             let _ = self.daemon.shutdown();
+        }
+    }
+
+    fn is_link_local(ip: &IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(v4) => {
+                let octets = v4.octets();
+                octets[0] == 169 && octets[1] == 254 // 169.254.0.0/16
+            }
+            IpAddr::V6(v6) => {
+                let segments = v6.segments();
+                segments[0] & 0xffc0 == 0xfe80 // fe80::/10
+            }
         }
     }
 

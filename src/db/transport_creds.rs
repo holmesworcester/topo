@@ -35,11 +35,28 @@ pub fn load_local_creds(
     }
 }
 
-/// Load the first available local transport credentials (for single-tenant use).
-/// Returns (peer_id, cert_der, key_der) if any exist.
-pub fn load_any_local_creds(
+/// Load the sole local transport credentials (for single-tenant use).
+/// Returns (peer_id, cert_der, key_der) if exactly one exists.
+/// Returns None if no credentials exist.
+/// Errors if multiple credentials exist (ambiguous — use node mode or specify peer_id).
+pub fn load_sole_local_creds(
     conn: &Connection,
 ) -> Result<Option<(String, Vec<u8>, Vec<u8>)>, Box<dyn std::error::Error + Send + Sync>> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM local_transport_creds",
+        [],
+        |row| row.get(0),
+    )?;
+    if count == 0 {
+        return Ok(None);
+    }
+    if count > 1 {
+        return Err(format!(
+            "Multiple local identities found ({}). Use --node mode for multi-tenant operation, \
+             or specify an explicit peer_id.",
+            count
+        ).into());
+    }
     match conn.query_row(
         "SELECT peer_id, cert_der, key_der FROM local_transport_creds LIMIT 1",
         [],
@@ -52,7 +69,6 @@ pub fn load_any_local_creds(
         },
     ) {
         Ok(triple) => Ok(Some(triple)),
-        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(e) => Err(e.into()),
     }
 }
@@ -129,15 +145,28 @@ mod tests {
     }
 
     #[test]
-    fn test_load_any_local_creds() {
+    fn test_load_sole_local_creds() {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
 
-        assert!(load_any_local_creds(&conn).unwrap().is_none());
+        assert!(load_sole_local_creds(&conn).unwrap().is_none());
 
         store_local_creds(&conn, "peer1", b"c1", b"k1").unwrap();
-        let result = load_any_local_creds(&conn).unwrap().unwrap();
+        let result = load_sole_local_creds(&conn).unwrap().unwrap();
         assert_eq!(result.0, "peer1");
+    }
+
+    #[test]
+    fn test_load_sole_local_creds_rejects_multiple() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+
+        store_local_creds(&conn, "peer1", b"c1", b"k1").unwrap();
+        store_local_creds(&conn, "peer2", b"c2", b"k2").unwrap();
+
+        let err = load_sole_local_creds(&conn).unwrap_err();
+        assert!(err.to_string().contains("Multiple local identities"),
+            "should reject ambiguous multi-tenant DB, got: {}", err);
     }
 
     #[test]
