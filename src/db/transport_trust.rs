@@ -58,7 +58,7 @@ pub fn record_invite_bootstrap_trust(
 ) -> Result<(), rusqlite::Error> {
     let now = now_ms_i64();
     conn.execute(
-        "INSERT OR REPLACE INTO invite_bootstrap_trust (
+        "INSERT INTO invite_bootstrap_trust (
              recorded_by,
              invite_accepted_event_id,
              invite_event_id,
@@ -68,7 +68,15 @@ pub fn record_invite_bootstrap_trust(
              accepted_at,
              expires_at,
              superseded_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)
+         ON CONFLICT(recorded_by, invite_accepted_event_id) DO UPDATE SET
+             invite_event_id = excluded.invite_event_id,
+             workspace_id = excluded.workspace_id,
+             bootstrap_addr = excluded.bootstrap_addr,
+             bootstrap_spki_fingerprint = excluded.bootstrap_spki_fingerprint,
+             accepted_at = excluded.accepted_at,
+             expires_at = excluded.expires_at,
+             superseded_at = NULL",
         rusqlite::params![
             recorded_by,
             invite_accepted_event_id,
@@ -95,7 +103,7 @@ pub fn record_pending_invite_bootstrap_trust(
 ) -> Result<(), rusqlite::Error> {
     let now = now_ms_i64();
     conn.execute(
-        "INSERT OR REPLACE INTO pending_invite_bootstrap_trust (
+        "INSERT INTO pending_invite_bootstrap_trust (
              recorded_by,
              invite_event_id,
              workspace_id,
@@ -103,7 +111,13 @@ pub fn record_pending_invite_bootstrap_trust(
              created_at,
              expires_at,
              superseded_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)
+         ON CONFLICT(recorded_by, invite_event_id) DO UPDATE SET
+             workspace_id = excluded.workspace_id,
+             expected_bootstrap_spki_fingerprint = excluded.expected_bootstrap_spki_fingerprint,
+             created_at = excluded.created_at,
+             expires_at = excluded.expires_at,
+             superseded_at = NULL",
         rusqlite::params![
             recorded_by,
             invite_event_id,
@@ -536,6 +550,92 @@ mod tests {
         assert!(is_peer_allowed(&conn, recorded_by, &db_only, &cli).unwrap());
         assert!(is_peer_allowed(&conn, recorded_by, &pending_only, &cli).unwrap());
         assert!(!is_peer_allowed(&conn, recorded_by, &denied, &cli).unwrap());
+    }
+
+    #[test]
+    fn test_invite_bootstrap_trust_upsert_updates_in_place() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+
+        let recorded_by = "aaaa";
+        let spki: [u8; 32] = [20u8; 32];
+
+        // First insert
+        record_invite_bootstrap_trust(
+            &conn, recorded_by, "ia1", "invite1", "workspace1", "127.0.0.1:4433", &spki,
+        ).unwrap();
+
+        // Second insert with same PK but different values
+        let spki2: [u8; 32] = [21u8; 32];
+        record_invite_bootstrap_trust(
+            &conn, recorded_by, "ia1", "invite2", "workspace2", "10.0.0.1:4434", &spki2,
+        ).unwrap();
+
+        // Should be exactly 1 row (updated in place, not deleted+reinserted)
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM invite_bootstrap_trust
+             WHERE recorded_by = ?1 AND invite_accepted_event_id = ?2",
+            rusqlite::params![recorded_by, "ia1"],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count, 1, "upsert should update in place, not create duplicate");
+
+        // Verify new values
+        let (addr, ws): (String, String) = conn.query_row(
+            "SELECT bootstrap_addr, workspace_id FROM invite_bootstrap_trust
+             WHERE recorded_by = ?1 AND invite_accepted_event_id = ?2",
+            rusqlite::params![recorded_by, "ia1"],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(addr, "10.0.0.1:4434");
+        assert_eq!(ws, "workspace2");
+    }
+
+    #[test]
+    fn test_pending_invite_bootstrap_trust_upsert_updates_in_place() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+
+        let recorded_by = "aaaa";
+        let spki: [u8; 32] = [30u8; 32];
+
+        // First insert
+        record_pending_invite_bootstrap_trust(
+            &conn, recorded_by, "invite1", "workspace1", &spki,
+        ).unwrap();
+
+        // Second insert with same PK but different values
+        let spki2: [u8; 32] = [31u8; 32];
+        record_pending_invite_bootstrap_trust(
+            &conn, recorded_by, "invite1", "workspace2", &spki2,
+        ).unwrap();
+
+        // Should be exactly 1 row
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pending_invite_bootstrap_trust
+             WHERE recorded_by = ?1 AND invite_event_id = ?2",
+            rusqlite::params![recorded_by, "invite1"],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count, 1, "upsert should update in place, not create duplicate");
+
+        // Verify new values
+        let ws: String = conn.query_row(
+            "SELECT workspace_id FROM pending_invite_bootstrap_trust
+             WHERE recorded_by = ?1 AND invite_event_id = ?2",
+            rusqlite::params![recorded_by, "invite1"],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(ws, "workspace2");
+
+        // Verify new SPKI
+        let fp_blob: Vec<u8> = conn.query_row(
+            "SELECT expected_bootstrap_spki_fingerprint FROM pending_invite_bootstrap_trust
+             WHERE recorded_by = ?1 AND invite_event_id = ?2",
+            rusqlite::params![recorded_by, "invite1"],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(fp_blob, spki2.to_vec());
     }
 
     #[test]
