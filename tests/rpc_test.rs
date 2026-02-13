@@ -1,0 +1,414 @@
+//! RPC tests: protocol roundtrip, daemon+CLI integration, command regression.
+
+use std::path::PathBuf;
+use std::process::Command;
+
+fn bin_p7d() -> String {
+    env!("CARGO_BIN_EXE_p7d").to_string()
+}
+
+fn bin_p7ctl() -> String {
+    env!("CARGO_BIN_EXE_p7ctl").to_string()
+}
+
+fn bin_poc7() -> String {
+    env!("CARGO_BIN_EXE_poc-7").to_string()
+}
+
+fn temp_db() -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("test.db").to_str().unwrap().to_string();
+    (dir, db)
+}
+
+// ---------------------------------------------------------------------------
+// 1. RPC protocol unit tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rpc_request_encode_decode_roundtrip() {
+    use poc_7::rpc::protocol::*;
+
+    let req = RpcRequest {
+        version: PROTOCOL_VERSION,
+        method: RpcMethod::Status,
+    };
+    let frame = encode_frame(&req).unwrap();
+    let decoded: RpcRequest = decode_frame(&mut &frame[..]).unwrap();
+    assert_eq!(decoded.version, PROTOCOL_VERSION);
+    match decoded.method {
+        RpcMethod::Status => {}
+        other => panic!("expected Status, got {:?}", other),
+    }
+}
+
+#[test]
+fn rpc_request_send_roundtrip() {
+    use poc_7::rpc::protocol::*;
+
+    let req = RpcRequest {
+        version: PROTOCOL_VERSION,
+        method: RpcMethod::Send {
+            workspace: "abc123".into(),
+            content: "hello world".into(),
+        },
+    };
+    let frame = encode_frame(&req).unwrap();
+    let decoded: RpcRequest = decode_frame(&mut &frame[..]).unwrap();
+    match decoded.method {
+        RpcMethod::Send { workspace, content } => {
+            assert_eq!(workspace, "abc123");
+            assert_eq!(content, "hello world");
+        }
+        other => panic!("expected Send, got {:?}", other),
+    }
+}
+
+#[test]
+fn rpc_response_success_roundtrip() {
+    use poc_7::rpc::protocol::*;
+    use poc_7::service::StatusResponse;
+
+    let data = StatusResponse {
+        events_count: 42,
+        messages_count: 10,
+        reactions_count: 3,
+        recorded_events_count: 42,
+        neg_items_count: 42,
+    };
+    let resp = RpcResponse::success(data);
+    let frame = encode_frame(&resp).unwrap();
+    let decoded: RpcResponse = decode_frame(&mut &frame[..]).unwrap();
+    assert!(decoded.ok);
+    assert!(decoded.error.is_none());
+    let d = decoded.data.unwrap();
+    assert_eq!(d["events_count"], 42);
+    assert_eq!(d["messages_count"], 10);
+}
+
+#[test]
+fn rpc_response_error_roundtrip() {
+    use poc_7::rpc::protocol::*;
+
+    let resp = RpcResponse::error("something went wrong");
+    let frame = encode_frame(&resp).unwrap();
+    let decoded: RpcResponse = decode_frame(&mut &frame[..]).unwrap();
+    assert!(!decoded.ok);
+    assert_eq!(decoded.error.as_deref(), Some("something went wrong"));
+    assert!(decoded.data.is_none());
+}
+
+#[test]
+fn rpc_all_methods_serialize() {
+    use poc_7::rpc::protocol::*;
+
+    let methods = vec![
+        RpcMethod::Status,
+        RpcMethod::Messages { limit: 50 },
+        RpcMethod::Send {
+            workspace: "ws".into(),
+            content: "msg".into(),
+        },
+        RpcMethod::Generate {
+            count: 10,
+            workspace: "ws".into(),
+        },
+        RpcMethod::AssertNow {
+            predicate: "message_count == 0".into(),
+        },
+        RpcMethod::AssertEventually {
+            predicate: "message_count == 5".into(),
+            timeout_ms: 10000,
+            interval_ms: 200,
+        },
+        RpcMethod::TransportIdentity,
+        RpcMethod::React {
+            target: "abc".into(),
+            emoji: "thumbs_up".into(),
+        },
+        RpcMethod::DeleteMessage {
+            target: "def".into(),
+        },
+        RpcMethod::Reactions,
+        RpcMethod::Users,
+        RpcMethod::Keys { summary: true },
+        RpcMethod::Workspaces,
+        RpcMethod::IntroAttempts {
+            peer: Some("peer1".into()),
+        },
+    ];
+
+    for method in methods {
+        let req = RpcRequest {
+            version: PROTOCOL_VERSION,
+            method,
+        };
+        let frame = encode_frame(&req).unwrap();
+        let decoded: RpcRequest = decode_frame(&mut &frame[..]).unwrap();
+        assert_eq!(decoded.version, PROTOCOL_VERSION);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 2. Integration: daemon + p7ctl
+// ---------------------------------------------------------------------------
+
+#[test]
+fn daemon_and_ctl_status() {
+    let (_dir, db) = temp_db();
+    let socket = format!("{}.p7d.sock", &db);
+
+    // Bootstrap the DB so transport identity exists.
+    let out = Command::new(bin_poc7())
+        .args(["transport-identity", "--db", &db])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "transport-identity failed: {:?}", out);
+
+    // Start daemon in background.
+    let mut daemon = Command::new(bin_p7d())
+        .args(["--db", &db, "--socket", &socket])
+        .spawn()
+        .unwrap();
+
+    // Wait for socket to appear.
+    let socket_path = PathBuf::from(&socket);
+    let start = std::time::Instant::now();
+    while !socket_path.exists() && start.elapsed().as_secs() < 5 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(socket_path.exists(), "daemon socket did not appear");
+
+    // Query status via p7ctl.
+    let out = Command::new(bin_p7ctl())
+        .args(["--db", &db, "--socket", &socket, "status"])
+        .output()
+        .unwrap();
+
+    // Kill daemon.
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+
+    assert!(out.status.success(), "p7ctl status failed: {:?}", out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(parsed["ok"], true);
+    assert!(parsed["data"]["events_count"].is_number());
+}
+
+#[test]
+fn daemon_and_ctl_send_and_messages() {
+    let (_dir, db) = temp_db();
+    let socket = format!("{}.p7d.sock", &db);
+
+    // Bootstrap DB.
+    let out = Command::new(bin_poc7())
+        .args(["transport-identity", "--db", &db])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    // Start daemon.
+    let mut daemon = Command::new(bin_p7d())
+        .args(["--db", &db, "--socket", &socket])
+        .spawn()
+        .unwrap();
+
+    let socket_path = PathBuf::from(&socket);
+    let start = std::time::Instant::now();
+    while !socket_path.exists() && start.elapsed().as_secs() < 5 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    // Send a message via p7ctl.
+    let out = Command::new(bin_p7ctl())
+        .args([
+            "--db", &db,
+            "--socket", &socket,
+            "send", "hello from p7ctl",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(out.status.success(), "p7ctl send failed: {:?}", String::from_utf8_lossy(&out.stdout));
+    let send_resp: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert_eq!(send_resp["ok"], true);
+    assert_eq!(send_resp["data"]["content"], "hello from p7ctl");
+
+    // Query messages.
+    let out = Command::new(bin_p7ctl())
+        .args(["--db", &db, "--socket", &socket, "messages"])
+        .output()
+        .unwrap();
+
+    // Kill daemon.
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+
+    assert!(out.status.success());
+    let msgs_resp: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert_eq!(msgs_resp["ok"], true);
+    assert_eq!(msgs_resp["data"]["total"], 1);
+    assert_eq!(msgs_resp["data"]["messages"][0]["content"], "hello from p7ctl");
+}
+
+#[test]
+fn daemon_and_ctl_assert_now() {
+    let (_dir, db) = temp_db();
+    let socket = format!("{}.p7d.sock", &db);
+
+    // Bootstrap DB.
+    Command::new(bin_poc7())
+        .args(["transport-identity", "--db", &db])
+        .output()
+        .unwrap();
+
+    // Start daemon.
+    let mut daemon = Command::new(bin_p7d())
+        .args(["--db", &db, "--socket", &socket])
+        .spawn()
+        .unwrap();
+
+    let socket_path = PathBuf::from(&socket);
+    let start = std::time::Instant::now();
+    while !socket_path.exists() && start.elapsed().as_secs() < 5 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    // Assert message_count == 0 (should pass).
+    let out = Command::new(bin_p7ctl())
+        .args([
+            "--db", &db,
+            "--socket", &socket,
+            "assert-now", "message_count == 0",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(out.status.success(), "assert-now should pass");
+    let resp: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert_eq!(resp["data"]["pass"], true);
+
+    // Assert message_count == 99 (should fail with exit 1).
+    let out = Command::new(bin_p7ctl())
+        .args([
+            "--db", &db,
+            "--socket", &socket,
+            "assert-now", "message_count == 99",
+        ])
+        .output()
+        .unwrap();
+
+    // Kill daemon.
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+
+    assert_eq!(out.status.code(), Some(1), "assert-now should fail with exit 1");
+    let resp: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert_eq!(resp["data"]["pass"], false);
+}
+
+#[test]
+fn p7ctl_daemon_not_running_exit_code() {
+    let (_dir, db) = temp_db();
+    let socket = format!("{}.p7d.sock", &db);
+
+    // Try to connect without a daemon running.
+    let out = Command::new(bin_p7ctl())
+        .args(["--db", &db, "--socket", &socket, "status"])
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(2), "should exit 2 when daemon not running");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let resp: serde_json::Value = serde_json::from_str(&stderr).unwrap();
+    assert_eq!(resp["ok"], false);
+    assert!(resp["error"].as_str().unwrap().contains("daemon not running"));
+}
+
+// ---------------------------------------------------------------------------
+// 3. Regression: legacy CLI still works (service layer not used by main.rs)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn legacy_cli_send_and_status() {
+    let (_dir, db) = temp_db();
+
+    // Send a message via legacy CLI.
+    let out = Command::new(bin_poc7())
+        .args(["send", "legacy msg", "--db", &db])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "legacy send failed: {:?}", String::from_utf8_lossy(&out.stdout));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Sent: legacy msg"));
+
+    // Check status.
+    let out = Command::new(bin_poc7())
+        .args(["status", "--db", &db])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Messages:"));
+}
+
+#[test]
+fn legacy_cli_assert_now() {
+    let (_dir, db) = temp_db();
+
+    // Bootstrap with a send.
+    Command::new(bin_poc7())
+        .args(["send", "test", "--db", &db])
+        .output()
+        .unwrap();
+
+    // assert-now message_count == 1.
+    let out = Command::new(bin_poc7())
+        .args(["assert-now", "message_count == 1", "--db", &db])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "assert-now should pass");
+
+    // assert-now message_count == 0 (should fail).
+    let out = Command::new(bin_poc7())
+        .args(["assert-now", "message_count == 0", "--db", &db])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+}
+
+// ---------------------------------------------------------------------------
+// 4. Service function unit tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn service_socket_path_derivation() {
+    let path = poc_7::service::socket_path_for_db("server.db");
+    assert!(path.to_str().unwrap().ends_with("server.p7d.sock"));
+
+    let path = poc_7::service::socket_path_for_db("/tmp/mydb.db");
+    assert_eq!(path.to_str().unwrap(), "/tmp/mydb.p7d.sock");
+}
+
+#[test]
+fn service_predicate_parsing() {
+    use poc_7::service::parse_predicate;
+
+    let (field, op, val) = parse_predicate("message_count == 10").unwrap();
+    assert_eq!(field, "message_count");
+    assert_eq!(op.symbol(), "==");
+    assert_eq!(val, 10);
+
+    let (field, op, val) = parse_predicate("store_count >= 0").unwrap();
+    assert_eq!(field, "store_count");
+    assert_eq!(op.symbol(), ">=");
+    assert_eq!(val, 0);
+
+    assert!(parse_predicate("bad").is_err());
+    assert!(parse_predicate("x ?? 1").is_err());
+}

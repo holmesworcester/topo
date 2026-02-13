@@ -31,6 +31,18 @@ dirs-next = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+[[bin]]
+name = "poc-7"
+path = "src/main.rs"
+
+[[bin]]
+name = "p7d"
+path = "src/bin/p7d.rs"
+
+[[bin]]
+name = "p7ctl"
+path = "src/bin/p7ctl.rs"
+
 [dev-dependencies]
 
 # Crypto deps are orders of magnitude slower in debug mode; optimize them even in tests.
