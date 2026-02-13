@@ -17,7 +17,7 @@ use crate::events::{
     UserRemovedEvent, PeerRemovedEvent, SecretSharedEvent,
     TransportKeyEvent,
 };
-use crate::transport_identity::{transport_cert_paths_from_db, ensure_transport_peer_id_from_db};
+use crate::transport_identity::ensure_transport_peer_id;
 use crate::projection::create::{create_event_sync, create_signed_event_sync, create_encrypted_event_sync, event_id_or_blocked, CreateEventError};
 use crate::projection::pipeline::project_one;
 use crate::sync::SyncMessage;
@@ -29,7 +29,7 @@ use crate::transport::{
     create_dual_endpoint,
     create_server_endpoint,
     extract_spki_fingerprint,
-    load_or_generate_cert,
+    load_or_generate_cert_db,
     peer_identity_from_connection,
 };
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
@@ -96,7 +96,7 @@ impl Peer {
         let db = open_connection(&db_path).expect("failed to open db");
         create_tables(&db).expect("failed to create tables");
 
-        let identity = ensure_transport_peer_id_from_db(&db_path).expect("failed to compute identity");
+        let identity = ensure_transport_peer_id(&db).expect("failed to compute identity");
         let author_id: [u8; 32] = rand::random();
 
         Self {
@@ -329,8 +329,8 @@ impl Peer {
 
     /// Load (or generate) the transport certificate and private key for this peer.
     pub fn cert_and_key(&self) -> (CertificateDer<'static>, PrivatePkcs8KeyDer<'static>) {
-        let (cp, kp) = transport_cert_paths_from_db(&self.db_path);
-        load_or_generate_cert(&cp, &kp).expect("failed to load cert")
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        load_or_generate_cert_db(&db).expect("failed to load cert")
     }
 
     /// Extract the SPKI fingerprint (SHA-256) from this peer's transport certificate.
@@ -343,7 +343,8 @@ impl Peer {
     /// Requires identity chain (use new_with_identity).
     pub fn publish_transport_key(&self) -> EventId {
         let fp = self.spki_fingerprint();
-        self.create_transport_key(fp, self.signing_key(), &self.signer_eid())
+        let peer_shared_eid = self.peer_shared_event_id.expect("no identity chain");
+        self.create_transport_key(fp, &peer_shared_eid)
     }
 
     /// Create a message and insert it into all relevant tables.
@@ -733,18 +734,26 @@ impl Peer {
     pub fn create_transport_key(
         &self,
         spki_fingerprint: [u8; 32],
-        signing_key: &ed25519_dalek::SigningKey,
         peer_shared_event_id: &EventId,
     ) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
+        // Get PeerShared event's created_at_ms for deterministic timestamp
+        let peer_shared_b64 = crate::crypto::event_id_to_base64(peer_shared_event_id);
+        let peer_shared_ts: u64 = db.query_row(
+            "SELECT blob FROM events WHERE event_id = ?1",
+            rusqlite::params![&peer_shared_b64],
+            |row| row.get::<_, Vec<u8>>(0),
+        ).map(|blob| {
+            if blob.len() >= 9 {
+                u64::from_le_bytes(blob[1..9].try_into().unwrap_or([0u8; 8]))
+            } else { 0 }
+        }).unwrap_or(0);
         let evt = ParsedEvent::TransportKey(TransportKeyEvent {
-            created_at_ms: current_timestamp_ms(),
+            created_at_ms: peer_shared_ts,
             spki_fingerprint,
-            signed_by: *peer_shared_event_id,
-            signer_type: 5,
-            signature: [0u8; 64],
+            peer_shared_event_id: *peer_shared_event_id,
         });
-        create_signed_event_sync(&db, &self.identity, &evt, signing_key)
+        create_event_sync(&db, &self.identity, &evt)
             .expect("failed to create transport_key")
     }
 
@@ -1107,6 +1116,7 @@ fn replay_projection_impl(db: &rusqlite::Connection, recorded_by: &str, order: &
     db.execute("DELETE FROM trust_anchors WHERE peer_id = ?1", rusqlite::params![recorded_by]).ok();
     db.execute("DELETE FROM peer_transport_bindings WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
     db.execute("DELETE FROM transport_keys WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
+    db.execute("DELETE FROM local_tls_credentials WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
     db.execute("DELETE FROM valid_events WHERE peer_id = ?1", rusqlite::params![recorded_by])
         .expect("failed to clear valid_events");
     db.execute("DELETE FROM blocked_event_deps WHERE peer_id = ?1", rusqlite::params![recorded_by])
@@ -1450,8 +1460,8 @@ pub fn start_chain(peers: &[Peer]) -> Vec<std::thread::JoinHandle<()>> {
     // Extract fingerprints for all peers (needed before creating endpoints)
     let mut fingerprints: Vec<[u8; 32]> = Vec::new();
     for peer in peers {
-        let (cert_path, key_path) = transport_cert_paths_from_db(&peer.db_path);
-        let (cert, _) = load_or_generate_cert(&cert_path, &key_path)
+        let db = open_connection(&peer.db_path).expect("failed to open db");
+        let (cert, _) = load_or_generate_cert_db(&db)
             .expect("failed to load cert for fingerprint");
         let fp = extract_spki_fingerprint(cert.as_ref())
             .expect("failed to extract fingerprint");
@@ -1462,8 +1472,8 @@ pub fn start_chain(peers: &[Peer]) -> Vec<std::thread::JoinHandle<()>> {
     let mut server_addrs: Vec<SocketAddr> = Vec::new();
     let mut server_endpoints: Vec<quinn::Endpoint> = Vec::new();
     for i in 0..n-1 {
-        let (cert_path, key_path) = transport_cert_paths_from_db(&peers[i].db_path);
-        let (cert, key) = load_or_generate_cert(&cert_path, &key_path)
+        let db = open_connection(&peers[i].db_path).expect("failed to open db");
+        let (cert, key) = load_or_generate_cert_db(&db)
             .expect("failed to load cert for server");
         let allowed = Arc::new(AllowedPeers::from_fingerprints(vec![fingerprints[i+1]]));
         let endpoint = create_server_endpoint(
@@ -1478,8 +1488,8 @@ pub fn start_chain(peers: &[Peer]) -> Vec<std::thread::JoinHandle<()>> {
     // Create client endpoints for peers 1..n-1 (each connects to its left neighbor)
     let mut client_endpoints: Vec<quinn::Endpoint> = Vec::new();
     for i in 1..n {
-        let (cert_path, key_path) = transport_cert_paths_from_db(&peers[i].db_path);
-        let (cert, key) = load_or_generate_cert(&cert_path, &key_path)
+        let db = open_connection(&peers[i].db_path).expect("failed to open db");
+        let (cert, key) = load_or_generate_cert_db(&db)
             .expect("failed to load cert for client");
         let allowed = Arc::new(AllowedPeers::from_fingerprints(vec![fingerprints[i-1]]));
         let endpoint = create_client_endpoint(
@@ -1542,8 +1552,8 @@ pub fn start_multi_source(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Joi
     // Extract source fingerprints
     let mut source_fps: Vec<[u8; 32]> = Vec::new();
     for source in sources {
-        let (cert_path, key_path) = transport_cert_paths_from_db(&source.db_path);
-        let (cert, _) = load_or_generate_cert(&cert_path, &key_path)
+        let db = open_connection(&source.db_path).expect("failed to open db");
+        let (cert, _) = load_or_generate_cert_db(&db)
             .expect("failed to load source cert");
         let fp = extract_spki_fingerprint(cert.as_ref())
             .expect("failed to extract source fingerprint");
@@ -1551,8 +1561,8 @@ pub fn start_multi_source(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Joi
     }
 
     // Sink server endpoint allows all sources
-    let (sink_cert_path, sink_key_path) = transport_cert_paths_from_db(&sink.db_path);
-    let (sink_cert, sink_key) = load_or_generate_cert(&sink_cert_path, &sink_key_path)
+    let sink_db = open_connection(&sink.db_path).expect("failed to open db");
+    let (sink_cert, sink_key) = load_or_generate_cert_db(&sink_db)
         .expect("failed to load sink cert");
     let sink_fp = extract_spki_fingerprint(sink_cert.as_ref())
         .expect("failed to extract sink fingerprint");
@@ -1583,8 +1593,8 @@ pub fn start_multi_source(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Joi
 
     // Spawn connect_loop for each source
     for (i, source) in sources.iter().enumerate() {
-        let (cert_path, key_path) = transport_cert_paths_from_db(&source.db_path);
-        let (cert, key) = load_or_generate_cert(&cert_path, &key_path)
+        let db = open_connection(&source.db_path).expect("failed to open db");
+        let (cert, key) = load_or_generate_cert_db(&db)
             .expect("failed to load source cert");
         let allowed = Arc::new(AllowedPeers::from_fingerprints(vec![sink_fp]));
         let endpoint = create_client_endpoint(
@@ -1622,8 +1632,8 @@ pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Jo
     assert!(!sources.is_empty(), "need at least one source");
 
     // Extract sink fingerprint for sources to allow
-    let (sink_cert_path, sink_key_path) = transport_cert_paths_from_db(&sink.db_path);
-    let (sink_cert, sink_key) = load_or_generate_cert(&sink_cert_path, &sink_key_path)
+    let sink_db = open_connection(&sink.db_path).expect("failed to open db");
+    let (sink_cert, sink_key) = load_or_generate_cert_db(&sink_db)
         .expect("failed to load sink cert");
     let sink_fp = extract_spki_fingerprint(sink_cert.as_ref())
         .expect("failed to extract sink fingerprint");
@@ -1633,8 +1643,8 @@ pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Jo
 
     // Start accept_loop for each source
     for source in sources {
-        let (cert_path, key_path) = transport_cert_paths_from_db(&source.db_path);
-        let (cert, key) = load_or_generate_cert(&cert_path, &key_path)
+        let db = open_connection(&source.db_path).expect("failed to open db");
+        let (cert, key) = load_or_generate_cert_db(&db)
             .expect("failed to load source cert");
 
         let allowed = Arc::new(AllowedPeers::from_fingerprints(vec![sink_fp]));
@@ -1663,8 +1673,8 @@ pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Jo
     // Build per-source client endpoints for the sink
     let mut endpoint_pairs = Vec::new();
     for (i, source) in sources.iter().enumerate() {
-        let (cert_path, key_path) = transport_cert_paths_from_db(&source.db_path);
-        let (cert, _) = load_or_generate_cert(&cert_path, &key_path)
+        let source_db = open_connection(&source.db_path).expect("failed to open db");
+        let (cert, _) = load_or_generate_cert_db(&source_db)
             .expect("failed to load source cert");
         let source_fp = extract_spki_fingerprint(cert.as_ref())
             .expect("failed to extract source fingerprint");
@@ -1705,8 +1715,8 @@ pub async fn connect_sync_once(
     remote_addr: SocketAddr,
     remote_fp: [u8; 32],
 ) -> Result<crate::runtime::SyncStats, Box<dyn std::error::Error + Send + Sync>> {
-    let (cert_path, key_path) = transport_cert_paths_from_db(db_path);
-    let (cert, key) = load_or_generate_cert(&cert_path, &key_path)?;
+    let db = open_connection(db_path)?;
+    let (cert, key) = load_or_generate_cert_db(&db)?;
     let allowed = Arc::new(AllowedPeers::from_fingerprints(vec![remote_fp]));
     let endpoint = create_client_endpoint("0.0.0.0:0".parse().unwrap(), cert, key, allowed)?;
 
@@ -1740,8 +1750,8 @@ pub fn start_sink_accept(
     sink: &Peer,
     allowed_fps: Vec<[u8; 32]>,
 ) -> (std::thread::JoinHandle<()>, SocketAddr) {
-    let (cert_path, key_path) = transport_cert_paths_from_db(&sink.db_path);
-    let (cert, key) = load_or_generate_cert(&cert_path, &key_path)
+    let db = open_connection(&sink.db_path).expect("failed to open db");
+    let (cert, key) = load_or_generate_cert_db(&db)
         .expect("failed to load sink cert");
     let allowed = Arc::new(AllowedPeers::from_fingerprints(allowed_fps));
     let endpoint = create_server_endpoint(
@@ -1767,10 +1777,10 @@ pub fn start_sink_accept(
     (handle, addr)
 }
 
-/// Extract the SPKI fingerprint for a peer (from its cert file).
+/// Extract the SPKI fingerprint for a peer (from its SQLite credential store).
 pub fn peer_fingerprint(peer: &Peer) -> [u8; 32] {
-    let (cert_path, key_path) = transport_cert_paths_from_db(&peer.db_path);
-    let (cert, _) = load_or_generate_cert(&cert_path, &key_path)
+    let db = open_connection(&peer.db_path).expect("failed to open db");
+    let (cert, _) = load_or_generate_cert_db(&db)
         .expect("failed to load cert");
     extract_spki_fingerprint(cert.as_ref())
         .expect("failed to extract fingerprint")

@@ -6,8 +6,7 @@ use crate::events::*;
 use crate::projection::create::{
     create_event_sync, create_signed_event_sync, event_id_or_blocked, require_valid_event_id,
 };
-use crate::transport::extract_spki_fingerprint;
-use crate::transport_identity::transport_cert_paths_from_db;
+use crate::transport::{extract_spki_fingerprint, load_cert_from_db};
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -79,7 +78,6 @@ pub enum InviteType {
 pub fn bootstrap_workspace(
     conn: &Connection,
     recorded_by: &str,
-    db_path: &str,
 ) -> Result<IdentityChain, Box<dyn std::error::Error + Send + Sync>> {
     let mut rng = rand::thread_rng();
 
@@ -188,12 +186,10 @@ pub fn bootstrap_workspace(
         &workspace_key,
     ))?;
 
-    // 8. TransportKey (signed by peer_shared_key)
+    // 8. TransportKey (unsigned deterministic emitted event)
     let transport_key_event_id = create_transport_key_if_possible(
         conn,
         recorded_by,
-        db_path,
-        &peer_shared_key,
         &peer_shared_event_id,
     )?;
 
@@ -261,7 +257,6 @@ pub fn accept_user_invite(
     invite_key: &SigningKey,
     invite_event_id: &EventId,
     workspace_id: EventId,
-    db_path: &str,
 ) -> Result<JoinChain, Box<dyn std::error::Error + Send + Sync>> {
     let mut rng = rand::thread_rng();
 
@@ -324,12 +319,10 @@ pub fn accept_user_invite(
         &device_invite_key,
     ))?;
 
-    // 5. TransportKey (signed by peer_shared_key)
+    // 5. TransportKey (unsigned deterministic emitted event)
     let transport_key_event_id = create_transport_key_if_possible(
         conn,
         recorded_by,
-        db_path,
-        &peer_shared_key,
         &peer_shared_event_id,
     )?;
 
@@ -385,7 +378,6 @@ pub fn accept_device_link(
     device_invite_key: &SigningKey,
     device_invite_event_id: &EventId,
     workspace_id: EventId,
-    db_path: &str,
 ) -> Result<LinkChain, Box<dyn std::error::Error + Send + Sync>> {
     let mut rng = rand::thread_rng();
 
@@ -414,12 +406,10 @@ pub fn accept_device_link(
         device_invite_key,
     ))?;
 
-    // 3. TransportKey (signed by peer_shared_key)
+    // 3. TransportKey (unsigned deterministic emitted event)
     let transport_key_event_id = create_transport_key_if_possible(
         conn,
         recorded_by,
-        db_path,
-        &peer_shared_key,
         &peer_shared_event_id,
     )?;
 
@@ -431,30 +421,39 @@ pub fn accept_device_link(
     })
 }
 
-/// Try to create a TransportKey event binding the local TLS cert to the peer_shared identity.
+/// Try to create a deterministic unsigned TransportKey event binding the local
+/// TLS cert to the peer_shared identity.
 fn create_transport_key_if_possible(
     conn: &Connection,
     recorded_by: &str,
-    db_path: &str,
-    peer_shared_key: &SigningKey,
     peer_shared_event_id: &EventId,
 ) -> Result<Option<EventId>, Box<dyn std::error::Error + Send + Sync>> {
-    let (cert_path, _key_path) = transport_cert_paths_from_db(db_path);
-    if !cert_path.exists() {
-        return Ok(None);
-    }
+    let (cert_der, _) = match load_cert_from_db(conn)? {
+        Some(pair) => pair,
+        None => return Ok(None),
+    };
 
-    let cert_bytes = std::fs::read(&cert_path)?;
-    let spki_fp = extract_spki_fingerprint(&cert_bytes)?;
+    let spki_fp = extract_spki_fingerprint(cert_der.as_ref())?;
+
+    // Get PeerShared event's created_at_ms for deterministic timestamp
+    let peer_shared_b64 = crate::crypto::event_id_to_base64(peer_shared_event_id);
+    let peer_shared_ts: u64 = match conn.query_row(
+        "SELECT blob FROM events WHERE event_id = ?1",
+        rusqlite::params![&peer_shared_b64],
+        |row| row.get::<_, Vec<u8>>(0),
+    ) {
+        Ok(blob) if blob.len() >= 9 => {
+            u64::from_le_bytes(blob[1..9].try_into().unwrap_or([0u8; 8]))
+        }
+        _ => 0,
+    };
 
     let evt = ParsedEvent::TransportKey(TransportKeyEvent {
-        created_at_ms: now_ms(),
+        created_at_ms: peer_shared_ts,
         spki_fingerprint: spki_fp,
-        signed_by: *peer_shared_event_id,
-        signer_type: 5,
-        signature: [0u8; 64],
+        peer_shared_event_id: *peer_shared_event_id,
     });
 
-    let event_id = create_signed_event_sync(conn, recorded_by, &evt, peer_shared_key)?;
+    let event_id = create_event_sync(conn, recorded_by, &evt)?;
     Ok(Some(event_id))
 }

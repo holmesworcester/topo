@@ -503,6 +503,37 @@ static MIGRATIONS: &[Migration] = &[
             );
         ",
     },
+    Migration {
+        version: 26,
+        name: "add_local_transport_credentials",
+        sql: "
+            CREATE TABLE IF NOT EXISTS local_transport_credentials (
+                id INTEGER PRIMARY KEY,
+                cert_der BLOB NOT NULL,
+                key_der BLOB NOT NULL,
+                spki_fingerprint BLOB NOT NULL UNIQUE,
+                created_at INTEGER NOT NULL
+            );
+        ",
+    },
+    Migration {
+        version: 27,
+        name: "add_local_tls_credentials",
+        sql: "
+            CREATE TABLE IF NOT EXISTS local_tls_credentials (
+                recorded_by TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                cert_der BLOB NOT NULL,
+                key_der BLOB NOT NULL,
+                spki_fingerprint TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                is_active INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (recorded_by, event_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_local_tls_active
+                ON local_tls_credentials(recorded_by, is_active, created_at DESC);
+        ",
+    },
 ];
 
 fn ensure_schema_migrations(conn: &Connection) -> SqliteResult<()> {
@@ -716,6 +747,6 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(max_version, 25);
+        assert_eq!(max_version, 27);
     }
 }

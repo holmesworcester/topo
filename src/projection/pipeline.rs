@@ -3,8 +3,9 @@ use rusqlite::Connection;
 use super::decision::ProjectionDecision;
 use super::encrypted::project_encrypted;
 use super::projectors::{
-    project_file_slice, project_message, project_message_attachment, project_message_deletion,
-    project_reaction, project_secret_key, project_signed_memo,
+    project_file_slice, project_local_tls_credential, project_message,
+    project_message_attachment, project_message_deletion, project_reaction, project_secret_key,
+    project_signed_memo,
 };
 use super::signer::{resolve_signer_key, verify_ed25519_signature, SignerResolution};
 use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
@@ -134,6 +135,9 @@ fn apply_projection(
         }
         ParsedEvent::BenchDep(_) => {
             // No projection table — valid_events tracks completion
+        }
+        ParsedEvent::LocalTlsCredential(cred) => {
+            project_local_tls_credential(conn, recorded_by, event_id_b64, cred)?;
         }
         // Identity events: dispatch to identity projectors
         ParsedEvent::Workspace(_)

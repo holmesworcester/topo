@@ -4,6 +4,7 @@ pub mod device_invite;
 pub mod encrypted;
 pub mod file_slice;
 pub mod invite_accepted;
+pub mod local_tls_credential;
 pub mod message;
 pub mod message_deletion;
 pub mod workspace;
@@ -41,6 +42,7 @@ pub use secret_shared::SecretSharedEvent;
 pub use signed_memo::SignedMemoEvent;
 pub use user::{UserBootEvent, UserOngoingEvent};
 pub use user_invite::{UserInviteBootEvent, UserInviteOngoingEvent};
+pub use local_tls_credential::LocalTlsCredentialEvent;
 pub use transport_key::TransportKeyEvent;
 pub use user_removed::UserRemovedEvent;
 
@@ -69,6 +71,7 @@ pub const EVENT_TYPE_TRANSPORT_KEY: u8 = 23;
 pub const EVENT_TYPE_MESSAGE_ATTACHMENT: u8 = 24;
 pub const EVENT_TYPE_FILE_SLICE: u8 = 25;
 pub const EVENT_TYPE_BENCH_DEP: u8 = 26;
+pub const EVENT_TYPE_LOCAL_TLS_CREDENTIAL: u8 = 27;
 
 /// Max event blob size: 1 MiB
 pub const EVENT_MAX_BLOB_BYTES: usize = 1024 * 1024;
@@ -100,6 +103,7 @@ pub enum ParsedEvent {
     MessageAttachment(MessageAttachmentEvent),
     FileSlice(FileSliceEvent),
     BenchDep(BenchDepEvent),
+    LocalTlsCredential(LocalTlsCredentialEvent),
 }
 
 impl ParsedEvent {
@@ -130,6 +134,7 @@ impl ParsedEvent {
             ParsedEvent::MessageAttachment(a) => a.created_at_ms,
             ParsedEvent::FileSlice(f) => f.created_at_ms,
             ParsedEvent::BenchDep(b) => b.created_at_ms,
+            ParsedEvent::LocalTlsCredential(c) => c.created_at_ms,
         }
     }
 
@@ -178,7 +183,7 @@ impl ParsedEvent {
                 ("recipient_event_id", s.recipient_event_id),
                 ("signed_by", s.signed_by),
             ],
-            ParsedEvent::TransportKey(t) => vec![("signed_by", t.signed_by)],
+            ParsedEvent::TransportKey(t) => vec![("peer_shared_event_id", t.peer_shared_event_id)],
             ParsedEvent::MessageAttachment(a) => vec![
                 ("message_id", a.message_id),
                 ("key_event_id", a.key_event_id),
@@ -186,6 +191,7 @@ impl ParsedEvent {
             ],
             ParsedEvent::FileSlice(f) => vec![("signed_by", f.signed_by)],
             ParsedEvent::BenchDep(b) => b.dep_ids.iter().map(|id| ("dep_id", *id)).collect(),
+            ParsedEvent::LocalTlsCredential(_) => vec![],
         }
     }
 
@@ -216,6 +222,7 @@ impl ParsedEvent {
             ParsedEvent::MessageAttachment(_) => EVENT_TYPE_MESSAGE_ATTACHMENT,
             ParsedEvent::FileSlice(_) => EVENT_TYPE_FILE_SLICE,
             ParsedEvent::BenchDep(_) => EVENT_TYPE_BENCH_DEP,
+            ParsedEvent::LocalTlsCredential(_) => EVENT_TYPE_LOCAL_TLS_CREDENTIAL,
         }
     }
 
@@ -237,7 +244,6 @@ impl ParsedEvent {
             ParsedEvent::UserRemoved(r) => Some((r.signed_by, r.signer_type)),
             ParsedEvent::PeerRemoved(r) => Some((r.signed_by, r.signer_type)),
             ParsedEvent::SecretShared(s) => Some((s.signed_by, s.signer_type)),
-            ParsedEvent::TransportKey(t) => Some((t.signed_by, t.signer_type)),
             ParsedEvent::FileSlice(f) => Some((f.signed_by, f.signer_type)),
             ParsedEvent::Message(m) => Some((m.signed_by, m.signer_type)),
             ParsedEvent::Reaction(r) => Some((r.signed_by, r.signer_type)),
@@ -247,7 +253,9 @@ impl ParsedEvent {
             | ParsedEvent::SecretKey(_)
             | ParsedEvent::Workspace(_)
             | ParsedEvent::InviteAccepted(_)
-            | ParsedEvent::BenchDep(_) => None,
+            | ParsedEvent::TransportKey(_)
+            | ParsedEvent::BenchDep(_)
+            | ParsedEvent::LocalTlsCredential(_) => None,
         }
     }
 }
@@ -325,6 +333,7 @@ pub fn registry() -> &'static EventRegistry {
             &message_attachment::MESSAGE_ATTACHMENT_META,
             &file_slice::FILE_SLICE_META,
             &bench_dep::BENCH_DEP_META,
+            &local_tls_credential::LOCAL_TLS_CREDENTIAL_META,
         ])
     })
 }
@@ -667,13 +676,11 @@ mod tests {
         let e = TransportKeyEvent {
             created_at_ms: 1400,
             spki_fingerprint: [59u8; 32],
-            signed_by: [60u8; 32],
-            signer_type: 5,
-            signature: [61u8; 64],
+            peer_shared_event_id: [60u8; 32],
         };
         let event = ParsedEvent::TransportKey(e);
         let blob = encode_event(&event).unwrap();
-        assert_eq!(blob.len(), 138);
+        assert_eq!(blob.len(), 73);
         let parsed = parse_event(&blob).unwrap();
         assert_eq!(parsed, event);
     }

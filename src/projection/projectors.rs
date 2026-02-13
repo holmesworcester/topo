@@ -3,8 +3,8 @@ use rusqlite::Connection;
 use super::decision::ProjectionDecision;
 use crate::crypto::event_id_to_base64;
 use crate::events::{
-    FileSliceEvent, MessageAttachmentEvent, MessageDeletionEvent, MessageEvent,
-    ReactionEvent, SecretKeyEvent, SignedMemoEvent,
+    FileSliceEvent, LocalTlsCredentialEvent, MessageAttachmentEvent, MessageDeletionEvent,
+    MessageEvent, ReactionEvent, SecretKeyEvent, SignedMemoEvent,
 };
 
 /// Project a Message event into the messages table. Returns Ok(true) if written.
@@ -353,4 +353,51 @@ pub fn project_file_slice(
             ),
         })
     }
+}
+
+/// Project a LocalTlsCredential event into the local_tls_credentials table.
+/// Implements latest-wins rotation: the credential with the highest created_at
+/// becomes is_active=1, all others become is_active=0.
+/// Returns Ok(false) if the cert DER is invalid (cannot compute SPKI fingerprint).
+pub fn project_local_tls_credential(
+    conn: &Connection,
+    recorded_by: &str,
+    event_id_b64: &str,
+    cred: &LocalTlsCredentialEvent,
+) -> Result<bool, rusqlite::Error> {
+    // Compute SPKI fingerprint — skip projection if cert is invalid
+    let spki_hex = match crate::transport::extract_spki_fingerprint(&cred.cert_der) {
+        Ok(fp) => hex::encode(fp),
+        Err(_) => return Ok(false),
+    };
+
+    let rows = conn.execute(
+        "INSERT OR IGNORE INTO local_tls_credentials (recorded_by, event_id, cert_der, key_der, spki_fingerprint, created_at, is_active)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
+        rusqlite::params![
+            recorded_by,
+            event_id_b64,
+            &cred.cert_der,
+            &cred.key_der,
+            &spki_hex,
+            cred.created_at_ms as i64,
+        ],
+    )?;
+
+    if rows > 0 {
+        // Deactivate all credentials for this peer
+        conn.execute(
+            "UPDATE local_tls_credentials SET is_active = 0 WHERE recorded_by = ?1",
+            rusqlite::params![recorded_by],
+        )?;
+        // Activate the one with the highest created_at (latest-wins)
+        conn.execute(
+            "UPDATE local_tls_credentials SET is_active = 1
+             WHERE recorded_by = ?1
+               AND created_at = (SELECT MAX(created_at) FROM local_tls_credentials WHERE recorded_by = ?1)",
+            rusqlite::params![recorded_by],
+        )?;
+    }
+
+    Ok(rows > 0)
 }

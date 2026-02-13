@@ -174,6 +174,72 @@ pub fn extract_spki_fingerprint(
     Ok(fingerprint)
 }
 
+/// Store cert and private key in SQLite `local_transport_credentials`.
+/// Returns the SPKI fingerprint. Skips insert if fingerprint already exists.
+pub fn store_cert_in_db(
+    conn: &rusqlite::Connection,
+    cert_der: &CertificateDer<'_>,
+    key_der: &PrivatePkcs8KeyDer<'_>,
+) -> Result<[u8; 32], Box<dyn std::error::Error + Send + Sync>> {
+    validate_cert_key_match(cert_der, key_der)?;
+    let fp = extract_spki_fingerprint(cert_der.as_ref())?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    conn.execute(
+        "INSERT OR IGNORE INTO local_transport_credentials (cert_der, key_der, spki_fingerprint, created_at)
+         VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![cert_der.as_ref(), key_der.secret_pkcs8_der(), fp.as_slice(), now_ms],
+    )?;
+    Ok(fp)
+}
+
+/// Load the most recent cert and private key from SQLite `local_transport_credentials`.
+/// Returns None if no credential exists.
+pub fn load_cert_from_db(
+    conn: &rusqlite::Connection,
+) -> Result<Option<(CertificateDer<'static>, PrivatePkcs8KeyDer<'static>)>, Box<dyn std::error::Error + Send + Sync>> {
+    let result: Result<(Vec<u8>, Vec<u8>), _> = conn.query_row(
+        "SELECT cert_der, key_der FROM local_transport_credentials ORDER BY created_at DESC LIMIT 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    );
+    match result {
+        Ok((cert_bytes, key_bytes)) => {
+            let cert_der = CertificateDer::from(cert_bytes);
+            let key_der = PrivatePkcs8KeyDer::from(key_bytes);
+            validate_cert_key_match(&cert_der, &key_der)?;
+            Ok(Some((cert_der, key_der)))
+        }
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Load cert/key from SQLite, or generate a new one and store it.
+/// This is the SQLite-backed replacement for the file-based `load_or_generate_cert`.
+pub fn load_or_generate_cert_db(
+    conn: &rusqlite::Connection,
+) -> Result<(CertificateDer<'static>, PrivatePkcs8KeyDer<'static>), Box<dyn std::error::Error + Send + Sync>> {
+    if let Some((cert, key)) = load_cert_from_db(conn)? {
+        return Ok((cert, key));
+    }
+    let (cert_der, key_der) = generate_self_signed_cert()?;
+    store_cert_in_db(conn, &cert_der, &key_der)?;
+    Ok((cert_der, key_der))
+}
+
+/// Store a deterministic cert/key (from invite signing key) in SQLite.
+/// Replaces `install_invite_bootstrap_transport_identity` file-based path.
+pub fn store_invite_bootstrap_cert_in_db(
+    conn: &rusqlite::Connection,
+    invite_key: &SigningKey,
+) -> Result<[u8; 32], Box<dyn std::error::Error + Send + Sync>> {
+    let (cert_der, key_der) = generate_self_signed_cert_from_signing_key(invite_key)?;
+    store_cert_in_db(conn, &cert_der, &key_der)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
