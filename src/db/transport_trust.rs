@@ -1,5 +1,6 @@
 use rusqlite::Connection;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::info;
 
 use crate::transport::AllowedPeers;
 
@@ -9,6 +10,15 @@ const PENDING_INVITE_BOOTSTRAP_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 /// Accepted bootstrap trust is also temporary until steady-state transport key
 /// trust converges for that same SPKI.
 const ACCEPTED_INVITE_BOOTSTRAP_TTL_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// Workspace sentinel for CLI-pin-imported bootstrap trust rows.
+const CLI_PIN_WORKSPACE: &str = "cli-bootstrap";
+
+/// Build the deterministic `invite_event_id` for a CLI-pin import.
+/// Uses the full 32-byte hex fingerprint so distinct pins never collide.
+fn cli_pin_invite_event_id(spki_fingerprint: &[u8; 32]) -> String {
+    format!("cli-pin-{}", hex::encode(spki_fingerprint))
+}
 
 fn now_ms_i64() -> i64 {
     SystemTime::now()
@@ -130,6 +140,38 @@ pub fn record_pending_invite_bootstrap_trust(
     Ok(())
 }
 
+/// Import CLI pin hex strings as `pending_invite_bootstrap_trust` rows.
+///
+/// Each pin is stored with a deterministic `invite_event_id` (via
+/// `cli_pin_invite_event_id`) and `workspace_id = CLI_PIN_WORKSPACE`.
+/// Reuses the existing table and 24h TTL.
+/// Existing supersede logic auto-marks these stale when `transport_keys` arrive.
+///
+/// This is idempotent: re-importing the same pins refreshes their expiry.
+pub fn import_cli_pins_to_sql(
+    conn: &Connection,
+    recorded_by: &str,
+    cli_pins: &AllowedPeers,
+) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    let fps = cli_pins.fingerprints();
+    let mut imported = 0;
+    for fp in &fps {
+        let invite_event_id = cli_pin_invite_event_id(fp);
+        record_pending_invite_bootstrap_trust(
+            conn,
+            recorded_by,
+            &invite_event_id,
+            CLI_PIN_WORKSPACE,
+            fp,
+        )?;
+        imported += 1;
+    }
+    if imported > 0 {
+        info!("Imported {} CLI pin(s) to SQL trust rows", imported);
+    }
+    Ok(imported)
+}
+
 /// When steady-state transport_keys are available for an SPKI, pending invite
 /// bootstrap trust for that same SPKI is no longer authoritative.
 fn supersede_pending_bootstrap_if_steady_trust_exists(
@@ -210,18 +252,12 @@ pub fn allowed_peers_from_db(
     Ok(AllowedPeers::from_fingerprints(fps))
 }
 
-/// Check a single peer fingerprint against SQL trust sources plus optional
-/// CLI fallback pins.
+/// Check a single peer fingerprint against SQL trust sources.
 pub fn is_peer_allowed(
     conn: &Connection,
     recorded_by: &str,
     spki_fingerprint: &[u8; 32],
-    cli_pins: &AllowedPeers,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    if cli_pins.contains(spki_fingerprint) {
-        return Ok(true);
-    }
-
     supersede_pending_bootstrap_if_steady_trust_exists(conn, recorded_by)?;
     supersede_accepted_bootstrap_if_steady_trust_exists(conn, recorded_by)?;
     let now = now_ms_i64();
@@ -339,7 +375,6 @@ pub fn allowed_peers_combined(
     let db_peers = allowed_peers_from_db(conn, recorded_by)?;
     Ok(cli_pins.union(&db_peers))
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -544,63 +579,11 @@ mod tests {
     }
 
     #[test]
-    fn test_allowed_peers_combined() {
-        let conn = open_in_memory().unwrap();
-        create_tables(&conn).unwrap();
-
-        let recorded_by = "aaaa";
-        let spki_db: [u8; 32] = [42u8; 32];
-        let spki_cli: [u8; 32] = [99u8; 32];
-        let spki_bootstrap: [u8; 32] = [88u8; 32];
-        let spki_pending: [u8; 32] = [66u8; 32];
-        let spki_binding: [u8; 32] = [77u8; 32];
-
-        // transport_keys row should appear
-        conn.execute(
-            "INSERT INTO transport_keys (recorded_by, event_id, spki_fingerprint) VALUES (?1, ?2, ?3)",
-            rusqlite::params![recorded_by, "evt1", spki_db.as_slice()],
-        ).unwrap();
-
-        // binding-only row should NOT appear
-        record_transport_binding(&conn, recorded_by, "remote", &spki_binding).unwrap();
-
-        // accepted-invite bootstrap trust should appear
-        record_invite_bootstrap_trust(
-            &conn,
-            recorded_by,
-            "ia2",
-            "invite2",
-            "workspace2",
-            "127.0.0.1:4434",
-            &spki_bootstrap,
-        )
-        .unwrap();
-        record_pending_invite_bootstrap_trust(
-            &conn,
-            recorded_by,
-            "invite3",
-            "workspace3",
-            &spki_pending,
-        )
-        .unwrap();
-
-        let cli_pins = AllowedPeers::from_fingerprints(vec![spki_cli]);
-        let combined = allowed_peers_combined(&conn, recorded_by, &cli_pins).unwrap();
-
-        assert!(combined.contains(&spki_db));
-        assert!(combined.contains(&spki_bootstrap));
-        assert!(combined.contains(&spki_pending));
-        assert!(combined.contains(&spki_cli));
-        assert!(!combined.contains(&spki_binding));
-    }
-
-    #[test]
     fn test_is_peer_allowed_checks_all_sources() {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
 
         let recorded_by = "aaaa";
-        let cli_only: [u8; 32] = [1u8; 32];
         let db_only: [u8; 32] = [2u8; 32];
         let pending_only: [u8; 32] = [3u8; 32];
         let denied: [u8; 32] = [4u8; 32];
@@ -619,11 +602,116 @@ mod tests {
         )
         .unwrap();
 
-        let cli = AllowedPeers::from_fingerprints(vec![cli_only]);
-        assert!(is_peer_allowed(&conn, recorded_by, &cli_only, &cli).unwrap());
-        assert!(is_peer_allowed(&conn, recorded_by, &db_only, &cli).unwrap());
-        assert!(is_peer_allowed(&conn, recorded_by, &pending_only, &cli).unwrap());
-        assert!(!is_peer_allowed(&conn, recorded_by, &denied, &cli).unwrap());
+        assert!(is_peer_allowed(&conn, recorded_by, &db_only).unwrap());
+        assert!(is_peer_allowed(&conn, recorded_by, &pending_only).unwrap());
+        assert!(!is_peer_allowed(&conn, recorded_by, &denied).unwrap());
+    }
+
+    #[test]
+    fn test_import_cli_pins_to_sql() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+
+        let recorded_by = "aaaa";
+        let pin1: [u8; 32] = [0xAA; 32];
+        let pin2: [u8; 32] = [0xBB; 32];
+        let not_pinned: [u8; 32] = [0xCC; 32];
+
+        let cli_pins = AllowedPeers::from_fingerprints(vec![pin1, pin2]);
+        let imported = import_cli_pins_to_sql(&conn, recorded_by, &cli_pins).unwrap();
+        assert_eq!(imported, 2);
+
+        // Both should be visible via allowed_peers_from_db
+        let allowed = allowed_peers_from_db(&conn, recorded_by).unwrap();
+        assert!(allowed.contains(&pin1));
+        assert!(allowed.contains(&pin2));
+        assert!(!allowed.contains(&not_pinned));
+
+        // And via is_peer_allowed
+        assert!(is_peer_allowed(&conn, recorded_by, &pin1).unwrap());
+        assert!(is_peer_allowed(&conn, recorded_by, &pin2).unwrap());
+        assert!(!is_peer_allowed(&conn, recorded_by, &not_pinned).unwrap());
+    }
+
+    #[test]
+    fn test_cli_pin_superseded_by_transport_key() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+
+        let recorded_by = "aaaa";
+        let pin_fp: [u8; 32] = [0xDD; 32];
+
+        // Import a CLI pin
+        let cli_pins = AllowedPeers::from_fingerprints(vec![pin_fp]);
+        import_cli_pins_to_sql(&conn, recorded_by, &cli_pins).unwrap();
+
+        // Verify it's trusted
+        assert!(is_peer_allowed(&conn, recorded_by, &pin_fp).unwrap());
+
+        // Simulate arrival of a transport_key for the same SPKI
+        conn.execute(
+            "INSERT INTO transport_keys (recorded_by, event_id, spki_fingerprint) VALUES (?1, ?2, ?3)",
+            rusqlite::params![recorded_by, "tk-steady", pin_fp.as_slice()],
+        ).unwrap();
+
+        // Still trusted (via transport_keys now)
+        assert!(is_peer_allowed(&conn, recorded_by, &pin_fp).unwrap());
+
+        // The pending_invite_bootstrap_trust row should be superseded
+        let allowed = allowed_peers_from_db(&conn, recorded_by).unwrap();
+        assert!(allowed.contains(&pin_fp));
+
+        let invite_event_id = cli_pin_invite_event_id(&pin_fp);
+        let superseded_at: Option<i64> = conn
+            .query_row(
+                "SELECT superseded_at FROM pending_invite_bootstrap_trust
+                  WHERE recorded_by = ?1 AND invite_event_id = ?2",
+                rusqlite::params![recorded_by, &invite_event_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(superseded_at.is_some(), "CLI pin should be superseded by transport_key");
+    }
+
+    #[test]
+    fn test_cli_pin_not_silently_trusted_without_import() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+
+        let recorded_by = "aaaa";
+        let raw_fp: [u8; 32] = [0xEE; 32];
+
+        // Without importing, a raw fingerprint should NOT be trusted
+        assert!(!is_peer_allowed(&conn, recorded_by, &raw_fp).unwrap());
+        let allowed = allowed_peers_from_db(&conn, recorded_by).unwrap();
+        assert!(!allowed.contains(&raw_fp));
+    }
+
+    #[test]
+    fn test_cli_pin_import_no_collision_on_shared_prefix() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+
+        let recorded_by = "aaaa";
+        // Two fingerprints that share the same first 8 bytes but differ after
+        let mut fp_a: [u8; 32] = [0xAB; 32];
+        let mut fp_b: [u8; 32] = [0xAB; 32];
+        fp_a[8] = 0x01;
+        fp_b[8] = 0x02;
+
+        let pins = AllowedPeers::from_fingerprints(vec![fp_a, fp_b]);
+        let count = import_cli_pins_to_sql(&conn, recorded_by, &pins).unwrap();
+        assert_eq!(count, 2);
+
+        // Both must remain trusted — no silent overwrite
+        assert!(is_peer_allowed(&conn, recorded_by, &fp_a).unwrap(),
+            "fp_a should be trusted after import");
+        assert!(is_peer_allowed(&conn, recorded_by, &fp_b).unwrap(),
+            "fp_b should be trusted after import");
+
+        let allowed = allowed_peers_from_db(&conn, recorded_by).unwrap();
+        assert!(allowed.contains(&fp_a), "fp_a should be in allowed set");
+        assert!(allowed.contains(&fp_b), "fp_b should be in allowed set");
     }
 
     #[test]

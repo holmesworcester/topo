@@ -14,7 +14,7 @@ use crate::db::{
 };
 use crate::sync::{SyncMessage, parse_sync_message};
 use crate::sync::engine::run_sync_initiator_dual;
-use crate::transport::{AllowedPeers, DualConnection, peer_identity_from_connection};
+use crate::transport::{DualConnection, peer_identity_from_connection};
 
 const ENDPOINT_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 
@@ -55,7 +55,6 @@ pub async fn handle_intro_offer(
     recorded_by: &str,
     introduced_by: &str,
     endpoint: quinn::Endpoint,
-    allowed_peers: &AllowedPeers,
     intro_id: [u8; 16],
     other_peer_id: [u8; 32],
     origin_family: u8,
@@ -83,10 +82,10 @@ pub async fn handle_intro_offer(
         return;
     }
 
-    // Validate trust from SQL plus optional CLI fallback pins.
+    // Validate trust from SQL only. No DB = no trust authority.
     let trusted = match open_connection(db_path) {
-        Ok(db) => is_peer_allowed(&db, recorded_by, &other_peer_id, allowed_peers).unwrap_or(false),
-        Err(_) => allowed_peers.contains(&other_peer_id),
+        Ok(db) => is_peer_allowed(&db, recorded_by, &other_peer_id).unwrap_or(false),
+        Err(_) => false,
     };
     if !trusted {
         info!("IntroOffer for untrusted peer {}, rejecting", &other_peer_hex[..16]);
@@ -260,7 +259,6 @@ pub fn spawn_intro_listener(
     recorded_by: String,
     introduced_by: String,
     endpoint: quinn::Endpoint,
-    allowed_peers: AllowedPeers,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_local(async move {
         loop {
@@ -290,7 +288,6 @@ pub fn spawn_intro_listener(
                     let recorded_by = recorded_by.clone();
                     let introduced_by = introduced_by.clone();
                     let endpoint = endpoint.clone();
-                    let allowed = allowed_peers.clone();
 
                     // Spawn punch attempt as a local task — runs on the same
                     // LocalSet / runtime that owns the endpoint I/O driver,
@@ -298,7 +295,7 @@ pub fn spawn_intro_listener(
                     tokio::task::spawn_local(async move {
                         handle_intro_offer(
                             &db_path, &recorded_by, &introduced_by, endpoint,
-                            &allowed, intro_id, other_peer_id, origin_family,
+                            intro_id, other_peer_id, origin_family,
                             origin_ip, origin_port, observed_at_ms, expires_at_ms,
                             attempt_window_ms,
                         ).await;

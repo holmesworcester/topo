@@ -68,6 +68,11 @@ impl AllowedPeers {
     pub fn is_empty(&self) -> bool {
         self.fingerprints.is_empty()
     }
+
+    /// Return a copy of all fingerprints as a Vec.
+    pub fn fingerprints(&self) -> Vec<[u8; 32]> {
+        self.fingerprints.iter().copied().collect()
+    }
 }
 
 pub type DynamicAllowFn =

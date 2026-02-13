@@ -1046,7 +1046,6 @@ pub async fn accept_loop(
     db_path: &str,
     recorded_by: &str,
     endpoint: quinn::Endpoint,
-    allowed_peers: Option<crate::transport::AllowedPeers>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     {
         let db = open_connection(db_path)?;
@@ -1147,7 +1146,6 @@ pub async fn accept_loop(
         let db_path_owned = db_path.to_string();
         let recorded_by_owned = recorded_by.to_string();
         let ingest_clone = shared_ingest_tx.clone();
-        let intro_allowed = allowed_peers.clone();
         let intro_endpoint = endpoint.clone();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -1157,16 +1155,13 @@ pub async fn accept_loop(
             let local = tokio::task::LocalSet::new();
             rt.block_on(local.run_until(async move {
                 // Spawn intro listener for uni-streams on this connection
-                if let Some(ap) = intro_allowed {
-                    crate::sync::punch::spawn_intro_listener(
-                        connection.clone(),
-                        db_path_owned.clone(),
-                        recorded_by_owned.clone(),
-                        peer_id.clone(),
-                        intro_endpoint,
-                        ap,
-                    );
-                }
+                crate::sync::punch::spawn_intro_listener(
+                    connection.clone(),
+                    db_path_owned.clone(),
+                    recorded_by_owned.clone(),
+                    peer_id.clone(),
+                    intro_endpoint,
+                );
 
                 loop {
                     let (ctrl_send, ctrl_recv) = match connection.accept_bi().await {
@@ -1208,7 +1203,6 @@ pub async fn connect_loop(
     recorded_by: &str,
     endpoint: quinn::Endpoint,
     remote: SocketAddr,
-    allowed_peers: Option<crate::transport::AllowedPeers>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     {
         let db = open_connection(db_path)?;
@@ -1239,7 +1233,7 @@ pub async fn connect_loop(
     // Use LocalSet so the intro listener (spawn_intro_listener uses spawn_local)
     // can run on the same runtime that drives the endpoint I/O.
     let local = tokio::task::LocalSet::new();
-    local.run_until(connect_loop_inner(db_path, recorded_by, endpoint, remote, allowed_peers)).await
+    local.run_until(connect_loop_inner(db_path, recorded_by, endpoint, remote)).await
 }
 
 async fn connect_loop_inner(
@@ -1247,7 +1241,6 @@ async fn connect_loop_inner(
     recorded_by: &str,
     endpoint: quinn::Endpoint,
     remote: SocketAddr,
-    allowed_peers: Option<crate::transport::AllowedPeers>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     loop {
         info!("Connecting to {}...", remote);
@@ -1306,18 +1299,13 @@ async fn connect_loop_inner(
         }
 
         // Spawn intro listener for uni-streams on this connection
-        let _intro_handle = if let Some(ref ap) = allowed_peers {
-            Some(crate::sync::punch::spawn_intro_listener(
-                connection.clone(),
-                db_path.to_string(),
-                recorded_by.to_string(),
-                peer_id.clone(),
-                endpoint.clone(),
-                ap.clone(),
-            ))
-        } else {
-            None
-        };
+        let _intro_handle = crate::sync::punch::spawn_intro_listener(
+            connection.clone(),
+            db_path.to_string(),
+            recorded_by.to_string(),
+            peer_id.clone(),
+            endpoint.clone(),
+        );
 
         // Inner loop: repeated sync sessions on this connection
         loop {

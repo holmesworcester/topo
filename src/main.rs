@@ -11,7 +11,7 @@ use poc_7::crypto::EventId;
 use poc_7::db::{
     open_connection,
     schema::create_tables,
-    transport_trust::{has_any_trusted_peer, is_peer_allowed, trusted_peer_count},
+    transport_trust::{allowed_peers_from_db, import_cli_pins_to_sql, is_peer_allowed},
 };
 use poc_7::events::{
     DeviceInviteFirstEvent, InviteAcceptedEvent, MessageDeletionEvent, MessageEvent, ParsedEvent,
@@ -21,8 +21,8 @@ use poc_7::projection::create::{create_event_sync, create_event_staged, create_s
 use poc_7::projection::pipeline::project_one;
 use poc_7::sync::engine::{accept_loop, connect_loop};
 use poc_7::transport::{
-    create_dual_endpoint_dynamic, extract_spki_fingerprint, load_or_generate_cert, AllowedPeers,
-    DynamicAllowFn,
+    create_dual_endpoint, create_dual_endpoint_dynamic, extract_spki_fingerprint,
+    load_or_generate_cert, AllowedPeers,
 };
 use poc_7::transport_identity::{
     ensure_transport_peer_id_from_db, load_transport_peer_id_from_db, transport_cert_paths_from_db,
@@ -980,23 +980,15 @@ async fn run_sync(
         hex::encode(fp)
     };
 
-    // Build combined trust: CLI pins + SQL trust rows
-    // (projected transport_keys + accepted-invite bootstrap trust).
+    // Import CLI pins to SQL, then check combined trust.
     let cli_pins = AllowedPeers::from_hex_strings(pin_peers)?;
     {
         let db = open_connection(db_path)?;
-        let has_db_trust = has_any_trusted_peer(&db, &recorded_by)?;
-        if cli_pins.is_empty() && !has_db_trust {
+        import_cli_pins_to_sql(&db, &recorded_by, &cli_pins)?;
+        let combined = allowed_peers_from_db(&db, &recorded_by)?;
+        if combined.is_empty() {
             return Err("No allowed peers: provide --pin-peer for bootstrap, accept an invite link, or ensure identity events have synced. \
                 Use `poc-7 transport-identity --db <peer-db>` to get a peer's fingerprint.".into());
-        }
-        if has_db_trust {
-            let db_count = trusted_peer_count(&db, &recorded_by)?;
-            info!(
-                "Trust sources: {} from CLI pins, {} from SQL-trusted peer fingerprints",
-                cli_pins.len(),
-                db_count
-            );
         }
     }
 
@@ -1004,19 +996,16 @@ async fn run_sync(
     // for hole punching). Trust is resolved from SQL at handshake time.
     let db_path_for_lookup = db_path.to_string();
     let recorded_by_for_lookup = recorded_by.clone();
-    let cli_pins_for_lookup = cli_pins.clone();
     let dynamic_allow = Arc::new(move |peer_fp: &[u8; 32]| {
         let db = open_connection(&db_path_for_lookup)?;
-        is_peer_allowed(&db, &recorded_by_for_lookup, peer_fp, &cli_pins_for_lookup)
+        is_peer_allowed(&db, &recorded_by_for_lookup, peer_fp)
     });
     let endpoint = create_dual_endpoint_dynamic(bind, cert, key, dynamic_allow)?;
-    let allowed_peers_inner = cli_pins.clone();
     info!("Listening on {}", endpoint.local_addr()?);
 
     let db_owned = db_path.to_string();
     let recorded_by_clone = recorded_by.clone();
     let accept_endpoint = endpoint.clone();
-    let accept_allowed = allowed_peers_inner.clone();
     let accept_handle = tokio::task::spawn_blocking({
         let db = db_owned.clone();
         move || {
@@ -1029,7 +1018,6 @@ async fn run_sync(
                     &db,
                     &recorded_by_clone,
                     accept_endpoint,
-                    Some(accept_allowed),
                 )
                 .await
                 {
@@ -1041,7 +1029,6 @@ async fn run_sync(
 
     if let Some(remote) = connect {
         let connect_endpoint = endpoint.clone();
-        let connect_allowed = allowed_peers_inner.clone();
         let db = db_owned.clone();
         let recorded_by_clone = recorded_by.clone();
         let connect_handle = tokio::task::spawn_blocking(move || {
@@ -1055,7 +1042,6 @@ async fn run_sync(
                     &recorded_by_clone,
                     connect_endpoint,
                     remote,
-                    Some(connect_allowed),
                 )
                 .await
                 {
@@ -1348,15 +1334,12 @@ async fn cli_intro(
         all_pins.push(peer_b.to_string());
     }
     let cli_pins = AllowedPeers::from_hex_strings(&all_pins)?;
-    let db_path_for_lookup = db_path.to_string();
-    let recorded_by_for_lookup = recorded_by.clone();
-    let cli_pins_for_lookup = cli_pins.clone();
-    let dynamic_allow: Arc<DynamicAllowFn> = Arc::new(move |peer_fp: &[u8; 32]| {
-        let db = open_connection(&db_path_for_lookup)?;
-        is_peer_allowed(&db, &recorded_by_for_lookup, peer_fp, &cli_pins_for_lookup)
-    });
+    let db = open_connection(db_path)?;
+    import_cli_pins_to_sql(&db, &recorded_by, &cli_pins)?;
+    let allowed = allowed_peers_from_db(&db, &recorded_by)?;
+    drop(db);
 
-    let endpoint = create_dual_endpoint_dynamic("0.0.0.0:0".parse()?, cert, key, dynamic_allow)?;
+    let endpoint = create_dual_endpoint("0.0.0.0:0".parse()?, cert, key, Arc::new(allowed))?;
 
     let result = poc_7::sync::intro::run_intro(
         &endpoint,
