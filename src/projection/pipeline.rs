@@ -164,14 +164,14 @@ fn apply_projection(
     Ok(ProjectionDecision::Valid)
 }
 
-/// Central projection entrypoint. Given an event_id that is already stored in the
-/// `events` table, parse it, check dependencies, project into terminal tables,
-/// and cascade-unblock any dependents.
-pub fn project_one(
+/// Core projection logic: steps 1-7 (terminal check, load, parse, dep check,
+/// type check, apply projection, write valid_events). Returns the decision and
+/// the parsed event (if available). Does NOT cascade — caller handles that.
+fn project_one_core(
     conn: &Connection,
     recorded_by: &str,
     event_id: &EventId,
-) -> Result<ProjectionDecision, Box<dyn std::error::Error>> {
+) -> Result<(ProjectionDecision, Option<ParsedEvent>), Box<dyn std::error::Error>> {
     let event_id_b64 = event_id_to_base64(event_id);
 
     // 1. Check terminal state — already processed (valid)?
@@ -181,7 +181,7 @@ pub fn project_one(
         |row| row.get(0),
     )?;
     if already {
-        return Ok(ProjectionDecision::AlreadyProcessed);
+        return Ok((ProjectionDecision::AlreadyProcessed, None));
     }
 
     // 1b. Check terminal state — already rejected?
@@ -191,7 +191,7 @@ pub fn project_one(
         |row| row.get(0),
     )?;
     if already_rejected {
-        return Ok(ProjectionDecision::AlreadyProcessed);
+        return Ok((ProjectionDecision::AlreadyProcessed, None));
     }
 
     // 2. Load blob from events table
@@ -204,7 +204,7 @@ pub fn project_one(
         Err(rusqlite::Error::QueryReturnedNoRows) => {
             let reason = format!("event {} not found in events table", event_id_b64);
             record_rejection(conn, recorded_by, &event_id_b64, &reason);
-            return Ok(ProjectionDecision::Reject { reason });
+            return Ok((ProjectionDecision::Reject { reason }, None));
         }
         Err(e) => return Err(e.into()),
     };
@@ -215,7 +215,7 @@ pub fn project_one(
         Err(e) => {
             let reason = format!("parse error: {}", e);
             record_rejection(conn, recorded_by, &event_id_b64, &reason);
-            return Ok(ProjectionDecision::Reject { reason });
+            return Ok((ProjectionDecision::Reject { reason }, None));
         }
     };
 
@@ -251,7 +251,7 @@ pub fn project_one(
              VALUES (?1, ?2, ?3)",
             rusqlite::params![recorded_by, &event_id_b64, missing.len() as i64],
         )?;
-        return Ok(ProjectionDecision::Block { missing });
+        return Ok((ProjectionDecision::Block { missing }, Some(parsed)));
     }
 
     // 5b. Dep type checking — verify each dep's type code matches expectations
@@ -260,7 +260,7 @@ pub fn project_one(
     if !meta.dep_field_type_codes.is_empty() {
         if let Some(reason) = check_dep_types(conn, &deps, meta.dep_field_type_codes)? {
             record_rejection(conn, recorded_by, &event_id_b64, &reason);
-            return Ok(ProjectionDecision::Reject { reason });
+            return Ok((ProjectionDecision::Reject { reason }, Some(parsed)));
         }
     }
 
@@ -269,11 +269,29 @@ pub fn project_one(
     match &decision {
         ProjectionDecision::Reject { ref reason } => {
             record_rejection(conn, recorded_by, &event_id_b64, reason);
-            return Ok(decision);
+            return Ok((decision, Some(parsed)));
         }
-        ProjectionDecision::Block { .. } => {
-            // Inner deps missing (encrypted events); don't mark valid
-            return Ok(decision);
+        ProjectionDecision::Block { ref missing } => {
+            // Inner deps missing (encrypted events). Write block records if non-empty.
+            if !missing.is_empty() {
+                let mut unique_blockers = missing.clone();
+                unique_blockers.sort_unstable();
+                unique_blockers.dedup();
+                for dep_id in &unique_blockers {
+                    let dep_b64 = event_id_to_base64(dep_id);
+                    conn.execute(
+                        "INSERT OR IGNORE INTO blocked_event_deps (peer_id, event_id, blocker_event_id)
+                         VALUES (?1, ?2, ?3)",
+                        rusqlite::params![recorded_by, &event_id_b64, &dep_b64],
+                    )?;
+                }
+                conn.execute(
+                    "INSERT OR IGNORE INTO blocked_events (peer_id, event_id, deps_remaining)
+                     VALUES (?1, ?2, ?3)",
+                    rusqlite::params![recorded_by, &event_id_b64, unique_blockers.len() as i64],
+                )?;
+            }
+            return Ok((decision, Some(parsed)));
         }
         _ => {}
     }
@@ -284,91 +302,61 @@ pub fn project_one(
         rusqlite::params![recorded_by, &event_id_b64],
     )?;
 
-    // 8. Unblock dependents (iterative to avoid stack overflow)
-    unblock_dependents(conn, recorded_by, &event_id_b64)?;
-
-    // 9. Guard cascade: if InviteAccepted just projected, retry guard-blocked events
-    //    (e.g., Workspace events waiting for trust anchor).
-    //    This is separate from dep-based cascading because guard blocks don't use
-    //    blocked_event_deps — they return Block with empty missing list.
-    if matches!(parsed, ParsedEvent::InviteAccepted(_)) {
-        super::identity::retry_guard_blocked_events(conn, recorded_by)?;
-    }
-
-    // 10. Guard cascade: if MessageAttachment just projected, retry only the
-    //     file_slice events that were guard-blocked for this specific file_id.
-    if let ParsedEvent::MessageAttachment(att) = parsed {
-        let file_id_b64 = event_id_to_base64(&att.file_id);
-        retry_file_slice_guard_blocks_for_file(conn, recorded_by, &file_id_b64)?;
-    }
-
-    Ok(ProjectionDecision::Valid)
+    Ok((ProjectionDecision::Valid, Some(parsed)))
 }
 
-/// After a MessageAttachment projects, retry only file_slice events that were
-/// guard-blocked waiting for this file descriptor.
-fn retry_file_slice_guard_blocks_for_file(
+/// Central projection entrypoint. Given an event_id that is already stored in the
+/// `events` table, parse it, check dependencies, project into terminal tables,
+/// and cascade-unblock any dependents.
+pub fn project_one(
     conn: &Connection,
     recorded_by: &str,
-    file_id_b64: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Targeted lookup avoids scanning all historical file_slice events.
-    let mut stmt = conn.prepare(
-        "SELECT event_id
-         FROM file_slice_guard_blocks
-         WHERE peer_id = ?1 AND file_id = ?2",
-    )?;
-    let candidates: Vec<String> = stmt
-        .query_map(rusqlite::params![recorded_by, file_id_b64], |row| {
-            row.get::<_, String>(0)
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    drop(stmt);
-
-    for eid_b64 in candidates {
-        if let Some(event_id) = event_id_from_base64(&eid_b64) {
-            let _ = project_one(conn, recorded_by, &event_id)?;
-        }
-        // Descriptor exists now; subsequent blocking (if any) should be represented
-        // as normal dep-block rows, not descriptor-guard state.
-        conn.execute(
-            "DELETE FROM file_slice_guard_blocks WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, &eid_b64],
-        )?;
+    event_id: &EventId,
+) -> Result<ProjectionDecision, Box<dyn std::error::Error>> {
+    let (decision, parsed) = project_one_core(conn, recorded_by, event_id)?;
+    if matches!(decision, ProjectionDecision::Valid) {
+        let event_id_b64 = event_id_to_base64(event_id);
+        cascade_unblocked(conn, recorded_by, &event_id_b64, parsed.as_ref())?;
     }
-    Ok(())
+    Ok(decision)
 }
 
-/// After projecting an event, find and cascade-project any events that were
-/// blocked waiting on it. Uses Kahn's algorithm with a deps_remaining counter
-/// for O(N) scaling: blocked_event_deps is read-only during the cascade (no
-/// per-step DELETEs), only the small blocked_events table gets counter
-/// decrements, and deps are bulk-cleaned after the cascade completes.
-fn unblock_dependents(
+/// After projecting an event, cascade-unblock dependents using a two-phase approach:
+/// Phase 1: Kahn's algorithm dep cascade (using project_one_core).
+/// Phase 2: Guard retries (after bulk cleanup so guard queries work correctly).
+fn cascade_unblocked(
     conn: &Connection,
     recorded_by: &str,
     blocker_b64: &str,
+    initial_parsed: Option<&ParsedEvent>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Wrap entire cascade in a savepoint for batched WAL writes
-    conn.execute_batch("SAVEPOINT unblock_cascade")?;
-    let result = unblock_dependents_inner(conn, recorded_by, blocker_b64);
+    conn.execute_batch("SAVEPOINT cascade_unblocked")?;
+    let result = cascade_unblocked_inner(conn, recorded_by, blocker_b64, initial_parsed);
     match &result {
-        Ok(()) => conn.execute_batch("RELEASE unblock_cascade")?,
-        Err(_) => { let _ = conn.execute_batch("ROLLBACK TO unblock_cascade; RELEASE unblock_cascade"); }
+        Ok(()) => conn.execute_batch("RELEASE cascade_unblocked")?,
+        Err(_) => { let _ = conn.execute_batch("ROLLBACK TO cascade_unblocked; RELEASE cascade_unblocked"); }
     }
     result
 }
 
-fn unblock_dependents_inner(
+fn cascade_unblocked_inner(
     conn: &Connection,
     recorded_by: &str,
     blocker_b64: &str,
+    initial_parsed: Option<&ParsedEvent>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Kahn's algorithm. Only the worklist lives on the heap.
+    // Track guard cascade triggers across the entire cascade
+    let mut invite_accepted_projected = matches!(initial_parsed, Some(ParsedEvent::InviteAccepted(_)));
+    let mut attachment_file_ids: Vec<String> = Vec::new();
+    if let Some(ParsedEvent::MessageAttachment(att)) = initial_parsed {
+        attachment_file_ids.push(event_id_to_base64(&att.file_id));
+    }
+
+    // --- Phase 1: Kahn's algorithm dep cascade ---
     // blocked_event_deps is READ-ONLY during cascade (no per-step DELETEs).
     // Only blocked_events (small table) gets counter decrements.
-    // Bulk cleanup of blocked_event_deps happens once at the end.
-
+    // Bulk cleanup of blocked_event_deps happens once after the loop.
     let mut worklist = vec![blocker_b64.to_string()];
 
     while let Some(blocker) = worklist.pop() {
@@ -418,66 +406,27 @@ fn unblock_dependents_inner(
                 "DELETE FROM blocked_events WHERE peer_id = ?1 AND event_id = ?2",
             )?.execute(rusqlite::params![recorded_by, eid_b64])?;
 
-            // 4. Project this event
-            let blob: Vec<u8> = conn.prepare_cached(
-                "SELECT blob FROM events WHERE event_id = ?1",
-            )?.query_row(
-                rusqlite::params![eid_b64],
-                |row| row.get(0),
-            )?;
-
-            match events::parse_event(&blob) {
-                Err(e) => {
-                    let reason = format!("parse error: {}", e);
-                    record_rejection(conn, recorded_by, eid_b64, &reason);
-                    continue;
-                }
-                Ok(parsed) => {
-                    let deps = parsed.dep_field_values();
-
-                    // Dep type checking (same policy as project_one).
-                    let meta = registry().lookup(parsed.event_type_code());
-                    if let Some(meta) = meta {
-                        if !meta.dep_field_type_codes.is_empty() {
-                            if let Some(reason) = check_dep_types(conn, &deps, meta.dep_field_type_codes)? {
-                                record_rejection(conn, recorded_by, eid_b64, &reason);
-                                continue;
+            // 4. Project this event through the canonical single entrypoint
+            if let Some(event_id) = event_id_from_base64(eid_b64) {
+                let (decision, parsed) = project_one_core(conn, recorded_by, &event_id)?;
+                match &decision {
+                    ProjectionDecision::Valid => {
+                        // Track guard triggers from cascaded events
+                        if let Some(ref p) = parsed {
+                            if matches!(p, ParsedEvent::InviteAccepted(_)) {
+                                invite_accepted_projected = true;
+                            }
+                            if let ParsedEvent::MessageAttachment(att) = p {
+                                attachment_file_ids.push(event_id_to_base64(&att.file_id));
                             }
                         }
+                        worklist.push(eid_b64.clone());
                     }
-
-                    let decision = apply_projection(conn, recorded_by, eid_b64, &blob, &parsed)?;
-                    match &decision {
-                        ProjectionDecision::Reject { ref reason } => {
-                            record_rejection(conn, recorded_by, eid_b64, reason);
-                            continue;
-                        }
-                        ProjectionDecision::Block { ref missing } => {
-                            // Re-block with new deps (e.g., encrypted event inner deps)
-                            let mut unique_blockers = missing.clone();
-                            unique_blockers.sort_unstable();
-                            unique_blockers.dedup();
-                            for dep_id in &unique_blockers {
-                                let dep_b64 = event_id_to_base64(dep_id);
-                                conn.prepare_cached(
-                                    "INSERT OR IGNORE INTO blocked_event_deps (peer_id, event_id, blocker_event_id)
-                                     VALUES (?1, ?2, ?3)",
-                                )?.execute(rusqlite::params![recorded_by, eid_b64, &dep_b64])?;
-                            }
-                            conn.prepare_cached(
-                                "INSERT OR IGNORE INTO blocked_events (peer_id, event_id, deps_remaining)
-                                 VALUES (?1, ?2, ?3)",
-                            )?.execute(rusqlite::params![recorded_by, eid_b64, unique_blockers.len() as i64])?;
-                            continue;
-                        }
-                        _ => {}
+                    ProjectionDecision::Reject { .. } | ProjectionDecision::Block { .. } => {
+                        // project_one_core already handled recording rejections
+                        // and writing block records for inner deps
                     }
-
-                    conn.prepare_cached(
-                        "INSERT OR IGNORE INTO valid_events (peer_id, event_id) VALUES (?1, ?2)",
-                    )?.execute(rusqlite::params![recorded_by, eid_b64])?;
-
-                    worklist.push(eid_b64.clone());
+                    ProjectionDecision::AlreadyProcessed => {}
                 }
             }
         }
@@ -492,6 +441,63 @@ fn unblock_dependents_inner(
         "DELETE FROM blocked_event_deps WHERE peer_id = ?1
          AND event_id IN (SELECT event_id FROM rejected_events WHERE peer_id = ?1)",
     )?.execute(rusqlite::params![recorded_by])?;
+
+    // --- Phase 2: Guard retries (AFTER bulk cleanup so queries work correctly) ---
+
+    // Guard cascade: if InviteAccepted projected, retry workspace guard blocks.
+    // Only Workspace uses trust-anchor guarding today, so keep the candidate
+    // set bounded to workspace events rather than scanning all recorded events.
+    if invite_accepted_projected {
+        let guard_candidates: Vec<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT re.event_id
+                 FROM recorded_events re
+                 INNER JOIN events e ON e.event_id = re.event_id
+                 WHERE re.peer_id = ?1
+                   AND e.event_type = 'workspace'
+                   AND re.event_id NOT IN (SELECT event_id FROM valid_events WHERE peer_id = ?1)
+                   AND re.event_id NOT IN (SELECT event_id FROM rejected_events WHERE peer_id = ?1)
+                   AND re.event_id NOT IN (SELECT DISTINCT event_id FROM blocked_event_deps WHERE peer_id = ?1)",
+            )?;
+            let mut rows = stmt.query(rusqlite::params![recorded_by])?;
+            let mut result = Vec::new();
+            while let Some(row) = rows.next()? {
+                result.push(row.get::<_, String>(0)?);
+            }
+            result
+        };
+        for eid_b64 in guard_candidates {
+            if let Some(event_id) = event_id_from_base64(&eid_b64) {
+                // Use project_one (full entrypoint) for proper recursive cascade
+                let _ = project_one(conn, recorded_by, &event_id)?;
+            }
+        }
+    }
+
+    // Guard cascade: if MessageAttachment projected, retry file_slice guard blocks
+    for file_id_b64 in &attachment_file_ids {
+        let fs_candidates: Vec<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT event_id FROM file_slice_guard_blocks
+                 WHERE peer_id = ?1 AND file_id = ?2",
+            )?;
+            let mut rows = stmt.query(rusqlite::params![recorded_by, file_id_b64])?;
+            let mut result = Vec::new();
+            while let Some(row) = rows.next()? {
+                result.push(row.get::<_, String>(0)?);
+            }
+            result
+        };
+        for eid_b64 in fs_candidates {
+            if let Some(event_id) = event_id_from_base64(&eid_b64) {
+                let _ = project_one(conn, recorded_by, &event_id)?;
+            }
+            conn.execute(
+                "DELETE FROM file_slice_guard_blocks WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, &eid_b64],
+            )?;
+        }
+    }
 
     Ok(())
 }
@@ -509,6 +515,7 @@ mod tests {
         self, BenchDepEvent, EncryptedEvent, FileSliceEvent, MessageAttachmentEvent,
         MessageDeletionEvent, MessageEvent, ParsedEvent, ReactionEvent, SecretKeyEvent,
         SignedMemoEvent, WorkspaceEvent, EVENT_TYPE_ENCRYPTED, EVENT_TYPE_MESSAGE,
+        EVENT_TYPE_REACTION,
     };
     use crate::projection::encrypted::encrypt_event_blob;
     use crate::projection::signer::sign_event_bytes;
@@ -3518,5 +3525,354 @@ mod tests {
             "file_slice with wrong signer should be rejected, got {:?}",
             result
         );
+    }
+
+    // ========================================================================
+    // New tests for single-entrypoint cascade refactor (Issue 1)
+    // ========================================================================
+
+    #[test]
+    fn test_multi_dep_event_projects_only_when_all_resolve() {
+        // BenchDepEvent with 2 deps: verify it only projects when both deps are valid.
+        let conn = setup();
+        let recorded_by = "peer1";
+
+        // Create two SecretKey events as deps (no deps of their own)
+        let sk_a = ParsedEvent::SecretKey(SecretKeyEvent {
+            created_at_ms: now_ms(),
+            key_bytes: [0xAA; 32],
+        });
+        let sk_a_blob = events::encode_event(&sk_a).unwrap();
+        let sk_a_eid = insert_event_raw(&conn, recorded_by, &sk_a_blob);
+
+        let sk_b = ParsedEvent::SecretKey(SecretKeyEvent {
+            created_at_ms: now_ms(),
+            key_bytes: [0xBB; 32],
+        });
+        let sk_b_blob = events::encode_event(&sk_b).unwrap();
+        let sk_b_eid = insert_event_raw(&conn, recorded_by, &sk_b_blob);
+
+        // Create BenchDepEvent depending on both
+        let bench = ParsedEvent::BenchDep(BenchDepEvent {
+            created_at_ms: now_ms(),
+            dep_ids: vec![sk_a_eid, sk_b_eid],
+            payload: [0x42; 16],
+        });
+        let bench_blob = events::encode_event(&bench).unwrap();
+        let bench_eid = insert_event_raw(&conn, recorded_by, &bench_blob);
+
+        // Project bench first — should block on both deps
+        let result = project_one(&conn, recorded_by, &bench_eid).unwrap();
+        assert!(
+            matches!(result, ProjectionDecision::Block { ref missing } if missing.len() == 2),
+            "should block on 2 missing deps, got {:?}",
+            result
+        );
+
+        // Project dep A only — bench should still be blocked
+        project_one(&conn, recorded_by, &sk_a_eid).unwrap();
+        let bench_b64 = event_id_to_base64(&bench_eid);
+        let still_blocked: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM blocked_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, &bench_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(still_blocked, "bench should still be blocked after only one dep resolves");
+
+        // Project dep B — now bench should cascade to valid
+        project_one(&conn, recorded_by, &sk_b_eid).unwrap();
+        let bench_valid: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, &bench_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(bench_valid, "bench should be valid after both deps resolve via cascade");
+    }
+
+    #[test]
+    fn test_cascade_and_direct_produce_same_state() {
+        // Compare direct (in-order) projection vs out-of-order cascade.
+        // Both should produce identical valid_events sets.
+        let recorded_by = "peer1";
+
+        // --- Direct path (in dependency order) ---
+        let conn_direct = setup();
+        let (signer_eid, signing_key) = make_identity_chain(&conn_direct, recorded_by);
+        let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "hello");
+        let msg_eid = insert_event_raw(&conn_direct, recorded_by, &msg_blob);
+        project_one(&conn_direct, recorded_by, &msg_eid).unwrap();
+
+        let (_rxn, rxn_blob) = make_reaction_signed(&signing_key, &signer_eid, &msg_eid, "thumbs_up");
+        let rxn_eid = insert_event_raw(&conn_direct, recorded_by, &rxn_blob);
+        project_one(&conn_direct, recorded_by, &rxn_eid).unwrap();
+
+        // --- Cascade path (reaction before message) ---
+        let conn_cascade = setup();
+        // Same identity chain
+        let (signer_eid_c, signing_key_c) = make_identity_chain(&conn_cascade, recorded_by);
+        let (_msg_c, msg_blob_c) = make_message_signed(&signing_key_c, &signer_eid_c, "hello");
+        let msg_eid_c = insert_event_raw(&conn_cascade, recorded_by, &msg_blob_c);
+        // DON'T project message yet
+
+        let (_rxn_c, rxn_blob_c) = make_reaction_signed(&signing_key_c, &signer_eid_c, &msg_eid_c, "thumbs_up");
+        let rxn_eid_c = insert_event_raw(&conn_cascade, recorded_by, &rxn_blob_c);
+        // Reaction should block (message not valid yet)
+        let r = project_one(&conn_cascade, recorded_by, &rxn_eid_c).unwrap();
+        assert!(matches!(r, ProjectionDecision::Block { .. }));
+
+        // Now project message — should cascade and unblock reaction
+        project_one(&conn_cascade, recorded_by, &msg_eid_c).unwrap();
+
+        // Both should have the reaction as valid
+        let rxn_b64 = event_id_to_base64(&rxn_eid);
+        let rxn_valid_direct: bool = conn_direct
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, &rxn_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let rxn_b64_c = event_id_to_base64(&rxn_eid_c);
+        let rxn_valid_cascade: bool = conn_cascade
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, &rxn_b64_c],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert!(rxn_valid_direct, "reaction should be valid via direct path");
+        assert!(rxn_valid_cascade, "reaction should be valid via cascade path");
+    }
+
+    #[test]
+    fn test_encrypted_inner_dep_cascade_unblock() {
+        // Encrypted event whose inner event (a Reaction) depends on a message.
+        // Insert encrypted event first (blocks on key), then provide key (cascades
+        // to decrypt, but inner reaction blocks on message), then provide message
+        // (cascades to unblock inner reaction -> encrypted becomes valid).
+        let conn = setup();
+        let recorded_by = "peer1";
+        let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
+
+        // Create the message that the inner reaction will target
+        let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "target msg");
+        let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
+        // DON'T project message yet
+
+        // Create the secret key for encryption
+        let key_bytes: [u8; 32] = rand::random();
+        let (_sk, sk_blob) = make_secret_key(key_bytes);
+        let sk_eid = insert_event_raw(&conn, recorded_by, &sk_blob);
+        // DON'T project key yet
+
+        // Create inner event: a Reaction targeting the message
+        let rxn = ReactionEvent {
+            created_at_ms: now_ms(),
+            target_event_id: msg_eid,
+            author_id: [3u8; 32],
+            emoji: "heart".to_string(),
+            signed_by: signer_eid,
+            signer_type: 5,
+            signature: [0u8; 64],
+        };
+        let rxn_event = ParsedEvent::Reaction(rxn);
+        let mut inner_blob = events::encode_event(&rxn_event).unwrap();
+        sign_blob(&signing_key, &mut inner_blob);
+
+        // Wrap in encrypted envelope
+        let (_enc, enc_blob) = make_encrypted_event(&key_bytes, &inner_blob, EVENT_TYPE_REACTION, &sk_eid);
+        let enc_eid = insert_event_raw(&conn, recorded_by, &enc_blob);
+
+        // Project encrypted event — should block on missing key_event_id dep
+        let r1 = project_one(&conn, recorded_by, &enc_eid).unwrap();
+        assert!(
+            matches!(r1, ProjectionDecision::Block { .. }),
+            "encrypted should block on missing key, got {:?}",
+            r1
+        );
+
+        // Project key — encrypted event cascades, decrypts, but inner reaction
+        // blocks on missing message. Encrypted event should NOT be valid yet.
+        project_one(&conn, recorded_by, &sk_eid).unwrap();
+        let enc_b64 = event_id_to_base64(&enc_eid);
+        let enc_valid_after_key: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, &enc_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !enc_valid_after_key,
+            "encrypted event should NOT be valid yet (inner dep missing)"
+        );
+
+        // Project message — inner reaction unblocks, encrypted event should cascade to valid
+        project_one(&conn, recorded_by, &msg_eid).unwrap();
+        let enc_valid_final: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, &enc_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            enc_valid_final,
+            "encrypted event should be valid after all inner deps resolve"
+        );
+    }
+
+    #[test]
+    fn test_invite_accepted_guard_retry_on_workspace() {
+        // Workspace events are guard-blocked (not dep-blocked) until InviteAccepted
+        // sets the trust anchor. Verify that projecting InviteAccepted triggers
+        // guard retry and unblocks the Workspace event.
+        let conn = setup();
+        let recorded_by = "peer1";
+        let mut rng = rand::thread_rng();
+
+        // Create workspace event
+        let workspace_key = SigningKey::generate(&mut rng);
+        let workspace_pub = workspace_key.verifying_key().to_bytes();
+        let ws_event = ParsedEvent::Workspace(WorkspaceEvent {
+            created_at_ms: now_ms(),
+            public_key: workspace_pub,
+        });
+        let ws_blob = events::encode_event(&ws_event).unwrap();
+        let ws_eid = insert_event_raw(&conn, recorded_by, &ws_blob);
+
+        // Project workspace first — should be guard-blocked (no trust anchor yet)
+        let r1 = project_one(&conn, recorded_by, &ws_eid).unwrap();
+        assert!(
+            matches!(r1, ProjectionDecision::Block { ref missing } if missing.is_empty()),
+            "workspace should be guard-blocked with empty missing, got {:?}",
+            r1
+        );
+
+        // Create and project InviteAccepted — should set trust anchor and trigger guard retry
+        let ia_event = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
+            created_at_ms: now_ms(),
+            invite_event_id: ws_eid,
+            workspace_id: ws_eid,
+        });
+        let ia_blob = events::encode_event(&ia_event).unwrap();
+        let ia_eid = insert_event_raw(&conn, recorded_by, &ia_blob);
+        let r2 = project_one(&conn, recorded_by, &ia_eid).unwrap();
+        assert_eq!(r2, ProjectionDecision::Valid, "invite_accepted should project Valid");
+
+        // Workspace should now be valid via guard retry cascade
+        let ws_b64 = event_id_to_base64(&ws_eid);
+        let ws_valid: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, &ws_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(ws_valid, "workspace should be valid after invite_accepted guard retry");
+    }
+
+    #[test]
+    fn test_file_slice_guard_retry_after_cascaded_attachment() {
+        // FileSlice is guard-blocked waiting for descriptor (MessageAttachment).
+        // MessageAttachment is dep-blocked on a message. When the message projects,
+        // it cascades the attachment, which triggers guard retry on the file_slice.
+        let conn = setup();
+        let recorded_by = "peer1";
+        let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
+
+        let file_id = [77u8; 32];
+
+        // Create message (dep for attachment) but DON'T project yet
+        let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "parent msg");
+        let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
+
+        // Create SecretKey (dep for attachment) and project it
+        let sk = ParsedEvent::SecretKey(SecretKeyEvent {
+            created_at_ms: now_ms(),
+            key_bytes: [0xDD; 32],
+        });
+        let sk_blob = events::encode_event(&sk).unwrap();
+        let sk_eid = insert_event_raw(&conn, recorded_by, &sk_blob);
+        project_one(&conn, recorded_by, &sk_eid).unwrap();
+
+        // Create attachment (descriptor) — dep-blocked on message
+        let att = MessageAttachmentEvent {
+            created_at_ms: now_ms(),
+            message_id: msg_eid,
+            file_id,
+            blob_bytes: 204800,
+            total_slices: 4,
+            slice_bytes: 65536,
+            root_hash: [12u8; 32],
+            key_event_id: sk_eid,
+            filename: "test.bin".to_string(),
+            mime_type: "application/octet-stream".to_string(),
+            signed_by: signer_eid,
+            signer_type: 5,
+            signature: [0u8; 64],
+        };
+        let att_event = ParsedEvent::MessageAttachment(att);
+        let mut att_blob = events::encode_event(&att_event).unwrap();
+        sign_blob(&signing_key, &mut att_blob);
+        let att_eid = insert_event_raw(&conn, recorded_by, &att_blob);
+        let r1 = project_one(&conn, recorded_by, &att_eid).unwrap();
+        assert!(
+            matches!(r1, ProjectionDecision::Block { .. }),
+            "attachment should block on missing message dep, got {:?}",
+            r1
+        );
+
+        // Create file_slice — guard-blocked (no descriptor yet)
+        let (_fs, fs_blob) = make_file_slice(&signing_key, &signer_eid, file_id, 0, b"slice data");
+        let fs_eid = insert_event_raw(&conn, recorded_by, &fs_blob);
+        let r2 = project_one(&conn, recorded_by, &fs_eid).unwrap();
+        // file_slice returns Block with empty missing (guard block) because no descriptor exists
+        assert!(
+            matches!(r2, ProjectionDecision::Block { ref missing } if missing.is_empty()),
+            "file_slice should be guard-blocked, got {:?}",
+            r2
+        );
+
+        // Verify file_slice is in guard block table
+        let fs_b64 = event_id_to_base64(&fs_eid);
+        let guard_blocked: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM file_slice_guard_blocks WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, &fs_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(guard_blocked, "file_slice should be in guard_blocks table");
+
+        // Now project message — should cascade: attachment unblocks, then guard retry unblocks file_slice
+        project_one(&conn, recorded_by, &msg_eid).unwrap();
+
+        // Attachment should be valid
+        let att_b64 = event_id_to_base64(&att_eid);
+        let att_valid: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, &att_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(att_valid, "attachment should be valid after message cascade");
+
+        // File slice should be valid (guard retry triggered by attachment cascade)
+        let fs_valid: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, &fs_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(fs_valid, "file_slice should be valid after cascaded guard retry");
     }
 }
