@@ -192,6 +192,9 @@ impl<'a> ProjectQueue<'a> {
     }
 
     /// Like `drain` but with a configurable claim batch size.
+    ///
+    /// Each item's projection and queue-row deletion are wrapped in a savepoint,
+    /// so they either both commit or both roll back — no split state.
     pub fn drain_with_limit<F>(&self, peer_id: &str, batch_size: usize, mut project_fn: F) -> SqliteResult<usize>
     where
         F: FnMut(&Connection, &str) -> Result<(), Box<dyn std::error::Error>>,
@@ -202,33 +205,32 @@ impl<'a> ProjectQueue<'a> {
             if batch.is_empty() {
                 break;
             }
-            // Process items and track which succeeded vs failed
-            let mut succeeded: Vec<&str> = Vec::with_capacity(batch.len());
-            let mut failed: Vec<&str> = Vec::new();
+            let mut succeeded = 0usize;
             for event_id_b64 in &batch {
+                self.conn.execute_batch("SAVEPOINT project_item")?;
                 match project_fn(self.conn, event_id_b64) {
-                    Ok(()) => succeeded.push(event_id_b64),
-                    Err(_) => failed.push(event_id_b64),
+                    Ok(()) => {
+                        // Delete queue row inside the same savepoint
+                        self.conn.execute(
+                            "DELETE FROM project_queue WHERE peer_id = ?1 AND event_id = ?2",
+                            params![peer_id, event_id_b64],
+                        )?;
+                        // Commit both projection effects + dequeue atomically
+                        self.conn.execute_batch("RELEASE project_item")?;
+                        succeeded += 1;
+                    }
+                    Err(_) => {
+                        // Roll back any partial projection writes, then release
+                        let _ = self.conn.execute_batch(
+                            "ROLLBACK TO project_item; RELEASE project_item"
+                        );
+                        let _ = self.mark_retry(peer_id, event_id_b64);
+                    }
                 }
             }
-            // Batch-delete successful items
-            if !succeeded.is_empty() {
-                self.conn.execute("BEGIN", [])?;
-                let mut del_stmt = self.conn.prepare(
-                    "DELETE FROM project_queue WHERE peer_id = ?1 AND event_id = ?2",
-                )?;
-                for event_id_b64 in &succeeded {
-                    del_stmt.execute(params![peer_id, event_id_b64])?;
-                }
-                self.conn.execute("COMMIT", [])?;
-            }
-            // Retry failed items with backoff
-            for event_id_b64 in &failed {
-                let _ = self.mark_retry(peer_id, event_id_b64);
-            }
-            total += succeeded.len();
+            total += succeeded;
             // If entire batch failed, stop draining to avoid infinite loop
-            if succeeded.is_empty() && !batch.is_empty() {
+            if succeeded == 0 && !batch.is_empty() {
                 break;
             }
         }
@@ -498,6 +500,91 @@ mod tests {
     }
 
     #[test]
+    fn test_drain_atomicity_no_split_state() {
+        let conn = setup();
+        let pq = ProjectQueue::new(&conn);
+
+        pq.enqueue("peer1", "event_a").unwrap();
+        pq.enqueue("peer1", "event_b").unwrap();
+
+        // Projector that writes to valid_events (simulating real projection)
+        let count = pq.drain("peer1", |conn, eid| {
+            conn.execute(
+                "INSERT INTO valid_events (peer_id, event_id) VALUES ('peer1', ?1)",
+                params![eid],
+            )?;
+            Ok(())
+        }).unwrap();
+
+        assert_eq!(count, 2);
+
+        // Both valid_events rows must exist (projection committed)
+        let valid_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM valid_events WHERE peer_id = 'peer1'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(valid_count, 2, "projection writes should be committed");
+
+        // Queue must be empty (dequeue committed atomically with projection)
+        let queue_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM project_queue WHERE peer_id = 'peer1'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(queue_count, 0, "queue rows should be deleted atomically with projection");
+    }
+
+    #[test]
+    fn test_drain_rollback_on_projector_failure() {
+        let conn = setup();
+        let pq = ProjectQueue::new(&conn);
+
+        pq.enqueue("peer1", "event_a").unwrap();
+        pq.enqueue("peer1", "event_b").unwrap();
+
+        // Projector that writes to valid_events but fails for event_b
+        let count = pq.drain("peer1", |conn, eid| {
+            conn.execute(
+                "INSERT INTO valid_events (peer_id, event_id) VALUES ('peer1', ?1)",
+                params![eid],
+            )?;
+            if eid == "event_b" {
+                return Err("simulated failure after write".into());
+            }
+            Ok(())
+        }).unwrap();
+
+        assert_eq!(count, 1, "only event_a should succeed");
+
+        // event_a should be in valid_events
+        let valid_a: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = 'peer1' AND event_id = 'event_a'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert!(valid_a, "event_a projection should be committed");
+
+        // event_b's partial write to valid_events should be rolled back
+        let valid_b: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = 'peer1' AND event_id = 'event_b'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert!(!valid_b, "event_b projection should be rolled back");
+
+        // event_b should remain in the queue for retry
+        let queue_b: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM project_queue WHERE peer_id = 'peer1' AND event_id = 'event_b'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert!(queue_b, "event_b should remain in queue for retry");
+
+        // event_a should be gone from queue
+        let queue_a: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM project_queue WHERE peer_id = 'peer1' AND event_id = 'event_a'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert!(!queue_a, "event_a should be dequeued");
+    }
+
+    #[test]
     fn test_enqueue_batch() {
         let conn = setup();
         let pq = ProjectQueue::new(&conn);
@@ -548,4 +635,5 @@ mod tests {
         assert_eq!(h.pending, 2); // both still in queue
         assert_eq!(h.max_attempts, 1); // event_a retried once
     }
+
 }
