@@ -252,6 +252,8 @@ Rules:
 
 This preserves `poc-6`-style scoped reads/writes while keeping the schema ergonomic.
 
+**Known limitation:** The `neg_items` table (negentropy reconciliation index) is global — not scoped by tenant. A remote peer connecting to tenant A's endpoint will see event IDs from all tenants during negentropy, including tenant B in a different workspace. This is acceptable because multi-tenant nodes are single-operator (one person with multiple workspace memberships on one device). The operator already has direct DB access, and the stronger deanonymization signal — multiple tenants sharing the same IP address and mDNS advertisements — exists at the network layer regardless. Real pseudonym isolation requires separate nodes on separate network paths.
+
 ## 3.3 Table lifecycle and naming
 
 1. schema creation runs through ordered migrations,

@@ -5,8 +5,6 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use rcgen::{generate_simple_self_signed, Certificate, CertificateParams, KeyPair, PKCS_ED25519};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
-use std::io::Write;
-use std::path::Path;
 use x509_parser::prelude::*;
 
 /// Generate a new Ed25519 keypair (for future event signing, not TLS)
@@ -59,80 +57,12 @@ pub fn generate_self_signed_cert_from_signing_key(
     Ok((cert_der, key_der))
 }
 
-/// Load a cert/key from disk, or generate and save new ones.
-///
-/// Persistence hardening:
-/// - Writes via temp file + fsync + rename (atomic replacement, crash-safe).
-/// - Sets private key file to mode 0600 on Unix.
-/// - Validates that the loaded cert's public key matches the private key.
-pub fn load_or_generate_cert(
-    cert_path: &Path,
-    key_path: &Path,
-) -> Result<
-    (CertificateDer<'static>, PrivatePkcs8KeyDer<'static>),
-    Box<dyn std::error::Error + Send + Sync>,
-> {
-    if cert_path.exists() && key_path.exists() {
-        let cert_bytes = std::fs::read(cert_path)?;
-        let key_bytes = std::fs::read(key_path)?;
-        let cert_der = CertificateDer::from(cert_bytes);
-        let key_der = PrivatePkcs8KeyDer::from(key_bytes);
-        validate_cert_key_match(&cert_der, &key_der)?;
-        #[cfg(unix)]
-        if let Err(e) = set_owner_only_permissions(key_path) {
-            eprintln!(
-                "warning: could not normalize key permissions on {}: {}",
-                key_path.display(),
-                e
-            );
-        }
-        Ok((cert_der, key_der))
-    } else {
-        let (cert_der, key_der) = generate_self_signed_cert()?;
-        write_cert_and_key(cert_path, key_path, &cert_der, &key_der)?;
-        Ok((cert_der, key_der))
-    }
-}
-
-/// Persist certificate and private key atomically.
-pub fn write_cert_and_key(
-    cert_path: &Path,
-    key_path: &Path,
-    cert_der: &CertificateDer<'_>,
-    key_der: &PrivatePkcs8KeyDer<'_>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    atomic_write(cert_path, cert_der.as_ref())?;
-    atomic_write(key_path, key_der.secret_pkcs8_der())?;
-    #[cfg(unix)]
-    set_owner_only_permissions(key_path)?;
-    Ok(())
-}
-
-/// Write data atomically: write to a temporary sibling file, fsync, then rename.
-fn atomic_write(path: &Path, data: &[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let parent = path.parent().unwrap_or(Path::new("."));
-    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
-    tmp.write_all(data)?;
-    tmp.as_file().sync_all()?;
-    tmp.persist(path)?;
-    Ok(())
-}
-
-/// Set file permissions to owner-only (0600) on Unix.
-#[cfg(unix)]
-fn set_owner_only_permissions(path: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use std::os::unix::fs::PermissionsExt;
-    let perms = std::fs::Permissions::from_mode(0o600);
-    std::fs::set_permissions(path, perms)?;
-    Ok(())
-}
-
 /// Validate that the certificate's public key matches the private key.
 ///
 /// Derives the public key from the private key via rcgen and compares the
 /// raw SPKI bytes against those in the certificate. This catches mismatched
-/// cert/key files and file corruption.
-fn validate_cert_key_match(
+/// cert/key pairs and data corruption.
+pub fn validate_cert_key_match(
     cert_der: &CertificateDer<'_>,
     key_der: &PrivatePkcs8KeyDer<'_>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -229,83 +159,12 @@ mod tests {
     }
 
     #[test]
-    fn test_cert_persistence_roundtrip() {
-        let tmpdir = tempfile::tempdir().unwrap();
-        let cert_path = tmpdir.path().join("test.cert.der");
-        let key_path = tmpdir.path().join("test.key.der");
-
-        let (cert1, key1) = load_or_generate_cert(&cert_path, &key_path).unwrap();
-        let fp1 = extract_spki_fingerprint(cert1.as_ref()).unwrap();
-
-        // Load again — should get same cert
-        let (cert2, key2) = load_or_generate_cert(&cert_path, &key_path).unwrap();
-        let fp2 = extract_spki_fingerprint(cert2.as_ref()).unwrap();
-
-        assert_eq!(fp1, fp2);
-        assert_eq!(cert1.as_ref(), cert2.as_ref());
-        assert_eq!(key1.secret_pkcs8_der(), key2.secret_pkcs8_der());
-    }
-
-    #[test]
-    fn test_cert_persistence_identical_fingerprint_after_reload() {
-        let tmpdir = tempfile::tempdir().unwrap();
-        let cert_path = tmpdir.path().join("reload.cert.der");
-        let key_path = tmpdir.path().join("reload.key.der");
-
-        let (cert1, _) = load_or_generate_cert(&cert_path, &key_path).unwrap();
-        let fp1 = extract_spki_fingerprint(cert1.as_ref()).unwrap();
-
-        // Simulate process restart — reload from persisted files
-        let (cert2, _) = load_or_generate_cert(&cert_path, &key_path).unwrap();
-        let fp2 = extract_spki_fingerprint(cert2.as_ref()).unwrap();
-
-        assert_eq!(fp1, fp2, "fingerprint must be identical after reload");
-    }
-
-    #[test]
-    fn test_mismatched_cert_key_detected() {
-        let tmpdir = tempfile::tempdir().unwrap();
-        let cert_path = tmpdir.path().join("mismatch.cert.der");
-        let key_path = tmpdir.path().join("mismatch.key.der");
-
-        // Generate and save first keypair
-        let (_cert1, _key1) = load_or_generate_cert(&cert_path, &key_path).unwrap();
-
-        // Overwrite key file with a different key
-        let (_cert2, key2) = generate_self_signed_cert().unwrap();
-        std::fs::write(&key_path, key2.secret_pkcs8_der()).unwrap();
-
-        // Loading must detect the mismatch: cert SPKI != private key's public SPKI
-        let result = load_or_generate_cert(&cert_path, &key_path);
-        assert!(
-            result.is_err(),
-            "expected error for mismatched cert/key pair"
-        );
+    fn test_validate_cert_key_match_detects_mismatch() {
+        let (cert1, _) = generate_self_signed_cert().unwrap();
+        let (_, key2) = generate_self_signed_cert().unwrap();
+        let result = validate_cert_key_match(&cert1, &key2);
+        assert!(result.is_err(), "expected error for mismatched cert/key pair");
         let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("cert/key mismatch"),
-            "error should mention mismatch: {}",
-            err
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_private_key_permissions() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let tmpdir = tempfile::tempdir().unwrap();
-        let cert_path = tmpdir.path().join("perms.cert.der");
-        let key_path = tmpdir.path().join("perms.key.der");
-
-        let _ = load_or_generate_cert(&cert_path, &key_path).unwrap();
-
-        let metadata = std::fs::metadata(&key_path).unwrap();
-        let mode = metadata.permissions().mode() & 0o777;
-        assert_eq!(
-            mode, 0o600,
-            "private key should be owner-only (0600), got {:o}",
-            mode
-        );
+        assert!(err.contains("cert/key mismatch"), "error should mention mismatch: {}", err);
     }
 }

@@ -503,6 +503,18 @@ static MIGRATIONS: &[Migration] = &[
             );
         ",
     },
+    Migration {
+        version: 26,
+        name: "add_local_transport_creds",
+        sql: "
+            CREATE TABLE IF NOT EXISTS local_transport_creds (
+                peer_id TEXT PRIMARY KEY,
+                cert_der BLOB NOT NULL,
+                key_der BLOB NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+        ",
+    },
 ];
 
 fn ensure_schema_migrations(conn: &Connection) -> SqliteResult<()> {
@@ -716,6 +728,6 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(max_version, 25);
+        assert_eq!(max_version, 26);
     }
 }

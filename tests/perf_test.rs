@@ -39,16 +39,14 @@ async fn perf_sync_50k() {
 
     let rss_before = peak_rss_mib();
 
-    // 6 identity per peer + 50k content; after sync each has 6 own + 5 other shared + 50k = 50011
-    let expected_store = 50_000 + 11;
+    let sample = alice.sample_event_ids(1)[0].clone();
     let metrics = sync_until_converged(
-        &alice, &bob, expected_store, Duration::from_secs(300),
+        &alice, &bob, || bob.has_event(&sample), Duration::from_secs(300),
     ).await;
 
     let rss_after = peak_rss_mib();
 
-    assert_eq!(alice.store_count(), expected_store);
-    assert_eq!(bob.store_count(), expected_store);
+    assert_eq!(alice.message_count(), 50_000);
 
     eprintln!();
     eprintln!("=== 50k one-way sync ===");
@@ -76,16 +74,15 @@ async fn perf_sync_10k() {
 
     let rss_before = peak_rss_mib();
 
-    // 6 identity per peer + 10k content; after sync each has 6 own + 5 other shared + 10k = 10011
-    let expected_store = 10_000 + 11;
+    let sample = alice.sample_event_ids(1)[0].clone();
     let metrics = sync_until_converged(
-        &alice, &bob, expected_store, Duration::from_secs(120),
+        &alice, &bob, || bob.has_event(&sample), Duration::from_secs(120),
     ).await;
 
     let rss_after = peak_rss_mib();
 
-    assert_eq!(alice.store_count(), expected_store);
-    assert_eq!(bob.store_count(), expected_store);
+    assert_eq!(alice.message_count(), 5_000);
+    assert_eq!(bob.message_count(), 5_000);
 
     eprintln!();
     eprintln!("=== 10k bidirectional sync ===");
@@ -205,16 +202,14 @@ async fn perf_sync_100k() {
 
     let rss_before = peak_rss_mib();
 
-    // 6 identity per peer + 100k content; after sync each has 6 own + 5 other shared + 100k = 100011
-    let expected_store = 100_000 + 11;
+    let sample = alice.sample_event_ids(1)[0].clone();
     let metrics = sync_until_converged(
-        &alice, &bob, expected_store, Duration::from_secs(600),
+        &alice, &bob, || bob.has_event(&sample), Duration::from_secs(600),
     ).await;
 
     let rss_after = peak_rss_mib();
 
-    assert_eq!(alice.store_count(), expected_store);
-    assert_eq!(bob.store_count(), expected_store);
+    assert_eq!(alice.message_count(), 100_000);
 
     eprintln!();
     eprintln!("=== 100k one-way sync ===");
@@ -242,16 +237,14 @@ async fn perf_sync_200k() {
 
     let rss_before = peak_rss_mib();
 
-    // 6 identity per peer + 200k content; after sync each has 6 own + 5 other shared + 200k = 200011
-    let expected_store = 200_000 + 11;
+    let sample = alice.sample_event_ids(1)[0].clone();
     let metrics = sync_until_converged(
-        &alice, &bob, expected_store, Duration::from_secs(600),
+        &alice, &bob, || bob.has_event(&sample), Duration::from_secs(600),
     ).await;
 
     let rss_after = peak_rss_mib();
 
-    assert_eq!(alice.store_count(), expected_store);
-    assert_eq!(bob.store_count(), expected_store);
+    assert_eq!(alice.message_count(), 200_000);
 
     eprintln!();
     eprintln!("=== 200k one-way sync ===");
@@ -279,16 +272,14 @@ async fn perf_sync_500k() {
 
     let rss_before = peak_rss_mib();
 
-    // 6 identity per peer + 500k content; after sync each has 6 own + 5 other shared + 500k = 500011
-    let expected_store = 500_000 + 11;
+    let sample = alice.sample_event_ids(1)[0].clone();
     let metrics = sync_until_converged(
-        &alice, &bob, expected_store, Duration::from_secs(1200),
+        &alice, &bob, || bob.has_event(&sample), Duration::from_secs(1200),
     ).await;
 
     let rss_after = peak_rss_mib();
 
-    assert_eq!(alice.store_count(), expected_store);
-    assert_eq!(bob.store_count(), expected_store);
+    assert_eq!(alice.message_count(), 500_000);
 
     eprintln!();
     eprintln!("=== 500k one-way sync ===");

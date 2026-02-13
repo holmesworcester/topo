@@ -21,11 +21,12 @@ use poc_7::projection::create::{create_event_sync, create_event_staged, create_s
 use poc_7::projection::pipeline::project_one;
 use poc_7::sync::engine::{accept_loop, connect_loop};
 use poc_7::transport::{
-    create_dual_endpoint, create_dual_endpoint_dynamic, extract_spki_fingerprint,
-    load_or_generate_cert, AllowedPeers,
+    create_dual_endpoint, create_dual_endpoint_dynamic,
+    AllowedPeers,
 };
 use poc_7::transport_identity::{
-    ensure_transport_peer_id_from_db, load_transport_peer_id_from_db, transport_cert_paths_from_db,
+    ensure_transport_peer_id_from_db, ensure_transport_cert_from_db,
+    load_transport_peer_id_from_db,
 };
 
 #[derive(Parser)]
@@ -305,10 +306,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 // ---------------------------------------------------------------------------
 
 fn run_identity(db_path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let (cert_path, key_path) = transport_cert_paths_from_db(db_path);
-    let (cert_der, _) = load_or_generate_cert(&cert_path, &key_path)?;
-    let fp = extract_spki_fingerprint(cert_der.as_ref())?;
-    println!("{}", hex::encode(fp));
+    let peer_id = ensure_transport_peer_id_from_db(db_path)?;
+    println!("{}", peer_id);
     Ok(())
 }
 
@@ -973,12 +972,7 @@ async fn run_sync(
         create_tables(&db)?;
     }
 
-    let (cert_path, key_path) = transport_cert_paths_from_db(db_path);
-    let (cert, key) = load_or_generate_cert(&cert_path, &key_path)?;
-    let recorded_by = {
-        let fp = extract_spki_fingerprint(cert.as_ref())?;
-        hex::encode(fp)
-    };
+    let (recorded_by, cert, key) = ensure_transport_cert_from_db(db_path)?;
 
     // Import CLI pins to SQL, then check combined trust.
     let cli_pins = AllowedPeers::from_hex_strings(pin_peers)?;
@@ -1314,16 +1308,12 @@ async fn cli_intro(
     ttl_ms: u64,
     attempt_window_ms: u32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let db = open_connection(db_path)?;
-    create_tables(&db)?;
-    drop(db);
+    {
+        let db = open_connection(db_path)?;
+        create_tables(&db)?;
+    }
 
-    let (cert_path, key_path) = transport_cert_paths_from_db(db_path);
-    let (cert, key) = load_or_generate_cert(&cert_path, &key_path)?;
-    let recorded_by = {
-        let fp = extract_spki_fingerprint(cert.as_ref())?;
-        hex::encode(fp)
-    };
+    let (recorded_by, cert, key) = ensure_transport_cert_from_db(db_path)?;
 
     // Build allowed peers: must include both target peers
     let mut all_pins = pin_peers.to_vec();
@@ -1374,12 +1364,7 @@ fn cli_intro_attempts(
     let db = open_connection(db_path)?;
     create_tables(&db)?;
 
-    let recorded_by = {
-        let (cert_path, key_path) = transport_cert_paths_from_db(db_path);
-        let (cert, _) = load_or_generate_cert(&cert_path, &key_path)?;
-        let fp = extract_spki_fingerprint(cert.as_ref())?;
-        hex::encode(fp)
-    };
+    let recorded_by = ensure_transport_peer_id_from_db(db_path)?;
 
     let rows = poc_7::db::intro::list_intro_attempts(&db, &recorded_by, peer)?;
     if rows.is_empty() {

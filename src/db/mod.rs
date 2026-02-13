@@ -8,6 +8,7 @@ pub mod egress_queue;
 pub mod health;
 pub mod transport_trust;
 pub mod intro;
+pub mod transport_creds;
 
 use rusqlite::{Connection, Result as SqliteResult};
 use std::path::Path;

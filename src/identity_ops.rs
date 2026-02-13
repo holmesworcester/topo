@@ -6,8 +6,8 @@ use crate::events::*;
 use crate::projection::create::{
     create_event_sync, create_event_staged, create_signed_event_sync, create_signed_event_staged,
 };
+use crate::db::transport_creds::load_local_creds;
 use crate::transport::extract_spki_fingerprint;
-use crate::transport_identity::transport_cert_paths_from_db;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -79,7 +79,6 @@ pub enum InviteType {
 pub fn bootstrap_workspace(
     conn: &Connection,
     recorded_by: &str,
-    db_path: &str,
 ) -> Result<IdentityChain, Box<dyn std::error::Error + Send + Sync>> {
     let mut rng = rand::thread_rng();
 
@@ -192,7 +191,6 @@ pub fn bootstrap_workspace(
     let transport_key_event_id = create_transport_key_if_possible(
         conn,
         recorded_by,
-        db_path,
         &peer_shared_key,
         &peer_shared_event_id,
     )?;
@@ -261,7 +259,6 @@ pub fn accept_user_invite(
     invite_key: &SigningKey,
     invite_event_id: &EventId,
     workspace_id: EventId,
-    db_path: &str,
 ) -> Result<JoinChain, Box<dyn std::error::Error + Send + Sync>> {
     let mut rng = rand::thread_rng();
 
@@ -328,7 +325,6 @@ pub fn accept_user_invite(
     let transport_key_event_id = create_transport_key_if_possible(
         conn,
         recorded_by,
-        db_path,
         &peer_shared_key,
         &peer_shared_event_id,
     )?;
@@ -384,7 +380,6 @@ pub fn accept_device_link(
     device_invite_key: &SigningKey,
     device_invite_event_id: &EventId,
     workspace_id: EventId,
-    db_path: &str,
 ) -> Result<LinkChain, Box<dyn std::error::Error + Send + Sync>> {
     let mut rng = rand::thread_rng();
 
@@ -417,7 +412,6 @@ pub fn accept_device_link(
     let transport_key_event_id = create_transport_key_if_possible(
         conn,
         recorded_by,
-        db_path,
         &peer_shared_key,
         &peer_shared_event_id,
     )?;
@@ -434,16 +428,14 @@ pub fn accept_device_link(
 fn create_transport_key_if_possible(
     conn: &Connection,
     recorded_by: &str,
-    db_path: &str,
     peer_shared_key: &SigningKey,
     peer_shared_event_id: &EventId,
 ) -> Result<Option<EventId>, Box<dyn std::error::Error + Send + Sync>> {
-    let (cert_path, _key_path) = transport_cert_paths_from_db(db_path);
-    if !cert_path.exists() {
-        return Ok(None);
-    }
+    let cert_bytes = match load_local_creds(conn, recorded_by)? {
+        Some((cert, _)) => cert,
+        None => return Ok(None),
+    };
 
-    let cert_bytes = std::fs::read(&cert_path)?;
     let spki_fp = extract_spki_fingerprint(&cert_bytes)?;
 
     let evt = ParsedEvent::TransportKey(TransportKeyEvent {

@@ -17,7 +17,7 @@ use crate::events::{
     UserRemovedEvent, PeerRemovedEvent, SecretSharedEvent,
     TransportKeyEvent,
 };
-use crate::transport_identity::{transport_cert_paths_from_db, ensure_transport_peer_id_from_db};
+use crate::transport_identity::{ensure_transport_peer_id, ensure_transport_cert};
 use crate::projection::create::{create_event_sync, create_event_staged, create_signed_event_sync, create_signed_event_staged, create_encrypted_event_sync, CreateEventError};
 use crate::projection::pipeline::project_one;
 use crate::sync::SyncMessage;
@@ -29,7 +29,6 @@ use crate::transport::{
     create_dual_endpoint,
     create_server_endpoint,
     extract_spki_fingerprint,
-    load_or_generate_cert,
     peer_identity_from_connection,
 };
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
@@ -96,7 +95,7 @@ impl Peer {
         let db = open_connection(&db_path).expect("failed to open db");
         create_tables(&db).expect("failed to create tables");
 
-        let identity = ensure_transport_peer_id_from_db(&db_path).expect("failed to compute identity");
+        let identity = ensure_transport_peer_id(&db).expect("failed to compute identity");
         let author_id: [u8; 32] = rand::random();
 
         Self {
@@ -112,8 +111,9 @@ impl Peer {
         }
     }
 
-    /// Create a new peer with a full identity chain (Workspace → InviteAccepted →
-    /// UserInviteBoot → UserBoot → DeviceInviteFirst → PeerSharedFirst).
+    /// Create a new peer with a full identity chain via the production
+    /// `bootstrap_workspace` flow (Workspace → UserInviteBoot → InviteAccepted →
+    /// UserBoot → DeviceInviteFirst → PeerSharedFirst → AdminBoot → TransportKey).
     /// Content events (Message, Reaction, etc.) are signed with the PeerShared key.
     pub fn new_with_identity(name: &str) -> Self {
         let mut peer = Self::new(name);
@@ -121,198 +121,74 @@ impl Peer {
         peer
     }
 
-    /// Bootstrap a full identity chain for this peer.
+    /// Bootstrap a full identity chain using the production `bootstrap_workspace` flow.
     fn bootstrap_identity_chain(&mut self) {
+        use crate::identity_ops::bootstrap_workspace;
+
         let db = open_connection(&self.db_path).expect("failed to open db");
-        let mut rng = rand::thread_rng();
+        let chain = bootstrap_workspace(&db, &self.identity)
+            .expect("failed to bootstrap workspace");
 
-        // 1. Workspace
-        let workspace_key = SigningKey::generate(&mut rng);
-        let workspace_pub = workspace_key.verifying_key().to_bytes();
-        let net = ParsedEvent::Workspace(WorkspaceEvent {
-            created_at_ms: current_timestamp_ms(),
-            public_key: workspace_pub,
-        });
-        let net_eid = create_event_staged(&db, &self.identity, &net)
-            .expect("failed to create workspace");
-        self.workspace_id = net_eid;
-
-        // 2. InviteAccepted (binds trust anchor)
-        let ia = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
-            created_at_ms: current_timestamp_ms(),
-            invite_event_id: net_eid,
-            workspace_id: net_eid,
-        });
-        let _ia_eid = create_event_sync(&db, &self.identity, &ia)
-            .expect("failed to create invite_accepted");
-
-        // Re-project Workspace (now trust anchor exists)
-        project_one(&db, &self.identity, &net_eid).unwrap();
-
-        // 3. UserInviteBoot (signed by workspace key)
-        let invite_key = SigningKey::generate(&mut rng);
-        let uib = ParsedEvent::UserInviteBoot(UserInviteBootEvent {
-            created_at_ms: current_timestamp_ms(),
-            public_key: invite_key.verifying_key().to_bytes(),
-            workspace_id: net_eid,
-            signed_by: net_eid,
-            signer_type: 1,
-            signature: [0u8; 64],
-        });
-        let uib_eid = create_signed_event_sync(&db, &self.identity, &uib, &workspace_key)
-            .expect("failed to create user_invite_boot");
-
-        // 4. UserBoot (signed by invite key)
-        let user_key = SigningKey::generate(&mut rng);
-        let ub = ParsedEvent::UserBoot(UserBootEvent {
-            created_at_ms: current_timestamp_ms(),
-            public_key: user_key.verifying_key().to_bytes(),
-            signed_by: uib_eid,
-            signer_type: 2,
-            signature: [0u8; 64],
-        });
-        let ub_eid = create_signed_event_sync(&db, &self.identity, &ub, &invite_key)
-            .expect("failed to create user_boot");
-
-        // 5. DeviceInviteFirst (signed by user key)
-        let device_invite_key = SigningKey::generate(&mut rng);
-        let dif = ParsedEvent::DeviceInviteFirst(DeviceInviteFirstEvent {
-            created_at_ms: current_timestamp_ms(),
-            public_key: device_invite_key.verifying_key().to_bytes(),
-            signed_by: ub_eid,
-            signer_type: 4,
-            signature: [0u8; 64],
-        });
-        let dif_eid = create_signed_event_sync(&db, &self.identity, &dif, &user_key)
-            .expect("failed to create device_invite_first");
-
-        // 6. PeerSharedFirst (signed by device_invite key)
-        let peer_shared_key = SigningKey::generate(&mut rng);
-        let psf = ParsedEvent::PeerSharedFirst(PeerSharedFirstEvent {
-            created_at_ms: current_timestamp_ms(),
-            public_key: peer_shared_key.verifying_key().to_bytes(),
-            signed_by: dif_eid,
-            signer_type: 3,
-            signature: [0u8; 64],
-        });
-        let psf_eid = create_signed_event_sync(&db, &self.identity, &psf, &device_invite_key)
-            .expect("failed to create peer_shared_first");
-
-        self.peer_shared_event_id = Some(psf_eid);
-        self.peer_shared_signing_key = Some(peer_shared_key);
-        self.workspace_signing_key = Some(workspace_key);
+        self.workspace_id = chain.workspace_id;
+        self.peer_shared_event_id = Some(chain.peer_shared_event_id);
+        self.peer_shared_signing_key = Some(chain.peer_shared_key);
+        self.workspace_signing_key = Some(chain.workspace_key);
     }
 
-    /// Create a new peer that joins an existing workspace created by `creator`.
-    /// The new peer gets a full identity chain rooted in the shared workspace,
-    /// so identity-derived trust (TransportKey validation) works across peers.
+    /// Create a new peer that joins an existing workspace created by `creator`
+    /// using the production invite flow: creator issues a `create_user_invite`,
+    /// joiner copies prerequisite events and calls `accept_user_invite`.
+    /// Both TransportKey and full identity chain are created automatically.
     pub fn new_in_workspace(name: &str, creator: &Peer) -> Self {
         use crate::crypto::event_id_to_base64;
+        use crate::identity_ops::{create_user_invite, accept_user_invite};
 
         let mut peer = Self::new(name);
         let db = open_connection(&peer.db_path).expect("failed to open db");
         let creator_db = open_connection(&creator.db_path).expect("failed to open creator db");
         let workspace_key = creator.workspace_signing_key.as_ref()
             .expect("creator has no workspace_signing_key; use new_with_identity()");
-        let mut rng = rand::thread_rng();
 
-        // Copy the Workspace event from creator's DB to this peer's DB
-        let ws_b64 = event_id_to_base64(&creator.workspace_id);
-        let (event_type, blob, share_scope, created_at, inserted_at): (String, Vec<u8>, String, i64, i64) =
-            creator_db.query_row(
-                "SELECT event_type, blob, share_scope, created_at, inserted_at FROM events WHERE event_id = ?1",
-                rusqlite::params![&ws_b64],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
-            ).expect("workspace event not found in creator");
+        // Creator issues an invite (creates UserInviteOngoing on creator's DB)
+        let invite = create_user_invite(
+            &creator_db, &creator.identity, workspace_key, &creator.workspace_id,
+        ).expect("failed to create user invite");
+
+        // Copy prerequisite events from creator to joiner:
+        // Workspace + the UserInviteBoot created by create_user_invite
+        for eid in &[creator.workspace_id, invite.invite_event_id] {
+            let eid_b64 = event_id_to_base64(eid);
+            let (event_type, blob, share_scope, created_at, inserted_at): (String, Vec<u8>, String, i64, i64) =
+                creator_db.query_row(
+                    "SELECT event_type, blob, share_scope, created_at, inserted_at FROM events WHERE event_id = ?1",
+                    rusqlite::params![&eid_b64],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                ).expect("event not found in creator");
+
+            let scope = parse_share_scope(&share_scope).expect("invalid share_scope");
+            insert_event(&db, eid, &event_type, &blob, scope, created_at, inserted_at)
+                .expect("failed to insert event");
+
+            let now_ms = current_timestamp_ms() as i64;
+            insert_recorded_event(&db, &peer.identity, eid, now_ms, "test")
+                .expect("failed to record event");
+            insert_neg_item_if_shared(&db, scope, created_at, eid)
+                .expect("failed to add to neg_items");
+
+            let _ = project_one(&db, &peer.identity, eid);
+        }
         drop(creator_db);
 
-        let scope = parse_share_scope(&share_scope).expect("invalid workspace share_scope");
-        insert_event(
-            &db,
-            &creator.workspace_id,
-            &event_type,
-            &blob,
-            scope,
-            created_at,
-            inserted_at,
-        )
-        .expect("failed to insert workspace event");
-
-        let now_ms = current_timestamp_ms() as i64;
-        insert_recorded_event(&db, &peer.identity, &creator.workspace_id, now_ms, "test")
-            .expect("failed to record workspace event");
-
-        // Add to neg_items so this peer advertises the workspace.
-        insert_neg_item_if_shared(&db, scope, created_at, &creator.workspace_id)
-            .expect("failed to add workspace to neg_items");
-
-        // Project workspace (guard-blocked: no trust anchor yet)
-        let _ = project_one(&db, &peer.identity, &creator.workspace_id);
-
-        // InviteAccepted: sets trust anchor, then retry_guard_blocked unblocks Workspace
-        let ia = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
-            created_at_ms: current_timestamp_ms(),
-            invite_event_id: creator.workspace_id,
-            workspace_id: creator.workspace_id,
-        });
-        create_event_sync(&db, &peer.identity, &ia)
-            .expect("failed to create invite_accepted");
-
-        // Re-project Workspace (now trust anchor exists)
-        project_one(&db, &peer.identity, &creator.workspace_id).unwrap();
-
-        // UserInviteBoot (signed by workspace key from creator)
-        let invite_key = SigningKey::generate(&mut rng);
-        let uib = ParsedEvent::UserInviteBoot(UserInviteBootEvent {
-            created_at_ms: current_timestamp_ms(),
-            public_key: invite_key.verifying_key().to_bytes(),
-            workspace_id: creator.workspace_id,
-            signed_by: creator.workspace_id,
-            signer_type: 1,
-            signature: [0u8; 64],
-        });
-        let uib_eid = create_signed_event_sync(&db, &peer.identity, &uib, workspace_key)
-            .expect("failed to create user_invite_boot");
-
-        // UserBoot (signed by invite key)
-        let user_key = SigningKey::generate(&mut rng);
-        let ub = ParsedEvent::UserBoot(UserBootEvent {
-            created_at_ms: current_timestamp_ms(),
-            public_key: user_key.verifying_key().to_bytes(),
-            signed_by: uib_eid,
-            signer_type: 2,
-            signature: [0u8; 64],
-        });
-        let ub_eid = create_signed_event_sync(&db, &peer.identity, &ub, &invite_key)
-            .expect("failed to create user_boot");
-
-        // DeviceInviteFirst (signed by user key)
-        let device_invite_key = SigningKey::generate(&mut rng);
-        let dif = ParsedEvent::DeviceInviteFirst(DeviceInviteFirstEvent {
-            created_at_ms: current_timestamp_ms(),
-            public_key: device_invite_key.verifying_key().to_bytes(),
-            signed_by: ub_eid,
-            signer_type: 4,
-            signature: [0u8; 64],
-        });
-        let dif_eid = create_signed_event_sync(&db, &peer.identity, &dif, &user_key)
-            .expect("failed to create device_invite_first");
-
-        // PeerSharedFirst (signed by device_invite key)
-        let peer_shared_key = SigningKey::generate(&mut rng);
-        let psf = ParsedEvent::PeerSharedFirst(PeerSharedFirstEvent {
-            created_at_ms: current_timestamp_ms(),
-            public_key: peer_shared_key.verifying_key().to_bytes(),
-            signed_by: dif_eid,
-            signer_type: 3,
-            signature: [0u8; 64],
-        });
-        let psf_eid = create_signed_event_sync(&db, &peer.identity, &psf, &device_invite_key)
-            .expect("failed to create peer_shared_first");
+        // Joiner accepts the invite (production flow: InviteAccepted → UserBoot →
+        // DeviceInviteFirst → PeerSharedFirst → TransportKey)
+        let join = accept_user_invite(
+            &db, &peer.identity, &invite.invite_key,
+            &invite.invite_event_id, creator.workspace_id,
+        ).expect("failed to accept user invite");
 
         peer.workspace_id = creator.workspace_id;
-        peer.peer_shared_event_id = Some(psf_eid);
-        peer.peer_shared_signing_key = Some(peer_shared_key);
+        peer.peer_shared_event_id = Some(join.peer_shared_event_id);
+        peer.peer_shared_signing_key = Some(join.peer_shared_key);
 
         peer
     }
@@ -329,8 +205,9 @@ impl Peer {
 
     /// Load (or generate) the transport certificate and private key for this peer.
     pub fn cert_and_key(&self) -> (CertificateDer<'static>, PrivatePkcs8KeyDer<'static>) {
-        let (cp, kp) = transport_cert_paths_from_db(&self.db_path);
-        load_or_generate_cert(&cp, &kp).expect("failed to load cert")
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        let (_, cert, key) = ensure_transport_cert(&db).expect("failed to load cert");
+        (cert, key)
     }
 
     /// Extract the SPKI fingerprint (SHA-256) from this peer's transport certificate.
@@ -1375,37 +1252,27 @@ pub fn start_peers_identity_trust(
     (a_handle, b_handle)
 }
 
-/// Start sync, wait for convergence, return metrics.
-pub async fn sync_until_converged(
+/// Start sync, wait for a caller-defined convergence check, return metrics.
+pub async fn sync_until_converged<F: Fn() -> bool>(
     peer_a: &Peer,
     peer_b: &Peer,
-    expected_count: i64,
+    check: F,
     timeout: Duration,
 ) -> SyncMetrics {
     let a_before = peer_a.store_count();
     let b_before = peer_b.store_count();
-    let events_to_transfer =
-        (expected_count - a_before) + (expected_count - b_before);
 
     let start = Instant::now();
     let sync = start_peers(peer_a, peer_b);
 
-    assert_eventually(
-        || peer_a.store_count() >= expected_count && peer_b.store_count() >= expected_count,
-        timeout,
-        &format!(
-            "convergence to {} events (a={}, b={})",
-            expected_count,
-            peer_a.store_count(),
-            peer_b.store_count(),
-        ),
-    ).await;
+    assert_eventually(check, timeout, "sync convergence").await;
 
     let wall_secs = start.elapsed().as_secs_f64();
     drop(sync);
 
-    let events_transferred = events_to_transfer as u64;
-    // Variable-length events — estimate ~100 bytes per event
+    let a_after = peer_a.store_count();
+    let b_after = peer_b.store_count();
+    let events_transferred = ((a_after - a_before) + (b_after - b_before)) as u64;
     let bytes_transferred = events_transferred * 100;
     let events_per_sec = if wall_secs > 0.0 { events_transferred as f64 / wall_secs } else { 0.0 };
     let throughput_mib_s = (bytes_transferred as f64) / (1024.0 * 1024.0) / wall_secs.max(0.001);
@@ -1450,21 +1317,14 @@ pub fn start_chain(peers: &[Peer]) -> Vec<std::thread::JoinHandle<()>> {
     // Extract fingerprints for all peers (needed before creating endpoints)
     let mut fingerprints: Vec<[u8; 32]> = Vec::new();
     for peer in peers {
-        let (cert_path, key_path) = transport_cert_paths_from_db(&peer.db_path);
-        let (cert, _) = load_or_generate_cert(&cert_path, &key_path)
-            .expect("failed to load cert for fingerprint");
-        let fp = extract_spki_fingerprint(cert.as_ref())
-            .expect("failed to extract fingerprint");
-        fingerprints.push(fp);
+        fingerprints.push(peer.spki_fingerprint());
     }
 
     // Create server endpoints for peers 0..n-2 (each accepts from its right neighbor)
     let mut server_addrs: Vec<SocketAddr> = Vec::new();
     let mut server_endpoints: Vec<quinn::Endpoint> = Vec::new();
     for i in 0..n-1 {
-        let (cert_path, key_path) = transport_cert_paths_from_db(&peers[i].db_path);
-        let (cert, key) = load_or_generate_cert(&cert_path, &key_path)
-            .expect("failed to load cert for server");
+        let (cert, key) = peers[i].cert_and_key();
         let allowed = Arc::new(AllowedPeers::from_fingerprints(vec![fingerprints[i+1]]));
         let endpoint = create_server_endpoint(
             "127.0.0.1:0".parse().unwrap(),
@@ -1478,9 +1338,7 @@ pub fn start_chain(peers: &[Peer]) -> Vec<std::thread::JoinHandle<()>> {
     // Create client endpoints for peers 1..n-1 (each connects to its left neighbor)
     let mut client_endpoints: Vec<quinn::Endpoint> = Vec::new();
     for i in 1..n {
-        let (cert_path, key_path) = transport_cert_paths_from_db(&peers[i].db_path);
-        let (cert, key) = load_or_generate_cert(&cert_path, &key_path)
-            .expect("failed to load cert for client");
+        let (cert, key) = peers[i].cert_and_key();
         let allowed = Arc::new(AllowedPeers::from_fingerprints(vec![fingerprints[i-1]]));
         let endpoint = create_client_endpoint(
             "0.0.0.0:0".parse().unwrap(),
@@ -1542,20 +1400,12 @@ pub fn start_multi_source(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Joi
     // Extract source fingerprints
     let mut source_fps: Vec<[u8; 32]> = Vec::new();
     for source in sources {
-        let (cert_path, key_path) = transport_cert_paths_from_db(&source.db_path);
-        let (cert, _) = load_or_generate_cert(&cert_path, &key_path)
-            .expect("failed to load source cert");
-        let fp = extract_spki_fingerprint(cert.as_ref())
-            .expect("failed to extract source fingerprint");
-        source_fps.push(fp);
+        source_fps.push(source.spki_fingerprint());
     }
 
     // Sink server endpoint allows all sources
-    let (sink_cert_path, sink_key_path) = transport_cert_paths_from_db(&sink.db_path);
-    let (sink_cert, sink_key) = load_or_generate_cert(&sink_cert_path, &sink_key_path)
-        .expect("failed to load sink cert");
-    let sink_fp = extract_spki_fingerprint(sink_cert.as_ref())
-        .expect("failed to extract sink fingerprint");
+    let (sink_cert, sink_key) = sink.cert_and_key();
+    let sink_fp = sink.spki_fingerprint();
 
     let allowed_for_sink = Arc::new(AllowedPeers::from_fingerprints(source_fps));
     let server_endpoint = create_server_endpoint(
@@ -1583,9 +1433,7 @@ pub fn start_multi_source(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Joi
 
     // Spawn connect_loop for each source
     for (i, source) in sources.iter().enumerate() {
-        let (cert_path, key_path) = transport_cert_paths_from_db(&source.db_path);
-        let (cert, key) = load_or_generate_cert(&cert_path, &key_path)
-            .expect("failed to load source cert");
+        let (cert, key) = source.cert_and_key();
         let allowed = Arc::new(AllowedPeers::from_fingerprints(vec![sink_fp]));
         let endpoint = create_client_endpoint(
             "0.0.0.0:0".parse().unwrap(),
@@ -1622,20 +1470,15 @@ pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Jo
     assert!(!sources.is_empty(), "need at least one source");
 
     // Extract sink fingerprint for sources to allow
-    let (sink_cert_path, sink_key_path) = transport_cert_paths_from_db(&sink.db_path);
-    let (sink_cert, sink_key) = load_or_generate_cert(&sink_cert_path, &sink_key_path)
-        .expect("failed to load sink cert");
-    let sink_fp = extract_spki_fingerprint(sink_cert.as_ref())
-        .expect("failed to extract sink fingerprint");
+    let (sink_cert, sink_key) = sink.cert_and_key();
+    let sink_fp = sink.spki_fingerprint();
 
     let mut handles = Vec::new();
     let mut source_addrs = Vec::new();
 
     // Start accept_loop for each source
     for source in sources {
-        let (cert_path, key_path) = transport_cert_paths_from_db(&source.db_path);
-        let (cert, key) = load_or_generate_cert(&cert_path, &key_path)
-            .expect("failed to load source cert");
+        let (cert, key) = source.cert_and_key();
 
         let allowed = Arc::new(AllowedPeers::from_fingerprints(vec![sink_fp]));
         let server_endpoint = create_server_endpoint(
@@ -1663,11 +1506,7 @@ pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Jo
     // Build per-source client endpoints for the sink
     let mut endpoint_pairs = Vec::new();
     for (i, source) in sources.iter().enumerate() {
-        let (cert_path, key_path) = transport_cert_paths_from_db(&source.db_path);
-        let (cert, _) = load_or_generate_cert(&cert_path, &key_path)
-            .expect("failed to load source cert");
-        let source_fp = extract_spki_fingerprint(cert.as_ref())
-            .expect("failed to extract source fingerprint");
+        let source_fp = source.spki_fingerprint();
 
         let allowed = Arc::new(AllowedPeers::from_fingerprints(vec![source_fp]));
         let client_endpoint = create_client_endpoint(
@@ -1705,8 +1544,9 @@ pub async fn connect_sync_once(
     remote_addr: SocketAddr,
     remote_fp: [u8; 32],
 ) -> Result<crate::runtime::SyncStats, Box<dyn std::error::Error + Send + Sync>> {
-    let (cert_path, key_path) = transport_cert_paths_from_db(db_path);
-    let (cert, key) = load_or_generate_cert(&cert_path, &key_path)?;
+    let (_, cert, key) = ensure_transport_cert(
+        &open_connection(db_path)?
+    )?;
     let allowed = Arc::new(AllowedPeers::from_fingerprints(vec![remote_fp]));
     let endpoint = create_client_endpoint("0.0.0.0:0".parse().unwrap(), cert, key, allowed)?;
 
@@ -1740,9 +1580,7 @@ pub fn start_sink_accept(
     sink: &Peer,
     allowed_fps: Vec<[u8; 32]>,
 ) -> (std::thread::JoinHandle<()>, SocketAddr) {
-    let (cert_path, key_path) = transport_cert_paths_from_db(&sink.db_path);
-    let (cert, key) = load_or_generate_cert(&cert_path, &key_path)
-        .expect("failed to load sink cert");
+    let (cert, key) = sink.cert_and_key();
     let allowed = Arc::new(AllowedPeers::from_fingerprints(allowed_fps));
     let endpoint = create_server_endpoint(
         "127.0.0.1:0".parse().unwrap(),
@@ -1767,13 +1605,288 @@ pub fn start_sink_accept(
     (handle, addr)
 }
 
-/// Extract the SPKI fingerprint for a peer (from its cert file).
+/// Extract the SPKI fingerprint for a peer.
 pub fn peer_fingerprint(peer: &Peer) -> [u8; 32] {
-    let (cert_path, key_path) = transport_cert_paths_from_db(&peer.db_path);
-    let (cert, _) = load_or_generate_cert(&cert_path, &key_path)
-        .expect("failed to load cert");
-    extract_spki_fingerprint(cert.as_ref())
-        .expect("failed to extract fingerprint")
+    peer.spki_fingerprint()
+}
+
+/// A multi-tenant node: multiple peers sharing a single database.
+///
+/// Each tenant has its own transport identity but they all use the same DB file.
+/// This mirrors the production `run_node` setup where tenant discovery comes from
+/// the join of `trust_anchors` and `local_transport_creds`.
+pub struct SharedDbNode {
+    pub db_path: String,
+    pub tenants: Vec<Peer>,
+    _tempdir: tempfile::TempDir,
+}
+
+impl SharedDbNode {
+    /// Create a shared-DB node with N tenants, each bootstrapped with a full identity chain.
+    pub fn new(n: usize) -> Self {
+        assert!(n >= 1, "need at least 1 tenant");
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        let db_path = tempdir.path().join("shared.db").to_str().unwrap().to_string();
+
+        // Initialize DB once
+        {
+            let db = open_connection(&db_path).expect("failed to open shared db");
+            create_tables(&db).expect("failed to create tables");
+        }
+
+        let mut tenants = Vec::with_capacity(n);
+        for i in 0..n {
+            let name = format!("tenant-{}", i);
+            // Create a Peer that uses the shared db_path
+            let peer = Self::create_tenant(&db_path, &name);
+            tenants.push(peer);
+        }
+
+        Self {
+            db_path,
+            tenants,
+            _tempdir: tempdir,
+        }
+    }
+
+    /// Create a single tenant within the shared DB.
+    fn create_tenant(db_path: &str, name: &str) -> Peer {
+        // Ensure tables exist (idempotent)
+        let db = open_connection(db_path).expect("failed to open db");
+        create_tables(&db).expect("failed to create tables");
+        drop(db);
+
+        // We need a separate identity for each tenant. The first call to
+        // ensure_transport_peer_id generates one cert; subsequent tenants
+        // need distinct certs. Generate a new cert for this tenant.
+        let (cert, key) = crate::transport::generate_self_signed_cert()
+            .expect("failed to generate cert");
+        let fp = extract_spki_fingerprint(cert.as_ref()).expect("failed to extract SPKI");
+        let tenant_identity = hex::encode(fp);
+
+        // Store this tenant's creds in the shared DB
+        let db = open_connection(db_path).expect("failed to open db");
+        crate::db::transport_creds::store_local_creds(
+            &db,
+            &tenant_identity,
+            cert.as_ref(),
+            key.secret_pkcs8_der(),
+        ).expect("failed to store creds");
+
+        let author_id: [u8; 32] = rand::random();
+
+        // Build a Peer struct pointing to the shared db
+        // We need a dummy tempdir since Peer owns one, but for SharedDbNode
+        // the real DB is in the node's tempdir
+        let dummy_tempdir = tempfile::tempdir().expect("failed to create dummy tempdir");
+
+        let mut peer = Peer {
+            name: name.to_string(),
+            db_path: db_path.to_string(),
+            identity: tenant_identity,
+            author_id,
+            workspace_id: [0u8; 32],
+            peer_shared_event_id: None,
+            peer_shared_signing_key: None,
+            workspace_signing_key: None,
+            _tempdir: dummy_tempdir,
+        };
+
+        // Bootstrap full identity chain
+        peer.bootstrap_identity_chain();
+        peer
+    }
+
+    /// Add a new tenant that joins an existing tenant's workspace (same DB)
+    /// using the production `create_user_invite` + `accept_user_invite` flow.
+    pub fn add_tenant_in_workspace(&mut self, name: &str, creator_index: usize) {
+        use crate::identity_ops::{create_user_invite, accept_user_invite};
+        use crate::projection::pipeline::project_one;
+
+        let creator = &self.tenants[creator_index];
+        let workspace_id = creator.workspace_id;
+        let workspace_key = creator.workspace_signing_key.as_ref()
+            .expect("creator has no workspace_signing_key")
+            .clone();
+        let creator_identity = creator.identity.clone();
+
+        // Create a new transport identity in the shared DB
+        let (cert, key) = crate::transport::generate_self_signed_cert()
+            .expect("failed to generate cert");
+        let fp = extract_spki_fingerprint(cert.as_ref()).expect("failed to extract SPKI");
+        let tenant_identity = hex::encode(fp);
+
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        crate::db::transport_creds::store_local_creds(
+            &db,
+            &tenant_identity,
+            cert.as_ref(),
+            key.secret_pkcs8_der(),
+        ).expect("failed to store creds");
+
+        // Creator issues an invite
+        let invite = create_user_invite(
+            &db, &creator_identity, &workspace_key, &workspace_id,
+        ).expect("failed to create user invite");
+
+        // The Workspace and UserInviteBoot events already exist in the shared DB.
+        // Record them for this new tenant and project.
+        let now_ms = current_timestamp_ms() as i64;
+        insert_recorded_event(&db, &tenant_identity, &workspace_id, now_ms, "test")
+            .expect("failed to record workspace event");
+        let _ = project_one(&db, &tenant_identity, &workspace_id);
+
+        insert_recorded_event(&db, &tenant_identity, &invite.invite_event_id, now_ms, "test")
+            .expect("failed to record invite event");
+        let _ = project_one(&db, &tenant_identity, &invite.invite_event_id);
+
+        // Accept the invite (production flow)
+        let join = accept_user_invite(
+            &db, &tenant_identity, &invite.invite_key,
+            &invite.invite_event_id, workspace_id,
+        ).expect("failed to accept user invite");
+
+        let author_id: [u8; 32] = rand::random();
+        let dummy_tempdir = tempfile::tempdir().expect("failed to create dummy tempdir");
+
+        let peer = Peer {
+            name: name.to_string(),
+            db_path: self.db_path.clone(),
+            identity: tenant_identity,
+            author_id,
+            workspace_id,
+            peer_shared_event_id: Some(join.peer_shared_event_id),
+            peer_shared_signing_key: Some(join.peer_shared_key),
+            workspace_signing_key: None,
+            _tempdir: dummy_tempdir,
+        };
+
+        self.tenants.push(peer);
+    }
+
+    /// Get the list of tenant peer_ids.
+    pub fn tenant_ids(&self) -> Vec<String> {
+        self.tenants.iter().map(|t| t.identity.clone()).collect()
+    }
+
+    /// Verify projection invariants for all tenants and assert no cross-tenant leakage.
+    pub fn verify_all_invariants(&self) {
+        for tenant in &self.tenants {
+            verify_projection_invariants(tenant);
+        }
+        let tenant_workspaces: Vec<(String, String)> = self.tenants.iter()
+            .map(|t| (t.identity.clone(), hex::encode(t.workspace_id)))
+            .collect();
+        assert_no_cross_tenant_leakage(&self.db_path, &tenant_workspaces);
+    }
+}
+
+/// Assert that no cross-tenant leakage exists in the shared database.
+///
+/// `tenant_workspaces` is a list of (peer_id, workspace_id) pairs. Checks:
+/// 1. For tenants in different workspaces: recorded_events and valid_events
+///    event_id sets are pairwise disjoint (no cross-workspace leakage).
+///    For tenants in the same workspace: overlap is expected after sync.
+/// 2. No unexpected peer_ids appear in recorded_events, valid_events, or
+///    projection tables.
+pub fn assert_no_cross_tenant_leakage(db_path: &str, tenant_workspaces: &[(String, String)]) {
+    let db = open_connection(db_path).expect("failed to open db");
+
+    let tenant_ids: Vec<&str> = tenant_workspaces.iter().map(|(id, _)| id.as_str()).collect();
+    let known_ids: std::collections::HashSet<&str> = tenant_ids.iter().copied().collect();
+
+    // Collect recorded event_ids per tenant
+    let mut recorded_per_tenant: std::collections::HashMap<&str, std::collections::HashSet<String>> = std::collections::HashMap::new();
+    for tid in &tenant_ids {
+        let mut stmt = db.prepare(
+            "SELECT event_id FROM recorded_events WHERE peer_id = ?1"
+        ).expect("failed to prepare stmt");
+        let events: std::collections::HashSet<String> = stmt
+            .query_map([tid], |row| row.get::<_, String>(0))
+            .expect("failed to query")
+            .collect::<Result<std::collections::HashSet<_>, _>>()
+            .expect("failed to collect");
+        recorded_per_tenant.insert(tid, events);
+    }
+
+    // Verify pairwise disjointness of recorded_events for tenants in DIFFERENT workspaces
+    for i in 0..tenant_workspaces.len() {
+        for j in (i + 1)..tenant_workspaces.len() {
+            let (id_a, ws_a) = &tenant_workspaces[i];
+            let (id_b, ws_b) = &tenant_workspaces[j];
+            if ws_a == ws_b {
+                continue; // same workspace — overlap is expected after sync
+            }
+            let a = recorded_per_tenant.get(id_a.as_str()).unwrap();
+            let b = recorded_per_tenant.get(id_b.as_str()).unwrap();
+            let overlap: Vec<&String> = a.intersection(b).collect();
+            assert!(overlap.is_empty(),
+                "Cross-workspace leakage in recorded_events between {} and {}: {:?}",
+                &id_a[..16], &id_b[..16], overlap);
+        }
+    }
+
+    // Collect valid event_ids per tenant
+    let mut valid_per_tenant: std::collections::HashMap<&str, std::collections::HashSet<String>> = std::collections::HashMap::new();
+    for tid in &tenant_ids {
+        let mut stmt = db.prepare(
+            "SELECT event_id FROM valid_events WHERE peer_id = ?1"
+        ).expect("failed to prepare stmt");
+        let events: std::collections::HashSet<String> = stmt
+            .query_map([tid], |row| row.get::<_, String>(0))
+            .expect("failed to query")
+            .collect::<Result<std::collections::HashSet<_>, _>>()
+            .expect("failed to collect");
+        valid_per_tenant.insert(tid, events);
+    }
+
+    for i in 0..tenant_workspaces.len() {
+        for j in (i + 1)..tenant_workspaces.len() {
+            let (id_a, ws_a) = &tenant_workspaces[i];
+            let (id_b, ws_b) = &tenant_workspaces[j];
+            if ws_a == ws_b {
+                continue; // same workspace — overlap is expected after sync
+            }
+            let a = valid_per_tenant.get(id_a.as_str()).unwrap();
+            let b = valid_per_tenant.get(id_b.as_str()).unwrap();
+            let overlap: Vec<&String> = a.intersection(b).collect();
+            assert!(overlap.is_empty(),
+                "Cross-workspace leakage in valid_events between {} and {}: {:?}",
+                &id_a[..16], &id_b[..16], overlap);
+        }
+    }
+
+    // Verify no unexpected peer_ids in key scoped tables
+    for table in &["recorded_events", "valid_events"] {
+        let query = format!("SELECT DISTINCT peer_id FROM {}", table);
+        let mut stmt = db.prepare(&query).expect("failed to prepare");
+        let found_ids: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("failed to query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("failed to collect");
+        for found_id in &found_ids {
+            assert!(known_ids.contains(found_id.as_str()),
+                "Unknown peer_id '{}...' in {} table",
+                &found_id[..16.min(found_id.len())], table);
+        }
+    }
+
+    // Verify no unexpected peer_ids in projection tables
+    for table in &["messages", "reactions", "signed_memos", "secret_keys", "deleted_messages"] {
+        let query = format!("SELECT DISTINCT recorded_by FROM {}", table);
+        let mut stmt = db.prepare(&query).expect("failed to prepare");
+        let found_ids: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("failed to query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("failed to collect");
+        for found_id in &found_ids {
+            assert!(known_ids.contains(found_id.as_str()),
+                "Unknown peer_id '{}...' in {} table",
+                &found_id[..16.min(found_id.len())], table);
+        }
+    }
 }
 
 /// Copy all events and neg_items from a source peer's database to target peers.

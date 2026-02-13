@@ -42,6 +42,11 @@ use crate::transport::{
 };
 use crate::transport::connection::ConnectionError;
 
+/// Ingest channel item: (event_id, blob, recorded_by).
+/// The `recorded_by` field allows a shared batch_writer to route events
+/// to the correct tenant's projection pipeline.
+pub type IngestItem = (EventId, Vec<u8>, String);
+
 fn low_mem_mode() -> bool {
     read_bool_env("LOW_MEM_IOS") || read_bool_env("LOW_MEM")
 }
@@ -152,10 +157,12 @@ fn shared_ingest_cap() -> usize {
 /// Batch writer task - drains channel and writes to SQLite in batches.
 /// Writes event blob/neg_items/recorded_events, enqueues into project_queue,
 /// then drains the queue via `project_one` for crash-recoverable projection.
+///
+/// Each item carries its own `recorded_by`, enabling a single writer to serve
+/// multiple tenants sharing one DB.
 pub fn batch_writer(
     db_path: String,
-    recorded_by: String,
-    mut rx: mpsc::Receiver<(EventId, Vec<u8>)>,
+    mut rx: mpsc::Receiver<IngestItem>,
     events_received: Arc<AtomicU64>,
 ) {
     let db = match open_connection(&db_path) {
@@ -245,7 +252,9 @@ pub fn batch_writer(
 
         // First pass: write blob storage, neg_items, recorded_events, enqueue for projection
         let mut event_ids_persisted: Vec<EventId> = Vec::with_capacity(batch.len());
-        for (event_id, blob) in &batch {
+        // Collect distinct tenants seen in this batch for per-tenant drain
+        let mut tenants_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (event_id, blob, recorded_by) in &batch {
             let event_id_b64 = event_id_to_base64(event_id);
 
             if let Some(created_at_ms) = events::extract_created_at_ms(blob) {
@@ -279,7 +288,7 @@ pub fn batch_writer(
                             .unwrap()
                             .as_millis() as i64;
                         if let Err(e) = recorded_stmt.execute(rusqlite::params![
-                            &recorded_by,
+                            recorded_by,
                             &event_id_b64,
                             recorded_at,
                             "quic_recv"
@@ -290,13 +299,14 @@ pub fn batch_writer(
 
                         // Enqueue for durable projection (atomicity boundary 1)
                         if let Err(e) = enqueue_stmt.execute(rusqlite::params![
-                            &recorded_by,
+                            recorded_by,
                             &event_id_b64,
                             current_timestamp_ms()
                         ]) {
                             warn!("project_queue enqueue error for {}: {}", event_id_b64, e);
                         }
 
+                        tenants_seen.insert(recorded_by.clone());
                         event_ids_persisted.push(*event_id);
                     }
                 }
@@ -309,20 +319,22 @@ pub fn batch_writer(
                     let _ = wanted.remove(event_id);
                 }
 
-                // Second pass: drain project_queue
+                // Second pass: drain project_queue per tenant
                 let batch_sz = drain_batch_size();
-                if let Err(e) = pq.drain_with_limit(&recorded_by, batch_sz, |conn, event_id_b64| {
-                    if let Some(eid) = event_id_from_base64(event_id_b64) {
-                        project_one(conn, &recorded_by, &eid)
-                            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                for rb in &tenants_seen {
+                    if let Err(e) = pq.drain_with_limit(rb, batch_sz, |conn, event_id_b64| {
+                        if let Some(eid) = event_id_from_base64(event_id_b64) {
+                            project_one(conn, rb, &eid)
+                                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                        }
+                        Ok(())
+                    }) {
+                        warn!("project_queue drain error for {}: {}", rb, e);
                     }
-                    Ok(())
-                }) {
-                    warn!("project_queue drain error: {}", e);
-                }
-                if let Ok(h) = pq.health(&recorded_by) {
-                    if h.pending > 0 || h.max_attempts > 0 {
-                        tracing::debug!(pending=%h.pending, max_attempts=%h.max_attempts, oldest_age_ms=%h.oldest_age_ms, "project_queue health");
+                    if let Ok(h) = pq.health(rb) {
+                        if h.pending > 0 || h.max_attempts > 0 {
+                            tracing::debug!(tenant=%rb, pending=%h.pending, max_attempts=%h.max_attempts, oldest_age_ms=%h.oldest_age_ms, "project_queue health");
+                        }
                     }
                 }
             }
@@ -342,10 +354,14 @@ pub fn batch_writer(
 /// - `shutdown_tx`: forced shutdown (timeout fallback only)
 /// - `data_drained_rx`: signals when peer's DataDone marker is received (all data consumed)
 /// - `JoinHandle`: task handle
+///
+/// Each received event is tagged with `recorded_by` before being sent to the
+/// ingest channel, so the batch_writer can route it to the correct tenant.
 pub fn spawn_data_receiver<R>(
     mut data_recv: R,
-    ingest_tx: mpsc::Sender<(EventId, Vec<u8>)>,
+    ingest_tx: mpsc::Sender<IngestItem>,
     bytes_received: Arc<AtomicU64>,
+    recorded_by: String,
 ) -> (oneshot::Sender<()>, oneshot::Receiver<()>, tokio::task::JoinHandle<()>)
 where
     R: StreamRecv + Send + 'static,
@@ -364,7 +380,7 @@ where
                         Ok(SyncMessage::Event { blob }) => {
                             bytes_received.fetch_add(blob.len() as u64, Ordering::Relaxed);
                             let event_id = hash_event(&blob);
-                            if ingest_tx.send((event_id, blob)).await.is_err() {
+                            if ingest_tx.send((event_id, blob, recorded_by.clone())).await.is_err() {
                                 warn!("Ingest channel closed");
                                 break;
                             }
@@ -550,7 +566,7 @@ pub async fn run_sync_initiator_dual<C, S, R>(
     peer_id: &str,
     recorded_by: &str,
     coordination: Option<&PeerCoord>,
-    shared_ingest: Option<mpsc::Sender<(EventId, Vec<u8>)>>,
+    shared_ingest: Option<mpsc::Sender<IngestItem>>,
 ) -> Result<SyncStats, Box<dyn std::error::Error + Send + Sync>>
 where
     C: StreamConn,
@@ -592,12 +608,11 @@ where
         (shared_tx, None)
     } else {
         let ingest_cap = session_ingest_cap();
-        let (tx, rx) = mpsc::channel::<(EventId, Vec<u8>)>(ingest_cap);
+        let (tx, rx) = mpsc::channel::<IngestItem>(ingest_cap);
         let events_received_writer = events_received.clone();
         let db_path_owned = db_path.to_string();
-        let recorded_by_owned = recorded_by.to_string();
         let handle = tokio::task::spawn_blocking(move || {
-            batch_writer(db_path_owned, recorded_by_owned, rx, events_received_writer)
+            batch_writer(db_path_owned, rx, events_received_writer)
         });
         (tx, Some(handle))
     };
@@ -607,7 +622,7 @@ where
     let mut events_sent: u64 = 0;
     let mut bytes_sent: u64 = 0;
     let (shutdown_tx, data_drained_rx, recv_handle) =
-        spawn_data_receiver(data_recv, ingest_tx.clone(), bytes_received.clone());
+        spawn_data_receiver(data_recv, ingest_tx.clone(), bytes_received.clone(), recorded_by.to_string());
 
     let initial_msg = neg.initiate()?;
     control.send(&SyncMessage::NegOpen { msg: initial_msg }).await?;
@@ -849,7 +864,7 @@ pub async fn run_sync_responder_dual<C, S, R>(
     timeout_secs: u64,
     peer_id: &str,
     recorded_by: &str,
-    shared_ingest: Option<mpsc::Sender<(EventId, Vec<u8>)>>,
+    shared_ingest: Option<mpsc::Sender<IngestItem>>,
 ) -> Result<SyncStats, Box<dyn std::error::Error + Send + Sync>>
 where
     C: StreamConn,
@@ -889,18 +904,17 @@ where
         (shared_tx, None)
     } else {
         let ingest_cap = session_ingest_cap();
-        let (tx, rx) = mpsc::channel::<(EventId, Vec<u8>)>(ingest_cap);
+        let (tx, rx) = mpsc::channel::<IngestItem>(ingest_cap);
         let events_received_writer = events_received.clone();
         let db_path_owned = db_path.to_string();
-        let recorded_by_owned = recorded_by.to_string();
         let handle = tokio::task::spawn_blocking(move || {
-            batch_writer(db_path_owned, recorded_by_owned, rx, events_received_writer)
+            batch_writer(db_path_owned, rx, events_received_writer)
         });
         (tx, Some(handle))
     };
 
     let (shutdown_tx, data_drained_rx, recv_handle) =
-        spawn_data_receiver(data_recv, ingest_tx.clone(), bytes_received.clone());
+        spawn_data_receiver(data_recv, ingest_tx.clone(), bytes_received.clone(), recorded_by.to_string());
 
     let mut events_sent: u64 = 0;
     let mut bytes_sent: u64 = 0;
@@ -1047,6 +1061,32 @@ pub async fn accept_loop(
     recorded_by: &str,
     endpoint: quinn::Endpoint,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Shared batch_writer: single writer thread for all concurrent responder sessions.
+    // Eliminates SQLite WAL contention from multiple writers hitting the same DB.
+    let ingest_cap = shared_ingest_cap();
+    let (shared_ingest_tx, shared_ingest_rx) = mpsc::channel::<IngestItem>(ingest_cap);
+    let shared_events_received = Arc::new(AtomicU64::new(0));
+    let writer_events = shared_events_received.clone();
+    let writer_db_path = db_path.to_string();
+    let _writer_handle = std::thread::spawn(move || {
+        batch_writer(writer_db_path, shared_ingest_rx, writer_events);
+    });
+
+    accept_loop_with_ingest(db_path, recorded_by, endpoint, allowed_peers, shared_ingest_tx).await
+}
+
+/// Accept incoming connections using an externally-provided ingest channel.
+///
+/// Same as `accept_loop` but takes a pre-existing `Sender<IngestItem>` instead
+/// of spawning its own batch_writer. Used by the multi-tenant node daemon so
+/// all tenants share a single writer thread.
+pub async fn accept_loop_with_ingest(
+    db_path: &str,
+    recorded_by: &str,
+    endpoint: quinn::Endpoint,
+    allowed_peers: Option<crate::transport::AllowedPeers>,
+    shared_ingest_tx: mpsc::Sender<IngestItem>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     {
         let db = open_connection(db_path)?;
         create_tables(&db)?;
@@ -1073,26 +1113,12 @@ pub async fn accept_loop(
         }
     }
 
-    // Shared batch_writer: single writer thread for all concurrent responder sessions.
-    // Eliminates SQLite WAL contention from multiple writers hitting the same DB.
-    let ingest_cap = shared_ingest_cap();
-    let (shared_ingest_tx, shared_ingest_rx) = mpsc::channel::<(EventId, Vec<u8>)>(ingest_cap);
-    let shared_events_received = Arc::new(AtomicU64::new(0));
-    let writer_events = shared_events_received.clone();
-    let writer_db_path = db_path.to_string();
-    let writer_recorded_by = recorded_by.to_string();
-    let _writer_handle = std::thread::spawn(move || {
-        batch_writer(writer_db_path, writer_recorded_by, shared_ingest_rx, writer_events);
-    });
-
     loop {
         info!("Waiting for incoming connection...");
         let incoming = match endpoint.accept().await {
             Some(inc) => inc,
             None => {
                 info!("Endpoint closed, stopping accept_loop");
-                // Drop sender so batch_writer exits
-                drop(shared_ingest_tx);
                 return Ok(());
             }
         };
@@ -1365,13 +1391,12 @@ pub async fn download_from_sources(
 
     // Shared batch_writer: single writer for all source connections
     let ingest_cap = shared_ingest_cap();
-    let (shared_tx, shared_rx) = mpsc::channel::<(EventId, Vec<u8>)>(ingest_cap);
+    let (shared_tx, shared_rx) = mpsc::channel::<IngestItem>(ingest_cap);
     let shared_events = Arc::new(AtomicU64::new(0));
     let writer_events = shared_events.clone();
     let writer_db_path = db_path.to_string();
-    let writer_recorded_by = recorded_by.to_string();
     let _writer_handle = std::thread::spawn(move || {
-        batch_writer(writer_db_path, writer_recorded_by, shared_rx, writer_events);
+        batch_writer(writer_db_path, shared_rx, writer_events);
     });
 
     // Create per-peer coordination channels

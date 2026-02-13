@@ -1,9 +1,12 @@
 pub mod crypto;
 pub mod db;
+#[cfg(feature = "discovery")]
+pub mod discovery;
 pub mod events;
 pub mod identity_ops;
 pub mod interactive;
 pub mod invite_link;
+pub mod node;
 pub mod projection;
 pub mod rpc;
 pub mod runtime;

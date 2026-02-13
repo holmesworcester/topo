@@ -22,11 +22,12 @@ use crate::events::{
 use crate::projection::create::{create_event_sync, create_signed_event_sync, CreateEventError};
 use crate::projection::pipeline::project_one;
 use crate::transport::{
-    create_dual_endpoint, create_dual_endpoint_dynamic, extract_spki_fingerprint,
-    load_or_generate_cert, AllowedPeers,
+    create_dual_endpoint, create_dual_endpoint_dynamic,
+    AllowedPeers,
 };
 use crate::transport_identity::{
-    ensure_transport_peer_id_from_db, load_transport_peer_id_from_db, transport_cert_paths_from_db,
+    ensure_transport_peer_id_from_db, ensure_transport_cert_from_db,
+    load_transport_peer_id_from_db,
 };
 
 // ---------------------------------------------------------------------------
@@ -103,6 +104,12 @@ fn unwrap_event_id(result: Result<EventId, CreateEventError>) -> ServiceResult<E
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TransportIdentityResponse {
     pub fingerprint: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct NodeTenantItem {
+    pub peer_id: String,
+    pub workspace_id: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -509,12 +516,22 @@ pub fn query_field(db: &rusqlite::Connection, field: &str, recorded_by: &str) ->
 // ---------------------------------------------------------------------------
 
 pub fn svc_transport_identity(db_path: &str) -> ServiceResult<TransportIdentityResponse> {
-    let (cert_path, key_path) = transport_cert_paths_from_db(db_path);
-    let (cert_der, _) = load_or_generate_cert(&cert_path, &key_path)?;
-    let fp = extract_spki_fingerprint(cert_der.as_ref())?;
-    Ok(TransportIdentityResponse {
-        fingerprint: hex::encode(fp),
-    })
+    let fingerprint = ensure_transport_peer_id_from_db(db_path)?;
+    Ok(TransportIdentityResponse { fingerprint })
+}
+
+/// Node status: list local tenant identities discovered from DB.
+pub fn svc_node_status(db_path: &str) -> ServiceResult<Vec<NodeTenantItem>> {
+    let db = open_connection(db_path)?;
+    create_tables(&db)?;
+    let tenants = crate::db::transport_creds::discover_local_tenants(&db)?;
+    Ok(tenants
+        .into_iter()
+        .map(|t| NodeTenantItem {
+            peer_id: t.peer_id,
+            workspace_id: t.workspace_id,
+        })
+        .collect())
 }
 
 pub fn svc_messages(db_path: &str, limit: usize) -> ServiceResult<MessagesResponse> {
@@ -937,12 +954,7 @@ pub fn svc_intro_attempts(
     let db = open_connection(db_path)?;
     create_tables(&db)?;
 
-    let recorded_by = {
-        let (cert_path, key_path) = transport_cert_paths_from_db(db_path);
-        let (cert, _) = load_or_generate_cert(&cert_path, &key_path)?;
-        let fp = extract_spki_fingerprint(cert.as_ref())?;
-        hex::encode(fp)
-    };
+    let recorded_by = ensure_transport_peer_id_from_db(db_path)?;
 
     let rows = crate::db::intro::list_intro_attempts(&db, &recorded_by, peer)?;
     Ok(rows
@@ -979,12 +991,7 @@ pub async fn svc_sync(
         create_tables(&db)?;
     }
 
-    let (cert_path, key_path) = transport_cert_paths_from_db(db_path);
-    let (cert, key) = load_or_generate_cert(&cert_path, &key_path)?;
-    let recorded_by = {
-        let fp = extract_spki_fingerprint(cert.as_ref())?;
-        hex::encode(fp)
-    };
+    let (recorded_by, cert, key) = ensure_transport_cert_from_db(db_path)?;
 
     let cli_pins = AllowedPeers::from_hex_strings(pin_peers)?;
     {
@@ -1086,12 +1093,7 @@ pub async fn svc_intro(
     create_tables(&db)?;
     drop(db);
 
-    let (cert_path, key_path) = transport_cert_paths_from_db(db_path);
-    let (cert, key) = load_or_generate_cert(&cert_path, &key_path)?;
-    let recorded_by = {
-        let fp = extract_spki_fingerprint(cert.as_ref())?;
-        hex::encode(fp)
-    };
+    let (recorded_by, cert, key) = ensure_transport_cert_from_db(db_path)?;
 
     let mut all_pins = pin_peers.to_vec();
     if !all_pins.contains(&peer_a.to_string()) {
