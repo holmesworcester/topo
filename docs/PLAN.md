@@ -1101,16 +1101,26 @@ Not in scope yet:
 - For each identity-phase projector, include a referenced guard list in comments/docs.
 - Treat divergence between projector logic and TLA guards as a spec bug that must be resolved before adding behavior.
 
-## 11.8 TLA transport-scope gap (must be explicit)
+## 11.8 TLA transport-credential lifecycle (gap closed)
 
-Current TLA models are identity/event-causality models first. They may intentionally abstract over transport internals.
+**Status:** Closed. `docs/tla/TransportCredentialLifecycle.tla` models the runtime transport credential and trust-store layer.
 
-Required explicit note for future work:
-- current models do not fully encode mTLS transit credential lifecycle (for example local TLS cert/private-key event state materialization, projected SPKI trust-set state transitions, and cert rotation rules).
-- TLS handshake/session key derivation can remain abstracted, but credential/trust state transitions must be modeled.
+Previous gap: TLA models were identity/event-causality models that did not encode mTLS credential lifecycle (SPKI generation/rotation/revocation, projected trust-set state transitions).
 
-Follow-up requirement:
-- add a transport-credential TLA extension (new module or integrated extension) and map its guards/transitions into projector/runtime checks before claiming full identity-transport convergence.
+**What is now modeled** (TransportCredentialLifecycle.tla):
+- Local credential lifecycle: generate, rotate, revoke with SPKI uniqueness and history tracking.
+- Three-source trust store: transport_keys, invite_bootstrap_trust, pending_invite_bootstrap_trust.
+- Supersession: AddTransportKeyTrust automatically removes matching bootstrap/pending entries.
+- TTL expiry of bootstrap trust sources.
+- Trust removal (peer_removed cascading).
+- 11 invariants verified by TLC, mapped to Rust checks in `docs/tla/projector_spec.md`.
+
+**What remains abstract** (by design):
+- TLS handshake and session-key derivation.
+- CLI pin trust source (modeled only in Rust, not in TLA+).
+- Event-graph causality for trust-source inputs (nondeterministic in this module; covered by EventGraphSchema.tla).
+
+Config files: `transport_credential_lifecycle_fast.cfg` (2 peers, 3 SPKIs), `transport_credential_lifecycle.cfg` (2 peers, 4 SPKIs).
 
 ---
 

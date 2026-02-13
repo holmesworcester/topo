@@ -165,3 +165,23 @@ type_code(1) | created_at_ms(8) | key_event_id(32) | recipient_event_id(32) | wr
 | InvAllValidRequireWorkspace | test_bootstrap_sequence: non-local events require workspace valid |
 | InvMessageWorkspace | Message projection requires workspace (workspace_event_id dep) |
 | InvRemovalExclusion | project_secret_shared: reject if recipient removed |
+
+## Transport Credential Lifecycle (TransportCredentialLifecycle.tla)
+
+Standalone module modeling runtime SPKI credential and trust-store state transitions.
+Not an extension of EventGraphSchema — trust-source inputs are nondeterministic,
+abstracting over the event graph.
+
+| TLA+ Invariant | Rust Check |
+|----------------|------------|
+| InvActiveCredInHistory | load_or_generate_cert: generated cert SPKI tracked in local identity |
+| InvRevokedSubsetHistory | Revocation only applies to previously held credentials |
+| InvActiveCredNotRevoked | Active cert is never in revoked set |
+| InvSPKIUniqueness | BLAKE2b-256 collision resistance: no two peers share an SPKI |
+| InvActiveCredGloballyUnique | Each active cert fingerprint is distinct (extract_spki_fingerprint) |
+| InvBootstrapConsumedByTransportKey | supersede_accepted_bootstrap_if_steady_trust_exists: bootstrap ∩ transport_keys = {} |
+| InvPendingConsumedByTransportKey | supersede_pending_bootstrap_if_steady_trust_exists: pending ∩ transport_keys = {} |
+| InvTrustSetIsExactUnion | allowed_peers_from_db: UNION of transport_keys, invite_bootstrap_trust, pending_invite_bootstrap_trust |
+| InvTrustSourcesWellFormed | All trust table rows contain valid 32-byte SPKI fingerprints |
+| InvRevokedNotInBootstrapTrust | Revoked credentials not trusted via bootstrap paths |
+| InvMutualAuthSymmetry | Mutual CanAuthenticate requires both peers have active credentials |
