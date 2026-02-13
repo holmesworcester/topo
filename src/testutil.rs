@@ -111,8 +111,9 @@ impl Peer {
         }
     }
 
-    /// Create a new peer with a full identity chain (Workspace → InviteAccepted →
-    /// UserInviteBoot → UserBoot → DeviceInviteFirst → PeerSharedFirst).
+    /// Create a new peer with a full identity chain via the production
+    /// `bootstrap_workspace` flow (Workspace → UserInviteBoot → InviteAccepted →
+    /// UserBoot → DeviceInviteFirst → PeerSharedFirst → AdminBoot → TransportKey).
     /// Content events (Message, Reaction, etc.) are signed with the PeerShared key.
     pub fn new_with_identity(name: &str) -> Self {
         let mut peer = Self::new(name);
@@ -120,198 +121,74 @@ impl Peer {
         peer
     }
 
-    /// Bootstrap a full identity chain for this peer.
+    /// Bootstrap a full identity chain using the production `bootstrap_workspace` flow.
     fn bootstrap_identity_chain(&mut self) {
+        use crate::identity_ops::bootstrap_workspace;
+
         let db = open_connection(&self.db_path).expect("failed to open db");
-        let mut rng = rand::thread_rng();
+        let chain = bootstrap_workspace(&db, &self.identity)
+            .expect("failed to bootstrap workspace");
 
-        // 1. Workspace
-        let workspace_key = SigningKey::generate(&mut rng);
-        let workspace_pub = workspace_key.verifying_key().to_bytes();
-        let net = ParsedEvent::Workspace(WorkspaceEvent {
-            created_at_ms: current_timestamp_ms(),
-            public_key: workspace_pub,
-        });
-        let net_eid = create_event_staged(&db, &self.identity, &net)
-            .expect("failed to create workspace");
-        self.workspace_id = net_eid;
-
-        // 2. InviteAccepted (binds trust anchor)
-        let ia = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
-            created_at_ms: current_timestamp_ms(),
-            invite_event_id: net_eid,
-            workspace_id: net_eid,
-        });
-        let _ia_eid = create_event_sync(&db, &self.identity, &ia)
-            .expect("failed to create invite_accepted");
-
-        // Re-project Workspace (now trust anchor exists)
-        project_one(&db, &self.identity, &net_eid).unwrap();
-
-        // 3. UserInviteBoot (signed by workspace key)
-        let invite_key = SigningKey::generate(&mut rng);
-        let uib = ParsedEvent::UserInviteBoot(UserInviteBootEvent {
-            created_at_ms: current_timestamp_ms(),
-            public_key: invite_key.verifying_key().to_bytes(),
-            workspace_id: net_eid,
-            signed_by: net_eid,
-            signer_type: 1,
-            signature: [0u8; 64],
-        });
-        let uib_eid = create_signed_event_sync(&db, &self.identity, &uib, &workspace_key)
-            .expect("failed to create user_invite_boot");
-
-        // 4. UserBoot (signed by invite key)
-        let user_key = SigningKey::generate(&mut rng);
-        let ub = ParsedEvent::UserBoot(UserBootEvent {
-            created_at_ms: current_timestamp_ms(),
-            public_key: user_key.verifying_key().to_bytes(),
-            signed_by: uib_eid,
-            signer_type: 2,
-            signature: [0u8; 64],
-        });
-        let ub_eid = create_signed_event_sync(&db, &self.identity, &ub, &invite_key)
-            .expect("failed to create user_boot");
-
-        // 5. DeviceInviteFirst (signed by user key)
-        let device_invite_key = SigningKey::generate(&mut rng);
-        let dif = ParsedEvent::DeviceInviteFirst(DeviceInviteFirstEvent {
-            created_at_ms: current_timestamp_ms(),
-            public_key: device_invite_key.verifying_key().to_bytes(),
-            signed_by: ub_eid,
-            signer_type: 4,
-            signature: [0u8; 64],
-        });
-        let dif_eid = create_signed_event_sync(&db, &self.identity, &dif, &user_key)
-            .expect("failed to create device_invite_first");
-
-        // 6. PeerSharedFirst (signed by device_invite key)
-        let peer_shared_key = SigningKey::generate(&mut rng);
-        let psf = ParsedEvent::PeerSharedFirst(PeerSharedFirstEvent {
-            created_at_ms: current_timestamp_ms(),
-            public_key: peer_shared_key.verifying_key().to_bytes(),
-            signed_by: dif_eid,
-            signer_type: 3,
-            signature: [0u8; 64],
-        });
-        let psf_eid = create_signed_event_sync(&db, &self.identity, &psf, &device_invite_key)
-            .expect("failed to create peer_shared_first");
-
-        self.peer_shared_event_id = Some(psf_eid);
-        self.peer_shared_signing_key = Some(peer_shared_key);
-        self.workspace_signing_key = Some(workspace_key);
+        self.workspace_id = chain.workspace_id;
+        self.peer_shared_event_id = Some(chain.peer_shared_event_id);
+        self.peer_shared_signing_key = Some(chain.peer_shared_key);
+        self.workspace_signing_key = Some(chain.workspace_key);
     }
 
-    /// Create a new peer that joins an existing workspace created by `creator`.
-    /// The new peer gets a full identity chain rooted in the shared workspace,
-    /// so identity-derived trust (TransportKey validation) works across peers.
+    /// Create a new peer that joins an existing workspace created by `creator`
+    /// using the production invite flow: creator issues a `create_user_invite`,
+    /// joiner copies prerequisite events and calls `accept_user_invite`.
+    /// Both TransportKey and full identity chain are created automatically.
     pub fn new_in_workspace(name: &str, creator: &Peer) -> Self {
         use crate::crypto::event_id_to_base64;
+        use crate::identity_ops::{create_user_invite, accept_user_invite};
 
         let mut peer = Self::new(name);
         let db = open_connection(&peer.db_path).expect("failed to open db");
         let creator_db = open_connection(&creator.db_path).expect("failed to open creator db");
         let workspace_key = creator.workspace_signing_key.as_ref()
             .expect("creator has no workspace_signing_key; use new_with_identity()");
-        let mut rng = rand::thread_rng();
 
-        // Copy the Workspace event from creator's DB to this peer's DB
-        let ws_b64 = event_id_to_base64(&creator.workspace_id);
-        let (event_type, blob, share_scope, created_at, inserted_at): (String, Vec<u8>, String, i64, i64) =
-            creator_db.query_row(
-                "SELECT event_type, blob, share_scope, created_at, inserted_at FROM events WHERE event_id = ?1",
-                rusqlite::params![&ws_b64],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
-            ).expect("workspace event not found in creator");
+        // Creator issues an invite (creates UserInviteOngoing on creator's DB)
+        let invite = create_user_invite(
+            &creator_db, &creator.identity, workspace_key, &creator.workspace_id,
+        ).expect("failed to create user invite");
+
+        // Copy prerequisite events from creator to joiner:
+        // Workspace + the UserInviteBoot created by create_user_invite
+        for eid in &[creator.workspace_id, invite.invite_event_id] {
+            let eid_b64 = event_id_to_base64(eid);
+            let (event_type, blob, share_scope, created_at, inserted_at): (String, Vec<u8>, String, i64, i64) =
+                creator_db.query_row(
+                    "SELECT event_type, blob, share_scope, created_at, inserted_at FROM events WHERE event_id = ?1",
+                    rusqlite::params![&eid_b64],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                ).expect("event not found in creator");
+
+            let scope = parse_share_scope(&share_scope).expect("invalid share_scope");
+            insert_event(&db, eid, &event_type, &blob, scope, created_at, inserted_at)
+                .expect("failed to insert event");
+
+            let now_ms = current_timestamp_ms() as i64;
+            insert_recorded_event(&db, &peer.identity, eid, now_ms, "test")
+                .expect("failed to record event");
+            insert_neg_item_if_shared(&db, scope, created_at, eid)
+                .expect("failed to add to neg_items");
+
+            let _ = project_one(&db, &peer.identity, eid);
+        }
         drop(creator_db);
 
-        let scope = parse_share_scope(&share_scope).expect("invalid workspace share_scope");
-        insert_event(
-            &db,
-            &creator.workspace_id,
-            &event_type,
-            &blob,
-            scope,
-            created_at,
-            inserted_at,
-        )
-        .expect("failed to insert workspace event");
-
-        let now_ms = current_timestamp_ms() as i64;
-        insert_recorded_event(&db, &peer.identity, &creator.workspace_id, now_ms, "test")
-            .expect("failed to record workspace event");
-
-        // Add to neg_items so this peer advertises the workspace.
-        insert_neg_item_if_shared(&db, scope, created_at, &creator.workspace_id)
-            .expect("failed to add workspace to neg_items");
-
-        // Project workspace (guard-blocked: no trust anchor yet)
-        let _ = project_one(&db, &peer.identity, &creator.workspace_id);
-
-        // InviteAccepted: sets trust anchor, then retry_guard_blocked unblocks Workspace
-        let ia = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
-            created_at_ms: current_timestamp_ms(),
-            invite_event_id: creator.workspace_id,
-            workspace_id: creator.workspace_id,
-        });
-        create_event_sync(&db, &peer.identity, &ia)
-            .expect("failed to create invite_accepted");
-
-        // Re-project Workspace (now trust anchor exists)
-        project_one(&db, &peer.identity, &creator.workspace_id).unwrap();
-
-        // UserInviteBoot (signed by workspace key from creator)
-        let invite_key = SigningKey::generate(&mut rng);
-        let uib = ParsedEvent::UserInviteBoot(UserInviteBootEvent {
-            created_at_ms: current_timestamp_ms(),
-            public_key: invite_key.verifying_key().to_bytes(),
-            workspace_id: creator.workspace_id,
-            signed_by: creator.workspace_id,
-            signer_type: 1,
-            signature: [0u8; 64],
-        });
-        let uib_eid = create_signed_event_sync(&db, &peer.identity, &uib, workspace_key)
-            .expect("failed to create user_invite_boot");
-
-        // UserBoot (signed by invite key)
-        let user_key = SigningKey::generate(&mut rng);
-        let ub = ParsedEvent::UserBoot(UserBootEvent {
-            created_at_ms: current_timestamp_ms(),
-            public_key: user_key.verifying_key().to_bytes(),
-            signed_by: uib_eid,
-            signer_type: 2,
-            signature: [0u8; 64],
-        });
-        let ub_eid = create_signed_event_sync(&db, &peer.identity, &ub, &invite_key)
-            .expect("failed to create user_boot");
-
-        // DeviceInviteFirst (signed by user key)
-        let device_invite_key = SigningKey::generate(&mut rng);
-        let dif = ParsedEvent::DeviceInviteFirst(DeviceInviteFirstEvent {
-            created_at_ms: current_timestamp_ms(),
-            public_key: device_invite_key.verifying_key().to_bytes(),
-            signed_by: ub_eid,
-            signer_type: 4,
-            signature: [0u8; 64],
-        });
-        let dif_eid = create_signed_event_sync(&db, &peer.identity, &dif, &user_key)
-            .expect("failed to create device_invite_first");
-
-        // PeerSharedFirst (signed by device_invite key)
-        let peer_shared_key = SigningKey::generate(&mut rng);
-        let psf = ParsedEvent::PeerSharedFirst(PeerSharedFirstEvent {
-            created_at_ms: current_timestamp_ms(),
-            public_key: peer_shared_key.verifying_key().to_bytes(),
-            signed_by: dif_eid,
-            signer_type: 3,
-            signature: [0u8; 64],
-        });
-        let psf_eid = create_signed_event_sync(&db, &peer.identity, &psf, &device_invite_key)
-            .expect("failed to create peer_shared_first");
+        // Joiner accepts the invite (production flow: InviteAccepted → UserBoot →
+        // DeviceInviteFirst → PeerSharedFirst → TransportKey)
+        let join = accept_user_invite(
+            &db, &peer.identity, &invite.invite_key,
+            &invite.invite_event_id, creator.workspace_id,
+        ).expect("failed to accept user invite");
 
         peer.workspace_id = creator.workspace_id;
-        peer.peer_shared_event_id = Some(psf_eid);
-        peer.peer_shared_signing_key = Some(peer_shared_key);
+        peer.peer_shared_event_id = Some(join.peer_shared_event_id);
+        peer.peer_shared_signing_key = Some(join.peer_shared_key);
 
         peer
     }
@@ -1375,37 +1252,27 @@ pub fn start_peers_identity_trust(
     (a_handle, b_handle)
 }
 
-/// Start sync, wait for convergence, return metrics.
-pub async fn sync_until_converged(
+/// Start sync, wait for a caller-defined convergence check, return metrics.
+pub async fn sync_until_converged<F: Fn() -> bool>(
     peer_a: &Peer,
     peer_b: &Peer,
-    expected_count: i64,
+    check: F,
     timeout: Duration,
 ) -> SyncMetrics {
     let a_before = peer_a.store_count();
     let b_before = peer_b.store_count();
-    let events_to_transfer =
-        (expected_count - a_before) + (expected_count - b_before);
 
     let start = Instant::now();
     let sync = start_peers(peer_a, peer_b);
 
-    assert_eventually(
-        || peer_a.store_count() >= expected_count && peer_b.store_count() >= expected_count,
-        timeout,
-        &format!(
-            "convergence to {} events (a={}, b={})",
-            expected_count,
-            peer_a.store_count(),
-            peer_b.store_count(),
-        ),
-    ).await;
+    assert_eventually(check, timeout, "sync convergence").await;
 
     let wall_secs = start.elapsed().as_secs_f64();
     drop(sync);
 
-    let events_transferred = events_to_transfer as u64;
-    // Variable-length events — estimate ~100 bytes per event
+    let a_after = peer_a.store_count();
+    let b_after = peer_b.store_count();
+    let events_transferred = ((a_after - a_before) + (b_after - b_before)) as u64;
     let bytes_transferred = events_transferred * 100;
     let events_per_sec = if wall_secs > 0.0 { events_transferred as f64 / wall_secs } else { 0.0 };
     let throughput_mib_s = (bytes_transferred as f64) / (1024.0 * 1024.0) / wall_secs.max(0.001);
@@ -1830,9 +1697,10 @@ impl SharedDbNode {
         peer
     }
 
-    /// Add a new tenant that joins an existing tenant's workspace (same DB).
-    /// The creator tenant must have a workspace_signing_key.
+    /// Add a new tenant that joins an existing tenant's workspace (same DB)
+    /// using the production `create_user_invite` + `accept_user_invite` flow.
     pub fn add_tenant_in_workspace(&mut self, name: &str, creator_index: usize) {
+        use crate::identity_ops::{create_user_invite, accept_user_invite};
         use crate::projection::pipeline::project_one;
 
         let creator = &self.tenants[creator_index];
@@ -1840,6 +1708,7 @@ impl SharedDbNode {
         let workspace_key = creator.workspace_signing_key.as_ref()
             .expect("creator has no workspace_signing_key")
             .clone();
+        let creator_identity = creator.identity.clone();
 
         // Create a new transport identity in the shared DB
         let (cert, key) = crate::transport::generate_self_signed_cert()
@@ -1855,92 +1724,42 @@ impl SharedDbNode {
             key.secret_pkcs8_der(),
         ).expect("failed to store creds");
 
-        let author_id: [u8; 32] = rand::random();
-        let dummy_tempdir = tempfile::tempdir().expect("failed to create dummy tempdir");
+        // Creator issues an invite
+        let invite = create_user_invite(
+            &db, &creator_identity, &workspace_key, &workspace_id,
+        ).expect("failed to create user invite");
 
-        let mut peer = Peer {
-            name: name.to_string(),
-            db_path: self.db_path.clone(),
-            identity: tenant_identity.clone(),
-            author_id,
-            workspace_id,
-            peer_shared_event_id: None,
-            peer_shared_signing_key: None,
-            workspace_signing_key: None,
-            _tempdir: dummy_tempdir,
-        };
-
-        // The Workspace event already exists in the shared DB (created by creator).
-        // Record it for this tenant and project.
+        // The Workspace and UserInviteBoot events already exist in the shared DB.
+        // Record them for this new tenant and project.
         let now_ms = current_timestamp_ms() as i64;
         insert_recorded_event(&db, &tenant_identity, &workspace_id, now_ms, "test")
             .expect("failed to record workspace event");
         let _ = project_one(&db, &tenant_identity, &workspace_id);
 
-        // InviteAccepted: sets trust anchor
-        let ia = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
-            created_at_ms: current_timestamp_ms(),
-            invite_event_id: workspace_id,
+        insert_recorded_event(&db, &tenant_identity, &invite.invite_event_id, now_ms, "test")
+            .expect("failed to record invite event");
+        let _ = project_one(&db, &tenant_identity, &invite.invite_event_id);
+
+        // Accept the invite (production flow)
+        let join = accept_user_invite(
+            &db, &tenant_identity, &invite.invite_key,
+            &invite.invite_event_id, workspace_id,
+        ).expect("failed to accept user invite");
+
+        let author_id: [u8; 32] = rand::random();
+        let dummy_tempdir = tempfile::tempdir().expect("failed to create dummy tempdir");
+
+        let peer = Peer {
+            name: name.to_string(),
+            db_path: self.db_path.clone(),
+            identity: tenant_identity,
+            author_id,
             workspace_id,
-        });
-        create_event_sync(&db, &tenant_identity, &ia)
-            .expect("failed to create invite_accepted");
-
-        // Re-project Workspace (now trust anchor exists)
-        project_one(&db, &tenant_identity, &workspace_id).unwrap();
-
-        // UserInviteBoot (signed by workspace key from creator)
-        let mut rng = rand::thread_rng();
-        let invite_key = SigningKey::generate(&mut rng);
-        let uib = ParsedEvent::UserInviteBoot(UserInviteBootEvent {
-            created_at_ms: current_timestamp_ms(),
-            public_key: invite_key.verifying_key().to_bytes(),
-            workspace_id,
-            signed_by: workspace_id,
-            signer_type: 1,
-            signature: [0u8; 64],
-        });
-        let uib_eid = create_signed_event_sync(&db, &tenant_identity, &uib, &workspace_key)
-            .expect("failed to create user_invite_boot");
-
-        // UserBoot (signed by invite key)
-        let user_key = SigningKey::generate(&mut rng);
-        let ub = ParsedEvent::UserBoot(UserBootEvent {
-            created_at_ms: current_timestamp_ms(),
-            public_key: user_key.verifying_key().to_bytes(),
-            signed_by: uib_eid,
-            signer_type: 2,
-            signature: [0u8; 64],
-        });
-        let ub_eid = create_signed_event_sync(&db, &tenant_identity, &ub, &invite_key)
-            .expect("failed to create user_boot");
-
-        // DeviceInviteFirst (signed by user key)
-        let device_invite_key = SigningKey::generate(&mut rng);
-        let dif = ParsedEvent::DeviceInviteFirst(DeviceInviteFirstEvent {
-            created_at_ms: current_timestamp_ms(),
-            public_key: device_invite_key.verifying_key().to_bytes(),
-            signed_by: ub_eid,
-            signer_type: 4,
-            signature: [0u8; 64],
-        });
-        let dif_eid = create_signed_event_sync(&db, &tenant_identity, &dif, &user_key)
-            .expect("failed to create device_invite_first");
-
-        // PeerSharedFirst (signed by device_invite key)
-        let peer_shared_key = SigningKey::generate(&mut rng);
-        let psf = ParsedEvent::PeerSharedFirst(PeerSharedFirstEvent {
-            created_at_ms: current_timestamp_ms(),
-            public_key: peer_shared_key.verifying_key().to_bytes(),
-            signed_by: dif_eid,
-            signer_type: 3,
-            signature: [0u8; 64],
-        });
-        let psf_eid = create_signed_event_sync(&db, &tenant_identity, &psf, &device_invite_key)
-            .expect("failed to create peer_shared_first");
-
-        peer.peer_shared_event_id = Some(psf_eid);
-        peer.peer_shared_signing_key = Some(peer_shared_key);
+            peer_shared_event_id: Some(join.peer_shared_event_id),
+            peer_shared_signing_key: Some(join.peer_shared_key),
+            workspace_signing_key: None,
+            _tempdir: dummy_tempdir,
+        };
 
         self.tenants.push(peer);
     }

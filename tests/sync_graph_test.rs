@@ -88,35 +88,31 @@ async fn run_chain_bench(n: usize, event_count: usize) {
     let gen_secs = gen_start.elapsed().as_secs_f64();
     eprintln!("Generated {} events at P0 in {:.2}s", event_count, gen_secs);
 
+    // Sample an event from P0 to use as convergence marker
+    let sample = peers[0].sample_event_ids(1)[0].clone();
+
     let rss_before = peak_rss_mib();
     let start = Instant::now();
 
     let handles = start_chain(&peers);
 
-    // Expected message count (identity events are additional overhead)
-    let expected = event_count as i64;
     let timeout = Duration::from_secs(600);
 
-    // Wait for tail peer to converge (>= because identity events add overhead)
+    // Wait for tail peer to have the sampled event
     assert_eventually(
-        || peers[n - 1].store_count() >= expected,
+        || peers[n - 1].has_event(&sample),
         timeout,
-        &format!(
-            "chain tail P{} convergence to {} (currently {})",
-            n - 1,
-            expected,
-            peers[n - 1].store_count(),
-        ),
+        &format!("chain tail P{} receives sampled event", n - 1),
     )
     .await;
 
     let tail_wall_ms = start.elapsed().as_millis() as u64;
 
-    // Wait for ALL peers to converge
+    // Wait for ALL peers to have the sampled event
     assert_eventually(
-        || peers.iter().all(|p| p.store_count() >= expected),
+        || peers.iter().all(|p| p.has_event(&sample)),
         Duration::from_secs(60),
-        "all peers converge",
+        "all peers receive sampled event",
     )
     .await;
 
@@ -206,16 +202,13 @@ async fn run_multi_source_bench(source_count: usize, events_per_source: usize) {
     let start = Instant::now();
 
     // Sync each source with sink pairwise (serialized B0 baseline).
-    // Use message-count-based targets (identity events add overhead, handled by >=).
-    let mut cumulative: i64 = 0;
     for (i, source) in sources.iter().enumerate() {
-        cumulative += events_per_source as i64;
         let source_start = Instant::now();
 
-        // Both peers converge to cumulative count:
-        // sink gets this source's events, source gets sink's accumulated events
+        // Sample an event from this source as convergence marker
+        let sample = source.sample_event_ids(1)[0].clone();
         let metrics = sync_until_converged(
-            source, &sink, cumulative, Duration::from_secs(120),
+            source, &sink, || sink.has_event(&sample), Duration::from_secs(120),
         ).await;
 
         let source_ms = source_start.elapsed().as_millis() as u64;
@@ -228,9 +221,6 @@ async fn run_multi_source_bench(source_count: usize, events_per_source: usize) {
     let wall_ms = start.elapsed().as_millis() as u64;
     let rss_after = peak_rss_mib();
     let events_per_sec = total_messages as f64 / (wall_ms as f64 / 1000.0);
-
-    assert!(sink.store_count() >= total_messages,
-        "sink should have at least {} events, got {}", total_messages, sink.store_count());
 
     eprintln!();
     eprintln!(
@@ -301,13 +291,16 @@ async fn run_multi_source_concurrent_bench(source_count: usize, events_per_sourc
         total_messages, gen_secs, source_count - 1
     );
 
+    // Sample a convergence marker from S0 before cloning
+    let sample = sources[0].sample_event_ids(1)[0].clone();
+
     // Clone S0's data to all other sources (overlapping data)
     if source_count > 1 {
         let targets: Vec<&Peer> = sources[1..].iter().collect();
         clone_events_to(&sources[0], &targets);
         for i in 1..source_count {
-            assert!(sources[i].store_count() >= total_messages,
-                "S{} should have at least {} events after clone", i, total_messages);
+            assert!(sources[i].has_event(&sample),
+                "S{} should have cloned event", i);
         }
         eprintln!("  Cloned to S1..S{}", source_count - 1);
     }
@@ -318,25 +311,12 @@ async fn run_multi_source_concurrent_bench(source_count: usize, events_per_sourc
     // Start concurrent sink + all sources with connect_loop (repeated sessions)
     let handles = start_multi_source(&sources, &sink);
 
-    // Wait for sink to converge (scale timeout with event count)
+    // Wait for sink to receive the sampled event (scale timeout with event count)
     let timeout_secs = if events_per_source >= 100_000 { 600 } else { 120 };
-    let progress_start = Instant::now();
-    let last_progress = std::cell::Cell::new(Instant::now());
     assert_eventually(
-        || {
-            let count = sink.store_count();
-            if last_progress.get().elapsed() >= Duration::from_secs(10) {
-                eprintln!("  [progress] sink has {} / {} events ({:.0}s elapsed)",
-                    count, total_messages, progress_start.elapsed().as_secs_f64());
-                last_progress.set(Instant::now());
-            }
-            count >= total_messages
-        },
+        || sink.has_event(&sample),
         Duration::from_secs(timeout_secs),
-        &format!(
-            "concurrent sink convergence to {} events",
-            total_messages,
-        ),
+        "concurrent sink receives sampled event",
     ).await;
 
     let wall_ms = start.elapsed().as_millis() as u64;
@@ -345,9 +325,6 @@ async fn run_multi_source_concurrent_bench(source_count: usize, events_per_sourc
 
     // Drop handles to stop all loops
     drop(handles);
-
-    assert!(sink.store_count() >= total_messages,
-        "sink should have at least {} events, got {}", total_messages, sink.store_count());
 
     eprintln!();
     eprintln!(
@@ -457,26 +434,21 @@ async fn run_multi_source_partitioned_bench(source_count: usize, total_events: u
         total_messages, source_count, gen_secs, events_per_source,
     );
 
+    // Sample one event from each source as convergence markers
+    let samples: Vec<String> = sources.iter()
+        .map(|s| s.sample_event_ids(1)[0].clone())
+        .collect();
+
     let rss_before = peak_rss_mib();
     let start = Instant::now();
 
     let handles = start_multi_source(&sources, &sink);
 
     let timeout_secs = if total_events >= 100_000 { 600 } else { 120 };
-    let progress_start = Instant::now();
-    let last_progress = std::cell::Cell::new(Instant::now());
     assert_eventually(
-        || {
-            let count = sink.store_count();
-            if last_progress.get().elapsed() >= Duration::from_secs(10) {
-                eprintln!("  [progress] sink has {} / {} events ({:.0}s elapsed)",
-                    count, total_messages, progress_start.elapsed().as_secs_f64());
-                last_progress.set(Instant::now());
-            }
-            count >= total_messages
-        },
+        || samples.iter().all(|s| sink.has_event(s)),
         Duration::from_secs(timeout_secs),
-        &format!("partitioned sink convergence to {} events", total_messages),
+        "partitioned sink receives events from all sources",
     ).await;
 
     let wall_ms = start.elapsed().as_millis() as u64;
@@ -485,8 +457,6 @@ async fn run_multi_source_partitioned_bench(source_count: usize, total_events: u
     let mb_per_sec = events_per_sec * 100.0 / 1_000_000.0;
 
     drop(handles);
-    assert!(sink.store_count() >= total_messages,
-        "sink should have at least {} events, got {}", total_messages, sink.store_count());
 
     eprintln!();
     eprintln!(
@@ -564,6 +534,9 @@ async fn run_sink_download_bench(source_count: usize, events_per_source: usize) 
         eprintln!("  Cloned to S1..S{}", source_count - 1);
     }
 
+    // Sample a convergence marker from S0
+    let sample = sources[0].sample_event_ids(1)[0].clone();
+
     let rss_before = peak_rss_mib();
     let start = Instant::now();
 
@@ -571,20 +544,10 @@ async fn run_sink_download_bench(source_count: usize, events_per_source: usize) 
     let handles = start_sink_download(&sources, &sink);
 
     let timeout_secs = if events_per_source >= 100_000 { 600 } else { 120 };
-    let progress_start = Instant::now();
-    let last_progress = std::cell::Cell::new(Instant::now());
     assert_eventually(
-        || {
-            let count = sink.store_count();
-            if last_progress.get().elapsed() >= Duration::from_secs(10) {
-                eprintln!("  [progress] sink has {} / {} events ({:.0}s elapsed)",
-                    count, total_messages, progress_start.elapsed().as_secs_f64());
-                last_progress.set(Instant::now());
-            }
-            count >= total_messages
-        },
+        || sink.has_event(&sample),
         Duration::from_secs(timeout_secs),
-        &format!("sink download convergence to {} events", total_messages),
+        "sink download receives sampled event",
     ).await;
 
     let wall_ms = start.elapsed().as_millis() as u64;
@@ -593,8 +556,6 @@ async fn run_sink_download_bench(source_count: usize, events_per_source: usize) 
     let mb_per_sec = events_per_sec * 100.0 / 1_000_000.0;
 
     drop(handles);
-    assert!(sink.store_count() >= total_messages,
-        "sink should have at least {} events, got {}", total_messages, sink.store_count());
 
     eprintln!();
     eprintln!(

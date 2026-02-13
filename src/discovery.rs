@@ -40,16 +40,21 @@ mod inner {
         ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
             let daemon = ServiceDaemon::new()?;
 
-            // Instance name: full peer_id to avoid collisions
-            let instance = format!("p7-{}", peer_id);
+            // Instance name: truncated peer_id (DNS labels max 63 bytes).
+            // Full peer_id is 64 hex chars; "p7-" prefix + 59 chars = 62.
+            // The full peer_id is in the TXT "peer_id" property for exact matching.
+            let id_truncated = &peer_id[..59.min(peer_id.len())];
+            let instance = format!("p7-{}", id_truncated);
 
             let host = format!("{}.local.", hostname());
+            let my_ip = local_non_loopback_ipv4()
+                .unwrap_or_else(|| "0.0.0.0".to_string());
             let properties = [("peer_id", peer_id)];
             let service = ServiceInfo::new(
                 SERVICE_TYPE,
                 &instance,
                 &host,
-                "",  // empty IP = auto-detect
+                &my_ip,
                 port,
                 &properties[..],
             )?;
@@ -147,6 +152,18 @@ mod inner {
                 segments[0] & 0xffc0 == 0xfe80 // fe80::/10
             }
         }
+    }
+
+    /// Find a non-loopback IPv4 address to advertise via mDNS.
+    /// Returns None if no suitable address is found.
+    fn local_non_loopback_ipv4() -> Option<String> {
+        use std::net::UdpSocket;
+        // Connect a UDP socket to a public address to discover the local IP
+        // the OS would route through. No data is actually sent.
+        let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+        socket.connect("8.8.8.8:80").ok()?;
+        let addr = socket.local_addr().ok()?;
+        Some(addr.ip().to_string())
     }
 
     fn hostname() -> String {

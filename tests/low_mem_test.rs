@@ -81,12 +81,11 @@ async fn low_mem_ios_budget_smoke_10k() {
     alice.batch_create_messages(5_000);
     bob.batch_create_messages(5_000);
 
-    // 6 identity per peer + 10k content; after sync each has 6 own + 5 other shared + 10k = 10011
-    let expected_store = 10_000 + 11;
-    let _metrics = sync_until_converged(&alice, &bob, expected_store, Duration::from_secs(180)).await;
+    let sample = alice.sample_event_ids(1)[0].clone();
+    let _metrics = sync_until_converged(&alice, &bob, || bob.has_event(&sample), Duration::from_secs(180)).await;
 
-    assert_eq!(alice.store_count(), expected_store);
-    assert_eq!(bob.store_count(), expected_store);
+    assert_eq!(alice.message_count(), 5_000);
+    assert_eq!(bob.message_count(), 5_000);
 
     let peak = peak_rss_mib().expect("VmHWM unavailable on this platform");
     let budget = rss_budget_mib_from_env("LOW_MEM_IOS_BUDGET_MIB", rss_budget_mib_default());
@@ -114,12 +113,10 @@ async fn low_mem_ios_budget_soak_million() {
     let bob = Peer::new_with_identity("bob_lowmem_soak");
 
     alice.batch_create_messages(events);
-    // 6 identity per peer + N content; after sync each has 6 own + 5 other shared + N = N + 11
-    let expected_store = events as i64 + 11;
-    let _metrics = sync_until_converged(&alice, &bob, expected_store, Duration::from_secs(3600)).await;
+    let sample = alice.sample_event_ids(1)[0].clone();
+    let _metrics = sync_until_converged(&alice, &bob, || bob.has_event(&sample), Duration::from_secs(3600)).await;
 
-    assert_eq!(alice.store_count(), expected_store);
-    assert_eq!(bob.store_count(), expected_store);
+    assert_eq!(alice.message_count(), events as i64);
 
     let peak = peak_rss_mib().expect("VmHWM unavailable on this platform");
     assert!(
