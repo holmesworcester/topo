@@ -38,19 +38,12 @@ impl std::error::Error for CreateEventError {}
 
 /// Extract event_id from Ok or Blocked (event is stored in both cases).
 /// Returns Err only for true failures (encode, db, rejected).
-pub fn event_id_or_blocked(result: Result<EventId, CreateEventError>) -> Result<EventId, CreateEventError> {
+fn event_id_or_blocked(result: Result<EventId, CreateEventError>) -> Result<EventId, CreateEventError> {
     match result {
         Ok(eid) => Ok(eid),
         Err(CreateEventError::Blocked { event_id, .. }) => Ok(event_id),
         Err(e) => Err(e),
     }
-}
-
-/// Require the event to be Valid (not Blocked). Use this for post-anchor events
-/// in accept_user_invite / accept_device_link where Blocked means a prerequisite
-/// chain is broken and the account will not be usable.
-pub fn require_valid_event_id(result: Result<EventId, CreateEventError>) -> Result<EventId, CreateEventError> {
-    result
 }
 
 /// Shared helper: hash blob, write to events/neg_items/recorded_events, project via project_one.
@@ -220,6 +213,31 @@ pub fn create_encrypted_event_sync(
     create_event_sync(conn, recorded_by, &wrapper)
 }
 
+/// Staged create: persist and enqueue an event even if it is Blocked.
+/// Returns the event_id on both Valid and Blocked outcomes.
+/// Use this only for pre-trust-anchor events in bootstrap flows where blocking
+/// is expected and will resolve via guard cascade after the trust anchor arrives.
+pub fn create_event_staged(
+    conn: &Connection,
+    recorded_by: &str,
+    event: &ParsedEvent,
+) -> Result<EventId, CreateEventError> {
+    event_id_or_blocked(create_event_sync(conn, recorded_by, event))
+}
+
+/// Staged signed create: persist and enqueue a signed event even if it is Blocked.
+/// Returns the event_id on both Valid and Blocked outcomes.
+/// Use this only for pre-trust-anchor events in bootstrap flows where blocking
+/// is expected and will resolve via guard cascade after the trust anchor arrives.
+pub fn create_signed_event_staged(
+    conn: &Connection,
+    recorded_by: &str,
+    event: &ParsedEvent,
+    signing_key: &ed25519_dalek::SigningKey,
+) -> Result<EventId, CreateEventError> {
+    event_id_or_blocked(create_signed_event_sync(conn, recorded_by, event, signing_key))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,7 +265,7 @@ mod tests {
             created_at_ms: now_ms(),
             public_key: [0xAA; 32],
         });
-        event_id_or_blocked(create_event_sync(conn, recorded_by, &ws)).unwrap()
+        create_event_staged(conn, recorded_by, &ws).unwrap()
     }
 
     /// Helper: sign a blob in-place (overwrite last 64 bytes).
@@ -268,10 +286,8 @@ mod tests {
             created_at_ms: now_ms(),
             public_key: workspace_pub,
         });
-        let net_blob = events::encode_event(&net_event).unwrap();
-        let net_eid = create_event_sync(conn, recorded_by, &net_event);
-        // Workspace may block (needs trust anchor). Create InviteAccepted first.
-        let net_eid = event_id_or_blocked(net_eid).unwrap();
+        // Workspace may block (needs trust anchor). Use staged API.
+        let net_eid = create_event_staged(conn, recorded_by, &net_event).unwrap();
 
         let ia_event = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
             created_at_ms: now_ms(),
@@ -493,5 +509,80 @@ mod tests {
             rusqlite::params![&memo_b64, recorded_by], |row| row.get(0),
         ).unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_create_signed_event_sync_returns_blocked_error() {
+        // Verify strict API: create_signed_event_sync returns Err(Blocked) for
+        // events with missing dependencies.
+        let conn = setup();
+        let recorded_by = "peer1";
+
+        let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
+
+        // Reaction targeting a non-existent event → blocked on missing dep
+        let fake_target = [0xDD; 32];
+        let rxn = ParsedEvent::Reaction(ReactionEvent {
+            created_at_ms: now_ms(),
+            target_event_id: fake_target,
+            author_id: [3u8; 32],
+            emoji: "x".to_string(),
+            signed_by: signer_eid,
+            signer_type: 5,
+            signature: [0u8; 64],
+        });
+        let result = create_signed_event_sync(&conn, recorded_by, &rxn, &signing_key);
+        match result {
+            Err(CreateEventError::Blocked { event_id, missing }) => {
+                assert_eq!(missing.len(), 1);
+                assert_eq!(missing[0], fake_target);
+                // Event is stored even though blocked
+                let eid_b64 = event_id_to_base64(&event_id);
+                let in_events: bool = conn.query_row(
+                    "SELECT COUNT(*) > 0 FROM events WHERE event_id = ?1",
+                    rusqlite::params![&eid_b64], |row| row.get(0),
+                ).unwrap();
+                assert!(in_events, "event should be stored even when blocked");
+            }
+            Ok(_) => panic!("expected Blocked error, got Ok"),
+            Err(e) => panic!("expected Blocked error, got: {}", e),
+        }
+    }
+
+    #[test]
+    fn test_create_signed_event_staged_returns_ok_on_blocked() {
+        // Verify staged API: create_signed_event_staged returns Ok(event_id)
+        // even when event is blocked.
+        let conn = setup();
+        let recorded_by = "peer1";
+
+        let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
+
+        let fake_target = [0xEE; 32];
+        let rxn = ParsedEvent::Reaction(ReactionEvent {
+            created_at_ms: now_ms(),
+            target_event_id: fake_target,
+            author_id: [3u8; 32],
+            emoji: "y".to_string(),
+            signed_by: signer_eid,
+            signer_type: 5,
+            signature: [0u8; 64],
+        });
+        let eid = create_signed_event_staged(&conn, recorded_by, &rxn, &signing_key)
+            .expect("staged API should return Ok even for blocked events");
+
+        let eid_b64 = event_id_to_base64(&eid);
+        let in_events: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM events WHERE event_id = ?1",
+            rusqlite::params![&eid_b64], |row| row.get(0),
+        ).unwrap();
+        assert!(in_events, "event should be stored");
+
+        // Should NOT be in valid_events (blocked)
+        let in_valid: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &eid_b64], |row| row.get(0),
+        ).unwrap();
+        assert!(!in_valid, "blocked event should not be in valid_events");
     }
 }

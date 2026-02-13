@@ -13,7 +13,7 @@ use crate::db::{
 use crate::events::*;
 use crate::identity_ops::{self, IdentityChain, InviteType, JoinChain, LinkChain};
 use crate::invite_link::{create_invite_link, parse_invite_link, InviteLinkKind};
-use crate::projection::create::{create_signed_event_sync, event_id_or_blocked};
+use crate::projection::create::create_signed_event_sync;
 use crate::transport_identity::{
     ensure_transport_peer_id_from_db, expected_invite_bootstrap_spki_from_invite_key,
     install_invite_bootstrap_transport_identity,
@@ -724,12 +724,12 @@ fn cmd_react(
         signer_type: 5,
         signature: [0u8; 64],
     });
-    event_id_or_blocked(create_signed_event_sync(
+    create_signed_event_sync(
         &conn,
         &account.identity,
         &rxn,
         &peer_shared_key,
-    ))?;
+    )?;
 
     writeln!(out, "Reacted {} to message {}", emoji, msg_num)?;
 
@@ -805,12 +805,12 @@ fn cmd_delete(
         signer_type: 5,
         signature: [0u8; 64],
     });
-    event_id_or_blocked(create_signed_event_sync(
+    create_signed_event_sync(
         &conn,
         &account.identity,
         &del,
         &peer_shared_key,
-    ))?;
+    )?;
 
     writeln!(out, "Deleted message {}", msg_num)?;
 
@@ -1485,12 +1485,12 @@ fn cmd_ban(
         signer_type: 5,
         signature: [0u8; 64],
     });
-    event_id_or_blocked(create_signed_event_sync(
+    create_signed_event_sync(
         &conn,
         &account.identity,
         &ur_evt,
         &peer_shared_key,
-    ))?;
+    )?;
 
     writeln!(out, "Banned user {}", user_num)?;
 

@@ -17,7 +17,7 @@ use poc_7::events::{
     DeviceInviteFirstEvent, InviteAcceptedEvent, MessageDeletionEvent, MessageEvent, ParsedEvent,
     PeerSharedFirstEvent, ReactionEvent, UserBootEvent, UserInviteBootEvent, WorkspaceEvent,
 };
-use poc_7::projection::create::{create_event_sync, create_signed_event_sync, event_id_or_blocked};
+use poc_7::projection::create::{create_event_sync, create_event_staged, create_signed_event_sync};
 use poc_7::projection::pipeline::project_one;
 use poc_7::sync::engine::{accept_loop, connect_loop};
 use poc_7::transport::{
@@ -615,7 +615,7 @@ fn ensure_identity_chain(
         created_at_ms: current_timestamp_ms(),
         public_key: workspace_key.verifying_key().to_bytes(),
     });
-    let ws_eid = event_id_or_blocked(create_event_sync(db, recorded_by, &ws))
+    let ws_eid = create_event_staged(db, recorded_by, &ws)
         .map_err(|e| format!("{}", e))?;
 
     let ia = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
@@ -1120,12 +1120,12 @@ fn cli_react(
         signer_type: 5,
         signature: [0u8; 64],
     });
-    let eid = event_id_or_blocked(create_signed_event_sync(
+    let eid = create_signed_event_sync(
         &db,
         &recorded_by,
         &rxn,
         &signing_key,
-    ))?;
+    )?;
     println!("Reacted {} ({})", emoji, hex::encode(&eid[..4]));
 
     Ok(())
@@ -1151,12 +1151,12 @@ fn cli_delete_message(
         signer_type: 5,
         signature: [0u8; 64],
     });
-    event_id_or_blocked(create_signed_event_sync(
+    create_signed_event_sync(
         &db,
         &recorded_by,
         &del,
         &signing_key,
-    ))?;
+    )?;
     println!(
         "Deleted message {}",
         &target_hex[..target_hex.len().min(16)]

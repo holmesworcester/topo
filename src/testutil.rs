@@ -18,7 +18,7 @@ use crate::events::{
     TransportKeyEvent,
 };
 use crate::transport_identity::{transport_cert_paths_from_db, ensure_transport_peer_id_from_db};
-use crate::projection::create::{create_event_sync, create_signed_event_sync, create_encrypted_event_sync, event_id_or_blocked, CreateEventError};
+use crate::projection::create::{create_event_sync, create_event_staged, create_signed_event_sync, create_signed_event_staged, create_encrypted_event_sync, CreateEventError};
 use crate::projection::pipeline::project_one;
 use crate::sync::SyncMessage;
 use crate::sync::engine::{accept_loop, connect_loop, download_from_sources, run_sync_initiator_dual, SYNC_SESSION_TIMEOUT_SECS};
@@ -133,7 +133,7 @@ impl Peer {
             created_at_ms: current_timestamp_ms(),
             public_key: workspace_pub,
         });
-        let net_eid = event_id_or_blocked(create_event_sync(&db, &self.identity, &net))
+        let net_eid = create_event_staged(&db, &self.identity, &net)
             .expect("failed to create workspace");
         self.workspace_id = net_eid;
 
@@ -376,7 +376,7 @@ impl Peer {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        event_id_or_blocked(create_signed_event_sync(&db, &self.identity, &rxn, self.signing_key()))
+        create_signed_event_staged(&db, &self.identity, &rxn, self.signing_key())
             .expect("failed to create reaction")
     }
 
@@ -463,7 +463,7 @@ impl Peer {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        event_id_or_blocked(create_signed_event_sync(&db, &self.identity, &del, self.signing_key()))
+        create_signed_event_sync(&db, &self.identity, &del, self.signing_key())
             .expect("failed to create message_deletion")
     }
 
@@ -491,7 +491,7 @@ impl Peer {
             created_at_ms: current_timestamp_ms(),
             public_key,
         });
-        event_id_or_blocked(create_event_sync(&db, &self.identity, &ws))
+        create_event_staged(&db, &self.identity, &ws)
             .expect("failed to create workspace")
     }
 
@@ -544,7 +544,7 @@ impl Peer {
             signer_type: 1,
             signature: [0u8; 64],
         });
-        event_id_or_blocked(create_signed_event_sync(&db, &self.identity, &evt, signing_key))
+        create_signed_event_staged(&db, &self.identity, &evt, signing_key)
             .expect("failed to create user_invite_boot")
     }
 
@@ -564,7 +564,7 @@ impl Peer {
             signer_type: 1,
             signature: [0u8; 64],
         });
-        event_id_or_blocked(create_signed_event_sync(&db, &self.identity, &evt, signing_key))
+        create_signed_event_staged(&db, &self.identity, &evt, signing_key)
             .expect("failed to create user_invite_boot")
     }
 
@@ -586,7 +586,7 @@ impl Peer {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        event_id_or_blocked(create_signed_event_sync(&db, &self.identity, &evt, signing_key))
+        create_signed_event_sync(&db, &self.identity, &evt, signing_key)
             .expect("failed to create user_invite_ongoing")
     }
 
@@ -605,7 +605,7 @@ impl Peer {
             signer_type: 2,
             signature: [0u8; 64],
         });
-        event_id_or_blocked(create_signed_event_sync(&db, &self.identity, &evt, signing_key))
+        create_signed_event_staged(&db, &self.identity, &evt, signing_key)
             .expect("failed to create user_boot")
     }
 
@@ -624,7 +624,7 @@ impl Peer {
             signer_type: 4,
             signature: [0u8; 64],
         });
-        event_id_or_blocked(create_signed_event_sync(&db, &self.identity, &evt, signing_key))
+        create_signed_event_staged(&db, &self.identity, &evt, signing_key)
             .expect("failed to create device_invite_first")
     }
 
@@ -643,7 +643,7 @@ impl Peer {
             signer_type: 3,
             signature: [0u8; 64],
         });
-        event_id_or_blocked(create_signed_event_sync(&db, &self.identity, &evt, signing_key))
+        create_signed_event_staged(&db, &self.identity, &evt, signing_key)
             .expect("failed to create peer_shared_first")
     }
 
@@ -664,7 +664,7 @@ impl Peer {
             signer_type: 1,
             signature: [0u8; 64],
         });
-        event_id_or_blocked(create_signed_event_sync(&db, &self.identity, &evt, signing_key))
+        create_signed_event_sync(&db, &self.identity, &evt, signing_key)
             .expect("failed to create admin_boot")
     }
 
@@ -683,7 +683,7 @@ impl Peer {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        event_id_or_blocked(create_signed_event_sync(&db, &self.identity, &evt, signing_key))
+        create_signed_event_sync(&db, &self.identity, &evt, signing_key)
             .expect("failed to create user_removed")
     }
 
@@ -702,7 +702,7 @@ impl Peer {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        event_id_or_blocked(create_signed_event_sync(&db, &self.identity, &evt, signing_key))
+        create_signed_event_sync(&db, &self.identity, &evt, signing_key)
             .expect("failed to create peer_removed")
     }
 
@@ -725,7 +725,7 @@ impl Peer {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        event_id_or_blocked(create_signed_event_sync(&db, &self.identity, &evt, signing_key))
+        create_signed_event_sync(&db, &self.identity, &evt, signing_key)
             .expect("failed to create secret_shared")
     }
 
