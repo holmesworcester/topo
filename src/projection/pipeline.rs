@@ -587,6 +587,7 @@ mod tests {
             crate::events::ShareScope::Shared,
             ts as i64,
             &event_id,
+            "",
         )
         .unwrap();
         insert_recorded_event(conn, recorded_by, &event_id, ts as i64, "test").unwrap();

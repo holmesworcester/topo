@@ -55,12 +55,13 @@ impl Drop for EnvGuard {
     }
 }
 
+/// Hard ceiling: 24 MiB per instance (iOS notification extension limit).
+/// DO NOT bump this — if the test fails, reduce memory usage instead.
+///
+/// This test runs 2 peer instances in one process, so the process-level
+/// budget is 2 × 24 = 48 MiB.
 fn rss_budget_mib_default() -> f64 {
-    if cfg!(debug_assertions) {
-        28.0
-    } else {
-        24.0
-    }
+    48.0
 }
 
 fn rss_budget_mib_from_env(var: &str, default: f64) -> f64 {

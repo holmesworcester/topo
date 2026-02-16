@@ -215,7 +215,11 @@ fn test_cli_bidirectional_sync() {
     assert_now(&alice_db, "store_count == 14");
     assert_now(&bob_db, "store_count == 14");
 
-    // Only locally-created messages are projected (remote signer chain is foreign)
+    // This test uses --pin-peer with independent workspaces (each peer
+    // bootstraps its own Network). Remote messages are stored but their signer
+    // chains are foreign (different Network), so only locally-created messages
+    // are projected. For the realistic shared-workspace flow where cross-peer
+    // messages resolve, see tests/two_process_test.rs.
     assert_now(&alice_db, "message_count == 2");
     assert_now(&bob_db, "message_count == 1");
 

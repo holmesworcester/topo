@@ -207,7 +207,13 @@ fn test_two_process_invite_and_sync() {
     assert_eventually(&alice_db, "store_count >= 12", timeout_ms);
     assert_eventually(&bob_db, "store_count >= 12", timeout_ms);
 
-    // Verify Alice's locally-projected messages (her own + bob's if signer resolved)
+    // Wait for cross-peer message projection: signer chain cascade must complete
+    // after events sync. Alice should see 3 messages (2 own + 1 from Bob),
+    // Bob should see 3 messages (1 own + 2 from Alice).
+    assert_eventually(&alice_db, "message_count >= 3", timeout_ms);
+    assert_eventually(&bob_db, "message_count >= 3", timeout_ms);
+
+    // Verify Alice's messages (her own + bob's)
     let alice_msgs = get_messages(&alice_db);
     assert!(
         alice_msgs.contains(&"Hello world from alice".to_string()),
@@ -219,12 +225,27 @@ fn test_two_process_invite_and_sync() {
         "Alice should have her second message, got: {:?}",
         alice_msgs
     );
+    assert!(
+        alice_msgs.contains(&"Hello from bob".to_string()),
+        "Alice should see Bob's message (shared workspace), got: {:?}",
+        alice_msgs
+    );
 
-    // Verify Bob's locally-projected messages
+    // Verify Bob's messages (his own + alice's)
     let bob_msgs = get_messages(&bob_db);
     assert!(
         bob_msgs.contains(&"Hello from bob".to_string()),
         "Bob should have his message, got: {:?}",
+        bob_msgs
+    );
+    assert!(
+        bob_msgs.contains(&"Hello world from alice".to_string()),
+        "Bob should see Alice's first message (shared workspace), got: {:?}",
+        bob_msgs
+    );
+    assert!(
+        bob_msgs.contains(&"Second message from alice".to_string()),
+        "Bob should see Alice's second message (shared workspace), got: {:?}",
         bob_msgs
     );
 

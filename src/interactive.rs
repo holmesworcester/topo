@@ -91,44 +91,6 @@ impl Account {
         }
     }
 
-    /// Create an account with a fresh DB but no transport identity.
-    /// Used by invite acceptance where the service layer installs
-    /// a deterministic bootstrap identity instead of a random one.
-    fn new_without_transport(user_name: &str, device_name: &str) -> Self {
-        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
-        let db_path = tempdir
-            .path()
-            .join(format!("{}.db", user_name))
-            .to_str()
-            .unwrap()
-            .to_string();
-
-        let db = open_connection(&db_path).expect("failed to open db");
-        create_tables(&db).expect("failed to create tables");
-
-        let mut default_channel = [0u8; 32];
-        default_channel[..16]
-            .copy_from_slice(&hex::decode("0102030405060708090a0b0c0d0e0f10").unwrap());
-
-        Account {
-            db_path,
-            identity: String::new(), // will be set after svc_accept_invite
-            signing_keys: HashMap::new(),
-            workspace_id: None,
-            workspace_name: None,
-            workspace_key: None,
-            user_event_id: None,
-            user_key: None,
-            peer_shared_event_id: None,
-            peer_shared_key: None,
-            user_name: user_name.to_string(),
-            device_name: device_name.to_string(),
-            active_channel: default_channel,
-            author_id: rand::random(),
-            _tempdir: tempdir,
-        }
-    }
-
     fn store_chain_keys(&mut self, chain: &IdentityChain) {
         self.workspace_id = Some(chain.workspace_id);
         self.workspace_key = Some(chain.workspace_key.clone());
@@ -1019,8 +981,9 @@ fn cmd_accept_invite(
         (invite_link.clone(), None)
     };
 
-    // Create account with a fresh DB (no transport identity — svc_accept_invite installs one)
-    let mut account = Account::new_without_transport(username, devicename);
+    // Create account — svc_accept_invite will replace the random cert with a
+    // deterministic one derived from the invite key (DELETE + INSERT).
+    let mut account = Account::new(username, devicename);
 
     // Delegate to service layer: bootstrap sync + identity chain creation
     let result = tokio::task::block_in_place(|| {
@@ -1186,7 +1149,7 @@ fn cmd_accept_link(
     // Re-parse the effective link to get the updated bootstrap addr
     let effective_invite = parse_invite_link(&_effective_link)?;
 
-    let mut account = Account::new_without_transport(&username, devicename);
+    let mut account = Account::new(&username, devicename);
     account.identity =
         install_invite_bootstrap_transport_identity(&account.db_path, &device_invite_key)?;
     account.workspace_id = Some(workspace_id);

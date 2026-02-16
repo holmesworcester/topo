@@ -24,7 +24,7 @@ use crate::db::{
     open_connection,
     project_queue::ProjectQueue,
     schema::create_tables,
-    store::{Store, SQL_INSERT_EVENT, SQL_INSERT_NEG_ITEM, SQL_INSERT_RECORDED_EVENT},
+    store::{Store, SQL_INSERT_EVENT, SQL_INSERT_NEG_ITEM, SQL_INSERT_RECORDED_EVENT, lookup_workspace_id},
     wanted::WantedEvents,
 };
 use crate::db::health::{purge_expired_endpoints, record_endpoint_observation};
@@ -201,6 +201,8 @@ pub fn batch_writer(
 
     let reg = registry();
     let pq = ProjectQueue::new(&db);
+    // Cache workspace_id per recorded_by to avoid repeated lookups
+    let mut workspace_cache: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
     let mut enqueue_stmt = match db.prepare(
         "INSERT OR IGNORE INTO project_queue (peer_id, event_id, available_at)
@@ -231,10 +233,21 @@ pub fn batch_writer(
             }
         }
 
+        // Pre-warm workspace_id cache for all recorded_by values in this batch
+        // BEFORE the transaction — avoids SHARED→EXCLUSIVE lock upgrade inside BEGIN.
+        for (_, _, rb) in &batch {
+            if !workspace_cache.contains_key(rb) {
+                let ws = lookup_workspace_id(&db, rb);
+                if !ws.is_empty() {
+                    workspace_cache.insert(rb.clone(), ws);
+                }
+            }
+        }
+
         // BEGIN with retry+backoff — do not drain batch on failure
         let mut begin_ok = false;
         for attempt in 0..3 {
-            match db.execute("BEGIN", []) {
+            match db.execute("BEGIN IMMEDIATE", []) {
                 Ok(_) => { begin_ok = true; break; }
                 Err(e) => {
                     warn!("BEGIN failed (attempt {}): {}", attempt + 1, e);
@@ -262,12 +275,25 @@ pub fn batch_writer(
                     if let Some(meta) = reg.lookup(type_code) {
                         // Only insert into neg_items for shared events (defense-in-depth)
                         if meta.share_scope == ShareScope::Shared {
+                            // Look up workspace_id; cache only non-empty values
+                            // (empty means trust anchor not yet projected).
+                            let ws_id = if let Some(cached) = workspace_cache.get(recorded_by) {
+                                cached.clone()
+                            } else {
+                                let ws = lookup_workspace_id(&db, recorded_by);
+                                if !ws.is_empty() {
+                                    workspace_cache.insert(recorded_by.clone(), ws.clone());
+                                }
+                                ws
+                            };
                             if let Err(e) = neg_items_stmt.execute(rusqlite::params![
+                                &ws_id,
                                 created_at_ms as i64,
                                 event_id.as_slice()
                             ]) {
+                                // Non-fatal: neg_items is a reconciliation cache;
+                                // event will be re-added on next sync session.
                                 warn!("neg_items insert error for {}: {}", event_id_b64, e);
-                                continue;
                             }
                         }
 
@@ -591,7 +617,8 @@ where
     let _ = egress.clear_connection(peer_id);
     let _ = wanted.clear();
 
-    let neg_storage = NegentropyStorageSqlite::new(&neg_db);
+    let ws_id = lookup_workspace_id(&db, recorded_by);
+    let neg_storage = NegentropyStorageSqlite::new(&neg_db, &ws_id);
 
     neg_db.execute("BEGIN", []).map_err(|e| format!("Failed to begin snapshot: {}", e))?;
     neg_storage.rebuild_blocks().map_err(|e| format!("Failed to rebuild blocks: {}", e))?;
@@ -887,7 +914,8 @@ where
     let egress = EgressQueue::new(&db);
     let _ = egress.clear_connection(peer_id);
 
-    let neg_storage = NegentropyStorageSqlite::new(&neg_db);
+    let ws_id = lookup_workspace_id(&db, recorded_by);
+    let neg_storage = NegentropyStorageSqlite::new(&neg_db, &ws_id);
 
     neg_db.execute("BEGIN", []).map_err(|e| format!("Failed to begin snapshot: {}", e))?;
     neg_storage.rebuild_blocks().map_err(|e| format!("Failed to rebuild blocks: {}", e))?;
@@ -1084,7 +1112,7 @@ pub async fn accept_loop_with_ingest(
     db_path: &str,
     recorded_by: &str,
     endpoint: quinn::Endpoint,
-    allowed_peers: Option<crate::transport::AllowedPeers>,
+    _allowed_peers: Option<crate::transport::AllowedPeers>,
     shared_ingest_tx: mpsc::Sender<IngestItem>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     {
@@ -1268,9 +1296,20 @@ async fn connect_loop_inner(
     endpoint: quinn::Endpoint,
     remote: SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Look up workspace SNI for this tenant (falls back to "localhost" if no trust anchor)
+    let sni = {
+        let db = open_connection(db_path)?;
+        let ws_id = lookup_workspace_id(&db, recorded_by);
+        if ws_id.is_empty() {
+            "localhost".to_string()
+        } else {
+            crate::transport::multi_workspace::workspace_sni(&ws_id)
+        }
+    };
+
     loop {
         info!("Connecting to {}...", remote);
-        let connection = match endpoint.connect(remote, "localhost") {
+        let connection = match endpoint.connect(remote, &sni) {
             Ok(connecting) => match connecting.await {
                 Ok(c) => c,
                 Err(e) => {
@@ -1423,10 +1462,22 @@ pub async fn download_from_sources(
 
     let mut handles = Vec::new();
 
+    // Look up workspace SNI once for all peers
+    let download_sni = {
+        let db = open_connection(db_path)?;
+        let ws_id = lookup_workspace_id(&db, recorded_by);
+        if ws_id.is_empty() {
+            "localhost".to_string()
+        } else {
+            crate::transport::multi_workspace::workspace_sni(&ws_id)
+        }
+    };
+
     for (peer_coord, (endpoint, remote)) in peer_coords.into_iter().zip(endpoints.into_iter()) {
         let db_path = db_path.to_string();
         let recorded_by = recorded_by.to_string();
         let ingest_tx = shared_tx.clone();
+        let sni = download_sni.clone();
 
         handles.push(std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -1435,7 +1486,7 @@ pub async fn download_from_sources(
                 .unwrap();
             rt.block_on(async move {
                 loop {
-                    let connection = match endpoint.connect(remote, "localhost") {
+                    let connection = match endpoint.connect(remote, &sni) {
                         Ok(connecting) => match connecting.await {
                             Ok(c) => c,
                             Err(e) => {

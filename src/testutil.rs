@@ -6,7 +6,7 @@ use crate::crypto::{event_id_from_base64, EventId};
 use crate::db::{
     open_connection,
     schema::create_tables,
-    store::{insert_event, insert_neg_item_if_shared, insert_recorded_event, parse_share_scope},
+    store::{insert_event, insert_neg_item_if_shared, insert_recorded_event, parse_share_scope, lookup_workspace_id},
 };
 use crate::events::{
     MessageEvent, MessageDeletionEvent, ReactionEvent, SecretKeyEvent,
@@ -172,7 +172,8 @@ impl Peer {
             let now_ms = current_timestamp_ms() as i64;
             insert_recorded_event(&db, &peer.identity, eid, now_ms, "test")
                 .expect("failed to record event");
-            insert_neg_item_if_shared(&db, scope, created_at, eid)
+            let ws_id = lookup_workspace_id(&db, &peer.identity);
+            insert_neg_item_if_shared(&db, scope, created_at, eid, &ws_id)
                 .expect("failed to add to neg_items");
 
             let _ = project_one(&db, &peer.identity, eid);

@@ -18,19 +18,23 @@ pub const BLOCK_SIZE: usize = 4096;
 
 /// SQLite-backed negentropy storage
 ///
-/// Uses `neg_items` table for sorted (ts, id) pairs and `neg_blocks`
-/// as a sparse index for O(1) index-to-key lookups.
+/// Uses `neg_items` table for sorted (workspace_id, ts, id) pairs and
+/// `session_blocks` as a sparse index for O(1) index-to-key lookups.
+/// All queries are scoped to a single `workspace_id`.
 pub struct NegentropyStorageSqlite<'a> {
     conn: &'a Connection,
+    /// Workspace scope for neg_items queries
+    workspace_id: String,
     /// Cached size (computed once per sync)
     cached_size: RefCell<Option<usize>>,
 }
 
 impl<'a> NegentropyStorageSqlite<'a> {
-    /// Create a new SQLite storage adapter
-    pub fn new(conn: &'a Connection) -> Self {
+    /// Create a new SQLite storage adapter scoped to the given workspace.
+    pub fn new(conn: &'a Connection, workspace_id: &str) -> Self {
         Self {
             conn,
+            workspace_id: workspace_id.to_string(),
             cached_size: RefCell::new(None),
         }
     }
@@ -59,9 +63,10 @@ impl<'a> NegentropyStorageSqlite<'a> {
         // Clear existing session blocks
         self.conn.execute("DELETE FROM session_blocks", [])?;
 
-        // Stream through all items and insert every BLOCK_SIZE-th one
+        // Stream through all items: include workspace-scoped items plus any
+        // with empty workspace_id (pre-trust-anchor items stored before projection).
         let mut stmt = self.conn.prepare(
-            "SELECT ts, id FROM neg_items ORDER BY ts, id"
+            "SELECT ts, id FROM neg_items WHERE workspace_id = ?1 OR workspace_id = '' ORDER BY ts, id"
         )?;
 
         let mut insert_stmt = self.conn.prepare(
@@ -71,7 +76,7 @@ impl<'a> NegentropyStorageSqlite<'a> {
         let mut row_idx: usize = 0;
         let mut block_idx: usize = 0;
 
-        let mut rows = stmt.query([])?;
+        let mut rows = stmt.query(rusqlite::params![&self.workspace_id])?;
         while let Some(row) = rows.next()? {
             if row_idx % BLOCK_SIZE == 0 {
                 let ts: i64 = row.get(0)?;
@@ -128,7 +133,11 @@ impl NegentropyStorageBase for NegentropyStorageSqlite<'_> {
 
         // Otherwise query and cache
         let count: i64 = self.conn
-            .query_row("SELECT COUNT(*) FROM neg_items", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM neg_items WHERE workspace_id = ?1 OR workspace_id = ''",
+                rusqlite::params![&self.workspace_id],
+                |row| row.get(0),
+            )
             .map_err(|e| sql_err(e))?;
 
         let size = count as usize;
@@ -150,11 +159,11 @@ impl NegentropyStorageBase for NegentropyStorageSqlite<'_> {
 
         // Fetch item at offset within block
         let mut stmt = self.conn.prepare_cached(
-            "SELECT ts, id FROM neg_items WHERE (ts, id) >= (?, ?) ORDER BY ts, id LIMIT 1 OFFSET ?"
+            "SELECT ts, id FROM neg_items WHERE (workspace_id = ?1 OR workspace_id = '') AND (ts, id) >= (?2, ?3) ORDER BY ts, id LIMIT 1 OFFSET ?4"
         ).map_err(|e| sql_err(e))?;
 
         let result = stmt.query_row(
-            rusqlite::params![block_ts, block_id, offset as i64],
+            rusqlite::params![&self.workspace_id, block_ts, block_id, offset as i64],
             |row| {
                 let ts: i64 = row.get(0)?;
                 let id: Vec<u8> = row.get(1)?;
@@ -193,10 +202,11 @@ impl NegentropyStorageBase for NegentropyStorageSqlite<'_> {
 
         // Query items starting from begin position
         let mut stmt = self.conn.prepare_cached(
-            "SELECT ts, id FROM neg_items WHERE (ts, id) >= (?, ?) ORDER BY ts, id LIMIT ? OFFSET ?"
+            "SELECT ts, id FROM neg_items WHERE (workspace_id = ?1 OR workspace_id = '') AND (ts, id) >= (?2, ?3) ORDER BY ts, id LIMIT ?4 OFFSET ?5"
         ).map_err(|e| sql_err(e))?;
 
         let mut rows = stmt.query(rusqlite::params![
+            &self.workspace_id,
             block_ts,
             block_id,
             count as i64,
@@ -245,11 +255,12 @@ impl NegentropyStorageBase for NegentropyStorageSqlite<'_> {
                 .unwrap_or((0, vec![0u8; 32]));
 
             let mut scan_stmt = self.conn.prepare_cached(
-                "SELECT ts, id FROM neg_items WHERE (ts, id) >= (?, ?) ORDER BY ts, id LIMIT ?"
+                "SELECT ts, id FROM neg_items WHERE (workspace_id = ?1 OR workspace_id = '') AND (ts, id) >= (?2, ?3) ORDER BY ts, id LIMIT ?4"
             )?;
 
             let limit = BLOCK_SIZE + 1; // Scan at most one block plus one
             let mut rows = scan_stmt.query(rusqlite::params![
+                &self.workspace_id,
                 block_start.0,
                 block_start.1,
                 limit as i64
@@ -299,7 +310,7 @@ mod tests {
 
         insert_test_items(&conn, 100);
 
-        let storage = NegentropyStorageSqlite::new(&conn);
+        let storage = NegentropyStorageSqlite::new(&conn, "");
         assert_eq!(storage.size().unwrap(), 100);
     }
 
@@ -311,7 +322,7 @@ mod tests {
         // Insert more than one block worth
         insert_test_items(&conn, BLOCK_SIZE + 100);
 
-        let storage = NegentropyStorageSqlite::new(&conn);
+        let storage = NegentropyStorageSqlite::new(&conn, "");
         storage.rebuild_blocks().unwrap();
 
         // Should have 2 blocks (in session_blocks TEMP table)
@@ -328,7 +339,7 @@ mod tests {
 
         insert_test_items(&conn, 100);
 
-        let storage = NegentropyStorageSqlite::new(&conn);
+        let storage = NegentropyStorageSqlite::new(&conn, "");
         storage.rebuild_blocks().unwrap();
 
         // Get first item
@@ -351,7 +362,7 @@ mod tests {
 
         insert_test_items(&conn, 100);
 
-        let storage = NegentropyStorageSqlite::new(&conn);
+        let storage = NegentropyStorageSqlite::new(&conn, "");
         storage.rebuild_blocks().unwrap();
 
         let mut items = Vec::new();
@@ -372,7 +383,7 @@ mod tests {
 
         insert_test_items(&conn, 100);
 
-        let storage = NegentropyStorageSqlite::new(&conn);
+        let storage = NegentropyStorageSqlite::new(&conn, "");
         storage.rebuild_blocks().unwrap();
 
         // Find bound for timestamp 50000 (should be index 50)
@@ -392,7 +403,7 @@ mod tests {
         // Insert items spanning multiple blocks
         insert_test_items(&conn, BLOCK_SIZE * 2 + 100);
 
-        let storage = NegentropyStorageSqlite::new(&conn);
+        let storage = NegentropyStorageSqlite::new(&conn, "");
         storage.rebuild_blocks().unwrap();
 
         // Iterate across block boundary
@@ -425,7 +436,7 @@ mod tests {
             stmt.execute(rusqlite::params![ts, id.as_slice()]).unwrap();
         }
 
-        let storage = NegentropyStorageSqlite::new(&conn);
+        let storage = NegentropyStorageSqlite::new(&conn, "");
         storage.rebuild_blocks().unwrap();
 
         // Verify all items are accessible
@@ -475,7 +486,7 @@ mod tests {
         }
         inmem.seal().unwrap();
 
-        let sqlite_storage = NegentropyStorageSqlite::new(&conn);
+        let sqlite_storage = NegentropyStorageSqlite::new(&conn, "");
         sqlite_storage.rebuild_blocks().unwrap();
 
         // Compare sizes
