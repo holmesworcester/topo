@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Run TLC model checker with recommended JVM flags.
+# Usage: ./tlc <config.cfg> [extra TLC args...]
+#   e.g. ./tlc event_graph_schema.cfg
+#        ./tlc event_graph_schema_bootstrap.cfg -workers auto
+set -euo pipefail
+DIR="$(cd "$(dirname "$0")" && pwd)"
+CFG="${1:?Usage: $0 <config.cfg> [extra TLC args...]}"
+shift
+exec java \
+  -XX:+UseParallelGC \
+  -cp "$DIR/tla2tools.jar" \
+  tlc2.TLC \
+  -config "$CFG" \
+  -workers auto \
+  "$@" \
+  "$DIR/EventGraphSchema"

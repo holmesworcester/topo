@@ -43,7 +43,8 @@ CONSTANTS ActiveEvents, Peers, Workspaces
 VARIABLES recorded, valid, trustAnchor, removed,
           inviteCarriedWorkspace, inviteCarriedBootstrapPeer, bootstrapTrustPeer,
           inviteCarriedPendingPeer, pendingBootstrapTrustPeer,
-          transportKeyCarriedPeer, transportKeyTrustPeer
+          transportKeyCarriedPeer, transportKeyTrustPeer,
+          connState
 
 \* ---- Event type constants ----
 
@@ -159,6 +160,9 @@ IdentityEvents == {
 
 ContentEvents == {Channel, Message, MessageReaction, MessageDeletion, MessageAttachment, FileSlice}
 EncryptionEvents == {SecretKey, SecretShared, Encrypted}
+
+\* Connection state values (per-peer state machine for invite-based bootstrap).
+ConnStates == {"none", "req", "ack", "invite", "peer"}
 
 ASSUME (ActiveEvents \ {Workspace}) \subseteq FullEventTypes
 ASSUME Peers /= {}
@@ -317,6 +321,7 @@ Init ==
     /\ pendingBootstrapTrustPeer = [p \in Peers |-> "none"]
     /\ transportKeyCarriedPeer = [p \in Peers |-> "none"]
     /\ transportKeyTrustPeer = [p \in Peers |-> "none"]
+    /\ connState = [p \in Peers |-> "none"]
 
 \* Record captures the event-carried workspace_id at ingress time.
 \* For invite_accepted, the event carries a specific workspace_id chosen
@@ -344,7 +349,7 @@ Record(p, e) ==
        THEN \E tp \in Peers:
             transportKeyCarriedPeer' = [transportKeyCarriedPeer EXCEPT ![p] = tp]
        ELSE UNCHANGED transportKeyCarriedPeer
-    /\ UNCHANGED <<valid, trustAnchor, removed, bootstrapTrustPeer, transportKeyTrustPeer>>
+    /\ UNCHANGED <<valid, trustAnchor, removed, bootstrapTrustPeer, transportKeyTrustPeer, connState>>
 
 \* invite_accepted binds the trust anchor from its event-carried workspace_id.
 \* First-write-wins: if trust anchor is already set to a different workspace,
@@ -397,24 +402,68 @@ Project(p, e) ==
         THEN [pendingBootstrapTrustPeer EXCEPT ![p] = "none"]
         ELSE pendingBootstrapTrustPeer
     /\ UNCHANGED <<recorded, inviteCarriedWorkspace, inviteCarriedBootstrapPeer,
-                  inviteCarriedPendingPeer, transportKeyCarriedPeer>>
+                  inviteCarriedPendingPeer, transportKeyCarriedPeer, connState>>
 
 Stutter ==
     UNCHANGED <<recorded, valid, trustAnchor, removed,
                 inviteCarriedWorkspace, inviteCarriedBootstrapPeer, bootstrapTrustPeer,
                 inviteCarriedPendingPeer, pendingBootstrapTrustPeer,
-                transportKeyCarriedPeer, transportKeyTrustPeer>>
+                transportKeyCarriedPeer, transportKeyTrustPeer,
+                connState>>
+
+\* ---- Connection state machine (bootstrap invite upgrade) ----
+\* Models the upgrade from invite-labeled to peer-labeled connection.
+\* Only active when InviteAccepted is in EVENTS.
+
+allVars == <<recorded, valid, trustAnchor, removed,
+             inviteCarriedWorkspace, inviteCarriedBootstrapPeer, bootstrapTrustPeer,
+             inviteCarriedPendingPeer, pendingBootstrapTrustPeer,
+             transportKeyCarriedPeer, transportKeyTrustPeer, connState>>
+
+nonConnVars == <<recorded, valid, trustAnchor, removed,
+                 inviteCarriedWorkspace, inviteCarriedBootstrapPeer, bootstrapTrustPeer,
+                 inviteCarriedPendingPeer, pendingBootstrapTrustPeer,
+                 transportKeyCarriedPeer, transportKeyTrustPeer>>
+
+\* Bootstrap connection request: authenticated by invite signature.
+ConnectReqByInvite(p) ==
+    /\ InviteAccepted \in EVENTS
+    /\ connState[p] = "none"
+    /\ InviteAccepted \in valid[p]
+    /\ \E ie \in (UserInviteEvents \cap EVENTS): ie \in recorded[p]
+    /\ connState' = [connState EXCEPT ![p] = "req"]
+    /\ UNCHANGED nonConnVars
+
+\* Connection acknowledgment: only after request is accepted.
+ConnectAck(p) ==
+    /\ connState[p] = "req"
+    /\ connState' = [connState EXCEPT ![p] = "ack"]
+    /\ UNCHANGED nonConnVars
+
+\* Bootstrap connection active (invite-labeled) after ack.
+ConnectByInvite(p) ==
+    /\ connState[p] = "ack"
+    /\ connState' = [connState EXCEPT ![p] = "invite"]
+    /\ UNCHANGED nonConnVars
+
+\* Upgrade to peer-labeled connection once peer_shared is valid.
+UpgradeToPeer(p) ==
+    /\ connState[p] = "invite"
+    /\ \E ps \in ({PeerSharedFirst, PeerSharedOngoing} \cap EVENTS): ps \in valid[p]
+    /\ connState' = [connState EXCEPT ![p] = "peer"]
+    /\ UNCHANGED nonConnVars
 
 Next ==
     \/ \E p \in Peers, e \in EVENTS: Record(p, e)
     \/ \E p \in Peers, e \in EVENTS: Project(p, e)
+    \/ \E p \in Peers: ConnectReqByInvite(p)
+    \/ \E p \in Peers: ConnectAck(p)
+    \/ \E p \in Peers: ConnectByInvite(p)
+    \/ \E p \in Peers: UpgradeToPeer(p)
     \/ Stutter
 
 Spec ==
-    Init /\ [][Next]_<<recorded, valid, trustAnchor, removed,
-                       inviteCarriedWorkspace, inviteCarriedBootstrapPeer, bootstrapTrustPeer,
-                       inviteCarriedPendingPeer, pendingBootstrapTrustPeer,
-                       transportKeyCarriedPeer, transportKeyTrustPeer>>
+    Init /\ [][Next]_allVars
 
 \* ---- Invariants ----
 
@@ -431,6 +480,7 @@ TypeOK ==
     /\ pendingBootstrapTrustPeer \in [Peers -> Peers \cup {"none"}]
     /\ transportKeyCarriedPeer \in [Peers -> Peers \cup {"none"}]
     /\ transportKeyTrustPeer \in [Peers -> Peers \cup {"none"}]
+    /\ connState \in [Peers -> ConnStates]
 
 \* Every valid event has all its peer-resolved dependencies valid.
 InvDeps ==
@@ -610,6 +660,40 @@ InvFileSliceAuth ==
     THEN \A p \in Peers:
         (FileSlice \in valid[p] /\ MessageAttachment \in valid[p])
             => (PeerSharedOngoing \in valid[p] \/ PeerSharedFirst \in valid[p])
+    ELSE TRUE
+
+\* ---- Connection state machine invariants ----
+
+\* Connection request requires invite_accepted valid and a user invite recorded.
+InvConnReq ==
+    IF InviteAccepted \in EVENTS
+    THEN \A p \in Peers:
+        connState[p] \in {"req", "ack", "invite", "peer"} =>
+            (InviteAccepted \in valid[p]
+             /\ \E ie \in (UserInviteEvents \cap EVENTS): ie \in recorded[p])
+    ELSE TRUE
+
+\* Connection ack requires request (monotonic state machine).
+InvConnAck ==
+    \A p \in Peers:
+        connState[p] \in {"ack", "invite", "peer"} =>
+            connState[p] /= "none"
+
+\* Connection by invite requires ack.
+InvConnInvite ==
+    IF InviteAccepted \in EVENTS
+    THEN \A p \in Peers:
+        connState[p] \in {"invite", "peer"} =>
+            (InviteAccepted \in valid[p]
+             /\ \E ie \in (UserInviteEvents \cap EVENTS): ie \in recorded[p])
+    ELSE TRUE
+
+\* Peer connection requires invite connection and peer_shared valid.
+InvConnPeer ==
+    IF InviteAccepted \in EVENTS
+    THEN \A p \in Peers:
+        connState[p] = "peer" =>
+            (\E ps \in ({PeerSharedFirst, PeerSharedOngoing} \cap EVENTS): ps \in valid[p])
     ELSE TRUE
 
 ====

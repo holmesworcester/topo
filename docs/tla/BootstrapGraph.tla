@@ -1,4 +1,12 @@
 ---- MODULE BootstrapGraph ----
+\* DEPRECATED: This spec has been absorbed into EventGraphSchema.tla.
+\* Use event_graph_schema_bootstrap.cfg for the equivalent bootstrap scenario.
+\* The connection state machine (ConnectReqByInvite, ConnectAck, ConnectByInvite,
+\* UpgradeToPeer) and all identity/workspace/guard invariants now live in
+\* EventGraphSchema as a single source of truth.
+\*
+\* This file is retained for reference only and will be removed in a future cleanup.
+
 EXTENDS Naturals
 
 \* Model of the identity bootstrap and join sequence for poc-7.
