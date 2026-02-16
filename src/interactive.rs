@@ -1066,8 +1066,8 @@ fn cmd_accept_link(
         (invite_link.clone(), None)
     };
 
-    // Create account with a fresh DB (no transport identity — svc_accept_device_link installs one)
-    let mut account = Account::new_without_transport(&username, devicename);
+    // Create account DB/state; svc_accept_device_link installs invite-derived transport identity.
+    let mut account = Account::new(&username, devicename);
 
     // Delegate to service layer: bootstrap sync + identity chain creation
     let result = tokio::task::block_in_place(|| {
