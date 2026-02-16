@@ -8,6 +8,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use ed25519_dalek::SigningKey;
 use tracing::info;
 
 use crate::db::{open_connection, schema::create_tables};
@@ -16,7 +17,9 @@ use crate::sync::SyncMessage;
 use crate::transport::{
     create_dual_endpoint, AllowedPeers, DualConnection, peer_identity_from_connection,
 };
-use crate::transport_identity::ensure_transport_cert_from_db;
+use crate::transport_identity::{
+    ensure_transport_cert_from_db, expected_invite_bootstrap_spki_from_invite_key,
+};
 
 /// Run a one-shot bootstrap sync from an invite link's bootstrap address.
 ///
@@ -107,4 +110,83 @@ pub async fn bootstrap_sync_from_invite(
     endpoint.wait_idle().await;
 
     Ok(())
+}
+
+/// Start a temporary QUIC sync endpoint that serves one bootstrap connection.
+///
+/// The endpoint allows only the invitee's SPKI (derived from the invite key).
+/// A sync responder runs on a separate thread (rusqlite is not Send), accepts
+/// one connection, syncs, and exits. Returns the bound address and endpoint
+/// handle — caller must close the endpoint when done.
+///
+/// Used by both interactive REPL and test helpers to let an in-process inviter
+/// serve prerequisite events to a joiner via real QUIC sync.
+pub fn start_bootstrap_responder(
+    inviter_db_path: &str,
+    inviter_identity: &str,
+    invite_key: &SigningKey,
+) -> Result<(SocketAddr, quinn::Endpoint), Box<dyn std::error::Error + Send + Sync>> {
+    let db = open_connection(inviter_db_path)?;
+    let (_, cert, key) = crate::transport_identity::ensure_transport_cert(&db)?;
+
+    let joiner_spki = expected_invite_bootstrap_spki_from_invite_key(invite_key)?;
+    let allowed = Arc::new(AllowedPeers::from_fingerprints(vec![joiner_spki]));
+
+    let endpoint = create_dual_endpoint(
+        "127.0.0.1:0".parse().unwrap(),
+        cert,
+        key,
+        allowed,
+    )?;
+    let local_addr = endpoint.local_addr()?;
+
+    let db_path = inviter_db_path.to_string();
+    let recorded_by = inviter_identity.to_string();
+    let ep = endpoint.clone();
+
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to create bootstrap responder runtime");
+        rt.block_on(async move {
+            let connection = match ep.accept().await {
+                Some(incoming) => match incoming.await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!("Bootstrap responder: connection failed: {}", e);
+                        return;
+                    }
+                },
+                None => return,
+            };
+
+            let peer_id = peer_identity_from_connection(&connection)
+                .unwrap_or_default();
+
+            let (ctrl_send, ctrl_recv) = match connection.accept_bi().await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("Bootstrap responder: control stream failed: {}", e);
+                    return;
+                }
+            };
+            let (data_send, data_recv) = match connection.accept_bi().await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("Bootstrap responder: data stream failed: {}", e);
+                    return;
+                }
+            };
+            let conn = DualConnection::new(ctrl_send, ctrl_recv, data_send, data_recv);
+
+            if let Err(e) = crate::sync::engine::run_sync_responder_dual(
+                conn, &db_path, 30, &peer_id, &recorded_by, None,
+            ).await {
+                tracing::warn!("Bootstrap responder: sync error: {}", e);
+            }
+        });
+    });
+
+    Ok((local_addr, endpoint))
 }

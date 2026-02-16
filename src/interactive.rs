@@ -832,85 +832,13 @@ fn cmd_invite(
 
 /// In the interactive REPL all accounts live in one process — nobody is
 /// running `poc-7 sync`.  This spins up a temporary QUIC sync endpoint for
-/// the inviter's account so the joiner can connect and run a normal
-/// negentropy sync session, exactly as it would against a real remote peer.
-/// Returns the endpoint's bound address and a handle to close it afterward.
+/// Delegate to the shared bootstrap responder in sync::bootstrap.
 fn start_temp_sync_endpoint(
     inviter_db_path: &str,
     inviter_identity: &str,
     invite_key: &ed25519_dalek::SigningKey,
 ) -> Result<(std::net::SocketAddr, quinn::Endpoint), Box<dyn std::error::Error + Send + Sync>> {
-    use std::sync::Arc;
-    use crate::transport::{create_dual_endpoint, AllowedPeers, DualConnection, peer_identity_from_connection};
-    use crate::transport_identity::ensure_transport_cert;
-
-    let conn = open_connection(inviter_db_path)?;
-    let (_, cert, key) = ensure_transport_cert(&conn)?;
-
-    // The joiner will present a cert derived from the invite key.
-    let joiner_spki = expected_invite_bootstrap_spki_from_invite_key(invite_key)?;
-    let allowed = Arc::new(AllowedPeers::from_fingerprints(vec![joiner_spki]));
-
-    let endpoint = create_dual_endpoint(
-        "127.0.0.1:0".parse().unwrap(),
-        cert,
-        key,
-        allowed,
-    )?;
-    let local_addr = endpoint.local_addr()?;
-
-    let db_path = inviter_db_path.to_string();
-    let recorded_by = inviter_identity.to_string();
-    let ep = endpoint.clone();
-
-    // Spawn on a separate thread with its own runtime because
-    // run_sync_responder_dual uses non-Send types (rusqlite).
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("failed to create temp sync runtime");
-        rt.block_on(async move {
-            let connection = match ep.accept().await {
-                Some(incoming) => match incoming.await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::warn!("Temp sync endpoint: connection failed: {}", e);
-                        return;
-                    }
-                },
-                None => return,
-            };
-
-            let peer_id = peer_identity_from_connection(&connection)
-                .unwrap_or_default();
-
-            // Accept 2 bi-directional streams (control + data)
-            let (ctrl_send, ctrl_recv) = match connection.accept_bi().await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("Temp sync endpoint: control stream failed: {}", e);
-                    return;
-                }
-            };
-            let (data_send, data_recv) = match connection.accept_bi().await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("Temp sync endpoint: data stream failed: {}", e);
-                    return;
-                }
-            };
-            let conn = DualConnection::new(ctrl_send, ctrl_recv, data_send, data_recv);
-
-            if let Err(e) = crate::sync::engine::run_sync_responder_dual(
-                conn, &db_path, 30, &peer_id, &recorded_by, None,
-            ).await {
-                tracing::warn!("Temp sync endpoint: sync error: {}", e);
-            }
-        });
-    });
-
-    Ok((local_addr, endpoint))
+    crate::sync::bootstrap::start_bootstrap_responder(inviter_db_path, inviter_identity, invite_key)
 }
 
 fn cmd_accept_invite(
