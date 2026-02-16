@@ -27,6 +27,7 @@ use crate::transport::{
     DualConnection,
     create_client_endpoint,
     create_dual_endpoint,
+    create_dual_endpoint_dynamic,
     create_server_endpoint,
     extract_spki_fingerprint,
     peer_identity_from_connection,
@@ -1287,6 +1288,116 @@ pub fn start_peers_identity_trust(
     });
 
     (a_handle, b_handle)
+}
+
+/// Start continuous sync between two peers using dynamic DB trust lookup.
+/// Trust is resolved from SQL at each TLS handshake, matching production
+/// behavior (`is_peer_allowed`). Caller must have seeded trust rows
+/// (via `publish_transport_key` + sync, `import_cli_pins_to_sql`, or invite
+/// bootstrap) before peers will accept connections.
+pub fn start_peers_dynamic(
+    peer_a: &Peer,
+    peer_b: &Peer,
+) -> (std::thread::JoinHandle<()>, std::thread::JoinHandle<()>) {
+    use crate::db::transport_trust::is_peer_allowed;
+
+    let (cert_a, key_a) = peer_a.cert_and_key();
+    let (cert_b, key_b) = peer_b.cert_and_key();
+
+    let a_db_path = peer_a.db_path.clone();
+    let a_recorded_by = peer_a.identity.clone();
+    let dynamic_allow_a: Arc<crate::transport::DynamicAllowFn> =
+        Arc::new(move |peer_fp: &[u8; 32]| {
+            let db = open_connection(&a_db_path)?;
+            is_peer_allowed(&db, &a_recorded_by, peer_fp)
+        });
+
+    let b_db_path = peer_b.db_path.clone();
+    let b_recorded_by = peer_b.identity.clone();
+    let dynamic_allow_b: Arc<crate::transport::DynamicAllowFn> =
+        Arc::new(move |peer_fp: &[u8; 32]| {
+            let db = open_connection(&b_db_path)?;
+            is_peer_allowed(&db, &b_recorded_by, peer_fp)
+        });
+
+    let listener_endpoint = create_dual_endpoint_dynamic(
+        "127.0.0.1:0".parse().unwrap(),
+        cert_a,
+        key_a,
+        dynamic_allow_a,
+    )
+    .expect("failed to create dynamic dual endpoint for A");
+
+    let listener_addr = listener_endpoint
+        .local_addr()
+        .expect("failed to get listener addr");
+
+    let connector_endpoint = create_dual_endpoint_dynamic(
+        "127.0.0.1:0".parse().unwrap(),
+        cert_b,
+        key_b,
+        dynamic_allow_b,
+    )
+    .expect("failed to create dynamic dual endpoint for B");
+
+    let a_db = peer_a.db_path.clone();
+    let a_identity = peer_a.identity.clone();
+    let b_db = peer_b.db_path.clone();
+    let b_identity = peer_b.identity.clone();
+
+    let a_handle = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            if let Err(e) = accept_loop(&a_db, &a_identity, listener_endpoint).await {
+                tracing::warn!("accept_loop exited: {}", e);
+            }
+        });
+    });
+
+    let b_handle = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            if let Err(e) =
+                connect_loop(&b_db, &b_identity, connector_endpoint, listener_addr).await
+            {
+                tracing::warn!("connect_loop exited: {}", e);
+            }
+        });
+    });
+
+    (a_handle, b_handle)
+}
+
+/// Create a QUIC endpoint with dynamic DB trust lookup for a test peer.
+/// Returns the endpoint (dual-role: accepts and connects).
+/// Trust is resolved from SQL at each TLS handshake, matching production behavior.
+pub fn create_dynamic_endpoint_for_peer(
+    peer: &Peer,
+) -> quinn::Endpoint {
+    use crate::db::transport_trust::is_peer_allowed;
+
+    let (cert, key) = peer.cert_and_key();
+    let db_path = peer.db_path.clone();
+    let recorded_by = peer.identity.clone();
+    let dynamic_allow: Arc<crate::transport::DynamicAllowFn> =
+        Arc::new(move |peer_fp: &[u8; 32]| {
+            let db = open_connection(&db_path)?;
+            is_peer_allowed(&db, &recorded_by, peer_fp)
+        });
+
+    create_dual_endpoint_dynamic(
+        "127.0.0.1:0".parse().unwrap(),
+        cert,
+        key,
+        dynamic_allow,
+    )
+    .expect("failed to create dynamic endpoint for peer")
 }
 
 /// Start sync, wait for a caller-defined convergence check, return metrics.

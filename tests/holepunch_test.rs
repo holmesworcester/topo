@@ -18,7 +18,7 @@ use poc_7::db::transport_trust::{allowed_peers_from_db, import_cli_pins_to_sql};
 use poc_7::projection::pipeline::project_one;
 use poc_7::sync::engine::{accept_loop, connect_loop};
 use poc_7::sync::intro::{run_intro, send_intro_offer, build_intro_offer};
-use poc_7::testutil::{Peer, assert_eventually};
+use poc_7::testutil::{Peer, assert_eventually, create_dynamic_endpoint_for_peer};
 use poc_7::transport::{
     AllowedPeers, create_dual_endpoint,
 };
@@ -39,79 +39,18 @@ fn drain_project_queue(db_path: &str, identity: &str) {
     });
 }
 
-/// Start an accept_loop + connect_loop pair between two peers.
-/// Seeds SQL trust rows (via import_cli_pins_to_sql) so the intro listener
-/// can verify peers from the DB. Returns handles and the listener address.
-fn start_peers_with_intro(
-    listener: &Peer,
-    connector: &Peer,
-    listener_trusts: Vec<[u8; 32]>,
-    connector_trusts: Vec<[u8; 32]>,
-) -> (std::thread::JoinHandle<()>, std::thread::JoinHandle<()>, std::net::SocketAddr) {
-    // Seed SQL trust rows so the intro listener can verify peers from DB
-    {
-        let db = open_connection(&listener.db_path).expect("open listener db");
-        let pins = AllowedPeers::from_fingerprints(listener_trusts.clone());
-        import_cli_pins_to_sql(&db, &listener.identity, &pins).expect("import listener pins");
-    }
-    {
-        let db = open_connection(&connector.db_path).expect("open connector db");
-        let pins = AllowedPeers::from_fingerprints(connector_trusts.clone());
-        import_cli_pins_to_sql(&db, &connector.identity, &pins).expect("import connector pins");
-    }
-
-    let (cert_l, key_l) = listener.cert_and_key();
-    let (cert_c, key_c) = connector.cert_and_key();
-
-    let allowed_l = Arc::new(AllowedPeers::from_fingerprints(listener_trusts));
-    let allowed_c = Arc::new(AllowedPeers::from_fingerprints(connector_trusts));
-
-    let ep_l = create_dual_endpoint(
-        "127.0.0.1:0".parse().unwrap(), cert_l, key_l, allowed_l,
-    ).expect("create listener endpoint");
-    let addr_l = ep_l.local_addr().expect("listener addr");
-
-    let ep_c = create_dual_endpoint(
-        "127.0.0.1:0".parse().unwrap(), cert_c, key_c, allowed_c,
-    ).expect("create connector endpoint");
-
-    let l_db = listener.db_path.clone();
-    let l_id = listener.identity.clone();
-    let l_handle = std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async move {
-            let _ = accept_loop(&l_db, &l_id, ep_l).await;
-        });
-    });
-
-    let c_db = connector.db_path.clone();
-    let c_id = connector.identity.clone();
-    let c_handle = std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async move {
-            let _ = connect_loop(&c_db, &c_id, ep_c, addr_l).await;
-        });
-    });
-
-    (l_handle, c_handle, addr_l)
-}
-
-/// Functional intro test. Phase 1 uses pinning bootstrap; Phase 2 uses
-/// identity-derived trust via TransportKey events.
+/// Functional intro test with realistic transport trust and endpoint discovery.
 ///
 /// All three peers share the same workspace so identity chains validate
 /// across peers through normal sync (TransportKey events project correctly).
+/// Uses dynamic DB trust lookup (matching production behavior) and derives
+/// endpoint observations from organic sync traffic (no manual DB writes).
 ///
 /// Three-peer intro happy path:
-/// 1. A <-> I, B <-> I sync (gives I endpoint observations for A and B,
+/// 1. A <-> I, B <-> I sync via dynamic-trust dual endpoints
+///    (gives I organic endpoint observations for A and B,
 ///    and relays identity chains so TransportKey events project at each peer)
-/// 2. I sends IntroOffer to A and B
+/// 2. I sends IntroOffer to A and B using organically observed addresses
 /// 3. A and B dial each other using identity-derived trust and sync messages
 #[tokio::test]
 async fn test_three_peer_intro_happy_path() {
@@ -134,72 +73,103 @@ async fn test_three_peer_intro_happy_path() {
     let fp_a = peer_a.spki_fingerprint();
     let fp_b = peer_b.spki_fingerprint();
 
-    // --- Phase 1: Relay sync I<->A and I<->B (pinning bootstrap) ---
-    // Uses manual fingerprint pinning for the initial connections.
-    // After sync, each peer has the others' identity chains validated
-    // (shared workspace means remote chains resolve through the common
-    // Workspace event), so TransportKey events project into transport_keys.
+    // Seed CLI pin trust for bootstrap connections (dynamic trust reads these from SQL)
+    {
+        let db = open_connection(&intro.db_path).expect("open intro db");
+        let pins = AllowedPeers::from_fingerprints(vec![fp_a, fp_b]);
+        import_cli_pins_to_sql(&db, &intro.identity, &pins).expect("import intro pins");
+    }
+    {
+        let db = open_connection(&peer_a.db_path).expect("open A db");
+        let pins = AllowedPeers::from_fingerprints(vec![fp_i]);
+        import_cli_pins_to_sql(&db, &peer_a.identity, &pins).expect("import A pins");
+    }
+    {
+        let db = open_connection(&peer_b.db_path).expect("open B db");
+        let pins = AllowedPeers::from_fingerprints(vec![fp_i]);
+        import_cli_pins_to_sql(&db, &peer_b.identity, &pins).expect("import B pins");
+    }
 
-    let sync_ia = start_peers_with_intro(
-        &intro, &peer_a,
-        vec![fp_a, fp_b],  // I trusts A and B
-        vec![fp_i],        // A trusts I
-    );
-    // Intro has 8 own events (6 identity + 1 TransportKey + 1 message).
-    // A has 8 events (W copied + 5 identity + 1 TransportKey + 1 message).
-    // After I<->A sync: each gets the other's 6 shared events = 14 total.
-    // (Workspace event is shared, already present at both.)
-    assert_eventually(
-        || intro.store_count() >= 14 && peer_a.store_count() >= 14,
-        Duration::from_secs(10),
-        &format!("I<->A sync (I={}, A={})", intro.store_count(), peer_a.store_count()),
-    ).await;
+    // Create dynamic dual endpoints for all three peers.
+    // Trust is resolved from SQL at each TLS handshake (production behavior).
+    // Dual endpoints use the same port for connect and accept, so I's organic
+    // endpoint observations from Phase 1 sync point to A and B's listening addresses.
+    let ep_i = create_dynamic_endpoint_for_peer(&intro);
+    let ep_a = create_dynamic_endpoint_for_peer(&peer_a);
+    let ep_b = create_dynamic_endpoint_for_peer(&peer_b);
 
-    let sync_ib = start_peers_with_intro(
-        &intro, &peer_b,
-        vec![fp_a, fp_b],  // I trusts A and B
-        vec![fp_i],        // B trusts I
-    );
-    // I now has all 3 peers' shared events. B gets I's + A's (relayed).
-    assert_eventually(
-        || intro.store_count() >= 20 && peer_b.store_count() >= 14,
-        Duration::from_secs(10),
-        &format!("I<->B sync (I={}, B={})", intro.store_count(), peer_b.store_count()),
-    ).await;
+    let addr_i = ep_i.local_addr().expect("addr_i");
+    let addr_a = ep_a.local_addr().expect("addr_a");
+    let addr_b = ep_b.local_addr().expect("addr_b");
 
-    // Wait for full convergence: all 3 peers should have all shared events.
-    // 1 shared Workspace + 7 shared per peer (UIB+UB+DIF+PSF+TK+Msg + IA is local) = 20.
-    // Note: each peer has 8 in events table (Workspace + 6 identity + TK + Msg)
-    // but only 7 are in neg_items (IA is local). Unique shared events across
-    // all 3 peers: 1 Workspace + 3*6 = 19 shared. Total in events = 19 + 1 own IA = 20.
+    // --- Phase 1: Relay sync I<->A and I<->B ---
+    // I runs accept_loop; A and B connect to I using their dual endpoints.
+    // I's accept_loop organically records endpoint observations for A and B
+    // at their dual endpoint source addresses (= their listening addresses).
+    let i_ep1 = ep_i.clone();
+    let i_db = intro.db_path.clone();
+    let i_id = intro.identity.clone();
+    let _i_accept = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all().build().unwrap();
+        rt.block_on(async move {
+            let _ = accept_loop(&i_db, &i_id, i_ep1).await;
+        });
+    });
+
+    let a_ep1 = ep_a.clone();
+    let a_db1 = peer_a.db_path.clone();
+    let a_id1 = peer_a.identity.clone();
+    let _a_connect = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all().build().unwrap();
+        rt.block_on(async move {
+            let _ = connect_loop(&a_db1, &a_id1, a_ep1, addr_i).await;
+        });
+    });
+
+    let b_ep1 = ep_b.clone();
+    let b_db1 = peer_b.db_path.clone();
+    let b_id1 = peer_b.identity.clone();
+    let _b_connect = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all().build().unwrap();
+        rt.block_on(async move {
+            let _ = connect_loop(&b_db1, &b_id1, b_ep1, addr_i).await;
+        });
+    });
+
+    // Wait for full convergence: all 3 peers should have all shared events (20).
     assert_eventually(
         || peer_a.store_count() >= 20 && peer_b.store_count() >= 20 && intro.store_count() >= 20,
-        Duration::from_secs(15),
+        Duration::from_secs(20),
         &format!("full convergence (I={}, A={}, B={})",
             intro.store_count(), peer_a.store_count(), peer_b.store_count()),
     ).await;
 
-    // --- Verify I has endpoint observations for A and B ---
+    // Verify I has organic endpoint observations for A and B that match
+    // their actual dual endpoint addresses (no manual observation writes).
     {
         let db = open_connection(&intro.db_path).expect("open intro db");
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH).unwrap()
             .as_millis() as i64;
-        let ep_a = freshest_endpoint(&db, &intro.identity, &peer_a.identity, now_ms)
+        let ep_a_obs = freshest_endpoint(&db, &intro.identity, &peer_a.identity, now_ms)
             .expect("query ep_a");
-        let ep_b = freshest_endpoint(&db, &intro.identity, &peer_b.identity, now_ms)
+        let ep_b_obs = freshest_endpoint(&db, &intro.identity, &peer_b.identity, now_ms)
             .expect("query ep_b");
-        assert!(ep_a.is_some(), "I should have endpoint observation for A");
-        assert!(ep_b.is_some(), "I should have endpoint observation for B");
-        let (ip_a, port_a, _) = ep_a.unwrap();
-        let (ip_b, port_b, _) = ep_b.unwrap();
-        eprintln!("I observed A at {}:{}, B at {}:{}", ip_a, port_a, ip_b, port_b);
+        assert!(ep_a_obs.is_some(), "I should have organic endpoint observation for A");
+        assert!(ep_b_obs.is_some(), "I should have organic endpoint observation for B");
+        let (ip_a, port_a, _) = ep_a_obs.unwrap();
+        let (ip_b, port_b, _) = ep_b_obs.unwrap();
+        eprintln!("I organically observed A at {}:{}, B at {}:{}", ip_a, port_a, ip_b, port_b);
+        assert_eq!(port_a, addr_a.port(),
+            "organic observation for A should match A's dual endpoint port");
+        assert_eq!(port_b, addr_b.port(),
+            "organic observation for B should match B's dual endpoint port");
     }
 
     // Wait for TransportKey projection to complete at A and B.
-    // The batch_writer drains the project_queue after each event batch commit,
-    // but items with blocked deps may need a retry pass. We poll + force-drain
-    // to pick up any stragglers the batch_writer left behind.
     {
         let a_path = peer_a.db_path.clone();
         let a_ident = peer_a.identity.clone();
@@ -224,102 +194,45 @@ async fn test_three_peer_intro_happy_path() {
         ).await;
     }
 
-    // Drop the I<->A and I<->B sync sessions
-    drop(sync_ia);
-    drop(sync_ib);
-
-    // Give threads time to clean up
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    // --- Phase 2: I sends IntroOffer to A and B ---
-    // After Phase 1, remote identity chains validated through the shared workspace,
-    // so TransportKey events projected at each peer. A and B now use
-    // identity-derived trust (transport_keys table) instead of manual fingerprints.
-
-    let (cert_a, key_a) = peer_a.cert_and_key();
-    let (cert_b, key_b) = peer_b.cert_and_key();
-
-    let db_a_conn = open_connection(&peer_a.db_path).expect("open A db");
-    let allowed_a_peers = allowed_peers_from_db(&db_a_conn, &peer_a.identity)
-        .expect("allowed peers for A");
-    drop(db_a_conn);
-    let db_b_conn = open_connection(&peer_b.db_path).expect("open B db");
-    let allowed_b_peers = allowed_peers_from_db(&db_b_conn, &peer_b.identity)
-        .expect("allowed peers for B");
-    drop(db_b_conn);
-
-    let allowed_a = Arc::new(allowed_a_peers);
-    let allowed_b = Arc::new(allowed_b_peers);
-
-    let ep_a = create_dual_endpoint(
-        "127.0.0.1:0".parse().unwrap(), cert_a, key_a, allowed_a.clone(),
-    ).expect("ep_a");
-    let ep_b = create_dual_endpoint(
-        "127.0.0.1:0".parse().unwrap(), cert_b, key_b, allowed_b.clone(),
-    ).expect("ep_b");
-
-    let addr_a = ep_a.local_addr().expect("addr_a");
-    let addr_b = ep_b.local_addr().expect("addr_b");
-
-    eprintln!("A listening on {}, B listening on {}", addr_a, addr_b);
-
-    // Start accept loops for A and B with intro listeners (identity-derived trust via SQL)
-    let a_db = peer_a.db_path.clone();
-    let a_id = peer_a.identity.clone();
-    let a_ep = ep_a.clone();
-    let a_handle = std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async move {
-            let _ = accept_loop(&a_db, &a_id, a_ep).await;
-        });
-    });
-
-    let b_db = peer_b.db_path.clone();
-    let b_id = peer_b.identity.clone();
-    let b_ep = ep_b.clone();
-    let b_handle = std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async move {
-            let _ = accept_loop(&b_db, &b_id, b_ep).await;
-        });
-    });
-
-    // Give accept loops time to start
+    // Close I's endpoint to stop Phase 1 sync sessions.
+    // A and B's connect_loop threads will fail to reconnect (expected).
+    ep_i.close(0u32.into(), b"phase1-done");
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // Now I acts as introducer: manually record fresh observations for A and B
-    // using the actual addresses A and B are listening on.
-    {
-        let db = open_connection(&intro.db_path).expect("open intro db");
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap()
-            .as_millis() as i64;
-        poc_7::db::health::record_endpoint_observation(
-            &db, &intro.identity, &peer_a.identity,
-            &addr_a.ip().to_string(), addr_a.port(), now_ms, 60_000,
-        ).expect("record ep_a");
-        poc_7::db::health::record_endpoint_observation(
-            &db, &intro.identity, &peer_b.identity,
-            &addr_b.ip().to_string(), addr_b.port(), now_ms, 60_000,
-        ).expect("record ep_b");
-    }
+    // --- Phase 2: I sends IntroOffer to A and B ---
+    // A and B's dual endpoints are still alive at the same addresses.
+    // Start accept_loops so they can receive intros and punched connections.
+    // Dynamic trust now includes identity-derived entries (from TransportKey events).
+    let a_ep2 = ep_a.clone();
+    let a_db2 = peer_a.db_path.clone();
+    let a_id2 = peer_a.identity.clone();
+    let _a_accept = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all().build().unwrap();
+        rt.block_on(async move {
+            let _ = accept_loop(&a_db2, &a_id2, a_ep2).await;
+        });
+    });
 
-    // I creates an endpoint to send intros from (manual pinning — I is the introducer)
-    let (cert_i, key_i) = intro.cert_and_key();
-    let allowed_i = Arc::new(AllowedPeers::from_fingerprints(vec![fp_a, fp_b]));
-    let ep_i = create_dual_endpoint(
-        "127.0.0.1:0".parse().unwrap(), cert_i, key_i, allowed_i,
-    ).expect("ep_i");
+    let b_ep2 = ep_b.clone();
+    let b_db2 = peer_b.db_path.clone();
+    let b_id2 = peer_b.identity.clone();
+    let _b_accept = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all().build().unwrap();
+        rt.block_on(async move {
+            let _ = accept_loop(&b_db2, &b_id2, b_ep2).await;
+        });
+    });
 
-    // Send intros
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // I creates a fresh endpoint to send intros from (dynamic trust).
+    let ep_i2 = create_dynamic_endpoint_for_peer(&intro);
+
+    // Send intros — run_intro reads organic observations from I's DB.
     let result = run_intro(
-        &ep_i, &intro.db_path, &intro.identity,
+        &ep_i2, &intro.db_path, &intro.identity,
         &peer_a.identity, &peer_b.identity,
         30_000, 4_000,
     ).await.expect("run_intro");
@@ -376,9 +289,9 @@ async fn test_three_peer_intro_happy_path() {
     }
 
     // Clean up
-    ep_i.close(0u32.into(), b"done");
-    drop(a_handle);
-    drop(b_handle);
+    ep_i2.close(0u32.into(), b"done");
+    ep_a.close(0u32.into(), b"done");
+    ep_b.close(0u32.into(), b"done");
 }
 
 /// TRUST BOUNDARY TEST: Stale intro rejected.
