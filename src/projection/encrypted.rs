@@ -6,7 +6,7 @@ use aes_gcm::aead::Aead;
 use crate::crypto::event_id_to_base64;
 use crate::events::{self, EncryptedEvent, EVENT_TYPE_ENCRYPTED};
 use super::decision::ProjectionDecision;
-use super::pipeline::{apply_projection, check_dep_types, check_deps_and_block, record_rejection};
+use super::pipeline::{apply_projection, check_deps_and_block};
 
 /// Admissible inner event type codes for encrypted wrappers.
 /// Identity events, encrypted (nested), and bench_dep are not permitted.
@@ -123,17 +123,14 @@ pub fn project_encrypted(
         return Ok(block);
     }
 
-    // 8. Check inner dep types
-    let inner_meta = events::registry().lookup(inner_parsed.event_type_code())
-        .ok_or_else(|| format!("unknown inner type code {}", inner_parsed.event_type_code()))?;
-    if !inner_meta.dep_field_type_codes.is_empty() {
-        if let Some(reason) = check_dep_types(conn, &inner_deps, inner_meta.dep_field_type_codes)? {
-            record_rejection(conn, recorded_by, event_id_b64, &reason);
-            return Ok(ProjectionDecision::Reject { reason });
-        }
-    }
+    // Note: dep type checking is intentionally NOT applied to inner events.
+    // Inner deps may target encrypted wrapper events (type 5) rather than the
+    // raw inner type code expected by the registry. For example, an encrypted
+    // deletion's target_event_id points to an encrypted message wrapper (type 5),
+    // not a raw message (type 1). The dep type check is designed for cleartext
+    // events where dep targets have their actual type codes in the events table.
 
-    // 9. Signer verification + projector dispatch (shared stage).
+    // 8. Signer verification + projector dispatch (shared stage).
     //    Passes decrypted plaintext as the signing bytes source.
     apply_projection(conn, recorded_by, event_id_b64, &plaintext, &inner_parsed)
 }
