@@ -19,7 +19,7 @@ use crate::events::{
     DeviceInviteFirstEvent, InviteAcceptedEvent, MessageDeletionEvent, MessageEvent, ParsedEvent,
     PeerSharedFirstEvent, ReactionEvent, UserBootEvent, UserInviteBootEvent, WorkspaceEvent,
 };
-use crate::projection::create::{create_event_sync, create_signed_event_sync, CreateEventError};
+use crate::projection::create::{create_event_sync, create_event_staged, create_signed_event_sync};
 use crate::projection::pipeline::project_one;
 use crate::transport::{
     create_dual_endpoint, create_dual_endpoint_dynamic,
@@ -74,26 +74,6 @@ impl From<hex::FromHexError> for ServiceError {
 impl From<Box<dyn std::error::Error + Send + Sync>> for ServiceError {
     fn from(e: Box<dyn std::error::Error + Send + Sync>) -> Self {
         ServiceError(e.to_string())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Isolation wrapper for create-event helpers (Feedback item 1)
-//
-// Issue 3 may change the `event_id_or_blocked` API in projection::create.
-// This local wrapper insulates the service layer from that churn — if the
-// upstream signature changes we only need to update one site here.
-// ---------------------------------------------------------------------------
-
-/// Accept an event-creation result, treating `Blocked` as success (returns
-/// the event_id) and propagating real errors.  Mirrors the semantics of
-/// `projection::create::event_id_or_blocked` but is owned by the service
-/// layer so upstream API changes don't ripple across every call site.
-fn unwrap_event_id(result: Result<EventId, CreateEventError>) -> ServiceResult<EventId> {
-    match result {
-        Ok(eid) => Ok(eid),
-        Err(CreateEventError::Blocked { event_id, .. }) => Ok(event_id),
-        Err(e) => Err(ServiceError(format!("{}", e))),
     }
 }
 
@@ -390,7 +370,8 @@ pub fn ensure_identity_chain(
         created_at_ms: current_timestamp_ms(),
         public_key: workspace_key.verifying_key().to_bytes(),
     });
-    let ws_eid = unwrap_event_id(create_event_sync(db, recorded_by, &ws))?;
+    let ws_eid = create_event_staged(db, recorded_by, &ws)
+        .map_err(|e| ServiceError(format!("{}", e)))?;
 
     let ia = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
         created_at_ms: current_timestamp_ms(),
@@ -645,7 +626,8 @@ pub fn svc_send(
         signer_type: 5,
         signature: [0u8; 64],
     });
-    let eid = unwrap_event_id(create_signed_event_sync(&db, &recorded_by, &msg, &signing_key))?;
+    let eid = create_signed_event_sync(&db, &recorded_by, &msg, &signing_key)
+        .map_err(|e| ServiceError(format!("{}", e)))?;
 
     Ok(SendResponse {
         content: content.to_string(),
@@ -811,7 +793,8 @@ pub fn svc_react(
         signer_type: 5,
         signature: [0u8; 64],
     });
-    let eid = unwrap_event_id(create_signed_event_sync(&db, &recorded_by, &rxn, &signing_key))?;
+    let eid = create_signed_event_sync(&db, &recorded_by, &rxn, &signing_key)
+        .map_err(|e| ServiceError(format!("{}", e)))?;
 
     Ok(ReactResponse {
         emoji: emoji.to_string(),
@@ -839,7 +822,8 @@ pub fn svc_delete_message(
         signer_type: 5,
         signature: [0u8; 64],
     });
-    unwrap_event_id(create_signed_event_sync(&db, &recorded_by, &del, &signing_key))?;
+    create_signed_event_sync(&db, &recorded_by, &del, &signing_key)
+        .map_err(|e| ServiceError(format!("{}", e)))?;
 
     Ok(DeleteResponse {
         target: target_hex.to_string(),
@@ -1410,4 +1394,85 @@ pub fn socket_path_for_db(db_path: &str) -> std::path::PathBuf {
         std::env::current_dir().unwrap_or_default().join(p)
     };
     abs.with_extension("p7d.sock")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_db_path() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let path_str = path.to_str().unwrap().to_string();
+        // Bootstrap transport identity + schema
+        ensure_transport_peer_id_from_db(&path_str).unwrap();
+        (dir, path_str)
+    }
+
+    fn setup_with_workspace(db_path: &str) -> String {
+        let recorded_by = load_transport_peer_id_from_db(db_path).unwrap();
+        let db = open_connection(db_path).unwrap();
+        create_tables(&db).unwrap();
+        let (_eid, _key) = ensure_identity_chain(&db, &recorded_by).unwrap();
+
+        // Get the workspace hex for this identity chain
+        let ws_b64: String = db
+            .query_row(
+                "SELECT workspace_id FROM workspaces WHERE recorded_by = ?1 LIMIT 1",
+                rusqlite::params![&recorded_by],
+                |row| row.get(0),
+            )
+            .unwrap();
+        use base64::Engine;
+        let ws_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&ws_b64)
+            .unwrap();
+        hex::encode(ws_bytes)
+    }
+
+    #[test]
+    fn test_svc_send_succeeds_on_valid() {
+        let (_dir, db_path) = temp_db_path();
+        let workspace_hex = setup_with_workspace(&db_path);
+
+        let resp = svc_send(&db_path, &workspace_hex, "hello").unwrap();
+        assert_eq!(resp.content, "hello");
+        assert!(!resp.event_id.is_empty());
+    }
+
+    #[test]
+    fn test_svc_react_errors_on_blocked() {
+        let (_dir, db_path) = temp_db_path();
+        let _workspace_hex = setup_with_workspace(&db_path);
+
+        // React to a non-existent target — reaction will block on missing dep
+        let fake_target = hex::encode([0xDD_u8; 32]);
+        let result = svc_react(&db_path, &fake_target, "thumbsup");
+        assert!(result.is_err(), "reaction to missing target should error, got: {:?}", result);
+    }
+
+    #[test]
+    fn test_svc_delete_errors_on_blocked() {
+        let (_dir, db_path) = temp_db_path();
+        let _workspace_hex = setup_with_workspace(&db_path);
+
+        // Delete a non-existent message — will block on missing dep
+        let fake_target = hex::encode([0xEE_u8; 32]);
+        let result = svc_delete_message(&db_path, &fake_target);
+        assert!(result.is_err(), "delete of missing target should error, got: {:?}", result);
+    }
+
+    #[test]
+    fn test_ensure_identity_chain_tolerates_workspace_blocked() {
+        // Workspace is created before trust anchor exists, so it blocks.
+        // ensure_identity_chain must handle this via staged API.
+        let (_dir, db_path) = temp_db_path();
+        let recorded_by = load_transport_peer_id_from_db(&db_path).unwrap();
+        let db = open_connection(&db_path).unwrap();
+        create_tables(&db).unwrap();
+
+        // This should succeed — workspace blocking is handled internally
+        let (eid, _key) = ensure_identity_chain(&db, &recorded_by).unwrap();
+        assert_ne!(eid, [0u8; 32]);
+    }
 }
