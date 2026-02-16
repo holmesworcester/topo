@@ -525,9 +525,9 @@ Deterministic emitted-event exception (still under this rule):
 - deterministic emitted-event patterns (for example key material derivations) using the unsigned deterministic exception above.
 - identity-specific exceptions (`invite_accepted`, removal enforcement) are deferred to Phase 12.
 
-## 6.2 Dependency handling (blocked-only first)
+## 6.2 Dependency handling (blocked-edge + header first)
 
-Start with only blocked-edge persistence.
+Start with blocker-edge persistence plus a small blocked-header table.
 
 ```sql
 CREATE TABLE blocked_event_deps (
@@ -536,16 +536,25 @@ CREATE TABLE blocked_event_deps (
     blocker_event_id TEXT NOT NULL,
     PRIMARY KEY (peer_id, event_id, blocker_event_id)
 );
-CREATE INDEX idx_blocked_by_dep ON blocked_event_deps(peer_id, blocker_event_id);
+CREATE INDEX idx_blocked_by_dep_covering
+    ON blocked_event_deps(peer_id, blocker_event_id, event_id);
+
+CREATE TABLE blocked_events (
+    peer_id TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    deps_remaining INTEGER NOT NULL,
+    PRIMARY KEY (peer_id, event_id)
+);
 ```
 
 Rules:
 - Extract refs from schema-marked fields on each projection attempt.
 - If required refs are present: continue projection.
-- If any required refs are missing: write rows in `blocked_event_deps` and return `Block`.
+- If any required refs are missing: dedupe blockers, write rows in `blocked_event_deps`, write `blocked_events.deps_remaining` from unique blocker count, and return `Block`.
 - Signer refs (`signed_by` + `signer_type`) are dependency metadata and use the same blocking/unblocking path.
 - Signature verification is attempted only after signer deps and other required deps are available (signed event types only).
-- Do not add a second blocked-state counter table; blockedness is derived from `blocked_event_deps` rows.
+- `blocked_event_deps` remains the canonical blockedness check for queue admission guards.
+- `blocked_events.deps_remaining` is the performance counter used by the cascade scheduler.
 - Do not persist full `event_dependencies` yet.
 - Use one dependency resolver for all event families (content, identity, encrypted wrappers, invites).
 - Dependency extraction is driven by event schema metadata only (`is_event_ref`, `required`, conditional requirement flags).
@@ -555,26 +564,27 @@ When full dependency table is justified later:
 - heavy dependency introspection,
 - or proven perf bottleneck from repeated lookups.
 
-## 6.3 SQL-first cascade unblock (Kahn-compatible with multiple blockers)
+## 6.3 Counter-based cascade unblock (Kahn-compatible with multiple blockers)
 
 - An event can have N blocker rows.
-- It is runnable when no blocker rows remain.
+- It is runnable when `blocked_events.deps_remaining` reaches zero.
 
-Use SQL-first unblock when blocker `X` becomes valid:
-
-```sql
-DELETE FROM blocked_event_deps
-WHERE peer_id = ? AND blocker_event_id = ?;
-```
+Use counter-based unblock when blocker `X` becomes valid:
 
 Implementation shape:
-- Use `DELETE ... RETURNING event_id` to collect candidates in one pass.
-- For each returned candidate, check if blocker rows still exist (`EXISTS` on `blocked_event_deps`).
-- Enqueue newly unblocked candidates into a DB temp worklist (`cascade_worklist`), then project by popping rows from that worklist.
-- When a projected event becomes `Valid`, run the same unblock step for that event id.
-- If projection returns `Block { missing }` (for example encrypted inner deps), reinsert missing rows into `blocked_event_deps` for the same outer `event_id`.
+- Read candidates from `blocked_event_deps` by (`peer_id`, `blocker_event_id`) using the covering index.
+- For each candidate, decrement `blocked_events.deps_remaining`.
+- If remaining deps are > 0, keep it blocked.
+- If remaining deps reach 0, delete the `blocked_events` row and project the event through the canonical entrypoint.
+- When a projected event becomes `Valid`, use it as the next blocker in the same cascade worklist.
+- If projection returns `Block { missing }` (for example encrypted inner deps), write deduped blocker rows plus a new `blocked_events` header row.
+- Keep `blocked_event_deps` read-only inside the per-step cascade loop.
+- After cascade transitions occur, bulk-clean `blocked_event_deps` rows for events now terminal (`valid` or `rejected`).
+- Run guard retries after dep cleanup so guard queries see current dep state.
 
-Do not use a durable `blocked_event_deps_candidates` scratch table for this path.
+Design tradeoff:
+- SQL-only unblock (`DELETE ... RETURNING` + blocker-row existence checks) is simpler.
+- Current code keeps the counter path because branch-local topo-cascade measurements showed roughly 2x higher throughput.
 Do not route in-call cascade fanout through `project_queue`.
 
 ## 6.4 Event creation API (simple and testable)
@@ -602,7 +612,7 @@ Implementation note:
 ## 6.5 Optional TLA checkpoint for blocking/unblocking (only if needed)
 
 Usually not required at this stage, but useful if blocker behavior gets ambiguous:
-- model only `valid`, `blocked_event_deps`, and unblock transitions,
+- model `valid`, `blocked_event_deps`, `blocked_events.deps_remaining`, and unblock transitions,
 - verify multi-blocker convergence and no-lost-unblock behavior,
 - then map those guards directly into projector dependency checks.
 
@@ -610,7 +620,7 @@ Usually not required at this stage, but useful if blocker behavior gets ambiguou
 
 Implement one signer pipeline for all signed event types:
 1. signer metadata is schema-declared (`signed_by`, `signer_type`, `signature`).
-2. missing signer dependency uses normal blocking/unblocking (`blocked_event_deps`).
+2. missing signer dependency uses normal blocking/unblocking (`blocked_event_deps` + `blocked_events`).
 3. resolve signer key by (`signer_type`, `signed_by`) only after dependency resolution.
 4. invalid signature is `Reject`, never `Block`.
 5. signer verification helper path is shared across signed event families (no identity-specific signer path later).
@@ -672,14 +682,14 @@ Rule:
 
 1. Parse outer encrypted event from canonical `events.blob`.
 2. Extract outer deps from its flat event-ref fields (`key_event_id`, plus any other refs).
-3. If outer deps missing: write `blocked_event_deps` and return `Block`.
+3. If outer deps missing: write `blocked_event_deps` + `blocked_events` and return `Block`.
 4. Verify signature/auth over canonical encrypted bytes.
 5. Decrypt ciphertext using key from `key_event_id`.
 6. Decode inner event with normal registry.
 7. Verify decoded inner type matches outer `inner_type_code`; mismatch -> `Reject(inner_type_mismatch)`.
 8. If inner type is encrypted wrapper: reject.
 9. Extract inner deps from inner schema metadata.
-10. If inner deps missing: write `blocked_event_deps` using outer `event_id` and return `Block`.
+10. If inner deps missing: write `blocked_event_deps` + `blocked_events` using outer `event_id` and return `Block`.
 11. Call the normal projector for the inner type.
 12. Mark outer event `valid` only after inner projection succeeds.
 
@@ -759,7 +769,7 @@ CREATE UNIQUE INDEX idx_egress_dedupe
 
 Keep canonical and queue data separate:
 - permanent: `events`, `recorded_events`, projection outputs
-- operational/transient: `project_queue`, `blocked_event_deps`, `egress_queue`
+- operational/transient: `project_queue`, `blocked_event_deps`, `blocked_events`, `egress_queue`
 - reserved/optional staging: `ingress_queue` (schema-present, currently not on runtime ingest hot path)
 
 ## 8.2 Why not one generic jobs table
@@ -1330,8 +1340,8 @@ Definition of done:
 
 Must implement:
 1. `project_one(recorded_by,event_id)` entrypoint.
-2. blocked-only dependency persistence (`blocked_event_deps`).
-3. SQL-first cascade unblock via `DELETE ... RETURNING` plus DB-backed temp worklist.
+2. dependency persistence tables (`blocked_event_deps` + `blocked_events` header).
+3. counter-based Kahn cascade unblock (`deps_remaining` decrement path + post-cascade dep-row cleanup).
 4. `create_event_sync` success-only-on-valid contract.
 5. explicit DRY split enforcement:
    - shared pipeline handles deps/signer/queues/terminal writes,

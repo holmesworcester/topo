@@ -419,26 +419,41 @@ Convergence requirement:
 
 # 5. Dependency Blocking and Unblocking
 
-## 5.1 Blocked edge persistence
+## 5.1 Blocked dependency persistence
 
-Blocked edges are recorded in:
+Blocked state uses two projection tables:
 
-`blocked_event_deps(peer_id, event_id, blocker_event_id)`
+1. `blocked_event_deps(peer_id, event_id, blocker_event_id)`:
+   - unique blocker edges per blocked event.
+2. `blocked_events(peer_id, event_id, deps_remaining)`:
+   - small header row with unresolved unique blocker count.
 
-We do not require a full persisted dependency graph for baseline projection.
+Rules:
+1. missing deps are deduped before write,
+2. blocker edges are persisted in `blocked_event_deps`,
+3. `deps_remaining` is written from that deduped blocker set,
+4. `blocked_event_deps` stays the canonical "currently blocked?" source for queue admission checks; `blocked_events` is a performance header for cascade scheduling.
+
+We still do not require a full persisted dependency graph for baseline projection.
 Dependencies are extracted per attempt from schema metadata.
 
-## 5.2 SQL-first cascade unblock
+## 5.2 Counter-based Kahn cascade unblock
 
-Unblocking uses a SQL-first cascade path:
+Unblocking uses a counter-driven Kahn-style cascade:
 
-1. clear blocker rows with `DELETE ... RETURNING event_id`,
-2. for returned candidates, keep only those with zero remaining blocker rows,
-3. enqueue runnable candidates into a DB temp worklist (`cascade_worklist`),
-4. project by popping from that worklist; newly valid events repeat step 1.
+1. when blocker `X` becomes valid, read candidates from `blocked_event_deps` by (`peer_id`, `blocker_event_id`),
+2. decrement `blocked_events.deps_remaining` for each candidate,
+3. when a candidate reaches zero remaining deps, delete its `blocked_events` header row and project it through the same canonical projection entrypoint,
+4. if that candidate becomes valid, treat it as the next blocker and continue the cascade.
 
-This remains Kahn-compatible with multiple blockers while avoiding a separate
-durable candidate table or ad-hoc in-memory recursion.
+Implementation detail:
+1. `blocked_event_deps` is read-only during per-step cascade work,
+2. stale rows are bulk-cleaned only after cascade transitions occur (valid/rejected terminal rows),
+3. guard retries run after this dep cleanup so guard queries see current state.
+
+Design note:
+1. a SQL-only cascade (`DELETE ... RETURNING` + zero-row checks) is simpler,
+2. current branch measurements showed the counter path roughly 2x faster in the topo-cascade workload, so counter-based cascade is the default.
 
 ## 5.3 Event creation API
 
@@ -456,7 +471,7 @@ This preserves imperative orchestration ergonomics:
 
 ## 5.4 Signer pipeline
 
-Signer refs (`signed_by` + `signer_type`) are dependency metadata using the same `blocked_event_deps` mechanism as other event references. Missing signer dependency writes rows in `blocked_event_deps` and returns `Block`, identical to any other missing dep.
+Signer refs (`signed_by` + `signer_type`) are dependency metadata using the same blocking mechanism as other event references. Missing signer dependency writes blocker rows in `blocked_event_deps`, updates `blocked_events.deps_remaining`, and returns `Block`, identical to any other missing dep.
 
 Ordering:
 1. signer key is resolved only after all required deps (including the signer dep itself) are available,
@@ -492,7 +507,7 @@ Projection flow:
 
 1. parse outer encrypted wrapper,
 2. resolve outer deps (including key dependency),
-3. if missing deps: block on normal `blocked_event_deps`,
+3. if missing deps: block through normal dependency path (`blocked_event_deps` + `blocked_events`),
 4. verify envelope signature/auth,
 5. decrypt,
 6. decode inner event using normal registry,
