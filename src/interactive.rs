@@ -10,12 +10,11 @@ use crate::db::{
     schema::create_tables,
 };
 use crate::events::*;
-use crate::identity_ops::{self, IdentityChain, InviteType, LinkChain};
+use crate::identity_ops::{self, IdentityChain, InviteType};
 use crate::invite_link::{create_invite_link, parse_invite_link, InviteLinkKind};
 use crate::projection::create::create_signed_event_sync;
 use crate::transport_identity::{
     ensure_transport_peer_id_from_db, expected_invite_bootstrap_spki_from_invite_key,
-    install_invite_bootstrap_transport_identity,
 };
 
 use rustyline::completion::{Completer, Pair};
@@ -113,15 +112,6 @@ impl Account {
         for (eid, key) in keys_to_store {
             self.signing_keys.insert(event_id_to_base64(&eid), key);
         }
-    }
-
-    fn store_link_keys(&mut self, link: &LinkChain) {
-        self.peer_shared_event_id = Some(link.peer_shared_event_id);
-        self.peer_shared_key = Some(link.peer_shared_key.clone());
-        self.signing_keys.insert(
-            event_id_to_base64(&link.peer_shared_event_id),
-            link.peer_shared_key.clone(),
-        );
     }
 
     fn short_user_id(&self) -> String {
@@ -1088,6 +1078,8 @@ fn cmd_accept_link(
             return Ok(());
         }
     };
+
+    // Validate invite kind before creating account
     let invite = match parse_invite_link(&invite_link) {
         Ok(v) => v,
         Err(e) => {
@@ -1104,8 +1096,6 @@ fn cmd_accept_link(
         return Ok(());
     }
 
-    let device_invite_key = invite.invite_signing_key();
-    let device_invite_event_id = invite.invite_event_id;
     let workspace_id = invite.workspace_id;
     let inviter = session
         .accounts
@@ -1130,8 +1120,10 @@ fn cmd_accept_link(
         InviteType::User => "user".to_string(),
     };
 
-    // Start temp sync endpoint if inviter is in this session
-    let (_effective_link, _temp_endpoint) = if let Some(inviter) = inviter {
+    // If the inviter is in this session, start a temp sync endpoint so
+    // the joiner can fetch prerequisite events via real QUIC.
+    let device_invite_key = invite.invite_signing_key();
+    let (effective_link, _temp_endpoint) = if let Some(inviter) = inviter {
         let (addr, ep) = start_temp_sync_endpoint(
             &inviter.db_path,
             &inviter.identity,
@@ -1146,60 +1138,40 @@ fn cmd_accept_link(
         (invite_link.clone(), None)
     };
 
-    // Re-parse the effective link to get the updated bootstrap addr
-    let effective_invite = parse_invite_link(&_effective_link)?;
+    // Create account with a fresh DB (no transport identity — svc_accept_device_link installs one)
+    let mut account = Account::new_without_transport(&username, devicename);
 
-    let mut account = Account::new(&username, devicename);
-    account.identity =
-        install_invite_bootstrap_transport_identity(&account.db_path, &device_invite_key)?;
-    account.workspace_id = Some(workspace_id);
-    account.workspace_name = workspace_name;
-
-    // Bootstrap sync: fetch prerequisite events from inviter via real QUIC
-    let bootstrap_addr: std::net::SocketAddr = effective_invite
-        .bootstrap_addr
-        .parse()
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("Invalid bootstrap address: {}", e).into()
-        })?;
-    tokio::task::block_in_place(|| {
-        session.rt.block_on(
-            crate::sync::bootstrap::bootstrap_sync_from_invite(
-                &account.db_path,
-                &account.identity,
-                bootstrap_addr,
-                &effective_invite.bootstrap_spki_fingerprint,
-                15,
-            ),
-        )
+    // Delegate to service layer: bootstrap sync + identity chain creation
+    let result = tokio::task::block_in_place(|| {
+        session.rt.block_on(crate::service::svc_accept_device_link(
+            &account.db_path,
+            &effective_link,
+            devicename,
+        ))
+    })
+    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+        format!("{}", e).into()
     })?;
 
-    // Shut down temp sync endpoint
+    // Shut down temp sync endpoint if we started one
     if let Some(ep) = _temp_endpoint {
         ep.close(0u32.into(), b"bootstrap done");
     }
 
+    // Update account state from service result
+    account.identity = result.peer_id;
+    account.workspace_id = Some(workspace_id);
+    account.workspace_name = workspace_name;
+
+    // Load keys from DB for interactive signing (service layer persisted them)
     let conn = open_connection(&account.db_path)?;
-
-    let link = identity_ops::accept_device_link(
-        &conn,
-        &account.identity,
-        &device_invite_key,
-        &device_invite_event_id,
-        workspace_id,
-    )?;
-
-    crate::db::transport_trust::record_invite_bootstrap_trust(
-        &conn,
-        &account.identity,
-        &event_id_to_base64(&link.invite_accepted_event_id),
-        &event_id_to_base64(&device_invite_event_id),
-        &event_id_to_base64(&workspace_id),
-        &invite.bootstrap_addr,
-        &invite.bootstrap_spki_fingerprint,
-    )?;
-
-    account.store_link_keys(&link);
+    if let Ok(Some((psf_eid, psf_key))) = crate::service::load_local_peer_signer_pub(&conn, &account.identity) {
+        account.peer_shared_event_id = Some(psf_eid);
+        account.peer_shared_key = Some(psf_key.clone());
+        account
+            .signing_keys
+            .insert(event_id_to_base64(&psf_eid), psf_key);
+    }
 
     let peer_id = account.short_peer_id();
     session.accounts.push(account);
@@ -1757,4 +1729,3 @@ fn get_message_event_id_by_num(
     crate::crypto::event_id_from_base64(&ids[msg_num - 1])
         .ok_or_else(|| format!("Invalid event ID for message {}", msg_num).into())
 }
-

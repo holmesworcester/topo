@@ -190,6 +190,12 @@ pub struct AcceptInviteResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct AcceptDeviceLinkResponse {
+    pub peer_id: String,
+    pub peer_shared_event_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct IntroAttemptItem {
     pub intro_id: String,
     pub other_peer_id: String,
@@ -1344,6 +1350,89 @@ pub async fn svc_accept_invite(
     Ok(AcceptInviteResponse {
         peer_id: recorded_by,
         user_event_id: event_id_to_base64(&join.user_event_id),
+        peer_shared_event_id: psf_b64,
+    })
+}
+
+/// Accept a device link invite via bootstrap sync + identity chain creation.
+///
+/// Mirrors `svc_accept_invite` but for device-link invites:
+/// 1. Parses the invite link (expects `quiet://link/...`)
+/// 2. Installs bootstrap transport identity derived from invite key
+/// 3. Connects to bootstrap address and syncs prerequisite events
+/// 4. Creates identity chain (InviteAccepted → PeerSharedFirst → TransportKey)
+/// 5. Records bootstrap trust and persists signer keys
+pub async fn svc_accept_device_link(
+    db_path: &str,
+    invite_link_str: &str,
+    _devicename: &str,
+) -> ServiceResult<AcceptDeviceLinkResponse> {
+    let invite = crate::invite_link::parse_invite_link(invite_link_str)
+        .map_err(|e| ServiceError(format!("Invalid invite link: {}", e)))?;
+
+    if invite.kind != crate::invite_link::InviteLinkKind::DeviceLink {
+        return Err(ServiceError("Expected a device link (quiet://link/...)".into()));
+    }
+
+    let invite_key = invite.invite_signing_key();
+    let invite_event_id = invite.invite_event_id;
+    let workspace_id = invite.workspace_id;
+
+    // Initialize DB and install bootstrap transport identity
+    {
+        let db = open_connection(db_path)?;
+        create_tables(&db)?;
+    }
+    let recorded_by = crate::transport_identity::install_invite_bootstrap_transport_identity(
+        db_path,
+        &invite_key,
+    )
+    .map_err(|e| ServiceError(format!("Failed to install bootstrap identity: {}", e)))?;
+
+    // Bootstrap sync: fetch prerequisite events from inviter
+    let bootstrap_addr: std::net::SocketAddr = invite
+        .bootstrap_addr
+        .parse()
+        .map_err(|e| ServiceError(format!("Invalid bootstrap address '{}': {}", invite.bootstrap_addr, e)))?;
+
+    crate::sync::bootstrap::bootstrap_sync_from_invite(
+        db_path,
+        &recorded_by,
+        bootstrap_addr,
+        &invite.bootstrap_spki_fingerprint,
+        15,
+    )
+    .await
+    .map_err(|e| ServiceError(format!("Bootstrap sync failed: {}", e)))?;
+
+    // Accept the device link: creates identity chain
+    let db = open_connection(db_path)?;
+    let link = crate::identity_ops::accept_device_link(
+        &db,
+        &recorded_by,
+        &invite_key,
+        &invite_event_id,
+        workspace_id,
+    )
+    .map_err(|e| ServiceError(format!("Failed to accept device link: {}", e)))?;
+
+    // Record bootstrap trust
+    crate::db::transport_trust::record_invite_bootstrap_trust(
+        &db,
+        &recorded_by,
+        &event_id_to_base64(&link.invite_accepted_event_id),
+        &event_id_to_base64(&invite_event_id),
+        &event_id_to_base64(&workspace_id),
+        &invite.bootstrap_addr,
+        &invite.bootstrap_spki_fingerprint,
+    )?;
+
+    // Persist signer key
+    let psf_b64 = event_id_to_base64(&link.peer_shared_event_id);
+    persist_local_peer_signer(&db, &recorded_by, &psf_b64, &link.peer_shared_key)?;
+
+    Ok(AcceptDeviceLinkResponse {
+        peer_id: recorded_by,
         peer_shared_event_id: psf_b64,
     })
 }
