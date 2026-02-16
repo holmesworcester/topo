@@ -1,8 +1,8 @@
-# TODO: Test Realism Gaps (poc-7/master)
+# TODO: Design/Plan/Code Alignment Backlog (poc-7/master)
 
 Date: 2026-02-15
 
-Goal: make invite/join/sync tests exercise the same trust and transport paths as production `sync`, with minimal test-only shortcuts.
+Goal: track and close high-impact discrepancies between `docs/DESIGN.md`, `docs/PLAN.md`, TLA mappings, tests, and runtime code, while keeping behavior realistic and simplifying where possible.
 
 ## Cross-cutting rule: TLA/model alignment
 
@@ -372,3 +372,219 @@ Acceptance:
 1. Docs match implemented semantics exactly (or implementation is upgraded to match docs).
 2. A test exists for the chosen policy (overlap-allowed behavior or strict-disjoint rejection behavior).
 3. TLA invariants and mapping docs encode the chosen policy unambiguously.
+
+## P0: Enforce removal policy at transport runtime (deny + disconnect active sessions)
+
+Evidence:
+
+1. Design/plan require removal to affect trust runtime semantics:
+   - `docs/DESIGN.md:770` ("peer_removed cascades trust removal"),
+   - `docs/PLAN.md:1131` (transport lifecycle includes trust removal).
+2. Runtime transport allow checks currently read trust tables only:
+   - `src/db/transport_trust.rs:221` (`allowed_peers_from_db`),
+   - `src/db/transport_trust.rs:256` (`is_peer_allowed`).
+3. Identity projector currently records removals but does not perform trust/source/session teardown:
+   - `src/projection/identity.rs:221` (`user_removed` -> `removed_entities`),
+   - `src/projection/identity.rs:236` (`peer_removed` -> `removed_entities`).
+
+Problem: after a removal event projects, removed peers/users may remain transport-authorized by existing trust rows and active sessions can continue, violating expected removal enforcement semantics.
+
+Fix:
+
+1. Define and implement removal closure per tenant:
+   - direct peer target for `peer_removed`,
+   - user target expansion for `user_removed` (all currently authorized peer identities linked to removed user identity).
+2. Apply closure to transport trust runtime:
+   - supersede/remove matching entries from `transport_keys`, `invite_bootstrap_trust`, and `pending_invite_bootstrap_trust` (or enforce an equivalent deny overlay in lookup path).
+3. Enforce immediate runtime behavior:
+   - deny new handshakes for removed peers from first post-removal check,
+   - disconnect existing active sessions for removed peers,
+   - cancel/deny related intro/hole-punch attempts.
+4. Add integration tests:
+   - "allowed before removal, denied after removal",
+   - "active sync session is terminated after removal is observed",
+   - same checks for `user_removed` transitive peer closure.
+5. TLA/model alignment:
+   - extend/update transport lifecycle model and mapping rows so removal semantics include both trust-source exclusion and runtime deny behavior.
+
+Acceptance:
+
+1. Removed peers cannot authenticate after removal projection for that tenant.
+2. Existing sessions with removed peers are torn down promptly.
+3. Removal semantics are covered for both `peer_removed` and `user_removed`.
+4. TLA/model docs match runtime behavior.
+
+## P0: Bring scenario invariant harness fully in line with PLAN (fingerprints + full invariant set)
+
+Evidence:
+
+1. PLAN requires deterministic table-state fingerprints and full replay/reproject/reorder checks:
+   - `docs/PLAN.md:439`,
+   - `docs/PLAN.md:451`,
+   - `docs/PLAN.md:1188`,
+   - `docs/PLAN.md:1200`.
+2. Current helper checks only selected table counts:
+   - `src/testutil.rs:1047` (`verify_projection_invariants`),
+   - count-based comparisons at `src/testutil.rs:1051`-`src/testutil.rs:1114`.
+
+Problem: count-only checks can miss state regressions where row contents differ but aggregate counts stay equal; harness also does not yet encode the full PLAN 12.4 invariant set in one standard path.
+
+Fix:
+
+1. Add deterministic tenant-scoped table-state fingerprinting helper(s) for canonical projected state (excluding operational queues).
+2. Upgrade scenario invariants to compare fingerprints for:
+   - replay once,
+   - replay twice (idempotency),
+   - reverse-order replay,
+   - reproject from canonical store,
+   - reorder/out-of-order ingest convergence.
+3. Fold into the default scenario harness path (paired with explicit opt-out mechanism from the existing replay-default TODO).
+4. Add failing-then-passing regression tests proving fingerprint checks catch state-content divergence missed by count-only checks.
+
+Acceptance:
+
+1. Scenario invariants use deterministic state fingerprints, not count-only comparisons.
+2. Standard harness covers PLAN 12.4 checks in default flow.
+3. Per-test opt-out remains explicit and justified.
+
+## P1: Investigate and decide `create_event_sync` service semantics before implementation changes
+
+Evidence:
+
+1. PLAN contract says synchronous create success implies `valid` terminal state:
+   - `docs/PLAN.md:600`-`docs/PLAN.md:603`.
+2. Service currently treats `Blocked` as success via wrapper:
+   - `src/service.rs:88`-`src/service.rs:96`,
+   - used in user-facing commands (`src/service.rs:607`, `src/service.rs:773`, `src/service.rs:801`).
+
+Problem: docs/plan contract and service API behavior are currently misaligned; changing behavior affects CLI/service UX and orchestration assumptions.
+
+Required process for this TODO (approval gate):
+
+1. Initial investigation only (no behavior changes):
+   - enumerate all call sites and current caller expectations,
+   - catalog where `Blocked`-as-success is relied on today.
+2. Planning and explanation:
+   - write options with tradeoffs (for example strict valid-only vs explicit terminal-status response),
+   - include migration/test impact and compatibility risks.
+3. Decision checkpoint:
+   - present recommendation and wait for explicit approval before any implementation patch.
+4. Implementation starts only after approval is recorded on this TODO item.
+
+Acceptance:
+
+1. Investigation note + option analysis is committed/recorded first.
+2. No runtime behavior change lands before explicit approval.
+3. Post-approval implementation and tests follow the selected option.
+
+## P1: Reconcile TLA/spec mapping docs with PLAN and implemented projector semantics
+
+Evidence:
+
+1. PLAN requires projector/TLA divergence to be treated as spec bug (`docs/PLAN.md:1118`).
+2. `docs/tla/projector_spec.md` currently contains stale rows versus current schema/runtime in several places (for example signer-required/signer-type rows and invite-related invariants).
+
+Problem: stale mapping docs weaken reviewability and can hide real model/runtime divergence.
+
+Fix:
+
+1. Perform a row-by-row audit:
+   - event registry metadata vs projector-spec table,
+   - guard/invariant mapping vs implemented guards/projectors.
+2. Update `docs/tla/projector_spec.md` to match current code and PLAN semantics:
+   - signer requirements/types,
+   - invite-accepted trust-anchor semantics,
+   - transport trust/removal mapping rows.
+3. Reconcile/trim stale invariants that no longer reflect normative behavior; add missing ones that now are normative.
+4. Re-run relevant TLC/model checks and record results/artifacts.
+5. Update `docs/DESIGN.md` / `docs/PLAN.md` references where mapping names changed.
+
+Acceptance:
+
+1. Mapping doc has no known stale rows against current runtime semantics.
+2. TLC/model checks pass for updated invariants.
+3. DESIGN/PLAN/TLA mapping terminology is consistent.
+
+## P1: Remove duplicated command/business logic between CLI (`main.rs`) and service layer (`service.rs`)
+
+Evidence:
+
+1. Command/business flows are implemented in both places (for example identity bootstrap, send/react/delete/status/assert paths):
+   - `src/main.rs`
+   - `src/service.rs`
+2. This duplication has already produced behavior-shape divergence risks (for example create semantics wrappers and differing helper patterns).
+
+Problem: maintaining parallel command logic increases drift risk, review overhead, and bug-fix fanout. It also weakens confidence that CLI and daemon/control-plane behavior are identical.
+
+Fix:
+
+1. Define one canonical command/business layer (service/application module) as the only owner of command semantics.
+2. Make CLI entrypoints thin adapters:
+   - parse args,
+   - call canonical service functions,
+   - render output.
+3. Remove duplicated business logic from `main.rs` once parity tests pass.
+4. Add parity tests ensuring CLI command behavior matches service API behavior for key flows.
+
+Acceptance:
+
+1. No duplicated command semantics remain between `src/main.rs` and `src/service.rs`.
+2. CLI path and service/API path share one implementation per command.
+3. Regression tests cover CLI/service parity for core commands.
+
+## P1: Eliminate direct SQL access in CLI command paths where module APIs already exist
+
+Evidence:
+
+1. CLI/service command handlers still perform direct DB queries/updates for business behavior in multiple places instead of consistently routing through dedicated domain modules (identity/projection/trust/query helpers).
+2. Existing architecture intent favors command/query helpers and event/projection modules as semantic boundaries.
+
+Problem: direct SQL in command handlers bypasses domain boundaries, duplicates query semantics, and makes future schema/projection changes harder and riskier.
+
+Fix:
+
+1. Audit CLI/service command handlers for direct SQL that can be replaced by existing APIs in:
+   - `src/identity_ops.rs`,
+   - `src/projection/*`,
+   - `src/db/*` query helpers,
+   - service-layer command/query helpers.
+2. Introduce missing command/query helpers where needed, then migrate command handlers to use them.
+3. Reserve inline SQL in CLI/service only for narrow glue/telemetry cases with explicit justification.
+4. Add lint/check or code-review guardrails to prevent reintroduction of ad-hoc command-layer SQL.
+
+Acceptance:
+
+1. Command paths do not embed business-critical SQL when an owned module API exists.
+2. Query semantics used by CLI are centralized in reusable helpers/modules.
+3. Future schema updates require changes in one query owner, not N command handlers.
+
+## P1: Investigate simplification of `project_one`/`project_one_core` split to better match one-path intent
+
+Evidence:
+
+1. PLAN/doc one-path intent emphasizes a single projection entrypoint for all sources and retries:
+   - `docs/PLAN.md:95`
+   - `docs/PLAN.md:481`
+2. Current implementation keeps two projection layers:
+   - `project_one_core` (single-event projection stages),
+   - `project_one` (core + cascade),
+   and cascade internals call `project_one_core` directly.
+
+Problem: even if behavior is mostly coherent, the dual-entry structure makes the one-path story harder to reason about and can cause doc/implementation tension.
+
+Required process for this TODO (investigation-first):
+
+1. Investigate current call graph and semantics:
+   - when `project_one` is required,
+   - when `project_one_core` is used directly and why.
+2. Produce simplification options (for example one internal entrypoint with mode/context flags) and tradeoffs (correctness, performance, recursion/cascade behavior).
+3. Decide whether to:
+   - simplify code to one conceptual entrypoint, or
+   - keep split and update docs to formalize the justified internal boundary.
+4. Do not implement structural refactor until option review/approval is complete.
+
+Acceptance:
+
+1. Investigation note captures current rationale and concrete options.
+2. Chosen direction is explicit (refactor vs documented boundary).
+3. Implementation/docs are updated only after decision.
