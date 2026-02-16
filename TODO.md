@@ -37,7 +37,7 @@ For every stage of work in this TODO:
 Realism-first rule for ordering: finish test-fidelity items up front (copying events, direct DB seeding, static pinning overlays, and optional invariant checks) so downstream refactors are validated by realistic tests.
 
 1. ~~`P0: Remove copy_event_chain from interactive invite acceptance`~~ **DONE**: `copy_event_chain` deleted; interactive and CLI invite acceptance now use real QUIC bootstrap sync via `svc_accept_invite` / `bootstrap_sync_from_invite`. Two-process integration test validates end-to-end. See PLAN.md §2.2 "CLI Isomorphism Principle".
-2. `P1: Replace prerequisite event copy in Peer::new_in_workspace`
+2. ~~`P1: Replace prerequisite event copy in Peer::new_in_workspace`~~ **DONE**: `new_in_workspace` now uses real QUIC bootstrap sync via `svc_accept_invite` + temp sync endpoint. No direct `insert_event`/`insert_recorded_event` calls remain in the join path. Joiner DB starts empty (no transport identity); invite-derived identity installed by service layer. Holepunch and scenario tests pass with realistic bootstrap.
 3. `P1: Stop direct SQL trust seeding in CLI invite-bootstrap test` (partially addressed: `test_two_process_invite_and_sync` uses production invite flow; existing `test_cli_sync_bootstrap_from_accepted_invite_data` still seeds directly)
 4. `P1: Remove manual endpoint observation writes in hole-punch integration test`
 5. `P2: Align test transport setup with production dynamic trust lookup`

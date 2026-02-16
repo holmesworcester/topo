@@ -1985,9 +1985,9 @@ Three constructors matching different test needs:
 |-------------|----------|-----------|----------|
 | `Peer::new(name)` | Transport only | None | Manual identity tests |
 | `Peer::new_with_identity(name)` | Full bootstrap | Own | Independent peer tests |
-| `Peer::new_in_workspace(name, creator)` | Join flow | Creator's | Same-workspace tests |
+| `Peer::new_in_workspace(name, creator)` | Join flow (async) | Creator's | Same-workspace tests |
 
-`new_with_identity` calls `bootstrap_workspace` (production flow). `new_in_workspace` calls `create_user_invite` + `accept_user_invite` (production flow), copying prerequisite events between DBs.
+`new_with_identity` calls `bootstrap_workspace` (production flow). `new_in_workspace` (async) creates a real invite, starts a temp QUIC sync endpoint for the creator, and calls `svc_accept_invite` which performs bootstrap sync + identity chain creation — no direct DB-to-DB event copying.
 
 ### 17.6.3 Closure-based `sync_until_converged`
 

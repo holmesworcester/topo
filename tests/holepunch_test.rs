@@ -117,8 +117,8 @@ fn start_peers_with_intro(
 async fn test_three_peer_intro_happy_path() {
     // Intro creates the workspace; A and B join it so all share one trust root.
     let intro = Peer::new_with_identity("introducer");
-    let peer_a = Peer::new_in_workspace("peer_a", &intro);
-    let peer_b = Peer::new_in_workspace("peer_b", &intro);
+    let peer_a = Peer::new_in_workspace("peer_a", &intro).await;
+    let peer_b = Peer::new_in_workspace("peer_b", &intro).await;
 
     // Publish TransportKey events binding each peer's TLS cert to its identity chain
     intro.publish_transport_key();
