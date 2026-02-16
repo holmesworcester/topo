@@ -134,7 +134,7 @@ Transport peer identity is SPKI-derived:
 Runtime rule: handshake verification queries SQL trust state per connection
 creation; projected peer keys are not treated as in-memory authority.
 Conceptually:
-`TrustedPeerSet = transport_keys U invite_bootstrap_trust U pending_invite_bootstrap_trust`.
+`TrustedPeerSet = transport_keys ∪ invite_bootstrap_trust ∪ pending_invite_bootstrap_trust`.
 
 ## 2.3 Event-graph identity binding
 
@@ -297,7 +297,7 @@ The node daemon (`run_node`) operates as follows:
 
 ### Per-tenant dynamic trust
 
-Each tenant's QUIC endpoint verifies incoming connections against that tenant's own trust state. The trust closure queries `transport_keys` and `trust_anchors` for the specific `recorded_by`, so tenant A's endpoint only accepts peers trusted by tenant A. Tenants in different workspaces have disjoint trust sets.
+Each tenant's QUIC endpoint verifies incoming connections against that tenant's own trust state. The trust closure queries the three trust sources defined in section 2.2 (`transport_keys`, `invite_bootstrap_trust`, `pending_invite_bootstrap_trust`) for the specific `recorded_by`, so tenant A's endpoint only accepts peers trusted by tenant A. Tenants in different workspaces have disjoint trust sets. (`trust_anchors` is used only for tenant discovery at startup, not for per-connection verification.)
 
 ### Shared batch writer with tenant routing
 
@@ -745,13 +745,7 @@ No historical re-encryption or key history backfill is required in this baseline
 
 ## 9.5 Transport credential lifecycle model
 
-Three trust sources compose the runtime trusted peer set:
-
-1. `transport_keys`: projected from identity events (steady-state trust),
-2. `invite_bootstrap_trust`: rows written when invite links are accepted (bootstrap trust),
-3. `pending_invite_bootstrap_trust`: rows written by inviters before invitee first dial (pre-bootstrap trust).
-
-Conceptually: `TrustedPeerSet = transport_keys ∪ invite_bootstrap_trust ∪ pending_invite_bootstrap_trust`.
+This section covers the lifecycle state machine for the three trust sources defined in section 2.2 (`transport_keys`, `invite_bootstrap_trust`, `pending_invite_bootstrap_trust`).
 
 Supersession: when steady-state `transport_keys` trust appears for a peer, matching `invite_bootstrap_trust` and `pending_invite_bootstrap_trust` entries are automatically consumed. Bootstrap and steady-state trust for the same peer never coexist.
 
