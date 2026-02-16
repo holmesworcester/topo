@@ -200,6 +200,32 @@ enum Commands {
         #[arg(long)]
         peer: Option<String>,
     },
+
+    /// Create a user invite link for the active workspace
+    #[command(name = "create-invite")]
+    CreateInvite {
+        #[arg(short, long, default_value = "server.db")]
+        db: String,
+        /// Bootstrap address (host:port) to embed in invite link
+        #[arg(long)]
+        bootstrap: String,
+    },
+
+    /// Accept a user invite link (bootstrap sync + identity chain creation)
+    #[command(name = "accept-invite")]
+    AcceptInvite {
+        #[arg(short, long, default_value = "server.db")]
+        db: String,
+        /// Invite link (quiet://invite/...)
+        #[arg(long)]
+        invite: String,
+        /// Username for the new identity
+        #[arg(long, default_value = "user")]
+        username: String,
+        /// Device name for the new identity
+        #[arg(long, default_value = "device")]
+        devicename: String,
+    },
 }
 
 #[tokio::main]
@@ -208,7 +234,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Only init tracing for sync commands (avoid polluting message output)
     match &cli.command {
-        Commands::Sync { .. } | Commands::Intro { .. } => {
+        Commands::Sync { .. } | Commands::Intro { .. } | Commands::AcceptInvite { .. } => {
             let subscriber = FmtSubscriber::builder()
                 .with_max_level(Level::INFO)
                 .finish();
@@ -295,6 +321,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
         Commands::IntroAttempts { db, peer } => {
             cli_intro_attempts(&db, peer.as_deref())?;
+        }
+        Commands::CreateInvite { db, bootstrap } => {
+            cli_create_invite(&db, &bootstrap)?;
+        }
+        Commands::AcceptInvite {
+            db,
+            invite,
+            username,
+            devicename,
+        } => {
+            cli_accept_invite(&db, &invite, &username, &devicename).await?;
         }
     }
 
@@ -670,9 +707,11 @@ fn ensure_identity_chain(
     let psf_eid = create_signed_event_sync(db, recorded_by, &psf, &device_invite_key)
         .map_err(|e| format!("{}", e))?;
 
-    // Store signing key for future CLI invocations
+    // Store signing keys for future CLI invocations
     let psf_b64 = poc_7::crypto::event_id_to_base64(&psf_eid);
     persist_local_peer_signer(db, recorded_by, &psf_b64, &peer_shared_key)?;
+    poc_7::service::persist_workspace_key(db, recorded_by, &workspace_key)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() })?;
 
     Ok((psf_eid, peer_shared_key))
 }
@@ -1386,5 +1425,28 @@ fn cli_intro_attempts(
         println!();
     }
 
+    Ok(())
+}
+
+fn cli_create_invite(
+    db_path: &str,
+    bootstrap_addr: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let result = poc_7::service::svc_create_invite(db_path, bootstrap_addr)?;
+    println!("{}", result.invite_link);
+    Ok(())
+}
+
+async fn cli_accept_invite(
+    db_path: &str,
+    invite_link: &str,
+    username: &str,
+    devicename: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let result = poc_7::service::svc_accept_invite(db_path, invite_link, username, devicename).await?;
+    println!("Accepted invite");
+    println!("  peer_id: {}", result.peer_id);
+    println!("  user:    {}", result.user_event_id);
+    println!("  peer:    {}", result.peer_shared_event_id);
     Ok(())
 }

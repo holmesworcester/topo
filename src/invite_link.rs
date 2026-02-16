@@ -172,6 +172,33 @@ pub fn parse_invite_link(link: &str) -> Result<ParsedInviteLink, InviteLinkError
     })
 }
 
+/// Re-encode an invite link with a different bootstrap address.
+/// Decodes the payload, swaps the bootstrap_addr, and re-encodes.
+pub fn rewrite_bootstrap_addr(
+    link: &str,
+    new_addr: &str,
+) -> Result<String, InviteLinkError> {
+    let (prefix, code) = if let Some(code) = link.strip_prefix(INVITE_PREFIX) {
+        (INVITE_PREFIX, code)
+    } else if let Some(code) = link.strip_prefix(LINK_PREFIX) {
+        (LINK_PREFIX, code)
+    } else {
+        return Err(InviteLinkError::InvalidPrefix);
+    };
+
+    let payload_json = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(code)
+        .map_err(|e| InviteLinkError::Decode(e.to_string()))?;
+    let mut payload: InviteLinkPayload = serde_json::from_slice(&payload_json)
+        .map_err(|e| InviteLinkError::Decode(e.to_string()))?;
+
+    payload.bootstrap_addr = new_addr.to_string();
+
+    let json = serde_json::to_vec(&payload).map_err(|e| InviteLinkError::Encode(e.to_string()))?;
+    let new_code = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json);
+    Ok(format!("{}{}", prefix, new_code))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

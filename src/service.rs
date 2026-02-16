@@ -197,6 +197,19 @@ pub struct WorkspaceItem {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct CreateInviteResponse {
+    pub invite_link: String,
+    pub invite_event_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AcceptInviteResponse {
+    pub peer_id: String,
+    pub user_event_id: String,
+    pub peer_shared_event_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct IntroAttemptItem {
     pub intro_id: String,
     pub other_peer_id: String,
@@ -337,6 +350,31 @@ fn load_local_peer_signer(
     Ok(None)
 }
 
+/// Public accessor for loading the locally stored peer signer.
+/// Used by the interactive module to recover keys after service-layer operations.
+pub fn load_local_peer_signer_pub(
+    db: &rusqlite::Connection,
+    recorded_by: &str,
+) -> ServiceResult<Option<(EventId, SigningKey)>> {
+    ensure_local_signer_tables(db)?;
+
+    if let Some((eid_b64, key_bytes)) = db
+        .query_row(
+            "SELECT event_id, signing_key FROM local_peer_signers WHERE recorded_by = ?1",
+            rusqlite::params![recorded_by],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
+        .optional()?
+    {
+        let signing_key = decode_signing_key(key_bytes)?;
+        let eid = event_id_from_base64(&eid_b64)
+            .ok_or_else(|| ServiceError("bad local peer signer event_id".into()))?;
+        return Ok(Some((eid, signing_key)));
+    }
+
+    Ok(None)
+}
+
 pub fn ensure_identity_chain(
     db: &rusqlite::Connection,
     recorded_by: &str,
@@ -411,6 +449,9 @@ pub fn ensure_identity_chain(
 
     let psf_b64 = event_id_to_base64(&psf_eid);
     persist_local_peer_signer(db, recorded_by, &psf_b64, &peer_shared_key)?;
+
+    // Persist workspace key for later invite creation
+    persist_workspace_key(db, recorded_by, &workspace_key)?;
 
     Ok((psf_eid, peer_shared_key))
 }
@@ -1134,6 +1175,225 @@ pub async fn svc_intro(
             Err(ServiceError(format!("Partial send: {}", errors.join("; "))))
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Invite create / accept
+// ---------------------------------------------------------------------------
+
+/// Create a user invite for the active workspace.
+///
+/// Requires an existing bootstrapped identity (workspace + admin).
+/// Returns an invite link with the bootstrap address and SPKI embedded.
+pub fn svc_create_invite(
+    db_path: &str,
+    bootstrap_addr: &str,
+) -> ServiceResult<CreateInviteResponse> {
+    let db = open_connection(db_path)?;
+    create_tables(&db)?;
+
+    let recorded_by = load_transport_peer_id_from_db(db_path)
+        .map_err(|e| ServiceError(format!("No transport identity: {}", e)))?;
+
+    // Load workspace key from local_peer_signers + workspace lookup
+    let workspace_id = db
+        .query_row(
+            "SELECT workspace_id FROM trust_anchors WHERE peer_id = ?1",
+            [&recorded_by],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|_| ServiceError("No workspace found. Bootstrap a workspace first.".into()))?;
+
+    let ws_eid = event_id_from_base64(&workspace_id)
+        .ok_or_else(|| ServiceError("Invalid workspace_id in trust_anchors".into()))?;
+
+    // Look up the workspace signing key from the workspace event's public key,
+    // then find the matching signer. For invite creation we need the workspace
+    // key stored during bootstrap (in local_peer_signers we only store peer_shared).
+    // The workspace key is stored in a separate table by ensure_identity_chain.
+    //
+    // For now, we require the caller to have the workspace_key stored.
+    // Check local_workspace_keys table (created by bootstrap).
+    ensure_workspace_key_table(&db)?;
+    let ws_key_bytes: Vec<u8> = db
+        .query_row(
+            "SELECT signing_key FROM local_workspace_keys WHERE recorded_by = ?1",
+            [&recorded_by],
+            |row| row.get(0),
+        )
+        .map_err(|_| ServiceError("No workspace signing key found. Only workspace creators can invite.".into()))?;
+
+    if ws_key_bytes.len() != 32 {
+        return Err(ServiceError("Corrupt workspace key".into()));
+    }
+    let mut key_arr = [0u8; 32];
+    key_arr.copy_from_slice(&ws_key_bytes);
+    let workspace_key = SigningKey::from_bytes(&key_arr);
+
+    let invite = crate::identity_ops::create_user_invite(&db, &recorded_by, &workspace_key, &ws_eid)
+        .map_err(|e| ServiceError(format!("Failed to create invite: {}", e)))?;
+
+    // Record pending bootstrap trust so invitee can connect
+    let pending_spki = crate::transport_identity::expected_invite_bootstrap_spki_from_invite_key(
+        &invite.invite_key,
+    )
+    .map_err(|e| ServiceError(format!("Failed to derive invite SPKI: {}", e)))?;
+    crate::db::transport_trust::record_pending_invite_bootstrap_trust(
+        &db,
+        &recorded_by,
+        &event_id_to_base64(&invite.invite_event_id),
+        &event_id_to_base64(&ws_eid),
+        &pending_spki,
+    )?;
+
+    // Get local SPKI for the bootstrap address
+    let spki_hex = &recorded_by;
+    let spki_bytes = hex::decode(spki_hex)?;
+    let mut bootstrap_spki = [0u8; 32];
+    bootstrap_spki.copy_from_slice(&spki_bytes);
+
+    let invite_link = crate::invite_link::create_invite_link(&invite, bootstrap_addr, &bootstrap_spki)
+        .map_err(|e| ServiceError(format!("Failed to create invite link: {}", e)))?;
+
+    Ok(CreateInviteResponse {
+        invite_link,
+        invite_event_id: event_id_to_base64(&invite.invite_event_id),
+    })
+}
+
+/// Accept a user invite via bootstrap sync + identity chain creation.
+///
+/// 1. Parses the invite link
+/// 2. Installs bootstrap transport identity derived from invite key
+/// 3. Connects to bootstrap address and syncs prerequisite events
+/// 4. Creates identity chain (InviteAccepted → UserBoot → DeviceInvite → PeerShared)
+/// 5. Records bootstrap trust and persists signer keys
+pub async fn svc_accept_invite(
+    db_path: &str,
+    invite_link_str: &str,
+    _username: &str,
+    _devicename: &str,
+) -> ServiceResult<AcceptInviteResponse> {
+    let invite = crate::invite_link::parse_invite_link(invite_link_str)
+        .map_err(|e| ServiceError(format!("Invalid invite link: {}", e)))?;
+
+    if invite.kind != crate::invite_link::InviteLinkKind::User {
+        return Err(ServiceError("Expected a user invite link (quiet://invite/...)".into()));
+    }
+
+    let invite_key = invite.invite_signing_key();
+    let invite_event_id = invite.invite_event_id;
+    let workspace_id = invite.workspace_id;
+
+    // Initialize DB and install bootstrap transport identity
+    {
+        let db = open_connection(db_path)?;
+        create_tables(&db)?;
+    }
+    let recorded_by = crate::transport_identity::install_invite_bootstrap_transport_identity(
+        db_path,
+        &invite_key,
+    )
+    .map_err(|e| ServiceError(format!("Failed to install bootstrap identity: {}", e)))?;
+
+    // Bootstrap sync: fetch prerequisite events from inviter
+    let bootstrap_addr: std::net::SocketAddr = invite
+        .bootstrap_addr
+        .parse()
+        .map_err(|e| ServiceError(format!("Invalid bootstrap address '{}': {}", invite.bootstrap_addr, e)))?;
+
+    crate::sync::bootstrap::bootstrap_sync_from_invite(
+        db_path,
+        &recorded_by,
+        bootstrap_addr,
+        &invite.bootstrap_spki_fingerprint,
+        15, // timeout seconds
+    )
+    .await
+    .map_err(|e| ServiceError(format!("Bootstrap sync failed: {}", e)))?;
+
+    // Verify prerequisite events arrived
+    let db = open_connection(db_path)?;
+    let ws_b64 = event_id_to_base64(&workspace_id);
+    let ws_exists: bool = db
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM events WHERE event_id = ?1",
+            [&ws_b64],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    if !ws_exists {
+        return Err(ServiceError(
+            "Bootstrap sync did not deliver workspace event. Ensure the inviter is running sync.".into(),
+        ));
+    }
+
+    // Accept the invite: creates identity chain
+    let join = crate::identity_ops::accept_user_invite(
+        &db,
+        &recorded_by,
+        &invite_key,
+        &invite_event_id,
+        workspace_id,
+    )
+    .map_err(|e| ServiceError(format!("Failed to accept invite: {}", e)))?;
+
+    // Record bootstrap trust
+    crate::db::transport_trust::record_invite_bootstrap_trust(
+        &db,
+        &recorded_by,
+        &event_id_to_base64(&join.invite_accepted_event_id),
+        &event_id_to_base64(&invite_event_id),
+        &event_id_to_base64(&workspace_id),
+        &invite.bootstrap_addr,
+        &invite.bootstrap_spki_fingerprint,
+    )?;
+
+    // Persist signer key so future commands can sign events
+    let psf_b64 = event_id_to_base64(&join.peer_shared_event_id);
+    persist_local_peer_signer(&db, &recorded_by, &psf_b64, &join.peer_shared_key)?;
+
+    // Also store workspace key table entry (not applicable for joiners, they don't
+    // have the workspace key — only the creator does)
+
+    Ok(AcceptInviteResponse {
+        peer_id: recorded_by,
+        user_event_id: event_id_to_base64(&join.user_event_id),
+        peer_shared_event_id: psf_b64,
+    })
+}
+
+/// Ensure the local_workspace_keys table exists (stores workspace signing keys
+/// for invite creation by workspace creators).
+fn ensure_workspace_key_table(db: &rusqlite::Connection) -> ServiceResult<()> {
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS local_workspace_keys (
+            recorded_by TEXT PRIMARY KEY,
+            signing_key BLOB NOT NULL,
+            updated_at INTEGER NOT NULL
+        )",
+        [],
+    )?;
+    Ok(())
+}
+
+/// Persist the workspace signing key for later invite creation.
+pub fn persist_workspace_key(
+    db: &rusqlite::Connection,
+    recorded_by: &str,
+    workspace_key: &SigningKey,
+) -> ServiceResult<()> {
+    ensure_workspace_key_table(db)?;
+    let now = current_timestamp_ms() as i64;
+    db.execute(
+        "INSERT INTO local_workspace_keys (recorded_by, signing_key, updated_at)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(recorded_by)
+         DO UPDATE SET signing_key = excluded.signing_key, updated_at = excluded.updated_at",
+        rusqlite::params![recorded_by, workspace_key.to_bytes().as_slice(), now],
+    )?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

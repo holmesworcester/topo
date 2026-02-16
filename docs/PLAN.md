@@ -119,6 +119,23 @@ These are required, not optional:
    - trust-anchor gating belongs on root workspace event validity.
    - do not use pre-projection raw-blob capture tables as authority for trust-anchor binding.
 
+## 2.2 CLI Isomorphism Principle
+
+Every CLI instance is a real peer-to-peer device. Interactive REPL and non-interactive CLI must be isomorphic:
+
+1. **One service layer**: all business logic lives in `src/service.rs` (or the domain modules it calls). CLI subcommands and the interactive REPL are thin UI adapters over the same service functions.
+2. **Real networking**: invite acceptance uses real QUIC bootstrap sync, not in-process event copying. Interactive REPL spins up a temporary sync endpoint for the inviter account when the joiner is in the same process.
+3. **Testing equivalence**: testing the non-interactive CLI validates the interactive REPL and vice versa, because both exercise the same service-layer code paths. An LLM-driven QA agent can target either surface with equal confidence.
+4. **No synthetic shortcuts**: no `copy_event_chain`, no direct DB-to-DB event transfers, no bypass of the sync/projection pipeline. Every event flows through the same ingest path it would in production.
+
+## 2.3 Device Architecture
+
+1. **One CLI instance = one device**: each running `poc-7` process is a device with its own transport identity and persistent state.
+2. **Multiple tenants per device**: a single device can host many tenants, each participating in arbitrary (potentially overlapping) workspaces.
+3. **Zeroconf discovery**: mDNS/DNS-SD discovers peers on the same workspace on the local machine or LAN (existing `discovery` feature via `p7d --node`).
+4. **Per-tenant QUIC endpoints**: each tenant gets its own QUIC endpoint with trust resolved from event-derived SQL state (no manual `--pin-peer` in steady state).
+5. **Shared batch writer**: all tenants on a device share one batch writer for projection, grouped by `recorded_by`.
+
 ---
 
 ## 3. Phase 1: CLI + Daemon First
