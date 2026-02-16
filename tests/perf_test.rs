@@ -101,7 +101,7 @@ async fn perf_sync_10k() {
 async fn perf_continuous_10k() {
     let alice = Peer::new_with_identity("alice");
     // Use a shared workspace so workspace-scoped sync transfers content events.
-    let bob = Peer::new_in_workspace("bob", &alice);
+    let bob = Peer::new_in_workspace("bob", &alice).await;
 
     let rss_before = peak_rss_mib();
 
