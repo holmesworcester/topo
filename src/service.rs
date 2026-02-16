@@ -13,7 +13,10 @@ use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
 use crate::db::{
     open_connection,
     schema::create_tables,
-    transport_trust::{allowed_peers_from_db, import_cli_pins_to_sql, is_peer_allowed},
+    transport_trust::{
+        allowed_peers_from_db, import_cli_pins_to_sql, is_peer_allowed,
+        record_invite_bootstrap_trust, record_pending_invite_bootstrap_trust,
+    },
 };
 use crate::events::{
     DeviceInviteFirstEvent, InviteAcceptedEvent, MessageDeletionEvent, MessageEvent, ParsedEvent,
@@ -27,6 +30,8 @@ use crate::transport::{
 };
 use crate::transport_identity::{
     ensure_transport_peer_id_from_db, ensure_transport_cert_from_db,
+    expected_invite_bootstrap_spki_from_invite_key,
+    install_invite_bootstrap_transport_identity,
     load_transport_peer_id_from_db,
 };
 
@@ -73,6 +78,12 @@ impl From<hex::FromHexError> for ServiceError {
 
 impl From<Box<dyn std::error::Error + Send + Sync>> for ServiceError {
     fn from(e: Box<dyn std::error::Error + Send + Sync>) -> Self {
+        ServiceError(e.to_string())
+    }
+}
+
+impl From<crate::invite_link::InviteLinkError> for ServiceError {
+    fn from(e: crate::invite_link::InviteLinkError) -> Self {
         ServiceError(e.to_string())
     }
 }
@@ -1150,4 +1161,95 @@ pub fn socket_path_for_db(db_path: &str) -> std::path::PathBuf {
         std::env::current_dir().unwrap_or_default().join(p)
     };
     abs.with_extension("p7d.sock")
+}
+
+// ---------------------------------------------------------------------------
+// Invite create / accept
+// ---------------------------------------------------------------------------
+
+pub struct CreateInviteResult {
+    pub invite_link: String,
+}
+
+/// Create a user invite link and record pending bootstrap trust.
+///
+/// Bootstraps a workspace identity chain, creates a UserInviteBoot event,
+/// derives the expected invitee SPKI from the invite key, records
+/// `pending_invite_bootstrap_trust`, and returns the invite link.
+pub fn create_invite(
+    db_path: &str,
+    bootstrap_addr: &str,
+) -> ServiceResult<CreateInviteResult> {
+    use crate::identity_ops;
+    use crate::invite_link::create_invite_link;
+    use crate::transport::extract_spki_fingerprint;
+
+    let (recorded_by, cert_der, _key) = ensure_transport_cert_from_db(db_path)?;
+    let db = open_connection(db_path)?;
+    create_tables(&db)?;
+
+    let chain = identity_ops::bootstrap_workspace(&db, &recorded_by)?;
+
+    // Persist peer_shared signing key so future CLI commands (send, etc.) work.
+    let psf_b64 = event_id_to_base64(&chain.peer_shared_event_id);
+    persist_local_peer_signer(&db, &recorded_by, &psf_b64, &chain.peer_shared_key)?;
+
+    let invite_data = identity_ops::create_user_invite(
+        &db,
+        &recorded_by,
+        &chain.workspace_key,
+        &chain.workspace_id,
+    )?;
+
+    // Derive expected invitee SPKI from invite key (deterministic identity).
+    let pending_spki = expected_invite_bootstrap_spki_from_invite_key(&invite_data.invite_key)?;
+    record_pending_invite_bootstrap_trust(
+        &db,
+        &recorded_by,
+        &event_id_to_base64(&invite_data.invite_event_id),
+        &event_id_to_base64(&chain.workspace_id),
+        &pending_spki,
+    )?;
+
+    let local_spki = extract_spki_fingerprint(cert_der.as_ref())?;
+    let link = create_invite_link(&invite_data, bootstrap_addr, &local_spki)?;
+
+    Ok(CreateInviteResult { invite_link: link })
+}
+
+pub struct AcceptInviteResult {
+    pub peer_id: String,
+}
+
+/// Accept a user invite link: install deterministic transport cert and record
+/// bootstrap trust for the inviter.
+///
+/// The invitee's transport identity is derived from the invite key so the
+/// inviter can recognize the connection without a pre-shared fingerprint.
+pub fn accept_invite(
+    db_path: &str,
+    link_str: &str,
+) -> ServiceResult<AcceptInviteResult> {
+    use crate::invite_link::parse_invite_link;
+
+    let parsed = parse_invite_link(link_str)?;
+
+    // Install deterministic transport cert derived from invite key.
+    let invite_key = parsed.invite_signing_key();
+    let peer_id = install_invite_bootstrap_transport_identity(db_path, &invite_key)?;
+
+    let db = open_connection(db_path)?;
+    create_tables(&db)?;
+
+    record_invite_bootstrap_trust(
+        &db,
+        &peer_id,
+        &event_id_to_base64(&parsed.invite_event_id),
+        &event_id_to_base64(&parsed.invite_event_id),
+        &event_id_to_base64(&parsed.workspace_id),
+        &parsed.bootstrap_addr,
+        &parsed.bootstrap_spki_fingerprint,
+    )?;
+
+    Ok(AcceptInviteResult { peer_id })
 }

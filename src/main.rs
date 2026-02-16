@@ -11,10 +11,7 @@ use poc_7::crypto::EventId;
 use poc_7::db::{
     open_connection,
     schema::create_tables,
-    transport_trust::{
-        allowed_peers_from_db, import_cli_pins_to_sql, is_peer_allowed,
-        record_invite_bootstrap_trust, record_pending_invite_bootstrap_trust,
-    },
+    transport_trust::{allowed_peers_from_db, import_cli_pins_to_sql, is_peer_allowed},
 };
 use poc_7::events::{
     DeviceInviteFirstEvent, InviteAcceptedEvent, MessageDeletionEvent, MessageEvent, ParsedEvent,
@@ -27,9 +24,6 @@ use poc_7::transport::{
     create_dual_endpoint, create_dual_endpoint_dynamic,
     AllowedPeers,
 };
-use poc_7::identity_ops;
-use poc_7::invite_link::{create_invite_link, parse_invite_link};
-use poc_7::transport::extract_spki_fingerprint;
 use poc_7::transport_identity::{
     ensure_transport_peer_id_from_db, ensure_transport_cert_from_db,
     load_transport_peer_id_from_db,
@@ -207,22 +201,19 @@ enum Commands {
         peer: Option<String>,
     },
 
-    /// Create a user invite link and record pending bootstrap trust for the expected peer
-    #[command(name = "invite-create")]
-    InviteCreate {
+    /// Create a user invite link and record pending bootstrap trust
+    #[command(name = "create-invite")]
+    CreateInvite {
         #[arg(short, long, default_value = "server.db")]
         db: String,
         /// Bootstrap address to embed in the invite link (e.g. 127.0.0.1:4433)
         #[arg(long)]
         bind: SocketAddr,
-        /// Hex SPKI fingerprint of the expected invitee peer
-        #[arg(long)]
-        expected_peer: String,
     },
 
-    /// Accept an invite link: record bootstrap trust for the inviter peer
-    #[command(name = "invite-accept")]
-    InviteAccept {
+    /// Accept an invite link: install deterministic transport cert and record bootstrap trust
+    #[command(name = "accept-invite")]
+    AcceptInvite {
         #[arg(short, long, default_value = "server.db")]
         db: String,
         /// The invite link URL to accept
@@ -325,15 +316,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Commands::IntroAttempts { db, peer } => {
             cli_intro_attempts(&db, peer.as_deref())?;
         }
-        Commands::InviteCreate {
-            db,
-            bind,
-            expected_peer,
-        } => {
-            cli_invite_create(&db, bind, &expected_peer)?;
+        Commands::CreateInvite { db, bind } => {
+            let result = poc_7::service::create_invite(&db, &bind.to_string())?;
+            println!("{}", result.invite_link);
         }
-        Commands::InviteAccept { db, link } => {
-            cli_invite_accept(&db, &link)?;
+        Commands::AcceptInvite { db, link } => {
+            let result = poc_7::service::accept_invite(&db, &link)?;
+            println!("{}", result.peer_id);
         }
     }
 
@@ -1428,87 +1417,3 @@ fn cli_intro_attempts(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Invite create / accept (non-interactive)
-// ---------------------------------------------------------------------------
-
-fn cli_invite_create(
-    db_path: &str,
-    bind: SocketAddr,
-    expected_peer_hex: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let (recorded_by, cert_der, _key) = ensure_transport_cert_from_db(db_path)?;
-    let db = open_connection(db_path)?;
-    create_tables(&db)?;
-
-    // Bootstrap a full workspace identity chain (returns all keys).
-    let chain = identity_ops::bootstrap_workspace(&db, &recorded_by)?;
-
-    // Create a user invite (signed by workspace key).
-    let invite_data = identity_ops::create_user_invite(
-        &db,
-        &recorded_by,
-        &chain.workspace_key,
-        &chain.workspace_id,
-    )?;
-
-    // Persist peer_shared signing key so future CLI commands (send, etc.) work.
-    let psf_b64 = poc_7::crypto::event_id_to_base64(&chain.peer_shared_event_id);
-    persist_local_peer_signer(&db, &recorded_by, &psf_b64, &chain.peer_shared_key)?;
-
-    // Build invite link with this node's bootstrap info.
-    let local_spki = extract_spki_fingerprint(cert_der.as_ref())?;
-    let link = create_invite_link(&invite_data, &bind.to_string(), &local_spki)?;
-
-    // Record pending bootstrap trust for the expected invitee.
-    let expected_fp_bytes = hex::decode(expected_peer_hex)?;
-    if expected_fp_bytes.len() != 32 {
-        return Err(format!(
-            "expected-peer fingerprint must be 32 bytes, got {}",
-            expected_fp_bytes.len()
-        )
-        .into());
-    }
-    let mut expected_fp = [0u8; 32];
-    expected_fp.copy_from_slice(&expected_fp_bytes);
-
-    let invite_eid_hex = hex::encode(invite_data.invite_event_id);
-    let workspace_hex = hex::encode(chain.workspace_id);
-    record_pending_invite_bootstrap_trust(
-        &db,
-        &recorded_by,
-        &invite_eid_hex,
-        &workspace_hex,
-        &expected_fp,
-    )?;
-
-    println!("{}", link);
-    Ok(())
-}
-
-fn cli_invite_accept(
-    db_path: &str,
-    link_str: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let recorded_by = ensure_transport_peer_id_from_db(db_path)?;
-    let db = open_connection(db_path)?;
-    create_tables(&db)?;
-
-    let parsed = parse_invite_link(link_str)?;
-
-    // Record bootstrap trust for the inviter's address and fingerprint.
-    let invite_eid_hex = hex::encode(parsed.invite_event_id);
-    let workspace_hex = hex::encode(parsed.workspace_id);
-    record_invite_bootstrap_trust(
-        &db,
-        &recorded_by,
-        &format!("ia_{}", &invite_eid_hex[..16]),
-        &invite_eid_hex,
-        &workspace_hex,
-        &parsed.bootstrap_addr,
-        &parsed.bootstrap_spki_fingerprint,
-    )?;
-
-    println!("{}", recorded_by);
-    Ok(())
-}

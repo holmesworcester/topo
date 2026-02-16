@@ -125,41 +125,41 @@ fn get_messages(db: &str) -> Vec<String> {
         .collect()
 }
 
-/// Helper: run invite-create CLI command. Returns the invite link printed to stdout.
-fn invite_create(db: &str, bind_addr: &str, expected_peer_hex: &str) -> String {
+/// Helper: run create-invite CLI command. Returns the invite link printed to stdout.
+fn create_invite(db: &str, bind_addr: &str) -> String {
     let output = Command::new(bin())
-        .arg("invite-create")
+        .arg("create-invite")
         .arg("--db")
         .arg(db)
         .arg("--bind")
         .arg(bind_addr)
-        .arg("--expected-peer")
-        .arg(expected_peer_hex)
         .output()
-        .expect("failed to run invite-create");
+        .expect("failed to run create-invite");
     assert!(
         output.status.success(),
-        "invite-create failed: {}",
+        "create-invite failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
-/// Helper: run invite-accept CLI command.
-fn invite_accept(db: &str, link: &str) {
+/// Helper: run accept-invite CLI command. Installs deterministic transport cert
+/// and records bootstrap trust. Returns the new peer ID.
+fn accept_invite(db: &str, link: &str) -> String {
     let output = Command::new(bin())
-        .arg("invite-accept")
+        .arg("accept-invite")
         .arg("--db")
         .arg(db)
         .arg("--link")
         .arg(link)
         .output()
-        .expect("failed to run invite-accept");
+        .expect("failed to run accept-invite");
     assert!(
         output.status.success(),
-        "invite-accept failed: {}",
+        "accept-invite failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
 /// Functional sync test. Uses --pin-peer for CLI bootstrap (not testing pinning policy).
@@ -383,19 +383,17 @@ fn test_cli_sync_bootstrap_from_accepted_invite_data() {
     let alice_port = random_port();
     let bob_port = random_port();
 
-    // Get transport identities (SPKI fingerprints).
-    let _alice_fp = get_identity(&alice_db);
-    let bob_fp = get_identity(&bob_db);
-
-    // Alice creates invite, seeding pending bootstrap trust for Bob.
-    let invite_link = invite_create(
+    // Alice creates invite; derives expected invitee SPKI from invite key
+    // and records pending_invite_bootstrap_trust.
+    let invite_link = create_invite(
         &alice_db,
         &format!("127.0.0.1:{}", alice_port),
-        &bob_fp,
     );
 
-    // Bob accepts invite link, seeding bootstrap trust for Alice.
-    invite_accept(&bob_db, &invite_link);
+    // Bob accepts invite: installs deterministic transport cert derived from
+    // invite key (matching Alice's pending trust) and records bootstrap trust
+    // for Alice's SPKI.
+    accept_invite(&bob_db, &invite_link);
 
     // No CLI pins required when bootstrap trust is present from invite flow.
     let mut alice = start_sync(&alice_db, alice_port, None, &[]);
