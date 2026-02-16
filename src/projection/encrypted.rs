@@ -4,13 +4,33 @@ use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use aes_gcm::aead::Aead;
 
 use crate::crypto::event_id_to_base64;
-use crate::events::{self, EncryptedEvent, ParsedEvent, EVENT_TYPE_ENCRYPTED};
+use crate::events::{self, EncryptedEvent, EVENT_TYPE_ENCRYPTED};
 use super::decision::ProjectionDecision;
-use super::projectors::{project_message, project_message_attachment, project_message_deletion, project_file_slice, project_reaction, project_secret_key, project_signed_memo};
-use super::signer::{resolve_signer_key, verify_ed25519_signature, SignerResolution};
+use super::pipeline::{apply_projection, check_dep_types, check_deps_and_block, record_rejection};
 
-/// Project an encrypted event: decrypt, parse inner, check inner deps, dispatch to inner projector.
-/// Returns Valid, Block, or Reject.
+/// Admissible inner event type codes for encrypted wrappers.
+/// Identity events, encrypted (nested), and bench_dep are not permitted.
+const ADMISSIBLE_INNER_TYPES: &[u8] = &[
+    1,  // message
+    2,  // reaction
+    4,  // signed_memo
+    6,  // secret_key
+    7,  // message_deletion
+    24, // message_attachment
+    25, // file_slice
+];
+
+/// Project an encrypted event: decrypt, parse inner, verify admissibility,
+/// then hand off to shared pipeline stages (dep check, dep type check,
+/// signer verify, projector dispatch).
+///
+/// Wrapper-specific concerns handled here:
+///   1. Secret-key resolve and decrypt
+///   2. inner_type_code consistency check
+///   3. Nested-encrypted prohibition
+///   4. Admissible-inner-family check
+///
+/// Block/reject/valid state is anchored to the outer encrypted `event_id_b64`.
 pub fn project_encrypted(
     conn: &Connection,
     recorded_by: &str,
@@ -88,131 +108,34 @@ pub fn project_encrypted(
         });
     }
 
-    // 6. Check inner deps via valid_events (tenant-scoped)
+    // 6. Reject disallowed inner families (identity events, bench_dep)
+    if !ADMISSIBLE_INNER_TYPES.contains(&inner_parsed.event_type_code()) {
+        return Ok(ProjectionDecision::Reject {
+            reason: "identity events cannot appear inside encrypted wrappers".to_string(),
+        });
+    }
+
+    // --- Shared pipeline stages (using outer event_id for block/reject anchoring) ---
+
+    // 7. Check inner dep presence (block rows keyed to outer event_id)
     let inner_deps = inner_parsed.dep_field_values();
-    let mut missing = Vec::new();
-    for (_field_name, dep_id) in &inner_deps {
-        let dep_b64 = event_id_to_base64(dep_id);
-        let dep_valid: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, &dep_b64],
-            |row| row.get(0),
-        )?;
-        if !dep_valid {
-            missing.push(*dep_id);
-        }
+    if let Some(block) = check_deps_and_block(conn, recorded_by, event_id_b64, &inner_deps)? {
+        return Ok(block);
     }
 
-    if !missing.is_empty() {
-        // Write blocked_event_deps + blocked_events header using OUTER event_id
-        missing.sort_unstable();
-        missing.dedup();
-        for dep_id in &missing {
-            let dep_b64 = event_id_to_base64(dep_id);
-            conn.execute(
-                "INSERT OR IGNORE INTO blocked_event_deps (peer_id, event_id, blocker_event_id)
-                 VALUES (?1, ?2, ?3)",
-                rusqlite::params![recorded_by, event_id_b64, &dep_b64],
-            )?;
-        }
-        conn.execute(
-            "INSERT OR IGNORE INTO blocked_events (peer_id, event_id, deps_remaining)
-             VALUES (?1, ?2, ?3)",
-            rusqlite::params![recorded_by, event_id_b64, missing.len() as i64],
-        )?;
-        return Ok(ProjectionDecision::Block { missing });
-    }
-
-    // 7. If inner type has signer_required: verify signer
+    // 8. Check inner dep types
     let inner_meta = events::registry().lookup(inner_parsed.event_type_code())
         .ok_or_else(|| format!("unknown inner type code {}", inner_parsed.event_type_code()))?;
-
-    if inner_meta.signer_required {
-        let (signer_event_id, signer_type) = inner_parsed.signer_fields()
-            .ok_or("inner type signer_required but no signer_fields")?;
-        let resolution = resolve_signer_key(conn, recorded_by, signer_type, &signer_event_id)?;
-        match resolution {
-            SignerResolution::NotFound => {
-                return Ok(ProjectionDecision::Reject {
-                    reason: "inner event signer key not found".to_string(),
-                });
-            }
-            SignerResolution::Invalid(msg) => {
-                return Ok(ProjectionDecision::Reject {
-                    reason: format!("inner event signer resolution invalid: {}", msg),
-                });
-            }
-            SignerResolution::Found(key) => {
-                let sig_len = inner_meta.signature_byte_len;
-                if plaintext.len() < sig_len {
-                    return Ok(ProjectionDecision::Reject {
-                        reason: "inner blob too short for signature".to_string(),
-                    });
-                }
-                let signing_bytes = &plaintext[..plaintext.len() - sig_len];
-                let sig_bytes = &plaintext[plaintext.len() - sig_len..];
-                if !verify_ed25519_signature(&key, signing_bytes, sig_bytes) {
-                    return Ok(ProjectionDecision::Reject {
-                        reason: "inner event invalid signature".to_string(),
-                    });
-                }
-            }
+    if !inner_meta.dep_field_type_codes.is_empty() {
+        if let Some(reason) = check_dep_types(conn, &inner_deps, inner_meta.dep_field_type_codes)? {
+            record_rejection(conn, recorded_by, event_id_b64, &reason);
+            return Ok(ProjectionDecision::Reject { reason });
         }
     }
 
-    // 8. Dispatch to inner projector
-    match &inner_parsed {
-        ParsedEvent::Message(msg) => {
-            project_message(conn, recorded_by, event_id_b64, msg)?;
-        }
-        ParsedEvent::Reaction(rxn) => {
-            project_reaction(conn, recorded_by, event_id_b64, rxn)?;
-        }
-        ParsedEvent::SignedMemo(memo) => {
-            project_signed_memo(conn, recorded_by, event_id_b64, memo)?;
-        }
-        ParsedEvent::SecretKey(sk) => {
-            project_secret_key(conn, recorded_by, event_id_b64, sk)?;
-        }
-        ParsedEvent::MessageDeletion(del) => {
-            return project_message_deletion(conn, recorded_by, event_id_b64, del);
-        }
-        ParsedEvent::MessageAttachment(att) => {
-            project_message_attachment(conn, recorded_by, event_id_b64, att)?;
-        }
-        ParsedEvent::FileSlice(fs) => {
-            return Ok(project_file_slice(conn, recorded_by, event_id_b64, fs)?);
-        }
-        ParsedEvent::Encrypted(_) => {
-            // Already rejected above (nested encryption)
-            unreachable!();
-        }
-        // Identity events cannot appear inside encrypted wrappers
-        ParsedEvent::Workspace(_)
-        | ParsedEvent::InviteAccepted(_)
-        | ParsedEvent::UserInviteBoot(_)
-        | ParsedEvent::UserInviteOngoing(_)
-        | ParsedEvent::DeviceInviteFirst(_)
-        | ParsedEvent::DeviceInviteOngoing(_)
-        | ParsedEvent::UserBoot(_)
-        | ParsedEvent::UserOngoing(_)
-        | ParsedEvent::PeerSharedFirst(_)
-        | ParsedEvent::PeerSharedOngoing(_)
-        | ParsedEvent::AdminBoot(_)
-        | ParsedEvent::AdminOngoing(_)
-        | ParsedEvent::UserRemoved(_)
-        | ParsedEvent::PeerRemoved(_)
-        | ParsedEvent::SecretShared(_)
-        | ParsedEvent::TransportKey(_)
-        | ParsedEvent::BenchDep(_) => {
-            return Ok(ProjectionDecision::Reject {
-                reason: "identity events cannot appear inside encrypted wrappers".to_string(),
-            });
-        }
-    }
-
-    // 9. Return Valid
-    Ok(ProjectionDecision::Valid)
+    // 9. Signer verification + projector dispatch (shared stage).
+    //    Passes decrypted plaintext as the signing bytes source.
+    apply_projection(conn, recorded_by, event_id_b64, &plaintext, &inner_parsed)
 }
 
 /// Encrypt a plaintext blob using AES-256-GCM with a random nonce.
