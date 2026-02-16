@@ -285,10 +285,9 @@ pub async fn run_node(
     }
 
     // Single accept loop for all workspaces.
-    // Use the first tenant's peer_id as recorded_by for now — in future,
-    // accept_loop_with_ingest will determine recorded_by from the peer's
-    // SPKI fingerprint post-handshake.
-    let first_tenant_id = tenants[0].peer_id.clone();
+    // Post-handshake, each connection is routed to the tenant that trusts
+    // the remote peer's SPKI fingerprint.
+    let all_tenant_ids: Vec<String> = tenants.iter().map(|t| t.peer_id.clone()).collect();
     let db_path_owned = db_path.to_string();
     let ingest_tx = shared_tx.clone();
     let accept_handle = std::thread::spawn(move || {
@@ -299,7 +298,7 @@ pub async fn run_node(
         rt.block_on(async move {
             if let Err(e) = accept_loop_with_ingest(
                 &db_path_owned,
-                &first_tenant_id,
+                &all_tenant_ids,
                 endpoint,
                 None,
                 ingest_tx,

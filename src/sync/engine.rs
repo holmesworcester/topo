@@ -1100,7 +1100,8 @@ pub async fn accept_loop(
         batch_writer(writer_db_path, shared_ingest_rx, writer_events);
     });
 
-    accept_loop_with_ingest(db_path, recorded_by, endpoint, None, shared_ingest_tx).await
+    let tenant_ids = vec![recorded_by.to_string()];
+    accept_loop_with_ingest(db_path, &tenant_ids, endpoint, None, shared_ingest_tx).await
 }
 
 /// Accept incoming connections using an externally-provided ingest channel.
@@ -1108,9 +1109,13 @@ pub async fn accept_loop(
 /// Same as `accept_loop` but takes a pre-existing `Sender<IngestItem>` instead
 /// of spawning its own batch_writer. Used by the multi-tenant node daemon so
 /// all tenants share a single writer thread.
+///
+/// `tenant_peer_ids` lists local tenants. After TLS handshake, the remote
+/// peer's SPKI fingerprint is checked against each tenant's trust set to
+/// determine the `recorded_by` for that connection.
 pub async fn accept_loop_with_ingest(
     db_path: &str,
-    recorded_by: &str,
+    tenant_peer_ids: &[String],
     endpoint: quinn::Endpoint,
     _allowed_peers: Option<crate::transport::AllowedPeers>,
     shared_ingest_tx: mpsc::Sender<IngestItem>,
@@ -1127,17 +1132,20 @@ pub async fn accept_loop_with_ingest(
         if recovered > 0 {
             info!("Recovered {} expired project_queue leases", recovered);
         }
-        let recorded_by_str = recorded_by.to_string();
+        // Drain pending project_queue items for ALL tenants
         let batch_sz = drain_batch_size();
-        let drained = pq.drain_with_limit(&recorded_by_str, batch_sz, |conn, event_id_b64| {
-            if let Some(eid) = event_id_from_base64(event_id_b64) {
-                project_one(conn, &recorded_by_str, &eid)
-                    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        for tenant_id in tenant_peer_ids {
+            let tid = tenant_id.clone();
+            let drained = pq.drain_with_limit(&tid, batch_sz, |conn, event_id_b64| {
+                if let Some(eid) = event_id_from_base64(event_id_b64) {
+                    project_one(conn, &tid, &eid)
+                        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                }
+                Ok(())
+            }).unwrap_or(0);
+            if drained > 0 {
+                info!("Processed {} pending project_queue items for tenant {}", drained, &tenant_id[..16.min(tenant_id.len())]);
             }
-            Ok(())
-        }).unwrap_or(0);
-        if drained > 0 {
-            info!("Processed {} pending project_queue items from previous session", drained);
         }
     }
 
@@ -1166,6 +1174,18 @@ pub async fn accept_loop_with_ingest(
         };
         info!("Accepted connection from {}", peer_id);
 
+        // Resolve which local tenant trusts this peer (post-handshake routing)
+        let recorded_by = resolve_tenant_for_peer(db_path, tenant_peer_ids, &peer_id);
+        let recorded_by = match recorded_by {
+            Some(rb) => rb,
+            None => {
+                // TLS already verified trust at the transport level, so this
+                // shouldn't happen in normal operation. Fall back to first tenant.
+                warn!("No tenant matched peer {} post-handshake, using first tenant", &peer_id[..16.min(peer_id.len())]);
+                tenant_peer_ids[0].clone()
+            }
+        };
+
         // Record endpoint observation, transport binding, and purge expired
         {
             let remote = connection.remote_address();
@@ -1173,7 +1193,7 @@ pub async fn accept_loop_with_ingest(
             if let Ok(db) = open_connection(db_path) {
                 let _ = record_endpoint_observation(
                     &db,
-                    recorded_by,
+                    &recorded_by,
                     &peer_id,
                     &remote.ip().to_string(),
                     remote.port(),
@@ -1184,7 +1204,7 @@ pub async fn accept_loop_with_ingest(
                     if spki_bytes.len() == 32 {
                         let mut fp = [0u8; 32];
                         fp.copy_from_slice(&spki_bytes);
-                        let _ = record_transport_binding(&db, recorded_by, &peer_id, &fp);
+                        let _ = record_transport_binding(&db, &recorded_by, &peer_id, &fp);
                     }
                 }
                 let purged = purge_expired_endpoints(&db, now).unwrap_or(0);
@@ -1198,7 +1218,7 @@ pub async fn accept_loop_with_ingest(
         // Uses LocalSet so the intro listener (spawn_local) can run alongside
         // the responder sync sessions on the same runtime.
         let db_path_owned = db_path.to_string();
-        let recorded_by_owned = recorded_by.to_string();
+        let recorded_by_owned = recorded_by;
         let ingest_clone = shared_ingest_tx.clone();
         let intro_endpoint = endpoint.clone();
         std::thread::spawn(move || {
@@ -1246,6 +1266,31 @@ pub async fn accept_loop_with_ingest(
             }));
         });
     }
+}
+
+/// Resolve which local tenant trusts a given remote peer.
+///
+/// Checks `is_peer_allowed` for each tenant. Returns the first tenant that
+/// trusts the peer, or `None` if no tenant matches.
+fn resolve_tenant_for_peer(
+    db_path: &str,
+    tenant_peer_ids: &[String],
+    remote_peer_id: &str,
+) -> Option<String> {
+    let peer_fp_bytes = hex::decode(remote_peer_id).ok()?;
+    if peer_fp_bytes.len() != 32 {
+        return None;
+    }
+    let mut fp = [0u8; 32];
+    fp.copy_from_slice(&peer_fp_bytes);
+
+    let db = open_connection(db_path).ok()?;
+    for tenant_id in tenant_peer_ids {
+        if crate::db::transport_trust::is_peer_allowed(&db, tenant_id, &fp).unwrap_or(false) {
+            return Some(tenant_id.clone());
+        }
+    }
+    None
 }
 
 /// Connect to a remote peer and run initiator sync sessions.
