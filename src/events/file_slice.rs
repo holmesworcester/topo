@@ -127,6 +127,7 @@ pub static FILE_SLICE_META: EventTypeMeta = EventTypeMeta {
     dep_field_type_codes: &[&[]],
     signer_required: true,
     signature_byte_len: 64,
+    encryptable: true,
     parse: parse_file_slice,
     encode: encode_file_slice,
 };

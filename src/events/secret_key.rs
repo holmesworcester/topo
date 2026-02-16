@@ -64,6 +64,7 @@ pub static SECRET_KEY_META: EventTypeMeta = EventTypeMeta {
     dep_field_type_codes: &[],
     signer_required: false,
     signature_byte_len: 0,
+    encryptable: true,
     parse: parse_secret_key,
     encode: encode_secret_key,
 };

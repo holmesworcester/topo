@@ -130,6 +130,7 @@ pub static USER_BOOT_META: EventTypeMeta = EventTypeMeta {
     dep_field_type_codes: &[&[]],
     signer_required: true,
     signature_byte_len: 64,
+    encryptable: false,
     parse: parse_user_boot,
     encode: encode_user_boot,
 };
@@ -143,6 +144,7 @@ pub static USER_ONGOING_META: EventTypeMeta = EventTypeMeta {
     dep_field_type_codes: &[&[]],
     signer_required: true,
     signature_byte_len: 64,
+    encryptable: false,
     parse: parse_user_ongoing,
     encode: encode_user_ongoing,
 };

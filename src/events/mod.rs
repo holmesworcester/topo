@@ -728,6 +728,31 @@ mod tests {
     }
 
     #[test]
+    fn test_registry_encryptable_coverage() {
+        let reg = registry();
+        let encryptable_codes: Vec<u8> = (1..=26u8)
+            .filter(|c| reg.lookup(*c).map_or(false, |m| m.encryptable))
+            .collect();
+        // Must match the admissible set from projector_spec:
+        // message(1), reaction(2), signed_memo(4), secret_key(6),
+        // message_deletion(7), message_attachment(24), file_slice(25)
+        assert_eq!(
+            encryptable_codes,
+            vec![1, 2, 4, 6, 7, 24, 25],
+            "encryptable set drifted from expected admissible inner types"
+        );
+        // Identity/infrastructure types must NOT be encryptable
+        for code in [5, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 26] {
+            let meta = reg.lookup(code).unwrap();
+            assert!(
+                !meta.encryptable,
+                "type {} ({}) should not be encryptable",
+                code, meta.type_name
+            );
+        }
+    }
+
+    #[test]
     fn test_variable_length_content() {
         // Empty content
         let msg = ParsedEvent::Message(MessageEvent {

@@ -142,6 +142,7 @@ pub static ADMIN_BOOT_META: EventTypeMeta = EventTypeMeta {
     dep_field_type_codes: &[&[14, 15], &[]],
     signer_required: true,
     signature_byte_len: 64,
+    encryptable: false,
     parse: parse_admin_boot,
     encode: encode_admin_boot,
 };
@@ -155,6 +156,7 @@ pub static ADMIN_ONGOING_META: EventTypeMeta = EventTypeMeta {
     dep_field_type_codes: &[&[18], &[]],
     signer_required: true,
     signature_byte_len: 64,
+    encryptable: false,
     parse: parse_admin_ongoing,
     encode: encode_admin_ongoing,
 };

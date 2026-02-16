@@ -97,6 +97,7 @@ pub static BENCH_DEP_META: EventTypeMeta = EventTypeMeta {
     dep_field_type_codes: &[&[]],
     signer_required: false,
     signature_byte_len: 0,
+    encryptable: false,
     parse: parse_bench_dep,
     encode: encode_bench_dep,
 };

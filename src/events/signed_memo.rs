@@ -103,6 +103,7 @@ pub static SIGNED_MEMO_META: EventTypeMeta = EventTypeMeta {
     dep_field_type_codes: &[&[]],
     signer_required: true,
     signature_byte_len: 64,
+    encryptable: true,
     parse: parse_signed_memo,
     encode: encode_signed_memo,
 };

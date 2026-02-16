@@ -2552,7 +2552,7 @@ mod tests {
     // --- Inner signer failure parity ---
 
     #[test]
-    fn test_encrypted_inner_signer_not_found_rejects() {
+    fn test_encrypted_inner_signer_dep_missing_blocks() {
         // Encrypted message where the inner event references a signer that
         // doesn't exist. Should reject (not block) since signer resolution
         // fails after deps are satisfied.
@@ -2700,7 +2700,7 @@ mod tests {
         match result {
             ProjectionDecision::Reject { reason } => {
                 assert!(
-                    reason.contains("identity events cannot appear inside encrypted"),
+                    reason.contains("not admissible inside encrypted wrappers"),
                     "reason: {}",
                     reason
                 );

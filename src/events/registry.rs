@@ -28,6 +28,9 @@ pub struct EventTypeMeta {
     pub dep_field_type_codes: &'static [&'static [u8]],
     pub signer_required: bool,
     pub signature_byte_len: usize,
+    /// Whether this event type is admissible as inner payload of an encrypted wrapper.
+    /// Identity events, encrypted (nested), and bench_dep are not permitted.
+    pub encryptable: bool,
     pub parse: fn(&[u8]) -> Result<ParsedEvent, EventError>,
     pub encode: fn(&ParsedEvent) -> Result<Vec<u8>, EventError>,
 }

@@ -4,33 +4,33 @@ Changes to this document require TLA+ model re-verification.
 
 ## Event Type Registry
 
-| Code | Rust Type | TLA+ Name | Wire Size | Share Scope | Signer Required | Sig Len | Signer Type |
-|------|-----------|-----------|-----------|-------------|-----------------|---------|-------------|
-| 1 | Message | Message | variable | Shared | No | 0 | — |
-| 2 | Reaction | MessageReaction | variable | Shared | No | 0 | — |
-| 3 | PeerKey | Peer | 41B | Shared | No | 0 | — |
-| 4 | SignedMemo | — | variable | Shared | Yes | 64 | 0 (peer) |
-| 5 | Encrypted | Encrypted | variable | Shared | No | 0 | — |
-| 6 | SecretKey | SecretKey | 41B | Local | No | 0 | — |
-| 7 | MessageDeletion | MessageDeletion | 73B | Shared | No | 0 | — |
-| 8 | Workspace | Workspace | 73B | Shared | No | 0 | — |
-| 9 | InviteAccepted | InviteAccepted | 73B | Local | No | 0 | — |
-| 10 | UserInviteBoot | UserInviteBoot | 170B | Shared | Yes | 64 | 1 (workspace) |
-| 11 | UserInviteOngoing | UserInviteOngoing | 170B | Shared | Yes | 64 | 5 (peer_shared) |
-| 12 | DeviceInviteFirst | DeviceInviteFirst | 138B | Shared | Yes | 64 | 4 (user) |
-| 13 | DeviceInviteOngoing | DeviceInviteOngoing | 138B | Shared | Yes | 64 | 5 (peer_shared) |
-| 14 | UserBoot | UserBoot | 138B | Shared | Yes | 64 | 2 (user_invite) |
-| 15 | UserOngoing | UserOngoing | 138B | Shared | Yes | 64 | 2 (user_invite) |
-| 16 | PeerSharedFirst | PeerSharedFirst | 138B | Shared | Yes | 64 | 3 (device_invite) |
-| 17 | PeerSharedOngoing | PeerSharedOngoing | 138B | Shared | Yes | 64 | 3 (device_invite) |
-| 18 | AdminBoot | AdminBoot | 170B | Shared | Yes | 64 | 1 (workspace) |
-| 19 | AdminOngoing | AdminOngoing | 170B | Shared | Yes | 64 | 5 (peer_shared) |
-| 20 | UserRemoved | UserRemoved | 138B | Shared | Yes | 64 | 5 (peer_shared) |
-| 21 | PeerRemoved | PeerRemoved | 138B | Shared | Yes | 64 | 5 (peer_shared) |
-| 22 | SecretShared | SecretShared | 202B | Shared | Yes | 64 | 5 (peer_shared) |
-| 23 | TransportKey | — | 41B | Shared | No | 0 | — |
-| 24 | MessageAttachment | — | variable | Shared | No | 0 | — |
-| 25 | FileSlice | — | variable | Shared | Yes | 64 | 5 (peer_shared) |
+| Code | Rust Type | TLA+ Name | Wire Size | Share Scope | Encryptable | Signer Required | Sig Len | Signer Type |
+|------|-----------|-----------|-----------|-------------|-------------|-----------------|---------|-------------|
+| 1 | Message | Message | variable | Shared | Yes | No | 0 | — |
+| 2 | Reaction | MessageReaction | variable | Shared | Yes | No | 0 | — |
+| 3 | PeerKey | Peer | 41B | Shared | — | No | 0 | — |
+| 4 | SignedMemo | — | variable | Shared | Yes | Yes | 64 | 0 (peer) |
+| 5 | Encrypted | Encrypted | variable | Shared | No | No | 0 | — |
+| 6 | SecretKey | SecretKey | 41B | Local | Yes | No | 0 | — |
+| 7 | MessageDeletion | MessageDeletion | 73B | Shared | Yes | No | 0 | — |
+| 8 | Workspace | Workspace | 73B | Shared | No | No | 0 | — |
+| 9 | InviteAccepted | InviteAccepted | 73B | Local | No | No | 0 | — |
+| 10 | UserInviteBoot | UserInviteBoot | 170B | Shared | No | Yes | 64 | 1 (workspace) |
+| 11 | UserInviteOngoing | UserInviteOngoing | 170B | Shared | No | Yes | 64 | 5 (peer_shared) |
+| 12 | DeviceInviteFirst | DeviceInviteFirst | 138B | Shared | No | Yes | 64 | 4 (user) |
+| 13 | DeviceInviteOngoing | DeviceInviteOngoing | 138B | Shared | No | Yes | 64 | 5 (peer_shared) |
+| 14 | UserBoot | UserBoot | 138B | Shared | No | Yes | 64 | 2 (user_invite) |
+| 15 | UserOngoing | UserOngoing | 138B | Shared | No | Yes | 64 | 2 (user_invite) |
+| 16 | PeerSharedFirst | PeerSharedFirst | 138B | Shared | No | Yes | 64 | 3 (device_invite) |
+| 17 | PeerSharedOngoing | PeerSharedOngoing | 138B | Shared | No | Yes | 64 | 3 (device_invite) |
+| 18 | AdminBoot | AdminBoot | 170B | Shared | No | Yes | 64 | 1 (workspace) |
+| 19 | AdminOngoing | AdminOngoing | 170B | Shared | No | Yes | 64 | 5 (peer_shared) |
+| 20 | UserRemoved | UserRemoved | 138B | Shared | No | Yes | 64 | 5 (peer_shared) |
+| 21 | PeerRemoved | PeerRemoved | 138B | Shared | No | Yes | 64 | 5 (peer_shared) |
+| 22 | SecretShared | SecretShared | 202B | Shared | No | Yes | 64 | 5 (peer_shared) |
+| 23 | TransportKey | — | 41B | Shared | No | No | 0 | — |
+| 24 | MessageAttachment | — | variable | Shared | Yes | No | 0 | — |
+| 25 | FileSlice | — | variable | Shared | Yes | Yes | 64 | 5 (peer_shared) |
 
 ## Signer Type Resolution
 
@@ -223,3 +223,25 @@ abstracting over the event graph.
 | InvTrustSourcesWellFormed | All trust table rows contain valid 32-byte SPKI fingerprints |
 | InvRevokedNotInBootstrapTrust | Revoked credentials not trusted via bootstrap paths |
 | InvMutualAuthSymmetry | Mutual CanAuthenticate requires both peers have active credentials |
+
+## TLA Verification Notes
+
+### collapse-encrypted-inner refactor (2026-02-16)
+
+This refactor collapses duplicated dep/signer/dispatch logic from `encrypted.rs`
+into shared pipeline stages without changing event semantics or projection outcomes.
+No TLA+ model changes were required because:
+
+1. The TLA+ model (`EventGraphSchema`) specifies *what* projections and guards hold,
+   not *how* the Rust pipeline is structured internally.
+2. Admissibility, dep checking, signer verification, and dispatch behavior are
+   unchanged — only the code path was unified.
+3. The `encryptable` metadata field on `EventTypeMeta` centralizes the admissible
+   inner type set previously hard-coded in `encrypted.rs`.
+
+TLC model check was not run because `tla2tools.jar` is not present in this worktree.
+When the JAR is restored, verify with:
+```
+cd docs/tla && ./tlc event_graph_schema_fast.cfg
+cd docs/tla && ./tlc transport_credential_lifecycle_fast.cfg
+```

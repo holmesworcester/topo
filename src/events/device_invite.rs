@@ -130,6 +130,7 @@ pub static DEVICE_INVITE_FIRST_META: EventTypeMeta = EventTypeMeta {
     dep_field_type_codes: &[&[]],
     signer_required: true,
     signature_byte_len: 64,
+    encryptable: false,
     parse: parse_device_invite_first,
     encode: encode_device_invite_first,
 };
@@ -143,6 +144,7 @@ pub static DEVICE_INVITE_ONGOING_META: EventTypeMeta = EventTypeMeta {
     dep_field_type_codes: &[&[]],
     signer_required: true,
     signature_byte_len: 64,
+    encryptable: false,
     parse: parse_device_invite_ongoing,
     encode: encode_device_invite_ongoing,
 };

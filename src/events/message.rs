@@ -120,6 +120,7 @@ pub static MESSAGE_META: EventTypeMeta = EventTypeMeta {
     dep_field_type_codes: &[&[]],
     signer_required: true,
     signature_byte_len: 64,
+    encryptable: true,
     parse: parse_message,
     encode: encode_message,
 };

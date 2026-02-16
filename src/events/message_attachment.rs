@@ -198,6 +198,7 @@ pub static MESSAGE_ATTACHMENT_META: EventTypeMeta = EventTypeMeta {
     dep_field_type_codes: &[&[1], &[6], &[]],
     signer_required: true,
     signature_byte_len: 64,
+    encryptable: true,
     parse: parse_message_attachment,
     encode: encode_message_attachment,
 };

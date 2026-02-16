@@ -123,6 +123,7 @@ pub static REACTION_TYPE_META: EventTypeMeta = EventTypeMeta {
     dep_field_type_codes: &[&[1], &[]],
     signer_required: true,
     signature_byte_len: 64,
+    encryptable: true,
     parse: parse_reaction,
     encode: encode_reaction,
 };

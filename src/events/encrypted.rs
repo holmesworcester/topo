@@ -109,6 +109,7 @@ pub static ENCRYPTED_META: EventTypeMeta = EventTypeMeta {
     dep_field_type_codes: &[&[6]],
     signer_required: false,
     signature_byte_len: 0,
+    encryptable: false,
     parse: parse_encrypted,
     encode: encode_encrypted,
 };

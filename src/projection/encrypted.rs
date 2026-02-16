@@ -8,21 +8,9 @@ use crate::events::{self, EncryptedEvent, EVENT_TYPE_ENCRYPTED};
 use super::decision::ProjectionDecision;
 use super::pipeline::{apply_projection, check_deps_and_block};
 
-/// Admissible inner event type codes for encrypted wrappers.
-/// Identity events, encrypted (nested), and bench_dep are not permitted.
-const ADMISSIBLE_INNER_TYPES: &[u8] = &[
-    1,  // message
-    2,  // reaction
-    4,  // signed_memo
-    6,  // secret_key
-    7,  // message_deletion
-    24, // message_attachment
-    25, // file_slice
-];
-
 /// Project an encrypted event: decrypt, parse inner, verify admissibility,
-/// then hand off to shared pipeline stages (dep check, dep type check,
-/// signer verify, projector dispatch).
+/// then hand off to shared pipeline stages (dep check, signer verify,
+/// projector dispatch).
 ///
 /// Wrapper-specific concerns handled here:
 ///   1. Secret-key resolve and decrypt
@@ -108,11 +96,19 @@ pub fn project_encrypted(
         });
     }
 
-    // 6. Reject disallowed inner families (identity events, bench_dep)
-    if !ADMISSIBLE_INNER_TYPES.contains(&inner_parsed.event_type_code()) {
-        return Ok(ProjectionDecision::Reject {
-            reason: "identity events cannot appear inside encrypted wrappers".to_string(),
-        });
+    // 6. Reject disallowed inner families via registry metadata
+    let inner_code = inner_parsed.event_type_code();
+    let inner_meta = events::registry().lookup(inner_code);
+    match inner_meta {
+        Some(m) if m.encryptable => {}
+        _ => {
+            return Ok(ProjectionDecision::Reject {
+                reason: format!(
+                    "event type {} is not admissible inside encrypted wrappers",
+                    inner_code
+                ),
+            });
+        }
     }
 
     // --- Shared pipeline stages (using outer event_id for block/reject anchoring) ---
