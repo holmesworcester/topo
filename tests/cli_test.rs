@@ -1,12 +1,6 @@
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use poc_7::db::{
-    open_connection,
-    schema::create_tables,
-    transport_trust::{record_invite_bootstrap_trust, record_pending_invite_bootstrap_trust},
-};
-
 fn bin() -> String {
     env!("CARGO_BIN_EXE_poc-7").to_string()
 }
@@ -131,50 +125,41 @@ fn get_messages(db: &str) -> Vec<String> {
         .collect()
 }
 
-fn seed_invite_bootstrap_trust(
-    db: &str,
-    recorded_by: &str,
-    trusted_peer_fp_hex: &str,
-    bootstrap_addr: &str,
-) {
-    let conn = open_connection(db).expect("failed to open db for bootstrap trust seed");
-    create_tables(&conn).expect("failed to create schema for bootstrap trust seed");
-
-    let raw = hex::decode(trusted_peer_fp_hex).expect("trusted peer fingerprint must be valid hex");
-    assert_eq!(raw.len(), 32, "trusted peer fingerprint must be 32 bytes");
-    let mut fp = [0u8; 32];
-    fp.copy_from_slice(&raw);
-
-    record_invite_bootstrap_trust(
-        &conn,
-        recorded_by,
-        "ia_bootstrap",
-        "invite_bootstrap",
-        "workspace_bootstrap",
-        bootstrap_addr,
-        &fp,
-    )
-    .expect("failed to insert invite bootstrap trust row");
+/// Helper: run invite-create CLI command. Returns the invite link printed to stdout.
+fn invite_create(db: &str, bind_addr: &str, expected_peer_hex: &str) -> String {
+    let output = Command::new(bin())
+        .arg("invite-create")
+        .arg("--db")
+        .arg(db)
+        .arg("--bind")
+        .arg(bind_addr)
+        .arg("--expected-peer")
+        .arg(expected_peer_hex)
+        .output()
+        .expect("failed to run invite-create");
+    assert!(
+        output.status.success(),
+        "invite-create failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
-fn seed_pending_invite_bootstrap_trust(db: &str, recorded_by: &str, expected_peer_fp_hex: &str) {
-    let conn = open_connection(db).expect("failed to open db for pending bootstrap trust seed");
-    create_tables(&conn).expect("failed to create schema for pending bootstrap trust seed");
-
-    let raw =
-        hex::decode(expected_peer_fp_hex).expect("expected peer fingerprint must be valid hex");
-    assert_eq!(raw.len(), 32, "expected peer fingerprint must be 32 bytes");
-    let mut fp = [0u8; 32];
-    fp.copy_from_slice(&raw);
-
-    record_pending_invite_bootstrap_trust(
-        &conn,
-        recorded_by,
-        "invite_pending_bootstrap",
-        "workspace_bootstrap",
-        &fp,
-    )
-    .expect("failed to insert pending bootstrap trust row");
+/// Helper: run invite-accept CLI command.
+fn invite_accept(db: &str, link: &str) {
+    let output = Command::new(bin())
+        .arg("invite-accept")
+        .arg("--db")
+        .arg(db)
+        .arg("--link")
+        .arg(link)
+        .output()
+        .expect("failed to run invite-accept");
+    assert!(
+        output.status.success(),
+        "invite-accept failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 /// Functional sync test. Uses --pin-peer for CLI bootstrap (not testing pinning policy).
@@ -376,6 +361,8 @@ fn test_cli_empty_pin_peer_fails() {
     );
 }
 
+/// Bootstrap trust test using production invite-create / invite-accept CLI flow.
+/// No direct SQL trust seeding — trust is materialized through CLI commands.
 #[test]
 fn test_cli_sync_bootstrap_from_accepted_invite_data() {
     let tmpdir = tempfile::tempdir().unwrap();
@@ -396,21 +383,21 @@ fn test_cli_sync_bootstrap_from_accepted_invite_data() {
     let alice_port = random_port();
     let bob_port = random_port();
 
-    let alice_fp = get_identity(&alice_db);
+    // Get transport identities (SPKI fingerprints).
+    let _alice_fp = get_identity(&alice_db);
     let bob_fp = get_identity(&bob_db);
 
-    // Simulate accepted invite link state:
-    // Bob trusts Alice from accepted invite metadata.
-    seed_invite_bootstrap_trust(
-        &bob_db,
-        &bob_fp,
-        &alice_fp,
+    // Alice creates invite, seeding pending bootstrap trust for Bob.
+    let invite_link = invite_create(
+        &alice_db,
         &format!("127.0.0.1:{}", alice_port),
+        &bob_fp,
     );
-    // Alice trusts Bob from pending invite bootstrap metadata.
-    seed_pending_invite_bootstrap_trust(&alice_db, &alice_fp, &bob_fp);
 
-    // No CLI pins required when bootstrap trust is present in SQL.
+    // Bob accepts invite link, seeding bootstrap trust for Alice.
+    invite_accept(&bob_db, &invite_link);
+
+    // No CLI pins required when bootstrap trust is present from invite flow.
     let mut alice = start_sync(&alice_db, alice_port, None, &[]);
     std::thread::sleep(Duration::from_millis(500));
 
