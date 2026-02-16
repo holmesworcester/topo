@@ -13,7 +13,9 @@ use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
 use crate::db::{
     open_connection,
     schema::create_tables,
-    transport_trust::{allowed_peers_from_db, import_cli_pins_to_sql, is_peer_allowed},
+    transport_trust::{
+        allowed_peers_from_db, import_cli_pins_to_sql, is_peer_allowed,
+    },
 };
 use crate::events::{
     DeviceInviteFirstEvent, InviteAcceptedEvent, MessageDeletionEvent, MessageEvent, ParsedEvent,
@@ -73,6 +75,12 @@ impl From<hex::FromHexError> for ServiceError {
 
 impl From<Box<dyn std::error::Error + Send + Sync>> for ServiceError {
     fn from(e: Box<dyn std::error::Error + Send + Sync>) -> Self {
+        ServiceError(e.to_string())
+    }
+}
+
+impl From<crate::invite_link::InviteLinkError> for ServiceError {
+    fn from(e: crate::invite_link::InviteLinkError) -> Self {
         ServiceError(e.to_string())
     }
 }
