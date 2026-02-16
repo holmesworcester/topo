@@ -12,7 +12,7 @@ use crate::events::{self, registry, ParsedEvent};
 
 /// Check that each dep's type code matches the allowed types for that dep field.
 /// Returns Some(reason) if a type mismatch is found, None if all pass.
-fn check_dep_types(
+pub(crate) fn check_dep_types(
     conn: &Connection,
     deps: &[(&str, EventId)],
     type_codes: &[&[u8]],
@@ -46,7 +46,7 @@ fn check_dep_types(
 }
 
 /// Record a rejected event durably so it is not re-processed on replay or cascade.
-fn record_rejection(conn: &Connection, recorded_by: &str, event_id_b64: &str, reason: &str) {
+pub(crate) fn record_rejection(conn: &Connection, recorded_by: &str, event_id_b64: &str, reason: &str) {
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -58,9 +58,55 @@ fn record_rejection(conn: &Connection, recorded_by: &str, event_id_b64: &str, re
     );
 }
 
+/// Check dep presence against valid_events (tenant-scoped). If any deps are
+/// missing, write block rows (blocked_event_deps + blocked_events header) keyed
+/// to the caller-provided `event_id_b64` and return `Some(Block { missing })`.
+/// Returns `None` if all deps are satisfied.
+pub(crate) fn check_deps_and_block(
+    conn: &Connection,
+    recorded_by: &str,
+    event_id_b64: &str,
+    deps: &[(&str, EventId)],
+) -> Result<Option<ProjectionDecision>, Box<dyn std::error::Error>> {
+    let mut missing = Vec::new();
+    for (_field_name, dep_id) in deps {
+        let dep_b64 = event_id_to_base64(dep_id);
+        let dep_valid: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &dep_b64],
+            |row| row.get(0),
+        )?;
+        if !dep_valid {
+            missing.push(*dep_id);
+        }
+    }
+
+    if missing.is_empty() {
+        return Ok(None);
+    }
+
+    missing.sort_unstable();
+    missing.dedup();
+    for dep_id in &missing {
+        let dep_b64 = event_id_to_base64(dep_id);
+        conn.execute(
+            "INSERT OR IGNORE INTO blocked_event_deps (peer_id, event_id, blocker_event_id)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![recorded_by, event_id_b64, &dep_b64],
+        )?;
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO blocked_events (peer_id, event_id, deps_remaining)
+         VALUES (?1, ?2, ?3)",
+        rusqlite::params![recorded_by, event_id_b64, missing.len() as i64],
+    )?;
+
+    Ok(Some(ProjectionDecision::Block { missing }))
+}
+
 /// Shared projection helper: verify signer (if required), dispatch to per-event
 /// projector, return Valid or Reject. Caller is responsible for dep checks.
-fn apply_projection(
+pub(crate) fn apply_projection(
     conn: &Connection,
     recorded_by: &str,
     event_id_b64: &str,
@@ -219,39 +265,10 @@ fn project_one_core(
         }
     };
 
-    // 4. Extract deps and check them
+    // 4-5. Check dep presence and write block rows if missing
     let deps = parsed.dep_field_values();
-    let mut missing = Vec::new();
-    for (_field_name, dep_id) in &deps {
-        let dep_b64 = event_id_to_base64(dep_id);
-        let dep_valid: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, &dep_b64],
-            |row| row.get(0),
-        )?;
-        if !dep_valid {
-            missing.push(*dep_id);
-        }
-    }
-
-    // 5. If missing deps — write to blocked_event_deps + blocked_events header
-    if !missing.is_empty() {
-        missing.sort_unstable();
-        missing.dedup();
-        for dep_id in &missing {
-            let dep_b64 = event_id_to_base64(dep_id);
-            conn.execute(
-                "INSERT OR IGNORE INTO blocked_event_deps (peer_id, event_id, blocker_event_id)
-                 VALUES (?1, ?2, ?3)",
-                rusqlite::params![recorded_by, &event_id_b64, &dep_b64],
-            )?;
-        }
-        conn.execute(
-            "INSERT OR IGNORE INTO blocked_events (peer_id, event_id, deps_remaining)
-             VALUES (?1, ?2, ?3)",
-            rusqlite::params![recorded_by, &event_id_b64, missing.len() as i64],
-        )?;
-        return Ok((ProjectionDecision::Block { missing }, Some(parsed)));
+    if let Some(block) = check_deps_and_block(conn, recorded_by, &event_id_b64, &deps)? {
+        return Ok((block, Some(parsed)));
     }
 
     // 5b. Dep type checking — verify each dep's type code matches expectations
