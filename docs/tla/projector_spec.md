@@ -87,7 +87,7 @@ Changes to this document require TLA+ model re-verification.
 | 2 | project_reaction | reactions | skip if target deleted |
 | 3 | retired (peer_key) | — | rejected as unknown type |
 | 4 | project_signed_memo | signed_memos | — |
-| 5 | project_encrypted | (dispatches inner) | decrypt + inner dispatch |
+| 5 | project_encrypted | (dispatches inner) | decrypt → admissibility check → shared dep/signer/dispatch stages |
 | 6 | project_secret_key | secret_keys | — |
 | 7 | project_message_deletion | deleted_messages | author auth + cascade |
 | 8 | project_workspace | workspaces | TrustAnchorMatch guard |
@@ -108,6 +108,44 @@ Changes to this document require TLA+ model re-verification.
 | 23 | project_transport_key | transport_keys | — |
 | 24 | project_message_attachment | message_attachments | — |
 | 25 | project_file_slice | file_slices | signature verification |
+
+## Shared Pipeline Stages
+
+One staged dependency/signer/dispatch engine is reused for both cleartext
+outer events and decrypted inner events from encrypted wrappers.
+
+### Shared stages (pipeline.rs)
+
+| Stage | Function | Description |
+|-------|----------|-------------|
+| Dep presence | `check_deps_and_block` | Check deps against `valid_events`; write `blocked_event_deps` + `blocked_events` rows keyed to caller-provided `event_id_b64` if missing |
+| Dep type check | `check_dep_types` | Verify each dep's type code matches registry expectations (cleartext path only; skipped for encrypted inner events whose dep targets may be encrypted wrappers) |
+| Signer verify + dispatch | `apply_projection` | Resolve signer key, verify Ed25519 signature, dispatch to per-event projector |
+| Rejection recording | `record_rejection` | Write durable rejection to `rejected_events` |
+
+### Cleartext event path (project_one_core)
+
+1. Terminal check (already valid/rejected?)
+2. Load blob + parse
+3. Dep presence → `check_deps_and_block`
+4. Dep type check → `check_dep_types`
+5. Signer verify + dispatch → `apply_projection`
+6. Write `valid_events`
+
+### Encrypted inner event path (project_encrypted)
+
+Wrapper-specific logic (steps 1-6 below), then shared stages (step 7-8):
+
+1. Secret-key resolve from `secret_keys` table
+2. AES-256-GCM decrypt
+3. Parse inner event
+4. Verify `inner_type_code` consistency
+5. Reject nested encryption (inner type = 5)
+6. Reject disallowed inner families (identity events, bench_dep)
+7. Inner dep presence → `check_deps_and_block` (block rows keyed to **outer** encrypted `event_id`)
+8. Inner signer verify + dispatch → `apply_projection` (signing bytes = decrypted plaintext)
+
+Block/reject/valid state is always anchored to the outer encrypted event_id.
 
 ## Wire Formats
 
