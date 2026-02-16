@@ -1,18 +1,18 @@
-# Feedback: Issue 7 - Atomicity and Upsert Policy
+# Feedback: plan/cli-bootstrap-test-realism
 
-## Findings
+## Branch snapshot
+- Branch: `plan/cli-bootstrap-test-realism`
+- Ahead/behind vs `origin/master`: `ahead 2`, `behind 0`
+- Commit 1: `dd416e1` Replace direct SQL trust seeding with invite-create/invite-accept CLI commands
+- Commit 2: `b945eb7` Address feedback: service-layer routing, deterministic invite SPKI, naming alignment
 
-1. No blocking correctness issues found in reviewed scope.
-2. Low: Current tests cover rollback atomicity and in-place upsert behavior well, but there is still residual risk around higher-concurrency write contention patterns not covered by focused unit tests.
+## Verification run
+- `cargo test --test cli_test -q` ✅ pass
+- `cargo test --test rpc_test -q` ✅ pass
+- `cargo test --test scenario_test -q` ✅ pass
+- `cargo test --test interactive_test -q` ✅ pass
 
-## Evidence
-
-- Passed:
-  - `test_drain_atomicity_no_split_state`
-  - `test_drain_rollback_on_projector_failure`
-  - `test_invite_bootstrap_trust_upsert_updates_in_place`
-  - `test_pending_invite_bootstrap_trust_upsert_updates_in_place`
-
-## Summary
-
-The transactional dequeue/project changes and `ON CONFLICT DO UPDATE` migration look solid for single-flow correctness.
+## Findings (all resolved in commit 2)
+1. ~~High: logic split between CLI and service layer~~ → Fixed: logic moved to `service::create_invite` / `service::accept_invite`; CLI commands are thin wrappers.
+2. ~~Medium: `--expected-peer` fingerprint required up front~~ → Fixed: removed. Inviter derives expected SPKI from invite key via `expected_invite_bootstrap_spki_from_invite_key()`. Invitee installs deterministic transport cert via `install_invite_bootstrap_transport_identity()`.
+3. ~~Medium: naming divergence~~ → Fixed: renamed to `create-invite` / `accept-invite`.
