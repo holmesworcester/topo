@@ -294,8 +294,48 @@ async fn test_three_peer_intro_happy_path() {
     ep_b.close(0u32.into(), b"done");
 }
 
+/// TRUST BOUNDARY TEST: Dynamic trust rejects unknown peer at handshake.
+/// When no SQL trust row exists for a peer, the dynamic trust lookup
+/// should reject the TLS handshake (connection fails).
+#[tokio::test]
+async fn test_dynamic_trust_rejects_unknown_peer() {
+    let peer_a = Peer::new("dyn_reject_a");
+    let unknown = Peer::new("dyn_reject_unknown");
+
+    // A has a dynamic-trust endpoint but NO trust rows seeded for `unknown`.
+    let ep_a = create_dynamic_endpoint_for_peer(&peer_a);
+    let addr_a = ep_a.local_addr().expect("addr_a");
+
+    let a_db = peer_a.db_path.clone();
+    let a_id = peer_a.identity.clone();
+    let a_ep = ep_a.clone();
+    let _a_accept = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all().build().unwrap();
+        rt.block_on(async move {
+            let _ = accept_loop(&a_db, &a_id, a_ep).await;
+        });
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Unknown peer tries to connect to A — should fail at TLS handshake
+    // because A's dynamic trust lookup finds no matching row.
+    let ep_unknown = create_dynamic_endpoint_for_peer(&unknown);
+    let result = ep_unknown.connect(addr_a, "localhost")
+        .expect("initiate connect")
+        .await;
+
+    assert!(result.is_err(), "connection should fail: A has no trust row for unknown peer");
+    eprintln!("Dynamic trust rejection confirmed: {:?}", result.unwrap_err());
+
+    ep_a.close(0u32.into(), b"done");
+    ep_unknown.close(0u32.into(), b"done");
+}
+
 /// TRUST BOUNDARY TEST: Stale intro rejected.
 /// Expired expires_at_ms should result in status='expired'.
+/// Uses static pinning — this test exercises intro validation logic,
+/// not transport trust resolution.
 #[tokio::test]
 async fn test_stale_intro_rejected() {
     let intro = Peer::new("stale_introducer");
@@ -304,7 +344,7 @@ async fn test_stale_intro_rejected() {
     let fp_i = intro.spki_fingerprint();
     let fp_a = peer_a.spki_fingerprint();
 
-    // Create an endpoint for A that trusts I
+    // Static pin: A trusts only I (pinning policy is the thing under test here)
     let (cert_a, key_a) = peer_a.cert_and_key();
     let allowed_a = Arc::new(AllowedPeers::from_fingerprints(vec![fp_i]));
     let ep_a = create_dual_endpoint(
@@ -377,6 +417,8 @@ async fn test_stale_intro_rejected() {
 
 /// TRUST BOUNDARY TEST: Untrusted target rejected.
 /// other_peer_id not in allowed set.
+/// Uses static pinning — this test exercises intro target trust validation,
+/// not transport trust resolution.
 #[tokio::test]
 async fn test_untrusted_peer_intro_rejected() {
     let intro = Peer::new("untrust_introducer");
@@ -385,8 +427,8 @@ async fn test_untrusted_peer_intro_rejected() {
     let fp_i = intro.spki_fingerprint();
     let fp_a = peer_a.spki_fingerprint();
 
+    // Static pin: A only trusts I, not the introduced peer (pinning policy under test)
     let (cert_a, key_a) = peer_a.cert_and_key();
-    // A only trusts I, not the introduced peer
     let allowed_a = Arc::new(AllowedPeers::from_fingerprints(vec![fp_i]));
     let ep_a = create_dual_endpoint(
         "127.0.0.1:0".parse().unwrap(), cert_a, key_a, allowed_a,
