@@ -729,8 +729,9 @@ Self-invite bootstrap stays explicit:
 
 Guard placement rules:
 1. trust-anchor guard applies to root workspace events only; foreign root ids must not become valid,
-2. `invite_accepted` uses invite-presence gating (`HasRecordedInvite`) in peer scope, not workspace-root gating — invite material must be recorded in the same peer scope before `invite_accepted` can become valid,
-3. bootstrap transport trust is persisted in SQL and queried at connection creation time; projected peer keys are not treated as in-memory-only authority.
+2. `invite_accepted` is a local trust-anchor binding event (no invite-presence dependency gate). In peer scope, it binds anchor from carried `workspace_id` with first-write-wins; a conflicting `workspace_id` for an already anchored peer is rejected,
+3. new user/device/peer identities are still gated by normal signer/dependency validation in the same peer scope (for example `user_boot -> user_invite`, `peer_shared -> device_invite`),
+4. bootstrap transport trust is persisted in SQL and queried at connection creation time; projected peer keys are not treated as in-memory-only authority.
 
 ## 9.4 Sender-subjective encryption baseline
 

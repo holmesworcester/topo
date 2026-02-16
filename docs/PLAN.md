@@ -6,27 +6,27 @@
 
 This document is ordered exactly as we should build it.
 
-1. `Phase -1`: CLI + daemon around the current simple prototype.
-2. `Phase 0`: mTLS + QUIC transport baseline finalized.
-3. `Phase 0.5`: Provisional multi-workspace/tenant routing smoke test (CLI-supplied key material).
-4. `Phase 1`: Event schema, recording semantics, and multitenancy foundation.
-5. `Phase 2`: Projector core and dependency blocking (without full queue complexity).
-6. `Phase 2.5`: Shared signer substrate (`signed_by` dependency blocking + signature verification ordering).
-7. `Phase 2.6`: Multitenancy scoped-projection/query gate (with signer substrate active).
-8. `Phase 3`: Encrypted events using the same dependency/projector model, tested first with per-instance PSK.
-9. `Phase 4`: Durable queue architecture (`ingress`, `project`, `egress`) and workers.
-10. `Phase 5`: Non-identity special-case projector logic (deletion/emitted-events).
-11. `Phase 6`: Performance hardening, observability, scaling, and low-memory iOS mode.
-12. `Phase 7`: TLA-first minimal identity layer for trust-anchor cascade, removal, and sender-subjective encryption.
-13. `Phase 8`: Functional multitenancy — one node hosting N tenant identities in a shared DB with per-tenant QUIC endpoints and mDNS discovery.
+1. `Phase 1`: CLI + daemon around the current simple prototype.
+2. `Phase 2`: mTLS + QUIC transport baseline finalized.
+3. `Phase 3`: Provisional multi-workspace/tenant routing smoke test (CLI-supplied key material).
+4. `Phase 4`: Event schema, recording semantics, and multitenancy foundation.
+5. `Phase 5`: Projector core and dependency blocking (without full queue complexity).
+6. `Phase 6`: Shared signer substrate (`signed_by` dependency blocking + signature verification ordering).
+7. `Phase 7`: Multitenancy scoped-projection/query gate (with signer substrate active).
+8. `Phase 8`: Encrypted events using the same dependency/projector model, tested first with per-instance PSK.
+9. `Phase 9`: Durable queue architecture (`ingress`, `project`, `egress`) and workers.
+10. `Phase 10`: Non-identity special-case projector logic (deletion/emitted-events).
+11. `Phase 11`: Performance hardening, observability, scaling, and low-memory iOS mode.
+12. `Phase 12`: TLA-first minimal identity layer for trust-anchor cascade, removal, and sender-subjective encryption.
+13. `Phase 13`: Functional multitenancy — one node hosting N tenant identities in a shared DB with per-tenant QUIC endpoints and mDNS discovery.
 
 Scheduling note:
 - two-tier multitenancy plan:
-  - Phase 0.5 proves provisional transport/workspace separation and CLI workspace views.
-  - Phase 2.6 proves scoped projection/query separation once projector + signer substrate exist.
-- `signed_by` dependency blocking + signature verification ordering is tackled in Phase 2.5.
-- Phase 2.5 and Phase 2.6 must be complete before starting identity projectors in Phase 7.
-- Phase 8 depends on Phase 7 identity flows (bootstrap_workspace, accept_user_invite) being stable.
+  - Phase 3 proves provisional transport/workspace separation and CLI workspace views.
+  - Phase 7 proves scoped projection/query separation once projector + signer substrate exist.
+- `signed_by` dependency blocking + signature verification ordering is tackled in Phase 6.
+- Phase 6 and Phase 7 must be complete before starting identity projectors in Phase 12.
+- Phase 13 depends on Phase 12 identity flows (bootstrap_workspace, accept_user_invite) being stable.
 
 ## 1.1 `codex-simplified` baseline gap audit (current state)
 
@@ -48,19 +48,19 @@ Current code in `poc-7` (post-move from `codex-simplified`) is a useful sync pro
 8. No shared signer substrate yet:
    - no uniform `signed_by` dependency blocking + signature verification ordering across event types.
 9. No two-tier multitenancy verification yet:
-   - no Phase 0.5 routing smoke coverage and no post-projector scoped-projection gate.
+   - no Phase 3 routing smoke coverage and no post-projector scoped-projection gate.
 
 Gap-to-phase mapping:
-- wire framing + schema normalization -> `Phase 1`
-- strict pinned mTLS -> `Phase 0`
-- provisional workspace routing smoke -> `Phase 0.5`
-- projector entrypoint + dep/blocking core -> `Phase 2`
-- shared signer dependency + signature pipeline -> `Phase 2.5`
-- scoped multitenancy projection/query gate -> `Phase 2.6`
-- encryption adapter + key deps -> `Phase 3`
-- queue/worker architecture -> `Phase 4`
-- deletion/emits explicit rules -> `Phase 5`
-- trust-anchor/invite/removal/sender-keys -> `Phase 7`
+- wire framing + schema normalization -> `Phase 4`
+- strict pinned mTLS -> `Phase 2`
+- provisional workspace routing smoke -> `Phase 3`
+- projector entrypoint + dep/blocking core -> `Phase 5`
+- shared signer dependency + signature pipeline -> `Phase 6`
+- scoped multitenancy projection/query gate -> `Phase 7`
+- encryption adapter + key deps -> `Phase 8`
+- queue/worker architecture -> `Phase 9`
+- deletion/emits explicit rules -> `Phase 10`
+- trust-anchor/invite/removal/sender-keys -> `Phase 12`
 
 ---
 
@@ -80,9 +80,10 @@ Gap-to-phase mapping:
 - No per-event transit wrapper. QUIC + mTLS secures the channel.
 - Use separate tables for permanent canonical data vs operational queues.
 - Use separate invite event types (`user_invite`, `device_invite`), not one multimodal invite with `mode=*`.
-- `invite_accepted` is local trust-anchor binding and follows `poc-6` guard semantics:
-  - it requires invite material to be recorded in the same peer scope (`HasRecordedInvite`),
-  - it is not gated by the root-workspace trust-anchor guard itself.
+- `invite_accepted` is local trust-anchor binding:
+  - it binds trust anchor from carried `workspace_id` in peer scope (first-write-wins),
+  - it is not gated by the root-workspace trust-anchor guard itself,
+  - conflicting `workspace_id` for an already anchored peer scope is rejected.
 - Trust-anchor guards apply to root workspace events (foreign root ids must not become valid).
 - Deterministic emitted event types stay inside the emitted-event rule flow but are unsigned for determinism (`no signed_by/signer_type/signature`).
 
@@ -120,7 +121,7 @@ These are required, not optional:
 
 ---
 
-## 3. Phase -1: CLI + Daemon First
+## 3. Phase 1: CLI + Daemon First
 
 Build this before queue complexity.
 
@@ -148,7 +149,7 @@ Build this before queue complexity.
 
 ### Status: COMPLETE
 
-Phase -1 is functionally complete. All deliverables are met:
+Phase 1 is functionally complete. All deliverables are met:
 - `sync`, `send`, `messages`, `status`, `generate` CLI commands work.
 - `assert-now` and `assert-eventually` commands enable deterministic scripting.
 - CLI integration tests use assert commands (no ad-hoc wait helpers).
@@ -156,7 +157,7 @@ Phase -1 is functionally complete. All deliverables are met:
 
 ---
 
-## 4. Phase 0: mTLS + QUIC Baseline
+## 4. Phase 2: mTLS + QUIC Baseline
 
 ### Deliverables
 
@@ -166,8 +167,8 @@ Phase -1 is functionally complete. All deliverables are met:
 ### Invariants
 
 - No transit event wrapping layer in this model.
-- Phase 0 does not require event signature/dependency implementation.
-- Event signature/dependency enforcement is delivered in Phase 2.5 (`signed_by` blocking + signature verification ordering).
+- Phase 2 does not require event signature/dependency implementation.
+- Event signature/dependency enforcement is delivered in Phase 6 (`signed_by` blocking + signature verification ordering).
 - Transport authentication must remain separate from event authorization semantics.
 
 ### Exit criteria
@@ -177,7 +178,7 @@ Phase -1 is functionally complete. All deliverables are met:
 
 ## 4.1 mTLS implementation (current state)
 
-Phase 0 mTLS is implemented in the main codebase:
+Phase 2 mTLS is implemented in the main codebase:
 - `src/transport/mod.rs`: `PinnedCertVerifier` with BLAKE2b-256 SPKI fingerprint pinning (both client and server).
 - `src/transport/cert.rs`: self-signed certificate generation and SPKI extraction helpers.
 
@@ -189,7 +190,7 @@ Historical reference branches (`poc-7-mtls`, `poc-7=codex-attempt`) are no longe
    - certificate DER
    - private key PKCS#8 DER
    - extracted SPKI bytes (for pinning / identity lookup)
-2. Current Phase 0 implementation status (transitional):
+2. Current Phase 2 implementation status (transitional):
    - daemon startup config supplies allowed remote cert public keys (SPKI pins).
    - local cert/key are file-backed per profile.
 3. Required end-state trust source:
@@ -201,7 +202,7 @@ Historical reference branches (`poc-7-mtls`, `poc-7=codex-attempt`) are no longe
      - not CLI/file pin lists as authority.
    - shorthand model term: `TrustedPeerSet = transport_keys U invite_bootstrap_trust U pending_invite_bootstrap_trust`.
    - trust inputs are not only `invite`/`invite_accepted`; they include the full identity policy graph (for example peer/user/device/admin/removal state).
-4. TODO (retrofit completed Phase 0 implementation before Phase 7 is done):
+4. TODO (retrofit completed Phase 2 implementation before Phase 12 is done):
    - remove CLI/profile SPKI allowlist as trust authority.
    - keep CLI pin input only as optional diagnostics/bootstrap import helper.
    - keep file cert/key only as optional cache/materialization artifact, not authority.
@@ -218,7 +219,7 @@ Historical reference branches (`poc-7-mtls`, `poc-7=codex-attempt`) are no longe
 10. Scope for this phase: invited-member allowlist only.
    - do not implement removal/disconnection policy yet.
 11. Identity-phase migration rule:
-   - once Phase 7 identity model lands, transport policy runs from projected identity events (`peer_id -> cert SPKI`) and related projected policy rows.
+   - once Phase 12 identity model lands, transport policy runs from projected identity events (`peer_id -> cert SPKI`) and related projected policy rows.
 12. TLS key material modeling rule (end-state):
    - local TLS cert/public/private key material is represented by local events with normal dependency ordering.
    - runtime may materialize active TLS objects from projected event state.
@@ -228,10 +229,10 @@ Historical reference branches (`poc-7-mtls`, `poc-7=codex-attempt`) are no longe
 
 1. Port cert helper types/functions from mtls branch (`SelfSignedCert`, base64 SPKI helpers).
 2. Add `PeerKeyStore` trait + concrete store:
-   - transitional source: CLI/profile allowlist of permitted SPKI pins (completed Phase 0 behavior).
+   - transitional source: CLI/profile allowlist of permitted SPKI pins (completed Phase 2 behavior).
    - required source: projected identity mapping (`peer_id -> expected SPKI`) and related projected policy state.
    - reverse lookup by `SPKI -> peer_id` once identity mapping exists.
-   - TODO (retrofit completed Phase 0 behavior): switch verifier default from transitional source to projected source.
+   - TODO (retrofit completed Phase 2 behavior): switch verifier default from transitional source to projected source.
 3. Add `PinnedCertVerifier` implementing:
    - `rustls::client::danger::ServerCertVerifier`
    - `rustls::verify::ClientCertVerifier` (or `rustls::server::danger::ClientCertVerifier` depending on rustls version in branch)
@@ -264,7 +265,7 @@ Historical reference branches (`poc-7-mtls`, `poc-7=codex-attempt`) are no longe
 
 ---
 
-## 4.5 Phase 0.5: Provisional Multi-Workspace Routing Smoke
+## 4.5 Phase 3: Provisional Multi-Workspace Routing Smoke
 
 Goal: validate basic workspace/tenant separation early, before deep projector/identity complexity.
 
@@ -278,8 +279,8 @@ Goal: validate basic workspace/tenant separation early, before deep projector/id
 ### Scope boundaries
 
 - This is a routing/scope smoke phase, not full identity semantics.
-- It uses the same temporary trust source as Phase 0 (CLI/profile allowlist), not identity events.
-- Signature/dependency enforcement is still deferred to Phase 2.5.
+- It uses the same temporary trust source as Phase 2 (CLI/profile allowlist), not identity events.
+- Signature/dependency enforcement is still deferred to Phase 6.
 
 ### Exit criteria
 
@@ -289,13 +290,13 @@ Goal: validate basic workspace/tenant separation early, before deep projector/id
 
 ---
 
-## 5. Phase 1: Event Schema, Recording Semantics, and Multitenancy Foundation
+## 5. Phase 4: Event Schema, Recording Semantics, and Multitenancy Foundation
 
 ## 5.1 Single-source event schema
 
 Define event shape once and drive these from it:
 - wire encode/decode
-- canonical signing bytes metadata (consumed by signer substrate in Phase 2.5)
+- canonical signing bytes metadata (consumed by signer substrate in Phase 6)
 - signer metadata fields (`signed_by`, `signer_type`, `signature`)
 - validation scaffolding
 - projector auto-row mapping metadata
@@ -326,7 +327,7 @@ This supports large events like `file_slice` while keeping deterministic signing
   - for fixed-size event types it must exactly match schema size,
   - for variable-size types decoder must consume exactly `payload_len`,
   - any mismatch rejects the frame.
-- do not keep any global fixed event blob size constant once Phase 1 is complete.
+- do not keep any global fixed event blob size constant once Phase 4 is complete.
 
 ## 5.3 Signer and recording semantics (explicit)
 
@@ -437,7 +438,7 @@ Why this rule exists:
 
 ## 5.7 Replay-idempotency harness baseline (required)
 
-Phase 1 must introduce a standard event-store replay harness and make it mandatory for scenario coverage.
+Phase 4 must introduce a standard event-store replay harness and make it mandatory for scenario coverage.
 
 Required checks per tenant scope (`recorded_by`):
 1. replay-once: rebuild projection state from canonical event store order and compare with baseline.
@@ -451,7 +452,7 @@ Harness policy:
 
 ---
 
-## 6. Phase 2: Projector Core Before Full Queues
+## 6. Phase 5: Projector Core Before Full Queues
 
 Implement projection semantics before adding heavy queue machinery.
 
@@ -484,7 +485,7 @@ DRY split (required):
 - Shared projection pipeline code owns:
   1. canonical event load/decode dispatch,
   2. dependency extraction + missing-dependency block writes,
-  3. signer resolution + signature verification ordering (Phase 2.5),
+  3. signer resolution + signature verification ordering (Phase 6),
   4. terminal state writes (`valid`/`block`/`reject`) + queue transitions,
   5. generic effect application (`auto_row`, `emit_events`, common write helpers).
 - Per-event projector code owns only:
@@ -522,7 +523,7 @@ Deterministic emitted-event exception (still under this rule):
 
 - `message_deletion` and deletion cascade rules.
 - deterministic emitted-event patterns (for example key material derivations) using the unsigned deterministic exception above.
-- identity-specific exceptions (`invite_accepted`, removal enforcement) are deferred to Phase 7.
+- identity-specific exceptions (`invite_accepted`, removal enforcement) are deferred to Phase 12.
 
 ## 6.2 Dependency handling (blocked-only first)
 
@@ -605,7 +606,7 @@ Usually not required at this stage, but useful if blocker behavior gets ambiguou
 - verify multi-blocker convergence and no-lost-unblock behavior,
 - then map those guards directly into projector dependency checks.
 
-## 6.6 Phase 2.5: Shared signer substrate (required before identity)
+## 6.6 Phase 6: Shared signer substrate (required before identity)
 
 Implement one signer pipeline for all signed event types:
 1. signer metadata is schema-declared (`signed_by`, `signer_type`, `signature`).
@@ -615,9 +616,9 @@ Implement one signer pipeline for all signed event types:
 5. signer verification helper path is shared across signed event families (no identity-specific signer path later).
 6. deterministic emitted event types are explicitly schema-marked unsigned (`signer_required=false`) and excluded from signer-stage enforcement.
 
-This phase should be completed immediately after Phase 2 and before Phase 3/Phase 7 work.
+This phase should be completed immediately after Phase 5 and before Phase 8/Phase 12 work.
 
-## 6.7 Phase 2.6: Multitenancy Scoped Projection/Query Gate (Tier 2)
+## 6.7 Phase 7: Multitenancy Scoped Projection/Query Gate (Tier 2)
 
 Goal: validate full tenant/workspace scoping after projector + signer substrate are active.
 
@@ -631,14 +632,14 @@ Required checks:
 Exit criteria:
 1. Cross-tenant leak tests fail correctly when scope guards are removed.
 2. Re-enable scope guards and pass full scoped projection/query suite.
-3. This gate passes before identity projector implementation (Phase 7).
+3. This gate passes before identity projector implementation (Phase 12).
 
 ---
 
-## 7. Phase 3: Encrypted Events With The Same Model
+## 7. Phase 8: Encrypted Events With The Same Model
 
 Goal: encrypted events behave like normal events for dependencies and projection.
-Precondition: Phase 2.5 signer substrate and Phase 2.6 multitenancy gate are already active.
+Precondition: Phase 6 signer substrate and Phase 7 multitenancy gate are already active.
 
 ## 7.1 Registry integration
 
@@ -704,11 +705,11 @@ Start encryption correctness with a deliberately crude harness before identity k
 4. Keep all replay/reorder invariants enabled while on PSK mode.
 
 This isolates queue/projection/dependency correctness from identity/envelope complexity.
-- keep the same key-wrap event type + projector logic that will be used in Phase 7 identity sender-keys; only key source differs.
+- keep the same key-wrap event type + projector logic that will be used in Phase 12 identity sender-keys; only key source differs.
 
 ---
 
-## 8. Phase 4: Durable Queues and Workers
+## 8. Phase 9: Durable Queues and Workers
 
 Add full queue machinery after projection + signer + encryption semantics are stable.
 
@@ -862,7 +863,7 @@ Do not add in-memory dedup sets in front of `INSERT OR IGNORE` writers:
 
 ---
 
-## 9. Phase 5: Special Cases That Stay Explicit
+## 9. Phase 10: Special Cases That Stay Explicit
 
 These should not be forced into generic auto-write behavior.
 
@@ -874,7 +875,7 @@ Deletion is special and should remain explicit.
 
 ---
 
-## 10. Phase 6: Performance + Operational Hardening
+## 10. Phase 11: Performance + Operational Hardening
 
 Start simple, then tune.
 
@@ -979,15 +980,15 @@ Test families (in `sync_graph_test.rs`):
 
 ---
 
-## 11. Phase 7: Minimal Identity Layer + Crude Sender-Subjective Encryption
+## 11. Phase 12: Minimal Identity Layer + Crude Sender-Subjective Encryption
 
 This is a final functional phase after the core projection/queue path is stable.
-Prerequisite: Phase 2.5 signer substrate is complete before identity projector implementation begins.
+Prerequisite: Phase 6 signer substrate is complete before identity projector implementation begins.
 
 ## 11.1 Phase gate: TLA+ causal model first
 
 Before writing identity/removal/encryption projectors in Rust:
-1. Confirm signer pipeline from Phase 2.5 is active:
+1. Confirm signer pipeline from Phase 6 is active:
    - missing `signed_by` dependency blocks,
    - unblocked signer enables signature verification,
    - invalid signature rejects (not block).
@@ -997,7 +998,8 @@ Before writing identity/removal/encryption projectors in Rust:
 5. **Model invite-derived trust anchor binding**: the trust anchor must bind deterministically to the workspace referenced by the invite, not by a free nondeterministic choice at `invite_accepted` time. The model captures which workspace an invite references when the first invite is recorded (`inviteCarriedWorkspace` variable); `invite_accepted` then reads `inviteCarriedWorkspace` to set the trust anchor. This ensures the binding mechanism is faithful to the real protocol where the invite blob carries a `workspace_id`. See `InvTrustAnchorMatchesCarried` invariant.
 6. **Model guard placement explicitly (poc-6 parity)**:
    - trust-anchor guard applies to root workspace events,
-   - `invite_accepted` uses invite-presence gating (`HasRecordedInvite`) rather than workspace-root gating.
+   - `invite_accepted` is local anchor binding from carried `workspace_id` (no invite-presence dep gate),
+   - downstream identity admission (`user`/`device`/`peer`) still requires signer/dependency chain validity in the same peer scope.
 7. Verify bootstrap/self-invite, join, device-link, and removal safety invariants.
 8. Freeze a projector-spec mapping table: each projector predicate/check maps to a named TLA guard.
 9. Record TLA scope boundary for this phase:
@@ -1034,7 +1036,9 @@ Implementation requirement:
 
 Required behavior:
 - `invite_accepted` records trust anchor intent for `workspace_id` (per `recorded_by` peer scope).
-- `invite_accepted` is a local binding step and requires invite material to be recorded in the same peer scope (`HasRecordedInvite`), matching `poc-6` TLA semantics.
+- `invite_accepted` is a local binding step from event-carried `workspace_id` (no invite-presence dep gate).
+- if a different trust anchor already exists for that peer scope, `invite_accepted` is rejected.
+- downstream identity events (`user_boot`, `device_invite`, `peer_shared`) remain dependency/signer-gated in peer scope.
 - root `workspace` events are not valid until corresponding trust anchor exists and matches the root id.
 - trust-anchor binding must come from validated projector input fields, not pre-projection capture tables.
 - invites are never force-valid; they validate only through signer/dependency chain.
@@ -1072,12 +1076,12 @@ Use `poc-6` as reference behavior for end-to-end test setup:
 ## 11.5 Crude sender-keys model (phase-1 style, no key history yet)
 
 Use the sender-subjective O(n) baseline from `docs/group-encryption-design-aspects.md`
-("Maximally simple.../Phase 1: baseline correctness and healing with O(n) key broadcast"):
+("Maximally simple.../Phase 4: baseline correctness and healing with O(n) key broadcast"):
 - sender creates a fresh local-only `secret` key event per message,
 - sender emits one `secret_shared`-style key-wrap event per perceived eligible recipient peer pubkey,
 - encrypted content event references the key event id through normal dependency fields,
 - each sender wraps to all perceived eligible members for each message (intentionally crude).
-- use the same key-wrap event type/projector path introduced in Phase 3 PSK mode.
+- use the same key-wrap event type/projector path introduced in Phase 8 PSK mode.
 
 Key modeling requirements for this phase:
 - All protocol-level key material that projectors depend on must be represented as events and resolved by event-id dependencies (for example sender `secret` keys and recipient key-wrap events). Do not introduce out-of-band key stores for event-graph key dependencies.
@@ -1230,12 +1234,12 @@ Keep:
 
 Fastest coherent milestone:
 
-1. Finish Phase `-1`, `0`, `1`, and `2` with a small event set.
-2. Complete Phase `2.5` signer substrate.
-3. Add Phase `3` encrypted wrapper with PSK test harness for one core content path.
-4. Add minimal Phase `4` queues.
+1. Finish Phase `1`, `2`, `4`, and `5` with a small event set.
+2. Complete Phase 6 signer substrate.
+3. Add Phase 8 encrypted wrapper with PSK test harness for one core content path.
+4. Add minimal Phase 9 queues.
 5. Add deletion special-case behavior after baseline sync is stable.
-6. Add final Phase `7` identity + invite cascade + sender-subjective key wraps.
+6. Add final Phase 12 identity + invite cascade + sender-subjective key wraps.
 
 ---
 
@@ -1251,7 +1255,7 @@ Use this section as the implementation contract. If code conflicts with this sec
    - dependency refs come from schema metadata only.
 3. No insecure transport default:
    - pinned mTLS required unless explicitly running dedicated test mode.
-4. No fixed global event blob size after Phase 1.
+4. No fixed global event blob size after Phase 4.
 5. No queue-specific retry logic duplication:
    - shared claim/lease/retry/backoff helpers only.
 6. No per-tenant table fanout:
@@ -1261,7 +1265,7 @@ Use this section as the implementation contract. If code conflicts with this sec
 8. No alternate signer pipeline:
    - all signed event types use the same dependency-then-signature-verification ordering.
 
-## 15.2 Phase `-1` implementation checklist (CLI + daemon)
+## 15.2 Phase 1 implementation checklist (CLI + daemon)
 
 Must implement:
 1. daemon process with profile-scoped db path and control socket.
@@ -1276,19 +1280,19 @@ Definition of done:
 - two daemons exchange at least one message via real QUIC,
 - `assert-eventually` based scripts run deterministically.
 
-## 15.3 Phase `0` implementation checklist (mTLS baseline)
+## 15.3 Phase 2 implementation checklist (mTLS baseline)
 
 Must implement:
 1. persistent cert identity per profile.
 2. pinned-cert verifier on both client and server.
-3. Transitional allowlist source in completed Phase 0 is CLI/profile supplied cert SPKI pins, not socket address.
+3. Transitional allowlist source in completed Phase 2 is CLI/profile supplied cert SPKI pins, not socket address.
 4. session context binds:
    - local `recorded_by` from local cert profile identity.
-   - remote `via_peer_id` from verified cert SPKI mapping (identity-backed once Phase 7 lands).
+   - remote `via_peer_id` from verified cert SPKI mapping (identity-backed once Phase 12 lands).
 5. unit/integration tests for allowed and denied peers.
 6. migration note implemented:
-   - Phase 7 switches allowlist source to projected identity events (`peer_id -> cert SPKI`).
-7. TODO (mandatory retrofit before final Phase 7 sign-off):
+   - Phase 12 switches allowlist source to projected identity events (`peer_id -> cert SPKI`).
+7. TODO (mandatory retrofit before final Phase 12 sign-off):
    - remove CLI/file pin authority and run transport trust solely from projected identity graph state.
    - represent local TLS cert/private key material as event-backed state; file artifacts remain cache only.
 
@@ -1300,7 +1304,7 @@ Definition of done:
 - unpinned peer connection fails at handshake,
 - pinned invited peer sync succeeds repeatedly across daemon restarts.
 
-## 15.4 Phase `1` implementation checklist (schema + wire + recording)
+## 15.4 Phase 4 implementation checklist (schema + wire + recording)
 
 Must implement:
 1. event registry metadata describing fields and dependency refs.
@@ -1322,7 +1326,7 @@ Definition of done:
 - at least two event types decode via schema-driven parsers,
 - replay invariants pass in standard harness (`once`, `twice`, `reverse-order`) after every scenario test.
 
-## 15.5 Phase `2` implementation checklist (projector + blocked deps)
+## 15.5 Phase 5 implementation checklist (projector + blocked deps)
 
 Must implement:
 1. `project_one(recorded_by,event_id)` entrypoint.
@@ -1341,7 +1345,7 @@ Definition of done:
 - out-of-order events with multiple blockers converge correctly,
 - imperative command chains (`a=create_sync(); b=create_sync(depends_on=a)`) work without waits.
 
-## 15.5A Phase `2.5` implementation checklist (signer substrate)
+## 15.5A Phase 6 implementation checklist (signer substrate)
 
 Must implement:
 1. schema metadata for signer fields (`signed_by`, `signer_type`, `signature`).
@@ -1363,7 +1367,7 @@ Definition of done:
 - signed cleartext and signed encrypted-wrapper events follow the same signer pipeline,
 - deterministic emitted unsigned events validate via deterministic derivation checks and remain replay/reproject stable.
 
-## 15.6 Phase `3` implementation checklist (encrypted adapter)
+## 15.6 Phase 8 implementation checklist (encrypted adapter)
 
 Must implement:
 1. encrypted wrapper as a normal registry type.
@@ -1382,7 +1386,7 @@ Definition of done:
 - missing key blocks, wrong key rejects, correct key projects,
 - reorder/replay invariants hold for encrypted events.
 
-## 15.7 Phase `4` implementation checklist (durable queues/workers)
+## 15.7 Phase 9 implementation checklist (durable queues/workers)
 
 Must implement:
 1. queue tables (`project`, `egress`) with transactional boundaries; keep `ingress_queue` optional/reserved unless actively wired.
@@ -1399,7 +1403,7 @@ Definition of done:
 - crash/restart recovers and completes pending work,
 - retries/backoff and lease recovery are observable and deterministic.
 
-## 15.8 Phase `5` implementation checklist (special projectors)
+## 15.8 Phase 10 implementation checklist (special projectors)
 
 Must implement:
 1. explicit deletion/tombstone/cascade projector.
@@ -1411,7 +1415,7 @@ Common mistakes:
 Definition of done:
 - deletion-before-target and target-before-deletion converge identically.
 
-## 15.9 Phase `6` implementation checklist (hardening)
+## 15.9 Phase 11 implementation checklist (hardening)
 
 Must implement:
 1. batch/index tuning driven by measurements.
@@ -1430,7 +1434,7 @@ Definition of done:
 - long-running sync remains stable and bounded in memory/storage.
 - low-memory mode is reliable and repeatable under iOS NSE-style memory limits.
 
-## 15.10 Phase `7` implementation checklist (TLA-first identity)
+## 15.10 Phase 12 implementation checklist (TLA-first identity)
 
 Must implement:
 1. TLA model updated first for split invites and trust-anchor guards.
@@ -1438,11 +1442,11 @@ Must implement:
 3. split invite events (`user_invite`, `device_invite`) with shared helper core.
 4. sender-subjective O(n) key wrapping baseline (no key history yet).
 5. removal excludes removed peers from subsequent wraps.
-6. preserve Phase 2.5 signer pipeline (do not add identity-specific signature fast paths).
+6. preserve Phase 6 signer pipeline (do not add identity-specific signature fast paths).
 7. transport mTLS trust source switched to projected identity graph policy (retrofit completed; no CLI/file pin authority in steady state).
 8. local TLS cert/public/private key material modeled as events and materialized from projected local event state.
 9. guard placement correction:
-   - `invite_accepted` is local trust-anchor binding and requires invite-presence gating (`HasRecordedInvite`) per peer scope.
+   - `invite_accepted` is local trust-anchor binding from carried `workspace_id` (no invite-presence dep gate) per peer scope.
    - trust-anchor guard applies on root workspace events only.
 10. remove/avoid pre-projection trust-binding capture paths (for example raw-blob `invite_workspace_bindings` capture) as authority.
 11. TLA transport-credential scope extension plan exists and is linked (credential/trust transitions modeled; handshake/session keys may remain abstract).
@@ -1450,7 +1454,7 @@ Must implement:
 Common mistakes:
 - implementing projector rules before guard/model freeze.
 - re-introducing multimodal invite event (`mode=*`).
-- dropping the required `invite_accepted` invite-presence guard (`HasRecordedInvite`) after model correction.
+- adding a separate invite-presence gate to `invite_accepted` instead of enforcing identity admission through normal signer/dependency chain checks.
 - forgetting to track the transport-credential TLA scope gap explicitly.
 
 Definition of done:
@@ -1465,7 +1469,7 @@ Recommended PR sequence:
 2. wire framing + schema registry scaffolding.
 3. projector entrypoint + dependency resolver + blocked deps.
 4. create_sync API contract and tests.
-5. signer substrate (Phase 2.5): signer dep blocking + signature ordering tests.
+5. signer substrate (Phase 6): signer dep blocking + signature ordering tests.
 6. encrypted adapter + PSK tests.
 7. queue/worker architecture and shared queue helper extraction.
 8. deletion special-case projector.
@@ -1581,7 +1585,7 @@ Notes:
 
 ---
 
-## 17. Phase 8: Functional Multitenancy
+## 17. Phase 13: Functional Multitenancy
 
 ### Status: COMPLETE
 
@@ -2070,7 +2074,7 @@ Tests in `tests/mdns_smoke.rs`:
 
 ---
 
-## 17.9 Assistant Execution Playbook (Phase 8)
+## 17.9 Assistant Execution Playbook (Phase 13)
 
 ### Must implement
 
