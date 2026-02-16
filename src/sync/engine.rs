@@ -1174,15 +1174,19 @@ pub async fn accept_loop_with_ingest(
         };
         info!("Accepted connection from {}", peer_id);
 
-        // Resolve which local tenant trusts this peer (post-handshake routing)
-        let recorded_by = resolve_tenant_for_peer(db_path, tenant_peer_ids, &peer_id);
-        let recorded_by = match recorded_by {
-            Some(rb) => rb,
-            None => {
-                // TLS already verified trust at the transport level, so this
-                // shouldn't happen in normal operation. Fall back to first tenant.
-                warn!("No tenant matched peer {} post-handshake, using first tenant", &peer_id[..16.min(peer_id.len())]);
-                tenant_peer_ids[0].clone()
+        // Resolve which local tenant owns this connection.
+        // Single-tenant: TLS already verified trust; only one routing choice.
+        // Multi-tenant: check SQL trust tables to determine which tenant.
+        let recorded_by = if tenant_peer_ids.len() == 1 {
+            tenant_peer_ids[0].clone()
+        } else {
+            match resolve_tenant_for_peer(db_path, tenant_peer_ids, &peer_id) {
+                Some(rb) => rb,
+                None => {
+                    warn!("Rejected peer {}: no local tenant trusts this fingerprint", &peer_id[..16.min(peer_id.len())]);
+                    connection.close(1u32.into(), b"no matching tenant");
+                    continue;
+                }
             }
         };
 
