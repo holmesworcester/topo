@@ -406,6 +406,15 @@ Some behavior stays explicit by design:
 2. trust-anchor handling in `invite_accepted`,
 3. identity/removal policy checks from TLA guards.
 
+### Deletion cascade semantics
+
+`message_deletion` is always an explicit special projector, not autowrite. Forcing deletion into generic autowrite logic is a known anti-pattern.
+
+Convergence requirement:
+1. deletion-before-target and target-before-deletion must produce identical final projected state,
+2. this reordering invariance is the definition-of-done for deletion implementation,
+3. deletion events must handle the case where the target event has not yet been projected (out-of-order arrival).
+
 ---
 
 # 5. Dependency Blocking and Unblocking
@@ -444,6 +453,24 @@ This preserves imperative orchestration ergonomics:
 
 1. create event A synchronously,
 2. create dependent event B in the next line with no ad-hoc waits.
+
+## 5.4 Signer pipeline
+
+Signer refs (`signed_by` + `signer_type`) are dependency metadata using the same `blocked_event_deps` mechanism as other event references. Missing signer dependency writes rows in `blocked_event_deps` and returns `Block`, identical to any other missing dep.
+
+Ordering:
+1. signer key is resolved only after all required deps (including the signer dep itself) are available,
+2. signature verification runs after signer key resolution succeeds,
+3. invalid signature → `Reject`, never `Block`.
+
+One shared signer helper handles all signed event families. There is no identity-specific signer verification path; every signed event type uses the same resolve-by-(`signer_type`, `signed_by`) pipeline.
+
+Schema-marked unsigned exemption:
+1. deterministic emitted event types are schema-marked `signer_required=false`,
+2. the pipeline skips signer dependency extraction and signature verification for those types,
+3. validation uses deterministic-derivation checks from dependencies/context instead.
+
+Tenant-scoped signer behavior: signer resolution and verification are scoped to the projecting tenant's `recorded_by`. Missing or invalid signer state in tenant A does not leak effects into tenant B.
 
 ---
 
@@ -657,6 +684,18 @@ Assertion-first commands are first-class:
 Identity phase projector predicates are derived from an explicit TLA causal model.
 Rust projector guards map 1:1 to named model guards.
 
+Required invariants (TLC-checked):
+1. `InvWorkspaceAnchor`: workspace validity requires a matching trust anchor,
+2. `InvSingleWorkspace`: at most one workspace row per peer in the workspaces table,
+3. `InvForeignWorkspaceExcluded`: a foreign workspace event can never become valid,
+4. `InvTrustAnchorMatchesCarried`: trust anchor always matches the event-carried `workspace_id`.
+
+Workspace binding proof: the invite determines which workspace a peer accepts; only that workspace can project. The guard mechanism checks that a workspace event's id matches the binding, structurally excluding foreign workspace events.
+
+Invite-workspace binding: `invite_accepted` binds the trust anchor directly from its own `workspace_id` field using first-write-wins immutable semantics. No pre-projection capture authority.
+
+Projector-spec mapping: each Rust projector predicate maps to a named TLA guard. The full mapping is maintained in `docs/tla/projector_spec.md`. Any divergence between projector logic and TLA guards is treated as a spec bug that must be resolved before adding new behavior.
+
 ## 9.2 Invite model
 
 Use split event types:
@@ -688,6 +727,11 @@ Self-invite bootstrap stays explicit:
 3. locally accept invite (`invite_accepted`),
 4. cascade unblocks `workspace -> user_invite -> user -> device_invite -> peer_shared`.
 
+Guard placement rules:
+1. trust-anchor guard applies to root workspace events only; foreign root ids must not become valid,
+2. `invite_accepted` uses invite-presence gating (`HasRecordedInvite`) in peer scope, not workspace-root gating — invite material must be recorded in the same peer scope before `invite_accepted` can become valid,
+3. bootstrap transport trust is persisted in SQL and queried at connection creation time; projected peer keys are not treated as in-memory-only authority.
+
 ## 9.4 Sender-subjective encryption baseline
 
 For each encrypted message in the prototype baseline:
@@ -698,6 +742,37 @@ For each encrypted message in the prototype baseline:
 
 After observing `user_removed` or `peer_removed`, sender excludes removed recipients from subsequent wraps.
 No historical re-encryption or key history backfill is required in this baseline.
+
+## 9.5 Transport credential lifecycle model
+
+Three trust sources compose the runtime trusted peer set:
+
+1. `transport_keys`: projected from identity events (steady-state trust),
+2. `invite_bootstrap_trust`: rows written when invite links are accepted (bootstrap trust),
+3. `pending_invite_bootstrap_trust`: rows written by inviters before invitee first dial (pre-bootstrap trust).
+
+Conceptually: `TrustedPeerSet = transport_keys ∪ invite_bootstrap_trust ∪ pending_invite_bootstrap_trust`.
+
+Supersession: when steady-state `transport_keys` trust appears for a peer, matching `invite_bootstrap_trust` and `pending_invite_bootstrap_trust` entries are automatically consumed. Bootstrap and steady-state trust for the same peer never coexist.
+
+TTL expiry: bootstrap trust rows are time-bounded. Unconsumed entries expire and are purged.
+
+Removal cascade: `peer_removed` cascades trust removal across all three sources for the affected peer.
+
+TLC-verified invariants (from `TransportCredentialLifecycle.tla`, mapped to Rust checks in `docs/tla/projector_spec.md`):
+1. `InvActiveCredInHistory`,
+2. `InvRevokedSubsetHistory`,
+3. `InvActiveCredNotRevoked`,
+4. `InvSPKIUniqueness`,
+5. `InvActiveCredGloballyUnique`,
+6. `InvBootstrapConsumedByTransportKey`,
+7. `InvPendingConsumedByTransportKey`,
+8. `InvTrustSetIsExactUnion`,
+9. `InvTrustSourcesWellFormed`,
+10. `InvRevokedNotInBootstrapTrust`,
+11. `InvMutualAuthSymmetry`.
+
+Abstract boundary: TLS handshake and session-key derivation remain unmodeled. The TLA spec covers trust-source state transitions but not the cryptographic session establishment that consumes them.
 
 ---
 
@@ -767,6 +842,14 @@ Initial event-size policy:
 
 `file_slice` events (type 25, signed) are signed and validated like other canonical events.
 `message_attachment` events (type 24, signed) are file descriptors with deps on `message_id`, `key_event_id`, and `signed_by`.
+
+### Low-memory trust and key strategy (`low_mem_ios`)
+
+Trust and key sets use SQL indexed point lookups, not full in-memory loading. The projection tables (`transport_keys`, `trust_anchors`, identity chain tables) are queried on demand with indexed `(recorded_by, ...)` keys.
+
+A bounded hot cache holds recently accessed keys to avoid redundant SQL round-trips during burst projection. The cache is size-limited and evicts LRU entries; it never grows unbounded.
+
+Validation scale requirements: the low-memory path must remain stable at >= 1,000,000 canonical events on disk and >= 100,000 peer trust keys while staying within the 24 MiB steady-state RSS ceiling. Throughput may degrade to preserve the memory bound.
 
 ---
 
