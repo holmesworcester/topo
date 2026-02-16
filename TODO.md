@@ -8,10 +8,54 @@ Goal: track and close high-impact discrepancies between `docs/DESIGN.md`, `docs/
 
 For any TODO that changes protocol semantics, trust-source semantics, dependency/guard rules, or identity/key lifecycle behavior:
 
-1. Update relevant TLA modules under `docs/tla/` (for example `EventGraphSchema.tla`, `TransportCredentialLifecycle.tla`, `BootstrapGraph.tla`).
-2. Update TLC configs if state/events/invariants changed.
-3. Update `docs/tla/projector_spec.md` mapping rows and any DESIGN/PLAN invariant lists.
-4. Add or adjust model-check CI/test invocation for the changed model scope.
+1. Update relevant TLA modules under `docs/tla/` (for example `EventGraphSchema.tla`, `TransportCredentialLifecycle.tla`, `BootstrapGraph.tla`) before Rust implementation changes.
+2. Run TLC/model checks and confirm expected invariants/counterexamples before coding the semantic change.
+3. Implement Rust changes to match the validated model.
+4. Update `docs/tla/projector_spec.md` mapping rows and any DESIGN/PLAN invariant lists.
+5. Add or adjust model-check CI/test invocation for the changed model scope.
+
+## Cross-cutting rule: POC replacement policy (no backward compatibility)
+
+This repository is a POC. For protocol/runtime simplification work:
+
+1. Do not carry dual-read, dual-write, compatibility windows, or legacy shadow paths.
+2. Each round ends with old behavior/code paths removed, not just deprecated.
+3. Update tests/docs/TLA mappings in the same round so one canonical behavior remains.
+4. If old persisted state cannot be represented after a change, fail fast and require recreation rather than adding compatibility layers.
+
+## Cross-cutting rule: test gate and coverage requirements
+
+For every stage of work in this TODO:
+
+1. The stage is not complete until tests pass on the branch (`cargo test` and required scenario/integration suites for touched areas).
+2. Any behavior change, bug fix, or semantic change must include new or updated tests in the same stage.
+3. Pure refactors may skip new tests only when existing coverage already exercises the changed paths and all tests remain green.
+4. Do not defer required tests to a later TODO item.
+
+## Recommended execution order (dependency-driven)
+
+Realism-first rule for ordering: finish test-fidelity items up front (copying events, direct DB seeding, static pinning overlays, and optional invariant checks) so downstream refactors are validated by realistic tests.
+
+1. `P0: Remove copy_event_chain from interactive invite acceptance`
+2. `P1: Replace prerequisite event copy in Peer::new_in_workspace`
+3. `P1: Stop direct SQL trust seeding in CLI invite-bootstrap test`
+4. `P1: Remove manual endpoint observation writes in hole-punch integration test`
+5. `P2: Align test transport setup with production dynamic trust lookup`
+6. `P1: Deprecate --pin-peer from product code and design after invite-trust maturity`
+7. `P0: Make scenario replay invariants mandatory by default (opt-out only)`
+8. `P0: Bring scenario invariant harness fully in line with PLAN (fingerprints + full invariant set)`
+9. `P1: Investigate and decide create_event_sync service semantics before implementation changes`
+10. `P1: Investigate simplification of project_one/project_one_core split to better match one-path intent`
+11. `P0: Unify transport identity architecture (single event-derived peer identity, no rotation sidecar)`
+12. `P2: Resolve disjoint trust sets docs/code mismatch`
+13. `P0: Enforce removal policy at transport runtime (deny + disconnect active sessions)`
+14. `P0: Unify bootstrap key distribution via invite-key wrap/unwrap (keep local secret_key dep)`
+15. `P1: Collapse encrypted-inner projection onto the same dependency/signer engine stages`
+16. `P0: Re-impose fixed-length event fields + langsec parser model`
+17. `P1: Remove duplicated command/business logic between CLI (main.rs) and service layer (service.rs)`
+18. `P1: Eliminate direct SQL access in CLI command paths where module APIs already exist`
+19. `P1: Reconcile TLA/spec mapping docs with PLAN and implemented projector semantics`
+20. `P2: Remove residual compatibility cruft from active schema/docs/runtime surfaces`
 
 ## P0: Re-impose fixed-length event fields + langsec parser model
 
@@ -37,10 +81,10 @@ Fix:
    - table-driven fixed offsets and exact total-size checks,
    - no parser control flow driven by untrusted length prefixes for canonical event body layout,
    - strict zero-padding and canonical UTF-8 constraints where text is represented in fixed byte slots.
-4. Migration plan:
-   - dual-read old/new types during transition,
-   - write new fixed-layout types only once rollout gate is enabled,
-   - retire old variable-layout emitters after compatibility window.
+4. POC cutover plan:
+   - land fixed-layout schemas/parsers/emitters,
+   - remove variable-layout canonical parser/emitter paths in the same round,
+   - update fixtures/tests to only the new canonical layouts.
 5. Verification hardening:
    - add per-type fixed-size golden-byte tests,
    - add negative tests for truncation, trailing bytes, non-zero padding, and malformed text slots,
@@ -134,65 +178,46 @@ Acceptance:
 4. Tests cover bootstrap wrap/unwrap ordering (in-order and out-of-order arrival) without introducing rotation complexity.
 5. TLA model and mapping docs cover the new bootstrap wrap/unwrap flow.
 
-## P0: Event-source local transport credential lifecycle (no silent regen)
+## P0: Unify transport identity architecture (single event-derived peer identity, no rotation sidecar)
 
-Evidence: `src/transport_identity.rs:47` generates new cert/key when `local_transport_creds` is missing; bootstrap trust is TTL-bound (`src/db/transport_trust.rs:9`, `src/db/transport_trust.rs:12`); trust authority is event-derived `transport_keys`.
+Evidence:
 
-Problem: a DB rebuild from canonical events that loses `local_transport_creds` can silently generate a new transport identity (`peer_id`), making previously shared `transport_key` bindings unusable and potentially stranding the node once bootstrap rows expire.
+1. Current runtime still has split transport/event identity authority:
+   - transport identity and sidecar storage in `local_transport_creds`,
+   - event-graph identity and trust logic in identity projection + trust tables.
+2. Current split permits drift/rebuild hazards (for example silent local transport regeneration when sidecar state is missing).
+3. Existing design/plan complexity around transport credential lifecycle and bridge events (`transport_key`) increases surface area.
 
-Fix:
+Problem: duplicated identity authority (`peer` identity in event graph vs transport sidecar identity state) creates drift risk, replay/rebuild ambiguity, and unnecessary lifecycle machinery.
 
-1. Add local transport-identity lifecycle events (local share scope) for:
-   - initial local cert/key install,
-   - rotation/replacement.
-2. Project those local events into `local_transport_creds` so replay/rebuild restores the same local transport identity.
-3. Change `ensure_transport_cert*` behavior to avoid silent regen when identity already has trust history:
-   - fail closed (explicit recovery action required), or
-   - require an explicit `rotate-transport-identity` command that emits the local lifecycle event and follow-up `TransportKey` publication.
-4. Ensure rotation path automatically publishes a new `TransportKey` event and provides a controlled overlap/grace policy for old/new SPKIs.
-5. TLA/model alignment:
-   - update `docs/tla/TransportCredentialLifecycle.tla` invariants/actions if lifecycle authority changes (event-backed local creds, no silent regen),
-   - update `docs/tla/projector_spec.md` transport-lifecycle mapping rows accordingly.
+Target intent for this POC (preferred):
 
-Acceptance:
+1. Device identity is the event-layer peer key (`peer_shared` lineage); `peer_id` is permanent and bound to that identity.
+2. TLS cert/key material is derived/materialized from event-layer identity as a thin transport adapter, not an independent authority.
+3. No transport identity rotation machinery in this POC model.
+4. Security posture:
+   - TLS 1.3 provides forward secrecy for sessions,
+   - identity key capture permits active impersonation of that device identity (accepted tradeoff for this POC),
+   - no additional transport-key-history revocation machinery is required.
 
-1. Local transport credential state is reconstructible from event replay (including local events), not only mutable SQL side state.
-2. Restart/replay with intact event history does not change `peer_id` unexpectedly.
-3. Silent transport identity regeneration is removed from default sync startup path.
-4. Transport-credential TLA invariants and mapping docs match implemented lifecycle behavior.
+Fix (direct cutover):
 
-## P1: Simplify identity model (reduce transport/event key split complexity)
-
-Evidence: current design keeps separate transport SPKI identity and event-graph signer identity, bridged by `transport_key` events (`docs/DESIGN.md:102`, `docs/DESIGN.md:105`, `docs/DESIGN.md:144`).
-
-Problem: operational complexity is high (extra binding events, local credential side-state, rebuild edge cases).
-
-Fix (design + migration track):
-
-1. Write a design decision comparing:
-   - current split model (`peer_shared` + `transport_key` bridge),
-   - simplified model where transport identity is deterministically derived from event identity (single logical identity authority).
-2. If simplified model is chosen:
-   - remove `transport_key` as required steady-state trust authority,
-   - derive transport trust from projected identity graph directly,
-   - reduce or eliminate mutable local transport credential side-state,
-   - simplify transport credential lifecycle model by removing local credential history/revocation semantics (`InvActiveCredInHistory`, `InvRevokedSubsetHistory`, related invariants) from normative design and runtime requirements.
-3. Provide a migration path with compatibility window (dual-read/dual-validate), then remove legacy path.
-4. TLS forward-secrecy posture for simplification:
-   - treat QUIC/TLS session confidentiality as provided by TLS 1.3 ephemeral handshake,
-   - keep app-layer trust model focused on peer authorization and key distribution,
-   - avoid adding protocol-level historical transport-credential revocation machinery unless we need active compromise response semantics beyond trust-set removal.
-5. TLA/model alignment:
-   - remove or rewrite transport lifecycle invariants that are no longer normative (`InvActiveCredInHistory`, `InvRevokedSubsetHistory`, etc.),
-   - keep only invariants that remain part of the chosen simplified semantics.
+1. Lock the chosen model in DESIGN/PLAN/TLA first (TLA-first rule).
+2. Remove `transport_key` as normative trust authority if this model is selected.
+3. Remove/neutralize sidecar authority semantics (`local_transport_creds`) so canonical identity authority is event-derived.
+4. Eliminate silent transport identity regeneration paths tied to missing sidecar rows.
+5. Update transport allow/deny logic and tenant discovery to the chosen single-identity model.
+6. Remove old split/rotation code paths in the same round (no dual mode).
+7. TLA/model alignment:
+   - rewrite/remove transport lifecycle invariants that assume rotating sidecar credential history,
+   - align `docs/tla/projector_spec.md` mappings and DESIGN/PLAN invariant text to the chosen single-identity semantics.
 
 Acceptance:
 
-1. Decision doc committed with explicit tradeoffs and chosen direction.
-2. If simplification is adopted, one end-to-end flow (invite -> sync) works without publishing `transport_key` events.
-3. Replay/rebuild no longer depends on non-event local credential state for connectivity continuity.
-4. `docs/DESIGN.md` and `docs/PLAN.md` no longer require credential-history/revocation invariants as normative behavior for transport lifecycle.
-5. TLA modules/configs and `docs/tla/projector_spec.md` are updated to the simplified model.
+1. One canonical identity authority remains (event-layer peer identity).
+2. Replay/rebuild does not depend on independent mutable transport sidecar state for identity continuity.
+3. Runtime no longer has transport identity rotation behavior for this POC.
+4. DESIGN/PLAN/TLA mapping and runtime behavior match.
 
 ## P0: Remove `copy_event_chain` from interactive invite acceptance
 
@@ -315,21 +340,16 @@ Problem: retaining `--pin-peer` as a normal operational path undermines the even
 Fix:
 
 1. Define ordering gate:
-   - keep `--pin-peer` only as an explicit bootstrap aid while invite-derived trust paths are still being stabilized,
-   - once invite create/accept + first sync are reliable end-to-end, switch to deprecation mode.
-2. Deprecation mode:
-   - mark CLI `--pin-peer` as deprecated in help text and docs,
-   - emit runtime warnings when used,
-   - remove it from "happy path" examples and test defaults.
-3. Remove from steady-state code path:
+   - keep `--pin-peer` only until invite create/accept + first sync are reliable end-to-end.
+2. Once gate is met, remove from steady-state code path in the same round:
    - stop merging CLI pins into transport trust resolution by default,
    - make SQL/event-derived trust the sole default authority.
-4. Final removal:
+3. Final removal:
    - remove `--pin-peer` flags from primary commands and daemon entrypoints,
    - keep any explicit pinning behavior only in narrow transport-policy test utilities or a clearly scoped debug-only command.
-5. Design/doc update:
-   - update `docs/DESIGN.md` and `docs/PLAN.md` to state invite/event-derived trust is normative and manual pin overlays are transitional/deprecated (or removed).
-6. TLA/model alignment:
+4. Design/doc update:
+   - update `docs/DESIGN.md` and `docs/PLAN.md` to state invite/event-derived trust is normative and manual pin overlays are non-normative bootstrap-only paths removed from steady-state product behavior.
+5. TLA/model alignment:
    - if CLI pinning is removed from normative runtime semantics, update model boundary notes and mapping docs to reflect that (including any prior "modeled only in Rust" caveats).
 
 Acceptance:
@@ -466,7 +486,7 @@ Required process for this TODO (approval gate):
    - catalog where `Blocked`-as-success is relied on today.
 2. Planning and explanation:
    - write options with tradeoffs (for example strict valid-only vs explicit terminal-status response),
-   - include migration/test impact and compatibility risks.
+   - include test impact, caller behavior impact, and rollback risk.
 3. Decision checkpoint:
    - present recommendation and wait for explicit approval before any implementation patch.
 4. Implementation starts only after approval is recorded on this TODO item.
@@ -521,15 +541,16 @@ Fix:
 1. Define one canonical command/business layer (service/application module) as the only owner of command semantics.
 2. Make CLI entrypoints thin adapters:
    - parse args,
-   - call canonical service functions,
+   - apply CLI-only frontend affordances (for example number-alias resolution for message/invite references and other UX shorthands),
+   - call canonical service functions for business semantics,
    - render output.
 3. Remove duplicated business logic from `main.rs` once parity tests pass.
-4. Add parity tests ensuring CLI command behavior matches service API behavior for key flows.
+4. Add parity tests ensuring CLI command behavior matches service API behavior for key flows while preserving CLI affordances.
 
 Acceptance:
 
 1. No duplicated command semantics remain between `src/main.rs` and `src/service.rs`.
-2. CLI path and service/API path share one implementation per command.
+2. CLI path and service/API path share one business implementation per command, with CLI affordances limited to input/output adaptation.
 3. Regression tests cover CLI/service parity for core commands.
 
 ## P1: Eliminate direct SQL access in CLI command paths where module APIs already exist
@@ -551,12 +572,40 @@ Fix:
 2. Introduce missing command/query helpers where needed, then migrate command handlers to use them.
 3. Reserve inline SQL in CLI/service only for narrow glue/telemetry cases with explicit justification.
 4. Add lint/check or code-review guardrails to prevent reintroduction of ad-hoc command-layer SQL.
+5. Keep CLI convenience affordances (for example numeric aliases) by resolving them through owned query helpers rather than ad-hoc SQL in command handlers.
 
 Acceptance:
 
 1. Command paths do not embed business-critical SQL when an owned module API exists.
-2. Query semantics used by CLI are centralized in reusable helpers/modules.
+2. Query semantics used by CLI (including convenience alias resolution) are centralized in reusable helpers/modules.
 3. Future schema updates require changes in one query owner, not N command handlers.
+
+## P2: Remove residual compatibility cruft from active schema/docs/runtime surfaces
+
+Evidence:
+
+1. Active DESIGN still references compatibility-staging queue behavior:
+   - `docs/DESIGN.md:538` (`ingress_queue` "reserved compatibility/diagnostic staging").
+2. Migrations retain historical compatibility-only artifacts:
+   - `src/db/migrations.rs:296` (version-12 no-op retained for ordering compatibility),
+   - `src/db/migrations.rs:480` (`drop_retired_compat_tables` naming/history trail).
+3. Runtime/test surface still carries legacy terminology artifacts:
+   - `src/projection/pipeline.rs:1288` (`test_legacy_peer_key_blob_rejected` naming).
+
+Problem: these leftovers keep old-era compatibility context alive in active surfaces, increasing cognitive load and conflicting with the POC single-path replacement policy.
+
+Fix:
+
+1. Prune/rename compatibility artifacts from active docs and code where they no longer serve runtime correctness.
+2. Remove unused compatibility-only schema elements (for example `ingress_queue`) if no active runtime path depends on them.
+3. Collapse compatibility-only migration/history clutter via epoch-forward schema cleanup (POC recreate-db model).
+4. Keep archival context only under `docs/archive/`, not in normative active docs.
+
+Acceptance:
+
+1. Active DESIGN/PLAN text has no compatibility-shim framing for non-runtime features.
+2. Active schema/runtime does not include unused compatibility-only tables/paths.
+3. Legacy/compat wording in active tests/code is minimized to intentional hardening cases only.
 
 ## P1: Investigate simplification of `project_one`/`project_one_core` split to better match one-path intent
 
