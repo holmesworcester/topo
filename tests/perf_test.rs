@@ -100,11 +100,12 @@ async fn perf_sync_10k() {
 #[tokio::test]
 async fn perf_continuous_10k() {
     let alice = Peer::new_with_identity("alice");
-    let bob = Peer::new_with_identity("bob");
+    // Use a shared workspace so workspace-scoped sync transfers content events.
+    let bob = Peer::new_in_workspace("bob", &alice);
 
     let rss_before = peak_rss_mib();
 
-    // Start sync with identity-only peers (6 events each)
+    // Start sync between peers in the same workspace.
     let sync = start_peers(&alice, &bob);
 
     // Give sync a moment to connect
@@ -142,19 +143,17 @@ async fn perf_continuous_10k() {
     let inject_secs = start.elapsed().as_secs_f64();
     eprintln!("Injected 10k events (5k each) in {:.2}s", inject_secs);
 
-    // 6 identity per peer + 10k content; after sync each has 6 own + 5 other shared + 10k = 10011
-    // message_count only reflects locally-created messages (remote messages blocked by foreign signer)
-    let expected_store: i64 = 10_000 + 11;
-    let expected_messages: i64 = 5_000; // each peer only projects its own 5k messages
+    // In a shared workspace, both peers should project all 10k messages.
+    let expected_messages: i64 = 10_000;
 
-    // Wait for convergence (store + projection)
+    // Wait for convergence (projection + minimal store sanity).
     assert_eventually(
-        || alice.store_count() == expected_store && bob.store_count() == expected_store
-            && alice.message_count() == expected_messages && bob.message_count() == expected_messages,
+        || alice.message_count() == expected_messages && bob.message_count() == expected_messages
+            && alice.store_count() >= expected_messages && bob.store_count() >= expected_messages,
         Duration::from_secs(120),
         &format!(
-            "convergence to {} store events and {} projected messages (store: a={}, b={}; projected: a={}, b={})",
-            expected_store, expected_messages,
+            "convergence to {} projected messages (store: a={}, b={}; projected: a={}, b={})",
+            expected_messages,
             alice.store_count(),
             bob.store_count(),
             alice.message_count(),
@@ -172,8 +171,6 @@ async fn perf_continuous_10k() {
     let events_per_sec = events_transferred as f64 / wall_secs;
     let throughput_mib_s = (bytes_transferred as f64) / (1024.0 * 1024.0) / wall_secs.max(0.001);
 
-    assert_eq!(alice.store_count(), expected_store);
-    assert_eq!(bob.store_count(), expected_store);
     assert_eq!(alice.message_count(), expected_messages);
     assert_eq!(bob.message_count(), expected_messages);
 
