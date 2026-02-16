@@ -1,3 +1,4 @@
+use super::fixed_layout::{self, MESSAGE_WIRE_SIZE, MESSAGE_CONTENT_BYTES, message_offsets as off};
 use super::registry::{EventTypeMeta, ShareScope};
 use super::{EventError, ParsedEvent, EVENT_TYPE_MESSAGE};
 
@@ -12,23 +13,25 @@ pub struct MessageEvent {
     pub signature: [u8; 64],
 }
 
-/// Wire format (min 172 bytes, signed):
+/// Wire format (1194 bytes fixed, signed):
 /// [0]            type=1
 /// [1..9]         created_at_ms (u64 LE)
 /// [9..41]        workspace_id (32 bytes)
 /// [41..73]       author_id (32 bytes)
-/// [73..75]       content_len (u16 LE)
-/// [75..75+N]     content (UTF-8)
-/// --- signature trailer (97 bytes) ---
-/// [75+N..75+N+32]  signed_by (32 bytes)
-/// [75+N+32]        signer_type (1 byte)
-/// [75+N+33..75+N+97] signature (64 bytes)
+/// [73..1097]     content (1024 bytes, UTF-8 zero-padded)
+/// [1097..1129]   signed_by (32 bytes)
+/// [1129]         signer_type (1 byte)
+/// [1130..1194]   signature (64 bytes)
 pub fn parse_message(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    // Minimum: type(1) + created_at_ms(8) + workspace_id(32) + author_id(32) + content_len(2)
-    //        + signed_by(32) + signer_type(1) + signature(64) = 172
-    if blob.len() < 172 {
+    if blob.len() < MESSAGE_WIRE_SIZE {
         return Err(EventError::TooShort {
-            expected: 172,
+            expected: MESSAGE_WIRE_SIZE,
+            actual: blob.len(),
+        });
+    }
+    if blob.len() > MESSAGE_WIRE_SIZE {
+        return Err(EventError::TrailingData {
+            expected: MESSAGE_WIRE_SIZE,
             actual: blob.len(),
         });
     }
@@ -39,39 +42,24 @@ pub fn parse_message(blob: &[u8]) -> Result<ParsedEvent, EventError> {
         });
     }
 
-    let created_at_ms = u64::from_le_bytes(blob[1..9].try_into().unwrap());
+    let created_at_ms = u64::from_le_bytes(blob[off::CREATED_AT..off::WORKSPACE_ID].try_into().unwrap());
 
     let mut workspace_id = [0u8; 32];
-    workspace_id.copy_from_slice(&blob[9..41]);
+    workspace_id.copy_from_slice(&blob[off::WORKSPACE_ID..off::AUTHOR_ID]);
 
     let mut author_id = [0u8; 32];
-    author_id.copy_from_slice(&blob[41..73]);
+    author_id.copy_from_slice(&blob[off::AUTHOR_ID..off::CONTENT]);
 
-    let content_len = u16::from_le_bytes(blob[73..75].try_into().unwrap()) as usize;
-    let expected_len = 75 + content_len + 97; // 97 = signed_by(32) + signer_type(1) + signature(64)
-    if blob.len() < expected_len {
-        return Err(EventError::TooShort {
-            expected: expected_len,
-            actual: blob.len(),
-        });
-    }
-    if blob.len() > expected_len {
-        return Err(EventError::TrailingData {
-            expected: expected_len,
-            actual: blob.len(),
-        });
-    }
+    let content = fixed_layout::read_text_slot(&blob[off::CONTENT..off::CONTENT + MESSAGE_CONTENT_BYTES])
+        .map_err(EventError::TextSlot)?;
 
-    let content = String::from_utf8_lossy(&blob[75..75 + content_len]).to_string();
-
-    let trailer_start = 75 + content_len;
     let mut signed_by = [0u8; 32];
-    signed_by.copy_from_slice(&blob[trailer_start..trailer_start + 32]);
+    signed_by.copy_from_slice(&blob[off::SIGNED_BY..off::SIGNER_TYPE]);
 
-    let signer_type = blob[trailer_start + 32];
+    let signer_type = blob[off::SIGNER_TYPE];
 
     let mut signature = [0u8; 64];
-    signature.copy_from_slice(&blob[trailer_start + 33..trailer_start + 97]);
+    signature.copy_from_slice(&blob[off::SIGNATURE..off::SIGNATURE + 64]);
 
     Ok(ParsedEvent::Message(MessageEvent {
         created_at_ms,
@@ -91,22 +79,21 @@ pub fn encode_message(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     };
 
     let content_bytes = msg.content.as_bytes();
-    if content_bytes.len() > 65535 {
+    if content_bytes.len() > MESSAGE_CONTENT_BYTES {
         return Err(EventError::ContentTooLong(content_bytes.len()));
     }
 
-    let total = 75 + content_bytes.len() + 97;
-    let mut buf = Vec::with_capacity(total);
+    let mut buf = vec![0u8; MESSAGE_WIRE_SIZE];
 
-    buf.push(EVENT_TYPE_MESSAGE);
-    buf.extend_from_slice(&msg.created_at_ms.to_le_bytes());
-    buf.extend_from_slice(&msg.workspace_id);
-    buf.extend_from_slice(&msg.author_id);
-    buf.extend_from_slice(&(content_bytes.len() as u16).to_le_bytes());
-    buf.extend_from_slice(content_bytes);
-    buf.extend_from_slice(&msg.signed_by);
-    buf.push(msg.signer_type);
-    buf.extend_from_slice(&msg.signature);
+    buf[off::TYPE_CODE] = EVENT_TYPE_MESSAGE;
+    buf[off::CREATED_AT..off::WORKSPACE_ID].copy_from_slice(&msg.created_at_ms.to_le_bytes());
+    buf[off::WORKSPACE_ID..off::AUTHOR_ID].copy_from_slice(&msg.workspace_id);
+    buf[off::AUTHOR_ID..off::CONTENT].copy_from_slice(&msg.author_id);
+    fixed_layout::write_text_slot(&msg.content, &mut buf[off::CONTENT..off::CONTENT + MESSAGE_CONTENT_BYTES])
+        .map_err(EventError::TextSlot)?;
+    buf[off::SIGNED_BY..off::SIGNER_TYPE].copy_from_slice(&msg.signed_by);
+    buf[off::SIGNER_TYPE] = msg.signer_type;
+    buf[off::SIGNATURE..off::SIGNATURE + 64].copy_from_slice(&msg.signature);
 
     Ok(buf)
 }

@@ -6,11 +6,11 @@ Changes to this document require TLA+ model re-verification.
 
 | Code | Rust Type | TLA+ Name | Wire Size | Share Scope | Encryptable | Signer Required | Sig Len | Signer Type |
 |------|-----------|-----------|-----------|-------------|-------------|-----------------|---------|-------------|
-| 1 | Message | Message | variable | Shared | Yes | No | 0 | — |
-| 2 | Reaction | MessageReaction | variable | Shared | Yes | No | 0 | — |
+| 1 | Message | Message | 1194B | Shared | Yes | No | 0 | — |
+| 2 | Reaction | MessageReaction | 234B | Shared | Yes | No | 0 | — |
 | 3 | PeerKey | Peer | 41B | Shared | — | No | 0 | — |
-| 4 | SignedMemo | — | variable | Shared | Yes | Yes | 64 | 0 (peer) |
-| 5 | Encrypted | Encrypted | variable | Shared | No | No | 0 | — |
+| 4 | SignedMemo | — | 1130B | Shared | Yes | Yes | 64 | 0 (peer) |
+| 5 | Encrypted | Encrypted | 70+inner_size | Shared | No | No | 0 | — |
 | 6 | SecretKey | SecretKey | 41B | Local | Yes | No | 0 | — |
 | 7 | MessageDeletion | MessageDeletion | 73B | Shared | Yes | No | 0 | — |
 | 8 | Workspace | Workspace | 73B | Shared | No | No | 0 | — |
@@ -29,8 +29,8 @@ Changes to this document require TLA+ model re-verification.
 | 21 | PeerRemoved | PeerRemoved | 138B | Shared | No | Yes | 64 | 5 (peer_shared) |
 | 22 | SecretShared | SecretShared | 202B | Shared | No | Yes | 64 | 5 (peer_shared) |
 | 23 | TransportKey | — | 41B | Shared | No | No | 0 | — |
-| 24 | MessageAttachment | — | variable | Shared | Yes | No | 0 | — |
-| 25 | FileSlice | — | variable | Shared | Yes | Yes | 64 | 5 (peer_shared) |
+| 24 | MessageAttachment | — | 633B | Shared | Yes | No | 0 | — |
+| 25 | FileSlice | — | 262286B | Shared | Yes | Yes | 64 | 5 (peer_shared) |
 
 ## Signer Type Resolution
 
@@ -175,6 +175,66 @@ type_code(1) | created_at_ms(8) | public_key(32) | extra_dep_id(32) | signed_by(
 ```
 type_code(1) | created_at_ms(8) | key_event_id(32) | recipient_event_id(32) | wrapped_key(32) | signed_by(32) | signer_type(1) | signature(64)  = 202B
 ```
+
+### 1194B fixed signed (Message)
+```
+Message (1): type_code(1) | created_at_ms(8) | workspace_id(32) | author_id(32) | content(1024) | signed_by(32) | signer_type(1) | signature(64) = 1194B
+```
+- content: fixed 1024-byte UTF-8 slot, zero-padded after text
+
+### 234B fixed signed (Reaction)
+```
+Reaction (2): type_code(1) | created_at_ms(8) | target_event_id(32) | author_id(32) | emoji(64) | signed_by(32) | signer_type(1) | signature(64) = 234B
+```
+- emoji: fixed 64-byte UTF-8 slot, zero-padded after text
+
+### 1130B fixed signed (SignedMemo)
+```
+SignedMemo (4): type_code(1) | created_at_ms(8) | signed_by(32) | signer_type(1) | content(1024) | signature(64) = 1130B
+```
+- content: fixed 1024-byte UTF-8 slot, zero-padded after text
+
+### 70+inner_size fixed unsigned (Encrypted)
+```
+Encrypted (5): type_code(1) | created_at_ms(8) | key_event_id(32) | inner_type_code(1) | nonce(12) | ciphertext(inner_wire_size) | auth_tag(16) = 70 + inner_wire_size
+```
+- ciphertext size is deterministic: equals the fixed wire size of `inner_type_code`
+- no `ciphertext_len` field; parser derives size from `inner_type_code` lookup
+
+### 633B fixed signed (MessageAttachment)
+```
+MessageAttachment (24): type_code(1) | created_at_ms(8) | message_id(32) | file_id(32) | blob_bytes(8) | total_slices(4) | slice_bytes(4) | root_hash(32) | key_event_id(32) | filename(255) | mime_type(128) | signed_by(32) | signer_type(1) | signature(64) = 633B
+```
+- filename: fixed 255-byte UTF-8 slot, zero-padded after text
+- mime_type: fixed 128-byte UTF-8 slot, zero-padded after text
+
+### 262286B fixed signed (FileSlice)
+```
+FileSlice (25): type_code(1) | created_at_ms(8) | file_id(32) | slice_number(4) | ciphertext(262144) | signed_by(32) | signer_type(1) | signature(64) = 262286B
+```
+- ciphertext: canonical fixed 262144-byte (256 KiB) slot
+- final plaintext chunk is zero-padded before encryption; receiver uses `blob_bytes` from MessageAttachment for truncation
+
+### 345B fixed unsigned (BenchDep)
+```
+BenchDep (26): type_code(1) | created_at_ms(8) | dep_slots(10 × 32 = 320) | payload(16) = 345B
+```
+- 10 fixed dep slots; unused slots are all-zeros
+- no `dep_count` field; application counts non-zero slots
+
+### Canonical text slot rules
+1. UTF-8 required (reject invalid UTF-8 sequences)
+2. Zero-padding required: all bytes after the last content byte must be 0x00
+3. No non-zero bytes may appear after the first 0x00 byte in a text slot (NUL-terminated, then zero-padded)
+4. Encodings are unique: one valid byte representation per logical text content
+
+### Parser canonicalization boundary (TLA+ non-modeled)
+The TLA+ models cover event-graph semantics (dependencies, guards, trust transitions).
+The following parser-level canonicalization guarantees are enforced in Rust but not modeled in TLA+:
+1. Fixed wire sizes per event type (no length-field-controlled boundaries)
+2. Zero-padding enforcement on text and dep slots
+3. UTF-8 validity for text slots
+4. Deterministic ciphertext sizing for encrypted events by `inner_type_code`
 
 ## TLA+ Invariants → Rust Test Assertions
 

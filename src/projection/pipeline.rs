@@ -1981,6 +1981,8 @@ mod tests {
 
     #[test]
     fn test_encrypted_inner_type_mismatch_rejects() {
+        use crate::events::fixed_layout;
+
         let conn = setup();
         let recorded_by = "peer1";
         let key_bytes: [u8; 32] = rand::random();
@@ -1990,18 +1992,33 @@ mod tests {
         let sk_eid = insert_event_raw(&conn, recorded_by, &sk_blob);
         project_one(&conn, recorded_by, &sk_eid).unwrap();
 
-        // Create identity chain for signing the inner message
-        let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
+        // Craft a reaction-sized blob whose first byte is MESSAGE type (1)
+        // to trigger inner type mismatch at the pipeline level.
+        let reaction_wire_size = fixed_layout::REACTION_WIRE_SIZE;
+        let mut fake_inner = vec![0u8; reaction_wire_size];
+        fake_inner[0] = EVENT_TYPE_MESSAGE; // wrong: says message, envelope says reaction
 
-        // Create a message but declare inner_type_code=2 (reaction)
-        let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "type mismatch");
-        let (_enc, enc_blob) = make_encrypted_event(&key_bytes, &msg_blob, 2, &sk_eid);
+        let (nonce, ciphertext, auth_tag) = encrypt_event_blob(&key_bytes, &fake_inner).unwrap();
+        let enc = ParsedEvent::Encrypted(EncryptedEvent {
+            created_at_ms: now_ms(),
+            key_event_id: sk_eid,
+            inner_type_code: EVENT_TYPE_REACTION, // declares reaction
+            nonce,
+            ciphertext, // 234 bytes, matches reaction wire size
+            auth_tag,
+        });
+        let enc_blob = events::encode_event(&enc).unwrap();
         let enc_eid = insert_event_raw(&conn, recorded_by, &enc_blob);
 
         let result = project_one(&conn, recorded_by, &enc_eid).unwrap();
         match result {
             ProjectionDecision::Reject { reason } => {
-                assert!(reason.contains("inner type mismatch"), "reason: {}", reason);
+                // In fixed-size world, type mismatch manifests as parse error:
+                // the 234-byte ciphertext decrypts but can't parse as type 1 (1194 bytes)
+                assert!(
+                    reason.contains("inner type mismatch") || reason.contains("inner event parse error"),
+                    "reason: {}", reason
+                );
             }
             other => panic!("expected Reject, got {:?}", other),
         }
@@ -2009,6 +2026,8 @@ mod tests {
 
     #[test]
     fn test_encrypted_nested_rejects() {
+        use crate::events::fixed_layout;
+
         let conn = setup();
         let recorded_by = "peer1";
         let key_bytes: [u8; 32] = rand::random();
@@ -2018,23 +2037,31 @@ mod tests {
         let sk_eid = insert_event_raw(&conn, recorded_by, &sk_blob);
         project_one(&conn, recorded_by, &sk_eid).unwrap();
 
-        // Create identity chain for signing the inner message
+        // inner_type_code=5 (encrypted) is now rejected at parser level
+        // (encrypted_inner_wire_size returns None). Construct raw blob manually.
         let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
-
-        // Create inner encrypted event
         let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "nested inner");
         let (_inner_enc, inner_enc_blob) =
             make_encrypted_event(&key_bytes, &msg_blob, EVENT_TYPE_MESSAGE, &sk_eid);
 
-        // Encrypt the encrypted event
-        let (_outer_enc, outer_enc_blob) =
-            make_encrypted_event(&key_bytes, &inner_enc_blob, EVENT_TYPE_ENCRYPTED, &sk_eid);
-        let outer_eid = insert_event_raw(&conn, recorded_by, &outer_enc_blob);
+        // Manually build an outer encrypted blob with inner_type_code=5
+        let (nonce, raw_ct, auth_tag) = encrypt_event_blob(&key_bytes, &inner_enc_blob).unwrap();
+        let total = fixed_layout::ENCRYPTED_HEADER_BYTES + raw_ct.len() + fixed_layout::ENCRYPTED_AUTH_TAG_BYTES;
+        let mut buf = vec![0u8; total];
+        buf[0] = EVENT_TYPE_ENCRYPTED;
+        buf[1..9].copy_from_slice(&now_ms().to_le_bytes());
+        buf[9..41].copy_from_slice(&sk_eid);
+        buf[41] = EVENT_TYPE_ENCRYPTED; // inner_type_code = 5 (nested)
+        buf[42..54].copy_from_slice(&nonce);
+        buf[54..54 + raw_ct.len()].copy_from_slice(&raw_ct);
+        buf[54 + raw_ct.len()..].copy_from_slice(&auth_tag);
 
+        let outer_eid = insert_event_raw(&conn, recorded_by, &buf);
         let result = project_one(&conn, recorded_by, &outer_eid).unwrap();
         match result {
             ProjectionDecision::Reject { reason } => {
-                assert!(reason.contains("nested encryption"), "reason: {}", reason);
+                // Parser rejects unknown inner_type_code=5 before pipeline even runs
+                assert!(reason.contains("parse error"), "reason: {}", reason);
             }
             other => panic!("expected Reject, got {:?}", other),
         }
@@ -3427,13 +3454,18 @@ mod tests {
         signer_event_id: &EventId,
         file_id: [u8; 32],
         slice_number: u32,
-        ciphertext: &[u8],
+        ciphertext_seed: &[u8],
     ) -> (ParsedEvent, Vec<u8>) {
+        use crate::events::fixed_layout::FILE_SLICE_CIPHERTEXT_BYTES;
+        // Pad to canonical fixed size (short seeds are zero-extended)
+        let mut ciphertext = vec![0u8; FILE_SLICE_CIPHERTEXT_BYTES];
+        let len = ciphertext_seed.len().min(FILE_SLICE_CIPHERTEXT_BYTES);
+        ciphertext[..len].copy_from_slice(&ciphertext_seed[..len]);
         let fs = FileSliceEvent {
             created_at_ms: now_ms(),
             file_id,
             slice_number,
-            ciphertext: ciphertext.to_vec(),
+            ciphertext,
             signed_by: *signer_event_id,
             signer_type: 5,
             signature: [0u8; 64],

@@ -322,29 +322,29 @@ Define event shape once and drive these from it:
 Field encoding kinds:
 - `fixed_bytes(N)`
 - `u8/u16/u32/u64`
-- `var_bytes(len_prefix=u16|max_len=...)`
-- `var_string(len_prefix=u16|max_len=..., utf8=true)`
+- `fixed_text(N, utf8=true, zero_pad=true)` — fixed-size UTF-8 text slot, zero-padded after content
+- `fixed_ciphertext(N)` — fixed-size opaque byte slot
+
+Removed (no longer canonical):
+- ~~`var_bytes(len_prefix=u16|max_len=...)`~~
+- ~~`var_string(len_prefix=u16|max_len=..., utf8=true)`~~
+
+No canonical event parser uses a length or count field to determine body boundaries.
 
 ## 5.2 Wire format direction
 
 - Flat fields per type.
 - Deterministic field order from schema.
-- Fixed field definitions but variable total event sizes by type.
-- Length-prefixed framing for sync transport.
+- Every canonical event type has a fixed total wire size (deterministic by type code).
+- Encrypted events have wire size deterministic by `inner_type_code`.
+- Length-prefixed framing for sync transport (frame-level `payload_len` only; no in-event length fields).
 
-This supports large events like `file_slice` while keeping deterministic signing/parsing.
+This supports deterministic parsing by type dispatch and fixed offsets (langsec-first).
 
-`codex-simplified` migration note:
-- current code paths using global fixed sizes (`ENVELOPE_SIZE`, `EVENT_SIZE`) must be treated as temporary.
-- replace with:
-  1. sync frame header carrying message type + payload length,
-  2. event decoder dispatch by `event_type` schema,
-  3. per-type bounds checks from schema max lengths.
-- `payload_len` is a framing delimiter, not semantic authority:
-  - for fixed-size event types it must exactly match schema size,
-  - for variable-size types decoder must consume exactly `payload_len`,
-  - any mismatch rejects the frame.
-- do not keep any global fixed event blob size constant once Phase 4 is complete.
+`payload_len` is a framing delimiter, not semantic authority:
+- it must exactly match the schema-defined fixed size for the event type,
+- for encrypted events it must match the size determined by `inner_type_code`,
+- any mismatch rejects the frame.
 
 ## 5.3 Signer and recording semantics (explicit)
 

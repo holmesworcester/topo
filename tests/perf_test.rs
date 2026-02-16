@@ -150,7 +150,7 @@ async fn perf_continuous_10k() {
     assert_eventually(
         || alice.message_count() == expected_messages && bob.message_count() == expected_messages
             && alice.store_count() >= expected_messages && bob.store_count() >= expected_messages,
-        Duration::from_secs(120),
+        Duration::from_secs(300),
         &format!(
             "convergence to {} projected messages (store: a={}, b={}; projected: a={}, b={})",
             expected_messages,

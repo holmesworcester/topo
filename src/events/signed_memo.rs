@@ -1,28 +1,33 @@
+use super::fixed_layout::{self, SIGNED_MEMO_WIRE_SIZE, SIGNED_MEMO_CONTENT_BYTES, signed_memo_offsets as off};
 use super::registry::{EventTypeMeta, ShareScope};
 use super::{EventError, ParsedEvent, EVENT_TYPE_SIGNED_MEMO};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignedMemoEvent {
     pub created_at_ms: u64,
-    pub signed_by: [u8; 32],  // event_id of signer key event
-    pub signer_type: u8,      // 0=peer (future: 1=user, 2=workspace, 3=invite)
+    pub signed_by: [u8; 32],
+    pub signer_type: u8,
     pub content: String,
-    pub signature: [u8; 64],  // Ed25519 signature (trailing in blob)
+    pub signature: [u8; 64],
 }
 
-/// Wire format (variable):
+/// Wire format (1130 bytes fixed, signed):
 /// [0]            type_code = 4
 /// [1..9]         created_at_ms (u64 LE)
 /// [9..41]        signed_by (32 bytes)
 /// [41]           signer_type (1 byte)
-/// [42..44]       content_len (u16 LE)
-/// [44..44+N]     content (UTF-8)
-/// [44+N..44+N+64] signature (64 bytes, trailing)
+/// [42..1066]     content (1024 bytes, UTF-8 zero-padded)
+/// [1066..1130]   signature (64 bytes)
 pub fn parse_signed_memo(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    // Minimum: type(1) + created_at(8) + signed_by(32) + signer_type(1) + content_len(2) + signature(64) = 108
-    if blob.len() < 108 {
+    if blob.len() < SIGNED_MEMO_WIRE_SIZE {
         return Err(EventError::TooShort {
-            expected: 108,
+            expected: SIGNED_MEMO_WIRE_SIZE,
+            actual: blob.len(),
+        });
+    }
+    if blob.len() > SIGNED_MEMO_WIRE_SIZE {
+        return Err(EventError::TrailingData {
+            expected: SIGNED_MEMO_WIRE_SIZE,
             actual: blob.len(),
         });
     }
@@ -33,32 +38,18 @@ pub fn parse_signed_memo(blob: &[u8]) -> Result<ParsedEvent, EventError> {
         });
     }
 
-    let created_at_ms = u64::from_le_bytes(blob[1..9].try_into().unwrap());
+    let created_at_ms = u64::from_le_bytes(blob[off::CREATED_AT..off::SIGNED_BY].try_into().unwrap());
 
     let mut signed_by = [0u8; 32];
-    signed_by.copy_from_slice(&blob[9..41]);
+    signed_by.copy_from_slice(&blob[off::SIGNED_BY..off::SIGNER_TYPE]);
 
-    let signer_type = blob[41];
+    let signer_type = blob[off::SIGNER_TYPE];
 
-    let content_len = u16::from_le_bytes(blob[42..44].try_into().unwrap()) as usize;
-    let expected_len = 44 + content_len + 64;
-    if blob.len() < expected_len {
-        return Err(EventError::TooShort {
-            expected: expected_len,
-            actual: blob.len(),
-        });
-    }
-    if blob.len() > expected_len {
-        return Err(EventError::TrailingData {
-            expected: expected_len,
-            actual: blob.len(),
-        });
-    }
-
-    let content = String::from_utf8_lossy(&blob[44..44 + content_len]).to_string();
+    let content = fixed_layout::read_text_slot(&blob[off::CONTENT..off::CONTENT + SIGNED_MEMO_CONTENT_BYTES])
+        .map_err(EventError::TextSlot)?;
 
     let mut signature = [0u8; 64];
-    signature.copy_from_slice(&blob[44 + content_len..44 + content_len + 64]);
+    signature.copy_from_slice(&blob[off::SIGNATURE..off::SIGNATURE + 64]);
 
     Ok(ParsedEvent::SignedMemo(SignedMemoEvent {
         created_at_ms,
@@ -76,20 +67,19 @@ pub fn encode_signed_memo(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     };
 
     let content_bytes = memo.content.as_bytes();
-    if content_bytes.len() > 65535 {
+    if content_bytes.len() > SIGNED_MEMO_CONTENT_BYTES {
         return Err(EventError::ContentTooLong(content_bytes.len()));
     }
 
-    let total = 44 + content_bytes.len() + 64;
-    let mut buf = Vec::with_capacity(total);
+    let mut buf = vec![0u8; SIGNED_MEMO_WIRE_SIZE];
 
-    buf.push(EVENT_TYPE_SIGNED_MEMO);
-    buf.extend_from_slice(&memo.created_at_ms.to_le_bytes());
-    buf.extend_from_slice(&memo.signed_by);
-    buf.push(memo.signer_type);
-    buf.extend_from_slice(&(content_bytes.len() as u16).to_le_bytes());
-    buf.extend_from_slice(content_bytes);
-    buf.extend_from_slice(&memo.signature);
+    buf[off::TYPE_CODE] = EVENT_TYPE_SIGNED_MEMO;
+    buf[off::CREATED_AT..off::SIGNED_BY].copy_from_slice(&memo.created_at_ms.to_le_bytes());
+    buf[off::SIGNED_BY..off::SIGNER_TYPE].copy_from_slice(&memo.signed_by);
+    buf[off::SIGNER_TYPE] = memo.signer_type;
+    fixed_layout::write_text_slot(&memo.content, &mut buf[off::CONTENT..off::CONTENT + SIGNED_MEMO_CONTENT_BYTES])
+        .map_err(EventError::TextSlot)?;
+    buf[off::SIGNATURE..off::SIGNATURE + 64].copy_from_slice(&memo.signature);
 
     Ok(buf)
 }

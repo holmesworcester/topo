@@ -1,3 +1,4 @@
+use super::fixed_layout::{self, REACTION_WIRE_SIZE, REACTION_EMOJI_BYTES, reaction_offsets as off};
 use super::registry::{EventTypeMeta, ShareScope};
 use super::{EventError, ParsedEvent, EVENT_TYPE_REACTION};
 
@@ -12,21 +13,25 @@ pub struct ReactionEvent {
     pub signature: [u8; 64],
 }
 
-/// Wire format (min 172 bytes, signed):
+/// Wire format (234 bytes fixed, signed):
 /// [0]            type=2
 /// [1..9]         created_at_ms (u64 LE)
 /// [9..41]        target_event_id (32 bytes)
 /// [41..73]       author_id (32 bytes)
-/// [73..75]       emoji_len (u16 LE)
-/// [75..75+N]     emoji (UTF-8)
-/// --- signature trailer (97 bytes) ---
-/// [75+N..75+N+32]  signed_by (32 bytes)
-/// [75+N+32]        signer_type (1 byte)
-/// [75+N+33..75+N+97] signature (64 bytes)
+/// [73..137]      emoji (64 bytes, UTF-8 zero-padded)
+/// [137..169]     signed_by (32 bytes)
+/// [169]          signer_type (1 byte)
+/// [170..234]     signature (64 bytes)
 pub fn parse_reaction(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    if blob.len() < 172 {
+    if blob.len() < REACTION_WIRE_SIZE {
         return Err(EventError::TooShort {
-            expected: 172,
+            expected: REACTION_WIRE_SIZE,
+            actual: blob.len(),
+        });
+    }
+    if blob.len() > REACTION_WIRE_SIZE {
+        return Err(EventError::TrailingData {
+            expected: REACTION_WIRE_SIZE,
             actual: blob.len(),
         });
     }
@@ -37,39 +42,24 @@ pub fn parse_reaction(blob: &[u8]) -> Result<ParsedEvent, EventError> {
         });
     }
 
-    let created_at_ms = u64::from_le_bytes(blob[1..9].try_into().unwrap());
+    let created_at_ms = u64::from_le_bytes(blob[off::CREATED_AT..off::TARGET_EVENT_ID].try_into().unwrap());
 
     let mut target_event_id = [0u8; 32];
-    target_event_id.copy_from_slice(&blob[9..41]);
+    target_event_id.copy_from_slice(&blob[off::TARGET_EVENT_ID..off::AUTHOR_ID]);
 
     let mut author_id = [0u8; 32];
-    author_id.copy_from_slice(&blob[41..73]);
+    author_id.copy_from_slice(&blob[off::AUTHOR_ID..off::EMOJI]);
 
-    let emoji_len = u16::from_le_bytes(blob[73..75].try_into().unwrap()) as usize;
-    let expected_len = 75 + emoji_len + 97;
-    if blob.len() < expected_len {
-        return Err(EventError::TooShort {
-            expected: expected_len,
-            actual: blob.len(),
-        });
-    }
-    if blob.len() > expected_len {
-        return Err(EventError::TrailingData {
-            expected: expected_len,
-            actual: blob.len(),
-        });
-    }
+    let emoji = fixed_layout::read_text_slot(&blob[off::EMOJI..off::EMOJI + REACTION_EMOJI_BYTES])
+        .map_err(EventError::TextSlot)?;
 
-    let emoji = String::from_utf8_lossy(&blob[75..75 + emoji_len]).to_string();
-
-    let trailer_start = 75 + emoji_len;
     let mut signed_by = [0u8; 32];
-    signed_by.copy_from_slice(&blob[trailer_start..trailer_start + 32]);
+    signed_by.copy_from_slice(&blob[off::SIGNED_BY..off::SIGNER_TYPE]);
 
-    let signer_type = blob[trailer_start + 32];
+    let signer_type = blob[off::SIGNER_TYPE];
 
     let mut signature = [0u8; 64];
-    signature.copy_from_slice(&blob[trailer_start + 33..trailer_start + 97]);
+    signature.copy_from_slice(&blob[off::SIGNATURE..off::SIGNATURE + 64]);
 
     Ok(ParsedEvent::Reaction(ReactionEvent {
         created_at_ms,
@@ -89,22 +79,21 @@ pub fn encode_reaction(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     };
 
     let emoji_bytes = rxn.emoji.as_bytes();
-    if emoji_bytes.len() > 64 {
+    if emoji_bytes.len() > REACTION_EMOJI_BYTES {
         return Err(EventError::ContentTooLong(emoji_bytes.len()));
     }
 
-    let total = 75 + emoji_bytes.len() + 97;
-    let mut buf = Vec::with_capacity(total);
+    let mut buf = vec![0u8; REACTION_WIRE_SIZE];
 
-    buf.push(EVENT_TYPE_REACTION);
-    buf.extend_from_slice(&rxn.created_at_ms.to_le_bytes());
-    buf.extend_from_slice(&rxn.target_event_id);
-    buf.extend_from_slice(&rxn.author_id);
-    buf.extend_from_slice(&(emoji_bytes.len() as u16).to_le_bytes());
-    buf.extend_from_slice(emoji_bytes);
-    buf.extend_from_slice(&rxn.signed_by);
-    buf.push(rxn.signer_type);
-    buf.extend_from_slice(&rxn.signature);
+    buf[off::TYPE_CODE] = EVENT_TYPE_REACTION;
+    buf[off::CREATED_AT..off::TARGET_EVENT_ID].copy_from_slice(&rxn.created_at_ms.to_le_bytes());
+    buf[off::TARGET_EVENT_ID..off::AUTHOR_ID].copy_from_slice(&rxn.target_event_id);
+    buf[off::AUTHOR_ID..off::EMOJI].copy_from_slice(&rxn.author_id);
+    fixed_layout::write_text_slot(&rxn.emoji, &mut buf[off::EMOJI..off::EMOJI + REACTION_EMOJI_BYTES])
+        .map_err(EventError::TextSlot)?;
+    buf[off::SIGNED_BY..off::SIGNER_TYPE].copy_from_slice(&rxn.signed_by);
+    buf[off::SIGNER_TYPE] = rxn.signer_type;
+    buf[off::SIGNATURE..off::SIGNATURE + 64].copy_from_slice(&rxn.signature);
 
     Ok(buf)
 }
