@@ -9,6 +9,7 @@ use crate::db::{
     open_connection,
     schema::create_tables,
 };
+use crate::service;
 use crate::events::*;
 use crate::identity_ops::{self, IdentityChain, InviteType};
 use crate::invite_link::{create_invite_link, parse_invite_link, InviteLinkKind};
@@ -548,19 +549,18 @@ fn cmd_send(
         .as_ref()
         .ok_or("No signing key.")?
         .clone();
-    let msg = ParsedEvent::Message(MessageEvent {
-        created_at_ms: now_ms(),
+    let resp = service::svc_send_conn(
+        &conn,
+        &account.identity,
+        &peer_shared_eid,
+        &peer_shared_key,
         workspace_id,
-        author_id: account.author_id,
-        content: content.clone(),
-        signed_by: peer_shared_eid,
-        signer_type: 5,
-        signature: [0u8; 64],
-    });
-    let eid = create_signed_event_sync(&conn, &account.identity, &msg, &peer_shared_key)?;
-    let eid_b64 = event_id_to_base64(&eid);
+        account.author_id,
+        &content,
+    )
+    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() })?;
 
-    writeln!(out, "Sent: {} ({})", content, &eid_b64[..8])?;
+    writeln!(out, "Sent: {} ({})", content, &resp.event_id[..8])?;
 
     Ok(())
 }
@@ -581,24 +581,10 @@ fn cmd_messages(
         .map(|a| (base64_encode(&a.author_id), a.user_name.clone()))
         .collect();
 
-    let mut stmt = conn.prepare(
-        "SELECT message_id, author_id, content, created_at
-         FROM messages WHERE recorded_by = ?1
-         ORDER BY created_at ASC, rowid ASC",
-    )?;
+    let resp = service::svc_messages_conn(&conn, &account.identity, 0)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() })?;
 
-    let rows: Vec<(String, String, String, i64)> = stmt
-        .query_map(rusqlite::params![&account.identity], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)?,
-            ))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-
-    // Check deleted messages
+    // Enrichment: check deleted messages
     let deleted_targets: Vec<String> = {
         let mut del_stmt =
             conn.prepare("SELECT message_id FROM deleted_messages WHERE recorded_by = ?1")?;
@@ -619,27 +605,27 @@ fn cmd_messages(
         .unwrap_or("?");
 
     writeln!(out, "MESSAGES (#{}):", ch_name)?;
-    if rows.is_empty() {
+    if resp.messages.is_empty() {
         writeln!(out, "  (no messages)")?;
     } else {
         let mut num = 0;
-        for (msg_id, author_id, content, _created_at) in &rows {
+        for msg in &resp.messages {
             num += 1;
-            if deleted_targets.contains(msg_id) {
+            if deleted_targets.contains(&msg.id_b64) {
                 writeln!(out, "  {}. [deleted]", num)?;
             } else {
                 let author_name = author_map
-                    .get(author_id)
+                    .get(&msg.author_id)
                     .cloned()
                     .unwrap_or_else(|| "?".to_string());
-                writeln!(out, "  {}. [{}] {}", num, author_name, content)?;
+                writeln!(out, "  {}. [{}] {}", num, author_name, msg.content)?;
 
-                // Show reactions inline
+                // Enrichment: show reactions inline
                 let mut rxn_stmt = conn.prepare(
                     "SELECT emoji FROM reactions WHERE recorded_by = ?1 AND target_event_id = ?2",
                 )?;
                 let emojis: Vec<String> = rxn_stmt
-                    .query_map(rusqlite::params![&account.identity, msg_id], |row| {
+                    .query_map(rusqlite::params![&account.identity, &msg.id_b64], |row| {
                         row.get::<_, String>(0)
                     })?
                     .collect::<Result<Vec<_>, _>>()?;
@@ -691,21 +677,16 @@ fn cmd_react(
         .as_ref()
         .ok_or("No signing key.")?
         .clone();
-    let rxn = ParsedEvent::Reaction(ReactionEvent {
-        created_at_ms: now_ms(),
-        target_event_id,
-        author_id: account.author_id,
-        emoji: emoji.to_string(),
-        signed_by: peer_shared_eid,
-        signer_type: 5,
-        signature: [0u8; 64],
-    });
-    create_signed_event_sync(
+    service::svc_react_conn(
         &conn,
         &account.identity,
-        &rxn,
+        &peer_shared_eid,
         &peer_shared_key,
-    )?;
+        account.author_id,
+        target_event_id,
+        emoji,
+    )
+    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() })?;
 
     writeln!(out, "Reacted {} to message {}", emoji, msg_num)?;
 
@@ -773,20 +754,15 @@ fn cmd_delete(
         .as_ref()
         .ok_or("No signing key.")?
         .clone();
-    let del = ParsedEvent::MessageDeletion(MessageDeletionEvent {
-        created_at_ms: now_ms(),
-        target_event_id,
-        author_id: account.author_id,
-        signed_by: peer_shared_eid,
-        signer_type: 5,
-        signature: [0u8; 64],
-    });
-    create_signed_event_sync(
+    service::svc_delete_message_conn(
         &conn,
         &account.identity,
-        &del,
+        &peer_shared_eid,
         &peer_shared_key,
-    )?;
+        account.author_id,
+        target_event_id,
+    )
+    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() })?;
 
     writeln!(out, "Deleted message {}", msg_num)?;
 
@@ -1255,20 +1231,15 @@ fn cmd_users(
     let account = session.active_account().ok_or("No active account.")?;
 
     let conn = open_connection(&account.db_path)?;
-
-    let mut stmt = conn.prepare("SELECT event_id, public_key FROM users WHERE recorded_by = ?1")?;
-    let users: Vec<(String, Vec<u8>)> = stmt
-        .query_map(rusqlite::params![&account.identity], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+    let items = service::svc_users_conn(&conn, &account.identity)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() })?;
 
     writeln!(out, "USERS:")?;
-    if users.is_empty() {
+    if items.is_empty() {
         writeln!(out, "  (none)")?;
     } else {
-        for (i, (eid, _pubkey)) in users.iter().enumerate() {
-            writeln!(out, "  {}. user_{}", i + 1, &eid[..8])?;
+        for (i, item) in items.iter().enumerate() {
+            writeln!(out, "  {}. user_{}", i + 1, &item.event_id[..8])?;
         }
     }
 
@@ -1284,78 +1255,30 @@ fn cmd_keys(
 
     let summary = args.contains(&"--summary");
     let conn = open_connection(&account.db_path)?;
+    let resp = service::svc_keys_conn(&conn, &account.identity, summary)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() })?;
 
     if summary {
-        let user_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM users WHERE recorded_by = ?1",
-                rusqlite::params![&account.identity],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-        let peer_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM peers_shared WHERE recorded_by = ?1",
-                rusqlite::params![&account.identity],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-        let admin_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM admins WHERE recorded_by = ?1",
-                rusqlite::params![&account.identity],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-        let transport_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM transport_keys WHERE recorded_by = ?1",
-                rusqlite::params![&account.identity],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-
         writeln!(out, "KEYS SUMMARY:")?;
-        writeln!(out, "  Users: {}", user_count)?;
-        writeln!(out, "  Peers: {}", peer_count)?;
-        writeln!(out, "  Admins: {}", admin_count)?;
-        writeln!(out, "  TransportKeys: {}", transport_count)?;
+        writeln!(out, "  Users: {}", resp.user_count)?;
+        writeln!(out, "  Peers: {}", resp.peer_count)?;
+        writeln!(out, "  Admins: {}", resp.admin_count)?;
+        writeln!(out, "  TransportKeys: {}", resp.transport_count)?;
     } else {
         writeln!(out, "KEYS:")?;
 
-        // Users
-        let mut stmt = conn.prepare("SELECT event_id FROM users WHERE recorded_by = ?1")?;
-        let users: Vec<String> = stmt
-            .query_map(rusqlite::params![&account.identity], |row| {
-                row.get::<_, String>(0)
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        writeln!(out, "  Users: {}", users.len())?;
-        for eid in &users {
+        writeln!(out, "  Users: {}", resp.user_count)?;
+        for eid in &resp.users {
             writeln!(out, "    {}", &eid[..eid.len().min(12)])?;
         }
 
-        // Peers
-        let mut stmt = conn.prepare("SELECT event_id FROM peers_shared WHERE recorded_by = ?1")?;
-        let peers: Vec<String> = stmt
-            .query_map(rusqlite::params![&account.identity], |row| {
-                row.get::<_, String>(0)
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        writeln!(out, "  Peers: {}", peers.len())?;
-        for eid in &peers {
+        writeln!(out, "  Peers: {}", resp.peer_count)?;
+        for eid in &resp.peers {
             writeln!(out, "    {}", &eid[..eid.len().min(12)])?;
         }
 
-        // Admins
-        let mut stmt = conn.prepare("SELECT event_id FROM admins WHERE recorded_by = ?1")?;
-        let admins: Vec<String> = stmt
-            .query_map(rusqlite::params![&account.identity], |row| {
-                row.get::<_, String>(0)
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        writeln!(out, "  Admins: {}", admins.len())?;
-        for eid in &admins {
+        writeln!(out, "  Admins: {}", resp.admin_count)?;
+        for eid in &resp.admins {
             writeln!(out, "    {}", &eid[..eid.len().min(12)])?;
         }
     }
@@ -1370,30 +1293,24 @@ fn cmd_workspaces(
     let account = session.active_account().ok_or("No active account.")?;
 
     let conn = open_connection(&account.db_path)?;
-
-    let mut stmt =
-        conn.prepare("SELECT event_id, workspace_id FROM workspaces WHERE recorded_by = ?1")?;
-    let workspaces: Vec<(String, String)> = stmt
-        .query_map(rusqlite::params![&account.identity], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+    let items = service::svc_workspaces_conn(&conn, &account.identity)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() })?;
 
     writeln!(out, "WORKSPACES:")?;
-    if workspaces.is_empty() {
+    if items.is_empty() {
         writeln!(out, "  (none)")?;
     } else {
         let active_workspace_id = account.workspace_id.map(|id| event_id_to_base64(&id));
-        for (i, (eid, workspace_id_b64)) in workspaces.iter().enumerate() {
-            let label = if active_workspace_id.as_deref() == Some(workspace_id_b64.as_str()) {
+        for (i, item) in items.iter().enumerate() {
+            let label = if active_workspace_id.as_deref() == Some(item.workspace_id.as_str()) {
                 account
                     .workspace_name
                     .clone()
-                    .unwrap_or_else(|| workspace_id_b64.clone())
+                    .unwrap_or_else(|| item.workspace_id.clone())
             } else {
-                workspace_id_b64.clone()
+                item.workspace_id.clone()
             };
-            writeln!(out, "  {}. {} ({})", i + 1, label, &eid[..eid.len().min(8)])?;
+            writeln!(out, "  {}. {} ({})", i + 1, label, &item.event_id[..item.event_id.len().min(8)])?;
         }
     }
 
@@ -1407,24 +1324,8 @@ fn cmd_status(
     let account = session.active_account().ok_or("No active account.")?;
 
     let conn = open_connection(&account.db_path)?;
-
-    let events_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
-        .unwrap_or(0);
-    let messages_count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
-            rusqlite::params![&account.identity],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-    let reactions_count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM reactions WHERE recorded_by = ?1",
-            rusqlite::params![&account.identity],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
+    let resp = service::svc_status_conn(&conn, &account.identity)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() })?;
 
     // Network name
     let network_name = account
@@ -1442,9 +1343,9 @@ fn cmd_status(
         .unwrap_or_else(|| "(none)".to_string());
 
     writeln!(out, "STATUS ({}):", account.user_name)?;
-    writeln!(out, "  Events:    {}", events_count)?;
-    writeln!(out, "  Messages:  {}", messages_count)?;
-    writeln!(out, "  Reactions: {}", reactions_count)?;
+    writeln!(out, "  Events:    {}", resp.events_count)?;
+    writeln!(out, "  Messages:  {}", resp.messages_count)?;
+    writeln!(out, "  Reactions: {}", resp.reactions_count)?;
     writeln!(out, "  Workspace: {}", network_name)?;
     writeln!(out, "  Channel:   {}", ch_name)?;
 
