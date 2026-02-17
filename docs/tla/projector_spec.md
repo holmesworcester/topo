@@ -337,14 +337,10 @@ TLC status (run on 2026-02-17):
 
 1. `cd docs/tla && ./tlc event_graph_schema_fast.cfg`:
    - fails `InvAllValidRequireWorkspace`.
-   - counterexample path includes `invite_accepted` + `transport_key` becoming valid without `workspace`.
-   - trace file emitted: `docs/tla/EventGraphSchema_TTrace_1771345823.tla`.
-2. `cd docs/tla && java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -config transport_credential_lifecycle_fast.cfg -workers auto TransportCredentialLifecycle`:
+   - counterexample path includes `transport_key` becoming valid without `workspace` in one-step traces from bootstrap-carried states.
+   - trace file emitted under `docs/tla/EventGraphSchema_TTrace_*.tla`.
+2. `cd docs/tla && ./tlc TransportCredentialLifecycle transport_credential_lifecycle_fast.cfg`:
    - passes (no invariant violations).
-
-Note: `docs/tla/tlc` currently hardcodes `EventGraphSchema` as the module target,
-so `transport_credential_lifecycle_fast.cfg` must be run with direct `java ... tlc2.TLC`
-until the wrapper script is generalized.
 
 ### collapse-single-tenant per-tenant outbound trust (2026-02-17)
 

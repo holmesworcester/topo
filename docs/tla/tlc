@@ -1,12 +1,36 @@
 #!/usr/bin/env bash
 # Run TLC model checker with recommended JVM flags.
-# Usage: ./tlc <config.cfg> [extra TLC args...]
-#   e.g. ./tlc event_graph_schema.cfg
-#        ./tlc event_graph_schema_bootstrap.cfg -workers auto
+# Usage:
+#   ./tlc <config.cfg> [extra TLC args...]
+#   ./tlc <ModuleName> <config.cfg> [extra TLC args...]
+# Examples:
+#   ./tlc event_graph_schema.cfg
+#   ./tlc EventGraphSchema event_graph_schema_bootstrap.cfg -workers auto
+#   ./tlc TransportCredentialLifecycle transport_credential_lifecycle_fast.cfg
 set -euo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
-CFG="${1:?Usage: $0 <config.cfg> [extra TLC args...]}"
-shift
+if [[ $# -lt 1 ]]; then
+  echo "Usage: $0 [<ModuleName>] <config.cfg> [extra TLC args...]" >&2
+  exit 2
+fi
+
+MODULE="EventGraphSchema"
+if [[ "${1}" == *.cfg ]]; then
+  CFG="${1}"
+  shift
+else
+  MODULE="${1}"
+  shift
+  CFG="${1:?Usage: $0 [<ModuleName>] <config.cfg> [extra TLC args...]}"
+  shift
+fi
+
+SPEC_PATH="$DIR/$MODULE"
+if [[ ! -f "${SPEC_PATH}.tla" ]]; then
+  echo "Spec module not found: ${SPEC_PATH}.tla" >&2
+  exit 2
+fi
+
 exec java \
   -XX:+UseParallelGC \
   -cp "$DIR/tla2tools.jar" \
@@ -14,4 +38,4 @@ exec java \
   -config "$CFG" \
   -workers auto \
   "$@" \
-  "$DIR/EventGraphSchema"
+  "$SPEC_PATH"
