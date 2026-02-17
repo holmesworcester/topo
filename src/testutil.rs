@@ -1507,6 +1507,15 @@ pub fn start_peers_dynamic(
 pub fn create_dynamic_endpoint_for_peer(
     peer: &Peer,
 ) -> quinn::Endpoint {
+    create_dynamic_endpoint_for_peer_bind(peer, "127.0.0.1:0".parse().unwrap())
+}
+
+/// Like [`create_dynamic_endpoint_for_peer`] but with a caller-specified bind
+/// address. Use `0.0.0.0:0` when mDNS-resolved addresses may be non-loopback.
+pub fn create_dynamic_endpoint_for_peer_bind(
+    peer: &Peer,
+    bind_addr: std::net::SocketAddr,
+) -> quinn::Endpoint {
     use crate::db::transport_trust::is_peer_allowed;
 
     let (cert, key) = peer.cert_and_key();
@@ -1519,7 +1528,7 @@ pub fn create_dynamic_endpoint_for_peer(
         });
 
     create_dual_endpoint_dynamic(
-        "127.0.0.1:0".parse().unwrap(),
+        bind_addr,
         cert,
         key,
         dynamic_allow,

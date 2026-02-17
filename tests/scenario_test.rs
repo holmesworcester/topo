@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use poc_7::testutil::{Peer, SharedDbNode, ScenarioHarness, start_peers, assert_eventually, sync_until_converged};
 use poc_7::crypto::{event_id_to_base64, event_id_from_base64};
 use poc_7::transport::{
-    AllowedPeers, create_client_endpoint, create_dual_endpoint, create_server_endpoint,
+    AllowedPeers, create_client_endpoint, create_server_endpoint,
     extract_spki_fingerprint, peer_identity_from_connection,
 };
 use poc_7::sync::engine::{accept_loop, connect_loop};
@@ -506,6 +506,10 @@ async fn test_sync_50k() {
 
 /// Integration test: verify peer_identity_from_connection returns the correct
 /// SPKI fingerprint across a live QUIC mTLS handshake.
+///
+/// STATIC PINNING (intentional): this test validates TLS identity extraction
+/// mechanics, not transport trust resolution. Static AllowedPeers is the
+/// simplest way to stand up a handshake without DB state.
 #[tokio::test]
 async fn test_peer_identity_extraction_live_handshake() {
     let harness = ScenarioHarness::skip("transport handshake test, no projection state mutated");
@@ -3130,11 +3134,15 @@ async fn test_shared_db_same_workspace_two_tenants() {
 /// mDNS integration: two peers discover each other via mDNS and sync using
 /// the discovered address. Exercises the full flow: advertise → browse →
 /// discover → connect → sync → verify convergence.
+///
+/// Uses dynamic DB trust lookup (production-matching `is_peer_allowed`).
 #[cfg(feature = "discovery")]
 #[tokio::test]
 async fn test_mdns_two_peers_discover_and_sync() {
     use std::collections::HashSet;
     use poc_7::discovery::TenantDiscovery;
+    use poc_7::db::transport_trust::import_cli_pins_to_sql;
+    use poc_7::testutil::create_dynamic_endpoint_for_peer_bind;
 
     let alice = Peer::new_with_identity("mdns-alice");
     let bob = Peer::new_with_identity("mdns-bob");
@@ -3151,21 +3159,25 @@ async fn test_mdns_two_peers_discover_and_sync() {
     let bob_marker = bob.create_message("mdns-bob-marker");
     let bob_marker_b64 = event_id_to_base64(&bob_marker);
 
-    let (cert_a, key_a) = alice.cert_and_key();
-    let (cert_b, key_b) = bob.cert_and_key();
     let fp_a = alice.spki_fingerprint();
     let fp_b = bob.spki_fingerprint();
 
-    let allowed_for_a = Arc::new(AllowedPeers::from_fingerprints(vec![fp_b]));
-    let allowed_for_b = Arc::new(AllowedPeers::from_fingerprints(vec![fp_a]));
+    // Seed mutual trust via CLI pin import so dynamic trust lookup succeeds
+    {
+        let db_a = open_connection(&alice.db_path).expect("open A db");
+        import_cli_pins_to_sql(&db_a, &alice.identity, &AllowedPeers::from_fingerprints(vec![fp_b]))
+            .expect("import pins for A");
+    }
+    {
+        let db_b = open_connection(&bob.db_path).expect("open B db");
+        import_cli_pins_to_sql(&db_b, &bob.identity, &AllowedPeers::from_fingerprints(vec![fp_a]))
+            .expect("import pins for B");
+    }
 
-    // Bind to 0.0.0.0 so mDNS-resolved addresses (which may be non-loopback) are reachable
-    let ep_a = create_dual_endpoint(
-        "0.0.0.0:0".parse().unwrap(), cert_a, key_a, allowed_for_a,
-    ).expect("endpoint A");
-    let ep_b = create_dual_endpoint(
-        "0.0.0.0:0".parse().unwrap(), cert_b, key_b, allowed_for_b,
-    ).expect("endpoint B");
+    // Dynamic trust endpoints bound to 0.0.0.0 so mDNS-resolved addresses
+    // (which may be non-loopback) are reachable.
+    let ep_a = create_dynamic_endpoint_for_peer_bind(&alice, "0.0.0.0:0".parse().unwrap());
+    let ep_b = create_dynamic_endpoint_for_peer_bind(&bob, "0.0.0.0:0".parse().unwrap());
 
     let port_a = ep_a.local_addr().unwrap().port();
     let port_b = ep_b.local_addr().unwrap().port();
@@ -3236,11 +3248,15 @@ async fn test_mdns_two_peers_discover_and_sync() {
 /// mDNS multitenancy: verifies self-filtering (co-located tenants don't
 /// discover each other), external discovery (remote peer discovers all
 /// node tenants), and that sync works via the discovered address.
+///
+/// Uses dynamic DB trust lookup (production-matching `is_peer_allowed`).
 #[cfg(feature = "discovery")]
 #[tokio::test]
 async fn test_mdns_multitenant_self_filtering_and_sync() {
     use std::collections::HashSet;
     use poc_7::discovery::TenantDiscovery;
+    use poc_7::db::transport_trust::import_cli_pins_to_sql;
+    use poc_7::testutil::create_dynamic_endpoint_for_peer_bind;
 
     // Three peers: t0 and t1 are "co-located" (share local_peer_ids), ext is external
     let t0 = Peer::new_with_identity("mdns-t0");
@@ -3259,21 +3275,25 @@ async fn test_mdns_multitenant_self_filtering_and_sync() {
     let ext_marker = ext.create_message("mdns-ext-marker");
     let ext_marker_b64 = event_id_to_base64(&ext_marker);
 
-    // QUIC endpoints for t0 and ext (they'll sync); t1 only needs mDNS presence
-    let (cert_t0, key_t0) = t0.cert_and_key();
-    let (cert_ext, key_ext) = ext.cert_and_key();
     let fp_t0 = t0.spki_fingerprint();
     let fp_ext = ext.spki_fingerprint();
 
-    let allowed_t0 = Arc::new(AllowedPeers::from_fingerprints(vec![fp_ext]));
-    let allowed_ext = Arc::new(AllowedPeers::from_fingerprints(vec![fp_t0]));
+    // Seed mutual trust via CLI pin import so dynamic trust lookup succeeds
+    {
+        let db_t0 = open_connection(&t0.db_path).expect("open t0 db");
+        import_cli_pins_to_sql(&db_t0, &t0.identity, &AllowedPeers::from_fingerprints(vec![fp_ext]))
+            .expect("import pins for t0");
+    }
+    {
+        let db_ext = open_connection(&ext.db_path).expect("open ext db");
+        import_cli_pins_to_sql(&db_ext, &ext.identity, &AllowedPeers::from_fingerprints(vec![fp_t0]))
+            .expect("import pins for ext");
+    }
 
-    let ep_t0 = create_dual_endpoint(
-        "0.0.0.0:0".parse().unwrap(), cert_t0, key_t0, allowed_t0,
-    ).expect("endpoint t0");
-    let ep_ext = create_dual_endpoint(
-        "0.0.0.0:0".parse().unwrap(), cert_ext, key_ext, allowed_ext,
-    ).expect("endpoint ext");
+    // Dynamic trust endpoints bound to 0.0.0.0 so mDNS-resolved addresses are reachable.
+    // t1 only needs mDNS presence — no actual endpoint needed.
+    let ep_t0 = create_dynamic_endpoint_for_peer_bind(&t0, "0.0.0.0:0".parse().unwrap());
+    let ep_ext = create_dynamic_endpoint_for_peer_bind(&ext, "0.0.0.0:0".parse().unwrap());
 
     let port_t0 = ep_t0.local_addr().unwrap().port();
     let port_t1 = 19999; // mDNS presence only — no actual endpoint needed
@@ -3414,6 +3434,10 @@ async fn test_mdns_multitenant_self_filtering_and_sync() {
 ///
 /// Before the fix, `connect()` would present the default cert (first tenant's),
 /// causing the server to see the wrong identity for multi-tenant outbound dials.
+///
+/// STATIC PINNING (intentional): server uses static AllowedPeers because the
+/// test validates per-tenant cert presentation, not transport trust resolution.
+/// The client side already uses dynamic `DynamicAllowFn`.
 #[tokio::test]
 async fn test_connect_with_presents_correct_tenant_cert() {
     use poc_7::transport::{
@@ -3507,6 +3531,10 @@ async fn test_connect_with_presents_correct_tenant_cert() {
 ///
 /// Before the fix, the union-scoped trust check would accept ANY tenant's
 /// trusted peer, allowing cross-tenant trust bleed on outbound connections.
+///
+/// STATIC PINNING (intentional): servers use static AllowedPeers because the
+/// test validates client-side tenant-scoped trust rejection, not server trust
+/// resolution. The pinning policy boundary is the thing under test.
 #[tokio::test]
 async fn test_tenant_scoped_outbound_trust_rejects_untrusted_server() {
     use poc_7::transport::{

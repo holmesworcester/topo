@@ -586,4 +586,71 @@ mod tests {
         ).unwrap();
         assert!(!in_valid, "blocked event should not be in valid_events");
     }
+
+    /// PLAN §6.4 contract: `create_event_sync` returns Ok only for Valid events.
+    /// A message with all deps satisfied must return Ok(event_id) and be in valid_events.
+    #[test]
+    fn test_create_event_sync_contract_valid_only() {
+        let conn = setup();
+        let recorded_by = "peer1";
+        let net_eid = setup_workspace_event(&conn, recorded_by);
+        let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
+
+        let msg = ParsedEvent::Message(MessageEvent {
+            created_at_ms: now_ms(),
+            workspace_id: net_eid,
+            author_id: [2u8; 32],
+            content: "contract-valid".to_string(),
+            signed_by: signer_eid,
+            signer_type: 5,
+            signature: [0u8; 64],
+        });
+        let result = create_signed_event_sync(&conn, recorded_by, &msg, &signing_key);
+        assert!(result.is_ok(), "PLAN §6.4: valid event must return Ok, got: {:?}", result);
+
+        let eid = result.unwrap();
+        let eid_b64 = event_id_to_base64(&eid);
+        let in_valid: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &eid_b64], |row| row.get(0),
+        ).unwrap();
+        assert!(in_valid, "PLAN §6.4: Ok result implies event is in valid_events");
+    }
+
+    /// PLAN §6.4 contract: `create_event_sync` returns Err(Blocked) with event_id
+    /// and missing deps when a dependency is unresolved.
+    #[test]
+    fn test_create_event_sync_contract_blocked_returns_err_with_event_id() {
+        let conn = setup();
+        let recorded_by = "peer1";
+        let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
+
+        let fake_target = [0xCC; 32];
+        let rxn = ParsedEvent::Reaction(ReactionEvent {
+            created_at_ms: now_ms(),
+            target_event_id: fake_target,
+            author_id: [3u8; 32],
+            emoji: "z".to_string(),
+            signed_by: signer_eid,
+            signer_type: 5,
+            signature: [0u8; 64],
+        });
+        let result = create_signed_event_sync(&conn, recorded_by, &rxn, &signing_key);
+
+        match result {
+            Err(CreateEventError::Blocked { event_id, missing }) => {
+                // Error must contain the event_id so callers can reference it
+                let eid_b64 = event_id_to_base64(&event_id);
+                let stored: bool = conn.query_row(
+                    "SELECT COUNT(*) > 0 FROM events WHERE event_id = ?1",
+                    rusqlite::params![&eid_b64], |row| row.get(0),
+                ).unwrap();
+                assert!(stored, "PLAN §6.4: blocked event_id must reference a stored event");
+                assert!(!missing.is_empty(), "PLAN §6.4: Blocked error must list missing deps");
+                assert_eq!(missing[0], fake_target);
+            }
+            Ok(_) => panic!("PLAN §6.4: blocked event must NOT return Ok"),
+            Err(e) => panic!("expected Blocked, got: {}", e),
+        }
+    }
 }
