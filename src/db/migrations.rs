@@ -292,10 +292,7 @@ static MIGRATIONS: &[Migration] = &[
     Migration {
         version: 12,
         name: "retire_invite_workspace_bindings",
-        sql: "
-            -- Historical no-op migration kept to preserve migration numbering.
-            SELECT 1;
-        ",
+        sql: "SELECT 1;",
     },
     Migration {
         version: 13,
@@ -425,23 +422,8 @@ static MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 20,
-        name: "add_intro_attempts",
+        name: "add_intro_attempts_index",
         sql: "
-            CREATE TABLE IF NOT EXISTS intro_attempts (
-                recorded_by TEXT NOT NULL,
-                intro_id BLOB NOT NULL,
-                introduced_by_peer_id TEXT NOT NULL,
-                other_peer_id TEXT NOT NULL,
-                origin_ip TEXT NOT NULL,
-                origin_port INTEGER NOT NULL,
-                observed_at INTEGER NOT NULL,
-                expires_at INTEGER NOT NULL,
-                status TEXT NOT NULL,
-                error TEXT,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL,
-                PRIMARY KEY (recorded_by, intro_id)
-            );
             CREATE INDEX IF NOT EXISTS idx_intro_attempts_peer
                 ON intro_attempts(recorded_by, other_peer_id, created_at DESC);
         ",

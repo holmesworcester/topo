@@ -2,8 +2,6 @@ use rusqlite::Connection;
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 
 use crate::db::transport_creds::{load_sole_local_creds, load_local_creds, store_local_creds};
-use crate::events::{ParsedEvent, TransportKeyEvent};
-use crate::projection::create::create_signed_event_sync;
 use crate::transport::{
     extract_spki_fingerprint, generate_self_signed_cert,
     generate_self_signed_cert_from_signing_key,
@@ -237,76 +235,6 @@ pub fn install_invite_bootstrap_transport_identity_conn(
 }
 
 // ---------------------------------------------------------------------------
-// TransportKey event creation
-// ---------------------------------------------------------------------------
-
-/// Ensure a TransportKey event exists for the local TLS cert's SPKI fingerprint.
-/// Returns Ok(None) if no cert exists, no PeerShared event exists, or the binding already exists.
-/// Returns Ok(Some(event_id)) if a new TransportKey event was created.
-///
-/// Requires the PeerShared signing key to sign the TransportKey event.
-pub fn ensure_transport_key_event(
-    conn: &Connection,
-    recorded_by: &str,
-    signing_key: &ed25519_dalek::SigningKey,
-) -> Result<Option<[u8; 32]>, Box<dyn std::error::Error + Send + Sync>> {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let cert_bytes = match load_local_creds(conn, recorded_by)? {
-        Some((cert, _)) => cert,
-        None => return Ok(None),
-    };
-
-    let spki_fp = extract_spki_fingerprint(&cert_bytes)?;
-
-    // Check if a TransportKey event already exists with this SPKI
-    let already_exists: bool = conn
-        .query_row(
-            "SELECT COUNT(*) > 0 FROM transport_keys WHERE recorded_by = ?1 AND spki_fingerprint = ?2",
-            rusqlite::params![recorded_by, spki_fp.as_slice()],
-            |row| row.get(0),
-        )
-        .unwrap_or(false);
-
-    if already_exists {
-        return Ok(None);
-    }
-
-    // Find the PeerShared event whose public key matches the provided signing key.
-    let local_pubkey = signing_key.verifying_key().to_bytes();
-    let peer_shared_eid: Option<[u8; 32]> = match conn.query_row(
-        "SELECT event_id FROM peers_shared WHERE recorded_by = ?1 AND public_key = ?2 LIMIT 1",
-        rusqlite::params![recorded_by, local_pubkey.as_slice()],
-        |row| row.get::<_, String>(0),
-    ) {
-        Ok(eid_b64) => crate::crypto::event_id_from_base64(&eid_b64),
-        Err(rusqlite::Error::QueryReturnedNoRows) => None,
-        Err(e) => return Err(e.into()),
-    };
-
-    let peer_shared_eid = match peer_shared_eid {
-        Some(eid) => eid,
-        None => return Ok(None),
-    };
-
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-
-    let evt = ParsedEvent::TransportKey(TransportKeyEvent {
-        created_at_ms: now_ms,
-        spki_fingerprint: spki_fp,
-        signed_by: peer_shared_eid,
-        signer_type: 5,
-        signature: [0u8; 64],
-    });
-
-    let event_id = create_signed_event_sync(conn, recorded_by, &evt, signing_key)
-        .map_err(|e| format!("failed to create transport key event: {:?}", e))?;
-
-    Ok(Some(event_id))
-}
 
 #[cfg(test)]
 mod tests {

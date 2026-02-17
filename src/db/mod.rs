@@ -129,7 +129,6 @@ pub fn migrate_recorded_by(
         "blocked_event_deps",
         "blocked_events",
         "project_queue",
-        "ingress_queue",
         "trust_anchors",
         "recorded_events",
     ] {

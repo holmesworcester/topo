@@ -46,17 +46,17 @@ Realism-first rule for ordering: finish test-fidelity items up front (copying ev
 8. ~~`P0: Bring scenario invariant harness fully in line with PLAN (fingerprints + full invariant set)`~~ **DONE**: deterministic full-state fingerprint replay checks are now active for forward/idempotent/reverse/shuffled replay paths, with mandatory ScenarioHarness replay verification by default.
 9. ~~`P1: Investigate and decide create_event_sync service semantics before implementation changes`~~ **DONE**: strict `create_event_sync` and bootstrap-only `create_event_staged` semantics are explicitly captured in PLAN §6.4 and covered by contract tests (`test_create_event_sync_contract_valid_only`, `test_create_event_sync_contract_blocked_returns_err_with_event_id`).
 10. ~~`P1: Investigate simplification of project_one/project_one_core split to better match one-path intent`~~ **DONE**: Investigated and resolved. Decision: keep two-layer model (`project_one` public entrypoint + `project_one_step` internal non-cascading step) as justified cascade optimization. Renamed `project_one_core` → `project_one_step` with clear doc comments. Added 7 source-isomorphism invariance tests proving direct/cascade/reverse-order convergence. Updated DESIGN.md §4.1, PLAN.md §5/§15.1, and TLA projector_spec.md to explicitly document the internal split.
-11. `P0: Unify transport identity architecture (single event-derived peer identity, no rotation sidecar)` **PARTIALLY DONE**: strict non-regenerating credential loaders are in place, but sidecar/state-authority collapse and full event-derived identity authority are not complete.
+11. ~~`P0: Unify transport identity architecture (single event-derived peer identity, no rotation sidecar)`~~ **DONE**: single event-derived identity authority is canonical. `transport_key` removed as trust authority; transport allow/deny now uses PeerShared-derived SPKIs + bootstrap trust only. No rotation sidecar, no silent regeneration. TLA models (`EventGraphSchema`, `TransportCredentialLifecycle`) rewritten and verified. DESIGN/PLAN/projector_spec aligned.
 12. ~~`P2: Resolve disjoint trust sets docs/code mismatch`~~ **DONE**: docs now match code semantics (tenant-scoped trust checks with permitted cross-tenant SPKI overlap).
 13. ~~`P0: Enforce removal policy at transport runtime (deny + disconnect active sessions)`~~ **DONE**: runtime now checks removal state in sync loops and closes active sessions for removed peers.
-14. `P0: Unify bootstrap key distribution via invite-key wrap/unwrap (keep local secret_key dep)` **PARTIALLY DONE**: invite create/accept now uses canonical wrap -> unwrap flow (`secret_shared` targeted to invite key + deterministic local `secret_key` materialization), but explicit out-of-order bootstrap coverage and TLA/model/doc closure remain.
+14. ~~`P0: Unify bootstrap key distribution via invite-key wrap/unwrap (keep local secret_key dep)`~~ **DONE**: invite create/accept uses canonical wrap→unwrap flow (`secret_shared` targeted to invite key + deterministic local `secret_key` materialization). Out-of-order bootstrap tests cover SecretShared signer blocking, encrypted key-dep blocking/unblocking, deterministic key event ID convergence, and full wrap→unwrap→encrypt convergence. TLA model, projector_spec, DESIGN, and PLAN all updated to describe unified bootstrap/runtime wrap path. No raw PSK bootstrap input remains.
 15. ~~`P1: Collapse encrypted-inner projection onto the same dependency/signer engine stages`~~ **DONE**: encrypted-inner and cleartext share one dep/signer/dispatch stage helper (`run_dep_and_projection_stages`), and DESIGN/PLAN/TLA mapping docs now explicitly record the decrypted-inner dep-type-check exception rationale.
 16. ~~`P0: Re-impose fixed-length event fields + langsec parser model`~~ **DONE**: canonical event parsers now enforce fixed wire sizes (including encrypted-size-by-inner-type), no canonical parser uses in-event length/count fields, and fixed-layout/no-length guard suites are green (`fixed_layout_tests`, `wire_no_length_fields_guard_test`).
 17. ~~`P1: Remove duplicated command/business logic between CLI (main.rs) and service layer (service.rs)`~~ **DONE**: core CLI command flows route through service-layer APIs; remaining REPL-specific cleanup is tracked separately in item 21.
 18. ~~`P1: Eliminate direct SQL access in CLI command paths where module APIs already exist`~~ **DONE (CLI)**: direct SQL was removed from standard CLI command paths; remaining REPL/internal helper SQL cleanup is tracked under item 21.
-19. `P1: Reconcile TLA/spec mapping docs with PLAN and implemented projector semantics` **PARTIALLY DONE**: event-registry/dependency mapping rows were refreshed to current runtime semantics, and fast TLC checks are green; remaining open delta is transport-credential lifecycle naming/model drift (item 11).
-20. `P2: Remove residual compatibility cruft from active schema/docs/runtime surfaces` **PARTIALLY DONE**: compatibility-heavy wording was reduced in migrations/transport comments and legacy test naming, but broader schema/runtime cleanup remains.
-21. `P1: CLI isomorphism — route remaining interactive commands through service layer` (send, messages, status, react, delete, users, keys — interactive REPL should be a thin adapter over service functions per PLAN §2.2)
+19. ~~`P1: Reconcile TLA/spec mapping docs with PLAN and implemented projector semantics`~~ **DONE**: event-registry/dependency mapping rows refreshed; transport-credential lifecycle naming/model terms unified with item 11 architecture. TLC checks green for all models. No known stale mapping rows remain.
+20. ~~`P2: Remove residual compatibility cruft from active schema/docs/runtime surfaces`~~ **DONE**: `ingress_queue` removed from DESIGN queue listing and `rename_peer` loop (schema-only, no runtime path); migration 12 no-op comment removed; migration 20 duplicate name fixed; `legacy_cli_*` tests renamed to `cli_direct_*`; "backward compat parsing" comment removed from scenario test; PLAN.md references updated.
+21. ~~`P1: CLI isomorphism — route remaining interactive commands through service layer`~~ **DONE**: all interactive REPL commands now route through service-layer APIs. Zero direct SQL (`rusqlite::prepare`/`query_row`/`execute`) remains in interactive.rs. New service functions: `svc_message_event_id_by_num_conn`, `svc_deleted_message_ids_conn`, `svc_reactions_for_message_conn`, `svc_remove_user_conn`, `svc_create_invite_conn`, `svc_create_device_link_invite_conn`. REPL retains only UX affordances (numeric aliases, author name display, channel labels).
 22. ~~`P2: Single-port multi-tenant endpoint — share one UDP port across tenants on the same device`~~ **DONE**: node now runs a single shared QUIC endpoint with multi-workspace cert resolution and per-tenant outbound isolation checks.
 
 ## P0: Re-impose fixed-length event fields + langsec parser model
@@ -121,85 +121,41 @@ Verification:
 1. Projection pipeline tests remain green after refactor.
 2. Fixed-layout/no-length guard suites remain green.
 
-## P0: Unify bootstrap key distribution via invite-key wrap/unwrap (keep local `secret_key` dep)
+## ~~P0: Unify bootstrap key distribution via invite-key wrap/unwrap (keep local `secret_key` dep)~~ DONE
 
-Evidence:
+Completed:
 
-1. Plan requires one key-wrap model across PSK bootstrap and identity phases (`docs/PLAN.md:101`, `docs/PLAN.md:102`, `docs/PLAN.md:1080`).
-2. Current encrypted path correctly depends on local `secret_key` event (type 6, local scope):
-   - encrypted dep metadata: `src/events/encrypted.rs:108`
-   - type-6 dep constraint: `src/events/encrypted.rs:109`
-   - local scope: `src/events/secret_key.rs:62`
-3. Current create/project encrypted flow resolves key bytes directly from local `secret_keys` table:
-   - create path: `src/projection/create.rs:180`
-   - projection path: `src/projection/encrypted.rs:22`
-4. `secret_shared` key-wrap event/projector path already exists (`src/events/secret_shared.rs:76`, `src/projection/identity.rs:251`) but is not the canonical bootstrap flow for obtaining local decrypt keys.
+1. Local-only `secret_key` dependency model retained for encrypted payload decryption (type-6 local dep unchanged).
+2. No raw PSK bootstrap input paths remain in runtime code (CLI/service/invite-link).
+3. Invite create/accept uses canonical `secret_shared` wrap→unwrap flow:
+   - inviter wraps content key to invite public key (X25519 DH + BLAKE2b-256 + XOR),
+   - joiner unwraps with invite private key and materializes local `secret_key` events.
+4. Deterministic key event IDs: BLAKE2b of key bytes → `created_at_ms`, ensuring both parties derive identical `key_event_id` values.
+5. Out-of-order bootstrap tests in `tests/scenario_test.rs`:
+   - `test_secret_shared_blocks_until_signer_valid`: SecretShared blocks on missing signer dep, unblocks after identity cascade.
+   - `test_encrypted_blocks_then_unblocks_on_key_materialization`: encrypted blocks on key dep, key-dep resolves after deterministic key materialization.
+   - `test_deterministic_key_event_id_matches_across_peers`: deterministic key event IDs match across inviter/joiner.
+   - `test_wrap_unwrap_encrypted_convergence`: full wrap→unwrap→encrypt flow with key convergence verification.
+6. TLA model updated: `EventGraphSchema.tla` comments clarify bootstrap vs runtime SecretShared usage. TLC verified (177007 states, no errors).
+7. Docs updated: DESIGN.md §9.4.1 (bootstrap key distribution), §2.4.1 (accept key unwrap); PLAN.md §7.6 (test strategy), §11.4.1 (bootstrap flow), §11.5 (sender-keys model); projector_spec.md (SecretShared wire format notes, bootstrap key materialization section).
 
-Problem: bootstrap still relies on simplified PSK-style assumptions, not a realistic invite-key wrap/unwrap bootstrap path, so the architecture remains bifurcated in practice.
+## ~~P0: Unify transport identity architecture (single event-derived peer identity, no rotation sidecar)~~ DONE
 
-Fix:
+Completed:
 
-1. Keep local-only `secret_key` dependency model for encrypted payload decryption (do NOT remove type-6 local dependency).
-2. Remove raw PSK bootstrap input paths (invite-link/CLI bootstrap secret inputs) from normative flow.
-3. At invite creation, produce wrapped bootstrap/content key material to invite public key derived from invite secret (prefer reusing `secret_shared` event path rather than adding a second wrap model).
-4. At invite acceptance, unwrap with invite private key and materialize local `secret_key` event/state for the accepting tenant.
-5. Ensure out-of-order behavior is realistic:
-   - encrypted events block/reject until local unwrapped key material exists,
-   - unwrap arrival enables normal unblock/project flow.
-6. Explicitly keep key-layer simplicity in this POC:
-   - no rotation tree, no advanced key-history backfill, no removal-driven rekeying beyond baseline trust/removal logic.
-7. TLA/model alignment:
-   - update key-material and wrap/unwrap modeling in `docs/tla/EventGraphSchema.tla` (or split module) so invite bootstrap and steady-state use one key-wrap semantic path,
-   - refresh invariant mapping in `docs/tla/projector_spec.md`.
-
-Acceptance:
-
-1. No raw PSK bootstrap secret is required in invite links or bootstrap CLI paths for normal flow.
-2. End-to-end invite bootstrap demonstrates wrap -> unwrap -> local `secret_key` availability -> encrypted event projection.
-3. `encrypted` continues to depend on local type-6 key material; only key acquisition path changes.
-4. Tests cover bootstrap wrap/unwrap ordering (in-order and out-of-order arrival) without introducing rotation complexity.
-5. TLA model and mapping docs cover the new bootstrap wrap/unwrap flow.
-
-## P0: Unify transport identity architecture (single event-derived peer identity, no rotation sidecar)
-
-Evidence:
-
-1. Current runtime still has split transport/event identity authority:
-   - transport identity and sidecar storage in `local_transport_creds`,
-   - event-graph identity and trust logic in identity projection + trust tables.
-2. Current split permits drift/rebuild hazards (for example silent local transport regeneration when sidecar state is missing).
-3. Existing design/plan complexity around transport credential lifecycle and bridge events (`transport_key`) increases surface area.
-
-Problem: duplicated identity authority (`peer` identity in event graph vs transport sidecar identity state) creates drift risk, replay/rebuild ambiguity, and unnecessary lifecycle machinery.
-
-Target intent for this POC (preferred):
-
-1. Device identity is the event-layer peer key (`peer_shared` lineage); `peer_id` is permanent and bound to that identity.
-2. TLS cert/key material is derived/materialized from event-layer identity as a thin transport adapter, not an independent authority.
-3. No transport identity rotation machinery in this POC model.
-4. Security posture:
-   - TLS 1.3 provides forward secrecy for sessions,
-   - identity key capture permits active impersonation of that device identity (accepted tradeoff for this POC),
-   - no additional transport-key-history revocation machinery is required.
-
-Fix (direct cutover):
-
-1. Lock the chosen model in DESIGN/PLAN/TLA first (TLA-first rule).
-2. Remove `transport_key` as normative trust authority if this model is selected.
-3. Remove/neutralize sidecar authority semantics (`local_transport_creds`) so canonical identity authority is event-derived.
-4. Eliminate silent transport identity regeneration paths tied to missing sidecar rows.
-5. Update transport allow/deny logic and tenant discovery to the chosen single-identity model.
-6. Remove old split/rotation code paths in the same round (no dual mode).
-7. TLA/model alignment:
-   - rewrite/remove transport lifecycle invariants that assume rotating sidecar credential history,
-   - align `docs/tla/projector_spec.md` mappings and DESIGN/PLAN invariant text to the chosen single-identity semantics.
-
-Acceptance:
-
-1. One canonical identity authority remains (event-layer peer identity).
-2. Replay/rebuild does not depend on independent mutable transport sidecar state for identity continuity.
-3. Runtime no longer has transport identity rotation behavior for this POC.
-4. DESIGN/PLAN/TLA mapping and runtime behavior match.
+1. TLA models rewritten:
+   - `TransportCredentialLifecycle.tla`: rotation/revocation removed; 4 variables, 7 actions, 6 invariants for single-credential model.
+   - `EventGraphSchema.tla`: `transportKeyCarriedPeer`/`transportKeyTrustPeer` → `peerSharedDerivedPeer`/`peerSharedTrustPeer`; all invariants renamed; `InvPendingBootstrapTrustConsumedByPeerShared` added.
+   - TLC verified: EventGraphSchema (177007 states), TransportCredentialLifecycle (3450001 states), no errors.
+2. Runtime trust authority unified:
+   - `transport_key` removed as trust source from `allowed_peers_from_db`, `is_peer_allowed`, `trusted_peer_count`, `has_any_trusted_peer`.
+   - Trust union: PeerShared-derived SPKIs ∪ invite_bootstrap_trust ∪ pending_invite_bootstrap_trust.
+   - Bootstrap supersession uses PeerShared-derived SPKI matching.
+3. Identity bootstrap simplified:
+   - `transport_key_event_id` removed from `IdentityChain`/`JoinChain`/`LinkChain`.
+   - `create_transport_key_if_possible` and `ensure_transport_key_event` removed entirely.
+4. Docs updated: DESIGN.md, PLAN.md, projector_spec.md all aligned to single-authority model.
+5. All tests green (61 scenario, 21 transport_trust, 18 interactive, 2 low_mem).
 
 ## P0: Remove `copy_event_chain` from interactive invite acceptance
 
@@ -455,44 +411,25 @@ Decision and closure:
    - `src/projection/create.rs`: `test_create_event_sync_contract_valid_only`
    - `src/projection/create.rs`: `test_create_event_sync_contract_blocked_returns_err_with_event_id`
 
-## P1: Reconcile TLA/spec mapping docs with PLAN and implemented projector semantics
+## ~~P1: Reconcile TLA/spec mapping docs with PLAN and implemented projector semantics~~ DONE
 
-Evidence:
+Completed:
 
-1. PLAN requires projector/TLA divergence to be treated as spec bug (`docs/PLAN.md:1118`).
-2. `docs/tla/projector_spec.md` had stale rows versus current schema/runtime (signer-required/signer-type/dependency rows).
-3. Remaining known mismatch is transport-credential lifecycle naming drift while item 11 is still open.
+1. Event-registry and dependency mapping rows refreshed to match runtime semantics.
+2. Shared encrypted-inner pipeline mapping and rationale documented.
+3. Transport-credential lifecycle naming/model terms unified with item-11 architecture:
+   - `InvBootstrapTrustConsumedByTransportKey` → `InvBootstrapTrustConsumedByPeerShared`
+   - `InvTransportKeyTrustSource` → `InvPeerSharedTrustSource`
+   - `InvTransportKeyTrustMatchesCarried` → `InvPeerSharedTrustMatchesCarried`
+   - Added `InvPendingBootstrapTrustConsumedByPeerShared`
+   - Removed stale rotation/revocation invariants from projector_spec.md
+4. TLC checks green for all models (EventGraphSchema + TransportCredentialLifecycle).
+5. DESIGN.md / PLAN.md references updated where mapping names changed.
 
-Problem: unresolved mapping/model drift weakens reviewability and can hide real model/runtime divergence.
-
-Fix:
-
-1. Perform a row-by-row audit:
-   - event registry metadata vs projector-spec table,
-   - guard/invariant mapping vs implemented guards/projectors.
-2. Keep `docs/tla/projector_spec.md` aligned to current code and PLAN semantics (row-by-row):
-   - signer requirements/types,
-   - dependency mappings,
-   - invite-accepted trust-anchor semantics,
-   - transport trust/removal mapping rows.
-3. Reconcile/trim stale invariants that no longer reflect normative behavior; add missing ones that now are normative.
-4. Re-run relevant TLC/model checks and record results/artifacts.
-5. Update `docs/DESIGN.md` / `docs/PLAN.md` references where mapping names changed.
-
-Status update (2026-02-17):
-
-1. Event-registry and dependency rows were refreshed to match runtime semantics.
-2. Shared encrypted-inner pipeline mapping and rationale were documented.
-3. TLC runs are green:
-   - `EventGraphSchema` fast config passes.
-   - `TransportCredentialLifecycle` fast config passes.
-4. Remaining closure item is transport lifecycle naming/model drift tied to item 11.
-
-Acceptance (remaining):
-
-1. No known stale rows remain in mappings relevant to completed runtime behavior.
-2. TLC/model checks pass for any changed model scope.
-3. Transport lifecycle naming/model terms are unified with the selected item-11 architecture.
+Acceptance met:
+1. No known stale rows remain in mappings. ✓
+2. TLC/model checks pass. ✓
+3. Transport lifecycle naming unified with item-11 architecture. ✓
 
 ## P1: Remove duplicated command/business logic between CLI (`main.rs`) and service layer (`service.rs`)
 
@@ -549,40 +486,18 @@ Acceptance:
 2. Query semantics used by CLI (including convenience alias resolution) are centralized in reusable helpers/modules.
 3. Future schema updates require changes in one query owner, not N command handlers.
 
-## P2: Remove residual compatibility cruft from active schema/docs/runtime surfaces
+## ~~P2: Remove residual compatibility cruft from active schema/docs/runtime surfaces~~ DONE
 
-Evidence:
+Completed:
 
-1. Active DESIGN still references compatibility-staging queue behavior:
-   - `docs/DESIGN.md:538` (`ingress_queue` "reserved compatibility/diagnostic staging").
-2. Migrations retain historical compatibility-only artifacts:
-   - `src/db/migrations.rs:296` (version-12 historical no-op remains),
-   - `src/db/migrations.rs:480` (retired-table cleanup still represented as historical migration baggage).
-3. Runtime/test surface still carries legacy terminology artifacts:
-   - terminology cleanup is partial; additional legacy/compat phrasing remains across runtime/tests.
-
-Problem: these leftovers keep old-era compatibility context alive in active surfaces, increasing cognitive load and conflicting with the POC single-path replacement policy.
-
-Fix:
-
-1. Prune/rename compatibility artifacts from active docs and code where they no longer serve runtime correctness.
-2. Remove unused compatibility-only schema elements (for example `ingress_queue`) if no active runtime path depends on them.
-3. Collapse compatibility-only migration/history clutter via epoch-forward schema cleanup (POC recreate-db model).
-4. Keep archival context only under `docs/archive/`, not in normative active docs.
-
-Status update (2026-02-17):
-
-1. Reduced compatibility wording in active runtime surfaces:
-   - `drop_retired_compat_tables` migration label renamed to `drop_retired_tables`.
-   - transport cert-resolver fallback comments no longer frame behavior as backward-compat mode.
-   - `test_legacy_peer_key_blob_rejected` renamed to `test_retired_type3_peer_key_blob_rejected`.
-2. Remaining cleanup is structural (schema/docs/runtime surface), not just naming.
-
-Acceptance:
-
-1. Active DESIGN/PLAN text has no compatibility-shim framing for non-runtime features.
-2. Active schema/runtime does not include unused compatibility-only tables/paths.
-3. Legacy/compat wording in active tests/code is minimized to intentional hardening cases only.
+1. `ingress_queue` removed from DESIGN.md operational queue listing (schema-only, zero runtime readers/writers).
+2. `ingress_queue` removed from `rename_peer` loop in `src/db/mod.rs` and from `excluded_tables` in testutil.rs.
+3. Migration 12 no-op comment ("Historical no-op kept to preserve migration numbering") removed.
+4. Migration 20 name fixed from duplicate `add_intro_attempts` to `add_intro_attempts_index`.
+5. `legacy_cli_send_and_status` / `legacy_cli_assert_now` renamed to `cli_direct_send_and_status` / `cli_direct_assert_now` with section header updated to "Direct CLI commands".
+6. "backward compat parsing" comment removed from `test_transport_key_projects_without_auto_binding`.
+7. PLAN.md references updated: `ingress_queue` described as "schema-only (not wired)".
+8. Earlier round: `drop_retired_compat_tables` → `drop_retired_tables`, cert-resolver fallback comments updated, `test_legacy_peer_key_blob_rejected` → `test_retired_type3_peer_key_blob_rejected`.
 
 ## ~~P1: Investigate simplification of `project_one`/`project_one_core` split to better match one-path intent~~ DONE
 

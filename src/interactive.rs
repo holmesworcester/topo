@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::io::{self, BufRead, IsTerminal, Write};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::SigningKey;
 
@@ -10,13 +9,9 @@ use crate::db::{
     schema::create_tables,
 };
 use crate::service;
-use crate::events::*;
 use crate::identity_ops::{self, IdentityChain, InviteType};
-use crate::invite_link::{create_invite_link, parse_invite_link, InviteLinkKind};
-use crate::projection::create::create_signed_event_sync;
-use crate::transport_identity::{
-    ensure_transport_peer_id_from_db, expected_invite_bootstrap_spki_from_invite_key,
-};
+use crate::invite_link::{parse_invite_link, InviteLinkKind};
+use crate::transport_identity::ensure_transport_peer_id_from_db;
 
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
@@ -24,13 +19,6 @@ use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;
 use rustyline::validate::Validator;
 use rustyline::{Config, Context, Editor, Helper};
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64
-}
 
 /// Per-account state within an interactive session.
 struct Account {
@@ -585,16 +573,8 @@ fn cmd_messages(
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() })?;
 
     // Enrichment: check deleted messages
-    let deleted_targets: Vec<String> = {
-        let mut del_stmt =
-            conn.prepare("SELECT message_id FROM deleted_messages WHERE recorded_by = ?1")?;
-        let result = del_stmt
-            .query_map(rusqlite::params![&account.identity], |row| {
-                row.get::<_, String>(0)
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        result
-    };
+    let deleted_targets = service::svc_deleted_message_ids_conn(&conn, &account.identity)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() })?;
 
     // Find channel name
     let ch_name = session
@@ -621,14 +601,9 @@ fn cmd_messages(
                 writeln!(out, "  {}. [{}] {}", num, author_name, msg.content)?;
 
                 // Enrichment: show reactions inline
-                let mut rxn_stmt = conn.prepare(
-                    "SELECT emoji FROM reactions WHERE recorded_by = ?1 AND target_event_id = ?2",
-                )?;
-                let emojis: Vec<String> = rxn_stmt
-                    .query_map(rusqlite::params![&account.identity, &msg.id_b64], |row| {
-                        row.get::<_, String>(0)
-                    })?
-                    .collect::<Result<Vec<_>, _>>()?;
+                let emojis = service::svc_reactions_for_message_conn(
+                    &conn, &account.identity, &msg.id_b64,
+                ).unwrap_or_default();
 
                 if !emojis.is_empty() {
                     // Group reactions by emoji with counts
@@ -669,7 +644,8 @@ fn cmd_react(
     let account = session.active_account().ok_or("No active account.")?;
 
     let conn = open_connection(&account.db_path)?;
-    let target_event_id = get_message_event_id_by_num(&conn, &account.identity, msg_num)?;
+    let target_event_id = service::svc_message_event_id_by_num_conn(&conn, &account.identity, msg_num)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() })?;
 
     let peer_shared_eid = account.peer_shared_event_id.ok_or("No signing key.")?;
     let peer_shared_key = account
@@ -708,16 +684,12 @@ fn cmd_reactions(
     let account = session.active_account().ok_or("No active account.")?;
 
     let conn = open_connection(&account.db_path)?;
-    let target_event_id = get_message_event_id_by_num(&conn, &account.identity, msg_num)?;
+    let target_event_id = service::svc_message_event_id_by_num_conn(&conn, &account.identity, msg_num)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() })?;
     let target_b64 = event_id_to_base64(&target_event_id);
 
-    let mut stmt = conn
-        .prepare("SELECT emoji FROM reactions WHERE recorded_by = ?1 AND target_event_id = ?2")?;
-    let emojis: Vec<String> = stmt
-        .query_map(rusqlite::params![&account.identity, &target_b64], |row| {
-            row.get::<_, String>(0)
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+    let emojis = service::svc_reactions_for_message_conn(&conn, &account.identity, &target_b64)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() })?;
 
     writeln!(out, "REACTIONS for message {}:", msg_num)?;
     if emojis.is_empty() {
@@ -746,7 +718,8 @@ fn cmd_delete(
     let account = session.active_account().ok_or("No active account.")?;
 
     let conn = open_connection(&account.db_path)?;
-    let target_event_id = get_message_event_id_by_num(&conn, &account.identity, msg_num)?;
+    let target_event_id = service::svc_message_event_id_by_num_conn(&conn, &account.identity, msg_num)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() })?;
 
     let peer_shared_eid = account.peer_shared_event_id.ok_or("No signing key.")?;
     let peer_shared_key = account
@@ -792,36 +765,25 @@ fn cmd_invite(
         .ok_or("No peer shared event ID.")?;
 
     let conn = open_connection(&account.db_path)?;
-    identity_ops::ensure_content_key_for_peer(
-        &conn,
-        &account.identity,
-        &peer_shared_key,
-        &peer_shared_event_id,
-    )?;
-    let invite = identity_ops::create_user_invite(
+    let bootstrap_spki = decode_spki_hex(&account.identity)?;
+    let bootstrap_addr = resolve_bootstrap_addr(args)?;
+
+    let resp = service::svc_create_invite_conn(
         &conn,
         &account.identity,
         &workspace_key,
         &workspace_id,
-        Some(&peer_shared_key),
-        Some(&peer_shared_event_id),
-    )?;
-    let pending_spki = expected_invite_bootstrap_spki_from_invite_key(&invite.invite_key)?;
-    crate::db::transport_trust::record_pending_invite_bootstrap_trust(
-        &conn,
-        &account.identity,
-        &event_id_to_base64(&invite.invite_event_id),
-        &event_id_to_base64(&workspace_id),
-        &pending_spki,
-    )?;
+        &peer_shared_key,
+        &peer_shared_event_id,
+        &bootstrap_addr,
+        &bootstrap_spki,
+    )
+    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() })?;
 
-    let bootstrap_spki = decode_spki_hex(&account.identity)?;
-    let bootstrap_addr = resolve_bootstrap_addr(args)?;
-    let invite_link = create_invite_link(&invite, &bootstrap_addr, &bootstrap_spki)?;
-    let invite_num = session.add_invite(invite_link.clone());
+    let invite_num = session.add_invite(resp.invite_link.clone());
 
     writeln!(out, "Created invite #{}", invite_num)?;
-    writeln!(out, "  link: {}", invite_link)?;
+    writeln!(out, "  link: {}", resp.invite_link)?;
 
     Ok(())
 }
@@ -961,29 +923,24 @@ fn cmd_link(
     let workspace_id = account.workspace_id.ok_or("No network event ID.")?;
 
     let conn = open_connection(&account.db_path)?;
-    let invite = identity_ops::create_device_link_invite(
+    let bootstrap_spki = decode_spki_hex(&account.identity)?;
+    let bootstrap_addr = resolve_bootstrap_addr(args)?;
+
+    let resp = service::svc_create_device_link_invite_conn(
         &conn,
         &account.identity,
         &user_key,
         &user_event_id,
         &workspace_id,
-    )?;
-    let pending_spki = expected_invite_bootstrap_spki_from_invite_key(&invite.invite_key)?;
-    crate::db::transport_trust::record_pending_invite_bootstrap_trust(
-        &conn,
-        &account.identity,
-        &event_id_to_base64(&invite.invite_event_id),
-        &event_id_to_base64(&workspace_id),
-        &pending_spki,
-    )?;
+        &bootstrap_addr,
+        &bootstrap_spki,
+    )
+    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() })?;
 
-    let bootstrap_spki = decode_spki_hex(&account.identity)?;
-    let bootstrap_addr = resolve_bootstrap_addr(args)?;
-    let invite_link = create_invite_link(&invite, &bootstrap_addr, &bootstrap_spki)?;
-    let invite_num = session.add_invite(invite_link.clone());
+    let invite_num = session.add_invite(resp.invite_link.clone());
 
     writeln!(out, "Created device link invite #{}", invite_num)?;
-    writeln!(out, "  link: {}", invite_link)?;
+    writeln!(out, "  link: {}", resp.invite_link)?;
 
     Ok(())
 }
@@ -1411,38 +1368,26 @@ fn cmd_ban(
 
     let conn = open_connection(&account.db_path)?;
 
-    // Look up the user event by number
-    let mut stmt = conn.prepare("SELECT event_id FROM users WHERE recorded_by = ?1")?;
-    let users: Vec<String> = stmt
-        .query_map(rusqlite::params![&account.identity], |row| {
-            row.get::<_, String>(0)
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+    // Resolve user number to event ID via service layer
+    let users = service::svc_users_conn(&conn, &account.identity)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() })?;
 
     if user_num == 0 || user_num > users.len() {
         writeln!(out, "Invalid user number. Available: 1-{}", users.len())?;
         return Ok(());
     }
 
-    let target_eid_b64 = &users[user_num - 1];
     let target_event_id =
-        crate::crypto::event_id_from_base64(target_eid_b64).ok_or("Invalid event ID")?;
+        crate::crypto::event_id_from_base64(&users[user_num - 1].event_id).ok_or("Invalid event ID")?;
 
-    // Find peer_shared events associated with this user
-    // For now, create UserRemoved targeting the user event
-    let ur_evt = ParsedEvent::UserRemoved(UserRemovedEvent {
-        created_at_ms: now_ms(),
-        target_event_id,
-        signed_by: peer_shared_event_id,
-        signer_type: 5,
-        signature: [0u8; 64],
-    });
-    create_signed_event_sync(
+    service::svc_remove_user_conn(
         &conn,
         &account.identity,
-        &ur_evt,
+        &peer_shared_event_id,
         &peer_shared_key,
-    )?;
+        target_event_id,
+    )
+    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() })?;
 
     writeln!(out, "Banned user {}", user_num)?;
 
@@ -1552,29 +1497,3 @@ fn base64_encode(data: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(data)
 }
 
-fn get_message_event_id_by_num(
-    conn: &rusqlite::Connection,
-    recorded_by: &str,
-    msg_num: usize,
-) -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
-    let mut stmt = conn.prepare(
-        "SELECT message_id FROM messages WHERE recorded_by = ?1 ORDER BY created_at ASC, rowid ASC",
-    )?;
-    let ids: Vec<String> = stmt
-        .query_map(rusqlite::params![recorded_by], |row| {
-            row.get::<_, String>(0)
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-
-    if msg_num == 0 || msg_num > ids.len() {
-        return Err(format!(
-            "Invalid message number {}. Available: 1-{}",
-            msg_num,
-            ids.len()
-        )
-        .into());
-    }
-
-    crate::crypto::event_id_from_base64(&ids[msg_num - 1])
-        .ok_or_else(|| format!("Invalid event ID for message {}", msg_num).into())
-}

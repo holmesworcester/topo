@@ -146,7 +146,7 @@ pub fn record_pending_invite_bootstrap_trust(
 /// Each pin is stored with a deterministic `invite_event_id` (via
 /// `cli_pin_invite_event_id`) and `workspace_id = CLI_PIN_WORKSPACE`.
 /// Reuses the existing table and 24h TTL.
-/// Existing supersede logic auto-marks these stale when `transport_keys` arrive.
+/// Existing supersede logic auto-marks these stale when PeerShared-derived trust appears.
 ///
 /// This is idempotent: re-importing the same pins refreshes their expiry.
 pub fn import_cli_pins_to_sql(
@@ -173,47 +173,51 @@ pub fn import_cli_pins_to_sql(
     Ok(imported)
 }
 
-/// When steady-state transport_keys are available for an SPKI, pending invite
-/// bootstrap trust for that same SPKI is no longer authoritative.
+/// When PeerShared-derived SPKIs exist for an SPKI, pending invite bootstrap
+/// trust for that same SPKI is no longer authoritative (supersession invariant).
 fn supersede_pending_bootstrap_if_steady_trust_exists(
     conn: &Connection,
     recorded_by: &str,
-) -> Result<(), rusqlite::Error> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let peer_shared_fps = peer_shared_spki_fingerprints(conn, recorded_by)?;
+    if peer_shared_fps.is_empty() {
+        return Ok(());
+    }
     let now = now_ms_i64();
-    conn.execute(
+    let mut stmt = conn.prepare(
         "UPDATE pending_invite_bootstrap_trust
-            SET superseded_at = ?2
-          WHERE recorded_by = ?1
+            SET superseded_at = ?1
+          WHERE recorded_by = ?2
             AND superseded_at IS NULL
-            AND expected_bootstrap_spki_fingerprint IN (
-                SELECT spki_fingerprint
-                  FROM transport_keys
-                 WHERE recorded_by = ?1
-            )",
-        rusqlite::params![recorded_by, now],
+            AND expected_bootstrap_spki_fingerprint = ?3",
     )?;
+    for fp in &peer_shared_fps {
+        stmt.execute(rusqlite::params![now, recorded_by, fp.as_slice()])?;
+    }
     Ok(())
 }
 
-/// When steady-state transport_keys are available for an SPKI, accepted invite
-/// bootstrap trust for that same SPKI is no longer authoritative.
+/// When PeerShared-derived SPKIs exist for an SPKI, accepted invite bootstrap
+/// trust for that same SPKI is no longer authoritative (supersession invariant).
 fn supersede_accepted_bootstrap_if_steady_trust_exists(
     conn: &Connection,
     recorded_by: &str,
-) -> Result<(), rusqlite::Error> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let peer_shared_fps = peer_shared_spki_fingerprints(conn, recorded_by)?;
+    if peer_shared_fps.is_empty() {
+        return Ok(());
+    }
     let now = now_ms_i64();
-    conn.execute(
+    let mut stmt = conn.prepare(
         "UPDATE invite_bootstrap_trust
-            SET superseded_at = ?2
-          WHERE recorded_by = ?1
+            SET superseded_at = ?1
+          WHERE recorded_by = ?2
             AND superseded_at IS NULL
-            AND bootstrap_spki_fingerprint IN (
-                SELECT spki_fingerprint
-                  FROM transport_keys
-                 WHERE recorded_by = ?1
-            )",
-        rusqlite::params![recorded_by, now],
+            AND bootstrap_spki_fingerprint = ?3",
     )?;
+    for fp in &peer_shared_fps {
+        stmt.execute(rusqlite::params![now, recorded_by, fp.as_slice()])?;
+    }
     Ok(())
 }
 
@@ -265,6 +269,8 @@ fn is_peer_shared_spki(
 }
 
 /// Build AllowedPeers from SQL trust sources only.
+/// Trust sources: PeerShared-derived SPKIs (steady-state) ∪ accepted invite
+/// bootstrap trust ∪ pending invite bootstrap trust.
 /// Observation telemetry (peer_transport_bindings) is NOT consulted for trust.
 pub fn allowed_peers_from_db(
     conn: &Connection,
@@ -273,12 +279,8 @@ pub fn allowed_peers_from_db(
     supersede_pending_bootstrap_if_steady_trust_exists(conn, recorded_by)?;
     supersede_accepted_bootstrap_if_steady_trust_exists(conn, recorded_by)?;
     let now = now_ms_i64();
-    // transport_keys: legacy trust source, still authoritative during transition.
-    // Will be removed once all peers use PeerShared-derived transport identity.
     let mut stmt = conn.prepare(
-        "SELECT DISTINCT spki_fingerprint FROM transport_keys WHERE recorded_by = ?1
-         UNION
-         SELECT DISTINCT bootstrap_spki_fingerprint AS spki_fingerprint
+        "SELECT DISTINCT bootstrap_spki_fingerprint AS spki_fingerprint
           FROM invite_bootstrap_trust
           WHERE recorded_by = ?1
             AND superseded_at IS NULL
@@ -307,6 +309,7 @@ pub fn allowed_peers_from_db(
 }
 
 /// Check a single peer fingerprint against SQL trust sources.
+/// Trust sources: PeerShared-derived SPKIs ∪ accepted bootstrap ∪ pending bootstrap.
 pub fn is_peer_allowed(
     conn: &Connection,
     recorded_by: &str,
@@ -314,16 +317,14 @@ pub fn is_peer_allowed(
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     supersede_pending_bootstrap_if_steady_trust_exists(conn, recorded_by)?;
     supersede_accepted_bootstrap_if_steady_trust_exists(conn, recorded_by)?;
+    // Check PeerShared-derived SPKIs first (primary steady-state trust source)
+    if is_peer_shared_spki(conn, recorded_by, spki_fingerprint)? {
+        return Ok(true);
+    }
     let now = now_ms_i64();
     let allowed: i64 = conn.query_row(
         "SELECT
             EXISTS(
-                SELECT 1
-                  FROM transport_keys
-                 WHERE recorded_by = ?1
-                   AND spki_fingerprint = ?2
-            )
-            OR EXISTS(
                 SELECT 1
                   FROM invite_bootstrap_trust
                  WHERE recorded_by = ?1
@@ -342,15 +343,11 @@ pub fn is_peer_allowed(
         rusqlite::params![recorded_by, spki_fingerprint.as_slice(), now],
         |row| row.get(0),
     )?;
-    if allowed != 0 {
-        return Ok(true);
-    }
-    // Check PeerShared-derived SPKIs (primary steady-state trust source)
-    is_peer_shared_spki(conn, recorded_by, spki_fingerprint)
+    Ok(allowed != 0)
 }
 
 /// Count the total number of distinct trusted peer fingerprints from SQL
-/// trust sources (PeerShared-derived SPKIs + transport_keys + accepted/pending invite bootstrap trust).
+/// trust sources (PeerShared-derived SPKIs + accepted/pending invite bootstrap trust).
 /// Returns the deduplicated count without materializing the full set.
 pub fn trusted_peer_count(
     conn: &Connection,
@@ -359,13 +356,8 @@ pub fn trusted_peer_count(
     supersede_pending_bootstrap_if_steady_trust_exists(conn, recorded_by)?;
     supersede_accepted_bootstrap_if_steady_trust_exists(conn, recorded_by)?;
     let now = now_ms_i64();
-    let count: i64 = conn.query_row(
+    let bootstrap_count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM (
-            SELECT DISTINCT spki_fingerprint
-              FROM transport_keys
-             WHERE recorded_by = ?1
-               AND length(spki_fingerprint) = 32
-            UNION
             SELECT DISTINCT bootstrap_spki_fingerprint AS spki_fingerprint
               FROM invite_bootstrap_trust
               WHERE recorded_by = ?1
@@ -385,7 +377,7 @@ pub fn trusted_peer_count(
     )?;
     let peer_shared_count = peer_shared_spki_fingerprints(conn, recorded_by)?.len() as i64;
     // Approximate: doesn't dedupe across sources but sufficient for trust checks
-    Ok(count + peer_shared_count)
+    Ok(bootstrap_count + peer_shared_count)
 }
 
 /// Check whether any trusted peer fingerprints exist in SQL trust sources
@@ -400,12 +392,6 @@ pub fn has_any_trusted_peer(
     let has_any: i64 = conn.query_row(
         "SELECT
             EXISTS(
-                SELECT 1
-                  FROM transport_keys
-                 WHERE recorded_by = ?1
-                   AND length(spki_fingerprint) = 32
-            )
-            OR EXISTS(
                 SELECT 1 FROM invite_bootstrap_trust
                 WHERE recorded_by = ?1
                   AND length(bootstrap_spki_fingerprint) = 32
@@ -460,19 +446,23 @@ mod tests {
         record_transport_binding(&conn, recorded_by, peer_id, &spki).unwrap();
     }
 
+    /// Helper: insert a PeerShared row and return its SPKI fingerprint.
+    fn insert_peer_shared(conn: &Connection, recorded_by: &str, event_id: &str, pubkey: &[u8; 32]) -> [u8; 32] {
+        conn.execute(
+            "INSERT INTO peers_shared (recorded_by, event_id, public_key) VALUES (?1, ?2, ?3)",
+            rusqlite::params![recorded_by, event_id, pubkey.as_slice()],
+        ).unwrap();
+        spki_fingerprint_from_ed25519_pubkey(pubkey)
+    }
+
     #[test]
-    fn test_transport_keys_in_allowlist() {
+    fn test_peer_shared_derived_in_allowlist() {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
 
         let recorded_by = "aaaa";
-        let spki: [u8; 32] = [42u8; 32];
-
-        // Insert directly into transport_keys (event-derived)
-        conn.execute(
-            "INSERT INTO transport_keys (recorded_by, event_id, spki_fingerprint) VALUES (?1, ?2, ?3)",
-            rusqlite::params![recorded_by, "evt1", spki.as_slice()],
-        ).unwrap();
+        let pubkey: [u8; 32] = [42u8; 32];
+        let spki = insert_peer_shared(&conn, recorded_by, "ps1", &pubkey);
 
         let allowed = allowed_peers_from_db(&conn, recorded_by).unwrap();
         assert!(allowed.contains(&spki));
@@ -501,12 +491,13 @@ mod tests {
     }
 
     #[test]
-    fn test_invite_bootstrap_superseded_when_transport_key_exists() {
+    fn test_invite_bootstrap_superseded_when_peer_shared_exists() {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
 
         let recorded_by = "aaaa";
-        let spki: [u8; 32] = [14u8; 32];
+        let pubkey: [u8; 32] = [14u8; 32];
+        let spki = spki_fingerprint_from_ed25519_pubkey(&pubkey);
         record_invite_bootstrap_trust(
             &conn,
             recorded_by,
@@ -517,11 +508,9 @@ mod tests {
             &spki,
         )
         .unwrap();
-        conn.execute(
-            "INSERT INTO transport_keys (recorded_by, event_id, spki_fingerprint) VALUES (?1, ?2, ?3)",
-            rusqlite::params![recorded_by, "tk-supersede", spki.as_slice()],
-        )
-        .unwrap();
+
+        // Add PeerShared entry whose derived SPKI matches the bootstrap SPKI
+        insert_peer_shared(&conn, recorded_by, "ps-supersede", &pubkey);
 
         let allowed = allowed_peers_from_db(&conn, recorded_by).unwrap();
         assert!(allowed.contains(&spki));
@@ -583,19 +572,18 @@ mod tests {
     }
 
     #[test]
-    fn test_pending_invite_bootstrap_superseded_when_transport_key_exists() {
+    fn test_pending_invite_bootstrap_superseded_when_peer_shared_exists() {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
 
         let recorded_by = "aaaa";
-        let spki: [u8; 32] = [12u8; 32];
+        let pubkey: [u8; 32] = [12u8; 32];
+        let spki = spki_fingerprint_from_ed25519_pubkey(&pubkey);
         record_pending_invite_bootstrap_trust(&conn, recorded_by, "invite1", "workspace1", &spki)
             .unwrap();
-        conn.execute(
-            "INSERT INTO transport_keys (recorded_by, event_id, spki_fingerprint) VALUES (?1, ?2, ?3)",
-            rusqlite::params![recorded_by, "tk1", spki.as_slice()],
-        )
-        .unwrap();
+
+        // Add PeerShared entry whose derived SPKI matches the pending SPKI
+        insert_peer_shared(&conn, recorded_by, "ps1", &pubkey);
 
         let allowed = allowed_peers_from_db(&conn, recorded_by).unwrap();
         assert!(allowed.contains(&spki));
@@ -644,15 +632,11 @@ mod tests {
         create_tables(&conn).unwrap();
 
         let recorded_by = "aaaa";
-        let db_only: [u8; 32] = [2u8; 32];
+        let pubkey: [u8; 32] = [2u8; 32];
+        let peer_shared_spki = insert_peer_shared(&conn, recorded_by, "ps_db", &pubkey);
         let pending_only: [u8; 32] = [3u8; 32];
         let denied: [u8; 32] = [4u8; 32];
 
-        conn.execute(
-            "INSERT INTO transport_keys (recorded_by, event_id, spki_fingerprint) VALUES (?1, ?2, ?3)",
-            rusqlite::params![recorded_by, "evt_db", db_only.as_slice()],
-        )
-        .unwrap();
         record_pending_invite_bootstrap_trust(
             &conn,
             recorded_by,
@@ -662,7 +646,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(is_peer_allowed(&conn, recorded_by, &db_only).unwrap());
+        assert!(is_peer_allowed(&conn, recorded_by, &peer_shared_spki).unwrap());
         assert!(is_peer_allowed(&conn, recorded_by, &pending_only).unwrap());
         assert!(!is_peer_allowed(&conn, recorded_by, &denied).unwrap());
     }
@@ -694,12 +678,14 @@ mod tests {
     }
 
     #[test]
-    fn test_cli_pin_superseded_by_transport_key() {
+    fn test_cli_pin_superseded_by_peer_shared() {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
 
         let recorded_by = "aaaa";
-        let pin_fp: [u8; 32] = [0xDD; 32];
+        // Choose a pubkey whose derived SPKI we'll use as the CLI pin
+        let pubkey: [u8; 32] = [0xDD; 32];
+        let pin_fp = spki_fingerprint_from_ed25519_pubkey(&pubkey);
 
         // Import a CLI pin
         let cli_pins = AllowedPeers::from_fingerprints(vec![pin_fp]);
@@ -708,13 +694,10 @@ mod tests {
         // Verify it's trusted
         assert!(is_peer_allowed(&conn, recorded_by, &pin_fp).unwrap());
 
-        // Simulate arrival of a transport_key for the same SPKI
-        conn.execute(
-            "INSERT INTO transport_keys (recorded_by, event_id, spki_fingerprint) VALUES (?1, ?2, ?3)",
-            rusqlite::params![recorded_by, "tk-steady", pin_fp.as_slice()],
-        ).unwrap();
+        // Simulate arrival of a PeerShared entry for the same SPKI
+        insert_peer_shared(&conn, recorded_by, "ps-steady", &pubkey);
 
-        // Still trusted (via transport_keys now)
+        // Still trusted (via PeerShared now)
         assert!(is_peer_allowed(&conn, recorded_by, &pin_fp).unwrap());
 
         // The pending_invite_bootstrap_trust row should be superseded
@@ -730,7 +713,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(superseded_at.is_some(), "CLI pin should be superseded by transport_key");
+        assert!(superseded_at.is_some(), "CLI pin should be superseded by PeerShared");
     }
 
     #[test]
@@ -865,11 +848,8 @@ mod tests {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
 
-        let spki: [u8; 32] = [42u8; 32];
-        conn.execute(
-            "INSERT INTO transport_keys (recorded_by, event_id, spki_fingerprint) VALUES (?1, ?2, ?3)",
-            rusqlite::params!["peer_a", "evt1", spki.as_slice()],
-        ).unwrap();
+        let pubkey: [u8; 32] = [42u8; 32];
+        let spki = insert_peer_shared(&conn, "peer_a", "ps1", &pubkey);
 
         let allowed_a = allowed_peers_from_db(&conn, "peer_a").unwrap();
         assert!(allowed_a.contains(&spki));
@@ -879,28 +859,23 @@ mod tests {
     }
 
     #[test]
-    fn test_malformed_spki_blob_skipped() {
+    fn test_malformed_peer_shared_pubkey_skipped() {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
 
         let recorded_by = "aaaa";
-        let good_spki: [u8; 32] = [42u8; 32];
+        let good_pubkey: [u8; 32] = [42u8; 32];
+        let good_spki = insert_peer_shared(&conn, recorded_by, "ps1", &good_pubkey);
 
-        // Insert a valid row
+        // Insert a malformed peers_shared row (wrong length public_key)
         conn.execute(
-            "INSERT INTO transport_keys (recorded_by, event_id, spki_fingerprint) VALUES (?1, ?2, ?3)",
-            rusqlite::params![recorded_by, "evt1", good_spki.as_slice()],
-        ).unwrap();
-
-        // Insert a malformed row (wrong length blob)
-        conn.execute(
-            "INSERT INTO transport_keys (recorded_by, event_id, spki_fingerprint) VALUES (?1, ?2, ?3)",
-            rusqlite::params![recorded_by, "evt2", &[0u8; 16][..]],
+            "INSERT INTO peers_shared (recorded_by, event_id, public_key) VALUES (?1, ?2, ?3)",
+            rusqlite::params![recorded_by, "ps_bad", &[0u8; 16][..]],
         ).unwrap();
 
         let allowed = allowed_peers_from_db(&conn, recorded_by).unwrap();
         assert!(allowed.contains(&good_spki));
-        // Should have exactly 1 entry (malformed skipped)
+        // Malformed entry should be skipped — only 1 valid entry
         let zero_fp: [u8; 32] = [0u8; 32];
         assert!(!allowed.contains(&zero_fp));
     }
@@ -911,19 +886,15 @@ mod tests {
         create_tables(&conn).unwrap();
 
         let recorded_by = "aaaa";
-        let spki_tk: [u8; 32] = [1u8; 32];
+        let pubkey_ps: [u8; 32] = [1u8; 32];
         let spki_bootstrap: [u8; 32] = [2u8; 32];
         let spki_pending: [u8; 32] = [3u8; 32];
-        let spki_dup: [u8; 32] = [1u8; 32]; // same as spki_tk — dedup test
 
         // Empty → count should be 0
         assert_eq!(trusted_peer_count(&conn, recorded_by).unwrap(), 0);
 
-        // Add transport_keys row
-        conn.execute(
-            "INSERT INTO transport_keys (recorded_by, event_id, spki_fingerprint) VALUES (?1, ?2, ?3)",
-            rusqlite::params![recorded_by, "evt1", spki_tk.as_slice()],
-        ).unwrap();
+        // Add PeerShared row
+        insert_peer_shared(&conn, recorded_by, "ps1", &pubkey_ps);
         assert_eq!(trusted_peer_count(&conn, recorded_by).unwrap(), 1);
 
         // Add accepted invite bootstrap trust
@@ -935,13 +906,6 @@ mod tests {
         // Add pending invite bootstrap trust
         record_pending_invite_bootstrap_trust(
             &conn, recorded_by, "invite2", "ws2", &spki_pending,
-        ).unwrap();
-        assert_eq!(trusted_peer_count(&conn, recorded_by).unwrap(), 3);
-
-        // Add a duplicate SPKI via another transport_keys row — count stays 3
-        conn.execute(
-            "INSERT INTO transport_keys (recorded_by, event_id, spki_fingerprint) VALUES (?1, ?2, ?3)",
-            rusqlite::params![recorded_by, "evt_dup", spki_dup.as_slice()],
         ).unwrap();
         assert_eq!(trusted_peer_count(&conn, recorded_by).unwrap(), 3);
 
@@ -959,12 +923,9 @@ mod tests {
         // Empty → false
         assert!(!has_any_trusted_peer(&conn, recorded_by).unwrap());
 
-        // transport_keys only → true
-        let spki_tk: [u8; 32] = [10u8; 32];
-        conn.execute(
-            "INSERT INTO transport_keys (recorded_by, event_id, spki_fingerprint) VALUES (?1, ?2, ?3)",
-            rusqlite::params![recorded_by, "evt_tk", spki_tk.as_slice()],
-        ).unwrap();
+        // PeerShared only → true
+        let pubkey_ps: [u8; 32] = [10u8; 32];
+        insert_peer_shared(&conn, recorded_by, "ps_only", &pubkey_ps);
         assert!(has_any_trusted_peer(&conn, recorded_by).unwrap());
 
         // Start fresh for bootstrap-only test
@@ -987,15 +948,16 @@ mod tests {
     }
 
     #[test]
-    fn test_trusted_peer_count_ignores_malformed_spki_rows() {
+    fn test_trusted_peer_count_ignores_malformed_rows() {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
 
         let recorded_by = "malformed_count";
 
+        // Malformed PeerShared public key (wrong length)
         conn.execute(
-            "INSERT INTO transport_keys (recorded_by, event_id, spki_fingerprint) VALUES (?1, ?2, ?3)",
-            rusqlite::params![recorded_by, "evt_short", &[9u8; 16][..]],
+            "INSERT INTO peers_shared (recorded_by, event_id, public_key) VALUES (?1, ?2, ?3)",
+            rusqlite::params![recorded_by, "ps_short", &[9u8; 16][..]],
         ).unwrap();
         conn.execute(
             "INSERT INTO invite_bootstrap_trust

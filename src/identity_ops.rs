@@ -8,8 +8,6 @@ use crate::projection::create::{
 };
 use crate::projection::encrypted::{wrap_key_for_recipient, unwrap_key_from_sender};
 use crate::projection::signer::{resolve_signer_key, SignerResolution};
-use crate::db::transport_creds::load_local_creds;
-use crate::transport::extract_spki_fingerprint;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -101,7 +99,6 @@ pub struct IdentityChain {
     pub peer_shared_key: SigningKey,
     pub admin_event_id: EventId,
     pub admin_key: SigningKey,
-    pub transport_key_event_id: Option<EventId>,
     pub content_key_event_id: Option<EventId>,
 }
 
@@ -114,7 +111,6 @@ pub struct JoinChain {
     pub peer_shared_event_id: EventId,
     pub peer_shared_key: SigningKey,
     pub invite_accepted_event_id: EventId,
-    pub transport_key_event_id: Option<EventId>,
     pub content_key_event_id: Option<EventId>,
 }
 
@@ -123,7 +119,6 @@ pub struct LinkChain {
     pub peer_shared_event_id: EventId,
     pub peer_shared_key: SigningKey,
     pub invite_accepted_event_id: EventId,
-    pub transport_key_event_id: Option<EventId>,
 }
 
 /// Data needed to transfer an invite between accounts.
@@ -143,7 +138,7 @@ pub enum InviteType {
 
 /// Bootstrap a full workspace identity chain following the canonical sequence from scenario tests:
 /// Workspace -> UserInviteBoot -> InviteAccepted (trust anchor) -> UserBoot ->
-/// DeviceInviteFirst -> PeerSharedFirst -> AdminBoot -> TransportKey.
+/// DeviceInviteFirst -> PeerSharedFirst -> AdminBoot.
 ///
 /// InviteAccepted must come early to bind the trust anchor, which triggers a
 /// guard-cascade that unblocks the Workspace event and all its dependents.
@@ -266,14 +261,6 @@ pub fn bootstrap_workspace(
         &peer_shared_event_id,
     )?);
 
-    // 9. TransportKey (signed by peer_shared_key)
-    let transport_key_event_id = create_transport_key_if_possible(
-        conn,
-        recorded_by,
-        &peer_shared_key,
-        &peer_shared_event_id,
-    )?;
-
     Ok(IdentityChain {
         workspace_id,
         workspace_key,
@@ -287,7 +274,6 @@ pub fn bootstrap_workspace(
         peer_shared_key,
         admin_event_id,
         admin_key,
-        transport_key_event_id,
         content_key_event_id,
     })
 }
@@ -347,7 +333,7 @@ pub fn create_user_invite(
 }
 
 /// Accept a user invite: InviteAccepted (trust anchor) -> UserBoot -> DeviceInviteFirst ->
-/// PeerSharedFirst -> TransportKey.
+/// PeerSharedFirst.
 ///
 /// InviteAccepted must come first to bind the trust anchor and trigger the guard cascade
 /// that makes the copied Workspace/UserInviteBoot events valid.
@@ -427,14 +413,6 @@ pub fn accept_user_invite(
         invite_event_id,
     )?;
 
-    // 6. TransportKey (signed by peer_shared_key)
-    let transport_key_event_id = create_transport_key_if_possible(
-        conn,
-        recorded_by,
-        &peer_shared_key,
-        &peer_shared_event_id,
-    )?;
-
     Ok(JoinChain {
         user_event_id,
         user_key,
@@ -443,7 +421,6 @@ pub fn accept_user_invite(
         peer_shared_event_id,
         peer_shared_key,
         invite_accepted_event_id,
-        transport_key_event_id,
         content_key_event_id,
     })
 }
@@ -480,7 +457,7 @@ pub fn create_device_link_invite(
     })
 }
 
-/// Accept a device link invite: InviteAccepted (trust anchor) -> PeerSharedFirst -> TransportKey.
+/// Accept a device link invite: InviteAccepted (trust anchor) -> PeerSharedFirst.
 pub fn accept_device_link(
     conn: &Connection,
     recorded_by: &str,
@@ -515,19 +492,10 @@ pub fn accept_device_link(
         device_invite_key,
     )?;
 
-    // 3. TransportKey (signed by peer_shared_key)
-    let transport_key_event_id = create_transport_key_if_possible(
-        conn,
-        recorded_by,
-        &peer_shared_key,
-        &peer_shared_event_id,
-    )?;
-
     Ok(LinkChain {
         peer_shared_event_id,
         peer_shared_key,
         invite_accepted_event_id,
-        transport_key_event_id,
     })
 }
 
@@ -686,28 +654,3 @@ fn unwrap_content_key_from_invite(
     Ok(None)
 }
 
-/// Try to create a TransportKey event binding the local TLS cert to the peer_shared identity.
-fn create_transport_key_if_possible(
-    conn: &Connection,
-    recorded_by: &str,
-    peer_shared_key: &SigningKey,
-    peer_shared_event_id: &EventId,
-) -> Result<Option<EventId>, Box<dyn std::error::Error + Send + Sync>> {
-    let cert_bytes = match load_local_creds(conn, recorded_by)? {
-        Some((cert, _)) => cert,
-        None => return Ok(None),
-    };
-
-    let spki_fp = extract_spki_fingerprint(&cert_bytes)?;
-
-    let evt = ParsedEvent::TransportKey(TransportKeyEvent {
-        created_at_ms: now_ms(),
-        spki_fingerprint: spki_fp,
-        signed_by: *peer_shared_event_id,
-        signer_type: 5,
-        signature: [0u8; 64],
-    });
-
-    let event_id = create_signed_event_sync(conn, recorded_by, &evt, peer_shared_key)?;
-    Ok(Some(event_id))
-}

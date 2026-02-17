@@ -104,7 +104,7 @@ Transport identity is derived from event-layer peer identity:
 1. **Transport identity** (mTLS scope): cert/key material, SPKI fingerprints, `peer_id` derived from BLAKE2b-256 of X.509 SPKI. Managed by the `transport_identity` module.
 2. **Event-graph identity** (identity layer scope): Ed25519 keys, signer chains, trust anchors, and identity events (types 8-22). Managed by the `projection/identity` module.
 
-Transport certs are deterministically derived from PeerShared Ed25519 signing keys, so the two identity scopes are unified. `TransportKey` events (type 23) are still consulted as a trust source during the transition period but will be removed once all peers have PeerShared-derived transport identities.
+Transport certs are deterministically derived from PeerShared Ed25519 signing keys, so the two identity scopes are unified. `TransportKey` events (type 23) are retained for backward-compatible event parsing but are **not** authoritative for trust decisions. All steady-state transport trust is derived from PeerShared Ed25519 public keys via `spki_fingerprint_from_ed25519_pubkey()`.
 
 ## 2.1 QUIC + mTLS
 
@@ -219,15 +219,16 @@ Test the feature with both local integration tests and Linux netns NAT simulatio
 High-level identity operations provide imperative APIs for workspace creation, invites, and device linking. These compose the low-level event creation primitives into correct sequences.
 
 **Bootstrap** (`bootstrap_workspace`): creates the full 8-event chain for a new workspace owner:
-Workspace → UserInviteBoot → InviteAccepted (trust anchor) → UserBoot → DeviceInviteFirst → PeerSharedFirst → AdminBoot → TransportKey.
+Workspace → UserInviteBoot → InviteAccepted (trust anchor) → UserBoot → DeviceInviteFirst → PeerSharedFirst → AdminBoot.
 
 **Invite** (`create_user_invite`): admin creates a UserInviteBoot event and returns portable invite data (event ID + signing key + workspace ID).
 
 **Accept** (`accept_user_invite`): joiner consumes invite data and creates:
-InviteAccepted (trust anchor) → UserBoot → DeviceInviteFirst → PeerSharedFirst → TransportKey.
+InviteAccepted (trust anchor) → UserBoot → DeviceInviteFirst → PeerSharedFirst.
 Prerequisite: the joiner's DB must already contain the Workspace and UserInviteBoot events (copied from the inviter before or during sync).
+The acceptance path also unwraps any bootstrap content-key material from the invite link (wrapped to the invite public key at creation time) and materializes local `secret_key` events so that encrypted content received during bootstrap sync can be decrypted.
 
-**Device link** (`create_device_link_invite` / `accept_device_link`): similar to user invite but creates a shorter chain (PeerSharedFirst + TransportKey only, skipping user/device_invite creation).
+**Device link** (`create_device_link_invite` / `accept_device_link`): similar to user invite but creates a shorter chain (PeerSharedFirst only, skipping user/device_invite creation).
 
 All functions take `&Connection` and `recorded_by`, enabling multi-tenant operation where multiple identities share a single database.
 
@@ -284,7 +285,7 @@ FROM trust_anchors t
 JOIN local_transport_creds c ON t.peer_id = c.peer_id
 ```
 
-`trust_anchors` is populated by `invite_accepted` (local-only, part of the identity bootstrap). `local_transport_creds` is populated during identity bootstrap when TransportKey events are created. Any identity that has both a workspace binding and TLS material is a local tenant.
+`trust_anchors` is populated by `invite_accepted` (local-only, part of the identity bootstrap). `local_transport_creds` is populated during identity bootstrap (cert derived from PeerShared Ed25519 key). Any identity that has both a workspace binding and TLS material is a local tenant.
 
 ### Node daemon architecture
 
@@ -302,9 +303,8 @@ All tenants on a device share a single UDP port. The server uses `WorkspaceCertR
 
 ### Per-tenant dynamic trust
 
-The single QUIC endpoint uses a union trust closure that accepts connections trusted by **any** local tenant. Post-handshake, `resolve_tenant_for_peer` checks `is_peer_allowed` for each tenant to determine routing. The trust closure queries four trust sources for each tenant's `recorded_by`:
+The single QUIC endpoint uses a union trust closure that accepts connections trusted by **any** local tenant. Post-handshake, `resolve_tenant_for_peer` checks `is_peer_allowed` for each tenant to determine routing. The trust closure queries three trust sources for each tenant's `recorded_by`:
 - **PeerShared-derived SPKIs** (primary steady-state; SPKI computed directly from PeerShared public key),
-- `transport_keys` rows (legacy event-derived bindings, retained during transition),
 - `invite_bootstrap_trust` rows (accepted invite-link bootstrap, TTL-bounded),
 - `pending_invite_bootstrap_trust` rows (inviter-side pre-handshake, TTL-bounded).
 
@@ -562,8 +562,7 @@ Materialization is an adapter step, not a second projection system.
 Operational queues:
 
 1. `project_queue(peer_id, event_id, available_at, attempts, lease_until)`,
-2. `egress_queue(connection_id, frame_type, event_id, payload, attempts, lease_until, sent_at, dedupe_key)`,
-3. `ingress_queue` exists in schema as reserved future diagnostic staging, but current runtime ingest does not enqueue/dequeue through it.
+2. `egress_queue(connection_id, frame_type, event_id, payload, attempts, lease_until, sent_at, dedupe_key)`.
 
 Canonical tables and queue tables stay separate.
 
@@ -787,9 +786,21 @@ For each encrypted message in the prototype baseline:
 After observing `user_removed` or `peer_removed`, sender excludes removed recipients from subsequent wraps.
 No historical re-encryption or key history backfill is required in this baseline.
 
+### 9.4.1 Bootstrap key distribution via invite-key wrap/unwrap
+
+Bootstrap key acquisition uses the same `secret_shared` event type and wrap/unwrap logic as runtime sender-keys. The only difference is the recipient: at invite creation the inviter wraps content-key material to the invite public key (X25519-derived from the Ed25519 invite signing key), rather than to a peer's PeerShared public key.
+
+Flow:
+1. At invite creation, the inviter wraps current content key(s) to the invite key and embeds the wrapped material in the invite link.
+2. At invite acceptance, the joiner unwraps using the invite private key (carried in the link) and the inviter's public key.
+3. The joiner materializes local `secret_key` events with deterministic event IDs (BLAKE2b hash of key bytes → `created_at_ms`), ensuring both inviter and joiner derive identical `key_event_id` values.
+4. Encrypted events that depend on those key IDs can then be projected normally through the standard block/unblock cascade.
+
+This eliminates raw PSK bootstrap inputs; all key acquisition flows through the event-backed wrap/unwrap path.
+
 ## 9.5 Transport credential lifecycle model
 
-This section covers the lifecycle state machine for the trust sources defined in section 2.2 (PeerShared-derived SPKIs, `invite_bootstrap_trust`, `pending_invite_bootstrap_trust`). `transport_keys` rows remain as a legacy/transitional trust source but are non-authoritative; see `docs/tla/projector_spec.md` for details.
+This section covers the lifecycle state machine for the three trust sources: PeerShared-derived SPKIs (steady-state), `invite_bootstrap_trust`, and `pending_invite_bootstrap_trust`. The `transport_keys` table is populated by TransportKey event projection but is **not** consulted for trust decisions.
 
 Supersession: when steady-state PeerShared-derived trust appears for a peer, matching `invite_bootstrap_trust` and `pending_invite_bootstrap_trust` entries are automatically consumed. Bootstrap and steady-state trust for the same peer never coexist.
 
@@ -844,7 +855,7 @@ Harness policy:
 
 Sync tests assert on application-meaningful data, never on raw event counts.
 
-Why: the identity bootstrap chain produces a variable number of events (currently 8: Workspace, UserInviteBoot, InviteAccepted, UserBoot, DeviceInviteFirst, PeerSharedFirst, AdminBoot, TransportKey). This number has changed across development and may change again. Tests that hardcode `store_count() == 6 + N` break silently when the identity chain grows.
+Why: the identity bootstrap chain produces a variable number of events (currently 7: Workspace, UserInviteBoot, InviteAccepted, UserBoot, DeviceInviteFirst, PeerSharedFirst, AdminBoot; plus content key events). This number has changed across development and may change again. Tests that hardcode `store_count() == 6 + N` break silently when the identity chain grows.
 
 Rules:
 1. **Convergence detection** uses `has_event(event_id)` on a specific known event, not `store_count >= N`.
@@ -883,7 +894,7 @@ Initial event-size policy:
 
 ### Low-memory trust and key strategy (`low_mem_ios`)
 
-Trust and key sets use SQL indexed point lookups, not full in-memory loading. The projection tables (`transport_keys`, `trust_anchors`, identity chain tables) are queried on demand with indexed `(recorded_by, ...)` keys.
+Trust and key sets use SQL indexed point lookups, not full in-memory loading. The projection tables (`trust_anchors`, identity chain tables, bootstrap trust tables) are queried on demand with indexed `(recorded_by, ...)` keys.
 
 A bounded hot cache holds recently accessed keys to avoid redundant SQL round-trips during burst projection. The cache is size-limited and evicts LRU entries; it never grows unbounded.
 

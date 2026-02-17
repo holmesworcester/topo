@@ -2094,6 +2094,373 @@ fn test_secret_shared_key_wrap() {
     harness.finish();
 }
 
+/// Out-of-order test: SecretShared event blocks when its recipient dep
+/// (Bob's PeerShared in a shared workspace) is not yet valid on Alice's side,
+/// then unblocks via cascade after Bob's identity chain events are synced in.
+#[test]
+fn test_secret_shared_blocks_until_signer_valid() {
+    use poc_7::projection::pipeline::project_one;
+    use poc_7::projection::create::create_signed_event_staged;
+    use poc_7::events::{ParsedEvent, SecretSharedEvent};
+
+    let alice = Peer::new("alice");
+    let bob = Peer::new("bob");
+    let harness = ScenarioHarness::new();
+    harness.track(&alice);
+    harness.track(&bob);
+
+    // Alice bootstraps workspace; Bob joins Alice's workspace via invite.
+    let chain = bootstrap_peer(&alice);
+    let bob_join = join_workspace(&bob, &chain, &alice);
+
+    // Alice creates a local content key.
+    let secret_key_bytes: [u8; 32] = rand::random();
+    let sk_eid = alice.create_secret_key(secret_key_bytes);
+
+    // Alice creates a SecretShared targeting Bob's PeerShared as recipient.
+    // Bob's identity chain exists in Bob's DB, but NOT yet in Alice's DB.
+    let wrapped_key: [u8; 32] = rand::random();
+    let ss_event = ParsedEvent::SecretShared(SecretSharedEvent {
+        created_at_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64,
+        key_event_id: sk_eid,
+        recipient_event_id: bob_join.peer_shared_eid,
+        wrapped_key,
+        signed_by: chain.peer_shared_eid,
+        signer_type: 5,
+        signature: [0u8; 64],
+    });
+    let alice_db = open_connection(&alice.db_path).unwrap();
+    let ss_eid = create_signed_event_staged(
+        &alice_db, &alice.identity, &ss_event, &chain.peer_shared_key,
+    ).expect("staged create should succeed even if blocked");
+    let ss_b64 = event_id_to_base64(&ss_eid);
+
+    // SecretShared should be blocked: recipient_event_id (Bob's PeerShared) is not
+    // valid in Alice's DB yet.
+    let blocked_count: i64 = alice_db.query_row(
+        "SELECT COUNT(*) FROM blocked_event_deps WHERE peer_id = ?1 AND event_id = ?2",
+        rusqlite::params![&alice.identity, &ss_b64],
+        |row| row.get(0),
+    ).unwrap();
+    assert!(blocked_count >= 1,
+        "SecretShared should block — Bob's PeerShared not yet valid in Alice's DB");
+
+    // Now simulate sync: copy Bob's shared events to Alice's DB and project them.
+    let bob_db = open_connection(&bob.db_path).unwrap();
+    let bob_events: Vec<(String, Vec<u8>)> = {
+        let mut stmt = bob_db.prepare(
+            "SELECT e.event_id, e.blob FROM events e
+             INNER JOIN recorded_events re ON e.event_id = re.event_id
+             WHERE re.peer_id = ?1
+             ORDER BY e.created_at ASC"
+        ).unwrap();
+        stmt.query_map(rusqlite::params![&bob.identity], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        }).unwrap().collect::<Result<Vec<_>, _>>().unwrap()
+    };
+
+    use poc_7::events::registry;
+    let reg = registry();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    for (eid_b64, blob) in &bob_events {
+        let meta = reg.lookup(blob[0]).unwrap();
+        if meta.share_scope.as_str() == "local" {
+            continue;
+        }
+        alice_db.execute(
+            "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![eid_b64, meta.type_name, blob, meta.share_scope.as_str(), now_ms as i64, now_ms as i64],
+        ).unwrap();
+        alice_db.execute(
+            "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source) VALUES (?1, ?2, ?3, 'test')",
+            rusqlite::params![&alice.identity, eid_b64, now_ms as i64],
+        ).unwrap();
+        let eid = event_id_from_base64(eid_b64).unwrap();
+        project_one(&alice_db, &alice.identity, &eid).unwrap();
+    }
+
+    // After Bob's chain arrives and cascades, SecretShared should now be valid.
+    let ss_valid: bool = alice_db.query_row(
+        "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+        rusqlite::params![&alice.identity, &ss_b64],
+        |row| row.get(0),
+    ).unwrap();
+    assert!(ss_valid,
+        "SecretShared should be valid after Bob's identity chain arrived via cascade");
+
+    let ss_projected: i64 = alice_db.query_row(
+        "SELECT COUNT(*) FROM secret_shared WHERE recorded_by = ?1",
+        rusqlite::params![&alice.identity],
+        |row| row.get(0),
+    ).unwrap();
+    assert!(ss_projected >= 1, "SecretShared should be in projection table after cascade");
+
+    harness.finish();
+}
+
+/// Out-of-order test: encrypted wrapper arrives before local key materialization,
+/// blocks, then unblocks once the deterministic key is created.
+#[test]
+fn test_encrypted_blocks_then_unblocks_on_key_materialization() {
+    let alice = Peer::new_with_identity("alice_enc_ooo");
+    let bob = Peer::new_with_identity("bob_enc_ooo");
+    let harness = ScenarioHarness::new();
+    harness.track(&alice);
+    harness.track(&bob);
+
+    // Step 1: Alice creates a key and encrypted message.
+    let key_bytes: [u8; 32] = rand::random();
+    let fixed_ts = 7_000_000u64;
+    let sk_eid = alice.create_secret_key_deterministic(key_bytes, fixed_ts);
+    let enc_eid = alice.create_encrypted_message(&sk_eid, "Encrypted before key on bob");
+
+    // Verify alice can decrypt her own message
+    assert_eq!(alice.scoped_message_count(), 1);
+
+    // Manually insert the encrypted event blob into Bob's DB (simulating sync arrival
+    // of ciphertext BEFORE key materialization).
+    let alice_db = open_connection(&alice.db_path).unwrap();
+    let enc_b64 = event_id_to_base64(&enc_eid);
+    let enc_blob: Vec<u8> = alice_db.query_row(
+        "SELECT blob FROM events WHERE event_id = ?1",
+        rusqlite::params![&enc_b64],
+        |row| row.get(0),
+    ).unwrap();
+
+    let bob_db = open_connection(&bob.db_path).unwrap();
+    use poc_7::events::registry;
+    use poc_7::projection::pipeline::project_one;
+    use poc_7::projection::decision::ProjectionDecision;
+    let reg = registry();
+    let enc_meta = reg.lookup(enc_blob[0]).unwrap();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    bob_db.execute(
+        "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![&enc_b64, enc_meta.type_name, &enc_blob, enc_meta.share_scope.as_str(), now_ms as i64, now_ms as i64],
+    ).unwrap();
+    bob_db.execute(
+        "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source) VALUES (?1, ?2, ?3, 'test')",
+        rusqlite::params![&bob.identity, &enc_b64, now_ms as i64],
+    ).unwrap();
+
+    // Project the encrypted event on Bob — should block (key_event_id dep not in valid_events).
+    let result = project_one(&bob_db, &bob.identity, &enc_eid).unwrap();
+    assert!(matches!(result, ProjectionDecision::Block { .. }),
+        "Encrypted should block when key dep is missing: {:?}", result);
+
+    // Verify key-dep blocking is recorded.
+    let key_b64 = event_id_to_base64(&sk_eid);
+    let blocked_on_key: bool = bob_db.query_row(
+        "SELECT COUNT(*) > 0 FROM blocked_event_deps
+         WHERE peer_id = ?1 AND event_id = ?2 AND blocker_event_id = ?3",
+        rusqlite::params![&bob.identity, &enc_b64, &key_b64],
+        |row| row.get(0),
+    ).unwrap();
+    assert!(blocked_on_key, "Encrypted should be blocked specifically on key_event_id dep");
+
+    // Step 3: Materialize the same deterministic key on Bob.
+    let bob_sk_eid = bob.create_secret_key_deterministic(key_bytes, fixed_ts);
+    assert_eq!(bob_sk_eid, sk_eid, "Deterministic key event IDs must match across peers");
+
+    // After key materialization, re-project the encrypted wrapper once to assert
+    // current dependency semantics directly from the projection decision:
+    // key dep must be resolved; any remaining block should be on inner deps
+    // (for example foreign signer in this cross-workspace setup).
+    let result_after_key = project_one(&bob_db, &bob.identity, &enc_eid).unwrap();
+    if let ProjectionDecision::Block { missing } = result_after_key {
+        assert!(
+            !missing.contains(&sk_eid),
+            "After key materialization, encrypted must not remain blocked on key_event_id",
+        );
+    }
+
+    // Bob doesn't see Alice's encrypted message (foreign signer → inner rejected),
+    // which is correct cross-workspace behavior.
+    assert_eq!(bob.scoped_message_count(), 0,
+        "Bob should not see Alice's message (foreign signer in separate workspace)");
+
+    harness.finish();
+}
+
+/// Deterministic key event ID test: inviter wraps key, invitee unwraps, both see
+/// the same secret_key event ID. This validates the cross-peer key agreement property
+/// that underpins the invite key wrap/unwrap bootstrap flow.
+#[test]
+fn test_deterministic_key_event_id_matches_across_peers() {
+    use poc_7::projection::encrypted::{wrap_key_for_recipient, unwrap_key_from_sender};
+    use ed25519_dalek::SigningKey;
+    use poc_7::events::{encode_event, ParsedEvent, SecretKeyEvent};
+    use poc_7::crypto::hash_event;
+
+    let alice = Peer::new_with_identity("alice_det_key");
+    let bob = Peer::new_with_identity("bob_det_key");
+    let harness = ScenarioHarness::new();
+    harness.track(&alice);
+    harness.track(&bob);
+
+    // Alice generates a content key.
+    let plaintext_key: [u8; 32] = rand::random();
+
+    // Compute deterministic created_at from key bytes (same algorithm as identity_ops).
+    use blake2::digest::consts::U8;
+    use blake2::{Blake2b, Digest};
+    let mut hasher = Blake2b::<U8>::new();
+    hasher.update(b"poc7-content-key-created-at-v1");
+    hasher.update(&plaintext_key);
+    let digest = hasher.finalize();
+    let mut ts_bytes = [0u8; 8];
+    ts_bytes.copy_from_slice(&digest[..8]);
+    let deterministic_ts = u64::from_le_bytes(ts_bytes);
+
+    // Alice creates her local secret_key with deterministic timestamp.
+    let alice_sk_eid = alice.create_secret_key_deterministic(plaintext_key, deterministic_ts);
+
+    // Simulate invite wrap/unwrap with fresh key pairs (sender wraps for invite key).
+    let mut rng = rand::thread_rng();
+    let sender_key = SigningKey::generate(&mut rng);
+    let invite_key = SigningKey::generate(&mut rng);
+    let wrapped = wrap_key_for_recipient(
+        &sender_key,
+        &invite_key.verifying_key(),
+        &plaintext_key,
+    );
+
+    // Bob unwraps using the invite private key and sender's public key.
+    let unwrapped = unwrap_key_from_sender(
+        &invite_key,
+        &sender_key.verifying_key(),
+        &wrapped,
+    );
+    assert_eq!(unwrapped, plaintext_key, "Unwrapped key must match original plaintext");
+
+    // Bob materializes the deterministic secret_key from unwrapped bytes.
+    let bob_sk_eid = bob.create_secret_key_deterministic(unwrapped, deterministic_ts);
+    assert_eq!(bob_sk_eid, alice_sk_eid,
+        "Deterministic key event ID must match between inviter and invitee");
+
+    // Also verify via manual event construction that the event_id matches.
+    let sk_evt = ParsedEvent::SecretKey(SecretKeyEvent {
+        created_at_ms: deterministic_ts,
+        key_bytes: plaintext_key,
+    });
+    let expected_eid = hash_event(&encode_event(&sk_evt).unwrap());
+    assert_eq!(expected_eid, alice_sk_eid, "Manual hash matches create_secret_key_deterministic");
+
+    harness.finish();
+}
+
+/// Full wrap→unwrap→encrypt→decrypt convergence: Alice wraps a key for Bob via invite key,
+/// Bob unwraps and materializes local key, then an encrypted message from Alice
+/// becomes decryptable (or at least unblocked) on Bob's side.
+#[test]
+fn test_wrap_unwrap_encrypted_convergence() {
+    use poc_7::projection::encrypted::{wrap_key_for_recipient, unwrap_key_from_sender};
+    use ed25519_dalek::SigningKey;
+
+    let alice = Peer::new_with_identity("alice_conv");
+    let bob = Peer::new_with_identity("bob_conv");
+    let harness = ScenarioHarness::new();
+    harness.track(&alice);
+    harness.track(&bob);
+
+    // Alice creates a content key.
+    let plaintext_key: [u8; 32] = rand::random();
+
+    // Deterministic timestamp from key bytes.
+    use blake2::digest::consts::U8;
+    use blake2::{Blake2b, Digest};
+    let mut hasher = Blake2b::<U8>::new();
+    hasher.update(b"poc7-content-key-created-at-v1");
+    hasher.update(&plaintext_key);
+    let digest = hasher.finalize();
+    let mut ts_bytes = [0u8; 8];
+    ts_bytes.copy_from_slice(&digest[..8]);
+    let deterministic_ts = u64::from_le_bytes(ts_bytes);
+
+    let alice_sk_eid = alice.create_secret_key_deterministic(plaintext_key, deterministic_ts);
+
+    // Alice creates an encrypted message.
+    let enc_eid = alice.create_encrypted_message(&alice_sk_eid, "Wrapped key convergence test");
+    assert_eq!(alice.scoped_message_count(), 1, "Alice should see her encrypted message");
+
+    // Simulate invite wrap/unwrap with fresh key pairs.
+    let mut rng = rand::thread_rng();
+    let sender_key = SigningKey::generate(&mut rng);
+    let invite_key = SigningKey::generate(&mut rng);
+
+    // Alice wraps the content key for the invite key.
+    let wrapped = wrap_key_for_recipient(
+        &sender_key,
+        &invite_key.verifying_key(),
+        &plaintext_key,
+    );
+
+    // Bob unwraps using the invite private key and sender's public key.
+    let unwrapped = unwrap_key_from_sender(
+        &invite_key,
+        &sender_key.verifying_key(),
+        &wrapped,
+    );
+    assert_eq!(unwrapped, plaintext_key);
+
+    // Bob materializes the deterministic key.
+    let bob_sk_eid = bob.create_secret_key_deterministic(unwrapped, deterministic_ts);
+    assert_eq!(bob_sk_eid, alice_sk_eid, "Key event IDs match after unwrap");
+
+    // Copy the encrypted event to Bob's DB (simulating sync).
+    let alice_db = open_connection(&alice.db_path).unwrap();
+    let enc_b64 = event_id_to_base64(&enc_eid);
+    let enc_blob: Vec<u8> = alice_db.query_row(
+        "SELECT blob FROM events WHERE event_id = ?1",
+        rusqlite::params![&enc_b64],
+        |row| row.get(0),
+    ).unwrap();
+
+    let bob_db = open_connection(&bob.db_path).unwrap();
+    use poc_7::events::registry;
+    use poc_7::projection::decision::ProjectionDecision;
+    use poc_7::projection::pipeline::project_one;
+    let reg = registry();
+    let enc_meta = reg.lookup(enc_blob[0]).unwrap();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    bob_db.execute(
+        "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![&enc_b64, enc_meta.type_name, &enc_blob, enc_meta.share_scope.as_str(), now_ms as i64, now_ms as i64],
+    ).unwrap();
+    bob_db.execute(
+        "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source) VALUES (?1, ?2, ?3, 'test')",
+        rusqlite::params![&bob.identity, &enc_b64, now_ms as i64],
+    ).unwrap();
+
+    // Project encrypted event on Bob. Key is available, so any block must be on
+    // inner deps/signer, not on key_event_id.
+    let result = project_one(&bob_db, &bob.identity, &enc_eid).unwrap();
+    if let ProjectionDecision::Block { missing } = result {
+        assert!(
+            !missing.contains(&alice_sk_eid),
+            "Encrypted should not block on key_event_id when local key exists",
+        );
+    }
+
+    // Explicitly verify no key-dep blocker row exists for this event.
+    let blocked_on_key: i64 = bob_db.query_row(
+        "SELECT COUNT(*) FROM blocked_event_deps
+         WHERE peer_id = ?1 AND event_id = ?2 AND blocker_event_id = ?3",
+        rusqlite::params![&bob.identity, &enc_b64, &event_id_to_base64(&alice_sk_eid)],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(blocked_on_key, 0, "key_event_id blocker should be absent after key materialization");
+
+    harness.finish();
+}
+
 #[test]
 fn test_identity_replay_invariants() {
     let alice = Peer::new_with_identity("alice");
@@ -2148,67 +2515,21 @@ fn test_transport_key_projects_without_auto_binding() {
     ).unwrap();
     assert_eq!(binding_count, 0, "peer_transport_bindings should NOT be auto-populated");
 
-    // allowed_peers_from_db should include SPKI from transport_keys (not bindings)
+    // transport_keys are no longer authoritative for trust — PeerShared-derived SPKIs are.
+    // The transport_keys SPKI should NOT appear in allowed_peers (unless it also matches
+    // a PeerShared-derived SPKI).
     let allowed = poc_7::db::transport_trust::allowed_peers_from_db(&db, &alice.identity).unwrap();
-    assert!(allowed.contains(&spki_fp), "allowed_peers should include transport key SPKI");
+    assert!(!allowed.contains(&spki_fp), "transport_keys SPKI should not be in allowed set (non-authoritative)");
+
+    // But PeerShared-derived SPKI should be in allowed set
+    let ps_spki = poc_7::transport::cert::spki_fingerprint_from_ed25519_pubkey(
+        &chain.peer_shared_key.verifying_key().to_bytes()
+    );
+    assert!(allowed.contains(&ps_spki), "PeerShared-derived SPKI should be in allowed set");
 
     harness.finish();
 }
 
-#[test]
-fn test_transport_key_signer_matches_local_key() {
-    use ed25519_dalek::SigningKey;
-    use poc_7::transport_identity::ensure_transport_key_event;
-
-    let alice = Peer::new("alice");
-    let harness = ScenarioHarness::new();
-    harness.track(&alice);
-    let chain = bootstrap_peer(&alice);
-
-    // Create a second *valid* peers_shared chain entry with a different public
-    // key. Use real events (DeviceInviteFirst -> PeerSharedFirst) so replay
-    // invariants remain meaningful.
-    let other_device_invite_key = SigningKey::generate(&mut rand::thread_rng());
-    let other_device_invite_pubkey = other_device_invite_key.verifying_key().to_bytes();
-    let other_device_invite_eid = alice.create_device_invite_first(
-        other_device_invite_pubkey,
-        &chain.user_key,
-        &chain.user_eid,
-    );
-    let other_key = SigningKey::generate(&mut rand::thread_rng());
-    let other_pubkey = other_key.verifying_key().to_bytes();
-    let _other_peer_eid = alice.create_peer_shared_first(
-        other_pubkey,
-        &other_device_invite_key,
-        &other_device_invite_eid,
-    );
-
-    // Verify we now have 2 peers_shared rows
-    let db = open_connection(&alice.db_path).unwrap();
-    let count: i64 = db.query_row(
-        "SELECT COUNT(*) FROM peers_shared WHERE recorded_by = ?1",
-        rusqlite::params![&alice.identity],
-        |row| row.get(0),
-    ).unwrap();
-    assert_eq!(count, 2);
-    drop(db);
-
-    // TLS cert already exists in DB from Peer::new() — ensure_transport_key_event reads from DB
-
-    // Call ensure_transport_key_event with the LOCAL peer_shared signing key —
-    // it should succeed because it matches by public key, not by rowid order
-    let db = open_connection(&alice.db_path).unwrap();
-    let result = ensure_transport_key_event(&db, &alice.identity, &chain.peer_shared_key);
-    assert!(result.is_ok(), "ensure_transport_key_event should succeed with correct local key");
-    assert!(result.unwrap().is_some(), "should have created a new TransportKey event");
-
-    // A second call with the same local key should return None because the
-    // transport-key binding for the local cert SPKI already exists.
-    let result2 = ensure_transport_key_event(&db, &alice.identity, &chain.peer_shared_key);
-    assert_eq!(result2.unwrap(), None, "second call should return None (already exists)");
-
-    harness.finish();
-}
 
 #[test]
 fn test_transport_key_invalid_sig_rejected() {
