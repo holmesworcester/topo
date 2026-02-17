@@ -11,7 +11,7 @@ use poc_7::crypto::EventId;
 use poc_7::db::{
     open_connection,
     schema::create_tables,
-    transport_trust::{allowed_peers_from_db, import_cli_pins_to_sql, is_peer_allowed},
+    transport_trust::{allowed_peers_from_db, has_any_trusted_peer, import_cli_pins_to_sql, is_peer_allowed},
 };
 use poc_7::events::{
     DeviceInviteFirstEvent, InviteAcceptedEvent, MessageDeletionEvent, MessageEvent, ParsedEvent,
@@ -1018,8 +1018,7 @@ async fn run_sync(
     {
         let db = open_connection(db_path)?;
         import_cli_pins_to_sql(&db, &recorded_by, &cli_pins)?;
-        let combined = allowed_peers_from_db(&db, &recorded_by)?;
-        if combined.is_empty() {
+        if !has_any_trusted_peer(&db, &recorded_by)? {
             return Err("No allowed peers: provide --pin-peer for bootstrap, accept an invite link, or ensure identity events have synced. \
                 Use `poc-7 transport-identity --db <peer-db>` to get a peer's fingerprint.".into());
         }

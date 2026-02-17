@@ -932,6 +932,27 @@ impl Peer {
             .collect::<Result<Vec<_>, _>>()
             .expect("collect")
     }
+
+    /// Insert `count` synthetic transport_keys rows for this peer.
+    /// Returns the generated SPKI fingerprints.
+    pub fn seed_transport_keys(&self, count: usize) -> Vec<[u8; 32]> {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        db.execute("BEGIN", []).expect("failed to begin");
+        let mut fps = Vec::with_capacity(count);
+        for i in 0..count {
+            let mut fp = [0u8; 32];
+            let bytes = (i as u64).to_le_bytes();
+            fp[..8].copy_from_slice(&bytes);
+            fp[8] = 0xFE; // sentinel to distinguish synthetic keys
+            fps.push(fp);
+            db.execute(
+                "INSERT OR IGNORE INTO transport_keys (recorded_by, event_id, spki_fingerprint) VALUES (?1, ?2, ?3)",
+                rusqlite::params![&self.identity, format!("synthetic_tk_{}", i), fp.as_slice()],
+            ).expect("failed to insert transport_key");
+        }
+        db.execute("COMMIT", []).expect("failed to commit");
+        fps
+    }
 }
 
 /// Copy all events from `src` peer's DB into `dest` peer's DB and project them.
