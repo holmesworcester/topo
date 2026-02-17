@@ -877,6 +877,8 @@ async fn test_encrypted_event_sync() {
     let harness = ScenarioHarness::new();
     harness.track(&alice);
     harness.track(&bob);
+    let alice_initial_keys = alice.secret_key_count();
+    let bob_initial_keys = bob.secret_key_count();
 
     // Materialize the same PSK locally on both peers (local-only key event, not synced).
     let key_bytes: [u8; 32] = rand::random();
@@ -888,8 +890,8 @@ async fn test_encrypted_event_sync() {
     let enc_eid = alice.create_encrypted_message(&sk_eid_alice, "Hello encrypted world");
     let enc_b64 = event_id_to_base64(&enc_eid);
 
-    assert_eq!(alice.secret_key_count(), 1);
-    assert_eq!(bob.secret_key_count(), 1);
+    assert_eq!(alice.secret_key_count(), alice_initial_keys + 1);
+    assert_eq!(bob.secret_key_count(), bob_initial_keys + 1);
     // The encrypted event projects into messages table
     assert_eq!(alice.scoped_message_count(), 1);
 
@@ -906,7 +908,7 @@ async fn test_encrypted_event_sync() {
 
     // Bob has his local secret key. The encrypted wrapper decrypts to a Message
     // with signed_by = Alice's PeerShared (foreign signer -> inner message rejected).
-    assert_eq!(bob.secret_key_count(), 1);
+    assert_eq!(bob.secret_key_count(), bob_initial_keys + 1);
     // Encrypted inner message is rejected because its signer (Alice's PeerShared)
     // is not valid on Bob's side (foreign network)
     assert_eq!(bob.scoped_message_count(), 0);
@@ -922,6 +924,7 @@ async fn test_encrypted_out_of_order_sync() {
     let harness = ScenarioHarness::new();
     harness.track(&alice);
     harness.track(&bob);
+    let bob_initial_keys = bob.secret_key_count();
 
     // Alice creates key + encrypted message.
     let key_bytes: [u8; 32] = rand::random();
@@ -951,7 +954,7 @@ async fn test_encrypted_out_of_order_sync() {
     drop(sync1);
 
     // Bob should be blocked on missing key after phase 1.
-    assert_eq!(bob.secret_key_count(), 0);
+    assert_eq!(bob.secret_key_count(), bob_initial_keys);
     // Bob: only his own message projected (Alice's normal message blocked by foreign signer)
     assert_eq!(bob.scoped_message_count(), 1);
     let bob_db = open_connection(&bob.db_path).expect("open bob db");
@@ -968,7 +971,7 @@ async fn test_encrypted_out_of_order_sync() {
 
     // After key materialization, the encrypted wrapper unblocks. But the inner message
     // has signed_by = Alice's PeerShared (foreign signer), so it gets rejected.
-    assert_eq!(bob.secret_key_count(), 1);
+    assert_eq!(bob.secret_key_count(), bob_initial_keys + 1);
     // Bob still only sees his own message (encrypted inner rejected due to foreign signer)
     assert_eq!(bob.scoped_message_count(), 1);
 
@@ -984,6 +987,7 @@ async fn test_encrypted_replay_invariants() {
     let alice = Peer::new_with_identity("alice");
     let harness = ScenarioHarness::new();
     harness.track(&alice);
+    let initial_keys = alice.secret_key_count();
 
     // Create a mix of cleartext and encrypted events
     let key_bytes: [u8; 32] = rand::random();
@@ -994,7 +998,7 @@ async fn test_encrypted_replay_invariants() {
     alice.create_message("Cleartext 2");
     alice.create_encrypted_message(&sk_eid, "Encrypted 2");
 
-    assert_eq!(alice.secret_key_count(), 1);
+    assert_eq!(alice.secret_key_count(), initial_keys + 1);
     assert_eq!(alice.scoped_message_count(), 4); // 2 cleartext + 2 encrypted inner messages
 
     // Run invariant checks (forward, double, reverse)
@@ -1298,6 +1302,7 @@ async fn test_encrypted_deletion() {
     let alice = Peer::new_with_identity("alice");
     let harness = ScenarioHarness::new();
     harness.track(&alice);
+    let initial_keys = alice.secret_key_count();
 
     // Create a secret key
     let key_bytes: [u8; 32] = rand::random();
@@ -1306,7 +1311,7 @@ async fn test_encrypted_deletion() {
     // Create an encrypted message
     let _enc_msg_eid = alice.create_encrypted_message(&sk_eid, "Encrypted delete me");
 
-    assert_eq!(alice.secret_key_count(), 1);
+    assert_eq!(alice.secret_key_count(), initial_keys + 1);
     assert_eq!(alice.scoped_message_count(), 1); // inner message projected
 
     // Get the inner message's event_id from the messages table
@@ -1379,6 +1384,7 @@ async fn test_local_only_events_not_synced() {
     let harness = ScenarioHarness::new();
     harness.track(&alice);
     harness.track(&bob);
+    let bob_initial_keys = bob.secret_key_count();
 
     // Both peers materialize the same PSK locally
     let key_bytes: [u8; 32] = rand::random();
@@ -1405,7 +1411,7 @@ async fn test_local_only_events_not_synced() {
     drop(sync);
 
     // Bob should NOT have received Alice's SK event -- his store has his own SK
-    assert_eq!(bob.secret_key_count(), 1);
+    assert_eq!(bob.secret_key_count(), bob_initial_keys + 1);
     // Bob: encrypted inner rejected (foreign signer), normal msg blocked (foreign signer)
     assert_eq!(bob.scoped_message_count(), 0);
 

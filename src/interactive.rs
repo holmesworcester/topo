@@ -782,15 +782,29 @@ fn cmd_invite(
         .ok_or("No workspace key. Only workspace creators can invite.")?
         .clone();
     let workspace_id = account.workspace_id.ok_or("No network event ID.")?;
+    let peer_shared_key = account
+        .peer_shared_key
+        .as_ref()
+        .ok_or("No peer signing key.")?
+        .clone();
+    let peer_shared_event_id = account
+        .peer_shared_event_id
+        .ok_or("No peer shared event ID.")?;
 
     let conn = open_connection(&account.db_path)?;
+    identity_ops::ensure_content_key_for_peer(
+        &conn,
+        &account.identity,
+        &peer_shared_key,
+        &peer_shared_event_id,
+    )?;
     let invite = identity_ops::create_user_invite(
         &conn,
         &account.identity,
         &workspace_key,
         &workspace_id,
-        None,
-        None,
+        Some(&peer_shared_key),
+        Some(&peer_shared_event_id),
     )?;
     let pending_spki = expected_invite_bootstrap_spki_from_invite_key(&invite.invite_key)?;
     crate::db::transport_trust::record_pending_invite_bootstrap_trust(

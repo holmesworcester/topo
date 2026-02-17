@@ -176,6 +176,10 @@ impl Peer {
         let creator_db = open_connection(&creator.db_path).expect("failed to open creator db");
         let workspace_key = creator.workspace_signing_key.as_ref()
             .expect("creator has no workspace_signing_key; use new_with_identity()");
+        let creator_peer_key = creator.peer_shared_signing_key.as_ref()
+            .expect("creator has no peer_shared_signing_key; use new_with_identity()");
+        let creator_peer_eid = creator.peer_shared_event_id
+            .expect("creator has no peer_shared_event_id; use new_with_identity()");
 
         // Creator issues an invite (creates UserInviteOngoing on creator's DB)
         let invite = create_user_invite(
@@ -183,8 +187,8 @@ impl Peer {
             &creator.identity,
             workspace_key,
             &creator.workspace_id,
-            None,
-            None,
+            Some(creator_peer_key),
+            Some(&creator_peer_eid),
         ).expect("failed to create user invite");
 
         // Register pending bootstrap trust so creator's endpoint allows the joiner
@@ -2140,6 +2144,11 @@ impl SharedDbNode {
         let workspace_key = creator.workspace_signing_key.as_ref()
             .expect("creator has no workspace_signing_key")
             .clone();
+        let creator_peer_key = creator.peer_shared_signing_key.as_ref()
+            .expect("creator has no peer_shared_signing_key")
+            .clone();
+        let creator_peer_eid = creator.peer_shared_event_id
+            .expect("creator has no peer_shared_event_id");
         let creator_identity = creator.identity.clone();
 
         // Create a new transport identity in the shared DB
@@ -2162,8 +2171,8 @@ impl SharedDbNode {
             &creator_identity,
             &workspace_key,
             &workspace_id,
-            None,
-            None,
+            Some(&creator_peer_key),
+            Some(&creator_peer_eid),
         ).expect("failed to create user invite");
 
         // The Workspace and UserInviteBoot events already exist in the shared DB.

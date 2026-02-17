@@ -498,6 +498,14 @@ pub fn ensure_identity_chain(
     let psf_b64 = event_id_to_base64(&psf_eid);
     persist_local_peer_signer(db, recorded_by, &psf_b64, &peer_shared_key)?;
 
+    // Seed deterministic local content-key material used by invite key-wrap.
+    let _ = crate::identity_ops::ensure_content_key_for_peer(
+        db,
+        recorded_by,
+        &peer_shared_key,
+        &psf_eid,
+    ).map_err(|e| ServiceError(format!("failed to ensure content key: {}", e)))?;
+
     // Persist workspace key for later invite creation
     persist_workspace_key(db, recorded_by, &workspace_key)?;
 
@@ -1251,13 +1259,23 @@ pub fn svc_create_invite(
     key_arr.copy_from_slice(&ws_key_bytes);
     let workspace_key = SigningKey::from_bytes(&key_arr);
 
+    let (sender_peer_eid, sender_peer_key) = load_local_peer_signer(&db, &recorded_by)?
+        .ok_or_else(|| ServiceError("No local peer signer found for invite creation.".into()))?;
+    let _ = crate::identity_ops::ensure_content_key_for_peer(
+        &db,
+        &recorded_by,
+        &sender_peer_key,
+        &sender_peer_eid,
+    )
+    .map_err(|e| ServiceError(format!("Failed to ensure content key: {}", e)))?;
+
     let invite = crate::identity_ops::create_user_invite(
         &db,
         &recorded_by,
         &workspace_key,
         &ws_eid,
-        None,
-        None,
+        Some(&sender_peer_key),
+        Some(&sender_peer_eid),
     )
     .map_err(|e| ServiceError(format!("Failed to create invite: {}", e)))?;
 
@@ -1366,6 +1384,11 @@ pub async fn svc_accept_invite(
         workspace_id,
     )
     .map_err(|e| ServiceError(format!("Failed to accept invite: {}", e)))?;
+    if join.content_key_event_id.is_none() {
+        return Err(ServiceError(
+            "Invite acceptance missing wrapped content key material".into(),
+        ));
+    }
 
     // Record bootstrap trust
     crate::db::transport_trust::record_invite_bootstrap_trust(

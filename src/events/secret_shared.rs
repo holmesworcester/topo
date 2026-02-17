@@ -5,7 +5,7 @@ use super::{EventError, ParsedEvent, EVENT_TYPE_SECRET_SHARED};
 pub struct SecretSharedEvent {
     pub created_at_ms: u64,
     pub key_event_id: [u8; 32],        // dep: SecretKey event
-    pub recipient_event_id: [u8; 32],   // dep: PeerShared event of recipient
+    pub recipient_event_id: [u8; 32],   // dep: invite or peer_shared event of recipient
     pub wrapped_key: [u8; 32],          // key bytes wrapped for recipient
     pub signed_by: [u8; 32],            // signer event_id (PeerShared event — sender)
     pub signer_type: u8,                // 5 = peer_shared
@@ -79,7 +79,7 @@ pub static SECRET_SHARED_META: EventTypeMeta = EventTypeMeta {
     projection_table: "secret_shared",
     share_scope: ShareScope::Shared,
     dep_fields: &["key_event_id", "recipient_event_id", "signed_by"],
-    dep_field_type_codes: &[&[6], &[16, 17], &[]],
+    dep_field_type_codes: &[&[6], &[10, 11, 12, 13, 16, 17], &[]],
     signer_required: true,
     signature_byte_len: 64,
     encryptable: false,

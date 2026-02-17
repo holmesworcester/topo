@@ -1,5 +1,6 @@
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
+use rusqlite::Connection;
 
 fn bin() -> String {
     env!("CARGO_BIN_EXE_poc-7").to_string()
@@ -145,6 +146,13 @@ fn accept_invite(db: &str, invite_link: &str) {
         "accept-invite failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn count_rows(db: &str, table: &str) -> i64 {
+    let conn = Connection::open(db).expect("failed to open db");
+    let sql = format!("SELECT COUNT(*) FROM {}", table);
+    conn.query_row(&sql, [], |row| row.get(0))
+        .expect("failed to query row count")
 }
 
 /// Functional sync test using invite-based shared workspace flow.
@@ -381,6 +389,14 @@ fn test_cli_sync_bootstrap_from_accepted_invite_data() {
     // Bob accepts invite: installs deterministic cert, bootstrap-syncs from
     // Alice, creates identity chain, records bootstrap trust.
     accept_invite(&bob_db, &invite_link);
+    assert!(
+        count_rows(&alice_db, "secret_shared") >= 1,
+        "inviter should emit at least one secret_shared key-wrap during invite creation"
+    );
+    assert!(
+        count_rows(&bob_db, "secret_keys") >= 1,
+        "invitee should materialize local secret_key after unwrap"
+    );
 
     // Bob starts ongoing sync (connects to Alice for continued sync).
     let mut bob = start_sync(&bob_db, bob_port, Some(alice_port));
