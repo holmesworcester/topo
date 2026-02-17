@@ -132,7 +132,7 @@ Every CLI instance is a real peer-to-peer device. Interactive REPL and non-inter
 
 1. **One CLI instance = one device**: each running `poc-7` process is a device with its own transport identity and persistent state.
 2. **Multiple tenants per device**: a single device can host many tenants, each participating in arbitrary (potentially overlapping) workspaces.
-3. **Zeroconf discovery**: mDNS/DNS-SD discovers peers on the same workspace on the local machine or LAN (existing `discovery` feature via `p7d --node`).
+3. **Zeroconf discovery**: mDNS/DNS-SD discovers peers on the same workspace on the local machine or LAN (enabled by default via `discovery` feature).
 4. **Per-tenant QUIC endpoints**: each tenant gets its own QUIC endpoint with trust resolved from event-derived SQL state (no manual `--pin-peer` in steady state).
 5. **Shared batch writer**: all tenants on a device share one batch writer for projection, grouped by `recorded_by`.
 
@@ -1895,7 +1895,7 @@ pub struct PeerDispatcher {
 
 ### 17.4.4 CLI integration
 
-`src/bin/p7d.rs` has a `--node` flag. When set, calls `node::run_node()` instead of single-tenant `svc_sync()`. RPC server still runs alongside for queries.
+`src/bin/p7d.rs` always calls `node::run_node()` for sync (single-tenant and multi-tenant handled uniformly). RPC server still runs alongside for queries.
 
 ---
 
@@ -2128,7 +2128,7 @@ Tests in `tests/mdns_smoke.rs`:
 
 ### Definition of done
 
-- `p7d --node` discovers tenants from DB, starts per-tenant QUIC endpoints, syncs with external peers.
+- `p7d` discovers tenants from DB, starts QUIC endpoint with multi-workspace cert resolver, syncs with external peers.
 - Two tenants on same node in different workspaces have zero event overlap after sync.
 - Two tenants on same node in same workspace both project synced messages.
 - mDNS self-filtering prevents local-only connections; external peers discovered and synced.

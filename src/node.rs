@@ -14,7 +14,7 @@
 //! via mDNS and auto-connects to discovered remote peers.
 
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -73,15 +73,17 @@ use crate::transport::{
 };
 use rustls::sign::CertifiedKey;
 
-/// Run the multi-tenant node.
+/// Run the sync node.
 ///
 /// Discovers all local identities from the DB, verifies their SPKI fingerprints,
 /// builds a single QUIC endpoint with multi-workspace cert resolver, and runs
-/// a single accept loop sharing a batch_writer thread. With `discovery` feature,
+/// a single accept loop sharing a batch_writer thread. If `connect` is provided,
+/// also spawns a connect_loop to the specified peer. With `discovery` feature,
 /// also advertises via mDNS and auto-connects to discovered peers.
 pub async fn run_node(
     db_path: &str,
-    bind_ip: IpAddr,
+    bind: SocketAddr,
+    connect: Option<SocketAddr>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let db = open_connection(db_path)?;
     create_tables(&db)?;
@@ -184,17 +186,16 @@ pub async fn run_node(
         Ok(false)
     });
 
-    // Create single QUIC endpoint with auto-assigned port
-    let bind_addr = std::net::SocketAddr::new(bind_ip, 0);
+    // Create single QUIC endpoint
     let endpoint = create_single_port_endpoint(
-        bind_addr,
+        bind,
         Arc::new(cert_resolver),
         dynamic_allow,
         default_cert_der,
         default_key_der,
     )?;
 
-    let local_addr = endpoint.local_addr().unwrap_or(bind_addr);
+    let local_addr = endpoint.local_addr().unwrap_or(bind);
     info!(
         "Node listening on {} ({} workspace(s))",
         local_addr,
@@ -219,6 +220,9 @@ pub async fn run_node(
     #[cfg(feature = "discovery")]
     {
         let actual_port = local_addr.port();
+        // Skip mDNS auto-connect to the explicit --connect target to avoid
+        // duplicate connections (POC replacement policy: no dual paths).
+        let explicit_connect_addr = connect;
         for tenant in &tenants {
             match crate::discovery::TenantDiscovery::new(
                 &tenant.peer_id,
@@ -234,6 +238,12 @@ pub async fn run_node(
                             std::thread::spawn(move || {
                                 let mut dispatcher = PeerDispatcher::new();
                                 while let Ok(peer) = rx.recv() {
+                                    // Skip if this is the explicit --connect target
+                                    if let Some(explicit) = explicit_connect_addr {
+                                        if peer.addr == explicit {
+                                            continue;
+                                        }
+                                    }
                                     let (action, cancel_rx) = dispatcher.dispatch(&peer.peer_id, peer.addr);
                                     match action {
                                         DiscoveryAction::Skip => continue,
@@ -284,6 +294,9 @@ pub async fn run_node(
         }
     }
 
+    // Clone endpoint before moving into accept thread (needed for connect_loop).
+    let connect_endpoint = endpoint.clone();
+
     // Single accept loop for all workspaces.
     // Post-handshake, each connection is routed to the tenant that trusts
     // the remote peer's SPKI fingerprint.
@@ -310,13 +323,34 @@ pub async fn run_node(
         });
     });
 
+    // Explicit --connect target: spawn connect_loop for each tenant.
+    if let Some(remote) = connect {
+        for tenant in &tenants {
+            let ep = connect_endpoint.clone();
+            let db = db_path.to_string();
+            let tid = tenant.peer_id.clone();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async move {
+                    if let Err(e) = crate::sync::engine::connect_loop(&db, &tid, ep, remote).await
+                    {
+                        warn!("connect_loop for {} exited: {}", &tid[..16], e);
+                    }
+                });
+            });
+        }
+    }
+
     // Drop our copy so writer exits when all accept loops drop theirs
     drop(shared_tx);
 
     // Wait for Ctrl-C
     tokio::signal::ctrl_c().await?;
     info!(
-        "Shutting down node ({} events received)",
+        "Shutting down ({} events received)",
         events_received.load(Ordering::Relaxed)
     );
 

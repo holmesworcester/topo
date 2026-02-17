@@ -219,7 +219,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             connect,
             db,
         } => {
-            service::svc_sync(bind, connect.clone(), &db).await?;
+            poc_7::node::run_node(&db, bind, connect).await?;
         }
         Commands::TransportIdentity { db } => {
             let resp = service::svc_transport_identity(&db)?;

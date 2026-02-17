@@ -13,7 +13,7 @@ use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
 use crate::db::{
     open_connection,
     schema::create_tables,
-    transport_trust::{has_any_trusted_peer, is_peer_allowed},
+    transport_trust::is_peer_allowed,
 };
 use crate::events::{
     DeviceInviteFirstEvent, InviteAcceptedEvent, MessageDeletionEvent, MessageEvent, ParsedEvent,
@@ -1096,108 +1096,6 @@ pub fn svc_intro_attempts(
             created_at: r.created_at,
         })
         .collect())
-}
-
-// ---------------------------------------------------------------------------
-// Sync (long-running, used by daemon)
-// ---------------------------------------------------------------------------
-
-pub async fn svc_sync(
-    bind: std::net::SocketAddr,
-    connect: Option<std::net::SocketAddr>,
-    db_path: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use std::sync::Arc;
-    use crate::sync::engine::{accept_loop, connect_loop};
-    use tracing::info;
-
-    {
-        let db = open_connection(db_path)?;
-        create_tables(&db)?;
-    }
-
-    let (recorded_by, cert, key) = ensure_transport_cert_from_db(db_path)?;
-
-    {
-        let db = open_connection(db_path)?;
-        if !has_any_trusted_peer(&db, &recorded_by)? {
-            return Err("No trusted peers: accept an invite link or ensure identity events have synced.".into());
-        }
-    }
-
-    let db_path_for_lookup = db_path.to_string();
-    let recorded_by_for_lookup = recorded_by.clone();
-    let dynamic_allow = Arc::new(move |peer_fp: &[u8; 32]| {
-        let db = open_connection(&db_path_for_lookup)?;
-        is_peer_allowed(&db, &recorded_by_for_lookup, peer_fp)
-    });
-    let endpoint = create_dual_endpoint_dynamic(bind, cert, key, dynamic_allow)?;
-    info!("Listening on {}", endpoint.local_addr()?);
-
-    let db_owned = db_path.to_string();
-    let recorded_by_clone = recorded_by.clone();
-    let accept_endpoint = endpoint.clone();
-    let accept_handle = tokio::task::spawn_blocking({
-        let db = db_owned.clone();
-        move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            rt.block_on(async move {
-                if let Err(e) = accept_loop(
-                    &db,
-                    &recorded_by_clone,
-                    accept_endpoint,
-                )
-                .await
-                {
-                    tracing::warn!("accept_loop exited: {}", e);
-                }
-            });
-        }
-    });
-
-    if let Some(remote) = connect {
-        let connect_endpoint = endpoint.clone();
-        let db = db_owned.clone();
-        let recorded_by_clone = recorded_by.clone();
-        let connect_handle = tokio::task::spawn_blocking(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            rt.block_on(async move {
-                if let Err(e) = connect_loop(
-                    &db,
-                    &recorded_by_clone,
-                    connect_endpoint,
-                    remote,
-                )
-                .await
-                {
-                    tracing::warn!("connect_loop exited: {}", e);
-                }
-            });
-        });
-
-        tokio::select! {
-            _ = accept_handle => {}
-            _ = connect_handle => {}
-            _ = tokio::signal::ctrl_c() => {
-                info!("Ctrl-C received, shutting down");
-            }
-        }
-    } else {
-        tokio::select! {
-            _ = accept_handle => {}
-            _ = tokio::signal::ctrl_c() => {
-                info!("Ctrl-C received, shutting down");
-            }
-        }
-    }
-
-    Ok(())
 }
 
 pub async fn svc_intro(
