@@ -249,12 +249,12 @@ The following parser-level canonicalization guarantees are enforced in Rust but 
 | InvInviteAcceptedRecorded | invite_accepted can become valid only when invite material is recorded in the same peer scope |
 | InvBootstrapTrustSource | bootstrap transport trust (`invite_bootstrap_trust`) is derived only from valid `invite_accepted` |
 | InvBootstrapTrustMatchesCarried | bootstrap trust identity matches invite-carried bootstrap identity fields |
-| InvBootstrapTrustConsumedByTransportKey | bootstrap trust is consumed when equivalent transport-key trust appears |
+| InvBootstrapTrustConsumedByPeerShared | bootstrap trust is consumed when equivalent PeerShared-derived trust appears |
 | InvPendingBootstrapTrustSource | pending bootstrap trust (`pending_invite_bootstrap_trust`) is derived only from recorded invite events |
 | InvPendingBootstrapTrustMatchesCarried | pending bootstrap trust identity matches invite-carried pending peer identity fields |
-| InvTransportKeyTrustSource | transport-key trust (`transport_keys`) is derived only from valid `transport_key` events |
-| InvTransportKeyTrustMatchesCarried | transport-key trust identity matches transport-key carried identity fields |
-| InvTrustedPeerSetMembers | `TrustedPeerSet` members come only from bootstrap trust, pending bootstrap trust, or transport-key trust |
+| InvTransportKeyTrustSource | (legacy) transport-key trust (`transport_keys`) is derived only from valid `transport_key` events; non-authoritative |
+| InvTransportKeyTrustMatchesCarried | (legacy) transport-key trust identity matches transport-key carried identity fields; non-authoritative |
+| InvTrustedPeerSetMembers | `TrustedPeerSet` members come only from PeerShared-derived SPKIs, bootstrap trust, or pending bootstrap trust |
 | InvUserInviteChain | test_bootstrap_sequence: UserBoot requires UserInviteBoot valid |
 | InvDeviceInviteChain | test_bootstrap_sequence: PeerSharedFirst requires DeviceInviteFirst valid |
 | InvAdminChain | test_bootstrap_sequence: AdminOngoing requires AdminBoot valid |
@@ -277,9 +277,9 @@ abstracting over the event graph.
 | InvActiveCredNotRevoked | Active cert is never in revoked set |
 | InvSPKIUniqueness | BLAKE2b-256 collision resistance: no two peers share an SPKI |
 | InvActiveCredGloballyUnique | Each active cert fingerprint is distinct (extract_spki_fingerprint) |
-| InvBootstrapConsumedByTransportKey | supersede_accepted_bootstrap_if_steady_trust_exists: bootstrap ∩ transport_keys = {} |
-| InvPendingConsumedByTransportKey | supersede_pending_bootstrap_if_steady_trust_exists: pending ∩ transport_keys = {} |
-| InvTrustSetIsExactUnion | allowed_peers_from_db: UNION of transport_keys, invite_bootstrap_trust, pending_invite_bootstrap_trust |
+| InvBootstrapConsumedByPeerShared | supersede_accepted_bootstrap_if_steady_trust_exists: bootstrap ∩ PeerShared_SPKIs = {} |
+| InvPendingConsumedByPeerShared | supersede_pending_bootstrap_if_steady_trust_exists: pending ∩ PeerShared_SPKIs = {} |
+| InvTrustSetIsExactUnion | allowed_peers_from_db: UNION of PeerShared_SPKIs, invite_bootstrap_trust, pending_invite_bootstrap_trust |
 | InvTrustSourcesWellFormed | All trust table rows contain valid 32-byte SPKI fingerprints |
 | InvRevokedNotInBootstrapTrust | Revoked credentials not trusted via bootstrap paths |
 | InvMutualAuthSymmetry | Mutual CanAuthenticate requires both peers have active credentials |

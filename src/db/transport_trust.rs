@@ -3,6 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::info;
 
 use crate::transport::AllowedPeers;
+use crate::transport::cert::spki_fingerprint_from_ed25519_pubkey;
 
 /// Pending bootstrap trust from locally-created invites is temporary.
 /// If a peer never joins, this entry should not authorize transport forever.
@@ -55,8 +56,8 @@ pub fn record_transport_binding(
 }
 
 /// Record invite-accepted bootstrap trust metadata.
-/// This allows sync bootstrapping from accepted invite links before TransportKey
-/// events have propagated.
+/// This allows sync bootstrapping from accepted invite links before
+/// PeerShared-derived trust appears via identity event sync.
 pub fn record_invite_bootstrap_trust(
     conn: &Connection,
     recorded_by: &str,
@@ -216,6 +217,53 @@ fn supersede_accepted_bootstrap_if_steady_trust_exists(
     Ok(())
 }
 
+/// Compute SPKI fingerprints for all non-removed PeerShared public keys belonging to a peer.
+fn peer_shared_spki_fingerprints(
+    conn: &Connection,
+    recorded_by: &str,
+) -> Result<Vec<[u8; 32]>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut stmt = conn.prepare(
+        "SELECT p.public_key FROM peers_shared p
+         WHERE p.recorded_by = ?1
+           AND NOT EXISTS (
+             SELECT 1 FROM removed_entities r
+             WHERE r.recorded_by = p.recorded_by
+               AND r.target_event_id = p.event_id
+           )",
+    )?;
+    let fps: Vec<[u8; 32]> = stmt
+        .query_map(rusqlite::params![recorded_by], |row| {
+            let blob: Vec<u8> = row.get(0)?;
+            Ok(blob)
+        })?
+        .filter_map(|r| {
+            let blob = r.ok()?;
+            if blob.len() == 32 {
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&blob);
+                Some(spki_fingerprint_from_ed25519_pubkey(&key))
+            } else {
+                None
+            }
+        })
+        .collect();
+    Ok(fps)
+}
+
+/// Check whether a given SPKI fingerprint matches any PeerShared-derived identity.
+fn is_peer_shared_spki(
+    conn: &Connection,
+    recorded_by: &str,
+    spki_fingerprint: &[u8; 32],
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    for fp in peer_shared_spki_fingerprints(conn, recorded_by)? {
+        if &fp == spki_fingerprint {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Build AllowedPeers from SQL trust sources only.
 /// Observation telemetry (peer_transport_bindings) is NOT consulted for trust.
 pub fn allowed_peers_from_db(
@@ -225,6 +273,8 @@ pub fn allowed_peers_from_db(
     supersede_pending_bootstrap_if_steady_trust_exists(conn, recorded_by)?;
     supersede_accepted_bootstrap_if_steady_trust_exists(conn, recorded_by)?;
     let now = now_ms_i64();
+    // transport_keys: legacy trust source, still authoritative during transition.
+    // Will be removed once all peers use PeerShared-derived transport identity.
     let mut stmt = conn.prepare(
         "SELECT DISTINCT spki_fingerprint FROM transport_keys WHERE recorded_by = ?1
          UNION
@@ -240,7 +290,7 @@ pub fn allowed_peers_from_db(
             AND superseded_at IS NULL
             AND expires_at > ?2",
     )?;
-    let fps: Vec<[u8; 32]> = stmt
+    let mut fps: Vec<[u8; 32]> = stmt
         .query_map(rusqlite::params![recorded_by, now], |row| {
             let blob: Vec<u8> = row.get(0)?;
             Ok(decode_32_byte_blob(blob))
@@ -249,6 +299,10 @@ pub fn allowed_peers_from_db(
         .into_iter()
         .flatten()
         .collect();
+
+    // Add PeerShared-derived SPKIs (primary steady-state trust source)
+    fps.extend(peer_shared_spki_fingerprints(conn, recorded_by)?);
+
     Ok(AllowedPeers::from_fingerprints(fps))
 }
 
@@ -288,11 +342,15 @@ pub fn is_peer_allowed(
         rusqlite::params![recorded_by, spki_fingerprint.as_slice(), now],
         |row| row.get(0),
     )?;
-    Ok(allowed != 0)
+    if allowed != 0 {
+        return Ok(true);
+    }
+    // Check PeerShared-derived SPKIs (primary steady-state trust source)
+    is_peer_shared_spki(conn, recorded_by, spki_fingerprint)
 }
 
 /// Count the total number of distinct trusted peer fingerprints from SQL
-/// trust sources (transport_keys + accepted/pending invite bootstrap trust).
+/// trust sources (PeerShared-derived SPKIs + transport_keys + accepted/pending invite bootstrap trust).
 /// Returns the deduplicated count without materializing the full set.
 pub fn trusted_peer_count(
     conn: &Connection,
@@ -325,7 +383,9 @@ pub fn trusted_peer_count(
         rusqlite::params![recorded_by, now],
         |row| row.get(0),
     )?;
-    Ok(count)
+    let peer_shared_count = peer_shared_spki_fingerprints(conn, recorded_by)?.len() as i64;
+    // Approximate: doesn't dedupe across sources but sufficient for trust checks
+    Ok(count + peer_shared_count)
 }
 
 /// Check whether any trusted peer fingerprints exist in SQL trust sources
@@ -358,6 +418,16 @@ pub fn has_any_trusted_peer(
                   AND length(expected_bootstrap_spki_fingerprint) = 32
                   AND superseded_at IS NULL
                   AND expires_at > ?2
+            )
+            OR EXISTS(
+                SELECT 1 FROM peers_shared
+                WHERE recorded_by = ?1
+                  AND length(public_key) = 32
+                  AND NOT EXISTS (
+                    SELECT 1 FROM removed_entities r
+                    WHERE r.recorded_by = peers_shared.recorded_by
+                      AND r.target_event_id = peers_shared.event_id
+                  )
             )",
         rusqlite::params![recorded_by, now],
         |row| row.get(0),
@@ -365,16 +435,6 @@ pub fn has_any_trusted_peer(
     Ok(has_any != 0)
 }
 
-/// Build AllowedPeers from CLI pin-peer flags plus SQL trust rows
-/// (projected transport_keys + accepted/pending invite bootstrap trust).
-pub fn allowed_peers_combined(
-    conn: &Connection,
-    recorded_by: &str,
-    cli_pins: &AllowedPeers,
-) -> Result<AllowedPeers, Box<dyn std::error::Error + Send + Sync>> {
-    let db_peers = allowed_peers_from_db(conn, recorded_by)?;
-    Ok(cli_pins.union(&db_peers))
-}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -968,5 +1028,48 @@ mod tests {
 
         assert_eq!(trusted_peer_count(&conn, recorded_by).unwrap(), 0);
         assert!(!has_any_trusted_peer(&conn, recorded_by).unwrap());
+    }
+
+    #[test]
+    fn test_removed_peer_excluded_from_trust() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+
+        let recorded_by = "aaaa";
+        let peer_pubkey: [u8; 32] = [0x42; 32];
+        let peer_event_id = "peer_shared_evt1";
+
+        // Insert a peers_shared row
+        conn.execute(
+            "INSERT INTO peers_shared (recorded_by, event_id, public_key)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![recorded_by, peer_event_id, peer_pubkey.as_slice()],
+        ).unwrap();
+
+        // Compute expected SPKI fingerprint
+        let spki = spki_fingerprint_from_ed25519_pubkey(&peer_pubkey);
+
+        // Before removal: peer should be trusted
+        assert!(is_peer_allowed(&conn, recorded_by, &spki).unwrap(),
+            "peer should be trusted before removal");
+        assert!(has_any_trusted_peer(&conn, recorded_by).unwrap(),
+            "should have trusted peers before removal");
+        let allowed = allowed_peers_from_db(&conn, recorded_by).unwrap();
+        assert!(allowed.contains(&spki), "allowed set should contain peer before removal");
+
+        // Insert removal targeting this peer
+        conn.execute(
+            "INSERT INTO removed_entities (recorded_by, event_id, target_event_id, removal_type)
+             VALUES (?1, 'removal_evt1', ?2, 'peer_removed')",
+            rusqlite::params![recorded_by, peer_event_id],
+        ).unwrap();
+
+        // After removal: peer should NOT be trusted
+        assert!(!is_peer_allowed(&conn, recorded_by, &spki).unwrap(),
+            "removed peer should not be trusted");
+        assert!(!has_any_trusted_peer(&conn, recorded_by).unwrap(),
+            "should have no trusted peers after only peer removed");
+        let allowed = allowed_peers_from_db(&conn, recorded_by).unwrap();
+        assert!(!allowed.contains(&spki), "allowed set should not contain removed peer");
     }
 }

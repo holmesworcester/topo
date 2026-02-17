@@ -13,9 +13,7 @@ use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
 use crate::db::{
     open_connection,
     schema::create_tables,
-    transport_trust::{
-        allowed_peers_from_db, has_any_trusted_peer, import_cli_pins_to_sql, is_peer_allowed,
-    },
+    transport_trust::{has_any_trusted_peer, is_peer_allowed},
 };
 use crate::events::{
     DeviceInviteFirstEvent, InviteAcceptedEvent, MessageDeletionEvent, MessageEvent, ParsedEvent,
@@ -23,10 +21,7 @@ use crate::events::{
 };
 use crate::projection::create::{create_event_sync, create_event_staged, create_signed_event_sync};
 use crate::projection::pipeline::project_one;
-use crate::transport::{
-    create_dual_endpoint, create_dual_endpoint_dynamic,
-    AllowedPeers,
-};
+use crate::transport::create_dual_endpoint_dynamic;
 use crate::transport_identity::{
     ensure_transport_peer_id_from_db, ensure_transport_cert_from_db,
     load_transport_peer_id_from_db,
@@ -1084,7 +1079,6 @@ pub async fn svc_sync(
     bind: std::net::SocketAddr,
     connect: Option<std::net::SocketAddr>,
     db_path: &str,
-    pin_peers: &[String],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use std::sync::Arc;
     use crate::sync::engine::{accept_loop, connect_loop};
@@ -1097,13 +1091,10 @@ pub async fn svc_sync(
 
     let (recorded_by, cert, key) = ensure_transport_cert_from_db(db_path)?;
 
-    let cli_pins = AllowedPeers::from_hex_strings(pin_peers)?;
     {
         let db = open_connection(db_path)?;
-        import_cli_pins_to_sql(&db, &recorded_by, &cli_pins)?;
         if !has_any_trusted_peer(&db, &recorded_by)? {
-            return Err("No allowed peers: provide --pin-peer for bootstrap, accept an invite link, or ensure identity events have synced. \
-                Use `poc-7 transport-identity --db <peer-db>` to get a peer's fingerprint.".into());
+            return Err("No trusted peers: accept an invite link or ensure identity events have synced.".into());
         }
     }
 
@@ -1186,7 +1177,6 @@ pub async fn svc_intro(
     db_path: &str,
     peer_a: &str,
     peer_b: &str,
-    pin_peers: &[String],
     ttl_ms: u64,
     attempt_window_ms: u32,
 ) -> ServiceResult<bool> {
@@ -1198,20 +1188,14 @@ pub async fn svc_intro(
 
     let (recorded_by, cert, key) = ensure_transport_cert_from_db(db_path)?;
 
-    let mut all_pins = pin_peers.to_vec();
-    if !all_pins.contains(&peer_a.to_string()) {
-        all_pins.push(peer_a.to_string());
-    }
-    if !all_pins.contains(&peer_b.to_string()) {
-        all_pins.push(peer_b.to_string());
-    }
-    let cli_pins = AllowedPeers::from_hex_strings(&all_pins)?;
-    let db = open_connection(db_path)?;
-    import_cli_pins_to_sql(&db, &recorded_by, &cli_pins)?;
-    let allowed = allowed_peers_from_db(&db, &recorded_by)?;
-    drop(db);
-
-    let endpoint = create_dual_endpoint("0.0.0.0:0".parse().unwrap(), cert, key, Arc::new(allowed))?;
+    // Dynamic trust lookup from SQL at handshake time
+    let db_path_for_lookup = db_path.to_string();
+    let recorded_by_for_lookup = recorded_by.clone();
+    let dynamic_allow = Arc::new(move |peer_fp: &[u8; 32]| {
+        let db = open_connection(&db_path_for_lookup)?;
+        is_peer_allowed(&db, &recorded_by_for_lookup, peer_fp)
+    });
+    let endpoint = create_dual_endpoint_dynamic("0.0.0.0:0".parse().unwrap(), cert, key, dynamic_allow)?;
 
     let result = crate::sync::intro::run_intro(
         &endpoint,
@@ -1416,11 +1400,33 @@ pub async fn svc_accept_invite(
     let psf_b64 = event_id_to_base64(&join.peer_shared_event_id);
     persist_local_peer_signer(&db, &recorded_by, &psf_b64, &join.peer_shared_key)?;
 
-    // Also store workspace key table entry (not applicable for joiners, they don't
-    // have the workspace key — only the creator does)
+    // Push identity chain events back to inviter (while still using invite-derived
+    // cert, which the inviter trusts via pending_invite_bootstrap_trust). This ensures
+    // the inviter has our PeerShared event before we transition transport identity.
+    drop(db);
+    crate::sync::bootstrap::bootstrap_sync_from_invite(
+        db_path,
+        &recorded_by,
+        bootstrap_addr,
+        &invite.bootstrap_spki_fingerprint,
+        15,
+    )
+    .await
+    .map_err(|e| ServiceError(format!("Push-back sync failed: {}", e)))?;
+
+    let db = open_connection(db_path)?;
+
+    // Transition transport identity: replace invite-derived cert with
+    // PeerShared-derived cert so transport and event-layer identities match.
+    let new_peer_id = crate::transport_identity::install_peer_key_transport_identity(
+        &db,
+        &join.peer_shared_key,
+    )
+    .map_err(|e| ServiceError(format!("Failed to install peer key transport identity: {}", e)))?;
+    crate::db::migrate_recorded_by(&db, &recorded_by, &new_peer_id)?;
 
     Ok(AcceptInviteResponse {
-        peer_id: recorded_by,
+        peer_id: new_peer_id,
         user_event_id: event_id_to_base64(&join.user_event_id),
         peer_shared_event_id: psf_b64,
     })
@@ -1503,8 +1509,32 @@ pub async fn svc_accept_device_link(
     let psf_b64 = event_id_to_base64(&link.peer_shared_event_id);
     persist_local_peer_signer(&db, &recorded_by, &psf_b64, &link.peer_shared_key)?;
 
+    // Push identity chain events back to inviter (while still using invite-derived
+    // cert, which the inviter trusts via pending_invite_bootstrap_trust).
+    drop(db);
+    crate::sync::bootstrap::bootstrap_sync_from_invite(
+        db_path,
+        &recorded_by,
+        bootstrap_addr,
+        &invite.bootstrap_spki_fingerprint,
+        15,
+    )
+    .await
+    .map_err(|e| ServiceError(format!("Push-back sync failed: {}", e)))?;
+
+    let db = open_connection(db_path)?;
+
+    // Transition transport identity: replace invite-derived cert with
+    // PeerShared-derived cert so transport and event-layer identities match.
+    let new_peer_id = crate::transport_identity::install_peer_key_transport_identity(
+        &db,
+        &link.peer_shared_key,
+    )
+    .map_err(|e| ServiceError(format!("Failed to install peer key transport identity: {}", e)))?;
+    crate::db::migrate_recorded_by(&db, &recorded_by, &new_peer_id)?;
+
     Ok(AcceptDeviceLinkResponse {
-        peer_id: recorded_by,
+        peer_id: new_peer_id,
         peer_shared_event_id: psf_b64,
     })
 }

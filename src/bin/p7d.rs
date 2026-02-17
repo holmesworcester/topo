@@ -34,10 +34,6 @@ struct Args {
     #[arg(short = 'r', long)]
     connect: Option<SocketAddr>,
 
-    /// Peer fingerprints to trust (hex, repeatable)
-    #[arg(long = "pin-peer")]
-    pin_peer: Vec<String>,
-
     /// Custom RPC socket path (default: <db>.p7d.sock)
     #[arg(long)]
     socket: Option<String>,
@@ -88,13 +84,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Multi-tenant node mode
         let bind_ip = args.bind.ip();
         poc_7::node::run_node(&args.db, bind_ip).await?;
-    } else if !args.pin_peer.is_empty() || args.connect.is_some() {
-        // Single-tenant sync mode
-        service::svc_sync(args.bind, args.connect, &args.db, &args.pin_peer).await?;
     } else {
-        // No peers configured — just serve RPC and wait for shutdown.
-        info!("No peers configured, running RPC-only mode. Ctrl-C to stop.");
-        tokio::signal::ctrl_c().await?;
+        // Single-tenant sync mode: always run accept_loop for incoming
+        // connections. connect_loop only runs when --connect is provided.
+        service::svc_sync(args.bind, args.connect, &args.db).await?;
     }
 
     // Signal RPC server to stop.

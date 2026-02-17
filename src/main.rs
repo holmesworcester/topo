@@ -25,9 +25,6 @@ enum Commands {
         connect: Option<SocketAddr>,
         #[arg(short, long, default_value = "server.db")]
         db: String,
-        /// Optional fallback peer fingerprints (hex, repeatable)
-        #[arg(long = "pin-peer")]
-        pin_peer: Vec<String>,
     },
 
     /// Print local transport identity — SPKI fingerprint from TLS cert (generates cert if needed)
@@ -156,9 +153,6 @@ enum Commands {
         /// Peer B hex SPKI fingerprint
         #[arg(long)]
         peer_b: String,
-        /// Optional fallback peer fingerprints (hex, repeatable)
-        #[arg(long = "pin-peer")]
-        pin_peer: Vec<String>,
         /// Intro TTL in milliseconds
         #[arg(long, default_value = "30000")]
         ttl_ms: u64,
@@ -224,9 +218,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             bind,
             connect,
             db,
-            pin_peer,
         } => {
-            service::svc_sync(bind, connect.clone(), &db, &pin_peer).await?;
+            service::svc_sync(bind, connect.clone(), &db).await?;
         }
         Commands::TransportIdentity { db } => {
             let resp = service::svc_transport_identity(&db)?;
@@ -374,11 +367,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             db,
             peer_a,
             peer_b,
-            pin_peer,
             ttl_ms,
             attempt_window_ms,
         } => {
-            match service::svc_intro(&db, &peer_a, &peer_b, &pin_peer, ttl_ms, attempt_window_ms).await {
+            match service::svc_intro(&db, &peer_a, &peer_b, ttl_ms, attempt_window_ms).await {
                 Ok(true) => {
                     println!("Intro sent to both peers");
                 }

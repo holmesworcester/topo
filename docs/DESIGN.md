@@ -99,12 +99,12 @@ Safety rule:
 
 # 2. Transport and Session Identity
 
-Two separate identity scopes exist:
+Transport identity is derived from event-layer peer identity:
 
 1. **Transport identity** (mTLS scope): cert/key material, SPKI fingerprints, `peer_id` derived from BLAKE2b-256 of X.509 SPKI. Managed by the `transport_identity` module.
 2. **Event-graph identity** (identity layer scope): Ed25519 keys, signer chains, trust anchors, and identity events (types 8-22). Managed by the `projection/identity` module.
 
-These key spaces are separate. A `TransportKey` event (type 23) binds them: it attests a specific SPKI fingerprint under a PeerShared identity.
+Transport certs are deterministically derived from PeerShared Ed25519 signing keys, so the two identity scopes are unified. `TransportKey` events (type 23) are still consulted as a trust source during the transition period but will be removed once all peers have PeerShared-derived transport identities.
 
 ## 2.1 QUIC + mTLS
 
@@ -113,10 +113,9 @@ All peer transport uses QUIC with strict pinned mTLS.
 Rules:
 1. each daemon profile has persistent cert/private key material,
 2. peer allow/deny policy is based on SQL trust state:
-   - `transport_keys` projected from identity events (steady-state),
+   - PeerShared-derived SPKIs (steady-state; SPKI computed directly from PeerShared public key),
    - `invite_bootstrap_trust` rows written when invite links are accepted (bootstrap),
    - `pending_invite_bootstrap_trust` rows written by inviters before invitee first dial,
-   - optional CLI `--pin-peer` overlays for diagnostics/bootstrap fallback,
 3. no permissive verifier in production mode.
 
 ## 2.2 Transport identity binding
@@ -124,26 +123,26 @@ Rules:
 Transport peer identity is SPKI-derived:
 
 1. `peer_id = hex(BLAKE2b-256(cert_SPKI))`,
-2. the `peer_transport_bindings` table records observed connections,
-3. `TransportKey` events (type 23) provide event-graph-attested SPKI bindings,
+2. SPKI is computed directly from PeerShared public key (deterministic cert derivation),
+3. the `peer_transport_bindings` table records observed connections,
 4. `invite_bootstrap_trust` stores accepted invite-link bootstrap tuples
-   (`bootstrap_addr`, inviter SPKI) used before transport-key convergence,
+   (`bootstrap_addr`, inviter SPKI) used before PeerShared-derived trust appears,
 5. `pending_invite_bootstrap_trust` stores inviter-side expected invitee SPKI
-   until converged transport-key trust consumes it,
+   until PeerShared-derived trust consumes it,
 6. accepted/pending bootstrap rows are time-bounded and auto-consumed when
-   matching steady-state `transport_keys` trust is present.
+   matching steady-state PeerShared-derived trust is present.
 
 Runtime rule: handshake verification queries SQL trust state per connection
 creation; projected peer keys are not treated as in-memory authority.
 Conceptually:
-`TrustedPeerSet = transport_keys ∪ invite_bootstrap_trust ∪ pending_invite_bootstrap_trust`.
+`TrustedPeerSet = PeerShared_SPKIs ∪ invite_bootstrap_trust ∪ pending_invite_bootstrap_trust`.
 
 ## 2.3 Event-graph identity binding
 
 Event-graph identity is event-defined:
 
 1. identity state maintains signer chains from workspace root to peer,
-2. `TransportKey` events bridge event-graph identity to transport SPKI fingerprints,
+2. identity state directly determines transport trust — transport certs are derived from PeerShared signing keys,
 3. projected identity determines which peers are allowed to sync.
 
 ## 2.4 NAT traversal and hole punch

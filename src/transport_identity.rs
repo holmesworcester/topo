@@ -118,6 +118,27 @@ pub fn ensure_transport_cert_from_db(
 }
 
 // ---------------------------------------------------------------------------
+// Peer-key-derived transport identity (for all roles)
+// ---------------------------------------------------------------------------
+
+/// Install a deterministic transport cert/key derived from a PeerShared signing
+/// key. This replaces any prior transport identity (random or invite-derived)
+/// so that `recorded_by` (SPKI fingerprint) matches the event-layer peer identity.
+pub fn install_peer_key_transport_identity(
+    conn: &Connection,
+    peer_signing_key: &ed25519_dalek::SigningKey,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    // Delete any pre-existing creds
+    conn.execute("DELETE FROM local_transport_creds", [])?;
+
+    let (cert_der, key_der) = generate_self_signed_cert_from_signing_key(peer_signing_key)?;
+    let fp = extract_spki_fingerprint(cert_der.as_ref())?;
+    let peer_id = hex::encode(fp);
+    store_local_creds(conn, &peer_id, cert_der.as_ref(), key_der.secret_pkcs8_der())?;
+    Ok(peer_id)
+}
+
+// ---------------------------------------------------------------------------
 // Invite bootstrap identity
 // ---------------------------------------------------------------------------
 

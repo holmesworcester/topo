@@ -212,17 +212,15 @@ Historical reference branches (`poc-7-mtls`, `poc-7=codex-attempt`) are no longe
    - local cert/key are file-backed per profile.
 3. Required end-state trust source:
    - transport allow/deny must be derived from SQL trust state rooted in identity:
-     - projected `transport_keys` (steady-state),
+     - PeerShared-derived SPKIs (steady-state; SPKI computed directly from PeerShared public key),
      - accepted invite-link bootstrap rows (`invite_bootstrap_trust`),
      - inviter-side pending invite bootstrap rows (`pending_invite_bootstrap_trust`),
      - bootstrap rows are TTL-bounded and consumed when matching steady-state trust appears,
      - not CLI/file pin lists as authority.
-   - shorthand model term: `TrustedPeerSet = transport_keys U invite_bootstrap_trust U pending_invite_bootstrap_trust`.
+   - shorthand model term: `TrustedPeerSet = PeerShared_SPKIs U invite_bootstrap_trust U pending_invite_bootstrap_trust`.
    - trust inputs are not only `invite`/`invite_accepted`; they include the full identity policy graph (for example peer/user/device/admin/removal state).
-4. TODO (retrofit completed Phase 2 implementation before Phase 12 is done):
-   - remove CLI/profile SPKI allowlist as trust authority.
-   - keep CLI pin input only as optional diagnostics/bootstrap import helper.
-   - keep file cert/key only as optional cache/materialization artifact, not authority.
+4. Done: CLI/profile SPKI allowlist (`--pin-peer`) removed as trust authority.
+   File cert/key is a local cache/materialization artifact, not authority.
 5. Pin peers by expected SPKI from active projected trust state, not by socket address.
 6. Enforce pinning on both sides:
    - server verifies client cert SPKI against pinned store
@@ -1045,7 +1043,7 @@ Only include identity and policy needed for:
 - removal enforcement
 - recipient selection for encrypted message key wraps
 - transport mTLS trust policy derived from identity-backed SQL trust state
-  (projected `transport_keys` + accepted-invite bootstrap trust), not static CLI/file pin sources
+  (PeerShared-derived SPKIs + accepted-invite bootstrap trust), not static CLI/file pin sources
 
 ## 11.3 Split invite event types (no mode switch)
 
@@ -1143,7 +1141,7 @@ Previous gap: TLA models were identity/event-causality models that did not encod
 
 **What is now modeled** (TransportCredentialLifecycle.tla):
 - Local credential lifecycle: generate, rotate, revoke with SPKI uniqueness and history tracking.
-- Three-source trust store: transport_keys, invite_bootstrap_trust, pending_invite_bootstrap_trust.
+- Three-source trust store: PeerShared-derived SPKIs, invite_bootstrap_trust, pending_invite_bootstrap_trust.
 - Supersession: AddTransportKeyTrust automatically removes matching bootstrap/pending entries.
 - TTL expiry of bootstrap trust sources.
 - Trust removal (peer_removed cascading).
@@ -1881,7 +1879,7 @@ let is_allowed = move |peer_fp: &str| -> bool {
 };
 ```
 
-This queries `trust_anchors` and `transport_keys` for that specific `recorded_by`, enabling isolated trust policies per tenant within the same process.
+This queries `trust_anchors` and PeerShared-derived SPKIs for that specific `recorded_by`, enabling isolated trust policies per tenant within the same process.
 
 ### 17.4.3 `PeerDispatcher`
 

@@ -158,16 +158,16 @@ fn daemon_and_ctl_status() {
     let (_dir, db) = temp_db();
     let socket = format!("{}.p7d.sock", &db);
 
-    // Bootstrap the DB so transport identity exists.
+    // Bootstrap identity chain (workspace + PeerShared) so daemon can start sync.
     let out = Command::new(bin_poc7())
-        .args(["transport-identity", "--db", &db])
+        .args(["send", "bootstrap", "--db", &db])
         .output()
         .unwrap();
-    assert!(out.status.success(), "transport-identity failed: {:?}", out);
+    assert!(out.status.success(), "bootstrap failed: {:?}", out);
 
     // Start daemon in background.
     let mut daemon = Command::new(bin_p7d())
-        .args(["--db", &db, "--socket", &socket])
+        .args(["--db", &db, "--socket", &socket, "--bind", "127.0.0.1:0"])
         .spawn()
         .unwrap();
 
@@ -201,16 +201,16 @@ fn daemon_and_ctl_send_and_messages() {
     let (_dir, db) = temp_db();
     let socket = format!("{}.p7d.sock", &db);
 
-    // Bootstrap DB.
+    // Bootstrap identity chain so daemon can start sync.
     let out = Command::new(bin_poc7())
-        .args(["transport-identity", "--db", &db])
+        .args(["send", "bootstrap", "--db", &db])
         .output()
         .unwrap();
     assert!(out.status.success());
 
     // Start daemon.
     let mut daemon = Command::new(bin_p7d())
-        .args(["--db", &db, "--socket", &socket])
+        .args(["--db", &db, "--socket", &socket, "--bind", "127.0.0.1:0"])
         .spawn()
         .unwrap();
 
@@ -250,8 +250,11 @@ fn daemon_and_ctl_send_and_messages() {
     let msgs_resp: serde_json::Value =
         serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
     assert_eq!(msgs_resp["ok"], true);
-    assert_eq!(msgs_resp["data"]["total"], 1);
-    assert_eq!(msgs_resp["data"]["messages"][0]["content"], "hello from p7ctl");
+    assert_eq!(msgs_resp["data"]["total"], 2); // bootstrap + p7ctl message
+    // Find the p7ctl message in the list
+    let messages = msgs_resp["data"]["messages"].as_array().unwrap();
+    assert!(messages.iter().any(|m| m["content"] == "hello from p7ctl"),
+        "should find p7ctl message in list");
 }
 
 #[test]
@@ -259,15 +262,15 @@ fn daemon_and_ctl_assert_now() {
     let (_dir, db) = temp_db();
     let socket = format!("{}.p7d.sock", &db);
 
-    // Bootstrap DB.
+    // Bootstrap identity chain so daemon can start sync.
     Command::new(bin_poc7())
-        .args(["transport-identity", "--db", &db])
+        .args(["send", "bootstrap", "--db", &db])
         .output()
         .unwrap();
 
     // Start daemon.
     let mut daemon = Command::new(bin_p7d())
-        .args(["--db", &db, "--socket", &socket])
+        .args(["--db", &db, "--socket", &socket, "--bind", "127.0.0.1:0"])
         .spawn()
         .unwrap();
 
@@ -277,12 +280,12 @@ fn daemon_and_ctl_assert_now() {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 
-    // Assert message_count == 0 (should pass).
+    // Assert message_count == 1 (bootstrap message; should pass).
     let out = Command::new(bin_p7ctl())
         .args([
             "--db", &db,
             "--socket", &socket,
-            "assert-now", "message_count == 0",
+            "assert-now", "message_count == 1",
         ])
         .output()
         .unwrap();
