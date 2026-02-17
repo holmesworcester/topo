@@ -63,6 +63,7 @@ pub async fn handle_intro_offer(
     observed_at_ms: u64,
     expires_at_ms: u64,
     attempt_window_ms: u32,
+    client_config: Option<quinn::ClientConfig>,
 ) {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -139,7 +140,13 @@ pub async fn handle_intro_offer(
         }
         attempt += 1;
 
-        match endpoint.connect(addr, "localhost") {
+        // Use per-tenant config when available (node multi-tenant path).
+        // Fallback to endpoint default for single-tenant test endpoints.
+        match if let Some(ref cfg) = client_config {
+            endpoint.connect_with(cfg.clone(), addr, "localhost")
+        } else {
+            endpoint.connect(addr, "localhost")
+        } {
             Ok(connecting) => {
                 match tokio::time::timeout(pace, connecting).await {
                     Ok(Ok(connection)) => {
@@ -259,6 +266,7 @@ pub fn spawn_intro_listener(
     recorded_by: String,
     introduced_by: String,
     endpoint: quinn::Endpoint,
+    client_config: Option<quinn::ClientConfig>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_local(async move {
         loop {
@@ -288,16 +296,17 @@ pub fn spawn_intro_listener(
                     let recorded_by = recorded_by.clone();
                     let introduced_by = introduced_by.clone();
                     let endpoint = endpoint.clone();
+                    let cfg = client_config.clone();
 
                     // Spawn punch attempt as a local task — runs on the same
                     // LocalSet / runtime that owns the endpoint I/O driver,
-                    // so endpoint.connect() can properly send/receive UDP.
+                    // so endpoint.connect_with() can properly send/receive UDP.
                     tokio::task::spawn_local(async move {
                         handle_intro_offer(
                             &db_path, &recorded_by, &introduced_by, endpoint,
                             intro_id, other_peer_id, origin_family,
                             origin_ip, origin_port, observed_at_ms, expires_at_ms,
-                            attempt_window_ms,
+                            attempt_window_ms, cfg,
                         ).await;
                     });
                 }

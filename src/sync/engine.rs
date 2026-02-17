@@ -1101,7 +1101,7 @@ pub async fn accept_loop(
     });
 
     let tenant_ids = vec![recorded_by.to_string()];
-    accept_loop_with_ingest(db_path, &tenant_ids, endpoint, None, shared_ingest_tx).await
+    accept_loop_with_ingest(db_path, &tenant_ids, endpoint, None, shared_ingest_tx, std::collections::HashMap::new()).await
 }
 
 /// Accept incoming connections using an externally-provided ingest channel.
@@ -1119,6 +1119,7 @@ pub async fn accept_loop_with_ingest(
     endpoint: quinn::Endpoint,
     _allowed_peers: Option<crate::transport::AllowedPeers>,
     shared_ingest_tx: mpsc::Sender<IngestItem>,
+    tenant_client_configs: std::collections::HashMap<String, quinn::ClientConfig>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     {
         let db = open_connection(db_path)?;
@@ -1225,6 +1226,7 @@ pub async fn accept_loop_with_ingest(
         let recorded_by_owned = recorded_by;
         let ingest_clone = shared_ingest_tx.clone();
         let intro_endpoint = endpoint.clone();
+        let intro_client_cfg = tenant_client_configs.get(&recorded_by_owned).cloned();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -1239,6 +1241,7 @@ pub async fn accept_loop_with_ingest(
                     recorded_by_owned.clone(),
                     peer_id.clone(),
                     intro_endpoint,
+                    intro_client_cfg,
                 );
 
                 loop {
@@ -1428,6 +1431,7 @@ async fn connect_loop_inner(
             recorded_by.to_string(),
             peer_id.clone(),
             endpoint.clone(),
+            client_config.clone(),
         );
 
         // Inner loop: repeated sync sessions on this connection

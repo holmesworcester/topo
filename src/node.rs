@@ -255,7 +255,14 @@ pub async fn run_node(
                             let ep_clone = endpoint.clone();
                             let db_path_disc = db_path.to_string();
                             let tenant_id = tenant.peer_id.clone();
-                            let disc_client_cfg = tenant_client_configs.get(&tenant.peer_id).cloned();
+                            let disc_client_cfg = match tenant_client_configs.get(&tenant.peer_id).cloned() {
+                                Some(c) => c,
+                                None => {
+                                    warn!("Skipping mDNS browse for {}: no client config", &tenant.peer_id[..16]);
+                                    _discovery_handles.push(disc);
+                                    continue;
+                                }
+                            };
                             std::thread::spawn(move || {
                                 let mut dispatcher = PeerDispatcher::new();
                                 while let Ok(peer) = rx.recv() {
@@ -289,7 +296,7 @@ pub async fn run_node(
                                     let ep = ep_clone.clone();
                                     let db = db_path_disc.clone();
                                     let tid = tenant_id.clone();
-                                    let cfg = disc_client_cfg.clone();
+                                    let cfg = Some(disc_client_cfg.clone());
                                     std::thread::spawn(move || {
                                         let rt = tokio::runtime::Builder::new_current_thread()
                                             .enable_all()
@@ -325,6 +332,7 @@ pub async fn run_node(
     let all_tenant_ids: Vec<String> = tenants.iter().map(|t| t.peer_id.clone()).collect();
     let db_path_owned = db_path.to_string();
     let ingest_tx = shared_tx.clone();
+    let accept_configs = tenant_client_configs.clone();
     let accept_handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -337,6 +345,7 @@ pub async fn run_node(
                 endpoint,
                 None,
                 ingest_tx,
+                accept_configs,
             )
             .await
             {
@@ -346,19 +355,27 @@ pub async fn run_node(
     });
 
     // Explicit --connect target: spawn connect_loop for each tenant.
+    // Skip tenants that failed client config creation (fail-closed: no outbound
+    // with wrong cert/trust).
     if let Some(remote) = connect {
         for tenant in &tenants {
+            let cfg = match tenant_client_configs.get(&tenant.peer_id).cloned() {
+                Some(c) => c,
+                None => {
+                    warn!("Skipping outbound connect for {}: no client config", &tenant.peer_id[..16]);
+                    continue;
+                }
+            };
             let ep = connect_endpoint.clone();
             let db = db_path.to_string();
             let tid = tenant.peer_id.clone();
-            let cfg = tenant_client_configs.get(&tenant.peer_id).cloned();
             std::thread::spawn(move || {
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .unwrap();
                 rt.block_on(async move {
-                    if let Err(e) = crate::sync::engine::connect_loop(&db, &tid, ep, remote, cfg).await
+                    if let Err(e) = crate::sync::engine::connect_loop(&db, &tid, ep, remote, Some(cfg)).await
                     {
                         warn!("connect_loop for {} exited: {}", &tid[..16], e);
                     }
