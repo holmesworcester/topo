@@ -6,13 +6,13 @@ Changes to this document require TLA+ model re-verification.
 
 | Code | Rust Type | TLA+ Name | Wire Size | Share Scope | Encryptable | Signer Required | Sig Len | Signer Type |
 |------|-----------|-----------|-----------|-------------|-------------|-----------------|---------|-------------|
-| 1 | Message | Message | 1194B | Shared | Yes | No | 0 | — |
-| 2 | Reaction | MessageReaction | 234B | Shared | Yes | No | 0 | — |
-| 3 | PeerKey | Peer | 41B | Shared | — | No | 0 | — |
-| 4 | SignedMemo | — | 1130B | Shared | Yes | Yes | 64 | 0 (peer) |
+| 1 | Message | Message | 1194B | Shared | Yes | Yes | 64 | runtime (1..5) |
+| 2 | Reaction | MessageReaction | 234B | Shared | Yes | Yes | 64 | runtime (1..5) |
+| 3 | Retired (code reserved) | Peer (legacy) | — | — | — | — | — | — |
+| 4 | SignedMemo | — | 1130B | Shared | Yes | Yes | 64 | runtime (1..5) |
 | 5 | Encrypted | Encrypted | 70+inner_size | Shared | No | No | 0 | — |
 | 6 | SecretKey | SecretKey | 41B | Local | Yes | No | 0 | — |
-| 7 | MessageDeletion | MessageDeletion | 73B | Shared | Yes | No | 0 | — |
+| 7 | MessageDeletion | MessageDeletion | 170B | Shared | Yes | Yes | 64 | runtime (1..5) |
 | 8 | Workspace | Workspace | 73B | Shared | No | No | 0 | — |
 | 9 | InviteAccepted | InviteAccepted | 73B | Local | No | No | 0 | — |
 | 10 | UserInviteBoot | UserInviteBoot | 170B | Shared | No | Yes | 64 | 1 (workspace) |
@@ -28,15 +28,15 @@ Changes to this document require TLA+ model re-verification.
 | 20 | UserRemoved | UserRemoved | 138B | Shared | No | Yes | 64 | 5 (peer_shared) |
 | 21 | PeerRemoved | PeerRemoved | 138B | Shared | No | Yes | 64 | 5 (peer_shared) |
 | 22 | SecretShared | SecretShared | 202B | Shared | No | Yes | 64 | 5 (peer_shared) |
-| 23 | TransportKey | — | 41B | Shared | No | No | 0 | — |
-| 24 | MessageAttachment | — | 633B | Shared | Yes | No | 0 | — |
-| 25 | FileSlice | — | 262286B | Shared | Yes | Yes | 64 | 5 (peer_shared) |
+| 23 | TransportKey | — | 138B | Shared | No | Yes | 64 | runtime (1..5) |
+| 24 | MessageAttachment | — | 633B | Shared | Yes | Yes | 64 | runtime (1..5) |
+| 25 | FileSlice | — | 262286B | Shared | Yes | Yes | 64 | runtime (1..5) |
+| 26 | BenchDep | — | 345B | Shared | No | No | 0 | — |
 
 ## Signer Type Resolution
 
 | signer_type | Resolves From | Valid Event Type Codes | Key Extraction |
 |-------------|--------------|------------------------|----------------|
-| 0 | PeerKey | 3 | public_key at [9..41] |
 | 1 | Workspace | 8 | public_key at [9..41] |
 | 2 | UserInvite (Boot/Ongoing) | 10, 11 | public_key at [9..41] |
 | 3 | DeviceInvite (First/Ongoing) | 12, 13 | public_key at [9..41] |
@@ -47,13 +47,13 @@ Changes to this document require TLA+ model re-verification.
 
 | Code | TLA+ RawDeps | Rust dep_fields |
 |------|-------------|-----------------|
-| 1 | {Workspace} | [workspace_event_id] |
-| 2 | {target_event_id} | [target_event_id] |
+| 1 | {signed_by} | [signed_by] |
+| 2 | {target_event_id, signed_by} | [target_event_id, signed_by] |
 | 3 | {} | [] |
 | 4 | {signed_by} | [signed_by] |
 | 5 | {key_event_id} | [key_event_id] |
 | 6 | {} | [] |
-| 7 | {target_event_id} | [target_event_id] |
+| 7 | {target_event_id, signed_by} | [target_event_id, signed_by] |
 | 8 | {} | [] |
 | 9 | {} | [] |
 | 10 | {signed_by} | [signed_by] (workspace_id is reference, not dep) |
@@ -69,9 +69,10 @@ Changes to this document require TLA+ model re-verification.
 | 20 | {target_event_id, signed_by} | [target_event_id, signed_by] |
 | 21 | {target_event_id, signed_by} | [target_event_id, signed_by] |
 | 22 | {key_event_id, recipient_event_id, signed_by} | [key_event_id, recipient_event_id, signed_by] |
-| 23 | {} | [] |
-| 24 | {message_id, key_event_id} | [message_id, key_event_id] |
+| 23 | {signed_by} | [signed_by] |
+| 24 | {message_id, key_event_id, signed_by} | [message_id, key_event_id, signed_by] |
 | 25 | {signed_by} | [signed_by] |
+| 26 | {dep_id × 10 slots} | [dep_id × non-zero slots] |
 
 ## Guards (TLA+ Guard → Rust pipeline check)
 
@@ -108,6 +109,7 @@ Changes to this document require TLA+ model re-verification.
 | 23 | project_transport_key | transport_keys | — |
 | 24 | project_message_attachment | message_attachments | — |
 | 25 | project_file_slice | file_slices | signature verification |
+| 26 | (none) | valid_events | dependency benchmark event; no projection table side effects |
 
 ## Shared Pipeline Stages
 
@@ -331,12 +333,18 @@ No TLA+ model changes were required because:
 3. The `encryptable` metadata field on `EventTypeMeta` centralizes the admissible
    inner type set previously hard-coded in `encrypted.rs`.
 
-TLC model check was not run because `tla2tools.jar` is not present in this worktree.
-When the JAR is restored, verify with:
-```
-cd docs/tla && ./tlc event_graph_schema_fast.cfg
-cd docs/tla && ./tlc transport_credential_lifecycle_fast.cfg
-```
+TLC status (run on 2026-02-17):
+
+1. `cd docs/tla && ./tlc event_graph_schema_fast.cfg`:
+   - fails `InvAllValidRequireWorkspace`.
+   - counterexample path includes `invite_accepted` + `transport_key` becoming valid without `workspace`.
+   - trace file emitted: `docs/tla/EventGraphSchema_TTrace_1771345823.tla`.
+2. `cd docs/tla && java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -config transport_credential_lifecycle_fast.cfg -workers auto TransportCredentialLifecycle`:
+   - passes (no invariant violations).
+
+Note: `docs/tla/tlc` currently hardcodes `EventGraphSchema` as the module target,
+so `transport_credential_lifecycle_fast.cfg` must be run with direct `java ... tlc2.TLC`
+until the wrapper script is generalized.
 
 ### collapse-single-tenant per-tenant outbound trust (2026-02-17)
 

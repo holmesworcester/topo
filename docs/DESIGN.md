@@ -540,9 +540,10 @@ Projection flow:
 6. decode inner event using normal registry,
 7. verify `inner_type_code` matches decoded inner event type (mismatch -> reject),
 8. reject nested encrypted wrapper,
-9. resolve inner deps via same schema dependency engine,
-10. run normal inner projector,
-11. mark outer event valid only if inner projection succeeds.
+9. resolve inner deps via same schema dependency engine (presence check uses the same blocker tables and outer-event anchoring),
+10. skip inner dep type-code enforcement for decrypted inners because inner deps may legitimately target encrypted wrapper events that carry admissible plaintext,
+11. run normal inner signer + projector stages,
+12. mark outer event valid only if inner projection succeeds.
 
 Materialization is an adapter step, not a second projection system.
 

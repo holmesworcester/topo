@@ -38,26 +38,26 @@ Realism-first rule for ordering: finish test-fidelity items up front (copying ev
 
 1. ~~`P0: Remove copy_event_chain from interactive invite acceptance`~~ **DONE**: `copy_event_chain` deleted; interactive and CLI invite acceptance now use real QUIC bootstrap sync via `svc_accept_invite` / `bootstrap_sync_from_invite`. Two-process integration test validates end-to-end. See PLAN.md §2.2 "CLI Isomorphism Principle".
 2. ~~`P1: Replace prerequisite event copy in Peer::new_in_workspace`~~ **DONE**: `new_in_workspace` now uses real QUIC bootstrap sync via `svc_accept_invite` + temp sync endpoint. No direct `insert_event`/`insert_recorded_event` calls remain in the join path. Joiner DB starts empty (no transport identity); invite-derived identity installed by service layer. Holepunch and scenario tests pass with realistic bootstrap.
-3. `P1: Stop direct SQL trust seeding in CLI invite-bootstrap test` (partially addressed: `test_two_process_invite_and_sync` uses production invite flow; existing `test_cli_sync_bootstrap_from_accepted_invite_data` still seeds directly)
-4. `P1: Remove manual endpoint observation writes in hole-punch integration test`
-5. `P2: Align test transport setup with production dynamic trust lookup`
-6. `P1: Deprecate --pin-peer from product code and design after invite-trust maturity`
-7. `P0: Make scenario replay invariants mandatory by default (opt-out only)`
-8. `P0: Bring scenario invariant harness fully in line with PLAN (fingerprints + full invariant set)`
-9. `P1: Investigate and decide create_event_sync service semantics before implementation changes`
+3. ~~`P1: Stop direct SQL trust seeding in CLI invite-bootstrap test`~~ **DONE**: CLI bootstrap tests now use production invite create/accept flow; direct trust-row seed helpers were removed from active CLI test paths.
+4. ~~`P1: Remove manual endpoint observation writes in hole-punch integration test`~~ **DONE**: hole-punch integration now derives endpoint observations from organic sync traffic (no manual endpoint DB seeding in the test flow).
+5. `P2: Align test transport setup with production dynamic trust lookup` **PARTIALLY DONE**: shared test helpers now use dynamic trust lookup (`create_dual_endpoint_dynamic` + SQL trust import) for common sync topologies; remaining static-pinning cases in scenario/hole-punch tests need explicit migration/annotation.
+6. ~~`P1: Deprecate --pin-peer from product code and design after invite-trust maturity`~~ **DONE**: `--pin-peer` removed from product sync CLI/runtime trust authority; residual references are test-plan/archival artifacts only.
+7. ~~`P0: Make scenario replay invariants mandatory by default (opt-out only)`~~ **DONE**: scenario tests now go through mandatory `ScenarioHarness` replay checks unless explicitly skipped.
+8. ~~`P0: Bring scenario invariant harness fully in line with PLAN (fingerprints + full invariant set)`~~ **DONE**: deterministic full-state fingerprint replay checks are now active for forward/idempotent/reverse/shuffled replay paths, with mandatory ScenarioHarness replay verification by default.
+9. ~~`P1: Investigate and decide create_event_sync service semantics before implementation changes`~~ **DONE**: strict `create_event_sync` and bootstrap-only `create_event_staged` semantics are explicitly captured in PLAN §6.4 and covered by contract tests (`test_create_event_sync_contract_valid_only`, `test_create_event_sync_contract_blocked_returns_err_with_event_id`).
 10. ~~`P1: Investigate simplification of project_one/project_one_core split to better match one-path intent`~~ **DONE**: Investigated and resolved. Decision: keep two-layer model (`project_one` public entrypoint + `project_one_step` internal non-cascading step) as justified cascade optimization. Renamed `project_one_core` → `project_one_step` with clear doc comments. Added 7 source-isomorphism invariance tests proving direct/cascade/reverse-order convergence. Updated DESIGN.md §4.1, PLAN.md §5/§15.1, and TLA projector_spec.md to explicitly document the internal split.
-11. `P0: Unify transport identity architecture (single event-derived peer identity, no rotation sidecar)`
-12. `P2: Resolve disjoint trust sets docs/code mismatch`
-13. `P0: Enforce removal policy at transport runtime (deny + disconnect active sessions)`
-14. `P0: Unify bootstrap key distribution via invite-key wrap/unwrap (keep local secret_key dep)`
-15. `P1: Collapse encrypted-inner projection onto the same dependency/signer engine stages`
-16. `P0: Re-impose fixed-length event fields + langsec parser model`
-17. `P1: Remove duplicated command/business logic between CLI (main.rs) and service layer (service.rs)` (partially addressed: invite create/accept now routes through service layer; remaining: send, messages, status, react, delete, users, keys)
-18. `P1: Eliminate direct SQL access in CLI command paths where module APIs already exist`
-19. `P1: Reconcile TLA/spec mapping docs with PLAN and implemented projector semantics`
-20. `P2: Remove residual compatibility cruft from active schema/docs/runtime surfaces`
+11. `P0: Unify transport identity architecture (single event-derived peer identity, no rotation sidecar)` **PARTIALLY DONE**: strict non-regenerating credential loaders are in place, but sidecar/state-authority collapse and full event-derived identity authority are not complete.
+12. ~~`P2: Resolve disjoint trust sets docs/code mismatch`~~ **DONE**: docs now match code semantics (tenant-scoped trust checks with permitted cross-tenant SPKI overlap).
+13. ~~`P0: Enforce removal policy at transport runtime (deny + disconnect active sessions)`~~ **DONE**: runtime now checks removal state in sync loops and closes active sessions for removed peers.
+14. `P0: Unify bootstrap key distribution via invite-key wrap/unwrap (keep local secret_key dep)` **PARTIALLY DONE**: invite create/accept now uses canonical wrap -> unwrap flow (`secret_shared` targeted to invite key + deterministic local `secret_key` materialization), but explicit out-of-order bootstrap coverage and TLA/model/doc closure remain.
+15. ~~`P1: Collapse encrypted-inner projection onto the same dependency/signer engine stages`~~ **DONE**: encrypted-inner and cleartext share one dep/signer/dispatch stage helper (`run_dep_and_projection_stages`), and DESIGN/PLAN/TLA mapping docs now explicitly record the decrypted-inner dep-type-check exception rationale.
+16. ~~`P0: Re-impose fixed-length event fields + langsec parser model`~~ **DONE**: canonical event parsers now enforce fixed wire sizes (including encrypted-size-by-inner-type), no canonical parser uses in-event length/count fields, and fixed-layout/no-length guard suites are green (`fixed_layout_tests`, `wire_no_length_fields_guard_test`).
+17. ~~`P1: Remove duplicated command/business logic between CLI (main.rs) and service layer (service.rs)`~~ **DONE**: core CLI command flows route through service-layer APIs; remaining REPL-specific cleanup is tracked separately in item 21.
+18. ~~`P1: Eliminate direct SQL access in CLI command paths where module APIs already exist`~~ **DONE (CLI)**: direct SQL was removed from standard CLI command paths; remaining REPL/internal helper SQL cleanup is tracked under item 21.
+19. `P1: Reconcile TLA/spec mapping docs with PLAN and implemented projector semantics` **PARTIALLY DONE**: event-registry/dependency mapping rows were refreshed to current runtime semantics; remaining open deltas are transport-credential lifecycle naming/model drift (item 11) and EventGraphSchema `InvAllValidRequireWorkspace` model mismatch.
+20. `P2: Remove residual compatibility cruft from active schema/docs/runtime surfaces` **PARTIALLY DONE**: some stale wording/legacy assumptions were removed; broader runtime/schema cleanup remains.
 21. `P1: CLI isomorphism — route remaining interactive commands through service layer` (send, messages, status, react, delete, users, keys — interactive REPL should be a thin adapter over service functions per PLAN §2.2)
-22. `P2: Single-port multi-tenant endpoint — share one UDP port across tenants on the same device` (currently per-tenant ports; see PLAN §2.3)
+22. ~~`P2: Single-port multi-tenant endpoint — share one UDP port across tenants on the same device`~~ **DONE**: node now runs a single shared QUIC endpoint with multi-workspace cert resolution and per-tenant outbound isolation checks.
 
 ## P0: Re-impose fixed-length event fields + langsec parser model
 
@@ -103,43 +103,23 @@ Acceptance:
 4. Parser test suite demonstrates strict reject behavior for non-canonical encodings and malformed padding.
 5. TLA/projector mapping docs are updated to match the new canonical-format assumptions and boundaries.
 
-## P1: Collapse encrypted-inner projection onto the same dependency/signer engine stages
+## ~~P1: Collapse encrypted-inner projection onto the same dependency/signer engine stages~~ DONE
 
-Evidence:
+Completed:
 
-1. Plan requires one dependency engine and one projection entry pipeline (`docs/PLAN.md:95`, `docs/PLAN.md:96`, `docs/PLAN.md:550`).
-2. Signer refs are already modeled as dependencies in event metadata (`docs/PLAN.md:546`) and in code (`src/events/mod.rs:138`).
-3. Current encrypted path re-implements core stages for inner plaintext:
-   - inner dep check/block row writes: `src/projection/encrypted.rs:91`
-   - inner signer verification: `src/projection/encrypted.rs:126`
-   - inner projector dispatch switch: `src/projection/encrypted.rs:163`
-4. Generic non-encrypted flow already has shared stages:
-   - dep check/type check: `src/projection/pipeline.rs:222`, `src/projection/pipeline.rs:257`
-   - signer verify + dispatch: `src/projection/pipeline.rs:61`
+1. Cleartext and decrypted-inner events now run through one shared stage helper:
+   - `src/projection/pipeline.rs`: `run_dep_and_projection_stages(...)`
+   - `src/projection/encrypted.rs`: wrapper-specific decrypt/admissibility only, then shared stage call.
+2. Block/reject semantics remain outer-event anchored for encrypted wrappers.
+3. Docs now explicitly describe the shared-stage model and decrypted-inner dep-type-check exception rationale:
+   - `docs/tla/projector_spec.md`
+   - `docs/DESIGN.md` §6.2
+   - `docs/PLAN.md` §7.4
 
-Problem: logic drift risk. Two implementations of the same semantic stages can diverge (error reasons, blocker writes, signer handling, event-type admission policy).
+Verification:
 
-Fix:
-
-1. Keep the current model that signer refs are deps (for blocking) plus a distinct signature-verification stage after deps are available.
-2. Refactor pipeline into explicit reusable stages callable for both:
-   - canonical outer event path (today’s `project_one_core`),
-   - decrypted inner event path (encrypted wrapper).
-3. Minimize `projection/encrypted.rs` to wrapper-specific concerns only:
-   - key resolve / decrypt / `inner_type_code` checks / no-nested-encrypted policy,
-   - then call shared dep/type/signer/dispatch stage with outer `event_id` context.
-4. Ensure blocker/reject semantics remain anchored to outer event_id for encrypted wrappers.
-5. Add regression tests proving parity between direct event projection and encrypted-inner projection for the same inner type.
-6. TLA/model alignment:
-   - update `docs/tla/projector_spec.md` to reflect single staged engine semantics (including encrypted-inner reuse path),
-   - update model notes if any guard/dependency staging language changes.
-
-Acceptance:
-
-1. No duplicated dep/signer/dispatch logic remains between `projection/pipeline.rs` and `projection/encrypted.rs`.
-2. Signed inner events block on signer deps and verify signatures through the same shared stage as cleartext events.
-3. New parity tests pass for at least message/reaction/deletion/file-slice inner event families.
-4. TLA/projector mapping docs describe one staged dependency/signer engine path.
+1. Projection pipeline tests remain green after refactor.
+2. Fixed-layout/no-length guard suites remain green.
 
 ## P0: Unify bootstrap key distribution via invite-key wrap/unwrap (keep local `secret_key` dep)
 
@@ -469,63 +449,58 @@ Acceptance:
 2. Standard harness covers PLAN 12.4 checks in default flow.
 3. Per-test opt-out remains explicit and justified.
 
-## P1: Investigate and decide `create_event_sync` service semantics before implementation changes
+## ~~P1: Investigate and decide `create_event_sync` service semantics before implementation changes~~ DONE
 
-Evidence:
+Decision and closure:
 
-1. PLAN contract says synchronous create success implies `valid` terminal state:
-   - `docs/PLAN.md:600`-`docs/PLAN.md:603`.
-2. Service currently treats `Blocked` as success via wrapper:
-   - `src/service.rs:88`-`src/service.rs:96`,
-   - used in user-facing commands (`src/service.rs:607`, `src/service.rs:773`, `src/service.rs:801`).
-
-Problem: docs/plan contract and service API behavior are currently misaligned; changing behavior affects CLI/service UX and orchestration assumptions.
-
-Required process for this TODO (approval gate):
-
-1. Initial investigation only (no behavior changes):
-   - enumerate all call sites and current caller expectations,
-   - catalog where `Blocked`-as-success is relied on today.
-2. Planning and explanation:
-   - write options with tradeoffs (for example strict valid-only vs explicit terminal-status response),
-   - include test impact, caller behavior impact, and rollback risk.
-3. Decision checkpoint:
-   - present recommendation and wait for explicit approval before any implementation patch.
-4. Implementation starts only after approval is recorded on this TODO item.
-
-Acceptance:
-
-1. Investigation note + option analysis is committed/recorded first.
-2. No runtime behavior change lands before explicit approval.
-3. Post-approval implementation and tests follow the selected option.
+1. Keep two explicit create APIs with distinct contracts:
+   - `create_event_sync`: strict user-facing contract, success only on `Valid`/`AlreadyProcessed`.
+   - `create_event_staged`: bootstrap-only helper that preserves blocked event ids.
+2. PLAN now captures this split explicitly (`docs/PLAN.md` §6.4).
+3. Contract tests are present and green:
+   - `src/projection/create.rs`: `test_create_event_sync_contract_valid_only`
+   - `src/projection/create.rs`: `test_create_event_sync_contract_blocked_returns_err_with_event_id`
 
 ## P1: Reconcile TLA/spec mapping docs with PLAN and implemented projector semantics
 
 Evidence:
 
 1. PLAN requires projector/TLA divergence to be treated as spec bug (`docs/PLAN.md:1118`).
-2. `docs/tla/projector_spec.md` currently contains stale rows versus current schema/runtime in several places (for example signer-required/signer-type rows and invite-related invariants).
+2. `docs/tla/projector_spec.md` had stale rows versus current schema/runtime (signer-required/signer-type/dependency rows).
+3. Remaining known mismatch is transport-credential lifecycle naming drift while item 11 is still open.
 
-Problem: stale mapping docs weaken reviewability and can hide real model/runtime divergence.
+Problem: unresolved mapping/model drift weakens reviewability and can hide real model/runtime divergence.
 
 Fix:
 
 1. Perform a row-by-row audit:
    - event registry metadata vs projector-spec table,
    - guard/invariant mapping vs implemented guards/projectors.
-2. Update `docs/tla/projector_spec.md` to match current code and PLAN semantics:
+2. Keep `docs/tla/projector_spec.md` aligned to current code and PLAN semantics (row-by-row):
    - signer requirements/types,
+   - dependency mappings,
    - invite-accepted trust-anchor semantics,
    - transport trust/removal mapping rows.
 3. Reconcile/trim stale invariants that no longer reflect normative behavior; add missing ones that now are normative.
 4. Re-run relevant TLC/model checks and record results/artifacts.
 5. Update `docs/DESIGN.md` / `docs/PLAN.md` references where mapping names changed.
 
-Acceptance:
+Status update (2026-02-17):
 
-1. Mapping doc has no known stale rows against current runtime semantics.
-2. TLC/model checks pass for updated invariants.
-3. DESIGN/PLAN/TLA mapping terminology is consistent.
+1. Event-registry and dependency rows were refreshed to match runtime semantics.
+2. Shared encrypted-inner pipeline mapping and rationale were documented.
+3. TLC runs were executed:
+   - `EventGraphSchema` fast config currently fails `InvAllValidRequireWorkspace` (counterexample via `transport_key` path).
+   - `TransportCredentialLifecycle` fast config passes.
+4. Remaining closure items are:
+   - transport lifecycle naming/model drift tied to item 11,
+   - resolving/redesigning the `InvAllValidRequireWorkspace` expectation in EventGraphSchema.
+
+Acceptance (remaining):
+
+1. No known stale rows remain in mappings relevant to completed runtime behavior.
+2. TLC/model checks pass for any changed model scope.
+3. Transport lifecycle naming/model terms are unified with the selected item-11 architecture.
 
 ## P1: Remove duplicated command/business logic between CLI (`main.rs`) and service layer (`service.rs`)
 
