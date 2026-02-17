@@ -23,8 +23,7 @@ use crate::projection::create::{create_event_sync, create_event_staged, create_s
 use crate::projection::pipeline::project_one;
 use crate::transport::create_dual_endpoint_dynamic;
 use crate::transport_identity::{
-    ensure_transport_peer_id, ensure_transport_cert,
-    load_transport_peer_id,
+    install_peer_key_transport_identity, load_transport_cert_required, load_transport_peer_id,
 };
 
 // ---------------------------------------------------------------------------
@@ -95,14 +94,18 @@ fn open_db_load(
     Ok((recorded_by, conn))
 }
 
-/// Open DB, create tables, ensure transport peer ID (create if needed).
-/// For write/bootstrap commands.
+/// Open DB, create tables, and require an existing transport peer ID.
+/// For write commands that operate on an already initialized identity.
 fn open_db_ensure(
     db_path: &str,
 ) -> Result<(String, rusqlite::Connection), Box<dyn std::error::Error + Send + Sync>> {
     let conn = open_connection(db_path)?;
     create_tables(&conn)?;
-    let recorded_by = ensure_transport_peer_id(&conn)?;
+    let recorded_by = match load_transport_peer_id(&conn) {
+        Ok(peer_id) => peer_id,
+        Err(_) => bootstrap_event_derived_identity(&conn)
+            .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e))?,
+    };
     Ok((recorded_by, conn))
 }
 
@@ -392,6 +395,33 @@ pub fn load_local_peer_signer_pub(
     Ok(None)
 }
 
+fn load_any_event_local_peer_signer(
+    db: &rusqlite::Connection,
+) -> ServiceResult<Option<(String, SigningKey)>> {
+    ensure_local_signer_tables(db)?;
+
+    let row = db
+        .query_row(
+            "SELECT l.recorded_by, l.signing_key
+             FROM local_peer_signers l
+             INNER JOIN peers_shared p
+               ON p.recorded_by = l.recorded_by AND p.event_id = l.event_id
+             ORDER BY l.updated_at DESC
+             LIMIT 1",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
+        .optional()?;
+
+    match row {
+        Some((recorded_by, key_bytes)) => {
+            let signing_key = decode_signing_key(key_bytes)?;
+            Ok(Some((recorded_by, signing_key)))
+        }
+        None => Ok(None),
+    }
+}
+
 pub fn ensure_identity_chain(
     db: &rusqlite::Connection,
     recorded_by: &str,
@@ -472,6 +502,30 @@ pub fn ensure_identity_chain(
     persist_workspace_key(db, recorded_by, &workspace_key)?;
 
     Ok((psf_eid, peer_shared_key))
+}
+
+fn bootstrap_event_derived_identity(
+    db: &rusqlite::Connection,
+) -> ServiceResult<String> {
+    if let Some((existing_recorded_by, existing_signer)) = load_any_event_local_peer_signer(db)? {
+        let derived = install_peer_key_transport_identity(db, &existing_signer)
+            .map_err(|e| ServiceError(format!("install transport identity failed: {}", e)))?;
+        if derived != existing_recorded_by {
+            crate::db::migrate_recorded_by(db, &derived, &existing_recorded_by)
+                .map_err(|e| ServiceError(format!("recorded_by migration failed: {}", e)))?;
+        }
+        return Ok(derived);
+    }
+
+    let bootstrap_recorded_by = format!("bootstrap-{}", current_timestamp_ms());
+    let (_eid, peer_shared_key) = ensure_identity_chain(db, &bootstrap_recorded_by)?;
+    let derived = install_peer_key_transport_identity(db, &peer_shared_key)
+        .map_err(|e| ServiceError(format!("install transport identity failed: {}", e)))?;
+    if derived != bootstrap_recorded_by {
+        crate::db::migrate_recorded_by(db, &derived, &bootstrap_recorded_by)
+            .map_err(|e| ServiceError(format!("recorded_by migration failed: {}", e)))?;
+    }
+    Ok(derived)
 }
 
 // ---------------------------------------------------------------------------
@@ -602,7 +656,8 @@ pub fn query_field(db: &rusqlite::Connection, field: &str, recorded_by: &str) ->
 // ---------------------------------------------------------------------------
 
 pub fn svc_transport_identity(db_path: &str) -> ServiceResult<TransportIdentityResponse> {
-    let (fingerprint, _db) = open_db_ensure(db_path)?;
+    let (fingerprint, _db) = open_db_ensure(db_path)
+        .map_err(|e| ServiceError(format!("{}", e)))?;
     Ok(TransportIdentityResponse { fingerprint })
 }
 
@@ -1079,7 +1134,7 @@ pub fn svc_intro_attempts(
     db_path: &str,
     peer: Option<&str>,
 ) -> ServiceResult<Vec<IntroAttemptItem>> {
-    let (recorded_by, db) = open_db_ensure(db_path)?;
+    let (recorded_by, db) = open_db_load(db_path)?;
 
     let rows = crate::db::intro::list_intro_attempts(&db, &recorded_by, peer)?;
     Ok(rows
@@ -1108,7 +1163,7 @@ pub async fn svc_intro(
 
     let conn = open_connection(db_path)?;
     create_tables(&conn)?;
-    let (recorded_by, cert, key) = ensure_transport_cert(&conn)?;
+    let (recorded_by, cert, key) = load_transport_cert_required(&conn)?;
     drop(conn);
 
     // Dynamic trust lookup from SQL at handshake time
@@ -1522,8 +1577,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.db");
         let path_str = path.to_str().unwrap().to_string();
-        // Bootstrap transport identity + schema
-        open_db_ensure(&path_str).unwrap();
+        // Bootstrap identity using the service entrypoint.
+        svc_transport_identity(&path_str).unwrap();
         (dir, path_str)
     }
 
