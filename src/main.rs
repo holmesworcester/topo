@@ -20,9 +20,6 @@ enum Commands {
         /// Listen address
         #[arg(short, long, default_value = "127.0.0.1:4433")]
         bind: SocketAddr,
-        /// Peer to connect to (if omitted, just listens)
-        #[arg(short = 'r', long)]
-        connect: Option<SocketAddr>,
         #[arg(short, long, default_value = "server.db")]
         db: String,
     },
@@ -214,12 +211,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     match cli.command {
-        Commands::Sync {
-            bind,
-            connect,
-            db,
-        } => {
-            poc_7::node::run_node(&db, bind, connect).await?;
+        Commands::Sync { bind, db } => {
+            poc_7::node::run_node(&db, bind).await?;
         }
         Commands::TransportIdentity { db } => {
             let resp = service::svc_transport_identity(&db)?;

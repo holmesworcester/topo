@@ -36,7 +36,7 @@ fn send_message(db: &str, content: &str) -> String {
         .to_string()
 }
 
-fn start_sync(db: &str, bind_port: u16, connect_port: Option<u16>) -> Child {
+fn start_sync(db: &str, bind_port: u16) -> Child {
     let mut cmd = Command::new(bin());
     cmd.arg("sync")
         .arg("--bind")
@@ -45,10 +45,6 @@ fn start_sync(db: &str, bind_port: u16, connect_port: Option<u16>) -> Child {
         .arg(db)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-
-    if let Some(port) = connect_port {
-        cmd.arg("--connect").arg(format!("127.0.0.1:{}", port));
-    }
 
     cmd.spawn().expect("failed to start sync process")
 }
@@ -183,7 +179,7 @@ fn test_two_process_invite_and_sync() {
 
     // Step 3: Start Alice's sync. The pending_invite_bootstrap_trust from
     // create-invite means Alice will accept Bob's bootstrap cert.
-    let mut alice_sync = start_sync(&alice_db, alice_port, None);
+    let mut alice_sync = start_sync(&alice_db, alice_port);
     std::thread::sleep(Duration::from_millis(500));
 
     // Step 4: Bob accepts the invite. This connects to Alice's sync endpoint
@@ -194,8 +190,8 @@ fn test_two_process_invite_and_sync() {
     assert_now(&bob_db, &format!("has_event:{} >= 1", alice_first_eid));
 
     // Step 5: Start Bob's sync. Both now have invite_bootstrap_trust entries
-    // so they can connect without --pin-peer.
-    let mut bob_sync = start_sync(&bob_db, bob_port, Some(alice_port));
+    // and Bob can autodial Alice without manual peer targeting.
+    let mut bob_sync = start_sync(&bob_db, bob_port);
     std::thread::sleep(Duration::from_secs(1));
 
     // Step 6: Exchange messages and verify convergence.

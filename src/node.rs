@@ -141,13 +141,11 @@ fn load_placeholder_invite_autodial_targets(
 ///
 /// Discovers all local identities from the DB, verifies their SPKI fingerprints,
 /// builds a single QUIC endpoint with multi-workspace cert resolver, and runs
-/// a single accept loop sharing a batch_writer thread. If `connect` is provided,
-/// also spawns a connect_loop to the specified peer. With `discovery` feature,
+/// a single accept loop sharing a batch_writer thread. With `discovery` feature,
 /// also advertises via mDNS and auto-connects to discovered peers.
 pub async fn run_node(
     db_path: &str,
     bind: SocketAddr,
-    connect: Option<SocketAddr>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let db = open_connection(db_path)?;
     create_tables(&db)?;
@@ -303,9 +301,6 @@ pub async fn run_node(
     #[cfg(feature = "discovery")]
     {
         let actual_port = local_addr.port();
-        // Skip mDNS auto-connect to the explicit --connect target to avoid
-        // duplicate connections (POC replacement policy: no dual paths).
-        let explicit_connect_addr = connect;
         for tenant in &tenants {
             match crate::discovery::TenantDiscovery::new(
                 &tenant.peer_id,
@@ -329,12 +324,6 @@ pub async fn run_node(
                             std::thread::spawn(move || {
                                 let mut dispatcher = PeerDispatcher::new();
                                 while let Ok(peer) = rx.recv() {
-                                    // Skip if this is the explicit --connect target
-                                    if let Some(explicit) = explicit_connect_addr {
-                                        if peer.addr == explicit {
-                                            continue;
-                                        }
-                                    }
                                     let (action, cancel_rx) = dispatcher.dispatch(&peer.peer_id, peer.addr);
                                     match action {
                                         DiscoveryAction::Skip => continue,
@@ -417,29 +406,6 @@ pub async fn run_node(
         });
     });
 
-    // Explicit --connect target: spawn connect_loop for each tenant.
-    // Skip tenants that failed client config creation (fail-closed: no outbound
-    // with wrong cert/trust).
-    if let Some(remote) = connect {
-        for tenant in &tenants {
-            let cfg = match tenant_client_configs.get(&tenant.peer_id).cloned() {
-                Some(c) => c,
-                None => {
-                    warn!("Skipping outbound connect for {}: no client config", &tenant.peer_id[..16]);
-                    continue;
-                }
-            };
-            spawn_connect_loop_thread(
-                db_path.to_string(),
-                tenant.peer_id.clone(),
-                connect_endpoint.clone(),
-                remote,
-                cfg,
-                "explicit --connect",
-            );
-        }
-    }
-
     // Placeholder invite-based autodial source for realism tests.
     // This is intentionally narrow and should be replaced by a unified
     // persistent address manager that merges invite, discovery, and intro data.
@@ -452,9 +418,6 @@ pub async fn run_node(
         );
     }
     for (tenant_id, remote) in autodial_targets {
-        if connect == Some(remote) {
-            continue;
-        }
         let cfg = match tenant_client_configs.get(&tenant_id).cloned() {
             Some(c) => c,
             None => {

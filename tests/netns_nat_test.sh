@@ -240,54 +240,68 @@ fi
 log "Connectivity OK, NAT blocking verified"
 
 # ---------------------------------------------------------------------------
-# Generate identities and seed messages
+# Bootstrap identities and invite-based trust
 # ---------------------------------------------------------------------------
 DB_I="$TMPDIR/i.db"
 DB_A="$TMPDIR/a.db"
 DB_B="$TMPDIR/b.db"
 
-FP_I=$("$BIN" transport-identity --db "$DB_I" 2>/dev/null)
-FP_A=$("$BIN" transport-identity --db "$DB_A" 2>/dev/null)
-FP_B=$("$BIN" transport-identity --db "$DB_B" 2>/dev/null)
-
-log "I = ${FP_I:0:16}..."
-log "A = ${FP_A:0:16}..."
-log "B = ${FP_B:0:16}..."
-
+# Introducer workspace bootstrap
 "$BIN" send "hello from I" --db "$DB_I" >/dev/null
-"$BIN" send "hello from A" --db "$DB_A" >/dev/null
-"$BIN" send "hello from B" --db "$DB_B" >/dev/null
+
+# Realistic out-of-band data: invite links only.
+INV_A=$("$BIN" create-invite --db "$DB_I" --bootstrap "10.100.0.1:4433" | tr -d '\n')
+INV_B=$("$BIN" create-invite --db "$DB_I" --bootstrap "10.100.0.1:4433" | tr -d '\n')
+[[ "$INV_A" == quiet://invite/* ]] || fail "invalid invite for A"
+[[ "$INV_B" == quiet://invite/* ]] || fail "invalid invite for B"
 
 # ---------------------------------------------------------------------------
 # Start daemons
 # ---------------------------------------------------------------------------
-# --pin-peer is the standard CLI bootstrap mechanism for initial trust.
-# In production, identity-derived trust (TransportKey events) supplements
-# or replaces pinning after the first sync.
 log "Starting introducer I..."
 ip netns exec "${PREFIX}_i" env RUST_LOG=info "$BIN" sync \
     --bind 10.100.0.1:4433 \
     --db "$DB_I" \
-    --pin-peer "$FP_A" --pin-peer "$FP_B" \
     >"$TMPDIR/i.log" 2>&1 &
 PIDS+=($!)
 sleep 0.5
 
+# Accept invites from segmented peers (bootstrap over NAT to introducer).
+ip netns exec "${PREFIX}_a" "$BIN" accept-invite \
+    --db "$DB_A" \
+    --invite "$INV_A" \
+    --username "peer-a" \
+    --devicename "nat-a" \
+    >/dev/null
+ip netns exec "${PREFIX}_b" "$BIN" accept-invite \
+    --db "$DB_B" \
+    --invite "$INV_B" \
+    --username "peer-b" \
+    --devicename "nat-b" \
+    >/dev/null
+
+FP_I=$("$BIN" transport-identity --db "$DB_I" 2>/dev/null)
+FP_A=$("$BIN" transport-identity --db "$DB_A" 2>/dev/null)
+FP_B=$("$BIN" transport-identity --db "$DB_B" 2>/dev/null)
+log "I = ${FP_I:0:16}..."
+log "A = ${FP_A:0:16}..."
+log "B = ${FP_B:0:16}..."
+
+# Seed additional messages after invite acceptance.
+"$BIN" send "hello from A" --db "$DB_A" >/dev/null
+"$BIN" send "hello from B" --db "$DB_B" >/dev/null
+
 log "Starting peer A (behind NAT)..."
 ip netns exec "${PREFIX}_a" env RUST_LOG=info "$BIN" sync \
     --bind 0.0.0.0:4433 \
-    --connect 10.100.0.1:4433 \
     --db "$DB_A" \
-    --pin-peer "$FP_I" --pin-peer "$FP_B" \
     >"$TMPDIR/a.log" 2>&1 &
 PIDS+=($!)
 
 log "Starting peer B (behind NAT)..."
 ip netns exec "${PREFIX}_b" env RUST_LOG=info "$BIN" sync \
     --bind 0.0.0.0:4433 \
-    --connect 10.100.0.1:4433 \
     --db "$DB_B" \
-    --pin-peer "$FP_I" --pin-peer "$FP_A" \
     >"$TMPDIR/b.log" 2>&1 &
 PIDS+=($!)
 
@@ -317,7 +331,6 @@ while [[ $SECONDS -lt $PUNCH_DEADLINE ]]; do
         if ip netns exec "${PREFIX}_i" env RUST_LOG=info "$BIN" intro \
             --db "$DB_I" \
             --peer-a "$FP_A" --peer-b "$FP_B" \
-            --pin-peer "$FP_A" --pin-peer "$FP_B" \
             --ttl-ms 30000 --attempt-window-ms 5000 \
             >>"$TMPDIR/i_intro.log" 2>&1; then
             INTRO_CALLS=$((INTRO_CALLS + 1))

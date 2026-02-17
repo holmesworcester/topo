@@ -1,7 +1,6 @@
 //! Cheat-proof realism tests.
 //!
 //! These tests enforce an invite-only, daemon-first workflow:
-//! - prove transport path works today (manual `--connect` baseline),
 //! - require invite-only autodial behavior,
 //! - require daemon CLI invite lifecycle support.
 
@@ -122,7 +121,7 @@ struct Daemon {
 }
 
 impl Daemon {
-    fn start(db: &str, socket: &Path, bind_port: u16, connect_port: Option<u16>) -> Self {
+    fn start(db: &str, socket: &Path, bind_port: u16) -> Self {
         let mut cmd = Command::new(bin_p7d());
         cmd.arg("--db")
             .arg(db)
@@ -132,10 +131,6 @@ impl Daemon {
             .arg(format!("127.0.0.1:{}", bind_port))
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-
-        if let Some(port) = connect_port {
-            cmd.arg("--connect").arg(format!("127.0.0.1:{}", port));
-        }
 
         let child = cmd.spawn().expect("failed to start p7d");
         wait_for_socket(socket, Duration::from_secs(5));
@@ -171,33 +166,6 @@ fn bootstrap_alice_and_invite(tmpdir: &tempfile::TempDir) -> (String, String, St
 }
 
 #[test]
-fn test_manual_connect_proves_transport_path_after_invite_bootstrap() {
-    let tmpdir = tempfile::tempdir().unwrap();
-    let (alice_db, bob_db, invite_link, alice_port, bob_port) = bootstrap_alice_and_invite(&tmpdir);
-
-    let alice_socket: PathBuf = tmpdir.path().join("alice.sock");
-    let bob_socket: PathBuf = tmpdir.path().join("bob.sock");
-
-    let _alice = Daemon::start(&alice_db, &alice_socket, alice_port, None);
-    accept_invite(&bob_db, &invite_link);
-    let _bob = Daemon::start(&bob_db, &bob_socket, bob_port, Some(alice_port));
-
-    let bob_event_id = p7ctl_send(&bob_db, &bob_socket, "manual-connect-proof");
-    let out = p7ctl_assert_eventually(
-        &alice_db,
-        &alice_socket,
-        &format!("has_event:{} >= 1", bob_event_id),
-        12_000,
-    );
-    assert!(
-        out.status.success(),
-        "manual-connect baseline failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
-
-#[test]
 fn test_invite_only_daemons_should_autodial_without_manual_connect() {
     let tmpdir = tempfile::tempdir().unwrap();
     let (alice_db, bob_db, invite_link, alice_port, bob_port) = bootstrap_alice_and_invite(&tmpdir);
@@ -205,12 +173,12 @@ fn test_invite_only_daemons_should_autodial_without_manual_connect() {
     let alice_socket: PathBuf = tmpdir.path().join("alice.sock");
     let bob_socket: PathBuf = tmpdir.path().join("bob.sock");
 
-    let _alice = Daemon::start(&alice_db, &alice_socket, alice_port, None);
+    let _alice = Daemon::start(&alice_db, &alice_socket, alice_port);
     accept_invite(&bob_db, &invite_link);
-    let _bob = Daemon::start(&bob_db, &bob_socket, bob_port, None);
+    let _bob = Daemon::start(&bob_db, &bob_socket, bob_port);
 
     // Desired behavior: after invite acceptance, daemons should autodial based on
-    // persisted bootstrap/discovery state, with no manual --connect.
+    // persisted bootstrap/discovery state, with no manual connect flag.
     let bob_event_id = p7ctl_send(&bob_db, &bob_socket, "invite-only-autodial-required");
     let out = p7ctl_assert_eventually(
         &alice_db,

@@ -2151,7 +2151,7 @@ Goal: establish a test suite where successful P2P bootstrap and sync cannot be f
 ### 18.2 Execution strategy
 
 1. Add executable realism contract tests under `tests/cheat_proof_realism_test.rs`.
-2. Include one passing baseline that proves the transport path works today with manual dial (`--connect`), so failures are scoped to realism gaps, not broken transport.
+2. Include a passing baseline that proves invite bootstrap + daemon autodial transport path works, so failures are scoped to realism gaps, not broken transport.
 3. Include strict contract tests for desired behavior:
    - invite-only daemon autodial after invite acceptance,
    - daemon CLI invite lifecycle surface (`p7ctl create-invite` / `p7ctl accept-invite`).
@@ -2161,7 +2161,7 @@ Goal: establish a test suite where successful P2P bootstrap and sync cannot be f
 
 1. **Placeholder** startup autodial manager in `node.rs` that consumes persisted invite/bootstrap address rows first.
    - Must be explicitly labeled in code/logs as placeholder (for example `PLACEHOLDER AUTODIAL`) so it is not mistaken for end-state design.
-2. Deprecation path for manual `--connect` once autodial sources are sufficient.
+2. Keep daemon startup invite/discovery-driven only (manual `--connect` removed).
 3. Daemon CLI parity for invite lifecycle and tenant-targeted operations (so realism tests can stay daemon-first).
 
 ### 18.4 Follow-on topology expansion

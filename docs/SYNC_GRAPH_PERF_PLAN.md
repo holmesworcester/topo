@@ -19,12 +19,12 @@ This plan answers:
 4. Only add heavier coordination logic if measured data shows clear need.
 
 ## Current constraints to account for
-1. `sync` CLI currently supports one outbound `--connect` target per process.
+1. `sync` CLI is invite/discovery-driven (no manual outbound connect flag).
 2. `accept_loop` handles one accepted connection at a time in a long inner loop, so inbound concurrency is effectively serialized.
 3. Negentropy sessions run continuously per live connection with short inter-session delay; there is no configurable sync cadence policy yet.
 
 Implication:
-1. chain tests are valid now,
+1. chain tests are valid now (seed addresses via invite/bootstrap),
 2. true 8-source parallel catchup is not valid until accept/connect concurrency is refactored.
 
 ## Metrics to collect (minimum required)
