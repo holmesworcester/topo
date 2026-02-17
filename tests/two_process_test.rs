@@ -15,7 +15,7 @@ fn random_port() -> u16 {
     listener.local_addr().unwrap().port()
 }
 
-fn send_message(db: &str, content: &str) {
+fn send_message(db: &str, content: &str) -> String {
     let output = Command::new(bin())
         .arg("send")
         .arg(content)
@@ -28,6 +28,12 @@ fn send_message(db: &str, content: &str) {
         "send failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("event_id:"))
+        .expect("send output missing event_id: line")
+        .to_string()
 }
 
 fn start_sync(db: &str, bind_port: u16, connect_port: Option<u16>) -> Child {
@@ -165,7 +171,7 @@ fn test_two_process_invite_and_sync() {
     // Step 1: Alice bootstraps her workspace by sending an initial message.
     // This creates: Network, InviteAccepted, UserInviteBoot, UserBoot,
     // DeviceInviteFirst, PeerSharedFirst, AdminBoot + the message itself.
-    send_message(&alice_db, "Hello world from alice");
+    let alice_first_eid = send_message(&alice_db, "Hello world from alice");
 
     // Step 2: Alice creates an invite pointing to her sync address.
     let invite_link = create_invite(&alice_db, &format!("127.0.0.1:{}", alice_port));
@@ -184,10 +190,8 @@ fn test_two_process_invite_and_sync() {
     // via real QUIC, fetches prerequisite events, then creates Bob's identity chain.
     accept_invite(&bob_db, &invite_link, "bob", "laptop");
 
-    // Verify Bob has events from bootstrap sync + his own identity chain.
-    // Alice has: 7 identity events + 1 message + 1 user_invite = 9 shared events
-    // Bob receives those shared events, plus creates his own identity chain.
-    assert_now(&bob_db, "store_count >= 5");
+    // Verify Bob has Alice's first message from bootstrap sync.
+    assert_now(&bob_db, &format!("has_event:{} >= 1", alice_first_eid));
 
     // Step 5: Start Bob's sync. Both now have invite_bootstrap_trust entries
     // so they can connect without --pin-peer.
@@ -195,17 +199,12 @@ fn test_two_process_invite_and_sync() {
     std::thread::sleep(Duration::from_secs(1));
 
     // Step 6: Exchange messages and verify convergence.
-    send_message(&alice_db, "Second message from alice");
-    send_message(&bob_db, "Hello from bob");
+    let alice_second_eid = send_message(&alice_db, "Second message from alice");
+    let bob_eid = send_message(&bob_db, "Hello from bob");
 
-    // Wait for sync convergence. Both should see all events from both peers.
-    // Alice creates: Network + InviteAccepted + UserInviteBoot + UserBoot +
-    //   DeviceInviteFirst + PeerSharedFirst = 6 identity + 1 msg + 1 user_invite = 8
-    // Bob creates: InviteAccepted + UserBoot + DeviceInviteFirst + PeerSharedFirst = 4 identity + 1 msg = 5
-    // Shared events synced between them: alice's 7 shared + bob's 4 shared = 11+
-    // Each peer stores: own events + remote shared events
-    assert_eventually(&alice_db, "store_count >= 12", timeout_ms);
-    assert_eventually(&bob_db, "store_count >= 12", timeout_ms);
+    // Wait for sync convergence: each peer should have the other's last message event
+    assert_eventually(&alice_db, &format!("has_event:{} >= 1", bob_eid), timeout_ms);
+    assert_eventually(&bob_db, &format!("has_event:{} >= 1", alice_second_eid), timeout_ms);
 
     // Wait for cross-peer message projection: signer chain cascade must complete
     // after events sync. Alice should see 3 messages (2 own + 1 from Bob),

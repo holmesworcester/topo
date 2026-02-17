@@ -543,6 +543,15 @@ pub fn query_field(db: &rusqlite::Connection, field: &str, recorded_by: &str) ->
                 |row| row.get(0),
             )
             .map_err(|e| format!("query failed: {}", e)),
+        other if other.starts_with("has_event:") => {
+            let event_id_b64 = &other["has_event:".len()..];
+            db.query_row(
+                "SELECT COUNT(*) FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, event_id_b64],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("query failed: {}", e))
+        }
         other => Err(format!("unknown field: {}", other)),
     }
 }

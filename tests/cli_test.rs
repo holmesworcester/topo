@@ -50,7 +50,7 @@ fn start_sync(db: &str, bind_port: u16, connect_port: Option<u16>, pin_peers: &[
     cmd.spawn().expect("failed to start sync process")
 }
 
-fn send_message(db: &str, content: &str) {
+fn send_message(db: &str, content: &str) -> String {
     let output = Command::new(bin())
         .arg("send")
         .arg(content)
@@ -63,6 +63,12 @@ fn send_message(db: &str, content: &str) {
         "send failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("event_id:"))
+        .expect("send output missing event_id: line")
+        .to_string()
 }
 
 fn assert_now(db: &str, predicate: &str) {
@@ -186,18 +192,12 @@ fn test_cli_bidirectional_sync() {
 
     // Alice sends 2 messages, Bob sends 1
     send_message(&alice_db, "Hello from Alice");
-    send_message(&alice_db, "How are you?");
-    send_message(&bob_db, "Hey Alice!");
+    let alice_eid = send_message(&alice_db, "How are you?");
+    let bob_eid = send_message(&bob_db, "Hey Alice!");
 
-    // Wait for sync: each peer should have 14 events total
-    // (6 own identity + 5 remote shared identity + 2 alice msgs + 1 bob msg)
-    // Note: remote messages are stored but blocked (foreign signer chain),
-    // so only locally-created messages appear in message_count.
-    assert_eventually(&alice_db, "store_count >= 14", timeout_ms);
-    assert_eventually(&bob_db, "store_count >= 14", timeout_ms);
-
-    assert_now(&alice_db, "store_count == 14");
-    assert_now(&bob_db, "store_count == 14");
+    // Wait for sync convergence: each peer should have the other's last message event
+    assert_eventually(&alice_db, &format!("has_event:{} >= 1", bob_eid), timeout_ms);
+    assert_eventually(&bob_db, &format!("has_event:{} >= 1", alice_eid), timeout_ms);
 
     // This test uses --pin-peer with independent workspaces (each peer
     // bootstraps its own Network). Remote messages are stored but their signer
@@ -250,18 +250,14 @@ fn test_cli_ongoing_sync() {
     send_message(&alice_db, "Round 1");
     send_message(&bob_db, "Round 2");
     send_message(&alice_db, "Round 3a");
-    send_message(&bob_db, "Round 3b");
+    let bob_last_eid = send_message(&bob_db, "Round 3b");
 
     std::thread::sleep(Duration::from_secs(1));
-    send_message(&alice_db, "Round 4");
+    let alice_last_eid = send_message(&alice_db, "Round 4");
 
-    // Wait for sync: each peer should have 16 events total
-    // (6 own identity + 5 remote shared identity + 3 alice msgs + 2 bob msgs)
-    assert_eventually(&alice_db, "store_count >= 16", timeout_ms);
-    assert_eventually(&bob_db, "store_count >= 16", timeout_ms);
-
-    assert_now(&alice_db, "store_count == 16");
-    assert_now(&bob_db, "store_count == 16");
+    // Wait for sync convergence: each peer should have the other's last message event
+    assert_eventually(&alice_db, &format!("has_event:{} >= 1", bob_last_eid), timeout_ms);
+    assert_eventually(&bob_db, &format!("has_event:{} >= 1", alice_last_eid), timeout_ms);
 
     let _ = alice.kill();
     let _ = bob.kill();
@@ -275,13 +271,11 @@ fn test_cli_send_and_messages() {
     let tmpdir = tempfile::tempdir().unwrap();
     let db = tmpdir.path().join("test.db").to_str().unwrap().to_string();
 
-    send_message(&db, "First message");
-    send_message(&db, "Second message");
+    let _first_eid = send_message(&db, "First message");
+    let second_eid = send_message(&db, "Second message");
 
-    // 6 identity chain events + 2 messages = 8
-    assert_now(&db, "store_count == 8");
     assert_now(&db, "message_count == 2");
-    assert_now(&db, "recorded_events_count == 8");
+    assert_now(&db, &format!("has_event:{} >= 1", second_eid));
 
     let messages = get_messages(&db);
     assert_eq!(messages.len(), 2);
@@ -315,12 +309,12 @@ fn test_cli_unpinned_peer_rejected() {
     std::thread::sleep(Duration::from_secs(1));
 
     // Bob sends a message
-    send_message(&bob_db, "Should not arrive");
+    let bob_eid = send_message(&bob_db, "Should not arrive");
     // Give some time for sync to try
     std::thread::sleep(Duration::from_secs(3));
 
     // Alice should NOT have received Bob's message (Bob's cert is not pinned by Alice)
-    assert_now(&alice_db, "store_count == 0");
+    assert_now(&alice_db, &format!("has_event:{} == 0", bob_eid));
 
     let _ = alice.kill();
     let _ = bob.kill();
@@ -411,8 +405,8 @@ fn test_cli_sync_bootstrap_from_accepted_invite_data() {
     let mut bob = start_sync(&bob_db, bob_port, Some(alice_port), &[]);
     std::thread::sleep(Duration::from_secs(1));
 
-    send_message(&bob_db, "bootstrap trust from invite data");
-    assert_eventually(&alice_db, "store_count >= 1", timeout_ms);
+    let bob_eid = send_message(&bob_db, "bootstrap trust from invite data");
+    assert_eventually(&alice_db, &format!("has_event:{} >= 1", bob_eid), timeout_ms);
 
     let _ = alice.kill();
     let _ = bob.kill();

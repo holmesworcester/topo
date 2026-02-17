@@ -738,10 +738,11 @@ fn send_message(
         signer_type: 5,
         signature: [0u8; 64],
     });
-    create_signed_event_sync(&db, &recorded_by, &msg, &signing_key)
+    let eid = create_signed_event_sync(&db, &recorded_by, &msg, &signing_key)
         .map_err(|e| format!("create event error: {}", e))?;
 
     println!("Sent: {}", content);
+    println!("event_id:{}", poc_7::crypto::event_id_to_base64(&eid));
 
     Ok(())
 }
@@ -915,6 +916,15 @@ fn query_field(db: &rusqlite::Connection, field: &str, recorded_by: &str) -> Res
                 |row| row.get(0),
             )
             .map_err(|e| format!("query failed: {}", e)),
+        other if other.starts_with("has_event:") => {
+            let event_id_b64 = &other["has_event:".len()..];
+            db.query_row(
+                "SELECT COUNT(*) FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, event_id_b64],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("query failed: {}", e))
+        }
         other => Err(format!("unknown field: {}", other)),
     }
 }
