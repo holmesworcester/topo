@@ -210,6 +210,40 @@ pub(crate) fn apply_projection(
     Ok(ProjectionDecision::Valid)
 }
 
+/// Shared dependency/signer/projection stage bundle used by cleartext and
+/// decrypted-inner flows.
+///
+/// Stages:
+/// 1. Dependency presence check + block row writes
+/// 2. Optional dependency type enforcement
+/// 3. Signer verification + projector dispatch
+pub(crate) fn run_dep_and_projection_stages(
+    conn: &Connection,
+    recorded_by: &str,
+    event_id_b64: &str,
+    blob: &[u8],
+    parsed: &ParsedEvent,
+    enforce_dep_types: bool,
+) -> Result<ProjectionDecision, Box<dyn std::error::Error>> {
+    let deps = parsed.dep_field_values();
+    if let Some(block) = check_deps_and_block(conn, recorded_by, event_id_b64, &deps)? {
+        return Ok(block);
+    }
+
+    if enforce_dep_types {
+        let meta = registry()
+            .lookup(parsed.event_type_code())
+            .ok_or_else(|| format!("unknown type code {}", parsed.event_type_code()))?;
+        if !meta.dep_field_type_codes.is_empty() {
+            if let Some(reason) = check_dep_types(conn, &deps, meta.dep_field_type_codes)? {
+                return Ok(ProjectionDecision::Reject { reason });
+            }
+        }
+    }
+
+    apply_projection(conn, recorded_by, event_id_b64, blob, parsed)
+}
+
 /// Single-event projection step (no cascade).
 ///
 /// Executes the 7-step projection algorithm for one event:
@@ -279,24 +313,15 @@ fn project_one_step(
         }
     };
 
-    // 4-5. Check dep presence and write block rows if missing
-    let deps = parsed.dep_field_values();
-    if let Some(block) = check_deps_and_block(conn, recorded_by, &event_id_b64, &deps)? {
-        return Ok((block, Some(parsed)));
-    }
-
-    // 5b. Dep type checking — verify each dep's type code matches expectations
-    let meta = registry().lookup(parsed.event_type_code())
-        .ok_or_else(|| format!("unknown type code {}", parsed.event_type_code()))?;
-    if !meta.dep_field_type_codes.is_empty() {
-        if let Some(reason) = check_dep_types(conn, &deps, meta.dep_field_type_codes)? {
-            record_rejection(conn, recorded_by, &event_id_b64, &reason);
-            return Ok((ProjectionDecision::Reject { reason }, Some(parsed)));
-        }
-    }
-
-    // 6. Apply projection (signer verification + projector dispatch)
-    let decision = apply_projection(conn, recorded_by, &event_id_b64, &blob, &parsed)?;
+    // 4-6. Shared dep/signer/projection stages
+    let decision = run_dep_and_projection_stages(
+        conn,
+        recorded_by,
+        &event_id_b64,
+        &blob,
+        &parsed,
+        true, // canonical cleartext flow enforces dep type constraints
+    )?;
     match &decision {
         ProjectionDecision::Reject { ref reason } => {
             record_rejection(conn, recorded_by, &event_id_b64, reason);

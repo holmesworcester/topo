@@ -6,7 +6,7 @@ use aes_gcm::aead::Aead;
 use crate::crypto::event_id_to_base64;
 use crate::events::{self, EncryptedEvent, EVENT_TYPE_ENCRYPTED};
 use super::decision::ProjectionDecision;
-use super::pipeline::{apply_projection, check_deps_and_block};
+use super::pipeline::run_dep_and_projection_stages;
 
 /// Project an encrypted event: decrypt, parse inner, verify admissibility,
 /// then hand off to shared pipeline stages (dep check, signer verify,
@@ -111,24 +111,17 @@ pub fn project_encrypted(
         }
     }
 
-    // --- Shared pipeline stages (using outer event_id for block/reject anchoring) ---
-
-    // 7. Check inner dep presence (block rows keyed to outer event_id)
-    let inner_deps = inner_parsed.dep_field_values();
-    if let Some(block) = check_deps_and_block(conn, recorded_by, event_id_b64, &inner_deps)? {
-        return Ok(block);
-    }
-
-    // Note: dep type checking is intentionally NOT applied to inner events.
-    // Inner deps may target encrypted wrapper events (type 5) rather than the
-    // raw inner type code expected by the registry. For example, an encrypted
-    // deletion's target_event_id points to an encrypted message wrapper (type 5),
-    // not a raw message (type 1). The dep type check is designed for cleartext
-    // events where dep targets have their actual type codes in the events table.
-
-    // 8. Signer verification + projector dispatch (shared stage).
-    //    Passes decrypted plaintext as the signing bytes source.
-    apply_projection(conn, recorded_by, event_id_b64, &plaintext, &inner_parsed)
+    // Shared dep/signer/projection stages (outer event_id anchors block/reject rows).
+    // Dep type checking remains disabled for decrypted inners because their deps may
+    // intentionally target encrypted wrapper type-codes.
+    run_dep_and_projection_stages(
+        conn,
+        recorded_by,
+        event_id_b64,
+        &plaintext,
+        &inner_parsed,
+        false,
+    )
 }
 
 /// Encrypt a plaintext blob using AES-256-GCM with a random nonce.
