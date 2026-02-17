@@ -14,7 +14,7 @@ use poc_7::crypto::event_id_from_base64;
 use poc_7::db::open_connection;
 use poc_7::db::intro::{list_intro_attempts, freshest_endpoint};
 use poc_7::db::project_queue::ProjectQueue;
-use poc_7::db::transport_trust::{allowed_peers_from_db, import_cli_pins_to_sql};
+use poc_7::db::transport_trust::allowed_peers_from_db;
 use poc_7::projection::pipeline::project_one;
 use poc_7::sync::engine::{accept_loop, connect_loop};
 use poc_7::sync::intro::{run_intro, send_intro_offer, build_intro_offer};
@@ -73,22 +73,9 @@ async fn test_three_peer_intro_happy_path() {
     let fp_a = peer_a.spki_fingerprint();
     let fp_b = peer_b.spki_fingerprint();
 
-    // Seed CLI pin trust for bootstrap connections (dynamic trust reads these from SQL)
-    {
-        let db = open_connection(&intro.db_path).expect("open intro db");
-        let pins = AllowedPeers::from_fingerprints(vec![fp_a, fp_b]);
-        import_cli_pins_to_sql(&db, &intro.identity, &pins).expect("import intro pins");
-    }
-    {
-        let db = open_connection(&peer_a.db_path).expect("open A db");
-        let pins = AllowedPeers::from_fingerprints(vec![fp_i]);
-        import_cli_pins_to_sql(&db, &peer_a.identity, &pins).expect("import A pins");
-    }
-    {
-        let db = open_connection(&peer_b.db_path).expect("open B db");
-        let pins = AllowedPeers::from_fingerprints(vec![fp_i]);
-        import_cli_pins_to_sql(&db, &peer_b.identity, &pins).expect("import B pins");
-    }
+    // Trust is derived from PeerShared events synced during workspace join.
+    // No CLI pins needed — all peers share the same workspace so identity chains
+    // project TransportKey trust entries at each peer after sync.
 
     // Create dynamic dual endpoints for all three peers.
     // Trust is resolved from SQL at each TLS handshake (production behavior).
@@ -352,13 +339,6 @@ async fn test_stale_intro_rejected() {
     ).expect("ep_a");
     let addr_a = ep_a.local_addr().expect("addr_a");
 
-    // Seed SQL trust so the intro listener can verify I via DB
-    {
-        let db = open_connection(&peer_a.db_path).expect("open A db");
-        let pins = AllowedPeers::from_fingerprints(vec![fp_i]);
-        import_cli_pins_to_sql(&db, &peer_a.identity, &pins).expect("import A pins");
-    }
-
     // Start A's accept loop with intro listener
     let a_db = peer_a.db_path.clone();
     let a_id = peer_a.identity.clone();
@@ -434,13 +414,6 @@ async fn test_untrusted_peer_intro_rejected() {
         "127.0.0.1:0".parse().unwrap(), cert_a, key_a, allowed_a,
     ).expect("ep_a");
     let addr_a = ep_a.local_addr().expect("addr_a");
-
-    // Seed SQL trust: A only trusts I (fp_i), NOT the unknown peer
-    {
-        let db = open_connection(&peer_a.db_path).expect("open A db");
-        let pins = AllowedPeers::from_fingerprints(vec![fp_i]);
-        import_cli_pins_to_sql(&db, &peer_a.identity, &pins).expect("import A pins");
-    }
 
     let a_db = peer_a.db_path.clone();
     let a_id = peer_a.identity.clone();

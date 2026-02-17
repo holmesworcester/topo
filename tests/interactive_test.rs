@@ -472,7 +472,7 @@ fn test_invite_accept_produces_valid_identity() {
     // Bob should have a valid identity chain (sees both alice's and bob's projected keys)
     assert_contains(&out, "Accepted invite #1 as bob", "invite accepted");
     assert_contains(&out, "KEYS SUMMARY:", "keys summary shown");
-    // Bob sees both alice's and his own user/peer (from copied chain + own bootstrap)
+    // Bob sees both alice's and his own user/peer (from bootstrap sync + own bootstrap)
     assert_contains(&out, "Users: 2", "bob sees both users");
     assert_contains(&out, "Peers: 2", "bob sees both peers");
     // Bob should be able to send messages (requires valid identity)
@@ -480,11 +480,11 @@ fn test_invite_accept_produces_valid_identity() {
     assert_contains(&out, "1. [bob] hello from bob", "bob message visible");
 }
 
-/// Verify that copy_event_chain only transfers shared events by checking
-/// that the new account's status shows the expected event count (no extras
-/// from local-only events of the source account).
+/// Verify invite acceptance bootstrap sync transfers shared events only by
+/// checking that the joiner status is non-zero without inheriting inviter
+/// local-only rows.
 #[test]
-fn test_copy_event_chain_shared_only() {
+fn test_accept_invite_bootstrap_sync_shared_only() {
     let (out, err) = run_interactive(
         "new-workspace --name test --username alice --devicename desktop\n\
          status\n\
@@ -510,6 +510,6 @@ fn test_copy_event_chain_shared_only() {
 
     // Bob should have events but fewer than alice (no alice's local-only events)
     assert_contains(bob_status, "STATUS (bob):", "bob status");
-    // Bob's event count should be non-zero (shared chain was copied)
-    assert_not_contains(bob_status, "Events:    0", "bob has events from chain copy");
+    // Bob's event count should be non-zero (shared chain arrived via sync bootstrap)
+    assert_not_contains(bob_status, "Events:    0", "bob has events from bootstrap sync");
 }

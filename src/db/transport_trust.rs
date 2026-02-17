@@ -3,6 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::info;
 
 use crate::transport::AllowedPeers;
+use crate::transport::cert::spki_fingerprint_from_ed25519_pubkey;
 
 /// Pending bootstrap trust from locally-created invites is temporary.
 /// If a peer never joins, this entry should not authorize transport forever.
@@ -55,8 +56,8 @@ pub fn record_transport_binding(
 }
 
 /// Record invite-accepted bootstrap trust metadata.
-/// This allows sync bootstrapping from accepted invite links before TransportKey
-/// events have propagated.
+/// This allows sync bootstrapping from accepted invite links before
+/// PeerShared-derived trust appears via identity event sync.
 pub fn record_invite_bootstrap_trust(
     conn: &Connection,
     recorded_by: &str,
@@ -216,6 +217,47 @@ fn supersede_accepted_bootstrap_if_steady_trust_exists(
     Ok(())
 }
 
+/// Compute SPKI fingerprints for all PeerShared public keys belonging to a peer.
+fn peer_shared_spki_fingerprints(
+    conn: &Connection,
+    recorded_by: &str,
+) -> Result<Vec<[u8; 32]>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut stmt = conn.prepare(
+        "SELECT public_key FROM peers_shared WHERE recorded_by = ?1",
+    )?;
+    let fps: Vec<[u8; 32]> = stmt
+        .query_map(rusqlite::params![recorded_by], |row| {
+            let blob: Vec<u8> = row.get(0)?;
+            Ok(blob)
+        })?
+        .filter_map(|r| {
+            let blob = r.ok()?;
+            if blob.len() == 32 {
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&blob);
+                Some(spki_fingerprint_from_ed25519_pubkey(&key))
+            } else {
+                None
+            }
+        })
+        .collect();
+    Ok(fps)
+}
+
+/// Check whether a given SPKI fingerprint matches any PeerShared-derived identity.
+fn is_peer_shared_spki(
+    conn: &Connection,
+    recorded_by: &str,
+    spki_fingerprint: &[u8; 32],
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    for fp in peer_shared_spki_fingerprints(conn, recorded_by)? {
+        if &fp == spki_fingerprint {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Build AllowedPeers from SQL trust sources only.
 /// Observation telemetry (peer_transport_bindings) is NOT consulted for trust.
 pub fn allowed_peers_from_db(
@@ -240,7 +282,7 @@ pub fn allowed_peers_from_db(
             AND superseded_at IS NULL
             AND expires_at > ?2",
     )?;
-    let fps: Vec<[u8; 32]> = stmt
+    let mut fps: Vec<[u8; 32]> = stmt
         .query_map(rusqlite::params![recorded_by, now], |row| {
             let blob: Vec<u8> = row.get(0)?;
             Ok(decode_32_byte_blob(blob))
@@ -249,6 +291,10 @@ pub fn allowed_peers_from_db(
         .into_iter()
         .flatten()
         .collect();
+
+    // Add PeerShared-derived SPKIs (primary steady-state trust source)
+    fps.extend(peer_shared_spki_fingerprints(conn, recorded_by)?);
+
     Ok(AllowedPeers::from_fingerprints(fps))
 }
 
@@ -288,11 +334,15 @@ pub fn is_peer_allowed(
         rusqlite::params![recorded_by, spki_fingerprint.as_slice(), now],
         |row| row.get(0),
     )?;
-    Ok(allowed != 0)
+    if allowed != 0 {
+        return Ok(true);
+    }
+    // Check PeerShared-derived SPKIs (primary steady-state trust source)
+    is_peer_shared_spki(conn, recorded_by, spki_fingerprint)
 }
 
 /// Count the total number of distinct trusted peer fingerprints from SQL
-/// trust sources (transport_keys + accepted/pending invite bootstrap trust).
+/// trust sources (PeerShared-derived SPKIs + transport_keys + accepted/pending invite bootstrap trust).
 /// Returns the deduplicated count without materializing the full set.
 pub fn trusted_peer_count(
     conn: &Connection,
@@ -325,7 +375,9 @@ pub fn trusted_peer_count(
         rusqlite::params![recorded_by, now],
         |row| row.get(0),
     )?;
-    Ok(count)
+    let peer_shared_count = peer_shared_spki_fingerprints(conn, recorded_by)?.len() as i64;
+    // Approximate: doesn't dedupe across sources but sufficient for trust checks
+    Ok(count + peer_shared_count)
 }
 
 /// Check whether any trusted peer fingerprints exist in SQL trust sources
@@ -358,6 +410,11 @@ pub fn has_any_trusted_peer(
                   AND length(expected_bootstrap_spki_fingerprint) = 32
                   AND superseded_at IS NULL
                   AND expires_at > ?2
+            )
+            OR EXISTS(
+                SELECT 1 FROM peers_shared
+                WHERE recorded_by = ?1
+                  AND length(public_key) = 32
             )",
         rusqlite::params![recorded_by, now],
         |row| row.get(0),
@@ -365,16 +422,6 @@ pub fn has_any_trusted_peer(
     Ok(has_any != 0)
 }
 
-/// Build AllowedPeers from CLI pin-peer flags plus SQL trust rows
-/// (projected transport_keys + accepted/pending invite bootstrap trust).
-pub fn allowed_peers_combined(
-    conn: &Connection,
-    recorded_by: &str,
-    cli_pins: &AllowedPeers,
-) -> Result<AllowedPeers, Box<dyn std::error::Error + Send + Sync>> {
-    let db_peers = allowed_peers_from_db(conn, recorded_by)?;
-    Ok(cli_pins.union(&db_peers))
-}
 #[cfg(test)]
 mod tests {
     use super::*;

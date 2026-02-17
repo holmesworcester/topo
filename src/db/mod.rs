@@ -68,6 +68,88 @@ fn read_bool_env(name: &str) -> bool {
     }
 }
 
+/// Migrate all `recorded_by` / `peer_id` references from `old` to `new` across
+/// all projection and trust tables in a single transaction. This is used after
+/// a joiner transitions from an invite-derived transport identity to a
+/// PeerShared-derived one, ensuring transport-layer and event-layer identities
+/// match.
+pub fn migrate_recorded_by(
+    conn: &Connection,
+    old: &str,
+    new: &str,
+) -> Result<(), rusqlite::Error> {
+    conn.execute("BEGIN IMMEDIATE", [])?;
+
+    // Projection tables (recorded_by column)
+    for table in &[
+        "workspaces",
+        "invite_accepted",
+        "user_invites",
+        "device_invites",
+        "users",
+        "peers_shared",
+        "admins",
+        "removed_entities",
+        "secret_shared",
+        "transport_keys",
+        "peer_transport_bindings",
+        "messages",
+        "reactions",
+        "signed_memos",
+        "secret_keys",
+        "deleted_messages",
+        "message_attachments",
+        "file_slices",
+        "intro_attempts",
+        "peer_endpoint_observations",
+    ] {
+        conn.execute(
+            &format!("UPDATE {} SET recorded_by = ?1 WHERE recorded_by = ?2", table),
+            rusqlite::params![new, old],
+        )?;
+    }
+
+    // Trust tables (recorded_by column)
+    conn.execute(
+        "UPDATE invite_bootstrap_trust SET recorded_by = ?1 WHERE recorded_by = ?2",
+        rusqlite::params![new, old],
+    )?;
+    conn.execute(
+        "UPDATE pending_invite_bootstrap_trust SET recorded_by = ?1 WHERE recorded_by = ?2",
+        rusqlite::params![new, old],
+    )?;
+
+    // Pipeline tables (peer_id column)
+    for table in &[
+        "valid_events",
+        "rejected_events",
+        "blocked_event_deps",
+        "blocked_events",
+        "project_queue",
+        "ingress_queue",
+        "trust_anchors",
+        "recorded_events",
+    ] {
+        conn.execute(
+            &format!("UPDATE {} SET peer_id = ?1 WHERE peer_id = ?2", table),
+            rusqlite::params![new, old],
+        )?;
+    }
+
+    // Service tables (recorded_by, may not exist)
+    let _ = conn.execute(
+        "UPDATE local_peer_signers SET recorded_by = ?1 WHERE recorded_by = ?2",
+        rusqlite::params![new, old],
+    );
+    let _ = conn.execute(
+        "UPDATE local_workspace_keys SET recorded_by = ?1 WHERE recorded_by = ?2",
+        rusqlite::params![new, old],
+    );
+
+    conn.execute("COMMIT", [])?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -80,5 +162,69 @@ mod tests {
             .unwrap();
         // In-memory databases may report "memory" instead of "wal"
         assert!(journal_mode == "wal" || journal_mode == "memory");
+    }
+
+    #[test]
+    fn test_migrate_recorded_by() {
+        let conn = open_in_memory().unwrap();
+        schema::create_tables(&conn).unwrap();
+
+        let old = "aabbccdd";
+        let new = "11223344";
+
+        // Seed representative tables with old recorded_by / peer_id
+        conn.execute(
+            "INSERT INTO recorded_events (peer_id, event_id, recorded_at, source)
+             VALUES (?1, 'evt1', 1000, 'local')",
+            rusqlite::params![old],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO messages (message_id, workspace_id, author_id, content, created_at, recorded_by)
+             VALUES ('msg1', 'ws1', 'author1', 'hello', 1000, ?1)",
+            rusqlite::params![old],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO trust_anchors (peer_id, workspace_id)
+             VALUES (?1, 'ws1')",
+            rusqlite::params![old],
+        )
+        .unwrap();
+
+        // Run migration
+        migrate_recorded_by(&conn, old, new).unwrap();
+
+        // Verify recorded_events.peer_id updated
+        let peer_id: String = conn
+            .query_row(
+                "SELECT peer_id FROM recorded_events WHERE event_id = 'evt1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(peer_id, new);
+
+        // Verify messages.recorded_by updated
+        let rb: String = conn
+            .query_row(
+                "SELECT recorded_by FROM messages WHERE message_id = 'msg1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rb, new);
+
+        // Verify trust_anchors.peer_id updated
+        let ta_pid: String = conn
+            .query_row(
+                "SELECT peer_id FROM trust_anchors WHERE workspace_id = 'ws1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ta_pid, new);
     }
 }

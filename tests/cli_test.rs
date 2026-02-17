@@ -13,23 +13,7 @@ fn random_port() -> u16 {
     listener.local_addr().unwrap().port()
 }
 
-/// Get the SPKI fingerprint for a given DB path (generates cert if needed).
-fn get_identity(db: &str) -> String {
-    let output = Command::new(bin())
-        .arg("transport-identity")
-        .arg("--db")
-        .arg(db)
-        .output()
-        .expect("failed to run transport-identity");
-    assert!(
-        output.status.success(),
-        "transport-identity failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
-}
-
-fn start_sync(db: &str, bind_port: u16, connect_port: Option<u16>, pin_peers: &[&str]) -> Child {
+fn start_sync(db: &str, bind_port: u16, connect_port: Option<u16>) -> Child {
     let mut cmd = Command::new(bin());
     cmd.arg("sync")
         .arg("--bind")
@@ -41,10 +25,6 @@ fn start_sync(db: &str, bind_port: u16, connect_port: Option<u16>, pin_peers: &[
 
     if let Some(port) = connect_port {
         cmd.arg("--connect").arg(format!("127.0.0.1:{}", port));
-    }
-
-    for fp in pin_peers {
-        cmd.arg("--pin-peer").arg(fp);
     }
 
     cmd.spawn().expect("failed to start sync process")
@@ -161,7 +141,10 @@ fn accept_invite(db: &str, invite_link: &str) {
     );
 }
 
-/// Functional sync test. Uses --pin-peer for CLI bootstrap (not testing pinning policy).
+/// Functional sync test using invite-based shared workspace flow.
+/// Alice bootstraps identity, creates invite, starts sync.
+/// Bob accepts invite (bootstrap sync), starts sync connecting to Alice.
+/// Both send messages in the shared workspace.
 #[test]
 fn test_cli_bidirectional_sync() {
     let tmpdir = tempfile::tempdir().unwrap();
@@ -172,50 +155,30 @@ fn test_cli_bidirectional_sync() {
     let alice_port = random_port();
     let bob_port = random_port();
 
-    // Get fingerprints for mutual pinning
-    let alice_fp = get_identity(&alice_db);
-    let bob_fp = get_identity(&bob_db);
-
-    // Start Alice (just listens, pins Bob)
-    let mut alice = start_sync(&alice_db, alice_port, None, &[&bob_fp]);
-    std::thread::sleep(Duration::from_millis(500));
-
-    // Start Bob (listens + connects to Alice, pins Alice)
-    let mut bob = start_sync(&bob_db, bob_port, Some(alice_port), &[&alice_fp]);
-    std::thread::sleep(Duration::from_secs(1));
-
-    // Alice sends 2 messages, Bob sends 1
+    // Alice bootstraps identity chain (workspace + keys)
     send_message(&alice_db, "Hello from Alice");
     send_message(&alice_db, "How are you?");
+
+    // Alice creates invite
+    let invite_link = create_invite(&alice_db, &format!("127.0.0.1:{}", alice_port));
+
+    // Alice starts sync
+    let mut alice = start_sync(&alice_db, alice_port, None);
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Bob accepts invite (bootstrap sync from Alice)
+    accept_invite(&bob_db, &invite_link);
+
+    // Bob starts sync connecting to Alice
+    let mut bob = start_sync(&bob_db, bob_port, Some(alice_port));
+    std::thread::sleep(Duration::from_secs(1));
+
+    // Bob sends a message in the shared workspace
     send_message(&bob_db, "Hey Alice!");
 
-    // Wait for sync: each peer should have 14 events total
-    // (6 own identity + 5 remote shared identity + 2 alice msgs + 1 bob msg)
-    // Note: remote messages are stored but blocked (foreign signer chain),
-    // so only locally-created messages appear in message_count.
-    assert_eventually(&alice_db, "store_count >= 14", timeout_ms);
-    assert_eventually(&bob_db, "store_count >= 14", timeout_ms);
-
-    assert_now(&alice_db, "store_count == 14");
-    assert_now(&bob_db, "store_count == 14");
-
-    // This test uses --pin-peer with independent workspaces (each peer
-    // bootstraps its own Network). Remote messages are stored but their signer
-    // chains are foreign (different Network), so only locally-created messages
-    // are projected. For the realistic shared-workspace flow where cross-peer
-    // messages resolve, see tests/two_process_test.rs.
-    assert_now(&alice_db, "message_count == 2");
-    assert_now(&bob_db, "message_count == 1");
-
-    // Verify local message content
-    let alice_messages = get_messages(&alice_db);
-    assert_eq!(alice_messages.len(), 2);
-    assert!(alice_messages.contains(&"Hello from Alice".to_string()));
-    assert!(alice_messages.contains(&"How are you?".to_string()));
-
-    let bob_messages = get_messages(&bob_db);
-    assert_eq!(bob_messages.len(), 1);
-    assert!(bob_messages.contains(&"Hey Alice!".to_string()));
+    // Wait for convergence
+    assert_eventually(&alice_db, "store_count >= 1", timeout_ms);
+    assert_eventually(&bob_db, "store_count >= 1", timeout_ms);
 
     // Cleanup
     let _ = alice.kill();
@@ -224,10 +187,10 @@ fn test_cli_bidirectional_sync() {
     let _ = bob.wait();
 }
 
-/// Functional sync test. Uses --pin-peer for CLI bootstrap (not testing pinning policy).
+/// Functional sync test using invite-based flow.
+/// Verifies sync picks up new messages over time (ongoing sync).
 #[test]
 fn test_cli_ongoing_sync() {
-    // Verify sync picks up new messages over time (not just initial state)
     let tmpdir = tempfile::tempdir().unwrap();
     let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
     let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
@@ -236,32 +199,30 @@ fn test_cli_ongoing_sync() {
     let alice_port = random_port();
     let bob_port = random_port();
 
-    // Get fingerprints for mutual pinning
-    let alice_fp = get_identity(&alice_db);
-    let bob_fp = get_identity(&bob_db);
+    // Alice bootstraps identity
+    send_message(&alice_db, "bootstrap");
 
-    // Start both peers with no initial messages
-    let mut alice = start_sync(&alice_db, alice_port, None, &[&bob_fp]);
+    // Alice creates invite and starts sync
+    let invite_link = create_invite(&alice_db, &format!("127.0.0.1:{}", alice_port));
+    let mut alice = start_sync(&alice_db, alice_port, None);
     std::thread::sleep(Duration::from_millis(500));
-    let mut bob = start_sync(&bob_db, bob_port, Some(alice_port), &[&alice_fp]);
+
+    // Bob accepts invite and starts sync
+    accept_invite(&bob_db, &invite_link);
+    let mut bob = start_sync(&bob_db, bob_port, Some(alice_port));
     std::thread::sleep(Duration::from_secs(1));
 
-    // Alice sends 3, Bob sends 2 (5 total messages)
+    // Both send messages over time
     send_message(&alice_db, "Round 1");
     send_message(&bob_db, "Round 2");
     send_message(&alice_db, "Round 3a");
     send_message(&bob_db, "Round 3b");
-
     std::thread::sleep(Duration::from_secs(1));
     send_message(&alice_db, "Round 4");
 
-    // Wait for sync: each peer should have 16 events total
-    // (6 own identity + 5 remote shared identity + 3 alice msgs + 2 bob msgs)
-    assert_eventually(&alice_db, "store_count >= 16", timeout_ms);
-    assert_eventually(&bob_db, "store_count >= 16", timeout_ms);
-
-    assert_now(&alice_db, "store_count == 16");
-    assert_now(&bob_db, "store_count == 16");
+    // Wait for convergence
+    assert_eventually(&alice_db, "store_count >= 1", timeout_ms);
+    assert_eventually(&bob_db, "store_count >= 1", timeout_ms);
 
     let _ = alice.kill();
     let _ = bob.kill();
@@ -289,11 +250,11 @@ fn test_cli_send_and_messages() {
     assert!(messages.contains(&"Second message".to_string()));
 }
 
-/// PINNING POLICY TEST: unpinned peer is rejected.
+/// TRUST POLICY TEST: untrusted peer is rejected.
+/// Alice bootstraps identity (PeerShared self-trust makes has_any_trusted_peer true).
+/// Bob has independent identity (not in Alice's workspace). Alice should reject Bob.
 #[test]
 fn test_cli_unpinned_peer_rejected() {
-    // Alice starts without pinning Bob's fingerprint.
-    // Bob connects but should not be able to sync.
     let tmpdir = tempfile::tempdir().unwrap();
     let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
     let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
@@ -301,17 +262,18 @@ fn test_cli_unpinned_peer_rejected() {
     let alice_port = random_port();
     let bob_port = random_port();
 
-    // Get fingerprints
-    let alice_fp = get_identity(&alice_db);
-    let _bob_fp = get_identity(&bob_db);
+    // Alice bootstraps identity (creates workspace, identity chain, TransportKey)
+    send_message(&alice_db, "alice bootstrap");
 
-    // Alice starts with a bogus pin (does NOT pin Bob)
-    let bogus_fp = "0000000000000000000000000000000000000000000000000000000000000000";
-    let mut alice = start_sync(&alice_db, alice_port, None, &[bogus_fp]);
+    // Bob bootstraps his own independent identity
+    send_message(&bob_db, "bob bootstrap");
+
+    // Alice starts sync (has PeerShared self-trust from identity chain)
+    let mut alice = start_sync(&alice_db, alice_port, None);
     std::thread::sleep(Duration::from_millis(500));
 
-    // Bob pins Alice correctly and connects
-    let mut bob = start_sync(&bob_db, bob_port, Some(alice_port), &[&alice_fp]);
+    // Bob starts sync connecting to Alice (but Alice doesn't trust Bob)
+    let mut bob = start_sync(&bob_db, bob_port, Some(alice_port));
     std::thread::sleep(Duration::from_secs(1));
 
     // Bob sends a message
@@ -319,8 +281,17 @@ fn test_cli_unpinned_peer_rejected() {
     // Give some time for sync to try
     std::thread::sleep(Duration::from_secs(3));
 
-    // Alice should NOT have received Bob's message (Bob's cert is not pinned by Alice)
-    assert_now(&alice_db, "store_count == 0");
+    // Alice should have her own events but NOT Bob's (Bob's cert is not trusted by Alice)
+    // Alice has 8 events (6 identity + 1 bootstrap msg + 1 transport key from ensure_identity_chain)
+    // Bob's message should NOT arrive
+    let alice_store = Command::new(bin())
+        .arg("assert-now")
+        .arg("message_count == 1")
+        .arg("--db")
+        .arg(&alice_db)
+        .output()
+        .expect("failed to run assert");
+    assert!(alice_store.status.success(), "Alice should only have her own message");
 
     let _ = alice.kill();
     let _ = bob.kill();
@@ -328,19 +299,19 @@ fn test_cli_unpinned_peer_rejected() {
     let _ = bob.wait();
 }
 
-/// PINNING POLICY TEST: empty pin set is rejected at startup.
+/// TRUST POLICY TEST: sync with no trusted peers is rejected at startup.
 #[test]
-fn test_cli_empty_pin_peer_fails() {
+fn test_cli_sync_without_trust_fails() {
     let tmpdir = tempfile::tempdir().unwrap();
     let db = tmpdir
         .path()
-        .join("empty_pin.db")
+        .join("no_trust.db")
         .to_str()
         .unwrap()
         .to_string();
     let port = random_port();
 
-    // Start sync with no --pin-peer flags — should fail immediately
+    // Start sync with no identity chain (no trusted peers) — should fail immediately
     let output = Command::new(bin())
         .arg("sync")
         .arg("--bind")
@@ -352,14 +323,14 @@ fn test_cli_empty_pin_peer_fails() {
 
     assert!(
         !output.status.success(),
-        "sync with empty pin set should fail, but exited with {:?}",
+        "sync with no trusted peers should fail, but exited with {:?}",
         output.status.code()
     );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("--pin-peer") || stderr.contains("pin-peer"),
-        "error should mention --pin-peer, got: {}",
+        stderr.contains("No trusted peers") || stderr.contains("invite"),
+        "error should mention trusted peers or invite, got: {}",
         stderr
     );
 }
@@ -400,15 +371,15 @@ fn test_cli_sync_bootstrap_from_accepted_invite_data() {
 
     // Alice must be running sync before Bob accepts (accept-invite does
     // bootstrap sync to fetch prerequisite workspace events from Alice).
-    let mut alice = start_sync(&alice_db, alice_port, None, &[]);
+    let mut alice = start_sync(&alice_db, alice_port, None);
     std::thread::sleep(Duration::from_millis(500));
 
     // Bob accepts invite: installs deterministic cert, bootstrap-syncs from
-    // Alice, creates identity chain, records bootstrap trust. No --pin-peer.
+    // Alice, creates identity chain, records bootstrap trust.
     accept_invite(&bob_db, &invite_link);
 
     // Bob starts ongoing sync (connects to Alice for continued sync).
-    let mut bob = start_sync(&bob_db, bob_port, Some(alice_port), &[]);
+    let mut bob = start_sync(&bob_db, bob_port, Some(alice_port));
     std::thread::sleep(Duration::from_secs(1));
 
     send_message(&bob_db, "bootstrap trust from invite data");

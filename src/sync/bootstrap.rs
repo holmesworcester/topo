@@ -150,40 +150,47 @@ pub fn start_bootstrap_responder(
             .build()
             .expect("failed to create bootstrap responder runtime");
         rt.block_on(async move {
-            let connection = match ep.accept().await {
-                Some(incoming) => match incoming.await {
-                    Ok(c) => c,
+            // Accept up to 2 connections: the initial bootstrap sync and an
+            // optional push-back sync where the joiner pushes its identity
+            // chain events back after creation.
+            for _ in 0..2 {
+                let connection = match ep.accept().await {
+                    Some(incoming) => match incoming.await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::warn!("Bootstrap responder: connection failed: {}", e);
+                            return;
+                        }
+                    },
+                    None => return,
+                };
+
+                let peer_id = peer_identity_from_connection(&connection)
+                    .unwrap_or_default();
+
+                let (ctrl_send, ctrl_recv) = match connection.accept_bi().await {
+                    Ok(s) => s,
                     Err(e) => {
-                        tracing::warn!("Bootstrap responder: connection failed: {}", e);
+                        tracing::warn!("Bootstrap responder: control stream failed: {}", e);
                         return;
                     }
-                },
-                None => return,
-            };
+                };
+                let (data_send, data_recv) = match connection.accept_bi().await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!("Bootstrap responder: data stream failed: {}", e);
+                        return;
+                    }
+                };
+                let conn = DualConnection::new(ctrl_send, ctrl_recv, data_send, data_recv);
 
-            let peer_id = peer_identity_from_connection(&connection)
-                .unwrap_or_default();
-
-            let (ctrl_send, ctrl_recv) = match connection.accept_bi().await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("Bootstrap responder: control stream failed: {}", e);
-                    return;
+                let db_path_ref = &db_path;
+                let recorded_by_ref = &recorded_by;
+                if let Err(e) = crate::sync::engine::run_sync_responder_dual(
+                    conn, db_path_ref, 30, &peer_id, recorded_by_ref, None,
+                ).await {
+                    tracing::warn!("Bootstrap responder: sync error: {}", e);
                 }
-            };
-            let (data_send, data_recv) = match connection.accept_bi().await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("Bootstrap responder: data stream failed: {}", e);
-                    return;
-                }
-            };
-            let conn = DualConnection::new(ctrl_send, ctrl_recv, data_send, data_recv);
-
-            if let Err(e) = crate::sync::engine::run_sync_responder_dual(
-                conn, &db_path, 30, &peer_id, &recorded_by, None,
-            ).await {
-                tracing::warn!("Bootstrap responder: sync error: {}", e);
             }
         });
     });

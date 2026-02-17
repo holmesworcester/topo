@@ -11,7 +11,7 @@ use poc_7::crypto::EventId;
 use poc_7::db::{
     open_connection,
     schema::create_tables,
-    transport_trust::{allowed_peers_from_db, has_any_trusted_peer, import_cli_pins_to_sql, is_peer_allowed},
+    transport_trust::{has_any_trusted_peer, is_peer_allowed},
 };
 use poc_7::events::{
     DeviceInviteFirstEvent, InviteAcceptedEvent, MessageDeletionEvent, MessageEvent, ParsedEvent,
@@ -20,10 +20,7 @@ use poc_7::events::{
 use poc_7::projection::create::{create_event_sync, create_event_staged, create_signed_event_sync};
 use poc_7::projection::pipeline::project_one;
 use poc_7::sync::engine::{accept_loop, connect_loop};
-use poc_7::transport::{
-    create_dual_endpoint, create_dual_endpoint_dynamic,
-    AllowedPeers,
-};
+use poc_7::transport::create_dual_endpoint_dynamic;
 use poc_7::transport_identity::{
     ensure_transport_peer_id_from_db, ensure_transport_cert_from_db,
     load_transport_peer_id_from_db,
@@ -49,9 +46,6 @@ enum Commands {
         connect: Option<SocketAddr>,
         #[arg(short, long, default_value = "server.db")]
         db: String,
-        /// Optional fallback peer fingerprints (hex, repeatable)
-        #[arg(long = "pin-peer")]
-        pin_peer: Vec<String>,
     },
 
     /// Print local transport identity — SPKI fingerprint from TLS cert (generates cert if needed)
@@ -180,9 +174,6 @@ enum Commands {
         /// Peer B hex SPKI fingerprint
         #[arg(long)]
         peer_b: String,
-        /// Optional fallback peer fingerprints (hex, repeatable)
-        #[arg(long = "pin-peer")]
-        pin_peer: Vec<String>,
         /// Intro TTL in milliseconds
         #[arg(long, default_value = "30000")]
         ttl_ms: u64,
@@ -248,9 +239,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             bind,
             connect,
             db,
-            pin_peer,
         } => {
-            run_sync(bind, connect, &db, &pin_peer).await?;
+            run_sync(bind, connect, &db).await?;
         }
         Commands::TransportIdentity { db } => {
             run_identity(&db)?;
@@ -313,11 +303,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             db,
             peer_a,
             peer_b,
-            pin_peer,
             ttl_ms,
             attempt_window_ms,
         } => {
-            cli_intro(&db, &peer_a, &peer_b, &pin_peer, ttl_ms, attempt_window_ms).await?;
+            cli_intro(&db, &peer_a, &peer_b, ttl_ms, attempt_window_ms).await?;
         }
         Commands::IntroAttempts { db, peer } => {
             cli_intro_attempts(&db, peer.as_deref())?;
@@ -1003,7 +992,6 @@ async fn run_sync(
     bind: SocketAddr,
     connect: Option<SocketAddr>,
     db_path: &str,
-    pin_peers: &[String],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Initialize DB before spawning concurrent loops (avoids create_tables race)
     {
@@ -1013,14 +1001,10 @@ async fn run_sync(
 
     let (recorded_by, cert, key) = ensure_transport_cert_from_db(db_path)?;
 
-    // Import CLI pins to SQL, then check combined trust.
-    let cli_pins = AllowedPeers::from_hex_strings(pin_peers)?;
     {
         let db = open_connection(db_path)?;
-        import_cli_pins_to_sql(&db, &recorded_by, &cli_pins)?;
         if !has_any_trusted_peer(&db, &recorded_by)? {
-            return Err("No allowed peers: provide --pin-peer for bootstrap, accept an invite link, or ensure identity events have synced. \
-                Use `poc-7 transport-identity --db <peer-db>` to get a peer's fingerprint.".into());
+            return Err("No trusted peers: accept an invite link or ensure identity events have synced.".into());
         }
     }
 
@@ -1342,7 +1326,6 @@ async fn cli_intro(
     db_path: &str,
     peer_a: &str,
     peer_b: &str,
-    pin_peers: &[String],
     ttl_ms: u64,
     attempt_window_ms: u32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1353,21 +1336,14 @@ async fn cli_intro(
 
     let (recorded_by, cert, key) = ensure_transport_cert_from_db(db_path)?;
 
-    // Build allowed peers: must include both target peers
-    let mut all_pins = pin_peers.to_vec();
-    if !all_pins.contains(&peer_a.to_string()) {
-        all_pins.push(peer_a.to_string());
-    }
-    if !all_pins.contains(&peer_b.to_string()) {
-        all_pins.push(peer_b.to_string());
-    }
-    let cli_pins = AllowedPeers::from_hex_strings(&all_pins)?;
-    let db = open_connection(db_path)?;
-    import_cli_pins_to_sql(&db, &recorded_by, &cli_pins)?;
-    let allowed = allowed_peers_from_db(&db, &recorded_by)?;
-    drop(db);
-
-    let endpoint = create_dual_endpoint("0.0.0.0:0".parse()?, cert, key, Arc::new(allowed))?;
+    // Dynamic trust lookup from SQL at handshake time
+    let db_path_for_lookup = db_path.to_string();
+    let recorded_by_for_lookup = recorded_by.clone();
+    let dynamic_allow = Arc::new(move |peer_fp: &[u8; 32]| {
+        let db = open_connection(&db_path_for_lookup)?;
+        is_peer_allowed(&db, &recorded_by_for_lookup, peer_fp)
+    });
+    let endpoint = create_dual_endpoint_dynamic("0.0.0.0:0".parse()?, cert, key, dynamic_allow)?;
 
     let result = poc_7::sync::intro::run_intro(
         &endpoint,
