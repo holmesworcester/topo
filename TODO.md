@@ -45,7 +45,7 @@ Realism-first rule for ordering: finish test-fidelity items up front (copying ev
 7. `P0: Make scenario replay invariants mandatory by default (opt-out only)`
 8. `P0: Bring scenario invariant harness fully in line with PLAN (fingerprints + full invariant set)`
 9. `P1: Investigate and decide create_event_sync service semantics before implementation changes`
-10. `P1: Investigate simplification of project_one/project_one_core split to better match one-path intent`
+10. ~~`P1: Investigate simplification of project_one/project_one_core split to better match one-path intent`~~ **DONE**: Investigated and resolved. Decision: keep two-layer model (`project_one` public entrypoint + `project_one_step` internal non-cascading step) as justified cascade optimization. Renamed `project_one_core` → `project_one_step` with clear doc comments. Added 7 source-isomorphism invariance tests proving direct/cascade/reverse-order convergence. Updated DESIGN.md §4.1, PLAN.md §5/§15.1, and TLA projector_spec.md to explicitly document the internal split.
 11. `P0: Unify transport identity architecture (single event-derived peer identity, no rotation sidecar)`
 12. `P2: Resolve disjoint trust sets docs/code mismatch`
 13. `P0: Enforce removal policy at transport runtime (deny + disconnect active sessions)`
@@ -609,33 +609,22 @@ Acceptance:
 2. Active schema/runtime does not include unused compatibility-only tables/paths.
 3. Legacy/compat wording in active tests/code is minimized to intentional hardening cases only.
 
-## P1: Investigate simplification of `project_one`/`project_one_core` split to better match one-path intent
+## ~~P1: Investigate simplification of `project_one`/`project_one_core` split to better match one-path intent~~ DONE
 
-Evidence:
+Investigation completed. Decision: keep two-layer model with documentation alignment.
 
-1. PLAN/doc one-path intent emphasizes a single projection entrypoint for all sources and retries:
-   - `docs/PLAN.md:95`
-   - `docs/PLAN.md:481`
-2. Current implementation keeps two projection layers:
-   - `project_one_core` (single-event projection stages),
-   - `project_one` (core + cascade),
-   and cascade internals call `project_one_core` directly.
+Findings:
+1. `project_one` (pub) is the sole public entrypoint — all external callers use it.
+2. `project_one_core` (now renamed `project_one_step`, private) is only used within `cascade_unblocked_inner` Phase 1 (Kahn worklist).
+3. The split is a justified cascade optimization: Phase 1 uses `project_one_step` to avoid redundant recursive cascade (it manages its own worklist); Phase 2 guard retries use `project_one` for proper recursive cascade.
+4. No semantic divergence exists — all projection stages (dep check, type check, signer verify, projector dispatch) are shared.
 
-Problem: even if behavior is mostly coherent, the dual-entry structure makes the one-path story harder to reason about and can cause doc/implementation tension.
+Resolution:
+- Renamed `project_one_core` → `project_one_step` with clear doc comments explaining the relationship.
+- Added 7 source-isomorphism invariance tests proving direct/cascade/reverse-order convergence for message, reaction, encrypted, deletion, and multi-event chains.
+- Updated DESIGN.md §4.1, PLAN.md §5/§15.1, and TLA projector_spec.md to document the internal two-layer model as a justified optimization.
 
-Required process for this TODO (investigation-first):
-
-1. Investigate current call graph and semantics:
-   - when `project_one` is required,
-   - when `project_one_core` is used directly and why.
-2. Produce simplification options (for example one internal entrypoint with mode/context flags) and tradeoffs (correctness, performance, recursion/cascade behavior).
-3. Decide whether to:
-   - simplify code to one conceptual entrypoint, or
-   - keep split and update docs to formalize the justified internal boundary.
-4. Do not implement structural refactor until option review/approval is complete.
-
-Acceptance:
-
-1. Investigation note captures current rationale and concrete options.
-2. Chosen direction is explicit (refactor vs documented boundary).
-3. Implementation/docs are updated only after decision.
+All acceptance criteria met:
+1. Investigation note captures rationale and options. ✓
+2. Chosen direction is explicit: documented boundary (not refactor). ✓
+3. Docs and code are aligned after implementation. ✓

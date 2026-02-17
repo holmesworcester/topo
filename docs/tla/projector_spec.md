@@ -123,7 +123,7 @@ outer events and decrypted inner events from encrypted wrappers.
 | Signer verify + dispatch | `apply_projection` | Resolve signer key, verify Ed25519 signature, dispatch to per-event projector |
 | Rejection recording | `record_rejection` | Write durable rejection to `rejected_events` |
 
-### Cleartext event path (project_one_core)
+### Cleartext event path (project_one_step)
 
 1. Terminal check (already valid/rejected?)
 2. Load blob + parse

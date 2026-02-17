@@ -354,6 +354,15 @@ This applies to:
 
 No alternate projection path is allowed.
 
+Internal two-layer model: `project_one` is the sole public entrypoint.
+Internally it delegates to `project_one_step` (the 7-step single-event
+algorithm without cascade), then runs cascade-unblock if the result is
+`Valid`. The Kahn cascade worklist calls `project_one_step` directly to
+avoid redundant recursive cascade; Phase 2 guard retries call back into
+`project_one` for proper recursive cascade. This split is a cascade
+optimization, not an alternate projection path — all projection stages
+(dep check, type check, signer verify, projector dispatch) are shared.
+
 ## 4.2 Decision contract
 
 Each projection attempt yields one terminal decision:

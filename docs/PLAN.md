@@ -497,6 +497,7 @@ struct ProjectorEffects {
 Entry-point requirement:
 - `local_create`, `wire_receive`, `replay`, and unblock retries must all invoke `project_one`.
 - no alternate projection code paths for specific ingestion sources.
+- Internal cascade optimization: `project_one_step` (the 7-step algorithm without cascade) is used by the Kahn cascade worklist to avoid redundant recursive cascade. Phase 2 guard retries call `project_one` for proper recursive cascade. All projection stages are shared; the split is a performance optimization, not an alternate path.
 
 DRY split (required):
 - Shared projection pipeline code owns:
@@ -1278,6 +1279,7 @@ Use this section as the implementation contract. If code conflicts with this sec
 
 1. No alternate projection path:
    - all projection must converge on `project_one(recorded_by,event_id)`.
+   - `project_one_step` (internal, non-cascading) is used only within the cascade worklist as a performance optimization; it shares all projection stages with `project_one`.
 2. No alternate dependency resolver:
    - dependency refs come from schema metadata only.
 3. No insecure transport default:
