@@ -31,12 +31,16 @@ mod inner {
     impl TenantDiscovery {
         /// Register this tenant's endpoint on mDNS and prepare to browse.
         ///
-        /// `local_peer_ids` is the full set of peer IDs on this node,
-        /// used to self-filter discoveries.
+        /// `advertise_ip` is the routable IP to advertise in the mDNS A record.
+        /// The caller must provide a non-loopback IP — mDNS multicast does not
+        /// discover services advertised on 127.0.0.1. Use
+        /// [`local_non_loopback_ipv4`] to obtain a suitable address when the
+        /// daemon is bound to loopback or a wildcard address.
         pub fn new(
             peer_id: &str,
             port: u16,
             local_peer_ids: HashSet<String>,
+            advertise_ip: &str,
         ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
             let daemon = ServiceDaemon::new()?;
 
@@ -52,22 +56,21 @@ mod inner {
             // resolution. A per-tenant host label keeps records disjoint.
             let host_label = format!("p7h-{}", id_truncated);
             let host = format!("{}.local.", host_label);
-            let my_ip = local_non_loopback_ipv4()
-                .unwrap_or_else(|| "0.0.0.0".to_string());
             let properties = [("peer_id", peer_id)];
             let service = ServiceInfo::new(
                 SERVICE_TYPE,
                 &instance,
                 &host,
-                &my_ip,
+                advertise_ip,
                 port,
                 &properties[..],
             )?;
 
             daemon.register(service)?;
             info!(
-                "mDNS: advertising tenant {} on port {}",
+                "mDNS: advertising tenant {} on {}:{}",
                 &peer_id[..16.min(peer_id.len())],
+                advertise_ip,
                 port
             );
 
@@ -159,9 +162,11 @@ mod inner {
         }
     }
 
-    /// Find a non-loopback IPv4 address to advertise via mDNS.
-    /// Returns None if no suitable address is found.
-    fn local_non_loopback_ipv4() -> Option<String> {
+    /// Find a non-loopback IPv4 address suitable for mDNS advertisement.
+    ///
+    /// Uses the OS routing table to determine which local IP would be used
+    /// to reach the internet. Returns `None` if no routable address is found.
+    pub fn local_non_loopback_ipv4() -> Option<String> {
         use std::net::UdpSocket;
         // Connect a UDP socket to a public address to discover the local IP
         // the OS would route through. No data is actually sent.

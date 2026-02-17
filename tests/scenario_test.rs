@@ -3467,10 +3467,11 @@ async fn test_shared_db_same_workspace_two_tenants() {
 #[tokio::test]
 async fn test_mdns_two_peers_discover_and_sync() {
     use std::collections::HashSet;
-    use poc_7::discovery::TenantDiscovery;
+    use poc_7::discovery::{TenantDiscovery, local_non_loopback_ipv4};
     use poc_7::db::transport_trust::import_cli_pins_to_sql;
     use poc_7::testutil::create_dynamic_endpoint_for_peer_bind;
 
+    let advertise_ip = local_non_loopback_ipv4().expect("no routable IP");
     let alice = Peer::new_with_identity("mdns-alice");
     let bob = Peer::new_with_identity("mdns-bob");
     let harness = ScenarioHarness::new();
@@ -3513,9 +3514,9 @@ async fn test_mdns_two_peers_discover_and_sync() {
     let local_a: HashSet<String> = [alice.identity.clone()].into_iter().collect();
     let local_b: HashSet<String> = [bob.identity.clone()].into_iter().collect();
 
-    let disc_a = TenantDiscovery::new(&alice.identity, port_a, local_a)
+    let disc_a = TenantDiscovery::new(&alice.identity, port_a, local_a, &advertise_ip)
         .expect("mDNS registration A");
-    let disc_b = TenantDiscovery::new(&bob.identity, port_b, local_b)
+    let disc_b = TenantDiscovery::new(&bob.identity, port_b, local_b, &advertise_ip)
         .expect("mDNS registration B");
 
     // Bob browses for peers — should discover Alice (not self)
@@ -3581,10 +3582,11 @@ async fn test_mdns_two_peers_discover_and_sync() {
 #[tokio::test]
 async fn test_mdns_multitenant_self_filtering_and_sync() {
     use std::collections::HashSet;
-    use poc_7::discovery::TenantDiscovery;
+    use poc_7::discovery::{TenantDiscovery, local_non_loopback_ipv4};
     use poc_7::db::transport_trust::import_cli_pins_to_sql;
     use poc_7::testutil::create_dynamic_endpoint_for_peer_bind;
 
+    let advertise_ip = local_non_loopback_ipv4().expect("no routable IP");
     // Three peers: t0 and t1 are "co-located" (share local_peer_ids), ext is external
     let t0 = Peer::new_with_identity("mdns-t0");
     let t1 = Peer::new_with_identity("mdns-t1");
@@ -3632,11 +3634,11 @@ async fn test_mdns_multitenant_self_filtering_and_sync() {
     ].into_iter().collect();
     let ext_local: HashSet<String> = [ext.identity.clone()].into_iter().collect();
 
-    let disc_t0 = TenantDiscovery::new(&t0.identity, port_t0, node_local.clone())
+    let disc_t0 = TenantDiscovery::new(&t0.identity, port_t0, node_local.clone(), &advertise_ip)
         .expect("mDNS t0");
-    let disc_t1 = TenantDiscovery::new(&t1.identity, port_t1, node_local)
+    let disc_t1 = TenantDiscovery::new(&t1.identity, port_t1, node_local, &advertise_ip)
         .expect("mDNS t1");
-    let disc_ext = TenantDiscovery::new(&ext.identity, port_ext, ext_local)
+    let disc_ext = TenantDiscovery::new(&ext.identity, port_ext, ext_local, &advertise_ip)
         .expect("mDNS ext");
 
     // --- Assertion 1: t0 discovers ext but NOT t1 (self-filtered) ---

@@ -74,6 +74,24 @@ use crate::transport::{
 };
 use rustls::sign::CertifiedKey;
 
+fn normalize_discovered_addr_for_local_bind(
+    local_listen_ip: std::net::IpAddr,
+    discovered: SocketAddr,
+) -> SocketAddr {
+    if local_listen_ip.is_loopback() && !discovered.ip().is_loopback() {
+        match discovered {
+            SocketAddr::V4(v4) => {
+                SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), v4.port())
+            }
+            SocketAddr::V6(v6) => {
+                SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), v6.port())
+            }
+        }
+    } else {
+        discovered
+    }
+}
+
 fn spawn_connect_loop_thread(
     db_path: String,
     tenant_id: String,
@@ -375,11 +393,28 @@ pub async fn run_node(
     #[cfg(feature = "discovery")]
     {
         let actual_port = local_addr.port();
+        // Derive an explicit advertise IP for mDNS from the bind address.
+        //
+        // mDNS multicast requires a routable (non-loopback) IP for peer
+        // discovery to work — advertising 127.0.0.1 is not discoverable.
+        // For loopback and wildcard binds, infer a routable IP from the
+        // host's network interfaces. The browse side compensates via
+        // `normalize_discovered_addr_for_local_bind`, which rewrites
+        // discovered non-loopback addresses back to loopback when the
+        // local daemon is bound to loopback.
+        let advertise_ip = if local_addr.ip().is_unspecified() || local_addr.ip().is_loopback() {
+            crate::discovery::local_non_loopback_ipv4()
+                .unwrap_or_else(|| "0.0.0.0".to_string())
+        } else {
+            local_addr.ip().to_string()
+        };
+        let local_listen_ip = local_addr.ip();
         for tenant in &tenants {
             match crate::discovery::TenantDiscovery::new(
                 &tenant.peer_id,
                 actual_port,
                 _local_peer_ids.clone(),
+                &advertise_ip,
             ) {
                 Ok(disc) => {
                     match disc.browse() {
@@ -387,6 +422,7 @@ pub async fn run_node(
                             let ep_clone = endpoint.clone();
                             let db_path_disc = db_path.to_string();
                             let tenant_id = tenant.peer_id.clone();
+                            let local_listen_ip_for_thread = local_listen_ip;
                             let disc_client_cfg = match tenant_client_configs.get(&tenant.peer_id).cloned() {
                                 Some(c) => c,
                                 None => {
@@ -398,7 +434,11 @@ pub async fn run_node(
                             std::thread::spawn(move || {
                                 let mut dispatcher = PeerDispatcher::new();
                                 while let Ok(peer) = rx.recv() {
-                                    let (action, cancel_rx) = dispatcher.dispatch(&peer.peer_id, peer.addr);
+                                    let dial_addr = normalize_discovered_addr_for_local_bind(
+                                        local_listen_ip_for_thread,
+                                        peer.addr,
+                                    );
+                                    let (action, cancel_rx) = dispatcher.dispatch(&peer.peer_id, dial_addr);
                                     match action {
                                         DiscoveryAction::Skip => continue,
                                         DiscoveryAction::Reconnect => {
@@ -406,7 +446,7 @@ pub async fn run_node(
                                                 "mDNS: tenant {} peer {} addr changed, reconnecting at {}",
                                                 &tenant_id[..16],
                                                 &peer.peer_id[..16.min(peer.peer_id.len())],
-                                                peer.addr
+                                                dial_addr
                                             );
                                         }
                                         DiscoveryAction::Connect => {
@@ -414,7 +454,7 @@ pub async fn run_node(
                                                 "mDNS: tenant {} connecting to discovered peer {} at {}",
                                                 &tenant_id[..16],
                                                 &peer.peer_id[..16.min(peer.peer_id.len())],
-                                                peer.addr
+                                                dial_addr
                                             );
                                         }
                                     }
@@ -431,7 +471,7 @@ pub async fn run_node(
                                         rt.block_on(async move {
                                             tokio::select! {
                                                 _ = crate::sync::engine::connect_loop(
-                                                    &db, &tid, ep, peer.addr, cfg,
+                                                    &db, &tid, ep, dial_addr, cfg,
                                                 ) => {}
                                                 _ = cancel.changed() => {}
                                             }
@@ -483,48 +523,59 @@ pub async fn run_node(
     // Placeholder invite-based autodial source for realism tests.
     // This is intentionally narrow and should be replaced by a unified
     // persistent address manager that merges invite, discovery, and intro data.
-    let autodial_targets = collect_placeholder_invite_autodial_targets(db_path)?;
-    let mut launched_autodial: HashSet<(String, SocketAddr)> = HashSet::new();
-    if !autodial_targets.is_empty() {
-        warn!(
-            "PLACEHOLDER AUTODIAL ENABLED: launching {} invite-seeded outbound dial(s)",
-            autodial_targets.len()
-        );
-    }
-    for (tenant_id, remote) in autodial_targets {
-        launched_autodial.insert((tenant_id.clone(), remote));
-        let cfg = match build_tenant_client_config(db_path, &tenant_id) {
-            Ok(c) => c,
-            Err(e) => {
-                warn!(
-                    "Skipping placeholder autodial for {}: {}",
-                    &tenant_id[..16.min(tenant_id.len())],
-                    e
-                );
-                continue;
-            }
-        };
-        info!(
-            "PLACEHOLDER AUTODIAL: tenant {} dialing invite bootstrap {}",
-            &tenant_id[..16.min(tenant_id.len())],
-            remote
-        );
-        spawn_connect_loop_thread(
+    let disable_placeholder_autodial = std::env::var("P7_DISABLE_PLACEHOLDER_AUTODIAL")
+        .ok()
+        .map(|v| {
+            let lowered = v.to_ascii_lowercase();
+            lowered == "1" || lowered == "true" || lowered == "yes"
+        })
+        .unwrap_or(false);
+    if disable_placeholder_autodial {
+        warn!("PLACEHOLDER AUTODIAL DISABLED by P7_DISABLE_PLACEHOLDER_AUTODIAL");
+    } else {
+        let autodial_targets = collect_placeholder_invite_autodial_targets(db_path)?;
+        let mut launched_autodial: HashSet<(String, SocketAddr)> = HashSet::new();
+        if !autodial_targets.is_empty() {
+            warn!(
+                "PLACEHOLDER AUTODIAL ENABLED: launching {} invite-seeded outbound dial(s)",
+                autodial_targets.len()
+            );
+        }
+        for (tenant_id, remote) in autodial_targets {
+            launched_autodial.insert((tenant_id.clone(), remote));
+            let cfg = match build_tenant_client_config(db_path, &tenant_id) {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(
+                        "Skipping placeholder autodial for {}: {}",
+                        &tenant_id[..16.min(tenant_id.len())],
+                        e
+                    );
+                    continue;
+                }
+            };
+            info!(
+                "PLACEHOLDER AUTODIAL: tenant {} dialing invite bootstrap {}",
+                &tenant_id[..16.min(tenant_id.len())],
+                remote
+            );
+            spawn_connect_loop_thread(
+                db_path.to_string(),
+                tenant_id,
+                connect_endpoint.clone(),
+                remote,
+                cfg,
+                "placeholder-autodial",
+            );
+        }
+        // Keep polling for runtime invite acceptance: this allows daemons to pick up
+        // new invite bootstrap targets without restart.
+        spawn_placeholder_autodial_refresher(
             db_path.to_string(),
-            tenant_id,
             connect_endpoint.clone(),
-            remote,
-            cfg,
-            "placeholder-autodial",
+            launched_autodial,
         );
     }
-    // Keep polling for runtime invite acceptance: this allows daemons to pick up
-    // new invite bootstrap targets without restart.
-    spawn_placeholder_autodial_refresher(
-        db_path.to_string(),
-        connect_endpoint.clone(),
-        launched_autodial,
-    );
 
     // Drop our copy so writer exits when all accept loops drop theirs
     drop(shared_tx);
@@ -645,5 +696,21 @@ mod tests {
         let (b2, _) = d.dispatch("peer-b", addr(2000));
         assert_eq!(a2, DiscoveryAction::Reconnect);
         assert_eq!(b2, DiscoveryAction::Skip);
+    }
+
+    #[test]
+    fn test_normalize_discovered_addr_for_loopback_bind_rewrites_ipv4() {
+        let local_ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let discovered: SocketAddr = "192.168.10.42:4455".parse().unwrap();
+        let out = normalize_discovered_addr_for_local_bind(local_ip, discovered);
+        assert_eq!(out, "127.0.0.1:4455".parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
+    fn test_normalize_discovered_addr_for_non_loopback_bind_keeps_addr() {
+        let local_ip: std::net::IpAddr = "192.168.10.10".parse().unwrap();
+        let discovered: SocketAddr = "192.168.10.42:4455".parse().unwrap();
+        let out = normalize_discovered_addr_for_local_bind(local_ip, discovered);
+        assert_eq!(out, discovered);
     }
 }

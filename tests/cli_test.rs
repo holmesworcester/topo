@@ -14,7 +14,7 @@ fn random_port() -> u16 {
     listener.local_addr().unwrap().port()
 }
 
-fn start_sync(db: &str, bind_port: u16) -> Child {
+fn start_sync_with_options(db: &str, bind_port: u16, disable_placeholder_autodial: bool) -> Child {
     let mut cmd = Command::new(bin());
     cmd.arg("sync")
         .arg("--bind")
@@ -23,8 +23,15 @@ fn start_sync(db: &str, bind_port: u16) -> Child {
         .arg(db)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    if disable_placeholder_autodial {
+        cmd.env("P7_DISABLE_PLACEHOLDER_AUTODIAL", "1");
+    }
 
     cmd.spawn().expect("failed to start sync process")
+}
+
+fn start_sync(db: &str, bind_port: u16) -> Child {
+    start_sync_with_options(db, bind_port, false)
 }
 
 fn send_message(db: &str, content: &str) -> String {
@@ -243,6 +250,42 @@ fn test_cli_ongoing_sync() {
 
     assert_eventually(&alice_db, &format!("has_event:{} >= 1", bob_last_eid), timeout_ms);
     assert_eventually(&bob_db, &format!("has_event:{} >= 1", alice_last_eid), timeout_ms);
+
+    let _ = alice.kill();
+    let _ = bob.kill();
+    let _ = alice.wait();
+    let _ = bob.wait();
+}
+
+/// Two separate local daemons should discover and sync on the same machine
+/// even when invite-seeded placeholder autodial is disabled.
+#[test]
+fn test_cli_local_mdns_discovery_without_placeholder_autodial() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
+    let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
+    let timeout_ms = 20000;
+
+    let alice_port = random_port();
+    let bob_port = random_port();
+
+    // Bootstrap Alice and produce an invite Bob can accept.
+    let alice_seed_eid = send_message(&alice_db, "alice-seed");
+    let invite_link = create_invite(&alice_db, &format!("127.0.0.1:{}", alice_port));
+
+    // Start both daemons with placeholder invite-autodial disabled so this test
+    // exercises LAN discovery + trust gating for ongoing sync.
+    let mut alice = start_sync_with_options(&alice_db, alice_port, true);
+    std::thread::sleep(Duration::from_millis(700));
+
+    accept_invite(&bob_db, &invite_link);
+    let mut bob = start_sync_with_options(&bob_db, bob_port, true);
+    std::thread::sleep(Duration::from_secs(2));
+
+    // Validate bidirectional convergence.
+    let bob_msg_eid = send_message(&bob_db, "bob-via-mdns-localhost");
+    assert_eventually(&alice_db, &format!("has_event:{} >= 1", bob_msg_eid), timeout_ms);
+    assert_eventually(&bob_db, &format!("has_event:{} >= 1", alice_seed_eid), timeout_ms);
 
     let _ = alice.kill();
     let _ = bob.kill();
