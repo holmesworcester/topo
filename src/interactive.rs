@@ -784,8 +784,14 @@ fn cmd_invite(
     let workspace_id = account.workspace_id.ok_or("No network event ID.")?;
 
     let conn = open_connection(&account.db_path)?;
-    let invite =
-        identity_ops::create_user_invite(&conn, &account.identity, &workspace_key, &workspace_id)?;
+    let invite = identity_ops::create_user_invite(
+        &conn,
+        &account.identity,
+        &workspace_key,
+        &workspace_id,
+        None,
+        None,
+    )?;
     let pending_spki = expected_invite_bootstrap_spki_from_invite_key(&invite.invite_key)?;
     crate::db::transport_trust::record_pending_invite_bootstrap_trust(
         &conn,

@@ -179,7 +179,12 @@ impl Peer {
 
         // Creator issues an invite (creates UserInviteOngoing on creator's DB)
         let invite = create_user_invite(
-            &creator_db, &creator.identity, workspace_key, &creator.workspace_id,
+            &creator_db,
+            &creator.identity,
+            workspace_key,
+            &creator.workspace_id,
+            None,
+            None,
         ).expect("failed to create user invite");
 
         // Register pending bootstrap trust so creator's endpoint allows the joiner
@@ -2094,7 +2099,12 @@ impl SharedDbNode {
 
         // Creator issues an invite
         let invite = create_user_invite(
-            &db, &creator_identity, &workspace_key, &workspace_id,
+            &db,
+            &creator_identity,
+            &workspace_key,
+            &workspace_id,
+            None,
+            None,
         ).expect("failed to create user invite");
 
         // The Workspace and UserInviteBoot events already exist in the shared DB.

@@ -91,6 +91,48 @@ pub const FILE_SLICE_WIRE_SIZE: usize =
 pub const BENCH_DEP_WIRE_SIZE: usize =
     COMMON_HEADER_BYTES + BENCH_DEP_SLOTS_BYTES + 16;
 
+// ─── Identity & infrastructure event wire sizes ───
+//
+// These types have no text slots or variable fields — all fixed-size from inception.
+
+/// SecretKey (type 6): type(1) + created_at(8) + key_bytes(32) = 41
+pub const SECRET_KEY_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32;
+
+/// MessageDeletion (type 7): type(1) + created_at(8) + target_event_id(32) + author_id(32)
+///                          + signed_by(32) + signer_type(1) + signature(64) = 170
+pub const MESSAGE_DELETION_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32 + 32 + SIGNATURE_TRAILER_BYTES;
+
+/// Workspace (type 8): type(1) + created_at(8) + public_key(32) = 41
+pub const WORKSPACE_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32;
+
+/// InviteAccepted (type 9): type(1) + created_at(8) + invite_event_id(32) + workspace_id(32) = 73
+pub const INVITE_ACCEPTED_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32 + 32;
+
+/// UserInviteBoot (type 10): type(1) + created_at(8) + public_key(32) + workspace_id(32)
+///                          + signed_by(32) + signer_type(1) + signature(64) = 170
+pub const USER_INVITE_BOOT_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32 + 32 + SIGNATURE_TRAILER_BYTES;
+
+/// UserInviteOngoing (type 11): same layout as UserInviteBoot but admin_event_id in place of workspace_id = 170
+pub const USER_INVITE_ONGOING_WIRE_SIZE: usize = USER_INVITE_BOOT_WIRE_SIZE;
+
+/// Identity-pubkey-with-signer layout: type(1) + created_at(8) + public_key(32)
+///                                    + signed_by(32) + signer_type(1) + signature(64) = 138
+/// Used by: DeviceInviteFirst(12), DeviceInviteOngoing(13), UserBoot(14), UserOngoing(15),
+///          PeerSharedFirst(16), PeerSharedOngoing(17), UserRemoved(20), PeerRemoved(21),
+///          TransportKey(23)
+pub const IDENTITY_PUBKEY_SIGNED_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32 + SIGNATURE_TRAILER_BYTES;
+
+/// AdminBoot (type 18): type(1) + created_at(8) + public_key(32) + user_event_id(32)
+///                     + signed_by(32) + signer_type(1) + signature(64) = 170
+pub const ADMIN_BOOT_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32 + 32 + SIGNATURE_TRAILER_BYTES;
+
+/// AdminOngoing (type 19): same layout as AdminBoot = 170
+pub const ADMIN_ONGOING_WIRE_SIZE: usize = ADMIN_BOOT_WIRE_SIZE;
+
+/// SecretShared (type 22): type(1) + created_at(8) + key_event_id(32) + recipient_event_id(32)
+///                        + wrapped_key(32) + signed_by(32) + signer_type(1) + signature(64) = 202
+pub const SECRET_SHARED_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32 + 32 + 32 + SIGNATURE_TRAILER_BYTES;
+
 // ─── Per-type field offsets (Message, type 1) ───
 
 pub mod message_offsets {
@@ -190,29 +232,28 @@ pub const fn encrypted_wire_size(inner_wire_size: usize) -> usize {
 /// Returns None for types that cannot be encrypted (encrypted, secret_key, local-only, unknown).
 pub fn encrypted_inner_wire_size(inner_type_code: u8) -> Option<usize> {
     match inner_type_code {
-        1 => Some(MESSAGE_WIRE_SIZE),           // Message
-        2 => Some(REACTION_WIRE_SIZE),          // Reaction
-        4 => Some(SIGNED_MEMO_WIRE_SIZE),       // SignedMemo
-        7 => Some(170),                         // MessageDeletion (already fixed: 170B)
-        // Identity types (already fixed sizes)
-        8 => Some(41),                          // Workspace
-        10 => Some(170),                        // UserInviteBoot
-        11 => Some(170),                        // UserInviteOngoing
-        12 => Some(138),                        // DeviceInviteFirst
-        13 => Some(138),                        // DeviceInviteOngoing
-        14 => Some(138),                        // UserBoot
-        15 => Some(138),                        // UserOngoing
-        16 => Some(138),                        // PeerSharedFirst
-        17 => Some(138),                        // PeerSharedOngoing
-        18 => Some(170),                        // AdminBoot
-        19 => Some(170),                        // AdminOngoing
-        20 => Some(138),                        // UserRemoved
-        21 => Some(138),                        // PeerRemoved
-        22 => Some(202),                        // SecretShared
-        23 => Some(138),                        // TransportKey
-        24 => Some(MESSAGE_ATTACHMENT_WIRE_SIZE), // MessageAttachment
-        25 => Some(FILE_SLICE_WIRE_SIZE),       // FileSlice
-        26 => Some(BENCH_DEP_WIRE_SIZE),        // BenchDep
+        1 => Some(MESSAGE_WIRE_SIZE),                   // Message
+        2 => Some(REACTION_WIRE_SIZE),                  // Reaction
+        4 => Some(SIGNED_MEMO_WIRE_SIZE),               // SignedMemo
+        7 => Some(MESSAGE_DELETION_WIRE_SIZE),           // MessageDeletion
+        8 => Some(WORKSPACE_WIRE_SIZE),                  // Workspace
+        10 => Some(USER_INVITE_BOOT_WIRE_SIZE),          // UserInviteBoot
+        11 => Some(USER_INVITE_ONGOING_WIRE_SIZE),       // UserInviteOngoing
+        12 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE),    // DeviceInviteFirst
+        13 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE),    // DeviceInviteOngoing
+        14 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE),    // UserBoot
+        15 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE),    // UserOngoing
+        16 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE),    // PeerSharedFirst
+        17 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE),    // PeerSharedOngoing
+        18 => Some(ADMIN_BOOT_WIRE_SIZE),                // AdminBoot
+        19 => Some(ADMIN_ONGOING_WIRE_SIZE),             // AdminOngoing
+        20 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE),    // UserRemoved
+        21 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE),    // PeerRemoved
+        22 => Some(SECRET_SHARED_WIRE_SIZE),             // SecretShared
+        23 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE),    // TransportKey
+        24 => Some(MESSAGE_ATTACHMENT_WIRE_SIZE),         // MessageAttachment
+        25 => Some(FILE_SLICE_WIRE_SIZE),                // FileSlice
+        26 => Some(BENCH_DEP_WIRE_SIZE),                 // BenchDep
         // Cannot encrypt: encrypted(5), secret_key(6), invite_accepted(9)
         _ => None,
     }
@@ -367,6 +408,22 @@ mod tests {
         assert_eq!(bench_dep_offsets::DEP_SLOTS, 9);
         assert_eq!(bench_dep_offsets::PAYLOAD, 9 + BENCH_DEP_SLOTS_BYTES);
         assert_eq!(bench_dep_offsets::PAYLOAD + 16, BENCH_DEP_WIRE_SIZE);
+    }
+
+    // ─── Identity/infrastructure wire size sanity checks ───
+
+    #[test]
+    fn test_identity_wire_sizes() {
+        assert_eq!(SECRET_KEY_WIRE_SIZE, 41);
+        assert_eq!(MESSAGE_DELETION_WIRE_SIZE, 170);
+        assert_eq!(WORKSPACE_WIRE_SIZE, 41);
+        assert_eq!(INVITE_ACCEPTED_WIRE_SIZE, 73);
+        assert_eq!(USER_INVITE_BOOT_WIRE_SIZE, 170);
+        assert_eq!(USER_INVITE_ONGOING_WIRE_SIZE, 170);
+        assert_eq!(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE, 138);
+        assert_eq!(ADMIN_BOOT_WIRE_SIZE, 170);
+        assert_eq!(ADMIN_ONGOING_WIRE_SIZE, 170);
+        assert_eq!(SECRET_SHARED_WIRE_SIZE, 202);
     }
 
     // ─── Encrypted inner wire size lookup ───

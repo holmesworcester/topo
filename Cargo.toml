@@ -14,6 +14,7 @@ base64 = "0.21"
 rcgen = "0.12"
 hex = "0.4"
 ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8"] }
+curve25519-dalek = "4"
 aes-gcm = "0.10"
 rand = "0.8"
 clap = { version = "4", features = ["derive"] }

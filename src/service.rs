@@ -1196,8 +1196,15 @@ pub fn svc_create_invite(
     key_arr.copy_from_slice(&ws_key_bytes);
     let workspace_key = SigningKey::from_bytes(&key_arr);
 
-    let invite = crate::identity_ops::create_user_invite(&db, &recorded_by, &workspace_key, &ws_eid)
-        .map_err(|e| ServiceError(format!("Failed to create invite: {}", e)))?;
+    let invite = crate::identity_ops::create_user_invite(
+        &db,
+        &recorded_by,
+        &workspace_key,
+        &ws_eid,
+        None,
+        None,
+    )
+    .map_err(|e| ServiceError(format!("Failed to create invite: {}", e)))?;
 
     // Record pending bootstrap trust so invitee can connect
     let pending_spki = crate::transport_identity::expected_invite_bootstrap_spki_from_invite_key(
