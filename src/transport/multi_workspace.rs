@@ -16,7 +16,7 @@ use crate::crypto::event_id_from_base64;
 pub struct WorkspaceCertResolver {
     /// SNI hostname → CertifiedKey
     certs: HashMap<String, Arc<CertifiedKey>>,
-    /// Fallback cert when no SNI is provided (single-tenant backwards compat)
+    /// Fallback cert when no SNI is provided.
     fallback: Option<Arc<CertifiedKey>>,
 }
 
@@ -63,8 +63,7 @@ impl ResolvesServerCert for WorkspaceCertResolver {
                 return Some(ck.clone());
             }
         }
-        // Fallback: if only one workspace, always use it (backwards compat
-        // with clients that don't send workspace-specific SNI).
+        // Fallback for clients that do not send workspace-specific SNI.
         self.fallback.clone()
     }
 }

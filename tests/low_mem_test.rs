@@ -47,7 +47,7 @@ impl EnvGuard {
         let prev_low_mem_ios = std::env::var("LOW_MEM_IOS").ok();
         let prev_low_mem = std::env::var("LOW_MEM").ok();
         std::env::set_var("LOW_MEM_IOS", "1");
-        // Keep legacy knob aligned so older code paths in bench helpers stay consistent.
+        // Keep both low-memory env flags aligned for bench helpers.
         std::env::set_var("LOW_MEM", "1");
         Self {
             prev_low_mem_ios,

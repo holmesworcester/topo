@@ -293,7 +293,7 @@ static MIGRATIONS: &[Migration] = &[
         version: 12,
         name: "retire_invite_workspace_bindings",
         sql: "
-            -- Historical no-op migration retained for ordering compatibility.
+            -- Historical no-op migration kept to preserve migration numbering.
             SELECT 1;
         ",
     },
@@ -477,7 +477,7 @@ static MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 23,
-        name: "drop_retired_compat_tables",
+        name: "drop_retired_tables",
         sql: "
             DROP TABLE IF EXISTS shareable_events;
             DROP TABLE IF EXISTS invite_workspace_bindings;

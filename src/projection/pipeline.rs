@@ -1354,10 +1354,10 @@ mod tests {
     }
 
     #[test]
-    fn test_legacy_peer_key_blob_rejected() {
+    fn test_retired_type3_peer_key_blob_rejected() {
         let conn = setup();
         let recorded_by = "peer1";
-        // Legacy peer_key wire format: [type=3][created_at][public_key]
+        // Retired type-3 peer_key wire format: [type=3][created_at][public_key]
         let mut blob = Vec::with_capacity(41);
         blob.push(3);
         blob.extend_from_slice(&now_ms().to_le_bytes());

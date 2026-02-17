@@ -55,7 +55,7 @@ Realism-first rule for ordering: finish test-fidelity items up front (copying ev
 17. ~~`P1: Remove duplicated command/business logic between CLI (main.rs) and service layer (service.rs)`~~ **DONE**: core CLI command flows route through service-layer APIs; remaining REPL-specific cleanup is tracked separately in item 21.
 18. ~~`P1: Eliminate direct SQL access in CLI command paths where module APIs already exist`~~ **DONE (CLI)**: direct SQL was removed from standard CLI command paths; remaining REPL/internal helper SQL cleanup is tracked under item 21.
 19. `P1: Reconcile TLA/spec mapping docs with PLAN and implemented projector semantics` **PARTIALLY DONE**: event-registry/dependency mapping rows were refreshed to current runtime semantics, and fast TLC checks are green; remaining open delta is transport-credential lifecycle naming/model drift (item 11).
-20. `P2: Remove residual compatibility cruft from active schema/docs/runtime surfaces` **PARTIALLY DONE**: some stale wording/legacy assumptions were removed; broader runtime/schema cleanup remains.
+20. `P2: Remove residual compatibility cruft from active schema/docs/runtime surfaces` **PARTIALLY DONE**: compatibility-heavy wording was reduced in migrations/transport comments and legacy test naming, but broader schema/runtime cleanup remains.
 21. `P1: CLI isomorphism — route remaining interactive commands through service layer` (send, messages, status, react, delete, users, keys — interactive REPL should be a thin adapter over service functions per PLAN §2.2)
 22. ~~`P2: Single-port multi-tenant endpoint — share one UDP port across tenants on the same device`~~ **DONE**: node now runs a single shared QUIC endpoint with multi-workspace cert resolution and per-tenant outbound isolation checks.
 
@@ -556,10 +556,10 @@ Evidence:
 1. Active DESIGN still references compatibility-staging queue behavior:
    - `docs/DESIGN.md:538` (`ingress_queue` "reserved compatibility/diagnostic staging").
 2. Migrations retain historical compatibility-only artifacts:
-   - `src/db/migrations.rs:296` (version-12 no-op retained for ordering compatibility),
-   - `src/db/migrations.rs:480` (`drop_retired_compat_tables` naming/history trail).
+   - `src/db/migrations.rs:296` (version-12 historical no-op remains),
+   - `src/db/migrations.rs:480` (retired-table cleanup still represented as historical migration baggage).
 3. Runtime/test surface still carries legacy terminology artifacts:
-   - `src/projection/pipeline.rs:1288` (`test_legacy_peer_key_blob_rejected` naming).
+   - terminology cleanup is partial; additional legacy/compat phrasing remains across runtime/tests.
 
 Problem: these leftovers keep old-era compatibility context alive in active surfaces, increasing cognitive load and conflicting with the POC single-path replacement policy.
 
@@ -569,6 +569,14 @@ Fix:
 2. Remove unused compatibility-only schema elements (for example `ingress_queue`) if no active runtime path depends on them.
 3. Collapse compatibility-only migration/history clutter via epoch-forward schema cleanup (POC recreate-db model).
 4. Keep archival context only under `docs/archive/`, not in normative active docs.
+
+Status update (2026-02-17):
+
+1. Reduced compatibility wording in active runtime surfaces:
+   - `drop_retired_compat_tables` migration label renamed to `drop_retired_tables`.
+   - transport cert-resolver fallback comments no longer frame behavior as backward-compat mode.
+   - `test_legacy_peer_key_blob_rejected` renamed to `test_retired_type3_peer_key_blob_rejected`.
+2. Remaining cleanup is structural (schema/docs/runtime surface), not just naming.
 
 Acceptance:
 
