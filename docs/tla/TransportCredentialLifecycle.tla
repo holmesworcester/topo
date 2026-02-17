@@ -50,6 +50,12 @@ TrustedSPKIs(p) ==
 
 \* Whether peer p can authenticate peer q's current credential.
 \* Mirrors is_peer_allowed() (database path, excluding CLI pins).
+\*
+\* Rust note (collapse-single-tenant): on multi-tenant nodes, inbound (server)
+\* connections use a union gate (accept if ANY tenant trusts q), but post-handshake
+\* routing binds the session to the specific tenant p that trusts q.  Outbound
+\* (client) connections use per-tenant workspace_client_config which enforces
+\* exactly this per-peer CanAuthenticate check at the TLS layer.
 CanAuthenticate(p, q) ==
     /\ localCred[q] # None
     /\ localCred[q] \in TrustedSPKIs(p)

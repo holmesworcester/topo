@@ -3580,6 +3580,254 @@ async fn test_tenant_scoped_outbound_trust_rejects_untrusted_server() {
     harness.finish();
 }
 
+/// Integration test: two multi-tenant nodes exercise run_node's per-tenant outbound
+/// config pipeline (discover_local_tenants → workspace_client_config → connect_loop).
+///
+/// Setup: Node A (2 tenants: a0, a1) accepts connections. Node B (2 tenants: b0, b1)
+/// connects with per-tenant configs. Trust seeded so b0 trusts a0 (the fallback cert)
+/// and b1 trusts a1 only. Since A presents a0 as its fallback cert, b0's TLS handshake
+/// succeeds and sync proceeds, while b1's per-tenant trust verifier correctly rejects
+/// a0's cert and no sync occurs.
+///
+/// Proves: run_node's workspace_client_config correctly scopes outbound trust per-tenant.
+#[tokio::test]
+async fn test_run_node_multitenant_outbound_isolation() {
+    use std::collections::HashMap;
+    use std::sync::atomic::AtomicU64;
+    use poc_7::db::transport_creds::discover_local_tenants;
+    use poc_7::db::transport_trust::{import_cli_pins_to_sql, is_peer_allowed};
+    use poc_7::transport::{
+        create_single_port_endpoint, workspace_client_config,
+        multi_workspace::{WorkspaceCertResolver, workspace_sni},
+        DynamicAllowFn,
+    };
+    use poc_7::sync::engine::{accept_loop_with_ingest, IngestItem, batch_writer};
+    use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+    use rustls::sign::CertifiedKey;
+    use tokio::sync::mpsc;
+
+    // --- Two multi-tenant nodes ---
+    let node_a = SharedDbNode::new(2);
+    let node_b = SharedDbNode::new(2);
+    let harness = ScenarioHarness::skip(
+        "multi-tenant outbound isolation: tests transport config pipeline, \
+         not event projection (different workspace chains)",
+    );
+
+    let a0 = &node_a.tenants[0];
+    let a1 = &node_a.tenants[1];
+    let b0 = &node_b.tenants[0];
+    let b1 = &node_b.tenants[1];
+
+    // Decode SPKI fingerprints from hex identity strings
+    let fp = |peer: &poc_7::testutil::Peer| -> [u8; 32] {
+        hex::decode(&peer.identity).unwrap().try_into().unwrap()
+    };
+
+    // --- Seed cross-trust via CLI pins (SQL trust rows) ---
+    // a0 trusts b0, a1 trusts b1 (inbound: A accepts both)
+    {
+        let db = open_connection(&node_a.db_path).unwrap();
+        import_cli_pins_to_sql(&db, &a0.identity, &AllowedPeers::from_fingerprints(vec![fp(b0)])).unwrap();
+        import_cli_pins_to_sql(&db, &a1.identity, &AllowedPeers::from_fingerprints(vec![fp(b1)])).unwrap();
+    }
+    // b0 trusts a0, b1 trusts a1 (outbound: per-tenant client trust)
+    {
+        let db = open_connection(&node_b.db_path).unwrap();
+        import_cli_pins_to_sql(&db, &b0.identity, &AllowedPeers::from_fingerprints(vec![fp(a0)])).unwrap();
+        import_cli_pins_to_sql(&db, &b1.identity, &AllowedPeers::from_fingerprints(vec![fp(a1)])).unwrap();
+    }
+
+    // Create marker events on a0 (to be synced to b0 if connection succeeds)
+    let a0_marker = a0.create_message("a0-isolation-marker");
+    let a0_marker_b64 = event_id_to_base64(&a0_marker);
+
+    // --- Build Node A endpoint (same as run_node) ---
+    let tenants_a = {
+        let db = open_connection(&node_a.db_path).unwrap();
+        discover_local_tenants(&db).unwrap()
+    };
+    assert_eq!(tenants_a.len(), 2, "node A should have 2 tenants");
+
+    let provider = rustls::crypto::ring::default_provider();
+    let mut cert_resolver_a = WorkspaceCertResolver::new();
+    let mut default_cert_a: Option<(CertificateDer<'static>, PrivatePkcs8KeyDer<'static>)> = None;
+
+    for t in &tenants_a {
+        let cert_der = CertificateDer::from(t.cert_der.clone());
+        let key_der = PrivatePkcs8KeyDer::from(t.key_der.clone());
+        let ck = CertifiedKey::from_der(
+            vec![cert_der.clone()], key_der.clone_key().into(), &provider,
+        ).unwrap();
+        let sni = workspace_sni(&t.workspace_id);
+        cert_resolver_a.add(sni, Arc::new(ck));
+        if default_cert_a.is_none() {
+            default_cert_a = Some((cert_der, key_der));
+        }
+    }
+    let (default_cert_der, default_key_der) = default_cert_a.unwrap();
+
+    // Union trust for A's inbound (same as run_node)
+    let db_path_a_trust = node_a.db_path.clone();
+    let a_tenant_ids: Vec<String> = tenants_a.iter().map(|t| t.peer_id.clone()).collect();
+    let union_allow: Arc<DynamicAllowFn> = Arc::new(move |peer_fp: &[u8; 32]| {
+        let db = open_connection(&db_path_a_trust)?;
+        for tid in &a_tenant_ids {
+            if is_peer_allowed(&db, tid, peer_fp)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    });
+
+    let endpoint_a = create_single_port_endpoint(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(cert_resolver_a),
+        union_allow,
+        default_cert_der,
+        default_key_der,
+    ).unwrap();
+    let addr_a = endpoint_a.local_addr().unwrap();
+
+    // Shared batch_writer for A (same as run_node)
+    let (ingest_tx, ingest_rx) = mpsc::channel::<IngestItem>(5000);
+    let events_received = Arc::new(AtomicU64::new(0));
+    let writer_events = events_received.clone();
+    let writer_db = node_a.db_path.clone();
+    let _writer = std::thread::spawn(move || {
+        batch_writer(writer_db, ingest_rx, writer_events);
+    });
+
+    // Accept loop for A
+    let a_db = node_a.db_path.clone();
+    let a_ids: Vec<String> = tenants_a.iter().map(|t| t.peer_id.clone()).collect();
+    let _accept = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all().build().unwrap();
+        rt.block_on(async move {
+            let _ = accept_loop_with_ingest(
+                &a_db, &a_ids, endpoint_a, None, ingest_tx, HashMap::new(),
+            ).await;
+        });
+    });
+
+    // --- Build Node B per-tenant configs (same as run_node) ---
+    let tenants_b = {
+        let db = open_connection(&node_b.db_path).unwrap();
+        discover_local_tenants(&db).unwrap()
+    };
+    assert_eq!(tenants_b.len(), 2, "node B should have 2 tenants");
+
+    let mut b_configs: HashMap<String, quinn::ClientConfig> = HashMap::new();
+    for t in &tenants_b {
+        let cert_der = CertificateDer::from(t.cert_der.clone());
+        let key_der = PrivatePkcs8KeyDer::from(t.key_der.clone());
+        let db_path_t = node_b.db_path.clone();
+        let tid = t.peer_id.clone();
+        let tenant_allow: Arc<DynamicAllowFn> = Arc::new(move |peer_fp: &[u8; 32]| {
+            let db = open_connection(&db_path_t)?;
+            is_peer_allowed(&db, &tid, peer_fp)
+        });
+        let cfg = workspace_client_config(cert_der, key_der, tenant_allow).unwrap();
+        b_configs.insert(t.peer_id.clone(), cfg);
+    }
+
+    // Node B endpoint (for outbound connect_loop calls)
+    let mut cert_resolver_b = WorkspaceCertResolver::new();
+    let mut default_cert_b: Option<(CertificateDer<'static>, PrivatePkcs8KeyDer<'static>)> = None;
+    for t in &tenants_b {
+        let cert_der = CertificateDer::from(t.cert_der.clone());
+        let key_der = PrivatePkcs8KeyDer::from(t.key_der.clone());
+        let ck = CertifiedKey::from_der(
+            vec![cert_der.clone()], key_der.clone_key().into(), &provider,
+        ).unwrap();
+        cert_resolver_b.add(workspace_sni(&t.workspace_id), Arc::new(ck));
+        if default_cert_b.is_none() {
+            default_cert_b = Some((cert_der, key_der));
+        }
+    }
+    let (b_def_cert, b_def_key) = default_cert_b.unwrap();
+    let db_path_b_trust = node_b.db_path.clone();
+    let b_tenant_ids: Vec<String> = tenants_b.iter().map(|t| t.peer_id.clone()).collect();
+    let b_union_allow: Arc<DynamicAllowFn> = Arc::new(move |peer_fp: &[u8; 32]| {
+        let db = open_connection(&db_path_b_trust)?;
+        for tid in &b_tenant_ids {
+            if is_peer_allowed(&db, tid, peer_fp)? { return Ok(true); }
+        }
+        Ok(false)
+    });
+    let endpoint_b = create_single_port_endpoint(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(cert_resolver_b),
+        b_union_allow,
+        b_def_cert,
+        b_def_key,
+    ).unwrap();
+
+    // --- Spawn connect_loops for each B tenant (same as run_node) ---
+    // b0's config trusts a0 (= A's fallback cert) → should succeed
+    let b0_cfg = b_configs.get(&b0.identity).unwrap().clone();
+    let ep_b0 = endpoint_b.clone();
+    let b0_db = node_b.db_path.clone();
+    let b0_id = b0.identity.clone();
+    let _b0_connect = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all().build().unwrap();
+        rt.block_on(async move {
+            let _ = connect_loop(&b0_db, &b0_id, ep_b0, addr_a, Some(b0_cfg)).await;
+        });
+    });
+
+    // b1's config trusts a1 only (NOT a0 = A's fallback cert) → TLS should fail
+    let b1_cfg = b_configs.get(&b1.identity).unwrap().clone();
+    let ep_b1 = endpoint_b.clone();
+    let b1_db = node_b.db_path.clone();
+    let b1_id = b1.identity.clone();
+    let _b1_connect = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all().build().unwrap();
+        rt.block_on(async move {
+            let _ = connect_loop(&b1_db, &b1_id, ep_b1, addr_a, Some(b1_cfg)).await;
+        });
+    });
+
+    // --- Verify ---
+    // b0 should sync with A. Since b0 and b1 share a DB (`events` table is shared),
+    // we check `recorded_events` which tracks per-tenant sync state.
+    assert_eventually(
+        || {
+            let db = open_connection(&node_b.db_path).unwrap();
+            db.query_row(
+                "SELECT COUNT(*) > 0 FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![&b0.identity, &a0_marker_b64],
+                |row| row.get::<_, bool>(0),
+            ).unwrap_or(false)
+        },
+        Duration::from_secs(15),
+        "b0 should record a0's marker (b0 trusts a0 = A's fallback cert)",
+    ).await;
+
+    // b1 should NOT have recorded a0's marker. b1's per-tenant workspace_client_config
+    // only trusts a1's cert, but A presents a0 as its fallback — TLS fails, no sync.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let b1_has_marker: bool = {
+        let db = open_connection(&node_b.db_path).unwrap();
+        db.query_row(
+            "SELECT COUNT(*) > 0 FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![&b1.identity, &a0_marker_b64],
+            |row| row.get::<_, bool>(0),
+        ).unwrap_or(false)
+    };
+    assert!(
+        !b1_has_marker,
+        "b1 should NOT have recorded a0's marker: b1's per-tenant config only trusts a1, \
+         but A presents a0 as its fallback cert. Per-tenant outbound isolation prevents \
+         b1 from establishing a TLS connection."
+    );
+
+    harness.finish();
+}
+
 /// Guard test: verify that every test function in this file uses `ScenarioHarness`.
 /// This catches future tests that forget to add the harness.
 #[test]
