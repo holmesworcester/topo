@@ -23,8 +23,8 @@ use crate::projection::create::{create_event_sync, create_event_staged, create_s
 use crate::projection::pipeline::project_one;
 use crate::transport::create_dual_endpoint_dynamic;
 use crate::transport_identity::{
-    ensure_transport_peer_id_from_db, ensure_transport_cert_from_db,
-    load_transport_peer_id_from_db,
+    ensure_transport_peer_id, ensure_transport_cert,
+    load_transport_peer_id,
 };
 
 // ---------------------------------------------------------------------------
@@ -78,6 +78,32 @@ impl From<crate::invite_link::InviteLinkError> for ServiceError {
     fn from(e: crate::invite_link::InviteLinkError) -> Self {
         ServiceError(e.to_string())
     }
+}
+
+// ---------------------------------------------------------------------------
+// DB initialization helpers
+// ---------------------------------------------------------------------------
+
+/// Open DB, create tables, load existing transport peer ID.
+/// For read-only commands that require an existing identity.
+fn open_db_load(
+    db_path: &str,
+) -> Result<(String, rusqlite::Connection), Box<dyn std::error::Error + Send + Sync>> {
+    let conn = open_connection(db_path)?;
+    create_tables(&conn)?;
+    let recorded_by = load_transport_peer_id(&conn)?;
+    Ok((recorded_by, conn))
+}
+
+/// Open DB, create tables, ensure transport peer ID (create if needed).
+/// For write/bootstrap commands.
+fn open_db_ensure(
+    db_path: &str,
+) -> Result<(String, rusqlite::Connection), Box<dyn std::error::Error + Send + Sync>> {
+    let conn = open_connection(db_path)?;
+    create_tables(&conn)?;
+    let recorded_by = ensure_transport_peer_id(&conn)?;
+    Ok((recorded_by, conn))
 }
 
 // ---------------------------------------------------------------------------
@@ -576,7 +602,7 @@ pub fn query_field(db: &rusqlite::Connection, field: &str, recorded_by: &str) ->
 // ---------------------------------------------------------------------------
 
 pub fn svc_transport_identity(db_path: &str) -> ServiceResult<TransportIdentityResponse> {
-    let fingerprint = ensure_transport_peer_id_from_db(db_path)?;
+    let (fingerprint, _db) = open_db_ensure(db_path)?;
     Ok(TransportIdentityResponse { fingerprint })
 }
 
@@ -640,9 +666,7 @@ pub fn svc_messages_conn(db: &rusqlite::Connection, recorded_by: &str, limit: us
 }
 
 pub fn svc_messages(db_path: &str, limit: usize) -> ServiceResult<MessagesResponse> {
-    let recorded_by = load_transport_peer_id_from_db(db_path)?;
-    let db = open_connection(db_path)?;
-    create_tables(&db)?;
+    let (recorded_by, db) = open_db_load(db_path)?;
     svc_messages_conn(&db, &recorded_by, limit)
 }
 
@@ -678,9 +702,7 @@ pub fn svc_send(
     workspace_hex: &str,
     content: &str,
 ) -> ServiceResult<SendResponse> {
-    let recorded_by = ensure_transport_peer_id_from_db(db_path)?;
-    let db = open_connection(db_path)?;
-    create_tables(&db)?;
+    let (recorded_by, db) = open_db_ensure(db_path)?;
 
     let (signer_eid, signing_key) = ensure_identity_chain(&db, &recorded_by)?;
     let workspace_id = parse_workspace_hex(workspace_hex)?;
@@ -728,9 +750,7 @@ pub fn svc_status_conn(db: &rusqlite::Connection, recorded_by: &str) -> ServiceR
 }
 
 pub fn svc_status(db_path: &str) -> ServiceResult<StatusResponse> {
-    let recorded_by = load_transport_peer_id_from_db(db_path)?;
-    let db = open_connection(db_path)?;
-    create_tables(&db)?;
+    let (recorded_by, db) = open_db_load(db_path)?;
     svc_status_conn(&db, &recorded_by)
 }
 
@@ -739,9 +759,7 @@ pub fn svc_generate(
     count: usize,
     workspace_hex: &str,
 ) -> ServiceResult<GenerateResponse> {
-    let recorded_by = ensure_transport_peer_id_from_db(db_path)?;
-    let db = open_connection(db_path)?;
-    create_tables(&db)?;
+    let (recorded_by, db) = open_db_ensure(db_path)?;
 
     let (signer_eid, signing_key) = ensure_identity_chain(&db, &recorded_by)?;
     let workspace_id = parse_workspace_hex(workspace_hex)?;
@@ -770,11 +788,9 @@ pub fn svc_assert_now(
     db_path: &str,
     predicate_str: &str,
 ) -> ServiceResult<AssertResponse> {
-    let recorded_by = load_transport_peer_id_from_db(db_path)?;
+    let (recorded_by, db) = open_db_load(db_path)?;
     let (field, op, expected) =
         parse_predicate(predicate_str).map_err(ServiceError)?;
-    let db = open_connection(db_path)?;
-    create_tables(&db)?;
     let actual = query_field(&db, &field, &recorded_by).map_err(ServiceError)?;
 
     Ok(AssertResponse {
@@ -793,11 +809,9 @@ pub fn svc_assert_eventually(
     timeout_ms: u64,
     interval_ms: u64,
 ) -> ServiceResult<AssertResponse> {
-    let recorded_by = load_transport_peer_id_from_db(db_path)?;
+    let (recorded_by, db) = open_db_load(db_path)?;
     let (field, op, expected) =
         parse_predicate(predicate_str).map_err(ServiceError)?;
-    let db = open_connection(db_path)?;
-    create_tables(&db)?;
     let start = Instant::now();
     let timeout = Duration::from_millis(timeout_ms);
     let interval = Duration::from_millis(interval_ms);
@@ -860,9 +874,7 @@ pub fn svc_react(
     target_hex: &str,
     emoji: &str,
 ) -> ServiceResult<ReactResponse> {
-    let recorded_by = ensure_transport_peer_id_from_db(db_path)?;
-    let db = open_connection(db_path)?;
-    create_tables(&db)?;
+    let (recorded_by, db) = open_db_ensure(db_path)?;
 
     let (signer_eid, signing_key) = ensure_identity_chain(&db, &recorded_by)?;
     let target_event_id = parse_hex_event_id(target_hex)?;
@@ -899,9 +911,7 @@ pub fn svc_delete_message(
     db_path: &str,
     target_hex: &str,
 ) -> ServiceResult<DeleteResponse> {
-    let recorded_by = ensure_transport_peer_id_from_db(db_path)?;
-    let db = open_connection(db_path)?;
-    create_tables(&db)?;
+    let (recorded_by, db) = open_db_ensure(db_path)?;
 
     let (signer_eid, signing_key) = ensure_identity_chain(&db, &recorded_by)?;
     let target_event_id = parse_hex_event_id(target_hex)?;
@@ -934,9 +944,7 @@ pub fn svc_reactions_conn(db: &rusqlite::Connection, recorded_by: &str) -> Servi
 }
 
 pub fn svc_reactions(db_path: &str) -> ServiceResult<Vec<ReactionItem>> {
-    let recorded_by = load_transport_peer_id_from_db(db_path)?;
-    let db = open_connection(db_path)?;
-    create_tables(&db)?;
+    let (recorded_by, db) = open_db_load(db_path)?;
     svc_reactions_conn(&db, &recorded_by)
 }
 
@@ -955,9 +963,7 @@ pub fn svc_users_conn(db: &rusqlite::Connection, recorded_by: &str) -> ServiceRe
 }
 
 pub fn svc_users(db_path: &str) -> ServiceResult<Vec<UserItem>> {
-    let recorded_by = load_transport_peer_id_from_db(db_path)?;
-    let db = open_connection(db_path)?;
-    create_tables(&db)?;
+    let (recorded_by, db) = open_db_load(db_path)?;
     svc_users_conn(&db, &recorded_by)
 }
 
@@ -1030,9 +1036,7 @@ pub fn svc_keys_conn(db: &rusqlite::Connection, recorded_by: &str, summary: bool
 }
 
 pub fn svc_keys(db_path: &str, summary: bool) -> ServiceResult<KeysResponse> {
-    let recorded_by = load_transport_peer_id_from_db(db_path)?;
-    let db = open_connection(db_path)?;
-    create_tables(&db)?;
+    let (recorded_by, db) = open_db_load(db_path)?;
     svc_keys_conn(&db, &recorded_by, summary)
 }
 
@@ -1067,9 +1071,7 @@ pub fn svc_workspaces_conn(db: &rusqlite::Connection, recorded_by: &str) -> Serv
 }
 
 pub fn svc_workspaces(db_path: &str) -> ServiceResult<Vec<WorkspaceItem>> {
-    let recorded_by = load_transport_peer_id_from_db(db_path)?;
-    let db = open_connection(db_path)?;
-    create_tables(&db)?;
+    let (recorded_by, db) = open_db_load(db_path)?;
     svc_workspaces_conn(&db, &recorded_by)
 }
 
@@ -1077,10 +1079,7 @@ pub fn svc_intro_attempts(
     db_path: &str,
     peer: Option<&str>,
 ) -> ServiceResult<Vec<IntroAttemptItem>> {
-    let db = open_connection(db_path)?;
-    create_tables(&db)?;
-
-    let recorded_by = ensure_transport_peer_id_from_db(db_path)?;
+    let (recorded_by, db) = open_db_ensure(db_path)?;
 
     let rows = crate::db::intro::list_intro_attempts(&db, &recorded_by, peer)?;
     Ok(rows
@@ -1107,11 +1106,10 @@ pub async fn svc_intro(
 ) -> ServiceResult<bool> {
     use std::sync::Arc;
 
-    let db = open_connection(db_path)?;
-    create_tables(&db)?;
-    drop(db);
-
-    let (recorded_by, cert, key) = ensure_transport_cert_from_db(db_path)?;
+    let conn = open_connection(db_path)?;
+    create_tables(&conn)?;
+    let (recorded_by, cert, key) = ensure_transport_cert(&conn)?;
+    drop(conn);
 
     // Dynamic trust lookup from SQL at handshake time
     let db_path_for_lookup = db_path.to_string();
@@ -1160,10 +1158,7 @@ pub fn svc_create_invite(
     db_path: &str,
     bootstrap_addr: &str,
 ) -> ServiceResult<CreateInviteResponse> {
-    let db = open_connection(db_path)?;
-    create_tables(&db)?;
-
-    let recorded_by = load_transport_peer_id_from_db(db_path)
+    let (recorded_by, db) = open_db_load(db_path)
         .map_err(|e| ServiceError(format!("No transport identity: {}", e)))?;
 
     // Load workspace key from local_peer_signers + workspace lookup
@@ -1521,14 +1516,12 @@ mod tests {
         let path = dir.path().join("test.db");
         let path_str = path.to_str().unwrap().to_string();
         // Bootstrap transport identity + schema
-        ensure_transport_peer_id_from_db(&path_str).unwrap();
+        open_db_ensure(&path_str).unwrap();
         (dir, path_str)
     }
 
     fn setup_with_workspace(db_path: &str) -> String {
-        let recorded_by = load_transport_peer_id_from_db(db_path).unwrap();
-        let db = open_connection(db_path).unwrap();
-        create_tables(&db).unwrap();
+        let (recorded_by, db) = open_db_load(db_path).unwrap();
         let (_eid, _key) = ensure_identity_chain(&db, &recorded_by).unwrap();
 
         // Get the workspace hex for this identity chain
@@ -1583,9 +1576,7 @@ mod tests {
         // Workspace is created before trust anchor exists, so it blocks.
         // ensure_identity_chain must handle this via staged API.
         let (_dir, db_path) = temp_db_path();
-        let recorded_by = load_transport_peer_id_from_db(&db_path).unwrap();
-        let db = open_connection(&db_path).unwrap();
-        create_tables(&db).unwrap();
+        let (recorded_by, db) = open_db_load(&db_path).unwrap();
 
         // This should succeed — workspace blocking is handled internally
         let (eid, _key) = ensure_identity_chain(&db, &recorded_by).unwrap();

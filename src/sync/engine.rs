@@ -1301,11 +1301,15 @@ fn resolve_tenant_for_peer(
 ///
 /// Outer loop reconnects on connection drop. Inner loop runs repeated
 /// sync sessions on the same connection.
+///
+/// When `client_config` is `Some`, outbound dials use `endpoint.connect_with()`
+/// to present the correct per-tenant cert and tenant-scoped trust.
 pub async fn connect_loop(
     db_path: &str,
     recorded_by: &str,
     endpoint: quinn::Endpoint,
     remote: SocketAddr,
+    client_config: Option<quinn::ClientConfig>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     {
         let db = open_connection(db_path)?;
@@ -1336,7 +1340,7 @@ pub async fn connect_loop(
     // Use LocalSet so the intro listener (spawn_intro_listener uses spawn_local)
     // can run on the same runtime that drives the endpoint I/O.
     let local = tokio::task::LocalSet::new();
-    local.run_until(connect_loop_inner(db_path, recorded_by, endpoint, remote)).await
+    local.run_until(connect_loop_inner(db_path, recorded_by, endpoint, remote, client_config)).await
 }
 
 async fn connect_loop_inner(
@@ -1344,6 +1348,7 @@ async fn connect_loop_inner(
     recorded_by: &str,
     endpoint: quinn::Endpoint,
     remote: SocketAddr,
+    client_config: Option<quinn::ClientConfig>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Look up workspace SNI for this tenant (falls back to "localhost" if no trust anchor)
     let sni = {
@@ -1358,7 +1363,11 @@ async fn connect_loop_inner(
 
     loop {
         info!("Connecting to {}...", remote);
-        let connection = match endpoint.connect(remote, &sni) {
+        let connection = match if let Some(ref cfg) = client_config {
+            endpoint.connect_with(cfg.clone(), remote, &sni)
+        } else {
+            endpoint.connect(remote, &sni)
+        } {
             Ok(connecting) => match connecting.await {
                 Ok(c) => c,
                 Err(e) => {

@@ -1323,7 +1323,7 @@ pub fn start_peers(
             .build()
             .unwrap();
         rt.block_on(async move {
-            if let Err(e) = connect_loop(&b_db, &b_identity, connector_endpoint, listener_addr).await {
+            if let Err(e) = connect_loop(&b_db, &b_identity, connector_endpoint, listener_addr, None).await {
                 tracing::warn!("connect_loop exited: {}", e);
             }
         });
@@ -1409,7 +1409,7 @@ pub fn start_peers_dynamic(
             .unwrap();
         rt.block_on(async move {
             if let Err(e) =
-                connect_loop(&b_db, &b_identity, connector_endpoint, listener_addr).await
+                connect_loop(&b_db, &b_identity, connector_endpoint, listener_addr, None).await
             {
                 tracing::warn!("connect_loop exited: {}", e);
             }
@@ -1571,7 +1571,7 @@ pub fn start_chain(peers: &[Peer]) -> Vec<std::thread::JoinHandle<()>> {
                 .build()
                 .unwrap();
             rt.block_on(async move {
-                if let Err(e) = connect_loop(&db_path, &identity, endpoint, remote).await {
+                if let Err(e) = connect_loop(&db_path, &identity, endpoint, remote, None).await {
                     tracing::warn!("chain connect_loop[{}] exited: {}", i, e);
                 }
             });
@@ -1641,7 +1641,7 @@ pub fn start_multi_source(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Joi
                 .build()
                 .unwrap();
             rt.block_on(async move {
-                if let Err(e) = connect_loop(&db_path, &identity, endpoint, sink_addr).await {
+                if let Err(e) = connect_loop(&db_path, &identity, endpoint, sink_addr, None).await {
                     tracing::warn!("source connect_loop[{}] exited: {}", i, e);
                 }
             });

@@ -133,7 +133,7 @@ Every CLI instance is a real peer-to-peer device. Interactive REPL and non-inter
 1. **One CLI instance = one device**: each running `poc-7` process is a device with its own transport identity and persistent state.
 2. **Multiple tenants per device**: a single device can host many tenants, each participating in arbitrary (potentially overlapping) workspaces.
 3. **Zeroconf discovery**: mDNS/DNS-SD discovers peers on the same workspace on the local machine or LAN (enabled by default via `discovery` feature).
-4. **Per-tenant QUIC endpoints**: each tenant gets its own QUIC endpoint with trust resolved from event-derived SQL state (no manual `--pin-peer` in steady state).
+4. **Single-port QUIC endpoint**: one shared endpoint serves all tenants via multi-workspace cert resolver (SNI routing). Inbound trust is union-scoped; outbound dials use per-tenant client configs with tenant-scoped trust.
 5. **Shared batch writer**: all tenants on a device share one batch writer for projection, grouped by `recorded_by`.
 
 ---

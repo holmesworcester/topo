@@ -70,6 +70,7 @@ use crate::sync::engine::{IngestItem, accept_loop_with_ingest, batch_writer};
 use crate::transport::{
     create_single_port_endpoint, extract_spki_fingerprint,
     multi_workspace::{WorkspaceCertResolver, workspace_sni},
+    workspace_client_config, DynamicAllowFn,
 };
 use rustls::sign::CertifiedKey;
 
@@ -169,7 +170,8 @@ pub async fn run_node(
     let (default_cert_der, default_key_der) = default_cert
         .ok_or("No valid tenant certs found")?;
 
-    // Union trust closure: checks across ALL tenants
+    // Union trust closure for inbound (server) connections: accept if ANY tenant trusts
+    // the remote. Per-tenant outbound trust is handled by tenant_client_configs below.
     let db_path_trust = db_path.to_string();
     let tenant_peer_ids: Vec<String> = tenants.iter().map(|t| t.peer_id.clone()).collect();
     let dynamic_allow: Arc<
@@ -201,6 +203,24 @@ pub async fn run_node(
         local_addr,
         tenants.len()
     );
+
+    // Per-tenant outbound client configs: each presents the tenant's own cert
+    // and verifies remote peers against that tenant's trust set only.
+    let mut tenant_client_configs: HashMap<String, quinn::ClientConfig> = HashMap::new();
+    for tenant in &tenants {
+        let cert_der = rustls::pki_types::CertificateDer::from(tenant.cert_der.clone());
+        let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(tenant.key_der.clone());
+        let db_path_t = db_path.to_string();
+        let tid = tenant.peer_id.clone();
+        let tenant_allow: Arc<DynamicAllowFn> = Arc::new(move |peer_fp: &[u8; 32]| {
+            let db = open_connection(&db_path_t)?;
+            is_peer_allowed(&db, &tid, peer_fp)
+        });
+        match workspace_client_config(cert_der, key_der, tenant_allow) {
+            Ok(cfg) => { tenant_client_configs.insert(tenant.peer_id.clone(), cfg); }
+            Err(e) => warn!("Failed to build client config for {}: {}", &tenant.peer_id[..16], e),
+        }
+    }
 
     // Shared batch_writer: single writer thread for all tenants.
     let ingest_cap = if tenants.len() > 1 { 10000 } else { 5000 };
@@ -235,6 +255,7 @@ pub async fn run_node(
                             let ep_clone = endpoint.clone();
                             let db_path_disc = db_path.to_string();
                             let tenant_id = tenant.peer_id.clone();
+                            let disc_client_cfg = tenant_client_configs.get(&tenant.peer_id).cloned();
                             std::thread::spawn(move || {
                                 let mut dispatcher = PeerDispatcher::new();
                                 while let Ok(peer) = rx.recv() {
@@ -268,6 +289,7 @@ pub async fn run_node(
                                     let ep = ep_clone.clone();
                                     let db = db_path_disc.clone();
                                     let tid = tenant_id.clone();
+                                    let cfg = disc_client_cfg.clone();
                                     std::thread::spawn(move || {
                                         let rt = tokio::runtime::Builder::new_current_thread()
                                             .enable_all()
@@ -276,7 +298,7 @@ pub async fn run_node(
                                         rt.block_on(async move {
                                             tokio::select! {
                                                 _ = crate::sync::engine::connect_loop(
-                                                    &db, &tid, ep, peer.addr,
+                                                    &db, &tid, ep, peer.addr, cfg,
                                                 ) => {}
                                                 _ = cancel.changed() => {}
                                             }
@@ -329,13 +351,14 @@ pub async fn run_node(
             let ep = connect_endpoint.clone();
             let db = db_path.to_string();
             let tid = tenant.peer_id.clone();
+            let cfg = tenant_client_configs.get(&tenant.peer_id).cloned();
             std::thread::spawn(move || {
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .unwrap();
                 rt.block_on(async move {
-                    if let Err(e) = crate::sync::engine::connect_loop(&db, &tid, ep, remote).await
+                    if let Err(e) = crate::sync::engine::connect_loop(&db, &tid, ep, remote, cfg).await
                     {
                         warn!("connect_loop for {} exited: {}", &tid[..16], e);
                     }
