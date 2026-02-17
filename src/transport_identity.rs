@@ -27,8 +27,19 @@ pub fn load_transport_peer_id(
     }
 }
 
-/// Compute the local transport peer identity (hex SPKI fingerprint), generating cert if needed.
-/// Use this for bootstrap commands (transport-identity, send, generate, sync).
+/// Compute the local transport peer identity (hex SPKI fingerprint), generating a
+/// **random** cert if none exists.
+///
+/// **Bootstrap-only**: this path generates a throwaway random identity that will be
+/// replaced by a deterministic event-derived identity (via `install_peer_key_transport_identity`
+/// or `install_invite_bootstrap_transport_identity`) during workspace bootstrap or invite
+/// acceptance. Production code that expects a stable identity should use
+/// `load_transport_peer_id` instead, which fails if no credentials exist rather than
+/// silently generating new ones.
+///
+/// Acceptable callers: `Peer::new()` in test harness, initial CLI `transport-identity`
+/// command before any workspace exists. All other paths must go through the event-derived
+/// identity flow (bootstrap_workspace → install_peer_key_transport_identity).
 pub fn ensure_transport_peer_id(
     conn: &Connection,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
@@ -43,7 +54,11 @@ pub fn ensure_transport_peer_id(
 }
 
 /// Ensure transport credentials exist and return (peer_id, cert, key).
-/// Generates a new identity if none exists.
+///
+/// **Bootstrap-only**: generates a random identity if none exists. See
+/// `ensure_transport_peer_id` docs for authority semantics. Production sync/connect
+/// code should use `load_transport_cert_required` which fails rather than silently
+/// generating a new identity.
 pub fn ensure_transport_cert(
     conn: &Connection,
 ) -> Result<
@@ -60,6 +75,33 @@ pub fn ensure_transport_cert(
     let peer_id = hex::encode(fp);
     store_local_creds(conn, &peer_id, cert_der.as_ref(), key_der.secret_pkcs8_der())?;
     Ok((peer_id, cert_der, key_der))
+}
+
+/// Load existing transport credentials. Returns error if none exist.
+///
+/// This is the **production** path for loading transport identity. Unlike
+/// `ensure_transport_cert`, it never silently generates a new random identity.
+/// The caller must have already established identity through the event-derived
+/// flow (bootstrap_workspace, accept_invite, or install_peer_key_transport_identity).
+pub fn load_transport_cert_required(
+    conn: &Connection,
+) -> Result<
+    (String, CertificateDer<'static>, PrivatePkcs8KeyDer<'static>),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
+    match load_sole_local_creds(conn)? {
+        Some((peer_id, cert_bytes, key_bytes)) => {
+            let cert_der = CertificateDer::from(cert_bytes);
+            let key_der = PrivatePkcs8KeyDer::from(key_bytes);
+            Ok((peer_id, cert_der, key_der))
+        }
+        None => Err(
+            "Transport identity not found. Identity must be established through workspace \
+             bootstrap or invite acceptance before transport operations. \
+             No silent regeneration — event-derived identity is the sole authority."
+                .into(),
+        ),
+    }
 }
 
 /// Load transport credentials for a specific peer_id. Returns (cert, key) or error.
@@ -105,7 +147,7 @@ pub fn ensure_transport_peer_id_from_db(
 }
 
 /// Ensure transport credentials exist and return (peer_id, cert, key).
-/// Convenience wrapper that opens its own connection.
+/// Bootstrap-only convenience wrapper that opens its own connection.
 pub fn ensure_transport_cert_from_db(
     db_path: &str,
 ) -> Result<
@@ -115,6 +157,19 @@ pub fn ensure_transport_cert_from_db(
     let conn = crate::db::open_connection(db_path)?;
     crate::db::schema::create_tables(&conn)?;
     ensure_transport_cert(&conn)
+}
+
+/// Load existing transport credentials from DB. Fails if none exist.
+/// Production convenience wrapper — never silently generates new identity.
+pub fn load_transport_cert_required_from_db(
+    db_path: &str,
+) -> Result<
+    (String, CertificateDer<'static>, PrivatePkcs8KeyDer<'static>),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
+    let conn = crate::db::open_connection(db_path)?;
+    crate::db::schema::create_tables(&conn)?;
+    load_transport_cert_required(&conn)
 }
 
 // ---------------------------------------------------------------------------
@@ -358,5 +413,50 @@ mod tests {
             })
             .unwrap();
         assert_eq!(count, 1, "should have exactly 1 row, not {}", count);
+    }
+
+    #[test]
+    fn test_load_transport_cert_required_fails_when_empty() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+
+        let err = load_transport_cert_required(&conn).unwrap_err();
+        assert!(
+            err.to_string().contains("Transport identity not found"),
+            "should fail with clear message, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_load_transport_cert_required_succeeds_after_install() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+
+        // Install deterministic identity
+        let key = SigningKey::from_bytes(&[99u8; 32]);
+        let installed = install_peer_key_transport_identity(&conn, &key).unwrap();
+
+        // load_transport_cert_required should succeed
+        let (peer_id, cert, _key) = load_transport_cert_required(&conn).unwrap();
+        assert_eq!(peer_id, installed);
+        assert!(!cert.as_ref().is_empty());
+    }
+
+    #[test]
+    fn test_load_transport_cert_required_never_generates() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+
+        // Calling load_transport_cert_required on empty DB must fail, not generate
+        assert!(load_transport_cert_required(&conn).is_err());
+
+        // Verify no row was created
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM local_transport_creds", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "load_transport_cert_required must never generate creds");
     }
 }

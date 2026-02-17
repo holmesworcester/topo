@@ -28,6 +28,7 @@ use crate::db::{
     wanted::WantedEvents,
 };
 use crate::db::health::{purge_expired_endpoints, record_endpoint_observation};
+use crate::db::removal_watch::is_peer_removed;
 use crate::db::transport_trust::record_transport_binding;
 use crate::events::{self, registry, ShareScope};
 use crate::projection::pipeline::project_one;
@@ -1245,6 +1246,25 @@ pub async fn accept_loop_with_ingest(
                 );
 
                 loop {
+                    // Check if peer has been removed — deny further sessions
+                    // and close the connection.
+                    if let Ok(peer_fp_bytes) = hex::decode(&peer_id) {
+                        if peer_fp_bytes.len() == 32 {
+                            let mut fp = [0u8; 32];
+                            fp.copy_from_slice(&peer_fp_bytes);
+                            if let Ok(db) = open_connection(&db_path_owned) {
+                                if is_peer_removed(&db, &recorded_by_owned, &fp).unwrap_or(false) {
+                                    warn!(
+                                        "Peer {} has been removed — closing connection",
+                                        &peer_id[..16.min(peer_id.len())]
+                                    );
+                                    connection.close(2u32.into(), b"peer removed");
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
                     let (ctrl_send, ctrl_recv) = match connection.accept_bi().await {
                         Ok(streams) => streams,
                         Err(e) => {
@@ -1436,6 +1456,24 @@ async fn connect_loop_inner(
 
         // Inner loop: repeated sync sessions on this connection
         loop {
+            // Check if peer has been removed — deny further sessions
+            if let Ok(peer_fp_bytes) = hex::decode(&peer_id) {
+                if peer_fp_bytes.len() == 32 {
+                    let mut fp = [0u8; 32];
+                    fp.copy_from_slice(&peer_fp_bytes);
+                    if let Ok(db) = open_connection(db_path) {
+                        if is_peer_removed(&db, recorded_by, &fp).unwrap_or(false) {
+                            warn!(
+                                "Peer {} has been removed — closing connection",
+                                &peer_id[..16.min(peer_id.len())]
+                            );
+                            connection.close(2u32.into(), b"peer removed");
+                            break;
+                        }
+                    }
+                }
+            }
+
             let (ctrl_send, ctrl_recv) = match connection.open_bi().await {
                 Ok(streams) => streams,
                 Err(e) => {

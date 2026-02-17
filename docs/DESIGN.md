@@ -291,14 +291,30 @@ JOIN local_transport_creds c ON t.peer_id = c.peer_id
 The node daemon (`run_node`) operates as follows:
 
 1. Discover all local tenants from the DB.
-2. Create one QUIC endpoint per tenant with OS-assigned port.
+2. Create a **single** QUIC endpoint with `WorkspaceCertResolver` for SNI-based cert selection across all tenants.
 3. Create one shared `batch_writer` thread that all tenants feed into.
-4. Per tenant: spawn `accept_loop_with_ingest` with a dynamic trust closure scoped to that tenant's `recorded_by`.
+4. Run a single `accept_loop_with_ingest` with a union dynamic trust closure that checks across all tenants. Post-handshake, the peer's SPKI fingerprint is checked per-tenant to determine `recorded_by` routing.
 5. Optionally: per-tenant mDNS advertisement and peer discovery.
+
+### Single-port multi-tenant endpoint
+
+All tenants on a device share a single UDP port. The server uses `WorkspaceCertResolver` to select the correct TLS cert based on the client's SNI hostname (`workspace_sni()` maps workspace_id to a DNS-safe hex label). Outbound connections use `workspace_client_config()` for per-workspace cert presentation.
 
 ### Per-tenant dynamic trust
 
-Each tenant's QUIC endpoint verifies incoming connections against that tenant's own trust state. The trust closure queries the three trust sources defined in section 2.2 (`transport_keys`, `invite_bootstrap_trust`, `pending_invite_bootstrap_trust`) for the specific `recorded_by`, so tenant A's endpoint only accepts peers trusted by tenant A. Tenants in different workspaces have disjoint trust sets. (`trust_anchors` is used only for tenant discovery at startup, not for per-connection verification.)
+The single QUIC endpoint uses a union trust closure that accepts connections trusted by **any** local tenant. Post-handshake, `resolve_tenant_for_peer` checks `is_peer_allowed` for each tenant to determine routing. The trust closure queries four trust sources for each tenant's `recorded_by`:
+- **PeerShared-derived SPKIs** (primary steady-state; SPKI computed directly from PeerShared public key),
+- `transport_keys` rows (legacy event-derived bindings, retained during transition),
+- `invite_bootstrap_trust` rows (accepted invite-link bootstrap, TTL-bounded),
+- `pending_invite_bootstrap_trust` rows (inviter-side pre-handshake, TTL-bounded).
+
+Trust sets are **tenant-scoped** (`recorded_by`-partitioned). Tenants in different workspaces have operationally disjoint trust because their `recorded_by` values differ, though the union closure permits the shared endpoint to accept connections for any tenant. (`trust_anchors` is used only for tenant discovery at startup, not for per-connection verification.)
+
+### Removal-driven session teardown
+
+When a `PeerRemoved` event is projected, the removed peer's SPKI is excluded from trust lookups (via `NOT EXISTS (removed_entities)` in `peer_shared_spki_fingerprints`). Additionally:
+- New TLS handshakes are denied: `is_peer_allowed` returns false for removed peers.
+- Active sessions are torn down: between sync sessions, both `accept_loop` and `connect_loop` check `is_peer_removed` for the connected peer's SPKI. If the peer has been removed, the QUIC connection is closed with error code 2 ("peer removed").
 
 ### Shared batch writer with tenant routing
 

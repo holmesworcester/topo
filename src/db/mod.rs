@@ -9,6 +9,7 @@ pub mod health;
 pub mod transport_trust;
 pub mod intro;
 pub mod transport_creds;
+pub mod removal_watch;
 
 use rusqlite::{Connection, Result as SqliteResult};
 use std::path::Path;

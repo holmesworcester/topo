@@ -231,8 +231,8 @@ Historical reference branches (`poc-7-mtls`, `poc-7=codex-attempt`) are no longe
 9. Connection identity mapping for metadata/projection context:
    - `recorded_by` = local identity bound to the local cert/private key used for this daemon/profile.
    - `via_peer_id` = remote identity resolved from authenticated remote cert SPKI mapping.
-10. Scope for this phase: invited-member allowlist only.
-   - do not implement removal/disconnection policy yet.
+10. Scope for this phase: invited-member allowlist with removal policy.
+   - Removal events (`PeerRemoved`) deny new TLS handshakes and tear down active sessions.
 11. Identity-phase migration rule:
    - once Phase 12 identity model lands, transport policy runs from projected identity events (`peer_id -> cert SPKI`) and related projected policy rows.
 12. TLS key material modeling rule (end-state):

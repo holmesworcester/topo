@@ -25,10 +25,7 @@ use crate::sync::engine::{accept_loop, connect_loop, download_from_sources, run_
 use crate::transport::{
     AllowedPeers,
     DualConnection,
-    create_client_endpoint,
-    create_dual_endpoint,
     create_dual_endpoint_dynamic,
-    create_server_endpoint,
     extract_spki_fingerprint,
     peer_identity_from_connection,
 };
@@ -1266,39 +1263,69 @@ pub fn verify_projection_invariants(peer: &Peer) {
 // REALISM SYNC HELPERS
 // ---------------------------------------------------------------------------
 
-/// Start continuous sync between two peers with mutual mTLS pinning.
+/// Start continuous sync between two peers with dynamic DB trust lookup.
 ///
-/// REALISM HELPER: uses real QUIC sync loops with static transport trust
-/// (AllowedPeers snapshot) for convenience. Acceptable for scenario tests;
-/// see `start_peers_dynamic` for production-matching dynamic trust.
+/// Uses production-matching dynamic trust (`is_peer_allowed` at each TLS
+/// handshake). Automatically seeds mutual trust via CLI pin import so callers
+/// don't need to manually cross-register trust rows.
 pub fn start_peers(
     peer_a: &Peer,
     peer_b: &Peer,
 ) -> (std::thread::JoinHandle<()>, std::thread::JoinHandle<()>) {
+    use crate::db::transport_trust::import_cli_pins_to_sql;
+    use crate::db::transport_trust::is_peer_allowed;
+
     let (cert_a, key_a) = peer_a.cert_and_key();
     let (cert_b, key_b) = peer_b.cert_and_key();
 
     let fp_a = peer_a.spki_fingerprint();
     let fp_b = peer_b.spki_fingerprint();
 
-    let allowed_for_a = Arc::new(AllowedPeers::from_fingerprints(vec![fp_b]));
-    let allowed_for_b = Arc::new(AllowedPeers::from_fingerprints(vec![fp_a]));
+    // Seed mutual trust: A trusts B, B trusts A (via CLI pin import)
+    {
+        let db_a = open_connection(&peer_a.db_path).expect("failed to open A db");
+        let pins_for_a = AllowedPeers::from_fingerprints(vec![fp_b]);
+        import_cli_pins_to_sql(&db_a, &peer_a.identity, &pins_for_a)
+            .expect("failed to import pins for A");
+    }
+    {
+        let db_b = open_connection(&peer_b.db_path).expect("failed to open B db");
+        let pins_for_b = AllowedPeers::from_fingerprints(vec![fp_a]);
+        import_cli_pins_to_sql(&db_b, &peer_b.identity, &pins_for_b)
+            .expect("failed to import pins for B");
+    }
 
-    let listener_endpoint = create_dual_endpoint(
+    let a_db_path = peer_a.db_path.clone();
+    let a_recorded_by = peer_a.identity.clone();
+    let dynamic_allow_a: Arc<crate::transport::DynamicAllowFn> =
+        Arc::new(move |peer_fp: &[u8; 32]| {
+            let db = open_connection(&a_db_path)?;
+            is_peer_allowed(&db, &a_recorded_by, peer_fp)
+        });
+
+    let b_db_path = peer_b.db_path.clone();
+    let b_recorded_by = peer_b.identity.clone();
+    let dynamic_allow_b: Arc<crate::transport::DynamicAllowFn> =
+        Arc::new(move |peer_fp: &[u8; 32]| {
+            let db = open_connection(&b_db_path)?;
+            is_peer_allowed(&db, &b_recorded_by, peer_fp)
+        });
+
+    let listener_endpoint = create_dual_endpoint_dynamic(
         "127.0.0.1:0".parse().unwrap(),
         cert_a,
         key_a,
-        allowed_for_a,
-    ).expect("failed to create dual endpoint for A");
+        dynamic_allow_a,
+    ).expect("failed to create dynamic dual endpoint for A");
 
     let listener_addr = listener_endpoint.local_addr().expect("failed to get listener addr");
 
-    let connector_endpoint = create_dual_endpoint(
+    let connector_endpoint = create_dual_endpoint_dynamic(
         "127.0.0.1:0".parse().unwrap(),
         cert_b,
         key_b,
-        allowed_for_b,
-    ).expect("failed to create dual endpoint for B");
+        dynamic_allow_b,
+    ).expect("failed to create dynamic dual endpoint for B");
 
     let a_db = peer_a.db_path.clone();
     let a_identity = peer_a.identity.clone();
@@ -1504,38 +1531,65 @@ where
 ///
 /// Returns thread handles for all accept and connect loops.
 pub fn start_chain(peers: &[Peer]) -> Vec<std::thread::JoinHandle<()>> {
+    use crate::db::transport_trust::{import_cli_pins_to_sql, is_peer_allowed};
+
     let n = peers.len();
     assert!(n >= 2, "chain requires at least 2 peers");
 
-    // Extract fingerprints for all peers (needed before creating endpoints)
+    // Extract fingerprints for all peers
     let mut fingerprints: Vec<[u8; 32]> = Vec::new();
     for peer in peers {
         fingerprints.push(peer.spki_fingerprint());
     }
 
-    // Create server endpoints for peers 0..n-2 (each accepts from its right neighbor)
+    // Seed mutual trust between adjacent peers via CLI pin import
+    for i in 0..n-1 {
+        let db_left = open_connection(&peers[i].db_path).expect("failed to open db");
+        let pins = AllowedPeers::from_fingerprints(vec![fingerprints[i+1]]);
+        import_cli_pins_to_sql(&db_left, &peers[i].identity, &pins)
+            .expect("failed to import pins");
+
+        let db_right = open_connection(&peers[i+1].db_path).expect("failed to open db");
+        let pins = AllowedPeers::from_fingerprints(vec![fingerprints[i]]);
+        import_cli_pins_to_sql(&db_right, &peers[i+1].identity, &pins)
+            .expect("failed to import pins");
+    }
+
+    // Create server endpoints for peers 0..n-2 with dynamic trust
     let mut server_addrs: Vec<SocketAddr> = Vec::new();
     let mut server_endpoints: Vec<quinn::Endpoint> = Vec::new();
     for i in 0..n-1 {
         let (cert, key) = peers[i].cert_and_key();
-        let allowed = Arc::new(AllowedPeers::from_fingerprints(vec![fingerprints[i+1]]));
-        let endpoint = create_server_endpoint(
+        let db_path = peers[i].db_path.clone();
+        let recorded_by = peers[i].identity.clone();
+        let allow_fn: Arc<crate::transport::DynamicAllowFn> =
+            Arc::new(move |fp: &[u8; 32]| {
+                let db = open_connection(&db_path)?;
+                is_peer_allowed(&db, &recorded_by, fp)
+            });
+        let endpoint = create_dual_endpoint_dynamic(
             "127.0.0.1:0".parse().unwrap(),
-            cert, key, allowed,
+            cert, key, allow_fn,
         ).expect("failed to create chain server endpoint");
         let addr = endpoint.local_addr().expect("failed to get local addr");
         server_addrs.push(addr);
         server_endpoints.push(endpoint);
     }
 
-    // Create client endpoints for peers 1..n-1 (each connects to its left neighbor)
+    // Create client endpoints for peers 1..n-1 with dynamic trust
     let mut client_endpoints: Vec<quinn::Endpoint> = Vec::new();
     for i in 1..n {
         let (cert, key) = peers[i].cert_and_key();
-        let allowed = Arc::new(AllowedPeers::from_fingerprints(vec![fingerprints[i-1]]));
-        let endpoint = create_client_endpoint(
+        let db_path = peers[i].db_path.clone();
+        let recorded_by = peers[i].identity.clone();
+        let allow_fn: Arc<crate::transport::DynamicAllowFn> =
+            Arc::new(move |fp: &[u8; 32]| {
+                let db = open_connection(&db_path)?;
+                is_peer_allowed(&db, &recorded_by, fp)
+            });
+        let endpoint = create_dual_endpoint_dynamic(
             "0.0.0.0:0".parse().unwrap(),
-            cert, key, allowed,
+            cert, key, allow_fn,
         ).expect("failed to create chain client endpoint");
         client_endpoints.push(endpoint);
     }
@@ -1588,22 +1642,43 @@ pub fn start_chain(peers: &[Peer]) -> Vec<std::thread::JoinHandle<()>> {
 ///
 /// Returns thread handles for sink accept and all source connect loops.
 pub fn start_multi_source(sources: &[Peer], sink: &Peer) -> Vec<std::thread::JoinHandle<()>> {
+    use crate::db::transport_trust::{import_cli_pins_to_sql, is_peer_allowed};
+
     assert!(!sources.is_empty(), "need at least one source");
 
-    // Extract source fingerprints
+    // Extract fingerprints
     let mut source_fps: Vec<[u8; 32]> = Vec::new();
     for source in sources {
         source_fps.push(source.spki_fingerprint());
     }
-
-    // Sink server endpoint allows all sources
-    let (sink_cert, sink_key) = sink.cert_and_key();
     let sink_fp = sink.spki_fingerprint();
 
-    let allowed_for_sink = Arc::new(AllowedPeers::from_fingerprints(source_fps));
-    let server_endpoint = create_server_endpoint(
+    // Seed mutual trust: sink trusts all sources, each source trusts sink
+    {
+        let db_sink = open_connection(&sink.db_path).expect("failed to open sink db");
+        let pins = AllowedPeers::from_fingerprints(source_fps.clone());
+        import_cli_pins_to_sql(&db_sink, &sink.identity, &pins)
+            .expect("failed to import pins for sink");
+    }
+    for source in sources {
+        let db_src = open_connection(&source.db_path).expect("failed to open source db");
+        let pins = AllowedPeers::from_fingerprints(vec![sink_fp]);
+        import_cli_pins_to_sql(&db_src, &source.identity, &pins)
+            .expect("failed to import pins for source");
+    }
+
+    // Sink server endpoint with dynamic trust
+    let (sink_cert, sink_key) = sink.cert_and_key();
+    let sink_db_path = sink.db_path.clone();
+    let sink_recorded_by = sink.identity.clone();
+    let sink_allow: Arc<crate::transport::DynamicAllowFn> =
+        Arc::new(move |fp: &[u8; 32]| {
+            let db = open_connection(&sink_db_path)?;
+            is_peer_allowed(&db, &sink_recorded_by, fp)
+        });
+    let server_endpoint = create_dual_endpoint_dynamic(
         "127.0.0.1:0".parse().unwrap(),
-        sink_cert, sink_key, allowed_for_sink,
+        sink_cert, sink_key, sink_allow,
     ).expect("failed to create sink server endpoint");
     let sink_addr = server_endpoint.local_addr().expect("failed to get sink addr");
 
@@ -1624,13 +1699,19 @@ pub fn start_multi_source(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Joi
         });
     }));
 
-    // Spawn connect_loop for each source
+    // Spawn connect_loop for each source with dynamic trust
     for (i, source) in sources.iter().enumerate() {
         let (cert, key) = source.cert_and_key();
-        let allowed = Arc::new(AllowedPeers::from_fingerprints(vec![sink_fp]));
-        let endpoint = create_client_endpoint(
+        let src_db_path = source.db_path.clone();
+        let src_recorded_by = source.identity.clone();
+        let src_allow: Arc<crate::transport::DynamicAllowFn> =
+            Arc::new(move |fp: &[u8; 32]| {
+                let db = open_connection(&src_db_path)?;
+                is_peer_allowed(&db, &src_recorded_by, fp)
+            });
+        let endpoint = create_dual_endpoint_dynamic(
             "0.0.0.0:0".parse().unwrap(),
-            cert, key, allowed,
+            cert, key, src_allow,
         ).expect("failed to create source client endpoint");
 
         let db_path = source.db_path.clone();
@@ -1660,23 +1741,44 @@ pub fn start_multi_source(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Joi
 ///
 /// Returns thread handles for all source accept_loops and the sink download task.
 pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::JoinHandle<()>> {
+    use crate::db::transport_trust::{import_cli_pins_to_sql, is_peer_allowed};
+
     assert!(!sources.is_empty(), "need at least one source");
 
-    // Extract sink fingerprint for sources to allow
     let (sink_cert, sink_key) = sink.cert_and_key();
     let sink_fp = sink.spki_fingerprint();
+
+    // Seed mutual trust
+    let source_fps: Vec<[u8; 32]> = sources.iter().map(|s| s.spki_fingerprint()).collect();
+    {
+        let db_sink = open_connection(&sink.db_path).expect("failed to open sink db");
+        let pins = AllowedPeers::from_fingerprints(source_fps);
+        import_cli_pins_to_sql(&db_sink, &sink.identity, &pins)
+            .expect("failed to import pins for sink");
+    }
+    for source in sources {
+        let db_src = open_connection(&source.db_path).expect("failed to open source db");
+        let pins = AllowedPeers::from_fingerprints(vec![sink_fp]);
+        import_cli_pins_to_sql(&db_src, &source.identity, &pins)
+            .expect("failed to import pins for source");
+    }
 
     let mut handles = Vec::new();
     let mut source_addrs = Vec::new();
 
-    // Start accept_loop for each source
+    // Start accept_loop for each source with dynamic trust
     for source in sources {
         let (cert, key) = source.cert_and_key();
-
-        let allowed = Arc::new(AllowedPeers::from_fingerprints(vec![sink_fp]));
-        let server_endpoint = create_server_endpoint(
+        let src_db_path = source.db_path.clone();
+        let src_recorded_by = source.identity.clone();
+        let allow_fn: Arc<crate::transport::DynamicAllowFn> =
+            Arc::new(move |fp: &[u8; 32]| {
+                let db = open_connection(&src_db_path)?;
+                is_peer_allowed(&db, &src_recorded_by, fp)
+            });
+        let server_endpoint = create_dual_endpoint_dynamic(
             "127.0.0.1:0".parse().unwrap(),
-            cert, key, allowed,
+            cert, key, allow_fn,
         ).expect("failed to create source server endpoint");
         let addr = server_endpoint.local_addr().expect("failed to get source addr");
         source_addrs.push(addr);
@@ -1696,15 +1798,19 @@ pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Jo
         }));
     }
 
-    // Build per-source client endpoints for the sink
+    // Build per-source client endpoints for the sink with dynamic trust
     let mut endpoint_pairs = Vec::new();
-    for (i, source) in sources.iter().enumerate() {
-        let source_fp = source.spki_fingerprint();
-
-        let allowed = Arc::new(AllowedPeers::from_fingerprints(vec![source_fp]));
-        let client_endpoint = create_client_endpoint(
+    for (i, _source) in sources.iter().enumerate() {
+        let sink_db_path = sink.db_path.clone();
+        let sink_recorded_by = sink.identity.clone();
+        let allow_fn: Arc<crate::transport::DynamicAllowFn> =
+            Arc::new(move |fp: &[u8; 32]| {
+                let db = open_connection(&sink_db_path)?;
+                is_peer_allowed(&db, &sink_recorded_by, fp)
+            });
+        let client_endpoint = create_dual_endpoint_dynamic(
             "0.0.0.0:0".parse().unwrap(),
-            sink_cert.clone(), sink_key.clone_key(), allowed,
+            sink_cert.clone(), sink_key.clone_key(), allow_fn,
         ).expect("failed to create sink client endpoint");
 
         endpoint_pairs.push((client_endpoint, source_addrs[i]));
@@ -1729,6 +1835,10 @@ pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Jo
 
 /// Connect to a remote peer, run one sync session, and close the connection.
 ///
+/// Uses dynamic trust (`is_peer_allowed`) at each TLS handshake, matching
+/// production behavior. The caller must have seeded trust rows (e.g. via
+/// `import_cli_pins_to_sql`) before the connection will succeed.
+///
 /// Used for B0 multi-source baseline testing where sources connect sequentially
 /// (one session each) to a sink running accept_loop.
 pub async fn connect_sync_once(
@@ -1737,11 +1847,29 @@ pub async fn connect_sync_once(
     remote_addr: SocketAddr,
     remote_fp: [u8; 32],
 ) -> Result<crate::runtime::SyncStats, Box<dyn std::error::Error + Send + Sync>> {
+    use crate::db::transport_trust::{import_cli_pins_to_sql, is_peer_allowed};
+
     let (_, cert, key) = ensure_transport_cert(
         &open_connection(db_path)?
     )?;
-    let allowed = Arc::new(AllowedPeers::from_fingerprints(vec![remote_fp]));
-    let endpoint = create_client_endpoint("0.0.0.0:0".parse().unwrap(), cert, key, allowed)?;
+
+    // Seed trust for the remote peer
+    {
+        let db = open_connection(db_path)?;
+        let pins = AllowedPeers::from_fingerprints(vec![remote_fp]);
+        import_cli_pins_to_sql(&db, identity, &pins)?;
+    }
+
+    let db_path_owned = db_path.to_string();
+    let identity_owned = identity.to_string();
+    let allow_fn: Arc<crate::transport::DynamicAllowFn> =
+        Arc::new(move |fp: &[u8; 32]| {
+            let db = open_connection(&db_path_owned)?;
+            is_peer_allowed(&db, &identity_owned, fp)
+        });
+    let endpoint = create_dual_endpoint_dynamic(
+        "0.0.0.0:0".parse().unwrap(), cert, key, allow_fn,
+    )?;
 
     let connection = endpoint.connect(remote_addr, "localhost")?.await?;
     let peer_id = peer_identity_from_connection(&connection)
@@ -1768,16 +1896,35 @@ pub async fn connect_sync_once(
 }
 
 /// Start a sink's accept_loop and return the handle and listen address.
-/// `allowed_fps` is the list of source fingerprints allowed to connect.
+///
+/// Uses dynamic trust (`is_peer_allowed`) at each TLS handshake. The supplied
+/// `allowed_fps` are seeded as CLI pins into the sink's DB so the handshake
+/// succeeds, matching the pattern used by other topology helpers.
 pub fn start_sink_accept(
     sink: &Peer,
     allowed_fps: Vec<[u8; 32]>,
 ) -> (std::thread::JoinHandle<()>, SocketAddr) {
+    use crate::db::transport_trust::{import_cli_pins_to_sql, is_peer_allowed};
+
+    // Seed trust for all allowed fingerprints
+    {
+        let db = open_connection(&sink.db_path).expect("failed to open sink db");
+        let pins = AllowedPeers::from_fingerprints(allowed_fps);
+        import_cli_pins_to_sql(&db, &sink.identity, &pins)
+            .expect("failed to import pins for sink");
+    }
+
     let (cert, key) = sink.cert_and_key();
-    let allowed = Arc::new(AllowedPeers::from_fingerprints(allowed_fps));
-    let endpoint = create_server_endpoint(
+    let sink_db_path = sink.db_path.clone();
+    let sink_recorded_by = sink.identity.clone();
+    let allow_fn: Arc<crate::transport::DynamicAllowFn> =
+        Arc::new(move |fp: &[u8; 32]| {
+            let db = open_connection(&sink_db_path)?;
+            is_peer_allowed(&db, &sink_recorded_by, fp)
+        });
+    let endpoint = create_dual_endpoint_dynamic(
         "127.0.0.1:0".parse().unwrap(),
-        cert, key, allowed,
+        cert, key, allow_fn,
     ).expect("failed to create sink server endpoint");
     let addr = endpoint.local_addr().expect("failed to get sink addr");
 
