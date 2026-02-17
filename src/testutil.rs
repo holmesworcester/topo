@@ -2085,6 +2085,77 @@ impl SharedDbNode {
     }
 }
 
+/// Lightweight harness that ensures every scenario test runs projection replay
+/// invariant checks. Tracks `&Peer` and `&SharedDbNode` references, runs
+/// `verify_projection_invariants` (and `verify_all_invariants` for nodes)
+/// when `.finish()` is called. A `Drop` safety-net panics if `.finish()` was
+/// never called, preventing silent omission.
+///
+/// **Declaration order**: peers/nodes must be declared **before** the harness
+/// so they are dropped **after** it (Rust drops in reverse declaration order).
+pub struct ScenarioHarness<'a> {
+    peers: std::cell::RefCell<Vec<&'a Peer>>,
+    shared_db_nodes: std::cell::RefCell<Vec<&'a SharedDbNode>>,
+    skip_reason: Option<String>,
+    finished: std::cell::Cell<bool>,
+}
+
+impl<'a> ScenarioHarness<'a> {
+    /// Create a new harness that will verify replay invariants on `.finish()`.
+    pub fn new() -> Self {
+        Self {
+            peers: std::cell::RefCell::new(Vec::new()),
+            shared_db_nodes: std::cell::RefCell::new(Vec::new()),
+            skip_reason: None,
+            finished: std::cell::Cell::new(false),
+        }
+    }
+
+    /// Create a harness that skips replay checks with a documented reason.
+    pub fn skip(reason: &str) -> Self {
+        Self {
+            peers: std::cell::RefCell::new(Vec::new()),
+            shared_db_nodes: std::cell::RefCell::new(Vec::new()),
+            skip_reason: Some(reason.to_string()),
+            finished: std::cell::Cell::new(false),
+        }
+    }
+
+    /// Track a `Peer` for replay invariant checks.
+    pub fn track(&self, peer: &'a Peer) {
+        self.peers.borrow_mut().push(peer);
+    }
+
+    /// Track a `SharedDbNode` for replay invariant checks.
+    pub fn track_node(&self, node: &'a SharedDbNode) {
+        self.shared_db_nodes.borrow_mut().push(node);
+    }
+
+    /// Run replay invariant checks on all tracked peers and nodes.
+    /// Must be called exactly once before the harness is dropped.
+    pub fn finish(&self) {
+        self.finished.set(true);
+        if let Some(reason) = &self.skip_reason {
+            eprintln!("ScenarioHarness: skipping replay invariants — {}", reason);
+            return;
+        }
+        for peer in self.peers.borrow().iter() {
+            verify_projection_invariants(peer);
+        }
+        for node in self.shared_db_nodes.borrow().iter() {
+            node.verify_all_invariants();
+        }
+    }
+}
+
+impl Drop for ScenarioHarness<'_> {
+    fn drop(&mut self) {
+        if !self.finished.get() && !std::thread::panicking() {
+            panic!("ScenarioHarness::finish() was never called! Add harness.finish() at the end of the test.");
+        }
+    }
+}
+
 /// Assert that no cross-tenant leakage exists in the shared database.
 ///
 /// `tenant_workspaces` is a list of (peer_id, workspace_id) pairs. Checks:
