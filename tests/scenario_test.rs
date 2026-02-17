@@ -3217,7 +3217,7 @@ async fn test_mdns_two_peers_discover_and_sync() {
     let _b_handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all().build().unwrap();
-        rt.block_on(async { let _ = connect_loop(&b_db, &b_id, ep_b, remote).await; });
+        rt.block_on(async { let _ = connect_loop(&b_db, &b_id, ep_b, remote, None).await; });
     });
 
     // Wait for sync convergence using marker events
@@ -3389,7 +3389,7 @@ async fn test_mdns_multitenant_self_filtering_and_sync() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all().build().unwrap();
         rt.block_on(async {
-            let _ = connect_loop(&ext_db, &ext_identity, ep_ext, t0_connect_addr).await;
+            let _ = connect_loop(&ext_db, &ext_identity, ep_ext, t0_connect_addr, None).await;
         });
     });
 
@@ -3404,6 +3404,179 @@ async fn test_mdns_multitenant_self_filtering_and_sync() {
     drop(disc_t1);
     drop(disc_ext);
 
+    harness.finish();
+}
+
+/// Regression: per-tenant outbound cert identity.
+///
+/// When `connect_with(workspace_client_config)` is used, the remote server
+/// should see the tenant's cert, not the endpoint's default cert.
+///
+/// Before the fix, `connect()` would present the default cert (first tenant's),
+/// causing the server to see the wrong identity for multi-tenant outbound dials.
+#[tokio::test]
+async fn test_connect_with_presents_correct_tenant_cert() {
+    use poc_7::transport::{
+        create_single_port_endpoint, create_dual_endpoint, generate_self_signed_cert,
+        workspace_client_config, multi_workspace::WorkspaceCertResolver,
+    };
+
+    let harness = ScenarioHarness::new();
+
+    // Create two identities: "default" (first tenant) and "actual" (second tenant).
+    let (default_cert, default_key) = generate_self_signed_cert().unwrap();
+
+    let (actual_cert, actual_key) = generate_self_signed_cert().unwrap();
+    let actual_fp = extract_spki_fingerprint(actual_cert.as_ref()).unwrap();
+
+    // Server: dual endpoint that trusts only "actual" tenant, NOT "default"
+    let (server_cert, server_key) = generate_self_signed_cert().unwrap();
+    let server_fp = extract_spki_fingerprint(server_cert.as_ref()).unwrap();
+    let server_allowed = Arc::new(AllowedPeers::from_fingerprints(vec![actual_fp]));
+    let server_ep = create_dual_endpoint(
+        "127.0.0.1:0".parse().unwrap(),
+        server_cert.clone(),
+        server_key.clone_key(),
+        server_allowed,
+    ).unwrap();
+    let server_addr = server_ep.local_addr().unwrap();
+
+    // Spawn server accept
+    let server_ep_clone = server_ep.clone();
+    let server_accept = tokio::spawn(async move {
+        let incoming = server_ep_clone.accept().await;
+        match incoming {
+            Some(inc) => inc.await.ok(),
+            None => None,
+        }
+    });
+
+    // Client endpoint: default cert is "default" (the wrong one for this test)
+    let allow_server: Arc<poc_7::transport::DynamicAllowFn> = Arc::new(move |fp: &[u8; 32]| {
+        Ok(*fp == server_fp)
+    });
+    let resolver = WorkspaceCertResolver::new();
+    let client_ep = create_single_port_endpoint(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(resolver),
+        allow_server.clone(),
+        default_cert.clone(),
+        default_key.clone_key(),
+    ).unwrap();
+
+    // Build per-tenant client config for "actual" tenant (correct cert + trust)
+    let sfp = server_fp;
+    let tenant_config = workspace_client_config(
+        actual_cert.clone(),
+        actual_key.clone_key(),
+        Arc::new(move |fp: &[u8; 32]| Ok(*fp == sfp)),
+    ).unwrap();
+
+    // connect_with: should present "actual" cert → server accepts
+    let conn = client_ep
+        .connect_with(tenant_config, server_addr, "localhost")
+        .unwrap()
+        .await
+        .expect("connect_with should succeed: server trusts actual tenant cert");
+
+    // Server side: verify the client presented "actual" cert identity
+    let server_conn = server_accept.await.unwrap().expect("server should have accepted");
+    let server_saw_peer = peer_identity_from_connection(&server_conn)
+        .expect("server should see client cert identity");
+    assert_eq!(
+        server_saw_peer, hex::encode(actual_fp),
+        "server should see the actual tenant's identity, not the default"
+    );
+
+    // Key regression property: before the fix, connect_with did not exist in
+    // the outbound path — connect() would be used, presenting default_cert
+    // instead of actual_cert. The server (which only trusts actual_fp) would
+    // have rejected the handshake, making the test fail at the connect_with
+    // assertion above.
+
+    drop(conn);
+    drop(server_ep);
+    drop(client_ep);
+    harness.finish();
+}
+
+/// Regression: tenant-scoped outbound trust rejects untrusted servers.
+///
+/// When `workspace_client_config` is built with trust for peer A only,
+/// connecting to peer B should fail (client rejects server cert).
+///
+/// Before the fix, the union-scoped trust check would accept ANY tenant's
+/// trusted peer, allowing cross-tenant trust bleed on outbound connections.
+#[tokio::test]
+async fn test_tenant_scoped_outbound_trust_rejects_untrusted_server() {
+    use poc_7::transport::{
+        generate_self_signed_cert,
+        workspace_client_config, create_dual_endpoint,
+    };
+
+    let harness = ScenarioHarness::new();
+
+    // Create client and two servers
+    let (client_cert, client_key) = generate_self_signed_cert().unwrap();
+    let client_fp = extract_spki_fingerprint(client_cert.as_ref()).unwrap();
+
+    let (trusted_cert, trusted_key) = generate_self_signed_cert().unwrap();
+    let trusted_fp = extract_spki_fingerprint(trusted_cert.as_ref()).unwrap();
+
+    let (untrusted_cert, untrusted_key) = generate_self_signed_cert().unwrap();
+
+    // Both servers trust the client (will accept its cert)
+    let client_allowed = Arc::new(AllowedPeers::from_fingerprints(vec![client_fp]));
+    let trusted_ep = create_dual_endpoint(
+        "127.0.0.1:0".parse().unwrap(),
+        trusted_cert.clone(), trusted_key.clone_key(),
+        client_allowed.clone(),
+    ).unwrap();
+    let trusted_addr = trusted_ep.local_addr().unwrap();
+
+    let untrusted_ep = create_dual_endpoint(
+        "127.0.0.1:0".parse().unwrap(),
+        untrusted_cert.clone(), untrusted_key.clone_key(),
+        client_allowed,
+    ).unwrap();
+    let untrusted_addr = untrusted_ep.local_addr().unwrap();
+
+    // Client: create endpoint + tenant config that ONLY trusts "trusted_server"
+    let client_ep = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    let tenant_trust: Arc<poc_7::transport::DynamicAllowFn> = Arc::new(move |fp: &[u8; 32]| {
+        Ok(*fp == trusted_fp) // only trusts the trusted server
+    });
+    let tenant_config = workspace_client_config(
+        client_cert.clone(), client_key.clone_key(), tenant_trust,
+    ).unwrap();
+
+    // Spawn accept on both servers
+    let te = trusted_ep.clone();
+    tokio::spawn(async move { if let Some(inc) = te.accept().await { let _ = inc.await; } });
+    let ue = untrusted_ep.clone();
+    tokio::spawn(async move { if let Some(inc) = ue.accept().await { let _ = inc.await; } });
+
+    // Connect to trusted server → should succeed
+    let good_conn = client_ep
+        .connect_with(tenant_config.clone(), trusted_addr, "localhost")
+        .unwrap()
+        .await;
+    assert!(good_conn.is_ok(), "should succeed: client trusts this server");
+
+    // Connect to untrusted server → should fail (client rejects server cert)
+    let bad_conn = client_ep
+        .connect_with(tenant_config, untrusted_addr, "localhost")
+        .unwrap()
+        .await;
+    assert!(
+        bad_conn.is_err(),
+        "should fail: client does NOT trust this server (tenant-scoped trust)"
+    );
+
+    drop(good_conn);
+    drop(trusted_ep);
+    drop(untrusted_ep);
+    drop(client_ep);
     harness.finish();
 }
 

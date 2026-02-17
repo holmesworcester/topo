@@ -14,7 +14,7 @@
 //! via mDNS and auto-connects to discovered remote peers.
 
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -70,18 +70,21 @@ use crate::sync::engine::{IngestItem, accept_loop_with_ingest, batch_writer};
 use crate::transport::{
     create_single_port_endpoint, extract_spki_fingerprint,
     multi_workspace::{WorkspaceCertResolver, workspace_sni},
+    workspace_client_config, DynamicAllowFn,
 };
 use rustls::sign::CertifiedKey;
 
-/// Run the multi-tenant node.
+/// Run the sync node.
 ///
 /// Discovers all local identities from the DB, verifies their SPKI fingerprints,
 /// builds a single QUIC endpoint with multi-workspace cert resolver, and runs
-/// a single accept loop sharing a batch_writer thread. With `discovery` feature,
+/// a single accept loop sharing a batch_writer thread. If `connect` is provided,
+/// also spawns a connect_loop to the specified peer. With `discovery` feature,
 /// also advertises via mDNS and auto-connects to discovered peers.
 pub async fn run_node(
     db_path: &str,
-    bind_ip: IpAddr,
+    bind: SocketAddr,
+    connect: Option<SocketAddr>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let db = open_connection(db_path)?;
     create_tables(&db)?;
@@ -167,7 +170,8 @@ pub async fn run_node(
     let (default_cert_der, default_key_der) = default_cert
         .ok_or("No valid tenant certs found")?;
 
-    // Union trust closure: checks across ALL tenants
+    // Union trust closure for inbound (server) connections: accept if ANY tenant trusts
+    // the remote. Per-tenant outbound trust is handled by tenant_client_configs below.
     let db_path_trust = db_path.to_string();
     let tenant_peer_ids: Vec<String> = tenants.iter().map(|t| t.peer_id.clone()).collect();
     let dynamic_allow: Arc<
@@ -184,22 +188,39 @@ pub async fn run_node(
         Ok(false)
     });
 
-    // Create single QUIC endpoint with auto-assigned port
-    let bind_addr = std::net::SocketAddr::new(bind_ip, 0);
+    // Create single QUIC endpoint
     let endpoint = create_single_port_endpoint(
-        bind_addr,
+        bind,
         Arc::new(cert_resolver),
         dynamic_allow,
         default_cert_der,
         default_key_der,
     )?;
 
-    let local_addr = endpoint.local_addr().unwrap_or(bind_addr);
+    let local_addr = endpoint.local_addr().unwrap_or(bind);
     info!(
         "Node listening on {} ({} workspace(s))",
         local_addr,
         tenants.len()
     );
+
+    // Per-tenant outbound client configs: each presents the tenant's own cert
+    // and verifies remote peers against that tenant's trust set only.
+    let mut tenant_client_configs: HashMap<String, quinn::ClientConfig> = HashMap::new();
+    for tenant in &tenants {
+        let cert_der = rustls::pki_types::CertificateDer::from(tenant.cert_der.clone());
+        let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(tenant.key_der.clone());
+        let db_path_t = db_path.to_string();
+        let tid = tenant.peer_id.clone();
+        let tenant_allow: Arc<DynamicAllowFn> = Arc::new(move |peer_fp: &[u8; 32]| {
+            let db = open_connection(&db_path_t)?;
+            is_peer_allowed(&db, &tid, peer_fp)
+        });
+        match workspace_client_config(cert_der, key_der, tenant_allow) {
+            Ok(cfg) => { tenant_client_configs.insert(tenant.peer_id.clone(), cfg); }
+            Err(e) => warn!("Failed to build client config for {}: {}", &tenant.peer_id[..16], e),
+        }
+    }
 
     // Shared batch_writer: single writer thread for all tenants.
     let ingest_cap = if tenants.len() > 1 { 10000 } else { 5000 };
@@ -219,6 +240,9 @@ pub async fn run_node(
     #[cfg(feature = "discovery")]
     {
         let actual_port = local_addr.port();
+        // Skip mDNS auto-connect to the explicit --connect target to avoid
+        // duplicate connections (POC replacement policy: no dual paths).
+        let explicit_connect_addr = connect;
         for tenant in &tenants {
             match crate::discovery::TenantDiscovery::new(
                 &tenant.peer_id,
@@ -231,9 +255,23 @@ pub async fn run_node(
                             let ep_clone = endpoint.clone();
                             let db_path_disc = db_path.to_string();
                             let tenant_id = tenant.peer_id.clone();
+                            let disc_client_cfg = match tenant_client_configs.get(&tenant.peer_id).cloned() {
+                                Some(c) => c,
+                                None => {
+                                    warn!("Skipping mDNS browse for {}: no client config", &tenant.peer_id[..16]);
+                                    _discovery_handles.push(disc);
+                                    continue;
+                                }
+                            };
                             std::thread::spawn(move || {
                                 let mut dispatcher = PeerDispatcher::new();
                                 while let Ok(peer) = rx.recv() {
+                                    // Skip if this is the explicit --connect target
+                                    if let Some(explicit) = explicit_connect_addr {
+                                        if peer.addr == explicit {
+                                            continue;
+                                        }
+                                    }
                                     let (action, cancel_rx) = dispatcher.dispatch(&peer.peer_id, peer.addr);
                                     match action {
                                         DiscoveryAction::Skip => continue,
@@ -258,6 +296,7 @@ pub async fn run_node(
                                     let ep = ep_clone.clone();
                                     let db = db_path_disc.clone();
                                     let tid = tenant_id.clone();
+                                    let cfg = Some(disc_client_cfg.clone());
                                     std::thread::spawn(move || {
                                         let rt = tokio::runtime::Builder::new_current_thread()
                                             .enable_all()
@@ -266,7 +305,7 @@ pub async fn run_node(
                                         rt.block_on(async move {
                                             tokio::select! {
                                                 _ = crate::sync::engine::connect_loop(
-                                                    &db, &tid, ep, peer.addr,
+                                                    &db, &tid, ep, peer.addr, cfg,
                                                 ) => {}
                                                 _ = cancel.changed() => {}
                                             }
@@ -284,12 +323,16 @@ pub async fn run_node(
         }
     }
 
+    // Clone endpoint before moving into accept thread (needed for connect_loop).
+    let connect_endpoint = endpoint.clone();
+
     // Single accept loop for all workspaces.
     // Post-handshake, each connection is routed to the tenant that trusts
     // the remote peer's SPKI fingerprint.
     let all_tenant_ids: Vec<String> = tenants.iter().map(|t| t.peer_id.clone()).collect();
     let db_path_owned = db_path.to_string();
     let ingest_tx = shared_tx.clone();
+    let accept_configs = tenant_client_configs.clone();
     let accept_handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -302,6 +345,7 @@ pub async fn run_node(
                 endpoint,
                 None,
                 ingest_tx,
+                accept_configs,
             )
             .await
             {
@@ -310,13 +354,43 @@ pub async fn run_node(
         });
     });
 
+    // Explicit --connect target: spawn connect_loop for each tenant.
+    // Skip tenants that failed client config creation (fail-closed: no outbound
+    // with wrong cert/trust).
+    if let Some(remote) = connect {
+        for tenant in &tenants {
+            let cfg = match tenant_client_configs.get(&tenant.peer_id).cloned() {
+                Some(c) => c,
+                None => {
+                    warn!("Skipping outbound connect for {}: no client config", &tenant.peer_id[..16]);
+                    continue;
+                }
+            };
+            let ep = connect_endpoint.clone();
+            let db = db_path.to_string();
+            let tid = tenant.peer_id.clone();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async move {
+                    if let Err(e) = crate::sync::engine::connect_loop(&db, &tid, ep, remote, Some(cfg)).await
+                    {
+                        warn!("connect_loop for {} exited: {}", &tid[..16], e);
+                    }
+                });
+            });
+        }
+    }
+
     // Drop our copy so writer exits when all accept loops drop theirs
     drop(shared_tx);
 
     // Wait for Ctrl-C
     tokio::signal::ctrl_c().await?;
     info!(
-        "Shutting down node ({} events received)",
+        "Shutting down ({} events received)",
         events_received.load(Ordering::Relaxed)
     );
 

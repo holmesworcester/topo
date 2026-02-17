@@ -35,10 +35,10 @@ pub fn load_local_creds(
     }
 }
 
-/// Load the sole local transport credentials (for single-tenant use).
+/// Load the sole local transport credentials.
 /// Returns (peer_id, cert_der, key_der) if exactly one exists.
 /// Returns None if no credentials exist.
-/// Errors if multiple credentials exist (ambiguous — use node mode or specify peer_id).
+/// Errors if multiple credentials exist (ambiguous — multi-tenant is handled automatically by run_node).
 pub fn load_sole_local_creds(
     conn: &Connection,
 ) -> Result<Option<(String, Vec<u8>, Vec<u8>)>, Box<dyn std::error::Error + Send + Sync>> {
@@ -52,7 +52,7 @@ pub fn load_sole_local_creds(
     }
     if count > 1 {
         return Err(format!(
-            "Multiple local identities found ({}). Use --node mode for multi-tenant operation.",
+            "Multiple local identities found ({}). Multi-tenant is handled automatically.",
             count
         ).into());
     }

@@ -1101,7 +1101,7 @@ pub async fn accept_loop(
     });
 
     let tenant_ids = vec![recorded_by.to_string()];
-    accept_loop_with_ingest(db_path, &tenant_ids, endpoint, None, shared_ingest_tx).await
+    accept_loop_with_ingest(db_path, &tenant_ids, endpoint, None, shared_ingest_tx, std::collections::HashMap::new()).await
 }
 
 /// Accept incoming connections using an externally-provided ingest channel.
@@ -1119,6 +1119,7 @@ pub async fn accept_loop_with_ingest(
     endpoint: quinn::Endpoint,
     _allowed_peers: Option<crate::transport::AllowedPeers>,
     shared_ingest_tx: mpsc::Sender<IngestItem>,
+    tenant_client_configs: std::collections::HashMap<String, quinn::ClientConfig>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     {
         let db = open_connection(db_path)?;
@@ -1225,6 +1226,7 @@ pub async fn accept_loop_with_ingest(
         let recorded_by_owned = recorded_by;
         let ingest_clone = shared_ingest_tx.clone();
         let intro_endpoint = endpoint.clone();
+        let intro_client_cfg = tenant_client_configs.get(&recorded_by_owned).cloned();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -1239,6 +1241,7 @@ pub async fn accept_loop_with_ingest(
                     recorded_by_owned.clone(),
                     peer_id.clone(),
                     intro_endpoint,
+                    intro_client_cfg,
                 );
 
                 loop {
@@ -1301,11 +1304,15 @@ fn resolve_tenant_for_peer(
 ///
 /// Outer loop reconnects on connection drop. Inner loop runs repeated
 /// sync sessions on the same connection.
+///
+/// When `client_config` is `Some`, outbound dials use `endpoint.connect_with()`
+/// to present the correct per-tenant cert and tenant-scoped trust.
 pub async fn connect_loop(
     db_path: &str,
     recorded_by: &str,
     endpoint: quinn::Endpoint,
     remote: SocketAddr,
+    client_config: Option<quinn::ClientConfig>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     {
         let db = open_connection(db_path)?;
@@ -1336,7 +1343,7 @@ pub async fn connect_loop(
     // Use LocalSet so the intro listener (spawn_intro_listener uses spawn_local)
     // can run on the same runtime that drives the endpoint I/O.
     let local = tokio::task::LocalSet::new();
-    local.run_until(connect_loop_inner(db_path, recorded_by, endpoint, remote)).await
+    local.run_until(connect_loop_inner(db_path, recorded_by, endpoint, remote, client_config)).await
 }
 
 async fn connect_loop_inner(
@@ -1344,6 +1351,7 @@ async fn connect_loop_inner(
     recorded_by: &str,
     endpoint: quinn::Endpoint,
     remote: SocketAddr,
+    client_config: Option<quinn::ClientConfig>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Look up workspace SNI for this tenant (falls back to "localhost" if no trust anchor)
     let sni = {
@@ -1358,7 +1366,11 @@ async fn connect_loop_inner(
 
     loop {
         info!("Connecting to {}...", remote);
-        let connection = match endpoint.connect(remote, &sni) {
+        let connection = match if let Some(ref cfg) = client_config {
+            endpoint.connect_with(cfg.clone(), remote, &sni)
+        } else {
+            endpoint.connect(remote, &sni)
+        } {
             Ok(connecting) => match connecting.await {
                 Ok(c) => c,
                 Err(e) => {
@@ -1419,6 +1431,7 @@ async fn connect_loop_inner(
             recorded_by.to_string(),
             peer_id.clone(),
             endpoint.clone(),
+            client_config.clone(),
         );
 
         // Inner loop: repeated sync sessions on this connection

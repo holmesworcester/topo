@@ -333,8 +333,8 @@ fn test_cli_sync_without_trust_fails() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("No trusted peers") || stderr.contains("invite"),
-        "error should mention trusted peers or invite, got: {}",
+        stderr.contains("No local identities"),
+        "error should mention missing identities, got: {}",
         stderr
     );
 }

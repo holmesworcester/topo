@@ -111,7 +111,7 @@ async fn test_three_peer_intro_happy_path() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all().build().unwrap();
         rt.block_on(async move {
-            let _ = connect_loop(&a_db1, &a_id1, a_ep1, addr_i).await;
+            let _ = connect_loop(&a_db1, &a_id1, a_ep1, addr_i, None).await;
         });
     });
 
@@ -122,7 +122,7 @@ async fn test_three_peer_intro_happy_path() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all().build().unwrap();
         rt.block_on(async move {
-            let _ = connect_loop(&b_db1, &b_id1, b_ep1, addr_i).await;
+            let _ = connect_loop(&b_db1, &b_id1, b_ep1, addr_i, None).await;
         });
     });
 
