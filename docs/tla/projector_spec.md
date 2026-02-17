@@ -262,6 +262,9 @@ The following parser-level canonicalization guarantees are enforced in Rust but 
 | InvRemovalAdmin | test_removal_enforcement: removal requires admin context |
 | InvAllValidRequireWorkspace | test_bootstrap_sequence: non-local events require workspace valid |
 | InvMessageWorkspace | Message projection requires workspace (workspace_event_id dep) |
+| InvEncryptedKey | Encrypted content requires valid secret_key dependency |
+| InvSecretSharedKey | SecretShared requires valid secret_key dependency |
+| InvFileSliceAuth | FileSlice and MessageAttachment for the same file must share the same signer |
 | InvRemovalExclusion | project_secret_shared: reject if recipient removed |
 
 ## Transport Credential Lifecycle (TransportCredentialLifecycle.tla)
@@ -285,6 +288,16 @@ abstracting over the event graph.
 | InvMutualAuthSymmetry | Mutual CanAuthenticate requires both peers have active credentials |
 
 ## TLA Verification Notes
+
+### Trust source supersession model drift (2026-02-17)
+
+The TLA+ models (`EventGraphSchema.tla`, `TransportCredentialLifecycle.tla`) still
+use `...ConsumedByTransportKey` invariant names and include `TransportKeyTrustSet`
+in the `TrustedPeerSet` definition. The Rust implementation and this mapping document
+use `...ConsumedByPeerShared` semantics (bootstrap trust is consumed when PeerShared-derived
+SPKI trust appears, not transport_key trust). The TLA+ models need updating once the
+transport identity architecture is finalized (TODO 11). Until then, the mapping rows
+in this document reflect the target/implemented semantics, not the current TLA+ model text.
 
 ### collapse-encrypted-inner refactor (2026-02-16)
 

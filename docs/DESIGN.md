@@ -308,7 +308,7 @@ The single QUIC endpoint uses a union trust closure that accepts connections tru
 - `invite_bootstrap_trust` rows (accepted invite-link bootstrap, TTL-bounded),
 - `pending_invite_bootstrap_trust` rows (inviter-side pre-handshake, TTL-bounded).
 
-Trust sets are **tenant-scoped** (`recorded_by`-partitioned). Tenants in different workspaces have operationally disjoint trust because their `recorded_by` values differ, though the union closure permits the shared endpoint to accept connections for any tenant. (`trust_anchors` is used only for tenant discovery at startup, not for per-connection verification.)
+Trust checks are **tenant-scoped** (`recorded_by`-partitioned). Value-level trust-set overlap is allowed (the same SPKI may appear in multiple tenants' trust rows), and the union closure permits the shared endpoint to accept connections for any local tenant. (`trust_anchors` is used only for tenant discovery at startup, not for per-connection verification.)
 
 ### Removal-driven session teardown
 
@@ -562,7 +562,7 @@ Operational queues:
 
 1. `project_queue(peer_id, event_id, available_at, attempts, lease_until)`,
 2. `egress_queue(connection_id, frame_type, event_id, payload, attempts, lease_until, sent_at, dedupe_key)`,
-3. `ingress_queue` exists in schema as reserved compatibility/diagnostic staging, but current runtime ingest does not enqueue/dequeue through it.
+3. `ingress_queue` exists in schema as reserved future diagnostic staging, but current runtime ingest does not enqueue/dequeue through it.
 
 Canonical tables and queue tables stay separate.
 
@@ -788,9 +788,9 @@ No historical re-encryption or key history backfill is required in this baseline
 
 ## 9.5 Transport credential lifecycle model
 
-This section covers the lifecycle state machine for the three trust sources defined in section 2.2 (`transport_keys`, `invite_bootstrap_trust`, `pending_invite_bootstrap_trust`).
+This section covers the lifecycle state machine for the trust sources defined in section 2.2 (PeerShared-derived SPKIs, `invite_bootstrap_trust`, `pending_invite_bootstrap_trust`). `transport_keys` rows remain as a legacy/transitional trust source but are non-authoritative; see `docs/tla/projector_spec.md` for details.
 
-Supersession: when steady-state `transport_keys` trust appears for a peer, matching `invite_bootstrap_trust` and `pending_invite_bootstrap_trust` entries are automatically consumed. Bootstrap and steady-state trust for the same peer never coexist.
+Supersession: when steady-state PeerShared-derived trust appears for a peer, matching `invite_bootstrap_trust` and `pending_invite_bootstrap_trust` entries are automatically consumed. Bootstrap and steady-state trust for the same peer never coexist.
 
 TTL expiry: bootstrap trust rows are time-bounded. Unconsumed entries expire and are purged.
 
@@ -802,8 +802,8 @@ TLC-verified invariants (from `TransportCredentialLifecycle.tla`, mapped to Rust
 3. `InvActiveCredNotRevoked`,
 4. `InvSPKIUniqueness`,
 5. `InvActiveCredGloballyUnique`,
-6. `InvBootstrapConsumedByTransportKey`,
-7. `InvPendingConsumedByTransportKey`,
+6. `InvBootstrapConsumedByPeerShared`,
+7. `InvPendingConsumedByPeerShared`,
 8. `InvTrustSetIsExactUnion`,
 9. `InvTrustSourcesWellFormed`,
 10. `InvRevokedNotInBootstrapTrust`,
