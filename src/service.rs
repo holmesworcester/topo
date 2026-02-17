@@ -13,7 +13,7 @@ use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
 use crate::db::{
     open_connection,
     schema::create_tables,
-    transport_trust::{allowed_peers_combined, is_peer_allowed},
+    transport_trust::{allowed_peers_combined, has_any_trust_combined, is_peer_allowed, trust_source_count},
 };
 use crate::events::{
     DeviceInviteFirstEvent, InviteAcceptedEvent, MessageDeletionEvent, MessageEvent, ParsedEvent,
@@ -989,18 +989,17 @@ pub async fn svc_sync(
     let cli_pins = AllowedPeers::from_hex_strings(pin_peers)?;
     {
         let db = open_connection(db_path)?;
-        let combined = allowed_peers_combined(&db, &recorded_by, &cli_pins)?;
-        if combined.is_empty() {
+        if !has_any_trust_combined(&db, &recorded_by, &cli_pins)? {
             return Err("No allowed peers: provide --pin-peer for bootstrap, accept an invite link, or ensure identity events have synced. \
                 Use `poc-7 transport-identity --db <peer-db>` to get a peer's fingerprint.".into());
         }
         let cli_count = cli_pins.len();
-        let total = combined.len();
-        if total > cli_count {
+        let sql_count = trust_source_count(&db, &recorded_by)?;
+        if sql_count > 0 {
             info!(
                 "Trust sources: {} from CLI pins, {} from SQL trust rows",
                 cli_count,
-                total - cli_count
+                sql_count
             );
         }
     }

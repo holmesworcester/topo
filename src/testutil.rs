@@ -748,6 +748,29 @@ impl Peer {
             .expect("failed to create transport_key")
     }
 
+    /// Seed the `transport_keys` table with `count` synthetic SPKI fingerprints.
+    /// Used to test large trust-set behavior without creating full TransportKey events.
+    /// Returns the list of seeded fingerprints.
+    pub fn seed_transport_keys(&self, count: usize) -> Vec<[u8; 32]> {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        db.execute("BEGIN", []).expect("failed to begin");
+        let mut fps = Vec::with_capacity(count);
+        for i in 0..count {
+            let mut fp = [0u8; 32];
+            // Deterministic fingerprint from index
+            let bytes = (i as u64).to_le_bytes();
+            fp[..8].copy_from_slice(&bytes);
+            fp[8] = 0xFE; // sentinel to distinguish from real fingerprints
+            fps.push(fp);
+            db.execute(
+                "INSERT OR IGNORE INTO transport_keys (recorded_by, event_id, spki_fingerprint) VALUES (?1, ?2, ?3)",
+                rusqlite::params![&self.identity, format!("synthetic_tk_{}", i), fp.as_slice()],
+            ).expect("failed to insert transport_key");
+        }
+        db.execute("COMMIT", []).expect("failed to commit");
+        fps
+    }
+
     /// Create multiple messages. Uses a transaction for speed at scale.
     /// Requires identity chain.
     pub fn batch_create_messages(&self, count: usize) {

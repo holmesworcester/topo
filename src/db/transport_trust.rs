@@ -266,6 +266,80 @@ pub fn allowed_peers_combined(
     Ok(cli_pins.union(&db_peers))
 }
 
+/// Check whether any SQL-based trust source exists for this tenant.
+/// Does NOT materialize the full trust set — uses SQL EXISTS for O(1) memory.
+pub fn has_any_trust(
+    conn: &Connection,
+    recorded_by: &str,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    supersede_pending_bootstrap_if_steady_trust_exists(conn, recorded_by)?;
+    supersede_accepted_bootstrap_if_steady_trust_exists(conn, recorded_by)?;
+    let now = now_ms_i64();
+    let exists: bool = conn.query_row(
+        "SELECT
+            EXISTS(SELECT 1 FROM transport_keys WHERE recorded_by = ?1)
+            OR EXISTS(
+                SELECT 1 FROM invite_bootstrap_trust
+                 WHERE recorded_by = ?1
+                   AND superseded_at IS NULL
+                   AND expires_at > ?2
+            )
+            OR EXISTS(
+                SELECT 1 FROM pending_invite_bootstrap_trust
+                 WHERE recorded_by = ?1
+                   AND superseded_at IS NULL
+                   AND expires_at > ?2
+            )",
+        rusqlite::params![recorded_by, now],
+        |row| row.get(0),
+    )?;
+    Ok(exists)
+}
+
+/// Check whether any trust source exists, including CLI pins.
+/// Does NOT materialize the full trust set.
+pub fn has_any_trust_combined(
+    conn: &Connection,
+    recorded_by: &str,
+    cli_pins: &AllowedPeers,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    if !cli_pins.is_empty() {
+        return Ok(true);
+    }
+    has_any_trust(conn, recorded_by)
+}
+
+/// Count SQL-based trust sources for this tenant.
+/// Uses SQL COUNT — does not load fingerprints into memory.
+pub fn trust_source_count(
+    conn: &Connection,
+    recorded_by: &str,
+) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    supersede_pending_bootstrap_if_steady_trust_exists(conn, recorded_by)?;
+    supersede_accepted_bootstrap_if_steady_trust_exists(conn, recorded_by)?;
+    let now = now_ms_i64();
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM (
+            SELECT DISTINCT spki_fingerprint FROM transport_keys WHERE recorded_by = ?1
+            UNION
+            SELECT DISTINCT bootstrap_spki_fingerprint
+              FROM invite_bootstrap_trust
+             WHERE recorded_by = ?1
+               AND superseded_at IS NULL
+               AND expires_at > ?2
+            UNION
+            SELECT DISTINCT expected_bootstrap_spki_fingerprint
+              FROM pending_invite_bootstrap_trust
+             WHERE recorded_by = ?1
+               AND superseded_at IS NULL
+               AND expires_at > ?2
+        )",
+        rusqlite::params![recorded_by, now],
+        |row| row.get(0),
+    )?;
+    Ok(count as usize)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
