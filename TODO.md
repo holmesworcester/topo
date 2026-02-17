@@ -55,7 +55,7 @@ Realism-first rule for ordering: finish test-fidelity items up front (copying ev
 17. ~~`P1: Remove duplicated command/business logic between CLI (main.rs) and service layer (service.rs)`~~ **DONE**: core CLI command flows route through service-layer APIs; remaining REPL-specific cleanup is tracked separately in item 21.
 18. ~~`P1: Eliminate direct SQL access in CLI command paths where module APIs already exist`~~ **DONE (CLI)**: direct SQL was removed from standard CLI command paths; remaining REPL/internal helper SQL cleanup is tracked under item 21.
 19. ~~`P1: Reconcile TLA/spec mapping docs with PLAN and implemented projector semantics`~~ **DONE**: event-registry/dependency mapping rows refreshed; transport-credential lifecycle naming/model terms unified with item 11 architecture. TLC checks green for all models. No known stale mapping rows remain.
-20. ~~`P2: Remove residual compatibility cruft from active schema/docs/runtime surfaces`~~ **DONE**: `ingress_queue` removed from DESIGN queue listing and `rename_peer` loop (schema-only, no runtime path); migration 12 no-op comment removed; migration 20 duplicate name fixed; `legacy_cli_*` tests renamed to `cli_direct_*`; "backward compat parsing" comment removed from scenario test; PLAN.md references updated.
+20. ~~`P2: Remove residual compatibility cruft from active schema/docs/runtime surfaces`~~ **DONE**: `ingress_queue` removed from DESIGN queue listing, removed from `rename_peer` loop, and dropped from schema in migration 28 (unused, no runtime path); migration 12 no-op comment removed; migration 20 duplicate name fixed; `legacy_cli_*` tests renamed to `cli_direct_*`; "backward compat parsing" comment removed from scenario test; PLAN.md references updated.
 21. ~~`P1: CLI isomorphism — route remaining interactive commands through service layer`~~ **DONE**: all interactive REPL commands now route through service-layer APIs. Zero direct SQL (`rusqlite::prepare`/`query_row`/`execute`) remains in interactive.rs. New service functions: `svc_message_event_id_by_num_conn`, `svc_deleted_message_ids_conn`, `svc_reactions_for_message_conn`, `svc_remove_user_conn`, `svc_create_invite_conn`, `svc_create_device_link_invite_conn`. REPL retains only UX affordances (numeric aliases, author name display, channel labels).
 22. ~~`P2: Single-port multi-tenant endpoint — share one UDP port across tenants on the same device`~~ **DONE**: node now runs a single shared QUIC endpoint with multi-workspace cert resolution and per-tenant outbound isolation checks.
 
@@ -490,14 +490,15 @@ Acceptance:
 
 Completed:
 
-1. `ingress_queue` removed from DESIGN.md operational queue listing (schema-only, zero runtime readers/writers).
+1. `ingress_queue` removed from DESIGN.md operational queue listing.
 2. `ingress_queue` removed from `rename_peer` loop in `src/db/mod.rs` and from `excluded_tables` in testutil.rs.
-3. Migration 12 no-op comment ("Historical no-op kept to preserve migration numbering") removed.
-4. Migration 20 name fixed from duplicate `add_intro_attempts` to `add_intro_attempts_index`.
-5. `legacy_cli_send_and_status` / `legacy_cli_assert_now` renamed to `cli_direct_send_and_status` / `cli_direct_assert_now` with section header updated to "Direct CLI commands".
-6. "backward compat parsing" comment removed from `test_transport_key_projects_without_auto_binding`.
-7. PLAN.md references updated: `ingress_queue` described as "schema-only (not wired)".
-8. Earlier round: `drop_retired_compat_tables` → `drop_retired_tables`, cert-resolver fallback comments updated, `test_legacy_peer_key_blob_rejected` → `test_retired_type3_peer_key_blob_rejected`.
+3. `ingress_queue` dropped from active schema via migration 28 (`drop_unused_ingress_queue`).
+4. Migration 12 no-op comment ("Historical no-op kept to preserve migration numbering") removed.
+5. Migration 20 name fixed from duplicate `add_intro_attempts` to `add_intro_attempts_index`.
+6. `legacy_cli_send_and_status` / `legacy_cli_assert_now` renamed to `cli_direct_send_and_status` / `cli_direct_assert_now` with section header updated to "Direct CLI commands".
+7. "backward compat parsing" comment removed from `test_transport_key_projects_without_auto_binding`.
+8. PLAN.md references updated to remove active `ingress_queue` usage and note removal.
+9. Earlier round: `drop_retired_compat_tables` → `drop_retired_tables`, cert-resolver fallback comments updated, `test_legacy_peer_key_blob_rejected` → `test_retired_type3_peer_key_blob_rejected`.
 
 ## ~~P1: Investigate simplification of `project_one`/`project_one_core` split to better match one-path intent~~ DONE
 

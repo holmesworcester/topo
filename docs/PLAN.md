@@ -762,17 +762,6 @@ Add full queue machinery after projection + signer + encryption semantics are st
 ## 8.1 Queue tables
 
 ```sql
-CREATE TABLE ingress_queue (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    peer_id TEXT NOT NULL,
-    from_addr TEXT,
-    received_at INTEGER NOT NULL,
-    frame BLOB NOT NULL,
-    processed INTEGER NOT NULL DEFAULT 0
-);
-CREATE INDEX idx_ingress_unprocessed
-    ON ingress_queue(processed, received_at);
-
 CREATE TABLE project_queue (
     peer_id TEXT NOT NULL,
     event_id TEXT NOT NULL,
@@ -806,7 +795,7 @@ CREATE UNIQUE INDEX idx_egress_dedupe
 Keep canonical and queue data separate:
 - permanent: `events`, `recorded_events`, projection outputs
 - operational/transient: `project_queue`, `blocked_event_deps`, `blocked_events`, `egress_queue`
-- schema-only (not wired): `ingress_queue` (created in migration 5, no runtime writer or reader)
+- removed: `ingress_queue` was dropped in migration 28 because no runtime writer or reader used it
 
 ## 8.2 Why not one generic jobs table
 
@@ -822,8 +811,7 @@ Separate queue tables stay simpler operationally.
 1. `ingest receiver path` (current runtime): QUIC frame -> ingest channel -> transactional canonical insert -> record by tenant -> enqueue project.
 2. `project worker`: claim row -> project path (`valid`/`block`/`reject`) -> dequeue.
 3. `egress worker`: dequeue by `connection_id` -> send frame -> mark `sent_at`/retry.
-4. `cleanup worker`: purge stale ingress rows (if ingress staging is used) and sent egress rows, reclaim expired leases, TTL-purge old endpoint observations.
-5. `ingress_queue` exists in schema only; no active worker or ingest path reads or writes it.
+4. `cleanup worker`: purge sent egress rows, reclaim expired leases, TTL-purge old endpoint observations.
 
 Queue DRY requirement:
 - implement generic queue helper traits/functions once (`claim_batch`, `renew_lease`, `mark_done`, `mark_retry/backoff`).
