@@ -145,6 +145,7 @@ UserInviteEvents == {UserInviteBoot, UserInviteOngoing}
 DeviceInviteEvents == {DeviceInviteFirst, DeviceInviteOngoing}
 InviteEvents == UserInviteEvents \cup DeviceInviteEvents
 AdminEvents == {AdminBoot, AdminOngoing}
+PeerSharedSignerEvents == {PeerSharedFirst, PeerSharedOngoing}
 
 IdentityEvents == {
     InviteAccepted,
@@ -226,11 +227,11 @@ SignerDep(e) ==
     ELSE
     CASE \* user_invite: bootstrap signed by workspace; ongoing signed by admin peer
          e = UserInviteBoot -> {Workspace}
-       [] e = UserInviteOngoing -> {PeerSharedOngoing}
+       [] e = UserInviteOngoing -> PeerSharedSignerEvents
 
        \* device_invite: first signed by user; ongoing signed by linked peer
        [] e = DeviceInviteFirst -> {UserBoot}
-       [] e = DeviceInviteOngoing -> {PeerSharedOngoing}
+       [] e = DeviceInviteOngoing -> PeerSharedSignerEvents
 
        \* user: signed by the user_invite key
        [] e = UserBoot -> {UserInviteBoot}
@@ -242,22 +243,22 @@ SignerDep(e) ==
 
        \* admin: bootstrap signed by workspace; ongoing signed by admin peer
        [] e = AdminBoot -> {Workspace}
-       [] e = AdminOngoing -> {PeerSharedOngoing}
+       [] e = AdminOngoing -> PeerSharedSignerEvents
 
        \* Content: signed by a linked peer
-       [] e = Message -> {PeerSharedOngoing}
-       [] e = MessageReaction -> {PeerSharedOngoing}
-       [] e = MessageDeletion -> {PeerSharedOngoing}
-       [] e = MessageAttachment -> {PeerSharedOngoing}
-       [] e = FileSlice -> {PeerSharedOngoing}
-       [] e = TransportKey -> {PeerSharedOngoing}
+       [] e = Message -> PeerSharedSignerEvents
+       [] e = MessageReaction -> PeerSharedSignerEvents
+       [] e = MessageDeletion -> PeerSharedSignerEvents
+       [] e = MessageAttachment -> PeerSharedSignerEvents
+       [] e = FileSlice -> PeerSharedSignerEvents
+       [] e = TransportKey -> PeerSharedSignerEvents
 
        \* Encryption: secret_shared signed by sender peer
-       [] e = SecretShared -> {PeerSharedOngoing}
+       [] e = SecretShared -> PeerSharedSignerEvents
 
        \* Removal: signed by admin peer
-       [] e = UserRemoved -> {PeerSharedOngoing}
-       [] e = PeerRemoved -> {PeerSharedOngoing}
+       [] e = UserRemoved -> PeerSharedSignerEvents
+       [] e = PeerRemoved -> PeerSharedSignerEvents
 
        [] OTHER -> {}
 

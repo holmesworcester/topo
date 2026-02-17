@@ -54,7 +54,7 @@ Realism-first rule for ordering: finish test-fidelity items up front (copying ev
 16. ~~`P0: Re-impose fixed-length event fields + langsec parser model`~~ **DONE**: canonical event parsers now enforce fixed wire sizes (including encrypted-size-by-inner-type), no canonical parser uses in-event length/count fields, and fixed-layout/no-length guard suites are green (`fixed_layout_tests`, `wire_no_length_fields_guard_test`).
 17. ~~`P1: Remove duplicated command/business logic between CLI (main.rs) and service layer (service.rs)`~~ **DONE**: core CLI command flows route through service-layer APIs; remaining REPL-specific cleanup is tracked separately in item 21.
 18. ~~`P1: Eliminate direct SQL access in CLI command paths where module APIs already exist`~~ **DONE (CLI)**: direct SQL was removed from standard CLI command paths; remaining REPL/internal helper SQL cleanup is tracked under item 21.
-19. `P1: Reconcile TLA/spec mapping docs with PLAN and implemented projector semantics` **PARTIALLY DONE**: event-registry/dependency mapping rows were refreshed to current runtime semantics; remaining open deltas are transport-credential lifecycle naming/model drift (item 11) and EventGraphSchema `InvAllValidRequireWorkspace` model mismatch.
+19. `P1: Reconcile TLA/spec mapping docs with PLAN and implemented projector semantics` **PARTIALLY DONE**: event-registry/dependency mapping rows were refreshed to current runtime semantics, and fast TLC checks are green; remaining open delta is transport-credential lifecycle naming/model drift (item 11).
 20. `P2: Remove residual compatibility cruft from active schema/docs/runtime surfaces` **PARTIALLY DONE**: some stale wording/legacy assumptions were removed; broader runtime/schema cleanup remains.
 21. `P1: CLI isomorphism — route remaining interactive commands through service layer` (send, messages, status, react, delete, users, keys — interactive REPL should be a thin adapter over service functions per PLAN §2.2)
 22. ~~`P2: Single-port multi-tenant endpoint — share one UDP port across tenants on the same device`~~ **DONE**: node now runs a single shared QUIC endpoint with multi-workspace cert resolution and per-tenant outbound isolation checks.
@@ -489,12 +489,10 @@ Status update (2026-02-17):
 
 1. Event-registry and dependency rows were refreshed to match runtime semantics.
 2. Shared encrypted-inner pipeline mapping and rationale were documented.
-3. TLC runs were executed:
-   - `EventGraphSchema` fast config currently fails `InvAllValidRequireWorkspace` (counterexample via `transport_key` path).
+3. TLC runs are green:
+   - `EventGraphSchema` fast config passes.
    - `TransportCredentialLifecycle` fast config passes.
-4. Remaining closure items are:
-   - transport lifecycle naming/model drift tied to item 11,
-   - resolving/redesigning the `InvAllValidRequireWorkspace` expectation in EventGraphSchema.
+4. Remaining closure item is transport lifecycle naming/model drift tied to item 11.
 
 Acceptance (remaining):
 

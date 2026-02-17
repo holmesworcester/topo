@@ -336,9 +336,8 @@ No TLA+ model changes were required because:
 TLC status (run on 2026-02-17):
 
 1. `cd docs/tla && ./tlc event_graph_schema_fast.cfg`:
-   - fails `InvAllValidRequireWorkspace`.
-   - counterexample path includes `transport_key` becoming valid without `workspace` in one-step traces from bootstrap-carried states.
-   - trace file emitted under `docs/tla/EventGraphSchema_TTrace_*.tla`.
+   - passes (no invariant violations).
+   - model was aligned with runtime signer resolution by allowing peer-shared signer deps from both `peer_shared_first` and `peer_shared_ongoing`.
 2. `cd docs/tla && ./tlc TransportCredentialLifecycle transport_credential_lifecycle_fast.cfg`:
    - passes (no invariant violations).
 
