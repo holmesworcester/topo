@@ -40,7 +40,7 @@ Realism-first rule for ordering: finish test-fidelity items up front (copying ev
 2. ~~`P1: Replace prerequisite event copy in Peer::new_in_workspace`~~ **DONE**: `new_in_workspace` now uses real QUIC bootstrap sync via `svc_accept_invite` + temp sync endpoint. No direct `insert_event`/`insert_recorded_event` calls remain in the join path. Joiner DB starts empty (no transport identity); invite-derived identity installed by service layer. Holepunch and scenario tests pass with realistic bootstrap.
 3. ~~`P1: Stop direct SQL trust seeding in CLI invite-bootstrap test`~~ **DONE**: CLI bootstrap tests now use production invite create/accept flow; direct trust-row seed helpers were removed from active CLI test paths.
 4. ~~`P1: Remove manual endpoint observation writes in hole-punch integration test`~~ **DONE**: hole-punch integration now derives endpoint observations from organic sync traffic (no manual endpoint DB seeding in the test flow).
-5. `P2: Align test transport setup with production dynamic trust lookup` **PARTIALLY DONE**: shared test helpers now use dynamic trust lookup (`create_dual_endpoint_dynamic` + SQL trust import) for common sync topologies; remaining static-pinning cases in scenario/hole-punch tests need explicit migration/annotation.
+5. ~~`P2: Align test transport setup with production dynamic trust lookup`~~ **DONE**: realism-sensitive suites use dynamic DB trust lookup helpers; remaining static pinning cases are explicitly annotated as pinning-boundary tests in scenario/hole-punch coverage.
 6. ~~`P1: Deprecate --pin-peer from product code and design after invite-trust maturity`~~ **DONE**: `--pin-peer` removed from product sync CLI/runtime trust authority; residual references are test-plan/archival artifacts only.
 7. ~~`P0: Make scenario replay invariants mandatory by default (opt-out only)`~~ **DONE**: scenario tests now go through mandatory `ScenarioHarness` replay checks unless explicitly skipped.
 8. ~~`P0: Bring scenario invariant harness fully in line with PLAN (fingerprints + full invariant set)`~~ **DONE**: deterministic full-state fingerprint replay checks are now active for forward/idempotent/reverse/shuffled replay paths, with mandatory ScenarioHarness replay verification by default.
@@ -296,22 +296,16 @@ Acceptance:
 1. No direct `record_endpoint_observation` calls in `tests/holepunch_test.rs`.
 2. Intro happy-path still passes end-to-end.
 
-## P2: Align test transport setup with production dynamic trust lookup
+## ~~P2: Align test transport setup with production dynamic trust lookup~~ DONE
 
-Evidence: production dynamic trust is in `src/main.rs:993`-`src/main.rs:997`; test helpers often use static allowlists in `src/testutil.rs:1131` and `tests/holepunch_test.rs:66`.
+Completed:
 
-Problem: many integration helpers construct endpoints with static `AllowedPeers` snapshots, while production sync checks trust from SQL at handshake time.
-
-Fix:
-
-1. Add a test helper endpoint mode that uses dynamic DB trust lookup (`is_peer_allowed`) like `run_sync`.
-2. Migrate realism-sensitive integration tests to this mode.
-3. Keep static pin mode only for explicit pinning-policy tests.
-
-Acceptance:
-
-1. At least one main integration suite (CLI or hole-punch) runs through dynamic trust helper.
-2. Static pin helper remains only where pinning policy itself is the thing under test.
+1. Shared test helpers now use production-matching dynamic trust (`is_peer_allowed`) for common sync topologies:
+   - `src/testutil.rs` dynamic endpoint helpers (`create_dual_endpoint_dynamic` / tenant-scoped lookup).
+2. Realism-sensitive suites run through dynamic trust paths by default.
+3. Residual static pinning coverage is explicitly marked as intentional policy-boundary testing:
+   - `tests/holepunch_test.rs` (stale/untrusted intro boundary cases),
+   - `tests/scenario_test.rs` (tenant cert presentation and tenant-scoped outbound rejection).
 
 ## P1: Deprecate `--pin-peer` from product code and design after invite-trust maturity
 
