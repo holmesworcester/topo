@@ -2155,19 +2155,26 @@ fn test_transport_key_signer_matches_local_key() {
     harness.track(&alice);
     let chain = bootstrap_peer(&alice);
 
-    // Insert a second peers_shared row with a different public key (simulating another
-    // peer in the workspace). This row will have a lower rowid than the local peer's
-    // PeerSharedFirst if we insert it after bootstrap, but the point is that multiple
-    // rows exist and the function must select by public key match, not by rowid.
+    // Create a second *valid* peers_shared chain entry with a different public
+    // key. Use real events (DeviceInviteFirst -> PeerSharedFirst) so replay
+    // invariants remain meaningful.
+    let other_device_invite_key = SigningKey::generate(&mut rand::thread_rng());
+    let other_device_invite_pubkey = other_device_invite_key.verifying_key().to_bytes();
+    let other_device_invite_eid = alice.create_device_invite_first(
+        other_device_invite_pubkey,
+        &chain.user_key,
+        &chain.user_eid,
+    );
     let other_key = SigningKey::generate(&mut rand::thread_rng());
     let other_pubkey = other_key.verifying_key().to_bytes();
-    let db = open_connection(&alice.db_path).unwrap();
-    db.execute(
-        "INSERT INTO peers_shared (recorded_by, event_id, public_key) VALUES (?1, ?2, ?3)",
-        rusqlite::params![&alice.identity, "other_peer_eid", other_pubkey.as_slice()],
-    ).unwrap();
+    let _other_peer_eid = alice.create_peer_shared_first(
+        other_pubkey,
+        &other_device_invite_key,
+        &other_device_invite_eid,
+    );
 
     // Verify we now have 2 peers_shared rows
+    let db = open_connection(&alice.db_path).unwrap();
     let count: i64 = db.query_row(
         "SELECT COUNT(*) FROM peers_shared WHERE recorded_by = ?1",
         rusqlite::params![&alice.identity],
@@ -2185,11 +2192,8 @@ fn test_transport_key_signer_matches_local_key() {
     assert!(result.is_ok(), "ensure_transport_key_event should succeed with correct local key");
     assert!(result.unwrap().is_some(), "should have created a new TransportKey event");
 
-    // Calling with the OTHER key should return None (no matching peers_shared row
-    // with that public key that also has a valid signer chain — the manually inserted
-    // row won't pass signature verification)
-    // Actually, the function returns Ok(None) only for "already exists" or "no peers_shared".
-    // Since we already created one, a second call returns Ok(None) for the existing SPKI.
+    // A second call with the same local key should return None because the
+    // transport-key binding for the local cert SPKI already exists.
     let result2 = ensure_transport_key_event(&db, &alice.identity, &chain.peer_shared_key);
     assert_eq!(result2.unwrap(), None, "second call should return None (already exists)");
 
@@ -2308,7 +2312,12 @@ fn test_invite_accepted_no_prior_invite_required() {
 #[test]
 fn test_trust_anchor_immutability() {
     let alice = Peer::new("alice");
-    let harness = ScenarioHarness::new();
+    // This test intentionally constructs two conflicting InviteAccepted events
+    // and asserts first-write-wins immutability behavior. That policy is
+    // order-dependent under reverse replay, so skip replay-invariant checks.
+    let harness = ScenarioHarness::skip(
+        "conflicting invite_accepted first-write-wins semantics are intentionally order-dependent",
+    );
     harness.track(&alice);
     let db = open_connection(&alice.db_path).unwrap();
 
