@@ -1127,16 +1127,9 @@ fn compute_projection_fingerprint(
 // Replay helpers
 // ---------------------------------------------------------------------------
 
-/// Clear all projection and operational tables for a tenant, then re-project
-/// all recorded events through `project_one` in the given order.
-fn replay_and_fingerprint(
-    db: &rusqlite::Connection,
-    recorded_by: &str,
-    order: &str,
-) -> ProjectionFingerprint {
-    use crate::crypto::event_id_from_base64;
-
-    // Clear projection tables for this tenant
+/// Clear all projection and operational tables for a tenant so that
+/// re-projection from events produces a fresh state.
+fn clear_projection_tables(db: &rusqlite::Connection, recorded_by: &str) {
     // — Content projections
     db.execute("DELETE FROM messages WHERE recorded_by = ?1", rusqlite::params![recorded_by])
         .expect("failed to clear messages");
@@ -1172,6 +1165,18 @@ fn replay_and_fingerprint(
     db.execute("DELETE FROM rejected_events WHERE peer_id = ?1", rusqlite::params![recorded_by])
         .expect("failed to clear rejected_events");
     db.execute("DELETE FROM project_queue WHERE peer_id = ?1", rusqlite::params![recorded_by]).ok();
+}
+
+/// Clear all projection and operational tables for a tenant, then re-project
+/// all recorded events through `project_one` in the given order.
+fn replay_and_fingerprint(
+    db: &rusqlite::Connection,
+    recorded_by: &str,
+    order: &str,
+) -> ProjectionFingerprint {
+    use crate::crypto::event_id_from_base64;
+
+    clear_projection_tables(db, recorded_by);
 
     // Re-project all recorded events in the requested order
     let query = format!(
@@ -1221,10 +1226,46 @@ fn replay_no_clear_and_fingerprint(
     compute_projection_fingerprint(db, recorded_by)
 }
 
-/// Verify projection invariants for a peer using deterministic fingerprints:
+/// Clear projection tables and re-project all recorded events in random-shuffled
+/// order. Tests PLAN §12.4 item 5: out-of-order ingest converges to the same
+/// projected end state as canonical-order replay.
+fn replay_shuffled_and_fingerprint(
+    db: &rusqlite::Connection,
+    recorded_by: &str,
+) -> ProjectionFingerprint {
+    use crate::crypto::event_id_from_base64;
+    use rand::seq::SliceRandom;
+
+    // Collect event IDs in canonical order, then shuffle
+    let query = "SELECT e.event_id FROM events e
+         WHERE e.event_id IN (SELECT event_id FROM recorded_events WHERE peer_id = ?1)
+         ORDER BY created_at ASC, event_id ASC";
+    let mut stmt = db.prepare(query).expect("failed to prepare events query");
+    let mut event_ids: Vec<String> = stmt.query_map(rusqlite::params![recorded_by], |row| row.get::<_, String>(0))
+        .expect("failed to query events")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("failed to collect events");
+
+    event_ids.shuffle(&mut rand::thread_rng());
+
+    clear_projection_tables(db, recorded_by);
+
+    // Re-project in shuffled order
+    for eid_b64 in &event_ids {
+        if let Some(eid) = event_id_from_base64(eid_b64) {
+            let _ = project_one(db, recorded_by, &eid);
+        }
+    }
+
+    compute_projection_fingerprint(db, recorded_by)
+}
+
+/// Verify projection invariants for a peer using deterministic fingerprints
+/// (PLAN §12.4):
 /// 1. Forward replay: clear + re-project forward → must match original state.
 /// 2. Replay idempotency: re-project on already-projected state → no state change.
 /// 3. Reverse-order replay: clear + re-project in reverse order → must match original state.
+/// 4. Shuffle-reorder replay: clear + re-project in random order → must match original state.
 ///
 /// On failure, per-table diagnostics are printed showing which tables diverged.
 pub fn verify_projection_invariants(peer: &Peer) {
@@ -1233,7 +1274,7 @@ pub fn verify_projection_invariants(peer: &Peer) {
     // Capture original full-state fingerprint
     let orig = compute_projection_fingerprint(&db, &peer.identity);
 
-    // 1. Forward replay
+    // 1. Forward replay (reproject invariance: wipe + reproject yields same state)
     let fwd = replay_and_fingerprint(&db, &peer.identity, "ORDER BY created_at ASC, event_id ASC");
     assert!(
         orig.overall == fwd.overall,
@@ -1258,6 +1299,15 @@ pub fn verify_projection_invariants(peer: &Peer) {
         "Reverse replay fingerprint mismatch for peer '{}':\n{}",
         peer.name,
         fwd.diff_report(&rev, "forward", "reverse"),
+    );
+
+    // 4. Shuffle-reorder replay (PLAN §12.4 item 5: out-of-order ingest converges)
+    let shuf = replay_shuffled_and_fingerprint(&db, &peer.identity);
+    assert!(
+        fwd.overall == shuf.overall,
+        "Shuffle-reorder replay fingerprint mismatch for peer '{}':\n{}",
+        peer.name,
+        fwd.diff_report(&shuf, "forward", "shuffled"),
     );
 
     // Restore forward projection for subsequent assertions
