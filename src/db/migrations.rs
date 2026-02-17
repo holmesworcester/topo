@@ -515,6 +515,22 @@ static MIGRATIONS: &[Migration] = &[
             );
         ",
     },
+    Migration {
+        version: 27,
+        name: "add_workspace_id_to_neg_items",
+        sql: "
+            -- Recreate neg_items with workspace_id column.
+            -- Data loss is acceptable: neg_items is a reconciliation cache
+            -- that gets repopulated from events on the next sync.
+            DROP TABLE IF EXISTS neg_items;
+            CREATE TABLE IF NOT EXISTS neg_items (
+                workspace_id TEXT NOT NULL DEFAULT '',
+                ts INTEGER NOT NULL,
+                id BLOB NOT NULL,
+                PRIMARY KEY (workspace_id, ts, id)
+            ) WITHOUT ROWID;
+        ",
+    },
 ];
 
 fn ensure_schema_migrations(conn: &Connection) -> SqliteResult<()> {
@@ -728,6 +744,6 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(max_version, 26);
+        assert_eq!(max_version, 27);
     }
 }

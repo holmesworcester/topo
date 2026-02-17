@@ -1,3 +1,4 @@
+use super::fixed_layout::{self, encrypted_offsets as off, ENCRYPTED_AUTH_TAG_BYTES};
 use super::registry::{EventTypeMeta, ShareScope};
 use super::{EventError, ParsedEvent, EVENT_TYPE_ENCRYPTED};
 
@@ -11,20 +12,22 @@ pub struct EncryptedEvent {
     pub auth_tag: [u8; 16],
 }
 
-/// Wire format:
+/// Wire format (fixed size per inner_type_code, unsigned):
 /// [0]             type_code = 5
 /// [1..9]          created_at_ms (u64 LE)
 /// [9..41]         key_event_id (32B)
 /// [41]            inner_type_code (1B)
 /// [42..54]        nonce (12B, AES-256-GCM)
-/// [54..56]        ciphertext_len (u16 LE)
-/// [56..56+N]      ciphertext
-/// [56+N..56+N+16] auth_tag (16B)
-/// Min size: 72 bytes (empty ciphertext)
+/// [54..54+N]      ciphertext (N = inner type's fixed wire size)
+/// [54+N..54+N+16] auth_tag (16B)
+///
+/// Total size = 70 + inner_wire_size, deterministic by inner_type_code.
+/// No ciphertext_len field; size is derived from inner_type_code lookup.
 pub fn parse_encrypted(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    if blob.len() < 72 {
+    // Need at least the header to read inner_type_code
+    if blob.len() < off::CIPHERTEXT {
         return Err(EventError::TooShort {
-            expected: 72,
+            expected: off::CIPHERTEXT,
             actual: blob.len(),
         });
     }
@@ -35,18 +38,13 @@ pub fn parse_encrypted(blob: &[u8]) -> Result<ParsedEvent, EventError> {
         });
     }
 
-    let created_at_ms = u64::from_le_bytes(blob[1..9].try_into().unwrap());
+    let inner_type_code = blob[off::INNER_TYPE_CODE];
 
-    let mut key_event_id = [0u8; 32];
-    key_event_id.copy_from_slice(&blob[9..41]);
+    // Look up expected ciphertext size from inner_type_code
+    let ciphertext_size = fixed_layout::encrypted_inner_wire_size(inner_type_code)
+        .ok_or(EventError::InvalidEncryptedInnerType(inner_type_code))?;
 
-    let inner_type_code = blob[41];
-
-    let mut nonce = [0u8; 12];
-    nonce.copy_from_slice(&blob[42..54]);
-
-    let ciphertext_len = u16::from_le_bytes(blob[54..56].try_into().unwrap()) as usize;
-    let expected_len = 56 + ciphertext_len + 16;
+    let expected_len = fixed_layout::encrypted_wire_size(ciphertext_size);
     if blob.len() < expected_len {
         return Err(EventError::TooShort {
             expected: expected_len,
@@ -60,10 +58,19 @@ pub fn parse_encrypted(blob: &[u8]) -> Result<ParsedEvent, EventError> {
         });
     }
 
-    let ciphertext = blob[56..56 + ciphertext_len].to_vec();
+    let created_at_ms = u64::from_le_bytes(blob[off::CREATED_AT..off::KEY_EVENT_ID].try_into().unwrap());
 
+    let mut key_event_id = [0u8; 32];
+    key_event_id.copy_from_slice(&blob[off::KEY_EVENT_ID..off::INNER_TYPE_CODE]);
+
+    let mut nonce = [0u8; 12];
+    nonce.copy_from_slice(&blob[off::NONCE..off::CIPHERTEXT]);
+
+    let ciphertext = blob[off::CIPHERTEXT..off::CIPHERTEXT + ciphertext_size].to_vec();
+
+    let auth_tag_start = off::CIPHERTEXT + ciphertext_size;
     let mut auth_tag = [0u8; 16];
-    auth_tag.copy_from_slice(&blob[56 + ciphertext_len..56 + ciphertext_len + 16]);
+    auth_tag.copy_from_slice(&blob[auth_tag_start..auth_tag_start + ENCRYPTED_AUTH_TAG_BYTES]);
 
     Ok(ParsedEvent::Encrypted(EncryptedEvent {
         created_at_ms,
@@ -81,21 +88,25 @@ pub fn encode_encrypted(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         _ => return Err(EventError::WrongVariant),
     };
 
-    if enc.ciphertext.len() > 65535 {
-        return Err(EventError::ContentTooLong(enc.ciphertext.len()));
+    // Validate inner_type_code and get expected ciphertext size
+    let expected_ct_size = fixed_layout::encrypted_inner_wire_size(enc.inner_type_code)
+        .ok_or(EventError::InvalidEncryptedInnerType(enc.inner_type_code))?;
+
+    if enc.ciphertext.len() != expected_ct_size {
+        return Err(EventError::InvalidMetadata("ciphertext size does not match inner_type_code"));
     }
 
-    let total = 56 + enc.ciphertext.len() + 16;
-    let mut buf = Vec::with_capacity(total);
+    let total = fixed_layout::encrypted_wire_size(expected_ct_size);
+    let mut buf = vec![0u8; total];
 
-    buf.push(EVENT_TYPE_ENCRYPTED);
-    buf.extend_from_slice(&enc.created_at_ms.to_le_bytes());
-    buf.extend_from_slice(&enc.key_event_id);
-    buf.push(enc.inner_type_code);
-    buf.extend_from_slice(&enc.nonce);
-    buf.extend_from_slice(&(enc.ciphertext.len() as u16).to_le_bytes());
-    buf.extend_from_slice(&enc.ciphertext);
-    buf.extend_from_slice(&enc.auth_tag);
+    buf[off::TYPE_CODE] = EVENT_TYPE_ENCRYPTED;
+    buf[off::CREATED_AT..off::KEY_EVENT_ID].copy_from_slice(&enc.created_at_ms.to_le_bytes());
+    buf[off::KEY_EVENT_ID..off::INNER_TYPE_CODE].copy_from_slice(&enc.key_event_id);
+    buf[off::INNER_TYPE_CODE] = enc.inner_type_code;
+    buf[off::NONCE..off::CIPHERTEXT].copy_from_slice(&enc.nonce);
+    buf[off::CIPHERTEXT..off::CIPHERTEXT + expected_ct_size].copy_from_slice(&enc.ciphertext);
+    let auth_tag_start = off::CIPHERTEXT + expected_ct_size;
+    buf[auth_tag_start..auth_tag_start + ENCRYPTED_AUTH_TAG_BYTES].copy_from_slice(&enc.auth_tag);
 
     Ok(buf)
 }
@@ -109,6 +120,7 @@ pub static ENCRYPTED_META: EventTypeMeta = EventTypeMeta {
     dep_field_type_codes: &[&[6]],
     signer_required: false,
     signature_byte_len: 0,
+    encryptable: false,
     parse: parse_encrypted,
     encode: encode_encrypted,
 };

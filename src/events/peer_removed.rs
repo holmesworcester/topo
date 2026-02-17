@@ -70,6 +70,7 @@ pub static PEER_REMOVED_META: EventTypeMeta = EventTypeMeta {
     dep_field_type_codes: &[&[16, 17], &[]],
     signer_required: true,
     signature_byte_len: 64,
+    encryptable: false,
     parse: parse_peer_removed,
     encode: encode_peer_removed,
 };

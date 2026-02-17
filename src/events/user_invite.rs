@@ -142,6 +142,7 @@ pub static USER_INVITE_BOOT_META: EventTypeMeta = EventTypeMeta {
     dep_field_type_codes: &[&[]],
     signer_required: true,
     signature_byte_len: 64,
+    encryptable: false,
     parse: parse_user_invite_boot,
     encode: encode_user_invite_boot,
 };
@@ -155,6 +156,7 @@ pub static USER_INVITE_ONGOING_META: EventTypeMeta = EventTypeMeta {
     dep_field_type_codes: &[&[18, 19], &[]],
     signer_required: true,
     signature_byte_len: 64,
+    encryptable: false,
     parse: parse_user_invite_ongoing,
     encode: encode_user_invite_ongoing,
 };

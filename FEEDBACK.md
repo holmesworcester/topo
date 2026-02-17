@@ -1,18 +1,17 @@
-# Feedback: Issue 7 - Atomicity and Upsert Policy
+# Merge Readiness: master
 
-## Findings
+- Status: `NOT READY`
+- Head: `b9fd42993c00`
+- Ahead/behind vs `origin/master`: `ahead 3`, `behind 0`
 
-1. No blocking correctness issues found in reviewed scope.
-2. Low: Current tests cover rollback atomicity and in-place upsert behavior well, but there is still residual risk around higher-concurrency write contention patterns not covered by focused unit tests.
+## Verified
+- `cargo test --test cli_test -q` ✅
+- `cargo test --test two_process_test -q` ✅
 
-## Evidence
+## Blockers
+1. Known perf blocker still open: `perf_continuous_10k` has been failing in prior runs and was not re-cleared in this pass.
+2. Tenant routing safety issue remains: `accept_loop_with_ingest` still has first-tenant fallback when peer-to-tenant resolution misses.
 
-- Passed:
-  - `test_drain_atomicity_no_split_state`
-  - `test_drain_rollback_on_projector_failure`
-  - `test_invite_bootstrap_trust_upsert_updates_in_place`
-  - `test_pending_invite_bootstrap_trust_upsert_updates_in_place`
-
-## Summary
-
-The transactional dequeue/project changes and `ON CONFLICT DO UPDATE` migration look solid for single-flow correctness.
+## Required before merge
+1. Make `perf_continuous_10k` green (or explicitly quarantine with justification).
+2. Replace fallback routing with hard reject + telemetry.

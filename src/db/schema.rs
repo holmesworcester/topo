@@ -123,11 +123,12 @@ pub fn create_tables(conn: &Connection) -> SqliteResult<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_recorded_peer_order ON recorded_events(peer_id, id);
 
-        -- Negentropy items: sorted by (ts, id) for range-based reconciliation
+        -- Negentropy items: sorted by (workspace_id, ts, id) for range-based reconciliation
         CREATE TABLE IF NOT EXISTS neg_items (
+            workspace_id TEXT NOT NULL DEFAULT '',
             ts INTEGER NOT NULL,        -- created_at_ms timestamp
             id BLOB NOT NULL,           -- 32-byte event ID (raw, not base64)
-            PRIMARY KEY (ts, id)
+            PRIMARY KEY (workspace_id, ts, id)
         ) WITHOUT ROWID;
 
         -- Negentropy block index: sparse index every B items for O(1) index lookup

@@ -1,16 +1,17 @@
+use super::fixed_layout::{self, MESSAGE_ATTACHMENT_WIRE_SIZE, ATTACHMENT_FILENAME_BYTES, ATTACHMENT_MIME_BYTES, attachment_offsets as off};
 use super::registry::{EventTypeMeta, ShareScope};
 use super::{EventError, ParsedEvent, EVENT_TYPE_MESSAGE_ATTACHMENT};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageAttachmentEvent {
     pub created_at_ms: u64,
-    pub message_id: [u8; 32],      // dep: parent message
-    pub file_id: [u8; 32],         // random ID (NOT an event_id dep)
-    pub blob_bytes: u64,            // total plaintext file size
+    pub message_id: [u8; 32],
+    pub file_id: [u8; 32],
+    pub blob_bytes: u64,
     pub total_slices: u32,
-    pub slice_bytes: u32,           // bytes per non-final slice
-    pub root_hash: [u8; 32],       // Blake2b-256 of concatenated plaintext
-    pub key_event_id: [u8; 32],    // dep: decrypt key
+    pub slice_bytes: u32,
+    pub root_hash: [u8; 32],
+    pub key_event_id: [u8; 32],
     pub filename: String,
     pub mime_type: String,
     pub signed_by: [u8; 32],
@@ -18,7 +19,7 @@ pub struct MessageAttachmentEvent {
     pub signature: [u8; 64],
 }
 
-/// Wire format (min 254 bytes, signed):
+/// Wire format (633 bytes fixed, signed):
 /// [0]            type=24
 /// [1..9]         created_at_ms (u64 LE)
 /// [9..41]        message_id (32 bytes)
@@ -28,21 +29,21 @@ pub struct MessageAttachmentEvent {
 /// [85..89]       slice_bytes (u32 LE)
 /// [89..121]      root_hash (32 bytes)
 /// [121..153]     key_event_id (32 bytes)
-/// [153..155]     filename_len (u16 LE)
-/// [155..155+N]   filename (UTF-8)
-/// [155+N..157+N] mime_len (u16 LE)
-/// [157+N..157+N+M] mime_type (UTF-8)
-/// --- signature trailer (97 bytes) ---
-/// [157+N+M..157+N+M+32]  signed_by (32 bytes)
-/// [157+N+M+32]            signer_type (1 byte)
-/// [157+N+M+33..157+N+M+97] signature (64 bytes)
+/// [153..408]     filename (255 bytes, UTF-8 zero-padded)
+/// [408..536]     mime_type (128 bytes, UTF-8 zero-padded)
+/// [536..568]     signed_by (32 bytes)
+/// [568]          signer_type (1 byte)
+/// [569..633]     signature (64 bytes)
 pub fn parse_message_attachment(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    // Minimum: type(1) + created_at(8) + message_id(32) + file_id(32) + blob_bytes(8)
-    //        + total_slices(4) + slice_bytes(4) + root_hash(32) + key_event_id(32)
-    //        + filename_len(2) + mime_len(2) + signed_by(32) + signer_type(1) + signature(64) = 254
-    if blob.len() < 254 {
+    if blob.len() < MESSAGE_ATTACHMENT_WIRE_SIZE {
         return Err(EventError::TooShort {
-            expected: 254,
+            expected: MESSAGE_ATTACHMENT_WIRE_SIZE,
+            actual: blob.len(),
+        });
+    }
+    if blob.len() > MESSAGE_ATTACHMENT_WIRE_SIZE {
+        return Err(EventError::TrailingData {
+            expected: MESSAGE_ATTACHMENT_WIRE_SIZE,
             actual: blob.len(),
         });
     }
@@ -53,64 +54,37 @@ pub fn parse_message_attachment(blob: &[u8]) -> Result<ParsedEvent, EventError> 
         });
     }
 
-    let created_at_ms = u64::from_le_bytes(blob[1..9].try_into().unwrap());
+    let created_at_ms = u64::from_le_bytes(blob[off::CREATED_AT..off::MESSAGE_ID].try_into().unwrap());
 
     let mut message_id = [0u8; 32];
-    message_id.copy_from_slice(&blob[9..41]);
+    message_id.copy_from_slice(&blob[off::MESSAGE_ID..off::FILE_ID]);
 
     let mut file_id = [0u8; 32];
-    file_id.copy_from_slice(&blob[41..73]);
+    file_id.copy_from_slice(&blob[off::FILE_ID..off::BLOB_BYTES]);
 
-    let blob_bytes = u64::from_le_bytes(blob[73..81].try_into().unwrap());
-    let total_slices = u32::from_le_bytes(blob[81..85].try_into().unwrap());
-    let slice_bytes = u32::from_le_bytes(blob[85..89].try_into().unwrap());
+    let blob_bytes = u64::from_le_bytes(blob[off::BLOB_BYTES..off::TOTAL_SLICES].try_into().unwrap());
+    let total_slices = u32::from_le_bytes(blob[off::TOTAL_SLICES..off::SLICE_BYTES].try_into().unwrap());
+    let slice_bytes = u32::from_le_bytes(blob[off::SLICE_BYTES..off::ROOT_HASH].try_into().unwrap());
 
     let mut root_hash = [0u8; 32];
-    root_hash.copy_from_slice(&blob[89..121]);
+    root_hash.copy_from_slice(&blob[off::ROOT_HASH..off::KEY_EVENT_ID]);
 
     let mut key_event_id = [0u8; 32];
-    key_event_id.copy_from_slice(&blob[121..153]);
+    key_event_id.copy_from_slice(&blob[off::KEY_EVENT_ID..off::FILENAME]);
 
-    let filename_len = u16::from_le_bytes(blob[153..155].try_into().unwrap()) as usize;
-    if blob.len() < 157 + filename_len + 97 {
-        return Err(EventError::TooShort {
-            expected: 157 + filename_len + 97,
-            actual: blob.len(),
-        });
-    }
-    let filename = String::from_utf8_lossy(&blob[155..155 + filename_len]).to_string();
+    let filename = fixed_layout::read_text_slot(&blob[off::FILENAME..off::FILENAME + ATTACHMENT_FILENAME_BYTES])
+        .map_err(EventError::TextSlot)?;
 
-    let mime_offset = 155 + filename_len;
-    if blob.len() < mime_offset + 2 {
-        return Err(EventError::TooShort {
-            expected: mime_offset + 2,
-            actual: blob.len(),
-        });
-    }
-    let mime_len = u16::from_le_bytes(blob[mime_offset..mime_offset + 2].try_into().unwrap()) as usize;
-    let expected_total = mime_offset + 2 + mime_len + 97;
-    if blob.len() < expected_total {
-        return Err(EventError::TooShort {
-            expected: expected_total,
-            actual: blob.len(),
-        });
-    }
-    if blob.len() > expected_total {
-        return Err(EventError::TrailingData {
-            expected: expected_total,
-            actual: blob.len(),
-        });
-    }
-    let mime_type = String::from_utf8_lossy(&blob[mime_offset + 2..mime_offset + 2 + mime_len]).to_string();
+    let mime_type = fixed_layout::read_text_slot(&blob[off::MIME_TYPE..off::MIME_TYPE + ATTACHMENT_MIME_BYTES])
+        .map_err(EventError::TextSlot)?;
 
-    let trailer_start = mime_offset + 2 + mime_len;
     let mut signed_by = [0u8; 32];
-    signed_by.copy_from_slice(&blob[trailer_start..trailer_start + 32]);
+    signed_by.copy_from_slice(&blob[off::SIGNED_BY..off::SIGNER_TYPE]);
 
-    let signer_type = blob[trailer_start + 32];
+    let signer_type = blob[off::SIGNER_TYPE];
 
     let mut signature = [0u8; 64];
-    signature.copy_from_slice(&blob[trailer_start + 33..trailer_start + 97]);
+    signature.copy_from_slice(&blob[off::SIGNATURE..off::SIGNATURE + 64]);
 
     validate_attachment_metadata(blob_bytes, total_slices, slice_bytes)?;
 
@@ -157,34 +131,31 @@ pub fn encode_message_attachment(event: &ParsedEvent) -> Result<Vec<u8>, EventEr
 
     validate_attachment_metadata(att.blob_bytes, att.total_slices, att.slice_bytes)?;
 
-    let filename_bytes = att.filename.as_bytes();
-    let mime_bytes = att.mime_type.as_bytes();
-    if filename_bytes.len() > 65535 {
-        return Err(EventError::ContentTooLong(filename_bytes.len()));
+    if att.filename.as_bytes().len() > ATTACHMENT_FILENAME_BYTES {
+        return Err(EventError::ContentTooLong(att.filename.as_bytes().len()));
     }
-    if mime_bytes.len() > 65535 {
-        return Err(EventError::ContentTooLong(mime_bytes.len()));
+    if att.mime_type.as_bytes().len() > ATTACHMENT_MIME_BYTES {
+        return Err(EventError::ContentTooLong(att.mime_type.as_bytes().len()));
     }
 
-    let total = 157 + filename_bytes.len() + mime_bytes.len() + 97;
-    let mut buf = Vec::with_capacity(total);
+    let mut buf = vec![0u8; MESSAGE_ATTACHMENT_WIRE_SIZE];
 
-    buf.push(EVENT_TYPE_MESSAGE_ATTACHMENT);
-    buf.extend_from_slice(&att.created_at_ms.to_le_bytes());
-    buf.extend_from_slice(&att.message_id);
-    buf.extend_from_slice(&att.file_id);
-    buf.extend_from_slice(&att.blob_bytes.to_le_bytes());
-    buf.extend_from_slice(&att.total_slices.to_le_bytes());
-    buf.extend_from_slice(&att.slice_bytes.to_le_bytes());
-    buf.extend_from_slice(&att.root_hash);
-    buf.extend_from_slice(&att.key_event_id);
-    buf.extend_from_slice(&(filename_bytes.len() as u16).to_le_bytes());
-    buf.extend_from_slice(filename_bytes);
-    buf.extend_from_slice(&(mime_bytes.len() as u16).to_le_bytes());
-    buf.extend_from_slice(mime_bytes);
-    buf.extend_from_slice(&att.signed_by);
-    buf.push(att.signer_type);
-    buf.extend_from_slice(&att.signature);
+    buf[off::TYPE_CODE] = EVENT_TYPE_MESSAGE_ATTACHMENT;
+    buf[off::CREATED_AT..off::MESSAGE_ID].copy_from_slice(&att.created_at_ms.to_le_bytes());
+    buf[off::MESSAGE_ID..off::FILE_ID].copy_from_slice(&att.message_id);
+    buf[off::FILE_ID..off::BLOB_BYTES].copy_from_slice(&att.file_id);
+    buf[off::BLOB_BYTES..off::TOTAL_SLICES].copy_from_slice(&att.blob_bytes.to_le_bytes());
+    buf[off::TOTAL_SLICES..off::SLICE_BYTES].copy_from_slice(&att.total_slices.to_le_bytes());
+    buf[off::SLICE_BYTES..off::ROOT_HASH].copy_from_slice(&att.slice_bytes.to_le_bytes());
+    buf[off::ROOT_HASH..off::KEY_EVENT_ID].copy_from_slice(&att.root_hash);
+    buf[off::KEY_EVENT_ID..off::FILENAME].copy_from_slice(&att.key_event_id);
+    fixed_layout::write_text_slot(&att.filename, &mut buf[off::FILENAME..off::FILENAME + ATTACHMENT_FILENAME_BYTES])
+        .map_err(EventError::TextSlot)?;
+    fixed_layout::write_text_slot(&att.mime_type, &mut buf[off::MIME_TYPE..off::MIME_TYPE + ATTACHMENT_MIME_BYTES])
+        .map_err(EventError::TextSlot)?;
+    buf[off::SIGNED_BY..off::SIGNER_TYPE].copy_from_slice(&att.signed_by);
+    buf[off::SIGNER_TYPE] = att.signer_type;
+    buf[off::SIGNATURE..off::SIGNATURE + 64].copy_from_slice(&att.signature);
 
     Ok(buf)
 }
@@ -198,6 +169,7 @@ pub static MESSAGE_ATTACHMENT_META: EventTypeMeta = EventTypeMeta {
     dep_field_type_codes: &[&[1], &[6], &[]],
     signer_required: true,
     signature_byte_len: 64,
+    encryptable: true,
     parse: parse_message_attachment,
     encode: encode_message_attachment,
 };

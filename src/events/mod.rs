@@ -3,6 +3,7 @@ pub mod bench_dep;
 pub mod device_invite;
 pub mod encrypted;
 pub mod file_slice;
+pub mod fixed_layout;
 pub mod invite_accepted;
 pub mod message;
 pub mod message_deletion;
@@ -261,6 +262,8 @@ pub enum EventError {
     ContentTooLong(usize),
     InvalidMetadata(&'static str),
     UnknownType(u8),
+    TextSlot(fixed_layout::TextSlotError),
+    InvalidEncryptedInnerType(u8),
 }
 
 impl std::fmt::Display for EventError {
@@ -279,6 +282,8 @@ impl std::fmt::Display for EventError {
             EventError::ContentTooLong(len) => write!(f, "content too long: {} bytes", len),
             EventError::InvalidMetadata(msg) => write!(f, "invalid metadata: {}", msg),
             EventError::UnknownType(t) => write!(f, "unknown event type: {}", t),
+            EventError::TextSlot(e) => write!(f, "text slot error: {}", e),
+            EventError::InvalidEncryptedInnerType(t) => write!(f, "invalid encrypted inner type: {}", t),
         }
     }
 }
@@ -402,7 +407,7 @@ mod tests {
 
         let event = ParsedEvent::SignedMemo(memo.clone());
         let blob = encode_event(&event).unwrap();
-        assert_eq!(blob.len(), 44 + 14 + 64); // 122
+        assert_eq!(blob.len(), fixed_layout::SIGNED_MEMO_WIRE_SIZE);
         let parsed = parse_event(&blob).unwrap();
         assert_eq!(parsed, event);
     }
@@ -728,8 +733,33 @@ mod tests {
     }
 
     #[test]
-    fn test_variable_length_content() {
-        // Empty content
+    fn test_registry_encryptable_coverage() {
+        let reg = registry();
+        let encryptable_codes: Vec<u8> = (1..=26u8)
+            .filter(|c| reg.lookup(*c).map_or(false, |m| m.encryptable))
+            .collect();
+        // Must match the admissible set from projector_spec:
+        // message(1), reaction(2), signed_memo(4), secret_key(6),
+        // message_deletion(7), message_attachment(24), file_slice(25)
+        assert_eq!(
+            encryptable_codes,
+            vec![1, 2, 4, 6, 7, 24, 25],
+            "encryptable set drifted from expected admissible inner types"
+        );
+        // Identity/infrastructure types must NOT be encryptable
+        for code in [5, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 26] {
+            let meta = reg.lookup(code).unwrap();
+            assert!(
+                !meta.encryptable,
+                "type {} ({}) should not be encryptable",
+                code, meta.type_name
+            );
+        }
+    }
+
+    #[test]
+    fn test_fixed_length_content() {
+        // Empty content → still fixed wire size
         let msg = ParsedEvent::Message(MessageEvent {
             created_at_ms: 100,
             workspace_id: [0u8; 32],
@@ -740,11 +770,11 @@ mod tests {
             signature: [0u8; 64],
         });
         let blob = encode_event(&msg).unwrap();
-        assert_eq!(blob.len(), 172); // minimum
+        assert_eq!(blob.len(), fixed_layout::MESSAGE_WIRE_SIZE);
         let parsed = parse_event(&blob).unwrap();
         assert_eq!(parsed, msg);
 
-        // Large content
+        // Large content → same fixed wire size
         let big_content = "x".repeat(1000);
         let msg2 = ParsedEvent::Message(MessageEvent {
             created_at_ms: 200,
@@ -756,7 +786,7 @@ mod tests {
             signature: [0u8; 64],
         });
         let blob2 = encode_event(&msg2).unwrap();
-        assert_eq!(blob2.len(), 172 + 1000);
+        assert_eq!(blob2.len(), fixed_layout::MESSAGE_WIRE_SIZE);
         let parsed2 = parse_event(&blob2).unwrap();
         assert_eq!(parsed2, msg2);
     }
@@ -990,24 +1020,27 @@ mod tests {
         };
         let event = ParsedEvent::MessageAttachment(att);
         let blob = encode_event(&event).unwrap();
-        assert_eq!(blob.len(), 254); // minimum with empty strings
+        assert_eq!(blob.len(), fixed_layout::MESSAGE_ATTACHMENT_WIRE_SIZE);
         let parsed = parse_event(&blob).unwrap();
         assert_eq!(parsed, event);
     }
 
     #[test]
     fn test_file_slice_roundtrip() {
+        let mut ciphertext = vec![0xAB; fixed_layout::FILE_SLICE_CIPHERTEXT_BYTES];
+        ciphertext[0] = 0xDE; // mark first byte to verify roundtrip
         let fs = FileSliceEvent {
             created_at_ms: 6000000000000,
             file_id: [20u8; 32],
             slice_number: 3,
-            ciphertext: vec![0xAB; 128],
+            ciphertext,
             signed_by: [21u8; 32],
             signer_type: 5,
             signature: [22u8; 64],
         };
         let event = ParsedEvent::FileSlice(fs);
         let blob = encode_event(&event).unwrap();
+        assert_eq!(blob.len(), fixed_layout::FILE_SLICE_WIRE_SIZE);
         let parsed = parse_event(&blob).unwrap();
         assert_eq!(parsed, event);
         // Verify trailing signature layout: last 64 bytes are signature
@@ -1015,8 +1048,8 @@ mod tests {
     }
 
     #[test]
-    fn test_file_slice_large_ciphertext() {
-        let ciphertext = vec![0xCD; 65536]; // 64 KiB
+    fn test_file_slice_canonical_size() {
+        let ciphertext = vec![0xCD; fixed_layout::FILE_SLICE_CIPHERTEXT_BYTES];
         let fs = FileSliceEvent {
             created_at_ms: 7000000000000,
             file_id: [30u8; 32],
@@ -1028,9 +1061,22 @@ mod tests {
         };
         let event = ParsedEvent::FileSlice(fs);
         let blob = encode_event(&event).unwrap();
-        assert_eq!(blob.len(), 49 + 65536 + 97); // header + ciphertext + trailer
+        assert_eq!(blob.len(), fixed_layout::FILE_SLICE_WIRE_SIZE);
         let parsed = parse_event(&blob).unwrap();
         assert_eq!(parsed, event);
+
+        // Non-canonical ciphertext size is rejected
+        let bad_fs = FileSliceEvent {
+            created_at_ms: 100,
+            file_id: [0u8; 32],
+            slice_number: 0,
+            ciphertext: vec![0u8; 128], // wrong size
+            signed_by: [0u8; 32],
+            signer_type: 5,
+            signature: [0u8; 64],
+        };
+        let bad_event = ParsedEvent::FileSlice(bad_fs);
+        assert!(encode_event(&bad_event).is_err());
     }
 
     #[test]
@@ -1336,8 +1382,8 @@ mod tests {
     }
 
     #[test]
-    fn test_variable_size_rejects_trailing_data() {
-        // Message (variable)
+    fn test_now_fixed_types_reject_trailing_data() {
+        // Message (now fixed at 1194)
         let msg = ParsedEvent::Message(MessageEvent {
             created_at_ms: 100,
             workspace_id: [0u8; 32],
@@ -1348,13 +1394,13 @@ mod tests {
             signature: [0u8; 64],
         });
         let mut blob = encode_event(&msg).unwrap();
-        let expected_len = blob.len();
+        assert_eq!(blob.len(), fixed_layout::MESSAGE_WIRE_SIZE);
         blob.push(0xFF);
         let err = parse_event(&blob).unwrap_err();
         assert!(matches!(err, EventError::TrailingData { expected, actual }
-            if expected == expected_len && actual == expected_len + 1));
+            if expected == fixed_layout::MESSAGE_WIRE_SIZE && actual == fixed_layout::MESSAGE_WIRE_SIZE + 1));
 
-        // Reaction (variable)
+        // Reaction (now fixed at 234)
         let rxn = ParsedEvent::Reaction(ReactionEvent {
             created_at_ms: 100,
             target_event_id: [0u8; 32],
@@ -1365,56 +1411,58 @@ mod tests {
             signature: [0u8; 64],
         });
         let mut blob = encode_event(&rxn).unwrap();
-        let expected_len = blob.len();
+        assert_eq!(blob.len(), fixed_layout::REACTION_WIRE_SIZE);
         blob.push(0xFF);
         let err = parse_event(&blob).unwrap_err();
         assert!(matches!(err, EventError::TrailingData { expected, actual }
-            if expected == expected_len && actual == expected_len + 1));
+            if expected == fixed_layout::REACTION_WIRE_SIZE && actual == fixed_layout::REACTION_WIRE_SIZE + 1));
 
-        // Encrypted (variable)
+        // Encrypted (deterministic size from inner_type_code)
+        let inner_ct_size = fixed_layout::encrypted_inner_wire_size(1).unwrap();
         let enc = ParsedEvent::Encrypted(EncryptedEvent {
             created_at_ms: 100,
             key_event_id: [0u8; 32],
             inner_type_code: 1,
             nonce: [0u8; 12],
-            ciphertext: vec![0xAB; 50],
+            ciphertext: vec![0xAB; inner_ct_size],
             auth_tag: [0u8; 16],
         });
         let mut blob = encode_event(&enc).unwrap();
-        let expected_len = blob.len();
+        let expected_len = fixed_layout::encrypted_wire_size(inner_ct_size);
+        assert_eq!(blob.len(), expected_len);
         blob.push(0xFF);
         let err = parse_event(&blob).unwrap_err();
         assert!(matches!(err, EventError::TrailingData { expected, actual }
             if expected == expected_len && actual == expected_len + 1));
 
-        // FileSlice (variable)
+        // FileSlice (now fixed at 262286)
         let fs = ParsedEvent::FileSlice(FileSliceEvent {
             created_at_ms: 100,
             file_id: [0u8; 32],
             slice_number: 0,
-            ciphertext: vec![0xCD; 64],
+            ciphertext: vec![0xCD; fixed_layout::FILE_SLICE_CIPHERTEXT_BYTES],
             signed_by: [0u8; 32],
             signer_type: 5,
             signature: [0u8; 64],
         });
         let mut blob = encode_event(&fs).unwrap();
-        let expected_len = blob.len();
+        assert_eq!(blob.len(), fixed_layout::FILE_SLICE_WIRE_SIZE);
         blob.push(0xFF);
         let err = parse_event(&blob).unwrap_err();
         assert!(matches!(err, EventError::TrailingData { expected, actual }
-            if expected == expected_len && actual == expected_len + 1));
+            if expected == fixed_layout::FILE_SLICE_WIRE_SIZE && actual == fixed_layout::FILE_SLICE_WIRE_SIZE + 1));
 
-        // BenchDep (variable)
+        // BenchDep (now fixed at 345)
         let bd = ParsedEvent::BenchDep(BenchDepEvent {
             created_at_ms: 100,
             dep_ids: vec![[1u8; 32], [2u8; 32]],
             payload: [0u8; 16],
         });
         let mut blob = encode_event(&bd).unwrap();
-        let expected_len = blob.len();
+        assert_eq!(blob.len(), fixed_layout::BENCH_DEP_WIRE_SIZE);
         blob.push(0xFF);
         let err = parse_event(&blob).unwrap_err();
         assert!(matches!(err, EventError::TrailingData { expected, actual }
-            if expected == expected_len && actual == expected_len + 1));
+            if expected == fixed_layout::BENCH_DEP_WIRE_SIZE && actual == fixed_layout::BENCH_DEP_WIRE_SIZE + 1));
     }
 }

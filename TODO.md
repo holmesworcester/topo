@@ -36,26 +36,28 @@ For every stage of work in this TODO:
 
 Realism-first rule for ordering: finish test-fidelity items up front (copying events, direct DB seeding, static pinning overlays, and optional invariant checks) so downstream refactors are validated by realistic tests.
 
-1. `P0: Remove copy_event_chain from interactive invite acceptance`
-2. `P1: Replace prerequisite event copy in Peer::new_in_workspace`
-3. `P1: Stop direct SQL trust seeding in CLI invite-bootstrap test`
+1. ~~`P0: Remove copy_event_chain from interactive invite acceptance`~~ **DONE**: `copy_event_chain` deleted; interactive and CLI invite acceptance now use real QUIC bootstrap sync via `svc_accept_invite` / `bootstrap_sync_from_invite`. Two-process integration test validates end-to-end. See PLAN.md §2.2 "CLI Isomorphism Principle".
+2. ~~`P1: Replace prerequisite event copy in Peer::new_in_workspace`~~ **DONE**: `new_in_workspace` now uses real QUIC bootstrap sync via `svc_accept_invite` + temp sync endpoint. No direct `insert_event`/`insert_recorded_event` calls remain in the join path. Joiner DB starts empty (no transport identity); invite-derived identity installed by service layer. Holepunch and scenario tests pass with realistic bootstrap.
+3. `P1: Stop direct SQL trust seeding in CLI invite-bootstrap test` (partially addressed: `test_two_process_invite_and_sync` uses production invite flow; existing `test_cli_sync_bootstrap_from_accepted_invite_data` still seeds directly)
 4. `P1: Remove manual endpoint observation writes in hole-punch integration test`
 5. `P2: Align test transport setup with production dynamic trust lookup`
 6. `P1: Deprecate --pin-peer from product code and design after invite-trust maturity`
 7. `P0: Make scenario replay invariants mandatory by default (opt-out only)`
 8. `P0: Bring scenario invariant harness fully in line with PLAN (fingerprints + full invariant set)`
 9. `P1: Investigate and decide create_event_sync service semantics before implementation changes`
-10. `P1: Investigate simplification of project_one/project_one_core split to better match one-path intent`
+10. ~~`P1: Investigate simplification of project_one/project_one_core split to better match one-path intent`~~ **DONE**: Investigated and resolved. Decision: keep two-layer model (`project_one` public entrypoint + `project_one_step` internal non-cascading step) as justified cascade optimization. Renamed `project_one_core` → `project_one_step` with clear doc comments. Added 7 source-isomorphism invariance tests proving direct/cascade/reverse-order convergence. Updated DESIGN.md §4.1, PLAN.md §5/§15.1, and TLA projector_spec.md to explicitly document the internal split.
 11. `P0: Unify transport identity architecture (single event-derived peer identity, no rotation sidecar)`
 12. `P2: Resolve disjoint trust sets docs/code mismatch`
 13. `P0: Enforce removal policy at transport runtime (deny + disconnect active sessions)`
 14. `P0: Unify bootstrap key distribution via invite-key wrap/unwrap (keep local secret_key dep)`
 15. `P1: Collapse encrypted-inner projection onto the same dependency/signer engine stages`
 16. `P0: Re-impose fixed-length event fields + langsec parser model`
-17. `P1: Remove duplicated command/business logic between CLI (main.rs) and service layer (service.rs)`
+17. `P1: Remove duplicated command/business logic between CLI (main.rs) and service layer (service.rs)` (partially addressed: invite create/accept now routes through service layer; remaining: send, messages, status, react, delete, users, keys)
 18. `P1: Eliminate direct SQL access in CLI command paths where module APIs already exist`
 19. `P1: Reconcile TLA/spec mapping docs with PLAN and implemented projector semantics`
 20. `P2: Remove residual compatibility cruft from active schema/docs/runtime surfaces`
+21. `P1: CLI isomorphism — route remaining interactive commands through service layer` (send, messages, status, react, delete, users, keys — interactive REPL should be a thin adapter over service functions per PLAN §2.2)
+22. `P2: Single-port multi-tenant endpoint — share one UDP port across tenants on the same device` (currently per-tenant ports; see PLAN §2.3)
 
 ## P0: Re-impose fixed-length event fields + langsec parser model
 
@@ -607,33 +609,22 @@ Acceptance:
 2. Active schema/runtime does not include unused compatibility-only tables/paths.
 3. Legacy/compat wording in active tests/code is minimized to intentional hardening cases only.
 
-## P1: Investigate simplification of `project_one`/`project_one_core` split to better match one-path intent
+## ~~P1: Investigate simplification of `project_one`/`project_one_core` split to better match one-path intent~~ DONE
 
-Evidence:
+Investigation completed. Decision: keep two-layer model with documentation alignment.
 
-1. PLAN/doc one-path intent emphasizes a single projection entrypoint for all sources and retries:
-   - `docs/PLAN.md:95`
-   - `docs/PLAN.md:481`
-2. Current implementation keeps two projection layers:
-   - `project_one_core` (single-event projection stages),
-   - `project_one` (core + cascade),
-   and cascade internals call `project_one_core` directly.
+Findings:
+1. `project_one` (pub) is the sole public entrypoint — all external callers use it.
+2. `project_one_core` (now renamed `project_one_step`, private) is only used within `cascade_unblocked_inner` Phase 1 (Kahn worklist).
+3. The split is a justified cascade optimization: Phase 1 uses `project_one_step` to avoid redundant recursive cascade (it manages its own worklist); Phase 2 guard retries use `project_one` for proper recursive cascade.
+4. No semantic divergence exists — all projection stages (dep check, type check, signer verify, projector dispatch) are shared.
 
-Problem: even if behavior is mostly coherent, the dual-entry structure makes the one-path story harder to reason about and can cause doc/implementation tension.
+Resolution:
+- Renamed `project_one_core` → `project_one_step` with clear doc comments explaining the relationship.
+- Added 7 source-isomorphism invariance tests proving direct/cascade/reverse-order convergence for message, reaction, encrypted, deletion, and multi-event chains.
+- Updated DESIGN.md §4.1, PLAN.md §5/§15.1, and TLA projector_spec.md to document the internal two-layer model as a justified optimization.
 
-Required process for this TODO (investigation-first):
-
-1. Investigate current call graph and semantics:
-   - when `project_one` is required,
-   - when `project_one_core` is used directly and why.
-2. Produce simplification options (for example one internal entrypoint with mode/context flags) and tradeoffs (correctness, performance, recursion/cascade behavior).
-3. Decide whether to:
-   - simplify code to one conceptual entrypoint, or
-   - keep split and update docs to formalize the justified internal boundary.
-4. Do not implement structural refactor until option review/approval is complete.
-
-Acceptance:
-
-1. Investigation note captures current rationale and concrete options.
-2. Chosen direction is explicit (refactor vs documented boundary).
-3. Implementation/docs are updated only after decision.
+All acceptance criteria met:
+1. Investigation note captures rationale and options. ✓
+2. Chosen direction is explicit: documented boundary (not refactor). ✓
+3. Docs and code are aligned after implementation. ✓

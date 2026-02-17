@@ -13,13 +13,15 @@ use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
 use crate::db::{
     open_connection,
     schema::create_tables,
-    transport_trust::{allowed_peers_from_db, import_cli_pins_to_sql, is_peer_allowed},
+    transport_trust::{
+        allowed_peers_from_db, has_any_trusted_peer, import_cli_pins_to_sql, is_peer_allowed,
+    },
 };
 use crate::events::{
     DeviceInviteFirstEvent, InviteAcceptedEvent, MessageDeletionEvent, MessageEvent, ParsedEvent,
     PeerSharedFirstEvent, ReactionEvent, UserBootEvent, UserInviteBootEvent, WorkspaceEvent,
 };
-use crate::projection::create::{create_event_sync, create_signed_event_sync, CreateEventError};
+use crate::projection::create::{create_event_sync, create_event_staged, create_signed_event_sync};
 use crate::projection::pipeline::project_one;
 use crate::transport::{
     create_dual_endpoint, create_dual_endpoint_dynamic,
@@ -77,23 +79,9 @@ impl From<Box<dyn std::error::Error + Send + Sync>> for ServiceError {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Isolation wrapper for create-event helpers (Feedback item 1)
-//
-// Issue 3 may change the `event_id_or_blocked` API in projection::create.
-// This local wrapper insulates the service layer from that churn — if the
-// upstream signature changes we only need to update one site here.
-// ---------------------------------------------------------------------------
-
-/// Accept an event-creation result, treating `Blocked` as success (returns
-/// the event_id) and propagating real errors.  Mirrors the semantics of
-/// `projection::create::event_id_or_blocked` but is owned by the service
-/// layer so upstream API changes don't ripple across every call site.
-fn unwrap_event_id(result: Result<EventId, CreateEventError>) -> ServiceResult<EventId> {
-    match result {
-        Ok(eid) => Ok(eid),
-        Err(CreateEventError::Blocked { event_id, .. }) => Ok(event_id),
-        Err(e) => Err(ServiceError(format!("{}", e))),
+impl From<crate::invite_link::InviteLinkError> for ServiceError {
+    fn from(e: crate::invite_link::InviteLinkError) -> Self {
+        ServiceError(e.to_string())
     }
 }
 
@@ -194,6 +182,25 @@ pub struct WorkspaceItem {
     pub event_id: String,
     pub workspace_id: String,
     pub name: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CreateInviteResponse {
+    pub invite_link: String,
+    pub invite_event_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AcceptInviteResponse {
+    pub peer_id: String,
+    pub user_event_id: String,
+    pub peer_shared_event_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AcceptDeviceLinkResponse {
+    pub peer_id: String,
+    pub peer_shared_event_id: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -337,6 +344,31 @@ fn load_local_peer_signer(
     Ok(None)
 }
 
+/// Public accessor for loading the locally stored peer signer.
+/// Used by the interactive module to recover keys after service-layer operations.
+pub fn load_local_peer_signer_pub(
+    db: &rusqlite::Connection,
+    recorded_by: &str,
+) -> ServiceResult<Option<(EventId, SigningKey)>> {
+    ensure_local_signer_tables(db)?;
+
+    if let Some((eid_b64, key_bytes)) = db
+        .query_row(
+            "SELECT event_id, signing_key FROM local_peer_signers WHERE recorded_by = ?1",
+            rusqlite::params![recorded_by],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
+        .optional()?
+    {
+        let signing_key = decode_signing_key(key_bytes)?;
+        let eid = event_id_from_base64(&eid_b64)
+            .ok_or_else(|| ServiceError("bad local peer signer event_id".into()))?;
+        return Ok(Some((eid, signing_key)));
+    }
+
+    Ok(None)
+}
+
 pub fn ensure_identity_chain(
     db: &rusqlite::Connection,
     recorded_by: &str,
@@ -352,7 +384,8 @@ pub fn ensure_identity_chain(
         created_at_ms: current_timestamp_ms(),
         public_key: workspace_key.verifying_key().to_bytes(),
     });
-    let ws_eid = unwrap_event_id(create_event_sync(db, recorded_by, &ws))?;
+    let ws_eid = create_event_staged(db, recorded_by, &ws)
+        .map_err(|e| ServiceError(format!("{}", e)))?;
 
     let ia = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
         created_at_ms: current_timestamp_ms(),
@@ -411,6 +444,9 @@ pub fn ensure_identity_chain(
 
     let psf_b64 = event_id_to_base64(&psf_eid);
     persist_local_peer_signer(db, recorded_by, &psf_b64, &peer_shared_key)?;
+
+    // Persist workspace key for later invite creation
+    persist_workspace_key(db, recorded_by, &workspace_key)?;
 
     Ok((psf_eid, peer_shared_key))
 }
@@ -604,7 +640,8 @@ pub fn svc_send(
         signer_type: 5,
         signature: [0u8; 64],
     });
-    let eid = unwrap_event_id(create_signed_event_sync(&db, &recorded_by, &msg, &signing_key))?;
+    let eid = create_signed_event_sync(&db, &recorded_by, &msg, &signing_key)
+        .map_err(|e| ServiceError(format!("{}", e)))?;
 
     Ok(SendResponse {
         content: content.to_string(),
@@ -770,7 +807,8 @@ pub fn svc_react(
         signer_type: 5,
         signature: [0u8; 64],
     });
-    let eid = unwrap_event_id(create_signed_event_sync(&db, &recorded_by, &rxn, &signing_key))?;
+    let eid = create_signed_event_sync(&db, &recorded_by, &rxn, &signing_key)
+        .map_err(|e| ServiceError(format!("{}", e)))?;
 
     Ok(ReactResponse {
         emoji: emoji.to_string(),
@@ -798,7 +836,8 @@ pub fn svc_delete_message(
         signer_type: 5,
         signature: [0u8; 64],
     });
-    unwrap_event_id(create_signed_event_sync(&db, &recorded_by, &del, &signing_key))?;
+    create_signed_event_sync(&db, &recorded_by, &del, &signing_key)
+        .map_err(|e| ServiceError(format!("{}", e)))?;
 
     Ok(DeleteResponse {
         target: target_hex.to_string(),
@@ -997,8 +1036,7 @@ pub async fn svc_sync(
     {
         let db = open_connection(db_path)?;
         import_cli_pins_to_sql(&db, &recorded_by, &cli_pins)?;
-        let combined = allowed_peers_from_db(&db, &recorded_by)?;
-        if combined.is_empty() {
+        if !has_any_trusted_peer(&db, &recorded_by)? {
             return Err("No allowed peers: provide --pin-peer for bootstrap, accept an invite link, or ensure identity events have synced. \
                 Use `poc-7 transport-identity --db <peer-db>` to get a peer's fingerprint.".into());
         }
@@ -1137,6 +1175,308 @@ pub async fn svc_intro(
 }
 
 // ---------------------------------------------------------------------------
+// Invite create / accept
+// ---------------------------------------------------------------------------
+
+/// Create a user invite for the active workspace.
+///
+/// Requires an existing bootstrapped identity (workspace + admin).
+/// Returns an invite link with the bootstrap address and SPKI embedded.
+pub fn svc_create_invite(
+    db_path: &str,
+    bootstrap_addr: &str,
+) -> ServiceResult<CreateInviteResponse> {
+    let db = open_connection(db_path)?;
+    create_tables(&db)?;
+
+    let recorded_by = load_transport_peer_id_from_db(db_path)
+        .map_err(|e| ServiceError(format!("No transport identity: {}", e)))?;
+
+    // Load workspace key from local_peer_signers + workspace lookup
+    let workspace_id = db
+        .query_row(
+            "SELECT workspace_id FROM trust_anchors WHERE peer_id = ?1",
+            [&recorded_by],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|_| ServiceError("No workspace found. Bootstrap a workspace first.".into()))?;
+
+    let ws_eid = event_id_from_base64(&workspace_id)
+        .ok_or_else(|| ServiceError("Invalid workspace_id in trust_anchors".into()))?;
+
+    // Look up the workspace signing key from the workspace event's public key,
+    // then find the matching signer. For invite creation we need the workspace
+    // key stored during bootstrap (in local_peer_signers we only store peer_shared).
+    // The workspace key is stored in a separate table by ensure_identity_chain.
+    //
+    // For now, we require the caller to have the workspace_key stored.
+    // Check local_workspace_keys table (created by bootstrap).
+    ensure_workspace_key_table(&db)?;
+    let ws_key_bytes: Vec<u8> = db
+        .query_row(
+            "SELECT signing_key FROM local_workspace_keys WHERE recorded_by = ?1",
+            [&recorded_by],
+            |row| row.get(0),
+        )
+        .map_err(|_| ServiceError("No workspace signing key found. Only workspace creators can invite.".into()))?;
+
+    if ws_key_bytes.len() != 32 {
+        return Err(ServiceError("Corrupt workspace key".into()));
+    }
+    let mut key_arr = [0u8; 32];
+    key_arr.copy_from_slice(&ws_key_bytes);
+    let workspace_key = SigningKey::from_bytes(&key_arr);
+
+    let invite = crate::identity_ops::create_user_invite(&db, &recorded_by, &workspace_key, &ws_eid)
+        .map_err(|e| ServiceError(format!("Failed to create invite: {}", e)))?;
+
+    // Record pending bootstrap trust so invitee can connect
+    let pending_spki = crate::transport_identity::expected_invite_bootstrap_spki_from_invite_key(
+        &invite.invite_key,
+    )
+    .map_err(|e| ServiceError(format!("Failed to derive invite SPKI: {}", e)))?;
+    crate::db::transport_trust::record_pending_invite_bootstrap_trust(
+        &db,
+        &recorded_by,
+        &event_id_to_base64(&invite.invite_event_id),
+        &event_id_to_base64(&ws_eid),
+        &pending_spki,
+    )?;
+
+    // Get local SPKI for the bootstrap address
+    let spki_hex = &recorded_by;
+    let spki_bytes = hex::decode(spki_hex)?;
+    let mut bootstrap_spki = [0u8; 32];
+    bootstrap_spki.copy_from_slice(&spki_bytes);
+
+    let invite_link = crate::invite_link::create_invite_link(&invite, bootstrap_addr, &bootstrap_spki)
+        .map_err(|e| ServiceError(format!("Failed to create invite link: {}", e)))?;
+
+    Ok(CreateInviteResponse {
+        invite_link,
+        invite_event_id: event_id_to_base64(&invite.invite_event_id),
+    })
+}
+
+/// Accept a user invite via bootstrap sync + identity chain creation.
+///
+/// 1. Parses the invite link
+/// 2. Installs bootstrap transport identity derived from invite key
+/// 3. Connects to bootstrap address and syncs prerequisite events
+/// 4. Creates identity chain (InviteAccepted → UserBoot → DeviceInvite → PeerShared)
+/// 5. Records bootstrap trust and persists signer keys
+pub async fn svc_accept_invite(
+    db_path: &str,
+    invite_link_str: &str,
+    _username: &str,
+    _devicename: &str,
+) -> ServiceResult<AcceptInviteResponse> {
+    let invite = crate::invite_link::parse_invite_link(invite_link_str)
+        .map_err(|e| ServiceError(format!("Invalid invite link: {}", e)))?;
+
+    if invite.kind != crate::invite_link::InviteLinkKind::User {
+        return Err(ServiceError("Expected a user invite link (quiet://invite/...)".into()));
+    }
+
+    let invite_key = invite.invite_signing_key();
+    let invite_event_id = invite.invite_event_id;
+    let workspace_id = invite.workspace_id;
+
+    // Initialize DB and install bootstrap transport identity
+    {
+        let db = open_connection(db_path)?;
+        create_tables(&db)?;
+    }
+    let recorded_by = crate::transport_identity::install_invite_bootstrap_transport_identity(
+        db_path,
+        &invite_key,
+    )
+    .map_err(|e| ServiceError(format!("Failed to install bootstrap identity: {}", e)))?;
+
+    // Bootstrap sync: fetch prerequisite events from inviter
+    let bootstrap_addr: std::net::SocketAddr = invite
+        .bootstrap_addr
+        .parse()
+        .map_err(|e| ServiceError(format!("Invalid bootstrap address '{}': {}", invite.bootstrap_addr, e)))?;
+
+    crate::sync::bootstrap::bootstrap_sync_from_invite(
+        db_path,
+        &recorded_by,
+        bootstrap_addr,
+        &invite.bootstrap_spki_fingerprint,
+        15, // timeout seconds
+    )
+    .await
+    .map_err(|e| ServiceError(format!("Bootstrap sync failed: {}", e)))?;
+
+    // Verify prerequisite events arrived
+    let db = open_connection(db_path)?;
+    let ws_b64 = event_id_to_base64(&workspace_id);
+    let ws_exists: bool = db
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM events WHERE event_id = ?1",
+            [&ws_b64],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    if !ws_exists {
+        return Err(ServiceError(
+            "Bootstrap sync did not deliver workspace event. Ensure the inviter is running sync.".into(),
+        ));
+    }
+
+    // Accept the invite: creates identity chain
+    let join = crate::identity_ops::accept_user_invite(
+        &db,
+        &recorded_by,
+        &invite_key,
+        &invite_event_id,
+        workspace_id,
+    )
+    .map_err(|e| ServiceError(format!("Failed to accept invite: {}", e)))?;
+
+    // Record bootstrap trust
+    crate::db::transport_trust::record_invite_bootstrap_trust(
+        &db,
+        &recorded_by,
+        &event_id_to_base64(&join.invite_accepted_event_id),
+        &event_id_to_base64(&invite_event_id),
+        &event_id_to_base64(&workspace_id),
+        &invite.bootstrap_addr,
+        &invite.bootstrap_spki_fingerprint,
+    )?;
+
+    // Persist signer key so future commands can sign events
+    let psf_b64 = event_id_to_base64(&join.peer_shared_event_id);
+    persist_local_peer_signer(&db, &recorded_by, &psf_b64, &join.peer_shared_key)?;
+
+    // Also store workspace key table entry (not applicable for joiners, they don't
+    // have the workspace key — only the creator does)
+
+    Ok(AcceptInviteResponse {
+        peer_id: recorded_by,
+        user_event_id: event_id_to_base64(&join.user_event_id),
+        peer_shared_event_id: psf_b64,
+    })
+}
+
+/// Accept a device link invite via bootstrap sync + identity chain creation.
+///
+/// Mirrors `svc_accept_invite` but for device-link invites:
+/// 1. Parses the invite link (expects `quiet://link/...`)
+/// 2. Installs bootstrap transport identity derived from invite key
+/// 3. Connects to bootstrap address and syncs prerequisite events
+/// 4. Creates identity chain (InviteAccepted → PeerSharedFirst → TransportKey)
+/// 5. Records bootstrap trust and persists signer keys
+pub async fn svc_accept_device_link(
+    db_path: &str,
+    invite_link_str: &str,
+    _devicename: &str,
+) -> ServiceResult<AcceptDeviceLinkResponse> {
+    let invite = crate::invite_link::parse_invite_link(invite_link_str)
+        .map_err(|e| ServiceError(format!("Invalid invite link: {}", e)))?;
+
+    if invite.kind != crate::invite_link::InviteLinkKind::DeviceLink {
+        return Err(ServiceError("Expected a device link (quiet://link/...)".into()));
+    }
+
+    let invite_key = invite.invite_signing_key();
+    let invite_event_id = invite.invite_event_id;
+    let workspace_id = invite.workspace_id;
+
+    // Initialize DB and install bootstrap transport identity
+    {
+        let db = open_connection(db_path)?;
+        create_tables(&db)?;
+    }
+    let recorded_by = crate::transport_identity::install_invite_bootstrap_transport_identity(
+        db_path,
+        &invite_key,
+    )
+    .map_err(|e| ServiceError(format!("Failed to install bootstrap identity: {}", e)))?;
+
+    // Bootstrap sync: fetch prerequisite events from inviter
+    let bootstrap_addr: std::net::SocketAddr = invite
+        .bootstrap_addr
+        .parse()
+        .map_err(|e| ServiceError(format!("Invalid bootstrap address '{}': {}", invite.bootstrap_addr, e)))?;
+
+    crate::sync::bootstrap::bootstrap_sync_from_invite(
+        db_path,
+        &recorded_by,
+        bootstrap_addr,
+        &invite.bootstrap_spki_fingerprint,
+        15,
+    )
+    .await
+    .map_err(|e| ServiceError(format!("Bootstrap sync failed: {}", e)))?;
+
+    // Accept the device link: creates identity chain
+    let db = open_connection(db_path)?;
+    let link = crate::identity_ops::accept_device_link(
+        &db,
+        &recorded_by,
+        &invite_key,
+        &invite_event_id,
+        workspace_id,
+    )
+    .map_err(|e| ServiceError(format!("Failed to accept device link: {}", e)))?;
+
+    // Record bootstrap trust
+    crate::db::transport_trust::record_invite_bootstrap_trust(
+        &db,
+        &recorded_by,
+        &event_id_to_base64(&link.invite_accepted_event_id),
+        &event_id_to_base64(&invite_event_id),
+        &event_id_to_base64(&workspace_id),
+        &invite.bootstrap_addr,
+        &invite.bootstrap_spki_fingerprint,
+    )?;
+
+    // Persist signer key
+    let psf_b64 = event_id_to_base64(&link.peer_shared_event_id);
+    persist_local_peer_signer(&db, &recorded_by, &psf_b64, &link.peer_shared_key)?;
+
+    Ok(AcceptDeviceLinkResponse {
+        peer_id: recorded_by,
+        peer_shared_event_id: psf_b64,
+    })
+}
+
+/// Ensure the local_workspace_keys table exists (stores workspace signing keys
+/// for invite creation by workspace creators).
+fn ensure_workspace_key_table(db: &rusqlite::Connection) -> ServiceResult<()> {
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS local_workspace_keys (
+            recorded_by TEXT PRIMARY KEY,
+            signing_key BLOB NOT NULL,
+            updated_at INTEGER NOT NULL
+        )",
+        [],
+    )?;
+    Ok(())
+}
+
+/// Persist the workspace signing key for later invite creation.
+pub fn persist_workspace_key(
+    db: &rusqlite::Connection,
+    recorded_by: &str,
+    workspace_key: &SigningKey,
+) -> ServiceResult<()> {
+    ensure_workspace_key_table(db)?;
+    let now = current_timestamp_ms() as i64;
+    db.execute(
+        "INSERT INTO local_workspace_keys (recorded_by, signing_key, updated_at)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(recorded_by)
+         DO UPDATE SET signing_key = excluded.signing_key, updated_at = excluded.updated_at",
+        rusqlite::params![recorded_by, workspace_key.to_bytes().as_slice(), now],
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Socket path helper
 // ---------------------------------------------------------------------------
 
@@ -1150,4 +1490,85 @@ pub fn socket_path_for_db(db_path: &str) -> std::path::PathBuf {
         std::env::current_dir().unwrap_or_default().join(p)
     };
     abs.with_extension("p7d.sock")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_db_path() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let path_str = path.to_str().unwrap().to_string();
+        // Bootstrap transport identity + schema
+        ensure_transport_peer_id_from_db(&path_str).unwrap();
+        (dir, path_str)
+    }
+
+    fn setup_with_workspace(db_path: &str) -> String {
+        let recorded_by = load_transport_peer_id_from_db(db_path).unwrap();
+        let db = open_connection(db_path).unwrap();
+        create_tables(&db).unwrap();
+        let (_eid, _key) = ensure_identity_chain(&db, &recorded_by).unwrap();
+
+        // Get the workspace hex for this identity chain
+        let ws_b64: String = db
+            .query_row(
+                "SELECT workspace_id FROM workspaces WHERE recorded_by = ?1 LIMIT 1",
+                rusqlite::params![&recorded_by],
+                |row| row.get(0),
+            )
+            .unwrap();
+        use base64::Engine;
+        let ws_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&ws_b64)
+            .unwrap();
+        hex::encode(ws_bytes)
+    }
+
+    #[test]
+    fn test_svc_send_succeeds_on_valid() {
+        let (_dir, db_path) = temp_db_path();
+        let workspace_hex = setup_with_workspace(&db_path);
+
+        let resp = svc_send(&db_path, &workspace_hex, "hello").unwrap();
+        assert_eq!(resp.content, "hello");
+        assert!(!resp.event_id.is_empty());
+    }
+
+    #[test]
+    fn test_svc_react_errors_on_blocked() {
+        let (_dir, db_path) = temp_db_path();
+        let _workspace_hex = setup_with_workspace(&db_path);
+
+        // React to a non-existent target — reaction will block on missing dep
+        let fake_target = hex::encode([0xDD_u8; 32]);
+        let result = svc_react(&db_path, &fake_target, "thumbsup");
+        assert!(result.is_err(), "reaction to missing target should error, got: {:?}", result);
+    }
+
+    #[test]
+    fn test_svc_delete_errors_on_blocked() {
+        let (_dir, db_path) = temp_db_path();
+        let _workspace_hex = setup_with_workspace(&db_path);
+
+        // Delete a non-existent message — will block on missing dep
+        let fake_target = hex::encode([0xEE_u8; 32]);
+        let result = svc_delete_message(&db_path, &fake_target);
+        assert!(result.is_err(), "delete of missing target should error, got: {:?}", result);
+    }
+
+    #[test]
+    fn test_ensure_identity_chain_tolerates_workspace_blocked() {
+        // Workspace is created before trust anchor exists, so it blocks.
+        // ensure_identity_chain must handle this via staged API.
+        let (_dir, db_path) = temp_db_path();
+        let recorded_by = load_transport_peer_id_from_db(&db_path).unwrap();
+        let db = open_connection(&db_path).unwrap();
+        create_tables(&db).unwrap();
+
+        // This should succeed — workspace blocking is handled internally
+        let (eid, _key) = ensure_identity_chain(&db, &recorded_by).unwrap();
+        assert_ne!(eid, [0u8; 32]);
+    }
 }

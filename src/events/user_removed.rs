@@ -70,6 +70,7 @@ pub static USER_REMOVED_META: EventTypeMeta = EventTypeMeta {
     dep_field_type_codes: &[&[14, 15], &[]],
     signer_required: true,
     signature_byte_len: 64,
+    encryptable: false,
     parse: parse_user_removed,
     encode: encode_user_removed,
 };

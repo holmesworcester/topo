@@ -7,7 +7,7 @@ pub const SQL_INSERT_EVENT: &str =
     "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
      VALUES (?1, ?2, ?3, ?4, ?5, ?6)";
 pub const SQL_INSERT_NEG_ITEM: &str =
-    "INSERT OR IGNORE INTO neg_items (ts, id) VALUES (?1, ?2)";
+    "INSERT OR IGNORE INTO neg_items (workspace_id, ts, id) VALUES (?1, ?2, ?3)";
 pub const SQL_INSERT_RECORDED_EVENT: &str =
     "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
      VALUES (?1, ?2, ?3, ?4)";
@@ -49,11 +49,24 @@ pub fn insert_neg_item_if_shared(
     share_scope: ShareScope,
     created_at_ms: i64,
     event_id: &EventId,
+    workspace_id: &str,
 ) -> SqliteResult<()> {
     if share_scope == ShareScope::Shared {
-        conn.execute(SQL_INSERT_NEG_ITEM, params![created_at_ms, event_id.as_slice()])?;
+        conn.execute(SQL_INSERT_NEG_ITEM, params![workspace_id, created_at_ms, event_id.as_slice()])?;
     }
     Ok(())
+}
+
+/// Look up the workspace_id (base64 event_id of the Network/Workspace event)
+/// for a given peer_id from the trust_anchors table.
+/// Returns "" if no trust anchor exists yet (bootstrap-in-progress).
+pub fn lookup_workspace_id(conn: &Connection, peer_id: &str) -> String {
+    conn.query_row(
+        "SELECT workspace_id FROM trust_anchors WHERE peer_id = ?1",
+        params![peer_id],
+        |row| row.get::<_, String>(0),
+    )
+    .unwrap_or_default()
 }
 
 pub fn insert_recorded_event(

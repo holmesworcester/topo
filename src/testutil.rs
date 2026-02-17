@@ -2,11 +2,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::crypto::{event_id_from_base64, EventId};
+use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
 use crate::db::{
     open_connection,
     schema::create_tables,
-    store::{insert_event, insert_neg_item_if_shared, insert_recorded_event, parse_share_scope},
+    store::{insert_event, insert_recorded_event, parse_share_scope},
 };
 use crate::events::{
     MessageEvent, MessageDeletionEvent, ReactionEvent, SecretKeyEvent,
@@ -27,6 +27,7 @@ use crate::transport::{
     DualConnection,
     create_client_endpoint,
     create_dual_endpoint,
+    create_dual_endpoint_dynamic,
     create_server_endpoint,
     extract_spki_fingerprint,
     peer_identity_from_connection,
@@ -85,6 +86,15 @@ pub struct Peer {
     _tempdir: tempfile::TempDir,
 }
 
+/// Delegate to the shared bootstrap responder in sync::bootstrap.
+fn start_test_sync_endpoint(
+    inviter_db_path: &str,
+    inviter_identity: &str,
+    invite_key: &SigningKey,
+) -> Result<(SocketAddr, quinn::Endpoint), Box<dyn std::error::Error + Send + Sync>> {
+    crate::sync::bootstrap::start_bootstrap_responder(inviter_db_path, inviter_identity, invite_key)
+}
+
 impl Peer {
     /// Create a new peer with a fresh temp database (no identity chain).
     pub fn new(name: &str) -> Self {
@@ -136,15 +146,36 @@ impl Peer {
     }
 
     /// Create a new peer that joins an existing workspace created by `creator`
-    /// using the production invite flow: creator issues a `create_user_invite`,
-    /// joiner copies prerequisite events and calls `accept_user_invite`.
-    /// Both TransportKey and full identity chain are created automatically.
-    pub fn new_in_workspace(name: &str, creator: &Peer) -> Self {
-        use crate::crypto::event_id_to_base64;
-        use crate::identity_ops::{create_user_invite, accept_user_invite};
+    /// using the production invite flow with real QUIC bootstrap sync:
+    /// creator issues `create_user_invite`, starts a temp sync endpoint,
+    /// joiner fetches prerequisite events via bootstrap sync, then calls
+    /// `accept_user_invite`. No direct DB-to-DB event copying.
+    pub async fn new_in_workspace(name: &str, creator: &Peer) -> Self {
+        use crate::identity_ops::create_user_invite;
+        use crate::invite_link::create_invite_link;
+        use crate::transport_identity::expected_invite_bootstrap_spki_from_invite_key;
+        use crate::db::transport_trust::record_pending_invite_bootstrap_trust;
 
-        let mut peer = Self::new(name);
-        let db = open_connection(&peer.db_path).expect("failed to open db");
+        // Create a bare peer with DB tables but NO transport identity.
+        // svc_accept_invite will install the invite-derived identity.
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        let db_path = tempdir.path().join(format!("{}.db", name))
+            .to_str().unwrap().to_string();
+        {
+            let db = open_connection(&db_path).expect("failed to open db");
+            create_tables(&db).expect("failed to create tables");
+        }
+        let mut peer = Self {
+            name: name.to_string(),
+            db_path,
+            identity: String::new(),
+            author_id: rand::random(),
+            workspace_id: [0u8; 32],
+            peer_shared_event_id: None,
+            peer_shared_signing_key: None,
+            workspace_signing_key: None,
+            _tempdir: tempdir,
+        };
         let creator_db = open_connection(&creator.db_path).expect("failed to open creator db");
         let workspace_key = creator.workspace_signing_key.as_ref()
             .expect("creator has no workspace_signing_key; use new_with_identity()");
@@ -154,41 +185,48 @@ impl Peer {
             &creator_db, &creator.identity, workspace_key, &creator.workspace_id,
         ).expect("failed to create user invite");
 
-        // Copy prerequisite events from creator to joiner:
-        // Workspace + the UserInviteBoot created by create_user_invite
-        for eid in &[creator.workspace_id, invite.invite_event_id] {
-            let eid_b64 = event_id_to_base64(eid);
-            let (event_type, blob, share_scope, created_at, inserted_at): (String, Vec<u8>, String, i64, i64) =
-                creator_db.query_row(
-                    "SELECT event_type, blob, share_scope, created_at, inserted_at FROM events WHERE event_id = ?1",
-                    rusqlite::params![&eid_b64],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
-                ).expect("event not found in creator");
-
-            let scope = parse_share_scope(&share_scope).expect("invalid share_scope");
-            insert_event(&db, eid, &event_type, &blob, scope, created_at, inserted_at)
-                .expect("failed to insert event");
-
-            let now_ms = current_timestamp_ms() as i64;
-            insert_recorded_event(&db, &peer.identity, eid, now_ms, "test")
-                .expect("failed to record event");
-            insert_neg_item_if_shared(&db, scope, created_at, eid)
-                .expect("failed to add to neg_items");
-
-            let _ = project_one(&db, &peer.identity, eid);
-        }
+        // Register pending bootstrap trust so creator's endpoint allows the joiner
+        let pending_spki = expected_invite_bootstrap_spki_from_invite_key(&invite.invite_key)
+            .expect("failed to derive invite SPKI");
+        record_pending_invite_bootstrap_trust(
+            &creator_db,
+            &creator.identity,
+            &event_id_to_base64(&invite.invite_event_id),
+            &event_id_to_base64(&creator.workspace_id),
+            &pending_spki,
+        ).expect("failed to record pending bootstrap trust");
         drop(creator_db);
 
-        // Joiner accepts the invite (production flow: InviteAccepted → UserBoot →
-        // DeviceInviteFirst → PeerSharedFirst → TransportKey)
-        let join = accept_user_invite(
-            &db, &peer.identity, &invite.invite_key,
-            &invite.invite_event_id, creator.workspace_id,
-        ).expect("failed to accept user invite");
+        // Start a temp sync endpoint for the creator
+        let (sync_addr, sync_endpoint) = start_test_sync_endpoint(
+            &creator.db_path,
+            &creator.identity,
+            &invite.invite_key,
+        ).expect("failed to start temp sync endpoint");
 
+        // Build invite link with creator's bootstrap address and SPKI
+        let creator_spki = creator.spki_fingerprint();
+        let invite_link = create_invite_link(&invite, &sync_addr.to_string(), &creator_spki)
+            .expect("failed to create invite link");
+
+        // Joiner accepts via real bootstrap sync + identity chain creation
+        let result = crate::service::svc_accept_invite(
+            &peer.db_path, &invite_link, name, "device",
+        ).await.expect("failed to accept invite via bootstrap sync");
+
+        // Clean up sync endpoint
+        sync_endpoint.close(0u32.into(), b"bootstrap done");
+
+        // Update peer state from service result
+        peer.identity = result.peer_id.clone();
         peer.workspace_id = creator.workspace_id;
-        peer.peer_shared_event_id = Some(join.peer_shared_event_id);
-        peer.peer_shared_signing_key = Some(join.peer_shared_key);
+
+        // Load signing key from DB (service layer persisted it)
+        let db = open_connection(&peer.db_path).expect("failed to open db");
+        if let Ok(Some((eid, key))) = crate::service::load_local_peer_signer_pub(&db, &result.peer_id) {
+            peer.peer_shared_event_id = Some(eid);
+            peer.peer_shared_signing_key = Some(key);
+        }
 
         peer
     }
@@ -894,6 +932,27 @@ impl Peer {
             .collect::<Result<Vec<_>, _>>()
             .expect("collect")
     }
+
+    /// Insert `count` synthetic transport_keys rows for this peer.
+    /// Returns the generated SPKI fingerprints.
+    pub fn seed_transport_keys(&self, count: usize) -> Vec<[u8; 32]> {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        db.execute("BEGIN", []).expect("failed to begin");
+        let mut fps = Vec::with_capacity(count);
+        for i in 0..count {
+            let mut fp = [0u8; 32];
+            let bytes = (i as u64).to_le_bytes();
+            fp[..8].copy_from_slice(&bytes);
+            fp[8] = 0xFE; // sentinel to distinguish synthetic keys
+            fps.push(fp);
+            db.execute(
+                "INSERT OR IGNORE INTO transport_keys (recorded_by, event_id, spki_fingerprint) VALUES (?1, ?2, ?3)",
+                rusqlite::params![&self.identity, format!("synthetic_tk_{}", i), fp.as_slice()],
+            ).expect("failed to insert transport_key");
+        }
+        db.execute("COMMIT", []).expect("failed to commit");
+        fps
+    }
 }
 
 /// Copy all events from `src` peer's DB into `dest` peer's DB and project them.
@@ -1250,6 +1309,116 @@ pub fn start_peers_identity_trust(
     });
 
     (a_handle, b_handle)
+}
+
+/// Start continuous sync between two peers using dynamic DB trust lookup.
+/// Trust is resolved from SQL at each TLS handshake, matching production
+/// behavior (`is_peer_allowed`). Caller must have seeded trust rows
+/// (via `publish_transport_key` + sync, `import_cli_pins_to_sql`, or invite
+/// bootstrap) before peers will accept connections.
+pub fn start_peers_dynamic(
+    peer_a: &Peer,
+    peer_b: &Peer,
+) -> (std::thread::JoinHandle<()>, std::thread::JoinHandle<()>) {
+    use crate::db::transport_trust::is_peer_allowed;
+
+    let (cert_a, key_a) = peer_a.cert_and_key();
+    let (cert_b, key_b) = peer_b.cert_and_key();
+
+    let a_db_path = peer_a.db_path.clone();
+    let a_recorded_by = peer_a.identity.clone();
+    let dynamic_allow_a: Arc<crate::transport::DynamicAllowFn> =
+        Arc::new(move |peer_fp: &[u8; 32]| {
+            let db = open_connection(&a_db_path)?;
+            is_peer_allowed(&db, &a_recorded_by, peer_fp)
+        });
+
+    let b_db_path = peer_b.db_path.clone();
+    let b_recorded_by = peer_b.identity.clone();
+    let dynamic_allow_b: Arc<crate::transport::DynamicAllowFn> =
+        Arc::new(move |peer_fp: &[u8; 32]| {
+            let db = open_connection(&b_db_path)?;
+            is_peer_allowed(&db, &b_recorded_by, peer_fp)
+        });
+
+    let listener_endpoint = create_dual_endpoint_dynamic(
+        "127.0.0.1:0".parse().unwrap(),
+        cert_a,
+        key_a,
+        dynamic_allow_a,
+    )
+    .expect("failed to create dynamic dual endpoint for A");
+
+    let listener_addr = listener_endpoint
+        .local_addr()
+        .expect("failed to get listener addr");
+
+    let connector_endpoint = create_dual_endpoint_dynamic(
+        "127.0.0.1:0".parse().unwrap(),
+        cert_b,
+        key_b,
+        dynamic_allow_b,
+    )
+    .expect("failed to create dynamic dual endpoint for B");
+
+    let a_db = peer_a.db_path.clone();
+    let a_identity = peer_a.identity.clone();
+    let b_db = peer_b.db_path.clone();
+    let b_identity = peer_b.identity.clone();
+
+    let a_handle = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            if let Err(e) = accept_loop(&a_db, &a_identity, listener_endpoint).await {
+                tracing::warn!("accept_loop exited: {}", e);
+            }
+        });
+    });
+
+    let b_handle = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            if let Err(e) =
+                connect_loop(&b_db, &b_identity, connector_endpoint, listener_addr).await
+            {
+                tracing::warn!("connect_loop exited: {}", e);
+            }
+        });
+    });
+
+    (a_handle, b_handle)
+}
+
+/// Create a QUIC endpoint with dynamic DB trust lookup for a test peer.
+/// Returns the endpoint (dual-role: accepts and connects).
+/// Trust is resolved from SQL at each TLS handshake, matching production behavior.
+pub fn create_dynamic_endpoint_for_peer(
+    peer: &Peer,
+) -> quinn::Endpoint {
+    use crate::db::transport_trust::is_peer_allowed;
+
+    let (cert, key) = peer.cert_and_key();
+    let db_path = peer.db_path.clone();
+    let recorded_by = peer.identity.clone();
+    let dynamic_allow: Arc<crate::transport::DynamicAllowFn> =
+        Arc::new(move |peer_fp: &[u8; 32]| {
+            let db = open_connection(&db_path)?;
+            is_peer_allowed(&db, &recorded_by, peer_fp)
+        });
+
+    create_dual_endpoint_dynamic(
+        "127.0.0.1:0".parse().unwrap(),
+        cert,
+        key,
+        dynamic_allow,
+    )
+    .expect("failed to create dynamic endpoint for peer")
 }
 
 /// Start sync, wait for a caller-defined convergence check, return metrics.

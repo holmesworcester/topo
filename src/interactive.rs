@@ -4,19 +4,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::SigningKey;
 
-use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
+use crate::crypto::{event_id_to_base64, EventId};
 use crate::db::{
     open_connection,
     schema::create_tables,
-    store::{insert_event, insert_neg_item_if_shared, insert_recorded_event, parse_share_scope},
 };
 use crate::events::*;
-use crate::identity_ops::{self, IdentityChain, InviteType, JoinChain, LinkChain};
+use crate::identity_ops::{self, IdentityChain, InviteType};
 use crate::invite_link::{create_invite_link, parse_invite_link, InviteLinkKind};
 use crate::projection::create::create_signed_event_sync;
 use crate::transport_identity::{
     ensure_transport_peer_id_from_db, expected_invite_bootstrap_spki_from_invite_key,
-    install_invite_bootstrap_transport_identity,
 };
 
 use rustyline::completion::{Completer, Pair};
@@ -116,31 +114,6 @@ impl Account {
         }
     }
 
-    fn store_join_keys(&mut self, join: &JoinChain) {
-        self.user_event_id = Some(join.user_event_id);
-        self.user_key = Some(join.user_key.clone());
-        self.peer_shared_event_id = Some(join.peer_shared_event_id);
-        self.peer_shared_key = Some(join.peer_shared_key.clone());
-
-        let keys_to_store = [
-            (join.user_event_id, join.user_key.clone()),
-            (join.device_invite_event_id, join.device_invite_key.clone()),
-            (join.peer_shared_event_id, join.peer_shared_key.clone()),
-        ];
-        for (eid, key) in keys_to_store {
-            self.signing_keys.insert(event_id_to_base64(&eid), key);
-        }
-    }
-
-    fn store_link_keys(&mut self, link: &LinkChain) {
-        self.peer_shared_event_id = Some(link.peer_shared_event_id);
-        self.peer_shared_key = Some(link.peer_shared_key.clone());
-        self.signing_keys.insert(
-            event_id_to_base64(&link.peer_shared_event_id),
-            link.peer_shared_key.clone(),
-        );
-    }
-
     fn short_user_id(&self) -> String {
         self.user_event_id
             .map(|eid| {
@@ -174,10 +147,12 @@ struct Session {
     active: usize,
     invites: Vec<FrontendInvite>,
     channels: Vec<ChannelInfo>,
+    rt: tokio::runtime::Handle,
 }
 
 impl Session {
     fn new() -> Self {
+        let rt = tokio::runtime::Handle::current();
         let mut default_channel = [0u8; 32];
         default_channel[..16]
             .copy_from_slice(&hex::decode("0102030405060708090a0b0c0d0e0f10").unwrap());
@@ -189,6 +164,7 @@ impl Session {
                 name: "general".to_string(),
                 id: default_channel,
             }],
+            rt,
         }
     }
 
@@ -854,6 +830,17 @@ fn cmd_invite(
     Ok(())
 }
 
+/// In the interactive REPL all accounts live in one process — nobody is
+/// running `poc-7 sync`.  This spins up a temporary QUIC sync endpoint for
+/// Delegate to the shared bootstrap responder in sync::bootstrap.
+fn start_temp_sync_endpoint(
+    inviter_db_path: &str,
+    inviter_identity: &str,
+    invite_key: &ed25519_dalek::SigningKey,
+) -> Result<(std::net::SocketAddr, quinn::Endpoint), Box<dyn std::error::Error + Send + Sync>> {
+    crate::sync::bootstrap::start_bootstrap_responder(inviter_db_path, inviter_identity, invite_key)
+}
+
 fn cmd_accept_invite(
     session: &mut Session,
     args: &[&str],
@@ -869,6 +856,8 @@ fn cmd_accept_invite(
             return Ok(());
         }
     };
+
+    // Validate invite kind before creating account
     let invite = match parse_invite_link(&invite_link) {
         Ok(v) => v,
         Err(e) => {
@@ -885,44 +874,67 @@ fn cmd_accept_invite(
         return Ok(());
     }
 
-    let invite_key = invite.invite_signing_key();
-    let invite_event_id = invite.invite_event_id;
     let workspace_id = invite.workspace_id;
-    let workspace_name = session
+    let inviter = session
         .accounts
         .iter()
-        .find(|a| a.workspace_id == Some(workspace_id))
-        .and_then(|a| a.workspace_name.clone());
+        .find(|a| a.workspace_id == Some(workspace_id));
+    let workspace_name = inviter.and_then(|a| a.workspace_name.clone());
 
+    // If the inviter is in this session, start a temp sync endpoint so
+    // the joiner can fetch prerequisite events via real QUIC.
+    let invite_key = invite.invite_signing_key();
+    let (effective_link, _temp_endpoint) = if let Some(inviter) = inviter {
+        let (addr, ep) = start_temp_sync_endpoint(
+            &inviter.db_path,
+            &inviter.identity,
+            &invite_key,
+        )?;
+        let rewritten = crate::invite_link::rewrite_bootstrap_addr(
+            &invite_link,
+            &addr.to_string(),
+        )?;
+        (rewritten, Some(ep))
+    } else {
+        (invite_link.clone(), None)
+    };
+
+    // Create account — svc_accept_invite will replace the random cert with a
+    // deterministic one derived from the invite key (DELETE + INSERT).
     let mut account = Account::new(username, devicename);
-    account.identity = install_invite_bootstrap_transport_identity(&account.db_path, &invite_key)?;
+
+    // Delegate to service layer: bootstrap sync + identity chain creation
+    let result = tokio::task::block_in_place(|| {
+        session.rt.block_on(crate::service::svc_accept_invite(
+            &account.db_path,
+            &effective_link,
+            username,
+            devicename,
+        ))
+    })
+    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+        format!("{}", e).into()
+    })?;
+
+    // Shut down temp sync endpoint if we started one
+    if let Some(ep) = _temp_endpoint {
+        ep.close(0u32.into(), b"bootstrap done");
+    }
+
+    // Update account state from service result
+    account.identity = result.peer_id;
     account.workspace_id = Some(workspace_id);
     account.workspace_name = workspace_name;
 
+    // Load keys from DB for interactive signing (service layer persisted them)
     let conn = open_connection(&account.db_path)?;
-
-    // Copy shared chain needed to validate and project the invite.
-    copy_event_chain(session, workspace_id, &conn, &account.identity)?;
-
-    let join = identity_ops::accept_user_invite(
-        &conn,
-        &account.identity,
-        &invite_key,
-        &invite_event_id,
-        workspace_id,
-    )?;
-
-    crate::db::transport_trust::record_invite_bootstrap_trust(
-        &conn,
-        &account.identity,
-        &event_id_to_base64(&join.invite_accepted_event_id),
-        &event_id_to_base64(&invite_event_id),
-        &event_id_to_base64(&workspace_id),
-        &invite.bootstrap_addr,
-        &invite.bootstrap_spki_fingerprint,
-    )?;
-
-    account.store_join_keys(&join);
+    if let Ok(Some((psf_eid, psf_key))) = crate::service::load_local_peer_signer_pub(&conn, &account.identity) {
+        account.peer_shared_event_id = Some(psf_eid);
+        account.peer_shared_key = Some(psf_key.clone());
+        account
+            .signing_keys
+            .insert(event_id_to_base64(&psf_eid), psf_key);
+    }
 
     let user_id = account.short_user_id();
     let peer_id = account.short_peer_id();
@@ -994,6 +1006,8 @@ fn cmd_accept_link(
             return Ok(());
         }
     };
+
+    // Validate invite kind before creating account
     let invite = match parse_invite_link(&invite_link) {
         Ok(v) => v,
         Err(e) => {
@@ -1010,19 +1024,16 @@ fn cmd_accept_link(
         return Ok(());
     }
 
-    let device_invite_key = invite.invite_signing_key();
-    let device_invite_event_id = invite.invite_event_id;
     let workspace_id = invite.workspace_id;
-    let workspace_name = session
+    let inviter = session
         .accounts
         .iter()
-        .find(|a| a.workspace_id == Some(workspace_id))
-        .and_then(|a| a.workspace_name.clone());
+        .find(|a| a.workspace_id == Some(workspace_id));
+    let workspace_name = inviter.and_then(|a| a.workspace_name.clone());
 
     // Get the username from the inviting account for the device link.
     let username = match &invite.invite_type {
         InviteType::DeviceLink { .. } => {
-            // Find the account that created this invite by checking matching user_event_id.
             let mut found_name = "user".to_string();
             for acct in &session.accounts {
                 if let InviteType::DeviceLink { user_event_id } = &invite.invite_type {
@@ -1037,36 +1048,58 @@ fn cmd_accept_link(
         InviteType::User => "user".to_string(),
     };
 
+    // If the inviter is in this session, start a temp sync endpoint so
+    // the joiner can fetch prerequisite events via real QUIC.
+    let device_invite_key = invite.invite_signing_key();
+    let (effective_link, _temp_endpoint) = if let Some(inviter) = inviter {
+        let (addr, ep) = start_temp_sync_endpoint(
+            &inviter.db_path,
+            &inviter.identity,
+            &device_invite_key,
+        )?;
+        let rewritten = crate::invite_link::rewrite_bootstrap_addr(
+            &invite_link,
+            &addr.to_string(),
+        )?;
+        (rewritten, Some(ep))
+    } else {
+        (invite_link.clone(), None)
+    };
+
+    // Create account DB/state; svc_accept_device_link installs invite-derived transport identity.
     let mut account = Account::new(&username, devicename);
-    account.identity =
-        install_invite_bootstrap_transport_identity(&account.db_path, &device_invite_key)?;
+
+    // Delegate to service layer: bootstrap sync + identity chain creation
+    let result = tokio::task::block_in_place(|| {
+        session.rt.block_on(crate::service::svc_accept_device_link(
+            &account.db_path,
+            &effective_link,
+            devicename,
+        ))
+    })
+    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+        format!("{}", e).into()
+    })?;
+
+    // Shut down temp sync endpoint if we started one
+    if let Some(ep) = _temp_endpoint {
+        ep.close(0u32.into(), b"bootstrap done");
+    }
+
+    // Update account state from service result
+    account.identity = result.peer_id;
     account.workspace_id = Some(workspace_id);
     account.workspace_name = workspace_name;
 
+    // Load keys from DB for interactive signing (service layer persisted them)
     let conn = open_connection(&account.db_path)?;
-
-    // Copy shared chain needed to validate and project the invite.
-    copy_event_chain(session, workspace_id, &conn, &account.identity)?;
-
-    let link = identity_ops::accept_device_link(
-        &conn,
-        &account.identity,
-        &device_invite_key,
-        &device_invite_event_id,
-        workspace_id,
-    )?;
-
-    crate::db::transport_trust::record_invite_bootstrap_trust(
-        &conn,
-        &account.identity,
-        &event_id_to_base64(&link.invite_accepted_event_id),
-        &event_id_to_base64(&device_invite_event_id),
-        &event_id_to_base64(&workspace_id),
-        &invite.bootstrap_addr,
-        &invite.bootstrap_spki_fingerprint,
-    )?;
-
-    account.store_link_keys(&link);
+    if let Ok(Some((psf_eid, psf_key))) = crate::service::load_local_peer_signer_pub(&conn, &account.identity) {
+        account.peer_shared_event_id = Some(psf_eid);
+        account.peer_shared_key = Some(psf_key.clone());
+        account
+            .signing_keys
+            .insert(event_id_to_base64(&psf_eid), psf_key);
+    }
 
     let peer_id = account.short_peer_id();
     session.accounts.push(account);
@@ -1623,83 +1656,4 @@ fn get_message_event_id_by_num(
 
     crate::crypto::event_id_from_base64(&ids[msg_num - 1])
         .ok_or_else(|| format!("Invalid event ID for message {}", msg_num).into())
-}
-
-/// Copy the shared identity event chain needed for an invite to a new account's database.
-/// This simulates "syncing" the necessary events so the new account can validate the invite.
-/// Only copies shared events (not local-only) and fails fast on projection errors.
-fn copy_event_chain(
-    session: &Session,
-    workspace_id: EventId,
-    target_conn: &rusqlite::Connection,
-    target_recorded_by: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Find the source account that has this workspace event.
-    let source_account = session
-        .accounts
-        .iter()
-        .find(|a| a.workspace_id == Some(workspace_id))
-        .ok_or("Cannot find source account for invite workspace")?;
-
-    let source_conn = open_connection(&source_account.db_path)?;
-
-    // Copy only shared events from the source to the target
-    let mut stmt = source_conn.prepare(
-        "SELECT event_id, event_type, blob, share_scope, created_at, inserted_at
-         FROM events WHERE share_scope = 'shared'",
-    )?;
-    let events: Vec<(String, String, Vec<u8>, String, i64, i64)> = stmt
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, i64>(5)?,
-            ))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-
-    for (event_id, event_type, blob, share_scope_str, created_at, inserted_at) in &events {
-        let eid = event_id_from_base64(event_id).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Invalid event_id in source DB: {}", event_id),
-            )
-        })?;
-        let share_scope = parse_share_scope(share_scope_str).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Invalid share_scope in source DB: {}", share_scope_str),
-            )
-        })?;
-
-        insert_event(
-            target_conn,
-            &eid,
-            event_type,
-            blob,
-            share_scope,
-            *created_at,
-            *inserted_at,
-        )?;
-        insert_neg_item_if_shared(target_conn, share_scope, *created_at, &eid)?;
-
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
-        insert_recorded_event(target_conn, target_recorded_by, &eid, now_ms, "copy")?;
-    }
-
-    // Project all copied events, failing on errors
-    for (event_id, _, _, _, _, _) in &events {
-        if let Some(eid) = event_id_from_base64(event_id) {
-            crate::projection::pipeline::project_one(target_conn, target_recorded_by, &eid)
-                .map_err(|e| format!("projection failed for event {}: {}", &event_id[..8], e))?;
-        }
-    }
-
-    Ok(())
 }

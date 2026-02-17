@@ -57,8 +57,11 @@ Rules:
 2. no universal `payload` envelope,
 3. any schema field marked as `event_id` reference is a dependency source.
 
-Field kinds are schema-driven (`fixed_bytes`, integers, bounded var-bytes/strings), and each event type has deterministic field order.
-Field definitions are fixed; total event size is variable by event type.
+Field kinds are schema-driven (`fixed_bytes`, integers), and each event type has deterministic field order and fixed total wire size.
+No canonical event field uses a length prefix to determine body boundaries.
+Text slots use fixed-size UTF-8 with mandatory zero-padding: unused bytes after the canonical text content must be zero, and no non-zero bytes may appear after the text terminator.
+Encrypted event wire size is deterministic by `inner_type_code` (inner types are fixed-size).
+File slice events use a canonical fixed ciphertext size; final plaintext chunks are padded before encryption.
 
 ## 1.3 Event identity and signatures
 
@@ -89,9 +92,8 @@ Why keep it:
 Safety rule:
 1. `payload_len` is an untrusted framing delimiter, not semantic authority.
 2. enforce global and per-frame-type max lengths.
-3. fixed-size event types must match exact schema size.
-4. variable-size event types must parse via schema and consume exactly `payload_len`.
-5. any mismatch rejects the frame.
+3. all canonical event types have fixed wire sizes; `payload_len` must exactly match the schema-defined size for the event type (or, for encrypted events, the size determined by `inner_type_code`).
+4. any mismatch rejects the frame.
 
 ---
 
@@ -352,6 +354,15 @@ This applies to:
 
 No alternate projection path is allowed.
 
+Internal two-layer model: `project_one` is the sole public entrypoint.
+Internally it delegates to `project_one_step` (the 7-step single-event
+algorithm without cascade), then runs cascade-unblock if the result is
+`Valid`. The Kahn cascade worklist calls `project_one_step` directly to
+avoid redundant recursive cascade; Phase 2 guard retries call back into
+`project_one` for proper recursive cascade. This split is a cascade
+optimization, not an alternate projection path — all projection stages
+(dep check, type check, signer verify, projector dispatch) are shared.
+
 ## 4.2 Decision contract
 
 Each projection attempt yields one terminal decision:
@@ -497,9 +508,10 @@ Encrypted wrapper is a normal event type in the same registry.
 It uses flat fields such as `key_event_id`, mandatory `inner_type_code`, `ciphertext`, and auth metadata.
 
 Wrapper field rule:
-1. `inner_type_code` is mandatory in this phase (fixed-width).
-2. do not make it optional while wrapper ciphertext is variable-length.
-3. if we later adopt padded/opaque envelopes, this can be revisited deliberately.
+1. `inner_type_code` is mandatory (fixed-width).
+2. ciphertext size is deterministic: derived from `inner_type_code` because all inner plaintext types have fixed wire sizes.
+3. no `ciphertext_len` field exists in the canonical wire format; the parser computes expected ciphertext size from `inner_type_code`.
+4. if we later adopt padded/opaque envelopes, this can be revisited deliberately.
 
 ## 6.2 Materialization adapter
 
@@ -879,8 +891,8 @@ Additional content event families (reactions, edits, richer thread semantics, mo
 
 Attachments and slice streaming fit naturally:
 
-1. large payload events remain canonical typed events,
-2. variable event sizes already support larger slices,
+1. large payload events remain canonical typed events with fixed wire sizes,
+2. file slices use a canonical fixed ciphertext size; final plaintext chunks are zero-padded before encryption,
 3. deps and signatures continue to gate integrity and ordering.
 
 ## 12.3 Proactive 1-hop gossip on send

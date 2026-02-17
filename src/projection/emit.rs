@@ -2,7 +2,7 @@ use rusqlite::Connection;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::crypto::{hash_event, event_id_to_base64, EventId};
-use crate::db::store::{insert_event, insert_neg_item_if_shared, insert_recorded_event};
+use crate::db::store::{insert_event, insert_neg_item_if_shared, insert_recorded_event, lookup_workspace_id};
 use crate::events::{self, ParsedEvent, registry};
 use super::pipeline::project_one;
 
@@ -50,7 +50,8 @@ pub fn emit_deterministic_event(
             created_at_ms,
             now_ms,
         )?;
-        insert_neg_item_if_shared(conn, meta.share_scope, created_at_ms, &event_id)?;
+        let ws_id = lookup_workspace_id(conn, recorded_by);
+        insert_neg_item_if_shared(conn, meta.share_scope, created_at_ms, &event_id, &ws_id)?;
     }
 
     // Always record for this tenant and project (even if event already existed globally)

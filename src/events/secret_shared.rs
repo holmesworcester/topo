@@ -82,6 +82,7 @@ pub static SECRET_SHARED_META: EventTypeMeta = EventTypeMeta {
     dep_field_type_codes: &[&[6], &[16, 17], &[]],
     signer_required: true,
     signature_byte_len: 64,
+    encryptable: false,
     parse: parse_secret_shared,
     encode: encode_secret_shared,
 };

@@ -119,6 +119,23 @@ These are required, not optional:
    - trust-anchor gating belongs on root workspace event validity.
    - do not use pre-projection raw-blob capture tables as authority for trust-anchor binding.
 
+## 2.2 CLI Isomorphism Principle
+
+Every CLI instance is a real peer-to-peer device. Interactive REPL and non-interactive CLI must be isomorphic:
+
+1. **One service layer**: all business logic lives in `src/service.rs` (or the domain modules it calls). CLI subcommands and the interactive REPL are thin UI adapters over the same service functions.
+2. **Real networking**: invite acceptance uses real QUIC bootstrap sync, not in-process event copying. Interactive REPL spins up a temporary sync endpoint for the inviter account when the joiner is in the same process.
+3. **Testing equivalence**: testing the non-interactive CLI validates the interactive REPL and vice versa, because both exercise the same service-layer code paths. An LLM-driven QA agent can target either surface with equal confidence.
+4. **No synthetic shortcuts**: no `copy_event_chain`, no direct DB-to-DB event transfers, no bypass of the sync/projection pipeline. Every event flows through the same ingest path it would in production.
+
+## 2.3 Device Architecture
+
+1. **One CLI instance = one device**: each running `poc-7` process is a device with its own transport identity and persistent state.
+2. **Multiple tenants per device**: a single device can host many tenants, each participating in arbitrary (potentially overlapping) workspaces.
+3. **Zeroconf discovery**: mDNS/DNS-SD discovers peers on the same workspace on the local machine or LAN (existing `discovery` feature via `p7d --node`).
+4. **Per-tenant QUIC endpoints**: each tenant gets its own QUIC endpoint with trust resolved from event-derived SQL state (no manual `--pin-peer` in steady state).
+5. **Shared batch writer**: all tenants on a device share one batch writer for projection, grouped by `recorded_by`.
+
 ---
 
 ## 3. Phase 1: CLI + Daemon First
@@ -305,29 +322,29 @@ Define event shape once and drive these from it:
 Field encoding kinds:
 - `fixed_bytes(N)`
 - `u8/u16/u32/u64`
-- `var_bytes(len_prefix=u16|max_len=...)`
-- `var_string(len_prefix=u16|max_len=..., utf8=true)`
+- `fixed_text(N, utf8=true, zero_pad=true)` — fixed-size UTF-8 text slot, zero-padded after content
+- `fixed_ciphertext(N)` — fixed-size opaque byte slot
+
+Removed (no longer canonical):
+- ~~`var_bytes(len_prefix=u16|max_len=...)`~~
+- ~~`var_string(len_prefix=u16|max_len=..., utf8=true)`~~
+
+No canonical event parser uses a length or count field to determine body boundaries.
 
 ## 5.2 Wire format direction
 
 - Flat fields per type.
 - Deterministic field order from schema.
-- Fixed field definitions but variable total event sizes by type.
-- Length-prefixed framing for sync transport.
+- Every canonical event type has a fixed total wire size (deterministic by type code).
+- Encrypted events have wire size deterministic by `inner_type_code`.
+- Length-prefixed framing for sync transport (frame-level `payload_len` only; no in-event length fields).
 
-This supports large events like `file_slice` while keeping deterministic signing/parsing.
+This supports deterministic parsing by type dispatch and fixed offsets (langsec-first).
 
-`codex-simplified` migration note:
-- current code paths using global fixed sizes (`ENVELOPE_SIZE`, `EVENT_SIZE`) must be treated as temporary.
-- replace with:
-  1. sync frame header carrying message type + payload length,
-  2. event decoder dispatch by `event_type` schema,
-  3. per-type bounds checks from schema max lengths.
-- `payload_len` is a framing delimiter, not semantic authority:
-  - for fixed-size event types it must exactly match schema size,
-  - for variable-size types decoder must consume exactly `payload_len`,
-  - any mismatch rejects the frame.
-- do not keep any global fixed event blob size constant once Phase 4 is complete.
+`payload_len` is a framing delimiter, not semantic authority:
+- it must exactly match the schema-defined fixed size for the event type,
+- for encrypted events it must match the size determined by `inner_type_code`,
+- any mismatch rejects the frame.
 
 ## 5.3 Signer and recording semantics (explicit)
 
@@ -480,6 +497,7 @@ struct ProjectorEffects {
 Entry-point requirement:
 - `local_create`, `wire_receive`, `replay`, and unblock retries must all invoke `project_one`.
 - no alternate projection code paths for specific ingestion sources.
+- Internal cascade optimization: `project_one_step` (the 7-step algorithm without cascade) is used by the Kahn cascade worklist to avoid redundant recursive cascade. Phase 2 guard retries call `project_one` for proper recursive cascade. All projection stages are shared; the split is a performance optimization, not an alternate path.
 
 DRY split (required):
 - Shared projection pipeline code owns:
@@ -1261,6 +1279,7 @@ Use this section as the implementation contract. If code conflicts with this sec
 
 1. No alternate projection path:
    - all projection must converge on `project_one(recorded_by,event_id)`.
+   - `project_one_step` (internal, non-cascading) is used only within the cascade worklist as a performance optimization; it shares all projection stages with `project_one`.
 2. No alternate dependency resolver:
    - dependency refs come from schema metadata only.
 3. No insecure transport default:
@@ -1968,9 +1987,9 @@ Three constructors matching different test needs:
 |-------------|----------|-----------|----------|
 | `Peer::new(name)` | Transport only | None | Manual identity tests |
 | `Peer::new_with_identity(name)` | Full bootstrap | Own | Independent peer tests |
-| `Peer::new_in_workspace(name, creator)` | Join flow | Creator's | Same-workspace tests |
+| `Peer::new_in_workspace(name, creator)` | Join flow (async) | Creator's | Same-workspace tests |
 
-`new_with_identity` calls `bootstrap_workspace` (production flow). `new_in_workspace` calls `create_user_invite` + `accept_user_invite` (production flow), copying prerequisite events between DBs.
+`new_with_identity` calls `bootstrap_workspace` (production flow). `new_in_workspace` (async) creates a real invite, starts a temp QUIC sync endpoint for the creator, and calls `svc_accept_invite` which performs bootstrap sync + identity chain creation — no direct DB-to-DB event copying.
 
 ### 17.6.3 Closure-based `sync_until_converged`
 

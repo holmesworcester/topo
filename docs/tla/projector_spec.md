@@ -4,33 +4,33 @@ Changes to this document require TLA+ model re-verification.
 
 ## Event Type Registry
 
-| Code | Rust Type | TLA+ Name | Wire Size | Share Scope | Signer Required | Sig Len | Signer Type |
-|------|-----------|-----------|-----------|-------------|-----------------|---------|-------------|
-| 1 | Message | Message | variable | Shared | No | 0 | — |
-| 2 | Reaction | MessageReaction | variable | Shared | No | 0 | — |
-| 3 | PeerKey | Peer | 41B | Shared | No | 0 | — |
-| 4 | SignedMemo | — | variable | Shared | Yes | 64 | 0 (peer) |
-| 5 | Encrypted | Encrypted | variable | Shared | No | 0 | — |
-| 6 | SecretKey | SecretKey | 41B | Local | No | 0 | — |
-| 7 | MessageDeletion | MessageDeletion | 73B | Shared | No | 0 | — |
-| 8 | Workspace | Workspace | 73B | Shared | No | 0 | — |
-| 9 | InviteAccepted | InviteAccepted | 73B | Local | No | 0 | — |
-| 10 | UserInviteBoot | UserInviteBoot | 170B | Shared | Yes | 64 | 1 (workspace) |
-| 11 | UserInviteOngoing | UserInviteOngoing | 170B | Shared | Yes | 64 | 5 (peer_shared) |
-| 12 | DeviceInviteFirst | DeviceInviteFirst | 138B | Shared | Yes | 64 | 4 (user) |
-| 13 | DeviceInviteOngoing | DeviceInviteOngoing | 138B | Shared | Yes | 64 | 5 (peer_shared) |
-| 14 | UserBoot | UserBoot | 138B | Shared | Yes | 64 | 2 (user_invite) |
-| 15 | UserOngoing | UserOngoing | 138B | Shared | Yes | 64 | 2 (user_invite) |
-| 16 | PeerSharedFirst | PeerSharedFirst | 138B | Shared | Yes | 64 | 3 (device_invite) |
-| 17 | PeerSharedOngoing | PeerSharedOngoing | 138B | Shared | Yes | 64 | 3 (device_invite) |
-| 18 | AdminBoot | AdminBoot | 170B | Shared | Yes | 64 | 1 (workspace) |
-| 19 | AdminOngoing | AdminOngoing | 170B | Shared | Yes | 64 | 5 (peer_shared) |
-| 20 | UserRemoved | UserRemoved | 138B | Shared | Yes | 64 | 5 (peer_shared) |
-| 21 | PeerRemoved | PeerRemoved | 138B | Shared | Yes | 64 | 5 (peer_shared) |
-| 22 | SecretShared | SecretShared | 202B | Shared | Yes | 64 | 5 (peer_shared) |
-| 23 | TransportKey | — | 41B | Shared | No | 0 | — |
-| 24 | MessageAttachment | — | variable | Shared | No | 0 | — |
-| 25 | FileSlice | — | variable | Shared | Yes | 64 | 5 (peer_shared) |
+| Code | Rust Type | TLA+ Name | Wire Size | Share Scope | Encryptable | Signer Required | Sig Len | Signer Type |
+|------|-----------|-----------|-----------|-------------|-------------|-----------------|---------|-------------|
+| 1 | Message | Message | 1194B | Shared | Yes | No | 0 | — |
+| 2 | Reaction | MessageReaction | 234B | Shared | Yes | No | 0 | — |
+| 3 | PeerKey | Peer | 41B | Shared | — | No | 0 | — |
+| 4 | SignedMemo | — | 1130B | Shared | Yes | Yes | 64 | 0 (peer) |
+| 5 | Encrypted | Encrypted | 70+inner_size | Shared | No | No | 0 | — |
+| 6 | SecretKey | SecretKey | 41B | Local | Yes | No | 0 | — |
+| 7 | MessageDeletion | MessageDeletion | 73B | Shared | Yes | No | 0 | — |
+| 8 | Workspace | Workspace | 73B | Shared | No | No | 0 | — |
+| 9 | InviteAccepted | InviteAccepted | 73B | Local | No | No | 0 | — |
+| 10 | UserInviteBoot | UserInviteBoot | 170B | Shared | No | Yes | 64 | 1 (workspace) |
+| 11 | UserInviteOngoing | UserInviteOngoing | 170B | Shared | No | Yes | 64 | 5 (peer_shared) |
+| 12 | DeviceInviteFirst | DeviceInviteFirst | 138B | Shared | No | Yes | 64 | 4 (user) |
+| 13 | DeviceInviteOngoing | DeviceInviteOngoing | 138B | Shared | No | Yes | 64 | 5 (peer_shared) |
+| 14 | UserBoot | UserBoot | 138B | Shared | No | Yes | 64 | 2 (user_invite) |
+| 15 | UserOngoing | UserOngoing | 138B | Shared | No | Yes | 64 | 2 (user_invite) |
+| 16 | PeerSharedFirst | PeerSharedFirst | 138B | Shared | No | Yes | 64 | 3 (device_invite) |
+| 17 | PeerSharedOngoing | PeerSharedOngoing | 138B | Shared | No | Yes | 64 | 3 (device_invite) |
+| 18 | AdminBoot | AdminBoot | 170B | Shared | No | Yes | 64 | 1 (workspace) |
+| 19 | AdminOngoing | AdminOngoing | 170B | Shared | No | Yes | 64 | 5 (peer_shared) |
+| 20 | UserRemoved | UserRemoved | 138B | Shared | No | Yes | 64 | 5 (peer_shared) |
+| 21 | PeerRemoved | PeerRemoved | 138B | Shared | No | Yes | 64 | 5 (peer_shared) |
+| 22 | SecretShared | SecretShared | 202B | Shared | No | Yes | 64 | 5 (peer_shared) |
+| 23 | TransportKey | — | 41B | Shared | No | No | 0 | — |
+| 24 | MessageAttachment | — | 633B | Shared | Yes | No | 0 | — |
+| 25 | FileSlice | — | 262286B | Shared | Yes | Yes | 64 | 5 (peer_shared) |
 
 ## Signer Type Resolution
 
@@ -87,7 +87,7 @@ Changes to this document require TLA+ model re-verification.
 | 2 | project_reaction | reactions | skip if target deleted |
 | 3 | retired (peer_key) | — | rejected as unknown type |
 | 4 | project_signed_memo | signed_memos | — |
-| 5 | project_encrypted | (dispatches inner) | decrypt + inner dispatch |
+| 5 | project_encrypted | (dispatches inner) | decrypt → admissibility check → shared dep/signer/dispatch stages |
 | 6 | project_secret_key | secret_keys | — |
 | 7 | project_message_deletion | deleted_messages | author auth + cascade |
 | 8 | project_workspace | workspaces | TrustAnchorMatch guard |
@@ -108,6 +108,44 @@ Changes to this document require TLA+ model re-verification.
 | 23 | project_transport_key | transport_keys | — |
 | 24 | project_message_attachment | message_attachments | — |
 | 25 | project_file_slice | file_slices | signature verification |
+
+## Shared Pipeline Stages
+
+One staged dependency/signer/dispatch engine is reused for both cleartext
+outer events and decrypted inner events from encrypted wrappers.
+
+### Shared stages (pipeline.rs)
+
+| Stage | Function | Description |
+|-------|----------|-------------|
+| Dep presence | `check_deps_and_block` | Check deps against `valid_events`; write `blocked_event_deps` + `blocked_events` rows keyed to caller-provided `event_id_b64` if missing |
+| Dep type check | `check_dep_types` | Verify each dep's type code matches registry expectations (cleartext path only; skipped for encrypted inner events whose dep targets may be encrypted wrappers) |
+| Signer verify + dispatch | `apply_projection` | Resolve signer key, verify Ed25519 signature, dispatch to per-event projector |
+| Rejection recording | `record_rejection` | Write durable rejection to `rejected_events` |
+
+### Cleartext event path (project_one_step)
+
+1. Terminal check (already valid/rejected?)
+2. Load blob + parse
+3. Dep presence → `check_deps_and_block`
+4. Dep type check → `check_dep_types`
+5. Signer verify + dispatch → `apply_projection`
+6. Write `valid_events`
+
+### Encrypted inner event path (project_encrypted)
+
+Wrapper-specific logic (steps 1-6 below), then shared stages (step 7-8):
+
+1. Secret-key resolve from `secret_keys` table
+2. AES-256-GCM decrypt
+3. Parse inner event
+4. Verify `inner_type_code` consistency
+5. Reject nested encryption (inner type = 5)
+6. Reject disallowed inner families (identity events, bench_dep)
+7. Inner dep presence → `check_deps_and_block` (block rows keyed to **outer** encrypted `event_id`)
+8. Inner signer verify + dispatch → `apply_projection` (signing bytes = decrypted plaintext)
+
+Block/reject/valid state is always anchored to the outer encrypted event_id.
 
 ## Wire Formats
 
@@ -137,6 +175,66 @@ type_code(1) | created_at_ms(8) | public_key(32) | extra_dep_id(32) | signed_by(
 ```
 type_code(1) | created_at_ms(8) | key_event_id(32) | recipient_event_id(32) | wrapped_key(32) | signed_by(32) | signer_type(1) | signature(64)  = 202B
 ```
+
+### 1194B fixed signed (Message)
+```
+Message (1): type_code(1) | created_at_ms(8) | workspace_id(32) | author_id(32) | content(1024) | signed_by(32) | signer_type(1) | signature(64) = 1194B
+```
+- content: fixed 1024-byte UTF-8 slot, zero-padded after text
+
+### 234B fixed signed (Reaction)
+```
+Reaction (2): type_code(1) | created_at_ms(8) | target_event_id(32) | author_id(32) | emoji(64) | signed_by(32) | signer_type(1) | signature(64) = 234B
+```
+- emoji: fixed 64-byte UTF-8 slot, zero-padded after text
+
+### 1130B fixed signed (SignedMemo)
+```
+SignedMemo (4): type_code(1) | created_at_ms(8) | signed_by(32) | signer_type(1) | content(1024) | signature(64) = 1130B
+```
+- content: fixed 1024-byte UTF-8 slot, zero-padded after text
+
+### 70+inner_size fixed unsigned (Encrypted)
+```
+Encrypted (5): type_code(1) | created_at_ms(8) | key_event_id(32) | inner_type_code(1) | nonce(12) | ciphertext(inner_wire_size) | auth_tag(16) = 70 + inner_wire_size
+```
+- ciphertext size is deterministic: equals the fixed wire size of `inner_type_code`
+- no `ciphertext_len` field; parser derives size from `inner_type_code` lookup
+
+### 633B fixed signed (MessageAttachment)
+```
+MessageAttachment (24): type_code(1) | created_at_ms(8) | message_id(32) | file_id(32) | blob_bytes(8) | total_slices(4) | slice_bytes(4) | root_hash(32) | key_event_id(32) | filename(255) | mime_type(128) | signed_by(32) | signer_type(1) | signature(64) = 633B
+```
+- filename: fixed 255-byte UTF-8 slot, zero-padded after text
+- mime_type: fixed 128-byte UTF-8 slot, zero-padded after text
+
+### 262286B fixed signed (FileSlice)
+```
+FileSlice (25): type_code(1) | created_at_ms(8) | file_id(32) | slice_number(4) | ciphertext(262144) | signed_by(32) | signer_type(1) | signature(64) = 262286B
+```
+- ciphertext: canonical fixed 262144-byte (256 KiB) slot
+- final plaintext chunk is zero-padded before encryption; receiver uses `blob_bytes` from MessageAttachment for truncation
+
+### 345B fixed unsigned (BenchDep)
+```
+BenchDep (26): type_code(1) | created_at_ms(8) | dep_slots(10 × 32 = 320) | payload(16) = 345B
+```
+- 10 fixed dep slots; unused slots are all-zeros
+- no `dep_count` field; application counts non-zero slots
+
+### Canonical text slot rules
+1. UTF-8 required (reject invalid UTF-8 sequences)
+2. Zero-padding required: all bytes after the last content byte must be 0x00
+3. No non-zero bytes may appear after the first 0x00 byte in a text slot (NUL-terminated, then zero-padded)
+4. Encodings are unique: one valid byte representation per logical text content
+
+### Parser canonicalization boundary (TLA+ non-modeled)
+The TLA+ models cover event-graph semantics (dependencies, guards, trust transitions).
+The following parser-level canonicalization guarantees are enforced in Rust but not modeled in TLA+:
+1. Fixed wire sizes per event type (no length-field-controlled boundaries)
+2. Zero-padding enforcement on text and dep slots
+3. UTF-8 validity for text slots
+4. Deterministic ciphertext sizing for encrypted events by `inner_type_code`
 
 ## TLA+ Invariants → Rust Test Assertions
 
@@ -185,3 +283,25 @@ abstracting over the event graph.
 | InvTrustSourcesWellFormed | All trust table rows contain valid 32-byte SPKI fingerprints |
 | InvRevokedNotInBootstrapTrust | Revoked credentials not trusted via bootstrap paths |
 | InvMutualAuthSymmetry | Mutual CanAuthenticate requires both peers have active credentials |
+
+## TLA Verification Notes
+
+### collapse-encrypted-inner refactor (2026-02-16)
+
+This refactor collapses duplicated dep/signer/dispatch logic from `encrypted.rs`
+into shared pipeline stages without changing event semantics or projection outcomes.
+No TLA+ model changes were required because:
+
+1. The TLA+ model (`EventGraphSchema`) specifies *what* projections and guards hold,
+   not *how* the Rust pipeline is structured internally.
+2. Admissibility, dep checking, signer verification, and dispatch behavior are
+   unchanged — only the code path was unified.
+3. The `encryptable` metadata field on `EventTypeMeta` centralizes the admissible
+   inner type set previously hard-coded in `encrypted.rs`.
+
+TLC model check was not run because `tla2tools.jar` is not present in this worktree.
+When the JAR is restored, verify with:
+```
+cd docs/tla && ./tlc event_graph_schema_fast.cfg
+cd docs/tla && ./tlc transport_credential_lifecycle_fast.cfg
+```

@@ -1,5 +1,6 @@
 pub mod cert;
 pub mod connection;
+pub mod multi_workspace;
 
 pub use cert::{
     extract_spki_fingerprint, generate_keypair, generate_self_signed_cert,
@@ -370,6 +371,65 @@ pub fn peer_identity_from_connection(conn: &quinn::Connection) -> Option<String>
     let first = certs.first()?;
     let fp = extract_spki_fingerprint(first.as_ref()).ok()?;
     Some(hex::encode(fp))
+}
+
+/// Create a single-port dual-role QUIC endpoint that serves multiple workspaces.
+///
+/// Server side: uses `WorkspaceCertResolver` to select the correct cert based
+/// on the client's SNI. Client side: uses a default client config with the
+/// first workspace's cert (outbound connections use `connect_with()` for
+/// per-workspace config).
+///
+/// Trust verification is via a dynamic allow function that checks across
+/// all workspaces.
+pub fn create_single_port_endpoint(
+    bind_addr: SocketAddr,
+    cert_resolver: Arc<multi_workspace::WorkspaceCertResolver>,
+    allow_fn: Arc<DynamicAllowFn>,
+    default_client_cert: CertificateDer<'static>,
+    default_client_key: PrivatePkcs8KeyDer<'static>,
+) -> Result<Endpoint, Box<dyn std::error::Error + Send + Sync>> {
+    // Server config: multi-workspace cert resolver + dynamic trust
+    let server_verifier = Arc::new(PinnedCertVerifier::new_dynamic(allow_fn.clone()));
+    let server_crypto = rustls::ServerConfig::builder()
+        .with_client_cert_verifier(server_verifier)
+        .with_cert_resolver(cert_resolver);
+    let server_config = ServerConfig::with_crypto(Arc::new(
+        quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)?,
+    ));
+
+    // Default client config (for outbound connections that don't use connect_with)
+    let client_verifier = Arc::new(PinnedCertVerifier::new_dynamic(allow_fn));
+    let client_crypto = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(client_verifier)
+        .with_client_auth_cert(vec![default_client_cert], default_client_key.into())?;
+    let client_config = ClientConfig::new(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)?,
+    ));
+
+    let mut endpoint = Endpoint::server(server_config, bind_addr)?;
+    endpoint.set_default_client_config(client_config);
+    Ok(endpoint)
+}
+
+/// Build a per-workspace `ClientConfig` for outbound connections.
+///
+/// Used with `endpoint.connect_with(config, addr, sni)` to present the
+/// correct workspace cert and verify the remote server's workspace cert.
+pub fn workspace_client_config(
+    cert_der: CertificateDer<'static>,
+    key_der: PrivatePkcs8KeyDer<'static>,
+    allow_fn: Arc<DynamicAllowFn>,
+) -> Result<ClientConfig, Box<dyn std::error::Error + Send + Sync>> {
+    let verifier = Arc::new(PinnedCertVerifier::new_dynamic(allow_fn));
+    let crypto = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_client_auth_cert(vec![cert_der], key_der.into())?;
+    Ok(ClientConfig::new(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?,
+    )))
 }
 
 #[cfg(test)]

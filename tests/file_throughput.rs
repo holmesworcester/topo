@@ -14,6 +14,7 @@ use poc_7::events::{
     self, FileSliceEvent, MessageAttachmentEvent, MessageEvent, ParsedEvent,
     SecretKeyEvent, WorkspaceEvent, InviteAcceptedEvent, UserInviteBootEvent,
     UserBootEvent, DeviceInviteFirstEvent, PeerSharedFirstEvent,
+    fixed_layout::FILE_SLICE_CIPHERTEXT_BYTES,
 };
 use poc_7::projection::pipeline::project_one;
 use poc_7::projection::signer::sign_event_bytes;
@@ -188,12 +189,14 @@ fn create_prereqs(
     (msg_eid, sk_eid, signer_eid, signing_key)
 }
 
-fn run_file_throughput(file_size_bytes: usize, slice_size: usize) {
+fn run_file_throughput(file_size_bytes: usize) {
     let (conn, _tmp) = setup();
     let recorded_by = "peer1";
 
     let (msg_eid, sk_eid, signer_eid, signing_key) = create_prereqs(&conn, recorded_by);
 
+    // All file slices use canonical fixed ciphertext size (256 KiB)
+    let slice_size = FILE_SLICE_CIPHERTEXT_BYTES;
     let total_slices = (file_size_bytes + slice_size - 1) / slice_size;
     let file_id = [0xF0; 32];
 
@@ -218,24 +221,18 @@ fn run_file_throughput(file_size_bytes: usize, slice_size: usize) {
     let att_eid = insert_event_raw(&conn, recorded_by, &att_blob);
     project_one(&conn, recorded_by, &att_eid).unwrap();
 
-    // Pre-generate ciphertext for slices (reuse one buffer)
-    let ciphertext_template: Vec<u8> = vec![0xAB; slice_size];
+    // Pre-generate ciphertext for slices (canonical fixed size)
+    let ciphertext_template: Vec<u8> = vec![0xAB; FILE_SLICE_CIPHERTEXT_BYTES];
 
     let start = Instant::now();
 
     // Encode + store + project all file slices
     for i in 0..total_slices as u32 {
-        let ct_len = if (i as usize + 1) * slice_size > file_size_bytes {
-            file_size_bytes - (i as usize) * slice_size
-        } else {
-            slice_size
-        };
-
         let fs = FileSliceEvent {
             created_at_ms: now_ms(),
             file_id,
             slice_number: i,
-            ciphertext: ciphertext_template[..ct_len].to_vec(),
+            ciphertext: ciphertext_template.clone(),
             signed_by: signer_eid,
             signer_type: 5,
             signature: [0u8; 64],
@@ -303,22 +300,22 @@ fn run_file_throughput(file_size_bytes: usize, slice_size: usize) {
 
 #[test]
 fn test_file_throughput_200kb() {
-    run_file_throughput(200 * 1024, 65536); // ~4 slices
+    run_file_throughput(256 * 1024); // 1 canonical slice
 }
 
 #[test]
 fn test_file_throughput_10mb() {
-    run_file_throughput(10 * 1024 * 1024, 65536); // 160 slices
+    run_file_throughput(10 * 1024 * 1024); // 40 slices @ 256 KiB each
 }
 
 #[test]
 #[ignore]
 fn test_file_throughput_100mb() {
-    run_file_throughput(100 * 1024 * 1024, 65536); // 1,600 slices
+    run_file_throughput(100 * 1024 * 1024); // 400 slices
 }
 
 #[test]
 #[ignore]
 fn test_file_throughput_1gb() {
-    run_file_throughput(1024 * 1024 * 1024, 65536); // 16,384 slices
+    run_file_throughput(1024 * 1024 * 1024); // 4,096 slices
 }

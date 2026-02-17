@@ -1,9 +1,14 @@
 //! Multi-tenant node daemon.
 //!
 //! Discovers local tenant identities from the DB (trust_anchors JOIN
-//! local_transport_creds), creates one QUIC endpoint per tenant with
-//! dynamic trust, and routes all incoming events through a single
-//! shared batch_writer.
+//! local_transport_creds), creates a single QUIC endpoint with a
+//! multi-workspace cert resolver, and routes all incoming events
+//! through a single shared batch_writer.
+//!
+//! The TLS handshake determines the workspace: clients send the
+//! workspace SNI, and the server selects the matching cert via
+//! `WorkspaceCertResolver`. Post-handshake, the peer's SPKI fingerprint
+//! is checked against the trust set to determine the `recorded_by` tenant.
 //!
 //! When the `discovery` feature is enabled, each tenant also advertises
 //! via mDNS and auto-connects to discovered remote peers.
@@ -63,15 +68,17 @@ use crate::db::transport_creds::discover_local_tenants;
 use crate::db::transport_trust::is_peer_allowed;
 use crate::sync::engine::{IngestItem, accept_loop_with_ingest, batch_writer};
 use crate::transport::{
-    create_dual_endpoint_dynamic, extract_spki_fingerprint,
+    create_single_port_endpoint, extract_spki_fingerprint,
+    multi_workspace::{WorkspaceCertResolver, workspace_sni},
 };
+use rustls::sign::CertifiedKey;
 
 /// Run the multi-tenant node.
 ///
 /// Discovers all local identities from the DB, verifies their SPKI fingerprints,
-/// creates one QUIC endpoint per tenant, and runs accept loops sharing a single
-/// batch_writer thread. With `discovery` feature, also advertises via mDNS and
-/// auto-connects to discovered peers.
+/// builds a single QUIC endpoint with multi-workspace cert resolver, and runs
+/// a single accept loop sharing a batch_writer thread. With `discovery` feature,
+/// also advertises via mDNS and auto-connects to discovered peers.
 pub async fn run_node(
     db_path: &str,
     bind_ip: IpAddr,
@@ -93,22 +100,15 @@ pub async fn run_node(
     // Collect all local peer_ids for mDNS self-filtering
     let _local_peer_ids: HashSet<String> = tenants.iter().map(|t| t.peer_id.clone()).collect();
 
-    // Shared batch_writer: single writer thread for all tenants.
-    let ingest_cap = if tenants.len() > 1 { 10000 } else { 5000 };
-    let (shared_tx, shared_rx) = mpsc::channel::<IngestItem>(ingest_cap);
-    let events_received = Arc::new(AtomicU64::new(0));
-    let writer_events = events_received.clone();
-    let writer_db = db_path.to_string();
-    let _writer_handle = std::thread::spawn(move || {
-        batch_writer(writer_db, shared_rx, writer_events);
-    });
+    // Build multi-workspace cert resolver + tenant metadata
+    let provider = rustls::crypto::ring::default_provider();
+    let mut cert_resolver = WorkspaceCertResolver::new();
+    // Map: peer_id → workspace_id (for post-handshake tenant resolution)
+    let mut peer_to_workspace: HashMap<String, String> = HashMap::new();
+    // Keep first tenant's cert/key for the default client config
+    let mut default_cert: Option<(rustls::pki_types::CertificateDer<'static>, rustls::pki_types::PrivatePkcs8KeyDer<'static>)> = None;
 
-    let mut handles = Vec::new();
-    // Keep discovery handles alive so mDNS services stay registered
-    #[cfg(feature = "discovery")]
-    let mut _discovery_handles: Vec<crate::discovery::TenantDiscovery> = Vec::new();
-
-    for tenant in tenants {
+    for tenant in &tenants {
         // Verify SPKI fingerprint matches peer_id
         let fp = match extract_spki_fingerprint(&tenant.cert_der) {
             Ok(fp) => fp,
@@ -129,55 +129,103 @@ pub async fn run_node(
             continue;
         }
 
-        // Build per-tenant dynamic trust closure
-        let db_path_trust = db_path.to_string();
-        let recorded_by = tenant.peer_id.clone();
-        let dynamic_allow: Arc<
-            dyn Fn(&[u8; 32]) -> Result<bool, Box<dyn std::error::Error + Send + Sync>>
-                + Send
-                + Sync,
-        > = Arc::new(move |peer_fp: &[u8; 32]| {
-            let db = open_connection(&db_path_trust)?;
-            is_peer_allowed(&db, &recorded_by, peer_fp)
-        });
+        let cert_der = rustls::pki_types::CertificateDer::from(tenant.cert_der.clone());
+        let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(tenant.key_der.clone());
 
-        // Create QUIC endpoint with auto-assigned port
-        let bind_addr = std::net::SocketAddr::new(bind_ip, 0);
-        let cert_der =
-            rustls::pki_types::CertificateDer::from(tenant.cert_der);
-        let key_der =
-            rustls::pki_types::PrivatePkcs8KeyDer::from(tenant.key_der);
-
-        let endpoint = match create_dual_endpoint_dynamic(bind_addr, cert_der, key_der, dynamic_allow) {
-            Ok(ep) => ep,
+        // Build CertifiedKey for the resolver
+        let ck = match CertifiedKey::from_der(
+            vec![cert_der.clone()],
+            key_der.clone_key().into(),
+            &provider,
+        ) {
+            Ok(ck) => Arc::new(ck),
             Err(e) => {
                 error!(
-                    "Failed to create endpoint for tenant {}: {}",
+                    "Failed to create CertifiedKey for tenant {}: {}",
                     tenant.peer_id, e
                 );
                 continue;
             }
         };
 
-        let local_addr = endpoint.local_addr().unwrap_or(bind_addr);
-        let _actual_port = local_addr.port();
+        let sni = workspace_sni(&tenant.workspace_id);
+        cert_resolver.add(sni.clone(), ck);
+        peer_to_workspace.insert(tenant.peer_id.clone(), tenant.workspace_id.clone());
+
+        if default_cert.is_none() {
+            default_cert = Some((cert_der, key_der));
+        }
+
         info!(
-            "Tenant {} (workspace {}) listening on {}",
+            "Registered tenant {} (workspace {}, sni={})",
             &tenant.peer_id[..16],
             &tenant.workspace_id[..16.min(tenant.workspace_id.len())],
-            local_addr
+            sni
         );
+    }
 
-        // mDNS: advertise this tenant and browse for remote peers
-        #[cfg(feature = "discovery")]
-        {
+    let (default_cert_der, default_key_der) = default_cert
+        .ok_or("No valid tenant certs found")?;
+
+    // Union trust closure: checks across ALL tenants
+    let db_path_trust = db_path.to_string();
+    let tenant_peer_ids: Vec<String> = tenants.iter().map(|t| t.peer_id.clone()).collect();
+    let dynamic_allow: Arc<
+        dyn Fn(&[u8; 32]) -> Result<bool, Box<dyn std::error::Error + Send + Sync>>
+            + Send
+            + Sync,
+    > = Arc::new(move |peer_fp: &[u8; 32]| {
+        let db = open_connection(&db_path_trust)?;
+        for tenant_id in &tenant_peer_ids {
+            if is_peer_allowed(&db, tenant_id, peer_fp)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    });
+
+    // Create single QUIC endpoint with auto-assigned port
+    let bind_addr = std::net::SocketAddr::new(bind_ip, 0);
+    let endpoint = create_single_port_endpoint(
+        bind_addr,
+        Arc::new(cert_resolver),
+        dynamic_allow,
+        default_cert_der,
+        default_key_der,
+    )?;
+
+    let local_addr = endpoint.local_addr().unwrap_or(bind_addr);
+    info!(
+        "Node listening on {} ({} workspace(s))",
+        local_addr,
+        tenants.len()
+    );
+
+    // Shared batch_writer: single writer thread for all tenants.
+    let ingest_cap = if tenants.len() > 1 { 10000 } else { 5000 };
+    let (shared_tx, shared_rx) = mpsc::channel::<IngestItem>(ingest_cap);
+    let events_received = Arc::new(AtomicU64::new(0));
+    let writer_events = events_received.clone();
+    let writer_db = db_path.to_string();
+    let _writer_handle = std::thread::spawn(move || {
+        batch_writer(writer_db, shared_rx, writer_events);
+    });
+
+    // Keep discovery handles alive so mDNS services stay registered
+    #[cfg(feature = "discovery")]
+    let mut _discovery_handles: Vec<crate::discovery::TenantDiscovery> = Vec::new();
+
+    // mDNS: advertise all tenants and browse for remote peers
+    #[cfg(feature = "discovery")]
+    {
+        let actual_port = local_addr.port();
+        for tenant in &tenants {
             match crate::discovery::TenantDiscovery::new(
                 &tenant.peer_id,
-                _actual_port,
+                actual_port,
                 _local_peer_ids.clone(),
             ) {
                 Ok(disc) => {
-                    // Start browsing and spawn connect_loop for discovered peers
                     match disc.browse() {
                         Ok(rx) => {
                             let ep_clone = endpoint.clone();
@@ -234,32 +282,33 @@ pub async fn run_node(
                 Err(e) => warn!("mDNS registration failed for {}: {}", &tenant.peer_id[..16], e),
             }
         }
-
-        // Spawn accept loop for this tenant
-        let db_path_owned = db_path.to_string();
-        let tenant_peer_id = tenant.peer_id.clone();
-        let ingest_tx = shared_tx.clone();
-        let handle = std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            rt.block_on(async move {
-                if let Err(e) = accept_loop_with_ingest(
-                    &db_path_owned,
-                    &tenant_peer_id,
-                    endpoint,
-                    None, // dynamic trust is in the endpoint config
-                    ingest_tx,
-                )
-                .await
-                {
-                    warn!("accept_loop for tenant {} exited: {}", tenant_peer_id, e);
-                }
-            });
-        });
-        handles.push(handle);
     }
+
+    // Single accept loop for all workspaces.
+    // Post-handshake, each connection is routed to the tenant that trusts
+    // the remote peer's SPKI fingerprint.
+    let all_tenant_ids: Vec<String> = tenants.iter().map(|t| t.peer_id.clone()).collect();
+    let db_path_owned = db_path.to_string();
+    let ingest_tx = shared_tx.clone();
+    let accept_handle = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            if let Err(e) = accept_loop_with_ingest(
+                &db_path_owned,
+                &all_tenant_ids,
+                endpoint,
+                None,
+                ingest_tx,
+            )
+            .await
+            {
+                warn!("accept_loop exited: {}", e);
+            }
+        });
+    });
 
     // Drop our copy so writer exits when all accept loops drop theirs
     drop(shared_tx);
@@ -271,7 +320,7 @@ pub async fn run_node(
         events_received.load(Ordering::Relaxed)
     );
 
-    // Endpoints will be dropped when threads exit
+    drop(accept_handle);
     Ok(())
 }
 
