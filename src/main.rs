@@ -235,6 +235,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         } => {
             let resp = service::svc_send(&db, &workspace, &content)?;
             println!("Sent: {}", resp.content);
+            println!("event_id:{}", resp.event_id);
         }
         Commands::Status { db } => {
             let resp = service::svc_status(&db)?;

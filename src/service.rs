@@ -540,6 +540,33 @@ pub fn query_field(db: &rusqlite::Connection, field: &str, recorded_by: &str) ->
                 |row| row.get(0),
             )
             .map_err(|e| format!("query failed: {}", e)),
+        other if other.starts_with("has_event:") => {
+            let event_id = &other["has_event:".len()..];
+            let direct_count: i64 = db
+                .query_row(
+                "SELECT COUNT(*) FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, event_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("query failed: {}", e))?;
+            if direct_count > 0 {
+                return Ok(direct_count);
+            }
+            if let Ok(event_id_bytes) = hex::decode(event_id) {
+                if event_id_bytes.len() == 32 {
+                    let mut eid = [0u8; 32];
+                    eid.copy_from_slice(&event_id_bytes);
+                    return db
+                        .query_row(
+                            "SELECT COUNT(*) FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
+                            rusqlite::params![recorded_by, event_id_to_base64(&eid)],
+                            |row| row.get(0),
+                        )
+                        .map_err(|e| format!("query failed: {}", e));
+                }
+            }
+            Ok(0)
+        }
         other => Err(format!("unknown field: {}", other)),
     }
 }
