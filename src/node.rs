@@ -64,7 +64,7 @@ impl PeerDispatcher {
 }
 
 use crate::db::{open_connection, schema::create_tables};
-use crate::db::transport_creds::discover_local_tenants;
+use crate::db::transport_creds::{discover_local_tenants, list_local_peers, load_local_creds};
 use crate::db::transport_trust::{is_peer_allowed, list_active_invite_bootstrap_addrs};
 use crate::sync::engine::{IngestItem, accept_loop_with_ingest, batch_writer};
 use crate::transport::{
@@ -135,6 +135,80 @@ fn load_placeholder_invite_autodial_targets(
         }
     }
     Ok(out)
+}
+
+fn collect_placeholder_invite_autodial_targets(
+    db_path: &str,
+) -> Result<Vec<(String, SocketAddr)>, Box<dyn std::error::Error + Send + Sync>> {
+    let db = open_connection(db_path)?;
+    let tenant_ids = list_local_peers(&db)?;
+    drop(db);
+    load_placeholder_invite_autodial_targets(db_path, &tenant_ids)
+}
+
+fn build_tenant_client_config(
+    db_path: &str,
+    tenant_id: &str,
+) -> Result<quinn::ClientConfig, Box<dyn std::error::Error + Send + Sync>> {
+    let db = open_connection(db_path)?;
+    let (cert_der, key_der) = load_local_creds(&db, tenant_id)?
+        .ok_or_else(|| format!("local creds missing for tenant {}", tenant_id))?;
+    drop(db);
+
+    let cert_der = rustls::pki_types::CertificateDer::from(cert_der);
+    let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(key_der);
+    let db_path_t = db_path.to_string();
+    let tid = tenant_id.to_string();
+    let tenant_allow: Arc<DynamicAllowFn> = Arc::new(move |peer_fp: &[u8; 32]| {
+        let db = open_connection(&db_path_t)?;
+        is_peer_allowed(&db, &tid, peer_fp)
+    });
+    workspace_client_config(cert_der, key_der, tenant_allow)
+}
+
+fn spawn_placeholder_autodial_refresher(
+    db_path: String,
+    endpoint: quinn::Endpoint,
+    mut launched: HashSet<(String, SocketAddr)>,
+) {
+    std::thread::spawn(move || loop {
+        match collect_placeholder_invite_autodial_targets(&db_path) {
+            Ok(targets) => {
+                for (tenant_id, remote) in targets {
+                    let key = (tenant_id.clone(), remote);
+                    if !launched.insert(key) {
+                        continue;
+                    }
+                    let cfg = match build_tenant_client_config(&db_path, &tenant_id) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            warn!(
+                                "Skipping placeholder autodial refresh for {}: {}",
+                                &tenant_id[..16.min(tenant_id.len())],
+                                e
+                            );
+                            continue;
+                        }
+                    };
+                    info!(
+                        "PLACEHOLDER AUTODIAL REFRESH: tenant {} dialing invite bootstrap {}",
+                        &tenant_id[..16.min(tenant_id.len())],
+                        remote
+                    );
+                    spawn_connect_loop_thread(
+                        db_path.clone(),
+                        tenant_id,
+                        endpoint.clone(),
+                        remote,
+                        cfg,
+                        "placeholder-autodial-refresh",
+                    );
+                }
+            }
+            Err(e) => warn!("PLACEHOLDER AUTODIAL REFRESH failed: {}", e),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+    });
 }
 
 /// Run the sync node.
@@ -409,8 +483,8 @@ pub async fn run_node(
     // Placeholder invite-based autodial source for realism tests.
     // This is intentionally narrow and should be replaced by a unified
     // persistent address manager that merges invite, discovery, and intro data.
-    let tenant_ids_for_autodial: Vec<String> = tenants.iter().map(|t| t.peer_id.clone()).collect();
-    let autodial_targets = load_placeholder_invite_autodial_targets(db_path, &tenant_ids_for_autodial)?;
+    let autodial_targets = collect_placeholder_invite_autodial_targets(db_path)?;
+    let mut launched_autodial: HashSet<(String, SocketAddr)> = HashSet::new();
     if !autodial_targets.is_empty() {
         warn!(
             "PLACEHOLDER AUTODIAL ENABLED: launching {} invite-seeded outbound dial(s)",
@@ -418,12 +492,14 @@ pub async fn run_node(
         );
     }
     for (tenant_id, remote) in autodial_targets {
-        let cfg = match tenant_client_configs.get(&tenant_id).cloned() {
-            Some(c) => c,
-            None => {
+        launched_autodial.insert((tenant_id.clone(), remote));
+        let cfg = match build_tenant_client_config(db_path, &tenant_id) {
+            Ok(c) => c,
+            Err(e) => {
                 warn!(
-                    "Skipping placeholder autodial for {}: no client config",
-                    &tenant_id[..16.min(tenant_id.len())]
+                    "Skipping placeholder autodial for {}: {}",
+                    &tenant_id[..16.min(tenant_id.len())],
+                    e
                 );
                 continue;
             }
@@ -442,6 +518,13 @@ pub async fn run_node(
             "placeholder-autodial",
         );
     }
+    // Keep polling for runtime invite acceptance: this allows daemons to pick up
+    // new invite bootstrap targets without restart.
+    spawn_placeholder_autodial_refresher(
+        db_path.to_string(),
+        connect_endpoint.clone(),
+        launched_autodial,
+    );
 
     // Drop our copy so writer exits when all accept loops drop theirs
     drop(shared_tx);

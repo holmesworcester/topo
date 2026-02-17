@@ -2163,6 +2163,8 @@ Goal: establish a test suite where successful P2P bootstrap and sync cannot be f
    - Must be explicitly labeled in code/logs as placeholder (for example `PLACEHOLDER AUTODIAL`) so it is not mistaken for end-state design.
 2. Keep daemon startup invite/discovery-driven only (manual `--connect` removed).
 3. Daemon CLI parity for invite lifecycle and tenant-targeted operations (so realism tests can stay daemon-first).
+   - Scope note: in this branch, daemon-first operation requires at least one local tenant.
+     Fresh DB first-invite acceptance is still a pre-daemon bootstrap step.
 4. For realism in this POC, a naive autodialer is the critical requirement.
    - Full peer connection management (address scoring/prioritization, lifecycle policy, and advanced dial orchestration) is explicitly out of scope for this POC.
 

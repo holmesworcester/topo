@@ -103,6 +103,44 @@ fn p7ctl_send(db: &str, socket: &Path, content: &str) -> String {
         .to_string()
 }
 
+fn p7ctl_create_invite(db: &str, socket: &Path, bootstrap_addr: &str) -> String {
+    let out = p7ctl_output(db, socket, &["create-invite", "--bootstrap", bootstrap_addr]);
+    assert!(
+        out.status.success(),
+        "p7ctl create-invite failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("p7ctl create-invite stdout should be JSON");
+    v["data"]["invite_link"]
+        .as_str()
+        .expect("p7ctl create-invite response missing data.invite_link")
+        .to_string()
+}
+
+fn p7ctl_accept_invite(db: &str, socket: &Path, invite_link: &str) {
+    let out = p7ctl_output(
+        db,
+        socket,
+        &[
+            "accept-invite",
+            "--invite",
+            invite_link,
+            "--username",
+            "user",
+            "--devicename",
+            "device",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "p7ctl accept-invite failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 fn p7ctl_assert_eventually(db: &str, socket: &Path, predicate: &str, timeout_ms: u64) -> Output {
     p7ctl_output(
         db,
@@ -195,21 +233,45 @@ fn test_invite_only_daemons_should_autodial_without_manual_connect() {
 }
 
 #[test]
-fn test_daemon_cli_contract_exposes_invite_lifecycle_commands() {
-    let out = Command::new(bin_p7ctl())
-        .arg("--help")
-        .output()
-        .expect("failed to run p7ctl --help");
-    assert!(out.status.success(), "p7ctl --help failed");
-    let text = String::from_utf8_lossy(&out.stdout);
+fn test_daemon_cli_invite_lifecycle_works_without_restart() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
+    let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
 
-    // Desired daemon-first realism: setup should be possible via daemon CLI only.
-    assert!(
-        text.contains("create-invite"),
-        "p7ctl missing create-invite (daemon-first invite realism not met)"
+    // Both peers already have local identities so daemons can start immediately.
+    let alice_bootstrap = run_poc7(&["send", "alice-bootstrap", "--db", &alice_db]);
+    assert!(alice_bootstrap.status.success(), "alice bootstrap send failed");
+    let bob_bootstrap = run_poc7(&["send", "bob-bootstrap", "--db", &bob_db]);
+    assert!(bob_bootstrap.status.success(), "bob bootstrap send failed");
+
+    let alice_port = random_port();
+    let bob_port = random_port();
+    let alice_socket: PathBuf = tmpdir.path().join("alice.sock");
+    let bob_socket: PathBuf = tmpdir.path().join("bob.sock");
+
+    let _alice = Daemon::start(&alice_db, &alice_socket, alice_port);
+    let _bob = Daemon::start(&bob_db, &bob_socket, bob_port);
+
+    // Create/accept invite entirely via daemon CLI while Bob is already running.
+    let invite_link = p7ctl_create_invite(
+        &alice_db,
+        &alice_socket,
+        &format!("127.0.0.1:{}", alice_port),
+    );
+    p7ctl_accept_invite(&bob_db, &bob_socket, &invite_link);
+
+    // If runtime autodial refresh works, Bob reaches Alice without daemon restart.
+    let bob_event_id = p7ctl_send(&bob_db, &bob_socket, "runtime-accept-invite-no-restart");
+    let out = p7ctl_assert_eventually(
+        &alice_db,
+        &alice_socket,
+        &format!("has_event:{} >= 1", bob_event_id),
+        20_000,
     );
     assert!(
-        text.contains("accept-invite"),
-        "p7ctl missing accept-invite (daemon-first invite realism not met)"
+        out.status.success(),
+        "daemon CLI invite lifecycle behavior gap: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
     );
 }
