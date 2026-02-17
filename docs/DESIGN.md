@@ -340,6 +340,11 @@ Discovery rules:
 2. **Trust gating**: discovered peers are only dialed if they pass the tenant's dynamic trust check.
 3. **Address churn**: when a previously-discovered peer re-advertises at a different address, the old `connect_loop` is cancelled via a `watch` channel and a new one is spawned.
 
+Out-of-scope note (current POC):
+1. same-instance communication between two local tenants in the same workspace is not implemented as a special intra-daemon delivery path,
+2. because self-filtering excludes local peer IDs, local tenants do not discover/connect to each other through mDNS,
+3. adding explicit intra-instance delivery may be desirable future work, but it is out of scope for the current design baseline.
+
 DNS label constraint: peer IDs (64 hex chars) are truncated to 59 chars in the mDNS instance name (62 total with `p7-` prefix, under the 63-byte DNS label limit). The full peer ID is always in the TXT property for exact matching.
 
 ## 3.3 Table lifecycle and naming
