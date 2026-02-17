@@ -397,6 +397,10 @@ fn test_cli_sync_bootstrap_from_accepted_invite_data() {
         count_rows(&bob_db, "secret_keys") >= 1,
         "invitee should materialize local secret_key after unwrap"
     );
+    assert!(
+        count_rows(&bob_db, "secret_shared") >= 1,
+        "invitee should eventually project inviter secret_shared after local key materialization"
+    );
 
     // Bob starts ongoing sync (connects to Alice for continued sync).
     let mut bob = start_sync(&bob_db, bob_port, Some(alice_port));
