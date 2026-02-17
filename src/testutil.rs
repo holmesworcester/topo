@@ -2,11 +2,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
+use crate::crypto::{event_id_to_base64, EventId};
 use crate::db::{
     open_connection,
     schema::create_tables,
-    store::{insert_event, insert_recorded_event, parse_share_scope},
+    store::insert_recorded_event,
 };
 use crate::events::{
     MessageEvent, MessageDeletionEvent, ReactionEvent, SecretKeyEvent,
@@ -955,55 +955,6 @@ impl Peer {
     }
 }
 
-/// Copy all events from `src` peer's DB into `dest` peer's DB and project them.
-/// Simulates a completed sync session. Events are inserted in `created_at ASC`
-/// order so identity chain dependencies resolve correctly.
-pub fn replicate_all_events(src: &Peer, dest: &Peer) {
-    let src_db = open_connection(&src.db_path).expect("failed to open src db");
-    let dest_db = open_connection(&dest.db_path).expect("failed to open dest db");
-
-    let mut stmt = src_db.prepare(
-        "SELECT event_id, event_type, blob, share_scope, created_at, inserted_at
-         FROM events ORDER BY created_at ASC, event_id ASC"
-    ).expect("failed to prepare events query");
-
-    let rows: Vec<(String, String, Vec<u8>, String, i64, i64)> = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, Vec<u8>>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, i64>(4)?,
-            row.get::<_, i64>(5)?,
-        ))
-    }).expect("failed to query events")
-      .collect::<Result<Vec<_>, _>>()
-      .expect("failed to collect events");
-
-    let now_ms = current_timestamp_ms() as i64;
-
-    for (event_id, event_type, blob, share_scope_str, created_at, inserted_at) in &rows {
-        let eid = event_id_from_base64(event_id).expect("invalid event_id in source events table");
-        let share_scope = parse_share_scope(share_scope_str).expect("invalid share_scope in source events table");
-
-        insert_event(
-            &dest_db,
-            &eid,
-            event_type,
-            blob,
-            share_scope,
-            *created_at,
-            *inserted_at,
-        )
-        .expect("failed to insert event");
-        insert_recorded_event(&dest_db, &dest.identity, &eid, now_ms, "test")
-            .expect("failed to insert recorded_event");
-
-        // Project the event
-        let _ = project_one(&dest_db, &dest.identity, &eid);
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Deterministic projection fingerprinting
 // ---------------------------------------------------------------------------
@@ -1311,7 +1262,15 @@ pub fn verify_projection_invariants(peer: &Peer) {
     let _ = replay_and_fingerprint(&db, &peer.identity, "ORDER BY created_at ASC, event_id ASC");
 }
 
+// ---------------------------------------------------------------------------
+// REALISM SYNC HELPERS
+// ---------------------------------------------------------------------------
+
 /// Start continuous sync between two peers with mutual mTLS pinning.
+///
+/// REALISM HELPER: uses real QUIC sync loops with static transport trust
+/// (AllowedPeers snapshot) for convenience. Acceptable for scenario tests;
+/// see `start_peers_dynamic` for production-matching dynamic trust.
 pub fn start_peers(
     peer_a: &Peer,
     peer_b: &Peer,
@@ -1373,84 +1332,14 @@ pub fn start_peers(
     (a_handle, b_handle)
 }
 
-/// Start continuous sync between two peers using identity-derived trust.
-/// Reads `AllowedPeers` from each peer's `transport_keys` projection table
-/// via `allowed_peers_from_db()`. Caller must have called `publish_transport_key()`
-/// and `replicate_all_events()` first so each peer's DB has the other's TransportKey.
-pub fn start_peers_identity_trust(
-    peer_a: &Peer,
-    peer_b: &Peer,
-) -> (std::thread::JoinHandle<()>, std::thread::JoinHandle<()>) {
-    use crate::db::transport_trust::allowed_peers_from_db;
-
-    let (cert_a, key_a) = peer_a.cert_and_key();
-    let (cert_b, key_b) = peer_b.cert_and_key();
-
-    let db_a = open_connection(&peer_a.db_path).expect("failed to open db for A");
-    let allowed_for_a = allowed_peers_from_db(&db_a, &peer_a.identity)
-        .expect("failed to read allowed peers for A");
-    assert!(!allowed_for_a.is_empty(), "A has no identity-derived trust; call publish_transport_key() + replicate_all_events() first");
-    drop(db_a);
-
-    let db_b = open_connection(&peer_b.db_path).expect("failed to open db for B");
-    let allowed_for_b = allowed_peers_from_db(&db_b, &peer_b.identity)
-        .expect("failed to read allowed peers for B");
-    assert!(!allowed_for_b.is_empty(), "B has no identity-derived trust; call publish_transport_key() + replicate_all_events() first");
-    drop(db_b);
-
-    let listener_endpoint = create_dual_endpoint(
-        "127.0.0.1:0".parse().unwrap(),
-        cert_a,
-        key_a,
-        Arc::new(allowed_for_a),
-    ).expect("failed to create dual endpoint for A");
-
-    let listener_addr = listener_endpoint.local_addr().expect("failed to get listener addr");
-
-    let connector_endpoint = create_dual_endpoint(
-        "127.0.0.1:0".parse().unwrap(),
-        cert_b,
-        key_b,
-        Arc::new(allowed_for_b),
-    ).expect("failed to create dual endpoint for B");
-
-    let a_db = peer_a.db_path.clone();
-    let a_identity = peer_a.identity.clone();
-    let b_db = peer_b.db_path.clone();
-    let b_identity = peer_b.identity.clone();
-
-    let a_handle = std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async move {
-            if let Err(e) = accept_loop(&a_db, &a_identity, listener_endpoint).await {
-                tracing::warn!("accept_loop exited: {}", e);
-            }
-        });
-    });
-
-    let b_handle = std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async move {
-            if let Err(e) = connect_loop(&b_db, &b_identity, connector_endpoint, listener_addr).await {
-                tracing::warn!("connect_loop exited: {}", e);
-            }
-        });
-    });
-
-    (a_handle, b_handle)
-}
-
 /// Start continuous sync between two peers using dynamic DB trust lookup.
 /// Trust is resolved from SQL at each TLS handshake, matching production
 /// behavior (`is_peer_allowed`). Caller must have seeded trust rows
 /// (via `publish_transport_key` + sync, `import_cli_pins_to_sql`, or invite
 /// bootstrap) before peers will accept connections.
+///
+/// REALISM HELPER: production-matching dynamic trust. Used in holepunch
+/// integration tests.
 pub fn start_peers_dynamic(
     peer_a: &Peer,
     peer_b: &Peer,
@@ -1914,6 +1803,35 @@ pub fn peer_fingerprint(peer: &Peer) -> [u8; 32] {
     peer.spki_fingerprint()
 }
 
+/// Record pre-existing events for a new tenant in a shared-DB context.
+///
+/// In separate-DB peers, prerequisite events arrive via bootstrap sync
+/// (see `Peer::new_in_workspace`). In shared-DB multi-tenant mode, the
+/// events are already in the events table; this helper records them for
+/// the new tenant and projects them, equivalent to what the sync engine's
+/// batch writer does after receiving events.
+///
+/// WHITE-BOX HELPER: used only in SharedDbNode (shared-DB multi-tenant
+/// projection tests), not in realism/integration test paths.
+fn record_shared_db_events_for_tenant(
+    db: &rusqlite::Connection,
+    tenant_id: &str,
+    event_ids: &[EventId],
+) {
+    use crate::projection::pipeline::project_one;
+
+    let now_ms = current_timestamp_ms() as i64;
+    for eid in event_ids {
+        insert_recorded_event(db, tenant_id, eid, now_ms, "test")
+            .expect("failed to record event for tenant");
+        let _ = project_one(db, tenant_id, eid);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WHITE-BOX: multi-tenant shared-DB projection tests
+// ---------------------------------------------------------------------------
+
 /// A multi-tenant node: multiple peers sharing a single database.
 ///
 /// Each tenant has its own transport identity but they all use the same DB file.
@@ -2005,7 +1923,6 @@ impl SharedDbNode {
     /// using the production `create_user_invite` + `accept_user_invite` flow.
     pub fn add_tenant_in_workspace(&mut self, name: &str, creator_index: usize) {
         use crate::identity_ops::{create_user_invite, accept_user_invite};
-        use crate::projection::pipeline::project_one;
 
         let creator = &self.tenants[creator_index];
         let workspace_id = creator.workspace_id;
@@ -2034,15 +1951,10 @@ impl SharedDbNode {
         ).expect("failed to create user invite");
 
         // The Workspace and UserInviteBoot events already exist in the shared DB.
-        // Record them for this new tenant and project.
-        let now_ms = current_timestamp_ms() as i64;
-        insert_recorded_event(&db, &tenant_identity, &workspace_id, now_ms, "test")
-            .expect("failed to record workspace event");
-        let _ = project_one(&db, &tenant_identity, &workspace_id);
-
-        insert_recorded_event(&db, &tenant_identity, &invite.invite_event_id, now_ms, "test")
-            .expect("failed to record invite event");
-        let _ = project_one(&db, &tenant_identity, &invite.invite_event_id);
+        // Record them for this new tenant and project (white-box shared-DB prerequisite).
+        record_shared_db_events_for_tenant(
+            &db, &tenant_identity, &[workspace_id, invite.invite_event_id],
+        );
 
         // Accept the invite (production flow)
         let join = accept_user_invite(
@@ -2264,10 +2176,18 @@ pub fn assert_no_cross_tenant_leakage(db_path: &str, tenant_workspaces: &[(Strin
     }
 }
 
+// ---------------------------------------------------------------------------
+// WHITE-BOX: deliberately copies events DB-to-DB for dedup/overlap benchmarks
+// ---------------------------------------------------------------------------
+
 /// Copy all events and neg_items from a source peer's database to target peers.
 ///
 /// This creates identical data at each target so that concurrent sync tests can
 /// verify dedup behavior when multiple sources offer the same events.
+///
+/// WHITE-BOX HELPER: intentional DB-to-DB copy for sync_graph_test benchmarks
+/// that need identical pre-seeded data across multiple peers. Not used in
+/// realism/integration test paths.
 pub fn clone_events_to(source: &Peer, targets: &[&Peer]) {
     let src_db = open_connection(&source.db_path).expect("failed to open source db");
 
