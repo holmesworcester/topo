@@ -188,5 +188,33 @@ fn dispatch(db_path: &str, method: RpcMethod) -> RpcResponse {
                 Err(e) => RpcResponse::error(e.to_string()),
             }
         }
+        RpcMethod::CreateInvite { bootstrap } => {
+            match service::svc_create_invite(db_path, &bootstrap) {
+                Ok(data) => RpcResponse::success(data),
+                Err(e) => RpcResponse::error(e.to_string()),
+            }
+        }
+        RpcMethod::AcceptInvite {
+            invite,
+            username,
+            devicename,
+        } => {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => return RpcResponse::error(format!("failed to start runtime: {}", e)),
+            };
+            match rt.block_on(service::svc_accept_invite(
+                db_path,
+                &invite,
+                &username,
+                &devicename,
+            )) {
+                Ok(data) => RpcResponse::success(data),
+                Err(e) => RpcResponse::error(e.to_string()),
+            }
+        }
     }
 }

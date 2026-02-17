@@ -92,7 +92,10 @@ cargo run --release -- generate --count 50000 --db test.db
 
 # Run sync between two terminals
 cargo run --release -- sync --bind 127.0.0.1:4433 --db server.db
-cargo run --release -- sync --bind 127.0.0.1:4434 --connect 127.0.0.1:4433 --db client.db
+cargo run --release -- create-invite --db server.db --bootstrap 127.0.0.1:4433
+# then on client:
+cargo run --release -- accept-invite --db client.db --invite quiet://invite/...
+cargo run --release -- sync --bind 127.0.0.1:4434 --db client.db
 
 # Check status
 cargo run --release -- status --db server.db

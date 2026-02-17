@@ -46,7 +46,12 @@ mod inner {
             let id_truncated = &peer_id[..59.min(peer_id.len())];
             let instance = format!("p7-{}", id_truncated);
 
-            let host = format!("{}.local.", hostname());
+            // Do not use the machine hostname here. In segmented test harnesses
+            // (and some container setups), many peers can share /etc/hostname,
+            // which causes mDNS host-record collisions and wrong peer->addr
+            // resolution. A per-tenant host label keeps records disjoint.
+            let host_label = format!("p7h-{}", id_truncated);
+            let host = format!("{}.local.", host_label);
             let my_ip = local_non_loopback_ipv4()
                 .unwrap_or_else(|| "0.0.0.0".to_string());
             let properties = [("peer_id", peer_id)];
@@ -166,11 +171,6 @@ mod inner {
         Some(addr.ip().to_string())
     }
 
-    fn hostname() -> String {
-        std::fs::read_to_string("/etc/hostname")
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|_| "localhost".to_string())
-    }
 }
 
 #[cfg(feature = "discovery")]

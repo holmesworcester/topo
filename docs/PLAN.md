@@ -2156,3 +2156,61 @@ Tests in `tests/mdns_smoke.rs`:
 - mDNS self-filtering prevents local-only connections; external peers discovered and synced.
 - Cross-tenant leakage check passes after every multi-tenant scenario test.
 - All test files use application-level convergence and assertions (no `store_count`).
+
+---
+
+## 18. Cheat-Proof Realism Tests (`cheat-proof-tests` branch)
+
+Goal: establish a test suite where successful P2P bootstrap and sync cannot be faked by local process shortcuts, shared filesystem state, or manual operator dials.
+
+### 18.1 Realism contract
+
+1. Out-of-band input is limited to invite links (`quiet://...`) with standard bootstrap data.
+2. Nodes run in non-interactive daemon mode (`p7d`) and are asserted through CLI command results (`p7ctl` / `poc-7 assert-*`).
+3. Desired steady-state connectivity is invite/discovery-driven autodial, not manual `--connect`.
+4. Multi-network topologies are required (local discovery + internet bootstrap-address mode).
+
+### 18.2 Execution strategy
+
+1. Add executable realism contract tests under `tests/cheat_proof_realism_test.rs`.
+2. Include a passing baseline that proves invite bootstrap + daemon autodial transport path works, so failures are scoped to realism gaps, not broken transport.
+3. Include strict contract tests for desired behavior:
+   - invite-only daemon autodial after invite acceptance,
+   - daemon CLI invite lifecycle surface (`p7ctl create-invite` / `p7ctl accept-invite`).
+4. Keep these tests as non-negotiable regression guards for future refactors.
+
+### 18.3 Minimal implementation required to make these tests pass
+
+1. **Placeholder** startup autodial manager in `node.rs` that consumes persisted invite/bootstrap address rows first.
+   - Must be explicitly labeled in code/logs as placeholder (for example `PLACEHOLDER AUTODIAL`) so it is not mistaken for end-state design.
+2. Keep daemon startup invite/discovery-driven only (manual `--connect` removed).
+3. Daemon CLI parity for invite lifecycle and tenant-targeted operations (so realism tests can stay daemon-first).
+   - Scope note: in this branch, daemon-first operation requires at least one local tenant.
+     Fresh DB first-invite acceptance is still a pre-daemon bootstrap step.
+4. For realism in this POC, a naive autodialer is the critical requirement.
+   - Full peer connection management (address scoring/prioritization, lifecycle policy, and advanced dial orchestration) is explicitly out of scope for this POC.
+
+### 18.4 Follow-on topology expansion
+
+1. Add segmented multi-network harness (container or netns) with at least 3 networks and overlapping peers.
+2. Exercise all three behaviors in one scenario:
+   - multitenancy overlap,
+   - local mDNS discovery on shared LAN segments,
+   - invite-link bootstrap address dialing across non-LAN segments.
+
+### 18.5 Netns-first vs containers
+
+1. Start with netns harness for fast iteration on network realism:
+   - three LAN segments,
+   - routed bootstrap reachability,
+   - daemon-only assertions.
+2. Treat netns harness as **insufficient** for strict anti-cheat filesystem isolation:
+   - netns isolates network stack, not host filesystem visibility.
+3. Container phase is required for strict "no filesystem/shared-memory cheat path" guarantees:
+   - one container per peer,
+   - no shared writable volumes,
+   - isolated IPC/PID namespaces,
+   - capability drop + no-new-privileges.
+4. Current branch uses netns as a stepping stone and keeps this limitation explicit.
+5. Netns realism caveat observed in practice: multiple peers can share the same OS hostname, which can alias mDNS host records and mis-map peer IDs to wrong IPs.
+   - Mitigation in this branch: advertise per-tenant mDNS host labels (peer-id-derived), not `/etc/hostname`.

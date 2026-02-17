@@ -14,7 +14,7 @@ fn random_port() -> u16 {
     listener.local_addr().unwrap().port()
 }
 
-fn start_sync(db: &str, bind_port: u16, connect_port: Option<u16>) -> Child {
+fn start_sync(db: &str, bind_port: u16) -> Child {
     let mut cmd = Command::new(bin());
     cmd.arg("sync")
         .arg("--bind")
@@ -23,10 +23,6 @@ fn start_sync(db: &str, bind_port: u16, connect_port: Option<u16>) -> Child {
         .arg(db)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-
-    if let Some(port) = connect_port {
-        cmd.arg("--connect").arg(format!("127.0.0.1:{}", port));
-    }
 
     cmd.spawn().expect("failed to start sync process")
 }
@@ -157,7 +153,7 @@ fn count_rows(db: &str, table: &str) -> i64 {
 
 /// Functional sync test using invite-based shared workspace flow.
 /// Alice bootstraps identity, creates invite, starts sync.
-/// Bob accepts invite (bootstrap sync), starts sync connecting to Alice.
+/// Bob accepts invite (bootstrap sync), starts sync with invite-seeded autodial.
 /// Both send messages in the shared workspace.
 #[test]
 fn test_cli_bidirectional_sync() {
@@ -177,14 +173,14 @@ fn test_cli_bidirectional_sync() {
     let invite_link = create_invite(&alice_db, &format!("127.0.0.1:{}", alice_port));
 
     // Alice starts sync
-    let mut alice = start_sync(&alice_db, alice_port, None);
+    let mut alice = start_sync(&alice_db, alice_port);
     std::thread::sleep(Duration::from_millis(500));
 
     // Bob accepts invite (bootstrap sync from Alice)
     accept_invite(&bob_db, &invite_link);
 
-    // Bob starts sync connecting to Alice
-    let mut bob = start_sync(&bob_db, bob_port, Some(alice_port));
+    // Bob starts sync; daemon uses invite-seeded autodial to reach Alice.
+    let mut bob = start_sync(&bob_db, bob_port);
     std::thread::sleep(Duration::from_secs(1));
 
     // Bob sends a message in the shared workspace
@@ -229,12 +225,12 @@ fn test_cli_ongoing_sync() {
 
     // Alice creates invite and starts sync
     let invite_link = create_invite(&alice_db, &format!("127.0.0.1:{}", alice_port));
-    let mut alice = start_sync(&alice_db, alice_port, None);
+    let mut alice = start_sync(&alice_db, alice_port);
     std::thread::sleep(Duration::from_millis(500));
 
     // Bob accepts invite and starts sync
     accept_invite(&bob_db, &invite_link);
-    let mut bob = start_sync(&bob_db, bob_port, Some(alice_port));
+    let mut bob = start_sync(&bob_db, bob_port);
     std::thread::sleep(Duration::from_secs(1));
 
     // Both send messages over time
@@ -291,11 +287,11 @@ fn test_cli_unpinned_peer_rejected() {
     send_message(&bob_db, "bob bootstrap");
 
     // Alice starts sync (has PeerShared self-trust from identity chain)
-    let mut alice = start_sync(&alice_db, alice_port, None);
+    let mut alice = start_sync(&alice_db, alice_port);
     std::thread::sleep(Duration::from_millis(500));
 
-    // Bob starts sync connecting to Alice (but Alice doesn't trust Bob)
-    let mut bob = start_sync(&bob_db, bob_port, Some(alice_port));
+    // Bob starts sync; with independent identity/workspace he should still be rejected.
+    let mut bob = start_sync(&bob_db, bob_port);
     std::thread::sleep(Duration::from_secs(1));
 
     // Bob sends a message
@@ -383,7 +379,7 @@ fn test_cli_sync_bootstrap_from_accepted_invite_data() {
 
     // Alice must be running sync before Bob accepts (accept-invite does
     // bootstrap sync to fetch prerequisite workspace events from Alice).
-    let mut alice = start_sync(&alice_db, alice_port, None);
+    let mut alice = start_sync(&alice_db, alice_port);
     std::thread::sleep(Duration::from_millis(500));
 
     // Bob accepts invite: installs deterministic cert, bootstrap-syncs from
@@ -402,8 +398,8 @@ fn test_cli_sync_bootstrap_from_accepted_invite_data() {
         "invitee should eventually project inviter secret_shared after local key materialization"
     );
 
-    // Bob starts ongoing sync (connects to Alice for continued sync).
-    let mut bob = start_sync(&bob_db, bob_port, Some(alice_port));
+    // Bob starts ongoing sync; invite bootstrap trust seeds daemon autodial.
+    let mut bob = start_sync(&bob_db, bob_port);
     std::thread::sleep(Duration::from_secs(1));
 
     let bob_eid = send_message(&bob_db, "bootstrap trust from invite data");

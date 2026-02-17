@@ -30,10 +30,6 @@ struct Args {
     #[arg(short, long, default_value = "127.0.0.1:4433")]
     bind: SocketAddr,
 
-    /// Peer to connect to (if omitted, just listens)
-    #[arg(short = 'r', long)]
-    connect: Option<SocketAddr>,
-
     /// Custom RPC socket path (default: <db>.p7d.sock)
     #[arg(long)]
     socket: Option<String>,
@@ -75,7 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     info!("p7d started (db={}, socket={})", args.db, socket_path.display());
 
-    poc_7::node::run_node(&args.db, args.bind, args.connect).await?;
+    poc_7::node::run_node(&args.db, args.bind).await?;
 
     // Signal RPC server to stop.
     shutdown.store(true, Ordering::Relaxed);
