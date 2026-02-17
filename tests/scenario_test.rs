@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use poc_7::testutil::{Peer, SharedDbNode, start_peers, assert_eventually, sync_until_converged, verify_projection_invariants};
+use poc_7::testutil::{Peer, SharedDbNode, ScenarioHarness, start_peers, assert_eventually, sync_until_converged};
 use poc_7::crypto::{event_id_to_base64, event_id_from_base64};
 use poc_7::transport::{
     AllowedPeers, create_client_endpoint, create_dual_endpoint, create_server_endpoint,
@@ -15,6 +15,9 @@ use poc_7::db::open_connection;
 async fn test_two_peer_bidirectional_sync() {
     let alice = Peer::new_with_identity("alice");
     let bob = Peer::new_with_identity("bob");
+    let harness = ScenarioHarness::new();
+    harness.track(&alice);
+    harness.track(&bob);
 
     alice.batch_create_messages(2);
     bob.batch_create_messages(1);
@@ -41,14 +44,16 @@ async fn test_two_peer_bidirectional_sync() {
 
     drop(sync);
 
-    verify_projection_invariants(&alice);
-    verify_projection_invariants(&bob);
+    harness.finish();
 }
 
 #[tokio::test]
 async fn test_one_way_sync() {
     let alice = Peer::new_with_identity("alice");
     let bob = Peer::new_with_identity("bob");
+    let harness = ScenarioHarness::new();
+    harness.track(&alice);
+    harness.track(&bob);
 
     alice.batch_create_messages(10);
     let marker = alice.create_message("alice-sync-marker");
@@ -64,12 +69,17 @@ async fn test_one_way_sync() {
     ).await;
 
     drop(sync);
+
+    harness.finish();
 }
 
 #[tokio::test]
 async fn test_concurrent_create_and_sync() {
     let alice = Peer::new_with_identity("alice");
     let bob = Peer::new_with_identity("bob");
+    let harness = ScenarioHarness::new();
+    harness.track(&alice);
+    harness.track(&bob);
 
     let sync = start_peers(&alice, &bob);
 
@@ -100,12 +110,17 @@ async fn test_concurrent_create_and_sync() {
     ).await;
 
     drop(sync);
+
+    harness.finish();
 }
 
 #[tokio::test]
 async fn test_sync_10k() {
     let alice = Peer::new_with_identity("alice");
     let bob = Peer::new_with_identity("bob");
+    let harness = ScenarioHarness::new();
+    harness.track(&alice);
+    harness.track(&bob);
 
     let gen_start = Instant::now();
     alice.batch_create_messages(10_000);
@@ -126,12 +141,17 @@ async fn test_sync_10k() {
 
     // Only alice's locally-created messages are projected on alice; bob has none projected
     assert_eq!(alice.message_count(), 10_000);
+
+    harness.finish();
 }
 
 #[tokio::test]
 async fn test_recorded_events_isolation() {
     let alice = Peer::new_with_identity("alice");
     let bob = Peer::new_with_identity("bob");
+    let harness = ScenarioHarness::new();
+    harness.track(&alice);
+    harness.track(&bob);
 
     // Create messages locally
     alice.batch_create_messages(3);
@@ -165,14 +185,16 @@ async fn test_recorded_events_isolation() {
     assert_eq!(alice.scoped_message_count(), 4);
     assert_eq!(bob.scoped_message_count(), 3);
 
-    verify_projection_invariants(&alice);
-    verify_projection_invariants(&bob);
+    harness.finish();
 }
 
 #[tokio::test]
 async fn test_reaction_sync() {
     let alice = Peer::new_with_identity("alice");
     let bob = Peer::new_with_identity("bob");
+    let harness = ScenarioHarness::new();
+    harness.track(&alice);
+    harness.track(&bob);
 
     // Alice creates messages, Bob adds reactions
     let msg1 = alice.create_message("Hello!");
@@ -204,8 +226,7 @@ async fn test_reaction_sync() {
     assert_eq!(alice.reaction_count(), 0);
     assert_eq!(bob.reaction_count(), 0);
 
-    verify_projection_invariants(&alice);
-    verify_projection_invariants(&bob);
+    harness.finish();
 }
 
 /// Stress test: high-volume bidirectional sync verifying exact event ID equality.
@@ -214,6 +235,9 @@ async fn test_reaction_sync() {
 async fn test_zero_loss_stress() {
     let alice = Peer::new_with_identity("alice");
     let bob = Peer::new_with_identity("bob");
+    let harness = ScenarioHarness::new();
+    harness.track(&alice);
+    harness.track(&bob);
 
     alice.batch_create_messages(5_000);
     bob.batch_create_messages(5_000);
@@ -253,12 +277,17 @@ async fn test_zero_loss_stress() {
     for id in &bob_ids_before {
         assert!(bob_ids.contains(id), "bob lost own event {}", id);
     }
+
+    harness.finish();
 }
 
 #[tokio::test]
 async fn test_recorded_at_monotonicity() {
     let alice = Peer::new_with_identity("alice");
     let bob = Peer::new_with_identity("bob");
+    let harness = ScenarioHarness::new();
+    harness.track(&alice);
+    harness.track(&bob);
 
     // Alice creates messages with small delays to ensure different created_at
     alice.create_message("first");
@@ -329,6 +358,8 @@ async fn test_recorded_at_monotonicity() {
         bob_min_recv,
         alice_max_local_create,
     );
+
+    harness.finish();
 }
 
 #[tokio::test]
@@ -341,6 +372,11 @@ async fn test_cross_workspace_isolation() {
     let peer_a2 = Peer::new_with_identity("peerA2");
     let peer_b1 = Peer::new_with_identity("peerB1");
     let peer_b2 = Peer::new_with_identity("peerB2");
+    let harness = ScenarioHarness::new();
+    harness.track(&peer_a1);
+    harness.track(&peer_a2);
+    harness.track(&peer_b1);
+    harness.track(&peer_b2);
 
     // Create messages in each workspace
     peer_a1.batch_create_messages(5);
@@ -435,10 +471,13 @@ async fn test_cross_workspace_isolation() {
         "workspace A and B should have zero overlapping message IDs, found {} shared",
         msg_overlap.len(),
     );
+
+    harness.finish();
 }
 
 #[tokio::test]
 async fn test_sync_50k() {
+    let harness = ScenarioHarness::skip("50k event replay too slow for CI");
     let alice = Peer::new_with_identity("alice");
     let bob = Peer::new_with_identity("bob");
 
@@ -461,12 +500,15 @@ async fn test_sync_50k() {
 
     // Only alice's locally-created messages are projected on alice
     assert_eq!(alice.message_count(), 50_000);
+
+    harness.finish();
 }
 
 /// Integration test: verify peer_identity_from_connection returns the correct
 /// SPKI fingerprint across a live QUIC mTLS handshake.
 #[tokio::test]
 async fn test_peer_identity_extraction_live_handshake() {
+    let harness = ScenarioHarness::skip("transport handshake test, no projection state mutated");
     let alice = Peer::new("alice");
     let bob = Peer::new("bob");
 
@@ -518,6 +560,8 @@ async fn test_peer_identity_extraction_live_handshake() {
     // Verify they match the Peer identities computed from DB
     assert_eq!(client_sees_server.unwrap(), alice.identity);
     assert_eq!(server_sees_client.unwrap(), bob.identity);
+
+    harness.finish();
 }
 
 /// Test out-of-order reaction sync: Bob creates a reaction targeting Alice's message,
@@ -526,6 +570,9 @@ async fn test_peer_identity_extraction_live_handshake() {
 async fn test_out_of_order_reaction_sync() {
     let alice = Peer::new_with_identity("alice");
     let bob = Peer::new_with_identity("bob");
+    let harness = ScenarioHarness::new();
+    harness.track(&alice);
+    harness.track(&bob);
 
     // Alice creates a message
     let msg_id = alice.create_message("Hello from Alice");
@@ -558,8 +605,7 @@ async fn test_out_of_order_reaction_sync() {
     assert_eq!(alice.message_count(), 1);
     assert_eq!(alice.reaction_count(), 0);
 
-    verify_projection_invariants(&alice);
-    verify_projection_invariants(&bob);
+    harness.finish();
 }
 
 /// Test that multiple reactions targeting different messages all resolve correctly
@@ -568,6 +614,9 @@ async fn test_out_of_order_reaction_sync() {
 async fn test_multi_dep_blocking_sync() {
     let alice = Peer::new_with_identity("alice");
     let bob = Peer::new_with_identity("bob");
+    let harness = ScenarioHarness::new();
+    harness.track(&alice);
+    harness.track(&bob);
 
     // Alice creates 3 messages
     let msg1 = alice.create_message("First");
@@ -600,8 +649,7 @@ async fn test_multi_dep_blocking_sync() {
     assert_eq!(alice.reaction_count(), 0);
     assert_eq!(bob.reaction_count(), 0);
 
-    verify_projection_invariants(&alice);
-    verify_projection_invariants(&bob);
+    harness.finish();
 }
 
 /// Integration test: Alice creates SignedMemo + message, Bob syncs, both valid.
@@ -609,6 +657,9 @@ async fn test_multi_dep_blocking_sync() {
 async fn test_signed_event_sync() {
     let alice = Peer::new_with_identity("alice");
     let bob = Peer::new_with_identity("bob");
+    let harness = ScenarioHarness::new();
+    harness.track(&alice);
+    harness.track(&bob);
 
     // Alice creates a SignedMemo using her PeerShared identity chain key
     let signer_eid = alice.peer_shared_event_id.unwrap();
@@ -633,8 +684,7 @@ async fn test_signed_event_sync() {
     // (InviteAccepted is Local-scoped, not synced). Only locally-created signed memos project.
     assert_eq!(alice.signed_memo_count(), 1);
 
-    verify_projection_invariants(&alice);
-    verify_projection_invariants(&bob);
+    harness.finish();
 }
 
 /// Integration test: signed memo syncs alongside messages; verify store convergence.
@@ -642,6 +692,9 @@ async fn test_signed_event_sync() {
 async fn test_signed_event_out_of_order_sync() {
     let alice = Peer::new_with_identity("alice");
     let bob = Peer::new_with_identity("bob");
+    let harness = ScenarioHarness::new();
+    harness.track(&alice);
+    harness.track(&bob);
 
     // Alice creates SignedMemo (using PeerShared key) + a message
     let signer_eid = alice.peer_shared_event_id.unwrap();
@@ -671,8 +724,7 @@ async fn test_signed_event_out_of_order_sync() {
     assert_eq!(alice.signed_memo_count(), 1);
     assert_eq!(bob.message_count(), 1);
 
-    verify_projection_invariants(&alice);
-    verify_projection_invariants(&bob);
+    harness.finish();
 }
 
 /// Integration test: wrong-key memo rejected on remote peer.
@@ -683,6 +735,9 @@ async fn test_invalid_signature_rejected_after_sync() {
 
     let alice = Peer::new_with_identity("alice");
     let bob = Peer::new_with_identity("bob");
+    let harness = ScenarioHarness::new();
+    harness.track(&alice);
+    harness.track(&bob);
 
     let mut rng = rand::thread_rng();
     let wrong_key = SigningKey::generate(&mut rng);
@@ -751,6 +806,8 @@ async fn test_invalid_signature_rejected_after_sync() {
 
     // Bob should NOT project the bad-signature memo.
     assert_eq!(bob.signed_memo_count(), 0, "bad-signature memo should be rejected, not projected");
+
+    harness.finish();
 }
 
 /// Integration test: verify valid_events are tenant-scoped after sync.
@@ -760,6 +817,9 @@ async fn test_invalid_signature_rejected_after_sync() {
 async fn test_cross_tenant_dep_scoping_after_sync() {
     let alice = Peer::new_with_identity("alice");
     let bob = Peer::new_with_identity("bob");
+    let harness = ScenarioHarness::new();
+    harness.track(&alice);
+    harness.track(&bob);
 
     // Alice creates a message and a reaction targeting it
     let msg_id = alice.create_message("Cross-tenant scoping test");
@@ -802,9 +862,7 @@ async fn test_cross_tenant_dep_scoping_after_sync() {
     ).unwrap();
     assert!(alice_valid > bob_valid, "Alice should have more valid events due to content (alice={}, bob={})", alice_valid, bob_valid);
 
-    // Run projection invariants for both
-    verify_projection_invariants(&alice);
-    verify_projection_invariants(&bob);
+    harness.finish();
 }
 
 /// Integration test: Alice creates a PSK + encrypted message → syncs to Bob → Bob projects.
@@ -812,6 +870,9 @@ async fn test_cross_tenant_dep_scoping_after_sync() {
 async fn test_encrypted_event_sync() {
     let alice = Peer::new_with_identity("alice");
     let bob = Peer::new_with_identity("bob");
+    let harness = ScenarioHarness::new();
+    harness.track(&alice);
+    harness.track(&bob);
 
     // Materialize the same PSK locally on both peers (local-only key event, not synced).
     let key_bytes: [u8; 32] = rand::random();
@@ -846,8 +907,7 @@ async fn test_encrypted_event_sync() {
     // is not valid on Bob's side (foreign network)
     assert_eq!(bob.scoped_message_count(), 0);
 
-    verify_projection_invariants(&alice);
-    verify_projection_invariants(&bob);
+    harness.finish();
 }
 
 /// Integration test: Encrypted event syncs before key → blocks → key syncs → cascade unblocks.
@@ -855,6 +915,9 @@ async fn test_encrypted_event_sync() {
 async fn test_encrypted_out_of_order_sync() {
     let alice = Peer::new_with_identity("alice");
     let bob = Peer::new_with_identity("bob");
+    let harness = ScenarioHarness::new();
+    harness.track(&alice);
+    harness.track(&bob);
 
     // Alice creates key + encrypted message.
     let key_bytes: [u8; 32] = rand::random();
@@ -908,14 +971,15 @@ async fn test_encrypted_out_of_order_sync() {
     // Alice sees all her own messages
     assert_eq!(alice.scoped_message_count(), 2); // encrypted inner + normal message
 
-    verify_projection_invariants(&alice);
-    verify_projection_invariants(&bob);
+    harness.finish();
 }
 
 /// Integration test: mixed cleartext + encrypted events → verify_projection_invariants.
 #[tokio::test]
 async fn test_encrypted_replay_invariants() {
     let alice = Peer::new_with_identity("alice");
+    let harness = ScenarioHarness::new();
+    harness.track(&alice);
 
     // Create a mix of cleartext and encrypted events
     let key_bytes: [u8; 32] = rand::random();
@@ -930,13 +994,14 @@ async fn test_encrypted_replay_invariants() {
     assert_eq!(alice.scoped_message_count(), 4); // 2 cleartext + 2 encrypted inner messages
 
     // Run invariant checks (forward, double, reverse)
-    verify_projection_invariants(&alice);
+    harness.finish();
 }
 
 /// Integration test: simulate crash recovery by manually enqueuing events into project_queue,
 /// then calling recovery (recover_expired + drain). All events should be projected.
 #[tokio::test]
 async fn test_project_queue_crash_recovery() {
+    let harness = ScenarioHarness::skip("manually destroys/rebuilds projection as test mechanism");
     use poc_7::db::project_queue::ProjectQueue;
     use poc_7::projection::pipeline::project_one;
 
@@ -1015,11 +1080,14 @@ async fn test_project_queue_crash_recovery() {
 
     // Queue should be empty
     assert_eq!(pq.count_pending(&alice.identity).unwrap(), 0);
+
+    harness.finish();
 }
 
 /// Integration test: verify project_queue drain works end-to-end with create_event_sync events.
 #[tokio::test]
 async fn test_project_queue_drain_after_batch() {
+    let harness = ScenarioHarness::skip("tests queue dedup guard, not projection invariants");
     use poc_7::db::project_queue::ProjectQueue;
     use poc_7::projection::pipeline::project_one;
 
@@ -1056,11 +1124,14 @@ async fn test_project_queue_drain_after_batch() {
 
     // State unchanged
     assert_eq!(alice.scoped_message_count(), 5);
+
+    harness.finish();
 }
 
 /// Integration test: egress_queue lifecycle — enqueue, claim, send, cleanup.
 #[tokio::test]
 async fn test_egress_queue_lifecycle() {
+    let harness = ScenarioHarness::skip("tests egress queue lifecycle, no projection state involved");
     use poc_7::db::egress_queue::EgressQueue;
 
     let alice = Peer::new_with_identity("alice");
@@ -1112,6 +1183,8 @@ async fn test_egress_queue_lifecycle() {
     eq.clear_connection(conn_id).unwrap();
     let pending = eq.count_pending(conn_id).unwrap();
     assert_eq!(pending, 0);
+
+    harness.finish();
 }
 
 /// Integration test: Alice creates message + reactions, syncs to Bob. Alice deletes message.
@@ -1120,6 +1193,9 @@ async fn test_egress_queue_lifecycle() {
 async fn test_deletion_sync() {
     let alice = Peer::new_with_identity("alice");
     let bob = Peer::new_with_identity("bob");
+    let harness = ScenarioHarness::new();
+    harness.track(&alice);
+    harness.track(&bob);
 
     // Alice creates a message and a reaction targeting it
     let msg_id = alice.create_message("Delete me");
@@ -1169,8 +1245,7 @@ async fn test_deletion_sync() {
     assert_eq!(bob.reaction_count(), 0, "bob: no reactions projected (foreign signer)");
     assert_eq!(bob.deleted_message_count(), 0, "bob: no tombstones (deletion blocked too)");
 
-    verify_projection_invariants(&alice);
-    verify_projection_invariants(&bob);
+    harness.finish();
 }
 
 /// Integration test: Alice creates a message and then a deletion targeting it.
@@ -1182,6 +1257,9 @@ async fn test_deletion_sync() {
 async fn test_deletion_before_target_sync() {
     let alice = Peer::new_with_identity("alice");
     let bob = Peer::new_with_identity("bob");
+    let harness = ScenarioHarness::new();
+    harness.track(&alice);
+    harness.track(&bob);
 
     // Alice creates a message and then deletes it
     let msg_id = alice.create_message("Delete me via sync");
@@ -1206,8 +1284,7 @@ async fn test_deletion_before_target_sync() {
     assert_eq!(bob.message_count(), 0, "bob: no messages (foreign signer)");
     assert_eq!(bob.deleted_message_count(), 0, "bob: no tombstones (foreign signer)");
 
-    verify_projection_invariants(&alice);
-    verify_projection_invariants(&bob);
+    harness.finish();
 }
 
 /// Integration test: Create encrypted message, then encrypted deletion targeting it.
@@ -1215,6 +1292,8 @@ async fn test_deletion_before_target_sync() {
 #[tokio::test]
 async fn test_encrypted_deletion() {
     let alice = Peer::new_with_identity("alice");
+    let harness = ScenarioHarness::new();
+    harness.track(&alice);
 
     // Create a secret key
     let key_bytes: [u8; 32] = rand::random();
@@ -1242,7 +1321,7 @@ async fn test_encrypted_deletion() {
     assert_eq!(alice.scoped_message_count(), 0); // inner message deleted
     assert_eq!(alice.deleted_message_count(), 1); // tombstone from encrypted deletion
 
-    verify_projection_invariants(&alice);
+    harness.finish();
 }
 
 /// Integration test: After deletion sync, verify_projection_invariants on both peers.
@@ -1250,6 +1329,9 @@ async fn test_encrypted_deletion() {
 async fn test_deletion_replay_invariants() {
     let alice = Peer::new_with_identity("alice");
     let bob = Peer::new_with_identity("bob");
+    let harness = ScenarioHarness::new();
+    harness.track(&alice);
+    harness.track(&bob);
 
     // Create a mix of messages, reactions, and deletions
     let msg1 = alice.create_message("Keep me");
@@ -1282,8 +1364,7 @@ async fn test_deletion_replay_invariants() {
     assert_eq!(bob.deleted_message_count(), 0);
 
     // Run full replay invariants on both
-    verify_projection_invariants(&alice);
-    verify_projection_invariants(&bob);
+    harness.finish();
 }
 
 /// Gap 1: Verify SecretKey events (ShareScope::Local) are never sent to remote peers.
@@ -1291,6 +1372,9 @@ async fn test_deletion_replay_invariants() {
 async fn test_local_only_events_not_synced() {
     let alice = Peer::new_with_identity("alice");
     let bob = Peer::new_with_identity("bob");
+    let harness = ScenarioHarness::new();
+    harness.track(&alice);
+    harness.track(&bob);
 
     // Both peers materialize the same PSK locally
     let key_bytes: [u8; 32] = rand::random();
@@ -1325,8 +1409,7 @@ async fn test_local_only_events_not_synced() {
     let sk_b64 = event_id_to_base64(&sk_eid);
     assert!(bob.has_event(&sk_b64), "bob should have the SK event (his own local copy)");
 
-    verify_projection_invariants(&alice);
-    verify_projection_invariants(&bob);
+    harness.finish();
 }
 
 /// Gap 2: Two-set PSK isolation -- mismatched PSKs cannot decrypt each other's messages.
@@ -1334,6 +1417,9 @@ async fn test_local_only_events_not_synced() {
 async fn test_psk_two_set_isolation() {
     let alice = Peer::new_with_identity("alice");
     let bob = Peer::new_with_identity("bob");
+    let harness = ScenarioHarness::new();
+    harness.track(&alice);
+    harness.track(&bob);
 
     // Alice and Bob use DIFFERENT PSKs
     let key_a: [u8; 32] = rand::random();
@@ -1371,6 +1457,8 @@ async fn test_psk_two_set_isolation() {
         |row| row.get(0),
     ).unwrap();
     assert!(blocked >= 1, "events should be blocked (foreign signer + missing key dep)");
+
+    harness.finish();
 }
 
 /// Integration test: Alice and Bob sync, verify peer_endpoint_observations are recorded.
@@ -1381,6 +1469,9 @@ async fn test_endpoint_observations_recorded() {
 
     let alice = Peer::new_with_identity("alice");
     let bob = Peer::new_with_identity("bob");
+    let harness = ScenarioHarness::new();
+    harness.track(&alice);
+    harness.track(&bob);
 
     // Create some data so sync has something to do
     let marker = alice.create_message("endpoint obs test");
@@ -1437,6 +1528,8 @@ async fn test_endpoint_observations_recorded() {
         |row| row.get(0),
     ).unwrap();
     assert_eq!(remaining, 0, "no observations should remain after far-future purge");
+
+    harness.finish();
 }
 
 /// Gap 3: Encrypted inner event with unsupported signer_type rejects durably (not hard error).
@@ -1450,6 +1543,8 @@ async fn test_encrypted_inner_unsupported_signer_rejects_durably() {
     use poc_7::projection::pipeline::project_one;
 
     let alice = Peer::new_with_identity("alice");
+    let harness = ScenarioHarness::new();
+    harness.track(&alice);
 
     // Create and project a secret key
     let key_bytes: [u8; 32] = rand::random();
@@ -1526,6 +1621,8 @@ async fn test_encrypted_inner_unsupported_signer_rejects_durably() {
         poc_7::projection::decision::ProjectionDecision::AlreadyProcessed,
         "rejected event should not be re-processed"
     );
+
+    harness.finish();
 }
 
 // =============================================================================
@@ -1628,6 +1725,8 @@ fn bootstrap_peer(peer: &Peer) -> BootstrapChain {
 #[test]
 fn test_bootstrap_sequence() {
     let alice = Peer::new("alice");
+    let harness = ScenarioHarness::new();
+    harness.track(&alice);
     let chain = bootstrap_peer(&alice);
 
     let db = open_connection(&alice.db_path).unwrap();
@@ -1703,6 +1802,8 @@ fn test_bootstrap_sequence() {
         |row| row.get(0),
     ).unwrap();
     assert_eq!(ia_count, 1);
+
+    harness.finish();
 }
 
 #[test]
@@ -1710,6 +1811,8 @@ fn test_out_of_order_identity() {
     // Record UserBoot BEFORE UserInviteBoot — UserBoot blocks on missing dep,
     // then cascades when the full invite chain is created afterward.
     let alice = Peer::new("alice");
+    let harness = ScenarioHarness::new();
+    harness.track(&alice);
     let db = open_connection(&alice.db_path).unwrap();
 
     use ed25519_dalek::SigningKey;
@@ -1854,11 +1957,15 @@ fn test_out_of_order_identity() {
         |row| row.get(0),
     ).unwrap();
     assert!(uib_valid, "UserInviteBoot should be valid after cascade");
+
+    harness.finish();
 }
 
 #[test]
 fn test_foreign_workspace_excluded() {
     let alice = Peer::new("alice");
+    let harness = ScenarioHarness::new();
+    harness.track(&alice);
     let _chain = bootstrap_peer(&alice);
 
     let db = open_connection(&alice.db_path).unwrap();
@@ -1893,11 +2000,15 @@ fn test_foreign_workspace_excluded() {
         |row| row.get(0),
     ).unwrap();
     assert!(rejected_count > 0, "foreign workspace event should be rejected");
+
+    harness.finish();
 }
 
 #[test]
 fn test_removal_enforcement() {
     let alice = Peer::new("alice");
+    let harness = ScenarioHarness::new();
+    harness.track(&alice);
     let chain = bootstrap_peer(&alice);
 
     // Create a "Bob" user event to be removed
@@ -1929,11 +2040,15 @@ fn test_removal_enforcement() {
         |row| row.get(0),
     ).unwrap();
     assert_eq!(removed_count, 1, "removed_entities should have one user removal");
+
+    harness.finish();
 }
 
 #[test]
 fn test_secret_shared_key_wrap() {
     let alice = Peer::new("alice");
+    let harness = ScenarioHarness::new();
+    harness.track(&alice);
     let chain = bootstrap_peer(&alice);
 
     // Create SecretKey
@@ -1965,22 +2080,28 @@ fn test_secret_shared_key_wrap() {
         |row| row.get(0),
     ).unwrap();
     assert_eq!(ss_count, 1, "secret_shared should be in projection table");
+
+    harness.finish();
 }
 
 #[test]
 fn test_identity_replay_invariants() {
     let alice = Peer::new_with_identity("alice");
+    let harness = ScenarioHarness::new();
+    harness.track(&alice);
 
     // Create some content after identity chain
     alice.create_message("hello after bootstrap");
 
     // Verify replay invariants (forward, double, reverse)
-    verify_projection_invariants(&alice);
+    harness.finish();
 }
 
 #[test]
 fn test_transport_key_projects_without_auto_binding() {
     let alice = Peer::new("alice");
+    let harness = ScenarioHarness::new();
+    harness.track(&alice);
     let chain = bootstrap_peer(&alice);
 
     // Create a TransportKey event signed by PeerShared
@@ -2020,6 +2141,8 @@ fn test_transport_key_projects_without_auto_binding() {
     // allowed_peers_from_db should include SPKI from transport_keys (not bindings)
     let allowed = poc_7::db::transport_trust::allowed_peers_from_db(&db, &alice.identity).unwrap();
     assert!(allowed.contains(&spki_fp), "allowed_peers should include transport key SPKI");
+
+    harness.finish();
 }
 
 #[test]
@@ -2028,6 +2151,8 @@ fn test_transport_key_signer_matches_local_key() {
     use poc_7::transport_identity::ensure_transport_key_event;
 
     let alice = Peer::new("alice");
+    let harness = ScenarioHarness::new();
+    harness.track(&alice);
     let chain = bootstrap_peer(&alice);
 
     // Insert a second peers_shared row with a different public key (simulating another
@@ -2067,10 +2192,13 @@ fn test_transport_key_signer_matches_local_key() {
     // Since we already created one, a second call returns Ok(None) for the existing SPKI.
     let result2 = ensure_transport_key_event(&db, &alice.identity, &chain.peer_shared_key);
     assert_eq!(result2.unwrap(), None, "second call should return None (already exists)");
+
+    harness.finish();
 }
 
 #[test]
 fn test_transport_key_invalid_sig_rejected() {
+    let harness = ScenarioHarness::skip("uses catch_unwind; projection may be partial after panic");
     use ed25519_dalek::SigningKey;
 
     let alice = Peer::new("alice");
@@ -2108,11 +2236,15 @@ fn test_transport_key_invalid_sig_rejected() {
         assert!(rejected_count > 0, "invalid-sig transport key should be rejected");
     }
     // If it panicked, that's also acceptable — signature verification failed
+
+    harness.finish();
 }
 
 #[test]
 fn test_transport_key_replay_invariants() {
     let alice = Peer::new_with_identity("alice");
+    let harness = ScenarioHarness::new();
+    harness.track(&alice);
     let ps_eid = alice.peer_shared_event_id.unwrap();
     let ps_key = alice.peer_shared_signing_key.as_ref().unwrap();
 
@@ -2128,7 +2260,7 @@ fn test_transport_key_replay_invariants() {
     alice.create_message("after transport key");
 
     // Verify replay invariants (forward, double, reverse)
-    verify_projection_invariants(&alice);
+    harness.finish();
 }
 
 
@@ -2141,6 +2273,8 @@ fn test_transport_key_replay_invariants() {
 #[test]
 fn test_invite_accepted_no_prior_invite_required() {
     let alice = Peer::new("alice");
+    let harness = ScenarioHarness::new();
+    harness.track(&alice);
     let db = open_connection(&alice.db_path).unwrap();
 
     let workspace_id: [u8; 32] = rand::random();
@@ -2166,12 +2300,16 @@ fn test_invite_accepted_no_prior_invite_required() {
     ).expect("trust anchor should exist");
     let expected_nid = event_id_to_base64(&workspace_id);
     assert_eq!(anchor, expected_nid, "trust anchor should match invite_accepted event's workspace_id");
+
+    harness.finish();
 }
 
 /// Trust anchor immutability: second invite_accepted with conflicting workspace_id is rejected.
 #[test]
 fn test_trust_anchor_immutability() {
     let alice = Peer::new("alice");
+    let harness = ScenarioHarness::new();
+    harness.track(&alice);
     let db = open_connection(&alice.db_path).unwrap();
 
     let workspace_id_1: [u8; 32] = rand::random();
@@ -2219,12 +2357,15 @@ fn test_trust_anchor_immutability() {
     ).expect("trust anchor should still exist");
     let expected_nid = event_id_to_base64(&workspace_id_1);
     assert_eq!(anchor, expected_nid, "trust anchor should not have changed");
+
+    harness.finish();
 }
 
 /// No pre-projection blob capture influence: manually inserting a malformed
 /// invite-like blob into events should not alter trust binding state.
 #[test]
 fn test_no_blob_capture_trust_influence() {
+    let harness = ScenarioHarness::skip("raw blob insertion without project_one; no projection to replay");
     let alice = Peer::new("alice");
     let db = open_connection(&alice.db_path).unwrap();
 
@@ -2259,6 +2400,8 @@ fn test_no_blob_capture_trust_influence() {
         |row| row.get(0),
     ).unwrap();
     assert_eq!(anchor_count, 0, "trust anchor should not be set by raw blob presence");
+
+    harness.finish();
 }
 
 /// True out-of-order identity chain: record invite_accepted BEFORE its referenced
@@ -2266,6 +2409,8 @@ fn test_no_blob_capture_trust_influence() {
 #[test]
 fn test_true_out_of_order_identity_chain() {
     let alice = Peer::new("alice");
+    let harness = ScenarioHarness::new();
+    harness.track(&alice);
     let db = open_connection(&alice.db_path).unwrap();
 
     use ed25519_dalek::SigningKey;
@@ -2340,6 +2485,8 @@ fn test_true_out_of_order_identity_chain() {
         |row| row.get(0),
     ).unwrap();
     assert!(user_valid, "user_boot should be valid after full chain");
+
+    harness.finish();
 }
 
 // =============================================================================
@@ -2426,6 +2573,9 @@ fn join_workspace(
 async fn test_two_peer_identity_join_and_sync() {
     let alice = Peer::new("alice");
     let bob = Peer::new("bob");
+    let harness = ScenarioHarness::new();
+    harness.track(&alice);
+    harness.track(&bob);
 
     // Alice bootstraps her full identity chain
     let alice_chain = bootstrap_peer(&alice);
@@ -2472,8 +2622,7 @@ async fn test_two_peer_identity_join_and_sync() {
     assert_eq!(bob.admin_count(), 1, "Bob sees 1 admin");
 
     // Replay invariants hold for both peers
-    verify_projection_invariants(&alice);
-    verify_projection_invariants(&bob);
+    harness.finish();
 }
 
 /// Identity chain events arrive out of order via sync and cascade to valid.
@@ -2483,6 +2632,8 @@ async fn test_two_peer_identity_join_and_sync() {
 async fn test_identity_cascade_via_sync() {
     let alice = Peer::new("alice");
     let bob = Peer::new("bob");
+    let harness = ScenarioHarness::new();
+    harness.track(&bob);
 
     // Alice bootstraps
     let alice_chain = bootstrap_peer(&alice);
@@ -2537,7 +2688,7 @@ async fn test_identity_cascade_via_sync() {
     assert_eq!(bob.user_invite_count(), 2, "Bob should have both invites");
     assert_eq!(bob.user_count(), 2, "Both Alice's and Bob's users should be valid");
 
-    verify_projection_invariants(&bob);
+    harness.finish();
 }
 
 /// After identity join, Alice and Bob can exchange messages. Tests that the
@@ -2556,6 +2707,10 @@ async fn test_identity_then_messaging() {
     alice.peer_shared_signing_key = Some(alice_chain.peer_shared_key.clone());
     bob.peer_shared_event_id = Some(bob_join.peer_shared_eid);
     bob.peer_shared_signing_key = Some(bob_join.peer_shared_key.clone());
+
+    let harness = ScenarioHarness::new();
+    harness.track(&alice);
+    harness.track(&bob);
 
     // Sync identity events first
     let sync = start_peers(&alice, &bob);
@@ -2579,8 +2734,7 @@ async fn test_identity_then_messaging() {
     ).await;
     drop(sync);
 
-    verify_projection_invariants(&alice);
-    verify_projection_invariants(&bob);
+    harness.finish();
 }
 
 /// Alice bootstraps on two devices (Phone and Laptop). Phone creates a DeviceInviteOngoing
@@ -2592,6 +2746,9 @@ async fn test_device_link_via_sync() {
 
     let phone = Peer::new("phone");
     let laptop = Peer::new("laptop");
+    let harness = ScenarioHarness::new();
+    harness.track(&phone);
+    harness.track(&laptop);
 
     let mut rng = rand::thread_rng();
 
@@ -2657,8 +2814,7 @@ async fn test_device_link_via_sync() {
     assert_eq!(phone.device_invite_count(), 2, "Phone: first + ongoing");
     assert_eq!(laptop.device_invite_count(), 2, "Laptop: first + ongoing");
 
-    verify_projection_invariants(&phone);
-    verify_projection_invariants(&laptop);
+    harness.finish();
 }
 
 /// Alice and Bob are on different workspaces. When they sync, Bob's workspace events
@@ -2668,6 +2824,9 @@ async fn test_device_link_via_sync() {
 async fn test_foreign_workspace_rejected_via_sync() {
     let alice = Peer::new("alice");
     let bob = Peer::new("bob");
+    let harness = ScenarioHarness::new();
+    harness.track(&alice);
+    harness.track(&bob);
 
     // Both bootstrap independently on DIFFERENT workspaces
     let alice_chain = bootstrap_peer(&alice);
@@ -2711,8 +2870,7 @@ async fn test_foreign_workspace_rejected_via_sync() {
     assert_eq!(alice.user_count(), 1, "Alice's own user unchanged");
     assert_eq!(bob.user_count(), 1, "Bob's own user unchanged");
 
-    verify_projection_invariants(&alice);
-    verify_projection_invariants(&bob);
+    harness.finish();
 }
 
 // ---------------------------------------------------------------------------
@@ -2724,6 +2882,8 @@ async fn test_foreign_workspace_rejected_via_sync() {
 #[tokio::test]
 async fn test_shared_db_two_tenants_different_workspaces() {
     let node = SharedDbNode::new(2);
+    let harness = ScenarioHarness::new();
+    harness.track_node(&node);
     let t0 = &node.tenants[0];
     let t1 = &node.tenants[1];
 
@@ -2742,13 +2902,15 @@ async fn test_shared_db_two_tenants_different_workspaces() {
     assert_eq!(t1.scoped_message_count(), 2, "tenant 1 should have 2 projected messages");
 
     // Verify per-tenant projection invariants + no cross-tenant leakage
-    node.verify_all_invariants();
+    harness.finish();
 }
 
 /// SharedDbNode tenant discovery: verify discover_local_tenants returns all tenants.
 #[tokio::test]
 async fn test_shared_db_tenant_discovery() {
     let node = SharedDbNode::new(3);
+    let harness = ScenarioHarness::new();
+    harness.track_node(&node);
 
     let db = open_connection(&node.db_path).unwrap();
     let tenants = poc_7::db::transport_creds::discover_local_tenants(&db).unwrap();
@@ -2767,6 +2929,8 @@ async fn test_shared_db_tenant_discovery() {
     let ids: Vec<&str> = tenants.iter().map(|t| t.peer_id.as_str()).collect();
     let unique: std::collections::HashSet<&str> = ids.iter().copied().collect();
     assert_eq!(ids.len(), unique.len(), "all tenant IDs should be unique");
+
+    harness.finish();
 }
 
 /// No cross-tenant leakage: events created by one tenant should not have
@@ -2774,6 +2938,8 @@ async fn test_shared_db_tenant_discovery() {
 #[tokio::test]
 async fn test_shared_db_no_cross_tenant_leakage() {
     let node = SharedDbNode::new(2);
+    let harness = ScenarioHarness::new();
+    harness.track_node(&node);
     let t0 = &node.tenants[0];
     let t1 = &node.tenants[1];
 
@@ -2841,17 +3007,18 @@ async fn test_shared_db_no_cross_tenant_leakage() {
         valid_overlap.len(), valid_overlap);
 
     // Also verify via the comprehensive helper
-    node.verify_all_invariants();
+    harness.finish();
 }
 
 /// Node + external peer: a SharedDbNode tenant syncs with a standalone Peer.
 #[tokio::test]
 async fn test_shared_db_sync_with_external_peer() {
     let node = SharedDbNode::new(1);
-    let tenant = &node.tenants[0];
-
-    // External standalone peer
     let external = Peer::new_with_identity("external");
+    let harness = ScenarioHarness::new();
+    harness.track_node(&node);
+    harness.track(&external);
+    let tenant = &node.tenants[0];
 
     // Create messages on both sides
     tenant.batch_create_messages(2);
@@ -2873,14 +3040,15 @@ async fn test_shared_db_sync_with_external_peer() {
         "tenant and external should exchange marker events",
     ).await;
 
-    node.verify_all_invariants();
-    verify_projection_invariants(&external);
+    harness.finish();
 }
 
 /// svc_node_status returns the correct tenant list.
 #[tokio::test]
 async fn test_svc_node_status() {
     let node = SharedDbNode::new(2);
+    let harness = ScenarioHarness::new();
+    harness.track_node(&node);
 
     let status = poc_7::service::svc_node_status(&node.db_path).unwrap();
     assert_eq!(status.len(), 2, "should report 2 tenants");
@@ -2889,7 +3057,7 @@ async fn test_svc_node_status() {
     assert!(ids.contains(&node.tenants[0].identity.as_str()));
     assert!(ids.contains(&node.tenants[1].identity.as_str()));
 
-    node.verify_all_invariants();
+    harness.finish();
 }
 
 /// Two tenants in the same workspace on the same node: verify that canonical
@@ -2902,6 +3070,9 @@ async fn test_shared_db_same_workspace_two_tenants() {
 
     // Second tenant joins the first tenant's workspace
     node.add_tenant_in_workspace("tenant-1-same-ws", 0);
+
+    let harness = ScenarioHarness::new();
+    harness.track_node(&node);
 
     let t0 = &node.tenants[0];
     let t1 = &node.tenants[1];
@@ -2944,7 +3115,7 @@ async fn test_shared_db_same_workspace_two_tenants() {
 
     // Projection invariants should hold — verify_all_invariants uses the
     // workspace-aware check that allows overlap for same-workspace tenants.
-    node.verify_all_invariants();
+    harness.finish();
 }
 
 /// mDNS integration: two peers discover each other via mDNS and sync using
@@ -2958,6 +3129,9 @@ async fn test_mdns_two_peers_discover_and_sync() {
 
     let alice = Peer::new_with_identity("mdns-alice");
     let bob = Peer::new_with_identity("mdns-bob");
+    let harness = ScenarioHarness::new();
+    harness.track(&alice);
+    harness.track(&bob);
 
     alice.batch_create_messages(3);
     bob.batch_create_messages(2);
@@ -3047,8 +3221,7 @@ async fn test_mdns_two_peers_discover_and_sync() {
     drop(disc_a);
     drop(disc_b);
 
-    verify_projection_invariants(&alice);
-    verify_projection_invariants(&bob);
+    harness.finish();
 }
 
 /// mDNS multitenancy: verifies self-filtering (co-located tenants don't
@@ -3064,6 +3237,9 @@ async fn test_mdns_multitenant_self_filtering_and_sync() {
     let t0 = Peer::new_with_identity("mdns-t0");
     let t1 = Peer::new_with_identity("mdns-t1");
     let ext = Peer::new_with_identity("mdns-ext");
+    let harness = ScenarioHarness::new();
+    harness.track(&t0);
+    harness.track(&ext);
 
     t0.batch_create_messages(2);
     ext.batch_create_messages(3);
@@ -3219,6 +3395,59 @@ async fn test_mdns_multitenant_self_filtering_and_sync() {
     drop(disc_t1);
     drop(disc_ext);
 
-    verify_projection_invariants(&t0);
-    verify_projection_invariants(&ext);
+    harness.finish();
+}
+
+/// Guard test: verify that every test function in this file uses `ScenarioHarness`.
+/// This catches future tests that forget to add the harness.
+#[test]
+fn test_scenario_harness_guard() {
+    let source = include_str!("scenario_test.rs");
+
+    // Collect (line_index, fn_name) for each test function definition
+    let lines: Vec<&str> = source.lines().collect();
+    let mut test_fns: Vec<(usize, String)> = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        let is_fn_def = (trimmed.starts_with("fn test_")
+            || trimmed.starts_with("async fn test_"))
+            && trimmed.contains('(');
+        if !is_fn_def {
+            continue;
+        }
+        let name = trimmed
+            .trim_start_matches("async ")
+            .trim_start_matches("fn ")
+            .split('(')
+            .next()
+            .unwrap_or("")
+            .to_string();
+        if name == "test_scenario_harness_guard" {
+            continue;
+        }
+        test_fns.push((i, name));
+    }
+
+    // For each test function, scan from its definition line to the next test function
+    // (or EOF) and check that "ScenarioHarness" appears in that range.
+    let mut uncovered = Vec::new();
+    for (idx, (start_line, ref name)) in test_fns.iter().enumerate() {
+        let end_line = if idx + 1 < test_fns.len() {
+            test_fns[idx + 1].0
+        } else {
+            lines.len()
+        };
+        let section = &lines[*start_line..end_line];
+        let has_harness = section.iter().any(|l| l.contains("ScenarioHarness"));
+        if !has_harness {
+            uncovered.push(name.clone());
+        }
+    }
+
+    assert!(
+        uncovered.is_empty(),
+        "The following test(s) do not use ScenarioHarness: {:?}\n\
+         Every scenario test must use ScenarioHarness::new(), ::skip(), or be documented.",
+        uncovered,
+    );
 }
