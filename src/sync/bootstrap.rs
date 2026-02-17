@@ -18,7 +18,7 @@ use crate::transport::{
     create_dual_endpoint, AllowedPeers, DualConnection, peer_identity_from_connection,
 };
 use crate::transport_identity::{
-    ensure_transport_cert_from_db, expected_invite_bootstrap_spki_from_invite_key,
+    load_transport_cert_required_from_db, expected_invite_bootstrap_spki_from_invite_key,
 };
 
 /// Run a one-shot bootstrap sync from an invite link's bootstrap address.
@@ -43,7 +43,7 @@ pub async fn bootstrap_sync_from_invite(
         create_tables(&db)?;
     }
 
-    let (_peer_id, cert, key) = ensure_transport_cert_from_db(db_path)?;
+    let (_peer_id, cert, key) = load_transport_cert_required_from_db(db_path)?;
 
     // Pin only the bootstrap peer's SPKI for this one-shot connection
     let allowed = Arc::new(AllowedPeers::from_fingerprints(vec![*bootstrap_spki]));

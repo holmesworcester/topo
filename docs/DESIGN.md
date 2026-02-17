@@ -226,7 +226,7 @@ Workspace → UserInviteBoot → InviteAccepted (trust anchor) → UserBoot → 
 **Accept** (`accept_user_invite`): joiner consumes invite data and creates:
 InviteAccepted (trust anchor) → UserBoot → DeviceInviteFirst → PeerSharedFirst.
 Prerequisite: the joiner's DB must already contain the Workspace and UserInviteBoot events (copied from the inviter before or during sync).
-The acceptance path also unwraps any bootstrap content-key material from the invite link (wrapped to the invite public key at creation time) and materializes local `secret_key` events so that encrypted content received during bootstrap sync can be decrypted.
+The acceptance path also unwraps bootstrap content-key material received via `secret_shared` events (wrapped to the invite public key at creation time) and materializes local `secret_key` events so that encrypted content received during bootstrap sync can be decrypted.
 
 **Device link** (`create_device_link_invite` / `accept_device_link`): similar to user invite but creates a shorter chain (PeerSharedFirst only, skipping user/device_invite creation).
 
@@ -791,8 +791,8 @@ No historical re-encryption or key history backfill is required in this baseline
 Bootstrap key acquisition uses the same `secret_shared` event type and wrap/unwrap logic as runtime sender-keys. The only difference is the recipient: at invite creation the inviter wraps content-key material to the invite public key (X25519-derived from the Ed25519 invite signing key), rather than to a peer's PeerShared public key.
 
 Flow:
-1. At invite creation, the inviter wraps current content key(s) to the invite key and embeds the wrapped material in the invite link.
-2. At invite acceptance, the joiner unwraps using the invite private key (carried in the link) and the inviter's public key.
+1. At invite creation, the inviter wraps current content key(s) to the invite key via `secret_shared` events (delivered during bootstrap sync, not embedded in the invite link payload).
+2. At invite acceptance, the joiner unwraps using the invite private key (carried in the link) and the inviter's public key (from the `secret_shared` event's signer).
 3. The joiner materializes local `secret_key` events with deterministic event IDs (BLAKE2b hash of key bytes → `created_at_ms`), ensuring both inviter and joiner derive identical `key_event_id` values.
 4. Encrypted events that depend on those key IDs can then be projected normally through the standard block/unblock cascade.
 

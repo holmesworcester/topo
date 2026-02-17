@@ -603,7 +603,7 @@ fn cmd_messages(
                 // Enrichment: show reactions inline
                 let emojis = service::svc_reactions_for_message_conn(
                     &conn, &account.identity, &msg.id_b64,
-                ).unwrap_or_default();
+                ).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() })?;
 
                 if !emojis.is_empty() {
                     // Group reactions by emoji with counts

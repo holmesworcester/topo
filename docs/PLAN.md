@@ -1103,7 +1103,7 @@ Self-invite bootstrap sequence must stay explicit:
 
 Use `poc-6` as reference behavior for end-to-end test setup:
 1. Alice creates workspace + identity chain via high-level bootstrap API.
-2. Alice creates invite link (contains bootstrap address + inviter transport key identity metadata + wrapped content-key material targeting the invite public key).
+2. Alice creates invite link (contains bootstrap address + inviter SPKI fingerprint + invite event ID + invite private key + workspace ID). Wrapped content-key material is delivered via `secret_shared` events during bootstrap sync, not embedded in the invite link payload.
 3. Bob accepts invite link via high-level accept API:
    - records local `invite_accepted`,
    - writes trust anchor binding (`workspace_id`),
@@ -1650,7 +1650,7 @@ The DB already IS the tenant registry. `trust_anchors(peer_id, workspace_id)` co
 
 ## 17.1 DB-Only TLS Credential Storage
 
-Cert/key DER blobs live exclusively in SQLite. No `.cert.der` / `.key.der` files on disk. The identity bootstrap projection pipeline (which creates TransportKey events) stores credentials in the DB as part of the same flow.
+Cert/key DER blobs live exclusively in SQLite. No `.cert.der` / `.key.der` files on disk. Transport credentials are derived from PeerShared signing keys during identity bootstrap (workspace creation or invite acceptance) and stored in the DB.
 
 ### 17.1.1 Migration 26: `local_transport_creds`
 
@@ -1663,7 +1663,7 @@ CREATE TABLE local_transport_creds (
 );
 ```
 
-Auto-populated during the identity bootstrap flow that creates TransportKey events. Added in `src/db/migrations.rs`.
+Populated during identity bootstrap: PeerShared-derived cert/key is installed by `install_peer_key_transport_identity`, or invite-derived cert/key by `install_invite_bootstrap_transport_identity`. Added in `src/db/migrations.rs`.
 
 ### 17.1.2 `src/db/transport_creds.rs`
 

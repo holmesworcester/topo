@@ -513,6 +513,13 @@ static MIGRATIONS: &[Migration] = &[
             ) WITHOUT ROWID;
         ",
     },
+    Migration {
+        version: 28,
+        name: "drop_unused_ingress_queue",
+        sql: "
+            DROP TABLE IF EXISTS ingress_queue;
+        ",
+    },
 ];
 
 fn ensure_schema_migrations(conn: &Connection) -> SqliteResult<()> {
@@ -726,6 +733,6 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(max_version, 27);
+        assert_eq!(max_version, 28);
     }
 }

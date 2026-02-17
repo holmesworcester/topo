@@ -40,7 +40,7 @@ fn decode_32_byte_blob(blob: Vec<u8>) -> Option<[u8; 32]> {
 /// Record an observed transport binding (observation telemetry only).
 /// peer_id (hex SPKI fingerprint) was seen on a TLS connection with this SPKI
 /// fingerprint. Idempotent (INSERT OR IGNORE). NOT used for trust decisions —
-/// allowed_peers_from_db queries only event-derived transport_keys.
+/// allowed_peers_from_db queries PeerShared-derived SPKIs and bootstrap trust only.
 pub fn record_transport_binding(
     conn: &Connection,
     recorded_by: &str,
