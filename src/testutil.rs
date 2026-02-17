@@ -939,9 +939,15 @@ impl Peer {
             .expect("collect")
     }
 
-    /// Insert `count` synthetic transport_keys rows for this peer.
+    /// Insert `count` synthetic pending_invite_bootstrap_trust rows for this peer.
     /// Returns the generated SPKI fingerprints.
     pub fn seed_transport_keys(&self, count: usize) -> Vec<[u8; 32]> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let expires_at = now + 24 * 60 * 60 * 1000;
         let db = open_connection(&self.db_path).expect("failed to open db");
         db.execute("BEGIN", []).expect("failed to begin");
         let mut fps = Vec::with_capacity(count);
@@ -952,9 +958,11 @@ impl Peer {
             fp[8] = 0xFE; // sentinel to distinguish synthetic keys
             fps.push(fp);
             db.execute(
-                "INSERT OR IGNORE INTO transport_keys (recorded_by, event_id, spki_fingerprint) VALUES (?1, ?2, ?3)",
-                rusqlite::params![&self.identity, format!("synthetic_tk_{}", i), fp.as_slice()],
-            ).expect("failed to insert transport_key");
+                "INSERT OR IGNORE INTO pending_invite_bootstrap_trust
+                 (recorded_by, invite_event_id, workspace_id, expected_bootstrap_spki_fingerprint, created_at, expires_at, superseded_at)
+                 VALUES (?1, ?2, 'synthetic_ws', ?3, ?4, ?5, NULL)",
+                rusqlite::params![&self.identity, format!("synthetic_inv_{}", i), fp.as_slice(), now, expires_at],
+            ).expect("failed to insert pending_invite_bootstrap_trust");
         }
         db.execute("COMMIT", []).expect("failed to commit");
         fps
@@ -2679,7 +2687,7 @@ mod fingerprint_tests {
         ];
         let excluded_tables = [
             "valid_events", "rejected_events", "blocked_event_deps", "blocked_events",
-            "project_queue", "egress_queue", "ingress_queue",
+            "project_queue", "egress_queue",
             "peer_endpoint_observations", "intro_attempts",
             "peer_transport_bindings", "invite_bootstrap_trust",
             "pending_invite_bootstrap_trust", "local_transport_creds",

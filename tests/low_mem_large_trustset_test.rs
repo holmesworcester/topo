@@ -48,7 +48,7 @@ impl Drop for EnvGuard {
     }
 }
 
-/// Correctness test: seed 100K transport keys and verify allow/deny via SQL lookup.
+/// Correctness test: seed 100K pending bootstrap trust entries and verify allow/deny via SQL lookup.
 /// Ensures `is_peer_allowed` returns the correct result without materializing the
 /// full trust set.
 #[test]
@@ -78,7 +78,7 @@ fn large_trustset_allow_deny_correctness() {
     );
 }
 
-/// Memory budget test: seed 100K transport keys, then perform lookups and verify
+/// Memory budget test: seed 100K pending bootstrap trust entries, then perform lookups and verify
 /// that the RSS delta stays within budget (proving we don't load the full set).
 #[test]
 #[cfg(target_os = "linux")]
@@ -93,7 +93,7 @@ fn low_mem_large_trustset_budget() {
     // Warm the SQLite page cache so it doesn't count against our delta.
     let _warmup: i64 = db
         .query_row(
-            "SELECT COUNT(*) FROM transport_keys WHERE recorded_by = ?1",
+            "SELECT COUNT(*) FROM pending_invite_bootstrap_trust WHERE recorded_by = ?1",
             rusqlite::params![&alice.identity],
             |row| row.get(0),
         )

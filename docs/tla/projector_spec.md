@@ -105,7 +105,7 @@ Changes to this document require TLA+ model re-verification.
 | 19 | project_admin | admins | — |
 | 20 | project_user_removed | removed_entities | — |
 | 21 | project_peer_removed | removed_entities | — |
-| 22 | project_secret_shared | secret_shared | — |
+| 22 | project_secret_shared | secret_shared | bootstrap: wrap to invite key; runtime: wrap to PeerShared key |
 | 23 | project_transport_key | transport_keys | — |
 | 24 | project_message_attachment | message_attachments | — |
 | 25 | project_file_slice | file_slices | signature verification |
@@ -177,6 +177,9 @@ type_code(1) | created_at_ms(8) | public_key(32) | extra_dep_id(32) | signed_by(
 ```
 type_code(1) | created_at_ms(8) | key_event_id(32) | recipient_event_id(32) | wrapped_key(32) | signed_by(32) | signer_type(1) | signature(64)  = 202B
 ```
+- Bootstrap mode: `recipient_event_id` targets an invite-derived key; `wrapped_key` is XOR of content key with X25519 DH + BLAKE2b-256 shared secret.
+- Runtime mode: `recipient_event_id` targets a PeerShared event; same wrap algorithm.
+- Recipients unwrap and materialize local `secret_key` events with deterministic event IDs (BLAKE2b of key bytes → `created_at_ms`), ensuring both parties derive identical `key_event_id` values.
 
 ### 1194B fixed signed (Message)
 ```
@@ -254,8 +257,9 @@ The following parser-level canonicalization guarantees are enforced in Rust but 
 | InvBootstrapTrustConsumedByPeerShared | bootstrap trust is consumed when equivalent PeerShared-derived trust appears |
 | InvPendingBootstrapTrustSource | pending bootstrap trust (`pending_invite_bootstrap_trust`) is derived only from recorded invite events |
 | InvPendingBootstrapTrustMatchesCarried | pending bootstrap trust identity matches invite-carried pending peer identity fields |
-| InvTransportKeyTrustSource | (legacy) transport-key trust (`transport_keys`) is derived only from valid `transport_key` events; non-authoritative |
-| InvTransportKeyTrustMatchesCarried | (legacy) transport-key trust identity matches transport-key carried identity fields; non-authoritative |
+| InvPeerSharedTrustSource | PeerShared-derived trust (`peerSharedTrustPeer`) is set only when a PeerShared event is valid |
+| InvPeerSharedTrustMatchesCarried | PeerShared-derived trust identity matches event-derived peer identity |
+| InvPendingBootstrapTrustConsumedByPeerShared | pending bootstrap trust is consumed when equivalent PeerShared-derived trust appears |
 | InvTrustedPeerSetMembers | `TrustedPeerSet` members come only from PeerShared-derived SPKIs, bootstrap trust, or pending bootstrap trust |
 | InvUserInviteChain | test_bootstrap_sequence: UserBoot requires UserInviteBoot valid |
 | InvDeviceInviteChain | test_bootstrap_sequence: PeerSharedFirst requires DeviceInviteFirst valid |
@@ -269,24 +273,27 @@ The following parser-level canonicalization guarantees are enforced in Rust but 
 | InvFileSliceAuth | FileSlice and MessageAttachment for the same file must share the same signer |
 | InvRemovalExclusion | project_secret_shared: reject if recipient removed |
 
+### Bootstrap key materialization
+
+When a joiner accepts an invite, the acceptance path unwraps bootstrap content-key material (from the invite link) and materializes local `secret_key` events with deterministic event IDs. The deterministic ID derivation (BLAKE2b of key bytes → `created_at_ms`) ensures that both inviter and joiner produce matching `key_event_id` values without out-of-band coordination. This enables encrypted events referencing those keys to unblock via normal cascade after key materialization.
+
+The TLA model does not distinguish bootstrap vs runtime SecretShared structurally — both use the same event type with identical dependency semantics ({SecretKey, PeerSharedOngoing}). The bootstrap/runtime distinction is a key-source detail below the model's abstraction boundary.
+
 ## Transport Credential Lifecycle (TransportCredentialLifecycle.tla)
 
 Standalone module modeling runtime SPKI credential and trust-store state transitions.
+Single-credential-per-peer (no rotation/revocation). Trust sources: PeerShared-derived
+SPKIs (steady-state) ∪ invite_bootstrap_trust ∪ pending_invite_bootstrap_trust.
 Not an extension of EventGraphSchema — trust-source inputs are nondeterministic,
 abstracting over the event graph.
 
 | TLA+ Invariant | Rust Check |
 |----------------|------------|
-| InvActiveCredInHistory | load_or_generate_cert: generated cert SPKI tracked in local identity |
-| InvRevokedSubsetHistory | Revocation only applies to previously held credentials |
-| InvActiveCredNotRevoked | Active cert is never in revoked set |
 | InvSPKIUniqueness | BLAKE2b-256 collision resistance: no two peers share an SPKI |
-| InvActiveCredGloballyUnique | Each active cert fingerprint is distinct (extract_spki_fingerprint) |
 | InvBootstrapConsumedByPeerShared | supersede_accepted_bootstrap_if_steady_trust_exists: bootstrap ∩ PeerShared_SPKIs = {} |
 | InvPendingConsumedByPeerShared | supersede_pending_bootstrap_if_steady_trust_exists: pending ∩ PeerShared_SPKIs = {} |
 | InvTrustSetIsExactUnion | allowed_peers_from_db: UNION of PeerShared_SPKIs, invite_bootstrap_trust, pending_invite_bootstrap_trust |
 | InvTrustSourcesWellFormed | All trust table rows contain valid 32-byte SPKI fingerprints |
-| InvRevokedNotInBootstrapTrust | Revoked credentials not trusted via bootstrap paths |
 | InvMutualAuthSymmetry | Mutual CanAuthenticate requires both peers have active credentials |
 
 ### Multi-tenant trust scoping (collapse-single-tenant, 2026-02-17)
@@ -310,16 +317,6 @@ boundary. No TLA+ model changes required.
 
 ## TLA Verification Notes
 
-### Trust source supersession model drift (2026-02-17)
-
-The TLA+ models (`EventGraphSchema.tla`, `TransportCredentialLifecycle.tla`) still
-use `...ConsumedByTransportKey` invariant names and include `TransportKeyTrustSet`
-in the `TrustedPeerSet` definition. The Rust implementation and this mapping document
-use `...ConsumedByPeerShared` semantics (bootstrap trust is consumed when PeerShared-derived
-SPKI trust appears, not transport_key trust). The TLA+ models need updating once the
-transport identity architecture is finalized (TODO 11). Until then, the mapping rows
-in this document reflect the target/implemented semantics, not the current TLA+ model text.
-
 ### collapse-encrypted-inner refactor (2026-02-16)
 
 This refactor collapses duplicated dep/signer/dispatch logic from `encrypted.rs`
@@ -333,13 +330,16 @@ No TLA+ model changes were required because:
 3. The `encryptable` metadata field on `EventTypeMeta` centralizes the admissible
    inner type set previously hard-coded in `encrypted.rs`.
 
-TLC status (run on 2026-02-17):
+TLC status (run on 2026-02-17, post-transport-identity-unification):
 
 1. `cd docs/tla && ./tlc event_graph_schema_fast.cfg`:
    - passes (no invariant violations).
-   - model was aligned with runtime signer resolution by allowing peer-shared signer deps from both `peer_shared_first` and `peer_shared_ongoing`.
+   - model aligned with PeerShared-derived trust: `transportKeyCarriedPeer`/`transportKeyTrustPeer`
+     renamed to `peerSharedDerivedPeer`/`peerSharedTrustPeer`; invariants renamed accordingly.
 2. `cd docs/tla && ./tlc TransportCredentialLifecycle transport_credential_lifecycle_fast.cfg`:
    - passes (no invariant violations).
+   - model simplified: rotation/revocation removed (POC single-credential-per-peer),
+     `transportKeyTrust` renamed to `peerSharedTrust`.
 
 ### collapse-single-tenant per-tenant outbound trust (2026-02-17)
 

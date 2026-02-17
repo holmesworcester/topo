@@ -334,21 +334,21 @@ fn p7ctl_daemon_not_running_exit_code() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. Regression: legacy CLI still works (service layer not used by main.rs)
+// 3. Direct CLI commands (single-process mode, no daemon)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn legacy_cli_send_and_status() {
+fn cli_direct_send_and_status() {
     let (_dir, db) = temp_db();
 
-    // Send a message via legacy CLI.
+    // Send a message via direct CLI.
     let out = Command::new(bin_poc7())
-        .args(["send", "legacy msg", "--db", &db])
+        .args(["send", "direct msg", "--db", &db])
         .output()
         .unwrap();
-    assert!(out.status.success(), "legacy send failed: {:?}", String::from_utf8_lossy(&out.stdout));
+    assert!(out.status.success(), "direct send failed: {:?}", String::from_utf8_lossy(&out.stdout));
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("Sent: legacy msg"));
+    assert!(stdout.contains("Sent: direct msg"));
 
     // Check status.
     let out = Command::new(bin_poc7())
@@ -361,7 +361,7 @@ fn legacy_cli_send_and_status() {
 }
 
 #[test]
-fn legacy_cli_assert_now() {
+fn cli_direct_assert_now() {
     let (_dir, db) = temp_db();
 
     // Bootstrap with a send.

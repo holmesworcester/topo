@@ -324,7 +324,7 @@ fn test_identity_display() {
     assert_contains(&out, "Users: 1", "user key count");
     assert_contains(&out, "Peers: 1", "peer key count");
     assert_contains(&out, "Admins: 1", "admin key count");
-    assert_contains(&out, "TransportKeys: 1", "transport key count");
+    assert_contains(&out, "TransportKeys: 0", "transport key count (no longer created during bootstrap)");
 }
 
 #[test]

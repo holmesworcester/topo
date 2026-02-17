@@ -739,21 +739,19 @@ Rule:
 
 This preserves one blocker model and one projector model.
 
-## 7.6 Initial encrypted-event test strategy (PSK first)
+## 7.6 Encrypted-event test strategy
 
-Start encryption correctness with a deliberately crude harness before identity key wrapping:
+Encryption tests use deterministic local key materialization (shared key bytes + deterministic `created_at_ms` from BLAKE2b hash) to set up key state on both sender and recipient sides. This matches the production invite-key wrap/unwrap flow where both parties derive identical `secret_key` event IDs.
 
-1. Give each test daemon/instance a configured AES PSK (same PSK for happy-path suites; mismatched PSK for negative suites).
-2. Materialize this as a local key event during test setup, and reference that key via normal `key_event_id` dependency fields.
-   - the materialized key event must be recorded/projected in the correct tenant scope (`recorded_by` for that test peer/workspace).
-3. Run encrypted projection through the exact same block/unblock flow as other events:
-   - missing key event -> `Block`
-   - key present + decrypt/auth failure -> `Reject`
-   - key present + decrypt/auth success -> normal inner projector path
-4. Keep all replay/reorder invariants enabled while on PSK mode.
+Test harness contract:
+1. Materialize key as a local `secret_key` event in the correct tenant scope (`recorded_by`).
+2. Run encrypted projection through the standard block/unblock flow:
+   - missing key event → `Block`
+   - key present + decrypt/auth failure → `Reject`
+   - key present + decrypt/auth success → inner dep/signer/dispatch stages
+3. Keep all replay/reorder invariants enabled.
 
-This isolates queue/projection/dependency correctness from identity/envelope complexity.
-- keep the same key-wrap event type + projector logic that will be used in Phase 12 identity sender-keys; only key source differs.
+The same `secret_shared` event type and wrap/unwrap projector logic is used for both bootstrap (wrap to invite key) and runtime (wrap to peer key) key distribution. Only the recipient key source differs.
 
 ---
 
@@ -764,17 +762,6 @@ Add full queue machinery after projection + signer + encryption semantics are st
 ## 8.1 Queue tables
 
 ```sql
-CREATE TABLE ingress_queue (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    peer_id TEXT NOT NULL,
-    from_addr TEXT,
-    received_at INTEGER NOT NULL,
-    frame BLOB NOT NULL,
-    processed INTEGER NOT NULL DEFAULT 0
-);
-CREATE INDEX idx_ingress_unprocessed
-    ON ingress_queue(processed, received_at);
-
 CREATE TABLE project_queue (
     peer_id TEXT NOT NULL,
     event_id TEXT NOT NULL,
@@ -808,7 +795,7 @@ CREATE UNIQUE INDEX idx_egress_dedupe
 Keep canonical and queue data separate:
 - permanent: `events`, `recorded_events`, projection outputs
 - operational/transient: `project_queue`, `blocked_event_deps`, `blocked_events`, `egress_queue`
-- reserved/optional staging: `ingress_queue` (schema-present, currently not on runtime ingest hot path)
+- removed: `ingress_queue` was dropped in migration 28 because no runtime writer or reader used it
 
 ## 8.2 Why not one generic jobs table
 
@@ -824,8 +811,7 @@ Separate queue tables stay simpler operationally.
 1. `ingest receiver path` (current runtime): QUIC frame -> ingest channel -> transactional canonical insert -> record by tenant -> enqueue project.
 2. `project worker`: claim row -> project path (`valid`/`block`/`reject`) -> dequeue.
 3. `egress worker`: dequeue by `connection_id` -> send frame -> mark `sent_at`/retry.
-4. `cleanup worker`: purge stale ingress rows (if ingress staging is used) and sent egress rows, reclaim expired leases, TTL-purge old endpoint observations.
-5. `ingress_queue` is reserved for optional future staging/diagnostics; no active worker currently drains it.
+4. `cleanup worker`: purge sent egress rows, reclaim expired leases, TTL-purge old endpoint observations.
 
 Queue DRY requirement:
 - implement generic queue helper traits/functions once (`claim_batch`, `renew_lease`, `mark_done`, `mark_retry/backoff`).
@@ -1105,31 +1091,35 @@ Self-invite bootstrap sequence must stay explicit:
 
 Use `poc-6` as reference behavior for end-to-end test setup:
 1. Alice creates workspace + identity chain via high-level bootstrap API.
-2. Alice creates invite link (contains bootstrap address + inviter transport key identity metadata).
+2. Alice creates invite link (contains bootstrap address + inviter SPKI fingerprint + invite event ID + invite private key + workspace ID). Wrapped content-key material is delivered via `secret_shared` events during bootstrap sync, not embedded in the invite link payload.
 3. Bob accepts invite link via high-level accept API:
    - records local `invite_accepted`,
    - writes trust anchor binding (`workspace_id`),
-   - stores accepted-invite bootstrap transport trust tuple in SQL.
+   - stores accepted-invite bootstrap transport trust tuple in SQL,
+   - unwraps bootstrap content-key material using invite private key and inviter public key,
+   - materializes local `secret_key` events with deterministic event IDs (matching inviter's key IDs).
 4. Sync bootstrap trust is read from SQL at connection creation (no in-memory-only trust authority).
-5. Connection state follows `poc-6` ordering:
+5. Encrypted events received during bootstrap sync block until local key materialization (step 3) completes, then unblock via normal cascade.
+6. Connection state follows `poc-6` ordering:
    - invite-auth request (`connReq`) -> ack (`connAck`) ->
    - invite-labeled connection (`connInvite`) ->
    - peer-labeled upgraded connection (`connPeer`).
-6. Tests migrate to this flow:
+7. Tests migrate to this flow:
    - remove direct SPKI pin setup from test harnesses,
    - remove synthetic low-level bootstrap stubs where high-level APIs exist,
    - require invite-link acceptance path for multi-peer bootstrap.
-7. Keep low-level tests only for explicit adversarial/property coverage, not baseline bootstrap.
+8. Keep low-level tests only for explicit adversarial/property coverage, not baseline bootstrap.
 
 ## 11.5 Crude sender-keys model (phase-1 style, no key history yet)
 
 Use the sender-subjective O(n) baseline from `docs/group-encryption-design-aspects.md`
 ("Maximally simple.../Phase 4: baseline correctness and healing with O(n) key broadcast"):
 - sender creates a fresh local-only `secret` key event per message,
-- sender emits one `secret_shared`-style key-wrap event per perceived eligible recipient peer pubkey,
+- sender emits one `secret_shared` key-wrap event per perceived eligible recipient peer pubkey,
 - encrypted content event references the key event id through normal dependency fields,
 - each sender wraps to all perceived eligible members for each message (intentionally crude).
-- use the same key-wrap event type/projector path introduced in Phase 8 PSK mode.
+
+Bootstrap and runtime wrapping share the same `secret_shared` event type and wrap/unwrap projector path. Bootstrap wraps target the invite public key (X25519-derived from Ed25519 invite signing key); runtime wraps target PeerShared public keys. Recipients materialize local `secret_key` events with deterministic event IDs derived from key bytes (BLAKE2b hash → `created_at_ms`), ensuring inviter and joiner agree on `key_event_id` values.
 
 Key modeling requirements for this phase:
 - All protocol-level key material that projectors depend on must be represented as events and resolved by event-id dependencies (for example sender `secret` keys and recipient key-wrap events). Do not introduce out-of-band key stores for event-graph key dependencies.
@@ -1162,12 +1152,12 @@ Not in scope yet:
 Previous gap: TLA models were identity/event-causality models that did not encode mTLS credential lifecycle (SPKI generation/rotation/revocation, projected trust-set state transitions).
 
 **What is now modeled** (TransportCredentialLifecycle.tla):
-- Local credential lifecycle: generate, rotate, revoke with SPKI uniqueness and history tracking.
+- Local credential lifecycle: single credential per peer (no rotation/revocation in POC).
 - Three-source trust store: PeerShared-derived SPKIs, invite_bootstrap_trust, pending_invite_bootstrap_trust.
-- Supersession: AddTransportKeyTrust automatically removes matching bootstrap/pending entries.
+- Supersession: AddPeerSharedTrust automatically removes matching bootstrap/pending entries.
 - TTL expiry of bootstrap trust sources.
 - Trust removal (peer_removed cascading).
-- 11 invariants verified by TLC, mapped to Rust checks in `docs/tla/projector_spec.md`.
+- 6 invariants verified by TLC, mapped to Rust checks in `docs/tla/projector_spec.md`.
 
 **What remains abstract** (by design):
 - TLS handshake and session-key derivation.
@@ -1438,7 +1428,7 @@ Definition of done:
 ## 15.7 Phase 9 implementation checklist (durable queues/workers)
 
 Must implement:
-1. queue tables (`project`, `egress`) with transactional boundaries; keep `ingress_queue` optional/reserved unless actively wired.
+1. queue tables (`project`, `egress`) with transactional boundaries.
 2. shared queue helper functions for claim/lease/retry.
 3. egress creation from reconciliation and request-list producers.
 4. queue cleanup + TTL maintenance jobs.
@@ -1648,7 +1638,7 @@ The DB already IS the tenant registry. `trust_anchors(peer_id, workspace_id)` co
 
 ## 17.1 DB-Only TLS Credential Storage
 
-Cert/key DER blobs live exclusively in SQLite. No `.cert.der` / `.key.der` files on disk. The identity bootstrap projection pipeline (which creates TransportKey events) stores credentials in the DB as part of the same flow.
+Cert/key DER blobs live exclusively in SQLite. No `.cert.der` / `.key.der` files on disk. Transport credentials are derived from PeerShared signing keys during identity bootstrap (workspace creation or invite acceptance) and stored in the DB.
 
 ### 17.1.1 Migration 26: `local_transport_creds`
 
@@ -1661,7 +1651,7 @@ CREATE TABLE local_transport_creds (
 );
 ```
 
-Auto-populated during the identity bootstrap flow that creates TransportKey events. Added in `src/db/migrations.rs`.
+Populated during identity bootstrap: PeerShared-derived cert/key is installed by `install_peer_key_transport_identity`, or invite-derived cert/key by `install_invite_bootstrap_transport_identity`. Added in `src/db/migrations.rs`.
 
 ### 17.1.2 `src/db/transport_creds.rs`
 
@@ -1724,11 +1714,11 @@ pub fn ensure_transport_cert_from_db(db_path) -> Result<(String, CertificateDer,
 pub fn expected_invite_bootstrap_spki_from_invite_key(invite_key) -> [u8; 32]
 pub fn install_invite_bootstrap_transport_identity(db_path, invite_key) -> Result<String>
 
-// TransportKey event creation:
-pub fn ensure_transport_key_event(conn, recorded_by, signing_key) -> Result<Option<[u8; 32]>>
+// TransportKey event creation (removed — no longer created during bootstrap):
+// ensure_transport_key_event has been removed; PeerShared-derived SPKIs serve as trust source
 ```
 
-`ensure_transport_key_event` looks up the local cert for `recorded_by`, creates a TransportKey event binding the cert's SPKI fingerprint to the PeerShared identity. Returns `None` if TransportKey already exists.
+TransportKey event creation has been removed from the identity bootstrap flow. PeerShared-derived SPKIs now serve as the sole steady-state transport trust source.
 
 ### 17.1.5 Caller updates
 
@@ -1760,7 +1750,7 @@ Three high-level flows:
 ```rust
 pub fn bootstrap_workspace(conn, recorded_by) -> Result<IdentityChain>
 ```
-Creates: Workspace → UserInviteBoot → InviteAccepted (trust anchor) → UserBoot → DeviceInviteFirst → PeerSharedFirst → AdminBoot → TransportKey (8 events).
+Creates: Workspace → UserInviteBoot → InviteAccepted (trust anchor) → UserBoot → DeviceInviteFirst → PeerSharedFirst → AdminBoot (7 identity events + content key events).
 
 **Invite (admin):**
 ```rust
@@ -1772,7 +1762,7 @@ Creates UserInviteBoot event signed by workspace key. Returns `InviteData { invi
 ```rust
 pub fn accept_user_invite(conn, recorded_by, invite_key, invite_event_id, workspace_id) -> Result<JoinChain>
 ```
-Creates: InviteAccepted → UserBoot → DeviceInviteFirst → PeerSharedFirst → TransportKey. Joiner must pre-copy Workspace + UserInviteBoot events into their DB before calling this.
+Creates: InviteAccepted → UserBoot → DeviceInviteFirst → PeerSharedFirst. Joiner must pre-copy Workspace + UserInviteBoot events into their DB before calling this.
 
 **Device link:**
 ```rust
@@ -1797,7 +1787,6 @@ pub struct JoinChain {
     pub peer_shared_event_id: [u8; 32],
     pub peer_shared_key: SigningKey,
     pub invite_accepted_event_id: [u8; 32],
-    pub transport_key_event_id: Option<[u8; 32]>,
     // ... plus intermediate keys
 }
 ```
@@ -1997,7 +1986,7 @@ impl SharedDbNode {
 1. Generate distinct cert for new tenant, store in shared DB.
 2. Creator issues invite via `create_user_invite`.
 3. Copy prerequisite events (Workspace + UserInviteBoot) from creator to joiner.
-4. Joiner accepts via `accept_user_invite` → full identity chain + TransportKey.
+4. Joiner accepts via `accept_user_invite` → full identity chain (no TransportKey — PeerShared-derived).
 
 ### 17.6.2 `Peer` construction
 
@@ -2133,7 +2122,7 @@ Tests in `tests/mdns_smoke.rs`:
 4. `IngestItem` 3-tuple `(event_id, blob, recorded_by)` everywhere in sync engine.
 5. `accept_loop_with_ingest` accepting external shared ingest channel.
 6. `run_node` per-tenant QUIC endpoint spawning with shared batch writer.
-7. Per-tenant dynamic trust closure from `trust_anchors`/`transport_keys`.
+7. Per-tenant dynamic trust closure from `trust_anchors`/PeerShared-derived SPKIs.
 8. mDNS per-tenant advertise + browse with self-filtering.
 9. `SharedDbNode` test helper using production identity flows.
 10. Application-level test assertions (never `store_count`, always `message_count`/`has_event`/etc.).

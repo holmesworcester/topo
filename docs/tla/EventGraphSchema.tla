@@ -8,9 +8,14 @@ EXTENDS Naturals, FiniteSets
 \*   device_invite (was invite(mode=peer))
 \*
 \* Adds sender-subjective encryption modeling:
-\*   secret_key      — per-message symmetric key (local-only)
-\*   secret_shared   — key wrap to a specific recipient peer
+\*   secret_key      — per-message symmetric key (local-only, deterministic event ID from key bytes)
+\*   secret_shared   — key wrap to a specific recipient (PeerShared for runtime, invite key for bootstrap)
 \*   encrypted       — encrypted content referencing a secret_key
+\*
+\* Bootstrap and runtime key wrapping use the same SecretShared event type.
+\* Bootstrap recipients materialize local secret_key events with deterministic
+\* event IDs (BLAKE2b of key bytes → created_at_ms), ensuring both parties agree
+\* on key_event_id values without out-of-band coordination.
 \*
 \* Adds removal modeling:
 \*   user_removed    — removes a user (and transitively excludes peers)
@@ -43,7 +48,7 @@ CONSTANTS ActiveEvents, Peers, Workspaces
 VARIABLES recorded, valid, trustAnchor, removed,
           inviteCarriedWorkspace, inviteCarriedBootstrapPeer, bootstrapTrustPeer,
           inviteCarriedPendingPeer, pendingBootstrapTrustPeer,
-          transportKeyCarriedPeer, transportKeyTrustPeer,
+          peerSharedDerivedPeer, peerSharedTrustPeer,
           connState
 
 \* ---- Event type constants ----
@@ -209,7 +214,8 @@ RawDeps(e) ==
        [] e = FileSlice -> {}
        [] e = TransportKey -> {}
 
-       \* Encryption: secret_key is local; secret_shared depends on key + recipient peer;
+       \* Encryption: secret_key is local (deterministic event ID from key bytes);
+       \* secret_shared wraps key to recipient (PeerShared for runtime, invite key for bootstrap);
        \* encrypted depends on secret_key
        [] e = SecretKey -> {}
        [] e = SecretShared -> {SecretKey, PeerSharedOngoing}
@@ -293,7 +299,7 @@ HasRecordedInvite(p) ==
 
 \* Trusted peer set abstraction used by runtime transport checks.
 \* This models the union of:
-\* - projected transport_keys
+\* - PeerShared-derived SPKIs (primary steady-state trust)
 \* - accepted invite bootstrap trust
 \* - pending invite bootstrap trust
 BootstrapTrustSet(p) ==
@@ -302,11 +308,11 @@ BootstrapTrustSet(p) ==
 PendingBootstrapTrustSet(p) ==
     IF pendingBootstrapTrustPeer[p] = "none" THEN {} ELSE {pendingBootstrapTrustPeer[p]}
 
-TransportKeyTrustSet(p) ==
-    IF transportKeyTrustPeer[p] = "none" THEN {} ELSE {transportKeyTrustPeer[p]}
+PeerSharedTrustSet(p) ==
+    IF peerSharedTrustPeer[p] = "none" THEN {} ELSE {peerSharedTrustPeer[p]}
 
 TrustedPeerSet(p) ==
-    BootstrapTrustSet(p) \cup PendingBootstrapTrustSet(p) \cup TransportKeyTrustSet(p)
+    BootstrapTrustSet(p) \cup PendingBootstrapTrustSet(p) \cup PeerSharedTrustSet(p)
 
 \* ---- State machine ----
 
@@ -320,8 +326,8 @@ Init ==
     /\ bootstrapTrustPeer = [p \in Peers |-> "none"]
     /\ inviteCarriedPendingPeer = [p \in Peers |-> "none"]
     /\ pendingBootstrapTrustPeer = [p \in Peers |-> "none"]
-    /\ transportKeyCarriedPeer = [p \in Peers |-> "none"]
-    /\ transportKeyTrustPeer = [p \in Peers |-> "none"]
+    /\ peerSharedDerivedPeer = [p \in Peers |-> "none"]
+    /\ peerSharedTrustPeer = [p \in Peers |-> "none"]
     /\ connState = [p \in Peers |-> "none"]
 
 \* Record captures the event-carried workspace_id at ingress time.
@@ -346,11 +352,11 @@ Record(p, e) ==
             /\ pendingBootstrapTrustPeer' = [pendingBootstrapTrustPeer EXCEPT ![p] = pp]
        ELSE /\ UNCHANGED inviteCarriedPendingPeer
             /\ UNCHANGED pendingBootstrapTrustPeer
-    /\ IF e = TransportKey /\ transportKeyCarriedPeer[p] = "none"
-       THEN \E tp \in Peers:
-            transportKeyCarriedPeer' = [transportKeyCarriedPeer EXCEPT ![p] = tp]
-       ELSE UNCHANGED transportKeyCarriedPeer
-    /\ UNCHANGED <<valid, trustAnchor, removed, bootstrapTrustPeer, transportKeyTrustPeer, connState>>
+    /\ IF e \in {PeerSharedFirst, PeerSharedOngoing} /\ peerSharedDerivedPeer[p] = "none"
+       THEN \E dp \in Peers:
+            peerSharedDerivedPeer' = [peerSharedDerivedPeer EXCEPT ![p] = dp]
+       ELSE UNCHANGED peerSharedDerivedPeer
+    /\ UNCHANGED <<valid, trustAnchor, removed, bootstrapTrustPeer, peerSharedTrustPeer, connState>>
 
 \* invite_accepted binds the trust anchor from its event-carried workspace_id.
 \* First-write-wins: if trust anchor is already set to a different workspace,
@@ -368,13 +374,13 @@ Project(p, e) ==
        THEN trustAnchor[p] = inviteCarriedWorkspace[p]
        ELSE TRUE
     \* invite_accepted bootstrap trust is seeded from invite_accepted and
-    \* consumed when equivalent transport_key trust appears.
+    \* consumed when equivalent PeerShared-derived trust appears.
     /\ IF e = InviteAccepted /\ bootstrapTrustPeer[p] /= "none"
        THEN bootstrapTrustPeer[p] = inviteCarriedBootstrapPeer[p]
        ELSE TRUE
-    \* transport_key trust is first-write-wins and immutable.
-    /\ IF e = TransportKey /\ transportKeyTrustPeer[p] /= "none"
-       THEN transportKeyTrustPeer[p] = transportKeyCarriedPeer[p]
+    \* PeerShared-derived trust is first-write-wins and immutable.
+    /\ IF e \in {PeerSharedFirst, PeerSharedOngoing} /\ peerSharedTrustPeer[p] /= "none"
+       THEN peerSharedTrustPeer[p] = peerSharedDerivedPeer[p]
        ELSE TRUE
     /\ valid' = [valid EXCEPT ![p] = @ \cup {e}]
     \* Trust anchor binding: deterministic from event-carried workspace_id.
@@ -391,25 +397,25 @@ Project(p, e) ==
     /\ bootstrapTrustPeer' =
         IF e = InviteAccepted /\ bootstrapTrustPeer[p] = "none"
         THEN [bootstrapTrustPeer EXCEPT ![p] = inviteCarriedBootstrapPeer[p]]
-        ELSE IF e = TransportKey /\ bootstrapTrustPeer[p] = transportKeyCarriedPeer[p]
+        ELSE IF e \in {PeerSharedFirst, PeerSharedOngoing} /\ bootstrapTrustPeer[p] = peerSharedDerivedPeer[p]
         THEN [bootstrapTrustPeer EXCEPT ![p] = "none"]
         ELSE bootstrapTrustPeer
-    /\ transportKeyTrustPeer' =
-        IF e = TransportKey /\ transportKeyTrustPeer[p] = "none"
-        THEN [transportKeyTrustPeer EXCEPT ![p] = transportKeyCarriedPeer[p]]
-        ELSE transportKeyTrustPeer
+    /\ peerSharedTrustPeer' =
+        IF e \in {PeerSharedFirst, PeerSharedOngoing} /\ peerSharedTrustPeer[p] = "none"
+        THEN [peerSharedTrustPeer EXCEPT ![p] = peerSharedDerivedPeer[p]]
+        ELSE peerSharedTrustPeer
     /\ pendingBootstrapTrustPeer' =
-        IF e = TransportKey /\ pendingBootstrapTrustPeer[p] = transportKeyCarriedPeer[p]
+        IF e \in {PeerSharedFirst, PeerSharedOngoing} /\ pendingBootstrapTrustPeer[p] = peerSharedDerivedPeer[p]
         THEN [pendingBootstrapTrustPeer EXCEPT ![p] = "none"]
         ELSE pendingBootstrapTrustPeer
     /\ UNCHANGED <<recorded, inviteCarriedWorkspace, inviteCarriedBootstrapPeer,
-                  inviteCarriedPendingPeer, transportKeyCarriedPeer, connState>>
+                  inviteCarriedPendingPeer, peerSharedDerivedPeer, connState>>
 
 Stutter ==
     UNCHANGED <<recorded, valid, trustAnchor, removed,
                 inviteCarriedWorkspace, inviteCarriedBootstrapPeer, bootstrapTrustPeer,
                 inviteCarriedPendingPeer, pendingBootstrapTrustPeer,
-                transportKeyCarriedPeer, transportKeyTrustPeer,
+                peerSharedDerivedPeer, peerSharedTrustPeer,
                 connState>>
 
 \* ---- Connection state machine (bootstrap invite upgrade) ----
@@ -419,12 +425,12 @@ Stutter ==
 allVars == <<recorded, valid, trustAnchor, removed,
              inviteCarriedWorkspace, inviteCarriedBootstrapPeer, bootstrapTrustPeer,
              inviteCarriedPendingPeer, pendingBootstrapTrustPeer,
-             transportKeyCarriedPeer, transportKeyTrustPeer, connState>>
+             peerSharedDerivedPeer, peerSharedTrustPeer, connState>>
 
 nonConnVars == <<recorded, valid, trustAnchor, removed,
                  inviteCarriedWorkspace, inviteCarriedBootstrapPeer, bootstrapTrustPeer,
                  inviteCarriedPendingPeer, pendingBootstrapTrustPeer,
-                 transportKeyCarriedPeer, transportKeyTrustPeer>>
+                 peerSharedDerivedPeer, peerSharedTrustPeer>>
 
 \* Bootstrap connection request: authenticated by invite signature.
 ConnectReqByInvite(p) ==
@@ -479,8 +485,8 @@ TypeOK ==
     /\ bootstrapTrustPeer \in [Peers -> Peers \cup {"none"}]
     /\ inviteCarriedPendingPeer \in [Peers -> Peers \cup {"none"}]
     /\ pendingBootstrapTrustPeer \in [Peers -> Peers \cup {"none"}]
-    /\ transportKeyCarriedPeer \in [Peers -> Peers \cup {"none"}]
-    /\ transportKeyTrustPeer \in [Peers -> Peers \cup {"none"}]
+    /\ peerSharedDerivedPeer \in [Peers -> Peers \cup {"none"}]
+    /\ peerSharedTrustPeer \in [Peers -> Peers \cup {"none"}]
     /\ connState \in [Peers -> ConnStates]
 
 \* Every valid event has all its peer-resolved dependencies valid.
@@ -536,13 +542,23 @@ InvBootstrapTrustMatchesCarried ==
         (bootstrapTrustPeer[p] /= "none") =>
             (bootstrapTrustPeer[p] = inviteCarriedBootstrapPeer[p])
 
-\* Bootstrap trust is consumed once equivalent transport-key trust exists.
-InvBootstrapTrustConsumedByTransportKey ==
-    IF TransportKey \in EVENTS
+\* Bootstrap trust is consumed once equivalent PeerShared-derived trust exists.
+InvBootstrapTrustConsumedByPeerShared ==
+    IF (PeerSharedFirst \in EVENTS \/ PeerSharedOngoing \in EVENTS)
     THEN \A p \in Peers:
         ~(
-            transportKeyTrustPeer[p] /= "none"
-            /\ bootstrapTrustPeer[p] = transportKeyTrustPeer[p]
+            peerSharedTrustPeer[p] /= "none"
+            /\ bootstrapTrustPeer[p] = peerSharedTrustPeer[p]
+        )
+    ELSE TRUE
+
+\* Pending bootstrap trust is consumed once equivalent PeerShared-derived trust exists.
+InvPendingBootstrapTrustConsumedByPeerShared ==
+    IF (PeerSharedFirst \in EVENTS \/ PeerSharedOngoing \in EVENTS)
+    THEN \A p \in Peers:
+        ~(
+            peerSharedTrustPeer[p] /= "none"
+            /\ pendingBootstrapTrustPeer[p] = peerSharedTrustPeer[p]
         )
     ELSE TRUE
 
@@ -560,18 +576,19 @@ InvPendingBootstrapTrustMatchesCarried ==
         (pendingBootstrapTrustPeer[p] /= "none") =>
             (pendingBootstrapTrustPeer[p] = inviteCarriedPendingPeer[p])
 
-\* Transport-key trust comes only from valid transport_key events.
-InvTransportKeyTrustSource ==
-    IF TransportKey \in EVENTS
+\* PeerShared-derived trust comes only from valid PeerShared events.
+InvPeerSharedTrustSource ==
+    IF (PeerSharedFirst \in EVENTS \/ PeerSharedOngoing \in EVENTS)
     THEN \A p \in Peers:
-        (transportKeyTrustPeer[p] /= "none") => (TransportKey \in valid[p])
+        (peerSharedTrustPeer[p] /= "none") =>
+            (\E ps \in ({PeerSharedFirst, PeerSharedOngoing} \cap EVENTS): ps \in valid[p])
     ELSE TRUE
 
-\* Transport-key trust matches the event-carried peer identity.
-InvTransportKeyTrustMatchesCarried ==
+\* PeerShared-derived trust matches the event-derived peer identity.
+InvPeerSharedTrustMatchesCarried ==
     \A p \in Peers:
-        (transportKeyTrustPeer[p] /= "none") =>
-            (transportKeyTrustPeer[p] = transportKeyCarriedPeer[p])
+        (peerSharedTrustPeer[p] /= "none") =>
+            (peerSharedTrustPeer[p] = peerSharedDerivedPeer[p])
 
 \* Trusted peer set members are exactly from modeled trust sources.
 InvTrustedPeerSetMembers ==
@@ -579,7 +596,7 @@ InvTrustedPeerSetMembers ==
         \A q \in TrustedPeerSet(p):
             q = bootstrapTrustPeer[p]
             \/ q = pendingBootstrapTrustPeer[p]
-            \/ q = transportKeyTrustPeer[p]
+            \/ q = peerSharedTrustPeer[p]
 
 \* All non-local singleton events that are valid require some workspace to be valid.
 InvAllValidRequireWorkspace ==

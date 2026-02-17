@@ -17,7 +17,8 @@ use crate::db::{
 };
 use crate::events::{
     DeviceInviteFirstEvent, InviteAcceptedEvent, MessageDeletionEvent, MessageEvent, ParsedEvent,
-    PeerSharedFirstEvent, ReactionEvent, UserBootEvent, UserInviteBootEvent, WorkspaceEvent,
+    PeerSharedFirstEvent, ReactionEvent, UserBootEvent, UserInviteBootEvent, UserRemovedEvent,
+    WorkspaceEvent,
 };
 use crate::projection::create::{create_event_sync, create_event_staged, create_signed_event_sync};
 use crate::projection::pipeline::project_one;
@@ -1009,6 +1010,162 @@ pub fn svc_reactions_conn(db: &rusqlite::Connection, recorded_by: &str) -> Servi
 pub fn svc_reactions(db_path: &str) -> ServiceResult<Vec<ReactionItem>> {
     let (recorded_by, db) = open_db_load(db_path)?;
     svc_reactions_conn(&db, &recorded_by)
+}
+
+/// Return reactions for a specific message target.
+pub fn svc_reactions_for_message_conn(
+    db: &rusqlite::Connection,
+    recorded_by: &str,
+    target_event_id_b64: &str,
+) -> ServiceResult<Vec<String>> {
+    let mut stmt = db.prepare(
+        "SELECT emoji FROM reactions WHERE recorded_by = ?1 AND target_event_id = ?2",
+    )?;
+    let emojis: Vec<String> = stmt
+        .query_map(rusqlite::params![recorded_by, target_event_id_b64], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(emojis)
+}
+
+/// Return base64 event IDs of deleted messages for a tenant.
+pub fn svc_deleted_message_ids_conn(
+    db: &rusqlite::Connection,
+    recorded_by: &str,
+) -> ServiceResult<Vec<String>> {
+    let mut stmt = db.prepare(
+        "SELECT message_id FROM deleted_messages WHERE recorded_by = ?1",
+    )?;
+    let ids: Vec<String> = stmt
+        .query_map(rusqlite::params![recorded_by], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ids)
+}
+
+/// Resolve a 1-based message number to its event ID.
+pub fn svc_message_event_id_by_num_conn(
+    db: &rusqlite::Connection,
+    recorded_by: &str,
+    msg_num: usize,
+) -> ServiceResult<crate::crypto::EventId> {
+    let mut stmt = db.prepare(
+        "SELECT message_id FROM messages WHERE recorded_by = ?1 ORDER BY created_at ASC, rowid ASC",
+    )?;
+    let ids: Vec<String> = stmt
+        .query_map(rusqlite::params![recorded_by], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if msg_num == 0 || msg_num > ids.len() {
+        return Err(ServiceError(format!(
+            "Invalid message number {}. Available: 1-{}",
+            msg_num, ids.len()
+        )));
+    }
+
+    crate::crypto::event_id_from_base64(&ids[msg_num - 1])
+        .ok_or_else(|| ServiceError(format!("Invalid event ID for message {}", msg_num)))
+}
+
+/// Remove a user by creating a UserRemoved event.
+pub fn svc_remove_user_conn(
+    db: &rusqlite::Connection,
+    recorded_by: &str,
+    signer_eid: &crate::crypto::EventId,
+    signing_key: &SigningKey,
+    target_event_id: crate::crypto::EventId,
+) -> ServiceResult<DeleteResponse> {
+    let ur = ParsedEvent::UserRemoved(UserRemovedEvent {
+        created_at_ms: current_timestamp_ms(),
+        target_event_id,
+        signed_by: *signer_eid,
+        signer_type: 5,
+        signature: [0u8; 64],
+    });
+    create_signed_event_sync(db, recorded_by, &ur, signing_key)
+        .map_err(|e| ServiceError(format!("{}", e)))?;
+
+    Ok(DeleteResponse {
+        target: hex::encode(target_event_id),
+    })
+}
+
+/// Create a user invite (conn-based variant for interactive use with in-memory keys).
+pub fn svc_create_invite_conn(
+    db: &rusqlite::Connection,
+    recorded_by: &str,
+    workspace_key: &SigningKey,
+    workspace_id: &crate::crypto::EventId,
+    peer_shared_key: &SigningKey,
+    peer_shared_event_id: &crate::crypto::EventId,
+    bootstrap_addr: &str,
+    bootstrap_spki: &[u8; 32],
+) -> ServiceResult<CreateInviteResponse> {
+    let _ = crate::identity_ops::ensure_content_key_for_peer(
+        db, recorded_by, peer_shared_key, peer_shared_event_id,
+    ).map_err(|e| ServiceError(format!("Failed to ensure content key: {}", e)))?;
+
+    let invite = crate::identity_ops::create_user_invite(
+        db, recorded_by, workspace_key, workspace_id,
+        Some(peer_shared_key), Some(peer_shared_event_id),
+    ).map_err(|e| ServiceError(format!("Failed to create invite: {}", e)))?;
+
+    let pending_spki = crate::transport_identity::expected_invite_bootstrap_spki_from_invite_key(
+        &invite.invite_key,
+    ).map_err(|e| ServiceError(format!("Failed to derive invite SPKI: {}", e)))?;
+
+    crate::db::transport_trust::record_pending_invite_bootstrap_trust(
+        db, recorded_by,
+        &event_id_to_base64(&invite.invite_event_id),
+        &event_id_to_base64(workspace_id),
+        &pending_spki,
+    )?;
+
+    let invite_link = crate::invite_link::create_invite_link(&invite, bootstrap_addr, bootstrap_spki)
+        .map_err(|e| ServiceError(format!("Failed to create invite link: {}", e)))?;
+
+    Ok(CreateInviteResponse {
+        invite_link,
+        invite_event_id: event_id_to_base64(&invite.invite_event_id),
+    })
+}
+
+/// Create a device link invite (conn-based variant for interactive use with in-memory keys).
+pub fn svc_create_device_link_invite_conn(
+    db: &rusqlite::Connection,
+    recorded_by: &str,
+    user_key: &SigningKey,
+    user_event_id: &crate::crypto::EventId,
+    workspace_id: &crate::crypto::EventId,
+    bootstrap_addr: &str,
+    bootstrap_spki: &[u8; 32],
+) -> ServiceResult<CreateInviteResponse> {
+    let invite = crate::identity_ops::create_device_link_invite(
+        db, recorded_by, user_key, user_event_id, workspace_id,
+    ).map_err(|e| ServiceError(format!("Failed to create device link invite: {}", e)))?;
+
+    let pending_spki = crate::transport_identity::expected_invite_bootstrap_spki_from_invite_key(
+        &invite.invite_key,
+    ).map_err(|e| ServiceError(format!("Failed to derive invite SPKI: {}", e)))?;
+
+    crate::db::transport_trust::record_pending_invite_bootstrap_trust(
+        db, recorded_by,
+        &event_id_to_base64(&invite.invite_event_id),
+        &event_id_to_base64(workspace_id),
+        &pending_spki,
+    )?;
+
+    let invite_link = crate::invite_link::create_invite_link(&invite, bootstrap_addr, bootstrap_spki)
+        .map_err(|e| ServiceError(format!("Failed to create invite link: {}", e)))?;
+
+    Ok(CreateInviteResponse {
+        invite_link,
+        invite_event_id: event_id_to_base64(&invite.invite_event_id),
+    })
 }
 
 pub fn svc_users_conn(db: &rusqlite::Connection, recorded_by: &str) -> ServiceResult<Vec<UserItem>> {
