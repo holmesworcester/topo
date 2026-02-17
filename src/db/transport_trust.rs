@@ -435,6 +435,29 @@ pub fn has_any_trusted_peer(
     Ok(has_any != 0)
 }
 
+/// List active invite bootstrap addresses for a tenant.
+///
+/// This is intentionally transport-only metadata used by startup autodial.
+/// It does not authorize trust decisions on its own.
+pub fn list_active_invite_bootstrap_addrs(
+    conn: &Connection,
+    recorded_by: &str,
+) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+    supersede_accepted_bootstrap_if_steady_trust_exists(conn, recorded_by)?;
+    let now = now_ms_i64();
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT bootstrap_addr
+           FROM invite_bootstrap_trust
+          WHERE recorded_by = ?1
+            AND superseded_at IS NULL
+            AND expires_at > ?2",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![recorded_by, now], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

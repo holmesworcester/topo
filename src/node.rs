@@ -65,7 +65,7 @@ impl PeerDispatcher {
 
 use crate::db::{open_connection, schema::create_tables};
 use crate::db::transport_creds::discover_local_tenants;
-use crate::db::transport_trust::is_peer_allowed;
+use crate::db::transport_trust::{is_peer_allowed, list_active_invite_bootstrap_addrs};
 use crate::sync::engine::{IngestItem, accept_loop_with_ingest, batch_writer};
 use crate::transport::{
     create_single_port_endpoint, extract_spki_fingerprint,
@@ -73,6 +73,69 @@ use crate::transport::{
     workspace_client_config, DynamicAllowFn,
 };
 use rustls::sign::CertifiedKey;
+
+fn spawn_connect_loop_thread(
+    db_path: String,
+    tenant_id: String,
+    endpoint: quinn::Endpoint,
+    remote: SocketAddr,
+    cfg: quinn::ClientConfig,
+    source: &'static str,
+) {
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            if let Err(e) =
+                crate::sync::engine::connect_loop(&db_path, &tenant_id, endpoint, remote, Some(cfg)).await
+            {
+                warn!(
+                    "{} connect_loop for {} to {} exited: {}",
+                    source,
+                    &tenant_id[..16.min(tenant_id.len())],
+                    remote,
+                    e
+                );
+            }
+        });
+    });
+}
+
+/// Placeholder autodial source from accepted invite metadata.
+///
+/// This is intentionally minimal and temporary for realism test scaffolding.
+/// It should be replaced by a unified persistent peer address manager.
+fn load_placeholder_invite_autodial_targets(
+    db_path: &str,
+    tenant_ids: &[String],
+) -> Result<Vec<(String, SocketAddr)>, Box<dyn std::error::Error + Send + Sync>> {
+    let db = open_connection(db_path)?;
+    let mut seen: HashSet<(String, SocketAddr)> = HashSet::new();
+    let mut out = Vec::new();
+    for tenant_id in tenant_ids {
+        for addr_text in list_active_invite_bootstrap_addrs(&db, tenant_id)? {
+            match addr_text.parse::<SocketAddr>() {
+                Ok(addr) => {
+                    let key = (tenant_id.clone(), addr);
+                    if seen.insert(key.clone()) {
+                        out.push(key);
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Skipping invalid invite bootstrap_addr '{}' for tenant {}: {}",
+                        addr_text,
+                        &tenant_id[..16.min(tenant_id.len())],
+                        e
+                    );
+                }
+            }
+        }
+    }
+    Ok(out)
+}
 
 /// Run the sync node.
 ///
@@ -366,22 +429,55 @@ pub async fn run_node(
                     continue;
                 }
             };
-            let ep = connect_endpoint.clone();
-            let db = db_path.to_string();
-            let tid = tenant.peer_id.clone();
-            std::thread::spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap();
-                rt.block_on(async move {
-                    if let Err(e) = crate::sync::engine::connect_loop(&db, &tid, ep, remote, Some(cfg)).await
-                    {
-                        warn!("connect_loop for {} exited: {}", &tid[..16], e);
-                    }
-                });
-            });
+            spawn_connect_loop_thread(
+                db_path.to_string(),
+                tenant.peer_id.clone(),
+                connect_endpoint.clone(),
+                remote,
+                cfg,
+                "explicit --connect",
+            );
         }
+    }
+
+    // Placeholder invite-based autodial source for realism tests.
+    // This is intentionally narrow and should be replaced by a unified
+    // persistent address manager that merges invite, discovery, and intro data.
+    let tenant_ids_for_autodial: Vec<String> = tenants.iter().map(|t| t.peer_id.clone()).collect();
+    let autodial_targets = load_placeholder_invite_autodial_targets(db_path, &tenant_ids_for_autodial)?;
+    if !autodial_targets.is_empty() {
+        warn!(
+            "PLACEHOLDER AUTODIAL ENABLED: launching {} invite-seeded outbound dial(s)",
+            autodial_targets.len()
+        );
+    }
+    for (tenant_id, remote) in autodial_targets {
+        if connect == Some(remote) {
+            continue;
+        }
+        let cfg = match tenant_client_configs.get(&tenant_id).cloned() {
+            Some(c) => c,
+            None => {
+                warn!(
+                    "Skipping placeholder autodial for {}: no client config",
+                    &tenant_id[..16.min(tenant_id.len())]
+                );
+                continue;
+            }
+        };
+        info!(
+            "PLACEHOLDER AUTODIAL: tenant {} dialing invite bootstrap {}",
+            &tenant_id[..16.min(tenant_id.len())],
+            remote
+        );
+        spawn_connect_loop_thread(
+            db_path.to_string(),
+            tenant_id,
+            connect_endpoint.clone(),
+            remote,
+            cfg,
+            "placeholder-autodial",
+        );
     }
 
     // Drop our copy so writer exits when all accept loops drop theirs

@@ -55,6 +55,14 @@ pub enum RpcMethod {
     IntroAttempts {
         peer: Option<String>,
     },
+    CreateInvite {
+        bootstrap: String,
+    },
+    AcceptInvite {
+        invite: String,
+        username: String,
+        devicename: String,
+    },
 }
 
 // ---------------------------------------------------------------------------

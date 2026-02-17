@@ -120,6 +120,28 @@ enum Commands {
         #[arg(long)]
         peer: Option<String>,
     },
+
+    /// Create a user invite link for the active workspace
+    #[command(name = "create-invite")]
+    CreateInvite {
+        /// Bootstrap address (host:port) to embed in invite link
+        #[arg(long)]
+        bootstrap: String,
+    },
+
+    /// Accept a user invite link (bootstrap sync + identity chain creation)
+    #[command(name = "accept-invite")]
+    AcceptInvite {
+        /// Invite link (quiet://invite/...)
+        #[arg(long)]
+        invite: String,
+        /// Username for the new identity
+        #[arg(long, default_value = "user")]
+        username: String,
+        /// Device name for the new identity
+        #[arg(long, default_value = "device")]
+        devicename: String,
+    },
 }
 
 fn main() {
@@ -154,6 +176,16 @@ fn main() {
         Commands::Keys { summary } => RpcMethod::Keys { summary },
         Commands::Networks => RpcMethod::Workspaces,
         Commands::IntroAttempts { peer } => RpcMethod::IntroAttempts { peer },
+        Commands::CreateInvite { bootstrap } => RpcMethod::CreateInvite { bootstrap },
+        Commands::AcceptInvite {
+            invite,
+            username,
+            devicename,
+        } => RpcMethod::AcceptInvite {
+            invite,
+            username,
+            devicename,
+        },
     };
 
     match rpc_call(&socket_path, method) {
