@@ -17,6 +17,18 @@ fn socket_path_for_db(db: &str) -> PathBuf {
     topo::service::socket_path_for_db(db)
 }
 
+fn create_workspace(db: &str) {
+    let out = Command::new(bin())
+        .args(["create-workspace", "--db", db])
+        .output()
+        .expect("create-workspace");
+    assert!(
+        out.status.success(),
+        "create-workspace failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 1. RPC protocol unit tests
 // ---------------------------------------------------------------------------
@@ -45,15 +57,13 @@ fn rpc_request_send_roundtrip() {
     let req = RpcRequest {
         version: PROTOCOL_VERSION,
         method: RpcMethod::Send {
-            workspace: "abc123".into(),
             content: "hello world".into(),
         },
     };
     let frame = encode_frame(&req).unwrap();
     let decoded: RpcRequest = decode_frame(&mut &frame[..]).unwrap();
     match decoded.method {
-        RpcMethod::Send { workspace, content } => {
-            assert_eq!(workspace, "abc123");
+        RpcMethod::Send { content } => {
             assert_eq!(content, "hello world");
         }
         other => panic!("expected Send, got {:?}", other),
@@ -102,12 +112,10 @@ fn rpc_all_methods_serialize() {
         RpcMethod::Status,
         RpcMethod::Messages { limit: 50 },
         RpcMethod::Send {
-            workspace: "ws".into(),
             content: "msg".into(),
         },
         RpcMethod::Generate {
             count: 10,
-            workspace: "ws".into(),
         },
         RpcMethod::AssertNow {
             predicate: "message_count == 0".into(),
@@ -133,6 +141,18 @@ fn rpc_all_methods_serialize() {
             peer: Some("peer1".into()),
         },
         RpcMethod::Shutdown,
+        RpcMethod::Peers,
+        RpcMethod::UsePeer { index: 1 },
+        RpcMethod::ActivePeer,
+        RpcMethod::CreateWorkspace,
+        RpcMethod::CreateInvite {
+            bootstrap: "127.0.0.1:4433".into(),
+        },
+        RpcMethod::AcceptInvite {
+            invite: "quiet://invite/test".into(),
+            username: "user".into(),
+            devicename: "device".into(),
+        },
     ];
 
     for method in methods {
@@ -155,12 +175,8 @@ fn daemon_and_cli_status() {
     let (_dir, db) = temp_db();
     let socket = socket_path_for_db(&db);
 
-    // Bootstrap identity chain (workspace + PeerShared) so daemon can start sync.
-    let out = Command::new(bin())
-        .args(["send", "bootstrap", "--db", &db])
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "bootstrap failed: {:?}", out);
+    // Create workspace (identity chain) so daemon can start.
+    create_workspace(&db);
 
     // Start daemon in background.
     let mut daemon = Command::new(bin())
@@ -196,12 +212,8 @@ fn daemon_and_cli_send_and_messages() {
     let (_dir, db) = temp_db();
     let socket = socket_path_for_db(&db);
 
-    // Bootstrap identity chain so daemon can start sync.
-    let out = Command::new(bin())
-        .args(["send", "bootstrap", "--db", &db])
-        .output()
-        .unwrap();
-    assert!(out.status.success());
+    // Create workspace so daemon can start.
+    create_workspace(&db);
 
     // Start daemon.
     let mut daemon = Command::new(bin())
@@ -222,8 +234,9 @@ fn daemon_and_cli_send_and_messages() {
 
     assert!(
         out.status.success(),
-        "send failed: {:?}",
-        String::from_utf8_lossy(&out.stdout)
+        "send failed: stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("Sent: hello from topo"));
@@ -252,11 +265,8 @@ fn daemon_and_cli_assert_now() {
     let (_dir, db) = temp_db();
     let socket = socket_path_for_db(&db);
 
-    // Bootstrap identity chain so daemon can start sync.
-    Command::new(bin())
-        .args(["send", "bootstrap", "--db", &db])
-        .output()
-        .unwrap();
+    // Create workspace so daemon can start.
+    create_workspace(&db);
 
     // Start daemon.
     let mut daemon = Command::new(bin())
@@ -269,9 +279,9 @@ fn daemon_and_cli_assert_now() {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 
-    // Assert message_count == 1 (bootstrap message; should pass).
+    // Assert message_count == 0 (no messages sent yet; should pass).
     let out = Command::new(bin())
-        .args(["--db", &db, "assert-now", "message_count == 1"])
+        .args(["--db", &db, "assert-now", "message_count == 0"])
         .output()
         .unwrap();
 
@@ -294,91 +304,8 @@ fn daemon_and_cli_assert_now() {
     assert!(stdout.contains("FAIL"));
 }
 
-#[test]
-fn direct_fallback_when_daemon_not_running() {
-    let (_dir, db) = temp_db();
-
-    // Send without daemon — should fall back to direct DB access.
-    let out = Command::new(bin())
-        .args(["send", "direct msg", "--db", &db])
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "direct send failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("Sent: direct msg"));
-
-    // Status without daemon — should fall back to direct DB access.
-    let out = Command::new(bin())
-        .args(["status", "--db", &db])
-        .output()
-        .unwrap();
-    assert!(out.status.success());
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("Messages:"));
-}
-
 // ---------------------------------------------------------------------------
-// 3. Direct CLI commands (single-process mode, no daemon)
-// ---------------------------------------------------------------------------
-
-#[test]
-fn cli_direct_send_and_status() {
-    let (_dir, db) = temp_db();
-
-    // Send a message via direct CLI.
-    let out = Command::new(bin())
-        .args(["send", "direct msg", "--db", &db])
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "direct send failed: {:?}",
-        String::from_utf8_lossy(&out.stdout)
-    );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("Sent: direct msg"));
-
-    // Check status.
-    let out = Command::new(bin())
-        .args(["status", "--db", &db])
-        .output()
-        .unwrap();
-    assert!(out.status.success());
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("Messages:"));
-}
-
-#[test]
-fn cli_direct_assert_now() {
-    let (_dir, db) = temp_db();
-
-    // Bootstrap with a send.
-    Command::new(bin())
-        .args(["send", "test", "--db", &db])
-        .output()
-        .unwrap();
-
-    // assert-now message_count == 1.
-    let out = Command::new(bin())
-        .args(["assert-now", "message_count == 1", "--db", &db])
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "assert-now should pass");
-
-    // assert-now message_count == 0 (should fail).
-    let out = Command::new(bin())
-        .args(["assert-now", "message_count == 0", "--db", &db])
-        .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(1));
-}
-
-// ---------------------------------------------------------------------------
-// 4. Service function unit tests
+// 3. Service function unit tests
 // ---------------------------------------------------------------------------
 
 #[test]

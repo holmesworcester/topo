@@ -278,20 +278,21 @@ DB_D="$TMPDIR/d.db"; SOCK_D="$TMPDIR/d.sock"
 DB_E="$TMPDIR/e.db"; SOCK_E="$TMPDIR/e.sock"
 DB_F="$TMPDIR/f.db"; SOCK_F="$TMPDIR/f.sock"
 
-log "Bootstrapping workspace on A and creating invite links..."
-"$BIN" send "bootstrap-from-a" --db "$DB_A" >/dev/null || fail "A bootstrap send failed"
-
-INV_B="$("$BIN" create-invite --db "$DB_A" --bootstrap "10.11.1.10:4433" | tr -d '\n')"
-INV_C="$("$BIN" create-invite --db "$DB_A" --bootstrap "10.11.1.10:4433" | tr -d '\n')"
-INV_D="$("$BIN" create-invite --db "$DB_A" --bootstrap "10.11.1.10:4433" | tr -d '\n')"
-INV_E="$("$BIN" create-invite --db "$DB_A" --bootstrap "10.11.1.10:4433" | tr -d '\n')"
-INV_F="$("$BIN" create-invite --db "$DB_A" --bootstrap "10.11.1.10:4433" | tr -d '\n')"
-
-[[ "$INV_B" == quiet://invite/* ]] || fail "invalid invite link format for B"
-[[ "$INV_F" == quiet://invite/* ]] || fail "invalid invite link format for F"
+log "Bootstrapping workspace on A..."
+"$BIN" create-workspace --db "$DB_A" >/dev/null || fail "A create-workspace failed"
 
 log "Starting inviter daemon A..."
 PID_A="$(start_daemon "$NS_A" "$DB_A" "$SOCK_A" "$TMPDIR/a.log")"
+
+log "Creating invite links via daemon RPC..."
+INV_B="$(run_p7ctl "$DB_A" "$SOCK_A" create-invite --bootstrap "10.11.1.10:4433" | tr -d '\n')"
+INV_C="$(run_p7ctl "$DB_A" "$SOCK_A" create-invite --bootstrap "10.11.1.10:4433" | tr -d '\n')"
+INV_D="$(run_p7ctl "$DB_A" "$SOCK_A" create-invite --bootstrap "10.11.1.10:4433" | tr -d '\n')"
+INV_E="$(run_p7ctl "$DB_A" "$SOCK_A" create-invite --bootstrap "10.11.1.10:4433" | tr -d '\n')"
+INV_F="$(run_p7ctl "$DB_A" "$SOCK_A" create-invite --bootstrap "10.11.1.10:4433" | tr -d '\n')"
+
+[[ "$INV_B" == quiet://invite/* ]] || fail "invalid invite link format for B"
+[[ "$INV_F" == quiet://invite/* ]] || fail "invalid invite link format for F"
 
 log "Accepting invites from segmented peers (internet bootstrap mode)..."
 ip netns exec "$NS_B" "$BIN" accept-invite --db "$DB_B" --invite "$INV_B" --username "b" --devicename "dev-b" >/dev/null

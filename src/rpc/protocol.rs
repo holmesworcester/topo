@@ -23,12 +23,10 @@ pub enum RpcMethod {
         limit: usize,
     },
     Send {
-        workspace: String,
         content: String,
     },
     Generate {
         count: usize,
-        workspace: String,
     },
     AssertNow {
         predicate: String,
@@ -64,6 +62,14 @@ pub enum RpcMethod {
         devicename: String,
     },
     Shutdown,
+    /// List peers (tenants) in this DB with active marker.
+    Peers,
+    /// Switch active peer by 1-based index from peers list.
+    UsePeer { index: usize },
+    /// Return the currently active peer.
+    ActivePeer,
+    /// Create a new workspace + identity chain.
+    CreateWorkspace,
 }
 
 // ---------------------------------------------------------------------------
