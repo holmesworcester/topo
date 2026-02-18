@@ -114,9 +114,7 @@ fn rpc_all_methods_serialize() {
         RpcMethod::Send {
             content: "msg".into(),
         },
-        RpcMethod::Generate {
-            count: 10,
-        },
+        RpcMethod::Generate { count: 10 },
         RpcMethod::AssertNow {
             predicate: "message_count == 0".into(),
         },
@@ -153,6 +151,7 @@ fn rpc_all_methods_serialize() {
             username: "user".into(),
             devicename: "device".into(),
         },
+        RpcMethod::Upnp,
     ];
 
     for method in methods {
@@ -485,6 +484,93 @@ fn custom_socket_routing() {
     );
 
     let _ = daemon.wait();
+}
+
+#[test]
+fn daemon_status_includes_runtime_net_info() {
+    let (_dir, db) = temp_db();
+    let socket = socket_path_for_db(&db);
+
+    create_workspace(&db);
+
+    let mut daemon = Command::new(bin())
+        .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
+        .spawn()
+        .unwrap();
+
+    let start = std::time::Instant::now();
+    while !socket.exists() && start.elapsed().as_secs() < 5 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(socket.exists(), "daemon socket did not appear");
+
+    // Give daemon a moment to populate runtime net info.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    // Query status via RPC.
+    let resp =
+        topo::rpc::client::rpc_call(&socket, topo::rpc::protocol::RpcMethod::Status).unwrap();
+    assert!(resp.ok, "status RPC should succeed");
+    let data = resp.data.unwrap();
+
+    // runtime.listen_addr should be present and contain a port.
+    let runtime = &data["runtime"];
+    assert!(
+        runtime["listen_addr"].is_string(),
+        "runtime.listen_addr should be a string, got: {:?}",
+        runtime
+    );
+    let listen_addr = runtime["listen_addr"].as_str().unwrap();
+    assert!(
+        listen_addr.contains(':'),
+        "listen_addr should be host:port, got: {}",
+        listen_addr
+    );
+
+    // upnp should be absent (not attempted yet — requires explicit `topo upnp`).
+    assert!(
+        runtime.get("upnp").is_none() || runtime["upnp"].is_null(),
+        "upnp should not be present before running topo upnp"
+    );
+
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+}
+
+#[test]
+fn daemon_cli_status_shows_listen_line() {
+    let (_dir, db) = temp_db();
+    let socket = socket_path_for_db(&db);
+
+    create_workspace(&db);
+
+    let mut daemon = Command::new(bin())
+        .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
+        .spawn()
+        .unwrap();
+
+    let start = std::time::Instant::now();
+    while !socket.exists() && start.elapsed().as_secs() < 5 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    let out = Command::new(bin())
+        .args(["--db", &db, "status"])
+        .output()
+        .unwrap();
+
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Listen:"),
+        "status output should contain Listen line, got: {}",
+        stdout
+    );
 }
 
 #[test]

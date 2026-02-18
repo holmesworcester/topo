@@ -17,3 +17,4 @@ pub mod sync;
 pub mod testutil;
 pub mod transport;
 pub mod transport_identity;
+pub mod upnp;

@@ -18,8 +18,21 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
+
+use crate::upnp::UpnpMappingReport;
+
+/// Runtime networking information collected during node startup.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeRuntimeNetInfo {
+    /// Actual bound listen address (after OS port assignment).
+    pub listen_addr: String,
+    /// UPnP port mapping attempt result (None until `topo upnp` is run).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upnp: Option<UpnpMappingReport>,
+}
 
 /// Dispatch decision for a discovered peer.
 #[derive(Debug, PartialEq)]
@@ -248,9 +261,13 @@ fn spawn_placeholder_autodial_refresher(
 /// builds a single QUIC endpoint with multi-workspace cert resolver, and runs
 /// a single accept loop sharing a batch_writer thread. With `discovery` feature,
 /// also advertises via mDNS and auto-connects to discovered peers.
+///
+/// If `net_info_tx` is provided, runtime networking info (listen addr + UPnP
+/// result) is sent as soon as the endpoint is bound and UPnP is attempted.
 pub async fn run_node(
     db_path: &str,
     bind: SocketAddr,
+    net_info_tx: Option<tokio::sync::oneshot::Sender<NodeRuntimeNetInfo>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let db = open_connection(db_path)?;
     create_tables(&db)?;
@@ -371,6 +388,15 @@ pub async fn run_node(
         local_addr,
         tenants.len()
     );
+
+    // Send runtime networking info back to caller (e.g. DaemonState in main.rs).
+    if let Some(tx) = net_info_tx {
+        let info = NodeRuntimeNetInfo {
+            listen_addr: local_addr.to_string(),
+            upnp: None,
+        };
+        let _ = tx.send(info);
+    }
 
     // Per-tenant outbound client configs: each presents the tenant's own cert
     // and verifies remote peers against that tenant's trust set only.
