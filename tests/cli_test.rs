@@ -32,14 +32,14 @@ fn create_workspace(db: &str) {
     );
 }
 
-fn start_daemon_with_options(db: &str, bind_port: u16, disable_placeholder_autodial: bool) -> Child {
+fn start_daemon_with_options(db: &str, disable_placeholder_autodial: bool) -> Child {
     let socket = socket_path_for_db(db);
     let mut cmd = Command::new(bin());
     cmd.arg("--db")
         .arg(db)
         .arg("start")
         .arg("--bind")
-        .arg(format!("127.0.0.1:{}", bind_port))
+        .arg("127.0.0.1:0")
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     if disable_placeholder_autodial {
@@ -64,21 +64,34 @@ fn start_daemon_with_options(db: &str, bind_port: u16, disable_placeholder_autod
 }
 
 fn wait_for_daemon_ready(db: &str, timeout: Duration) {
+    let socket = socket_path_for_db(db);
     let start = Instant::now();
     while start.elapsed() < timeout {
-        let out = Command::new(bin())
-            .arg("--db")
-            .arg(db)
-            .arg("status")
-            .output();
-        if let Ok(output) = out {
-            if output.status.success() {
-                return;
+        if socket.exists() {
+            if let Ok(resp) =
+                topo::rpc::client::rpc_call(&socket, topo::rpc::protocol::RpcMethod::Status)
+            {
+                if resp.ok {
+                    return;
+                }
             }
         }
         std::thread::sleep(Duration::from_millis(50));
     }
     panic!("daemon did not become ready for RPC within {:?}", timeout);
+}
+
+fn daemon_listen_addr(db: &str) -> String {
+    let socket = socket_path_for_db(db);
+    let resp = topo::rpc::client::rpc_call(&socket, topo::rpc::protocol::RpcMethod::Status)
+        .expect("status RPC for listen addr");
+    assert!(resp.ok, "status RPC returned error");
+    let data = resp.data.expect("status response missing data");
+    data.get("runtime")
+        .and_then(|r| r.get("listen_addr"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .expect("status response missing runtime.listen_addr")
 }
 
 fn cli_test_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -88,8 +101,8 @@ fn cli_test_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn start_daemon(db: &str, bind_port: u16) -> Child {
-    start_daemon_with_options(db, bind_port, false)
+fn start_daemon(db: &str) -> Child {
+    start_daemon_with_options(db, false)
 }
 
 fn send_message(db: &str, content: &str) -> String {
@@ -227,27 +240,24 @@ fn test_cli_bidirectional_sync() {
     let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
     let timeout_ms = 15000;
 
-    let alice_port = random_port();
-    let bob_port = random_port();
-
     // Alice creates workspace (identity chain)
     create_workspace(&alice_db);
 
     // Alice starts daemon (auto-selects single peer)
-    let mut alice = start_daemon(&alice_db, alice_port);
+    let mut alice = start_daemon(&alice_db);
 
     // Alice sends messages via daemon RPC
     send_message(&alice_db, "Hello from Alice");
     let alice_eid = send_message(&alice_db, "How are you?");
 
     // Alice creates invite (via daemon RPC)
-    let invite_link = create_invite(&alice_db, &format!("127.0.0.1:{}", alice_port));
+    let invite_link = create_invite(&alice_db, &daemon_listen_addr(&alice_db));
 
     // Bob accepts invite (bootstrap sync from Alice)
     accept_invite(&bob_db, &invite_link);
 
     // Bob starts daemon; invite-seeded autodial reaches Alice.
-    let mut bob = start_daemon(&bob_db, bob_port);
+    let mut bob = start_daemon(&bob_db);
     std::thread::sleep(Duration::from_secs(1));
 
     // Bob sends a message in the shared workspace
@@ -285,22 +295,19 @@ fn test_cli_ongoing_sync() {
     let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
     let timeout_ms = 15000;
 
-    let alice_port = random_port();
-    let bob_port = random_port();
-
     // Alice creates workspace and starts daemon
     create_workspace(&alice_db);
-    let mut alice = start_daemon(&alice_db, alice_port);
+    let mut alice = start_daemon(&alice_db);
 
     // Alice sends bootstrap message
     send_message(&alice_db, "bootstrap");
 
     // Alice creates invite
-    let invite_link = create_invite(&alice_db, &format!("127.0.0.1:{}", alice_port));
+    let invite_link = create_invite(&alice_db, &daemon_listen_addr(&alice_db));
 
     // Bob accepts invite and starts daemon
     accept_invite(&bob_db, &invite_link);
-    let mut bob = start_daemon(&bob_db, bob_port);
+    let mut bob = start_daemon(&bob_db);
     std::thread::sleep(Duration::from_secs(1));
 
     // Both send messages over time
@@ -330,20 +337,17 @@ fn test_cli_local_mdns_discovery_without_placeholder_autodial() {
     let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
     let timeout_ms = 20000;
 
-    let alice_port = random_port();
-    let bob_port = random_port();
-
     // Alice creates workspace and starts daemon
     create_workspace(&alice_db);
-    let mut alice = start_daemon_with_options(&alice_db, alice_port, true);
+    let mut alice = start_daemon_with_options(&alice_db, true);
 
     // Alice sends seed message and creates invite
     let alice_seed_eid = send_message(&alice_db, "alice-seed");
-    let invite_link = create_invite(&alice_db, &format!("127.0.0.1:{}", alice_port));
+    let invite_link = create_invite(&alice_db, &daemon_listen_addr(&alice_db));
 
     // Bob accepts invite and starts daemon with placeholder autodial disabled
     accept_invite(&bob_db, &invite_link);
-    let mut bob = start_daemon_with_options(&bob_db, bob_port, true);
+    let mut bob = start_daemon_with_options(&bob_db, true);
     std::thread::sleep(Duration::from_secs(2));
 
     // Validate bidirectional convergence.
@@ -363,10 +367,9 @@ fn test_cli_send_and_messages() {
     // Basic test: create workspace, start daemon, send/messages work
     let tmpdir = tempfile::tempdir().unwrap();
     let db = tmpdir.path().join("test.db").to_str().unwrap().to_string();
-    let port = random_port();
 
     create_workspace(&db);
-    let mut daemon = start_daemon(&db, port);
+    let mut daemon = start_daemon(&db);
 
     let _first_eid = send_message(&db, "First message");
     let second_eid = send_message(&db, "Second message");
@@ -393,19 +396,16 @@ fn test_cli_unpinned_peer_rejected() {
     let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
     let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
 
-    let alice_port = random_port();
-    let bob_port = random_port();
-
     // Alice creates workspace and starts daemon
     create_workspace(&alice_db);
-    let mut alice = start_daemon(&alice_db, alice_port);
+    let mut alice = start_daemon(&alice_db);
 
     // Alice sends a message
     send_message(&alice_db, "alice bootstrap");
 
     // Bob creates independent workspace (not in Alice's workspace)
     create_workspace(&bob_db);
-    let mut bob = start_daemon(&bob_db, bob_port);
+    let mut bob = start_daemon(&bob_db);
 
     // Bob sends a message
     let bob_eid = send_message(&bob_db, "Should not arrive");
@@ -479,21 +479,15 @@ fn test_cli_sync_bootstrap_from_accepted_invite_data() {
         .to_string();
     let timeout_ms = 15000;
 
-    let alice_port = random_port();
-    let bob_port = random_port();
-
     // Alice creates workspace and starts daemon
     create_workspace(&alice_db);
-    let mut alice = start_daemon(&alice_db, alice_port);
+    let mut alice = start_daemon(&alice_db);
 
     // Alice sends bootstrap message
     send_message(&alice_db, "bootstrap");
 
     // Alice creates invite (via daemon RPC)
-    let invite_link = create_invite(
-        &alice_db,
-        &format!("127.0.0.1:{}", alice_port),
-    );
+    let invite_link = create_invite(&alice_db, &daemon_listen_addr(&alice_db));
 
     // Bob accepts invite: installs deterministic cert, bootstrap-syncs from
     // Alice, creates identity chain, records bootstrap trust.
@@ -512,7 +506,7 @@ fn test_cli_sync_bootstrap_from_accepted_invite_data() {
     );
 
     // Bob starts daemon; invite bootstrap trust seeds daemon autodial.
-    let mut bob = start_daemon(&bob_db, bob_port);
+    let mut bob = start_daemon(&bob_db);
     std::thread::sleep(Duration::from_secs(1));
 
     let bob_eid = send_message(&bob_db, "bootstrap trust from invite data");
