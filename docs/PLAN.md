@@ -119,13 +119,13 @@ These are required, not optional:
    - trust-anchor gating belongs on root workspace event validity.
    - do not use pre-projection raw-blob capture tables as authority for trust-anchor binding.
 
-## 2.2 CLI Isomorphism Principle
+## 2.2 CLI Architecture Principle
 
-Every CLI instance is a real peer-to-peer device. Interactive REPL and non-interactive CLI must be isomorphic:
+Every CLI instance is a real peer-to-peer device. All user-facing commands go through daemon RPC to the service layer:
 
-1. **One service layer**: all business logic lives in `src/service.rs` (or the domain modules it calls). CLI subcommands and the interactive REPL are thin UI adapters over the same service functions.
-2. **Real networking**: invite acceptance uses real QUIC bootstrap sync, not in-process event copying. Interactive REPL spins up a temporary sync endpoint for the inviter account when the joiner is in the same process.
-3. **Testing equivalence**: testing the non-interactive CLI validates the interactive REPL and vice versa, because both exercise the same service-layer code paths. An LLM-driven QA agent can target either surface with equal confidence.
+1. **One service layer**: all business logic lives in `src/service.rs` (or the domain modules it calls). CLI subcommands are thin UI adapters that call daemon RPC, which dispatches to service functions.
+2. **Real networking**: invite acceptance uses real QUIC bootstrap sync, not in-process event copying. The daemon manages ongoing sync with discovered peers.
+3. **Testing equivalence**: CLI integration tests exercise the full path (CLI binary → RPC → service → DB/sync). No separate interactive surface exists; the daemon-backed CLI is the single command interface.
 4. **No synthetic shortcuts**: no `copy_event_chain`, no direct DB-to-DB event transfers, no bypass of the sync/projection pipeline. Every event flows through the same ingest path it would in production.
 
 ## 2.3 Device Architecture

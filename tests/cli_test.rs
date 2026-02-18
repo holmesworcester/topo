@@ -45,18 +45,48 @@ fn start_daemon_with_options(db: &str, bind_port: u16, disable_placeholder_autod
         cmd.env("P7_DISABLE_PLACEHOLDER_AUTODIAL", "1");
     }
 
-    let child = cmd.spawn().expect("failed to start daemon");
+    let mut child = cmd.spawn().expect("failed to start daemon");
 
-    // Wait for socket to appear.
+    // Wait for socket to appear, checking that daemon hasn't exited early.
     let start = std::time::Instant::now();
     while !socket.exists() && start.elapsed().as_secs() < 5 {
+        // Check if process already exited (immediate crash / bind failure).
+        if let Some(status) = child.try_wait().expect("failed to check daemon status") {
+            panic!(
+                "daemon exited immediately with {} (db={}, port={})",
+                status, db, bind_port
+            );
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
     assert!(
         socket.exists(),
-        "daemon socket did not appear at {}",
-        socket.display()
+        "daemon socket did not appear at {} within 5s (db={}, port={})",
+        socket.display(),
+        db,
+        bind_port
     );
+
+    // Verify daemon is accepting RPC (socket exists but server may not be listening yet).
+    let rpc_start = std::time::Instant::now();
+    loop {
+        let out = Command::new(bin())
+            .args(["--db", db, "status"])
+            .output()
+            .expect("failed to probe daemon status");
+        if out.status.success() {
+            break;
+        }
+        if rpc_start.elapsed().as_secs() >= 5 {
+            panic!(
+                "daemon socket exists but RPC not responding after 5s (db={}, port={}): {}",
+                db,
+                bind_port,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 
     child
 }
@@ -152,7 +182,7 @@ fn create_invite(db: &str, bootstrap_addr: &str) -> String {
         .arg("--db")
         .arg(db)
         .arg("create-invite")
-        .arg("--bootstrap")
+        .arg("--public-addr")
         .arg(bootstrap_addr)
         .output()
         .expect("failed to run create-invite");
@@ -161,7 +191,13 @@ fn create_invite(db: &str, bootstrap_addr: &str) -> String {
         "create-invite failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Extract the quiet:// link line (may have "Created invite #N" prefix line)
+    stdout
+        .lines()
+        .find(|line| line.starts_with("quiet://"))
+        .unwrap_or_else(|| stdout.trim())
+        .to_string()
 }
 
 /// Helper: run accept-invite CLI command (direct, pre-daemon).
@@ -488,4 +524,239 @@ fn test_cli_sync_bootstrap_from_accepted_invite_data() {
     let _ = bob.kill();
     let _ = alice.wait();
     let _ = bob.wait();
+}
+
+// ---------------------------------------------------------------------------
+// New CLI command tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_cli_completions_bash() {
+    let output = Command::new(bin())
+        .args(["completions", "bash"])
+        .output()
+        .expect("failed to run completions");
+    assert!(output.status.success(), "completions bash failed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.is_empty(), "bash completions should produce output");
+    assert!(stdout.contains("topo"), "bash completions should reference 'topo'");
+}
+
+#[test]
+fn test_cli_completions_zsh() {
+    let output = Command::new(bin())
+        .args(["completions", "zsh"])
+        .output()
+        .expect("failed to run completions");
+    assert!(output.status.success(), "completions zsh failed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.is_empty(), "zsh completions should produce output");
+}
+
+#[test]
+fn test_cli_ban_user() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = tmpdir.path().join("ban.db").to_str().unwrap().to_string();
+    let port = random_port();
+
+    create_workspace(&db);
+    let mut daemon = start_daemon(&db, port);
+
+    // There should be 1 user (the workspace creator)
+    let out = Command::new(bin())
+        .args(["--db", &db, "users"])
+        .output()
+        .expect("users command");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("1."), "should have at least 1 user");
+
+    // Ban user #1
+    let out = Command::new(bin())
+        .args(["--db", &db, "ban", "1"])
+        .output()
+        .expect("ban command");
+    assert!(
+        out.status.success(),
+        "ban failed: {} {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Banned"), "should confirm ban");
+
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+}
+
+#[test]
+fn test_cli_workspaces_alias() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = tmpdir.path().join("wsalias.db").to_str().unwrap().to_string();
+    let port = random_port();
+
+    create_workspace(&db);
+    let mut daemon = start_daemon(&db, port);
+
+    // Test both "networks" and "workspaces" alias
+    let out = Command::new(bin())
+        .args(["--db", &db, "networks"])
+        .output()
+        .expect("networks command");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("WORKSPACES"), "networks should show WORKSPACES header");
+
+    let out = Command::new(bin())
+        .args(["--db", &db, "workspaces"])
+        .output()
+        .expect("workspaces command");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("WORKSPACES"), "workspaces alias should work");
+
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+}
+
+#[test]
+fn test_cli_db_registry() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let reg_dir = tmpdir.path().join("registry");
+    std::fs::create_dir_all(&reg_dir).unwrap();
+
+    // Use TOPO_REGISTRY_DIR to isolate
+    let out = Command::new(bin())
+        .env("TOPO_REGISTRY_DIR", reg_dir.to_str().unwrap())
+        .args(["db", "add", "/tmp/test_registry.db", "--name", "mytest"])
+        .output()
+        .expect("db add");
+    assert!(out.status.success(), "db add failed: {:?}", out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Added"), "should confirm add");
+
+    // List
+    let out = Command::new(bin())
+        .env("TOPO_REGISTRY_DIR", reg_dir.to_str().unwrap())
+        .args(["db", "list"])
+        .output()
+        .expect("db list");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("mytest"), "should show alias name");
+
+    // Rename
+    let out = Command::new(bin())
+        .env("TOPO_REGISTRY_DIR", reg_dir.to_str().unwrap())
+        .args(["db", "rename", "mytest", "renamed"])
+        .output()
+        .expect("db rename");
+    assert!(out.status.success());
+
+    // Remove
+    let out = Command::new(bin())
+        .env("TOPO_REGISTRY_DIR", reg_dir.to_str().unwrap())
+        .args(["db", "remove", "renamed"])
+        .output()
+        .expect("db remove");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Removed"), "should confirm remove");
+
+    // List should now be empty
+    let out = Command::new(bin())
+        .env("TOPO_REGISTRY_DIR", reg_dir.to_str().unwrap())
+        .args(["db", "list"])
+        .output()
+        .expect("db list");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("No databases"), "should show empty message");
+}
+
+#[test]
+fn test_cli_db_invalid_numeric_selector_errors() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let reg_dir = tmpdir.path().join("registry");
+    std::fs::create_dir_all(&reg_dir).unwrap();
+
+    // --db 999 with empty registry should error, not silently use "999" as filename.
+    let out = Command::new(bin())
+        .env("TOPO_REGISTRY_DIR", reg_dir.to_str().unwrap())
+        .args(["--db", "999", "status"])
+        .output()
+        .expect("db 999");
+    assert!(
+        !out.status.success(),
+        "should fail for invalid numeric selector, got success"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("invalid index"),
+        "should mention invalid index, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_cli_react_by_message_number() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = tmpdir.path().join("msgnum.db").to_str().unwrap().to_string();
+    let port = random_port();
+
+    create_workspace(&db);
+    let mut daemon = start_daemon(&db, port);
+
+    // Send two messages.
+    send_message(&db, "first msg");
+    send_message(&db, "second msg");
+
+    // React to message #1 by number.
+    let out = Command::new(bin())
+        .args(["--db", &db, "react", "--target", "1", "thumbsup"])
+        .output()
+        .expect("react by number");
+    assert!(
+        out.status.success(),
+        "react by number failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Reacted"), "expected Reacted output, got: {}", stdout);
+
+    // React to message #2 with # prefix.
+    let out = Command::new(bin())
+        .args(["--db", &db, "react", "--target", "#2", "heart"])
+        .output()
+        .expect("react by #N");
+    assert!(
+        out.status.success(),
+        "react by #N failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Delete message #1 by number.
+    let out = Command::new(bin())
+        .args(["--db", &db, "delete-message", "--target", "1"])
+        .output()
+        .expect("delete by number");
+    assert!(
+        out.status.success(),
+        "delete by number failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Deleted"), "expected Deleted output, got: {}", stdout);
+
+    // Invalid message number should error.
+    let out = Command::new(bin())
+        .args(["--db", &db, "react", "--target", "99", "sad"])
+        .output()
+        .expect("react invalid number");
+    assert!(!out.status.success(), "should fail for invalid message number");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("invalid message number"), "expected error message, got: {}", stderr);
+
+    let _ = daemon.kill();
+    let _ = daemon.wait();
 }

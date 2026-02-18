@@ -54,12 +54,39 @@ pub enum RpcMethod {
         peer: Option<String>,
     },
     CreateInvite {
-        bootstrap: Option<String>,
+        public_addr: String,
+        public_spki: Option<String>,
     },
     AcceptInvite {
         invite: String,
         username: String,
         devicename: String,
+    },
+    /// Create a device link invite for the active peer's user.
+    CreateDeviceLink {
+        public_addr: String,
+        public_spki: Option<String>,
+    },
+    /// Accept a device link invite.
+    AcceptLink {
+        invite: String,
+        devicename: String,
+    },
+    /// Ban (remove) a user by number or hex event ID.
+    Ban {
+        target: String,
+    },
+    /// Show combined identity info for the active peer.
+    Identity,
+    /// List channels for the active peer.
+    Channels,
+    /// Create a new channel for the active peer.
+    NewChannel {
+        name: String,
+    },
+    /// Switch active channel by number or name.
+    UseChannel {
+        selector: String,
     },
     Shutdown,
     /// List peers (tenants) in this DB with active marker.

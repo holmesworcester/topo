@@ -3,6 +3,7 @@
 //! Connection count is bounded by a semaphore to prevent local connection-flood
 //! pressure (feedback item 2).
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::os::unix::net::UnixListener;
 use std::path::Path;
@@ -21,17 +22,38 @@ use crate::service;
 /// Additional connections block until a slot is freed.
 const MAX_CONCURRENT_CONNECTIONS: usize = 64;
 
-/// Daemon-wide shared state: tracks active peer for CLI commands.
+/// Default channel ID (matches interactive.rs hardcoded "general" channel).
+fn default_channel_id() -> [u8; 32] {
+    let mut id = [0u8; 32];
+    id[..16].copy_from_slice(&hex::decode("0102030405060708090a0b0c0d0e0f10").unwrap());
+    id
+}
+
+/// A named channel alias in the daemon frontend state.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChannelAlias {
+    pub name: String,
+    pub channel_id: [u8; 32],
+}
+
+/// Daemon-wide shared state: tracks active peer, invite refs, and channel state.
 pub struct DaemonState {
     pub db_path: String,
     pub active_peer: RwLock<Option<String>>,
     /// Runtime networking info (listen addr, UPnP result). Set once the
     /// QUIC endpoint is bound; UPnP result is populated by `topo upnp`.
     pub runtime_net: RwLock<Option<NodeRuntimeNetInfo>>,
+    /// Invite/link strings stored by number (index+1 = invite ref number).
+    pub invite_refs: RwLock<Vec<String>>,
+    /// Channel aliases per peer_id.
+    pub channel_aliases: RwLock<HashMap<String, Vec<ChannelAlias>>>,
+    /// Active channel per peer_id.
+    pub active_channel: RwLock<HashMap<String, [u8; 32]>>,
 }
 
 impl DaemonState {
     /// Create state with auto-selected peer if exactly one tenant exists.
+    /// Seeds the default "general" channel.
     pub fn new(db_path: &str) -> Self {
         let active = match crate::db::open_connection(db_path) {
             Ok(conn) => {
@@ -47,6 +69,9 @@ impl DaemonState {
             db_path: db_path.to_string(),
             active_peer: RwLock::new(active),
             runtime_net: RwLock::new(None),
+            invite_refs: RwLock::new(Vec::new()),
+            channel_aliases: RwLock::new(HashMap::new()),
+            active_channel: RwLock::new(HashMap::new()),
         }
     }
 
@@ -56,6 +81,71 @@ impl DaemonState {
             .unwrap()
             .clone()
             .ok_or_else(|| "no active peer — run `topo use-peer <N>`".to_string())
+    }
+
+    /// Store an invite/link string and return its 1-based reference number.
+    pub fn add_invite_ref(&self, link: String) -> usize {
+        let mut refs = self.invite_refs.write().unwrap();
+        refs.push(link);
+        refs.len()
+    }
+
+    /// Resolve an invite ref: numeric string → stored link, otherwise passthrough.
+    pub fn resolve_invite_ref(&self, selector: &str) -> Result<String, String> {
+        if let Ok(num) = selector.parse::<usize>() {
+            let refs = self.invite_refs.read().unwrap();
+            if num >= 1 && num <= refs.len() {
+                return Ok(refs[num - 1].clone());
+            }
+            return Err(format!(
+                "invalid invite ref #{}; available: 1-{}",
+                num,
+                refs.len()
+            ));
+        }
+        // Passthrough: treat as a raw invite link
+        Ok(selector.to_string())
+    }
+
+    /// Get channel list for a peer, seeding "general" if empty.
+    pub fn channels_for_peer(&self, peer_id: &str) -> Vec<ChannelAlias> {
+        let mut aliases = self.channel_aliases.write().unwrap();
+        let channels = aliases.entry(peer_id.to_string()).or_insert_with(|| {
+            vec![ChannelAlias {
+                name: "general".to_string(),
+                channel_id: default_channel_id(),
+            }]
+        });
+        channels.clone()
+    }
+
+    /// Get the active channel for a peer, defaulting to "general".
+    pub fn active_channel_for_peer(&self, peer_id: &str) -> [u8; 32] {
+        let active = self.active_channel.read().unwrap();
+        active.get(peer_id).copied().unwrap_or_else(default_channel_id)
+    }
+
+    /// Set the active channel for a peer.
+    pub fn set_active_channel(&self, peer_id: &str, channel_id: [u8; 32]) {
+        let mut active = self.active_channel.write().unwrap();
+        active.insert(peer_id.to_string(), channel_id);
+    }
+
+    /// Add a new channel for a peer. Returns the channel number and ID.
+    pub fn add_channel(&self, peer_id: &str, name: &str) -> (usize, [u8; 32]) {
+        let channel_id: [u8; 32] = rand::random();
+        let mut aliases = self.channel_aliases.write().unwrap();
+        let channels = aliases.entry(peer_id.to_string()).or_insert_with(|| {
+            vec![ChannelAlias {
+                name: "general".to_string(),
+                channel_id: default_channel_id(),
+            }]
+        });
+        channels.push(ChannelAlias {
+            name: name.to_string(),
+            channel_id,
+        });
+        (channels.len(), channel_id)
     }
 }
 
@@ -169,6 +259,7 @@ fn handle_connection(
     Ok(())
 }
 
+#[allow(dead_code)] // used by tests; will be called when auto-UPnP bootstrap is re-enabled
 fn resolve_bootstrap_from_upnp(upnp: &crate::upnp::UpnpMappingReport) -> Result<String, String> {
     if upnp.status != crate::upnp::UpnpMappingStatus::Success {
         let status = match &upnp.status {
@@ -394,30 +485,25 @@ fn dispatch(
                 Err(e) => RpcResponse::error(e.to_string()),
             }
         }
-        RpcMethod::CreateInvite { bootstrap } => {
-            let resolved = match bootstrap {
-                Some(addr) => addr,
-                None => {
-                    // Derive from UPnP result stored in daemon state.
-                    let net = state.runtime_net.read().unwrap();
-                    match net.as_ref().and_then(|n| n.upnp.as_ref()) {
-                        Some(upnp) => match resolve_bootstrap_from_upnp(upnp) {
-                            Ok(addr) => addr,
-                            Err(msg) => return RpcResponse::error(msg),
-                        },
-                        None => {
-                            return RpcResponse::error(
-                                "no bootstrap address — provide --bootstrap or run `topo upnp` first",
-                            );
-                        }
-                    }
-                }
+        RpcMethod::CreateInvite { public_addr, public_spki } => {
+            let result = match public_spki {
+                Some(ref spki) => service::svc_create_invite_with_spki(db_path, &public_addr, spki),
+                None => service::svc_create_invite(db_path, &public_addr),
             };
-            match service::svc_create_invite(db_path, &resolved) {
+            match result {
                 Ok(data) => {
-                    let mut val = serde_json::to_value(&data).unwrap_or(serde_json::Value::Null);
-                    val["bootstrap"] = serde_json::Value::String(resolved);
-                    RpcResponse::success(val)
+                    // Store invite ref
+                    if let Some(link) = serde_json::to_value(&data)
+                        .ok()
+                        .and_then(|v| v["invite_link"].as_str().map(|s| s.to_string()))
+                    {
+                        let num = state.add_invite_ref(link);
+                        let mut resp_data = serde_json::to_value(&data).unwrap();
+                        resp_data["invite_ref"] = serde_json::json!(num);
+                        RpcResponse::success(resp_data)
+                    } else {
+                        RpcResponse::success(data)
+                    }
                 }
                 Err(e) => RpcResponse::error(e.to_string()),
             }
@@ -453,7 +539,150 @@ fn dispatch(
                 }
             }
         }
-
+        RpcMethod::CreateDeviceLink { public_addr, public_spki } => {
+            match state.require_active_peer() {
+                Ok(peer_id) => {
+                    match service::svc_create_device_link_for_peer(
+                        db_path,
+                        &peer_id,
+                        &public_addr,
+                        public_spki.as_deref(),
+                    ) {
+                        Ok(data) => {
+                            if let Some(link) = serde_json::to_value(&data)
+                                .ok()
+                                .and_then(|v| v["invite_link"].as_str().map(|s| s.to_string()))
+                            {
+                                let num = state.add_invite_ref(link);
+                                let mut resp_data = serde_json::to_value(&data).unwrap();
+                                resp_data["invite_ref"] = serde_json::json!(num);
+                                RpcResponse::success(resp_data)
+                            } else {
+                                RpcResponse::success(data)
+                            }
+                        }
+                        Err(e) => RpcResponse::error(e.to_string()),
+                    }
+                }
+                Err(e) => RpcResponse::error(e),
+            }
+        }
+        RpcMethod::AcceptLink { invite, devicename } => {
+            let resolved = match state.resolve_invite_ref(&invite) {
+                Ok(link) => link,
+                Err(e) => return RpcResponse::error(e),
+            };
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => return RpcResponse::error(format!("failed to start runtime: {}", e)),
+            };
+            match rt.block_on(service::svc_accept_device_link(
+                db_path,
+                &resolved,
+                &devicename,
+            )) {
+                Ok(data) => {
+                    // Auto-select if no active peer
+                    let mut ap = state.active_peer.write().unwrap();
+                    if ap.is_none() {
+                        *ap = Some(data.peer_id.clone());
+                    }
+                    RpcResponse::success(data)
+                }
+                Err(e) => RpcResponse::error(e.to_string()),
+            }
+        }
+        RpcMethod::Ban { target } => {
+            match state.require_active_peer() {
+                Ok(peer_id) => {
+                    match service::svc_ban_for_peer(db_path, &peer_id, &target) {
+                        Ok(data) => RpcResponse::success(data),
+                        Err(e) => RpcResponse::error(e.to_string()),
+                    }
+                }
+                Err(e) => RpcResponse::error(e),
+            }
+        }
+        RpcMethod::Identity => {
+            match state.require_active_peer() {
+                Ok(peer_id) => {
+                    match service::svc_identity_for_peer(db_path, &peer_id) {
+                        Ok(data) => RpcResponse::success(data),
+                        Err(e) => RpcResponse::error(e.to_string()),
+                    }
+                }
+                Err(e) => RpcResponse::error(e),
+            }
+        }
+        RpcMethod::Channels => {
+            match state.require_active_peer() {
+                Ok(peer_id) => {
+                    let channels = state.channels_for_peer(&peer_id);
+                    let active = state.active_channel_for_peer(&peer_id);
+                    let items: Vec<serde_json::Value> = channels
+                        .iter()
+                        .enumerate()
+                        .map(|(i, ch)| {
+                            serde_json::json!({
+                                "index": i + 1,
+                                "name": ch.name,
+                                "active": ch.channel_id == active,
+                            })
+                        })
+                        .collect();
+                    RpcResponse::success(items)
+                }
+                Err(e) => RpcResponse::error(e),
+            }
+        }
+        RpcMethod::NewChannel { name } => {
+            match state.require_active_peer() {
+                Ok(peer_id) => {
+                    let (num, channel_id) = state.add_channel(&peer_id, &name);
+                    RpcResponse::success(serde_json::json!({
+                        "index": num,
+                        "name": name,
+                        "channel_id": hex::encode(channel_id),
+                    }))
+                }
+                Err(e) => RpcResponse::error(e),
+            }
+        }
+        RpcMethod::UseChannel { selector } => {
+            match state.require_active_peer() {
+                Ok(peer_id) => {
+                    let channels = state.channels_for_peer(&peer_id);
+                    // Try numeric index first
+                    let found = if let Ok(idx) = selector.parse::<usize>() {
+                        if idx >= 1 && idx <= channels.len() {
+                            Some(channels[idx - 1].clone())
+                        } else {
+                            None
+                        }
+                    } else {
+                        // Try name match
+                        channels.iter().find(|ch| ch.name == selector).cloned()
+                    };
+                    match found {
+                        Some(ch) => {
+                            state.set_active_channel(&peer_id, ch.channel_id);
+                            RpcResponse::success(serde_json::json!({
+                                "name": ch.name,
+                                "channel_id": hex::encode(ch.channel_id),
+                            }))
+                        }
+                        None => RpcResponse::error(format!(
+                            "channel not found: {}; use `topo channels` to list",
+                            selector
+                        )),
+                    }
+                }
+                Err(e) => RpcResponse::error(e),
+            }
+        }
         RpcMethod::AcceptInvite {
             invite,
             username,
