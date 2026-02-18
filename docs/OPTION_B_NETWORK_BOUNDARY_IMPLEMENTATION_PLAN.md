@@ -324,3 +324,23 @@ Still remaining for full Option B completion:
 2. Phase 3 extraction of replication session logic into dedicated replication module.
 3. Phase 4 extraction of network runtime orchestration out of `node.rs`/`sync` glue.
 4. Phase 5 dependency-direction enforcement and privileged adversity CI hardening.
+
+## Phase 2 Progress (2026-02-18, follow-up)
+
+A follow-up extraction slice was completed after the Phase 1 checkpoint:
+
+1. Moved ingest runtime implementation (`IngestItem`, `batch_writer`) into `src/event_runtime/ingest_runtime.rs`.
+2. Added SQL-backed event-runtime adapters in `src/event_runtime/sqlite_adapters.rs`:
+   - `SqliteIngestSink` implementing `IngestSink`
+   - `SqliteReplicationStore` implementing `ReplicationStore`
+3. Kept compatibility for existing callers via `sync::engine` re-export of `batch_writer` and `IngestItem`.
+4. Preserved behavior in sync loops while narrowing ownership of ingest/projection queue flow toward the event-runtime module.
+
+Validation performed for this slice:
+
+1. `cargo test --lib --no-run`
+2. `cargo test --test scenario_test --no-run`
+3. `cargo test --test two_process_test -q`
+4. `cargo test --test holepunch_test -q`
+5. `cargo test --test rpc_test -q`
+6. `cargo test --test cli_test -q`
