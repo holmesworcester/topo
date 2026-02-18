@@ -250,8 +250,8 @@ DB_B="$TMPDIR/b.db"
 "$BIN" send "hello from I" --db "$DB_I" >/dev/null
 
 # Realistic out-of-band data: invite links only.
-INV_A=$("$BIN" create-invite --db "$DB_I" --bootstrap "10.100.0.1:4433" | tr -d '\n')
-INV_B=$("$BIN" create-invite --db "$DB_I" --bootstrap "10.100.0.1:4433" | tr -d '\n')
+INV_A=$("$BIN" create-invite --db "$DB_I" --public-addr "10.100.0.1:4433" | grep '^quiet://')
+INV_B=$("$BIN" create-invite --db "$DB_I" --public-addr "10.100.0.1:4433" | grep '^quiet://')
 [[ "$INV_A" == quiet://invite/* ]] || fail "invalid invite for A"
 [[ "$INV_B" == quiet://invite/* ]] || fail "invalid invite for B"
 

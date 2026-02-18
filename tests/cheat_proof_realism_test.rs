@@ -98,14 +98,19 @@ fn topo_send(db: &str, content: &str) -> String {
 }
 
 fn topo_create_invite(db: &str, bootstrap_addr: &str) -> String {
-    let out = topo_rpc(db, &["create-invite", "--bootstrap", bootstrap_addr]);
+    let out = topo_rpc(db, &["create-invite", "--public-addr", bootstrap_addr]);
     assert!(
         out.status.success(),
         "topo create-invite failed: stdout={} stderr={}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    stdout
+        .lines()
+        .find(|line| line.starts_with("quiet://"))
+        .expect("create-invite output missing quiet:// link")
+        .to_string()
 }
 
 fn topo_accept_invite(db: &str, invite_link: &str) {
