@@ -1,6 +1,15 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use async_trait::async_trait;
 use std::net::SocketAddr;
 use tokio_util::sync::CancellationToken;
+
+static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Allocate a monotonically increasing session ID.
+pub fn next_session_id() -> u64 {
+    NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TenantId(pub String);

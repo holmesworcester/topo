@@ -47,6 +47,32 @@ fn drain_batch_size() -> usize {
     }
 }
 
+/// Drain pending project_queue items for a tenant, projecting each event.
+///
+/// This encapsulates the `project_one` + `drain_with_limit` pattern so that
+/// callers outside `event_runtime` do not need to import `projection::pipeline`
+/// directly.  Used by both `batch_writer` (internal) and `sync::engine` startup
+/// recovery paths.
+pub fn drain_project_queue(db_path: &str, tenant_id: &str, batch_size: usize) -> usize {
+    let db = match crate::db::open_connection(db_path) {
+        Ok(db) => db,
+        Err(e) => {
+            warn!("drain_project_queue: failed to open db: {}", e);
+            return 0;
+        }
+    };
+    let pq = crate::db::project_queue::ProjectQueue::new(&db);
+    let tid = tenant_id.to_string();
+    pq.drain_with_limit(&tid, batch_size, |conn, event_id_b64| {
+        if let Some(eid) = event_id_from_base64(event_id_b64) {
+            project_one(conn, &tid, &eid)
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        }
+        Ok(())
+    })
+    .unwrap_or(0)
+}
+
 /// Batch writer write batch cap: 1000 normal, 500 in low_mem.
 fn write_batch_cap() -> usize {
     if low_mem_mode() {

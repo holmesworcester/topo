@@ -13,11 +13,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use crate::contracts::network_contract::{
-    PeerFingerprint, SessionDirection, SessionHandler, SessionMeta, TenantId,
+    next_session_id, PeerFingerprint, SessionDirection, SessionHandler, SessionMeta, TenantId,
 };
 use crate::db::{open_connection, schema::create_tables};
-use crate::sync::session_handler::{next_session_id, LegacySyncSessionHandler};
-use crate::sync::SyncMessage;
+use crate::replication::ReplicationSessionHandler;
+
 use crate::transport::{
     create_dual_endpoint, peer_identity_from_connection, AllowedPeers, DualConnection,
     SyncSessionIo,
@@ -101,17 +101,10 @@ pub async fn bootstrap_sync_from_invite(
         .await
         .map_err(|e| format!("Bootstrap sync: failed to open data stream: {}", e))?;
 
-    let mut conn = DualConnection::new(ctrl_send, ctrl_recv, data_send, data_recv);
+    let conn = DualConnection::new(ctrl_send, ctrl_recv, data_send, data_recv);
 
-    // Send markers to materialize lazy QUIC streams on the receiver
-    conn.control
-        .send(&SyncMessage::HaveList { ids: vec![] })
-        .await?;
-    conn.data_send
-        .send(&SyncMessage::HaveList { ids: vec![] })
-        .await?;
-    conn.flush_control().await?;
-    conn.flush_data().await?;
+    // Stream materialization markers are now sent by
+    // ReplicationSessionHandler::on_session for outbound sessions.
 
     let peer_fp = peer_fingerprint_from_hex(&peer_id)?;
     let session_id = next_session_id();
@@ -122,7 +115,7 @@ pub async fn bootstrap_sync_from_invite(
         remote_addr: connection.remote_address(),
         direction: SessionDirection::Outbound,
     };
-    let handler = LegacySyncSessionHandler::initiator(db_path.to_string(), timeout_secs);
+    let handler = ReplicationSessionHandler::initiator(db_path.to_string(), timeout_secs);
     let io = SyncSessionIo::new(session_id, conn);
     handler
         .on_session(meta, Box::new(io), CancellationToken::new())
@@ -171,7 +164,7 @@ pub fn start_bootstrap_responder(
             .build()
             .expect("failed to create bootstrap responder runtime");
         rt.block_on(async move {
-            let handler = crate::sync::session_handler::LegacySyncSessionHandler::responder(
+            let handler = ReplicationSessionHandler::responder(
                 db_path.clone(),
                 30,
             );
@@ -214,7 +207,7 @@ pub fn start_bootstrap_responder(
                     }
                 };
                 let conn = DualConnection::new(ctrl_send, ctrl_recv, data_send, data_recv);
-                let session_id = crate::sync::session_handler::next_session_id();
+                let session_id = next_session_id();
                 let meta = SessionMeta {
                     session_id,
                     tenant: TenantId(recorded_by.clone()),
