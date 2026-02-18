@@ -8,12 +8,11 @@ These are current specs, plans, and reference material.
 |----------|-------------|
 | [PLAN.md](PLAN.md) | Authoritative implementation plan for all phases |
 | [DESIGN.md](DESIGN.md) | Target protocol design (post-PLAN end state) |
+| [../TODO.md](../TODO.md) | Current discrepancy/remediation backlog and execution ordering |
 | [PERF.md](PERF.md) | Benchmark results and testing guide |
 | [LOW_MEM_PERF_ANALYSIS.md](LOW_MEM_PERF_ANALYSIS.md) | Scaling analysis and memory-constrained architecture guidance |
-| [PHASE_7_LOGIC_FIXES.md](PHASE_7_LOGIC_FIXES.md) | Work plan for Phase 7 guard-placement and trust-binding corrections |
-| [QUIC_HOLEPUNCH_PLAN.md](QUIC_HOLEPUNCH_PLAN.md) | NAT traversal implementation plan (partially implemented) |
-| [SYNC_GRAPH_PERF_PLAN.md](SYNC_GRAPH_PERF_PLAN.md) | Performance plan for graph-topology sync |
-| [IDENTITY_RENAME_PLAN.md](IDENTITY_RENAME_PLAN.md) | Identity compatibility cleanup plan |
+| [tla/projector_spec.md](tla/projector_spec.md) | Runtime-to-model mapping for projector semantics |
+| [planning/DISCREPANCY-MATRIX.md](planning/DISCREPANCY-MATRIX.md) | Current design/plan/code discrepancy matrix |
 
 ## Archive
 
@@ -30,6 +29,7 @@ Historical feedback artifacts and superseded planning docs. Retained for context
 | [archive/PHASE_5_FEEDBACK.md](archive/PHASE_5_FEEDBACK.md) | Phase 5 review |
 | [archive/PHASE_6_FEEDBACK.md](archive/PHASE_6_FEEDBACK.md) | Phase 6 review |
 | [archive/PHASE_7_FEEDBACK.md](archive/PHASE_7_FEEDBACK.md) | Phase 7 review |
+| [archive/PHASE_7_LOGIC_FIXES.md](archive/PHASE_7_LOGIC_FIXES.md) | Historical Phase 7 guard-placement fix plan |
 | [archive/TRANSPORT_TRUST_HARDENING_FEEDBACK.md](archive/TRANSPORT_TRUST_HARDENING_FEEDBACK.md) | Transport trust hardening review |
 | [archive/NEGENTROPY_SQLITE_PLAN.md](archive/NEGENTROPY_SQLITE_PLAN.md) | Historical negentropy/SQLite plan |
 | [archive/SYNC_ROUND_DESIGN.md](archive/SYNC_ROUND_DESIGN.md) | Historical sync round design |
@@ -38,5 +38,7 @@ Historical feedback artifacts and superseded planning docs. Retained for context
 
 | Directory | Description |
 |-----------|-------------|
-| `tla/` | TLA+ formal models (BootstrapGraph, EventGraphSchema) |
-| `cleanup/` | Parallel cleanup stream plans |
+| `planning/` | Execution plans and discrepancy tracking for active workstreams |
+| `tla/` | TLA+ formal models and configs (BootstrapGraph, EventGraphSchema, transport lifecycle) |
+| `cleanup/` | Cleanup stream plans and decomposition notes |
+| `archive/` | Historical plans, feedback docs, and superseded material |
