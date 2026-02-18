@@ -18,7 +18,7 @@ This document is ordered exactly as we should build it.
 10. `Phase 10`: Non-identity special-case projector logic (deletion/emitted-events).
 11. `Phase 11`: Performance hardening, observability, scaling, and low-memory iOS mode.
 12. `Phase 12`: TLA-first minimal identity layer for trust-anchor cascade, removal, and sender-subjective encryption.
-13. `Phase 13`: Functional multitenancy — one node hosting N tenant identities in a shared DB with per-tenant QUIC endpoints and mDNS discovery.
+13. `Phase 13`: Functional multitenancy — one node hosting N tenant identities in a shared DB with one shared QUIC endpoint and per-tenant routing/discovery.
 
 Scheduling note:
 - two-tier multitenancy plan:
@@ -1628,11 +1628,11 @@ Notes:
 
 ### Status: COMPLETE
 
-One node hosting N local tenant identities in a shared SQLite DB, each with its own QUIC endpoint, workspace binding, and trust policy. The DB itself is the tenant registry — no explicit registration step. Tenants are discovered by joining `trust_anchors` with `local_transport_creds`.
+One node hosting N local tenant identities in a shared SQLite DB with one shared QUIC endpoint, tenant-scoped workspace binding, and tenant-scoped trust policy. The DB itself is the tenant registry — no explicit registration step. Tenants are discovered by joining `trust_anchors` with `local_transport_creds`.
 
 ### Key insight
 
-The DB already IS the tenant registry. `trust_anchors(peer_id, workspace_id)` contains every local identity that has accepted an invite (populated by `invite_accepted`, which is local-only). All projection tables scope by `(recorded_by, event_id)`. The only missing pieces were: (a) storing TLS cert/key material per tenant in the DB, and (b) a node daemon that reads this state and spins up per-tenant QUIC endpoints.
+The DB already IS the tenant registry. `trust_anchors(peer_id, workspace_id)` contains every local identity that has accepted an invite (populated by `invite_accepted`, which is local-only). All projection tables scope by `(recorded_by, event_id)`. The only missing pieces were: (a) storing TLS cert/key material per tenant in the DB, and (b) a node daemon that reads this state and runs one shared QUIC endpoint with tenant-scoped cert selection/routing.
 
 ---
 
@@ -1947,7 +1947,7 @@ Each tenant advertises under `_quiet-p7._udp.local.` with:
 
 ### 17.5.3 Integration in `node.rs`
 
-After creating each tenant's endpoint, node creates `TenantDiscovery` with the actual bound port. On trusted discovery, `PeerDispatcher` routes to `connect_loop`. Feature-gated with `#[cfg(feature = "discovery")]`.
+After creating the shared endpoint and learning its bound port, node creates `TenantDiscovery` per tenant using that shared port. On trusted discovery, `PeerDispatcher` routes to tenant-specific `connect_loop`. Feature-gated with `#[cfg(feature = "discovery")]`.
 
 ### 17.5.4 DNS label truncation
 
@@ -2121,7 +2121,7 @@ Tests in `tests/mdns_smoke.rs`:
 3. All cert operations via DB, zero filesystem cert paths.
 4. `IngestItem` 3-tuple `(event_id, blob, recorded_by)` everywhere in sync engine.
 5. `accept_loop_with_ingest` accepting external shared ingest channel.
-6. `run_node` per-tenant QUIC endpoint spawning with shared batch writer.
+6. `run_node` single shared QUIC endpoint with `WorkspaceCertResolver`, tenant-scoped routing, and shared batch writer.
 7. Per-tenant dynamic trust closure from `trust_anchors`/PeerShared-derived SPKIs.
 8. mDNS per-tenant advertise + browse with self-filtering.
 9. `SharedDbNode` test helper using production identity flows.
@@ -2132,7 +2132,7 @@ Tests in `tests/mdns_smoke.rs`:
 - **Filesystem cert remnants**: Do not read or write `.cert.der` / `.key.der` files. All cert material lives in `local_transport_creds`.
 - **Hardcoded event counts in tests**: Identity chain size may change. Test convergence with `has_event()` on specific event IDs, assert with `message_count()` / `peer_shared_count()` / etc.
 - **Single-sample convergence for large syncs**: A single `has_event` sample may pass after only partial transfer. For zero-loss or high-volume tests, sample 50+ events from both sides.
-- **Global neg_items**: All tenants share one `neg_items` table. A remote peer connecting to tenant A's endpoint will see event IDs from all tenants during negentropy. This is acceptable for single-operator nodes.
+- **Global neg_items**: All tenants share one `neg_items` table. A remote peer connecting to the shared endpoint (routed as tenant A) will see event IDs from all tenants during negentropy. This is acceptable for single-operator nodes.
 - **DNS label overflow**: Peer IDs are 64 hex chars. Instance names must stay under 63 bytes. Truncate peer ID in instance name; use TXT property for full ID.
 - **Self-discovery in mDNS**: Pass the full set of local tenant peer IDs to `TenantDiscovery::new` so it can filter them all out, not just its own.
 - **Forgetting per-tenant drain**: `batch_writer` must group ingested items by `recorded_by` and drain `project_queue` per tenant. A single drain call with one `recorded_by` misses events from other tenants in the same batch.

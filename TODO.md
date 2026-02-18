@@ -59,7 +59,7 @@ Realism-first rule for ordering: finish test-fidelity items up front (copying ev
 21. ~~`P1: CLI isomorphism — route remaining interactive commands through service layer`~~ **DONE**: all interactive REPL commands now route through service-layer APIs. Zero direct SQL (`rusqlite::prepare`/`query_row`/`execute`) remains in interactive.rs. New service functions: `svc_message_event_id_by_num_conn`, `svc_deleted_message_ids_conn`, `svc_reactions_for_message_conn`, `svc_remove_user_conn`, `svc_create_invite_conn`, `svc_create_device_link_invite_conn`. REPL retains only UX affordances (numeric aliases, author name display, channel labels).
 22. ~~`P2: Single-port multi-tenant endpoint — share one UDP port across tenants on the same device`~~ **DONE**: node now runs a single shared QUIC endpoint with multi-workspace cert resolution and per-tenant outbound isolation checks.
 
-## P0: Re-impose fixed-length event fields + langsec parser model
+## ~~P0: Re-impose fixed-length event fields + langsec parser model~~ DONE
 
 Evidence: current docs explicitly allow variable event payloads (`docs/DESIGN.md:60`, `docs/DESIGN.md:61`, `docs/PLAN.md:305`, `docs/PLAN.md:314`), and these event types currently parse variable-length payloads:
 
@@ -157,7 +157,7 @@ Completed:
 4. Docs updated: DESIGN.md, PLAN.md, projector_spec.md all aligned to single-authority model.
 5. All tests green (61 scenario, 21 transport_trust, 18 interactive, 2 low_mem).
 
-## P0: Remove `copy_event_chain` from interactive invite acceptance
+## ~~P0: Remove `copy_event_chain` from interactive invite acceptance~~ DONE
 
 Evidence: `src/interactive.rs:905`, `src/interactive.rs:1049`, `src/interactive.rs:1629`.
 
@@ -174,7 +174,7 @@ Acceptance:
 1. No direct event-copy call remains in interactive invite acceptance paths.
 2. `tests/interactive_test.rs` no longer validates copied-event behavior (`test_copy_event_chain_shared_only` should be removed/replaced).
 
-## P1: Stop direct SQL trust seeding in CLI invite-bootstrap test
+## ~~P1: Stop direct SQL trust seeding in CLI invite-bootstrap test~~ DONE
 
 Evidence: `tests/cli_test.rs:134`, `tests/cli_test.rs:160`, `tests/cli_test.rs:404`.
 
@@ -190,7 +190,7 @@ Acceptance:
 1. `tests/cli_test.rs` no longer calls direct trust-row seed helpers.
 2. Invite-bootstrap sync test passes through production invite APIs or CLI commands only.
 
-## P1: Replace prerequisite event copy in `Peer::new_in_workspace`
+## ~~P1: Replace prerequisite event copy in `Peer::new_in_workspace`~~ DONE
 
 Evidence: `src/testutil.rs:140`, `src/testutil.rs:157`, `src/testutil.rs:169`.
 
@@ -206,7 +206,7 @@ Acceptance:
 1. `new_in_workspace` contains no `insert_event`/`insert_recorded_event` calls.
 2. Hole-punch and other same-workspace integration tests still pass with real sync bootstrap.
 
-## P0: Make scenario replay invariants mandatory by default (opt-out only)
+## ~~P0: Make scenario replay invariants mandatory by default (opt-out only)~~ DONE
 
 Evidence:
 
@@ -236,7 +236,7 @@ Acceptance:
 2. Any omitted replay coverage is explicit and justified in the test definition.
 3. `tests/scenario_test.rs` no longer relies on ad-hoc optional replay calls for baseline coverage.
 
-## P1: Remove manual endpoint observation writes in hole-punch integration test
+## ~~P1: Remove manual endpoint observation writes in hole-punch integration test~~ DONE
 
 Evidence: `tests/holepunch_test.rs:296`, `tests/holepunch_test.rs:303`, `tests/holepunch_test.rs:307`.
 
@@ -263,7 +263,7 @@ Completed:
    - `tests/holepunch_test.rs` (stale/untrusted intro boundary cases),
    - `tests/scenario_test.rs` (tenant cert presentation and tenant-scoped outbound rejection).
 
-## P1: Deprecate `--pin-peer` from product code and design after invite-trust maturity
+## ~~P1: Deprecate `--pin-peer` from product code and design after invite-trust maturity~~ DONE
 
 Evidence: `--pin-peer` remains a first-class CLI surface (`src/main.rs:53`, `src/main.rs:184`, `src/bin/p7d.rs:38`), runtime guidance still points users to it (`src/main.rs:984`, `src/service.rs:1002`), and design still documents it as an overlay (`docs/DESIGN.md:117`).
 
@@ -291,7 +291,7 @@ Acceptance:
 3. `docs/DESIGN.md` and `docs/PLAN.md` no longer present `--pin-peer` as a normal steady-state mechanism.
 4. TLA/model boundary/mapping docs reflect the post-deprecation trust-source story.
 
-## P2: Resolve "disjoint trust sets" docs/code mismatch
+## ~~P2: Resolve "disjoint trust sets" docs/code mismatch~~ DONE
 
 Evidence:
 
@@ -325,7 +325,7 @@ Acceptance:
 2. A test exists for the chosen policy (overlap-allowed behavior or strict-disjoint rejection behavior).
 3. TLA invariants and mapping docs encode the chosen policy unambiguously.
 
-## P0: Enforce removal policy at transport runtime (deny + disconnect active sessions)
+## ~~P0: Enforce removal policy at transport runtime (deny + disconnect active sessions)~~ DONE
 
 Evidence:
 
@@ -366,7 +366,7 @@ Acceptance:
 3. Removal semantics are covered for both `peer_removed` and `user_removed`.
 4. TLA/model docs match runtime behavior.
 
-## P0: Bring scenario invariant harness fully in line with PLAN (fingerprints + full invariant set)
+## ~~P0: Bring scenario invariant harness fully in line with PLAN (fingerprints + full invariant set)~~ DONE
 
 Evidence:
 
@@ -431,7 +431,7 @@ Acceptance met:
 2. TLC/model checks pass. ✓
 3. Transport lifecycle naming unified with item-11 architecture. ✓
 
-## P1: Remove duplicated command/business logic between CLI (`main.rs`) and service layer (`service.rs`)
+## ~~P1: Remove duplicated command/business logic between CLI (`main.rs`) and service layer (`service.rs`)~~ DONE
 
 Evidence:
 
@@ -459,7 +459,7 @@ Acceptance:
 2. CLI path and service/API path share one business implementation per command, with CLI affordances limited to input/output adaptation.
 3. Regression tests cover CLI/service parity for core commands.
 
-## P1: Eliminate direct SQL access in CLI command paths where module APIs already exist
+## ~~P1: Eliminate direct SQL access in CLI command paths where module APIs already exist~~ DONE
 
 Evidence:
 

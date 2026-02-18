@@ -271,11 +271,11 @@ Rules:
 
 This preserves `poc-6`-style scoped reads/writes while keeping the schema ergonomic.
 
-**Known limitation:** The `neg_items` table (negentropy reconciliation index) is global — not scoped by tenant. A remote peer connecting to tenant A's endpoint will see event IDs from all tenants during negentropy, including tenant B in a different workspace. This is acceptable because multi-tenant nodes are single-operator (one person with multiple workspace memberships on one device). The operator already has direct DB access, and the stronger deanonymization signal — multiple tenants sharing the same IP address and mDNS advertisements — exists at the network layer regardless. Real pseudonym isolation requires separate nodes on separate network paths.
+**Known limitation:** The `neg_items` table (negentropy reconciliation index) is global — not scoped by tenant. A remote peer connecting to the shared endpoint and routed as tenant A can see event IDs from all tenants during negentropy, including tenant B in a different workspace. This is acceptable because multi-tenant nodes are single-operator (one person with multiple workspace memberships on one device). The operator already has direct DB access, and the stronger deanonymization signal — multiple tenants sharing the same IP address and mDNS advertisements — exists at the network layer regardless. Real pseudonym isolation requires separate nodes on separate network paths.
 
 ## 3.2.1 Functional multitenancy: one node, N tenants
 
-A single node process can host N tenant identities in one shared SQLite database, each with its own QUIC endpoint, workspace binding, and trust policy.
+A single node process can host N tenant identities in one shared SQLite database, with one shared QUIC endpoint plus tenant-scoped workspace binding and trust policy.
 
 The DB is the tenant registry. No explicit tenant registration step is required. The node discovers its tenants by joining two tables:
 
