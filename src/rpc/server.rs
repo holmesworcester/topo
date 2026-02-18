@@ -169,6 +169,45 @@ fn handle_connection(
     Ok(())
 }
 
+fn resolve_bootstrap_from_upnp(upnp: &crate::upnp::UpnpMappingReport) -> Result<String, String> {
+    if upnp.status != crate::upnp::UpnpMappingStatus::Success {
+        let status = match &upnp.status {
+            crate::upnp::UpnpMappingStatus::Success => "success",
+            crate::upnp::UpnpMappingStatus::Failed => "failed",
+            crate::upnp::UpnpMappingStatus::NotAttempted => "not_attempted",
+        };
+        let reason = upnp.error.as_deref().unwrap_or("unknown");
+        return Err(format!(
+            "no bootstrap address — UPnP status is {} ({}) — provide --bootstrap or run `topo upnp` first",
+            status, reason
+        ));
+    }
+
+    let (ip, port) = match (upnp.external_ip.as_deref(), upnp.mapped_external_port) {
+        (Some(ip), Some(port)) => (ip, port),
+        _ => {
+            return Err(
+                "no bootstrap address — provide --bootstrap or run `topo upnp` first".to_string(),
+            )
+        }
+    };
+
+    let parsed_ip: std::net::IpAddr = ip.parse().map_err(|_| {
+        format!(
+            "UPnP external IP is malformed ({}) — provide --bootstrap explicitly",
+            ip
+        )
+    })?;
+    if !crate::upnp::is_public_internet_ip(parsed_ip) {
+        return Err(format!(
+            "UPnP external IP {} is not publicly routable — provide --bootstrap explicitly",
+            ip
+        ));
+    }
+
+    Ok(std::net::SocketAddr::new(parsed_ip, port).to_string())
+}
+
 fn dispatch(
     state: &DaemonState,
     method: RpcMethod,
@@ -362,16 +401,10 @@ fn dispatch(
                     // Derive from UPnP result stored in daemon state.
                     let net = state.runtime_net.read().unwrap();
                     match net.as_ref().and_then(|n| n.upnp.as_ref()) {
-                        Some(upnp) => {
-                            match (upnp.external_ip.as_deref(), upnp.mapped_external_port) {
-                                (Some(ip), Some(port)) => format!("{}:{}", ip, port),
-                                _ => {
-                                    return RpcResponse::error(
-                                        "no bootstrap address — provide --bootstrap or run `topo upnp` first",
-                                    );
-                                }
-                            }
-                        }
+                        Some(upnp) => match resolve_bootstrap_from_upnp(upnp) {
+                            Ok(addr) => addr,
+                            Err(msg) => return RpcResponse::error(msg),
+                        },
                         None => {
                             return RpcResponse::error(
                                 "no bootstrap address — provide --bootstrap or run `topo upnp` first",
@@ -443,5 +476,61 @@ fn dispatch(
                 Err(e) => RpcResponse::error(e.to_string()),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_bootstrap_from_upnp;
+    use crate::upnp::{UpnpMappingReport, UpnpMappingStatus};
+
+    fn mk_report(
+        status: UpnpMappingStatus,
+        external_ip: Option<&str>,
+        mapped_external_port: Option<u16>,
+        error: Option<&str>,
+    ) -> UpnpMappingReport {
+        UpnpMappingReport {
+            status,
+            protocol: "udp".to_string(),
+            local_addr: "192.168.1.20:4433".to_string(),
+            requested_external_port: 4433,
+            mapped_external_port,
+            external_ip: external_ip.map(|s| s.to_string()),
+            gateway: Some("192.168.1.1:1900".to_string()),
+            error: error.map(|s| s.to_string()),
+            double_nat: false,
+        }
+    }
+
+    #[test]
+    fn bootstrap_resolution_rejects_non_success_status() {
+        let report = mk_report(
+            UpnpMappingStatus::NotAttempted,
+            None,
+            None,
+            Some("listen address is loopback"),
+        );
+        let err = resolve_bootstrap_from_upnp(&report).unwrap_err();
+        assert!(err.contains("UPnP status is not_attempted"));
+    }
+
+    #[test]
+    fn bootstrap_resolution_formats_ipv6_with_brackets() {
+        let report = mk_report(
+            UpnpMappingStatus::Success,
+            Some("2001:4860:4860::8888"),
+            Some(4433),
+            None,
+        );
+        let addr = resolve_bootstrap_from_upnp(&report).unwrap();
+        assert_eq!(addr, "[2001:4860:4860::8888]:4433");
+    }
+
+    #[test]
+    fn bootstrap_resolution_rejects_non_public_ip() {
+        let report = mk_report(UpnpMappingStatus::Success, Some("10.0.0.8"), Some(4433), None);
+        let err = resolve_bootstrap_from_upnp(&report).unwrap_err();
+        assert!(err.contains("not publicly routable"));
     }
 }

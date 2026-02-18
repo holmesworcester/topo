@@ -4,7 +4,7 @@
 //! local gateway via UPnP IGD. The result is purely informational — startup
 //! continues regardless of whether the mapping succeeds.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -34,8 +34,8 @@ pub struct UpnpMappingReport {
     pub gateway: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// True when UPnP succeeded but the gateway's external IP is a private
-    /// address, indicating double-NAT (e.g. behind CGNAT or a second router).
+    /// True when UPnP succeeded but the gateway's external IP is not publicly
+    /// routable, indicating double-NAT (e.g. behind CGNAT or a second router).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub double_nat: bool,
 }
@@ -70,24 +70,6 @@ impl UpnpMappingReport {
     }
 }
 
-/// Check whether an IP address is in a private/reserved range (RFC 1918, RFC 6598 CGNAT, etc.).
-fn is_private_ip(ip_str: &str) -> bool {
-    match ip_str.parse::<IpAddr>() {
-        Ok(IpAddr::V4(v4)) => {
-            v4.is_private()             // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
-            || v4.is_loopback()         // 127.0.0.0/8
-            || v4.is_link_local()       // 169.254.0.0/16
-            || v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64  // 100.64.0.0/10 (CGNAT)
-        }
-        Ok(IpAddr::V6(v6)) => {
-            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| {
-                v4.is_private() || v4.is_loopback() || v4.is_link_local()
-            })
-        }
-        Err(_) => false,
-    }
-}
-
 /// Discover the LAN IP the OS would use to reach the public internet.
 ///
 /// Reuses the same UDP-connect trick from `discovery.rs`.
@@ -95,6 +77,77 @@ fn discover_lan_ip() -> Option<IpAddr> {
     let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.connect("8.8.8.8:80").ok()?;
     Some(socket.local_addr().ok()?.ip())
+}
+
+fn is_public_ipv4(ip: Ipv4Addr) -> bool {
+    let o = ip.octets();
+    // RFC1918 private ranges.
+    if o[0] == 10 || (o[0] == 172 && (16..=31).contains(&o[1])) || (o[0] == 192 && o[1] == 168) {
+        return false;
+    }
+    // Loopback, link-local, multicast/reserved, unspecified, broadcast.
+    if o[0] == 127
+        || (o[0] == 169 && o[1] == 254)
+        || o[0] >= 224
+        || o[0] == 0
+        || (o[0] == 255 && o[1] == 255 && o[2] == 255 && o[3] == 255)
+    {
+        return false;
+    }
+    // Carrier-grade NAT (100.64.0.0/10).
+    if o[0] == 100 && (64..=127).contains(&o[1]) {
+        return false;
+    }
+    // Benchmarking range (198.18.0.0/15).
+    if o[0] == 198 && (o[1] == 18 || o[1] == 19) {
+        return false;
+    }
+    // Documentation/test ranges.
+    if (o[0] == 192 && o[1] == 0 && o[2] == 2)
+        || (o[0] == 198 && o[1] == 51 && o[2] == 100)
+        || (o[0] == 203 && o[1] == 0 && o[2] == 113)
+    {
+        return false;
+    }
+    true
+}
+
+fn is_public_ipv6(ip: Ipv6Addr) -> bool {
+    if let Some(v4) = ip.to_ipv4() {
+        return is_public_ipv4(v4);
+    }
+    if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() {
+        return false;
+    }
+    let s = ip.segments();
+    // fc00::/7 unique local.
+    if (s[0] & 0xfe00) == 0xfc00 {
+        return false;
+    }
+    // fe80::/10 link-local.
+    if (s[0] & 0xffc0) == 0xfe80 {
+        return false;
+    }
+    // 2001:db8::/32 documentation range.
+    if s[0] == 0x2001 && s[1] == 0x0db8 {
+        return false;
+    }
+    true
+}
+
+pub fn is_public_internet_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_public_ipv4(v4),
+        IpAddr::V6(v6) => is_public_ipv6(v6),
+    }
+}
+
+fn external_ip_not_public(external_ip: &Option<String>) -> bool {
+    external_ip
+        .as_deref()
+        .and_then(|ip| ip.parse::<IpAddr>().ok())
+        .map(|ip| !is_public_internet_ip(ip))
+        .unwrap_or(false)
 }
 
 /// Attempt a UDP port mapping via UPnP IGD.
@@ -109,8 +162,18 @@ pub async fn attempt_udp_port_mapping(
 ) -> UpnpMappingReport {
     let port = local_bind.port();
 
+    // Mapping loopback listeners is misleading: traffic is forwarded to LAN IP:port,
+    // but a loopback-bound daemon only accepts 127.0.0.1 traffic.
+    if local_bind.ip().is_loopback() {
+        return UpnpMappingReport::not_attempted(
+            local_bind,
+            port,
+            "listen address is loopback; restart with --bind 0.0.0.0:<port> for UPnP",
+        );
+    }
+
     // Determine the LAN IP to use for the mapping target.
-    let lan_ip = if local_bind.ip().is_unspecified() || local_bind.ip().is_loopback() {
+    let lan_ip = if local_bind.ip().is_unspecified() {
         match discover_lan_ip() {
             Some(ip) => ip,
             None => {
@@ -177,10 +240,10 @@ pub async fn attempt_udp_port_mapping(
         .await
     {
         Ok(()) => {
-            let double_nat = external_ip.as_deref().is_some_and(is_private_ip);
+            let double_nat = external_ip_not_public(&external_ip);
             if double_nat {
                 warn!(
-                    "UPnP: double-NAT detected — gateway external IP {} is private",
+                    "UPnP: double-NAT detected — gateway external IP {} is not publicly routable",
                     external_ip.as_deref().unwrap_or("?")
                 );
             }
@@ -216,10 +279,10 @@ pub async fn attempt_udp_port_mapping(
         .await
     {
         Ok(mapped_port) => {
-            let double_nat = external_ip.as_deref().is_some_and(is_private_ip);
+            let double_nat = external_ip_not_public(&external_ip);
             if double_nat {
                 warn!(
-                    "UPnP: double-NAT detected — gateway external IP {} is private",
+                    "UPnP: double-NAT detected — gateway external IP {} is not publicly routable",
                     external_ip.as_deref().unwrap_or("?")
                 );
             }
@@ -321,15 +384,14 @@ mod tests {
     }
 
     #[test]
-    fn double_nat_detected_for_private_external_ip() {
-        assert!(is_private_ip("10.0.0.88"));
-        assert!(is_private_ip("192.168.1.1"));
-        assert!(is_private_ip("172.16.0.1"));
-        assert!(is_private_ip("100.64.0.1"));   // CGNAT
-        assert!(is_private_ip("127.0.0.1"));
-        assert!(!is_private_ip("203.0.113.5"));
-        assert!(!is_private_ip("73.15.131.63"));
-        assert!(!is_private_ip("8.8.8.8"));
+    fn external_ip_not_public_detects_double_nat_like_conditions() {
+        assert!(external_ip_not_public(&Some("10.0.0.88".into())));
+        assert!(external_ip_not_public(&Some("100.64.0.1".into()))); // CGNAT
+        assert!(external_ip_not_public(&Some("fd12::1".into())));
+        assert!(!external_ip_not_public(&Some("8.8.8.8".into())));
+        assert!(!external_ip_not_public(&Some(
+            "2001:4860:4860::8888".into()
+        )));
     }
 
     #[test]
@@ -365,5 +427,37 @@ mod tests {
             assert!(!ip.is_loopback(), "LAN IP should not be loopback");
             assert!(!ip.is_unspecified(), "LAN IP should not be unspecified");
         }
+    }
+
+    #[test]
+    fn public_ip_classifier_filters_private_and_cgnat() {
+        assert!(!is_public_internet_ip("10.0.0.88".parse().unwrap()));
+        assert!(!is_public_internet_ip("100.64.10.20".parse().unwrap()));
+        assert!(!is_public_internet_ip("127.0.0.1".parse().unwrap()));
+        assert!(is_public_internet_ip("8.8.8.8".parse().unwrap()));
+    }
+
+    #[test]
+    fn public_ip_classifier_filters_non_global_ipv6() {
+        assert!(!is_public_internet_ip("::1".parse().unwrap()));
+        assert!(!is_public_internet_ip("fd12::1".parse().unwrap()));
+        assert!(!is_public_internet_ip("fe80::1".parse().unwrap()));
+        assert!(is_public_internet_ip(
+            "2001:4860:4860::8888".parse().unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn loopback_listener_skips_mapping() {
+        let report = attempt_udp_port_mapping(
+            "127.0.0.1:4433".parse().unwrap(),
+            Duration::from_millis(200),
+        )
+        .await;
+        assert_eq!(report.status, UpnpMappingStatus::NotAttempted);
+        assert_eq!(
+            report.error.as_deref(),
+            Some("listen address is loopback; restart with --bind 0.0.0.0:<port> for UPnP")
+        );
     }
 }

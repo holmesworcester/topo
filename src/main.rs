@@ -191,11 +191,13 @@ enum Commands {
     CreateInvite {
         /// Bootstrap address (host:port) to embed in invite link.
         /// If omitted, auto-derived from UPnP result (run `topo upnp` first).
+        /// Auto-derivation requires a publicly routable UPnP external IP.
         #[arg(long)]
         bootstrap: Option<String>,
     },
 
-    /// Attempt UPnP port forwarding for the daemon's QUIC listen port
+    /// Attempt UPnP port forwarding for the daemon's QUIC listen port.
+    /// Requires daemon listening on non-loopback (for example `--bind 0.0.0.0:...`).
     Upnp,
 }
 
@@ -497,6 +499,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             let err = upnp["error"].as_str().unwrap_or("unknown");
                             println!("  UPnP:      failed ({})", err);
                         }
+                        "not_attempted" => {
+                            let err = upnp["error"].as_str().unwrap_or("unknown");
+                            println!("  UPnP:      not attempted ({})", err);
+                        }
                         _ => {
                             println!("  UPnP:      not attempted");
                         }
@@ -776,7 +782,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         ext_port, ext_ip
                     );
                     if data["double_nat"].as_bool().unwrap_or(false) {
-                        println!("warning: double-NAT detected — external IP {} is private; port forwarding may not be reachable from the internet", ext_ip);
+                        println!("warning: double-NAT detected — external IP {} is not publicly routable; port forwarding may not be reachable from the internet", ext_ip);
                     }
                 }
                 "failed" => {

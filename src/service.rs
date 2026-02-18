@@ -1524,10 +1524,13 @@ pub async fn svc_accept_invite(
     .map_err(|e| ServiceError(format!("Failed to install bootstrap identity: {}", e)))?;
 
     // Bootstrap sync: fetch prerequisite events from inviter
-    let bootstrap_addr: std::net::SocketAddr = invite
-        .bootstrap_addr
-        .parse()
-        .map_err(|e| ServiceError(format!("Invalid bootstrap address '{}': {}", invite.bootstrap_addr, e)))?;
+    let bootstrap_addr: std::net::SocketAddr =
+        crate::invite_link::resolve_bootstrap_socket_addr(&invite).map_err(|e| {
+            ServiceError(format!(
+                "Invalid bootstrap address '{}': {}",
+                invite.bootstrap_addr, e
+            ))
+        })?;
 
     crate::sync::bootstrap::bootstrap_sync_from_invite(
         db_path,
@@ -1654,10 +1657,13 @@ pub async fn svc_accept_device_link(
     .map_err(|e| ServiceError(format!("Failed to install bootstrap identity: {}", e)))?;
 
     // Bootstrap sync: fetch prerequisite events from inviter
-    let bootstrap_addr: std::net::SocketAddr = invite
-        .bootstrap_addr
-        .parse()
-        .map_err(|e| ServiceError(format!("Invalid bootstrap address '{}': {}", invite.bootstrap_addr, e)))?;
+    let bootstrap_addr: std::net::SocketAddr =
+        crate::invite_link::resolve_bootstrap_socket_addr(&invite).map_err(|e| {
+            ServiceError(format!(
+                "Invalid bootstrap address '{}': {}",
+                invite.bootstrap_addr, e
+            ))
+        })?;
 
     crate::sync::bootstrap::bootstrap_sync_from_invite(
         db_path,
