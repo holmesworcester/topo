@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 /// Dispatch decision for a discovered peer.
 #[derive(Debug, PartialEq)]
@@ -40,12 +40,18 @@ struct PeerDispatcher {
 
 impl PeerDispatcher {
     fn new() -> Self {
-        Self { known: HashMap::new() }
+        Self {
+            known: HashMap::new(),
+        }
     }
 
     /// Evaluate a discovery event. Returns the action to take and (for Connect/Reconnect)
     /// a watch::Receiver that will be signalled when this entry is superseded.
-    fn dispatch(&mut self, peer_id: &str, addr: SocketAddr) -> (DiscoveryAction, Option<tokio::sync::watch::Receiver<()>>) {
+    fn dispatch(
+        &mut self,
+        peer_id: &str,
+        addr: SocketAddr,
+    ) -> (DiscoveryAction, Option<tokio::sync::watch::Receiver<()>>) {
         if let Some((prev_addr, _)) = self.known.get(peer_id) {
             if *prev_addr == addr {
                 return (DiscoveryAction::Skip, None);
@@ -63,14 +69,15 @@ impl PeerDispatcher {
     }
 }
 
-use crate::db::{open_connection, schema::create_tables};
+use crate::contracts::network_contract::{PeerFingerprint, TenantId, TrustDecision};
 use crate::db::transport_creds::{discover_local_tenants, list_local_peers, load_local_creds};
-use crate::db::transport_trust::{is_peer_allowed, list_active_invite_bootstrap_addrs};
-use crate::sync::engine::{IngestItem, accept_loop_with_ingest, batch_writer};
+use crate::db::transport_trust::list_active_invite_bootstrap_addrs;
+use crate::db::{open_connection, schema::create_tables};
+use crate::sync::engine::{accept_loop_with_ingest, batch_writer, IngestItem};
 use crate::transport::{
     create_single_port_endpoint, extract_spki_fingerprint,
-    multi_workspace::{WorkspaceCertResolver, workspace_sni},
-    workspace_client_config, DynamicAllowFn,
+    multi_workspace::{workspace_sni, WorkspaceCertResolver},
+    workspace_client_config, DynamicAllowFn, SqliteTrustOracle,
 };
 use rustls::sign::CertifiedKey;
 
@@ -80,12 +87,14 @@ fn normalize_discovered_addr_for_local_bind(
 ) -> SocketAddr {
     if local_listen_ip.is_loopback() && !discovered.ip().is_loopback() {
         match discovered {
-            SocketAddr::V4(v4) => {
-                SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), v4.port())
-            }
-            SocketAddr::V6(v6) => {
-                SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), v6.port())
-            }
+            SocketAddr::V4(v4) => SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                v4.port(),
+            ),
+            SocketAddr::V6(v6) => SocketAddr::new(
+                std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+                v6.port(),
+            ),
         }
     } else {
         discovered
@@ -107,7 +116,8 @@ fn spawn_connect_loop_thread(
             .unwrap();
         rt.block_on(async move {
             if let Err(e) =
-                crate::sync::engine::connect_loop(&db_path, &tenant_id, endpoint, remote, Some(cfg)).await
+                crate::sync::engine::connect_loop(&db_path, &tenant_id, endpoint, remote, Some(cfg))
+                    .await
             {
                 warn!(
                     "{} connect_loop for {} to {} exited: {}",
@@ -175,11 +185,14 @@ fn build_tenant_client_config(
 
     let cert_der = rustls::pki_types::CertificateDer::from(cert_der);
     let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(key_der);
-    let db_path_t = db_path.to_string();
-    let tid = tenant_id.to_string();
+    let oracle = SqliteTrustOracle::new(db_path);
+    let tid = TenantId(tenant_id.to_string());
     let tenant_allow: Arc<DynamicAllowFn> = Arc::new(move |peer_fp: &[u8; 32]| {
-        let db = open_connection(&db_path_t)?;
-        is_peer_allowed(&db, &tid, peer_fp)
+        match oracle.check_sync(&tid, &PeerFingerprint(*peer_fp)) {
+            Ok(TrustDecision::Allow) => Ok(true),
+            Ok(TrustDecision::Deny) => Ok(false),
+            Err(e) => Err(e.to_string().into()),
+        }
     });
     workspace_client_config(cert_der, key_der, tenant_allow)
 }
@@ -262,7 +275,10 @@ pub async fn run_node(
     // Map: peer_id → workspace_id (for post-handshake tenant resolution)
     let mut peer_to_workspace: HashMap<String, String> = HashMap::new();
     // Keep first tenant's cert/key for the default client config
-    let mut default_cert: Option<(rustls::pki_types::CertificateDer<'static>, rustls::pki_types::PrivatePkcs8KeyDer<'static>)> = None;
+    let mut default_cert: Option<(
+        rustls::pki_types::CertificateDer<'static>,
+        rustls::pki_types::PrivatePkcs8KeyDer<'static>,
+    )> = None;
 
     for tenant in &tenants {
         // Verify SPKI fingerprint matches peer_id
@@ -320,22 +336,21 @@ pub async fn run_node(
         );
     }
 
-    let (default_cert_der, default_key_der) = default_cert
-        .ok_or("No valid tenant certs found")?;
+    let (default_cert_der, default_key_der) = default_cert.ok_or("No valid tenant certs found")?;
 
     // Union trust closure for inbound (server) connections: accept if ANY tenant trusts
     // the remote. Per-tenant outbound trust is handled by tenant_client_configs below.
-    let db_path_trust = db_path.to_string();
+    let trust_oracle = SqliteTrustOracle::new(db_path);
     let tenant_peer_ids: Vec<String> = tenants.iter().map(|t| t.peer_id.clone()).collect();
     let dynamic_allow: Arc<
-        dyn Fn(&[u8; 32]) -> Result<bool, Box<dyn std::error::Error + Send + Sync>>
-            + Send
-            + Sync,
+        dyn Fn(&[u8; 32]) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> + Send + Sync,
     > = Arc::new(move |peer_fp: &[u8; 32]| {
-        let db = open_connection(&db_path_trust)?;
         for tenant_id in &tenant_peer_ids {
-            if is_peer_allowed(&db, tenant_id, peer_fp)? {
-                return Ok(true);
+            match trust_oracle.check_sync(&TenantId(tenant_id.clone()), &PeerFingerprint(*peer_fp))
+            {
+                Ok(TrustDecision::Allow) => return Ok(true),
+                Ok(TrustDecision::Deny) => {}
+                Err(e) => return Err(e.to_string().into()),
             }
         }
         Ok(false)
@@ -363,15 +378,24 @@ pub async fn run_node(
     for tenant in &tenants {
         let cert_der = rustls::pki_types::CertificateDer::from(tenant.cert_der.clone());
         let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(tenant.key_der.clone());
-        let db_path_t = db_path.to_string();
-        let tid = tenant.peer_id.clone();
+        let oracle = SqliteTrustOracle::new(db_path);
+        let tid = TenantId(tenant.peer_id.clone());
         let tenant_allow: Arc<DynamicAllowFn> = Arc::new(move |peer_fp: &[u8; 32]| {
-            let db = open_connection(&db_path_t)?;
-            is_peer_allowed(&db, &tid, peer_fp)
+            match oracle.check_sync(&tid, &PeerFingerprint(*peer_fp)) {
+                Ok(TrustDecision::Allow) => Ok(true),
+                Ok(TrustDecision::Deny) => Ok(false),
+                Err(e) => Err(e.to_string().into()),
+            }
         });
         match workspace_client_config(cert_der, key_der, tenant_allow) {
-            Ok(cfg) => { tenant_client_configs.insert(tenant.peer_id.clone(), cfg); }
-            Err(e) => warn!("Failed to build client config for {}: {}", &tenant.peer_id[..16], e),
+            Ok(cfg) => {
+                tenant_client_configs.insert(tenant.peer_id.clone(), cfg);
+            }
+            Err(e) => warn!(
+                "Failed to build client config for {}: {}",
+                &tenant.peer_id[..16],
+                e
+            ),
         }
     }
 
@@ -403,8 +427,7 @@ pub async fn run_node(
         // discovered non-loopback addresses back to loopback when the
         // local daemon is bound to loopback.
         let advertise_ip = if local_addr.ip().is_unspecified() || local_addr.ip().is_loopback() {
-            crate::discovery::local_non_loopback_ipv4()
-                .unwrap_or_else(|| "0.0.0.0".to_string())
+            crate::discovery::local_non_loopback_ipv4().unwrap_or_else(|| "0.0.0.0".to_string())
         } else {
             local_addr.ip().to_string()
         };
@@ -423,14 +446,18 @@ pub async fn run_node(
                             let db_path_disc = db_path.to_string();
                             let tenant_id = tenant.peer_id.clone();
                             let local_listen_ip_for_thread = local_listen_ip;
-                            let disc_client_cfg = match tenant_client_configs.get(&tenant.peer_id).cloned() {
-                                Some(c) => c,
-                                None => {
-                                    warn!("Skipping mDNS browse for {}: no client config", &tenant.peer_id[..16]);
-                                    _discovery_handles.push(disc);
-                                    continue;
-                                }
-                            };
+                            let disc_client_cfg =
+                                match tenant_client_configs.get(&tenant.peer_id).cloned() {
+                                    Some(c) => c,
+                                    None => {
+                                        warn!(
+                                            "Skipping mDNS browse for {}: no client config",
+                                            &tenant.peer_id[..16]
+                                        );
+                                        _discovery_handles.push(disc);
+                                        continue;
+                                    }
+                                };
                             std::thread::spawn(move || {
                                 let mut dispatcher = PeerDispatcher::new();
                                 while let Ok(peer) = rx.recv() {
@@ -438,7 +465,8 @@ pub async fn run_node(
                                         local_listen_ip_for_thread,
                                         peer.addr,
                                     );
-                                    let (action, cancel_rx) = dispatcher.dispatch(&peer.peer_id, dial_addr);
+                                    let (action, cancel_rx) =
+                                        dispatcher.dispatch(&peer.peer_id, dial_addr);
                                     match action {
                                         DiscoveryAction::Skip => continue,
                                         DiscoveryAction::Reconnect => {
@@ -484,7 +512,11 @@ pub async fn run_node(
                     }
                     _discovery_handles.push(disc);
                 }
-                Err(e) => warn!("mDNS registration failed for {}: {}", &tenant.peer_id[..16], e),
+                Err(e) => warn!(
+                    "mDNS registration failed for {}: {}",
+                    &tenant.peer_id[..16],
+                    e
+                ),
             }
         }
     }

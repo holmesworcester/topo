@@ -1,3 +1,4 @@
+pub mod contracts;
 pub mod crypto;
 pub mod db;
 #[cfg(feature = "discovery")]

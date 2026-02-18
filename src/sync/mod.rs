@@ -1,6 +1,7 @@
 pub mod protocol;
 pub mod negentropy_sqlite;
 pub mod engine;
+pub mod session_handler;
 pub mod bootstrap;
 pub mod intro;
 pub mod punch;
