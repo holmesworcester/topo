@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use rusqlite::Connection;
 
 fn bin() -> String {
@@ -57,8 +58,34 @@ fn start_daemon_with_options(db: &str, bind_port: u16, disable_placeholder_autod
         "daemon socket did not appear at {}",
         socket.display()
     );
+    wait_for_daemon_ready(db, Duration::from_secs(15));
 
     child
+}
+
+fn wait_for_daemon_ready(db: &str, timeout: Duration) {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        let out = Command::new(bin())
+            .arg("--db")
+            .arg(db)
+            .arg("status")
+            .output();
+        if let Ok(output) = out {
+            if output.status.success() {
+                return;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("daemon did not become ready for RPC within {:?}", timeout);
+}
+
+fn cli_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn start_daemon(db: &str, bind_port: u16) -> Child {
@@ -194,6 +221,7 @@ fn count_rows(db: &str, table: &str) -> i64 {
 /// Both send messages in the shared workspace.
 #[test]
 fn test_cli_bidirectional_sync() {
+    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
     let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
@@ -251,6 +279,7 @@ fn test_cli_bidirectional_sync() {
 /// Verifies sync picks up new messages over time (ongoing sync).
 #[test]
 fn test_cli_ongoing_sync() {
+    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
     let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
@@ -295,6 +324,7 @@ fn test_cli_ongoing_sync() {
 /// even when invite-seeded placeholder autodial is disabled.
 #[test]
 fn test_cli_local_mdns_discovery_without_placeholder_autodial() {
+    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
     let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
@@ -329,6 +359,7 @@ fn test_cli_local_mdns_discovery_without_placeholder_autodial() {
 
 #[test]
 fn test_cli_send_and_messages() {
+    let _guard = cli_test_lock();
     // Basic test: create workspace, start daemon, send/messages work
     let tmpdir = tempfile::tempdir().unwrap();
     let db = tmpdir.path().join("test.db").to_str().unwrap().to_string();
@@ -357,6 +388,7 @@ fn test_cli_send_and_messages() {
 /// Bob has independent identity (not in Alice's workspace). Alice should reject Bob.
 #[test]
 fn test_cli_unpinned_peer_rejected() {
+    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
     let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
@@ -391,6 +423,7 @@ fn test_cli_unpinned_peer_rejected() {
 /// TRUST POLICY TEST: sync with no trusted peers is rejected at startup.
 #[test]
 fn test_cli_sync_without_trust_fails() {
+    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let db = tmpdir
         .path()
@@ -430,6 +463,7 @@ fn test_cli_sync_without_trust_fails() {
 /// then creates the full identity chain and records transport trust.
 #[test]
 fn test_cli_sync_bootstrap_from_accepted_invite_data() {
+    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let alice_db = tmpdir
         .path()
