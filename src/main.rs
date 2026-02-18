@@ -483,9 +483,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 .map(|p| p.to_string())
                                 .unwrap_or_else(|| "?".into());
                             let ext_ip = upnp["external_ip"].as_str().unwrap_or("unknown");
+                            let nat_tag = if upnp["double_nat"].as_bool().unwrap_or(false) {
+                                " (double-NAT!)"
+                            } else {
+                                ""
+                            };
                             println!(
-                                "  UPnP:      success udp external_port={} external_ip={}",
-                                ext_port, ext_ip
+                                "  UPnP:      success udp external_port={} external_ip={}{}",
+                                ext_port, ext_ip, nat_tag
                             );
                         }
                         "failed" => {
@@ -770,6 +775,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         "upnp: success udp external_port={} external_ip={}",
                         ext_port, ext_ip
                     );
+                    if data["double_nat"].as_bool().unwrap_or(false) {
+                        println!("warning: double-NAT detected — external IP {} is private; port forwarding may not be reachable from the internet", ext_ip);
+                    }
                 }
                 "failed" => {
                     let err = data["error"].as_str().unwrap_or("unknown reason");
