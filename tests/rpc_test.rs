@@ -144,9 +144,28 @@ fn rpc_all_methods_serialize() {
         RpcMethod::ActivePeer,
         RpcMethod::CreateWorkspace,
         RpcMethod::CreateInvite {
-            bootstrap: Some("127.0.0.1:4433".into()),
+            public_addr: "127.0.0.1:4433".into(),
+            public_spki: None,
         },
-        RpcMethod::CreateInvite { bootstrap: None },
+        RpcMethod::CreateDeviceLink {
+            public_addr: "127.0.0.1:4433".into(),
+            public_spki: None,
+        },
+        RpcMethod::AcceptLink {
+            invite: "quiet://link/test".into(),
+            devicename: "device".into(),
+        },
+        RpcMethod::Ban {
+            target: "1".into(),
+        },
+        RpcMethod::Identity,
+        RpcMethod::Channels,
+        RpcMethod::NewChannel {
+            name: "general".into(),
+        },
+        RpcMethod::UseChannel {
+            selector: "1".into(),
+        },
         RpcMethod::AcceptInvite {
             invite: "quiet://invite/test".into(),
             username: "user".into(),
@@ -583,4 +602,136 @@ fn shutdown_handler_does_not_call_process_exit() {
         !server_source.contains("process::exit"),
         "RPC server must not call process::exit; use coordinated shutdown instead"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 6. New RPC method tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rpc_identity_command() {
+    let (_dir, db) = temp_db();
+    let socket = socket_path_for_db(&db);
+
+    // Create workspace (identity chain) so daemon can start.
+    create_workspace(&db);
+
+    // Start daemon in background.
+    let mut daemon = Command::new(bin())
+        .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
+        .spawn()
+        .unwrap();
+
+    let start = std::time::Instant::now();
+    while !socket.exists() && start.elapsed().as_secs() < 5 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    // Query identity via CLI
+    let out = Command::new(bin())
+        .args(["--db", &db, "identity"])
+        .output()
+        .unwrap();
+
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+
+    assert!(out.status.success(), "identity failed: {:?}", out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("IDENTITY:"), "should contain IDENTITY header");
+    assert!(stdout.contains("Transport:"), "should contain Transport line");
+    assert!(stdout.contains("User:"), "should contain User line");
+    assert!(stdout.contains("Peer:"), "should contain Peer line");
+}
+
+#[test]
+fn rpc_channel_lifecycle() {
+    let (_dir, db) = temp_db();
+    let socket = socket_path_for_db(&db);
+
+    create_workspace(&db);
+
+    let mut daemon = Command::new(bin())
+        .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
+        .spawn()
+        .unwrap();
+
+    let start = std::time::Instant::now();
+    while !socket.exists() && start.elapsed().as_secs() < 5 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    // List channels — should have "general" by default
+    let out = Command::new(bin())
+        .args(["--db", &db, "channels"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("general"), "should have default 'general' channel, got: {}", stdout);
+
+    // Create a new channel
+    let out = Command::new(bin())
+        .args(["--db", &db, "new-channel", "random"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("random"), "should show new channel name");
+
+    // Switch to the new channel
+    let out = Command::new(bin())
+        .args(["--db", &db, "channel", "2"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("random"), "should show switched channel name");
+
+    // Verify channels list now shows 2
+    let out = Command::new(bin())
+        .args(["--db", &db, "channels"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("general"), "should still have general");
+    assert!(stdout.contains("random"), "should also have random");
+
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+}
+
+#[test]
+fn rpc_invite_ref_resolution() {
+    let (_dir, db) = temp_db();
+    let socket = socket_path_for_db(&db);
+
+    create_workspace(&db);
+
+    let mut daemon = Command::new(bin())
+        .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
+        .spawn()
+        .unwrap();
+
+    let start = std::time::Instant::now();
+    while !socket.exists() && start.elapsed().as_secs() < 5 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    // Create invite — should get ref #1
+    let out = Command::new(bin())
+        .args(["--db", &db, "create-invite", "--public-addr", "127.0.0.1:4433"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "create-invite failed: {:?}", out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("#1") || stdout.contains("quiet://"),
+        "should show invite ref or link, got: {}",
+        stdout
+    );
+
+    let _ = daemon.kill();
+    let _ = daemon.wait();
 }

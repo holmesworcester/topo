@@ -422,6 +422,69 @@ pub fn load_local_peer_signer_pub(
     Ok(None)
 }
 
+// ---------------------------------------------------------------------------
+// local_user_keys table — persists user signing keys for daemon device-link
+// ---------------------------------------------------------------------------
+
+fn ensure_local_user_key_table(db: &rusqlite::Connection) -> ServiceResult<()> {
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS local_user_keys (
+            recorded_by TEXT PRIMARY KEY,
+            event_id TEXT NOT NULL,
+            signing_key BLOB NOT NULL,
+            updated_at INTEGER NOT NULL
+        )",
+        [],
+    )?;
+    Ok(())
+}
+
+pub fn persist_local_user_key(
+    db: &rusqlite::Connection,
+    recorded_by: &str,
+    event_id_b64: &str,
+    user_key: &SigningKey,
+) -> ServiceResult<()> {
+    ensure_local_user_key_table(db)?;
+    let now = current_timestamp_ms() as i64;
+    db.execute(
+        "INSERT INTO local_user_keys (recorded_by, event_id, signing_key, updated_at)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(recorded_by)
+         DO UPDATE SET event_id = excluded.event_id,
+                       signing_key = excluded.signing_key,
+                       updated_at = excluded.updated_at",
+        rusqlite::params![
+            recorded_by,
+            event_id_b64,
+            user_key.to_bytes().as_slice(),
+            now
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn load_local_user_key(
+    db: &rusqlite::Connection,
+    recorded_by: &str,
+) -> ServiceResult<Option<(EventId, SigningKey)>> {
+    ensure_local_user_key_table(db)?;
+    if let Some((eid_b64, key_bytes)) = db
+        .query_row(
+            "SELECT event_id, signing_key FROM local_user_keys WHERE recorded_by = ?1",
+            rusqlite::params![recorded_by],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
+        .optional()?
+    {
+        let signing_key = decode_signing_key(key_bytes)?;
+        let eid = event_id_from_base64(&eid_b64)
+            .ok_or_else(|| ServiceError("bad local user key event_id".into()))?;
+        return Ok(Some((eid, signing_key)));
+    }
+    Ok(None)
+}
+
 pub fn svc_bootstrap_workspace_conn(
     db: &rusqlite::Connection,
     recorded_by: &str,
@@ -505,6 +568,10 @@ pub fn ensure_identity_chain(
 
     let psf_b64 = event_id_to_base64(&psf_eid);
     persist_local_peer_signer(db, recorded_by, &psf_b64, &peer_shared_key)?;
+
+    // Persist user key for later device-link creation
+    let ub_b64 = event_id_to_base64(&ub_eid);
+    persist_local_user_key(db, recorded_by, &ub_b64, &user_key)?;
 
     // Seed deterministic local content-key material used by invite key-wrap.
     let _ = crate::identity_ops::ensure_content_key_for_peer(
@@ -964,7 +1031,7 @@ pub fn svc_react_for_peer(
     let (recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
 
     let (signer_eid, signing_key) = require_local_peer_signer(&db, &recorded_by)?;
-    let target_event_id = parse_hex_event_id(target_hex)?;
+    let target_event_id = resolve_message_selector(&db, &recorded_by, target_hex)?;
     let author_id = stable_author_id(&recorded_by);
 
     svc_react_conn(&db, &recorded_by, &signer_eid, &signing_key, author_id, target_event_id, emoji)
@@ -1002,10 +1069,50 @@ pub fn svc_delete_message_for_peer(
     let (recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
 
     let (signer_eid, signing_key) = require_local_peer_signer(&db, &recorded_by)?;
-    let target_event_id = parse_hex_event_id(target_hex)?;
+    let target_event_id = resolve_message_selector(&db, &recorded_by, target_hex)?;
     let author_id = stable_author_id(&recorded_by);
 
     svc_delete_message_conn(&db, &recorded_by, &signer_eid, &signing_key, author_id, target_event_id)
+}
+
+/// Resolve a message selector: `N`, `#N` (1-based message number), or raw hex event ID.
+fn resolve_message_selector(
+    db: &rusqlite::Connection,
+    recorded_by: &str,
+    selector: &str,
+) -> ServiceResult<[u8; 32]> {
+    let stripped = selector.strip_prefix('#').unwrap_or(selector);
+    if let Ok(num) = stripped.parse::<usize>() {
+        if num == 0 {
+            return Err(ServiceError("message number must be >= 1".into()));
+        }
+        // Query messages in same order as svc_messages_conn, pick the N-th (1-based).
+        let mut stmt = db.prepare(
+            "SELECT message_id FROM messages WHERE recorded_by = ?1 ORDER BY created_at ASC, rowid ASC LIMIT 1 OFFSET ?2"
+        )?;
+        let msg_id_b64: Option<String> = stmt
+            .query_row(rusqlite::params![recorded_by, num - 1], |row| row.get(0))
+            .ok();
+        match msg_id_b64 {
+            Some(b64) => {
+                let hex_id = base64_to_hex(&b64);
+                parse_hex_event_id(&hex_id)
+            }
+            None => {
+                let total: i64 = db.query_row(
+                    "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
+                    rusqlite::params![recorded_by],
+                    |row| row.get(0),
+                )?;
+                Err(ServiceError(format!(
+                    "invalid message number {}; available: 1-{}",
+                    num, total
+                )))
+            }
+        }
+    } else {
+        parse_hex_event_id(selector)
+    }
 }
 
 pub fn svc_reactions_conn(db: &rusqlite::Connection, recorded_by: &str) -> ServiceResult<Vec<ReactionItem>> {
@@ -1589,6 +1696,10 @@ pub async fn svc_accept_invite(
     let psf_b64 = event_id_to_base64(&join.peer_shared_event_id);
     persist_local_peer_signer(&db, &recorded_by, &psf_b64, &join.peer_shared_key)?;
 
+    // Persist user key for device-link creation
+    let ub_b64 = event_id_to_base64(&join.user_event_id);
+    persist_local_user_key(&db, &recorded_by, &ub_b64, &join.user_key)?;
+
     // Push identity chain events back to inviter (while still using invite-derived
     // cert, which the inviter trusts via pending_invite_bootstrap_trust). This ensures
     // the inviter has our PeerShared event before we transition transport identity.
@@ -1769,6 +1880,213 @@ pub fn persist_workspace_key(
 }
 
 // ---------------------------------------------------------------------------
+// Response types for new daemon commands
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct IdentityResponse {
+    pub transport_fingerprint: String,
+    pub user_event_id: Option<String>,
+    pub peer_shared_event_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BanResponse {
+    pub target: String,
+    pub banned: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Daemon-usable service wrappers (operate on peer_id, load keys from DB)
+// ---------------------------------------------------------------------------
+
+/// Create invite with an explicit SPKI hex (instead of using local transport SPKI).
+pub fn svc_create_invite_with_spki(
+    db_path: &str,
+    public_addr: &str,
+    public_spki_hex: &str,
+) -> ServiceResult<CreateInviteResponse> {
+    let (recorded_by, db) = open_db_load(db_path)
+        .map_err(|e| ServiceError(format!("No transport identity: {}", e)))?;
+
+    let workspace_id = db
+        .query_row(
+            "SELECT workspace_id FROM trust_anchors WHERE peer_id = ?1",
+            [&recorded_by],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|_| ServiceError("No workspace found. Bootstrap a workspace first.".into()))?;
+
+    let ws_eid = event_id_from_base64(&workspace_id)
+        .ok_or_else(|| ServiceError("Invalid workspace_id in trust_anchors".into()))?;
+
+    ensure_workspace_key_table(&db)?;
+    let ws_key_bytes: Vec<u8> = db
+        .query_row(
+            "SELECT signing_key FROM local_workspace_keys WHERE recorded_by = ?1",
+            [&recorded_by],
+            |row| row.get(0),
+        )
+        .map_err(|_| ServiceError("No workspace signing key found.".into()))?;
+
+    if ws_key_bytes.len() != 32 {
+        return Err(ServiceError("Corrupt workspace key".into()));
+    }
+    let mut key_arr = [0u8; 32];
+    key_arr.copy_from_slice(&ws_key_bytes);
+    let workspace_key = SigningKey::from_bytes(&key_arr);
+
+    let (sender_peer_eid, sender_peer_key) = load_local_peer_signer(&db, &recorded_by)?
+        .ok_or_else(|| ServiceError("No local peer signer found.".into()))?;
+
+    let spki_bytes = hex::decode(public_spki_hex)?;
+    let mut bootstrap_spki = [0u8; 32];
+    if spki_bytes.len() != 32 {
+        return Err(ServiceError("SPKI must be 32 bytes hex".into()));
+    }
+    bootstrap_spki.copy_from_slice(&spki_bytes);
+
+    svc_create_invite_conn(
+        &db,
+        &recorded_by,
+        &workspace_key,
+        &ws_eid,
+        &sender_peer_key,
+        &sender_peer_eid,
+        public_addr,
+        &bootstrap_spki,
+    )
+}
+
+/// Create a device link for a specific peer (daemon provides the peer_id).
+/// Loads user_key from local_user_keys, workspace from trust_anchors.
+pub fn svc_create_device_link_for_peer(
+    db_path: &str,
+    peer_id: &str,
+    public_addr: &str,
+    public_spki_hex: Option<&str>,
+) -> ServiceResult<CreateInviteResponse> {
+    let (_recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
+
+    // Load user key from local_user_keys
+    let (user_event_id, user_key) = load_local_user_key(&db, peer_id)?
+        .ok_or_else(|| ServiceError("No local user key found. Only workspace creators/inviters can create device links.".into()))?;
+
+    let workspace_id = resolve_workspace_for_peer(&db, peer_id)?;
+
+    // Resolve SPKI: use provided or fall back to peer's transport SPKI
+    let bootstrap_spki = if let Some(spki_hex) = public_spki_hex {
+        let spki_bytes = hex::decode(spki_hex)?;
+        if spki_bytes.len() != 32 {
+            return Err(ServiceError("SPKI must be 32 bytes hex".into()));
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&spki_bytes);
+        arr
+    } else {
+        let spki_bytes = hex::decode(peer_id)?;
+        if spki_bytes.len() != 32 {
+            return Err(ServiceError("peer_id is not valid 32-byte hex SPKI".into()));
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&spki_bytes);
+        arr
+    };
+
+    svc_create_device_link_invite_conn(
+        &db,
+        peer_id,
+        &user_key,
+        &user_event_id,
+        &workspace_id,
+        public_addr,
+        &bootstrap_spki,
+    )
+}
+
+/// Ban (remove) a user for a specific peer.
+/// Target selector: numeric (1-based user list index) or hex event ID.
+pub fn svc_ban_for_peer(
+    db_path: &str,
+    peer_id: &str,
+    target_selector: &str,
+) -> ServiceResult<BanResponse> {
+    let (_recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
+    let (signer_eid, signing_key) = require_local_peer_signer(&db, peer_id)?;
+
+    // Resolve target: numeric → user list index, or hex event ID
+    let target_event_id = if let Ok(num) = target_selector.parse::<usize>() {
+        let users = svc_users_conn(&db, peer_id)?;
+        if num == 0 || num > users.len() {
+            return Err(ServiceError(format!(
+                "Invalid user number {}. Available: 1-{}",
+                num,
+                users.len()
+            )));
+        }
+        crate::crypto::event_id_from_base64(&users[num - 1].event_id)
+            .ok_or_else(|| ServiceError("Invalid event ID for user".into()))?
+    } else if target_selector.starts_with('#') {
+        // #N syntax
+        let num: usize = target_selector[1..]
+            .parse()
+            .map_err(|_| ServiceError(format!("Invalid user ref: {}", target_selector)))?;
+        let users = svc_users_conn(&db, peer_id)?;
+        if num == 0 || num > users.len() {
+            return Err(ServiceError(format!(
+                "Invalid user number {}. Available: 1-{}",
+                num,
+                users.len()
+            )));
+        }
+        crate::crypto::event_id_from_base64(&users[num - 1].event_id)
+            .ok_or_else(|| ServiceError("Invalid event ID for user".into()))?
+    } else {
+        // Hex event ID
+        parse_hex_event_id(target_selector)?
+    };
+
+    svc_remove_user_conn(&db, peer_id, &signer_eid, &signing_key, target_event_id)?;
+
+    Ok(BanResponse {
+        target: hex::encode(target_event_id),
+        banned: true,
+    })
+}
+
+/// Get combined identity info for a specific peer.
+pub fn svc_identity_for_peer(
+    db_path: &str,
+    peer_id: &str,
+) -> ServiceResult<IdentityResponse> {
+    let (_recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
+
+    // User event ID from users table
+    let user_event_id: Option<String> = db
+        .query_row(
+            "SELECT event_id FROM users WHERE recorded_by = ?1 LIMIT 1",
+            rusqlite::params![peer_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    // Peer shared event ID from peers_shared table
+    let peer_shared_event_id: Option<String> = db
+        .query_row(
+            "SELECT event_id FROM peers_shared WHERE recorded_by = ?1 LIMIT 1",
+            rusqlite::params![peer_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    Ok(IdentityResponse {
+        transport_fingerprint: peer_id.to_string(),
+        user_event_id,
+        peer_shared_event_id,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Socket path helper
 // ---------------------------------------------------------------------------
 
@@ -1830,6 +2148,41 @@ mod tests {
         let fake_target = hex::encode([0xEE_u8; 32]);
         let result = svc_delete_message_for_peer(&db_path, &peer_id, &fake_target);
         assert!(result.is_err(), "delete of missing target should error, got: {:?}", result);
+    }
+
+    #[test]
+    fn test_resolve_message_selector_by_number() {
+        let (_dir, db_path) = temp_db_path();
+        let peer_id = setup_workspace(&db_path);
+
+        // Send two messages so we have numbered targets.
+        let msg1 = svc_send_for_peer(&db_path, &peer_id, "first").unwrap();
+        let msg2 = svc_send_for_peer(&db_path, &peer_id, "second").unwrap();
+
+        let (recorded_by, db) = open_db_for_peer(&db_path, &peer_id).unwrap();
+
+        // Resolve by 1-based number.
+        let eid1 = resolve_message_selector(&db, &recorded_by, "1").unwrap();
+        assert_eq!(hex::encode(eid1), msg1.event_id);
+
+        let eid2 = resolve_message_selector(&db, &recorded_by, "2").unwrap();
+        assert_eq!(hex::encode(eid2), msg2.event_id);
+
+        // Resolve with # prefix.
+        let eid1_hash = resolve_message_selector(&db, &recorded_by, "#1").unwrap();
+        assert_eq!(eid1, eid1_hash);
+
+        // Resolve by raw hex.
+        let eid_hex = resolve_message_selector(&db, &recorded_by, &msg1.event_id).unwrap();
+        assert_eq!(eid1, eid_hex);
+
+        // Invalid index.
+        let err = resolve_message_selector(&db, &recorded_by, "99").unwrap_err();
+        assert!(err.to_string().contains("invalid message number"), "{}", err);
+
+        // Zero index.
+        let err = resolve_message_selector(&db, &recorded_by, "0").unwrap_err();
+        assert!(err.to_string().contains("must be >= 1"), "{}", err);
     }
 
     #[test]

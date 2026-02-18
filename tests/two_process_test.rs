@@ -84,7 +84,7 @@ fn create_invite(db: &str, bootstrap_addr: &str) -> String {
         .arg("--db")
         .arg(db)
         .arg("create-invite")
-        .arg("--bootstrap")
+        .arg("--public-addr")
         .arg(bootstrap_addr)
         .output()
         .expect("failed to run create-invite");
@@ -93,7 +93,12 @@ fn create_invite(db: &str, bootstrap_addr: &str) -> String {
         "create-invite failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .find(|line| line.starts_with("quiet://"))
+        .expect("create-invite output missing quiet:// link")
+        .to_string()
 }
 
 fn accept_invite(db: &str, invite_link: &str, username: &str, devicename: &str) {

@@ -147,6 +147,10 @@ pub fn migrate_recorded_by(
         "UPDATE local_workspace_keys SET recorded_by = ?1 WHERE recorded_by = ?2",
         rusqlite::params![new, old],
     );
+    let _ = tx.execute(
+        "UPDATE local_user_keys SET recorded_by = ?1 WHERE recorded_by = ?2",
+        rusqlite::params![new, old],
+    );
 
     tx.commit()?;
     Ok(())

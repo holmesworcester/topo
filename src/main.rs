@@ -2,11 +2,12 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use topo::db::{open_connection, schema::create_tables};
+use topo::db_registry::DbRegistry;
 use topo::rpc::client::{rpc_call, RpcClientError};
 use topo::rpc::protocol::RpcMethod;
 use topo::rpc::server::{run_rpc_server, DaemonState};
@@ -50,9 +51,6 @@ enum Commands {
         #[arg(short, long, default_value = "127.0.0.1:4433")]
         bind: SocketAddr,
     },
-
-    /// Interactive REPL mode with multi-account support
-    Interactive,
 
     /// Accept a user invite link (bootstrap sync + identity chain creation)
     #[command(name = "accept-invite")]
@@ -133,7 +131,7 @@ enum Commands {
     React {
         /// Emoji to react with
         emoji: String,
-        /// Target event ID (hex)
+        /// Target: message number (N or #N) or hex event ID
         #[arg(long)]
         target: String,
     },
@@ -141,7 +139,7 @@ enum Commands {
     /// Delete a message
     #[command(name = "delete-message")]
     DeleteMessage {
-        /// Target message event ID (hex)
+        /// Target: message number (N or #N) or hex event ID
         #[arg(long)]
         target: String,
     },
@@ -160,6 +158,7 @@ enum Commands {
     },
 
     /// List workspaces from projection
+    #[command(alias = "workspaces")]
     Networks,
 
     /// Send intro offers to two peers so they can hole-punch a direct connection
@@ -189,16 +188,106 @@ enum Commands {
     /// Create a user invite link for the active workspace
     #[command(name = "create-invite")]
     CreateInvite {
-        /// Bootstrap address (host:port) to embed in invite link.
-        /// If omitted, auto-derived from UPnP result (run `topo upnp` first).
-        /// Auto-derivation requires a publicly routable UPnP external IP.
+        /// Public address (host:port) to embed in invite link
+        #[arg(long, alias = "bootstrap")]
+        public_addr: String,
+        /// Public SPKI fingerprint (hex) — defaults to local transport SPKI
         #[arg(long)]
-        bootstrap: Option<String>,
+        public_spki: Option<String>,
+    },
+
+    /// Create a device link invite for the active peer's user
+    Link {
+        /// Public address (host:port) to embed in link
+        #[arg(long, alias = "bootstrap")]
+        public_addr: String,
+        /// Public SPKI fingerprint (hex) — defaults to local transport SPKI
+        #[arg(long)]
+        public_spki: Option<String>,
+    },
+
+    /// Accept a device link invite
+    #[command(name = "accept-link")]
+    AcceptLink {
+        /// Device link (quiet://link/...)
+        #[arg(long)]
+        invite: String,
+        /// Device name for the new identity
+        #[arg(long, default_value = "device")]
+        devicename: String,
+    },
+
+    /// Ban (remove) a user from the workspace
+    Ban {
+        /// User number (from `topo users`), #N, or hex event ID
+        user: String,
+    },
+
+    /// Show combined identity info (transport + user + peer)
+    Identity,
+
+    /// List channels
+    Channels,
+
+    /// Create a new channel
+    #[command(name = "new-channel")]
+    NewChannel {
+        /// Channel name
+        name: String,
+    },
+
+    /// Switch active channel
+    Channel {
+        /// Channel number or name
+        selector: String,
+    },
+
+    /// Generate shell completions
+    Completions {
+        /// Shell to generate completions for
+        shell: clap_complete::Shell,
+    },
+
+    /// Manage the database registry (aliases, default DB)
+    Db {
+        #[command(subcommand)]
+        action: DbAction,
     },
 
     /// Attempt UPnP port forwarding for the daemon's QUIC listen port.
     /// Requires daemon listening on non-loopback (for example `--bind 0.0.0.0:...`).
     Upnp,
+}
+
+#[derive(Subcommand)]
+enum DbAction {
+    /// Add a database to the registry
+    Add {
+        /// Path to the database file
+        path: String,
+        /// Alias name
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// List registered databases
+    List,
+    /// Remove a database from the registry
+    Remove {
+        /// Alias name, index, or path
+        selector: String,
+    },
+    /// Rename a database alias
+    Rename {
+        /// Current alias name, index, or path
+        selector: String,
+        /// New alias name
+        new_name: String,
+    },
+    /// Set the default database
+    Default {
+        /// Alias name, index, or path
+        selector: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -230,10 +319,28 @@ fn rpc_require_daemon(
     }
 }
 
+/// Resolve the --db argument using the registry:
+/// - If --db is the clap default "server.db" and a registry default exists, use it
+/// - Otherwise run selector resolution (existing path → alias → index → passthrough)
+fn resolve_db_arg(raw: &str) -> Result<String, String> {
+    let registry = DbRegistry::load();
+    if raw == "server.db" {
+        if let Some(default_path) = registry.default_path() {
+            return Ok(default_path.to_string());
+        }
+    }
+    // If it parses as a number, it must be a valid registry index — don't fall back.
+    if raw.parse::<usize>().is_ok() {
+        return registry.resolve(raw);
+    }
+    // For non-numeric selectors, resolve returns passthrough on miss, so this is fine.
+    Ok(registry.resolve(raw).unwrap_or_else(|_| raw.to_string()))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cli = Cli::parse();
-    let db = &cli.db;
+    let db = &resolve_db_arg(&cli.db).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
     let socket_override = cli.socket.clone();
 
     // Init tracing for commands that need it
@@ -364,10 +471,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
         Commands::Sync { bind } => {
             topo::node::run_node(db, bind, None).await?;
-        }
-
-        Commands::Interactive => {
-            topo::interactive::run_interactive()?;
         }
 
         Commands::AcceptInvite {
@@ -752,19 +855,148 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         }
 
-        Commands::CreateInvite { bootstrap } => {
-            let auto = bootstrap.is_none();
+        Commands::CreateInvite { public_addr, public_spki } => {
             let data = rpc_require_daemon(
                 db,
                 socket_override.as_deref(),
-                RpcMethod::CreateInvite { bootstrap },
+                RpcMethod::CreateInvite { public_addr, public_spki },
             )?;
-            if auto {
-                if let Some(addr) = data["bootstrap"].as_str() {
-                    println!("bootstrap: {} (from UPnP)", addr);
+            println!("{}", data["invite_link"].as_str().unwrap_or(""));
+            if let Some(num) = data["invite_ref"].as_u64() {
+                eprintln!("Created invite #{}", num);
+            }
+        }
+
+        Commands::Link { public_addr, public_spki } => {
+            let data = rpc_require_daemon(
+                db,
+                socket_override.as_deref(),
+                RpcMethod::CreateDeviceLink { public_addr, public_spki },
+            )?;
+            println!("{}", data["invite_link"].as_str().unwrap_or(""));
+            if let Some(num) = data["invite_ref"].as_u64() {
+                eprintln!("Created device link #{}", num);
+            }
+        }
+
+        Commands::AcceptLink { invite, devicename } => {
+            let data = rpc_require_daemon(
+                db,
+                socket_override.as_deref(),
+                RpcMethod::AcceptLink { invite, devicename },
+            )?;
+            let peer_id = data["peer_id"].as_str().unwrap_or("");
+            println!("Accepted device link");
+            println!("  peer_id: {}", peer_id);
+        }
+
+        Commands::Ban { user } => {
+            let data = rpc_require_daemon(
+                db,
+                socket_override.as_deref(),
+                RpcMethod::Ban { target: user },
+            )?;
+            let target = data["target"].as_str().unwrap_or("");
+            println!("Banned user {}", &target[..target.len().min(16)]);
+        }
+
+        Commands::Identity => {
+            let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::Identity)?;
+            println!("IDENTITY:");
+            println!("  Transport: {}", data["transport_fingerprint"].as_str().unwrap_or(""));
+            match data["user_event_id"].as_str() {
+                Some(uid) => println!("  User:      {}", &uid[..uid.len().min(16)]),
+                None => println!("  User:      (none)"),
+            }
+            match data["peer_shared_event_id"].as_str() {
+                Some(pid) => println!("  Peer:      {}", &pid[..pid.len().min(16)]),
+                None => println!("  Peer:      (none)"),
+            }
+        }
+
+        Commands::Channels => {
+            let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::Channels)?;
+            println!("CHANNELS:");
+            if let Some(items) = data.as_array() {
+                for item in items {
+                    let marker = if item["active"].as_bool().unwrap_or(false) { "*" } else { " " };
+                    let idx = item["index"].as_u64().unwrap_or(0);
+                    let name = item["name"].as_str().unwrap_or("");
+                    println!("  {}{}. #{}", marker, idx, name);
                 }
             }
-            println!("{}", data["invite_link"].as_str().unwrap_or(""));
+        }
+
+        Commands::NewChannel { name } => {
+            let data = rpc_require_daemon(
+                db,
+                socket_override.as_deref(),
+                RpcMethod::NewChannel { name: name.clone() },
+            )?;
+            let idx = data["index"].as_u64().unwrap_or(0);
+            println!("Created channel #{}: {}", idx, name);
+        }
+
+        Commands::Channel { selector } => {
+            let data = rpc_require_daemon(
+                db,
+                socket_override.as_deref(),
+                RpcMethod::UseChannel { selector },
+            )?;
+            let name = data["name"].as_str().unwrap_or("");
+            println!("Switched to channel #{}", name);
+        }
+
+        Commands::Completions { shell } => {
+            let mut cmd = Cli::command();
+            clap_complete::generate(shell, &mut cmd, "topo", &mut std::io::stdout());
+        }
+
+        // ---------------------------------------------------------------
+        // DB registry management (no daemon needed)
+        // ---------------------------------------------------------------
+        Commands::Db { action } => {
+            match action {
+                DbAction::Add { path, name } => {
+                    let mut registry = DbRegistry::load();
+                    registry.add(&path, name.as_deref())?;
+                    registry.save()?;
+                    let display_name = name.as_deref().unwrap_or("(none)");
+                    println!("Added {} (alias: {})", path, display_name);
+                }
+                DbAction::List => {
+                    let registry = DbRegistry::load();
+                    if registry.entries.is_empty() {
+                        println!("No databases registered.");
+                        println!("  Use `topo db add <path> --name <alias>` to register one.");
+                    } else {
+                        println!("DATABASES:");
+                        for (i, entry) in registry.entries.iter().enumerate() {
+                            let marker = if entry.is_default { "*" } else { " " };
+                            let name = entry.name.as_deref().unwrap_or("-");
+                            println!("  {}{}. {} ({})", marker, i + 1, name, entry.path);
+                        }
+                    }
+                }
+                DbAction::Remove { selector } => {
+                    let mut registry = DbRegistry::load();
+                    let removed = registry.remove(&selector)?;
+                    registry.save()?;
+                    println!("Removed {}", removed.path);
+                }
+                DbAction::Rename { selector, new_name } => {
+                    let mut registry = DbRegistry::load();
+                    registry.rename(&selector, &new_name)?;
+                    registry.save()?;
+                    println!("Renamed to {}", new_name);
+                }
+                DbAction::Default { selector } => {
+                    let mut registry = DbRegistry::load();
+                    registry.set_default(&selector)?;
+                    registry.save()?;
+                    println!("Default set to {}", selector);
+                }
+            }
         }
 
         Commands::Upnp => {

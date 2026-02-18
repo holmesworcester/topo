@@ -1,12 +1,12 @@
 pub mod contracts;
 pub mod crypto;
 pub mod db;
+pub mod db_registry;
 #[cfg(feature = "discovery")]
 pub mod discovery;
 pub mod event_runtime;
 pub mod events;
 pub mod identity_ops;
-pub mod interactive;
 pub mod invite_link;
 pub mod network;
 pub mod node;
