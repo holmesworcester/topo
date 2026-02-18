@@ -361,7 +361,7 @@ Validation performed for this slice:
 |---|---|---|---|
 | Phase 0 | Complete | Baseline behavior/test gates established | None |
 | Phase 1 | Complete | Contracts + adapters + session handler wiring landed | None |
-| Phase 2 | In Progress | Ingest runtime moved to `src/event_runtime/*`; SQL adapters added | Remove compatibility shims and finish decoupling from projection internals |
+| Phase 2 | Complete | Ingest runtime + SQL adapters + `drain_project_queue` boundary; shims removed; `project_one` no longer imported from sync/node | None |
 | Phase 3 | Not Started | N/A | Extract replication session logic to `src/replication/*` |
 | Phase 4 | Not Started | N/A | Extract network runtime orchestration to `src/network/*` |
 | Phase 5 | Not Started | N/A | Enforce dependency direction + privileged adversity CI |

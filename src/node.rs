@@ -86,7 +86,8 @@ use crate::contracts::network_contract::{PeerFingerprint, TenantId, TrustDecisio
 use crate::db::transport_creds::{discover_local_tenants, list_local_peers, load_local_creds};
 use crate::db::transport_trust::list_active_invite_bootstrap_addrs;
 use crate::db::{open_connection, schema::create_tables};
-use crate::sync::engine::{accept_loop_with_ingest, batch_writer, IngestItem};
+use crate::event_runtime::{batch_writer, IngestItem};
+use crate::sync::engine::accept_loop_with_ingest;
 use crate::transport::{
     create_single_port_endpoint, extract_spki_fingerprint,
     multi_workspace::{workspace_sni, WorkspaceCertResolver},

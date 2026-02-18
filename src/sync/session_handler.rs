@@ -7,9 +7,8 @@ use tokio_util::sync::CancellationToken;
 use crate::contracts::network_contract::{
     SessionDirection, SessionHandler, SessionIo, SessionMeta,
 };
-use crate::sync::engine::{
-    run_sync_initiator_dual, run_sync_responder_dual, IngestItem, PeerCoord,
-};
+use crate::event_runtime::IngestItem;
+use crate::sync::engine::{run_sync_initiator_dual, run_sync_responder_dual, PeerCoord};
 use crate::transport::connection::{Connection, RecvConnection, SendConnection};
 use crate::transport::SyncSessionIo;
 

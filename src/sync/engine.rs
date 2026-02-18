@@ -22,7 +22,7 @@ use tracing::{info, warn};
 use crate::contracts::network_contract::{
     PeerFingerprint, SessionDirection, SessionHandler, SessionMeta, TenantId, TrustDecision,
 };
-use crate::crypto::{event_id_from_base64, hash_event, EventId};
+use crate::crypto::{hash_event, EventId};
 use crate::db::health::{purge_expired_endpoints, record_endpoint_observation};
 use crate::db::removal_watch::is_peer_removed;
 use crate::db::transport_trust::record_transport_binding;
@@ -34,7 +34,7 @@ use crate::db::{
     store::{lookup_workspace_id, Store},
     wanted::WantedEvents,
 };
-use crate::projection::pipeline::project_one;
+use crate::event_runtime::drain_project_queue;
 use crate::runtime::SyncStats;
 use crate::sync::session_handler::{next_session_id, LegacySyncSessionHandler};
 use crate::sync::{neg_id_to_event_id, NegentropyStorageSqlite, SyncMessage};
@@ -44,7 +44,7 @@ use crate::transport::{
     StreamSend, SyncSessionIo,
 };
 
-pub use crate::event_runtime::{batch_writer, IngestItem};
+use crate::event_runtime::{batch_writer, IngestItem};
 
 fn low_mem_mode() -> bool {
     read_bool_env("LOW_MEM_IOS") || read_bool_env("LOW_MEM")
@@ -1014,16 +1014,7 @@ pub async fn accept_loop_with_ingest(
         // Drain pending project_queue items for ALL tenants
         let batch_sz = drain_batch_size();
         for tenant_id in tenant_peer_ids {
-            let tid = tenant_id.clone();
-            let drained = pq
-                .drain_with_limit(&tid, batch_sz, |conn, event_id_b64| {
-                    if let Some(eid) = event_id_from_base64(event_id_b64) {
-                        project_one(conn, &tid, &eid)
-                            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-                    }
-                    Ok(())
-                })
-                .unwrap_or(0);
+            let drained = drain_project_queue(db_path, tenant_id, batch_sz);
             if drained > 0 {
                 info!(
                     "Processed {} pending project_queue items for tenant {}",
@@ -1254,17 +1245,8 @@ pub async fn connect_loop(
         if recovered > 0 {
             info!("Recovered {} expired project_queue leases", recovered);
         }
-        let recorded_by_str = recorded_by.to_string();
         let batch_sz = drain_batch_size();
-        let drained = pq
-            .drain_with_limit(&recorded_by_str, batch_sz, |conn, event_id_b64| {
-                if let Some(eid) = event_id_from_base64(event_id_b64) {
-                    project_one(conn, &recorded_by_str, &eid)
-                        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-                }
-                Ok(())
-            })
-            .unwrap_or(0);
+        let drained = drain_project_queue(db_path, recorded_by, batch_sz);
         if drained > 0 {
             info!(
                 "Processed {} pending project_queue items from previous session",
