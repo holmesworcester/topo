@@ -4,7 +4,7 @@
 //! Slow tests: cargo test --release --test perf_test -- --nocapture --ignored
 
 use std::time::{Duration, Instant};
-use topo::testutil::{Peer, start_peers, assert_eventually, sync_until_converged};
+use topo::testutil::{Peer, assert_eventually, start_peers_pinned, sync_until_converged};
 
 
 
@@ -106,7 +106,7 @@ async fn perf_continuous_10k() {
     let rss_before = peak_rss_mib();
 
     // Start sync between peers in the same workspace.
-    let sync = start_peers(&alice, &bob);
+    let sync = start_peers_pinned(&alice, &bob);
 
     // Give sync a moment to connect
     tokio::time::sleep(Duration::from_millis(500)).await;

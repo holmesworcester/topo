@@ -422,6 +422,40 @@ pub fn load_local_peer_signer_pub(
     Ok(None)
 }
 
+fn load_any_event_local_peer_signer(
+    db: &rusqlite::Connection,
+) -> ServiceResult<Option<(String, SigningKey)>> {
+    ensure_local_signer_tables(db)?;
+
+    let row = db
+        .query_row(
+            "SELECT l.recorded_by, l.signing_key
+             FROM local_peer_signers l
+             INNER JOIN peers_shared p
+               ON p.recorded_by = l.recorded_by AND p.event_id = l.event_id
+             ORDER BY l.updated_at DESC
+             LIMIT 1",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
+        .optional()?;
+
+    match row {
+        Some((recorded_by, key_bytes)) => {
+            let signing_key = decode_signing_key(key_bytes)?;
+            Ok(Some((recorded_by, signing_key)))
+        }
+        None => Ok(None),
+    }
+}
+
+pub fn svc_bootstrap_workspace_conn(
+    db: &rusqlite::Connection,
+    recorded_by: &str,
+) -> ServiceResult<crate::identity_ops::IdentityChain> {
+    crate::identity_ops::bootstrap_workspace(db, recorded_by)
+        .map_err(|e| ServiceError(format!("{}", e)))
+}
 pub fn ensure_identity_chain(
     db: &rusqlite::Connection,
     recorded_by: &str,
@@ -488,6 +522,7 @@ pub fn ensure_identity_chain(
     let psf = ParsedEvent::PeerSharedFirst(PeerSharedFirstEvent {
         created_at_ms: current_timestamp_ms(),
         public_key: peer_shared_key.verifying_key().to_bytes(),
+        user_event_id: ub_eid,
         signed_by: dif_eid,
         signer_type: 3,
         signature: [0u8; 64],
@@ -1663,12 +1698,17 @@ pub async fn svc_accept_device_link(
 
     // Accept the device link: creates identity chain
     let db = open_connection(db_path)?;
+    let user_event_id = match invite.invite_type {
+        crate::identity_ops::InviteType::DeviceLink { user_event_id } => user_event_id,
+        _ => return Err(ServiceError("Expected DeviceLink invite type".into())),
+    };
     let link = crate::identity_ops::accept_device_link(
         &db,
         &recorded_by,
         &invite_key,
         &invite_event_id,
         workspace_id,
+        user_event_id,
     )
     .map_err(|e| ServiceError(format!("Failed to accept device link: {}", e)))?;
 

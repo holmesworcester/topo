@@ -224,6 +224,7 @@ pub fn bootstrap_workspace(
     let psf_evt = ParsedEvent::PeerSharedFirst(PeerSharedFirstEvent {
         created_at_ms: now_ms(),
         public_key: peer_shared_pub,
+        user_event_id,
         signed_by: device_invite_event_id,
         signer_type: 3,
         signature: [0u8; 64],
@@ -394,6 +395,7 @@ pub fn accept_user_invite(
     let psf_evt = ParsedEvent::PeerSharedFirst(PeerSharedFirstEvent {
         created_at_ms: now_ms(),
         public_key: peer_shared_pub,
+        user_event_id,
         signed_by: device_invite_event_id,
         signer_type: 3,
         signature: [0u8; 64],
@@ -464,6 +466,7 @@ pub fn accept_device_link(
     device_invite_key: &SigningKey,
     device_invite_event_id: &EventId,
     workspace_id: EventId,
+    user_event_id: EventId,
 ) -> Result<LinkChain, Box<dyn std::error::Error + Send + Sync>> {
     let mut rng = rand::thread_rng();
 
@@ -481,6 +484,7 @@ pub fn accept_device_link(
     let psf_evt = ParsedEvent::PeerSharedFirst(PeerSharedFirstEvent {
         created_at_ms: now_ms(),
         public_key: peer_shared_pub,
+        user_event_id,
         signed_by: *device_invite_event_id,
         signer_type: 3,
         signature: [0u8; 64],

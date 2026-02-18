@@ -520,6 +520,13 @@ static MIGRATIONS: &[Migration] = &[
             DROP TABLE IF EXISTS ingress_queue;
         ",
     },
+    Migration {
+        version: 29,
+        name: "add_user_event_id_to_peers_shared",
+        sql: "
+            ALTER TABLE peers_shared ADD COLUMN user_event_id TEXT;
+        ",
+    },
 ];
 
 fn ensure_schema_migrations(conn: &Connection) -> SqliteResult<()> {
@@ -733,6 +740,6 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(max_version, 28);
+        assert_eq!(max_version, 29);
     }
 }

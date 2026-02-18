@@ -191,6 +191,7 @@ mod tests {
         let signer_event = ParsedEvent::PeerSharedFirst(PeerSharedFirstEvent {
             created_at_ms: now_ms(),
             public_key,
+            user_event_id: [0u8; 32],
             signed_by: [1u8; 32],
             signer_type: 5,
             signature: [0u8; 64],
@@ -263,6 +264,7 @@ mod tests {
         let signer_event = ParsedEvent::PeerSharedFirst(PeerSharedFirstEvent {
             created_at_ms: now_ms(),
             public_key,
+            user_event_id: [0u8; 32],
             signed_by: [1u8; 32],
             signer_type: 5,
             signature: [0u8; 64],

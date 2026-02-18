@@ -118,9 +118,12 @@ pub const USER_INVITE_ONGOING_WIRE_SIZE: usize = USER_INVITE_BOOT_WIRE_SIZE;
 /// Identity-pubkey-with-signer layout: type(1) + created_at(8) + public_key(32)
 ///                                    + signed_by(32) + signer_type(1) + signature(64) = 138
 /// Used by: DeviceInviteFirst(12), DeviceInviteOngoing(13), UserBoot(14), UserOngoing(15),
-///          PeerSharedFirst(16), PeerSharedOngoing(17), UserRemoved(20), PeerRemoved(21),
-///          TransportKey(23)
+///          UserRemoved(20), PeerRemoved(21), TransportKey(23)
 pub const IDENTITY_PUBKEY_SIGNED_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32 + SIGNATURE_TRAILER_BYTES;
+
+/// PeerShared (types 16, 17): type(1) + created_at(8) + public_key(32) + user_event_id(32)
+///                           + signed_by(32) + signer_type(1) + signature(64) = 170
+pub const PEER_SHARED_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32 + 32 + SIGNATURE_TRAILER_BYTES;
 
 /// AdminBoot (type 18): type(1) + created_at(8) + public_key(32) + user_event_id(32)
 ///                     + signed_by(32) + signer_type(1) + signature(64) = 170
@@ -243,8 +246,8 @@ pub fn encrypted_inner_wire_size(inner_type_code: u8) -> Option<usize> {
         13 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE),    // DeviceInviteOngoing
         14 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE),    // UserBoot
         15 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE),    // UserOngoing
-        16 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE),    // PeerSharedFirst
-        17 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE),    // PeerSharedOngoing
+        16 => Some(PEER_SHARED_WIRE_SIZE),                 // PeerSharedFirst
+        17 => Some(PEER_SHARED_WIRE_SIZE),                 // PeerSharedOngoing
         18 => Some(ADMIN_BOOT_WIRE_SIZE),                // AdminBoot
         19 => Some(ADMIN_ONGOING_WIRE_SIZE),             // AdminOngoing
         20 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE),    // UserRemoved

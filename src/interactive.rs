@@ -9,7 +9,7 @@ use crate::db::{
     schema::create_tables,
 };
 use crate::service;
-use crate::identity_ops::{self, IdentityChain, InviteType};
+use crate::identity_ops::{IdentityChain, InviteType};
 use crate::invite_link::{parse_invite_link, InviteLinkKind};
 use crate::transport_identity::ensure_transport_peer_id_from_db;
 
@@ -491,7 +491,7 @@ fn cmd_new_workspace(
 
     let mut account = Account::new(username, devicename);
     let conn = open_connection(&account.db_path)?;
-    let chain = identity_ops::bootstrap_workspace(&conn, &account.identity)?;
+    let chain = crate::service::svc_bootstrap_workspace_conn(&conn, &account.identity)?;
     account.store_chain_keys(&chain);
     account.workspace_name = Some(name.to_string());
 

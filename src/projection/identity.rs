@@ -22,8 +22,8 @@ pub fn apply_identity_projection(
         ParsedEvent::DeviceInviteOngoing(di) => project_device_invite(conn, recorded_by, event_id_b64, &di.public_key),
         ParsedEvent::UserBoot(u) => project_user(conn, recorded_by, event_id_b64, &u.public_key),
         ParsedEvent::UserOngoing(u) => project_user(conn, recorded_by, event_id_b64, &u.public_key),
-        ParsedEvent::PeerSharedFirst(p) => project_peer_shared(conn, recorded_by, event_id_b64, &p.public_key),
-        ParsedEvent::PeerSharedOngoing(p) => project_peer_shared(conn, recorded_by, event_id_b64, &p.public_key),
+        ParsedEvent::PeerSharedFirst(p) => project_peer_shared(conn, recorded_by, event_id_b64, &p.public_key, &p.user_event_id),
+        ParsedEvent::PeerSharedOngoing(p) => project_peer_shared(conn, recorded_by, event_id_b64, &p.public_key, &p.user_event_id),
         ParsedEvent::AdminBoot(a) => project_admin(conn, recorded_by, event_id_b64, &a.public_key),
         ParsedEvent::AdminOngoing(a) => project_admin(conn, recorded_by, event_id_b64, &a.public_key),
         ParsedEvent::UserRemoved(r) => project_user_removed(conn, recorded_by, event_id_b64, &r.target_event_id),
@@ -195,11 +195,13 @@ fn project_peer_shared(
     recorded_by: &str,
     event_id_b64: &str,
     public_key: &[u8; 32],
+    user_event_id: &[u8; 32],
 ) -> Result<ProjectionDecision, Box<dyn std::error::Error>> {
+    let user_event_id_b64 = crate::crypto::event_id_to_base64(user_event_id);
     conn.execute(
-        "INSERT OR IGNORE INTO peers_shared (recorded_by, event_id, public_key)
-         VALUES (?1, ?2, ?3)",
-        rusqlite::params![recorded_by, event_id_b64, public_key.as_slice()],
+        "INSERT OR IGNORE INTO peers_shared (recorded_by, event_id, public_key, user_event_id)
+         VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![recorded_by, event_id_b64, public_key.as_slice(), &user_event_id_b64],
     )?;
     Ok(ProjectionDecision::Valid)
 }

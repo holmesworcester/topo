@@ -62,8 +62,8 @@ Changes to this document require TLA+ model re-verification.
 | 13 | {signed_by} | [signed_by] |
 | 14 | {signed_by} | [signed_by] |
 | 15 | {signed_by} | [signed_by] |
-| 16 | {signed_by} | [signed_by] |
-| 17 | {signed_by} | [signed_by] |
+| 16 | {user_event_id, signed_by} | [user_event_id, signed_by] |
+| 17 | {user_event_id, signed_by} | [user_event_id, signed_by] |
 | 18 | {user_event_id, signed_by} | [user_event_id, signed_by] |
 | 19 | {admin_boot_event_id, signed_by} | [admin_boot_event_id, signed_by] |
 | 20 | {target_event_id, signed_by} | [target_event_id, signed_by] |
@@ -157,19 +157,20 @@ Workspace (8):       type_code(1) | created_at_ms(8) | public_key(32) | workspac
 InviteAccepted (9):  type_code(1) | created_at_ms(8) | invite_event_id(32) | workspace_id(32)  = 73B
 ```
 
-### 138B signed (DeviceInvite, User, PeerShared, Removal)
+### 138B signed (DeviceInvite, User, Removal)
 ```
 type_code(1) | created_at_ms(8) | public_key_or_target(32) | signed_by(32) | signer_type(1) | signature(64)  = 138B
 ```
-- Types 12-17: field at [9..41] is public_key
+- Types 12-15: field at [9..41] is public_key
 - Types 20-21: field at [9..41] is target_event_id
 
-### 170B signed (UserInvite, Admin)
+### 170B signed (UserInvite, PeerShared, Admin)
 ```
 type_code(1) | created_at_ms(8) | public_key(32) | extra_dep_id(32) | signed_by(32) | signer_type(1) | signature(64)  = 170B
 ```
 - Type 10: extra_dep_id = workspace_id (reference, not a dep)
 - Type 11: extra_dep_id = admin_event_id (dep)
+- Types 16-17: extra_dep_id = user_event_id (dep, UserBoot or UserOngoing)
 - Type 18: extra_dep_id = user_event_id (dep)
 - Type 19: extra_dep_id = admin_boot_event_id (dep)
 
@@ -272,6 +273,7 @@ The following parser-level canonicalization guarantees are enforced in Rust but 
 | InvSecretSharedKey | SecretShared requires valid secret_key dependency |
 | InvFileSliceAuth | FileSlice and MessageAttachment for the same file must share the same signer |
 | InvRemovalExclusion | project_secret_shared: reject if recipient removed |
+| InvUserRemovalTransitiveDeny | user_removed transitively denies all peers linked via peers_shared.user_event_id |
 
 ### Bootstrap key materialization
 

@@ -156,8 +156,8 @@ impl ParsedEvent {
             ParsedEvent::DeviceInviteOngoing(d) => vec![("signed_by", d.signed_by)],
             ParsedEvent::UserBoot(u) => vec![("signed_by", u.signed_by)],
             ParsedEvent::UserOngoing(u) => vec![("signed_by", u.signed_by)],
-            ParsedEvent::PeerSharedFirst(p) => vec![("signed_by", p.signed_by)],
-            ParsedEvent::PeerSharedOngoing(p) => vec![("signed_by", p.signed_by)],
+            ParsedEvent::PeerSharedFirst(p) => vec![("user_event_id", p.user_event_id), ("signed_by", p.signed_by)],
+            ParsedEvent::PeerSharedOngoing(p) => vec![("user_event_id", p.user_event_id), ("signed_by", p.signed_by)],
             ParsedEvent::AdminBoot(a) => vec![
                 ("user_event_id", a.user_event_id),
                 ("signed_by", a.signed_by),
@@ -560,13 +560,14 @@ mod tests {
         let e = PeerSharedFirstEvent {
             created_at_ms: 700,
             public_key: [34u8; 32],
+            user_event_id: [99u8; 32],
             signed_by: [35u8; 32],
             signer_type: 3,
             signature: [36u8; 64],
         };
         let event = ParsedEvent::PeerSharedFirst(e);
         let blob = encode_event(&event).unwrap();
-        assert_eq!(blob.len(), 138);
+        assert_eq!(blob.len(), 170);
         let parsed = parse_event(&blob).unwrap();
         assert_eq!(parsed, event);
     }
@@ -576,13 +577,14 @@ mod tests {
         let e = PeerSharedOngoingEvent {
             created_at_ms: 800,
             public_key: [37u8; 32],
+            user_event_id: [98u8; 32],
             signed_by: [38u8; 32],
             signer_type: 3,
             signature: [39u8; 64],
         };
         let event = ParsedEvent::PeerSharedOngoing(e);
         let blob = encode_event(&event).unwrap();
-        assert_eq!(blob.len(), 138);
+        assert_eq!(blob.len(), 170);
         let parsed = parse_event(&blob).unwrap();
         assert_eq!(parsed, event);
     }

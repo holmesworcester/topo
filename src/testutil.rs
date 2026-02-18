@@ -555,11 +555,13 @@ impl Peer {
         peer_shared_public_key: [u8; 32],
         signing_key: &ed25519_dalek::SigningKey,
         device_invite_event_id: &EventId,
+        user_event_id: &EventId,
     ) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
         let evt = ParsedEvent::PeerSharedFirst(PeerSharedFirstEvent {
             created_at_ms: current_timestamp_ms(),
             public_key: peer_shared_public_key,
+            user_event_id: *user_event_id,
             signed_by: *device_invite_event_id,
             signer_type: 3,
             signature: [0u8; 64],
@@ -1335,7 +1337,85 @@ pub fn verify_projection_invariants(peer: &Peer) {
 /// Uses production-matching dynamic trust (`is_peer_allowed` at each TLS
 /// handshake). Automatically seeds mutual trust via CLI pin import so callers
 /// don't need to manually cross-register trust rows.
+/// Start sync between two peers in the same workspace with PeerShared-derived trust.
+/// Both peers must already have each other's PeerShared events projected (from
+/// invite-based workspace join or bootstrap). No CLI pin seeding.
 pub fn start_peers(
+    peer_a: &Peer,
+    peer_b: &Peer,
+) -> (std::thread::JoinHandle<()>, std::thread::JoinHandle<()>) {
+    use crate::db::transport_trust::is_peer_allowed;
+
+    let (cert_a, key_a) = peer_a.cert_and_key();
+    let (cert_b, key_b) = peer_b.cert_and_key();
+
+    let a_db_path = peer_a.db_path.clone();
+    let a_recorded_by = peer_a.identity.clone();
+    let dynamic_allow_a: Arc<crate::transport::DynamicAllowFn> =
+        Arc::new(move |peer_fp: &[u8; 32]| {
+            let db = open_connection(&a_db_path)?;
+            is_peer_allowed(&db, &a_recorded_by, peer_fp)
+        });
+
+    let b_db_path = peer_b.db_path.clone();
+    let b_recorded_by = peer_b.identity.clone();
+    let dynamic_allow_b: Arc<crate::transport::DynamicAllowFn> =
+        Arc::new(move |peer_fp: &[u8; 32]| {
+            let db = open_connection(&b_db_path)?;
+            is_peer_allowed(&db, &b_recorded_by, peer_fp)
+        });
+
+    let listener_endpoint = create_dual_endpoint_dynamic(
+        "127.0.0.1:0".parse().unwrap(),
+        cert_a,
+        key_a,
+        dynamic_allow_a,
+    ).expect("failed to create dynamic dual endpoint for A");
+
+    let listener_addr = listener_endpoint.local_addr().expect("failed to get listener addr");
+
+    let connector_endpoint = create_dual_endpoint_dynamic(
+        "127.0.0.1:0".parse().unwrap(),
+        cert_b,
+        key_b,
+        dynamic_allow_b,
+    ).expect("failed to create dynamic dual endpoint for B");
+
+    let a_db = peer_a.db_path.clone();
+    let a_identity = peer_a.identity.clone();
+    let b_db = peer_b.db_path.clone();
+    let b_identity = peer_b.identity.clone();
+
+    let a_handle = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            if let Err(e) = accept_loop(&a_db, &a_identity, listener_endpoint).await {
+                tracing::warn!("accept_loop exited: {}", e);
+            }
+        });
+    });
+
+    let b_handle = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            if let Err(e) = connect_loop(&b_db, &b_identity, connector_endpoint, listener_addr, None).await {
+                tracing::warn!("connect_loop exited: {}", e);
+            }
+        });
+    });
+
+    (a_handle, b_handle)
+}
+
+// PINNING BOUNDARY: uses CLI pin import for cross-workspace trust setup.
+// Use `start_peers` instead when both peers share a workspace with PeerShared-derived trust.
+pub fn start_peers_pinned(
     peer_a: &Peer,
     peer_b: &Peer,
 ) -> (std::thread::JoinHandle<()>, std::thread::JoinHandle<()>) {
@@ -1559,7 +1639,7 @@ pub async fn sync_until_converged<F: Fn() -> bool>(
     let b_before = peer_b.store_count();
 
     let start = Instant::now();
-    let sync = start_peers(peer_a, peer_b);
+    let sync = start_peers_pinned(peer_a, peer_b);
 
     assert_eventually(check, timeout, "sync convergence").await;
 
@@ -2283,6 +2363,11 @@ impl<'a> ScenarioHarness<'a> {
         if let Some(reason) = &self.skip_reason {
             eprintln!("ScenarioHarness: skipping replay invariants — {}", reason);
             return;
+        }
+        let tracked = self.peers.borrow().len() + self.shared_db_nodes.borrow().len();
+        if tracked == 0 {
+            panic!("ScenarioHarness::finish() with zero tracked subjects. \
+                    Use ScenarioHarness::skip(reason) to opt out.");
         }
         for peer in self.peers.borrow().iter() {
             verify_projection_invariants(peer);

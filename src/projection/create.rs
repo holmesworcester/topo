@@ -335,6 +335,7 @@ mod tests {
         let psf = ParsedEvent::PeerSharedFirst(PeerSharedFirstEvent {
             created_at_ms: now_ms(),
             public_key: peer_shared_key.verifying_key().to_bytes(),
+            user_event_id: ub_eid,
             signed_by: dif_eid,
             signer_type: 3,
             signature: [0u8; 64],

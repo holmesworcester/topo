@@ -233,6 +233,13 @@ fn peer_shared_spki_fingerprints(
              SELECT 1 FROM removed_entities r
              WHERE r.recorded_by = p.recorded_by
                AND r.target_event_id = p.event_id
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM removed_entities r
+             WHERE r.recorded_by = p.recorded_by
+               AND p.user_event_id IS NOT NULL
+               AND r.target_event_id = p.user_event_id
+               AND r.removal_type = 'user'
            )",
     )?;
     let fps: Vec<[u8; 32]> = stmt
@@ -414,6 +421,13 @@ pub fn has_any_trusted_peer(
                     WHERE r.recorded_by = peers_shared.recorded_by
                       AND r.target_event_id = peers_shared.event_id
                   )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM removed_entities r
+                    WHERE r.recorded_by = peers_shared.recorded_by
+                      AND peers_shared.user_event_id IS NOT NULL
+                      AND r.target_event_id = peers_shared.user_event_id
+                      AND r.removal_type = 'user'
+                  )
             )",
         rusqlite::params![recorded_by, now],
         |row| row.get(0),
@@ -474,6 +488,15 @@ mod tests {
         conn.execute(
             "INSERT INTO peers_shared (recorded_by, event_id, public_key) VALUES (?1, ?2, ?3)",
             rusqlite::params![recorded_by, event_id, pubkey.as_slice()],
+        ).unwrap();
+        spki_fingerprint_from_ed25519_pubkey(pubkey)
+    }
+
+    /// Helper: insert a PeerShared row with user_event_id and return its SPKI fingerprint.
+    fn insert_peer_shared_with_user(conn: &Connection, recorded_by: &str, event_id: &str, pubkey: &[u8; 32], user_event_id: &str) -> [u8; 32] {
+        conn.execute(
+            "INSERT INTO peers_shared (recorded_by, event_id, public_key, user_event_id) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![recorded_by, event_id, pubkey.as_slice(), user_event_id],
         ).unwrap();
         spki_fingerprint_from_ed25519_pubkey(pubkey)
     }
@@ -1056,5 +1079,44 @@ mod tests {
             "should have no trusted peers after only peer removed");
         let allowed = allowed_peers_from_db(&conn, recorded_by).unwrap();
         assert!(!allowed.contains(&spki), "allowed set should not contain removed peer");
+    }
+
+    #[test]
+    fn test_user_removed_denies_linked_peer_trust() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+
+        let recorded_by = "aaaa";
+        let peer_pubkey: [u8; 32] = [0x55; 32];
+        let user_event_id = "user_evt1";
+
+        // Insert a peers_shared row with user_event_id
+        let spki = insert_peer_shared_with_user(
+            &conn, recorded_by, "peer_shared_evt1", &peer_pubkey, user_event_id,
+        );
+
+        // Before removal: peer should be trusted
+        assert!(is_peer_allowed(&conn, recorded_by, &spki).unwrap(),
+            "peer should be trusted before user removal");
+        assert!(has_any_trusted_peer(&conn, recorded_by).unwrap(),
+            "should have trusted peers before user removal");
+        let allowed = allowed_peers_from_db(&conn, recorded_by).unwrap();
+        assert!(allowed.contains(&spki), "allowed set should contain peer before user removal");
+
+        // Insert user removal targeting the user_event_id
+        conn.execute(
+            "INSERT INTO removed_entities (recorded_by, event_id, target_event_id, removal_type)
+             VALUES (?1, 'user_removal_evt1', ?2, 'user')",
+            rusqlite::params![recorded_by, user_event_id],
+        ).unwrap();
+
+        // After user removal: peer should NOT be trusted (transitive denial)
+        assert!(!is_peer_allowed(&conn, recorded_by, &spki).unwrap(),
+            "peer linked to removed user should not be trusted");
+        assert!(!has_any_trusted_peer(&conn, recorded_by).unwrap(),
+            "should have no trusted peers after user removed");
+        let allowed = allowed_peers_from_db(&conn, recorded_by).unwrap();
+        assert!(!allowed.contains(&spki),
+            "allowed set should not contain peer linked to removed user");
     }
 }

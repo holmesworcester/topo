@@ -61,10 +61,10 @@ Realism-first rule for ordering: finish test-fidelity items up front (copying ev
 
 ## Newly opened follow-up items (2026-02-18)
 
-23. `P0: Enforce user_removed transitive transport deny + disconnect` **OPEN**: `user_removed` currently records `removed_entities` rows, but runtime trust/session checks only enforce direct `peer_removed` targets.
-24. `P1: Close ScenarioHarness implicit bypass (new-without-track)` **OPEN**: tests can call `ScenarioHarness::new()` and `finish()` without `track(...)`, which performs zero replay checks without explicit opt-out.
-25. `P1: Route interactive new-workspace through service layer` **OPEN**: `cmd_new_workspace` still directly calls `identity_ops::bootstrap_workspace` rather than a service-layer command path.
-26. `P2: Remove residual trust-bootstrap shortcuts from realism helpers` **OPEN**: several realism helpers/tests still seed trust using `import_cli_pins_to_sql` instead of invite/bootstrap/discovery-driven trust acquisition.
+23. `P0: Enforce user_removed transitive transport deny + disconnect` **DONE**: Added `user_event_id: [u8; 32]` to PeerShared events (170B wire format), migration 29, transitive user removal in trust queries and removal watch.
+24. `P1: Close ScenarioHarness implicit bypass (new-without-track)` **DONE**: `finish()` now panics on zero tracked subjects; two tests switched to `ScenarioHarness::skip()`.
+25. `P1: Route interactive new-workspace through service layer` **DONE**: Added `svc_bootstrap_workspace_conn` to service.rs; `cmd_new_workspace` now routes through it.
+26. `P2: Remove residual trust-bootstrap shortcuts from realism helpers` **DONE**: `start_peers` renamed to `start_peers_pinned` (annotated as PINNING BOUNDARY); new `start_peers` for same-workspace peers without CLI pin seeding; mDNS tests use `new_in_workspace` for invite-based trust instead of `import_cli_pins_to_sql`.
 
 ## ~~P0: Re-impose fixed-length event fields + langsec parser model~~ DONE
 

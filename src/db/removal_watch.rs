@@ -42,7 +42,7 @@ pub fn is_peer_removed(
         key.copy_from_slice(&pubkey_blob);
         let derived_spki = spki_fingerprint_from_ed25519_pubkey(&key);
         if &derived_spki == spki_fingerprint {
-            // Found the PeerShared event for this SPKI. Check if it's been removed.
+            // Found the PeerShared event for this SPKI. Check if it's been directly removed.
             let removed: bool = conn.query_row(
                 "SELECT COUNT(*) > 0 FROM removed_entities
                  WHERE recorded_by = ?1 AND target_event_id = ?2",
@@ -50,6 +50,21 @@ pub fn is_peer_removed(
                 |row| row.get(0),
             )?;
             if removed {
+                return Ok(true);
+            }
+            // Check if the peer's user has been removed (transitive user_removed denial).
+            let user_removed: bool = conn.query_row(
+                "SELECT COUNT(*) > 0 FROM removed_entities r
+                 WHERE r.recorded_by = ?1
+                   AND r.removal_type = 'user'
+                   AND r.target_event_id = (
+                     SELECT p.user_event_id FROM peers_shared p
+                     WHERE p.recorded_by = ?1 AND p.event_id = ?2 AND p.user_event_id IS NOT NULL
+                   )",
+                rusqlite::params![recorded_by, &event_id],
+                |row| row.get(0),
+            )?;
+            if user_removed {
                 return Ok(true);
             }
         }
@@ -67,10 +82,19 @@ pub fn removed_peer_spki_fingerprints(
     let mut stmt = conn.prepare(
         "SELECT p.public_key FROM peers_shared p
          WHERE p.recorded_by = ?1
-           AND EXISTS (
-             SELECT 1 FROM removed_entities r
-             WHERE r.recorded_by = p.recorded_by
-               AND r.target_event_id = p.event_id
+           AND (
+             EXISTS (
+               SELECT 1 FROM removed_entities r
+               WHERE r.recorded_by = p.recorded_by
+                 AND r.target_event_id = p.event_id
+             )
+             OR EXISTS (
+               SELECT 1 FROM removed_entities r
+               WHERE r.recorded_by = p.recorded_by
+                 AND p.user_event_id IS NOT NULL
+                 AND r.target_event_id = p.user_event_id
+                 AND r.removal_type = 'user'
+             )
            )",
     )?;
     let fps: Vec<[u8; 32]> = stmt
@@ -197,5 +221,48 @@ mod tests {
         assert!(is_peer_removed(&conn, "tenant_a", &spki).unwrap());
         // Tenant B does NOT see the removal
         assert!(!is_peer_removed(&conn, "tenant_b", &spki).unwrap());
+    }
+
+    #[test]
+    fn test_user_removed_peer_appears_in_removed_spki() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+
+        let recorded_by = "aaaa";
+        let pubkey_a: [u8; 32] = [0x10; 32];
+        let pubkey_b: [u8; 32] = [0x20; 32];
+        let spki_a = spki_fingerprint_from_ed25519_pubkey(&pubkey_a);
+        let spki_b = spki_fingerprint_from_ed25519_pubkey(&pubkey_b);
+        let user_event_id = "user_evt1";
+
+        // Both peers linked to same user
+        conn.execute(
+            "INSERT INTO peers_shared (recorded_by, event_id, public_key, user_event_id) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![recorded_by, "ps_a", pubkey_a.as_slice(), user_event_id],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO peers_shared (recorded_by, event_id, public_key, user_event_id) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![recorded_by, "ps_b", pubkey_b.as_slice(), user_event_id],
+        ).unwrap();
+
+        // Before removal: neither peer is removed
+        assert!(!is_peer_removed(&conn, recorded_by, &spki_a).unwrap());
+        assert!(!is_peer_removed(&conn, recorded_by, &spki_b).unwrap());
+        assert!(removed_peer_spki_fingerprints(&conn, recorded_by).unwrap().is_empty());
+
+        // Remove the user (transitive removal of both peers)
+        conn.execute(
+            "INSERT INTO removed_entities (recorded_by, event_id, target_event_id, removal_type) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![recorded_by, "removal_user", user_event_id, "user"],
+        ).unwrap();
+
+        // Both peers should now be detected as removed
+        assert!(is_peer_removed(&conn, recorded_by, &spki_a).unwrap());
+        assert!(is_peer_removed(&conn, recorded_by, &spki_b).unwrap());
+
+        let removed = removed_peer_spki_fingerprints(&conn, recorded_by).unwrap();
+        assert_eq!(removed.len(), 2);
+        assert!(removed.contains(&spki_a));
+        assert!(removed.contains(&spki_b));
     }
 }

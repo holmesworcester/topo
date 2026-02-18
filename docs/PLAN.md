@@ -1156,7 +1156,7 @@ Previous gap: TLA models were identity/event-causality models that did not encod
 - Three-source trust store: PeerShared-derived SPKIs, invite_bootstrap_trust, pending_invite_bootstrap_trust.
 - Supersession: AddPeerSharedTrust automatically removes matching bootstrap/pending entries.
 - TTL expiry of bootstrap trust sources.
-- Trust removal (peer_removed cascading).
+- Trust removal (peer_removed cascading, user_removed transitive denial via `peers_shared.user_event_id`).
 - 6 invariants verified by TLC, mapped to Rust checks in `docs/tla/projector_spec.md`.
 
 **What remains abstract** (by design):

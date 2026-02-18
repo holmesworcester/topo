@@ -767,6 +767,7 @@ mod tests {
         let psf = PeerSharedFirstEvent {
             created_at_ms: now_ms(),
             public_key: peer_shared_pub,
+            user_event_id: ub_eid,
             signed_by: dif_eid,
             signer_type: 3,
             signature: [0u8; 64],
@@ -860,6 +861,7 @@ mod tests {
         let psf = PeerSharedFirstEvent {
             created_at_ms: now_ms(),
             public_key: peer_shared_pub,
+            user_event_id: ub_eid,
             signed_by: dif_eid,
             signer_type: 3,
             signature: [0u8; 64],
@@ -4101,6 +4103,7 @@ mod tests {
         let psf_a = PeerSharedFirstEvent {
             created_at_ms: now_ms(),
             public_key: peer_pub_a,
+            user_event_id: ub_eid,
             signed_by: dif_a_eid,
             signer_type: 3,
             signature: [0u8; 64],
@@ -4133,6 +4136,7 @@ mod tests {
         let psf_b = PeerSharedFirstEvent {
             created_at_ms: now_ms(),
             public_key: peer_pub_b,
+            user_event_id: ub_eid,
             signed_by: dif_b_eid,
             signer_type: 3,
             signature: [0u8; 64],

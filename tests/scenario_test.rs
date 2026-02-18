@@ -1,7 +1,10 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use topo::testutil::{Peer, SharedDbNode, ScenarioHarness, start_peers, assert_eventually, sync_until_converged};
-use topo::crypto::{event_id_to_base64, event_id_from_base64};
+use topo::crypto::{event_id_from_base64, event_id_to_base64};
+use topo::testutil::{
+    assert_eventually, start_peers_pinned, sync_until_converged, Peer, ScenarioHarness,
+    SharedDbNode,
+};
 use topo::transport::{
     AllowedPeers, create_client_endpoint, create_server_endpoint,
     extract_spki_fingerprint, peer_identity_from_connection,
@@ -28,7 +31,7 @@ async fn test_two_peer_bidirectional_sync() {
     let bob_marker = bob.create_message("bob-marker");
     let bob_marker_b64 = event_id_to_base64(&bob_marker);
 
-    let sync = start_peers(&alice, &bob);
+    let sync = start_peers_pinned(&alice, &bob);
 
     // Wait for bidirectional sync to complete
     assert_eventually(
@@ -59,7 +62,7 @@ async fn test_one_way_sync() {
     let marker = alice.create_message("alice-sync-marker");
     let marker_b64 = event_id_to_base64(&marker);
 
-    let sync = start_peers(&alice, &bob);
+    let sync = start_peers_pinned(&alice, &bob);
 
     // Wait for bob to receive alice's marker (last created event)
     assert_eventually(
@@ -81,7 +84,7 @@ async fn test_concurrent_create_and_sync() {
     harness.track(&alice);
     harness.track(&bob);
 
-    let sync = start_peers(&alice, &bob);
+    let sync = start_peers_pinned(&alice, &bob);
 
     // Give sync loop a moment to connect
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -167,7 +170,7 @@ async fn test_recorded_events_isolation() {
     let bob_marker_b64 = event_id_to_base64(&bob_marker);
 
     // Sync
-    let sync = start_peers(&alice, &bob);
+    let sync = start_peers_pinned(&alice, &bob);
 
     assert_eventually(
         || bob.has_event(&alice_marker_b64) && alice.has_event(&bob_marker_b64),
@@ -207,7 +210,7 @@ async fn test_reaction_sync() {
     assert_eq!(alice.message_count(), 2);
     assert_eq!(bob.reaction_count(), 0); // blocked until targets arrive
 
-    let sync = start_peers(&alice, &bob);
+    let sync = start_peers_pinned(&alice, &bob);
 
     // Wait for sync convergence: bob gets alice's messages, alice gets bob's reactions
     assert_eventually(
@@ -298,7 +301,7 @@ async fn test_recorded_at_monotonicity() {
     let third_b64 = event_id_to_base64(&third);
 
     // Sync to Bob — Bob's recorded_at should use local wall clock, not event created_at
-    let sync = start_peers(&alice, &bob);
+    let sync = start_peers_pinned(&alice, &bob);
 
     assert_eventually(
         || bob.has_event(&third_b64),
@@ -395,7 +398,7 @@ async fn test_cross_workspace_isolation() {
     let b2_marker_b64 = event_id_to_base64(&b2_marker);
 
     // Sync workspace A peers
-    let sync_a = start_peers(&peer_a1, &peer_a2);
+    let sync_a = start_peers_pinned(&peer_a1, &peer_a2);
     assert_eventually(
         || peer_a2.has_event(&a1_marker_b64) && peer_a1.has_event(&a2_marker_b64),
         Duration::from_secs(15),
@@ -404,7 +407,7 @@ async fn test_cross_workspace_isolation() {
     drop(sync_a);
 
     // Sync workspace B peers
-    let sync_b = start_peers(&peer_b1, &peer_b2);
+    let sync_b = start_peers_pinned(&peer_b1, &peer_b2);
     assert_eventually(
         || peer_b2.has_event(&b1_marker_b64) && peer_b1.has_event(&b2_marker_b64),
         Duration::from_secs(15),
@@ -590,7 +593,7 @@ async fn test_out_of_order_reaction_sync() {
     assert_eq!(alice.message_count(), 1);
 
     // Sync — both get each other's events
-    let sync = start_peers(&alice, &bob);
+    let sync = start_peers_pinned(&alice, &bob);
 
     assert_eventually(
         || bob.has_event(&msg_id_b64) && alice.has_event(&rxn_id_b64),
@@ -637,7 +640,7 @@ async fn test_multi_dep_blocking_sync() {
     assert_eq!(bob.reaction_count(), 0);
 
     // Sync
-    let sync = start_peers(&alice, &bob);
+    let sync = start_peers_pinned(&alice, &bob);
 
     assert_eventually(
         || bob.has_event(&msg3_b64) && alice.has_event(&bob_rxn3_b64),
@@ -674,7 +677,7 @@ async fn test_signed_event_sync() {
     assert_eq!(alice.signed_memo_count(), 1);
 
     // Sync to Bob
-    let sync = start_peers(&alice, &bob);
+    let sync = start_peers_pinned(&alice, &bob);
 
     assert_eventually(
         || bob.has_event(&memo_b64),
@@ -713,7 +716,7 @@ async fn test_signed_event_out_of_order_sync() {
     let bob_msg_b64 = event_id_to_base64(&bob_msg);
 
     // Sync
-    let sync = start_peers(&alice, &bob);
+    let sync = start_peers_pinned(&alice, &bob);
 
     assert_eventually(
         || bob.has_event(&alice_msg_b64) && bob.has_event(&memo_b64) && alice.has_event(&bob_msg_b64),
@@ -798,7 +801,7 @@ async fn test_invalid_signature_rejected_after_sync() {
     }
 
     // Sync to Bob
-    let sync = start_peers(&alice, &bob);
+    let sync = start_peers_pinned(&alice, &bob);
 
     assert_eventually(
         || bob.has_event(&bad_memo_event_id_b64),
@@ -835,7 +838,7 @@ async fn test_cross_tenant_dep_scoping_after_sync() {
     assert_eq!(alice.reaction_count(), 1);
 
     // Sync to Bob
-    let sync = start_peers(&alice, &bob);
+    let sync = start_peers_pinned(&alice, &bob);
 
     assert_eventually(
         || bob.has_event(&msg_b64) && bob.has_event(&rxn_b64),
@@ -896,7 +899,7 @@ async fn test_encrypted_event_sync() {
     assert_eq!(alice.scoped_message_count(), 1);
 
     // Sync to Bob
-    let sync = start_peers(&alice, &bob);
+    let sync = start_peers_pinned(&alice, &bob);
 
     assert_eventually(
         || bob.has_event(&enc_b64),
@@ -943,7 +946,7 @@ async fn test_encrypted_out_of_order_sync() {
 
     // Sync phase 1: ciphertext arrives before key materialization on Bob.
     // Note: alice's SK is local scope, not synced
-    let sync1 = start_peers(&alice, &bob);
+    let sync1 = start_peers_pinned(&alice, &bob);
 
     assert_eventually(
         || bob.has_event(&enc_b64) && bob.has_event(&alice_msg_b64) && alice.has_event(&bob_msg_b64),
@@ -1215,7 +1218,7 @@ async fn test_deletion_sync() {
     assert_eq!(alice.reaction_count(), 1);
 
     // Sync to Bob
-    let sync = start_peers(&alice, &bob);
+    let sync = start_peers_pinned(&alice, &bob);
 
     assert_eventually(
         || bob.has_event(&msg_b64) && bob.has_event(&rxn_b64),
@@ -1238,7 +1241,7 @@ async fn test_deletion_sync() {
     assert_eq!(alice.deleted_message_count(), 1); // tombstone
 
     // Sync again — Bob gets the deletion event
-    let sync2 = start_peers(&alice, &bob);
+    let sync2 = start_peers_pinned(&alice, &bob);
 
     assert_eventually(
         || bob.has_event(&del_b64),
@@ -1278,7 +1281,7 @@ async fn test_deletion_before_target_sync() {
     assert_eq!(alice.deleted_message_count(), 1); // tombstone
 
     // Sync
-    let sync = start_peers(&alice, &bob);
+    let sync = start_peers_pinned(&alice, &bob);
 
     assert_eventually(
         || bob.has_event(&del_b64),
@@ -1357,7 +1360,7 @@ async fn test_deletion_replay_invariants() {
     assert_eq!(alice.deleted_message_count(), 1); // msg2 tombstone
 
     // Sync to Bob
-    let sync = start_peers(&alice, &bob);
+    let sync = start_peers_pinned(&alice, &bob);
 
     assert_eventually(
         || bob.has_event(&del_b64),
@@ -1400,7 +1403,7 @@ async fn test_local_only_events_not_synced() {
     let alice_msg_b64 = event_id_to_base64(&alice_msg);
 
     // Sync
-    let sync = start_peers(&alice, &bob);
+    let sync = start_peers_pinned(&alice, &bob);
 
     assert_eventually(
         || bob.has_event(&enc_b64) && bob.has_event(&alice_msg_b64),
@@ -1446,7 +1449,7 @@ async fn test_psk_two_set_isolation() {
     let alice_msg_b64 = event_id_to_base64(&alice_msg);
 
     // Sync
-    let sync = start_peers(&alice, &bob);
+    let sync = start_peers_pinned(&alice, &bob);
 
     assert_eventually(
         || bob.has_event(&enc_b64) && bob.has_event(&alice_msg_b64),
@@ -1487,7 +1490,7 @@ async fn test_endpoint_observations_recorded() {
     let marker = alice.create_message("endpoint obs test");
     let marker_b64 = event_id_to_base64(&marker);
 
-    let sync = start_peers(&alice, &bob);
+    let sync = start_peers_pinned(&alice, &bob);
 
     assert_eventually(
         || bob.has_event(&marker_b64),
@@ -1702,6 +1705,7 @@ fn bootstrap_peer(peer: &Peer) -> BootstrapChain {
         peer_shared_pubkey,
         &device_invite_key,
         &device_invite_eid,
+        &user_eid,
     );
 
     // 7. AdminBoot (signed by workspace, dep on user)
@@ -2892,6 +2896,7 @@ fn join_workspace(
         peer_shared_pubkey,
         &device_invite_key,
         &device_invite_eid,
+        &user_eid,
     );
 
     JoinChain {
@@ -2925,7 +2930,7 @@ async fn test_two_peer_identity_join_and_sync() {
     let _bob_join = join_workspace(&bob, &alice_chain, &alice);
 
     // Sync — shared events flow between peers
-    let sync = start_peers(&alice, &bob);
+    let sync = start_peers_pinned(&alice, &bob);
 
     // Wait for convergence on projected identity state, not raw event counts
     assert_eventually(
@@ -3004,7 +3009,7 @@ async fn test_identity_cascade_via_sync() {
     assert!(bob.blocked_dep_count() > 0, "Bob should have blocked deps");
 
     // Sync — Alice's events flow to Bob, unblocking the cascade
-    let sync = start_peers(&alice, &bob);
+    let sync = start_peers_pinned(&alice, &bob);
 
     // Wait for Bob's specific UserBoot event to become valid, not just any user
     assert_eventually(
@@ -3053,7 +3058,7 @@ async fn test_identity_then_messaging() {
     harness.track(&bob);
 
     // Sync identity events first
-    let sync = start_peers(&alice, &bob);
+    let sync = start_peers_pinned(&alice, &bob);
     assert_eventually(
         || alice.peer_shared_count() == 2 && bob.peer_shared_count() == 2,
         Duration::from_secs(15),
@@ -3066,7 +3071,7 @@ async fn test_identity_then_messaging() {
     bob.create_message("Hello from Bob");
 
     // Sync messages
-    let sync = start_peers(&alice, &bob);
+    let sync = start_peers_pinned(&alice, &bob);
     assert_eventually(
         || alice.scoped_message_count() == 2 && bob.scoped_message_count() == 2,
         Duration::from_secs(15),
@@ -3125,6 +3130,7 @@ async fn test_device_link_via_sync() {
         created_at_ms: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64,
         public_key: laptop_ps_pubkey,
+        user_event_id: phone_chain.user_eid,
         signed_by: laptop_di_eid,
         signer_type: 3,
         signature: [0u8; 64],
@@ -3138,7 +3144,7 @@ async fn test_device_link_via_sync() {
     assert_eq!(laptop.peer_shared_count(), 0, "Laptop's peer_shared should be blocked before sync");
 
     // Sync — Phone's events flow to Laptop, unblocking Laptop's chain
-    let sync = start_peers(&phone, &laptop);
+    let sync = start_peers_pinned(&phone, &laptop);
 
     assert_eventually(
         || phone.peer_shared_count() == 2 && laptop.peer_shared_count() == 2,
@@ -3181,7 +3187,7 @@ async fn test_foreign_workspace_rejected_via_sync() {
     assert_eq!(bob.workspace_count(), 1);
 
     // Sync — shared events flow between peers
-    let sync = start_peers(&alice, &bob);
+    let sync = start_peers_pinned(&alice, &bob);
 
     // Wait for events to transfer — gate on rejected events appearing
     // (foreign workspace events get rejected by the trust anchor guard)
@@ -3372,7 +3378,7 @@ async fn test_shared_db_sync_with_external_peer() {
 
     // Start sync between tenant and external peer.
     // The tenant uses the shared db_path, external uses its own.
-    let _sync = start_peers(tenant, &external);
+    let _sync = start_peers_pinned(tenant, &external);
 
     assert_eventually(
         || external.has_event(&tenant_marker_b64) && tenant.has_event(&ext_marker_b64),
@@ -3463,17 +3469,18 @@ async fn test_shared_db_same_workspace_two_tenants() {
 /// discover → connect → sync → verify convergence.
 ///
 /// Uses dynamic DB trust lookup (production-matching `is_peer_allowed`).
+/// Trust comes from PeerShared-derived identity chain (no CLI pin import).
 #[cfg(feature = "discovery")]
 #[tokio::test]
 async fn test_mdns_two_peers_discover_and_sync() {
     use std::collections::HashSet;
-    use topo::discovery::{TenantDiscovery, local_non_loopback_ipv4};
-    use topo::db::transport_trust::import_cli_pins_to_sql;
+    use topo::discovery::{local_non_loopback_ipv4, TenantDiscovery};
     use topo::testutil::create_dynamic_endpoint_for_peer_bind;
 
     let advertise_ip = local_non_loopback_ipv4().expect("no routable IP");
     let alice = Peer::new_with_identity("mdns-alice");
-    let bob = Peer::new_with_identity("mdns-bob");
+    let bob = Peer::new_in_workspace("mdns-bob", &alice).await;
+
     let harness = ScenarioHarness::new();
     harness.track(&alice);
     harness.track(&bob);
@@ -3486,21 +3493,6 @@ async fn test_mdns_two_peers_discover_and_sync() {
     let alice_marker_b64 = event_id_to_base64(&alice_marker);
     let bob_marker = bob.create_message("mdns-bob-marker");
     let bob_marker_b64 = event_id_to_base64(&bob_marker);
-
-    let fp_a = alice.spki_fingerprint();
-    let fp_b = bob.spki_fingerprint();
-
-    // Seed mutual trust via CLI pin import so dynamic trust lookup succeeds
-    {
-        let db_a = open_connection(&alice.db_path).expect("open A db");
-        import_cli_pins_to_sql(&db_a, &alice.identity, &AllowedPeers::from_fingerprints(vec![fp_b]))
-            .expect("import pins for A");
-    }
-    {
-        let db_b = open_connection(&bob.db_path).expect("open B db");
-        import_cli_pins_to_sql(&db_b, &bob.identity, &AllowedPeers::from_fingerprints(vec![fp_a]))
-            .expect("import pins for B");
-    }
 
     // Dynamic trust endpoints bound to 0.0.0.0 so mDNS-resolved addresses
     // (which may be non-loopback) are reachable.
@@ -3578,19 +3570,20 @@ async fn test_mdns_two_peers_discover_and_sync() {
 /// node tenants), and that sync works via the discovered address.
 ///
 /// Uses dynamic DB trust lookup (production-matching `is_peer_allowed`).
+/// Trust comes from PeerShared-derived identity chain (no CLI pin import).
 #[cfg(feature = "discovery")]
 #[tokio::test]
 async fn test_mdns_multitenant_self_filtering_and_sync() {
     use std::collections::HashSet;
-    use topo::discovery::{TenantDiscovery, local_non_loopback_ipv4};
-    use topo::db::transport_trust::import_cli_pins_to_sql;
+    use topo::discovery::{local_non_loopback_ipv4, TenantDiscovery};
     use topo::testutil::create_dynamic_endpoint_for_peer_bind;
 
     let advertise_ip = local_non_loopback_ipv4().expect("no routable IP");
     // Three peers: t0 and t1 are "co-located" (share local_peer_ids), ext is external
     let t0 = Peer::new_with_identity("mdns-t0");
-    let t1 = Peer::new_with_identity("mdns-t1");
-    let ext = Peer::new_with_identity("mdns-ext");
+    let t1 = Peer::new_with_identity("mdns-t1"); // t1 only needs mDNS presence, no sync
+    let ext = Peer::new_in_workspace("mdns-ext", &t0).await;
+
     let harness = ScenarioHarness::new();
     harness.track(&t0);
     harness.track(&ext);
@@ -3603,21 +3596,6 @@ async fn test_mdns_multitenant_self_filtering_and_sync() {
     let t0_marker_b64 = event_id_to_base64(&t0_marker);
     let ext_marker = ext.create_message("mdns-ext-marker");
     let ext_marker_b64 = event_id_to_base64(&ext_marker);
-
-    let fp_t0 = t0.spki_fingerprint();
-    let fp_ext = ext.spki_fingerprint();
-
-    // Seed mutual trust via CLI pin import so dynamic trust lookup succeeds
-    {
-        let db_t0 = open_connection(&t0.db_path).expect("open t0 db");
-        import_cli_pins_to_sql(&db_t0, &t0.identity, &AllowedPeers::from_fingerprints(vec![fp_ext]))
-            .expect("import pins for t0");
-    }
-    {
-        let db_ext = open_connection(&ext.db_path).expect("open ext db");
-        import_cli_pins_to_sql(&db_ext, &ext.identity, &AllowedPeers::from_fingerprints(vec![fp_t0]))
-            .expect("import pins for ext");
-    }
 
     // Dynamic trust endpoints bound to 0.0.0.0 so mDNS-resolved addresses are reachable.
     // t1 only needs mDNS presence — no actual endpoint needed.
@@ -3774,7 +3752,7 @@ async fn test_connect_with_presents_correct_tenant_cert() {
         workspace_client_config, multi_workspace::WorkspaceCertResolver,
     };
 
-    let harness = ScenarioHarness::new();
+    let harness = ScenarioHarness::skip("transport-layer cert presentation test, no projection peers");
 
     // Create two identities: "default" (first tenant) and "actual" (second tenant).
     let (default_cert, default_key) = generate_self_signed_cert().unwrap();
@@ -3871,7 +3849,7 @@ async fn test_tenant_scoped_outbound_trust_rejects_untrusted_server() {
         workspace_client_config, create_dual_endpoint,
     };
 
-    let harness = ScenarioHarness::new();
+    let harness = ScenarioHarness::skip("transport-layer trust rejection test, no projection peers");
 
     // Create client and two servers
     let (client_cert, client_key) = generate_self_signed_cert().unwrap();

@@ -312,9 +312,9 @@ Trust checks are **tenant-scoped** (`recorded_by`-partitioned). Value-level trus
 
 ### Removal-driven session teardown
 
-When a `PeerRemoved` event is projected, the removed peer's SPKI is excluded from trust lookups (via `NOT EXISTS (removed_entities)` in `peer_shared_spki_fingerprints`). Additionally:
-- New TLS handshakes are denied: `is_peer_allowed` returns false for removed peers.
-- Active sessions are torn down: between sync sessions, both `accept_loop` and `connect_loop` check `is_peer_removed` for the connected peer's SPKI. If the peer has been removed, the QUIC connection is closed with error code 2 ("peer removed").
+When a `PeerRemoved` event is projected, the removed peer's SPKI is excluded from trust lookups (via `NOT EXISTS (removed_entities)` in `peer_shared_spki_fingerprints`). When a `UserRemoved` event is projected, all peers linked to that user via `peers_shared.user_event_id` are transitively denied. Additionally:
+- New TLS handshakes are denied: `is_peer_allowed` returns false for removed peers and for peers whose owning user has been removed.
+- Active sessions are torn down: between sync sessions, both `accept_loop` and `connect_loop` check `is_peer_removed` for the connected peer's SPKI. If the peer has been directly removed or its user has been removed, the QUIC connection is closed with error code 2 ("peer removed").
 
 ### Shared batch writer with tenant routing
 
