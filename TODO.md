@@ -59,7 +59,14 @@ Realism-first rule for ordering: finish test-fidelity items up front (copying ev
 21. ~~`P1: CLI isomorphism — route remaining interactive commands through service layer`~~ **DONE**: all interactive REPL commands now route through service-layer APIs. Zero direct SQL (`rusqlite::prepare`/`query_row`/`execute`) remains in interactive.rs. New service functions: `svc_message_event_id_by_num_conn`, `svc_deleted_message_ids_conn`, `svc_reactions_for_message_conn`, `svc_remove_user_conn`, `svc_create_invite_conn`, `svc_create_device_link_invite_conn`. REPL retains only UX affordances (numeric aliases, author name display, channel labels).
 22. ~~`P2: Single-port multi-tenant endpoint — share one UDP port across tenants on the same device`~~ **DONE**: node now runs a single shared QUIC endpoint with multi-workspace cert resolution and per-tenant outbound isolation checks.
 
-## P0: Re-impose fixed-length event fields + langsec parser model
+## Newly opened follow-up items (2026-02-18)
+
+23. `P0: Enforce user_removed transitive transport deny + disconnect` **OPEN**: `user_removed` currently records `removed_entities` rows, but runtime trust/session checks only enforce direct `peer_removed` targets.
+24. `P1: Close ScenarioHarness implicit bypass (new-without-track)` **OPEN**: tests can call `ScenarioHarness::new()` and `finish()` without `track(...)`, which performs zero replay checks without explicit opt-out.
+25. `P1: Route interactive new-workspace through service layer` **OPEN**: `cmd_new_workspace` still directly calls `identity_ops::bootstrap_workspace` rather than a service-layer command path.
+26. `P2: Remove residual trust-bootstrap shortcuts from realism helpers` **OPEN**: several realism helpers/tests still seed trust using `import_cli_pins_to_sql` instead of invite/bootstrap/discovery-driven trust acquisition.
+
+## ~~P0: Re-impose fixed-length event fields + langsec parser model~~ DONE
 
 Evidence: current docs explicitly allow variable event payloads (`docs/DESIGN.md:60`, `docs/DESIGN.md:61`, `docs/PLAN.md:305`, `docs/PLAN.md:314`), and these event types currently parse variable-length payloads:
 
@@ -157,7 +164,7 @@ Completed:
 4. Docs updated: DESIGN.md, PLAN.md, projector_spec.md all aligned to single-authority model.
 5. All tests green (61 scenario, 21 transport_trust, 18 interactive, 2 low_mem).
 
-## P0: Remove `copy_event_chain` from interactive invite acceptance
+## ~~P0: Remove `copy_event_chain` from interactive invite acceptance~~ DONE
 
 Evidence: `src/interactive.rs:905`, `src/interactive.rs:1049`, `src/interactive.rs:1629`.
 
@@ -174,7 +181,7 @@ Acceptance:
 1. No direct event-copy call remains in interactive invite acceptance paths.
 2. `tests/interactive_test.rs` no longer validates copied-event behavior (`test_copy_event_chain_shared_only` should be removed/replaced).
 
-## P1: Stop direct SQL trust seeding in CLI invite-bootstrap test
+## ~~P1: Stop direct SQL trust seeding in CLI invite-bootstrap test~~ DONE
 
 Evidence: `tests/cli_test.rs:134`, `tests/cli_test.rs:160`, `tests/cli_test.rs:404`.
 
@@ -190,7 +197,7 @@ Acceptance:
 1. `tests/cli_test.rs` no longer calls direct trust-row seed helpers.
 2. Invite-bootstrap sync test passes through production invite APIs or CLI commands only.
 
-## P1: Replace prerequisite event copy in `Peer::new_in_workspace`
+## ~~P1: Replace prerequisite event copy in `Peer::new_in_workspace`~~ DONE
 
 Evidence: `src/testutil.rs:140`, `src/testutil.rs:157`, `src/testutil.rs:169`.
 
@@ -206,7 +213,7 @@ Acceptance:
 1. `new_in_workspace` contains no `insert_event`/`insert_recorded_event` calls.
 2. Hole-punch and other same-workspace integration tests still pass with real sync bootstrap.
 
-## P0: Make scenario replay invariants mandatory by default (opt-out only)
+## ~~P0: Make scenario replay invariants mandatory by default (opt-out only)~~ DONE
 
 Evidence:
 
@@ -236,7 +243,7 @@ Acceptance:
 2. Any omitted replay coverage is explicit and justified in the test definition.
 3. `tests/scenario_test.rs` no longer relies on ad-hoc optional replay calls for baseline coverage.
 
-## P1: Remove manual endpoint observation writes in hole-punch integration test
+## ~~P1: Remove manual endpoint observation writes in hole-punch integration test~~ DONE
 
 Evidence: `tests/holepunch_test.rs:296`, `tests/holepunch_test.rs:303`, `tests/holepunch_test.rs:307`.
 
@@ -263,7 +270,7 @@ Completed:
    - `tests/holepunch_test.rs` (stale/untrusted intro boundary cases),
    - `tests/scenario_test.rs` (tenant cert presentation and tenant-scoped outbound rejection).
 
-## P1: Deprecate `--pin-peer` from product code and design after invite-trust maturity
+## ~~P1: Deprecate `--pin-peer` from product code and design after invite-trust maturity~~ DONE
 
 Evidence: `--pin-peer` remains a first-class CLI surface (`src/main.rs:53`, `src/main.rs:184`, `src/main.rs (daemon start)`), runtime guidance still points users to it (`src/main.rs:984`, `src/service.rs:1002`), and design still documents it as an overlay (`docs/DESIGN.md:117`).
 
@@ -291,7 +298,7 @@ Acceptance:
 3. `docs/DESIGN.md` and `docs/PLAN.md` no longer present `--pin-peer` as a normal steady-state mechanism.
 4. TLA/model boundary/mapping docs reflect the post-deprecation trust-source story.
 
-## P2: Resolve "disjoint trust sets" docs/code mismatch
+## ~~P2: Resolve "disjoint trust sets" docs/code mismatch~~ DONE
 
 Evidence:
 
@@ -325,7 +332,7 @@ Acceptance:
 2. A test exists for the chosen policy (overlap-allowed behavior or strict-disjoint rejection behavior).
 3. TLA invariants and mapping docs encode the chosen policy unambiguously.
 
-## P0: Enforce removal policy at transport runtime (deny + disconnect active sessions)
+## ~~P0: Enforce removal policy at transport runtime (deny + disconnect active sessions)~~ DONE
 
 Evidence:
 
@@ -366,7 +373,7 @@ Acceptance:
 3. Removal semantics are covered for both `peer_removed` and `user_removed`.
 4. TLA/model docs match runtime behavior.
 
-## P0: Bring scenario invariant harness fully in line with PLAN (fingerprints + full invariant set)
+## ~~P0: Bring scenario invariant harness fully in line with PLAN (fingerprints + full invariant set)~~ DONE
 
 Evidence:
 
@@ -431,7 +438,7 @@ Acceptance met:
 2. TLC/model checks pass. ✓
 3. Transport lifecycle naming unified with item-11 architecture. ✓
 
-## P1: Remove duplicated command/business logic between CLI (`main.rs`) and service layer (`service.rs`)
+## ~~P1: Remove duplicated command/business logic between CLI (`main.rs`) and service layer (`service.rs`)~~ DONE
 
 Evidence:
 
@@ -459,7 +466,7 @@ Acceptance:
 2. CLI path and service/API path share one business implementation per command, with CLI affordances limited to input/output adaptation.
 3. Regression tests cover CLI/service parity for core commands.
 
-## P1: Eliminate direct SQL access in CLI command paths where module APIs already exist
+## ~~P1: Eliminate direct SQL access in CLI command paths where module APIs already exist~~ DONE
 
 Evidence:
 
@@ -519,3 +526,100 @@ All acceptance criteria met:
 1. Investigation note captures rationale and options. ✓
 2. Chosen direction is explicit: documented boundary (not refactor). ✓
 3. Docs and code are aligned after implementation. ✓
+
+## P0: Enforce `user_removed` transitive transport deny + disconnect
+
+Evidence:
+
+1. `user_removed` projection currently only records `removed_entities` (`src/projection/identity.rs:221`).
+2. Trust checks exclude removed peers by `target_event_id = peers_shared.event_id` only (`src/db/transport_trust.rs:225`).
+3. Active-session teardown checks also resolve only removed peer identities (`src/db/removal_watch.rs:20`, `src/sync/engine.rs:1256`, `src/sync/engine.rs:1465`).
+
+Problem: removal enforcement is complete for direct `peer_removed`, but not for `user_removed` transitive closure across linked peer identities.
+
+Fix:
+
+1. Define user-removal closure in runtime terms: if a `user_removed` target is present, all corresponding active/trusted peer identities for that user become denied.
+2. Apply closure in both trust lookup and active-session teardown paths.
+3. Add integration coverage:
+   - allowed before removal, denied after `user_removed`,
+   - active sync session terminated after `user_removed`,
+   - both single-tenant and shared-endpoint multi-tenant routing paths.
+4. Update TLA and mapping docs before Rust semantics changes:
+   - `docs/tla/EventGraphSchema.tla`,
+   - `docs/tla/TransportCredentialLifecycle.tla`,
+   - `docs/tla/projector_spec.md`,
+   - matching DESIGN/PLAN invariant text.
+
+Acceptance:
+
+1. `user_removed` denies new transport auth for all covered peer identities.
+2. Existing sessions for covered peers are closed promptly.
+3. Tests prove both direct and transitive removal behavior.
+4. TLA/model/docs and runtime behavior are aligned.
+
+## P1: Close ScenarioHarness implicit bypass (`new()` without `track`)
+
+Evidence:
+
+1. Replay checks run only for tracked peers/nodes (`src/testutil.rs:2287`).
+2. Some tests use `ScenarioHarness::new()` with no `track(...)`, so replay checks are skipped implicitly (`tests/scenario_test.rs:3777`, `tests/scenario_test.rs:3874`).
+
+Problem: this bypasses the "mandatory by default (opt-out only)" requirement without explicit skip rationale.
+
+Fix:
+
+1. Enforce harness contract: `ScenarioHarness::new()` must fail on `finish()` when no subjects were tracked.
+2. Keep `ScenarioHarness::skip(reason)` as the only explicit opt-out.
+3. Extend the scenario guard test to catch `new()`-without-track usage.
+4. Update PLAN/DESIGN testing text if any wording currently implies weaker guarantees.
+
+Acceptance:
+
+1. `ScenarioHarness::new()` cannot complete silently with zero tracked subjects.
+2. Every scenario test either tracks subjects or uses `skip(reason)`.
+3. Guard test fails on implicit bypass patterns.
+
+## P1: Route interactive `new-workspace` through service layer
+
+Evidence:
+
+1. Interactive `cmd_new_workspace` currently calls `identity_ops::bootstrap_workspace` directly (`src/interactive.rs:494`).
+2. TODO goal states interactive command semantics should route through service APIs (item 21).
+
+Problem: one interactive command path still bypasses the intended service-layer boundary.
+
+Fix:
+
+1. Add or use a service-layer command for workspace bootstrap.
+2. Migrate `cmd_new_workspace` to call service-layer API only.
+3. Keep interactive-only UX shaping (labels, defaults) in `interactive.rs`.
+4. Add regression coverage for parity with non-interactive flows.
+
+Acceptance:
+
+1. No direct `identity_ops::bootstrap_workspace` call remains in interactive command flow.
+2. Service layer owns workspace bootstrap command semantics.
+3. Interactive behavior remains UX-equivalent.
+
+## P2: Remove residual trust-bootstrap shortcuts from realism helpers
+
+Evidence:
+
+1. `start_peers` auto-imports CLI pin rows (`src/testutil.rs:1336`).
+2. mDNS realism tests seed trust with `import_cli_pins_to_sql` (`tests/scenario_test.rs:3493`, `tests/scenario_test.rs:3610`).
+
+Problem: these helpers still shortcut trust bootstrap and can mask invite/bootstrap/discovery trust integration failures.
+
+Fix:
+
+1. For realism-sensitive suites, replace direct pin-import setup with invite/bootstrap/discovery or event-derived trust setup flows.
+2. Keep pin-import usage only in tests explicitly labeled as pinning-policy boundary tests.
+3. Update helper naming/documentation to distinguish realism helpers from policy-boundary fixtures.
+4. Add/adjust tests so realism suites fail if trust bootstrap is not acquired through runtime paths.
+
+Acceptance:
+
+1. Realism suites do not rely on `import_cli_pins_to_sql` for baseline connectivity.
+2. Remaining pin-import tests are explicitly scope-labeled as policy-boundary tests.
+3. Documentation reflects the boundary clearly.

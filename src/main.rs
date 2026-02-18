@@ -9,7 +9,7 @@ use tracing_subscriber::FmtSubscriber;
 use topo::db::{open_connection, schema::create_tables};
 use topo::rpc::client::{rpc_call, RpcClientError};
 use topo::rpc::protocol::RpcMethod;
-use topo::rpc::server::run_rpc_server;
+use topo::rpc::server::{run_rpc_server, DaemonState};
 use topo::service;
 
 #[derive(Parser)]
@@ -43,14 +43,53 @@ enum Commands {
         socket: Option<String>,
     },
 
-    /// Run continuous sync (Ctrl-C to stop)
+    /// Create a new workspace and identity chain
+    #[command(name = "create-workspace")]
+    CreateWorkspace,
+
+    /// Run continuous sync (Ctrl-C to stop) — legacy foreground mode
     Sync {
         /// Listen address
         #[arg(short, long, default_value = "127.0.0.1:4433")]
         bind: SocketAddr,
     },
 
-    /// Print local transport identity — SPKI fingerprint from TLS cert (generates cert if needed)
+    /// Interactive REPL mode with multi-account support
+    Interactive,
+
+    /// Accept a user invite link (bootstrap sync + identity chain creation)
+    #[command(name = "accept-invite")]
+    AcceptInvite {
+        /// Invite link (quiet://invite/...)
+        #[arg(long)]
+        invite: String,
+        /// Username for the new identity
+        #[arg(long, default_value = "user")]
+        username: String,
+        /// Device name for the new identity
+        #[arg(long, default_value = "device")]
+        devicename: String,
+    },
+
+    // -------------------------------------------------------------------
+    // Daemon-only commands (require a running daemon)
+    // -------------------------------------------------------------------
+
+    /// List peers in this DB with active marker
+    Peers,
+
+    /// Switch active peer by number from the peers list
+    #[command(name = "use-peer")]
+    UsePeer {
+        /// Peer number (1-based, from `topo peers`)
+        index: usize,
+    },
+
+    /// Show currently active peer
+    #[command(name = "active-peer")]
+    ActivePeer,
+
+    /// Print local transport identity — SPKI fingerprint from TLS cert
     #[command(name = "transport-identity")]
     TransportIdentity,
 
@@ -61,24 +100,19 @@ enum Commands {
         limit: usize,
     },
 
-    /// Send a message
+    /// Send a message (uses active peer's workspace)
     Send {
         /// Message content
         content: String,
-        /// Workspace event ID hex (32 bytes)
-        #[arg(short = 'n', long, default_value = "0102030405060708090a0b0c0d0e0f10")]
-        workspace: String,
     },
 
     /// Show database status
     Status,
 
-    /// Generate test messages
+    /// Generate test messages (uses active peer's workspace)
     Generate {
         #[arg(short, long, default_value = "100")]
         count: usize,
-        #[arg(short = 'n', long, default_value = "0102030405060708090a0b0c0d0e0f10")]
-        workspace: String,
     },
 
     /// Assert a predicate holds right now (exit 0 = pass, exit 1 = fail)
@@ -98,9 +132,6 @@ enum Commands {
         #[arg(long, default_value = "200")]
         interval_ms: u64,
     },
-
-    /// Interactive REPL mode with multi-account support
-    Interactive,
 
     /// Create a reaction to a message
     React {
@@ -166,37 +197,19 @@ enum Commands {
         #[arg(long)]
         bootstrap: String,
     },
-
-    /// Accept a user invite link (bootstrap sync + identity chain creation)
-    #[command(name = "accept-invite")]
-    AcceptInvite {
-        /// Invite link (quiet://invite/...)
-        #[arg(long)]
-        invite: String,
-        /// Username for the new identity
-        #[arg(long, default_value = "user")]
-        username: String,
-        /// Device name for the new identity
-        #[arg(long, default_value = "device")]
-        devicename: String,
-    },
 }
 
 // ---------------------------------------------------------------------------
-// Command routing
+// RPC helper: call daemon, fail if not running
 // ---------------------------------------------------------------------------
 
-/// Try RPC to a running daemon; fall back to direct DB access on DaemonNotRunning.
-fn try_rpc_or_direct(
+fn rpc_require_daemon(
     db: &str,
-    socket: Option<&str>,
     method: RpcMethod,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
-    let sock = socket
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| service::socket_path_for_db(db));
+    let sock = service::socket_path_for_db(db);
 
-    match rpc_call(&sock, method.clone()) {
+    match rpc_call(&sock, method) {
         Ok(resp) => {
             if !resp.ok {
                 if let Some(err) = resp.error {
@@ -206,76 +219,10 @@ fn try_rpc_or_direct(
             Ok(resp.data.unwrap_or(serde_json::Value::Null))
         }
         Err(RpcClientError::DaemonNotRunning(_)) => {
-            // Fall back to direct DB access
-            dispatch_direct(db, method)
+            Err("daemon not running — start with `topo start`".into())
         }
         Err(e) => Err(e.to_string().into()),
     }
-}
-
-/// Execute an RPC method directly against the DB (no daemon).
-fn dispatch_direct(
-    db: &str,
-    method: RpcMethod,
-) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
-    let val = match method {
-        RpcMethod::Status => serde_json::to_value(service::svc_status(db)?)?,
-        RpcMethod::Messages { limit } => serde_json::to_value(service::svc_messages(db, limit)?)?,
-        RpcMethod::Send { workspace, content } => {
-            serde_json::to_value(service::svc_send(db, &workspace, &content)?)?
-        }
-        RpcMethod::Generate { count, workspace } => {
-            serde_json::to_value(service::svc_generate(db, count, &workspace)?)?
-        }
-        RpcMethod::AssertNow { predicate } => {
-            serde_json::to_value(service::svc_assert_now(db, &predicate)?)?
-        }
-        RpcMethod::AssertEventually {
-            predicate,
-            timeout_ms,
-            interval_ms,
-        } => serde_json::to_value(service::svc_assert_eventually(
-            db,
-            &predicate,
-            timeout_ms,
-            interval_ms,
-        )?)?,
-        RpcMethod::TransportIdentity => {
-            serde_json::to_value(service::svc_transport_identity(db)?)?
-        }
-        RpcMethod::React { target, emoji } => {
-            serde_json::to_value(service::svc_react(db, &target, &emoji)?)?
-        }
-        RpcMethod::DeleteMessage { target } => {
-            serde_json::to_value(service::svc_delete_message(db, &target)?)?
-        }
-        RpcMethod::Reactions => serde_json::to_value(service::svc_reactions(db)?)?,
-        RpcMethod::Users => serde_json::to_value(service::svc_users(db)?)?,
-        RpcMethod::Keys { summary } => serde_json::to_value(service::svc_keys(db, summary)?)?,
-        RpcMethod::Workspaces => serde_json::to_value(service::svc_workspaces(db)?)?,
-        RpcMethod::IntroAttempts { peer } => {
-            serde_json::to_value(service::svc_intro_attempts(db, peer.as_deref())?)?
-        }
-        RpcMethod::CreateInvite { bootstrap } => {
-            serde_json::to_value(service::svc_create_invite(db, &bootstrap)?)?
-        }
-        RpcMethod::AcceptInvite {
-            invite,
-            username,
-            devicename,
-        } => {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
-            serde_json::to_value(rt.block_on(service::svc_accept_invite(
-                db, &invite, &username, &devicename,
-            ))?)?
-        }
-        RpcMethod::Shutdown => {
-            return Err("Shutdown cannot be dispatched directly".into());
-        }
-    };
-    Ok(val)
 }
 
 #[tokio::main]
@@ -299,7 +246,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     match cli.command {
         // ---------------------------------------------------------------
-        // Daemon commands
+        // Daemon lifecycle
         // ---------------------------------------------------------------
         Commands::Start { bind, socket } => {
             let socket_path = socket
@@ -328,14 +275,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
 
             let shutdown = Arc::new(AtomicBool::new(false));
-            let db_path = Arc::new(db.to_string());
+            let state = Arc::new(DaemonState::new(db));
 
             // Start RPC server in a background thread
             let rpc_shutdown = shutdown.clone();
             let rpc_socket = socket_path.clone();
-            let rpc_db = db_path.clone();
+            let rpc_state = state.clone();
             let rpc_handle = std::thread::spawn(move || {
-                if let Err(e) = run_rpc_server(&rpc_socket, rpc_db, rpc_shutdown) {
+                if let Err(e) = run_rpc_server(&rpc_socket, rpc_state, rpc_shutdown) {
                     tracing::error!("RPC server error: {}", e);
                 }
             });
@@ -375,27 +322,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
 
         // ---------------------------------------------------------------
-        // Direct-only commands
+        // Direct-only commands (no daemon needed)
         // ---------------------------------------------------------------
+        Commands::CreateWorkspace => {
+            let result = service::svc_create_workspace(db)?;
+            println!("peer_id:      {}", result.peer_id);
+            println!("workspace_id: {}", result.workspace_id);
+        }
+
         Commands::Sync { bind } => {
             topo::node::run_node(db, bind).await?;
         }
 
         Commands::Interactive => {
             topo::interactive::run_interactive()?;
-        }
-
-        Commands::Generate {
-            count,
-            workspace,
-        } => {
-            let resp = service::svc_generate(db, count, &workspace)?;
-            println!("Generated {} messages in {}", resp.count, db);
-        }
-
-        Commands::CreateInvite { bootstrap } => {
-            let result = service::svc_create_invite(db, &bootstrap)?;
-            println!("{}", result.invite_link);
         }
 
         Commands::AcceptInvite {
@@ -411,25 +351,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
 
         // ---------------------------------------------------------------
-        // Daemon-preferred with direct fallback
+        // Daemon-only commands (require running daemon)
         // ---------------------------------------------------------------
+        Commands::Peers => {
+            let data = rpc_require_daemon(db, RpcMethod::Peers)?;
+            println!("PEERS ({}):", db);
+            if let Some(items) = data.as_array() {
+                if items.is_empty() {
+                    println!("  (none)");
+                } else {
+                    for item in items {
+                        let marker = if item["active"].as_bool().unwrap_or(false) { "*" } else { " " };
+                        let peer_id = item["peer_id"].as_str().unwrap_or("");
+                        let ws_id = item["workspace_id"].as_str().unwrap_or("");
+                        let idx = item["index"].as_u64().unwrap_or(0);
+                        println!("  {}. {} {} (workspace: {})", idx, marker, short_id(peer_id), short_id(ws_id));
+                    }
+                }
+            }
+        }
+
+        Commands::UsePeer { index } => {
+            let data = rpc_require_daemon(db, RpcMethod::UsePeer { index })?;
+            let peer_id = data["peer_id"].as_str().unwrap_or("");
+            let ws_id = data["workspace_id"].as_str().unwrap_or("");
+            println!("Switched to peer {} (workspace: {})", short_id(peer_id), short_id(ws_id));
+        }
+
+        Commands::ActivePeer => {
+            let data = rpc_require_daemon(db, RpcMethod::ActivePeer)?;
+            match data["peer_id"].as_str() {
+                Some(peer_id) => println!("{}", peer_id),
+                None => println!("(no active peer)"),
+            }
+        }
+
         Commands::TransportIdentity => {
-            let data = try_rpc_or_direct(db, None, RpcMethod::TransportIdentity)?;
+            let data = rpc_require_daemon(db, RpcMethod::TransportIdentity)?;
             let fingerprint = data["fingerprint"].as_str().unwrap_or("");
             println!("{}", fingerprint);
         }
 
         Commands::Messages { limit } => {
-            let data = try_rpc_or_direct(db, None, RpcMethod::Messages { limit })?;
+            let data = rpc_require_daemon(db, RpcMethod::Messages { limit })?;
             show_messages_from_json(db, &data);
         }
 
-        Commands::Send { content, workspace } => {
-            let data = try_rpc_or_direct(
+        Commands::Send { content } => {
+            let data = rpc_require_daemon(
                 db,
-                None,
                 RpcMethod::Send {
-                    workspace,
                     content: content.clone(),
                 },
             )?;
@@ -439,7 +410,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
 
         Commands::Status => {
-            let data = try_rpc_or_direct(db, None, RpcMethod::Status)?;
+            let data = rpc_require_daemon(db, RpcMethod::Status)?;
             println!("STATUS ({}):", db);
             println!("  Events:    {} total", data["events_count"]);
             println!("  Messages:  {} projected", data["messages_count"]);
@@ -448,10 +419,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             println!("  NegItems:  {} indexed", data["neg_items_count"]);
         }
 
-        Commands::AssertNow { predicate } => {
-            let data = try_rpc_or_direct(
+        Commands::Generate { count } => {
+            let data = rpc_require_daemon(
                 db,
-                None,
+                RpcMethod::Generate { count },
+            )?;
+            println!("Generated {} messages in {}", data["count"], db);
+        }
+
+        Commands::AssertNow { predicate } => {
+            let data = rpc_require_daemon(
+                db,
                 RpcMethod::AssertNow {
                     predicate: predicate.clone(),
                 },
@@ -475,9 +453,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             timeout_ms,
             interval_ms,
         } => {
-            let data = try_rpc_or_direct(
+            let data = rpc_require_daemon(
                 db,
-                None,
                 RpcMethod::AssertEventually {
                     predicate: predicate.clone(),
                     timeout_ms,
@@ -502,9 +479,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
 
         Commands::React { emoji, target } => {
-            let data = try_rpc_or_direct(
+            let data = rpc_require_daemon(
                 db,
-                None,
                 RpcMethod::React {
                     target,
                     emoji: emoji.clone(),
@@ -516,9 +492,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
 
         Commands::DeleteMessage { target } => {
-            let data = try_rpc_or_direct(
+            let data = rpc_require_daemon(
                 db,
-                None,
                 RpcMethod::DeleteMessage { target },
             )?;
             let target_str = data["target"].as_str().unwrap_or("");
@@ -529,7 +504,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
 
         Commands::Reactions => {
-            let data = try_rpc_or_direct(db, None, RpcMethod::Reactions)?;
+            let data = rpc_require_daemon(db, RpcMethod::Reactions)?;
             println!("REACTIONS ({}):", db);
             if let Some(items) = data.as_array() {
                 if items.is_empty() {
@@ -550,7 +525,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
 
         Commands::Users => {
-            let data = try_rpc_or_direct(db, None, RpcMethod::Users)?;
+            let data = rpc_require_daemon(db, RpcMethod::Users)?;
             println!("USERS ({}):", db);
             if let Some(items) = data.as_array() {
                 if items.is_empty() {
@@ -570,7 +545,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
 
         Commands::Keys { summary } => {
-            let data = try_rpc_or_direct(db, None, RpcMethod::Keys { summary })?;
+            let data = rpc_require_daemon(db, RpcMethod::Keys { summary })?;
             println!("KEYS ({}):", db);
             println!("  Users: {}", data["user_count"]);
             println!("  Peers: {}", data["peer_count"]);
@@ -591,7 +566,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
 
         Commands::Networks => {
-            let data = try_rpc_or_direct(db, None, RpcMethod::Workspaces)?;
+            let data = rpc_require_daemon(db, RpcMethod::Workspaces)?;
             println!("WORKSPACES ({}):", db);
             if let Some(items) = data.as_array() {
                 if items.is_empty() {
@@ -632,9 +607,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
 
         Commands::IntroAttempts { peer } => {
-            let data = try_rpc_or_direct(
+            let data = rpc_require_daemon(
                 db,
-                None,
                 RpcMethod::IntroAttempts { peer },
             )?;
             if let Some(items) = data.as_array() {
@@ -664,6 +638,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             } else {
                 println!("No intro attempts recorded.");
             }
+        }
+
+        Commands::CreateInvite { bootstrap } => {
+            let data = rpc_require_daemon(
+                db,
+                RpcMethod::CreateInvite { bootstrap },
+            )?;
+            println!("{}", data["invite_link"].as_str().unwrap_or(""));
         }
     }
 

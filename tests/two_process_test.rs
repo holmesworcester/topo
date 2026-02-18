@@ -1,8 +1,9 @@
-//! Two-process integration test: real QUIC sync between separate CLI invocations.
+//! Two-process integration test: real QUIC sync between separate daemon invocations.
 //!
 //! This test validates the full invite + bootstrap sync + ongoing sync flow
 //! using real separate processes, just like a user would run from the command line.
 
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
@@ -15,12 +16,54 @@ fn random_port() -> u16 {
     listener.local_addr().unwrap().port()
 }
 
+fn socket_path_for_db(db: &str) -> PathBuf {
+    topo::service::socket_path_for_db(db)
+}
+
+fn create_workspace(db: &str) {
+    let out = Command::new(bin())
+        .args(["create-workspace", "--db", db])
+        .output()
+        .expect("create-workspace");
+    assert!(
+        out.status.success(),
+        "create-workspace failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn start_daemon(db: &str, bind_port: u16) -> Child {
+    let socket = socket_path_for_db(db);
+    let mut cmd = Command::new(bin());
+    cmd.arg("--db")
+        .arg(db)
+        .arg("start")
+        .arg("--bind")
+        .arg(format!("127.0.0.1:{}", bind_port))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    let child = cmd.spawn().expect("failed to start daemon");
+
+    let start = std::time::Instant::now();
+    while !socket.exists() && start.elapsed().as_secs() < 5 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        socket.exists(),
+        "daemon socket did not appear at {}",
+        socket.display()
+    );
+
+    child
+}
+
 fn send_message(db: &str, content: &str) -> String {
     let output = Command::new(bin())
-        .arg("send")
-        .arg(content)
         .arg("--db")
         .arg(db)
+        .arg("send")
+        .arg(content)
         .output()
         .expect("failed to run send");
     assert!(
@@ -36,24 +79,11 @@ fn send_message(db: &str, content: &str) -> String {
         .to_string()
 }
 
-fn start_sync(db: &str, bind_port: u16) -> Child {
-    let mut cmd = Command::new(bin());
-    cmd.arg("sync")
-        .arg("--bind")
-        .arg(format!("127.0.0.1:{}", bind_port))
-        .arg("--db")
-        .arg(db)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-
-    cmd.spawn().expect("failed to start sync process")
-}
-
 fn create_invite(db: &str, bootstrap_addr: &str) -> String {
     let output = Command::new(bin())
-        .arg("create-invite")
         .arg("--db")
         .arg(db)
+        .arg("create-invite")
         .arg("--bootstrap")
         .arg(bootstrap_addr)
         .output()
@@ -91,10 +121,10 @@ fn accept_invite(db: &str, invite_link: &str, username: &str, devicename: &str) 
 
 fn assert_eventually(db: &str, predicate: &str, timeout_ms: u64) {
     let output = Command::new(bin())
-        .arg("assert-eventually")
-        .arg(predicate)
         .arg("--db")
         .arg(db)
+        .arg("assert-eventually")
+        .arg(predicate)
         .arg("--timeout-ms")
         .arg(timeout_ms.to_string())
         .output()
@@ -110,10 +140,10 @@ fn assert_eventually(db: &str, predicate: &str, timeout_ms: u64) {
 
 fn assert_now(db: &str, predicate: &str) {
     let output = Command::new(bin())
-        .arg("assert-now")
-        .arg(predicate)
         .arg("--db")
         .arg(db)
+        .arg("assert-now")
+        .arg(predicate)
         .output()
         .expect("failed to run assert-now");
     let text = String::from_utf8_lossy(&output.stdout);
@@ -127,9 +157,9 @@ fn assert_now(db: &str, predicate: &str) {
 
 fn get_messages(db: &str) -> Vec<String> {
     let output = Command::new(bin())
-        .arg("messages")
         .arg("--db")
         .arg(db)
+        .arg("messages")
         .output()
         .expect("failed to run messages");
     let text = String::from_utf8_lossy(&output.stdout);
@@ -149,11 +179,10 @@ fn get_messages(db: &str) -> Vec<String> {
 
 /// Full two-process invite + bootstrap sync + ongoing sync test.
 ///
-/// 1. Alice bootstraps a workspace (via `send`)
+/// 1. Alice creates workspace and starts daemon
 /// 2. Alice creates an invite
-/// 3. Alice runs sync
-/// 4. Bob accepts the invite (real QUIC bootstrap sync from Alice)
-/// 5. Both run sync, exchange messages, verify convergence
+/// 3. Bob accepts the invite (real QUIC bootstrap sync from Alice)
+/// 4. Both run daemons, exchange messages, verify convergence
 #[test]
 fn test_two_process_invite_and_sync() {
     let tmpdir = tempfile::tempdir().unwrap();
@@ -164,12 +193,14 @@ fn test_two_process_invite_and_sync() {
     let alice_port = random_port();
     let bob_port = random_port();
 
-    // Step 1: Alice bootstraps her workspace by sending an initial message.
-    // This creates: Network, InviteAccepted, UserInviteBoot, UserBoot,
-    // DeviceInviteFirst, PeerSharedFirst, AdminBoot + the message itself.
+    // Step 1: Alice creates workspace and starts daemon.
+    create_workspace(&alice_db);
+    let mut alice_daemon = start_daemon(&alice_db, alice_port);
+
+    // Alice sends initial message via daemon.
     let alice_first_eid = send_message(&alice_db, "Hello world from alice");
 
-    // Step 2: Alice creates an invite pointing to her sync address.
+    // Step 2: Alice creates an invite pointing to her sync address (via daemon RPC).
     let invite_link = create_invite(&alice_db, &format!("127.0.0.1:{}", alice_port));
     assert!(
         invite_link.starts_with("quiet://invite/"),
@@ -177,24 +208,18 @@ fn test_two_process_invite_and_sync() {
         invite_link
     );
 
-    // Step 3: Start Alice's sync. The pending_invite_bootstrap_trust from
-    // create-invite means Alice will accept Bob's bootstrap cert.
-    let mut alice_sync = start_sync(&alice_db, alice_port);
-    std::thread::sleep(Duration::from_millis(500));
-
-    // Step 4: Bob accepts the invite. This connects to Alice's sync endpoint
+    // Step 3: Bob accepts the invite. This connects to Alice's sync endpoint
     // via real QUIC, fetches prerequisite events, then creates Bob's identity chain.
     accept_invite(&bob_db, &invite_link, "bob", "laptop");
 
     // Verify Bob has Alice's first message from bootstrap sync.
-    assert_now(&bob_db, &format!("has_event:{} >= 1", alice_first_eid));
-
-    // Step 5: Start Bob's sync. Both now have invite_bootstrap_trust entries
-    // and Bob can autodial Alice without manual peer targeting.
-    let mut bob_sync = start_sync(&bob_db, bob_port);
+    // Bob's daemon is needed for assert-now, so start it first.
+    let mut bob_daemon = start_daemon(&bob_db, bob_port);
     std::thread::sleep(Duration::from_secs(1));
 
-    // Step 6: Exchange messages and verify convergence.
+    assert_now(&bob_db, &format!("has_event:{} >= 1", alice_first_eid));
+
+    // Step 4: Exchange messages and verify convergence.
     let alice_second_eid = send_message(&alice_db, "Second message from alice");
     let bob_eid = send_message(&bob_db, "Hello from bob");
 
@@ -245,8 +270,8 @@ fn test_two_process_invite_and_sync() {
     );
 
     // Cleanup
-    let _ = alice_sync.kill();
-    let _ = bob_sync.kill();
-    let _ = alice_sync.wait();
-    let _ = bob_sync.wait();
+    let _ = alice_daemon.kill();
+    let _ = bob_daemon.kill();
+    let _ = alice_daemon.wait();
+    let _ = bob_daemon.wait();
 }

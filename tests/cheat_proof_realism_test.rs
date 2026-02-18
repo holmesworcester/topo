@@ -41,15 +41,14 @@ fn run_topo(args: &[&str]) -> Output {
         .expect("failed to run topo")
 }
 
-fn create_invite(db: &str, bootstrap_addr: &str) -> String {
-    let out = run_topo(&["create-invite", "--db", db, "--bootstrap", bootstrap_addr]);
+fn create_workspace(db: &str) {
+    let out = run_topo(&["create-workspace", "--db", db]);
     assert!(
         out.status.success(),
-        "create-invite failed: stdout={} stderr={}",
+        "create-workspace failed: stdout={} stderr={}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
 fn accept_invite(db: &str, invite_link: &str) {
@@ -176,17 +175,24 @@ fn bootstrap_alice_and_invite(tmpdir: &tempfile::TempDir) -> (String, String, St
     let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
     let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
 
-    let alice_bootstrap = run_topo(&["send", "alice-bootstrap", "--db", &alice_db]);
-    assert!(
-        alice_bootstrap.status.success(),
-        "alice bootstrap send failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&alice_bootstrap.stdout),
-        String::from_utf8_lossy(&alice_bootstrap.stderr)
-    );
-
     let alice_port = random_port();
     let bob_port = random_port();
-    let invite_link = create_invite(&alice_db, &format!("127.0.0.1:{}", alice_port));
+
+    // Create workspace for Alice (identity chain)
+    create_workspace(&alice_db);
+
+    // Start Alice's daemon so we can create invites via RPC
+    // (Daemon is returned via the test — caller will hold it)
+    // We need the daemon running to create invites, so we start it here
+    // and return the invite link. Caller will start their own Daemon.
+    let _alice_daemon = Daemon::start(&alice_db, alice_port);
+
+    // Create invite via daemon RPC
+    let invite_link = topo_create_invite(&alice_db, &format!("127.0.0.1:{}", alice_port));
+
+    // Kill temporary daemon — caller will start their own
+    drop(_alice_daemon);
+
     (alice_db, bob_db, invite_link, alice_port, bob_port)
 }
 
@@ -221,26 +227,26 @@ fn test_daemon_cli_invite_lifecycle_works_without_restart() {
     let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
     let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
 
-    // Both peers already have local identities so daemons can start immediately.
-    let alice_bootstrap = run_topo(&["send", "alice-bootstrap", "--db", &alice_db]);
-    assert!(alice_bootstrap.status.success(), "alice bootstrap send failed");
-    let bob_bootstrap = run_topo(&["send", "bob-bootstrap", "--db", &bob_db]);
-    assert!(bob_bootstrap.status.success(), "bob bootstrap send failed");
-
     let alice_port = random_port();
     let bob_port = random_port();
 
+    // Create workspace for Alice and start her daemon.
+    create_workspace(&alice_db);
     let _alice = Daemon::start(&alice_db, alice_port);
-    let _bob = Daemon::start(&bob_db, bob_port);
 
-    // Create/accept invite entirely via unified CLI while Bob is already running.
+    // Create invite while Alice's daemon is running (via RPC).
     let invite_link = topo_create_invite(
         &alice_db,
         &format!("127.0.0.1:{}", alice_port),
     );
+
+    // Bob accepts invite before starting daemon (direct command, does bootstrap sync).
     topo_accept_invite(&bob_db, &invite_link);
 
-    // If runtime autodial refresh works, Bob reaches Alice without daemon restart.
+    // Bob starts daemon after accept-invite — auto-selects the shared workspace peer.
+    let _bob = Daemon::start(&bob_db, bob_port);
+
+    // Bob sends a message in the shared workspace via daemon RPC.
     let bob_event_id = topo_send(&bob_db, "runtime-accept-invite-no-restart");
     let out = topo_assert_eventually(
         &alice_db,

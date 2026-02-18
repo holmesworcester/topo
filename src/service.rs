@@ -95,24 +95,50 @@ fn open_db_load(
     Ok((recorded_by, conn))
 }
 
-/// Open DB, create tables, and require an existing transport peer ID.
-/// For write commands that operate on an already initialized identity.
-fn open_db_ensure(
+/// Open DB for a specific peer_id (used when daemon provides the active peer).
+fn open_db_for_peer(
     db_path: &str,
+    peer_id: &str,
 ) -> Result<(String, rusqlite::Connection), Box<dyn std::error::Error + Send + Sync>> {
     let conn = open_connection(db_path)?;
     create_tables(&conn)?;
-    let recorded_by = match load_transport_peer_id(&conn) {
-        Ok(peer_id) => peer_id,
-        Err(_) => bootstrap_event_derived_identity(&conn)
-            .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e))?,
-    };
-    Ok((recorded_by, conn))
+    Ok((peer_id.to_string(), conn))
+}
+
+/// Require that a local peer signer exists for this recorded_by, or error.
+fn require_local_peer_signer(
+    db: &rusqlite::Connection,
+    recorded_by: &str,
+) -> ServiceResult<(crate::crypto::EventId, ed25519_dalek::SigningKey)> {
+    load_local_peer_signer(db, recorded_by)?
+        .ok_or_else(|| ServiceError("no identity — run `topo create-workspace` first".into()))
+}
+
+/// Look up the workspace_id for a peer from trust_anchors.
+pub fn resolve_workspace_for_peer(
+    db: &rusqlite::Connection,
+    peer_id: &str,
+) -> ServiceResult<[u8; 32]> {
+    let ws_b64: String = db
+        .query_row(
+            "SELECT workspace_id FROM trust_anchors WHERE peer_id = ?1",
+            rusqlite::params![peer_id],
+            |row| row.get(0),
+        )
+        .map_err(|_| ServiceError(format!("no workspace found for peer {}", peer_id)))?;
+    event_id_from_base64(&ws_b64)
+        .ok_or_else(|| ServiceError(format!("invalid workspace_id in trust_anchors: {}", ws_b64)))
 }
 
 // ---------------------------------------------------------------------------
 // Response types (all Serialize for JSON output)
 // ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CreateWorkspaceResponse {
+    pub peer_id: String,
+    pub workspace_id: String,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TransportIdentityResponse {
@@ -396,33 +422,6 @@ pub fn load_local_peer_signer_pub(
     Ok(None)
 }
 
-fn load_any_event_local_peer_signer(
-    db: &rusqlite::Connection,
-) -> ServiceResult<Option<(String, SigningKey)>> {
-    ensure_local_signer_tables(db)?;
-
-    let row = db
-        .query_row(
-            "SELECT l.recorded_by, l.signing_key
-             FROM local_peer_signers l
-             INNER JOIN peers_shared p
-               ON p.recorded_by = l.recorded_by AND p.event_id = l.event_id
-             ORDER BY l.updated_at DESC
-             LIMIT 1",
-            [],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
-        )
-        .optional()?;
-
-    match row {
-        Some((recorded_by, key_bytes)) => {
-            let signing_key = decode_signing_key(key_bytes)?;
-            Ok(Some((recorded_by, signing_key)))
-        }
-        None => Ok(None),
-    }
-}
-
 pub fn ensure_identity_chain(
     db: &rusqlite::Connection,
     recorded_by: &str,
@@ -511,30 +510,6 @@ pub fn ensure_identity_chain(
     persist_workspace_key(db, recorded_by, &workspace_key)?;
 
     Ok((psf_eid, peer_shared_key))
-}
-
-fn bootstrap_event_derived_identity(
-    db: &rusqlite::Connection,
-) -> ServiceResult<String> {
-    if let Some((existing_recorded_by, existing_signer)) = load_any_event_local_peer_signer(db)? {
-        let derived = install_peer_key_transport_identity(db, &existing_signer)
-            .map_err(|e| ServiceError(format!("install transport identity failed: {}", e)))?;
-        if derived != existing_recorded_by {
-            crate::db::migrate_recorded_by(db, &derived, &existing_recorded_by)
-                .map_err(|e| ServiceError(format!("recorded_by migration failed: {}", e)))?;
-        }
-        return Ok(derived);
-    }
-
-    let bootstrap_recorded_by = format!("bootstrap-{}", current_timestamp_ms());
-    let (_eid, peer_shared_key) = ensure_identity_chain(db, &bootstrap_recorded_by)?;
-    let derived = install_peer_key_transport_identity(db, &peer_shared_key)
-        .map_err(|e| ServiceError(format!("install transport identity failed: {}", e)))?;
-    if derived != bootstrap_recorded_by {
-        crate::db::migrate_recorded_by(db, &derived, &bootstrap_recorded_by)
-            .map_err(|e| ServiceError(format!("recorded_by migration failed: {}", e)))?;
-    }
-    Ok(derived)
 }
 
 // ---------------------------------------------------------------------------
@@ -664,8 +639,46 @@ pub fn query_field(db: &rusqlite::Connection, field: &str, recorded_by: &str) ->
 // Service functions
 // ---------------------------------------------------------------------------
 
+pub fn svc_create_workspace(db_path: &str) -> ServiceResult<CreateWorkspaceResponse> {
+    let conn = open_connection(db_path)?;
+    create_tables(&conn)?;
+
+    // Check if identity already exists
+    if let Ok(peer_id) = load_transport_peer_id(&conn) {
+        // Already bootstrapped — return existing workspace info
+        let workspaces = svc_workspaces_conn(&conn, &peer_id)?;
+        if let Some(ws) = workspaces.first() {
+            return Ok(CreateWorkspaceResponse {
+                peer_id,
+                workspace_id: ws.event_id.clone(),
+            });
+        }
+    }
+
+    // Bootstrap new identity chain (creates Workspace + 5 identity events)
+    let bootstrap_rb = format!("bootstrap-{}", current_timestamp_ms());
+    let (_eid, peer_shared_key) = ensure_identity_chain(&conn, &bootstrap_rb)?;
+    let derived = install_peer_key_transport_identity(&conn, &peer_shared_key)
+        .map_err(|e| ServiceError(format!("install transport identity failed: {}", e)))?;
+    if derived != bootstrap_rb {
+        crate::db::migrate_recorded_by(&conn, &bootstrap_rb, &derived)
+            .map_err(|e| ServiceError(format!("recorded_by migration failed: {}", e)))?;
+    }
+
+    let workspaces = svc_workspaces_conn(&conn, &derived)?;
+    let workspace_id = workspaces
+        .first()
+        .map(|ws| ws.event_id.clone())
+        .unwrap_or_default();
+
+    Ok(CreateWorkspaceResponse {
+        peer_id: derived,
+        workspace_id,
+    })
+}
+
 pub fn svc_transport_identity(db_path: &str) -> ServiceResult<TransportIdentityResponse> {
-    let (fingerprint, _db) = open_db_ensure(db_path)
+    let (fingerprint, _db) = open_db_load(db_path)
         .map_err(|e| ServiceError(format!("{}", e)))?;
     Ok(TransportIdentityResponse { fingerprint })
 }
@@ -761,15 +774,16 @@ pub fn svc_send_conn(
     })
 }
 
-pub fn svc_send(
+/// Send a message as a specific peer (daemon provides the peer_id).
+pub fn svc_send_for_peer(
     db_path: &str,
-    workspace_hex: &str,
+    peer_id: &str,
     content: &str,
 ) -> ServiceResult<SendResponse> {
-    let (recorded_by, db) = open_db_ensure(db_path)?;
+    let (recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
 
-    let (signer_eid, signing_key) = ensure_identity_chain(&db, &recorded_by)?;
-    let workspace_id = parse_workspace_hex(workspace_hex)?;
+    let (signer_eid, signing_key) = require_local_peer_signer(&db, &recorded_by)?;
+    let workspace_id = resolve_workspace_for_peer(&db, &recorded_by)?;
     let author_id = stable_author_id(&recorded_by);
 
     svc_send_conn(&db, &recorded_by, &signer_eid, &signing_key, workspace_id, author_id, content)
@@ -818,15 +832,15 @@ pub fn svc_status(db_path: &str) -> ServiceResult<StatusResponse> {
     svc_status_conn(&db, &recorded_by)
 }
 
-pub fn svc_generate(
+pub fn svc_generate_for_peer(
     db_path: &str,
+    peer_id: &str,
     count: usize,
-    workspace_hex: &str,
 ) -> ServiceResult<GenerateResponse> {
-    let (recorded_by, db) = open_db_ensure(db_path)?;
+    let (recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
 
-    let (signer_eid, signing_key) = ensure_identity_chain(&db, &recorded_by)?;
-    let workspace_id = parse_workspace_hex(workspace_hex)?;
+    let (signer_eid, signing_key) = require_local_peer_signer(&db, &recorded_by)?;
+    let workspace_id = resolve_workspace_for_peer(&db, &recorded_by)?;
     let author_id: [u8; 32] = rand::random();
 
     db.execute("BEGIN", [])?;
@@ -933,14 +947,15 @@ pub fn svc_react_conn(
     })
 }
 
-pub fn svc_react(
+pub fn svc_react_for_peer(
     db_path: &str,
+    peer_id: &str,
     target_hex: &str,
     emoji: &str,
 ) -> ServiceResult<ReactResponse> {
-    let (recorded_by, db) = open_db_ensure(db_path)?;
+    let (recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
 
-    let (signer_eid, signing_key) = ensure_identity_chain(&db, &recorded_by)?;
+    let (signer_eid, signing_key) = require_local_peer_signer(&db, &recorded_by)?;
     let target_event_id = parse_hex_event_id(target_hex)?;
     let author_id = stable_author_id(&recorded_by);
 
@@ -971,13 +986,14 @@ pub fn svc_delete_message_conn(
     })
 }
 
-pub fn svc_delete_message(
+pub fn svc_delete_message_for_peer(
     db_path: &str,
+    peer_id: &str,
     target_hex: &str,
 ) -> ServiceResult<DeleteResponse> {
-    let (recorded_by, db) = open_db_ensure(db_path)?;
+    let (recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
 
-    let (signer_eid, signing_key) = ensure_identity_chain(&db, &recorded_by)?;
+    let (signer_eid, signing_key) = require_local_peer_signer(&db, &recorded_by)?;
     let target_event_id = parse_hex_event_id(target_hex)?;
     let author_id = stable_author_id(&recorded_by);
 
@@ -1757,36 +1773,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.db");
         let path_str = path.to_str().unwrap().to_string();
-        // Bootstrap identity using the service entrypoint.
-        svc_transport_identity(&path_str).unwrap();
         (dir, path_str)
     }
 
-    fn setup_with_workspace(db_path: &str) -> String {
-        let (recorded_by, db) = open_db_load(db_path).unwrap();
-        let (_eid, _key) = ensure_identity_chain(&db, &recorded_by).unwrap();
-
-        // Get the workspace hex for this identity chain
-        let ws_b64: String = db
-            .query_row(
-                "SELECT workspace_id FROM workspaces WHERE recorded_by = ?1 LIMIT 1",
-                rusqlite::params![&recorded_by],
-                |row| row.get(0),
-            )
-            .unwrap();
-        use base64::Engine;
-        let ws_bytes = base64::engine::general_purpose::STANDARD
-            .decode(&ws_b64)
-            .unwrap();
-        hex::encode(ws_bytes)
+    fn setup_workspace(db_path: &str) -> String {
+        let resp = svc_create_workspace(db_path).unwrap();
+        resp.peer_id
     }
 
     #[test]
     fn test_svc_send_succeeds_on_valid() {
         let (_dir, db_path) = temp_db_path();
-        let workspace_hex = setup_with_workspace(&db_path);
+        let peer_id = setup_workspace(&db_path);
 
-        let resp = svc_send(&db_path, &workspace_hex, "hello").unwrap();
+        let resp = svc_send_for_peer(&db_path, &peer_id, "hello").unwrap();
         assert_eq!(resp.content, "hello");
         assert!(!resp.event_id.is_empty());
     }
@@ -1794,22 +1794,22 @@ mod tests {
     #[test]
     fn test_svc_react_errors_on_blocked() {
         let (_dir, db_path) = temp_db_path();
-        let _workspace_hex = setup_with_workspace(&db_path);
+        let peer_id = setup_workspace(&db_path);
 
         // React to a non-existent target — reaction will block on missing dep
         let fake_target = hex::encode([0xDD_u8; 32]);
-        let result = svc_react(&db_path, &fake_target, "thumbsup");
+        let result = svc_react_for_peer(&db_path, &peer_id, &fake_target, "thumbsup");
         assert!(result.is_err(), "reaction to missing target should error, got: {:?}", result);
     }
 
     #[test]
     fn test_svc_delete_errors_on_blocked() {
         let (_dir, db_path) = temp_db_path();
-        let _workspace_hex = setup_with_workspace(&db_path);
+        let peer_id = setup_workspace(&db_path);
 
         // Delete a non-existent message — will block on missing dep
         let fake_target = hex::encode([0xEE_u8; 32]);
-        let result = svc_delete_message(&db_path, &fake_target);
+        let result = svc_delete_message_for_peer(&db_path, &peer_id, &fake_target);
         assert!(result.is_err(), "delete of missing target should error, got: {:?}", result);
     }
 
@@ -1817,11 +1817,15 @@ mod tests {
     fn test_ensure_identity_chain_tolerates_workspace_blocked() {
         // Workspace is created before trust anchor exists, so it blocks.
         // ensure_identity_chain must handle this via staged API.
+        // svc_create_workspace exercises this path.
         let (_dir, db_path) = temp_db_path();
-        let (recorded_by, db) = open_db_load(&db_path).unwrap();
+        let resp = svc_create_workspace(&db_path).unwrap();
+        assert!(!resp.peer_id.is_empty());
+        assert!(!resp.workspace_id.is_empty());
 
-        // This should succeed — workspace blocking is handled internally
-        let (eid, _key) = ensure_identity_chain(&db, &recorded_by).unwrap();
-        assert_ne!(eid, [0u8; 32]);
+        // Calling again should be idempotent (returns existing workspace).
+        let resp2 = svc_create_workspace(&db_path).unwrap();
+        assert_eq!(resp.peer_id, resp2.peer_id);
+        assert_eq!(resp.workspace_id, resp2.workspace_id);
     }
 }

@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 use rusqlite::Connection;
@@ -14,32 +15,62 @@ fn random_port() -> u16 {
     listener.local_addr().unwrap().port()
 }
 
-fn start_sync_with_options(db: &str, bind_port: u16, disable_placeholder_autodial: bool) -> Child {
+fn socket_path_for_db(db: &str) -> PathBuf {
+    topo::service::socket_path_for_db(db)
+}
+
+fn create_workspace(db: &str) {
+    let out = Command::new(bin())
+        .args(["create-workspace", "--db", db])
+        .output()
+        .expect("create-workspace");
+    assert!(
+        out.status.success(),
+        "create-workspace failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn start_daemon_with_options(db: &str, bind_port: u16, disable_placeholder_autodial: bool) -> Child {
+    let socket = socket_path_for_db(db);
     let mut cmd = Command::new(bin());
-    cmd.arg("sync")
+    cmd.arg("--db")
+        .arg(db)
+        .arg("start")
         .arg("--bind")
         .arg(format!("127.0.0.1:{}", bind_port))
-        .arg("--db")
-        .arg(db)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     if disable_placeholder_autodial {
         cmd.env("P7_DISABLE_PLACEHOLDER_AUTODIAL", "1");
     }
 
-    cmd.spawn().expect("failed to start sync process")
+    let child = cmd.spawn().expect("failed to start daemon");
+
+    // Wait for socket to appear.
+    let start = std::time::Instant::now();
+    while !socket.exists() && start.elapsed().as_secs() < 5 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        socket.exists(),
+        "daemon socket did not appear at {}",
+        socket.display()
+    );
+
+    child
 }
 
-fn start_sync(db: &str, bind_port: u16) -> Child {
-    start_sync_with_options(db, bind_port, false)
+fn start_daemon(db: &str, bind_port: u16) -> Child {
+    start_daemon_with_options(db, bind_port, false)
 }
 
 fn send_message(db: &str, content: &str) -> String {
     let output = Command::new(bin())
-        .arg("send")
-        .arg(content)
         .arg("--db")
         .arg(db)
+        .arg("send")
+        .arg(content)
         .output()
         .expect("failed to run send");
     assert!(
@@ -57,10 +88,10 @@ fn send_message(db: &str, content: &str) -> String {
 
 fn assert_now(db: &str, predicate: &str) {
     let output = Command::new(bin())
-        .arg("assert-now")
-        .arg(predicate)
         .arg("--db")
         .arg(db)
+        .arg("assert-now")
+        .arg(predicate)
         .output()
         .expect("failed to run assert-now");
     let text = String::from_utf8_lossy(&output.stdout);
@@ -74,10 +105,10 @@ fn assert_now(db: &str, predicate: &str) {
 
 fn assert_eventually(db: &str, predicate: &str, timeout_ms: u64) {
     let output = Command::new(bin())
-        .arg("assert-eventually")
-        .arg(predicate)
         .arg("--db")
         .arg(db)
+        .arg("assert-eventually")
+        .arg(predicate)
         .arg("--timeout-ms")
         .arg(timeout_ms.to_string())
         .output()
@@ -93,9 +124,9 @@ fn assert_eventually(db: &str, predicate: &str, timeout_ms: u64) {
 
 fn get_messages(db: &str) -> Vec<String> {
     let output = Command::new(bin())
-        .arg("messages")
         .arg("--db")
         .arg(db)
+        .arg("messages")
         .output()
         .expect("failed to run messages");
     let text = String::from_utf8_lossy(&output.stdout);
@@ -115,12 +146,12 @@ fn get_messages(db: &str) -> Vec<String> {
         .collect()
 }
 
-/// Helper: run create-invite CLI command. Returns the invite link printed to stdout.
+/// Helper: run create-invite CLI command (daemon-only). Returns the invite link printed to stdout.
 fn create_invite(db: &str, bootstrap_addr: &str) -> String {
     let output = Command::new(bin())
-        .arg("create-invite")
         .arg("--db")
         .arg(db)
+        .arg("create-invite")
         .arg("--bootstrap")
         .arg(bootstrap_addr)
         .output()
@@ -133,8 +164,7 @@ fn create_invite(db: &str, bootstrap_addr: &str) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
-/// Helper: run accept-invite CLI command. Installs deterministic transport cert,
-/// does bootstrap sync, creates identity chain, and records bootstrap trust.
+/// Helper: run accept-invite CLI command (direct, pre-daemon).
 fn accept_invite(db: &str, invite_link: &str) {
     let output = Command::new(bin())
         .arg("accept-invite")
@@ -159,8 +189,8 @@ fn count_rows(db: &str, table: &str) -> i64 {
 }
 
 /// Functional sync test using invite-based shared workspace flow.
-/// Alice bootstraps identity, creates invite, starts sync.
-/// Bob accepts invite (bootstrap sync), starts sync with invite-seeded autodial.
+/// Alice bootstraps identity, creates invite, starts daemon.
+/// Bob accepts invite (bootstrap sync), starts daemon with invite-seeded autodial.
 /// Both send messages in the shared workspace.
 #[test]
 fn test_cli_bidirectional_sync() {
@@ -172,22 +202,24 @@ fn test_cli_bidirectional_sync() {
     let alice_port = random_port();
     let bob_port = random_port();
 
-    // Alice bootstraps identity chain (workspace + keys)
+    // Alice creates workspace (identity chain)
+    create_workspace(&alice_db);
+
+    // Alice starts daemon (auto-selects single peer)
+    let mut alice = start_daemon(&alice_db, alice_port);
+
+    // Alice sends messages via daemon RPC
     send_message(&alice_db, "Hello from Alice");
     let alice_eid = send_message(&alice_db, "How are you?");
 
-    // Alice creates invite
+    // Alice creates invite (via daemon RPC)
     let invite_link = create_invite(&alice_db, &format!("127.0.0.1:{}", alice_port));
-
-    // Alice starts sync
-    let mut alice = start_sync(&alice_db, alice_port);
-    std::thread::sleep(Duration::from_millis(500));
 
     // Bob accepts invite (bootstrap sync from Alice)
     accept_invite(&bob_db, &invite_link);
 
-    // Bob starts sync; daemon uses invite-seeded autodial to reach Alice.
-    let mut bob = start_sync(&bob_db, bob_port);
+    // Bob starts daemon; invite-seeded autodial reaches Alice.
+    let mut bob = start_daemon(&bob_db, bob_port);
     std::thread::sleep(Duration::from_secs(1));
 
     // Bob sends a message in the shared workspace
@@ -227,17 +259,19 @@ fn test_cli_ongoing_sync() {
     let alice_port = random_port();
     let bob_port = random_port();
 
-    // Alice bootstraps identity
+    // Alice creates workspace and starts daemon
+    create_workspace(&alice_db);
+    let mut alice = start_daemon(&alice_db, alice_port);
+
+    // Alice sends bootstrap message
     send_message(&alice_db, "bootstrap");
 
-    // Alice creates invite and starts sync
+    // Alice creates invite
     let invite_link = create_invite(&alice_db, &format!("127.0.0.1:{}", alice_port));
-    let mut alice = start_sync(&alice_db, alice_port);
-    std::thread::sleep(Duration::from_millis(500));
 
-    // Bob accepts invite and starts sync
+    // Bob accepts invite and starts daemon
     accept_invite(&bob_db, &invite_link);
-    let mut bob = start_sync(&bob_db, bob_port);
+    let mut bob = start_daemon(&bob_db, bob_port);
     std::thread::sleep(Duration::from_secs(1));
 
     // Both send messages over time
@@ -269,17 +303,17 @@ fn test_cli_local_mdns_discovery_without_placeholder_autodial() {
     let alice_port = random_port();
     let bob_port = random_port();
 
-    // Bootstrap Alice and produce an invite Bob can accept.
+    // Alice creates workspace and starts daemon
+    create_workspace(&alice_db);
+    let mut alice = start_daemon_with_options(&alice_db, alice_port, true);
+
+    // Alice sends seed message and creates invite
     let alice_seed_eid = send_message(&alice_db, "alice-seed");
     let invite_link = create_invite(&alice_db, &format!("127.0.0.1:{}", alice_port));
 
-    // Start both daemons with placeholder invite-autodial disabled so this test
-    // exercises LAN discovery + trust gating for ongoing sync.
-    let mut alice = start_sync_with_options(&alice_db, alice_port, true);
-    std::thread::sleep(Duration::from_millis(700));
-
+    // Bob accepts invite and starts daemon with placeholder autodial disabled
     accept_invite(&bob_db, &invite_link);
-    let mut bob = start_sync_with_options(&bob_db, bob_port, true);
+    let mut bob = start_daemon_with_options(&bob_db, bob_port, true);
     std::thread::sleep(Duration::from_secs(2));
 
     // Validate bidirectional convergence.
@@ -295,9 +329,13 @@ fn test_cli_local_mdns_discovery_without_placeholder_autodial() {
 
 #[test]
 fn test_cli_send_and_messages() {
-    // Basic test: send/messages work without sync running
+    // Basic test: create workspace, start daemon, send/messages work
     let tmpdir = tempfile::tempdir().unwrap();
     let db = tmpdir.path().join("test.db").to_str().unwrap().to_string();
+    let port = random_port();
+
+    create_workspace(&db);
+    let mut daemon = start_daemon(&db, port);
 
     let _first_eid = send_message(&db, "First message");
     let second_eid = send_message(&db, "Second message");
@@ -309,6 +347,9 @@ fn test_cli_send_and_messages() {
     assert_eq!(messages.len(), 2);
     assert!(messages.contains(&"First message".to_string()));
     assert!(messages.contains(&"Second message".to_string()));
+
+    let _ = daemon.kill();
+    let _ = daemon.wait();
 }
 
 /// TRUST POLICY TEST: untrusted peer is rejected.
@@ -323,19 +364,16 @@ fn test_cli_unpinned_peer_rejected() {
     let alice_port = random_port();
     let bob_port = random_port();
 
-    // Alice bootstraps identity (creates workspace, identity chain, TransportKey)
+    // Alice creates workspace and starts daemon
+    create_workspace(&alice_db);
+    let mut alice = start_daemon(&alice_db, alice_port);
+
+    // Alice sends a message
     send_message(&alice_db, "alice bootstrap");
 
-    // Bob bootstraps his own independent identity
-    send_message(&bob_db, "bob bootstrap");
-
-    // Alice starts sync (has PeerShared self-trust from identity chain)
-    let mut alice = start_sync(&alice_db, alice_port);
-    std::thread::sleep(Duration::from_millis(500));
-
-    // Bob starts sync; with independent identity/workspace he should still be rejected.
-    let mut bob = start_sync(&bob_db, bob_port);
-    std::thread::sleep(Duration::from_secs(1));
+    // Bob creates independent workspace (not in Alice's workspace)
+    create_workspace(&bob_db);
+    let mut bob = start_daemon(&bob_db, bob_port);
 
     // Bob sends a message
     let bob_eid = send_message(&bob_db, "Should not arrive");
@@ -410,20 +448,18 @@ fn test_cli_sync_bootstrap_from_accepted_invite_data() {
     let alice_port = random_port();
     let bob_port = random_port();
 
-    // Bootstrap Alice's identity chain (workspace + keys) so create-invite
-    // can find the workspace key. send triggers ensure_identity_chain.
+    // Alice creates workspace and starts daemon
+    create_workspace(&alice_db);
+    let mut alice = start_daemon(&alice_db, alice_port);
+
+    // Alice sends bootstrap message
     send_message(&alice_db, "bootstrap");
 
-    // Alice creates invite (records pending trust with derived invitee SPKI).
+    // Alice creates invite (via daemon RPC)
     let invite_link = create_invite(
         &alice_db,
         &format!("127.0.0.1:{}", alice_port),
     );
-
-    // Alice must be running sync before Bob accepts (accept-invite does
-    // bootstrap sync to fetch prerequisite workspace events from Alice).
-    let mut alice = start_sync(&alice_db, alice_port);
-    std::thread::sleep(Duration::from_millis(500));
 
     // Bob accepts invite: installs deterministic cert, bootstrap-syncs from
     // Alice, creates identity chain, records bootstrap trust.
@@ -441,8 +477,8 @@ fn test_cli_sync_bootstrap_from_accepted_invite_data() {
         "invitee should eventually project inviter secret_shared after local key materialization"
     );
 
-    // Bob starts ongoing sync; invite bootstrap trust seeds daemon autodial.
-    let mut bob = start_sync(&bob_db, bob_port);
+    // Bob starts daemon; invite bootstrap trust seeds daemon autodial.
+    let mut bob = start_daemon(&bob_db, bob_port);
     std::thread::sleep(Duration::from_secs(1));
 
     let bob_eid = send_message(&bob_db, "bootstrap trust from invite data");

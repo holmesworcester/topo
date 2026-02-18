@@ -7,10 +7,12 @@ use std::io::Write;
 use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
+use serde::Serialize;
 use tracing::{info, warn};
 
+use crate::db::transport_creds::discover_local_tenants;
 use crate::rpc::protocol::*;
 use crate::service;
 
@@ -18,11 +20,54 @@ use crate::service;
 /// Additional connections block until a slot is freed.
 const MAX_CONCURRENT_CONNECTIONS: usize = 64;
 
+/// Daemon-wide shared state: tracks active peer for CLI commands.
+pub struct DaemonState {
+    pub db_path: String,
+    pub active_peer: RwLock<Option<String>>,
+}
+
+impl DaemonState {
+    /// Create state with auto-selected peer if exactly one tenant exists.
+    pub fn new(db_path: &str) -> Self {
+        let active = match crate::db::open_connection(db_path) {
+            Ok(conn) => {
+                let _ = crate::db::schema::create_tables(&conn);
+                match discover_local_tenants(&conn) {
+                    Ok(tenants) if tenants.len() == 1 => Some(tenants[0].peer_id.clone()),
+                    _ => None,
+                }
+            }
+            Err(_) => None,
+        };
+        DaemonState {
+            db_path: db_path.to_string(),
+            active_peer: RwLock::new(active),
+        }
+    }
+
+    fn require_active_peer(&self) -> Result<String, String> {
+        self.active_peer
+            .read()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| "no active peer — run `topo use-peer <N>`".to_string())
+    }
+}
+
+/// Peer info returned by the Peers command.
+#[derive(Debug, Serialize)]
+struct PeerItem {
+    index: usize,
+    peer_id: String,
+    workspace_id: String,
+    active: bool,
+}
+
 /// Run the RPC server on a Unix socket, dispatching to service functions.
 /// Blocks the calling thread. Intended to be run in a background thread.
 pub fn run_rpc_server(
     socket_path: &Path,
-    db_path: Arc<String>,
+    state: Arc<DaemonState>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Remove stale socket file if it exists.
@@ -58,13 +103,13 @@ pub fn run_rpc_server(
                     continue;
                 }
 
-                let db = db_path.clone();
+                let st = state.clone();
                 let active_clone = active.clone();
                 let shutdown_clone = shutdown.clone();
                 active.fetch_add(1, AtomicOrdering::Relaxed);
 
                 std::thread::spawn(move || {
-                    if let Err(e) = handle_connection(stream, &db, &shutdown_clone) {
+                    if let Err(e) = handle_connection(stream, &st, &shutdown_clone) {
                         warn!("RPC connection error: {}", e);
                     }
                     active_clone.fetch_sub(1, AtomicOrdering::Relaxed);
@@ -89,7 +134,7 @@ pub fn run_rpc_server(
 
 fn handle_connection(
     mut stream: std::os::unix::net::UnixStream,
-    db_path: &str,
+    state: &DaemonState,
     shutdown: &std::sync::atomic::AtomicBool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Set blocking for this connection.
@@ -109,27 +154,149 @@ fn handle_connection(
         return Ok(());
     }
 
-    let resp = dispatch(db_path, req.method, shutdown);
+    let resp = dispatch(state, req.method, shutdown);
     let frame = encode_frame(&resp)?;
     stream.write_all(&frame)?;
     stream.flush()?;
     Ok(())
 }
 
-fn dispatch(db_path: &str, method: RpcMethod, shutdown: &std::sync::atomic::AtomicBool) -> RpcResponse {
+fn dispatch(state: &DaemonState, method: RpcMethod, shutdown: &std::sync::atomic::AtomicBool) -> RpcResponse {
+    let db_path = &state.db_path;
+
     match method {
         RpcMethod::Shutdown => {
-            // Signal the server to shut down, then reply success.
             shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
-            // Also exit the main process so the daemon stops.
-            // We spawn a thread that waits briefly (to let the response flush),
-            // then exits the process.
             std::thread::spawn(|| {
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 std::process::exit(0);
             });
             RpcResponse::success(serde_json::json!({"shutdown": true}))
         }
+
+        // ----- Peer management (daemon state) -----
+
+        RpcMethod::Peers => {
+            match crate::db::open_connection(db_path) {
+                Ok(conn) => {
+                    let _ = crate::db::schema::create_tables(&conn);
+                    match discover_local_tenants(&conn) {
+                        Ok(tenants) => {
+                            let active = state.active_peer.read().unwrap().clone();
+                            let mut items: Vec<PeerItem> = tenants
+                                .iter()
+                                .enumerate()
+                                .map(|(i, t)| PeerItem {
+                                    index: i + 1,
+                                    peer_id: t.peer_id.clone(),
+                                    workspace_id: t.workspace_id.clone(),
+                                    active: active.as_deref() == Some(&t.peer_id),
+                                })
+                                .collect();
+                            items.sort_by(|a, b| a.peer_id.cmp(&b.peer_id));
+                            // Re-number after sort
+                            for (i, item) in items.iter_mut().enumerate() {
+                                item.index = i + 1;
+                            }
+                            RpcResponse::success(serde_json::json!(items))
+                        }
+                        Err(e) => RpcResponse::error(e.to_string()),
+                    }
+                }
+                Err(e) => RpcResponse::error(e.to_string()),
+            }
+        }
+
+        RpcMethod::UsePeer { index } => {
+            match crate::db::open_connection(db_path) {
+                Ok(conn) => {
+                    let _ = crate::db::schema::create_tables(&conn);
+                    match discover_local_tenants(&conn) {
+                        Ok(mut tenants) => {
+                            tenants.sort_by(|a, b| a.peer_id.cmp(&b.peer_id));
+                            if index == 0 || index > tenants.len() {
+                                return RpcResponse::error(format!(
+                                    "invalid peer number {}; available: 1-{}",
+                                    index, tenants.len()
+                                ));
+                            }
+                            let tenant = &tenants[index - 1];
+                            *state.active_peer.write().unwrap() = Some(tenant.peer_id.clone());
+                            RpcResponse::success(serde_json::json!({
+                                "peer_id": tenant.peer_id,
+                                "workspace_id": tenant.workspace_id,
+                            }))
+                        }
+                        Err(e) => RpcResponse::error(e.to_string()),
+                    }
+                }
+                Err(e) => RpcResponse::error(e.to_string()),
+            }
+        }
+
+        RpcMethod::ActivePeer => {
+            let active = state.active_peer.read().unwrap().clone();
+            match active {
+                Some(peer_id) => RpcResponse::success(serde_json::json!({"peer_id": peer_id})),
+                None => RpcResponse::success(serde_json::json!({"peer_id": null})),
+            }
+        }
+
+        RpcMethod::CreateWorkspace => {
+            match service::svc_create_workspace(db_path) {
+                Ok(resp) => {
+                    // Auto-select newly created peer if none active
+                    let mut ap = state.active_peer.write().unwrap();
+                    if ap.is_none() {
+                        *ap = Some(resp.peer_id.clone());
+                    }
+                    RpcResponse::success(resp)
+                }
+                Err(e) => RpcResponse::error(e.to_string()),
+            }
+        }
+
+        // ----- Commands that need active peer -----
+
+        RpcMethod::Send { content } => {
+            match state.require_active_peer() {
+                Ok(peer_id) => match service::svc_send_for_peer(db_path, &peer_id, &content) {
+                    Ok(data) => RpcResponse::success(data),
+                    Err(e) => RpcResponse::error(e.to_string()),
+                },
+                Err(e) => RpcResponse::error(e),
+            }
+        }
+        RpcMethod::Generate { count } => {
+            match state.require_active_peer() {
+                Ok(peer_id) => match service::svc_generate_for_peer(db_path, &peer_id, count) {
+                    Ok(data) => RpcResponse::success(data),
+                    Err(e) => RpcResponse::error(e.to_string()),
+                },
+                Err(e) => RpcResponse::error(e),
+            }
+        }
+        RpcMethod::React { target, emoji } => {
+            match state.require_active_peer() {
+                Ok(peer_id) => match service::svc_react_for_peer(db_path, &peer_id, &target, &emoji) {
+                    Ok(data) => RpcResponse::success(data),
+                    Err(e) => RpcResponse::error(e.to_string()),
+                },
+                Err(e) => RpcResponse::error(e),
+            }
+        }
+        RpcMethod::DeleteMessage { target } => {
+            match state.require_active_peer() {
+                Ok(peer_id) => match service::svc_delete_message_for_peer(db_path, &peer_id, &target) {
+                    Ok(data) => RpcResponse::success(data),
+                    Err(e) => RpcResponse::error(e.to_string()),
+                },
+                Err(e) => RpcResponse::error(e),
+            }
+        }
+
+        // ----- Read-only commands (no active peer needed) -----
+
         RpcMethod::TransportIdentity => match service::svc_transport_identity(db_path) {
             Ok(data) => RpcResponse::success(data),
             Err(e) => RpcResponse::error(e.to_string()),
@@ -138,22 +305,10 @@ fn dispatch(db_path: &str, method: RpcMethod, shutdown: &std::sync::atomic::Atom
             Ok(data) => RpcResponse::success(data),
             Err(e) => RpcResponse::error(e.to_string()),
         },
-        RpcMethod::Send { workspace, content } => {
-            match service::svc_send(db_path, &workspace, &content) {
-                Ok(data) => RpcResponse::success(data),
-                Err(e) => RpcResponse::error(e.to_string()),
-            }
-        }
         RpcMethod::Status => match service::svc_status(db_path) {
             Ok(data) => RpcResponse::success(data),
             Err(e) => RpcResponse::error(e.to_string()),
         },
-        RpcMethod::Generate { count, workspace } => {
-            match service::svc_generate(db_path, count, &workspace) {
-                Ok(data) => RpcResponse::success(data),
-                Err(e) => RpcResponse::error(e.to_string()),
-            }
-        }
         RpcMethod::AssertNow { predicate } => {
             match service::svc_assert_now(db_path, &predicate) {
                 Ok(data) => RpcResponse::success(data),
@@ -168,18 +323,6 @@ fn dispatch(db_path: &str, method: RpcMethod, shutdown: &std::sync::atomic::Atom
             Ok(data) => RpcResponse::success(data),
             Err(e) => RpcResponse::error(e.to_string()),
         },
-        RpcMethod::React { target, emoji } => {
-            match service::svc_react(db_path, &target, &emoji) {
-                Ok(data) => RpcResponse::success(data),
-                Err(e) => RpcResponse::error(e.to_string()),
-            }
-        }
-        RpcMethod::DeleteMessage { target } => {
-            match service::svc_delete_message(db_path, &target) {
-                Ok(data) => RpcResponse::success(data),
-                Err(e) => RpcResponse::error(e.to_string()),
-            }
-        }
         RpcMethod::Reactions => match service::svc_reactions(db_path) {
             Ok(data) => RpcResponse::success(data),
             Err(e) => RpcResponse::error(e.to_string()),
