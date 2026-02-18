@@ -355,7 +355,7 @@ Validation performed for this slice:
    - `e51fd33` - Strengthen plan with phase tracking and handoff context
    - `f7e5162` - Phase 2 complete: decouple projection internals from sync/network boundary
    - `547b21f` - Phase 3: extract replication session logic to `src/replication/`
-   - (pending) - Phase 4: extract network runtime to `src/network/`
+   - `c9ae259` - Phase 4: extract network boundary into `src/network/`
 4. Worktree status expectation before starting new work: `git status -sb` should be clean.
 
 ## Phase Status Tracker
@@ -714,7 +714,7 @@ Wire this into CI as a required check (same tier as `cargo test --lib`).
 | 3 | Direct `projection::pipeline::project_one` in `sync/engine.rs` | Pre-refactor | **Resolved in Phase 2** | Replaced by `drain_project_queue` |
 | 4 | `node.rs` re-export of `run_node` | Phase 4 | Phase 5 | `src/node.rs` (6 lines, re-export only) |
 | 5 | Direct runtime orchestration in `src/node.rs` | Pre-refactor | **Resolved in Phase 4** | Moved to `network/runtime.rs` |
-| 6 | Network-path direct dependency on `sync` internals | Pre-refactor | **Resolved in Phase 4** | Network now imports from `network::loops` directly |
+| 6 | Network-path dependency on `sync` internals (`session_handler`, `SyncMessage`, `punch`) | Pre-refactor | Phase 5 | `network/loops.rs` still imports `crate::sync::{session_handler, SyncMessage, punch}` |
 | 7 | Any remaining `anyhow::Result` at boundary traits | Various | Phase 5 | Grep `anyhow` in `src/contracts/` |
 
 ## Cross-Boundary Import Audit (2026-02-18)
@@ -741,7 +741,6 @@ by the phase indicated.
 | `src/replication/session.rs` | **855** (Phase 3 done) | ~855 (stable) | Phase 3 ✓ |
 | `src/network/runtime.rs` | **736** (Phase 4 done) | ~736 (stable) | Phase 4 ✓ |
 | `src/network/loops.rs` | **812** (Phase 4 done) | ~812 (stable) | Phase 4 ✓ |
-| `src/network/runtime.rs` | N/A (new) | ~580 (run_node + discovery + orchestration) | Phase 4 |
 
 ## Assistant Handoff Notes
 
