@@ -124,7 +124,7 @@ fn all_canonical_event_files_exist() {
 /// registered types (via the existing registry).
 #[test]
 fn all_registered_types_have_fixed_wire_size() {
-    use poc_7::events::{fixed_layout, registry};
+    use topo::events::{fixed_layout, registry};
 
     // For each type code 1..=26, verify the registry has an entry
     // and encoding produces a deterministic-length blob.

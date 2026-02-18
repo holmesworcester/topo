@@ -3,16 +3,8 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-fn bin_p7d() -> String {
-    env!("CARGO_BIN_EXE_p7d").to_string()
-}
-
-fn bin_p7ctl() -> String {
-    env!("CARGO_BIN_EXE_p7ctl").to_string()
-}
-
-fn bin_poc7() -> String {
-    env!("CARGO_BIN_EXE_poc-7").to_string()
+fn bin() -> String {
+    env!("CARGO_BIN_EXE_topo").to_string()
 }
 
 fn temp_db() -> (tempfile::TempDir, String) {
@@ -21,13 +13,17 @@ fn temp_db() -> (tempfile::TempDir, String) {
     (dir, db)
 }
 
+fn socket_path_for_db(db: &str) -> PathBuf {
+    topo::service::socket_path_for_db(db)
+}
+
 // ---------------------------------------------------------------------------
 // 1. RPC protocol unit tests
 // ---------------------------------------------------------------------------
 
 #[test]
 fn rpc_request_encode_decode_roundtrip() {
-    use poc_7::rpc::protocol::*;
+    use topo::rpc::protocol::*;
 
     let req = RpcRequest {
         version: PROTOCOL_VERSION,
@@ -44,7 +40,7 @@ fn rpc_request_encode_decode_roundtrip() {
 
 #[test]
 fn rpc_request_send_roundtrip() {
-    use poc_7::rpc::protocol::*;
+    use topo::rpc::protocol::*;
 
     let req = RpcRequest {
         version: PROTOCOL_VERSION,
@@ -66,8 +62,8 @@ fn rpc_request_send_roundtrip() {
 
 #[test]
 fn rpc_response_success_roundtrip() {
-    use poc_7::rpc::protocol::*;
-    use poc_7::service::StatusResponse;
+    use topo::rpc::protocol::*;
+    use topo::service::StatusResponse;
 
     let data = StatusResponse {
         events_count: 42,
@@ -88,7 +84,7 @@ fn rpc_response_success_roundtrip() {
 
 #[test]
 fn rpc_response_error_roundtrip() {
-    use poc_7::rpc::protocol::*;
+    use topo::rpc::protocol::*;
 
     let resp = RpcResponse::error("something went wrong");
     let frame = encode_frame(&resp).unwrap();
@@ -100,7 +96,7 @@ fn rpc_response_error_roundtrip() {
 
 #[test]
 fn rpc_all_methods_serialize() {
-    use poc_7::rpc::protocol::*;
+    use topo::rpc::protocol::*;
 
     let methods = vec![
         RpcMethod::Status,
@@ -136,6 +132,7 @@ fn rpc_all_methods_serialize() {
         RpcMethod::IntroAttempts {
             peer: Some("peer1".into()),
         },
+        RpcMethod::Shutdown,
     ];
 
     for method in methods {
@@ -150,38 +147,37 @@ fn rpc_all_methods_serialize() {
 }
 
 // ---------------------------------------------------------------------------
-// 2. Integration: daemon + p7ctl
+// 2. Integration: daemon via `topo start` + CLI commands
 // ---------------------------------------------------------------------------
 
 #[test]
-fn daemon_and_ctl_status() {
+fn daemon_and_cli_status() {
     let (_dir, db) = temp_db();
-    let socket = format!("{}.p7d.sock", &db);
+    let socket = socket_path_for_db(&db);
 
     // Bootstrap identity chain (workspace + PeerShared) so daemon can start sync.
-    let out = Command::new(bin_poc7())
+    let out = Command::new(bin())
         .args(["send", "bootstrap", "--db", &db])
         .output()
         .unwrap();
     assert!(out.status.success(), "bootstrap failed: {:?}", out);
 
     // Start daemon in background.
-    let mut daemon = Command::new(bin_p7d())
-        .args(["--db", &db, "--socket", &socket, "--bind", "127.0.0.1:0"])
+    let mut daemon = Command::new(bin())
+        .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
         .spawn()
         .unwrap();
 
     // Wait for socket to appear.
-    let socket_path = PathBuf::from(&socket);
     let start = std::time::Instant::now();
-    while !socket_path.exists() && start.elapsed().as_secs() < 5 {
+    while !socket.exists() && start.elapsed().as_secs() < 5 {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    assert!(socket_path.exists(), "daemon socket did not appear");
+    assert!(socket.exists(), "daemon socket did not appear");
 
-    // Query status via p7ctl.
-    let out = Command::new(bin_p7ctl())
-        .args(["--db", &db, "--socket", &socket, "status"])
+    // Query status via unified CLI (routes through daemon via RPC).
+    let out = Command::new(bin())
+        .args(["--db", &db, "status"])
         .output()
         .unwrap();
 
@@ -189,56 +185,52 @@ fn daemon_and_ctl_status() {
     let _ = daemon.kill();
     let _ = daemon.wait();
 
-    assert!(out.status.success(), "p7ctl status failed: {:?}", out);
+    assert!(out.status.success(), "status failed: {:?}", out);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(parsed["ok"], true);
-    assert!(parsed["data"]["events_count"].is_number());
+    assert!(stdout.contains("STATUS"), "status output should contain STATUS header");
+    assert!(stdout.contains("Events:"), "status output should contain Events count");
 }
 
 #[test]
-fn daemon_and_ctl_send_and_messages() {
+fn daemon_and_cli_send_and_messages() {
     let (_dir, db) = temp_db();
-    let socket = format!("{}.p7d.sock", &db);
+    let socket = socket_path_for_db(&db);
 
     // Bootstrap identity chain so daemon can start sync.
-    let out = Command::new(bin_poc7())
+    let out = Command::new(bin())
         .args(["send", "bootstrap", "--db", &db])
         .output()
         .unwrap();
     assert!(out.status.success());
 
     // Start daemon.
-    let mut daemon = Command::new(bin_p7d())
-        .args(["--db", &db, "--socket", &socket, "--bind", "127.0.0.1:0"])
+    let mut daemon = Command::new(bin())
+        .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
         .spawn()
         .unwrap();
 
-    let socket_path = PathBuf::from(&socket);
     let start = std::time::Instant::now();
-    while !socket_path.exists() && start.elapsed().as_secs() < 5 {
+    while !socket.exists() && start.elapsed().as_secs() < 5 {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 
-    // Send a message via p7ctl.
-    let out = Command::new(bin_p7ctl())
-        .args([
-            "--db", &db,
-            "--socket", &socket,
-            "send", "hello from p7ctl",
-        ])
+    // Send a message via unified CLI (routes through daemon via RPC).
+    let out = Command::new(bin())
+        .args(["--db", &db, "send", "hello from topo"])
         .output()
         .unwrap();
 
-    assert!(out.status.success(), "p7ctl send failed: {:?}", String::from_utf8_lossy(&out.stdout));
-    let send_resp: serde_json::Value =
-        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
-    assert_eq!(send_resp["ok"], true);
-    assert_eq!(send_resp["data"]["content"], "hello from p7ctl");
+    assert!(
+        out.status.success(),
+        "send failed: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Sent: hello from topo"));
 
     // Query messages.
-    let out = Command::new(bin_p7ctl())
-        .args(["--db", &db, "--socket", &socket, "messages"])
+    let out = Command::new(bin())
+        .args(["--db", &db, "messages"])
         .output()
         .unwrap();
 
@@ -247,61 +239,49 @@ fn daemon_and_ctl_send_and_messages() {
     let _ = daemon.wait();
 
     assert!(out.status.success());
-    let msgs_resp: serde_json::Value =
-        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
-    assert_eq!(msgs_resp["ok"], true);
-    assert_eq!(msgs_resp["data"]["total"], 2); // bootstrap + p7ctl message
-    // Find the p7ctl message in the list
-    let messages = msgs_resp["data"]["messages"].as_array().unwrap();
-    assert!(messages.iter().any(|m| m["content"] == "hello from p7ctl"),
-        "should find p7ctl message in list");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("hello from topo"),
+        "should find message in list, got: {}",
+        stdout
+    );
 }
 
 #[test]
-fn daemon_and_ctl_assert_now() {
+fn daemon_and_cli_assert_now() {
     let (_dir, db) = temp_db();
-    let socket = format!("{}.p7d.sock", &db);
+    let socket = socket_path_for_db(&db);
 
     // Bootstrap identity chain so daemon can start sync.
-    Command::new(bin_poc7())
+    Command::new(bin())
         .args(["send", "bootstrap", "--db", &db])
         .output()
         .unwrap();
 
     // Start daemon.
-    let mut daemon = Command::new(bin_p7d())
-        .args(["--db", &db, "--socket", &socket, "--bind", "127.0.0.1:0"])
+    let mut daemon = Command::new(bin())
+        .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
         .spawn()
         .unwrap();
 
-    let socket_path = PathBuf::from(&socket);
     let start = std::time::Instant::now();
-    while !socket_path.exists() && start.elapsed().as_secs() < 5 {
+    while !socket.exists() && start.elapsed().as_secs() < 5 {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 
     // Assert message_count == 1 (bootstrap message; should pass).
-    let out = Command::new(bin_p7ctl())
-        .args([
-            "--db", &db,
-            "--socket", &socket,
-            "assert-now", "message_count == 1",
-        ])
+    let out = Command::new(bin())
+        .args(["--db", &db, "assert-now", "message_count == 1"])
         .output()
         .unwrap();
 
     assert!(out.status.success(), "assert-now should pass");
-    let resp: serde_json::Value =
-        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
-    assert_eq!(resp["data"]["pass"], true);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("PASS"));
 
     // Assert message_count == 99 (should fail with exit 1).
-    let out = Command::new(bin_p7ctl())
-        .args([
-            "--db", &db,
-            "--socket", &socket,
-            "assert-now", "message_count == 99",
-        ])
+    let out = Command::new(bin())
+        .args(["--db", &db, "assert-now", "message_count == 99"])
         .output()
         .unwrap();
 
@@ -310,27 +290,35 @@ fn daemon_and_ctl_assert_now() {
     let _ = daemon.wait();
 
     assert_eq!(out.status.code(), Some(1), "assert-now should fail with exit 1");
-    let resp: serde_json::Value =
-        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
-    assert_eq!(resp["data"]["pass"], false);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("FAIL"));
 }
 
 #[test]
-fn p7ctl_daemon_not_running_exit_code() {
+fn direct_fallback_when_daemon_not_running() {
     let (_dir, db) = temp_db();
-    let socket = format!("{}.p7d.sock", &db);
 
-    // Try to connect without a daemon running.
-    let out = Command::new(bin_p7ctl())
-        .args(["--db", &db, "--socket", &socket, "status"])
+    // Send without daemon — should fall back to direct DB access.
+    let out = Command::new(bin())
+        .args(["send", "direct msg", "--db", &db])
         .output()
         .unwrap();
+    assert!(
+        out.status.success(),
+        "direct send failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Sent: direct msg"));
 
-    assert_eq!(out.status.code(), Some(2), "should exit 2 when daemon not running");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let resp: serde_json::Value = serde_json::from_str(&stderr).unwrap();
-    assert_eq!(resp["ok"], false);
-    assert!(resp["error"].as_str().unwrap().contains("daemon not running"));
+    // Status without daemon — should fall back to direct DB access.
+    let out = Command::new(bin())
+        .args(["status", "--db", &db])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Messages:"));
 }
 
 // ---------------------------------------------------------------------------
@@ -342,16 +330,20 @@ fn cli_direct_send_and_status() {
     let (_dir, db) = temp_db();
 
     // Send a message via direct CLI.
-    let out = Command::new(bin_poc7())
+    let out = Command::new(bin())
         .args(["send", "direct msg", "--db", &db])
         .output()
         .unwrap();
-    assert!(out.status.success(), "direct send failed: {:?}", String::from_utf8_lossy(&out.stdout));
+    assert!(
+        out.status.success(),
+        "direct send failed: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("Sent: direct msg"));
 
     // Check status.
-    let out = Command::new(bin_poc7())
+    let out = Command::new(bin())
         .args(["status", "--db", &db])
         .output()
         .unwrap();
@@ -365,20 +357,20 @@ fn cli_direct_assert_now() {
     let (_dir, db) = temp_db();
 
     // Bootstrap with a send.
-    Command::new(bin_poc7())
+    Command::new(bin())
         .args(["send", "test", "--db", &db])
         .output()
         .unwrap();
 
     // assert-now message_count == 1.
-    let out = Command::new(bin_poc7())
+    let out = Command::new(bin())
         .args(["assert-now", "message_count == 1", "--db", &db])
         .output()
         .unwrap();
     assert!(out.status.success(), "assert-now should pass");
 
     // assert-now message_count == 0 (should fail).
-    let out = Command::new(bin_poc7())
+    let out = Command::new(bin())
         .args(["assert-now", "message_count == 0", "--db", &db])
         .output()
         .unwrap();
@@ -391,16 +383,16 @@ fn cli_direct_assert_now() {
 
 #[test]
 fn service_socket_path_derivation() {
-    let path = poc_7::service::socket_path_for_db("server.db");
-    assert!(path.to_str().unwrap().ends_with("server.p7d.sock"));
+    let path = topo::service::socket_path_for_db("server.db");
+    assert!(path.to_str().unwrap().ends_with("server.topo.sock"));
 
-    let path = poc_7::service::socket_path_for_db("/tmp/mydb.db");
-    assert_eq!(path.to_str().unwrap(), "/tmp/mydb.p7d.sock");
+    let path = topo::service::socket_path_for_db("/tmp/mydb.db");
+    assert_eq!(path.to_str().unwrap(), "/tmp/mydb.topo.sock");
 }
 
 #[test]
 fn service_predicate_parsing() {
-    use poc_7::service::parse_predicate;
+    use topo::service::parse_predicate;
 
     let (field, op, val) = parse_predicate("message_count == 10").unwrap();
     assert_eq!(field, "message_count");

@@ -15,7 +15,7 @@ pub struct RpcRequest {
     pub method: RpcMethod,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum RpcMethod {
     Status,
@@ -63,6 +63,7 @@ pub enum RpcMethod {
         username: String,
         devicename: String,
     },
+    Shutdown,
 }
 
 // ---------------------------------------------------------------------------

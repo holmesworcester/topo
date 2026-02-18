@@ -1,4 +1,4 @@
-# TODO: Design/Plan/Code Alignment Backlog (poc-7/master)
+# TODO: Design/Plan/Code Alignment Backlog (topo/master)
 
 Date: 2026-02-15
 
@@ -265,7 +265,7 @@ Completed:
 
 ## P1: Deprecate `--pin-peer` from product code and design after invite-trust maturity
 
-Evidence: `--pin-peer` remains a first-class CLI surface (`src/main.rs:53`, `src/main.rs:184`, `src/bin/p7d.rs:38`), runtime guidance still points users to it (`src/main.rs:984`, `src/service.rs:1002`), and design still documents it as an overlay (`docs/DESIGN.md:117`).
+Evidence: `--pin-peer` remains a first-class CLI surface (`src/main.rs:53`, `src/main.rs:184`, `src/main.rs (daemon start)`), runtime guidance still points users to it (`src/main.rs:984`, `src/service.rs:1002`), and design still documents it as an overlay (`docs/DESIGN.md:117`).
 
 Problem: retaining `--pin-peer` as a normal operational path undermines the event-derived trust model and keeps manual transport trust bootstrapping in the critical path after invite/bootstrap workflows are available.
 

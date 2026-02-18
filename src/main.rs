@@ -1,40 +1,61 @@
-use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
-use tracing::{Level};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use clap::{Parser, Subcommand};
+use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
-use poc_7::service;
+use topo::db::{open_connection, schema::create_tables};
+use topo::rpc::client::{rpc_call, RpcClientError};
+use topo::rpc::protocol::RpcMethod;
+use topo::rpc::server::run_rpc_server;
+use topo::service;
 
 #[derive(Parser)]
-#[command(name = "poc-7")]
+#[command(name = "topo")]
 #[command(about = "High-performance QUIC sync system")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+
+    /// Database path
+    #[arg(short, long, default_value = "server.db", global = true)]
+    db: String,
 }
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Start the daemon (runs sync + RPC server)
+    Start {
+        /// Listen address for QUIC sync
+        #[arg(short, long, default_value = "127.0.0.1:4433")]
+        bind: SocketAddr,
+        /// Custom RPC socket path (default: <db>.topo.sock)
+        #[arg(long)]
+        socket: Option<String>,
+    },
+
+    /// Stop a running daemon
+    Stop {
+        /// Custom RPC socket path (default: derived from --db)
+        #[arg(long)]
+        socket: Option<String>,
+    },
+
     /// Run continuous sync (Ctrl-C to stop)
     Sync {
         /// Listen address
         #[arg(short, long, default_value = "127.0.0.1:4433")]
         bind: SocketAddr,
-        #[arg(short, long, default_value = "server.db")]
-        db: String,
     },
 
     /// Print local transport identity — SPKI fingerprint from TLS cert (generates cert if needed)
     #[command(name = "transport-identity")]
-    TransportIdentity {
-        #[arg(short, long, default_value = "server.db")]
-        db: String,
-    },
+    TransportIdentity,
 
     /// List messages
     Messages {
-        #[arg(short, long, default_value = "server.db")]
-        db: String,
         /// Max messages to show (0 = all)
         #[arg(short, long, default_value = "50")]
         limit: usize,
@@ -44,25 +65,18 @@ enum Commands {
     Send {
         /// Message content
         content: String,
-        #[arg(short, long, default_value = "server.db")]
-        db: String,
         /// Workspace event ID hex (32 bytes)
         #[arg(short = 'n', long, default_value = "0102030405060708090a0b0c0d0e0f10")]
         workspace: String,
     },
 
     /// Show database status
-    Status {
-        #[arg(short, long, default_value = "server.db")]
-        db: String,
-    },
+    Status,
 
     /// Generate test messages
     Generate {
         #[arg(short, long, default_value = "100")]
         count: usize,
-        #[arg(short, long, default_value = "server.db")]
-        db: String,
         #[arg(short = 'n', long, default_value = "0102030405060708090a0b0c0d0e0f10")]
         workspace: String,
     },
@@ -71,16 +85,12 @@ enum Commands {
     AssertNow {
         /// Predicate: "field op value" (e.g. "store_count >= 10")
         predicate: String,
-        #[arg(short, long, default_value = "server.db")]
-        db: String,
     },
 
     /// Assert a predicate eventually holds (exit 0 = pass, exit 1 = timeout)
     AssertEventually {
         /// Predicate: "field op value" (e.g. "message_count == 50")
         predicate: String,
-        #[arg(short, long, default_value = "server.db")]
-        db: String,
         /// Timeout in milliseconds
         #[arg(long, default_value = "10000")]
         timeout_ms: u64,
@@ -99,8 +109,6 @@ enum Commands {
         /// Target event ID (hex)
         #[arg(long)]
         target: String,
-        #[arg(short, long, default_value = "server.db")]
-        db: String,
     },
 
     /// Delete a message
@@ -109,41 +117,26 @@ enum Commands {
         /// Target message event ID (hex)
         #[arg(long)]
         target: String,
-        #[arg(short, long, default_value = "server.db")]
-        db: String,
     },
 
     /// List reactions
-    Reactions {
-        #[arg(short, long, default_value = "server.db")]
-        db: String,
-    },
+    Reactions,
 
     /// List users from projection
-    Users {
-        #[arg(short, long, default_value = "server.db")]
-        db: String,
-    },
+    Users,
 
     /// List keys from projection
     Keys {
-        #[arg(short, long, default_value = "server.db")]
-        db: String,
         /// Show summary only
         #[arg(long)]
         summary: bool,
     },
 
     /// List workspaces from projection
-    Networks {
-        #[arg(short, long, default_value = "server.db")]
-        db: String,
-    },
+    Networks,
 
     /// Send intro offers to two peers so they can hole-punch a direct connection
     Intro {
-        #[arg(short, long, default_value = "server.db")]
-        db: String,
         /// Peer A hex SPKI fingerprint
         #[arg(long)]
         peer_a: String,
@@ -161,8 +154,6 @@ enum Commands {
     /// Show intro attempt records
     #[command(name = "intro-attempts")]
     IntroAttempts {
-        #[arg(short, long, default_value = "server.db")]
-        db: String,
         /// Filter by peer SPKI fingerprint (hex)
         #[arg(long)]
         peer: Option<String>,
@@ -171,8 +162,6 @@ enum Commands {
     /// Create a user invite link for the active workspace
     #[command(name = "create-invite")]
     CreateInvite {
-        #[arg(short, long, default_value = "server.db")]
-        db: String,
         /// Bootstrap address (host:port) to embed in invite link
         #[arg(long)]
         bootstrap: String,
@@ -181,8 +170,6 @@ enum Commands {
     /// Accept a user invite link (bootstrap sync + identity chain creation)
     #[command(name = "accept-invite")]
     AcceptInvite {
-        #[arg(short, long, default_value = "server.db")]
-        db: String,
         /// Invite link (quiet://invite/...)
         #[arg(long)]
         invite: String,
@@ -195,13 +182,113 @@ enum Commands {
     },
 }
 
+// ---------------------------------------------------------------------------
+// Command routing
+// ---------------------------------------------------------------------------
+
+/// Try RPC to a running daemon; fall back to direct DB access on DaemonNotRunning.
+fn try_rpc_or_direct(
+    db: &str,
+    socket: Option<&str>,
+    method: RpcMethod,
+) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+    let sock = socket
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| service::socket_path_for_db(db));
+
+    match rpc_call(&sock, method.clone()) {
+        Ok(resp) => {
+            if !resp.ok {
+                if let Some(err) = resp.error {
+                    return Err(err.into());
+                }
+            }
+            Ok(resp.data.unwrap_or(serde_json::Value::Null))
+        }
+        Err(RpcClientError::DaemonNotRunning(_)) => {
+            // Fall back to direct DB access
+            dispatch_direct(db, method)
+        }
+        Err(e) => Err(e.to_string().into()),
+    }
+}
+
+/// Execute an RPC method directly against the DB (no daemon).
+fn dispatch_direct(
+    db: &str,
+    method: RpcMethod,
+) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+    let val = match method {
+        RpcMethod::Status => serde_json::to_value(service::svc_status(db)?)?,
+        RpcMethod::Messages { limit } => serde_json::to_value(service::svc_messages(db, limit)?)?,
+        RpcMethod::Send { workspace, content } => {
+            serde_json::to_value(service::svc_send(db, &workspace, &content)?)?
+        }
+        RpcMethod::Generate { count, workspace } => {
+            serde_json::to_value(service::svc_generate(db, count, &workspace)?)?
+        }
+        RpcMethod::AssertNow { predicate } => {
+            serde_json::to_value(service::svc_assert_now(db, &predicate)?)?
+        }
+        RpcMethod::AssertEventually {
+            predicate,
+            timeout_ms,
+            interval_ms,
+        } => serde_json::to_value(service::svc_assert_eventually(
+            db,
+            &predicate,
+            timeout_ms,
+            interval_ms,
+        )?)?,
+        RpcMethod::TransportIdentity => {
+            serde_json::to_value(service::svc_transport_identity(db)?)?
+        }
+        RpcMethod::React { target, emoji } => {
+            serde_json::to_value(service::svc_react(db, &target, &emoji)?)?
+        }
+        RpcMethod::DeleteMessage { target } => {
+            serde_json::to_value(service::svc_delete_message(db, &target)?)?
+        }
+        RpcMethod::Reactions => serde_json::to_value(service::svc_reactions(db)?)?,
+        RpcMethod::Users => serde_json::to_value(service::svc_users(db)?)?,
+        RpcMethod::Keys { summary } => serde_json::to_value(service::svc_keys(db, summary)?)?,
+        RpcMethod::Workspaces => serde_json::to_value(service::svc_workspaces(db)?)?,
+        RpcMethod::IntroAttempts { peer } => {
+            serde_json::to_value(service::svc_intro_attempts(db, peer.as_deref())?)?
+        }
+        RpcMethod::CreateInvite { bootstrap } => {
+            serde_json::to_value(service::svc_create_invite(db, &bootstrap)?)?
+        }
+        RpcMethod::AcceptInvite {
+            invite,
+            username,
+            devicename,
+        } => {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            serde_json::to_value(rt.block_on(service::svc_accept_invite(
+                db, &invite, &username, &devicename,
+            ))?)?
+        }
+        RpcMethod::Shutdown => {
+            return Err("Shutdown cannot be dispatched directly".into());
+        }
+    };
+    Ok(val)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cli = Cli::parse();
+    let db = &cli.db;
 
-    // Only init tracing for sync commands (avoid polluting message output)
+    // Init tracing for commands that need it
     match &cli.command {
-        Commands::Sync { .. } | Commands::Intro { .. } | Commands::AcceptInvite { .. } => {
+        Commands::Sync { .. }
+        | Commands::Start { .. }
+        | Commands::Intro { .. }
+        | Commands::AcceptInvite { .. } => {
             let subscriber = FmtSubscriber::builder()
                 .with_max_level(Level::INFO)
                 .finish();
@@ -211,160 +298,326 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     match cli.command {
-        Commands::Sync { bind, db } => {
-            poc_7::node::run_node(&db, bind).await?;
+        // ---------------------------------------------------------------
+        // Daemon commands
+        // ---------------------------------------------------------------
+        Commands::Start { bind, socket } => {
+            let socket_path = socket
+                .as_ref()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| service::socket_path_for_db(db));
+
+            // Idempotent: check if daemon is already running
+            if socket_path.exists() {
+                match rpc_call(&socket_path, RpcMethod::Status) {
+                    Ok(_) => {
+                        println!("daemon already running for {}", db);
+                        return Ok(());
+                    }
+                    Err(RpcClientError::DaemonNotRunning(_)) | Err(_) => {
+                        // Stale socket — remove it
+                        let _ = std::fs::remove_file(&socket_path);
+                    }
+                }
+            }
+
+            // Initialize DB eagerly
+            {
+                let conn = open_connection(db)?;
+                create_tables(&conn)?;
+            }
+
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let db_path = Arc::new(db.to_string());
+
+            // Start RPC server in a background thread
+            let rpc_shutdown = shutdown.clone();
+            let rpc_socket = socket_path.clone();
+            let rpc_db = db_path.clone();
+            let rpc_handle = std::thread::spawn(move || {
+                if let Err(e) = run_rpc_server(&rpc_socket, rpc_db, rpc_shutdown) {
+                    tracing::error!("RPC server error: {}", e);
+                }
+            });
+
+            info!("topo daemon started (db={}, socket={})", db, socket_path.display());
+
+            topo::node::run_node(db, bind).await?;
+
+            // Signal RPC server to stop
+            shutdown.store(true, Ordering::Relaxed);
+            let _ = rpc_handle.join();
+
+            // Clean up socket file
+            let _ = std::fs::remove_file(&socket_path);
+
+            info!("topo daemon shut down cleanly");
         }
-        Commands::TransportIdentity { db } => {
-            let resp = service::svc_transport_identity(&db)?;
-            println!("{}", resp.fingerprint);
+
+        Commands::Stop { socket } => {
+            let socket_path = socket
+                .as_ref()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| service::socket_path_for_db(db));
+
+            match rpc_call(&socket_path, RpcMethod::Shutdown) {
+                Ok(_) => {
+                    println!("daemon stopped");
+                }
+                Err(RpcClientError::DaemonNotRunning(_)) => {
+                    println!("no daemon running for {}", db);
+                }
+                Err(e) => {
+                    eprintln!("error stopping daemon: {}", e);
+                    std::process::exit(1);
+                }
+            }
         }
-        Commands::Messages { db, limit } => {
-            show_messages(&db, limit)?;
+
+        // ---------------------------------------------------------------
+        // Direct-only commands
+        // ---------------------------------------------------------------
+        Commands::Sync { bind } => {
+            topo::node::run_node(db, bind).await?;
         }
-        Commands::Send {
-            content,
-            db,
-            workspace,
-        } => {
-            let resp = service::svc_send(&db, &workspace, &content)?;
-            println!("Sent: {}", resp.content);
-            println!("event_id:{}", resp.event_id);
+
+        Commands::Interactive => {
+            topo::interactive::run_interactive()?;
         }
-        Commands::Status { db } => {
-            let resp = service::svc_status(&db)?;
-            println!("STATUS ({}):", db);
-            println!("  Events:    {} total", resp.events_count);
-            println!("  Messages:  {} projected", resp.messages_count);
-            println!("  Reactions: {} projected", resp.reactions_count);
-            println!("  Recorded:  {} events", resp.recorded_events_count);
-            println!("  NegItems:  {} indexed", resp.neg_items_count);
-        }
+
         Commands::Generate {
             count,
-            db,
             workspace,
         } => {
-            let resp = service::svc_generate(&db, count, &workspace)?;
+            let resp = service::svc_generate(db, count, &workspace)?;
             println!("Generated {} messages in {}", resp.count, db);
         }
-        Commands::AssertNow { predicate, db } => {
-            let resp = service::svc_assert_now(&db, &predicate)?;
-            if resp.pass {
-                println!(
-                    "PASS: {} = {} (expected {} {})",
-                    resp.field, resp.actual, resp.op, resp.expected
-                );
+
+        Commands::CreateInvite { bootstrap } => {
+            let result = service::svc_create_invite(db, &bootstrap)?;
+            println!("{}", result.invite_link);
+        }
+
+        Commands::AcceptInvite {
+            invite,
+            username,
+            devicename,
+        } => {
+            let result = service::svc_accept_invite(db, &invite, &username, &devicename).await?;
+            println!("Accepted invite");
+            println!("  peer_id: {}", result.peer_id);
+            println!("  user:    {}", result.user_event_id);
+            println!("  peer:    {}", result.peer_shared_event_id);
+        }
+
+        // ---------------------------------------------------------------
+        // Daemon-preferred with direct fallback
+        // ---------------------------------------------------------------
+        Commands::TransportIdentity => {
+            let data = try_rpc_or_direct(db, None, RpcMethod::TransportIdentity)?;
+            let fingerprint = data["fingerprint"].as_str().unwrap_or("");
+            println!("{}", fingerprint);
+        }
+
+        Commands::Messages { limit } => {
+            let data = try_rpc_or_direct(db, None, RpcMethod::Messages { limit })?;
+            show_messages_from_json(db, &data);
+        }
+
+        Commands::Send { content, workspace } => {
+            let data = try_rpc_or_direct(
+                db,
+                None,
+                RpcMethod::Send {
+                    workspace,
+                    content: content.clone(),
+                },
+            )?;
+            let event_id = data["event_id"].as_str().unwrap_or("");
+            println!("Sent: {}", data["content"].as_str().unwrap_or(&content));
+            println!("event_id:{}", event_id);
+        }
+
+        Commands::Status => {
+            let data = try_rpc_or_direct(db, None, RpcMethod::Status)?;
+            println!("STATUS ({}):", db);
+            println!("  Events:    {} total", data["events_count"]);
+            println!("  Messages:  {} projected", data["messages_count"]);
+            println!("  Reactions: {} projected", data["reactions_count"]);
+            println!("  Recorded:  {} events", data["recorded_events_count"]);
+            println!("  NegItems:  {} indexed", data["neg_items_count"]);
+        }
+
+        Commands::AssertNow { predicate } => {
+            let data = try_rpc_or_direct(
+                db,
+                None,
+                RpcMethod::AssertNow {
+                    predicate: predicate.clone(),
+                },
+            )?;
+            let pass = data["pass"].as_bool().unwrap_or(false);
+            let field = data["field"].as_str().unwrap_or("");
+            let actual = data["actual"].as_i64().unwrap_or(0);
+            let op = data["op"].as_str().unwrap_or("");
+            let expected = data["expected"].as_i64().unwrap_or(0);
+            if pass {
+                println!("PASS: {} = {} (expected {} {})", field, actual, op, expected);
                 std::process::exit(0);
             } else {
-                println!(
-                    "FAIL: {} = {} (expected {} {})",
-                    resp.field, resp.actual, resp.op, resp.expected
-                );
+                println!("FAIL: {} = {} (expected {} {})", field, actual, op, expected);
                 std::process::exit(1);
             }
         }
+
         Commands::AssertEventually {
             predicate,
-            db,
             timeout_ms,
             interval_ms,
         } => {
-            let resp = service::svc_assert_eventually(&db, &predicate, timeout_ms, interval_ms)?;
-            if resp.pass {
-                println!(
-                    "PASS: {} = {} (expected {} {})",
-                    resp.field, resp.actual, resp.op, resp.expected
-                );
+            let data = try_rpc_or_direct(
+                db,
+                None,
+                RpcMethod::AssertEventually {
+                    predicate: predicate.clone(),
+                    timeout_ms,
+                    interval_ms,
+                },
+            )?;
+            let pass = data["pass"].as_bool().unwrap_or(false);
+            let field = data["field"].as_str().unwrap_or("");
+            let actual = data["actual"].as_i64().unwrap_or(0);
+            let op = data["op"].as_str().unwrap_or("");
+            let expected = data["expected"].as_i64().unwrap_or(0);
+            if pass {
+                println!("PASS: {} = {} (expected {} {})", field, actual, op, expected);
                 std::process::exit(0);
             } else {
                 println!(
                     "TIMEOUT: {} = {} (expected {} {}) after {}ms",
-                    resp.field, resp.actual, resp.op, resp.expected, timeout_ms
+                    field, actual, op, expected, timeout_ms
                 );
                 std::process::exit(1);
             }
         }
-        Commands::Interactive => {
-            poc_7::interactive::run_interactive()?;
+
+        Commands::React { emoji, target } => {
+            let data = try_rpc_or_direct(
+                db,
+                None,
+                RpcMethod::React {
+                    target,
+                    emoji: emoji.clone(),
+                },
+            )?;
+            let event_id = data["event_id"].as_str().unwrap_or("");
+            let short = &event_id[..event_id.len().min(8)];
+            println!("Reacted {} ({})", data["emoji"].as_str().unwrap_or(&emoji), short);
         }
-        Commands::React { emoji, target, db } => {
-            let resp = service::svc_react(&db, &target, &emoji)?;
-            println!("Reacted {} ({})", resp.emoji, &resp.event_id[..8]);
-        }
-        Commands::DeleteMessage { target, db } => {
-            let resp = service::svc_delete_message(&db, &target)?;
+
+        Commands::DeleteMessage { target } => {
+            let data = try_rpc_or_direct(
+                db,
+                None,
+                RpcMethod::DeleteMessage { target },
+            )?;
+            let target_str = data["target"].as_str().unwrap_or("");
             println!(
                 "Deleted message {}",
-                &resp.target[..resp.target.len().min(16)]
+                &target_str[..target_str.len().min(16)]
             );
         }
-        Commands::Reactions { db } => {
-            let items = service::svc_reactions(&db)?;
+
+        Commands::Reactions => {
+            let data = try_rpc_or_direct(db, None, RpcMethod::Reactions)?;
             println!("REACTIONS ({}):", db);
-            if items.is_empty() {
-                println!("  (none)");
-            } else {
-                for item in &items {
-                    println!(
-                        "  {} -> {} {}",
-                        short_id(&item.event_id),
-                        short_id(&item.target_event_id),
-                        item.emoji
-                    );
+            if let Some(items) = data.as_array() {
+                if items.is_empty() {
+                    println!("  (none)");
+                } else {
+                    for item in items {
+                        println!(
+                            "  {} -> {} {}",
+                            short_id(item["event_id"].as_str().unwrap_or("")),
+                            short_id(item["target_event_id"].as_str().unwrap_or("")),
+                            item["emoji"].as_str().unwrap_or("")
+                        );
+                    }
                 }
+            } else {
+                println!("  (none)");
             }
         }
-        Commands::Users { db } => {
-            let items = service::svc_users(&db)?;
+
+        Commands::Users => {
+            let data = try_rpc_or_direct(db, None, RpcMethod::Users)?;
             println!("USERS ({}):", db);
-            if items.is_empty() {
-                println!("  (none)");
-            } else {
-                for (i, item) in items.iter().enumerate() {
-                    println!("  {}. user_{}", i + 1, short_id(&item.event_id));
+            if let Some(items) = data.as_array() {
+                if items.is_empty() {
+                    println!("  (none)");
+                } else {
+                    for (i, item) in items.iter().enumerate() {
+                        println!(
+                            "  {}. user_{}",
+                            i + 1,
+                            short_id(item["event_id"].as_str().unwrap_or(""))
+                        );
+                    }
                 }
+            } else {
+                println!("  (none)");
             }
         }
-        Commands::Keys { db, summary } => {
-            let resp = service::svc_keys(&db, summary)?;
+
+        Commands::Keys { summary } => {
+            let data = try_rpc_or_direct(db, None, RpcMethod::Keys { summary })?;
             println!("KEYS ({}):", db);
-            println!("  Users: {}", resp.user_count);
-            println!("  Peers: {}", resp.peer_count);
-            println!("  Admins: {}", resp.admin_count);
-            println!("  TransportKeys: {}", resp.transport_count);
+            println!("  Users: {}", data["user_count"]);
+            println!("  Peers: {}", data["peer_count"]);
+            println!("  Admins: {}", data["admin_count"]);
+            println!("  TransportKeys: {}", data["transport_count"]);
             if !summary {
-                for eid in &resp.users {
-                    println!("    user {}", short_id(eid));
+                if let Some(users) = data["users"].as_array() {
+                    for eid in users {
+                        println!("    user {}", short_id(eid.as_str().unwrap_or("")));
+                    }
                 }
-                for eid in &resp.peers {
-                    println!("    peer {}", short_id(eid));
+                if let Some(peers) = data["peers"].as_array() {
+                    for eid in peers {
+                        println!("    peer {}", short_id(eid.as_str().unwrap_or("")));
+                    }
                 }
             }
         }
-        Commands::Networks { db } => {
-            let items = service::svc_workspaces(&db)?;
+
+        Commands::Networks => {
+            let data = try_rpc_or_direct(db, None, RpcMethod::Workspaces)?;
             println!("WORKSPACES ({}):", db);
-            if items.is_empty() {
-                println!("  (none)");
-            } else {
-                for (i, item) in items.iter().enumerate() {
-                    println!(
-                        "  {}. {} ({})",
-                        i + 1,
-                        item.name,
-                        short_id(&item.event_id)
-                    );
+            if let Some(items) = data.as_array() {
+                if items.is_empty() {
+                    println!("  (none)");
+                } else {
+                    for (i, item) in items.iter().enumerate() {
+                        println!(
+                            "  {}. {} ({})",
+                            i + 1,
+                            item["name"].as_str().unwrap_or(""),
+                            short_id(item["event_id"].as_str().unwrap_or(""))
+                        );
+                    }
                 }
+            } else {
+                println!("  (none)");
             }
         }
+
         Commands::Intro {
-            db,
             peer_a,
             peer_b,
             ttl_ms,
             attempt_window_ms,
         } => {
-            match service::svc_intro(&db, &peer_a, &peer_b, ttl_ms, attempt_window_ms).await {
+            match service::svc_intro(db, &peer_a, &peer_b, ttl_ms, attempt_window_ms).await {
                 Ok(true) => {
                     println!("Intro sent to both peers");
                 }
@@ -377,40 +630,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
             }
         }
-        Commands::IntroAttempts { db, peer } => {
-            let items = service::svc_intro_attempts(&db, peer.as_deref())?;
-            if items.is_empty() {
-                println!("No intro attempts recorded.");
-            } else {
-                for r in &items {
-                    println!("  intro_id:  {}...", &r.intro_id[..16]);
-                    println!("  peer:      {}", &r.other_peer_id[..16]);
-                    println!("  via:       {}", &r.introduced_by_peer_id[..16]);
-                    println!("  endpoint:  {}:{}", r.origin_ip, r.origin_port);
-                    println!("  status:    {}", r.status);
-                    if let Some(ref err) = r.error {
-                        println!("  error:     {}", err);
+
+        Commands::IntroAttempts { peer } => {
+            let data = try_rpc_or_direct(
+                db,
+                None,
+                RpcMethod::IntroAttempts { peer },
+            )?;
+            if let Some(items) = data.as_array() {
+                if items.is_empty() {
+                    println!("No intro attempts recorded.");
+                } else {
+                    for r in items {
+                        let intro_id = r["intro_id"].as_str().unwrap_or("");
+                        println!("  intro_id:  {}...", &intro_id[..intro_id.len().min(16)]);
+                        let peer_id = r["other_peer_id"].as_str().unwrap_or("");
+                        println!("  peer:      {}", &peer_id[..peer_id.len().min(16)]);
+                        let intro_by = r["introduced_by_peer_id"].as_str().unwrap_or("");
+                        println!("  via:       {}", &intro_by[..intro_by.len().min(16)]);
+                        println!(
+                            "  endpoint:  {}:{}",
+                            r["origin_ip"].as_str().unwrap_or(""),
+                            r["origin_port"]
+                        );
+                        println!("  status:    {}", r["status"].as_str().unwrap_or(""));
+                        if let Some(err) = r["error"].as_str() {
+                            println!("  error:     {}", err);
+                        }
+                        println!("  created:   {}", r["created_at"]);
+                        println!();
                     }
-                    println!("  created:   {}", r.created_at);
-                    println!();
                 }
+            } else {
+                println!("No intro attempts recorded.");
             }
-        }
-        Commands::CreateInvite { db, bootstrap } => {
-            let result = service::svc_create_invite(&db, &bootstrap)?;
-            println!("{}", result.invite_link);
-        }
-        Commands::AcceptInvite {
-            db,
-            invite,
-            username,
-            devicename,
-        } => {
-            let result = service::svc_accept_invite(&db, &invite, &username, &devicename).await?;
-            println!("Accepted invite");
-            println!("  peer_id: {}", result.peer_id);
-            println!("  user:    {}", result.user_event_id);
-            println!("  peer:    {}", result.peer_shared_event_id);
         }
     }
 
@@ -461,14 +714,12 @@ fn format_timestamp(ms: i64) -> String {
 fn format_absolute(ms: i64) -> String {
     use std::time::{Duration, UNIX_EPOCH};
     let dt = UNIX_EPOCH + Duration::from_millis(ms as u64);
-    // Format as "Jan 15 10:30"
     let secs = dt.duration_since(UNIX_EPOCH).unwrap().as_secs();
     let days_since_epoch = secs / 86400;
     let time_of_day = secs % 86400;
     let hours = time_of_day / 3600;
     let minutes = (time_of_day % 3600) / 60;
 
-    // Simple month/day calculation
     let (_year, month, day) = days_to_ymd(days_since_epoch as i64);
     let month_name = match month {
         1 => "Jan",
@@ -489,7 +740,6 @@ fn format_absolute(ms: i64) -> String {
 }
 
 fn days_to_ymd(days: i64) -> (i64, u32, u32) {
-    // Civil days from epoch to y/m/d (simplified)
     let z = days + 719468;
     let era = z / 146097;
     let doe = z - era * 146097;
@@ -504,45 +754,50 @@ fn days_to_ymd(days: i64) -> (i64, u32, u32) {
 }
 
 // ---------------------------------------------------------------------------
-// Messages display (uses service + CLI formatting)
+// Messages display (from JSON data)
 // ---------------------------------------------------------------------------
 
-fn show_messages(
-    db_path: &str,
-    limit: usize,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let resp = service::svc_messages(db_path, limit)?;
+fn show_messages_from_json(db_path: &str, data: &serde_json::Value) {
+    let messages = match data["messages"].as_array() {
+        Some(msgs) => msgs,
+        None => {
+            println!("MESSAGES ({}):", db_path);
+            println!("  (no messages)");
+            return;
+        }
+    };
 
-    if resp.messages.is_empty() {
+    if messages.is_empty() {
         println!("MESSAGES ({}):", db_path);
         println!("  (no messages)");
-        return Ok(());
+        return;
     }
 
-    println!("MESSAGES ({}, {} total):", db_path, resp.total);
+    let total = data["total"].as_i64().unwrap_or(0);
+    println!("MESSAGES ({}, {} total):", db_path, total);
     println!();
 
     let mut last_author = String::new();
-    for (i, msg) in resp.messages.iter().enumerate() {
-        let ts = format_timestamp(msg.created_at);
-        let author = short_id(&msg.author_id);
+    for (i, msg) in messages.iter().enumerate() {
+        let created_at = msg["created_at"].as_i64().unwrap_or(0);
+        let ts = format_timestamp(created_at);
+        let author_id = msg["author_id"].as_str().unwrap_or("");
+        let author = short_id(author_id);
+        let content = msg["content"].as_str().unwrap_or("");
+        let id = msg["id"].as_str().unwrap_or("");
 
-        if msg.author_id != last_author {
-            // New author group
+        if author_id != last_author {
             if i > 0 {
                 println!();
             }
             println!("  {} [{}]", author, ts);
-            println!("    {}. {}", i + 1, msg.content);
-            println!("       id: {}", msg.id);
-            last_author = msg.author_id.clone();
+            println!("    {}. {}", i + 1, content);
+            println!("       id: {}", id);
+            last_author = author_id.to_string();
         } else {
-            // Same author, continuation
-            println!("    {}. {}", i + 1, msg.content);
-            println!("       id: {}", msg.id);
+            println!("    {}. {}", i + 1, content);
+            println!("       id: {}", id);
         }
     }
     println!();
-
-    Ok(())
 }

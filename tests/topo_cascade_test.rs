@@ -9,10 +9,10 @@
 
 use std::time::Instant;
 
-use poc_7::crypto::{event_id_to_base64, hash_event, EventId};
-use poc_7::db::{open_connection, schema::create_tables};
-use poc_7::events::{self, BenchDepEvent, ParsedEvent};
-use poc_7::projection::pipeline::project_one;
+use topo::crypto::{event_id_to_base64, hash_event, EventId};
+use topo::db::{open_connection, schema::create_tables};
+use topo::events::{self, BenchDepEvent, ParsedEvent};
+use topo::projection::pipeline::project_one;
 use rusqlite::Connection;
 use tempfile::NamedTempFile;
 
@@ -131,7 +131,7 @@ fn run_topo_cascade(n: usize) {
         assert!(
             matches!(
                 result,
-                poc_7::projection::decision::ProjectionDecision::Block { .. }
+                topo::projection::decision::ProjectionDecision::Block { .. }
             ),
             "event {} should block, got {:?}",
             i,
@@ -150,7 +150,7 @@ fn run_topo_cascade(n: usize) {
         assert!(
             matches!(
                 result,
-                poc_7::projection::decision::ProjectionDecision::Valid
+                topo::projection::decision::ProjectionDecision::Valid
             ),
             "root event {} should be valid, got {:?}",
             i,

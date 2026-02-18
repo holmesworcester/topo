@@ -1,6 +1,6 @@
 //! LAN peer discovery via mDNS/DNS-SD.
 //!
-//! Each tenant advertises its QUIC endpoint under `_quiet-p7._udp.local.`
+//! Each tenant advertises its QUIC endpoint under `_topo._udp.local.`
 //! with the peer_id encoded in the service instance name. Browsing discovers
 //! remote tenants, self-filtering local identities.
 
@@ -12,7 +12,7 @@ mod inner {
     use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
     use tracing::{info, debug};
 
-    const SERVICE_TYPE: &str = "_quiet-p7._udp.local.";
+    const SERVICE_TYPE: &str = "_topo._udp.local.";
 
     /// A discovered peer on the LAN.
     #[derive(Debug, Clone)]

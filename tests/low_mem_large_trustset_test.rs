@@ -1,7 +1,7 @@
 //! Large trust-set low-memory correctness and budget tests.
 
-use poc_7::db::{open_connection, transport_trust::is_peer_allowed};
-use poc_7::testutil::Peer;
+use topo::db::{open_connection, transport_trust::is_peer_allowed};
+use topo::testutil::Peer;
 
 fn current_rss_mib() -> Option<f64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;

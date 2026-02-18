@@ -196,7 +196,7 @@ NAT traversal relies on simultaneous open: both peers dial each other at roughly
 
 Introductions are explicit and one-shot:
 
-1. An operator (or external job) calls `poc-7 intro --peer-a <fpA> --peer-b <fpB>`.
+1. An operator (or external job) calls `topo intro --peer-a <fpA> --peer-b <fpB>`.
 2. The command looks up freshest non-expired endpoint observations for both peers.
 3. It sends IntroOffers to both peers on the same QUIC endpoint socket.
 4. The daemon does not run background peer-pair selection or automatic intro scheduling.
@@ -333,7 +333,7 @@ Transport cert/key DER blobs live exclusively in the `local_transport_creds` SQL
 
 ## 3.2.2 LAN peer discovery (mDNS/DNS-SD)
 
-Multi-tenant nodes advertise each tenant on the local network under the `_quiet-p7._udp.local.` service type. Each tenant registers a separate mDNS service instance with its actual bound port and full `peer_id` in a TXT property.
+Multi-tenant nodes advertise each tenant on the local network under the `_topo._udp.local.` service type. Each tenant registers a separate mDNS service instance with its actual bound port and full `peer_id` in a TXT property.
 
 Discovery rules:
 1. **Self-filtering**: the browser receives the full set of local tenant peer IDs and filters them out, preventing unnecessary local connections.
@@ -710,9 +710,9 @@ inconsistent view during block rebuilding.
 
 ## 8.1 Operational shape
 
-1. one daemon per profile/peer,
+1. one daemon per profile/peer (`topo start`),
 2. local RPC control socket,
-3. thin CLI (`p7ctl`) with stable JSON and strict exit codes.
+3. unified CLI (`topo`) with subcommands that route through daemon when running, fall back to direct DB access otherwise.
 
 ## 8.2 Testing and agent ergonomics
 

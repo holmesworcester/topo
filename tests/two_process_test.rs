@@ -7,7 +7,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 fn bin() -> String {
-    env!("CARGO_BIN_EXE_poc-7").to_string()
+    env!("CARGO_BIN_EXE_topo").to_string()
 }
 
 fn random_port() -> u16 {

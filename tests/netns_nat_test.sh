@@ -21,7 +21,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-BIN="${PROJECT_DIR}/target/release/poc-7"
+BIN="${PROJECT_DIR}/target/release/topo"
 PREFIX="hp"
 TMPDIR="$(mktemp -d /tmp/hp_nat_test.XXXXXX)"
 

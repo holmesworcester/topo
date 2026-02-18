@@ -3,7 +3,7 @@ use std::time::Duration;
 use rusqlite::Connection;
 
 fn bin() -> String {
-    env!("CARGO_BIN_EXE_poc-7").to_string()
+    env!("CARGO_BIN_EXE_topo").to_string()
 }
 
 /// Pick a random port in the ephemeral range to avoid conflicts between
