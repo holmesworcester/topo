@@ -20,10 +20,14 @@ const MAX_CONCURRENT_CONNECTIONS: usize = 64;
 
 /// Run the RPC server on a Unix socket, dispatching to service functions.
 /// Blocks the calling thread. Intended to be run in a background thread.
+///
+/// When a Shutdown RPC is received, the server sets the `shutdown` flag and
+/// notifies `shutdown_notify` so the daemon main loop can exit cleanly.
 pub fn run_rpc_server(
     socket_path: &Path,
     db_path: Arc<String>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
+    shutdown_notify: Arc<tokio::sync::Notify>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Remove stale socket file if it exists.
     if socket_path.exists() {
@@ -61,10 +65,11 @@ pub fn run_rpc_server(
                 let db = db_path.clone();
                 let active_clone = active.clone();
                 let shutdown_clone = shutdown.clone();
+                let notify_clone = shutdown_notify.clone();
                 active.fetch_add(1, AtomicOrdering::Relaxed);
 
                 std::thread::spawn(move || {
-                    if let Err(e) = handle_connection(stream, &db, &shutdown_clone) {
+                    if let Err(e) = handle_connection(stream, &db, &shutdown_clone, &notify_clone) {
                         warn!("RPC connection error: {}", e);
                     }
                     active_clone.fetch_sub(1, AtomicOrdering::Relaxed);
@@ -91,6 +96,7 @@ fn handle_connection(
     mut stream: std::os::unix::net::UnixStream,
     db_path: &str,
     shutdown: &std::sync::atomic::AtomicBool,
+    shutdown_notify: &tokio::sync::Notify,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Set blocking for this connection.
     stream.set_nonblocking(false)?;
@@ -109,25 +115,24 @@ fn handle_connection(
         return Ok(());
     }
 
-    let resp = dispatch(db_path, req.method, shutdown);
+    let resp = dispatch(db_path, req.method, shutdown, shutdown_notify);
     let frame = encode_frame(&resp)?;
     stream.write_all(&frame)?;
     stream.flush()?;
     Ok(())
 }
 
-fn dispatch(db_path: &str, method: RpcMethod, shutdown: &std::sync::atomic::AtomicBool) -> RpcResponse {
+fn dispatch(
+    db_path: &str,
+    method: RpcMethod,
+    shutdown: &std::sync::atomic::AtomicBool,
+    shutdown_notify: &tokio::sync::Notify,
+) -> RpcResponse {
     match method {
         RpcMethod::Shutdown => {
-            // Signal the server to shut down, then reply success.
+            // Signal the server and daemon to shut down, then reply success.
             shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
-            // Also exit the main process so the daemon stops.
-            // We spawn a thread that waits briefly (to let the response flush),
-            // then exits the process.
-            std::thread::spawn(|| {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                std::process::exit(0);
-            });
+            shutdown_notify.notify_one();
             RpcResponse::success(serde_json::json!({"shutdown": true}))
         }
         RpcMethod::TransportIdentity => match service::svc_transport_identity(db_path) {
@@ -154,12 +159,10 @@ fn dispatch(db_path: &str, method: RpcMethod, shutdown: &std::sync::atomic::Atom
                 Err(e) => RpcResponse::error(e.to_string()),
             }
         }
-        RpcMethod::AssertNow { predicate } => {
-            match service::svc_assert_now(db_path, &predicate) {
-                Ok(data) => RpcResponse::success(data),
-                Err(e) => RpcResponse::error(e.to_string()),
-            }
-        }
+        RpcMethod::AssertNow { predicate } => match service::svc_assert_now(db_path, &predicate) {
+            Ok(data) => RpcResponse::success(data),
+            Err(e) => RpcResponse::error(e.to_string()),
+        },
         RpcMethod::AssertEventually {
             predicate,
             timeout_ms,
@@ -168,12 +171,10 @@ fn dispatch(db_path: &str, method: RpcMethod, shutdown: &std::sync::atomic::Atom
             Ok(data) => RpcResponse::success(data),
             Err(e) => RpcResponse::error(e.to_string()),
         },
-        RpcMethod::React { target, emoji } => {
-            match service::svc_react(db_path, &target, &emoji) {
-                Ok(data) => RpcResponse::success(data),
-                Err(e) => RpcResponse::error(e.to_string()),
-            }
-        }
+        RpcMethod::React { target, emoji } => match service::svc_react(db_path, &target, &emoji) {
+            Ok(data) => RpcResponse::success(data),
+            Err(e) => RpcResponse::error(e.to_string()),
+        },
         RpcMethod::DeleteMessage { target } => {
             match service::svc_delete_message(db_path, &target) {
                 Ok(data) => RpcResponse::success(data),

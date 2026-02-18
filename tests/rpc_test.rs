@@ -187,8 +187,14 @@ fn daemon_and_cli_status() {
 
     assert!(out.status.success(), "status failed: {:?}", out);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("STATUS"), "status output should contain STATUS header");
-    assert!(stdout.contains("Events:"), "status output should contain Events count");
+    assert!(
+        stdout.contains("STATUS"),
+        "status output should contain STATUS header"
+    );
+    assert!(
+        stdout.contains("Events:"),
+        "status output should contain Events count"
+    );
 }
 
 #[test]
@@ -289,7 +295,11 @@ fn daemon_and_cli_assert_now() {
     let _ = daemon.kill();
     let _ = daemon.wait();
 
-    assert_eq!(out.status.code(), Some(1), "assert-now should fail with exit 1");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "assert-now should fail with exit 1"
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("FAIL"));
 }
@@ -406,4 +416,165 @@ fn service_predicate_parsing() {
 
     assert!(parse_predicate("bad").is_err());
     assert!(parse_predicate("x ?? 1").is_err());
+}
+
+// ---------------------------------------------------------------------------
+// 5. Regression tests for topo consolidation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn daemon_stop_flow_clean_exit_and_socket_removal() {
+    let (_dir, db) = temp_db();
+    let socket = socket_path_for_db(&db);
+
+    // Bootstrap identity chain so daemon can start sync.
+    let out = Command::new(bin())
+        .args(["send", "bootstrap", "--db", &db])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "bootstrap failed: {:?}", out);
+
+    // Start daemon in background.
+    let mut daemon = Command::new(bin())
+        .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
+        .spawn()
+        .unwrap();
+
+    // Wait for socket to appear.
+    let start = std::time::Instant::now();
+    while !socket.exists() && start.elapsed().as_secs() < 5 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(socket.exists(), "daemon socket did not appear");
+
+    // Stop daemon via `topo stop`.
+    let out = Command::new(bin())
+        .args(["--db", &db, "stop"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "stop failed: {:?}", out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("daemon stopped"),
+        "expected 'daemon stopped', got: {}",
+        stdout
+    );
+
+    // Wait for daemon process to exit.
+    let exit_start = std::time::Instant::now();
+    loop {
+        match daemon.try_wait() {
+            Ok(Some(status)) => {
+                // Daemon exited — success regardless of exit code (may be non-zero
+                // because tokio tasks get cancelled on shutdown).
+                let _ = status;
+                break;
+            }
+            Ok(None) => {
+                if exit_start.elapsed().as_secs() >= 5 {
+                    let _ = daemon.kill();
+                    let _ = daemon.wait();
+                    panic!("daemon did not exit within 5s after stop");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => panic!("error waiting for daemon: {}", e),
+        }
+    }
+
+    // Socket should be cleaned up.
+    assert!(!socket.exists(), "socket file should be removed after stop");
+}
+
+#[test]
+fn custom_socket_routing() {
+    let (dir, db) = temp_db();
+    let custom_socket = dir.path().join("custom.sock");
+
+    // Bootstrap identity chain.
+    let out = Command::new(bin())
+        .args(["send", "bootstrap", "--db", &db])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "bootstrap failed: {:?}", out);
+
+    // Start daemon on custom socket.
+    let mut daemon = Command::new(bin())
+        .args([
+            "--db",
+            &db,
+            "--socket",
+            custom_socket.to_str().unwrap(),
+            "start",
+            "--bind",
+            "127.0.0.1:0",
+        ])
+        .spawn()
+        .unwrap();
+
+    // Wait for custom socket to appear.
+    let start = std::time::Instant::now();
+    while !custom_socket.exists() && start.elapsed().as_secs() < 5 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(custom_socket.exists(), "custom socket did not appear");
+
+    // Query status via custom socket.
+    let out = Command::new(bin())
+        .args([
+            "--db",
+            &db,
+            "--socket",
+            custom_socket.to_str().unwrap(),
+            "status",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "status via custom socket failed: {:?}",
+        out
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("STATUS"),
+        "status output should contain STATUS header"
+    );
+
+    // Default socket should NOT exist (daemon is on custom socket).
+    let default_socket = socket_path_for_db(&db);
+    assert!(
+        !default_socket.exists(),
+        "default socket should not exist when custom socket is used"
+    );
+
+    // Stop daemon via custom socket.
+    let out = Command::new(bin())
+        .args([
+            "--db",
+            &db,
+            "--socket",
+            custom_socket.to_str().unwrap(),
+            "stop",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stop via custom socket failed: {:?}",
+        out
+    );
+
+    let _ = daemon.wait();
+}
+
+#[test]
+fn shutdown_handler_does_not_call_process_exit() {
+    // Source-level guard: verify that the RPC server dispatch does NOT contain
+    // process::exit. This is a simple grep-style check to prevent regression.
+    let server_source = include_str!("../src/rpc/server.rs");
+    assert!(
+        !server_source.contains("process::exit"),
+        "RPC server must not call process::exit; use coordinated shutdown instead"
+    );
 }

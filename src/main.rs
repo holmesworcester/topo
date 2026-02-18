@@ -22,6 +22,10 @@ struct Cli {
     /// Database path
     #[arg(short, long, default_value = "server.db", global = true)]
     db: String,
+
+    /// Custom RPC socket path (default: <db>.topo.sock)
+    #[arg(long, global = true)]
+    socket: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -31,17 +35,10 @@ enum Commands {
         /// Listen address for QUIC sync
         #[arg(short, long, default_value = "127.0.0.1:4433")]
         bind: SocketAddr,
-        /// Custom RPC socket path (default: <db>.topo.sock)
-        #[arg(long)]
-        socket: Option<String>,
     },
 
     /// Stop a running daemon
-    Stop {
-        /// Custom RPC socket path (default: derived from --db)
-        #[arg(long)]
-        socket: Option<String>,
-    },
+    Stop,
 
     /// Run continuous sync (Ctrl-C to stop)
     Sync {
@@ -240,9 +237,7 @@ fn dispatch_direct(
             timeout_ms,
             interval_ms,
         )?)?,
-        RpcMethod::TransportIdentity => {
-            serde_json::to_value(service::svc_transport_identity(db)?)?
-        }
+        RpcMethod::TransportIdentity => serde_json::to_value(service::svc_transport_identity(db)?)?,
         RpcMethod::React { target, emoji } => {
             serde_json::to_value(service::svc_react(db, &target, &emoji)?)?
         }
@@ -268,7 +263,10 @@ fn dispatch_direct(
                 .enable_all()
                 .build()?;
             serde_json::to_value(rt.block_on(service::svc_accept_invite(
-                db, &invite, &username, &devicename,
+                db,
+                &invite,
+                &username,
+                &devicename,
             ))?)?
         }
         RpcMethod::Shutdown => {
@@ -301,8 +299,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // ---------------------------------------------------------------
         // Daemon commands
         // ---------------------------------------------------------------
-        Commands::Start { bind, socket } => {
-            let socket_path = socket
+        Commands::Start { bind } => {
+            let socket_path = cli
+                .socket
                 .as_ref()
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| service::socket_path_for_db(db));
@@ -328,21 +327,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
 
             let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown_notify = Arc::new(tokio::sync::Notify::new());
             let db_path = Arc::new(db.to_string());
 
             // Start RPC server in a background thread
             let rpc_shutdown = shutdown.clone();
+            let rpc_notify = shutdown_notify.clone();
             let rpc_socket = socket_path.clone();
             let rpc_db = db_path.clone();
             let rpc_handle = std::thread::spawn(move || {
-                if let Err(e) = run_rpc_server(&rpc_socket, rpc_db, rpc_shutdown) {
+                if let Err(e) = run_rpc_server(&rpc_socket, rpc_db, rpc_shutdown, rpc_notify) {
                     tracing::error!("RPC server error: {}", e);
                 }
             });
 
-            info!("topo daemon started (db={}, socket={})", db, socket_path.display());
+            info!(
+                "topo daemon started (db={}, socket={})",
+                db,
+                socket_path.display()
+            );
 
-            topo::node::run_node(db, bind).await?;
+            // Wait for either the node to finish (Ctrl-C) or an RPC shutdown signal.
+            tokio::select! {
+                result = topo::node::run_node(db, bind) => {
+                    result?;
+                }
+                _ = shutdown_notify.notified() => {
+                    info!("Shutdown requested via RPC");
+                }
+            }
 
             // Signal RPC server to stop
             shutdown.store(true, Ordering::Relaxed);
@@ -354,8 +367,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             info!("topo daemon shut down cleanly");
         }
 
-        Commands::Stop { socket } => {
-            let socket_path = socket
+        Commands::Stop => {
+            let socket_path = cli
+                .socket
                 .as_ref()
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| service::socket_path_for_db(db));
@@ -385,10 +399,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             topo::interactive::run_interactive()?;
         }
 
-        Commands::Generate {
-            count,
-            workspace,
-        } => {
+        Commands::Generate { count, workspace } => {
             let resp = service::svc_generate(db, count, &workspace)?;
             println!("Generated {} messages in {}", resp.count, db);
         }
@@ -414,20 +425,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Daemon-preferred with direct fallback
         // ---------------------------------------------------------------
         Commands::TransportIdentity => {
-            let data = try_rpc_or_direct(db, None, RpcMethod::TransportIdentity)?;
+            let data = try_rpc_or_direct(db, cli.socket.as_deref(), RpcMethod::TransportIdentity)?;
             let fingerprint = data["fingerprint"].as_str().unwrap_or("");
             println!("{}", fingerprint);
         }
 
         Commands::Messages { limit } => {
-            let data = try_rpc_or_direct(db, None, RpcMethod::Messages { limit })?;
+            let data = try_rpc_or_direct(db, cli.socket.as_deref(), RpcMethod::Messages { limit })?;
             show_messages_from_json(db, &data);
         }
 
         Commands::Send { content, workspace } => {
             let data = try_rpc_or_direct(
                 db,
-                None,
+                cli.socket.as_deref(),
                 RpcMethod::Send {
                     workspace,
                     content: content.clone(),
@@ -439,7 +450,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
 
         Commands::Status => {
-            let data = try_rpc_or_direct(db, None, RpcMethod::Status)?;
+            let data = try_rpc_or_direct(db, cli.socket.as_deref(), RpcMethod::Status)?;
             println!("STATUS ({}):", db);
             println!("  Events:    {} total", data["events_count"]);
             println!("  Messages:  {} projected", data["messages_count"]);
@@ -451,7 +462,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Commands::AssertNow { predicate } => {
             let data = try_rpc_or_direct(
                 db,
-                None,
+                cli.socket.as_deref(),
                 RpcMethod::AssertNow {
                     predicate: predicate.clone(),
                 },
@@ -462,10 +473,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let op = data["op"].as_str().unwrap_or("");
             let expected = data["expected"].as_i64().unwrap_or(0);
             if pass {
-                println!("PASS: {} = {} (expected {} {})", field, actual, op, expected);
+                println!(
+                    "PASS: {} = {} (expected {} {})",
+                    field, actual, op, expected
+                );
                 std::process::exit(0);
             } else {
-                println!("FAIL: {} = {} (expected {} {})", field, actual, op, expected);
+                println!(
+                    "FAIL: {} = {} (expected {} {})",
+                    field, actual, op, expected
+                );
                 std::process::exit(1);
             }
         }
@@ -477,7 +494,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         } => {
             let data = try_rpc_or_direct(
                 db,
-                None,
+                cli.socket.as_deref(),
                 RpcMethod::AssertEventually {
                     predicate: predicate.clone(),
                     timeout_ms,
@@ -490,7 +507,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let op = data["op"].as_str().unwrap_or("");
             let expected = data["expected"].as_i64().unwrap_or(0);
             if pass {
-                println!("PASS: {} = {} (expected {} {})", field, actual, op, expected);
+                println!(
+                    "PASS: {} = {} (expected {} {})",
+                    field, actual, op, expected
+                );
                 std::process::exit(0);
             } else {
                 println!(
@@ -504,7 +524,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Commands::React { emoji, target } => {
             let data = try_rpc_or_direct(
                 db,
-                None,
+                cli.socket.as_deref(),
                 RpcMethod::React {
                     target,
                     emoji: emoji.clone(),
@@ -512,13 +532,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             )?;
             let event_id = data["event_id"].as_str().unwrap_or("");
             let short = &event_id[..event_id.len().min(8)];
-            println!("Reacted {} ({})", data["emoji"].as_str().unwrap_or(&emoji), short);
+            println!(
+                "Reacted {} ({})",
+                data["emoji"].as_str().unwrap_or(&emoji),
+                short
+            );
         }
 
         Commands::DeleteMessage { target } => {
             let data = try_rpc_or_direct(
                 db,
-                None,
+                cli.socket.as_deref(),
                 RpcMethod::DeleteMessage { target },
             )?;
             let target_str = data["target"].as_str().unwrap_or("");
@@ -529,7 +553,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
 
         Commands::Reactions => {
-            let data = try_rpc_or_direct(db, None, RpcMethod::Reactions)?;
+            let data = try_rpc_or_direct(db, cli.socket.as_deref(), RpcMethod::Reactions)?;
             println!("REACTIONS ({}):", db);
             if let Some(items) = data.as_array() {
                 if items.is_empty() {
@@ -550,7 +574,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
 
         Commands::Users => {
-            let data = try_rpc_or_direct(db, None, RpcMethod::Users)?;
+            let data = try_rpc_or_direct(db, cli.socket.as_deref(), RpcMethod::Users)?;
             println!("USERS ({}):", db);
             if let Some(items) = data.as_array() {
                 if items.is_empty() {
@@ -570,7 +594,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
 
         Commands::Keys { summary } => {
-            let data = try_rpc_or_direct(db, None, RpcMethod::Keys { summary })?;
+            let data = try_rpc_or_direct(db, cli.socket.as_deref(), RpcMethod::Keys { summary })?;
             println!("KEYS ({}):", db);
             println!("  Users: {}", data["user_count"]);
             println!("  Peers: {}", data["peer_count"]);
@@ -591,7 +615,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
 
         Commands::Networks => {
-            let data = try_rpc_or_direct(db, None, RpcMethod::Workspaces)?;
+            let data = try_rpc_or_direct(db, cli.socket.as_deref(), RpcMethod::Workspaces)?;
             println!("WORKSPACES ({}):", db);
             if let Some(items) = data.as_array() {
                 if items.is_empty() {
@@ -616,27 +640,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             peer_b,
             ttl_ms,
             attempt_window_ms,
-        } => {
-            match service::svc_intro(db, &peer_a, &peer_b, ttl_ms, attempt_window_ms).await {
-                Ok(true) => {
-                    println!("Intro sent to both peers");
-                }
-                Ok(false) => {
-                    std::process::exit(1);
-                }
-                Err(e) => {
-                    eprintln!("Error: {}", e);
-                    std::process::exit(1);
-                }
+        } => match service::svc_intro(db, &peer_a, &peer_b, ttl_ms, attempt_window_ms).await {
+            Ok(true) => {
+                println!("Intro sent to both peers");
             }
-        }
+            Ok(false) => {
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        },
 
         Commands::IntroAttempts { peer } => {
-            let data = try_rpc_or_direct(
-                db,
-                None,
-                RpcMethod::IntroAttempts { peer },
-            )?;
+            let data =
+                try_rpc_or_direct(db, cli.socket.as_deref(), RpcMethod::IntroAttempts { peer })?;
             if let Some(items) = data.as_array() {
                 if items.is_empty() {
                     println!("No intro attempts recorded.");
