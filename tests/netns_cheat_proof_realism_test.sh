@@ -142,8 +142,6 @@ fi
 
 command -v ip >/dev/null || fail "ip command not found"
 [[ -x "$BIN" ]] || fail "Missing $BIN (run: cargo build --bins)"
-[[ -x "$BIN start"  ]] || fail "Missing $BIN start (run: cargo build --bins)"
-[[ -x "$BIN" ]] || fail "Missing $BIN (run: cargo build --bins)"
 
 wait_for_file() {
     local path="$1"
@@ -219,7 +217,7 @@ start_daemon() {
     local db="$2"
     local sock="$3"
     local log_file="$4"
-    ip netns exec "$ns" "$BIN start" \
+    ip netns exec "$ns" "$BIN" start \
         --db "$db" \
         --socket "$sock" \
         --bind "0.0.0.0:4433" \

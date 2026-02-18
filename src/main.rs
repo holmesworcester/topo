@@ -22,6 +22,10 @@ struct Cli {
     /// Database path
     #[arg(short, long, default_value = "server.db", global = true)]
     db: String,
+
+    /// Custom RPC socket path (default: <db>.topo.sock)
+    #[arg(long, global = true)]
+    socket: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -31,17 +35,10 @@ enum Commands {
         /// Listen address for QUIC sync
         #[arg(short, long, default_value = "127.0.0.1:4433")]
         bind: SocketAddr,
-        /// Custom RPC socket path (default: <db>.topo.sock)
-        #[arg(long)]
-        socket: Option<String>,
     },
 
     /// Stop a running daemon
-    Stop {
-        /// Custom RPC socket path (default: derived from --db)
-        #[arg(long)]
-        socket: Option<String>,
-    },
+    Stop,
 
     /// Create a new workspace and identity chain
     #[command(name = "create-workspace")]
@@ -205,9 +202,12 @@ enum Commands {
 
 fn rpc_require_daemon(
     db: &str,
+    socket: Option<&str>,
     method: RpcMethod,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
-    let sock = service::socket_path_for_db(db);
+    let sock = socket
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| service::socket_path_for_db(db));
 
     match rpc_call(&sock, method) {
         Ok(resp) => {
@@ -229,6 +229,7 @@ fn rpc_require_daemon(
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cli = Cli::parse();
     let db = &cli.db;
+    let socket_override = cli.socket.clone();
 
     // Init tracing for commands that need it
     match &cli.command {
@@ -248,8 +249,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // ---------------------------------------------------------------
         // Daemon lifecycle
         // ---------------------------------------------------------------
-        Commands::Start { bind, socket } => {
-            let socket_path = socket
+        Commands::Start { bind } => {
+            let socket_path = socket_override
                 .as_ref()
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| service::socket_path_for_db(db));
@@ -275,21 +276,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
 
             let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown_notify = Arc::new(tokio::sync::Notify::new());
             let state = Arc::new(DaemonState::new(db));
 
             // Start RPC server in a background thread
             let rpc_shutdown = shutdown.clone();
+            let rpc_notify = shutdown_notify.clone();
             let rpc_socket = socket_path.clone();
             let rpc_state = state.clone();
             let rpc_handle = std::thread::spawn(move || {
-                if let Err(e) = run_rpc_server(&rpc_socket, rpc_state, rpc_shutdown) {
+                if let Err(e) = run_rpc_server(&rpc_socket, rpc_state, rpc_shutdown, rpc_notify) {
                     tracing::error!("RPC server error: {}", e);
                 }
             });
 
             info!("topo daemon started (db={}, socket={})", db, socket_path.display());
 
-            topo::node::run_node(db, bind).await?;
+            tokio::select! {
+                result = topo::node::run_node(db, bind) => {
+                    result?;
+                }
+                _ = shutdown_notify.notified() => {
+                    info!("Shutdown requested via RPC");
+                }
+            }
 
             // Signal RPC server to stop
             shutdown.store(true, Ordering::Relaxed);
@@ -301,8 +311,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             info!("topo daemon shut down cleanly");
         }
 
-        Commands::Stop { socket } => {
-            let socket_path = socket
+        Commands::Stop => {
+            let socket_path = socket_override
                 .as_ref()
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| service::socket_path_for_db(db));
@@ -354,7 +364,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Daemon-only commands (require running daemon)
         // ---------------------------------------------------------------
         Commands::Peers => {
-            let data = rpc_require_daemon(db, RpcMethod::Peers)?;
+            let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::Peers)?;
             println!("PEERS ({}):", db);
             if let Some(items) = data.as_array() {
                 if items.is_empty() {
@@ -372,14 +382,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
 
         Commands::UsePeer { index } => {
-            let data = rpc_require_daemon(db, RpcMethod::UsePeer { index })?;
+            let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::UsePeer { index })?;
             let peer_id = data["peer_id"].as_str().unwrap_or("");
             let ws_id = data["workspace_id"].as_str().unwrap_or("");
             println!("Switched to peer {} (workspace: {})", short_id(peer_id), short_id(ws_id));
         }
 
         Commands::ActivePeer => {
-            let data = rpc_require_daemon(db, RpcMethod::ActivePeer)?;
+            let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::ActivePeer)?;
             match data["peer_id"].as_str() {
                 Some(peer_id) => println!("{}", peer_id),
                 None => println!("(no active peer)"),
@@ -387,19 +397,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
 
         Commands::TransportIdentity => {
-            let data = rpc_require_daemon(db, RpcMethod::TransportIdentity)?;
+            let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::TransportIdentity)?;
             let fingerprint = data["fingerprint"].as_str().unwrap_or("");
             println!("{}", fingerprint);
         }
 
         Commands::Messages { limit } => {
-            let data = rpc_require_daemon(db, RpcMethod::Messages { limit })?;
+            let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::Messages { limit })?;
             show_messages_from_json(db, &data);
         }
 
         Commands::Send { content } => {
             let data = rpc_require_daemon(
                 db,
+                socket_override.as_deref(),
                 RpcMethod::Send {
                     content: content.clone(),
                 },
@@ -410,7 +421,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
 
         Commands::Status => {
-            let data = rpc_require_daemon(db, RpcMethod::Status)?;
+            let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::Status)?;
             println!("STATUS ({}):", db);
             println!("  Events:    {} total", data["events_count"]);
             println!("  Messages:  {} projected", data["messages_count"]);
@@ -422,6 +433,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Commands::Generate { count } => {
             let data = rpc_require_daemon(
                 db,
+                socket_override.as_deref(),
                 RpcMethod::Generate { count },
             )?;
             println!("Generated {} messages in {}", data["count"], db);
@@ -430,6 +442,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Commands::AssertNow { predicate } => {
             let data = rpc_require_daemon(
                 db,
+                socket_override.as_deref(),
                 RpcMethod::AssertNow {
                     predicate: predicate.clone(),
                 },
@@ -455,6 +468,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         } => {
             let data = rpc_require_daemon(
                 db,
+                socket_override.as_deref(),
                 RpcMethod::AssertEventually {
                     predicate: predicate.clone(),
                     timeout_ms,
@@ -481,6 +495,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Commands::React { emoji, target } => {
             let data = rpc_require_daemon(
                 db,
+                socket_override.as_deref(),
                 RpcMethod::React {
                     target,
                     emoji: emoji.clone(),
@@ -494,6 +509,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Commands::DeleteMessage { target } => {
             let data = rpc_require_daemon(
                 db,
+                socket_override.as_deref(),
                 RpcMethod::DeleteMessage { target },
             )?;
             let target_str = data["target"].as_str().unwrap_or("");
@@ -504,7 +520,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
 
         Commands::Reactions => {
-            let data = rpc_require_daemon(db, RpcMethod::Reactions)?;
+            let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::Reactions)?;
             println!("REACTIONS ({}):", db);
             if let Some(items) = data.as_array() {
                 if items.is_empty() {
@@ -525,7 +541,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
 
         Commands::Users => {
-            let data = rpc_require_daemon(db, RpcMethod::Users)?;
+            let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::Users)?;
             println!("USERS ({}):", db);
             if let Some(items) = data.as_array() {
                 if items.is_empty() {
@@ -545,7 +561,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
 
         Commands::Keys { summary } => {
-            let data = rpc_require_daemon(db, RpcMethod::Keys { summary })?;
+            let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::Keys { summary })?;
             println!("KEYS ({}):", db);
             println!("  Users: {}", data["user_count"]);
             println!("  Peers: {}", data["peer_count"]);
@@ -566,7 +582,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
 
         Commands::Networks => {
-            let data = rpc_require_daemon(db, RpcMethod::Workspaces)?;
+            let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::Workspaces)?;
             println!("WORKSPACES ({}):", db);
             if let Some(items) = data.as_array() {
                 if items.is_empty() {
@@ -609,6 +625,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Commands::IntroAttempts { peer } => {
             let data = rpc_require_daemon(
                 db,
+                socket_override.as_deref(),
                 RpcMethod::IntroAttempts { peer },
             )?;
             if let Some(items) = data.as_array() {
@@ -643,6 +660,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Commands::CreateInvite { bootstrap } => {
             let data = rpc_require_daemon(
                 db,
+                socket_override.as_deref(),
                 RpcMethod::CreateInvite { bootstrap },
             )?;
             println!("{}", data["invite_link"].as_str().unwrap_or(""));

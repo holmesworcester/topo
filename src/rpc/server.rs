@@ -69,6 +69,7 @@ pub fn run_rpc_server(
     socket_path: &Path,
     state: Arc<DaemonState>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
+    shutdown_notify: Arc<tokio::sync::Notify>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Remove stale socket file if it exists.
     if socket_path.exists() {
@@ -106,10 +107,11 @@ pub fn run_rpc_server(
                 let st = state.clone();
                 let active_clone = active.clone();
                 let shutdown_clone = shutdown.clone();
+                let notify_clone = shutdown_notify.clone();
                 active.fetch_add(1, AtomicOrdering::Relaxed);
 
                 std::thread::spawn(move || {
-                    if let Err(e) = handle_connection(stream, &st, &shutdown_clone) {
+                    if let Err(e) = handle_connection(stream, &st, &shutdown_clone, &notify_clone) {
                         warn!("RPC connection error: {}", e);
                     }
                     active_clone.fetch_sub(1, AtomicOrdering::Relaxed);
@@ -136,6 +138,7 @@ fn handle_connection(
     mut stream: std::os::unix::net::UnixStream,
     state: &DaemonState,
     shutdown: &std::sync::atomic::AtomicBool,
+    shutdown_notify: &tokio::sync::Notify,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Set blocking for this connection.
     stream.set_nonblocking(false)?;
@@ -154,23 +157,25 @@ fn handle_connection(
         return Ok(());
     }
 
-    let resp = dispatch(state, req.method, shutdown);
+    let resp = dispatch(state, req.method, shutdown, shutdown_notify);
     let frame = encode_frame(&resp)?;
     stream.write_all(&frame)?;
     stream.flush()?;
     Ok(())
 }
 
-fn dispatch(state: &DaemonState, method: RpcMethod, shutdown: &std::sync::atomic::AtomicBool) -> RpcResponse {
+fn dispatch(
+    state: &DaemonState,
+    method: RpcMethod,
+    shutdown: &std::sync::atomic::AtomicBool,
+    shutdown_notify: &tokio::sync::Notify,
+) -> RpcResponse {
     let db_path = &state.db_path;
 
     match method {
         RpcMethod::Shutdown => {
             shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
-            std::thread::spawn(|| {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                std::process::exit(0);
-            });
+            shutdown_notify.notify_one();
             RpcResponse::success(serde_json::json!({"shutdown": true}))
         }
 
