@@ -9,7 +9,7 @@ Worktree: `/home/holmes/poc-7-local-two-cli-discovery`
 Make two CLI users on the same Linux machine, each with a separate DB and separate sync daemon process, reliably discover and sync after a valid invite flow.
 
 Target runtime shape:
-1. Alice and Bob run separate `p7d`/`sync` processes.
+1. Alice and Bob run separate `topo start`/`sync` processes.
 2. Bob accepts Alice's invite.
 3. Ongoing sync works locally without manual `--connect`.
 4. mDNS discovery behavior is correct for loopback-bound local daemons.

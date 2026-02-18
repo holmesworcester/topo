@@ -46,7 +46,7 @@ Files:
 
 Changes:
 
-- Add back a global CLI socket option on root `Cli` (like old `p7ctl` behavior):
+- Add back a global CLI socket option on root `Cli` (like old daemon CLI behavior):
   - `#[arg(long, global = true)] socket: Option<String>`
 - Use a single derived socket value for command routing.
 - Pass that socket to `try_rpc_or_direct` for all daemon-preferred commands.
@@ -143,7 +143,7 @@ sudo tests/netns_cheat_proof_realism_test.sh --keep-logs
 
 ## Notes / Guardrails
 
-- Do not reintroduce legacy `p7d`/`p7ctl` binaries.
+- Do not reintroduce separate daemon/control binaries (all commands go through `topo`).
 - Keep fallback semantics explicit and deterministic when daemon is unavailable.
 - Prefer one socket-resolution path shared by all daemon-preferred commands.
 - Avoid broad refactors while fixing this slice.

@@ -1,4 +1,4 @@
-# Simplification Plan For Rust `poc-7`
+# Simplification Plan For Topo
 
 > **Status: Active** — Authoritative implementation plan for all phases.
 
@@ -30,7 +30,7 @@ Scheduling note:
 
 ## 1.1 `codex-simplified` baseline gap audit (current state)
 
-Current code in `poc-7` (post-move from `codex-simplified`) is a useful sync prototype, but has deliberate gaps relative to this plan:
+Current code in Topo (post-move from `codex-simplified`) is a useful sync prototype, but has deliberate gaps relative to this plan:
 
 1. ~~Fixed-size wire/event assumptions~~ **RESOLVED**: wire protocol moved to `src/sync/protocol.rs` with variable-length framing and `EVENT_MAX_BLOB_BYTES = 1 MiB` cap. No global fixed envelope size remains.
 2. ~~mTLS is not yet pinned/strict~~ **RESOLVED**: `src/transport/mod.rs` now uses `PinnedCertVerifier` with BLAKE2b-256 SPKI fingerprint pinning on both client and server sides. No permissive verifier remains in production paths.
@@ -130,7 +130,7 @@ Every CLI instance is a real peer-to-peer device. Interactive REPL and non-inter
 
 ## 2.3 Device Architecture
 
-1. **One CLI instance = one device**: each running `poc-7` process is a device with its own transport identity and persistent state.
+1. **One CLI instance = one device**: each running `topo` process is a device with its own transport identity and persistent state.
 2. **Multiple tenants per device**: a single device can host many tenants, each participating in arbitrary (potentially overlapping) workspaces.
 3. **Zeroconf discovery**: mDNS/DNS-SD discovers peers on the same workspace on the local machine or LAN (enabled by default via `discovery` feature).
 4. **Single-port QUIC endpoint**: one shared endpoint serves all tenants via multi-workspace cert resolver (SNI routing). Inbound trust is union-scoped; outbound dials use per-tenant client configs with tenant-scoped trust.
@@ -145,7 +145,7 @@ Build this before queue complexity.
 ### Deliverables
 
 - One daemon per profile/peer with local RPC control socket.
-- Thin CLI (`p7ctl`) for non-interactive control.
+- Thin CLI (`topo`) for non-interactive control.
 - Stable JSON responses and exit codes.
 - Assertion-first testing commands:
   - `assert-now <predicate>`
@@ -817,7 +817,7 @@ Queue DRY requirement:
 - implement generic queue helper traits/functions once (`claim_batch`, `renew_lease`, `mark_done`, `mark_retry/backoff`).
 - reuse them for both `project_queue` and `egress_queue` to avoid diverging retry/lease semantics.
 
-## 8.4 Egress queue creation (matching working `poc-7` shape)
+## 8.4 Egress queue creation (matching working Topo shape)
 
 Create rows from:
 1. Negentropy reconciliation producer (`have_ids` we can send).
@@ -1565,7 +1565,7 @@ NAT types that will NOT work:
 ### 16.4 Explicit intro flow
 
 The current intro flow is intentionally minimal:
-1. An operator/controller calls `poc-7 intro --peer-a <fpA> --peer-b <fpB>`.
+1. An operator/controller calls `topo intro --peer-a <fpA> --peer-b <fpB>`.
 2. The introducer resolves freshest non-expired endpoint observations for both peers.
 3. It sends one `IntroOffer` to each peer over uni-directional QUIC streams.
 4. Receivers validate trust/expiry/dedup, then run paced dial attempts inside `attempt_window_ms`.
@@ -1906,7 +1906,7 @@ pub struct PeerDispatcher {
 
 ### 17.4.4 CLI integration
 
-`src/bin/p7d.rs` always calls `node::run_node()` for sync (single-tenant and multi-tenant handled uniformly). RPC server still runs alongside for queries.
+`src/main.rs` always calls `node::run_node()` for sync (single-tenant and multi-tenant handled uniformly). RPC server still runs alongside for queries.
 
 ---
 
@@ -2139,7 +2139,7 @@ Tests in `tests/mdns_smoke.rs`:
 
 ### Definition of done
 
-- `p7d` discovers tenants from DB, starts QUIC endpoint with multi-workspace cert resolver, syncs with external peers.
+- `topo start` discovers tenants from DB, starts QUIC endpoint with multi-workspace cert resolver, syncs with external peers.
 - Two tenants on same node in different workspaces have zero event overlap after sync.
 - Two tenants on same node in same workspace both project synced messages.
 - mDNS self-filtering prevents local-only connections; external peers discovered and synced.
@@ -2155,7 +2155,7 @@ Goal: establish a test suite where successful P2P bootstrap and sync cannot be f
 ### 18.1 Realism contract
 
 1. Out-of-band input is limited to invite links (`quiet://...`) with standard bootstrap data.
-2. Nodes run in non-interactive daemon mode (`p7d`) and are asserted through CLI command results (`p7ctl` / `poc-7 assert-*`).
+2. Nodes run in non-interactive daemon mode (`topo start`) and are asserted through CLI command results (`topo assert-*`).
 3. Desired steady-state connectivity is invite/discovery-driven autodial, not manual `--connect`.
 4. Multi-network topologies are required (local discovery + internet bootstrap-address mode).
 
@@ -2165,7 +2165,7 @@ Goal: establish a test suite where successful P2P bootstrap and sync cannot be f
 2. Include a passing baseline that proves invite bootstrap + daemon autodial transport path works, so failures are scoped to realism gaps, not broken transport.
 3. Include strict contract tests for desired behavior:
    - invite-only daemon autodial after invite acceptance,
-   - daemon CLI invite lifecycle surface (`p7ctl create-invite` / `p7ctl accept-invite`).
+   - daemon CLI invite lifecycle surface (`topo create-invite` / `topo accept-invite`).
 4. Keep these tests as non-negotiable regression guards for future refactors.
 
 ### 18.3 Minimal implementation required to make these tests pass

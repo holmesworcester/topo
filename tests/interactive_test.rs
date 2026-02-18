@@ -19,7 +19,7 @@ fn run_interactive_with_bootstrap_env(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if let Some(addr) = bootstrap_addr {
-        cmd.env("POC7_BOOTSTRAP_ADDR", addr);
+        cmd.env("TOPO_BOOTSTRAP_ADDR", addr);
     }
     let mut child = cmd.spawn().expect("failed to spawn interactive");
 
@@ -301,7 +301,7 @@ fn test_invite_requires_bootstrap_addr_when_unset() {
     assert!(err.is_empty(), "stderr should be empty, got: {}", err);
     assert_contains(
         &out,
-        "Missing bootstrap endpoint. Pass --bootstrap <host:port> or set POC7_BOOTSTRAP_ADDR.",
+        "Missing bootstrap endpoint. Pass --bootstrap <host:port> or set TOPO_BOOTSTRAP_ADDR.",
         "invite missing bootstrap",
     );
 }
@@ -512,4 +512,31 @@ fn test_accept_invite_bootstrap_sync_shared_only() {
     assert_contains(bob_status, "STATUS (bob):", "bob status");
     // Bob's event count should be non-zero (shared chain arrived via sync bootstrap)
     assert_not_contains(bob_status, "Events:    0", "bob has events from bootstrap sync");
+}
+
+// ---------------------------------------------------------------------------
+// Branding regression guard
+// ---------------------------------------------------------------------------
+
+/// Verify that stale poc-7/POC7 branding does not appear in user-facing
+/// runtime entrypoints (main.rs, interactive.rs).
+#[test]
+fn test_no_stale_branding_in_runtime_sources() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let user_facing_files = ["src/main.rs", "src/interactive.rs"];
+    let stale_patterns = ["POC7_", "poc7_", "p7ctl", "p7d"];
+
+    for rel in &user_facing_files {
+        let path = root.join(rel);
+        let content = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {}", rel, e));
+        for pat in &stale_patterns {
+            assert!(
+                !content.contains(pat),
+                "Stale branding {:?} found in {}. Rebrand to Topo equivalents.",
+                pat,
+                rel
+            );
+        }
+    }
 }

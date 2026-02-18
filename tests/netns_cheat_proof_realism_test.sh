@@ -5,7 +5,7 @@
 # Scope:
 # - real network segmentation with 3 LANs and overlapping peers,
 # - invite-link bootstrap over routed (non-LAN) paths,
-# - daemon-only sync operation (p7d + p7ctl assertions),
+# - daemon-only sync operation (topo start + topo CLI assertions),
 # - local discovery exercised after inviter shutdown.
 #
 # IMPORTANT:
@@ -182,7 +182,7 @@ set_default_route() {
     ip netns exec "$ns" ip route replace default via "$gw"
 }
 
-run_p7ctl() {
+run_topo() {
     local db="$1"
     local sock="$2"
     shift 2
@@ -195,7 +195,7 @@ assert_eventually() {
     local predicate="$3"
     local timeout_ms="$4"
     local out
-    out="$(run_p7ctl "$db" "$sock" assert-eventually "$predicate" --timeout-ms "$timeout_ms" 2>&1)" || {
+    out="$(run_topo "$db" "$sock" assert-eventually "$predicate" --timeout-ms "$timeout_ms" 2>&1)" || {
         echo "$out"
         fail "assert-eventually failed for '$predicate' on $db"
     }
@@ -206,7 +206,7 @@ send_message() {
     local sock="$2"
     local content="$3"
     local out
-    out="$(run_p7ctl "$db" "$sock" send "$content" 2>&1)" || {
+    out="$(run_topo "$db" "$sock" send "$content" 2>&1)" || {
         echo "$out"
         fail "send failed ($content) on $db"
     }
@@ -283,11 +283,11 @@ log "Starting inviter daemon A..."
 PID_A="$(start_daemon "$NS_A" "$DB_A" "$SOCK_A" "$TMPDIR/a.log")"
 
 log "Creating invite links via daemon RPC..."
-INV_B="$(run_p7ctl "$DB_A" "$SOCK_A" create-invite --bootstrap "10.11.1.10:4433" | tr -d '\n')"
-INV_C="$(run_p7ctl "$DB_A" "$SOCK_A" create-invite --bootstrap "10.11.1.10:4433" | tr -d '\n')"
-INV_D="$(run_p7ctl "$DB_A" "$SOCK_A" create-invite --bootstrap "10.11.1.10:4433" | tr -d '\n')"
-INV_E="$(run_p7ctl "$DB_A" "$SOCK_A" create-invite --bootstrap "10.11.1.10:4433" | tr -d '\n')"
-INV_F="$(run_p7ctl "$DB_A" "$SOCK_A" create-invite --bootstrap "10.11.1.10:4433" | tr -d '\n')"
+INV_B="$(run_topo "$DB_A" "$SOCK_A" create-invite --bootstrap "10.11.1.10:4433" | tr -d '\n')"
+INV_C="$(run_topo "$DB_A" "$SOCK_A" create-invite --bootstrap "10.11.1.10:4433" | tr -d '\n')"
+INV_D="$(run_topo "$DB_A" "$SOCK_A" create-invite --bootstrap "10.11.1.10:4433" | tr -d '\n')"
+INV_E="$(run_topo "$DB_A" "$SOCK_A" create-invite --bootstrap "10.11.1.10:4433" | tr -d '\n')"
+INV_F="$(run_topo "$DB_A" "$SOCK_A" create-invite --bootstrap "10.11.1.10:4433" | tr -d '\n')"
 
 [[ "$INV_B" == quiet://invite/* ]] || fail "invalid invite link format for B"
 [[ "$INV_F" == quiet://invite/* ]] || fail "invalid invite link format for F"

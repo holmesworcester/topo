@@ -353,8 +353,8 @@ fn run_interactive_tty() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     rl.bind_sequence(rustyline::KeyEvent::from('\t'), rustyline::Cmd::Complete);
 
     let history_path = dirs_next::home_dir()
-        .map(|h| h.join(".poc7_cli_history"))
-        .unwrap_or_else(|| std::path::PathBuf::from(".poc7_cli_history"));
+        .map(|h| h.join(".topo_cli_history"))
+        .unwrap_or_else(|| std::path::PathBuf::from(".topo_cli_history"));
     let _ = rl.load_history(&history_path);
 
     let mut session = Session::new();
@@ -444,12 +444,12 @@ fn resolve_bootstrap_addr(args: &[&str]) -> Result<String, Box<dyn std::error::E
             return Ok(addr.to_string());
         }
     }
-    if let Ok(addr) = std::env::var("POC7_BOOTSTRAP_ADDR") {
+    if let Ok(addr) = std::env::var("TOPO_BOOTSTRAP_ADDR") {
         if !addr.trim().is_empty() {
             return Ok(addr);
         }
     }
-    Err("Missing bootstrap endpoint. Pass --bootstrap <host:port> or set POC7_BOOTSTRAP_ADDR.".into())
+    Err("Missing bootstrap endpoint. Pass --bootstrap <host:port> or set TOPO_BOOTSTRAP_ADDR.".into())
 }
 
 fn resolve_invite_ref(
@@ -1395,6 +1395,8 @@ fn cmd_ban(
 }
 
 fn cmd_help(out: &mut impl Write) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    writeln!(out, "🐭 Topo")?;
+    writeln!(out)?;
     writeln!(out, "COMMANDS:")?;
     writeln!(out)?;
     writeln!(out, "  Workspace setup:")?;

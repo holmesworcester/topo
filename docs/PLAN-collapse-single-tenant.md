@@ -2,7 +2,7 @@
 
 ## Context
 
-Two sync entry points exist: `svc_sync` (single-tenant, `service.rs:1078`) and `run_node` (multi-tenant, `node.rs:82`). They duplicate endpoint creation, trust setup, batch_writer spawning, and accept_loop orchestration. With transport identity unification complete, a single-tenant peer is just a node with one tenant. The `--node` flag in p7d and the dual code paths add complexity with no functional benefit.
+Two sync entry points exist: `svc_sync` (single-tenant, `service.rs:1078`) and `run_node` (multi-tenant, `node.rs:82`). They duplicate endpoint creation, trust setup, batch_writer spawning, and accept_loop orchestration. With transport identity unification complete, a single-tenant peer is just a node with one tenant. The `--node` flag in the daemon and the dual code paths add complexity with no functional benefit.
 
 Goal: make `run_node` the single sync entry point. Remove `svc_sync` and all single-tenant-only code paths it depended on.
 
@@ -20,7 +20,7 @@ pub async fn run_node(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 ```
 
-Currently `run_node` does `SocketAddr::new(bind_ip, 0)` (auto-assign port). Change to use the caller-provided `bind` directly, so callers can specify an exact port (needed by CLI tests and p7d `--bind`).
+Currently `run_node` does `SocketAddr::new(bind_ip, 0)` (auto-assign port). Change to use the caller-provided `bind` directly, so callers can specify an exact port (needed by CLI tests and `topo start --bind`).
 
 Remove the `use std::net::IpAddr` import (no longer needed), add `use std::net::SocketAddr`.
 
@@ -93,9 +93,9 @@ Commands::Sync { bind, connect, db } => {
 
 The `use poc_7::service` import stays (used by many other commands).
 
-## Step 5: Update `src/bin/p7d.rs`
+## Step 5: Update `src/main.rs` (formerly `src/bin/p7d.rs`)
 
-**File**: `src/bin/p7d.rs`
+**File**: `src/main.rs`
 
 Remove:
 - `--node` flag from `Args` struct (line 43-44)
@@ -155,7 +155,7 @@ No code change needed, but worth noting as a behavior change.
 1. `src/node.rs` — extend signature (`SocketAddr` + `Option<SocketAddr>`), clone endpoint before accept thread, add connect_loop support
 2. `src/service.rs` — delete `svc_sync` function (~100 lines)
 3. `src/main.rs` — change Sync handler to call `run_node`
-4. `src/bin/p7d.rs` — remove `--node` flag, always call `run_node`, keep service import
+4. `src/main.rs` — remove `--node` flag, always call `run_node`, keep service import
 5. `tests/cli_test.rs` — update `test_cli_sync_without_trust_fails` error assertion
 
 ## Files NOT modified
@@ -166,7 +166,7 @@ No code change needed, but worth noting as a behavior change.
 
 ## Verification
 
-1. `cargo build --bin poc-7 --bin p7d --bin p7ctl` — compiles
+1. `cargo build --bin topo` — compiles
 2. `cargo test -q --test cli_test` — all 6 CLI tests pass
 3. `cargo test -q --test rpc_test` — all 13 RPC tests pass
 4. `cargo test -q --test holepunch_test` — all 4 holepunch tests pass
@@ -177,5 +177,5 @@ No code change needed, but worth noting as a behavior change.
 1. **Endpoint move** (High): Fixed in Step 2 — clone endpoint before accept thread spawn
 2. **Per-tenant client cert** (High): Acknowledged — single default cert is correct for 1-tenant case; SNI+SPKI handles multi-tenant adequately
 3. **has_any_trusted_peer vs discover_local_tenants** (Medium): The semantics differ but both correctly gate on "has a bootstrapped identity". `discover_local_tenants` is actually stricter (requires both trust_anchors and transport creds), which is correct behavior
-4. **service import in p7d** (Low): Fixed in Step 5 — keep the import for `socket_path_for_db`
+4. **service import in main** (Low): Fixed in Step 5 — keep the import for `socket_path_for_db`
 5. **Discovery feature** (Low): Documented in Step 8 — acceptable behavior change

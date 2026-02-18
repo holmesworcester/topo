@@ -14,7 +14,7 @@ use topo::service;
 
 #[derive(Parser)]
 #[command(name = "topo")]
-#[command(about = "High-performance QUIC sync system")]
+#[command(about = "🐭 Topo — peer-to-peer encrypted sync")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -290,7 +290,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
             });
 
-            info!("topo daemon started (db={}, socket={})", db, socket_path.display());
+            info!("🐭 Topo daemon started (db={}, socket={})", db, socket_path.display());
 
             tokio::select! {
                 result = topo::node::run_node(db, bind) => {
@@ -308,7 +308,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             // Clean up socket file
             let _ = std::fs::remove_file(&socket_path);
 
-            info!("topo daemon shut down cleanly");
+            info!("🐭 Topo daemon shut down cleanly");
         }
 
         Commands::Stop => {

@@ -139,11 +139,11 @@ If no direct path established:
 ## CLI surface (minimal)
 
 Add:
-1. `poc-7 intro --db <introducer.db> --peer-a <hex_spki> --peer-b <hex_spki> [--ttl-ms 30000]`
-2. `poc-7 intro-attempts --db <peer.db> [--peer <hex_spki>]`
+1. `topo intro --db <introducer.db> --peer-a <hex_spki> --peer-b <hex_spki> [--ttl-ms 30000]`
+2. `topo intro-attempts --db <peer.db> [--peer <hex_spki>]`
 
 Optional later:
-1. `poc-7 intro-worker --db <introducer.db> [--interval-ms 1000]` (continuous background emission; same logic as one-shot).
+1. `topo intro-worker --db <introducer.db> [--interval-ms 1000]` (continuous background emission; same logic as one-shot).
 
 ## Implementation phases
 

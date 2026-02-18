@@ -1,4 +1,4 @@
-# Execution Plan: Remaining TODOs (poc-7)
+# Execution Plan: Remaining TODOs (Topo)
 
 Date: 2026-02-17
 Branch: `exec/all-remaining-todos-20260217`
