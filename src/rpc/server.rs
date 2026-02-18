@@ -13,6 +13,7 @@ use serde::Serialize;
 use tracing::{info, warn};
 
 use crate::db::transport_creds::discover_local_tenants;
+use crate::node::NodeRuntimeNetInfo;
 use crate::rpc::protocol::*;
 use crate::service;
 
@@ -24,6 +25,9 @@ const MAX_CONCURRENT_CONNECTIONS: usize = 64;
 pub struct DaemonState {
     pub db_path: String,
     pub active_peer: RwLock<Option<String>>,
+    /// Runtime networking info (listen addr, UPnP result). Set once the
+    /// QUIC endpoint is bound; UPnP result is populated by `topo upnp`.
+    pub runtime_net: RwLock<Option<NodeRuntimeNetInfo>>,
 }
 
 impl DaemonState {
@@ -42,6 +46,7 @@ impl DaemonState {
         DaemonState {
             db_path: db_path.to_string(),
             active_peer: RwLock::new(active),
+            runtime_net: RwLock::new(None),
         }
     }
 
@@ -180,7 +185,6 @@ fn dispatch(
         }
 
         // ----- Peer management (daemon state) -----
-
         RpcMethod::Peers => {
             match crate::db::open_connection(db_path) {
                 Ok(conn) => {
@@ -212,32 +216,31 @@ fn dispatch(
             }
         }
 
-        RpcMethod::UsePeer { index } => {
-            match crate::db::open_connection(db_path) {
-                Ok(conn) => {
-                    let _ = crate::db::schema::create_tables(&conn);
-                    match discover_local_tenants(&conn) {
-                        Ok(mut tenants) => {
-                            tenants.sort_by(|a, b| a.peer_id.cmp(&b.peer_id));
-                            if index == 0 || index > tenants.len() {
-                                return RpcResponse::error(format!(
-                                    "invalid peer number {}; available: 1-{}",
-                                    index, tenants.len()
-                                ));
-                            }
-                            let tenant = &tenants[index - 1];
-                            *state.active_peer.write().unwrap() = Some(tenant.peer_id.clone());
-                            RpcResponse::success(serde_json::json!({
-                                "peer_id": tenant.peer_id,
-                                "workspace_id": tenant.workspace_id,
-                            }))
+        RpcMethod::UsePeer { index } => match crate::db::open_connection(db_path) {
+            Ok(conn) => {
+                let _ = crate::db::schema::create_tables(&conn);
+                match discover_local_tenants(&conn) {
+                    Ok(mut tenants) => {
+                        tenants.sort_by(|a, b| a.peer_id.cmp(&b.peer_id));
+                        if index == 0 || index > tenants.len() {
+                            return RpcResponse::error(format!(
+                                "invalid peer number {}; available: 1-{}",
+                                index,
+                                tenants.len()
+                            ));
                         }
-                        Err(e) => RpcResponse::error(e.to_string()),
+                        let tenant = &tenants[index - 1];
+                        *state.active_peer.write().unwrap() = Some(tenant.peer_id.clone());
+                        RpcResponse::success(serde_json::json!({
+                            "peer_id": tenant.peer_id,
+                            "workspace_id": tenant.workspace_id,
+                        }))
                     }
+                    Err(e) => RpcResponse::error(e.to_string()),
                 }
-                Err(e) => RpcResponse::error(e.to_string()),
             }
-        }
+            Err(e) => RpcResponse::error(e.to_string()),
+        },
 
         RpcMethod::ActivePeer => {
             let active = state.active_peer.read().unwrap().clone();
@@ -262,46 +265,36 @@ fn dispatch(
         }
 
         // ----- Commands that need active peer -----
-
-        RpcMethod::Send { content } => {
-            match state.require_active_peer() {
-                Ok(peer_id) => match service::svc_send_for_peer(db_path, &peer_id, &content) {
-                    Ok(data) => RpcResponse::success(data),
-                    Err(e) => RpcResponse::error(e.to_string()),
-                },
-                Err(e) => RpcResponse::error(e),
-            }
-        }
-        RpcMethod::Generate { count } => {
-            match state.require_active_peer() {
-                Ok(peer_id) => match service::svc_generate_for_peer(db_path, &peer_id, count) {
-                    Ok(data) => RpcResponse::success(data),
-                    Err(e) => RpcResponse::error(e.to_string()),
-                },
-                Err(e) => RpcResponse::error(e),
-            }
-        }
-        RpcMethod::React { target, emoji } => {
-            match state.require_active_peer() {
-                Ok(peer_id) => match service::svc_react_for_peer(db_path, &peer_id, &target, &emoji) {
-                    Ok(data) => RpcResponse::success(data),
-                    Err(e) => RpcResponse::error(e.to_string()),
-                },
-                Err(e) => RpcResponse::error(e),
-            }
-        }
-        RpcMethod::DeleteMessage { target } => {
-            match state.require_active_peer() {
-                Ok(peer_id) => match service::svc_delete_message_for_peer(db_path, &peer_id, &target) {
-                    Ok(data) => RpcResponse::success(data),
-                    Err(e) => RpcResponse::error(e.to_string()),
-                },
-                Err(e) => RpcResponse::error(e),
-            }
-        }
+        RpcMethod::Send { content } => match state.require_active_peer() {
+            Ok(peer_id) => match service::svc_send_for_peer(db_path, &peer_id, &content) {
+                Ok(data) => RpcResponse::success(data),
+                Err(e) => RpcResponse::error(e.to_string()),
+            },
+            Err(e) => RpcResponse::error(e),
+        },
+        RpcMethod::Generate { count } => match state.require_active_peer() {
+            Ok(peer_id) => match service::svc_generate_for_peer(db_path, &peer_id, count) {
+                Ok(data) => RpcResponse::success(data),
+                Err(e) => RpcResponse::error(e.to_string()),
+            },
+            Err(e) => RpcResponse::error(e),
+        },
+        RpcMethod::React { target, emoji } => match state.require_active_peer() {
+            Ok(peer_id) => match service::svc_react_for_peer(db_path, &peer_id, &target, &emoji) {
+                Ok(data) => RpcResponse::success(data),
+                Err(e) => RpcResponse::error(e.to_string()),
+            },
+            Err(e) => RpcResponse::error(e),
+        },
+        RpcMethod::DeleteMessage { target } => match state.require_active_peer() {
+            Ok(peer_id) => match service::svc_delete_message_for_peer(db_path, &peer_id, &target) {
+                Ok(data) => RpcResponse::success(data),
+                Err(e) => RpcResponse::error(e.to_string()),
+            },
+            Err(e) => RpcResponse::error(e),
+        },
 
         // ----- Read-only commands (no active peer needed) -----
-
         RpcMethod::TransportIdentity => match service::svc_transport_identity(db_path) {
             Ok(data) => RpcResponse::success(data),
             Err(e) => RpcResponse::error(e.to_string()),
@@ -311,15 +304,27 @@ fn dispatch(
             Err(e) => RpcResponse::error(e.to_string()),
         },
         RpcMethod::Status => match service::svc_status(db_path) {
+            Ok(data) => {
+                let mut json = serde_json::to_value(data).unwrap_or(serde_json::Value::Null);
+                // Merge runtime networking info if available.
+                if let Some(net_info) = state.runtime_net.read().unwrap().as_ref() {
+                    if let Ok(net_val) = serde_json::to_value(net_info) {
+                        json["runtime"] = net_val;
+                    }
+                }
+                RpcResponse {
+                    version: crate::rpc::protocol::PROTOCOL_VERSION,
+                    ok: true,
+                    error: None,
+                    data: Some(json),
+                }
+            }
+            Err(e) => RpcResponse::error(e.to_string()),
+        },
+        RpcMethod::AssertNow { predicate } => match service::svc_assert_now(db_path, &predicate) {
             Ok(data) => RpcResponse::success(data),
             Err(e) => RpcResponse::error(e.to_string()),
         },
-        RpcMethod::AssertNow { predicate } => {
-            match service::svc_assert_now(db_path, &predicate) {
-                Ok(data) => RpcResponse::success(data),
-                Err(e) => RpcResponse::error(e.to_string()),
-            }
-        }
         RpcMethod::AssertEventually {
             predicate,
             timeout_ms,
@@ -356,6 +361,38 @@ fn dispatch(
                 Err(e) => RpcResponse::error(e.to_string()),
             }
         }
+        RpcMethod::Upnp => {
+            let net_info = state.runtime_net.read().unwrap().clone();
+            match net_info {
+                None => RpcResponse::error("daemon not ready — listen address not yet known"),
+                Some(info) => {
+                    let listen_addr: std::net::SocketAddr = match info.listen_addr.parse() {
+                        Ok(a) => a,
+                        Err(e) => return RpcResponse::error(format!("invalid listen addr: {}", e)),
+                    };
+                    let rt = match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(rt) => rt,
+                        Err(e) => {
+                            return RpcResponse::error(format!("failed to start runtime: {}", e))
+                        }
+                    };
+                    let report = rt.block_on(crate::upnp::attempt_udp_port_mapping(
+                        listen_addr,
+                        std::time::Duration::from_secs(10),
+                    ));
+                    // Store result in daemon state.
+                    let mut net = state.runtime_net.write().unwrap();
+                    if let Some(ref mut ni) = *net {
+                        ni.upnp = Some(report.clone());
+                    }
+                    RpcResponse::success(report)
+                }
+            }
+        }
+
         RpcMethod::AcceptInvite {
             invite,
             username,

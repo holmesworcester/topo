@@ -71,7 +71,6 @@ enum Commands {
     // -------------------------------------------------------------------
     // Daemon-only commands (require a running daemon)
     // -------------------------------------------------------------------
-
     /// List peers in this DB with active marker
     Peers,
 
@@ -194,6 +193,9 @@ enum Commands {
         #[arg(long)]
         bootstrap: String,
     },
+
+    /// Attempt UPnP port forwarding for the daemon's QUIC listen port
+    Upnp,
 }
 
 // ---------------------------------------------------------------------------
@@ -290,10 +292,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
             });
 
-            info!("🐭 Topo daemon started (db={}, socket={})", db, socket_path.display());
+            // Oneshot to receive runtime net info (listen addr) from node.
+            let (net_tx, net_rx) =
+                tokio::sync::oneshot::channel::<topo::node::NodeRuntimeNetInfo>();
+
+            info!(
+                "🐭 Topo daemon started (db={}, socket={})",
+                db,
+                socket_path.display()
+            );
+
+            // Spawn a task that waits for runtime net info and populates DaemonState.
+            let state_for_net = state.clone();
+            tokio::spawn(async move {
+                if let Ok(info) = net_rx.await {
+                    println!("listen: {}", info.listen_addr);
+                    *state_for_net.runtime_net.write().unwrap() = Some(info);
+                }
+            });
 
             tokio::select! {
-                result = topo::node::run_node(db, bind) => {
+                result = topo::node::run_node(db, bind, Some(net_tx)) => {
                     result?;
                 }
                 _ = shutdown_notify.notified() => {
@@ -341,7 +360,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
 
         Commands::Sync { bind } => {
-            topo::node::run_node(db, bind).await?;
+            topo::node::run_node(db, bind, None).await?;
         }
 
         Commands::Interactive => {
@@ -371,21 +390,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     println!("  (none)");
                 } else {
                     for item in items {
-                        let marker = if item["active"].as_bool().unwrap_or(false) { "*" } else { " " };
+                        let marker = if item["active"].as_bool().unwrap_or(false) {
+                            "*"
+                        } else {
+                            " "
+                        };
                         let peer_id = item["peer_id"].as_str().unwrap_or("");
                         let ws_id = item["workspace_id"].as_str().unwrap_or("");
                         let idx = item["index"].as_u64().unwrap_or(0);
-                        println!("  {}. {} {} (workspace: {})", idx, marker, short_id(peer_id), short_id(ws_id));
+                        println!(
+                            "  {}. {} {} (workspace: {})",
+                            idx,
+                            marker,
+                            short_id(peer_id),
+                            short_id(ws_id)
+                        );
                     }
                 }
             }
         }
 
         Commands::UsePeer { index } => {
-            let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::UsePeer { index })?;
+            let data =
+                rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::UsePeer { index })?;
             let peer_id = data["peer_id"].as_str().unwrap_or("");
             let ws_id = data["workspace_id"].as_str().unwrap_or("");
-            println!("Switched to peer {} (workspace: {})", short_id(peer_id), short_id(ws_id));
+            println!(
+                "Switched to peer {} (workspace: {})",
+                short_id(peer_id),
+                short_id(ws_id)
+            );
         }
 
         Commands::ActivePeer => {
@@ -397,13 +431,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
 
         Commands::TransportIdentity => {
-            let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::TransportIdentity)?;
+            let data =
+                rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::TransportIdentity)?;
             let fingerprint = data["fingerprint"].as_str().unwrap_or("");
             println!("{}", fingerprint);
         }
 
         Commands::Messages { limit } => {
-            let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::Messages { limit })?;
+            let data = rpc_require_daemon(
+                db,
+                socket_override.as_deref(),
+                RpcMethod::Messages { limit },
+            )?;
             show_messages_from_json(db, &data);
         }
 
@@ -428,6 +467,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             println!("  Reactions: {} projected", data["reactions_count"]);
             println!("  Recorded:  {} events", data["recorded_events_count"]);
             println!("  NegItems:  {} indexed", data["neg_items_count"]);
+            // Runtime networking info.
+            if let Some(rt) = data.get("runtime") {
+                println!(
+                    "  Listen:    {}",
+                    rt["listen_addr"].as_str().unwrap_or("unknown")
+                );
+                if let Some(upnp) = rt.get("upnp") {
+                    let status = upnp["status"].as_str().unwrap_or("not_attempted");
+                    match status {
+                        "success" => {
+                            let ext_port = upnp["mapped_external_port"]
+                                .as_u64()
+                                .map(|p| p.to_string())
+                                .unwrap_or_else(|| "?".into());
+                            let ext_ip = upnp["external_ip"].as_str().unwrap_or("unknown");
+                            println!(
+                                "  UPnP:      success udp external_port={} external_ip={}",
+                                ext_port, ext_ip
+                            );
+                        }
+                        "failed" => {
+                            let err = upnp["error"].as_str().unwrap_or("unknown");
+                            println!("  UPnP:      failed ({})", err);
+                        }
+                        _ => {
+                            println!("  UPnP:      not attempted");
+                        }
+                    }
+                } else {
+                    println!("  UPnP:      not attempted (run `topo upnp` to try)");
+                }
+            }
         }
 
         Commands::Generate { count } => {
@@ -453,10 +524,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let op = data["op"].as_str().unwrap_or("");
             let expected = data["expected"].as_i64().unwrap_or(0);
             if pass {
-                println!("PASS: {} = {} (expected {} {})", field, actual, op, expected);
+                println!(
+                    "PASS: {} = {} (expected {} {})",
+                    field, actual, op, expected
+                );
                 std::process::exit(0);
             } else {
-                println!("FAIL: {} = {} (expected {} {})", field, actual, op, expected);
+                println!(
+                    "FAIL: {} = {} (expected {} {})",
+                    field, actual, op, expected
+                );
                 std::process::exit(1);
             }
         }
@@ -481,7 +558,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let op = data["op"].as_str().unwrap_or("");
             let expected = data["expected"].as_i64().unwrap_or(0);
             if pass {
-                println!("PASS: {} = {} (expected {} {})", field, actual, op, expected);
+                println!(
+                    "PASS: {} = {} (expected {} {})",
+                    field, actual, op, expected
+                );
                 std::process::exit(0);
             } else {
                 println!(
@@ -503,7 +583,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             )?;
             let event_id = data["event_id"].as_str().unwrap_or("");
             let short = &event_id[..event_id.len().min(8)];
-            println!("Reacted {} ({})", data["emoji"].as_str().unwrap_or(&emoji), short);
+            println!(
+                "Reacted {} ({})",
+                data["emoji"].as_str().unwrap_or(&emoji),
+                short
+            );
         }
 
         Commands::DeleteMessage { target } => {
@@ -561,7 +645,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
 
         Commands::Keys { summary } => {
-            let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::Keys { summary })?;
+            let data =
+                rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::Keys { summary })?;
             println!("KEYS ({}):", db);
             println!("  Users: {}", data["user_count"]);
             println!("  Peers: {}", data["peer_count"]);
@@ -607,20 +692,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             peer_b,
             ttl_ms,
             attempt_window_ms,
-        } => {
-            match service::svc_intro(db, &peer_a, &peer_b, ttl_ms, attempt_window_ms).await {
-                Ok(true) => {
-                    println!("Intro sent to both peers");
-                }
-                Ok(false) => {
-                    std::process::exit(1);
-                }
-                Err(e) => {
-                    eprintln!("Error: {}", e);
-                    std::process::exit(1);
-                }
+        } => match service::svc_intro(db, &peer_a, &peer_b, ttl_ms, attempt_window_ms).await {
+            Ok(true) => {
+                println!("Intro sent to both peers");
             }
-        }
+            Ok(false) => {
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        },
 
         Commands::IntroAttempts { peer } => {
             let data = rpc_require_daemon(
@@ -664,6 +747,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 RpcMethod::CreateInvite { bootstrap },
             )?;
             println!("{}", data["invite_link"].as_str().unwrap_or(""));
+        }
+
+        Commands::Upnp => {
+            let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::Upnp)?;
+            let status = data["status"].as_str().unwrap_or("unknown");
+            match status {
+                "success" => {
+                    let ext_port = data["mapped_external_port"]
+                        .as_u64()
+                        .map(|p| p.to_string())
+                        .unwrap_or_else(|| "?".into());
+                    let ext_ip = data["external_ip"].as_str().unwrap_or("unknown");
+                    println!(
+                        "upnp: success udp external_port={} external_ip={}",
+                        ext_port, ext_ip
+                    );
+                }
+                "failed" => {
+                    let err = data["error"].as_str().unwrap_or("unknown reason");
+                    println!("upnp: failed ({})", err);
+                }
+                "not_attempted" => {
+                    let err = data["error"].as_str().unwrap_or("unknown reason");
+                    println!("upnp: not attempted ({})", err);
+                }
+                other => {
+                    println!("upnp: {}", other);
+                }
+            }
         }
     }
 
