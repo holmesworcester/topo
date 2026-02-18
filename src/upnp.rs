@@ -34,6 +34,10 @@ pub struct UpnpMappingReport {
     pub gateway: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// True when UPnP succeeded but the gateway's external IP is a private
+    /// address, indicating double-NAT (e.g. behind CGNAT or a second router).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub double_nat: bool,
 }
 
 impl UpnpMappingReport {
@@ -47,6 +51,7 @@ impl UpnpMappingReport {
             external_ip: None,
             gateway: None,
             error: Some(reason.into()),
+            double_nat: false,
         }
     }
 
@@ -60,7 +65,26 @@ impl UpnpMappingReport {
             external_ip: None,
             gateway,
             error: Some(err.into()),
+            double_nat: false,
         }
+    }
+}
+
+/// Check whether an IP address is in a private/reserved range (RFC 1918, RFC 6598 CGNAT, etc.).
+fn is_private_ip(ip_str: &str) -> bool {
+    match ip_str.parse::<IpAddr>() {
+        Ok(IpAddr::V4(v4)) => {
+            v4.is_private()             // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+            || v4.is_loopback()         // 127.0.0.0/8
+            || v4.is_link_local()       // 169.254.0.0/16
+            || v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64  // 100.64.0.0/10 (CGNAT)
+        }
+        Ok(IpAddr::V6(v6)) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| {
+                v4.is_private() || v4.is_loopback() || v4.is_link_local()
+            })
+        }
+        Err(_) => false,
     }
 }
 
@@ -153,6 +177,13 @@ pub async fn attempt_udp_port_mapping(
         .await
     {
         Ok(()) => {
+            let double_nat = external_ip.as_deref().is_some_and(is_private_ip);
+            if double_nat {
+                warn!(
+                    "UPnP: double-NAT detected — gateway external IP {} is private",
+                    external_ip.as_deref().unwrap_or("?")
+                );
+            }
             info!(
                 "UPnP: mapped udp external_port={} -> {} (gateway={})",
                 port, mapping_target, gw_addr
@@ -166,6 +197,7 @@ pub async fn attempt_udp_port_mapping(
                 external_ip,
                 gateway: Some(gw_addr),
                 error: None,
+                double_nat,
             };
         }
         Err(e) => {
@@ -184,6 +216,13 @@ pub async fn attempt_udp_port_mapping(
         .await
     {
         Ok(mapped_port) => {
+            let double_nat = external_ip.as_deref().is_some_and(is_private_ip);
+            if double_nat {
+                warn!(
+                    "UPnP: double-NAT detected — gateway external IP {} is private",
+                    external_ip.as_deref().unwrap_or("?")
+                );
+            }
             info!(
                 "UPnP: mapped udp external_port={} -> {} (gateway={})",
                 mapped_port, mapping_target, gw_addr
@@ -197,6 +236,7 @@ pub async fn attempt_udp_port_mapping(
                 external_ip,
                 gateway: Some(gw_addr),
                 error: None,
+                double_nat,
             }
         }
         Err(e) => {
@@ -248,11 +288,13 @@ mod tests {
             external_ip: Some("203.0.113.5".into()),
             gateway: Some("192.168.1.1:5431".into()),
             error: None,
+            double_nat: false,
         };
         assert_eq!(report.status, UpnpMappingStatus::Success);
         assert_eq!(report.mapped_external_port, Some(4433));
         assert_eq!(report.external_ip.as_deref(), Some("203.0.113.5"));
         assert!(report.error.is_none());
+        assert!(!report.double_nat);
     }
 
     #[test]
@@ -266,14 +308,45 @@ mod tests {
             external_ip: Some("203.0.113.5".into()),
             gateway: Some("192.168.1.1:5431".into()),
             error: None,
+            double_nat: false,
         };
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["status"], "success");
         assert_eq!(json["protocol"], "udp");
         assert_eq!(json["mapped_external_port"], 4433);
         assert_eq!(json["external_ip"], "203.0.113.5");
-        // error should be absent (skip_serializing_if = None)
+        // error and double_nat should be absent (skip_serializing_if)
         assert!(json.get("error").is_none());
+        assert!(json.get("double_nat").is_none());
+    }
+
+    #[test]
+    fn double_nat_detected_for_private_external_ip() {
+        assert!(is_private_ip("10.0.0.88"));
+        assert!(is_private_ip("192.168.1.1"));
+        assert!(is_private_ip("172.16.0.1"));
+        assert!(is_private_ip("100.64.0.1"));   // CGNAT
+        assert!(is_private_ip("127.0.0.1"));
+        assert!(!is_private_ip("203.0.113.5"));
+        assert!(!is_private_ip("73.15.131.63"));
+        assert!(!is_private_ip("8.8.8.8"));
+    }
+
+    #[test]
+    fn report_double_nat_serializes() {
+        let report = UpnpMappingReport {
+            status: UpnpMappingStatus::Success,
+            protocol: "udp".into(),
+            local_addr: "192.168.1.10:4433".into(),
+            requested_external_port: 4433,
+            mapped_external_port: Some(4433),
+            external_ip: Some("10.0.0.88".into()),
+            gateway: Some("192.168.4.1:1900".into()),
+            error: None,
+            double_nat: true,
+        };
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["double_nat"], true);
     }
 
     #[test]
