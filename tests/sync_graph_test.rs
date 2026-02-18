@@ -14,7 +14,7 @@
 //! race condition (duplicate items from concurrent reads/writes to neg_items).
 
 use std::time::{Duration, Instant};
-use poc_7::testutil::{
+use topo::testutil::{
     Peer, start_chain, start_multi_source, start_sink_download,
     sync_until_converged, assert_eventually, clone_events_to,
 };

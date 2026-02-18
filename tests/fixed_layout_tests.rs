@@ -1,7 +1,7 @@
 //! Phase 5 test expansion: golden-byte, negative parse, and idempotent
 //! encode/decode tests for all fixed-layout canonical event types.
 
-use poc_7::events::{
+use topo::events::{
     self, fixed_layout, EventError, ParsedEvent,
     MessageEvent, ReactionEvent, SignedMemoEvent, EncryptedEvent,
     FileSliceEvent, MessageAttachmentEvent, BenchDepEvent,

@@ -1060,39 +1060,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
 
 [[package]]
-name = "poc-7"
-version = "0.1.0"
-dependencies = [
- "aes-gcm",
- "async-trait",
- "base64 0.21.7",
- "blake2",
- "clap",
- "curve25519-dalek",
- "dirs-next",
- "ed25519-dalek",
- "hex",
- "mdns-sd",
- "negentropy",
- "nom",
- "quinn",
- "rand 0.8.5",
- "rcgen",
- "rusqlite",
- "rustls",
- "rustls-webpki",
- "rustyline",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "x509-parser",
-]
-
-[[package]]
 name = "polling"
 version = "2.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1867,6 +1834,39 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "topo"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "async-trait",
+ "base64 0.21.7",
+ "blake2",
+ "clap",
+ "curve25519-dalek",
+ "dirs-next",
+ "ed25519-dalek",
+ "hex",
+ "mdns-sd",
+ "negentropy",
+ "nom",
+ "quinn",
+ "rand 0.8.5",
+ "rcgen",
+ "rusqlite",
+ "rustls",
+ "rustls-webpki",
+ "rustyline",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "x509-parser",
 ]
 
 [[package]]

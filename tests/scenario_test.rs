@@ -1,13 +1,13 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use poc_7::testutil::{Peer, SharedDbNode, ScenarioHarness, start_peers, assert_eventually, sync_until_converged};
-use poc_7::crypto::{event_id_to_base64, event_id_from_base64};
-use poc_7::transport::{
+use topo::testutil::{Peer, SharedDbNode, ScenarioHarness, start_peers, assert_eventually, sync_until_converged};
+use topo::crypto::{event_id_to_base64, event_id_from_base64};
+use topo::transport::{
     AllowedPeers, create_client_endpoint, create_server_endpoint,
     extract_spki_fingerprint, peer_identity_from_connection,
 };
-use poc_7::sync::engine::{accept_loop, connect_loop};
-use poc_7::db::open_connection;
+use topo::sync::engine::{accept_loop, connect_loop};
+use topo::db::open_connection;
 
 
 
@@ -735,7 +735,7 @@ async fn test_signed_event_out_of_order_sync() {
 #[tokio::test]
 async fn test_invalid_signature_rejected_after_sync() {
     use ed25519_dalek::SigningKey;
-    use poc_7::crypto::event_id_to_base64;
+    use topo::crypto::event_id_to_base64;
 
     let alice = Peer::new_with_identity("alice");
     let bob = Peer::new_with_identity("bob");
@@ -751,9 +751,9 @@ async fn test_invalid_signature_rejected_after_sync() {
     // We need to do this manually since create_signed_memo uses proper signing
     let bad_memo_event_id_b64: String;
     {
-        use poc_7::events::{SignedMemoEvent, ParsedEvent, encode_event};
-        use poc_7::projection::signer::sign_event_bytes;
-        use poc_7::crypto::hash_event;
+        use topo::events::{SignedMemoEvent, ParsedEvent, encode_event};
+        use topo::projection::signer::sign_event_bytes;
+        use topo::crypto::hash_event;
 
         let db = open_connection(&alice.db_path).expect("open alice db");
         let memo = ParsedEvent::SignedMemo(SignedMemoEvent {
@@ -1010,8 +1010,8 @@ async fn test_encrypted_replay_invariants() {
 #[tokio::test]
 async fn test_project_queue_crash_recovery() {
     let harness = ScenarioHarness::skip("manually destroys/rebuilds projection as test mechanism");
-    use poc_7::db::project_queue::ProjectQueue;
-    use poc_7::projection::pipeline::project_one;
+    use topo::db::project_queue::ProjectQueue;
+    use topo::projection::pipeline::project_one;
 
     let alice = Peer::new_with_identity("alice");
 
@@ -1096,8 +1096,8 @@ async fn test_project_queue_crash_recovery() {
 #[tokio::test]
 async fn test_project_queue_drain_after_batch() {
     let harness = ScenarioHarness::skip("tests queue dedup guard, not projection invariants");
-    use poc_7::db::project_queue::ProjectQueue;
-    use poc_7::projection::pipeline::project_one;
+    use topo::db::project_queue::ProjectQueue;
+    use topo::projection::pipeline::project_one;
 
     let alice = Peer::new_with_identity("alice");
 
@@ -1140,7 +1140,7 @@ async fn test_project_queue_drain_after_batch() {
 #[tokio::test]
 async fn test_egress_queue_lifecycle() {
     let harness = ScenarioHarness::skip("tests egress queue lifecycle, no projection state involved");
-    use poc_7::db::egress_queue::EgressQueue;
+    use topo::db::egress_queue::EgressQueue;
 
     let alice = Peer::new_with_identity("alice");
 
@@ -1475,7 +1475,7 @@ async fn test_psk_two_set_isolation() {
 /// Purge with far-future cutoff removes them; purge with past cutoff keeps them.
 #[tokio::test]
 async fn test_endpoint_observations_recorded() {
-    use poc_7::db::health::purge_expired_endpoints;
+    use topo::db::health::purge_expired_endpoints;
 
     let alice = Peer::new_with_identity("alice");
     let bob = Peer::new_with_identity("bob");
@@ -1545,12 +1545,12 @@ async fn test_endpoint_observations_recorded() {
 /// Gap 3: Encrypted inner event with unsupported signer_type rejects durably (not hard error).
 #[tokio::test]
 async fn test_encrypted_inner_unsupported_signer_rejects_durably() {
-    use poc_7::crypto::hash_event;
-    use poc_7::events::{
+    use topo::crypto::hash_event;
+    use topo::events::{
         EncryptedEvent, ParsedEvent, SignedMemoEvent, EVENT_TYPE_SIGNED_MEMO, encode_event,
     };
-    use poc_7::projection::encrypted::encrypt_event_blob;
-    use poc_7::projection::pipeline::project_one;
+    use topo::projection::encrypted::encrypt_event_blob;
+    use topo::projection::pipeline::project_one;
 
     let alice = Peer::new_with_identity("alice");
     let harness = ScenarioHarness::new();
@@ -1604,7 +1604,7 @@ async fn test_encrypted_inner_unsupported_signer_rejects_durably() {
     // Project: should get Reject (not hard Err) because signer_type=255 is invalid
     let result = project_one(&db, &alice.identity, &enc_eid).unwrap();
     match result {
-        poc_7::projection::decision::ProjectionDecision::Reject { reason } => {
+        topo::projection::decision::ProjectionDecision::Reject { reason } => {
             assert!(
                 reason.contains("unsupported signer_type") || reason.contains("signer resolution failed"),
                 "unexpected rejection reason: {}",
@@ -1628,7 +1628,7 @@ async fn test_encrypted_inner_unsupported_signer_rejects_durably() {
     let result2 = project_one(&db, &alice.identity, &enc_eid).unwrap();
     assert_eq!(
         result2,
-        poc_7::projection::decision::ProjectionDecision::AlreadyProcessed,
+        topo::projection::decision::ProjectionDecision::AlreadyProcessed,
         "rejected event should not be re-processed"
     );
 
@@ -1826,11 +1826,11 @@ fn test_out_of_order_identity() {
     let db = open_connection(&alice.db_path).unwrap();
 
     use ed25519_dalek::SigningKey;
-    use poc_7::events::{encode_event, ParsedEvent, WorkspaceEvent, UserInviteBootEvent, UserBootEvent};
-    use poc_7::projection::signer::sign_event_bytes;
-    use poc_7::projection::pipeline::project_one;
-    use poc_7::crypto::hash_event;
-    use poc_7::events::registry;
+    use topo::events::{encode_event, ParsedEvent, WorkspaceEvent, UserInviteBootEvent, UserBootEvent};
+    use topo::projection::signer::sign_event_bytes;
+    use topo::projection::pipeline::project_one;
+    use topo::crypto::hash_event;
+    use topo::events::registry;
 
     let mut rng = rand::thread_rng();
     let workspace_key = SigningKey::generate(&mut rng);
@@ -1895,7 +1895,7 @@ fn test_out_of_order_identity() {
     // Project UserBoot — should Block (signed_by dep user_invite_eid not valid)
     let result = project_one(&db, &alice.identity, &user_eid).unwrap();
     assert!(
-        matches!(result, poc_7::projection::decision::ProjectionDecision::Block { .. }),
+        matches!(result, topo::projection::decision::ProjectionDecision::Block { .. }),
         "UserBoot should block when UserInviteBoot is not yet present, got {:?}", result,
     );
     let valid_before: bool = db.query_row(
@@ -1919,7 +1919,7 @@ fn test_out_of_order_identity() {
     ).unwrap();
     let net_result = project_one(&db, &alice.identity, &workspace_eid).unwrap();
     assert!(
-        matches!(net_result, poc_7::projection::decision::ProjectionDecision::Block { .. }),
+        matches!(net_result, topo::projection::decision::ProjectionDecision::Block { .. }),
         "Workspace should block (no trust anchor yet), got {:?}", net_result,
     );
 
@@ -1937,7 +1937,7 @@ fn test_out_of_order_identity() {
     ).unwrap();
     let uib_result = project_one(&db, &alice.identity, &user_invite_eid).unwrap();
     assert!(
-        matches!(uib_result, poc_7::projection::decision::ProjectionDecision::Block { .. }),
+        matches!(uib_result, topo::projection::decision::ProjectionDecision::Block { .. }),
         "UserInviteBoot should block (workspace dep not valid), got {:?}", uib_result,
     );
 
@@ -2099,9 +2099,9 @@ fn test_secret_shared_key_wrap() {
 /// then unblocks via cascade after Bob's identity chain events are synced in.
 #[test]
 fn test_secret_shared_blocks_until_signer_valid() {
-    use poc_7::projection::pipeline::project_one;
-    use poc_7::projection::create::create_signed_event_staged;
-    use poc_7::events::{ParsedEvent, SecretSharedEvent};
+    use topo::projection::pipeline::project_one;
+    use topo::projection::create::create_signed_event_staged;
+    use topo::events::{ParsedEvent, SecretSharedEvent};
 
     let alice = Peer::new("alice");
     let bob = Peer::new("bob");
@@ -2160,7 +2160,7 @@ fn test_secret_shared_blocks_until_signer_valid() {
         }).unwrap().collect::<Result<Vec<_>, _>>().unwrap()
     };
 
-    use poc_7::events::registry;
+    use topo::events::registry;
     let reg = registry();
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
@@ -2231,9 +2231,9 @@ fn test_encrypted_blocks_then_unblocks_on_key_materialization() {
     ).unwrap();
 
     let bob_db = open_connection(&bob.db_path).unwrap();
-    use poc_7::events::registry;
-    use poc_7::projection::pipeline::project_one;
-    use poc_7::projection::decision::ProjectionDecision;
+    use topo::events::registry;
+    use topo::projection::pipeline::project_one;
+    use topo::projection::decision::ProjectionDecision;
     let reg = registry();
     let enc_meta = reg.lookup(enc_blob[0]).unwrap();
     let now_ms = std::time::SystemTime::now()
@@ -2292,10 +2292,10 @@ fn test_encrypted_blocks_then_unblocks_on_key_materialization() {
 /// that underpins the invite key wrap/unwrap bootstrap flow.
 #[test]
 fn test_deterministic_key_event_id_matches_across_peers() {
-    use poc_7::projection::encrypted::{wrap_key_for_recipient, unwrap_key_from_sender};
+    use topo::projection::encrypted::{wrap_key_for_recipient, unwrap_key_from_sender};
     use ed25519_dalek::SigningKey;
-    use poc_7::events::{encode_event, ParsedEvent, SecretKeyEvent};
-    use poc_7::crypto::hash_event;
+    use topo::events::{encode_event, ParsedEvent, SecretKeyEvent};
+    use topo::crypto::hash_event;
 
     let alice = Peer::new_with_identity("alice_det_key");
     let bob = Peer::new_with_identity("bob_det_key");
@@ -2359,7 +2359,7 @@ fn test_deterministic_key_event_id_matches_across_peers() {
 /// becomes decryptable (or at least unblocked) on Bob's side.
 #[test]
 fn test_wrap_unwrap_encrypted_convergence() {
-    use poc_7::projection::encrypted::{wrap_key_for_recipient, unwrap_key_from_sender};
+    use topo::projection::encrypted::{wrap_key_for_recipient, unwrap_key_from_sender};
     use ed25519_dalek::SigningKey;
 
     let alice = Peer::new_with_identity("alice_conv");
@@ -2422,9 +2422,9 @@ fn test_wrap_unwrap_encrypted_convergence() {
     ).unwrap();
 
     let bob_db = open_connection(&bob.db_path).unwrap();
-    use poc_7::events::registry;
-    use poc_7::projection::decision::ProjectionDecision;
-    use poc_7::projection::pipeline::project_one;
+    use topo::events::registry;
+    use topo::projection::decision::ProjectionDecision;
+    use topo::projection::pipeline::project_one;
     let reg = registry();
     let enc_meta = reg.lookup(enc_blob[0]).unwrap();
     let now_ms = std::time::SystemTime::now()
@@ -2518,11 +2518,11 @@ fn test_transport_key_projects_without_auto_binding() {
     // transport_keys are no longer authoritative for trust — PeerShared-derived SPKIs are.
     // The transport_keys SPKI should NOT appear in allowed_peers (unless it also matches
     // a PeerShared-derived SPKI).
-    let allowed = poc_7::db::transport_trust::allowed_peers_from_db(&db, &alice.identity).unwrap();
+    let allowed = topo::db::transport_trust::allowed_peers_from_db(&db, &alice.identity).unwrap();
     assert!(!allowed.contains(&spki_fp), "transport_keys SPKI should not be in allowed set (non-authoritative)");
 
     // But PeerShared-derived SPKI should be in allowed set
-    let ps_spki = poc_7::transport::cert::spki_fingerprint_from_ed25519_pubkey(
+    let ps_spki = topo::transport::cert::spki_fingerprint_from_ed25519_pubkey(
         &chain.peer_shared_key.verifying_key().to_bytes()
     );
     assert!(allowed.contains(&ps_spki), "PeerShared-derived SPKI should be in allowed set");
@@ -2719,7 +2719,7 @@ fn test_no_blob_capture_trust_influence() {
     fake_blob.extend_from_slice(&fake_workspace_id); // workspace_id at [41..73]
     fake_blob.extend_from_slice(&[0u8; 97]); // rest of the 170B blob
 
-    let fake_eid = poc_7::crypto::hash_event(&fake_blob);
+    let fake_eid = topo::crypto::hash_event(&fake_blob);
     let fake_b64 = event_id_to_base64(&fake_eid);
 
     db.execute(
@@ -2754,9 +2754,9 @@ fn test_true_out_of_order_identity_chain() {
     let db = open_connection(&alice.db_path).unwrap();
 
     use ed25519_dalek::SigningKey;
-    use poc_7::crypto::hash_event;
-    use poc_7::events::{encode_event, ParsedEvent, WorkspaceEvent};
-    use poc_7::projection::create::create_event_staged;
+    use topo::crypto::hash_event;
+    use topo::events::{encode_event, ParsedEvent, WorkspaceEvent};
+    use topo::projection::create::create_event_staged;
     let mut rng = rand::thread_rng();
 
     let workspace_key = SigningKey::generate(&mut rng);
@@ -3081,8 +3081,8 @@ async fn test_identity_then_messaging() {
 /// for Laptop, Laptop joins with PeerSharedOngoing, both sync and converge.
 #[tokio::test]
 async fn test_device_link_via_sync() {
-    use poc_7::events::{DeviceInviteOngoingEvent, PeerSharedOngoingEvent, ParsedEvent};
-    use poc_7::projection::create::{create_signed_event_sync, create_signed_event_staged};
+    use topo::events::{DeviceInviteOngoingEvent, PeerSharedOngoingEvent, ParsedEvent};
+    use topo::projection::create::{create_signed_event_sync, create_signed_event_staged};
 
     let phone = Peer::new("phone");
     let laptop = Peer::new("laptop");
@@ -3253,7 +3253,7 @@ async fn test_shared_db_tenant_discovery() {
     harness.track_node(&node);
 
     let db = open_connection(&node.db_path).unwrap();
-    let tenants = poc_7::db::transport_creds::discover_local_tenants(&db).unwrap();
+    let tenants = topo::db::transport_creds::discover_local_tenants(&db).unwrap();
 
     assert_eq!(tenants.len(), 3, "should discover all 3 tenants");
 
@@ -3390,7 +3390,7 @@ async fn test_svc_node_status() {
     let harness = ScenarioHarness::new();
     harness.track_node(&node);
 
-    let status = poc_7::service::svc_node_status(&node.db_path).unwrap();
+    let status = topo::service::svc_node_status(&node.db_path).unwrap();
     assert_eq!(status.len(), 2, "should report 2 tenants");
 
     let ids: Vec<&str> = status.iter().map(|t| t.peer_id.as_str()).collect();
@@ -3431,12 +3431,12 @@ async fn test_shared_db_same_workspace_two_tenants() {
     // Both tenants should have recorded the shared Workspace event
     let t0_has_ws: bool = db.query_row(
         "SELECT COUNT(*) > 0 FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
-        rusqlite::params![&t0.identity, &poc_7::crypto::event_id_to_base64(&creator_workspace)],
+        rusqlite::params![&t0.identity, &topo::crypto::event_id_to_base64(&creator_workspace)],
         |row| row.get(0),
     ).unwrap();
     let t1_has_ws: bool = db.query_row(
         "SELECT COUNT(*) > 0 FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
-        rusqlite::params![&t1.identity, &poc_7::crypto::event_id_to_base64(&creator_workspace)],
+        rusqlite::params![&t1.identity, &topo::crypto::event_id_to_base64(&creator_workspace)],
         |row| row.get(0),
     ).unwrap();
     assert!(t0_has_ws, "tenant 0 should have recorded the workspace event");
@@ -3444,7 +3444,7 @@ async fn test_shared_db_same_workspace_two_tenants() {
 
     // The workspace event_id should appear in both tenants' recorded_events —
     // this is the legitimate overlap that the workspace-aware leakage check allows.
-    let ws_b64 = poc_7::crypto::event_id_to_base64(&creator_workspace);
+    let ws_b64 = topo::crypto::event_id_to_base64(&creator_workspace);
     let tenants_with_ws: i64 = db.query_row(
         "SELECT COUNT(DISTINCT peer_id) FROM recorded_events WHERE event_id = ?1",
         rusqlite::params![&ws_b64],
@@ -3467,9 +3467,9 @@ async fn test_shared_db_same_workspace_two_tenants() {
 #[tokio::test]
 async fn test_mdns_two_peers_discover_and_sync() {
     use std::collections::HashSet;
-    use poc_7::discovery::{TenantDiscovery, local_non_loopback_ipv4};
-    use poc_7::db::transport_trust::import_cli_pins_to_sql;
-    use poc_7::testutil::create_dynamic_endpoint_for_peer_bind;
+    use topo::discovery::{TenantDiscovery, local_non_loopback_ipv4};
+    use topo::db::transport_trust::import_cli_pins_to_sql;
+    use topo::testutil::create_dynamic_endpoint_for_peer_bind;
 
     let advertise_ip = local_non_loopback_ipv4().expect("no routable IP");
     let alice = Peer::new_with_identity("mdns-alice");
@@ -3582,9 +3582,9 @@ async fn test_mdns_two_peers_discover_and_sync() {
 #[tokio::test]
 async fn test_mdns_multitenant_self_filtering_and_sync() {
     use std::collections::HashSet;
-    use poc_7::discovery::{TenantDiscovery, local_non_loopback_ipv4};
-    use poc_7::db::transport_trust::import_cli_pins_to_sql;
-    use poc_7::testutil::create_dynamic_endpoint_for_peer_bind;
+    use topo::discovery::{TenantDiscovery, local_non_loopback_ipv4};
+    use topo::db::transport_trust::import_cli_pins_to_sql;
+    use topo::testutil::create_dynamic_endpoint_for_peer_bind;
 
     let advertise_ip = local_non_loopback_ipv4().expect("no routable IP");
     // Three peers: t0 and t1 are "co-located" (share local_peer_ids), ext is external
@@ -3769,7 +3769,7 @@ async fn test_mdns_multitenant_self_filtering_and_sync() {
 /// The client side already uses dynamic `DynamicAllowFn`.
 #[tokio::test]
 async fn test_connect_with_presents_correct_tenant_cert() {
-    use poc_7::transport::{
+    use topo::transport::{
         create_single_port_endpoint, create_dual_endpoint, generate_self_signed_cert,
         workspace_client_config, multi_workspace::WorkspaceCertResolver,
     };
@@ -3805,7 +3805,7 @@ async fn test_connect_with_presents_correct_tenant_cert() {
     });
 
     // Client endpoint: default cert is "default" (the wrong one for this test)
-    let allow_server: Arc<poc_7::transport::DynamicAllowFn> = Arc::new(move |fp: &[u8; 32]| {
+    let allow_server: Arc<topo::transport::DynamicAllowFn> = Arc::new(move |fp: &[u8; 32]| {
         Ok(*fp == server_fp)
     });
     let resolver = WorkspaceCertResolver::new();
@@ -3866,7 +3866,7 @@ async fn test_connect_with_presents_correct_tenant_cert() {
 /// resolution. The pinning policy boundary is the thing under test.
 #[tokio::test]
 async fn test_tenant_scoped_outbound_trust_rejects_untrusted_server() {
-    use poc_7::transport::{
+    use topo::transport::{
         generate_self_signed_cert,
         workspace_client_config, create_dual_endpoint,
     };
@@ -3900,7 +3900,7 @@ async fn test_tenant_scoped_outbound_trust_rejects_untrusted_server() {
 
     // Client: create endpoint + tenant config that ONLY trusts "trusted_server"
     let client_ep = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
-    let tenant_trust: Arc<poc_7::transport::DynamicAllowFn> = Arc::new(move |fp: &[u8; 32]| {
+    let tenant_trust: Arc<topo::transport::DynamicAllowFn> = Arc::new(move |fp: &[u8; 32]| {
         Ok(*fp == trusted_fp) // only trusts the trusted server
     });
     let tenant_config = workspace_client_config(
@@ -3951,14 +3951,14 @@ async fn test_tenant_scoped_outbound_trust_rejects_untrusted_server() {
 async fn test_run_node_multitenant_outbound_isolation() {
     use std::collections::HashMap;
     use std::sync::atomic::AtomicU64;
-    use poc_7::db::transport_creds::discover_local_tenants;
-    use poc_7::db::transport_trust::{import_cli_pins_to_sql, is_peer_allowed};
-    use poc_7::transport::{
+    use topo::db::transport_creds::discover_local_tenants;
+    use topo::db::transport_trust::{import_cli_pins_to_sql, is_peer_allowed};
+    use topo::transport::{
         create_single_port_endpoint, workspace_client_config,
         multi_workspace::{WorkspaceCertResolver, workspace_sni},
         DynamicAllowFn,
     };
-    use poc_7::sync::engine::{accept_loop_with_ingest, IngestItem, batch_writer};
+    use topo::sync::engine::{accept_loop_with_ingest, IngestItem, batch_writer};
     use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
     use rustls::sign::CertifiedKey;
     use tokio::sync::mpsc;
@@ -3977,7 +3977,7 @@ async fn test_run_node_multitenant_outbound_isolation() {
     let b1 = &node_b.tenants[1];
 
     // Decode SPKI fingerprints from hex identity strings
-    let fp = |peer: &poc_7::testutil::Peer| -> [u8; 32] {
+    let fp = |peer: &topo::testutil::Peer| -> [u8; 32] {
         hex::decode(&peer.identity).unwrap().try_into().unwrap()
     };
 

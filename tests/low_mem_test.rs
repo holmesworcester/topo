@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use poc_7::testutil::{Peer, sync_until_converged};
+use topo::testutil::{Peer, sync_until_converged};
 
 
 

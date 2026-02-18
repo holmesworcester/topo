@@ -10,16 +10,16 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use poc_7::crypto::event_id_from_base64;
-use poc_7::db::open_connection;
-use poc_7::db::intro::{list_intro_attempts, freshest_endpoint};
-use poc_7::db::project_queue::ProjectQueue;
-use poc_7::db::transport_trust::allowed_peers_from_db;
-use poc_7::projection::pipeline::project_one;
-use poc_7::sync::engine::{accept_loop, connect_loop};
-use poc_7::sync::intro::{run_intro, send_intro_offer, build_intro_offer};
-use poc_7::testutil::{Peer, assert_eventually, create_dynamic_endpoint_for_peer};
-use poc_7::transport::{
+use topo::crypto::event_id_from_base64;
+use topo::db::open_connection;
+use topo::db::intro::{list_intro_attempts, freshest_endpoint};
+use topo::db::project_queue::ProjectQueue;
+use topo::db::transport_trust::allowed_peers_from_db;
+use topo::projection::pipeline::project_one;
+use topo::sync::engine::{accept_loop, connect_loop};
+use topo::sync::intro::{run_intro, send_intro_offer, build_intro_offer};
+use topo::testutil::{Peer, assert_eventually, create_dynamic_endpoint_for_peer};
+use topo::transport::{
     AllowedPeers, create_dual_endpoint,
 };
 

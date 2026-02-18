@@ -1938,7 +1938,7 @@ impl TenantDiscovery {
 }
 ```
 
-Each tenant advertises under `_quiet-p7._udp.local.` with:
+Each tenant advertises under `_topo._udp.local.` with:
 - Instance name: `p7-{peer_id_truncated_to_59_chars}` (DNS labels max 63 bytes).
 - TXT property: `peer_id={full_64_hex_chars}` for exact matching.
 - Explicit local non-loopback IPv4 address (discovered via UDP socket connect to 8.8.8.8).

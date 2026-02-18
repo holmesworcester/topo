@@ -8,16 +8,16 @@
 use std::time::Instant;
 
 use ed25519_dalek::SigningKey;
-use poc_7::crypto::{event_id_to_base64, hash_event, EventId};
-use poc_7::db::{open_connection, schema::create_tables};
-use poc_7::events::{
+use topo::crypto::{event_id_to_base64, hash_event, EventId};
+use topo::db::{open_connection, schema::create_tables};
+use topo::events::{
     self, FileSliceEvent, MessageAttachmentEvent, MessageEvent, ParsedEvent,
     SecretKeyEvent, WorkspaceEvent, InviteAcceptedEvent, UserInviteBootEvent,
     UserBootEvent, DeviceInviteFirstEvent, PeerSharedFirstEvent,
     fixed_layout::FILE_SLICE_CIPHERTEXT_BYTES,
 };
-use poc_7::projection::pipeline::project_one;
-use poc_7::projection::signer::sign_event_bytes;
+use topo::projection::pipeline::project_one;
+use topo::projection::signer::sign_event_bytes;
 use rusqlite::Connection;
 use tempfile::NamedTempFile;
 
@@ -252,7 +252,7 @@ fn run_file_throughput(file_size_bytes: usize) {
         assert!(
             matches!(
                 result,
-                poc_7::projection::decision::ProjectionDecision::Valid
+                topo::projection::decision::ProjectionDecision::Valid
             ),
             "slice {} failed: {:?}",
             i,

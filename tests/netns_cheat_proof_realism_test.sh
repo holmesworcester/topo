@@ -37,9 +37,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-BIN_POC7="${PROJECT_DIR}/target/debug/poc-7"
-BIN_P7D="${PROJECT_DIR}/target/debug/p7d"
-BIN_P7CTL="${PROJECT_DIR}/target/debug/p7ctl"
+BIN="${PROJECT_DIR}/target/debug/topo"
+
+
 
 PREFIX="cp7"
 TMPDIR="$(mktemp -d /tmp/cp7_realism.XXXXXX)"
@@ -141,9 +141,9 @@ if [[ "$CLEANUP_ONLY" == "1" ]]; then
 fi
 
 command -v ip >/dev/null || fail "ip command not found"
-[[ -x "$BIN_POC7" ]] || fail "Missing $BIN_POC7 (run: cargo build --bins)"
-[[ -x "$BIN_P7D"  ]] || fail "Missing $BIN_P7D (run: cargo build --bins)"
-[[ -x "$BIN_P7CTL" ]] || fail "Missing $BIN_P7CTL (run: cargo build --bins)"
+[[ -x "$BIN" ]] || fail "Missing $BIN (run: cargo build --bins)"
+[[ -x "$BIN start"  ]] || fail "Missing $BIN start (run: cargo build --bins)"
+[[ -x "$BIN" ]] || fail "Missing $BIN (run: cargo build --bins)"
 
 wait_for_file() {
     local path="$1"
@@ -188,7 +188,7 @@ run_p7ctl() {
     local db="$1"
     local sock="$2"
     shift 2
-    "$BIN_P7CTL" --db "$db" --socket "$sock" "$@"
+    "$BIN" --db "$db" --socket "$sock" "$@"
 }
 
 assert_eventually() {
@@ -219,7 +219,7 @@ start_daemon() {
     local db="$2"
     local sock="$3"
     local log_file="$4"
-    ip netns exec "$ns" "$BIN_P7D" \
+    ip netns exec "$ns" "$BIN start" \
         --db "$db" \
         --socket "$sock" \
         --bind "0.0.0.0:4433" \
@@ -279,13 +279,13 @@ DB_E="$TMPDIR/e.db"; SOCK_E="$TMPDIR/e.sock"
 DB_F="$TMPDIR/f.db"; SOCK_F="$TMPDIR/f.sock"
 
 log "Bootstrapping workspace on A and creating invite links..."
-"$BIN_POC7" send "bootstrap-from-a" --db "$DB_A" >/dev/null || fail "A bootstrap send failed"
+"$BIN" send "bootstrap-from-a" --db "$DB_A" >/dev/null || fail "A bootstrap send failed"
 
-INV_B="$("$BIN_POC7" create-invite --db "$DB_A" --bootstrap "10.11.1.10:4433" | tr -d '\n')"
-INV_C="$("$BIN_POC7" create-invite --db "$DB_A" --bootstrap "10.11.1.10:4433" | tr -d '\n')"
-INV_D="$("$BIN_POC7" create-invite --db "$DB_A" --bootstrap "10.11.1.10:4433" | tr -d '\n')"
-INV_E="$("$BIN_POC7" create-invite --db "$DB_A" --bootstrap "10.11.1.10:4433" | tr -d '\n')"
-INV_F="$("$BIN_POC7" create-invite --db "$DB_A" --bootstrap "10.11.1.10:4433" | tr -d '\n')"
+INV_B="$("$BIN" create-invite --db "$DB_A" --bootstrap "10.11.1.10:4433" | tr -d '\n')"
+INV_C="$("$BIN" create-invite --db "$DB_A" --bootstrap "10.11.1.10:4433" | tr -d '\n')"
+INV_D="$("$BIN" create-invite --db "$DB_A" --bootstrap "10.11.1.10:4433" | tr -d '\n')"
+INV_E="$("$BIN" create-invite --db "$DB_A" --bootstrap "10.11.1.10:4433" | tr -d '\n')"
+INV_F="$("$BIN" create-invite --db "$DB_A" --bootstrap "10.11.1.10:4433" | tr -d '\n')"
 
 [[ "$INV_B" == quiet://invite/* ]] || fail "invalid invite link format for B"
 [[ "$INV_F" == quiet://invite/* ]] || fail "invalid invite link format for F"
@@ -294,11 +294,11 @@ log "Starting inviter daemon A..."
 PID_A="$(start_daemon "$NS_A" "$DB_A" "$SOCK_A" "$TMPDIR/a.log")"
 
 log "Accepting invites from segmented peers (internet bootstrap mode)..."
-ip netns exec "$NS_B" "$BIN_POC7" accept-invite --db "$DB_B" --invite "$INV_B" --username "b" --devicename "dev-b" >/dev/null
-ip netns exec "$NS_C" "$BIN_POC7" accept-invite --db "$DB_C" --invite "$INV_C" --username "c" --devicename "dev-c" >/dev/null
-ip netns exec "$NS_D" "$BIN_POC7" accept-invite --db "$DB_D" --invite "$INV_D" --username "d" --devicename "dev-d" >/dev/null
-ip netns exec "$NS_E" "$BIN_POC7" accept-invite --db "$DB_E" --invite "$INV_E" --username "e" --devicename "dev-e" >/dev/null
-ip netns exec "$NS_F" "$BIN_POC7" accept-invite --db "$DB_F" --invite "$INV_F" --username "f" --devicename "dev-f" >/dev/null
+ip netns exec "$NS_B" "$BIN" accept-invite --db "$DB_B" --invite "$INV_B" --username "b" --devicename "dev-b" >/dev/null
+ip netns exec "$NS_C" "$BIN" accept-invite --db "$DB_C" --invite "$INV_C" --username "c" --devicename "dev-c" >/dev/null
+ip netns exec "$NS_D" "$BIN" accept-invite --db "$DB_D" --invite "$INV_D" --username "d" --devicename "dev-d" >/dev/null
+ip netns exec "$NS_E" "$BIN" accept-invite --db "$DB_E" --invite "$INV_E" --username "e" --devicename "dev-e" >/dev/null
+ip netns exec "$NS_F" "$BIN" accept-invite --db "$DB_F" --invite "$INV_F" --username "f" --devicename "dev-f" >/dev/null
 
 log "Starting peer daemons without manual --connect..."
 PID_B="$(start_daemon "$NS_B" "$DB_B" "$SOCK_B" "$TMPDIR/b.log")"

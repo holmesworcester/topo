@@ -1,5 +1,5 @@
 [package]
-name = "poc-7"
+name = "topo"
 version = "0.1.0"
 edition = "2021"
 
@@ -38,16 +38,8 @@ default = ["discovery"]
 discovery = ["mdns-sd"]
 
 [[bin]]
-name = "poc-7"
+name = "topo"
 path = "src/main.rs"
-
-[[bin]]
-name = "p7d"
-path = "src/bin/p7d.rs"
-
-[[bin]]
-name = "p7ctl"
-path = "src/bin/p7ctl.rs"
 
 [dev-dependencies]
 

@@ -4,7 +4,7 @@
 //! Slow tests: cargo test --release --test perf_test -- --nocapture --ignored
 
 use std::time::{Duration, Instant};
-use poc_7::testutil::{Peer, start_peers, assert_eventually, sync_until_converged};
+use topo::testutil::{Peer, start_peers, assert_eventually, sync_until_converged};
 
 
 
@@ -304,9 +304,9 @@ fn inject_messages_batched(
     signing_key: &ed25519_dalek::SigningKey,
 ) {
     use std::time::{SystemTime, UNIX_EPOCH};
-    use poc_7::db::open_connection;
-    use poc_7::events::{MessageEvent, ParsedEvent};
-    use poc_7::projection::create::create_signed_event_sync;
+    use topo::db::open_connection;
+    use topo::events::{MessageEvent, ParsedEvent};
+    use topo::projection::create::create_signed_event_sync;
 
     let db = open_connection(db_path).expect("failed to open db");
 

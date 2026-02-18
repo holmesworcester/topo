@@ -789,7 +789,7 @@ fn cmd_invite(
 }
 
 /// In the interactive REPL all accounts live in one process — nobody is
-/// running `poc-7 sync`.  This spins up a temporary QUIC sync endpoint for
+/// running `topo sync`.  This spins up a temporary QUIC sync endpoint for
 /// Delegate to the shared bootstrap responder in sync::bootstrap.
 fn start_temp_sync_endpoint(
     inviter_db_path: &str,

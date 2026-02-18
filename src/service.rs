@@ -1738,7 +1738,7 @@ pub fn persist_workspace_key(
 // ---------------------------------------------------------------------------
 
 /// Derive the RPC socket path from a DB path.
-/// Uses `<db_path>.p7d.sock` — same directory as the database file.
+/// Uses `<db_path>.topo.sock` — same directory as the database file.
 pub fn socket_path_for_db(db_path: &str) -> std::path::PathBuf {
     let p = std::path::Path::new(db_path);
     let abs = if p.is_absolute() {
@@ -1746,7 +1746,7 @@ pub fn socket_path_for_db(db_path: &str) -> std::path::PathBuf {
     } else {
         std::env::current_dir().unwrap_or_default().join(p)
     };
-    abs.with_extension("p7d.sock")
+    abs.with_extension("topo.sock")
 }
 
 #[cfg(test)]

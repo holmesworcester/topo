@@ -1,10 +1,10 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-use poc_7::invite_link::parse_invite_link;
+use topo::invite_link::parse_invite_link;
 
 fn bin() -> String {
-    env!("CARGO_BIN_EXE_poc-7").to_string()
+    env!("CARGO_BIN_EXE_topo").to_string()
 }
 
 /// Run the interactive REPL with the given commands piped to stdin.
