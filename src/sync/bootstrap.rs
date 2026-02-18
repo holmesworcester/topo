@@ -17,7 +17,7 @@ use crate::contracts::network_contract::{
 };
 use crate::db::{open_connection, schema::create_tables};
 use crate::replication::ReplicationSessionHandler;
-use crate::sync::SyncMessage;
+
 use crate::transport::{
     create_dual_endpoint, peer_identity_from_connection, AllowedPeers, DualConnection,
     SyncSessionIo,
@@ -101,17 +101,10 @@ pub async fn bootstrap_sync_from_invite(
         .await
         .map_err(|e| format!("Bootstrap sync: failed to open data stream: {}", e))?;
 
-    let mut conn = DualConnection::new(ctrl_send, ctrl_recv, data_send, data_recv);
+    let conn = DualConnection::new(ctrl_send, ctrl_recv, data_send, data_recv);
 
-    // Send markers to materialize lazy QUIC streams on the receiver
-    conn.control
-        .send(&SyncMessage::HaveList { ids: vec![] })
-        .await?;
-    conn.data_send
-        .send(&SyncMessage::HaveList { ids: vec![] })
-        .await?;
-    conn.flush_control().await?;
-    conn.flush_data().await?;
+    // Stream materialization markers are now sent by
+    // ReplicationSessionHandler::on_session for outbound sessions.
 
     let peer_fp = peer_fingerprint_from_hex(&peer_id)?;
     let session_id = next_session_id();

@@ -367,7 +367,7 @@ Validation performed for this slice:
 | Phase 2 | Complete | Ingest runtime + SQL adapters + `drain_project_queue` boundary; shims removed; `project_one` no longer imported from sync/node | None |
 | Phase 3 | Complete | Session logic extracted to `src/replication/session.rs`; `sync/engine.rs` reduced from 1338→806 lines; transitional re-exports in place; 342 unit + 65 scenario tests pass | None |
 | Phase 4 | Complete | Network orchestration extracted to `src/network/{runtime,loops}.rs`; `node.rs` reduced to 6 lines (re-export); `sync/engine.rs` reduced to 20 lines (re-exports); 342 unit + all integration tests pass | None |
-| Phase 5 | Not Started | N/A | Enforce dependency direction + privileged adversity CI |
+| Phase 5 | Complete | Boundary enforcement via `check_boundary_imports.sh` (also runs as `cargo test --lib` gate); `ReplicationSessionHandler` moved to `replication/`; `sync/engine.rs` and `sync/session_handler.rs` emptied; `next_session_id` in contracts; `IntroSpawnerFn` DI for intro listener; 350 unit + all integration tests pass | Tier 4 adversity tests (netns/netem) not yet created |
 
 ## Progress Tracking Rules
 
@@ -385,9 +385,8 @@ Phase 2 is complete. The items below document what was done for reference.
 
 ### 2a. Remove `project_one` calls from `sync/engine.rs`
 
-Current state: `src/sync/engine.rs` line 37 imports `projection::pipeline::project_one` and calls
-it directly at lines ~1021 and ~1262 during project-queue drain in `accept_loop_with_ingest` and
-`connect_loop`.
+(Resolved in Phase 2. The `project_one` import was replaced by `drain_project_queue` in
+`event_runtime`. As of Phase 5, `sync/engine.rs` is empty — all code moved to `network/loops.rs`.)
 
 Steps:
 1. Add a `ProjectionDriver` trait (or extend `IngestSink`) in `src/contracts/event_runtime_contract.rs`
@@ -413,8 +412,8 @@ Steps:
 
 ### 2c. Remove re-export shims in `sync/engine.rs`
 
-Current state: `src/sync/engine.rs` line 47 has `pub use crate::event_runtime::{batch_writer, IngestItem};`.
-`src/node.rs` line 76 imports these re-exports via `crate::sync::engine::{..., batch_writer, IngestItem}`.
+(Resolved in Phase 5. All re-exports removed; `sync/engine.rs` is now empty. Callers import
+directly from `network::loops`, `replication::session`, and `event_runtime`.)
 
 Steps:
 1. Update `src/node.rs` to import `batch_writer` and `IngestItem` directly from `crate::event_runtime`.
