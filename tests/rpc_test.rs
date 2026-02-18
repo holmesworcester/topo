@@ -144,8 +144,9 @@ fn rpc_all_methods_serialize() {
         RpcMethod::ActivePeer,
         RpcMethod::CreateWorkspace,
         RpcMethod::CreateInvite {
-            bootstrap: "127.0.0.1:4433".into(),
+            bootstrap: Some("127.0.0.1:4433".into()),
         },
+        RpcMethod::CreateInvite { bootstrap: None },
         RpcMethod::AcceptInvite {
             invite: "quiet://invite/test".into(),
             username: "user".into(),

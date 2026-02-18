@@ -54,7 +54,7 @@ pub enum RpcMethod {
         peer: Option<String>,
     },
     CreateInvite {
-        bootstrap: String,
+        bootstrap: Option<String>,
     },
     AcceptInvite {
         invite: String,

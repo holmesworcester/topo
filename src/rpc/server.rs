@@ -356,8 +356,36 @@ fn dispatch(
             }
         }
         RpcMethod::CreateInvite { bootstrap } => {
-            match service::svc_create_invite(db_path, &bootstrap) {
-                Ok(data) => RpcResponse::success(data),
+            let resolved = match bootstrap {
+                Some(addr) => addr,
+                None => {
+                    // Derive from UPnP result stored in daemon state.
+                    let net = state.runtime_net.read().unwrap();
+                    match net.as_ref().and_then(|n| n.upnp.as_ref()) {
+                        Some(upnp) => {
+                            match (upnp.external_ip.as_deref(), upnp.mapped_external_port) {
+                                (Some(ip), Some(port)) => format!("{}:{}", ip, port),
+                                _ => {
+                                    return RpcResponse::error(
+                                        "no bootstrap address — provide --bootstrap or run `topo upnp` first",
+                                    );
+                                }
+                            }
+                        }
+                        None => {
+                            return RpcResponse::error(
+                                "no bootstrap address — provide --bootstrap or run `topo upnp` first",
+                            );
+                        }
+                    }
+                }
+            };
+            match service::svc_create_invite(db_path, &resolved) {
+                Ok(data) => {
+                    let mut val = serde_json::to_value(&data).unwrap_or(serde_json::Value::Null);
+                    val["bootstrap"] = serde_json::Value::String(resolved);
+                    RpcResponse::success(val)
+                }
                 Err(e) => RpcResponse::error(e.to_string()),
             }
         }

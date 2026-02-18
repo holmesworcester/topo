@@ -189,9 +189,10 @@ enum Commands {
     /// Create a user invite link for the active workspace
     #[command(name = "create-invite")]
     CreateInvite {
-        /// Bootstrap address (host:port) to embed in invite link
+        /// Bootstrap address (host:port) to embed in invite link.
+        /// If omitted, auto-derived from UPnP result (run `topo upnp` first).
         #[arg(long)]
-        bootstrap: String,
+        bootstrap: Option<String>,
     },
 
     /// Attempt UPnP port forwarding for the daemon's QUIC listen port
@@ -741,11 +742,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
 
         Commands::CreateInvite { bootstrap } => {
+            let auto = bootstrap.is_none();
             let data = rpc_require_daemon(
                 db,
                 socket_override.as_deref(),
                 RpcMethod::CreateInvite { bootstrap },
             )?;
+            if auto {
+                if let Some(addr) = data["bootstrap"].as_str() {
+                    println!("bootstrap: {} (from UPnP)", addr);
+                }
+            }
             println!("{}", data["invite_link"].as_str().unwrap_or(""));
         }
 
