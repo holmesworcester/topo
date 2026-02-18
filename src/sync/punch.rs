@@ -16,7 +16,8 @@ use crate::db::{
     intro::{insert_intro_attempt, intro_already_seen, update_intro_status},
     open_connection,
 };
-use crate::sync::session_handler::{next_session_id, LegacySyncSessionHandler};
+use crate::contracts::network_contract::next_session_id;
+use crate::replication::ReplicationSessionHandler;
 use crate::sync::{parse_sync_message, SyncMessage};
 use crate::transport::{
     peer_identity_from_connection, DualConnection, SqliteTrustOracle, SyncSessionIo,
@@ -343,7 +344,7 @@ async fn run_sync_on_punched_connection(
         remote_addr: connection.remote_address(),
         direction: SessionDirection::Outbound,
     };
-    let handler = LegacySyncSessionHandler::initiator(db_path.to_string(), 60);
+    let handler = ReplicationSessionHandler::initiator(db_path.to_string(), 60);
     let io = SyncSessionIo::new(session_id, conn);
 
     if let Err(e) = handler

@@ -31,11 +31,26 @@ use crate::event_runtime::drain_project_queue;
 use crate::event_runtime::{batch_writer, IngestItem};
 use crate::replication::session::run_coordinator;
 use crate::replication::PeerCoord;
-use crate::sync::session_handler::{next_session_id, LegacySyncSessionHandler};
-use crate::sync::SyncMessage;
+use crate::contracts::network_contract::next_session_id;
+use crate::replication::ReplicationSessionHandler;
 use crate::transport::{
     peer_identity_from_connection, DualConnection, SqliteTrustOracle, SyncSessionIo,
 };
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+/// Function that spawns an intro listener for holepunch handling on a QUIC connection.
+/// Injected by the composition root so network/ doesn't depend on sync::punch.
+pub type IntroSpawnerFn = fn(
+    quinn::Connection,
+    String,
+    String,
+    String,
+    quinn::Endpoint,
+    Option<quinn::ClientConfig>,
+) -> tokio::task::JoinHandle<()>;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -141,6 +156,7 @@ pub async fn accept_loop(
     db_path: &str,
     recorded_by: &str,
     endpoint: quinn::Endpoint,
+    intro_spawner: IntroSpawnerFn,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Shared batch_writer: single writer thread for all concurrent responder sessions.
     // Eliminates SQLite WAL contention from multiple writers hitting the same DB.
@@ -161,6 +177,7 @@ pub async fn accept_loop(
         None,
         shared_ingest_tx,
         std::collections::HashMap::new(),
+        intro_spawner,
     )
     .await
 }
@@ -181,6 +198,7 @@ pub async fn accept_loop_with_ingest(
     _allowed_peers: Option<crate::transport::AllowedPeers>,
     shared_ingest_tx: mpsc::Sender<IngestItem>,
     tenant_client_configs: std::collections::HashMap<String, quinn::ClientConfig>,
+    intro_spawner: IntroSpawnerFn,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     {
         let db = open_connection(db_path)?;
@@ -292,7 +310,7 @@ pub async fn accept_loop_with_ingest(
             let local = tokio::task::LocalSet::new();
             rt.block_on(local.run_until(async move {
                 // Spawn intro listener for uni-streams on this connection
-                crate::sync::punch::spawn_intro_listener(
+                intro_spawner(
                     connection.clone(),
                     db_path_owned.clone(),
                     recorded_by_owned.clone(),
@@ -312,7 +330,7 @@ pub async fn accept_loop_with_ingest(
                         return;
                     }
                 };
-                let responder_handler = LegacySyncSessionHandler::responder_with_shared_ingest(
+                let responder_handler = ReplicationSessionHandler::responder_with_shared_ingest(
                     db_path_owned.clone(),
                     SYNC_SESSION_TIMEOUT_SECS,
                     ingest_clone.clone(),
@@ -419,6 +437,7 @@ pub async fn connect_loop(
     endpoint: quinn::Endpoint,
     remote: SocketAddr,
     client_config: Option<quinn::ClientConfig>,
+    intro_spawner: IntroSpawnerFn,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     {
         let db = open_connection(db_path)?;
@@ -452,6 +471,7 @@ pub async fn connect_loop(
             endpoint,
             remote,
             client_config,
+            intro_spawner,
         ))
         .await
 }
@@ -462,6 +482,7 @@ async fn connect_loop_inner(
     endpoint: quinn::Endpoint,
     remote: SocketAddr,
     client_config: Option<quinn::ClientConfig>,
+    intro_spawner: IntroSpawnerFn,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Look up workspace SNI for this tenant (falls back to "localhost" if no trust anchor)
     let sni = {
@@ -474,7 +495,7 @@ async fn connect_loop_inner(
         }
     };
     let initiator_handler =
-        LegacySyncSessionHandler::initiator(db_path.to_string(), SYNC_SESSION_TIMEOUT_SECS);
+        ReplicationSessionHandler::initiator(db_path.to_string(), SYNC_SESSION_TIMEOUT_SECS);
 
     loop {
         info!("Connecting to {}...", remote);
@@ -542,7 +563,7 @@ async fn connect_loop_inner(
         }
 
         // Spawn intro listener for uni-streams on this connection
-        let _intro_handle = crate::sync::punch::spawn_intro_listener(
+        let _intro_handle = intro_spawner(
             connection.clone(),
             db_path.to_string(),
             recorded_by.to_string(),
@@ -579,17 +600,7 @@ async fn connect_loop_inner(
                     break;
                 }
             };
-            let mut conn = DualConnection::new(ctrl_send, ctrl_recv, data_send, data_recv);
-
-            // Send markers to materialize lazy QUIC streams on the receiver
-            conn.control
-                .send(&SyncMessage::HaveList { ids: vec![] })
-                .await?;
-            conn.data_send
-                .send(&SyncMessage::HaveList { ids: vec![] })
-                .await?;
-            conn.flush_control().await?;
-            conn.flush_data().await?;
+            let conn = DualConnection::new(ctrl_send, ctrl_recv, data_send, data_recv);
 
             let session_id = next_session_id();
             let meta = SessionMeta {
@@ -698,7 +709,7 @@ pub async fn download_from_sources(
         let recorded_by = recorded_by.to_string();
         let ingest_tx = shared_tx.clone();
         let sni = download_sni.clone();
-        let handler = LegacySyncSessionHandler::initiator_with_coordination(
+        let handler = ReplicationSessionHandler::initiator_with_coordination(
             db_path.clone(),
             SYNC_SESSION_TIMEOUT_SECS,
             peer_coord.clone(),
@@ -764,19 +775,8 @@ pub async fn download_from_sources(
                                 break;
                             }
                         };
-                        let mut conn =
+                        let conn =
                             DualConnection::new(ctrl_send, ctrl_recv, data_send, data_recv);
-
-                        let _ = conn
-                            .control
-                            .send(&SyncMessage::HaveList { ids: vec![] })
-                            .await;
-                        let _ = conn
-                            .data_send
-                            .send(&SyncMessage::HaveList { ids: vec![] })
-                            .await;
-                        let _ = conn.flush_control().await;
-                        let _ = conn.flush_data().await;
 
                         let session_id = next_session_id();
                         let meta = SessionMeta {

@@ -21,7 +21,8 @@ use crate::transport_identity::{ensure_transport_peer_id, ensure_transport_cert}
 use crate::projection::create::{create_event_sync, create_event_staged, create_signed_event_sync, create_signed_event_staged, create_encrypted_event_sync, CreateEventError};
 use crate::projection::pipeline::project_one;
 use crate::sync::SyncMessage;
-use crate::sync::engine::{accept_loop, connect_loop, download_from_sources, run_sync_initiator_dual, SYNC_SESSION_TIMEOUT_SECS};
+use crate::network::loops::{accept_loop, connect_loop, download_from_sources, SYNC_SESSION_TIMEOUT_SECS};
+use crate::replication::session::run_sync_initiator_dual;
 use crate::transport::{
     AllowedPeers,
     DualConnection,
@@ -31,6 +32,18 @@ use crate::transport::{
 };
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use ed25519_dalek::SigningKey;
+
+/// No-op intro spawner for tests that don't need holepunch.
+pub fn noop_intro_spawner(
+    _conn: quinn::Connection,
+    _db_path: String,
+    _recorded_by: String,
+    _peer_id: String,
+    _endpoint: quinn::Endpoint,
+    _client_config: Option<quinn::ClientConfig>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::task::spawn_local(async {})
+}
 
 fn current_timestamp_ms() -> u64 {
     SystemTime::now()
@@ -1392,7 +1405,7 @@ pub fn start_peers(
             .build()
             .unwrap();
         rt.block_on(async move {
-            if let Err(e) = accept_loop(&a_db, &a_identity, listener_endpoint).await {
+            if let Err(e) = accept_loop(&a_db, &a_identity, listener_endpoint, noop_intro_spawner).await {
                 tracing::warn!("accept_loop exited: {}", e);
             }
         });
@@ -1404,7 +1417,7 @@ pub fn start_peers(
             .build()
             .unwrap();
         rt.block_on(async move {
-            if let Err(e) = connect_loop(&b_db, &b_identity, connector_endpoint, listener_addr, None).await {
+            if let Err(e) = connect_loop(&b_db, &b_identity, connector_endpoint, listener_addr, None, noop_intro_spawner).await {
                 tracing::warn!("connect_loop exited: {}", e);
             }
         });
@@ -1485,7 +1498,7 @@ pub fn start_peers_pinned(
             .build()
             .unwrap();
         rt.block_on(async move {
-            if let Err(e) = accept_loop(&a_db, &a_identity, listener_endpoint).await {
+            if let Err(e) = accept_loop(&a_db, &a_identity, listener_endpoint, noop_intro_spawner).await {
                 tracing::warn!("accept_loop exited: {}", e);
             }
         });
@@ -1497,7 +1510,7 @@ pub fn start_peers_pinned(
             .build()
             .unwrap();
         rt.block_on(async move {
-            if let Err(e) = connect_loop(&b_db, &b_identity, connector_endpoint, listener_addr, None).await {
+            if let Err(e) = connect_loop(&b_db, &b_identity, connector_endpoint, listener_addr, None, noop_intro_spawner).await {
                 tracing::warn!("connect_loop exited: {}", e);
             }
         });
@@ -1570,7 +1583,7 @@ pub fn start_peers_dynamic(
             .build()
             .unwrap();
         rt.block_on(async move {
-            if let Err(e) = accept_loop(&a_db, &a_identity, listener_endpoint).await {
+            if let Err(e) = accept_loop(&a_db, &a_identity, listener_endpoint, noop_intro_spawner).await {
                 tracing::warn!("accept_loop exited: {}", e);
             }
         });
@@ -1583,7 +1596,7 @@ pub fn start_peers_dynamic(
             .unwrap();
         rt.block_on(async move {
             if let Err(e) =
-                connect_loop(&b_db, &b_identity, connector_endpoint, listener_addr, None).await
+                connect_loop(&b_db, &b_identity, connector_endpoint, listener_addr, None, noop_intro_spawner).await
             {
                 tracing::warn!("connect_loop exited: {}", e);
             }
@@ -1762,7 +1775,7 @@ pub fn start_chain(peers: &[Peer]) -> Vec<std::thread::JoinHandle<()>> {
                 .build()
                 .unwrap();
             rt.block_on(async move {
-                if let Err(e) = accept_loop(&db_path, &identity, endpoint).await {
+                if let Err(e) = accept_loop(&db_path, &identity, endpoint, noop_intro_spawner).await {
                     tracing::warn!("chain accept_loop[{}] exited: {}", i, e);
                 }
             });
@@ -1781,7 +1794,7 @@ pub fn start_chain(peers: &[Peer]) -> Vec<std::thread::JoinHandle<()>> {
                 .build()
                 .unwrap();
             rt.block_on(async move {
-                if let Err(e) = connect_loop(&db_path, &identity, endpoint, remote, None).await {
+                if let Err(e) = connect_loop(&db_path, &identity, endpoint, remote, None, noop_intro_spawner).await {
                     tracing::warn!("chain connect_loop[{}] exited: {}", i, e);
                 }
             });
@@ -1849,7 +1862,7 @@ pub fn start_multi_source(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Joi
             .build()
             .unwrap();
         rt.block_on(async move {
-            if let Err(e) = accept_loop(&sink_db, &sink_identity, server_endpoint).await {
+            if let Err(e) = accept_loop(&sink_db, &sink_identity, server_endpoint, noop_intro_spawner).await {
                 tracing::warn!("sink accept_loop exited: {}", e);
             }
         });
@@ -1878,7 +1891,7 @@ pub fn start_multi_source(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Joi
                 .build()
                 .unwrap();
             rt.block_on(async move {
-                if let Err(e) = connect_loop(&db_path, &identity, endpoint, sink_addr, None).await {
+                if let Err(e) = connect_loop(&db_path, &identity, endpoint, sink_addr, None, noop_intro_spawner).await {
                     tracing::warn!("source connect_loop[{}] exited: {}", i, e);
                 }
             });
@@ -1947,7 +1960,7 @@ pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Jo
                 .build()
                 .unwrap();
             rt.block_on(async move {
-                if let Err(e) = accept_loop(&db_path, &identity, server_endpoint).await {
+                if let Err(e) = accept_loop(&db_path, &identity, server_endpoint, noop_intro_spawner).await {
                     tracing::warn!("source accept_loop exited: {}", e);
                 }
             });
@@ -2092,7 +2105,7 @@ pub fn start_sink_accept(
             .build()
             .unwrap();
         rt.block_on(async move {
-            if let Err(e) = accept_loop(&db_path, &identity, endpoint).await {
+            if let Err(e) = accept_loop(&db_path, &identity, endpoint, noop_intro_spawner).await {
                 tracing::warn!("sink accept_loop exited: {}", e);
             }
         });

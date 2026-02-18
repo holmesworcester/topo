@@ -16,9 +16,10 @@ use topo::db::intro::{list_intro_attempts, freshest_endpoint};
 use topo::db::project_queue::ProjectQueue;
 use topo::db::transport_trust::allowed_peers_from_db;
 use topo::projection::pipeline::project_one;
-use topo::sync::engine::{accept_loop, connect_loop};
+use topo::network::loops::{accept_loop, connect_loop};
 use topo::sync::intro::{run_intro, send_intro_offer, build_intro_offer};
-use topo::testutil::{Peer, assert_eventually, create_dynamic_endpoint_for_peer};
+use topo::sync::punch::spawn_intro_listener;
+use topo::testutil::{Peer, assert_eventually, create_dynamic_endpoint_for_peer, noop_intro_spawner};
 use topo::transport::{
     AllowedPeers, create_dual_endpoint,
 };
@@ -100,7 +101,7 @@ async fn test_three_peer_intro_happy_path() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all().build().unwrap();
         rt.block_on(async move {
-            let _ = accept_loop(&i_db, &i_id, i_ep1).await;
+            let _ = accept_loop(&i_db, &i_id, i_ep1, spawn_intro_listener).await;
         });
     });
 
@@ -111,7 +112,7 @@ async fn test_three_peer_intro_happy_path() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all().build().unwrap();
         rt.block_on(async move {
-            let _ = connect_loop(&a_db1, &a_id1, a_ep1, addr_i, None).await;
+            let _ = connect_loop(&a_db1, &a_id1, a_ep1, addr_i, None, spawn_intro_listener).await;
         });
     });
 
@@ -122,7 +123,7 @@ async fn test_three_peer_intro_happy_path() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all().build().unwrap();
         rt.block_on(async move {
-            let _ = connect_loop(&b_db1, &b_id1, b_ep1, addr_i, None).await;
+            let _ = connect_loop(&b_db1, &b_id1, b_ep1, addr_i, None, spawn_intro_listener).await;
         });
     });
 
@@ -197,7 +198,7 @@ async fn test_three_peer_intro_happy_path() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all().build().unwrap();
         rt.block_on(async move {
-            let _ = accept_loop(&a_db2, &a_id2, a_ep2).await;
+            let _ = accept_loop(&a_db2, &a_id2, a_ep2, spawn_intro_listener).await;
         });
     });
 
@@ -208,7 +209,7 @@ async fn test_three_peer_intro_happy_path() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all().build().unwrap();
         rt.block_on(async move {
-            let _ = accept_loop(&b_db2, &b_id2, b_ep2).await;
+            let _ = accept_loop(&b_db2, &b_id2, b_ep2, spawn_intro_listener).await;
         });
     });
 
@@ -300,7 +301,7 @@ async fn test_dynamic_trust_rejects_unknown_peer() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all().build().unwrap();
         rt.block_on(async move {
-            let _ = accept_loop(&a_db, &a_id, a_ep).await;
+            let _ = accept_loop(&a_db, &a_id, a_ep, spawn_intro_listener).await;
         });
     });
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -347,7 +348,7 @@ async fn test_stale_intro_rejected() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all().build().unwrap();
         rt.block_on(async move {
-            let _ = accept_loop(&a_db, &a_id, a_ep).await;
+            let _ = accept_loop(&a_db, &a_id, a_ep, spawn_intro_listener).await;
         });
     });
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -422,7 +423,7 @@ async fn test_untrusted_peer_intro_rejected() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all().build().unwrap();
         rt.block_on(async move {
-            let _ = accept_loop(&a_db, &a_id, a_ep).await;
+            let _ = accept_loop(&a_db, &a_id, a_ep, spawn_intro_listener).await;
         });
     });
     tokio::time::sleep(Duration::from_millis(200)).await;

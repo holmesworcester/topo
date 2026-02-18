@@ -21,7 +21,7 @@ use crate::db::transport_creds::{discover_local_tenants, list_local_peers, load_
 use crate::db::transport_trust::list_active_invite_bootstrap_addrs;
 use crate::db::{open_connection, schema::create_tables};
 use crate::event_runtime::{batch_writer, IngestItem};
-use crate::network::loops::{accept_loop_with_ingest, connect_loop};
+use crate::network::loops::{accept_loop_with_ingest, connect_loop, IntroSpawnerFn};
 use crate::transport::{
     create_single_port_endpoint, extract_spki_fingerprint,
     multi_workspace::{workspace_sni, WorkspaceCertResolver},
@@ -122,6 +122,7 @@ fn spawn_connect_loop_thread(
     remote: SocketAddr,
     cfg: quinn::ClientConfig,
     source: &'static str,
+    intro_spawner: IntroSpawnerFn,
 ) {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -129,7 +130,10 @@ fn spawn_connect_loop_thread(
             .build()
             .unwrap();
         rt.block_on(async move {
-            if let Err(e) = connect_loop(&db_path, &tenant_id, endpoint, remote, Some(cfg)).await {
+            if let Err(e) =
+                connect_loop(&db_path, &tenant_id, endpoint, remote, Some(cfg), intro_spawner)
+                    .await
+            {
                 warn!(
                     "{} connect_loop for {} to {} exited: {}",
                     source,
@@ -209,6 +213,7 @@ fn spawn_placeholder_autodial_refresher(
     db_path: String,
     endpoint: quinn::Endpoint,
     mut launched: HashSet<(String, SocketAddr)>,
+    intro_spawner: IntroSpawnerFn,
 ) {
     std::thread::spawn(move || loop {
         match collect_placeholder_invite_autodial_targets(&db_path) {
@@ -241,6 +246,7 @@ fn spawn_placeholder_autodial_refresher(
                         remote,
                         cfg,
                         "placeholder-autodial-refresh",
+                        intro_spawner,
                     );
                 }
             }
@@ -267,6 +273,7 @@ pub async fn run_node(
     db_path: &str,
     bind: SocketAddr,
     net_info_tx: Option<tokio::sync::oneshot::Sender<NodeRuntimeNetInfo>>,
+    intro_spawner: IntroSpawnerFn,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let db = open_connection(db_path)?;
     create_tables(&db)?;
@@ -515,7 +522,7 @@ pub async fn run_node(
                                         rt.block_on(async move {
                                             tokio::select! {
                                                 _ = connect_loop(
-                                                    &db, &tid, ep, dial_addr, cfg,
+                                                    &db, &tid, ep, dial_addr, cfg, intro_spawner,
                                                 ) => {}
                                                 _ = cancel.changed() => {}
                                             }
@@ -558,6 +565,7 @@ pub async fn run_node(
                 None,
                 ingest_tx,
                 accept_configs,
+                intro_spawner,
             )
             .await
             {
@@ -610,6 +618,7 @@ pub async fn run_node(
                 remote,
                 cfg,
                 "placeholder-autodial",
+                intro_spawner,
             );
         }
         // Keep polling for runtime invite acceptance
@@ -617,6 +626,7 @@ pub async fn run_node(
             db_path.to_string(),
             connect_endpoint.clone(),
             launched_autodial,
+            intro_spawner,
         );
     }
 
