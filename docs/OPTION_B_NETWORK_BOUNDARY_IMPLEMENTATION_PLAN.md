@@ -708,13 +708,13 @@ Wire this into CI as a required check (same tier as `cargo test --lib`).
 
 | # | Debt item | Introduced | Remove after | Current location |
 |---|-----------|-----------|-------------|-----------------|
-| 1 | `LegacySyncSessionHandler` downcast bridge | Phase 1 | Phase 5 | `src/sync/session_handler.rs` |
-| 2 | `sync::engine` re-export shim (all symbols) | Phase 2-4 | Phase 5 | `src/sync/engine.rs` (20 lines, re-exports only) |
+| 1 | `LegacySyncSessionHandler` downcast bridge | Phase 1 | Phase 5 | **Resolved in Phase 5** — moved to `replication/session_handler.rs` as `ReplicationSessionHandler`; `sync/session_handler.rs` emptied |
+| 2 | `sync::engine` re-export shim (all symbols) | Phase 2-4 | Phase 5 | **Resolved in Phase 5** — `sync/engine.rs` emptied; callers import directly from `network::loops`, `replication::session`, `event_runtime` |
 | 3 | Direct `projection::pipeline::project_one` in `sync/engine.rs` | Pre-refactor | **Resolved in Phase 2** | Replaced by `drain_project_queue` |
-| 4 | `node.rs` re-export of `run_node` | Phase 4 | Phase 5 | `src/node.rs` (6 lines, re-export only) |
+| 4 | `node.rs` re-export of `run_node` | Phase 4 | Phase 5 | **Resolved in Phase 5** — `node.rs` is now a composition root wiring `sync::punch::spawn_intro_listener` into `network::runtime::run_node` |
 | 5 | Direct runtime orchestration in `src/node.rs` | Pre-refactor | **Resolved in Phase 4** | Moved to `network/runtime.rs` |
-| 6 | Network-path dependency on `sync` internals (`session_handler`, `SyncMessage`, `punch`) | Pre-refactor | Phase 5 | `network/loops.rs` still imports `crate::sync::{session_handler, SyncMessage, punch}` |
-| 7 | Any remaining `anyhow::Result` at boundary traits | Various | Phase 5 | Grep `anyhow` in `src/contracts/` |
+| 6 | Network-path dependency on `sync` internals (`session_handler`, `SyncMessage`, `punch`) | Pre-refactor | Phase 5 | **Resolved in Phase 5** — `network/loops.rs` has zero `crate::sync` imports; `SyncMessage` markers moved to session handler; intro listener injected via `IntroSpawnerFn` |
+| 7 | Any remaining `anyhow::Result` at boundary traits | Various | Phase 5 | **Resolved in Phase 5** — zero `anyhow` in `src/contracts/` |
 
 ## Cross-Boundary Import Audit (2026-02-18)
 
