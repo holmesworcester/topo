@@ -2203,3 +2203,11 @@ Goal: establish a test suite where successful P2P bootstrap and sync cannot be f
 4. Current branch uses netns as a stepping stone and keeps this limitation explicit.
 5. Netns realism caveat observed in practice: multiple peers can share the same OS hostname, which can alias mDNS host records and mis-map peer IDs to wrong IPs.
    - Mitigation in this branch: advertise per-tenant mDNS host labels (peer-id-derived), not `/etc/hostname`.
+
+### 18.6 UPnP note for real-life multi-user testing
+
+1. UPnP port mapping + external IP discovery were added as a pragmatic POC feature to make real-life testing with multiple users on different home networks easier.
+2. This can be considered outside strict protocol scope: protocol correctness does not depend on UPnP, and explicit `--bootstrap <host:port>` remains supported.
+3. Reason for inclusion anyway: it reduces manual router/NAT setup friction during realism testing and makes invite bootstrap trials faster to run.
+4. Current behavior is intentionally best-effort/manual (`topo upnp`); there is no long-running lease-refresh manager in daemon scope.
+5. Expected limitation: some networks (for example CGNAT or non-UPnP routers) still require manual bootstrap endpoints even with this feature.
