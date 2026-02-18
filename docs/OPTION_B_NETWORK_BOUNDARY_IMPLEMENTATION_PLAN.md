@@ -353,6 +353,8 @@ Validation performed for this slice:
    - `efca1a0` - Phase 1 contracts/adapters/session-handler wiring
    - `933fa9f` - Phase 2 event-runtime ingest slice
    - `e51fd33` - Strengthen plan with phase tracking and handoff context
+   - `f7e5162` - Phase 2 complete: decouple projection internals from sync/network boundary
+   - (pending) - Phase 3: extract replication session logic to `src/replication/`
 4. Worktree status expectation before starting new work: `git status -sb` should be clean.
 
 ## Phase Status Tracker
@@ -362,7 +364,7 @@ Validation performed for this slice:
 | Phase 0 | Complete | Baseline behavior/test gates established | None |
 | Phase 1 | Complete | Contracts + adapters + session handler wiring landed | None |
 | Phase 2 | Complete | Ingest runtime + SQL adapters + `drain_project_queue` boundary; shims removed; `project_one` no longer imported from sync/node | None |
-| Phase 3 | Not Started | N/A | Extract replication session logic to `src/replication/*` |
+| Phase 3 | Complete | Session logic extracted to `src/replication/session.rs`; `sync/engine.rs` reduced from 1338→806 lines; transitional re-exports in place; 342 unit + 65 scenario tests pass | None |
 | Phase 4 | Not Started | N/A | Extract network runtime orchestration to `src/network/*` |
 | Phase 5 | Not Started | N/A | Enforce dependency direction + privileged adversity CI |
 
@@ -708,9 +710,10 @@ Wire this into CI as a required check (same tier as `cargo test --lib`).
 | # | Debt item | Introduced | Remove after | Current location |
 |---|-----------|-----------|-------------|-----------------|
 | 1 | `LegacySyncSessionHandler` downcast bridge | Phase 1 | Phase 5 | `src/sync/session_handler.rs` |
-| 2 | `sync::engine` re-export of `batch_writer`/`IngestItem` | Phase 2 | Phase 2 completion | `src/sync/engine.rs` line 47 |
-| 3 | Direct `projection::pipeline::project_one` in `sync/engine.rs` | Pre-refactor | Phase 2 completion | `src/sync/engine.rs` lines ~37, ~1021, ~1262 |
-| 4 | `sync::engine` re-export of `run_sync_initiator_dual`/`run_sync_responder_dual` | Phase 3 (planned) | Phase 4 | To be added in Phase 3 |
+| 2 | `sync::engine` re-export of `batch_writer`/`IngestItem` | Phase 2 | Phase 4 (test callers still use `topo::sync::engine::batch_writer`) | `src/sync/engine.rs` line ~41 |
+| 3 | Direct `projection::pipeline::project_one` in `sync/engine.rs` | Pre-refactor | **Resolved in Phase 2** | Replaced by `drain_project_queue` |
+| 4 | `sync::engine` re-export of `run_sync_initiator_dual`/`run_sync_responder_dual`/`spawn_data_receiver`/`PeerCoord` | Phase 3 | Phase 4 | `src/sync/engine.rs` line ~131 |
+| 4b | `sync::engine` private import of `run_coordinator` from `replication::session` | Phase 3 | Phase 4 | `src/sync/engine.rs` line ~134 |
 | 5 | Direct runtime orchestration in `src/node.rs` | Pre-refactor | Phase 4 | `src/node.rs` lines ~251-629 |
 | 6 | Network-path direct dependency on `sync` internals | Pre-refactor | Phase 4 | `src/node.rs` imports from `sync::engine` |
 | 7 | Any remaining `anyhow::Result` at boundary traits | Various | Phase 5 | Grep `anyhow` in `src/contracts/` |
@@ -734,10 +737,9 @@ by the phase indicated.
 
 | Module | Current lines | Target after extraction | Phase |
 |--------|--------------|----------------------|-------|
-| `src/sync/engine.rs` | ~1639 | ~700-800 (orchestration glue) | Phase 3 |
-| `src/sync/engine.rs` | ~700-800 | ~0 (absorbed by network + replication) | Phase 4 |
+| `src/sync/engine.rs` | ~~1639~~ **806** (Phase 3 done) | ~0 (absorbed by network + replication) | Phase 4 |
 | `src/node.rs` | ~748 | ~100-150 (composition root) | Phase 4 |
-| `src/replication/session.rs` | N/A (new) | ~730 (initiator + responder + helpers) | Phase 3 |
+| `src/replication/session.rs` | **855** (Phase 3 done) | ~855 (stable) | Phase 3 ✓ |
 | `src/network/runtime.rs` | N/A (new) | ~580 (run_node + discovery + orchestration) | Phase 4 |
 
 ## Assistant Handoff Notes

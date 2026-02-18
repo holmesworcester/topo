@@ -10,6 +10,7 @@ pub mod interactive;
 pub mod invite_link;
 pub mod node;
 pub mod projection;
+pub mod replication;
 pub mod rpc;
 pub mod runtime;
 pub mod service;
