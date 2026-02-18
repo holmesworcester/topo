@@ -100,9 +100,9 @@ pub trait SessionIo: Send {
     fn session_id(&self) -> u64;
     fn max_frame_size(&self) -> usize;
     async fn poll_send_ready(&mut self) -> Result<(), SessionIoError>;
-    async fn recv_control(&mut self) -> Result<bytes::Bytes, SessionIoError>;
+    async fn recv_control(&mut self) -> Result<Vec<u8>, SessionIoError>;
     async fn send_control(&mut self, frame: &[u8]) -> Result<(), SessionIoError>;
-    async fn recv_data(&mut self) -> Result<bytes::Bytes, SessionIoError>;
+    async fn recv_data(&mut self) -> Result<Vec<u8>, SessionIoError>;
     async fn send_data(&mut self, frame: &[u8]) -> Result<(), SessionIoError>;
     async fn close_session(&mut self, code: u32, reason: &[u8]) -> Result<(), SessionIoError>;
 }
@@ -320,7 +320,7 @@ Validation snapshot:
 
 Still remaining for full Option B completion:
 
-1. Phase 2 extraction of event runtime modules (`event_runtime/*`) behind contracts.
+1. Phase 2 completion: remove compatibility shims and fully stop direct projection internals from replication/network paths.
 2. Phase 3 extraction of replication session logic into dedicated replication module.
 3. Phase 4 extraction of network runtime orchestration out of `node.rs`/`sync` glue.
 4. Phase 5 dependency-direction enforcement and privileged adversity CI hardening.
@@ -344,3 +344,90 @@ Validation performed for this slice:
 4. `cargo test --test holepunch_test -q`
 5. `cargo test --test rpc_test -q`
 6. `cargo test --test cli_test -q`
+
+## Current Branch Snapshot (Rebased)
+
+1. Branch: `exec/option-b-network-boundary`
+2. Base: `master` at `241094b` (plus earlier master history)
+3. Option B commits on top:
+   - `efca1a0` - Phase 1 contracts/adapters/session-handler wiring
+   - `933fa9f` - Phase 2 event-runtime ingest slice
+4. Worktree status expectation before starting new work: `git status -sb` should be clean.
+
+## Phase Status Tracker
+
+| Phase | Status | What is complete | Remaining to close phase |
+|---|---|---|---|
+| Phase 0 | Complete | Baseline behavior/test gates established | None |
+| Phase 1 | Complete | Contracts + adapters + session handler wiring landed | None |
+| Phase 2 | In Progress | Ingest runtime moved to `src/event_runtime/*`; SQL adapters added | Remove compatibility shims and finish decoupling from projection internals |
+| Phase 3 | Not Started | N/A | Extract replication session logic to `src/replication/*` |
+| Phase 4 | Not Started | N/A | Extract network runtime orchestration to `src/network/*` |
+| Phase 5 | Not Started | N/A | Enforce dependency direction + privileged adversity CI |
+
+## Progress Tracking Rules
+
+1. Every implementation checkpoint must update this doc in-place with:
+   - commit hash,
+   - date,
+   - completed checklist items,
+   - commands run and pass/fail outcome.
+2. Do not mark a phase complete without both code movement and listed test gate evidence.
+3. Keep all extraction PRs "no behavior change" unless explicitly scoped otherwise.
+
+## Next Task (Phase 3) - Concrete Checklist
+
+1. Create `src/replication/session.rs` and move:
+   - `run_sync_initiator_dual`,
+   - `run_sync_responder_dual`,
+   - directly-related helpers used only by those loops.
+2. Keep wire protocol behavior identical:
+   - control/data sequencing,
+   - completion semantics,
+   - timeout behavior.
+3. Keep compatibility with existing call sites via temporary re-exports or thin wrappers.
+4. Reduce `src/sync/engine.rs` to orchestration and connection lifecycle glue.
+5. Add/adjust minimal compile-safe module exports in `src/lib.rs`.
+6. Validate with Phase 3 fast gate tests (below) before commit.
+
+## Non-Negotiable Runtime Invariants
+
+1. Do not change DataDone/Done/DoneAck semantics.
+2. Keep stream materialization markers used by current connect/session bootstrap paths.
+3. Preserve cancellation-on-peer-removal behavior for active sessions.
+4. Preserve trust check semantics (SQL-backed trust sources).
+5. No event wire format changes and no DB schema changes for this refactor track.
+
+## Test Gates by Stage
+
+### Fast Gate (required for every extraction commit)
+
+1. `cargo test --lib --no-run`
+2. `cargo test --test two_process_test -q`
+3. `cargo test --test holepunch_test -q`
+4. `cargo test --test rpc_test -q`
+5. `cargo test --test cli_test -q`
+
+### Phase 3 Gate (before marking Phase 3 complete)
+
+1. Fast Gate commands above
+2. `cargo test --test scenario_test --no-run`
+3. At least one representative sync-graph smoke:
+   - `cargo test --test sync_graph_test multi_source_coordinated_2x_5k -q`
+
+### Full Gate (periodic / pre-merge to shared branch)
+
+1. `cargo test`
+
+## Transitional Debt to Remove
+
+1. `LegacySyncSessionHandler` downcast-dependent bridge is transitional.
+2. `sync::engine` re-export compatibility for event-runtime symbols is transitional.
+3. Any direct `projection::pipeline::project_one` usage from replication/network modules is transitional.
+4. Remove transitional paths once replacement module boundaries are stable and tested.
+
+## Assistant Handoff Notes
+
+1. Update this doc first when starting work, then implement, then update with evidence.
+2. Favor small extraction commits with explicit no-behavior-change scope.
+3. If conflicts with newer `master` changes appear, rebase before starting a new phase slice.
