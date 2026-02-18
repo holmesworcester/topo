@@ -1,12 +1,14 @@
 use super::registry::{EventTypeMeta, ShareScope};
-use super::{EventError, ParsedEvent, EVENT_TYPE_DEVICE_INVITE_FIRST, EVENT_TYPE_DEVICE_INVITE_ONGOING};
+use super::{
+    EventError, ParsedEvent, EVENT_TYPE_DEVICE_INVITE_FIRST, EVENT_TYPE_DEVICE_INVITE_ONGOING,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceInviteFirstEvent {
     pub created_at_ms: u64,
     pub public_key: [u8; 32],
-    pub signed_by: [u8; 32],     // signer event_id (User event)
-    pub signer_type: u8,         // 4 = user
+    pub signed_by: [u8; 32], // signer event_id (User event)
+    pub signer_type: u8,     // 4 = user
     pub signature: [u8; 64],
 }
 
@@ -14,8 +16,8 @@ pub struct DeviceInviteFirstEvent {
 pub struct DeviceInviteOngoingEvent {
     pub created_at_ms: u64,
     pub public_key: [u8; 32],
-    pub signed_by: [u8; 32],     // signer event_id (PeerShared event)
-    pub signer_type: u8,         // 5 = peer_shared
+    pub signed_by: [u8; 32], // signer event_id (PeerShared event)
+    pub signer_type: u8,     // 5 = peer_shared
     pub signature: [u8; 64],
 }
 
@@ -28,13 +30,22 @@ pub struct DeviceInviteOngoingEvent {
 /// [74..138]  signature (64 bytes)
 pub fn parse_device_invite_first(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if blob.len() < 138 {
-        return Err(EventError::TooShort { expected: 138, actual: blob.len() });
+        return Err(EventError::TooShort {
+            expected: 138,
+            actual: blob.len(),
+        });
     }
     if blob.len() > 138 {
-        return Err(EventError::TrailingData { expected: 138, actual: blob.len() });
+        return Err(EventError::TrailingData {
+            expected: 138,
+            actual: blob.len(),
+        });
     }
     if blob[0] != EVENT_TYPE_DEVICE_INVITE_FIRST {
-        return Err(EventError::WrongType { expected: EVENT_TYPE_DEVICE_INVITE_FIRST, actual: blob[0] });
+        return Err(EventError::WrongType {
+            expected: EVENT_TYPE_DEVICE_INVITE_FIRST,
+            actual: blob[0],
+        });
     }
 
     let created_at_ms = u64::from_le_bytes(blob[1..9].try_into().unwrap());
@@ -79,13 +90,22 @@ pub fn encode_device_invite_first(event: &ParsedEvent) -> Result<Vec<u8>, EventE
 /// [74..138]  signature (64 bytes)
 pub fn parse_device_invite_ongoing(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if blob.len() < 138 {
-        return Err(EventError::TooShort { expected: 138, actual: blob.len() });
+        return Err(EventError::TooShort {
+            expected: 138,
+            actual: blob.len(),
+        });
     }
     if blob.len() > 138 {
-        return Err(EventError::TrailingData { expected: 138, actual: blob.len() });
+        return Err(EventError::TrailingData {
+            expected: 138,
+            actual: blob.len(),
+        });
     }
     if blob[0] != EVENT_TYPE_DEVICE_INVITE_ONGOING {
-        return Err(EventError::WrongType { expected: EVENT_TYPE_DEVICE_INVITE_ONGOING, actual: blob[0] });
+        return Err(EventError::WrongType {
+            expected: EVENT_TYPE_DEVICE_INVITE_ONGOING,
+            actual: blob[0],
+        });
     }
 
     let created_at_ms = u64::from_le_bytes(blob[1..9].try_into().unwrap());

@@ -2,8 +2,8 @@ use rusqlite::Connection;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::info;
 
-use crate::transport::AllowedPeers;
 use crate::transport::cert::spki_fingerprint_from_ed25519_pubkey;
+use crate::transport::AllowedPeers;
 
 /// Pending bootstrap trust from locally-created invites is temporary.
 /// If a peer never joins, this entry should not authorize transport forever.
@@ -439,7 +439,9 @@ pub fn list_active_invite_bootstrap_addrs(
             AND expires_at > ?2",
     )?;
     let rows = stmt
-        .query_map(rusqlite::params![recorded_by, now], |row| row.get::<_, String>(0))?
+        .query_map(rusqlite::params![recorded_by, now], |row| {
+            row.get::<_, String>(0)
+        })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
 }
@@ -470,11 +472,17 @@ mod tests {
     }
 
     /// Helper: insert a PeerShared row and return its SPKI fingerprint.
-    fn insert_peer_shared(conn: &Connection, recorded_by: &str, event_id: &str, pubkey: &[u8; 32]) -> [u8; 32] {
+    fn insert_peer_shared(
+        conn: &Connection,
+        recorded_by: &str,
+        event_id: &str,
+        pubkey: &[u8; 32],
+    ) -> [u8; 32] {
         conn.execute(
             "INSERT INTO peers_shared (recorded_by, event_id, public_key) VALUES (?1, ?2, ?3)",
             rusqlite::params![recorded_by, event_id, pubkey.as_slice()],
-        ).unwrap();
+        )
+        .unwrap();
         spki_fingerprint_from_ed25519_pubkey(pubkey)
     }
 
@@ -736,7 +744,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(superseded_at.is_some(), "CLI pin should be superseded by PeerShared");
+        assert!(
+            superseded_at.is_some(),
+            "CLI pin should be superseded by PeerShared"
+        );
     }
 
     #[test]
@@ -770,10 +781,14 @@ mod tests {
         assert_eq!(count, 2);
 
         // Both must remain trusted — no silent overwrite
-        assert!(is_peer_allowed(&conn, recorded_by, &fp_a).unwrap(),
-            "fp_a should be trusted after import");
-        assert!(is_peer_allowed(&conn, recorded_by, &fp_b).unwrap(),
-            "fp_b should be trusted after import");
+        assert!(
+            is_peer_allowed(&conn, recorded_by, &fp_a).unwrap(),
+            "fp_a should be trusted after import"
+        );
+        assert!(
+            is_peer_allowed(&conn, recorded_by, &fp_b).unwrap(),
+            "fp_b should be trusted after import"
+        );
 
         let allowed = allowed_peers_from_db(&conn, recorded_by).unwrap();
         assert!(allowed.contains(&fp_a), "fp_a should be in allowed set");
@@ -790,31 +805,52 @@ mod tests {
 
         // First insert
         record_invite_bootstrap_trust(
-            &conn, recorded_by, "ia1", "invite1", "workspace1", "127.0.0.1:4433", &spki,
-        ).unwrap();
+            &conn,
+            recorded_by,
+            "ia1",
+            "invite1",
+            "workspace1",
+            "127.0.0.1:4433",
+            &spki,
+        )
+        .unwrap();
 
         // Second insert with same PK but different values
         let spki2: [u8; 32] = [21u8; 32];
         record_invite_bootstrap_trust(
-            &conn, recorded_by, "ia1", "invite2", "workspace2", "10.0.0.1:4434", &spki2,
-        ).unwrap();
+            &conn,
+            recorded_by,
+            "ia1",
+            "invite2",
+            "workspace2",
+            "10.0.0.1:4434",
+            &spki2,
+        )
+        .unwrap();
 
         // Should be exactly 1 row (updated in place, not deleted+reinserted)
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM invite_bootstrap_trust
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM invite_bootstrap_trust
              WHERE recorded_by = ?1 AND invite_accepted_event_id = ?2",
-            rusqlite::params![recorded_by, "ia1"],
-            |row| row.get(0),
-        ).unwrap();
-        assert_eq!(count, 1, "upsert should update in place, not create duplicate");
+                rusqlite::params![recorded_by, "ia1"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "upsert should update in place, not create duplicate"
+        );
 
         // Verify new values
-        let (addr, ws): (String, String) = conn.query_row(
-            "SELECT bootstrap_addr, workspace_id FROM invite_bootstrap_trust
+        let (addr, ws): (String, String) = conn
+            .query_row(
+                "SELECT bootstrap_addr, workspace_id FROM invite_bootstrap_trust
              WHERE recorded_by = ?1 AND invite_accepted_event_id = ?2",
-            rusqlite::params![recorded_by, "ia1"],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        ).unwrap();
+                rusqlite::params![recorded_by, "ia1"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
         assert_eq!(addr, "10.0.0.1:4434");
         assert_eq!(ws, "workspace2");
     }
@@ -828,41 +864,48 @@ mod tests {
         let spki: [u8; 32] = [30u8; 32];
 
         // First insert
-        record_pending_invite_bootstrap_trust(
-            &conn, recorded_by, "invite1", "workspace1", &spki,
-        ).unwrap();
+        record_pending_invite_bootstrap_trust(&conn, recorded_by, "invite1", "workspace1", &spki)
+            .unwrap();
 
         // Second insert with same PK but different values
         let spki2: [u8; 32] = [31u8; 32];
-        record_pending_invite_bootstrap_trust(
-            &conn, recorded_by, "invite1", "workspace2", &spki2,
-        ).unwrap();
+        record_pending_invite_bootstrap_trust(&conn, recorded_by, "invite1", "workspace2", &spki2)
+            .unwrap();
 
         // Should be exactly 1 row
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pending_invite_bootstrap_trust
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pending_invite_bootstrap_trust
              WHERE recorded_by = ?1 AND invite_event_id = ?2",
-            rusqlite::params![recorded_by, "invite1"],
-            |row| row.get(0),
-        ).unwrap();
-        assert_eq!(count, 1, "upsert should update in place, not create duplicate");
+                rusqlite::params![recorded_by, "invite1"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "upsert should update in place, not create duplicate"
+        );
 
         // Verify new values
-        let ws: String = conn.query_row(
-            "SELECT workspace_id FROM pending_invite_bootstrap_trust
+        let ws: String = conn
+            .query_row(
+                "SELECT workspace_id FROM pending_invite_bootstrap_trust
              WHERE recorded_by = ?1 AND invite_event_id = ?2",
-            rusqlite::params![recorded_by, "invite1"],
-            |row| row.get(0),
-        ).unwrap();
+                rusqlite::params![recorded_by, "invite1"],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(ws, "workspace2");
 
         // Verify new SPKI
-        let fp_blob: Vec<u8> = conn.query_row(
-            "SELECT expected_bootstrap_spki_fingerprint FROM pending_invite_bootstrap_trust
+        let fp_blob: Vec<u8> = conn
+            .query_row(
+                "SELECT expected_bootstrap_spki_fingerprint FROM pending_invite_bootstrap_trust
              WHERE recorded_by = ?1 AND invite_event_id = ?2",
-            rusqlite::params![recorded_by, "invite1"],
-            |row| row.get(0),
-        ).unwrap();
+                rusqlite::params![recorded_by, "invite1"],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(fp_blob, spki2.to_vec());
     }
 
@@ -894,7 +937,8 @@ mod tests {
         conn.execute(
             "INSERT INTO peers_shared (recorded_by, event_id, public_key) VALUES (?1, ?2, ?3)",
             rusqlite::params![recorded_by, "ps_bad", &[0u8; 16][..]],
-        ).unwrap();
+        )
+        .unwrap();
 
         let allowed = allowed_peers_from_db(&conn, recorded_by).unwrap();
         assert!(allowed.contains(&good_spki));
@@ -922,14 +966,20 @@ mod tests {
 
         // Add accepted invite bootstrap trust
         record_invite_bootstrap_trust(
-            &conn, recorded_by, "ia1", "invite1", "ws1", "127.0.0.1:4433", &spki_bootstrap,
-        ).unwrap();
+            &conn,
+            recorded_by,
+            "ia1",
+            "invite1",
+            "ws1",
+            "127.0.0.1:4433",
+            &spki_bootstrap,
+        )
+        .unwrap();
         assert_eq!(trusted_peer_count(&conn, recorded_by).unwrap(), 2);
 
         // Add pending invite bootstrap trust
-        record_pending_invite_bootstrap_trust(
-            &conn, recorded_by, "invite2", "ws2", &spki_pending,
-        ).unwrap();
+        record_pending_invite_bootstrap_trust(&conn, recorded_by, "invite2", "ws2", &spki_pending)
+            .unwrap();
         assert_eq!(trusted_peer_count(&conn, recorded_by).unwrap(), 3);
 
         // Cross-tenant isolation: different recorded_by sees 0
@@ -956,17 +1006,23 @@ mod tests {
         assert!(!has_any_trusted_peer(&conn, rb_boot).unwrap());
         let spki_boot: [u8; 32] = [20u8; 32];
         record_invite_bootstrap_trust(
-            &conn, rb_boot, "ia_boot", "inv_boot", "ws_boot", "127.0.0.1:4433", &spki_boot,
-        ).unwrap();
+            &conn,
+            rb_boot,
+            "ia_boot",
+            "inv_boot",
+            "ws_boot",
+            "127.0.0.1:4433",
+            &spki_boot,
+        )
+        .unwrap();
         assert!(has_any_trusted_peer(&conn, rb_boot).unwrap());
 
         // Pending-only test
         let rb_pend = "pending_only";
         assert!(!has_any_trusted_peer(&conn, rb_pend).unwrap());
         let spki_pend: [u8; 32] = [30u8; 32];
-        record_pending_invite_bootstrap_trust(
-            &conn, rb_pend, "inv_pend", "ws_pend", &spki_pend,
-        ).unwrap();
+        record_pending_invite_bootstrap_trust(&conn, rb_pend, "inv_pend", "ws_pend", &spki_pend)
+            .unwrap();
         assert!(has_any_trusted_peer(&conn, rb_pend).unwrap());
     }
 
@@ -981,7 +1037,8 @@ mod tests {
         conn.execute(
             "INSERT INTO peers_shared (recorded_by, event_id, public_key) VALUES (?1, ?2, ?3)",
             rusqlite::params![recorded_by, "ps_short", &[9u8; 16][..]],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO invite_bootstrap_trust
              (recorded_by, invite_accepted_event_id, invite_event_id, workspace_id, bootstrap_addr, bootstrap_spki_fingerprint, accepted_at, expires_at, superseded_at)
@@ -1029,32 +1086,48 @@ mod tests {
             "INSERT INTO peers_shared (recorded_by, event_id, public_key)
              VALUES (?1, ?2, ?3)",
             rusqlite::params![recorded_by, peer_event_id, peer_pubkey.as_slice()],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Compute expected SPKI fingerprint
         let spki = spki_fingerprint_from_ed25519_pubkey(&peer_pubkey);
 
         // Before removal: peer should be trusted
-        assert!(is_peer_allowed(&conn, recorded_by, &spki).unwrap(),
-            "peer should be trusted before removal");
-        assert!(has_any_trusted_peer(&conn, recorded_by).unwrap(),
-            "should have trusted peers before removal");
+        assert!(
+            is_peer_allowed(&conn, recorded_by, &spki).unwrap(),
+            "peer should be trusted before removal"
+        );
+        assert!(
+            has_any_trusted_peer(&conn, recorded_by).unwrap(),
+            "should have trusted peers before removal"
+        );
         let allowed = allowed_peers_from_db(&conn, recorded_by).unwrap();
-        assert!(allowed.contains(&spki), "allowed set should contain peer before removal");
+        assert!(
+            allowed.contains(&spki),
+            "allowed set should contain peer before removal"
+        );
 
         // Insert removal targeting this peer
         conn.execute(
             "INSERT INTO removed_entities (recorded_by, event_id, target_event_id, removal_type)
              VALUES (?1, 'removal_evt1', ?2, 'peer_removed')",
             rusqlite::params![recorded_by, peer_event_id],
-        ).unwrap();
+        )
+        .unwrap();
 
         // After removal: peer should NOT be trusted
-        assert!(!is_peer_allowed(&conn, recorded_by, &spki).unwrap(),
-            "removed peer should not be trusted");
-        assert!(!has_any_trusted_peer(&conn, recorded_by).unwrap(),
-            "should have no trusted peers after only peer removed");
+        assert!(
+            !is_peer_allowed(&conn, recorded_by, &spki).unwrap(),
+            "removed peer should not be trusted"
+        );
+        assert!(
+            !has_any_trusted_peer(&conn, recorded_by).unwrap(),
+            "should have no trusted peers after only peer removed"
+        );
         let allowed = allowed_peers_from_db(&conn, recorded_by).unwrap();
-        assert!(!allowed.contains(&spki), "allowed set should not contain removed peer");
+        assert!(
+            !allowed.contains(&spki),
+            "allowed set should not contain removed peer"
+        );
     }
 }

@@ -4,7 +4,7 @@ use super::{EventError, ParsedEvent, EVENT_TYPE_WORKSPACE};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceEvent {
     pub created_at_ms: u64,
-    pub public_key: [u8; 32],  // Ed25519 verifying key for the workspace
+    pub public_key: [u8; 32], // Ed25519 verifying key for the workspace
 }
 
 /// Wire format (41 bytes fixed):

@@ -3,8 +3,8 @@ use rusqlite::Connection;
 use super::decision::ProjectionDecision;
 use crate::crypto::event_id_to_base64;
 use crate::events::{
-    FileSliceEvent, MessageAttachmentEvent, MessageDeletionEvent, MessageEvent,
-    ReactionEvent, SecretKeyEvent, SignedMemoEvent,
+    FileSliceEvent, MessageAttachmentEvent, MessageDeletionEvent, MessageEvent, ReactionEvent,
+    SecretKeyEvent, SignedMemoEvent,
 };
 
 /// Project a Message event into the messages table. Returns Ok(true) if written.

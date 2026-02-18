@@ -1,12 +1,12 @@
 use ed25519_dalek::SigningKey;
 use rusqlite::Connection;
 
-use crate::crypto::{EventId, event_id_from_base64, event_id_to_base64, hash_event};
+use crate::crypto::{event_id_from_base64, event_id_to_base64, hash_event, EventId};
 use crate::events::*;
 use crate::projection::create::{
-    create_event_sync, create_event_staged, create_signed_event_sync, create_signed_event_staged,
+    create_event_staged, create_event_sync, create_signed_event_staged, create_signed_event_sync,
 };
-use crate::projection::encrypted::{wrap_key_for_recipient, unwrap_key_from_sender};
+use crate::projection::encrypted::{unwrap_key_from_sender, wrap_key_for_recipient};
 use crate::projection::signer::{resolve_signer_key, SignerResolution};
 
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -78,8 +78,7 @@ pub fn ensure_content_key_for_peer(
         )
         .ok();
     if let Some(eid_b64) = existing {
-        let eid = event_id_from_base64(&eid_b64)
-            .ok_or("invalid secret_keys.event_id base64")?;
+        let eid = event_id_from_base64(&eid_b64).ok_or("invalid secret_keys.event_id base64")?;
         return Ok(eid);
     }
     create_content_key_and_self_wrap(conn, recorded_by, peer_shared_key, peer_shared_event_id)
@@ -168,12 +167,8 @@ pub fn bootstrap_workspace(
         signer_type: 1,
         signature: [0u8; 64],
     });
-    let user_invite_event_id = create_signed_event_staged(
-        conn,
-        recorded_by,
-        &uib_evt,
-        &workspace_key,
-    )?;
+    let user_invite_event_id =
+        create_signed_event_staged(conn, recorded_by, &uib_evt, &workspace_key)?;
 
     // 3. InviteAccepted (local event) — binds trust anchor, triggers guard cascade
     //    that unblocks Workspace -> UserInviteBoot -> and all downstream events
@@ -194,12 +189,7 @@ pub fn bootstrap_workspace(
         signer_type: 2,
         signature: [0u8; 64],
     });
-    let user_event_id = create_signed_event_sync(
-        conn,
-        recorded_by,
-        &ub_evt,
-        &invite_key,
-    )?;
+    let user_event_id = create_signed_event_sync(conn, recorded_by, &ub_evt, &invite_key)?;
 
     // 5. DeviceInviteFirst (signed by user_key)
     let device_invite_key = SigningKey::generate(&mut rng);
@@ -211,12 +201,7 @@ pub fn bootstrap_workspace(
         signer_type: 4,
         signature: [0u8; 64],
     });
-    let device_invite_event_id = create_signed_event_sync(
-        conn,
-        recorded_by,
-        &dif_evt,
-        &user_key,
-    )?;
+    let device_invite_event_id = create_signed_event_sync(conn, recorded_by, &dif_evt, &user_key)?;
 
     // 6. PeerSharedFirst (signed by device_invite_key)
     let peer_shared_key = SigningKey::generate(&mut rng);
@@ -228,12 +213,8 @@ pub fn bootstrap_workspace(
         signer_type: 3,
         signature: [0u8; 64],
     });
-    let peer_shared_event_id = create_signed_event_sync(
-        conn,
-        recorded_by,
-        &psf_evt,
-        &device_invite_key,
-    )?;
+    let peer_shared_event_id =
+        create_signed_event_sync(conn, recorded_by, &psf_evt, &device_invite_key)?;
 
     // 7. AdminBoot (signed by workspace_key, dep: user_event)
     let admin_key = SigningKey::generate(&mut rng);
@@ -246,12 +227,7 @@ pub fn bootstrap_workspace(
         signer_type: 1,
         signature: [0u8; 64],
     });
-    let admin_event_id = create_signed_event_sync(
-        conn,
-        recorded_by,
-        &ab_evt,
-        &workspace_key,
-    )?;
+    let admin_event_id = create_signed_event_sync(conn, recorded_by, &ab_evt, &workspace_key)?;
 
     // 8. Create deterministic local content key + self-wrap (bootstrap key seed).
     let content_key_event_id = Some(ensure_content_key_for_peer(
@@ -305,12 +281,7 @@ pub fn create_user_invite(
         signature: [0u8; 64],
     });
 
-    let invite_event_id = create_signed_event_sync(
-        conn,
-        recorded_by,
-        &evt,
-        workspace_key,
-    )?;
+    let invite_event_id = create_signed_event_sync(conn, recorded_by, &evt, workspace_key)?;
 
     // Wrap content key for invitee if sender has peer_shared identity
     if let (Some(ps_key), Some(ps_eid)) = (sender_peer_shared_key, sender_peer_shared_event_id) {
@@ -364,12 +335,7 @@ pub fn accept_user_invite(
         signer_type: 2,
         signature: [0u8; 64],
     });
-    let user_event_id = create_signed_event_sync(
-        conn,
-        recorded_by,
-        &ub_evt,
-        invite_key,
-    )?;
+    let user_event_id = create_signed_event_sync(conn, recorded_by, &ub_evt, invite_key)?;
 
     // 3. DeviceInviteFirst (signed by user_key)
     let device_invite_key = SigningKey::generate(&mut rng);
@@ -381,12 +347,7 @@ pub fn accept_user_invite(
         signer_type: 4,
         signature: [0u8; 64],
     });
-    let device_invite_event_id = create_signed_event_sync(
-        conn,
-        recorded_by,
-        &dif_evt,
-        &user_key,
-    )?;
+    let device_invite_event_id = create_signed_event_sync(conn, recorded_by, &dif_evt, &user_key)?;
 
     // 4. PeerSharedFirst (signed by device_invite_key)
     let peer_shared_key = SigningKey::generate(&mut rng);
@@ -398,20 +359,12 @@ pub fn accept_user_invite(
         signer_type: 3,
         signature: [0u8; 64],
     });
-    let peer_shared_event_id = create_signed_event_sync(
-        conn,
-        recorded_by,
-        &psf_evt,
-        &device_invite_key,
-    )?;
+    let peer_shared_event_id =
+        create_signed_event_sync(conn, recorded_by, &psf_evt, &device_invite_key)?;
 
     // 5. Unwrap inviter-provided content key targeted at this invite (if present).
-    let content_key_event_id = unwrap_content_key_from_invite(
-        conn,
-        recorded_by,
-        invite_key,
-        invite_event_id,
-    )?;
+    let content_key_event_id =
+        unwrap_content_key_from_invite(conn, recorded_by, invite_key, invite_event_id)?;
 
     Ok(JoinChain {
         user_event_id,
@@ -485,12 +438,8 @@ pub fn accept_device_link(
         signer_type: 3,
         signature: [0u8; 64],
     });
-    let peer_shared_event_id = create_signed_event_sync(
-        conn,
-        recorded_by,
-        &psf_evt,
-        device_invite_key,
-    )?;
+    let peer_shared_event_id =
+        create_signed_event_sync(conn, recorded_by, &psf_evt, device_invite_key)?;
 
     Ok(LinkChain {
         peer_shared_event_id,
@@ -534,12 +483,7 @@ fn create_content_key_and_self_wrap(
         signer_type: 5,
         signature: [0u8; 64],
     });
-    let _ss_event_id = create_signed_event_sync(
-        conn,
-        recorded_by,
-        &ss_evt,
-        peer_shared_key,
-    )?;
+    let _ss_event_id = create_signed_event_sync(conn, recorded_by, &ss_evt, peer_shared_key)?;
 
     Ok(key_event_id)
 }
@@ -576,11 +520,7 @@ fn wrap_content_key_for_invite(
     plaintext_key.copy_from_slice(&key_bytes);
 
     // Wrap for invitee's public key
-    let wrapped = wrap_key_for_recipient(
-        sender_peer_shared_key,
-        invite_public_key,
-        &plaintext_key,
-    );
+    let wrapped = wrap_key_for_recipient(sender_peer_shared_key, invite_public_key, &plaintext_key);
 
     // Create SecretShared event (signed by sender's peer_shared_key)
     let ss_evt = ParsedEvent::SecretShared(SecretSharedEvent {
@@ -592,12 +532,8 @@ fn wrap_content_key_for_invite(
         signer_type: 5,
         signature: [0u8; 64],
     });
-    let _ss_event_id = create_signed_event_sync(
-        conn,
-        recorded_by,
-        &ss_evt,
-        sender_peer_shared_key,
-    )?;
+    let _ss_event_id =
+        create_signed_event_sync(conn, recorded_by, &ss_evt, sender_peer_shared_key)?;
 
     Ok(())
 }
@@ -632,7 +568,8 @@ fn unwrap_content_key_from_invite(
             continue;
         }
 
-        let sender_key = match resolve_signer_key(conn, recorded_by, ss.signer_type, &ss.signed_by) {
+        let sender_key = match resolve_signer_key(conn, recorded_by, ss.signer_type, &ss.signed_by)
+        {
             Ok(SignerResolution::Found(k)) => k,
             Ok(_) => continue,
             Err(_) => continue,
@@ -647,10 +584,10 @@ fn unwrap_content_key_from_invite(
         if expected_key_event_id != ss.key_event_id {
             continue;
         }
-        let local_key_event_id = create_deterministic_secret_key_event(conn, recorded_by, plaintext_key)?;
+        let local_key_event_id =
+            create_deterministic_secret_key_event(conn, recorded_by, plaintext_key)?;
         return Ok(Some(local_key_event_id));
     }
 
     Ok(None)
 }
-

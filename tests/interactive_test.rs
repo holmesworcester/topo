@@ -324,7 +324,11 @@ fn test_identity_display() {
     assert_contains(&out, "Users: 1", "user key count");
     assert_contains(&out, "Peers: 1", "peer key count");
     assert_contains(&out, "Admins: 1", "admin key count");
-    assert_contains(&out, "TransportKeys: 0", "transport key count (no longer created during bootstrap)");
+    assert_contains(
+        &out,
+        "TransportKeys: 0",
+        "transport key count (no longer created during bootstrap)",
+    );
 }
 
 #[test]
@@ -511,5 +515,9 @@ fn test_accept_invite_bootstrap_sync_shared_only() {
     // Bob should have events but fewer than alice (no alice's local-only events)
     assert_contains(bob_status, "STATUS (bob):", "bob status");
     // Bob's event count should be non-zero (shared chain arrived via sync bootstrap)
-    assert_not_contains(bob_status, "Events:    0", "bob has events from bootstrap sync");
+    assert_not_contains(
+        bob_status,
+        "Events:    0",
+        "bob has events from bootstrap sync",
+    );
 }

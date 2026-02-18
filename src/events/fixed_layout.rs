@@ -77,9 +77,16 @@ pub const ENCRYPTED_OVERHEAD_BYTES: usize = ENCRYPTED_HEADER_BYTES + ENCRYPTED_A
 /// MessageAttachment (type 24): type(1) + created_at(8) + message_id(32) + file_id(32)
 ///   + blob_bytes(8) + total_slices(4) + slice_bytes(4) + root_hash(32) + key_event_id(32)
 ///   + filename(255) + mime_type(128) + signed_by(32) + signer_type(1) + signature(64) = 633
-pub const MESSAGE_ATTACHMENT_WIRE_SIZE: usize =
-    COMMON_HEADER_BYTES + 32 + 32 + 8 + 4 + 4 + 32 + 32
-    + ATTACHMENT_FILENAME_BYTES + ATTACHMENT_MIME_BYTES
+pub const MESSAGE_ATTACHMENT_WIRE_SIZE: usize = COMMON_HEADER_BYTES
+    + 32
+    + 32
+    + 8
+    + 4
+    + 4
+    + 32
+    + 32
+    + ATTACHMENT_FILENAME_BYTES
+    + ATTACHMENT_MIME_BYTES
     + SIGNATURE_TRAILER_BYTES;
 
 /// FileSlice (type 25): type(1) + created_at(8) + file_id(32) + slice_number(4)
@@ -88,8 +95,7 @@ pub const FILE_SLICE_WIRE_SIZE: usize =
     COMMON_HEADER_BYTES + 32 + 4 + FILE_SLICE_CIPHERTEXT_BYTES + SIGNATURE_TRAILER_BYTES;
 
 /// BenchDep (type 26): type(1) + created_at(8) + dep_slots(320) + payload(16) = 345
-pub const BENCH_DEP_WIRE_SIZE: usize =
-    COMMON_HEADER_BYTES + BENCH_DEP_SLOTS_BYTES + 16;
+pub const BENCH_DEP_WIRE_SIZE: usize = COMMON_HEADER_BYTES + BENCH_DEP_SLOTS_BYTES + 16;
 
 // ─── Identity & infrastructure event wire sizes ───
 //
@@ -100,7 +106,8 @@ pub const SECRET_KEY_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32;
 
 /// MessageDeletion (type 7): type(1) + created_at(8) + target_event_id(32) + author_id(32)
 ///                          + signed_by(32) + signer_type(1) + signature(64) = 170
-pub const MESSAGE_DELETION_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32 + 32 + SIGNATURE_TRAILER_BYTES;
+pub const MESSAGE_DELETION_WIRE_SIZE: usize =
+    COMMON_HEADER_BYTES + 32 + 32 + SIGNATURE_TRAILER_BYTES;
 
 /// Workspace (type 8): type(1) + created_at(8) + public_key(32) = 41
 pub const WORKSPACE_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32;
@@ -110,7 +117,8 @@ pub const INVITE_ACCEPTED_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32 + 32;
 
 /// UserInviteBoot (type 10): type(1) + created_at(8) + public_key(32) + workspace_id(32)
 ///                          + signed_by(32) + signer_type(1) + signature(64) = 170
-pub const USER_INVITE_BOOT_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32 + 32 + SIGNATURE_TRAILER_BYTES;
+pub const USER_INVITE_BOOT_WIRE_SIZE: usize =
+    COMMON_HEADER_BYTES + 32 + 32 + SIGNATURE_TRAILER_BYTES;
 
 /// UserInviteOngoing (type 11): same layout as UserInviteBoot but admin_event_id in place of workspace_id = 170
 pub const USER_INVITE_ONGOING_WIRE_SIZE: usize = USER_INVITE_BOOT_WIRE_SIZE;
@@ -120,7 +128,8 @@ pub const USER_INVITE_ONGOING_WIRE_SIZE: usize = USER_INVITE_BOOT_WIRE_SIZE;
 /// Used by: DeviceInviteFirst(12), DeviceInviteOngoing(13), UserBoot(14), UserOngoing(15),
 ///          PeerSharedFirst(16), PeerSharedOngoing(17), UserRemoved(20), PeerRemoved(21),
 ///          TransportKey(23)
-pub const IDENTITY_PUBKEY_SIGNED_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32 + SIGNATURE_TRAILER_BYTES;
+pub const IDENTITY_PUBKEY_SIGNED_WIRE_SIZE: usize =
+    COMMON_HEADER_BYTES + 32 + SIGNATURE_TRAILER_BYTES;
 
 /// AdminBoot (type 18): type(1) + created_at(8) + public_key(32) + user_event_id(32)
 ///                     + signed_by(32) + signer_type(1) + signature(64) = 170
@@ -131,7 +140,8 @@ pub const ADMIN_ONGOING_WIRE_SIZE: usize = ADMIN_BOOT_WIRE_SIZE;
 
 /// SecretShared (type 22): type(1) + created_at(8) + key_event_id(32) + recipient_event_id(32)
 ///                        + wrapped_key(32) + signed_by(32) + signer_type(1) + signature(64) = 202
-pub const SECRET_SHARED_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32 + 32 + 32 + SIGNATURE_TRAILER_BYTES;
+pub const SECRET_SHARED_WIRE_SIZE: usize =
+    COMMON_HEADER_BYTES + 32 + 32 + 32 + SIGNATURE_TRAILER_BYTES;
 
 // ─── Per-type field offsets (Message, type 1) ───
 
@@ -142,8 +152,8 @@ pub mod message_offsets {
     pub const AUTHOR_ID: usize = 41;
     pub const CONTENT: usize = 73;
     pub const SIGNED_BY: usize = 73 + super::MESSAGE_CONTENT_BYTES; // 1097
-    pub const SIGNER_TYPE: usize = SIGNED_BY + 32;                   // 1129
-    pub const SIGNATURE: usize = SIGNER_TYPE + 1;                    // 1130
+    pub const SIGNER_TYPE: usize = SIGNED_BY + 32; // 1129
+    pub const SIGNATURE: usize = SIGNER_TYPE + 1; // 1130
 }
 
 // ─── Per-type field offsets (Reaction, type 2) ───
@@ -154,9 +164,9 @@ pub mod reaction_offsets {
     pub const TARGET_EVENT_ID: usize = 9;
     pub const AUTHOR_ID: usize = 41;
     pub const EMOJI: usize = 73;
-    pub const SIGNED_BY: usize = 73 + super::REACTION_EMOJI_BYTES;  // 137
-    pub const SIGNER_TYPE: usize = SIGNED_BY + 32;                   // 169
-    pub const SIGNATURE: usize = SIGNER_TYPE + 1;                    // 170
+    pub const SIGNED_BY: usize = 73 + super::REACTION_EMOJI_BYTES; // 137
+    pub const SIGNER_TYPE: usize = SIGNED_BY + 32; // 169
+    pub const SIGNATURE: usize = SIGNER_TYPE + 1; // 170
 }
 
 // ─── Per-type field offsets (SignedMemo, type 4) ───
@@ -195,10 +205,10 @@ pub mod attachment_offsets {
     pub const ROOT_HASH: usize = 89;
     pub const KEY_EVENT_ID: usize = 121;
     pub const FILENAME: usize = 153;
-    pub const MIME_TYPE: usize = 153 + super::ATTACHMENT_FILENAME_BYTES;  // 408
+    pub const MIME_TYPE: usize = 153 + super::ATTACHMENT_FILENAME_BYTES; // 408
     pub const SIGNED_BY: usize = MIME_TYPE + super::ATTACHMENT_MIME_BYTES; // 536
-    pub const SIGNER_TYPE: usize = SIGNED_BY + 32;                         // 568
-    pub const SIGNATURE: usize = SIGNER_TYPE + 1;                          // 569
+    pub const SIGNER_TYPE: usize = SIGNED_BY + 32; // 568
+    pub const SIGNATURE: usize = SIGNER_TYPE + 1; // 569
 }
 
 // ─── Per-type field offsets (FileSlice, type 25) ───
@@ -210,8 +220,8 @@ pub mod file_slice_offsets {
     pub const SLICE_NUMBER: usize = 41;
     pub const CIPHERTEXT: usize = 45;
     pub const SIGNED_BY: usize = 45 + super::FILE_SLICE_CIPHERTEXT_BYTES; // 262189
-    pub const SIGNER_TYPE: usize = SIGNED_BY + 32;                         // 262221
-    pub const SIGNATURE: usize = SIGNER_TYPE + 1;                          // 262222
+    pub const SIGNER_TYPE: usize = SIGNED_BY + 32; // 262221
+    pub const SIGNATURE: usize = SIGNER_TYPE + 1; // 262222
 }
 
 // ─── Per-type field offsets (BenchDep, type 26) ───
@@ -232,28 +242,28 @@ pub const fn encrypted_wire_size(inner_wire_size: usize) -> usize {
 /// Returns None for types that cannot be encrypted (encrypted, secret_key, local-only, unknown).
 pub fn encrypted_inner_wire_size(inner_type_code: u8) -> Option<usize> {
     match inner_type_code {
-        1 => Some(MESSAGE_WIRE_SIZE),                   // Message
-        2 => Some(REACTION_WIRE_SIZE),                  // Reaction
-        4 => Some(SIGNED_MEMO_WIRE_SIZE),               // SignedMemo
-        7 => Some(MESSAGE_DELETION_WIRE_SIZE),           // MessageDeletion
-        8 => Some(WORKSPACE_WIRE_SIZE),                  // Workspace
-        10 => Some(USER_INVITE_BOOT_WIRE_SIZE),          // UserInviteBoot
-        11 => Some(USER_INVITE_ONGOING_WIRE_SIZE),       // UserInviteOngoing
-        12 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE),    // DeviceInviteFirst
-        13 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE),    // DeviceInviteOngoing
-        14 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE),    // UserBoot
-        15 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE),    // UserOngoing
-        16 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE),    // PeerSharedFirst
-        17 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE),    // PeerSharedOngoing
-        18 => Some(ADMIN_BOOT_WIRE_SIZE),                // AdminBoot
-        19 => Some(ADMIN_ONGOING_WIRE_SIZE),             // AdminOngoing
-        20 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE),    // UserRemoved
-        21 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE),    // PeerRemoved
-        22 => Some(SECRET_SHARED_WIRE_SIZE),             // SecretShared
-        23 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE),    // TransportKey
-        24 => Some(MESSAGE_ATTACHMENT_WIRE_SIZE),         // MessageAttachment
-        25 => Some(FILE_SLICE_WIRE_SIZE),                // FileSlice
-        26 => Some(BENCH_DEP_WIRE_SIZE),                 // BenchDep
+        1 => Some(MESSAGE_WIRE_SIZE),                 // Message
+        2 => Some(REACTION_WIRE_SIZE),                // Reaction
+        4 => Some(SIGNED_MEMO_WIRE_SIZE),             // SignedMemo
+        7 => Some(MESSAGE_DELETION_WIRE_SIZE),        // MessageDeletion
+        8 => Some(WORKSPACE_WIRE_SIZE),               // Workspace
+        10 => Some(USER_INVITE_BOOT_WIRE_SIZE),       // UserInviteBoot
+        11 => Some(USER_INVITE_ONGOING_WIRE_SIZE),    // UserInviteOngoing
+        12 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE), // DeviceInviteFirst
+        13 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE), // DeviceInviteOngoing
+        14 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE), // UserBoot
+        15 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE), // UserOngoing
+        16 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE), // PeerSharedFirst
+        17 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE), // PeerSharedOngoing
+        18 => Some(ADMIN_BOOT_WIRE_SIZE),             // AdminBoot
+        19 => Some(ADMIN_ONGOING_WIRE_SIZE),          // AdminOngoing
+        20 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE), // UserRemoved
+        21 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE), // PeerRemoved
+        22 => Some(SECRET_SHARED_WIRE_SIZE),          // SecretShared
+        23 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE), // TransportKey
+        24 => Some(MESSAGE_ATTACHMENT_WIRE_SIZE),     // MessageAttachment
+        25 => Some(FILE_SLICE_WIRE_SIZE),             // FileSlice
+        26 => Some(BENCH_DEP_WIRE_SIZE),              // BenchDep
         // Cannot encrypt: encrypted(5), secret_key(6), invite_accepted(9)
         _ => None,
     }
@@ -271,8 +281,7 @@ pub fn read_text_slot(slot: &[u8]) -> Result<String, TextSlotError> {
     }
 
     // Validate UTF-8
-    let text = std::str::from_utf8(&slot[..content_end])
-        .map_err(|_| TextSlotError::InvalidUtf8)?;
+    let text = std::str::from_utf8(&slot[..content_end]).map_err(|_| TextSlotError::InvalidUtf8)?;
 
     Ok(text.to_string())
 }
@@ -384,22 +393,37 @@ mod tests {
     #[test]
     fn test_signed_memo_offsets_consistent() {
         assert_eq!(signed_memo_offsets::CONTENT, 42);
-        assert_eq!(signed_memo_offsets::SIGNATURE, 42 + SIGNED_MEMO_CONTENT_BYTES);
+        assert_eq!(
+            signed_memo_offsets::SIGNATURE,
+            42 + SIGNED_MEMO_CONTENT_BYTES
+        );
         assert_eq!(signed_memo_offsets::SIGNATURE + 64, SIGNED_MEMO_WIRE_SIZE);
     }
 
     #[test]
     fn test_attachment_offsets_consistent() {
         assert_eq!(attachment_offsets::FILENAME, 153);
-        assert_eq!(attachment_offsets::MIME_TYPE, 153 + ATTACHMENT_FILENAME_BYTES);
-        assert_eq!(attachment_offsets::SIGNED_BY, attachment_offsets::MIME_TYPE + ATTACHMENT_MIME_BYTES);
-        assert_eq!(attachment_offsets::SIGNATURE + 64, MESSAGE_ATTACHMENT_WIRE_SIZE);
+        assert_eq!(
+            attachment_offsets::MIME_TYPE,
+            153 + ATTACHMENT_FILENAME_BYTES
+        );
+        assert_eq!(
+            attachment_offsets::SIGNED_BY,
+            attachment_offsets::MIME_TYPE + ATTACHMENT_MIME_BYTES
+        );
+        assert_eq!(
+            attachment_offsets::SIGNATURE + 64,
+            MESSAGE_ATTACHMENT_WIRE_SIZE
+        );
     }
 
     #[test]
     fn test_file_slice_offsets_consistent() {
         assert_eq!(file_slice_offsets::CIPHERTEXT, 45);
-        assert_eq!(file_slice_offsets::SIGNED_BY, 45 + FILE_SLICE_CIPHERTEXT_BYTES);
+        assert_eq!(
+            file_slice_offsets::SIGNED_BY,
+            45 + FILE_SLICE_CIPHERTEXT_BYTES
+        );
         assert_eq!(file_slice_offsets::SIGNATURE + 64, FILE_SLICE_WIRE_SIZE);
     }
 
@@ -433,7 +457,10 @@ mod tests {
         assert_eq!(encrypted_inner_wire_size(1), Some(MESSAGE_WIRE_SIZE));
         assert_eq!(encrypted_inner_wire_size(2), Some(REACTION_WIRE_SIZE));
         assert_eq!(encrypted_inner_wire_size(4), Some(SIGNED_MEMO_WIRE_SIZE));
-        assert_eq!(encrypted_inner_wire_size(24), Some(MESSAGE_ATTACHMENT_WIRE_SIZE));
+        assert_eq!(
+            encrypted_inner_wire_size(24),
+            Some(MESSAGE_ATTACHMENT_WIRE_SIZE)
+        );
         assert_eq!(encrypted_inner_wire_size(25), Some(FILE_SLICE_WIRE_SIZE));
         assert_eq!(encrypted_inner_wire_size(26), Some(BENCH_DEP_WIRE_SIZE));
     }

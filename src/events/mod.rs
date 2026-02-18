@@ -6,20 +6,20 @@ pub mod file_slice;
 pub mod fixed_layout;
 pub mod invite_accepted;
 pub mod message;
+pub mod message_attachment;
 pub mod message_deletion;
-pub mod workspace;
 pub mod peer_removed;
 pub mod peer_shared;
 pub mod reaction;
 pub mod registry;
 pub mod secret_key;
-pub mod message_attachment;
 pub mod secret_shared;
 pub mod signed_memo;
 pub mod transport_key;
 pub mod user;
 pub mod user_invite;
 pub mod user_removed;
+pub mod workspace;
 
 use std::sync::OnceLock;
 
@@ -32,7 +32,6 @@ pub use invite_accepted::InviteAcceptedEvent;
 pub use message::MessageEvent;
 pub use message_attachment::MessageAttachmentEvent;
 pub use message_deletion::MessageDeletionEvent;
-pub use workspace::WorkspaceEvent;
 pub use peer_removed::PeerRemovedEvent;
 pub use peer_shared::{PeerSharedFirstEvent, PeerSharedOngoingEvent};
 pub use reaction::ReactionEvent;
@@ -40,10 +39,11 @@ pub use registry::{EventRegistry, EventTypeMeta, ShareScope};
 pub use secret_key::SecretKeyEvent;
 pub use secret_shared::SecretSharedEvent;
 pub use signed_memo::SignedMemoEvent;
+pub use transport_key::TransportKeyEvent;
 pub use user::{UserBootEvent, UserOngoingEvent};
 pub use user_invite::{UserInviteBootEvent, UserInviteOngoingEvent};
-pub use transport_key::TransportKeyEvent;
 pub use user_removed::UserRemovedEvent;
+pub use workspace::WorkspaceEvent;
 
 pub const EVENT_TYPE_MESSAGE: u8 = 1;
 pub const EVENT_TYPE_REACTION: u8 = 2;
@@ -139,11 +139,17 @@ impl ParsedEvent {
     pub fn dep_field_values(&self) -> Vec<(&'static str, [u8; 32])> {
         match self {
             ParsedEvent::Message(m) => vec![("signed_by", m.signed_by)],
-            ParsedEvent::Reaction(r) => vec![("target_event_id", r.target_event_id), ("signed_by", r.signed_by)],
+            ParsedEvent::Reaction(r) => vec![
+                ("target_event_id", r.target_event_id),
+                ("signed_by", r.signed_by),
+            ],
             ParsedEvent::SignedMemo(s) => vec![("signed_by", s.signed_by)],
             ParsedEvent::Encrypted(e) => vec![("key_event_id", e.key_event_id)],
             ParsedEvent::SecretKey(_) => vec![],
-            ParsedEvent::MessageDeletion(d) => vec![("target_event_id", d.target_event_id), ("signed_by", d.signed_by)],
+            ParsedEvent::MessageDeletion(d) => vec![
+                ("target_event_id", d.target_event_id),
+                ("signed_by", d.signed_by),
+            ],
             ParsedEvent::Workspace(_) => vec![],
             ParsedEvent::InviteAccepted(_) => vec![],
             // UserInviteBoot: signed_by is a dep (workspace_id is reference, not dep)
@@ -270,10 +276,18 @@ impl std::fmt::Display for EventError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             EventError::TooShort { expected, actual } => {
-                write!(f, "blob too short: expected {} bytes, got {}", expected, actual)
+                write!(
+                    f,
+                    "blob too short: expected {} bytes, got {}",
+                    expected, actual
+                )
             }
             EventError::TrailingData { expected, actual } => {
-                write!(f, "blob has trailing data: expected exactly {} bytes, got {}", expected, actual)
+                write!(
+                    f,
+                    "blob has trailing data: expected exactly {} bytes, got {}",
+                    expected, actual
+                )
             }
             EventError::WrongType { expected, actual } => {
                 write!(f, "wrong event type: expected {}, got {}", expected, actual)
@@ -283,7 +297,9 @@ impl std::fmt::Display for EventError {
             EventError::InvalidMetadata(msg) => write!(f, "invalid metadata: {}", msg),
             EventError::UnknownType(t) => write!(f, "unknown event type: {}", t),
             EventError::TextSlot(e) => write!(f, "text slot error: {}", e),
-            EventError::InvalidEncryptedInnerType(t) => write!(f, "invalid encrypted inner type: {}", t),
+            EventError::InvalidEncryptedInnerType(t) => {
+                write!(f, "invalid encrypted inner type: {}", t)
+            }
         }
     }
 }
@@ -344,14 +360,18 @@ pub fn parse_event(blob: &[u8]) -> Result<ParsedEvent, EventError> {
         expected: 1,
         actual: 0,
     })?;
-    let meta = registry().lookup(type_code).ok_or(EventError::UnknownType(type_code))?;
+    let meta = registry()
+        .lookup(type_code)
+        .ok_or(EventError::UnknownType(type_code))?;
     (meta.parse)(blob)
 }
 
 /// Encode a ParsedEvent using the global registry.
 pub fn encode_event(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     let type_code = event.event_type_code();
-    let meta = registry().lookup(type_code).ok_or(EventError::UnknownType(type_code))?;
+    let meta = registry()
+        .lookup(type_code)
+        .ok_or(EventError::UnknownType(type_code))?;
     (meta.encode)(event)
 }
 
@@ -727,7 +747,10 @@ mod tests {
         assert_eq!(uib_meta.signature_byte_len, 64);
 
         let ss_meta = reg.lookup(EVENT_TYPE_SECRET_SHARED).unwrap();
-        assert_eq!(ss_meta.dep_fields, &["key_event_id", "recipient_event_id", "signed_by"]);
+        assert_eq!(
+            ss_meta.dep_fields,
+            &["key_event_id", "recipient_event_id", "signed_by"]
+        );
 
         assert!(reg.lookup(99).is_none());
     }
@@ -747,7 +770,9 @@ mod tests {
             "encryptable set drifted from expected admissible inner types"
         );
         // Identity/infrastructure types must NOT be encryptable
-        for code in [5, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 26] {
+        for code in [
+            5, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 26,
+        ] {
             let meta = reg.lookup(code).unwrap();
             assert!(
                 !meta.encryptable,
@@ -1175,7 +1200,10 @@ mod tests {
         assert_eq!(meta.projection_table, "message_attachments");
         assert!(meta.signer_required);
         assert_eq!(meta.signature_byte_len, 64);
-        assert_eq!(meta.dep_fields, &["message_id", "key_event_id", "signed_by"]);
+        assert_eq!(
+            meta.dep_fields,
+            &["message_id", "key_event_id", "signed_by"]
+        );
     }
 
     #[test]
@@ -1315,7 +1343,13 @@ mod tests {
         assert_eq!(blob.len(), 41);
         blob.push(0xFF);
         let err = parse_event(&blob).unwrap_err();
-        assert!(matches!(err, EventError::TrailingData { expected: 41, actual: 42 }));
+        assert!(matches!(
+            err,
+            EventError::TrailingData {
+                expected: 41,
+                actual: 42
+            }
+        ));
 
         // SecretKey (41 bytes fixed)
         let sk = ParsedEvent::SecretKey(SecretKeyEvent {
@@ -1325,7 +1359,13 @@ mod tests {
         let mut blob = encode_event(&sk).unwrap();
         blob.push(0xFF);
         let err = parse_event(&blob).unwrap_err();
-        assert!(matches!(err, EventError::TrailingData { expected: 41, actual: 42 }));
+        assert!(matches!(
+            err,
+            EventError::TrailingData {
+                expected: 41,
+                actual: 42
+            }
+        ));
 
         // InviteAccepted (73 bytes fixed)
         let ia = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
@@ -1336,7 +1376,13 @@ mod tests {
         let mut blob = encode_event(&ia).unwrap();
         blob.push(0xFF);
         let err = parse_event(&blob).unwrap_err();
-        assert!(matches!(err, EventError::TrailingData { expected: 73, actual: 74 }));
+        assert!(matches!(
+            err,
+            EventError::TrailingData {
+                expected: 73,
+                actual: 74
+            }
+        ));
 
         // UserBoot (138 bytes fixed)
         let ub = ParsedEvent::UserBoot(UserBootEvent {
@@ -1349,7 +1395,13 @@ mod tests {
         let mut blob = encode_event(&ub).unwrap();
         blob.push(0xFF);
         let err = parse_event(&blob).unwrap_err();
-        assert!(matches!(err, EventError::TrailingData { expected: 138, actual: 139 }));
+        assert!(matches!(
+            err,
+            EventError::TrailingData {
+                expected: 138,
+                actual: 139
+            }
+        ));
 
         // AdminBoot (170 bytes fixed)
         let ab = ParsedEvent::AdminBoot(AdminBootEvent {
@@ -1363,7 +1415,13 @@ mod tests {
         let mut blob = encode_event(&ab).unwrap();
         blob.push(0xFF);
         let err = parse_event(&blob).unwrap_err();
-        assert!(matches!(err, EventError::TrailingData { expected: 170, actual: 171 }));
+        assert!(matches!(
+            err,
+            EventError::TrailingData {
+                expected: 170,
+                actual: 171
+            }
+        ));
 
         // SecretShared (202 bytes fixed)
         let ss = ParsedEvent::SecretShared(SecretSharedEvent {
@@ -1378,7 +1436,13 @@ mod tests {
         let mut blob = encode_event(&ss).unwrap();
         blob.push(0xFF);
         let err = parse_event(&blob).unwrap_err();
-        assert!(matches!(err, EventError::TrailingData { expected: 202, actual: 203 }));
+        assert!(matches!(
+            err,
+            EventError::TrailingData {
+                expected: 202,
+                actual: 203
+            }
+        ));
     }
 
     #[test]

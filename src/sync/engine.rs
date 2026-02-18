@@ -10,38 +10,37 @@
 // Both sides gate exit on data-plane drain confirmation, not just control.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use negentropy::{Negentropy, Id, Storage};
+use negentropy::{Id, Negentropy, Storage};
 use tokio::sync::{mpsc, oneshot};
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
-use crate::crypto::{hash_event, event_id_to_base64, event_id_from_base64, EventId};
+use crate::crypto::{event_id_from_base64, event_id_to_base64, hash_event, EventId};
+use crate::db::health::{purge_expired_endpoints, record_endpoint_observation};
+use crate::db::removal_watch::is_peer_removed;
+use crate::db::transport_trust::record_transport_binding;
 use crate::db::{
     egress_queue::EgressQueue,
     open_connection,
     project_queue::ProjectQueue,
     schema::create_tables,
-    store::{Store, SQL_INSERT_EVENT, SQL_INSERT_NEG_ITEM, SQL_INSERT_RECORDED_EVENT, lookup_workspace_id},
+    store::{
+        lookup_workspace_id, Store, SQL_INSERT_EVENT, SQL_INSERT_NEG_ITEM,
+        SQL_INSERT_RECORDED_EVENT,
+    },
     wanted::WantedEvents,
 };
-use crate::db::health::{purge_expired_endpoints, record_endpoint_observation};
-use crate::db::removal_watch::is_peer_removed;
-use crate::db::transport_trust::record_transport_binding;
 use crate::events::{self, registry, ShareScope};
 use crate::projection::pipeline::project_one;
 use crate::runtime::SyncStats;
-use crate::sync::{SyncMessage, neg_id_to_event_id, NegentropyStorageSqlite};
-use crate::transport::{
-    DualConnection,
-    StreamConn,
-    StreamRecv,
-    StreamSend,
-    peer_identity_from_connection,
-};
+use crate::sync::{neg_id_to_event_id, NegentropyStorageSqlite, SyncMessage};
 use crate::transport::connection::ConnectionError;
+use crate::transport::{
+    peer_identity_from_connection, DualConnection, StreamConn, StreamRecv, StreamSend,
+};
 
 /// Ingest channel item: (event_id, blob, recorded_by).
 /// The `recorded_by` field allows a shared batch_writer to route events
@@ -137,22 +136,38 @@ const COORDINATOR_COLLECTION_POLL: Duration = Duration::from_millis(2);
 
 /// Batch writer drain batch size: 100 normal, 50 in low_mem.
 fn drain_batch_size() -> usize {
-    if low_mem_mode() { 50 } else { 100 }
+    if low_mem_mode() {
+        50
+    } else {
+        100
+    }
 }
 
 /// Batch writer write batch cap: 1000 normal, 500 in low_mem.
 fn write_batch_cap() -> usize {
-    if low_mem_mode() { 500 } else { 1000 }
+    if low_mem_mode() {
+        500
+    } else {
+        1000
+    }
 }
 
 /// Async channel capacity for per-session ingest (initiator/responder).
 fn session_ingest_cap() -> usize {
-    if low_mem_mode() { 1000 } else { 5000 }
+    if low_mem_mode() {
+        1000
+    } else {
+        5000
+    }
 }
 
 /// Async channel capacity for shared ingest (accept_loop / download_from_sources).
 fn shared_ingest_cap() -> usize {
-    if low_mem_mode() { 1000 } else { 10000 }
+    if low_mem_mode() {
+        1000
+    } else {
+        10000
+    }
 }
 
 /// Batch writer task - drains channel and writes to SQLite in batches.
@@ -203,14 +218,15 @@ pub fn batch_writer(
     let reg = registry();
     let pq = ProjectQueue::new(&db);
     // Cache workspace_id per recorded_by to avoid repeated lookups
-    let mut workspace_cache: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut workspace_cache: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
 
     let mut enqueue_stmt = match db.prepare(
         "INSERT OR IGNORE INTO project_queue (peer_id, event_id, available_at)
          SELECT ?1, ?2, ?3
          WHERE NOT EXISTS (SELECT 1 FROM valid_events WHERE peer_id=?1 AND event_id=?2)
          AND NOT EXISTS (SELECT 1 FROM rejected_events WHERE peer_id=?1 AND event_id=?2)
-         AND NOT EXISTS (SELECT 1 FROM blocked_event_deps WHERE peer_id=?1 AND event_id=?2)"
+         AND NOT EXISTS (SELECT 1 FROM blocked_event_deps WHERE peer_id=?1 AND event_id=?2)",
     ) {
         Ok(stmt) => stmt,
         Err(e) => {
@@ -249,7 +265,10 @@ pub fn batch_writer(
         let mut begin_ok = false;
         for attempt in 0..3 {
             match db.execute("BEGIN IMMEDIATE", []) {
-                Ok(_) => { begin_ok = true; break; }
+                Ok(_) => {
+                    begin_ok = true;
+                    break;
+                }
                 Err(e) => {
                     warn!("BEGIN failed (attempt {}): {}", attempt + 1, e);
                     // Ensure no leftover transaction state
@@ -259,7 +278,10 @@ pub fn batch_writer(
             }
         }
         if !begin_ok {
-            error!("BEGIN failed after retries, preserving {} items for next batch", batch.len());
+            error!(
+                "BEGIN failed after retries, preserving {} items for next batch",
+                batch.len()
+            );
             // Items remain in wanted — they will be re-requested on next sync
             continue;
         }
@@ -389,7 +411,11 @@ pub fn spawn_data_receiver<R>(
     ingest_tx: mpsc::Sender<IngestItem>,
     bytes_received: Arc<AtomicU64>,
     recorded_by: String,
-) -> (oneshot::Sender<()>, oneshot::Receiver<()>, tokio::task::JoinHandle<()>)
+) -> (
+    oneshot::Sender<()>,
+    oneshot::Receiver<()>,
+    tokio::task::JoinHandle<()>,
+)
 where
     R: StreamRecv + Send + 'static,
 {
@@ -477,10 +503,7 @@ fn assign_events(reports: &[(usize, Vec<EventId>)], total_peers: usize) -> Vec<V
 
     for (eid, peers) in events_sorted {
         // Pick peer with minimum load among those that have this event
-        let best = peers.iter()
-            .copied()
-            .min_by_key(|&p| loads[p])
-            .unwrap(); // peers is non-empty by construction
+        let best = peers.iter().copied().min_by_key(|&p| loads[p]).unwrap(); // peers is non-empty by construction
         assignments[best].push(eid);
         loads[best] += 1;
     }
@@ -511,7 +534,9 @@ fn run_coordinator(
         loop {
             let mut all_disconnected = true;
             for (i, rx) in report_rxs.iter().enumerate() {
-                if reports[i].is_some() { continue; }
+                if reports[i].is_some() {
+                    continue;
+                }
                 match rx.try_recv() {
                     Ok(need_ids) => {
                         reports[i] = Some(need_ids);
@@ -525,7 +550,9 @@ fn run_coordinator(
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
                 }
             }
-            if reported_count > 0 || all_disconnected { break; }
+            if reported_count > 0 || all_disconnected {
+                break;
+            }
             std::thread::sleep(COORDINATOR_POLL_INTERVAL);
         }
 
@@ -541,7 +568,9 @@ fn run_coordinator(
         let deadline = Instant::now() + COORDINATOR_COLLECTION_WINDOW;
         while reported_count < total_peers && Instant::now() < deadline {
             for (i, rx) in report_rxs.iter().enumerate() {
-                if reports[i].is_some() { continue; }
+                if reports[i].is_some() {
+                    continue;
+                }
                 match rx.try_recv() {
                     Ok(need_ids) => {
                         reports[i] = Some(need_ids);
@@ -556,7 +585,9 @@ fn run_coordinator(
         }
 
         // Phase 3: Assign events
-        let collected: Vec<(usize, Vec<EventId>)> = reports.iter().enumerate()
+        let collected: Vec<(usize, Vec<EventId>)> = reports
+            .iter()
+            .enumerate()
             .filter_map(|(i, r)| r.as_ref().map(|ids| (i, ids.clone())))
             .collect();
         let assignments = assign_events(&collected, total_peers);
@@ -608,7 +639,10 @@ where
     let start = Instant::now();
     let timeout = Duration::from_secs(timeout_secs);
 
-    info!("Starting negentropy sync (initiator, dual-stream) for {} seconds", timeout_secs);
+    info!(
+        "Starting negentropy sync (initiator, dual-stream) for {} seconds",
+        timeout_secs
+    );
 
     let db = open_connection(db_path)?;
     let neg_db = open_connection(db_path)?;
@@ -621,8 +655,12 @@ where
     let ws_id = lookup_workspace_id(&db, recorded_by);
     let neg_storage = NegentropyStorageSqlite::new(&neg_db, &ws_id);
 
-    neg_db.execute("BEGIN", []).map_err(|e| format!("Failed to begin snapshot: {}", e))?;
-    neg_storage.rebuild_blocks().map_err(|e| format!("Failed to rebuild blocks: {}", e))?;
+    neg_db
+        .execute("BEGIN", [])
+        .map_err(|e| format!("Failed to begin snapshot: {}", e))?;
+    neg_storage
+        .rebuild_blocks()
+        .map_err(|e| format!("Failed to rebuild blocks: {}", e))?;
 
     let mut neg = Negentropy::new(Storage::Borrowed(&neg_storage), NEGENTROPY_FRAME_SIZE)?;
 
@@ -649,11 +687,17 @@ where
     let mut need_ids: Vec<Id> = Vec::new();
     let mut events_sent: u64 = 0;
     let mut bytes_sent: u64 = 0;
-    let (shutdown_tx, data_drained_rx, recv_handle) =
-        spawn_data_receiver(data_recv, ingest_tx.clone(), bytes_received.clone(), recorded_by.to_string());
+    let (shutdown_tx, data_drained_rx, recv_handle) = spawn_data_receiver(
+        data_recv,
+        ingest_tx.clone(),
+        bytes_received.clone(),
+        recorded_by.to_string(),
+    );
 
     let initial_msg = neg.initiate()?;
-    control.send(&SyncMessage::NegOpen { msg: initial_msg }).await?;
+    control
+        .send(&SyncMessage::NegOpen { msg: initial_msg })
+        .await?;
     control.flush().await?;
 
     let mut reconciliation_done = false;
@@ -746,7 +790,11 @@ where
         if let Some(coord) = coordination {
             if reconciliation_done && !coordination_reported {
                 let report = std::mem::take(&mut coordinated_need_ids);
-                info!("Reporting {} need_ids to coordinator (peer {})", report.len(), coord.peer_idx);
+                info!(
+                    "Reporting {} need_ids to coordinator (peer {})",
+                    report.len(),
+                    coord.peer_idx
+                );
                 let _ = coord.report_tx.send(report);
                 coordination_reported = true;
             }
@@ -755,8 +803,11 @@ where
             if coordination_pending && coordination_reported {
                 match coord.assign_rx.try_recv() {
                     Ok(assigned) => {
-                        info!("Received {} assigned events from coordinator (peer {})",
-                            assigned.len(), coord.peer_idx);
+                        info!(
+                            "Received {} assigned events from coordinator (peer {})",
+                            assigned.len(),
+                            coord.peer_idx
+                        );
                         // Send HaveList for assigned events
                         let mut batch: Vec<EventId> = Vec::with_capacity(NEED_CHUNK);
                         for event_id in assigned {
@@ -798,7 +849,9 @@ where
         let mut sent_this_round = 0;
         let mut blocked = false;
         while !blocked {
-            let batch = egress.claim_batch(peer_id, EGRESS_CLAIM_COUNT, EGRESS_CLAIM_LEASE_MS).unwrap_or_default();
+            let batch = egress
+                .claim_batch(peer_id, EGRESS_CLAIM_COUNT, EGRESS_CLAIM_LEASE_MS)
+                .unwrap_or_default();
             if batch.is_empty() {
                 break;
             }
@@ -838,8 +891,11 @@ where
                 control.send(&SyncMessage::Done).await?;
                 control.flush().await?;
                 done_sent = true;
-                info!("Sent DataDone+Done, waiting for DoneAck (sent {}, received {})",
-                    events_sent, events_received.load(Ordering::Relaxed));
+                info!(
+                    "Sent DataDone+Done, waiting for DoneAck (sent {}, received {})",
+                    events_sent,
+                    events_received.load(Ordering::Relaxed)
+                );
             }
         }
     }
@@ -907,7 +963,10 @@ where
     let start = Instant::now();
     let timeout = Duration::from_secs(timeout_secs);
 
-    info!("Starting negentropy sync (responder, dual-stream) for {} seconds", timeout_secs);
+    info!(
+        "Starting negentropy sync (responder, dual-stream) for {} seconds",
+        timeout_secs
+    );
 
     let db = open_connection(db_path)?;
     let neg_db = open_connection(db_path)?;
@@ -918,8 +977,12 @@ where
     let ws_id = lookup_workspace_id(&db, recorded_by);
     let neg_storage = NegentropyStorageSqlite::new(&neg_db, &ws_id);
 
-    neg_db.execute("BEGIN", []).map_err(|e| format!("Failed to begin snapshot: {}", e))?;
-    neg_storage.rebuild_blocks().map_err(|e| format!("Failed to rebuild blocks: {}", e))?;
+    neg_db
+        .execute("BEGIN", [])
+        .map_err(|e| format!("Failed to begin snapshot: {}", e))?;
+    neg_storage
+        .rebuild_blocks()
+        .map_err(|e| format!("Failed to rebuild blocks: {}", e))?;
 
     let mut neg = Negentropy::new(Storage::Borrowed(&neg_storage), NEGENTROPY_FRAME_SIZE)?;
 
@@ -942,8 +1005,12 @@ where
         (tx, Some(handle))
     };
 
-    let (shutdown_tx, data_drained_rx, recv_handle) =
-        spawn_data_receiver(data_recv, ingest_tx.clone(), bytes_received.clone(), recorded_by.to_string());
+    let (shutdown_tx, data_drained_rx, recv_handle) = spawn_data_receiver(
+        data_recv,
+        ingest_tx.clone(),
+        bytes_received.clone(),
+        recorded_by.to_string(),
+    );
 
     let mut events_sent: u64 = 0;
     let mut bytes_sent: u64 = 0;
@@ -996,7 +1063,9 @@ where
         let mut sent_this_round = 0;
         let mut blocked = false;
         while !blocked {
-            let batch = egress.claim_batch(peer_id, EGRESS_CLAIM_COUNT, EGRESS_CLAIM_LEASE_MS).unwrap_or_default();
+            let batch = egress
+                .claim_batch(peer_id, EGRESS_CLAIM_COUNT, EGRESS_CLAIM_LEASE_MS)
+                .unwrap_or_default();
             if batch.is_empty() {
                 break;
             }
@@ -1047,8 +1116,11 @@ where
 
                 control.send(&SyncMessage::DoneAck).await?;
                 control.flush().await?;
-                info!("Sent DoneAck (sent {}, received {})",
-                    events_sent, events_received.load(Ordering::Relaxed));
+                info!(
+                    "Sent DoneAck (sent {}, received {})",
+                    events_sent,
+                    events_received.load(Ordering::Relaxed)
+                );
                 completed = true;
                 break;
             }
@@ -1102,7 +1174,15 @@ pub async fn accept_loop(
     });
 
     let tenant_ids = vec![recorded_by.to_string()];
-    accept_loop_with_ingest(db_path, &tenant_ids, endpoint, None, shared_ingest_tx, std::collections::HashMap::new()).await
+    accept_loop_with_ingest(
+        db_path,
+        &tenant_ids,
+        endpoint,
+        None,
+        shared_ingest_tx,
+        std::collections::HashMap::new(),
+    )
+    .await
 }
 
 /// Accept incoming connections using an externally-provided ingest channel.
@@ -1138,15 +1218,21 @@ pub async fn accept_loop_with_ingest(
         let batch_sz = drain_batch_size();
         for tenant_id in tenant_peer_ids {
             let tid = tenant_id.clone();
-            let drained = pq.drain_with_limit(&tid, batch_sz, |conn, event_id_b64| {
-                if let Some(eid) = event_id_from_base64(event_id_b64) {
-                    project_one(conn, &tid, &eid)
-                        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-                }
-                Ok(())
-            }).unwrap_or(0);
+            let drained = pq
+                .drain_with_limit(&tid, batch_sz, |conn, event_id_b64| {
+                    if let Some(eid) = event_id_from_base64(event_id_b64) {
+                        project_one(conn, &tid, &eid)
+                            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                    }
+                    Ok(())
+                })
+                .unwrap_or(0);
             if drained > 0 {
-                info!("Processed {} pending project_queue items for tenant {}", drained, &tenant_id[..16.min(tenant_id.len())]);
+                info!(
+                    "Processed {} pending project_queue items for tenant {}",
+                    drained,
+                    &tenant_id[..16.min(tenant_id.len())]
+                );
             }
         }
     }
@@ -1185,7 +1271,10 @@ pub async fn accept_loop_with_ingest(
             match resolve_tenant_for_peer(db_path, tenant_peer_ids, &peer_id) {
                 Some(rb) => rb,
                 None => {
-                    warn!("Rejected peer {}: no local tenant trusts this fingerprint", &peer_id[..16.min(peer_id.len())]);
+                    warn!(
+                        "Rejected peer {}: no local tenant trusts this fingerprint",
+                        &peer_id[..16.min(peer_id.len())]
+                    );
                     connection.close(1u32.into(), b"no matching tenant");
                     continue;
                 }
@@ -1282,9 +1371,15 @@ pub async fn accept_loop_with_ingest(
                     let conn = DualConnection::new(ctrl_send, ctrl_recv, data_send, data_recv);
 
                     if let Err(e) = run_sync_responder_dual(
-                        conn, &db_path_owned, SYNC_SESSION_TIMEOUT_SECS, &peer_id, &recorded_by_owned,
+                        conn,
+                        &db_path_owned,
+                        SYNC_SESSION_TIMEOUT_SECS,
+                        &peer_id,
+                        &recorded_by_owned,
                         Some(ingest_clone.clone()),
-                    ).await {
+                    )
+                    .await
+                    {
                         warn!("Responder session error: {}", e);
                     }
 
@@ -1348,22 +1443,35 @@ pub async fn connect_loop(
         }
         let recorded_by_str = recorded_by.to_string();
         let batch_sz = drain_batch_size();
-        let drained = pq.drain_with_limit(&recorded_by_str, batch_sz, |conn, event_id_b64| {
-            if let Some(eid) = event_id_from_base64(event_id_b64) {
-                project_one(conn, &recorded_by_str, &eid)
-                    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-            }
-            Ok(())
-        }).unwrap_or(0);
+        let drained = pq
+            .drain_with_limit(&recorded_by_str, batch_sz, |conn, event_id_b64| {
+                if let Some(eid) = event_id_from_base64(event_id_b64) {
+                    project_one(conn, &recorded_by_str, &eid)
+                        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                }
+                Ok(())
+            })
+            .unwrap_or(0);
         if drained > 0 {
-            info!("Processed {} pending project_queue items from previous session", drained);
+            info!(
+                "Processed {} pending project_queue items from previous session",
+                drained
+            );
         }
     }
 
     // Use LocalSet so the intro listener (spawn_intro_listener uses spawn_local)
     // can run on the same runtime that drives the endpoint I/O.
     let local = tokio::task::LocalSet::new();
-    local.run_until(connect_loop_inner(db_path, recorded_by, endpoint, remote, client_config)).await
+    local
+        .run_until(connect_loop_inner(
+            db_path,
+            recorded_by,
+            endpoint,
+            remote,
+            client_config,
+        ))
+        .await
 }
 
 async fn connect_loop_inner(
@@ -1491,14 +1599,26 @@ async fn connect_loop_inner(
             let mut conn = DualConnection::new(ctrl_send, ctrl_recv, data_send, data_recv);
 
             // Send markers to materialize lazy QUIC streams on the receiver
-            conn.control.send(&SyncMessage::HaveList { ids: vec![] }).await?;
-            conn.data_send.send(&SyncMessage::HaveList { ids: vec![] }).await?;
+            conn.control
+                .send(&SyncMessage::HaveList { ids: vec![] })
+                .await?;
+            conn.data_send
+                .send(&SyncMessage::HaveList { ids: vec![] })
+                .await?;
             conn.flush_control().await?;
             conn.flush_data().await?;
 
             if let Err(e) = run_sync_initiator_dual(
-                conn, db_path, SYNC_SESSION_TIMEOUT_SECS, &peer_id, recorded_by, None, None,
-            ).await {
+                conn,
+                db_path,
+                SYNC_SESSION_TIMEOUT_SECS,
+                &peer_id,
+                recorded_by,
+                None,
+                None,
+            )
+            .await
+            {
                 warn!("Initiator session error: {}", e);
             }
 
@@ -1627,19 +1747,31 @@ pub async fn download_from_sources(
                                 break;
                             }
                         };
-                        let mut conn = DualConnection::new(
-                            ctrl_send, ctrl_recv, data_send, data_recv,
-                        );
+                        let mut conn =
+                            DualConnection::new(ctrl_send, ctrl_recv, data_send, data_recv);
 
-                        let _ = conn.control.send(&SyncMessage::HaveList { ids: vec![] }).await;
-                        let _ = conn.data_send.send(&SyncMessage::HaveList { ids: vec![] }).await;
+                        let _ = conn
+                            .control
+                            .send(&SyncMessage::HaveList { ids: vec![] })
+                            .await;
+                        let _ = conn
+                            .data_send
+                            .send(&SyncMessage::HaveList { ids: vec![] })
+                            .await;
                         let _ = conn.flush_control().await;
                         let _ = conn.flush_data().await;
 
                         if let Err(e) = run_sync_initiator_dual(
-                            conn, &db_path, SYNC_SESSION_TIMEOUT_SECS, &peer_id, &recorded_by,
-                            Some(&peer_coord), Some(ingest_tx.clone()),
-                        ).await {
+                            conn,
+                            &db_path,
+                            SYNC_SESSION_TIMEOUT_SECS,
+                            &peer_id,
+                            &recorded_by,
+                            Some(&peer_coord),
+                            Some(ingest_tx.clone()),
+                        )
+                        .await
+                        {
                             warn!("Download session error: {}", e);
                         }
 

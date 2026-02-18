@@ -15,8 +15,8 @@
 
 use std::time::{Duration, Instant};
 use topo::testutil::{
-    Peer, start_chain, start_multi_source, start_sink_download,
-    sync_until_converged, assert_eventually, clone_events_to,
+    assert_eventually, clone_events_to, start_chain, start_multi_source, start_sink_download,
+    sync_until_converged, Peer,
 };
 
 /// Read peak resident set size from /proc/self/status (Linux only).
@@ -134,9 +134,16 @@ async fn run_chain_bench(n: usize, event_count: usize) {
     eprintln!("  Tail converge:    {} ms", tail_wall_ms);
     eprintln!("  All converge:     {} ms", all_wall_ms);
     eprintln!("  Events/s (tail):  {:.0}", events_per_sec);
-    eprintln!("  Hop latency P50:  {:.1} ms ({} samples)", hop_p50, hop_delays.len());
+    eprintln!(
+        "  Hop latency P50:  {:.1} ms ({} samples)",
+        hop_p50,
+        hop_delays.len()
+    );
     eprintln!("  Hop latency P95:  {:.1} ms", hop_p95);
-    eprintln!("  Peak RSS:         {:.1} MiB (before: {:.1})", rss_after, rss_before);
+    eprintln!(
+        "  Peak RSS:         {:.1} MiB (before: {:.1})",
+        rss_after, rss_before
+    );
     print_chain_counts(&peers);
     eprintln!();
 }
@@ -208,8 +215,12 @@ async fn run_multi_source_bench(source_count: usize, events_per_source: usize) {
         // Sample an event from this source as convergence marker
         let sample = source.sample_event_ids(1)[0].clone();
         let metrics = sync_until_converged(
-            source, &sink, || sink.has_event(&sample), Duration::from_secs(120),
-        ).await;
+            source,
+            &sink,
+            || sink.has_event(&sample),
+            Duration::from_secs(120),
+        )
+        .await;
 
         let source_ms = source_start.elapsed().as_millis() as u64;
         eprintln!(
@@ -230,7 +241,10 @@ async fn run_multi_source_bench(source_count: usize, events_per_source: usize) {
     eprintln!("  Catchup wall:     {} ms", wall_ms);
     eprintln!("  Events/s:         {:.0}", events_per_sec);
     eprintln!("  Sink store:       {}", sink.store_count());
-    eprintln!("  Peak RSS:         {:.1} MiB (before: {:.1})", rss_after, rss_before);
+    eprintln!(
+        "  Peak RSS:         {:.1} MiB (before: {:.1})",
+        rss_after, rss_before
+    );
     for (i, source) in sources.iter().enumerate() {
         eprintln!("  S{} store:          {}", i, source.store_count());
     }
@@ -288,7 +302,9 @@ async fn run_multi_source_concurrent_bench(source_count: usize, events_per_sourc
     let total_messages = events_per_source as i64;
     eprintln!(
         "Generated {} events at S0 in {:.2}s, cloning to {} sources...",
-        total_messages, gen_secs, source_count - 1
+        total_messages,
+        gen_secs,
+        source_count - 1
     );
 
     // Sample a convergence marker from S0 before cloning
@@ -299,8 +315,11 @@ async fn run_multi_source_concurrent_bench(source_count: usize, events_per_sourc
         let targets: Vec<&Peer> = sources[1..].iter().collect();
         clone_events_to(&sources[0], &targets);
         for i in 1..source_count {
-            assert!(sources[i].has_event(&sample),
-                "S{} should have cloned event", i);
+            assert!(
+                sources[i].has_event(&sample),
+                "S{} should have cloned event",
+                i
+            );
         }
         eprintln!("  Cloned to S1..S{}", source_count - 1);
     }
@@ -312,12 +331,17 @@ async fn run_multi_source_concurrent_bench(source_count: usize, events_per_sourc
     let handles = start_multi_source(&sources, &sink);
 
     // Wait for sink to receive the sampled event (scale timeout with event count)
-    let timeout_secs = if events_per_source >= 100_000 { 600 } else { 120 };
+    let timeout_secs = if events_per_source >= 100_000 {
+        600
+    } else {
+        120
+    };
     assert_eventually(
         || sink.has_event(&sample),
         Duration::from_secs(timeout_secs),
         "concurrent sink receives sampled event",
-    ).await;
+    )
+    .await;
 
     let wall_ms = start.elapsed().as_millis() as u64;
     let rss_after = peak_rss_mib();
@@ -335,7 +359,10 @@ async fn run_multi_source_concurrent_bench(source_count: usize, events_per_sourc
     eprintln!("  Catchup wall:     {} ms", wall_ms);
     eprintln!("  Events/s:         {:.0}", events_per_sec);
     eprintln!("  Sink store:       {}", sink.store_count());
-    eprintln!("  Peak RSS:         {:.1} MiB (before: {:.1})", rss_after, rss_before);
+    eprintln!(
+        "  Peak RSS:         {:.1} MiB (before: {:.1})",
+        rss_after, rss_before
+    );
     eprintln!();
 }
 
@@ -435,7 +462,8 @@ async fn run_multi_source_partitioned_bench(source_count: usize, total_events: u
     );
 
     // Sample one event from each source as convergence markers
-    let samples: Vec<String> = sources.iter()
+    let samples: Vec<String> = sources
+        .iter()
         .map(|s| s.sample_event_ids(1)[0].clone())
         .collect();
 
@@ -449,7 +477,8 @@ async fn run_multi_source_partitioned_bench(source_count: usize, total_events: u
         || samples.iter().all(|s| sink.has_event(s)),
         Duration::from_secs(timeout_secs),
         "partitioned sink receives events from all sources",
-    ).await;
+    )
+    .await;
 
     let wall_ms = start.elapsed().as_millis() as u64;
     let rss_after = peak_rss_mib();
@@ -468,7 +497,10 @@ async fn run_multi_source_partitioned_bench(source_count: usize, total_events: u
     eprintln!("  Events/s:         {:.0}", events_per_sec);
     eprintln!("  MB/s:             {:.2}", mb_per_sec);
     eprintln!("  Sink store:       {}", sink.store_count());
-    eprintln!("  Peak RSS:         {:.1} MiB (before: {:.1})", rss_after, rss_before);
+    eprintln!(
+        "  Peak RSS:         {:.1} MiB (before: {:.1})",
+        rss_after, rss_before
+    );
     eprintln!();
 }
 
@@ -524,7 +556,9 @@ async fn run_sink_download_bench(source_count: usize, events_per_source: usize) 
     let total_messages = events_per_source as i64;
     eprintln!(
         "Generated {} events at S0 in {:.2}s, cloning to {} sources...",
-        total_messages, gen_secs, source_count - 1
+        total_messages,
+        gen_secs,
+        source_count - 1
     );
 
     // Clone S0's data to all other sources (overlapping data)
@@ -543,12 +577,17 @@ async fn run_sink_download_bench(source_count: usize, events_per_source: usize) 
     // Sink-driven download: sink connects to all sources with claimed set
     let handles = start_sink_download(&sources, &sink);
 
-    let timeout_secs = if events_per_source >= 100_000 { 600 } else { 120 };
+    let timeout_secs = if events_per_source >= 100_000 {
+        600
+    } else {
+        120
+    };
     assert_eventually(
         || sink.has_event(&sample),
         Duration::from_secs(timeout_secs),
         "sink download receives sampled event",
-    ).await;
+    )
+    .await;
 
     let wall_ms = start.elapsed().as_millis() as u64;
     let rss_after = peak_rss_mib();
@@ -567,7 +606,10 @@ async fn run_sink_download_bench(source_count: usize, events_per_source: usize) 
     eprintln!("  Events/s:         {:.0}", events_per_sec);
     eprintln!("  MB/s:             {:.2}", mb_per_sec);
     eprintln!("  Sink store:       {}", sink.store_count());
-    eprintln!("  Peak RSS:         {:.1} MiB (before: {:.1})", rss_after, rss_before);
+    eprintln!(
+        "  Peak RSS:         {:.1} MiB (before: {:.1})",
+        rss_after, rss_before
+    );
     eprintln!();
 }
 

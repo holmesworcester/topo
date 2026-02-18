@@ -2,13 +2,17 @@ use async_trait::async_trait;
 use quinn::{RecvStream, SendStream};
 use tokio::io::AsyncWriteExt;
 
-use crate::sync::{encode_sync_message, parse_sync_message, SyncMessage};
 use crate::sync::protocol::ParseError;
+use crate::sync::{encode_sync_message, parse_sync_message, SyncMessage};
 
 /// Max recv buffer size to prevent unbounded growth.
 /// 2 MiB normally, 512 KiB in low_mem mode.
 fn max_recv_buffer() -> usize {
-    if low_mem_mode() { 512 * 1024 } else { 2 * 1024 * 1024 }
+    if low_mem_mode() {
+        512 * 1024
+    } else {
+        2 * 1024 * 1024
+    }
 }
 
 fn low_mem_mode() -> bool {
@@ -63,7 +67,11 @@ pub struct RecvConnection {
 /// Data stream: Event blobs
 ///
 /// This prevents large event transfers from blocking control messages.
-pub struct DualConnection<C: StreamConn = Connection, S: StreamSend = SendConnection, R: StreamRecv = RecvConnection> {
+pub struct DualConnection<
+    C: StreamConn = Connection,
+    S: StreamSend = SendConnection,
+    R: StreamRecv = RecvConnection,
+> {
     pub control: C,
     pub data_send: S,
     pub data_recv: R,
@@ -95,7 +103,6 @@ impl<C: StreamConn, S: StreamSend, R: StreamRecv> DualConnection<C, S, R> {
     pub async fn flush_data(&mut self) -> Result<(), ConnectionError> {
         self.data_send.flush().await
     }
-
 }
 
 impl Connection {
@@ -141,7 +148,9 @@ impl Connection {
             }
 
             if self.recv_buffer.len() > max_recv_buffer() {
-                return Err(ConnectionError::Parse(ParseError::EventTooLarge(self.recv_buffer.len())));
+                return Err(ConnectionError::Parse(ParseError::EventTooLarge(
+                    self.recv_buffer.len(),
+                )));
             }
 
             // Read more data
@@ -201,7 +210,9 @@ impl RecvConnection {
             }
 
             if self.recv_buffer.len() > max_recv_buffer() {
-                return Err(ConnectionError::Parse(ParseError::EventTooLarge(self.recv_buffer.len())));
+                return Err(ConnectionError::Parse(ParseError::EventTooLarge(
+                    self.recv_buffer.len(),
+                )));
             }
 
             let mut buf = [0u8; 4096];

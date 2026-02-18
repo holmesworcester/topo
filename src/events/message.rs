@@ -1,4 +1,4 @@
-use super::fixed_layout::{self, MESSAGE_WIRE_SIZE, MESSAGE_CONTENT_BYTES, message_offsets as off};
+use super::fixed_layout::{self, message_offsets as off, MESSAGE_CONTENT_BYTES, MESSAGE_WIRE_SIZE};
 use super::registry::{EventTypeMeta, ShareScope};
 use super::{EventError, ParsedEvent, EVENT_TYPE_MESSAGE};
 
@@ -42,7 +42,8 @@ pub fn parse_message(blob: &[u8]) -> Result<ParsedEvent, EventError> {
         });
     }
 
-    let created_at_ms = u64::from_le_bytes(blob[off::CREATED_AT..off::WORKSPACE_ID].try_into().unwrap());
+    let created_at_ms =
+        u64::from_le_bytes(blob[off::CREATED_AT..off::WORKSPACE_ID].try_into().unwrap());
 
     let mut workspace_id = [0u8; 32];
     workspace_id.copy_from_slice(&blob[off::WORKSPACE_ID..off::AUTHOR_ID]);
@@ -50,8 +51,9 @@ pub fn parse_message(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     let mut author_id = [0u8; 32];
     author_id.copy_from_slice(&blob[off::AUTHOR_ID..off::CONTENT]);
 
-    let content = fixed_layout::read_text_slot(&blob[off::CONTENT..off::CONTENT + MESSAGE_CONTENT_BYTES])
-        .map_err(EventError::TextSlot)?;
+    let content =
+        fixed_layout::read_text_slot(&blob[off::CONTENT..off::CONTENT + MESSAGE_CONTENT_BYTES])
+            .map_err(EventError::TextSlot)?;
 
     let mut signed_by = [0u8; 32];
     signed_by.copy_from_slice(&blob[off::SIGNED_BY..off::SIGNER_TYPE]);
@@ -89,8 +91,11 @@ pub fn encode_message(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     buf[off::CREATED_AT..off::WORKSPACE_ID].copy_from_slice(&msg.created_at_ms.to_le_bytes());
     buf[off::WORKSPACE_ID..off::AUTHOR_ID].copy_from_slice(&msg.workspace_id);
     buf[off::AUTHOR_ID..off::CONTENT].copy_from_slice(&msg.author_id);
-    fixed_layout::write_text_slot(&msg.content, &mut buf[off::CONTENT..off::CONTENT + MESSAGE_CONTENT_BYTES])
-        .map_err(EventError::TextSlot)?;
+    fixed_layout::write_text_slot(
+        &msg.content,
+        &mut buf[off::CONTENT..off::CONTENT + MESSAGE_CONTENT_BYTES],
+    )
+    .map_err(EventError::TextSlot)?;
     buf[off::SIGNED_BY..off::SIGNER_TYPE].copy_from_slice(&msg.signed_by);
     buf[off::SIGNER_TYPE] = msg.signer_type;
     buf[off::SIGNATURE..off::SIGNATURE + 64].copy_from_slice(&msg.signature);

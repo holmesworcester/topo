@@ -1,12 +1,14 @@
 use super::registry::{EventTypeMeta, ShareScope};
-use super::{EventError, ParsedEvent, EVENT_TYPE_PEER_SHARED_FIRST, EVENT_TYPE_PEER_SHARED_ONGOING};
+use super::{
+    EventError, ParsedEvent, EVENT_TYPE_PEER_SHARED_FIRST, EVENT_TYPE_PEER_SHARED_ONGOING,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerSharedFirstEvent {
     pub created_at_ms: u64,
     pub public_key: [u8; 32],
-    pub signed_by: [u8; 32],     // signer event_id (DeviceInviteFirst event)
-    pub signer_type: u8,         // 3 = device_invite
+    pub signed_by: [u8; 32], // signer event_id (DeviceInviteFirst event)
+    pub signer_type: u8,     // 3 = device_invite
     pub signature: [u8; 64],
 }
 
@@ -14,8 +16,8 @@ pub struct PeerSharedFirstEvent {
 pub struct PeerSharedOngoingEvent {
     pub created_at_ms: u64,
     pub public_key: [u8; 32],
-    pub signed_by: [u8; 32],     // signer event_id (DeviceInviteOngoing event)
-    pub signer_type: u8,         // 3 = device_invite
+    pub signed_by: [u8; 32], // signer event_id (DeviceInviteOngoing event)
+    pub signer_type: u8,     // 3 = device_invite
     pub signature: [u8; 64],
 }
 
@@ -28,13 +30,22 @@ pub struct PeerSharedOngoingEvent {
 /// [74..138]  signature (64 bytes)
 pub fn parse_peer_shared_first(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if blob.len() < 138 {
-        return Err(EventError::TooShort { expected: 138, actual: blob.len() });
+        return Err(EventError::TooShort {
+            expected: 138,
+            actual: blob.len(),
+        });
     }
     if blob.len() > 138 {
-        return Err(EventError::TrailingData { expected: 138, actual: blob.len() });
+        return Err(EventError::TrailingData {
+            expected: 138,
+            actual: blob.len(),
+        });
     }
     if blob[0] != EVENT_TYPE_PEER_SHARED_FIRST {
-        return Err(EventError::WrongType { expected: EVENT_TYPE_PEER_SHARED_FIRST, actual: blob[0] });
+        return Err(EventError::WrongType {
+            expected: EVENT_TYPE_PEER_SHARED_FIRST,
+            actual: blob[0],
+        });
     }
 
     let created_at_ms = u64::from_le_bytes(blob[1..9].try_into().unwrap());
@@ -79,13 +90,22 @@ pub fn encode_peer_shared_first(event: &ParsedEvent) -> Result<Vec<u8>, EventErr
 /// [74..138]  signature (64 bytes)
 pub fn parse_peer_shared_ongoing(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if blob.len() < 138 {
-        return Err(EventError::TooShort { expected: 138, actual: blob.len() });
+        return Err(EventError::TooShort {
+            expected: 138,
+            actual: blob.len(),
+        });
     }
     if blob.len() > 138 {
-        return Err(EventError::TrailingData { expected: 138, actual: blob.len() });
+        return Err(EventError::TrailingData {
+            expected: 138,
+            actual: blob.len(),
+        });
     }
     if blob[0] != EVENT_TYPE_PEER_SHARED_ONGOING {
-        return Err(EventError::WrongType { expected: EVENT_TYPE_PEER_SHARED_ONGOING, actual: blob[0] });
+        return Err(EventError::WrongType {
+            expected: EVENT_TYPE_PEER_SHARED_ONGOING,
+            actual: blob[0],
+        });
     }
 
     let created_at_ms = u64::from_le_bytes(blob[1..9].try_into().unwrap());

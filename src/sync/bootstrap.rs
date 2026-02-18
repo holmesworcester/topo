@@ -15,10 +15,10 @@ use crate::db::{open_connection, schema::create_tables};
 use crate::sync::engine::run_sync_initiator_dual;
 use crate::sync::SyncMessage;
 use crate::transport::{
-    create_dual_endpoint, AllowedPeers, DualConnection, peer_identity_from_connection,
+    create_dual_endpoint, peer_identity_from_connection, AllowedPeers, DualConnection,
 };
 use crate::transport_identity::{
-    load_transport_cert_required_from_db, expected_invite_bootstrap_spki_from_invite_key,
+    expected_invite_bootstrap_spki_from_invite_key, load_transport_cert_required_from_db,
 };
 
 /// Run a one-shot bootstrap sync from an invite link's bootstrap address.
@@ -47,12 +47,7 @@ pub async fn bootstrap_sync_from_invite(
 
     // Pin only the bootstrap peer's SPKI for this one-shot connection
     let allowed = Arc::new(AllowedPeers::from_fingerprints(vec![*bootstrap_spki]));
-    let endpoint = create_dual_endpoint(
-        "0.0.0.0:0".parse().unwrap(),
-        cert,
-        key,
-        allowed,
-    )?;
+    let endpoint = create_dual_endpoint("0.0.0.0:0".parse().unwrap(), cert, key, allowed)?;
 
     info!(
         "Bootstrap sync: connecting to {} (spki {}...)",
@@ -63,7 +58,12 @@ pub async fn bootstrap_sync_from_invite(
     let connection = endpoint
         .connect(bootstrap_addr, "localhost")?
         .await
-        .map_err(|e| format!("Bootstrap sync: failed to connect to {}: {}", bootstrap_addr, e))?;
+        .map_err(|e| {
+            format!(
+                "Bootstrap sync: failed to connect to {}: {}",
+                bootstrap_addr, e
+            )
+        })?;
 
     let peer_id = peer_identity_from_connection(&connection)
         .ok_or("Bootstrap sync: could not extract peer identity")?;
@@ -83,8 +83,12 @@ pub async fn bootstrap_sync_from_invite(
     let mut conn = DualConnection::new(ctrl_send, ctrl_recv, data_send, data_recv);
 
     // Send markers to materialize lazy QUIC streams on the receiver
-    conn.control.send(&SyncMessage::HaveList { ids: vec![] }).await?;
-    conn.data_send.send(&SyncMessage::HaveList { ids: vec![] }).await?;
+    conn.control
+        .send(&SyncMessage::HaveList { ids: vec![] })
+        .await?;
+    conn.data_send
+        .send(&SyncMessage::HaveList { ids: vec![] })
+        .await?;
     conn.flush_control().await?;
     conn.flush_data().await?;
 
@@ -132,12 +136,7 @@ pub fn start_bootstrap_responder(
     let joiner_spki = expected_invite_bootstrap_spki_from_invite_key(invite_key)?;
     let allowed = Arc::new(AllowedPeers::from_fingerprints(vec![joiner_spki]));
 
-    let endpoint = create_dual_endpoint(
-        "127.0.0.1:0".parse().unwrap(),
-        cert,
-        key,
-        allowed,
-    )?;
+    let endpoint = create_dual_endpoint("127.0.0.1:0".parse().unwrap(), cert, key, allowed)?;
     let local_addr = endpoint.local_addr()?;
 
     let db_path = inviter_db_path.to_string();
@@ -165,8 +164,7 @@ pub fn start_bootstrap_responder(
                     None => return,
                 };
 
-                let peer_id = peer_identity_from_connection(&connection)
-                    .unwrap_or_default();
+                let peer_id = peer_identity_from_connection(&connection).unwrap_or_default();
 
                 let (ctrl_send, ctrl_recv) = match connection.accept_bi().await {
                     Ok(s) => s,
@@ -187,8 +185,15 @@ pub fn start_bootstrap_responder(
                 let db_path_ref = &db_path;
                 let recorded_by_ref = &recorded_by;
                 if let Err(e) = crate::sync::engine::run_sync_responder_dual(
-                    conn, db_path_ref, 30, &peer_id, recorded_by_ref, None,
-                ).await {
+                    conn,
+                    db_path_ref,
+                    30,
+                    &peer_id,
+                    recorded_by_ref,
+                    None,
+                )
+                .await
+                {
                     tracing::warn!("Bootstrap responder: sync error: {}", e);
                 }
             }

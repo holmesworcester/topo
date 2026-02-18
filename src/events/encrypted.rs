@@ -58,7 +58,8 @@ pub fn parse_encrypted(blob: &[u8]) -> Result<ParsedEvent, EventError> {
         });
     }
 
-    let created_at_ms = u64::from_le_bytes(blob[off::CREATED_AT..off::KEY_EVENT_ID].try_into().unwrap());
+    let created_at_ms =
+        u64::from_le_bytes(blob[off::CREATED_AT..off::KEY_EVENT_ID].try_into().unwrap());
 
     let mut key_event_id = [0u8; 32];
     key_event_id.copy_from_slice(&blob[off::KEY_EVENT_ID..off::INNER_TYPE_CODE]);
@@ -93,7 +94,9 @@ pub fn encode_encrypted(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         .ok_or(EventError::InvalidEncryptedInnerType(enc.inner_type_code))?;
 
     if enc.ciphertext.len() != expected_ct_size {
-        return Err(EventError::InvalidMetadata("ciphertext size does not match inner_type_code"));
+        return Err(EventError::InvalidMetadata(
+            "ciphertext size does not match inner_type_code",
+        ));
     }
 
     let total = fixed_layout::encrypted_wire_size(expected_ct_size);

@@ -1,5 +1,5 @@
-use blake2::{Blake2b, Digest};
 use blake2::digest::consts::U32;
+use blake2::{Blake2b, Digest};
 
 pub type EventId = [u8; 32];
 

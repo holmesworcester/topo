@@ -174,10 +174,7 @@ pub fn parse_invite_link(link: &str) -> Result<ParsedInviteLink, InviteLinkError
 
 /// Re-encode an invite link with a different bootstrap address.
 /// Decodes the payload, swaps the bootstrap_addr, and re-encodes.
-pub fn rewrite_bootstrap_addr(
-    link: &str,
-    new_addr: &str,
-) -> Result<String, InviteLinkError> {
+pub fn rewrite_bootstrap_addr(link: &str, new_addr: &str) -> Result<String, InviteLinkError> {
     let (prefix, code) = if let Some(code) = link.strip_prefix(INVITE_PREFIX) {
         (INVITE_PREFIX, code)
     } else if let Some(code) = link.strip_prefix(LINK_PREFIX) {

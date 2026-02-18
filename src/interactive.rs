@@ -4,13 +4,10 @@ use std::io::{self, BufRead, IsTerminal, Write};
 use ed25519_dalek::SigningKey;
 
 use crate::crypto::{event_id_to_base64, EventId};
-use crate::db::{
-    open_connection,
-    schema::create_tables,
-};
-use crate::service;
+use crate::db::{open_connection, schema::create_tables};
 use crate::identity_ops::{self, IdentityChain, InviteType};
 use crate::invite_link::{parse_invite_link, InviteLinkKind};
+use crate::service;
 use crate::transport_identity::ensure_transport_peer_id_from_db;
 
 use rustyline::completion::{Completer, Pair};
@@ -438,7 +435,9 @@ fn parse_named_arg<'a>(args: &'a [&str], name: &str) -> Option<&'a str> {
     None
 }
 
-fn resolve_bootstrap_addr(args: &[&str]) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+fn resolve_bootstrap_addr(
+    args: &[&str],
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     if let Some(addr) = parse_named_arg(args, "--bootstrap") {
         if !addr.trim().is_empty() {
             return Ok(addr.to_string());
@@ -449,7 +448,10 @@ fn resolve_bootstrap_addr(args: &[&str]) -> Result<String, Box<dyn std::error::E
             return Ok(addr);
         }
     }
-    Err("Missing bootstrap endpoint. Pass --bootstrap <host:port> or set POC7_BOOTSTRAP_ADDR.".into())
+    Err(
+        "Missing bootstrap endpoint. Pass --bootstrap <host:port> or set POC7_BOOTSTRAP_ADDR."
+            .into(),
+    )
 }
 
 fn resolve_invite_ref(
@@ -601,9 +603,11 @@ fn cmd_messages(
                 writeln!(out, "  {}. [{}] {}", num, author_name, msg.content)?;
 
                 // Enrichment: show reactions inline
-                let emojis = service::svc_reactions_for_message_conn(
-                    &conn, &account.identity, &msg.id_b64,
-                ).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() })?;
+                let emojis =
+                    service::svc_reactions_for_message_conn(&conn, &account.identity, &msg.id_b64)
+                        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                            format!("{}", e).into()
+                        })?;
 
                 if !emojis.is_empty() {
                     // Group reactions by emoji with counts
@@ -644,8 +648,9 @@ fn cmd_react(
     let account = session.active_account().ok_or("No active account.")?;
 
     let conn = open_connection(&account.db_path)?;
-    let target_event_id = service::svc_message_event_id_by_num_conn(&conn, &account.identity, msg_num)
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() })?;
+    let target_event_id =
+        service::svc_message_event_id_by_num_conn(&conn, &account.identity, msg_num)
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() })?;
 
     let peer_shared_eid = account.peer_shared_event_id.ok_or("No signing key.")?;
     let peer_shared_key = account
@@ -684,8 +689,9 @@ fn cmd_reactions(
     let account = session.active_account().ok_or("No active account.")?;
 
     let conn = open_connection(&account.db_path)?;
-    let target_event_id = service::svc_message_event_id_by_num_conn(&conn, &account.identity, msg_num)
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() })?;
+    let target_event_id =
+        service::svc_message_event_id_by_num_conn(&conn, &account.identity, msg_num)
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() })?;
     let target_b64 = event_id_to_base64(&target_event_id);
 
     let emojis = service::svc_reactions_for_message_conn(&conn, &account.identity, &target_b64)
@@ -718,8 +724,9 @@ fn cmd_delete(
     let account = session.active_account().ok_or("No active account.")?;
 
     let conn = open_connection(&account.db_path)?;
-    let target_event_id = service::svc_message_event_id_by_num_conn(&conn, &account.identity, msg_num)
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() })?;
+    let target_event_id =
+        service::svc_message_event_id_by_num_conn(&conn, &account.identity, msg_num)
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() })?;
 
     let peer_shared_eid = account.peer_shared_event_id.ok_or("No signing key.")?;
     let peer_shared_key = account
@@ -843,15 +850,10 @@ fn cmd_accept_invite(
     // the joiner can fetch prerequisite events via real QUIC.
     let invite_key = invite.invite_signing_key();
     let (effective_link, _temp_endpoint) = if let Some(inviter) = inviter {
-        let (addr, ep) = start_temp_sync_endpoint(
-            &inviter.db_path,
-            &inviter.identity,
-            &invite_key,
-        )?;
-        let rewritten = crate::invite_link::rewrite_bootstrap_addr(
-            &invite_link,
-            &addr.to_string(),
-        )?;
+        let (addr, ep) =
+            start_temp_sync_endpoint(&inviter.db_path, &inviter.identity, &invite_key)?;
+        let rewritten =
+            crate::invite_link::rewrite_bootstrap_addr(&invite_link, &addr.to_string())?;
         (rewritten, Some(ep))
     } else {
         (invite_link.clone(), None)
@@ -870,9 +872,7 @@ fn cmd_accept_invite(
             devicename,
         ))
     })
-    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-        format!("{}", e).into()
-    })?;
+    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() })?;
 
     // Shut down temp sync endpoint if we started one
     if let Some(ep) = _temp_endpoint {
@@ -886,7 +886,9 @@ fn cmd_accept_invite(
 
     // Load keys from DB for interactive signing (service layer persisted them)
     let conn = open_connection(&account.db_path)?;
-    if let Ok(Some((psf_eid, psf_key))) = crate::service::load_local_peer_signer_pub(&conn, &account.identity) {
+    if let Ok(Some((psf_eid, psf_key))) =
+        crate::service::load_local_peer_signer_pub(&conn, &account.identity)
+    {
         account.peer_shared_event_id = Some(psf_eid);
         account.peer_shared_key = Some(psf_key.clone());
         account
@@ -1005,15 +1007,10 @@ fn cmd_accept_link(
     // the joiner can fetch prerequisite events via real QUIC.
     let device_invite_key = invite.invite_signing_key();
     let (effective_link, _temp_endpoint) = if let Some(inviter) = inviter {
-        let (addr, ep) = start_temp_sync_endpoint(
-            &inviter.db_path,
-            &inviter.identity,
-            &device_invite_key,
-        )?;
-        let rewritten = crate::invite_link::rewrite_bootstrap_addr(
-            &invite_link,
-            &addr.to_string(),
-        )?;
+        let (addr, ep) =
+            start_temp_sync_endpoint(&inviter.db_path, &inviter.identity, &device_invite_key)?;
+        let rewritten =
+            crate::invite_link::rewrite_bootstrap_addr(&invite_link, &addr.to_string())?;
         (rewritten, Some(ep))
     } else {
         (invite_link.clone(), None)
@@ -1030,9 +1027,7 @@ fn cmd_accept_link(
             devicename,
         ))
     })
-    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-        format!("{}", e).into()
-    })?;
+    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() })?;
 
     // Shut down temp sync endpoint if we started one
     if let Some(ep) = _temp_endpoint {
@@ -1046,7 +1041,9 @@ fn cmd_accept_link(
 
     // Load keys from DB for interactive signing (service layer persisted them)
     let conn = open_connection(&account.db_path)?;
-    if let Ok(Some((psf_eid, psf_key))) = crate::service::load_local_peer_signer_pub(&conn, &account.identity) {
+    if let Ok(Some((psf_eid, psf_key))) =
+        crate::service::load_local_peer_signer_pub(&conn, &account.identity)
+    {
         account.peer_shared_event_id = Some(psf_eid);
         account.peer_shared_key = Some(psf_key.clone());
         account
@@ -1287,7 +1284,13 @@ fn cmd_workspaces(
             } else {
                 item.workspace_id.clone()
             };
-            writeln!(out, "  {}. {} ({})", i + 1, label, &item.event_id[..item.event_id.len().min(8)])?;
+            writeln!(
+                out,
+                "  {}. {} ({})",
+                i + 1,
+                label,
+                &item.event_id[..item.event_id.len().min(8)]
+            )?;
         }
     }
 
@@ -1377,8 +1380,8 @@ fn cmd_ban(
         return Ok(());
     }
 
-    let target_event_id =
-        crate::crypto::event_id_from_base64(&users[user_num - 1].event_id).ok_or("Invalid event ID")?;
+    let target_event_id = crate::crypto::event_id_from_base64(&users[user_num - 1].event_id)
+        .ok_or("Invalid event ID")?;
 
     service::svc_remove_user_conn(
         &conn,
@@ -1496,4 +1499,3 @@ fn base64_encode(data: &[u8]) -> String {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.encode(data)
 }
-

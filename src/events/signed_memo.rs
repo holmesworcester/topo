@@ -1,4 +1,6 @@
-use super::fixed_layout::{self, SIGNED_MEMO_WIRE_SIZE, SIGNED_MEMO_CONTENT_BYTES, signed_memo_offsets as off};
+use super::fixed_layout::{
+    self, signed_memo_offsets as off, SIGNED_MEMO_CONTENT_BYTES, SIGNED_MEMO_WIRE_SIZE,
+};
 use super::registry::{EventTypeMeta, ShareScope};
 use super::{EventError, ParsedEvent, EVENT_TYPE_SIGNED_MEMO};
 
@@ -38,15 +40,17 @@ pub fn parse_signed_memo(blob: &[u8]) -> Result<ParsedEvent, EventError> {
         });
     }
 
-    let created_at_ms = u64::from_le_bytes(blob[off::CREATED_AT..off::SIGNED_BY].try_into().unwrap());
+    let created_at_ms =
+        u64::from_le_bytes(blob[off::CREATED_AT..off::SIGNED_BY].try_into().unwrap());
 
     let mut signed_by = [0u8; 32];
     signed_by.copy_from_slice(&blob[off::SIGNED_BY..off::SIGNER_TYPE]);
 
     let signer_type = blob[off::SIGNER_TYPE];
 
-    let content = fixed_layout::read_text_slot(&blob[off::CONTENT..off::CONTENT + SIGNED_MEMO_CONTENT_BYTES])
-        .map_err(EventError::TextSlot)?;
+    let content =
+        fixed_layout::read_text_slot(&blob[off::CONTENT..off::CONTENT + SIGNED_MEMO_CONTENT_BYTES])
+            .map_err(EventError::TextSlot)?;
 
     let mut signature = [0u8; 64];
     signature.copy_from_slice(&blob[off::SIGNATURE..off::SIGNATURE + 64]);
@@ -77,8 +81,11 @@ pub fn encode_signed_memo(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     buf[off::CREATED_AT..off::SIGNED_BY].copy_from_slice(&memo.created_at_ms.to_le_bytes());
     buf[off::SIGNED_BY..off::SIGNER_TYPE].copy_from_slice(&memo.signed_by);
     buf[off::SIGNER_TYPE] = memo.signer_type;
-    fixed_layout::write_text_slot(&memo.content, &mut buf[off::CONTENT..off::CONTENT + SIGNED_MEMO_CONTENT_BYTES])
-        .map_err(EventError::TextSlot)?;
+    fixed_layout::write_text_slot(
+        &memo.content,
+        &mut buf[off::CONTENT..off::CONTENT + SIGNED_MEMO_CONTENT_BYTES],
+    )
+    .map_err(EventError::TextSlot)?;
     buf[off::SIGNATURE..off::SIGNATURE + 64].copy_from_slice(&memo.signature);
 
     Ok(buf)

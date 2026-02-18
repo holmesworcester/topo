@@ -1,8 +1,8 @@
 use rusqlite::Connection;
 
-use crate::crypto::{event_id_to_base64, event_id_from_base64};
-use crate::events::ParsedEvent;
 use super::decision::ProjectionDecision;
+use crate::crypto::{event_id_from_base64, event_id_to_base64};
+use crate::events::ParsedEvent;
 
 // Trust anchor is set directly from invite_accepted.workspace_id.
 
@@ -15,19 +15,39 @@ pub fn apply_identity_projection(
 ) -> Result<ProjectionDecision, Box<dyn std::error::Error>> {
     match parsed {
         ParsedEvent::Workspace(ws) => project_workspace(conn, recorded_by, event_id_b64, ws),
-        ParsedEvent::InviteAccepted(ia) => project_invite_accepted(conn, recorded_by, event_id_b64, ia),
-        ParsedEvent::UserInviteBoot(ui) => project_user_invite_boot(conn, recorded_by, event_id_b64, ui),
-        ParsedEvent::UserInviteOngoing(ui) => project_user_invite(conn, recorded_by, event_id_b64, &ui.public_key),
-        ParsedEvent::DeviceInviteFirst(di) => project_device_invite(conn, recorded_by, event_id_b64, &di.public_key),
-        ParsedEvent::DeviceInviteOngoing(di) => project_device_invite(conn, recorded_by, event_id_b64, &di.public_key),
+        ParsedEvent::InviteAccepted(ia) => {
+            project_invite_accepted(conn, recorded_by, event_id_b64, ia)
+        }
+        ParsedEvent::UserInviteBoot(ui) => {
+            project_user_invite_boot(conn, recorded_by, event_id_b64, ui)
+        }
+        ParsedEvent::UserInviteOngoing(ui) => {
+            project_user_invite(conn, recorded_by, event_id_b64, &ui.public_key)
+        }
+        ParsedEvent::DeviceInviteFirst(di) => {
+            project_device_invite(conn, recorded_by, event_id_b64, &di.public_key)
+        }
+        ParsedEvent::DeviceInviteOngoing(di) => {
+            project_device_invite(conn, recorded_by, event_id_b64, &di.public_key)
+        }
         ParsedEvent::UserBoot(u) => project_user(conn, recorded_by, event_id_b64, &u.public_key),
         ParsedEvent::UserOngoing(u) => project_user(conn, recorded_by, event_id_b64, &u.public_key),
-        ParsedEvent::PeerSharedFirst(p) => project_peer_shared(conn, recorded_by, event_id_b64, &p.public_key),
-        ParsedEvent::PeerSharedOngoing(p) => project_peer_shared(conn, recorded_by, event_id_b64, &p.public_key),
+        ParsedEvent::PeerSharedFirst(p) => {
+            project_peer_shared(conn, recorded_by, event_id_b64, &p.public_key)
+        }
+        ParsedEvent::PeerSharedOngoing(p) => {
+            project_peer_shared(conn, recorded_by, event_id_b64, &p.public_key)
+        }
         ParsedEvent::AdminBoot(a) => project_admin(conn, recorded_by, event_id_b64, &a.public_key),
-        ParsedEvent::AdminOngoing(a) => project_admin(conn, recorded_by, event_id_b64, &a.public_key),
-        ParsedEvent::UserRemoved(r) => project_user_removed(conn, recorded_by, event_id_b64, &r.target_event_id),
-        ParsedEvent::PeerRemoved(r) => project_peer_removed(conn, recorded_by, event_id_b64, &r.target_event_id),
+        ParsedEvent::AdminOngoing(a) => {
+            project_admin(conn, recorded_by, event_id_b64, &a.public_key)
+        }
+        ParsedEvent::UserRemoved(r) => {
+            project_user_removed(conn, recorded_by, event_id_b64, &r.target_event_id)
+        }
+        ParsedEvent::PeerRemoved(r) => {
+            project_peer_removed(conn, recorded_by, event_id_b64, &r.target_event_id)
+        }
         ParsedEvent::SecretShared(s) => project_secret_shared(conn, recorded_by, event_id_b64, s),
         ParsedEvent::TransportKey(t) => project_transport_key(conn, recorded_by, event_id_b64, t),
         _ => Ok(ProjectionDecision::Reject {
@@ -67,7 +87,12 @@ fn project_workspace(
             conn.execute(
                 "INSERT OR IGNORE INTO workspaces (recorded_by, event_id, workspace_id, public_key)
                  VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![recorded_by, event_id_b64, &workspace_id_b64, ws.public_key.as_slice()],
+                rusqlite::params![
+                    recorded_by,
+                    event_id_b64,
+                    &workspace_id_b64,
+                    ws.public_key.as_slice()
+                ],
             )?;
             Ok(ProjectionDecision::Valid)
         }
@@ -311,10 +336,11 @@ pub fn retry_guard_blocked_events(
            AND re.event_id NOT IN (SELECT event_id FROM rejected_events WHERE peer_id = ?1)
            AND re.event_id NOT IN (SELECT DISTINCT event_id FROM blocked_event_deps WHERE peer_id = ?1)"
     )?;
-    let candidates: Vec<String> = stmt.query_map(
-        rusqlite::params![recorded_by],
-        |row| row.get::<_, String>(0),
-    )?.collect::<Result<Vec<_>, _>>()?;
+    let candidates: Vec<String> = stmt
+        .query_map(rusqlite::params![recorded_by], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
     drop(stmt);
 
     for eid_b64 in candidates {

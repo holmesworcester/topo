@@ -199,8 +199,16 @@ fn test_two_process_invite_and_sync() {
     let bob_eid = send_message(&bob_db, "Hello from bob");
 
     // Wait for sync convergence: each peer should have the other's last message event
-    assert_eventually(&alice_db, &format!("has_event:{} >= 1", bob_eid), timeout_ms);
-    assert_eventually(&bob_db, &format!("has_event:{} >= 1", alice_second_eid), timeout_ms);
+    assert_eventually(
+        &alice_db,
+        &format!("has_event:{} >= 1", bob_eid),
+        timeout_ms,
+    );
+    assert_eventually(
+        &bob_db,
+        &format!("has_event:{} >= 1", alice_second_eid),
+        timeout_ms,
+    );
 
     // Wait for cross-peer message projection: signer chain cascade must complete
     // after events sync. Alice should see 3 messages (2 own + 1 from Bob),

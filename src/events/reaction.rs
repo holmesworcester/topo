@@ -1,4 +1,6 @@
-use super::fixed_layout::{self, REACTION_WIRE_SIZE, REACTION_EMOJI_BYTES, reaction_offsets as off};
+use super::fixed_layout::{
+    self, reaction_offsets as off, REACTION_EMOJI_BYTES, REACTION_WIRE_SIZE,
+};
 use super::registry::{EventTypeMeta, ShareScope};
 use super::{EventError, ParsedEvent, EVENT_TYPE_REACTION};
 
@@ -42,7 +44,11 @@ pub fn parse_reaction(blob: &[u8]) -> Result<ParsedEvent, EventError> {
         });
     }
 
-    let created_at_ms = u64::from_le_bytes(blob[off::CREATED_AT..off::TARGET_EVENT_ID].try_into().unwrap());
+    let created_at_ms = u64::from_le_bytes(
+        blob[off::CREATED_AT..off::TARGET_EVENT_ID]
+            .try_into()
+            .unwrap(),
+    );
 
     let mut target_event_id = [0u8; 32];
     target_event_id.copy_from_slice(&blob[off::TARGET_EVENT_ID..off::AUTHOR_ID]);
@@ -89,8 +95,11 @@ pub fn encode_reaction(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     buf[off::CREATED_AT..off::TARGET_EVENT_ID].copy_from_slice(&rxn.created_at_ms.to_le_bytes());
     buf[off::TARGET_EVENT_ID..off::AUTHOR_ID].copy_from_slice(&rxn.target_event_id);
     buf[off::AUTHOR_ID..off::EMOJI].copy_from_slice(&rxn.author_id);
-    fixed_layout::write_text_slot(&rxn.emoji, &mut buf[off::EMOJI..off::EMOJI + REACTION_EMOJI_BYTES])
-        .map_err(EventError::TextSlot)?;
+    fixed_layout::write_text_slot(
+        &rxn.emoji,
+        &mut buf[off::EMOJI..off::EMOJI + REACTION_EMOJI_BYTES],
+    )
+    .map_err(EventError::TextSlot)?;
     buf[off::SIGNED_BY..off::SIGNER_TYPE].copy_from_slice(&rxn.signed_by);
     buf[off::SIGNER_TYPE] = rxn.signer_type;
     buf[off::SIGNATURE..off::SIGNATURE + 64].copy_from_slice(&rxn.signature);

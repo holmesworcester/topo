@@ -1,6 +1,6 @@
+use rusqlite::Connection;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
-use rusqlite::Connection;
 
 fn bin() -> String {
     env!("CARGO_BIN_EXE_topo").to_string()
@@ -192,18 +192,34 @@ fn test_cli_bidirectional_sync() {
 
     // Bob sends a message in the shared workspace
     let bob_eid = send_message(&bob_db, "Hey Alice!");
-    assert_eventually(&alice_db, &format!("has_event:{} >= 1", bob_eid), timeout_ms);
-    assert_eventually(&bob_db, &format!("has_event:{} >= 1", alice_eid), timeout_ms);
+    assert_eventually(
+        &alice_db,
+        &format!("has_event:{} >= 1", bob_eid),
+        timeout_ms,
+    );
+    assert_eventually(
+        &bob_db,
+        &format!("has_event:{} >= 1", alice_eid),
+        timeout_ms,
+    );
 
     // Verify specific message content arrived on both sides
     let alice_msgs = get_messages(&alice_db);
-    assert!(alice_msgs.len() >= 3, "Alice should see at least 3 messages, got {}", alice_msgs.len());
+    assert!(
+        alice_msgs.len() >= 3,
+        "Alice should see at least 3 messages, got {}",
+        alice_msgs.len()
+    );
     assert!(alice_msgs.contains(&"Hello from Alice".to_string()));
     assert!(alice_msgs.contains(&"How are you?".to_string()));
     assert!(alice_msgs.contains(&"Hey Alice!".to_string()));
 
     let bob_msgs = get_messages(&bob_db);
-    assert!(bob_msgs.len() >= 3, "Bob should see at least 3 messages, got {}", bob_msgs.len());
+    assert!(
+        bob_msgs.len() >= 3,
+        "Bob should see at least 3 messages, got {}",
+        bob_msgs.len()
+    );
     assert!(bob_msgs.contains(&"Hello from Alice".to_string()));
     assert!(bob_msgs.contains(&"How are you?".to_string()));
     assert!(bob_msgs.contains(&"Hey Alice!".to_string()));
@@ -248,8 +264,16 @@ fn test_cli_ongoing_sync() {
     std::thread::sleep(Duration::from_secs(1));
     let alice_last_eid = send_message(&alice_db, "Round 4");
 
-    assert_eventually(&alice_db, &format!("has_event:{} >= 1", bob_last_eid), timeout_ms);
-    assert_eventually(&bob_db, &format!("has_event:{} >= 1", alice_last_eid), timeout_ms);
+    assert_eventually(
+        &alice_db,
+        &format!("has_event:{} >= 1", bob_last_eid),
+        timeout_ms,
+    );
+    assert_eventually(
+        &bob_db,
+        &format!("has_event:{} >= 1", alice_last_eid),
+        timeout_ms,
+    );
 
     let _ = alice.kill();
     let _ = bob.kill();
@@ -284,8 +308,16 @@ fn test_cli_local_mdns_discovery_without_placeholder_autodial() {
 
     // Validate bidirectional convergence.
     let bob_msg_eid = send_message(&bob_db, "bob-via-mdns-localhost");
-    assert_eventually(&alice_db, &format!("has_event:{} >= 1", bob_msg_eid), timeout_ms);
-    assert_eventually(&bob_db, &format!("has_event:{} >= 1", alice_seed_eid), timeout_ms);
+    assert_eventually(
+        &alice_db,
+        &format!("has_event:{} >= 1", bob_msg_eid),
+        timeout_ms,
+    );
+    assert_eventually(
+        &bob_db,
+        &format!("has_event:{} >= 1", alice_seed_eid),
+        timeout_ms,
+    );
 
     let _ = alice.kill();
     let _ = bob.kill();
@@ -415,10 +447,7 @@ fn test_cli_sync_bootstrap_from_accepted_invite_data() {
     send_message(&alice_db, "bootstrap");
 
     // Alice creates invite (records pending trust with derived invitee SPKI).
-    let invite_link = create_invite(
-        &alice_db,
-        &format!("127.0.0.1:{}", alice_port),
-    );
+    let invite_link = create_invite(&alice_db, &format!("127.0.0.1:{}", alice_port));
 
     // Alice must be running sync before Bob accepts (accept-invite does
     // bootstrap sync to fetch prerequisite workspace events from Alice).
@@ -446,7 +475,11 @@ fn test_cli_sync_bootstrap_from_accepted_invite_data() {
     std::thread::sleep(Duration::from_secs(1));
 
     let bob_eid = send_message(&bob_db, "bootstrap trust from invite data");
-    assert_eventually(&alice_db, &format!("has_event:{} >= 1", bob_eid), timeout_ms);
+    assert_eventually(
+        &alice_db,
+        &format!("has_event:{} >= 1", bob_eid),
+        timeout_ms,
+    );
 
     let _ = alice.kill();
     let _ = bob.kill();

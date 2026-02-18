@@ -4,11 +4,11 @@ use super::{EventError, ParsedEvent, EVENT_TYPE_SECRET_SHARED};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecretSharedEvent {
     pub created_at_ms: u64,
-    pub key_event_id: [u8; 32],        // dep: SecretKey event
-    pub recipient_event_id: [u8; 32],   // dep: invite or peer_shared event of recipient
-    pub wrapped_key: [u8; 32],          // key bytes wrapped for recipient
-    pub signed_by: [u8; 32],            // signer event_id (PeerShared event — sender)
-    pub signer_type: u8,                // 5 = peer_shared
+    pub key_event_id: [u8; 32],       // dep: SecretKey event
+    pub recipient_event_id: [u8; 32], // dep: invite or peer_shared event of recipient
+    pub wrapped_key: [u8; 32],        // key bytes wrapped for recipient
+    pub signed_by: [u8; 32],          // signer event_id (PeerShared event — sender)
+    pub signer_type: u8,              // 5 = peer_shared
     pub signature: [u8; 64],
 }
 
@@ -23,13 +23,22 @@ pub struct SecretSharedEvent {
 /// [138..202]   signature (64 bytes)
 pub fn parse_secret_shared(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if blob.len() < 202 {
-        return Err(EventError::TooShort { expected: 202, actual: blob.len() });
+        return Err(EventError::TooShort {
+            expected: 202,
+            actual: blob.len(),
+        });
     }
     if blob.len() > 202 {
-        return Err(EventError::TrailingData { expected: 202, actual: blob.len() });
+        return Err(EventError::TrailingData {
+            expected: 202,
+            actual: blob.len(),
+        });
     }
     if blob[0] != EVENT_TYPE_SECRET_SHARED {
-        return Err(EventError::WrongType { expected: EVENT_TYPE_SECRET_SHARED, actual: blob[0] });
+        return Err(EventError::WrongType {
+            expected: EVENT_TYPE_SECRET_SHARED,
+            actual: blob[0],
+        });
     }
 
     let created_at_ms = u64::from_le_bytes(blob[1..9].try_into().unwrap());

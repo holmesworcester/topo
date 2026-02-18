@@ -10,7 +10,7 @@ mod inner {
     use std::net::{IpAddr, SocketAddr};
 
     use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
-    use tracing::{info, debug};
+    use tracing::{debug, info};
 
     const SERVICE_TYPE: &str = "_topo._udp.local.";
 
@@ -113,7 +113,8 @@ mod inner {
 
                             // Extract address: prefer non-loopback, non-link-local
                             let addrs: Vec<&IpAddr> = info.get_addresses().iter().collect();
-                            let best_ip = addrs.iter()
+                            let best_ip = addrs
+                                .iter()
                                 .find(|ip| !ip.is_loopback() && !is_link_local(ip))
                                 .or_else(|| addrs.iter().find(|ip| !ip.is_loopback()))
                                 .or(addrs.first());
@@ -175,7 +176,6 @@ mod inner {
         let addr = socket.local_addr().ok()?;
         Some(addr.ip().to_string())
     }
-
 }
 
 #[cfg(feature = "discovery")]

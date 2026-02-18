@@ -1,22 +1,30 @@
 use rusqlite::Connection;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::crypto::{hash_event, event_id_to_base64, EventId};
-use crate::db::store::{insert_event, insert_neg_item_if_shared, insert_recorded_event, lookup_workspace_id};
-use crate::events::{self, ParsedEvent, registry};
+use super::decision::ProjectionDecision;
+use super::pipeline::project_one;
+use crate::crypto::{event_id_to_base64, hash_event, EventId};
+use crate::db::store::{
+    insert_event, insert_neg_item_if_shared, insert_recorded_event, lookup_workspace_id,
+};
 use crate::events::EncryptedEvent;
+use crate::events::{self, registry, ParsedEvent};
 use crate::projection::encrypted::encrypt_event_blob;
 use crate::projection::signer::sign_event_bytes;
 use ed25519_dalek::SigningKey;
-use super::decision::ProjectionDecision;
-use super::pipeline::project_one;
 
 #[derive(Debug)]
 pub enum CreateEventError {
     EncodeError(String),
     DbError(String),
-    Blocked { event_id: EventId, missing: Vec<[u8; 32]> },
-    Rejected { event_id: EventId, reason: String },
+    Blocked {
+        event_id: EventId,
+        missing: Vec<[u8; 32]>,
+    },
+    Rejected {
+        event_id: EventId,
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for CreateEventError {
@@ -25,10 +33,20 @@ impl std::fmt::Display for CreateEventError {
             CreateEventError::EncodeError(e) => write!(f, "encode error: {}", e),
             CreateEventError::DbError(e) => write!(f, "db error: {}", e),
             CreateEventError::Blocked { event_id, missing } => {
-                write!(f, "event {} blocked on {} deps", event_id_to_base64(event_id), missing.len())
+                write!(
+                    f,
+                    "event {} blocked on {} deps",
+                    event_id_to_base64(event_id),
+                    missing.len()
+                )
             }
             CreateEventError::Rejected { event_id, reason } => {
-                write!(f, "event {} rejected: {}", event_id_to_base64(event_id), reason)
+                write!(
+                    f,
+                    "event {} rejected: {}",
+                    event_id_to_base64(event_id),
+                    reason
+                )
             }
         }
     }
@@ -38,7 +56,9 @@ impl std::error::Error for CreateEventError {}
 
 /// Extract event_id from Ok or Blocked (event is stored in both cases).
 /// Returns Err only for true failures (encode, db, rejected).
-fn event_id_or_blocked(result: Result<EventId, CreateEventError>) -> Result<EventId, CreateEventError> {
+fn event_id_or_blocked(
+    result: Result<EventId, CreateEventError>,
+) -> Result<EventId, CreateEventError> {
     match result {
         Ok(eid) => Ok(eid),
         Err(CreateEventError::Blocked { event_id, .. }) => Ok(event_id),
@@ -84,8 +104,7 @@ fn store_blob_and_project(
         .map_err(|e| CreateEventError::DbError(e.to_string()))?;
 
     match decision {
-        ProjectionDecision::Valid
-        | ProjectionDecision::AlreadyProcessed => Ok(event_id),
+        ProjectionDecision::Valid | ProjectionDecision::AlreadyProcessed => Ok(event_id),
         ProjectionDecision::Block { missing } => {
             Err(CreateEventError::Blocked { event_id, missing })
         }
@@ -102,12 +121,13 @@ pub fn create_event_sync(
     recorded_by: &str,
     event: &ParsedEvent,
 ) -> Result<EventId, CreateEventError> {
-    let blob = events::encode_event(event)
-        .map_err(|e| CreateEventError::EncodeError(e.to_string()))?;
+    let blob =
+        events::encode_event(event).map_err(|e| CreateEventError::EncodeError(e.to_string()))?;
 
     let type_code = event.event_type_code();
     let reg = registry();
-    let meta = reg.lookup(type_code)
+    let meta = reg
+        .lookup(type_code)
         .ok_or_else(|| CreateEventError::EncodeError(format!("unknown type code {}", type_code)))?;
 
     let created_at_ms = event.created_at_ms() as i64;
@@ -122,12 +142,13 @@ pub fn create_signed_event_sync(
     event: &ParsedEvent,
     signing_key: &ed25519_dalek::SigningKey,
 ) -> Result<EventId, CreateEventError> {
-    let mut blob = events::encode_event(event)
-        .map_err(|e| CreateEventError::EncodeError(e.to_string()))?;
+    let mut blob =
+        events::encode_event(event).map_err(|e| CreateEventError::EncodeError(e.to_string()))?;
 
     let type_code = event.event_type_code();
     let reg = registry();
-    let meta = reg.lookup(type_code)
+    let meta = reg
+        .lookup(type_code)
         .ok_or_else(|| CreateEventError::EncodeError(format!("unknown type code {}", type_code)))?;
 
     if meta.signature_byte_len == 0 {
@@ -165,7 +186,8 @@ pub fn create_encrypted_event_sync(
 
     // 2. Sign inner blob if signing_key provided
     if let Some(key) = signing_key {
-        let meta = events::registry().lookup(inner_event.event_type_code())
+        let meta = events::registry()
+            .lookup(inner_event.event_type_code())
             .ok_or_else(|| CreateEventError::EncodeError("unknown event type".to_string()))?;
         let sig_len = meta.signature_byte_len;
         if sig_len > 0 {
@@ -177,16 +199,19 @@ pub fn create_encrypted_event_sync(
 
     // 3. Resolve encryption key from secret_keys table
     let key_b64 = event_id_to_base64(key_event_id);
-    let key_bytes: Vec<u8> = conn.query_row(
-        "SELECT key_bytes FROM secret_keys WHERE recorded_by = ?1 AND event_id = ?2",
-        rusqlite::params![recorded_by, &key_b64],
-        |row| row.get(0),
-    ).map_err(|e| CreateEventError::DbError(format!("key lookup: {}", e)))?;
+    let key_bytes: Vec<u8> = conn
+        .query_row(
+            "SELECT key_bytes FROM secret_keys WHERE recorded_by = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &key_b64],
+            |row| row.get(0),
+        )
+        .map_err(|e| CreateEventError::DbError(format!("key lookup: {}", e)))?;
 
     if key_bytes.len() != 32 {
-        return Err(CreateEventError::EncodeError(
-            format!("secret key wrong length: {}", key_bytes.len()),
-        ));
+        return Err(CreateEventError::EncodeError(format!(
+            "secret key wrong length: {}",
+            key_bytes.len()
+        )));
     }
     let mut key_arr = [0u8; 32];
     key_arr.copy_from_slice(&key_bytes);
@@ -236,7 +261,12 @@ pub fn create_signed_event_staged(
     event: &ParsedEvent,
     signing_key: &ed25519_dalek::SigningKey,
 ) -> Result<EventId, CreateEventError> {
-    event_id_or_blocked(create_signed_event_sync(conn, recorded_by, event, signing_key))
+    event_id_or_blocked(create_signed_event_sync(
+        conn,
+        recorded_by,
+        event,
+        signing_key,
+    ))
 }
 
 #[cfg(test)]
@@ -244,15 +274,17 @@ mod tests {
     use super::*;
     use crate::db::{open_in_memory, schema::create_tables};
     use crate::events::{
-        MessageEvent, ReactionEvent, SignedMemoEvent,
-        WorkspaceEvent, InviteAcceptedEvent, UserInviteBootEvent,
-        UserBootEvent, DeviceInviteFirstEvent, PeerSharedFirstEvent,
+        DeviceInviteFirstEvent, InviteAcceptedEvent, MessageEvent, PeerSharedFirstEvent,
+        ReactionEvent, SignedMemoEvent, UserBootEvent, UserInviteBootEvent, WorkspaceEvent,
     };
     use crate::projection::signer::sign_event_bytes;
     use ed25519_dalek::SigningKey;
 
     fn now_ms() -> u64 {
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
     }
 
     fn setup() -> Connection {
@@ -339,7 +371,8 @@ mod tests {
             signer_type: 3,
             signature: [0u8; 64],
         });
-        let psf_eid = create_signed_event_sync(conn, recorded_by, &psf, &device_invite_key).unwrap();
+        let psf_eid =
+            create_signed_event_sync(conn, recorded_by, &psf, &device_invite_key).unwrap();
 
         (psf_eid, peer_shared_key)
     }
@@ -366,24 +399,33 @@ mod tests {
         let eid_b64 = event_id_to_base64(&eid);
 
         // events table
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM events WHERE event_id = ?1",
-            rusqlite::params![&eid_b64], |row| row.get(0),
-        ).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE event_id = ?1",
+                rusqlite::params![&eid_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 1);
 
         // messages table
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM messages WHERE message_id = ?1 AND recorded_by = ?2",
-            rusqlite::params![&eid_b64, recorded_by], |row| row.get(0),
-        ).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE message_id = ?1 AND recorded_by = ?2",
+                rusqlite::params![&eid_b64, recorded_by],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 1);
 
         // valid_events
-        let valid: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, &eid_b64], |row| row.get(0),
-        ).unwrap();
+        let valid: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, &eid_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert!(valid);
     }
 
@@ -421,10 +463,13 @@ mod tests {
         let msg_b64 = event_id_to_base64(&msg_eid);
         let rxn_b64 = event_id_to_base64(&rxn_eid);
         for b64 in [&msg_b64, &rxn_b64] {
-            let valid: bool = conn.query_row(
-                "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-                rusqlite::params![recorded_by, b64], |row| row.get(0),
-            ).unwrap();
+            let valid: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+                    rusqlite::params![recorded_by, b64],
+                    |row| row.get(0),
+                )
+                .unwrap();
             assert!(valid);
         }
     }
@@ -458,23 +503,32 @@ mod tests {
         let eid_b64 = event_id_to_base64(&eid);
 
         // Should be in events table but NOT in valid_events
-        let in_events: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM events WHERE event_id = ?1",
-            rusqlite::params![&eid_b64], |row| row.get(0),
-        ).unwrap();
+        let in_events: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM events WHERE event_id = ?1",
+                rusqlite::params![&eid_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert!(in_events);
 
-        let in_valid: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, &eid_b64], |row| row.get(0),
-        ).unwrap();
+        let in_valid: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, &eid_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert!(!in_valid);
 
         // Should be in blocked_event_deps
-        let blocked: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM blocked_event_deps WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, &eid_b64], |row| row.get(0),
-        ).unwrap();
+        let blocked: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM blocked_event_deps WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, &eid_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(blocked, 1);
     }
 
@@ -498,17 +552,23 @@ mod tests {
         let memo_b64 = event_id_to_base64(&memo_eid);
 
         // Should be valid
-        let valid: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, &memo_b64], |row| row.get(0),
-        ).unwrap();
+        let valid: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, &memo_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert!(valid);
 
         // Should be in signed_memos table
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM signed_memos WHERE event_id = ?1 AND recorded_by = ?2",
-            rusqlite::params![&memo_b64, recorded_by], |row| row.get(0),
-        ).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM signed_memos WHERE event_id = ?1 AND recorded_by = ?2",
+                rusqlite::params![&memo_b64, recorded_by],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 1);
     }
 
@@ -539,10 +599,13 @@ mod tests {
                 assert_eq!(missing[0], fake_target);
                 // Event is stored even though blocked
                 let eid_b64 = event_id_to_base64(&event_id);
-                let in_events: bool = conn.query_row(
-                    "SELECT COUNT(*) > 0 FROM events WHERE event_id = ?1",
-                    rusqlite::params![&eid_b64], |row| row.get(0),
-                ).unwrap();
+                let in_events: bool = conn
+                    .query_row(
+                        "SELECT COUNT(*) > 0 FROM events WHERE event_id = ?1",
+                        rusqlite::params![&eid_b64],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
                 assert!(in_events, "event should be stored even when blocked");
             }
             Ok(_) => panic!("expected Blocked error, got Ok"),
@@ -573,17 +636,23 @@ mod tests {
             .expect("staged API should return Ok even for blocked events");
 
         let eid_b64 = event_id_to_base64(&eid);
-        let in_events: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM events WHERE event_id = ?1",
-            rusqlite::params![&eid_b64], |row| row.get(0),
-        ).unwrap();
+        let in_events: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM events WHERE event_id = ?1",
+                rusqlite::params![&eid_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert!(in_events, "event should be stored");
 
         // Should NOT be in valid_events (blocked)
-        let in_valid: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, &eid_b64], |row| row.get(0),
-        ).unwrap();
+        let in_valid: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, &eid_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert!(!in_valid, "blocked event should not be in valid_events");
     }
 
@@ -606,15 +675,25 @@ mod tests {
             signature: [0u8; 64],
         });
         let result = create_signed_event_sync(&conn, recorded_by, &msg, &signing_key);
-        assert!(result.is_ok(), "PLAN §6.4: valid event must return Ok, got: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "PLAN §6.4: valid event must return Ok, got: {:?}",
+            result
+        );
 
         let eid = result.unwrap();
         let eid_b64 = event_id_to_base64(&eid);
-        let in_valid: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, &eid_b64], |row| row.get(0),
-        ).unwrap();
-        assert!(in_valid, "PLAN §6.4: Ok result implies event is in valid_events");
+        let in_valid: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, &eid_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            in_valid,
+            "PLAN §6.4: Ok result implies event is in valid_events"
+        );
     }
 
     /// PLAN §6.4 contract: `create_event_sync` returns Err(Blocked) with event_id
@@ -641,12 +720,21 @@ mod tests {
             Err(CreateEventError::Blocked { event_id, missing }) => {
                 // Error must contain the event_id so callers can reference it
                 let eid_b64 = event_id_to_base64(&event_id);
-                let stored: bool = conn.query_row(
-                    "SELECT COUNT(*) > 0 FROM events WHERE event_id = ?1",
-                    rusqlite::params![&eid_b64], |row| row.get(0),
-                ).unwrap();
-                assert!(stored, "PLAN §6.4: blocked event_id must reference a stored event");
-                assert!(!missing.is_empty(), "PLAN §6.4: Blocked error must list missing deps");
+                let stored: bool = conn
+                    .query_row(
+                        "SELECT COUNT(*) > 0 FROM events WHERE event_id = ?1",
+                        rusqlite::params![&eid_b64],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert!(
+                    stored,
+                    "PLAN §6.4: blocked event_id must reference a stored event"
+                );
+                assert!(
+                    !missing.is_empty(),
+                    "PLAN §6.4: Blocked error must list missing deps"
+                );
                 assert_eq!(missing[0], fake_target);
             }
             Ok(_) => panic!("PLAN §6.4: blocked event must NOT return Ok"),

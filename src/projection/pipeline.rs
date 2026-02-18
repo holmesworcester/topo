@@ -1,5 +1,3 @@
-use std::time::{SystemTime, UNIX_EPOCH};
-use rusqlite::Connection;
 use super::decision::ProjectionDecision;
 use super::encrypted::project_encrypted;
 use super::projectors::{
@@ -9,6 +7,8 @@ use super::projectors::{
 use super::signer::{resolve_signer_key, verify_ed25519_signature, SignerResolution};
 use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
 use crate::events::{self, registry, ParsedEvent};
+use rusqlite::Connection;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Check that each dep's type code matches the allowed types for that dep field.
 /// Returns Some(reason) if a type mismatch is found, None if all pass.
@@ -46,7 +46,12 @@ pub(crate) fn check_dep_types(
 }
 
 /// Record a rejected event durably so it is not re-processed on replay or cascade.
-pub(crate) fn record_rejection(conn: &Connection, recorded_by: &str, event_id_b64: &str, reason: &str) {
+pub(crate) fn record_rejection(
+    conn: &Connection,
+    recorded_by: &str,
+    event_id_b64: &str,
+    reason: &str,
+) {
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -410,7 +415,8 @@ fn cascade_unblocked_inner(
     initial_parsed: Option<&ParsedEvent>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Track guard cascade triggers across the entire cascade
-    let mut invite_accepted_projected = matches!(initial_parsed, Some(ParsedEvent::InviteAccepted(_)));
+    let mut invite_accepted_projected =
+        matches!(initial_parsed, Some(ParsedEvent::InviteAccepted(_)));
     let mut attachment_file_ids: Vec<String> = Vec::new();
     if let Some(ParsedEvent::MessageAttachment(att)) = initial_parsed {
         attachment_file_ids.push(event_id_to_base64(&att.file_id));
@@ -447,15 +453,16 @@ fn cascade_unblocked_inner(
             conn.prepare_cached(
                 "UPDATE blocked_events SET deps_remaining = deps_remaining - 1
                  WHERE peer_id = ?1 AND event_id = ?2 AND deps_remaining > 0",
-            )?.execute(rusqlite::params![recorded_by, eid_b64])?;
+            )?
+            .execute(rusqlite::params![recorded_by, eid_b64])?;
 
-            let remaining: i64 = match conn.prepare_cached(
-                "SELECT deps_remaining FROM blocked_events
+            let remaining: i64 = match conn
+                .prepare_cached(
+                    "SELECT deps_remaining FROM blocked_events
                  WHERE peer_id = ?1 AND event_id = ?2",
-            )?.query_row(
-                rusqlite::params![recorded_by, eid_b64],
-                |row| row.get(0),
-            ) {
+                )?
+                .query_row(rusqlite::params![recorded_by, eid_b64], |row| row.get(0))
+            {
                 Ok(v) => v,
                 Err(rusqlite::Error::QueryReturnedNoRows) => continue, // already processed
                 Err(e) => return Err(e.into()),
@@ -467,9 +474,8 @@ fn cascade_unblocked_inner(
 
             // 3. Ready — clean up header row
             did_unblock = true;
-            conn.prepare_cached(
-                "DELETE FROM blocked_events WHERE peer_id = ?1 AND event_id = ?2",
-            )?.execute(rusqlite::params![recorded_by, eid_b64])?;
+            conn.prepare_cached("DELETE FROM blocked_events WHERE peer_id = ?1 AND event_id = ?2")?
+                .execute(rusqlite::params![recorded_by, eid_b64])?;
 
             // 4. Project this event via project_one_step (no recursive cascade)
             if let Some(event_id) = event_id_from_base64(eid_b64) {
@@ -512,11 +518,13 @@ fn cascade_unblocked_inner(
         conn.prepare_cached(
             "DELETE FROM blocked_event_deps WHERE peer_id = ?1
              AND event_id IN (SELECT event_id FROM valid_events WHERE peer_id = ?1)",
-        )?.execute(rusqlite::params![recorded_by])?;
+        )?
+        .execute(rusqlite::params![recorded_by])?;
         conn.prepare_cached(
             "DELETE FROM blocked_event_deps WHERE peer_id = ?1
              AND event_id IN (SELECT event_id FROM rejected_events WHERE peer_id = ?1)",
-        )?.execute(rusqlite::params![recorded_by])?;
+        )?
+        .execute(rusqlite::params![recorded_by])?;
     }
 
     // --- Phase 2: Guard retries (AFTER bulk cleanup so queries work correctly) ---
@@ -592,11 +600,13 @@ fn cascade_unblocked_inner(
         conn.prepare_cached(
             "DELETE FROM blocked_event_deps WHERE peer_id = ?1
              AND event_id IN (SELECT event_id FROM valid_events WHERE peer_id = ?1)",
-        )?.execute(rusqlite::params![recorded_by])?;
+        )?
+        .execute(rusqlite::params![recorded_by])?;
         conn.prepare_cached(
             "DELETE FROM blocked_event_deps WHERE peer_id = ?1
              AND event_id IN (SELECT event_id FROM rejected_events WHERE peer_id = ?1)",
-        )?.execute(rusqlite::params![recorded_by])?;
+        )?
+        .execute(rusqlite::params![recorded_by])?;
     }
 
     Ok(())
@@ -1240,7 +1250,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(deps_remaining, 1, "deps_remaining should be unique blocker count");
+        assert_eq!(
+            deps_remaining, 1,
+            "deps_remaining should be unique blocker count"
+        );
 
         // Now project E_root — cascade should unblock E_dup
         let result = project_one(&conn, recorded_by, &root_eid).unwrap();
@@ -1253,7 +1266,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(valid, "event with duplicate deps should be unblocked after blocker resolves");
+        assert!(
+            valid,
+            "event with duplicate deps should be unblocked after blocker resolves"
+        );
 
         // No stuck blocked_events rows
         let stuck: i64 = conn
@@ -1367,7 +1383,11 @@ mod tests {
         let result = project_one(&conn, recorded_by, &eid).unwrap();
         match result {
             ProjectionDecision::Reject { reason } => {
-                assert!(reason.contains("unknown event type: 3"), "reason: {}", reason);
+                assert!(
+                    reason.contains("unknown event type: 3"),
+                    "reason: {}",
+                    reason
+                );
             }
             other => panic!("expected Reject, got {:?}", other),
         }
@@ -1559,7 +1579,8 @@ mod tests {
         conn.execute(
             "INSERT OR IGNORE INTO valid_events (peer_id, event_id) VALUES (?1, ?2)",
             rusqlite::params![tenant_b, &net_b64],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Create identity chain for tenant_a, then replicate identity events for tenant_b
         let (signer_eid, signing_key) = make_identity_chain(&conn, tenant_a);
@@ -2067,8 +2088,10 @@ mod tests {
                 // In fixed-size world, type mismatch manifests as parse error:
                 // the 234-byte ciphertext decrypts but can't parse as type 1 (1194 bytes)
                 assert!(
-                    reason.contains("inner type mismatch") || reason.contains("inner event parse error"),
-                    "reason: {}", reason
+                    reason.contains("inner type mismatch")
+                        || reason.contains("inner event parse error"),
+                    "reason: {}",
+                    reason
                 );
             }
             other => panic!("expected Reject, got {:?}", other),
@@ -2097,7 +2120,9 @@ mod tests {
 
         // Manually build an outer encrypted blob with inner_type_code=5
         let (nonce, raw_ct, auth_tag) = encrypt_event_blob(&key_bytes, &inner_enc_blob).unwrap();
-        let total = fixed_layout::ENCRYPTED_HEADER_BYTES + raw_ct.len() + fixed_layout::ENCRYPTED_AUTH_TAG_BYTES;
+        let total = fixed_layout::ENCRYPTED_HEADER_BYTES
+            + raw_ct.len()
+            + fixed_layout::ENCRYPTED_AUTH_TAG_BYTES;
         let mut buf = vec![0u8; total];
         buf[0] = EVENT_TYPE_ENCRYPTED;
         buf[1..9].copy_from_slice(&now_ms().to_le_bytes());
@@ -2319,8 +2344,7 @@ mod tests {
         let conn = setup();
         let recorded_by = "peer1";
         let _ws = setup_workspace_event(&conn, recorded_by);
-        let (signer_eid, signing_key, key_bytes, sk_eid) =
-            setup_encryption_ctx(&conn, recorded_by);
+        let (signer_eid, signing_key, key_bytes, sk_eid) = setup_encryption_ctx(&conn, recorded_by);
 
         // Direct message
         let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "direct hello");
@@ -2347,7 +2371,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(direct_count, 1, "direct message should be in messages table");
+        assert_eq!(
+            direct_count, 1,
+            "direct message should be in messages table"
+        );
 
         let enc_count: i64 = conn
             .query_row(
@@ -2356,7 +2383,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(enc_count, 1, "encrypted message should be in messages table with outer event_id");
+        assert_eq!(
+            enc_count, 1,
+            "encrypted message should be in messages table with outer event_id"
+        );
 
         // Both in valid_events
         let direct_valid: bool = conn
@@ -2387,8 +2417,7 @@ mod tests {
         let conn = setup();
         let recorded_by = "peer1";
         let _ws = setup_workspace_event(&conn, recorded_by);
-        let (signer_eid, signing_key, key_bytes, sk_eid) =
-            setup_encryption_ctx(&conn, recorded_by);
+        let (signer_eid, signing_key, key_bytes, sk_eid) = setup_encryption_ctx(&conn, recorded_by);
 
         // Create a target message
         let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "reaction target");
@@ -2422,7 +2451,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(direct_count, 1, "direct reaction should be in reactions table");
+        assert_eq!(
+            direct_count, 1,
+            "direct reaction should be in reactions table"
+        );
 
         let enc_count: i64 = conn
             .query_row(
@@ -2431,7 +2463,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(enc_count, 1, "encrypted reaction should be in reactions table with outer event_id");
+        assert_eq!(
+            enc_count, 1,
+            "encrypted reaction should be in reactions table with outer event_id"
+        );
     }
 
     // --- Message deletion parity ---
@@ -2443,17 +2478,16 @@ mod tests {
         let conn = setup();
         let recorded_by = "peer1";
         let _ws = setup_workspace_event(&conn, recorded_by);
-        let (signer_eid, signing_key, key_bytes, sk_eid) =
-            setup_encryption_ctx(&conn, recorded_by);
+        let (signer_eid, signing_key, key_bytes, sk_eid) = setup_encryption_ctx(&conn, recorded_by);
 
         // Create and project a message (will be deleted by encrypted deletion)
-        let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "to be deleted via encrypted");
+        let (_msg, msg_blob) =
+            make_message_signed(&signing_key, &signer_eid, "to be deleted via encrypted");
         let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
         project_one(&conn, recorded_by, &msg_eid).unwrap();
 
         // Create deletion event (author_id = [2;32] matches message author)
-        let (_del, del_blob) =
-            make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [2u8; 32]);
+        let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [2u8; 32]);
 
         // Encrypt the deletion
         let (_enc, enc_blob) =
@@ -2502,8 +2536,7 @@ mod tests {
         let conn = setup();
         let recorded_by = "peer1";
         let _ws = setup_workspace_event(&conn, recorded_by);
-        let (signer_eid, signing_key, key_bytes, sk_eid) =
-            setup_encryption_ctx(&conn, recorded_by);
+        let (signer_eid, signing_key, key_bytes, sk_eid) = setup_encryption_ctx(&conn, recorded_by);
 
         // Create deletion targeting a non-existent message
         let fake_target = [77u8; 32];
@@ -2516,7 +2549,10 @@ mod tests {
 
         match result {
             ProjectionDecision::Block { missing } => {
-                assert!(missing.contains(&fake_target), "should block on missing target");
+                assert!(
+                    missing.contains(&fake_target),
+                    "should block on missing target"
+                );
             }
             other => panic!("expected Block, got {:?}", other),
         }
@@ -2530,7 +2566,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(blocked, "blocked_events row should use outer encrypted event_id");
+        assert!(
+            blocked,
+            "blocked_events row should use outer encrypted event_id"
+        );
 
         let dep_count: i64 = conn
             .query_row(
@@ -2539,7 +2578,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(dep_count > 0, "blocked_event_deps should use outer encrypted event_id");
+        assert!(
+            dep_count > 0,
+            "blocked_event_deps should use outer encrypted event_id"
+        );
     }
 
     // --- File slice parity ---
@@ -2551,16 +2593,20 @@ mod tests {
         let conn = setup();
         let recorded_by = "peer1";
         let _ws = setup_workspace_event(&conn, recorded_by);
-        let (signer_eid, signing_key, key_bytes, sk_eid) =
-            setup_encryption_ctx(&conn, recorded_by);
+        let (signer_eid, signing_key, key_bytes, sk_eid) = setup_encryption_ctx(&conn, recorded_by);
 
         // Create descriptor (required for file_slice projection)
         let file_id = [99u8; 32];
         setup_descriptor_for_file(&conn, recorded_by, &signing_key, &signer_eid, file_id);
 
         // Create and encrypt file_slice
-        let (_fs, fs_blob) =
-            make_file_slice(&signing_key, &signer_eid, file_id, 0, b"encrypted slice data");
+        let (_fs, fs_blob) = make_file_slice(
+            &signing_key,
+            &signer_eid,
+            file_id,
+            0,
+            b"encrypted slice data",
+        );
         let (_enc, enc_blob) =
             make_encrypted_event(&key_bytes, &fs_blob, EVENT_TYPE_FILE_SLICE, &sk_eid);
         let enc_eid = insert_event_raw(&conn, recorded_by, &enc_blob);
@@ -2576,7 +2622,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 1, "encrypted file_slice should be in file_slices with outer event_id");
+        assert_eq!(
+            count, 1,
+            "encrypted file_slice should be in file_slices with outer event_id"
+        );
 
         // Outer event should be in valid_events
         let enc_valid: bool = conn
@@ -2596,8 +2645,7 @@ mod tests {
         let conn = setup();
         let recorded_by = "peer1";
         let _ws = setup_workspace_event(&conn, recorded_by);
-        let (signer_eid, signing_key, key_bytes, sk_eid) =
-            setup_encryption_ctx(&conn, recorded_by);
+        let (signer_eid, signing_key, key_bytes, sk_eid) = setup_encryption_ctx(&conn, recorded_by);
 
         // No descriptor — file_slice should guard-block
         let file_id = [88u8; 32];
@@ -2624,7 +2672,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(!enc_valid, "encrypted file_slice should not be valid without descriptor");
+        assert!(
+            !enc_valid,
+            "encrypted file_slice should not be valid without descriptor"
+        );
     }
 
     // --- Inner signer failure parity ---
@@ -2689,7 +2740,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(blocked, "block should be anchored to outer encrypted event_id");
+        assert!(
+            blocked,
+            "block should be anchored to outer encrypted event_id"
+        );
     }
 
     #[test]
@@ -2726,7 +2780,8 @@ mod tests {
         match result {
             ProjectionDecision::Reject { reason } => {
                 assert!(
-                    reason.contains("invalid signature") || reason.contains("inner event invalid signature"),
+                    reason.contains("invalid signature")
+                        || reason.contains("inner event invalid signature"),
                     "expected signature rejection, got: {}",
                     reason
                 );
@@ -2743,7 +2798,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(rejected, "rejection should be recorded for outer encrypted event_id");
+        assert!(
+            rejected,
+            "rejection should be recorded for outer encrypted event_id"
+        );
     }
 
     // --- Identity-inside-encrypted rejection ---
@@ -2783,7 +2841,10 @@ mod tests {
                     reason
                 );
             }
-            other => panic!("expected Reject for identity inside encrypted, got {:?}", other),
+            other => panic!(
+                "expected Reject for identity inside encrypted, got {:?}",
+                other
+            ),
         }
     }
 
@@ -3200,7 +3261,8 @@ mod tests {
         conn.execute(
             "INSERT OR IGNORE INTO valid_events (peer_id, event_id) VALUES (?1, ?2)",
             rusqlite::params![recorded_by, &net_b64],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Project in reverse order: del first (blocks), then rxn (blocks), then msg (unblocks all)
         project_one(&conn, recorded_by, &del_eid).unwrap();
@@ -3301,7 +3363,8 @@ mod tests {
         conn.execute(
             "INSERT OR IGNORE INTO valid_events (peer_id, event_id) VALUES (?1, ?2)",
             rusqlite::params![tenant_b, &net_b64],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Use a SecretKey event (unsigned, no signer_required) for the cross-tenant
         // emit test. This avoids needing to set up identity chains for emit_deterministic_event.
@@ -4148,8 +4211,13 @@ mod tests {
         setup_descriptor_for_file(&conn, recorded_by, &signer_key_a, &signer_a_eid, file_id);
 
         // Create file_slice signed by signer B (different from descriptor's signer A)
-        let (_fs, fs_blob) =
-            make_file_slice(&signer_key_b, &signer_b_eid, file_id, 0, b"unauthorized data");
+        let (_fs, fs_blob) = make_file_slice(
+            &signer_key_b,
+            &signer_b_eid,
+            file_id,
+            0,
+            b"unauthorized data",
+        );
         let fs_eid = insert_event_raw(&conn, recorded_by, &fs_blob);
         let result = project_one(&conn, recorded_by, &fs_eid).unwrap();
         assert!(
@@ -4211,7 +4279,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(still_blocked, "bench should still be blocked after only one dep resolves");
+        assert!(
+            still_blocked,
+            "bench should still be blocked after only one dep resolves"
+        );
 
         // Project dep B — now bench should cascade to valid
         project_one(&conn, recorded_by, &sk_b_eid).unwrap();
@@ -4222,7 +4293,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(bench_valid, "bench should be valid after both deps resolve via cascade");
+        assert!(
+            bench_valid,
+            "bench should be valid after both deps resolve via cascade"
+        );
     }
 
     #[test]
@@ -4238,7 +4312,8 @@ mod tests {
         let msg_eid = insert_event_raw(&conn_direct, recorded_by, &msg_blob);
         project_one(&conn_direct, recorded_by, &msg_eid).unwrap();
 
-        let (_rxn, rxn_blob) = make_reaction_signed(&signing_key, &signer_eid, &msg_eid, "thumbs_up");
+        let (_rxn, rxn_blob) =
+            make_reaction_signed(&signing_key, &signer_eid, &msg_eid, "thumbs_up");
         let rxn_eid = insert_event_raw(&conn_direct, recorded_by, &rxn_blob);
         project_one(&conn_direct, recorded_by, &rxn_eid).unwrap();
 
@@ -4250,7 +4325,8 @@ mod tests {
         let msg_eid_c = insert_event_raw(&conn_cascade, recorded_by, &msg_blob_c);
         // DON'T project message yet
 
-        let (_rxn_c, rxn_blob_c) = make_reaction_signed(&signing_key_c, &signer_eid_c, &msg_eid_c, "thumbs_up");
+        let (_rxn_c, rxn_blob_c) =
+            make_reaction_signed(&signing_key_c, &signer_eid_c, &msg_eid_c, "thumbs_up");
         let rxn_eid_c = insert_event_raw(&conn_cascade, recorded_by, &rxn_blob_c);
         // Reaction should block (message not valid yet)
         let r = project_one(&conn_cascade, recorded_by, &rxn_eid_c).unwrap();
@@ -4279,7 +4355,10 @@ mod tests {
             .unwrap();
 
         assert!(rxn_valid_direct, "reaction should be valid via direct path");
-        assert!(rxn_valid_cascade, "reaction should be valid via cascade path");
+        assert!(
+            rxn_valid_cascade,
+            "reaction should be valid via cascade path"
+        );
     }
 
     #[test]
@@ -4318,7 +4397,8 @@ mod tests {
         sign_blob(&signing_key, &mut inner_blob);
 
         // Wrap in encrypted envelope
-        let (_enc, enc_blob) = make_encrypted_event(&key_bytes, &inner_blob, EVENT_TYPE_REACTION, &sk_eid);
+        let (_enc, enc_blob) =
+            make_encrypted_event(&key_bytes, &inner_blob, EVENT_TYPE_REACTION, &sk_eid);
         let enc_eid = insert_event_raw(&conn, recorded_by, &enc_blob);
 
         // Project encrypted event — should block on missing key_event_id dep
@@ -4396,7 +4476,11 @@ mod tests {
         let ia_blob = events::encode_event(&ia_event).unwrap();
         let ia_eid = insert_event_raw(&conn, recorded_by, &ia_blob);
         let r2 = project_one(&conn, recorded_by, &ia_eid).unwrap();
-        assert_eq!(r2, ProjectionDecision::Valid, "invite_accepted should project Valid");
+        assert_eq!(
+            r2,
+            ProjectionDecision::Valid,
+            "invite_accepted should project Valid"
+        );
 
         // Workspace should now be valid via guard retry cascade
         let ws_b64 = event_id_to_base64(&ws_eid);
@@ -4407,7 +4491,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(ws_valid, "workspace should be valid after invite_accepted guard retry");
+        assert!(
+            ws_valid,
+            "workspace should be valid after invite_accepted guard retry"
+        );
     }
 
     #[test]
@@ -4495,7 +4582,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(att_valid, "attachment should be valid after message cascade");
+        assert!(
+            att_valid,
+            "attachment should be valid after message cascade"
+        );
 
         // File slice should be valid (guard retry triggered by attachment cascade)
         let fs_valid: bool = conn
@@ -4505,7 +4595,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(fs_valid, "file_slice should be valid after cascaded guard retry");
+        assert!(
+            fs_valid,
+            "file_slice should be valid after cascaded guard retry"
+        );
     }
 
     // =========================================================================
@@ -4548,7 +4641,6 @@ mod tests {
         )
         .unwrap()
     }
-
 
     /// Count message rows for a tenant.
     fn count_messages(conn: &Connection, recorded_by: &str) -> i64 {
@@ -4593,8 +4685,7 @@ mod tests {
         let msg_eid_a = insert_event_raw(&conn_a, recorded_by, &msg_blob_a);
         project_one(&conn_a, recorded_by, &msg_eid_a).unwrap();
 
-        let (_rxn_a, rxn_blob_a) =
-            make_reaction_signed(&key_a, &signer_a, &msg_eid_a, "thumbs_up");
+        let (_rxn_a, rxn_blob_a) = make_reaction_signed(&key_a, &signer_a, &msg_eid_a, "thumbs_up");
         let rxn_eid_a = insert_event_raw(&conn_a, recorded_by, &rxn_blob_a);
         project_one(&conn_a, recorded_by, &rxn_eid_a).unwrap();
 
@@ -4604,8 +4695,7 @@ mod tests {
         let (_msg_b, msg_blob_b) = make_message_signed(&key_b, &signer_b, "iso msg");
         let msg_eid_b = insert_event_raw(&conn_b, recorded_by, &msg_blob_b);
 
-        let (_rxn_b, rxn_blob_b) =
-            make_reaction_signed(&key_b, &signer_b, &msg_eid_b, "thumbs_up");
+        let (_rxn_b, rxn_blob_b) = make_reaction_signed(&key_b, &signer_b, &msg_eid_b, "thumbs_up");
         let _rxn_eid_b = insert_event_raw(&conn_b, recorded_by, &rxn_blob_b);
         let r = project_one(&conn_b, recorded_by, &_rxn_eid_b).unwrap();
         assert!(matches!(r, ProjectionDecision::Block { .. }));
@@ -4709,8 +4799,7 @@ mod tests {
         let msg_eid_a = insert_event_raw(&conn_a, recorded_by, &msg_blob_a);
         project_one(&conn_a, recorded_by, &msg_eid_a).unwrap();
 
-        let (_del_a, del_blob_a) =
-            make_deletion_signed(&key_a, &signer_a, &msg_eid_a, [2u8; 32]);
+        let (_del_a, del_blob_a) = make_deletion_signed(&key_a, &signer_a, &msg_eid_a, [2u8; 32]);
         let del_eid_a = insert_event_raw(&conn_a, recorded_by, &del_blob_a);
         project_one(&conn_a, recorded_by, &del_eid_a).unwrap();
 
@@ -4720,8 +4809,7 @@ mod tests {
         let (_msg_b, msg_blob_b) = make_message_signed(&key_b, &signer_b, "to delete");
         let msg_eid_b = insert_event_raw(&conn_b, recorded_by, &msg_blob_b);
 
-        let (_del_b, del_blob_b) =
-            make_deletion_signed(&key_b, &signer_b, &msg_eid_b, [2u8; 32]);
+        let (_del_b, del_blob_b) = make_deletion_signed(&key_b, &signer_b, &msg_eid_b, [2u8; 32]);
         let del_eid_b = insert_event_raw(&conn_b, recorded_by, &del_blob_b);
         let r = project_one(&conn_b, recorded_by, &del_eid_b).unwrap();
         assert!(matches!(r, ProjectionDecision::Block { .. }));
@@ -4766,13 +4854,11 @@ mod tests {
         let msg_eid_a = insert_event_raw(&conn_a, recorded_by, &msg_blob_a);
         project_one(&conn_a, recorded_by, &msg_eid_a).unwrap();
 
-        let (_rxn_a, rxn_blob_a) =
-            make_reaction_signed(&key_a, &signer_a, &msg_eid_a, "star");
+        let (_rxn_a, rxn_blob_a) = make_reaction_signed(&key_a, &signer_a, &msg_eid_a, "star");
         let rxn_eid_a = insert_event_raw(&conn_a, recorded_by, &rxn_blob_a);
         project_one(&conn_a, recorded_by, &rxn_eid_a).unwrap();
 
-        let (_del_a, del_blob_a) =
-            make_deletion_signed(&key_a, &signer_a, &msg_eid_a, [2u8; 32]);
+        let (_del_a, del_blob_a) = make_deletion_signed(&key_a, &signer_a, &msg_eid_a, [2u8; 32]);
         let del_eid_a = insert_event_raw(&conn_a, recorded_by, &del_blob_a);
         project_one(&conn_a, recorded_by, &del_eid_a).unwrap();
 
@@ -4789,12 +4875,10 @@ mod tests {
         let (_msg_b, msg_blob_b) = make_message_signed(&key_b, &signer_b, "rev msg");
         let msg_eid_b = insert_event_raw(&conn_b, recorded_by, &msg_blob_b);
 
-        let (_rxn_b, rxn_blob_b) =
-            make_reaction_signed(&key_b, &signer_b, &msg_eid_b, "star");
+        let (_rxn_b, rxn_blob_b) = make_reaction_signed(&key_b, &signer_b, &msg_eid_b, "star");
         let rxn_eid_b = insert_event_raw(&conn_b, recorded_by, &rxn_blob_b);
 
-        let (_del_b, del_blob_b) =
-            make_deletion_signed(&key_b, &signer_b, &msg_eid_b, [2u8; 32]);
+        let (_del_b, del_blob_b) = make_deletion_signed(&key_b, &signer_b, &msg_eid_b, [2u8; 32]);
         let del_eid_b = insert_event_raw(&conn_b, recorded_by, &del_blob_b);
 
         // Project in reverse: deletion, reaction, message, then identity chain in reverse
@@ -4842,13 +4926,11 @@ mod tests {
         let msg_eid_a = insert_event_raw(&conn_a, recorded_by, &msg_blob_a);
         project_one(&conn_a, recorded_by, &msg_eid_a).unwrap();
 
-        let (_rxn_a, rxn_blob_a) =
-            make_reaction_signed(&key_a, &signer_a, &msg_eid_a, "fire");
+        let (_rxn_a, rxn_blob_a) = make_reaction_signed(&key_a, &signer_a, &msg_eid_a, "fire");
         let rxn_eid_a = insert_event_raw(&conn_a, recorded_by, &rxn_blob_a);
         project_one(&conn_a, recorded_by, &rxn_eid_a).unwrap();
 
-        let (_del_a, del_blob_a) =
-            make_deletion_signed(&key_a, &signer_a, &msg_eid_a, [2u8; 32]);
+        let (_del_a, del_blob_a) = make_deletion_signed(&key_a, &signer_a, &msg_eid_a, [2u8; 32]);
         let del_eid_a = insert_event_raw(&conn_a, recorded_by, &del_blob_a);
         project_one(&conn_a, recorded_by, &del_eid_a).unwrap();
 
@@ -4859,12 +4941,10 @@ mod tests {
         let (_msg_b, msg_blob_b) = make_message_signed(&key_b, &signer_b, "deep msg");
         let msg_eid_b = insert_event_raw(&conn_b, recorded_by, &msg_blob_b);
 
-        let (_rxn_b, rxn_blob_b) =
-            make_reaction_signed(&key_b, &signer_b, &msg_eid_b, "fire");
+        let (_rxn_b, rxn_blob_b) = make_reaction_signed(&key_b, &signer_b, &msg_eid_b, "fire");
         let _rxn_eid_b = insert_event_raw(&conn_b, recorded_by, &rxn_blob_b);
 
-        let (_del_b, del_blob_b) =
-            make_deletion_signed(&key_b, &signer_b, &msg_eid_b, [2u8; 32]);
+        let (_del_b, del_blob_b) = make_deletion_signed(&key_b, &signer_b, &msg_eid_b, [2u8; 32]);
         let _del_eid_b = insert_event_raw(&conn_b, recorded_by, &del_blob_b);
 
         // Project reaction and deletion first (both block on message)
@@ -4916,8 +4996,7 @@ mod tests {
         project_one(&conn_a, recorded_by, &sk_eid_a).unwrap();
 
         // Message (target for inner reaction)
-        let (_msg_a, msg_blob_a) =
-            make_message_signed(&signing_key_a, &signer_a, "enc rxn target");
+        let (_msg_a, msg_blob_a) = make_message_signed(&signing_key_a, &signer_a, "enc rxn target");
         let msg_eid_a = insert_event_raw(&conn_a, recorded_by, &msg_blob_a);
         project_one(&conn_a, recorded_by, &msg_eid_a).unwrap();
 
@@ -4938,8 +5017,7 @@ mod tests {
         let (_sk_b, sk_blob_b) = make_secret_key(key_bytes);
         let sk_eid_b = insert_event_raw(&conn_b, recorded_by, &sk_blob_b);
 
-        let (_msg_b, msg_blob_b) =
-            make_message_signed(&signing_key_b, &signer_b, "enc rxn target");
+        let (_msg_b, msg_blob_b) = make_message_signed(&signing_key_b, &signer_b, "enc rxn target");
         let msg_eid_b = insert_event_raw(&conn_b, recorded_by, &msg_blob_b);
 
         let (_rxn_b, rxn_blob_b) =

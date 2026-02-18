@@ -5,8 +5,8 @@ use super::{EventError, ParsedEvent, EVENT_TYPE_USER_BOOT, EVENT_TYPE_USER_ONGOI
 pub struct UserBootEvent {
     pub created_at_ms: u64,
     pub public_key: [u8; 32],
-    pub signed_by: [u8; 32],     // signer event_id (UserInviteBoot event)
-    pub signer_type: u8,         // 2 = user_invite
+    pub signed_by: [u8; 32], // signer event_id (UserInviteBoot event)
+    pub signer_type: u8,     // 2 = user_invite
     pub signature: [u8; 64],
 }
 
@@ -14,8 +14,8 @@ pub struct UserBootEvent {
 pub struct UserOngoingEvent {
     pub created_at_ms: u64,
     pub public_key: [u8; 32],
-    pub signed_by: [u8; 32],     // signer event_id (UserInviteOngoing event)
-    pub signer_type: u8,         // 2 = user_invite
+    pub signed_by: [u8; 32], // signer event_id (UserInviteOngoing event)
+    pub signer_type: u8,     // 2 = user_invite
     pub signature: [u8; 64],
 }
 
@@ -28,13 +28,22 @@ pub struct UserOngoingEvent {
 /// [74..138]  signature (64 bytes)
 pub fn parse_user_boot(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if blob.len() < 138 {
-        return Err(EventError::TooShort { expected: 138, actual: blob.len() });
+        return Err(EventError::TooShort {
+            expected: 138,
+            actual: blob.len(),
+        });
     }
     if blob.len() > 138 {
-        return Err(EventError::TrailingData { expected: 138, actual: blob.len() });
+        return Err(EventError::TrailingData {
+            expected: 138,
+            actual: blob.len(),
+        });
     }
     if blob[0] != EVENT_TYPE_USER_BOOT {
-        return Err(EventError::WrongType { expected: EVENT_TYPE_USER_BOOT, actual: blob[0] });
+        return Err(EventError::WrongType {
+            expected: EVENT_TYPE_USER_BOOT,
+            actual: blob[0],
+        });
     }
 
     let created_at_ms = u64::from_le_bytes(blob[1..9].try_into().unwrap());
@@ -79,13 +88,22 @@ pub fn encode_user_boot(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
 /// [74..138]  signature (64 bytes)
 pub fn parse_user_ongoing(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if blob.len() < 138 {
-        return Err(EventError::TooShort { expected: 138, actual: blob.len() });
+        return Err(EventError::TooShort {
+            expected: 138,
+            actual: blob.len(),
+        });
     }
     if blob.len() > 138 {
-        return Err(EventError::TrailingData { expected: 138, actual: blob.len() });
+        return Err(EventError::TrailingData {
+            expected: 138,
+            actual: blob.len(),
+        });
     }
     if blob[0] != EVENT_TYPE_USER_ONGOING {
-        return Err(EventError::WrongType { expected: EVENT_TYPE_USER_ONGOING, actual: blob[0] });
+        return Err(EventError::WrongType {
+            expected: EVENT_TYPE_USER_ONGOING,
+            actual: blob[0],
+        });
     }
 
     let created_at_ms = u64::from_le_bytes(blob[1..9].try_into().unwrap());

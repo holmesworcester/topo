@@ -223,7 +223,10 @@ fn test_daemon_cli_invite_lifecycle_works_without_restart() {
 
     // Both peers already have local identities so daemons can start immediately.
     let alice_bootstrap = run_topo(&["send", "alice-bootstrap", "--db", &alice_db]);
-    assert!(alice_bootstrap.status.success(), "alice bootstrap send failed");
+    assert!(
+        alice_bootstrap.status.success(),
+        "alice bootstrap send failed"
+    );
     let bob_bootstrap = run_topo(&["send", "bob-bootstrap", "--db", &bob_db]);
     assert!(bob_bootstrap.status.success(), "bob bootstrap send failed");
 
@@ -234,10 +237,7 @@ fn test_daemon_cli_invite_lifecycle_works_without_restart() {
     let _bob = Daemon::start(&bob_db, bob_port);
 
     // Create/accept invite entirely via unified CLI while Bob is already running.
-    let invite_link = topo_create_invite(
-        &alice_db,
-        &format!("127.0.0.1:{}", alice_port),
-    );
+    let invite_link = topo_create_invite(&alice_db, &format!("127.0.0.1:{}", alice_port));
     topo_accept_invite(&bob_db, &invite_link);
 
     // If runtime autodial refresh works, Bob reaches Alice without daemon restart.

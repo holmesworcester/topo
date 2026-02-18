@@ -4,8 +4,8 @@ use super::{EventError, ParsedEvent, EVENT_TYPE_INVITE_ACCEPTED};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InviteAcceptedEvent {
     pub created_at_ms: u64,
-    pub invite_event_id: [u8; 32],  // the invite event being accepted
-    pub workspace_id: [u8; 32],       // workspace being joined
+    pub invite_event_id: [u8; 32], // the invite event being accepted
+    pub workspace_id: [u8; 32],    // workspace being joined
 }
 
 /// Wire format (73 bytes fixed):
