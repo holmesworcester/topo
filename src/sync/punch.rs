@@ -4,17 +4,23 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use crate::contracts::network_contract::{
+    PeerFingerprint, SessionDirection, SessionHandler, SessionMeta, TenantId, TrustDecision,
+    TrustOracle,
+};
 use crate::db::{
-    open_connection,
     health::record_endpoint_observation,
     intro::{insert_intro_attempt, intro_already_seen, update_intro_status},
-    transport_trust::is_peer_allowed,
+    open_connection,
 };
-use crate::sync::{SyncMessage, parse_sync_message};
-use crate::sync::engine::run_sync_initiator_dual;
-use crate::transport::{DualConnection, peer_identity_from_connection};
+use crate::sync::session_handler::{next_session_id, LegacySyncSessionHandler};
+use crate::sync::{parse_sync_message, SyncMessage};
+use crate::transport::{
+    peer_identity_from_connection, DualConnection, SqliteTrustOracle, SyncSessionIo,
+};
 
 const ENDPOINT_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 
@@ -37,7 +43,10 @@ fn intro_offer_addr(
 ) -> Result<SocketAddr, Box<dyn std::error::Error + Send + Sync>> {
     let ip = match origin_family {
         4 => IpAddr::V4(Ipv4Addr::new(
-            origin_ip[12], origin_ip[13], origin_ip[14], origin_ip[15],
+            origin_ip[12],
+            origin_ip[13],
+            origin_ip[14],
+            origin_ip[15],
         )),
         6 => IpAddr::V6(Ipv6Addr::from(*origin_ip)),
         _ => return Err(format!("unknown origin_family: {}", origin_family).into()),
@@ -74,26 +83,62 @@ pub async fn handle_intro_offer(
 
     // Validate expiry
     if now_ms > expires_at_ms as i64 {
-        info!("IntroOffer expired (now={}, expires={}), dropping", now_ms, expires_at_ms);
+        info!(
+            "IntroOffer expired (now={}, expires={}), dropping",
+            now_ms, expires_at_ms
+        );
         let _ = try_record_intro(
-            db_path, recorded_by, &intro_id, introduced_by, &other_peer_hex,
-            &origin_ip, origin_family, origin_port, observed_at_ms as i64,
-            expires_at_ms as i64, now_ms, "expired", None,
+            db_path,
+            recorded_by,
+            &intro_id,
+            introduced_by,
+            &other_peer_hex,
+            &origin_ip,
+            origin_family,
+            origin_port,
+            observed_at_ms as i64,
+            expires_at_ms as i64,
+            now_ms,
+            "expired",
+            None,
         );
         return;
     }
 
     // Validate trust from SQL only. No DB = no trust authority.
-    let trusted = match open_connection(db_path) {
-        Ok(db) => is_peer_allowed(&db, recorded_by, &other_peer_id).unwrap_or(false),
-        Err(_) => false,
+    let trusted = match SqliteTrustOracle::new(db_path)
+        .check(
+            &TenantId(recorded_by.to_string()),
+            &PeerFingerprint(other_peer_id),
+        )
+        .await
+    {
+        Ok(TrustDecision::Allow) => true,
+        Ok(TrustDecision::Deny) => false,
+        Err(e) => {
+            warn!("IntroOffer trust check failed: {}", e);
+            false
+        }
     };
     if !trusted {
-        info!("IntroOffer for untrusted peer {}, rejecting", &other_peer_hex[..16]);
+        info!(
+            "IntroOffer for untrusted peer {}, rejecting",
+            &other_peer_hex[..16]
+        );
         let _ = try_record_intro(
-            db_path, recorded_by, &intro_id, introduced_by, &other_peer_hex,
-            &origin_ip, origin_family, origin_port, observed_at_ms as i64,
-            expires_at_ms as i64, now_ms, "rejected", Some("untrusted peer"),
+            db_path,
+            recorded_by,
+            &intro_id,
+            introduced_by,
+            &other_peer_hex,
+            &origin_ip,
+            origin_family,
+            origin_port,
+            observed_at_ms as i64,
+            expires_at_ms as i64,
+            now_ms,
+            "rejected",
+            Some("untrusted peer"),
         );
         return;
     }
@@ -101,7 +146,10 @@ pub async fn handle_intro_offer(
     // Dedupe
     if let Ok(db) = open_connection(db_path) {
         if intro_already_seen(&db, recorded_by, &intro_id).unwrap_or(false) {
-            info!("IntroOffer {} already seen, skipping", hex::encode(&intro_id[..8]));
+            info!(
+                "IntroOffer {} already seen, skipping",
+                hex::encode(&intro_id[..8])
+            );
             return;
         }
     }
@@ -117,16 +165,30 @@ pub async fn handle_intro_offer(
 
     // Record as received
     let _ = try_record_intro(
-        db_path, recorded_by, &intro_id, introduced_by, &other_peer_hex,
-        &origin_ip, origin_family, origin_port, observed_at_ms as i64,
-        expires_at_ms as i64, now_ms, "received", None,
+        db_path,
+        recorded_by,
+        &intro_id,
+        introduced_by,
+        &other_peer_hex,
+        &origin_ip,
+        origin_family,
+        origin_port,
+        observed_at_ms as i64,
+        expires_at_ms as i64,
+        now_ms,
+        "received",
+        None,
     );
 
     // Transition to dialing
     update_status(db_path, recorded_by, &intro_id, "dialing", None);
 
-    info!("Attempting hole punch to {} at {} (local_addr={:?})",
-        &other_peer_hex[..16], addr, endpoint.local_addr());
+    info!(
+        "Attempting hole punch to {} at {} (local_addr={:?})",
+        &other_peer_hex[..16],
+        addr,
+        endpoint.local_addr()
+    );
 
     // Paced dial attempts within the attempt window
     let window = Duration::from_millis(attempt_window_ms as u64);
@@ -155,14 +217,23 @@ pub async fn handle_intro_offer(
                         if actual_peer.as_deref() != Some(&other_peer_hex) {
                             warn!(
                                 "Punch connected but wrong peer: expected {}, got {:?}",
-                                &other_peer_hex[..16], actual_peer.as_ref().map(|s| &s[..16])
+                                &other_peer_hex[..16],
+                                actual_peer.as_ref().map(|s| &s[..16])
                             );
-                            update_status(db_path, recorded_by, &intro_id, "failed",
-                                Some("wrong peer identity"));
+                            update_status(
+                                db_path,
+                                recorded_by,
+                                &intro_id,
+                                "failed",
+                                Some("wrong peer identity"),
+                            );
                             return;
                         }
 
-                        info!("Hole punch succeeded! Direct connection to {}", &other_peer_hex[..16]);
+                        info!(
+                            "Hole punch succeeded! Direct connection to {}",
+                            &other_peer_hex[..16]
+                        );
                         update_status(db_path, recorded_by, &intro_id, "connected", None);
 
                         // Preserve endpoint observations for peers reached via punched links.
@@ -187,8 +258,12 @@ pub async fn handle_intro_offer(
 
                         // Run normal sync on the direct connection
                         run_sync_on_punched_connection(
-                            connection, db_path, recorded_by, &other_peer_hex,
-                        ).await;
+                            connection,
+                            db_path,
+                            recorded_by,
+                            &other_peer_hex,
+                        )
+                        .await;
                         return;
                     }
                     Ok(Err(e)) => {
@@ -237,19 +312,47 @@ async fn run_sync_on_punched_connection(
     let mut conn = DualConnection::new(ctrl_send, ctrl_recv, data_send, data_recv);
 
     // Send markers (same as connect_loop)
-    let _ = conn.control.send(&SyncMessage::HaveList { ids: vec![] }).await;
-    let _ = conn.data_send.send(&SyncMessage::HaveList { ids: vec![] }).await;
+    let _ = conn
+        .control
+        .send(&SyncMessage::HaveList { ids: vec![] })
+        .await;
+    let _ = conn
+        .data_send
+        .send(&SyncMessage::HaveList { ids: vec![] })
+        .await;
     let _ = conn.flush_control().await;
     let _ = conn.flush_data().await;
 
-    match run_sync_initiator_dual(conn, db_path, 60, peer_id, recorded_by, None, None).await {
-        Ok(stats) => {
-            info!("Punched sync complete: sent={}, recv={}, rounds={}",
-                stats.events_sent, stats.events_received, stats.neg_rounds);
+    let peer_fp = match hex::decode(peer_id) {
+        Ok(bytes) if bytes.len() == 32 => {
+            let mut fp = [0u8; 32];
+            fp.copy_from_slice(&bytes);
+            fp
         }
-        Err(e) => {
-            warn!("Punched sync error: {}", e);
+        _ => {
+            warn!("Punched sync error: invalid peer id {}", peer_id);
+            return;
         }
+    };
+
+    let session_id = next_session_id();
+    let meta = SessionMeta {
+        session_id,
+        tenant: TenantId(recorded_by.to_string()),
+        peer: PeerFingerprint(peer_fp),
+        remote_addr: connection.remote_address(),
+        direction: SessionDirection::Outbound,
+    };
+    let handler = LegacySyncSessionHandler::initiator(db_path.to_string(), 60);
+    let io = SyncSessionIo::new(session_id, conn);
+
+    if let Err(e) = handler
+        .on_session(meta, Box::new(io), CancellationToken::new())
+        .await
+    {
+        warn!("Punched sync error: {}", e);
+    } else {
+        info!("Punched sync complete");
     }
 }
 
@@ -289,8 +392,11 @@ pub fn spawn_intro_listener(
                     expires_at_ms,
                     attempt_window_ms,
                 }) => {
-                    info!("Received IntroOffer from {} for peer {}",
-                        &introduced_by[..16], hex::encode(&other_peer_id[..8]));
+                    info!(
+                        "Received IntroOffer from {} for peer {}",
+                        &introduced_by[..16],
+                        hex::encode(&other_peer_id[..8])
+                    );
 
                     let db_path = db_path.clone();
                     let recorded_by = recorded_by.clone();
@@ -303,11 +409,21 @@ pub fn spawn_intro_listener(
                     // so endpoint.connect_with() can properly send/receive UDP.
                     tokio::task::spawn_local(async move {
                         handle_intro_offer(
-                            &db_path, &recorded_by, &introduced_by, endpoint,
-                            intro_id, other_peer_id, origin_family,
-                            origin_ip, origin_port, observed_at_ms, expires_at_ms,
-                            attempt_window_ms, cfg,
-                        ).await;
+                            &db_path,
+                            &recorded_by,
+                            &introduced_by,
+                            endpoint,
+                            intro_id,
+                            other_peer_id,
+                            origin_family,
+                            origin_ip,
+                            origin_port,
+                            observed_at_ms,
+                            expires_at_ms,
+                            attempt_window_ms,
+                            cfg,
+                        )
+                        .await;
                     });
                 }
                 Ok(_) => {
@@ -343,8 +459,16 @@ fn try_record_intro(
 
     if let Ok(db) = open_connection(db_path) {
         let _ = insert_intro_attempt(
-            &db, recorded_by, intro_id, introduced_by, other_peer_hex,
-            &ip_str, origin_port, observed_at_ms, expires_at_ms, now_ms,
+            &db,
+            recorded_by,
+            intro_id,
+            introduced_by,
+            other_peer_hex,
+            &ip_str,
+            origin_port,
+            observed_at_ms,
+            expires_at_ms,
+            now_ms,
         );
         if status != "received" {
             let _ = update_intro_status(&db, recorded_by, intro_id, status, error, now_ms);
@@ -352,7 +476,13 @@ fn try_record_intro(
     }
 }
 
-fn update_status(db_path: &str, recorded_by: &str, intro_id: &[u8; 16], status: &str, error: Option<&str>) {
+fn update_status(
+    db_path: &str,
+    recorded_by: &str,
+    intro_id: &[u8; 16],
+    status: &str,
+    error: Option<&str>,
+) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -369,7 +499,10 @@ mod tests {
     #[test]
     fn test_intro_offer_addr_v4() {
         let mut ip = [0u8; 16];
-        ip[12] = 192; ip[13] = 168; ip[14] = 1; ip[15] = 100;
+        ip[12] = 192;
+        ip[13] = 168;
+        ip[14] = 1;
+        ip[15] = 100;
         let addr = intro_offer_addr(4, &ip, 12345).unwrap();
         assert_eq!(addr, "192.168.1.100:12345".parse::<SocketAddr>().unwrap());
     }

@@ -9,17 +9,38 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use ed25519_dalek::SigningKey;
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 
+use crate::contracts::network_contract::{
+    PeerFingerprint, SessionDirection, SessionHandler, SessionMeta, TenantId,
+};
 use crate::db::{open_connection, schema::create_tables};
-use crate::sync::engine::run_sync_initiator_dual;
+use crate::sync::session_handler::{next_session_id, LegacySyncSessionHandler};
 use crate::sync::SyncMessage;
 use crate::transport::{
-    create_dual_endpoint, AllowedPeers, DualConnection, peer_identity_from_connection,
+    create_dual_endpoint, peer_identity_from_connection, AllowedPeers, DualConnection,
+    SyncSessionIo,
 };
 use crate::transport_identity::{
-    load_transport_cert_required_from_db, expected_invite_bootstrap_spki_from_invite_key,
+    expected_invite_bootstrap_spki_from_invite_key, load_transport_cert_required_from_db,
 };
+
+fn peer_fingerprint_from_hex(
+    peer_id: &str,
+) -> Result<[u8; 32], Box<dyn std::error::Error + Send + Sync>> {
+    let bytes = hex::decode(peer_id)?;
+    if bytes.len() != 32 {
+        return Err(format!(
+            "peer_id must be 32-byte hex fingerprint, got {}",
+            bytes.len()
+        )
+        .into());
+    }
+    let mut fp = [0u8; 32];
+    fp.copy_from_slice(&bytes);
+    Ok(fp)
+}
 
 /// Run a one-shot bootstrap sync from an invite link's bootstrap address.
 ///
@@ -47,12 +68,7 @@ pub async fn bootstrap_sync_from_invite(
 
     // Pin only the bootstrap peer's SPKI for this one-shot connection
     let allowed = Arc::new(AllowedPeers::from_fingerprints(vec![*bootstrap_spki]));
-    let endpoint = create_dual_endpoint(
-        "0.0.0.0:0".parse().unwrap(),
-        cert,
-        key,
-        allowed,
-    )?;
+    let endpoint = create_dual_endpoint("0.0.0.0:0".parse().unwrap(), cert, key, allowed)?;
 
     info!(
         "Bootstrap sync: connecting to {} (spki {}...)",
@@ -63,7 +79,12 @@ pub async fn bootstrap_sync_from_invite(
     let connection = endpoint
         .connect(bootstrap_addr, "localhost")?
         .await
-        .map_err(|e| format!("Bootstrap sync: failed to connect to {}: {}", bootstrap_addr, e))?;
+        .map_err(|e| {
+            format!(
+                "Bootstrap sync: failed to connect to {}: {}",
+                bootstrap_addr, e
+            )
+        })?;
 
     let peer_id = peer_identity_from_connection(&connection)
         .ok_or("Bootstrap sync: could not extract peer identity")?;
@@ -83,27 +104,32 @@ pub async fn bootstrap_sync_from_invite(
     let mut conn = DualConnection::new(ctrl_send, ctrl_recv, data_send, data_recv);
 
     // Send markers to materialize lazy QUIC streams on the receiver
-    conn.control.send(&SyncMessage::HaveList { ids: vec![] }).await?;
-    conn.data_send.send(&SyncMessage::HaveList { ids: vec![] }).await?;
+    conn.control
+        .send(&SyncMessage::HaveList { ids: vec![] })
+        .await?;
+    conn.data_send
+        .send(&SyncMessage::HaveList { ids: vec![] })
+        .await?;
     conn.flush_control().await?;
     conn.flush_data().await?;
 
-    // Run one sync session
-    let stats = run_sync_initiator_dual(
-        conn,
-        db_path,
-        timeout_secs,
-        &peer_id,
-        recorded_by,
-        None, // no coordinator
-        None, // no shared ingest (uses internal batch_writer)
-    )
-    .await?;
+    let peer_fp = peer_fingerprint_from_hex(&peer_id)?;
+    let session_id = next_session_id();
+    let meta = SessionMeta {
+        session_id,
+        tenant: TenantId(recorded_by.to_string()),
+        peer: PeerFingerprint(peer_fp),
+        remote_addr: connection.remote_address(),
+        direction: SessionDirection::Outbound,
+    };
+    let handler = LegacySyncSessionHandler::initiator(db_path.to_string(), timeout_secs);
+    let io = SyncSessionIo::new(session_id, conn);
+    handler
+        .on_session(meta, Box::new(io), CancellationToken::new())
+        .await
+        .map_err(|e| format!("Bootstrap sync: {}", e))?;
 
-    info!(
-        "Bootstrap sync complete: {} events received, {} sent",
-        stats.events_received, stats.events_sent
-    );
+    info!("Bootstrap sync complete");
 
     // Close endpoint cleanly
     endpoint.close(0u32.into(), b"bootstrap done");
@@ -132,12 +158,7 @@ pub fn start_bootstrap_responder(
     let joiner_spki = expected_invite_bootstrap_spki_from_invite_key(invite_key)?;
     let allowed = Arc::new(AllowedPeers::from_fingerprints(vec![joiner_spki]));
 
-    let endpoint = create_dual_endpoint(
-        "127.0.0.1:0".parse().unwrap(),
-        cert,
-        key,
-        allowed,
-    )?;
+    let endpoint = create_dual_endpoint("127.0.0.1:0".parse().unwrap(), cert, key, allowed)?;
     let local_addr = endpoint.local_addr()?;
 
     let db_path = inviter_db_path.to_string();
@@ -150,6 +171,10 @@ pub fn start_bootstrap_responder(
             .build()
             .expect("failed to create bootstrap responder runtime");
         rt.block_on(async move {
+            let handler = crate::sync::session_handler::LegacySyncSessionHandler::responder(
+                db_path.clone(),
+                30,
+            );
             // Accept up to 2 connections: the initial bootstrap sync and an
             // optional push-back sync where the joiner pushes its identity
             // chain events back after creation.
@@ -165,8 +190,14 @@ pub fn start_bootstrap_responder(
                     None => return,
                 };
 
-                let peer_id = peer_identity_from_connection(&connection)
-                    .unwrap_or_default();
+                let peer_id = peer_identity_from_connection(&connection).unwrap_or_default();
+                let peer_fp = match peer_fingerprint_from_hex(&peer_id) {
+                    Ok(fp) => fp,
+                    Err(e) => {
+                        tracing::warn!("Bootstrap responder: invalid peer_id: {}", e);
+                        continue;
+                    }
+                };
 
                 let (ctrl_send, ctrl_recv) = match connection.accept_bi().await {
                     Ok(s) => s,
@@ -183,12 +214,20 @@ pub fn start_bootstrap_responder(
                     }
                 };
                 let conn = DualConnection::new(ctrl_send, ctrl_recv, data_send, data_recv);
+                let session_id = crate::sync::session_handler::next_session_id();
+                let meta = SessionMeta {
+                    session_id,
+                    tenant: TenantId(recorded_by.clone()),
+                    peer: PeerFingerprint(peer_fp),
+                    remote_addr: connection.remote_address(),
+                    direction: SessionDirection::Inbound,
+                };
+                let io = SyncSessionIo::new(session_id, conn);
 
-                let db_path_ref = &db_path;
-                let recorded_by_ref = &recorded_by;
-                if let Err(e) = crate::sync::engine::run_sync_responder_dual(
-                    conn, db_path_ref, 30, &peer_id, recorded_by_ref, None,
-                ).await {
+                if let Err(e) = handler
+                    .on_session(meta, Box::new(io), CancellationToken::new())
+                    .await
+                {
                     tracing::warn!("Bootstrap responder: sync error: {}", e);
                 }
             }

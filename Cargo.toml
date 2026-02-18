@@ -8,6 +8,7 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 nom = "7.1"
 quinn = "0.11"
 tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 blake2 = "0.10"
 base64 = "0.21"

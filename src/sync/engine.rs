@@ -10,43 +10,41 @@
 // Both sides gate exit on data-plane drain confirmation, not just control.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use negentropy::{Negentropy, Id, Storage};
+use negentropy::{Id, Negentropy, Storage};
 use tokio::sync::{mpsc, oneshot};
-use tracing::{info, warn, error};
+use tokio_util::sync::CancellationToken;
+use tracing::{info, warn};
 
-use crate::crypto::{hash_event, event_id_to_base64, event_id_from_base64, EventId};
+use crate::contracts::network_contract::{
+    PeerFingerprint, SessionDirection, SessionHandler, SessionMeta, TenantId, TrustDecision,
+};
+use crate::crypto::{event_id_from_base64, hash_event, EventId};
+use crate::db::health::{purge_expired_endpoints, record_endpoint_observation};
+use crate::db::removal_watch::is_peer_removed;
+use crate::db::transport_trust::record_transport_binding;
 use crate::db::{
     egress_queue::EgressQueue,
     open_connection,
     project_queue::ProjectQueue,
     schema::create_tables,
-    store::{Store, SQL_INSERT_EVENT, SQL_INSERT_NEG_ITEM, SQL_INSERT_RECORDED_EVENT, lookup_workspace_id},
+    store::{lookup_workspace_id, Store},
     wanted::WantedEvents,
 };
-use crate::db::health::{purge_expired_endpoints, record_endpoint_observation};
-use crate::db::removal_watch::is_peer_removed;
-use crate::db::transport_trust::record_transport_binding;
-use crate::events::{self, registry, ShareScope};
 use crate::projection::pipeline::project_one;
 use crate::runtime::SyncStats;
-use crate::sync::{SyncMessage, neg_id_to_event_id, NegentropyStorageSqlite};
-use crate::transport::{
-    DualConnection,
-    StreamConn,
-    StreamRecv,
-    StreamSend,
-    peer_identity_from_connection,
-};
+use crate::sync::session_handler::{next_session_id, LegacySyncSessionHandler};
+use crate::sync::{neg_id_to_event_id, NegentropyStorageSqlite, SyncMessage};
 use crate::transport::connection::ConnectionError;
+use crate::transport::{
+    peer_identity_from_connection, DualConnection, SqliteTrustOracle, StreamConn, StreamRecv,
+    StreamSend, SyncSessionIo,
+};
 
-/// Ingest channel item: (event_id, blob, recorded_by).
-/// The `recorded_by` field allows a shared batch_writer to route events
-/// to the correct tenant's projection pipeline.
-pub type IngestItem = (EventId, Vec<u8>, String);
+pub use crate::event_runtime::{batch_writer, IngestItem};
 
 fn low_mem_mode() -> bool {
     read_bool_env("LOW_MEM_IOS") || read_bool_env("LOW_MEM")
@@ -64,6 +62,38 @@ fn current_timestamp_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64
+}
+
+fn peer_fingerprint_from_hex(peer_id: &str) -> Option<[u8; 32]> {
+    let peer_fp_bytes = hex::decode(peer_id).ok()?;
+    if peer_fp_bytes.len() != 32 {
+        return None;
+    }
+    let mut fp = [0u8; 32];
+    fp.copy_from_slice(&peer_fp_bytes);
+    Some(fp)
+}
+
+fn spawn_peer_removal_cancellation_watch(
+    db_path: String,
+    recorded_by: String,
+    peer_fp: [u8; 32],
+    cancel: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::task::spawn_local(async move {
+        loop {
+            if cancel.is_cancelled() {
+                break;
+            }
+            if let Ok(db) = open_connection(&db_path) {
+                if is_peer_removed(&db, &recorded_by, &peer_fp).unwrap_or(false) {
+                    cancel.cancel();
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -137,243 +167,28 @@ const COORDINATOR_COLLECTION_POLL: Duration = Duration::from_millis(2);
 
 /// Batch writer drain batch size: 100 normal, 50 in low_mem.
 fn drain_batch_size() -> usize {
-    if low_mem_mode() { 50 } else { 100 }
-}
-
-/// Batch writer write batch cap: 1000 normal, 500 in low_mem.
-fn write_batch_cap() -> usize {
-    if low_mem_mode() { 500 } else { 1000 }
+    if low_mem_mode() {
+        50
+    } else {
+        100
+    }
 }
 
 /// Async channel capacity for per-session ingest (initiator/responder).
 fn session_ingest_cap() -> usize {
-    if low_mem_mode() { 1000 } else { 5000 }
+    if low_mem_mode() {
+        1000
+    } else {
+        5000
+    }
 }
 
 /// Async channel capacity for shared ingest (accept_loop / download_from_sources).
 fn shared_ingest_cap() -> usize {
-    if low_mem_mode() { 1000 } else { 10000 }
-}
-
-/// Batch writer task - drains channel and writes to SQLite in batches.
-/// Writes event blob/neg_items/recorded_events, enqueues into project_queue,
-/// then drains the queue via `project_one` for crash-recoverable projection.
-///
-/// Each item carries its own `recorded_by`, enabling a single writer to serve
-/// multiple tenants sharing one DB.
-pub fn batch_writer(
-    db_path: String,
-    mut rx: mpsc::Receiver<IngestItem>,
-    events_received: Arc<AtomicU64>,
-) {
-    let db = match open_connection(&db_path) {
-        Ok(db) => db,
-        Err(e) => {
-            error!("Writer failed to open db: {}", e);
-            return;
-        }
-    };
-
-    let wanted = WantedEvents::new(&db);
-
-    let mut neg_items_stmt = match db.prepare(SQL_INSERT_NEG_ITEM) {
-        Ok(stmt) => stmt,
-        Err(e) => {
-            error!("Failed to prepare neg_items statement: {}", e);
-            return;
-        }
-    };
-
-    let mut recorded_stmt = match db.prepare(SQL_INSERT_RECORDED_EVENT) {
-        Ok(stmt) => stmt,
-        Err(e) => {
-            error!("Failed to prepare recorded_events statement: {}", e);
-            return;
-        }
-    };
-
-    let mut events_stmt = match db.prepare(SQL_INSERT_EVENT) {
-        Ok(stmt) => stmt,
-        Err(e) => {
-            error!("Failed to prepare events statement: {}", e);
-            return;
-        }
-    };
-
-    let reg = registry();
-    let pq = ProjectQueue::new(&db);
-    // Cache workspace_id per recorded_by to avoid repeated lookups
-    let mut workspace_cache: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-
-    let mut enqueue_stmt = match db.prepare(
-        "INSERT OR IGNORE INTO project_queue (peer_id, event_id, available_at)
-         SELECT ?1, ?2, ?3
-         WHERE NOT EXISTS (SELECT 1 FROM valid_events WHERE peer_id=?1 AND event_id=?2)
-         AND NOT EXISTS (SELECT 1 FROM rejected_events WHERE peer_id=?1 AND event_id=?2)
-         AND NOT EXISTS (SELECT 1 FROM blocked_event_deps WHERE peer_id=?1 AND event_id=?2)"
-    ) {
-        Ok(stmt) => stmt,
-        Err(e) => {
-            error!("Failed to prepare enqueue statement: {}", e);
-            return;
-        }
-    };
-
-    loop {
-        let first = match rx.blocking_recv() {
-            Some(item) => item,
-            None => break,
-        };
-
-        let cap = write_batch_cap();
-        let mut batch = vec![first];
-        while let Ok(item) = rx.try_recv() {
-            batch.push(item);
-            if batch.len() >= cap {
-                break;
-            }
-        }
-
-        // Pre-warm workspace_id cache for all recorded_by values in this batch
-        // BEFORE the transaction — avoids SHARED→EXCLUSIVE lock upgrade inside BEGIN.
-        for (_, _, rb) in &batch {
-            if !workspace_cache.contains_key(rb) {
-                let ws = lookup_workspace_id(&db, rb);
-                if !ws.is_empty() {
-                    workspace_cache.insert(rb.clone(), ws);
-                }
-            }
-        }
-
-        // BEGIN with retry+backoff — do not drain batch on failure
-        let mut begin_ok = false;
-        for attempt in 0..3 {
-            match db.execute("BEGIN IMMEDIATE", []) {
-                Ok(_) => { begin_ok = true; break; }
-                Err(e) => {
-                    warn!("BEGIN failed (attempt {}): {}", attempt + 1, e);
-                    // Ensure no leftover transaction state
-                    let _ = db.execute("ROLLBACK", []);
-                    std::thread::sleep(Duration::from_millis(50 * (1 << attempt)));
-                }
-            }
-        }
-        if !begin_ok {
-            error!("BEGIN failed after retries, preserving {} items for next batch", batch.len());
-            // Items remain in wanted — they will be re-requested on next sync
-            continue;
-        }
-
-        // First pass: write blob storage, neg_items, recorded_events, enqueue for projection
-        let mut event_ids_persisted: Vec<EventId> = Vec::with_capacity(batch.len());
-        // Collect distinct tenants seen in this batch for per-tenant drain
-        let mut tenants_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for (event_id, blob, recorded_by) in &batch {
-            let event_id_b64 = event_id_to_base64(event_id);
-
-            if let Some(created_at_ms) = events::extract_created_at_ms(blob) {
-                if let Some(type_code) = events::extract_event_type(blob) {
-                    if let Some(meta) = reg.lookup(type_code) {
-                        // Only insert into neg_items for shared events (defense-in-depth)
-                        if meta.share_scope == ShareScope::Shared {
-                            // Look up workspace_id; cache only non-empty values
-                            // (empty means trust anchor not yet projected).
-                            let ws_id = if let Some(cached) = workspace_cache.get(recorded_by) {
-                                cached.clone()
-                            } else {
-                                let ws = lookup_workspace_id(&db, recorded_by);
-                                if !ws.is_empty() {
-                                    workspace_cache.insert(recorded_by.clone(), ws.clone());
-                                }
-                                ws
-                            };
-                            if let Err(e) = neg_items_stmt.execute(rusqlite::params![
-                                &ws_id,
-                                created_at_ms as i64,
-                                event_id.as_slice()
-                            ]) {
-                                // Non-fatal: neg_items is a reconciliation cache;
-                                // event will be re-added on next sync session.
-                                warn!("neg_items insert error for {}: {}", event_id_b64, e);
-                            }
-                        }
-
-                        if let Err(e) = events_stmt.execute(rusqlite::params![
-                            &event_id_b64,
-                            meta.type_name,
-                            blob.as_slice(),
-                            meta.share_scope.as_str(),
-                            created_at_ms as i64,
-                            current_timestamp_ms()
-                        ]) {
-                            warn!("events insert error for {}: {}", event_id_b64, e);
-                            continue;
-                        }
-
-                        let recorded_at = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap()
-                            .as_millis() as i64;
-                        if let Err(e) = recorded_stmt.execute(rusqlite::params![
-                            recorded_by,
-                            &event_id_b64,
-                            recorded_at,
-                            "quic_recv"
-                        ]) {
-                            warn!("recorded_events insert error for {}: {}", event_id_b64, e);
-                            continue;
-                        }
-
-                        // Enqueue for durable projection (atomicity boundary 1)
-                        if let Err(e) = enqueue_stmt.execute(rusqlite::params![
-                            recorded_by,
-                            &event_id_b64,
-                            current_timestamp_ms()
-                        ]) {
-                            warn!("project_queue enqueue error for {}: {}", event_id_b64, e);
-                        }
-
-                        tenants_seen.insert(recorded_by.clone());
-                        event_ids_persisted.push(*event_id);
-                    }
-                }
-            }
-        }
-        match db.execute("COMMIT", []) {
-            Ok(_) => {
-                // Remove from wanted only for successfully persisted items
-                for event_id in &event_ids_persisted {
-                    let _ = wanted.remove(event_id);
-                }
-
-                // Second pass: drain project_queue per tenant
-                let batch_sz = drain_batch_size();
-                for rb in &tenants_seen {
-                    if let Err(e) = pq.drain_with_limit(rb, batch_sz, |conn, event_id_b64| {
-                        if let Some(eid) = event_id_from_base64(event_id_b64) {
-                            project_one(conn, rb, &eid)
-                                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-                        }
-                        Ok(())
-                    }) {
-                        warn!("project_queue drain error for {}: {}", rb, e);
-                    }
-                    if let Ok(h) = pq.health(rb) {
-                        if h.pending > 0 || h.max_attempts > 0 {
-                            tracing::debug!(tenant=%rb, pending=%h.pending, max_attempts=%h.max_attempts, oldest_age_ms=%h.oldest_age_ms, "project_queue health");
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                warn!("COMMIT failed, rolling back: {}", e);
-                let _ = db.execute("ROLLBACK", []);
-                // Items remain in wanted — they will be re-requested on next sync
-                continue;
-            }
-        }
-
-        events_received.fetch_add(event_ids_persisted.len() as u64, Ordering::Relaxed);
+    if low_mem_mode() {
+        1000
+    } else {
+        10000
     }
 }
 
@@ -389,7 +204,11 @@ pub fn spawn_data_receiver<R>(
     ingest_tx: mpsc::Sender<IngestItem>,
     bytes_received: Arc<AtomicU64>,
     recorded_by: String,
-) -> (oneshot::Sender<()>, oneshot::Receiver<()>, tokio::task::JoinHandle<()>)
+) -> (
+    oneshot::Sender<()>,
+    oneshot::Receiver<()>,
+    tokio::task::JoinHandle<()>,
+)
 where
     R: StreamRecv + Send + 'static,
 {
@@ -445,7 +264,7 @@ where
 pub struct PeerCoord {
     pub peer_idx: usize,
     pub report_tx: std::sync::mpsc::Sender<Vec<EventId>>,
-    pub assign_rx: std::sync::mpsc::Receiver<Vec<EventId>>,
+    pub assign_rx: std::sync::Mutex<std::sync::mpsc::Receiver<Vec<EventId>>>,
 }
 
 /// Assign events to peers using greedy load balancing.
@@ -477,10 +296,7 @@ fn assign_events(reports: &[(usize, Vec<EventId>)], total_peers: usize) -> Vec<V
 
     for (eid, peers) in events_sorted {
         // Pick peer with minimum load among those that have this event
-        let best = peers.iter()
-            .copied()
-            .min_by_key(|&p| loads[p])
-            .unwrap(); // peers is non-empty by construction
+        let best = peers.iter().copied().min_by_key(|&p| loads[p]).unwrap(); // peers is non-empty by construction
         assignments[best].push(eid);
         loads[best] += 1;
     }
@@ -511,7 +327,9 @@ fn run_coordinator(
         loop {
             let mut all_disconnected = true;
             for (i, rx) in report_rxs.iter().enumerate() {
-                if reports[i].is_some() { continue; }
+                if reports[i].is_some() {
+                    continue;
+                }
                 match rx.try_recv() {
                     Ok(need_ids) => {
                         reports[i] = Some(need_ids);
@@ -525,7 +343,9 @@ fn run_coordinator(
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
                 }
             }
-            if reported_count > 0 || all_disconnected { break; }
+            if reported_count > 0 || all_disconnected {
+                break;
+            }
             std::thread::sleep(COORDINATOR_POLL_INTERVAL);
         }
 
@@ -541,7 +361,9 @@ fn run_coordinator(
         let deadline = Instant::now() + COORDINATOR_COLLECTION_WINDOW;
         while reported_count < total_peers && Instant::now() < deadline {
             for (i, rx) in report_rxs.iter().enumerate() {
-                if reports[i].is_some() { continue; }
+                if reports[i].is_some() {
+                    continue;
+                }
                 match rx.try_recv() {
                     Ok(need_ids) => {
                         reports[i] = Some(need_ids);
@@ -556,7 +378,9 @@ fn run_coordinator(
         }
 
         // Phase 3: Assign events
-        let collected: Vec<(usize, Vec<EventId>)> = reports.iter().enumerate()
+        let collected: Vec<(usize, Vec<EventId>)> = reports
+            .iter()
+            .enumerate()
             .filter_map(|(i, r)| r.as_ref().map(|ids| (i, ids.clone())))
             .collect();
         let assignments = assign_events(&collected, total_peers);
@@ -608,7 +432,10 @@ where
     let start = Instant::now();
     let timeout = Duration::from_secs(timeout_secs);
 
-    info!("Starting negentropy sync (initiator, dual-stream) for {} seconds", timeout_secs);
+    info!(
+        "Starting negentropy sync (initiator, dual-stream) for {} seconds",
+        timeout_secs
+    );
 
     let db = open_connection(db_path)?;
     let neg_db = open_connection(db_path)?;
@@ -621,8 +448,12 @@ where
     let ws_id = lookup_workspace_id(&db, recorded_by);
     let neg_storage = NegentropyStorageSqlite::new(&neg_db, &ws_id);
 
-    neg_db.execute("BEGIN", []).map_err(|e| format!("Failed to begin snapshot: {}", e))?;
-    neg_storage.rebuild_blocks().map_err(|e| format!("Failed to rebuild blocks: {}", e))?;
+    neg_db
+        .execute("BEGIN", [])
+        .map_err(|e| format!("Failed to begin snapshot: {}", e))?;
+    neg_storage
+        .rebuild_blocks()
+        .map_err(|e| format!("Failed to rebuild blocks: {}", e))?;
 
     let mut neg = Negentropy::new(Storage::Borrowed(&neg_storage), NEGENTROPY_FRAME_SIZE)?;
 
@@ -649,11 +480,17 @@ where
     let mut need_ids: Vec<Id> = Vec::new();
     let mut events_sent: u64 = 0;
     let mut bytes_sent: u64 = 0;
-    let (shutdown_tx, data_drained_rx, recv_handle) =
-        spawn_data_receiver(data_recv, ingest_tx.clone(), bytes_received.clone(), recorded_by.to_string());
+    let (shutdown_tx, data_drained_rx, recv_handle) = spawn_data_receiver(
+        data_recv,
+        ingest_tx.clone(),
+        bytes_received.clone(),
+        recorded_by.to_string(),
+    );
 
     let initial_msg = neg.initiate()?;
-    control.send(&SyncMessage::NegOpen { msg: initial_msg }).await?;
+    control
+        .send(&SyncMessage::NegOpen { msg: initial_msg })
+        .await?;
     control.flush().await?;
 
     let mut reconciliation_done = false;
@@ -746,17 +583,28 @@ where
         if let Some(coord) = coordination {
             if reconciliation_done && !coordination_reported {
                 let report = std::mem::take(&mut coordinated_need_ids);
-                info!("Reporting {} need_ids to coordinator (peer {})", report.len(), coord.peer_idx);
+                info!(
+                    "Reporting {} need_ids to coordinator (peer {})",
+                    report.len(),
+                    coord.peer_idx
+                );
                 let _ = coord.report_tx.send(report);
                 coordination_reported = true;
             }
 
             // Poll for assignment (non-blocking so push path continues)
             if coordination_pending && coordination_reported {
-                match coord.assign_rx.try_recv() {
+                let assign_result = match coord.assign_rx.lock() {
+                    Ok(rx) => rx.try_recv(),
+                    Err(_) => Err(std::sync::mpsc::TryRecvError::Disconnected),
+                };
+                match assign_result {
                     Ok(assigned) => {
-                        info!("Received {} assigned events from coordinator (peer {})",
-                            assigned.len(), coord.peer_idx);
+                        info!(
+                            "Received {} assigned events from coordinator (peer {})",
+                            assigned.len(),
+                            coord.peer_idx
+                        );
                         // Send HaveList for assigned events
                         let mut batch: Vec<EventId> = Vec::with_capacity(NEED_CHUNK);
                         for event_id in assigned {
@@ -798,7 +646,9 @@ where
         let mut sent_this_round = 0;
         let mut blocked = false;
         while !blocked {
-            let batch = egress.claim_batch(peer_id, EGRESS_CLAIM_COUNT, EGRESS_CLAIM_LEASE_MS).unwrap_or_default();
+            let batch = egress
+                .claim_batch(peer_id, EGRESS_CLAIM_COUNT, EGRESS_CLAIM_LEASE_MS)
+                .unwrap_or_default();
             if batch.is_empty() {
                 break;
             }
@@ -838,8 +688,11 @@ where
                 control.send(&SyncMessage::Done).await?;
                 control.flush().await?;
                 done_sent = true;
-                info!("Sent DataDone+Done, waiting for DoneAck (sent {}, received {})",
-                    events_sent, events_received.load(Ordering::Relaxed));
+                info!(
+                    "Sent DataDone+Done, waiting for DoneAck (sent {}, received {})",
+                    events_sent,
+                    events_received.load(Ordering::Relaxed)
+                );
             }
         }
     }
@@ -907,7 +760,10 @@ where
     let start = Instant::now();
     let timeout = Duration::from_secs(timeout_secs);
 
-    info!("Starting negentropy sync (responder, dual-stream) for {} seconds", timeout_secs);
+    info!(
+        "Starting negentropy sync (responder, dual-stream) for {} seconds",
+        timeout_secs
+    );
 
     let db = open_connection(db_path)?;
     let neg_db = open_connection(db_path)?;
@@ -918,8 +774,12 @@ where
     let ws_id = lookup_workspace_id(&db, recorded_by);
     let neg_storage = NegentropyStorageSqlite::new(&neg_db, &ws_id);
 
-    neg_db.execute("BEGIN", []).map_err(|e| format!("Failed to begin snapshot: {}", e))?;
-    neg_storage.rebuild_blocks().map_err(|e| format!("Failed to rebuild blocks: {}", e))?;
+    neg_db
+        .execute("BEGIN", [])
+        .map_err(|e| format!("Failed to begin snapshot: {}", e))?;
+    neg_storage
+        .rebuild_blocks()
+        .map_err(|e| format!("Failed to rebuild blocks: {}", e))?;
 
     let mut neg = Negentropy::new(Storage::Borrowed(&neg_storage), NEGENTROPY_FRAME_SIZE)?;
 
@@ -942,8 +802,12 @@ where
         (tx, Some(handle))
     };
 
-    let (shutdown_tx, data_drained_rx, recv_handle) =
-        spawn_data_receiver(data_recv, ingest_tx.clone(), bytes_received.clone(), recorded_by.to_string());
+    let (shutdown_tx, data_drained_rx, recv_handle) = spawn_data_receiver(
+        data_recv,
+        ingest_tx.clone(),
+        bytes_received.clone(),
+        recorded_by.to_string(),
+    );
 
     let mut events_sent: u64 = 0;
     let mut bytes_sent: u64 = 0;
@@ -996,7 +860,9 @@ where
         let mut sent_this_round = 0;
         let mut blocked = false;
         while !blocked {
-            let batch = egress.claim_batch(peer_id, EGRESS_CLAIM_COUNT, EGRESS_CLAIM_LEASE_MS).unwrap_or_default();
+            let batch = egress
+                .claim_batch(peer_id, EGRESS_CLAIM_COUNT, EGRESS_CLAIM_LEASE_MS)
+                .unwrap_or_default();
             if batch.is_empty() {
                 break;
             }
@@ -1047,8 +913,11 @@ where
 
                 control.send(&SyncMessage::DoneAck).await?;
                 control.flush().await?;
-                info!("Sent DoneAck (sent {}, received {})",
-                    events_sent, events_received.load(Ordering::Relaxed));
+                info!(
+                    "Sent DoneAck (sent {}, received {})",
+                    events_sent,
+                    events_received.load(Ordering::Relaxed)
+                );
                 completed = true;
                 break;
             }
@@ -1102,7 +971,15 @@ pub async fn accept_loop(
     });
 
     let tenant_ids = vec![recorded_by.to_string()];
-    accept_loop_with_ingest(db_path, &tenant_ids, endpoint, None, shared_ingest_tx, std::collections::HashMap::new()).await
+    accept_loop_with_ingest(
+        db_path,
+        &tenant_ids,
+        endpoint,
+        None,
+        shared_ingest_tx,
+        std::collections::HashMap::new(),
+    )
+    .await
 }
 
 /// Accept incoming connections using an externally-provided ingest channel.
@@ -1138,15 +1015,21 @@ pub async fn accept_loop_with_ingest(
         let batch_sz = drain_batch_size();
         for tenant_id in tenant_peer_ids {
             let tid = tenant_id.clone();
-            let drained = pq.drain_with_limit(&tid, batch_sz, |conn, event_id_b64| {
-                if let Some(eid) = event_id_from_base64(event_id_b64) {
-                    project_one(conn, &tid, &eid)
-                        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-                }
-                Ok(())
-            }).unwrap_or(0);
+            let drained = pq
+                .drain_with_limit(&tid, batch_sz, |conn, event_id_b64| {
+                    if let Some(eid) = event_id_from_base64(event_id_b64) {
+                        project_one(conn, &tid, &eid)
+                            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                    }
+                    Ok(())
+                })
+                .unwrap_or(0);
             if drained > 0 {
-                info!("Processed {} pending project_queue items for tenant {}", drained, &tenant_id[..16.min(tenant_id.len())]);
+                info!(
+                    "Processed {} pending project_queue items for tenant {}",
+                    drained,
+                    &tenant_id[..16.min(tenant_id.len())]
+                );
             }
         }
     }
@@ -1185,7 +1068,10 @@ pub async fn accept_loop_with_ingest(
             match resolve_tenant_for_peer(db_path, tenant_peer_ids, &peer_id) {
                 Some(rb) => rb,
                 None => {
-                    warn!("Rejected peer {}: no local tenant trusts this fingerprint", &peer_id[..16.min(peer_id.len())]);
+                    warn!(
+                        "Rejected peer {}: no local tenant trusts this fingerprint",
+                        &peer_id[..16.min(peer_id.len())]
+                    );
                     connection.close(1u32.into(), b"no matching tenant");
                     continue;
                 }
@@ -1206,12 +1092,8 @@ pub async fn accept_loop_with_ingest(
                     now,
                     ENDPOINT_TTL_MS,
                 );
-                if let Ok(spki_bytes) = hex::decode(&peer_id) {
-                    if spki_bytes.len() == 32 {
-                        let mut fp = [0u8; 32];
-                        fp.copy_from_slice(&spki_bytes);
-                        let _ = record_transport_binding(&db, &recorded_by, &peer_id, &fp);
-                    }
+                if let Some(fp) = peer_fingerprint_from_hex(&peer_id) {
+                    let _ = record_transport_binding(&db, &recorded_by, &peer_id, &fp);
                 }
                 let purged = purge_expired_endpoints(&db, now).unwrap_or(0);
                 if purged > 0 {
@@ -1245,23 +1127,34 @@ pub async fn accept_loop_with_ingest(
                     intro_client_cfg,
                 );
 
+                let peer_fp = match peer_fingerprint_from_hex(&peer_id) {
+                    Some(fp) => fp,
+                    None => {
+                        warn!(
+                            "Invalid peer fingerprint on accepted connection: {}",
+                            &peer_id[..16.min(peer_id.len())]
+                        );
+                        connection.close(1u32.into(), b"invalid peer fingerprint");
+                        return;
+                    }
+                };
+                let responder_handler = LegacySyncSessionHandler::responder_with_shared_ingest(
+                    db_path_owned.clone(),
+                    SYNC_SESSION_TIMEOUT_SECS,
+                    ingest_clone.clone(),
+                );
+
                 loop {
                     // Check if peer has been removed — deny further sessions
                     // and close the connection.
-                    if let Ok(peer_fp_bytes) = hex::decode(&peer_id) {
-                        if peer_fp_bytes.len() == 32 {
-                            let mut fp = [0u8; 32];
-                            fp.copy_from_slice(&peer_fp_bytes);
-                            if let Ok(db) = open_connection(&db_path_owned) {
-                                if is_peer_removed(&db, &recorded_by_owned, &fp).unwrap_or(false) {
-                                    warn!(
-                                        "Peer {} has been removed — closing connection",
-                                        &peer_id[..16.min(peer_id.len())]
-                                    );
-                                    connection.close(2u32.into(), b"peer removed");
-                                    break;
-                                }
-                            }
+                    if let Ok(db) = open_connection(&db_path_owned) {
+                        if is_peer_removed(&db, &recorded_by_owned, &peer_fp).unwrap_or(false) {
+                            warn!(
+                                "Peer {} has been removed — closing connection",
+                                &peer_id[..16.min(peer_id.len())]
+                            );
+                            connection.close(2u32.into(), b"peer removed");
+                            break;
                         }
                     }
 
@@ -1280,13 +1173,31 @@ pub async fn accept_loop_with_ingest(
                         }
                     };
                     let conn = DualConnection::new(ctrl_send, ctrl_recv, data_send, data_recv);
+                    let session_id = next_session_id();
+                    let meta = SessionMeta {
+                        session_id,
+                        tenant: TenantId(recorded_by_owned.clone()),
+                        peer: PeerFingerprint(peer_fp),
+                        remote_addr: connection.remote_address(),
+                        direction: SessionDirection::Inbound,
+                    };
+                    let io = SyncSessionIo::new(session_id, conn);
+                    let cancel = CancellationToken::new();
+                    let watch = spawn_peer_removal_cancellation_watch(
+                        db_path_owned.clone(),
+                        recorded_by_owned.clone(),
+                        peer_fp,
+                        cancel.clone(),
+                    );
 
-                    if let Err(e) = run_sync_responder_dual(
-                        conn, &db_path_owned, SYNC_SESSION_TIMEOUT_SECS, &peer_id, &recorded_by_owned,
-                        Some(ingest_clone.clone()),
-                    ).await {
+                    if let Err(e) = responder_handler
+                        .on_session(meta, Box::new(io), cancel.clone())
+                        .await
+                    {
                         warn!("Responder session error: {}", e);
                     }
+                    cancel.cancel();
+                    let _ = watch.await;
 
                     tokio::time::sleep(SESSION_GAP).await;
                 }
@@ -1304,16 +1215,13 @@ fn resolve_tenant_for_peer(
     tenant_peer_ids: &[String],
     remote_peer_id: &str,
 ) -> Option<String> {
-    let peer_fp_bytes = hex::decode(remote_peer_id).ok()?;
-    if peer_fp_bytes.len() != 32 {
-        return None;
-    }
-    let mut fp = [0u8; 32];
-    fp.copy_from_slice(&peer_fp_bytes);
-
-    let db = open_connection(db_path).ok()?;
+    let fp = peer_fingerprint_from_hex(remote_peer_id)?;
+    let oracle = SqliteTrustOracle::new(db_path);
     for tenant_id in tenant_peer_ids {
-        if crate::db::transport_trust::is_peer_allowed(&db, tenant_id, &fp).unwrap_or(false) {
+        if matches!(
+            oracle.check_sync(&TenantId(tenant_id.clone()), &PeerFingerprint(fp)),
+            Ok(TrustDecision::Allow)
+        ) {
             return Some(tenant_id.clone());
         }
     }
@@ -1348,22 +1256,35 @@ pub async fn connect_loop(
         }
         let recorded_by_str = recorded_by.to_string();
         let batch_sz = drain_batch_size();
-        let drained = pq.drain_with_limit(&recorded_by_str, batch_sz, |conn, event_id_b64| {
-            if let Some(eid) = event_id_from_base64(event_id_b64) {
-                project_one(conn, &recorded_by_str, &eid)
-                    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-            }
-            Ok(())
-        }).unwrap_or(0);
+        let drained = pq
+            .drain_with_limit(&recorded_by_str, batch_sz, |conn, event_id_b64| {
+                if let Some(eid) = event_id_from_base64(event_id_b64) {
+                    project_one(conn, &recorded_by_str, &eid)
+                        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                }
+                Ok(())
+            })
+            .unwrap_or(0);
         if drained > 0 {
-            info!("Processed {} pending project_queue items from previous session", drained);
+            info!(
+                "Processed {} pending project_queue items from previous session",
+                drained
+            );
         }
     }
 
     // Use LocalSet so the intro listener (spawn_intro_listener uses spawn_local)
     // can run on the same runtime that drives the endpoint I/O.
     let local = tokio::task::LocalSet::new();
-    local.run_until(connect_loop_inner(db_path, recorded_by, endpoint, remote, client_config)).await
+    local
+        .run_until(connect_loop_inner(
+            db_path,
+            recorded_by,
+            endpoint,
+            remote,
+            client_config,
+        ))
+        .await
 }
 
 async fn connect_loop_inner(
@@ -1383,6 +1304,8 @@ async fn connect_loop_inner(
             crate::transport::multi_workspace::workspace_sni(&ws_id)
         }
     };
+    let initiator_handler =
+        LegacySyncSessionHandler::initiator(db_path.to_string(), SYNC_SESSION_TIMEOUT_SECS);
 
     loop {
         info!("Connecting to {}...", remote);
@@ -1413,6 +1336,17 @@ async fn connect_loop_inner(
                 continue;
             }
         };
+        let peer_fp = match peer_fingerprint_from_hex(&peer_id) {
+            Some(fp) => fp,
+            None => {
+                warn!(
+                    "Could not decode peer fingerprint from identity {}, retrying...",
+                    &peer_id[..16.min(peer_id.len())]
+                );
+                tokio::time::sleep(CONNECT_RETRY_DELAY).await;
+                continue;
+            }
+        };
         info!("Connected to {}", peer_id);
 
         // Record endpoint observation, transport binding, and purge expired
@@ -1430,13 +1364,7 @@ async fn connect_loop_inner(
                     ENDPOINT_TTL_MS,
                 );
                 // Record transport binding (peer_id is hex SPKI fingerprint)
-                if let Ok(spki_bytes) = hex::decode(&peer_id) {
-                    if spki_bytes.len() == 32 {
-                        let mut fp = [0u8; 32];
-                        fp.copy_from_slice(&spki_bytes);
-                        let _ = record_transport_binding(&db, recorded_by, &peer_id, &fp);
-                    }
-                }
+                let _ = record_transport_binding(&db, recorded_by, &peer_id, &peer_fp);
                 let purged = purge_expired_endpoints(&db, now).unwrap_or(0);
                 if purged > 0 {
                     info!("Purged {} expired endpoint observations", purged);
@@ -1457,20 +1385,14 @@ async fn connect_loop_inner(
         // Inner loop: repeated sync sessions on this connection
         loop {
             // Check if peer has been removed — deny further sessions
-            if let Ok(peer_fp_bytes) = hex::decode(&peer_id) {
-                if peer_fp_bytes.len() == 32 {
-                    let mut fp = [0u8; 32];
-                    fp.copy_from_slice(&peer_fp_bytes);
-                    if let Ok(db) = open_connection(db_path) {
-                        if is_peer_removed(&db, recorded_by, &fp).unwrap_or(false) {
-                            warn!(
-                                "Peer {} has been removed — closing connection",
-                                &peer_id[..16.min(peer_id.len())]
-                            );
-                            connection.close(2u32.into(), b"peer removed");
-                            break;
-                        }
-                    }
+            if let Ok(db) = open_connection(db_path) {
+                if is_peer_removed(&db, recorded_by, &peer_fp).unwrap_or(false) {
+                    warn!(
+                        "Peer {} has been removed — closing connection",
+                        &peer_id[..16.min(peer_id.len())]
+                    );
+                    connection.close(2u32.into(), b"peer removed");
+                    break;
                 }
             }
 
@@ -1491,16 +1413,40 @@ async fn connect_loop_inner(
             let mut conn = DualConnection::new(ctrl_send, ctrl_recv, data_send, data_recv);
 
             // Send markers to materialize lazy QUIC streams on the receiver
-            conn.control.send(&SyncMessage::HaveList { ids: vec![] }).await?;
-            conn.data_send.send(&SyncMessage::HaveList { ids: vec![] }).await?;
+            conn.control
+                .send(&SyncMessage::HaveList { ids: vec![] })
+                .await?;
+            conn.data_send
+                .send(&SyncMessage::HaveList { ids: vec![] })
+                .await?;
             conn.flush_control().await?;
             conn.flush_data().await?;
 
-            if let Err(e) = run_sync_initiator_dual(
-                conn, db_path, SYNC_SESSION_TIMEOUT_SECS, &peer_id, recorded_by, None, None,
-            ).await {
+            let session_id = next_session_id();
+            let meta = SessionMeta {
+                session_id,
+                tenant: TenantId(recorded_by.to_string()),
+                peer: PeerFingerprint(peer_fp),
+                remote_addr: connection.remote_address(),
+                direction: SessionDirection::Outbound,
+            };
+            let io = SyncSessionIo::new(session_id, conn);
+            let cancel = CancellationToken::new();
+            let watch = spawn_peer_removal_cancellation_watch(
+                db_path.to_string(),
+                recorded_by.to_string(),
+                peer_fp,
+                cancel.clone(),
+            );
+
+            if let Err(e) = initiator_handler
+                .on_session(meta, Box::new(io), cancel.clone())
+                .await
+            {
                 warn!("Initiator session error: {}", e);
             }
+            cancel.cancel();
+            let _ = watch.await;
 
             tokio::time::sleep(SESSION_GAP).await;
         }
@@ -1549,7 +1495,7 @@ pub async fn download_from_sources(
         peer_coords.push(PeerCoord {
             peer_idx: i,
             report_tx,
-            assign_rx,
+            assign_rx: std::sync::Mutex::new(assign_rx),
         });
         report_rxs.push(report_rx);
         assign_txs.push(assign_tx);
@@ -1574,10 +1520,17 @@ pub async fn download_from_sources(
     };
 
     for (peer_coord, (endpoint, remote)) in peer_coords.into_iter().zip(endpoints.into_iter()) {
+        let peer_coord = std::sync::Arc::new(peer_coord);
         let db_path = db_path.to_string();
         let recorded_by = recorded_by.to_string();
         let ingest_tx = shared_tx.clone();
         let sni = download_sni.clone();
+        let handler = LegacySyncSessionHandler::initiator_with_coordination(
+            db_path.clone(),
+            SYNC_SESSION_TIMEOUT_SECS,
+            peer_coord.clone(),
+            Some(ingest_tx.clone()),
+        );
 
         handles.push(std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -1609,6 +1562,17 @@ pub async fn download_from_sources(
                             continue;
                         }
                     };
+                    let peer_fp = match peer_fingerprint_from_hex(&peer_id) {
+                        Some(fp) => fp,
+                        None => {
+                            warn!(
+                                "Invalid peer fingerprint {}, retrying",
+                                &peer_id[..16.min(peer_id.len())]
+                            );
+                            tokio::time::sleep(CONNECT_RETRY_DELAY).await;
+                            continue;
+                        }
+                    };
                     info!("Connected to {} for download", peer_id);
 
                     // Inner loop: repeated sync sessions
@@ -1627,19 +1591,34 @@ pub async fn download_from_sources(
                                 break;
                             }
                         };
-                        let mut conn = DualConnection::new(
-                            ctrl_send, ctrl_recv, data_send, data_recv,
-                        );
+                        let mut conn =
+                            DualConnection::new(ctrl_send, ctrl_recv, data_send, data_recv);
 
-                        let _ = conn.control.send(&SyncMessage::HaveList { ids: vec![] }).await;
-                        let _ = conn.data_send.send(&SyncMessage::HaveList { ids: vec![] }).await;
+                        let _ = conn
+                            .control
+                            .send(&SyncMessage::HaveList { ids: vec![] })
+                            .await;
+                        let _ = conn
+                            .data_send
+                            .send(&SyncMessage::HaveList { ids: vec![] })
+                            .await;
                         let _ = conn.flush_control().await;
                         let _ = conn.flush_data().await;
 
-                        if let Err(e) = run_sync_initiator_dual(
-                            conn, &db_path, SYNC_SESSION_TIMEOUT_SECS, &peer_id, &recorded_by,
-                            Some(&peer_coord), Some(ingest_tx.clone()),
-                        ).await {
+                        let session_id = next_session_id();
+                        let meta = SessionMeta {
+                            session_id,
+                            tenant: TenantId(recorded_by.clone()),
+                            peer: PeerFingerprint(peer_fp),
+                            remote_addr: connection.remote_address(),
+                            direction: SessionDirection::Outbound,
+                        };
+                        let io = SyncSessionIo::new(session_id, conn);
+
+                        if let Err(e) = handler
+                            .on_session(meta, Box::new(io), CancellationToken::new())
+                            .await
+                        {
                             warn!("Download session error: {}", e);
                         }
 

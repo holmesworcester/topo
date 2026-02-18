@@ -1,12 +1,16 @@
 pub mod cert;
 pub mod connection;
 pub mod multi_workspace;
+pub mod session_io;
+pub mod trust_oracle;
 
 pub use cert::{
     extract_spki_fingerprint, generate_keypair, generate_self_signed_cert,
     generate_self_signed_cert_from_signing_key, validate_cert_key_match,
 };
 pub use connection::{DualConnection, StreamConn, StreamRecv, StreamSend};
+pub use session_io::{SyncSessionIo, DEFAULT_SYNC_FRAME_MAX_BYTES};
+pub use trust_oracle::SqliteTrustOracle;
 
 use quinn::{ClientConfig, Endpoint, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
