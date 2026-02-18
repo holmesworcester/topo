@@ -354,7 +354,8 @@ Validation performed for this slice:
    - `933fa9f` - Phase 2 event-runtime ingest slice
    - `e51fd33` - Strengthen plan with phase tracking and handoff context
    - `f7e5162` - Phase 2 complete: decouple projection internals from sync/network boundary
-   - (pending) - Phase 3: extract replication session logic to `src/replication/`
+   - `547b21f` - Phase 3: extract replication session logic to `src/replication/`
+   - (pending) - Phase 4: extract network runtime to `src/network/`
 4. Worktree status expectation before starting new work: `git status -sb` should be clean.
 
 ## Phase Status Tracker
@@ -365,7 +366,7 @@ Validation performed for this slice:
 | Phase 1 | Complete | Contracts + adapters + session handler wiring landed | None |
 | Phase 2 | Complete | Ingest runtime + SQL adapters + `drain_project_queue` boundary; shims removed; `project_one` no longer imported from sync/node | None |
 | Phase 3 | Complete | Session logic extracted to `src/replication/session.rs`; `sync/engine.rs` reduced from 1338→806 lines; transitional re-exports in place; 342 unit + 65 scenario tests pass | None |
-| Phase 4 | Not Started | N/A | Extract network runtime orchestration to `src/network/*` |
+| Phase 4 | Complete | Network orchestration extracted to `src/network/{runtime,loops}.rs`; `node.rs` reduced to 6 lines (re-export); `sync/engine.rs` reduced to 20 lines (re-exports); 342 unit + all integration tests pass | None |
 | Phase 5 | Not Started | N/A | Enforce dependency direction + privileged adversity CI |
 
 ## Progress Tracking Rules
@@ -378,10 +379,9 @@ Validation performed for this slice:
 2. Do not mark a phase complete without both code movement and listed test gate evidence.
 3. Keep all extraction PRs "no behavior change" unless explicitly scoped otherwise.
 
-## Next Task (Phase 2 Completion) - Concrete Checklist
+## Phase 2 Completion Checklist (DONE)
 
-Phase 2 is in-progress. The remaining work removes compatibility shims and finishes decoupling
-projection internals from replication/network paths.
+Phase 2 is complete. The items below document what was done for reference.
 
 ### 2a. Remove `project_one` calls from `sync/engine.rs`
 
@@ -432,7 +432,7 @@ Steps:
 
 ---
 
-## Planned Task (Phase 3) - Concrete Checklist
+## Phase 3 Checklist (DONE)
 
 ### 3a. Create `src/replication/` module structure
 
@@ -491,7 +491,7 @@ After extraction, `src/sync/engine.rs` should contain only orchestration glue (~
    `src/replication/session.rs`, not in `src/sync/engine.rs`.
 5. Update Phase Status Tracker with commit hash, date, and test evidence.
 
-## Planned Task (Phase 4) - Concrete Checklist
+## Phase 4 Checklist (DONE)
 
 ### 4a. Create `src/network/` module structure
 
@@ -710,12 +710,11 @@ Wire this into CI as a required check (same tier as `cargo test --lib`).
 | # | Debt item | Introduced | Remove after | Current location |
 |---|-----------|-----------|-------------|-----------------|
 | 1 | `LegacySyncSessionHandler` downcast bridge | Phase 1 | Phase 5 | `src/sync/session_handler.rs` |
-| 2 | `sync::engine` re-export of `batch_writer`/`IngestItem` | Phase 2 | Phase 4 (test callers still use `topo::sync::engine::batch_writer`) | `src/sync/engine.rs` line ~41 |
+| 2 | `sync::engine` re-export shim (all symbols) | Phase 2-4 | Phase 5 | `src/sync/engine.rs` (20 lines, re-exports only) |
 | 3 | Direct `projection::pipeline::project_one` in `sync/engine.rs` | Pre-refactor | **Resolved in Phase 2** | Replaced by `drain_project_queue` |
-| 4 | `sync::engine` re-export of `run_sync_initiator_dual`/`run_sync_responder_dual`/`spawn_data_receiver`/`PeerCoord` | Phase 3 | Phase 4 | `src/sync/engine.rs` line ~131 |
-| 4b | `sync::engine` private import of `run_coordinator` from `replication::session` | Phase 3 | Phase 4 | `src/sync/engine.rs` line ~134 |
-| 5 | Direct runtime orchestration in `src/node.rs` | Pre-refactor | Phase 4 | `src/node.rs` lines ~251-629 |
-| 6 | Network-path direct dependency on `sync` internals | Pre-refactor | Phase 4 | `src/node.rs` imports from `sync::engine` |
+| 4 | `node.rs` re-export of `run_node` | Phase 4 | Phase 5 | `src/node.rs` (6 lines, re-export only) |
+| 5 | Direct runtime orchestration in `src/node.rs` | Pre-refactor | **Resolved in Phase 4** | Moved to `network/runtime.rs` |
+| 6 | Network-path direct dependency on `sync` internals | Pre-refactor | **Resolved in Phase 4** | Network now imports from `network::loops` directly |
 | 7 | Any remaining `anyhow::Result` at boundary traits | Various | Phase 5 | Grep `anyhow` in `src/contracts/` |
 
 ## Cross-Boundary Import Audit (2026-02-18)
@@ -737,9 +736,11 @@ by the phase indicated.
 
 | Module | Current lines | Target after extraction | Phase |
 |--------|--------------|----------------------|-------|
-| `src/sync/engine.rs` | ~~1639~~ **806** (Phase 3 done) | ~0 (absorbed by network + replication) | Phase 4 |
-| `src/node.rs` | ~748 | ~100-150 (composition root) | Phase 4 |
+| `src/sync/engine.rs` | ~~1639~~ ~~806~~ **20** (Phase 4 done, re-exports only) | ~0 (remove in Phase 5) | Phase 4 ✓ |
+| `src/node.rs` | ~~748~~ **6** (Phase 4 done, re-export only) | ~0 (remove in Phase 5) | Phase 4 ✓ |
 | `src/replication/session.rs` | **855** (Phase 3 done) | ~855 (stable) | Phase 3 ✓ |
+| `src/network/runtime.rs` | **736** (Phase 4 done) | ~736 (stable) | Phase 4 ✓ |
+| `src/network/loops.rs` | **812** (Phase 4 done) | ~812 (stable) | Phase 4 ✓ |
 | `src/network/runtime.rs` | N/A (new) | ~580 (run_node + discovery + orchestration) | Phase 4 |
 
 ## Assistant Handoff Notes

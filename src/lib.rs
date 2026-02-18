@@ -8,6 +8,7 @@ pub mod events;
 pub mod identity_ops;
 pub mod interactive;
 pub mod invite_link;
+pub mod network;
 pub mod node;
 pub mod projection;
 pub mod replication;
