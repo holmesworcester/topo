@@ -422,33 +422,6 @@ pub fn load_local_peer_signer_pub(
     Ok(None)
 }
 
-fn load_any_event_local_peer_signer(
-    db: &rusqlite::Connection,
-) -> ServiceResult<Option<(String, SigningKey)>> {
-    ensure_local_signer_tables(db)?;
-
-    let row = db
-        .query_row(
-            "SELECT l.recorded_by, l.signing_key
-             FROM local_peer_signers l
-             INNER JOIN peers_shared p
-               ON p.recorded_by = l.recorded_by AND p.event_id = l.event_id
-             ORDER BY l.updated_at DESC
-             LIMIT 1",
-            [],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
-        )
-        .optional()?;
-
-    match row {
-        Some((recorded_by, key_bytes)) => {
-            let signing_key = decode_signing_key(key_bytes)?;
-            Ok(Some((recorded_by, signing_key)))
-        }
-        None => Ok(None),
-    }
-}
-
 pub fn svc_bootstrap_workspace_conn(
     db: &rusqlite::Connection,
     recorded_by: &str,
