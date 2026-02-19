@@ -20,9 +20,9 @@ use crate::event_modules::{
 use crate::identity::transport::{ensure_transport_peer_id, ensure_transport_cert};
 use crate::projection::create::{create_event_sync, create_event_staged, create_signed_event_sync, create_signed_event_staged, create_encrypted_event_sync, CreateEventError};
 use crate::projection::apply::project_one;
-use crate::protocol::SyncMessage;
+use crate::protocol::Frame;
 use crate::peering::loops::{accept_loop, connect_loop, download_from_sources, SYNC_SESSION_TIMEOUT_SECS};
-use crate::sync::session::run_sync_initiator_dual;
+use crate::sync::session::run_sync_initiator;
 use crate::transport::{
     AllowedPeers,
     DualConnection,
@@ -2085,12 +2085,12 @@ pub async fn connect_sync_once(
     let mut conn = DualConnection::new(ctrl_send, ctrl_recv, data_send, data_recv);
 
     // Send markers to materialize lazy QUIC streams on the receiver
-    conn.control.send(&SyncMessage::HaveList { ids: vec![] }).await?;
-    conn.data_send.send(&SyncMessage::HaveList { ids: vec![] }).await?;
+    conn.control.send(&Frame::HaveList { ids: vec![] }).await?;
+    conn.data_send.send(&Frame::HaveList { ids: vec![] }).await?;
     conn.flush_control().await?;
     conn.flush_data().await?;
 
-    let stats = run_sync_initiator_dual(
+    let stats = run_sync_initiator(
         conn, db_path, SYNC_SESSION_TIMEOUT_SECS, &peer_id, identity, None, None, crate::event_pipeline::batch_writer,
     ).await?;
 

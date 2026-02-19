@@ -1,5 +1,5 @@
 //! Tests that IO errors are correctly surfaced through the SessionHandler
-//! when using FakeSessionIo.
+//! when using FakeTransportSessionIo.
 //!
 //! Covers: connection loss, half-close, abrupt close, delayed delivery,
 //! frame-size enforcement, out-of-order delivery, frame fragmentation,
@@ -9,10 +9,10 @@ use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 use topo::contracts::network_contract::{
-    SessionDirection, SessionHandler, SessionIo, SessionIoError,
+    SessionDirection, SessionHandler, TransportSessionIo, TransportSessionIoError,
 };
 use topo::sync::session_handler::ReplicationSessionHandler;
-use topo::protocol::SyncMessage;
+use topo::protocol::Frame;
 
 use crate::fake_session_io::{
     create_test_db, empty_negentropy_storage, fake_session_io_pair,
@@ -132,15 +132,15 @@ async fn normal_roundtrip_completes_successfully() {
         )
         .unwrap();
         let initial_msg = neg.initiate().unwrap();
-        peer.send_control_msg(&SyncMessage::NegOpen { msg: initial_msg })
+        peer.send_control_msg(&Frame::NegOpen { msg: initial_msg })
             .await;
 
         // Consume NegMsg if any
         let _ = peer.recv_control_msg_timeout(Duration::from_secs(2)).await;
 
         // Signal done
-        peer.send_data_msg(&SyncMessage::DataDone).await;
-        peer.send_control_msg(&SyncMessage::Done).await;
+        peer.send_data_msg(&Frame::DataDone).await;
+        peer.send_control_msg(&Frame::Done).await;
 
         // Get DataDone + DoneAck
         let _ = peer.recv_data_msg_timeout(Duration::from_secs(5)).await;
@@ -206,7 +206,7 @@ async fn frame_size_enforcement_rejects_oversized() {
     // Test data_send path.
     let data_err = parts.data_send.send(&oversized).await.unwrap_err();
     match &data_err {
-        SessionIoError::FrameTooLarge { len, max } => {
+        TransportSessionIoError::FrameTooLarge { len, max } => {
             assert_eq!(*len, 101);
             assert_eq!(*max, 100);
         }
@@ -216,7 +216,7 @@ async fn frame_size_enforcement_rejects_oversized() {
     // Test control send path.
     let ctrl_err = parts.control.send(&oversized).await.unwrap_err();
     match &ctrl_err {
-        SessionIoError::FrameTooLarge { len, max } => {
+        TransportSessionIoError::FrameTooLarge { len, max } => {
             assert_eq!(*len, 101);
             assert_eq!(*max, 100);
         }
@@ -328,7 +328,7 @@ async fn fragmented_data_frames_handler_completes() {
         )
         .unwrap();
         let initial_msg = neg.initiate().unwrap();
-        peer.send_control_msg(&SyncMessage::NegOpen { msg: initial_msg })
+        peer.send_control_msg(&Frame::NegOpen { msg: initial_msg })
             .await;
 
         // Consume NegMsg
@@ -336,13 +336,13 @@ async fn fragmented_data_frames_handler_completes() {
 
         // Send an Event with a multi-byte payload that WILL be fragmented.
         // The data receiver will get a partial frame and fail to parse it.
-        peer.send_data_msg(&SyncMessage::Event { blob: vec![0xAA; 100] })
+        peer.send_data_msg(&Frame::Event { blob: vec![0xAA; 100] })
             .await;
 
         // Send DataDone (1-byte message, not fragmented since len==1) and
         // Done on control to drive the session toward completion.
-        peer.send_data_msg(&SyncMessage::DataDone).await;
-        peer.send_control_msg(&SyncMessage::Done).await;
+        peer.send_data_msg(&Frame::DataDone).await;
+        peer.send_control_msg(&Frame::Done).await;
 
         // Consume any responses from the handler.
         let _ = peer.recv_data_msg_timeout(Duration::from_secs(5)).await;
@@ -495,15 +495,15 @@ async fn duplicate_done_violation_terminates_handler() {
         )
         .unwrap();
         let initial_msg = neg.initiate().unwrap();
-        peer.send_control_msg(&SyncMessage::NegOpen { msg: initial_msg })
+        peer.send_control_msg(&Frame::NegOpen { msg: initial_msg })
             .await;
 
         // Consume NegMsg from responder
         let _ = peer.recv_control_msg_timeout(Duration::from_secs(2)).await;
 
         // Signal done (the FakeControlIo will auto-duplicate this Done)
-        peer.send_data_msg(&SyncMessage::DataDone).await;
-        peer.send_control_msg(&SyncMessage::Done).await;
+        peer.send_data_msg(&Frame::DataDone).await;
+        peer.send_control_msg(&Frame::Done).await;
 
         // Try to receive DataDone + DoneAck — the handler may or may not
         // produce these depending on how it handles the duplicate Done.

@@ -42,8 +42,8 @@ check_no_match 'crate::event_pipeline::IngestItem' src/peering/
 check_no_match 'crate::projection' src/sync/
 # sync -> QUIC concrete types
 check_no_match 'quinn::' src/sync/
-# sync -> SyncSessionIo concrete type
-check_no_match 'SyncSessionIo<' src/sync/
+# sync -> QuicTransportSessionIo concrete type
+check_no_match 'QuicTransportSessionIo<' src/sync/
 # sync -> into_any downcast path
 check_no_match '\.into_any\(' src/sync/
 check_no_match 'downcast::<' src/sync/

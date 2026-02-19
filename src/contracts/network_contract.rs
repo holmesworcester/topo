@@ -47,7 +47,7 @@ pub enum TrustError {
 }
 
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
-pub enum SessionIoError {
+pub enum TransportSessionIoError {
     #[error("connection lost")]
     ConnectionLost,
     #[error("frame too large: len={len}, max={max}")]
@@ -72,39 +72,39 @@ pub trait TrustOracle: Send + Sync {
 /// Control stream: bidirectional (send + recv) for negentropy and protocol messages.
 #[async_trait]
 pub trait ControlIo: Send {
-    async fn recv(&mut self) -> Result<Vec<u8>, SessionIoError>;
-    async fn send(&mut self, frame: &[u8]) -> Result<(), SessionIoError>;
-    async fn flush(&mut self) -> Result<(), SessionIoError>;
+    async fn recv(&mut self) -> Result<Vec<u8>, TransportSessionIoError>;
+    async fn send(&mut self, frame: &[u8]) -> Result<(), TransportSessionIoError>;
+    async fn flush(&mut self) -> Result<(), TransportSessionIoError>;
 }
 
 /// Data send stream: outbound event blobs.
 #[async_trait]
 pub trait DataSendIo: Send {
-    async fn send(&mut self, frame: &[u8]) -> Result<(), SessionIoError>;
-    async fn flush(&mut self) -> Result<(), SessionIoError>;
+    async fn send(&mut self, frame: &[u8]) -> Result<(), TransportSessionIoError>;
+    async fn flush(&mut self) -> Result<(), TransportSessionIoError>;
 }
 
 /// Data receive stream: inbound event blobs.  Must be `'static` so it can be
 /// sent to a spawned task.
 #[async_trait]
 pub trait DataRecvIo: Send + 'static {
-    async fn recv(&mut self) -> Result<Vec<u8>, SessionIoError>;
+    async fn recv(&mut self) -> Result<Vec<u8>, TransportSessionIoError>;
 }
 
-/// Split session IO parts returned by [`SessionIo::split`].
-pub struct SessionIoParts {
+/// Split session IO parts returned by [`TransportSessionIo::split`].
+pub struct TransportSessionIoParts {
     pub control: Box<dyn ControlIo>,
     pub data_send: Box<dyn DataSendIo>,
     pub data_recv: Box<dyn DataRecvIo>,
 }
 
 #[async_trait]
-pub trait SessionIo: Send {
+pub trait TransportSessionIo: Send {
     fn session_id(&self) -> u64;
     fn max_frame_size(&self) -> usize;
     /// Split into independent control, data-send, and data-recv handles.
     /// Consuming `self` allows the data-recv handle to be moved to a spawned task.
-    fn split(self: Box<Self>) -> SessionIoParts;
+    fn split(self: Box<Self>) -> TransportSessionIoParts;
 }
 
 #[async_trait(?Send)]
@@ -112,7 +112,7 @@ pub trait SessionHandler: Send + Sync {
     async fn on_session(
         &self,
         meta: SessionMeta,
-        io: Box<dyn SessionIo>,
+        io: Box<dyn TransportSessionIo>,
         cancel: CancellationToken,
     ) -> Result<(), String>;
 }

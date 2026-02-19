@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 use topo::contracts::network_contract::{SessionDirection, SessionHandler};
 use topo::sync::session_handler::ReplicationSessionHandler;
-use topo::protocol::SyncMessage;
+use topo::protocol::Frame;
 
 use crate::fake_session_io::{
     create_test_db, empty_negentropy_storage, fake_session_io_pair, noop_batch_writer,
@@ -45,35 +45,35 @@ async fn responder_inbound_replies_negmsg_then_doneack() {
         )
         .unwrap();
         let initial_msg = neg.initiate().unwrap();
-        peer.send_control_msg(&SyncMessage::NegOpen { msg: initial_msg })
+        peer.send_control_msg(&Frame::NegOpen { msg: initial_msg })
             .await;
 
         // 2. Responder should reply with NegMsg
         let neg_msg = peer
             .recv_control_msg_timeout(Duration::from_secs(5))
             .await;
-        if let Some(SyncMessage::NegMsg { msg }) = &neg_msg {
+        if let Some(Frame::NegMsg { msg }) = &neg_msg {
             let mut have_ids = Vec::new();
             let mut need_ids = Vec::new();
             let _ = neg.reconcile_with_ids(msg, &mut have_ids, &mut need_ids);
         }
 
         // 3. Signal Done from initiator
-        peer.send_data_msg(&SyncMessage::DataDone).await;
-        peer.send_control_msg(&SyncMessage::Done).await;
+        peer.send_data_msg(&Frame::DataDone).await;
+        peer.send_control_msg(&Frame::Done).await;
 
         // 4. Responder should send DataDone on data stream, then DoneAck on control
         let data_done = peer
             .recv_data_msg_timeout(Duration::from_secs(5))
             .await
             .expect("expected DataDone from responder");
-        assert_eq!(data_done, SyncMessage::DataDone);
+        assert_eq!(data_done, Frame::DataDone);
 
         let done_ack = peer
             .recv_control_msg_timeout(Duration::from_secs(5))
             .await
             .expect("expected DoneAck from responder");
-        assert_eq!(done_ack, SyncMessage::DoneAck);
+        assert_eq!(done_ack, Frame::DoneAck);
 
         let result = tokio::time::timeout(Duration::from_secs(10), handler_task)
             .await
@@ -112,15 +112,15 @@ async fn anticheat_responder_datadone_before_doneack() {
         )
         .unwrap();
         let initial_msg = neg.initiate().unwrap();
-        peer.send_control_msg(&SyncMessage::NegOpen { msg: initial_msg })
+        peer.send_control_msg(&Frame::NegOpen { msg: initial_msg })
             .await;
 
         // Consume NegMsg if any
         let _ = peer.recv_control_msg_timeout(Duration::from_secs(2)).await;
 
         // Signal done
-        peer.send_data_msg(&SyncMessage::DataDone).await;
-        peer.send_control_msg(&SyncMessage::Done).await;
+        peer.send_data_msg(&Frame::DataDone).await;
+        peer.send_control_msg(&Frame::Done).await;
 
         // DataDone must arrive on data stream before DoneAck on control.
         let data_msg = peer
@@ -129,7 +129,7 @@ async fn anticheat_responder_datadone_before_doneack() {
             .expect("expected data message from responder");
         assert_eq!(
             data_msg,
-            SyncMessage::DataDone,
+            Frame::DataDone,
             "ANTI-CHEAT: responder's first post-Done data message must be DataDone"
         );
 
@@ -139,7 +139,7 @@ async fn anticheat_responder_datadone_before_doneack() {
             .expect("expected control message from responder");
         assert_eq!(
             ctrl_msg,
-            SyncMessage::DoneAck,
+            Frame::DoneAck,
             "ANTI-CHEAT: responder's post-DataDone control message must be DoneAck"
         );
 
@@ -194,7 +194,7 @@ async fn responder_ignores_empty_havelist_marker() {
         });
 
         // Send empty HaveList markers (like an outbound initiator would)
-        peer.send_control_msg(&SyncMessage::HaveList { ids: vec![] })
+        peer.send_control_msg(&Frame::HaveList { ids: vec![] })
             .await;
 
         // Then proceed with normal protocol
@@ -205,28 +205,28 @@ async fn responder_ignores_empty_havelist_marker() {
         )
         .unwrap();
         let initial_msg = neg.initiate().unwrap();
-        peer.send_control_msg(&SyncMessage::NegOpen { msg: initial_msg })
+        peer.send_control_msg(&Frame::NegOpen { msg: initial_msg })
             .await;
 
         // Consume NegMsg
         let _ = peer.recv_control_msg_timeout(Duration::from_secs(2)).await;
 
         // Signal done
-        peer.send_data_msg(&SyncMessage::DataDone).await;
-        peer.send_control_msg(&SyncMessage::Done).await;
+        peer.send_data_msg(&Frame::DataDone).await;
+        peer.send_control_msg(&Frame::Done).await;
 
         // Should still get proper DoneAck sequence
         let data_done = peer
             .recv_data_msg_timeout(Duration::from_secs(5))
             .await
             .expect("expected DataDone");
-        assert_eq!(data_done, SyncMessage::DataDone);
+        assert_eq!(data_done, Frame::DataDone);
 
         let done_ack = peer
             .recv_control_msg_timeout(Duration::from_secs(5))
             .await
             .expect("expected DoneAck");
-        assert_eq!(done_ack, SyncMessage::DoneAck);
+        assert_eq!(done_ack, Frame::DoneAck);
 
         cancel.cancel();
     })

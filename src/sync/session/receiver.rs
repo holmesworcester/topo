@@ -11,7 +11,7 @@ use tracing::{info, warn};
 
 use crate::contracts::event_runtime_contract::IngestItem;
 use crate::crypto::hash_event;
-use crate::protocol::SyncMessage;
+use crate::protocol::Frame;
 use crate::transport::connection::ConnectionError;
 use crate::transport::StreamRecv;
 
@@ -46,7 +46,7 @@ where
                 }
                 msg = data_recv.recv() => {
                     match msg {
-                        Ok(SyncMessage::Event { blob }) => {
+                        Ok(Frame::Event { blob }) => {
                             bytes_received.fetch_add(blob.len() as u64, Ordering::Relaxed);
                             let event_id = hash_event(&blob);
                             if ingest_tx.send((event_id, blob, recorded_by.clone())).await.is_err() {
@@ -54,7 +54,7 @@ where
                                 break;
                             }
                         }
-                        Ok(SyncMessage::DataDone) => {
+                        Ok(Frame::DataDone) => {
                             info!("Received DataDone from peer — all data consumed");
                             if let Some(tx) = data_done_tx.take() {
                                 let _ = tx.send(());

@@ -2,7 +2,7 @@
 //! sync initiator/responder functions in replication::session.
 //!
 //! Moved from sync/session_handler.rs (Phase 5 of Option B refactor).
-//! Phase 6: removed `into_any` downcast; uses `SessionIo::split()` and
+//! Phase 6: removed `into_any` downcast; uses `TransportSessionIo::split()` and
 //! adapter wrappers so replication never depends on QUIC concrete types.
 
 use async_trait::async_trait;
@@ -12,12 +12,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::contracts::event_runtime_contract::{BatchWriterFn, IngestItem};
 use crate::contracts::network_contract::{
-    ControlIo, DataRecvIo, DataSendIo, SessionDirection, SessionHandler, SessionIo,
-    SessionIoError, SessionMeta,
+    ControlIo, DataRecvIo, DataSendIo, SessionDirection, SessionHandler, TransportSessionIo,
+    TransportSessionIoError, SessionMeta,
 };
-use crate::sync::session::{run_sync_initiator_dual, run_sync_responder_dual, PeerCoord};
-use crate::protocol::SyncMessage;
-use crate::protocol::{encode_sync_message, parse_sync_message};
+use crate::sync::session::{run_sync_initiator, run_sync_responder, PeerCoord};
+use crate::protocol::Frame;
+use crate::protocol::{encode_frame, parse_frame};
 use crate::transport::connection::ConnectionError;
 use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
 
@@ -32,8 +32,8 @@ struct ControlAdapter {
 
 #[async_trait]
 impl StreamConn for ControlAdapter {
-    async fn send(&mut self, msg: &SyncMessage) -> Result<(), ConnectionError> {
-        let frame = encode_sync_message(msg);
+    async fn send(&mut self, msg: &Frame) -> Result<(), ConnectionError> {
+        let frame = encode_frame(msg);
         self.inner
             .send(&frame)
             .await
@@ -44,9 +44,9 @@ impl StreamConn for ControlAdapter {
         self.inner.flush().await.map_err(|e| map_io_error(e))
     }
 
-    async fn recv(&mut self) -> Result<SyncMessage, ConnectionError> {
+    async fn recv(&mut self) -> Result<Frame, ConnectionError> {
         let frame = self.inner.recv().await.map_err(|e| map_io_error(e))?;
-        let (msg, _) = parse_sync_message(&frame)
+        let (msg, _) = parse_frame(&frame)
             .map_err(|e| ConnectionError::Parse(e))?;
         Ok(msg)
     }
@@ -58,8 +58,8 @@ struct DataSendAdapter {
 
 #[async_trait]
 impl StreamSend for DataSendAdapter {
-    async fn send(&mut self, msg: &SyncMessage) -> Result<(), ConnectionError> {
-        let frame = encode_sync_message(msg);
+    async fn send(&mut self, msg: &Frame) -> Result<(), ConnectionError> {
+        let frame = encode_frame(msg);
         self.inner
             .send(&frame)
             .await
@@ -77,17 +77,17 @@ struct DataRecvAdapter {
 
 #[async_trait]
 impl StreamRecv for DataRecvAdapter {
-    async fn recv(&mut self) -> Result<SyncMessage, ConnectionError> {
+    async fn recv(&mut self) -> Result<Frame, ConnectionError> {
         let frame = self.inner.recv().await.map_err(|e| map_io_error(e))?;
-        let (msg, _) = parse_sync_message(&frame)
+        let (msg, _) = parse_frame(&frame)
             .map_err(|e| ConnectionError::Parse(e))?;
         Ok(msg)
     }
 }
 
-fn map_io_error(err: SessionIoError) -> ConnectionError {
+fn map_io_error(err: TransportSessionIoError) -> ConnectionError {
     match err {
-        SessionIoError::ConnectionLost => ConnectionError::Closed,
+        TransportSessionIoError::ConnectionLost => ConnectionError::Closed,
         other => ConnectionError::Io(std::io::Error::new(
             std::io::ErrorKind::Other,
             other.to_string(),
@@ -177,7 +177,7 @@ impl SessionHandler for ReplicationSessionHandler {
     async fn on_session(
         &self,
         meta: SessionMeta,
-        io: Box<dyn SessionIo>,
+        io: Box<dyn TransportSessionIo>,
         cancel: CancellationToken,
     ) -> Result<(), String> {
         if cancel.is_cancelled() {
@@ -187,7 +187,7 @@ impl SessionHandler for ReplicationSessionHandler {
             ));
         }
 
-        // Split the abstract SessionIo into independent control/data handles,
+        // Split the abstract TransportSessionIo into independent control/data handles,
         // then wrap them as StreamConn/StreamSend/StreamRecv adapters so the
         // existing session functions work without QUIC-specific types.
         let parts = io.split();
@@ -212,11 +212,11 @@ impl SessionHandler for ReplicationSessionHandler {
         // lazy QUIC streams to open on the receiver side.
         if meta.direction == SessionDirection::Outbound {
             conn.control
-                .send(&SyncMessage::HaveList { ids: vec![] })
+                .send(&Frame::HaveList { ids: vec![] })
                 .await
                 .map_err(|e| format!("failed to send control marker: {e}"))?;
             conn.data_send
-                .send(&SyncMessage::HaveList { ids: vec![] })
+                .send(&Frame::HaveList { ids: vec![] })
                 .await
                 .map_err(|e| format!("failed to send data marker: {e}"))?;
             conn.flush_control()
@@ -229,7 +229,7 @@ impl SessionHandler for ReplicationSessionHandler {
 
         match (self.role, meta.direction) {
             (SessionRole::Initiator, SessionDirection::Outbound) => {
-                let run = run_sync_initiator_dual(
+                let run = run_sync_initiator(
                     conn,
                     &self.db_path,
                     self.timeout_secs,
@@ -248,7 +248,7 @@ impl SessionHandler for ReplicationSessionHandler {
                 }
             }
             (SessionRole::Responder, SessionDirection::Inbound) => {
-                let run = run_sync_responder_dual(
+                let run = run_sync_responder(
                     conn,
                     &self.db_path,
                     self.timeout_secs,

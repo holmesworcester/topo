@@ -18,7 +18,7 @@ use crate::db::{
     store::{lookup_workspace_id, Store},
 };
 use crate::runtime::SyncStats;
-use crate::protocol::SyncMessage;
+use crate::protocol::Frame;
 use crate::sync::negentropy_sqlite::NegentropyStorageSqlite;
 use crate::transport::connection::ConnectionError;
 use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
@@ -34,7 +34,7 @@ use super::{
 /// When `shared_ingest` is provided, events are sent to the shared channel
 /// instead of spawning a per-session batch_writer. This eliminates SQLite
 /// write contention when multiple sources sync concurrently.
-pub async fn run_sync_responder_dual<C, S, R>(
+pub async fn run_sync_responder<C, S, R>(
     conn: DualConnection<C, S, R>,
     db_path: &str,
     timeout_secs: u64,
@@ -120,25 +120,25 @@ where
         }
 
         match tokio::time::timeout(CONTROL_POLL_TIMEOUT, control.recv()).await {
-            Ok(Ok(SyncMessage::NegOpen { msg })) | Ok(Ok(SyncMessage::NegMsg { msg })) => {
+            Ok(Ok(Frame::NegOpen { msg })) | Ok(Ok(Frame::NegMsg { msg })) => {
                 rounds += 1;
 
                 let response = neg.reconcile(&msg)?;
                 if response.is_empty() {
                     info!("Reconciliation complete in {} rounds", rounds);
                 } else {
-                    control.send(&SyncMessage::NegMsg { msg: response }).await?;
+                    control.send(&Frame::NegMsg { msg: response }).await?;
                     control.flush().await?;
                 }
             }
-            Ok(Ok(SyncMessage::HaveList { ids })) => {
+            Ok(Ok(Frame::HaveList { ids })) => {
                 if ids.is_empty() {
                     continue;
                 }
 
                 let _ = egress.enqueue_events(peer_id, &ids);
             }
-            Ok(Ok(SyncMessage::Done)) => {
+            Ok(Ok(Frame::Done)) => {
                 info!("Received Done from initiator");
                 peer_done = true;
             }
@@ -168,7 +168,7 @@ where
             for (rowid, event_id) in batch {
                 if let Ok(Some(blob)) = store.get_shared(&event_id) {
                     let blob_len = blob.len() as u64;
-                    if data_send.send(&SyncMessage::Event { blob }).await.is_ok() {
+                    if data_send.send(&Frame::Event { blob }).await.is_ok() {
                         events_sent += 1;
                         bytes_sent += blob_len;
                         sent_this_round += 1;
@@ -196,7 +196,7 @@ where
             let pending_out = egress.count_pending(peer_id).unwrap_or(0);
             if pending_out == 0 {
                 let _ = data_send.flush().await;
-                data_send.send(&SyncMessage::DataDone).await?;
+                data_send.send(&Frame::DataDone).await?;
                 data_send.flush().await?;
 
                 let drain_timeout = DATA_DRAIN_TIMEOUT;
@@ -206,7 +206,7 @@ where
                     Err(_) => warn!("Timed out waiting for inbound data drain"),
                 }
 
-                control.send(&SyncMessage::DoneAck).await?;
+                control.send(&Frame::DoneAck).await?;
                 control.flush().await?;
                 info!(
                     "Sent DoneAck (sent {}, received {})",

@@ -21,7 +21,7 @@ use crate::sync::ReplicationSessionHandler;
 
 use crate::transport::{
     create_dual_endpoint, peer_identity_from_connection, AllowedPeers, DualConnection,
-    SyncSessionIo,
+    QuicTransportSessionIo,
 };
 use crate::identity::transport::{
     expected_invite_bootstrap_spki_from_invite_key, load_transport_cert_required_from_db,
@@ -118,7 +118,7 @@ pub async fn bootstrap_sync_from_invite(
         direction: SessionDirection::Outbound,
     };
     let handler = ReplicationSessionHandler::initiator(db_path.to_string(), timeout_secs, batch_writer);
-    let io = SyncSessionIo::new(session_id, conn);
+    let io = QuicTransportSessionIo::new(session_id, conn);
     handler
         .on_session(meta, Box::new(io), CancellationToken::new())
         .await
@@ -219,7 +219,7 @@ pub fn start_bootstrap_responder(
                     remote_addr: connection.remote_address(),
                     direction: SessionDirection::Inbound,
                 };
-                let io = SyncSessionIo::new(session_id, conn);
+                let io = QuicTransportSessionIo::new(session_id, conn);
 
                 if let Err(e) = handler
                     .on_session(meta, Box::new(io), CancellationToken::new())

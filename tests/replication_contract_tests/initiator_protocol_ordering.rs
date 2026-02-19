@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 use topo::contracts::network_contract::{SessionDirection, SessionHandler};
 use topo::sync::session_handler::ReplicationSessionHandler;
-use topo::protocol::SyncMessage;
+use topo::protocol::Frame;
 
 use crate::fake_session_io::{
     create_test_db, empty_negentropy_storage, fake_session_io_pair, noop_batch_writer,
@@ -25,7 +25,7 @@ async fn drive_empty_responder(peer: &mut FakePeerSide) {
         .expect("expected control marker");
     assert_eq!(
         ctrl_marker,
-        SyncMessage::HaveList { ids: vec![] },
+        Frame::HaveList { ids: vec![] },
         "first control message should be empty HaveList marker"
     );
 
@@ -35,7 +35,7 @@ async fn drive_empty_responder(peer: &mut FakePeerSide) {
         .expect("expected data marker");
     assert_eq!(
         data_marker,
-        SyncMessage::HaveList { ids: vec![] },
+        Frame::HaveList { ids: vec![] },
         "first data message should be empty HaveList marker"
     );
 
@@ -45,13 +45,13 @@ async fn drive_empty_responder(peer: &mut FakePeerSide) {
         .await
         .expect("expected NegOpen");
     assert!(
-        matches!(neg_open, SyncMessage::NegOpen { .. }),
+        matches!(neg_open, Frame::NegOpen { .. }),
         "expected NegOpen, got {:?}",
         neg_open
     );
 
     // 3. Respond with NegMsg to complete reconciliation.
-    if let SyncMessage::NegOpen { msg } = neg_open {
+    if let Frame::NegOpen { msg } = neg_open {
         let storage = empty_negentropy_storage();
         let mut neg = negentropy::Negentropy::new(
             negentropy::Storage::Borrowed(&storage),
@@ -59,7 +59,7 @@ async fn drive_empty_responder(peer: &mut FakePeerSide) {
         )
         .unwrap();
         let response = neg.reconcile(&msg).unwrap();
-        peer.send_control_msg(&SyncMessage::NegMsg { msg: response })
+        peer.send_control_msg(&Frame::NegMsg { msg: response })
             .await;
     }
 
@@ -68,17 +68,17 @@ async fn drive_empty_responder(peer: &mut FakePeerSide) {
         .recv_data_msg_timeout(Duration::from_secs(5))
         .await
         .expect("expected DataDone");
-    assert_eq!(data_done, SyncMessage::DataDone, "expected DataDone");
+    assert_eq!(data_done, Frame::DataDone, "expected DataDone");
 
     let done = peer
         .recv_control_msg_timeout(Duration::from_secs(5))
         .await
         .expect("expected Done");
-    assert_eq!(done, SyncMessage::Done, "expected Done");
+    assert_eq!(done, Frame::Done, "expected Done");
 
     // 5. Send DataDone + DoneAck back to let initiator complete.
-    peer.send_data_msg(&SyncMessage::DataDone).await;
-    peer.send_control_msg(&SyncMessage::DoneAck).await;
+    peer.send_data_msg(&Frame::DataDone).await;
+    peer.send_control_msg(&Frame::DoneAck).await;
 }
 
 #[tokio::test]
@@ -141,7 +141,7 @@ async fn anticheat_markers_precede_negopen() {
 
         assert_eq!(
             first,
-            SyncMessage::HaveList { ids: vec![] },
+            Frame::HaveList { ids: vec![] },
             "ANTI-CHEAT: first control message must be marker HaveList, not {:?}. \
              If this fails, the stream materialization marker code was disabled.",
             first
@@ -180,7 +180,7 @@ async fn anticheat_datadone_before_done() {
             .recv_control_msg_timeout(Duration::from_secs(5))
             .await
             .unwrap();
-        if let SyncMessage::NegOpen { msg } = neg_open {
+        if let Frame::NegOpen { msg } = neg_open {
             let storage = empty_negentropy_storage();
             let mut neg = negentropy::Negentropy::new(
                 negentropy::Storage::Borrowed(&storage),
@@ -188,7 +188,7 @@ async fn anticheat_datadone_before_done() {
             )
             .unwrap();
             let response = neg.reconcile(&msg).unwrap();
-            peer.send_control_msg(&SyncMessage::NegMsg { msg: response })
+            peer.send_control_msg(&Frame::NegMsg { msg: response })
                 .await;
         }
 
@@ -199,7 +199,7 @@ async fn anticheat_datadone_before_done() {
             .expect("expected DataDone on data stream");
         assert_eq!(
             data_done,
-            SyncMessage::DataDone,
+            Frame::DataDone,
             "ANTI-CHEAT: DataDone must appear on data stream before Done on control"
         );
 
@@ -210,13 +210,13 @@ async fn anticheat_datadone_before_done() {
             .expect("expected Done on control stream");
         assert_eq!(
             done,
-            SyncMessage::Done,
+            Frame::Done,
             "ANTI-CHEAT: Done must follow DataDone"
         );
 
         // Send completion
-        peer.send_data_msg(&SyncMessage::DataDone).await;
-        peer.send_control_msg(&SyncMessage::DoneAck).await;
+        peer.send_data_msg(&Frame::DataDone).await;
+        peer.send_control_msg(&Frame::DoneAck).await;
         cancel.cancel();
     })
     .await;

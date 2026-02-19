@@ -7,8 +7,8 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 use tracing::{info, warn};
 
-use crate::protocol::SyncMessage;
-use crate::protocol::wire::encode_sync_message;
+use crate::protocol::Frame;
+use crate::protocol::wire::encode_frame;
 
 /// Build an IntroOffer message for `recipient` about `other_peer`.
 pub fn build_intro_offer(
@@ -18,7 +18,7 @@ pub fn build_intro_offer(
     observed_at_ms: u64,
     ttl_ms: u64,
     attempt_window_ms: u32,
-) -> Result<SyncMessage, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Frame, Box<dyn std::error::Error + Send + Sync>> {
     let other_peer_bytes = hex::decode(other_peer_id_hex)?;
     if other_peer_bytes.len() != 32 {
         return Err(format!("other_peer_id must be 32 bytes, got {}", other_peer_bytes.len()).into());
@@ -39,7 +39,7 @@ pub fn build_intro_offer(
     let intro_id: [u8; 16] = rand::random();
     let expires_at_ms = observed_at_ms + ttl_ms;
 
-    Ok(SyncMessage::IntroOffer {
+    Ok(Frame::IntroOffer {
         intro_id,
         other_peer_id,
         origin_family,
@@ -55,9 +55,9 @@ pub fn build_intro_offer(
 /// Opens a new uni-directional stream, writes the encoded message, and finishes.
 pub async fn send_intro_offer(
     connection: &quinn::Connection,
-    msg: &SyncMessage,
+    msg: &Frame,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let encoded = encode_sync_message(msg);
+    let encoded = encode_frame(msg);
     let mut send_stream = connection.open_uni().await?;
     send_stream.write_all(&encoded).await?;
     send_stream.finish()?;
@@ -135,7 +135,7 @@ pub async fn run_intro(
 async fn send_intro_to_peer(
     endpoint: &quinn::Endpoint,
     addr: SocketAddr,
-    offer: &SyncMessage,
+    offer: &Frame,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let connecting = endpoint.connect(addr, "localhost")?;
     let connection = tokio::time::timeout(Duration::from_secs(5), connecting).await

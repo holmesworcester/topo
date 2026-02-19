@@ -1,23 +1,23 @@
 use async_trait::async_trait;
 
 use crate::contracts::network_contract::{
-    ControlIo, DataRecvIo, DataSendIo, SessionIo, SessionIoError, SessionIoParts,
+    ControlIo, DataRecvIo, DataSendIo, TransportSessionIo, TransportSessionIoError, TransportSessionIoParts,
 };
 use crate::protocol::wire::ParseError;
-use crate::protocol::{encode_sync_message, parse_sync_message, SyncMessage};
+use crate::protocol::{encode_frame, parse_frame, Frame};
 use crate::transport::connection::ConnectionError;
 use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
 
 /// Largest legal sync frame today is NegOpen/NegMsg: 1 byte tag + 4 byte len + 4 MiB payload.
 pub const DEFAULT_SYNC_FRAME_MAX_BYTES: usize = (4 * 1024 * 1024) + 5;
 
-pub struct SyncSessionIo<C: StreamConn, S: StreamSend, R: StreamRecv> {
+pub struct QuicTransportSessionIo<C: StreamConn, S: StreamSend, R: StreamRecv> {
     session_id: u64,
     max_frame_size: usize,
     conn: DualConnection<C, S, R>,
 }
 
-impl<C: StreamConn, S: StreamSend, R: StreamRecv> SyncSessionIo<C, S, R> {
+impl<C: StreamConn, S: StreamSend, R: StreamRecv> QuicTransportSessionIo<C, S, R> {
     pub fn new(session_id: u64, conn: DualConnection<C, S, R>) -> Self {
         Self {
             session_id,
@@ -43,35 +43,35 @@ impl<C: StreamConn, S: StreamSend, R: StreamRecv> SyncSessionIo<C, S, R> {
     }
 }
 
-fn map_parse_error(err: ParseError, max_frame_size: usize) -> SessionIoError {
+fn map_parse_error(err: ParseError, max_frame_size: usize) -> TransportSessionIoError {
     match err {
         ParseError::EventTooLarge(len) | ParseError::NegMessageTooLarge(len) => {
-            SessionIoError::FrameTooLarge {
+            TransportSessionIoError::FrameTooLarge {
                 len,
                 max: max_frame_size,
             }
         }
-        other => SessionIoError::PeerViolation(other.to_string()),
+        other => TransportSessionIoError::PeerViolation(other.to_string()),
     }
 }
 
-fn map_connection_error(err: ConnectionError, max_frame_size: usize) -> SessionIoError {
+fn map_connection_error(err: ConnectionError, max_frame_size: usize) -> TransportSessionIoError {
     match err {
-        ConnectionError::Closed => SessionIoError::ConnectionLost,
+        ConnectionError::Closed => TransportSessionIoError::ConnectionLost,
         ConnectionError::Parse(parse) => map_parse_error(parse, max_frame_size),
-        ConnectionError::Io(e) => SessionIoError::Internal(format!("io: {e}")),
-        ConnectionError::Quinn(e) => SessionIoError::Internal(format!("quinn write: {e}")),
-        ConnectionError::QuinnRead(e) => SessionIoError::Internal(format!("quinn read: {e}")),
-        ConnectionError::QuinnClose(e) => SessionIoError::Internal(format!("quinn close: {e}")),
+        ConnectionError::Io(e) => TransportSessionIoError::Internal(format!("io: {e}")),
+        ConnectionError::Quinn(e) => TransportSessionIoError::Internal(format!("quinn write: {e}")),
+        ConnectionError::QuinnRead(e) => TransportSessionIoError::Internal(format!("quinn read: {e}")),
+        ConnectionError::QuinnClose(e) => TransportSessionIoError::Internal(format!("quinn close: {e}")),
     }
 }
 
-fn decode_exact_frame(frame: &[u8], max_frame_size: usize) -> Result<SyncMessage, SessionIoError> {
+fn decode_exact_frame(frame: &[u8], max_frame_size: usize) -> Result<Frame, TransportSessionIoError> {
     let (msg, consumed) =
-        parse_sync_message(frame).map_err(|e| map_parse_error(e, max_frame_size))?;
+        parse_frame(frame).map_err(|e| map_parse_error(e, max_frame_size))?;
 
     if consumed != frame.len() {
-        return Err(SessionIoError::PeerViolation(format!(
+        return Err(TransportSessionIoError::PeerViolation(format!(
             "trailing bytes in frame: consumed={consumed}, total={}",
             frame.len()
         )));
@@ -91,18 +91,18 @@ struct SyncControlIo<C: StreamConn + Send + 'static> {
 
 #[async_trait]
 impl<C: StreamConn + Send + 'static> ControlIo for SyncControlIo<C> {
-    async fn recv(&mut self) -> Result<Vec<u8>, SessionIoError> {
+    async fn recv(&mut self) -> Result<Vec<u8>, TransportSessionIoError> {
         let msg = self
             .inner
             .recv()
             .await
             .map_err(|e| map_connection_error(e, self.max_frame_size))?;
-        Ok(encode_sync_message(&msg))
+        Ok(encode_frame(&msg))
     }
 
-    async fn send(&mut self, frame: &[u8]) -> Result<(), SessionIoError> {
+    async fn send(&mut self, frame: &[u8]) -> Result<(), TransportSessionIoError> {
         if frame.len() > self.max_frame_size {
-            return Err(SessionIoError::FrameTooLarge {
+            return Err(TransportSessionIoError::FrameTooLarge {
                 len: frame.len(),
                 max: self.max_frame_size,
             });
@@ -114,7 +114,7 @@ impl<C: StreamConn + Send + 'static> ControlIo for SyncControlIo<C> {
             .map_err(|e| map_connection_error(e, self.max_frame_size))
     }
 
-    async fn flush(&mut self) -> Result<(), SessionIoError> {
+    async fn flush(&mut self) -> Result<(), TransportSessionIoError> {
         self.inner
             .flush()
             .await
@@ -129,9 +129,9 @@ struct SyncDataSendIo<S: StreamSend + Send + 'static> {
 
 #[async_trait]
 impl<S: StreamSend + Send + 'static> DataSendIo for SyncDataSendIo<S> {
-    async fn send(&mut self, frame: &[u8]) -> Result<(), SessionIoError> {
+    async fn send(&mut self, frame: &[u8]) -> Result<(), TransportSessionIoError> {
         if frame.len() > self.max_frame_size {
-            return Err(SessionIoError::FrameTooLarge {
+            return Err(TransportSessionIoError::FrameTooLarge {
                 len: frame.len(),
                 max: self.max_frame_size,
             });
@@ -143,7 +143,7 @@ impl<S: StreamSend + Send + 'static> DataSendIo for SyncDataSendIo<S> {
             .map_err(|e| map_connection_error(e, self.max_frame_size))
     }
 
-    async fn flush(&mut self) -> Result<(), SessionIoError> {
+    async fn flush(&mut self) -> Result<(), TransportSessionIoError> {
         self.inner
             .flush()
             .await
@@ -158,22 +158,22 @@ struct SyncDataRecvIo<R: StreamRecv + Send + 'static> {
 
 #[async_trait]
 impl<R: StreamRecv + Send + 'static> DataRecvIo for SyncDataRecvIo<R> {
-    async fn recv(&mut self) -> Result<Vec<u8>, SessionIoError> {
+    async fn recv(&mut self) -> Result<Vec<u8>, TransportSessionIoError> {
         let msg = self
             .inner
             .recv()
             .await
             .map_err(|e| map_connection_error(e, self.max_frame_size))?;
-        Ok(encode_sync_message(&msg))
+        Ok(encode_frame(&msg))
     }
 }
 
 // ---------------------------------------------------------------------------
-// SessionIo implementation
+// TransportSessionIo implementation
 // ---------------------------------------------------------------------------
 
 #[async_trait]
-impl<C, S, R> SessionIo for SyncSessionIo<C, S, R>
+impl<C, S, R> TransportSessionIo for QuicTransportSessionIo<C, S, R>
 where
     C: StreamConn + Send + 'static,
     S: StreamSend + Send + 'static,
@@ -187,10 +187,10 @@ where
         self.max_frame_size
     }
 
-    fn split(self: Box<Self>) -> SessionIoParts {
+    fn split(self: Box<Self>) -> TransportSessionIoParts {
         let max = self.max_frame_size;
         let conn = self.conn;
-        SessionIoParts {
+        TransportSessionIoParts {
             control: Box::new(SyncControlIo {
                 inner: conn.control,
                 max_frame_size: max,
@@ -215,8 +215,8 @@ mod tests {
 
     #[derive(Default)]
     struct MockControlState {
-        recv: VecDeque<Result<SyncMessage, ConnectionError>>,
-        sent: Vec<SyncMessage>,
+        recv: VecDeque<Result<Frame, ConnectionError>>,
+        sent: Vec<Frame>,
         flushes: usize,
     }
 
@@ -227,7 +227,7 @@ mod tests {
 
     impl MockControl {
         fn with_recv(
-            recv: Vec<Result<SyncMessage, ConnectionError>>,
+            recv: Vec<Result<Frame, ConnectionError>>,
         ) -> (Self, Arc<Mutex<MockControlState>>) {
             let state = Arc::new(Mutex::new(MockControlState {
                 recv: recv.into(),
@@ -245,7 +245,7 @@ mod tests {
 
     #[async_trait]
     impl StreamConn for MockControl {
-        async fn send(&mut self, msg: &SyncMessage) -> Result<(), ConnectionError> {
+        async fn send(&mut self, msg: &Frame) -> Result<(), ConnectionError> {
             self.state
                 .lock()
                 .expect("control lock")
@@ -259,7 +259,7 @@ mod tests {
             Ok(())
         }
 
-        async fn recv(&mut self) -> Result<SyncMessage, ConnectionError> {
+        async fn recv(&mut self) -> Result<Frame, ConnectionError> {
             self.state
                 .lock()
                 .expect("control lock")
@@ -271,7 +271,7 @@ mod tests {
 
     #[derive(Default)]
     struct MockSendState {
-        sent: Vec<SyncMessage>,
+        sent: Vec<Frame>,
         flushes: usize,
     }
 
@@ -294,7 +294,7 @@ mod tests {
 
     #[async_trait]
     impl StreamSend for MockDataSend {
-        async fn send(&mut self, msg: &SyncMessage) -> Result<(), ConnectionError> {
+        async fn send(&mut self, msg: &Frame) -> Result<(), ConnectionError> {
             self.state.lock().expect("send lock").sent.push(msg.clone());
             Ok(())
         }
@@ -307,7 +307,7 @@ mod tests {
 
     #[derive(Default)]
     struct MockRecvState {
-        recv: VecDeque<Result<SyncMessage, ConnectionError>>,
+        recv: VecDeque<Result<Frame, ConnectionError>>,
     }
 
     #[derive(Clone)]
@@ -317,7 +317,7 @@ mod tests {
 
     impl MockDataRecv {
         fn with_recv(
-            recv: Vec<Result<SyncMessage, ConnectionError>>,
+            recv: Vec<Result<Frame, ConnectionError>>,
         ) -> (Self, Arc<Mutex<MockRecvState>>) {
             let state = Arc::new(Mutex::new(MockRecvState { recv: recv.into() }));
             (
@@ -331,7 +331,7 @@ mod tests {
 
     #[async_trait]
     impl StreamRecv for MockDataRecv {
-        async fn recv(&mut self) -> Result<SyncMessage, ConnectionError> {
+        async fn recv(&mut self) -> Result<Frame, ConnectionError> {
             self.state
                 .lock()
                 .expect("recv lock")
@@ -342,10 +342,10 @@ mod tests {
     }
 
     fn build_io(
-        control_recv: Vec<Result<SyncMessage, ConnectionError>>,
-        data_recv: Vec<Result<SyncMessage, ConnectionError>>,
+        control_recv: Vec<Result<Frame, ConnectionError>>,
+        data_recv: Vec<Result<Frame, ConnectionError>>,
     ) -> (
-        SessionIoParts,
+        TransportSessionIoParts,
         Arc<Mutex<MockControlState>>,
         Arc<Mutex<MockSendState>>,
     ) {
@@ -358,7 +358,7 @@ mod tests {
             data_recv,
         };
 
-        let io = Box::new(SyncSessionIo::new(7, conn));
+        let io = Box::new(QuicTransportSessionIo::new(7, conn));
         let parts = io.split();
         (parts, control_state, data_send_state)
     }
@@ -366,30 +366,30 @@ mod tests {
     #[tokio::test]
     async fn session_io_encodes_decodes_control_and_data_frames() {
         let (mut parts, control_state, data_send_state) = build_io(
-            vec![Ok(SyncMessage::Done)],
-            vec![Ok(SyncMessage::Event {
+            vec![Ok(Frame::Done)],
+            vec![Ok(Frame::Event {
                 blob: vec![1, 2, 3],
             })],
         );
 
         let control_frame = parts.control.recv().await.expect("recv control");
-        let (control_msg, consumed) = parse_sync_message(&control_frame).expect("parse control");
+        let (control_msg, consumed) = parse_frame(&control_frame).expect("parse control");
         assert_eq!(consumed, control_frame.len());
-        assert_eq!(control_msg, SyncMessage::Done);
+        assert_eq!(control_msg, Frame::Done);
 
         let data_frame = parts.data_recv.recv().await.expect("recv data");
-        let (data_msg, consumed) = parse_sync_message(&data_frame).expect("parse data");
+        let (data_msg, consumed) = parse_frame(&data_frame).expect("parse data");
         assert_eq!(consumed, data_frame.len());
         assert_eq!(
             data_msg,
-            SyncMessage::Event {
+            Frame::Event {
                 blob: vec![1, 2, 3]
             }
         );
 
-        let neg_open = encode_sync_message(&SyncMessage::NegOpen { msg: vec![9, 8, 7] });
+        let neg_open = encode_frame(&Frame::NegOpen { msg: vec![9, 8, 7] });
         parts.control.send(&neg_open).await.expect("send control");
-        let data_done = encode_sync_message(&SyncMessage::DataDone);
+        let data_done = encode_frame(&Frame::DataDone);
         parts.data_send.send(&data_done).await.expect("send data");
 
         parts.control.flush().await.expect("control flush");
@@ -397,23 +397,23 @@ mod tests {
 
         let control = control_state.lock().expect("control lock");
         assert_eq!(control.sent.len(), 1);
-        assert_eq!(control.sent[0], SyncMessage::NegOpen { msg: vec![9, 8, 7] });
+        assert_eq!(control.sent[0], Frame::NegOpen { msg: vec![9, 8, 7] });
         assert!(control.flushes >= 1);
 
         let data_send = data_send_state.lock().expect("send lock");
         assert_eq!(data_send.sent.len(), 1);
-        assert_eq!(data_send.sent[0], SyncMessage::DataDone);
+        assert_eq!(data_send.sent[0], Frame::DataDone);
         assert!(data_send.flushes >= 1);
     }
 
     #[tokio::test]
     async fn send_control_rejects_trailing_bytes() {
         let (mut parts, _control_state, _data_send_state) = build_io(vec![], vec![]);
-        let mut frame = encode_sync_message(&SyncMessage::Done);
+        let mut frame = encode_frame(&Frame::Done);
         frame.push(0);
 
         let err = parts.control.send(&frame).await.expect_err("expected error");
-        assert!(matches!(err, SessionIoError::PeerViolation(_)));
+        assert!(matches!(err, TransportSessionIoError::PeerViolation(_)));
     }
 
     #[tokio::test]
@@ -422,7 +422,7 @@ mod tests {
             build_io(vec![Err(ConnectionError::Closed)], vec![]);
 
         let err = parts.control.recv().await.expect_err("expected error");
-        assert_eq!(err, SessionIoError::ConnectionLost);
+        assert_eq!(err, TransportSessionIoError::ConnectionLost);
     }
 
     #[tokio::test]
@@ -433,7 +433,7 @@ mod tests {
         let err = parts.data_recv.recv().await.expect_err("expected error");
         assert_eq!(
             err,
-            SessionIoError::FrameTooLarge {
+            TransportSessionIoError::FrameTooLarge {
                 len: 123_456,
                 max: DEFAULT_SYNC_FRAME_MAX_BYTES,
             }
@@ -448,7 +448,7 @@ mod tests {
         let err = parts.data_send.send(&oversized).await.expect_err("expected error");
         assert_eq!(
             err,
-            SessionIoError::FrameTooLarge {
+            TransportSessionIoError::FrameTooLarge {
                 len: DEFAULT_SYNC_FRAME_MAX_BYTES + 1,
                 max: DEFAULT_SYNC_FRAME_MAX_BYTES,
             }

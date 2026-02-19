@@ -1,6 +1,6 @@
 pub mod wire;
 
-pub use wire::{SyncMessage, parse_sync_message, encode_sync_message};
+pub use wire::{Frame, parse_frame, encode_frame};
 
 use crate::crypto::EventId;
 use negentropy::Id;

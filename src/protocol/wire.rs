@@ -8,7 +8,7 @@ const MAX_HAVE_LIST_IDS: usize = 100_000;
 
 /// Sync protocol messages
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SyncMessage {
+pub enum Frame {
     /// Initial negentropy reconciliation message
     NegOpen { msg: Vec<u8> },
     /// Negentropy reconciliation response
@@ -37,8 +37,8 @@ pub enum SyncMessage {
 }
 
 
-/// Parse a sync message from bytes
-pub fn parse_sync_message(input: &[u8]) -> Result<(SyncMessage, usize), ParseError> {
+/// Parse a frame from bytes
+pub fn parse_frame(input: &[u8]) -> Result<(Frame, usize), ParseError> {
     if input.is_empty() {
         return Err(ParseError::InsufficientData);
     }
@@ -61,9 +61,9 @@ pub fn parse_sync_message(input: &[u8]) -> Result<(SyncMessage, usize), ParseErr
             }
             let msg = input[5..total_size].to_vec();
             let sync_msg = if msg_type == MSG_TYPE_NEG_OPEN {
-                SyncMessage::NegOpen { msg }
+                Frame::NegOpen { msg }
             } else {
-                SyncMessage::NegMsg { msg }
+                Frame::NegMsg { msg }
             };
             Ok((sync_msg, total_size))
         }
@@ -87,7 +87,7 @@ pub fn parse_sync_message(input: &[u8]) -> Result<(SyncMessage, usize), ParseErr
                 id.copy_from_slice(&input[start..start + 32]);
                 ids.push(id);
             }
-            Ok((SyncMessage::HaveList { ids }, total_size))
+            Ok((Frame::HaveList { ids }, total_size))
         }
         MSG_TYPE_EVENT => {
             // Variable length: type(1) + len(4) + blob(len)
@@ -103,11 +103,11 @@ pub fn parse_sync_message(input: &[u8]) -> Result<(SyncMessage, usize), ParseErr
                 return Err(ParseError::InsufficientData);
             }
             let blob = input[5..total_size].to_vec();
-            Ok((SyncMessage::Event { blob }, total_size))
+            Ok((Frame::Event { blob }, total_size))
         }
-        MSG_TYPE_DONE => Ok((SyncMessage::Done, 1)),
-        MSG_TYPE_DONE_ACK => Ok((SyncMessage::DoneAck, 1)),
-        MSG_TYPE_DATA_DONE => Ok((SyncMessage::DataDone, 1)),
+        MSG_TYPE_DONE => Ok((Frame::Done, 1)),
+        MSG_TYPE_DONE_ACK => Ok((Frame::DoneAck, 1)),
+        MSG_TYPE_DATA_DONE => Ok((Frame::DataDone, 1)),
         MSG_TYPE_INTRO_OFFER => {
             // Fixed layout: type(1) + intro_id(16) + other_peer_id(32)
             //   + origin_family(1) + origin_ip(16) + origin_port(2)
@@ -137,7 +137,7 @@ pub fn parse_sync_message(input: &[u8]) -> Result<(SyncMessage, usize), ParseErr
             let attempt_window_ms = u32::from_le_bytes(input[pos..pos + 4].try_into().unwrap());
             pos += 4;
             debug_assert_eq!(pos, INTRO_OFFER_SIZE);
-            Ok((SyncMessage::IntroOffer {
+            Ok((Frame::IntroOffer {
                 intro_id,
                 other_peer_id,
                 origin_family,
@@ -152,24 +152,24 @@ pub fn parse_sync_message(input: &[u8]) -> Result<(SyncMessage, usize), ParseErr
     }
 }
 
-/// Encode a sync message to bytes
-pub fn encode_sync_message(msg: &SyncMessage) -> Vec<u8> {
+/// Encode a frame to bytes
+pub fn encode_frame(msg: &Frame) -> Vec<u8> {
     match msg {
-        SyncMessage::NegOpen { msg: data } => {
+        Frame::NegOpen { msg: data } => {
             let mut buf = Vec::with_capacity(5 + data.len());
             buf.push(MSG_TYPE_NEG_OPEN);
             buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
             buf.extend_from_slice(data);
             buf
         }
-        SyncMessage::NegMsg { msg: data } => {
+        Frame::NegMsg { msg: data } => {
             let mut buf = Vec::with_capacity(5 + data.len());
             buf.push(MSG_TYPE_NEG_MSG);
             buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
             buf.extend_from_slice(data);
             buf
         }
-        SyncMessage::HaveList { ids } => {
+        Frame::HaveList { ids } => {
             let mut buf = Vec::with_capacity(5 + ids.len() * 32);
             buf.push(MSG_TYPE_HAVE_LIST);
             buf.extend_from_slice(&(ids.len() as u32).to_le_bytes());
@@ -178,17 +178,17 @@ pub fn encode_sync_message(msg: &SyncMessage) -> Vec<u8> {
             }
             buf
         }
-        SyncMessage::Event { blob } => {
+        Frame::Event { blob } => {
             let mut buf = Vec::with_capacity(5 + blob.len());
             buf.push(MSG_TYPE_EVENT);
             buf.extend_from_slice(&(blob.len() as u32).to_le_bytes());
             buf.extend_from_slice(blob);
             buf
         }
-        SyncMessage::Done => vec![MSG_TYPE_DONE],
-        SyncMessage::DoneAck => vec![MSG_TYPE_DONE_ACK],
-        SyncMessage::DataDone => vec![MSG_TYPE_DATA_DONE],
-        SyncMessage::IntroOffer {
+        Frame::Done => vec![MSG_TYPE_DONE],
+        Frame::DoneAck => vec![MSG_TYPE_DONE_ACK],
+        Frame::DataDone => vec![MSG_TYPE_DATA_DONE],
+        Frame::IntroOffer {
             intro_id,
             other_peer_id,
             origin_family,
@@ -242,22 +242,22 @@ mod tests {
 
     #[test]
     fn test_neg_open_roundtrip() {
-        let msg = SyncMessage::NegOpen { msg: vec![1, 2, 3, 4, 5] };
-        let encoded = encode_sync_message(&msg);
+        let msg = Frame::NegOpen { msg: vec![1, 2, 3, 4, 5] };
+        let encoded = encode_frame(&msg);
         assert_eq!(encoded.len(), 10); // 1 + 4 + 5
 
-        let (parsed, consumed) = parse_sync_message(&encoded).unwrap();
+        let (parsed, consumed) = parse_frame(&encoded).unwrap();
         assert_eq!(consumed, 10);
         assert_eq!(parsed, msg);
     }
 
     #[test]
     fn test_neg_msg_roundtrip() {
-        let msg = SyncMessage::NegMsg { msg: vec![10, 20, 30] };
-        let encoded = encode_sync_message(&msg);
+        let msg = Frame::NegMsg { msg: vec![10, 20, 30] };
+        let encoded = encode_frame(&msg);
         assert_eq!(encoded.len(), 8); // 1 + 4 + 3
 
-        let (parsed, consumed) = parse_sync_message(&encoded).unwrap();
+        let (parsed, consumed) = parse_frame(&encoded).unwrap();
         assert_eq!(consumed, 8);
         assert_eq!(parsed, msg);
     }
@@ -265,11 +265,11 @@ mod tests {
     #[test]
     fn test_event_roundtrip() {
         let blob = vec![3u8; 100];
-        let msg = SyncMessage::Event { blob: blob.clone() };
-        let encoded = encode_sync_message(&msg);
+        let msg = Frame::Event { blob: blob.clone() };
+        let encoded = encode_frame(&msg);
         assert_eq!(encoded.len(), 5 + 100); // type(1) + len(4) + blob(100)
 
-        let (parsed, consumed) = parse_sync_message(&encoded).unwrap();
+        let (parsed, consumed) = parse_frame(&encoded).unwrap();
         assert_eq!(consumed, 105);
         assert_eq!(parsed, msg);
     }
@@ -278,10 +278,10 @@ mod tests {
     fn test_event_variable_sizes() {
         for size in [0, 1, 75, 100, 512, 1000, 10000] {
             let blob = vec![0xABu8; size];
-            let msg = SyncMessage::Event { blob: blob.clone() };
-            let encoded = encode_sync_message(&msg);
+            let msg = Frame::Event { blob: blob.clone() };
+            let encoded = encode_frame(&msg);
             assert_eq!(encoded.len(), 5 + size);
-            let (parsed, consumed) = parse_sync_message(&encoded).unwrap();
+            let (parsed, consumed) = parse_frame(&encoded).unwrap();
             assert_eq!(consumed, 5 + size);
             assert_eq!(parsed, msg);
         }
@@ -295,54 +295,54 @@ mod tests {
         buf.extend_from_slice(&(len as u32).to_le_bytes());
         // Don't need actual data — parser should reject based on length
         buf.extend_from_slice(&vec![0u8; len]);
-        let result = parse_sync_message(&buf);
+        let result = parse_frame(&buf);
         assert_eq!(result, Err(ParseError::EventTooLarge(len)));
     }
 
     #[test]
     fn test_parse_insufficient_data() {
-        let result = parse_sync_message(&[MSG_TYPE_NEG_OPEN]);
+        let result = parse_frame(&[MSG_TYPE_NEG_OPEN]);
         assert_eq!(result, Err(ParseError::InsufficientData));
     }
 
     #[test]
     fn test_parse_unknown_type() {
-        let result = parse_sync_message(&[0xFF, 0, 0, 0, 0]);
+        let result = parse_frame(&[0xFF, 0, 0, 0, 0]);
         assert_eq!(result, Err(ParseError::UnknownType(0xFF)));
     }
     #[test]
     fn test_done_roundtrip() {
-        let msg = SyncMessage::Done;
-        let encoded = encode_sync_message(&msg);
+        let msg = Frame::Done;
+        let encoded = encode_frame(&msg);
         assert_eq!(encoded.len(), 1);
-        let (parsed, consumed) = parse_sync_message(&encoded).unwrap();
+        let (parsed, consumed) = parse_frame(&encoded).unwrap();
         assert_eq!(consumed, 1);
         assert_eq!(parsed, msg);
     }
 
     #[test]
     fn test_done_ack_roundtrip() {
-        let msg = SyncMessage::DoneAck;
-        let encoded = encode_sync_message(&msg);
+        let msg = Frame::DoneAck;
+        let encoded = encode_frame(&msg);
         assert_eq!(encoded.len(), 1);
-        let (parsed, consumed) = parse_sync_message(&encoded).unwrap();
+        let (parsed, consumed) = parse_frame(&encoded).unwrap();
         assert_eq!(consumed, 1);
         assert_eq!(parsed, msg);
     }
 
     #[test]
     fn test_data_done_roundtrip() {
-        let msg = SyncMessage::DataDone;
-        let encoded = encode_sync_message(&msg);
+        let msg = Frame::DataDone;
+        let encoded = encode_frame(&msg);
         assert_eq!(encoded.len(), 1);
-        let (parsed, consumed) = parse_sync_message(&encoded).unwrap();
+        let (parsed, consumed) = parse_frame(&encoded).unwrap();
         assert_eq!(consumed, 1);
         assert_eq!(parsed, msg);
     }
 
     #[test]
     fn test_intro_offer_roundtrip() {
-        let msg = SyncMessage::IntroOffer {
+        let msg = Frame::IntroOffer {
             intro_id: [0xAA; 16],
             other_peer_id: [0xBB; 32],
             origin_family: 4,
@@ -357,16 +357,16 @@ mod tests {
             expires_at_ms: 1700000030000,
             attempt_window_ms: 4000,
         };
-        let encoded = encode_sync_message(&msg);
+        let encoded = encode_frame(&msg);
         assert_eq!(encoded.len(), 88); // type(1) + fixed payload(87)
-        let (parsed, consumed) = parse_sync_message(&encoded).unwrap();
+        let (parsed, consumed) = parse_frame(&encoded).unwrap();
         assert_eq!(consumed, 88);
         assert_eq!(parsed, msg);
     }
 
     #[test]
     fn test_intro_offer_ipv6_roundtrip() {
-        let msg = SyncMessage::IntroOffer {
+        let msg = Frame::IntroOffer {
             intro_id: [0x01; 16],
             other_peer_id: [0x02; 32],
             origin_family: 6,
@@ -376,9 +376,9 @@ mod tests {
             expires_at_ms: u64::MAX,
             attempt_window_ms: 10000,
         };
-        let encoded = encode_sync_message(&msg);
+        let encoded = encode_frame(&msg);
         assert_eq!(encoded.len(), 88);
-        let (parsed, consumed) = parse_sync_message(&encoded).unwrap();
+        let (parsed, consumed) = parse_frame(&encoded).unwrap();
         assert_eq!(consumed, 88);
         assert_eq!(parsed, msg);
     }
@@ -386,13 +386,13 @@ mod tests {
     #[test]
     fn test_intro_offer_insufficient_data() {
         // Just the type byte, no payload
-        let result = parse_sync_message(&[MSG_TYPE_INTRO_OFFER]);
+        let result = parse_frame(&[MSG_TYPE_INTRO_OFFER]);
         assert_eq!(result, Err(ParseError::InsufficientData));
 
         // Partial payload (50 of 87 needed)
         let mut buf = vec![MSG_TYPE_INTRO_OFFER];
         buf.extend_from_slice(&[0u8; 50]);
-        let result = parse_sync_message(&buf);
+        let result = parse_frame(&buf);
         assert_eq!(result, Err(ParseError::InsufficientData));
     }
 
@@ -402,12 +402,12 @@ mod tests {
         let mut buf = vec![MSG_TYPE_NEG_OPEN];
         buf.extend_from_slice(&oversized_len.to_le_bytes());
         buf.extend_from_slice(&vec![0u8; MAX_NEG_MSG_BYTES + 1]);
-        let result = parse_sync_message(&buf);
+        let result = parse_frame(&buf);
         assert_eq!(result, Err(ParseError::NegMessageTooLarge(MAX_NEG_MSG_BYTES + 1)));
 
         // Also test NEG_MSG
         buf[0] = MSG_TYPE_NEG_MSG;
-        let result = parse_sync_message(&buf);
+        let result = parse_frame(&buf);
         assert_eq!(result, Err(ParseError::NegMessageTooLarge(MAX_NEG_MSG_BYTES + 1)));
     }
 
@@ -417,9 +417,9 @@ mod tests {
         let mut buf = vec![MSG_TYPE_NEG_OPEN];
         buf.extend_from_slice(&max_len.to_le_bytes());
         buf.extend_from_slice(&vec![0u8; MAX_NEG_MSG_BYTES]);
-        let (msg, consumed) = parse_sync_message(&buf).unwrap();
+        let (msg, consumed) = parse_frame(&buf).unwrap();
         assert_eq!(consumed, 5 + MAX_NEG_MSG_BYTES);
-        assert!(matches!(msg, SyncMessage::NegOpen { .. }));
+        assert!(matches!(msg, Frame::NegOpen { .. }));
     }
 
     #[test]
@@ -428,7 +428,7 @@ mod tests {
         let mut buf = vec![MSG_TYPE_HAVE_LIST];
         buf.extend_from_slice(&oversized_count.to_le_bytes());
         // Don't need full data — parser should reject based on count
-        let result = parse_sync_message(&buf);
+        let result = parse_frame(&buf);
         assert_eq!(result, Err(ParseError::TooManyIds(MAX_HAVE_LIST_IDS + 1)));
     }
 
@@ -438,9 +438,9 @@ mod tests {
         let mut buf = vec![MSG_TYPE_HAVE_LIST];
         buf.extend_from_slice(&max_count.to_le_bytes());
         buf.extend_from_slice(&vec![0u8; MAX_HAVE_LIST_IDS * 32]);
-        let (msg, consumed) = parse_sync_message(&buf).unwrap();
+        let (msg, consumed) = parse_frame(&buf).unwrap();
         assert_eq!(consumed, 5 + MAX_HAVE_LIST_IDS * 32);
-        if let SyncMessage::HaveList { ids } = msg {
+        if let Frame::HaveList { ids } = msg {
             assert_eq!(ids.len(), MAX_HAVE_LIST_IDS);
         } else {
             panic!("expected HaveList");

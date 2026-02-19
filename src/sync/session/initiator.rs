@@ -20,7 +20,7 @@ use crate::db::{
     wanted::WantedEvents,
 };
 use crate::runtime::SyncStats;
-use crate::protocol::{neg_id_to_event_id, SyncMessage};
+use crate::protocol::{neg_id_to_event_id, Frame};
 use crate::sync::negentropy_sqlite::NegentropyStorageSqlite;
 use crate::transport::connection::ConnectionError;
 use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
@@ -44,7 +44,7 @@ use super::{
 ///
 /// When `shared_ingest` is provided, events are sent to the shared channel
 /// instead of spawning a per-session batch_writer.
-pub async fn run_sync_initiator_dual<C, S, R>(
+pub async fn run_sync_initiator<C, S, R>(
     conn: DualConnection<C, S, R>,
     db_path: &str,
     timeout_secs: u64,
@@ -125,7 +125,7 @@ where
 
     let initial_msg = neg.initiate()?;
     control
-        .send(&SyncMessage::NegOpen { msg: initial_msg })
+        .send(&Frame::NegOpen { msg: initial_msg })
         .await?;
     control.flush().await?;
 
@@ -150,11 +150,11 @@ where
         }
 
         match tokio::time::timeout(CONTROL_POLL_TIMEOUT, control.recv()).await {
-            Ok(Ok(SyncMessage::NegMsg { msg })) => {
+            Ok(Ok(Frame::NegMsg { msg })) => {
                 rounds += 1;
                 match neg.reconcile_with_ids(&msg, &mut have_ids, &mut need_ids)? {
                     Some(next_msg) => {
-                        control.send(&SyncMessage::NegMsg { msg: next_msg }).await?;
+                        control.send(&Frame::NegMsg { msg: next_msg }).await?;
                         control.flush().await?;
                     }
                     None => {
@@ -186,19 +186,19 @@ where
                                 batch.push(event_id);
                             }
                             if batch.len() >= NEED_CHUNK {
-                                control.send(&SyncMessage::HaveList { ids: batch }).await?;
+                                control.send(&Frame::HaveList { ids: batch }).await?;
                                 control.flush().await?;
                                 batch = Vec::with_capacity(NEED_CHUNK);
                             }
                         }
                         if !batch.is_empty() {
-                            control.send(&SyncMessage::HaveList { ids: batch }).await?;
+                            control.send(&Frame::HaveList { ids: batch }).await?;
                             control.flush().await?;
                         }
                     }
                 }
             }
-            Ok(Ok(SyncMessage::DoneAck)) => {
+            Ok(Ok(Frame::DoneAck)) => {
                 info!("Received DoneAck from responder");
                 completed = true;
                 break;
@@ -248,13 +248,13 @@ where
                                 batch.push(event_id);
                             }
                             if batch.len() >= NEED_CHUNK {
-                                let _ = control.send(&SyncMessage::HaveList { ids: batch }).await;
+                                let _ = control.send(&Frame::HaveList { ids: batch }).await;
                                 let _ = control.flush().await;
                                 batch = Vec::with_capacity(NEED_CHUNK);
                             }
                         }
                         if !batch.is_empty() {
-                            let _ = control.send(&SyncMessage::HaveList { ids: batch }).await;
+                            let _ = control.send(&Frame::HaveList { ids: batch }).await;
                             let _ = control.flush().await;
                         }
                         coordination_pending = false;
@@ -291,7 +291,7 @@ where
             for (rowid, event_id) in batch {
                 if let Ok(Some(blob)) = store.get_shared(&event_id) {
                     let blob_len = blob.len() as u64;
-                    if data_send.send(&SyncMessage::Event { blob }).await.is_ok() {
+                    if data_send.send(&Frame::Event { blob }).await.is_ok() {
                         events_sent += 1;
                         bytes_sent += blob_len;
                         sent_this_round += 1;
@@ -317,9 +317,9 @@ where
             let pending_out = egress.count_pending(peer_id).unwrap_or(0);
             if pending_out == 0 {
                 let _ = data_send.flush().await;
-                data_send.send(&SyncMessage::DataDone).await?;
+                data_send.send(&Frame::DataDone).await?;
                 data_send.flush().await?;
-                control.send(&SyncMessage::Done).await?;
+                control.send(&Frame::Done).await?;
                 control.flush().await?;
                 done_sent = true;
                 info!(

@@ -17,7 +17,7 @@ use crate::db::schema::create_tables;
 use crate::db::store::lookup_workspace_id;
 use crate::db::transport_trust::record_transport_binding;
 use crate::sync::ReplicationSessionHandler;
-use crate::transport::{peer_identity_from_connection, DualConnection, SyncSessionIo};
+use crate::transport::{peer_identity_from_connection, DualConnection, QuicTransportSessionIo};
 
 use super::{
     current_timestamp_ms, drain_batch_size, peer_fingerprint_from_hex,
@@ -219,7 +219,7 @@ async fn connect_loop_inner(
                 remote_addr: connection.remote_address(),
                 direction: SessionDirection::Outbound,
             };
-            let io = SyncSessionIo::new(session_id, conn);
+            let io = QuicTransportSessionIo::new(session_id, conn);
             let cancel = CancellationToken::new();
             let watch = spawn_peer_removal_cancellation_watch(
                 db_path.to_string(),

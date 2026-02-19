@@ -21,9 +21,9 @@ use std::time::Duration;
 // Re-exports — preserve the existing public API surface
 // ---------------------------------------------------------------------------
 pub use coordinator::{run_coordinator, PeerCoord};
-pub use initiator::run_sync_initiator_dual;
+pub use initiator::run_sync_initiator;
 pub use receiver::spawn_data_receiver;
-pub use responder::run_sync_responder_dual;
+pub use responder::run_sync_responder;
 
 // ---------------------------------------------------------------------------
 // Session tuning constants (shared across sub-modules)

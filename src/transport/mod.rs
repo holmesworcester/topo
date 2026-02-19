@@ -1,7 +1,7 @@
 pub mod cert;
 pub mod connection;
 pub mod multi_workspace;
-pub mod session_io;
+pub mod transport_session_io;
 pub mod trust_oracle;
 
 pub use cert::{
@@ -9,7 +9,7 @@ pub use cert::{
     generate_self_signed_cert_from_signing_key, validate_cert_key_match,
 };
 pub use connection::{DualConnection, StreamConn, StreamRecv, StreamSend};
-pub use session_io::{SyncSessionIo, DEFAULT_SYNC_FRAME_MAX_BYTES};
+pub use transport_session_io::{QuicTransportSessionIo, DEFAULT_SYNC_FRAME_MAX_BYTES};
 pub use trust_oracle::SqliteTrustOracle;
 
 use quinn::{ClientConfig, Endpoint, ServerConfig};

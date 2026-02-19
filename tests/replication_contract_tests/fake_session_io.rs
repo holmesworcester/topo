@@ -1,4 +1,4 @@
-//! FakeSessionIo: channel-backed implementation of the SessionIo contract
+//! FakeTransportSessionIo: channel-backed implementation of the TransportSessionIo contract
 //! for deterministic, transport-free replication testing.
 //!
 //! Models:
@@ -11,7 +11,7 @@
 //! - transport-layer frame fragmentation,
 //! - deterministic peer-protocol violations.
 //!
-//! The `fake_session_io_pair` constructor returns a `FakeSessionIo` (for the
+//! The `fake_session_io_pair` constructor returns a `FakeTransportSessionIo` (for the
 //! handler under test) and a `FakePeerSide` (for the test harness to script
 //! the other end of the conversation).
 
@@ -23,9 +23,9 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use topo::contracts::network_contract::{
-    ControlIo, DataRecvIo, DataSendIo, SessionIo, SessionIoError, SessionIoParts,
+    ControlIo, DataRecvIo, DataSendIo, TransportSessionIo, TransportSessionIoError, TransportSessionIoParts,
 };
-use topo::protocol::{encode_sync_message, parse_sync_message, SyncMessage};
+use topo::protocol::{encode_frame, parse_frame, Frame};
 
 /// Default max frame size for tests (4 MiB + 5-byte header).
 pub const TEST_MAX_FRAME_SIZE: usize = (4 * 1024 * 1024) + 5;
@@ -34,7 +34,7 @@ pub const TEST_MAX_FRAME_SIZE: usize = (4 * 1024 * 1024) + 5;
 const CHANNEL_CAP: usize = 256;
 
 // ---------------------------------------------------------------------------
-// FakeIoConfig: configurable failure modes for FakeSessionIo
+// FakeIoConfig: configurable failure modes for FakeTransportSessionIo
 // ---------------------------------------------------------------------------
 
 /// Deterministic peer-protocol violations that can be injected into a session.
@@ -52,7 +52,7 @@ pub enum ProtocolViolation {
     DuplicateDone,
 }
 
-/// Configuration for FakeSessionIo failure-mode simulation.
+/// Configuration for FakeTransportSessionIo failure-mode simulation.
 ///
 /// Controls frame-size enforcement, per-frame delivery delay,
 /// data-frame reordering, transport-layer fragmentation, and
@@ -64,7 +64,7 @@ pub struct FakeIoConfig {
     /// Simulates network latency / delayed delivery.
     pub frame_delay: Option<Duration>,
     /// Maximum frame size enforced on send operations. Frames exceeding this
-    /// limit will produce `SessionIoError::FrameTooLarge`.
+    /// limit will produce `TransportSessionIoError::FrameTooLarge`.
     pub max_frame_size: usize,
     /// When true, data frames received via `FakeDataRecvIo` are buffered and
     /// delivered in reversed order (simulates out-of-order delivery).
@@ -94,10 +94,10 @@ impl Default for FakeIoConfig {
 }
 
 // ---------------------------------------------------------------------------
-// FakeSessionIo: implements SessionIo for injection into SessionHandler
+// FakeTransportSessionIo: implements TransportSessionIo for injection into SessionHandler
 // ---------------------------------------------------------------------------
 
-pub struct FakeSessionIo {
+pub struct FakeTransportSessionIo {
     session_id: u64,
     max_frame_size: usize,
     config: FakeIoConfig,
@@ -124,8 +124,8 @@ pub struct FakePeerSide {
     pub closed: Arc<AtomicBool>,
 }
 
-/// Create a paired FakeSessionIo + FakePeerSide for testing.
-pub fn fake_session_io_pair(session_id: u64) -> (FakeSessionIo, FakePeerSide) {
+/// Create a paired FakeTransportSessionIo + FakePeerSide for testing.
+pub fn fake_session_io_pair(session_id: u64) -> (FakeTransportSessionIo, FakePeerSide) {
     fake_session_io_pair_with_config(session_id, FakeIoConfig::default())
 }
 
@@ -133,15 +133,15 @@ pub fn fake_session_io_pair(session_id: u64) -> (FakeSessionIo, FakePeerSide) {
 pub fn fake_session_io_pair_with_capacity(
     session_id: u64,
     cap: usize,
-) -> (FakeSessionIo, FakePeerSide) {
+) -> (FakeTransportSessionIo, FakePeerSide) {
     build_fake_session_io(session_id, cap, FakeIoConfig::default())
 }
 
-/// Create a paired FakeSessionIo + FakePeerSide with custom failure-mode config.
+/// Create a paired FakeTransportSessionIo + FakePeerSide with custom failure-mode config.
 pub fn fake_session_io_pair_with_config(
     session_id: u64,
     config: FakeIoConfig,
-) -> (FakeSessionIo, FakePeerSide) {
+) -> (FakeTransportSessionIo, FakePeerSide) {
     build_fake_session_io(session_id, CHANNEL_CAP, config)
 }
 
@@ -149,14 +149,14 @@ fn build_fake_session_io(
     session_id: u64,
     cap: usize,
     config: FakeIoConfig,
-) -> (FakeSessionIo, FakePeerSide) {
+) -> (FakeTransportSessionIo, FakePeerSide) {
     let (ctrl_to_handler_tx, ctrl_to_handler_rx) = mpsc::channel(cap);
     let (ctrl_from_handler_tx, ctrl_from_handler_rx) = mpsc::channel(cap);
     let (data_to_handler_tx, data_to_handler_rx) = mpsc::channel(cap);
     let (data_from_handler_tx, data_from_handler_rx) = mpsc::channel(cap);
     let closed = Arc::new(AtomicBool::new(false));
 
-    let io = FakeSessionIo {
+    let io = FakeTransportSessionIo {
         session_id,
         max_frame_size: config.max_frame_size,
         config,
@@ -195,15 +195,15 @@ struct FakeControlIo {
     pending_duplicate: Option<Vec<u8>>,
 }
 
-/// Garbage bytes that cannot be parsed as any valid SyncMessage.
+/// Garbage bytes that cannot be parsed as any valid Frame.
 /// Uses 0xFF as the message type byte, which is not a known type.
 const GARBAGE_CONTROL_FRAME: &[u8] = &[0xFF, 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x42];
 
 #[async_trait]
 impl ControlIo for FakeControlIo {
-    async fn recv(&mut self) -> Result<Vec<u8>, SessionIoError> {
+    async fn recv(&mut self) -> Result<Vec<u8>, TransportSessionIoError> {
         if self.closed.load(Ordering::Acquire) {
-            return Err(SessionIoError::ConnectionLost);
+            return Err(TransportSessionIoError::ConnectionLost);
         }
         if let Some(delay) = self.frame_delay {
             tokio::time::sleep(delay).await;
@@ -226,7 +226,7 @@ impl ControlIo for FakeControlIo {
         let frame = self.rx
             .recv()
             .await
-            .ok_or(SessionIoError::ConnectionLost)?;
+            .ok_or(TransportSessionIoError::ConnectionLost)?;
 
         // DuplicateDone: when we see a Done frame, queue a duplicate.
         if let Some(ProtocolViolation::DuplicateDone) = &self.violation {
@@ -240,12 +240,12 @@ impl ControlIo for FakeControlIo {
         Ok(frame)
     }
 
-    async fn send(&mut self, frame: &[u8]) -> Result<(), SessionIoError> {
+    async fn send(&mut self, frame: &[u8]) -> Result<(), TransportSessionIoError> {
         if self.closed.load(Ordering::Acquire) {
-            return Err(SessionIoError::ConnectionLost);
+            return Err(TransportSessionIoError::ConnectionLost);
         }
         if frame.len() > self.max_frame_size {
-            return Err(SessionIoError::FrameTooLarge {
+            return Err(TransportSessionIoError::FrameTooLarge {
                 len: frame.len(),
                 max: self.max_frame_size,
             });
@@ -253,10 +253,10 @@ impl ControlIo for FakeControlIo {
         self.tx
             .send(frame.to_vec())
             .await
-            .map_err(|_| SessionIoError::ConnectionLost)
+            .map_err(|_| TransportSessionIoError::ConnectionLost)
     }
 
-    async fn flush(&mut self) -> Result<(), SessionIoError> {
+    async fn flush(&mut self) -> Result<(), TransportSessionIoError> {
         Ok(()) // channels are unbuffered from the sender's perspective
     }
 }
@@ -269,12 +269,12 @@ struct FakeDataSendIo {
 
 #[async_trait]
 impl DataSendIo for FakeDataSendIo {
-    async fn send(&mut self, frame: &[u8]) -> Result<(), SessionIoError> {
+    async fn send(&mut self, frame: &[u8]) -> Result<(), TransportSessionIoError> {
         if self.closed.load(Ordering::Acquire) {
-            return Err(SessionIoError::ConnectionLost);
+            return Err(TransportSessionIoError::ConnectionLost);
         }
         if frame.len() > self.max_frame_size {
-            return Err(SessionIoError::FrameTooLarge {
+            return Err(TransportSessionIoError::FrameTooLarge {
                 len: frame.len(),
                 max: self.max_frame_size,
             });
@@ -282,10 +282,10 @@ impl DataSendIo for FakeDataSendIo {
         self.tx
             .send(frame.to_vec())
             .await
-            .map_err(|_| SessionIoError::ConnectionLost)
+            .map_err(|_| TransportSessionIoError::ConnectionLost)
     }
 
-    async fn flush(&mut self) -> Result<(), SessionIoError> {
+    async fn flush(&mut self) -> Result<(), TransportSessionIoError> {
         Ok(())
     }
 }
@@ -308,9 +308,9 @@ struct FakeDataRecvIo {
 
 #[async_trait]
 impl DataRecvIo for FakeDataRecvIo {
-    async fn recv(&mut self) -> Result<Vec<u8>, SessionIoError> {
+    async fn recv(&mut self) -> Result<Vec<u8>, TransportSessionIoError> {
         if self.closed.load(Ordering::Acquire) {
-            return Err(SessionIoError::ConnectionLost);
+            return Err(TransportSessionIoError::ConnectionLost);
         }
         if let Some(delay) = self.frame_delay {
             tokio::time::sleep(delay).await;
@@ -337,12 +337,12 @@ impl DataRecvIo for FakeDataRecvIo {
             }
             self.reorder_buf
                 .pop()
-                .ok_or(SessionIoError::ConnectionLost)?
+                .ok_or(TransportSessionIoError::ConnectionLost)?
         } else {
             self.rx
                 .recv()
                 .await
-                .ok_or(SessionIoError::ConnectionLost)?
+                .ok_or(TransportSessionIoError::ConnectionLost)?
         };
 
         // Apply fragmentation: split the frame into 2 chunks at the midpoint.
@@ -359,11 +359,11 @@ impl DataRecvIo for FakeDataRecvIo {
 }
 
 // ---------------------------------------------------------------------------
-// SessionIo implementation
+// TransportSessionIo implementation
 // ---------------------------------------------------------------------------
 
 #[async_trait]
-impl SessionIo for FakeSessionIo {
+impl TransportSessionIo for FakeTransportSessionIo {
     fn session_id(&self) -> u64 {
         self.session_id
     }
@@ -372,9 +372,9 @@ impl SessionIo for FakeSessionIo {
         self.max_frame_size
     }
 
-    fn split(self: Box<Self>) -> SessionIoParts {
+    fn split(self: Box<Self>) -> TransportSessionIoParts {
         let config = &self.config;
-        SessionIoParts {
+        TransportSessionIoParts {
             control: Box::new(FakeControlIo {
                 rx: self.ctrl_in_rx.expect("split called twice"),
                 tx: self.ctrl_out_tx.expect("split called twice"),
@@ -409,62 +409,62 @@ impl SessionIo for FakeSessionIo {
 // ---------------------------------------------------------------------------
 
 impl FakePeerSide {
-    /// Send a SyncMessage (encoded) on the control channel.
-    pub async fn send_control_msg(&self, msg: &SyncMessage) {
-        let frame = encode_sync_message(msg);
+    /// Send a Frame (encoded) on the control channel.
+    pub async fn send_control_msg(&self, msg: &Frame) {
+        let frame = encode_frame(msg);
         self.control_send
             .send(frame)
             .await
             .expect("control channel closed");
     }
 
-    /// Send a SyncMessage (encoded) on the data channel.
-    pub async fn send_data_msg(&self, msg: &SyncMessage) {
-        let frame = encode_sync_message(msg);
+    /// Send a Frame (encoded) on the data channel.
+    pub async fn send_data_msg(&self, msg: &Frame) {
+        let frame = encode_frame(msg);
         self.data_send
             .send(frame)
             .await
             .expect("data channel closed");
     }
 
-    /// Receive and decode a SyncMessage from the control channel.
+    /// Receive and decode a Frame from the control channel.
     #[allow(dead_code)]
-    pub async fn recv_control_msg(&mut self) -> Option<SyncMessage> {
+    pub async fn recv_control_msg(&mut self) -> Option<Frame> {
         let frame = self.control_recv.recv().await?;
-        let (msg, _) = parse_sync_message(&frame).expect("invalid frame from handler");
+        let (msg, _) = parse_frame(&frame).expect("invalid frame from handler");
         Some(msg)
     }
 
-    /// Receive and decode a SyncMessage from the data channel.
+    /// Receive and decode a Frame from the data channel.
     #[allow(dead_code)]
-    pub async fn recv_data_msg(&mut self) -> Option<SyncMessage> {
+    pub async fn recv_data_msg(&mut self) -> Option<Frame> {
         let frame = self.data_recv.recv().await?;
-        let (msg, _) = parse_sync_message(&frame).expect("invalid frame from handler");
+        let (msg, _) = parse_frame(&frame).expect("invalid frame from handler");
         Some(msg)
     }
 
-    /// Receive and decode a SyncMessage from the control channel with timeout.
+    /// Receive and decode a Frame from the control channel with timeout.
     pub async fn recv_control_msg_timeout(
         &mut self,
         timeout: std::time::Duration,
-    ) -> Option<SyncMessage> {
+    ) -> Option<Frame> {
         match tokio::time::timeout(timeout, self.control_recv.recv()).await {
             Ok(Some(frame)) => {
-                let (msg, _) = parse_sync_message(&frame).expect("invalid frame from handler");
+                let (msg, _) = parse_frame(&frame).expect("invalid frame from handler");
                 Some(msg)
             }
             _ => None,
         }
     }
 
-    /// Receive and decode a SyncMessage from the data channel with timeout.
+    /// Receive and decode a Frame from the data channel with timeout.
     pub async fn recv_data_msg_timeout(
         &mut self,
         timeout: std::time::Duration,
-    ) -> Option<SyncMessage> {
+    ) -> Option<Frame> {
         match tokio::time::timeout(timeout, self.data_recv.recv()).await {
             Ok(Some(frame)) => {
-                let (msg, _) = parse_sync_message(&frame).expect("invalid frame from handler");
+                let (msg, _) = parse_frame(&frame).expect("invalid frame from handler");
                 Some(msg)
             }
             _ => None,

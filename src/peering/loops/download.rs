@@ -20,7 +20,7 @@ use crate::db::store::lookup_workspace_id;
 use crate::sync::session::run_coordinator;
 use crate::sync::PeerCoord;
 use crate::sync::ReplicationSessionHandler;
-use crate::transport::{peer_identity_from_connection, DualConnection, SyncSessionIo};
+use crate::transport::{peer_identity_from_connection, DualConnection, QuicTransportSessionIo};
 
 use super::{
     peer_fingerprint_from_hex, shared_ingest_cap, CONNECT_RETRY_DELAY, SESSION_GAP,
@@ -183,7 +183,7 @@ pub async fn download_from_sources(
                             remote_addr: connection.remote_address(),
                             direction: SessionDirection::Outbound,
                         };
-                        let io = SyncSessionIo::new(session_id, conn);
+                        let io = QuicTransportSessionIo::new(session_id, conn);
 
                         if let Err(e) = handler
                             .on_session(meta, Box::new(io), CancellationToken::new())

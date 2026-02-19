@@ -19,9 +19,9 @@ use crate::db::{
 };
 use crate::contracts::network_contract::next_session_id;
 use crate::sync::ReplicationSessionHandler;
-use crate::protocol::{parse_sync_message, SyncMessage};
+use crate::protocol::{parse_frame, Frame};
 use crate::transport::{
-    peer_identity_from_connection, DualConnection, SqliteTrustOracle, SyncSessionIo,
+    peer_identity_from_connection, DualConnection, SqliteTrustOracle, QuicTransportSessionIo,
 };
 
 const ENDPOINT_TTL_MS: i64 = 24 * 60 * 60 * 1000;
@@ -29,11 +29,11 @@ const ENDPOINT_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 /// Read an IntroOffer from a uni-directional recv stream.
 pub async fn read_intro_from_uni(
     recv: &mut quinn::RecvStream,
-) -> Result<SyncMessage, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Frame, Box<dyn std::error::Error + Send + Sync>> {
     // IntroOffer is 88 bytes fixed
     let mut buf = vec![0u8; 88];
     recv.read_exact(&mut buf).await?;
-    let (msg, _) = parse_sync_message(&buf)?;
+    let (msg, _) = parse_frame(&buf)?;
     Ok(msg)
 }
 
@@ -319,11 +319,11 @@ async fn run_sync_on_punched_connection(
     // Send markers (same as connect_loop)
     let _ = conn
         .control
-        .send(&SyncMessage::HaveList { ids: vec![] })
+        .send(&Frame::HaveList { ids: vec![] })
         .await;
     let _ = conn
         .data_send
-        .send(&SyncMessage::HaveList { ids: vec![] })
+        .send(&Frame::HaveList { ids: vec![] })
         .await;
     let _ = conn.flush_control().await;
     let _ = conn.flush_data().await;
@@ -349,7 +349,7 @@ async fn run_sync_on_punched_connection(
         direction: SessionDirection::Outbound,
     };
     let handler = ReplicationSessionHandler::initiator(db_path.to_string(), 60, batch_writer);
-    let io = SyncSessionIo::new(session_id, conn);
+    let io = QuicTransportSessionIo::new(session_id, conn);
 
     if let Err(e) = handler
         .on_session(meta, Box::new(io), CancellationToken::new())
@@ -388,7 +388,7 @@ pub fn spawn_intro_listener(
             };
 
             match read_intro_from_uni(&mut recv).await {
-                Ok(SyncMessage::IntroOffer {
+                Ok(Frame::IntroOffer {
                     intro_id,
                     other_peer_id,
                     origin_family,

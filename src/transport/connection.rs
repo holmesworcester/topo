@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use quinn::{RecvStream, SendStream};
 use tokio::io::AsyncWriteExt;
 
-use crate::protocol::{encode_sync_message, parse_sync_message, SyncMessage};
+use crate::protocol::{encode_frame, parse_frame, Frame};
 use crate::protocol::wire::ParseError;
 
 /// Max recv buffer size to prevent unbounded growth.
@@ -21,22 +21,22 @@ fn low_mem_mode() -> bool {
 /// Async stream connection abstraction for sync protocol.
 #[async_trait]
 pub trait StreamConn {
-    async fn send(&mut self, msg: &SyncMessage) -> Result<(), ConnectionError>;
+    async fn send(&mut self, msg: &Frame) -> Result<(), ConnectionError>;
     async fn flush(&mut self) -> Result<(), ConnectionError>;
-    async fn recv(&mut self) -> Result<SyncMessage, ConnectionError>;
+    async fn recv(&mut self) -> Result<Frame, ConnectionError>;
 }
 
 /// Async send-only stream abstraction for data plane.
 #[async_trait]
 pub trait StreamSend {
-    async fn send(&mut self, msg: &SyncMessage) -> Result<(), ConnectionError>;
+    async fn send(&mut self, msg: &Frame) -> Result<(), ConnectionError>;
     async fn flush(&mut self) -> Result<(), ConnectionError>;
 }
 
 /// Async recv-only stream abstraction for data plane.
 #[async_trait]
 pub trait StreamRecv {
-    async fn recv(&mut self) -> Result<SyncMessage, ConnectionError>;
+    async fn recv(&mut self) -> Result<Frame, ConnectionError>;
 }
 
 /// Bidirectional QUIC stream wrapper for sync protocol
@@ -109,8 +109,8 @@ impl Connection {
     }
 
     /// Send a sync message
-    pub async fn send(&mut self, msg: &SyncMessage) -> Result<(), ConnectionError> {
-        let data = encode_sync_message(msg);
+    pub async fn send(&mut self, msg: &Frame) -> Result<(), ConnectionError> {
+        let data = encode_frame(msg);
         self.send.write_all(&data).await?;
         Ok(())
     }
@@ -122,11 +122,11 @@ impl Connection {
     }
 
     /// Receive a sync message (blocking)
-    pub async fn recv(&mut self) -> Result<SyncMessage, ConnectionError> {
+    pub async fn recv(&mut self) -> Result<Frame, ConnectionError> {
         loop {
             // Try to parse from existing buffer
             if !self.recv_buffer.is_empty() {
-                match parse_sync_message(&self.recv_buffer) {
+                match parse_frame(&self.recv_buffer) {
                     Ok((msg, consumed)) => {
                         self.recv_buffer.drain(..consumed);
                         return Ok(msg);
@@ -165,8 +165,8 @@ impl SendConnection {
         Self { send }
     }
 
-    pub async fn send(&mut self, msg: &SyncMessage) -> Result<(), ConnectionError> {
-        let data = encode_sync_message(msg);
+    pub async fn send(&mut self, msg: &Frame) -> Result<(), ConnectionError> {
+        let data = encode_frame(msg);
         self.send.write_all(&data).await?;
         Ok(())
     }
@@ -185,10 +185,10 @@ impl RecvConnection {
         }
     }
 
-    pub async fn recv(&mut self) -> Result<SyncMessage, ConnectionError> {
+    pub async fn recv(&mut self) -> Result<Frame, ConnectionError> {
         loop {
             if !self.recv_buffer.is_empty() {
-                match parse_sync_message(&self.recv_buffer) {
+                match parse_frame(&self.recv_buffer) {
                     Ok((msg, consumed)) => {
                         self.recv_buffer.drain(..consumed);
                         return Ok(msg);
@@ -220,7 +220,7 @@ impl RecvConnection {
 
 #[async_trait]
 impl StreamConn for Connection {
-    async fn send(&mut self, msg: &SyncMessage) -> Result<(), ConnectionError> {
+    async fn send(&mut self, msg: &Frame) -> Result<(), ConnectionError> {
         Connection::send(self, msg).await
     }
 
@@ -228,14 +228,14 @@ impl StreamConn for Connection {
         Connection::flush(self).await
     }
 
-    async fn recv(&mut self) -> Result<SyncMessage, ConnectionError> {
+    async fn recv(&mut self) -> Result<Frame, ConnectionError> {
         Connection::recv(self).await
     }
 }
 
 #[async_trait]
 impl StreamSend for SendConnection {
-    async fn send(&mut self, msg: &SyncMessage) -> Result<(), ConnectionError> {
+    async fn send(&mut self, msg: &Frame) -> Result<(), ConnectionError> {
         SendConnection::send(self, msg).await
     }
 
@@ -246,7 +246,7 @@ impl StreamSend for SendConnection {
 
 #[async_trait]
 impl StreamRecv for RecvConnection {
-    async fn recv(&mut self) -> Result<SyncMessage, ConnectionError> {
+    async fn recv(&mut self) -> Result<Frame, ConnectionError> {
         RecvConnection::recv(self).await
     }
 }
