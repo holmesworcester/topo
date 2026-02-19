@@ -126,6 +126,20 @@ def main() -> int:
         if sid not in spec_checks or not spec_checks[sid]:
             errors.append(f"SPEC_NO_CHECK: {sid} has no check_id mapping")
 
+    # ── Rule 5: validate test_ids resolve to real test functions ──
+    src_root = REPO_ROOT / "src"
+    real_tests: set[str] = set()
+    for rs_file in src_root.rglob("*.rs"):
+        for m in re.finditer(r'fn\s+(test_\w+)\s*\(', rs_file.read_text()):
+            real_tests.add(m.group(1))
+    for row in matrix_rows:
+        tid = row.get("test_id", "")
+        if not tid or tid == "—":
+            continue
+        fn_name = tid.rsplit("::", 1)[-1] if "::" in tid else tid
+        if fn_name.startswith("test_") and fn_name not in real_tests:
+            errors.append(f"STALE_TEST_ID: {tid} does not match any test function")
+
     # ── Report ──
     if errors:
         print(f"TLA conformance check FAILED ({len(errors)} issues):\n")
