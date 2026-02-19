@@ -24,6 +24,11 @@ This branch should focus on projector architecture and application flow.
 2. `poc-7` model source of truth:
    - `docs/tla/EventGraphSchema.tla`
 3. If semantics change, update TLA + docs first (`docs/PLAN.md`, `docs/DESIGN.md`), then code.
+4. Required doc content for this branch:
+   - pure projector `ProjectorResult` contract
+   - command/effect execution stage semantics
+   - deletion intent + tombstone lifecycle
+   - replay/reorder/idempotence deletion invariants
 
 ## Core contract to implement
 
@@ -103,7 +108,10 @@ Keep integration points explicit in docs to avoid merge friction.
 1. Functional projector contract is used for migrated event types.
 2. Deletion paths pass replay/reorder/idempotence tests.
 3. `InviteAccepted` trust-anchor behavior remains TLA-aligned.
-4. `docs/PLAN.md` and `docs/DESIGN.md` updated with pure projector + command execution model.
+4. `docs/PLAN.md` and `docs/DESIGN.md` updated with:
+   - pure projector + command execution model
+   - explicit deletion intent/tombstone contract
+   - replay/reorder/idempotence invariants for deletion flows
 5. Test gates:
    - `cargo test --test replication_contract_tests -q`
    - `cargo test --test holepunch_test -q`
