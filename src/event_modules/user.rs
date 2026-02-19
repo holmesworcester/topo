@@ -256,3 +256,12 @@ pub fn count(
         |row| row.get(0),
     )
 }
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+    #[test]
+    fn offsets_consistent() {
+        assert_eq!(user_offsets::SIGNATURE + 64, USER_WIRE_SIZE);
+    }
+}

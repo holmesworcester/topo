@@ -249,3 +249,12 @@ pub fn count(
         |row| row.get(0),
     )
 }
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+    #[test]
+    fn offsets_consistent() {
+        assert_eq!(peer_shared_offsets::SIGNATURE + 64, PEER_SHARED_WIRE_SIZE);
+    }
+}

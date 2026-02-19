@@ -18,3 +18,12 @@ pub mod offsets {
     pub const SIGNER_TYPE: usize = SIGNED_BY + 32;                   // 1129
     pub const SIGNATURE: usize = SIGNER_TYPE + 1;                    // 1130
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn offsets_consistent() {
+        assert_eq!(offsets::SIGNATURE + 64, MESSAGE_WIRE_SIZE);
+    }
+}

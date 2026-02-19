@@ -154,3 +154,12 @@ pub static SIGNED_MEMO_META: EventTypeMeta = EventTypeMeta {
     encode: encode_signed_memo,
     projector: project_pure,
 };
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+    #[test]
+    fn offsets_consistent() {
+        assert_eq!(signed_memo_offsets::SIGNATURE + 64, SIGNED_MEMO_WIRE_SIZE);
+    }
+}

@@ -1,5 +1,5 @@
-//! Phase 5 test expansion: golden-byte, negative parse, and idempotent
-//! encode/decode tests for all fixed-layout canonical event types.
+//! Golden-byte, negative parse, and idempotent encode/decode tests
+//! for all canonical event types with fixed wire layouts.
 
 use topo::event_modules::{
     self as events, EventError, ParsedEvent,

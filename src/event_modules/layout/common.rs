@@ -236,6 +236,46 @@ mod tests {
         assert_eq!(read_text_slot(&slot).unwrap(), text);
     }
 
+    // ─── Per-event wire size sanity (guards against formula drift) ───
+
+    #[test]
+    fn test_per_event_wire_sizes() {
+        use super::super::super::message::MESSAGE_WIRE_SIZE;
+        use super::super::super::reaction::REACTION_WIRE_SIZE;
+        use super::super::super::signed_memo::SIGNED_MEMO_WIRE_SIZE;
+        use super::super::super::message_attachment::MESSAGE_ATTACHMENT_WIRE_SIZE;
+        use super::super::super::file_slice::FILE_SLICE_WIRE_SIZE;
+        use super::super::super::bench_dep::BENCH_DEP_WIRE_SIZE;
+        use super::super::super::workspace::WORKSPACE_WIRE_SIZE;
+        use super::super::super::user::USER_WIRE_SIZE;
+        use super::super::super::peer_shared::PEER_SHARED_WIRE_SIZE;
+        use super::super::super::secret_key::SECRET_KEY_WIRE_SIZE;
+        use super::super::super::message_deletion::MESSAGE_DELETION_WIRE_SIZE;
+        use super::super::super::invite_accepted::INVITE_ACCEPTED_WIRE_SIZE;
+        use super::super::super::user_invite::{USER_INVITE_BOOT_WIRE_SIZE, USER_INVITE_ONGOING_WIRE_SIZE};
+        use super::super::super::admin::{ADMIN_BOOT_WIRE_SIZE, ADMIN_ONGOING_WIRE_SIZE};
+        use super::super::super::secret_shared::SECRET_SHARED_WIRE_SIZE;
+
+        assert_eq!(MESSAGE_WIRE_SIZE, 1194);
+        assert_eq!(REACTION_WIRE_SIZE, 234);
+        assert_eq!(SIGNED_MEMO_WIRE_SIZE, 1130);
+        assert_eq!(MESSAGE_ATTACHMENT_WIRE_SIZE, 633);
+        assert_eq!(FILE_SLICE_WIRE_SIZE, 262286);
+        assert_eq!(BENCH_DEP_WIRE_SIZE, 345);
+        assert_eq!(WORKSPACE_WIRE_SIZE, 105);
+        assert_eq!(USER_WIRE_SIZE, 202);
+        assert_eq!(PEER_SHARED_WIRE_SIZE, 234);
+        assert_eq!(SECRET_KEY_WIRE_SIZE, 41);
+        assert_eq!(MESSAGE_DELETION_WIRE_SIZE, 170);
+        assert_eq!(INVITE_ACCEPTED_WIRE_SIZE, 73);
+        assert_eq!(USER_INVITE_BOOT_WIRE_SIZE, 170);
+        assert_eq!(USER_INVITE_ONGOING_WIRE_SIZE, 170);
+        assert_eq!(ADMIN_BOOT_WIRE_SIZE, 170);
+        assert_eq!(ADMIN_ONGOING_WIRE_SIZE, 170);
+        assert_eq!(SECRET_SHARED_WIRE_SIZE, 202);
+        assert_eq!(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE, 138);
+    }
+
     // ─── Encrypted inner wire size lookup ───
 
     #[test]

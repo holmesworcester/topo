@@ -264,3 +264,12 @@ pub static MESSAGE_ATTACHMENT_META: EventTypeMeta = EventTypeMeta {
     encode: encode_message_attachment,
     projector: project_pure,
 };
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+    #[test]
+    fn offsets_consistent() {
+        assert_eq!(attachment_offsets::SIGNATURE + 64, MESSAGE_ATTACHMENT_WIRE_SIZE);
+    }
+}

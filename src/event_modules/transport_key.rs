@@ -1,5 +1,10 @@
+use super::layout::common::IDENTITY_PUBKEY_SIGNED_WIRE_SIZE;
 use super::registry::{EventTypeMeta, ShareScope};
 use super::{EventError, ParsedEvent, EVENT_TYPE_TRANSPORT_KEY};
+
+// ─── Layout (owned by this module) ───
+
+pub const TRANSPORT_KEY_WIRE_SIZE: usize = IDENTITY_PUBKEY_SIGNED_WIRE_SIZE;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportKeyEvent {
@@ -18,11 +23,11 @@ pub struct TransportKeyEvent {
 /// [73]       signer_type (1 byte)
 /// [74..138]  signature (64 bytes)
 pub fn parse_transport_key(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    if blob.len() < 138 {
-        return Err(EventError::TooShort { expected: 138, actual: blob.len() });
+    if blob.len() < IDENTITY_PUBKEY_SIGNED_WIRE_SIZE {
+        return Err(EventError::TooShort { expected: IDENTITY_PUBKEY_SIGNED_WIRE_SIZE, actual: blob.len() });
     }
-    if blob.len() > 138 {
-        return Err(EventError::TrailingData { expected: 138, actual: blob.len() });
+    if blob.len() > IDENTITY_PUBKEY_SIGNED_WIRE_SIZE {
+        return Err(EventError::TrailingData { expected: IDENTITY_PUBKEY_SIGNED_WIRE_SIZE, actual: blob.len() });
     }
     if blob[0] != EVENT_TYPE_TRANSPORT_KEY {
         return Err(EventError::WrongType { expected: EVENT_TYPE_TRANSPORT_KEY, actual: blob[0] });
@@ -51,7 +56,7 @@ pub fn encode_transport_key(event: &ParsedEvent) -> Result<Vec<u8>, EventError> 
         ParsedEvent::TransportKey(v) => v,
         _ => return Err(EventError::WrongVariant),
     };
-    let mut buf = Vec::with_capacity(138);
+    let mut buf = Vec::with_capacity(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE);
     buf.push(EVENT_TYPE_TRANSPORT_KEY);
     buf.extend_from_slice(&e.created_at_ms.to_le_bytes());
     buf.extend_from_slice(&e.spki_fingerprint);

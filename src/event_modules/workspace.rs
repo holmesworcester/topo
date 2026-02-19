@@ -166,3 +166,13 @@ pub fn list(
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
 }
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+    use super::super::layout;
+    #[test]
+    fn offsets_consistent() {
+        assert_eq!(workspace_offsets::NAME + layout::common::NAME_BYTES, WORKSPACE_WIRE_SIZE);
+    }
+}

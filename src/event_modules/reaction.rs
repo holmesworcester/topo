@@ -328,3 +328,12 @@ pub fn list(
         })
         .collect())
 }
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+    #[test]
+    fn offsets_consistent() {
+        assert_eq!(offsets::SIGNATURE + 64, REACTION_WIRE_SIZE);
+    }
+}

@@ -135,3 +135,12 @@ pub static BENCH_DEP_META: EventTypeMeta = EventTypeMeta {
     encode: encode_bench_dep,
     projector: project_pure,
 };
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+    #[test]
+    fn offsets_consistent() {
+        assert_eq!(bench_dep_offsets::PAYLOAD + 16, BENCH_DEP_WIRE_SIZE);
+    }
+}

@@ -231,3 +231,12 @@ pub static FILE_SLICE_META: EventTypeMeta = EventTypeMeta {
     encode: encode_file_slice,
     projector: project_pure,
 };
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+    #[test]
+    fn offsets_consistent() {
+        assert_eq!(file_slice_offsets::SIGNATURE + 64, FILE_SLICE_WIRE_SIZE);
+    }
+}
