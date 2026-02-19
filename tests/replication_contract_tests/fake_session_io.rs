@@ -7,13 +7,16 @@
 //! - abrupt close via explicit error injection,
 //! - frame-size enforcement,
 //! - delayed delivery (optional per-frame delay),
-//! - out-of-order data frame reordering.
+//! - out-of-order data frame reordering,
+//! - transport-layer frame fragmentation,
+//! - deterministic peer-protocol violations.
 //!
 //! The `fake_session_io_pair` constructor returns a `FakeSessionIo` (for the
 //! handler under test) and a `FakePeerSide` (for the test harness to script
 //! the other end of the conversation).
 
 use async_trait::async_trait;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,10 +37,27 @@ const CHANNEL_CAP: usize = 256;
 // FakeIoConfig: configurable failure modes for FakeSessionIo
 // ---------------------------------------------------------------------------
 
+/// Deterministic peer-protocol violations that can be injected into a session.
+///
+/// Each variant causes the harness to inject a specific protocol-level error
+/// at the appropriate point during the session, allowing tests to verify that
+/// the handler correctly rejects or handles malformed peer behavior.
+#[derive(Clone, Debug)]
+pub enum ProtocolViolation {
+    /// Inject random garbage bytes as a control frame. The handler should
+    /// fail with a parse error when it tries to decode the invalid frame.
+    GarbageControlFrame,
+    /// Send the `Done` control message twice. The handler should detect the
+    /// duplicate and either ignore it or error out.
+    DuplicateDone,
+}
+
 /// Configuration for FakeSessionIo failure-mode simulation.
 ///
-/// Controls frame-size enforcement, per-frame delivery delay, and
-/// data-frame reordering. Use `Default::default()` for standard behavior.
+/// Controls frame-size enforcement, per-frame delivery delay,
+/// data-frame reordering, transport-layer fragmentation, and
+/// deterministic protocol violations.
+/// Use `Default::default()` for standard behavior.
 #[derive(Clone, Debug)]
 pub struct FakeIoConfig {
     /// If set, sleep this duration before delivering each received frame.
@@ -49,6 +69,16 @@ pub struct FakeIoConfig {
     /// When true, data frames received via `FakeDataRecvIo` are buffered and
     /// delivered in reversed order (simulates out-of-order delivery).
     pub reorder_data_frames: bool,
+    /// When true, each data frame received from the peer is split into 2+
+    /// smaller chunks before delivery to the handler's `DataRecvIo`.
+    /// Simulates transport-layer fragmentation where a single logical frame
+    /// arrives as multiple smaller reads.
+    pub fragment_data_frames: bool,
+    /// If set, inject a deterministic protocol violation during the session.
+    /// The violation is injected on the control channel at an appropriate
+    /// point (e.g., as the first control frame for `GarbageControlFrame`,
+    /// or after a legitimate `Done` for `DuplicateDone`).
+    pub inject_protocol_violation: Option<ProtocolViolation>,
 }
 
 impl Default for FakeIoConfig {
@@ -57,6 +87,8 @@ impl Default for FakeIoConfig {
             frame_delay: None,
             max_frame_size: TEST_MAX_FRAME_SIZE,
             reorder_data_frames: false,
+            fragment_data_frames: false,
+            inject_protocol_violation: None,
         }
     }
 }
@@ -156,7 +188,16 @@ struct FakeControlIo {
     closed: Arc<AtomicBool>,
     max_frame_size: usize,
     frame_delay: Option<Duration>,
+    violation: Option<ProtocolViolation>,
+    /// Number of frames delivered so far (for injection timing).
+    recv_count: u64,
+    /// Pending frame to re-deliver (used by DuplicateDone).
+    pending_duplicate: Option<Vec<u8>>,
 }
+
+/// Garbage bytes that cannot be parsed as any valid SyncMessage.
+/// Uses 0xFF as the message type byte, which is not a known type.
+const GARBAGE_CONTROL_FRAME: &[u8] = &[0xFF, 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x42];
 
 #[async_trait]
 impl ControlIo for FakeControlIo {
@@ -167,10 +208,36 @@ impl ControlIo for FakeControlIo {
         if let Some(delay) = self.frame_delay {
             tokio::time::sleep(delay).await;
         }
-        self.rx
+
+        // DuplicateDone: if we have a pending duplicate, deliver it first.
+        if let Some(dup) = self.pending_duplicate.take() {
+            self.recv_count += 1;
+            return Ok(dup);
+        }
+
+        // GarbageControlFrame: inject garbage as the very first control frame.
+        if self.recv_count == 0 {
+            if let Some(ProtocolViolation::GarbageControlFrame) = &self.violation {
+                self.recv_count += 1;
+                return Ok(GARBAGE_CONTROL_FRAME.to_vec());
+            }
+        }
+
+        let frame = self.rx
             .recv()
             .await
-            .ok_or(SessionIoError::ConnectionLost)
+            .ok_or(SessionIoError::ConnectionLost)?;
+
+        // DuplicateDone: when we see a Done frame, queue a duplicate.
+        if let Some(ProtocolViolation::DuplicateDone) = &self.violation {
+            // Done is encoded as a single byte (MSG_TYPE_DONE = 0x20).
+            if frame.len() == 1 && frame[0] == 0x20 {
+                self.pending_duplicate = Some(frame.clone());
+            }
+        }
+
+        self.recv_count += 1;
+        Ok(frame)
     }
 
     async fn send(&mut self, frame: &[u8]) -> Result<(), SessionIoError> {
@@ -228,11 +295,15 @@ struct FakeDataRecvIo {
     closed: Arc<AtomicBool>,
     frame_delay: Option<Duration>,
     reorder: bool,
+    fragment: bool,
     /// Buffer for reordering: frames accumulate here until the channel closes,
     /// then are delivered in reverse order.
     reorder_buf: Vec<Vec<u8>>,
     /// True once the underlying channel has been drained for reordering.
     reorder_drained: bool,
+    /// Buffer for fragmentation: when a frame is split into chunks, the
+    /// remaining chunks are stored here and delivered on subsequent recv calls.
+    fragment_buf: std::collections::VecDeque<Vec<u8>>,
 }
 
 #[async_trait]
@@ -244,7 +315,13 @@ impl DataRecvIo for FakeDataRecvIo {
         if let Some(delay) = self.frame_delay {
             tokio::time::sleep(delay).await;
         }
-        if self.reorder {
+
+        // If we have buffered fragments from a previous frame, deliver them first.
+        if let Some(chunk) = self.fragment_buf.pop_front() {
+            return Ok(chunk);
+        }
+
+        let frame = if self.reorder {
             // In reorder mode, buffer all frames from the channel first,
             // then pop them in reverse order.
             if !self.reorder_drained {
@@ -260,12 +337,23 @@ impl DataRecvIo for FakeDataRecvIo {
             }
             self.reorder_buf
                 .pop()
-                .ok_or(SessionIoError::ConnectionLost)
+                .ok_or(SessionIoError::ConnectionLost)?
         } else {
             self.rx
                 .recv()
                 .await
-                .ok_or(SessionIoError::ConnectionLost)
+                .ok_or(SessionIoError::ConnectionLost)?
+        };
+
+        // Apply fragmentation: split the frame into 2 chunks at the midpoint.
+        if self.fragment && frame.len() > 1 {
+            let mid = frame.len() / 2;
+            let first = frame[..mid].to_vec();
+            let second = frame[mid..].to_vec();
+            self.fragment_buf.push_back(second);
+            Ok(first)
+        } else {
+            Ok(frame)
         }
     }
 }
@@ -293,6 +381,9 @@ impl SessionIo for FakeSessionIo {
                 closed: self.closed.clone(),
                 max_frame_size: config.max_frame_size,
                 frame_delay: config.frame_delay,
+                violation: config.inject_protocol_violation.clone(),
+                recv_count: 0,
+                pending_duplicate: None,
             }),
             data_send: Box::new(FakeDataSendIo {
                 tx: self.data_out_tx.expect("split called twice"),
@@ -304,72 +395,12 @@ impl SessionIo for FakeSessionIo {
                 closed: self.closed.clone(),
                 frame_delay: config.frame_delay,
                 reorder: config.reorder_data_frames,
+                fragment: config.fragment_data_frames,
                 reorder_buf: Vec::new(),
                 reorder_drained: false,
+                fragment_buf: VecDeque::new(),
             }),
         }
-    }
-
-    async fn poll_send_ready(&mut self) -> Result<(), SessionIoError> {
-        Ok(())
-    }
-
-    async fn recv_control(&mut self) -> Result<Vec<u8>, SessionIoError> {
-        if let Some(rx) = &mut self.ctrl_in_rx {
-            if let Some(delay) = self.config.frame_delay {
-                tokio::time::sleep(delay).await;
-            }
-            rx.recv().await.ok_or(SessionIoError::ConnectionLost)
-        } else {
-            Err(SessionIoError::Internal("already split".into()))
-        }
-    }
-
-    async fn send_control(&mut self, frame: &[u8]) -> Result<(), SessionIoError> {
-        if frame.len() > self.config.max_frame_size {
-            return Err(SessionIoError::FrameTooLarge {
-                len: frame.len(),
-                max: self.config.max_frame_size,
-            });
-        }
-        if let Some(tx) = &self.ctrl_out_tx {
-            tx.send(frame.to_vec())
-                .await
-                .map_err(|_| SessionIoError::ConnectionLost)
-        } else {
-            Err(SessionIoError::Internal("already split".into()))
-        }
-    }
-
-    async fn recv_data(&mut self) -> Result<Vec<u8>, SessionIoError> {
-        if let Some(rx) = &mut self.data_in_rx {
-            if let Some(delay) = self.config.frame_delay {
-                tokio::time::sleep(delay).await;
-            }
-            rx.recv().await.ok_or(SessionIoError::ConnectionLost)
-        } else {
-            Err(SessionIoError::Internal("already split".into()))
-        }
-    }
-
-    async fn send_data(&mut self, frame: &[u8]) -> Result<(), SessionIoError> {
-        if frame.len() > self.config.max_frame_size {
-            return Err(SessionIoError::FrameTooLarge {
-                len: frame.len(),
-                max: self.config.max_frame_size,
-            });
-        }
-        if let Some(tx) = &self.data_out_tx {
-            tx.send(frame.to_vec())
-                .await
-                .map_err(|_| SessionIoError::ConnectionLost)
-        } else {
-            Err(SessionIoError::Internal("already split".into()))
-        }
-    }
-
-    async fn close_session(&mut self, _code: u32, _reason: &[u8]) -> Result<(), SessionIoError> {
-        Ok(())
     }
 }
 

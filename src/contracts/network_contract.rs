@@ -105,16 +105,6 @@ pub trait SessionIo: Send {
     /// Split into independent control, data-send, and data-recv handles.
     /// Consuming `self` allows the data-recv handle to be moved to a spawned task.
     fn split(self: Box<Self>) -> SessionIoParts;
-
-    // -- Direct frame methods (backward compatibility) --
-    // These exist for unit tests in transport/session_io.rs that exercise
-    // the pre-split code path. Production code should use `split()` instead.
-    async fn poll_send_ready(&mut self) -> Result<(), SessionIoError>;
-    async fn recv_control(&mut self) -> Result<Vec<u8>, SessionIoError>;
-    async fn send_control(&mut self, frame: &[u8]) -> Result<(), SessionIoError>;
-    async fn recv_data(&mut self) -> Result<Vec<u8>, SessionIoError>;
-    async fn send_data(&mut self, frame: &[u8]) -> Result<(), SessionIoError>;
-    async fn close_session(&mut self, code: u32, reason: &[u8]) -> Result<(), SessionIoError>;
 }
 
 #[async_trait(?Send)]

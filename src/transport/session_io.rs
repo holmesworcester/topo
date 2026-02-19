@@ -205,84 +205,6 @@ where
             }),
         }
     }
-
-    async fn poll_send_ready(&mut self) -> Result<(), SessionIoError> {
-        self.conn
-            .control
-            .flush()
-            .await
-            .map_err(|e| map_connection_error(e, self.max_frame_size))?;
-        self.conn
-            .data_send
-            .flush()
-            .await
-            .map_err(|e| map_connection_error(e, self.max_frame_size))?;
-        Ok(())
-    }
-
-    async fn recv_control(&mut self) -> Result<Vec<u8>, SessionIoError> {
-        let msg = self
-            .conn
-            .control
-            .recv()
-            .await
-            .map_err(|e| map_connection_error(e, self.max_frame_size))?;
-        Ok(encode_sync_message(&msg))
-    }
-
-    async fn send_control(&mut self, frame: &[u8]) -> Result<(), SessionIoError> {
-        if frame.len() > self.max_frame_size {
-            return Err(SessionIoError::FrameTooLarge {
-                len: frame.len(),
-                max: self.max_frame_size,
-            });
-        }
-        let msg = decode_exact_frame(frame, self.max_frame_size)?;
-        self.conn
-            .control
-            .send(&msg)
-            .await
-            .map_err(|e| map_connection_error(e, self.max_frame_size))
-    }
-
-    async fn recv_data(&mut self) -> Result<Vec<u8>, SessionIoError> {
-        let msg = self
-            .conn
-            .data_recv
-            .recv()
-            .await
-            .map_err(|e| map_connection_error(e, self.max_frame_size))?;
-        Ok(encode_sync_message(&msg))
-    }
-
-    async fn send_data(&mut self, frame: &[u8]) -> Result<(), SessionIoError> {
-        if frame.len() > self.max_frame_size {
-            return Err(SessionIoError::FrameTooLarge {
-                len: frame.len(),
-                max: self.max_frame_size,
-            });
-        }
-        let msg = decode_exact_frame(frame, self.max_frame_size)?;
-        self.conn
-            .data_send
-            .send(&msg)
-            .await
-            .map_err(|e| map_connection_error(e, self.max_frame_size))
-    }
-
-    async fn close_session(&mut self, _code: u32, _reason: &[u8]) -> Result<(), SessionIoError> {
-        self.conn
-            .control
-            .flush()
-            .await
-            .map_err(|e| map_connection_error(e, self.max_frame_size))?;
-        self.conn
-            .data_send
-            .flush()
-            .await
-            .map_err(|e| map_connection_error(e, self.max_frame_size))?;
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -423,7 +345,7 @@ mod tests {
         control_recv: Vec<Result<SyncMessage, ConnectionError>>,
         data_recv: Vec<Result<SyncMessage, ConnectionError>>,
     ) -> (
-        SyncSessionIo<MockControl, MockDataSend, MockDataRecv>,
+        SessionIoParts,
         Arc<Mutex<MockControlState>>,
         Arc<Mutex<MockSendState>>,
     ) {
@@ -436,24 +358,26 @@ mod tests {
             data_recv,
         };
 
-        (SyncSessionIo::new(7, conn), control_state, data_send_state)
+        let io = Box::new(SyncSessionIo::new(7, conn));
+        let parts = io.split();
+        (parts, control_state, data_send_state)
     }
 
     #[tokio::test]
     async fn session_io_encodes_decodes_control_and_data_frames() {
-        let (mut io, control_state, data_send_state) = build_io(
+        let (mut parts, control_state, data_send_state) = build_io(
             vec![Ok(SyncMessage::Done)],
             vec![Ok(SyncMessage::Event {
                 blob: vec![1, 2, 3],
             })],
         );
 
-        let control_frame = io.recv_control().await.expect("recv control");
+        let control_frame = parts.control.recv().await.expect("recv control");
         let (control_msg, consumed) = parse_sync_message(&control_frame).expect("parse control");
         assert_eq!(consumed, control_frame.len());
         assert_eq!(control_msg, SyncMessage::Done);
 
-        let data_frame = io.recv_data().await.expect("recv data");
+        let data_frame = parts.data_recv.recv().await.expect("recv data");
         let (data_msg, consumed) = parse_sync_message(&data_frame).expect("parse data");
         assert_eq!(consumed, data_frame.len());
         assert_eq!(
@@ -464,49 +388,49 @@ mod tests {
         );
 
         let neg_open = encode_sync_message(&SyncMessage::NegOpen { msg: vec![9, 8, 7] });
-        io.send_control(&neg_open).await.expect("send control");
+        parts.control.send(&neg_open).await.expect("send control");
         let data_done = encode_sync_message(&SyncMessage::DataDone);
-        io.send_data(&data_done).await.expect("send data");
+        parts.data_send.send(&data_done).await.expect("send data");
 
-        io.poll_send_ready().await.expect("poll send ready");
-        io.close_session(0, b"done").await.expect("close session");
+        parts.control.flush().await.expect("control flush");
+        parts.data_send.flush().await.expect("data_send flush");
 
         let control = control_state.lock().expect("control lock");
         assert_eq!(control.sent.len(), 1);
         assert_eq!(control.sent[0], SyncMessage::NegOpen { msg: vec![9, 8, 7] });
-        assert!(control.flushes >= 2);
+        assert!(control.flushes >= 1);
 
         let data_send = data_send_state.lock().expect("send lock");
         assert_eq!(data_send.sent.len(), 1);
         assert_eq!(data_send.sent[0], SyncMessage::DataDone);
-        assert!(data_send.flushes >= 2);
+        assert!(data_send.flushes >= 1);
     }
 
     #[tokio::test]
     async fn send_control_rejects_trailing_bytes() {
-        let (mut io, _control_state, _data_send_state) = build_io(vec![], vec![]);
+        let (mut parts, _control_state, _data_send_state) = build_io(vec![], vec![]);
         let mut frame = encode_sync_message(&SyncMessage::Done);
         frame.push(0);
 
-        let err = io.send_control(&frame).await.expect_err("expected error");
+        let err = parts.control.send(&frame).await.expect_err("expected error");
         assert!(matches!(err, SessionIoError::PeerViolation(_)));
     }
 
     #[tokio::test]
     async fn recv_control_maps_connection_closed_to_connection_lost() {
-        let (mut io, _control_state, _data_send_state) =
+        let (mut parts, _control_state, _data_send_state) =
             build_io(vec![Err(ConnectionError::Closed)], vec![]);
 
-        let err = io.recv_control().await.expect_err("expected error");
+        let err = parts.control.recv().await.expect_err("expected error");
         assert_eq!(err, SessionIoError::ConnectionLost);
     }
 
     #[tokio::test]
     async fn recv_data_maps_parse_too_large_to_typed_error() {
         let parse_err = ConnectionError::Parse(ParseError::NegMessageTooLarge(123_456));
-        let (mut io, _control_state, _data_send_state) = build_io(vec![], vec![Err(parse_err)]);
+        let (mut parts, _control_state, _data_send_state) = build_io(vec![], vec![Err(parse_err)]);
 
-        let err = io.recv_data().await.expect_err("expected error");
+        let err = parts.data_recv.recv().await.expect_err("expected error");
         assert_eq!(
             err,
             SessionIoError::FrameTooLarge {
@@ -518,10 +442,10 @@ mod tests {
 
     #[tokio::test]
     async fn send_data_rejects_oversized_frame_before_parse() {
-        let (mut io, _control_state, _data_send_state) = build_io(vec![], vec![]);
+        let (mut parts, _control_state, _data_send_state) = build_io(vec![], vec![]);
         let oversized = vec![0u8; DEFAULT_SYNC_FRAME_MAX_BYTES + 1];
 
-        let err = io.send_data(&oversized).await.expect_err("expected error");
+        let err = parts.data_send.send(&oversized).await.expect_err("expected error");
         assert_eq!(
             err,
             SessionIoError::FrameTooLarge {

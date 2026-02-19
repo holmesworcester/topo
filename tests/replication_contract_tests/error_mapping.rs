@@ -2,7 +2,8 @@
 //! when using FakeSessionIo.
 //!
 //! Covers: connection loss, half-close, abrupt close, delayed delivery,
-//! frame-size enforcement, and out-of-order delivery scenarios.
+//! frame-size enforcement, out-of-order delivery, frame fragmentation,
+//! and deterministic protocol violation scenarios.
 
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
@@ -16,7 +17,7 @@ use topo::sync::SyncMessage;
 use crate::fake_session_io::{
     create_test_db, empty_negentropy_storage, fake_session_io_pair,
     fake_session_io_pair_with_config, noop_batch_writer, run_local, test_session_meta,
-    FakeIoConfig,
+    FakeIoConfig, ProtocolViolation,
 };
 
 /// When the peer drops the control channel (half-close), the handler should
@@ -279,4 +280,247 @@ async fn out_of_order_data_delivery() {
         eof.is_err(),
         "recv after all reordered frames should return ConnectionLost"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Frame fragmentation tests
+// ---------------------------------------------------------------------------
+
+/// Verify that fragment_data_frames splits each data frame into 2 chunks.
+/// The handler receives fragments (not complete protocol messages) on the
+/// data channel. The data receiver task encounters parse errors on the
+/// fragmented frames, but the responder's control loop is tolerant and the
+/// session terminates without hanging or panicking.
+///
+/// This documents the handler's resilience to transport-layer fragmentation:
+/// the data receiver task fails gracefully, and the control protocol drives
+/// the session to completion.
+#[tokio::test]
+async fn fragmented_data_frames_handler_completes() {
+    run_local(async {
+        let (db_path, _tmpdir) = create_test_db("test-tenant");
+        let handler =
+            ReplicationSessionHandler::responder(db_path, 30, noop_batch_writer);
+        let meta = test_session_meta(SessionDirection::Inbound);
+        let cancel = CancellationToken::new();
+
+        let config = FakeIoConfig {
+            fragment_data_frames: true,
+            ..Default::default()
+        };
+        let (fake_io, mut peer) = fake_session_io_pair_with_config(meta.session_id, config);
+
+        let handler_task = tokio::task::spawn_local({
+            let cancel = cancel.clone();
+            async move {
+                handler
+                    .on_session(meta, Box::new(fake_io), cancel)
+                    .await
+            }
+        });
+
+        // Drive the normal protocol: NegOpen -> NegMsg -> then send events
+        // on the data channel, which will be fragmented.
+        let storage = empty_negentropy_storage();
+        let mut neg = negentropy::Negentropy::new(
+            negentropy::Storage::Borrowed(&storage),
+            0,
+        )
+        .unwrap();
+        let initial_msg = neg.initiate().unwrap();
+        peer.send_control_msg(&SyncMessage::NegOpen { msg: initial_msg })
+            .await;
+
+        // Consume NegMsg
+        let _ = peer.recv_control_msg_timeout(Duration::from_secs(2)).await;
+
+        // Send an Event with a multi-byte payload that WILL be fragmented.
+        // The data receiver will get a partial frame and fail to parse it.
+        peer.send_data_msg(&SyncMessage::Event { blob: vec![0xAA; 100] })
+            .await;
+
+        // Send DataDone (1-byte message, not fragmented since len==1) and
+        // Done on control to drive the session toward completion.
+        peer.send_data_msg(&SyncMessage::DataDone).await;
+        peer.send_control_msg(&SyncMessage::Done).await;
+
+        // Consume any responses from the handler.
+        let _ = peer.recv_data_msg_timeout(Duration::from_secs(5)).await;
+        let _ = peer.recv_control_msg_timeout(Duration::from_secs(5)).await;
+
+        // Drop channels to ensure handler can exit.
+        drop(peer.control_send);
+        drop(peer.data_send);
+
+        let result = tokio::time::timeout(Duration::from_secs(10), handler_task)
+            .await
+            .expect("handler timed out with fragmented frames -- must not hang")
+            .expect("handler panicked");
+
+        // The handler must terminate without hanging or panicking.
+        // It may return Ok (tolerating the data receiver error) or Err
+        // (propagating the parse failure) -- both are acceptable.
+        // The critical property is non-hanging termination.
+        let _ = result;
+        cancel.cancel();
+    })
+    .await;
+}
+
+/// Verify that fragmentation correctly splits multi-byte frames at the
+/// DataRecvIo level by testing the raw IO adapter directly.
+#[tokio::test]
+async fn fragmentation_splits_data_frames_into_chunks() {
+    let config = FakeIoConfig {
+        fragment_data_frames: true,
+        ..Default::default()
+    };
+    let (fake_io, peer) = fake_session_io_pair_with_config(100, config);
+    let mut parts = Box::new(fake_io).split();
+
+    // Send a 10-byte frame.
+    let original = vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A];
+    peer.data_send
+        .send(original.clone())
+        .await
+        .expect("send failed");
+
+    // First recv should return the first half (5 bytes).
+    let chunk1 = parts.data_recv.recv().await.expect("recv chunk1 failed");
+    assert_eq!(chunk1, vec![0x01, 0x02, 0x03, 0x04, 0x05]);
+
+    // Second recv should return the second half (5 bytes).
+    let chunk2 = parts.data_recv.recv().await.expect("recv chunk2 failed");
+    assert_eq!(chunk2, vec![0x06, 0x07, 0x08, 0x09, 0x0A]);
+
+    // The two chunks together should equal the original frame.
+    let mut reassembled = chunk1;
+    reassembled.extend(chunk2);
+    assert_eq!(reassembled, original, "reassembled chunks should match original");
+}
+
+// ---------------------------------------------------------------------------
+// Protocol violation tests
+// ---------------------------------------------------------------------------
+
+/// Verify that injecting a GarbageControlFrame causes the responder handler
+/// to terminate. The garbage is injected as the first control frame the
+/// handler receives (before any legitimate NegOpen from the peer).
+///
+/// The responder's control loop handles parse errors by logging and breaking
+/// out of the loop. The session terminates cleanly without hanging or
+/// panicking, even though the peer sent an unparseable control frame.
+#[tokio::test]
+async fn garbage_control_frame_terminates_handler() {
+    run_local(async {
+        let (db_path, _tmpdir) = create_test_db("test-tenant");
+        let handler =
+            ReplicationSessionHandler::responder(db_path, 30, noop_batch_writer);
+        let meta = test_session_meta(SessionDirection::Inbound);
+        let cancel = CancellationToken::new();
+
+        let config = FakeIoConfig {
+            inject_protocol_violation: Some(ProtocolViolation::GarbageControlFrame),
+            ..Default::default()
+        };
+        let (fake_io, peer) = fake_session_io_pair_with_config(meta.session_id, config);
+
+        let handler_task = tokio::task::spawn_local({
+            let cancel = cancel.clone();
+            async move {
+                handler
+                    .on_session(meta, Box::new(fake_io), cancel)
+                    .await
+            }
+        });
+
+        // The handler will receive garbage as its first control frame and
+        // should fail to parse it. Drop all channels so the handler's
+        // data receiver can also exit.
+        drop(peer.control_send);
+        drop(peer.data_send);
+
+        let result = tokio::time::timeout(Duration::from_secs(10), handler_task)
+            .await
+            .expect("handler timed out on garbage control frame -- must not hang")
+            .expect("handler panicked");
+
+        // The handler must terminate without hanging or panicking.
+        // The responder's control loop breaks on parse errors and returns.
+        // This verifies that garbage control frames don't cause infinite
+        // loops or deadlocks in the protocol state machine.
+        let _ = result;
+        cancel.cancel();
+    })
+    .await;
+}
+
+/// Verify behavior when a DuplicateDone violation is injected. The harness
+/// sends Done twice on the control channel. The responder should either
+/// handle the duplicate gracefully or error — but must not hang or panic.
+#[tokio::test]
+async fn duplicate_done_violation_terminates_handler() {
+    run_local(async {
+        let (db_path, _tmpdir) = create_test_db("test-tenant");
+        let handler =
+            ReplicationSessionHandler::responder(db_path, 30, noop_batch_writer);
+        let meta = test_session_meta(SessionDirection::Inbound);
+        let cancel = CancellationToken::new();
+
+        let config = FakeIoConfig {
+            inject_protocol_violation: Some(ProtocolViolation::DuplicateDone),
+            ..Default::default()
+        };
+        let (fake_io, mut peer) = fake_session_io_pair_with_config(meta.session_id, config);
+
+        let handler_task = tokio::task::spawn_local({
+            let cancel = cancel.clone();
+            async move {
+                handler
+                    .on_session(meta, Box::new(fake_io), cancel)
+                    .await
+            }
+        });
+
+        // Drive the normal protocol up to Done, which will be duplicated
+        // by the FakeControlIo violation injection.
+        let storage = empty_negentropy_storage();
+        let mut neg = negentropy::Negentropy::new(
+            negentropy::Storage::Borrowed(&storage),
+            0,
+        )
+        .unwrap();
+        let initial_msg = neg.initiate().unwrap();
+        peer.send_control_msg(&SyncMessage::NegOpen { msg: initial_msg })
+            .await;
+
+        // Consume NegMsg from responder
+        let _ = peer.recv_control_msg_timeout(Duration::from_secs(2)).await;
+
+        // Signal done (the FakeControlIo will auto-duplicate this Done)
+        peer.send_data_msg(&SyncMessage::DataDone).await;
+        peer.send_control_msg(&SyncMessage::Done).await;
+
+        // Try to receive DataDone + DoneAck — the handler may or may not
+        // produce these depending on how it handles the duplicate Done.
+        let _ = peer.recv_data_msg_timeout(Duration::from_secs(5)).await;
+        let _ = peer.recv_control_msg_timeout(Duration::from_secs(5)).await;
+
+        // Drop our channels so the handler doesn't block indefinitely
+        // waiting for more messages after processing the duplicate.
+        drop(peer.control_send);
+        drop(peer.data_send);
+
+        let result = tokio::time::timeout(Duration::from_secs(10), handler_task)
+            .await
+            .expect("handler timed out on duplicate Done — it should not hang")
+            .expect("handler panicked");
+
+        // The handler must terminate. It may succeed (ignoring duplicate)
+        // or error (rejecting duplicate) — both are acceptable behaviors.
+        // The critical property is that it does not hang or panic.
+        let _ = result;
+        cancel.cancel();
+    })
+    .await;
 }
