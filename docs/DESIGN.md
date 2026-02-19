@@ -1055,11 +1055,21 @@ The result is a small protocol core with clear upgrade paths instead of a stack 
 
 ## 14.1 Layering convention
 
-Event modules (`src/events/*.rs`) own three concerns:
+Event modules (`src/event_modules/*.rs`) own four concerns:
 
 1. **Schema** — struct definition, parse/encode, wire layout, `EventTypeMeta`.
-2. **Command helpers** — `CreateXxxCmd` struct + `create()` function that builds the `ParsedEvent`, calls `create_signed_event_sync`, and returns `EventId`.
-3. **Query helpers** — `query_list()`, `query_count()`, `resolve_by_number()`, etc. — SQL against projection tables scoped by `recorded_by`.
+2. **Projector** — `project_pure()` function: the pure projector for this event type. Takes `(recorded_by, event_id_b64, &ParsedEvent, &ContextSnapshot)` and returns `ProjectorResult`. Registered in `EventTypeMeta.projector` so the pipeline dispatches via registry lookup with no central match statement.
+3. **Command helpers** — `CreateXxxCmd` struct + `create()` function that builds the `ParsedEvent`, calls `create_signed_event_sync`, and returns `EventId`.
+4. **Query helpers** — `query_list()`, `query_count()`, `resolve_by_number()`, etc. — SQL against projection tables scoped by `recorded_by`.
+
+The projection pipeline (`src/projection/apply.rs`) is orchestration-only:
+
+- Dependency presence check + block row writes
+- Dependency type enforcement
+- Signer verification (uniform across all signed events)
+- Context snapshot construction
+- Registry-driven projector dispatch: `(meta.projector)(recorded_by, event_id_b64, parsed, ctx)`
+- Write-op execution and emit-command handling
 
 The service layer (`src/service.rs`) is a thin orchestrator that handles:
 
@@ -1068,16 +1078,29 @@ The service layer (`src/service.rs`) is a thin orchestrator that handles:
 - Response type definitions and shaping (`MessageItem`, `MessagesResponse`, etc.)
 - Non-event-specific logic (identity bootstrap, invite flows, predicate/assert system)
 
-## 14.2 Typed command dispatch
+## 14.2 Registry-driven projector dispatch
 
-`src/events/dispatch.rs` provides an `EventCommand` enum and `execute_command()` function that routes creation to the appropriate event module. This enables callers that want a single entry point for event creation without depending on specific event module APIs.
+`EventTypeMeta` includes a `projector` function pointer with the uniform signature:
 
-## 14.3 Adding a new event type
+```rust
+fn(&str, &str, &ParsedEvent, &ContextSnapshot) -> ProjectorResult
+```
 
-When adding a new event type that has service-layer commands or queries:
+`dispatch_pure_projector` in `apply.rs` looks up the event's type code in the registry and calls the registered projector. No central match statement is required. Each event module owns its complete projection semantics.
 
-1. Define the event struct, parse/encode, and `EventTypeMeta` in `src/events/<type>.rs`.
-2. Add `CreateXxxCmd` + `create()` for command paths.
-3. Add `query_*()` functions for any projection-table queries.
-4. Add an `EventCommand` variant to `dispatch.rs` if the type participates in command dispatch.
-5. Wire service.rs to call the event module functions, shaping results into response types.
+## 14.3 Typed command dispatch
+
+`src/event_modules/dispatch.rs` provides an `EventCommand` enum and `execute_command()` function that routes creation to the appropriate event module. This enables callers that want a single entry point for event creation without depending on specific event module APIs.
+
+## 14.4 Adding a new event type
+
+When adding a new event type:
+
+1. Define the event struct, parse/encode, and `EventTypeMeta` in `src/event_modules/<type>.rs`.
+2. **Add `project_pure()`** — the pure projector function. Set `EventTypeMeta.projector = project_pure`. This is where all projection semantics for this event type live.
+3. Add `CreateXxxCmd` + `create()` for command paths.
+4. Add `query_*()` functions for any projection-table queries.
+5. Add an `EventCommand` variant to `dispatch.rs` if the type participates in command dispatch.
+6. Wire service.rs to call the event module functions, shaping results into response types.
+
+**Rule**: Event projection semantics MUST live in event modules, not in central projector files. The pipeline must not contain event-type-specific logic beyond context snapshot construction.

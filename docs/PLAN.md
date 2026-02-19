@@ -2259,23 +2259,31 @@ Goal: establish a test suite where successful P2P bootstrap and sync cannot be f
 4. Current behavior is intentionally best-effort/manual (`topo upnp`); there is no long-running lease-refresh manager in daemon scope.
 5. Expected limitation: some networks (for example CGNAT or non-UPnP routers) still require manual bootstrap endpoints even with this feature.
 
-## 19. Event-module locality (Option 1+2)
+## 19. Event-module locality (Option 1+2+4)
 
 ### 19.1 Motivation
 
 `service.rs` previously embedded event-specific SQL queries and event construction logic for all event types. This scattered event-specific concerns: message SQL lived far from `MessageEvent` schema, reaction queries were disconnected from `ReactionEvent`, etc.
 
+Similarly, projector logic for all event types lived in two central files (`projection/projectors.rs` for content events, `projection/identity.rs` for identity events) with a large match statement in `apply.rs` routing to them. This violated locality — to understand message projection you had to jump to a different module.
+
 ### 19.2 Approach
 
-Moved event-specific command (create) and query helpers into event-owned modules, making `service.rs` a thin orchestrator that handles DB context, auth, and response shaping.
+Moved event-specific command (create), query helpers, and **projector functions** into event-owned modules, making `service.rs` a thin orchestrator and `apply.rs` an orchestration-only pipeline.
 
 **Event modules gained:**
 - `CreateXxxCmd` structs — input params for creating events
 - `create()` — builds `ParsedEvent`, calls `create_signed_event_sync`, returns `EventId`
 - `query_list()`, `query_count()`, `resolve_by_number()`, `resolve_selector()` — SQL against projection tables
+- `project_pure()` — pure projector function registered in `EventTypeMeta.projector`
+
+**Registry-driven projector dispatch:**
+- `EventTypeMeta` gained a `projector` field: `fn(&str, &str, &ParsedEvent, &ContextSnapshot) -> ProjectorResult`
+- `dispatch_pure_projector` in `apply.rs` uses registry lookup — no central match statement
+- Deleted: `src/projection/projectors.rs` (content event splay) and `src/projection/identity.rs` (identity event splay)
 
 **New dispatch layer:**
-- `src/events/dispatch.rs` — `EventCommand` enum + `execute_command()` for typed command routing
+- `src/event_modules/dispatch.rs` — `EventCommand` enum + `execute_command()` for typed command routing
 
 **Shared utilities added to `src/crypto/mod.rs`:**
 - `event_id_from_hex()` — parse hex event ID
@@ -2307,3 +2315,13 @@ Moved event-specific command (create) and query helpers into event-owned modules
 - Response type definitions and shaping
 - Identity bootstrap, invite flows, predicate/assert system
 - Service-level helpers (`current_timestamp_ms`, `stable_author_id`, `parse_workspace_hex`)
+
+### 19.5 What apply.rs retains (orchestration-only)
+
+- Dependency presence check + block row writes
+- Dependency type enforcement
+- Signer verification (uniform, not event-type-specific)
+- Context snapshot construction
+- Registry-driven projector dispatch
+- Write-op execution and emit-command handling
+- **No event-type-specific projection logic** — that lives in event modules

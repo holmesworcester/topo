@@ -61,6 +61,37 @@ pub fn encode_user_removed(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     Ok(buf)
 }
 
+// === Projector (event-module locality) ===
+
+use crate::crypto::event_id_to_base64;
+use crate::projection::result::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
+
+/// Pure projector: UserRemoved → removed_entities table.
+pub fn project_pure(
+    recorded_by: &str,
+    event_id_b64: &str,
+    parsed: &ParsedEvent,
+    _ctx: &ContextSnapshot,
+) -> ProjectorResult {
+    let r = match parsed {
+        ParsedEvent::UserRemoved(r) => r,
+        _ => return ProjectorResult::reject("not a user_removed event".to_string()),
+    };
+
+    let target_b64 = event_id_to_base64(&r.target_event_id);
+    let ops = vec![WriteOp::InsertOrIgnore {
+        table: "removed_entities",
+        columns: vec!["recorded_by", "event_id", "target_event_id", "removal_type"],
+        values: vec![
+            SqlVal::Text(recorded_by.to_string()),
+            SqlVal::Text(event_id_b64.to_string()),
+            SqlVal::Text(target_b64),
+            SqlVal::Text("user".to_string()),
+        ],
+    }];
+    ProjectorResult::valid(ops)
+}
+
 pub static USER_REMOVED_META: EventTypeMeta = EventTypeMeta {
     type_code: EVENT_TYPE_USER_REMOVED,
     type_name: "user_removed",
@@ -73,6 +104,7 @@ pub static USER_REMOVED_META: EventTypeMeta = EventTypeMeta {
     encryptable: false,
     parse: parse_user_removed,
     encode: encode_user_removed,
+    projector: project_pure,
 };
 
 // === Command/Query APIs (event-module locality) ===

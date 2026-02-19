@@ -73,6 +73,45 @@ pub fn encode_secret_shared(event: &ParsedEvent) -> Result<Vec<u8>, EventError> 
     Ok(buf)
 }
 
+// === Projector (event-module locality) ===
+
+use crate::crypto::event_id_to_base64;
+use crate::projection::result::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
+
+/// Pure projector: SecretShared → secret_shared table.
+/// Rejects if recipient has been removed (InvRemovalExclusion).
+pub fn project_pure(
+    recorded_by: &str,
+    event_id_b64: &str,
+    parsed: &ParsedEvent,
+    ctx: &ContextSnapshot,
+) -> ProjectorResult {
+    let ss = match parsed {
+        ParsedEvent::SecretShared(s) => s,
+        _ => return ProjectorResult::reject("not a secret_shared event".to_string()),
+    };
+
+    let key_b64 = event_id_to_base64(&ss.key_event_id);
+    let recipient_b64 = event_id_to_base64(&ss.recipient_event_id);
+
+    if ctx.recipient_removed {
+        return ProjectorResult::reject(format!("recipient {} has been removed", recipient_b64));
+    }
+
+    let ops = vec![WriteOp::InsertOrIgnore {
+        table: "secret_shared",
+        columns: vec!["recorded_by", "event_id", "key_event_id", "recipient_event_id", "wrapped_key"],
+        values: vec![
+            SqlVal::Text(recorded_by.to_string()),
+            SqlVal::Text(event_id_b64.to_string()),
+            SqlVal::Text(key_b64),
+            SqlVal::Text(recipient_b64),
+            SqlVal::Blob(ss.wrapped_key.to_vec()),
+        ],
+    }];
+    ProjectorResult::valid(ops)
+}
+
 pub static SECRET_SHARED_META: EventTypeMeta = EventTypeMeta {
     type_code: EVENT_TYPE_SECRET_SHARED,
     type_name: "secret_shared",
@@ -85,4 +124,5 @@ pub static SECRET_SHARED_META: EventTypeMeta = EventTypeMeta {
     encryptable: false,
     parse: parse_secret_shared,
     encode: encode_secret_shared,
+    projector: project_pure,
 };

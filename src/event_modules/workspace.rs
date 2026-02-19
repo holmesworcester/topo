@@ -64,6 +64,54 @@ pub fn encode_workspace(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     Ok(buf)
 }
 
+// === Projector (event-module locality) ===
+
+use crate::projection::result::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
+
+/// Pure projector: Workspace guard — trust_anchors must match workspace event_id.
+/// Returns Block if no trust anchor yet, Reject if mismatch.
+pub fn project_pure(
+    recorded_by: &str,
+    event_id_b64: &str,
+    parsed: &ParsedEvent,
+    ctx: &ContextSnapshot,
+) -> ProjectorResult {
+    let ws = match parsed {
+        ParsedEvent::Workspace(w) => w,
+        _ => return ProjectorResult::reject("not a workspace event".to_string()),
+    };
+
+    let workspace_id_b64 = event_id_b64.to_string();
+
+    match &ctx.trust_anchor_workspace_id {
+        None => {
+            // No trust anchor yet — block until invite_accepted sets it
+            ProjectorResult::block(vec![])
+        }
+        Some(anchor_wid) if anchor_wid == &workspace_id_b64 => {
+            // Trust anchor matches — project
+            let ops = vec![
+                WriteOp::InsertOrIgnore {
+                    table: "workspaces",
+                    columns: vec!["recorded_by", "event_id", "workspace_id", "public_key", "name"],
+                    values: vec![
+                        SqlVal::Text(recorded_by.to_string()),
+                        SqlVal::Text(event_id_b64.to_string()),
+                        SqlVal::Text(workspace_id_b64),
+                        SqlVal::Blob(ws.public_key.to_vec()),
+                        SqlVal::Text(ws.name.clone()),
+                    ],
+                },
+            ];
+            ProjectorResult::valid(ops)
+        }
+        Some(_) => {
+            // Foreign workspace — reject
+            ProjectorResult::reject("workspace_id does not match trust anchor".to_string())
+        }
+    }
+}
+
 pub static WORKSPACE_META: EventTypeMeta = EventTypeMeta {
     type_code: EVENT_TYPE_WORKSPACE,
     type_name: "workspace",
@@ -76,6 +124,7 @@ pub static WORKSPACE_META: EventTypeMeta = EventTypeMeta {
     encryptable: false,
     parse: parse_workspace,
     encode: encode_workspace,
+    projector: project_pure,
 };
 
 // === Query APIs (event-module locality) ===

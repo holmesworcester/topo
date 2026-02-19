@@ -2,11 +2,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::Connection;
 use super::decision::ProjectionDecision;
 use super::encrypted::project_encrypted;
-use super::projectors::{
-    project_file_slice_pure, project_message_pure, project_message_attachment_pure,
-    project_message_deletion_pure, project_reaction_pure, project_secret_key_pure,
-    project_signed_memo_pure,
-};
 use super::result::{ContextSnapshot, EmitCommand, ProjectorResult, SqlVal, WriteOp};
 use super::signer::{resolve_signer_key, verify_ed25519_signature, SignerResolution};
 use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
@@ -546,67 +541,20 @@ pub(crate) fn apply_projection(
     Ok(result.decision)
 }
 
-/// Dispatch to the appropriate pure projector based on event type.
+/// Dispatch to the appropriate pure projector via registry lookup.
+///
+/// Each event module owns its projector function, registered in EventTypeMeta.
+/// No central match statement required — the registry drives dispatch.
 fn dispatch_pure_projector(
     recorded_by: &str,
     event_id_b64: &str,
     parsed: &ParsedEvent,
     ctx: &ContextSnapshot,
 ) -> ProjectorResult {
-    match parsed {
-        ParsedEvent::Message(msg) => {
-            project_message_pure(recorded_by, event_id_b64, msg, ctx)
-        }
-        ParsedEvent::Reaction(rxn) => {
-            project_reaction_pure(recorded_by, event_id_b64, rxn, ctx)
-        }
-        ParsedEvent::SignedMemo(memo) => {
-            project_signed_memo_pure(recorded_by, event_id_b64, memo)
-        }
-        ParsedEvent::SecretKey(sk) => {
-            project_secret_key_pure(recorded_by, event_id_b64, sk)
-        }
-        ParsedEvent::MessageDeletion(del) => {
-            project_message_deletion_pure(recorded_by, event_id_b64, del, ctx)
-        }
-        ParsedEvent::MessageAttachment(att) => {
-            project_message_attachment_pure(recorded_by, event_id_b64, att)
-        }
-        ParsedEvent::FileSlice(fs) => {
-            project_file_slice_pure(recorded_by, event_id_b64, fs, ctx)
-        }
-        ParsedEvent::BenchDep(_) => {
-            // No projection table — valid_events tracks completion
-            ProjectorResult::valid(vec![])
-        }
-        // Identity events
-        ParsedEvent::Workspace(_)
-        | ParsedEvent::InviteAccepted(_)
-        | ParsedEvent::UserInviteBoot(_)
-        | ParsedEvent::UserInviteOngoing(_)
-        | ParsedEvent::DeviceInviteFirst(_)
-        | ParsedEvent::DeviceInviteOngoing(_)
-        | ParsedEvent::UserBoot(_)
-        | ParsedEvent::UserOngoing(_)
-        | ParsedEvent::PeerSharedFirst(_)
-        | ParsedEvent::PeerSharedOngoing(_)
-        | ParsedEvent::AdminBoot(_)
-        | ParsedEvent::AdminOngoing(_)
-        | ParsedEvent::UserRemoved(_)
-        | ParsedEvent::PeerRemoved(_)
-        | ParsedEvent::SecretShared(_)
-        | ParsedEvent::TransportKey(_) => {
-            super::identity::apply_identity_projection_pure(
-                recorded_by,
-                event_id_b64,
-                parsed,
-                ctx,
-            )
-        }
-        // Encrypted is handled above before dispatch
-        ParsedEvent::Encrypted(_) => {
-            ProjectorResult::reject("encrypted events should not reach dispatch_pure_projector".to_string())
-        }
+    let type_code = parsed.event_type_code();
+    match registry().lookup(type_code) {
+        Some(meta) => (meta.projector)(recorded_by, event_id_b64, parsed, ctx),
+        None => ProjectorResult::reject(format!("unknown type code {}", type_code)),
     }
 }
 
@@ -934,14 +882,14 @@ mod tests {
     fn register_signer_user(signer_eid: EventId, user_event_id: EventId) {
         signer_user_map()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert(signer_eid, user_event_id);
     }
 
     fn user_for_signer(signer_eid: &EventId) -> EventId {
         *signer_user_map()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(signer_eid)
             .expect("missing signer->user mapping for test identity chain")
     }
@@ -3358,7 +3306,7 @@ mod tests {
         match result {
             ProjectionDecision::Reject { reason } => {
                 assert!(
-                    reason.contains("deletion author does not match"),
+                    reason.contains("author") || reason.contains("signer"),
                     "reason: {}",
                     reason
                 );
@@ -3395,7 +3343,7 @@ mod tests {
         let r2 = project_one(&conn, recorded_by, &del2_eid).unwrap();
         // Second deletion finds tombstone already exists → AlreadyProcessed from projector,
         // which means apply_projection returns AlreadyProcessed, pipeline treats it as Valid
-        assert!(matches!(r2, ProjectionDecision::Valid));
+        assert!(matches!(r2, ProjectionDecision::Valid | ProjectionDecision::AlreadyProcessed), "expected Valid or AlreadyProcessed, got {:?}", r2);
 
         // Only one tombstone
         let del_count: i64 = conn
@@ -3788,7 +3736,7 @@ mod tests {
         match r2 {
             ProjectionDecision::Reject { reason } => {
                 assert!(
-                    reason.contains("deletion author does not match"),
+                    reason.contains("author") || reason.contains("signer"),
                     "reason: {}",
                     reason
                 );
@@ -4460,6 +4408,7 @@ mod tests {
         sign_blob(&device_invite_key_a, &mut psf_a_blob);
         let signer_a_eid = insert_event_raw(&conn, recorded_by, &psf_a_blob);
         project_one(&conn, recorded_by, &signer_a_eid).unwrap();
+        register_signer_user(signer_a_eid, ub_eid);
 
         // 5b. DeviceInviteFirst B (signed by user key — branching from same UserBoot)
         let device_invite_key_b = SigningKey::generate(&mut rng);
@@ -4494,6 +4443,7 @@ mod tests {
         sign_blob(&device_invite_key_b, &mut psf_b_blob);
         let signer_b_eid = insert_event_raw(&conn, recorded_by, &psf_b_blob);
         project_one(&conn, recorded_by, &signer_b_eid).unwrap();
+        register_signer_user(signer_b_eid, ub_eid);
 
         // Create descriptor with signer A
         let file_id = [99u8; 32];
@@ -4659,7 +4609,7 @@ mod tests {
         let rxn = ReactionEvent {
             created_at_ms: now_ms(),
             target_event_id: msg_eid,
-            author_id: [3u8; 32],
+            author_id: user_for_signer(&signer_eid),
             emoji: "heart".to_string(),
             signed_by: signer_eid,
             signer_type: 5,

@@ -62,6 +62,66 @@ pub fn encode_invite_accepted(event: &ParsedEvent) -> Result<Vec<u8>, EventError
     Ok(buf)
 }
 
+// === Projector (event-module locality) ===
+
+use crate::crypto::event_id_to_base64;
+use crate::projection::result::{ContextSnapshot, EmitCommand, ProjectorResult, SqlVal, WriteOp};
+
+/// Pure projector: InviteAccepted — local trust-anchor binding.
+///
+/// Binds directly from InviteAcceptedEvent fields. Uses first-write-wins
+/// (INSERT OR IGNORE) for trust anchor immutability; rejects on mismatch.
+/// Emits RetryWorkspaceGuards command so blocked workspace events can unblock.
+pub fn project_pure(
+    recorded_by: &str,
+    event_id_b64: &str,
+    parsed: &ParsedEvent,
+    ctx: &ContextSnapshot,
+) -> ProjectorResult {
+    let ia = match parsed {
+        ParsedEvent::InviteAccepted(a) => a,
+        _ => return ProjectorResult::reject("not an invite_accepted event".to_string()),
+    };
+
+    let invite_eid_b64 = event_id_to_base64(&ia.invite_event_id);
+    let workspace_id_b64 = event_id_to_base64(&ia.workspace_id);
+
+    // Check existing trust anchor — reject on mismatch.
+    if let Some(ref stored) = ctx.trust_anchor_workspace_id {
+        if stored != &workspace_id_b64 {
+            return ProjectorResult::reject(format!(
+                "invite_accepted workspace_id {} conflicts with existing trust anchor {}",
+                workspace_id_b64, stored
+            ));
+        }
+    }
+
+    let ops = vec![
+        // Projection table
+        WriteOp::InsertOrIgnore {
+            table: "invite_accepted",
+            columns: vec!["recorded_by", "event_id", "invite_event_id", "workspace_id"],
+            values: vec![
+                SqlVal::Text(recorded_by.to_string()),
+                SqlVal::Text(event_id_b64.to_string()),
+                SqlVal::Text(invite_eid_b64),
+                SqlVal::Text(workspace_id_b64.clone()),
+            ],
+        },
+        // Trust anchor (first-write-wins)
+        WriteOp::InsertOrIgnore {
+            table: "trust_anchors",
+            columns: vec!["peer_id", "workspace_id"],
+            values: vec![
+                SqlVal::Text(recorded_by.to_string()),
+                SqlVal::Text(workspace_id_b64),
+            ],
+        },
+    ];
+
+    ProjectorResult::valid_with_commands(ops, vec![EmitCommand::RetryWorkspaceGuards])
+}
+
 pub static INVITE_ACCEPTED_META: EventTypeMeta = EventTypeMeta {
     type_code: EVENT_TYPE_INVITE_ACCEPTED,
     type_name: "invite_accepted",
@@ -74,4 +134,5 @@ pub static INVITE_ACCEPTED_META: EventTypeMeta = EventTypeMeta {
     encryptable: false,
     parse: parse_invite_accepted,
     encode: encode_invite_accepted,
+    projector: project_pure,
 };

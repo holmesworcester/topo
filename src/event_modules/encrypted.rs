@@ -111,6 +111,21 @@ pub fn encode_encrypted(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     Ok(buf)
 }
 
+// === Projector (event-module locality) ===
+
+use crate::projection::result::{ContextSnapshot, ProjectorResult};
+
+/// Encrypted events are handled by the pipeline before projector dispatch.
+/// If this function is reached, it means the encrypted event was not decrypted.
+pub fn project_pure(
+    _recorded_by: &str,
+    _event_id_b64: &str,
+    _parsed: &ParsedEvent,
+    _ctx: &ContextSnapshot,
+) -> ProjectorResult {
+    ProjectorResult::reject("encrypted events should not reach projector dispatch".to_string())
+}
+
 pub static ENCRYPTED_META: EventTypeMeta = EventTypeMeta {
     type_code: EVENT_TYPE_ENCRYPTED,
     type_name: "encrypted",
@@ -123,4 +138,5 @@ pub static ENCRYPTED_META: EventTypeMeta = EventTypeMeta {
     encryptable: false,
     parse: parse_encrypted,
     encode: encode_encrypted,
+    projector: project_pure,
 };

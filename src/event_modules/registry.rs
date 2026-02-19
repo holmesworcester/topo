@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use super::{EventError, ParsedEvent};
+use crate::projection::result::{ContextSnapshot, ProjectorResult};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShareScope {
@@ -33,6 +34,9 @@ pub struct EventTypeMeta {
     pub encryptable: bool,
     pub parse: fn(&[u8]) -> Result<ParsedEvent, EventError>,
     pub encode: fn(&ParsedEvent) -> Result<Vec<u8>, EventError>,
+    /// Module-owned pure projector function. The pipeline dispatches to this
+    /// via registry lookup — no central match statement required.
+    pub projector: fn(&str, &str, &ParsedEvent, &ContextSnapshot) -> ProjectorResult,
 }
 
 pub struct EventRegistry {

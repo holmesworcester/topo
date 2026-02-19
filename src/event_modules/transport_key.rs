@@ -61,6 +61,34 @@ pub fn encode_transport_key(event: &ParsedEvent) -> Result<Vec<u8>, EventError> 
     Ok(buf)
 }
 
+// === Projector (event-module locality) ===
+
+use crate::projection::result::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
+
+/// Pure projector: TransportKey → transport_keys table.
+pub fn project_pure(
+    recorded_by: &str,
+    event_id_b64: &str,
+    parsed: &ParsedEvent,
+    _ctx: &ContextSnapshot,
+) -> ProjectorResult {
+    let tk = match parsed {
+        ParsedEvent::TransportKey(t) => t,
+        _ => return ProjectorResult::reject("not a transport_key event".to_string()),
+    };
+
+    let ops = vec![WriteOp::InsertOrIgnore {
+        table: "transport_keys",
+        columns: vec!["recorded_by", "event_id", "spki_fingerprint"],
+        values: vec![
+            SqlVal::Text(recorded_by.to_string()),
+            SqlVal::Text(event_id_b64.to_string()),
+            SqlVal::Blob(tk.spki_fingerprint.to_vec()),
+        ],
+    }];
+    ProjectorResult::valid(ops)
+}
+
 pub static TRANSPORT_KEY_META: EventTypeMeta = EventTypeMeta {
     type_code: EVENT_TYPE_TRANSPORT_KEY,
     type_name: "transport_key",
@@ -73,6 +101,7 @@ pub static TRANSPORT_KEY_META: EventTypeMeta = EventTypeMeta {
     encryptable: false,
     parse: parse_transport_key,
     encode: encode_transport_key,
+    projector: project_pure,
 };
 
 // === Query APIs (event-module locality) ===

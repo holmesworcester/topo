@@ -84,6 +84,41 @@ pub fn encode_signed_memo(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     Ok(buf)
 }
 
+// === Projector (event-module locality) ===
+
+use crate::crypto::event_id_to_base64;
+use crate::projection::result::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
+
+/// Pure projector: SignedMemo → signed_memos table insert.
+pub fn project_pure(
+    recorded_by: &str,
+    event_id_b64: &str,
+    parsed: &ParsedEvent,
+    _ctx: &ContextSnapshot,
+) -> ProjectorResult {
+    let memo = match parsed {
+        ParsedEvent::SignedMemo(m) => m,
+        _ => return ProjectorResult::reject("not a signed_memo event".to_string()),
+    };
+
+    let signed_by_b64 = event_id_to_base64(&memo.signed_by);
+    let ops = vec![
+        WriteOp::InsertOrIgnore {
+            table: "signed_memos",
+            columns: vec!["event_id", "signed_by", "signer_type", "content", "created_at", "recorded_by"],
+            values: vec![
+                SqlVal::Text(event_id_b64.to_string()),
+                SqlVal::Text(signed_by_b64),
+                SqlVal::Int(memo.signer_type as i64),
+                SqlVal::Text(memo.content.clone()),
+                SqlVal::Int(memo.created_at_ms as i64),
+                SqlVal::Text(recorded_by.to_string()),
+            ],
+        },
+    ];
+    ProjectorResult::valid(ops)
+}
+
 pub static SIGNED_MEMO_META: EventTypeMeta = EventTypeMeta {
     type_code: EVENT_TYPE_SIGNED_MEMO,
     type_name: "signed_memo",
@@ -96,4 +131,5 @@ pub static SIGNED_MEMO_META: EventTypeMeta = EventTypeMeta {
     encryptable: true,
     parse: parse_signed_memo,
     encode: encode_signed_memo,
+    projector: project_pure,
 };

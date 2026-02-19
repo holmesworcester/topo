@@ -140,6 +140,36 @@ pub fn encode_user_ongoing(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     Ok(buf)
 }
 
+// === Projector (event-module locality) ===
+
+use crate::projection::result::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
+
+/// Pure projector: User (Boot or Ongoing) → users table.
+pub fn project_pure(
+    recorded_by: &str,
+    event_id_b64: &str,
+    parsed: &ParsedEvent,
+    _ctx: &ContextSnapshot,
+) -> ProjectorResult {
+    let (public_key, username) = match parsed {
+        ParsedEvent::UserBoot(u) => (&u.public_key, &u.username),
+        ParsedEvent::UserOngoing(u) => (&u.public_key, &u.username),
+        _ => return ProjectorResult::reject("not a user event".to_string()),
+    };
+
+    let ops = vec![WriteOp::InsertOrIgnore {
+        table: "users",
+        columns: vec!["recorded_by", "event_id", "public_key", "username"],
+        values: vec![
+            SqlVal::Text(recorded_by.to_string()),
+            SqlVal::Text(event_id_b64.to_string()),
+            SqlVal::Blob(public_key.to_vec()),
+            SqlVal::Text(username.to_string()),
+        ],
+    }];
+    ProjectorResult::valid(ops)
+}
+
 pub static USER_BOOT_META: EventTypeMeta = EventTypeMeta {
     type_code: EVENT_TYPE_USER_BOOT,
     type_name: "user_boot",
@@ -152,6 +182,7 @@ pub static USER_BOOT_META: EventTypeMeta = EventTypeMeta {
     encryptable: false,
     parse: parse_user_boot,
     encode: encode_user_boot,
+    projector: project_pure,
 };
 
 pub static USER_ONGOING_META: EventTypeMeta = EventTypeMeta {
@@ -166,6 +197,7 @@ pub static USER_ONGOING_META: EventTypeMeta = EventTypeMeta {
     encryptable: false,
     parse: parse_user_ongoing,
     encode: encode_user_ongoing,
+    projector: project_pure,
 };
 
 // === Query APIs (event-module locality) ===

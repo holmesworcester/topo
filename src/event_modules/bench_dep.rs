@@ -86,6 +86,20 @@ pub fn encode_bench_dep(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     Ok(buf)
 }
 
+// === Projector (event-module locality) ===
+
+use crate::projection::result::{ContextSnapshot, ProjectorResult};
+
+/// Pure projector: BenchDep — no projection table, valid_events tracks completion.
+pub fn project_pure(
+    _recorded_by: &str,
+    _event_id_b64: &str,
+    _parsed: &ParsedEvent,
+    _ctx: &ContextSnapshot,
+) -> ProjectorResult {
+    ProjectorResult::valid(vec![])
+}
+
 pub static BENCH_DEP_META: EventTypeMeta = EventTypeMeta {
     type_code: EVENT_TYPE_BENCH_DEP,
     type_name: "bench_dep",
@@ -98,4 +112,5 @@ pub static BENCH_DEP_META: EventTypeMeta = EventTypeMeta {
     encryptable: false,
     parse: parse_bench_dep,
     encode: encode_bench_dep,
+    projector: project_pure,
 };
