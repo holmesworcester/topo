@@ -194,3 +194,14 @@ pub fn query_list(
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
 }
+
+pub fn query_count(
+    db: &Connection,
+    recorded_by: &str,
+) -> Result<i64, rusqlite::Error> {
+    db.query_row(
+        "SELECT COUNT(*) FROM users WHERE recorded_by = ?1",
+        rusqlite::params![recorded_by],
+        |row| row.get(0),
+    )
+}

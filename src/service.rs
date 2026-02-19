@@ -1338,7 +1338,7 @@ pub fn svc_view_for_peer(db_path: &str, peer_id: &str, limit: usize) -> ServiceR
 }
 
 pub fn svc_keys_conn(db: &rusqlite::Connection, recorded_by: &str, summary: bool) -> ServiceResult<KeysResponse> {
-    let user_count = user::query_list(db, recorded_by).map(|v| v.len() as i64).unwrap_or(0);
+    let user_count = user::query_count(db, recorded_by).unwrap_or(0);
     let peer_count = peer_shared::query_count(db, recorded_by).unwrap_or(0);
     let admin_count = admin::query_count(db, recorded_by).unwrap_or(0);
     let transport_count = transport_key::query_count(db, recorded_by).unwrap_or(0);
