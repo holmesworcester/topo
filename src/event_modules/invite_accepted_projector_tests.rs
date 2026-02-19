@@ -73,8 +73,8 @@ mod tests {
 
         let result = project_pure(PEER, "event_ia_4", &parsed, &ctx);
         assert_valid(&result);
-        assert_emits_command(&result, "RetryWorkspaceGuards", |c| {
-            matches!(c, EmitCommand::RetryWorkspaceGuards)
+        assert_emits_command(&result, "RetryWorkspaceEvent", |c| {
+            matches!(c, EmitCommand::RetryWorkspaceEvent { .. })
         });
         assert_emits_command(&result, "WriteAcceptedBootstrapTrust", |c| {
             matches!(c, EmitCommand::WriteAcceptedBootstrapTrust { .. })
@@ -91,9 +91,9 @@ mod tests {
 
         let result = project_pure(PEER, "event_ia_5", &parsed, &ctx);
         assert_valid(&result);
-        // Should emit RetryWorkspaceGuards but NOT WriteAcceptedBootstrapTrust
-        assert_emits_command(&result, "RetryWorkspaceGuards", |c| {
-            matches!(c, EmitCommand::RetryWorkspaceGuards)
+        // Should emit RetryWorkspaceEvent but NOT WriteAcceptedBootstrapTrust
+        assert_emits_command(&result, "RetryWorkspaceEvent", |c| {
+            matches!(c, EmitCommand::RetryWorkspaceEvent { .. })
         });
         assert!(
             !result
