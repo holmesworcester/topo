@@ -1055,12 +1055,13 @@ The result is a small protocol core with clear upgrade paths instead of a stack 
 
 ## 14.1 Layering convention
 
-Event modules (`src/event_modules/*.rs`) own four concerns:
+Event modules (`src/event_modules/<type>.rs` or `src/event_modules/<type>/`) own five concerns:
 
-1. **Schema** — struct definition, parse/encode, wire layout, `EventTypeMeta`.
+1. **Wire** — struct definition, parse/encode, wire layout, `EventTypeMeta`.
 2. **Projector** — `project_pure()` function: the pure projector for this event type. Takes `(recorded_by, event_id_b64, &ParsedEvent, &ContextSnapshot)` and returns `ProjectorResult`. Registered in `EventTypeMeta.projector` so the pipeline dispatches via registry lookup with no central match statement.
-3. **Command helpers** — `CreateXxxCmd` struct + `create()` function that builds the `ParsedEvent`, calls `create_signed_event_sync`, and returns `EventId`.
-4. **Query helpers** — `query_list()`, `query_count()`, `resolve_by_number()`, etc. — SQL against projection tables scoped by `recorded_by`.
+3. **Commands** — `CreateXxxCmd` struct + `create()` function that builds the `ParsedEvent`, calls `create_signed_event_sync`, and returns `EventId`. High-level conn-level helpers (e.g. `send_conn`, `react_conn`) that combine create + response shaping.
+4. **Queries** — `query_list()`, `query_count()`, `resolve_by_number()`, etc. — SQL against projection tables scoped by `recorded_by`. Response assembly helpers (e.g. `messages_conn`) that combine queries into structured responses.
+5. **Response types** — serializable structs for the event domain (e.g. `MessageItem`, `MessagesResponse`, `SendResponse`). Owned by the event module, re-exported by service.rs for external callers.
 
 The projection pipeline (`src/projection/apply.rs`) is orchestration-only:
 
@@ -1075,8 +1076,9 @@ The service layer (`src/service.rs`) is a thin orchestrator that handles:
 
 - DB open/close and connection management
 - Auth (key loading, `require_local_peer_signer`)
-- Response type definitions and shaping (`MessageItem`, `MessagesResponse`, etc.)
+- Cross-module orchestration (e.g. `svc_view_conn` combines messages, reactions, users)
 - Non-event-specific logic (identity bootstrap, invite flows, predicate/assert system)
+- Error mapping from module results to `ServiceError`
 
 ## 14.2 Registry-driven projector dispatch
 
@@ -1086,21 +1088,36 @@ The service layer (`src/service.rs`) is a thin orchestrator that handles:
 fn(&str, &str, &ParsedEvent, &ContextSnapshot) -> ProjectorResult
 ```
 
-`dispatch_pure_projector` in `apply.rs` looks up the event's type code in the registry and calls the registered projector. No central match statement is required. Each event module owns its complete projection semantics.
+## 14.3 Module split rule
 
-## 14.3 Typed command dispatch
+When an event module exceeds roughly 300-400 LOC or mixes 3+ concerns (wire + commands + queries + projector), split it into a directory module:
+
+```
+src/event_modules/<name>/
+    mod.rs          — re-exports stable public API
+    wire.rs         — event struct, parse, encode, EventTypeMeta, project_pure
+    commands.rs     — CreateXxxCmd, create(), high-level command helpers
+    queries.rs      — query_list, query_count, resolve_*, response assembly
+```
+
+`mod.rs` re-exports all public items so callers continue to import from `event_modules::<name>`.
+
+## 14.4 Typed command dispatch
 
 `src/event_modules/dispatch.rs` provides an `EventCommand` enum and `execute_command()` function that routes creation to the appropriate event module. This enables callers that want a single entry point for event creation without depending on specific event module APIs.
 
-## 14.4 Adding a new event type
+## 14.5 Adding a new event type
+
+`dispatch_pure_projector` in `apply.rs` looks up the event's type code in the registry and calls the registered projector. No central match statement is required. Each event module owns its complete projection semantics.
 
 When adding a new event type:
 
-1. Define the event struct, parse/encode, and `EventTypeMeta` in `src/event_modules/<type>.rs`.
+1. Define the event struct, parse/encode, and `EventTypeMeta` in `src/event_modules/<type>.rs` (or `<type>/wire.rs` if split).
 2. **Add `project_pure()`** — the pure projector function. Set `EventTypeMeta.projector = project_pure`. This is where all projection semantics for this event type live.
 3. Add `CreateXxxCmd` + `create()` for command paths.
 4. Add `query_*()` functions for any projection-table queries.
-5. Add an `EventCommand` variant to `dispatch.rs` if the type participates in command dispatch.
-6. Wire service.rs to call the event module functions, shaping results into response types.
+5. Add response types and conn-level helpers in the event module.
+6. Add an `EventCommand` variant to `dispatch.rs` if the type participates in command dispatch.
+7. Wire service.rs to call the event module functions, mapping errors to `ServiceError`.
 
 **Rule**: Event projection semantics MUST live in event modules, not in central projector files. The pipeline must not contain event-type-specific logic beyond context snapshot construction.

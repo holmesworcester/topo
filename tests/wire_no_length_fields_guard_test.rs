@@ -9,7 +9,7 @@ use std::fs;
 
 /// Canonical event source files in scope for fixed-layout enforcement.
 const CANONICAL_EVENT_FILES: &[&str] = &[
-    "src/event_modules/message.rs",
+    "src/event_modules/message/wire.rs",
     "src/event_modules/reaction.rs",
     "src/event_modules/signed_memo.rs",
     "src/event_modules/encrypted.rs",

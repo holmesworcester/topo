@@ -136,3 +136,20 @@ pub fn create(
     let eid = create_signed_event_sync(db, recorded_by, &ur, signing_key)?;
     Ok(eid)
 }
+
+/// High-level remove-user command: creates a UserRemoved event and returns target hex.
+pub fn remove_user_conn(
+    db: &Connection,
+    recorded_by: &str,
+    signer_eid: &EventId,
+    signing_key: &SigningKey,
+    created_at_ms: u64,
+    target_event_id: EventId,
+) -> Result<String, String> {
+    create(
+        db, recorded_by, signer_eid, signing_key, created_at_ms,
+        CreateUserRemovedCmd { target_event_id },
+    ).map_err(|e| format!("{}", e))?;
+
+    Ok(hex::encode(target_event_id))
+}

@@ -131,7 +131,7 @@ These are required, not optional:
 
 Every CLI instance is a real peer-to-peer device. All user-facing commands go through daemon RPC to the service layer:
 
-1. **One service layer**: all business logic lives in `src/service.rs` (or the domain modules it calls). CLI subcommands are thin UI adapters that call daemon RPC, which dispatches to service functions.
+1. **One service layer**: business logic lives in event modules (`src/event_modules/`) for event-specific concerns and `src/service.rs` for orchestration. CLI subcommands are thin UI adapters that call daemon RPC, which dispatches to service functions.
 2. **Real networking**: invite acceptance uses real QUIC bootstrap sync, not in-process event copying. The daemon manages ongoing sync with discovered peers.
 3. **Testing equivalence**: CLI integration tests exercise the full path (CLI binary → RPC → service → DB/sync). No separate interactive surface exists; the daemon-backed CLI is the single command interface.
 4. **No synthetic shortcuts**: no `copy_event_chain`, no direct DB-to-DB event transfers, no bypass of the sync/projection pipeline. Every event flows through the same ingest path it would in production.
@@ -2259,15 +2259,15 @@ Goal: establish a test suite where successful P2P bootstrap and sync cannot be f
 4. Current behavior is intentionally best-effort/manual (`topo upnp`); there is no long-running lease-refresh manager in daemon scope.
 5. Expected limitation: some networks (for example CGNAT or non-UPnP routers) still require manual bootstrap endpoints even with this feature.
 
-## 19. Event-module locality (Option 1+2+4)
+## 19. Event-module locality (Options 1+2+4+5)
 
 ### 19.1 Motivation
 
-`service.rs` previously embedded event-specific SQL queries and event construction logic for all event types. This scattered event-specific concerns: message SQL lived far from `MessageEvent` schema, reaction queries were disconnected from `ReactionEvent`, etc.
+`service.rs` previously embedded event-specific SQL queries, event construction logic, and response type definitions for all event types. This scattered event-specific concerns: message SQL lived far from `MessageEvent` schema, reaction queries were disconnected from `ReactionEvent`, etc.
 
 Similarly, projector logic for all event types lived in two central files (`projection/projectors.rs` for content events, `projection/identity.rs` for identity events) with a large match statement in `apply.rs` routing to them. This violated locality — to understand message projection you had to jump to a different module.
 
-### 19.2 Approach
+### 19.2 Approach (Options 1+2)
 
 Moved event-specific command (create), query helpers, and **projector functions** into event-owned modules, making `service.rs` a thin orchestrator and `apply.rs` an orchestration-only pipeline.
 
@@ -2289,32 +2289,46 @@ Moved event-specific command (create), query helpers, and **projector functions*
 - `event_id_from_hex()` — parse hex event ID
 - `b64_to_hex()` — base64 to hex conversion
 
-### 19.3 Service.rs conversions
+### 19.3 Service-to-event-module locality (Option 5)
 
-| Old service.rs function | Now delegates to |
+Moved response types and conn-level service functions into event modules, making service.rs orchestration-only for event domains.
+
+**Event modules gained (Option 5):**
+- Response types (`MessageItem`, `MessagesResponse`, `SendResponse`, `ReactResponse`, `ReactionItem`) — owned by event modules, re-exported by service.rs
+- High-level conn-level helpers (`send_conn`, `react_conn`, `delete_message_conn`, `remove_user_conn`, `messages_conn`, `reactions_conn`) — combine event creation/query with response assembly
+
+**Module split pattern applied:**
+- `message` module converted from flat file to directory (`message/{mod,wire,commands,queries}.rs`) as the pilot for the split pattern
+- Split rule: when a module exceeds ~300-400 LOC or mixes 3+ concerns, split into `wire.rs`, `commands.rs`, `queries.rs`, `projector.rs`
+
+### 19.4 Service.rs delegation table
+
+| service.rs function | Delegates to |
 |---|---|
-| `svc_send_conn` event construction | `message::create` |
-| `svc_messages_conn` SQL | `message::query_list` + `message::query_count` |
-| `svc_react_conn` event construction | `reaction::create` |
-| `svc_reactions_conn` SQL | `reaction::query_list` |
-| `svc_reactions_for_message_conn` SQL | `reaction::query_for_message` |
-| `svc_delete_message_conn` event construction | `message_deletion::create` |
-| `svc_deleted_message_ids_conn` SQL | `message_deletion::query_deleted_ids` |
-| `svc_remove_user_conn` event construction | `user_removed::create` |
-| `svc_message_event_id_by_num_conn` SQL | `message::resolve_by_number` |
-| `resolve_message_selector` SQL | `message::resolve_selector` |
+| `svc_send_conn` | `message::send_conn` |
+| `svc_messages_conn` | `message::messages_conn` |
+| `svc_react_conn` | `reaction::react_conn` |
+| `svc_reactions_conn` | `reaction::reactions_conn` |
+| `svc_reactions_for_message_conn` | `reaction::query_for_message` |
+| `svc_delete_message_conn` | `message_deletion::delete_message_conn` |
+| `svc_deleted_message_ids_conn` | `message_deletion::query_deleted_ids` |
+| `svc_remove_user_conn` | `user_removed::remove_user_conn` |
+| `svc_message_event_id_by_num_conn` | `message::resolve_by_number` |
+| `resolve_message_selector` | `message::resolve_selector` |
 | `svc_status_conn` message/reaction counts | `message::query_count` + `reaction::query_count` |
-| `svc_users_conn` SQL | `user::query_list` |
+| `query_field` message/reaction counts | `message::query_count` + `reaction::query_count` |
+| `svc_users_conn` | `user::query_list` |
 | `svc_keys_conn` counts | `peer_shared::query_count` + `admin::query_count` + `transport_key::query_count` |
-| `svc_workspaces_conn` SQL | `workspace::query_list` |
+| `svc_workspaces_conn` | `workspace::query_list` |
 
-### 19.4 What service.rs retains
+### 19.5 What service.rs retains
 
 - DB open/close (`open_db_load`, `open_db_for_peer`)
 - Auth (key loading, `require_local_peer_signer`)
-- Response type definitions and shaping
+- Cross-module orchestration (`svc_view_conn` combines messages, reactions, users)
+- Shared response types (`DeleteResponse`, `StatusResponse`, `ViewResponse`, etc.)
 - Identity bootstrap, invite flows, predicate/assert system
-- Service-level helpers (`current_timestamp_ms`, `stable_author_id`, `parse_workspace_hex`)
+- Service-level helpers (`current_timestamp_ms`, `parse_workspace_hex`)
 
 ### 19.5 What apply.rs retains (orchestration-only)
 
@@ -2325,3 +2339,10 @@ Moved event-specific command (create), query helpers, and **projector functions*
 - Registry-driven projector dispatch
 - Write-op execution and emit-command handling
 - **No event-type-specific projection logic** — that lives in event modules
+
+### 19.6 Boundary rules (normative)
+
+1. Event-specific commands, queries, response types, and projectors belong in event modules.
+2. `service.rs` is orchestration glue: DB context, auth, cross-module joins, error mapping.
+3. `apply.rs` is pipeline orchestration: dependency checks, signer verification, registry dispatch.
+4. Long event modules must split into `wire/commands/queries` structure (see DESIGN §14.3).

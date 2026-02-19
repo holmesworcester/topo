@@ -153,27 +153,7 @@ pub struct NodeTenantItem {
     pub workspace_id: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct MessageItem {
-    pub id: String,
-    pub id_b64: String,
-    pub author_id: String,
-    pub author_name: String,
-    pub content: String,
-    pub created_at: i64,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct MessagesResponse {
-    pub messages: Vec<MessageItem>,
-    pub total: i64,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SendResponse {
-    pub content: String,
-    pub event_id: String,
-}
+pub use crate::event_modules::message::{MessageItem, MessagesResponse, SendResponse};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StatusResponse {
@@ -199,22 +179,11 @@ pub struct AssertResponse {
     pub timed_out: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ReactResponse {
-    pub emoji: String,
-    pub event_id: String,
-}
+pub use crate::event_modules::reaction::{ReactResponse, ReactionItem};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DeleteResponse {
     pub target: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ReactionItem {
-    pub event_id: String,
-    pub target_event_id: String,
-    pub emoji: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -705,19 +674,9 @@ pub fn query_field(db: &rusqlite::Connection, field: &str, recorded_by: &str) ->
         "store_count" | "events_count" => db
             .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
             .map_err(|e| format!("query failed: {}", e)),
-        "message_count" => db
-            .query_row(
-                "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
-                rusqlite::params![recorded_by],
-                |row| row.get(0),
-            )
+        "message_count" => message::query_count(db, recorded_by)
             .map_err(|e| format!("query failed: {}", e)),
-        "reaction_count" => db
-            .query_row(
-                "SELECT COUNT(*) FROM reactions WHERE recorded_by = ?1",
-                rusqlite::params![recorded_by],
-                |row| row.get(0),
-            )
+        "reaction_count" => reaction::query_count(db, recorded_by)
             .map_err(|e| format!("query failed: {}", e)),
         "neg_items_count" => db
             .query_row("SELECT COUNT(*) FROM neg_items", [], |row| row.get(0))
@@ -823,22 +782,7 @@ pub fn svc_node_status(db_path: &str) -> ServiceResult<Vec<NodeTenantItem>> {
 }
 
 pub fn svc_messages_conn(db: &rusqlite::Connection, recorded_by: &str, limit: usize) -> ServiceResult<MessagesResponse> {
-    let rows = message::query_list(db, recorded_by, limit)?;
-    let total = message::query_count(db, recorded_by)?;
-
-    let messages = rows
-        .into_iter()
-        .map(|row| MessageItem {
-            id: row.message_id_hex,
-            id_b64: row.message_id_b64,
-            author_id: row.author_id,
-            author_name: row.author_name,
-            content: row.content,
-            created_at: row.created_at,
-        })
-        .collect();
-
-    Ok(MessagesResponse { messages, total })
+    Ok(message::messages_conn(db, recorded_by, limit)?)
 }
 
 pub fn svc_messages(db_path: &str, limit: usize) -> ServiceResult<MessagesResponse> {
@@ -855,19 +799,8 @@ pub fn svc_send_conn(
     author_id: [u8; 32],
     content: &str,
 ) -> ServiceResult<SendResponse> {
-    let eid = message::create(
-        db, recorded_by, signer_eid, signing_key, current_timestamp_ms(),
-        message::CreateMessageCmd {
-            workspace_id,
-            author_id,
-            content: content.to_string(),
-        },
-    ).map_err(|e| ServiceError(format!("{}", e)))?;
-
-    Ok(SendResponse {
-        content: content.to_string(),
-        event_id: hex::encode(eid),
-    })
+    message::send_conn(db, recorded_by, signer_eid, signing_key, current_timestamp_ms(), workspace_id, author_id, content)
+        .map_err(ServiceError)
 }
 
 /// Send a message as a specific peer (daemon provides the peer_id).
@@ -1010,19 +943,8 @@ pub fn svc_react_conn(
     target_event_id: [u8; 32],
     emoji: &str,
 ) -> ServiceResult<ReactResponse> {
-    let eid = reaction::create(
-        db, recorded_by, signer_eid, signing_key, current_timestamp_ms(),
-        reaction::CreateReactionCmd {
-            target_event_id,
-            author_id,
-            emoji: emoji.to_string(),
-        },
-    ).map_err(|e| ServiceError(format!("{}", e)))?;
-
-    Ok(ReactResponse {
-        emoji: emoji.to_string(),
-        event_id: hex::encode(eid),
-    })
+    reaction::react_conn(db, recorded_by, signer_eid, signing_key, current_timestamp_ms(), author_id, target_event_id, emoji)
+        .map_err(ServiceError)
 }
 
 pub fn svc_react_for_peer(
@@ -1049,17 +971,10 @@ pub fn svc_delete_message_conn(
     author_id: [u8; 32],
     target_event_id: [u8; 32],
 ) -> ServiceResult<DeleteResponse> {
-    message_deletion::create(
-        db, recorded_by, signer_eid, signing_key, current_timestamp_ms(),
-        message_deletion::CreateMessageDeletionCmd {
-            target_event_id,
-            author_id,
-        },
-    ).map_err(|e| ServiceError(format!("{}", e)))?;
-
-    Ok(DeleteResponse {
-        target: hex::encode(target_event_id),
-    })
+    let target = message_deletion::delete_message_conn(
+        db, recorded_by, signer_eid, signing_key, current_timestamp_ms(), author_id, target_event_id,
+    ).map_err(ServiceError)?;
+    Ok(DeleteResponse { target })
 }
 
 pub fn svc_delete_message_for_peer(
@@ -1090,15 +1005,7 @@ fn resolve_message_selector(
 }
 
 pub fn svc_reactions_conn(db: &rusqlite::Connection, recorded_by: &str) -> ServiceResult<Vec<ReactionItem>> {
-    let rows = reaction::query_list(db, recorded_by)?;
-    Ok(rows
-        .into_iter()
-        .map(|row| ReactionItem {
-            event_id: row.event_id,
-            target_event_id: row.target_event_id,
-            emoji: row.emoji,
-        })
-        .collect())
+    Ok(reaction::reactions_conn(db, recorded_by)?)
 }
 
 pub fn svc_reactions(db_path: &str) -> ServiceResult<Vec<ReactionItem>> {
@@ -1106,7 +1013,6 @@ pub fn svc_reactions(db_path: &str) -> ServiceResult<Vec<ReactionItem>> {
     svc_reactions_conn(&db, &recorded_by)
 }
 
-/// Return reactions for a specific message target.
 pub fn svc_reactions_for_message_conn(
     db: &rusqlite::Connection,
     recorded_by: &str,
@@ -1115,7 +1021,6 @@ pub fn svc_reactions_for_message_conn(
     Ok(reaction::query_for_message(db, recorded_by, target_event_id_b64)?)
 }
 
-/// Return base64 event IDs of deleted messages for a tenant.
 pub fn svc_deleted_message_ids_conn(
     db: &rusqlite::Connection,
     recorded_by: &str,
@@ -1133,7 +1038,6 @@ pub fn svc_message_event_id_by_num_conn(
         .map_err(ServiceError)
 }
 
-/// Remove a user by creating a UserRemoved event.
 pub fn svc_remove_user_conn(
     db: &rusqlite::Connection,
     recorded_by: &str,
@@ -1141,14 +1045,10 @@ pub fn svc_remove_user_conn(
     signing_key: &SigningKey,
     target_event_id: crate::crypto::EventId,
 ) -> ServiceResult<DeleteResponse> {
-    user_removed::create(
-        db, recorded_by, signer_eid, signing_key, current_timestamp_ms(),
-        user_removed::CreateUserRemovedCmd { target_event_id },
-    ).map_err(|e| ServiceError(format!("{}", e)))?;
-
-    Ok(DeleteResponse {
-        target: hex::encode(target_event_id),
-    })
+    let target = user_removed::remove_user_conn(
+        db, recorded_by, signer_eid, signing_key, current_timestamp_ms(), target_event_id,
+    ).map_err(ServiceError)?;
+    Ok(DeleteResponse { target })
 }
 
 /// Create a user invite (conn-based variant for interactive use with in-memory keys).

@@ -246,3 +246,62 @@ pub fn query_count(
         |row| row.get(0),
     )
 }
+
+// --- Response types and service-level query/command helpers ---
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ReactResponse {
+    pub emoji: String,
+    pub event_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ReactionItem {
+    pub event_id: String,
+    pub target_event_id: String,
+    pub emoji: String,
+}
+
+/// High-level react command: creates a reaction event and returns a ReactResponse.
+pub fn react_conn(
+    db: &Connection,
+    recorded_by: &str,
+    signer_eid: &EventId,
+    signing_key: &SigningKey,
+    created_at_ms: u64,
+    author_id: [u8; 32],
+    target_event_id: [u8; 32],
+    emoji: &str,
+) -> Result<ReactResponse, String> {
+    let eid = create(
+        db, recorded_by, signer_eid, signing_key, created_at_ms,
+        CreateReactionCmd {
+            target_event_id,
+            author_id,
+            emoji: emoji.to_string(),
+        },
+    ).map_err(|e| format!("{}", e))?;
+
+    Ok(ReactResponse {
+        emoji: emoji.to_string(),
+        event_id: hex::encode(eid),
+    })
+}
+
+/// Assemble a list of ReactionItems from the database.
+pub fn reactions_conn(
+    db: &Connection,
+    recorded_by: &str,
+) -> Result<Vec<ReactionItem>, rusqlite::Error> {
+    let rows = query_list(db, recorded_by)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| ReactionItem {
+            event_id: row.event_id,
+            target_event_id: row.target_event_id,
+            emoji: row.emoji,
+        })
+        .collect())
+}
