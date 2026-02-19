@@ -2,7 +2,6 @@ pub mod contracts;
 pub mod crypto;
 pub mod db;
 pub mod db_registry;
-#[cfg(feature = "discovery")]
 pub mod event_modules;
 pub mod event_pipeline;
 pub mod identity_ops;
