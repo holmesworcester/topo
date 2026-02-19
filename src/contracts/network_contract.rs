@@ -69,11 +69,46 @@ pub trait TrustOracle: Send + Sync {
     ) -> Result<TrustDecision, TrustError>;
 }
 
+/// Control stream: bidirectional (send + recv) for negentropy and protocol messages.
+#[async_trait]
+pub trait ControlIo: Send {
+    async fn recv(&mut self) -> Result<Vec<u8>, SessionIoError>;
+    async fn send(&mut self, frame: &[u8]) -> Result<(), SessionIoError>;
+    async fn flush(&mut self) -> Result<(), SessionIoError>;
+}
+
+/// Data send stream: outbound event blobs.
+#[async_trait]
+pub trait DataSendIo: Send {
+    async fn send(&mut self, frame: &[u8]) -> Result<(), SessionIoError>;
+    async fn flush(&mut self) -> Result<(), SessionIoError>;
+}
+
+/// Data receive stream: inbound event blobs.  Must be `'static` so it can be
+/// sent to a spawned task.
+#[async_trait]
+pub trait DataRecvIo: Send + 'static {
+    async fn recv(&mut self) -> Result<Vec<u8>, SessionIoError>;
+}
+
+/// Split session IO parts returned by [`SessionIo::split`].
+pub struct SessionIoParts {
+    pub control: Box<dyn ControlIo>,
+    pub data_send: Box<dyn DataSendIo>,
+    pub data_recv: Box<dyn DataRecvIo>,
+}
+
 #[async_trait]
 pub trait SessionIo: Send {
     fn session_id(&self) -> u64;
-    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send>;
     fn max_frame_size(&self) -> usize;
+    /// Split into independent control, data-send, and data-recv handles.
+    /// Consuming `self` allows the data-recv handle to be moved to a spawned task.
+    fn split(self: Box<Self>) -> SessionIoParts;
+
+    // -- Direct frame methods (backward compatibility) --
+    // These exist for unit tests in transport/session_io.rs that exercise
+    // the pre-split code path. Production code should use `split()` instead.
     async fn poll_send_ready(&mut self) -> Result<(), SessionIoError>;
     async fn recv_control(&mut self) -> Result<Vec<u8>, SessionIoError>;
     async fn send_control(&mut self, frame: &[u8]) -> Result<(), SessionIoError>;

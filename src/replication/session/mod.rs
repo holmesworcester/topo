@@ -1,0 +1,93 @@
+//! Replication session logic: initiator and responder sync loops.
+//!
+//! Extracted from sync/engine.rs (Phase 3 of Option B refactor).
+//! Wire protocol behavior is unchanged -- this is a pure code-movement extraction.
+//!
+//! Shutdown protocol (preserved):
+//! 1. Each side sends DataDone on the data stream after flushing all events.
+//! 2. Initiator sends Done on control after its DataDone.
+//! 3. Responder receives Done, finishes sending, sends DataDone on data,
+//!    waits for initiator's DataDone to be consumed, then sends DoneAck.
+//! 4. Initiator receives DoneAck, waits for responder's DataDone, exits.
+
+pub mod coordinator;
+pub mod initiator;
+pub mod receiver;
+pub mod responder;
+
+use std::time::Duration;
+
+// ---------------------------------------------------------------------------
+// Re-exports — preserve the existing public API surface
+// ---------------------------------------------------------------------------
+pub use coordinator::{run_coordinator, PeerCoord};
+pub use initiator::run_sync_initiator_dual;
+pub use receiver::spawn_data_receiver;
+pub use responder::run_sync_responder_dual;
+
+// ---------------------------------------------------------------------------
+// Session tuning constants (shared across sub-modules)
+// ---------------------------------------------------------------------------
+
+/// Negentropy frame size limit.
+pub(super) const NEGENTROPY_FRAME_SIZE: u64 = 64 * 1024;
+
+/// Max event IDs sent per HaveList message during reconciliation.
+pub(super) const HAVE_CHUNK: usize = 1000;
+
+/// Max event IDs sent per NeedList/HaveList request during reconciliation.
+pub(super) const NEED_CHUNK: usize = 1000;
+
+/// Max events to enqueue into the egress queue per main-loop iteration.
+pub(super) const ENQUEUE_BATCH: usize = 5000;
+
+/// Max events per egress claim (one send batch to the data stream).
+pub(super) const EGRESS_CLAIM_COUNT: usize = 500;
+
+/// Lease duration (ms) for claimed egress events.
+pub(super) const EGRESS_CLAIM_LEASE_MS: i64 = 30_000;
+
+/// Max age (ms) for sent egress entries before cleanup.
+pub(super) const EGRESS_SENT_TTL_MS: i64 = 300_000;
+
+/// Time to wait for inbound data stream drain at session end.
+pub(super) const DATA_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Non-blocking poll timeout for the control stream receive.
+pub(super) const CONTROL_POLL_TIMEOUT: Duration = Duration::from_millis(1);
+
+// -- Coordinator timing (B-coordinated / download_from_sources) --
+
+/// How long the coordinator waits (after the first peer reports) for
+/// remaining peers to finish reconciliation and report their need_ids.
+pub(super) const COORDINATOR_COLLECTION_WINDOW: Duration = Duration::from_millis(500);
+
+/// Coordinator busy-poll interval while waiting for the first peer report.
+pub(super) const COORDINATOR_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Coordinator poll interval within the collection window.
+pub(super) const COORDINATOR_COLLECTION_POLL: Duration = Duration::from_millis(2);
+
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
+
+pub(super) fn low_mem_mode() -> bool {
+    match std::env::var("LOW_MEM_IOS") {
+        Ok(v) if v != "0" && v.to_lowercase() != "false" => return true,
+        _ => {}
+    }
+    match std::env::var("LOW_MEM") {
+        Ok(v) if v != "0" && v.to_lowercase() != "false" => true,
+        _ => false,
+    }
+}
+
+/// Async channel capacity for per-session ingest (initiator/responder).
+pub(super) fn session_ingest_cap() -> usize {
+    if low_mem_mode() {
+        1000
+    } else {
+        5000
+    }
+}

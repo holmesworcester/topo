@@ -5,6 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tracing::{error, warn};
 
+use crate::contracts::event_runtime_contract::IngestItem;
 use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
 use crate::db::open_connection;
 use crate::db::project_queue::ProjectQueue;
@@ -14,11 +15,6 @@ use crate::db::store::{
 use crate::db::wanted::WantedEvents;
 use crate::events::{self, registry, ShareScope};
 use crate::projection::pipeline::project_one;
-
-/// Ingest channel item: (event_id, blob, recorded_by).
-/// The `recorded_by` field allows a shared batch_writer to route events
-/// to the correct tenant's projection pipeline.
-pub type IngestItem = (EventId, Vec<u8>, String);
 
 fn low_mem_mode() -> bool {
     read_bool_env("LOW_MEM_IOS") || read_bool_env("LOW_MEM")

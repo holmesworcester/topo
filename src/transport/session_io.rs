@@ -1,6 +1,8 @@
 use async_trait::async_trait;
 
-use crate::contracts::network_contract::{SessionIo, SessionIoError};
+use crate::contracts::network_contract::{
+    ControlIo, DataRecvIo, DataSendIo, SessionIo, SessionIoError, SessionIoParts,
+};
 use crate::sync::protocol::ParseError;
 use crate::sync::{encode_sync_message, parse_sync_message, SyncMessage};
 use crate::transport::connection::ConnectionError;
@@ -78,6 +80,98 @@ fn decode_exact_frame(frame: &[u8], max_frame_size: usize) -> Result<SyncMessage
     Ok(msg)
 }
 
+// ---------------------------------------------------------------------------
+// Split adapters: wrap StreamConn/StreamSend/StreamRecv into contract traits
+// ---------------------------------------------------------------------------
+
+struct SyncControlIo<C: StreamConn + Send + 'static> {
+    inner: C,
+    max_frame_size: usize,
+}
+
+#[async_trait]
+impl<C: StreamConn + Send + 'static> ControlIo for SyncControlIo<C> {
+    async fn recv(&mut self) -> Result<Vec<u8>, SessionIoError> {
+        let msg = self
+            .inner
+            .recv()
+            .await
+            .map_err(|e| map_connection_error(e, self.max_frame_size))?;
+        Ok(encode_sync_message(&msg))
+    }
+
+    async fn send(&mut self, frame: &[u8]) -> Result<(), SessionIoError> {
+        if frame.len() > self.max_frame_size {
+            return Err(SessionIoError::FrameTooLarge {
+                len: frame.len(),
+                max: self.max_frame_size,
+            });
+        }
+        let msg = decode_exact_frame(frame, self.max_frame_size)?;
+        self.inner
+            .send(&msg)
+            .await
+            .map_err(|e| map_connection_error(e, self.max_frame_size))
+    }
+
+    async fn flush(&mut self) -> Result<(), SessionIoError> {
+        self.inner
+            .flush()
+            .await
+            .map_err(|e| map_connection_error(e, self.max_frame_size))
+    }
+}
+
+struct SyncDataSendIo<S: StreamSend + Send + 'static> {
+    inner: S,
+    max_frame_size: usize,
+}
+
+#[async_trait]
+impl<S: StreamSend + Send + 'static> DataSendIo for SyncDataSendIo<S> {
+    async fn send(&mut self, frame: &[u8]) -> Result<(), SessionIoError> {
+        if frame.len() > self.max_frame_size {
+            return Err(SessionIoError::FrameTooLarge {
+                len: frame.len(),
+                max: self.max_frame_size,
+            });
+        }
+        let msg = decode_exact_frame(frame, self.max_frame_size)?;
+        self.inner
+            .send(&msg)
+            .await
+            .map_err(|e| map_connection_error(e, self.max_frame_size))
+    }
+
+    async fn flush(&mut self) -> Result<(), SessionIoError> {
+        self.inner
+            .flush()
+            .await
+            .map_err(|e| map_connection_error(e, self.max_frame_size))
+    }
+}
+
+struct SyncDataRecvIo<R: StreamRecv + Send + 'static> {
+    inner: R,
+    max_frame_size: usize,
+}
+
+#[async_trait]
+impl<R: StreamRecv + Send + 'static> DataRecvIo for SyncDataRecvIo<R> {
+    async fn recv(&mut self) -> Result<Vec<u8>, SessionIoError> {
+        let msg = self
+            .inner
+            .recv()
+            .await
+            .map_err(|e| map_connection_error(e, self.max_frame_size))?;
+        Ok(encode_sync_message(&msg))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SessionIo implementation
+// ---------------------------------------------------------------------------
+
 #[async_trait]
 impl<C, S, R> SessionIo for SyncSessionIo<C, S, R>
 where
@@ -89,12 +183,27 @@ where
         self.session_id
     }
 
-    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
-        self
-    }
-
     fn max_frame_size(&self) -> usize {
         self.max_frame_size
+    }
+
+    fn split(self: Box<Self>) -> SessionIoParts {
+        let max = self.max_frame_size;
+        let conn = self.conn;
+        SessionIoParts {
+            control: Box::new(SyncControlIo {
+                inner: conn.control,
+                max_frame_size: max,
+            }),
+            data_send: Box::new(SyncDataSendIo {
+                inner: conn.data_send,
+                max_frame_size: max,
+            }),
+            data_recv: Box::new(SyncDataRecvIo {
+                inner: conn.data_recv,
+                max_frame_size: max,
+            }),
+        }
     }
 
     async fn poll_send_ready(&mut self) -> Result<(), SessionIoError> {

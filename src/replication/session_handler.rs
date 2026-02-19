@@ -2,22 +2,102 @@
 //! sync initiator/responder functions in replication::session.
 //!
 //! Moved from sync/session_handler.rs (Phase 5 of Option B refactor).
+//! Phase 6: removed `into_any` downcast; uses `SessionIo::split()` and
+//! adapter wrappers so replication never depends on QUIC concrete types.
 
 use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::contracts::event_runtime_contract::{BatchWriterFn, IngestItem};
 use crate::contracts::network_contract::{
-    SessionDirection, SessionHandler, SessionIo, SessionMeta,
+    ControlIo, DataRecvIo, DataSendIo, SessionDirection, SessionHandler, SessionIo,
+    SessionIoError, SessionMeta,
 };
-use crate::event_runtime::IngestItem;
 use crate::replication::session::{run_sync_initiator_dual, run_sync_responder_dual, PeerCoord};
 use crate::sync::SyncMessage;
-use crate::transport::connection::{Connection, RecvConnection, SendConnection};
-use crate::transport::SyncSessionIo;
+use crate::sync::{encode_sync_message, parse_sync_message};
+use crate::transport::connection::ConnectionError;
+use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
 
-type QuinnSessionIo = SyncSessionIo<Connection, SendConnection, RecvConnection>;
+// ---------------------------------------------------------------------------
+// Adapters: wrap contract IO traits into StreamConn/StreamSend/StreamRecv
+// so session functions can consume them without knowing about QUIC.
+// ---------------------------------------------------------------------------
+
+struct ControlAdapter {
+    inner: Box<dyn ControlIo>,
+}
+
+#[async_trait]
+impl StreamConn for ControlAdapter {
+    async fn send(&mut self, msg: &SyncMessage) -> Result<(), ConnectionError> {
+        let frame = encode_sync_message(msg);
+        self.inner
+            .send(&frame)
+            .await
+            .map_err(|e| map_io_error(e))
+    }
+
+    async fn flush(&mut self) -> Result<(), ConnectionError> {
+        self.inner.flush().await.map_err(|e| map_io_error(e))
+    }
+
+    async fn recv(&mut self) -> Result<SyncMessage, ConnectionError> {
+        let frame = self.inner.recv().await.map_err(|e| map_io_error(e))?;
+        let (msg, _) = parse_sync_message(&frame)
+            .map_err(|e| ConnectionError::Parse(e))?;
+        Ok(msg)
+    }
+}
+
+struct DataSendAdapter {
+    inner: Box<dyn DataSendIo>,
+}
+
+#[async_trait]
+impl StreamSend for DataSendAdapter {
+    async fn send(&mut self, msg: &SyncMessage) -> Result<(), ConnectionError> {
+        let frame = encode_sync_message(msg);
+        self.inner
+            .send(&frame)
+            .await
+            .map_err(|e| map_io_error(e))
+    }
+
+    async fn flush(&mut self) -> Result<(), ConnectionError> {
+        self.inner.flush().await.map_err(|e| map_io_error(e))
+    }
+}
+
+struct DataRecvAdapter {
+    inner: Box<dyn DataRecvIo>,
+}
+
+#[async_trait]
+impl StreamRecv for DataRecvAdapter {
+    async fn recv(&mut self) -> Result<SyncMessage, ConnectionError> {
+        let frame = self.inner.recv().await.map_err(|e| map_io_error(e))?;
+        let (msg, _) = parse_sync_message(&frame)
+            .map_err(|e| ConnectionError::Parse(e))?;
+        Ok(msg)
+    }
+}
+
+fn map_io_error(err: SessionIoError) -> ConnectionError {
+    match err {
+        SessionIoError::ConnectionLost => ConnectionError::Closed,
+        other => ConnectionError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            other.to_string(),
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Session handler
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionRole {
@@ -32,16 +112,18 @@ pub struct ReplicationSessionHandler {
     role: SessionRole,
     shared_ingest: Option<mpsc::Sender<IngestItem>>,
     coordination: Option<Arc<PeerCoord>>,
+    batch_writer_fn: BatchWriterFn,
 }
 
 impl ReplicationSessionHandler {
-    pub fn initiator(db_path: String, timeout_secs: u64) -> Self {
+    pub fn initiator(db_path: String, timeout_secs: u64, batch_writer_fn: BatchWriterFn) -> Self {
         Self {
             db_path,
             timeout_secs,
             role: SessionRole::Initiator,
             shared_ingest: None,
             coordination: None,
+            batch_writer_fn,
         }
     }
 
@@ -50,6 +132,7 @@ impl ReplicationSessionHandler {
         timeout_secs: u64,
         coordination: Arc<PeerCoord>,
         shared_ingest: Option<mpsc::Sender<IngestItem>>,
+        batch_writer_fn: BatchWriterFn,
     ) -> Self {
         Self {
             db_path,
@@ -57,16 +140,18 @@ impl ReplicationSessionHandler {
             role: SessionRole::Initiator,
             shared_ingest,
             coordination: Some(coordination),
+            batch_writer_fn,
         }
     }
 
-    pub fn responder(db_path: String, timeout_secs: u64) -> Self {
+    pub fn responder(db_path: String, timeout_secs: u64, batch_writer_fn: BatchWriterFn) -> Self {
         Self {
             db_path,
             timeout_secs,
             role: SessionRole::Responder,
             shared_ingest: None,
             coordination: None,
+            batch_writer_fn,
         }
     }
 
@@ -74,6 +159,7 @@ impl ReplicationSessionHandler {
         db_path: String,
         timeout_secs: u64,
         shared_ingest: mpsc::Sender<IngestItem>,
+        batch_writer_fn: BatchWriterFn,
     ) -> Self {
         Self {
             db_path,
@@ -81,18 +167,8 @@ impl ReplicationSessionHandler {
             role: SessionRole::Responder,
             shared_ingest: Some(shared_ingest),
             coordination: None,
+            batch_writer_fn,
         }
-    }
-
-    fn downcast_quinn_session_io(io: Box<dyn SessionIo>) -> Result<QuinnSessionIo, String> {
-        let any_io = io.into_any();
-        any_io
-            .downcast::<QuinnSessionIo>()
-            .map(|boxed| *boxed)
-            .map_err(|_| {
-                "replication session handler only supports SyncSessionIo over QUIC dual streams"
-                    .to_string()
-            })
     }
 }
 
@@ -111,8 +187,23 @@ impl SessionHandler for ReplicationSessionHandler {
             ));
         }
 
-        let io = Self::downcast_quinn_session_io(io)?;
-        let mut conn = io.into_inner();
+        // Split the abstract SessionIo into independent control/data handles,
+        // then wrap them as StreamConn/StreamSend/StreamRecv adapters so the
+        // existing session functions work without QUIC-specific types.
+        let parts = io.split();
+        let mut conn: DualConnection<ControlAdapter, DataSendAdapter, DataRecvAdapter> =
+            DualConnection {
+                control: ControlAdapter {
+                    inner: parts.control,
+                },
+                data_send: DataSendAdapter {
+                    inner: parts.data_send,
+                },
+                data_recv: DataRecvAdapter {
+                    inner: parts.data_recv,
+                },
+            };
+
         let peer_id = hex::encode(meta.peer.0);
         let tenant_id = meta.tenant.0.clone();
 
@@ -146,6 +237,7 @@ impl SessionHandler for ReplicationSessionHandler {
                     &tenant_id,
                     self.coordination.as_deref(),
                     self.shared_ingest.clone(),
+                    self.batch_writer_fn,
                 );
                 tokio::pin!(run);
                 tokio::select! {
@@ -163,6 +255,7 @@ impl SessionHandler for ReplicationSessionHandler {
                     &peer_id,
                     &tenant_id,
                     self.shared_ingest.clone(),
+                    self.batch_writer_fn,
                 );
                 tokio::pin!(run);
                 tokio::select! {
