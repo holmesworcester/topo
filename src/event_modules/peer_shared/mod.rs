@@ -7,6 +7,7 @@ pub use wire::{
     PeerSharedFirstEvent, PeerSharedOngoingEvent,
     parse_peer_shared_first, encode_peer_shared_first,
     parse_peer_shared_ongoing, encode_peer_shared_ongoing,
+    PEER_SHARED_WIRE_SIZE,
     PEER_SHARED_FIRST_META, PEER_SHARED_ONGOING_META,
 };
 pub use queries::count;

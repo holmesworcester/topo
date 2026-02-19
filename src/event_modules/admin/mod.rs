@@ -7,6 +7,7 @@ pub use wire::{
     AdminBootEvent, AdminOngoingEvent,
     parse_admin_boot, encode_admin_boot,
     parse_admin_ongoing, encode_admin_ongoing,
+    ADMIN_BOOT_WIRE_SIZE,
     ADMIN_BOOT_META, ADMIN_ONGOING_META,
 };
 pub use queries::count;
