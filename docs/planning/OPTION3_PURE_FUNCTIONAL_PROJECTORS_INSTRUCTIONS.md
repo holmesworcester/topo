@@ -53,6 +53,41 @@ Pure functional deletion handling must preserve correctness under replay/reorder
    - target arrival should unblock via standard cascade
 6. Replay must produce identical final tombstone/message/reaction state.
 
+## Deletion contract details (implement this way)
+
+Use a two-stage model so deletes stay deterministic when events arrive out of order.
+
+1. `Delete*` projector emits an idempotent `deletion_intent` write keyed by stable identity:
+   - `workspace_id`
+   - `target_kind` (message/reaction/etc)
+   - `target_id`
+2. If target exists in projected state, projector also emits target tombstone write ops in same apply batch.
+3. If target does not exist yet, projector only records intent; it does not perform imperative retries.
+4. Target-creation projectors must check for matching `deletion_intent` rows in their context snapshot and immediately tombstone on first materialization.
+5. Cleanup work (for example message delete -> reaction tombstones) must be explicit:
+   - emitted command(s), or
+   - explicit deterministic write ops
+   - never hidden side effects in service/network loops.
+6. Deletion state must be monotonic:
+   - active -> tombstoned is allowed
+   - tombstoned -> active is not allowed by replay
+7. Physical row removal is a separate compaction concern; projector semantics should prefer tombstones.
+
+## Deletion invariants and tests (hard to cheat)
+
+Add tests that validate observable invariants, not implementation details.
+
+1. Duplicate delete event replay leaves state unchanged after first application.
+2. Delete-before-create converges to the same final state as create-before-delete.
+3. Restart/replay from event log reproduces identical tombstone state.
+4. Authorization failure paths are deterministic from projected context snapshot.
+5. Cleanup fanout is complete:
+   - no live reactions remain for tombstoned message
+   - no query can surface deleted entities.
+6. Command execution idempotence:
+   - emitted command identities are stable (derive from event identity)
+   - re-running command executor does not mutate final state.
+
 ## Parallelization note
 
 This branch is parallelizable with option 1+2 branch, but coordinate on shared contracts:
