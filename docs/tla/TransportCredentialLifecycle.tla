@@ -22,11 +22,17 @@ EXTENDS FiniteSets
 \* AddPendingBootstrapTrust) are modeled as nondeterministic, abstracting
 \* over the event graph.
 \*
+\* Invite ownership: inviteCreator tracks which peer created each invite SPKI.
+\* Pending bootstrap trust may only be added by the invite creator (inviter).
+\* This prevents the joiner from materializing inviter-side pending trust when
+\* syncing the invite event — a bug caught during eventization review.
+\*
 \* Rust mapping:
 \*   localCred              → install_peer_key_transport_identity() active cert SPKI
 \*   peerSharedTrust        → PeerShared-derived SPKIs (peer_shared_spki_fingerprints())
 \*   bootstrapTrust         → invite_bootstrap_trust (non-expired, non-superseded)
 \*   pendingBootstrapTrust  → pending_invite_bootstrap_trust (non-expired, non-superseded)
+\*   inviteCreator          → is_local_create check on UserInviteBoot/DeviceInviteFirst
 \*
 \* CONSTANTS:
 \*   Peers — set of peer identifiers
@@ -34,9 +40,9 @@ EXTENDS FiniteSets
 
 CONSTANTS Peers, SPKIs
 
-VARIABLES localCred, peerSharedTrust, bootstrapTrust, pendingBootstrapTrust
+VARIABLES localCred, peerSharedTrust, bootstrapTrust, pendingBootstrapTrust, inviteCreator
 
-vars == <<localCred, peerSharedTrust, bootstrapTrust, pendingBootstrapTrust>>
+vars == <<localCred, peerSharedTrust, bootstrapTrust, pendingBootstrapTrust, inviteCreator>>
 
 \* ---- Helper: "none" sentinel for absent credential ----
 None == "none"
@@ -71,6 +77,7 @@ TypeOK ==
         /\ peerSharedTrust[p] \subseteq SPKIs
         /\ bootstrapTrust[p] \subseteq SPKIs
         /\ pendingBootstrapTrust[p] \subseteq SPKIs
+    /\ inviteCreator \in [SPKIs -> Peers \union {None}]
 
 \* ---- Init ----
 
@@ -79,6 +86,7 @@ Init ==
     /\ peerSharedTrust = [p \in Peers |-> {}]
     /\ bootstrapTrust = [p \in Peers |-> {}]
     /\ pendingBootstrapTrust = [p \in Peers |-> {}]
+    /\ inviteCreator = [s \in SPKIs |-> None]
 
 \* ---- Actions ----
 
@@ -91,7 +99,7 @@ GenerateCredential(p, s) ==
     /\ localCred[p] = None
     /\ s \notin AllActiveCredentials
     /\ localCred' = [localCred EXCEPT ![p] = s]
-    /\ UNCHANGED <<peerSharedTrust, bootstrapTrust, pendingBootstrapTrust>>
+    /\ UNCHANGED <<peerSharedTrust, bootstrapTrust, pendingBootstrapTrust, inviteCreator>>
 
 \* 2. AddPeerSharedTrust(p, s)
 \*    Steady-state trust derived from a valid PeerShared event.
@@ -104,10 +112,10 @@ AddPeerSharedTrust(p, s) ==
     \* Supersede: remove from bootstrap and pending if present
     /\ bootstrapTrust' = [bootstrapTrust EXCEPT ![p] = @ \ {s}]
     /\ pendingBootstrapTrust' = [pendingBootstrapTrust EXCEPT ![p] = @ \ {s}]
-    /\ UNCHANGED localCred
+    /\ UNCHANGED <<localCred, inviteCreator>>
 
 \* 3. AddBootstrapTrust(p, s)
-\*    Accepted invite bootstrap trust.
+\*    Accepted invite bootstrap trust (joiner side).
 \*    Blocked if SPKI already has steady-state PeerShared-derived trust.
 \*    Rust: record_invite_bootstrap_trust().
 AddBootstrapTrust(p, s) ==
@@ -115,18 +123,30 @@ AddBootstrapTrust(p, s) ==
     /\ s \notin peerSharedTrust[p]
     /\ s \notin bootstrapTrust[p]
     /\ bootstrapTrust' = [bootstrapTrust EXCEPT ![p] = @ \union {s}]
-    /\ UNCHANGED <<localCred, peerSharedTrust, pendingBootstrapTrust>>
+    /\ UNCHANGED <<localCred, peerSharedTrust, pendingBootstrapTrust, inviteCreator>>
 
-\* 4. AddPendingBootstrapTrust(p, s)
+\* 4a. CreateInvite(p, s)
+\*    Inviter creates an invite, establishing ownership of the invite SPKI.
+\*    Must happen before AddPendingBootstrapTrust for this SPKI.
+\*    Rust: create_user_invite / create_device_link_invite (local create).
+CreateInvite(p, s) ==
+    /\ s \in SPKIs
+    /\ inviteCreator[s] = None
+    /\ inviteCreator' = [inviteCreator EXCEPT ![s] = p]
+    /\ UNCHANGED <<localCred, peerSharedTrust, bootstrapTrust, pendingBootstrapTrust>>
+
+\* 4b. AddPendingBootstrapTrust(p, s)
 \*    Inviter-side pending bootstrap trust.
+\*    CRITICAL: Only the invite creator may add pending trust for this SPKI.
 \*    Blocked if SPKI already has steady-state PeerShared-derived trust.
-\*    Rust: record_pending_invite_bootstrap_trust().
+\*    Rust: record_pending_invite_bootstrap_trust() gated by is_local_create.
 AddPendingBootstrapTrust(p, s) ==
     /\ s \in SPKIs
+    /\ inviteCreator[s] = p   \* Only the inviter can add pending trust
     /\ s \notin peerSharedTrust[p]
     /\ s \notin pendingBootstrapTrust[p]
     /\ pendingBootstrapTrust' = [pendingBootstrapTrust EXCEPT ![p] = @ \union {s}]
-    /\ UNCHANGED <<localCred, peerSharedTrust, bootstrapTrust>>
+    /\ UNCHANGED <<localCred, peerSharedTrust, bootstrapTrust, inviteCreator>>
 
 \* 5. ExpireBootstrapTrust(p, s)
 \*    TTL expiry of accepted bootstrap trust.
@@ -134,7 +154,7 @@ AddPendingBootstrapTrust(p, s) ==
 ExpireBootstrapTrust(p, s) ==
     /\ s \in bootstrapTrust[p]
     /\ bootstrapTrust' = [bootstrapTrust EXCEPT ![p] = @ \ {s}]
-    /\ UNCHANGED <<localCred, peerSharedTrust, pendingBootstrapTrust>>
+    /\ UNCHANGED <<localCred, peerSharedTrust, pendingBootstrapTrust, inviteCreator>>
 
 \* 6. ExpirePendingBootstrapTrust(p, s)
 \*    TTL expiry of pending bootstrap trust.
@@ -142,7 +162,7 @@ ExpireBootstrapTrust(p, s) ==
 ExpirePendingBootstrapTrust(p, s) ==
     /\ s \in pendingBootstrapTrust[p]
     /\ pendingBootstrapTrust' = [pendingBootstrapTrust EXCEPT ![p] = @ \ {s}]
-    /\ UNCHANGED <<localCred, peerSharedTrust, bootstrapTrust>>
+    /\ UNCHANGED <<localCred, peerSharedTrust, bootstrapTrust, inviteCreator>>
 
 \* 7. RemovePeerSharedTrust(p, s)
 \*    Removal of steady-state trust (e.g. peer_removed projection).
@@ -150,7 +170,7 @@ ExpirePendingBootstrapTrust(p, s) ==
 RemovePeerSharedTrust(p, s) ==
     /\ s \in peerSharedTrust[p]
     /\ peerSharedTrust' = [peerSharedTrust EXCEPT ![p] = @ \ {s}]
-    /\ UNCHANGED <<localCred, bootstrapTrust, pendingBootstrapTrust>>
+    /\ UNCHANGED <<localCred, bootstrapTrust, pendingBootstrapTrust, inviteCreator>>
 
 \* ---- Next-state relation ----
 
@@ -159,6 +179,7 @@ Next ==
         \/ GenerateCredential(p, s)
         \/ AddPeerSharedTrust(p, s)
         \/ AddBootstrapTrust(p, s)
+        \/ CreateInvite(p, s)
         \/ AddPendingBootstrapTrust(p, s)
         \/ ExpireBootstrapTrust(p, s)
         \/ ExpirePendingBootstrapTrust(p, s)
@@ -206,5 +227,17 @@ InvMutualAuthSymmetry ==
     \A p, q \in Peers :
         (CanAuthenticate(p, q) /\ CanAuthenticate(q, p))
         => (localCred[p] # None /\ localCred[q] # None)
+
+\* Inv7: Pending bootstrap trust can only exist on the invite creator's trust store.
+\* This catches the joiner-side pending trust emission bug: if a joiner syncs a
+\* UserInviteBoot event and the projector emits WritePendingBootstrapTrust without
+\* checking is_local_create, the joiner's trust store gets a pending trust row that
+\* should only exist on the inviter side.
+\*
+\* Rust check: is_local_create flag in ContextSnapshot gates WritePendingBootstrapTrust
+\* emission in UserInviteBoot and DeviceInviteFirst projectors.
+InvPendingTrustOnlyOnInviter ==
+    \A p \in Peers, s \in SPKIs :
+        s \in pendingBootstrapTrust[p] => inviteCreator[s] = p
 
 ====
