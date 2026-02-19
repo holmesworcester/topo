@@ -120,29 +120,29 @@ flowchart TB
     I --> W["writer"]
     W --> P["project"]
 
-    S --> H
-    U --> H
-    W --> H
-    P --> H
     T --> E
 
     subgraph D["SQLite (single file)"]
-        direction LR
-        H["core tables"]
+        direction TB
         QP["project_q"]
         QE["egress_q"]
         EV["events/recorded/neg"]
         VV["valid/reject/block"]
         PJ["projection rows"]
         TT["trust rows"]
-        H --- QP
-        H --- QE
-        H --- EV
-        H --- VV
-        H --- PJ
-        H --- TT
     end
 
+    S --> EV
+    S --> PJ
+    S --> TT
+    U --> TT
+    W --> EV
+    W --> QP
+    P --> VV
+    P --> PJ
+    P --> TT
+    QE --> A
+    QE --> K
     TT --> T["trust oracle"]
 ```
 
