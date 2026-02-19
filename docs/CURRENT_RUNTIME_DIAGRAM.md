@@ -37,6 +37,71 @@ flowchart TD
     P3 --> TRUST
 ```
 
+## 1b) Runtime topology (SQLite-centered)
+
+```mermaid
+flowchart LR
+    CLI["CLI (topo)"] --> MAIN["main.rs"]
+    MAIN --> RPC["RPC server + DaemonState"]
+    MAIN --> NODE["node::run_node"]
+
+    RPC --> SVC["service::*"]
+
+    NODE --> START["startup: tenants + cert resolver + endpoint config"]
+    START --> EP["single QUIC endpoint"]
+    EP --> LOOPS["accept/connect loops"]
+    LOOPS --> INGEST["shared ingest channel"]
+    INGEST --> WRITER["batch_writer"]
+    WRITER --> PROJ["project_one + cascade"]
+
+    DB[(SQLite DB)]
+
+    SVC --> DB
+    START --> DB
+    WRITER --> DB
+    PROJ --> DB
+
+    DB --> TRUST["tenant-scoped trust lookup"]
+    TRUST --> EP
+```
+
+## 1c) Runtime topology (SQLite box with internal queues)
+
+```mermaid
+flowchart LR
+    CLI["CLI (topo)"] --> MAIN["main.rs"]
+    MAIN --> RPC["RPC server + DaemonState"]
+    MAIN --> NODE["node::run_node"]
+
+    RPC --> SVC["service::*"]
+    NODE --> START["startup (tenants + endpoint config)"]
+    START --> EP["single QUIC endpoint"]
+    EP --> LOOPS["accept/connect loops"]
+    LOOPS --> INGEST["shared ingest channel"]
+    INGEST --> WRITER["batch_writer"]
+    WRITER --> PROJ["project_one + cascade"]
+
+    subgraph SQLITE["SQLite DB (single file)"]
+        direction TB
+        Q1["project_queue"]
+        Q2["egress_queue"]
+        E1["events + recorded_events + neg_items"]
+        E2["valid/rejected/blocked"]
+        E3["projection tables"]
+        E4["transport trust tables"]
+    end
+
+    SVC --> SQLITE
+    START --> SQLITE
+    WRITER --> Q1
+    WRITER --> E1
+    PROJ --> E2
+    PROJ --> E3
+    PROJ --> E4
+    Q2 --> LOOPS
+    E4 --> EP
+```
+
 ## 2) One sync session (compact phases)
 
 ```mermaid
