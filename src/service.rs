@@ -1412,7 +1412,7 @@ pub fn svc_view_conn(
 
     // Accounts (peers)
     let mut acct_stmt = db.prepare(
-        "SELECT ps.event_id, COALESCE(ps.device_name, ''), ps.user_event_id,
+        "SELECT ps.event_id, COALESCE(ps.device_name, ''), COALESCE(ps.user_event_id, ''),
                 COALESCE(u.username, '')
          FROM peers_shared ps
          LEFT JOIN users u ON ps.user_event_id = u.event_id AND ps.recorded_by = u.recorded_by

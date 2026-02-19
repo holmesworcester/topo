@@ -1,4 +1,4 @@
-use super::fixed_layout::{self, WORKSPACE_WIRE_SIZE, NAME_BYTES, workspace_offsets as off};
+use super::fixed_layout::{self, WORKSPACE_WIRE_SIZE, WORKSPACE_WIRE_SIZE_LEGACY, NAME_BYTES, workspace_offsets as off};
 use super::registry::{EventTypeMeta, ShareScope};
 use super::{EventError, ParsedEvent, EVENT_TYPE_WORKSPACE};
 
@@ -9,19 +9,21 @@ pub struct WorkspaceEvent {
     pub name: String,           // Workspace display name (64-byte text slot)
 }
 
-/// Wire format (105 bytes fixed):
+/// Wire format (105 bytes fixed, or legacy 41 bytes without name):
 /// [0]      type_code = 8
 /// [1..9]   created_at_ms (u64 LE)
 /// [9..41]  public_key (32 bytes)
-/// [41..105] name (64 bytes, UTF-8 zero-padded)
+/// [41..105] name (64 bytes, UTF-8 zero-padded) — absent in legacy format
 pub fn parse_workspace(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    if blob.len() < WORKSPACE_WIRE_SIZE {
+    let is_legacy = blob.len() == WORKSPACE_WIRE_SIZE_LEGACY;
+
+    if !is_legacy && blob.len() < WORKSPACE_WIRE_SIZE {
         return Err(EventError::TooShort {
             expected: WORKSPACE_WIRE_SIZE,
             actual: blob.len(),
         });
     }
-    if blob.len() > WORKSPACE_WIRE_SIZE {
+    if !is_legacy && blob.len() > WORKSPACE_WIRE_SIZE {
         return Err(EventError::TrailingData {
             expected: WORKSPACE_WIRE_SIZE,
             actual: blob.len(),
@@ -39,8 +41,12 @@ pub fn parse_workspace(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     let mut public_key = [0u8; 32];
     public_key.copy_from_slice(&blob[off::PUBLIC_KEY..off::NAME]);
 
-    let name = fixed_layout::read_text_slot(&blob[off::NAME..off::NAME + NAME_BYTES])
-        .map_err(EventError::TextSlot)?;
+    let name = if is_legacy {
+        String::new()
+    } else {
+        fixed_layout::read_text_slot(&blob[off::NAME..off::NAME + NAME_BYTES])
+            .map_err(EventError::TextSlot)?
+    };
 
     Ok(ParsedEvent::Workspace(WorkspaceEvent {
         created_at_ms,
