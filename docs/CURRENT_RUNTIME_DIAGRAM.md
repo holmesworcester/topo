@@ -102,6 +102,56 @@ flowchart LR
     E4 --> EP
 ```
 
+## 1d) Runtime topology (dense, shorthand)
+
+```mermaid
+%%{init: {'flowchart': {'nodeSpacing': 14, 'rankSpacing': 14, 'curve': 'linear'}} }%%
+flowchart TB
+    C["CLI"] --> M["main"]
+    M --> R["RPC"]
+    M --> N["node"]
+    R --> S["svc"]
+    N --> U["startup"]
+    U --> E["endpoint"]
+    E --> A["accept"]
+    E --> K["connect"]
+    A --> I["ingest"]
+    K --> I
+    I --> W["writer"]
+    W --> P["project"]
+
+    S --> H
+    U --> H
+    W --> H
+    P --> H
+    T --> E
+
+    subgraph D["SQLite (single file)"]
+        direction LR
+        H["core tables"]
+        QP["project_q"]
+        QE["egress_q"]
+        EV["events/recorded/neg"]
+        VV["valid/reject/block"]
+        PJ["projection rows"]
+        TT["trust rows"]
+        H --- QP
+        H --- QE
+        H --- EV
+        H --- VV
+        H --- PJ
+        H --- TT
+    end
+
+    TT --> T["trust oracle"]
+```
+
+Legend:
+- `svc` = `service::*`
+- `project_q` = `project_queue`
+- `egress_q` = `egress_queue`
+- `project` = `project_one + cascade`
+
 ## 2) One sync session (compact phases)
 
 ```mermaid
