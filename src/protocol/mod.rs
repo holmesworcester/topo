@@ -1,11 +1,9 @@
 pub mod wire;
-pub mod negentropy_sqlite;
 pub mod bootstrap;
 pub mod intro;
 pub mod punch;
 
 pub use wire::{SyncMessage, parse_sync_message, encode_sync_message};
-pub use negentropy_sqlite::NegentropyStorageSqlite;
 
 use crate::crypto::EventId;
 use negentropy::Id;

@@ -18,7 +18,8 @@ use crate::db::{
     store::{lookup_workspace_id, Store},
 };
 use crate::runtime::SyncStats;
-use crate::protocol::{NegentropyStorageSqlite, SyncMessage};
+use crate::protocol::SyncMessage;
+use crate::sync::negentropy_sqlite::NegentropyStorageSqlite;
 use crate::transport::connection::ConnectionError;
 use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
 
