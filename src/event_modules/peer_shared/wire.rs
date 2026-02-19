@@ -1,23 +1,35 @@
-use super::layout::common::{COMMON_HEADER_BYTES, SIGNATURE_TRAILER_BYTES, NAME_BYTES, read_text_slot, write_text_slot};
-use super::registry::{EventTypeMeta, ShareScope};
-use super::{EventError, ParsedEvent, EVENT_TYPE_PEER_SHARED_FIRST, EVENT_TYPE_PEER_SHARED_ONGOING};
+use super::super::layout::common::{
+    COMMON_HEADER_BYTES,
+    SIGNATURE_TRAILER_BYTES,
+    NAME_BYTES,
+    read_text_slot,
+    write_text_slot,
+};
+use super::super::registry::{EventTypeMeta, ShareScope};
+use super::super::{
+    EventError,
+    ParsedEvent,
+    EVENT_TYPE_PEER_SHARED_FIRST,
+    EVENT_TYPE_PEER_SHARED_ONGOING,
+};
 
-// ─── Layout (owned by this module) ───
+// --- Layout (owned by this module) ---
 
 /// PeerShared (types 16, 17): type(1) + created_at(8) + public_key(32) + user_event_id(32)
 ///                           + device_name(64) + signed_by(32) + signer_type(1) + signature(64) = 234
-pub const PEER_SHARED_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32 + 32 + NAME_BYTES + SIGNATURE_TRAILER_BYTES;
+pub const PEER_SHARED_WIRE_SIZE: usize =
+    COMMON_HEADER_BYTES + 32 + 32 + NAME_BYTES + SIGNATURE_TRAILER_BYTES;
 
 mod peer_shared_offsets {
-    use super::super::layout::common::NAME_BYTES;
+    use super::super::super::layout::common::NAME_BYTES;
     pub const TYPE_CODE: usize = 0;
     pub const CREATED_AT: usize = 1;
     pub const PUBLIC_KEY: usize = 9;
     pub const USER_EVENT_ID: usize = 41;
     pub const DEVICE_NAME: usize = 73;
-    pub const SIGNED_BY: usize = 73 + NAME_BYTES;           // 137
-    pub const SIGNER_TYPE: usize = SIGNED_BY + 32;                  // 169
-    pub const SIGNATURE: usize = SIGNER_TYPE + 1;                   // 170
+    pub const SIGNED_BY: usize = 73 + NAME_BYTES; // 137
+    pub const SIGNER_TYPE: usize = SIGNED_BY + 32; // 169
+    pub const SIGNATURE: usize = SIGNER_TYPE + 1; // 170
 }
 
 use peer_shared_offsets as off;
@@ -26,10 +38,10 @@ use peer_shared_offsets as off;
 pub struct PeerSharedFirstEvent {
     pub created_at_ms: u64,
     pub public_key: [u8; 32],
-    pub user_event_id: [u8; 32], // UserBoot or UserOngoing event that owns this peer
-    pub device_name: String,      // Device display name (64-byte text slot)
-    pub signed_by: [u8; 32],     // signer event_id (DeviceInviteFirst event)
-    pub signer_type: u8,         // 3 = device_invite
+    pub user_event_id: [u8; 32],
+    pub device_name: String,
+    pub signed_by: [u8; 32],
+    pub signer_type: u8,
     pub signature: [u8; 64],
 }
 
@@ -37,22 +49,13 @@ pub struct PeerSharedFirstEvent {
 pub struct PeerSharedOngoingEvent {
     pub created_at_ms: u64,
     pub public_key: [u8; 32],
-    pub user_event_id: [u8; 32], // UserBoot or UserOngoing event that owns this peer
-    pub device_name: String,      // Device display name (64-byte text slot)
-    pub signed_by: [u8; 32],     // signer event_id (DeviceInviteOngoing event)
-    pub signer_type: u8,         // 3 = device_invite
+    pub user_event_id: [u8; 32],
+    pub device_name: String,
+    pub signed_by: [u8; 32],
+    pub signer_type: u8,
     pub signature: [u8; 64],
 }
 
-/// Wire format (234 bytes fixed):
-/// [0]          type_code = 16
-/// [1..9]       created_at_ms (u64 LE)
-/// [9..41]      public_key (32 bytes)
-/// [41..73]     user_event_id (32 bytes)
-/// [73..137]    device_name (64 bytes, UTF-8 zero-padded)
-/// [137..169]   signed_by (32 bytes)
-/// [169]        signer_type (1 byte)
-/// [170..234]   signature (64 bytes)
 pub fn parse_peer_shared_first(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if blob.len() < PEER_SHARED_WIRE_SIZE {
         return Err(EventError::TooShort { expected: PEER_SHARED_WIRE_SIZE, actual: blob.len() });
@@ -108,15 +111,6 @@ pub fn encode_peer_shared_first(event: &ParsedEvent) -> Result<Vec<u8>, EventErr
     Ok(buf)
 }
 
-/// Wire format (234 bytes fixed):
-/// [0]          type_code = 17
-/// [1..9]       created_at_ms (u64 LE)
-/// [9..41]      public_key (32 bytes)
-/// [41..73]     user_event_id (32 bytes)
-/// [73..137]    device_name (64 bytes, UTF-8 zero-padded)
-/// [137..169]   signed_by (32 bytes)
-/// [169]        signer_type (1 byte)
-/// [170..234]   signature (64 bytes)
 pub fn parse_peer_shared_ongoing(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if blob.len() < PEER_SHARED_WIRE_SIZE {
         return Err(EventError::TooShort { expected: PEER_SHARED_WIRE_SIZE, actual: blob.len() });
@@ -172,39 +166,6 @@ pub fn encode_peer_shared_ongoing(event: &ParsedEvent) -> Result<Vec<u8>, EventE
     Ok(buf)
 }
 
-// === Projector (event-module locality) ===
-
-use crate::crypto::event_id_to_base64;
-use crate::projection::result::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
-
-/// Pure projector: PeerShared (First or Ongoing) → peers_shared table.
-pub fn project_pure(
-    recorded_by: &str,
-    event_id_b64: &str,
-    parsed: &ParsedEvent,
-    _ctx: &ContextSnapshot,
-) -> ProjectorResult {
-    let (public_key, user_event_id, device_name) = match parsed {
-        ParsedEvent::PeerSharedFirst(p) => (&p.public_key, &p.user_event_id, &p.device_name),
-        ParsedEvent::PeerSharedOngoing(p) => (&p.public_key, &p.user_event_id, &p.device_name),
-        _ => return ProjectorResult::reject("not a peer_shared event".to_string()),
-    };
-
-    let user_event_id_b64 = event_id_to_base64(user_event_id);
-    let ops = vec![WriteOp::InsertOrIgnore {
-        table: "peers_shared",
-        columns: vec!["recorded_by", "event_id", "public_key", "user_event_id", "device_name"],
-        values: vec![
-            SqlVal::Text(recorded_by.to_string()),
-            SqlVal::Text(event_id_b64.to_string()),
-            SqlVal::Blob(public_key.to_vec()),
-            SqlVal::Text(user_event_id_b64),
-            SqlVal::Text(device_name.to_string()),
-        ],
-    }];
-    ProjectorResult::valid(ops)
-}
-
 pub static PEER_SHARED_FIRST_META: EventTypeMeta = EventTypeMeta {
     type_code: EVENT_TYPE_PEER_SHARED_FIRST,
     type_name: "peer_shared_first",
@@ -217,7 +178,7 @@ pub static PEER_SHARED_FIRST_META: EventTypeMeta = EventTypeMeta {
     encryptable: false,
     parse: parse_peer_shared_first,
     encode: encode_peer_shared_first,
-    projector: project_pure,
+    projector: super::projector::project_pure,
 };
 
 pub static PEER_SHARED_ONGOING_META: EventTypeMeta = EventTypeMeta {
@@ -232,27 +193,13 @@ pub static PEER_SHARED_ONGOING_META: EventTypeMeta = EventTypeMeta {
     encryptable: false,
     parse: parse_peer_shared_ongoing,
     encode: encode_peer_shared_ongoing,
-    projector: project_pure,
+    projector: super::projector::project_pure,
 };
-
-// === Query APIs (event-module locality) ===
-
-use rusqlite::Connection;
-
-pub fn count(
-    db: &Connection,
-    recorded_by: &str,
-) -> Result<i64, rusqlite::Error> {
-    db.query_row(
-        "SELECT COUNT(*) FROM peers_shared WHERE recorded_by = ?1",
-        rusqlite::params![recorded_by],
-        |row| row.get(0),
-    )
-}
 
 #[cfg(test)]
 mod layout_tests {
     use super::*;
+
     #[test]
     fn offsets_consistent() {
         assert_eq!(peer_shared_offsets::SIGNATURE + 64, PEER_SHARED_WIRE_SIZE);
