@@ -255,19 +255,66 @@ async fn test_zero_loss_stress() {
     let alice_samples = alice.sample_event_ids(50);
     let bob_samples = bob.sample_event_ids(50);
 
-    let metrics = sync_until_converged(
-        &alice, &bob,
+    // Phase 1: sample-based fast convergence gate (sync stays running).
+    let a_before = alice.store_count();
+    let b_before = bob.store_count();
+    let start = Instant::now();
+    let sync = start_peers_pinned(&alice, &bob);
+
+    assert_eventually(
         || alice_samples.iter().all(|s| bob.has_event(s))
             && bob_samples.iter().all(|s| alice.has_event(s)),
         Duration::from_secs(120),
+        "phase 1: sample-based convergence",
     ).await;
 
-    eprintln!("zero-loss stress: {}", metrics);
+    // Phase 2: full-set quiescence gate — require diff <= 2 on both sides,
+    // stable for 5 consecutive polls at 200ms, before dropping sync.
+    let quiesce_needed = 5u32;
+    let mut quiesce_streak = 0u32;
+    let phase2_timeout = Duration::from_secs(30);
+    let phase2_start = Instant::now();
+    loop {
+        let a_ids = alice.store_ids();
+        let b_ids = bob.store_ids();
+        let a_only = a_ids.difference(&b_ids).count();
+        let b_only = b_ids.difference(&a_ids).count();
 
+        if a_only <= 2 && b_only <= 2 {
+            quiesce_streak += 1;
+            if quiesce_streak >= quiesce_needed {
+                break;
+            }
+        } else {
+            quiesce_streak = 0;
+        }
+
+        assert!(
+            phase2_start.elapsed() < phase2_timeout,
+            "phase 2 quiescence timed out: alice_only={}, bob_only={}",
+            a_only, b_only,
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    let wall_secs = start.elapsed().as_secs_f64();
+    drop(sync);
+
+    let a_after = alice.store_count();
+    let b_after = bob.store_count();
+    let events_transferred = ((a_after - a_before) + (b_after - b_before)) as u64;
+    let events_per_sec = if wall_secs > 0.0 { events_transferred as f64 / wall_secs } else { 0.0 };
+    let bytes_transferred = events_transferred * 100;
+    let throughput_mib_s = (bytes_transferred as f64) / (1024.0 * 1024.0) / wall_secs.max(0.001);
+    eprintln!(
+        "zero-loss stress: {} events in {:.2}s ({:.0} events/s, {:.2} MiB/s)",
+        events_transferred, wall_secs, events_per_sec, throughput_mib_s,
+    );
+
+    // Final assertions on the quiesced state.
     let alice_ids = alice.store_ids();
     let bob_ids = bob.store_ids();
 
-    // Set difference should only be the local-scope InviteAccepted events (not synced)
     let alice_only: Vec<_> = alice_ids.difference(&bob_ids).collect();
     let bob_only: Vec<_> = bob_ids.difference(&alice_ids).collect();
     assert!(alice_only.len() <= 2, "alice has too many unique events: {}", alice_only.len());
