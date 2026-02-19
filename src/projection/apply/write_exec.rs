@@ -78,28 +78,19 @@ pub(crate) fn execute_emit_commands(
 ) -> Result<(), Box<dyn std::error::Error>> {
     for cmd in commands {
         match cmd {
-            EmitCommand::RetryWorkspaceGuards => {
-                // Find workspace events stuck in guard-blocked limbo and re-project them.
-                let guard_candidates: Vec<String> = {
-                    let mut stmt = conn.prepare(
-                        "SELECT re.event_id
-                         FROM recorded_events re
-                         INNER JOIN events e ON e.event_id = re.event_id
-                         WHERE re.peer_id = ?1
-                           AND e.event_type = 'workspace'
-                           AND re.event_id NOT IN (SELECT event_id FROM valid_events WHERE peer_id = ?1)
-                           AND re.event_id NOT IN (SELECT event_id FROM rejected_events WHERE peer_id = ?1)
-                           AND re.event_id NOT IN (SELECT DISTINCT event_id FROM blocked_event_deps WHERE peer_id = ?1)",
-                    )?;
-                    let mut rows = stmt.query(rusqlite::params![recorded_by])?;
-                    let mut result = Vec::new();
-                    while let Some(row) = rows.next()? {
-                        result.push(row.get::<_, String>(0)?);
-                    }
-                    result
-                };
-                for eid_b64 in guard_candidates {
-                    if let Some(event_id) = event_id_from_base64(&eid_b64) {
+            EmitCommand::RetryWorkspaceEvent { workspace_id } => {
+                // Re-project the specific workspace event now that a trust anchor exists.
+                // The workspace_id IS the event_id for workspace events.
+                // Only attempt if the event exists and is not yet in a terminal state
+                // (the workspace event may arrive later, in which case it will project
+                // normally since the trust anchor is already set).
+                let exists: bool = conn.query_row(
+                    "SELECT COUNT(*) > 0 FROM events WHERE event_id = ?1",
+                    rusqlite::params![workspace_id],
+                    |row| row.get(0),
+                ).unwrap_or(false);
+                if exists {
+                    if let Some(event_id) = event_id_from_base64(workspace_id) {
                         let _ = super::project_one(conn, recorded_by, &event_id)?;
                     }
                 }

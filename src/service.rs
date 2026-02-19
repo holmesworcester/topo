@@ -1176,14 +1176,8 @@ pub fn svc_view_conn(
     recorded_by: &str,
     limit: usize,
 ) -> ServiceResult<ViewResponse> {
-    // Workspace name
-    let workspace_name: String = db
-        .query_row(
-            "SELECT COALESCE(name, '') FROM workspaces WHERE recorded_by = ?1 LIMIT 1",
-            rusqlite::params![recorded_by],
-            |row| row.get(0),
-        )
-        .unwrap_or_default();
+    // Workspace name — delegate to workspace module
+    let workspace_name = workspace::name(db, recorded_by).unwrap_or_default();
 
     // Users
     let users = svc_users_conn(db, recorded_by)?;
@@ -1192,56 +1186,38 @@ pub fn svc_view_conn(
     let own_user_eid: String = if let Ok(Some((signer_eid, _))) =
         load_local_peer_signer(db, recorded_by)
     {
-        let signer_b64 = crate::crypto::event_id_to_base64(&signer_eid);
-        db.query_row(
-            "SELECT COALESCE(user_event_id, '') FROM peers_shared WHERE recorded_by = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, &signer_b64],
-            |row| row.get(0),
-        ).unwrap_or_default()
+        resolve_user_event_id_for_signer(db, recorded_by, &signer_eid)
+            .map(|eid| crate::crypto::event_id_to_base64(&eid))
+            .unwrap_or_default()
     } else {
         String::new()
     };
 
-    // Accounts (peers)
-    let mut acct_stmt = db.prepare(
-        "SELECT ps.event_id, COALESCE(ps.device_name, ''), COALESCE(ps.user_event_id, ''),
-                COALESCE(u.username, '')
-         FROM peers_shared ps
-         LEFT JOIN users u ON ps.user_event_id = u.event_id AND ps.recorded_by = u.recorded_by
-         WHERE ps.recorded_by = ?1",
-    )?;
-    let accounts: Vec<AccountItem> = acct_stmt
-        .query_map(rusqlite::params![recorded_by], |row| {
-            Ok(AccountItem {
-                event_id: row.get(0)?,
-                device_name: row.get(1)?,
-                user_event_id: row.get(2)?,
-                username: row.get(3)?,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    drop(acct_stmt);
+    // Accounts (peers) — delegate to peer_shared module
+    let accounts: Vec<AccountItem> = peer_shared::list_accounts(db, recorded_by)?
+        .into_iter()
+        .map(|row| AccountItem {
+            event_id: row.event_id,
+            device_name: row.device_name,
+            user_event_id: row.user_event_id,
+            username: row.username,
+        })
+        .collect();
 
     // Messages with author names
     let msg_resp = svc_messages_conn(db, recorded_by, limit)?;
 
-    // Reactions per message
+    // Reactions per message — delegate to reaction module
     let mut view_messages = Vec::with_capacity(msg_resp.messages.len());
     for msg in msg_resp.messages {
-        let mut rxn_stmt = db.prepare(
-            "SELECT r.emoji, COALESCE(u.username, '') as reactor_name
-             FROM reactions r
-             LEFT JOIN users u ON r.author_id = u.event_id AND r.recorded_by = u.recorded_by
-             WHERE r.target_event_id = ?1 AND r.recorded_by = ?2",
-        )?;
-        let reactions: Vec<ViewReaction> = rxn_stmt
-            .query_map(rusqlite::params![&msg.id_b64, recorded_by], |row| {
-                Ok(ViewReaction {
-                    emoji: row.get(0)?,
-                    reactor_name: row.get(1)?,
+        let reactions: Vec<ViewReaction> =
+            reaction::list_for_message_with_authors(db, recorded_by, &msg.id_b64)?
+                .into_iter()
+                .map(|r| ViewReaction {
+                    emoji: r.emoji,
+                    reactor_name: r.reactor_name,
                 })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+                .collect();
 
         view_messages.push(ViewMessage {
             id: msg.id_b64,
@@ -1296,19 +1272,8 @@ pub fn svc_keys_conn(
             .map(|row| row.event_id)
             .collect();
 
-        let mut stmt = db.prepare("SELECT event_id FROM peers_shared WHERE recorded_by = ?1")?;
-        peers = stmt
-            .query_map(rusqlite::params![recorded_by], |row| {
-                row.get::<_, String>(0)
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let mut stmt = db.prepare("SELECT event_id FROM admins WHERE recorded_by = ?1")?;
-        admins = stmt
-            .query_map(rusqlite::params![recorded_by], |row| {
-                row.get::<_, String>(0)
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+        peers = peer_shared::list_event_ids(db, recorded_by)?;
+        admins = admin::list_event_ids(db, recorded_by)?;
     }
 
     Ok(KeysResponse {
@@ -1998,23 +1963,8 @@ pub fn svc_ban_for_peer(
 pub fn svc_identity_for_peer(db_path: &str, peer_id: &str) -> ServiceResult<IdentityResponse> {
     let (_recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
 
-    // User event ID from users table
-    let user_event_id: Option<String> = db
-        .query_row(
-            "SELECT event_id FROM users WHERE recorded_by = ?1 LIMIT 1",
-            rusqlite::params![peer_id],
-            |row| row.get(0),
-        )
-        .optional()?;
-
-    // Peer shared event ID from peers_shared table
-    let peer_shared_event_id: Option<String> = db
-        .query_row(
-            "SELECT event_id FROM peers_shared WHERE recorded_by = ?1 LIMIT 1",
-            rusqlite::params![peer_id],
-            |row| row.get(0),
-        )
-        .optional()?;
+    let user_event_id = user::first_event_id(&db, peer_id)?;
+    let peer_shared_event_id = peer_shared::first_event_id(&db, peer_id)?;
 
     Ok(IdentityResponse {
         transport_fingerprint: peer_id.to_string(),

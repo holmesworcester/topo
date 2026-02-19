@@ -75,3 +75,31 @@ pub fn list(
         })
         .collect())
 }
+
+pub struct ReactionWithAuthor {
+    pub emoji: String,
+    pub reactor_name: String,
+}
+
+/// List reactions for a specific message, including reactor username.
+pub fn list_for_message_with_authors(
+    db: &Connection,
+    recorded_by: &str,
+    target_event_id_b64: &str,
+) -> Result<Vec<ReactionWithAuthor>, rusqlite::Error> {
+    let mut stmt = db.prepare(
+        "SELECT r.emoji, COALESCE(u.username, '') as reactor_name
+         FROM reactions r
+         LEFT JOIN users u ON r.author_id = u.event_id AND r.recorded_by = u.recorded_by
+         WHERE r.target_event_id = ?1 AND r.recorded_by = ?2",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![target_event_id_b64, recorded_by], |row| {
+            Ok(ReactionWithAuthor {
+                emoji: row.get(0)?,
+                reactor_name: row.get(1)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}

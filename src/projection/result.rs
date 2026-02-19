@@ -36,8 +36,10 @@ pub enum WriteOp {
 /// event identity for idempotence.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EmitCommand {
-    /// Retry workspace guard-blocked events after a trust anchor was set.
-    RetryWorkspaceGuards,
+    /// Re-project a specific workspace event after a trust anchor was set.
+    /// Emitted by invite_accepted when it knows the workspace_id.
+    /// Flows through normal projection + cascade.
+    RetryWorkspaceEvent { workspace_id: String },
     /// Retry file_slice guard-blocked events for a specific file_id.
     RetryFileSliceGuards { file_id: String },
     /// Record a guard-block for a file_slice awaiting its descriptor.

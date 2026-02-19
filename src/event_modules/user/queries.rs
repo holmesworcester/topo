@@ -33,3 +33,17 @@ pub fn count(
         |row| row.get(0),
     )
 }
+
+/// Return the first user event_id, if any.
+pub fn first_event_id(
+    db: &Connection,
+    recorded_by: &str,
+) -> Result<Option<String>, rusqlite::Error> {
+    use rusqlite::OptionalExtension;
+    db.query_row(
+        "SELECT event_id FROM users WHERE recorded_by = ?1 LIMIT 1",
+        rusqlite::params![recorded_by],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+}

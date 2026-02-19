@@ -10,5 +10,5 @@ pub use wire::{
     USER_WIRE_SIZE,
     USER_BOOT_META, USER_ONGOING_META,
 };
-pub use queries::{UserRow, list, count};
+pub use queries::{UserRow, list, count, first_event_id};
 pub use projector::project_pure;

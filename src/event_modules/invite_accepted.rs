@@ -77,7 +77,8 @@ use crate::projection::result::{ContextSnapshot, EmitCommand, ProjectorResult, S
 ///
 /// Binds directly from InviteAcceptedEvent fields. Uses first-write-wins
 /// (INSERT OR IGNORE) for trust anchor immutability; rejects on mismatch.
-/// Emits RetryWorkspaceGuards command so blocked workspace events can unblock.
+/// Emits RetryWorkspaceEvent targeting the specific workspace_id so the
+/// guard-blocked workspace event can unblock through normal projection + cascade.
 /// When bootstrap_context is available, emits WriteAcceptedBootstrapTrust
 /// so the projection pipeline materializes accepted trust instead of the
 /// service layer.
@@ -128,7 +129,9 @@ pub fn project_pure(
         },
     ];
 
-    let mut commands = vec![EmitCommand::RetryWorkspaceGuards];
+    let mut commands = vec![EmitCommand::RetryWorkspaceEvent {
+        workspace_id: workspace_id_b64.clone(),
+    }];
 
     // Emit accepted bootstrap trust when local context exists (joiner side)
     if let Some(ref bc) = ctx.bootstrap_context {

@@ -421,7 +421,7 @@ ProjectorResult {
 
 ### EmitCommand types
 
-1. `RetryWorkspaceGuards` — re-project guard-blocked workspace events after trust anchor set.
+1. `RetryWorkspaceEvent { workspace_id }` — re-project the specific workspace event after trust anchor set by invite_accepted.
 2. `RetryFileSliceGuards { file_id }` — re-project file_slice events after descriptor arrives.
 3. `RecordFileSliceGuardBlock { file_id, event_id }` — record guard-block for pending file_slices.
 4. `WritePendingBootstrapTrust { invite_event_id, workspace_id, expected_bootstrap_spki_fingerprint }` — materialize inviter-side pending trust from invite event + bootstrap context. Emitted by UserInviteBoot and DeviceInviteFirst projectors.
@@ -1057,17 +1057,29 @@ The result is a small protocol core with clear upgrade paths instead of a stack 
 
 # 14. Event-Module Locality
 
-## 14.1 Layering convention
+## 14.1 Enforceable locality contract
+
+These rules are mandatory. Violations must be fixed before merge.
+
+1. **Event-module locality rule**: Event modules (`src/event_modules/<type>/`) own all event-type-specific behavior: wire format, projector, commands, queries, and response types. No event-type-specific SQL or logic may live in `service.rs` or the projection pipeline.
+
+2. **Service orchestration-only rule**: `service.rs` is a thin orchestrator. It handles DB open/close, auth/key loading, cross-module composition, non-event-specific logic (identity bootstrap, invite flows, predicate/assert), and error mapping. It must not contain event-type-specific SQL — it calls event-module APIs.
+
+3. **Registry-driven routing rule**: Both commands and queries flow through typed dispatch enums in `src/event_modules/dispatch.rs` (`EventCommand`, `EventQuery`). The service layer routes through these for event-local operations. Module internals remain the true behavior owners.
+
+4. **Module split rule**: When an event module exceeds ~300-400 LOC or mixes 3+ concerns, split into a directory module (see 14.3).
+
+## 14.2 Layering convention
 
 Event modules (`src/event_modules/<type>.rs` or `src/event_modules/<type>/`) own five concerns:
 
 1. **Wire** — struct definition, parse/encode, wire layout, `EventTypeMeta`.
 2. **Projector** — `project_pure()` function: the pure projector for this event type. Takes `(recorded_by, event_id_b64, &ParsedEvent, &ContextSnapshot)` and returns `ProjectorResult`. Registered in `EventTypeMeta.projector` so the pipeline dispatches via registry lookup with no central match statement.
-3. **Commands** — `CreateXxxCmd` struct + `create()` function that builds the `ParsedEvent`, calls `create_signed_event_sync`, and returns `EventId`. High-level conn-level helpers (e.g. `send_conn`, `react_conn`) that combine create + response shaping.
-4. **Queries** — `query_list()`, `query_count()`, `resolve_by_number()`, etc. — SQL against projection tables scoped by `recorded_by`. Response assembly helpers (e.g. `messages_conn`) that combine queries into structured responses.
+3. **Commands** — `CreateXxxCmd` struct + `create()` function that builds the `ParsedEvent`, calls `create_signed_event_sync`, and returns `EventId`. High-level conn-level helpers (e.g. `send`, `react`) that combine create + response shaping.
+4. **Queries** — `list()`, `count()`, `resolve()`, `list_for_message_with_authors()`, etc. — SQL against projection tables scoped by `recorded_by`. All event-specific SQL lives here.
 5. **Response types** — serializable structs for the event domain (e.g. `MessageItem`, `MessagesResponse`, `SendResponse`). Owned by the event module, re-exported by service.rs for external callers.
 
-The projection pipeline (`src/projection/apply.rs`) is orchestration-only:
+The projection pipeline (`src/projection/apply/`) is orchestration-only:
 
 - Dependency presence check + block row writes
 - Dependency type enforcement
@@ -1076,15 +1088,17 @@ The projection pipeline (`src/projection/apply.rs`) is orchestration-only:
 - Registry-driven projector dispatch: `(meta.projector)(recorded_by, event_id_b64, parsed, ctx)`
 - Write-op execution and emit-command handling
 
-The service layer (`src/service.rs`) is a thin orchestrator that handles:
+The service layer (`src/service.rs`) is a thin orchestrator:
 
 - DB open/close and connection management
 - Auth (key loading, `require_local_peer_signer`)
-- Cross-module orchestration (e.g. `svc_view_conn` combines messages, reactions, users)
+- Cross-module composition (e.g. `svc_view_conn` combines workspace::name + message::list + reaction::list_for_message_with_authors)
 - Non-event-specific logic (identity bootstrap, invite flows, predicate/assert system)
 - Error mapping from module results to `ServiceError`
 
-## 14.2 Registry-driven projector dispatch
+## 14.3 Registry-driven dispatch
+
+### Projector dispatch
 
 `EventTypeMeta` includes a `projector` function pointer with the uniform signature:
 
@@ -1092,7 +1106,15 @@ The service layer (`src/service.rs`) is a thin orchestrator that handles:
 fn(&str, &str, &ParsedEvent, &ContextSnapshot) -> ProjectorResult
 ```
 
-## 14.3 Module split rule
+### Command dispatch
+
+`src/event_modules/dispatch.rs` provides `EventCommand` enum and `execute_command()` that routes creation to the appropriate event module.
+
+### Query dispatch
+
+`src/event_modules/dispatch.rs` provides `EventQuery` enum and `execute_query()` that routes read operations to the appropriate event module. Query variants cover: message list/count/resolve, reaction list/count/list-with-authors, deletion list, user list/first, workspace list/name, peer_shared list/accounts, admin list.
+
+## 14.4 Module split rule
 
 When an event module exceeds roughly 300-400 LOC or mixes 3+ concerns (wire + commands + queries + projector), split it into a directory module:
 
@@ -1106,7 +1128,7 @@ src/event_modules/<name>/
 
 `mod.rs` re-exports all public items so callers continue to import from `event_modules::<name>`.
 
-## 14.4 Layout locality rule
+## 14.5 Layout locality rule
 
 Wire layout constants (wire sizes, text-slot budgets, field offset modules) are owned by the event module that defines the event type:
 
@@ -1117,13 +1139,13 @@ Wire layout constants (wire sizes, text-slot budgets, field offset modules) are 
 
 Do not reintroduce a global layout monolith. When adding a new event type, define its wire size and offsets in the owning module.
 
-## 14.5 Typed command dispatch
+## 14.6 Explicit workspace guard retry
 
-`src/event_modules/dispatch.rs` provides an `EventCommand` enum and `execute_command()` function that routes creation to the appropriate event module. This enables callers that want a single entry point for event creation without depending on specific event module APIs.
+The `invite_accepted` projector emits `RetryWorkspaceEvent { workspace_id }` after writing the trust anchor. This explicitly targets the known workspace event for re-projection, flowing through normal `project_one` + cascade. The workspace projector guard-blocks when no trust anchor exists and unblocks when retried after the trust anchor is set by `invite_accepted`.
 
-## 14.6 Adding a new event type
+## 14.7 Adding a new event type
 
-`dispatch_pure_projector` in `apply.rs` looks up the event's type code in the registry and calls the registered projector. No central match statement is required. Each event module owns its complete projection semantics.
+`dispatch_pure_projector` in `apply/dispatch.rs` looks up the event's type code in the registry and calls the registered projector. No central match statement is required. Each event module owns its complete projection semantics.
 
 When adding a new event type:
 
@@ -1132,7 +1154,7 @@ When adding a new event type:
 3. Add `CreateXxxCmd` + `create()` for command paths.
 4. Add `query_*()` functions for any projection-table queries.
 5. Add response types and conn-level helpers in the event module.
-6. Add an `EventCommand` variant to `dispatch.rs` if the type participates in command dispatch.
+6. Add `EventCommand` and/or `EventQuery` variants to `dispatch.rs` if the type participates in dispatch.
 7. Wire service.rs to call the event module functions, mapping errors to `ServiceError`.
 
 **Rule**: Event projection semantics MUST live in event modules, not in central projector files. The pipeline must not contain event-type-specific logic beyond context snapshot construction.

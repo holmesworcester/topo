@@ -167,6 +167,22 @@ pub fn list(
     Ok(rows)
 }
 
+/// Return the workspace display name for the first workspace, or empty string.
+pub fn name(
+    db: &Connection,
+    recorded_by: &str,
+) -> Result<String, rusqlite::Error> {
+    use rusqlite::OptionalExtension;
+    Ok(db
+        .query_row(
+            "SELECT COALESCE(name, '') FROM workspaces WHERE recorded_by = ?1 LIMIT 1",
+            rusqlite::params![recorded_by],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .unwrap_or_default())
+}
+
 #[cfg(test)]
 mod layout_tests {
     use super::*;

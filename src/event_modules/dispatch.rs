@@ -1,7 +1,7 @@
-//! Typed command dispatch for event creation.
+//! Typed command and query dispatch for event modules.
 //!
-//! Provides an `EventCommand` enum that routes creation to the appropriate event module,
-//! keeping service.rs as a thin orchestrator.
+//! Provides `EventCommand` and `EventQuery` enums that route operations to
+//! the appropriate event module, keeping service.rs as a thin orchestrator.
 
 use crate::crypto::EventId;
 use ed25519_dalek::SigningKey;
@@ -11,6 +11,10 @@ use super::message;
 use super::reaction;
 use super::message_deletion;
 use super::user_removed;
+
+// ---------------------------------------------------------------------------
+// Commands
+// ---------------------------------------------------------------------------
 
 pub enum EventCommand {
     Message(message::CreateMessageCmd),
@@ -39,6 +43,134 @@ pub fn execute_command(
         }
         EventCommand::UserRemoved(c) => {
             user_removed::create(db, recorded_by, signer_eid, signing_key, created_at_ms, c)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Queries
+// ---------------------------------------------------------------------------
+
+use super::{admin, peer_shared, user, workspace};
+
+/// Typed query enum for event-module-owned read operations.
+/// Service routes through these instead of inlining event-specific SQL.
+pub enum EventQuery {
+    /// List messages (returns QueryResult::Messages).
+    MessageList { limit: usize },
+    /// Count messages (returns QueryResult::Count).
+    MessageCount,
+    /// Resolve a message selector to an EventId (returns QueryResult::EventId).
+    MessageResolve { selector: String },
+    /// Resolve a 1-based message number to an EventId (returns QueryResult::EventId).
+    MessageResolveNumber { msg_num: usize },
+    /// List reactions (returns QueryResult::Reactions).
+    ReactionList,
+    /// Count reactions (returns QueryResult::Count).
+    ReactionCount,
+    /// List reactions for a message with author names (returns QueryResult::ReactionsWithAuthors).
+    ReactionListForMessageWithAuthors { target_event_id_b64: String },
+    /// List emojis for a message (returns QueryResult::Strings).
+    ReactionListForMessage { target_event_id_b64: String },
+    /// List deleted message IDs (returns QueryResult::Strings).
+    DeletedMessageIds,
+    /// List users (returns QueryResult::Users).
+    UserList,
+    /// First user event_id (returns QueryResult::OptionalString).
+    UserFirstEventId,
+    /// List workspaces (returns QueryResult::Workspaces).
+    WorkspaceList,
+    /// Workspace display name (returns QueryResult::String).
+    WorkspaceName,
+    /// List peer_shared event_ids (returns QueryResult::Strings).
+    PeerSharedEventIds,
+    /// First peer_shared event_id (returns QueryResult::OptionalString).
+    PeerSharedFirstEventId,
+    /// List peer accounts with usernames (returns QueryResult::Accounts).
+    PeerSharedAccounts,
+    /// List admin event_ids (returns QueryResult::Strings).
+    AdminEventIds,
+}
+
+/// Result type for event queries. Callers destructure the expected variant.
+pub enum QueryResult {
+    Messages(message::MessagesResponse),
+    Reactions(Vec<reaction::ReactionItem>),
+    ReactionsWithAuthors(Vec<reaction::ReactionWithAuthor>),
+    Users(Vec<user::UserRow>),
+    Workspaces(Vec<workspace::WorkspaceRow>),
+    Accounts(Vec<peer_shared::AccountRow>),
+    Strings(Vec<String>),
+    String(String),
+    OptionalString(Option<String>),
+    Count(i64),
+    EventId(EventId),
+}
+
+pub fn execute_query(
+    db: &Connection,
+    recorded_by: &str,
+    query: EventQuery,
+) -> Result<QueryResult, Box<dyn std::error::Error + Send + Sync>> {
+    match query {
+        EventQuery::MessageList { limit } => {
+            Ok(QueryResult::Messages(message::list(db, recorded_by, limit)?))
+        }
+        EventQuery::MessageCount => {
+            Ok(QueryResult::Count(message::count(db, recorded_by)?))
+        }
+        EventQuery::MessageResolve { selector } => {
+            let eid = message::resolve(db, recorded_by, &selector)
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+            Ok(QueryResult::EventId(eid))
+        }
+        EventQuery::MessageResolveNumber { msg_num } => {
+            let eid = message::resolve_number(db, recorded_by, msg_num)
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+            Ok(QueryResult::EventId(eid))
+        }
+        EventQuery::ReactionList => {
+            Ok(QueryResult::Reactions(reaction::list(db, recorded_by)?))
+        }
+        EventQuery::ReactionCount => {
+            Ok(QueryResult::Count(reaction::count(db, recorded_by)?))
+        }
+        EventQuery::ReactionListForMessageWithAuthors { target_event_id_b64 } => {
+            Ok(QueryResult::ReactionsWithAuthors(
+                reaction::list_for_message_with_authors(db, recorded_by, &target_event_id_b64)?,
+            ))
+        }
+        EventQuery::ReactionListForMessage { target_event_id_b64 } => {
+            Ok(QueryResult::Strings(
+                reaction::list_for_message(db, recorded_by, &target_event_id_b64)?,
+            ))
+        }
+        EventQuery::DeletedMessageIds => {
+            Ok(QueryResult::Strings(message_deletion::list_deleted_ids(db, recorded_by)?))
+        }
+        EventQuery::UserList => {
+            Ok(QueryResult::Users(user::list(db, recorded_by)?))
+        }
+        EventQuery::UserFirstEventId => {
+            Ok(QueryResult::OptionalString(user::first_event_id(db, recorded_by)?))
+        }
+        EventQuery::WorkspaceList => {
+            Ok(QueryResult::Workspaces(workspace::list(db, recorded_by)?))
+        }
+        EventQuery::WorkspaceName => {
+            Ok(QueryResult::String(workspace::name(db, recorded_by)?))
+        }
+        EventQuery::PeerSharedEventIds => {
+            Ok(QueryResult::Strings(peer_shared::list_event_ids(db, recorded_by)?))
+        }
+        EventQuery::PeerSharedFirstEventId => {
+            Ok(QueryResult::OptionalString(peer_shared::first_event_id(db, recorded_by)?))
+        }
+        EventQuery::PeerSharedAccounts => {
+            Ok(QueryResult::Accounts(peer_shared::list_accounts(db, recorded_by)?))
+        }
+        EventQuery::AdminEventIds => {
+            Ok(QueryResult::Strings(admin::list_event_ids(db, recorded_by)?))
         }
     }
 }

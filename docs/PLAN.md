@@ -500,7 +500,7 @@ enum WriteOp {
 }
 
 enum EmitCommand {
-    RetryWorkspaceGuards,
+    RetryWorkspaceEvent { workspace_id },
     RetryFileSliceGuards { file_id },
     RecordFileSliceGuardBlock { file_id, event_id },
     WritePendingBootstrapTrust { invite_event_id, workspace_id, expected_bootstrap_spki_fingerprint },
@@ -564,7 +564,7 @@ Deterministic emitted-event exception (still under this rule):
 
 - `message_deletion` uses the two-stage deletion intent + tombstone model (see Phase 10).
 - deterministic emitted-event patterns (for example key material derivations) using the unsigned deterministic exception above.
-- identity-specific exceptions (`invite_accepted` trust-anchor binding via `RetryWorkspaceGuards` command, removal enforcement, bootstrap trust materialization via `WritePendingBootstrapTrust`/`WriteAcceptedBootstrapTrust` commands, supersession via `SupersedeBootstrapTrust` command) implemented via EmitCommand handlers.
+- identity-specific exceptions (`invite_accepted` trust-anchor binding via `RetryWorkspaceEvent { workspace_id }` command, removal enforcement, bootstrap trust materialization via `WritePendingBootstrapTrust`/`WriteAcceptedBootstrapTrust` commands, supersession via `SupersedeBootstrapTrust` command) implemented via EmitCommand handlers.
 
 ### Deletion intent + tombstone contract (Phase 10)
 

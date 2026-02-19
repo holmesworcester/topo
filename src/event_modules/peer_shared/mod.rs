@@ -10,5 +10,5 @@ pub use wire::{
     PEER_SHARED_WIRE_SIZE,
     PEER_SHARED_FIRST_META, PEER_SHARED_ONGOING_META,
 };
-pub use queries::count;
+pub use queries::{count, list_event_ids, first_event_id, AccountRow, list_accounts};
 pub use projector::project_pure;

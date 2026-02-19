@@ -79,7 +79,7 @@ fn cascade_unblocked_inner(
 
             // 4. Project this event via project_one_step (no recursive cascade).
             //    apply_projection (called by project_one_step) executes emit_commands,
-            //    which handles guard retries (RetryWorkspaceGuards, RetryFileSliceGuards).
+            //    which handles guard retries (RetryWorkspaceEvent, RetryFileSliceGuards).
             if let Some(event_id) = event_id_from_base64(eid_b64) {
                 let (decision, _parsed) =
                     super::project_one::project_one_step(conn, recorded_by, &event_id)?;
