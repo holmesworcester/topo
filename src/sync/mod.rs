@@ -1,28 +1,32 @@
-pub mod protocol;
-pub mod negentropy_sqlite;
-pub mod engine;
+pub mod session;
 pub mod session_handler;
-pub mod bootstrap;
-pub mod intro;
-pub mod punch;
 
-pub use protocol::{SyncMessage, parse_sync_message, encode_sync_message};
-pub use negentropy_sqlite::NegentropyStorageSqlite;
+pub use session::PeerCoord;
+pub use session_handler::ReplicationSessionHandler;
 
-use crate::crypto::EventId;
-use negentropy::Id;
+pub use crate::protocol::{
+    NegentropyStorageSqlite, SyncMessage, encode_sync_message, parse_sync_message,
+    neg_id_to_event_id, MSG_TYPE_DATA_DONE, MSG_TYPE_DONE, MSG_TYPE_DONE_ACK,
+    MSG_TYPE_EVENT, MSG_TYPE_HAVE_LIST, MSG_TYPE_INTRO_OFFER, MSG_TYPE_NEG_MSG,
+    MSG_TYPE_NEG_OPEN,
+};
 
-/// Convert negentropy Id to our EventId
-pub fn neg_id_to_event_id(id: &Id) -> EventId {
-    *id.as_bytes()
+pub mod protocol {
+    pub use crate::protocol::wire::*;
 }
 
-/// Sync message types
-pub const MSG_TYPE_NEG_OPEN: u8 = 0x10;   // Initial negentropy message
-pub const MSG_TYPE_NEG_MSG: u8 = 0x11;    // Negentropy response
-pub const MSG_TYPE_HAVE_LIST: u8 = 0x12;  // List of IDs client needs from server
-pub const MSG_TYPE_EVENT: u8 = 0x03;      // Event blob (variable length)
-pub const MSG_TYPE_DONE: u8 = 0x20;      // Initiator signals all events sent
-pub const MSG_TYPE_DONE_ACK: u8 = 0x21;  // Responder acknowledges done
-pub const MSG_TYPE_DATA_DONE: u8 = 0x22; // Sent on data stream: no more events will follow
-pub const MSG_TYPE_INTRO_OFFER: u8 = 0x30; // Intro offer for hole punching
+pub mod negentropy_sqlite {
+    pub use crate::protocol::negentropy_sqlite::*;
+}
+
+pub mod bootstrap {
+    pub use crate::protocol::bootstrap::*;
+}
+
+pub mod intro {
+    pub use crate::protocol::intro::*;
+}
+
+pub mod punch {
+    pub use crate::protocol::punch::*;
+}

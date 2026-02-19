@@ -16,7 +16,7 @@ use crate::contracts::network_contract::{
     next_session_id, PeerFingerprint, SessionDirection, SessionHandler, SessionMeta, TenantId,
 };
 use crate::db::{open_connection, schema::create_tables};
-use crate::replication::ReplicationSessionHandler;
+use crate::sync::ReplicationSessionHandler;
 
 use crate::transport::{
     create_dual_endpoint, peer_identity_from_connection, AllowedPeers, DualConnection,

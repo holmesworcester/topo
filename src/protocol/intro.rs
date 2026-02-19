@@ -7,8 +7,8 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 use tracing::{info, warn};
 
-use crate::sync::SyncMessage;
-use crate::sync::protocol::encode_sync_message;
+use crate::protocol::SyncMessage;
+use crate::protocol::wire::encode_sync_message;
 
 /// Build an IntroOffer message for `recipient` about `other_peer`.
 pub fn build_intro_offer(

@@ -20,7 +20,7 @@ use crate::db::{
     wanted::WantedEvents,
 };
 use crate::runtime::SyncStats;
-use crate::sync::{neg_id_to_event_id, NegentropyStorageSqlite, SyncMessage};
+use crate::protocol::{neg_id_to_event_id, NegentropyStorageSqlite, SyncMessage};
 use crate::transport::connection::ConnectionError;
 use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
 

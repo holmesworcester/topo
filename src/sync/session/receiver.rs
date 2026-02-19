@@ -11,7 +11,7 @@ use tracing::{info, warn};
 
 use crate::contracts::event_runtime_contract::IngestItem;
 use crate::crypto::hash_event;
-use crate::sync::SyncMessage;
+use crate::protocol::SyncMessage;
 use crate::transport::connection::ConnectionError;
 use crate::transport::StreamRecv;
 

@@ -8,7 +8,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use topo::contracts::network_contract::{SessionDirection, SessionHandler};
-use topo::replication::session_handler::ReplicationSessionHandler;
+use topo::sync::session_handler::ReplicationSessionHandler;
 use topo::sync::SyncMessage;
 
 use crate::fake_session_io::{

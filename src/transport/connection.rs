@@ -2,8 +2,8 @@ use async_trait::async_trait;
 use quinn::{RecvStream, SendStream};
 use tokio::io::AsyncWriteExt;
 
-use crate::sync::{encode_sync_message, parse_sync_message, SyncMessage};
-use crate::sync::protocol::ParseError;
+use crate::protocol::{encode_sync_message, parse_sync_message, SyncMessage};
+use crate::protocol::wire::ParseError;
 
 /// Max recv buffer size to prevent unbounded growth.
 /// 2 MiB normally, 512 KiB in low_mem mode.

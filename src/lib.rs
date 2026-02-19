@@ -11,6 +11,7 @@ pub mod invite_link;
 pub mod node;
 pub mod peering;
 pub mod projection;
+pub mod protocol;
 pub mod replication;
 pub mod rpc;
 pub mod runtime;

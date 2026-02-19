@@ -3,8 +3,8 @@ use async_trait::async_trait;
 use crate::contracts::network_contract::{
     ControlIo, DataRecvIo, DataSendIo, SessionIo, SessionIoError, SessionIoParts,
 };
-use crate::sync::protocol::ParseError;
-use crate::sync::{encode_sync_message, parse_sync_message, SyncMessage};
+use crate::protocol::wire::ParseError;
+use crate::protocol::{encode_sync_message, parse_sync_message, SyncMessage};
 use crate::transport::connection::ConnectionError;
 use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
 

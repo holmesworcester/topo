@@ -16,7 +16,7 @@ use crate::db::removal_watch::is_peer_removed;
 use crate::db::schema::create_tables;
 use crate::db::store::lookup_workspace_id;
 use crate::db::transport_trust::record_transport_binding;
-use crate::replication::ReplicationSessionHandler;
+use crate::sync::ReplicationSessionHandler;
 use crate::transport::{peer_identity_from_connection, DualConnection, SyncSessionIo};
 
 use super::{

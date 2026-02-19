@@ -20,9 +20,9 @@ use crate::event_modules::{
 use crate::transport_identity::{ensure_transport_peer_id, ensure_transport_cert};
 use crate::projection::create::{create_event_sync, create_event_staged, create_signed_event_sync, create_signed_event_staged, create_encrypted_event_sync, CreateEventError};
 use crate::projection::apply::project_one;
-use crate::sync::SyncMessage;
+use crate::protocol::SyncMessage;
 use crate::peering::loops::{accept_loop, connect_loop, download_from_sources, SYNC_SESSION_TIMEOUT_SECS};
-use crate::replication::session::run_sync_initiator_dual;
+use crate::sync::session::run_sync_initiator_dual;
 use crate::transport::{
     AllowedPeers,
     DualConnection,

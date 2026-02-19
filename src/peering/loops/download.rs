@@ -17,9 +17,9 @@ use crate::crypto::EventId;
 use crate::db::open_connection;
 use crate::db::schema::create_tables;
 use crate::db::store::lookup_workspace_id;
-use crate::replication::session::run_coordinator;
-use crate::replication::PeerCoord;
-use crate::replication::ReplicationSessionHandler;
+use crate::sync::session::run_coordinator;
+use crate::sync::PeerCoord;
+use crate::sync::ReplicationSessionHandler;
 use crate::transport::{peer_identity_from_connection, DualConnection, SyncSessionIo};
 
 use super::{

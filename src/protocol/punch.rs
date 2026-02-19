@@ -17,8 +17,8 @@ use crate::db::{
     open_connection,
 };
 use crate::contracts::network_contract::next_session_id;
-use crate::replication::ReplicationSessionHandler;
-use crate::sync::{parse_sync_message, SyncMessage};
+use crate::sync::ReplicationSessionHandler;
+use crate::protocol::{parse_sync_message, SyncMessage};
 use crate::transport::{
     peer_identity_from_connection, DualConnection, SqliteTrustOracle, SyncSessionIo,
 };
