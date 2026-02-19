@@ -325,11 +325,14 @@ pub fn resolve_user_event_id_for_signer(
     let signer_b64 = crate::crypto::event_id_to_base64(signer_eid);
     let user_eid_b64: String = db
         .query_row(
-            "SELECT user_event_id FROM peers_shared WHERE recorded_by = ?1 AND event_id = ?2",
+            "SELECT COALESCE(user_event_id, '') FROM peers_shared WHERE recorded_by = ?1 AND event_id = ?2",
             rusqlite::params![recorded_by, &signer_b64],
             |row| row.get(0),
         )
         .map_err(|_| ServiceError("no peer_shared entry found for signer — identity chain incomplete".into()))?;
+    if user_eid_b64.is_empty() {
+        return Err(ServiceError("peer_shared entry has no user_event_id (legacy row) — recreate database".into()));
+    }
     crate::crypto::event_id_from_base64(&user_eid_b64)
         .ok_or_else(|| ServiceError("invalid user_event_id in peers_shared".into()))
 }
@@ -1399,7 +1402,7 @@ pub fn svc_view_conn(
     let own_user_eid: String = if let Ok(Some((signer_eid, _))) = load_local_peer_signer(db, recorded_by) {
         let signer_b64 = crate::crypto::event_id_to_base64(&signer_eid);
         db.query_row(
-            "SELECT user_event_id FROM peers_shared WHERE recorded_by = ?1 AND event_id = ?2",
+            "SELECT COALESCE(user_event_id, '') FROM peers_shared WHERE recorded_by = ?1 AND event_id = ?2",
             rusqlite::params![recorded_by, &signer_b64],
             |row| row.get(0),
         ).unwrap_or_default()

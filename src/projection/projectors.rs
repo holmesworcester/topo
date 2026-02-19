@@ -20,11 +20,15 @@ fn verify_signer_user_match(
 
     let peer_user_eid: String = conn
         .query_row(
-            "SELECT user_event_id FROM peers_shared WHERE recorded_by = ?1 AND event_id = ?2",
+            "SELECT COALESCE(user_event_id, '') FROM peers_shared WHERE recorded_by = ?1 AND event_id = ?2",
             rusqlite::params![recorded_by, &signed_by_b64],
             |row| row.get(0),
         )
         .map_err(|_| format!("no peers_shared entry for signer {}", signed_by_b64))?;
+
+    if peer_user_eid.is_empty() {
+        return Err(format!("peers_shared entry for signer {} has no user_event_id (legacy row)", signed_by_b64));
+    }
 
     if peer_user_eid != author_id_b64 {
         return Err(format!(
