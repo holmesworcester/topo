@@ -102,8 +102,11 @@ async fn connect_loop_inner(
             crate::transport::multi_workspace::workspace_sni(&ws_id)
         }
     };
-    let initiator_handler =
-        ReplicationSessionHandler::initiator(db_path.to_string(), SYNC_SESSION_TIMEOUT_SECS, batch_writer_fn);
+    let initiator_handler = ReplicationSessionHandler::initiator(
+        db_path.to_string(),
+        SYNC_SESSION_TIMEOUT_SECS,
+        batch_writer_fn,
+    );
 
     loop {
         info!("Connecting to {}...", remote);

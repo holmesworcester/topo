@@ -5,10 +5,12 @@ use crate::contracts::event_runtime_contract::{
 };
 use crate::contracts::network_contract::{PeerFingerprint, TenantId};
 use crate::db::egress_queue::EgressQueue;
+use crate::db::open_connection;
 use crate::db::project_queue::ProjectQueue;
 use crate::db::schema::create_tables;
-use crate::db::store::{lookup_workspace_id, Store, SQL_INSERT_EVENT, SQL_INSERT_NEG_ITEM, SQL_INSERT_RECORDED_EVENT};
-use crate::db::open_connection;
+use crate::db::store::{
+    lookup_workspace_id, Store, SQL_INSERT_EVENT, SQL_INSERT_NEG_ITEM, SQL_INSERT_RECORDED_EVENT,
+};
 use crate::event_modules::{self as events, registry, ShareScope};
 
 const DEFAULT_EGRESS_LEASE_MS: i64 = 30_000;
@@ -34,7 +36,8 @@ impl IngestSink for SqliteIngestSink {
         blob: Vec<u8>,
     ) -> Result<(), IngestError> {
         let db = open_connection(&self.db_path).map_err(|_| IngestError::StoreUnavailable)?;
-        create_tables(&db).map_err(|e| IngestError::Internal(format!("schema init failed: {e}")))?;
+        create_tables(&db)
+            .map_err(|e| IngestError::Internal(format!("schema init failed: {e}")))?;
 
         let created_at_ms = events::extract_created_at_ms(&blob)
             .ok_or_else(|| IngestError::Invalid("missing created_at".to_string()))?;
@@ -116,11 +119,7 @@ impl SqliteReplicationStore {
 }
 
 impl ReplicationStore for SqliteReplicationStore {
-    fn enqueue_outbound(
-        &self,
-        peer: &PeerFingerprint,
-        ids: &[[u8; 32]],
-    ) -> Result<(), StoreError> {
+    fn enqueue_outbound(&self, peer: &PeerFingerprint, ids: &[[u8; 32]]) -> Result<(), StoreError> {
         let db = open_connection(&self.db_path).map_err(|_| StoreError::Unavailable)?;
         let queue = EgressQueue::new(&db);
         queue

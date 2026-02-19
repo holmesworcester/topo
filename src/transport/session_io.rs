@@ -412,7 +412,11 @@ mod tests {
         let mut frame = encode_sync_message(&SyncMessage::Done);
         frame.push(0);
 
-        let err = parts.control.send(&frame).await.expect_err("expected error");
+        let err = parts
+            .control
+            .send(&frame)
+            .await
+            .expect_err("expected error");
         assert!(matches!(err, SessionIoError::PeerViolation(_)));
     }
 
@@ -445,7 +449,11 @@ mod tests {
         let (mut parts, _control_state, _data_send_state) = build_io(vec![], vec![]);
         let oversized = vec![0u8; DEFAULT_SYNC_FRAME_MAX_BYTES + 1];
 
-        let err = parts.data_send.send(&oversized).await.expect_err("expected error");
+        let err = parts
+            .data_send
+            .send(&oversized)
+            .await
+            .expect_err("expected error");
         assert_eq!(
             err,
             SessionIoError::FrameTooLarge {

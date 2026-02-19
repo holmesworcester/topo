@@ -10,20 +10,14 @@ use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
-use crate::db::{
-    open_connection,
-    schema::create_tables,
-    transport_trust::is_peer_allowed,
-};
+use crate::db::{open_connection, schema::create_tables, transport_trust::is_peer_allowed};
 use crate::event_modules::{
-    DeviceInviteFirstEvent, InviteAcceptedEvent, ParsedEvent,
-    PeerSharedFirstEvent, UserBootEvent, UserInviteBootEvent,
-    WorkspaceEvent,
-    message, reaction, message_deletion, user_removed,
-    workspace, user, peer_shared, admin, transport_key,
+    admin, message, message_deletion, peer_shared, reaction, transport_key, user, user_removed,
+    workspace, DeviceInviteFirstEvent, InviteAcceptedEvent, ParsedEvent, PeerSharedFirstEvent,
+    UserBootEvent, UserInviteBootEvent, WorkspaceEvent,
 };
-use crate::projection::create::{create_event_sync, create_event_staged, create_signed_event_sync};
 use crate::projection::apply::project_one;
+use crate::projection::create::{create_event_staged, create_event_sync, create_signed_event_sync};
 use crate::transport::create_dual_endpoint_dynamic;
 use crate::transport_identity::{
     install_peer_key_transport_identity, load_transport_cert_required, load_transport_peer_id,
@@ -333,7 +327,9 @@ pub fn resolve_user_event_id_for_signer(
         )
         .map_err(|_| ServiceError("no peer_shared entry found for signer — identity chain incomplete".into()))?;
     if user_eid_b64.is_empty() {
-        return Err(ServiceError("peer_shared entry has no user_event_id (legacy row) — recreate database".into()));
+        return Err(ServiceError(
+            "peer_shared entry has no user_event_id (legacy row) — recreate database".into(),
+        ));
     }
     crate::crypto::event_id_from_base64(&user_eid_b64)
         .ok_or_else(|| ServiceError("invalid user_event_id in peers_shared".into()))
@@ -362,10 +358,7 @@ pub fn parse_hex_event_id(hex_str: &str) -> ServiceResult<[u8; 32]> {
     Ok(eid)
 }
 
-
-fn ensure_local_signer_tables(
-    db: &rusqlite::Connection,
-) -> ServiceResult<()> {
+fn ensure_local_signer_tables(db: &rusqlite::Connection) -> ServiceResult<()> {
     db.execute(
         "CREATE TABLE IF NOT EXISTS local_peer_signers (
             recorded_by TEXT PRIMARY KEY,
@@ -555,18 +548,17 @@ pub fn ensure_identity_chain(
         public_key: workspace_key.verifying_key().to_bytes(),
         name: workspace_name.to_string(),
     });
-    let ws_eid = create_event_staged(db, recorded_by, &ws)
-        .map_err(|e| ServiceError(format!("{}", e)))?;
+    let ws_eid =
+        create_event_staged(db, recorded_by, &ws).map_err(|e| ServiceError(format!("{}", e)))?;
 
     let ia = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
         created_at_ms: current_timestamp_ms(),
         invite_event_id: ws_eid,
         workspace_id: ws_eid,
     });
-    let _ia_eid = create_event_sync(db, recorded_by, &ia)
-        .map_err(|e| ServiceError(format!("{}", e)))?;
-    project_one(db, recorded_by, &ws_eid)
-        .map_err(|e| ServiceError(format!("{}", e)))?;
+    let _ia_eid =
+        create_event_sync(db, recorded_by, &ia).map_err(|e| ServiceError(format!("{}", e)))?;
+    project_one(db, recorded_by, &ws_eid).map_err(|e| ServiceError(format!("{}", e)))?;
 
     let invite_key = SigningKey::generate(&mut rng);
     let uib = ParsedEvent::UserInviteBoot(UserInviteBootEvent {
@@ -629,7 +621,8 @@ pub fn ensure_identity_chain(
         recorded_by,
         &peer_shared_key,
         &psf_eid,
-    ).map_err(|e| ServiceError(format!("failed to ensure content key: {}", e)))?;
+    )
+    .map_err(|e| ServiceError(format!("failed to ensure content key: {}", e)))?;
 
     // Persist workspace key for later invite creation
     persist_workspace_key(db, recorded_by, &workspace_key)?;
@@ -700,7 +693,11 @@ pub fn parse_predicate(s: &str) -> Result<(String, Op, i64), String> {
     Ok((field, op, value))
 }
 
-pub fn query_field(db: &rusqlite::Connection, field: &str, recorded_by: &str) -> Result<i64, String> {
+pub fn query_field(
+    db: &rusqlite::Connection,
+    field: &str,
+    recorded_by: &str,
+) -> Result<i64, String> {
     match field {
         "store_count" | "events_count" => db
             .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
@@ -733,11 +730,11 @@ pub fn query_field(db: &rusqlite::Connection, field: &str, recorded_by: &str) ->
             let event_id = &other["has_event:".len()..];
             let direct_count: i64 = db
                 .query_row(
-                "SELECT COUNT(*) FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
-                rusqlite::params![recorded_by, event_id],
-                |row| row.get(0),
-            )
-            .map_err(|e| format!("query failed: {}", e))?;
+                    "SELECT COUNT(*) FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
+                    rusqlite::params![recorded_by, event_id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("query failed: {}", e))?;
             if direct_count > 0 {
                 return Ok(direct_count);
             }
@@ -764,7 +761,12 @@ pub fn query_field(db: &rusqlite::Connection, field: &str, recorded_by: &str) ->
 // Service functions
 // ---------------------------------------------------------------------------
 
-pub fn svc_create_workspace(db_path: &str, workspace_name: &str, username: &str, device_name: &str) -> ServiceResult<CreateWorkspaceResponse> {
+pub fn svc_create_workspace(
+    db_path: &str,
+    workspace_name: &str,
+    username: &str,
+    device_name: &str,
+) -> ServiceResult<CreateWorkspaceResponse> {
     let conn = open_connection(db_path)?;
     create_tables(&conn)?;
 
@@ -782,7 +784,8 @@ pub fn svc_create_workspace(db_path: &str, workspace_name: &str, username: &str,
 
     // Bootstrap new identity chain (creates Workspace + 5 identity events)
     let bootstrap_rb = format!("bootstrap-{}", current_timestamp_ms());
-    let (_eid, peer_shared_key) = ensure_identity_chain(&conn, &bootstrap_rb, workspace_name, username, device_name)?;
+    let (_eid, peer_shared_key) =
+        ensure_identity_chain(&conn, &bootstrap_rb, workspace_name, username, device_name)?;
     let derived = install_peer_key_transport_identity(&conn, &peer_shared_key)
         .map_err(|e| ServiceError(format!("install transport identity failed: {}", e)))?;
     if derived != bootstrap_rb {
@@ -803,8 +806,7 @@ pub fn svc_create_workspace(db_path: &str, workspace_name: &str, username: &str,
 }
 
 pub fn svc_transport_identity(db_path: &str) -> ServiceResult<TransportIdentityResponse> {
-    let (fingerprint, _db) = open_db_load(db_path)
-        .map_err(|e| ServiceError(format!("{}", e)))?;
+    let (fingerprint, _db) = open_db_load(db_path).map_err(|e| ServiceError(format!("{}", e)))?;
     Ok(TransportIdentityResponse { fingerprint })
 }
 
@@ -822,7 +824,11 @@ pub fn svc_node_status(db_path: &str) -> ServiceResult<Vec<NodeTenantItem>> {
         .collect())
 }
 
-pub fn svc_messages_conn(db: &rusqlite::Connection, recorded_by: &str, limit: usize) -> ServiceResult<MessagesResponse> {
+pub fn svc_messages_conn(
+    db: &rusqlite::Connection,
+    recorded_by: &str,
+    limit: usize,
+) -> ServiceResult<MessagesResponse> {
     let rows = message::query_list(db, recorded_by, limit)?;
     let total = message::query_count(db, recorded_by)?;
 
@@ -856,13 +862,18 @@ pub fn svc_send_conn(
     content: &str,
 ) -> ServiceResult<SendResponse> {
     let eid = message::create(
-        db, recorded_by, signer_eid, signing_key, current_timestamp_ms(),
+        db,
+        recorded_by,
+        signer_eid,
+        signing_key,
+        current_timestamp_ms(),
         message::CreateMessageCmd {
             workspace_id,
             author_id,
             content: content.to_string(),
         },
-    ).map_err(|e| ServiceError(format!("{}", e)))?;
+    )
+    .map_err(|e| ServiceError(format!("{}", e)))?;
 
     Ok(SendResponse {
         content: content.to_string(),
@@ -882,10 +893,21 @@ pub fn svc_send_for_peer(
     let workspace_id = resolve_workspace_for_peer(&db, &recorded_by)?;
     let author_id = resolve_user_event_id_for_signer(&db, &recorded_by, &signer_eid)?;
 
-    svc_send_conn(&db, &recorded_by, &signer_eid, &signing_key, workspace_id, author_id, content)
+    svc_send_conn(
+        &db,
+        &recorded_by,
+        &signer_eid,
+        &signing_key,
+        workspace_id,
+        author_id,
+        content,
+    )
 }
 
-pub fn svc_status_conn(db: &rusqlite::Connection, recorded_by: &str) -> ServiceResult<StatusResponse> {
+pub fn svc_status_conn(
+    db: &rusqlite::Connection,
+    recorded_by: &str,
+) -> ServiceResult<StatusResponse> {
     let events_count: i64 = db
         .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
         .unwrap_or(0);
@@ -930,26 +952,27 @@ pub fn svc_generate_for_peer(
     db.execute("BEGIN", [])?;
     for i in 0..count {
         message::create(
-            &db, &recorded_by, &signer_eid, &signing_key, current_timestamp_ms(),
+            &db,
+            &recorded_by,
+            &signer_eid,
+            &signing_key,
+            current_timestamp_ms(),
             message::CreateMessageCmd {
                 workspace_id,
                 author_id,
                 content: format!("Message {}", i),
             },
-        ).map_err(|e| ServiceError(format!("create event error: {}", e)))?;
+        )
+        .map_err(|e| ServiceError(format!("create event error: {}", e)))?;
     }
     db.execute("COMMIT", [])?;
 
     Ok(GenerateResponse { count })
 }
 
-pub fn svc_assert_now(
-    db_path: &str,
-    predicate_str: &str,
-) -> ServiceResult<AssertResponse> {
+pub fn svc_assert_now(db_path: &str, predicate_str: &str) -> ServiceResult<AssertResponse> {
     let (recorded_by, db) = open_db_load(db_path)?;
-    let (field, op, expected) =
-        parse_predicate(predicate_str).map_err(ServiceError)?;
+    let (field, op, expected) = parse_predicate(predicate_str).map_err(ServiceError)?;
     let actual = query_field(&db, &field, &recorded_by).map_err(ServiceError)?;
 
     Ok(AssertResponse {
@@ -969,8 +992,7 @@ pub fn svc_assert_eventually(
     interval_ms: u64,
 ) -> ServiceResult<AssertResponse> {
     let (recorded_by, db) = open_db_load(db_path)?;
-    let (field, op, expected) =
-        parse_predicate(predicate_str).map_err(ServiceError)?;
+    let (field, op, expected) = parse_predicate(predicate_str).map_err(ServiceError)?;
     let start = Instant::now();
     let timeout = Duration::from_millis(timeout_ms);
     let interval = Duration::from_millis(interval_ms);
@@ -1011,13 +1033,18 @@ pub fn svc_react_conn(
     emoji: &str,
 ) -> ServiceResult<ReactResponse> {
     let eid = reaction::create(
-        db, recorded_by, signer_eid, signing_key, current_timestamp_ms(),
+        db,
+        recorded_by,
+        signer_eid,
+        signing_key,
+        current_timestamp_ms(),
         reaction::CreateReactionCmd {
             target_event_id,
             author_id,
             emoji: emoji.to_string(),
         },
-    ).map_err(|e| ServiceError(format!("{}", e)))?;
+    )
+    .map_err(|e| ServiceError(format!("{}", e)))?;
 
     Ok(ReactResponse {
         emoji: emoji.to_string(),
@@ -1034,11 +1061,19 @@ pub fn svc_react_for_peer(
     let (recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
 
     let (signer_eid, signing_key) = require_local_peer_signer(&db, &recorded_by)?;
-    let target_event_id = message::resolve_selector(&db, &recorded_by, target_hex)
-        .map_err(ServiceError)?;
+    let target_event_id =
+        message::resolve_selector(&db, &recorded_by, target_hex).map_err(ServiceError)?;
     let author_id = resolve_user_event_id_for_signer(&db, &recorded_by, &signer_eid)?;
 
-    svc_react_conn(&db, &recorded_by, &signer_eid, &signing_key, author_id, target_event_id, emoji)
+    svc_react_conn(
+        &db,
+        &recorded_by,
+        &signer_eid,
+        &signing_key,
+        author_id,
+        target_event_id,
+        emoji,
+    )
 }
 
 pub fn svc_delete_message_conn(
@@ -1050,12 +1085,17 @@ pub fn svc_delete_message_conn(
     target_event_id: [u8; 32],
 ) -> ServiceResult<DeleteResponse> {
     message_deletion::create(
-        db, recorded_by, signer_eid, signing_key, current_timestamp_ms(),
+        db,
+        recorded_by,
+        signer_eid,
+        signing_key,
+        current_timestamp_ms(),
         message_deletion::CreateMessageDeletionCmd {
             target_event_id,
             author_id,
         },
-    ).map_err(|e| ServiceError(format!("{}", e)))?;
+    )
+    .map_err(|e| ServiceError(format!("{}", e)))?;
 
     Ok(DeleteResponse {
         target: hex::encode(target_event_id),
@@ -1070,11 +1110,18 @@ pub fn svc_delete_message_for_peer(
     let (recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
 
     let (signer_eid, signing_key) = require_local_peer_signer(&db, &recorded_by)?;
-    let target_event_id = message::resolve_selector(&db, &recorded_by, target_hex)
-        .map_err(ServiceError)?;
+    let target_event_id =
+        message::resolve_selector(&db, &recorded_by, target_hex).map_err(ServiceError)?;
     let author_id = resolve_user_event_id_for_signer(&db, &recorded_by, &signer_eid)?;
 
-    svc_delete_message_conn(&db, &recorded_by, &signer_eid, &signing_key, author_id, target_event_id)
+    svc_delete_message_conn(
+        &db,
+        &recorded_by,
+        &signer_eid,
+        &signing_key,
+        author_id,
+        target_event_id,
+    )
 }
 
 /// Resolve a message selector: `N`, `#N` (1-based message number), or raw hex event ID.
@@ -1085,11 +1132,13 @@ fn resolve_message_selector(
     recorded_by: &str,
     selector: &str,
 ) -> ServiceResult<[u8; 32]> {
-    message::resolve_selector(db, recorded_by, selector)
-        .map_err(ServiceError)
+    message::resolve_selector(db, recorded_by, selector).map_err(ServiceError)
 }
 
-pub fn svc_reactions_conn(db: &rusqlite::Connection, recorded_by: &str) -> ServiceResult<Vec<ReactionItem>> {
+pub fn svc_reactions_conn(
+    db: &rusqlite::Connection,
+    recorded_by: &str,
+) -> ServiceResult<Vec<ReactionItem>> {
     let rows = reaction::query_list(db, recorded_by)?;
     Ok(rows
         .into_iter()
@@ -1112,7 +1161,11 @@ pub fn svc_reactions_for_message_conn(
     recorded_by: &str,
     target_event_id_b64: &str,
 ) -> ServiceResult<Vec<String>> {
-    Ok(reaction::query_for_message(db, recorded_by, target_event_id_b64)?)
+    Ok(reaction::query_for_message(
+        db,
+        recorded_by,
+        target_event_id_b64,
+    )?)
 }
 
 /// Return base64 event IDs of deleted messages for a tenant.
@@ -1129,8 +1182,7 @@ pub fn svc_message_event_id_by_num_conn(
     recorded_by: &str,
     msg_num: usize,
 ) -> ServiceResult<crate::crypto::EventId> {
-    message::resolve_by_number(db, recorded_by, msg_num)
-        .map_err(ServiceError)
+    message::resolve_by_number(db, recorded_by, msg_num).map_err(ServiceError)
 }
 
 /// Remove a user by creating a UserRemoved event.
@@ -1142,9 +1194,14 @@ pub fn svc_remove_user_conn(
     target_event_id: crate::crypto::EventId,
 ) -> ServiceResult<DeleteResponse> {
     user_removed::create(
-        db, recorded_by, signer_eid, signing_key, current_timestamp_ms(),
+        db,
+        recorded_by,
+        signer_eid,
+        signing_key,
+        current_timestamp_ms(),
         user_removed::CreateUserRemovedCmd { target_event_id },
-    ).map_err(|e| ServiceError(format!("{}", e)))?;
+    )
+    .map_err(|e| ServiceError(format!("{}", e)))?;
 
     Ok(DeleteResponse {
         target: hex::encode(target_event_id),
@@ -1163,27 +1220,39 @@ pub fn svc_create_invite_conn(
     bootstrap_spki: &[u8; 32],
 ) -> ServiceResult<CreateInviteResponse> {
     let _ = crate::identity_ops::ensure_content_key_for_peer(
-        db, recorded_by, peer_shared_key, peer_shared_event_id,
-    ).map_err(|e| ServiceError(format!("Failed to ensure content key: {}", e)))?;
+        db,
+        recorded_by,
+        peer_shared_key,
+        peer_shared_event_id,
+    )
+    .map_err(|e| ServiceError(format!("Failed to ensure content key: {}", e)))?;
 
     let invite = crate::identity_ops::create_user_invite(
-        db, recorded_by, workspace_key, workspace_id,
-        Some(peer_shared_key), Some(peer_shared_event_id),
-    ).map_err(|e| ServiceError(format!("Failed to create invite: {}", e)))?;
+        db,
+        recorded_by,
+        workspace_key,
+        workspace_id,
+        Some(peer_shared_key),
+        Some(peer_shared_event_id),
+    )
+    .map_err(|e| ServiceError(format!("Failed to create invite: {}", e)))?;
 
     let pending_spki = crate::transport_identity::expected_invite_bootstrap_spki_from_invite_key(
         &invite.invite_key,
-    ).map_err(|e| ServiceError(format!("Failed to derive invite SPKI: {}", e)))?;
+    )
+    .map_err(|e| ServiceError(format!("Failed to derive invite SPKI: {}", e)))?;
 
     crate::db::transport_trust::record_pending_invite_bootstrap_trust(
-        db, recorded_by,
+        db,
+        recorded_by,
         &event_id_to_base64(&invite.invite_event_id),
         &event_id_to_base64(workspace_id),
         &pending_spki,
     )?;
 
-    let invite_link = crate::invite_link::create_invite_link(&invite, bootstrap_addr, bootstrap_spki)
-        .map_err(|e| ServiceError(format!("Failed to create invite link: {}", e)))?;
+    let invite_link =
+        crate::invite_link::create_invite_link(&invite, bootstrap_addr, bootstrap_spki)
+            .map_err(|e| ServiceError(format!("Failed to create invite link: {}", e)))?;
 
     Ok(CreateInviteResponse {
         invite_link,
@@ -1202,22 +1271,30 @@ pub fn svc_create_device_link_invite_conn(
     bootstrap_spki: &[u8; 32],
 ) -> ServiceResult<CreateInviteResponse> {
     let invite = crate::identity_ops::create_device_link_invite(
-        db, recorded_by, user_key, user_event_id, workspace_id,
-    ).map_err(|e| ServiceError(format!("Failed to create device link invite: {}", e)))?;
+        db,
+        recorded_by,
+        user_key,
+        user_event_id,
+        workspace_id,
+    )
+    .map_err(|e| ServiceError(format!("Failed to create device link invite: {}", e)))?;
 
     let pending_spki = crate::transport_identity::expected_invite_bootstrap_spki_from_invite_key(
         &invite.invite_key,
-    ).map_err(|e| ServiceError(format!("Failed to derive invite SPKI: {}", e)))?;
+    )
+    .map_err(|e| ServiceError(format!("Failed to derive invite SPKI: {}", e)))?;
 
     crate::db::transport_trust::record_pending_invite_bootstrap_trust(
-        db, recorded_by,
+        db,
+        recorded_by,
         &event_id_to_base64(&invite.invite_event_id),
         &event_id_to_base64(workspace_id),
         &pending_spki,
     )?;
 
-    let invite_link = crate::invite_link::create_invite_link(&invite, bootstrap_addr, bootstrap_spki)
-        .map_err(|e| ServiceError(format!("Failed to create invite link: {}", e)))?;
+    let invite_link =
+        crate::invite_link::create_invite_link(&invite, bootstrap_addr, bootstrap_spki)
+            .map_err(|e| ServiceError(format!("Failed to create invite link: {}", e)))?;
 
     Ok(CreateInviteResponse {
         invite_link,
@@ -1225,11 +1302,17 @@ pub fn svc_create_device_link_invite_conn(
     })
 }
 
-pub fn svc_users_conn(db: &rusqlite::Connection, recorded_by: &str) -> ServiceResult<Vec<UserItem>> {
+pub fn svc_users_conn(
+    db: &rusqlite::Connection,
+    recorded_by: &str,
+) -> ServiceResult<Vec<UserItem>> {
     let rows = user::query_list(db, recorded_by)?;
     Ok(rows
         .into_iter()
-        .map(|row| UserItem { event_id: row.event_id, username: row.username })
+        .map(|row| UserItem {
+            event_id: row.event_id,
+            username: row.username,
+        })
         .collect())
 }
 
@@ -1256,7 +1339,9 @@ pub fn svc_view_conn(
     let users = svc_users_conn(db, recorded_by)?;
 
     // Own user_event_id (for marking "you") — look up via local signer
-    let own_user_eid: String = if let Ok(Some((signer_eid, _))) = load_local_peer_signer(db, recorded_by) {
+    let own_user_eid: String = if let Ok(Some((signer_eid, _))) =
+        load_local_peer_signer(db, recorded_by)
+    {
         let signer_b64 = crate::crypto::event_id_to_base64(&signer_eid);
         db.query_row(
             "SELECT COALESCE(user_event_id, '') FROM peers_shared WHERE recorded_by = ?1 AND event_id = ?2",
@@ -1273,7 +1358,7 @@ pub fn svc_view_conn(
                 COALESCE(u.username, '')
          FROM peers_shared ps
          LEFT JOIN users u ON ps.user_event_id = u.event_id AND ps.recorded_by = u.recorded_by
-         WHERE ps.recorded_by = ?1"
+         WHERE ps.recorded_by = ?1",
     )?;
     let accounts: Vec<AccountItem> = acct_stmt
         .query_map(rusqlite::params![recorded_by], |row| {
@@ -1297,7 +1382,7 @@ pub fn svc_view_conn(
             "SELECT r.emoji, COALESCE(u.username, '') as reactor_name
              FROM reactions r
              LEFT JOIN users u ON r.author_id = u.event_id AND r.recorded_by = u.recorded_by
-             WHERE r.target_event_id = ?1 AND r.recorded_by = ?2"
+             WHERE r.target_event_id = ?1 AND r.recorded_by = ?2",
         )?;
         let reactions: Vec<ViewReaction> = rxn_stmt
             .query_map(rusqlite::params![&msg.id_b64, recorded_by], |row| {
@@ -1332,12 +1417,20 @@ pub fn svc_view(db_path: &str, limit: usize) -> ServiceResult<ViewResponse> {
     svc_view_conn(&db, &recorded_by, limit)
 }
 
-pub fn svc_view_for_peer(db_path: &str, peer_id: &str, limit: usize) -> ServiceResult<ViewResponse> {
+pub fn svc_view_for_peer(
+    db_path: &str,
+    peer_id: &str,
+    limit: usize,
+) -> ServiceResult<ViewResponse> {
     let (recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
     svc_view_conn(&db, &recorded_by, limit)
 }
 
-pub fn svc_keys_conn(db: &rusqlite::Connection, recorded_by: &str, summary: bool) -> ServiceResult<KeysResponse> {
+pub fn svc_keys_conn(
+    db: &rusqlite::Connection,
+    recorded_by: &str,
+    summary: bool,
+) -> ServiceResult<KeysResponse> {
     let user_count = user::query_count(db, recorded_by).unwrap_or(0);
     let peer_count = peer_shared::query_count(db, recorded_by).unwrap_or(0);
     let admin_count = admin::query_count(db, recorded_by).unwrap_or(0);
@@ -1384,21 +1477,25 @@ pub fn svc_keys(db_path: &str, summary: bool) -> ServiceResult<KeysResponse> {
     svc_keys_conn(&db, &recorded_by, summary)
 }
 
-pub fn svc_workspaces_conn(db: &rusqlite::Connection, recorded_by: &str) -> ServiceResult<Vec<WorkspaceItem>> {
+pub fn svc_workspaces_conn(
+    db: &rusqlite::Connection,
+    recorded_by: &str,
+) -> ServiceResult<Vec<WorkspaceItem>> {
     let rows = workspace::query_list(db, recorded_by)?;
 
     use base64::Engine;
     Ok(rows
         .into_iter()
         .map(|row| {
-            let name =
-                if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&row.workspace_id) {
-                    String::from_utf8_lossy(&bytes)
-                        .trim_end_matches('\0')
-                        .to_string()
-                } else {
-                    row.workspace_id.clone()
-                };
+            let name = if let Ok(bytes) =
+                base64::engine::general_purpose::STANDARD.decode(&row.workspace_id)
+            {
+                String::from_utf8_lossy(&bytes)
+                    .trim_end_matches('\0')
+                    .to_string()
+            } else {
+                row.workspace_id.clone()
+            };
             WorkspaceItem {
                 event_id: row.event_id,
                 workspace_id: row.workspace_id,
@@ -1456,7 +1553,8 @@ pub async fn svc_intro(
         let db = open_connection(&db_path_for_lookup)?;
         is_peer_allowed(&db, &recorded_by_for_lookup, peer_fp)
     });
-    let endpoint = create_dual_endpoint_dynamic("0.0.0.0:0".parse().unwrap(), cert, key, dynamic_allow)?;
+    let endpoint =
+        create_dual_endpoint_dynamic("0.0.0.0:0".parse().unwrap(), cert, key, dynamic_allow)?;
 
     let result = crate::protocol::intro::run_intro(
         &endpoint,
@@ -1477,7 +1575,10 @@ pub async fn svc_intro(
     } else {
         let errors: Vec<String> = result.errors.iter().map(|e| e.to_string()).collect();
         if !result.sent_to_a && !result.sent_to_b {
-            Err(ServiceError(format!("Failed to send to both peers: {}", errors.join("; "))))
+            Err(ServiceError(format!(
+                "Failed to send to both peers: {}",
+                errors.join("; ")
+            )))
         } else {
             Err(ServiceError(format!("Partial send: {}", errors.join("; "))))
         }
@@ -1496,8 +1597,8 @@ pub fn svc_create_invite(
     db_path: &str,
     bootstrap_addr: &str,
 ) -> ServiceResult<CreateInviteResponse> {
-    let (recorded_by, db) = open_db_load(db_path)
-        .map_err(|e| ServiceError(format!("No transport identity: {}", e)))?;
+    let (recorded_by, db) =
+        open_db_load(db_path).map_err(|e| ServiceError(format!("No transport identity: {}", e)))?;
 
     // Load workspace key from local_peer_signers + workspace lookup
     let workspace_id = db
@@ -1525,7 +1626,11 @@ pub fn svc_create_invite(
             [&recorded_by],
             |row| row.get(0),
         )
-        .map_err(|_| ServiceError("No workspace signing key found. Only workspace creators can invite.".into()))?;
+        .map_err(|_| {
+            ServiceError(
+                "No workspace signing key found. Only workspace creators can invite.".into(),
+            )
+        })?;
 
     if ws_key_bytes.len() != 32 {
         return Err(ServiceError("Corrupt workspace key".into()));
@@ -1573,8 +1678,9 @@ pub fn svc_create_invite(
     let mut bootstrap_spki = [0u8; 32];
     bootstrap_spki.copy_from_slice(&spki_bytes);
 
-    let invite_link = crate::invite_link::create_invite_link(&invite, bootstrap_addr, &bootstrap_spki)
-        .map_err(|e| ServiceError(format!("Failed to create invite link: {}", e)))?;
+    let invite_link =
+        crate::invite_link::create_invite_link(&invite, bootstrap_addr, &bootstrap_spki)
+            .map_err(|e| ServiceError(format!("Failed to create invite link: {}", e)))?;
 
     Ok(CreateInviteResponse {
         invite_link,
@@ -1599,7 +1705,9 @@ pub async fn svc_accept_invite(
         .map_err(|e| ServiceError(format!("Invalid invite link: {}", e)))?;
 
     if invite.kind != crate::invite_link::InviteLinkKind::User {
-        return Err(ServiceError("Expected a user invite link (quiet://invite/...)".into()));
+        return Err(ServiceError(
+            "Expected a user invite link (quiet://invite/...)".into(),
+        ));
     }
 
     let invite_key = invite.invite_signing_key();
@@ -1649,7 +1757,8 @@ pub async fn svc_accept_invite(
 
     if !ws_exists {
         return Err(ServiceError(
-            "Bootstrap sync did not deliver workspace event. Ensure the inviter is running sync.".into(),
+            "Bootstrap sync did not deliver workspace event. Ensure the inviter is running sync."
+                .into(),
         ));
     }
 
@@ -1707,11 +1816,14 @@ pub async fn svc_accept_invite(
 
     // Transition transport identity: replace invite-derived cert with
     // PeerShared-derived cert so transport and event-layer identities match.
-    let new_peer_id = crate::transport_identity::install_peer_key_transport_identity(
-        &db,
-        &join.peer_shared_key,
-    )
-    .map_err(|e| ServiceError(format!("Failed to install peer key transport identity: {}", e)))?;
+    let new_peer_id =
+        crate::transport_identity::install_peer_key_transport_identity(&db, &join.peer_shared_key)
+            .map_err(|e| {
+                ServiceError(format!(
+                    "Failed to install peer key transport identity: {}",
+                    e
+                ))
+            })?;
     crate::db::migrate_recorded_by(&db, &recorded_by, &new_peer_id)?;
 
     Ok(AcceptInviteResponse {
@@ -1738,7 +1850,9 @@ pub async fn svc_accept_device_link(
         .map_err(|e| ServiceError(format!("Invalid invite link: {}", e)))?;
 
     if invite.kind != crate::invite_link::InviteLinkKind::DeviceLink {
-        return Err(ServiceError("Expected a device link (quiet://link/...)".into()));
+        return Err(ServiceError(
+            "Expected a device link (quiet://link/...)".into(),
+        ));
     }
 
     let invite_key = invite.invite_signing_key();
@@ -1824,11 +1938,14 @@ pub async fn svc_accept_device_link(
 
     // Transition transport identity: replace invite-derived cert with
     // PeerShared-derived cert so transport and event-layer identities match.
-    let new_peer_id = crate::transport_identity::install_peer_key_transport_identity(
-        &db,
-        &link.peer_shared_key,
-    )
-    .map_err(|e| ServiceError(format!("Failed to install peer key transport identity: {}", e)))?;
+    let new_peer_id =
+        crate::transport_identity::install_peer_key_transport_identity(&db, &link.peer_shared_key)
+            .map_err(|e| {
+                ServiceError(format!(
+                    "Failed to install peer key transport identity: {}",
+                    e
+                ))
+            })?;
     crate::db::migrate_recorded_by(&db, &recorded_by, &new_peer_id)?;
 
     Ok(AcceptDeviceLinkResponse {
@@ -1896,8 +2013,8 @@ pub fn svc_create_invite_with_spki(
     public_addr: &str,
     public_spki_hex: &str,
 ) -> ServiceResult<CreateInviteResponse> {
-    let (recorded_by, db) = open_db_load(db_path)
-        .map_err(|e| ServiceError(format!("No transport identity: {}", e)))?;
+    let (recorded_by, db) =
+        open_db_load(db_path).map_err(|e| ServiceError(format!("No transport identity: {}", e)))?;
 
     let workspace_id = db
         .query_row(
@@ -1959,8 +2076,12 @@ pub fn svc_create_device_link_for_peer(
     let (_recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
 
     // Load user key from local_user_keys
-    let (user_event_id, user_key) = load_local_user_key(&db, peer_id)?
-        .ok_or_else(|| ServiceError("No local user key found. Only workspace creators/inviters can create device links.".into()))?;
+    let (user_event_id, user_key) = load_local_user_key(&db, peer_id)?.ok_or_else(|| {
+        ServiceError(
+            "No local user key found. Only workspace creators/inviters can create device links."
+                .into(),
+        )
+    })?;
 
     let workspace_id = resolve_workspace_for_peer(&db, peer_id)?;
 
@@ -2045,10 +2166,7 @@ pub fn svc_ban_for_peer(
 }
 
 /// Get combined identity info for a specific peer.
-pub fn svc_identity_for_peer(
-    db_path: &str,
-    peer_id: &str,
-) -> ServiceResult<IdentityResponse> {
+pub fn svc_identity_for_peer(db_path: &str, peer_id: &str) -> ServiceResult<IdentityResponse> {
     let (_recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
 
     // User event ID from users table
@@ -2104,7 +2222,8 @@ mod tests {
     }
 
     fn setup_workspace(db_path: &str) -> String {
-        let resp = svc_create_workspace(db_path, "test-workspace", "test-user", "test-device").unwrap();
+        let resp =
+            svc_create_workspace(db_path, "test-workspace", "test-user", "test-device").unwrap();
         resp.peer_id
     }
 
@@ -2126,7 +2245,11 @@ mod tests {
         // React to a non-existent target — reaction will block on missing dep
         let fake_target = hex::encode([0xDD_u8; 32]);
         let result = svc_react_for_peer(&db_path, &peer_id, &fake_target, "thumbsup");
-        assert!(result.is_err(), "reaction to missing target should error, got: {:?}", result);
+        assert!(
+            result.is_err(),
+            "reaction to missing target should error, got: {:?}",
+            result
+        );
     }
 
     #[test]
@@ -2138,7 +2261,11 @@ mod tests {
         // (intent-only path for delete-before-create convergence)
         let fake_target = hex::encode([0xEE_u8; 32]);
         let result = svc_delete_message_for_peer(&db_path, &peer_id, &fake_target);
-        assert!(result.is_ok(), "delete of missing target writes intent: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "delete of missing target writes intent: {:?}",
+            result
+        );
     }
 
     #[test]
@@ -2169,7 +2296,11 @@ mod tests {
 
         // Invalid index.
         let err = resolve_message_selector(&db, &recorded_by, "99").unwrap_err();
-        assert!(err.to_string().contains("invalid message number"), "{}", err);
+        assert!(
+            err.to_string().contains("invalid message number"),
+            "{}",
+            err
+        );
 
         // Zero index.
         let err = resolve_message_selector(&db, &recorded_by, "0").unwrap_err();
@@ -2182,12 +2313,14 @@ mod tests {
         // ensure_identity_chain must handle this via staged API.
         // svc_create_workspace exercises this path.
         let (_dir, db_path) = temp_db_path();
-        let resp = svc_create_workspace(&db_path, "test-workspace", "test-user", "test-device").unwrap();
+        let resp =
+            svc_create_workspace(&db_path, "test-workspace", "test-user", "test-device").unwrap();
         assert!(!resp.peer_id.is_empty());
         assert!(!resp.workspace_id.is_empty());
 
         // Calling again should be idempotent (returns existing workspace).
-        let resp2 = svc_create_workspace(&db_path, "test-workspace", "test-user", "test-device").unwrap();
+        let resp2 =
+            svc_create_workspace(&db_path, "test-workspace", "test-user", "test-device").unwrap();
         assert_eq!(resp.peer_id, resp2.peer_id);
         assert_eq!(resp.workspace_id, resp2.workspace_id);
     }

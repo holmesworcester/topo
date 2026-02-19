@@ -21,9 +21,9 @@ pub use download::download_from_sources;
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio_util::sync::CancellationToken;
 use crate::db::open_connection;
 use crate::db::removal_watch::is_peer_removed;
+use tokio_util::sync::CancellationToken;
 
 // ---------------------------------------------------------------------------
 // Types

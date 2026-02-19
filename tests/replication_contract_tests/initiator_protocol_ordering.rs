@@ -8,12 +8,12 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use topo::contracts::network_contract::{SessionDirection, SessionHandler};
-use topo::sync::session_handler::ReplicationSessionHandler;
 use topo::protocol::SyncMessage;
+use topo::sync::session_handler::ReplicationSessionHandler;
 
 use crate::fake_session_io::{
-    create_test_db, empty_negentropy_storage, fake_session_io_pair, noop_batch_writer,
-    run_local, test_session_meta, FakePeerSide,
+    create_test_db, empty_negentropy_storage, fake_session_io_pair, noop_batch_writer, run_local,
+    test_session_meta, FakePeerSide,
 };
 
 /// Drive the responder side of an empty-DB sync from the test harness.
@@ -53,11 +53,8 @@ async fn drive_empty_responder(peer: &mut FakePeerSide) {
     // 3. Respond with NegMsg to complete reconciliation.
     if let SyncMessage::NegOpen { msg } = neg_open {
         let storage = empty_negentropy_storage();
-        let mut neg = negentropy::Negentropy::new(
-            negentropy::Storage::Borrowed(&storage),
-            0,
-        )
-        .unwrap();
+        let mut neg =
+            negentropy::Negentropy::new(negentropy::Storage::Borrowed(&storage), 0).unwrap();
         let response = neg.reconcile(&msg).unwrap();
         peer.send_control_msg(&SyncMessage::NegMsg { msg: response })
             .await;
@@ -85,8 +82,7 @@ async fn drive_empty_responder(peer: &mut FakePeerSide) {
 async fn initiator_outbound_sends_markers_then_negopen_then_done_sequence() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
-        let handler =
-            ReplicationSessionHandler::initiator(db_path, 30, noop_batch_writer);
+        let handler = ReplicationSessionHandler::initiator(db_path, 30, noop_batch_writer);
         let meta = test_session_meta(SessionDirection::Outbound);
         let cancel = CancellationToken::new();
 
@@ -94,11 +90,7 @@ async fn initiator_outbound_sends_markers_then_negopen_then_done_sequence() {
 
         let handler_task = tokio::task::spawn_local({
             let cancel = cancel.clone();
-            async move {
-                handler
-                    .on_session(meta, Box::new(fake_io), cancel)
-                    .await
-            }
+            async move { handler.on_session(meta, Box::new(fake_io), cancel).await }
         });
 
         drive_empty_responder(&mut peer).await;
@@ -119,8 +111,7 @@ async fn initiator_outbound_sends_markers_then_negopen_then_done_sequence() {
 async fn anticheat_markers_precede_negopen() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
-        let handler =
-            ReplicationSessionHandler::initiator(db_path, 30, noop_batch_writer);
+        let handler = ReplicationSessionHandler::initiator(db_path, 30, noop_batch_writer);
         let meta = test_session_meta(SessionDirection::Outbound);
         let cancel = CancellationToken::new();
 
@@ -157,8 +148,7 @@ async fn anticheat_markers_precede_negopen() {
 async fn anticheat_datadone_before_done() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
-        let handler =
-            ReplicationSessionHandler::initiator(db_path, 30, noop_batch_writer);
+        let handler = ReplicationSessionHandler::initiator(db_path, 30, noop_batch_writer);
         let meta = test_session_meta(SessionDirection::Outbound);
         let cancel = CancellationToken::new();
 
@@ -182,11 +172,8 @@ async fn anticheat_datadone_before_done() {
             .unwrap();
         if let SyncMessage::NegOpen { msg } = neg_open {
             let storage = empty_negentropy_storage();
-            let mut neg = negentropy::Negentropy::new(
-                negentropy::Storage::Borrowed(&storage),
-                0,
-            )
-            .unwrap();
+            let mut neg =
+                negentropy::Negentropy::new(negentropy::Storage::Borrowed(&storage), 0).unwrap();
             let response = neg.reconcile(&msg).unwrap();
             peer.send_control_msg(&SyncMessage::NegMsg { msg: response })
                 .await;
@@ -227,16 +214,13 @@ async fn anticheat_datadone_before_done() {
 async fn initiator_rejects_inbound_direction() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
-        let handler =
-            ReplicationSessionHandler::initiator(db_path, 30, noop_batch_writer);
+        let handler = ReplicationSessionHandler::initiator(db_path, 30, noop_batch_writer);
         let meta = test_session_meta(SessionDirection::Inbound);
         let cancel = CancellationToken::new();
 
         let (fake_io, _peer) = fake_session_io_pair(meta.session_id);
 
-        let result = handler
-            .on_session(meta, Box::new(fake_io), cancel)
-            .await;
+        let result = handler.on_session(meta, Box::new(fake_io), cancel).await;
         assert!(result.is_err());
         assert!(
             result

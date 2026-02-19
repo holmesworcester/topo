@@ -1,12 +1,12 @@
-use super::fixed_layout::{self, WORKSPACE_WIRE_SIZE, NAME_BYTES, workspace_offsets as off};
+use super::fixed_layout::{self, workspace_offsets as off, NAME_BYTES, WORKSPACE_WIRE_SIZE};
 use super::registry::{EventTypeMeta, ShareScope};
 use super::{EventError, ParsedEvent, EVENT_TYPE_WORKSPACE};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceEvent {
     pub created_at_ms: u64,
-    pub public_key: [u8; 32],  // Ed25519 verifying key for the workspace
-    pub name: String,           // Workspace display name (64-byte text slot)
+    pub public_key: [u8; 32], // Ed25519 verifying key for the workspace
+    pub name: String,         // Workspace display name (64-byte text slot)
 }
 
 /// Wire format (105 bytes fixed):
@@ -34,7 +34,8 @@ pub fn parse_workspace(blob: &[u8]) -> Result<ParsedEvent, EventError> {
         });
     }
 
-    let created_at_ms = u64::from_le_bytes(blob[off::CREATED_AT..off::PUBLIC_KEY].try_into().unwrap());
+    let created_at_ms =
+        u64::from_le_bytes(blob[off::CREATED_AT..off::PUBLIC_KEY].try_into().unwrap());
 
     let mut public_key = [0u8; 32];
     public_key.copy_from_slice(&blob[off::PUBLIC_KEY..off::NAME]);

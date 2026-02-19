@@ -1,10 +1,12 @@
 use rusqlite::Connection;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::crypto::{hash_event, event_id_to_base64, EventId};
-use crate::db::store::{insert_event, insert_neg_item_if_shared, insert_recorded_event, lookup_workspace_id};
-use crate::event_modules::{self as events, ParsedEvent, registry};
 use super::apply::project_one;
+use crate::crypto::{event_id_to_base64, hash_event, EventId};
+use crate::db::store::{
+    insert_event, insert_neg_item_if_shared, insert_recorded_event, lookup_workspace_id,
+};
+use crate::event_modules::{self as events, registry, ParsedEvent};
 
 /// Emit a deterministic event: compute blob, hash to event_id, check if already
 /// exists, if not: store in events/neg_items/recorded_events and project via project_one.
@@ -17,14 +19,14 @@ pub fn emit_deterministic_event(
     recorded_by: &str,
     event: &ParsedEvent,
 ) -> Result<EventId, Box<dyn std::error::Error>> {
-    let blob = events::encode_event(event)
-        .map_err(|e| format!("encode error: {}", e))?;
+    let blob = events::encode_event(event).map_err(|e| format!("encode error: {}", e))?;
 
     let event_id = hash_event(&blob);
     let event_id_b64 = event_id_to_base64(&event_id);
 
     let type_code = event.event_type_code();
-    let meta = registry().lookup(type_code)
+    let meta = registry()
+        .lookup(type_code)
         .ok_or_else(|| format!("unknown type code {}", type_code))?;
 
     let created_at_ms = event.created_at_ms() as i64;

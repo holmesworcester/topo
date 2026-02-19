@@ -1,4 +1,4 @@
-use super::fixed_layout::{self, USER_WIRE_SIZE, NAME_BYTES, user_offsets as off};
+use super::fixed_layout::{self, user_offsets as off, NAME_BYTES, USER_WIRE_SIZE};
 use super::registry::{EventTypeMeta, ShareScope};
 use super::{EventError, ParsedEvent, EVENT_TYPE_USER_BOOT, EVENT_TYPE_USER_ONGOING};
 
@@ -6,9 +6,9 @@ use super::{EventError, ParsedEvent, EVENT_TYPE_USER_BOOT, EVENT_TYPE_USER_ONGOI
 pub struct UserBootEvent {
     pub created_at_ms: u64,
     pub public_key: [u8; 32],
-    pub username: String,        // Display name (64-byte text slot)
-    pub signed_by: [u8; 32],     // signer event_id (UserInviteBoot event)
-    pub signer_type: u8,         // 2 = user_invite
+    pub username: String,    // Display name (64-byte text slot)
+    pub signed_by: [u8; 32], // signer event_id (UserInviteBoot event)
+    pub signer_type: u8,     // 2 = user_invite
     pub signature: [u8; 64],
 }
 
@@ -16,9 +16,9 @@ pub struct UserBootEvent {
 pub struct UserOngoingEvent {
     pub created_at_ms: u64,
     pub public_key: [u8; 32],
-    pub username: String,        // Display name (64-byte text slot)
-    pub signed_by: [u8; 32],     // signer event_id (UserInviteOngoing event)
-    pub signer_type: u8,         // 2 = user_invite
+    pub username: String,    // Display name (64-byte text slot)
+    pub signed_by: [u8; 32], // signer event_id (UserInviteOngoing event)
+    pub signer_type: u8,     // 2 = user_invite
     pub signature: [u8; 64],
 }
 
@@ -32,16 +32,26 @@ pub struct UserOngoingEvent {
 /// [138..202]   signature (64 bytes)
 pub fn parse_user_boot(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if blob.len() < USER_WIRE_SIZE {
-        return Err(EventError::TooShort { expected: USER_WIRE_SIZE, actual: blob.len() });
+        return Err(EventError::TooShort {
+            expected: USER_WIRE_SIZE,
+            actual: blob.len(),
+        });
     }
     if blob.len() > USER_WIRE_SIZE {
-        return Err(EventError::TrailingData { expected: USER_WIRE_SIZE, actual: blob.len() });
+        return Err(EventError::TrailingData {
+            expected: USER_WIRE_SIZE,
+            actual: blob.len(),
+        });
     }
     if blob[0] != EVENT_TYPE_USER_BOOT {
-        return Err(EventError::WrongType { expected: EVENT_TYPE_USER_BOOT, actual: blob[0] });
+        return Err(EventError::WrongType {
+            expected: EVENT_TYPE_USER_BOOT,
+            actual: blob[0],
+        });
     }
 
-    let created_at_ms = u64::from_le_bytes(blob[off::CREATED_AT..off::PUBLIC_KEY].try_into().unwrap());
+    let created_at_ms =
+        u64::from_le_bytes(blob[off::CREATED_AT..off::PUBLIC_KEY].try_into().unwrap());
     let mut public_key = [0u8; 32];
     public_key.copy_from_slice(&blob[off::PUBLIC_KEY..off::USERNAME]);
 
@@ -73,8 +83,11 @@ pub fn encode_user_boot(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     buf[off::TYPE_CODE] = EVENT_TYPE_USER_BOOT;
     buf[off::CREATED_AT..off::PUBLIC_KEY].copy_from_slice(&e.created_at_ms.to_le_bytes());
     buf[off::PUBLIC_KEY..off::USERNAME].copy_from_slice(&e.public_key);
-    fixed_layout::write_text_slot(&e.username, &mut buf[off::USERNAME..off::USERNAME + NAME_BYTES])
-        .map_err(EventError::TextSlot)?;
+    fixed_layout::write_text_slot(
+        &e.username,
+        &mut buf[off::USERNAME..off::USERNAME + NAME_BYTES],
+    )
+    .map_err(EventError::TextSlot)?;
     buf[off::SIGNED_BY..off::SIGNER_TYPE].copy_from_slice(&e.signed_by);
     buf[off::SIGNER_TYPE] = e.signer_type;
     buf[off::SIGNATURE..off::SIGNATURE + 64].copy_from_slice(&e.signature);
@@ -91,16 +104,26 @@ pub fn encode_user_boot(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
 /// [138..202]   signature (64 bytes)
 pub fn parse_user_ongoing(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if blob.len() < USER_WIRE_SIZE {
-        return Err(EventError::TooShort { expected: USER_WIRE_SIZE, actual: blob.len() });
+        return Err(EventError::TooShort {
+            expected: USER_WIRE_SIZE,
+            actual: blob.len(),
+        });
     }
     if blob.len() > USER_WIRE_SIZE {
-        return Err(EventError::TrailingData { expected: USER_WIRE_SIZE, actual: blob.len() });
+        return Err(EventError::TrailingData {
+            expected: USER_WIRE_SIZE,
+            actual: blob.len(),
+        });
     }
     if blob[0] != EVENT_TYPE_USER_ONGOING {
-        return Err(EventError::WrongType { expected: EVENT_TYPE_USER_ONGOING, actual: blob[0] });
+        return Err(EventError::WrongType {
+            expected: EVENT_TYPE_USER_ONGOING,
+            actual: blob[0],
+        });
     }
 
-    let created_at_ms = u64::from_le_bytes(blob[off::CREATED_AT..off::PUBLIC_KEY].try_into().unwrap());
+    let created_at_ms =
+        u64::from_le_bytes(blob[off::CREATED_AT..off::PUBLIC_KEY].try_into().unwrap());
     let mut public_key = [0u8; 32];
     public_key.copy_from_slice(&blob[off::PUBLIC_KEY..off::USERNAME]);
 
@@ -132,8 +155,11 @@ pub fn encode_user_ongoing(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     buf[off::TYPE_CODE] = EVENT_TYPE_USER_ONGOING;
     buf[off::CREATED_AT..off::PUBLIC_KEY].copy_from_slice(&e.created_at_ms.to_le_bytes());
     buf[off::PUBLIC_KEY..off::USERNAME].copy_from_slice(&e.public_key);
-    fixed_layout::write_text_slot(&e.username, &mut buf[off::USERNAME..off::USERNAME + NAME_BYTES])
-        .map_err(EventError::TextSlot)?;
+    fixed_layout::write_text_slot(
+        &e.username,
+        &mut buf[off::USERNAME..off::USERNAME + NAME_BYTES],
+    )
+    .map_err(EventError::TextSlot)?;
     buf[off::SIGNED_BY..off::SIGNER_TYPE].copy_from_slice(&e.signed_by);
     buf[off::SIGNER_TYPE] = e.signer_type;
     buf[off::SIGNATURE..off::SIGNATURE + 64].copy_from_slice(&e.signature);
@@ -177,13 +203,9 @@ pub struct UserRow {
     pub username: String,
 }
 
-pub fn query_list(
-    db: &Connection,
-    recorded_by: &str,
-) -> Result<Vec<UserRow>, rusqlite::Error> {
-    let mut stmt = db.prepare(
-        "SELECT event_id, COALESCE(username, '') FROM users WHERE recorded_by = ?1"
-    )?;
+pub fn query_list(db: &Connection, recorded_by: &str) -> Result<Vec<UserRow>, rusqlite::Error> {
+    let mut stmt =
+        db.prepare("SELECT event_id, COALESCE(username, '') FROM users WHERE recorded_by = ?1")?;
     let rows = stmt
         .query_map(rusqlite::params![recorded_by], |row| {
             Ok(UserRow {
@@ -195,10 +217,7 @@ pub fn query_list(
     Ok(rows)
 }
 
-pub fn query_count(
-    db: &Connection,
-    recorded_by: &str,
-) -> Result<i64, rusqlite::Error> {
+pub fn query_count(db: &Connection, recorded_by: &str) -> Result<i64, rusqlite::Error> {
     db.query_row(
         "SELECT COUNT(*) FROM users WHERE recorded_by = ?1",
         rusqlite::params![recorded_by],

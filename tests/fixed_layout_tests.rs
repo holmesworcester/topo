@@ -2,9 +2,8 @@
 //! encode/decode tests for all fixed-layout canonical event types.
 
 use topo::event_modules::{
-    self as events, fixed_layout, EventError, ParsedEvent,
-    MessageEvent, ReactionEvent, SignedMemoEvent, EncryptedEvent,
-    FileSliceEvent, MessageAttachmentEvent, BenchDepEvent,
+    self as events, fixed_layout, BenchDepEvent, EncryptedEvent, EventError, FileSliceEvent,
+    MessageAttachmentEvent, MessageEvent, ParsedEvent, ReactionEvent, SignedMemoEvent,
 };
 
 // ─── Golden-byte tests ───
@@ -29,7 +28,10 @@ fn golden_bytes_message() {
     // Type code
     assert_eq!(blob[0], 1);
     // created_at_ms LE
-    assert_eq!(&blob[1..9], &[0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]);
+    assert_eq!(
+        &blob[1..9],
+        &[0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]
+    );
     // workspace_id
     assert_eq!(&blob[9..41], &[0xAA; 32]);
     // author_id

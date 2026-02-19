@@ -1,7 +1,7 @@
-use rusqlite::{Connection, Result as SqliteResult, params};
+use rusqlite::{params, Connection, Result as SqliteResult};
 
+use super::queue::{backoff_ms, current_timestamp_ms, recover_expired_leases, QueueHealth};
 use crate::crypto::EventId;
-use super::queue::{current_timestamp_ms, backoff_ms, recover_expired_leases, QueueHealth};
 
 pub struct EgressQueue<'a> {
     conn: &'a Connection,
@@ -15,7 +15,11 @@ impl<'a> EgressQueue<'a> {
     /// Enqueue a batch of events for a connection. Deduped by partial unique index
     /// on (connection_id, event_id) WHERE frame_type='event' AND sent_at IS NULL.
     /// Returns number inserted.
-    pub fn enqueue_events(&self, connection_id: &str, event_ids: &[EventId]) -> SqliteResult<usize> {
+    pub fn enqueue_events(
+        &self,
+        connection_id: &str,
+        event_ids: &[EventId],
+    ) -> SqliteResult<usize> {
         if event_ids.is_empty() {
             return Ok(0);
         }
@@ -69,9 +73,9 @@ impl<'a> EgressQueue<'a> {
 
         // Batch-update leases in a single transaction
         self.conn.execute("BEGIN", [])?;
-        let mut update_stmt = self.conn.prepare(
-            "UPDATE egress_queue SET lease_until = ?1 WHERE id = ?2",
-        )?;
+        let mut update_stmt = self
+            .conn
+            .prepare("UPDATE egress_queue SET lease_until = ?1 WHERE id = ?2")?;
         let mut result = Vec::with_capacity(rows.len());
         for (rowid, blob) in rows {
             if blob.len() == 32 {
@@ -93,9 +97,9 @@ impl<'a> EgressQueue<'a> {
         }
         let now = current_timestamp_ms();
         self.conn.execute("BEGIN", [])?;
-        let mut stmt = self.conn.prepare(
-            "UPDATE egress_queue SET sent_at = ?1, lease_until = NULL WHERE id = ?2",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("UPDATE egress_queue SET sent_at = ?1, lease_until = NULL WHERE id = ?2")?;
         for rowid in rowids {
             stmt.execute(params![now, rowid])?;
         }
@@ -167,7 +171,11 @@ impl<'a> EgressQueue<'a> {
             params![connection_id, now],
             |row| row.get(0),
         )?;
-        Ok(QueueHealth { pending, max_attempts, oldest_age_ms })
+        Ok(QueueHealth {
+            pending,
+            max_attempts,
+            oldest_age_ms,
+        })
     }
 
     /// Recover expired leases, making them claimable again.
@@ -215,7 +223,10 @@ mod tests {
         let id = make_event_id(1);
         eq.enqueue_events("conn1", &[id]).unwrap();
         let inserted = eq.enqueue_events("conn1", &[id]).unwrap();
-        assert_eq!(inserted, 0, "duplicate event_id for same connection should be ignored");
+        assert_eq!(
+            inserted, 0,
+            "duplicate event_id for same connection should be ignored"
+        );
 
         let count = eq.count_pending("conn1").unwrap();
         assert_eq!(count, 1);
@@ -269,20 +280,17 @@ mod tests {
         eq.mark_sent(&rowids).unwrap();
 
         // Backdate sent_at to make items "old"
-        conn.execute(
-            "UPDATE egress_queue SET sent_at = sent_at - 600000",
-            [],
-        ).unwrap();
+        conn.execute("UPDATE egress_queue SET sent_at = sent_at - 600000", [])
+            .unwrap();
 
         // Cleanup items older than 300 seconds
         let cleaned = eq.cleanup_sent(300_000).unwrap();
         assert_eq!(cleaned, 2);
 
         // Total row count should be 0
-        let total: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM egress_queue",
-            [], |row| row.get(0),
-        ).unwrap();
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM egress_queue", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(total, 0);
     }
 
@@ -300,19 +308,28 @@ mod tests {
         eq.mark_retry(rowid).unwrap();
 
         // Check attempts incremented
-        let attempts: i64 = conn.query_row(
-            "SELECT attempts FROM egress_queue WHERE id = ?1",
-            params![rowid], |row| row.get(0),
-        ).unwrap();
+        let attempts: i64 = conn
+            .query_row(
+                "SELECT attempts FROM egress_queue WHERE id = ?1",
+                params![rowid],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(attempts, 1);
 
         // available_at should be in the future
-        let available_at: i64 = conn.query_row(
-            "SELECT available_at FROM egress_queue WHERE id = ?1",
-            params![rowid], |row| row.get(0),
-        ).unwrap();
+        let available_at: i64 = conn
+            .query_row(
+                "SELECT available_at FROM egress_queue WHERE id = ?1",
+                params![rowid],
+                |row| row.get(0),
+            )
+            .unwrap();
         let now = current_timestamp_ms();
-        assert!(available_at > now, "available_at should be in the future after retry");
+        assert!(
+            available_at > now,
+            "available_at should be in the future after retry"
+        );
     }
 
     #[test]
@@ -345,10 +362,8 @@ mod tests {
         assert_eq!(claimed.len(), 1);
 
         // Set lease to the past
-        conn.execute(
-            "UPDATE egress_queue SET lease_until = 1",
-            [],
-        ).unwrap();
+        conn.execute("UPDATE egress_queue SET lease_until = 1", [])
+            .unwrap();
 
         let recovered = eq.recover_expired().unwrap();
         assert_eq!(recovered, 1);

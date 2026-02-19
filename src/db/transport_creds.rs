@@ -42,11 +42,9 @@ pub fn load_local_creds(
 pub fn load_sole_local_creds(
     conn: &Connection,
 ) -> Result<Option<(String, Vec<u8>, Vec<u8>)>, Box<dyn std::error::Error + Send + Sync>> {
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM local_transport_creds",
-        [],
-        |row| row.get(0),
-    )?;
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM local_transport_creds", [], |row| {
+        row.get(0)
+    })?;
     if count == 0 {
         return Ok(None);
     }
@@ -54,7 +52,8 @@ pub fn load_sole_local_creds(
         return Err(format!(
             "Multiple local identities found ({}). Multi-tenant is handled automatically.",
             count
-        ).into());
+        )
+        .into());
     }
     match conn.query_row(
         "SELECT peer_id, cert_der, key_der FROM local_transport_creds LIMIT 1",
@@ -164,8 +163,11 @@ mod tests {
         store_local_creds(&conn, "peer2", b"c2", b"k2").unwrap();
 
         let err = load_sole_local_creds(&conn).unwrap_err();
-        assert!(err.to_string().contains("Multiple local identities"),
-            "should reject ambiguous multi-tenant DB, got: {}", err);
+        assert!(
+            err.to_string().contains("Multiple local identities"),
+            "should reject ambiguous multi-tenant DB, got: {}",
+            err
+        );
     }
 
     #[test]

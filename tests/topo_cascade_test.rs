@@ -9,12 +9,12 @@
 
 use std::time::Instant;
 
+use rusqlite::Connection;
+use tempfile::NamedTempFile;
 use topo::crypto::{event_id_to_base64, hash_event, EventId};
 use topo::db::{open_connection, schema::create_tables};
 use topo::event_modules::{self as events, BenchDepEvent, ParsedEvent};
 use topo::projection::apply::project_one;
-use rusqlite::Connection;
-use tempfile::NamedTempFile;
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -92,7 +92,11 @@ fn run_topo_cascade(n: usize) {
     let mut event_ids: Vec<EventId> = Vec::with_capacity(n);
 
     for i in 0..n {
-        let num_deps = if i < deps_per_event { i } else { deps_per_event };
+        let num_deps = if i < deps_per_event {
+            i
+        } else {
+            deps_per_event
+        };
         let mut dep_ids = Vec::with_capacity(num_deps);
         for j in 0..num_deps {
             dep_ids.push(event_ids[i - num_deps + j]);
@@ -117,7 +121,13 @@ fn run_topo_cascade(n: usize) {
     conn.execute_batch("COMMIT").unwrap();
 
     let dep_rows_total: usize = (0..n)
-        .map(|i| if i < deps_per_event { i } else { deps_per_event })
+        .map(|i| {
+            if i < deps_per_event {
+                i
+            } else {
+                deps_per_event
+            }
+        })
         .sum();
     let setup_secs = setup_start.elapsed().as_secs_f64();
 

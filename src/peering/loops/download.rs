@@ -172,8 +172,7 @@ pub async fn download_from_sources(
                                 break;
                             }
                         };
-                        let conn =
-                            DualConnection::new(ctrl_send, ctrl_recv, data_send, data_recv);
+                        let conn = DualConnection::new(ctrl_send, ctrl_recv, data_send, data_recv);
 
                         let session_id = next_session_id();
                         let meta = SessionMeta {

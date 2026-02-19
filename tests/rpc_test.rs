@@ -159,9 +159,7 @@ fn rpc_all_methods_serialize() {
             invite: "quiet://link/test".into(),
             devicename: "device".into(),
         },
-        RpcMethod::Ban {
-            target: "1".into(),
-        },
+        RpcMethod::Ban { target: "1".into() },
         RpcMethod::Identity,
         RpcMethod::Channels,
         RpcMethod::NewChannel {
@@ -642,8 +640,14 @@ fn rpc_identity_command() {
 
     assert!(out.status.success(), "identity failed: {:?}", out);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("IDENTITY:"), "should contain IDENTITY header");
-    assert!(stdout.contains("Transport:"), "should contain Transport line");
+    assert!(
+        stdout.contains("IDENTITY:"),
+        "should contain IDENTITY header"
+    );
+    assert!(
+        stdout.contains("Transport:"),
+        "should contain Transport line"
+    );
     assert!(stdout.contains("User:"), "should contain User line");
     assert!(stdout.contains("Peer:"), "should contain Peer line");
 }
@@ -672,7 +676,11 @@ fn rpc_channel_lifecycle() {
         .unwrap();
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("general"), "should have default 'general' channel, got: {}", stdout);
+    assert!(
+        stdout.contains("general"),
+        "should have default 'general' channel, got: {}",
+        stdout
+    );
 
     // Create a new channel
     let out = Command::new(bin())
@@ -690,7 +698,10 @@ fn rpc_channel_lifecycle() {
         .unwrap();
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("random"), "should show switched channel name");
+    assert!(
+        stdout.contains("random"),
+        "should show switched channel name"
+    );
 
     // Verify channels list now shows 2
     let out = Command::new(bin())
@@ -725,7 +736,13 @@ fn rpc_invite_ref_resolution() {
 
     // Create invite — should get ref #1
     let out = Command::new(bin())
-        .args(["--db", &db, "create-invite", "--public-addr", "127.0.0.1:4433"])
+        .args([
+            "--db",
+            &db,
+            "create-invite",
+            "--public-addr",
+            "127.0.0.1:4433",
+        ])
         .output()
         .unwrap();
     assert!(out.status.success(), "create-invite failed: {:?}", out);

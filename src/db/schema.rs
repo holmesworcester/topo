@@ -41,7 +41,9 @@ fn enforce_schema_epoch(conn: &Connection) -> SqliteResult<()> {
     let has_epoch = table_exists(conn, "schema_epoch")?;
     if has_epoch {
         let epoch_opt: Option<i64> = conn
-            .query_row("SELECT epoch FROM schema_epoch LIMIT 1", [], |row| row.get(0))
+            .query_row("SELECT epoch FROM schema_epoch LIMIT 1", [], |row| {
+                row.get(0)
+            })
             .optional()?;
         let epoch = match epoch_opt {
             Some(v) => v,
@@ -177,7 +179,9 @@ mod tests {
         assert!(tables.contains(&"schema_epoch".to_string()));
 
         let epoch: i64 = conn
-            .query_row("SELECT epoch FROM schema_epoch LIMIT 1", [], |row| row.get(0))
+            .query_row("SELECT epoch FROM schema_epoch LIMIT 1", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(epoch, PROTOTYPE_SCHEMA_EPOCH);
     }
@@ -221,5 +225,4 @@ mod tests {
             msg
         );
     }
-
 }

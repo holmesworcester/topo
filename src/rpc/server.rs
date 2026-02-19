@@ -122,7 +122,10 @@ impl DaemonState {
     /// Get the active channel for a peer, defaulting to "general".
     pub fn active_channel_for_peer(&self, peer_id: &str) -> [u8; 32] {
         let active = self.active_channel.read().unwrap();
-        active.get(peer_id).copied().unwrap_or_else(default_channel_id)
+        active
+            .get(peer_id)
+            .copied()
+            .unwrap_or_else(default_channel_id)
     }
 
     /// Set the active channel for a peer.
@@ -260,7 +263,9 @@ fn handle_connection(
 }
 
 #[allow(dead_code)] // used by tests; will be called when auto-UPnP bootstrap is re-enabled
-fn resolve_bootstrap_from_upnp(upnp: &crate::peering::nat::upnp::UpnpMappingReport) -> Result<String, String> {
+fn resolve_bootstrap_from_upnp(
+    upnp: &crate::peering::nat::upnp::UpnpMappingReport,
+) -> Result<String, String> {
     if upnp.status != crate::peering::nat::upnp::UpnpMappingStatus::Success {
         let status = match &upnp.status {
             crate::peering::nat::upnp::UpnpMappingStatus::Success => "success",
@@ -380,7 +385,11 @@ fn dispatch(
             }
         }
 
-        RpcMethod::CreateWorkspace { workspace_name, username, device_name } => {
+        RpcMethod::CreateWorkspace {
+            workspace_name,
+            username,
+            device_name,
+        } => {
             match service::svc_create_workspace(db_path, &workspace_name, &username, &device_name) {
                 Ok(resp) => {
                     // Auto-select newly created peer if none active
@@ -485,7 +494,10 @@ fn dispatch(
                 Err(e) => RpcResponse::error(e.to_string()),
             }
         }
-        RpcMethod::CreateInvite { public_addr, public_spki } => {
+        RpcMethod::CreateInvite {
+            public_addr,
+            public_spki,
+        } => {
             let result = match public_spki {
                 Some(ref spki) => service::svc_create_invite_with_spki(db_path, &public_addr, spki),
                 None => service::svc_create_invite(db_path, &public_addr),
@@ -539,34 +551,35 @@ fn dispatch(
                 }
             }
         }
-        RpcMethod::CreateDeviceLink { public_addr, public_spki } => {
-            match state.require_active_peer() {
-                Ok(peer_id) => {
-                    match service::svc_create_device_link_for_peer(
-                        db_path,
-                        &peer_id,
-                        &public_addr,
-                        public_spki.as_deref(),
-                    ) {
-                        Ok(data) => {
-                            if let Some(link) = serde_json::to_value(&data)
-                                .ok()
-                                .and_then(|v| v["invite_link"].as_str().map(|s| s.to_string()))
-                            {
-                                let num = state.add_invite_ref(link);
-                                let mut resp_data = serde_json::to_value(&data).unwrap();
-                                resp_data["invite_ref"] = serde_json::json!(num);
-                                RpcResponse::success(resp_data)
-                            } else {
-                                RpcResponse::success(data)
-                            }
+        RpcMethod::CreateDeviceLink {
+            public_addr,
+            public_spki,
+        } => match state.require_active_peer() {
+            Ok(peer_id) => {
+                match service::svc_create_device_link_for_peer(
+                    db_path,
+                    &peer_id,
+                    &public_addr,
+                    public_spki.as_deref(),
+                ) {
+                    Ok(data) => {
+                        if let Some(link) = serde_json::to_value(&data)
+                            .ok()
+                            .and_then(|v| v["invite_link"].as_str().map(|s| s.to_string()))
+                        {
+                            let num = state.add_invite_ref(link);
+                            let mut resp_data = serde_json::to_value(&data).unwrap();
+                            resp_data["invite_ref"] = serde_json::json!(num);
+                            RpcResponse::success(resp_data)
+                        } else {
+                            RpcResponse::success(data)
                         }
-                        Err(e) => RpcResponse::error(e.to_string()),
                     }
+                    Err(e) => RpcResponse::error(e.to_string()),
                 }
-                Err(e) => RpcResponse::error(e),
             }
-        }
+            Err(e) => RpcResponse::error(e),
+        },
         RpcMethod::AcceptLink { invite, devicename } => {
             let resolved = match state.resolve_invite_ref(&invite) {
                 Ok(link) => link,
@@ -595,62 +608,50 @@ fn dispatch(
                 Err(e) => RpcResponse::error(e.to_string()),
             }
         }
-        RpcMethod::Ban { target } => {
-            match state.require_active_peer() {
-                Ok(peer_id) => {
-                    match service::svc_ban_for_peer(db_path, &peer_id, &target) {
-                        Ok(data) => RpcResponse::success(data),
-                        Err(e) => RpcResponse::error(e.to_string()),
-                    }
-                }
-                Err(e) => RpcResponse::error(e),
-            }
-        }
-        RpcMethod::Identity => {
-            match state.require_active_peer() {
-                Ok(peer_id) => {
-                    match service::svc_identity_for_peer(db_path, &peer_id) {
-                        Ok(data) => RpcResponse::success(data),
-                        Err(e) => RpcResponse::error(e.to_string()),
-                    }
-                }
-                Err(e) => RpcResponse::error(e),
-            }
-        }
-        RpcMethod::Channels => {
-            match state.require_active_peer() {
-                Ok(peer_id) => {
-                    let channels = state.channels_for_peer(&peer_id);
-                    let active = state.active_channel_for_peer(&peer_id);
-                    let items: Vec<serde_json::Value> = channels
-                        .iter()
-                        .enumerate()
-                        .map(|(i, ch)| {
-                            serde_json::json!({
-                                "index": i + 1,
-                                "name": ch.name,
-                                "active": ch.channel_id == active,
-                            })
+        RpcMethod::Ban { target } => match state.require_active_peer() {
+            Ok(peer_id) => match service::svc_ban_for_peer(db_path, &peer_id, &target) {
+                Ok(data) => RpcResponse::success(data),
+                Err(e) => RpcResponse::error(e.to_string()),
+            },
+            Err(e) => RpcResponse::error(e),
+        },
+        RpcMethod::Identity => match state.require_active_peer() {
+            Ok(peer_id) => match service::svc_identity_for_peer(db_path, &peer_id) {
+                Ok(data) => RpcResponse::success(data),
+                Err(e) => RpcResponse::error(e.to_string()),
+            },
+            Err(e) => RpcResponse::error(e),
+        },
+        RpcMethod::Channels => match state.require_active_peer() {
+            Ok(peer_id) => {
+                let channels = state.channels_for_peer(&peer_id);
+                let active = state.active_channel_for_peer(&peer_id);
+                let items: Vec<serde_json::Value> = channels
+                    .iter()
+                    .enumerate()
+                    .map(|(i, ch)| {
+                        serde_json::json!({
+                            "index": i + 1,
+                            "name": ch.name,
+                            "active": ch.channel_id == active,
                         })
-                        .collect();
-                    RpcResponse::success(items)
-                }
-                Err(e) => RpcResponse::error(e),
+                    })
+                    .collect();
+                RpcResponse::success(items)
             }
-        }
-        RpcMethod::NewChannel { name } => {
-            match state.require_active_peer() {
-                Ok(peer_id) => {
-                    let (num, channel_id) = state.add_channel(&peer_id, &name);
-                    RpcResponse::success(serde_json::json!({
-                        "index": num,
-                        "name": name,
-                        "channel_id": hex::encode(channel_id),
-                    }))
-                }
-                Err(e) => RpcResponse::error(e),
+            Err(e) => RpcResponse::error(e),
+        },
+        RpcMethod::NewChannel { name } => match state.require_active_peer() {
+            Ok(peer_id) => {
+                let (num, channel_id) = state.add_channel(&peer_id, &name);
+                RpcResponse::success(serde_json::json!({
+                    "index": num,
+                    "name": name,
+                    "channel_id": hex::encode(channel_id),
+                }))
             }
-        }
+            Err(e) => RpcResponse::error(e),
+        },
         RpcMethod::UseChannel { selector } => {
             match state.require_active_peer() {
                 Ok(peer_id) => {
@@ -765,7 +766,12 @@ mod tests {
 
     #[test]
     fn bootstrap_resolution_rejects_non_public_ip() {
-        let report = mk_report(UpnpMappingStatus::Success, Some("10.0.0.8"), Some(4433), None);
+        let report = mk_report(
+            UpnpMappingStatus::Success,
+            Some("10.0.0.8"),
+            Some(4433),
+            None,
+        );
         let err = resolve_bootstrap_from_upnp(&report).unwrap_err();
         assert!(err.contains("not publicly routable"));
     }

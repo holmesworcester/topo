@@ -8,8 +8,8 @@ use ed25519_dalek::SigningKey;
 use rusqlite::Connection;
 
 use super::message;
-use super::reaction;
 use super::message_deletion;
+use super::reaction;
 use super::user_removed;
 
 pub enum EventCommand {

@@ -1,4 +1,4 @@
-use super::fixed_layout::{BENCH_DEP_WIRE_SIZE, BENCH_DEP_MAX_SLOTS, bench_dep_offsets as off};
+use super::fixed_layout::{bench_dep_offsets as off, BENCH_DEP_MAX_SLOTS, BENCH_DEP_WIRE_SIZE};
 use super::registry::{EventTypeMeta, ShareScope};
 use super::{EventError, ParsedEvent, EVENT_TYPE_BENCH_DEP};
 
@@ -36,7 +36,8 @@ pub fn parse_bench_dep(blob: &[u8]) -> Result<ParsedEvent, EventError> {
         });
     }
 
-    let created_at_ms = u64::from_le_bytes(blob[off::CREATED_AT..off::DEP_SLOTS].try_into().unwrap());
+    let created_at_ms =
+        u64::from_le_bytes(blob[off::CREATED_AT..off::DEP_SLOTS].try_into().unwrap());
 
     // Read all 10 slots, collect non-zero ones as deps
     let mut dep_ids = Vec::new();

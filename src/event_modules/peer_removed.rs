@@ -4,9 +4,9 @@ use super::{EventError, ParsedEvent, EVENT_TYPE_PEER_REMOVED};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerRemovedEvent {
     pub created_at_ms: u64,
-    pub target_event_id: [u8; 32],  // PeerShared event being removed
-    pub signed_by: [u8; 32],        // signer event_id (PeerShared event — admin)
-    pub signer_type: u8,            // 5 = peer_shared
+    pub target_event_id: [u8; 32], // PeerShared event being removed
+    pub signed_by: [u8; 32],       // signer event_id (PeerShared event — admin)
+    pub signer_type: u8,           // 5 = peer_shared
     pub signature: [u8; 64],
 }
 
@@ -19,13 +19,22 @@ pub struct PeerRemovedEvent {
 /// [74..138]  signature (64 bytes)
 pub fn parse_peer_removed(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if blob.len() < 138 {
-        return Err(EventError::TooShort { expected: 138, actual: blob.len() });
+        return Err(EventError::TooShort {
+            expected: 138,
+            actual: blob.len(),
+        });
     }
     if blob.len() > 138 {
-        return Err(EventError::TrailingData { expected: 138, actual: blob.len() });
+        return Err(EventError::TrailingData {
+            expected: 138,
+            actual: blob.len(),
+        });
     }
     if blob[0] != EVENT_TYPE_PEER_REMOVED {
-        return Err(EventError::WrongType { expected: EVENT_TYPE_PEER_REMOVED, actual: blob[0] });
+        return Err(EventError::WrongType {
+            expected: EVENT_TYPE_PEER_REMOVED,
+            actual: blob[0],
+        });
     }
 
     let created_at_ms = u64::from_le_bytes(blob[1..9].try_into().unwrap());

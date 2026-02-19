@@ -12,12 +12,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::contracts::event_runtime_contract::{BatchWriterFn, IngestItem};
 use crate::contracts::network_contract::{
-    ControlIo, DataRecvIo, DataSendIo, SessionDirection, SessionHandler, SessionIo,
-    SessionIoError, SessionMeta,
+    ControlIo, DataRecvIo, DataSendIo, SessionDirection, SessionHandler, SessionIo, SessionIoError,
+    SessionMeta,
 };
-use crate::sync::session::{run_sync_initiator_dual, run_sync_responder_dual, PeerCoord};
 use crate::protocol::SyncMessage;
 use crate::protocol::{encode_sync_message, parse_sync_message};
+use crate::sync::session::{run_sync_initiator_dual, run_sync_responder_dual, PeerCoord};
 use crate::transport::connection::ConnectionError;
 use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
 
@@ -34,10 +34,7 @@ struct ControlAdapter {
 impl StreamConn for ControlAdapter {
     async fn send(&mut self, msg: &SyncMessage) -> Result<(), ConnectionError> {
         let frame = encode_sync_message(msg);
-        self.inner
-            .send(&frame)
-            .await
-            .map_err(|e| map_io_error(e))
+        self.inner.send(&frame).await.map_err(|e| map_io_error(e))
     }
 
     async fn flush(&mut self) -> Result<(), ConnectionError> {
@@ -46,8 +43,7 @@ impl StreamConn for ControlAdapter {
 
     async fn recv(&mut self) -> Result<SyncMessage, ConnectionError> {
         let frame = self.inner.recv().await.map_err(|e| map_io_error(e))?;
-        let (msg, _) = parse_sync_message(&frame)
-            .map_err(|e| ConnectionError::Parse(e))?;
+        let (msg, _) = parse_sync_message(&frame).map_err(|e| ConnectionError::Parse(e))?;
         Ok(msg)
     }
 }
@@ -60,10 +56,7 @@ struct DataSendAdapter {
 impl StreamSend for DataSendAdapter {
     async fn send(&mut self, msg: &SyncMessage) -> Result<(), ConnectionError> {
         let frame = encode_sync_message(msg);
-        self.inner
-            .send(&frame)
-            .await
-            .map_err(|e| map_io_error(e))
+        self.inner.send(&frame).await.map_err(|e| map_io_error(e))
     }
 
     async fn flush(&mut self) -> Result<(), ConnectionError> {
@@ -79,8 +72,7 @@ struct DataRecvAdapter {
 impl StreamRecv for DataRecvAdapter {
     async fn recv(&mut self) -> Result<SyncMessage, ConnectionError> {
         let frame = self.inner.recv().await.map_err(|e| map_io_error(e))?;
-        let (msg, _) = parse_sync_message(&frame)
-            .map_err(|e| ConnectionError::Parse(e))?;
+        let (msg, _) = parse_sync_message(&frame).map_err(|e| ConnectionError::Parse(e))?;
         Ok(msg)
     }
 }

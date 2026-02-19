@@ -118,12 +118,8 @@ mod tests {
         let (cert1, key1) = crate::transport::generate_self_signed_cert().unwrap();
         let (cert2, key2) = crate::transport::generate_self_signed_cert().unwrap();
 
-        let ck1 = Arc::new(
-            CertifiedKey::from_der(vec![cert1], key1.into(), &provider).unwrap(),
-        );
-        let ck2 = Arc::new(
-            CertifiedKey::from_der(vec![cert2], key2.into(), &provider).unwrap(),
-        );
+        let ck1 = Arc::new(CertifiedKey::from_der(vec![cert1], key1.into(), &provider).unwrap());
+        let ck2 = Arc::new(CertifiedKey::from_der(vec![cert2], key2.into(), &provider).unwrap());
 
         resolver.add("ws-aaa".to_string(), ck1.clone());
         resolver.add("ws-bbb".to_string(), ck2.clone());

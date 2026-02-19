@@ -223,10 +223,7 @@ impl ControlIo for FakeControlIo {
             }
         }
 
-        let frame = self.rx
-            .recv()
-            .await
-            .ok_or(SessionIoError::ConnectionLost)?;
+        let frame = self.rx.recv().await.ok_or(SessionIoError::ConnectionLost)?;
 
         // DuplicateDone: when we see a Done frame, queue a duplicate.
         if let Some(ProtocolViolation::DuplicateDone) = &self.violation {
@@ -339,10 +336,7 @@ impl DataRecvIo for FakeDataRecvIo {
                 .pop()
                 .ok_or(SessionIoError::ConnectionLost)?
         } else {
-            self.rx
-                .recv()
-                .await
-                .ok_or(SessionIoError::ConnectionLost)?
+            self.rx.recv().await.ok_or(SessionIoError::ConnectionLost)?
         };
 
         // Apply fragmentation: split the frame into 2 chunks at the midpoint.

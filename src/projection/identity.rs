@@ -1,6 +1,6 @@
+use super::result::{ContextSnapshot, EmitCommand, ProjectorResult, SqlVal, WriteOp};
 use crate::crypto::event_id_to_base64;
 use crate::event_modules::ParsedEvent;
-use super::result::{ContextSnapshot, EmitCommand, ProjectorResult, SqlVal, WriteOp};
 
 /// Dispatch identity event projections to pure projectors.
 pub fn apply_identity_projection_pure(
@@ -11,40 +11,54 @@ pub fn apply_identity_projection_pure(
 ) -> ProjectorResult {
     match parsed {
         ParsedEvent::Workspace(ws) => project_workspace_pure(recorded_by, event_id_b64, ws, ctx),
-        ParsedEvent::InviteAccepted(ia) => project_invite_accepted_pure(recorded_by, event_id_b64, ia, ctx),
-        ParsedEvent::UserInviteBoot(ui) => project_user_invite_boot_pure(recorded_by, event_id_b64, ui),
-        ParsedEvent::UserInviteOngoing(ui) => project_user_invite_pure(recorded_by, event_id_b64, &ui.public_key),
-        ParsedEvent::DeviceInviteFirst(di) => project_device_invite_pure(recorded_by, event_id_b64, &di.public_key),
-        ParsedEvent::DeviceInviteOngoing(di) => project_device_invite_pure(recorded_by, event_id_b64, &di.public_key),
+        ParsedEvent::InviteAccepted(ia) => {
+            project_invite_accepted_pure(recorded_by, event_id_b64, ia, ctx)
+        }
+        ParsedEvent::UserInviteBoot(ui) => {
+            project_user_invite_boot_pure(recorded_by, event_id_b64, ui)
+        }
+        ParsedEvent::UserInviteOngoing(ui) => {
+            project_user_invite_pure(recorded_by, event_id_b64, &ui.public_key)
+        }
+        ParsedEvent::DeviceInviteFirst(di) => {
+            project_device_invite_pure(recorded_by, event_id_b64, &di.public_key)
+        }
+        ParsedEvent::DeviceInviteOngoing(di) => {
+            project_device_invite_pure(recorded_by, event_id_b64, &di.public_key)
+        }
         ParsedEvent::UserBoot(u) => {
             project_user_pure(recorded_by, event_id_b64, &u.public_key, &u.username)
         }
         ParsedEvent::UserOngoing(u) => {
             project_user_pure(recorded_by, event_id_b64, &u.public_key, &u.username)
         }
-        ParsedEvent::PeerSharedFirst(p) => {
-            project_peer_shared_pure(
-                recorded_by,
-                event_id_b64,
-                &p.public_key,
-                &p.user_event_id,
-                &p.device_name,
-            )
-        }
-        ParsedEvent::PeerSharedOngoing(p) => {
-            project_peer_shared_pure(
-                recorded_by,
-                event_id_b64,
-                &p.public_key,
-                &p.user_event_id,
-                &p.device_name,
-            )
-        }
+        ParsedEvent::PeerSharedFirst(p) => project_peer_shared_pure(
+            recorded_by,
+            event_id_b64,
+            &p.public_key,
+            &p.user_event_id,
+            &p.device_name,
+        ),
+        ParsedEvent::PeerSharedOngoing(p) => project_peer_shared_pure(
+            recorded_by,
+            event_id_b64,
+            &p.public_key,
+            &p.user_event_id,
+            &p.device_name,
+        ),
         ParsedEvent::AdminBoot(a) => project_admin_pure(recorded_by, event_id_b64, &a.public_key),
-        ParsedEvent::AdminOngoing(a) => project_admin_pure(recorded_by, event_id_b64, &a.public_key),
-        ParsedEvent::UserRemoved(r) => project_user_removed_pure(recorded_by, event_id_b64, &r.target_event_id),
-        ParsedEvent::PeerRemoved(r) => project_peer_removed_pure(recorded_by, event_id_b64, &r.target_event_id),
-        ParsedEvent::SecretShared(s) => project_secret_shared_pure(recorded_by, event_id_b64, s, ctx),
+        ParsedEvent::AdminOngoing(a) => {
+            project_admin_pure(recorded_by, event_id_b64, &a.public_key)
+        }
+        ParsedEvent::UserRemoved(r) => {
+            project_user_removed_pure(recorded_by, event_id_b64, &r.target_event_id)
+        }
+        ParsedEvent::PeerRemoved(r) => {
+            project_peer_removed_pure(recorded_by, event_id_b64, &r.target_event_id)
+        }
+        ParsedEvent::SecretShared(s) => {
+            project_secret_shared_pure(recorded_by, event_id_b64, s, ctx)
+        }
         ParsedEvent::TransportKey(t) => project_transport_key_pure(recorded_by, event_id_b64, t),
         _ => ProjectorResult::reject("not an identity event".to_string()),
     }
@@ -67,19 +81,23 @@ fn project_workspace_pure(
         }
         Some(anchor_wid) if anchor_wid == &workspace_id_b64 => {
             // Trust anchor matches — project
-            let ops = vec![
-                WriteOp::InsertOrIgnore {
-                    table: "workspaces",
-                    columns: vec!["recorded_by", "event_id", "workspace_id", "public_key", "name"],
-                    values: vec![
-                        SqlVal::Text(recorded_by.to_string()),
-                        SqlVal::Text(event_id_b64.to_string()),
-                        SqlVal::Text(workspace_id_b64),
-                        SqlVal::Blob(ws.public_key.to_vec()),
-                        SqlVal::Text(ws.name.clone()),
-                    ],
-                },
-            ];
+            let ops = vec![WriteOp::InsertOrIgnore {
+                table: "workspaces",
+                columns: vec![
+                    "recorded_by",
+                    "event_id",
+                    "workspace_id",
+                    "public_key",
+                    "name",
+                ],
+                values: vec![
+                    SqlVal::Text(recorded_by.to_string()),
+                    SqlVal::Text(event_id_b64.to_string()),
+                    SqlVal::Text(workspace_id_b64),
+                    SqlVal::Blob(ws.public_key.to_vec()),
+                    SqlVal::Text(ws.name.clone()),
+                ],
+            }];
             ProjectorResult::valid(ops)
         }
         Some(_) => {
@@ -226,7 +244,13 @@ fn project_peer_shared_pure(
     let user_event_id_b64 = event_id_to_base64(user_event_id);
     let ops = vec![WriteOp::InsertOrIgnore {
         table: "peers_shared",
-        columns: vec!["recorded_by", "event_id", "public_key", "user_event_id", "device_name"],
+        columns: vec![
+            "recorded_by",
+            "event_id",
+            "public_key",
+            "user_event_id",
+            "device_name",
+        ],
         values: vec![
             SqlVal::Text(recorded_by.to_string()),
             SqlVal::Text(event_id_b64.to_string()),
@@ -313,7 +337,13 @@ fn project_secret_shared_pure(
 
     let ops = vec![WriteOp::InsertOrIgnore {
         table: "secret_shared",
-        columns: vec!["recorded_by", "event_id", "key_event_id", "recipient_event_id", "wrapped_key"],
+        columns: vec![
+            "recorded_by",
+            "event_id",
+            "key_event_id",
+            "recipient_event_id",
+            "wrapped_key",
+        ],
         values: vec![
             SqlVal::Text(recorded_by.to_string()),
             SqlVal::Text(event_id_b64.to_string()),
@@ -358,10 +388,11 @@ pub fn retry_guard_blocked_events(
            AND re.event_id NOT IN (SELECT event_id FROM rejected_events WHERE peer_id = ?1)
            AND re.event_id NOT IN (SELECT DISTINCT event_id FROM blocked_event_deps WHERE peer_id = ?1)"
     )?;
-    let candidates: Vec<String> = stmt.query_map(
-        rusqlite::params![recorded_by],
-        |row| row.get::<_, String>(0),
-    )?.collect::<Result<Vec<_>, _>>()?;
+    let candidates: Vec<String> = stmt
+        .query_map(rusqlite::params![recorded_by], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
     drop(stmt);
 
     for eid_b64 in candidates {

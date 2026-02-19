@@ -1,10 +1,9 @@
 use rusqlite::Connection;
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 
-use crate::db::transport_creds::{load_sole_local_creds, load_local_creds, store_local_creds};
+use crate::db::transport_creds::{load_local_creds, load_sole_local_creds, store_local_creds};
 use crate::transport::{
-    extract_spki_fingerprint, generate_self_signed_cert,
-    generate_self_signed_cert_from_signing_key,
+    extract_spki_fingerprint, generate_self_signed_cert, generate_self_signed_cert_from_signing_key,
 };
 
 // ---------------------------------------------------------------------------
@@ -47,7 +46,12 @@ pub fn ensure_transport_peer_id(
     let (cert_der, key_der) = generate_self_signed_cert()?;
     let fp = extract_spki_fingerprint(cert_der.as_ref())?;
     let peer_id = hex::encode(fp);
-    store_local_creds(conn, &peer_id, cert_der.as_ref(), key_der.secret_pkcs8_der())?;
+    store_local_creds(
+        conn,
+        &peer_id,
+        cert_der.as_ref(),
+        key_der.secret_pkcs8_der(),
+    )?;
     Ok(peer_id)
 }
 
@@ -71,7 +75,12 @@ pub fn ensure_transport_cert(
     let (cert_der, key_der) = generate_self_signed_cert()?;
     let fp = extract_spki_fingerprint(cert_der.as_ref())?;
     let peer_id = hex::encode(fp);
-    store_local_creds(conn, &peer_id, cert_der.as_ref(), key_der.secret_pkcs8_der())?;
+    store_local_creds(
+        conn,
+        &peer_id,
+        cert_der.as_ref(),
+        key_der.secret_pkcs8_der(),
+    )?;
     Ok((peer_id, cert_der, key_der))
 }
 
@@ -187,7 +196,12 @@ pub fn install_peer_key_transport_identity(
     let (cert_der, key_der) = generate_self_signed_cert_from_signing_key(peer_signing_key)?;
     let fp = extract_spki_fingerprint(cert_der.as_ref())?;
     let peer_id = hex::encode(fp);
-    store_local_creds(conn, &peer_id, cert_der.as_ref(), key_der.secret_pkcs8_der())?;
+    store_local_creds(
+        conn,
+        &peer_id,
+        cert_der.as_ref(),
+        key_der.secret_pkcs8_der(),
+    )?;
     Ok(peer_id)
 }
 
@@ -230,7 +244,12 @@ pub fn install_invite_bootstrap_transport_identity_conn(
     let (cert_der, key_der) = generate_self_signed_cert_from_signing_key(invite_key)?;
     let fp = extract_spki_fingerprint(cert_der.as_ref())?;
     let peer_id = hex::encode(fp);
-    store_local_creds(conn, &peer_id, cert_der.as_ref(), key_der.secret_pkcs8_der())?;
+    store_local_creds(
+        conn,
+        &peer_id,
+        cert_der.as_ref(),
+        key_der.secret_pkcs8_der(),
+    )?;
     Ok(peer_id)
 }
 
@@ -385,6 +404,9 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(count, 0, "load_transport_cert_required must never generate creds");
+        assert_eq!(
+            count, 0,
+            "load_transport_cert_required must never generate creds"
+        );
     }
 }

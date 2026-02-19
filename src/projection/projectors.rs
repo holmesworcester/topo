@@ -1,9 +1,9 @@
+use super::result::{ContextSnapshot, EmitCommand, ProjectorResult, SqlVal, WriteOp};
 use crate::crypto::event_id_to_base64;
 use crate::event_modules::{
-    FileSliceEvent, MessageAttachmentEvent, MessageDeletionEvent, MessageEvent,
-    ReactionEvent, SecretKeyEvent, SignedMemoEvent,
+    FileSliceEvent, MessageAttachmentEvent, MessageDeletionEvent, MessageEvent, ReactionEvent,
+    SecretKeyEvent, SignedMemoEvent,
 };
-use super::result::{ContextSnapshot, EmitCommand, ProjectorResult, SqlVal, WriteOp};
 
 /// Pure projector: Message → messages table insert.
 ///
@@ -27,44 +27,57 @@ pub fn project_message_pure(
     // Check for pre-existing deletion intents (delete-before-create convergence).
     // Multiple intents may exist (different deletion events targeting this message).
     // Find the first one whose author matches the message author.
-    if let Some(intent) = ctx.deletion_intents.iter().find(|i| i.author_id == author_id_b64) {
+    if let Some(intent) = ctx
+        .deletion_intents
+        .iter()
+        .find(|i| i.author_id == author_id_b64)
+    {
         // Message was already targeted for deletion before it arrived.
         // Record the tombstone immediately using the original deletion event ID
         // for replay invariance — the same tombstone row results regardless of
         // whether delete or create arrives first.
-        let ops = vec![
-            WriteOp::InsertOrIgnore {
-                table: "deleted_messages",
-                columns: vec!["recorded_by", "message_id", "deletion_event_id", "author_id", "deleted_at"],
-                values: vec![
-                    SqlVal::Text(recorded_by.to_string()),
-                    SqlVal::Text(event_id_b64.to_string()),
-                    SqlVal::Text(intent.deletion_event_id.clone()),
-                    SqlVal::Text(intent.author_id.clone()),
-                    SqlVal::Int(intent.created_at),
-                ],
-            },
-        ];
+        let ops = vec![WriteOp::InsertOrIgnore {
+            table: "deleted_messages",
+            columns: vec![
+                "recorded_by",
+                "message_id",
+                "deletion_event_id",
+                "author_id",
+                "deleted_at",
+            ],
+            values: vec![
+                SqlVal::Text(recorded_by.to_string()),
+                SqlVal::Text(event_id_b64.to_string()),
+                SqlVal::Text(intent.deletion_event_id.clone()),
+                SqlVal::Text(intent.author_id.clone()),
+                SqlVal::Int(intent.created_at),
+            ],
+        }];
         // Structurally valid (the event itself is fine), but tombstoned.
         return ProjectorResult::valid(ops);
     }
     // No matching-author intent found — materialize the message normally.
     // Any wrong-author intents are stale and ignored.
 
-    let ops = vec![
-        WriteOp::InsertOrIgnore {
-            table: "messages",
-            columns: vec!["message_id", "workspace_id", "author_id", "content", "created_at", "recorded_by"],
-            values: vec![
-                SqlVal::Text(event_id_b64.to_string()),
-                SqlVal::Text(workspace_id_b64),
-                SqlVal::Text(author_id_b64),
-                SqlVal::Text(msg.content.clone()),
-                SqlVal::Int(msg.created_at_ms as i64),
-                SqlVal::Text(recorded_by.to_string()),
-            ],
-        },
-    ];
+    let ops = vec![WriteOp::InsertOrIgnore {
+        table: "messages",
+        columns: vec![
+            "message_id",
+            "workspace_id",
+            "author_id",
+            "content",
+            "created_at",
+            "recorded_by",
+        ],
+        values: vec![
+            SqlVal::Text(event_id_b64.to_string()),
+            SqlVal::Text(workspace_id_b64),
+            SqlVal::Text(author_id_b64),
+            SqlVal::Text(msg.content.clone()),
+            SqlVal::Int(msg.created_at_ms as i64),
+            SqlVal::Text(recorded_by.to_string()),
+        ],
+    }];
     ProjectorResult::valid(ops)
 }
 
@@ -90,20 +103,25 @@ pub fn project_reaction_pure(
     }
 
     let author_id_b64 = event_id_to_base64(&rxn.author_id);
-    let ops = vec![
-        WriteOp::InsertOrIgnore {
-            table: "reactions",
-            columns: vec!["event_id", "target_event_id", "author_id", "emoji", "created_at", "recorded_by"],
-            values: vec![
-                SqlVal::Text(event_id_b64.to_string()),
-                SqlVal::Text(target_id_b64),
-                SqlVal::Text(author_id_b64),
-                SqlVal::Text(rxn.emoji.clone()),
-                SqlVal::Int(rxn.created_at_ms as i64),
-                SqlVal::Text(recorded_by.to_string()),
-            ],
-        },
-    ];
+    let ops = vec![WriteOp::InsertOrIgnore {
+        table: "reactions",
+        columns: vec![
+            "event_id",
+            "target_event_id",
+            "author_id",
+            "emoji",
+            "created_at",
+            "recorded_by",
+        ],
+        values: vec![
+            SqlVal::Text(event_id_b64.to_string()),
+            SqlVal::Text(target_id_b64),
+            SqlVal::Text(author_id_b64),
+            SqlVal::Text(rxn.emoji.clone()),
+            SqlVal::Int(rxn.created_at_ms as i64),
+            SqlVal::Text(recorded_by.to_string()),
+        ],
+    }];
     ProjectorResult::valid(ops)
 }
 
@@ -113,18 +131,16 @@ pub fn project_secret_key_pure(
     event_id_b64: &str,
     sk: &SecretKeyEvent,
 ) -> ProjectorResult {
-    let ops = vec![
-        WriteOp::InsertOrIgnore {
-            table: "secret_keys",
-            columns: vec!["event_id", "key_bytes", "created_at", "recorded_by"],
-            values: vec![
-                SqlVal::Text(event_id_b64.to_string()),
-                SqlVal::Blob(sk.key_bytes.to_vec()),
-                SqlVal::Int(sk.created_at_ms as i64),
-                SqlVal::Text(recorded_by.to_string()),
-            ],
-        },
-    ];
+    let ops = vec![WriteOp::InsertOrIgnore {
+        table: "secret_keys",
+        columns: vec!["event_id", "key_bytes", "created_at", "recorded_by"],
+        values: vec![
+            SqlVal::Text(event_id_b64.to_string()),
+            SqlVal::Blob(sk.key_bytes.to_vec()),
+            SqlVal::Int(sk.created_at_ms as i64),
+            SqlVal::Text(recorded_by.to_string()),
+        ],
+    }];
     ProjectorResult::valid(ops)
 }
 
@@ -135,20 +151,25 @@ pub fn project_signed_memo_pure(
     memo: &SignedMemoEvent,
 ) -> ProjectorResult {
     let signed_by_b64 = event_id_to_base64(&memo.signed_by);
-    let ops = vec![
-        WriteOp::InsertOrIgnore {
-            table: "signed_memos",
-            columns: vec!["event_id", "signed_by", "signer_type", "content", "created_at", "recorded_by"],
-            values: vec![
-                SqlVal::Text(event_id_b64.to_string()),
-                SqlVal::Text(signed_by_b64),
-                SqlVal::Int(memo.signer_type as i64),
-                SqlVal::Text(memo.content.clone()),
-                SqlVal::Int(memo.created_at_ms as i64),
-                SqlVal::Text(recorded_by.to_string()),
-            ],
-        },
-    ];
+    let ops = vec![WriteOp::InsertOrIgnore {
+        table: "signed_memos",
+        columns: vec![
+            "event_id",
+            "signed_by",
+            "signer_type",
+            "content",
+            "created_at",
+            "recorded_by",
+        ],
+        values: vec![
+            SqlVal::Text(event_id_b64.to_string()),
+            SqlVal::Text(signed_by_b64),
+            SqlVal::Int(memo.signer_type as i64),
+            SqlVal::Text(memo.content.clone()),
+            SqlVal::Int(memo.created_at_ms as i64),
+            SqlVal::Text(recorded_by.to_string()),
+        ],
+    }];
     ProjectorResult::valid(ops)
 }
 
@@ -177,9 +198,7 @@ pub fn project_message_deletion_pure(
     // (target_event_id was removed from deps for the intent-only path,
     // so we check the target type at projection time instead.)
     if ctx.target_is_non_message {
-        return ProjectorResult::reject(
-            "deletion target is a non-message event".to_string(),
-        );
+        return ProjectorResult::reject("deletion target is a non-message event".to_string());
     }
 
     // Already tombstoned — verify author, return AlreadyProcessed
@@ -191,20 +210,25 @@ pub fn project_message_deletion_pure(
         }
         // Deletion intent should still be recorded for idempotence,
         // but it's a no-op if already exists.
-        let ops = vec![
-            WriteOp::InsertOrIgnore {
-                table: "deletion_intents",
-                columns: vec!["recorded_by", "target_kind", "target_id", "deletion_event_id", "author_id", "created_at"],
-                values: vec![
-                    SqlVal::Text(recorded_by.to_string()),
-                    SqlVal::Text("message".to_string()),
-                    SqlVal::Text(target_b64),
-                    SqlVal::Text(event_id_b64.to_string()),
-                    SqlVal::Text(del_author_b64),
-                    SqlVal::Int(del.created_at_ms as i64),
-                ],
-            },
-        ];
+        let ops = vec![WriteOp::InsertOrIgnore {
+            table: "deletion_intents",
+            columns: vec![
+                "recorded_by",
+                "target_kind",
+                "target_id",
+                "deletion_event_id",
+                "author_id",
+                "created_at",
+            ],
+            values: vec![
+                SqlVal::Text(recorded_by.to_string()),
+                SqlVal::Text("message".to_string()),
+                SqlVal::Text(target_b64),
+                SqlVal::Text(event_id_b64.to_string()),
+                SqlVal::Text(del_author_b64),
+                SqlVal::Int(del.created_at_ms as i64),
+            ],
+        }];
         return ProjectorResult {
             decision: super::decision::ProjectionDecision::AlreadyProcessed,
             write_ops: ops,
@@ -213,20 +237,25 @@ pub fn project_message_deletion_pure(
     }
 
     // Always record deletion intent (idempotent via INSERT OR IGNORE)
-    let mut ops = vec![
-        WriteOp::InsertOrIgnore {
-            table: "deletion_intents",
-            columns: vec!["recorded_by", "target_kind", "target_id", "deletion_event_id", "author_id", "created_at"],
-            values: vec![
-                SqlVal::Text(recorded_by.to_string()),
-                SqlVal::Text("message".to_string()),
-                SqlVal::Text(target_b64.clone()),
-                SqlVal::Text(event_id_b64.to_string()),
-                SqlVal::Text(del_author_b64.clone()),
-                SqlVal::Int(del.created_at_ms as i64),
-            ],
-        },
-    ];
+    let mut ops = vec![WriteOp::InsertOrIgnore {
+        table: "deletion_intents",
+        columns: vec![
+            "recorded_by",
+            "target_kind",
+            "target_id",
+            "deletion_event_id",
+            "author_id",
+            "created_at",
+        ],
+        values: vec![
+            SqlVal::Text(recorded_by.to_string()),
+            SqlVal::Text("message".to_string()),
+            SqlVal::Text(target_b64.clone()),
+            SqlVal::Text(event_id_b64.to_string()),
+            SqlVal::Text(del_author_b64.clone()),
+            SqlVal::Int(del.created_at_ms as i64),
+        ],
+    }];
 
     // Target exists — verify author, emit tombstone + cascade
     if let Some(ref msg_author) = ctx.target_message_author {
@@ -239,7 +268,13 @@ pub fn project_message_deletion_pure(
         // Tombstone
         ops.push(WriteOp::InsertOrIgnore {
             table: "deleted_messages",
-            columns: vec!["recorded_by", "message_id", "deletion_event_id", "author_id", "deleted_at"],
+            columns: vec![
+                "recorded_by",
+                "message_id",
+                "deletion_event_id",
+                "author_id",
+                "deleted_at",
+            ],
             values: vec![
                 SqlVal::Text(recorded_by.to_string()),
                 SqlVal::Text(target_b64.clone()),
@@ -286,35 +321,45 @@ pub fn project_message_attachment_pure(
     let key_event_id_b64 = event_id_to_base64(&att.key_event_id);
     let signer_event_id_b64 = event_id_to_base64(&att.signed_by);
 
-    let ops = vec![
-        WriteOp::InsertOrIgnore {
-            table: "message_attachments",
-            columns: vec![
-                "recorded_by", "event_id", "message_id", "file_id",
-                "blob_bytes", "total_slices", "slice_bytes", "root_hash",
-                "key_event_id", "filename", "mime_type", "created_at", "signer_event_id",
-            ],
-            values: vec![
-                SqlVal::Text(recorded_by.to_string()),
-                SqlVal::Text(event_id_b64.to_string()),
-                SqlVal::Text(message_id_b64),
-                SqlVal::Text(file_id_b64.clone()),
-                SqlVal::Int(att.blob_bytes as i64),
-                SqlVal::Int(att.total_slices as i64),
-                SqlVal::Int(att.slice_bytes as i64),
-                SqlVal::Blob(att.root_hash.to_vec()),
-                SqlVal::Text(key_event_id_b64),
-                SqlVal::Text(att.filename.clone()),
-                SqlVal::Text(att.mime_type.clone()),
-                SqlVal::Int(att.created_at_ms as i64),
-                SqlVal::Text(signer_event_id_b64),
-            ],
-        },
-    ];
+    let ops = vec![WriteOp::InsertOrIgnore {
+        table: "message_attachments",
+        columns: vec![
+            "recorded_by",
+            "event_id",
+            "message_id",
+            "file_id",
+            "blob_bytes",
+            "total_slices",
+            "slice_bytes",
+            "root_hash",
+            "key_event_id",
+            "filename",
+            "mime_type",
+            "created_at",
+            "signer_event_id",
+        ],
+        values: vec![
+            SqlVal::Text(recorded_by.to_string()),
+            SqlVal::Text(event_id_b64.to_string()),
+            SqlVal::Text(message_id_b64),
+            SqlVal::Text(file_id_b64.clone()),
+            SqlVal::Int(att.blob_bytes as i64),
+            SqlVal::Int(att.total_slices as i64),
+            SqlVal::Int(att.slice_bytes as i64),
+            SqlVal::Blob(att.root_hash.to_vec()),
+            SqlVal::Text(key_event_id_b64),
+            SqlVal::Text(att.filename.clone()),
+            SqlVal::Text(att.mime_type.clone()),
+            SqlVal::Int(att.created_at_ms as i64),
+            SqlVal::Text(signer_event_id_b64),
+        ],
+    }];
 
     ProjectorResult::valid_with_commands(
         ops,
-        vec![EmitCommand::RetryFileSliceGuards { file_id: file_id_b64 }],
+        vec![EmitCommand::RetryFileSliceGuards {
+            file_id: file_id_b64,
+        }],
     )
 }
 
@@ -391,19 +436,24 @@ pub fn project_file_slice_pure(
     // projection is serialized in the ingest runtime. InsertOrIgnore is
     // idempotent for replay, and concurrent slot claiming by different events
     // cannot occur within a single connection.
-    let ops = vec![
-        WriteOp::InsertOrIgnore {
-            table: "file_slices",
-            columns: vec!["recorded_by", "file_id", "slice_number", "event_id", "created_at", "descriptor_event_id"],
-            values: vec![
-                SqlVal::Text(recorded_by.to_string()),
-                SqlVal::Text(file_id_b64),
-                SqlVal::Int(fs.slice_number as i64),
-                SqlVal::Text(event_id_b64.to_string()),
-                SqlVal::Int(fs.created_at_ms as i64),
-                SqlVal::Text(descriptor_event_id),
-            ],
-        },
-    ];
+    let ops = vec![WriteOp::InsertOrIgnore {
+        table: "file_slices",
+        columns: vec![
+            "recorded_by",
+            "file_id",
+            "slice_number",
+            "event_id",
+            "created_at",
+            "descriptor_event_id",
+        ],
+        values: vec![
+            SqlVal::Text(recorded_by.to_string()),
+            SqlVal::Text(file_id_b64),
+            SqlVal::Int(fs.slice_number as i64),
+            SqlVal::Text(event_id_b64.to_string()),
+            SqlVal::Int(fs.created_at_ms as i64),
+            SqlVal::Text(descriptor_event_id),
+        ],
+    }];
     ProjectorResult::valid(ops)
 }

@@ -8,7 +8,9 @@ use std::time::Instant;
 
 use crate::crypto::EventId;
 
-use super::{COORDINATOR_COLLECTION_POLL, COORDINATOR_COLLECTION_WINDOW, COORDINATOR_POLL_INTERVAL};
+use super::{
+    COORDINATOR_COLLECTION_POLL, COORDINATOR_COLLECTION_WINDOW, COORDINATOR_POLL_INTERVAL,
+};
 
 /// Per-peer coordination handles for coordinated multi-source download.
 ///

@@ -1,12 +1,12 @@
 use rusqlite::Connection;
 
-use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use aes_gcm::aead::Aead;
+use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 
+use super::apply::run_dep_and_projection_stages;
+use super::decision::ProjectionDecision;
 use crate::crypto::event_id_to_base64;
 use crate::event_modules::{self as events, EncryptedEvent, EVENT_TYPE_ENCRYPTED};
-use super::decision::ProjectionDecision;
-use super::apply::run_dep_and_projection_stages;
 
 /// Project an encrypted event: decrypt, parse inner, verify admissibility,
 /// then hand off to shared pipeline stages (dep check, signer verify,
@@ -50,8 +50,8 @@ pub fn project_encrypted(
     key_arr.copy_from_slice(&key_bytes);
 
     // 2. Decrypt: AES-256-GCM
-    let cipher = Aes256Gcm::new_from_slice(&key_arr)
-        .map_err(|e| format!("aes-gcm key init: {}", e))?;
+    let cipher =
+        Aes256Gcm::new_from_slice(&key_arr).map_err(|e| format!("aes-gcm key init: {}", e))?;
     let nonce = Nonce::from_slice(&enc.nonce);
 
     // Combine ciphertext + auth_tag for aes-gcm crate (it expects tag appended)
@@ -132,14 +132,14 @@ pub fn encrypt_event_blob(
 ) -> Result<([u8; 12], Vec<u8>, [u8; 16]), Box<dyn std::error::Error>> {
     use rand::RngCore;
 
-    let cipher = Aes256Gcm::new_from_slice(key)
-        .map_err(|e| format!("aes-gcm key init: {}", e))?;
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| format!("aes-gcm key init: {}", e))?;
 
     let mut nonce_bytes = [0u8; 12];
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
 
-    let ciphertext_with_tag = cipher.encrypt(nonce, plaintext)
+    let ciphertext_with_tag = cipher
+        .encrypt(nonce, plaintext)
         .map_err(|e| format!("aes-gcm encrypt: {}", e))?;
 
     // aes-gcm appends the 16-byte tag to the ciphertext
@@ -173,12 +173,9 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 /// and hashes the shared point with BLAKE2b-256 for domain separation.
 /// Both sender and recipient derive the same key from their own private
 /// key and the other's public key.
-fn derive_wrap_key(
-    local_private: &SigningKey,
-    remote_public: &VerifyingKey,
-) -> [u8; 32] {
-    use blake2::{Blake2b, Digest};
+fn derive_wrap_key(local_private: &SigningKey, remote_public: &VerifyingKey) -> [u8; 32] {
     use blake2::digest::consts::U32;
+    use blake2::{Blake2b, Digest};
 
     // Convert Ed25519 keys to X25519 (Montgomery form)
     let local_scalar = local_private.to_scalar();
@@ -244,20 +241,14 @@ mod tests {
 
         let plaintext_key = [0x42u8; 32];
 
-        let wrapped = wrap_key_for_recipient(
-            &sender_key,
-            &recipient_key.verifying_key(),
-            &plaintext_key,
-        );
+        let wrapped =
+            wrap_key_for_recipient(&sender_key, &recipient_key.verifying_key(), &plaintext_key);
 
         // Wrapped key should differ from plaintext
         assert_ne!(wrapped, plaintext_key);
 
-        let unwrapped = unwrap_key_from_sender(
-            &recipient_key,
-            &sender_key.verifying_key(),
-            &wrapped,
-        );
+        let unwrapped =
+            unwrap_key_from_sender(&recipient_key, &sender_key.verifying_key(), &wrapped);
 
         assert_eq!(unwrapped, plaintext_key);
     }
@@ -271,18 +262,11 @@ mod tests {
 
         let plaintext_key = [0xAB; 32];
 
-        let wrapped = wrap_key_for_recipient(
-            &sender_key,
-            &recipient_key.verifying_key(),
-            &plaintext_key,
-        );
+        let wrapped =
+            wrap_key_for_recipient(&sender_key, &recipient_key.verifying_key(), &plaintext_key);
 
         // Wrong recipient cannot unwrap
-        let bad_unwrap = unwrap_key_from_sender(
-            &wrong_key,
-            &sender_key.verifying_key(),
-            &wrapped,
-        );
+        let bad_unwrap = unwrap_key_from_sender(&wrong_key, &sender_key.verifying_key(), &wrapped);
         assert_ne!(bad_unwrap, plaintext_key);
     }
 
@@ -295,16 +279,8 @@ mod tests {
         let key_a = [0x11u8; 32];
         let key_b = [0x22u8; 32];
 
-        let wrapped_a = wrap_key_for_recipient(
-            &sender_key,
-            &recipient_key.verifying_key(),
-            &key_a,
-        );
-        let wrapped_b = wrap_key_for_recipient(
-            &sender_key,
-            &recipient_key.verifying_key(),
-            &key_b,
-        );
+        let wrapped_a = wrap_key_for_recipient(&sender_key, &recipient_key.verifying_key(), &key_a);
+        let wrapped_b = wrap_key_for_recipient(&sender_key, &recipient_key.verifying_key(), &key_b);
 
         assert_ne!(wrapped_a, wrapped_b);
     }

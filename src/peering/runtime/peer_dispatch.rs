@@ -95,9 +95,16 @@ pub(crate) fn spawn_connect_loop_thread(
             .build()
             .unwrap();
         rt.block_on(async move {
-            if let Err(e) =
-                connect_loop(&db_path, &tenant_id, endpoint, remote, Some(cfg), intro_spawner, ingest)
-                    .await
+            if let Err(e) = connect_loop(
+                &db_path,
+                &tenant_id,
+                endpoint,
+                remote,
+                Some(cfg),
+                intro_spawner,
+                ingest,
+            )
+            .await
             {
                 warn!(
                     "{} connect_loop for {} to {} exited: {}",

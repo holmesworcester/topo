@@ -17,8 +17,8 @@ use crate::db::{
     open_connection,
     store::{lookup_workspace_id, Store},
 };
-use crate::runtime::SyncStats;
 use crate::protocol::SyncMessage;
+use crate::runtime::SyncStats;
 use crate::sync::negentropy_sqlite::NegentropyStorageSqlite;
 use crate::transport::connection::ConnectionError;
 use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
@@ -93,9 +93,8 @@ where
         let events_received_writer = events_received.clone();
         let db_path_owned = db_path.to_string();
         let bw = batch_writer_fn;
-        let handle = tokio::task::spawn_blocking(move || {
-            bw(db_path_owned, rx, events_received_writer)
-        });
+        let handle =
+            tokio::task::spawn_blocking(move || bw(db_path_owned, rx, events_received_writer));
         (tx, Some(handle))
     };
 

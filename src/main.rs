@@ -357,7 +357,8 @@ fn resolve_db_arg(raw: &str) -> Result<String, String> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cli = Cli::parse();
-    let db = &resolve_db_arg(&cli.db).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+    let db = &resolve_db_arg(&cli.db)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
     let socket_override = cli.socket.clone();
 
     // Init tracing for commands that need it
@@ -480,8 +481,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // ---------------------------------------------------------------
         // Direct-only commands (no daemon needed)
         // ---------------------------------------------------------------
-        Commands::CreateWorkspace { workspace_name, username, device_name } => {
-            let result = service::svc_create_workspace(db, &workspace_name, &username, &device_name)?;
+        Commands::CreateWorkspace {
+            workspace_name,
+            username,
+            device_name,
+        } => {
+            let result =
+                service::svc_create_workspace(db, &workspace_name, &username, &device_name)?;
             println!("peer_id:      {}", result.peer_id);
             println!("workspace_id: {}", result.workspace_id);
         }
@@ -561,11 +567,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
 
         Commands::View { limit } => {
-            let data = rpc_require_daemon(
-                db,
-                socket_override.as_deref(),
-                RpcMethod::View { limit },
-            )?;
+            let data =
+                rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::View { limit })?;
             show_view(&data);
         }
 
@@ -884,11 +887,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         }
 
-        Commands::CreateInvite { public_addr, public_spki } => {
+        Commands::CreateInvite {
+            public_addr,
+            public_spki,
+        } => {
             let data = rpc_require_daemon(
                 db,
                 socket_override.as_deref(),
-                RpcMethod::CreateInvite { public_addr, public_spki },
+                RpcMethod::CreateInvite {
+                    public_addr,
+                    public_spki,
+                },
             )?;
             println!("{}", data["invite_link"].as_str().unwrap_or(""));
             if let Some(num) = data["invite_ref"].as_u64() {
@@ -896,11 +905,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         }
 
-        Commands::Link { public_addr, public_spki } => {
+        Commands::Link {
+            public_addr,
+            public_spki,
+        } => {
             let data = rpc_require_daemon(
                 db,
                 socket_override.as_deref(),
-                RpcMethod::CreateDeviceLink { public_addr, public_spki },
+                RpcMethod::CreateDeviceLink {
+                    public_addr,
+                    public_spki,
+                },
             )?;
             println!("{}", data["invite_link"].as_str().unwrap_or(""));
             if let Some(num) = data["invite_ref"].as_u64() {
@@ -932,7 +947,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Commands::Identity => {
             let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::Identity)?;
             println!("IDENTITY:");
-            println!("  Transport: {}", data["transport_fingerprint"].as_str().unwrap_or(""));
+            println!(
+                "  Transport: {}",
+                data["transport_fingerprint"].as_str().unwrap_or("")
+            );
             match data["user_event_id"].as_str() {
                 Some(uid) => println!("  User:      {}", &uid[..uid.len().min(16)]),
                 None => println!("  User:      (none)"),
@@ -948,7 +966,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             println!("CHANNELS:");
             if let Some(items) = data.as_array() {
                 for item in items {
-                    let marker = if item["active"].as_bool().unwrap_or(false) { "*" } else { " " };
+                    let marker = if item["active"].as_bool().unwrap_or(false) {
+                        "*"
+                    } else {
+                        " "
+                    };
                     let idx = item["index"].as_u64().unwrap_or(0);
                     let name = item["name"].as_str().unwrap_or("");
                     println!("  {}{}. #{}", marker, idx, name);
@@ -984,49 +1006,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // ---------------------------------------------------------------
         // DB registry management (no daemon needed)
         // ---------------------------------------------------------------
-        Commands::Db { action } => {
-            match action {
-                DbAction::Add { path, name } => {
-                    let mut registry = DbRegistry::load();
-                    registry.add(&path, name.as_deref())?;
-                    registry.save()?;
-                    let display_name = name.as_deref().unwrap_or("(none)");
-                    println!("Added {} (alias: {})", path, display_name);
-                }
-                DbAction::List => {
-                    let registry = DbRegistry::load();
-                    if registry.entries.is_empty() {
-                        println!("No databases registered.");
-                        println!("  Use `topo db add <path> --name <alias>` to register one.");
-                    } else {
-                        println!("DATABASES:");
-                        for (i, entry) in registry.entries.iter().enumerate() {
-                            let marker = if entry.is_default { "*" } else { " " };
-                            let name = entry.name.as_deref().unwrap_or("-");
-                            println!("  {}{}. {} ({})", marker, i + 1, name, entry.path);
-                        }
+        Commands::Db { action } => match action {
+            DbAction::Add { path, name } => {
+                let mut registry = DbRegistry::load();
+                registry.add(&path, name.as_deref())?;
+                registry.save()?;
+                let display_name = name.as_deref().unwrap_or("(none)");
+                println!("Added {} (alias: {})", path, display_name);
+            }
+            DbAction::List => {
+                let registry = DbRegistry::load();
+                if registry.entries.is_empty() {
+                    println!("No databases registered.");
+                    println!("  Use `topo db add <path> --name <alias>` to register one.");
+                } else {
+                    println!("DATABASES:");
+                    for (i, entry) in registry.entries.iter().enumerate() {
+                        let marker = if entry.is_default { "*" } else { " " };
+                        let name = entry.name.as_deref().unwrap_or("-");
+                        println!("  {}{}. {} ({})", marker, i + 1, name, entry.path);
                     }
                 }
-                DbAction::Remove { selector } => {
-                    let mut registry = DbRegistry::load();
-                    let removed = registry.remove(&selector)?;
-                    registry.save()?;
-                    println!("Removed {}", removed.path);
-                }
-                DbAction::Rename { selector, new_name } => {
-                    let mut registry = DbRegistry::load();
-                    registry.rename(&selector, &new_name)?;
-                    registry.save()?;
-                    println!("Renamed to {}", new_name);
-                }
-                DbAction::Default { selector } => {
-                    let mut registry = DbRegistry::load();
-                    registry.set_default(&selector)?;
-                    registry.save()?;
-                    println!("Default set to {}", selector);
-                }
             }
-        }
+            DbAction::Remove { selector } => {
+                let mut registry = DbRegistry::load();
+                let removed = registry.remove(&selector)?;
+                registry.save()?;
+                println!("Removed {}", removed.path);
+            }
+            DbAction::Rename { selector, new_name } => {
+                let mut registry = DbRegistry::load();
+                registry.rename(&selector, &new_name)?;
+                registry.save()?;
+                println!("Renamed to {}", new_name);
+            }
+            DbAction::Default { selector } => {
+                let mut registry = DbRegistry::load();
+                registry.set_default(&selector)?;
+                registry.save()?;
+                println!("Default set to {}", selector);
+            }
+        },
 
         Commands::Upnp => {
             let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::Upnp)?;

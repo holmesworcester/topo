@@ -248,7 +248,9 @@ mod tests {
         // Before removal: neither peer is removed
         assert!(!is_peer_removed(&conn, recorded_by, &spki_a).unwrap());
         assert!(!is_peer_removed(&conn, recorded_by, &spki_b).unwrap());
-        assert!(removed_peer_spki_fingerprints(&conn, recorded_by).unwrap().is_empty());
+        assert!(removed_peer_spki_fingerprints(&conn, recorded_by)
+            .unwrap()
+            .is_empty());
 
         // Remove the user (transitive removal of both peers)
         conn.execute(

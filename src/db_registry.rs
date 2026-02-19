@@ -59,8 +59,7 @@ impl DbRegistry {
         }
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| format!("failed to serialize registry: {}", e))?;
-        std::fs::write(&path, json)
-            .map_err(|e| format!("failed to write registry: {}", e))?;
+        std::fs::write(&path, json).map_err(|e| format!("failed to write registry: {}", e))?;
         Ok(())
     }
 
@@ -103,7 +102,11 @@ impl DbRegistry {
 
     pub fn rename(&mut self, selector: &str, new_name: &str) -> Result<(), String> {
         // Check for duplicate name
-        if self.entries.iter().any(|e| e.name.as_deref() == Some(new_name)) {
+        if self
+            .entries
+            .iter()
+            .any(|e| e.name.as_deref() == Some(new_name))
+        {
             return Err(format!("name already in use: {}", new_name));
         }
         let idx = self.find_index(selector)?;
@@ -131,7 +134,11 @@ impl DbRegistry {
         }
 
         // 2. Exact alias match
-        if let Some(entry) = self.entries.iter().find(|e| e.name.as_deref() == Some(selector)) {
+        if let Some(entry) = self
+            .entries
+            .iter()
+            .find(|e| e.name.as_deref() == Some(selector))
+        {
             return Ok(entry.path.clone());
         }
 
@@ -161,7 +168,11 @@ impl DbRegistry {
 
     fn find_index(&self, selector: &str) -> Result<usize, String> {
         // By name
-        if let Some(idx) = self.entries.iter().position(|e| e.name.as_deref() == Some(selector)) {
+        if let Some(idx) = self
+            .entries
+            .iter()
+            .position(|e| e.name.as_deref() == Some(selector))
+        {
             return Ok(idx);
         }
 

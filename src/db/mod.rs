@@ -1,15 +1,15 @@
-pub mod migrations;
-pub mod schema;
-pub mod store;
-pub mod wanted;
-pub mod queue;
-pub mod project_queue;
 pub mod egress_queue;
 pub mod health;
-pub mod transport_trust;
 pub mod intro;
-pub mod transport_creds;
+pub mod migrations;
+pub mod project_queue;
+pub mod queue;
 pub mod removal_watch;
+pub mod schema;
+pub mod store;
+pub mod transport_creds;
+pub mod transport_trust;
+pub mod wanted;
 
 use rusqlite::{Connection, Result as SqliteResult};
 use std::path::Path;
@@ -74,11 +74,7 @@ fn read_bool_env(name: &str) -> bool {
 /// a joiner transitions from an invite-derived transport identity to a
 /// PeerShared-derived one, ensuring transport-layer and event-layer identities
 /// match.
-pub fn migrate_recorded_by(
-    conn: &Connection,
-    old: &str,
-    new: &str,
-) -> Result<(), rusqlite::Error> {
+pub fn migrate_recorded_by(conn: &Connection, old: &str, new: &str) -> Result<(), rusqlite::Error> {
     // Use RAII transaction: auto-rolls-back on drop if not committed,
     // preventing partial state on constraint errors.
     let tx = conn.unchecked_transaction()?;
@@ -108,7 +104,10 @@ pub fn migrate_recorded_by(
         "peer_endpoint_observations",
     ] {
         tx.execute(
-            &format!("UPDATE {} SET recorded_by = ?1 WHERE recorded_by = ?2", table),
+            &format!(
+                "UPDATE {} SET recorded_by = ?1 WHERE recorded_by = ?2",
+                table
+            ),
             rusqlite::params![new, old],
         )?;
     }

@@ -115,7 +115,11 @@ pub async fn bootstrap_sync_from_invite(
         remote_addr: connection.remote_address(),
         direction: SessionDirection::Outbound,
     };
-    let handler = ReplicationSessionHandler::initiator(db_path.to_string(), timeout_secs, crate::event_pipeline::batch_writer);
+    let handler = ReplicationSessionHandler::initiator(
+        db_path.to_string(),
+        timeout_secs,
+        crate::event_pipeline::batch_writer,
+    );
     let io = SyncSessionIo::new(session_id, conn);
     handler
         .on_session(meta, Box::new(io), CancellationToken::new())

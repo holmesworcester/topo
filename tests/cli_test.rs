@@ -1,8 +1,8 @@
+use rusqlite::Connection;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use rusqlite::Connection;
 
 fn bin() -> String {
     env!("CARGO_BIN_EXE_topo").to_string()
@@ -298,18 +298,34 @@ fn test_cli_bidirectional_sync() {
 
     // Bob sends a message in the shared workspace
     let bob_eid = send_message(&bob_db, "Hey Alice!");
-    assert_eventually(&alice_db, &format!("has_event:{} >= 1", bob_eid), timeout_ms);
-    assert_eventually(&bob_db, &format!("has_event:{} >= 1", alice_eid), timeout_ms);
+    assert_eventually(
+        &alice_db,
+        &format!("has_event:{} >= 1", bob_eid),
+        timeout_ms,
+    );
+    assert_eventually(
+        &bob_db,
+        &format!("has_event:{} >= 1", alice_eid),
+        timeout_ms,
+    );
 
     // Verify specific message content arrived on both sides
     let alice_msgs = get_messages(&alice_db);
-    assert!(alice_msgs.len() >= 3, "Alice should see at least 3 messages, got {}", alice_msgs.len());
+    assert!(
+        alice_msgs.len() >= 3,
+        "Alice should see at least 3 messages, got {}",
+        alice_msgs.len()
+    );
     assert!(alice_msgs.contains(&"Hello from Alice".to_string()));
     assert!(alice_msgs.contains(&"How are you?".to_string()));
     assert!(alice_msgs.contains(&"Hey Alice!".to_string()));
 
     let bob_msgs = get_messages(&bob_db);
-    assert!(bob_msgs.len() >= 3, "Bob should see at least 3 messages, got {}", bob_msgs.len());
+    assert!(
+        bob_msgs.len() >= 3,
+        "Bob should see at least 3 messages, got {}",
+        bob_msgs.len()
+    );
     assert!(bob_msgs.contains(&"Hello from Alice".to_string()));
     assert!(bob_msgs.contains(&"How are you?".to_string()));
     assert!(bob_msgs.contains(&"Hey Alice!".to_string()));
@@ -354,8 +370,16 @@ fn test_cli_ongoing_sync() {
     std::thread::sleep(Duration::from_secs(1));
     let alice_last_eid = send_message(&alice_db, "Round 4");
 
-    assert_eventually(&alice_db, &format!("has_event:{} >= 1", bob_last_eid), timeout_ms);
-    assert_eventually(&bob_db, &format!("has_event:{} >= 1", alice_last_eid), timeout_ms);
+    assert_eventually(
+        &alice_db,
+        &format!("has_event:{} >= 1", bob_last_eid),
+        timeout_ms,
+    );
+    assert_eventually(
+        &bob_db,
+        &format!("has_event:{} >= 1", alice_last_eid),
+        timeout_ms,
+    );
 
     let _ = alice.kill();
     let _ = bob.kill();
@@ -388,8 +412,16 @@ fn test_cli_local_mdns_discovery_without_placeholder_autodial() {
 
     // Validate bidirectional convergence.
     let bob_msg_eid = send_message(&bob_db, "bob-via-mdns-localhost");
-    assert_eventually(&alice_db, &format!("has_event:{} >= 1", bob_msg_eid), timeout_ms);
-    assert_eventually(&bob_db, &format!("has_event:{} >= 1", alice_seed_eid), timeout_ms);
+    assert_eventually(
+        &alice_db,
+        &format!("has_event:{} >= 1", bob_msg_eid),
+        timeout_ms,
+    );
+    assert_eventually(
+        &bob_db,
+        &format!("has_event:{} >= 1", alice_seed_eid),
+        timeout_ms,
+    );
 
     let _ = alice.kill();
     let _ = bob.kill();
@@ -546,7 +578,11 @@ fn test_cli_sync_bootstrap_from_accepted_invite_data() {
     std::thread::sleep(Duration::from_secs(1));
 
     let bob_eid = send_message(&bob_db, "bootstrap trust from invite data");
-    assert_eventually(&alice_db, &format!("has_event:{} >= 1", bob_eid), timeout_ms);
+    assert_eventually(
+        &alice_db,
+        &format!("has_event:{} >= 1", bob_eid),
+        timeout_ms,
+    );
 
     let _ = alice.kill();
     let _ = bob.kill();
@@ -567,7 +603,10 @@ fn test_cli_completions_bash() {
     assert!(output.status.success(), "completions bash failed");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(!stdout.is_empty(), "bash completions should produce output");
-    assert!(stdout.contains("topo"), "bash completions should reference 'topo'");
+    assert!(
+        stdout.contains("topo"),
+        "bash completions should reference 'topo'"
+    );
 }
 
 #[test]
@@ -620,7 +659,12 @@ fn test_cli_ban_user() {
 #[test]
 fn test_cli_workspaces_alias() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let db = tmpdir.path().join("wsalias.db").to_str().unwrap().to_string();
+    let db = tmpdir
+        .path()
+        .join("wsalias.db")
+        .to_str()
+        .unwrap()
+        .to_string();
     let port = random_port();
 
     create_workspace(&db);
@@ -633,7 +677,10 @@ fn test_cli_workspaces_alias() {
         .expect("networks command");
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("WORKSPACES"), "networks should show WORKSPACES header");
+    assert!(
+        stdout.contains("WORKSPACES"),
+        "networks should show WORKSPACES header"
+    );
 
     let out = Command::new(bin())
         .args(["--db", &db, "workspaces"])
@@ -641,7 +688,10 @@ fn test_cli_workspaces_alias() {
         .expect("workspaces command");
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("WORKSPACES"), "workspaces alias should work");
+    assert!(
+        stdout.contains("WORKSPACES"),
+        "workspaces alias should work"
+    );
 
     let _ = daemon.kill();
     let _ = daemon.wait();
@@ -729,7 +779,12 @@ fn test_cli_db_invalid_numeric_selector_errors() {
 #[test]
 fn test_cli_react_by_message_number() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let db = tmpdir.path().join("msgnum.db").to_str().unwrap().to_string();
+    let db = tmpdir
+        .path()
+        .join("msgnum.db")
+        .to_str()
+        .unwrap()
+        .to_string();
     let port = random_port();
 
     create_workspace(&db);
@@ -750,7 +805,11 @@ fn test_cli_react_by_message_number() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("Reacted"), "expected Reacted output, got: {}", stdout);
+    assert!(
+        stdout.contains("Reacted"),
+        "expected Reacted output, got: {}",
+        stdout
+    );
 
     // React to message #2 with # prefix.
     let out = Command::new(bin())
@@ -774,16 +833,27 @@ fn test_cli_react_by_message_number() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("Deleted"), "expected Deleted output, got: {}", stdout);
+    assert!(
+        stdout.contains("Deleted"),
+        "expected Deleted output, got: {}",
+        stdout
+    );
 
     // Invalid message number should error.
     let out = Command::new(bin())
         .args(["--db", &db, "react", "--target", "99", "sad"])
         .output()
         .expect("react invalid number");
-    assert!(!out.status.success(), "should fail for invalid message number");
+    assert!(
+        !out.status.success(),
+        "should fail for invalid message number"
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("invalid message number"), "expected error message, got: {}", stderr);
+    assert!(
+        stderr.contains("invalid message number"),
+        "expected error message, got: {}",
+        stderr
+    );
 
     let _ = daemon.kill();
     let _ = daemon.wait();

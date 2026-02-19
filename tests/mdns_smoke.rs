@@ -10,9 +10,9 @@ fn routable_ip() -> String {
 #[cfg(feature = "discovery")]
 #[test]
 fn mdns_smoke_tenant_discovery() {
-    use topo::peering::discovery::TenantDiscovery;
     use std::collections::HashSet;
     use std::time::{Duration, Instant};
+    use topo::peering::discovery::TenantDiscovery;
 
     let ip = routable_ip();
     let local_ids: HashSet<String> = ["self-id".to_string()].into_iter().collect();
@@ -48,29 +48,28 @@ fn mdns_smoke_tenant_discovery() {
     drop(disc);
     drop(disc2);
 
-    assert!(found, "TenantDiscovery did not discover remote peer within 15s");
+    assert!(
+        found,
+        "TenantDiscovery did not discover remote peer within 15s"
+    );
 }
 
 /// Verify that two tenants with explicit advertise IPs discover each other.
 #[cfg(feature = "discovery")]
 #[test]
 fn mdns_smoke_explicit_advertise_ip() {
-    use topo::peering::discovery::TenantDiscovery;
     use std::collections::HashSet;
     use std::time::{Duration, Instant};
+    use topo::peering::discovery::TenantDiscovery;
 
     let ip = routable_ip();
 
     let local_a: HashSet<String> = ["exp-peer-a".to_string()].into_iter().collect();
     let local_b: HashSet<String> = ["exp-peer-b".to_string()].into_iter().collect();
 
-    let disc_a = TenantDiscovery::new(
-        "exp-peer-a", 55001, local_a, &ip,
-    ).expect("disc_a");
+    let disc_a = TenantDiscovery::new("exp-peer-a", 55001, local_a, &ip).expect("disc_a");
 
-    let disc_b = TenantDiscovery::new(
-        "exp-peer-b", 55002, local_b, &ip,
-    ).expect("disc_b");
+    let disc_b = TenantDiscovery::new("exp-peer-b", 55002, local_b, &ip).expect("disc_b");
 
     let rx_a = disc_a.browse().expect("browse a");
 
@@ -79,7 +78,10 @@ fn mdns_smoke_explicit_advertise_ip() {
     while Instant::now() < deadline {
         match rx_a.recv_timeout(Duration::from_millis(500)) {
             Ok(peer) => {
-                eprintln!("explicit-ip-test: peer_id={}, addr={}", peer.peer_id, peer.addr);
+                eprintln!(
+                    "explicit-ip-test: peer_id={}, addr={}",
+                    peer.peer_id, peer.addr
+                );
                 if peer.peer_id == "exp-peer-b" {
                     assert_eq!(peer.addr.port(), 55002);
                     found = true;
@@ -94,5 +96,8 @@ fn mdns_smoke_explicit_advertise_ip() {
     drop(disc_a);
     drop(disc_b);
 
-    assert!(found, "mDNS with explicit advertise IP did not discover peer within 15s");
+    assert!(
+        found,
+        "mDNS with explicit advertise IP did not discover peer within 15s"
+    );
 }

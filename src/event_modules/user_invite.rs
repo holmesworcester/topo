@@ -4,20 +4,20 @@ use super::{EventError, ParsedEvent, EVENT_TYPE_USER_INVITE_BOOT, EVENT_TYPE_USE
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserInviteBootEvent {
     pub created_at_ms: u64,
-    pub public_key: [u8; 32],    // Ed25519 key for this invite
-    pub workspace_id: [u8; 32],    // reference (for workspace capture), NOT a dep
-    pub signed_by: [u8; 32],     // signer event_id (Workspace event)
-    pub signer_type: u8,         // 1 = workspace
+    pub public_key: [u8; 32],   // Ed25519 key for this invite
+    pub workspace_id: [u8; 32], // reference (for workspace capture), NOT a dep
+    pub signed_by: [u8; 32],    // signer event_id (Workspace event)
+    pub signer_type: u8,        // 1 = workspace
     pub signature: [u8; 64],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserInviteOngoingEvent {
     pub created_at_ms: u64,
-    pub public_key: [u8; 32],       // Ed25519 key for this invite
-    pub admin_event_id: [u8; 32],   // dep: admin event authorizing this invite
-    pub signed_by: [u8; 32],        // signer event_id (PeerShared event)
-    pub signer_type: u8,            // 5 = peer_shared
+    pub public_key: [u8; 32],     // Ed25519 key for this invite
+    pub admin_event_id: [u8; 32], // dep: admin event authorizing this invite
+    pub signed_by: [u8; 32],      // signer event_id (PeerShared event)
+    pub signer_type: u8,          // 5 = peer_shared
     pub signature: [u8; 64],
 }
 
@@ -31,13 +31,22 @@ pub struct UserInviteOngoingEvent {
 /// [106..170] signature (64 bytes)
 pub fn parse_user_invite_boot(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if blob.len() < 170 {
-        return Err(EventError::TooShort { expected: 170, actual: blob.len() });
+        return Err(EventError::TooShort {
+            expected: 170,
+            actual: blob.len(),
+        });
     }
     if blob.len() > 170 {
-        return Err(EventError::TrailingData { expected: 170, actual: blob.len() });
+        return Err(EventError::TrailingData {
+            expected: 170,
+            actual: blob.len(),
+        });
     }
     if blob[0] != EVENT_TYPE_USER_INVITE_BOOT {
-        return Err(EventError::WrongType { expected: EVENT_TYPE_USER_INVITE_BOOT, actual: blob[0] });
+        return Err(EventError::WrongType {
+            expected: EVENT_TYPE_USER_INVITE_BOOT,
+            actual: blob[0],
+        });
     }
 
     let created_at_ms = u64::from_le_bytes(blob[1..9].try_into().unwrap());
@@ -87,13 +96,22 @@ pub fn encode_user_invite_boot(event: &ParsedEvent) -> Result<Vec<u8>, EventErro
 /// [106..170] signature (64 bytes)
 pub fn parse_user_invite_ongoing(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if blob.len() < 170 {
-        return Err(EventError::TooShort { expected: 170, actual: blob.len() });
+        return Err(EventError::TooShort {
+            expected: 170,
+            actual: blob.len(),
+        });
     }
     if blob.len() > 170 {
-        return Err(EventError::TrailingData { expected: 170, actual: blob.len() });
+        return Err(EventError::TrailingData {
+            expected: 170,
+            actual: blob.len(),
+        });
     }
     if blob[0] != EVENT_TYPE_USER_INVITE_ONGOING {
-        return Err(EventError::WrongType { expected: EVENT_TYPE_USER_INVITE_ONGOING, actual: blob[0] });
+        return Err(EventError::WrongType {
+            expected: EVENT_TYPE_USER_INVITE_ONGOING,
+            actual: blob[0],
+        });
     }
 
     let created_at_ms = u64::from_le_bytes(blob[1..9].try_into().unwrap());
