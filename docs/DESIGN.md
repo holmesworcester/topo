@@ -1102,11 +1102,22 @@ src/event_modules/<name>/
 
 `mod.rs` re-exports all public items so callers continue to import from `event_modules::<name>`.
 
-## 14.4 Typed command dispatch
+## 14.4 Layout locality rule
+
+Wire layout constants (wire sizes, text-slot budgets, field offset modules) are owned by the event module that defines the event type:
+
+1. **Single-file events** (`foo.rs`): layout constants live inline in `foo.rs`.
+2. **Folderized events** (`foo/`): layout constants live in `foo/layout.rs`.
+3. **Shared cross-event primitives** (`COMMON_HEADER_BYTES`, `SIGNATURE_TRAILER_BYTES`, text-slot helpers, encrypted envelope helpers) live in `src/event_modules/layout/common.rs`.
+4. **Event modules must not import another event module's layout constants.** Cross-event wire math (e.g. `encrypted_inner_wire_size`) belongs in `layout/common.rs` and imports the needed per-event wire sizes.
+
+Do not reintroduce a global layout monolith. When adding a new event type, define its wire size and offsets in the owning module.
+
+## 14.5 Typed command dispatch
 
 `src/event_modules/dispatch.rs` provides an `EventCommand` enum and `execute_command()` function that routes creation to the appropriate event module. This enables callers that want a single entry point for event creation without depending on specific event module APIs.
 
-## 14.5 Adding a new event type
+## 14.6 Adding a new event type
 
 `dispatch_pure_projector` in `apply.rs` looks up the event's type code in the registry and calls the registered projector. No central match statement is required. Each event module owns its complete projection semantics.
 

@@ -1,5 +1,12 @@
+use super::layout::common::{COMMON_HEADER_BYTES, SIGNATURE_TRAILER_BYTES};
 use super::registry::{EventTypeMeta, ShareScope};
 use super::{EventError, ParsedEvent, EVENT_TYPE_SECRET_SHARED};
+
+// ─── Layout (owned by this module) ───
+
+/// SecretShared (type 22): type(1) + created_at(8) + key_event_id(32) + recipient_event_id(32)
+///                        + wrapped_key(32) + signed_by(32) + signer_type(1) + signature(64) = 202
+pub const SECRET_SHARED_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32 + 32 + 32 + SIGNATURE_TRAILER_BYTES;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecretSharedEvent {

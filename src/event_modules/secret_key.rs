@@ -1,5 +1,11 @@
+use super::layout::common::COMMON_HEADER_BYTES;
 use super::registry::{EventTypeMeta, ShareScope};
 use super::{EventError, ParsedEvent, EVENT_TYPE_SECRET_KEY};
+
+// ─── Layout (owned by this module) ───
+
+/// SecretKey (type 6): type(1) + created_at(8) + key_bytes(32) = 41
+pub const SECRET_KEY_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecretKeyEvent {

@@ -1,5 +1,15 @@
+use super::layout::common::{COMMON_HEADER_BYTES, SIGNATURE_TRAILER_BYTES};
 use super::registry::{EventTypeMeta, ShareScope};
 use super::{EventError, ParsedEvent, EVENT_TYPE_ADMIN_BOOT, EVENT_TYPE_ADMIN_ONGOING};
+
+// ─── Layout (owned by this module) ───
+
+/// AdminBoot (type 18): type(1) + created_at(8) + public_key(32) + user_event_id(32)
+///                     + signed_by(32) + signer_type(1) + signature(64) = 170
+pub const ADMIN_BOOT_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32 + 32 + SIGNATURE_TRAILER_BYTES;
+
+/// AdminOngoing (type 19): same layout as AdminBoot = 170
+pub const ADMIN_ONGOING_WIRE_SIZE: usize = ADMIN_BOOT_WIRE_SIZE;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdminBootEvent {

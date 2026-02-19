@@ -1,5 +1,11 @@
+use super::layout::common::COMMON_HEADER_BYTES;
 use super::registry::{EventTypeMeta, ShareScope};
 use super::{EventError, ParsedEvent, EVENT_TYPE_INVITE_ACCEPTED};
+
+// ─── Layout (owned by this module) ───
+
+/// InviteAccepted (type 9): type(1) + created_at(8) + invite_event_id(32) + workspace_id(32) = 73
+pub const INVITE_ACCEPTED_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32 + 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InviteAcceptedEvent {

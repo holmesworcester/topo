@@ -1,6 +1,29 @@
-use super::fixed_layout::{FILE_SLICE_WIRE_SIZE, FILE_SLICE_CIPHERTEXT_BYTES, file_slice_offsets as off};
+use super::layout::common::{COMMON_HEADER_BYTES, SIGNATURE_TRAILER_BYTES};
 use super::registry::{EventTypeMeta, ShareScope};
 use super::{EventError, ParsedEvent, EVENT_TYPE_FILE_SLICE};
+
+// ─── Layout (owned by this module) ───
+
+/// FileSlice: canonical fixed ciphertext size (256 KiB)
+pub const FILE_SLICE_CIPHERTEXT_BYTES: usize = 262_144;
+
+/// FileSlice (type 25): type(1) + created_at(8) + file_id(32) + slice_number(4)
+///   + ciphertext(262144) + signed_by(32) + signer_type(1) + signature(64) = 262286
+pub const FILE_SLICE_WIRE_SIZE: usize =
+    COMMON_HEADER_BYTES + 32 + 4 + FILE_SLICE_CIPHERTEXT_BYTES + SIGNATURE_TRAILER_BYTES;
+
+mod file_slice_offsets {
+    pub const TYPE_CODE: usize = 0;
+    pub const CREATED_AT: usize = 1;
+    pub const FILE_ID: usize = 9;
+    pub const SLICE_NUMBER: usize = 41;
+    pub const CIPHERTEXT: usize = 45;
+    pub const SIGNED_BY: usize = 45 + super::FILE_SLICE_CIPHERTEXT_BYTES; // 262189
+    pub const SIGNER_TYPE: usize = SIGNED_BY + 32;                         // 262221
+    pub const SIGNATURE: usize = SIGNER_TYPE + 1;                          // 262222
+}
+
+use file_slice_offsets as off;
 
 /// Maximum ciphertext size per file slice: canonical fixed 256 KiB.
 /// Final plaintext chunks are zero-padded before encryption.

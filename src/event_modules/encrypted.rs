@@ -1,6 +1,23 @@
-use super::fixed_layout::{self, encrypted_offsets as off, ENCRYPTED_AUTH_TAG_BYTES};
+use super::layout::common::{
+    ENCRYPTED_AUTH_TAG_BYTES,
+    encrypted_wire_size, encrypted_inner_wire_size,
+};
 use super::registry::{EventTypeMeta, ShareScope};
 use super::{EventError, ParsedEvent, EVENT_TYPE_ENCRYPTED};
+
+// ─── Layout (owned by this module) ───
+
+mod encrypted_offsets {
+    pub const TYPE_CODE: usize = 0;
+    pub const CREATED_AT: usize = 1;
+    pub const KEY_EVENT_ID: usize = 9;
+    pub const INNER_TYPE_CODE: usize = 41;
+    pub const NONCE: usize = 42;
+    pub const CIPHERTEXT: usize = 54;
+    // auth_tag follows ciphertext at CIPHERTEXT + ciphertext_size
+}
+
+use encrypted_offsets as off;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncryptedEvent {
@@ -41,10 +58,10 @@ pub fn parse_encrypted(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     let inner_type_code = blob[off::INNER_TYPE_CODE];
 
     // Look up expected ciphertext size from inner_type_code
-    let ciphertext_size = fixed_layout::encrypted_inner_wire_size(inner_type_code)
+    let ciphertext_size = encrypted_inner_wire_size(inner_type_code)
         .ok_or(EventError::InvalidEncryptedInnerType(inner_type_code))?;
 
-    let expected_len = fixed_layout::encrypted_wire_size(ciphertext_size);
+    let expected_len = encrypted_wire_size(ciphertext_size);
     if blob.len() < expected_len {
         return Err(EventError::TooShort {
             expected: expected_len,
@@ -89,14 +106,14 @@ pub fn encode_encrypted(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     };
 
     // Validate inner_type_code and get expected ciphertext size
-    let expected_ct_size = fixed_layout::encrypted_inner_wire_size(enc.inner_type_code)
+    let expected_ct_size = encrypted_inner_wire_size(enc.inner_type_code)
         .ok_or(EventError::InvalidEncryptedInnerType(enc.inner_type_code))?;
 
     if enc.ciphertext.len() != expected_ct_size {
         return Err(EventError::InvalidMetadata("ciphertext size does not match inner_type_code"));
     }
 
-    let total = fixed_layout::encrypted_wire_size(expected_ct_size);
+    let total = encrypted_wire_size(expected_ct_size);
     let mut buf = vec![0u8; total];
 
     buf[off::TYPE_CODE] = EVENT_TYPE_ENCRYPTED;

@@ -2,10 +2,15 @@
 //! encode/decode tests for all fixed-layout canonical event types.
 
 use topo::event_modules::{
-    self as events, fixed_layout, EventError, ParsedEvent,
+    self as events, EventError, ParsedEvent,
     MessageEvent, ReactionEvent, SignedMemoEvent, EncryptedEvent,
     FileSliceEvent, MessageAttachmentEvent, BenchDepEvent,
 };
+use topo::event_modules::message::layout::offsets as message_offsets;
+use topo::event_modules::reaction::offsets as reaction_offsets;
+use topo::event_modules::signed_memo::signed_memo_offsets;
+use topo::event_modules::message_attachment::attachment_offsets;
+use topo::event_modules::layout::common::{encrypted_inner_wire_size, encrypted_wire_size, ENCRYPTED_HEADER_BYTES};
 
 // ─── Golden-byte tests ───
 //
@@ -24,7 +29,7 @@ fn golden_bytes_message() {
         signature: [0xDD; 64],
     });
     let blob = events::encode_event(&msg).unwrap();
-    assert_eq!(blob.len(), fixed_layout::MESSAGE_WIRE_SIZE);
+    assert_eq!(blob.len(), events::message::MESSAGE_WIRE_SIZE);
 
     // Type code
     assert_eq!(blob[0], 1);
@@ -38,12 +43,12 @@ fn golden_bytes_message() {
     assert_eq!(&blob[73..75], b"Hi");
     assert!(blob[75..73 + 1024].iter().all(|&b| b == 0));
     // signed_by
-    let sb_start = fixed_layout::message_offsets::SIGNED_BY;
+    let sb_start = message_offsets::SIGNED_BY;
     assert_eq!(&blob[sb_start..sb_start + 32], &[0xCC; 32]);
     // signer_type
-    assert_eq!(blob[fixed_layout::message_offsets::SIGNER_TYPE], 5);
+    assert_eq!(blob[message_offsets::SIGNER_TYPE], 5);
     // signature
-    let sig_start = fixed_layout::message_offsets::SIGNATURE;
+    let sig_start = message_offsets::SIGNATURE;
     assert_eq!(&blob[sig_start..sig_start + 64], &[0xDD; 64]);
 }
 
@@ -59,7 +64,7 @@ fn golden_bytes_reaction() {
         signature: [0x44; 64],
     });
     let blob = events::encode_event(&rxn).unwrap();
-    assert_eq!(blob.len(), fixed_layout::REACTION_WIRE_SIZE);
+    assert_eq!(blob.len(), events::reaction::REACTION_WIRE_SIZE);
     assert_eq!(blob[0], 2);
     assert_eq!(&blob[9..41], &[0x11; 32]);
     assert_eq!(&blob[41..73], &[0x22; 32]);
@@ -78,19 +83,19 @@ fn golden_bytes_signed_memo() {
         signature: [0x66; 64],
     });
     let blob = events::encode_event(&memo).unwrap();
-    assert_eq!(blob.len(), fixed_layout::SIGNED_MEMO_WIRE_SIZE);
+    assert_eq!(blob.len(), events::signed_memo::SIGNED_MEMO_WIRE_SIZE);
     assert_eq!(blob[0], 4);
     assert_eq!(&blob[9..41], &[0x55; 32]);
     assert_eq!(blob[41], 5);
     assert_eq!(&blob[42..46], b"memo");
     assert!(blob[46..42 + 1024].iter().all(|&b| b == 0));
-    let sig_off = fixed_layout::signed_memo_offsets::SIGNATURE;
+    let sig_off = signed_memo_offsets::SIGNATURE;
     assert_eq!(&blob[sig_off..sig_off + 64], &[0x66; 64]);
 }
 
 #[test]
 fn golden_bytes_encrypted() {
-    let ct_size = fixed_layout::encrypted_inner_wire_size(2).unwrap(); // reaction = 234
+    let ct_size = encrypted_inner_wire_size(2).unwrap(); // reaction = 234
     let enc = ParsedEvent::Encrypted(EncryptedEvent {
         created_at_ms: 3000,
         key_event_id: [0x77; 32],
@@ -100,7 +105,7 @@ fn golden_bytes_encrypted() {
         auth_tag: [0xAA; 16],
     });
     let blob = events::encode_event(&enc).unwrap();
-    let expected_size = fixed_layout::encrypted_wire_size(ct_size);
+    let expected_size = encrypted_wire_size(ct_size);
     assert_eq!(blob.len(), expected_size);
     assert_eq!(blob[0], 5);
     assert_eq!(&blob[9..41], &[0x77; 32]);
@@ -129,7 +134,7 @@ fn golden_bytes_message_attachment() {
         signature: [0x06; 64],
     });
     let blob = events::encode_event(&att).unwrap();
-    assert_eq!(blob.len(), fixed_layout::MESSAGE_ATTACHMENT_WIRE_SIZE);
+    assert_eq!(blob.len(), events::message_attachment::MESSAGE_ATTACHMENT_WIRE_SIZE);
     assert_eq!(blob[0], 24);
     // filename at offset 153
     assert_eq!(&blob[153..161], b"test.bin");
@@ -148,7 +153,7 @@ fn golden_bytes_bench_dep() {
         payload: [0xCC; 16],
     });
     let blob = events::encode_event(&bd).unwrap();
-    assert_eq!(blob.len(), fixed_layout::BENCH_DEP_WIRE_SIZE);
+    assert_eq!(blob.len(), events::bench_dep::BENCH_DEP_WIRE_SIZE);
     assert_eq!(blob[0], 26);
     // First dep slot at offset 9
     assert_eq!(&blob[9..41], &[0xAA; 32]);
@@ -211,7 +216,7 @@ fn truncation_signed_memo() {
 
 #[test]
 fn truncation_encrypted() {
-    let ct_size = fixed_layout::encrypted_inner_wire_size(1).unwrap();
+    let ct_size = encrypted_inner_wire_size(1).unwrap();
     let enc = ParsedEvent::Encrypted(EncryptedEvent {
         created_at_ms: 100,
         key_event_id: [0u8; 32],
@@ -274,7 +279,7 @@ fn nonzero_padding_message_content() {
     });
     let mut blob = events::encode_event(&msg).unwrap();
     // Inject non-zero byte after NUL in content slot
-    let content_start = fixed_layout::message_offsets::CONTENT;
+    let content_start = message_offsets::CONTENT;
     blob[content_start + 2] = 0xFF; // byte after "a\0" should be 0
     let err = events::parse_event(&blob).unwrap_err();
     assert!(matches!(err, EventError::TextSlot(_)));
@@ -292,7 +297,7 @@ fn nonzero_padding_reaction_emoji() {
         signature: [0u8; 64],
     });
     let mut blob = events::encode_event(&rxn).unwrap();
-    let emoji_start = fixed_layout::reaction_offsets::EMOJI;
+    let emoji_start = reaction_offsets::EMOJI;
     blob[emoji_start + 2] = 0xFF; // after "x\0"
     let err = events::parse_event(&blob).unwrap_err();
     assert!(matches!(err, EventError::TextSlot(_)));
@@ -308,7 +313,7 @@ fn nonzero_padding_signed_memo_content() {
         signature: [0u8; 64],
     });
     let mut blob = events::encode_event(&memo).unwrap();
-    let content_start = fixed_layout::signed_memo_offsets::CONTENT;
+    let content_start = signed_memo_offsets::CONTENT;
     blob[content_start + 2] = 0xFF;
     let err = events::parse_event(&blob).unwrap_err();
     assert!(matches!(err, EventError::TextSlot(_)));
@@ -332,7 +337,7 @@ fn nonzero_padding_attachment_filename() {
         signature: [0u8; 64],
     });
     let mut blob = events::encode_event(&att).unwrap();
-    let fn_start = fixed_layout::attachment_offsets::FILENAME;
+    let fn_start = attachment_offsets::FILENAME;
     blob[fn_start + 2] = 0xFF;
     let err = events::parse_event(&blob).unwrap_err();
     assert!(matches!(err, EventError::TextSlot(_)));
@@ -356,7 +361,7 @@ fn nonzero_padding_attachment_mime() {
         signature: [0u8; 64],
     });
     let mut blob = events::encode_event(&att).unwrap();
-    let mime_start = fixed_layout::attachment_offsets::MIME_TYPE;
+    let mime_start = attachment_offsets::MIME_TYPE;
     blob[mime_start + 2] = 0xFF;
     let err = events::parse_event(&blob).unwrap_err();
     assert!(matches!(err, EventError::TextSlot(_)));
@@ -376,7 +381,7 @@ fn malformed_utf8_message_content() {
         signature: [0u8; 64],
     });
     let mut blob = events::encode_event(&msg).unwrap();
-    let content_start = fixed_layout::message_offsets::CONTENT;
+    let content_start = message_offsets::CONTENT;
     blob[content_start] = 0xFF; // invalid UTF-8 lead byte
     blob[content_start + 1] = 0xFE;
     let err = events::parse_event(&blob).unwrap_err();
@@ -395,7 +400,7 @@ fn malformed_utf8_reaction_emoji() {
         signature: [0u8; 64],
     });
     let mut blob = events::encode_event(&rxn).unwrap();
-    let emoji_start = fixed_layout::reaction_offsets::EMOJI;
+    let emoji_start = reaction_offsets::EMOJI;
     blob[emoji_start] = 0xFF;
     blob[emoji_start + 1] = 0xFE;
     let err = events::parse_event(&blob).unwrap_err();
@@ -426,7 +431,7 @@ fn wrong_type_code_message() {
 #[test]
 fn encrypted_unknown_inner_type_code() {
     // Build raw blob with inner_type_code=200 (unknown)
-    let header_size = fixed_layout::ENCRYPTED_HEADER_BYTES;
+    let header_size = ENCRYPTED_HEADER_BYTES;
     // Minimal: just enough for the parser to read the header and reject
     let mut buf = vec![0u8; header_size + 1]; // +1 so TooShort isn't the error
     buf[0] = 5; // EVENT_TYPE_ENCRYPTED
@@ -629,7 +634,7 @@ fn idempotent_signed_memo() {
 
 #[test]
 fn idempotent_encrypted() {
-    let ct_size = fixed_layout::encrypted_inner_wire_size(1).unwrap();
+    let ct_size = encrypted_inner_wire_size(1).unwrap();
     assert_idempotent(&ParsedEvent::Encrypted(EncryptedEvent {
         created_at_ms: 400,
         key_event_id: [11u8; 32],
@@ -665,7 +670,7 @@ fn idempotent_file_slice() {
         created_at_ms: 600,
         file_id: [21u8; 32],
         slice_number: 42,
-        ciphertext: vec![22u8; fixed_layout::FILE_SLICE_CIPHERTEXT_BYTES],
+        ciphertext: vec![22u8; events::file_slice::FILE_SLICE_CIPHERTEXT_BYTES],
         signed_by: [23u8; 32],
         signer_type: 5,
         signature: [24u8; 64],

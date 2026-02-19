@@ -2346,3 +2346,4 @@ Moved response types and conn-level service functions into event modules, making
 2. `service.rs` is orchestration glue: DB context, auth, cross-module joins, error mapping.
 3. `apply.rs` is pipeline orchestration: dependency checks, signer verification, registry dispatch.
 4. Long event modules must split into `wire/commands/queries` structure (see DESIGN §14.3).
+5. Wire layout constants (wire sizes, offsets) are owned by the event module — not in a global monolith. Shared cross-event primitives live in `src/event_modules/layout/common.rs` (see DESIGN §14.4).

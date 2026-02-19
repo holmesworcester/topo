@@ -1472,7 +1472,7 @@ fn test_encrypted_wrong_key_rejects() {
 
 #[test]
 fn test_encrypted_inner_type_mismatch_rejects() {
-    use crate::event_modules::fixed_layout;
+    use crate::event_modules::reaction::REACTION_WIRE_SIZE;
 
     let conn = setup();
     let recorded_by = "peer1";
@@ -1485,7 +1485,7 @@ fn test_encrypted_inner_type_mismatch_rejects() {
 
     // Craft a reaction-sized blob whose first byte is MESSAGE type (1)
     // to trigger inner type mismatch at the pipeline level.
-    let reaction_wire_size = fixed_layout::REACTION_WIRE_SIZE;
+    let reaction_wire_size = REACTION_WIRE_SIZE;
     let mut fake_inner = vec![0u8; reaction_wire_size];
     fake_inner[0] = EVENT_TYPE_MESSAGE; // wrong: says message, envelope says reaction
 
@@ -1519,7 +1519,7 @@ fn test_encrypted_inner_type_mismatch_rejects() {
 
 #[test]
 fn test_encrypted_nested_rejects() {
-    use crate::event_modules::fixed_layout;
+    use crate::event_modules::layout::common::{ENCRYPTED_HEADER_BYTES, ENCRYPTED_AUTH_TAG_BYTES};
 
     let conn = setup();
     let recorded_by = "peer1";
@@ -1539,9 +1539,9 @@ fn test_encrypted_nested_rejects() {
 
     // Manually build an outer encrypted blob with inner_type_code=5
     let (nonce, raw_ct, auth_tag) = encrypt_event_blob(&key_bytes, &inner_enc_blob).unwrap();
-    let total = fixed_layout::ENCRYPTED_HEADER_BYTES
+    let total = ENCRYPTED_HEADER_BYTES
         + raw_ct.len()
-        + fixed_layout::ENCRYPTED_AUTH_TAG_BYTES;
+        + ENCRYPTED_AUTH_TAG_BYTES;
     let mut buf = vec![0u8; total];
     buf[0] = EVENT_TYPE_ENCRYPTED;
     buf[1..9].copy_from_slice(&now_ms().to_le_bytes());
@@ -2993,7 +2993,7 @@ fn make_file_slice(
     slice_number: u32,
     ciphertext_seed: &[u8],
 ) -> (ParsedEvent, Vec<u8>) {
-    use crate::event_modules::fixed_layout::FILE_SLICE_CIPHERTEXT_BYTES;
+    use crate::event_modules::file_slice::FILE_SLICE_CIPHERTEXT_BYTES;
     // Pad to canonical fixed size (short seeds are zero-extended)
     let mut ciphertext = vec![0u8; FILE_SLICE_CIPHERTEXT_BYTES];
     let len = ciphertext_seed.len().min(FILE_SLICE_CIPHERTEXT_BYTES);

@@ -1,6 +1,25 @@
-use super::fixed_layout::{self, USER_WIRE_SIZE, NAME_BYTES, user_offsets as off};
+use super::layout::common::{COMMON_HEADER_BYTES, SIGNATURE_TRAILER_BYTES, NAME_BYTES, read_text_slot, write_text_slot};
 use super::registry::{EventTypeMeta, ShareScope};
 use super::{EventError, ParsedEvent, EVENT_TYPE_USER_BOOT, EVENT_TYPE_USER_ONGOING};
+
+// ─── Layout (owned by this module) ───
+
+/// User (types 14, 15): type(1) + created_at(8) + public_key(32) + username(64)
+///                     + signed_by(32) + signer_type(1) + signature(64) = 202
+pub const USER_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32 + NAME_BYTES + SIGNATURE_TRAILER_BYTES;
+
+mod user_offsets {
+    use super::super::layout::common::NAME_BYTES;
+    pub const TYPE_CODE: usize = 0;
+    pub const CREATED_AT: usize = 1;
+    pub const PUBLIC_KEY: usize = 9;
+    pub const USERNAME: usize = 41;
+    pub const SIGNED_BY: usize = 41 + NAME_BYTES;           // 105
+    pub const SIGNER_TYPE: usize = SIGNED_BY + 32;                  // 137
+    pub const SIGNATURE: usize = SIGNER_TYPE + 1;                   // 138
+}
+
+use user_offsets as off;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserBootEvent {
@@ -45,7 +64,7 @@ pub fn parse_user_boot(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     let mut public_key = [0u8; 32];
     public_key.copy_from_slice(&blob[off::PUBLIC_KEY..off::USERNAME]);
 
-    let username = fixed_layout::read_text_slot(&blob[off::USERNAME..off::USERNAME + NAME_BYTES])
+    let username = read_text_slot(&blob[off::USERNAME..off::USERNAME + NAME_BYTES])
         .map_err(EventError::TextSlot)?;
 
     let mut signed_by = [0u8; 32];
@@ -73,7 +92,7 @@ pub fn encode_user_boot(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     buf[off::TYPE_CODE] = EVENT_TYPE_USER_BOOT;
     buf[off::CREATED_AT..off::PUBLIC_KEY].copy_from_slice(&e.created_at_ms.to_le_bytes());
     buf[off::PUBLIC_KEY..off::USERNAME].copy_from_slice(&e.public_key);
-    fixed_layout::write_text_slot(&e.username, &mut buf[off::USERNAME..off::USERNAME + NAME_BYTES])
+    write_text_slot(&e.username, &mut buf[off::USERNAME..off::USERNAME + NAME_BYTES])
         .map_err(EventError::TextSlot)?;
     buf[off::SIGNED_BY..off::SIGNER_TYPE].copy_from_slice(&e.signed_by);
     buf[off::SIGNER_TYPE] = e.signer_type;
@@ -104,7 +123,7 @@ pub fn parse_user_ongoing(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     let mut public_key = [0u8; 32];
     public_key.copy_from_slice(&blob[off::PUBLIC_KEY..off::USERNAME]);
 
-    let username = fixed_layout::read_text_slot(&blob[off::USERNAME..off::USERNAME + NAME_BYTES])
+    let username = read_text_slot(&blob[off::USERNAME..off::USERNAME + NAME_BYTES])
         .map_err(EventError::TextSlot)?;
 
     let mut signed_by = [0u8; 32];
@@ -132,7 +151,7 @@ pub fn encode_user_ongoing(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     buf[off::TYPE_CODE] = EVENT_TYPE_USER_ONGOING;
     buf[off::CREATED_AT..off::PUBLIC_KEY].copy_from_slice(&e.created_at_ms.to_le_bytes());
     buf[off::PUBLIC_KEY..off::USERNAME].copy_from_slice(&e.public_key);
-    fixed_layout::write_text_slot(&e.username, &mut buf[off::USERNAME..off::USERNAME + NAME_BYTES])
+    write_text_slot(&e.username, &mut buf[off::USERNAME..off::USERNAME + NAME_BYTES])
         .map_err(EventError::TextSlot)?;
     buf[off::SIGNED_BY..off::SIGNER_TYPE].copy_from_slice(&e.signed_by);
     buf[off::SIGNER_TYPE] = e.signer_type;

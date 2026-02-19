@@ -1,6 +1,27 @@
-use super::fixed_layout::{BENCH_DEP_WIRE_SIZE, BENCH_DEP_MAX_SLOTS, bench_dep_offsets as off};
+use super::layout::common::COMMON_HEADER_BYTES;
 use super::registry::{EventTypeMeta, ShareScope};
 use super::{EventError, ParsedEvent, EVENT_TYPE_BENCH_DEP};
+
+// ─── Layout (owned by this module) ───
+
+/// BenchDep: fixed number of dep slots (unused slots are all-zeros)
+pub const BENCH_DEP_MAX_SLOTS: usize = 10;
+
+/// BenchDep: total bytes for dep slots (10 × 32)
+pub const BENCH_DEP_SLOTS_BYTES: usize = BENCH_DEP_MAX_SLOTS * 32;
+
+/// BenchDep (type 26): type(1) + created_at(8) + dep_slots(320) + payload(16) = 345
+pub const BENCH_DEP_WIRE_SIZE: usize =
+    COMMON_HEADER_BYTES + BENCH_DEP_SLOTS_BYTES + 16;
+
+mod bench_dep_offsets {
+    pub const TYPE_CODE: usize = 0;
+    pub const CREATED_AT: usize = 1;
+    pub const DEP_SLOTS: usize = 9;
+    pub const PAYLOAD: usize = 9 + super::BENCH_DEP_SLOTS_BYTES; // 329
+}
+
+use bench_dep_offsets as off;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BenchDepEvent {

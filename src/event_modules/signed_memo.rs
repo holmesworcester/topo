@@ -1,6 +1,27 @@
-use super::fixed_layout::{self, SIGNED_MEMO_WIRE_SIZE, SIGNED_MEMO_CONTENT_BYTES, signed_memo_offsets as off};
+use super::layout::common::{COMMON_HEADER_BYTES, read_text_slot, write_text_slot};
 use super::registry::{EventTypeMeta, ShareScope};
 use super::{EventError, ParsedEvent, EVENT_TYPE_SIGNED_MEMO};
+
+// ─── Layout (owned by this module) ───
+
+/// SignedMemo content: fixed UTF-8 slot (1024 bytes, zero-padded)
+pub const SIGNED_MEMO_CONTENT_BYTES: usize = 1024;
+
+/// SignedMemo (type 4): type(1) + created_at(8) + signed_by(32) + signer_type(1)
+///                    + content(1024) + signature(64) = 1130
+pub const SIGNED_MEMO_WIRE_SIZE: usize =
+    COMMON_HEADER_BYTES + 32 + 1 + SIGNED_MEMO_CONTENT_BYTES + 64;
+
+pub mod signed_memo_offsets {
+    pub const TYPE_CODE: usize = 0;
+    pub const CREATED_AT: usize = 1;
+    pub const SIGNED_BY: usize = 9;
+    pub const SIGNER_TYPE: usize = 41;
+    pub const CONTENT: usize = 42;
+    pub const SIGNATURE: usize = 42 + super::SIGNED_MEMO_CONTENT_BYTES; // 1066
+}
+
+use signed_memo_offsets as off;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignedMemoEvent {
@@ -45,7 +66,7 @@ pub fn parse_signed_memo(blob: &[u8]) -> Result<ParsedEvent, EventError> {
 
     let signer_type = blob[off::SIGNER_TYPE];
 
-    let content = fixed_layout::read_text_slot(&blob[off::CONTENT..off::CONTENT + SIGNED_MEMO_CONTENT_BYTES])
+    let content = read_text_slot(&blob[off::CONTENT..off::CONTENT + SIGNED_MEMO_CONTENT_BYTES])
         .map_err(EventError::TextSlot)?;
 
     let mut signature = [0u8; 64];
@@ -77,7 +98,7 @@ pub fn encode_signed_memo(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     buf[off::CREATED_AT..off::SIGNED_BY].copy_from_slice(&memo.created_at_ms.to_le_bytes());
     buf[off::SIGNED_BY..off::SIGNER_TYPE].copy_from_slice(&memo.signed_by);
     buf[off::SIGNER_TYPE] = memo.signer_type;
-    fixed_layout::write_text_slot(&memo.content, &mut buf[off::CONTENT..off::CONTENT + SIGNED_MEMO_CONTENT_BYTES])
+    write_text_slot(&memo.content, &mut buf[off::CONTENT..off::CONTENT + SIGNED_MEMO_CONTENT_BYTES])
         .map_err(EventError::TextSlot)?;
     buf[off::SIGNATURE..off::SIGNATURE + 64].copy_from_slice(&memo.signature);
 

@@ -14,7 +14,7 @@ use topo::event_modules::{
     self as events, FileSliceEvent, MessageAttachmentEvent, MessageEvent, ParsedEvent,
     SecretKeyEvent, WorkspaceEvent, InviteAcceptedEvent, UserInviteBootEvent,
     UserBootEvent, DeviceInviteFirstEvent, PeerSharedFirstEvent,
-    fixed_layout::FILE_SLICE_CIPHERTEXT_BYTES,
+    file_slice::FILE_SLICE_CIPHERTEXT_BYTES,
 };
 use topo::projection::apply::project_one;
 use topo::projection::signer::sign_event_bytes;

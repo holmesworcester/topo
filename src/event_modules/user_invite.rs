@@ -1,5 +1,15 @@
+use super::layout::common::{COMMON_HEADER_BYTES, SIGNATURE_TRAILER_BYTES};
 use super::registry::{EventTypeMeta, ShareScope};
 use super::{EventError, ParsedEvent, EVENT_TYPE_USER_INVITE_BOOT, EVENT_TYPE_USER_INVITE_ONGOING};
+
+// ─── Layout (owned by this module) ───
+
+/// UserInviteBoot (type 10): type(1) + created_at(8) + public_key(32) + workspace_id(32)
+///                          + signed_by(32) + signer_type(1) + signature(64) = 170
+pub const USER_INVITE_BOOT_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32 + 32 + SIGNATURE_TRAILER_BYTES;
+
+/// UserInviteOngoing (type 11): same layout as UserInviteBoot = 170
+pub const USER_INVITE_ONGOING_WIRE_SIZE: usize = USER_INVITE_BOOT_WIRE_SIZE;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserInviteBootEvent {

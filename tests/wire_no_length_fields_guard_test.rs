@@ -124,7 +124,7 @@ fn all_canonical_event_files_exist() {
 /// registered types (via the existing registry).
 #[test]
 fn all_registered_types_have_fixed_wire_size() {
-    use topo::event_modules::{fixed_layout, registry};
+    use topo::event_modules::{layout, registry};
 
     // For each type code 1..=26, verify the registry has an entry
     // and encoding produces a deterministic-length blob.
@@ -151,7 +151,7 @@ fn all_registered_types_have_fixed_wire_size() {
         if matches!(code, 5 | 6 | 9) {
             continue;
         }
-        let inner_size = fixed_layout::encrypted_inner_wire_size(code);
+        let inner_size = layout::common::encrypted_inner_wire_size(code);
         assert!(
             inner_size.is_some(),
             "encryptable type {} has no encrypted_inner_wire_size entry",

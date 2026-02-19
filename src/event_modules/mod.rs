@@ -4,8 +4,8 @@ pub mod device_invite;
 pub mod dispatch;
 pub mod encrypted;
 pub mod file_slice;
-pub mod fixed_layout;
 pub mod invite_accepted;
+pub mod layout;
 pub mod message;
 pub mod message_deletion;
 pub mod workspace;
@@ -263,7 +263,7 @@ pub enum EventError {
     ContentTooLong(usize),
     InvalidMetadata(&'static str),
     UnknownType(u8),
-    TextSlot(fixed_layout::TextSlotError),
+    TextSlot(layout::common::TextSlotError),
     InvalidEncryptedInnerType(u8),
 }
 
@@ -408,7 +408,7 @@ mod tests {
 
         let event = ParsedEvent::SignedMemo(memo.clone());
         let blob = encode_event(&event).unwrap();
-        assert_eq!(blob.len(), fixed_layout::SIGNED_MEMO_WIRE_SIZE);
+        assert_eq!(blob.len(), signed_memo::SIGNED_MEMO_WIRE_SIZE);
         let parsed = parse_event(&blob).unwrap();
         assert_eq!(parsed, event);
     }
@@ -778,7 +778,7 @@ mod tests {
             signature: [0u8; 64],
         });
         let blob = encode_event(&msg).unwrap();
-        assert_eq!(blob.len(), fixed_layout::MESSAGE_WIRE_SIZE);
+        assert_eq!(blob.len(), message::MESSAGE_WIRE_SIZE);
         let parsed = parse_event(&blob).unwrap();
         assert_eq!(parsed, msg);
 
@@ -794,7 +794,7 @@ mod tests {
             signature: [0u8; 64],
         });
         let blob2 = encode_event(&msg2).unwrap();
-        assert_eq!(blob2.len(), fixed_layout::MESSAGE_WIRE_SIZE);
+        assert_eq!(blob2.len(), message::MESSAGE_WIRE_SIZE);
         let parsed2 = parse_event(&blob2).unwrap();
         assert_eq!(parsed2, msg2);
     }
@@ -1033,14 +1033,14 @@ mod tests {
         };
         let event = ParsedEvent::MessageAttachment(att);
         let blob = encode_event(&event).unwrap();
-        assert_eq!(blob.len(), fixed_layout::MESSAGE_ATTACHMENT_WIRE_SIZE);
+        assert_eq!(blob.len(), message_attachment::MESSAGE_ATTACHMENT_WIRE_SIZE);
         let parsed = parse_event(&blob).unwrap();
         assert_eq!(parsed, event);
     }
 
     #[test]
     fn test_file_slice_roundtrip() {
-        let mut ciphertext = vec![0xAB; fixed_layout::FILE_SLICE_CIPHERTEXT_BYTES];
+        let mut ciphertext = vec![0xAB; file_slice::FILE_SLICE_CIPHERTEXT_BYTES];
         ciphertext[0] = 0xDE; // mark first byte to verify roundtrip
         let fs = FileSliceEvent {
             created_at_ms: 6000000000000,
@@ -1053,7 +1053,7 @@ mod tests {
         };
         let event = ParsedEvent::FileSlice(fs);
         let blob = encode_event(&event).unwrap();
-        assert_eq!(blob.len(), fixed_layout::FILE_SLICE_WIRE_SIZE);
+        assert_eq!(blob.len(), file_slice::FILE_SLICE_WIRE_SIZE);
         let parsed = parse_event(&blob).unwrap();
         assert_eq!(parsed, event);
         // Verify trailing signature layout: last 64 bytes are signature
@@ -1062,7 +1062,7 @@ mod tests {
 
     #[test]
     fn test_file_slice_canonical_size() {
-        let ciphertext = vec![0xCD; fixed_layout::FILE_SLICE_CIPHERTEXT_BYTES];
+        let ciphertext = vec![0xCD; file_slice::FILE_SLICE_CIPHERTEXT_BYTES];
         let fs = FileSliceEvent {
             created_at_ms: 7000000000000,
             file_id: [30u8; 32],
@@ -1074,7 +1074,7 @@ mod tests {
         };
         let event = ParsedEvent::FileSlice(fs);
         let blob = encode_event(&event).unwrap();
-        assert_eq!(blob.len(), fixed_layout::FILE_SLICE_WIRE_SIZE);
+        assert_eq!(blob.len(), file_slice::FILE_SLICE_WIRE_SIZE);
         let parsed = parse_event(&blob).unwrap();
         assert_eq!(parsed, event);
 
@@ -1409,11 +1409,11 @@ mod tests {
             signature: [0u8; 64],
         });
         let mut blob = encode_event(&msg).unwrap();
-        assert_eq!(blob.len(), fixed_layout::MESSAGE_WIRE_SIZE);
+        assert_eq!(blob.len(), message::MESSAGE_WIRE_SIZE);
         blob.push(0xFF);
         let err = parse_event(&blob).unwrap_err();
         assert!(matches!(err, EventError::TrailingData { expected, actual }
-            if expected == fixed_layout::MESSAGE_WIRE_SIZE && actual == fixed_layout::MESSAGE_WIRE_SIZE + 1));
+            if expected == message::MESSAGE_WIRE_SIZE && actual == message::MESSAGE_WIRE_SIZE + 1));
 
         // Reaction (now fixed at 234)
         let rxn = ParsedEvent::Reaction(ReactionEvent {
@@ -1426,14 +1426,14 @@ mod tests {
             signature: [0u8; 64],
         });
         let mut blob = encode_event(&rxn).unwrap();
-        assert_eq!(blob.len(), fixed_layout::REACTION_WIRE_SIZE);
+        assert_eq!(blob.len(), reaction::REACTION_WIRE_SIZE);
         blob.push(0xFF);
         let err = parse_event(&blob).unwrap_err();
         assert!(matches!(err, EventError::TrailingData { expected, actual }
-            if expected == fixed_layout::REACTION_WIRE_SIZE && actual == fixed_layout::REACTION_WIRE_SIZE + 1));
+            if expected == reaction::REACTION_WIRE_SIZE && actual == reaction::REACTION_WIRE_SIZE + 1));
 
         // Encrypted (deterministic size from inner_type_code)
-        let inner_ct_size = fixed_layout::encrypted_inner_wire_size(1).unwrap();
+        let inner_ct_size = layout::common::encrypted_inner_wire_size(1).unwrap();
         let enc = ParsedEvent::Encrypted(EncryptedEvent {
             created_at_ms: 100,
             key_event_id: [0u8; 32],
@@ -1443,7 +1443,7 @@ mod tests {
             auth_tag: [0u8; 16],
         });
         let mut blob = encode_event(&enc).unwrap();
-        let expected_len = fixed_layout::encrypted_wire_size(inner_ct_size);
+        let expected_len = layout::common::encrypted_wire_size(inner_ct_size);
         assert_eq!(blob.len(), expected_len);
         blob.push(0xFF);
         let err = parse_event(&blob).unwrap_err();
@@ -1455,17 +1455,17 @@ mod tests {
             created_at_ms: 100,
             file_id: [0u8; 32],
             slice_number: 0,
-            ciphertext: vec![0xCD; fixed_layout::FILE_SLICE_CIPHERTEXT_BYTES],
+            ciphertext: vec![0xCD; file_slice::FILE_SLICE_CIPHERTEXT_BYTES],
             signed_by: [0u8; 32],
             signer_type: 5,
             signature: [0u8; 64],
         });
         let mut blob = encode_event(&fs).unwrap();
-        assert_eq!(blob.len(), fixed_layout::FILE_SLICE_WIRE_SIZE);
+        assert_eq!(blob.len(), file_slice::FILE_SLICE_WIRE_SIZE);
         blob.push(0xFF);
         let err = parse_event(&blob).unwrap_err();
         assert!(matches!(err, EventError::TrailingData { expected, actual }
-            if expected == fixed_layout::FILE_SLICE_WIRE_SIZE && actual == fixed_layout::FILE_SLICE_WIRE_SIZE + 1));
+            if expected == file_slice::FILE_SLICE_WIRE_SIZE && actual == file_slice::FILE_SLICE_WIRE_SIZE + 1));
 
         // BenchDep (now fixed at 345)
         let bd = ParsedEvent::BenchDep(BenchDepEvent {
@@ -1474,10 +1474,10 @@ mod tests {
             payload: [0u8; 16],
         });
         let mut blob = encode_event(&bd).unwrap();
-        assert_eq!(blob.len(), fixed_layout::BENCH_DEP_WIRE_SIZE);
+        assert_eq!(blob.len(), bench_dep::BENCH_DEP_WIRE_SIZE);
         blob.push(0xFF);
         let err = parse_event(&blob).unwrap_err();
         assert!(matches!(err, EventError::TrailingData { expected, actual }
-            if expected == fixed_layout::BENCH_DEP_WIRE_SIZE && actual == fixed_layout::BENCH_DEP_WIRE_SIZE + 1));
+            if expected == bench_dep::BENCH_DEP_WIRE_SIZE && actual == bench_dep::BENCH_DEP_WIRE_SIZE + 1));
     }
 }

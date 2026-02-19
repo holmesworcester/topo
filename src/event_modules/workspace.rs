@@ -1,6 +1,20 @@
-use super::fixed_layout::{self, WORKSPACE_WIRE_SIZE, NAME_BYTES, workspace_offsets as off};
+use super::layout::common::{COMMON_HEADER_BYTES, NAME_BYTES, read_text_slot, write_text_slot};
 use super::registry::{EventTypeMeta, ShareScope};
 use super::{EventError, ParsedEvent, EVENT_TYPE_WORKSPACE};
+
+// ─── Layout (owned by this module) ───
+
+/// Workspace (type 8): type(1) + created_at(8) + public_key(32) + name(64) = 105
+pub const WORKSPACE_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32 + NAME_BYTES;
+
+mod workspace_offsets {
+    pub const TYPE_CODE: usize = 0;
+    pub const CREATED_AT: usize = 1;
+    pub const PUBLIC_KEY: usize = 9;
+    pub const NAME: usize = 41;
+}
+
+use workspace_offsets as off;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceEvent {
@@ -39,7 +53,7 @@ pub fn parse_workspace(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     let mut public_key = [0u8; 32];
     public_key.copy_from_slice(&blob[off::PUBLIC_KEY..off::NAME]);
 
-    let name = fixed_layout::read_text_slot(&blob[off::NAME..off::NAME + NAME_BYTES])
+    let name = read_text_slot(&blob[off::NAME..off::NAME + NAME_BYTES])
         .map_err(EventError::TextSlot)?;
 
     Ok(ParsedEvent::Workspace(WorkspaceEvent {
@@ -59,7 +73,7 @@ pub fn encode_workspace(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     buf[off::TYPE_CODE] = EVENT_TYPE_WORKSPACE;
     buf[off::CREATED_AT..off::PUBLIC_KEY].copy_from_slice(&ws.created_at_ms.to_le_bytes());
     buf[off::PUBLIC_KEY..off::NAME].copy_from_slice(&ws.public_key);
-    fixed_layout::write_text_slot(&ws.name, &mut buf[off::NAME..off::NAME + NAME_BYTES])
+    write_text_slot(&ws.name, &mut buf[off::NAME..off::NAME + NAME_BYTES])
         .map_err(EventError::TextSlot)?;
     Ok(buf)
 }
