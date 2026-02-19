@@ -20,9 +20,11 @@ use crate::event_modules::{
     DeviceInviteFirstEvent, InviteAcceptedEvent, ParsedEvent, PeerSharedFirstEvent, UserBootEvent,
     UserInviteBootEvent, WorkspaceEvent,
 };
-use crate::identity::transport::{
-    install_peer_key_transport_identity, load_transport_cert_required, load_transport_peer_id,
+use crate::contracts::transport_identity_contract::{
+    TransportIdentityAdapter, TransportIdentityIntent,
 };
+use crate::identity::transport::{load_transport_cert_required, load_transport_peer_id};
+use crate::transport::identity_adapter::ConcreteTransportIdentityAdapter;
 use crate::projection::apply::project_one;
 use crate::projection::create::{create_event_staged, create_event_sync, create_signed_event_sync};
 use crate::transport::create_dual_endpoint_dynamic;
@@ -700,9 +702,17 @@ pub fn svc_create_workspace(
 
     // Bootstrap new identity chain (creates Workspace + 5 identity events)
     let bootstrap_rb = format!("bootstrap-{}", current_timestamp_ms());
-    let (_eid, peer_shared_key) =
+    let (psf_eid, _peer_shared_key) =
         ensure_identity_chain(&conn, &bootstrap_rb, workspace_name, username, device_name)?;
-    let derived = install_peer_key_transport_identity(&conn, &peer_shared_key)
+    let adapter = ConcreteTransportIdentityAdapter;
+    let derived = adapter
+        .apply_intent(
+            &conn,
+            TransportIdentityIntent::InstallPeerSharedIdentityFromSigner {
+                recorded_by: bootstrap_rb.clone(),
+                signer_event_id: psf_eid,
+            },
+        )
         .map_err(|e| ServiceError(format!("install transport identity failed: {}", e)))?;
     if derived != bootstrap_rb {
         crate::db::migrate_recorded_by(&conn, &bootstrap_rb, &derived)
@@ -1517,15 +1527,19 @@ pub async fn svc_accept_invite(
     let workspace_id = invite.workspace_id;
 
     // Initialize DB and install bootstrap transport identity
-    {
+    let recorded_by = {
         let db = open_connection(db_path)?;
         create_tables(&db)?;
-    }
-    let recorded_by = crate::identity::transport::install_invite_bootstrap_transport_identity(
-        db_path,
-        &invite_key,
-    )
-    .map_err(|e| ServiceError(format!("Failed to install bootstrap identity: {}", e)))?;
+        let adapter = ConcreteTransportIdentityAdapter;
+        adapter
+            .apply_intent(
+                &db,
+                TransportIdentityIntent::InstallInviteBootstrapIdentity {
+                    invite_private_key: invite_key.to_bytes(),
+                },
+            )
+            .map_err(|e| ServiceError(format!("Failed to install bootstrap identity: {}", e)))?
+    };
 
     // Bootstrap sync: fetch prerequisite events from inviter
     let bootstrap_addr: std::net::SocketAddr =
@@ -1631,14 +1645,21 @@ pub async fn svc_accept_invite(
 
     // Transition transport identity: replace invite-derived cert with
     // PeerShared-derived cert so transport and event-layer identities match.
-    let new_peer_id =
-        crate::identity::transport::install_peer_key_transport_identity(&db, &join.peer_shared_key)
-            .map_err(|e| {
-                ServiceError(format!(
-                    "Failed to install peer key transport identity: {}",
-                    e
-                ))
-            })?;
+    let adapter = ConcreteTransportIdentityAdapter;
+    let new_peer_id = adapter
+        .apply_intent(
+            &db,
+            TransportIdentityIntent::InstallPeerSharedIdentityFromSigner {
+                recorded_by: recorded_by.clone(),
+                signer_event_id: join.peer_shared_event_id,
+            },
+        )
+        .map_err(|e| {
+            ServiceError(format!(
+                "Failed to install peer key transport identity: {}",
+                e
+            ))
+        })?;
     crate::db::migrate_recorded_by(&db, &recorded_by, &new_peer_id)?;
 
     Ok(AcceptInviteResponse {
@@ -1675,15 +1696,19 @@ pub async fn svc_accept_device_link(
     let workspace_id = invite.workspace_id;
 
     // Initialize DB and install bootstrap transport identity
-    {
+    let recorded_by = {
         let db = open_connection(db_path)?;
         create_tables(&db)?;
-    }
-    let recorded_by = crate::identity::transport::install_invite_bootstrap_transport_identity(
-        db_path,
-        &invite_key,
-    )
-    .map_err(|e| ServiceError(format!("Failed to install bootstrap identity: {}", e)))?;
+        let adapter = ConcreteTransportIdentityAdapter;
+        adapter
+            .apply_intent(
+                &db,
+                TransportIdentityIntent::InstallInviteBootstrapIdentity {
+                    invite_private_key: invite_key.to_bytes(),
+                },
+            )
+            .map_err(|e| ServiceError(format!("Failed to install bootstrap identity: {}", e)))?
+    };
 
     // Bootstrap sync: fetch prerequisite events from inviter
     let bootstrap_addr: std::net::SocketAddr =
@@ -1763,14 +1788,21 @@ pub async fn svc_accept_device_link(
 
     // Transition transport identity: replace invite-derived cert with
     // PeerShared-derived cert so transport and event-layer identities match.
-    let new_peer_id =
-        crate::identity::transport::install_peer_key_transport_identity(&db, &link.peer_shared_key)
-            .map_err(|e| {
-                ServiceError(format!(
-                    "Failed to install peer key transport identity: {}",
-                    e
-                ))
-            })?;
+    let adapter = ConcreteTransportIdentityAdapter;
+    let new_peer_id = adapter
+        .apply_intent(
+            &db,
+            TransportIdentityIntent::InstallPeerSharedIdentityFromSigner {
+                recorded_by: recorded_by.clone(),
+                signer_event_id: link.peer_shared_event_id,
+            },
+        )
+        .map_err(|e| {
+            ServiceError(format!(
+                "Failed to install peer key transport identity: {}",
+                e
+            ))
+        })?;
     crate::db::migrate_recorded_by(&db, &recorded_by, &new_peer_id)?;
 
     Ok(AcceptDeviceLinkResponse {
