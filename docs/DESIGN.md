@@ -1,11 +1,12 @@
-# Quiet Rust Prototype Protocol (Post-PLAN End State)
+# Topo Protocol Design (Post-PLAN End State)
 
-> **Status: Active** — Target protocol design describing the post-PLAN end state.
+> **Status: Active** — Topo target protocol design describing the post-PLAN end state.
 
 This document describes the target protocol and runtime shape after completing all phases in `PLAN.md`.
 It is intentionally practical: one coherent model, one projection path, one dependency mechanism, and operational behavior that is easy to test with real QUIC daemons.
 
 Terminology note:
+`Topo` is the project and runtime name used throughout this repository.
 `workspace` is the term for the logical peer set and shared protocol context; "network" refers only to transport/networking concerns.
 
 ## Why?

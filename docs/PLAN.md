@@ -1,4 +1,4 @@
-# Simplification Plan For Topo
+# How to implement Topo
 
 > **Status: Active** — Authoritative implementation plan for all phases.
 
