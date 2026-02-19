@@ -100,8 +100,11 @@ def main() -> int:
             else:
                 spec_polarities[sid].add(pol)
 
-    for sid, pols in spec_polarities.items():
-        if "pass" not in pols:
+    # Check all spec_ids, not just those with polarity entries, so that
+    # rows with missing/blank polarity are caught.
+    for sid in sorted(all_spec_ids):
+        pols = spec_polarities.get(sid, set())
+        if "pass" not in pols and sid not in waived_specs:
             errors.append(f"SPEC_NO_PASS: {sid} has no pass-polarity test")
         if "break" not in pols and sid not in waived_specs:
             # Only warn for guard-level specs (not replay/order convergence specs)
