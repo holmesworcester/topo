@@ -392,32 +392,79 @@ avoid redundant recursive cascade; Phase 2 guard retries call back into
 optimization, not an alternate projection path — all projection stages
 (dep check, type check, signer verify, projector dispatch) are shared.
 
-## 4.2 Decision contract
+## 4.2 Pure functional projector contract
 
-Each projection attempt yields one terminal decision:
+Projectors are **pure functions** over `(ParsedEvent, ContextSnapshot)` that return
+a deterministic `ProjectorResult`. They do not execute SQL or any other side effects
+directly. The apply engine executes the returned operations.
 
-1. `Valid(effects)`,
-2. `Block(missing_deps)`,
-3. `Reject(reason)`.
+### ProjectorResult
 
-Most event types are predicate + tenant-scoped autowrite.
+```
+ProjectorResult {
+    decision: ProjectionDecision,  // Valid | Block | Reject | AlreadyProcessed
+    write_ops: Vec<WriteOp>,       // deterministic state mutations
+    emit_commands: Vec<EmitCommand> // follow-on actions for the command executor
+}
+```
 
-Default write policy:
-1. immutable and idempotent materialization uses `INSERT OR IGNORE`,
-2. mutable operational metadata uses `ON CONFLICT DO UPDATE`,
-3. avoid `INSERT OR REPLACE`.
+- `write_ops` are only applied when `decision` is `Valid` (or `AlreadyProcessed` for
+  idempotent intent writes).
+- `emit_commands` are only executed when `decision` is `Valid`.
 
-Pipeline/projector split (DRY contract):
+### WriteOp types
+
+1. `InsertOrIgnore { table, columns, values }` — immutable, idempotent materialization.
+2. `Delete { table, where_clause }` — explicit row removal (tombstone cascades).
+
+### EmitCommand types
+
+1. `RetryWorkspaceGuards` — re-project guard-blocked workspace events after trust anchor set.
+2. `RetryFileSliceGuards { file_id }` — re-project file_slice events after descriptor arrives.
+3. `RecordFileSliceGuardBlock { file_id, event_id }` — record guard-block for pending file_slices.
+
+### ContextSnapshot
+
+Read-model snapshot populated by the pipeline before calling the pure projector.
+Projectors must not access the database directly. Fields include:
+
+- `trust_anchor_workspace_id` — trust anchor for this tenant
+- `target_message_author` / `target_tombstone_author` — for deletion auth
+- `deletion_intent` — pre-existing deletion intent (for delete-before-create convergence)
+- `target_message_deleted` — for reaction skip-on-delete
+- `recipient_removed` — for SecretShared removal exclusion
+- `file_descriptors` / `existing_file_slice` — for FileSlice authorization
+- `secret_key_bytes` — for Encrypted event decryption
+
+### Command/effect execution stage semantics
+
+After `write_ops` are applied transactionally, `emit_commands` are executed in order
+by explicit handlers in the pipeline. Commands may call `project_one` recursively
+(e.g., to retry guard-blocked events), which is safe because each re-projection goes
+through the same pure projector → apply engine path. Command identities are derived
+from event identity for idempotence — re-running the command executor does not mutate
+final state.
+
+### Pipeline/projector split (DRY contract)
+
 1. shared pipeline code handles:
    - event load/decode dispatch,
    - dependency extraction and blocking,
    - signer resolution and signature verification ordering,
-   - queue/state transitions and terminal status writes,
-   - generic effect application.
+   - building the `ContextSnapshot` from the database,
+   - executing `write_ops` and `emit_commands`,
+   - queue/state transitions and terminal status writes.
 2. per-event projector code handles:
    - event-specific predicate/policy logic,
-   - returning declarative effects for the shared applier.
-3. per-event projectors do not implement custom dependency resolution, signature pipeline, or queue/terminal-write paths.
+   - returning `ProjectorResult` with deterministic `write_ops` and `emit_commands`.
+3. per-event projectors do not access the database, implement custom dependency resolution,
+   signature pipeline, or queue/terminal-write paths.
+
+### Default write policy
+
+1. immutable and idempotent materialization uses `InsertOrIgnore`,
+2. avoid `INSERT OR REPLACE`,
+3. deletions are explicit `Delete` WriteOps (never hidden side effects).
 
 Endpoint observation policy:
 1. observations are append-only rows with TTL (`observed_at`, `expires_at`),
@@ -446,14 +493,48 @@ Some behavior stays explicit by design:
 2. trust-anchor handling in `invite_accepted`,
 3. identity/removal policy checks from TLA guards.
 
-### Deletion cascade semantics
+### Deletion intent + tombstone lifecycle
 
-`message_deletion` is always an explicit special projector, not autowrite. Forcing deletion into generic autowrite logic is a known anti-pattern.
+Deletion uses a two-stage model so deletes stay deterministic when events arrive out of order.
 
-Convergence requirement:
-1. deletion-before-target and target-before-deletion must produce identical final projected state,
-2. this reordering invariance is the definition-of-done for deletion implementation,
-3. deletion events must handle the case where the target event has not yet been projected (out-of-order arrival).
+**Stage 1: deletion_intent write.**
+The `MessageDeletion` projector always emits an idempotent `deletion_intent` write keyed
+by `(recorded_by, target_kind="message", target_id)`. This records the intent to delete
+regardless of whether the target message exists yet.
+
+**Stage 2: tombstone + cascade.**
+- If the target message exists in projected state, the projector also emits tombstone
+  (`deleted_messages`) write ops and cascade deletes (`messages`, `reactions`) in the same
+  apply batch.
+- If the target does not exist yet, only the intent is recorded. No imperative retries.
+
+**Delete-before-create convergence:**
+Target-creation projectors (`project_message_pure`) check for matching `deletion_intent`
+rows in their context snapshot and immediately tombstone on first materialization. The
+tombstone row uses the original deletion event's ID and author from the intent, ensuring
+identical final state regardless of arrival order.
+
+**Monotonic deletion state:**
+- `active → tombstoned` is allowed.
+- `tombstoned → active` is never allowed by replay.
+- Physical row removal is a separate compaction concern; projector semantics prefer tombstones.
+
+**Cleanup fanout:**
+Reaction cleanup on message delete is represented as explicit deterministic `Delete` WriteOps
+in the `ProjectorResult`, not hidden side effects. Reactions arriving after their target
+message is deleted (or has a deletion intent) are structurally valid but produce no row.
+
+### Replay/reorder/idempotence deletion invariants
+
+These invariants are enforced by tests (`test_deletion_invariant_*`):
+
+1. **Duplicate replay:** Re-projecting a deletion event leaves state unchanged after first application.
+2. **Order convergence:** Delete-before-create produces identical tombstone rows as create-before-delete.
+3. **Replay invariance:** Full forward replay from event log reproduces identical tombstone state.
+4. **Auth determinism:** Authorization failure paths are deterministic from projected context snapshot.
+5. **Cleanup completeness:** No live reactions remain for tombstoned messages; no query can surface deleted entities.
+6. **Command idempotence:** `deletion_intent` identities are stable (derived from event identity); re-running does not mutate final state.
+7. **Monotonicity:** Once tombstoned, a message cannot revert to active state.
 
 ---
 

@@ -536,6 +536,23 @@ static MIGRATIONS: &[Migration] = &[
             ALTER TABLE peers_shared ADD COLUMN device_name TEXT;
         ",
     },
+    Migration {
+        version: 31,
+        name: "add_deletion_intents",
+        sql: "
+            CREATE TABLE IF NOT EXISTS deletion_intents (
+                recorded_by TEXT NOT NULL,
+                target_kind TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                deletion_event_id TEXT NOT NULL,
+                author_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (recorded_by, target_kind, target_id, deletion_event_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_deletion_intents_target
+                ON deletion_intents(recorded_by, target_id);
+        ",
+    },
 ];
 
 fn ensure_schema_migrations(conn: &Connection) -> SqliteResult<()> {
@@ -601,6 +618,7 @@ mod tests {
         assert!(tables.contains(&"reactions".to_string()));
         assert!(tables.contains(&"invite_bootstrap_trust".to_string()));
         assert!(tables.contains(&"pending_invite_bootstrap_trust".to_string()));
+        assert!(tables.contains(&"deletion_intents".to_string()));
         assert!(tables.contains(&"schema_migrations".to_string()));
     }
 
@@ -749,6 +767,6 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(max_version, 30);
+        assert_eq!(max_version, 31);
     }
 }

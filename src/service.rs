@@ -2130,14 +2130,15 @@ mod tests {
     }
 
     #[test]
-    fn test_svc_delete_errors_on_blocked() {
+    fn test_svc_delete_of_missing_target_writes_intent() {
         let (_dir, db_path) = temp_db_path();
         let peer_id = setup_workspace(&db_path);
 
-        // Delete a non-existent message — will block on missing dep
+        // Delete a non-existent message — writes deletion_intent, returns Ok
+        // (intent-only path for delete-before-create convergence)
         let fake_target = hex::encode([0xEE_u8; 32]);
         let result = svc_delete_message_for_peer(&db_path, &peer_id, &fake_target);
-        assert!(result.is_err(), "delete of missing target should error, got: {:?}", result);
+        assert!(result.is_ok(), "delete of missing target writes intent: {:?}", result);
     }
 
     #[test]

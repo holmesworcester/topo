@@ -1,422 +1,409 @@
-use rusqlite::Connection;
-
-use super::decision::ProjectionDecision;
 use crate::crypto::event_id_to_base64;
 use crate::event_modules::{
     FileSliceEvent, MessageAttachmentEvent, MessageDeletionEvent, MessageEvent,
     ReactionEvent, SecretKeyEvent, SignedMemoEvent,
 };
+use super::result::{ContextSnapshot, EmitCommand, ProjectorResult, SqlVal, WriteOp};
 
-/// Result of verifying signer-user match.
-enum SignerUserCheck {
-    /// Signer's user_event_id matches the claimed author_id.
-    Match,
-    /// Semantic mismatch or missing data — event should be rejected.
-    Mismatch(String),
-}
-
-/// Verify that signed_by peer's user_event_id matches the claimed author_id.
-/// Returns Err only for real DB errors (should not cause permanent rejection).
-fn verify_signer_user_match(
-    conn: &Connection,
-    recorded_by: &str,
-    signed_by: &[u8; 32],
-    author_id: &[u8; 32],
-) -> Result<SignerUserCheck, rusqlite::Error> {
-    let signed_by_b64 = event_id_to_base64(signed_by);
-    let author_id_b64 = event_id_to_base64(author_id);
-
-    let peer_user_eid: String = match conn.query_row(
-        "SELECT COALESCE(user_event_id, '') FROM peers_shared WHERE recorded_by = ?1 AND event_id = ?2",
-        rusqlite::params![recorded_by, &signed_by_b64],
-        |row| row.get(0),
-    ) {
-        Ok(v) => v,
-        Err(rusqlite::Error::QueryReturnedNoRows) => {
-            return Ok(SignerUserCheck::Mismatch(
-                format!("no peers_shared entry for signer {}", signed_by_b64),
-            ));
-        }
-        Err(e) => return Err(e),
-    };
-
-    if peer_user_eid.is_empty() {
-        return Ok(SignerUserCheck::Mismatch(
-            format!("peers_shared entry for signer {} has no user_event_id (legacy row)", signed_by_b64),
-        ));
-    }
-
-    if peer_user_eid != author_id_b64 {
-        return Ok(SignerUserCheck::Mismatch(format!(
-            "signer {} belongs to user {} but author_id claims {}",
-            signed_by_b64, peer_user_eid, author_id_b64
-        )));
-    }
-    Ok(SignerUserCheck::Match)
-}
-
-/// Project a Message event into the messages table. Returns Ok(true) if written.
-pub fn project_message(
-    conn: &Connection,
+/// Pure projector: Message → messages table insert.
+///
+/// Also checks the context snapshot for a matching deletion_intent — if the
+/// message target already has a deletion intent recorded, the message is
+/// projected as tombstoned on first materialization (deletion-before-create
+/// convergence).
+pub fn project_message_pure(
     recorded_by: &str,
     event_id_b64: &str,
     msg: &MessageEvent,
-) -> Result<ProjectionDecision, Box<dyn std::error::Error>> {
-    // Verify signer-user match
-    match verify_signer_user_match(conn, recorded_by, &msg.signed_by, &msg.author_id)? {
-        SignerUserCheck::Mismatch(reason) => return Ok(ProjectionDecision::Reject { reason }),
-        SignerUserCheck::Match => {}
+    ctx: &ContextSnapshot,
+) -> ProjectorResult {
+    if let Some(reason) = &ctx.signer_user_mismatch_reason {
+        return ProjectorResult::reject(reason.clone());
     }
 
     let workspace_id_b64 = event_id_to_base64(&msg.workspace_id);
     let author_id_b64 = event_id_to_base64(&msg.author_id);
-    conn.execute(
-        "INSERT OR IGNORE INTO messages (message_id, workspace_id, author_id, content, created_at, recorded_by)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        rusqlite::params![
-            event_id_b64,
-            workspace_id_b64,
-            author_id_b64,
-            &msg.content,
-            msg.created_at_ms as i64,
-            recorded_by
-        ],
-    )?;
-    Ok(ProjectionDecision::Valid)
+
+    // Check for pre-existing deletion intents (delete-before-create convergence).
+    // Multiple intents may exist (different deletion events targeting this message).
+    // Find the first one whose author matches the message author.
+    if let Some(intent) = ctx.deletion_intents.iter().find(|i| i.author_id == author_id_b64) {
+        // Message was already targeted for deletion before it arrived.
+        // Record the tombstone immediately using the original deletion event ID
+        // for replay invariance — the same tombstone row results regardless of
+        // whether delete or create arrives first.
+        let ops = vec![
+            WriteOp::InsertOrIgnore {
+                table: "deleted_messages",
+                columns: vec!["recorded_by", "message_id", "deletion_event_id", "author_id", "deleted_at"],
+                values: vec![
+                    SqlVal::Text(recorded_by.to_string()),
+                    SqlVal::Text(event_id_b64.to_string()),
+                    SqlVal::Text(intent.deletion_event_id.clone()),
+                    SqlVal::Text(intent.author_id.clone()),
+                    SqlVal::Int(intent.created_at),
+                ],
+            },
+        ];
+        // Structurally valid (the event itself is fine), but tombstoned.
+        return ProjectorResult::valid(ops);
+    }
+    // No matching-author intent found — materialize the message normally.
+    // Any wrong-author intents are stale and ignored.
+
+    let ops = vec![
+        WriteOp::InsertOrIgnore {
+            table: "messages",
+            columns: vec!["message_id", "workspace_id", "author_id", "content", "created_at", "recorded_by"],
+            values: vec![
+                SqlVal::Text(event_id_b64.to_string()),
+                SqlVal::Text(workspace_id_b64),
+                SqlVal::Text(author_id_b64),
+                SqlVal::Text(msg.content.clone()),
+                SqlVal::Int(msg.created_at_ms as i64),
+                SqlVal::Text(recorded_by.to_string()),
+            ],
+        },
+    ];
+    ProjectorResult::valid(ops)
 }
 
-/// Project a Reaction event into the reactions table.
-/// If the target message has been deleted, the reaction is structurally valid but skipped.
-pub fn project_reaction(
-    conn: &Connection,
+/// Pure projector: Reaction → reactions table insert.
+///
+/// If the target message has been deleted, the
+/// reaction is structurally valid but no row is written.
+pub fn project_reaction_pure(
     recorded_by: &str,
     event_id_b64: &str,
     rxn: &ReactionEvent,
-) -> Result<ProjectionDecision, Box<dyn std::error::Error>> {
-    // Verify signer-user match
-    match verify_signer_user_match(conn, recorded_by, &rxn.signed_by, &rxn.author_id)? {
-        SignerUserCheck::Mismatch(reason) => return Ok(ProjectionDecision::Reject { reason }),
-        SignerUserCheck::Match => {}
+    ctx: &ContextSnapshot,
+) -> ProjectorResult {
+    if let Some(reason) = &ctx.signer_user_mismatch_reason {
+        return ProjectorResult::reject(reason.clone());
     }
 
     let target_id_b64 = event_id_to_base64(&rxn.target_event_id);
 
-    // Check if target message has been deleted — skip projection if so
-    let target_deleted: bool = conn.query_row(
-        "SELECT COUNT(*) > 0 FROM deleted_messages WHERE recorded_by = ?1 AND message_id = ?2",
-        rusqlite::params![recorded_by, &target_id_b64],
-        |row| row.get(0),
-    )?;
-    if target_deleted {
-        return Ok(ProjectionDecision::Valid); // structurally valid, but skip projection (message gone)
+    // Check deletion state — skip if target is tombstoned or has deletion intent
+    if ctx.target_message_deleted {
+        return ProjectorResult::valid(vec![]); // valid event, no row written
     }
 
     let author_id_b64 = event_id_to_base64(&rxn.author_id);
-    conn.execute(
-        "INSERT OR IGNORE INTO reactions (event_id, target_event_id, author_id, emoji, created_at, recorded_by)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        rusqlite::params![
-            event_id_b64,
-            target_id_b64,
-            author_id_b64,
-            &rxn.emoji,
-            rxn.created_at_ms as i64,
-            recorded_by
-        ],
-    )?;
-    Ok(ProjectionDecision::Valid)
+    let ops = vec![
+        WriteOp::InsertOrIgnore {
+            table: "reactions",
+            columns: vec!["event_id", "target_event_id", "author_id", "emoji", "created_at", "recorded_by"],
+            values: vec![
+                SqlVal::Text(event_id_b64.to_string()),
+                SqlVal::Text(target_id_b64),
+                SqlVal::Text(author_id_b64),
+                SqlVal::Text(rxn.emoji.clone()),
+                SqlVal::Int(rxn.created_at_ms as i64),
+                SqlVal::Text(recorded_by.to_string()),
+            ],
+        },
+    ];
+    ProjectorResult::valid(ops)
 }
 
-/// Project a SecretKey event into the secret_keys table. Returns Ok(true) if written.
-pub fn project_secret_key(
-    conn: &Connection,
+/// Pure projector: SecretKey → secret_keys table insert.
+pub fn project_secret_key_pure(
     recorded_by: &str,
     event_id_b64: &str,
     sk: &SecretKeyEvent,
-) -> Result<bool, rusqlite::Error> {
-    let rows = conn.execute(
-        "INSERT OR IGNORE INTO secret_keys (event_id, key_bytes, created_at, recorded_by)
-         VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![
-            event_id_b64,
-            sk.key_bytes.as_slice(),
-            sk.created_at_ms as i64,
-            recorded_by
-        ],
-    )?;
-    Ok(rows > 0)
+) -> ProjectorResult {
+    let ops = vec![
+        WriteOp::InsertOrIgnore {
+            table: "secret_keys",
+            columns: vec!["event_id", "key_bytes", "created_at", "recorded_by"],
+            values: vec![
+                SqlVal::Text(event_id_b64.to_string()),
+                SqlVal::Blob(sk.key_bytes.to_vec()),
+                SqlVal::Int(sk.created_at_ms as i64),
+                SqlVal::Text(recorded_by.to_string()),
+            ],
+        },
+    ];
+    ProjectorResult::valid(ops)
 }
 
-/// Project a SignedMemo event into the signed_memos table. Returns Ok(true) if written.
-pub fn project_signed_memo(
-    conn: &Connection,
+/// Pure projector: SignedMemo → signed_memos table insert.
+pub fn project_signed_memo_pure(
     recorded_by: &str,
     event_id_b64: &str,
     memo: &SignedMemoEvent,
-) -> Result<bool, rusqlite::Error> {
+) -> ProjectorResult {
     let signed_by_b64 = event_id_to_base64(&memo.signed_by);
-    let rows = conn.execute(
-        "INSERT OR IGNORE INTO signed_memos (event_id, signed_by, signer_type, content, created_at, recorded_by)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        rusqlite::params![
-            event_id_b64,
-            signed_by_b64,
-            memo.signer_type as i64,
-            &memo.content,
-            memo.created_at_ms as i64,
-            recorded_by
-        ],
-    )?;
-    Ok(rows > 0)
+    let ops = vec![
+        WriteOp::InsertOrIgnore {
+            table: "signed_memos",
+            columns: vec!["event_id", "signed_by", "signer_type", "content", "created_at", "recorded_by"],
+            values: vec![
+                SqlVal::Text(event_id_b64.to_string()),
+                SqlVal::Text(signed_by_b64),
+                SqlVal::Int(memo.signer_type as i64),
+                SqlVal::Text(memo.content.clone()),
+                SqlVal::Int(memo.created_at_ms as i64),
+                SqlVal::Text(recorded_by.to_string()),
+            ],
+        },
+    ];
+    ProjectorResult::valid(ops)
 }
 
-/// Project a MessageDeletion event: verify author matches, tombstone, cascade-delete message + reactions.
-/// Returns ProjectionDecision directly (can Reject on auth failure).
-pub fn project_message_deletion(
-    conn: &Connection,
+/// Pure projector: MessageDeletion → two-stage deletion intent + tombstone model.
+///
+/// 1. Always emits an idempotent deletion_intent write keyed by (recorded_by, "message", target_id).
+/// 2. If target exists in projected state (ctx.target_message_author is Some), verifies
+///    author match and emits tombstone + cascade writes.
+/// 3. If target doesn't exist yet (None), only records intent — the message projector
+///    will tombstone on first materialization when it checks deletion_intents.
+/// 4. If already tombstoned, verifies author and returns AlreadyProcessed.
+pub fn project_message_deletion_pure(
     recorded_by: &str,
     event_id_b64: &str,
     del: &MessageDeletionEvent,
-) -> Result<ProjectionDecision, Box<dyn std::error::Error>> {
-    // Verify signer-user match
-    match verify_signer_user_match(conn, recorded_by, &del.signed_by, &del.author_id)? {
-        SignerUserCheck::Mismatch(reason) => return Ok(ProjectionDecision::Reject { reason }),
-        SignerUserCheck::Match => {}
+    ctx: &ContextSnapshot,
+) -> ProjectorResult {
+    if let Some(reason) = &ctx.signer_user_mismatch_reason {
+        return ProjectorResult::reject(reason.clone());
     }
 
     let target_b64 = event_id_to_base64(&del.target_event_id);
     let del_author_b64 = event_id_to_base64(&del.author_id);
 
-    // Check if already tombstoned — if so, verify author against tombstone before accepting
-    let tombstone_author: Option<String> = match conn.query_row(
-        "SELECT author_id FROM deleted_messages WHERE recorded_by = ?1 AND message_id = ?2",
-        rusqlite::params![recorded_by, &target_b64],
-        |row| row.get::<_, String>(0),
-    ) {
-        Ok(a) => Some(a),
-        Err(rusqlite::Error::QueryReturnedNoRows) => None,
-        Err(e) => return Err(e.into()),
-    };
+    // Type validation: reject if target is a known non-message event.
+    // (target_event_id was removed from deps for the intent-only path,
+    // so we check the target type at projection time instead.)
+    if ctx.target_is_non_message {
+        return ProjectorResult::reject(
+            "deletion target is a non-message event".to_string(),
+        );
+    }
 
-    if let Some(ref stored_author) = tombstone_author {
-        // Tombstone exists — still enforce author match
+    // Already tombstoned — verify author, return AlreadyProcessed
+    if let Some(ref stored_author) = ctx.target_tombstone_author {
         if stored_author != &del_author_b64 {
-            return Ok(ProjectionDecision::Reject {
-                reason: "deletion author does not match message author".to_string(),
-            });
+            return ProjectorResult::reject(
+                "deletion author does not match message author".to_string(),
+            );
         }
-        return Ok(ProjectionDecision::AlreadyProcessed);
+        // Deletion intent should still be recorded for idempotence,
+        // but it's a no-op if already exists.
+        let ops = vec![
+            WriteOp::InsertOrIgnore {
+                table: "deletion_intents",
+                columns: vec!["recorded_by", "target_kind", "target_id", "deletion_event_id", "author_id", "created_at"],
+                values: vec![
+                    SqlVal::Text(recorded_by.to_string()),
+                    SqlVal::Text("message".to_string()),
+                    SqlVal::Text(target_b64),
+                    SqlVal::Text(event_id_b64.to_string()),
+                    SqlVal::Text(del_author_b64),
+                    SqlVal::Int(del.created_at_ms as i64),
+                ],
+            },
+        ];
+        return ProjectorResult {
+            decision: super::decision::ProjectionDecision::AlreadyProcessed,
+            write_ops: ops,
+            emit_commands: Vec::new(),
+        };
     }
 
-    // No tombstone — look up target message for authorization
-    let msg_author: Option<String> = match conn.query_row(
-        "SELECT author_id FROM messages WHERE recorded_by = ?1 AND message_id = ?2",
-        rusqlite::params![recorded_by, &target_b64],
-        |row| row.get(0),
-    ) {
-        Ok(a) => Some(a),
-        Err(rusqlite::Error::QueryReturnedNoRows) => None,
-        Err(e) => return Err(e.into()),
-    };
+    // Always record deletion intent (idempotent via INSERT OR IGNORE)
+    let mut ops = vec![
+        WriteOp::InsertOrIgnore {
+            table: "deletion_intents",
+            columns: vec!["recorded_by", "target_kind", "target_id", "deletion_event_id", "author_id", "created_at"],
+            values: vec![
+                SqlVal::Text(recorded_by.to_string()),
+                SqlVal::Text("message".to_string()),
+                SqlVal::Text(target_b64.clone()),
+                SqlVal::Text(event_id_b64.to_string()),
+                SqlVal::Text(del_author_b64.clone()),
+                SqlVal::Int(del.created_at_ms as i64),
+            ],
+        },
+    ];
 
-    match msg_author {
-        None => {
-            return Ok(ProjectionDecision::Reject {
-                reason: "target message not found".to_string(),
-            });
+    // Target exists — verify author, emit tombstone + cascade
+    if let Some(ref msg_author) = ctx.target_message_author {
+        if msg_author != &del_author_b64 {
+            return ProjectorResult::reject(
+                "deletion author does not match message author".to_string(),
+            );
         }
-        Some(author_b64) => {
-            if author_b64 != del_author_b64 {
-                return Ok(ProjectionDecision::Reject {
-                    reason: "deletion author does not match message author".to_string(),
-                });
-            }
-        }
+
+        // Tombstone
+        ops.push(WriteOp::InsertOrIgnore {
+            table: "deleted_messages",
+            columns: vec!["recorded_by", "message_id", "deletion_event_id", "author_id", "deleted_at"],
+            values: vec![
+                SqlVal::Text(recorded_by.to_string()),
+                SqlVal::Text(target_b64.clone()),
+                SqlVal::Text(event_id_b64.to_string()),
+                SqlVal::Text(del_author_b64),
+                SqlVal::Int(del.created_at_ms as i64),
+            ],
+        });
+
+        // Cascade: delete message and its reactions (explicit write ops, not hidden side effects)
+        ops.push(WriteOp::Delete {
+            table: "messages",
+            where_clause: vec![
+                ("recorded_by", SqlVal::Text(recorded_by.to_string())),
+                ("message_id", SqlVal::Text(target_b64.clone())),
+            ],
+        });
+        ops.push(WriteOp::Delete {
+            table: "reactions",
+            where_clause: vec![
+                ("recorded_by", SqlVal::Text(recorded_by.to_string())),
+                ("target_event_id", SqlVal::Text(target_b64)),
+            ],
+        });
+
+        return ProjectorResult::valid(ops);
     }
 
-    // Tombstone
-    conn.execute(
-        "INSERT OR IGNORE INTO deleted_messages (recorded_by, message_id, deletion_event_id, author_id, deleted_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        rusqlite::params![
-            recorded_by,
-            &target_b64,
-            event_id_b64,
-            &del_author_b64,
-            del.created_at_ms as i64
-        ],
-    )?;
-
-    // Cascade: remove message and its reactions
-    conn.execute(
-        "DELETE FROM messages WHERE recorded_by = ?1 AND message_id = ?2",
-        rusqlite::params![recorded_by, &target_b64],
-    )?;
-    conn.execute(
-        "DELETE FROM reactions WHERE recorded_by = ?1 AND target_event_id = ?2",
-        rusqlite::params![recorded_by, &target_b64],
-    )?;
-
-    Ok(ProjectionDecision::Valid)
+    // Target doesn't exist yet — only record intent.
+    // When the message arrives, project_message_pure will check deletion_intents
+    // and tombstone immediately (delete-before-create convergence).
+    ProjectorResult::valid(ops)
 }
 
-pub fn project_message_attachment(
-    conn: &Connection,
+/// Pure projector: MessageAttachment → message_attachments table insert.
+/// Emits RetryFileSliceGuards command so pending file_slices can unblock.
+pub fn project_message_attachment_pure(
     recorded_by: &str,
     event_id_b64: &str,
     att: &MessageAttachmentEvent,
-) -> Result<bool, rusqlite::Error> {
+) -> ProjectorResult {
     let message_id_b64 = event_id_to_base64(&att.message_id);
     let file_id_b64 = event_id_to_base64(&att.file_id);
     let key_event_id_b64 = event_id_to_base64(&att.key_event_id);
     let signer_event_id_b64 = event_id_to_base64(&att.signed_by);
-    let rows = conn.execute(
-        "INSERT OR IGNORE INTO message_attachments (recorded_by, event_id, message_id, file_id, blob_bytes, total_slices, slice_bytes, root_hash, key_event_id, filename, mime_type, created_at, signer_event_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-        rusqlite::params![
-            recorded_by,
-            event_id_b64,
-            message_id_b64,
-            file_id_b64,
-            att.blob_bytes as i64,
-            att.total_slices as i64,
-            att.slice_bytes as i64,
-            att.root_hash.as_slice(),
-            key_event_id_b64,
-            &att.filename,
-            &att.mime_type,
-            att.created_at_ms as i64,
-            signer_event_id_b64,
-        ],
-    )?;
-    Ok(rows > 0)
+
+    let ops = vec![
+        WriteOp::InsertOrIgnore {
+            table: "message_attachments",
+            columns: vec![
+                "recorded_by", "event_id", "message_id", "file_id",
+                "blob_bytes", "total_slices", "slice_bytes", "root_hash",
+                "key_event_id", "filename", "mime_type", "created_at", "signer_event_id",
+            ],
+            values: vec![
+                SqlVal::Text(recorded_by.to_string()),
+                SqlVal::Text(event_id_b64.to_string()),
+                SqlVal::Text(message_id_b64),
+                SqlVal::Text(file_id_b64.clone()),
+                SqlVal::Int(att.blob_bytes as i64),
+                SqlVal::Int(att.total_slices as i64),
+                SqlVal::Int(att.slice_bytes as i64),
+                SqlVal::Blob(att.root_hash.to_vec()),
+                SqlVal::Text(key_event_id_b64),
+                SqlVal::Text(att.filename.clone()),
+                SqlVal::Text(att.mime_type.clone()),
+                SqlVal::Int(att.created_at_ms as i64),
+                SqlVal::Text(signer_event_id_b64),
+            ],
+        },
+    ];
+
+    ProjectorResult::valid_with_commands(
+        ops,
+        vec![EmitCommand::RetryFileSliceGuards { file_id: file_id_b64 }],
+    )
 }
 
-/// Project a FileSlice event into the file_slices table (index only, no ciphertext).
-/// Authorization: if a MessageAttachment descriptor exists for this file_id,
-/// the file_slice signer must match the descriptor's signer. If no descriptor
-/// exists yet, the file_slice is guard-blocked (Block with empty missing).
-/// Returns Ok(ProjectionDecision::Valid) on success or idempotent replay.
-/// Returns Ok(ProjectionDecision::Reject) if signer mismatch or slot conflict.
-pub fn project_file_slice(
-    conn: &Connection,
+/// Pure projector: FileSlice → file_slices table insert.
+///
+/// Uses ContextSnapshot.file_descriptors to determine authorization:
+/// - No descriptors → guard-block (emit RecordFileSliceGuardBlock command)
+/// - Multiple signers → reject
+/// - Signer mismatch → reject
+/// - Success → insert file_slice row
+pub fn project_file_slice_pure(
     recorded_by: &str,
     event_id_b64: &str,
     fs: &FileSliceEvent,
-) -> Result<ProjectionDecision, rusqlite::Error> {
+    ctx: &ContextSnapshot,
+) -> ProjectorResult {
     let file_id_b64 = event_id_to_base64(&fs.file_id);
     let slice_signer_b64 = event_id_to_base64(&fs.signed_by);
 
-    // Authorization: load descriptors for this file_id deterministically.
-    let mut desc_stmt = conn.prepare(
-        "SELECT event_id, signer_event_id
-         FROM message_attachments
-         WHERE recorded_by = ?1 AND file_id = ?2
-         ORDER BY created_at ASC, event_id ASC",
-    )?;
-    let descriptors: Vec<(String, String)> = desc_stmt
-        .query_map(rusqlite::params![recorded_by, &file_id_b64], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    drop(desc_stmt);
-
-    if descriptors.is_empty() {
-        // No descriptor yet — guard-block until MessageAttachment arrives.
-        conn.execute(
-            "INSERT OR IGNORE INTO file_slice_guard_blocks (peer_id, file_id, event_id)
-             VALUES (?1, ?2, ?3)",
-            rusqlite::params![recorded_by, &file_id_b64, event_id_b64],
-        )?;
-        return Ok(ProjectionDecision::Block { missing: vec![] });
+    if ctx.file_descriptors.is_empty() {
+        // No descriptor yet — guard-block
+        return ProjectorResult {
+            decision: super::decision::ProjectionDecision::Block { missing: vec![] },
+            write_ops: Vec::new(),
+            emit_commands: vec![EmitCommand::RecordFileSliceGuardBlock {
+                file_id: file_id_b64,
+                event_id: event_id_b64.to_string(),
+            }],
+        };
     }
 
-    // Ensure file_id does not map to conflicting descriptor signers.
+    // Check for conflicting descriptor signers
     let mut descriptor_signers = std::collections::BTreeSet::new();
-    for (_, signer) in &descriptors {
+    for (_, signer) in &ctx.file_descriptors {
         descriptor_signers.insert(signer.clone());
     }
     if descriptor_signers.len() > 1 {
-        conn.execute(
-            "DELETE FROM file_slice_guard_blocks WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, event_id_b64],
-        )?;
-        return Ok(ProjectionDecision::Reject {
-            reason: format!(
-                "file_id {} maps to multiple attachment signers ({}), cannot authorize file_slice",
-                file_id_b64,
-                descriptor_signers.len()
-            ),
-        });
+        return ProjectorResult::reject(format!(
+            "file_id {} maps to multiple attachment signers ({}), cannot authorize file_slice",
+            file_id_b64,
+            descriptor_signers.len()
+        ));
     }
 
-    let (descriptor_event_id, descriptor_signer) = descriptors[0].clone();
+    let (descriptor_event_id, descriptor_signer) = ctx.file_descriptors[0].clone();
     if descriptor_signer != slice_signer_b64 {
-        conn.execute(
-            "DELETE FROM file_slice_guard_blocks WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, event_id_b64],
-        )?;
-        return Ok(ProjectionDecision::Reject {
-            reason: format!(
-                "file_slice signer {} does not match attachment descriptor signer {}",
-                slice_signer_b64, descriptor_signer
-            ),
-        });
+        return ProjectorResult::reject(format!(
+            "file_slice signer {} does not match attachment descriptor signer {}",
+            slice_signer_b64, descriptor_signer
+        ));
     }
 
-    let rows = conn.execute(
-        "INSERT OR IGNORE INTO file_slices (recorded_by, file_id, slice_number, event_id, created_at, descriptor_event_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        rusqlite::params![
-            recorded_by,
-            &file_id_b64,
-            fs.slice_number as i64,
-            event_id_b64,
-            fs.created_at_ms as i64,
-            &descriptor_event_id,
-        ],
-    )?;
-    if rows > 0 {
-        conn.execute(
-            "DELETE FROM file_slice_guard_blocks WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, event_id_b64],
-        )?;
-        return Ok(ProjectionDecision::Valid);
-    }
-
-    // Row already exists — check if same event_id (idempotent replay) or conflict
-    let (existing_event_id, existing_descriptor_event_id): (String, String) = conn.query_row(
-        "SELECT event_id, descriptor_event_id
-         FROM file_slices
-         WHERE recorded_by = ?1 AND file_id = ?2 AND slice_number = ?3",
-        rusqlite::params![recorded_by, &file_id_b64, fs.slice_number as i64],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-
-    if existing_event_id == event_id_b64 {
-        if existing_descriptor_event_id != descriptor_event_id {
-            return Ok(ProjectionDecision::Reject {
-                reason: format!(
+    // Check for existing slice in same slot (idempotent replay or conflict)
+    if let Some((ref existing_event_id, ref existing_descriptor)) = ctx.existing_file_slice {
+        if existing_event_id == event_id_b64 {
+            if existing_descriptor != &descriptor_event_id {
+                return ProjectorResult::reject(format!(
                     "file_slice descriptor mismatch: existing {} vs authorized {}",
-                    existing_descriptor_event_id, descriptor_event_id
-                ),
-            });
-        }
-        conn.execute(
-            "DELETE FROM file_slice_guard_blocks WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, event_id_b64],
-        )?;
-        Ok(ProjectionDecision::Valid) // idempotent replay
-    } else {
-        conn.execute(
-            "DELETE FROM file_slice_guard_blocks WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, event_id_b64],
-        )?;
-        Ok(ProjectionDecision::Reject {
-            reason: format!(
+                    existing_descriptor, descriptor_event_id
+                ));
+            }
+            return ProjectorResult::valid(vec![]); // idempotent replay
+        } else {
+            return ProjectorResult::reject(format!(
                 "duplicate file_slice: slot ({}, {}, {}) already claimed by event {}",
                 recorded_by, file_id_b64, fs.slice_number, existing_event_id
-            ),
-        })
+            ));
+        }
     }
+
+    // Insert new slice.
+    // Safety: the TOCTOU window between ctx.existing_file_slice check and this
+    // write is harmless because SQLite WAL is single-writer and per-peer
+    // projection is serialized in the ingest runtime. InsertOrIgnore is
+    // idempotent for replay, and concurrent slot claiming by different events
+    // cannot occur within a single connection.
+    let ops = vec![
+        WriteOp::InsertOrIgnore {
+            table: "file_slices",
+            columns: vec!["recorded_by", "file_id", "slice_number", "event_id", "created_at", "descriptor_event_id"],
+            values: vec![
+                SqlVal::Text(recorded_by.to_string()),
+                SqlVal::Text(file_id_b64),
+                SqlVal::Int(fs.slice_number as i64),
+                SqlVal::Text(event_id_b64.to_string()),
+                SqlVal::Int(fs.created_at_ms as i64),
+                SqlVal::Text(descriptor_event_id),
+            ],
+        },
+    ];
+    ProjectorResult::valid(ops)
 }

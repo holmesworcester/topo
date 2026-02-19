@@ -479,54 +479,69 @@ Harness policy:
 
 Implement projection semantics before adding heavy queue machinery.
 
-## 6.1 Projector contract
+## 6.1 Pure functional projector contract
 
-Keep projector core pure and worker orchestration imperative.
+Projectors are **pure functions** over `(ParsedEvent, ContextSnapshot)`. They return
+a deterministic `ProjectorResult` containing write operations and emitted commands.
+They do not execute SQL or any other side effects directly.
+
 All code paths call the same projector entrypoint:
 - `project_one(recorded_by, event_id) -> ProjectionDecision`
 
 ```rust
-enum ProjectionDecision {
-    Valid(ProjectorEffects),
-    Block { missing: Vec<EventId> },
-    Reject { reason: String },
+struct ProjectorResult {
+    decision: ProjectionDecision,   // Valid | Block | Reject | AlreadyProcessed
+    write_ops: Vec<WriteOp>,        // deterministic state mutations
+    emit_commands: Vec<EmitCommand>, // follow-on actions for command executor
 }
 
-struct ProjectorEffects {
-    auto_row: Option<AutoRow>,
-    extra_writes: Vec<WriteOp>,
-    emit_events: Vec<NewEvent>,
-    commands: Vec<Command>,
+enum WriteOp {
+    InsertOrIgnore { table, columns, values },
+    Delete { table, where_clause },
+}
+
+enum EmitCommand {
+    RetryWorkspaceGuards,
+    RetryFileSliceGuards { file_id },
+    RecordFileSliceGuardBlock { file_id, event_id },
 }
 ```
 
 Entry-point requirement:
 - `local_create`, `wire_receive`, `replay`, and unblock retries must all invoke `project_one`.
 - no alternate projection code paths for specific ingestion sources.
-- Internal cascade optimization: `project_one_step` (the 7-step algorithm without cascade) is used by the Kahn cascade worklist to avoid redundant recursive cascade. Phase 2 guard retries call `project_one` for proper recursive cascade. All projection stages are shared; the split is a performance optimization, not an alternate path.
+- Internal cascade optimization: `project_one_step` (the 7-step algorithm without cascade) is used by the Kahn cascade worklist to avoid redundant recursive cascade. `apply_projection` executes `emit_commands` (which handles guard retries), so the cascade only manages Kahn dependency unblocking. All projection stages are shared; the split is a performance optimization, not an alternate path.
+
+Apply engine execution stages:
+1. Pipeline builds `ContextSnapshot` from DB (the only DB reads the projector needs).
+2. Pipeline calls pure projector → receives `ProjectorResult`.
+3. Pipeline executes `write_ops` transactionally (only on Valid/AlreadyProcessed).
+4. Pipeline executes `emit_commands` via explicit handlers (only on Valid).
+5. Pipeline handles guard-block commands on Block decisions (e.g., file_slice guard blocks).
 
 DRY split (required):
 - Shared projection pipeline code owns:
   1. canonical event load/decode dispatch,
   2. dependency extraction + missing-dependency block writes,
   3. signer resolution + signature verification ordering (Phase 6),
-  4. terminal state writes (`valid`/`block`/`reject`) + queue transitions,
-  5. generic effect application (`auto_row`, `emit_events`, common write helpers).
+  4. building `ContextSnapshot` from the database,
+  5. executing `write_ops` and `emit_commands`,
+  6. terminal state writes (`valid`/`block`/`reject`) + queue transitions.
 - Per-event projector code owns only:
   1. event-specific predicate/policy checks,
-  2. event-specific effect declaration (`ProjectorEffects`) for the shared applier.
-- Per-event projector code must not implement its own dependency walker, signer verifier, queue handling, or terminal-state writer.
+  2. returning `ProjectorResult` with deterministic `write_ops` and `emit_commands`.
+- Per-event projector code must not access the database, implement its own dependency walker, signer verifier, queue handling, or terminal-state writer.
 
 ### Default behavior
 
 - Most event types use predicate + auto-write.
-- Auto-write is typically `INSERT OR IGNORE` of flat event fields + metadata.
+- Auto-write is typically `InsertOrIgnore` WriteOps of flat event fields + metadata.
 - Auto-write is tenant-scoped in shared tables (`peer_id`/`recorded_by` included in subjective rows and keys).
 - Validation order for signed events is fixed:
   1. dependency extraction/check (including signer dependency),
   2. signature verification using resolved signer key,
   3. authorization/policy predicate checks,
-  4. autowrite/effects.
+  4. pure projector dispatch → WriteOps + EmitCommands.
 
 ### Emitted-event rule (required)
 
@@ -545,9 +560,33 @@ Deterministic emitted-event exception (still under this rule):
 
 ### Explicit exceptions
 
-- `message_deletion` and deletion cascade rules.
+- `message_deletion` uses the two-stage deletion intent + tombstone model (see Phase 10).
 - deterministic emitted-event patterns (for example key material derivations) using the unsigned deterministic exception above.
-- identity-specific exceptions (`invite_accepted`, removal enforcement) are deferred to Phase 12.
+- identity-specific exceptions (`invite_accepted` trust-anchor binding via `RetryWorkspaceGuards` command, removal enforcement) implemented via EmitCommand handlers.
+
+### Deletion intent + tombstone contract (Phase 10)
+
+Two-stage model so deletes stay deterministic when events arrive out of order:
+
+1. `MessageDeletion` projector emits an idempotent `deletion_intent` write keyed by
+   `(recorded_by, target_kind="message", target_id)`.
+2. If target exists in projected state, projector also emits tombstone + cascade delete
+   WriteOps in same apply batch.
+3. If target does not exist yet, projector only records intent; no imperative retries.
+4. Target-creation projectors check for matching `deletion_intent` rows in their
+   `ContextSnapshot` and immediately tombstone on first materialization, using the
+   original deletion event's identity for replay invariance.
+5. Cleanup work (message delete → reaction tombstones) is explicit `Delete` WriteOps.
+6. Deletion state is monotonic: `active → tombstoned` allowed, `tombstoned → active` forbidden.
+7. Physical row removal is a separate compaction concern.
+
+Deletion invariants validated by tests:
+1. Duplicate replay leaves state unchanged after first application.
+2. Delete-before-create converges to identical final state as create-before-delete.
+3. Full replay reproduces identical tombstone state.
+4. Authorization failure paths are deterministic from projected context.
+5. No live reactions remain for tombstoned message.
+6. Command execution idempotence: intent identities are stable, re-running does not mutate state.
 
 ## 6.2 Dependency handling (blocked-edge + header first)
 

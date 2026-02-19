@@ -1199,6 +1199,8 @@ fn clear_projection_tables(db: &rusqlite::Connection, recorded_by: &str) {
     db.execute("DELETE FROM trust_anchors WHERE peer_id = ?1", rusqlite::params![recorded_by]).ok();
     db.execute("DELETE FROM peer_transport_bindings WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
     db.execute("DELETE FROM transport_keys WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
+    // — Deletion intents (deterministic projection state, must be cleared for replay)
+    db.execute("DELETE FROM deletion_intents WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
     // — Operational state (must be cleared for correct re-projection)
     db.execute("DELETE FROM valid_events WHERE peer_id = ?1", rusqlite::params![recorded_by])
         .expect("failed to clear valid_events");

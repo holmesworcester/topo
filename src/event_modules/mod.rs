@@ -144,7 +144,7 @@ impl ParsedEvent {
             ParsedEvent::SignedMemo(s) => vec![("signed_by", s.signed_by)],
             ParsedEvent::Encrypted(e) => vec![("key_event_id", e.key_event_id)],
             ParsedEvent::SecretKey(_) => vec![],
-            ParsedEvent::MessageDeletion(d) => vec![("target_event_id", d.target_event_id), ("author_id", d.author_id), ("signed_by", d.signed_by)],
+            ParsedEvent::MessageDeletion(d) => vec![("signed_by", d.signed_by)],
             ParsedEvent::Workspace(_) => vec![],
             ParsedEvent::InviteAccepted(_) => vec![],
             // UserInviteBoot: signed_by is a dep (workspace_id is reference, not dep)
@@ -882,12 +882,8 @@ mod tests {
             signature: [0u8; 64],
         });
         let deps = del.dep_field_values();
-        assert_eq!(deps.len(), 3);
-        assert_eq!(deps[0].0, "target_event_id");
-        assert_eq!(deps[0].1, target);
-        assert_eq!(deps[1].0, "author_id");
-        assert_eq!(deps[1].1, [10u8; 32]);
-        assert_eq!(deps[2].0, "signed_by");
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].0, "signed_by");
     }
 
     #[test]

@@ -1,313 +1,356 @@
-use rusqlite::Connection;
-
-use crate::crypto::{event_id_to_base64, event_id_from_base64};
+use crate::crypto::event_id_to_base64;
 use crate::event_modules::ParsedEvent;
-use super::decision::ProjectionDecision;
+use super::result::{ContextSnapshot, EmitCommand, ProjectorResult, SqlVal, WriteOp};
 
-// Trust anchor is set directly from invite_accepted.workspace_id.
-
-/// Dispatch identity event projections. Called from apply_projection in pipeline.rs.
-pub fn apply_identity_projection(
-    conn: &Connection,
+/// Dispatch identity event projections to pure projectors.
+pub fn apply_identity_projection_pure(
     recorded_by: &str,
     event_id_b64: &str,
     parsed: &ParsedEvent,
-) -> Result<ProjectionDecision, Box<dyn std::error::Error>> {
+    ctx: &ContextSnapshot,
+) -> ProjectorResult {
     match parsed {
-        ParsedEvent::Workspace(ws) => project_workspace(conn, recorded_by, event_id_b64, ws),
-        ParsedEvent::InviteAccepted(ia) => project_invite_accepted(conn, recorded_by, event_id_b64, ia),
-        ParsedEvent::UserInviteBoot(ui) => project_user_invite_boot(conn, recorded_by, event_id_b64, ui),
-        ParsedEvent::UserInviteOngoing(ui) => project_user_invite(conn, recorded_by, event_id_b64, &ui.public_key),
-        ParsedEvent::DeviceInviteFirst(di) => project_device_invite(conn, recorded_by, event_id_b64, &di.public_key),
-        ParsedEvent::DeviceInviteOngoing(di) => project_device_invite(conn, recorded_by, event_id_b64, &di.public_key),
-        ParsedEvent::UserBoot(u) => project_user(conn, recorded_by, event_id_b64, &u.public_key, &u.username),
-        ParsedEvent::UserOngoing(u) => project_user(conn, recorded_by, event_id_b64, &u.public_key, &u.username),
-        ParsedEvent::PeerSharedFirst(p) => project_peer_shared(conn, recorded_by, event_id_b64, &p.public_key, &p.user_event_id, &p.device_name),
-        ParsedEvent::PeerSharedOngoing(p) => project_peer_shared(conn, recorded_by, event_id_b64, &p.public_key, &p.user_event_id, &p.device_name),
-        ParsedEvent::AdminBoot(a) => project_admin(conn, recorded_by, event_id_b64, &a.public_key),
-        ParsedEvent::AdminOngoing(a) => project_admin(conn, recorded_by, event_id_b64, &a.public_key),
-        ParsedEvent::UserRemoved(r) => project_user_removed(conn, recorded_by, event_id_b64, &r.target_event_id),
-        ParsedEvent::PeerRemoved(r) => project_peer_removed(conn, recorded_by, event_id_b64, &r.target_event_id),
-        ParsedEvent::SecretShared(s) => project_secret_shared(conn, recorded_by, event_id_b64, s),
-        ParsedEvent::TransportKey(t) => project_transport_key(conn, recorded_by, event_id_b64, t),
-        _ => Ok(ProjectionDecision::Reject {
-            reason: "not an identity event".to_string(),
-        }),
+        ParsedEvent::Workspace(ws) => project_workspace_pure(recorded_by, event_id_b64, ws, ctx),
+        ParsedEvent::InviteAccepted(ia) => project_invite_accepted_pure(recorded_by, event_id_b64, ia, ctx),
+        ParsedEvent::UserInviteBoot(ui) => project_user_invite_boot_pure(recorded_by, event_id_b64, ui),
+        ParsedEvent::UserInviteOngoing(ui) => project_user_invite_pure(recorded_by, event_id_b64, &ui.public_key),
+        ParsedEvent::DeviceInviteFirst(di) => project_device_invite_pure(recorded_by, event_id_b64, &di.public_key),
+        ParsedEvent::DeviceInviteOngoing(di) => project_device_invite_pure(recorded_by, event_id_b64, &di.public_key),
+        ParsedEvent::UserBoot(u) => {
+            project_user_pure(recorded_by, event_id_b64, &u.public_key, &u.username)
+        }
+        ParsedEvent::UserOngoing(u) => {
+            project_user_pure(recorded_by, event_id_b64, &u.public_key, &u.username)
+        }
+        ParsedEvent::PeerSharedFirst(p) => {
+            project_peer_shared_pure(
+                recorded_by,
+                event_id_b64,
+                &p.public_key,
+                &p.user_event_id,
+                &p.device_name,
+            )
+        }
+        ParsedEvent::PeerSharedOngoing(p) => {
+            project_peer_shared_pure(
+                recorded_by,
+                event_id_b64,
+                &p.public_key,
+                &p.user_event_id,
+                &p.device_name,
+            )
+        }
+        ParsedEvent::AdminBoot(a) => project_admin_pure(recorded_by, event_id_b64, &a.public_key),
+        ParsedEvent::AdminOngoing(a) => project_admin_pure(recorded_by, event_id_b64, &a.public_key),
+        ParsedEvent::UserRemoved(r) => project_user_removed_pure(recorded_by, event_id_b64, &r.target_event_id),
+        ParsedEvent::PeerRemoved(r) => project_peer_removed_pure(recorded_by, event_id_b64, &r.target_event_id),
+        ParsedEvent::SecretShared(s) => project_secret_shared_pure(recorded_by, event_id_b64, s, ctx),
+        ParsedEvent::TransportKey(t) => project_transport_key_pure(recorded_by, event_id_b64, t),
+        _ => ProjectorResult::reject("not an identity event".to_string()),
     }
 }
 
-/// Workspace guard: trust_anchors must match the Workspace event_id.
+/// Pure projector: Workspace guard — trust_anchors must match workspace event_id.
 /// Returns Block if no trust anchor yet, Reject if mismatch.
-fn project_workspace(
-    conn: &Connection,
+fn project_workspace_pure(
     recorded_by: &str,
     event_id_b64: &str,
     ws: &crate::event_modules::WorkspaceEvent,
-) -> Result<ProjectionDecision, Box<dyn std::error::Error>> {
+    ctx: &ContextSnapshot,
+) -> ProjectorResult {
     let workspace_id_b64 = event_id_b64.to_string();
 
-    // Check trust anchor
-    let anchor: Option<String> = match conn.query_row(
-        "SELECT workspace_id FROM trust_anchors WHERE peer_id = ?1",
-        rusqlite::params![recorded_by],
-        |row| row.get::<_, String>(0),
-    ) {
-        Ok(a) => Some(a),
-        Err(rusqlite::Error::QueryReturnedNoRows) => None,
-        Err(e) => return Err(e.into()),
-    };
-
-    match anchor {
+    match &ctx.trust_anchor_workspace_id {
         None => {
             // No trust anchor yet — block until invite_accepted sets it
-            Ok(ProjectionDecision::Block { missing: vec![] })
+            ProjectorResult::block(vec![])
         }
-        Some(ref anchor_wid) if anchor_wid == &workspace_id_b64 => {
+        Some(anchor_wid) if anchor_wid == &workspace_id_b64 => {
             // Trust anchor matches — project
-            conn.execute(
-                "INSERT OR IGNORE INTO workspaces (recorded_by, event_id, workspace_id, public_key, name)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                rusqlite::params![recorded_by, event_id_b64, &workspace_id_b64, ws.public_key.as_slice(), &ws.name],
-            )?;
-            Ok(ProjectionDecision::Valid)
+            let ops = vec![
+                WriteOp::InsertOrIgnore {
+                    table: "workspaces",
+                    columns: vec!["recorded_by", "event_id", "workspace_id", "public_key", "name"],
+                    values: vec![
+                        SqlVal::Text(recorded_by.to_string()),
+                        SqlVal::Text(event_id_b64.to_string()),
+                        SqlVal::Text(workspace_id_b64),
+                        SqlVal::Blob(ws.public_key.to_vec()),
+                        SqlVal::Text(ws.name.clone()),
+                    ],
+                },
+            ];
+            ProjectorResult::valid(ops)
         }
         Some(_) => {
             // Foreign workspace — reject
-            Ok(ProjectionDecision::Reject {
-                reason: "workspace_id does not match trust anchor".to_string(),
-            })
+            ProjectorResult::reject("workspace_id does not match trust anchor".to_string())
         }
     }
 }
 
-/// Local trust-anchor binding step.
-/// Binds directly from InviteAcceptedEvent fields (no global invite-presence guard,
-/// no pre-projection capture table). Uses first-write-wins (INSERT OR IGNORE)
-/// for trust anchor immutability; rejects on mismatch.
-fn project_invite_accepted(
-    conn: &Connection,
+/// Pure projector: InviteAccepted — local trust-anchor binding.
+///
+/// Binds directly from InviteAcceptedEvent fields. Uses first-write-wins
+/// (INSERT OR IGNORE) for trust anchor immutability; rejects on mismatch.
+/// Emits RetryWorkspaceGuards command so blocked workspace events can unblock.
+fn project_invite_accepted_pure(
     recorded_by: &str,
     event_id_b64: &str,
     ia: &crate::event_modules::InviteAcceptedEvent,
-) -> Result<ProjectionDecision, Box<dyn std::error::Error>> {
+    ctx: &ContextSnapshot,
+) -> ProjectorResult {
     let invite_eid_b64 = event_id_to_base64(&ia.invite_event_id);
     let workspace_id_b64 = event_id_to_base64(&ia.workspace_id);
 
-    // Check existing trust anchor BEFORE any writes — reject on mismatch.
-    let existing_anchor: Option<String> = match conn.query_row(
-        "SELECT workspace_id FROM trust_anchors WHERE peer_id = ?1",
-        rusqlite::params![recorded_by],
-        |row| row.get::<_, String>(0),
-    ) {
-        Ok(v) => Some(v),
-        Err(rusqlite::Error::QueryReturnedNoRows) => None,
-        Err(e) => return Err(e.into()),
-    };
-
-    if let Some(ref stored) = existing_anchor {
+    // Check existing trust anchor — reject on mismatch.
+    if let Some(ref stored) = ctx.trust_anchor_workspace_id {
         if stored != &workspace_id_b64 {
-            return Ok(ProjectionDecision::Reject {
-                reason: format!(
-                    "invite_accepted workspace_id {} conflicts with existing trust anchor {}",
-                    workspace_id_b64, stored
-                ),
-            });
+            return ProjectorResult::reject(format!(
+                "invite_accepted workspace_id {} conflicts with existing trust anchor {}",
+                workspace_id_b64, stored
+            ));
         }
     }
 
-    // Mismatch check passed — write projection table.
-    conn.execute(
-        "INSERT OR IGNORE INTO invite_accepted (recorded_by, event_id, invite_event_id, workspace_id)
-         VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![recorded_by, event_id_b64, &invite_eid_b64, &workspace_id_b64],
-    )?;
+    let ops = vec![
+        // Projection table
+        WriteOp::InsertOrIgnore {
+            table: "invite_accepted",
+            columns: vec!["recorded_by", "event_id", "invite_event_id", "workspace_id"],
+            values: vec![
+                SqlVal::Text(recorded_by.to_string()),
+                SqlVal::Text(event_id_b64.to_string()),
+                SqlVal::Text(invite_eid_b64),
+                SqlVal::Text(workspace_id_b64.clone()),
+            ],
+        },
+        // Trust anchor (first-write-wins)
+        WriteOp::InsertOrIgnore {
+            table: "trust_anchors",
+            columns: vec!["peer_id", "workspace_id"],
+            values: vec![
+                SqlVal::Text(recorded_by.to_string()),
+                SqlVal::Text(workspace_id_b64),
+            ],
+        },
+    ];
 
-    // Write trust anchor (first-write-wins).
-    conn.execute(
-        "INSERT OR IGNORE INTO trust_anchors (peer_id, workspace_id) VALUES (?1, ?2)",
-        rusqlite::params![recorded_by, &workspace_id_b64],
-    )?;
-
-    Ok(ProjectionDecision::Valid)
+    // Force-valid workspace is represented as an emitted command — not ad hoc
+    // service-side imperative logic (per instructions §InviteAccepted).
+    ProjectorResult::valid_with_commands(ops, vec![EmitCommand::RetryWorkspaceGuards])
 }
 
-/// Project UserInviteBoot: insert into user_invites.
-fn project_user_invite_boot(
-    conn: &Connection,
+/// Pure projector: UserInviteBoot → user_invites table.
+fn project_user_invite_boot_pure(
     recorded_by: &str,
     event_id_b64: &str,
     ui: &crate::event_modules::UserInviteBootEvent,
-) -> Result<ProjectionDecision, Box<dyn std::error::Error>> {
-    conn.execute(
-        "INSERT OR IGNORE INTO user_invites (recorded_by, event_id, public_key)
-         VALUES (?1, ?2, ?3)",
-        rusqlite::params![recorded_by, event_id_b64, ui.public_key.as_slice()],
-    )?;
-
-    Ok(ProjectionDecision::Valid)
+) -> ProjectorResult {
+    let ops = vec![WriteOp::InsertOrIgnore {
+        table: "user_invites",
+        columns: vec!["recorded_by", "event_id", "public_key"],
+        values: vec![
+            SqlVal::Text(recorded_by.to_string()),
+            SqlVal::Text(event_id_b64.to_string()),
+            SqlVal::Blob(ui.public_key.to_vec()),
+        ],
+    }];
+    ProjectorResult::valid(ops)
 }
 
-/// Project UserInvite (ongoing variant — no workspace capture needed).
-fn project_user_invite(
-    conn: &Connection,
+/// Pure projector: UserInviteOngoing → user_invites table.
+fn project_user_invite_pure(
     recorded_by: &str,
     event_id_b64: &str,
     public_key: &[u8; 32],
-) -> Result<ProjectionDecision, Box<dyn std::error::Error>> {
-    conn.execute(
-        "INSERT OR IGNORE INTO user_invites (recorded_by, event_id, public_key)
-         VALUES (?1, ?2, ?3)",
-        rusqlite::params![recorded_by, event_id_b64, public_key.as_slice()],
-    )?;
-    Ok(ProjectionDecision::Valid)
+) -> ProjectorResult {
+    let ops = vec![WriteOp::InsertOrIgnore {
+        table: "user_invites",
+        columns: vec!["recorded_by", "event_id", "public_key"],
+        values: vec![
+            SqlVal::Text(recorded_by.to_string()),
+            SqlVal::Text(event_id_b64.to_string()),
+            SqlVal::Blob(public_key.to_vec()),
+        ],
+    }];
+    ProjectorResult::valid(ops)
 }
 
-fn project_device_invite(
-    conn: &Connection,
+/// Pure projector: DeviceInvite → device_invites table.
+fn project_device_invite_pure(
     recorded_by: &str,
     event_id_b64: &str,
     public_key: &[u8; 32],
-) -> Result<ProjectionDecision, Box<dyn std::error::Error>> {
-    conn.execute(
-        "INSERT OR IGNORE INTO device_invites (recorded_by, event_id, public_key)
-         VALUES (?1, ?2, ?3)",
-        rusqlite::params![recorded_by, event_id_b64, public_key.as_slice()],
-    )?;
-    Ok(ProjectionDecision::Valid)
+) -> ProjectorResult {
+    let ops = vec![WriteOp::InsertOrIgnore {
+        table: "device_invites",
+        columns: vec!["recorded_by", "event_id", "public_key"],
+        values: vec![
+            SqlVal::Text(recorded_by.to_string()),
+            SqlVal::Text(event_id_b64.to_string()),
+            SqlVal::Blob(public_key.to_vec()),
+        ],
+    }];
+    ProjectorResult::valid(ops)
 }
 
-fn project_user(
-    conn: &Connection,
+/// Pure projector: User → users table.
+fn project_user_pure(
     recorded_by: &str,
     event_id_b64: &str,
     public_key: &[u8; 32],
     username: &str,
-) -> Result<ProjectionDecision, Box<dyn std::error::Error>> {
-    conn.execute(
-        "INSERT OR IGNORE INTO users (recorded_by, event_id, public_key, username)
-         VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![recorded_by, event_id_b64, public_key.as_slice(), username],
-    )?;
-    Ok(ProjectionDecision::Valid)
+) -> ProjectorResult {
+    let ops = vec![WriteOp::InsertOrIgnore {
+        table: "users",
+        columns: vec!["recorded_by", "event_id", "public_key", "username"],
+        values: vec![
+            SqlVal::Text(recorded_by.to_string()),
+            SqlVal::Text(event_id_b64.to_string()),
+            SqlVal::Blob(public_key.to_vec()),
+            SqlVal::Text(username.to_string()),
+        ],
+    }];
+    ProjectorResult::valid(ops)
 }
 
-fn project_peer_shared(
-    conn: &Connection,
+/// Pure projector: PeerShared → peers_shared table.
+fn project_peer_shared_pure(
     recorded_by: &str,
     event_id_b64: &str,
     public_key: &[u8; 32],
     user_event_id: &[u8; 32],
     device_name: &str,
-) -> Result<ProjectionDecision, Box<dyn std::error::Error>> {
-    let user_event_id_b64 = crate::crypto::event_id_to_base64(user_event_id);
-    conn.execute(
-        "INSERT OR IGNORE INTO peers_shared (recorded_by, event_id, public_key, user_event_id, device_name)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        rusqlite::params![recorded_by, event_id_b64, public_key.as_slice(), &user_event_id_b64, device_name],
-    )?;
-    Ok(ProjectionDecision::Valid)
+) -> ProjectorResult {
+    let user_event_id_b64 = event_id_to_base64(user_event_id);
+    let ops = vec![WriteOp::InsertOrIgnore {
+        table: "peers_shared",
+        columns: vec!["recorded_by", "event_id", "public_key", "user_event_id", "device_name"],
+        values: vec![
+            SqlVal::Text(recorded_by.to_string()),
+            SqlVal::Text(event_id_b64.to_string()),
+            SqlVal::Blob(public_key.to_vec()),
+            SqlVal::Text(user_event_id_b64),
+            SqlVal::Text(device_name.to_string()),
+        ],
+    }];
+    ProjectorResult::valid(ops)
 }
 
-fn project_admin(
-    conn: &Connection,
+/// Pure projector: Admin → admins table.
+fn project_admin_pure(
     recorded_by: &str,
     event_id_b64: &str,
     public_key: &[u8; 32],
-) -> Result<ProjectionDecision, Box<dyn std::error::Error>> {
-    conn.execute(
-        "INSERT OR IGNORE INTO admins (recorded_by, event_id, public_key)
-         VALUES (?1, ?2, ?3)",
-        rusqlite::params![recorded_by, event_id_b64, public_key.as_slice()],
-    )?;
-    Ok(ProjectionDecision::Valid)
+) -> ProjectorResult {
+    let ops = vec![WriteOp::InsertOrIgnore {
+        table: "admins",
+        columns: vec!["recorded_by", "event_id", "public_key"],
+        values: vec![
+            SqlVal::Text(recorded_by.to_string()),
+            SqlVal::Text(event_id_b64.to_string()),
+            SqlVal::Blob(public_key.to_vec()),
+        ],
+    }];
+    ProjectorResult::valid(ops)
 }
 
-fn project_user_removed(
-    conn: &Connection,
+/// Pure projector: UserRemoved → removed_entities table.
+fn project_user_removed_pure(
     recorded_by: &str,
     event_id_b64: &str,
     target_event_id: &[u8; 32],
-) -> Result<ProjectionDecision, Box<dyn std::error::Error>> {
+) -> ProjectorResult {
     let target_b64 = event_id_to_base64(target_event_id);
-    conn.execute(
-        "INSERT OR IGNORE INTO removed_entities (recorded_by, event_id, target_event_id, removal_type)
-         VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![recorded_by, event_id_b64, &target_b64, "user"],
-    )?;
-    Ok(ProjectionDecision::Valid)
+    let ops = vec![WriteOp::InsertOrIgnore {
+        table: "removed_entities",
+        columns: vec!["recorded_by", "event_id", "target_event_id", "removal_type"],
+        values: vec![
+            SqlVal::Text(recorded_by.to_string()),
+            SqlVal::Text(event_id_b64.to_string()),
+            SqlVal::Text(target_b64),
+            SqlVal::Text("user".to_string()),
+        ],
+    }];
+    ProjectorResult::valid(ops)
 }
 
-fn project_peer_removed(
-    conn: &Connection,
+/// Pure projector: PeerRemoved → removed_entities table.
+fn project_peer_removed_pure(
     recorded_by: &str,
     event_id_b64: &str,
     target_event_id: &[u8; 32],
-) -> Result<ProjectionDecision, Box<dyn std::error::Error>> {
+) -> ProjectorResult {
     let target_b64 = event_id_to_base64(target_event_id);
-    conn.execute(
-        "INSERT OR IGNORE INTO removed_entities (recorded_by, event_id, target_event_id, removal_type)
-         VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![recorded_by, event_id_b64, &target_b64, "peer"],
-    )?;
-    Ok(ProjectionDecision::Valid)
+    let ops = vec![WriteOp::InsertOrIgnore {
+        table: "removed_entities",
+        columns: vec!["recorded_by", "event_id", "target_event_id", "removal_type"],
+        values: vec![
+            SqlVal::Text(recorded_by.to_string()),
+            SqlVal::Text(event_id_b64.to_string()),
+            SqlVal::Text(target_b64),
+            SqlVal::Text("peer".to_string()),
+        ],
+    }];
+    ProjectorResult::valid(ops)
 }
 
-fn project_secret_shared(
-    conn: &Connection,
+/// Pure projector: SecretShared → secret_shared table.
+/// Rejects if recipient has been removed (InvRemovalExclusion).
+fn project_secret_shared_pure(
     recorded_by: &str,
     event_id_b64: &str,
     ss: &crate::event_modules::SecretSharedEvent,
-) -> Result<ProjectionDecision, Box<dyn std::error::Error>> {
+    ctx: &ContextSnapshot,
+) -> ProjectorResult {
     let key_b64 = event_id_to_base64(&ss.key_event_id);
     let recipient_b64 = event_id_to_base64(&ss.recipient_event_id);
 
-    // InvRemovalExclusion: reject if recipient has been removed
-    let recipient_removed: bool = conn.query_row(
-        "SELECT COUNT(*) > 0 FROM removed_entities
-         WHERE recorded_by = ?1 AND target_event_id = ?2",
-        rusqlite::params![recorded_by, &recipient_b64],
-        |row| row.get(0),
-    )?;
-    if recipient_removed {
-        return Ok(ProjectionDecision::Reject {
-            reason: format!("recipient {} has been removed", recipient_b64),
-        });
+    if ctx.recipient_removed {
+        return ProjectorResult::reject(format!("recipient {} has been removed", recipient_b64));
     }
 
-    conn.execute(
-        "INSERT OR IGNORE INTO secret_shared (recorded_by, event_id, key_event_id, recipient_event_id, wrapped_key)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        rusqlite::params![recorded_by, event_id_b64, &key_b64, &recipient_b64, ss.wrapped_key.as_slice()],
-    )?;
-    Ok(ProjectionDecision::Valid)
+    let ops = vec![WriteOp::InsertOrIgnore {
+        table: "secret_shared",
+        columns: vec!["recorded_by", "event_id", "key_event_id", "recipient_event_id", "wrapped_key"],
+        values: vec![
+            SqlVal::Text(recorded_by.to_string()),
+            SqlVal::Text(event_id_b64.to_string()),
+            SqlVal::Text(key_b64),
+            SqlVal::Text(recipient_b64),
+            SqlVal::Blob(ss.wrapped_key.to_vec()),
+        ],
+    }];
+    ProjectorResult::valid(ops)
 }
 
-/// Project TransportKey: insert into transport_keys.
-fn project_transport_key(
-    conn: &Connection,
+/// Pure projector: TransportKey → transport_keys table.
+fn project_transport_key_pure(
     recorded_by: &str,
     event_id_b64: &str,
     tk: &crate::event_modules::TransportKeyEvent,
-) -> Result<ProjectionDecision, Box<dyn std::error::Error>> {
-    conn.execute(
-        "INSERT OR IGNORE INTO transport_keys (recorded_by, event_id, spki_fingerprint)
-         VALUES (?1, ?2, ?3)",
-        rusqlite::params![recorded_by, event_id_b64, tk.spki_fingerprint.as_slice()],
-    )?;
-
-    Ok(ProjectionDecision::Valid)
+) -> ProjectorResult {
+    let ops = vec![WriteOp::InsertOrIgnore {
+        table: "transport_keys",
+        columns: vec!["recorded_by", "event_id", "spki_fingerprint"],
+        values: vec![
+            SqlVal::Text(recorded_by.to_string()),
+            SqlVal::Text(event_id_b64.to_string()),
+            SqlVal::Blob(tk.spki_fingerprint.to_vec()),
+        ],
+    }];
+    ProjectorResult::valid(ops)
 }
-/// After guard state changes (e.g., trust anchor set by invite_accepted),
-/// find events that are recorded but stuck in guard-blocked limbo
-/// (not valid, not rejected, not in blocked_event_deps) and re-project them.
-/// Called from project_one after InviteAccepted projects as Valid.
+
+/// After guard state changes, find and re-project guard-blocked events.
+/// This is now triggered by the RetryWorkspaceGuards command.
 pub fn retry_guard_blocked_events(
-    conn: &Connection,
+    conn: &rusqlite::Connection,
     recorded_by: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Find events that are recorded for this peer, but not valid, not rejected,
-    // and have no remaining entries in blocked_event_deps.
-    // These are events that returned Block from a guard (empty missing).
+    use crate::crypto::event_id_from_base64;
+
     let mut stmt = conn.prepare(
         "SELECT re.event_id FROM recorded_events re
          WHERE re.peer_id = ?1
@@ -323,7 +366,6 @@ pub fn retry_guard_blocked_events(
 
     for eid_b64 in candidates {
         if let Some(event_id) = event_id_from_base64(&eid_b64) {
-            // Re-project via project_one — it will re-check guards
             let _ = super::apply::project_one(conn, recorded_by, &event_id)?;
         }
     }

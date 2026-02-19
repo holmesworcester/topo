@@ -101,6 +101,7 @@ pub fn migrate_recorded_by(
         "signed_memos",
         "secret_keys",
         "deleted_messages",
+        "deletion_intents",
         "message_attachments",
         "file_slices",
         "intro_attempts",
