@@ -1,0 +1,366 @@
+//! Sync initiator (client role) with dual-stream transport.
+//!
+//! Drives negentropy reconciliation, pushes events the peer needs, and
+//! optionally coordinates pull work with a multi-source coordinator.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use negentropy::{Id, Negentropy, Storage};
+use tokio::sync::mpsc;
+use tracing::{info, warn};
+
+use crate::contracts::event_runtime_contract::{BatchWriterFn, IngestItem};
+use crate::crypto::EventId;
+use crate::db::{
+    egress_queue::EgressQueue,
+    open_connection,
+    store::{lookup_workspace_id, Store},
+    wanted::WantedEvents,
+};
+use crate::runtime::SyncStats;
+use crate::sync::{neg_id_to_event_id, NegentropyStorageSqlite, SyncMessage};
+use crate::transport::connection::ConnectionError;
+use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
+
+use super::coordinator::PeerCoord;
+use super::receiver::spawn_data_receiver;
+use super::{
+    session_ingest_cap, CONTROL_POLL_TIMEOUT, DATA_DRAIN_TIMEOUT, EGRESS_CLAIM_COUNT,
+    EGRESS_CLAIM_LEASE_MS, EGRESS_SENT_TTL_MS, ENQUEUE_BATCH, HAVE_CHUNK, NEED_CHUNK,
+    NEGENTROPY_FRAME_SIZE,
+};
+
+/// Run sync as the initiator (client role) with dual streams.
+/// Control stream: NegOpen, NegMsg, HaveList
+/// Data stream: Event blobs
+///
+/// Push (have_ids): always sends everything the peer needs.
+/// Pull (need_ids): when `coordination` is set, buffers need_ids and sends
+/// them to the coordinator for load-balanced assignment across peers.
+/// When coordination is None, requests all need_ids directly.
+///
+/// When `shared_ingest` is provided, events are sent to the shared channel
+/// instead of spawning a per-session batch_writer.
+pub async fn run_sync_initiator_dual<C, S, R>(
+    conn: DualConnection<C, S, R>,
+    db_path: &str,
+    timeout_secs: u64,
+    peer_id: &str,
+    recorded_by: &str,
+    coordination: Option<&PeerCoord>,
+    shared_ingest: Option<mpsc::Sender<IngestItem>>,
+    batch_writer_fn: BatchWriterFn,
+) -> Result<SyncStats, Box<dyn std::error::Error + Send + Sync>>
+where
+    C: StreamConn,
+    S: StreamSend,
+    R: StreamRecv + Send + 'static,
+{
+    let DualConnection {
+        mut control,
+        mut data_send,
+        data_recv,
+    } = conn;
+    let start = Instant::now();
+    let timeout = Duration::from_secs(timeout_secs);
+
+    info!(
+        "Starting negentropy sync (initiator, dual-stream) for {} seconds",
+        timeout_secs
+    );
+
+    let db = open_connection(db_path)?;
+    let neg_db = open_connection(db_path)?;
+
+    let egress = EgressQueue::new(&db);
+    let wanted = WantedEvents::new(&db);
+    let _ = egress.clear_connection(peer_id);
+    let _ = wanted.clear();
+
+    let ws_id = lookup_workspace_id(&db, recorded_by);
+    let neg_storage = NegentropyStorageSqlite::new(&neg_db, &ws_id);
+
+    neg_db
+        .execute("BEGIN", [])
+        .map_err(|e| format!("Failed to begin snapshot: {}", e))?;
+    neg_storage
+        .rebuild_blocks()
+        .map_err(|e| format!("Failed to rebuild blocks: {}", e))?;
+
+    let mut neg = Negentropy::new(Storage::Borrowed(&neg_storage), NEGENTROPY_FRAME_SIZE)?;
+
+    let store = Store::new(&db);
+
+    let events_received = Arc::new(AtomicU64::new(0));
+    let bytes_received = Arc::new(AtomicU64::new(0));
+
+    // Use shared ingest channel if provided, otherwise create per-session batch_writer
+    let (ingest_tx, writer_handle) = if let Some(shared_tx) = shared_ingest {
+        (shared_tx, None)
+    } else {
+        let ingest_cap = session_ingest_cap();
+        let (tx, rx) = mpsc::channel::<IngestItem>(ingest_cap);
+        let events_received_writer = events_received.clone();
+        let db_path_owned = db_path.to_string();
+        let bw = batch_writer_fn;
+        let handle = tokio::task::spawn_blocking(move || {
+            bw(db_path_owned, rx, events_received_writer)
+        });
+        (tx, Some(handle))
+    };
+
+    let mut have_ids: Vec<Id> = Vec::new();
+    let mut need_ids: Vec<Id> = Vec::new();
+    let mut events_sent: u64 = 0;
+    let mut bytes_sent: u64 = 0;
+    let (shutdown_tx, data_drained_rx, recv_handle) = spawn_data_receiver(
+        data_recv,
+        ingest_tx.clone(),
+        bytes_received.clone(),
+        recorded_by.to_string(),
+    );
+
+    let initial_msg = neg.initiate()?;
+    control
+        .send(&SyncMessage::NegOpen { msg: initial_msg })
+        .await?;
+    control.flush().await?;
+
+    let mut reconciliation_done = false;
+    let mut rounds = 0;
+
+    let mut completed = false;
+    let mut done_sent = false;
+    let sync_start = Instant::now();
+    // Pending have_ids buffer: populated by reconciliation, drained incrementally
+    let mut pending_have: Vec<EventId> = Vec::new();
+
+    // Coordination state: buffer need_ids during reconciliation, send to coordinator after
+    let mut coordinated_need_ids: Vec<EventId> = Vec::new();
+    let mut coordination_pending = coordination.is_some();
+    let mut coordination_reported = false;
+
+    loop {
+        if start.elapsed() >= timeout {
+            warn!("Timeout");
+            break;
+        }
+
+        match tokio::time::timeout(CONTROL_POLL_TIMEOUT, control.recv()).await {
+            Ok(Ok(SyncMessage::NegMsg { msg })) => {
+                rounds += 1;
+                match neg.reconcile_with_ids(&msg, &mut have_ids, &mut need_ids)? {
+                    Some(next_msg) => {
+                        control.send(&SyncMessage::NegMsg { msg: next_msg }).await?;
+                        control.flush().await?;
+                    }
+                    None => {
+                        info!("Reconciliation complete in {} rounds", rounds);
+                        reconciliation_done = true;
+                    }
+                }
+
+                // Convert have_ids to EventIds and add to pending buffer
+                if !have_ids.is_empty() {
+                    pending_have.reserve(have_ids.len());
+                    for neg_id in have_ids.drain(..) {
+                        pending_have.push(neg_id_to_event_id(&neg_id));
+                    }
+                }
+
+                if !need_ids.is_empty() {
+                    if coordination.is_some() {
+                        // Buffer need_ids for coordinator assignment
+                        for neg_id in need_ids.drain(..) {
+                            coordinated_need_ids.push(neg_id_to_event_id(&neg_id));
+                        }
+                    } else {
+                        // No coordination: send HaveList immediately
+                        let mut batch: Vec<EventId> = Vec::with_capacity(NEED_CHUNK);
+                        for neg_id in need_ids.drain(..) {
+                            let event_id = neg_id_to_event_id(&neg_id);
+                            if wanted.insert(&event_id).unwrap_or(false) {
+                                batch.push(event_id);
+                            }
+                            if batch.len() >= NEED_CHUNK {
+                                control.send(&SyncMessage::HaveList { ids: batch }).await?;
+                                control.flush().await?;
+                                batch = Vec::with_capacity(NEED_CHUNK);
+                            }
+                        }
+                        if !batch.is_empty() {
+                            control.send(&SyncMessage::HaveList { ids: batch }).await?;
+                            control.flush().await?;
+                        }
+                    }
+                }
+            }
+            Ok(Ok(SyncMessage::DoneAck)) => {
+                info!("Received DoneAck from responder");
+                completed = true;
+                break;
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(ConnectionError::Closed)) => {
+                info!("Control stream closed by peer");
+                break;
+            }
+            Ok(Err(e)) => {
+                warn!("Control stream error: {}", e);
+                break;
+            }
+            Err(_) => {}
+        }
+
+        // Coordination: after reconciliation, send need_ids to coordinator
+        if let Some(coord) = coordination {
+            if reconciliation_done && !coordination_reported {
+                let report = std::mem::take(&mut coordinated_need_ids);
+                info!(
+                    "Reporting {} need_ids to coordinator (peer {})",
+                    report.len(),
+                    coord.peer_idx
+                );
+                let _ = coord.report_tx.send(report);
+                coordination_reported = true;
+            }
+
+            // Poll for assignment (non-blocking so push path continues)
+            if coordination_pending && coordination_reported {
+                let assign_result = match coord.assign_rx.lock() {
+                    Ok(rx) => rx.try_recv(),
+                    Err(_) => Err(std::sync::mpsc::TryRecvError::Disconnected),
+                };
+                match assign_result {
+                    Ok(assigned) => {
+                        info!(
+                            "Received {} assigned events from coordinator (peer {})",
+                            assigned.len(),
+                            coord.peer_idx
+                        );
+                        // Send HaveList for assigned events
+                        let mut batch: Vec<EventId> = Vec::with_capacity(NEED_CHUNK);
+                        for event_id in assigned {
+                            if wanted.insert(&event_id).unwrap_or(false) {
+                                batch.push(event_id);
+                            }
+                            if batch.len() >= NEED_CHUNK {
+                                let _ = control.send(&SyncMessage::HaveList { ids: batch }).await;
+                                let _ = control.flush().await;
+                                batch = Vec::with_capacity(NEED_CHUNK);
+                            }
+                        }
+                        if !batch.is_empty() {
+                            let _ = control.send(&SyncMessage::HaveList { ids: batch }).await;
+                            let _ = control.flush().await;
+                        }
+                        coordination_pending = false;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        coordination_pending = false;
+                    }
+                }
+            }
+        }
+
+        // Incrementally enqueue pending have_ids to egress queue
+        if !pending_have.is_empty() {
+            let drain_count = pending_have.len().min(ENQUEUE_BATCH);
+            let to_enqueue: Vec<EventId> = pending_have.drain(..drain_count).collect();
+            for chunk in to_enqueue.chunks(HAVE_CHUNK) {
+                let _ = egress.enqueue_events(peer_id, chunk);
+            }
+        }
+
+        // Stream events from DB queue on data stream
+        let mut sent_this_round = 0;
+        let mut blocked = false;
+        while !blocked {
+            let batch = egress
+                .claim_batch(peer_id, EGRESS_CLAIM_COUNT, EGRESS_CLAIM_LEASE_MS)
+                .unwrap_or_default();
+            if batch.is_empty() {
+                break;
+            }
+
+            let mut sent_rowids: Vec<i64> = Vec::with_capacity(batch.len());
+            for (rowid, event_id) in batch {
+                if let Ok(Some(blob)) = store.get_shared(&event_id) {
+                    let blob_len = blob.len() as u64;
+                    if data_send.send(&SyncMessage::Event { blob }).await.is_ok() {
+                        events_sent += 1;
+                        bytes_sent += blob_len;
+                        sent_this_round += 1;
+                        sent_rowids.push(rowid);
+                    } else {
+                        blocked = true;
+                        break;
+                    }
+                } else {
+                    sent_rowids.push(rowid);
+                }
+            }
+            let _ = egress.mark_sent(&sent_rowids);
+        }
+
+        if sent_this_round > 0 {
+            let _ = data_send.flush().await;
+        }
+
+        // Once reconciliation is done, coordination resolved, pending_have drained,
+        // and egress queue empty, send DataDone on data stream then Done on control.
+        if reconciliation_done && !coordination_pending && pending_have.is_empty() && !done_sent {
+            let pending_out = egress.count_pending(peer_id).unwrap_or(0);
+            if pending_out == 0 {
+                let _ = data_send.flush().await;
+                data_send.send(&SyncMessage::DataDone).await?;
+                data_send.flush().await?;
+                control.send(&SyncMessage::Done).await?;
+                control.flush().await?;
+                done_sent = true;
+                info!(
+                    "Sent DataDone+Done, waiting for DoneAck (sent {}, received {})",
+                    events_sent,
+                    events_received.load(Ordering::Relaxed)
+                );
+            }
+        }
+    }
+
+    if completed {
+        let _ = egress.clear_connection(peer_id);
+        let _ = wanted.clear();
+        let _ = egress.cleanup_sent(EGRESS_SENT_TTL_MS);
+    }
+    let _ = neg_db.execute("COMMIT", []);
+
+    // Wait for inbound data drain: data receiver exits on peer's DataDone.
+    if completed {
+        let drain_timeout = DATA_DRAIN_TIMEOUT;
+        match tokio::time::timeout(drain_timeout, data_drained_rx).await {
+            Ok(Ok(())) => info!("Inbound data fully drained"),
+            Ok(Err(_)) => info!("Data drain channel dropped (receiver already exited)"),
+            Err(_) => warn!("Timed out waiting for inbound data drain"),
+        }
+    }
+    let _ = shutdown_tx.send(());
+    let _ = recv_handle.await;
+    drop(ingest_tx);
+    if let Some(handle) = writer_handle {
+        let _ = handle.await;
+    }
+
+    let stats = SyncStats {
+        events_sent,
+        events_received: events_received.load(Ordering::Relaxed),
+        neg_rounds: rounds,
+        bytes_sent,
+        bytes_received: bytes_received.load(Ordering::Relaxed),
+        duration_ms: sync_start.elapsed().as_millis(),
+    };
+    info!("Sync stats: {:?}", stats);
+    Ok(stats)
+}

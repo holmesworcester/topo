@@ -115,7 +115,7 @@ pub async fn bootstrap_sync_from_invite(
         remote_addr: connection.remote_address(),
         direction: SessionDirection::Outbound,
     };
-    let handler = ReplicationSessionHandler::initiator(db_path.to_string(), timeout_secs);
+    let handler = ReplicationSessionHandler::initiator(db_path.to_string(), timeout_secs, crate::event_runtime::batch_writer);
     let io = SyncSessionIo::new(session_id, conn);
     handler
         .on_session(meta, Box::new(io), CancellationToken::new())
@@ -167,6 +167,7 @@ pub fn start_bootstrap_responder(
             let handler = ReplicationSessionHandler::responder(
                 db_path.clone(),
                 30,
+                crate::event_runtime::batch_writer,
             );
             // Accept up to 2 connections: the initial bootstrap sync and an
             // optional push-back sync where the joiner pushes its identity
