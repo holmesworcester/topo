@@ -20,15 +20,15 @@ pub struct InviteAcceptedEvent {
 /// [9..41]  invite_event_id (32 bytes)
 /// [41..73] workspace_id (32 bytes)
 pub fn parse_invite_accepted(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    if blob.len() < 73 {
+    if blob.len() < INVITE_ACCEPTED_WIRE_SIZE {
         return Err(EventError::TooShort {
-            expected: 73,
+            expected: INVITE_ACCEPTED_WIRE_SIZE,
             actual: blob.len(),
         });
     }
-    if blob.len() > 73 {
+    if blob.len() > INVITE_ACCEPTED_WIRE_SIZE {
         return Err(EventError::TrailingData {
-            expected: 73,
+            expected: INVITE_ACCEPTED_WIRE_SIZE,
             actual: blob.len(),
         });
     }
@@ -60,7 +60,7 @@ pub fn encode_invite_accepted(event: &ParsedEvent) -> Result<Vec<u8>, EventError
         _ => return Err(EventError::WrongVariant),
     };
 
-    let mut buf = Vec::with_capacity(73);
+    let mut buf = Vec::with_capacity(INVITE_ACCEPTED_WIRE_SIZE);
     buf.push(EVENT_TYPE_INVITE_ACCEPTED);
     buf.extend_from_slice(&ia.created_at_ms.to_le_bytes());
     buf.extend_from_slice(&ia.invite_event_id);

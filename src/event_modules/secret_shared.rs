@@ -29,11 +29,11 @@ pub struct SecretSharedEvent {
 /// [137]        signer_type (1 byte)
 /// [138..202]   signature (64 bytes)
 pub fn parse_secret_shared(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    if blob.len() < 202 {
-        return Err(EventError::TooShort { expected: 202, actual: blob.len() });
+    if blob.len() < SECRET_SHARED_WIRE_SIZE {
+        return Err(EventError::TooShort { expected: SECRET_SHARED_WIRE_SIZE, actual: blob.len() });
     }
-    if blob.len() > 202 {
-        return Err(EventError::TrailingData { expected: 202, actual: blob.len() });
+    if blob.len() > SECRET_SHARED_WIRE_SIZE {
+        return Err(EventError::TrailingData { expected: SECRET_SHARED_WIRE_SIZE, actual: blob.len() });
     }
     if blob[0] != EVENT_TYPE_SECRET_SHARED {
         return Err(EventError::WrongType { expected: EVENT_TYPE_SECRET_SHARED, actual: blob[0] });
@@ -68,7 +68,7 @@ pub fn encode_secret_shared(event: &ParsedEvent) -> Result<Vec<u8>, EventError> 
         ParsedEvent::SecretShared(v) => v,
         _ => return Err(EventError::WrongVariant),
     };
-    let mut buf = Vec::with_capacity(202);
+    let mut buf = Vec::with_capacity(SECRET_SHARED_WIRE_SIZE);
     buf.push(EVENT_TYPE_SECRET_SHARED);
     buf.extend_from_slice(&e.created_at_ms.to_le_bytes());
     buf.extend_from_slice(&e.key_event_id);

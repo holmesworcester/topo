@@ -18,15 +18,15 @@ pub struct SecretKeyEvent {
 /// [1..9]   created_at_ms (u64 LE)
 /// [9..41]  key_bytes (32 bytes)
 pub fn parse_secret_key(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    if blob.len() < 41 {
+    if blob.len() < SECRET_KEY_WIRE_SIZE {
         return Err(EventError::TooShort {
-            expected: 41,
+            expected: SECRET_KEY_WIRE_SIZE,
             actual: blob.len(),
         });
     }
-    if blob.len() > 41 {
+    if blob.len() > SECRET_KEY_WIRE_SIZE {
         return Err(EventError::TrailingData {
-            expected: 41,
+            expected: SECRET_KEY_WIRE_SIZE,
             actual: blob.len(),
         });
     }
@@ -54,7 +54,7 @@ pub fn encode_secret_key(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         _ => return Err(EventError::WrongVariant),
     };
 
-    let mut buf = Vec::with_capacity(41);
+    let mut buf = Vec::with_capacity(SECRET_KEY_WIRE_SIZE);
     buf.push(EVENT_TYPE_SECRET_KEY);
     buf.extend_from_slice(&sk.created_at_ms.to_le_bytes());
     buf.extend_from_slice(&sk.key_bytes);

@@ -426,7 +426,7 @@ mod tests {
 
         let event = ParsedEvent::MessageDeletion(del.clone());
         let blob = encode_event(&event).unwrap();
-        assert_eq!(blob.len(), 170);
+        assert_eq!(blob.len(), message_deletion::MESSAGE_DELETION_WIRE_SIZE);
         let parsed = parse_event(&blob).unwrap();
         assert_eq!(parsed, event);
     }
@@ -440,7 +440,7 @@ mod tests {
         };
         let event = ParsedEvent::Workspace(ws);
         let blob = encode_event(&event).unwrap();
-        assert_eq!(blob.len(), 105);
+        assert_eq!(blob.len(), workspace::WORKSPACE_WIRE_SIZE);
         let parsed = parse_event(&blob).unwrap();
         assert_eq!(parsed, event);
     }
@@ -454,7 +454,7 @@ mod tests {
         };
         let event = ParsedEvent::InviteAccepted(ia);
         let blob = encode_event(&event).unwrap();
-        assert_eq!(blob.len(), 73);
+        assert_eq!(blob.len(), invite_accepted::INVITE_ACCEPTED_WIRE_SIZE);
         let parsed = parse_event(&blob).unwrap();
         assert_eq!(parsed, event);
     }
@@ -471,7 +471,7 @@ mod tests {
         };
         let event = ParsedEvent::UserInviteBoot(e);
         let blob = encode_event(&event).unwrap();
-        assert_eq!(blob.len(), 170);
+        assert_eq!(blob.len(), user_invite::USER_INVITE_BOOT_WIRE_SIZE);
         let parsed = parse_event(&blob).unwrap();
         assert_eq!(parsed, event);
     }
@@ -488,7 +488,7 @@ mod tests {
         };
         let event = ParsedEvent::UserInviteOngoing(e);
         let blob = encode_event(&event).unwrap();
-        assert_eq!(blob.len(), 170);
+        assert_eq!(blob.len(), user_invite::USER_INVITE_ONGOING_WIRE_SIZE);
         let parsed = parse_event(&blob).unwrap();
         assert_eq!(parsed, event);
     }
@@ -504,7 +504,7 @@ mod tests {
         };
         let event = ParsedEvent::DeviceInviteFirst(e);
         let blob = encode_event(&event).unwrap();
-        assert_eq!(blob.len(), 138);
+        assert_eq!(blob.len(), device_invite::DEVICE_INVITE_FIRST_WIRE_SIZE);
         let parsed = parse_event(&blob).unwrap();
         assert_eq!(parsed, event);
     }
@@ -520,7 +520,7 @@ mod tests {
         };
         let event = ParsedEvent::DeviceInviteOngoing(e);
         let blob = encode_event(&event).unwrap();
-        assert_eq!(blob.len(), 138);
+        assert_eq!(blob.len(), device_invite::DEVICE_INVITE_ONGOING_WIRE_SIZE);
         let parsed = parse_event(&blob).unwrap();
         assert_eq!(parsed, event);
     }
@@ -537,7 +537,7 @@ mod tests {
         };
         let event = ParsedEvent::UserBoot(e);
         let blob = encode_event(&event).unwrap();
-        assert_eq!(blob.len(), 202);
+        assert_eq!(blob.len(), user::USER_WIRE_SIZE);
         let parsed = parse_event(&blob).unwrap();
         assert_eq!(parsed, event);
     }
@@ -554,7 +554,7 @@ mod tests {
         };
         let event = ParsedEvent::UserOngoing(e);
         let blob = encode_event(&event).unwrap();
-        assert_eq!(blob.len(), 202);
+        assert_eq!(blob.len(), user::USER_WIRE_SIZE);
         let parsed = parse_event(&blob).unwrap();
         assert_eq!(parsed, event);
     }
@@ -572,7 +572,7 @@ mod tests {
         };
         let event = ParsedEvent::PeerSharedFirst(e);
         let blob = encode_event(&event).unwrap();
-        assert_eq!(blob.len(), 234);
+        assert_eq!(blob.len(), peer_shared::PEER_SHARED_WIRE_SIZE);
         let parsed = parse_event(&blob).unwrap();
         assert_eq!(parsed, event);
     }
@@ -590,7 +590,7 @@ mod tests {
         };
         let event = ParsedEvent::PeerSharedOngoing(e);
         let blob = encode_event(&event).unwrap();
-        assert_eq!(blob.len(), 234);
+        assert_eq!(blob.len(), peer_shared::PEER_SHARED_WIRE_SIZE);
         let parsed = parse_event(&blob).unwrap();
         assert_eq!(parsed, event);
     }
@@ -607,7 +607,7 @@ mod tests {
         };
         let event = ParsedEvent::AdminBoot(e);
         let blob = encode_event(&event).unwrap();
-        assert_eq!(blob.len(), 170);
+        assert_eq!(blob.len(), admin::ADMIN_BOOT_WIRE_SIZE);
         let parsed = parse_event(&blob).unwrap();
         assert_eq!(parsed, event);
     }
@@ -624,7 +624,7 @@ mod tests {
         };
         let event = ParsedEvent::AdminOngoing(e);
         let blob = encode_event(&event).unwrap();
-        assert_eq!(blob.len(), 170);
+        assert_eq!(blob.len(), admin::ADMIN_ONGOING_WIRE_SIZE);
         let parsed = parse_event(&blob).unwrap();
         assert_eq!(parsed, event);
     }
@@ -640,7 +640,7 @@ mod tests {
         };
         let event = ParsedEvent::UserRemoved(e);
         let blob = encode_event(&event).unwrap();
-        assert_eq!(blob.len(), 138);
+        assert_eq!(blob.len(), user_removed::USER_REMOVED_WIRE_SIZE);
         let parsed = parse_event(&blob).unwrap();
         assert_eq!(parsed, event);
     }
@@ -656,7 +656,7 @@ mod tests {
         };
         let event = ParsedEvent::PeerRemoved(e);
         let blob = encode_event(&event).unwrap();
-        assert_eq!(blob.len(), 138);
+        assert_eq!(blob.len(), peer_removed::PEER_REMOVED_WIRE_SIZE);
         let parsed = parse_event(&blob).unwrap();
         assert_eq!(parsed, event);
     }
@@ -674,7 +674,7 @@ mod tests {
         };
         let event = ParsedEvent::SecretShared(e);
         let blob = encode_event(&event).unwrap();
-        assert_eq!(blob.len(), 202);
+        assert_eq!(blob.len(), secret_shared::SECRET_SHARED_WIRE_SIZE);
         let parsed = parse_event(&blob).unwrap();
         assert_eq!(parsed, event);
     }
@@ -690,7 +690,7 @@ mod tests {
         };
         let event = ParsedEvent::TransportKey(e);
         let blob = encode_event(&event).unwrap();
-        assert_eq!(blob.len(), 138);
+        assert_eq!(blob.len(), transport_key::TRANSPORT_KEY_WIRE_SIZE);
         let parsed = parse_event(&blob).unwrap();
         assert_eq!(parsed, event);
     }
@@ -1326,10 +1326,11 @@ mod tests {
             name: "test-workspace".to_string(),
         });
         let mut blob = encode_event(&ws).unwrap();
-        assert_eq!(blob.len(), 105);
+        assert_eq!(blob.len(), workspace::WORKSPACE_WIRE_SIZE);
         blob.push(0xFF);
         let err = parse_event(&blob).unwrap_err();
-        assert!(matches!(err, EventError::TrailingData { expected: 105, actual: 106 }));
+        assert!(matches!(err, EventError::TrailingData { expected, actual }
+            if expected == workspace::WORKSPACE_WIRE_SIZE && actual == workspace::WORKSPACE_WIRE_SIZE + 1));
 
         // SecretKey (41 bytes fixed)
         let sk = ParsedEvent::SecretKey(SecretKeyEvent {
@@ -1339,7 +1340,8 @@ mod tests {
         let mut blob = encode_event(&sk).unwrap();
         blob.push(0xFF);
         let err = parse_event(&blob).unwrap_err();
-        assert!(matches!(err, EventError::TrailingData { expected: 41, actual: 42 }));
+        assert!(matches!(err, EventError::TrailingData { expected, actual }
+            if expected == secret_key::SECRET_KEY_WIRE_SIZE && actual == secret_key::SECRET_KEY_WIRE_SIZE + 1));
 
         // InviteAccepted (73 bytes fixed)
         let ia = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
@@ -1350,7 +1352,8 @@ mod tests {
         let mut blob = encode_event(&ia).unwrap();
         blob.push(0xFF);
         let err = parse_event(&blob).unwrap_err();
-        assert!(matches!(err, EventError::TrailingData { expected: 73, actual: 74 }));
+        assert!(matches!(err, EventError::TrailingData { expected, actual }
+            if expected == invite_accepted::INVITE_ACCEPTED_WIRE_SIZE && actual == invite_accepted::INVITE_ACCEPTED_WIRE_SIZE + 1));
 
         // UserBoot (202 bytes fixed)
         let ub = ParsedEvent::UserBoot(UserBootEvent {
@@ -1364,7 +1367,8 @@ mod tests {
         let mut blob = encode_event(&ub).unwrap();
         blob.push(0xFF);
         let err = parse_event(&blob).unwrap_err();
-        assert!(matches!(err, EventError::TrailingData { expected: 202, actual: 203 }));
+        assert!(matches!(err, EventError::TrailingData { expected, actual }
+            if expected == user::USER_WIRE_SIZE && actual == user::USER_WIRE_SIZE + 1));
 
         // AdminBoot (170 bytes fixed)
         let ab = ParsedEvent::AdminBoot(AdminBootEvent {
@@ -1378,7 +1382,8 @@ mod tests {
         let mut blob = encode_event(&ab).unwrap();
         blob.push(0xFF);
         let err = parse_event(&blob).unwrap_err();
-        assert!(matches!(err, EventError::TrailingData { expected: 170, actual: 171 }));
+        assert!(matches!(err, EventError::TrailingData { expected, actual }
+            if expected == admin::ADMIN_BOOT_WIRE_SIZE && actual == admin::ADMIN_BOOT_WIRE_SIZE + 1));
 
         // SecretShared (202 bytes fixed)
         let ss = ParsedEvent::SecretShared(SecretSharedEvent {
@@ -1393,7 +1398,8 @@ mod tests {
         let mut blob = encode_event(&ss).unwrap();
         blob.push(0xFF);
         let err = parse_event(&blob).unwrap_err();
-        assert!(matches!(err, EventError::TrailingData { expected: 202, actual: 203 }));
+        assert!(matches!(err, EventError::TrailingData { expected, actual }
+            if expected == secret_shared::SECRET_SHARED_WIRE_SIZE && actual == secret_shared::SECRET_SHARED_WIRE_SIZE + 1));
     }
 
     #[test]

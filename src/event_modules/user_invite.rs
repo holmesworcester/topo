@@ -40,11 +40,11 @@ pub struct UserInviteOngoingEvent {
 /// [105]      signer_type (1 byte)
 /// [106..170] signature (64 bytes)
 pub fn parse_user_invite_boot(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    if blob.len() < 170 {
-        return Err(EventError::TooShort { expected: 170, actual: blob.len() });
+    if blob.len() < USER_INVITE_BOOT_WIRE_SIZE {
+        return Err(EventError::TooShort { expected: USER_INVITE_BOOT_WIRE_SIZE, actual: blob.len() });
     }
-    if blob.len() > 170 {
-        return Err(EventError::TrailingData { expected: 170, actual: blob.len() });
+    if blob.len() > USER_INVITE_BOOT_WIRE_SIZE {
+        return Err(EventError::TrailingData { expected: USER_INVITE_BOOT_WIRE_SIZE, actual: blob.len() });
     }
     if blob[0] != EVENT_TYPE_USER_INVITE_BOOT {
         return Err(EventError::WrongType { expected: EVENT_TYPE_USER_INVITE_BOOT, actual: blob[0] });
@@ -76,7 +76,7 @@ pub fn encode_user_invite_boot(event: &ParsedEvent) -> Result<Vec<u8>, EventErro
         ParsedEvent::UserInviteBoot(v) => v,
         _ => return Err(EventError::WrongVariant),
     };
-    let mut buf = Vec::with_capacity(170);
+    let mut buf = Vec::with_capacity(USER_INVITE_BOOT_WIRE_SIZE);
     buf.push(EVENT_TYPE_USER_INVITE_BOOT);
     buf.extend_from_slice(&e.created_at_ms.to_le_bytes());
     buf.extend_from_slice(&e.public_key);
@@ -96,11 +96,11 @@ pub fn encode_user_invite_boot(event: &ParsedEvent) -> Result<Vec<u8>, EventErro
 /// [105]      signer_type (1 byte)
 /// [106..170] signature (64 bytes)
 pub fn parse_user_invite_ongoing(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    if blob.len() < 170 {
-        return Err(EventError::TooShort { expected: 170, actual: blob.len() });
+    if blob.len() < USER_INVITE_ONGOING_WIRE_SIZE {
+        return Err(EventError::TooShort { expected: USER_INVITE_ONGOING_WIRE_SIZE, actual: blob.len() });
     }
-    if blob.len() > 170 {
-        return Err(EventError::TrailingData { expected: 170, actual: blob.len() });
+    if blob.len() > USER_INVITE_ONGOING_WIRE_SIZE {
+        return Err(EventError::TrailingData { expected: USER_INVITE_ONGOING_WIRE_SIZE, actual: blob.len() });
     }
     if blob[0] != EVENT_TYPE_USER_INVITE_ONGOING {
         return Err(EventError::WrongType { expected: EVENT_TYPE_USER_INVITE_ONGOING, actual: blob[0] });
@@ -132,7 +132,7 @@ pub fn encode_user_invite_ongoing(event: &ParsedEvent) -> Result<Vec<u8>, EventE
         ParsedEvent::UserInviteOngoing(v) => v,
         _ => return Err(EventError::WrongVariant),
     };
-    let mut buf = Vec::with_capacity(170);
+    let mut buf = Vec::with_capacity(USER_INVITE_ONGOING_WIRE_SIZE);
     buf.push(EVENT_TYPE_USER_INVITE_ONGOING);
     buf.extend_from_slice(&e.created_at_ms.to_le_bytes());
     buf.extend_from_slice(&e.public_key);

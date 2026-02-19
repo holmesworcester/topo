@@ -28,15 +28,15 @@ pub struct MessageDeletionEvent {
 /// [105]     signer_type (1 byte)
 /// [106..170] signature (64 bytes)
 pub fn parse_message_deletion(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    if blob.len() < 170 {
+    if blob.len() < MESSAGE_DELETION_WIRE_SIZE {
         return Err(EventError::TooShort {
-            expected: 170,
+            expected: MESSAGE_DELETION_WIRE_SIZE,
             actual: blob.len(),
         });
     }
-    if blob.len() > 170 {
+    if blob.len() > MESSAGE_DELETION_WIRE_SIZE {
         return Err(EventError::TrailingData {
-            expected: 170,
+            expected: MESSAGE_DELETION_WIRE_SIZE,
             actual: blob.len(),
         });
     }
@@ -79,7 +79,7 @@ pub fn encode_message_deletion(event: &ParsedEvent) -> Result<Vec<u8>, EventErro
         _ => return Err(EventError::WrongVariant),
     };
 
-    let mut buf = Vec::with_capacity(170);
+    let mut buf = Vec::with_capacity(MESSAGE_DELETION_WIRE_SIZE);
     buf.push(EVENT_TYPE_MESSAGE_DELETION);
     buf.extend_from_slice(&del.created_at_ms.to_le_bytes());
     buf.extend_from_slice(&del.target_event_id);

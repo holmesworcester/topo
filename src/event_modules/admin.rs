@@ -40,11 +40,11 @@ pub struct AdminOngoingEvent {
 /// [105]      signer_type (1 byte)
 /// [106..170] signature (64 bytes)
 pub fn parse_admin_boot(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    if blob.len() < 170 {
-        return Err(EventError::TooShort { expected: 170, actual: blob.len() });
+    if blob.len() < ADMIN_BOOT_WIRE_SIZE {
+        return Err(EventError::TooShort { expected: ADMIN_BOOT_WIRE_SIZE, actual: blob.len() });
     }
-    if blob.len() > 170 {
-        return Err(EventError::TrailingData { expected: 170, actual: blob.len() });
+    if blob.len() > ADMIN_BOOT_WIRE_SIZE {
+        return Err(EventError::TrailingData { expected: ADMIN_BOOT_WIRE_SIZE, actual: blob.len() });
     }
     if blob[0] != EVENT_TYPE_ADMIN_BOOT {
         return Err(EventError::WrongType { expected: EVENT_TYPE_ADMIN_BOOT, actual: blob[0] });
@@ -76,7 +76,7 @@ pub fn encode_admin_boot(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         ParsedEvent::AdminBoot(v) => v,
         _ => return Err(EventError::WrongVariant),
     };
-    let mut buf = Vec::with_capacity(170);
+    let mut buf = Vec::with_capacity(ADMIN_BOOT_WIRE_SIZE);
     buf.push(EVENT_TYPE_ADMIN_BOOT);
     buf.extend_from_slice(&e.created_at_ms.to_le_bytes());
     buf.extend_from_slice(&e.public_key);
@@ -96,11 +96,11 @@ pub fn encode_admin_boot(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
 /// [105]      signer_type (1 byte)
 /// [106..170] signature (64 bytes)
 pub fn parse_admin_ongoing(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    if blob.len() < 170 {
-        return Err(EventError::TooShort { expected: 170, actual: blob.len() });
+    if blob.len() < ADMIN_ONGOING_WIRE_SIZE {
+        return Err(EventError::TooShort { expected: ADMIN_ONGOING_WIRE_SIZE, actual: blob.len() });
     }
-    if blob.len() > 170 {
-        return Err(EventError::TrailingData { expected: 170, actual: blob.len() });
+    if blob.len() > ADMIN_ONGOING_WIRE_SIZE {
+        return Err(EventError::TrailingData { expected: ADMIN_ONGOING_WIRE_SIZE, actual: blob.len() });
     }
     if blob[0] != EVENT_TYPE_ADMIN_ONGOING {
         return Err(EventError::WrongType { expected: EVENT_TYPE_ADMIN_ONGOING, actual: blob[0] });
@@ -132,7 +132,7 @@ pub fn encode_admin_ongoing(event: &ParsedEvent) -> Result<Vec<u8>, EventError> 
         ParsedEvent::AdminOngoing(v) => v,
         _ => return Err(EventError::WrongVariant),
     };
-    let mut buf = Vec::with_capacity(170);
+    let mut buf = Vec::with_capacity(ADMIN_ONGOING_WIRE_SIZE);
     buf.push(EVENT_TYPE_ADMIN_ONGOING);
     buf.extend_from_slice(&e.created_at_ms.to_le_bytes());
     buf.extend_from_slice(&e.public_key);
