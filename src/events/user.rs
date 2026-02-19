@@ -1,4 +1,4 @@
-use super::fixed_layout::{self, USER_WIRE_SIZE, USER_WIRE_SIZE_LEGACY, NAME_BYTES, user_offsets as off, user_offsets_legacy as off_legacy};
+use super::fixed_layout::{self, USER_WIRE_SIZE, NAME_BYTES, user_offsets as off};
 use super::registry::{EventTypeMeta, ShareScope};
 use super::{EventError, ParsedEvent, EVENT_TYPE_USER_BOOT, EVENT_TYPE_USER_ONGOING};
 
@@ -31,12 +31,10 @@ pub struct UserOngoingEvent {
 /// [137]        signer_type (1 byte)
 /// [138..202]   signature (64 bytes)
 pub fn parse_user_boot(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    let is_legacy = blob.len() == USER_WIRE_SIZE_LEGACY;
-
-    if !is_legacy && blob.len() < USER_WIRE_SIZE {
+    if blob.len() < USER_WIRE_SIZE {
         return Err(EventError::TooShort { expected: USER_WIRE_SIZE, actual: blob.len() });
     }
-    if !is_legacy && blob.len() > USER_WIRE_SIZE {
+    if blob.len() > USER_WIRE_SIZE {
         return Err(EventError::TrailingData { expected: USER_WIRE_SIZE, actual: blob.len() });
     }
     if blob[0] != EVENT_TYPE_USER_BOOT {
@@ -47,19 +45,14 @@ pub fn parse_user_boot(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     let mut public_key = [0u8; 32];
     public_key.copy_from_slice(&blob[off::PUBLIC_KEY..off::USERNAME]);
 
-    let (username, signed_by_off, signer_type_off, signature_off) = if is_legacy {
-        (String::new(), off_legacy::SIGNED_BY, off_legacy::SIGNER_TYPE, off_legacy::SIGNATURE)
-    } else {
-        let name = fixed_layout::read_text_slot(&blob[off::USERNAME..off::USERNAME + NAME_BYTES])
-            .map_err(EventError::TextSlot)?;
-        (name, off::SIGNED_BY, off::SIGNER_TYPE, off::SIGNATURE)
-    };
+    let username = fixed_layout::read_text_slot(&blob[off::USERNAME..off::USERNAME + NAME_BYTES])
+        .map_err(EventError::TextSlot)?;
 
     let mut signed_by = [0u8; 32];
-    signed_by.copy_from_slice(&blob[signed_by_off..signer_type_off]);
-    let signer_type = blob[signer_type_off];
+    signed_by.copy_from_slice(&blob[off::SIGNED_BY..off::SIGNER_TYPE]);
+    let signer_type = blob[off::SIGNER_TYPE];
     let mut signature = [0u8; 64];
-    signature.copy_from_slice(&blob[signature_off..signature_off + 64]);
+    signature.copy_from_slice(&blob[off::SIGNATURE..off::SIGNATURE + 64]);
 
     Ok(ParsedEvent::UserBoot(UserBootEvent {
         created_at_ms,
@@ -97,12 +90,10 @@ pub fn encode_user_boot(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
 /// [137]        signer_type (1 byte)
 /// [138..202]   signature (64 bytes)
 pub fn parse_user_ongoing(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    let is_legacy = blob.len() == USER_WIRE_SIZE_LEGACY;
-
-    if !is_legacy && blob.len() < USER_WIRE_SIZE {
+    if blob.len() < USER_WIRE_SIZE {
         return Err(EventError::TooShort { expected: USER_WIRE_SIZE, actual: blob.len() });
     }
-    if !is_legacy && blob.len() > USER_WIRE_SIZE {
+    if blob.len() > USER_WIRE_SIZE {
         return Err(EventError::TrailingData { expected: USER_WIRE_SIZE, actual: blob.len() });
     }
     if blob[0] != EVENT_TYPE_USER_ONGOING {
@@ -113,19 +104,14 @@ pub fn parse_user_ongoing(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     let mut public_key = [0u8; 32];
     public_key.copy_from_slice(&blob[off::PUBLIC_KEY..off::USERNAME]);
 
-    let (username, signed_by_off, signer_type_off, signature_off) = if is_legacy {
-        (String::new(), off_legacy::SIGNED_BY, off_legacy::SIGNER_TYPE, off_legacy::SIGNATURE)
-    } else {
-        let name = fixed_layout::read_text_slot(&blob[off::USERNAME..off::USERNAME + NAME_BYTES])
-            .map_err(EventError::TextSlot)?;
-        (name, off::SIGNED_BY, off::SIGNER_TYPE, off::SIGNATURE)
-    };
+    let username = fixed_layout::read_text_slot(&blob[off::USERNAME..off::USERNAME + NAME_BYTES])
+        .map_err(EventError::TextSlot)?;
 
     let mut signed_by = [0u8; 32];
-    signed_by.copy_from_slice(&blob[signed_by_off..signer_type_off]);
-    let signer_type = blob[signer_type_off];
+    signed_by.copy_from_slice(&blob[off::SIGNED_BY..off::SIGNER_TYPE]);
+    let signer_type = blob[off::SIGNER_TYPE];
     let mut signature = [0u8; 64];
-    signature.copy_from_slice(&blob[signature_off..signature_off + 64]);
+    signature.copy_from_slice(&blob[off::SIGNATURE..off::SIGNATURE + 64]);
 
     Ok(ParsedEvent::UserOngoing(UserOngoingEvent {
         created_at_ms,

@@ -1,6 +1,6 @@
 use super::registry::{EventTypeMeta, ShareScope};
 use super::{EventError, ParsedEvent, EVENT_TYPE_PEER_SHARED_FIRST, EVENT_TYPE_PEER_SHARED_ONGOING};
-use super::fixed_layout::{self, PEER_SHARED_WIRE_SIZE, PEER_SHARED_WIRE_SIZE_LEGACY, NAME_BYTES, peer_shared_offsets as off, peer_shared_offsets_legacy as off_legacy};
+use super::fixed_layout::{self, PEER_SHARED_WIRE_SIZE, NAME_BYTES, peer_shared_offsets as off};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerSharedFirstEvent {
@@ -34,12 +34,10 @@ pub struct PeerSharedOngoingEvent {
 /// [169]        signer_type (1 byte)
 /// [170..234]   signature (64 bytes)
 pub fn parse_peer_shared_first(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    let is_legacy = blob.len() == PEER_SHARED_WIRE_SIZE_LEGACY;
-
-    if !is_legacy && blob.len() < PEER_SHARED_WIRE_SIZE {
+    if blob.len() < PEER_SHARED_WIRE_SIZE {
         return Err(EventError::TooShort { expected: PEER_SHARED_WIRE_SIZE, actual: blob.len() });
     }
-    if !is_legacy && blob.len() > PEER_SHARED_WIRE_SIZE {
+    if blob.len() > PEER_SHARED_WIRE_SIZE {
         return Err(EventError::TrailingData { expected: PEER_SHARED_WIRE_SIZE, actual: blob.len() });
     }
     if blob[0] != EVENT_TYPE_PEER_SHARED_FIRST {
@@ -52,19 +50,14 @@ pub fn parse_peer_shared_first(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     let mut user_event_id = [0u8; 32];
     user_event_id.copy_from_slice(&blob[off::USER_EVENT_ID..off::DEVICE_NAME]);
 
-    let (device_name, signed_by_off, signer_type_off, signature_off) = if is_legacy {
-        (String::new(), off_legacy::SIGNED_BY, off_legacy::SIGNER_TYPE, off_legacy::SIGNATURE)
-    } else {
-        let name = fixed_layout::read_text_slot(&blob[off::DEVICE_NAME..off::DEVICE_NAME + NAME_BYTES])
-            .map_err(EventError::TextSlot)?;
-        (name, off::SIGNED_BY, off::SIGNER_TYPE, off::SIGNATURE)
-    };
+    let device_name = fixed_layout::read_text_slot(&blob[off::DEVICE_NAME..off::DEVICE_NAME + NAME_BYTES])
+        .map_err(EventError::TextSlot)?;
 
     let mut signed_by = [0u8; 32];
-    signed_by.copy_from_slice(&blob[signed_by_off..signer_type_off]);
-    let signer_type = blob[signer_type_off];
+    signed_by.copy_from_slice(&blob[off::SIGNED_BY..off::SIGNER_TYPE]);
+    let signer_type = blob[off::SIGNER_TYPE];
     let mut signature = [0u8; 64];
-    signature.copy_from_slice(&blob[signature_off..signature_off + 64]);
+    signature.copy_from_slice(&blob[off::SIGNATURE..off::SIGNATURE + 64]);
 
     Ok(ParsedEvent::PeerSharedFirst(PeerSharedFirstEvent {
         created_at_ms,
@@ -105,12 +98,10 @@ pub fn encode_peer_shared_first(event: &ParsedEvent) -> Result<Vec<u8>, EventErr
 /// [169]        signer_type (1 byte)
 /// [170..234]   signature (64 bytes)
 pub fn parse_peer_shared_ongoing(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    let is_legacy = blob.len() == PEER_SHARED_WIRE_SIZE_LEGACY;
-
-    if !is_legacy && blob.len() < PEER_SHARED_WIRE_SIZE {
+    if blob.len() < PEER_SHARED_WIRE_SIZE {
         return Err(EventError::TooShort { expected: PEER_SHARED_WIRE_SIZE, actual: blob.len() });
     }
-    if !is_legacy && blob.len() > PEER_SHARED_WIRE_SIZE {
+    if blob.len() > PEER_SHARED_WIRE_SIZE {
         return Err(EventError::TrailingData { expected: PEER_SHARED_WIRE_SIZE, actual: blob.len() });
     }
     if blob[0] != EVENT_TYPE_PEER_SHARED_ONGOING {
@@ -123,19 +114,14 @@ pub fn parse_peer_shared_ongoing(blob: &[u8]) -> Result<ParsedEvent, EventError>
     let mut user_event_id = [0u8; 32];
     user_event_id.copy_from_slice(&blob[off::USER_EVENT_ID..off::DEVICE_NAME]);
 
-    let (device_name, signed_by_off, signer_type_off, signature_off) = if is_legacy {
-        (String::new(), off_legacy::SIGNED_BY, off_legacy::SIGNER_TYPE, off_legacy::SIGNATURE)
-    } else {
-        let name = fixed_layout::read_text_slot(&blob[off::DEVICE_NAME..off::DEVICE_NAME + NAME_BYTES])
-            .map_err(EventError::TextSlot)?;
-        (name, off::SIGNED_BY, off::SIGNER_TYPE, off::SIGNATURE)
-    };
+    let device_name = fixed_layout::read_text_slot(&blob[off::DEVICE_NAME..off::DEVICE_NAME + NAME_BYTES])
+        .map_err(EventError::TextSlot)?;
 
     let mut signed_by = [0u8; 32];
-    signed_by.copy_from_slice(&blob[signed_by_off..signer_type_off]);
-    let signer_type = blob[signer_type_off];
+    signed_by.copy_from_slice(&blob[off::SIGNED_BY..off::SIGNER_TYPE]);
+    let signer_type = blob[off::SIGNER_TYPE];
     let mut signature = [0u8; 64];
-    signature.copy_from_slice(&blob[signature_off..signature_off + 64]);
+    signature.copy_from_slice(&blob[off::SIGNATURE..off::SIGNATURE + 64]);
 
     Ok(ParsedEvent::PeerSharedOngoing(PeerSharedOngoingEvent {
         created_at_ms,

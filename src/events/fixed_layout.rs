@@ -109,9 +109,6 @@ pub const MESSAGE_DELETION_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32 + 32 + SI
 /// Workspace (type 8): type(1) + created_at(8) + public_key(32) + name(64) = 105
 pub const WORKSPACE_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32 + NAME_BYTES;
 
-/// Legacy Workspace wire size (pre-display-names): type(1) + created_at(8) + public_key(32) = 41
-pub const WORKSPACE_WIRE_SIZE_LEGACY: usize = COMMON_HEADER_BYTES + 32;
-
 /// InviteAccepted (type 9): type(1) + created_at(8) + invite_event_id(32) + workspace_id(32) = 73
 pub const INVITE_ACCEPTED_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32 + 32;
 
@@ -132,17 +129,9 @@ pub const IDENTITY_PUBKEY_SIGNED_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32 + S
 ///                     + signed_by(32) + signer_type(1) + signature(64) = 202
 pub const USER_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32 + NAME_BYTES + SIGNATURE_TRAILER_BYTES;
 
-/// Legacy User wire size (pre-display-names): type(1) + created_at(8) + public_key(32)
-///                                           + signed_by(32) + signer_type(1) + signature(64) = 138
-pub const USER_WIRE_SIZE_LEGACY: usize = IDENTITY_PUBKEY_SIGNED_WIRE_SIZE;
-
 /// PeerShared (types 16, 17): type(1) + created_at(8) + public_key(32) + user_event_id(32)
 ///                           + device_name(64) + signed_by(32) + signer_type(1) + signature(64) = 234
 pub const PEER_SHARED_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32 + 32 + NAME_BYTES + SIGNATURE_TRAILER_BYTES;
-
-/// Legacy PeerShared wire size (pre-display-names): type(1) + created_at(8) + public_key(32)
-///                                                 + user_event_id(32) + signed_by(32) + signer_type(1) + signature(64) = 170
-pub const PEER_SHARED_WIRE_SIZE_LEGACY: usize = COMMON_HEADER_BYTES + 32 + 32 + SIGNATURE_TRAILER_BYTES;
 
 /// AdminBoot (type 18): type(1) + created_at(8) + public_key(32) + user_event_id(32)
 ///                     + signed_by(32) + signer_type(1) + signature(64) = 170
@@ -266,14 +255,6 @@ pub mod user_offsets {
     pub const SIGNATURE: usize = SIGNER_TYPE + 1;                   // 138
 }
 
-// ─── Legacy offsets (User, pre-display-names: no username field) ───
-
-pub mod user_offsets_legacy {
-    pub const SIGNED_BY: usize = 41;                       // right after public_key
-    pub const SIGNER_TYPE: usize = SIGNED_BY + 32;          // 73
-    pub const SIGNATURE: usize = SIGNER_TYPE + 1;           // 74
-}
-
 // ─── Per-type field offsets (PeerSharedFirst/PeerSharedOngoing, types 16/17) ───
 
 pub mod peer_shared_offsets {
@@ -290,14 +271,6 @@ pub mod peer_shared_offsets {
 /// Compute the total encrypted event wire size for a given inner type wire size.
 pub const fn encrypted_wire_size(inner_wire_size: usize) -> usize {
     ENCRYPTED_OVERHEAD_BYTES + inner_wire_size
-}
-
-// ─── Legacy offsets (PeerShared, pre-display-names: no device_name field) ───
-
-pub mod peer_shared_offsets_legacy {
-    pub const SIGNED_BY: usize = 73;                       // right after user_event_id
-    pub const SIGNER_TYPE: usize = SIGNED_BY + 32;          // 105
-    pub const SIGNATURE: usize = SIGNER_TYPE + 1;           // 106
 }
 
 /// Look up the fixed wire size for a given inner_type_code.
