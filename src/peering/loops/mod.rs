@@ -14,7 +14,7 @@ mod accept;
 mod connect;
 mod download;
 
-// Re-export public API so callers can still `use crate::network::loops::*`.
+// Re-export public API so callers can still `use crate::peering::loops::*`.
 pub use accept::{accept_loop, accept_loop_with_ingest};
 pub use connect::connect_loop;
 pub use download::download_from_sources;

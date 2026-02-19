@@ -9,7 +9,7 @@ use topo::transport::{
     AllowedPeers, create_client_endpoint, create_server_endpoint,
     extract_spki_fingerprint, peer_identity_from_connection,
 };
-use topo::network::loops::{accept_loop, connect_loop};
+use topo::peering::loops::{accept_loop, connect_loop};
 use topo::testutil::{noop_intro_spawner, test_ingest_fns};
 use topo::db::open_connection;
 
@@ -754,7 +754,7 @@ async fn test_invalid_signature_rejected_after_sync() {
     // We need to do this manually since create_signed_memo uses proper signing
     let bad_memo_event_id_b64: String;
     {
-        use topo::events::{SignedMemoEvent, ParsedEvent, encode_event};
+        use topo::event_modules::{SignedMemoEvent, ParsedEvent, encode_event};
         use topo::projection::signer::sign_event_bytes;
         use topo::crypto::hash_event;
 
@@ -1014,7 +1014,7 @@ async fn test_encrypted_replay_invariants() {
 async fn test_project_queue_crash_recovery() {
     let harness = ScenarioHarness::skip("manually destroys/rebuilds projection as test mechanism");
     use topo::db::project_queue::ProjectQueue;
-    use topo::projection::pipeline::project_one;
+    use topo::projection::apply::project_one;
 
     let alice = Peer::new_with_identity("alice");
 
@@ -1100,7 +1100,7 @@ async fn test_project_queue_crash_recovery() {
 async fn test_project_queue_drain_after_batch() {
     let harness = ScenarioHarness::skip("tests queue dedup guard, not projection invariants");
     use topo::db::project_queue::ProjectQueue;
-    use topo::projection::pipeline::project_one;
+    use topo::projection::apply::project_one;
 
     let alice = Peer::new_with_identity("alice");
 
@@ -1549,11 +1549,11 @@ async fn test_endpoint_observations_recorded() {
 #[tokio::test]
 async fn test_encrypted_inner_unsupported_signer_rejects_durably() {
     use topo::crypto::hash_event;
-    use topo::events::{
+    use topo::event_modules::{
         EncryptedEvent, ParsedEvent, SignedMemoEvent, EVENT_TYPE_SIGNED_MEMO, encode_event,
     };
     use topo::projection::encrypted::encrypt_event_blob;
-    use topo::projection::pipeline::project_one;
+    use topo::projection::apply::project_one;
 
     let alice = Peer::new_with_identity("alice");
     let harness = ScenarioHarness::new();
@@ -1830,11 +1830,11 @@ fn test_out_of_order_identity() {
     let db = open_connection(&alice.db_path).unwrap();
 
     use ed25519_dalek::SigningKey;
-    use topo::events::{encode_event, ParsedEvent, WorkspaceEvent, UserInviteBootEvent, UserBootEvent};
+    use topo::event_modules::{encode_event, ParsedEvent, WorkspaceEvent, UserInviteBootEvent, UserBootEvent};
     use topo::projection::signer::sign_event_bytes;
-    use topo::projection::pipeline::project_one;
+    use topo::projection::apply::project_one;
     use topo::crypto::hash_event;
-    use topo::events::registry;
+    use topo::event_modules::registry;
 
     let mut rng = rand::thread_rng();
     let workspace_key = SigningKey::generate(&mut rng);
@@ -2105,9 +2105,9 @@ fn test_secret_shared_key_wrap() {
 /// then unblocks via cascade after Bob's identity chain events are synced in.
 #[test]
 fn test_secret_shared_blocks_until_signer_valid() {
-    use topo::projection::pipeline::project_one;
+    use topo::projection::apply::project_one;
     use topo::projection::create::create_signed_event_staged;
-    use topo::events::{ParsedEvent, SecretSharedEvent};
+    use topo::event_modules::{ParsedEvent, SecretSharedEvent};
 
     let alice = Peer::new("alice");
     let bob = Peer::new("bob");
@@ -2166,7 +2166,7 @@ fn test_secret_shared_blocks_until_signer_valid() {
         }).unwrap().collect::<Result<Vec<_>, _>>().unwrap()
     };
 
-    use topo::events::registry;
+    use topo::event_modules::registry;
     let reg = registry();
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
@@ -2237,8 +2237,8 @@ fn test_encrypted_blocks_then_unblocks_on_key_materialization() {
     ).unwrap();
 
     let bob_db = open_connection(&bob.db_path).unwrap();
-    use topo::events::registry;
-    use topo::projection::pipeline::project_one;
+    use topo::event_modules::registry;
+    use topo::projection::apply::project_one;
     use topo::projection::decision::ProjectionDecision;
     let reg = registry();
     let enc_meta = reg.lookup(enc_blob[0]).unwrap();
@@ -2300,7 +2300,7 @@ fn test_encrypted_blocks_then_unblocks_on_key_materialization() {
 fn test_deterministic_key_event_id_matches_across_peers() {
     use topo::projection::encrypted::{wrap_key_for_recipient, unwrap_key_from_sender};
     use ed25519_dalek::SigningKey;
-    use topo::events::{encode_event, ParsedEvent, SecretKeyEvent};
+    use topo::event_modules::{encode_event, ParsedEvent, SecretKeyEvent};
     use topo::crypto::hash_event;
 
     let alice = Peer::new_with_identity("alice_det_key");
@@ -2428,9 +2428,9 @@ fn test_wrap_unwrap_encrypted_convergence() {
     ).unwrap();
 
     let bob_db = open_connection(&bob.db_path).unwrap();
-    use topo::events::registry;
+    use topo::event_modules::registry;
     use topo::projection::decision::ProjectionDecision;
-    use topo::projection::pipeline::project_one;
+    use topo::projection::apply::project_one;
     let reg = registry();
     let enc_meta = reg.lookup(enc_blob[0]).unwrap();
     let now_ms = std::time::SystemTime::now()
@@ -2761,7 +2761,7 @@ fn test_true_out_of_order_identity_chain() {
 
     use ed25519_dalek::SigningKey;
     use topo::crypto::hash_event;
-    use topo::events::{encode_event, ParsedEvent, WorkspaceEvent};
+    use topo::event_modules::{encode_event, ParsedEvent, WorkspaceEvent};
     use topo::projection::create::create_event_staged;
     let mut rng = rand::thread_rng();
 
@@ -3091,7 +3091,7 @@ async fn test_identity_then_messaging() {
 /// for Laptop, Laptop joins with PeerSharedOngoing, both sync and converge.
 #[tokio::test]
 async fn test_device_link_via_sync() {
-    use topo::events::{DeviceInviteOngoingEvent, PeerSharedOngoingEvent, ParsedEvent};
+    use topo::event_modules::{DeviceInviteOngoingEvent, PeerSharedOngoingEvent, ParsedEvent};
     use topo::projection::create::{create_signed_event_sync, create_signed_event_staged};
 
     let phone = Peer::new("phone");
@@ -3942,8 +3942,8 @@ async fn test_run_node_multitenant_outbound_isolation() {
         multi_workspace::{WorkspaceCertResolver, workspace_sni},
         DynamicAllowFn,
     };
-    use topo::network::loops::accept_loop_with_ingest;
-    use topo::event_runtime::{IngestItem, batch_writer};
+    use topo::peering::loops::accept_loop_with_ingest;
+    use topo::event_pipeline::{IngestItem, batch_writer};
     use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
     use rustls::sign::CertifiedKey;
     use tokio::sync::mpsc;

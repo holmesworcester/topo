@@ -9,7 +9,7 @@ use crate::db::project_queue::ProjectQueue;
 use crate::db::schema::create_tables;
 use crate::db::store::{lookup_workspace_id, Store, SQL_INSERT_EVENT, SQL_INSERT_NEG_ITEM, SQL_INSERT_RECORDED_EVENT};
 use crate::db::open_connection;
-use crate::events::{self, registry, ShareScope};
+use crate::event_modules::{self as events, registry, ShareScope};
 
 const DEFAULT_EGRESS_LEASE_MS: i64 = 30_000;
 

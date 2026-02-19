@@ -4,9 +4,9 @@ use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use aes_gcm::aead::Aead;
 
 use crate::crypto::event_id_to_base64;
-use crate::events::{self, EncryptedEvent, EVENT_TYPE_ENCRYPTED};
+use crate::event_modules::{self as events, EncryptedEvent, EVENT_TYPE_ENCRYPTED};
 use super::decision::ProjectionDecision;
-use super::pipeline::run_dep_and_projection_stages;
+use super::apply::run_dep_and_projection_stages;
 
 /// Project an encrypted event: decrypt, parse inner, verify admissibility,
 /// then hand off to shared pipeline stages (dep check, signer verify,

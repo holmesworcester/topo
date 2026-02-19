@@ -1,7 +1,7 @@
 use rusqlite::{Connection, Result as SqliteResult, params};
 
 use crate::crypto::{event_id_to_base64, EventId};
-use crate::events::ShareScope;
+use crate::event_modules::ShareScope;
 
 pub const SQL_INSERT_EVENT: &str =
     "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)

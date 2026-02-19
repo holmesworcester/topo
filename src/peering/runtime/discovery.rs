@@ -14,7 +14,7 @@ use tracing::{info, warn};
 #[cfg(feature = "discovery")]
 use crate::contracts::event_runtime_contract::IngestFns;
 #[cfg(feature = "discovery")]
-use crate::network::loops::{connect_loop, IntroSpawnerFn};
+use crate::peering::loops::{connect_loop, IntroSpawnerFn};
 
 #[cfg(feature = "discovery")]
 use super::peer_dispatch::{normalize_discovered_addr_for_local_bind, DiscoveryAction, PeerDispatcher};

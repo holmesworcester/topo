@@ -8,7 +8,7 @@ use crate::db::{
     schema::create_tables,
     store::insert_recorded_event,
 };
-use crate::events::{
+use crate::event_modules::{
     MessageEvent, MessageDeletionEvent, ReactionEvent, SecretKeyEvent,
     SignedMemoEvent, ParsedEvent,
     WorkspaceEvent, InviteAcceptedEvent, UserInviteBootEvent, UserInviteOngoingEvent,
@@ -19,9 +19,9 @@ use crate::events::{
 };
 use crate::transport_identity::{ensure_transport_peer_id, ensure_transport_cert};
 use crate::projection::create::{create_event_sync, create_event_staged, create_signed_event_sync, create_signed_event_staged, create_encrypted_event_sync, CreateEventError};
-use crate::projection::pipeline::project_one;
+use crate::projection::apply::project_one;
 use crate::sync::SyncMessage;
-use crate::network::loops::{accept_loop, connect_loop, download_from_sources, SYNC_SESSION_TIMEOUT_SECS};
+use crate::peering::loops::{accept_loop, connect_loop, download_from_sources, SYNC_SESSION_TIMEOUT_SECS};
 use crate::replication::session::run_sync_initiator_dual;
 use crate::transport::{
     AllowedPeers,
@@ -48,8 +48,8 @@ pub fn noop_intro_spawner(
 /// Convenience: production `IngestFns` for tests.
 pub fn test_ingest_fns() -> crate::contracts::event_runtime_contract::IngestFns {
     crate::contracts::event_runtime_contract::IngestFns {
-        batch_writer: crate::event_runtime::batch_writer,
-        drain_queue: crate::event_runtime::drain_project_queue,
+        batch_writer: crate::event_pipeline::batch_writer,
+        drain_queue: crate::event_pipeline::drain_project_queue,
     }
 }
 
@@ -2008,7 +2008,7 @@ pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Jo
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async move {
             if let Err(e) = download_from_sources(
-                &sink_db, &sink_identity, endpoint_pairs, crate::event_runtime::batch_writer,
+                &sink_db, &sink_identity, endpoint_pairs, crate::event_pipeline::batch_writer,
             ).await {
                 tracing::warn!("sink download_from_sources exited: {}", e);
             }
@@ -2071,7 +2071,7 @@ pub async fn connect_sync_once(
     conn.flush_data().await?;
 
     let stats = run_sync_initiator_dual(
-        conn, db_path, SYNC_SESSION_TIMEOUT_SECS, &peer_id, identity, None, None, crate::event_runtime::batch_writer,
+        conn, db_path, SYNC_SESSION_TIMEOUT_SECS, &peer_id, identity, None, None, crate::event_pipeline::batch_writer,
     ).await?;
 
     connection.close(0u32.into(), b"done");
@@ -2150,7 +2150,7 @@ fn record_shared_db_events_for_tenant(
     tenant_id: &str,
     event_ids: &[EventId],
 ) {
-    use crate::projection::pipeline::project_one;
+    use crate::projection::apply::project_one;
 
     let now_ms = current_timestamp_ms() as i64;
     for eid in event_ids {

@@ -8,7 +8,7 @@ use super::projectors::{
 };
 use super::signer::{resolve_signer_key, verify_ed25519_signature, SignerResolution};
 use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
-use crate::events::{self, registry, ParsedEvent};
+use crate::event_modules::{self as events, registry, ParsedEvent};
 
 /// Check that each dep's type code matches the allowed types for that dep field.
 /// Returns Some(reason) if a type mismatch is found, None if all pass.
@@ -617,7 +617,7 @@ mod tests {
         schema::create_tables,
         store::{insert_event, insert_neg_item_if_shared, insert_recorded_event},
     };
-    use crate::events::{
+    use crate::event_modules::{
         self, BenchDepEvent, EncryptedEvent, FileSliceEvent, MessageAttachmentEvent,
         MessageDeletionEvent, MessageEvent, ParsedEvent, ReactionEvent, SecretKeyEvent,
         SignedMemoEvent, WorkspaceEvent, EVENT_TYPE_ENCRYPTED, EVENT_TYPE_FILE_SLICE,
@@ -651,14 +651,14 @@ mod tests {
             &event_id,
             type_name,
             blob,
-            crate::events::ShareScope::Shared,
+            crate::event_modules::ShareScope::Shared,
             ts as i64,
             ts as i64,
         )
         .unwrap();
         insert_neg_item_if_shared(
             conn,
-            crate::events::ShareScope::Shared,
+            crate::event_modules::ShareScope::Shared,
             ts as i64,
             &event_id,
             "",
@@ -669,7 +669,7 @@ mod tests {
         event_id
     }
 
-    use crate::events::{
+    use crate::event_modules::{
         DeviceInviteFirstEvent, InviteAcceptedEvent, PeerSharedFirstEvent, UserBootEvent,
         UserInviteBootEvent,
     };
@@ -2049,7 +2049,7 @@ mod tests {
 
     #[test]
     fn test_encrypted_inner_type_mismatch_rejects() {
-        use crate::events::fixed_layout;
+        use crate::event_modules::fixed_layout;
 
         let conn = setup();
         let recorded_by = "peer1";
@@ -2094,7 +2094,7 @@ mod tests {
 
     #[test]
     fn test_encrypted_nested_rejects() {
-        use crate::events::fixed_layout;
+        use crate::event_modules::fixed_layout;
 
         let conn = setup();
         let recorded_by = "peer1";
@@ -2787,7 +2787,7 @@ mod tests {
         let (_enc, enc_blob) = make_encrypted_event(
             &key_bytes,
             &ws_blob,
-            crate::events::EVENT_TYPE_WORKSPACE,
+            crate::event_modules::EVENT_TYPE_WORKSPACE,
             &sk_eid,
         );
         let enc_eid = insert_event_raw(&conn, recorded_by, &enc_blob);
@@ -3561,7 +3561,7 @@ mod tests {
         slice_number: u32,
         ciphertext_seed: &[u8],
     ) -> (ParsedEvent, Vec<u8>) {
-        use crate::events::fixed_layout::FILE_SLICE_CIPHERTEXT_BYTES;
+        use crate::event_modules::fixed_layout::FILE_SLICE_CIPHERTEXT_BYTES;
         // Pad to canonical fixed size (short seeds are zero-extended)
         let mut ciphertext = vec![0u8; FILE_SLICE_CIPHERTEXT_BYTES];
         let len = ciphertext_seed.len().min(FILE_SLICE_CIPHERTEXT_BYTES);

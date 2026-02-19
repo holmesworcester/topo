@@ -3,8 +3,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::crypto::{hash_event, event_id_to_base64, EventId};
 use crate::db::store::{insert_event, insert_neg_item_if_shared, insert_recorded_event, lookup_workspace_id};
-use crate::events::{self, ParsedEvent, registry};
-use super::pipeline::project_one;
+use crate::event_modules::{self as events, ParsedEvent, registry};
+use super::apply::project_one;
 
 /// Emit a deterministic event: compute blob, hash to event_id, check if already
 /// exists, if not: store in events/neg_items/recorded_events and project via project_one.

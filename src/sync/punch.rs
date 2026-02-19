@@ -344,7 +344,7 @@ async fn run_sync_on_punched_connection(
         remote_addr: connection.remote_address(),
         direction: SessionDirection::Outbound,
     };
-    let handler = ReplicationSessionHandler::initiator(db_path.to_string(), 60, crate::event_runtime::batch_writer);
+    let handler = ReplicationSessionHandler::initiator(db_path.to_string(), 60, crate::event_pipeline::batch_writer);
     let io = SyncSessionIo::new(session_id, conn);
 
     if let Err(e) = handler

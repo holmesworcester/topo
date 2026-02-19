@@ -15,7 +15,7 @@ use crate::db::{
     schema::create_tables,
     transport_trust::is_peer_allowed,
 };
-use crate::events::{
+use crate::event_modules::{
     DeviceInviteFirstEvent, InviteAcceptedEvent, ParsedEvent,
     PeerSharedFirstEvent, UserBootEvent, UserInviteBootEvent,
     WorkspaceEvent,
@@ -23,7 +23,7 @@ use crate::events::{
     workspace, user, peer_shared, admin, transport_key,
 };
 use crate::projection::create::{create_event_sync, create_event_staged, create_signed_event_sync};
-use crate::projection::pipeline::project_one;
+use crate::projection::apply::project_one;
 use crate::transport::create_dual_endpoint_dynamic;
 use crate::transport_identity::{
     install_peer_key_transport_identity, load_transport_cert_required, load_transport_peer_id,

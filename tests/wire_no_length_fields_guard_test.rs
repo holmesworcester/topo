@@ -9,26 +9,26 @@ use std::fs;
 
 /// Canonical event source files in scope for fixed-layout enforcement.
 const CANONICAL_EVENT_FILES: &[&str] = &[
-    "src/events/message.rs",
-    "src/events/reaction.rs",
-    "src/events/signed_memo.rs",
-    "src/events/encrypted.rs",
-    "src/events/file_slice.rs",
-    "src/events/message_attachment.rs",
-    "src/events/bench_dep.rs",
-    "src/events/message_deletion.rs",
-    "src/events/secret_key.rs",
-    "src/events/secret_shared.rs",
-    "src/events/workspace.rs",
-    "src/events/invite_accepted.rs",
-    "src/events/user_invite.rs",
-    "src/events/user.rs",
-    "src/events/device_invite.rs",
-    "src/events/peer_shared.rs",
-    "src/events/admin.rs",
-    "src/events/user_removed.rs",
-    "src/events/peer_removed.rs",
-    "src/events/transport_key.rs",
+    "src/event_modules/message.rs",
+    "src/event_modules/reaction.rs",
+    "src/event_modules/signed_memo.rs",
+    "src/event_modules/encrypted.rs",
+    "src/event_modules/file_slice.rs",
+    "src/event_modules/message_attachment.rs",
+    "src/event_modules/bench_dep.rs",
+    "src/event_modules/message_deletion.rs",
+    "src/event_modules/secret_key.rs",
+    "src/event_modules/secret_shared.rs",
+    "src/event_modules/workspace.rs",
+    "src/event_modules/invite_accepted.rs",
+    "src/event_modules/user_invite.rs",
+    "src/event_modules/user.rs",
+    "src/event_modules/device_invite.rs",
+    "src/event_modules/peer_shared.rs",
+    "src/event_modules/admin.rs",
+    "src/event_modules/user_removed.rs",
+    "src/event_modules/peer_removed.rs",
+    "src/event_modules/transport_key.rs",
 ];
 
 /// Denied field names that indicate variable-length wire format logic.
@@ -124,7 +124,7 @@ fn all_canonical_event_files_exist() {
 /// registered types (via the existing registry).
 #[test]
 fn all_registered_types_have_fixed_wire_size() {
-    use topo::events::{fixed_layout, registry};
+    use topo::event_modules::{fixed_layout, registry};
 
     // For each type code 1..=26, verify the registry has an entry
     // and encoding produces a deterministic-length blob.

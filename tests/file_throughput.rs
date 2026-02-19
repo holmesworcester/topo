@@ -10,13 +10,13 @@ use std::time::Instant;
 use ed25519_dalek::SigningKey;
 use topo::crypto::{event_id_to_base64, hash_event, EventId};
 use topo::db::{open_connection, schema::create_tables};
-use topo::events::{
-    self, FileSliceEvent, MessageAttachmentEvent, MessageEvent, ParsedEvent,
+use topo::event_modules::{
+    self as events, FileSliceEvent, MessageAttachmentEvent, MessageEvent, ParsedEvent,
     SecretKeyEvent, WorkspaceEvent, InviteAcceptedEvent, UserInviteBootEvent,
     UserBootEvent, DeviceInviteFirstEvent, PeerSharedFirstEvent,
     fixed_layout::FILE_SLICE_CIPHERTEXT_BYTES,
 };
-use topo::projection::pipeline::project_one;
+use topo::projection::apply::project_one;
 use topo::projection::signer::sign_event_bytes;
 use rusqlite::Connection;
 use tempfile::NamedTempFile;

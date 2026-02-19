@@ -22,7 +22,7 @@ use tracing::{info, warn};
 use crate::upnp::UpnpMappingReport;
 
 use crate::contracts::event_runtime_contract::{IngestFns, IngestItem};
-use crate::network::loops::{accept_loop_with_ingest, IntroSpawnerFn};
+use crate::peering::loops::{accept_loop_with_ingest, IntroSpawnerFn};
 
 use autodial::{
     build_tenant_client_config, collect_placeholder_invite_autodial_targets,

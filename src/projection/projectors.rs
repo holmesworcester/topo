@@ -2,7 +2,7 @@ use rusqlite::Connection;
 
 use super::decision::ProjectionDecision;
 use crate::crypto::event_id_to_base64;
-use crate::events::{
+use crate::event_modules::{
     FileSliceEvent, MessageAttachmentEvent, MessageDeletionEvent, MessageEvent,
     ReactionEvent, SecretKeyEvent, SignedMemoEvent,
 };

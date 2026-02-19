@@ -11,8 +11,8 @@ use std::time::Instant;
 
 use topo::crypto::{event_id_to_base64, hash_event, EventId};
 use topo::db::{open_connection, schema::create_tables};
-use topo::events::{self, BenchDepEvent, ParsedEvent};
-use topo::projection::pipeline::project_one;
+use topo::event_modules::{self as events, BenchDepEvent, ParsedEvent};
+use topo::projection::apply::project_one;
 use rusqlite::Connection;
 use tempfile::NamedTempFile;
 

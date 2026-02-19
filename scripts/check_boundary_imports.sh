@@ -28,16 +28,16 @@ check_required() {
 
 echo "=== Forbidden edges ==="
 
-# -- network must not reach into internals --
-# network -> sync internals
-check_no_match 'crate::sync' src/network/
-# network -> projection
-check_no_match 'crate::projection' src/network/
-# network -> event_runtime internals (must use contract types only)
-check_no_match 'crate::event_runtime::ingest_runtime' src/network/
-check_no_match 'crate::event_runtime::batch_writer' src/network/
-check_no_match 'crate::event_runtime::drain_project_queue' src/network/
-check_no_match 'crate::event_runtime::IngestItem' src/network/
+# -- peering must not reach into internals --
+# peering -> sync internals
+check_no_match 'crate::sync' src/peering/
+# peering -> projection
+check_no_match 'crate::projection' src/peering/
+# peering -> event_pipeline internals (must use contract types only)
+check_no_match 'crate::event_pipeline::ingest_runtime' src/peering/
+check_no_match 'crate::event_pipeline::batch_writer' src/peering/
+check_no_match 'crate::event_pipeline::drain_project_queue' src/peering/
+check_no_match 'crate::event_pipeline::IngestItem' src/peering/
 
 # -- replication must not depend on transport concrete types --
 # replication -> projection
@@ -50,16 +50,16 @@ check_no_match 'SyncSessionIo<' src/replication/
 check_no_match '\.into_any\(' src/replication/
 check_no_match 'downcast::<' src/replication/
 
-# -- event_runtime must not reach into network, replication, or sync --
-check_no_match 'crate::network' src/event_runtime/
-check_no_match 'crate::replication' src/event_runtime/
-check_no_match 'crate::sync' src/event_runtime/
+# -- event_pipeline must not reach into peering, replication, or sync --
+check_no_match 'crate::peering' src/event_pipeline/
+check_no_match 'crate::replication' src/event_pipeline/
+check_no_match 'crate::sync' src/event_pipeline/
 
 echo "=== Positive contract checks ==="
 
-# network and replication must import from contracts, not event_runtime
-check_required 'contracts::event_runtime_contract' src/network/
-check_required 'contracts::network_contract' src/network/
+# peering and replication must import from contracts, not event_pipeline
+check_required 'contracts::event_runtime_contract' src/peering/
+check_required 'contracts::network_contract' src/peering/
 check_required 'contracts::event_runtime_contract' src/replication/
 check_required 'contracts::network_contract' src/replication/
 

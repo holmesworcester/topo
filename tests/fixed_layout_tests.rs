@@ -1,8 +1,8 @@
 //! Phase 5 test expansion: golden-byte, negative parse, and idempotent
 //! encode/decode tests for all fixed-layout canonical event types.
 
-use topo::events::{
-    self, fixed_layout, EventError, ParsedEvent,
+use topo::event_modules::{
+    self as events, fixed_layout, EventError, ParsedEvent,
     MessageEvent, ReactionEvent, SignedMemoEvent, EncryptedEvent,
     FileSliceEvent, MessageAttachmentEvent, BenchDepEvent,
 };

@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 use tracing::warn;
 
 use crate::contracts::event_runtime_contract::IngestFns;
-use crate::network::loops::{connect_loop, IntroSpawnerFn};
+use crate::peering::loops::{connect_loop, IntroSpawnerFn};
 
 /// Dispatch decision for a discovered peer.
 #[derive(Debug, PartialEq)]

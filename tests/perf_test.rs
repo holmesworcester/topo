@@ -305,7 +305,7 @@ fn inject_messages_batched(
 ) {
     use std::time::{SystemTime, UNIX_EPOCH};
     use topo::db::open_connection;
-    use topo::events::{MessageEvent, ParsedEvent};
+    use topo::event_modules::{MessageEvent, ParsedEvent};
     use topo::projection::create::create_signed_event_sync;
 
     let db = open_connection(db_path).expect("failed to open db");

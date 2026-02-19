@@ -107,7 +107,7 @@ mod tests {
         schema::create_tables,
         store::{insert_event, insert_recorded_event},
     };
-    use crate::events::{PeerSharedFirstEvent, ParsedEvent, encode_event};
+    use crate::event_modules::{PeerSharedFirstEvent, ParsedEvent, encode_event};
     use ed25519_dalek::SigningKey;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -126,7 +126,7 @@ mod tests {
         let event_id = hash_event(blob);
         let event_id_b64 = event_id_to_base64(&event_id);
         let type_code = blob[0];
-        let type_name = crate::events::registry()
+        let type_name = crate::event_modules::registry()
             .lookup(type_code)
             .map(|m| m.type_name)
             .unwrap_or("unknown");
@@ -136,7 +136,7 @@ mod tests {
             &event_id,
             type_name,
             blob,
-            crate::events::ShareScope::Shared,
+            crate::event_modules::ShareScope::Shared,
             ts,
             ts,
         )
@@ -217,7 +217,7 @@ mod tests {
     fn test_resolve_signer_key_wrong_event_type() {
         let conn = setup();
         let recorded_by = "peer1";
-        use crate::events::MessageEvent;
+        use crate::event_modules::MessageEvent;
         let msg = ParsedEvent::Message(MessageEvent {
             created_at_ms: now_ms(),
             workspace_id: [1u8; 32],

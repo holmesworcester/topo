@@ -2,7 +2,7 @@ use ed25519_dalek::SigningKey;
 use rusqlite::Connection;
 
 use crate::crypto::{EventId, event_id_from_base64, event_id_to_base64, hash_event};
-use crate::events::*;
+use crate::event_modules::*;
 use crate::projection::create::{
     create_event_sync, create_event_staged, create_signed_event_sync, create_signed_event_staged,
 };

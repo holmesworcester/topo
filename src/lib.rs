@@ -4,12 +4,12 @@ pub mod db;
 pub mod db_registry;
 #[cfg(feature = "discovery")]
 pub mod discovery;
-pub mod event_runtime;
-pub mod events;
+pub mod event_modules;
+pub mod event_pipeline;
 pub mod identity_ops;
 pub mod invite_link;
-pub mod network;
 pub mod node;
+pub mod peering;
 pub mod projection;
 pub mod replication;
 pub mod rpc;

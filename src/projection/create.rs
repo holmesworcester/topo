@@ -3,13 +3,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::crypto::{hash_event, event_id_to_base64, EventId};
 use crate::db::store::{insert_event, insert_neg_item_if_shared, insert_recorded_event, lookup_workspace_id};
-use crate::events::{self, ParsedEvent, registry};
-use crate::events::EncryptedEvent;
+use crate::event_modules::{self as events, ParsedEvent, registry};
+use crate::event_modules::EncryptedEvent;
 use crate::projection::encrypted::encrypt_event_blob;
 use crate::projection::signer::sign_event_bytes;
 use ed25519_dalek::SigningKey;
 use super::decision::ProjectionDecision;
-use super::pipeline::project_one;
+use super::apply::project_one;
 
 #[derive(Debug)]
 pub enum CreateEventError {
@@ -243,7 +243,7 @@ pub fn create_signed_event_staged(
 mod tests {
     use super::*;
     use crate::db::{open_in_memory, schema::create_tables};
-    use crate::events::{
+    use crate::event_modules::{
         MessageEvent, ReactionEvent, SignedMemoEvent,
         WorkspaceEvent, InviteAcceptedEvent, UserInviteBootEvent,
         UserBootEvent, DeviceInviteFirstEvent, PeerSharedFirstEvent,

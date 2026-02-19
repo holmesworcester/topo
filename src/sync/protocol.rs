@@ -1,4 +1,4 @@
-use crate::events::EVENT_MAX_BLOB_BYTES;
+use crate::event_modules::EVENT_MAX_BLOB_BYTES;
 use super::{MSG_TYPE_NEG_OPEN, MSG_TYPE_NEG_MSG, MSG_TYPE_HAVE_LIST, MSG_TYPE_EVENT, MSG_TYPE_DONE, MSG_TYPE_DONE_ACK, MSG_TYPE_DATA_DONE, MSG_TYPE_INTRO_OFFER};
 
 /// Max negentropy message payload: 4 MiB (generous for large reconciliation rounds)

@@ -1,7 +1,7 @@
 use rusqlite::Connection;
 
 use crate::crypto::{event_id_to_base64, event_id_from_base64};
-use crate::events::ParsedEvent;
+use crate::event_modules::ParsedEvent;
 use super::decision::ProjectionDecision;
 
 // Trust anchor is set directly from invite_accepted.workspace_id.
@@ -42,7 +42,7 @@ fn project_workspace(
     conn: &Connection,
     recorded_by: &str,
     event_id_b64: &str,
-    ws: &crate::events::WorkspaceEvent,
+    ws: &crate::event_modules::WorkspaceEvent,
 ) -> Result<ProjectionDecision, Box<dyn std::error::Error>> {
     let workspace_id_b64 = event_id_b64.to_string();
 
@@ -88,7 +88,7 @@ fn project_invite_accepted(
     conn: &Connection,
     recorded_by: &str,
     event_id_b64: &str,
-    ia: &crate::events::InviteAcceptedEvent,
+    ia: &crate::event_modules::InviteAcceptedEvent,
 ) -> Result<ProjectionDecision, Box<dyn std::error::Error>> {
     let invite_eid_b64 = event_id_to_base64(&ia.invite_event_id);
     let workspace_id_b64 = event_id_to_base64(&ia.workspace_id);
@@ -136,7 +136,7 @@ fn project_user_invite_boot(
     conn: &Connection,
     recorded_by: &str,
     event_id_b64: &str,
-    ui: &crate::events::UserInviteBootEvent,
+    ui: &crate::event_modules::UserInviteBootEvent,
 ) -> Result<ProjectionDecision, Box<dyn std::error::Error>> {
     conn.execute(
         "INSERT OR IGNORE INTO user_invites (recorded_by, event_id, public_key)
@@ -256,7 +256,7 @@ fn project_secret_shared(
     conn: &Connection,
     recorded_by: &str,
     event_id_b64: &str,
-    ss: &crate::events::SecretSharedEvent,
+    ss: &crate::event_modules::SecretSharedEvent,
 ) -> Result<ProjectionDecision, Box<dyn std::error::Error>> {
     let key_b64 = event_id_to_base64(&ss.key_event_id);
     let recipient_b64 = event_id_to_base64(&ss.recipient_event_id);
@@ -287,7 +287,7 @@ fn project_transport_key(
     conn: &Connection,
     recorded_by: &str,
     event_id_b64: &str,
-    tk: &crate::events::TransportKeyEvent,
+    tk: &crate::event_modules::TransportKeyEvent,
 ) -> Result<ProjectionDecision, Box<dyn std::error::Error>> {
     conn.execute(
         "INSERT OR IGNORE INTO transport_keys (recorded_by, event_id, spki_fingerprint)
@@ -324,7 +324,7 @@ pub fn retry_guard_blocked_events(
     for eid_b64 in candidates {
         if let Some(event_id) = event_id_from_base64(&eid_b64) {
             // Re-project via project_one — it will re-check guards
-            let _ = super::pipeline::project_one(conn, recorded_by, &event_id)?;
+            let _ = super::apply::project_one(conn, recorded_by, &event_id)?;
         }
     }
     Ok(())

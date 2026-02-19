@@ -13,8 +13,8 @@ use crate::db::store::{
     lookup_workspace_id, SQL_INSERT_EVENT, SQL_INSERT_NEG_ITEM, SQL_INSERT_RECORDED_EVENT,
 };
 use crate::db::wanted::WantedEvents;
-use crate::events::{self, registry, ShareScope};
-use crate::projection::pipeline::project_one;
+use crate::event_modules::{self as events, registry, ShareScope};
+use crate::projection::apply::project_one;
 
 fn low_mem_mode() -> bool {
     read_bool_env("LOW_MEM_IOS") || read_bool_env("LOW_MEM")

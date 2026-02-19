@@ -14,7 +14,7 @@ use crate::contracts::network_contract::{PeerFingerprint, TenantId, TrustDecisio
 use crate::db::transport_creds::{list_local_peers, load_local_creds};
 use crate::db::transport_trust::list_active_invite_bootstrap_addrs;
 use crate::db::open_connection;
-use crate::network::loops::IntroSpawnerFn;
+use crate::peering::loops::IntroSpawnerFn;
 use crate::transport::{workspace_client_config, DynamicAllowFn, SqliteTrustOracle};
 
 use super::peer_dispatch::spawn_connect_loop_thread;
