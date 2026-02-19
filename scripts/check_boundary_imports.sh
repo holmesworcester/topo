@@ -53,6 +53,14 @@ check_no_match 'crate::peering' src/event_pipeline/
 check_no_match 'crate::sync::session' src/event_pipeline/
 check_no_match 'crate::sync' src/event_pipeline/
 
+# -- transport identity boundary: only transport/identity_adapter.rs may call raw install fns --
+check_no_match 'install_peer_key_transport_identity' src/service.rs
+check_no_match 'install_invite_bootstrap_transport_identity' src/service.rs
+check_no_match 'install_peer_key_transport_identity' src/event_modules/
+check_no_match 'install_invite_bootstrap_transport_identity' src/event_modules/
+check_no_match 'install_peer_key_transport_identity' src/projection/
+check_no_match 'install_invite_bootstrap_transport_identity' src/projection/
+
 echo "=== Positive contract checks ==="
 
 # peering and sync must import from contracts, not event_pipeline
@@ -60,6 +68,13 @@ check_required 'contracts::event_runtime_contract' src/peering/
 check_required 'contracts::network_contract' src/peering/
 check_required 'contracts::event_runtime_contract' src/sync/
 check_required 'contracts::network_contract' src/sync/
+
+# transport identity adapter must use contract types
+check_required 'TransportIdentityAdapter' src/transport/identity_adapter.rs
+check_required 'TransportIdentityIntent' src/transport/identity_adapter.rs
+
+# projection must route through adapter contract, not raw install fns
+check_required 'ApplyTransportIdentityIntent' src/projection/
 
 if [ "$FAIL" -ne 0 ]; then
   echo "FAILED: boundary violations found" >&2
