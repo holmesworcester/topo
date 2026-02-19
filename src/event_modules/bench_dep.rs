@@ -102,7 +102,7 @@ pub fn project_pure(
 
 pub static BENCH_DEP_META: EventTypeMeta = EventTypeMeta {
     type_code: EVENT_TYPE_BENCH_DEP,
-    type_name: "bench_dep",
+    type_name: "bench_dep_perf_testing",
     projection_table: "valid_events",
     share_scope: ShareScope::Shared,
     dep_fields: &["dep_id"],
