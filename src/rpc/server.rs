@@ -705,9 +705,12 @@ fn dispatch(
                 Err(e) => RpcResponse::error(e.to_string()),
             }
         }
-        RpcMethod::View { limit } => match service::svc_view(db_path, limit) {
-            Ok(data) => RpcResponse::success(data),
-            Err(e) => RpcResponse::error(e.to_string()),
+        RpcMethod::View { limit } => match state.require_active_peer() {
+            Ok(peer_id) => match service::svc_view_for_peer(db_path, &peer_id, limit) {
+                Ok(data) => RpcResponse::success(data),
+                Err(e) => RpcResponse::error(e.to_string()),
+            },
+            Err(e) => RpcResponse::error(e),
         },
     }
 }

@@ -1475,6 +1475,11 @@ pub fn svc_view(db_path: &str, limit: usize) -> ServiceResult<ViewResponse> {
     svc_view_conn(&db, &recorded_by, limit)
 }
 
+pub fn svc_view_for_peer(db_path: &str, peer_id: &str, limit: usize) -> ServiceResult<ViewResponse> {
+    let (recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
+    svc_view_conn(&db, &recorded_by, limit)
+}
+
 pub fn svc_keys_conn(db: &rusqlite::Connection, recorded_by: &str, summary: bool) -> ServiceResult<KeysResponse> {
     let user_count: i64 = db
         .query_row(
