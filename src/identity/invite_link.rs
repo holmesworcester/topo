@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 
 use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
-use crate::identity_ops::{InviteData, InviteType};
+use crate::identity::ops::{InviteData, InviteType};
 
 const INVITE_PREFIX: &str = "quiet://invite/";
 const LINK_PREFIX: &str = "quiet://link/";

@@ -4,8 +4,7 @@ pub mod db;
 pub mod db_registry;
 pub mod event_modules;
 pub mod event_pipeline;
-pub mod identity_ops;
-pub mod invite_link;
+pub mod identity;
 pub mod node;
 pub mod peering;
 pub mod projection;
@@ -16,7 +15,6 @@ pub mod service;
 pub mod sync;
 pub mod testutil;
 pub mod transport;
-pub mod transport_identity;
 
 #[cfg(test)]
 mod boundary_tests {

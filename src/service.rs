@@ -25,7 +25,7 @@ use crate::event_modules::{
 use crate::projection::create::{create_event_sync, create_event_staged, create_signed_event_sync};
 use crate::projection::apply::project_one;
 use crate::transport::create_dual_endpoint_dynamic;
-use crate::transport_identity::{
+use crate::identity::transport::{
     install_peer_key_transport_identity, load_transport_cert_required, load_transport_peer_id,
 };
 
@@ -76,8 +76,8 @@ impl From<Box<dyn std::error::Error + Send + Sync>> for ServiceError {
     }
 }
 
-impl From<crate::invite_link::InviteLinkError> for ServiceError {
-    fn from(e: crate::invite_link::InviteLinkError) -> Self {
+impl From<crate::identity::invite_link::InviteLinkError> for ServiceError {
+    fn from(e: crate::identity::invite_link::InviteLinkError) -> Self {
         ServiceError(e.to_string())
     }
 }
@@ -532,8 +532,8 @@ pub fn svc_bootstrap_workspace_conn(
     workspace_name: &str,
     username: &str,
     device_name: &str,
-) -> ServiceResult<crate::identity_ops::IdentityChain> {
-    crate::identity_ops::bootstrap_workspace(db, recorded_by, workspace_name, username, device_name)
+) -> ServiceResult<crate::identity::ops::IdentityChain> {
+    crate::identity::ops::bootstrap_workspace(db, recorded_by, workspace_name, username, device_name)
         .map_err(|e| ServiceError(format!("{}", e)))
 }
 pub fn ensure_identity_chain(
@@ -624,7 +624,7 @@ pub fn ensure_identity_chain(
     persist_local_user_key(db, recorded_by, &ub_b64, &user_key)?;
 
     // Seed deterministic local content-key material used by invite key-wrap.
-    let _ = crate::identity_ops::ensure_content_key_for_peer(
+    let _ = crate::identity::ops::ensure_content_key_for_peer(
         db,
         recorded_by,
         &peer_shared_key,
@@ -1162,16 +1162,16 @@ pub fn svc_create_invite_conn(
     bootstrap_addr: &str,
     bootstrap_spki: &[u8; 32],
 ) -> ServiceResult<CreateInviteResponse> {
-    let _ = crate::identity_ops::ensure_content_key_for_peer(
+    let _ = crate::identity::ops::ensure_content_key_for_peer(
         db, recorded_by, peer_shared_key, peer_shared_event_id,
     ).map_err(|e| ServiceError(format!("Failed to ensure content key: {}", e)))?;
 
-    let invite = crate::identity_ops::create_user_invite(
+    let invite = crate::identity::ops::create_user_invite(
         db, recorded_by, workspace_key, workspace_id,
         Some(peer_shared_key), Some(peer_shared_event_id),
     ).map_err(|e| ServiceError(format!("Failed to create invite: {}", e)))?;
 
-    let pending_spki = crate::transport_identity::expected_invite_bootstrap_spki_from_invite_key(
+    let pending_spki = crate::identity::transport::expected_invite_bootstrap_spki_from_invite_key(
         &invite.invite_key,
     ).map_err(|e| ServiceError(format!("Failed to derive invite SPKI: {}", e)))?;
 
@@ -1182,7 +1182,7 @@ pub fn svc_create_invite_conn(
         &pending_spki,
     )?;
 
-    let invite_link = crate::invite_link::create_invite_link(&invite, bootstrap_addr, bootstrap_spki)
+    let invite_link = crate::identity::invite_link::create_invite_link(&invite, bootstrap_addr, bootstrap_spki)
         .map_err(|e| ServiceError(format!("Failed to create invite link: {}", e)))?;
 
     Ok(CreateInviteResponse {
@@ -1201,11 +1201,11 @@ pub fn svc_create_device_link_invite_conn(
     bootstrap_addr: &str,
     bootstrap_spki: &[u8; 32],
 ) -> ServiceResult<CreateInviteResponse> {
-    let invite = crate::identity_ops::create_device_link_invite(
+    let invite = crate::identity::ops::create_device_link_invite(
         db, recorded_by, user_key, user_event_id, workspace_id,
     ).map_err(|e| ServiceError(format!("Failed to create device link invite: {}", e)))?;
 
-    let pending_spki = crate::transport_identity::expected_invite_bootstrap_spki_from_invite_key(
+    let pending_spki = crate::identity::transport::expected_invite_bootstrap_spki_from_invite_key(
         &invite.invite_key,
     ).map_err(|e| ServiceError(format!("Failed to derive invite SPKI: {}", e)))?;
 
@@ -1216,7 +1216,7 @@ pub fn svc_create_device_link_invite_conn(
         &pending_spki,
     )?;
 
-    let invite_link = crate::invite_link::create_invite_link(&invite, bootstrap_addr, bootstrap_spki)
+    let invite_link = crate::identity::invite_link::create_invite_link(&invite, bootstrap_addr, bootstrap_spki)
         .map_err(|e| ServiceError(format!("Failed to create invite link: {}", e)))?;
 
     Ok(CreateInviteResponse {
@@ -1536,7 +1536,7 @@ pub fn svc_create_invite(
 
     let (sender_peer_eid, sender_peer_key) = load_local_peer_signer(&db, &recorded_by)?
         .ok_or_else(|| ServiceError("No local peer signer found for invite creation.".into()))?;
-    let _ = crate::identity_ops::ensure_content_key_for_peer(
+    let _ = crate::identity::ops::ensure_content_key_for_peer(
         &db,
         &recorded_by,
         &sender_peer_key,
@@ -1544,7 +1544,7 @@ pub fn svc_create_invite(
     )
     .map_err(|e| ServiceError(format!("Failed to ensure content key: {}", e)))?;
 
-    let invite = crate::identity_ops::create_user_invite(
+    let invite = crate::identity::ops::create_user_invite(
         &db,
         &recorded_by,
         &workspace_key,
@@ -1555,7 +1555,7 @@ pub fn svc_create_invite(
     .map_err(|e| ServiceError(format!("Failed to create invite: {}", e)))?;
 
     // Record pending bootstrap trust so invitee can connect
-    let pending_spki = crate::transport_identity::expected_invite_bootstrap_spki_from_invite_key(
+    let pending_spki = crate::identity::transport::expected_invite_bootstrap_spki_from_invite_key(
         &invite.invite_key,
     )
     .map_err(|e| ServiceError(format!("Failed to derive invite SPKI: {}", e)))?;
@@ -1573,7 +1573,7 @@ pub fn svc_create_invite(
     let mut bootstrap_spki = [0u8; 32];
     bootstrap_spki.copy_from_slice(&spki_bytes);
 
-    let invite_link = crate::invite_link::create_invite_link(&invite, bootstrap_addr, &bootstrap_spki)
+    let invite_link = crate::identity::invite_link::create_invite_link(&invite, bootstrap_addr, &bootstrap_spki)
         .map_err(|e| ServiceError(format!("Failed to create invite link: {}", e)))?;
 
     Ok(CreateInviteResponse {
@@ -1595,10 +1595,10 @@ pub async fn svc_accept_invite(
     username: &str,
     devicename: &str,
 ) -> ServiceResult<AcceptInviteResponse> {
-    let invite = crate::invite_link::parse_invite_link(invite_link_str)
+    let invite = crate::identity::invite_link::parse_invite_link(invite_link_str)
         .map_err(|e| ServiceError(format!("Invalid invite link: {}", e)))?;
 
-    if invite.kind != crate::invite_link::InviteLinkKind::User {
+    if invite.kind != crate::identity::invite_link::InviteLinkKind::User {
         return Err(ServiceError("Expected a user invite link (quiet://invite/...)".into()));
     }
 
@@ -1611,7 +1611,7 @@ pub async fn svc_accept_invite(
         let db = open_connection(db_path)?;
         create_tables(&db)?;
     }
-    let recorded_by = crate::transport_identity::install_invite_bootstrap_transport_identity(
+    let recorded_by = crate::identity::transport::install_invite_bootstrap_transport_identity(
         db_path,
         &invite_key,
     )
@@ -1619,7 +1619,7 @@ pub async fn svc_accept_invite(
 
     // Bootstrap sync: fetch prerequisite events from inviter
     let bootstrap_addr: std::net::SocketAddr =
-        crate::invite_link::resolve_bootstrap_socket_addr(&invite).map_err(|e| {
+        crate::identity::invite_link::resolve_bootstrap_socket_addr(&invite).map_err(|e| {
             ServiceError(format!(
                 "Invalid bootstrap address '{}': {}",
                 invite.bootstrap_addr, e
@@ -1655,7 +1655,7 @@ pub async fn svc_accept_invite(
     }
 
     // Accept the invite: creates identity chain
-    let join = crate::identity_ops::accept_user_invite(
+    let join = crate::identity::ops::accept_user_invite(
         &db,
         &recorded_by,
         &invite_key,
@@ -1709,7 +1709,7 @@ pub async fn svc_accept_invite(
 
     // Transition transport identity: replace invite-derived cert with
     // PeerShared-derived cert so transport and event-layer identities match.
-    let new_peer_id = crate::transport_identity::install_peer_key_transport_identity(
+    let new_peer_id = crate::identity::transport::install_peer_key_transport_identity(
         &db,
         &join.peer_shared_key,
     )
@@ -1736,10 +1736,10 @@ pub async fn svc_accept_device_link(
     invite_link_str: &str,
     devicename: &str,
 ) -> ServiceResult<AcceptDeviceLinkResponse> {
-    let invite = crate::invite_link::parse_invite_link(invite_link_str)
+    let invite = crate::identity::invite_link::parse_invite_link(invite_link_str)
         .map_err(|e| ServiceError(format!("Invalid invite link: {}", e)))?;
 
-    if invite.kind != crate::invite_link::InviteLinkKind::DeviceLink {
+    if invite.kind != crate::identity::invite_link::InviteLinkKind::DeviceLink {
         return Err(ServiceError("Expected a device link (quiet://link/...)".into()));
     }
 
@@ -1752,7 +1752,7 @@ pub async fn svc_accept_device_link(
         let db = open_connection(db_path)?;
         create_tables(&db)?;
     }
-    let recorded_by = crate::transport_identity::install_invite_bootstrap_transport_identity(
+    let recorded_by = crate::identity::transport::install_invite_bootstrap_transport_identity(
         db_path,
         &invite_key,
     )
@@ -1760,7 +1760,7 @@ pub async fn svc_accept_device_link(
 
     // Bootstrap sync: fetch prerequisite events from inviter
     let bootstrap_addr: std::net::SocketAddr =
-        crate::invite_link::resolve_bootstrap_socket_addr(&invite).map_err(|e| {
+        crate::identity::invite_link::resolve_bootstrap_socket_addr(&invite).map_err(|e| {
             ServiceError(format!(
                 "Invalid bootstrap address '{}': {}",
                 invite.bootstrap_addr, e
@@ -1781,10 +1781,10 @@ pub async fn svc_accept_device_link(
     // Accept the device link: creates identity chain
     let db = open_connection(db_path)?;
     let user_event_id = match invite.invite_type {
-        crate::identity_ops::InviteType::DeviceLink { user_event_id } => user_event_id,
+        crate::identity::ops::InviteType::DeviceLink { user_event_id } => user_event_id,
         _ => return Err(ServiceError("Expected DeviceLink invite type".into())),
     };
-    let link = crate::identity_ops::accept_device_link(
+    let link = crate::identity::ops::accept_device_link(
         &db,
         &recorded_by,
         &invite_key,
@@ -1828,7 +1828,7 @@ pub async fn svc_accept_device_link(
 
     // Transition transport identity: replace invite-derived cert with
     // PeerShared-derived cert so transport and event-layer identities match.
-    let new_peer_id = crate::transport_identity::install_peer_key_transport_identity(
+    let new_peer_id = crate::identity::transport::install_peer_key_transport_identity(
         &db,
         &link.peer_shared_key,
     )

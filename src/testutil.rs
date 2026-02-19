@@ -17,7 +17,7 @@ use crate::event_modules::{
     UserRemovedEvent, PeerRemovedEvent, SecretSharedEvent,
     TransportKeyEvent,
 };
-use crate::transport_identity::{ensure_transport_peer_id, ensure_transport_cert};
+use crate::identity::transport::{ensure_transport_peer_id, ensure_transport_cert};
 use crate::projection::create::{create_event_sync, create_event_staged, create_signed_event_sync, create_signed_event_staged, create_encrypted_event_sync, CreateEventError};
 use crate::projection::apply::project_one;
 use crate::protocol::SyncMessage;
@@ -152,7 +152,7 @@ impl Peer {
 
     /// Bootstrap a full identity chain using the production `bootstrap_workspace` flow.
     fn bootstrap_identity_chain(&mut self) {
-        use crate::identity_ops::bootstrap_workspace;
+        use crate::identity::ops::bootstrap_workspace;
 
         let db = open_connection(&self.db_path).expect("failed to open db");
         let chain = bootstrap_workspace(&db, &self.identity, "test-workspace", "test-user", "test-device")
@@ -171,9 +171,9 @@ impl Peer {
     /// joiner fetches prerequisite events via bootstrap sync, then calls
     /// `accept_user_invite`. No direct DB-to-DB event copying.
     pub async fn new_in_workspace(name: &str, creator: &Peer) -> Self {
-        use crate::identity_ops::create_user_invite;
-        use crate::invite_link::create_invite_link;
-        use crate::transport_identity::expected_invite_bootstrap_spki_from_invite_key;
+        use crate::identity::ops::create_user_invite;
+        use crate::identity::invite_link::create_invite_link;
+        use crate::identity::transport::expected_invite_bootstrap_spki_from_invite_key;
         use crate::db::transport_trust::record_pending_invite_bootstrap_trust;
 
         // Create a bare peer with DB tables but NO transport identity.
@@ -2273,7 +2273,7 @@ impl SharedDbNode {
     /// Add a new tenant that joins an existing tenant's workspace (same DB)
     /// using the production `create_user_invite` + `accept_user_invite` flow.
     pub fn add_tenant_in_workspace(&mut self, name: &str, creator_index: usize) {
-        use crate::identity_ops::{create_user_invite, accept_user_invite};
+        use crate::identity::ops::{create_user_invite, accept_user_invite};
 
         let creator = &self.tenants[creator_index];
         let workspace_id = creator.workspace_id;
