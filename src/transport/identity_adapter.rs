@@ -6,6 +6,7 @@
 //! (service, projection, event_modules) must go through the adapter trait.
 
 use rusqlite::Connection;
+use rusqlite::OptionalExtension;
 
 use crate::contracts::transport_identity_contract::{
     TransportIdentityAdapter, TransportIdentityError, TransportIdentityIntent,
@@ -71,5 +72,3 @@ impl TransportIdentityAdapter for ConcreteTransportIdentityAdapter {
         }
     }
 }
-
-use rusqlite::OptionalExtension;

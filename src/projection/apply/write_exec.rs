@@ -187,7 +187,9 @@ pub(crate) fn execute_emit_commands(
             EmitCommand::ApplyTransportIdentityIntent { intent } => {
                 use crate::contracts::transport_identity_contract::TransportIdentityAdapter;
                 let adapter = crate::transport::identity_adapter::ConcreteTransportIdentityAdapter;
-                let _ = adapter.apply_intent(conn, intent.clone());
+                adapter
+                    .apply_intent(conn, intent.clone())
+                    .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
             }
         }
     }

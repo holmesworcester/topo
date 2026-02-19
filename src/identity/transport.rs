@@ -29,8 +29,8 @@ pub fn load_transport_peer_id(
 /// **random** cert if none exists.
 ///
 /// **Bootstrap-only**: this path generates a throwaway random identity that will be
-/// replaced by a deterministic event-derived identity (via `install_peer_key_transport_identity`
-/// or `install_invite_bootstrap_transport_identity`) during workspace bootstrap or invite
+/// replaced by a deterministic event-derived identity (via the transport identity adapter)
+/// during workspace bootstrap or invite
 /// acceptance. Production code that expects a stable identity should use
 /// `load_transport_peer_id` instead, which fails if no credentials exist rather than
 /// silently generating new ones.
@@ -207,17 +207,6 @@ pub fn expected_invite_bootstrap_spki_from_invite_key(
 /// Install a deterministic transport cert/key derived from the invite signing
 /// key into the database. This makes invitee transport identity predictable
 /// from invite material so inviter-side bootstrap trust can be precomputed.
-pub fn install_invite_bootstrap_transport_identity(
-    db_path: &str,
-    invite_key: &ed25519_dalek::SigningKey,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let conn = crate::db::open_connection(db_path)?;
-    crate::db::schema::create_tables(&conn)?;
-    install_invite_bootstrap_transport_identity_conn(&conn, invite_key)
-}
-
-/// Install a deterministic transport cert/key derived from the invite signing
-/// key into the database. Connection-based variant.
 pub fn install_invite_bootstrap_transport_identity_conn(
     conn: &Connection,
     invite_key: &ed25519_dalek::SigningKey,

@@ -99,6 +99,39 @@ fn concrete_adapter_signer_not_found_error() {
     }
 }
 
+#[test]
+fn concrete_adapter_invalid_key_material_error() {
+    let conn = setup_db();
+    let adapter = ConcreteTransportIdentityAdapter;
+    let recorded_by = "test-peer";
+    let signer_event_id = [11u8; 32];
+    let signer_eid_b64 = topo::crypto::event_id_to_base64(&signer_event_id);
+
+    // Insert a row with wrong key length (16 bytes instead of 32)
+    conn.execute(
+        "INSERT INTO local_signer_material (recorded_by, signer_event_id, signer_kind, private_key, created_at)
+         VALUES (?1, ?2, 3, ?3, 0)",
+        rusqlite::params![recorded_by, signer_eid_b64, vec![0u8; 16]],
+    )
+    .unwrap();
+
+    let result = adapter.apply_intent(
+        &conn,
+        TransportIdentityIntent::InstallPeerSharedIdentityFromSigner {
+            recorded_by: recorded_by.to_string(),
+            signer_event_id,
+        },
+    );
+
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        TransportIdentityError::InvalidKeyMaterial(msg) => {
+            assert!(msg.contains("16"), "should mention actual key length, got: {}", msg);
+        }
+        other => panic!("expected InvalidKeyMaterial, got {:?}", other),
+    }
+}
+
 // --- Fake adapter tests ---
 
 #[test]
