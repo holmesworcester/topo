@@ -1,15 +1,17 @@
 pub mod wire;
 pub mod commands;
 pub mod queries;
+pub mod projector;
 
 // Re-export stable public API so callers import from `event_modules::message`.
-pub use wire::{MessageEvent, parse_message, encode_message, project_pure, MESSAGE_META};
+pub use wire::{MessageEvent, parse_message, encode_message, MESSAGE_META};
 pub use commands::{CreateMessageCmd, create, send_conn};
 pub use queries::{
     MessageRow, query_list, query_count,
     resolve_by_number, resolve_selector,
     messages_conn,
 };
+pub use projector::project_pure;
 
 // --- Response types (moved from service.rs) ---
 
