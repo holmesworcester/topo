@@ -107,7 +107,7 @@ def main() -> int:
     for row in matrix_rows:
         cid = row.get("check_id", "")
         tid = row.get("test_id", "")
-        if cid and tid:
+        if cid and tid and tid != "—":
             check_to_tests[cid].append(tid)
 
     # ── Rule 1: every TLA guard has at least one check_id ──

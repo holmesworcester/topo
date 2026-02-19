@@ -81,7 +81,7 @@ def main() -> int:
         tid = row.get("test_id", "")
         if sid:
             all_spec_ids.add(sid)
-            if tid:
+            if tid and tid != "—":
                 spec_tests[sid].append(tid)
 
     for sid in sorted(all_spec_ids):
@@ -127,11 +127,13 @@ def main() -> int:
             errors.append(f"SPEC_NO_CHECK: {sid} has no check_id mapping")
 
     # ── Rule 5: validate test_ids resolve to real test functions ──
-    src_root = REPO_ROOT / "src"
     real_tests: set[str] = set()
-    for rs_file in src_root.rglob("*.rs"):
-        for m in re.finditer(r'fn\s+(test_\w+)\s*\(', rs_file.read_text()):
-            real_tests.add(m.group(1))
+    for search_dir in [REPO_ROOT / "src", REPO_ROOT / "tests"]:
+        if not search_dir.exists():
+            continue
+        for rs_file in search_dir.rglob("*.rs"):
+            for m in re.finditer(r'fn\s+(test_\w+)\s*\(', rs_file.read_text()):
+                real_tests.add(m.group(1))
     for row in matrix_rows:
         tid = row.get("test_id", "")
         if not tid or tid == "—":
