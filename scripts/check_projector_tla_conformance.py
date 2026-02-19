@@ -127,19 +127,32 @@ def main() -> int:
             errors.append(f"SPEC_NO_CHECK: {sid} has no check_id mapping")
 
     # ── Rule 5: validate test_ids resolve to real test functions ──
-    real_tests: set[str] = set()
-    for search_dir in [REPO_ROOT / "src", REPO_ROOT / "tests"]:
-        if not search_dir.exists():
-            continue
-        for rs_file in search_dir.rglob("*.rs"):
-            for m in re.finditer(r'fn\s+(test_\w+)\s*\(', rs_file.read_text()):
-                real_tests.add(m.group(1))
+    # Use full cargo test paths to avoid ambiguity with duplicate names.
+    import subprocess
+    real_test_paths: set[str] = set()
+    try:
+        out = subprocess.check_output(
+            ["cargo", "test", "--lib", "--", "--list"],
+            cwd=str(REPO_ROOT), text=True, stderr=subprocess.DEVNULL,
+        )
+        for line in out.splitlines():
+            if line.endswith(": test"):
+                real_test_paths.add(line[:-6])  # strip ": test"
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        # Fallback: scan source files for function names
+        for search_dir in [REPO_ROOT / "src", REPO_ROOT / "tests"]:
+            if not search_dir.exists():
+                continue
+            for rs_file in search_dir.rglob("*.rs"):
+                for m in re.finditer(r'fn\s+(test_\w+)\s*\(', rs_file.read_text()):
+                    real_test_paths.add(m.group(1))
+
     for row in matrix_rows:
         tid = row.get("test_id", "")
         if not tid or tid == "—":
             continue
-        fn_name = tid.rsplit("::", 1)[-1] if "::" in tid else tid
-        if fn_name.startswith("test_") and fn_name not in real_tests:
+        # Check if any cargo test path ends with the matrix test_id
+        if not any(p == tid or p.endswith("::" + tid) for p in real_test_paths):
             errors.append(f"STALE_TEST_ID: {tid} does not match any test function")
 
     # ── Report ──

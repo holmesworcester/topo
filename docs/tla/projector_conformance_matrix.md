@@ -12,7 +12,7 @@ both `pass` and `break` polarity unless waived.
 | SPEC_DEPS_01 | InvDeps | CHK_DEP_PRESENCE | pipeline_integration | apply::tests::test_project_reaction_blocked | break |
 | SPEC_DEPS_01 | InvDeps | CHK_DEP_PRESENCE | pipeline_integration | apply::tests::test_multi_dep_event_projects_only_when_all_resolve | break |
 | SPEC_DEPS_02 | InvDeps | CHK_DEP_TYPE | pipeline_integration | apply::tests::test_dep_type_mismatch_rejects | break |
-| SPEC_DEPS_02 | InvDeps | CHK_DEP_TYPE | pipeline_integration | apply::tests::test_signed_memo_valid | pass |
+| SPEC_DEPS_02 | InvDeps | CHK_DEP_TYPE | pipeline_integration | apply::tests::test_project_signed_memo_valid | pass |
 | SPEC_DEPS_03 | InvDeps (cascade) | CHK_CASCADE_UNBLOCK | pipeline_integration | apply::tests::test_project_unblock_cascade | pass |
 | SPEC_DEPS_03 | InvDeps (cascade) | CHK_CASCADE_UNBLOCK | pipeline_integration | apply::tests::test_project_reaction_blocked | break |
 | SPEC_SIGNER_01 | InvSigner | CHK_SIGNER_RESOLVE | pipeline_integration | apply::tests::test_signed_memo_blocks_on_missing_signer | break |
@@ -102,25 +102,25 @@ both `pass` and `break` polarity unless waived.
 | SPEC_FS_IDEMPOTENT_01 | (idempotent) | CHK_FS_IDEMPOTENT | projector_unit | event_modules::file_slice_projector_tests::tests::test_file_slice_valid | break |
 | SPEC_FS_SLOT_01 | (slot uniqueness) | CHK_FS_SLOT_CONFLICT | projector_unit | event_modules::file_slice_projector_tests::tests::test_file_slice_rejects_slot_conflict | break |
 | SPEC_FS_SLOT_01 | (slot uniqueness) | CHK_FS_SLOT_CONFLICT | projector_unit | event_modules::file_slice_projector_tests::tests::test_file_slice_valid | pass |
-| SPEC_ADM_INSERT_01 | InvAdminChain | CHK_ADM_INSERT | projector_unit | event_modules::simple_projector_tests::test_admin_boot_valid | pass |
+| SPEC_ADM_INSERT_01 | InvAdminChain | CHK_ADM_INSERT | projector_unit | event_modules::simple_projector_tests::tests::test_admin_boot_valid | pass |
 | SPEC_ADM_INSERT_01 | InvAdminChain | CHK_ADM_INSERT | pipeline_integration | apply::tests::test_signed_memo_blocks_on_missing_signer | break |
 | SPEC_DI_INSERT_01 | InvDeviceInviteChain | CHK_DI_INSERT | projector_unit | event_modules::device_invite_projector_tests::tests::test_device_invite_first_emits_pending_trust | pass |
 | SPEC_DI_INSERT_01 | InvDeviceInviteChain | CHK_DI_INSERT | pipeline_integration | apply::tests::test_signed_memo_blocks_on_missing_signer | break |
 | SPEC_UI_INSERT_01 | InvUserInviteChain | CHK_UI_INSERT | projector_unit | event_modules::user_invite_projector_tests::tests::test_user_invite_boot_basic_valid | pass |
 | SPEC_UI_INSERT_01 | InvUserInviteChain | CHK_UI_INSERT | pipeline_integration | apply::tests::test_signed_memo_blocks_on_missing_signer | break |
-| SPEC_USR_INSERT_01 | InvDeps | CHK_USR_INSERT | projector_unit | event_modules::simple_projector_tests::test_user_boot_valid | pass |
+| SPEC_USR_INSERT_01 | InvDeps | CHK_USR_INSERT | projector_unit | event_modules::simple_projector_tests::tests::test_user_boot_valid | pass |
 | SPEC_USR_INSERT_01 | InvDeps | CHK_USR_INSERT | pipeline_integration | apply::tests::test_signed_memo_blocks_on_missing_signer | break |
-| SPEC_SK_INSERT_01 | InvEncryptedKey | CHK_SK_INSERT | projector_unit | event_modules::simple_projector_tests::test_secret_key_valid | pass |
+| SPEC_SK_INSERT_01 | InvEncryptedKey | CHK_SK_INSERT | projector_unit | event_modules::simple_projector_tests::tests::test_secret_key_valid | pass |
 | SPEC_SK_INSERT_01 | InvEncryptedKey | CHK_SK_INSERT | pipeline_integration | apply::tests::test_encrypted_blocks_on_missing_key | break |
-| SPEC_TK_INSERT_01 | InvPeerSharedTrustMatchesCarried | CHK_TK_INSERT | projector_unit | event_modules::simple_projector_tests::test_transport_key_valid | pass |
+| SPEC_TK_INSERT_01 | InvPeerSharedTrustMatchesCarried | CHK_TK_INSERT | projector_unit | event_modules::simple_projector_tests::tests::test_transport_key_valid | pass |
 | SPEC_TK_INSERT_01 | InvPeerSharedTrustMatchesCarried | CHK_TK_INSERT | pipeline_integration | apply::tests::test_signed_memo_blocks_on_missing_signer | break |
-| SPEC_SM_INSERT_01 | InvDeps | CHK_SM_INSERT | projector_unit | event_modules::simple_projector_tests::test_signed_memo_valid | pass |
+| SPEC_SM_INSERT_01 | InvDeps | CHK_SM_INSERT | projector_unit | event_modules::simple_projector_tests::tests::test_signed_memo_valid | pass |
 | SPEC_SM_INSERT_01 | InvDeps | CHK_SM_INSERT | pipeline_integration | apply::tests::test_signed_memo_blocks_on_missing_signer | break |
-| SPEC_MA_INSERT_01 | InvDeps | CHK_MA_INSERT | projector_unit | event_modules::simple_projector_tests::test_message_attachment_valid | pass |
+| SPEC_MA_INSERT_01 | InvDeps | CHK_MA_INSERT | projector_unit | event_modules::simple_projector_tests::tests::test_message_attachment_valid | pass |
 | SPEC_MA_INSERT_01 | InvDeps | CHK_MA_INSERT | pipeline_integration | apply::tests::test_signed_memo_blocks_on_missing_signer | break |
-| SPEC_MA_RETRY_01 | InvFileSliceAuth | CHK_MA_RETRY_GUARD | projector_unit | event_modules::simple_projector_tests::test_message_attachment_valid | pass |
+| SPEC_MA_RETRY_01 | InvFileSliceAuth | CHK_MA_RETRY_GUARD | projector_unit | event_modules::simple_projector_tests::tests::test_message_attachment_valid | pass |
 | SPEC_MA_RETRY_01 | InvFileSliceAuth | CHK_MA_RETRY_GUARD | pipeline_integration | apply::tests::test_signed_memo_blocks_on_missing_signer | break |
-| SPEC_BD_NOOP_01 | (benchmark) | CHK_BD_NOOP | projector_unit | event_modules::simple_projector_tests::test_bench_dep_noop | pass |
+| SPEC_BD_NOOP_01 | (benchmark) | CHK_BD_NOOP | projector_unit | event_modules::simple_projector_tests::tests::test_bench_dep_noop | pass |
 | SPEC_BD_NOOP_01 | (benchmark) | CHK_BD_NOOP | pipeline_integration | apply::tests::test_multi_dep_event_projects_only_when_all_resolve | break |
 | SPEC_IA_RETRY_01 | InvWorkspaceAnchor | CHK_IA_RETRY_GUARDS | projector_unit | event_modules::invite_accepted_projector_tests::tests::test_invite_accepted_writes_trust_anchor | pass |
 | SPEC_IA_RETRY_01 | InvWorkspaceAnchor | CHK_IA_RETRY_GUARDS | pipeline_integration | apply::tests::test_invite_accepted_guard_retry_on_workspace | break |

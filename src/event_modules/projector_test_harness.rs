@@ -126,11 +126,22 @@ pub mod fixtures {
     /// Assert that write_ops contain an InsertOrIgnore to the given table.
     pub fn assert_writes_to_table(result: &ProjectorResult, table: &str) {
         assert!(
-            result.write_ops.iter().any(|op| match op {
-                WriteOp::InsertOrIgnore { table: t, .. } => *t == table,
-                WriteOp::Delete { table: t, .. } => *t == table,
-            }),
-            "expected write to table '{}', ops: {:?}",
+            result.write_ops.iter().any(|op| matches!(
+                op, WriteOp::InsertOrIgnore { table: t, .. } if *t == table
+            )),
+            "expected InsertOrIgnore to table '{}', ops: {:?}",
+            table,
+            result.write_ops
+        );
+    }
+
+    /// Assert that write_ops contain a Delete from the given table.
+    pub fn assert_deletes_from_table(result: &ProjectorResult, table: &str) {
+        assert!(
+            result.write_ops.iter().any(|op| matches!(
+                op, WriteOp::Delete { table: t, .. } if *t == table
+            )),
+            "expected Delete from table '{}', ops: {:?}",
             table,
             result.write_ops
         );
