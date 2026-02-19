@@ -702,18 +702,12 @@ pub fn svc_create_workspace(
 
     // Bootstrap new identity chain (creates Workspace + 5 identity events)
     let bootstrap_rb = format!("bootstrap-{}", current_timestamp_ms());
-    let (psf_eid, _peer_shared_key) =
+    let (_psf_eid, _peer_shared_key) =
         ensure_identity_chain(&conn, &bootstrap_rb, workspace_name, username, device_name)?;
-    let adapter = ConcreteTransportIdentityAdapter;
-    let derived = adapter
-        .apply_intent(
-            &conn,
-            TransportIdentityIntent::InstallPeerSharedIdentityFromSigner {
-                recorded_by: bootstrap_rb.clone(),
-                signer_event_id: psf_eid,
-            },
-        )
-        .map_err(|e| ServiceError(format!("install transport identity failed: {}", e)))?;
+    // Transport identity already installed by projection path: emit_local_signer_secret
+    // for PEER_SHARED triggers ApplyTransportIdentityIntent inside ensure_identity_chain.
+    let derived = load_transport_peer_id(&conn)
+        .map_err(|e| ServiceError(format!("load transport peer id failed: {}", e)))?;
     if derived != bootstrap_rb {
         crate::db::migrate_recorded_by(&conn, &bootstrap_rb, &derived)
             .map_err(|e| ServiceError(format!("recorded_by migration failed: {}", e)))?;
@@ -1643,23 +1637,10 @@ pub async fn svc_accept_invite(
         &join.user_key,
     )?;
 
-    // Transition transport identity: replace invite-derived cert with
-    // PeerShared-derived cert so transport and event-layer identities match.
-    let adapter = ConcreteTransportIdentityAdapter;
-    let new_peer_id = adapter
-        .apply_intent(
-            &db,
-            TransportIdentityIntent::InstallPeerSharedIdentityFromSigner {
-                recorded_by: recorded_by.clone(),
-                signer_event_id: join.peer_shared_event_id,
-            },
-        )
-        .map_err(|e| {
-            ServiceError(format!(
-                "Failed to install peer key transport identity: {}",
-                e
-            ))
-        })?;
+    // Transport identity already installed by projection path: the peer_shared
+    // emit_local_signer_secret above triggers ApplyTransportIdentityIntent.
+    let new_peer_id = load_transport_peer_id(&db)
+        .map_err(|e| ServiceError(format!("load transport peer id failed: {}", e)))?;
     crate::db::migrate_recorded_by(&db, &recorded_by, &new_peer_id)?;
 
     Ok(AcceptInviteResponse {
@@ -1786,23 +1767,10 @@ pub async fn svc_accept_device_link(
         &link.peer_shared_key,
     )?;
 
-    // Transition transport identity: replace invite-derived cert with
-    // PeerShared-derived cert so transport and event-layer identities match.
-    let adapter = ConcreteTransportIdentityAdapter;
-    let new_peer_id = adapter
-        .apply_intent(
-            &db,
-            TransportIdentityIntent::InstallPeerSharedIdentityFromSigner {
-                recorded_by: recorded_by.clone(),
-                signer_event_id: link.peer_shared_event_id,
-            },
-        )
-        .map_err(|e| {
-            ServiceError(format!(
-                "Failed to install peer key transport identity: {}",
-                e
-            ))
-        })?;
+    // Transport identity already installed by projection path: the peer_shared
+    // emit_local_signer_secret above triggers ApplyTransportIdentityIntent.
+    let new_peer_id = load_transport_peer_id(&db)
+        .map_err(|e| ServiceError(format!("load transport peer id failed: {}", e)))?;
     crate::db::migrate_recorded_by(&db, &recorded_by, &new_peer_id)?;
 
     Ok(AcceptDeviceLinkResponse {
