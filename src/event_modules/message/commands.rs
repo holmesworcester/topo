@@ -34,7 +34,7 @@ pub fn create(
 }
 
 /// High-level send command: creates a message event and returns a SendResponse.
-pub fn send_conn(
+pub fn send(
     db: &Connection,
     recorded_by: &str,
     signer_eid: &EventId,

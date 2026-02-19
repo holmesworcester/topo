@@ -263,7 +263,7 @@ pub fn create(
     Ok(eid)
 }
 
-pub fn query_deleted_ids(
+pub fn list_deleted_ids(
     db: &Connection,
     recorded_by: &str,
 ) -> Result<Vec<String>, rusqlite::Error> {
@@ -281,7 +281,7 @@ pub fn query_deleted_ids(
 // --- Service-level command helper ---
 
 /// High-level delete command: creates a message_deletion event and returns target hex.
-pub fn delete_message_conn(
+pub fn delete_message(
     db: &Connection,
     recorded_by: &str,
     signer_eid: &EventId,

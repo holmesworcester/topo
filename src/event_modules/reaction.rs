@@ -202,7 +202,7 @@ pub struct ReactionRow {
     pub emoji: String,
 }
 
-pub fn query_list(
+pub fn list_rows(
     db: &Connection,
     recorded_by: &str,
 ) -> Result<Vec<ReactionRow>, rusqlite::Error> {
@@ -220,7 +220,7 @@ pub fn query_list(
     Ok(rows)
 }
 
-pub fn query_for_message(
+pub fn list_for_message(
     db: &Connection,
     recorded_by: &str,
     target_event_id_b64: &str,
@@ -236,7 +236,7 @@ pub fn query_for_message(
     Ok(emojis)
 }
 
-pub fn query_count(
+pub fn count(
     db: &Connection,
     recorded_by: &str,
 ) -> Result<i64, rusqlite::Error> {
@@ -265,7 +265,7 @@ pub struct ReactionItem {
 }
 
 /// High-level react command: creates a reaction event and returns a ReactResponse.
-pub fn react_conn(
+pub fn react(
     db: &Connection,
     recorded_by: &str,
     signer_eid: &EventId,
@@ -291,11 +291,11 @@ pub fn react_conn(
 }
 
 /// Assemble a list of ReactionItems from the database.
-pub fn reactions_conn(
+pub fn list(
     db: &Connection,
     recorded_by: &str,
 ) -> Result<Vec<ReactionItem>, rusqlite::Error> {
-    let rows = query_list(db, recorded_by)?;
+    let rows = list_rows(db, recorded_by)?;
     Ok(rows
         .into_iter()
         .map(|row| ReactionItem {

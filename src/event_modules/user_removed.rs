@@ -138,7 +138,7 @@ pub fn create(
 }
 
 /// High-level remove-user command: creates a UserRemoved event and returns target hex.
-pub fn remove_user_conn(
+pub fn remove_user(
     db: &Connection,
     recorded_by: &str,
     signer_eid: &EventId,

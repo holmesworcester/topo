@@ -10,7 +10,7 @@ pub struct MessageRow {
     pub created_at: i64,
 }
 
-pub fn query_list(
+pub fn list_rows(
     db: &Connection,
     recorded_by: &str,
     limit: usize,
@@ -49,7 +49,7 @@ pub fn query_list(
     Ok(rows)
 }
 
-pub fn query_count(
+pub fn count(
     db: &Connection,
     recorded_by: &str,
 ) -> Result<i64, rusqlite::Error> {
@@ -60,7 +60,7 @@ pub fn query_count(
     )
 }
 
-pub fn resolve_by_number(
+pub fn resolve_number(
     db: &Connection,
     recorded_by: &str,
     num: usize,
@@ -93,14 +93,14 @@ pub fn resolve_by_number(
     }
 }
 
-pub fn resolve_selector(
+pub fn resolve(
     db: &Connection,
     recorded_by: &str,
     selector: &str,
 ) -> Result<EventId, String> {
     let stripped = selector.strip_prefix('#').unwrap_or(selector);
     if let Ok(num) = stripped.parse::<usize>() {
-        resolve_by_number(db, recorded_by, num)
+        resolve_number(db, recorded_by, num)
     } else {
         crypto::event_id_from_hex(selector)
             .ok_or_else(|| format!("invalid hex event ID: {}", selector))
@@ -108,13 +108,13 @@ pub fn resolve_selector(
 }
 
 /// Assemble a MessagesResponse from the database.
-pub fn messages_conn(
+pub fn list(
     db: &Connection,
     recorded_by: &str,
     limit: usize,
 ) -> Result<super::MessagesResponse, rusqlite::Error> {
-    let rows = query_list(db, recorded_by, limit)?;
-    let total = query_count(db, recorded_by)?;
+    let rows = list_rows(db, recorded_by, limit)?;
+    let total = count(db, recorded_by)?;
 
     let messages = rows
         .into_iter()

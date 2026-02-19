@@ -136,7 +136,7 @@ pub struct WorkspaceRow {
     pub workspace_id: String,
 }
 
-pub fn query_list(
+pub fn list(
     db: &Connection,
     recorded_by: &str,
 ) -> Result<Vec<WorkspaceRow>, rusqlite::Error> {

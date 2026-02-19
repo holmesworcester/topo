@@ -108,7 +108,7 @@ pub static TRANSPORT_KEY_META: EventTypeMeta = EventTypeMeta {
 
 use rusqlite::Connection;
 
-pub fn query_count(
+pub fn count(
     db: &Connection,
     recorded_by: &str,
 ) -> Result<i64, rusqlite::Error> {

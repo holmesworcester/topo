@@ -209,7 +209,7 @@ pub struct UserRow {
     pub username: String,
 }
 
-pub fn query_list(
+pub fn list(
     db: &Connection,
     recorded_by: &str,
 ) -> Result<Vec<UserRow>, rusqlite::Error> {
@@ -227,7 +227,7 @@ pub fn query_list(
     Ok(rows)
 }
 
-pub fn query_count(
+pub fn count(
     db: &Connection,
     recorded_by: &str,
 ) -> Result<i64, rusqlite::Error> {

@@ -5,11 +5,11 @@ pub mod projector;
 
 // Re-export stable public API so callers import from `event_modules::message`.
 pub use wire::{MessageEvent, parse_message, encode_message, MESSAGE_META};
-pub use commands::{CreateMessageCmd, create, send_conn};
+pub use commands::{CreateMessageCmd, create, send};
 pub use queries::{
-    MessageRow, query_list, query_count,
-    resolve_by_number, resolve_selector,
-    messages_conn,
+    MessageRow, list_rows, count,
+    resolve_number, resolve,
+    list,
 };
 pub use projector::project_pure;
 
