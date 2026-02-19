@@ -2,6 +2,14 @@
 
 > **Status: Active** — Authoritative implementation plan for all phases.
 
+## 0. POC Compatibility Posture (Explicit)
+
+This project is a POC and prioritizes clarity/simplicity over backward compatibility.
+
+1. Cross-epoch backward compatibility is **not required** by default (wire formats, projected schemas, DB layout, and migrations may change).
+2. If an old DB/protocol epoch is encountered, fail fast with a clear recreate/reset path instead of adding compatibility shims.
+3. Add backward compatibility only when explicitly requested for a specific test objective or transition window.
+
 ## 1. Implementation Order (Authoritative)
 
 This document is ordered exactly as we should build it.
