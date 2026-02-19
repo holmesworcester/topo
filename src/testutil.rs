@@ -110,7 +110,7 @@ fn start_test_sync_endpoint(
     inviter_identity: &str,
     invite_key: &SigningKey,
 ) -> Result<(SocketAddr, quinn::Endpoint), Box<dyn std::error::Error + Send + Sync>> {
-    crate::sync::bootstrap::start_bootstrap_responder(inviter_db_path, inviter_identity, invite_key)
+    crate::protocol::bootstrap::start_bootstrap_responder(inviter_db_path, inviter_identity, invite_key)
 }
 
 impl Peer {

@@ -25,7 +25,7 @@ use tokio::sync::mpsc;
 use topo::contracts::network_contract::{
     ControlIo, DataRecvIo, DataSendIo, SessionIo, SessionIoError, SessionIoParts,
 };
-use topo::sync::{encode_sync_message, parse_sync_message, SyncMessage};
+use topo::protocol::{encode_sync_message, parse_sync_message, SyncMessage};
 
 /// Default max frame size for tests (4 MiB + 5-byte header).
 pub const TEST_MAX_FRAME_SIZE: usize = (4 * 1024 * 1024) + 5;

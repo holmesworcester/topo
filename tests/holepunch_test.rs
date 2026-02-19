@@ -17,9 +17,9 @@ use topo::db::project_queue::ProjectQueue;
 use topo::db::transport_trust::allowed_peers_from_db;
 use topo::projection::apply::project_one;
 use topo::peering::loops::{accept_loop, connect_loop};
-use topo::sync::intro::{run_intro, send_intro_offer, build_intro_offer};
-use topo::sync::punch::spawn_intro_listener;
-use topo::testutil::{Peer, assert_eventually, create_dynamic_endpoint_for_peer, noop_intro_spawner};
+use topo::protocol::intro::{run_intro, send_intro_offer, build_intro_offer};
+use topo::protocol::punch::spawn_intro_listener;
+use topo::testutil::{Peer, assert_eventually, create_dynamic_endpoint_for_peer};
 use topo::transport::{
     AllowedPeers, create_dual_endpoint,
 };

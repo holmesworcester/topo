@@ -12,7 +12,7 @@ use topo::contracts::network_contract::{
     SessionDirection, SessionHandler, SessionIo, SessionIoError,
 };
 use topo::sync::session_handler::ReplicationSessionHandler;
-use topo::sync::SyncMessage;
+use topo::protocol::SyncMessage;
 
 use crate::fake_session_io::{
     create_test_db, empty_negentropy_storage, fake_session_io_pair,
