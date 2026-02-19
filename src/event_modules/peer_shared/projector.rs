@@ -1,8 +1,11 @@
 use super::super::ParsedEvent;
 use crate::crypto::event_id_to_base64;
-use crate::projection::result::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
+use crate::projection::result::{ContextSnapshot, EmitCommand, ProjectorResult, SqlVal, WriteOp};
 
 /// Pure projector: PeerShared (First or Ongoing) → peers_shared table.
+/// Emits SupersedeBootstrapTrust so that bootstrap trust rows matching
+/// this peer's derived SPKI are superseded at projection time rather
+/// than at trust-check read time.
 pub fn project_pure(
     recorded_by: &str,
     event_id_b64: &str,
@@ -27,5 +30,8 @@ pub fn project_pure(
             SqlVal::Text(device_name.to_string()),
         ],
     }];
-    ProjectorResult::valid(ops)
+    let commands = vec![EmitCommand::SupersedeBootstrapTrust {
+        peer_shared_public_key: *public_key,
+    }];
+    ProjectorResult::valid_with_commands(ops, commands)
 }

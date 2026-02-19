@@ -46,8 +46,9 @@ fn event_id_or_blocked(result: Result<EventId, CreateEventError>) -> Result<Even
     }
 }
 
-/// Shared helper: hash blob, write to events/neg_items/recorded_events, project via project_one.
-fn store_blob_and_project(
+/// Shared helper: hash blob, write to events/neg_items/recorded_events (no projection).
+/// Returns the event_id. Callers must invoke `project_stored_event` to trigger projection.
+fn store_blob_only(
     conn: &Connection,
     recorded_by: &str,
     blob: &[u8],
@@ -79,20 +80,40 @@ fn store_blob_and_project(
     insert_recorded_event(conn, recorded_by, &event_id, now_ms, "local_create")
         .map_err(|e| CreateEventError::DbError(e.to_string()))?;
 
-    // Project
-    let decision = project_one(conn, recorded_by, &event_id)
+    Ok(event_id)
+}
+
+/// Project a stored event and return the result.
+fn project_stored_event(
+    conn: &Connection,
+    recorded_by: &str,
+    event_id: &EventId,
+) -> Result<EventId, CreateEventError> {
+    let decision = project_one(conn, recorded_by, event_id)
         .map_err(|e| CreateEventError::DbError(e.to_string()))?;
 
     match decision {
         ProjectionDecision::Valid
-        | ProjectionDecision::AlreadyProcessed => Ok(event_id),
+        | ProjectionDecision::AlreadyProcessed => Ok(*event_id),
         ProjectionDecision::Block { missing } => {
-            Err(CreateEventError::Blocked { event_id, missing })
+            Err(CreateEventError::Blocked { event_id: *event_id, missing })
         }
         ProjectionDecision::Reject { reason } => {
-            Err(CreateEventError::Rejected { event_id, reason })
+            Err(CreateEventError::Rejected { event_id: *event_id, reason })
         }
     }
+}
+
+/// Shared helper: hash blob, write to events/neg_items/recorded_events, project via project_one.
+fn store_blob_and_project(
+    conn: &Connection,
+    recorded_by: &str,
+    blob: &[u8],
+    meta: &events::EventTypeMeta,
+    created_at_ms: i64,
+) -> Result<EventId, CreateEventError> {
+    let event_id = store_blob_only(conn, recorded_by, blob, meta, created_at_ms)?;
+    project_stored_event(conn, recorded_by, &event_id)
 }
 
 /// Create a new event: encode, hash, write to events/neg_items/recorded_events,
@@ -144,6 +165,79 @@ pub fn create_signed_event_sync(
 
     let created_at_ms = event.created_at_ms() as i64;
     store_blob_and_project(conn, recorded_by, &blob, meta, created_at_ms)
+}
+
+/// Store a signed event without projecting. Returns the event_id.
+/// The caller must call `project_event` after writing any required context.
+/// Used when projection depends on context that must be written after
+/// the event_id is known (e.g., bootstrap_context for invite trust).
+pub fn store_signed_event_only(
+    conn: &Connection,
+    recorded_by: &str,
+    event: &ParsedEvent,
+    signing_key: &ed25519_dalek::SigningKey,
+) -> Result<EventId, CreateEventError> {
+    let mut blob = events::encode_event(event)
+        .map_err(|e| CreateEventError::EncodeError(e.to_string()))?;
+
+    let type_code = event.event_type_code();
+    let reg = registry();
+    let meta = reg.lookup(type_code)
+        .ok_or_else(|| CreateEventError::EncodeError(format!("unknown type code {}", type_code)))?;
+
+    if meta.signature_byte_len == 0 {
+        return Err(CreateEventError::EncodeError(
+            "store_signed_event_only called for unsigned type".to_string(),
+        ));
+    }
+
+    let sig_len = meta.signature_byte_len;
+    let blob_len = blob.len();
+    let signing_bytes = &blob[..blob_len - sig_len];
+    let sig = sign_event_bytes(signing_key, signing_bytes);
+    blob[blob_len - sig_len..].copy_from_slice(&sig);
+
+    let created_at_ms = event.created_at_ms() as i64;
+    store_blob_only(conn, recorded_by, &blob, meta, created_at_ms)
+}
+
+/// Store an unsigned event without projecting. Returns the event_id.
+/// The caller must call `project_event` after writing any required context.
+pub fn store_event_only(
+    conn: &Connection,
+    recorded_by: &str,
+    event: &ParsedEvent,
+) -> Result<EventId, CreateEventError> {
+    let blob = events::encode_event(event)
+        .map_err(|e| CreateEventError::EncodeError(e.to_string()))?;
+
+    let type_code = event.event_type_code();
+    let reg = registry();
+    let meta = reg.lookup(type_code)
+        .ok_or_else(|| CreateEventError::EncodeError(format!("unknown type code {}", type_code)))?;
+
+    let created_at_ms = event.created_at_ms() as i64;
+    store_blob_only(conn, recorded_by, &blob, meta, created_at_ms)
+}
+
+/// Project a previously-stored event. Returns event_id on Valid/AlreadyProcessed,
+/// or CreateEventError on Block/Reject.
+pub fn project_event(
+    conn: &Connection,
+    recorded_by: &str,
+    event_id: &EventId,
+) -> Result<EventId, CreateEventError> {
+    project_stored_event(conn, recorded_by, event_id)
+}
+
+/// Project a previously-stored event, tolerating Block results (staged flow).
+/// Returns event_id on Valid, AlreadyProcessed, or Block.
+pub fn project_event_staged(
+    conn: &Connection,
+    recorded_by: &str,
+    event_id: &EventId,
+) -> Result<EventId, CreateEventError> {
+    event_id_or_blocked(project_stored_event(conn, recorded_by, event_id))
 }
 
 /// Create an encrypted event: encode inner event, optionally sign it,

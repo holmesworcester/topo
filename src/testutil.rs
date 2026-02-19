@@ -212,6 +212,7 @@ impl Peer {
             &creator.workspace_id,
             Some(creator_peer_key),
             Some(&creator_peer_eid),
+            None,
         ).expect("failed to create user invite");
 
         // Register pending bootstrap trust so creator's endpoint allows the joiner
@@ -2309,6 +2310,7 @@ impl SharedDbNode {
             &workspace_id,
             Some(&creator_peer_key),
             Some(&creator_peer_eid),
+            None,
         ).expect("failed to create user invite");
 
         // The Workspace and UserInviteBoot events already exist in the shared DB.

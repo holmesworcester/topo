@@ -78,6 +78,49 @@ pub(crate) fn build_context_snapshot(
         _ => {}
     }
 
+    // Local-create flag — needed by invite events to gate pending trust emission.
+    // Only locally-created invite events should emit WritePendingBootstrapTrust.
+    match parsed {
+        ParsedEvent::UserInviteBoot(_)
+        | ParsedEvent::DeviceInviteFirst(_) => {
+            ctx.is_local_create = match conn.query_row(
+                "SELECT source FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, event_id_b64],
+                |row| row.get::<_, String>(0),
+            ) {
+                Ok(source) => source == "local",
+                Err(_) => false,
+            };
+        }
+        _ => {}
+    }
+
+    // Bootstrap context — needed by invite events for trust materialization
+    match parsed {
+        ParsedEvent::UserInviteBoot(_)
+        | ParsedEvent::DeviceInviteFirst(_)
+        | ParsedEvent::InviteAccepted(_) => {
+            // For invite events, event_id IS the invite_event_id.
+            // For InviteAccepted, the invite_event_id is inside the event.
+            let lookup_invite_eid = match parsed {
+                ParsedEvent::InviteAccepted(ia) => {
+                    event_id_to_base64(&ia.invite_event_id)
+                }
+                _ => event_id_b64.to_string(),
+            };
+            if let Some(bc) = crate::db::transport_trust::read_bootstrap_context(
+                conn, recorded_by, &lookup_invite_eid,
+            ).map_err(|e| -> Box<dyn std::error::Error> { e })? {
+                ctx.bootstrap_context = Some(super::super::result::BootstrapContextSnapshot {
+                    workspace_id: bc.workspace_id,
+                    bootstrap_addr: bc.bootstrap_addr,
+                    bootstrap_spki_fingerprint: bc.bootstrap_spki_fingerprint,
+                });
+            }
+        }
+        _ => {}
+    }
+
     // MessageDeletion context — target message author and tombstone state
     if let ParsedEvent::MessageDeletion(del) = parsed {
         ctx.signer_user_mismatch_reason =

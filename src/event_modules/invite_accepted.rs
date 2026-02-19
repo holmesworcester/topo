@@ -78,6 +78,9 @@ use crate::projection::result::{ContextSnapshot, EmitCommand, ProjectorResult, S
 /// Binds directly from InviteAcceptedEvent fields. Uses first-write-wins
 /// (INSERT OR IGNORE) for trust anchor immutability; rejects on mismatch.
 /// Emits RetryWorkspaceGuards command so blocked workspace events can unblock.
+/// When bootstrap_context is available, emits WriteAcceptedBootstrapTrust
+/// so the projection pipeline materializes accepted trust instead of the
+/// service layer.
 pub fn project_pure(
     recorded_by: &str,
     event_id_b64: &str,
@@ -110,7 +113,7 @@ pub fn project_pure(
             values: vec![
                 SqlVal::Text(recorded_by.to_string()),
                 SqlVal::Text(event_id_b64.to_string()),
-                SqlVal::Text(invite_eid_b64),
+                SqlVal::Text(invite_eid_b64.clone()),
                 SqlVal::Text(workspace_id_b64.clone()),
             ],
         },
@@ -120,12 +123,25 @@ pub fn project_pure(
             columns: vec!["peer_id", "workspace_id"],
             values: vec![
                 SqlVal::Text(recorded_by.to_string()),
-                SqlVal::Text(workspace_id_b64),
+                SqlVal::Text(workspace_id_b64.clone()),
             ],
         },
     ];
 
-    ProjectorResult::valid_with_commands(ops, vec![EmitCommand::RetryWorkspaceGuards])
+    let mut commands = vec![EmitCommand::RetryWorkspaceGuards];
+
+    // Emit accepted bootstrap trust when local context exists (joiner side)
+    if let Some(ref bc) = ctx.bootstrap_context {
+        commands.push(EmitCommand::WriteAcceptedBootstrapTrust {
+            invite_accepted_event_id: event_id_b64.to_string(),
+            invite_event_id: invite_eid_b64,
+            workspace_id: workspace_id_b64,
+            bootstrap_addr: bc.bootstrap_addr.clone(),
+            bootstrap_spki_fingerprint: bc.bootstrap_spki_fingerprint,
+        });
+    }
+
+    ProjectorResult::valid_with_commands(ops, commands)
 }
 
 pub static INVITE_ACCEPTED_META: EventTypeMeta = EventTypeMeta {

@@ -553,6 +553,22 @@ static MIGRATIONS: &[Migration] = &[
                 ON deletion_intents(recorded_by, target_id);
         ",
     },
+    Migration {
+        version: 32,
+        name: "add_bootstrap_context",
+        sql: "
+            CREATE TABLE IF NOT EXISTS bootstrap_context (
+                recorded_by TEXT NOT NULL,
+                invite_event_id TEXT NOT NULL,
+                workspace_id TEXT NOT NULL,
+                bootstrap_addr TEXT NOT NULL,
+                bootstrap_spki_fingerprint BLOB NOT NULL,
+                observed_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_bootstrap_context_lookup
+                ON bootstrap_context(recorded_by, invite_event_id, observed_at DESC);
+        ",
+    },
 ];
 
 fn ensure_schema_migrations(conn: &Connection) -> SqliteResult<()> {
@@ -619,6 +635,7 @@ mod tests {
         assert!(tables.contains(&"invite_bootstrap_trust".to_string()));
         assert!(tables.contains(&"pending_invite_bootstrap_trust".to_string()));
         assert!(tables.contains(&"deletion_intents".to_string()));
+        assert!(tables.contains(&"bootstrap_context".to_string()));
         assert!(tables.contains(&"schema_migrations".to_string()));
     }
 
@@ -767,6 +784,6 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(max_version, 31);
+        assert_eq!(max_version, 32);
     }
 }

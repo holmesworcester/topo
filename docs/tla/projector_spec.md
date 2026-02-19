@@ -292,8 +292,8 @@ abstracting over the event graph.
 | TLA+ Invariant | Rust Check |
 |----------------|------------|
 | InvSPKIUniqueness | BLAKE2b-256 collision resistance: no two peers share an SPKI |
-| InvBootstrapConsumedByPeerShared | supersede_accepted_bootstrap_if_steady_trust_exists: bootstrap ∩ PeerShared_SPKIs = {} |
-| InvPendingConsumedByPeerShared | supersede_pending_bootstrap_if_steady_trust_exists: pending ∩ PeerShared_SPKIs = {} |
+| InvBootstrapConsumedByPeerShared | supersede_bootstrap_for_peer_shared (projection-time): bootstrap ∩ PeerShared_SPKIs = {} |
+| InvPendingConsumedByPeerShared | supersede_bootstrap_for_peer_shared (projection-time): pending ∩ PeerShared_SPKIs = {} |
 | InvTrustSetIsExactUnion | allowed_peers_from_db: UNION of PeerShared_SPKIs, invite_bootstrap_trust, pending_invite_bootstrap_trust |
 | InvTrustSourcesWellFormed | All trust table rows contain valid 32-byte SPKI fingerprints |
 | InvMutualAuthSymmetry | Mutual CanAuthenticate requires both peers have active credentials |

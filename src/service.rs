@@ -1066,21 +1066,15 @@ pub fn svc_create_invite_conn(
         db, recorded_by, peer_shared_key, peer_shared_event_id,
     ).map_err(|e| ServiceError(format!("Failed to ensure content key: {}", e)))?;
 
+    let ctx = crate::identity::ops::InviteBootstrapContext {
+        bootstrap_addr,
+        bootstrap_spki,
+    };
     let invite = crate::identity::ops::create_user_invite(
         db, recorded_by, workspace_key, workspace_id,
         Some(peer_shared_key), Some(peer_shared_event_id),
+        Some(&ctx),
     ).map_err(|e| ServiceError(format!("Failed to create invite: {}", e)))?;
-
-    let pending_spki = crate::identity::transport::expected_invite_bootstrap_spki_from_invite_key(
-        &invite.invite_key,
-    ).map_err(|e| ServiceError(format!("Failed to derive invite SPKI: {}", e)))?;
-
-    crate::db::transport_trust::record_pending_invite_bootstrap_trust(
-        db, recorded_by,
-        &event_id_to_base64(&invite.invite_event_id),
-        &event_id_to_base64(workspace_id),
-        &pending_spki,
-    )?;
 
     let invite_link = crate::identity::invite_link::create_invite_link(&invite, bootstrap_addr, bootstrap_spki)
         .map_err(|e| ServiceError(format!("Failed to create invite link: {}", e)))?;
@@ -1101,20 +1095,14 @@ pub fn svc_create_device_link_invite_conn(
     bootstrap_addr: &str,
     bootstrap_spki: &[u8; 32],
 ) -> ServiceResult<CreateInviteResponse> {
+    let ctx = crate::identity::ops::InviteBootstrapContext {
+        bootstrap_addr,
+        bootstrap_spki,
+    };
     let invite = crate::identity::ops::create_device_link_invite(
         db, recorded_by, user_key, user_event_id, workspace_id,
+        Some(&ctx),
     ).map_err(|e| ServiceError(format!("Failed to create device link invite: {}", e)))?;
-
-    let pending_spki = crate::identity::transport::expected_invite_bootstrap_spki_from_invite_key(
-        &invite.invite_key,
-    ).map_err(|e| ServiceError(format!("Failed to derive invite SPKI: {}", e)))?;
-
-    crate::db::transport_trust::record_pending_invite_bootstrap_trust(
-        db, recorded_by,
-        &event_id_to_base64(&invite.invite_event_id),
-        &event_id_to_base64(workspace_id),
-        &pending_spki,
-    )?;
 
     let invite_link = crate::identity::invite_link::create_invite_link(&invite, bootstrap_addr, bootstrap_spki)
         .map_err(|e| ServiceError(format!("Failed to create invite link: {}", e)))?;
@@ -1444,6 +1432,16 @@ pub fn svc_create_invite(
     )
     .map_err(|e| ServiceError(format!("Failed to ensure content key: {}", e)))?;
 
+    // Get local SPKI for the bootstrap address
+    let spki_hex = &recorded_by;
+    let spki_bytes = hex::decode(spki_hex)?;
+    let mut bootstrap_spki = [0u8; 32];
+    bootstrap_spki.copy_from_slice(&spki_bytes);
+
+    let ctx = crate::identity::ops::InviteBootstrapContext {
+        bootstrap_addr,
+        bootstrap_spki: &bootstrap_spki,
+    };
     let invite = crate::identity::ops::create_user_invite(
         &db,
         &recorded_by,
@@ -1451,27 +1449,9 @@ pub fn svc_create_invite(
         &ws_eid,
         Some(&sender_peer_key),
         Some(&sender_peer_eid),
+        Some(&ctx),
     )
     .map_err(|e| ServiceError(format!("Failed to create invite: {}", e)))?;
-
-    // Record pending bootstrap trust so invitee can connect
-    let pending_spki = crate::identity::transport::expected_invite_bootstrap_spki_from_invite_key(
-        &invite.invite_key,
-    )
-    .map_err(|e| ServiceError(format!("Failed to derive invite SPKI: {}", e)))?;
-    crate::db::transport_trust::record_pending_invite_bootstrap_trust(
-        &db,
-        &recorded_by,
-        &event_id_to_base64(&invite.invite_event_id),
-        &event_id_to_base64(&ws_eid),
-        &pending_spki,
-    )?;
-
-    // Get local SPKI for the bootstrap address
-    let spki_hex = &recorded_by;
-    let spki_bytes = hex::decode(spki_hex)?;
-    let mut bootstrap_spki = [0u8; 32];
-    bootstrap_spki.copy_from_slice(&spki_bytes);
 
     let invite_link = crate::identity::invite_link::create_invite_link(&invite, bootstrap_addr, &bootstrap_spki)
         .map_err(|e| ServiceError(format!("Failed to create invite link: {}", e)))?;
@@ -1554,6 +1534,16 @@ pub async fn svc_accept_invite(
         ));
     }
 
+    // Record bootstrap context BEFORE accept so InviteAccepted projection can read it
+    crate::db::transport_trust::append_bootstrap_context(
+        &db,
+        &recorded_by,
+        &event_id_to_base64(&invite_event_id),
+        &event_id_to_base64(&workspace_id),
+        &invite.bootstrap_addr,
+        &invite.bootstrap_spki_fingerprint,
+    )?;
+
     // Accept the invite: creates identity chain
     let join = crate::identity::ops::accept_user_invite(
         &db,
@@ -1570,17 +1560,6 @@ pub async fn svc_accept_invite(
             "Invite acceptance missing wrapped content key material".into(),
         ));
     }
-
-    // Record bootstrap trust
-    crate::db::transport_trust::record_invite_bootstrap_trust(
-        &db,
-        &recorded_by,
-        &event_id_to_base64(&join.invite_accepted_event_id),
-        &event_id_to_base64(&invite_event_id),
-        &event_id_to_base64(&workspace_id),
-        &invite.bootstrap_addr,
-        &invite.bootstrap_spki_fingerprint,
-    )?;
 
     // Persist signer key so future commands can sign events
     let psf_b64 = event_id_to_base64(&join.peer_shared_event_id);
@@ -1684,6 +1663,17 @@ pub async fn svc_accept_device_link(
         crate::identity::ops::InviteType::DeviceLink { user_event_id } => user_event_id,
         _ => return Err(ServiceError("Expected DeviceLink invite type".into())),
     };
+
+    // Record bootstrap context BEFORE accept so InviteAccepted projection can read it
+    crate::db::transport_trust::append_bootstrap_context(
+        &db,
+        &recorded_by,
+        &event_id_to_base64(&invite_event_id),
+        &event_id_to_base64(&workspace_id),
+        &invite.bootstrap_addr,
+        &invite.bootstrap_spki_fingerprint,
+    )?;
+
     let link = crate::identity::ops::accept_device_link(
         &db,
         &recorded_by,
@@ -1694,17 +1684,6 @@ pub async fn svc_accept_device_link(
         devicename,
     )
     .map_err(|e| ServiceError(format!("Failed to accept device link: {}", e)))?;
-
-    // Record bootstrap trust
-    crate::db::transport_trust::record_invite_bootstrap_trust(
-        &db,
-        &recorded_by,
-        &event_id_to_base64(&link.invite_accepted_event_id),
-        &event_id_to_base64(&invite_event_id),
-        &event_id_to_base64(&workspace_id),
-        &invite.bootstrap_addr,
-        &invite.bootstrap_spki_fingerprint,
-    )?;
 
     // Persist signer key
     let psf_b64 = event_id_to_base64(&link.peer_shared_event_id);

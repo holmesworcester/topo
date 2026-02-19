@@ -5,6 +5,7 @@ use crate::crypto::{EventId, event_id_from_base64, event_id_to_base64, hash_even
 use crate::event_modules::*;
 use crate::projection::create::{
     create_event_sync, create_event_staged, create_signed_event_sync, create_signed_event_staged,
+    store_signed_event_only, project_event,
 };
 use crate::projection::encrypted::{wrap_key_for_recipient, unwrap_key_from_sender};
 use crate::projection::signer::{resolve_signer_key, SignerResolution};
@@ -291,6 +292,14 @@ pub fn bootstrap_workspace(
 /// If `sender_peer_shared_key` and `sender_peer_shared_event_id` are provided,
 /// wraps the workspace content key for the invitee's invite public key and
 /// creates a SecretShared event so the joiner can unwrap on acceptance.
+/// Bootstrap context for invite creation. When provided, bootstrap_context
+/// is written between event storage and projection so the projector can
+/// emit trust commands.
+pub struct InviteBootstrapContext<'a> {
+    pub bootstrap_addr: &'a str,
+    pub bootstrap_spki: &'a [u8; 32],
+}
+
 pub fn create_user_invite(
     conn: &Connection,
     recorded_by: &str,
@@ -298,6 +307,7 @@ pub fn create_user_invite(
     workspace_id: &EventId,
     sender_peer_shared_key: Option<&SigningKey>,
     sender_peer_shared_event_id: Option<&EventId>,
+    bootstrap_ctx: Option<&InviteBootstrapContext<'_>>,
 ) -> Result<InviteData, Box<dyn std::error::Error + Send + Sync>> {
     let mut rng = rand::thread_rng();
     let invite_key = SigningKey::generate(&mut rng);
@@ -312,12 +322,23 @@ pub fn create_user_invite(
         signature: [0u8; 64],
     });
 
-    let invite_event_id = create_signed_event_sync(
-        conn,
-        recorded_by,
-        &evt,
-        workspace_key,
-    )?;
+    let invite_event_id = if let Some(ctx) = bootstrap_ctx {
+        // Split flow: store → write context → project
+        let eid = store_signed_event_only(conn, recorded_by, &evt, workspace_key)?;
+        crate::db::transport_trust::append_bootstrap_context(
+            conn,
+            recorded_by,
+            &event_id_to_base64(&eid),
+            &event_id_to_base64(workspace_id),
+            ctx.bootstrap_addr,
+            ctx.bootstrap_spki,
+        )?;
+        project_event(conn, recorded_by, &eid)?;
+        eid
+    } else {
+        // Normal flow: store + project inline (no bootstrap context needed)
+        create_signed_event_sync(conn, recorded_by, &evt, workspace_key)?
+    };
 
     // Wrap content key for invitee if sender has peer_shared identity
     if let (Some(ps_key), Some(ps_eid)) = (sender_peer_shared_key, sender_peer_shared_event_id) {
@@ -444,6 +465,7 @@ pub fn create_device_link_invite(
     user_key: &SigningKey,
     user_event_id: &EventId,
     workspace_id: &EventId,
+    bootstrap_ctx: Option<&InviteBootstrapContext<'_>>,
 ) -> Result<InviteData, Box<dyn std::error::Error + Send + Sync>> {
     let mut rng = rand::thread_rng();
     let device_invite_key = SigningKey::generate(&mut rng);
@@ -457,7 +479,23 @@ pub fn create_device_link_invite(
         signature: [0u8; 64],
     });
 
-    let invite_event_id = create_signed_event_sync(conn, recorded_by, &evt, user_key)?;
+    let invite_event_id = if let Some(ctx) = bootstrap_ctx {
+        // Split flow: store → write context → project
+        let eid = store_signed_event_only(conn, recorded_by, &evt, user_key)?;
+        crate::db::transport_trust::append_bootstrap_context(
+            conn,
+            recorded_by,
+            &event_id_to_base64(&eid),
+            &event_id_to_base64(workspace_id),
+            ctx.bootstrap_addr,
+            ctx.bootstrap_spki,
+        )?;
+        project_event(conn, recorded_by, &eid)?;
+        eid
+    } else {
+        // Normal flow: store + project inline
+        create_signed_event_sync(conn, recorded_by, &evt, user_key)?
+    };
 
     Ok(InviteData {
         invite_event_id,

@@ -122,6 +122,10 @@ pub fn migrate_recorded_by(
         "UPDATE pending_invite_bootstrap_trust SET recorded_by = ?1 WHERE recorded_by = ?2",
         rusqlite::params![new, old],
     )?;
+    tx.execute(
+        "UPDATE bootstrap_context SET recorded_by = ?1 WHERE recorded_by = ?2",
+        rusqlite::params![new, old],
+    )?;
 
     // Pipeline tables (peer_id column)
     for table in &[
@@ -201,6 +205,13 @@ mod tests {
         )
         .unwrap();
 
+        conn.execute(
+            "INSERT INTO bootstrap_context (recorded_by, invite_event_id, workspace_id, bootstrap_addr, bootstrap_spki_fingerprint, observed_at)
+             VALUES (?1, 'inv1', 'ws1', '127.0.0.1:9000', X'0000000000000000000000000000000000000000000000000000000000000000', 1000)",
+            rusqlite::params![old],
+        )
+        .unwrap();
+
         // Run migration
         migrate_recorded_by(&conn, old, new).unwrap();
 
@@ -233,6 +244,16 @@ mod tests {
             )
             .unwrap();
         assert_eq!(ta_pid, new);
+
+        // Verify bootstrap_context.recorded_by updated
+        let bc_rb: String = conn
+            .query_row(
+                "SELECT recorded_by FROM bootstrap_context WHERE invite_event_id = 'inv1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(bc_rb, new);
     }
 
     #[test]

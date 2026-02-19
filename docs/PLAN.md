@@ -225,6 +225,7 @@ Historical reference branches (`poc-7-mtls`, `poc-7=codex-attempt`) are no longe
      - inviter-side pending invite bootstrap rows (`pending_invite_bootstrap_trust`),
      - bootstrap rows are TTL-bounded and consumed when matching steady-state trust appears,
      - not CLI/file pin lists as authority.
+   - **Trust rows are projection-owned state**: `invite_bootstrap_trust` and `pending_invite_bootstrap_trust` rows are produced by projection from invite events + local `bootstrap_context` (an append-only local durable context table). The service layer writes context rows only, not trust rows directly. This follows the poc-6 invite trust cascade precedent where `invite_accepted` projection drives trust-anchor establishment.
    - shorthand model term: `TrustedPeerSet = PeerShared_SPKIs U invite_bootstrap_trust U pending_invite_bootstrap_trust`.
    - trust inputs are not only `invite`/`invite_accepted`; they include the full identity policy graph (for example peer/user/device/admin/removal state).
 4. Done: CLI/profile SPKI allowlist (`--pin-peer`) removed as trust authority.
@@ -504,6 +505,9 @@ enum EmitCommand {
     RetryWorkspaceGuards,
     RetryFileSliceGuards { file_id },
     RecordFileSliceGuardBlock { file_id, event_id },
+    WritePendingBootstrapTrust { invite_event_id, workspace_id, expected_bootstrap_spki_fingerprint },
+    WriteAcceptedBootstrapTrust { invite_accepted_event_id, invite_event_id, workspace_id, bootstrap_addr, bootstrap_spki_fingerprint },
+    SupersedeBootstrapTrust { peer_shared_public_key },
 }
 ```
 
@@ -562,7 +566,7 @@ Deterministic emitted-event exception (still under this rule):
 
 - `message_deletion` uses the two-stage deletion intent + tombstone model (see Phase 10).
 - deterministic emitted-event patterns (for example key material derivations) using the unsigned deterministic exception above.
-- identity-specific exceptions (`invite_accepted` trust-anchor binding via `RetryWorkspaceGuards` command, removal enforcement) implemented via EmitCommand handlers.
+- identity-specific exceptions (`invite_accepted` trust-anchor binding via `RetryWorkspaceGuards` command, removal enforcement, bootstrap trust materialization via `WritePendingBootstrapTrust`/`WriteAcceptedBootstrapTrust` commands, supersession via `SupersedeBootstrapTrust` command) implemented via EmitCommand handlers.
 
 ### Deletion intent + tombstone contract (Phase 10)
 
@@ -1123,10 +1127,11 @@ Required behavior:
 - root `workspace` events are not valid until corresponding trust anchor exists and matches the root id.
 - trust-anchor binding must come from validated projector input fields, not pre-projection capture tables.
 - invites are never force-valid; they validate only through signer/dependency chain.
-- accepted invite links store bootstrap transport trust tuples in SQL:
-  - inviter address from invite link,
-  - inviter SPKI fingerprint for that address,
-  - looked up by sync on each connection/handshake (no in-memory-only trust authority).
+- accepted invite links produce bootstrap transport trust tuples in SQL via projection:
+  - service layer writes local `bootstrap_context` rows (inviter address + SPKI fingerprint from invite link),
+  - invite projectors read `bootstrap_context` and emit `WritePendingBootstrapTrust` / `WriteAcceptedBootstrapTrust` commands,
+  - trust rows are looked up by sync on each connection/handshake (no in-memory-only trust authority).
+  - this follows the same poc-6 cascade pattern where `invite_accepted` projection drives trust-anchor establishment and workspace event unblocking.
 
 Self-invite bootstrap sequence must stay explicit:
 1. create `workspace` event (integrity self-sign only).
@@ -1201,7 +1206,7 @@ Previous gap: TLA models were identity/event-causality models that did not encod
 **What is now modeled** (TransportCredentialLifecycle.tla):
 - Local credential lifecycle: single credential per peer (no rotation/revocation in POC).
 - Three-source trust store: PeerShared-derived SPKIs, invite_bootstrap_trust, pending_invite_bootstrap_trust.
-- Supersession: AddPeerSharedTrust automatically removes matching bootstrap/pending entries.
+- Supersession: PeerShared projector emits `SupersedeBootstrapTrust` command at projection time, which removes matching bootstrap/pending entries. Trust check reads are pure (no write side-effects).
 - TTL expiry of bootstrap trust sources.
 - Trust removal (peer_removed cascading, user_removed transitive denial via `peers_shared.user_event_id`).
 - 6 invariants verified by TLC, mapped to Rust checks in `docs/tla/projector_spec.md`.
