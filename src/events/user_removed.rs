@@ -74,3 +74,33 @@ pub static USER_REMOVED_META: EventTypeMeta = EventTypeMeta {
     parse: parse_user_removed,
     encode: encode_user_removed,
 };
+
+// === Command/Query APIs (event-module locality) ===
+
+use crate::crypto::EventId;
+use crate::projection::create::create_signed_event_sync;
+use ed25519_dalek::SigningKey;
+use rusqlite::Connection;
+
+pub struct CreateUserRemovedCmd {
+    pub target_event_id: [u8; 32],
+}
+
+pub fn create(
+    db: &Connection,
+    recorded_by: &str,
+    signer_eid: &EventId,
+    signing_key: &SigningKey,
+    created_at_ms: u64,
+    cmd: CreateUserRemovedCmd,
+) -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
+    let ur = ParsedEvent::UserRemoved(UserRemovedEvent {
+        created_at_ms,
+        target_event_id: cmd.target_event_id,
+        signed_by: *signer_eid,
+        signer_type: 5,
+        signature: [0u8; 64],
+    });
+    let eid = create_signed_event_sync(db, recorded_by, &ur, signing_key)?;
+    Ok(eid)
+}

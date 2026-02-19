@@ -116,3 +116,88 @@ pub static REACTION_TYPE_META: EventTypeMeta = EventTypeMeta {
     parse: parse_reaction,
     encode: encode_reaction,
 };
+
+// === Command/Query APIs (event-module locality) ===
+
+use crate::crypto::EventId;
+use crate::projection::create::create_signed_event_sync;
+use ed25519_dalek::SigningKey;
+use rusqlite::Connection;
+
+pub struct CreateReactionCmd {
+    pub target_event_id: [u8; 32],
+    pub author_id: [u8; 32],
+    pub emoji: String,
+}
+
+pub fn create(
+    db: &Connection,
+    recorded_by: &str,
+    signer_eid: &EventId,
+    signing_key: &SigningKey,
+    created_at_ms: u64,
+    cmd: CreateReactionCmd,
+) -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
+    let rxn = ParsedEvent::Reaction(ReactionEvent {
+        created_at_ms,
+        target_event_id: cmd.target_event_id,
+        author_id: cmd.author_id,
+        emoji: cmd.emoji,
+        signed_by: *signer_eid,
+        signer_type: 5,
+        signature: [0u8; 64],
+    });
+    let eid = create_signed_event_sync(db, recorded_by, &rxn, signing_key)?;
+    Ok(eid)
+}
+
+pub struct ReactionRow {
+    pub event_id: String,
+    pub target_event_id: String,
+    pub emoji: String,
+}
+
+pub fn query_list(
+    db: &Connection,
+    recorded_by: &str,
+) -> Result<Vec<ReactionRow>, rusqlite::Error> {
+    let mut stmt = db
+        .prepare("SELECT event_id, target_event_id, emoji FROM reactions WHERE recorded_by = ?1")?;
+    let rows = stmt
+        .query_map(rusqlite::params![recorded_by], |row| {
+            Ok(ReactionRow {
+                event_id: row.get(0)?,
+                target_event_id: row.get(1)?,
+                emoji: row.get(2)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+pub fn query_for_message(
+    db: &Connection,
+    recorded_by: &str,
+    target_event_id_b64: &str,
+) -> Result<Vec<String>, rusqlite::Error> {
+    let mut stmt = db.prepare(
+        "SELECT emoji FROM reactions WHERE recorded_by = ?1 AND target_event_id = ?2",
+    )?;
+    let emojis = stmt
+        .query_map(rusqlite::params![recorded_by, target_event_id_b64], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(emojis)
+}
+
+pub fn query_count(
+    db: &Connection,
+    recorded_by: &str,
+) -> Result<i64, rusqlite::Error> {
+    db.query_row(
+        "SELECT COUNT(*) FROM reactions WHERE recorded_by = ?1",
+        rusqlite::params![recorded_by],
+        |row| row.get(0),
+    )
+}

@@ -74,3 +74,18 @@ pub static TRANSPORT_KEY_META: EventTypeMeta = EventTypeMeta {
     parse: parse_transport_key,
     encode: encode_transport_key,
 };
+
+// === Query APIs (event-module locality) ===
+
+use rusqlite::Connection;
+
+pub fn query_count(
+    db: &Connection,
+    recorded_by: &str,
+) -> Result<i64, rusqlite::Error> {
+    db.query_row(
+        "SELECT COUNT(*) FROM transport_keys WHERE recorded_by = ?1",
+        rusqlite::params![recorded_by],
+        |row| row.get(0),
+    )
+}

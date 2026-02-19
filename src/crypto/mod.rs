@@ -33,6 +33,26 @@ pub fn event_id_from_base64(s: &str) -> Option<EventId> {
     Some(id)
 }
 
+/// Parse a hex-encoded event ID into a 32-byte array.
+pub fn event_id_from_hex(hex_str: &str) -> Option<EventId> {
+    let bytes = hex::decode(hex_str).ok()?;
+    if bytes.len() != 32 {
+        return None;
+    }
+    let mut id = [0u8; 32];
+    id.copy_from_slice(&bytes);
+    Some(id)
+}
+
+/// Convert a base64-encoded string to hex. Returns the original string on decode failure.
+pub fn b64_to_hex(b64: &str) -> String {
+    use base64::Engine;
+    match base64::engine::general_purpose::STANDARD.decode(b64) {
+        Ok(bytes) => hex::encode(bytes),
+        Err(_) => b64.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -64,5 +84,32 @@ mod tests {
     fn test_event_id_size() {
         let id = hash_event(b"test");
         assert_eq!(id.len(), 32);
+    }
+
+    #[test]
+    fn test_event_id_from_hex_roundtrip() {
+        let id = hash_event(b"hex test");
+        let hex_str = hex::encode(id);
+        let decoded = event_id_from_hex(&hex_str).unwrap();
+        assert_eq!(id, decoded);
+    }
+
+    #[test]
+    fn test_event_id_from_hex_invalid() {
+        assert!(event_id_from_hex("not-hex").is_none());
+        assert!(event_id_from_hex("aabb").is_none()); // too short
+    }
+
+    #[test]
+    fn test_b64_to_hex() {
+        let id = hash_event(b"b64 test");
+        let b64 = event_id_to_base64(&id);
+        let hex_str = b64_to_hex(&b64);
+        assert_eq!(hex_str, hex::encode(id));
+    }
+
+    #[test]
+    fn test_b64_to_hex_invalid() {
+        assert_eq!(b64_to_hex("not-valid-b64!!!"), "not-valid-b64!!!");
     }
 }

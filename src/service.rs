@@ -16,9 +16,11 @@ use crate::db::{
     transport_trust::is_peer_allowed,
 };
 use crate::events::{
-    DeviceInviteFirstEvent, InviteAcceptedEvent, MessageDeletionEvent, MessageEvent, ParsedEvent,
-    PeerSharedFirstEvent, ReactionEvent, UserBootEvent, UserInviteBootEvent, UserRemovedEvent,
+    DeviceInviteFirstEvent, InviteAcceptedEvent, ParsedEvent,
+    PeerSharedFirstEvent, UserBootEvent, UserInviteBootEvent,
     WorkspaceEvent,
+    message, reaction, message_deletion, user_removed,
+    workspace, user, peer_shared, admin, transport_key,
 };
 use crate::projection::create::{create_event_sync, create_event_staged, create_signed_event_sync};
 use crate::projection::pipeline::project_one;
@@ -360,13 +362,6 @@ pub fn parse_hex_event_id(hex_str: &str) -> ServiceResult<[u8; 32]> {
     Ok(eid)
 }
 
-fn base64_to_hex(b64: &str) -> String {
-    use base64::Engine;
-    match base64::engine::general_purpose::STANDARD.decode(b64) {
-        Ok(bytes) => hex::encode(bytes),
-        Err(_) => b64.to_string(),
-    }
-}
 
 fn ensure_local_signer_tables(
     db: &rusqlite::Connection,
@@ -828,50 +823,18 @@ pub fn svc_node_status(db_path: &str) -> ServiceResult<Vec<NodeTenantItem>> {
 }
 
 pub fn svc_messages_conn(db: &rusqlite::Connection, recorded_by: &str, limit: usize) -> ServiceResult<MessagesResponse> {
-    let limit_clause = if limit > 0 {
-        format!("LIMIT {}", limit)
-    } else {
-        String::new()
-    };
-
-    let query = format!(
-        "SELECT m.message_id, m.author_id, m.content, m.created_at,
-                COALESCE(u.username, '') as author_name
-         FROM messages m
-         LEFT JOIN users u ON m.author_id = u.event_id AND m.recorded_by = u.recorded_by
-         WHERE m.recorded_by = ?1
-         ORDER BY m.created_at ASC, m.rowid ASC {}",
-        limit_clause
-    );
-
-    let mut stmt = db.prepare(&query)?;
-    let rows: Vec<(String, String, String, i64, String)> = stmt
-        .query_map(rusqlite::params![recorded_by], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, String>(4)?,
-            ))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let total: i64 = db.query_row(
-        "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
-        rusqlite::params![recorded_by],
-        |row| row.get(0),
-    )?;
+    let rows = message::query_list(db, recorded_by, limit)?;
+    let total = message::query_count(db, recorded_by)?;
 
     let messages = rows
         .into_iter()
-        .map(|(msg_id_b64, author_id, content, created_at, author_name)| MessageItem {
-            id: base64_to_hex(&msg_id_b64),
-            id_b64: msg_id_b64,
-            author_id,
-            author_name,
-            content,
-            created_at,
+        .map(|row| MessageItem {
+            id: row.message_id_hex,
+            id_b64: row.message_id_b64,
+            author_id: row.author_id,
+            author_name: row.author_name,
+            content: row.content,
+            created_at: row.created_at,
         })
         .collect();
 
@@ -892,17 +855,14 @@ pub fn svc_send_conn(
     author_id: [u8; 32],
     content: &str,
 ) -> ServiceResult<SendResponse> {
-    let msg = ParsedEvent::Message(MessageEvent {
-        created_at_ms: current_timestamp_ms(),
-        workspace_id,
-        author_id,
-        content: content.to_string(),
-        signed_by: *signer_eid,
-        signer_type: 5,
-        signature: [0u8; 64],
-    });
-    let eid = create_signed_event_sync(db, recorded_by, &msg, signing_key)
-        .map_err(|e| ServiceError(format!("{}", e)))?;
+    let eid = message::create(
+        db, recorded_by, signer_eid, signing_key, current_timestamp_ms(),
+        message::CreateMessageCmd {
+            workspace_id,
+            author_id,
+            content: content.to_string(),
+        },
+    ).map_err(|e| ServiceError(format!("{}", e)))?;
 
     Ok(SendResponse {
         content: content.to_string(),
@@ -929,20 +889,8 @@ pub fn svc_status_conn(db: &rusqlite::Connection, recorded_by: &str) -> ServiceR
     let events_count: i64 = db
         .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
         .unwrap_or(0);
-    let messages_count: i64 = db
-        .query_row(
-            "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
-            rusqlite::params![recorded_by],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-    let reactions_count: i64 = db
-        .query_row(
-            "SELECT COUNT(*) FROM reactions WHERE recorded_by = ?1",
-            rusqlite::params![recorded_by],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
+    let messages_count = message::query_count(db, recorded_by).unwrap_or(0);
+    let reactions_count = reaction::query_count(db, recorded_by).unwrap_or(0);
     let neg_items_count: i64 = db
         .query_row("SELECT COUNT(*) FROM neg_items", [], |row| row.get(0))
         .unwrap_or(0);
@@ -981,17 +929,14 @@ pub fn svc_generate_for_peer(
 
     db.execute("BEGIN", [])?;
     for i in 0..count {
-        let msg = ParsedEvent::Message(MessageEvent {
-            created_at_ms: current_timestamp_ms(),
-            workspace_id,
-            author_id,
-            content: format!("Message {}", i),
-            signed_by: signer_eid,
-            signer_type: 5,
-            signature: [0u8; 64],
-        });
-        create_signed_event_sync(&db, &recorded_by, &msg, &signing_key)
-            .map_err(|e| ServiceError(format!("create event error: {}", e)))?;
+        message::create(
+            &db, &recorded_by, &signer_eid, &signing_key, current_timestamp_ms(),
+            message::CreateMessageCmd {
+                workspace_id,
+                author_id,
+                content: format!("Message {}", i),
+            },
+        ).map_err(|e| ServiceError(format!("create event error: {}", e)))?;
     }
     db.execute("COMMIT", [])?;
 
@@ -1065,17 +1010,14 @@ pub fn svc_react_conn(
     target_event_id: [u8; 32],
     emoji: &str,
 ) -> ServiceResult<ReactResponse> {
-    let rxn = ParsedEvent::Reaction(ReactionEvent {
-        created_at_ms: current_timestamp_ms(),
-        target_event_id,
-        author_id,
-        emoji: emoji.to_string(),
-        signed_by: *signer_eid,
-        signer_type: 5,
-        signature: [0u8; 64],
-    });
-    let eid = create_signed_event_sync(db, recorded_by, &rxn, signing_key)
-        .map_err(|e| ServiceError(format!("{}", e)))?;
+    let eid = reaction::create(
+        db, recorded_by, signer_eid, signing_key, current_timestamp_ms(),
+        reaction::CreateReactionCmd {
+            target_event_id,
+            author_id,
+            emoji: emoji.to_string(),
+        },
+    ).map_err(|e| ServiceError(format!("{}", e)))?;
 
     Ok(ReactResponse {
         emoji: emoji.to_string(),
@@ -1092,7 +1034,8 @@ pub fn svc_react_for_peer(
     let (recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
 
     let (signer_eid, signing_key) = require_local_peer_signer(&db, &recorded_by)?;
-    let target_event_id = resolve_message_selector(&db, &recorded_by, target_hex)?;
+    let target_event_id = message::resolve_selector(&db, &recorded_by, target_hex)
+        .map_err(ServiceError)?;
     let author_id = resolve_user_event_id_for_signer(&db, &recorded_by, &signer_eid)?;
 
     svc_react_conn(&db, &recorded_by, &signer_eid, &signing_key, author_id, target_event_id, emoji)
@@ -1106,16 +1049,13 @@ pub fn svc_delete_message_conn(
     author_id: [u8; 32],
     target_event_id: [u8; 32],
 ) -> ServiceResult<DeleteResponse> {
-    let del = ParsedEvent::MessageDeletion(MessageDeletionEvent {
-        created_at_ms: current_timestamp_ms(),
-        target_event_id,
-        author_id,
-        signed_by: *signer_eid,
-        signer_type: 5,
-        signature: [0u8; 64],
-    });
-    create_signed_event_sync(db, recorded_by, &del, signing_key)
-        .map_err(|e| ServiceError(format!("{}", e)))?;
+    message_deletion::create(
+        db, recorded_by, signer_eid, signing_key, current_timestamp_ms(),
+        message_deletion::CreateMessageDeletionCmd {
+            target_event_id,
+            author_id,
+        },
+    ).map_err(|e| ServiceError(format!("{}", e)))?;
 
     Ok(DeleteResponse {
         target: hex::encode(target_event_id),
@@ -1130,71 +1070,33 @@ pub fn svc_delete_message_for_peer(
     let (recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
 
     let (signer_eid, signing_key) = require_local_peer_signer(&db, &recorded_by)?;
-    let target_event_id = resolve_message_selector(&db, &recorded_by, target_hex)?;
+    let target_event_id = message::resolve_selector(&db, &recorded_by, target_hex)
+        .map_err(ServiceError)?;
     let author_id = resolve_user_event_id_for_signer(&db, &recorded_by, &signer_eid)?;
 
     svc_delete_message_conn(&db, &recorded_by, &signer_eid, &signing_key, author_id, target_event_id)
 }
 
 /// Resolve a message selector: `N`, `#N` (1-based message number), or raw hex event ID.
+/// Thin wrapper over message::resolve_selector for test compatibility.
+#[cfg(test)]
 fn resolve_message_selector(
     db: &rusqlite::Connection,
     recorded_by: &str,
     selector: &str,
 ) -> ServiceResult<[u8; 32]> {
-    let stripped = selector.strip_prefix('#').unwrap_or(selector);
-    if let Ok(num) = stripped.parse::<usize>() {
-        if num == 0 {
-            return Err(ServiceError("message number must be >= 1".into()));
-        }
-        // Query messages in same order as svc_messages_conn, pick the N-th (1-based).
-        let mut stmt = db.prepare(
-            "SELECT message_id FROM messages WHERE recorded_by = ?1 ORDER BY created_at ASC, rowid ASC LIMIT 1 OFFSET ?2"
-        )?;
-        let msg_id_b64: Option<String> = stmt
-            .query_row(rusqlite::params![recorded_by, num - 1], |row| row.get(0))
-            .ok();
-        match msg_id_b64 {
-            Some(b64) => {
-                let hex_id = base64_to_hex(&b64);
-                parse_hex_event_id(&hex_id)
-            }
-            None => {
-                let total: i64 = db.query_row(
-                    "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
-                    rusqlite::params![recorded_by],
-                    |row| row.get(0),
-                )?;
-                Err(ServiceError(format!(
-                    "invalid message number {}; available: 1-{}",
-                    num, total
-                )))
-            }
-        }
-    } else {
-        parse_hex_event_id(selector)
-    }
+    message::resolve_selector(db, recorded_by, selector)
+        .map_err(ServiceError)
 }
 
 pub fn svc_reactions_conn(db: &rusqlite::Connection, recorded_by: &str) -> ServiceResult<Vec<ReactionItem>> {
-    let mut stmt = db
-        .prepare("SELECT event_id, target_event_id, emoji FROM reactions WHERE recorded_by = ?1")?;
-    let rows: Vec<(String, String, String)> = stmt
-        .query_map(rusqlite::params![recorded_by], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-
+    let rows = reaction::query_list(db, recorded_by)?;
     Ok(rows
         .into_iter()
-        .map(|(event_id, target_event_id, emoji)| ReactionItem {
-            event_id,
-            target_event_id,
-            emoji,
+        .map(|row| ReactionItem {
+            event_id: row.event_id,
+            target_event_id: row.target_event_id,
+            emoji: row.emoji,
         })
         .collect())
 }
@@ -1210,15 +1112,7 @@ pub fn svc_reactions_for_message_conn(
     recorded_by: &str,
     target_event_id_b64: &str,
 ) -> ServiceResult<Vec<String>> {
-    let mut stmt = db.prepare(
-        "SELECT emoji FROM reactions WHERE recorded_by = ?1 AND target_event_id = ?2",
-    )?;
-    let emojis: Vec<String> = stmt
-        .query_map(rusqlite::params![recorded_by, target_event_id_b64], |row| {
-            row.get::<_, String>(0)
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(emojis)
+    Ok(reaction::query_for_message(db, recorded_by, target_event_id_b64)?)
 }
 
 /// Return base64 event IDs of deleted messages for a tenant.
@@ -1226,15 +1120,7 @@ pub fn svc_deleted_message_ids_conn(
     db: &rusqlite::Connection,
     recorded_by: &str,
 ) -> ServiceResult<Vec<String>> {
-    let mut stmt = db.prepare(
-        "SELECT message_id FROM deleted_messages WHERE recorded_by = ?1",
-    )?;
-    let ids: Vec<String> = stmt
-        .query_map(rusqlite::params![recorded_by], |row| {
-            row.get::<_, String>(0)
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(ids)
+    Ok(message_deletion::query_deleted_ids(db, recorded_by)?)
 }
 
 /// Resolve a 1-based message number to its event ID.
@@ -1243,24 +1129,8 @@ pub fn svc_message_event_id_by_num_conn(
     recorded_by: &str,
     msg_num: usize,
 ) -> ServiceResult<crate::crypto::EventId> {
-    let mut stmt = db.prepare(
-        "SELECT message_id FROM messages WHERE recorded_by = ?1 ORDER BY created_at ASC, rowid ASC",
-    )?;
-    let ids: Vec<String> = stmt
-        .query_map(rusqlite::params![recorded_by], |row| {
-            row.get::<_, String>(0)
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-
-    if msg_num == 0 || msg_num > ids.len() {
-        return Err(ServiceError(format!(
-            "Invalid message number {}. Available: 1-{}",
-            msg_num, ids.len()
-        )));
-    }
-
-    crate::crypto::event_id_from_base64(&ids[msg_num - 1])
-        .ok_or_else(|| ServiceError(format!("Invalid event ID for message {}", msg_num)))
+    message::resolve_by_number(db, recorded_by, msg_num)
+        .map_err(ServiceError)
 }
 
 /// Remove a user by creating a UserRemoved event.
@@ -1271,15 +1141,10 @@ pub fn svc_remove_user_conn(
     signing_key: &SigningKey,
     target_event_id: crate::crypto::EventId,
 ) -> ServiceResult<DeleteResponse> {
-    let ur = ParsedEvent::UserRemoved(UserRemovedEvent {
-        created_at_ms: current_timestamp_ms(),
-        target_event_id,
-        signed_by: *signer_eid,
-        signer_type: 5,
-        signature: [0u8; 64],
-    });
-    create_signed_event_sync(db, recorded_by, &ur, signing_key)
-        .map_err(|e| ServiceError(format!("{}", e)))?;
+    user_removed::create(
+        db, recorded_by, signer_eid, signing_key, current_timestamp_ms(),
+        user_removed::CreateUserRemovedCmd { target_event_id },
+    ).map_err(|e| ServiceError(format!("{}", e)))?;
 
     Ok(DeleteResponse {
         target: hex::encode(target_event_id),
@@ -1361,18 +1226,10 @@ pub fn svc_create_device_link_invite_conn(
 }
 
 pub fn svc_users_conn(db: &rusqlite::Connection, recorded_by: &str) -> ServiceResult<Vec<UserItem>> {
-    let mut stmt = db.prepare(
-        "SELECT event_id, COALESCE(username, '') FROM users WHERE recorded_by = ?1"
-    )?;
-    let users: Vec<(String, String)> = stmt
-        .query_map(rusqlite::params![recorded_by], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-
-    Ok(users
+    let rows = user::query_list(db, recorded_by)?;
+    Ok(rows
         .into_iter()
-        .map(|(event_id, username)| UserItem { event_id, username })
+        .map(|row| UserItem { event_id: row.event_id, username: row.username })
         .collect())
 }
 
@@ -1481,46 +1338,20 @@ pub fn svc_view_for_peer(db_path: &str, peer_id: &str, limit: usize) -> ServiceR
 }
 
 pub fn svc_keys_conn(db: &rusqlite::Connection, recorded_by: &str, summary: bool) -> ServiceResult<KeysResponse> {
-    let user_count: i64 = db
-        .query_row(
-            "SELECT COUNT(*) FROM users WHERE recorded_by = ?1",
-            rusqlite::params![recorded_by],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-    let peer_count: i64 = db
-        .query_row(
-            "SELECT COUNT(*) FROM peers_shared WHERE recorded_by = ?1",
-            rusqlite::params![recorded_by],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-    let admin_count: i64 = db
-        .query_row(
-            "SELECT COUNT(*) FROM admins WHERE recorded_by = ?1",
-            rusqlite::params![recorded_by],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-    let transport_count: i64 = db
-        .query_row(
-            "SELECT COUNT(*) FROM transport_keys WHERE recorded_by = ?1",
-            rusqlite::params![recorded_by],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
+    let user_count = user::query_list(db, recorded_by).map(|v| v.len() as i64).unwrap_or(0);
+    let peer_count = peer_shared::query_count(db, recorded_by).unwrap_or(0);
+    let admin_count = admin::query_count(db, recorded_by).unwrap_or(0);
+    let transport_count = transport_key::query_count(db, recorded_by).unwrap_or(0);
 
     let mut users = Vec::new();
     let mut peers = Vec::new();
     let mut admins = Vec::new();
 
     if !summary {
-        let mut stmt = db.prepare("SELECT event_id FROM users WHERE recorded_by = ?1")?;
-        users = stmt
-            .query_map(rusqlite::params![recorded_by], |row| {
-                row.get::<_, String>(0)
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+        users = user::query_list(db, recorded_by)?
+            .into_iter()
+            .map(|row| row.event_id)
+            .collect();
 
         let mut stmt = db.prepare("SELECT event_id FROM peers_shared WHERE recorded_by = ?1")?;
         peers = stmt
@@ -1554,29 +1385,23 @@ pub fn svc_keys(db_path: &str, summary: bool) -> ServiceResult<KeysResponse> {
 }
 
 pub fn svc_workspaces_conn(db: &rusqlite::Connection, recorded_by: &str) -> ServiceResult<Vec<WorkspaceItem>> {
-    let mut stmt =
-        db.prepare("SELECT event_id, workspace_id FROM workspaces WHERE recorded_by = ?1")?;
-    let workspaces: Vec<(String, String)> = stmt
-        .query_map(rusqlite::params![recorded_by], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+    let rows = workspace::query_list(db, recorded_by)?;
 
     use base64::Engine;
-    Ok(workspaces
+    Ok(rows
         .into_iter()
-        .map(|(eid, ws_id_b64)| {
+        .map(|row| {
             let name =
-                if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&ws_id_b64) {
+                if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&row.workspace_id) {
                     String::from_utf8_lossy(&bytes)
                         .trim_end_matches('\0')
                         .to_string()
                 } else {
-                    ws_id_b64.clone()
+                    row.workspace_id.clone()
                 };
             WorkspaceItem {
-                event_id: eid,
-                workspace_id: ws_id_b64,
+                event_id: row.event_id,
+                workspace_id: row.workspace_id,
                 name,
             }
         })

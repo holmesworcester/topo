@@ -623,3 +623,17 @@ Acceptance:
 1. Realism suites do not rely on `import_cli_pins_to_sql` for baseline connectivity.
 2. Remaining pin-import tests are explicitly scope-labeled as policy-boundary tests.
 3. Documentation reflects the boundary clearly.
+
+---
+
+## Event-module locality follow-up
+
+Items deferred from the Option 1+2 event-locality refactor:
+
+1. **Projector entry points**: Each event module could own its projector dispatch case (currently in `src/projection/projectors.rs`). Deferred because it requires deeper refactoring of the projection pipeline.
+
+2. **Remaining inline SQL in query_field**: The `query_field` function in service.rs still has inline SQL for `message_count` and `reaction_count` fields (used by the assert system). These could delegate to `message::query_count` / `reaction::query_count` but were left as-is since `query_field` is a cross-cutting concern (assert predicates), not event-specific.
+
+3. **Event module list queries for peers/admins**: `svc_keys_conn` still uses inline SQL for the detailed (non-summary) peers and admins lists. Adding `query_list` to `peer_shared` and `admin` modules would complete the migration.
+
+4. **Encrypted event dispatch**: The `dispatch.rs` `EventCommand` enum currently covers only the four signed content event types (message, reaction, message_deletion, user_removed). Encrypted event creation follows a different path through `create_encrypted_event_sync` and was left out of scope.

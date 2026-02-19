@@ -77,3 +77,29 @@ pub static WORKSPACE_META: EventTypeMeta = EventTypeMeta {
     parse: parse_workspace,
     encode: encode_workspace,
 };
+
+// === Query APIs (event-module locality) ===
+
+use rusqlite::Connection;
+
+pub struct WorkspaceRow {
+    pub event_id: String,
+    pub workspace_id: String,
+}
+
+pub fn query_list(
+    db: &Connection,
+    recorded_by: &str,
+) -> Result<Vec<WorkspaceRow>, rusqlite::Error> {
+    let mut stmt =
+        db.prepare("SELECT event_id, workspace_id FROM workspaces WHERE recorded_by = ?1")?;
+    let rows = stmt
+        .query_map(rusqlite::params![recorded_by], |row| {
+            Ok(WorkspaceRow {
+                event_id: row.get(0)?,
+                workspace_id: row.get(1)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}

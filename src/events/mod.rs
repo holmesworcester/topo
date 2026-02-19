@@ -1,6 +1,7 @@
 pub mod admin;
 pub mod bench_dep;
 pub mod device_invite;
+pub mod dispatch;
 pub mod encrypted;
 pub mod file_slice;
 pub mod fixed_layout;

@@ -969,3 +969,34 @@ After completing all phases in `PLAN.md`, the system is:
 6. trust-anchor and identity behavior grounded in TLA guard mappings.
 
 The result is a small protocol core with clear upgrade paths instead of a stack of exceptions.
+
+# 14. Event-Module Locality
+
+## 14.1 Layering convention
+
+Event modules (`src/events/*.rs`) own three concerns:
+
+1. **Schema** — struct definition, parse/encode, wire layout, `EventTypeMeta`.
+2. **Command helpers** — `CreateXxxCmd` struct + `create()` function that builds the `ParsedEvent`, calls `create_signed_event_sync`, and returns `EventId`.
+3. **Query helpers** — `query_list()`, `query_count()`, `resolve_by_number()`, etc. — SQL against projection tables scoped by `recorded_by`.
+
+The service layer (`src/service.rs`) is a thin orchestrator that handles:
+
+- DB open/close and connection management
+- Auth (key loading, `require_local_peer_signer`)
+- Response type definitions and shaping (`MessageItem`, `MessagesResponse`, etc.)
+- Non-event-specific logic (identity bootstrap, invite flows, predicate/assert system)
+
+## 14.2 Typed command dispatch
+
+`src/events/dispatch.rs` provides an `EventCommand` enum and `execute_command()` function that routes creation to the appropriate event module. This enables callers that want a single entry point for event creation without depending on specific event module APIs.
+
+## 14.3 Adding a new event type
+
+When adding a new event type that has service-layer commands or queries:
+
+1. Define the event struct, parse/encode, and `EventTypeMeta` in `src/events/<type>.rs`.
+2. Add `CreateXxxCmd` + `create()` for command paths.
+3. Add `query_*()` functions for any projection-table queries.
+4. Add an `EventCommand` variant to `dispatch.rs` if the type participates in command dispatch.
+5. Wire service.rs to call the event module functions, shaping results into response types.

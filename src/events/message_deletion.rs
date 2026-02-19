@@ -96,3 +96,50 @@ pub static MESSAGE_DELETION_META: EventTypeMeta = EventTypeMeta {
     parse: parse_message_deletion,
     encode: encode_message_deletion,
 };
+
+// === Command/Query APIs (event-module locality) ===
+
+use crate::crypto::EventId;
+use crate::projection::create::create_signed_event_sync;
+use ed25519_dalek::SigningKey;
+use rusqlite::Connection;
+
+pub struct CreateMessageDeletionCmd {
+    pub target_event_id: [u8; 32],
+    pub author_id: [u8; 32],
+}
+
+pub fn create(
+    db: &Connection,
+    recorded_by: &str,
+    signer_eid: &EventId,
+    signing_key: &SigningKey,
+    created_at_ms: u64,
+    cmd: CreateMessageDeletionCmd,
+) -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
+    let del = ParsedEvent::MessageDeletion(MessageDeletionEvent {
+        created_at_ms,
+        target_event_id: cmd.target_event_id,
+        author_id: cmd.author_id,
+        signed_by: *signer_eid,
+        signer_type: 5,
+        signature: [0u8; 64],
+    });
+    let eid = create_signed_event_sync(db, recorded_by, &del, signing_key)?;
+    Ok(eid)
+}
+
+pub fn query_deleted_ids(
+    db: &Connection,
+    recorded_by: &str,
+) -> Result<Vec<String>, rusqlite::Error> {
+    let mut stmt = db.prepare(
+        "SELECT message_id FROM deleted_messages WHERE recorded_by = ?1",
+    )?;
+    let ids = stmt
+        .query_map(rusqlite::params![recorded_by], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ids)
+}

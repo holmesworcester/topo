@@ -2219,3 +2219,52 @@ Goal: establish a test suite where successful P2P bootstrap and sync cannot be f
 3. Reason for inclusion anyway: it reduces manual router/NAT setup friction during realism testing and makes invite bootstrap trials faster to run.
 4. Current behavior is intentionally best-effort/manual (`topo upnp`); there is no long-running lease-refresh manager in daemon scope.
 5. Expected limitation: some networks (for example CGNAT or non-UPnP routers) still require manual bootstrap endpoints even with this feature.
+
+## 19. Event-module locality (Option 1+2)
+
+### 19.1 Motivation
+
+`service.rs` previously embedded event-specific SQL queries and event construction logic for all event types. This scattered event-specific concerns: message SQL lived far from `MessageEvent` schema, reaction queries were disconnected from `ReactionEvent`, etc.
+
+### 19.2 Approach
+
+Moved event-specific command (create) and query helpers into event-owned modules, making `service.rs` a thin orchestrator that handles DB context, auth, and response shaping.
+
+**Event modules gained:**
+- `CreateXxxCmd` structs — input params for creating events
+- `create()` — builds `ParsedEvent`, calls `create_signed_event_sync`, returns `EventId`
+- `query_list()`, `query_count()`, `resolve_by_number()`, `resolve_selector()` — SQL against projection tables
+
+**New dispatch layer:**
+- `src/events/dispatch.rs` — `EventCommand` enum + `execute_command()` for typed command routing
+
+**Shared utilities added to `src/crypto/mod.rs`:**
+- `event_id_from_hex()` — parse hex event ID
+- `b64_to_hex()` — base64 to hex conversion
+
+### 19.3 Service.rs conversions
+
+| Old service.rs function | Now delegates to |
+|---|---|
+| `svc_send_conn` event construction | `message::create` |
+| `svc_messages_conn` SQL | `message::query_list` + `message::query_count` |
+| `svc_react_conn` event construction | `reaction::create` |
+| `svc_reactions_conn` SQL | `reaction::query_list` |
+| `svc_reactions_for_message_conn` SQL | `reaction::query_for_message` |
+| `svc_delete_message_conn` event construction | `message_deletion::create` |
+| `svc_deleted_message_ids_conn` SQL | `message_deletion::query_deleted_ids` |
+| `svc_remove_user_conn` event construction | `user_removed::create` |
+| `svc_message_event_id_by_num_conn` SQL | `message::resolve_by_number` |
+| `resolve_message_selector` SQL | `message::resolve_selector` |
+| `svc_status_conn` message/reaction counts | `message::query_count` + `reaction::query_count` |
+| `svc_users_conn` SQL | `user::query_list` |
+| `svc_keys_conn` counts | `peer_shared::query_count` + `admin::query_count` + `transport_key::query_count` |
+| `svc_workspaces_conn` SQL | `workspace::query_list` |
+
+### 19.4 What service.rs retains
+
+- DB open/close (`open_db_load`, `open_db_for_peer`)
+- Auth (key loading, `require_local_peer_signer`)
+- Response type definitions and shaping
+- Identity bootstrap, invite flows, predicate/assert system
+- Service-level helpers (`current_timestamp_ms`, `stable_author_id`, `parse_workspace_hex`)

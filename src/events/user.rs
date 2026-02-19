@@ -167,3 +167,30 @@ pub static USER_ONGOING_META: EventTypeMeta = EventTypeMeta {
     parse: parse_user_ongoing,
     encode: encode_user_ongoing,
 };
+
+// === Query APIs (event-module locality) ===
+
+use rusqlite::Connection;
+
+pub struct UserRow {
+    pub event_id: String,
+    pub username: String,
+}
+
+pub fn query_list(
+    db: &Connection,
+    recorded_by: &str,
+) -> Result<Vec<UserRow>, rusqlite::Error> {
+    let mut stmt = db.prepare(
+        "SELECT event_id, COALESCE(username, '') FROM users WHERE recorded_by = ?1"
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![recorded_by], |row| {
+            Ok(UserRow {
+                event_id: row.get(0)?,
+                username: row.get(1)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
