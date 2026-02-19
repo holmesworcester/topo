@@ -527,6 +527,15 @@ static MIGRATIONS: &[Migration] = &[
             ALTER TABLE peers_shared ADD COLUMN user_event_id TEXT;
         ",
     },
+    Migration {
+        version: 30,
+        name: "add_display_name_columns",
+        sql: "
+            ALTER TABLE workspaces ADD COLUMN name TEXT;
+            ALTER TABLE users ADD COLUMN username TEXT;
+            ALTER TABLE peers_shared ADD COLUMN device_name TEXT;
+        ",
+    },
 ];
 
 fn ensure_schema_migrations(conn: &Connection) -> SqliteResult<()> {
@@ -740,6 +749,6 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(max_version, 29);
+        assert_eq!(max_version, 30);
     }
 }

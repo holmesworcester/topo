@@ -146,10 +146,11 @@ impl Peer {
         use crate::identity_ops::bootstrap_workspace;
 
         let db = open_connection(&self.db_path).expect("failed to open db");
-        let chain = bootstrap_workspace(&db, &self.identity)
+        let chain = bootstrap_workspace(&db, &self.identity, "test-workspace", "test-user", "test-device")
             .expect("failed to bootstrap workspace");
 
         self.workspace_id = chain.workspace_id;
+        self.author_id = chain.user_event_id;
         self.peer_shared_event_id = Some(chain.peer_shared_event_id);
         self.peer_shared_signing_key = Some(chain.peer_shared_key);
         self.workspace_signing_key = Some(chain.workspace_key);
@@ -240,11 +241,14 @@ impl Peer {
         peer.identity = result.peer_id.clone();
         peer.workspace_id = creator.workspace_id;
 
-        // Load signing key from DB (service layer persisted it)
+        // Load signing key and user_event_id from DB (service layer persisted it)
         let db = open_connection(&peer.db_path).expect("failed to open db");
         if let Ok(Some((eid, key))) = crate::service::load_local_peer_signer_pub(&db, &result.peer_id) {
             peer.peer_shared_event_id = Some(eid);
             peer.peer_shared_signing_key = Some(key);
+            if let Ok(uid) = crate::service::resolve_user_event_id_for_signer(&db, &result.peer_id, &eid) {
+                peer.author_id = uid;
+            }
         }
 
         peer
@@ -424,6 +428,7 @@ impl Peer {
         let ws = ParsedEvent::Workspace(WorkspaceEvent {
             created_at_ms: current_timestamp_ms(),
             public_key,
+            name: "test-workspace".to_string(),
         });
         create_event_staged(&db, &self.identity, &ws)
             .expect("failed to create workspace")
@@ -435,6 +440,7 @@ impl Peer {
         let ws = ParsedEvent::Workspace(WorkspaceEvent {
             created_at_ms: current_timestamp_ms(),
             public_key,
+            name: "test-workspace".to_string(),
         });
         create_event_sync(&db, &self.identity, &ws)
     }
@@ -535,6 +541,7 @@ impl Peer {
         let evt = ParsedEvent::UserBoot(UserBootEvent {
             created_at_ms: current_timestamp_ms(),
             public_key: user_public_key,
+            username: "test-user".to_string(),
             signed_by: *user_invite_event_id,
             signer_type: 2,
             signature: [0u8; 64],
@@ -575,6 +582,7 @@ impl Peer {
             created_at_ms: current_timestamp_ms(),
             public_key: peer_shared_public_key,
             user_event_id: *user_event_id,
+            device_name: "test-device".to_string(),
             signed_by: *device_invite_event_id,
             signer_type: 3,
             signature: [0u8; 64],
@@ -2286,16 +2294,16 @@ impl SharedDbNode {
         let join = accept_user_invite(
             &db, &tenant_identity, &invite.invite_key,
             &invite.invite_event_id, workspace_id,
+            "test-user", "test-device",
         ).expect("failed to accept user invite");
 
-        let author_id: [u8; 32] = rand::random();
         let dummy_tempdir = tempfile::tempdir().expect("failed to create dummy tempdir");
 
         let peer = Peer {
             name: name.to_string(),
             db_path: self.db_path.clone(),
             identity: tenant_identity,
-            author_id,
+            author_id: join.user_event_id,
             workspace_id,
             peer_shared_event_id: Some(join.peer_shared_event_id),
             peer_shared_signing_key: Some(join.peer_shared_key),

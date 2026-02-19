@@ -145,6 +145,9 @@ pub enum InviteType {
 pub fn bootstrap_workspace(
     conn: &Connection,
     recorded_by: &str,
+    workspace_name: &str,
+    username: &str,
+    device_name: &str,
 ) -> Result<IdentityChain, Box<dyn std::error::Error + Send + Sync>> {
     let mut rng = rand::thread_rng();
 
@@ -154,6 +157,7 @@ pub fn bootstrap_workspace(
     let net_evt = ParsedEvent::Workspace(WorkspaceEvent {
         created_at_ms: now_ms(),
         public_key: workspace_pub,
+        name: workspace_name.to_string(),
     });
     let workspace_id = create_event_staged(conn, recorded_by, &net_evt)?;
 
@@ -190,6 +194,7 @@ pub fn bootstrap_workspace(
     let ub_evt = ParsedEvent::UserBoot(UserBootEvent {
         created_at_ms: now_ms(),
         public_key: user_pub,
+        username: username.to_string(),
         signed_by: user_invite_event_id,
         signer_type: 2,
         signature: [0u8; 64],
@@ -225,6 +230,7 @@ pub fn bootstrap_workspace(
         created_at_ms: now_ms(),
         public_key: peer_shared_pub,
         user_event_id,
+        device_name: device_name.to_string(),
         signed_by: device_invite_event_id,
         signer_type: 3,
         signature: [0u8; 64],
@@ -344,6 +350,8 @@ pub fn accept_user_invite(
     invite_key: &SigningKey,
     invite_event_id: &EventId,
     workspace_id: EventId,
+    username: &str,
+    device_name: &str,
 ) -> Result<JoinChain, Box<dyn std::error::Error + Send + Sync>> {
     let mut rng = rand::thread_rng();
 
@@ -361,6 +369,7 @@ pub fn accept_user_invite(
     let ub_evt = ParsedEvent::UserBoot(UserBootEvent {
         created_at_ms: now_ms(),
         public_key: user_pub,
+        username: username.to_string(),
         signed_by: *invite_event_id,
         signer_type: 2,
         signature: [0u8; 64],
@@ -396,6 +405,7 @@ pub fn accept_user_invite(
         created_at_ms: now_ms(),
         public_key: peer_shared_pub,
         user_event_id,
+        device_name: device_name.to_string(),
         signed_by: device_invite_event_id,
         signer_type: 3,
         signature: [0u8; 64],
@@ -467,6 +477,7 @@ pub fn accept_device_link(
     device_invite_event_id: &EventId,
     workspace_id: EventId,
     user_event_id: EventId,
+    device_name: &str,
 ) -> Result<LinkChain, Box<dyn std::error::Error + Send + Sync>> {
     let mut rng = rand::thread_rng();
 
@@ -485,6 +496,7 @@ pub fn accept_device_link(
         created_at_ms: now_ms(),
         public_key: peer_shared_pub,
         user_event_id,
+        device_name: device_name.to_string(),
         signed_by: *device_invite_event_id,
         signer_type: 3,
         signature: [0u8; 64],

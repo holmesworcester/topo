@@ -1,3 +1,4 @@
+use super::fixed_layout::{self, WORKSPACE_WIRE_SIZE, NAME_BYTES, workspace_offsets as off};
 use super::registry::{EventTypeMeta, ShareScope};
 use super::{EventError, ParsedEvent, EVENT_TYPE_WORKSPACE};
 
@@ -5,22 +6,24 @@ use super::{EventError, ParsedEvent, EVENT_TYPE_WORKSPACE};
 pub struct WorkspaceEvent {
     pub created_at_ms: u64,
     pub public_key: [u8; 32],  // Ed25519 verifying key for the workspace
+    pub name: String,           // Workspace display name (64-byte text slot)
 }
 
-/// Wire format (41 bytes fixed):
+/// Wire format (105 bytes fixed):
 /// [0]      type_code = 8
 /// [1..9]   created_at_ms (u64 LE)
 /// [9..41]  public_key (32 bytes)
+/// [41..105] name (64 bytes, UTF-8 zero-padded)
 pub fn parse_workspace(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    if blob.len() < 41 {
+    if blob.len() < WORKSPACE_WIRE_SIZE {
         return Err(EventError::TooShort {
-            expected: 41,
+            expected: WORKSPACE_WIRE_SIZE,
             actual: blob.len(),
         });
     }
-    if blob.len() > 41 {
+    if blob.len() > WORKSPACE_WIRE_SIZE {
         return Err(EventError::TrailingData {
-            expected: 41,
+            expected: WORKSPACE_WIRE_SIZE,
             actual: blob.len(),
         });
     }
@@ -31,14 +34,18 @@ pub fn parse_workspace(blob: &[u8]) -> Result<ParsedEvent, EventError> {
         });
     }
 
-    let created_at_ms = u64::from_le_bytes(blob[1..9].try_into().unwrap());
+    let created_at_ms = u64::from_le_bytes(blob[off::CREATED_AT..off::PUBLIC_KEY].try_into().unwrap());
 
     let mut public_key = [0u8; 32];
-    public_key.copy_from_slice(&blob[9..41]);
+    public_key.copy_from_slice(&blob[off::PUBLIC_KEY..off::NAME]);
+
+    let name = fixed_layout::read_text_slot(&blob[off::NAME..off::NAME + NAME_BYTES])
+        .map_err(EventError::TextSlot)?;
 
     Ok(ParsedEvent::Workspace(WorkspaceEvent {
         created_at_ms,
         public_key,
+        name,
     }))
 }
 
@@ -48,10 +55,12 @@ pub fn encode_workspace(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         _ => return Err(EventError::WrongVariant),
     };
 
-    let mut buf = Vec::with_capacity(41);
-    buf.push(EVENT_TYPE_WORKSPACE);
-    buf.extend_from_slice(&ws.created_at_ms.to_le_bytes());
-    buf.extend_from_slice(&ws.public_key);
+    let mut buf = vec![0u8; WORKSPACE_WIRE_SIZE];
+    buf[off::TYPE_CODE] = EVENT_TYPE_WORKSPACE;
+    buf[off::CREATED_AT..off::PUBLIC_KEY].copy_from_slice(&ws.created_at_ms.to_le_bytes());
+    buf[off::PUBLIC_KEY..off::NAME].copy_from_slice(&ws.public_key);
+    fixed_layout::write_text_slot(&ws.name, &mut buf[off::NAME..off::NAME + NAME_BYTES])
+        .map_err(EventError::TextSlot)?;
     Ok(buf)
 }
 

@@ -98,10 +98,27 @@ pub enum RpcMethod {
     /// Return the currently active peer.
     ActivePeer,
     /// Create a new workspace + identity chain.
-    CreateWorkspace,
+    CreateWorkspace {
+        #[serde(default = "default_workspace_name")]
+        workspace_name: String,
+        #[serde(default = "default_username")]
+        username: String,
+        #[serde(default = "default_device_name")]
+        device_name: String,
+    },
     /// Attempt UPnP port mapping for the QUIC listen port.
     Upnp,
+    /// Combined view: sidebar (workspace, users, accounts) + messages with inline reactions.
+    View {
+        #[serde(default = "default_view_limit")]
+        limit: usize,
+    },
 }
+
+fn default_workspace_name() -> String { "workspace".to_string() }
+fn default_username() -> String { "user".to_string() }
+fn default_device_name() -> String { "device".to_string() }
+fn default_view_limit() -> usize { 50 }
 
 // ---------------------------------------------------------------------------
 // Response

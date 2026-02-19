@@ -380,8 +380,8 @@ fn dispatch(
             }
         }
 
-        RpcMethod::CreateWorkspace => {
-            match service::svc_create_workspace(db_path) {
+        RpcMethod::CreateWorkspace { workspace_name, username, device_name } => {
+            match service::svc_create_workspace(db_path, &workspace_name, &username, &device_name) {
                 Ok(resp) => {
                     // Auto-select newly created peer if none active
                     let mut ap = state.active_peer.write().unwrap();
@@ -705,6 +705,10 @@ fn dispatch(
                 Err(e) => RpcResponse::error(e.to_string()),
             }
         }
+        RpcMethod::View { limit } => match service::svc_view(db_path, limit) {
+            Ok(data) => RpcResponse::success(data),
+            Err(e) => RpcResponse::error(e.to_string()),
+        },
     }
 }
 

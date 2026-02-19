@@ -142,7 +142,11 @@ fn rpc_all_methods_serialize() {
         RpcMethod::Peers,
         RpcMethod::UsePeer { index: 1 },
         RpcMethod::ActivePeer,
-        RpcMethod::CreateWorkspace,
+        RpcMethod::CreateWorkspace {
+            workspace_name: "test".into(),
+            username: "user".into(),
+            device_name: "device".into(),
+        },
         RpcMethod::CreateInvite {
             public_addr: "127.0.0.1:4433".into(),
             public_spki: None,

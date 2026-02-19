@@ -7,16 +7,49 @@ use crate::events::{
     ReactionEvent, SecretKeyEvent, SignedMemoEvent,
 };
 
+/// Verify that signed_by peer's user_event_id matches the claimed author_id.
+/// Returns Ok(()) on match, Err with reason on mismatch or missing data.
+fn verify_signer_user_match(
+    conn: &Connection,
+    recorded_by: &str,
+    signed_by: &[u8; 32],
+    author_id: &[u8; 32],
+) -> Result<(), String> {
+    let signed_by_b64 = event_id_to_base64(signed_by);
+    let author_id_b64 = event_id_to_base64(author_id);
+
+    let peer_user_eid: String = conn
+        .query_row(
+            "SELECT user_event_id FROM peers_shared WHERE recorded_by = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &signed_by_b64],
+            |row| row.get(0),
+        )
+        .map_err(|_| format!("no peers_shared entry for signer {}", signed_by_b64))?;
+
+    if peer_user_eid != author_id_b64 {
+        return Err(format!(
+            "signer {} belongs to user {} but author_id claims {}",
+            signed_by_b64, peer_user_eid, author_id_b64
+        ));
+    }
+    Ok(())
+}
+
 /// Project a Message event into the messages table. Returns Ok(true) if written.
 pub fn project_message(
     conn: &Connection,
     recorded_by: &str,
     event_id_b64: &str,
     msg: &MessageEvent,
-) -> Result<bool, rusqlite::Error> {
+) -> Result<ProjectionDecision, Box<dyn std::error::Error>> {
+    // Verify signer-user match
+    if let Err(reason) = verify_signer_user_match(conn, recorded_by, &msg.signed_by, &msg.author_id) {
+        return Ok(ProjectionDecision::Reject { reason });
+    }
+
     let workspace_id_b64 = event_id_to_base64(&msg.workspace_id);
     let author_id_b64 = event_id_to_base64(&msg.author_id);
-    let rows = conn.execute(
+    conn.execute(
         "INSERT OR IGNORE INTO messages (message_id, workspace_id, author_id, content, created_at, recorded_by)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         rusqlite::params![
@@ -28,17 +61,22 @@ pub fn project_message(
             recorded_by
         ],
     )?;
-    Ok(rows > 0)
+    Ok(ProjectionDecision::Valid)
 }
 
-/// Project a Reaction event into the reactions table. Returns Ok(true) if written.
+/// Project a Reaction event into the reactions table.
 /// If the target message has been deleted, the reaction is structurally valid but skipped.
 pub fn project_reaction(
     conn: &Connection,
     recorded_by: &str,
     event_id_b64: &str,
     rxn: &ReactionEvent,
-) -> Result<bool, rusqlite::Error> {
+) -> Result<ProjectionDecision, Box<dyn std::error::Error>> {
+    // Verify signer-user match
+    if let Err(reason) = verify_signer_user_match(conn, recorded_by, &rxn.signed_by, &rxn.author_id) {
+        return Ok(ProjectionDecision::Reject { reason });
+    }
+
     let target_id_b64 = event_id_to_base64(&rxn.target_event_id);
 
     // Check if target message has been deleted — skip projection if so
@@ -48,11 +86,11 @@ pub fn project_reaction(
         |row| row.get(0),
     )?;
     if target_deleted {
-        return Ok(true); // structurally valid, but skip projection (message gone)
+        return Ok(ProjectionDecision::Valid); // structurally valid, but skip projection (message gone)
     }
 
     let author_id_b64 = event_id_to_base64(&rxn.author_id);
-    let rows = conn.execute(
+    conn.execute(
         "INSERT OR IGNORE INTO reactions (event_id, target_event_id, author_id, emoji, created_at, recorded_by)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         rusqlite::params![
@@ -64,7 +102,7 @@ pub fn project_reaction(
             recorded_by
         ],
     )?;
-    Ok(rows > 0)
+    Ok(ProjectionDecision::Valid)
 }
 
 /// Project a SecretKey event into the secret_keys table. Returns Ok(true) if written.
@@ -118,6 +156,11 @@ pub fn project_message_deletion(
     event_id_b64: &str,
     del: &MessageDeletionEvent,
 ) -> Result<ProjectionDecision, Box<dyn std::error::Error>> {
+    // Verify signer-user match
+    if let Err(reason) = verify_signer_user_match(conn, recorded_by, &del.signed_by, &del.author_id) {
+        return Ok(ProjectionDecision::Reject { reason });
+    }
+
     let target_b64 = event_id_to_base64(&del.target_event_id);
     let del_author_b64 = event_id_to_base64(&del.author_id);
 

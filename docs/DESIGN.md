@@ -146,6 +146,12 @@ Event-graph identity is event-defined:
 2. identity state directly determines transport trust — transport certs are derived from PeerShared signing keys,
 3. projected identity determines which peers are allowed to sync.
 
+### Display names (POC placeholder)
+
+Workspace, user, and device events carry a 64-byte cleartext name text slot. This is POC convenience for human-readable CLI output. In a production system (cf. poc-6), display names would be encrypted profile fields — only visible to peers holding the workspace content key — with fallback display (truncated ID) when the key is unavailable. The cleartext approach here avoids the complexity of encrypted profile infrastructure while enabling a usable demo.
+
+Content events (Message, Reaction, MessageDeletion) declare `author_id` as a dependency field pointing to User events (type 14/15). The dependency system blocks projection until the referenced User event exists, and the projector verifies that the signer's peer_shared `user_event_id` matches the claimed `author_id`. This enables direct `messages.author_id = users.event_id` JOINs for display name resolution.
+
 ## 2.4 NAT traversal and hole punch
 
 Direct peer-to-peer connectivity through NAT is a transport optimization, not a canonical protocol concern.
