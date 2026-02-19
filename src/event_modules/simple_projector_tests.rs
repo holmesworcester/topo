@@ -1,0 +1,218 @@
+//! Pure projector conformance tests for simple projectors that do straight inserts
+//! with no guards beyond type matching.
+//!
+//! Covers: User, Admin, UserRemoved, PeerRemoved, SecretKey, TransportKey,
+//!         SignedMemo, MessageAttachment, BenchDep.
+
+#[cfg(test)]
+mod tests {
+    use crate::event_modules::projector_test_harness::fixtures::*;
+    use crate::event_modules::ParsedEvent;
+    use crate::projection::result::EmitCommand;
+
+    const PEER: &str = "peer_alice";
+    const EVENT_ID: &str = "simple_event_1";
+
+    // ── User (Boot) ──
+
+    #[test]
+    fn test_user_boot_valid() {
+        use crate::event_modules::user::{project_pure, UserBootEvent};
+        let parsed = ParsedEvent::UserBoot(UserBootEvent {
+            created_at_ms: 1000,
+            public_key: [1u8; 32],
+            username: "alice".to_string(),
+            signed_by: [2u8; 32],
+            signer_type: 2,
+            signature: [0u8; 64],
+        });
+        let result = project_pure(PEER, EVENT_ID, &parsed, &empty_ctx());
+        assert_valid(&result);
+        assert_writes_to_table(&result, "users");
+        assert_no_commands(&result);
+    }
+
+    #[test]
+    fn test_user_ongoing_valid() {
+        use crate::event_modules::user::{project_pure, UserOngoingEvent};
+        let parsed = ParsedEvent::UserOngoing(UserOngoingEvent {
+            created_at_ms: 1001,
+            public_key: [1u8; 32],
+            username: "alice".to_string(),
+            signed_by: [2u8; 32],
+            signer_type: 2,
+            signature: [0u8; 64],
+        });
+        let result = project_pure(PEER, EVENT_ID, &parsed, &empty_ctx());
+        assert_valid(&result);
+        assert_writes_to_table(&result, "users");
+    }
+
+    // ── Admin (Boot) ──
+
+    #[test]
+    fn test_admin_boot_valid() {
+        use crate::event_modules::admin::{project_pure, AdminBootEvent};
+        let parsed = ParsedEvent::AdminBoot(AdminBootEvent {
+            created_at_ms: 2000,
+            public_key: [1u8; 32],
+            user_event_id: [2u8; 32],
+            signed_by: [3u8; 32],
+            signer_type: 1,
+            signature: [0u8; 64],
+        });
+        let result = project_pure(PEER, EVENT_ID, &parsed, &empty_ctx());
+        assert_valid(&result);
+        assert_writes_to_table(&result, "admins");
+        assert_no_commands(&result);
+    }
+
+    #[test]
+    fn test_admin_ongoing_valid() {
+        use crate::event_modules::admin::{project_pure, AdminOngoingEvent};
+        let parsed = ParsedEvent::AdminOngoing(AdminOngoingEvent {
+            created_at_ms: 2001,
+            public_key: [1u8; 32],
+            admin_boot_event_id: [2u8; 32],
+            signed_by: [3u8; 32],
+            signer_type: 5,
+            signature: [0u8; 64],
+        });
+        let result = project_pure(PEER, EVENT_ID, &parsed, &empty_ctx());
+        assert_valid(&result);
+        assert_writes_to_table(&result, "admins");
+    }
+
+    // ── UserRemoved ──
+
+    #[test]
+    fn test_user_removed_writes_row() {
+        use crate::event_modules::user_removed::{project_pure, UserRemovedEvent};
+        let parsed = ParsedEvent::UserRemoved(UserRemovedEvent {
+            created_at_ms: 3000,
+            target_event_id: [1u8; 32],
+            signed_by: [2u8; 32],
+            signer_type: 5,
+            signature: [0u8; 64],
+        });
+        let result = project_pure(PEER, EVENT_ID, &parsed, &empty_ctx());
+        assert_valid(&result);
+        assert_writes_to_table(&result, "removed_entities");
+        assert_no_commands(&result);
+    }
+
+    // ── PeerRemoved ──
+
+    #[test]
+    fn test_peer_removed_writes_row() {
+        use crate::event_modules::peer_removed::{project_pure, PeerRemovedEvent};
+        let parsed = ParsedEvent::PeerRemoved(PeerRemovedEvent {
+            created_at_ms: 4000,
+            target_event_id: [1u8; 32],
+            signed_by: [2u8; 32],
+            signer_type: 5,
+            signature: [0u8; 64],
+        });
+        let result = project_pure(PEER, EVENT_ID, &parsed, &empty_ctx());
+        assert_valid(&result);
+        assert_writes_to_table(&result, "removed_entities");
+        assert_no_commands(&result);
+    }
+
+    // ── SecretKey ──
+
+    #[test]
+    fn test_secret_key_valid() {
+        use crate::event_modules::secret_key::{project_pure, SecretKeyEvent};
+        let parsed = ParsedEvent::SecretKey(SecretKeyEvent {
+            created_at_ms: 5000,
+            key_bytes: [0xAB; 32],
+        });
+        let result = project_pure(PEER, EVENT_ID, &parsed, &empty_ctx());
+        assert_valid(&result);
+        assert_writes_to_table(&result, "secret_keys");
+        assert_no_commands(&result);
+    }
+
+    // ── TransportKey ──
+
+    #[test]
+    fn test_transport_key_valid() {
+        use crate::event_modules::transport_key::{project_pure, TransportKeyEvent};
+        let parsed = ParsedEvent::TransportKey(TransportKeyEvent {
+            created_at_ms: 6000,
+            spki_fingerprint: [0xCC; 32],
+            signed_by: [2u8; 32],
+            signer_type: 5,
+            signature: [0u8; 64],
+        });
+        let result = project_pure(PEER, EVENT_ID, &parsed, &empty_ctx());
+        assert_valid(&result);
+        assert_writes_to_table(&result, "transport_keys");
+        assert_no_commands(&result);
+    }
+
+    // ── SignedMemo ──
+
+    #[test]
+    fn test_signed_memo_valid() {
+        use crate::event_modules::signed_memo::{project_pure, SignedMemoEvent};
+        let parsed = ParsedEvent::SignedMemo(SignedMemoEvent {
+            created_at_ms: 7000,
+            content: "test memo".to_string(),
+            signed_by: [2u8; 32],
+            signer_type: 5,
+            signature: [0u8; 64],
+        });
+        let result = project_pure(PEER, EVENT_ID, &parsed, &empty_ctx());
+        assert_valid(&result);
+        assert_writes_to_table(&result, "signed_memos");
+        assert_no_commands(&result);
+    }
+
+    // ── MessageAttachment ──
+
+    #[test]
+    fn test_message_attachment_valid() {
+        use crate::event_modules::message_attachment::{
+            project_pure, MessageAttachmentEvent,
+        };
+        let parsed = ParsedEvent::MessageAttachment(MessageAttachmentEvent {
+            created_at_ms: 8000,
+            message_id: [1u8; 32],
+            file_id: [2u8; 32],
+            blob_bytes: 1024,
+            total_slices: 1,
+            slice_bytes: 262144,
+            root_hash: [3u8; 32],
+            key_event_id: [4u8; 32],
+            filename: "test.txt".to_string(),
+            mime_type: "text/plain".to_string(),
+            signed_by: [5u8; 32],
+            signer_type: 5,
+            signature: [0u8; 64],
+        });
+        let result = project_pure(PEER, EVENT_ID, &parsed, &empty_ctx());
+        assert_valid(&result);
+        assert_writes_to_table(&result, "message_attachments");
+        assert_emits_command(&result, "RetryFileSliceGuards", |c| {
+            matches!(c, EmitCommand::RetryFileSliceGuards { .. })
+        });
+    }
+
+    // ── BenchDep (no-op projector) ──
+
+    #[test]
+    fn test_bench_dep_noop() {
+        use crate::event_modules::bench_dep::{project_pure, BenchDepEvent};
+        let parsed = ParsedEvent::BenchDep(BenchDepEvent {
+            created_at_ms: 9000,
+            dep_ids: vec![],
+            payload: [0u8; 16],
+        });
+        let result = project_pure(PEER, EVENT_ID, &parsed, &empty_ctx());
+        assert_valid(&result);
+        assert!(result.write_ops.is_empty(), "bench_dep should have no write_ops");
+        assert_no_commands(&result);
+    }
+}
