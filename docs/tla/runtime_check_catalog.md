@@ -38,8 +38,10 @@ an explicit `NON_MODELED::<reason>` waiver.
 | CHK_MA_RETRY_GUARD | event_modules/message_attachment::project_pure | InvFileSliceAuth | projector_local |
 | CHK_UI_INSERT | event_modules/user_invite::project_pure | InvUserInviteChain | projector_local |
 | CHK_UI_PENDING_TRUST | event_modules/user_invite::project_pure | InvPendingTrustOnlyOnInviter | projector_local |
+| CHK_UI_PENDING_BOOTSTRAP_SRC | event_modules/user_invite::project_pure | InvPendingBootstrapTrustSource | projector_local |
 | CHK_DI_INSERT | event_modules/device_invite::project_pure | InvDeviceInviteChain | projector_local |
 | CHK_DI_PENDING_TRUST | event_modules/device_invite::project_pure | InvPendingTrustOnlyOnInviter | projector_local |
+| CHK_DI_PENDING_BOOTSTRAP_SRC | event_modules/device_invite::project_pure | InvPendingBootstrapTrustSource | projector_local |
 | CHK_USR_INSERT | event_modules/user::project_pure | InvDeps | projector_local |
 | CHK_PS_INSERT | event_modules/peer_shared::project_pure | InvPeerSharedTrustSource | projector_local |
 | CHK_PS_SUPERSEDE | event_modules/peer_shared::project_pure | InvBootstrapConsumedByPeerShared | projector_local |
