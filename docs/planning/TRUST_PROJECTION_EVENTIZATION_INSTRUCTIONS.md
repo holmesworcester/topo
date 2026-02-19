@@ -15,6 +15,7 @@ Primary target:
 3. Preserve joiner-side accepted bootstrap trust until steady-state PeerShared trust supersedes it.
 4. No weakening of removal semantics (`UserRemoved`/`PeerRemoved` must still deny trust).
 5. Avoid broad redesign of sync protocol framing.
+6. Maintain model coherence: update TLA first when behavior changes require it, then implement code to match the model closely.
 
 ## Design Direction
 ### A) Projection-owned trust rows
@@ -33,6 +34,16 @@ Service/bootstrap code may write context rows, but should not write trust rows d
 ### C) Trust checks become read-only (preferred)
 `is_peer_allowed` currently performs supersede updates on read.
 Target: move supersession side effects into projection/maintenance path so trust checks are pure reads.
+
+### D) Root-event guard cascade pattern (poc-6 -> poc-7)
+Use `poc-6` as the reference pattern for trust-anchor-driven root validity:
+1. root graph event is guard-blocked until trust anchor exists
+2. `InviteAccepted` projection establishes the trust anchor
+3. `InviteAccepted` projection triggers guard retry/cascade that unblocks root validity
+
+Mapping:
+1. `poc-6`: `network` root event unblocked by `invite_accepted`
+2. `poc-7`: `workspace` root event unblocked by `invite_accepted`
 
 ## Implementation Plan
 ### Phase 1: Baseline + tests
@@ -91,3 +102,12 @@ Rule of thumb:
 3. Existing invite/bootstrap/connect flows still pass.
 4. No regression in strict trust checks and removal semantics.
 5. Tests explicitly cover pre-accept, post-accept, supersession, and removal.
+
+## Follow-up TODOs
+1. Update `docs/PLAN.md` to include this structure explicitly:
+- trust rows are projection-owned state
+- signer key material is local non-shareable event+projection state
+- `local_transport_creds` is a derived cache from projected signer state
+2. Update `docs/DESIGN.md` to match the same model and terminology.
+3. Update TLA docs/spec first if semantics changed (`docs/tla/*`), then keep implementation tightly aligned with the updated model.
+4. In both `PLAN.md` and `DESIGN.md`, explicitly call out the `poc-6` invite trust cascade precedent and the `workspace`/`invite_accepted` equivalent in `poc-7`.
