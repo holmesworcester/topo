@@ -127,7 +127,7 @@ both `pass` and `break` polarity unless waived.
 | SPEC_ENCRYPTED_DEP_01 | InvEncryptedKey | CHK_ENCRYPTED_DEP_OUTER_KEY | pipeline_integration | apply::tests::test_encrypted_message_valid | pass |
 | SPEC_ENCRYPTED_DEP_01 | InvEncryptedKey | CHK_ENCRYPTED_DEP_OUTER_KEY | pipeline_integration | apply::tests::test_encrypted_blocks_on_missing_key | break |
 | SPEC_DISPATCH_01 | (registry) | CHK_DISPATCH_UNKNOWN_TYPE | pipeline_integration | apply::tests::test_project_message_valid | pass |
-| SPEC_DISPATCH_01 | (registry) | CHK_DISPATCH_UNKNOWN_TYPE | pipeline_integration | apply::tests::test_signed_memo_invalid_signature_rejects | break |
+| SPEC_DISPATCH_01 | (registry) | CHK_DISPATCH_UNKNOWN_TYPE | pipeline_integration | apply::tests::test_retired_type3_peer_key_blob_rejected | break |
 | SPEC_REJECTION_01 | (durable rejection) | CHK_REJECTION_RECORD | pipeline_integration | apply::tests::test_signed_memo_invalid_signature_rejects | pass |
 | SPEC_REJECTION_01 | (durable rejection) | CHK_REJECTION_RECORD | pipeline_integration | apply::tests::test_project_message_valid | break |
 | SPEC_INVITE_RECORDED_01 | InvInviteAcceptedRecorded | CHK_IA_INVITE_RECORDED | projector_unit | event_modules::invite_accepted_projector_tests::tests::test_invite_accepted_writes_trust_anchor | pass |
@@ -160,19 +160,19 @@ both `pass` and `break` polarity unless waived.
 | SPEC_PENDING_INVITER_TCL_02 | InvPendingTrustOnlyOnInviter | CHK_DI_PENDING_TRUST | projector_unit | event_modules::device_invite_projector_tests::tests::test_device_invite_no_pending_when_not_local | break |
 | SPEC_PENDING_INVITER_TCL_02 | InvPendingTrustOnlyOnInviter | CHK_DI_PENDING_TRUST | projector_unit | event_modules::device_invite_projector_tests::tests::test_device_invite_first_emits_pending_trust | pass |
 | SPEC_TCL_SPKI_01 | InvSPKIUniqueness | CHK_TCL_SPKI_UNIQUE | transport_credential | apply::tests::test_signed_content_events_project_with_identity_chain | pass |
-| SPEC_TCL_SPKI_01 | InvSPKIUniqueness | CHK_TCL_SPKI_UNIQUE | transport_credential | apply::tests::test_signed_memo_invalid_signature_rejects | break |
+| SPEC_TCL_SPKI_01 | InvSPKIUniqueness | CHK_TCL_SPKI_UNIQUE | transport_credential | — | waiver:integration_effect_only |
 | SPEC_TCL_TRUST_UNION_01 | InvTrustSetIsExactUnion | CHK_TCL_TRUST_UNION | transport_credential | apply::tests::test_signed_content_events_project_with_identity_chain | pass |
-| SPEC_TCL_TRUST_UNION_01 | InvTrustSetIsExactUnion | CHK_TCL_TRUST_UNION | transport_credential | apply::tests::test_signed_memo_invalid_signature_rejects | break |
+| SPEC_TCL_TRUST_UNION_01 | InvTrustSetIsExactUnion | CHK_TCL_TRUST_UNION | transport_credential | — | waiver:integration_effect_only |
 | SPEC_TCL_SOURCES_01 | InvTrustSourcesWellFormed | CHK_TCL_SOURCES_FORMED | transport_credential | apply::tests::test_signed_content_events_project_with_identity_chain | pass |
-| SPEC_TCL_SOURCES_01 | InvTrustSourcesWellFormed | CHK_TCL_SOURCES_FORMED | transport_credential | apply::tests::test_signed_memo_invalid_signature_rejects | break |
+| SPEC_TCL_SOURCES_01 | InvTrustSourcesWellFormed | CHK_TCL_SOURCES_FORMED | transport_credential | — | waiver:integration_effect_only |
 | SPEC_TCL_MUTUAL_01 | InvMutualAuthSymmetry | CHK_TCL_MUTUAL_AUTH | transport_credential | apply::tests::test_signed_content_events_project_with_identity_chain | pass |
-| SPEC_TCL_MUTUAL_01 | InvMutualAuthSymmetry | CHK_TCL_MUTUAL_AUTH | transport_credential | apply::tests::test_signed_memo_invalid_signature_rejects | break |
+| SPEC_TCL_MUTUAL_01 | InvMutualAuthSymmetry | CHK_TCL_MUTUAL_AUTH | transport_credential | — | waiver:integration_effect_only |
 | SPEC_TCL_MEMBERS_01 | InvTrustedPeerSetMembers | CHK_TCL_TRUSTED_MEMBERS | transport_credential | apply::tests::test_signed_content_events_project_with_identity_chain | pass |
-| SPEC_TCL_MEMBERS_01 | InvTrustedPeerSetMembers | CHK_TCL_TRUSTED_MEMBERS | transport_credential | apply::tests::test_signed_memo_invalid_signature_rejects | break |
+| SPEC_TCL_MEMBERS_01 | InvTrustedPeerSetMembers | CHK_TCL_TRUSTED_MEMBERS | transport_credential | — | waiver:integration_effect_only |
 | SPEC_TCL_BOOTSTRAP_MATCH_01 | InvBootstrapTrustMatchesCarried | CHK_TCL_BOOTSTRAP_MATCH | transport_credential | apply::tests::test_signed_content_events_project_with_identity_chain | pass |
-| SPEC_TCL_BOOTSTRAP_MATCH_01 | InvBootstrapTrustMatchesCarried | CHK_TCL_BOOTSTRAP_MATCH | transport_credential | apply::tests::test_signed_memo_invalid_signature_rejects | break |
+| SPEC_TCL_BOOTSTRAP_MATCH_01 | InvBootstrapTrustMatchesCarried | CHK_TCL_BOOTSTRAP_MATCH | transport_credential | — | waiver:integration_effect_only |
 | SPEC_TCL_PENDING_MATCH_01 | InvPendingBootstrapTrustMatchesCarried | CHK_TCL_PENDING_MATCH | transport_credential | apply::tests::test_signed_content_events_project_with_identity_chain | pass |
-| SPEC_TCL_PENDING_MATCH_01 | InvPendingBootstrapTrustMatchesCarried | CHK_TCL_PENDING_MATCH | transport_credential | apply::tests::test_signed_memo_invalid_signature_rejects | break |
+| SPEC_TCL_PENDING_MATCH_01 | InvPendingBootstrapTrustMatchesCarried | CHK_TCL_PENDING_MATCH | transport_credential | — | waiver:integration_effect_only |
 
 ## Replay/Order Conformance
 
