@@ -1,3 +1,4 @@
+pub mod create;
 pub mod layout;
 pub mod wire;
 pub mod commands;
@@ -6,7 +7,8 @@ pub mod projector;
 
 // Re-export stable public API so callers import from `event_modules::message`.
 pub use wire::{MessageEvent, parse_message, encode_message, MESSAGE_META, MESSAGE_WIRE_SIZE};
-pub use commands::{CreateMessageCmd, create, send};
+pub use create::{CreateMessageCmd, create};
+pub use commands::send;
 pub use queries::{
     MessageRow, list_rows, count,
     resolve_number, resolve,

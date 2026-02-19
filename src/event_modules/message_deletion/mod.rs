@@ -1,3 +1,4 @@
+pub mod create;
 pub mod wire;
 pub mod projector;
 pub mod commands;
@@ -11,6 +12,7 @@ pub use wire::{
     MESSAGE_DELETION_WIRE_SIZE,
     MESSAGE_DELETION_META,
 };
-pub use commands::{CreateMessageDeletionCmd, create, delete_message};
+pub use create::{CreateMessageDeletionCmd, create};
+pub use commands::delete_message;
 pub use queries::list_deleted_ids;
 pub use projector::project_pure;
