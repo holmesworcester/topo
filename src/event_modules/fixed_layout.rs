@@ -144,6 +144,10 @@ pub const ADMIN_ONGOING_WIRE_SIZE: usize = ADMIN_BOOT_WIRE_SIZE;
 ///                        + wrapped_key(32) + signed_by(32) + signer_type(1) + signature(64) = 202
 pub const SECRET_SHARED_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32 + 32 + 32 + SIGNATURE_TRAILER_BYTES;
 
+/// LocalSignerSecret (type 27): type(1) + created_at(8) + signer_event_id(32)
+///                              + signer_kind(1) + private_key_bytes(32) = 74
+pub const LOCAL_SIGNER_SECRET_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32 + 1 + 32;
+
 // ─── Per-type field offsets (Message, type 1) ───
 
 pub mod message_offsets {

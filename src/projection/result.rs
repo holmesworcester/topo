@@ -42,6 +42,8 @@ pub enum EmitCommand {
     RetryFileSliceGuards { file_id: String },
     /// Record a guard-block for a file_slice awaiting its descriptor.
     RecordFileSliceGuardBlock { file_id: String, event_id: String },
+    /// Refresh transport credentials from projected local_signer_material (peer_shared key).
+    RefreshTransportCreds,
 }
 
 /// The pure projector contract: everything a projector returns.

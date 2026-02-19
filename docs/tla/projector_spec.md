@@ -32,6 +32,7 @@ Changes to this document require TLA+ model re-verification.
 | 24 | MessageAttachment | — | 633B | Shared | Yes | Yes | 64 | runtime (1..5) |
 | 25 | FileSlice | — | 262286B | Shared | Yes | Yes | 64 | runtime (1..5) |
 | 26 | BenchDep | — | 345B | Shared | No | No | 0 | — |
+| 27 | LocalSignerSecret | LocalSignerSecret | 74B | Local | No | No | 0 | — |
 
 ## Signer Type Resolution
 
@@ -68,11 +69,12 @@ Changes to this document require TLA+ model re-verification.
 | 19 | {admin_boot_event_id, signed_by} | [admin_boot_event_id, signed_by] |
 | 20 | {target_event_id, signed_by} | [target_event_id, signed_by] |
 | 21 | {target_event_id, signed_by} | [target_event_id, signed_by] |
-| 22 | {key_event_id, recipient_event_id, signed_by} | [key_event_id, recipient_event_id, signed_by] |
+| 22 | {recipient_event_id, signed_by} | [recipient_event_id, signed_by] (key_event_id is a hint, validated at materialization) |
 | 23 | {signed_by} | [signed_by] |
 | 24 | {message_id, key_event_id, signed_by} | [message_id, key_event_id, signed_by] |
 | 25 | {signed_by} | [signed_by] |
 | 26 | {dep_id × 10 slots} | [dep_id × non-zero slots] |
+| 27 | {signer_event_id} | [signer_event_id] |
 
 ## Guards (TLA+ Guard → Rust pipeline check)
 
@@ -110,6 +112,7 @@ Changes to this document require TLA+ model re-verification.
 | 24 | project_message_attachment | message_attachments | — |
 | 25 | project_file_slice | file_slices | signature verification |
 | 26 | (none) | valid_events | dependency benchmark event; no projection table side effects |
+| 27 | project_local_signer_secret | local_signer_material | UPSERT by signer_event_id; emits RefreshTransportCreds for peer_shared |
 
 ## Shared Pipeline Stages
 
@@ -228,6 +231,31 @@ BenchDep (26): type_code(1) | created_at_ms(8) | dep_slots(10 × 32 = 320) | pay
 - 10 fixed dep slots; unused slots are all-zeros
 - no `dep_count` field; application counts non-zero slots
 
+### 74B fixed unsigned (LocalSignerSecret)
+```
+LocalSignerSecret (27): type_code(1) | created_at_ms(8) | signer_event_id(32) | signer_kind(1) | private_key_bytes(32) = 74B
+```
+- signer_kind: 1=workspace, 2=user, 3=peer_shared
+- Dep: signer_event_id (types 8, 14, 15, 16, 17)
+- ShareScope: Local (never shared across peers)
+- Projector: UPSERT into local_signer_material (Delete + InsertOrIgnore)
+- EmitCommand: RefreshTransportCreds when signer_kind == 3 (peer_shared)
+
+### Key-wrap dependency model
+
+`secret_shared.key_event_id` is a **hint**, not a hard dependency. The key_event_id
+field is carried in the wire format but excluded from dep_fields. Validation occurs
+at materialization time: when a recipient unwraps the content key, the deterministic
+`secret_key` event ID is computed from the plaintext key bytes and compared against
+`key_event_id`. Mismatch causes the unwrap to be skipped (the key material is corrupt
+or tampered).
+
+This means:
+- `encrypted` events hard-dep on `secret_key` (key_event_id in dep_fields)
+- `secret_shared` does NOT hard-dep on `secret_key` (key_event_id is a hint)
+- Out-of-order arrival is handled: secret_shared can project before the local
+  secret_key exists; encrypted blocks until secret_key is projected
+
 ### Canonical text slot rules
 1. UTF-8 required (reject invalid UTF-8 sequences)
 2. Zero-padding required: all bytes after the last content byte must be 0x00
@@ -270,7 +298,7 @@ The following parser-level canonicalization guarantees are enforced in Rust but 
 | InvAllValidRequireWorkspace | test_bootstrap_sequence: non-local events require workspace valid |
 | InvMessageWorkspace | Message projection requires workspace (workspace_event_id dep) |
 | InvEncryptedKey | Encrypted content requires valid secret_key dependency |
-| InvSecretSharedKey | SecretShared requires valid secret_key dependency |
+| InvSecretSharedKey | SecretShared key_event_id is a hint (validated at materialization, not projection) |
 | InvFileSliceAuth | FileSlice and MessageAttachment for the same file must share the same signer |
 | InvRemovalExclusion | project_secret_shared: reject if recipient removed |
 | InvUserRemovalTransitiveDeny | user_removed transitively denies all peers linked via peers_shared.user_event_id |
@@ -279,7 +307,7 @@ The following parser-level canonicalization guarantees are enforced in Rust but 
 
 When a joiner accepts an invite, the acceptance path unwraps bootstrap content-key material (from the invite link) and materializes local `secret_key` events with deterministic event IDs. The deterministic ID derivation (BLAKE2b of key bytes → `created_at_ms`) ensures that both inviter and joiner produce matching `key_event_id` values without out-of-band coordination. This enables encrypted events referencing those keys to unblock via normal cascade after key materialization.
 
-The TLA model does not distinguish bootstrap vs runtime SecretShared structurally — both use the same event type with identical dependency semantics ({SecretKey, PeerSharedOngoing}). The bootstrap/runtime distinction is a key-source detail below the model's abstraction boundary.
+The TLA model does not distinguish bootstrap vs runtime SecretShared structurally — both use the same event type with identical dependency semantics ({PeerSharedOngoing}). The `key_event_id` field is a hint validated at materialization time, not a hard dependency. The bootstrap/runtime distinction is a key-source detail below the model's abstraction boundary.
 
 ## Transport Credential Lifecycle (TransportCredentialLifecycle.tla)
 

@@ -6,6 +6,7 @@ pub mod encrypted;
 pub mod file_slice;
 pub mod fixed_layout;
 pub mod invite_accepted;
+pub mod local_signer_secret;
 pub mod message;
 pub mod message_deletion;
 pub mod workspace;
@@ -44,6 +45,7 @@ pub use signed_memo::SignedMemoEvent;
 pub use user::{UserBootEvent, UserOngoingEvent};
 pub use user_invite::{UserInviteBootEvent, UserInviteOngoingEvent};
 pub use transport_key::TransportKeyEvent;
+pub use local_signer_secret::LocalSignerSecretEvent;
 pub use user_removed::UserRemovedEvent;
 
 pub const EVENT_TYPE_MESSAGE: u8 = 1;
@@ -71,6 +73,7 @@ pub const EVENT_TYPE_TRANSPORT_KEY: u8 = 23;
 pub const EVENT_TYPE_MESSAGE_ATTACHMENT: u8 = 24;
 pub const EVENT_TYPE_FILE_SLICE: u8 = 25;
 pub const EVENT_TYPE_BENCH_DEP: u8 = 26;
+pub const EVENT_TYPE_LOCAL_SIGNER_SECRET: u8 = 27;
 
 /// Max event blob size: 1 MiB
 pub const EVENT_MAX_BLOB_BYTES: usize = 1024 * 1024;
@@ -102,6 +105,7 @@ pub enum ParsedEvent {
     MessageAttachment(MessageAttachmentEvent),
     FileSlice(FileSliceEvent),
     BenchDep(BenchDepEvent),
+    LocalSignerSecret(LocalSignerSecretEvent),
 }
 
 impl ParsedEvent {
@@ -132,6 +136,7 @@ impl ParsedEvent {
             ParsedEvent::MessageAttachment(a) => a.created_at_ms,
             ParsedEvent::FileSlice(f) => f.created_at_ms,
             ParsedEvent::BenchDep(b) => b.created_at_ms,
+            ParsedEvent::LocalSignerSecret(l) => l.created_at_ms,
         }
     }
 
@@ -176,7 +181,6 @@ impl ParsedEvent {
                 ("signed_by", r.signed_by),
             ],
             ParsedEvent::SecretShared(s) => vec![
-                ("key_event_id", s.key_event_id),
                 ("recipient_event_id", s.recipient_event_id),
                 ("signed_by", s.signed_by),
             ],
@@ -188,6 +192,7 @@ impl ParsedEvent {
             ],
             ParsedEvent::FileSlice(f) => vec![("signed_by", f.signed_by)],
             ParsedEvent::BenchDep(b) => b.dep_ids.iter().map(|id| ("dep_id", *id)).collect(),
+            ParsedEvent::LocalSignerSecret(l) => vec![("signer_event_id", l.signer_event_id)],
         }
     }
 
@@ -218,6 +223,7 @@ impl ParsedEvent {
             ParsedEvent::MessageAttachment(_) => EVENT_TYPE_MESSAGE_ATTACHMENT,
             ParsedEvent::FileSlice(_) => EVENT_TYPE_FILE_SLICE,
             ParsedEvent::BenchDep(_) => EVENT_TYPE_BENCH_DEP,
+            ParsedEvent::LocalSignerSecret(_) => EVENT_TYPE_LOCAL_SIGNER_SECRET,
         }
     }
 
@@ -249,7 +255,8 @@ impl ParsedEvent {
             | ParsedEvent::SecretKey(_)
             | ParsedEvent::Workspace(_)
             | ParsedEvent::InviteAccepted(_)
-            | ParsedEvent::BenchDep(_) => None,
+            | ParsedEvent::BenchDep(_)
+            | ParsedEvent::LocalSignerSecret(_) => None,
         }
     }
 }
@@ -335,6 +342,7 @@ pub fn registry() -> &'static EventRegistry {
             &message_attachment::MESSAGE_ATTACHMENT_META,
             &file_slice::FILE_SLICE_META,
             &bench_dep::BENCH_DEP_META,
+            &local_signer_secret::LOCAL_SIGNER_SECRET_META,
         ])
     })
 }
@@ -735,7 +743,7 @@ mod tests {
         assert_eq!(uib_meta.signature_byte_len, 64);
 
         let ss_meta = reg.lookup(EVENT_TYPE_SECRET_SHARED).unwrap();
-        assert_eq!(ss_meta.dep_fields, &["key_event_id", "recipient_event_id", "signed_by"]);
+        assert_eq!(ss_meta.dep_fields, &["recipient_event_id", "signed_by"]);
 
         assert!(reg.lookup(99).is_none());
     }
@@ -743,7 +751,7 @@ mod tests {
     #[test]
     fn test_registry_encryptable_coverage() {
         let reg = registry();
-        let encryptable_codes: Vec<u8> = (1..=26u8)
+        let encryptable_codes: Vec<u8> = (1..=27u8)
             .filter(|c| reg.lookup(*c).map_or(false, |m| m.encryptable))
             .collect();
         // Must match the admissible set from projector_spec:
@@ -755,7 +763,7 @@ mod tests {
             "encryptable set drifted from expected admissible inner types"
         );
         // Identity/infrastructure types must NOT be encryptable
-        for code in [5, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 26] {
+        for code in [5, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 26, 27] {
             let meta = reg.lookup(code).unwrap();
             assert!(
                 !meta.encryptable,

@@ -81,8 +81,8 @@ PeerSharedOngoing == "peer_shared_ongoing"
 AdminBoot == "admin_bootstrap"
 AdminOngoing == "admin_ongoing"
 
-\* Local peer (never shared)
-Peer == "peer"
+\* Local signer secret (never shared)
+LocalSignerSecret == "local_signer_secret"
 
 \* Content
 Channel == "channel"
@@ -122,7 +122,7 @@ FullEventTypes == {
     UserBoot, UserOngoing,
     PeerSharedFirst, PeerSharedOngoing,
     AdminBoot, AdminOngoing,
-    Peer,
+    LocalSignerSecret,
     Channel, Message, MessageReaction, MessageDeletion,
     MessageAttachment, FileSlice,
     TransportKey,
@@ -136,7 +136,7 @@ FullEvents == FullEventTypes \cup AllWorkspaceEvents
 \* Local-only events (no workspace dep, no trust anchor gate).
 \* Encrypted is local because it's a cryptographic wrapper; its workspace
 \* requirement comes from the inner event, not the wrapper itself.
-LocalRoots == {InviteAccepted, Peer, SecretKey, Encrypted}
+LocalRoots == {InviteAccepted, LocalSignerSecret, SecretKey, Encrypted}
 
 \* Singleton event types that require workspace to be valid
 WorkspaceGuardedEvents == FullEventTypes \ LocalRoots
@@ -159,7 +159,7 @@ IdentityEvents == {
     UserBoot, UserOngoing,
     PeerSharedFirst, PeerSharedOngoing,
     AdminBoot, AdminOngoing,
-    Peer,
+    LocalSignerSecret,
     TransportKey,
     UserRemoved, PeerRemoved
 } \cup AllWorkspaceEvents
@@ -204,7 +204,7 @@ RawDeps(e) ==
        [] e = AdminBoot -> {Workspace}
        [] e = AdminOngoing -> {Workspace, AdminBoot}
 
-       [] e = Peer -> {}
+       [] e = LocalSignerSecret -> {}
 
        \* Content: message depends on workspace; reaction/deletion depend on message
        [] e = Message -> {Workspace}
@@ -218,7 +218,7 @@ RawDeps(e) ==
        \* secret_shared wraps key to recipient (PeerShared for runtime, invite key for bootstrap);
        \* encrypted depends on secret_key
        [] e = SecretKey -> {}
-       [] e = SecretShared -> {SecretKey, PeerSharedOngoing}
+       [] e = SecretShared -> {PeerSharedOngoing}
        [] e = Encrypted -> {SecretKey}
 
        \* Removal: depends on the entity being removed
@@ -665,11 +665,9 @@ InvEncryptedKey ==
     THEN \A p \in Peers: (Encrypted \in valid[p]) => (SecretKey \in valid[p])
     ELSE TRUE
 
-\* SecretShared requires secret_key.
-InvSecretSharedKey ==
-    IF SecretShared \in EVENTS /\ SecretKey \in EVENTS
-    THEN \A p \in Peers: (SecretShared \in valid[p]) => (SecretKey \in valid[p])
-    ELSE TRUE
+\* SecretShared carries key_event_id as a hint (not a hard dep).
+\* Validation happens at materialization time, not at projection time.
+InvSecretSharedKey == TRUE
 
 \* File slice authorization: if both FileSlice and MessageAttachment are valid,
 \* they must share the same signer (modeled abstractly: both require PeerSharedOngoing).

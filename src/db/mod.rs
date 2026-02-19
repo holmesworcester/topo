@@ -106,6 +106,7 @@ pub fn migrate_recorded_by(
         "file_slices",
         "intro_attempts",
         "peer_endpoint_observations",
+        "local_signer_material",
     ] {
         tx.execute(
             &format!("UPDATE {} SET recorded_by = ?1 WHERE recorded_by = ?2", table),
@@ -138,20 +139,6 @@ pub fn migrate_recorded_by(
             rusqlite::params![new, old],
         )?;
     }
-
-    // Service tables (recorded_by, may not exist)
-    let _ = tx.execute(
-        "UPDATE local_peer_signers SET recorded_by = ?1 WHERE recorded_by = ?2",
-        rusqlite::params![new, old],
-    );
-    let _ = tx.execute(
-        "UPDATE local_workspace_keys SET recorded_by = ?1 WHERE recorded_by = ?2",
-        rusqlite::params![new, old],
-    );
-    let _ = tx.execute(
-        "UPDATE local_user_keys SET recorded_by = ?1 WHERE recorded_by = ?2",
-        rusqlite::params![new, old],
-    );
 
     tx.commit()?;
     Ok(())

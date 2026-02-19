@@ -21,6 +21,9 @@ use crate::event_modules::{
     WorkspaceEvent,
     message, reaction, message_deletion, user_removed,
     workspace, user, peer_shared, admin, transport_key,
+    local_signer_secret::{
+        LocalSignerSecretEvent, SIGNER_KIND_WORKSPACE, SIGNER_KIND_USER, SIGNER_KIND_PEER_SHARED,
+    },
 };
 use crate::projection::create::{create_event_sync, create_event_staged, create_signed_event_sync};
 use crate::projection::apply::project_one;
@@ -332,21 +335,6 @@ pub fn parse_hex_event_id(hex_str: &str) -> ServiceResult<[u8; 32]> {
 }
 
 
-fn ensure_local_signer_tables(
-    db: &rusqlite::Connection,
-) -> ServiceResult<()> {
-    db.execute(
-        "CREATE TABLE IF NOT EXISTS local_peer_signers (
-            recorded_by TEXT PRIMARY KEY,
-            event_id TEXT NOT NULL,
-            signing_key BLOB NOT NULL,
-            updated_at INTEGER NOT NULL
-        )",
-        [],
-    )?;
-    Ok(())
-}
-
 fn decode_signing_key(key_bytes: Vec<u8>) -> ServiceResult<SigningKey> {
     let key_arr: [u8; 32] = key_bytes
         .try_into()
@@ -354,44 +342,36 @@ fn decode_signing_key(key_bytes: Vec<u8>) -> ServiceResult<SigningKey> {
     Ok(SigningKey::from_bytes(&key_arr))
 }
 
-fn persist_local_peer_signer(
+/// Emit a local_signer_secret event for the given signer identity.
+/// The event is projected into `local_signer_material` via the projector.
+fn emit_local_signer_secret(
     db: &rusqlite::Connection,
     recorded_by: &str,
-    event_id_b64: &str,
+    signer_event_id: &EventId,
+    signer_kind: u8,
     signing_key: &SigningKey,
-) -> ServiceResult<()> {
-    ensure_local_signer_tables(db)?;
-    let now = current_timestamp_ms() as i64;
-    db.execute(
-        "INSERT INTO local_peer_signers (recorded_by, event_id, signing_key, updated_at)
-         VALUES (?1, ?2, ?3, ?4)
-         ON CONFLICT(recorded_by)
-         DO UPDATE SET event_id = excluded.event_id,
-                       signing_key = excluded.signing_key,
-                       updated_at = excluded.updated_at",
-        rusqlite::params![
-            recorded_by,
-            event_id_b64,
-            signing_key.to_bytes().as_slice(),
-            now
-        ],
-    )?;
-    Ok(())
+) -> ServiceResult<EventId> {
+    let evt = ParsedEvent::LocalSignerSecret(LocalSignerSecretEvent {
+        created_at_ms: current_timestamp_ms(),
+        signer_event_id: *signer_event_id,
+        signer_kind,
+        private_key_bytes: signing_key.to_bytes(),
+    });
+    create_event_sync(db, recorded_by, &evt)
+        .map_err(|e| ServiceError(format!("emit local_signer_secret failed: {}", e)))
 }
 
 fn load_local_peer_signer(
     db: &rusqlite::Connection,
     recorded_by: &str,
 ) -> ServiceResult<Option<(EventId, SigningKey)>> {
-    ensure_local_signer_tables(db)?;
-
     if let Some((eid_b64, key_bytes)) = db
         .query_row(
-            "SELECT l.event_id, l.signing_key
-             FROM local_peer_signers l
+            "SELECT l.signer_event_id, l.private_key
+             FROM local_signer_material l
              INNER JOIN peers_shared p
-               ON p.recorded_by = l.recorded_by AND p.event_id = l.event_id
-             WHERE l.recorded_by = ?1
+               ON p.recorded_by = l.recorded_by AND p.event_id = l.signer_event_id
+             WHERE l.recorded_by = ?1 AND l.signer_kind = 3
              LIMIT 1",
             rusqlite::params![recorded_by],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
@@ -413,11 +393,11 @@ pub fn load_local_peer_signer_pub(
     db: &rusqlite::Connection,
     recorded_by: &str,
 ) -> ServiceResult<Option<(EventId, SigningKey)>> {
-    ensure_local_signer_tables(db)?;
-
     if let Some((eid_b64, key_bytes)) = db
         .query_row(
-            "SELECT event_id, signing_key FROM local_peer_signers WHERE recorded_by = ?1",
+            "SELECT signer_event_id, private_key FROM local_signer_material
+             WHERE recorded_by = ?1 AND signer_kind = 3
+             LIMIT 1",
             rusqlite::params![recorded_by],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
         )
@@ -432,56 +412,15 @@ pub fn load_local_peer_signer_pub(
     Ok(None)
 }
 
-// ---------------------------------------------------------------------------
-// local_user_keys table — persists user signing keys for daemon device-link
-// ---------------------------------------------------------------------------
-
-fn ensure_local_user_key_table(db: &rusqlite::Connection) -> ServiceResult<()> {
-    db.execute(
-        "CREATE TABLE IF NOT EXISTS local_user_keys (
-            recorded_by TEXT PRIMARY KEY,
-            event_id TEXT NOT NULL,
-            signing_key BLOB NOT NULL,
-            updated_at INTEGER NOT NULL
-        )",
-        [],
-    )?;
-    Ok(())
-}
-
-pub fn persist_local_user_key(
-    db: &rusqlite::Connection,
-    recorded_by: &str,
-    event_id_b64: &str,
-    user_key: &SigningKey,
-) -> ServiceResult<()> {
-    ensure_local_user_key_table(db)?;
-    let now = current_timestamp_ms() as i64;
-    db.execute(
-        "INSERT INTO local_user_keys (recorded_by, event_id, signing_key, updated_at)
-         VALUES (?1, ?2, ?3, ?4)
-         ON CONFLICT(recorded_by)
-         DO UPDATE SET event_id = excluded.event_id,
-                       signing_key = excluded.signing_key,
-                       updated_at = excluded.updated_at",
-        rusqlite::params![
-            recorded_by,
-            event_id_b64,
-            user_key.to_bytes().as_slice(),
-            now
-        ],
-    )?;
-    Ok(())
-}
-
 pub fn load_local_user_key(
     db: &rusqlite::Connection,
     recorded_by: &str,
 ) -> ServiceResult<Option<(EventId, SigningKey)>> {
-    ensure_local_user_key_table(db)?;
     if let Some((eid_b64, key_bytes)) = db
         .query_row(
-            "SELECT event_id, signing_key FROM local_user_keys WHERE recorded_by = ?1",
+            "SELECT signer_event_id, private_key FROM local_signer_material
+             WHERE recorded_by = ?1 AND signer_kind = 2
+             LIMIT 1",
             rusqlite::params![recorded_by],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
         )
@@ -585,12 +524,10 @@ pub fn ensure_identity_chain(
     let psf_eid = create_signed_event_sync(db, recorded_by, &psf, &device_invite_key)
         .map_err(|e| ServiceError(format!("{}", e)))?;
 
-    let psf_b64 = event_id_to_base64(&psf_eid);
-    persist_local_peer_signer(db, recorded_by, &psf_b64, &peer_shared_key)?;
-
-    // Persist user key for later device-link creation
-    let ub_b64 = event_id_to_base64(&ub_eid);
-    persist_local_user_key(db, recorded_by, &ub_b64, &user_key)?;
+    // Emit local_signer_secret events for all three signing keys
+    emit_local_signer_secret(db, recorded_by, &psf_eid, SIGNER_KIND_PEER_SHARED, &peer_shared_key)?;
+    emit_local_signer_secret(db, recorded_by, &ub_eid, SIGNER_KIND_USER, &user_key)?;
+    emit_local_signer_secret(db, recorded_by, &ws_eid, SIGNER_KIND_WORKSPACE, &workspace_key)?;
 
     // Seed deterministic local content-key material used by invite key-wrap.
     let _ = crate::identity::ops::ensure_content_key_for_peer(
@@ -599,9 +536,6 @@ pub fn ensure_identity_chain(
         &peer_shared_key,
         &psf_eid,
     ).map_err(|e| ServiceError(format!("failed to ensure content key: {}", e)))?;
-
-    // Persist workspace key for later invite creation
-    persist_workspace_key(db, recorded_by, &workspace_key)?;
 
     Ok((psf_eid, peer_shared_key))
 }
@@ -1411,17 +1345,12 @@ pub fn svc_create_invite(
     let ws_eid = event_id_from_base64(&workspace_id)
         .ok_or_else(|| ServiceError("Invalid workspace_id in trust_anchors".into()))?;
 
-    // Look up the workspace signing key from the workspace event's public key,
-    // then find the matching signer. For invite creation we need the workspace
-    // key stored during bootstrap (in local_peer_signers we only store peer_shared).
-    // The workspace key is stored in a separate table by ensure_identity_chain.
-    //
-    // For now, we require the caller to have the workspace_key stored.
-    // Check local_workspace_keys table (created by bootstrap).
-    ensure_workspace_key_table(&db)?;
+    // Load workspace signing key from projection-owned local_signer_material
     let ws_key_bytes: Vec<u8> = db
         .query_row(
-            "SELECT signing_key FROM local_workspace_keys WHERE recorded_by = ?1",
+            "SELECT private_key FROM local_signer_material
+             WHERE recorded_by = ?1 AND signer_kind = 1
+             LIMIT 1",
             [&recorded_by],
             |row| row.get(0),
         )
@@ -1582,13 +1511,7 @@ pub async fn svc_accept_invite(
         &invite.bootstrap_spki_fingerprint,
     )?;
 
-    // Persist signer key so future commands can sign events
     let psf_b64 = event_id_to_base64(&join.peer_shared_event_id);
-    persist_local_peer_signer(&db, &recorded_by, &psf_b64, &join.peer_shared_key)?;
-
-    // Persist user key for device-link creation
-    let ub_b64 = event_id_to_base64(&join.user_event_id);
-    persist_local_user_key(&db, &recorded_by, &ub_b64, &join.user_key)?;
 
     // Push identity chain events back to inviter (while still using invite-derived
     // cert, which the inviter trusts via pending_invite_bootstrap_trust). This ensures
@@ -1606,6 +1529,12 @@ pub async fn svc_accept_invite(
     .map_err(|e| ServiceError(format!("Push-back sync failed: {}", e)))?;
 
     let db = open_connection(db_path)?;
+
+    // Emit local_signer_secret events AFTER push-back sync: the peer_shared emit
+    // triggers RefreshTransportCreds which installs the PeerShared-derived transport
+    // identity, so it must happen after the push-back sync completes.
+    emit_local_signer_secret(&db, &recorded_by, &join.peer_shared_event_id, SIGNER_KIND_PEER_SHARED, &join.peer_shared_key)?;
+    emit_local_signer_secret(&db, &recorded_by, &join.user_event_id, SIGNER_KIND_USER, &join.user_key)?;
 
     // Transition transport identity: replace invite-derived cert with
     // PeerShared-derived cert so transport and event-layer identities match.
@@ -1706,9 +1635,7 @@ pub async fn svc_accept_device_link(
         &invite.bootstrap_spki_fingerprint,
     )?;
 
-    // Persist signer key
     let psf_b64 = event_id_to_base64(&link.peer_shared_event_id);
-    persist_local_peer_signer(&db, &recorded_by, &psf_b64, &link.peer_shared_key)?;
 
     // Push identity chain events back to inviter (while still using invite-derived
     // cert, which the inviter trusts via pending_invite_bootstrap_trust).
@@ -1726,6 +1653,10 @@ pub async fn svc_accept_device_link(
 
     let db = open_connection(db_path)?;
 
+    // Emit local_signer_secret AFTER push-back sync: the peer_shared emit triggers
+    // RefreshTransportCreds which installs PeerShared-derived transport identity.
+    emit_local_signer_secret(&db, &recorded_by, &link.peer_shared_event_id, SIGNER_KIND_PEER_SHARED, &link.peer_shared_key)?;
+
     // Transition transport identity: replace invite-derived cert with
     // PeerShared-derived cert so transport and event-layer identities match.
     let new_peer_id = crate::identity::transport::install_peer_key_transport_identity(
@@ -1739,38 +1670,6 @@ pub async fn svc_accept_device_link(
         peer_id: new_peer_id,
         peer_shared_event_id: psf_b64,
     })
-}
-
-/// Ensure the local_workspace_keys table exists (stores workspace signing keys
-/// for invite creation by workspace creators).
-fn ensure_workspace_key_table(db: &rusqlite::Connection) -> ServiceResult<()> {
-    db.execute(
-        "CREATE TABLE IF NOT EXISTS local_workspace_keys (
-            recorded_by TEXT PRIMARY KEY,
-            signing_key BLOB NOT NULL,
-            updated_at INTEGER NOT NULL
-        )",
-        [],
-    )?;
-    Ok(())
-}
-
-/// Persist the workspace signing key for later invite creation.
-pub fn persist_workspace_key(
-    db: &rusqlite::Connection,
-    recorded_by: &str,
-    workspace_key: &SigningKey,
-) -> ServiceResult<()> {
-    ensure_workspace_key_table(db)?;
-    let now = current_timestamp_ms() as i64;
-    db.execute(
-        "INSERT INTO local_workspace_keys (recorded_by, signing_key, updated_at)
-         VALUES (?1, ?2, ?3)
-         ON CONFLICT(recorded_by)
-         DO UPDATE SET signing_key = excluded.signing_key, updated_at = excluded.updated_at",
-        rusqlite::params![recorded_by, workspace_key.to_bytes().as_slice(), now],
-    )?;
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1814,10 +1713,11 @@ pub fn svc_create_invite_with_spki(
     let ws_eid = event_id_from_base64(&workspace_id)
         .ok_or_else(|| ServiceError("Invalid workspace_id in trust_anchors".into()))?;
 
-    ensure_workspace_key_table(&db)?;
     let ws_key_bytes: Vec<u8> = db
         .query_row(
-            "SELECT signing_key FROM local_workspace_keys WHERE recorded_by = ?1",
+            "SELECT private_key FROM local_signer_material
+             WHERE recorded_by = ?1 AND signer_kind = 1
+             LIMIT 1",
             [&recorded_by],
             |row| row.get(0),
         )
