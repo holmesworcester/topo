@@ -970,6 +970,22 @@ impl Peer {
             .expect("collect")
     }
 
+    /// Get a random sample of sync-eligible (shared-scope) event IDs (base64).
+    pub fn sample_shared_event_ids(&self, count: usize) -> Vec<String> {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        let mut stmt = db.prepare(
+            "SELECT event_id
+             FROM events
+             WHERE share_scope = 'shared'
+             ORDER BY RANDOM()
+             LIMIT ?1",
+        ).expect("prepare");
+        stmt.query_map(rusqlite::params![count as i64], |row| row.get::<_, String>(0))
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect")
+    }
+
     /// Insert `count` synthetic pending_invite_bootstrap_trust rows for this peer.
     /// Returns the generated SPKI fingerprints.
     pub fn seed_transport_keys(&self, count: usize) -> Vec<[u8; 32]> {
