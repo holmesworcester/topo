@@ -99,7 +99,11 @@ pub fn project_pure(
 
     match &ctx.trust_anchor_workspace_id {
         None => {
-            // No trust anchor yet — block until invite_accepted sets it
+            // Guard-block: no trust anchor yet. Returns Block with empty
+            // missing vec because the blocker is the trust anchor (set by
+            // invite_accepted), not a specific event dep. Recovery:
+            // invite_accepted emits RetryWorkspaceEvent { workspace_id }
+            // which re-projects this event after the anchor is written.
             ProjectorResult::block(vec![])
         }
         Some(anchor_wid) if anchor_wid == &workspace_id_b64 => {

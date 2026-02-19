@@ -174,3 +174,82 @@ pub fn execute_query(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::Peer;
+    use crate::db::open_connection;
+
+    #[test]
+    fn test_execute_query_routes_correctly() {
+        let peer = Peer::new_with_identity("dispatch-q");
+        let db = open_connection(&peer.db_path).unwrap();
+
+        // WorkspaceName
+        let res = execute_query(&db, &peer.identity, EventQuery::WorkspaceName).unwrap();
+        match res {
+            QueryResult::String(name) => assert!(!name.is_empty()),
+            _ => panic!("expected QueryResult::String"),
+        }
+
+        // MessageCount (should be 0 before any messages)
+        let res = execute_query(&db, &peer.identity, EventQuery::MessageCount).unwrap();
+        match res {
+            QueryResult::Count(n) => assert_eq!(n, 0),
+            _ => panic!("expected QueryResult::Count"),
+        }
+
+        // UserList
+        let res = execute_query(&db, &peer.identity, EventQuery::UserList).unwrap();
+        match res {
+            QueryResult::Users(users) => assert!(!users.is_empty()),
+            _ => panic!("expected QueryResult::Users"),
+        }
+
+        // PeerSharedAccounts
+        let res = execute_query(&db, &peer.identity, EventQuery::PeerSharedAccounts).unwrap();
+        match res {
+            QueryResult::Accounts(accts) => assert!(!accts.is_empty()),
+            _ => panic!("expected QueryResult::Accounts"),
+        }
+
+        // AdminEventIds
+        let res = execute_query(&db, &peer.identity, EventQuery::AdminEventIds).unwrap();
+        match res {
+            QueryResult::Strings(ids) => assert!(!ids.is_empty()),
+            _ => panic!("expected QueryResult::Strings"),
+        }
+    }
+
+    #[test]
+    fn test_execute_command_creates_message() {
+        let peer = Peer::new_with_identity("dispatch-c");
+        let db = open_connection(&peer.db_path).unwrap();
+        let signer_eid = peer.peer_shared_event_id.as_ref().unwrap();
+        let signing_key = peer.peer_shared_signing_key.as_ref().unwrap();
+
+        let eid = execute_command(
+            &db,
+            &peer.identity,
+            signer_eid,
+            signing_key,
+            1000,
+            EventCommand::Message(message::CreateMessageCmd {
+                workspace_id: peer.workspace_id,
+                author_id: peer.author_id,
+                content: "hello dispatch".to_string(),
+            }),
+        )
+        .unwrap();
+
+        // Verify via query dispatch
+        let res = execute_query(&db, &peer.identity, EventQuery::MessageCount).unwrap();
+        match res {
+            QueryResult::Count(n) => assert_eq!(n, 1),
+            _ => panic!("expected QueryResult::Count"),
+        }
+
+        let _ = eid; // suppress unused warning
+    }
+}

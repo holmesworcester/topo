@@ -83,7 +83,7 @@ Phase-2 verification commands:
 1. `src/projection/encrypted.rs` depends on `run_dep_and_projection_stages`.
 2. `src/event_pipeline/ingest_runtime.rs`, `src/projection/create.rs`, `src/service.rs`, and `src/testutil.rs` depend on `project_one`.
 3. Cascade path must keep existing blocked-edge cleanup behavior (`blocked_event_deps` orphan cleanup after header removal).
-4. Guard-retry behavior (`RetryWorkspaceGuards`, `RetryFileSliceGuards`) must remain command-driven.
+4. Guard-retry behavior (`RetryWorkspaceEvent`, `RetryFileSliceGuards`) must remain command-driven.
 
 ## Acceptance Criteria
 1. `src/projection/apply.rs` is replaced by a module directory split with clear responsibilities.
