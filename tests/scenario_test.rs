@@ -10,9 +10,8 @@ use topo::transport::{
     extract_spki_fingerprint, peer_identity_from_connection,
 };
 use topo::network::loops::{accept_loop, connect_loop};
-use topo::testutil::noop_intro_spawner;
+use topo::testutil::{noop_intro_spawner, test_ingest_fns};
 use topo::db::open_connection;
-
 
 
 #[tokio::test]
@@ -3541,7 +3540,7 @@ async fn test_mdns_two_peers_discover_and_sync() {
     let _a_handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all().build().unwrap();
-        rt.block_on(async { let _ = accept_loop(&a_db, &a_id, ep_a, noop_intro_spawner).await; });
+        rt.block_on(async { let _ = accept_loop(&a_db, &a_id, ep_a, noop_intro_spawner, test_ingest_fns()).await; });
     });
 
     let b_db = bob.db_path.clone();
@@ -3550,7 +3549,7 @@ async fn test_mdns_two_peers_discover_and_sync() {
     let _b_handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all().build().unwrap();
-        rt.block_on(async { let _ = connect_loop(&b_db, &b_id, ep_b, remote, None, noop_intro_spawner).await; });
+        rt.block_on(async { let _ = connect_loop(&b_db, &b_id, ep_b, remote, None, noop_intro_spawner, test_ingest_fns()).await; });
     });
 
     // Wait for sync convergence using marker events
@@ -3708,7 +3707,7 @@ async fn test_mdns_multitenant_self_filtering_and_sync() {
     let _t0_handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all().build().unwrap();
-        rt.block_on(async { let _ = accept_loop(&t0_db, &t0_id, ep_t0, noop_intro_spawner).await; });
+        rt.block_on(async { let _ = accept_loop(&t0_db, &t0_id, ep_t0, noop_intro_spawner, test_ingest_fns()).await; });
     });
 
     let ext_db = ext.db_path.clone();
@@ -3717,7 +3716,7 @@ async fn test_mdns_multitenant_self_filtering_and_sync() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all().build().unwrap();
         rt.block_on(async {
-            let _ = connect_loop(&ext_db, &ext_identity, ep_ext, t0_connect_addr, None, noop_intro_spawner).await;
+            let _ = connect_loop(&ext_db, &ext_identity, ep_ext, t0_connect_addr, None, noop_intro_spawner, test_ingest_fns()).await;
         });
     });
 
@@ -4043,7 +4042,7 @@ async fn test_run_node_multitenant_outbound_isolation() {
             .enable_all().build().unwrap();
         rt.block_on(async move {
             let _ = accept_loop_with_ingest(
-                &a_db, &a_ids, endpoint_a, None, ingest_tx, HashMap::new(), noop_intro_spawner,
+                &a_db, &a_ids, endpoint_a, None, ingest_tx, HashMap::new(), noop_intro_spawner, test_ingest_fns(),
             ).await;
         });
     });
@@ -4111,7 +4110,7 @@ async fn test_run_node_multitenant_outbound_isolation() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all().build().unwrap();
         rt.block_on(async move {
-            let _ = connect_loop(&b0_db, &b0_id, ep_b0, addr_a, Some(b0_cfg), noop_intro_spawner).await;
+            let _ = connect_loop(&b0_db, &b0_id, ep_b0, addr_a, Some(b0_cfg), noop_intro_spawner, test_ingest_fns()).await;
         });
     });
 
@@ -4124,7 +4123,7 @@ async fn test_run_node_multitenant_outbound_isolation() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all().build().unwrap();
         rt.block_on(async move {
-            let _ = connect_loop(&b1_db, &b1_id, ep_b1, addr_a, Some(b1_cfg), noop_intro_spawner).await;
+            let _ = connect_loop(&b1_db, &b1_id, ep_b1, addr_a, Some(b1_cfg), noop_intro_spawner, test_ingest_fns()).await;
         });
     });
 

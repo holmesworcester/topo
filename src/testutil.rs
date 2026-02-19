@@ -45,6 +45,14 @@ pub fn noop_intro_spawner(
     tokio::task::spawn_local(async {})
 }
 
+/// Convenience: production `IngestFns` for tests.
+pub fn test_ingest_fns() -> crate::contracts::event_runtime_contract::IngestFns {
+    crate::contracts::event_runtime_contract::IngestFns {
+        batch_writer: crate::event_runtime::batch_writer,
+        drain_queue: crate::event_runtime::drain_project_queue,
+    }
+}
+
 fn current_timestamp_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1405,7 +1413,7 @@ pub fn start_peers(
             .build()
             .unwrap();
         rt.block_on(async move {
-            if let Err(e) = accept_loop(&a_db, &a_identity, listener_endpoint, noop_intro_spawner).await {
+            if let Err(e) = accept_loop(&a_db, &a_identity, listener_endpoint, noop_intro_spawner, test_ingest_fns()).await {
                 tracing::warn!("accept_loop exited: {}", e);
             }
         });
@@ -1417,7 +1425,7 @@ pub fn start_peers(
             .build()
             .unwrap();
         rt.block_on(async move {
-            if let Err(e) = connect_loop(&b_db, &b_identity, connector_endpoint, listener_addr, None, noop_intro_spawner).await {
+            if let Err(e) = connect_loop(&b_db, &b_identity, connector_endpoint, listener_addr, None, noop_intro_spawner, test_ingest_fns()).await {
                 tracing::warn!("connect_loop exited: {}", e);
             }
         });
@@ -1498,7 +1506,7 @@ pub fn start_peers_pinned(
             .build()
             .unwrap();
         rt.block_on(async move {
-            if let Err(e) = accept_loop(&a_db, &a_identity, listener_endpoint, noop_intro_spawner).await {
+            if let Err(e) = accept_loop(&a_db, &a_identity, listener_endpoint, noop_intro_spawner, test_ingest_fns()).await {
                 tracing::warn!("accept_loop exited: {}", e);
             }
         });
@@ -1510,7 +1518,7 @@ pub fn start_peers_pinned(
             .build()
             .unwrap();
         rt.block_on(async move {
-            if let Err(e) = connect_loop(&b_db, &b_identity, connector_endpoint, listener_addr, None, noop_intro_spawner).await {
+            if let Err(e) = connect_loop(&b_db, &b_identity, connector_endpoint, listener_addr, None, noop_intro_spawner, test_ingest_fns()).await {
                 tracing::warn!("connect_loop exited: {}", e);
             }
         });
@@ -1583,7 +1591,7 @@ pub fn start_peers_dynamic(
             .build()
             .unwrap();
         rt.block_on(async move {
-            if let Err(e) = accept_loop(&a_db, &a_identity, listener_endpoint, noop_intro_spawner).await {
+            if let Err(e) = accept_loop(&a_db, &a_identity, listener_endpoint, noop_intro_spawner, test_ingest_fns()).await {
                 tracing::warn!("accept_loop exited: {}", e);
             }
         });
@@ -1596,7 +1604,7 @@ pub fn start_peers_dynamic(
             .unwrap();
         rt.block_on(async move {
             if let Err(e) =
-                connect_loop(&b_db, &b_identity, connector_endpoint, listener_addr, None, noop_intro_spawner).await
+                connect_loop(&b_db, &b_identity, connector_endpoint, listener_addr, None, noop_intro_spawner, test_ingest_fns()).await
             {
                 tracing::warn!("connect_loop exited: {}", e);
             }
@@ -1775,7 +1783,7 @@ pub fn start_chain(peers: &[Peer]) -> Vec<std::thread::JoinHandle<()>> {
                 .build()
                 .unwrap();
             rt.block_on(async move {
-                if let Err(e) = accept_loop(&db_path, &identity, endpoint, noop_intro_spawner).await {
+                if let Err(e) = accept_loop(&db_path, &identity, endpoint, noop_intro_spawner, test_ingest_fns()).await {
                     tracing::warn!("chain accept_loop[{}] exited: {}", i, e);
                 }
             });
@@ -1794,7 +1802,7 @@ pub fn start_chain(peers: &[Peer]) -> Vec<std::thread::JoinHandle<()>> {
                 .build()
                 .unwrap();
             rt.block_on(async move {
-                if let Err(e) = connect_loop(&db_path, &identity, endpoint, remote, None, noop_intro_spawner).await {
+                if let Err(e) = connect_loop(&db_path, &identity, endpoint, remote, None, noop_intro_spawner, test_ingest_fns()).await {
                     tracing::warn!("chain connect_loop[{}] exited: {}", i, e);
                 }
             });
@@ -1862,7 +1870,7 @@ pub fn start_multi_source(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Joi
             .build()
             .unwrap();
         rt.block_on(async move {
-            if let Err(e) = accept_loop(&sink_db, &sink_identity, server_endpoint, noop_intro_spawner).await {
+            if let Err(e) = accept_loop(&sink_db, &sink_identity, server_endpoint, noop_intro_spawner, test_ingest_fns()).await {
                 tracing::warn!("sink accept_loop exited: {}", e);
             }
         });
@@ -1891,7 +1899,7 @@ pub fn start_multi_source(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Joi
                 .build()
                 .unwrap();
             rt.block_on(async move {
-                if let Err(e) = connect_loop(&db_path, &identity, endpoint, sink_addr, None, noop_intro_spawner).await {
+                if let Err(e) = connect_loop(&db_path, &identity, endpoint, sink_addr, None, noop_intro_spawner, test_ingest_fns()).await {
                     tracing::warn!("source connect_loop[{}] exited: {}", i, e);
                 }
             });
@@ -1960,7 +1968,7 @@ pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Jo
                 .build()
                 .unwrap();
             rt.block_on(async move {
-                if let Err(e) = accept_loop(&db_path, &identity, server_endpoint, noop_intro_spawner).await {
+                if let Err(e) = accept_loop(&db_path, &identity, server_endpoint, noop_intro_spawner, test_ingest_fns()).await {
                     tracing::warn!("source accept_loop exited: {}", e);
                 }
             });
@@ -1992,7 +2000,7 @@ pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Jo
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async move {
             if let Err(e) = download_from_sources(
-                &sink_db, &sink_identity, endpoint_pairs,
+                &sink_db, &sink_identity, endpoint_pairs, crate::event_runtime::batch_writer,
             ).await {
                 tracing::warn!("sink download_from_sources exited: {}", e);
             }
@@ -2055,7 +2063,7 @@ pub async fn connect_sync_once(
     conn.flush_data().await?;
 
     let stats = run_sync_initiator_dual(
-        conn, db_path, SYNC_SESSION_TIMEOUT_SECS, &peer_id, identity, None, None,
+        conn, db_path, SYNC_SESSION_TIMEOUT_SECS, &peer_id, identity, None, None, crate::event_runtime::batch_writer,
     ).await?;
 
     connection.close(0u32.into(), b"done");
@@ -2105,7 +2113,7 @@ pub fn start_sink_accept(
             .build()
             .unwrap();
         rt.block_on(async move {
-            if let Err(e) = accept_loop(&db_path, &identity, endpoint, noop_intro_spawner).await {
+            if let Err(e) = accept_loop(&db_path, &identity, endpoint, noop_intro_spawner, test_ingest_fns()).await {
                 tracing::warn!("sink accept_loop exited: {}", e);
             }
         });

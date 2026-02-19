@@ -1,32 +1,35 @@
-# Feedback: exec/option-b-network-boundary
+# Feedback: exec/option-b-phase6-hardening
 
 ## Findings
 
-1. **Medium — plan doc still contains a Phase 4 status contradiction**  
-   The plan marks Phase 4 complete in the status table, but still lists "(pending) - Phase 4" in the branch snapshot list.  
-   References: `docs/OPTION_B_NETWORK_BOUNDARY_IMPLEMENTATION_PLAN.md:358`, `docs/OPTION_B_NETWORK_BOUNDARY_IMPLEMENTATION_PLAN.md:369`
+No blocking or medium-severity findings in current HEAD (`aca8a90`).
 
-2. **Medium — plan claims one boundary item is resolved, but code still depends on sync internals**  
-   The plan states network-path dependency on sync internals is resolved, but `src/network/loops.rs` still imports and calls through `crate::sync::*` for session handling and intro listener wiring.  
-   References: `docs/OPTION_B_NETWORK_BOUNDARY_IMPLEMENTATION_PLAN.md:717`, `src/network/loops.rs:34`, `src/network/loops.rs:35`, `src/network/loops.rs:295`, `src/network/loops.rs:545`
+## Recheck Status
+
+Latest recheck is still clean on code: no uncommitted source/test changes detected (only `feedback.md` is modified in this worktree).
+
+## Residual Risks / Gaps
+
+1. **Low — protocol-violation tests assert termination semantics more than error semantics**  
+   The new violation coverage is good (garbage control frame, duplicate Done), but tests currently accept either `Ok` or `Err` outcomes as long as the handler terminates. If stricter invariants are desired, add assertions on expected error category/message for each injected violation.
+   References: `tests/replication_contract_tests/error_mapping.rs:311`, `tests/replication_contract_tests/error_mapping.rs:391`
 
 ## What I verified
 
-1. Before writing this feedback, `git status -sb` was clean.
-2. Current structure matches the intended extraction shape:
-   - `src/sync/engine.rs` is now a 19-line re-export shim.
-   - `src/node.rs` is a 6-line re-export composition root.
-   - `src/network/runtime.rs` and `src/network/loops.rs` contain the moved orchestration code.
-3. Tests run and pass on current HEAD (`c9ae259`):
+1. Worktree has no pending code edits (`git status -sb` shows only `feedback.md` modified).
+2. New fixes from `aca8a90` are present:
+   - `SessionIo` surface trimmed to split-only path (legacy direct-frame methods removed).
+   - Harness now includes fragmentation and deterministic protocol violation injection.
+3. Boundary and test gates passed on current HEAD (`aca8a90`):
+   - `bash scripts/check_boundary_imports.sh`
    - `cargo test --lib --no-run`
-   - `cargo test --test two_process_test -q`
+   - `cargo test --lib test_boundary_imports_enforced -q`
+   - `cargo test --test replication_contract_tests -q` (21 tests)
    - `cargo test --test holepunch_test -q`
-   - `cargo test --test cli_test -q`
-   - `cargo test --test rpc_test -q`
    - `cargo test --test scenario_test test_mdns_two_peers_discover_and_sync -q`
    - `cargo test --test scenario_test test_run_node_multitenant_outbound_isolation -q`
    - `cargo test --test scenario_test test_tenant_scoped_outbound_trust_rejects_untrusted_server -q`
 
 ## Summary
 
-No blocking runtime regressions found in tested paths. Remaining work is mainly boundary-hardening/document-accuracy cleanup before Phase 5 enforcement.
+Current branch state looks merge-ready from this review pass. The prior issues are addressed; only optional strictness improvements remain in protocol-violation assertions.

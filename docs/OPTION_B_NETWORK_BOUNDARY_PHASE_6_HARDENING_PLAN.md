@@ -222,11 +222,11 @@ Update this table in each PR/commit.
 
 | Workstream | Status | Commit | Notes |
 |---|---|---|---|
-| A Ingest Contract | Not Started | | |
-| B SessionIo De-concretion | Not Started | | |
-| C Module Splits | Not Started | | |
-| D Boundary Gates | Not Started | | |
-| E Isolation Harness | Not Started | | |
+| A Ingest Contract | Done | — | Added `IngestItem`, `BatchWriterFn`, `DrainQueueFn` to contracts; threaded fn pointers through network/replication; zero forbidden imports remain |
+| B SessionIo De-concretion | Done | — | Added `ControlIo`/`DataSendIo`/`DataRecvIo` sub-traits + `split()` method; adapter pattern in session_handler; zero downcast/QUIC refs in replication |
+| C Module Splits | Done | — | `runtime.rs` → 5 files (max 240 lines); `loops.rs` → 4 files (max 316 lines); `session.rs` → 5 files (max 366 lines) |
+| D Boundary Gates | Done | — | Hardened `check_boundary_imports.sh` with forbidden edges + positive contract checks; added `.github/workflows/boundary-check.yml` CI gate |
+| E Isolation Harness | Done | — | `FakeSessionIo` + 14 tests in `tests/replication_contract_tests/`: protocol ordering, cancellation semantics, error mapping, 3 anti-cheat mutation targets |
 
 ## Required Validation Commands (minimum)
 
