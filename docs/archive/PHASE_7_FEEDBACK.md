@@ -1,5 +1,7 @@
 # Phase 7 Feedback
 
+> **Historical feedback; file paths may not match the current source tree.**
+
 Reviewed commit: `78cdf82` (`Implement Phase 7: TLA-first minimal identity layer`)
 
 Scope note:

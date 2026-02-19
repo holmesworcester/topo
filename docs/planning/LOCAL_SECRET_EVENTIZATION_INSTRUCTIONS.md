@@ -1,5 +1,7 @@
 # Local Secret Eventization Instructions
 
+> **Executed; file paths may not match the current source tree.** `src/projection/identity.rs` is now split across event modules under `src/event_modules/`.
+
 ## Goal
 Move local signer private-key persistence from service-owned ad-hoc tables to local non-shareable canonical events + projection-owned state.
 

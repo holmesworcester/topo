@@ -1,6 +1,6 @@
 # QUIC Hole Punch Plan (Intro via Third Peer)
 
-> **Status: Active** — Implementation plan for NAT traversal (partially implemented on `quic-holepunch` branch).
+> **Historical plan; file paths may not match the current source tree.** `src/sync/protocol.rs` is now `src/protocol/wire.rs`.
 
 ## Goal
 Enable two peers (`A`, `B`) to establish a direct QUIC+mTLS connection using only endpoint tuples observed by a third peer (`I`) and sent as an intro message.

@@ -1,5 +1,7 @@
 # Phase 2.5 Feedback-Fix Review (`de1f135`, `d494552`)
 
+> **Historical feedback; file paths may not match the current source tree.**
+
 Assumption for this review:
 - Baseline issues from `PHASE_2_5_FEEDBACK.md` are the target (hard-error signer paths, non-durable rejects, tenant-scope ambiguity).
 - Review is scoped to the fix commits on branch `phase-2.5-feedback-fixes` and checked against the signer/dependency intent in `PLAN.md` (Phase 2.5/2.6 ordering and invariants).

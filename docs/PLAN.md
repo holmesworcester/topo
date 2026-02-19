@@ -40,11 +40,9 @@ Scheduling note:
 
 Current code in Topo (post-move from `codex-simplified`) is a useful sync prototype, but has deliberate gaps relative to this plan:
 
-1. ~~Fixed-size wire/event assumptions~~ **RESOLVED**: wire protocol moved to `src/sync/protocol.rs` with variable-length framing and `EVENT_MAX_BLOB_BYTES = 1 MiB` cap. No global fixed envelope size remains.
+1. ~~Fixed-size wire/event assumptions~~ **RESOLVED**: wire protocol moved to `src/protocol/wire.rs` with variable-length framing and `EVENT_MAX_BLOB_BYTES = 1 MiB` cap. No global fixed envelope size remains.
 2. ~~mTLS is not yet pinned/strict~~ **RESOLVED**: `src/transport/mod.rs` now uses `PinnedCertVerifier` with BLAKE2b-256 SPKI fingerprint pinning on both client and server sides. No permissive verifier remains in production paths.
-3. Projection pipeline is still message-specific and sync-engine-coupled:
-   - `src/sync/engine.rs` does inline parse/project for message rows.
-   - no global `project_one(recorded_by,event_id)` entrypoint yet.
+3. ~~Projection pipeline is still message-specific and sync-engine-coupled~~ **RESOLVED**: projection pipeline extracted to `src/projection/apply/` with global `project_one(recorded_by,event_id)` entrypoint. Ingest runtime in `src/event_pipeline/`.
 4. No dependency blocking model yet:
    - no `blocked_event_deps` / unblock/requeue flow.
 5. No per-tenant receive journal yet:
@@ -1644,9 +1642,9 @@ Notes:
 
 ### 16.6 Key implementation files
 
-- `src/sync/punch.rs`: IntroOffer receiver, punch dial loop, identity verification, sync-on-punched-connection, punched-peer endpoint observation persistence.
-- `src/sync/intro.rs`: one-shot intro send and endpoint lookup.
-- `src/sync/engine.rs`: `accept_loop_inner` and `connect_loop_inner` with LocalSet, endpoint observation recording, `spawn_intro_listener` call sites.
+- `src/peering/workflows/punch.rs`: IntroOffer receiver, punch dial loop, identity verification, sync-on-punched-connection, punched-peer endpoint observation persistence.
+- `src/peering/workflows/intro.rs`: one-shot intro send and endpoint lookup.
+- `src/peering/loops/accept.rs` and `src/peering/loops/connect.rs`: accept/connect loops with LocalSet, endpoint observation recording, intro listener call sites.
 - `src/main.rs`: CLI commands (`Intro`, `IntroAttempts`) and `sync` command wiring.
 - `src/db/intro.rs`: `intro_attempts` table operations (insert, update status, query, dedup check) and freshest endpoint query.
 - `src/db/health.rs`: `record_endpoint_observation`, `purge_expired_endpoints`.
@@ -1747,7 +1745,7 @@ This returns every local identity that has (a) accepted an invite and (b) has TL
 - `extract_spki_fingerprint()` — computes BLAKE2b-256 of SPKI
 - `validate_cert_key_match()` — validates cert/key consistency
 
-### 17.1.4 Refactored `src/transport_identity.rs`
+### 17.1.4 Refactored `src/identity/transport.rs`
 
 All functions switched from file I/O to DB queries. Functions take `&Connection` instead of `db_path: &str` at the core, with convenience wrappers that open connections:
 
@@ -1781,7 +1779,7 @@ All cert-loading sites across the codebase were updated from file-based to DB-ba
 |------|-------|--------|
 | `src/main.rs` | 4 | `load_or_generate_cert` → `ensure_transport_cert_from_db` |
 | `src/service.rs` | 4 | same, conn already available in service context |
-| `src/identity_ops.rs` | 1 | `std::fs::read(cert_path)` → DB query |
+| `src/identity/ops.rs` | 1 | `std::fs::read(cert_path)` → DB query |
 | `src/testutil.rs` | ~15 | all Peer methods use `ensure_transport_cert` |
 | `src/transport/mod.rs` | exports | removed file-based, added DB-based |
 
@@ -1795,7 +1793,7 @@ All cert-loading sites across the codebase were updated from file-based to DB-ba
 
 Manual identity chain construction in test helpers was replaced with production `identity_ops` functions. This ensures tests exercise the same code paths as the real daemon.
 
-### 17.2.1 `src/identity_ops.rs`
+### 17.2.1 `src/identity/ops.rs`
 
 Three high-level flows:
 
@@ -1965,7 +1963,7 @@ pub struct PeerDispatcher {
 
 ## 17.5 mDNS/DNS-SD Discovery
 
-### 17.5.1 `src/discovery.rs` (feature-gated: `discovery`)
+### 17.5.1 `src/peering/discovery.rs` (feature-gated: `discovery`)
 
 ```toml
 # Cargo.toml
@@ -2147,14 +2145,15 @@ Tests in `tests/mdns_smoke.rs`:
 | `src/db/mod.rs` | Export `transport_creds` | 17.1 |
 | `src/transport/cert.rs` | Remove file I/O, keep generation + fingerprint | 17.1 |
 | `src/transport/mod.rs` | Update re-exports | 17.1 |
-| `src/transport_identity.rs` | Rewrite: `&Connection` instead of file paths, DB-only | 17.1 |
-| `src/identity_ops.rs` | Add `bootstrap_workspace`, `create_user_invite`, `accept_user_invite`, `create_device_link_invite`, `accept_device_link` | 17.2 |
+| `src/identity/transport.rs` | Rewrite: `&Connection` instead of file paths, DB-only | 17.1 |
+| `src/identity/ops.rs` | Add `bootstrap_workspace`, `create_user_invite`, `accept_user_invite`, `create_device_link_invite`, `accept_device_link` | 17.2 |
 | `src/main.rs` | Update 4 cert-loading sites | 17.1 |
 | `src/service.rs` | Update 4 cert-loading sites, add `svc_node_status` | 17.1, 17.4 |
-| `src/sync/engine.rs` | `IngestItem` 3-tuple, `accept_loop_with_ingest`, `PeerDispatcher` | 17.3 |
-| `src/node.rs` | **New** — `run_node` multi-tenant daemon | 17.4 |
-| `src/discovery.rs` | **New** — mDNS per-tenant discovery | 17.5 |
-| `src/lib.rs` | Export `node`, `discovery` | 17.4, 17.5 |
+| `src/peering/loops/` | `IngestItem` 3-tuple, `accept_loop_with_ingest` | 17.3 |
+| `src/peering/runtime/` | `PeerDispatcher`, `run_node` multi-tenant daemon | 17.3, 17.4 |
+| `src/node.rs` | Thin composition root delegating to `peering::runtime` | 17.4 |
+| `src/peering/discovery.rs` | mDNS per-tenant discovery | 17.5 |
+| `src/lib.rs` | Export `node`, `peering` | 17.4, 17.5 |
 | `Cargo.toml` | `mdns-sd` dep + `discovery` feature | 17.5 |
 | `src/testutil.rs` | `SharedDbNode`, closure-based `sync_until_converged`, `new_in_workspace`, `add_tenant_in_workspace`, leakage checks | 17.6 |
 | `tests/scenario_test.rs` | Multi-tenant + mDNS scenario tests, application-level assertions | 17.7 |

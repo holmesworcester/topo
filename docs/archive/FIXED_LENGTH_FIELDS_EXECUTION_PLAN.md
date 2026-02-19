@@ -1,5 +1,7 @@
 # Fixed-Length Event Fields: Execution And Handoff Plan
 
+> **Historical plan; file paths may not match the current source tree.** `src/events/` is now `src/event_modules/`.
+
 Date: 2026-02-16
 Owner branch: `plan/fixed-length-fields`
 Worktree: `/home/holmes/poc-7-fixed-length-fields-plan`

@@ -1,5 +1,7 @@
 # Phase 5 Feedback
 
+> **Historical feedback; file paths may not match the current source tree.**
+
 Reviewed commit: `2aae603` (`Implement Phase 5: message deletion with cascade/tombstone and fix O(N²) unblock_dependents`)
 
 ## Overall

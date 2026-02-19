@@ -1,5 +1,7 @@
 # CLI Bootstrap Test Realism: Execution And Handoff Plan
 
+> **Historical plan; completed. Retained for reference.**
+
 Date: 2026-02-16
 Owner branch: `plan/cli-bootstrap-test-realism`
 Worktree: `/home/holmes/poc-7-cli-bootstrap-realism-plan`

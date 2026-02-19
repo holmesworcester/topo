@@ -1,5 +1,7 @@
 # Networking/Event Boundary Options for `poc-7`
 
+> **Historical plan; module names and file paths may not match the current source tree.** Modules referenced as `src/network/`, `src/replication/`, `src/event_runtime/` are now `src/peering/`, `src/sync/`, `src/event_pipeline/` respectively.
+
 ## Context
 
 Current behavior is coherent but concentrated in a few large modules:

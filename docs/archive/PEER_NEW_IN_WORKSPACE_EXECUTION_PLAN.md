@@ -1,5 +1,7 @@
 # Peer::new_in_workspace Realism: Execution And Handoff Plan
 
+> **Historical plan; completed. Retained for reference.**
+
 Date: 2026-02-16
 Owner branch: `plan/peer-new-in-workspace-realism`
 Worktree: `/home/holmes/poc-7-peer-new-workspace-plan`

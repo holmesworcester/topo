@@ -1,6 +1,6 @@
 # Sync Graph Performance Plan
 
-> **Status: Active** — Performance measurement and improvement plan for graph-topology sync.
+> **Historical plan; retained for reference.**
 
 ## Goal
 Measure and improve sync behavior in graph-like topologies, with focus on:

@@ -1,5 +1,7 @@
 # Trust Projection Eventization Instructions
 
+> **Executed; file paths may not match the current source tree.** `src/projection/identity.rs` is now split across event modules under `src/event_modules/`.
+
 ## Goal
 Move transport trust persistence to an event+projection model as far as practical, with minimal protocol churn and no trust-regression risk.
 

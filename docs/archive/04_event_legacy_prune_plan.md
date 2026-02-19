@@ -1,5 +1,7 @@
 # Stream 4: Legacy Event Surface Pruning (`peer_key`)
 
+> **Historical plan; file paths may not match the current source tree.** `src/events/` is now `src/event_modules/`; `src/projection/pipeline.rs` is now `src/projection/apply/`.
+
 ## Goal
 
 Shrink protocol and projection complexity by retiring deprecated `peer_key` paths while keeping prototyping/perf scaffolding intact.

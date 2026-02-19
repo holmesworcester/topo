@@ -1,5 +1,7 @@
 # Parallel Cleanup Plan Index
 
+> **Historical plan; file paths may not match the current source tree.** `src/events/` is now `src/event_modules/`; `src/projection/pipeline.rs` is now `src/projection/apply/`.
+
 This index splits cleanup work into parallelizable streams with explicit file ownership and dependency edges so multiple assistants can work safely at the same time.
 
 ## Stream List

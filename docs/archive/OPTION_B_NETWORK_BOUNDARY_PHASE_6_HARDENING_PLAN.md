@@ -1,5 +1,7 @@
 # Option B Phase 6 Hardening Plan (Boundary Narrowing + Readability)
 
+> **Historical plan; module names and file paths may not match the current source tree.** Modules referenced as `src/network/`, `src/replication/`, `src/event_runtime/` are now `src/peering/`, `src/sync/`, `src/event_pipeline/` respectively.
+
 ## Scope Note
 
 This document is **Option B network-boundary Phase 6** and is separate from the unrelated `Phase 6` in `docs/PLAN.md`.

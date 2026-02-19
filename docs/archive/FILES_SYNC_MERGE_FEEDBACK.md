@@ -1,5 +1,7 @@
 # File-Sync Merge Review (post-revert)
 
+> **Historical feedback; file paths may not match the current source tree.**
+
 ## Commit reviewed
 - `13a4a44` (`Universal signing, PeerKey deprecation, and file slice authorization`)
 

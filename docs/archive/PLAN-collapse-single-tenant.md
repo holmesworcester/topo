@@ -1,5 +1,7 @@
 # Plan: Collapse single-tenant mode into node mode
 
+> **Historical plan; completed. Retained for reference.**
+
 ## Context
 
 Two sync entry points exist: `svc_sync` (single-tenant, `service.rs:1078`) and `run_node` (multi-tenant, `node.rs:82`). They duplicate endpoint creation, trust setup, batch_writer spawning, and accept_loop orchestration. With transport identity unification complete, a single-tenant peer is just a node with one tenant. The `--node` flag in the daemon and the dual code paths add complexity with no functional benefit.

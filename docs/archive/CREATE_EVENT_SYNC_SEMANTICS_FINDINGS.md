@@ -1,5 +1,7 @@
 # create_event_sync Semantics: Investigation Findings
 
+> **Historical findings; completed. Retained for reference.**
+
 Date: 2026-02-16
 Branch: `plan/create-event-sync-semantics`
 Worktree: `/home/holmes/poc-7-create-event-sync-plan`

@@ -1,5 +1,7 @@
 # Option 4 Execution Instructions: Event-Module Projector Locality
 
+> **Execution instructions; file paths may not match the current source tree.** `src/projection/projectors.rs` and `src/projection/identity.rs` have been deleted; projectors now live in event modules under `src/event_modules/`.
+
 Date: 2026-02-19
 Branch: `exec/event-locality-opt4-module-projector-locality`
 Worktree: `/home/holmes/poc-7-event-locality-opt4`

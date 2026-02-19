@@ -1,5 +1,7 @@
 # create_event_sync Semantics Investigation: Execution And Handoff Plan
 
+> **Historical plan; completed. Retained for reference.**
+
 Date: 2026-02-16
 Owner branch: `plan/create-event-sync-semantics`
 Worktree: `/home/holmes/poc-7-create-event-sync-plan`

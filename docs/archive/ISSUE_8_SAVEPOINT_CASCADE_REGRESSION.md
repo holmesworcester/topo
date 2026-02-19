@@ -1,5 +1,7 @@
 # Issue 8: Savepoint Rollback Destroys Cascade State
 
+> **Historical issue; file paths may not match the current source tree.** `src/projection/pipeline.rs` is now `src/projection/apply/`.
+
 ## Summary
 
 The savepoint-based atomicity change in `src/db/project_queue.rs` (commit `aa6eab1`,

@@ -1,6 +1,6 @@
 # Phase 7 Logic Fixes Plan
 
-> **Status: Active** — Open work plan for correcting Phase 7 guard placement and trust-binding semantics.
+> **Historical plan; file paths may not match the current source tree.**
 
 This plan aligns runtime, tests, and TLA artifacts with the corrected Phase 7 semantics:
 
