@@ -8,8 +8,8 @@ use ed25519_dalek::SigningKey;
 use rusqlite::Connection;
 
 use super::message;
-use super::reaction;
 use super::message_deletion;
+use super::reaction;
 use super::user_removed;
 
 // ---------------------------------------------------------------------------
@@ -51,7 +51,7 @@ pub fn execute_command(
 // Queries
 // ---------------------------------------------------------------------------
 
-use super::{admin, peer_shared, user, workspace};
+use super::{admin, peer_shared, transport_key, user, workspace};
 
 /// Typed query enum for event-module-owned read operations.
 /// Service routes through these instead of inlining event-specific SQL.
@@ -76,6 +76,8 @@ pub enum EventQuery {
     DeletedMessageIds,
     /// List users (returns QueryResult::Users).
     UserList,
+    /// Count users (returns QueryResult::Count).
+    UserCount,
     /// First user event_id (returns QueryResult::OptionalString).
     UserFirstEventId,
     /// List workspaces (returns QueryResult::Workspaces).
@@ -84,12 +86,18 @@ pub enum EventQuery {
     WorkspaceName,
     /// List peer_shared event_ids (returns QueryResult::Strings).
     PeerSharedEventIds,
+    /// Count peer_shared rows (returns QueryResult::Count).
+    PeerSharedCount,
     /// First peer_shared event_id (returns QueryResult::OptionalString).
     PeerSharedFirstEventId,
     /// List peer accounts with usernames (returns QueryResult::Accounts).
     PeerSharedAccounts,
     /// List admin event_ids (returns QueryResult::Strings).
     AdminEventIds,
+    /// Count admin rows (returns QueryResult::Count).
+    AdminCount,
+    /// Count transport key rows (returns QueryResult::Count).
+    TransportKeyCount,
 }
 
 /// Result type for event queries. Callers destructure the expected variant.
@@ -113,12 +121,12 @@ pub fn execute_query(
     query: EventQuery,
 ) -> Result<QueryResult, Box<dyn std::error::Error + Send + Sync>> {
     match query {
-        EventQuery::MessageList { limit } => {
-            Ok(QueryResult::Messages(message::list(db, recorded_by, limit)?))
-        }
-        EventQuery::MessageCount => {
-            Ok(QueryResult::Count(message::count(db, recorded_by)?))
-        }
+        EventQuery::MessageList { limit } => Ok(QueryResult::Messages(message::list(
+            db,
+            recorded_by,
+            limit,
+        )?)),
+        EventQuery::MessageCount => Ok(QueryResult::Count(message::count(db, recorded_by)?)),
         EventQuery::MessageResolve { selector } => {
             let eid = message::resolve(db, recorded_by, &selector)
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
@@ -129,48 +137,50 @@ pub fn execute_query(
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
             Ok(QueryResult::EventId(eid))
         }
-        EventQuery::ReactionList => {
-            Ok(QueryResult::Reactions(reaction::list(db, recorded_by)?))
-        }
-        EventQuery::ReactionCount => {
-            Ok(QueryResult::Count(reaction::count(db, recorded_by)?))
-        }
-        EventQuery::ReactionListForMessageWithAuthors { target_event_id_b64 } => {
-            Ok(QueryResult::ReactionsWithAuthors(
-                reaction::list_for_message_with_authors(db, recorded_by, &target_event_id_b64)?,
-            ))
-        }
-        EventQuery::ReactionListForMessage { target_event_id_b64 } => {
-            Ok(QueryResult::Strings(
-                reaction::list_for_message(db, recorded_by, &target_event_id_b64)?,
-            ))
-        }
-        EventQuery::DeletedMessageIds => {
-            Ok(QueryResult::Strings(message_deletion::list_deleted_ids(db, recorded_by)?))
-        }
-        EventQuery::UserList => {
-            Ok(QueryResult::Users(user::list(db, recorded_by)?))
-        }
-        EventQuery::UserFirstEventId => {
-            Ok(QueryResult::OptionalString(user::first_event_id(db, recorded_by)?))
-        }
-        EventQuery::WorkspaceList => {
-            Ok(QueryResult::Workspaces(workspace::list(db, recorded_by)?))
-        }
-        EventQuery::WorkspaceName => {
-            Ok(QueryResult::String(workspace::name(db, recorded_by)?))
-        }
-        EventQuery::PeerSharedEventIds => {
-            Ok(QueryResult::Strings(peer_shared::list_event_ids(db, recorded_by)?))
-        }
-        EventQuery::PeerSharedFirstEventId => {
-            Ok(QueryResult::OptionalString(peer_shared::first_event_id(db, recorded_by)?))
-        }
-        EventQuery::PeerSharedAccounts => {
-            Ok(QueryResult::Accounts(peer_shared::list_accounts(db, recorded_by)?))
-        }
-        EventQuery::AdminEventIds => {
-            Ok(QueryResult::Strings(admin::list_event_ids(db, recorded_by)?))
+        EventQuery::ReactionList => Ok(QueryResult::Reactions(reaction::list(db, recorded_by)?)),
+        EventQuery::ReactionCount => Ok(QueryResult::Count(reaction::count(db, recorded_by)?)),
+        EventQuery::ReactionListForMessageWithAuthors {
+            target_event_id_b64,
+        } => Ok(QueryResult::ReactionsWithAuthors(
+            reaction::list_for_message_with_authors(db, recorded_by, &target_event_id_b64)?,
+        )),
+        EventQuery::ReactionListForMessage {
+            target_event_id_b64,
+        } => Ok(QueryResult::Strings(reaction::list_for_message(
+            db,
+            recorded_by,
+            &target_event_id_b64,
+        )?)),
+        EventQuery::DeletedMessageIds => Ok(QueryResult::Strings(
+            message_deletion::list_deleted_ids(db, recorded_by)?,
+        )),
+        EventQuery::UserList => Ok(QueryResult::Users(user::list(db, recorded_by)?)),
+        EventQuery::UserCount => Ok(QueryResult::Count(user::count(db, recorded_by)?)),
+        EventQuery::UserFirstEventId => Ok(QueryResult::OptionalString(user::first_event_id(
+            db,
+            recorded_by,
+        )?)),
+        EventQuery::WorkspaceList => Ok(QueryResult::Workspaces(workspace::list(db, recorded_by)?)),
+        EventQuery::WorkspaceName => Ok(QueryResult::String(workspace::name(db, recorded_by)?)),
+        EventQuery::PeerSharedEventIds => Ok(QueryResult::Strings(peer_shared::list_event_ids(
+            db,
+            recorded_by,
+        )?)),
+        EventQuery::PeerSharedCount => Ok(QueryResult::Count(peer_shared::count(db, recorded_by)?)),
+        EventQuery::PeerSharedFirstEventId => Ok(QueryResult::OptionalString(
+            peer_shared::first_event_id(db, recorded_by)?,
+        )),
+        EventQuery::PeerSharedAccounts => Ok(QueryResult::Accounts(peer_shared::list_accounts(
+            db,
+            recorded_by,
+        )?)),
+        EventQuery::AdminEventIds => Ok(QueryResult::Strings(admin::list_event_ids(
+            db,
+            recorded_by,
+        )?)),
+        EventQuery::AdminCount => Ok(QueryResult::Count(admin::count(db, recorded_by)?)),
+        EventQuery::TransportKeyCount => {
+            Ok(QueryResult::Count(transport_key::count(db, recorded_by)?))
         }
     }
 }
@@ -178,8 +188,8 @@ pub fn execute_query(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::Peer;
     use crate::db::open_connection;
+    use crate::testutil::Peer;
 
     #[test]
     fn test_execute_query_routes_correctly() {
