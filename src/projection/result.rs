@@ -64,8 +64,11 @@ pub enum EmitCommand {
     /// PeerShared-derived SPKI. Emitted by PeerShared projectors so that
     /// trust check reads are pure (no write side-effects).
     SupersedeBootstrapTrust { peer_shared_public_key: [u8; 32] },
-    /// Refresh transport credentials from projected local_signer_material (peer_shared key).
-    RefreshTransportCreds,
+    /// Apply a typed transport identity transition via the adapter boundary.
+    /// Replaces the former ad-hoc RefreshTransportCreds marker.
+    ApplyTransportIdentityIntent {
+        intent: crate::contracts::transport_identity_contract::TransportIdentityIntent,
+    },
 }
 
 /// The pure projector contract: everything a projector returns.

@@ -1,7 +1,6 @@
 use super::super::result::{EmitCommand, SqlVal, WriteOp};
 use crate::crypto::event_id_from_base64;
 use rusqlite::Connection;
-use rusqlite::OptionalExtension;
 
 /// Execute a list of WriteOps against the database.
 ///
@@ -185,29 +184,10 @@ pub(crate) fn execute_emit_commands(
                 )
                 .map_err(|e| -> Box<dyn std::error::Error> { e })?;
             }
-            EmitCommand::RefreshTransportCreds => {
-                // Load peer_shared private key from local_signer_material
-                let key_bytes: Option<Vec<u8>> = conn
-                    .query_row(
-                        "SELECT private_key FROM local_signer_material
-                         WHERE recorded_by = ?1 AND signer_kind = 3
-                         LIMIT 1",
-                        rusqlite::params![recorded_by],
-                        |row| row.get(0),
-                    )
-                    .optional()?
-                    .flatten();
-                if let Some(key_bytes) = key_bytes {
-                    if key_bytes.len() == 32 {
-                        let mut arr = [0u8; 32];
-                        arr.copy_from_slice(&key_bytes);
-                        let signing_key = ed25519_dalek::SigningKey::from_bytes(&arr);
-                        let _ = crate::identity::transport::install_peer_key_transport_identity(
-                            conn,
-                            &signing_key,
-                        );
-                    }
-                }
+            EmitCommand::ApplyTransportIdentityIntent { intent } => {
+                use crate::contracts::transport_identity_contract::TransportIdentityAdapter;
+                let adapter = crate::transport::identity_adapter::ConcreteTransportIdentityAdapter;
+                let _ = adapter.apply_intent(conn, intent.clone());
             }
         }
     }

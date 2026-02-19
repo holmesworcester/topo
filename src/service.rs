@@ -1626,8 +1626,8 @@ pub async fn svc_accept_invite(
     let db = open_connection(db_path)?;
 
     // Emit local_signer_secret events AFTER push-back sync: the peer_shared emit
-    // triggers RefreshTransportCreds which installs the PeerShared-derived transport
-    // identity, so it must happen after the push-back sync completes.
+    // triggers ApplyTransportIdentityIntent which installs the PeerShared-derived
+    // transport identity, so it must happen after the push-back sync completes.
     emit_local_signer_secret(
         &db,
         &recorded_by,
@@ -1777,7 +1777,7 @@ pub async fn svc_accept_device_link(
     let db = open_connection(db_path)?;
 
     // Emit local_signer_secret AFTER push-back sync: the peer_shared emit triggers
-    // RefreshTransportCreds which installs PeerShared-derived transport identity.
+    // ApplyTransportIdentityIntent which installs PeerShared-derived transport identity.
     emit_local_signer_secret(
         &db,
         &recorded_by,

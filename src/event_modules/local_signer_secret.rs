@@ -86,11 +86,13 @@ pub fn encode_local_signer_secret(event: &ParsedEvent) -> Result<Vec<u8>, EventE
 // === Projector (event-module locality) ===
 
 use crate::crypto::event_id_to_base64;
+use crate::contracts::transport_identity_contract::TransportIdentityIntent;
 use crate::projection::result::{ContextSnapshot, EmitCommand, ProjectorResult, SqlVal, WriteOp};
 
 /// Pure projector: LocalSignerSecret → local_signer_material table.
 /// UPSERT by (recorded_by, signer_event_id): Delete existing + InsertOrIgnore.
-/// Emits RefreshTransportCreds when signer_kind == SIGNER_KIND_PEER_SHARED.
+/// Emits `ApplyTransportIdentityIntent(InstallPeerSharedIdentityFromSigner)`
+/// when signer_kind == SIGNER_KIND_PEER_SHARED.
 pub fn project_pure(
     recorded_by: &str,
     _event_id_b64: &str,
@@ -132,7 +134,15 @@ pub fn project_pure(
     ];
 
     if e.signer_kind == SIGNER_KIND_PEER_SHARED {
-        ProjectorResult::valid_with_commands(ops, vec![EmitCommand::RefreshTransportCreds])
+        ProjectorResult::valid_with_commands(
+            ops,
+            vec![EmitCommand::ApplyTransportIdentityIntent {
+                intent: TransportIdentityIntent::InstallPeerSharedIdentityFromSigner {
+                    recorded_by: recorded_by.to_string(),
+                    signer_event_id: e.signer_event_id,
+                },
+            }],
+        )
     } else {
         ProjectorResult::valid(ops)
     }
