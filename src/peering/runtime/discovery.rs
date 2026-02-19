@@ -33,19 +33,19 @@ pub(crate) fn launch_mdns_discovery(
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
     db_path: &str,
-) -> Vec<crate::discovery::TenantDiscovery> {
-    let mut discovery_handles: Vec<crate::discovery::TenantDiscovery> = Vec::new();
+) -> Vec<crate::peering::discovery::TenantDiscovery> {
+    let mut discovery_handles: Vec<crate::peering::discovery::TenantDiscovery> = Vec::new();
 
     let actual_port = local_addr.port();
     let advertise_ip = if local_addr.ip().is_unspecified() || local_addr.ip().is_loopback() {
-        crate::discovery::local_non_loopback_ipv4().unwrap_or_else(|| "0.0.0.0".to_string())
+        crate::peering::discovery::local_non_loopback_ipv4().unwrap_or_else(|| "0.0.0.0".to_string())
     } else {
         local_addr.ip().to_string()
     };
     let local_listen_ip = local_addr.ip();
 
     for tenant in tenants {
-        match crate::discovery::TenantDiscovery::new(
+        match crate::peering::discovery::TenantDiscovery::new(
             &tenant.peer_id,
             actual_port,
             local_peer_ids.clone(),

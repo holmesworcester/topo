@@ -3480,7 +3480,7 @@ async fn test_shared_db_same_workspace_two_tenants() {
 #[tokio::test]
 async fn test_mdns_two_peers_discover_and_sync() {
     use std::collections::HashSet;
-    use topo::discovery::{local_non_loopback_ipv4, TenantDiscovery};
+    use topo::peering::discovery::{local_non_loopback_ipv4, TenantDiscovery};
     use topo::testutil::create_dynamic_endpoint_for_peer_bind;
 
     let advertise_ip = local_non_loopback_ipv4().expect("no routable IP");
@@ -3581,7 +3581,7 @@ async fn test_mdns_two_peers_discover_and_sync() {
 #[tokio::test]
 async fn test_mdns_multitenant_self_filtering_and_sync() {
     use std::collections::HashSet;
-    use topo::discovery::{local_non_loopback_ipv4, TenantDiscovery};
+    use topo::peering::discovery::{local_non_loopback_ipv4, TenantDiscovery};
     use topo::testutil::create_dynamic_endpoint_for_peer_bind;
 
     let advertise_ip = local_non_loopback_ipv4().expect("no routable IP");

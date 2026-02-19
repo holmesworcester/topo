@@ -260,12 +260,12 @@ fn handle_connection(
 }
 
 #[allow(dead_code)] // used by tests; will be called when auto-UPnP bootstrap is re-enabled
-fn resolve_bootstrap_from_upnp(upnp: &crate::upnp::UpnpMappingReport) -> Result<String, String> {
-    if upnp.status != crate::upnp::UpnpMappingStatus::Success {
+fn resolve_bootstrap_from_upnp(upnp: &crate::peering::nat::upnp::UpnpMappingReport) -> Result<String, String> {
+    if upnp.status != crate::peering::nat::upnp::UpnpMappingStatus::Success {
         let status = match &upnp.status {
-            crate::upnp::UpnpMappingStatus::Success => "success",
-            crate::upnp::UpnpMappingStatus::Failed => "failed",
-            crate::upnp::UpnpMappingStatus::NotAttempted => "not_attempted",
+            crate::peering::nat::upnp::UpnpMappingStatus::Success => "success",
+            crate::peering::nat::upnp::UpnpMappingStatus::Failed => "failed",
+            crate::peering::nat::upnp::UpnpMappingStatus::NotAttempted => "not_attempted",
         };
         let reason = upnp.error.as_deref().unwrap_or("unknown");
         return Err(format!(
@@ -289,7 +289,7 @@ fn resolve_bootstrap_from_upnp(upnp: &crate::upnp::UpnpMappingReport) -> Result<
             ip
         )
     })?;
-    if !crate::upnp::is_public_internet_ip(parsed_ip) {
+    if !crate::peering::nat::upnp::is_public_internet_ip(parsed_ip) {
         return Err(format!(
             "UPnP external IP {} is not publicly routable — provide --bootstrap explicitly",
             ip
@@ -526,7 +526,7 @@ fn dispatch(
                             return RpcResponse::error(format!("failed to start runtime: {}", e))
                         }
                     };
-                    let report = rt.block_on(crate::upnp::attempt_udp_port_mapping(
+                    let report = rt.block_on(crate::peering::nat::upnp::attempt_udp_port_mapping(
                         listen_addr,
                         std::time::Duration::from_secs(10),
                     ));
@@ -718,7 +718,7 @@ fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::resolve_bootstrap_from_upnp;
-    use crate::upnp::{UpnpMappingReport, UpnpMappingStatus};
+    use crate::peering::nat::upnp::{UpnpMappingReport, UpnpMappingStatus};
 
     fn mk_report(
         status: UpnpMappingStatus,

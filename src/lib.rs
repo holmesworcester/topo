@@ -3,7 +3,6 @@ pub mod crypto;
 pub mod db;
 pub mod db_registry;
 #[cfg(feature = "discovery")]
-pub mod discovery;
 pub mod event_modules;
 pub mod event_pipeline;
 pub mod identity_ops;
@@ -20,7 +19,6 @@ pub mod sync;
 pub mod testutil;
 pub mod transport;
 pub mod transport_identity;
-pub mod upnp;
 
 #[cfg(test)]
 mod boundary_tests {

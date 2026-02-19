@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::upnp::UpnpMappingReport;
+use crate::peering::nat::upnp::UpnpMappingReport;
 
 use crate::contracts::event_runtime_contract::{IngestFns, IngestItem};
 use crate::peering::loops::{accept_loop_with_ingest, IntroSpawnerFn};

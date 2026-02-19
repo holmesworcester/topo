@@ -3,14 +3,14 @@
 /// Helper: get a routable (non-loopback) IP for mDNS advertisement.
 #[cfg(feature = "discovery")]
 fn routable_ip() -> String {
-    topo::discovery::local_non_loopback_ipv4()
+    topo::peering::discovery::local_non_loopback_ipv4()
         .expect("no routable IP available for mDNS test")
 }
 
 #[cfg(feature = "discovery")]
 #[test]
 fn mdns_smoke_tenant_discovery() {
-    use topo::discovery::TenantDiscovery;
+    use topo::peering::discovery::TenantDiscovery;
     use std::collections::HashSet;
     use std::time::{Duration, Instant};
 
@@ -55,7 +55,7 @@ fn mdns_smoke_tenant_discovery() {
 #[cfg(feature = "discovery")]
 #[test]
 fn mdns_smoke_explicit_advertise_ip() {
-    use topo::discovery::TenantDiscovery;
+    use topo::peering::discovery::TenantDiscovery;
     use std::collections::HashSet;
     use std::time::{Duration, Instant};
 

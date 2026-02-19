@@ -8,6 +8,7 @@ These are current specs, plans, and reference material.
 |----------|-------------|
 | [PLAN.md](PLAN.md) | Authoritative implementation plan for all phases |
 | [DESIGN.md](DESIGN.md) | Target protocol design (post-PLAN end state) |
+| [CURRENT_RUNTIME_DIAGRAM.md](CURRENT_RUNTIME_DIAGRAM.md) | Engineer-facing runtime diagrams (node, sync session, ingest/projection flow) |
 | [../TODO.md](../TODO.md) | Current discrepancy/remediation backlog and execution ordering |
 | [PERF.md](PERF.md) | Benchmark results and testing guide |
 | [LOW_MEM_PERF_ANALYSIS.md](LOW_MEM_PERF_ANALYSIS.md) | Scaling analysis and memory-constrained architecture guidance |
