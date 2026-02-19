@@ -4960,3 +4960,45 @@ fn test_deletion_invariant_monotonic() {
         "tombstone must exist for delete-before-create"
     );
 }
+
+// ── SPEC_DEPS_02: Dep type mismatch rejects ──
+
+/// TLA conformance: check_dep_types rejects when a reaction's target_event_id
+/// points to a non-message event (e.g., workspace type 8 instead of message type 1).
+#[test]
+fn test_dep_type_mismatch_rejects() {
+    let conn = setup();
+    let recorded_by = "peer1";
+    let _net_eid = setup_workspace_event(&conn, recorded_by);
+    let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
+
+    // Use the workspace event as the "target" of a reaction — workspace is type 8,
+    // but reaction.target_event_id requires type 1 (message).
+    let ws = ParsedEvent::Workspace(WorkspaceEvent {
+        created_at_ms: now_ms(),
+        public_key: [0xBB; 32],
+        name: "dep-type-target".to_string(),
+    });
+    let ws_blob = events::encode_event(&ws).unwrap();
+    let wrong_target_eid = insert_event_raw(&conn, recorded_by, &ws_blob);
+
+    // Make the wrong-type target valid so dep-presence passes but dep-type fails.
+    let wrong_target_b64 = event_id_to_base64(&wrong_target_eid);
+    conn.execute(
+        "INSERT OR IGNORE INTO valid_events (peer_id, event_id) VALUES (?1, ?2)",
+        rusqlite::params![recorded_by, &wrong_target_b64],
+    )
+    .unwrap();
+
+    // Build a reaction targeting the workspace event
+    let (_rxn, rxn_blob) =
+        make_reaction_signed(&signing_key, &signer_eid, &wrong_target_eid, "\u{1f44d}");
+    let rxn_eid = insert_event_raw(&conn, recorded_by, &rxn_blob);
+
+    let decision = project_one(&conn, recorded_by, &rxn_eid).unwrap();
+    assert!(
+        matches!(decision, ProjectionDecision::Reject { ref reason } if reason.contains("type code")),
+        "expected dep type mismatch rejection, got {:?}",
+        decision
+    );
+}
