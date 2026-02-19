@@ -72,16 +72,18 @@ Target: move supersession side effects into projection/maintenance path so trust
 ### Good candidates for projection ownership
 1. trust authorization rows (`pending_invite_bootstrap_trust`, `invite_bootstrap_trust`)
 2. derived trust/identity views tied directly to event facts
+3. local signer key material (`local_peer_signers`, `local_user_keys`, `local_workspace_keys`) as local non-shareable events + projection
 
 ### Usually NOT event-projection (keep operational/local)
 1. queue/lease state: `project_queue`, `egress_queue`, `wanted_events`
 2. reconciliation caches: `neg_items`, `neg_blocks`, `neg_meta`
 3. runtime observations/telemetry: `peer_endpoint_observations`, `intro_attempts`, `peer_transport_bindings`
-4. local secret material: `local_transport_creds`, local signer key tables
+4. transport certificate/key cache (`local_transport_creds`) when it is derivable from event-projected signer state
 
 Rule of thumb:
-- shared canonical product semantics => event + projection
-- local execution machinery, leases, telemetry, or private key material => non-event operational state
+- durable semantic state (shared or local) => event + projection
+- execution machinery/caches/telemetry => operational state (non-event)
+- private key material can still be eventized if local-only and non-shareable
 
 ## Acceptance Criteria
 1. Service layer no longer writes trust rows directly.
