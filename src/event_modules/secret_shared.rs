@@ -6,16 +6,17 @@ use super::{EventError, ParsedEvent, EVENT_TYPE_SECRET_SHARED};
 
 /// SecretShared (type 22): type(1) + created_at(8) + key_event_id(32) + recipient_event_id(32)
 ///                        + wrapped_key(32) + signed_by(32) + signer_type(1) + signature(64) = 202
-pub const SECRET_SHARED_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32 + 32 + 32 + SIGNATURE_TRAILER_BYTES;
+pub const SECRET_SHARED_WIRE_SIZE: usize =
+    COMMON_HEADER_BYTES + 32 + 32 + 32 + SIGNATURE_TRAILER_BYTES;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecretSharedEvent {
     pub created_at_ms: u64,
-    pub key_event_id: [u8; 32],        // dep: SecretKey event
-    pub recipient_event_id: [u8; 32],   // dep: invite or peer_shared event of recipient
-    pub wrapped_key: [u8; 32],          // key bytes wrapped for recipient
-    pub signed_by: [u8; 32],            // signer event_id (PeerShared event — sender)
-    pub signer_type: u8,                // 5 = peer_shared
+    pub key_event_id: [u8; 32],       // dep: SecretKey event
+    pub recipient_event_id: [u8; 32], // dep: invite or peer_shared event of recipient
+    pub wrapped_key: [u8; 32],        // key bytes wrapped for recipient
+    pub signed_by: [u8; 32],          // signer event_id (PeerShared event — sender)
+    pub signer_type: u8,              // 5 = peer_shared
     pub signature: [u8; 64],
 }
 
@@ -30,13 +31,22 @@ pub struct SecretSharedEvent {
 /// [138..202]   signature (64 bytes)
 pub fn parse_secret_shared(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if blob.len() < SECRET_SHARED_WIRE_SIZE {
-        return Err(EventError::TooShort { expected: SECRET_SHARED_WIRE_SIZE, actual: blob.len() });
+        return Err(EventError::TooShort {
+            expected: SECRET_SHARED_WIRE_SIZE,
+            actual: blob.len(),
+        });
     }
     if blob.len() > SECRET_SHARED_WIRE_SIZE {
-        return Err(EventError::TrailingData { expected: SECRET_SHARED_WIRE_SIZE, actual: blob.len() });
+        return Err(EventError::TrailingData {
+            expected: SECRET_SHARED_WIRE_SIZE,
+            actual: blob.len(),
+        });
     }
     if blob[0] != EVENT_TYPE_SECRET_SHARED {
-        return Err(EventError::WrongType { expected: EVENT_TYPE_SECRET_SHARED, actual: blob[0] });
+        return Err(EventError::WrongType {
+            expected: EVENT_TYPE_SECRET_SHARED,
+            actual: blob[0],
+        });
     }
 
     let created_at_ms = u64::from_le_bytes(blob[1..9].try_into().unwrap());
@@ -107,7 +117,13 @@ pub fn project_pure(
 
     let ops = vec![WriteOp::InsertOrIgnore {
         table: "secret_shared",
-        columns: vec!["recorded_by", "event_id", "key_event_id", "recipient_event_id", "wrapped_key"],
+        columns: vec![
+            "recorded_by",
+            "event_id",
+            "key_event_id",
+            "recipient_event_id",
+            "wrapped_key",
+        ],
         values: vec![
             SqlVal::Text(recorded_by.to_string()),
             SqlVal::Text(event_id_b64.to_string()),
@@ -124,8 +140,8 @@ pub static SECRET_SHARED_META: EventTypeMeta = EventTypeMeta {
     type_name: "secret_shared",
     projection_table: "secret_shared",
     share_scope: ShareScope::Shared,
-    dep_fields: &["key_event_id", "recipient_event_id", "signed_by"],
-    dep_field_type_codes: &[&[6], &[10, 11, 12, 13, 16, 17], &[]],
+    dep_fields: &["recipient_event_id", "signed_by"],
+    dep_field_type_codes: &[&[10, 11, 12, 13, 16, 17], &[]],
     signer_required: true,
     signature_byte_len: 64,
     encryptable: false,

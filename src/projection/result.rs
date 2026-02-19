@@ -61,9 +61,9 @@ pub enum EmitCommand {
     /// Supersede bootstrap trust rows whose SPKI matches a newly-projected
     /// PeerShared-derived SPKI. Emitted by PeerShared projectors so that
     /// trust check reads are pure (no write side-effects).
-    SupersedeBootstrapTrust {
-        peer_shared_public_key: [u8; 32],
-    },
+    SupersedeBootstrapTrust { peer_shared_public_key: [u8; 32] },
+    /// Refresh transport credentials from projected local_signer_material (peer_shared key).
+    RefreshTransportCreds,
 }
 
 /// The pure projector contract: everything a projector returns.

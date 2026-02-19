@@ -1,6 +1,7 @@
 use super::super::result::{EmitCommand, SqlVal, WriteOp};
 use crate::crypto::event_id_from_base64;
 use rusqlite::Connection;
+use rusqlite::OptionalExtension;
 
 /// Execute a list of WriteOps against the database.
 ///
@@ -154,7 +155,9 @@ pub(crate) fn execute_emit_commands(
                 // Bidirectional supersession: if PeerShared already projected
                 // for this SPKI, supersede the just-written bootstrap row.
                 supersede_bootstrap_if_peer_shared_exists(
-                    conn, recorded_by, expected_bootstrap_spki_fingerprint,
+                    conn,
+                    recorded_by,
+                    expected_bootstrap_spki_fingerprint,
                 )?;
             }
             EmitCommand::WriteAcceptedBootstrapTrust {
@@ -176,7 +179,9 @@ pub(crate) fn execute_emit_commands(
                 // Bidirectional supersession: if PeerShared already projected
                 // for this SPKI, supersede the just-written bootstrap row.
                 supersede_bootstrap_if_peer_shared_exists(
-                    conn, recorded_by, bootstrap_spki_fingerprint,
+                    conn,
+                    recorded_by,
+                    bootstrap_spki_fingerprint,
                 )?;
             }
             EmitCommand::SupersedeBootstrapTrust {
@@ -186,7 +191,32 @@ pub(crate) fn execute_emit_commands(
                     conn,
                     recorded_by,
                     peer_shared_public_key,
-                ).map_err(|e| -> Box<dyn std::error::Error> { e })?;
+                )
+                .map_err(|e| -> Box<dyn std::error::Error> { e })?;
+            }
+            EmitCommand::RefreshTransportCreds => {
+                // Load peer_shared private key from local_signer_material
+                let key_bytes: Option<Vec<u8>> = conn
+                    .query_row(
+                        "SELECT private_key FROM local_signer_material
+                         WHERE recorded_by = ?1 AND signer_kind = 3
+                         LIMIT 1",
+                        rusqlite::params![recorded_by],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .flatten();
+                if let Some(key_bytes) = key_bytes {
+                    if key_bytes.len() == 32 {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(&key_bytes);
+                        let signing_key = ed25519_dalek::SigningKey::from_bytes(&arr);
+                        let _ = crate::identity::transport::install_peer_key_transport_identity(
+                            conn,
+                            &signing_key,
+                        );
+                    }
+                }
             }
         }
     }
@@ -205,9 +235,7 @@ fn supersede_bootstrap_if_peer_shared_exists(
     use crate::transport::cert::spki_fingerprint_from_ed25519_pubkey;
 
     // Query all peers_shared public keys for this tenant and check SPKI match
-    let mut stmt = conn.prepare(
-        "SELECT public_key FROM peers_shared WHERE recorded_by = ?1",
-    )?;
+    let mut stmt = conn.prepare("SELECT public_key FROM peers_shared WHERE recorded_by = ?1")?;
     let mut rows = stmt.query(rusqlite::params![recorded_by])?;
     while let Some(row) = rows.next()? {
         let pk_blob: Vec<u8> = row.get(0)?;
@@ -217,8 +245,11 @@ fn supersede_bootstrap_if_peer_shared_exists(
             if derived.as_slice() == spki_fingerprint.as_slice() {
                 drop(rows);
                 crate::db::transport_trust::supersede_bootstrap_for_peer_shared(
-                    conn, recorded_by, &pk,
-                ).map_err(|e| -> Box<dyn std::error::Error> { e })?;
+                    conn,
+                    recorded_by,
+                    &pk,
+                )
+                .map_err(|e| -> Box<dyn std::error::Error> { e })?;
                 return Ok(());
             }
         }

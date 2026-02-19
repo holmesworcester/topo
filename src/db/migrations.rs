@@ -569,6 +569,74 @@ static MIGRATIONS: &[Migration] = &[
                 ON bootstrap_context(recorded_by, invite_event_id, observed_at DESC);
         ",
     },
+    Migration {
+        version: 33,
+        name: "add_local_signer_material",
+        sql: "
+            CREATE TABLE IF NOT EXISTS local_signer_material (
+                recorded_by TEXT NOT NULL,
+                signer_event_id TEXT NOT NULL,
+                signer_kind INTEGER NOT NULL,
+                private_key BLOB NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (recorded_by, signer_event_id)
+            );
+        ",
+    },
+    Migration {
+        version: 34,
+        name: "backfill_local_signer_material_from_legacy",
+        sql: "
+            -- Ensure legacy tables exist (they were created on-demand, not by migrations,
+            -- so they may be absent on databases that never bootstrapped).
+            CREATE TABLE IF NOT EXISTS local_peer_signers (
+                recorded_by TEXT PRIMARY KEY,
+                event_id TEXT NOT NULL,
+                signing_key BLOB NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS local_user_keys (
+                recorded_by TEXT PRIMARY KEY,
+                event_id TEXT NOT NULL,
+                signing_key BLOB NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS local_workspace_keys (
+                recorded_by TEXT PRIMARY KEY,
+                signing_key BLOB NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            -- Peer-shared signers (kind 3): legacy table has event_id
+            INSERT OR IGNORE INTO local_signer_material
+                (recorded_by, signer_event_id, signer_kind, private_key, created_at)
+            SELECT recorded_by, event_id, 3, signing_key, updated_at
+            FROM local_peer_signers;
+
+            -- User signers (kind 2): legacy table has event_id
+            INSERT OR IGNORE INTO local_signer_material
+                (recorded_by, signer_event_id, signer_kind, private_key, created_at)
+            SELECT recorded_by, event_id, 2, signing_key, updated_at
+            FROM local_user_keys;
+
+            -- Workspace signers (kind 1): legacy table has no event_id;
+            -- look up the workspace event_id from the workspaces projection table.
+            INSERT OR IGNORE INTO local_signer_material
+                (recorded_by, signer_event_id, signer_kind, private_key, created_at)
+            SELECT w.recorded_by, w.event_id, 1, k.signing_key, k.updated_at
+            FROM local_workspace_keys k
+            INNER JOIN workspaces w ON w.recorded_by = k.recorded_by;
+        ",
+    },
+    Migration {
+        version: 35,
+        name: "drop_legacy_local_signer_tables",
+        sql: "
+            DROP TABLE IF EXISTS local_peer_signers;
+            DROP TABLE IF EXISTS local_user_keys;
+            DROP TABLE IF EXISTS local_workspace_keys;
+        ",
+    },
 ];
 
 fn ensure_schema_migrations(conn: &Connection) -> SqliteResult<()> {
@@ -784,6 +852,6 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(max_version, 32);
+        assert_eq!(max_version, 35);
     }
 }

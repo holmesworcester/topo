@@ -6,21 +6,22 @@ pub mod encrypted;
 pub mod file_slice;
 pub mod invite_accepted;
 pub mod layout;
+pub mod local_signer_secret;
 pub mod message;
+pub mod message_attachment;
 pub mod message_deletion;
-pub mod workspace;
 pub mod peer_removed;
 pub mod peer_shared;
 pub mod reaction;
 pub mod registry;
 pub mod secret_key;
-pub mod message_attachment;
 pub mod secret_shared;
 pub mod signed_memo;
 pub mod transport_key;
 pub mod user;
 pub mod user_invite;
 pub mod user_removed;
+pub mod workspace;
 
 use std::sync::OnceLock;
 
@@ -30,10 +31,10 @@ pub use device_invite::{DeviceInviteFirstEvent, DeviceInviteOngoingEvent};
 pub use encrypted::EncryptedEvent;
 pub use file_slice::FileSliceEvent;
 pub use invite_accepted::InviteAcceptedEvent;
+pub use local_signer_secret::LocalSignerSecretEvent;
 pub use message::MessageEvent;
 pub use message_attachment::MessageAttachmentEvent;
 pub use message_deletion::MessageDeletionEvent;
-pub use workspace::WorkspaceEvent;
 pub use peer_removed::PeerRemovedEvent;
 pub use peer_shared::{PeerSharedFirstEvent, PeerSharedOngoingEvent};
 pub use reaction::ReactionEvent;
@@ -41,10 +42,11 @@ pub use registry::{EventRegistry, EventTypeMeta, ShareScope};
 pub use secret_key::SecretKeyEvent;
 pub use secret_shared::SecretSharedEvent;
 pub use signed_memo::SignedMemoEvent;
+pub use transport_key::TransportKeyEvent;
 pub use user::{UserBootEvent, UserOngoingEvent};
 pub use user_invite::{UserInviteBootEvent, UserInviteOngoingEvent};
-pub use transport_key::TransportKeyEvent;
 pub use user_removed::UserRemovedEvent;
+pub use workspace::WorkspaceEvent;
 
 pub const EVENT_TYPE_MESSAGE: u8 = 1;
 pub const EVENT_TYPE_REACTION: u8 = 2;
@@ -71,6 +73,7 @@ pub const EVENT_TYPE_TRANSPORT_KEY: u8 = 23;
 pub const EVENT_TYPE_MESSAGE_ATTACHMENT: u8 = 24;
 pub const EVENT_TYPE_FILE_SLICE: u8 = 25;
 pub const EVENT_TYPE_BENCH_DEP: u8 = 26;
+pub const EVENT_TYPE_LOCAL_SIGNER_SECRET: u8 = 27;
 
 /// Max event blob size: 1 MiB
 pub const EVENT_MAX_BLOB_BYTES: usize = 1024 * 1024;
@@ -102,6 +105,7 @@ pub enum ParsedEvent {
     MessageAttachment(MessageAttachmentEvent),
     FileSlice(FileSliceEvent),
     BenchDep(BenchDepEvent),
+    LocalSignerSecret(LocalSignerSecretEvent),
 }
 
 impl ParsedEvent {
@@ -132,6 +136,7 @@ impl ParsedEvent {
             ParsedEvent::MessageAttachment(a) => a.created_at_ms,
             ParsedEvent::FileSlice(f) => f.created_at_ms,
             ParsedEvent::BenchDep(b) => b.created_at_ms,
+            ParsedEvent::LocalSignerSecret(l) => l.created_at_ms,
         }
     }
 
@@ -140,7 +145,11 @@ impl ParsedEvent {
     pub fn dep_field_values(&self) -> Vec<(&'static str, [u8; 32])> {
         match self {
             ParsedEvent::Message(m) => vec![("author_id", m.author_id), ("signed_by", m.signed_by)],
-            ParsedEvent::Reaction(r) => vec![("target_event_id", r.target_event_id), ("author_id", r.author_id), ("signed_by", r.signed_by)],
+            ParsedEvent::Reaction(r) => vec![
+                ("target_event_id", r.target_event_id),
+                ("author_id", r.author_id),
+                ("signed_by", r.signed_by),
+            ],
             ParsedEvent::SignedMemo(s) => vec![("signed_by", s.signed_by)],
             ParsedEvent::Encrypted(e) => vec![("key_event_id", e.key_event_id)],
             ParsedEvent::SecretKey(_) => vec![],
@@ -157,8 +166,14 @@ impl ParsedEvent {
             ParsedEvent::DeviceInviteOngoing(d) => vec![("signed_by", d.signed_by)],
             ParsedEvent::UserBoot(u) => vec![("signed_by", u.signed_by)],
             ParsedEvent::UserOngoing(u) => vec![("signed_by", u.signed_by)],
-            ParsedEvent::PeerSharedFirst(p) => vec![("user_event_id", p.user_event_id), ("signed_by", p.signed_by)],
-            ParsedEvent::PeerSharedOngoing(p) => vec![("user_event_id", p.user_event_id), ("signed_by", p.signed_by)],
+            ParsedEvent::PeerSharedFirst(p) => vec![
+                ("user_event_id", p.user_event_id),
+                ("signed_by", p.signed_by),
+            ],
+            ParsedEvent::PeerSharedOngoing(p) => vec![
+                ("user_event_id", p.user_event_id),
+                ("signed_by", p.signed_by),
+            ],
             ParsedEvent::AdminBoot(a) => vec![
                 ("user_event_id", a.user_event_id),
                 ("signed_by", a.signed_by),
@@ -176,7 +191,6 @@ impl ParsedEvent {
                 ("signed_by", r.signed_by),
             ],
             ParsedEvent::SecretShared(s) => vec![
-                ("key_event_id", s.key_event_id),
                 ("recipient_event_id", s.recipient_event_id),
                 ("signed_by", s.signed_by),
             ],
@@ -188,6 +202,7 @@ impl ParsedEvent {
             ],
             ParsedEvent::FileSlice(f) => vec![("signed_by", f.signed_by)],
             ParsedEvent::BenchDep(b) => b.dep_ids.iter().map(|id| ("dep_id", *id)).collect(),
+            ParsedEvent::LocalSignerSecret(l) => vec![("signer_event_id", l.signer_event_id)],
         }
     }
 
@@ -218,6 +233,7 @@ impl ParsedEvent {
             ParsedEvent::MessageAttachment(_) => EVENT_TYPE_MESSAGE_ATTACHMENT,
             ParsedEvent::FileSlice(_) => EVENT_TYPE_FILE_SLICE,
             ParsedEvent::BenchDep(_) => EVENT_TYPE_BENCH_DEP,
+            ParsedEvent::LocalSignerSecret(_) => EVENT_TYPE_LOCAL_SIGNER_SECRET,
         }
     }
 
@@ -249,7 +265,8 @@ impl ParsedEvent {
             | ParsedEvent::SecretKey(_)
             | ParsedEvent::Workspace(_)
             | ParsedEvent::InviteAccepted(_)
-            | ParsedEvent::BenchDep(_) => None,
+            | ParsedEvent::BenchDep(_)
+            | ParsedEvent::LocalSignerSecret(_) => None,
         }
     }
 }
@@ -271,10 +288,18 @@ impl std::fmt::Display for EventError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             EventError::TooShort { expected, actual } => {
-                write!(f, "blob too short: expected {} bytes, got {}", expected, actual)
+                write!(
+                    f,
+                    "blob too short: expected {} bytes, got {}",
+                    expected, actual
+                )
             }
             EventError::TrailingData { expected, actual } => {
-                write!(f, "blob has trailing data: expected exactly {} bytes, got {}", expected, actual)
+                write!(
+                    f,
+                    "blob has trailing data: expected exactly {} bytes, got {}",
+                    expected, actual
+                )
             }
             EventError::WrongType { expected, actual } => {
                 write!(f, "wrong event type: expected {}, got {}", expected, actual)
@@ -284,7 +309,9 @@ impl std::fmt::Display for EventError {
             EventError::InvalidMetadata(msg) => write!(f, "invalid metadata: {}", msg),
             EventError::UnknownType(t) => write!(f, "unknown event type: {}", t),
             EventError::TextSlot(e) => write!(f, "text slot error: {}", e),
-            EventError::InvalidEncryptedInnerType(t) => write!(f, "invalid encrypted inner type: {}", t),
+            EventError::InvalidEncryptedInnerType(t) => {
+                write!(f, "invalid encrypted inner type: {}", t)
+            }
         }
     }
 }
@@ -335,6 +362,7 @@ pub fn registry() -> &'static EventRegistry {
             &message_attachment::MESSAGE_ATTACHMENT_META,
             &file_slice::FILE_SLICE_META,
             &bench_dep::BENCH_DEP_META,
+            &local_signer_secret::LOCAL_SIGNER_SECRET_META,
         ])
     })
 }
@@ -345,14 +373,18 @@ pub fn parse_event(blob: &[u8]) -> Result<ParsedEvent, EventError> {
         expected: 1,
         actual: 0,
     })?;
-    let meta = registry().lookup(type_code).ok_or(EventError::UnknownType(type_code))?;
+    let meta = registry()
+        .lookup(type_code)
+        .ok_or(EventError::UnknownType(type_code))?;
     (meta.parse)(blob)
 }
 
 /// Encode a ParsedEvent using the global registry.
 pub fn encode_event(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     let type_code = event.event_type_code();
-    let meta = registry().lookup(type_code).ok_or(EventError::UnknownType(type_code))?;
+    let meta = registry()
+        .lookup(type_code)
+        .ok_or(EventError::UnknownType(type_code))?;
     (meta.encode)(event)
 }
 
@@ -735,7 +767,7 @@ mod tests {
         assert_eq!(uib_meta.signature_byte_len, 64);
 
         let ss_meta = reg.lookup(EVENT_TYPE_SECRET_SHARED).unwrap();
-        assert_eq!(ss_meta.dep_fields, &["key_event_id", "recipient_event_id", "signed_by"]);
+        assert_eq!(ss_meta.dep_fields, &["recipient_event_id", "signed_by"]);
 
         assert!(reg.lookup(99).is_none());
     }
@@ -743,7 +775,7 @@ mod tests {
     #[test]
     fn test_registry_encryptable_coverage() {
         let reg = registry();
-        let encryptable_codes: Vec<u8> = (1..=26u8)
+        let encryptable_codes: Vec<u8> = (1..=27u8)
             .filter(|c| reg.lookup(*c).map_or(false, |m| m.encryptable))
             .collect();
         // Must match the admissible set from projector_spec:
@@ -755,7 +787,9 @@ mod tests {
             "encryptable set drifted from expected admissible inner types"
         );
         // Identity/infrastructure types must NOT be encryptable
-        for code in [5, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 26] {
+        for code in [
+            5, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 26, 27,
+        ] {
             let meta = reg.lookup(code).unwrap();
             assert!(
                 !meta.encryptable,
@@ -1188,7 +1222,10 @@ mod tests {
         assert_eq!(meta.projection_table, "message_attachments");
         assert!(meta.signer_required);
         assert_eq!(meta.signature_byte_len, 64);
-        assert_eq!(meta.dep_fields, &["message_id", "key_event_id", "signed_by"]);
+        assert_eq!(
+            meta.dep_fields,
+            &["message_id", "key_event_id", "signed_by"]
+        );
     }
 
     #[test]
