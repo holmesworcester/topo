@@ -1,4 +1,4 @@
-use super::project_one::{project_one, project_one_step};
+use super::project_one::project_one;
 use crate::crypto::{event_id_to_base64, hash_event, EventId};
 use crate::db::{
     open_in_memory,
