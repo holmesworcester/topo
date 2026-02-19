@@ -88,21 +88,25 @@ def main() -> int:
         if not spec_tests[sid]:
             errors.append(f"SPEC_NO_TEST: {sid} has no linked test")
 
-    # ── Rule 2: guard-level spec_ids have pass + break ──
+    # ── Rule 2: guard-level spec_ids have pass + break (or waiver) ──
     spec_polarities: dict[str, set[str]] = defaultdict(set)
+    waived_specs: set[str] = set()
     for row in matrix_rows:
         sid = row.get("spec_id", "")
         pol = row.get("polarity", "")
         if sid and pol:
-            spec_polarities[sid].add(pol)
+            if pol.startswith("waiver:"):
+                waived_specs.add(sid)
+            else:
+                spec_polarities[sid].add(pol)
 
     for sid, pols in spec_polarities.items():
         if "pass" not in pols:
             errors.append(f"SPEC_NO_PASS: {sid} has no pass-polarity test")
-        if "break" not in pols:
+        if "break" not in pols and sid not in waived_specs:
             # Only warn for guard-level specs (not replay/order convergence specs)
             if not sid.startswith("SPEC_REPLAY_") and not sid.startswith("SPEC_CASCADE_") and not sid.startswith("SPEC_DEL_CONVERGENCE_"):
-                errors.append(f"SPEC_NO_BREAK: {sid} has no break-polarity test (add test or waiver)")
+                errors.append(f"SPEC_NO_BREAK: {sid} has no break-polarity test (add test or waiver:<reason>)")
 
     # ── Rule 3: every check_id in matrix exists in catalog ──
     matrix_check_ids = {row.get("check_id", "") for row in matrix_rows if row.get("check_id")}

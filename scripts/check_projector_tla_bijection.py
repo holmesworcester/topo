@@ -115,11 +115,13 @@ def main() -> int:
         if guard not in guard_to_checks or not guard_to_checks[guard]:
             errors.append(f"GUARD_NO_CHECK: TLA guard {guard} has no runtime check_id mapped to it")
 
-    # ── Rule 2: every check_id maps to a guard or waiver ──
+    # ── Rule 2: every check_id maps to a valid guard or waiver ──
     for cid in sorted(catalog_by_check):
         gid = catalog_by_check[cid]
         if not gid:
             errors.append(f"CHECK_NO_GUARD: {cid} has no tla_guard_id mapping")
+        elif not gid.startswith("NON_MODELED::") and gid not in spec_guards:
+            errors.append(f"CHECK_UNKNOWN_GUARD: {cid} maps to '{gid}' which is not a known TLA guard")
 
     # ── Rule 3: every check_id has at least one linked test ──
     for cid in sorted(catalog_by_check):

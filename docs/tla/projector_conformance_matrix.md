@@ -46,7 +46,7 @@ both `pass` and `break` polarity unless waived.
 | SPEC_PEER_SHARED_TRUST_01 | InvPeerSharedTrustSource | CHK_PS_INSERT | projector_unit | event_modules::peer_shared::tests::test_peer_shared_writes_row | pass |
 | SPEC_PEER_SHARED_TRUST_01 | InvPeerSharedTrustSource | CHK_DEP_PRESENCE | pipeline_integration | apply::tests::test_project_reaction_blocked | break |
 | SPEC_PEER_SHARED_TRUST_02 | InvPeerSharedTrustMatchesCarried | CHK_PS_INSERT | projector_unit | event_modules::peer_shared::tests::test_peer_shared_writes_correct_fields | pass |
-| SPEC_PEER_SHARED_TRUST_02 | InvPeerSharedTrustMatchesCarried | CHK_PS_INSERT | projector_unit | event_modules::peer_shared::tests::test_peer_shared_writes_row | break |
+| SPEC_PEER_SHARED_TRUST_02 | InvPeerSharedTrustMatchesCarried | CHK_PS_INSERT | projector_unit | — | waiver:structural_copy |
 | SPEC_PENDING_CONSUMED_01 | InvPendingBootstrapTrustConsumedByPeerShared | CHK_PS_SUPERSEDE | projector_unit | event_modules::peer_shared::tests::test_peer_shared_emits_supersede | pass |
 | SPEC_PENDING_CONSUMED_01 | InvPendingBootstrapTrustConsumedByPeerShared | CHK_PS_SUPERSEDE | projector_unit | event_modules::peer_shared::tests::test_peer_shared_ongoing_also_emits_supersede | break |
 | SPEC_INVITE_CHAIN_01 | InvUserInviteChain | CHK_DEP_PRESENCE | pipeline_integration | apply::tests::test_signed_content_events_project_with_identity_chain | pass |
