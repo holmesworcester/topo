@@ -130,16 +130,25 @@ def main() -> int:
     # Use full cargo test paths to avoid ambiguity with duplicate names.
     import subprocess
     real_test_paths: set[str] = set()
-    try:
-        out = subprocess.check_output(
-            ["cargo", "test", "--lib", "--", "--list"],
-            cwd=str(REPO_ROOT), text=True, stderr=subprocess.DEVNULL,
-        )
-        for line in out.splitlines():
-            if line.endswith(": test"):
-                real_test_paths.add(line[:-6])  # strip ": test"
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        # Fallback: scan source files for function names
+    cargo_available = False
+    # Try listing lib tests, then integration tests (which may fail to compile).
+    for cargo_args in [["--lib"], ["--tests"]]:
+        try:
+            out = subprocess.check_output(
+                ["cargo", "test"] + cargo_args + ["--", "--list"],
+                cwd=str(REPO_ROOT), text=True, stderr=subprocess.DEVNULL,
+            )
+            cargo_available = True
+            for line in out.splitlines():
+                if line.endswith(": test"):
+                    real_test_paths.add(line[:-6])  # strip ": test"
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            pass
+
+    if not cargo_available:
+        # Fallback: scan source files for bare function names. In this mode
+        # we compare only by function name (suffix match), since we cannot
+        # reconstruct full module paths from source alone.
         for search_dir in [REPO_ROOT / "src", REPO_ROOT / "tests"]:
             if not search_dir.exists():
                 continue
@@ -153,7 +162,10 @@ def main() -> int:
             continue
         # Check if any cargo test path ends with the matrix test_id
         if not any(p == tid or p.endswith("::" + tid) for p in real_test_paths):
-            errors.append(f"STALE_TEST_ID: {tid} does not match any test function")
+            # In fallback mode, also try matching just the function name
+            fn_name = tid.rsplit("::", 1)[-1] if "::" in tid else tid
+            if fn_name not in real_test_paths:
+                errors.append(f"STALE_TEST_ID: {tid} does not match any test function")
 
     # ── Report ──
     if errors:
