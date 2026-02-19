@@ -12,6 +12,7 @@ use ed25519_dalek::SigningKey;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
+use crate::contracts::event_runtime_contract::BatchWriterFn;
 use crate::contracts::network_contract::{
     next_session_id, PeerFingerprint, SessionDirection, SessionHandler, SessionMeta, TenantId,
 };
@@ -57,6 +58,7 @@ pub async fn bootstrap_sync_from_invite(
     bootstrap_addr: SocketAddr,
     bootstrap_spki: &[u8; 32],
     timeout_secs: u64,
+    batch_writer: BatchWriterFn,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Ensure DB is initialized
     {
@@ -115,7 +117,7 @@ pub async fn bootstrap_sync_from_invite(
         remote_addr: connection.remote_address(),
         direction: SessionDirection::Outbound,
     };
-    let handler = ReplicationSessionHandler::initiator(db_path.to_string(), timeout_secs, crate::event_pipeline::batch_writer);
+    let handler = ReplicationSessionHandler::initiator(db_path.to_string(), timeout_secs, batch_writer);
     let io = SyncSessionIo::new(session_id, conn);
     handler
         .on_session(meta, Box::new(io), CancellationToken::new())
@@ -144,6 +146,7 @@ pub fn start_bootstrap_responder(
     inviter_db_path: &str,
     inviter_identity: &str,
     invite_key: &SigningKey,
+    batch_writer: BatchWriterFn,
 ) -> Result<(SocketAddr, quinn::Endpoint), Box<dyn std::error::Error + Send + Sync>> {
     let db = open_connection(inviter_db_path)?;
     let (_, cert, key) = crate::transport_identity::load_transport_cert_required(&db)?;
@@ -167,7 +170,7 @@ pub fn start_bootstrap_responder(
             let handler = ReplicationSessionHandler::responder(
                 db_path.clone(),
                 30,
-                crate::event_pipeline::batch_writer,
+                batch_writer,
             );
             // Accept up to 2 connections: the initial bootstrap sync and an
             // optional push-back sync where the joiner pushes its identity

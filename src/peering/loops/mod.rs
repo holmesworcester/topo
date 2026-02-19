@@ -38,6 +38,7 @@ pub type IntroSpawnerFn = fn(
     String,
     quinn::Endpoint,
     Option<quinn::ClientConfig>,
+    crate::contracts::event_runtime_contract::BatchWriterFn,
 ) -> tokio::task::JoinHandle<()>;
 
 // ---------------------------------------------------------------------------

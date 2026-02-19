@@ -208,6 +208,7 @@ pub async fn accept_loop_with_ingest(
                     peer_id.clone(),
                     intro_endpoint,
                     intro_client_cfg,
+                    ingest.batch_writer,
                 );
 
                 let peer_fp = match peer_fingerprint_from_hex(&peer_id) {

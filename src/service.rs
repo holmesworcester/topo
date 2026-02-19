@@ -1458,7 +1458,7 @@ pub async fn svc_intro(
     });
     let endpoint = create_dual_endpoint_dynamic("0.0.0.0:0".parse().unwrap(), cert, key, dynamic_allow)?;
 
-    let result = crate::protocol::intro::run_intro(
+    let result = crate::peering::workflows::intro::run_intro(
         &endpoint,
         db_path,
         &recorded_by,
@@ -1626,12 +1626,13 @@ pub async fn svc_accept_invite(
             ))
         })?;
 
-    crate::protocol::bootstrap::bootstrap_sync_from_invite(
+    crate::peering::workflows::bootstrap::bootstrap_sync_from_invite(
         db_path,
         &recorded_by,
         bootstrap_addr,
         &invite.bootstrap_spki_fingerprint,
         15, // timeout seconds
+        crate::event_pipeline::batch_writer,
     )
     .await
     .map_err(|e| ServiceError(format!("Bootstrap sync failed: {}", e)))?;
@@ -1693,12 +1694,13 @@ pub async fn svc_accept_invite(
     // cert, which the inviter trusts via pending_invite_bootstrap_trust). This ensures
     // the inviter has our PeerShared event before we transition transport identity.
     drop(db);
-    crate::protocol::bootstrap::bootstrap_sync_from_invite(
+    crate::peering::workflows::bootstrap::bootstrap_sync_from_invite(
         db_path,
         &recorded_by,
         bootstrap_addr,
         &invite.bootstrap_spki_fingerprint,
         15,
+        crate::event_pipeline::batch_writer,
     )
     .await
     .map_err(|e| ServiceError(format!("Push-back sync failed: {}", e)))?;
@@ -1765,12 +1767,13 @@ pub async fn svc_accept_device_link(
             ))
         })?;
 
-    crate::protocol::bootstrap::bootstrap_sync_from_invite(
+    crate::peering::workflows::bootstrap::bootstrap_sync_from_invite(
         db_path,
         &recorded_by,
         bootstrap_addr,
         &invite.bootstrap_spki_fingerprint,
         15,
+        crate::event_pipeline::batch_writer,
     )
     .await
     .map_err(|e| ServiceError(format!("Bootstrap sync failed: {}", e)))?;
@@ -1810,12 +1813,13 @@ pub async fn svc_accept_device_link(
     // Push identity chain events back to inviter (while still using invite-derived
     // cert, which the inviter trusts via pending_invite_bootstrap_trust).
     drop(db);
-    crate::protocol::bootstrap::bootstrap_sync_from_invite(
+    crate::peering::workflows::bootstrap::bootstrap_sync_from_invite(
         db_path,
         &recorded_by,
         bootstrap_addr,
         &invite.bootstrap_spki_fingerprint,
         15,
+        crate::event_pipeline::batch_writer,
     )
     .await
     .map_err(|e| ServiceError(format!("Push-back sync failed: {}", e)))?;

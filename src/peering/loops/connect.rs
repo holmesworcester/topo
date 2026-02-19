@@ -178,6 +178,7 @@ async fn connect_loop_inner(
             peer_id.clone(),
             endpoint.clone(),
             client_config.clone(),
+            batch_writer_fn,
         );
 
         // Inner loop: repeated sync sessions on this connection

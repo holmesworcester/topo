@@ -2,6 +2,7 @@ pub mod discovery;
 pub mod loops;
 pub mod nat;
 pub mod runtime;
+pub mod workflows;
 
 // Public API re-exports for the network boundary
 pub use loops::{

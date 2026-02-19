@@ -41,6 +41,7 @@ pub fn noop_intro_spawner(
     _peer_id: String,
     _endpoint: quinn::Endpoint,
     _client_config: Option<quinn::ClientConfig>,
+    _batch_writer: crate::contracts::event_runtime_contract::BatchWriterFn,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_local(async {})
 }
@@ -110,7 +111,7 @@ fn start_test_sync_endpoint(
     inviter_identity: &str,
     invite_key: &SigningKey,
 ) -> Result<(SocketAddr, quinn::Endpoint), Box<dyn std::error::Error + Send + Sync>> {
-    crate::protocol::bootstrap::start_bootstrap_responder(inviter_db_path, inviter_identity, invite_key)
+    crate::peering::workflows::bootstrap::start_bootstrap_responder(inviter_db_path, inviter_identity, invite_key, crate::event_pipeline::batch_writer)
 }
 
 impl Peer {

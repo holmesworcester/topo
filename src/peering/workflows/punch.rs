@@ -7,6 +7,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use crate::contracts::event_runtime_contract::BatchWriterFn;
 use crate::contracts::network_contract::{
     PeerFingerprint, SessionDirection, SessionHandler, SessionMeta, TenantId, TrustDecision,
     TrustOracle,
@@ -74,6 +75,7 @@ pub async fn handle_intro_offer(
     expires_at_ms: u64,
     attempt_window_ms: u32,
     client_config: Option<quinn::ClientConfig>,
+    batch_writer: BatchWriterFn,
 ) {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -263,6 +265,7 @@ pub async fn handle_intro_offer(
                             db_path,
                             recorded_by,
                             &other_peer_hex,
+                            batch_writer,
                         )
                         .await;
                         return;
@@ -294,6 +297,7 @@ async fn run_sync_on_punched_connection(
     db_path: &str,
     recorded_by: &str,
     peer_id: &str,
+    batch_writer: BatchWriterFn,
 ) {
     // Open streams and run initiator sync
     let (ctrl_send, ctrl_recv) = match connection.open_bi().await {
@@ -344,7 +348,7 @@ async fn run_sync_on_punched_connection(
         remote_addr: connection.remote_address(),
         direction: SessionDirection::Outbound,
     };
-    let handler = ReplicationSessionHandler::initiator(db_path.to_string(), 60, crate::event_pipeline::batch_writer);
+    let handler = ReplicationSessionHandler::initiator(db_path.to_string(), 60, batch_writer);
     let io = SyncSessionIo::new(session_id, conn);
 
     if let Err(e) = handler
@@ -371,6 +375,7 @@ pub fn spawn_intro_listener(
     introduced_by: String,
     endpoint: quinn::Endpoint,
     client_config: Option<quinn::ClientConfig>,
+    batch_writer: BatchWriterFn,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_local(async move {
         loop {
@@ -423,6 +428,7 @@ pub fn spawn_intro_listener(
                             expires_at_ms,
                             attempt_window_ms,
                             cfg,
+                            batch_writer,
                         )
                         .await;
                     });

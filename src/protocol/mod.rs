@@ -1,7 +1,4 @@
 pub mod wire;
-pub mod bootstrap;
-pub mod intro;
-pub mod punch;
 
 pub use wire::{SyncMessage, parse_sync_message, encode_sync_message};
 

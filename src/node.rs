@@ -18,7 +18,7 @@ pub async fn run_node(
         db_path,
         bind,
         net_info_tx,
-        crate::protocol::punch::spawn_intro_listener,
+        crate::peering::workflows::punch::spawn_intro_listener,
         IngestFns {
             batch_writer: crate::event_pipeline::batch_writer,
             drain_queue: crate::event_pipeline::drain_project_queue,
