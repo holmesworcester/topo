@@ -357,11 +357,13 @@ async fn fragmented_data_frames_handler_completes() {
             .expect("handler timed out with fragmented frames -- must not hang")
             .expect("handler panicked");
 
-        // The handler must terminate without hanging or panicking.
-        // It may return Ok (tolerating the data receiver error) or Err
-        // (propagating the parse failure) -- both are acceptable.
-        // The critical property is non-hanging termination.
-        let _ = result;
+        // The handler tolerates data-receiver parse failures from fragmented
+        // frames — the control loop drives the session to completion.
+        assert!(
+            result.is_ok(),
+            "handler should complete gracefully despite fragmented data frames, got: {:?}",
+            result
+        );
         cancel.cancel();
     })
     .await;
@@ -445,11 +447,13 @@ async fn garbage_control_frame_terminates_handler() {
             .expect("handler timed out on garbage control frame -- must not hang")
             .expect("handler panicked");
 
-        // The handler must terminate without hanging or panicking.
-        // The responder's control loop breaks on parse errors and returns.
-        // This verifies that garbage control frames don't cause infinite
-        // loops or deadlocks in the protocol state machine.
-        let _ = result;
+        // Responder breaks out of its control loop on parse errors and
+        // terminates the session gracefully — garbage does not cause hangs.
+        assert!(
+            result.is_ok(),
+            "handler should exit gracefully on garbage control frame, got: {:?}",
+            result
+        );
         cancel.cancel();
     })
     .await;
@@ -516,10 +520,14 @@ async fn duplicate_done_violation_terminates_handler() {
             .expect("handler timed out on duplicate Done — it should not hang")
             .expect("handler panicked");
 
-        // The handler must terminate. It may succeed (ignoring duplicate)
-        // or error (rejecting duplicate) — both are acceptable behaviors.
-        // The critical property is that it does not hang or panic.
-        let _ = result;
+        // Handler processes the first Done normally and completes the
+        // session. The duplicate Done arrives after the control loop has
+        // already exited, so the handler terminates gracefully.
+        assert!(
+            result.is_ok(),
+            "handler should complete gracefully despite duplicate Done, got: {:?}",
+            result
+        );
         cancel.cancel();
     })
     .await;
