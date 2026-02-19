@@ -1,5 +1,5 @@
-use super::registry::{EventTypeMeta, ShareScope};
-use super::{EventError, ParsedEvent, EVENT_TYPE_ADMIN_BOOT, EVENT_TYPE_ADMIN_ONGOING};
+use super::super::registry::{EventTypeMeta, ShareScope};
+use super::super::{EventError, ParsedEvent, EVENT_TYPE_ADMIN_BOOT, EVENT_TYPE_ADMIN_ONGOING};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdminBootEvent {
@@ -133,35 +133,6 @@ pub fn encode_admin_ongoing(event: &ParsedEvent) -> Result<Vec<u8>, EventError> 
     Ok(buf)
 }
 
-// === Projector (event-module locality) ===
-
-use crate::projection::result::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
-
-/// Pure projector: Admin (Boot or Ongoing) → admins table.
-pub fn project_pure(
-    recorded_by: &str,
-    event_id_b64: &str,
-    parsed: &ParsedEvent,
-    _ctx: &ContextSnapshot,
-) -> ProjectorResult {
-    let public_key = match parsed {
-        ParsedEvent::AdminBoot(a) => &a.public_key,
-        ParsedEvent::AdminOngoing(a) => &a.public_key,
-        _ => return ProjectorResult::reject("not an admin event".to_string()),
-    };
-
-    let ops = vec![WriteOp::InsertOrIgnore {
-        table: "admins",
-        columns: vec!["recorded_by", "event_id", "public_key"],
-        values: vec![
-            SqlVal::Text(recorded_by.to_string()),
-            SqlVal::Text(event_id_b64.to_string()),
-            SqlVal::Blob(public_key.to_vec()),
-        ],
-    }];
-    ProjectorResult::valid(ops)
-}
-
 pub static ADMIN_BOOT_META: EventTypeMeta = EventTypeMeta {
     type_code: EVENT_TYPE_ADMIN_BOOT,
     type_name: "admin_boot",
@@ -174,7 +145,7 @@ pub static ADMIN_BOOT_META: EventTypeMeta = EventTypeMeta {
     encryptable: false,
     parse: parse_admin_boot,
     encode: encode_admin_boot,
-    projector: project_pure,
+    projector: super::projector::project_pure,
 };
 
 pub static ADMIN_ONGOING_META: EventTypeMeta = EventTypeMeta {
@@ -189,20 +160,5 @@ pub static ADMIN_ONGOING_META: EventTypeMeta = EventTypeMeta {
     encryptable: false,
     parse: parse_admin_ongoing,
     encode: encode_admin_ongoing,
-    projector: project_pure,
+    projector: super::projector::project_pure,
 };
-
-// === Query APIs (event-module locality) ===
-
-use rusqlite::Connection;
-
-pub fn count(
-    db: &Connection,
-    recorded_by: &str,
-) -> Result<i64, rusqlite::Error> {
-    db.query_row(
-        "SELECT COUNT(*) FROM admins WHERE recorded_by = ?1",
-        rusqlite::params![recorded_by],
-        |row| row.get(0),
-    )
-}

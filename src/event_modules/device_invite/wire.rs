@@ -1,5 +1,5 @@
-use super::registry::{EventTypeMeta, ShareScope};
-use super::{EventError, ParsedEvent, EVENT_TYPE_DEVICE_INVITE_FIRST, EVENT_TYPE_DEVICE_INVITE_ONGOING};
+use super::super::registry::{EventTypeMeta, ShareScope};
+use super::super::{EventError, ParsedEvent, EVENT_TYPE_DEVICE_INVITE_FIRST, EVENT_TYPE_DEVICE_INVITE_ONGOING};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceInviteFirstEvent {
@@ -121,35 +121,6 @@ pub fn encode_device_invite_ongoing(event: &ParsedEvent) -> Result<Vec<u8>, Even
     Ok(buf)
 }
 
-// === Projector (event-module locality) ===
-
-use crate::projection::result::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
-
-/// Pure projector: DeviceInvite (First or Ongoing) → device_invites table.
-pub fn project_pure(
-    recorded_by: &str,
-    event_id_b64: &str,
-    parsed: &ParsedEvent,
-    _ctx: &ContextSnapshot,
-) -> ProjectorResult {
-    let public_key = match parsed {
-        ParsedEvent::DeviceInviteFirst(di) => &di.public_key,
-        ParsedEvent::DeviceInviteOngoing(di) => &di.public_key,
-        _ => return ProjectorResult::reject("not a device_invite event".to_string()),
-    };
-
-    let ops = vec![WriteOp::InsertOrIgnore {
-        table: "device_invites",
-        columns: vec!["recorded_by", "event_id", "public_key"],
-        values: vec![
-            SqlVal::Text(recorded_by.to_string()),
-            SqlVal::Text(event_id_b64.to_string()),
-            SqlVal::Blob(public_key.to_vec()),
-        ],
-    }];
-    ProjectorResult::valid(ops)
-}
-
 pub static DEVICE_INVITE_FIRST_META: EventTypeMeta = EventTypeMeta {
     type_code: EVENT_TYPE_DEVICE_INVITE_FIRST,
     type_name: "device_invite_first",
@@ -162,7 +133,7 @@ pub static DEVICE_INVITE_FIRST_META: EventTypeMeta = EventTypeMeta {
     encryptable: false,
     parse: parse_device_invite_first,
     encode: encode_device_invite_first,
-    projector: project_pure,
+    projector: super::projector::project_pure,
 };
 
 pub static DEVICE_INVITE_ONGOING_META: EventTypeMeta = EventTypeMeta {
@@ -177,5 +148,5 @@ pub static DEVICE_INVITE_ONGOING_META: EventTypeMeta = EventTypeMeta {
     encryptable: false,
     parse: parse_device_invite_ongoing,
     encode: encode_device_invite_ongoing,
-    projector: project_pure,
+    projector: super::projector::project_pure,
 };

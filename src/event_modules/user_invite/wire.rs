@@ -1,5 +1,5 @@
-use super::registry::{EventTypeMeta, ShareScope};
-use super::{EventError, ParsedEvent, EVENT_TYPE_USER_INVITE_BOOT, EVENT_TYPE_USER_INVITE_ONGOING};
+use super::super::registry::{EventTypeMeta, ShareScope};
+use super::super::{EventError, ParsedEvent, EVENT_TYPE_USER_INVITE_BOOT, EVENT_TYPE_USER_INVITE_ONGOING};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserInviteBootEvent {
@@ -133,35 +133,6 @@ pub fn encode_user_invite_ongoing(event: &ParsedEvent) -> Result<Vec<u8>, EventE
     Ok(buf)
 }
 
-// === Projector (event-module locality) ===
-
-use crate::projection::result::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
-
-/// Pure projector: UserInvite (Boot or Ongoing) → user_invites table.
-pub fn project_pure(
-    recorded_by: &str,
-    event_id_b64: &str,
-    parsed: &ParsedEvent,
-    _ctx: &ContextSnapshot,
-) -> ProjectorResult {
-    let public_key = match parsed {
-        ParsedEvent::UserInviteBoot(ui) => &ui.public_key,
-        ParsedEvent::UserInviteOngoing(ui) => &ui.public_key,
-        _ => return ProjectorResult::reject("not a user_invite event".to_string()),
-    };
-
-    let ops = vec![WriteOp::InsertOrIgnore {
-        table: "user_invites",
-        columns: vec!["recorded_by", "event_id", "public_key"],
-        values: vec![
-            SqlVal::Text(recorded_by.to_string()),
-            SqlVal::Text(event_id_b64.to_string()),
-            SqlVal::Blob(public_key.to_vec()),
-        ],
-    }];
-    ProjectorResult::valid(ops)
-}
-
 pub static USER_INVITE_BOOT_META: EventTypeMeta = EventTypeMeta {
     type_code: EVENT_TYPE_USER_INVITE_BOOT,
     type_name: "user_invite_boot",
@@ -174,7 +145,7 @@ pub static USER_INVITE_BOOT_META: EventTypeMeta = EventTypeMeta {
     encryptable: false,
     parse: parse_user_invite_boot,
     encode: encode_user_invite_boot,
-    projector: project_pure,
+    projector: super::projector::project_pure,
 };
 
 pub static USER_INVITE_ONGOING_META: EventTypeMeta = EventTypeMeta {
@@ -189,5 +160,5 @@ pub static USER_INVITE_ONGOING_META: EventTypeMeta = EventTypeMeta {
     encryptable: false,
     parse: parse_user_invite_ongoing,
     encode: encode_user_invite_ongoing,
-    projector: project_pure,
+    projector: super::projector::project_pure,
 };
