@@ -7,36 +7,52 @@ use crate::events::{
     ReactionEvent, SecretKeyEvent, SignedMemoEvent,
 };
 
+/// Result of verifying signer-user match.
+enum SignerUserCheck {
+    /// Signer's user_event_id matches the claimed author_id.
+    Match,
+    /// Semantic mismatch or missing data — event should be rejected.
+    Mismatch(String),
+}
+
 /// Verify that signed_by peer's user_event_id matches the claimed author_id.
-/// Returns Ok(()) on match, Err with reason on mismatch or missing data.
+/// Returns Err only for real DB errors (should not cause permanent rejection).
 fn verify_signer_user_match(
     conn: &Connection,
     recorded_by: &str,
     signed_by: &[u8; 32],
     author_id: &[u8; 32],
-) -> Result<(), String> {
+) -> Result<SignerUserCheck, rusqlite::Error> {
     let signed_by_b64 = event_id_to_base64(signed_by);
     let author_id_b64 = event_id_to_base64(author_id);
 
-    let peer_user_eid: String = conn
-        .query_row(
-            "SELECT COALESCE(user_event_id, '') FROM peers_shared WHERE recorded_by = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, &signed_by_b64],
-            |row| row.get(0),
-        )
-        .map_err(|_| format!("no peers_shared entry for signer {}", signed_by_b64))?;
+    let peer_user_eid: String = match conn.query_row(
+        "SELECT COALESCE(user_event_id, '') FROM peers_shared WHERE recorded_by = ?1 AND event_id = ?2",
+        rusqlite::params![recorded_by, &signed_by_b64],
+        |row| row.get(0),
+    ) {
+        Ok(v) => v,
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            return Ok(SignerUserCheck::Mismatch(
+                format!("no peers_shared entry for signer {}", signed_by_b64),
+            ));
+        }
+        Err(e) => return Err(e),
+    };
 
     if peer_user_eid.is_empty() {
-        return Err(format!("peers_shared entry for signer {} has no user_event_id (legacy row)", signed_by_b64));
+        return Ok(SignerUserCheck::Mismatch(
+            format!("peers_shared entry for signer {} has no user_event_id (legacy row)", signed_by_b64),
+        ));
     }
 
     if peer_user_eid != author_id_b64 {
-        return Err(format!(
+        return Ok(SignerUserCheck::Mismatch(format!(
             "signer {} belongs to user {} but author_id claims {}",
             signed_by_b64, peer_user_eid, author_id_b64
-        ));
+        )));
     }
-    Ok(())
+    Ok(SignerUserCheck::Match)
 }
 
 /// Project a Message event into the messages table. Returns Ok(true) if written.
@@ -47,8 +63,9 @@ pub fn project_message(
     msg: &MessageEvent,
 ) -> Result<ProjectionDecision, Box<dyn std::error::Error>> {
     // Verify signer-user match
-    if let Err(reason) = verify_signer_user_match(conn, recorded_by, &msg.signed_by, &msg.author_id) {
-        return Ok(ProjectionDecision::Reject { reason });
+    match verify_signer_user_match(conn, recorded_by, &msg.signed_by, &msg.author_id)? {
+        SignerUserCheck::Mismatch(reason) => return Ok(ProjectionDecision::Reject { reason }),
+        SignerUserCheck::Match => {}
     }
 
     let workspace_id_b64 = event_id_to_base64(&msg.workspace_id);
@@ -77,8 +94,9 @@ pub fn project_reaction(
     rxn: &ReactionEvent,
 ) -> Result<ProjectionDecision, Box<dyn std::error::Error>> {
     // Verify signer-user match
-    if let Err(reason) = verify_signer_user_match(conn, recorded_by, &rxn.signed_by, &rxn.author_id) {
-        return Ok(ProjectionDecision::Reject { reason });
+    match verify_signer_user_match(conn, recorded_by, &rxn.signed_by, &rxn.author_id)? {
+        SignerUserCheck::Mismatch(reason) => return Ok(ProjectionDecision::Reject { reason }),
+        SignerUserCheck::Match => {}
     }
 
     let target_id_b64 = event_id_to_base64(&rxn.target_event_id);
@@ -161,8 +179,9 @@ pub fn project_message_deletion(
     del: &MessageDeletionEvent,
 ) -> Result<ProjectionDecision, Box<dyn std::error::Error>> {
     // Verify signer-user match
-    if let Err(reason) = verify_signer_user_match(conn, recorded_by, &del.signed_by, &del.author_id) {
-        return Ok(ProjectionDecision::Reject { reason });
+    match verify_signer_user_match(conn, recorded_by, &del.signed_by, &del.author_id)? {
+        SignerUserCheck::Mismatch(reason) => return Ok(ProjectionDecision::Reject { reason }),
+        SignerUserCheck::Match => {}
     }
 
     let target_b64 = event_id_to_base64(&del.target_event_id);
