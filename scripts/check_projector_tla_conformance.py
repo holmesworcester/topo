@@ -74,15 +74,18 @@ def main() -> int:
     catalog_check_ids = {r["check_id"] for r in catalog_rows if "check_id" in r}
 
     # ── Rule 1: every spec_id has at least one test ──
+    all_spec_ids: set[str] = set()
     spec_tests: dict[str, list[str]] = defaultdict(list)
     for row in matrix_rows:
         sid = row.get("spec_id", "")
         tid = row.get("test_id", "")
-        if sid and tid:
-            spec_tests[sid].append(tid)
+        if sid:
+            all_spec_ids.add(sid)
+            if tid:
+                spec_tests[sid].append(tid)
 
-    for sid, tests in spec_tests.items():
-        if not tests:
+    for sid in sorted(all_spec_ids):
+        if not spec_tests[sid]:
             errors.append(f"SPEC_NO_TEST: {sid} has no linked test")
 
     # ── Rule 2: guard-level spec_ids have pass + break ──
@@ -115,7 +118,7 @@ def main() -> int:
         if sid and cid:
             spec_checks[sid].add(cid)
 
-    for sid in spec_tests:
+    for sid in sorted(all_spec_ids):
         if sid not in spec_checks or not spec_checks[sid]:
             errors.append(f"SPEC_NO_CHECK: {sid} has no check_id mapping")
 

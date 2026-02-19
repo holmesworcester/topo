@@ -93,9 +93,11 @@ def main() -> int:
     for row in catalog_rows:
         cid = row.get("check_id", "")
         gid = row.get("tla_guard_id", "")
-        if cid and gid:
+        if cid:
             catalog_by_check[cid] = gid
-            if gid.startswith("NON_MODELED::"):
+            if not gid:
+                pass  # will be caught by Rule 2
+            elif gid.startswith("NON_MODELED::"):
                 waivers.append((cid, gid))
             else:
                 guard_to_checks[gid].add(cid)
