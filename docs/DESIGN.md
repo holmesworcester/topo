@@ -441,6 +441,7 @@ Projectors must not access the database directly. Fields include:
 - `file_descriptors` / `existing_file_slice` — for FileSlice authorization
 - `secret_key_bytes` — for Encrypted event decryption
 - `bootstrap_context` — local bootstrap context (addr + SPKI) for invite trust materialization
+- `is_local_create` — whether the event was locally created (from `recorded_events.source`); gates `WritePendingBootstrapTrust` emission so only the invite creator materializes pending trust
 
 ### Command/effect execution stage semantics
 
@@ -908,18 +909,16 @@ TTL expiry: bootstrap trust rows are time-bounded. Unconsumed entries expire and
 
 Removal cascade: `peer_removed` cascades trust removal across all three sources for the affected peer.
 
-TLC-verified invariants (from `TransportCredentialLifecycle.tla`, mapped to Rust checks in `docs/tla/projector_spec.md`):
-1. `InvActiveCredInHistory`,
-2. `InvRevokedSubsetHistory`,
-3. `InvActiveCredNotRevoked`,
-4. `InvSPKIUniqueness`,
-5. `InvActiveCredGloballyUnique`,
-6. `InvBootstrapConsumedByPeerShared`,
-7. `InvPendingConsumedByPeerShared`,
-8. `InvTrustSetIsExactUnion`,
-9. `InvTrustSourcesWellFormed`,
-10. `InvRevokedNotInBootstrapTrust`,
-11. `InvMutualAuthSymmetry`.
+Invite ownership: `inviteCreator` tracks which peer created each invite SPKI. Only the invite creator (inviter) may materialize pending bootstrap trust — the joiner must not emit `WritePendingBootstrapTrust` when syncing the invite event. This is enforced by the `is_local_create` flag in `ContextSnapshot`, populated from `recorded_events.source`. The TLA+ model captures this via the `inviteCreator[s] = p` guard on `AddPendingBootstrapTrust` and the `InvPendingTrustOnlyOnInviter` invariant.
+
+TLC-verified invariants (from `TransportCredentialLifecycle.tla`, POC-simplified single-credential-per-peer model, mapped to Rust checks in `docs/tla/projector_spec.md`):
+1. `InvSPKIUniqueness` — no two peers share an active SPKI,
+2. `InvBootstrapConsumedByPeerShared` — bootstrap trust disjoint from PeerShared trust,
+3. `InvPendingConsumedByPeerShared` — pending trust disjoint from PeerShared trust,
+4. `InvTrustSetIsExactUnion` — trust set is exact union of three sources,
+5. `InvTrustSourcesWellFormed` — all trust sets contain valid SPKIs,
+6. `InvMutualAuthSymmetry` — mutual auth requires both peers have credentials,
+7. `InvPendingTrustOnlyOnInviter` — pending trust exists only on invite creator's store.
 
 Abstract boundary: TLS handshake and session-key derivation remain unmodeled. The TLA spec covers trust-source state transitions but not the cryptographic session establishment that consumes them.
 

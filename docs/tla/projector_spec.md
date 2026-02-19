@@ -92,15 +92,15 @@ Changes to this document require TLA+ model re-verification.
 | 6 | project_secret_key | secret_keys | — |
 | 7 | project_message_deletion | deleted_messages | author auth + cascade |
 | 8 | project_workspace | workspaces | TrustAnchorMatch guard |
-| 9 | project_invite_accepted | invite_accepted | writes trust_anchors (first-write-wins immutable) |
-| 10 | project_user_invite | user_invites | — |
+| 9 | project_invite_accepted | invite_accepted | writes trust_anchors (first-write-wins immutable); emits WriteAcceptedBootstrapTrust |
+| 10 | project_user_invite | user_invites | emits WritePendingBootstrapTrust (gated by is_local_create) |
 | 11 | project_user_invite | user_invites | — |
-| 12 | project_device_invite | device_invites | — |
+| 12 | project_device_invite | device_invites | emits WritePendingBootstrapTrust (gated by is_local_create) |
 | 13 | project_device_invite | device_invites | — |
 | 14 | project_user | users | — |
 | 15 | project_user | users | — |
-| 16 | project_peer_shared | peers_shared | — |
-| 17 | project_peer_shared | peers_shared | — |
+| 16 | project_peer_shared | peers_shared | emits SupersedeBootstrapTrust |
+| 17 | project_peer_shared | peers_shared | emits SupersedeBootstrapTrust |
 | 18 | project_admin | admins | — |
 | 19 | project_admin | admins | — |
 | 20 | project_user_removed | removed_entities | — |
@@ -297,6 +297,7 @@ abstracting over the event graph.
 | InvTrustSetIsExactUnion | allowed_peers_from_db: UNION of PeerShared_SPKIs, invite_bootstrap_trust, pending_invite_bootstrap_trust |
 | InvTrustSourcesWellFormed | All trust table rows contain valid 32-byte SPKI fingerprints |
 | InvMutualAuthSymmetry | Mutual CanAuthenticate requires both peers have active credentials |
+| InvPendingTrustOnlyOnInviter | is_local_create gate: pending bootstrap trust exists only on invite creator's trust store |
 
 ### Multi-tenant trust scoping (collapse-single-tenant, 2026-02-17)
 
@@ -350,3 +351,20 @@ scoping trust to each tenant's `is_peer_allowed`. The TLA+ `CanAuthenticate(p, q
 already models per-tenant trust, so no model changes are needed. A Rust comment was
 added to the `CanAuthenticate` operator documenting the dual trust model
 (union inbound, per-tenant outbound). See the table note above for details.
+
+### trust-projection-eventization invite ownership (2026-02-19)
+
+Extended `TransportCredentialLifecycle.tla` with invite ownership tracking to catch
+the joiner-side pending trust emission bug. Changes:
+- Added `inviteCreator` variable (function from SPKIs to Peers ∪ {None})
+- Added `CreateInvite(p, s)` action establishing invite SPKI ownership
+- Added `inviteCreator[s] = p` guard on `AddPendingBootstrapTrust`
+- Added `InvPendingTrustOnlyOnInviter` invariant
+
+TLC status: correct model passes (11.5M states, 771K distinct, 2 peers / 3 SPKIs).
+Buggy model (guard weakened to `inviteCreator[s] # None`) violates invariant in 5 steps:
+counterexample shows Bob (joiner) materializing pending trust for Alice's (inviter's) SPKI.
+
+Rust mapping: `is_local_create` field in `ContextSnapshot` (populated from
+`recorded_events.source`) gates `WritePendingBootstrapTrust` emission in
+UserInviteBoot and DeviceInviteFirst projectors.

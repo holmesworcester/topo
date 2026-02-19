@@ -1209,7 +1209,8 @@ Previous gap: TLA models were identity/event-causality models that did not encod
 - Supersession: PeerShared projector emits `SupersedeBootstrapTrust` command at projection time, which removes matching bootstrap/pending entries. Trust check reads are pure (no write side-effects).
 - TTL expiry of bootstrap trust sources.
 - Trust removal (peer_removed cascading, user_removed transitive denial via `peers_shared.user_event_id`).
-- 6 invariants verified by TLC, mapped to Rust checks in `docs/tla/projector_spec.md`.
+- Invite ownership: `inviteCreator` variable tracks which peer created each invite SPKI. The `CreateInvite` action establishes ownership; `AddPendingBootstrapTrust` is guarded by `inviteCreator[s] = p` so only the invite creator can materialize pending trust.
+- 7 invariants verified by TLC (11.5M states, 771K distinct at 2-peer/3-SPKI), mapped to Rust checks in `docs/tla/projector_spec.md`. The `InvPendingTrustOnlyOnInviter` invariant catches the joiner-side pending trust emission bug (verified: buggy model violates in 5 steps).
 
 **What remains abstract** (by design):
 - TLS handshake and session-key derivation.
