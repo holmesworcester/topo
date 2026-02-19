@@ -1852,6 +1852,7 @@ fn test_out_of_order_identity() {
     let net_blob = encode_event(&ParsedEvent::Workspace(WorkspaceEvent {
         created_at_ms: now_ms,
         public_key: workspace_pubkey,
+        name: "test-workspace".to_string(),
     })).unwrap();
     let workspace_eid = hash_event(&net_blob);
     let workspace_id = workspace_eid;
@@ -1874,6 +1875,7 @@ fn test_out_of_order_identity() {
     let mut ub_blob = encode_event(&ParsedEvent::UserBoot(UserBootEvent {
         created_at_ms: now_ms + 2,
         public_key: user_pubkey,
+        username: "test-user".to_string(),
         signed_by: user_invite_eid,
         signer_type: 2,
         signature: [0u8; 64],
@@ -2771,6 +2773,7 @@ fn test_true_out_of_order_identity_chain() {
             .unwrap()
             .as_millis() as u64,
         public_key: workspace_pubkey,
+        name: "test-workspace".to_string(),
     });
     let workspace_id = hash_event(&encode_event(&workspace_event).unwrap());
 
@@ -3047,11 +3050,13 @@ async fn test_identity_then_messaging() {
     let alice_chain = bootstrap_peer(&alice);
     let bob_join = join_workspace(&bob, &alice_chain, &alice);
 
-    // Set signing keys so create_message works
+    // Set signing keys and author_id so create_message works
     alice.peer_shared_event_id = Some(alice_chain.peer_shared_eid);
     alice.peer_shared_signing_key = Some(alice_chain.peer_shared_key.clone());
+    alice.author_id = alice_chain.user_eid;
     bob.peer_shared_event_id = Some(bob_join.peer_shared_eid);
     bob.peer_shared_signing_key = Some(bob_join.peer_shared_key.clone());
+    bob.author_id = bob_join.user_eid;
 
     let harness = ScenarioHarness::new();
     harness.track(&alice);
@@ -3131,6 +3136,7 @@ async fn test_device_link_via_sync() {
             .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64,
         public_key: laptop_ps_pubkey,
         user_event_id: phone_chain.user_eid,
+        device_name: "laptop".to_string(),
         signed_by: laptop_di_eid,
         signer_type: 3,
         signature: [0u8; 64],

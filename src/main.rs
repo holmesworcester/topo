@@ -43,7 +43,17 @@ enum Commands {
 
     /// Create a new workspace and identity chain
     #[command(name = "create-workspace")]
-    CreateWorkspace,
+    CreateWorkspace {
+        /// Display name for the workspace
+        #[arg(long, default_value = "workspace")]
+        workspace_name: String,
+        /// Your username
+        #[arg(long, default_value = "user")]
+        username: String,
+        /// Device name for this peer
+        #[arg(long, default_value = "device")]
+        device_name: String,
+    },
 
     /// Run continuous sync (Ctrl-C to stop) — legacy foreground mode
     Sync {
@@ -86,6 +96,13 @@ enum Commands {
     /// Print local transport identity — SPKI fingerprint from TLS cert
     #[command(name = "transport-identity")]
     TransportIdentity,
+
+    /// Combined view: sidebar + messages with inline reactions
+    View {
+        /// Max messages to show (0 = all)
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+    },
 
     /// List messages
     Messages {
@@ -463,8 +480,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // ---------------------------------------------------------------
         // Direct-only commands (no daemon needed)
         // ---------------------------------------------------------------
-        Commands::CreateWorkspace => {
-            let result = service::svc_create_workspace(db)?;
+        Commands::CreateWorkspace { workspace_name, username, device_name } => {
+            let result = service::svc_create_workspace(db, &workspace_name, &username, &device_name)?;
             println!("peer_id:      {}", result.peer_id);
             println!("workspace_id: {}", result.workspace_id);
         }
@@ -541,6 +558,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::TransportIdentity)?;
             let fingerprint = data["fingerprint"].as_str().unwrap_or("");
             println!("{}", fingerprint);
+        }
+
+        Commands::View { limit } => {
+            let data = rpc_require_daemon(
+                db,
+                socket_override.as_deref(),
+                RpcMethod::View { limit },
+            )?;
+            show_view(&data);
         }
 
         Commands::Messages { limit } => {
@@ -741,17 +767,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
         Commands::Users => {
             let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::Users)?;
-            println!("USERS ({}):", db);
+            println!("USERS:");
             if let Some(items) = data.as_array() {
                 if items.is_empty() {
                     println!("  (none)");
                 } else {
                     for (i, item) in items.iter().enumerate() {
-                        println!(
-                            "  {}. user_{}",
-                            i + 1,
-                            short_id(item["event_id"].as_str().unwrap_or(""))
-                        );
+                        let username = item["username"].as_str().unwrap_or("");
+                        let eid = item["event_id"].as_str().unwrap_or("");
+                        let display = if username.is_empty() {
+                            format!("user_{}", short_id(eid))
+                        } else {
+                            username.to_string()
+                        };
+                        println!("  {}. {}", i + 1, display);
                     }
                 }
             } else {
@@ -1122,46 +1151,151 @@ fn days_to_ymd(days: i64) -> (i64, u32, u32) {
 // Messages display (from JSON data)
 // ---------------------------------------------------------------------------
 
-fn show_messages_from_json(db_path: &str, data: &serde_json::Value) {
+fn show_messages_from_json(_db_path: &str, data: &serde_json::Value) {
     let messages = match data["messages"].as_array() {
         Some(msgs) => msgs,
         None => {
-            println!("MESSAGES ({}):", db_path);
             println!("  (no messages)");
             return;
         }
     };
 
     if messages.is_empty() {
-        println!("MESSAGES ({}):", db_path);
         println!("  (no messages)");
         return;
     }
 
     let total = data["total"].as_i64().unwrap_or(0);
-    println!("MESSAGES ({}, {} total):", db_path, total);
-    println!();
+    println!("MESSAGES ({} total):\n", total);
 
     let mut last_author = String::new();
     for (i, msg) in messages.iter().enumerate() {
         let created_at = msg["created_at"].as_i64().unwrap_or(0);
         let ts = format_timestamp(created_at);
         let author_id = msg["author_id"].as_str().unwrap_or("");
-        let author = short_id(author_id);
+        let author_name = msg["author_name"].as_str().unwrap_or("");
+        let display_name = if author_name.is_empty() {
+            short_id(author_id).to_string()
+        } else {
+            author_name.to_string()
+        };
         let content = msg["content"].as_str().unwrap_or("");
-        let id = msg["id"].as_str().unwrap_or("");
 
         if author_id != last_author {
             if i > 0 {
                 println!();
             }
-            println!("  {} [{}]", author, ts);
-            println!("    {}. {}", i + 1, content);
-            println!("       id: {}", id);
+            println!("  {} [{}]", display_name, ts);
             last_author = author_id.to_string();
+        }
+        println!("    {}. {}", i + 1, content);
+    }
+    println!();
+}
+
+fn show_view(data: &serde_json::Value) {
+    // Sidebar: workspace name
+    let workspace_name = data["workspace_name"].as_str().unwrap_or("(unnamed)");
+    let own_user_eid = data["own_user_event_id"].as_str().unwrap_or("");
+
+    println!("  {}", workspace_name);
+
+    // Users list
+    if let Some(users) = data["users"].as_array() {
+        let user_names: Vec<String> = users
+            .iter()
+            .map(|u| {
+                let name = u["username"].as_str().unwrap_or("");
+                let eid = u["event_id"].as_str().unwrap_or("");
+                let display = if name.is_empty() {
+                    short_id(eid).to_string()
+                } else {
+                    name.to_string()
+                };
+                if eid == own_user_eid {
+                    format!("{} (you)", display)
+                } else {
+                    display
+                }
+            })
+            .collect();
+        println!("    USERS: {}", user_names.join(", "));
+    }
+
+    // Accounts list
+    if let Some(accounts) = data["accounts"].as_array() {
+        let acct_names: Vec<String> = accounts
+            .iter()
+            .map(|a| {
+                let username = a["username"].as_str().unwrap_or("");
+                let device_name = a["device_name"].as_str().unwrap_or("");
+                let user_eid = a["user_event_id"].as_str().unwrap_or("");
+                let user_display = if username.is_empty() {
+                    short_id(user_eid).to_string()
+                } else {
+                    username.to_string()
+                };
+                let label = if device_name.is_empty() {
+                    user_display
+                } else {
+                    format!("{}/{}", user_display, device_name)
+                };
+                if user_eid == own_user_eid {
+                    format!("{} (you)", label)
+                } else {
+                    label
+                }
+            })
+            .collect();
+        println!("    ACCOUNTS: {}", acct_names.join(", "));
+    }
+
+    println!();
+    println!("  {}", "\u{2500}".repeat(40));
+    println!();
+
+    // Messages with inline reactions
+    if let Some(messages) = data["messages"].as_array() {
+        if messages.is_empty() {
+            println!("    (no messages)");
         } else {
-            println!("    {}. {}", i + 1, content);
-            println!("       id: {}", id);
+            let mut last_author = String::new();
+            for (i, msg) in messages.iter().enumerate() {
+                let created_at = msg["created_at"].as_i64().unwrap_or(0);
+                let ts = format_timestamp(created_at);
+                let author_id = msg["author_id"].as_str().unwrap_or("");
+                let author_name = msg["author_name"].as_str().unwrap_or("");
+                let display_name = if author_name.is_empty() {
+                    short_id(author_id).to_string()
+                } else {
+                    author_name.to_string()
+                };
+                let content = msg["content"].as_str().unwrap_or("");
+
+                if author_id != last_author {
+                    if i > 0 {
+                        println!();
+                    }
+                    println!("    {} [{}]", display_name, ts);
+                    last_author = author_id.to_string();
+                }
+                println!("      {}. {}", i + 1, content);
+
+                // Inline reactions
+                if let Some(reactions) = msg["reactions"].as_array() {
+                    if !reactions.is_empty() {
+                        for rxn in reactions {
+                            let emoji = rxn["emoji"].as_str().unwrap_or("");
+                            let reactor = rxn["reactor_name"].as_str().unwrap_or("");
+                            if reactor.is_empty() {
+                                println!("         {}", emoji);
+                            } else {
+                                println!("         {} {}", emoji, reactor);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
     println!();

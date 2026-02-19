@@ -76,13 +76,14 @@ fn sign_blob(key: &SigningKey, blob: &mut Vec<u8>) {
 
 /// Bootstrap a full identity chain: Workspace → InviteAccepted → UserInviteBoot →
 /// UserBoot → DeviceInviteFirst → PeerSharedFirst. Returns (peer_shared_eid, signing_key).
-fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (EventId, SigningKey) {
+fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (EventId, SigningKey, EventId) {
     let mut rng = rand::thread_rng();
 
     let workspace_key = SigningKey::generate(&mut rng);
     let net = ParsedEvent::Workspace(WorkspaceEvent {
         created_at_ms: now_ms(),
         public_key: workspace_key.verifying_key().to_bytes(),
+        name: "bench".to_string(),
     });
     let net_blob = events::encode_event(&net).unwrap();
     let net_eid = insert_event_raw(conn, recorded_by, &net_blob);
@@ -116,6 +117,7 @@ fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (EventId, Signin
     let ub = ParsedEvent::UserBoot(UserBootEvent {
         created_at_ms: now_ms(),
         public_key: user_key.verifying_key().to_bytes(),
+        username: "bench-user".to_string(),
         signed_by: uib_eid,
         signer_type: 2,
         signature: [0u8; 64],
@@ -143,6 +145,7 @@ fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (EventId, Signin
         created_at_ms: now_ms(),
         public_key: peer_shared_key.verifying_key().to_bytes(),
         user_event_id: ub_eid,
+        device_name: "bench-device".to_string(),
         signed_by: dif_eid,
         signer_type: 3,
         signature: [0u8; 64],
@@ -152,7 +155,7 @@ fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (EventId, Signin
     let psf_eid = insert_event_raw(conn, recorded_by, &psf_blob);
     project_one(conn, recorded_by, &psf_eid).unwrap();
 
-    (psf_eid, peer_shared_key)
+    (psf_eid, peer_shared_key, ub_eid)
 }
 
 /// Create prerequisite events (identity chain, signed message, secret key) and return IDs + signing key.
@@ -160,13 +163,13 @@ fn create_prereqs(
     conn: &Connection,
     recorded_by: &str,
 ) -> (EventId, EventId, EventId, SigningKey) {
-    let (signer_eid, signing_key) = make_identity_chain(conn, recorded_by);
+    let (signer_eid, signing_key, user_event_id) = make_identity_chain(conn, recorded_by);
 
     // Signed message
     let msg = ParsedEvent::Message(MessageEvent {
         created_at_ms: now_ms(),
         workspace_id: [1u8; 32],
-        author_id: [2u8; 32],
+        author_id: user_event_id,
         content: "file parent".to_string(),
         signed_by: signer_eid,
         signer_type: 5,

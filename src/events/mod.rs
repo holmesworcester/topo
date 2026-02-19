@@ -138,12 +138,12 @@ impl ParsedEvent {
     /// Returns (field_name, raw_32_byte_id) pairs.
     pub fn dep_field_values(&self) -> Vec<(&'static str, [u8; 32])> {
         match self {
-            ParsedEvent::Message(m) => vec![("signed_by", m.signed_by)],
-            ParsedEvent::Reaction(r) => vec![("target_event_id", r.target_event_id), ("signed_by", r.signed_by)],
+            ParsedEvent::Message(m) => vec![("author_id", m.author_id), ("signed_by", m.signed_by)],
+            ParsedEvent::Reaction(r) => vec![("target_event_id", r.target_event_id), ("author_id", r.author_id), ("signed_by", r.signed_by)],
             ParsedEvent::SignedMemo(s) => vec![("signed_by", s.signed_by)],
             ParsedEvent::Encrypted(e) => vec![("key_event_id", e.key_event_id)],
             ParsedEvent::SecretKey(_) => vec![],
-            ParsedEvent::MessageDeletion(d) => vec![("target_event_id", d.target_event_id), ("signed_by", d.signed_by)],
+            ParsedEvent::MessageDeletion(d) => vec![("target_event_id", d.target_event_id), ("author_id", d.author_id), ("signed_by", d.signed_by)],
             ParsedEvent::Workspace(_) => vec![],
             ParsedEvent::InviteAccepted(_) => vec![],
             // UserInviteBoot: signed_by is a dep (workspace_id is reference, not dep)
@@ -435,10 +435,11 @@ mod tests {
         let ws = WorkspaceEvent {
             created_at_ms: 4444444444444,
             public_key: [10u8; 32],
+            name: "test-workspace".to_string(),
         };
         let event = ParsedEvent::Workspace(ws);
         let blob = encode_event(&event).unwrap();
-        assert_eq!(blob.len(), 41);
+        assert_eq!(blob.len(), 105);
         let parsed = parse_event(&blob).unwrap();
         assert_eq!(parsed, event);
     }
@@ -528,13 +529,14 @@ mod tests {
         let e = UserBootEvent {
             created_at_ms: 500,
             public_key: [28u8; 32],
+            username: "test-user".to_string(),
             signed_by: [29u8; 32],
             signer_type: 2,
             signature: [30u8; 64],
         };
         let event = ParsedEvent::UserBoot(e);
         let blob = encode_event(&event).unwrap();
-        assert_eq!(blob.len(), 138);
+        assert_eq!(blob.len(), 202);
         let parsed = parse_event(&blob).unwrap();
         assert_eq!(parsed, event);
     }
@@ -544,13 +546,14 @@ mod tests {
         let e = UserOngoingEvent {
             created_at_ms: 600,
             public_key: [31u8; 32],
+            username: "test-user".to_string(),
             signed_by: [32u8; 32],
             signer_type: 2,
             signature: [33u8; 64],
         };
         let event = ParsedEvent::UserOngoing(e);
         let blob = encode_event(&event).unwrap();
-        assert_eq!(blob.len(), 138);
+        assert_eq!(blob.len(), 202);
         let parsed = parse_event(&blob).unwrap();
         assert_eq!(parsed, event);
     }
@@ -561,13 +564,14 @@ mod tests {
             created_at_ms: 700,
             public_key: [34u8; 32],
             user_event_id: [99u8; 32],
+            device_name: "test-device".to_string(),
             signed_by: [35u8; 32],
             signer_type: 3,
             signature: [36u8; 64],
         };
         let event = ParsedEvent::PeerSharedFirst(e);
         let blob = encode_event(&event).unwrap();
-        assert_eq!(blob.len(), 170);
+        assert_eq!(blob.len(), 234);
         let parsed = parse_event(&blob).unwrap();
         assert_eq!(parsed, event);
     }
@@ -578,13 +582,14 @@ mod tests {
             created_at_ms: 800,
             public_key: [37u8; 32],
             user_event_id: [98u8; 32],
+            device_name: "test-device".to_string(),
             signed_by: [38u8; 32],
             signer_type: 3,
             signature: [39u8; 64],
         };
         let event = ParsedEvent::PeerSharedOngoing(e);
         let blob = encode_event(&event).unwrap();
-        assert_eq!(blob.len(), 170);
+        assert_eq!(blob.len(), 234);
         let parsed = parse_event(&blob).unwrap();
         assert_eq!(parsed, event);
     }
@@ -821,8 +826,10 @@ mod tests {
             signature: [0u8; 64],
         });
         let deps = msg.dep_field_values();
-        assert_eq!(deps.len(), 1);
-        assert_eq!(deps[0].0, "signed_by");
+        assert_eq!(deps.len(), 2);
+        assert_eq!(deps[0].0, "author_id");
+        assert_eq!(deps[0].1, [2u8; 32]);
+        assert_eq!(deps[1].0, "signed_by");
     }
 
     #[test]
@@ -838,10 +845,12 @@ mod tests {
             signature: [0u8; 64],
         });
         let deps = rxn.dep_field_values();
-        assert_eq!(deps.len(), 2);
+        assert_eq!(deps.len(), 3);
         assert_eq!(deps[0].0, "target_event_id");
         assert_eq!(deps[0].1, target);
-        assert_eq!(deps[1].0, "signed_by");
+        assert_eq!(deps[1].0, "author_id");
+        assert_eq!(deps[1].1, [3u8; 32]);
+        assert_eq!(deps[2].0, "signed_by");
     }
 
     #[test]
@@ -872,10 +881,12 @@ mod tests {
             signature: [0u8; 64],
         });
         let deps = del.dep_field_values();
-        assert_eq!(deps.len(), 2);
+        assert_eq!(deps.len(), 3);
         assert_eq!(deps[0].0, "target_event_id");
         assert_eq!(deps[0].1, target);
-        assert_eq!(deps[1].0, "signed_by");
+        assert_eq!(deps[1].0, "author_id");
+        assert_eq!(deps[1].1, [10u8; 32]);
+        assert_eq!(deps[2].0, "signed_by");
     }
 
     #[test]
@@ -883,6 +894,7 @@ mod tests {
         let ws = ParsedEvent::Workspace(WorkspaceEvent {
             created_at_ms: 100,
             public_key: [0u8; 32],
+            name: "test-workspace".to_string(),
         });
         assert!(ws.signer_fields().is_none());
 
@@ -927,6 +939,7 @@ mod tests {
         let ub = ParsedEvent::UserBoot(UserBootEvent {
             created_at_ms: 100,
             public_key: [0u8; 32],
+            username: "test-user".to_string(),
             signed_by: [99u8; 32],
             signer_type: 2,
             signature: [0u8; 64],
@@ -975,6 +988,7 @@ mod tests {
         let ws_blob = encode_event(&ParsedEvent::Workspace(WorkspaceEvent {
             created_at_ms: 0,
             public_key: [0u8; 32],
+            name: "test-workspace".to_string(),
         }))
         .unwrap();
         assert_eq!(extract_event_type(&ws_blob), Some(EVENT_TYPE_WORKSPACE));
@@ -1308,16 +1322,17 @@ mod tests {
 
     #[test]
     fn test_fixed_size_rejects_trailing_data() {
-        // Workspace (41 bytes fixed)
+        // Workspace (105 bytes fixed)
         let ws = ParsedEvent::Workspace(WorkspaceEvent {
             created_at_ms: 100,
             public_key: [0u8; 32],
+            name: "test-workspace".to_string(),
         });
         let mut blob = encode_event(&ws).unwrap();
-        assert_eq!(blob.len(), 41);
+        assert_eq!(blob.len(), 105);
         blob.push(0xFF);
         let err = parse_event(&blob).unwrap_err();
-        assert!(matches!(err, EventError::TrailingData { expected: 41, actual: 42 }));
+        assert!(matches!(err, EventError::TrailingData { expected: 105, actual: 106 }));
 
         // SecretKey (41 bytes fixed)
         let sk = ParsedEvent::SecretKey(SecretKeyEvent {
@@ -1340,10 +1355,11 @@ mod tests {
         let err = parse_event(&blob).unwrap_err();
         assert!(matches!(err, EventError::TrailingData { expected: 73, actual: 74 }));
 
-        // UserBoot (138 bytes fixed)
+        // UserBoot (202 bytes fixed)
         let ub = ParsedEvent::UserBoot(UserBootEvent {
             created_at_ms: 100,
             public_key: [0u8; 32],
+            username: "test-user".to_string(),
             signed_by: [0u8; 32],
             signer_type: 2,
             signature: [0u8; 64],
@@ -1351,7 +1367,7 @@ mod tests {
         let mut blob = encode_event(&ub).unwrap();
         blob.push(0xFF);
         let err = parse_event(&blob).unwrap_err();
-        assert!(matches!(err, EventError::TrailingData { expected: 138, actual: 139 }));
+        assert!(matches!(err, EventError::TrailingData { expected: 202, actual: 203 }));
 
         // AdminBoot (170 bytes fixed)
         let ab = ParsedEvent::AdminBoot(AdminBootEvent {

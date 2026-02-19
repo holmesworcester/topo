@@ -24,6 +24,10 @@ pub const ATTACHMENT_FILENAME_BYTES: usize = 255;
 /// MessageAttachment MIME type: fixed UTF-8 slot (128 bytes, zero-padded)
 pub const ATTACHMENT_MIME_BYTES: usize = 128;
 
+/// Display name: fixed UTF-8 slot (64 bytes, zero-padded)
+/// Used for workspace name, username, device name.
+pub const NAME_BYTES: usize = 64;
+
 // ─── Dep slot budgets ───
 
 /// BenchDep: fixed number of dep slots (unused slots are all-zeros)
@@ -102,8 +106,8 @@ pub const SECRET_KEY_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32;
 ///                          + signed_by(32) + signer_type(1) + signature(64) = 170
 pub const MESSAGE_DELETION_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32 + 32 + SIGNATURE_TRAILER_BYTES;
 
-/// Workspace (type 8): type(1) + created_at(8) + public_key(32) = 41
-pub const WORKSPACE_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32;
+/// Workspace (type 8): type(1) + created_at(8) + public_key(32) + name(64) = 105
+pub const WORKSPACE_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32 + NAME_BYTES;
 
 /// InviteAccepted (type 9): type(1) + created_at(8) + invite_event_id(32) + workspace_id(32) = 73
 pub const INVITE_ACCEPTED_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32 + 32;
@@ -117,13 +121,17 @@ pub const USER_INVITE_ONGOING_WIRE_SIZE: usize = USER_INVITE_BOOT_WIRE_SIZE;
 
 /// Identity-pubkey-with-signer layout: type(1) + created_at(8) + public_key(32)
 ///                                    + signed_by(32) + signer_type(1) + signature(64) = 138
-/// Used by: DeviceInviteFirst(12), DeviceInviteOngoing(13), UserBoot(14), UserOngoing(15),
+/// Used by: DeviceInviteFirst(12), DeviceInviteOngoing(13),
 ///          UserRemoved(20), PeerRemoved(21), TransportKey(23)
 pub const IDENTITY_PUBKEY_SIGNED_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32 + SIGNATURE_TRAILER_BYTES;
 
+/// User (types 14, 15): type(1) + created_at(8) + public_key(32) + username(64)
+///                     + signed_by(32) + signer_type(1) + signature(64) = 202
+pub const USER_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32 + NAME_BYTES + SIGNATURE_TRAILER_BYTES;
+
 /// PeerShared (types 16, 17): type(1) + created_at(8) + public_key(32) + user_event_id(32)
-///                           + signed_by(32) + signer_type(1) + signature(64) = 170
-pub const PEER_SHARED_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32 + 32 + SIGNATURE_TRAILER_BYTES;
+///                           + device_name(64) + signed_by(32) + signer_type(1) + signature(64) = 234
+pub const PEER_SHARED_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32 + 32 + NAME_BYTES + SIGNATURE_TRAILER_BYTES;
 
 /// AdminBoot (type 18): type(1) + created_at(8) + public_key(32) + user_event_id(32)
 ///                     + signed_by(32) + signer_type(1) + signature(64) = 170
@@ -226,6 +234,40 @@ pub mod bench_dep_offsets {
     pub const PAYLOAD: usize = 9 + super::BENCH_DEP_SLOTS_BYTES; // 329
 }
 
+// ─── Per-type field offsets (Workspace, type 8) ───
+
+pub mod workspace_offsets {
+    pub const TYPE_CODE: usize = 0;
+    pub const CREATED_AT: usize = 1;
+    pub const PUBLIC_KEY: usize = 9;
+    pub const NAME: usize = 41;
+}
+
+// ─── Per-type field offsets (UserBoot/UserOngoing, types 14/15) ───
+
+pub mod user_offsets {
+    pub const TYPE_CODE: usize = 0;
+    pub const CREATED_AT: usize = 1;
+    pub const PUBLIC_KEY: usize = 9;
+    pub const USERNAME: usize = 41;
+    pub const SIGNED_BY: usize = 41 + super::NAME_BYTES;           // 105
+    pub const SIGNER_TYPE: usize = SIGNED_BY + 32;                  // 137
+    pub const SIGNATURE: usize = SIGNER_TYPE + 1;                   // 138
+}
+
+// ─── Per-type field offsets (PeerSharedFirst/PeerSharedOngoing, types 16/17) ───
+
+pub mod peer_shared_offsets {
+    pub const TYPE_CODE: usize = 0;
+    pub const CREATED_AT: usize = 1;
+    pub const PUBLIC_KEY: usize = 9;
+    pub const USER_EVENT_ID: usize = 41;
+    pub const DEVICE_NAME: usize = 73;
+    pub const SIGNED_BY: usize = 73 + super::NAME_BYTES;           // 137
+    pub const SIGNER_TYPE: usize = SIGNED_BY + 32;                  // 169
+    pub const SIGNATURE: usize = SIGNER_TYPE + 1;                   // 170
+}
+
 /// Compute the total encrypted event wire size for a given inner type wire size.
 pub const fn encrypted_wire_size(inner_wire_size: usize) -> usize {
     ENCRYPTED_OVERHEAD_BYTES + inner_wire_size
@@ -244,8 +286,8 @@ pub fn encrypted_inner_wire_size(inner_type_code: u8) -> Option<usize> {
         11 => Some(USER_INVITE_ONGOING_WIRE_SIZE),       // UserInviteOngoing
         12 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE),    // DeviceInviteFirst
         13 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE),    // DeviceInviteOngoing
-        14 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE),    // UserBoot
-        15 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE),    // UserOngoing
+        14 => Some(USER_WIRE_SIZE),                        // UserBoot
+        15 => Some(USER_WIRE_SIZE),                        // UserOngoing
         16 => Some(PEER_SHARED_WIRE_SIZE),                 // PeerSharedFirst
         17 => Some(PEER_SHARED_WIRE_SIZE),                 // PeerSharedOngoing
         18 => Some(ADMIN_BOOT_WIRE_SIZE),                // AdminBoot
@@ -419,14 +461,37 @@ mod tests {
     fn test_identity_wire_sizes() {
         assert_eq!(SECRET_KEY_WIRE_SIZE, 41);
         assert_eq!(MESSAGE_DELETION_WIRE_SIZE, 170);
-        assert_eq!(WORKSPACE_WIRE_SIZE, 41);
+        assert_eq!(WORKSPACE_WIRE_SIZE, 105);
         assert_eq!(INVITE_ACCEPTED_WIRE_SIZE, 73);
         assert_eq!(USER_INVITE_BOOT_WIRE_SIZE, 170);
         assert_eq!(USER_INVITE_ONGOING_WIRE_SIZE, 170);
         assert_eq!(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE, 138);
+        assert_eq!(USER_WIRE_SIZE, 202);
+        assert_eq!(PEER_SHARED_WIRE_SIZE, 234);
         assert_eq!(ADMIN_BOOT_WIRE_SIZE, 170);
         assert_eq!(ADMIN_ONGOING_WIRE_SIZE, 170);
         assert_eq!(SECRET_SHARED_WIRE_SIZE, 202);
+    }
+
+    #[test]
+    fn test_workspace_offsets_consistent() {
+        assert_eq!(workspace_offsets::NAME, 41);
+        assert_eq!(workspace_offsets::NAME + NAME_BYTES, WORKSPACE_WIRE_SIZE);
+    }
+
+    #[test]
+    fn test_user_offsets_consistent() {
+        assert_eq!(user_offsets::USERNAME, 41);
+        assert_eq!(user_offsets::SIGNED_BY, 41 + NAME_BYTES);
+        assert_eq!(user_offsets::SIGNATURE + 64, USER_WIRE_SIZE);
+    }
+
+    #[test]
+    fn test_peer_shared_offsets_consistent() {
+        assert_eq!(peer_shared_offsets::USER_EVENT_ID, 41);
+        assert_eq!(peer_shared_offsets::DEVICE_NAME, 73);
+        assert_eq!(peer_shared_offsets::SIGNED_BY, 73 + NAME_BYTES);
+        assert_eq!(peer_shared_offsets::SIGNATURE + 64, PEER_SHARED_WIRE_SIZE);
     }
 
     // ─── Encrypted inner wire size lookup ───

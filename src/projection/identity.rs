@@ -20,10 +20,10 @@ pub fn apply_identity_projection(
         ParsedEvent::UserInviteOngoing(ui) => project_user_invite(conn, recorded_by, event_id_b64, &ui.public_key),
         ParsedEvent::DeviceInviteFirst(di) => project_device_invite(conn, recorded_by, event_id_b64, &di.public_key),
         ParsedEvent::DeviceInviteOngoing(di) => project_device_invite(conn, recorded_by, event_id_b64, &di.public_key),
-        ParsedEvent::UserBoot(u) => project_user(conn, recorded_by, event_id_b64, &u.public_key),
-        ParsedEvent::UserOngoing(u) => project_user(conn, recorded_by, event_id_b64, &u.public_key),
-        ParsedEvent::PeerSharedFirst(p) => project_peer_shared(conn, recorded_by, event_id_b64, &p.public_key, &p.user_event_id),
-        ParsedEvent::PeerSharedOngoing(p) => project_peer_shared(conn, recorded_by, event_id_b64, &p.public_key, &p.user_event_id),
+        ParsedEvent::UserBoot(u) => project_user(conn, recorded_by, event_id_b64, &u.public_key, &u.username),
+        ParsedEvent::UserOngoing(u) => project_user(conn, recorded_by, event_id_b64, &u.public_key, &u.username),
+        ParsedEvent::PeerSharedFirst(p) => project_peer_shared(conn, recorded_by, event_id_b64, &p.public_key, &p.user_event_id, &p.device_name),
+        ParsedEvent::PeerSharedOngoing(p) => project_peer_shared(conn, recorded_by, event_id_b64, &p.public_key, &p.user_event_id, &p.device_name),
         ParsedEvent::AdminBoot(a) => project_admin(conn, recorded_by, event_id_b64, &a.public_key),
         ParsedEvent::AdminOngoing(a) => project_admin(conn, recorded_by, event_id_b64, &a.public_key),
         ParsedEvent::UserRemoved(r) => project_user_removed(conn, recorded_by, event_id_b64, &r.target_event_id),
@@ -65,9 +65,9 @@ fn project_workspace(
         Some(ref anchor_wid) if anchor_wid == &workspace_id_b64 => {
             // Trust anchor matches — project
             conn.execute(
-                "INSERT OR IGNORE INTO workspaces (recorded_by, event_id, workspace_id, public_key)
-                 VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![recorded_by, event_id_b64, &workspace_id_b64, ws.public_key.as_slice()],
+                "INSERT OR IGNORE INTO workspaces (recorded_by, event_id, workspace_id, public_key, name)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![recorded_by, event_id_b64, &workspace_id_b64, ws.public_key.as_slice(), &ws.name],
             )?;
             Ok(ProjectionDecision::Valid)
         }
@@ -181,11 +181,12 @@ fn project_user(
     recorded_by: &str,
     event_id_b64: &str,
     public_key: &[u8; 32],
+    username: &str,
 ) -> Result<ProjectionDecision, Box<dyn std::error::Error>> {
     conn.execute(
-        "INSERT OR IGNORE INTO users (recorded_by, event_id, public_key)
-         VALUES (?1, ?2, ?3)",
-        rusqlite::params![recorded_by, event_id_b64, public_key.as_slice()],
+        "INSERT OR IGNORE INTO users (recorded_by, event_id, public_key, username)
+         VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![recorded_by, event_id_b64, public_key.as_slice(), username],
     )?;
     Ok(ProjectionDecision::Valid)
 }
@@ -196,12 +197,13 @@ fn project_peer_shared(
     event_id_b64: &str,
     public_key: &[u8; 32],
     user_event_id: &[u8; 32],
+    device_name: &str,
 ) -> Result<ProjectionDecision, Box<dyn std::error::Error>> {
     let user_event_id_b64 = crate::crypto::event_id_to_base64(user_event_id);
     conn.execute(
-        "INSERT OR IGNORE INTO peers_shared (recorded_by, event_id, public_key, user_event_id)
-         VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![recorded_by, event_id_b64, public_key.as_slice(), &user_event_id_b64],
+        "INSERT OR IGNORE INTO peers_shared (recorded_by, event_id, public_key, user_event_id, device_name)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![recorded_by, event_id_b64, public_key.as_slice(), &user_event_id_b64, device_name],
     )?;
     Ok(ProjectionDecision::Valid)
 }

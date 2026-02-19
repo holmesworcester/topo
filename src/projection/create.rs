@@ -265,6 +265,7 @@ mod tests {
         let ws = ParsedEvent::Workspace(WorkspaceEvent {
             created_at_ms: now_ms(),
             public_key: [0xAA; 32],
+            name: "test-workspace".to_string(),
         });
         create_event_staged(conn, recorded_by, &ws).unwrap()
     }
@@ -278,7 +279,7 @@ mod tests {
 
     /// Create a minimal identity chain for the given tenant.
     /// Returns (peer_shared_event_id, peer_shared_signing_key).
-    fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (EventId, SigningKey) {
+    fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (EventId, SigningKey, EventId) {
         let mut rng = rand::thread_rng();
 
         let workspace_key = SigningKey::generate(&mut rng);
@@ -286,6 +287,7 @@ mod tests {
         let net_event = ParsedEvent::Workspace(WorkspaceEvent {
             created_at_ms: now_ms(),
             public_key: workspace_pub,
+            name: "test-workspace".to_string(),
         });
         // Workspace may block (needs trust anchor). Use staged API.
         let net_eid = create_event_staged(conn, recorded_by, &net_event).unwrap();
@@ -315,6 +317,7 @@ mod tests {
         let ub = ParsedEvent::UserBoot(UserBootEvent {
             created_at_ms: now_ms(),
             public_key: user_key.verifying_key().to_bytes(),
+            username: "test-user".to_string(),
             signed_by: uib_eid,
             signer_type: 2,
             signature: [0u8; 64],
@@ -336,13 +339,14 @@ mod tests {
             created_at_ms: now_ms(),
             public_key: peer_shared_key.verifying_key().to_bytes(),
             user_event_id: ub_eid,
+            device_name: "test-device".to_string(),
             signed_by: dif_eid,
             signer_type: 3,
             signature: [0u8; 64],
         });
         let psf_eid = create_signed_event_sync(conn, recorded_by, &psf, &device_invite_key).unwrap();
 
-        (psf_eid, peer_shared_key)
+        (psf_eid, peer_shared_key, ub_eid)
     }
 
     #[test]
@@ -351,12 +355,12 @@ mod tests {
         let recorded_by = "peer1";
         let net_eid = setup_workspace_event(&conn, recorded_by);
 
-        let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
+        let (signer_eid, signing_key, user_event_id) = make_identity_chain(&conn, recorded_by);
 
         let msg = ParsedEvent::Message(MessageEvent {
             created_at_ms: now_ms(),
             workspace_id: net_eid,
-            author_id: [2u8; 32],
+            author_id: user_event_id,
             content: "hello".to_string(),
             signed_by: signer_eid,
             signer_type: 5,
@@ -394,12 +398,12 @@ mod tests {
         let recorded_by = "peer1";
         let net_eid = setup_workspace_event(&conn, recorded_by);
 
-        let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
+        let (signer_eid, signing_key, user_event_id) = make_identity_chain(&conn, recorded_by);
 
         let msg = ParsedEvent::Message(MessageEvent {
             created_at_ms: now_ms(),
             workspace_id: net_eid,
-            author_id: [2u8; 32],
+            author_id: user_event_id,
             content: "target".to_string(),
             signed_by: signer_eid,
             signer_type: 5,
@@ -410,7 +414,7 @@ mod tests {
         let rxn = ParsedEvent::Reaction(ReactionEvent {
             created_at_ms: now_ms(),
             target_event_id: msg_eid,
-            author_id: [3u8; 32],
+            author_id: user_event_id,
             emoji: "\u{1f44d}".to_string(),
             signed_by: signer_eid,
             signer_type: 5,
@@ -435,13 +439,13 @@ mod tests {
         let conn = setup();
         let recorded_by = "peer1";
 
-        let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
+        let (signer_eid, signing_key, user_event_id) = make_identity_chain(&conn, recorded_by);
 
         let fake_target = [99u8; 32];
         let rxn = ParsedEvent::Reaction(ReactionEvent {
             created_at_ms: now_ms(),
             target_event_id: fake_target,
-            author_id: [3u8; 32],
+            author_id: user_event_id,
             emoji: "\u{1f44d}".to_string(),
             signed_by: signer_eid,
             signer_type: 5,
@@ -484,7 +488,7 @@ mod tests {
         let conn = setup();
         let recorded_by = "peer1";
 
-        let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
+        let (signer_eid, signing_key, _user_event_id) = make_identity_chain(&conn, recorded_by);
 
         // Create signed memo with PeerShared signer
         let memo = ParsedEvent::SignedMemo(SignedMemoEvent {
@@ -520,14 +524,14 @@ mod tests {
         let conn = setup();
         let recorded_by = "peer1";
 
-        let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
+        let (signer_eid, signing_key, user_event_id) = make_identity_chain(&conn, recorded_by);
 
         // Reaction targeting a non-existent event → blocked on missing dep
         let fake_target = [0xDD; 32];
         let rxn = ParsedEvent::Reaction(ReactionEvent {
             created_at_ms: now_ms(),
             target_event_id: fake_target,
-            author_id: [3u8; 32],
+            author_id: user_event_id,
             emoji: "x".to_string(),
             signed_by: signer_eid,
             signer_type: 5,
@@ -558,13 +562,13 @@ mod tests {
         let conn = setup();
         let recorded_by = "peer1";
 
-        let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
+        let (signer_eid, signing_key, user_event_id) = make_identity_chain(&conn, recorded_by);
 
         let fake_target = [0xEE; 32];
         let rxn = ParsedEvent::Reaction(ReactionEvent {
             created_at_ms: now_ms(),
             target_event_id: fake_target,
-            author_id: [3u8; 32],
+            author_id: user_event_id,
             emoji: "y".to_string(),
             signed_by: signer_eid,
             signer_type: 5,
@@ -595,12 +599,12 @@ mod tests {
         let conn = setup();
         let recorded_by = "peer1";
         let net_eid = setup_workspace_event(&conn, recorded_by);
-        let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
+        let (signer_eid, signing_key, user_event_id) = make_identity_chain(&conn, recorded_by);
 
         let msg = ParsedEvent::Message(MessageEvent {
             created_at_ms: now_ms(),
             workspace_id: net_eid,
-            author_id: [2u8; 32],
+            author_id: user_event_id,
             content: "contract-valid".to_string(),
             signed_by: signer_eid,
             signer_type: 5,
@@ -624,13 +628,13 @@ mod tests {
     fn test_create_event_sync_contract_blocked_returns_err_with_event_id() {
         let conn = setup();
         let recorded_by = "peer1";
-        let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
+        let (signer_eid, signing_key, user_event_id) = make_identity_chain(&conn, recorded_by);
 
         let fake_target = [0xCC; 32];
         let rxn = ParsedEvent::Reaction(ReactionEvent {
             created_at_ms: now_ms(),
             target_event_id: fake_target,
-            author_id: [3u8; 32],
+            author_id: user_event_id,
             emoji: "z".to_string(),
             signed_by: signer_eid,
             signer_type: 5,
