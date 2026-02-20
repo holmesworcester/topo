@@ -1129,6 +1129,9 @@ Service command handlers call event-module command APIs directly. Example flows:
 - `svc_create_workspace` -> `workspace::commands::create_workspace`
 - `svc_accept_invite` -> `workspace::commands::join_workspace_as_new_user`
 - `svc_accept_device_link` -> `workspace::commands::add_device_to_workspace`
+- `svc_create_invite_conn` -> `workspace::commands::create_user_invite`
+- `svc_create_device_link_invite_conn` -> `workspace::commands::create_device_link_invite`
+- `svc_create_invite` / `svc_create_invite_with_spki` -> `workspace::commands::load_workspace_signing_key` + `create_user_invite`
 
 ### Service query routing
 

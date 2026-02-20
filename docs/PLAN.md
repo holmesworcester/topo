@@ -2317,11 +2317,15 @@ Moved response types and event-local command/query ownership into event modules,
 - `message` module converted from flat file to directory (`message/{mod,wire,commands,queries}.rs`) as the pilot for the split pattern
 - Split rule: when a module exceeds ~300-400 LOC or mixes 3+ concerns, split into `wire.rs`, `commands.rs`, `queries.rs`, `projector.rs`
 
-**Workspace workflow locality examples (target pattern):**
+**Workspace workflow locality examples (implemented):**
 - Service wrappers route onboarding flows to workspace command APIs:
   - `svc_create_workspace` -> `workspace::commands::create_workspace`
   - `svc_accept_invite` -> `workspace::commands::join_workspace_as_new_user`
   - `svc_accept_device_link` -> `workspace::commands::add_device_to_workspace`
+- Service wrappers route invite creation to workspace command APIs:
+  - `svc_create_invite_conn` -> `workspace::commands::create_user_invite`
+  - `svc_create_device_link_invite_conn` -> `workspace::commands::create_device_link_invite`
+  - `svc_create_invite` / `svc_create_invite_with_spki` -> key loading + `create_user_invite`
 - If workspace command surface grows, split by workflow while preserving module-local ownership:
 
 ```
@@ -2350,6 +2354,10 @@ src/event_modules/workspace/
 | `svc_create_workspace` | `workspace::commands::create_workspace` |
 | `svc_accept_invite` | `workspace::commands::join_workspace_as_new_user` |
 | `svc_accept_device_link` | `workspace::commands::add_device_to_workspace` |
+| `svc_create_invite_conn` | `workspace::commands::create_user_invite` |
+| `svc_create_device_link_invite_conn` | `workspace::commands::create_device_link_invite` |
+| `svc_create_invite` | `workspace::commands::load_workspace_signing_key` + `create_user_invite` |
+| `svc_create_invite_with_spki` | `workspace::commands::load_workspace_signing_key` + `create_user_invite` |
 | `svc_status_conn` message/reaction counts | `message::count` + `reaction::count` |
 | `query_field` message/reaction counts | `message::count` + `reaction::count` |
 | `svc_users_conn` | `user::list` |
@@ -2362,7 +2370,8 @@ src/event_modules/workspace/
 - Auth (key loading, `require_local_peer_signer`)
 - Cross-module orchestration (`svc_view_conn` combines messages, reactions, users)
 - Shared response types (`DeleteResponse`, `StatusResponse`, `ViewResponse`, etc.)
-- Identity bootstrap, invite flows, predicate/assert system
+- Invite flow orchestration (bootstrap sync, transport setup — event-domain logic delegated to workspace::commands)
+- Predicate/assert system
 - Service-level helpers (`current_timestamp_ms`, `parse_workspace_hex`)
 
 ### 19.5 What apply.rs retains (orchestration-only)

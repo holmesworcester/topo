@@ -61,6 +61,12 @@ check_no_match 'install_invite_bootstrap_transport_identity' src/event_modules/
 check_no_match 'install_peer_key_transport_identity' src/projection/
 check_no_match 'install_invite_bootstrap_transport_identity' src/projection/
 
+# -- event-module locality: service.rs must not call event-domain invite/identity ops directly --
+check_no_match 'identity::ops::create_user_invite' src/service.rs
+check_no_match 'identity::ops::create_device_link_invite' src/service.rs
+check_no_match 'identity::ops::ensure_content_key_for_peer' src/service.rs
+check_no_match 'invite_link::create_invite_link' src/service.rs
+
 echo "=== Positive contract checks ==="
 
 # peering and sync must import from contracts, not event_pipeline
