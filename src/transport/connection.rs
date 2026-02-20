@@ -3,7 +3,7 @@ use quinn::{RecvStream, SendStream};
 use tokio::io::AsyncWriteExt;
 
 use crate::protocol::{encode_frame, parse_frame, Frame};
-use crate::protocol::wire::ParseError;
+use crate::protocol::ParseError;
 
 use crate::tuning::max_recv_buffer;
 

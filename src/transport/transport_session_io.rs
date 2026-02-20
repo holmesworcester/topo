@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use crate::contracts::peering_contract::{
     ControlIo, DataRecvIo, DataSendIo, TransportSessionIo, TransportSessionIoError, TransportSessionIoParts,
 };
-use crate::protocol::wire::ParseError;
+use crate::protocol::ParseError;
 use crate::protocol::{encode_frame, parse_frame, Frame};
 use crate::transport::connection::ConnectionError;
 use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};

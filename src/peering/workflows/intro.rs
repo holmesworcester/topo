@@ -8,7 +8,7 @@ use std::time::Duration;
 use tracing::{info, warn};
 
 use crate::protocol::Frame;
-use crate::protocol::wire::encode_frame;
+use crate::protocol::encode_frame;
 
 /// Build an IntroOffer message for `recipient` about `other_peer`.
 pub fn build_intro_offer(

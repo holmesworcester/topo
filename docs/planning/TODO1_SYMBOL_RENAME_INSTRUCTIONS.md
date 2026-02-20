@@ -18,9 +18,9 @@ POC rule: do not preserve backward-compatibility aliases unless they are needed 
 ## Remaining rename targets (from TODO)
 
 1. `protocol::SyncMessage` naming:
-   - Rename enum `SyncMessage` to `Frame` in `src/protocol/wire.rs`.
+   - Rename enum `SyncMessage` to `Frame` in `src/protocol.rs`.
    - Rename helpers `parse_sync_message` -> `parse_frame`, `encode_sync_message` -> `encode_frame`.
-   - Re-export from `src/protocol/mod.rs` using the new names.
+   - Export directly from `src/protocol.rs` using the new names.
 
 2. Session runner naming:
    - `run_sync_initiator_dual` -> `run_sync_initiator`.

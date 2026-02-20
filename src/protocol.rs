@@ -1,5 +1,21 @@
+use crate::crypto::EventId;
 use crate::event_modules::EVENT_MAX_BLOB_BYTES;
-use super::{MSG_TYPE_NEG_OPEN, MSG_TYPE_NEG_MSG, MSG_TYPE_HAVE_LIST, MSG_TYPE_EVENT, MSG_TYPE_DONE, MSG_TYPE_DONE_ACK, MSG_TYPE_DATA_DONE, MSG_TYPE_INTRO_OFFER};
+use negentropy::Id;
+
+/// Convert negentropy Id to our EventId
+pub fn neg_id_to_event_id(id: &Id) -> EventId {
+    *id.as_bytes()
+}
+
+/// Sync message types
+pub const MSG_TYPE_NEG_OPEN: u8 = 0x10;   // Initial negentropy message
+pub const MSG_TYPE_NEG_MSG: u8 = 0x11;    // Negentropy response
+pub const MSG_TYPE_HAVE_LIST: u8 = 0x12;  // List of IDs client needs from server
+pub const MSG_TYPE_EVENT: u8 = 0x03;      // Event blob (variable length)
+pub const MSG_TYPE_DONE: u8 = 0x20;      // Initiator signals all events sent
+pub const MSG_TYPE_DONE_ACK: u8 = 0x21;  // Responder acknowledges done
+pub const MSG_TYPE_DATA_DONE: u8 = 0x22; // Sent on data stream: no more events will follow
+pub const MSG_TYPE_INTRO_OFFER: u8 = 0x30; // Intro offer for hole punching
 
 /// Max negentropy message payload: 4 MiB (generous for large reconciliation rounds)
 const MAX_NEG_MSG_BYTES: usize = 4 * 1024 * 1024;

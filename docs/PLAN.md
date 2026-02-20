@@ -40,7 +40,7 @@ Scheduling note:
 
 Current code in Topo (post-move from `codex-simplified`) is a useful sync prototype, but has deliberate gaps relative to this plan:
 
-1. ~~Fixed-size wire/event assumptions~~ **RESOLVED**: wire protocol moved to `src/protocol/wire.rs` with variable-length framing and `EVENT_MAX_BLOB_BYTES = 1 MiB` cap. No global fixed envelope size remains.
+1. ~~Fixed-size wire/event assumptions~~ **RESOLVED**: wire protocol moved to `src/protocol.rs` with variable-length framing and `EVENT_MAX_BLOB_BYTES = 1 MiB` cap. No global fixed envelope size remains.
 2. ~~mTLS is not yet pinned/strict~~ **RESOLVED**: `src/transport/mod.rs` now uses `PinnedCertVerifier` with BLAKE2b-256 SPKI fingerprint pinning on both client and server sides. No permissive verifier remains in production paths.
 3. ~~Projection pipeline is still message-specific and sync-engine-coupled~~ **RESOLVED**: projection pipeline extracted to `src/projection/apply/` with global `project_one(recorded_by,event_id)` entrypoint. Ingest runtime in `src/event_pipeline/`.
 4. No dependency blocking model yet:

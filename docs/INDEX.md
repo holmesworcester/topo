@@ -40,7 +40,7 @@ These are the current source module names. Active docs should use these names ex
 | `src/replication/` | `src/sync/` |
 | `src/event_runtime/` | `src/event_pipeline/` |
 | `src/events/` | `src/event_modules/` |
-| `src/sync/protocol.rs` | `src/protocol/wire.rs` |
+| `src/sync/protocol.rs` | `src/protocol.rs` |
 | `src/projection/pipeline.rs` | `src/projection/apply/` |
 | `src/projection/projectors.rs` | deleted; projectors live in `src/event_modules/<type>/projector.rs` |
 | `src/projection/identity.rs` | deleted; identity projectors live in event modules |
