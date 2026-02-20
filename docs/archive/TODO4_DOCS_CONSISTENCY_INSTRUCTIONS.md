@@ -1,5 +1,7 @@
 # TODO 4 Instructions: Docs Vocabulary and Path Consistency
 
+> **Historical instructions; completed and archived.** Module names and file paths referenced here may not match the current source tree.
+
 Date: 2026-02-19
 Branch: `exec/todo4-docs-consistency-instructions`
 Worktree: `/home/holmes/poc-7-todo4-docs-consistency`
