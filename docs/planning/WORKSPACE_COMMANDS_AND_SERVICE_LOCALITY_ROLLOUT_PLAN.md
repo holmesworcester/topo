@@ -170,7 +170,7 @@ Required per major phase:
 1. `cargo check`
 2. `bash scripts/check_boundary_imports.sh`
 3. `cargo test --lib -q`
-4. `cargo test --test replication_contract_tests -q`
+4. `cargo test --test sync_contract_tests -q`
 5. `cargo test --test holepunch_test -q`
 
 Additional for onboarding workflow phases:

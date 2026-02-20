@@ -172,7 +172,7 @@ All must pass before merge:
 1. `cargo check`
 2. `bash scripts/check_boundary_imports.sh`
 3. `cargo test --lib deletion_invariant -- --nocapture`
-4. `cargo test --test replication_contract_tests -q`
+4. `cargo test --test sync_contract_tests -q`
 5. `cargo test --test scenario_test test_zero_loss_stress -- --nocapture`
 
 Also run any focused tests added/changed by the refactor.

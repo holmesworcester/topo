@@ -28,7 +28,7 @@ POC rule: do not preserve backward-compatibility aliases unless they are needed 
    - Update all imports/callers in `src/` and `tests/`.
 
 3. Session IO naming:
-   - Rename `SessionIo` trait in `src/contracts/network_contract.rs` to `TransportSessionIo`.
+   - Rename `SessionIo` trait in `src/contracts/peering_contract.rs` to `TransportSessionIo`.
    - Rename `SessionIoParts` to `TransportSessionIoParts`.
    - Rename `SessionIoError` to `TransportSessionIoError`.
    - Rename `src/transport/session_io.rs` to `src/transport/transport_session_io.rs`.
@@ -65,7 +65,7 @@ All should return zero relevant hits (ignoring archived docs if they are not tou
 
 1. `cargo check`
 2. `bash scripts/check_boundary_imports.sh`
-3. `cargo test --test replication_contract_tests -q`
+3. `cargo test --test sync_contract_tests -q`
 4. `cargo test --test holepunch_test -q`
 
 ## Done criteria

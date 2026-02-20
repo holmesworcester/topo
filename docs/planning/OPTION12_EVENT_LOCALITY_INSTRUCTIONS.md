@@ -43,7 +43,7 @@ Do not attempt Option 3 (pure functional projector conversion) in this branch.
 
 1. `service.rs` no longer embeds event-specific SQL for migrated slices.
 2. Service methods still expose same external response shapes.
-3. `cargo test --test replication_contract_tests -q`
+3. `cargo test --test sync_contract_tests -q`
 4. `cargo test --test holepunch_test -q`
 5. `bash scripts/check_boundary_imports.sh`
 

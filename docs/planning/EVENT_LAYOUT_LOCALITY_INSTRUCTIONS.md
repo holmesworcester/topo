@@ -125,7 +125,7 @@ Run at minimum:
 1. `cargo check`
 2. `cargo test event_modules -- --nocapture`
 3. `cargo test projection::apply -- --nocapture`
-4. `cargo test --test replication_contract_tests -q`
+4. `cargo test --test sync_contract_tests -q`
 5. `bash scripts/check_boundary_imports.sh`
 
 Also run any event-specific wire roundtrip tests touched by migration.

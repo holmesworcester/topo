@@ -113,6 +113,6 @@ Keep integration points explicit in docs to avoid merge friction.
    - explicit deletion intent/tombstone contract
    - replay/reorder/idempotence invariants for deletion flows
 5. Test gates:
-   - `cargo test --test replication_contract_tests -q`
+   - `cargo test --test sync_contract_tests -q`
    - `cargo test --test holepunch_test -q`
    - relevant scenario replay invariance suites.

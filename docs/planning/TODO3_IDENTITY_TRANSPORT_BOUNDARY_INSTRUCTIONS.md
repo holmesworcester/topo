@@ -160,7 +160,7 @@ Run invite accept and device-link flows to confirm no behavior regression:
 1. `cargo check`
 2. `bash scripts/check_boundary_imports.sh`
 3. `cargo test --lib -q`
-4. `cargo test --test replication_contract_tests -q`
+4. `cargo test --test sync_contract_tests -q`
 5. `cargo test --test holepunch_test -q`
 6. targeted invite/device-link tests (existing ones):
    - trust/bootstrap path tests in `tests/cli_test.rs` and/or `tests/scenario_test.rs`
