@@ -1,7 +1,7 @@
 //! Multi-tenant node daemon — composition root.
 //!
-//! Wires the sync/punch intro listener into the network runtime.
-//! Callers use `run_node` which delegates to `network::runtime::run_node`
+//! Wires the sync/punch intro listener into the peering runtime.
+//! Callers use `run_node` which delegates to `peering::runtime::run_node`
 //! with the intro spawner injected.
 
 use std::net::SocketAddr;

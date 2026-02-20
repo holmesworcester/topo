@@ -1,4 +1,4 @@
-//! Network runtime: daemon lifecycle, discovery, and peer dispatch.
+//! Peering runtime: daemon lifecycle, discovery, and peer dispatch.
 //!
 //! Extracted from node.rs (Phase 4 of Option B refactor).
 //! Discovers local tenant identities, creates a single QUIC endpoint with a
