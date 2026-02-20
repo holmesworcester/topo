@@ -53,9 +53,12 @@ Mandatory grep checks:
 5. TLA conformance — **PASS**
    - `docs/tla/EventGraphSchema.tla:139`: `InviteAccepted` in `LocalRoots`
    - Invariants: `InvTrustAnchorSource`, `InvInviteAcceptedRecorded`, `InvBootstrapTrustSource`
+   - `HasRecordedInvite` is a model-level ordering guard (not a runtime dep-gate);
+     comment clarified in TLA to document runtime vs model distinction
 
 6. TLA + DESIGN/PLAN updated — **PASS**
    - Semantic updates present in TLA models, DESIGN.md, PLAN.md
+   - TLA `HasRecordedInvite` comment explicitly notes model-vs-runtime distinction
 
 Required tests:
 1. Projection/apply tests — **PASS** (5 projector tests + 1 integration test)
@@ -117,7 +120,6 @@ B) Final completion audit — **PASS** (this file)
 2. `bash scripts/check_boundary_imports.sh` — **PASS**
 3. `cargo test --lib -q` — **PASS** (443 passed)
 4. `cargo test --test sync_contract_tests -q` — **PASS** (21 passed)
-   (Note: instructions reference `replication_contract_tests` — renamed to `sync_contract_tests` as part of Stage 1)
 5. `cargo test --test holepunch_test -q` — **PASS** (4 passed)
 6. `cargo test --test identity_transport_contract_tests -q` — **PASS** (11 passed)
 

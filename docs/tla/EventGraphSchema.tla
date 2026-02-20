@@ -292,6 +292,11 @@ Guard(p, e) == IF IsWorkspaceEvent(e) THEN trustAnchor[p] = WorkspaceEventId(e) 
 
 \* poc-6 alignment: invite_accepted projects only after at least one invite
 \* event is recorded for this peer perspective.
+\* NOTE: This is a MODEL-LEVEL ordering guard, not a runtime dep-gate.
+\* Runtime has dep_fields: &[] (no invite-presence dependency field) per
+\* DESIGN.md §8.3 / PLAN.md §12.1. Bootstrap sync workflow guarantees
+\* invite events arrive before invite_accepted is created. The guard
+\* constrains TLC exploration to realistic orderings only.
 HasRecordedInvite(p) ==
     IF (InviteEvents \cap EVENTS) = {}
     THEN TRUE
