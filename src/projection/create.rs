@@ -38,7 +38,10 @@ impl std::error::Error for CreateEventError {}
 
 /// Extract event_id from Ok or Blocked (event is stored in both cases).
 /// Returns Err only for true failures (encode, db, rejected).
-fn event_id_or_blocked(result: Result<EventId, CreateEventError>) -> Result<EventId, CreateEventError> {
+///
+/// Used by accept flows where chain events may block on prereqs that arrive
+/// later via sync. The events are stored and will project when deps are met.
+pub fn event_id_or_blocked(result: Result<EventId, CreateEventError>) -> Result<EventId, CreateEventError> {
     match result {
         Ok(eid) => Ok(eid),
         Err(CreateEventError::Blocked { event_id, .. }) => Ok(event_id),

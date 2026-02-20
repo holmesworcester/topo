@@ -76,11 +76,40 @@ impl DaemonState {
     }
 
     fn require_active_peer(&self) -> Result<String, String> {
-        self.active_peer
-            .read()
-            .unwrap()
-            .clone()
-            .ok_or_else(|| "no active peer — run `topo use-peer <N>`".to_string())
+        let cached = self.active_peer.read().unwrap().clone();
+        match cached {
+            Some(ref peer_id) => {
+                // Verify the cached peer_id still exists in the DB.
+                // After identity transition (invite-derived → PeerShared-derived),
+                // migrate_recorded_by moves all rows to the new peer_id, making
+                // the cached one stale.
+                if let Ok(conn) = crate::db::open_connection(&self.db_path) {
+                    if let Ok(current) =
+                        crate::identity::transport::load_transport_peer_id(&conn)
+                    {
+                        if current != *peer_id {
+                            *self.active_peer.write().unwrap() = Some(current.clone());
+                            return Ok(current);
+                        }
+                    }
+                }
+                Ok(peer_id.clone())
+            }
+            None => {
+                // Try auto-discovery (daemon may have started before workspace was created)
+                if let Ok(conn) = crate::db::open_connection(&self.db_path) {
+                    let _ = crate::db::schema::create_tables(&conn);
+                    if let Ok(tenants) = discover_local_tenants(&conn) {
+                        if tenants.len() == 1 {
+                            let peer_id = tenants[0].peer_id.clone();
+                            *self.active_peer.write().unwrap() = Some(peer_id.clone());
+                            return Ok(peer_id);
+                        }
+                    }
+                }
+                Err("no active peer — run `topo use-peer <N>`".to_string())
+            }
+        }
     }
 
     /// Store an invite/link string and return its 1-based reference number.

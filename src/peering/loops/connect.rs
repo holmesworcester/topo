@@ -199,9 +199,20 @@ async fn connect_loop_inner(
 
         // Inner loop: repeated sync sessions on this connection
         loop {
+            // Reload current transport peer_id: after identity transition
+            // (invite-derived → PeerShared-derived), migrate_recorded_by moves
+            // all rows to the new peer_id. The sync session must use the
+            // current peer_id to find events.
+            let current_rb = if let Ok(db) = open_connection(db_path) {
+                crate::identity::transport::load_transport_peer_id(&db)
+                    .unwrap_or_else(|_| recorded_by.to_string())
+            } else {
+                recorded_by.to_string()
+            };
+
             // Check if peer has been removed -- deny further sessions
             if let Ok(db) = open_connection(db_path) {
-                if is_peer_removed(&db, recorded_by, &peer_fp).unwrap_or(false) {
+                if is_peer_removed(&db, &current_rb, &peer_fp).unwrap_or(false) {
                     warn!(
                         "Peer {} has been removed -- closing connection",
                         &peer_id[..16.min(peer_id.len())]
@@ -230,7 +241,7 @@ async fn connect_loop_inner(
             let session_id = next_session_id();
             let meta = SessionMeta {
                 session_id,
-                tenant: TenantId(recorded_by.to_string()),
+                tenant: TenantId(current_rb.clone()),
                 peer: PeerFingerprint(peer_fp),
                 remote_addr: connection.remote_address(),
                 direction: SessionDirection::Outbound,
@@ -239,7 +250,7 @@ async fn connect_loop_inner(
             let cancel = CancellationToken::new();
             let watch = spawn_peer_removal_cancellation_watch(
                 db_path.to_string(),
-                recorded_by.to_string(),
+                current_rb.clone(),
                 peer_fp,
                 cancel.clone(),
             );

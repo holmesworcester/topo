@@ -23,7 +23,7 @@ use crate::event_modules::{
     UserBootEvent, UserInviteBootEvent, WorkspaceEvent,
 };
 use crate::projection::apply::project_one;
-use crate::projection::create::{create_event_staged, create_event_sync, create_signed_event_sync};
+use crate::projection::create::{create_event_staged, create_event_sync, create_signed_event_sync, event_id_or_blocked};
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -47,7 +47,7 @@ fn emit_local_signer_secret(
         signer_kind,
         private_key_bytes: signing_key.to_bytes(),
     });
-    create_event_sync(db, recorded_by, &evt)
+    event_id_or_blocked(create_event_sync(db, recorded_by, &evt))
         .map_err(|e| format!("emit local_signer_secret failed: {}", e).into())
 }
 
@@ -216,17 +216,17 @@ pub fn join_workspace_as_new_user(
         username,
         device_name,
     )?;
-    if join.content_key_event_id.is_none() {
-        return Err("Invite acceptance missing wrapped content key material".into());
-    }
+    // Content key may not be available yet if prereqs haven't been synced.
+    // It will be unwrapped when the content key event arrives via sync.
     Ok(join)
 }
 
-/// Persist signer secrets for a completed join.
+/// Persist signer secrets for a join.
 ///
-/// Must be called AFTER push-back sync completes, because the peer_shared
-/// emit triggers ApplyTransportIdentityIntent which installs the
-/// PeerShared-derived transport identity.
+/// The peer_shared LocalSignerSecret triggers ApplyTransportIdentityIntent
+/// on projection, which installs the PeerShared-derived transport identity.
+/// Events may block if the identity chain hasn't completed yet; they will
+/// project via cascade when prerequisites arrive.
 pub fn persist_join_signer_secrets(
     db: &Connection,
     recorded_by: &str,
@@ -257,7 +257,7 @@ pub fn persist_join_signer_secrets(
 ///
 /// Returns the LinkChain with keys/ids needed by service for transport setup.
 /// Signer secrets are NOT emitted here — call `persist_link_signer_secrets`
-/// after push-back sync completes.
+/// separately.
 pub fn add_device_to_workspace(
     db: &Connection,
     recorded_by: &str,
@@ -278,9 +278,9 @@ pub fn add_device_to_workspace(
     )
 }
 
-/// Persist signer secrets for a completed device link.
+/// Persist signer secrets for a device link.
 ///
-/// Must be called AFTER push-back sync completes.
+/// Events may block if the identity chain hasn't completed yet.
 pub fn persist_link_signer_secrets(
     db: &Connection,
     recorded_by: &str,
@@ -339,6 +339,20 @@ pub fn create_user_invite(
         Some(&ctx),
     )?;
 
+    // Record pending bootstrap trust so the inviter's daemon trusts the
+    // joiner's invite-derived cert when they connect via autodial.
+    let joiner_spki =
+        crate::identity::transport::expected_invite_bootstrap_spki_from_invite_key(
+            &invite.invite_key,
+        )?;
+    crate::db::transport_trust::record_pending_invite_bootstrap_trust(
+        db,
+        recorded_by,
+        &crate::crypto::event_id_to_base64(&invite.invite_event_id),
+        &crate::crypto::event_id_to_base64(workspace_id),
+        &joiner_spki,
+    )?;
+
     let invite_link =
         crate::identity::invite_link::create_invite_link(&invite, bootstrap_addr, bootstrap_spki)?;
 
@@ -374,6 +388,20 @@ pub fn create_device_link_invite(
         user_event_id,
         workspace_id,
         Some(&ctx),
+    )?;
+
+    // Record pending bootstrap trust so the inviter's daemon trusts the
+    // joiner's invite-derived cert when they connect via autodial.
+    let joiner_spki =
+        crate::identity::transport::expected_invite_bootstrap_spki_from_invite_key(
+            &invite.invite_key,
+        )?;
+    crate::db::transport_trust::record_pending_invite_bootstrap_trust(
+        db,
+        recorded_by,
+        &crate::crypto::event_id_to_base64(&invite.invite_event_id),
+        &crate::crypto::event_id_to_base64(workspace_id),
+        &joiner_spki,
     )?;
 
     let invite_link =

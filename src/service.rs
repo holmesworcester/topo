@@ -1296,13 +1296,18 @@ pub fn svc_create_invite(
     )
 }
 
-/// Accept a user invite via bootstrap sync + identity chain creation.
+/// Accept a user invite via projection-first flow.
 ///
 /// 1. Parses the invite link
 /// 2. Installs bootstrap transport identity derived from invite key
-/// 3. Connects to bootstrap address and syncs prerequisite events
-/// 4. Creates identity chain (InviteAccepted → UserBoot → DeviceInvite → PeerShared)
-/// 5. Records bootstrap trust and persists signer keys
+/// 3. Records bootstrap context so projection materializes trust rows
+/// 4. Creates identity chain (events stored; may block pending sync)
+/// 5. Persists signer keys (blocked until chain completes)
+///
+/// No one-shot bootstrap sync is performed. The ongoing peering loop
+/// discovers bootstrap trust from projected SQL state and handles all
+/// network sync. Identity chain events stored here will project via
+/// cascade when prerequisite events arrive.
 pub async fn svc_accept_invite(
     db_path: &str,
     invite_link_str: &str,
@@ -1337,45 +1342,10 @@ pub async fn svc_accept_invite(
             .map_err(|e| ServiceError(format!("Failed to install bootstrap identity: {}", e)))?
     };
 
-    // Bootstrap sync: fetch prerequisite events from inviter
-    let bootstrap_addr: std::net::SocketAddr =
-        crate::identity::invite_link::resolve_bootstrap_socket_addr(&invite).map_err(|e| {
-            ServiceError(format!(
-                "Invalid bootstrap address '{}': {}",
-                invite.bootstrap_addr, e
-            ))
-        })?;
-
-    crate::peering::workflows::bootstrap::bootstrap_sync_from_invite(
-        db_path,
-        &recorded_by,
-        bootstrap_addr,
-        &invite.bootstrap_spki_fingerprint,
-        15, // timeout seconds
-        crate::event_pipeline::batch_writer,
-    )
-    .await
-    .map_err(|e| ServiceError(format!("Bootstrap sync failed: {}", e)))?;
-
-    // Verify prerequisite events arrived
     let db = open_connection(db_path)?;
-    let ws_b64 = event_id_to_base64(&workspace_id);
-    let ws_exists: bool = db
-        .query_row(
-            "SELECT COUNT(*) > 0 FROM events WHERE event_id = ?1",
-            [&ws_b64],
-            |row| row.get(0),
-        )
-        .unwrap_or(false);
 
-    if !ws_exists {
-        return Err(ServiceError(
-            "Bootstrap sync did not deliver workspace event. Ensure the inviter is running sync."
-                .into(),
-        ));
-    }
-
-    // Record bootstrap context BEFORE accept so InviteAccepted projection can read it
+    // Record bootstrap context BEFORE accept so InviteAccepted projection
+    // materializes trust rows. This uses invite link metadata (no sync needed).
     crate::db::transport_trust::append_bootstrap_context(
         &db,
         &recorded_by,
@@ -1385,7 +1355,10 @@ pub async fn svc_accept_invite(
         &invite.bootstrap_spki_fingerprint,
     )?;
 
-    // Accept the invite: creates identity chain via workspace command API
+    // Accept the invite: creates identity chain via workspace command API.
+    // Chain events may block pending prerequisite arrival via sync — this is
+    // expected. They will project via cascade when the ongoing peering loop
+    // delivers the required events.
     let join = workspace::commands::join_workspace_as_new_user(
         &db,
         &recorded_by,
@@ -1399,29 +1372,17 @@ pub async fn svc_accept_invite(
 
     let psf_b64 = event_id_to_base64(&join.peer_shared_event_id);
 
-    // Push identity chain events back to inviter (while still using invite-derived
-    // cert, which the inviter trusts via pending_invite_bootstrap_trust). This ensures
-    // the inviter has our PeerShared event before we transition transport identity.
-    drop(db);
-    crate::peering::workflows::bootstrap::bootstrap_sync_from_invite(
-        db_path,
-        &recorded_by,
-        bootstrap_addr,
-        &invite.bootstrap_spki_fingerprint,
-        15,
-        crate::event_pipeline::batch_writer,
-    )
-    .await
-    .map_err(|e| ServiceError(format!("Push-back sync failed: {}", e)))?;
-
-    let db = open_connection(db_path)?;
-
-    // Emit local_signer_secret events AFTER push-back sync via workspace command API.
+    // Persist signer secrets. These events will block on their signer_event_id
+    // deps and project via cascade when the identity chain completes. The
+    // peer_shared LocalSignerSecret triggers ApplyTransportIdentityIntent on
+    // projection, transitioning transport identity to PeerShared-derived.
     workspace::commands::persist_join_signer_secrets(&db, &recorded_by, &join)
         .map_err(|e| ServiceError(format!("Failed to persist signer secrets: {}", e)))?;
 
-    // Transport identity already installed by projection path: the peer_shared
-    // emit_local_signer_secret above triggers ApplyTransportIdentityIntent.
+    // Load current transport peer_id and migrate recorded_by if identity has
+    // already transitioned (happens when prereqs were already synced). If the
+    // chain is still blocked, this is a no-op (identity hasn't changed yet;
+    // deferred migration happens when the chain completes via runtime cascade).
     let new_peer_id = load_transport_peer_id(&db)
         .map_err(|e| ServiceError(format!("load transport peer id failed: {}", e)))?;
     crate::db::migrate_recorded_by(&db, &recorded_by, &new_peer_id)?;
@@ -1433,14 +1394,17 @@ pub async fn svc_accept_invite(
     })
 }
 
-/// Accept a device link invite via bootstrap sync + identity chain creation.
+/// Accept a device link invite via projection-first flow.
 ///
 /// Mirrors `svc_accept_invite` but for device-link invites:
 /// 1. Parses the invite link (expects `quiet://link/...`)
 /// 2. Installs bootstrap transport identity derived from invite key
-/// 3. Connects to bootstrap address and syncs prerequisite events
-/// 4. Creates identity chain (InviteAccepted → PeerSharedFirst → TransportKey)
-/// 5. Records bootstrap trust and persists signer keys
+/// 3. Records bootstrap context so projection materializes trust rows
+/// 4. Creates identity chain (events stored; may block pending sync)
+/// 5. Persists signer keys (blocked until chain completes)
+///
+/// No one-shot bootstrap sync is performed. The ongoing peering loop
+/// handles all network sync via projected SQL state.
 pub async fn svc_accept_device_link(
     db_path: &str,
     invite_link_str: &str,
@@ -1474,34 +1438,14 @@ pub async fn svc_accept_device_link(
             .map_err(|e| ServiceError(format!("Failed to install bootstrap identity: {}", e)))?
     };
 
-    // Bootstrap sync: fetch prerequisite events from inviter
-    let bootstrap_addr: std::net::SocketAddr =
-        crate::identity::invite_link::resolve_bootstrap_socket_addr(&invite).map_err(|e| {
-            ServiceError(format!(
-                "Invalid bootstrap address '{}': {}",
-                invite.bootstrap_addr, e
-            ))
-        })?;
-
-    crate::peering::workflows::bootstrap::bootstrap_sync_from_invite(
-        db_path,
-        &recorded_by,
-        bootstrap_addr,
-        &invite.bootstrap_spki_fingerprint,
-        15,
-        crate::event_pipeline::batch_writer,
-    )
-    .await
-    .map_err(|e| ServiceError(format!("Bootstrap sync failed: {}", e)))?;
-
-    // Accept the device link: creates identity chain
     let db = open_connection(db_path)?;
     let user_event_id = match invite.invite_type {
         crate::identity::ops::InviteType::DeviceLink { user_event_id } => user_event_id,
         _ => return Err(ServiceError("Expected DeviceLink invite type".into())),
     };
 
-    // Record bootstrap context BEFORE accept so InviteAccepted projection can read it
+    // Record bootstrap context BEFORE accept so InviteAccepted projection
+    // materializes trust rows. Uses invite link metadata (no sync needed).
     crate::db::transport_trust::append_bootstrap_context(
         &db,
         &recorded_by,
@@ -1511,6 +1455,8 @@ pub async fn svc_accept_device_link(
         &invite.bootstrap_spki_fingerprint,
     )?;
 
+    // Accept the device link: creates identity chain. Events may block pending
+    // prerequisite arrival via sync — will project via cascade.
     let link = workspace::commands::add_device_to_workspace(
         &db,
         &recorded_by,
@@ -1524,28 +1470,13 @@ pub async fn svc_accept_device_link(
 
     let psf_b64 = event_id_to_base64(&link.peer_shared_event_id);
 
-    // Push identity chain events back to inviter (while still using invite-derived
-    // cert, which the inviter trusts via pending_invite_bootstrap_trust).
-    drop(db);
-    crate::peering::workflows::bootstrap::bootstrap_sync_from_invite(
-        db_path,
-        &recorded_by,
-        bootstrap_addr,
-        &invite.bootstrap_spki_fingerprint,
-        15,
-        crate::event_pipeline::batch_writer,
-    )
-    .await
-    .map_err(|e| ServiceError(format!("Push-back sync failed: {}", e)))?;
-
-    let db = open_connection(db_path)?;
-
-    // Emit local_signer_secret AFTER push-back sync via workspace command API.
+    // Persist signer secrets. Blocked until chain completes; projection triggers
+    // transport identity transition via ApplyTransportIdentityIntent.
     workspace::commands::persist_link_signer_secrets(&db, &recorded_by, &link)
         .map_err(|e| ServiceError(format!("Failed to persist signer secrets: {}", e)))?;
 
-    // Transport identity already installed by projection path: the peer_shared
-    // emit_local_signer_secret above triggers ApplyTransportIdentityIntent.
+    // Load current transport peer_id and migrate recorded_by if identity has
+    // already transitioned. If chain is still blocked, this is a no-op.
     let new_peer_id = load_transport_peer_id(&db)
         .map_err(|e| ServiceError(format!("load transport peer id failed: {}", e)))?;
     crate::db::migrate_recorded_by(&db, &recorded_by, &new_peer_id)?;

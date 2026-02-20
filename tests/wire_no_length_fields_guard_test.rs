@@ -19,7 +19,7 @@ const CANONICAL_EVENT_FILES: &[&str] = &[
     "src/event_modules/message_deletion/wire.rs",
     "src/event_modules/secret_key.rs",
     "src/event_modules/secret_shared.rs",
-    "src/event_modules/workspace.rs",
+    "src/event_modules/workspace/wire.rs",
     "src/event_modules/invite_accepted.rs",
     "src/event_modules/user_invite/wire.rs",
     "src/event_modules/user/wire.rs",

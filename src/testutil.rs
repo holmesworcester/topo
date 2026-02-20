@@ -240,24 +240,43 @@ impl Peer {
         let invite_link = create_invite_link(&invite, &sync_addr.to_string(), &creator_spki)
             .expect("failed to create invite link");
 
-        // Joiner accepts via real bootstrap sync + identity chain creation
+        // Step 1: Accept invite — stores events (may block), materializes bootstrap trust
         let result = crate::service::svc_accept_invite(
             &peer.db_path, &invite_link, name, "device",
-        ).await.expect("failed to accept invite via bootstrap sync");
+        ).await.expect("failed to accept invite");
+
+        // Step 2: Bootstrap sync — fetches prerequisites from creator.
+        // In production this is done by the autodial loop; in tests we trigger
+        // it directly. The batch_writer handles projection cascade and
+        // recorded_by migration when the identity chain completes.
+        crate::peering::workflows::bootstrap::bootstrap_sync_from_invite(
+            &peer.db_path,
+            &result.peer_id,
+            sync_addr,
+            &creator_spki,
+            10,
+            crate::event_pipeline::batch_writer,
+        ).await.expect("failed bootstrap sync");
+
+        // Allow batch_writer to finish draining (projection cascade + migration)
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
         // Clean up sync endpoint
         sync_endpoint.close(0u32.into(), b"bootstrap done");
 
-        // Update peer state from service result
-        peer.identity = result.peer_id.clone();
+        // Step 3: Load final identity — after cascade, transport peer_id
+        // has transitioned from invite-derived to PeerShared-derived.
+        let db = open_connection(&peer.db_path).expect("failed to open db");
+        let final_peer_id = crate::identity::transport::load_transport_peer_id(&db)
+            .expect("failed to load final transport peer_id");
+        peer.identity = final_peer_id.clone();
         peer.workspace_id = creator.workspace_id;
 
-        // Load signing key and user_event_id from DB (service layer persisted it)
-        let db = open_connection(&peer.db_path).expect("failed to open db");
-        if let Ok(Some((eid, key))) = crate::service::load_local_peer_signer_pub(&db, &result.peer_id) {
+        // Load signing key and user_event_id from DB
+        if let Ok(Some((eid, key))) = crate::service::load_local_peer_signer_pub(&db, &final_peer_id) {
             peer.peer_shared_event_id = Some(eid);
             peer.peer_shared_signing_key = Some(key);
-            if let Ok(uid) = crate::service::resolve_user_event_id_for_signer(&db, &result.peer_id, &eid) {
+            if let Ok(uid) = crate::service::resolve_user_event_id_for_signer(&db, &final_peer_id, &eid) {
                 peer.author_id = uid;
             }
         }

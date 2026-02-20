@@ -1,9 +1,10 @@
-//! One-shot bootstrap sync for invite acceptance.
+//! Bootstrap sync helpers for test infrastructure.
 //!
-//! When accepting an invite, the joiner needs prerequisite events (workspace,
-//! invite) from the inviter before calling `accept_user_invite`. This module
-//! provides a helper that connects to the bootstrap address from the invite
-//! link, runs a single negentropy sync session, and returns.
+//! In production, bootstrap connectivity is driven by projected SQL trust state
+//! and the ongoing autodial loop in `peering::runtime::autodial`. These helpers
+//! are used by test infrastructure to simulate the runtime bootstrap flow:
+//! `start_bootstrap_responder` serves prerequisite events, and
+//! `bootstrap_sync_from_invite` connects and fetches them.
 
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicU64;
@@ -45,15 +46,12 @@ fn peer_fingerprint_from_hex(
     Ok(fp)
 }
 
-/// Run a one-shot bootstrap sync from an invite link's bootstrap address.
+/// Run a bootstrap sync session against a known bootstrap address.
 ///
-/// Connects to `bootstrap_addr` using the local transport cert, with the
-/// bootstrap peer's SPKI pinned as the only allowed peer. Runs a single
-/// negentropy sync session to fetch shared events (workspace, invite, etc.),
-/// then closes the connection and returns.
-///
-/// The caller should verify that the expected prerequisite events arrived
-/// before proceeding with invite acceptance.
+/// Used by test infrastructure to simulate what the runtime autodial loop does
+/// in production: connect to the bootstrap peer, run a negentropy sync session
+/// to fetch prerequisite events, then close the connection. The batch_writer
+/// handles projection cascade and recorded_by migration.
 pub async fn bootstrap_sync_from_invite(
     db_path: &str,
     recorded_by: &str,
@@ -62,7 +60,6 @@ pub async fn bootstrap_sync_from_invite(
     timeout_secs: u64,
     batch_writer: BatchWriterFn,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Ensure DB is initialized
     {
         let db = open_connection(db_path)?;
         create_tables(&db)?;
@@ -70,7 +67,6 @@ pub async fn bootstrap_sync_from_invite(
 
     let (_peer_id, cert, key) = load_transport_cert_required_from_db(db_path)?;
 
-    // Pin only the bootstrap peer's SPKI for this one-shot connection
     let allowed = Arc::new(AllowedPeers::from_fingerprints(vec![*bootstrap_spki]));
     let endpoint = create_dual_endpoint("0.0.0.0:0".parse().unwrap(), cert, key, allowed)?;
 
@@ -95,7 +91,6 @@ pub async fn bootstrap_sync_from_invite(
 
     info!("Bootstrap sync: connected to peer {}", &peer_id[..16]);
 
-    // Open dual bi-directional streams (control + data)
     let (ctrl_send, ctrl_recv) = connection
         .open_bi()
         .await
@@ -118,7 +113,6 @@ pub async fn bootstrap_sync_from_invite(
     let writer_handle = std::thread::spawn(move || {
         bw(writer_db, ingest_rx, writer_events);
     });
-
     let peer_fp = peer_fingerprint_from_hex(&peer_id)?;
     let session_id = next_session_id();
     let meta = SessionMeta {
@@ -141,7 +135,6 @@ pub async fn bootstrap_sync_from_invite(
 
     info!("Bootstrap sync complete");
 
-    // Close endpoint cleanly
     endpoint.close(0u32.into(), b"bootstrap done");
     endpoint.wait_idle().await;
 
