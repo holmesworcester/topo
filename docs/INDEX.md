@@ -25,7 +25,7 @@ These are the current source module names. Active docs should use these names ex
 | `sync` | `src/sync/` | Negentropy reconciliation, sync session handler |
 | `protocol` | `src/protocol/` | Wire frame encoding/decoding (`wire.rs`) |
 | `event_modules` | `src/event_modules/` | Per-event-type wire format, projectors, commands, queries |
-| `event_pipeline` | `src/event_pipeline/` | Ingest runtime (`batch_writer`), projection queue draining, SQLite adapters |
+| `event_pipeline` | `src/event_pipeline.rs` | Ingest runtime (`batch_writer`), projection queue draining, SQLite adapters |
 | `projection/apply` | `src/projection/apply/` | Projection pipeline: `project_one`, cascade, context, dispatch, stages |
 | `projection` | `src/projection/` | Projection create, encrypted, signer, decision, emit helpers |
 | `identity` | `src/identity/` | Transport identity, identity ops (bootstrap, invite, accept) |
@@ -38,7 +38,7 @@ These are the current source module names. Active docs should use these names ex
 |----------|-------------|
 | `src/network/` | `src/peering/` |
 | `src/replication/` | `src/sync/` |
-| `src/event_runtime/` | `src/event_pipeline/` |
+| `src/event_runtime/` | `src/event_pipeline.rs` |
 | `src/events/` | `src/event_modules/` |
 | `src/sync/protocol.rs` | `src/protocol.rs` |
 | `src/projection/pipeline.rs` | `src/projection/apply/` |

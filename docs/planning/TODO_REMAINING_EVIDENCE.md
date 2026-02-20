@@ -12,11 +12,11 @@ Maps each TODO section/item to file/test proof of completion.
 | `network` → `peering` | Zero `crate::network` hits in `src/` and `tests/`; `src/peering/` is canonical |
 | `replication` → `sync` | Zero `crate::replication` hits; `src/sync/` is canonical |
 | `events` → `event_modules` | Zero `crate::events` (bare) hits; `src/event_modules/` is canonical |
-| `event_runtime` → `event_pipeline` | Zero `crate::event_runtime` hits; `src/event_pipeline/` is canonical |
+| `event_runtime` → `event_pipeline` | Zero `crate::event_runtime` hits; `src/event_pipeline.rs` is canonical |
 | `event_runtime_contract.rs` → `event_pipeline_contract.rs` | `src/contracts/event_pipeline_contract.rs` |
 | `network_contract.rs` → `peering_contract.rs` | `src/contracts/peering_contract.rs` |
 | `ReplicationStore` → `SyncStore` | `src/contracts/event_pipeline_contract.rs:65` |
-| `SqliteReplicationStore` → `SqliteSyncStore` | `src/event_pipeline/sqlite_adapters.rs:93` |
+| `SqliteReplicationStore` → `SqliteSyncStore` | Zero symbol hits in `src/` (legacy names removed from active code) |
 | `ReplicationSessionHandler` → `SyncSessionHandler` | `src/sync/session_handler.rs:109`, `src/sync/mod.rs:7` |
 | `tests/replication_contract_tests/` → `tests/sync_contract_tests/` | `tests/sync_contract_tests/main.rs` |
 | Boundary script updated | `scripts/check_boundary_imports.sh` uses `event_pipeline_contract`, `peering_contract` |

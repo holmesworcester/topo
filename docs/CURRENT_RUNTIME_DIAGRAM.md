@@ -1,7 +1,7 @@
 # POC-7 Current Runtime Diagram
 
 This is a code-accurate explainer of the runtime shape in `poc-7` today.
-Source modules: `src/node.rs`, `src/peering/runtime/*`, `src/peering/loops/*`, `src/sync/*`, `src/event_pipeline/*`, `src/projection/*`, `src/rpc/*`, `src/db/*`.
+Source modules: `src/node.rs`, `src/peering/runtime/*`, `src/peering/loops/*`, `src/sync/*`, `src/event_pipeline.rs`, `src/projection/*`, `src/rpc/*`, `src/db/*`.
 
 ## 1) Runtime topology (compact)
 

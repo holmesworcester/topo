@@ -28,7 +28,7 @@ fn current_timestamp_ms() -> i64 {
 /// Drain pending project_queue items for a tenant, projecting each event.
 ///
 /// This encapsulates the `project_one` + `drain_with_limit` pattern so that
-/// callers outside `event_runtime` do not need to import `projection::pipeline`
+/// callers outside `event_pipeline` do not need to import `projection::apply`
 /// directly.  Used by both `batch_writer` (internal) and `sync::engine` startup
 /// recovery paths.
 pub fn drain_project_queue(db_path: &str, tenant_id: &str, batch_size: usize) -> usize {
