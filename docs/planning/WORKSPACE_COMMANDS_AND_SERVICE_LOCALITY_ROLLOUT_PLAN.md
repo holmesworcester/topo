@@ -24,6 +24,12 @@ The following workflows belong in `workspace::commands.rs`:
 
 Rationale: all three are workspace-membership lifecycle operations and share trust-anchor/workspace context.
 
+Concrete command APIs to standardize:
+
+1. `workspace::commands::create_workspace(...)`
+2. `workspace::commands::join_workspace_as_new_user(...)`
+3. `workspace::commands::add_device_to_workspace(...)`
+
 ## Phase 0: Pre-flight
 
 1. Rebase on latest `master`.
@@ -46,6 +52,7 @@ Rules:
 
 1. Keep external API stable via `workspace::...` re-exports in `mod.rs`.
 2. No behavior changes in this phase (pure move/split).
+3. Treat workflows as first-class commands in this module.
 
 ## Phase 2: Move the three onboarding workflows into `workspace::commands`
 
@@ -91,6 +98,12 @@ After moving command ownership:
 1. `service.rs` should call workspace command APIs.
 2. `service.rs` should not assemble identity chain internals directly.
 3. Keep transport changes through intent/adapter contracts only.
+
+Example target routing:
+
+1. `svc_create_workspace` -> `workspace::commands::create_workspace`
+2. `svc_accept_invite` -> `workspace::commands::join_workspace_as_new_user`
+3. `svc_accept_device_link` -> `workspace::commands::add_device_to_workspace`
 
 ## Phase 3: Roll same pattern across remaining service commands
 
@@ -140,6 +153,15 @@ Add/extend enforcement checks:
 
 1. Boundary script checks for disallowed event-domain creation paths in `service.rs`.
 2. Prefer path-based guardrails over reviewer memory.
+3. Document and enforce the split convention: when `workspace::commands.rs` gets too large, split into:
+
+```
+src/event_modules/workspace/commands/
+  mod.rs
+  create_workspace.rs
+  join_workspace_as_new_user.rs
+  add_device_to_workspace.rs
+```
 
 ## Test/Gate plan
 

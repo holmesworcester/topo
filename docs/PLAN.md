@@ -2311,10 +2311,27 @@ Moved response types and event-local command/query ownership into event modules,
 **Event modules gained (Option 5):**
 - Response types (`MessageItem`, `MessagesResponse`, `SendResponse`, `ReactResponse`, `ReactionItem`) — owned by event modules, re-exported by service.rs
 - Event-local command/query APIs used directly by service (`create`, `send`, `list`, `count`, `resolve`, etc.)
+- Workflow commands are first-class event-module command APIs (not a special service-only category).
 
 **Module split pattern applied:**
 - `message` module converted from flat file to directory (`message/{mod,wire,commands,queries}.rs`) as the pilot for the split pattern
 - Split rule: when a module exceeds ~300-400 LOC or mixes 3+ concerns, split into `wire.rs`, `commands.rs`, `queries.rs`, `projector.rs`
+
+**Workspace workflow locality examples (target pattern):**
+- Service wrappers route onboarding flows to workspace command APIs:
+  - `svc_create_workspace` -> `workspace::commands::create_workspace`
+  - `svc_accept_invite` -> `workspace::commands::join_workspace_as_new_user`
+  - `svc_accept_device_link` -> `workspace::commands::add_device_to_workspace`
+- If workspace command surface grows, split by workflow while preserving module-local ownership:
+
+```
+src/event_modules/workspace/
+  commands/
+    mod.rs
+    create_workspace.rs
+    join_workspace_as_new_user.rs
+    add_device_to_workspace.rs
+```
 
 ### 19.4 Service.rs delegation table
 
@@ -2330,6 +2347,9 @@ Moved response types and event-local command/query ownership into event modules,
 | `svc_remove_user_conn` | `user_removed::remove_user` |
 | `svc_message_event_id_by_num_conn` | `message::resolve_number` |
 | `resolve_message_selector` | `message::resolve` |
+| `svc_create_workspace` | `workspace::commands::create_workspace` |
+| `svc_accept_invite` | `workspace::commands::join_workspace_as_new_user` |
+| `svc_accept_device_link` | `workspace::commands::add_device_to_workspace` |
 | `svc_status_conn` message/reaction counts | `message::count` + `reaction::count` |
 | `query_field` message/reaction counts | `message::count` + `reaction::count` |
 | `svc_users_conn` | `user::list` |
@@ -2360,5 +2380,6 @@ Moved response types and event-local command/query ownership into event modules,
 1. Event-specific commands, queries, response types, and projectors belong in event modules.
 2. `service.rs` is orchestration glue: DB context, auth, cross-module joins, error mapping.
 3. `apply.rs` is pipeline orchestration: dependency checks, signer verification, registry dispatch.
-4. Long event modules must split into `wire/commands/queries` structure (see DESIGN §14.3).
-5. Wire layout constants (wire sizes, offsets) are owned by the event module — not in a global monolith. Shared cross-event primitives live in `src/event_modules/layout/common.rs` (see DESIGN §14.4).
+4. Multi-step event-domain workflows belong in owning event-module command APIs (`commands.rs` or `commands/`), not in service.
+5. Long event modules must split into `wire/commands/queries/projector` structure, and long command surfaces split into `commands/` by workflow (see DESIGN §14.4).
+6. Wire layout constants (wire sizes, offsets) are owned by the event module — not in a global monolith. Shared cross-event primitives live in `src/event_modules/layout/common.rs` (see DESIGN §14.5).

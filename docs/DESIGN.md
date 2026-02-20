@@ -1077,7 +1077,9 @@ These rules are mandatory. Violations must be fixed before merge.
 
 3. **Direct module routing rule**: Service routes event-local operations directly to event-module command/query APIs (for example: `message::send`, `reaction::list`, `workspace::name`). There is no central `EventCommand`/`EventQuery` service dispatcher.
 
-4. **Module split rule**: When an event module exceeds ~300-400 LOC or mixes 3+ concerns, split into a directory module (see 14.3).
+4. **Workflow-command locality rule**: Multi-step event-domain workflows are still commands and belong in the owning event module `commands.rs` (or `commands/` when split), not in `service.rs`. Example: workspace onboarding workflows (`create_workspace`, `join_workspace_as_new_user`, `add_device_to_workspace`) live in `workspace::commands`.
+
+5. **Module split rule**: When an event module exceeds ~300-400 LOC or mixes 3+ concerns, split into a directory module (see 14.4).
 
 ## 14.2 Layering convention
 
@@ -1085,7 +1087,7 @@ Event modules (`src/event_modules/<type>.rs` or `src/event_modules/<type>/`) own
 
 1. **Wire** — struct definition, parse/encode, wire layout, `EventTypeMeta`.
 2. **Projector** — `project_pure()` function: the pure projector for this event type. Takes `(recorded_by, event_id_b64, &ParsedEvent, &ContextSnapshot)` and returns `ProjectorResult`. Registered in `EventTypeMeta.projector` so the pipeline dispatches via registry lookup with no central match statement.
-3. **Commands** — `CreateXxxCmd` struct + `create()` function that builds the `ParsedEvent`, calls `create_signed_event_sync`, and returns `EventId`. High-level conn-level helpers (e.g. `send`, `react`) that combine create + response shaping.
+3. **Commands** — `CreateXxxCmd` struct + `create()` function that builds the `ParsedEvent`, calls `create_signed_event_sync`, and returns `EventId`. High-level conn-level helpers (e.g. `send`, `react`) and multi-step workflows (e.g. workspace onboarding) are first-class command APIs in this layer.
 4. **Queries** — `list()`, `count()`, `resolve()`, `list_for_message_with_authors()`, etc. — SQL against projection tables scoped by `recorded_by`. All event-specific SQL lives here.
 5. **Response types** — serializable structs for the event domain (e.g. `MessageItem`, `MessagesResponse`, `SendResponse`). Owned by the event module, re-exported by service.rs for external callers.
 
@@ -1124,6 +1126,9 @@ Service command handlers call event-module command APIs directly. Example flows:
 - `svc_react_conn` -> `reaction::react`
 - `svc_delete_message_conn` -> `message_deletion::delete_message`
 - `svc_remove_user_conn` -> `user_removed::remove_user`
+- `svc_create_workspace` -> `workspace::commands::create_workspace`
+- `svc_accept_invite` -> `workspace::commands::join_workspace_as_new_user`
+- `svc_accept_device_link` -> `workspace::commands::add_device_to_workspace`
 
 ### Service query routing
 
@@ -1143,11 +1148,29 @@ When an event module exceeds roughly 300-400 LOC or mixes 3+ concerns (wire + co
 src/event_modules/<name>/
     mod.rs          — re-exports stable public API
     wire.rs         — event struct, parse, encode, EventTypeMeta, project_pure
+    projector.rs    — project_pure + projector-local helpers (if separated from wire)
     commands.rs     — CreateXxxCmd, create(), high-level command helpers
     queries.rs      — query_list, query_count, resolve_*, response assembly
 ```
 
 `mod.rs` re-exports all public items so callers continue to import from `event_modules::<name>`.
+
+If `commands.rs` becomes long because of multiple workflows, split commands into a directory while keeping `event_modules::<name>::commands::*` stable:
+
+```
+src/event_modules/workspace/
+    mod.rs
+    wire.rs
+    projector.rs
+    queries.rs
+    commands/
+        mod.rs
+        create_workspace.rs
+        join_workspace_as_new_user.rs
+        add_device_to_workspace.rs
+```
+
+This keeps workflow locality (all workspace lifecycle commands under workspace) without forcing one very large `commands.rs`.
 
 ## 14.5 Layout locality rule
 
