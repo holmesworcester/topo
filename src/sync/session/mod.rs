@@ -1,4 +1,4 @@
-//! Replication session logic: initiator and responder sync loops.
+//! Sync session logic: initiator and responder sync loops.
 //!
 //! Extracted from sync/engine.rs (Phase 3 of Option B refactor).
 //! Wire protocol behavior is unchanged -- this is a pure code-movement extraction.

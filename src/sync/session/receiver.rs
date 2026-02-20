@@ -1,4 +1,4 @@
-//! Data-stream receiver task for replication sessions.
+//! Data-stream receiver task for sync sessions.
 //!
 //! Spawns a background task that reads events from the peer's data stream,
 //! tags each with `recorded_by`, and forwards them to the ingest channel.

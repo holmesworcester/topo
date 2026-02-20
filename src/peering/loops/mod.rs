@@ -46,7 +46,7 @@ pub type IntroSpawnerFn = fn(
 
 // ---------------------------------------------------------------------------
 // Tuning constants (orchestration-level only; session constants live in
-// replication::session)
+// sync::session)
 // ---------------------------------------------------------------------------
 
 /// Endpoint observation TTL: 24 hours in milliseconds.
