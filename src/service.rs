@@ -9,27 +9,25 @@ use ed25519_dalek::SigningKey;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
-use crate::contracts::transport_identity_contract::{
-    TransportIdentityAdapter, TransportIdentityIntent,
-};
 use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
 use crate::db::{open_connection, schema::create_tables, transport_trust::is_peer_allowed};
 use crate::event_modules::{
-    dispatch::{
-        execute_command as execute_event_command, execute_query as execute_event_query,
-        EventCommand, EventQuery, QueryResult,
-    },
+    admin,
     local_signer_secret::{
         LocalSignerSecretEvent, SIGNER_KIND_PEER_SHARED, SIGNER_KIND_USER, SIGNER_KIND_WORKSPACE,
     },
+    message, message_deletion, peer_shared, reaction, transport_key, user, user_removed, workspace,
     DeviceInviteFirstEvent, InviteAcceptedEvent, ParsedEvent, PeerSharedFirstEvent, UserBootEvent,
     UserInviteBootEvent, WorkspaceEvent,
 };
+use crate::contracts::transport_identity_contract::{
+    TransportIdentityAdapter, TransportIdentityIntent,
+};
 use crate::identity::transport::{load_transport_cert_required, load_transport_peer_id};
+use crate::transport::identity_adapter::ConcreteTransportIdentityAdapter;
 use crate::projection::apply::project_one;
 use crate::projection::create::{create_event_staged, create_event_sync, create_signed_event_sync};
 use crate::transport::create_dual_endpoint_dynamic;
-use crate::transport::identity_adapter::ConcreteTransportIdentityAdapter;
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -630,16 +628,12 @@ pub fn query_field(
         "store_count" | "events_count" => db
             .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
             .map_err(|e| format!("query failed: {}", e)),
-        "message_count" => match execute_event_query(db, recorded_by, EventQuery::MessageCount) {
-            Ok(QueryResult::Count(n)) => Ok(n),
-            Ok(_) => Err("query failed: unexpected dispatch result for MessageCount".to_string()),
-            Err(e) => Err(format!("query failed: {}", e)),
-        },
-        "reaction_count" => match execute_event_query(db, recorded_by, EventQuery::ReactionCount) {
-            Ok(QueryResult::Count(n)) => Ok(n),
-            Ok(_) => Err("query failed: unexpected dispatch result for ReactionCount".to_string()),
-            Err(e) => Err(format!("query failed: {}", e)),
-        },
+        "message_count" => {
+            message::count(db, recorded_by).map_err(|e| format!("query failed: {}", e))
+        }
+        "reaction_count" => {
+            reaction::count(db, recorded_by).map_err(|e| format!("query failed: {}", e))
+        }
         "neg_items_count" => db
             .query_row("SELECT COUNT(*) FROM neg_items", [], |row| row.get(0))
             .map_err(|e| format!("query failed: {}", e)),
@@ -678,53 +672,6 @@ pub fn query_field(
             Ok(0)
         }
         other => Err(format!("unknown field: {}", other)),
-    }
-}
-
-fn query_dispatch(
-    db: &rusqlite::Connection,
-    recorded_by: &str,
-    query: EventQuery,
-) -> ServiceResult<QueryResult> {
-    execute_event_query(db, recorded_by, query).map_err(|e| ServiceError(e.to_string()))
-}
-
-fn query_dispatch_count(
-    db: &rusqlite::Connection,
-    recorded_by: &str,
-    query: EventQuery,
-) -> ServiceResult<i64> {
-    match query_dispatch(db, recorded_by, query)? {
-        QueryResult::Count(n) => Ok(n),
-        _ => Err(ServiceError(
-            "dispatch result type mismatch (expected count)".into(),
-        )),
-    }
-}
-
-fn query_dispatch_event_id(
-    db: &rusqlite::Connection,
-    recorded_by: &str,
-    query: EventQuery,
-) -> ServiceResult<EventId> {
-    match query_dispatch(db, recorded_by, query)? {
-        QueryResult::EventId(id) => Ok(id),
-        _ => Err(ServiceError(
-            "dispatch result type mismatch (expected event id)".into(),
-        )),
-    }
-}
-
-fn query_dispatch_strings(
-    db: &rusqlite::Connection,
-    recorded_by: &str,
-    query: EventQuery,
-) -> ServiceResult<Vec<String>> {
-    match query_dispatch(db, recorded_by, query)? {
-        QueryResult::Strings(values) => Ok(values),
-        _ => Err(ServiceError(
-            "dispatch result type mismatch (expected string list)".into(),
-        )),
     }
 }
 
@@ -802,12 +749,7 @@ pub fn svc_messages_conn(
     recorded_by: &str,
     limit: usize,
 ) -> ServiceResult<MessagesResponse> {
-    match query_dispatch(db, recorded_by, EventQuery::MessageList { limit })? {
-        QueryResult::Messages(messages) => Ok(messages),
-        _ => Err(ServiceError(
-            "dispatch result type mismatch (expected messages)".into(),
-        )),
-    }
+    Ok(message::list(db, recorded_by, limit)?)
 }
 
 pub fn svc_messages(db_path: &str, limit: usize) -> ServiceResult<MessagesResponse> {
@@ -824,23 +766,17 @@ pub fn svc_send_conn(
     author_id: [u8; 32],
     content: &str,
 ) -> ServiceResult<SendResponse> {
-    let eid = execute_event_command(
+    message::send(
         db,
         recorded_by,
         signer_eid,
         signing_key,
         current_timestamp_ms(),
-        EventCommand::Message(crate::event_modules::message::CreateMessageCmd {
-            workspace_id,
-            author_id,
-            content: content.to_string(),
-        }),
-    )?;
-
-    Ok(SendResponse {
-        content: content.to_string(),
-        event_id: hex::encode(eid),
-    })
+        workspace_id,
+        author_id,
+        content,
+    )
+    .map_err(ServiceError)
 }
 
 /// Send a message as a specific peer (daemon provides the peer_id).
@@ -873,10 +809,8 @@ pub fn svc_status_conn(
     let events_count: i64 = db
         .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
         .unwrap_or(0);
-    let messages_count =
-        query_dispatch_count(db, recorded_by, EventQuery::MessageCount).unwrap_or(0);
-    let reactions_count =
-        query_dispatch_count(db, recorded_by, EventQuery::ReactionCount).unwrap_or(0);
+    let messages_count = message::count(db, recorded_by).unwrap_or(0);
+    let reactions_count = reaction::count(db, recorded_by).unwrap_or(0);
     let neg_items_count: i64 = db
         .query_row("SELECT COUNT(*) FROM neg_items", [], |row| row.get(0))
         .unwrap_or(0);
@@ -915,17 +849,17 @@ pub fn svc_generate_for_peer(
 
     db.execute("BEGIN", [])?;
     for i in 0..count {
-        execute_event_command(
+        message::create(
             &db,
             &recorded_by,
             &signer_eid,
             &signing_key,
             current_timestamp_ms(),
-            EventCommand::Message(crate::event_modules::message::CreateMessageCmd {
+            message::CreateMessageCmd {
                 workspace_id,
                 author_id,
                 content: format!("Message {}", i),
-            }),
+            },
         )
         .map_err(|e| ServiceError(format!("create event error: {}", e)))?;
     }
@@ -996,23 +930,17 @@ pub fn svc_react_conn(
     target_event_id: [u8; 32],
     emoji: &str,
 ) -> ServiceResult<ReactResponse> {
-    let eid = execute_event_command(
+    reaction::react(
         db,
         recorded_by,
         signer_eid,
         signing_key,
         current_timestamp_ms(),
-        EventCommand::Reaction(crate::event_modules::reaction::CreateReactionCmd {
-            target_event_id,
-            author_id,
-            emoji: emoji.to_string(),
-        }),
-    )?;
-
-    Ok(ReactResponse {
-        emoji: emoji.to_string(),
-        event_id: hex::encode(eid),
-    })
+        author_id,
+        target_event_id,
+        emoji,
+    )
+    .map_err(ServiceError)
 }
 
 pub fn svc_react_for_peer(
@@ -1024,13 +952,7 @@ pub fn svc_react_for_peer(
     let (recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
 
     let (signer_eid, signing_key) = require_local_peer_signer(&db, &recorded_by)?;
-    let target_event_id = query_dispatch_event_id(
-        &db,
-        &recorded_by,
-        EventQuery::MessageResolve {
-            selector: target_hex.to_string(),
-        },
-    )?;
+    let target_event_id = message::resolve(&db, &recorded_by, target_hex).map_err(ServiceError)?;
     let author_id = resolve_user_event_id_for_signer(&db, &recorded_by, &signer_eid)?;
 
     svc_react_conn(
@@ -1052,22 +974,17 @@ pub fn svc_delete_message_conn(
     author_id: [u8; 32],
     target_event_id: [u8; 32],
 ) -> ServiceResult<DeleteResponse> {
-    execute_event_command(
+    let target = message_deletion::delete_message(
         db,
         recorded_by,
         signer_eid,
         signing_key,
         current_timestamp_ms(),
-        EventCommand::MessageDeletion(
-            crate::event_modules::message_deletion::CreateMessageDeletionCmd {
-                target_event_id,
-                author_id,
-            },
-        ),
-    )?;
-    Ok(DeleteResponse {
-        target: hex::encode(target_event_id),
-    })
+        author_id,
+        target_event_id,
+    )
+    .map_err(ServiceError)?;
+    Ok(DeleteResponse { target })
 }
 
 pub fn svc_delete_message_for_peer(
@@ -1078,13 +995,7 @@ pub fn svc_delete_message_for_peer(
     let (recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
 
     let (signer_eid, signing_key) = require_local_peer_signer(&db, &recorded_by)?;
-    let target_event_id = query_dispatch_event_id(
-        &db,
-        &recorded_by,
-        EventQuery::MessageResolve {
-            selector: target_hex.to_string(),
-        },
-    )?;
+    let target_event_id = message::resolve(&db, &recorded_by, target_hex).map_err(ServiceError)?;
     let author_id = resolve_user_event_id_for_signer(&db, &recorded_by, &signer_eid)?;
 
     svc_delete_message_conn(
@@ -1098,32 +1009,21 @@ pub fn svc_delete_message_for_peer(
 }
 
 /// Resolve a message selector: `N`, `#N` (1-based message number), or raw hex event ID.
-/// Thin wrapper over dispatch message resolve for test compatibility.
+/// Thin wrapper over message::resolve for test compatibility.
 #[cfg(test)]
 fn resolve_message_selector(
     db: &rusqlite::Connection,
     recorded_by: &str,
     selector: &str,
 ) -> ServiceResult<[u8; 32]> {
-    query_dispatch_event_id(
-        db,
-        recorded_by,
-        EventQuery::MessageResolve {
-            selector: selector.to_string(),
-        },
-    )
+    message::resolve(db, recorded_by, selector).map_err(ServiceError)
 }
 
 pub fn svc_reactions_conn(
     db: &rusqlite::Connection,
     recorded_by: &str,
 ) -> ServiceResult<Vec<ReactionItem>> {
-    match query_dispatch(db, recorded_by, EventQuery::ReactionList)? {
-        QueryResult::Reactions(reactions) => Ok(reactions),
-        _ => Err(ServiceError(
-            "dispatch result type mismatch (expected reactions)".into(),
-        )),
-    }
+    Ok(reaction::list(db, recorded_by)?)
 }
 
 pub fn svc_reactions(db_path: &str) -> ServiceResult<Vec<ReactionItem>> {
@@ -1136,20 +1036,18 @@ pub fn svc_reactions_for_message_conn(
     recorded_by: &str,
     target_event_id_b64: &str,
 ) -> ServiceResult<Vec<String>> {
-    query_dispatch_strings(
+    Ok(reaction::list_for_message(
         db,
         recorded_by,
-        EventQuery::ReactionListForMessage {
-            target_event_id_b64: target_event_id_b64.to_string(),
-        },
-    )
+        target_event_id_b64,
+    )?)
 }
 
 pub fn svc_deleted_message_ids_conn(
     db: &rusqlite::Connection,
     recorded_by: &str,
 ) -> ServiceResult<Vec<String>> {
-    query_dispatch_strings(db, recorded_by, EventQuery::DeletedMessageIds)
+    Ok(message_deletion::list_deleted_ids(db, recorded_by)?)
 }
 
 /// Resolve a 1-based message number to its event ID.
@@ -1158,11 +1056,7 @@ pub fn svc_message_event_id_by_num_conn(
     recorded_by: &str,
     msg_num: usize,
 ) -> ServiceResult<crate::crypto::EventId> {
-    query_dispatch_event_id(
-        db,
-        recorded_by,
-        EventQuery::MessageResolveNumber { msg_num },
-    )
+    message::resolve_number(db, recorded_by, msg_num).map_err(ServiceError)
 }
 
 pub fn svc_remove_user_conn(
@@ -1172,19 +1066,16 @@ pub fn svc_remove_user_conn(
     signing_key: &SigningKey,
     target_event_id: crate::crypto::EventId,
 ) -> ServiceResult<DeleteResponse> {
-    execute_event_command(
+    let target = user_removed::remove_user(
         db,
         recorded_by,
         signer_eid,
         signing_key,
         current_timestamp_ms(),
-        EventCommand::UserRemoved(crate::event_modules::user_removed::CreateUserRemovedCmd {
-            target_event_id,
-        }),
-    )?;
-    Ok(DeleteResponse {
-        target: hex::encode(target_event_id),
-    })
+        target_event_id,
+    )
+    .map_err(ServiceError)?;
+    Ok(DeleteResponse { target })
 }
 
 /// Create a user invite (conn-based variant for interactive use with in-memory keys).
@@ -1269,15 +1160,7 @@ pub fn svc_users_conn(
     db: &rusqlite::Connection,
     recorded_by: &str,
 ) -> ServiceResult<Vec<UserItem>> {
-    let rows = match query_dispatch(db, recorded_by, EventQuery::UserList)? {
-        QueryResult::Users(rows) => rows,
-        _ => {
-            return Err(ServiceError(
-                "dispatch result type mismatch (expected users)".into(),
-            ))
-        }
-    };
-
+    let rows = user::list(db, recorded_by)?;
     Ok(rows
         .into_iter()
         .map(|row| UserItem {
@@ -1297,34 +1180,25 @@ pub fn svc_view_conn(
     recorded_by: &str,
     limit: usize,
 ) -> ServiceResult<ViewResponse> {
-    let workspace_name = match query_dispatch(db, recorded_by, EventQuery::WorkspaceName) {
-        Ok(QueryResult::String(name)) => name,
-        _ => String::new(),
-    };
+    // Workspace name — delegate to workspace module
+    let workspace_name = workspace::name(db, recorded_by).unwrap_or_default();
 
     // Users
     let users = svc_users_conn(db, recorded_by)?;
 
     // Own user_event_id (for marking "you") — look up via local signer
-    let own_user_eid: String =
-        if let Ok(Some((signer_eid, _))) = load_local_peer_signer(db, recorded_by) {
-            resolve_user_event_id_for_signer(db, recorded_by, &signer_eid)
-                .map(|eid| crate::crypto::event_id_to_base64(&eid))
-                .unwrap_or_default()
-        } else {
-            String::new()
-        };
-
-    let account_rows = match query_dispatch(db, recorded_by, EventQuery::PeerSharedAccounts)? {
-        QueryResult::Accounts(rows) => rows,
-        _ => {
-            return Err(ServiceError(
-                "dispatch result type mismatch (expected accounts)".into(),
-            ))
-        }
+    let own_user_eid: String = if let Ok(Some((signer_eid, _))) =
+        load_local_peer_signer(db, recorded_by)
+    {
+        resolve_user_event_id_for_signer(db, recorded_by, &signer_eid)
+            .map(|eid| crate::crypto::event_id_to_base64(&eid))
+            .unwrap_or_default()
+    } else {
+        String::new()
     };
 
-    let accounts: Vec<AccountItem> = account_rows
+    // Accounts (peers) — delegate to peer_shared module
+    let accounts: Vec<AccountItem> = peer_shared::list_accounts(db, recorded_by)?
         .into_iter()
         .map(|row| AccountItem {
             event_id: row.event_id,
@@ -1337,30 +1211,17 @@ pub fn svc_view_conn(
     // Messages with author names
     let msg_resp = svc_messages_conn(db, recorded_by, limit)?;
 
+    // Reactions per message — delegate to reaction module
     let mut view_messages = Vec::with_capacity(msg_resp.messages.len());
     for msg in msg_resp.messages {
-        let reaction_rows = match query_dispatch(
-            db,
-            recorded_by,
-            EventQuery::ReactionListForMessageWithAuthors {
-                target_event_id_b64: msg.id_b64.clone(),
-            },
-        )? {
-            QueryResult::ReactionsWithAuthors(rows) => rows,
-            _ => {
-                return Err(ServiceError(
-                    "dispatch result type mismatch (expected reactions with authors)".into(),
-                ))
-            }
-        };
-
-        let reactions: Vec<ViewReaction> = reaction_rows
-            .into_iter()
-            .map(|r| ViewReaction {
-                emoji: r.emoji,
-                reactor_name: r.reactor_name,
-            })
-            .collect();
+        let reactions: Vec<ViewReaction> =
+            reaction::list_for_message_with_authors(db, recorded_by, &msg.id_b64)?
+                .into_iter()
+                .map(|r| ViewReaction {
+                    emoji: r.emoji,
+                    reactor_name: r.reactor_name,
+                })
+                .collect();
 
         view_messages.push(ViewMessage {
             id: msg.id_b64,
@@ -1400,29 +1261,23 @@ pub fn svc_keys_conn(
     recorded_by: &str,
     summary: bool,
 ) -> ServiceResult<KeysResponse> {
-    let user_count = query_dispatch_count(db, recorded_by, EventQuery::UserCount).unwrap_or(0);
-    let peer_count =
-        query_dispatch_count(db, recorded_by, EventQuery::PeerSharedCount).unwrap_or(0);
-    let admin_count = query_dispatch_count(db, recorded_by, EventQuery::AdminCount).unwrap_or(0);
-    let transport_count =
-        query_dispatch_count(db, recorded_by, EventQuery::TransportKeyCount).unwrap_or(0);
+    let user_count = user::count(db, recorded_by).unwrap_or(0);
+    let peer_count = peer_shared::count(db, recorded_by).unwrap_or(0);
+    let admin_count = admin::count(db, recorded_by).unwrap_or(0);
+    let transport_count = transport_key::count(db, recorded_by).unwrap_or(0);
 
     let mut users = Vec::new();
     let mut peers = Vec::new();
     let mut admins = Vec::new();
 
     if !summary {
-        users = match query_dispatch(db, recorded_by, EventQuery::UserList)? {
-            QueryResult::Users(rows) => rows.into_iter().map(|row| row.event_id).collect(),
-            _ => {
-                return Err(ServiceError(
-                    "dispatch result type mismatch (expected users)".into(),
-                ))
-            }
-        };
+        users = user::list(db, recorded_by)?
+            .into_iter()
+            .map(|row| row.event_id)
+            .collect();
 
-        peers = query_dispatch_strings(db, recorded_by, EventQuery::PeerSharedEventIds)?;
-        admins = query_dispatch_strings(db, recorded_by, EventQuery::AdminEventIds)?;
+        peers = peer_shared::list_event_ids(db, recorded_by)?;
+        admins = admin::list_event_ids(db, recorded_by)?;
     }
 
     Ok(KeysResponse {
@@ -1445,14 +1300,7 @@ pub fn svc_workspaces_conn(
     db: &rusqlite::Connection,
     recorded_by: &str,
 ) -> ServiceResult<Vec<WorkspaceItem>> {
-    let rows = match query_dispatch(db, recorded_by, EventQuery::WorkspaceList)? {
-        QueryResult::Workspaces(rows) => rows,
-        _ => {
-            return Err(ServiceError(
-                "dispatch result type mismatch (expected workspaces)".into(),
-            ))
-        }
-    };
+    let rows = workspace::list(db, recorded_by)?;
 
     use base64::Engine;
     Ok(rows
@@ -2115,23 +1963,8 @@ pub fn svc_ban_for_peer(
 pub fn svc_identity_for_peer(db_path: &str, peer_id: &str) -> ServiceResult<IdentityResponse> {
     let (_recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
 
-    let user_event_id = match query_dispatch(&db, peer_id, EventQuery::UserFirstEventId)? {
-        QueryResult::OptionalString(value) => value,
-        _ => {
-            return Err(ServiceError(
-                "dispatch result type mismatch (expected optional string)".into(),
-            ))
-        }
-    };
-    let peer_shared_event_id =
-        match query_dispatch(&db, peer_id, EventQuery::PeerSharedFirstEventId)? {
-            QueryResult::OptionalString(value) => value,
-            _ => {
-                return Err(ServiceError(
-                    "dispatch result type mismatch (expected optional string)".into(),
-                ))
-            }
-        };
+    let user_event_id = user::first_event_id(&db, peer_id)?;
+    let peer_shared_event_id = peer_shared::first_event_id(&db, peer_id)?;
 
     Ok(IdentityResponse {
         transport_fingerprint: peer_id.to_string(),
