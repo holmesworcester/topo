@@ -1232,7 +1232,7 @@ async fn test_egress_queue_lifecycle() {
     assert_eq!(pending, 3);
 
     // Claim batch
-    let claimed = eq.claim_batch(conn_id, 10, 30_000).unwrap();
+    let claimed = eq.claim_batch(conn_id, 10).unwrap();
     assert_eq!(claimed.len(), 3);
 
     // Mark sent

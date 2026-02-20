@@ -16,31 +16,13 @@ use crate::db::wanted::WantedEvents;
 use crate::event_modules::{self as events, registry, ShareScope};
 use crate::projection::apply::project_one;
 
-fn low_mem_mode() -> bool {
-    read_bool_env("LOW_MEM_IOS") || read_bool_env("LOW_MEM")
-}
-
-fn read_bool_env(name: &str) -> bool {
-    match std::env::var(name) {
-        Ok(v) => v != "0" && v.to_lowercase() != "false",
-        Err(_) => false,
-    }
-}
+use crate::tuning::{drain_batch_size, write_batch_cap};
 
 fn current_timestamp_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64
-}
-
-/// Batch writer drain batch size: 100 normal, 50 in low_mem.
-fn drain_batch_size() -> usize {
-    if low_mem_mode() {
-        50
-    } else {
-        100
-    }
 }
 
 /// Drain pending project_queue items for a tenant, projecting each event.
@@ -67,15 +49,6 @@ pub fn drain_project_queue(db_path: &str, tenant_id: &str, batch_size: usize) ->
         Ok(())
     })
     .unwrap_or(0)
-}
-
-/// Batch writer write batch cap: 1000 normal, 500 in low_mem.
-fn write_batch_cap() -> usize {
-    if low_mem_mode() {
-        500
-    } else {
-        1000
-    }
 }
 
 /// Batch writer task - drains channel and writes to SQLite in batches.

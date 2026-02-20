@@ -44,9 +44,6 @@ pub(super) const ENQUEUE_BATCH: usize = 5000;
 /// Max events per egress claim (one send batch to the data stream).
 pub(super) const EGRESS_CLAIM_COUNT: usize = 500;
 
-/// Lease duration (ms) for claimed egress events.
-pub(super) const EGRESS_CLAIM_LEASE_MS: i64 = 30_000;
-
 /// Max age (ms) for sent egress entries before cleanup.
 pub(super) const EGRESS_SENT_TTL_MS: i64 = 300_000;
 
@@ -68,26 +65,4 @@ pub(super) const COORDINATOR_POLL_INTERVAL: Duration = Duration::from_millis(10)
 /// Coordinator poll interval within the collection window.
 pub(super) const COORDINATOR_COLLECTION_POLL: Duration = Duration::from_millis(2);
 
-// ---------------------------------------------------------------------------
-// Shared helpers
-// ---------------------------------------------------------------------------
-
-pub(super) fn low_mem_mode() -> bool {
-    match std::env::var("LOW_MEM_IOS") {
-        Ok(v) if v != "0" && v.to_lowercase() != "false" => return true,
-        _ => {}
-    }
-    match std::env::var("LOW_MEM") {
-        Ok(v) if v != "0" && v.to_lowercase() != "false" => true,
-        _ => false,
-    }
-}
-
-/// Async channel capacity for per-session ingest (initiator/responder).
-pub(super) fn session_ingest_cap() -> usize {
-    if low_mem_mode() {
-        1000
-    } else {
-        5000
-    }
-}
+pub(super) use crate::tuning::session_ingest_cap;

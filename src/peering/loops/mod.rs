@@ -62,16 +62,6 @@ pub(super) const CONNECT_RETRY_DELAY: Duration = Duration::from_secs(1);
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-pub(super) fn low_mem_mode() -> bool {
-    read_bool_env("LOW_MEM_IOS") || read_bool_env("LOW_MEM")
-}
-
-fn read_bool_env(name: &str) -> bool {
-    match std::env::var(name) {
-        Ok(v) => v != "0" && v.to_lowercase() != "false",
-        Err(_) => false,
-    }
-}
 
 pub(crate) fn current_timestamp_ms() -> i64 {
     SystemTime::now()
@@ -112,20 +102,5 @@ pub(super) fn spawn_peer_removal_cancellation_watch(
     })
 }
 
-/// Batch writer drain batch size: 100 normal, 50 in low_mem.
-pub(super) fn drain_batch_size() -> usize {
-    if low_mem_mode() {
-        50
-    } else {
-        100
-    }
-}
-
-/// Async channel capacity for shared ingest (accept_loop / download_from_sources).
-pub(super) fn shared_ingest_cap() -> usize {
-    if low_mem_mode() {
-        1000
-    } else {
-        10000
-    }
-}
+pub(super) use crate::tuning::drain_batch_size;
+pub(super) use crate::tuning::shared_ingest_cap;

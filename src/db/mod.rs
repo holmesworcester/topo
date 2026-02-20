@@ -58,16 +58,7 @@ fn apply_pragmas(conn: &Connection) -> SqliteResult<()> {
     Ok(())
 }
 
-fn low_mem_mode() -> bool {
-    read_bool_env("LOW_MEM_IOS") || read_bool_env("LOW_MEM")
-}
-
-fn read_bool_env(name: &str) -> bool {
-    match std::env::var(name) {
-        Ok(v) => v != "0" && v.to_lowercase() != "false",
-        Err(_) => false,
-    }
-}
+use crate::tuning::low_mem_mode;
 
 /// Migrate all `recorded_by` / `peer_id` references from `old` to `new` across
 /// all projection and trust tables in a single transaction. This is used after

@@ -26,7 +26,7 @@ use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
 use super::receiver::spawn_data_receiver;
 use super::{
     session_ingest_cap, CONTROL_POLL_TIMEOUT, DATA_DRAIN_TIMEOUT, EGRESS_CLAIM_COUNT,
-    EGRESS_CLAIM_LEASE_MS, EGRESS_SENT_TTL_MS, NEGENTROPY_FRAME_SIZE,
+    EGRESS_SENT_TTL_MS, NEGENTROPY_FRAME_SIZE,
 };
 
 /// Run sync as the responder (server role) with dual streams.
@@ -158,7 +158,7 @@ where
         let mut blocked = false;
         while !blocked {
             let batch = egress
-                .claim_batch(peer_id, EGRESS_CLAIM_COUNT, EGRESS_CLAIM_LEASE_MS)
+                .claim_batch(peer_id, EGRESS_CLAIM_COUNT)
                 .unwrap_or_default();
             if batch.is_empty() {
                 break;

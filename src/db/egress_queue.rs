@@ -1,7 +1,7 @@
 use rusqlite::{Connection, Result as SqliteResult, params};
 
 use crate::crypto::EventId;
-use super::queue::{current_timestamp_ms, backoff_ms, recover_expired_leases, QueueHealth};
+use super::queue::current_timestamp_ms;
 
 pub struct EgressQueue<'a> {
     conn: &'a Connection,
@@ -35,53 +35,40 @@ impl<'a> EgressQueue<'a> {
     }
 
     /// Claim a batch of unsent items for sending.
-    /// Returns (rowid, event_id) pairs. Sets lease_until = now + lease_ms.
+    /// Returns (rowid, event_id) pairs.
+    ///
+    /// Single-consumer-per-connection makes leases unnecessary — the connection
+    /// is cleared at session start and end, so no other consumer races.
     pub fn claim_batch(
         &self,
         connection_id: &str,
         limit: usize,
-        lease_ms: i64,
     ) -> SqliteResult<Vec<(i64, EventId)>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let now = current_timestamp_ms();
-        let lease_until = now + lease_ms;
 
-        let mut select_stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare(
             "SELECT id, event_id FROM egress_queue
              WHERE connection_id = ?1
              AND sent_at IS NULL
-             AND available_at <= ?2
-             AND (lease_until IS NULL OR lease_until <= ?2)
-             ORDER BY available_at
-             LIMIT ?3",
+             ORDER BY id
+             LIMIT ?2",
         )?;
-        let rows: Vec<(i64, Vec<u8>)> = select_stmt
-            .query_map(params![connection_id, now, limit as i64], |row| {
+        let rows: Vec<(i64, Vec<u8>)> = stmt
+            .query_map(params![connection_id, limit as i64], |row| {
                 Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
             })?
             .collect::<Result<Vec<_>, _>>()?;
 
-        if rows.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Batch-update leases in a single transaction
-        self.conn.execute("BEGIN", [])?;
-        let mut update_stmt = self.conn.prepare(
-            "UPDATE egress_queue SET lease_until = ?1 WHERE id = ?2",
-        )?;
         let mut result = Vec::with_capacity(rows.len());
         for (rowid, blob) in rows {
             if blob.len() == 32 {
-                update_stmt.execute(params![lease_until, rowid])?;
                 let mut id = [0u8; 32];
                 id.copy_from_slice(&blob);
                 result.push((rowid, id));
             }
         }
-        self.conn.execute("COMMIT", [])?;
 
         Ok(result)
     }
@@ -100,24 +87,6 @@ impl<'a> EgressQueue<'a> {
             stmt.execute(params![now, rowid])?;
         }
         self.conn.execute("COMMIT", [])?;
-        Ok(())
-    }
-
-    /// Mark an item for retry with exponential backoff.
-    pub fn mark_retry(&self, rowid: i64) -> SqliteResult<()> {
-        let now = current_timestamp_ms();
-        let attempts: i64 = self.conn.query_row(
-            "SELECT attempts FROM egress_queue WHERE id = ?1",
-            params![rowid],
-            |row| row.get(0),
-        )?;
-        let new_attempts = attempts + 1;
-        let delay = backoff_ms(new_attempts);
-        self.conn.execute(
-            "UPDATE egress_queue SET attempts = ?1, available_at = ?2, lease_until = NULL
-             WHERE id = ?3",
-            params![new_attempts, now + delay, rowid],
-        )?;
         Ok(())
     }
 
@@ -147,33 +116,6 @@ impl<'a> EgressQueue<'a> {
             params![connection_id],
         )?;
         Ok(())
-    }
-
-    /// Queue health snapshot for observability.
-    pub fn health(&self, connection_id: &str) -> SqliteResult<QueueHealth> {
-        let now = current_timestamp_ms();
-        let pending: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM egress_queue WHERE connection_id = ?1 AND sent_at IS NULL",
-            params![connection_id],
-            |row| row.get(0),
-        )?;
-        let max_attempts: i64 = self.conn.query_row(
-            "SELECT COALESCE(MAX(attempts), 0) FROM egress_queue WHERE connection_id = ?1 AND sent_at IS NULL",
-            params![connection_id],
-            |row| row.get(0),
-        )?;
-        let oldest_age_ms: i64 = self.conn.query_row(
-            "SELECT COALESCE(?2 - MIN(available_at), 0) FROM egress_queue WHERE connection_id = ?1 AND sent_at IS NULL",
-            params![connection_id, now],
-            |row| row.get(0),
-        )?;
-        Ok(QueueHealth { pending, max_attempts, oldest_age_ms })
-    }
-
-    /// Recover expired leases, making them claimable again.
-    pub fn recover_expired(&self) -> SqliteResult<usize> {
-        let now = current_timestamp_ms();
-        recover_expired_leases(self.conn, "egress_queue", now)
     }
 }
 
@@ -229,7 +171,7 @@ mod tests {
         let ids = vec![make_event_id(1), make_event_id(2)];
         eq.enqueue_events("conn1", &ids).unwrap();
 
-        let claimed = eq.claim_batch("conn1", 10, 30_000).unwrap();
+        let claimed = eq.claim_batch("conn1", 10).unwrap();
         assert_eq!(claimed.len(), 2);
 
         let rowids: Vec<i64> = claimed.iter().map(|(r, _)| *r).collect();
@@ -247,12 +189,12 @@ mod tests {
         let ids = vec![make_event_id(1)];
         eq.enqueue_events("conn1", &ids).unwrap();
 
-        let claimed = eq.claim_batch("conn1", 10, 30_000).unwrap();
+        let claimed = eq.claim_batch("conn1", 10).unwrap();
         let rowids: Vec<i64> = claimed.iter().map(|(r, _)| *r).collect();
         eq.mark_sent(&rowids).unwrap();
 
         // Try claiming again — should get nothing
-        let claimed2 = eq.claim_batch("conn1", 10, 30_000).unwrap();
+        let claimed2 = eq.claim_batch("conn1", 10).unwrap();
         assert_eq!(claimed2.len(), 0, "sent items should not be re-claimed");
     }
 
@@ -264,7 +206,7 @@ mod tests {
         let ids = vec![make_event_id(1), make_event_id(2)];
         eq.enqueue_events("conn1", &ids).unwrap();
 
-        let claimed = eq.claim_batch("conn1", 10, 30_000).unwrap();
+        let claimed = eq.claim_batch("conn1", 10).unwrap();
         let rowids: Vec<i64> = claimed.iter().map(|(r, _)| *r).collect();
         eq.mark_sent(&rowids).unwrap();
 
@@ -287,35 +229,6 @@ mod tests {
     }
 
     #[test]
-    fn test_retry_with_backoff() {
-        let conn = setup();
-        let eq = EgressQueue::new(&conn);
-
-        let ids = vec![make_event_id(1)];
-        eq.enqueue_events("conn1", &ids).unwrap();
-
-        let claimed = eq.claim_batch("conn1", 10, 30_000).unwrap();
-        let rowid = claimed[0].0;
-
-        eq.mark_retry(rowid).unwrap();
-
-        // Check attempts incremented
-        let attempts: i64 = conn.query_row(
-            "SELECT attempts FROM egress_queue WHERE id = ?1",
-            params![rowid], |row| row.get(0),
-        ).unwrap();
-        assert_eq!(attempts, 1);
-
-        // available_at should be in the future
-        let available_at: i64 = conn.query_row(
-            "SELECT available_at FROM egress_queue WHERE id = ?1",
-            params![rowid], |row| row.get(0),
-        ).unwrap();
-        let now = current_timestamp_ms();
-        assert!(available_at > now, "available_at should be in the future after retry");
-    }
-
-    #[test]
     fn test_clear_connection() {
         let conn = setup();
         let eq = EgressQueue::new(&conn);
@@ -330,69 +243,5 @@ mod tests {
         let count2 = eq.count_pending("conn2").unwrap();
         assert_eq!(count1, 0);
         assert_eq!(count2, 1, "conn2's items should be unaffected");
-    }
-
-    #[test]
-    fn test_recover_expired() {
-        let conn = setup();
-        let eq = EgressQueue::new(&conn);
-
-        let ids = vec![make_event_id(1)];
-        eq.enqueue_events("conn1", &ids).unwrap();
-
-        // Claim with short lease, then manually expire it
-        let claimed = eq.claim_batch("conn1", 10, 30_000).unwrap();
-        assert_eq!(claimed.len(), 1);
-
-        // Set lease to the past
-        conn.execute(
-            "UPDATE egress_queue SET lease_until = 1",
-            [],
-        ).unwrap();
-
-        let recovered = eq.recover_expired().unwrap();
-        assert_eq!(recovered, 1);
-
-        // Should now be claimable again
-        let claimed2 = eq.claim_batch("conn1", 10, 30_000).unwrap();
-        assert_eq!(claimed2.len(), 1);
-    }
-
-    #[test]
-    fn test_egress_health() {
-        let conn = setup();
-        let eq = EgressQueue::new(&conn);
-
-        // Empty queue health
-        let h = eq.health("conn1").unwrap();
-        assert_eq!(h.pending, 0);
-        assert_eq!(h.max_attempts, 0);
-        assert_eq!(h.oldest_age_ms, 0);
-
-        // Enqueue items
-        let ids = vec![make_event_id(1), make_event_id(2), make_event_id(3)];
-        eq.enqueue_events("conn1", &ids).unwrap();
-
-        let h = eq.health("conn1").unwrap();
-        assert_eq!(h.pending, 3);
-        assert_eq!(h.max_attempts, 0);
-        assert!(h.oldest_age_ms >= 0);
-
-        // Claim, retry one
-        let claimed = eq.claim_batch("conn1", 1, 30_000).unwrap();
-        let rowid = claimed[0].0;
-        eq.mark_retry(rowid).unwrap();
-
-        let h = eq.health("conn1").unwrap();
-        assert_eq!(h.pending, 3); // all still unsent
-        assert_eq!(h.max_attempts, 1); // one retried
-
-        // Mark two as sent
-        let claimed = eq.claim_batch("conn1", 2, 30_000).unwrap();
-        let rowids: Vec<i64> = claimed.iter().map(|(r, _)| *r).collect();
-        eq.mark_sent(&rowids).unwrap();
-
-        let h = eq.health("conn1").unwrap();
-        assert_eq!(h.pending, 1); // only the retried one remains unsent
     }
 }

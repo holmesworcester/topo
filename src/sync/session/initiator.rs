@@ -29,7 +29,7 @@ use super::coordinator::PeerCoord;
 use super::receiver::spawn_data_receiver;
 use super::{
     session_ingest_cap, CONTROL_POLL_TIMEOUT, DATA_DRAIN_TIMEOUT, EGRESS_CLAIM_COUNT,
-    EGRESS_CLAIM_LEASE_MS, EGRESS_SENT_TTL_MS, ENQUEUE_BATCH, HAVE_CHUNK, NEED_CHUNK,
+    EGRESS_SENT_TTL_MS, ENQUEUE_BATCH, HAVE_CHUNK, NEED_CHUNK,
     NEGENTROPY_FRAME_SIZE,
 };
 
@@ -281,7 +281,7 @@ where
         let mut blocked = false;
         while !blocked {
             let batch = egress
-                .claim_batch(peer_id, EGRESS_CLAIM_COUNT, EGRESS_CLAIM_LEASE_MS)
+                .claim_batch(peer_id, EGRESS_CLAIM_COUNT)
                 .unwrap_or_default();
             if batch.is_empty() {
                 break;

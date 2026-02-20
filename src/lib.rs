@@ -15,6 +15,7 @@ pub mod service;
 pub mod sync;
 pub mod testutil;
 pub mod transport;
+pub mod tuning;
 
 #[cfg(test)]
 mod boundary_tests {

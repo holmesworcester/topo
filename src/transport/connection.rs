@@ -5,18 +5,7 @@ use tokio::io::AsyncWriteExt;
 use crate::protocol::{encode_frame, parse_frame, Frame};
 use crate::protocol::wire::ParseError;
 
-/// Max recv buffer size to prevent unbounded growth.
-/// 2 MiB normally, 512 KiB in low_mem mode.
-fn max_recv_buffer() -> usize {
-    if low_mem_mode() { 512 * 1024 } else { 2 * 1024 * 1024 }
-}
-
-fn low_mem_mode() -> bool {
-    match std::env::var("LOW_MEM_IOS").or_else(|_| std::env::var("LOW_MEM")) {
-        Ok(v) => v != "0" && v.to_lowercase() != "false",
-        Err(_) => false,
-    }
-}
+use crate::tuning::max_recv_buffer;
 
 /// Async stream connection abstraction for sync protocol.
 #[async_trait]
