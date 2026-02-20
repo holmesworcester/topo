@@ -12,21 +12,14 @@ use serde::{Deserialize, Serialize};
 use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
 use crate::db::{open_connection, schema::create_tables, transport_trust::is_peer_allowed};
 use crate::event_modules::{
-    admin,
-    local_signer_secret::{
-        LocalSignerSecretEvent, SIGNER_KIND_PEER_SHARED, SIGNER_KIND_USER, SIGNER_KIND_WORKSPACE,
-    },
-    message, message_deletion, peer_shared, reaction, transport_key, user, user_removed, workspace,
-    DeviceInviteFirstEvent, InviteAcceptedEvent, ParsedEvent, PeerSharedFirstEvent, UserBootEvent,
-    UserInviteBootEvent, WorkspaceEvent,
+    admin, message, message_deletion, peer_shared, reaction, transport_key, user, user_removed,
+    workspace,
 };
 use crate::contracts::transport_identity_contract::{
     TransportIdentityAdapter, TransportIdentityIntent,
 };
 use crate::identity::transport::{load_transport_cert_required, load_transport_peer_id};
 use crate::transport::identity_adapter::ConcreteTransportIdentityAdapter;
-use crate::projection::apply::project_one;
-use crate::projection::create::{create_event_staged, create_event_sync, create_signed_event_sync};
 use crate::transport::create_dual_endpoint_dynamic;
 
 // ---------------------------------------------------------------------------
@@ -340,25 +333,6 @@ fn decode_signing_key(key_bytes: Vec<u8>) -> ServiceResult<SigningKey> {
     Ok(SigningKey::from_bytes(&key_arr))
 }
 
-/// Emit a local_signer_secret event for the given signer identity.
-/// The event is projected into `local_signer_material` via the projector.
-fn emit_local_signer_secret(
-    db: &rusqlite::Connection,
-    recorded_by: &str,
-    signer_event_id: &EventId,
-    signer_kind: u8,
-    signing_key: &SigningKey,
-) -> ServiceResult<EventId> {
-    let evt = ParsedEvent::LocalSignerSecret(LocalSignerSecretEvent {
-        created_at_ms: current_timestamp_ms(),
-        signer_event_id: *signer_event_id,
-        signer_kind,
-        private_key_bytes: signing_key.to_bytes(),
-    });
-    create_event_sync(db, recorded_by, &evt)
-        .map_err(|e| ServiceError(format!("emit local_signer_secret failed: {}", e)))
-}
-
 fn load_local_peer_signer(
     db: &rusqlite::Connection,
     recorded_by: &str,
@@ -447,113 +421,6 @@ pub fn svc_bootstrap_workspace_conn(
         device_name,
     )
     .map_err(|e| ServiceError(format!("{}", e)))
-}
-pub fn ensure_identity_chain(
-    db: &rusqlite::Connection,
-    recorded_by: &str,
-    workspace_name: &str,
-    username: &str,
-    device_name: &str,
-) -> ServiceResult<(EventId, SigningKey)> {
-    if let Some((eid, signing_key)) = load_local_peer_signer(db, recorded_by)? {
-        return Ok((eid, signing_key));
-    }
-
-    let mut rng = rand::thread_rng();
-
-    let workspace_key = SigningKey::generate(&mut rng);
-    let ws = ParsedEvent::Workspace(WorkspaceEvent {
-        created_at_ms: current_timestamp_ms(),
-        public_key: workspace_key.verifying_key().to_bytes(),
-        name: workspace_name.to_string(),
-    });
-    let ws_eid =
-        create_event_staged(db, recorded_by, &ws).map_err(|e| ServiceError(format!("{}", e)))?;
-
-    let ia = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
-        created_at_ms: current_timestamp_ms(),
-        invite_event_id: ws_eid,
-        workspace_id: ws_eid,
-    });
-    let _ia_eid =
-        create_event_sync(db, recorded_by, &ia).map_err(|e| ServiceError(format!("{}", e)))?;
-    project_one(db, recorded_by, &ws_eid).map_err(|e| ServiceError(format!("{}", e)))?;
-
-    let invite_key = SigningKey::generate(&mut rng);
-    let uib = ParsedEvent::UserInviteBoot(UserInviteBootEvent {
-        created_at_ms: current_timestamp_ms(),
-        public_key: invite_key.verifying_key().to_bytes(),
-        workspace_id: ws_eid,
-        signed_by: ws_eid,
-        signer_type: 1,
-        signature: [0u8; 64],
-    });
-    let uib_eid = create_signed_event_sync(db, recorded_by, &uib, &workspace_key)
-        .map_err(|e| ServiceError(format!("{}", e)))?;
-
-    let user_key = SigningKey::generate(&mut rng);
-    let ub = ParsedEvent::UserBoot(UserBootEvent {
-        created_at_ms: current_timestamp_ms(),
-        public_key: user_key.verifying_key().to_bytes(),
-        username: username.to_string(),
-        signed_by: uib_eid,
-        signer_type: 2,
-        signature: [0u8; 64],
-    });
-    let ub_eid = create_signed_event_sync(db, recorded_by, &ub, &invite_key)
-        .map_err(|e| ServiceError(format!("{}", e)))?;
-
-    let device_invite_key = SigningKey::generate(&mut rng);
-    let dif = ParsedEvent::DeviceInviteFirst(DeviceInviteFirstEvent {
-        created_at_ms: current_timestamp_ms(),
-        public_key: device_invite_key.verifying_key().to_bytes(),
-        signed_by: ub_eid,
-        signer_type: 4,
-        signature: [0u8; 64],
-    });
-    let dif_eid = create_signed_event_sync(db, recorded_by, &dif, &user_key)
-        .map_err(|e| ServiceError(format!("{}", e)))?;
-
-    let peer_shared_key = SigningKey::generate(&mut rng);
-    let psf = ParsedEvent::PeerSharedFirst(PeerSharedFirstEvent {
-        created_at_ms: current_timestamp_ms(),
-        public_key: peer_shared_key.verifying_key().to_bytes(),
-        user_event_id: ub_eid,
-        device_name: device_name.to_string(),
-        signed_by: dif_eid,
-        signer_type: 3,
-        signature: [0u8; 64],
-    });
-    let psf_eid = create_signed_event_sync(db, recorded_by, &psf, &device_invite_key)
-        .map_err(|e| ServiceError(format!("{}", e)))?;
-
-    // Emit local_signer_secret events for all three signing keys
-    emit_local_signer_secret(
-        db,
-        recorded_by,
-        &psf_eid,
-        SIGNER_KIND_PEER_SHARED,
-        &peer_shared_key,
-    )?;
-    emit_local_signer_secret(db, recorded_by, &ub_eid, SIGNER_KIND_USER, &user_key)?;
-    emit_local_signer_secret(
-        db,
-        recorded_by,
-        &ws_eid,
-        SIGNER_KIND_WORKSPACE,
-        &workspace_key,
-    )?;
-
-    // Seed deterministic local content-key material used by invite key-wrap.
-    let _ = crate::identity::ops::ensure_content_key_for_peer(
-        db,
-        recorded_by,
-        &peer_shared_key,
-        &psf_eid,
-    )
-    .map_err(|e| ServiceError(format!("failed to ensure content key: {}", e)))?;
-
-    Ok((psf_eid, peer_shared_key))
 }
 
 // ---------------------------------------------------------------------------
@@ -700,12 +567,14 @@ pub fn svc_create_workspace(
         }
     }
 
-    // Bootstrap new identity chain (creates Workspace + 5 identity events)
+    // Bootstrap new identity chain via workspace command API
     let bootstrap_rb = format!("bootstrap-{}", current_timestamp_ms());
-    let (_psf_eid, _peer_shared_key) =
-        ensure_identity_chain(&conn, &bootstrap_rb, workspace_name, username, device_name)?;
+    let _result = workspace::commands::create_workspace(
+        &conn, &bootstrap_rb, workspace_name, username, device_name,
+    )
+    .map_err(|e| ServiceError(format!("{}", e)))?;
     // Transport identity already installed by projection path: emit_local_signer_secret
-    // for PEER_SHARED triggers ApplyTransportIdentityIntent inside ensure_identity_chain.
+    // for PEER_SHARED triggers ApplyTransportIdentityIntent inside create_workspace.
     let derived = load_transport_peer_id(&conn)
         .map_err(|e| ServiceError(format!("load transport peer id failed: {}", e)))?;
     if derived != bootstrap_rb {
@@ -1583,8 +1452,8 @@ pub async fn svc_accept_invite(
         &invite.bootstrap_spki_fingerprint,
     )?;
 
-    // Accept the invite: creates identity chain
-    let join = crate::identity::ops::accept_user_invite(
+    // Accept the invite: creates identity chain via workspace command API
+    let join = workspace::commands::join_workspace_as_new_user(
         &db,
         &recorded_by,
         &invite_key,
@@ -1594,11 +1463,6 @@ pub async fn svc_accept_invite(
         devicename,
     )
     .map_err(|e| ServiceError(format!("Failed to accept invite: {}", e)))?;
-    if join.content_key_event_id.is_none() {
-        return Err(ServiceError(
-            "Invite acceptance missing wrapped content key material".into(),
-        ));
-    }
 
     let psf_b64 = event_id_to_base64(&join.peer_shared_event_id);
 
@@ -1619,23 +1483,9 @@ pub async fn svc_accept_invite(
 
     let db = open_connection(db_path)?;
 
-    // Emit local_signer_secret events AFTER push-back sync: the peer_shared emit
-    // triggers ApplyTransportIdentityIntent which installs the PeerShared-derived
-    // transport identity, so it must happen after the push-back sync completes.
-    emit_local_signer_secret(
-        &db,
-        &recorded_by,
-        &join.peer_shared_event_id,
-        SIGNER_KIND_PEER_SHARED,
-        &join.peer_shared_key,
-    )?;
-    emit_local_signer_secret(
-        &db,
-        &recorded_by,
-        &join.user_event_id,
-        SIGNER_KIND_USER,
-        &join.user_key,
-    )?;
+    // Emit local_signer_secret events AFTER push-back sync via workspace command API.
+    workspace::commands::persist_join_signer_secrets(&db, &recorded_by, &join)
+        .map_err(|e| ServiceError(format!("Failed to persist signer secrets: {}", e)))?;
 
     // Transport identity already installed by projection path: the peer_shared
     // emit_local_signer_secret above triggers ApplyTransportIdentityIntent.
@@ -1728,7 +1578,7 @@ pub async fn svc_accept_device_link(
         &invite.bootstrap_spki_fingerprint,
     )?;
 
-    let link = crate::identity::ops::accept_device_link(
+    let link = workspace::commands::add_device_to_workspace(
         &db,
         &recorded_by,
         &invite_key,
@@ -1757,15 +1607,9 @@ pub async fn svc_accept_device_link(
 
     let db = open_connection(db_path)?;
 
-    // Emit local_signer_secret AFTER push-back sync: the peer_shared emit triggers
-    // ApplyTransportIdentityIntent which installs PeerShared-derived transport identity.
-    emit_local_signer_secret(
-        &db,
-        &recorded_by,
-        &link.peer_shared_event_id,
-        SIGNER_KIND_PEER_SHARED,
-        &link.peer_shared_key,
-    )?;
+    // Emit local_signer_secret AFTER push-back sync via workspace command API.
+    workspace::commands::persist_link_signer_secrets(&db, &recorded_by, &link)
+        .map_err(|e| ServiceError(format!("Failed to persist signer secrets: {}", e)))?;
 
     // Transport identity already installed by projection path: the peer_shared
     // emit_local_signer_secret above triggers ApplyTransportIdentityIntent.
