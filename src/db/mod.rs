@@ -66,6 +66,10 @@ use crate::tuning::low_mem_mode;
 /// PeerShared-derived one, ensuring transport-layer and event-layer identities
 /// match.
 pub fn migrate_recorded_by(conn: &Connection, old: &str, new: &str) -> Result<(), rusqlite::Error> {
+    if old == new {
+        return Ok(());
+    }
+
     // Use RAII transaction: auto-rolls-back on drop if not committed,
     // preventing partial state on constraint errors.
     let tx = conn.unchecked_transaction()?;
@@ -95,28 +99,25 @@ pub fn migrate_recorded_by(conn: &Connection, old: &str, new: &str) -> Result<()
         "peer_endpoint_observations",
         "local_signer_material",
     ] {
-        tx.execute(
-            &format!(
-                "UPDATE {} SET recorded_by = ?1 WHERE recorded_by = ?2",
-                table
-            ),
-            rusqlite::params![new, old],
-        )?;
+        update_identity_column_lossy(&tx, table, "recorded_by", old, new)?;
     }
 
     // Trust tables (recorded_by column)
-    tx.execute(
-        "UPDATE invite_bootstrap_trust SET recorded_by = ?1 WHERE recorded_by = ?2",
-        rusqlite::params![new, old],
+    update_identity_column_lossy(
+        &tx,
+        "invite_bootstrap_trust",
+        "recorded_by",
+        old,
+        new,
     )?;
-    tx.execute(
-        "UPDATE pending_invite_bootstrap_trust SET recorded_by = ?1 WHERE recorded_by = ?2",
-        rusqlite::params![new, old],
+    update_identity_column_lossy(
+        &tx,
+        "pending_invite_bootstrap_trust",
+        "recorded_by",
+        old,
+        new,
     )?;
-    tx.execute(
-        "UPDATE bootstrap_context SET recorded_by = ?1 WHERE recorded_by = ?2",
-        rusqlite::params![new, old],
-    )?;
+    update_identity_column_lossy(&tx, "bootstrap_context", "recorded_by", old, new)?;
 
     // Pipeline tables (peer_id column)
     for table in &[
@@ -128,13 +129,34 @@ pub fn migrate_recorded_by(conn: &Connection, old: &str, new: &str) -> Result<()
         "trust_anchors",
         "recorded_events",
     ] {
-        tx.execute(
-            &format!("UPDATE {} SET peer_id = ?1 WHERE peer_id = ?2", table),
-            rusqlite::params![new, old],
-        )?;
+        update_identity_column_lossy(&tx, table, "peer_id", old, new)?;
     }
 
     tx.commit()?;
+    Ok(())
+}
+
+fn update_identity_column_lossy(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    column: &str,
+    old: &str,
+    new: &str,
+) -> Result<(), rusqlite::Error> {
+    // First pass: move rows where no uniqueness conflict exists.
+    tx.execute(
+        &format!(
+            "UPDATE OR IGNORE {} SET {} = ?1 WHERE {} = ?2",
+            table, column, column
+        ),
+        rusqlite::params![new, old],
+    )?;
+    // Second pass: drop stale old-identity rows that conflicted with existing
+    // new-identity rows. This keeps migration idempotent under concurrent sync.
+    tx.execute(
+        &format!("DELETE FROM {} WHERE {} = ?1", table, column),
+        rusqlite::params![old],
+    )?;
     Ok(())
 }
 
@@ -234,7 +256,7 @@ mod tests {
     }
 
     #[test]
-    fn test_migrate_recorded_by_collision() {
+    fn test_migrate_recorded_by_collision_dedupes() {
         let conn = open_in_memory().unwrap();
         schema::create_tables(&conn).unwrap();
 
@@ -265,11 +287,24 @@ mod tests {
         )
         .unwrap();
 
-        // Migration should fail due to UNIQUE constraint on trust_anchors
-        let result = migrate_recorded_by(&conn, old, new);
-        assert!(result.is_err(), "migration should fail on PK collision");
+        // Also seed a colliding transport binding row.
+        conn.execute(
+            "INSERT INTO peer_transport_bindings (recorded_by, peer_id, spki_fingerprint, bound_at)
+             VALUES (?1, 'peer_a', X'0101010101010101010101010101010101010101010101010101010101010101', 1000)",
+            rusqlite::params![new],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO peer_transport_bindings (recorded_by, peer_id, spki_fingerprint, bound_at)
+             VALUES (?1, 'peer_a', X'0202020202020202020202020202020202020202020202020202020202020202', 1001)",
+            rusqlite::params![old],
+        )
+        .unwrap();
 
-        // Verify rollback: messages.recorded_by should still be old
+        // Migration should succeed, preserving new-id rows and dropping stale old-id duplicates.
+        migrate_recorded_by(&conn, old, new).unwrap();
+
+        // Messages migrate to new identity.
         let rb: String = conn
             .query_row(
                 "SELECT recorded_by FROM messages WHERE message_id = 'msg_rollback'",
@@ -277,6 +312,34 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(rb, old, "transaction should have rolled back");
+        assert_eq!(rb, new);
+
+        // Old trust anchor row should be removed; only one new row remains.
+        let ta_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM trust_anchors WHERE peer_id = ?1",
+                rusqlite::params![new],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ta_count, 1);
+
+        let old_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM trust_anchors WHERE peer_id = ?1",
+                rusqlite::params![old],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_rows, 0);
+
+        let binding_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM peer_transport_bindings WHERE recorded_by = ?1 AND peer_id = 'peer_a'",
+                rusqlite::params![new],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(binding_count, 1);
     }
 }

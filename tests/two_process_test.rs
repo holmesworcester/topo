@@ -40,8 +40,10 @@ fn start_daemon(db: &str, bind_port: u16) -> Child {
         .arg("start")
         .arg("--bind")
         .arg(format!("127.0.0.1:{}", bind_port))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .env("P7_DISABLE_DISCOVERY", "1")
+        .env("RUST_LOG", "topo::event_pipeline=debug,topo::peering::runtime::autodial=debug,topo::projection=debug,topo::sync::session=info,topo=warn")
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
 
     let child = cmd.spawn().expect("failed to start daemon");
 
@@ -68,7 +70,8 @@ fn send_message(db: &str, content: &str) -> String {
         .expect("failed to run send");
     assert!(
         output.status.success(),
-        "send failed: {}",
+        "send failed for db={}: {}",
+        db,
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -217,12 +220,13 @@ fn test_two_process_invite_and_sync() {
     // via real QUIC, fetches prerequisite events, then creates Bob's identity chain.
     accept_invite(&bob_db, &invite_link, "bob", "laptop");
 
-    // Verify Bob has Alice's first message from bootstrap sync.
-    // Bob's daemon is needed for assert-now, so start it first.
+    // Bob's daemon handles bootstrap sync via autodial: the runtime discovers
+    // bootstrap trust from projected SQL state and dials Alice's sync address.
     let mut bob_daemon = start_daemon(&bob_db, bob_port);
-    std::thread::sleep(Duration::from_secs(1));
 
-    assert_now(&bob_db, &format!("has_event:{} >= 1", alice_first_eid));
+    // Wait for Bob's bootstrap sync to complete: Alice's first message must be
+    // projected (requires full identity chain cascade + message projection).
+    assert_eventually(&bob_db, "message_count >= 1", timeout_ms);
 
     // Step 4: Exchange messages and verify convergence.
     let alice_second_eid = send_message(&alice_db, "Second message from alice");

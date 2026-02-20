@@ -5,12 +5,14 @@ use crate::crypto::{EventId, event_id_from_base64, event_id_to_base64, hash_even
 use crate::event_modules::*;
 use crate::projection::create::{
     create_event_sync, create_event_staged, create_signed_event_sync, create_signed_event_staged,
-    store_signed_event_only, project_event,
+    store_signed_event_only, project_event, event_id_or_blocked,
 };
 use crate::projection::encrypted::{wrap_key_for_recipient, unwrap_key_from_sender};
 use crate::projection::signer::{resolve_signer_key, SignerResolution};
 
 use std::time::{SystemTime, UNIX_EPOCH};
+
+const SIGNER_KIND_PENDING_INVITE_UNWRAP: i64 = 4;
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -375,6 +377,9 @@ pub fn accept_user_invite(
     device_name: &str,
 ) -> Result<JoinChain, Box<dyn std::error::Error + Send + Sync>> {
     let mut rng = rand::thread_rng();
+    // Persist invite key material so content-key unwrap can be retried after
+    // late-arriving SecretShared prerequisites.
+    store_pending_invite_unwrap_key(conn, recorded_by, invite_event_id, invite_key)?;
 
     // 1. InviteAccepted (local event) — binds trust anchor, triggers guard cascade
     let ia_evt = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
@@ -384,7 +389,9 @@ pub fn accept_user_invite(
     });
     let invite_accepted_event_id = create_event_sync(conn, recorded_by, &ia_evt)?;
 
-    // 2. UserBoot (signed by invite_key) — must be Valid after trust anchor cascade
+    // 2. UserBoot (signed by invite_key) — may block if invite event not yet synced.
+    // Tolerates Blocked: the event is stored and will project via cascade when
+    // the invite event arrives.
     let user_key = SigningKey::generate(&mut rng);
     let user_pub = user_key.verifying_key().to_bytes();
     let ub_evt = ParsedEvent::UserBoot(UserBootEvent {
@@ -395,14 +402,14 @@ pub fn accept_user_invite(
         signer_type: 2,
         signature: [0u8; 64],
     });
-    let user_event_id = create_signed_event_sync(
+    let user_event_id = event_id_or_blocked(create_signed_event_sync(
         conn,
         recorded_by,
         &ub_evt,
         invite_key,
-    )?;
+    ))?;
 
-    // 3. DeviceInviteFirst (signed by user_key)
+    // 3. DeviceInviteFirst (signed by user_key) — may block if UserBoot is blocked.
     let device_invite_key = SigningKey::generate(&mut rng);
     let device_invite_pub = device_invite_key.verifying_key().to_bytes();
     let dif_evt = ParsedEvent::DeviceInviteFirst(DeviceInviteFirstEvent {
@@ -412,14 +419,14 @@ pub fn accept_user_invite(
         signer_type: 4,
         signature: [0u8; 64],
     });
-    let device_invite_event_id = create_signed_event_sync(
+    let device_invite_event_id = event_id_or_blocked(create_signed_event_sync(
         conn,
         recorded_by,
         &dif_evt,
         &user_key,
-    )?;
+    ))?;
 
-    // 4. PeerSharedFirst (signed by device_invite_key)
+    // 4. PeerSharedFirst (signed by device_invite_key) — may block.
     let peer_shared_key = SigningKey::generate(&mut rng);
     let peer_shared_pub = peer_shared_key.verifying_key().to_bytes();
     let psf_evt = ParsedEvent::PeerSharedFirst(PeerSharedFirstEvent {
@@ -431,20 +438,24 @@ pub fn accept_user_invite(
         signer_type: 3,
         signature: [0u8; 64],
     });
-    let peer_shared_event_id = create_signed_event_sync(
+    let peer_shared_event_id = event_id_or_blocked(create_signed_event_sync(
         conn,
         recorded_by,
         &psf_evt,
         &device_invite_key,
-    )?;
+    ))?;
 
     // 5. Unwrap inviter-provided content key targeted at this invite (if present).
+    // May return None if the content key event hasn't been synced yet.
     let content_key_event_id = unwrap_content_key_from_invite(
         conn,
         recorded_by,
         invite_key,
         invite_event_id,
     )?;
+    if content_key_event_id.is_some() {
+        clear_pending_invite_unwrap_key(conn, recorded_by, invite_event_id)?;
+    }
 
     Ok(JoinChain {
         user_event_id,
@@ -527,7 +538,9 @@ pub fn accept_device_link(
     });
     let invite_accepted_event_id = create_event_sync(conn, recorded_by, &ia_evt)?;
 
-    // 2. PeerSharedFirst (signed by device_invite_key) — must be Valid after trust anchor cascade
+    // 2. PeerSharedFirst (signed by device_invite_key) — may block if device invite
+    // event not yet synced. Tolerates Blocked: the event is stored and will project
+    // via cascade when prerequisites arrive.
     let peer_shared_key = SigningKey::generate(&mut rng);
     let peer_shared_pub = peer_shared_key.verifying_key().to_bytes();
     let psf_evt = ParsedEvent::PeerSharedFirst(PeerSharedFirstEvent {
@@ -539,12 +552,12 @@ pub fn accept_device_link(
         signer_type: 3,
         signature: [0u8; 64],
     });
-    let peer_shared_event_id = create_signed_event_sync(
+    let peer_shared_event_id = event_id_or_blocked(create_signed_event_sync(
         conn,
         recorded_by,
         &psf_evt,
         device_invite_key,
-    )?;
+    ))?;
 
     Ok(LinkChain {
         peer_shared_event_id,
@@ -656,6 +669,52 @@ fn wrap_content_key_for_invite(
     Ok(())
 }
 
+/// Retry pending content-key unwraps for invite accept flows.
+///
+/// Accept paths persist invite private keys in `local_signer_material` with
+/// `signer_kind=4` so runtime projection can retry unwrap when SecretShared
+/// arrives later via sync.
+pub fn retry_pending_invite_content_key_unwraps(
+    conn: &Connection,
+    recorded_by: &str,
+) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    let mut stmt = conn.prepare(
+        "SELECT signer_event_id, private_key
+         FROM local_signer_material
+         WHERE recorded_by = ?1 AND signer_kind = ?2",
+    )?;
+    let rows = stmt
+        .query_map(
+            rusqlite::params![recorded_by, SIGNER_KIND_PENDING_INVITE_UNWRAP],
+            |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            },
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(stmt);
+
+    let mut unwrapped = 0usize;
+    for (invite_event_b64, key_bytes) in rows {
+        let invite_event_id = match event_id_from_base64(&invite_event_b64) {
+            Some(eid) => eid,
+            None => continue,
+        };
+        if key_bytes.len() != 32 {
+            continue;
+        }
+        let mut key_arr = [0u8; 32];
+        key_arr.copy_from_slice(&key_bytes);
+        let invite_key = SigningKey::from_bytes(&key_arr);
+
+        if unwrap_content_key_from_invite(conn, recorded_by, &invite_key, &invite_event_id)?.is_some() {
+            clear_pending_invite_unwrap_key(conn, recorded_by, &invite_event_id)?;
+            unwrapped += 1;
+        }
+    }
+
+    Ok(unwrapped)
+}
+
 /// After accepting an invite, look up any SecretShared events targeted at
 /// the invite_event_id, unwrap using the invite private key and the sender's
 /// public key, and create a local SecretKey event for the decrypted content key.
@@ -708,3 +767,40 @@ fn unwrap_content_key_from_invite(
     Ok(None)
 }
 
+fn store_pending_invite_unwrap_key(
+    conn: &Connection,
+    recorded_by: &str,
+    invite_event_id: &EventId,
+    invite_key: &SigningKey,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    conn.execute(
+        "INSERT OR REPLACE INTO local_signer_material
+         (recorded_by, signer_event_id, signer_kind, private_key, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![
+            recorded_by,
+            event_id_to_base64(invite_event_id),
+            SIGNER_KIND_PENDING_INVITE_UNWRAP,
+            invite_key.to_bytes().to_vec(),
+            now_ms() as i64,
+        ],
+    )?;
+    Ok(())
+}
+
+fn clear_pending_invite_unwrap_key(
+    conn: &Connection,
+    recorded_by: &str,
+    invite_event_id: &EventId,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    conn.execute(
+        "DELETE FROM local_signer_material
+         WHERE recorded_by = ?1 AND signer_event_id = ?2 AND signer_kind = ?3",
+        rusqlite::params![
+            recorded_by,
+            event_id_to_base64(invite_event_id),
+            SIGNER_KIND_PENDING_INVITE_UNWRAP,
+        ],
+    )?;
+    Ok(())
+}

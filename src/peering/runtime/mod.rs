@@ -78,16 +78,30 @@ pub async fn run_node(
 
     // Keep discovery handles alive so mDNS services stay registered
     #[cfg(feature = "discovery")]
-    let _discovery_handles = discovery::launch_mdns_discovery(
-        &tenants,
-        _local_addr,
-        &_local_peer_ids,
-        &endpoint,
-        &tenant_client_configs,
-        intro_spawner,
-        ingest,
-        db_path,
-    );
+    let _discovery_handles = {
+        let disable_discovery = std::env::var("P7_DISABLE_DISCOVERY")
+            .ok()
+            .map(|v| {
+                let lowered = v.to_ascii_lowercase();
+                lowered == "1" || lowered == "true" || lowered == "yes"
+            })
+            .unwrap_or(false);
+        if disable_discovery {
+            warn!("mDNS discovery disabled by P7_DISABLE_DISCOVERY");
+            Vec::new()
+        } else {
+            discovery::launch_mdns_discovery(
+                &tenants,
+                _local_addr,
+                &_local_peer_ids,
+                &endpoint,
+                &tenant_client_configs,
+                intro_spawner,
+                ingest,
+                db_path,
+            )
+        }
+    };
 
     // Clone endpoint before moving into accept thread (needed for connect_loop).
     let connect_endpoint = endpoint.clone();
@@ -120,7 +134,8 @@ pub async fn run_node(
         });
     });
 
-    // Placeholder invite-based autodial source for realism tests.
+    // Bootstrap invite-based autodial: polls SQL trust state for bootstrap
+    // addresses and dials them. This is the primary bootstrap sync mechanism.
     let disable_placeholder_autodial = std::env::var("P7_DISABLE_PLACEHOLDER_AUTODIAL")
         .ok()
         .map(|v| {
@@ -129,13 +144,13 @@ pub async fn run_node(
         })
         .unwrap_or(false);
     if disable_placeholder_autodial {
-        warn!("PLACEHOLDER AUTODIAL DISABLED by P7_DISABLE_PLACEHOLDER_AUTODIAL");
+        warn!("BOOTSTRAP AUTODIAL DISABLED by P7_DISABLE_PLACEHOLDER_AUTODIAL");
     } else {
         let autodial_targets = collect_placeholder_invite_autodial_targets(db_path)?;
         let mut launched_autodial: HashSet<(String, SocketAddr)> = HashSet::new();
         if !autodial_targets.is_empty() {
             warn!(
-                "PLACEHOLDER AUTODIAL ENABLED: launching {} invite-seeded outbound dial(s)",
+                "BOOTSTRAP AUTODIAL: launching {} invite-seeded outbound dial(s)",
                 autodial_targets.len()
             );
         }
@@ -145,7 +160,7 @@ pub async fn run_node(
                 Ok(c) => c,
                 Err(e) => {
                     warn!(
-                        "Skipping placeholder autodial for {}: {}",
+                        "Skipping bootstrap autodial for {}: {}",
                         &tenant_id[..16.min(tenant_id.len())],
                         e
                     );
@@ -153,7 +168,7 @@ pub async fn run_node(
                 }
             };
             info!(
-                "PLACEHOLDER AUTODIAL: tenant {} dialing invite bootstrap {}",
+                "BOOTSTRAP AUTODIAL: tenant {} dialing invite bootstrap {}",
                 &tenant_id[..16.min(tenant_id.len())],
                 remote
             );
@@ -163,7 +178,7 @@ pub async fn run_node(
                 connect_endpoint.clone(),
                 remote,
                 cfg,
-                "placeholder-autodial",
+                "bootstrap-autodial",
                 intro_spawner,
                 ingest,
             );

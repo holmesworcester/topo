@@ -266,6 +266,47 @@ pub fn batch_writer(
                             tracing::debug!(tenant=%rb, pending=%h.pending, max_attempts=%h.max_attempts, oldest_age_ms=%h.oldest_age_ms, "project_queue health");
                         }
                     }
+                    let mut effective_rb = rb.clone();
+                    // Post-drain: if projection cascade caused a transport identity
+                    // transition (e.g. LocalSignerSecret(PEER_SHARED) projected and
+                    // installed PeerShared-derived identity), migrate all DB rows
+                    // from the old recorded_by to the new peer_id.
+                    if let Ok(new_peer_id) = crate::identity::transport::load_transport_peer_id(&db) {
+                        if new_peer_id != *rb {
+                            if let Err(e) = crate::db::migrate_recorded_by(&db, rb, &new_peer_id) {
+                                warn!("post-drain recorded_by migration failed for {}: {}", rb, e);
+                            } else {
+                                tracing::info!(
+                                    "post-drain recorded_by migration: {} -> {}",
+                                    &rb[..16.min(rb.len())],
+                                    &new_peer_id[..16.min(new_peer_id.len())]
+                                );
+                                effective_rb = new_peer_id;
+                                workspace_cache.clear();
+                            }
+                        }
+                    }
+                    // Invite content-key unwrap can be deferred: SecretShared may
+                    // arrive after accept flow. Retry pending unwraps after each
+                    // projection drain so key material converges from synced events.
+                    match crate::identity::ops::retry_pending_invite_content_key_unwraps(
+                        &db,
+                        &effective_rb,
+                    ) {
+                        Ok(count) if count > 0 => {
+                            tracing::info!(
+                                "post-drain invite content-key unwrap: tenant {} resolved {} pending key(s)",
+                                &effective_rb[..16.min(effective_rb.len())],
+                                count
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => warn!(
+                            "post-drain invite content-key unwrap failed for {}: {}",
+                            &effective_rb[..16.min(effective_rb.len())],
+                            e
+                        ),
+                    }
                 }
             }
             Err(e) => {
