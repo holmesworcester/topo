@@ -13,6 +13,7 @@ pub mod wanted;
 
 use rusqlite::{Connection, Result as SqliteResult};
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Open database connection with WAL mode and performance pragmas
 pub fn open_connection<P: AsRef<Path>>(path: P) -> SqliteResult<Connection> {
@@ -103,13 +104,7 @@ pub fn migrate_recorded_by(conn: &Connection, old: &str, new: &str) -> Result<()
     }
 
     // Trust tables (recorded_by column)
-    update_identity_column_lossy(
-        &tx,
-        "invite_bootstrap_trust",
-        "recorded_by",
-        old,
-        new,
-    )?;
+    update_identity_column_lossy(&tx, "invite_bootstrap_trust", "recorded_by", old, new)?;
     update_identity_column_lossy(
         &tx,
         "pending_invite_bootstrap_trust",
@@ -131,6 +126,8 @@ pub fn migrate_recorded_by(conn: &Connection, old: &str, new: &str) -> Result<()
     ] {
         update_identity_column_lossy(&tx, table, "peer_id", old, new)?;
     }
+
+    reconcile_projection_state_after_migration(&tx, new)?;
 
     tx.commit()?;
     Ok(())
@@ -157,6 +154,95 @@ fn update_identity_column_lossy(
         &format!("DELETE FROM {} WHERE {} = ?1", table, column),
         rusqlite::params![old],
     )?;
+    Ok(())
+}
+
+fn reconcile_projection_state_after_migration(
+    tx: &rusqlite::Transaction<'_>,
+    peer_id: &str,
+) -> Result<(), rusqlite::Error> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+
+    // After recorded_by migration, blockers may already be valid under the new
+    // peer_id. Remove those edges so blocked headers can converge.
+    tx.execute(
+        "DELETE FROM blocked_event_deps
+         WHERE peer_id = ?1
+           AND blocker_event_id IN (
+               SELECT event_id FROM valid_events WHERE peer_id = ?1
+           )",
+        rusqlite::params![peer_id],
+    )?;
+
+    tx.execute(
+        "UPDATE blocked_events
+         SET deps_remaining = (
+             SELECT COUNT(*)
+             FROM blocked_event_deps d
+             WHERE d.peer_id = blocked_events.peer_id
+               AND d.event_id = blocked_events.event_id
+         )
+         WHERE peer_id = ?1",
+        rusqlite::params![peer_id],
+    )?;
+
+    let mut ready_events = Vec::new();
+    {
+        let mut stmt = tx.prepare(
+            "SELECT event_id
+             FROM blocked_events
+             WHERE peer_id = ?1
+               AND event_id NOT IN (
+                   SELECT event_id FROM blocked_event_deps WHERE peer_id = ?1
+               )",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![peer_id], |row| row.get::<_, String>(0))?;
+        for row in rows {
+            ready_events.push(row?);
+        }
+    }
+
+    // Re-queue newly unblocked events immediately and release stale leases.
+    for event_id in ready_events {
+        tx.execute(
+            "DELETE FROM blocked_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![peer_id, &event_id],
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO project_queue (peer_id, event_id, available_at, attempts, lease_until)
+             VALUES (?1, ?2, ?3, 0, NULL)",
+            rusqlite::params![peer_id, &event_id, now],
+        )?;
+        tx.execute(
+            "UPDATE project_queue
+             SET attempts = 0,
+                 lease_until = NULL,
+                 available_at = CASE WHEN available_at > ?3 THEN ?3 ELSE available_at END
+             WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![peer_id, &event_id, now],
+        )?;
+    }
+
+    // Any blocked row that remained leased during migration should become claimable.
+    tx.execute(
+        "UPDATE project_queue
+         SET lease_until = NULL
+         WHERE peer_id = ?1
+           AND event_id IN (SELECT event_id FROM blocked_events WHERE peer_id = ?1)",
+        rusqlite::params![peer_id],
+    )?;
+
+    // Drop orphan dep edges where the blocked header no longer exists.
+    tx.execute(
+        "DELETE FROM blocked_event_deps
+         WHERE peer_id = ?1
+           AND event_id NOT IN (SELECT event_id FROM blocked_events WHERE peer_id = ?1)",
+        rusqlite::params![peer_id],
+    )?;
+
     Ok(())
 }
 
@@ -341,5 +427,76 @@ mod tests {
             )
             .unwrap();
         assert_eq!(binding_count, 1);
+    }
+
+    #[test]
+    fn test_migrate_recorded_by_reconciles_blocked_deps_and_leases() {
+        let conn = open_in_memory().unwrap();
+        schema::create_tables(&conn).unwrap();
+
+        let old = "oldpeer";
+        let new = "newpeer";
+        let blocker = "blocker-valid";
+        let blocked = "blocked-ready";
+
+        conn.execute(
+            "INSERT INTO blocked_event_deps (peer_id, event_id, blocker_event_id)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![old, blocked, blocker],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO blocked_events (peer_id, event_id, deps_remaining)
+             VALUES (?1, ?2, 1)",
+            rusqlite::params![old, blocked],
+        )
+        .unwrap();
+
+        // Simulate a leased row from an in-flight drainer.
+        conn.execute(
+            "INSERT INTO project_queue (peer_id, event_id, available_at, attempts, lease_until)
+             VALUES (?1, ?2, 9999999999, 0, 9999999999)",
+            rusqlite::params![old, blocked],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO valid_events (peer_id, event_id) VALUES (?1, ?2)",
+            rusqlite::params![old, blocker],
+        )
+        .unwrap();
+
+        migrate_recorded_by(&conn, old, new).unwrap();
+
+        let dep_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM blocked_event_deps WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![new, blocked],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(dep_rows, 0, "resolved dep edge should be removed");
+
+        let header_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM blocked_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![new, blocked],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(header_rows, 0, "ready blocked header should be removed");
+
+        let (attempts, lease_until): (i64, Option<i64>) = conn
+            .query_row(
+                "SELECT attempts, lease_until FROM project_queue WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![new, blocked],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(attempts, 0);
+        assert!(
+            lease_until.is_none(),
+            "migrated queue row should be released for immediate processing"
+        );
     }
 }

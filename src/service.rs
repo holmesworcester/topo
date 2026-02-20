@@ -9,18 +9,18 @@ use ed25519_dalek::SigningKey;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
+use crate::contracts::transport_identity_contract::{
+    TransportIdentityAdapter, TransportIdentityIntent,
+};
 use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
 use crate::db::{open_connection, schema::create_tables, transport_trust::is_peer_allowed};
 use crate::event_modules::{
     admin, message, message_deletion, peer_shared, reaction, transport_key, user, user_removed,
     workspace,
 };
-use crate::contracts::transport_identity_contract::{
-    TransportIdentityAdapter, TransportIdentityIntent,
-};
 use crate::identity::transport::{load_transport_cert_required, load_transport_peer_id};
-use crate::transport::identity_adapter::ConcreteTransportIdentityAdapter;
 use crate::transport::create_dual_endpoint_dynamic;
+use crate::transport::identity_adapter::ConcreteTransportIdentityAdapter;
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -570,7 +570,11 @@ pub fn svc_create_workspace(
     // Bootstrap new identity chain via workspace command API
     let bootstrap_rb = format!("bootstrap-{}", current_timestamp_ms());
     let _result = workspace::commands::create_workspace(
-        &conn, &bootstrap_rb, workspace_name, username, device_name,
+        &conn,
+        &bootstrap_rb,
+        workspace_name,
+        username,
+        device_name,
     )
     .map_err(|e| ServiceError(format!("{}", e)))?;
     // Transport identity already installed by projection path: emit_local_signer_secret
@@ -758,13 +762,17 @@ pub fn svc_assert_eventually(
     timeout_ms: u64,
     interval_ms: u64,
 ) -> ServiceResult<AssertResponse> {
-    let (recorded_by, db) = open_db_load(db_path)?;
+    let db = open_connection(db_path)?;
+    create_tables(&db)?;
     let (field, op, expected) = parse_predicate(predicate_str).map_err(ServiceError)?;
     let start = Instant::now();
     let timeout = Duration::from_millis(timeout_ms);
     let interval = Duration::from_millis(interval_ms);
 
     loop {
+        // Re-resolve local transport identity every poll. During invite/bootstrap
+        // convergence, recorded_by can migrate from placeholder to peer-shared.
+        let recorded_by = load_transport_peer_id(&db).map_err(|e| ServiceError(e.to_string()))?;
         let actual = query_field(&db, &field, &recorded_by).map_err(ServiceError)?;
         if op.eval(actual, expected) {
             return Ok(AssertResponse {
@@ -1034,15 +1042,14 @@ pub fn svc_view_conn(
     let users = svc_users_conn(db, recorded_by)?;
 
     // Own user_event_id (for marking "you") — look up via local signer
-    let own_user_eid: String = if let Ok(Some((signer_eid, _))) =
-        load_local_peer_signer(db, recorded_by)
-    {
-        resolve_user_event_id_for_signer(db, recorded_by, &signer_eid)
-            .map(|eid| crate::crypto::event_id_to_base64(&eid))
-            .unwrap_or_default()
-    } else {
-        String::new()
-    };
+    let own_user_eid: String =
+        if let Ok(Some((signer_eid, _))) = load_local_peer_signer(db, recorded_by) {
+            resolve_user_event_id_for_signer(db, recorded_by, &signer_eid)
+                .map(|eid| crate::crypto::event_id_to_base64(&eid))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
 
     // Accounts (peers) — delegate to peer_shared module
     let accounts: Vec<AccountItem> = peer_shared::list_accounts(db, recorded_by)?
@@ -1788,5 +1795,64 @@ mod tests {
             svc_create_workspace(&db_path, "test-workspace", "test-user", "test-device").unwrap();
         assert_eq!(resp.peer_id, resp2.peer_id);
         assert_eq!(resp.workspace_id, resp2.workspace_id);
+    }
+
+    #[test]
+    fn test_svc_assert_eventually_reloads_recorded_by_after_migration() {
+        let (_dir, db_path) = temp_db_path();
+        let old_peer_id = setup_workspace(&db_path);
+
+        let db = open_connection(&db_path).unwrap();
+        create_tables(&db).unwrap();
+        let (cert_der, key_der): (Vec<u8>, Vec<u8>) = db
+            .query_row(
+                "SELECT cert_der, key_der FROM local_transport_creds WHERE peer_id = ?1",
+                rusqlite::params![&old_peer_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        drop(db);
+
+        let db_path_bg = db_path.clone();
+        let old_peer_bg = old_peer_id.clone();
+        let cert_bg = cert_der.clone();
+        let key_bg = key_der.clone();
+        let new_peer_id = "11".repeat(32);
+        let new_peer_bg = new_peer_id.clone();
+
+        let migrate = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            let db = open_connection(&db_path_bg).unwrap();
+            create_tables(&db).unwrap();
+
+            db.execute(
+                "DELETE FROM local_transport_creds WHERE peer_id = ?1",
+                rusqlite::params![old_peer_bg],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO local_transport_creds (peer_id, cert_der, key_der, created_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![new_peer_bg, cert_bg, key_bg, 12345_i64],
+            )
+            .unwrap();
+
+            let message_id = crate::crypto::event_id_to_base64(&[0xAA; 32]);
+            let workspace_id = crate::crypto::event_id_to_base64(&[0xBB; 32]);
+            let author_id = crate::crypto::event_id_to_base64(&[0xCC; 32]);
+            db.execute(
+                "INSERT INTO messages (message_id, workspace_id, author_id, content, created_at, recorded_by)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![message_id, workspace_id, author_id, "migrated", 1_i64, new_peer_id],
+            )
+            .unwrap();
+        });
+
+        let resp = svc_assert_eventually(&db_path, "message_count >= 1", 2_000, 25).unwrap();
+        assert!(
+            resp.pass,
+            "assert_eventually should follow migrated identity"
+        );
+        migrate.join().unwrap();
     }
 }

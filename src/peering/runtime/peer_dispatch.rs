@@ -64,16 +64,10 @@ pub(crate) fn normalize_discovered_addr_for_local_bind(
     discovered: SocketAddr,
 ) -> SocketAddr {
     if local_listen_ip.is_loopback() && !discovered.ip().is_loopback() {
-        match discovered {
-            SocketAddr::V4(v4) => SocketAddr::new(
-                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-                v4.port(),
-            ),
-            SocketAddr::V6(v6) => SocketAddr::new(
-                std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
-                v6.port(),
-            ),
-        }
+        // Keep the exact loopback family we are actually bound on.
+        // If we're bound to 127.0.0.1 and mDNS returns an IPv6 remote,
+        // dialing ::1 would fail because the server is v4-only.
+        SocketAddr::new(local_listen_ip, discovered.port())
     } else {
         discovered
     }
@@ -95,9 +89,16 @@ pub(crate) fn spawn_connect_loop_thread(
             .build()
             .unwrap();
         rt.block_on(async move {
-            if let Err(e) =
-                connect_loop(&db_path, &tenant_id, endpoint, remote, Some(cfg), intro_spawner, ingest)
-                    .await
+            if let Err(e) = connect_loop(
+                &db_path,
+                &tenant_id,
+                endpoint,
+                remote,
+                Some(cfg),
+                intro_spawner,
+                ingest,
+            )
+            .await
             {
                 warn!(
                     "{} connect_loop for {} to {} exited: {}",
@@ -235,5 +236,21 @@ mod tests {
         let discovered: SocketAddr = "192.168.10.42:4455".parse().unwrap();
         let out = normalize_discovered_addr_for_local_bind(local_ip, discovered);
         assert_eq!(out, discovered);
+    }
+
+    #[test]
+    fn test_normalize_discovered_ipv6_for_ipv4_loopback_bind_uses_ipv4_loopback() {
+        let local_ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let discovered: SocketAddr = "[2001:db8::42]:4455".parse().unwrap();
+        let out = normalize_discovered_addr_for_local_bind(local_ip, discovered);
+        assert_eq!(out, "127.0.0.1:4455".parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
+    fn test_normalize_discovered_ipv4_for_ipv6_loopback_bind_uses_ipv6_loopback() {
+        let local_ip: std::net::IpAddr = "::1".parse().unwrap();
+        let discovered: SocketAddr = "192.168.10.42:4455".parse().unwrap();
+        let out = normalize_discovered_addr_for_local_bind(local_ip, discovered);
+        assert_eq!(out, "[::1]:4455".parse::<SocketAddr>().unwrap());
     }
 }

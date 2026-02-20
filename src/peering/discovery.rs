@@ -10,7 +10,7 @@ mod inner {
     use std::net::{IpAddr, SocketAddr};
 
     use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
-    use tracing::{info, debug};
+    use tracing::{debug, info};
 
     const SERVICE_TYPE: &str = "_topo._udp.local.";
 
@@ -26,9 +26,23 @@ mod inner {
         peer_id: String,
         daemon: ServiceDaemon,
         local_peer_ids: HashSet<String>,
+        workspace_id: Option<String>,
     }
 
     impl TenantDiscovery {
+        /// Register this tenant's endpoint on mDNS and prepare to browse.
+        ///
+        /// Does not advertise a workspace scope in TXT properties. Prefer
+        /// [`new_with_workspace`] in production runtime paths.
+        pub fn new(
+            peer_id: &str,
+            port: u16,
+            local_peer_ids: HashSet<String>,
+            advertise_ip: &str,
+        ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+            Self::new_with_workspace(peer_id, port, local_peer_ids, advertise_ip, None)
+        }
+
         /// Register this tenant's endpoint on mDNS and prepare to browse.
         ///
         /// `advertise_ip` is the routable IP to advertise in the mDNS A record.
@@ -36,11 +50,12 @@ mod inner {
         /// discover services advertised on 127.0.0.1. Use
         /// [`local_non_loopback_ipv4`] to obtain a suitable address when the
         /// daemon is bound to loopback or a wildcard address.
-        pub fn new(
+        pub fn new_with_workspace(
             peer_id: &str,
             port: u16,
             local_peer_ids: HashSet<String>,
             advertise_ip: &str,
+            workspace_id: Option<&str>,
         ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
             let daemon = ServiceDaemon::new()?;
 
@@ -56,14 +71,18 @@ mod inner {
             // resolution. A per-tenant host label keeps records disjoint.
             let host_label = format!("p7h-{}", id_truncated);
             let host = format!("{}.local.", host_label);
-            let properties = [("peer_id", peer_id)];
+            let mut properties = Vec::with_capacity(2);
+            properties.push(("peer_id", peer_id));
+            if let Some(ws) = workspace_id {
+                properties.push(("workspace_id", ws));
+            }
             let service = ServiceInfo::new(
                 SERVICE_TYPE,
                 &instance,
                 &host,
                 advertise_ip,
                 port,
-                &properties[..],
+                properties.as_slice(),
             )?;
 
             daemon.register(service)?;
@@ -78,6 +97,7 @@ mod inner {
                 peer_id: peer_id.to_string(),
                 daemon,
                 local_peer_ids,
+                workspace_id: workspace_id.map(str::to_string),
             })
         }
 
@@ -92,15 +112,19 @@ mod inner {
             let (tx, rx) = std::sync::mpsc::channel();
             let local_ids = self.local_peer_ids.clone();
             let my_peer_id = self.peer_id.clone();
+            let my_workspace_id = self.workspace_id.clone();
 
             std::thread::spawn(move || {
                 while let Ok(event) = browser.recv() {
                     match event {
-                        ServiceEvent::ServiceResolved(info) => {
-                            let remote_peer_id = info
+                        ServiceEvent::ServiceResolved(svc_info) => {
+                            let remote_peer_id = svc_info
                                 .get_property_val_str("peer_id")
                                 .unwrap_or_default()
                                 .to_string();
+                            let remote_workspace_id = svc_info
+                                .get_property_val_str("workspace_id")
+                                .map(str::to_string);
 
                             // Skip our own and other local tenants
                             if local_ids.contains(&remote_peer_id) {
@@ -110,15 +134,27 @@ mod inner {
                                 );
                                 continue;
                             }
+                            if !workspace_matches(
+                                my_workspace_id.as_deref(),
+                                remote_workspace_id.as_deref(),
+                            ) {
+                                debug!(
+                                    "mDNS: tenant {} skipping peer {} outside workspace scope",
+                                    &my_peer_id[..16.min(my_peer_id.len())],
+                                    &remote_peer_id[..16.min(remote_peer_id.len())],
+                                );
+                                continue;
+                            }
 
                             // Extract address: prefer non-loopback, non-link-local
-                            let addrs: Vec<&IpAddr> = info.get_addresses().iter().collect();
-                            let best_ip = addrs.iter()
+                            let addrs: Vec<&IpAddr> = svc_info.get_addresses().iter().collect();
+                            let best_ip = addrs
+                                .iter()
                                 .find(|ip| !ip.is_loopback() && !is_link_local(ip))
                                 .or_else(|| addrs.iter().find(|ip| !ip.is_loopback()))
                                 .or(addrs.first());
                             if let Some(ip) = best_ip {
-                                let addr = SocketAddr::new(**ip, info.get_port());
+                                let addr = SocketAddr::new(**ip, svc_info.get_port());
                                 info!(
                                     "mDNS: tenant {} discovered peer {} at {}",
                                     &my_peer_id[..16.min(my_peer_id.len())],
@@ -162,6 +198,18 @@ mod inner {
         }
     }
 
+    fn workspace_matches(
+        local_workspace_id: Option<&str>,
+        remote_workspace_id: Option<&str>,
+    ) -> bool {
+        match local_workspace_id {
+            None => true,
+            Some(local_ws) => {
+                matches!(remote_workspace_id, Some(remote_ws) if remote_ws == local_ws)
+            }
+        }
+    }
+
     /// Find a non-loopback IPv4 address suitable for mDNS advertisement.
     ///
     /// Uses the OS routing table to determine which local IP would be used
@@ -176,6 +224,23 @@ mod inner {
         Some(addr.ip().to_string())
     }
 
+    #[cfg(test)]
+    mod tests {
+        use super::workspace_matches;
+
+        #[test]
+        fn workspace_matches_allows_when_unscoped() {
+            assert!(workspace_matches(None, None));
+            assert!(workspace_matches(None, Some("ws-a")));
+        }
+
+        #[test]
+        fn workspace_matches_requires_exact_match_when_scoped() {
+            assert!(workspace_matches(Some("ws-a"), Some("ws-a")));
+            assert!(!workspace_matches(Some("ws-a"), Some("ws-b")));
+            assert!(!workspace_matches(Some("ws-a"), None));
+        }
+    }
 }
 
 #[cfg(feature = "discovery")]

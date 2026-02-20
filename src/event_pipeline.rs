@@ -271,7 +271,8 @@ pub fn batch_writer(
                     // transition (e.g. LocalSignerSecret(PEER_SHARED) projected and
                     // installed PeerShared-derived identity), migrate all DB rows
                     // from the old recorded_by to the new peer_id.
-                    if let Ok(new_peer_id) = crate::identity::transport::load_transport_peer_id(&db) {
+                    if let Ok(new_peer_id) = crate::identity::transport::load_transport_peer_id(&db)
+                    {
                         if new_peer_id != *rb {
                             if let Err(e) = crate::db::migrate_recorded_by(&db, rb, &new_peer_id) {
                                 warn!("post-drain recorded_by migration failed for {}: {}", rb, e);
@@ -284,6 +285,26 @@ pub fn batch_writer(
                                 effective_rb = new_peer_id;
                                 workspace_cache.clear();
                             }
+                        }
+                    }
+                    if effective_rb != *rb {
+                        // Migration can move queued rows from old->new peer_id while
+                        // some are still blocked/leased. Drain once under the new
+                        // identity immediately so cascade projection keeps moving.
+                        if let Err(e) =
+                            pq.drain_with_limit(&effective_rb, batch_sz, |conn, event_id_b64| {
+                                if let Some(eid) = event_id_from_base64(event_id_b64) {
+                                    project_one(conn, &effective_rb, &eid)
+                                        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                                }
+                                Ok(())
+                            })
+                        {
+                            warn!(
+                                "post-migration project_queue drain error for {}: {}",
+                                &effective_rb[..16.min(effective_rb.len())],
+                                e
+                            );
                         }
                     }
                     // Invite content-key unwrap can be deferred: SecretShared may
