@@ -13,7 +13,7 @@ pub async fn run_node(
     bind: SocketAddr,
     net_info_tx: Option<tokio::sync::oneshot::Sender<NodeRuntimeNetInfo>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use crate::contracts::event_runtime_contract::IngestFns;
+    use crate::contracts::event_pipeline_contract::IngestFns;
     crate::peering::runtime::run_node(
         db_path,
         bind,

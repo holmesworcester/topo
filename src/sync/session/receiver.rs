@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
-use crate::contracts::event_runtime_contract::IngestItem;
+use crate::contracts::event_pipeline_contract::IngestItem;
 use crate::crypto::hash_event;
 use crate::protocol::Frame;
 use crate::transport::connection::ConnectionError;

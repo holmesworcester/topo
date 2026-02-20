@@ -1,5 +1,7 @@
 # Phase 0 Feedback (`ce4d4de`)
 
+> **Historical document; file paths and module names may not match the current source tree.**
+
 Scope reviewed:
 - Commit `ce4d4de` (`Implement Phase 0: mTLS + QUIC with SPKI-pinned certificates`)
 - Files: `src/transport/mod.rs`, `src/transport/cert.rs`, `src/sync/engine.rs`, `src/main.rs`, `src/testutil.rs`, `tests/cli_test.rs`

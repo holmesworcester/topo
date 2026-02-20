@@ -1,5 +1,7 @@
 # Transport Trust Hardening Feedback
 
+> **Historical document; file paths and module names may not match the current source tree.**
+
 Commit reviewed: `4d64ead` (`Fix transport trust: observation-only bindings, deterministic signer, malformed blob skip`)
 
 ## Findings

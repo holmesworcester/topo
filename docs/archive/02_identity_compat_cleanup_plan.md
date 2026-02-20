@@ -1,5 +1,7 @@
 # Stream 2: Identity Compatibility Cleanup
 
+> **Historical document; file paths and module names may not match the current source tree.**
+
 ## Goal
 
 Finish transport-identity rename cleanup by removing compatibility shims and reducing legacy CLI/name surface area.

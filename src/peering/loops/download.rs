@@ -9,8 +9,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::contracts::event_runtime_contract::{BatchWriterFn, IngestItem};
-use crate::contracts::network_contract::{
+use crate::contracts::event_pipeline_contract::{BatchWriterFn, IngestItem};
+use crate::contracts::peering_contract::{
     next_session_id, PeerFingerprint, SessionDirection, SessionHandler, SessionMeta, TenantId,
 };
 use crate::crypto::EventId;
@@ -19,7 +19,7 @@ use crate::db::schema::create_tables;
 use crate::db::store::lookup_workspace_id;
 use crate::sync::session::run_coordinator;
 use crate::sync::PeerCoord;
-use crate::sync::ReplicationSessionHandler;
+use crate::sync::SyncSessionHandler;
 use crate::transport::{peer_identity_from_connection, DualConnection, QuicTransportSessionIo};
 
 use super::{
@@ -105,7 +105,7 @@ pub async fn download_from_sources(
         let recorded_by = recorded_by.to_string();
         let ingest_tx = shared_tx.clone();
         let sni = download_sni.clone();
-        let handler = ReplicationSessionHandler::initiator_with_coordination(
+        let handler = SyncSessionHandler::initiator_with_coordination(
             db_path.clone(),
             SYNC_SESSION_TIMEOUT_SECS,
             peer_coord.clone(),

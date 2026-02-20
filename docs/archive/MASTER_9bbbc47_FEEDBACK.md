@@ -1,5 +1,7 @@
 # Feedback: `master` Commit `9bbbc47`
 
+> **Historical document; file paths and module names may not match the current source tree.**
+
 Commit reviewed:
 - `9bbbc4782311914d3176680cf949a834746e4247`
 - Subject: `Implement transport identity rename, projected trust, and TransportKey events`

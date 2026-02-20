@@ -1,5 +1,7 @@
 # Phase 6 Feedback
 
+> **Historical document; file paths and module names may not match the current source tree.**
+
 Reviewed commit: `c5d0af9` (`Implement Phase 6: performance + operational hardening`)
 
 ## Scope check

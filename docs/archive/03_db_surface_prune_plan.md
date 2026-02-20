@@ -1,5 +1,7 @@
 # Stream 3: DB Surface and Schema Pruning
 
+> **Historical document; file paths and module names may not match the current source tree.**
+
 ## Goal
 
 Remove unused DB modules and legacy schema artifacts that are no longer part of the active runtime path.

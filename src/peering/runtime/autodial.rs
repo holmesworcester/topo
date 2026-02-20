@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use tracing::{info, warn};
 
-use crate::contracts::event_runtime_contract::IngestFns;
-use crate::contracts::network_contract::{PeerFingerprint, TenantId, TrustDecision};
+use crate::contracts::event_pipeline_contract::IngestFns;
+use crate::contracts::peering_contract::{PeerFingerprint, TenantId, TrustDecision};
 use crate::db::transport_creds::{list_local_peers, load_local_creds};
 use crate::db::transport_trust::list_active_invite_bootstrap_addrs;
 use crate::db::open_connection;

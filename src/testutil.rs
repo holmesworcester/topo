@@ -41,14 +41,14 @@ pub fn noop_intro_spawner(
     _peer_id: String,
     _endpoint: quinn::Endpoint,
     _client_config: Option<quinn::ClientConfig>,
-    _batch_writer: crate::contracts::event_runtime_contract::BatchWriterFn,
+    _batch_writer: crate::contracts::event_pipeline_contract::BatchWriterFn,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_local(async {})
 }
 
 /// Convenience: production `IngestFns` for tests.
-pub fn test_ingest_fns() -> crate::contracts::event_runtime_contract::IngestFns {
-    crate::contracts::event_runtime_contract::IngestFns {
+pub fn test_ingest_fns() -> crate::contracts::event_pipeline_contract::IngestFns {
+    crate::contracts::event_pipeline_contract::IngestFns {
         batch_writer: crate::event_pipeline::batch_writer,
         drain_queue: crate::event_pipeline::drain_project_queue,
     }

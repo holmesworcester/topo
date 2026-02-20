@@ -1,5 +1,5 @@
 //! FakeTransportSessionIo: channel-backed implementation of the TransportSessionIo contract
-//! for deterministic, transport-free replication testing.
+//! for deterministic, transport-free sync testing.
 //!
 //! Models:
 //! - frame delivery via bounded tokio mpsc channels,
@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-use topo::contracts::network_contract::{
+use topo::contracts::peering_contract::{
     ControlIo, DataRecvIo, DataSendIo, TransportSessionIo, TransportSessionIoError, TransportSessionIoParts,
 };
 use topo::protocol::{encode_frame, parse_frame, Frame};
@@ -517,7 +517,7 @@ pub fn create_test_db(tenant_id: &str) -> (String, tempfile::TempDir) {
 /// No-op batch writer for tests that don't need event ingestion.
 pub fn noop_batch_writer(
     _db_path: String,
-    mut rx: tokio::sync::mpsc::Receiver<topo::contracts::event_runtime_contract::IngestItem>,
+    mut rx: tokio::sync::mpsc::Receiver<topo::contracts::event_pipeline_contract::IngestItem>,
     _events_received: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) {
     // Drain the channel so senders don't block
@@ -526,9 +526,9 @@ pub fn noop_batch_writer(
 
 /// Build a SessionMeta for testing.
 pub fn test_session_meta(
-    direction: topo::contracts::network_contract::SessionDirection,
-) -> topo::contracts::network_contract::SessionMeta {
-    use topo::contracts::network_contract::*;
+    direction: topo::contracts::peering_contract::SessionDirection,
+) -> topo::contracts::peering_contract::SessionMeta {
+    use topo::contracts::peering_contract::*;
     SessionMeta {
         session_id: next_session_id(),
         tenant: TenantId("test-tenant".into()),

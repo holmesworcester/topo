@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use tracing::{error, info, warn};
 
-use crate::contracts::network_contract::{PeerFingerprint, TenantId, TrustDecision};
+use crate::contracts::peering_contract::{PeerFingerprint, TenantId, TrustDecision};
 use crate::db::transport_creds::discover_local_tenants;
 use crate::db::{open_connection, schema::create_tables};
 use crate::transport::{

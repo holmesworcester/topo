@@ -1,5 +1,7 @@
 Here's my review:
 
+> **Historical document; file paths and module names may not match the current source tree.**
+
 ## Top 3 Remaining Risks
 
 1. **Phase 1 scope creep / analysis paralysis.** Freezing all contracts upfront before any extraction is a big-bang design commitment. If the contracts turn out wrong once you hit real extraction in phases 2-3, you'll either live with a bad boundary or do a costly contract revision that ripples across adapters and tests. The plan says "no throwaway adapters" but that's aspirational — you won't know until you extract.

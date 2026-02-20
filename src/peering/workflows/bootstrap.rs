@@ -12,12 +12,12 @@ use ed25519_dalek::SigningKey;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-use crate::contracts::event_runtime_contract::BatchWriterFn;
-use crate::contracts::network_contract::{
+use crate::contracts::event_pipeline_contract::BatchWriterFn;
+use crate::contracts::peering_contract::{
     next_session_id, PeerFingerprint, SessionDirection, SessionHandler, SessionMeta, TenantId,
 };
 use crate::db::{open_connection, schema::create_tables};
-use crate::sync::ReplicationSessionHandler;
+use crate::sync::SyncSessionHandler;
 
 use crate::transport::{
     create_dual_endpoint, peer_identity_from_connection, AllowedPeers, DualConnection,
@@ -106,7 +106,7 @@ pub async fn bootstrap_sync_from_invite(
     let conn = DualConnection::new(ctrl_send, ctrl_recv, data_send, data_recv);
 
     // Stream materialization markers are now sent by
-    // ReplicationSessionHandler::on_session for outbound sessions.
+    // SyncSessionHandler::on_session for outbound sessions.
 
     let peer_fp = peer_fingerprint_from_hex(&peer_id)?;
     let session_id = next_session_id();
@@ -117,7 +117,7 @@ pub async fn bootstrap_sync_from_invite(
         remote_addr: connection.remote_address(),
         direction: SessionDirection::Outbound,
     };
-    let handler = ReplicationSessionHandler::initiator(db_path.to_string(), timeout_secs, batch_writer);
+    let handler = SyncSessionHandler::initiator(db_path.to_string(), timeout_secs, batch_writer);
     let io = QuicTransportSessionIo::new(session_id, conn);
     handler
         .on_session(meta, Box::new(io), CancellationToken::new())
@@ -167,7 +167,7 @@ pub fn start_bootstrap_responder(
             .build()
             .expect("failed to create bootstrap responder runtime");
         rt.block_on(async move {
-            let handler = ReplicationSessionHandler::responder(
+            let handler = SyncSessionHandler::responder(
                 db_path.clone(),
                 30,
                 batch_writer,

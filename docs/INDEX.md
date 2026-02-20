@@ -48,6 +48,12 @@ These are the current source module names. Active docs should use these names ex
 | `src/identity_ops.rs` | `src/identity/ops.rs` |
 | `src/transport_identity.rs` | `src/identity/transport.rs` |
 | `src/discovery.rs` | `src/peering/discovery.rs` |
+| `event_runtime_contract.rs` | `event_pipeline_contract.rs` |
+| `network_contract.rs` | `peering_contract.rs` |
+| `ReplicationStore` | `SyncStore` |
+| `SqliteReplicationStore` | `SqliteSyncStore` |
+| `ReplicationSessionHandler` | `SyncSessionHandler` |
+| `tests/replication_contract_tests/` | `tests/sync_contract_tests/` |
 
 ## Maintenance Note
 

@@ -1,5 +1,7 @@
 # Transport Identity Rename — Completed
 
+> **Historical document; file paths and module names may not match the current source tree.**
+
 **Status: Complete.** All phases landed. No legacy symbols or aliases remain.
 
 ## Summary

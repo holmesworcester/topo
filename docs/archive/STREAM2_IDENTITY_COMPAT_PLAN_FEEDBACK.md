@@ -1,5 +1,7 @@
 # Feedback: Stream 2 Identity Compatibility Cleanup Plan
 
+> **Historical document; file paths and module names may not match the current source tree.**
+
 ## Decision
 Approved with merged changes.
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Boundary import enforcement for Option B network boundary refactor.
+# Boundary import enforcement for peering/sync/event_pipeline boundary refactor.
 # Phase 6: hardened with explicit forbidden edges and positive contract checks.
 # Exits non-zero on any violation.
 set -euo pipefail
@@ -70,10 +70,10 @@ check_no_match 'invite_link::create_invite_link' src/service.rs
 echo "=== Positive contract checks ==="
 
 # peering and sync must import from contracts, not event_pipeline
-check_required 'contracts::event_runtime_contract' src/peering/
-check_required 'contracts::network_contract' src/peering/
-check_required 'contracts::event_runtime_contract' src/sync/
-check_required 'contracts::network_contract' src/sync/
+check_required 'contracts::event_pipeline_contract' src/peering/
+check_required 'contracts::peering_contract' src/peering/
+check_required 'contracts::event_pipeline_contract' src/sync/
+check_required 'contracts::peering_contract' src/sync/
 
 # transport identity adapter must use contract types
 check_required 'TransportIdentityAdapter' src/transport/identity_adapter.rs

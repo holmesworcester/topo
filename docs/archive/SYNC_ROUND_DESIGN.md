@@ -1,5 +1,7 @@
 # Sync Round Design (Snapshot Negentropy + 1-Hop Gossip)
 
+> **Historical document; file paths and module names may not match the current source tree.**
+
 This document formalizes the sync design for SQLite-backed negentropy with QUIC dual streams, optimized for correctness, low memory, and continuous operation.
 
 ## Core Invariants

@@ -1,4 +1,4 @@
-//! Replication contract tests: verify protocol correctness via FakeSessionIo
+//! Sync contract tests: verify protocol correctness via FakeSessionIo
 //! without any QUIC transport or real network.
 //!
 //! Workstream E of the Option B Phase 6 hardening plan.

@@ -1,5 +1,7 @@
 # Misplaced/Superfluous Cleanup Handoff
 
+> **Historical document; file paths and module names may not match the current source tree.**
+
 ## Branch + Worktree
 
 - Branch: `exec/cleanup-misplaced-and-superfluous`

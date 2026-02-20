@@ -1780,6 +1780,10 @@ pub fn install_invite_bootstrap_transport_identity(db_path, invite_key) -> Resul
 
 TransportKey event creation has been removed from the identity bootstrap flow. PeerShared-derived SPKIs now serve as the sole steady-state transport trust source.
 
+### 17.1.4.1 Transport identity materialization contract
+
+Transport cert/key materialization is isolated behind `TransportIdentityIntent` (enum) + `TransportIdentityAdapter` (trait) in `src/contracts/transport_identity_contract.rs`. The sole concrete implementation (`ConcreteTransportIdentityAdapter` in `src/transport/identity_adapter.rs`) is the only code that calls `install_peer_key_transport_identity` and `install_invite_bootstrap_transport_identity`. Event modules emit `ApplyTransportIdentityIntent` commands (e.g., `local_signer_secret` projector for PeerShared signers); the projection pipeline routes them through the adapter; the service layer uses the adapter for invite-bootstrap identity. Boundary enforcement in `scripts/check_boundary_imports.sh` prevents raw install calls from leaking into `service.rs`, `event_modules/`, or `projection/`.
+
 ### 17.1.5 Caller updates
 
 All cert-loading sites across the codebase were updated from file-based to DB-based:

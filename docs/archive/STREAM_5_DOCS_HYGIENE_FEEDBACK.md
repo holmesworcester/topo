@@ -1,5 +1,7 @@
 # Feedback: Stream 5 Docs Archive Hygiene
 
+> **Historical document; file paths and module names may not match the current source tree.**
+
 ## Decision
 Approved.
 

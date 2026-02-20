@@ -1,5 +1,7 @@
 # Phase 0.5 Feedback (`78271a2`)
 
+> **Historical document; file paths and module names may not match the current source tree.**
+
 Assumption for this review:
 - Phase 0 feedback in `PHASE_0_FEEDBACK.md` is already addressed.
 - This document focuses only on Phase 0.5 changes (`recorded_by` + `recorded_events` + scoped CLI/query behavior).

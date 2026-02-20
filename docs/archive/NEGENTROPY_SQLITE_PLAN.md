@@ -1,5 +1,7 @@
 # SQLite Negentropy Adapter and QUIC-First Sync Plan
 
+> **Historical document; file paths and module names may not match the current source tree.**
+
 This document is for another assistant. It describes the simplest reliable path to a SQLite-backed negentropy storage adapter and a QUIC-first send/recv loop that keeps the outgoing stream full without blowing memory. It is intentionally conservative and focused on clarity, correctness, and minimal moving parts.
 
 **Context**

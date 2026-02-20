@@ -11,7 +11,7 @@ use negentropy::{Id, Negentropy, Storage};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::contracts::event_runtime_contract::{BatchWriterFn, IngestItem};
+use crate::contracts::event_pipeline_contract::{BatchWriterFn, IngestItem};
 use crate::crypto::EventId;
 use crate::db::{
     egress_queue::EgressQueue,

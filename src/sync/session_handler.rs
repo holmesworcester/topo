@@ -1,17 +1,16 @@
-//! Replication session handler: bridges the SessionHandler contract to the
-//! sync initiator/responder functions in replication::session.
+//! Sync session handler: bridges the SessionHandler contract to the
+//! sync initiator/responder functions in sync::session.
 //!
-//! Moved from sync/session_handler.rs (Phase 5 of Option B refactor).
 //! Phase 6: removed `into_any` downcast; uses `TransportSessionIo::split()` and
-//! adapter wrappers so replication never depends on QUIC concrete types.
+//! adapter wrappers so sync never depends on QUIC concrete types.
 
 use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::contracts::event_runtime_contract::{BatchWriterFn, IngestItem};
-use crate::contracts::network_contract::{
+use crate::contracts::event_pipeline_contract::{BatchWriterFn, IngestItem};
+use crate::contracts::peering_contract::{
     ControlIo, DataRecvIo, DataSendIo, SessionDirection, SessionHandler, TransportSessionIo,
     TransportSessionIoError, SessionMeta,
 };
@@ -106,7 +105,7 @@ pub enum SessionRole {
 }
 
 #[derive(Clone)]
-pub struct ReplicationSessionHandler {
+pub struct SyncSessionHandler {
     db_path: String,
     timeout_secs: u64,
     role: SessionRole,
@@ -115,7 +114,7 @@ pub struct ReplicationSessionHandler {
     batch_writer_fn: BatchWriterFn,
 }
 
-impl ReplicationSessionHandler {
+impl SyncSessionHandler {
     pub fn initiator(db_path: String, timeout_secs: u64, batch_writer_fn: BatchWriterFn) -> Self {
         Self {
             db_path,
@@ -173,7 +172,7 @@ impl ReplicationSessionHandler {
 }
 
 #[async_trait(?Send)]
-impl SessionHandler for ReplicationSessionHandler {
+impl SessionHandler for SyncSessionHandler {
     async fn on_session(
         &self,
         meta: SessionMeta,

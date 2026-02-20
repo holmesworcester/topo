@@ -140,6 +140,17 @@ creation; projected peer keys are not treated as in-memory authority.
 Conceptually:
 `TrustedPeerSet = PeerShared_SPKIs ∪ invite_bootstrap_trust ∪ pending_invite_bootstrap_trust`.
 
+### Transport identity materialization boundary
+
+Transport cert/key materialization is isolated behind a typed contract:
+
+- **`TransportIdentityIntent`** (enum): describes *what* identity change is needed (invite-bootstrap install, PeerShared-derived install).
+- **`TransportIdentityAdapter`** (trait): executes the intent against the DB. The sole concrete implementation (`ConcreteTransportIdentityAdapter` in `src/transport/identity_adapter.rs`) is the **only** code that calls raw install functions (`install_peer_key_transport_identity`, `install_invite_bootstrap_transport_identity`).
+- **Event modules** emit `ApplyTransportIdentityIntent` commands (e.g., `local_signer_secret` projector for PeerShared signers).
+- **Projection pipeline** (`write_exec.rs`) routes intents through the adapter.
+- **Service layer** uses the adapter directly for invite-bootstrap identity during `svc_accept_invite` / `svc_accept_device_link`.
+- **Boundary enforcement**: `scripts/check_boundary_imports.sh` prevents raw install calls from leaking into `service.rs`, `event_modules/`, or `projection/`.
+
 ## 2.3 Event-graph identity binding
 
 Event-graph identity is event-defined:
@@ -672,7 +683,7 @@ Canonical tables and queue tables stay separate.
 
 Current runtime ingest/worker shape:
 1. sync ingest receiver path:
-   - receive `SyncMessage::Event` blobs,
+   - receive `Frame::Event` blobs,
    - decode + canonical insert (`events`, `neg_items`, `recorded_events`) + `project_queue` enqueue in one transaction,
    - commit, then drain `project_queue`.
 2. project worker/drain:

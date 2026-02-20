@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 
-use crate::contracts::network_contract::{
+use crate::contracts::peering_contract::{
     PeerFingerprint, TenantId, TrustDecision, TrustError, TrustOracle,
 };
 use crate::db::open_connection;

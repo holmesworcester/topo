@@ -1,9 +1,9 @@
 use std::path::{Path, PathBuf};
 
-use crate::contracts::event_runtime_contract::{
-    IngestError, IngestSink, ReplicationStore, StoreError,
+use crate::contracts::event_pipeline_contract::{
+    IngestError, IngestSink, SyncStore, StoreError,
 };
-use crate::contracts::network_contract::{PeerFingerprint, TenantId};
+use crate::contracts::peering_contract::{PeerFingerprint, TenantId};
 use crate::db::egress_queue::EgressQueue;
 use crate::db::project_queue::ProjectQueue;
 use crate::db::schema::create_tables;
@@ -90,12 +90,12 @@ impl IngestSink for SqliteIngestSink {
 }
 
 #[derive(Debug, Clone)]
-pub struct SqliteReplicationStore {
+pub struct SqliteSyncStore {
     db_path: PathBuf,
     lease_ms: i64,
 }
 
-impl SqliteReplicationStore {
+impl SqliteSyncStore {
     pub fn new<P: AsRef<Path>>(db_path: P) -> Self {
         Self {
             db_path: db_path.as_ref().to_path_buf(),
@@ -115,7 +115,7 @@ impl SqliteReplicationStore {
     }
 }
 
-impl ReplicationStore for SqliteReplicationStore {
+impl SyncStore for SqliteSyncStore {
     fn enqueue_outbound(
         &self,
         peer: &PeerFingerprint,

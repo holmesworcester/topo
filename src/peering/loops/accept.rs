@@ -8,8 +8,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::contracts::event_runtime_contract::{IngestFns, IngestItem};
-use crate::contracts::network_contract::{
+use crate::contracts::event_pipeline_contract::{IngestFns, IngestItem};
+use crate::contracts::peering_contract::{
     next_session_id, PeerFingerprint, SessionDirection, SessionHandler, SessionMeta, TenantId,
     TrustDecision,
 };
@@ -19,7 +19,7 @@ use crate::db::project_queue::ProjectQueue;
 use crate::db::removal_watch::is_peer_removed;
 use crate::db::schema::create_tables;
 use crate::db::transport_trust::record_transport_binding;
-use crate::sync::ReplicationSessionHandler;
+use crate::sync::SyncSessionHandler;
 use crate::transport::{
     peer_identity_from_connection, DualConnection, SqliteTrustOracle, QuicTransportSessionIo,
 };
@@ -222,7 +222,7 @@ pub async fn accept_loop_with_ingest(
                         return;
                     }
                 };
-                let responder_handler = ReplicationSessionHandler::responder_with_shared_ingest(
+                let responder_handler = SyncSessionHandler::responder_with_shared_ingest(
                     db_path_owned.clone(),
                     SYNC_SESSION_TIMEOUT_SECS,
                     ingest_clone.clone(),

@@ -7,8 +7,8 @@
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-use topo::contracts::network_contract::{SessionDirection, SessionHandler};
-use topo::sync::session_handler::ReplicationSessionHandler;
+use topo::contracts::peering_contract::{SessionDirection, SessionHandler};
+use topo::sync::session_handler::SyncSessionHandler;
 use topo::protocol::Frame;
 
 use crate::fake_session_io::{
@@ -21,7 +21,7 @@ async fn responder_inbound_replies_negmsg_then_doneack() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
         let handler =
-            ReplicationSessionHandler::responder(db_path, 30, noop_batch_writer);
+            SyncSessionHandler::responder(db_path, 30, noop_batch_writer);
         let meta = test_session_meta(SessionDirection::Inbound);
         let cancel = CancellationToken::new();
 
@@ -91,7 +91,7 @@ async fn anticheat_responder_datadone_before_doneack() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
         let handler =
-            ReplicationSessionHandler::responder(db_path, 30, noop_batch_writer);
+            SyncSessionHandler::responder(db_path, 30, noop_batch_writer);
         let meta = test_session_meta(SessionDirection::Inbound);
         let cancel = CancellationToken::new();
 
@@ -154,7 +154,7 @@ async fn responder_rejects_outbound_direction() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
         let handler =
-            ReplicationSessionHandler::responder(db_path, 30, noop_batch_writer);
+            SyncSessionHandler::responder(db_path, 30, noop_batch_writer);
         let meta = test_session_meta(SessionDirection::Outbound);
         let cancel = CancellationToken::new();
 
@@ -180,7 +180,7 @@ async fn responder_ignores_empty_havelist_marker() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
         let handler =
-            ReplicationSessionHandler::responder(db_path, 30, noop_batch_writer);
+            SyncSessionHandler::responder(db_path, 30, noop_batch_writer);
         let meta = test_session_meta(SessionDirection::Inbound);
         let cancel = CancellationToken::new();
 

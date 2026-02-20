@@ -1,5 +1,7 @@
 # Feedback: `quic-holepunch` (latest)
 
+> **Historical document; file paths and module names may not match the current source tree.**
+
 ## Snapshot
 - Branch: `quic-holepunch` (`/home/holmes/poc-7-quic-holepunch`)
 - Relative to `origin/master`: `0 behind / 6 ahead`

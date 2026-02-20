@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 use tracing::{info, warn};
 
 #[cfg(feature = "discovery")]
-use crate::contracts::event_runtime_contract::IngestFns;
+use crate::contracts::event_pipeline_contract::IngestFns;
 #[cfg(feature = "discovery")]
 use crate::peering::loops::{connect_loop, IntroSpawnerFn};
 

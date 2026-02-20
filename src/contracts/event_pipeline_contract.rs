@@ -3,12 +3,12 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
-use super::network_contract::{PeerFingerprint, TenantId};
+use super::peering_contract::{PeerFingerprint, TenantId};
 
 /// Ingest channel item: (event_id, blob, recorded_by_tenant_id).
 ///
-/// Shared between network, replication, and event_runtime layers so that
-/// callers never import event_runtime internals directly.
+/// Shared between peering, sync, and event_pipeline layers so that
+/// callers never import event_pipeline internals directly.
 pub type IngestItem = ([u8; 32], Vec<u8>, String);
 
 /// Batch writer entry point.  Blocks the calling thread draining `rx` and
@@ -19,8 +19,8 @@ pub type BatchWriterFn = fn(String, mpsc::Receiver<IngestItem>, Arc<AtomicU64>);
 /// Returns the number of items successfully drained.
 pub type DrainQueueFn = fn(&str, &str, usize) -> usize;
 
-/// Bundled ingest function pointers for the network layer.
-/// Passed from the composition root to avoid leaking event-runtime details.
+/// Bundled ingest function pointers for the peering layer.
+/// Passed from the composition root to avoid leaking event-pipeline details.
 #[derive(Clone, Copy)]
 pub struct IngestFns {
     pub batch_writer: BatchWriterFn,
@@ -56,7 +56,7 @@ pub trait IngestSink: Send + Sync {
     ) -> Result<(), IngestError>;
 }
 
-pub trait ReplicationStore: Send + Sync {
+pub trait SyncStore: Send + Sync {
     fn enqueue_outbound(&self, peer: &PeerFingerprint, ids: &[[u8; 32]]) -> Result<(), StoreError>;
 
     fn claim_outbound(

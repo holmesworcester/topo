@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tracing::{error, warn};
 
-use crate::contracts::event_runtime_contract::IngestItem;
+use crate::contracts::event_pipeline_contract::IngestItem;
 use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
 use crate::db::open_connection;
 use crate::db::project_queue::ProjectQueue;

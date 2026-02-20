@@ -5,8 +5,8 @@ use std::net::SocketAddr;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::contracts::event_runtime_contract::{BatchWriterFn, IngestFns};
-use crate::contracts::network_contract::{
+use crate::contracts::event_pipeline_contract::{BatchWriterFn, IngestFns};
+use crate::contracts::peering_contract::{
     next_session_id, PeerFingerprint, SessionDirection, SessionHandler, SessionMeta, TenantId,
 };
 use crate::db::health::{purge_expired_endpoints, record_endpoint_observation};
@@ -16,7 +16,7 @@ use crate::db::removal_watch::is_peer_removed;
 use crate::db::schema::create_tables;
 use crate::db::store::lookup_workspace_id;
 use crate::db::transport_trust::record_transport_binding;
-use crate::sync::ReplicationSessionHandler;
+use crate::sync::SyncSessionHandler;
 use crate::transport::{peer_identity_from_connection, DualConnection, QuicTransportSessionIo};
 
 use super::{
@@ -103,7 +103,7 @@ async fn connect_loop_inner(
         }
     };
     let initiator_handler =
-        ReplicationSessionHandler::initiator(db_path.to_string(), SYNC_SESSION_TIMEOUT_SECS, batch_writer_fn);
+        SyncSessionHandler::initiator(db_path.to_string(), SYNC_SESSION_TIMEOUT_SECS, batch_writer_fn);
 
     loop {
         info!("Connecting to {}...", remote);

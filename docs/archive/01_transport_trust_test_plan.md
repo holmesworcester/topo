@@ -1,5 +1,7 @@
 # Stream 1: Transport Trust Test Modernization
 
+> **Historical document; file paths and module names may not match the current source tree.**
+
 ## Goal
 
 Reduce prototype-style cert pinning assumptions in test flows and move tests toward identity-derived trust behavior, while preserving a small explicit cert-pinning coverage set.

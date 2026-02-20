@@ -1,5 +1,7 @@
 # Stream 5: Docs and Archive Hygiene
 
+> **Historical document; file paths and module names may not match the current source tree.**
+
 ## Goal
 
 Make active docs accurate and compact; move branch-review/prototype artifacts into archive so contributors use one mature source of truth.

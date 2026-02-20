@@ -4009,7 +4009,7 @@ async fn test_run_node_multitenant_outbound_isolation() {
         DynamicAllowFn,
     };
     use topo::peering::loops::accept_loop_with_ingest;
-    use topo::contracts::event_runtime_contract::IngestItem;
+    use topo::contracts::event_pipeline_contract::IngestItem;
     use topo::event_pipeline::batch_writer;
     use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
     use rustls::sign::CertifiedKey;

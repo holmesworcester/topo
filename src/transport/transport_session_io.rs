@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use crate::contracts::network_contract::{
+use crate::contracts::peering_contract::{
     ControlIo, DataRecvIo, DataSendIo, TransportSessionIo, TransportSessionIoError, TransportSessionIoParts,
 };
 use crate::protocol::wire::ParseError;

@@ -7,8 +7,8 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::contracts::event_runtime_contract::BatchWriterFn;
-use crate::contracts::network_contract::{
+use crate::contracts::event_pipeline_contract::BatchWriterFn;
+use crate::contracts::peering_contract::{
     PeerFingerprint, SessionDirection, SessionHandler, SessionMeta, TenantId, TrustDecision,
     TrustOracle,
 };
@@ -17,8 +17,8 @@ use crate::db::{
     intro::{insert_intro_attempt, intro_already_seen, update_intro_status},
     open_connection,
 };
-use crate::contracts::network_contract::next_session_id;
-use crate::sync::ReplicationSessionHandler;
+use crate::contracts::peering_contract::next_session_id;
+use crate::sync::SyncSessionHandler;
 use crate::protocol::{parse_frame, Frame};
 use crate::transport::{
     peer_identity_from_connection, DualConnection, SqliteTrustOracle, QuicTransportSessionIo,
@@ -348,7 +348,7 @@ async fn run_sync_on_punched_connection(
         remote_addr: connection.remote_address(),
         direction: SessionDirection::Outbound,
     };
-    let handler = ReplicationSessionHandler::initiator(db_path.to_string(), 60, batch_writer);
+    let handler = SyncSessionHandler::initiator(db_path.to_string(), 60, batch_writer);
     let io = QuicTransportSessionIo::new(session_id, conn);
 
     if let Err(e) = handler
