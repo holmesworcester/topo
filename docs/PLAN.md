@@ -2296,8 +2296,9 @@ Moved event-specific command (create), query helpers, and **projector functions*
 - `dispatch_pure_projector` in `apply.rs` uses registry lookup — no central match statement
 - Deleted: `src/projection/projectors.rs` (content event splay) and `src/projection/identity.rs` (identity event splay)
 
-**New dispatch layer:**
-- `src/event_modules/dispatch.rs` — `EventCommand` enum + `execute_command()` for typed command routing
+**Service routing (dispatch retired):**
+- Service routes directly to event-module command/query APIs.
+- `src/event_modules/dispatch.rs` was removed to avoid a second service routing surface.
 
 **Shared utilities added to `src/crypto/mod.rs`:**
 - `event_id_from_hex()` — parse hex event ID
@@ -2305,11 +2306,11 @@ Moved event-specific command (create), query helpers, and **projector functions*
 
 ### 19.3 Service-to-event-module locality (Option 5)
 
-Moved response types and conn-level service functions into event modules, making service.rs orchestration-only for event domains.
+Moved response types and event-local command/query ownership into event modules, making service.rs orchestration-only for event domains.
 
 **Event modules gained (Option 5):**
 - Response types (`MessageItem`, `MessagesResponse`, `SendResponse`, `ReactResponse`, `ReactionItem`) — owned by event modules, re-exported by service.rs
-- High-level conn-level helpers (`send_conn`, `react_conn`, `delete_message_conn`, `remove_user_conn`, `messages_conn`, `reactions_conn`) — combine event creation/query with response assembly
+- Event-local command/query APIs used directly by service (`create`, `send`, `list`, `count`, `resolve`, etc.)
 
 **Module split pattern applied:**
 - `message` module converted from flat file to directory (`message/{mod,wire,commands,queries}.rs`) as the pilot for the split pattern
@@ -2319,21 +2320,21 @@ Moved response types and conn-level service functions into event modules, making
 
 | service.rs function | Delegates to |
 |---|---|
-| `svc_send_conn` | `message::send_conn` |
-| `svc_messages_conn` | `message::messages_conn` |
-| `svc_react_conn` | `reaction::react_conn` |
-| `svc_reactions_conn` | `reaction::reactions_conn` |
-| `svc_reactions_for_message_conn` | `reaction::query_for_message` |
-| `svc_delete_message_conn` | `message_deletion::delete_message_conn` |
-| `svc_deleted_message_ids_conn` | `message_deletion::query_deleted_ids` |
-| `svc_remove_user_conn` | `user_removed::remove_user_conn` |
-| `svc_message_event_id_by_num_conn` | `message::resolve_by_number` |
-| `resolve_message_selector` | `message::resolve_selector` |
-| `svc_status_conn` message/reaction counts | `message::query_count` + `reaction::query_count` |
-| `query_field` message/reaction counts | `message::query_count` + `reaction::query_count` |
-| `svc_users_conn` | `user::query_list` |
-| `svc_keys_conn` counts | `peer_shared::query_count` + `admin::query_count` + `transport_key::query_count` |
-| `svc_workspaces_conn` | `workspace::query_list` |
+| `svc_send_conn` | `message::send` |
+| `svc_messages_conn` | `message::list` |
+| `svc_react_conn` | `reaction::react` |
+| `svc_reactions_conn` | `reaction::list` |
+| `svc_reactions_for_message_conn` | `reaction::list_for_message` |
+| `svc_delete_message_conn` | `message_deletion::delete_message` |
+| `svc_deleted_message_ids_conn` | `message_deletion::list_deleted_ids` |
+| `svc_remove_user_conn` | `user_removed::remove_user` |
+| `svc_message_event_id_by_num_conn` | `message::resolve_number` |
+| `resolve_message_selector` | `message::resolve` |
+| `svc_status_conn` message/reaction counts | `message::count` + `reaction::count` |
+| `query_field` message/reaction counts | `message::count` + `reaction::count` |
+| `svc_users_conn` | `user::list` |
+| `svc_keys_conn` counts | `user::count` + `peer_shared::count` + `admin::count` + `transport_key::count` |
+| `svc_workspaces_conn` | `workspace::list` |
 
 ### 19.5 What service.rs retains
 

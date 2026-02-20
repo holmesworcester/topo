@@ -1075,7 +1075,7 @@ These rules are mandatory. Violations must be fixed before merge.
 
 2. **Service orchestration-only rule**: `service.rs` is a thin orchestrator. It handles DB open/close, auth/key loading, cross-module composition, non-event-specific logic (identity bootstrap, invite flows, predicate/assert), and error mapping. It must not contain event-type-specific SQL — it calls event-module APIs.
 
-3. **Registry-driven routing rule**: Both commands and queries flow through typed dispatch enums in `src/event_modules/dispatch.rs` (`EventCommand`, `EventQuery`). The service layer routes through these for event-local operations. Module internals remain the true behavior owners.
+3. **Direct module routing rule**: Service routes event-local operations directly to event-module command/query APIs (for example: `message::send`, `reaction::list`, `workspace::name`). There is no central `EventCommand`/`EventQuery` service dispatcher.
 
 4. **Module split rule**: When an event module exceeds ~300-400 LOC or mixes 3+ concerns, split into a directory module (see 14.3).
 
@@ -1106,7 +1106,7 @@ The service layer (`src/service.rs`) is a thin orchestrator:
 - Non-event-specific logic (identity bootstrap, invite flows, predicate/assert system)
 - Error mapping from module results to `ServiceError`
 
-## 14.3 Registry-driven dispatch
+## 14.3 Routing pattern
 
 ### Projector dispatch
 
@@ -1116,13 +1116,24 @@ The service layer (`src/service.rs`) is a thin orchestrator:
 fn(&str, &str, &ParsedEvent, &ContextSnapshot) -> ProjectorResult
 ```
 
-### Command dispatch
+### Service command routing
 
-`src/event_modules/dispatch.rs` provides `EventCommand` enum and `execute_command()` that routes creation to the appropriate event module.
+Service command handlers call event-module command APIs directly. Example flows:
 
-### Query dispatch
+- `svc_send_conn` -> `message::send`
+- `svc_react_conn` -> `reaction::react`
+- `svc_delete_message_conn` -> `message_deletion::delete_message`
+- `svc_remove_user_conn` -> `user_removed::remove_user`
 
-`src/event_modules/dispatch.rs` provides `EventQuery` enum and `execute_query()` that routes read operations to the appropriate event module. Query variants cover: message list/count/resolve, reaction list/count/list-with-authors, deletion list, user list/first, workspace list/name, peer_shared list/accounts, admin list.
+### Service query routing
+
+Service query handlers call event-module query APIs directly. Example flows:
+
+- `svc_messages_conn` -> `message::list`
+- `svc_reactions_conn` -> `reaction::list`
+- `svc_users_conn` -> `user::list`
+- `svc_workspaces_conn` -> `workspace::list`
+- `svc_keys_conn` -> `user::count`, `peer_shared::count`, `admin::count`, `transport_key::count`
 
 ## 14.4 Module split rule
 
@@ -1164,7 +1175,7 @@ When adding a new event type:
 3. Add `CreateXxxCmd` + `create()` for command paths.
 4. Add `query_*()` functions for any projection-table queries.
 5. Add response types and conn-level helpers in the event module.
-6. Add `EventCommand` and/or `EventQuery` variants to `dispatch.rs` if the type participates in dispatch.
+6. Wire service call sites directly to the new module command/query APIs where relevant.
 7. Wire service.rs to call the event module functions, mapping errors to `ServiceError`.
 
 **Rule**: Event projection semantics MUST live in event modules, not in central projector files. The pipeline must not contain event-type-specific logic beyond context snapshot construction.
