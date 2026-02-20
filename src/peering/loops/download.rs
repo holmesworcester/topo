@@ -109,8 +109,7 @@ pub async fn download_from_sources(
             db_path.clone(),
             SYNC_SESSION_TIMEOUT_SECS,
             peer_coord.clone(),
-            Some(ingest_tx.clone()),
-            batch_writer_fn,
+            ingest_tx.clone(),
         );
 
         handles.push(std::thread::spawn(move || {

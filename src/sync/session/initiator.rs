@@ -11,7 +11,7 @@ use negentropy::{Id, Negentropy, Storage};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::contracts::event_pipeline_contract::{BatchWriterFn, IngestItem};
+use crate::contracts::event_pipeline_contract::IngestItem;
 use crate::crypto::EventId;
 use crate::db::{
     egress_queue::EgressQueue,
@@ -28,7 +28,7 @@ use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
 use super::coordinator::PeerCoord;
 use super::receiver::spawn_data_receiver;
 use super::{
-    session_ingest_cap, CONTROL_POLL_TIMEOUT, DATA_DRAIN_TIMEOUT, EGRESS_CLAIM_COUNT,
+    CONTROL_POLL_TIMEOUT, DATA_DRAIN_TIMEOUT, EGRESS_CLAIM_COUNT,
     EGRESS_SENT_TTL_MS, ENQUEUE_BATCH, HAVE_CHUNK, NEED_CHUNK,
     NEGENTROPY_FRAME_SIZE,
 };
@@ -42,8 +42,8 @@ use super::{
 /// them to the coordinator for load-balanced assignment across peers.
 /// When coordination is None, requests all need_ids directly.
 ///
-/// When `shared_ingest` is provided, events are sent to the shared channel
-/// instead of spawning a per-session batch_writer.
+/// Callers must provide a `shared_ingest` sender connected to a shared
+/// batch_writer. The session never spawns its own writer thread.
 pub async fn run_sync_initiator<C, S, R>(
     conn: DualConnection<C, S, R>,
     db_path: &str,
@@ -51,8 +51,7 @@ pub async fn run_sync_initiator<C, S, R>(
     peer_id: &str,
     recorded_by: &str,
     coordination: Option<&PeerCoord>,
-    shared_ingest: Option<mpsc::Sender<IngestItem>>,
-    batch_writer_fn: BatchWriterFn,
+    shared_ingest: mpsc::Sender<IngestItem>,
 ) -> Result<SyncStats, Box<dyn std::error::Error + Send + Sync>>
 where
     C: StreamConn,
@@ -97,20 +96,7 @@ where
     let events_received = Arc::new(AtomicU64::new(0));
     let bytes_received = Arc::new(AtomicU64::new(0));
 
-    // Use shared ingest channel if provided, otherwise create per-session batch_writer
-    let (ingest_tx, writer_handle) = if let Some(shared_tx) = shared_ingest {
-        (shared_tx, None)
-    } else {
-        let ingest_cap = session_ingest_cap();
-        let (tx, rx) = mpsc::channel::<IngestItem>(ingest_cap);
-        let events_received_writer = events_received.clone();
-        let db_path_owned = db_path.to_string();
-        let bw = batch_writer_fn;
-        let handle = tokio::task::spawn_blocking(move || {
-            bw(db_path_owned, rx, events_received_writer)
-        });
-        (tx, Some(handle))
-    };
+    let ingest_tx = shared_ingest;
 
     let mut have_ids: Vec<Id> = Vec::new();
     let mut need_ids: Vec<Id> = Vec::new();
@@ -350,9 +336,6 @@ where
     let _ = shutdown_tx.send(());
     let _ = recv_handle.await;
     drop(ingest_tx);
-    if let Some(handle) = writer_handle {
-        let _ = handle.await;
-    }
 
     let stats = SyncStats {
         events_sent,

@@ -64,5 +64,3 @@ pub(super) const COORDINATOR_POLL_INTERVAL: Duration = Duration::from_millis(10)
 
 /// Coordinator poll interval within the collection window.
 pub(super) const COORDINATOR_COLLECTION_POLL: Duration = Duration::from_millis(2);
-
-pub(super) use crate::tuning::session_ingest_cap;

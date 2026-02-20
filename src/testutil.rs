@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -41,7 +42,7 @@ pub fn noop_intro_spawner(
     _peer_id: String,
     _endpoint: quinn::Endpoint,
     _client_config: Option<quinn::ClientConfig>,
-    _batch_writer: crate::contracts::event_pipeline_contract::BatchWriterFn,
+    _shared_ingest: tokio::sync::mpsc::Sender<crate::contracts::event_pipeline_contract::IngestItem>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_local(async {})
 }
@@ -2090,9 +2091,27 @@ pub async fn connect_sync_once(
     conn.flush_control().await?;
     conn.flush_data().await?;
 
+    // Shared writer for this one-shot initiator session.
+    let (ingest_tx, ingest_rx) =
+        tokio::sync::mpsc::channel::<crate::contracts::event_pipeline_contract::IngestItem>(5000);
+    let writer_events = Arc::new(AtomicU64::new(0));
+    let writer_db = db_path.to_string();
+    let writer_handle = std::thread::spawn(move || {
+        crate::event_pipeline::batch_writer(writer_db, ingest_rx, writer_events);
+    });
+
     let stats = run_sync_initiator(
-        conn, db_path, SYNC_SESSION_TIMEOUT_SECS, &peer_id, identity, None, None, crate::event_pipeline::batch_writer,
-    ).await?;
+        conn,
+        db_path,
+        SYNC_SESSION_TIMEOUT_SECS,
+        &peer_id,
+        identity,
+        None,
+        ingest_tx,
+    )
+    .await?;
+
+    let _ = writer_handle.join();
 
     connection.close(0u32.into(), b"done");
     endpoint.close(0u32.into(), b"done");

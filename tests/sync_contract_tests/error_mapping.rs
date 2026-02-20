@@ -16,7 +16,7 @@ use topo::protocol::Frame;
 
 use crate::fake_session_io::{
     create_test_db, empty_negentropy_storage, fake_session_io_pair,
-    fake_session_io_pair_with_config, noop_batch_writer, run_local, test_session_meta,
+    fake_session_io_pair_with_config, noop_ingest_tx, run_local, test_session_meta,
     FakeIoConfig, ProtocolViolation,
 };
 
@@ -27,7 +27,7 @@ async fn control_channel_half_close_terminates_handler() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
         let handler =
-            SyncSessionHandler::responder(db_path, 30, noop_batch_writer);
+            SyncSessionHandler::responder(db_path, 30, noop_ingest_tx());
         let meta = test_session_meta(SessionDirection::Inbound);
         let cancel = CancellationToken::new();
 
@@ -64,7 +64,7 @@ async fn abrupt_close_surfaces_connection_lost() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
         let handler =
-            SyncSessionHandler::initiator(db_path, 30, noop_batch_writer);
+            SyncSessionHandler::initiator(db_path, 30, noop_ingest_tx());
         let meta = test_session_meta(SessionDirection::Outbound);
         let cancel = CancellationToken::new();
 
@@ -109,7 +109,7 @@ async fn normal_roundtrip_completes_successfully() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
         let handler =
-            SyncSessionHandler::responder(db_path, 30, noop_batch_writer);
+            SyncSessionHandler::responder(db_path, 30, noop_ingest_tx());
         let meta = test_session_meta(SessionDirection::Inbound);
         let cancel = CancellationToken::new();
 
@@ -300,7 +300,7 @@ async fn fragmented_data_frames_handler_completes() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
         let handler =
-            SyncSessionHandler::responder(db_path, 30, noop_batch_writer);
+            SyncSessionHandler::responder(db_path, 30, noop_ingest_tx());
         let meta = test_session_meta(SessionDirection::Inbound);
         let cancel = CancellationToken::new();
 
@@ -417,7 +417,7 @@ async fn garbage_control_frame_terminates_handler() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
         let handler =
-            SyncSessionHandler::responder(db_path, 30, noop_batch_writer);
+            SyncSessionHandler::responder(db_path, 30, noop_ingest_tx());
         let meta = test_session_meta(SessionDirection::Inbound);
         let cancel = CancellationToken::new();
 
@@ -467,7 +467,7 @@ async fn duplicate_done_violation_terminates_handler() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
         let handler =
-            SyncSessionHandler::responder(db_path, 30, noop_batch_writer);
+            SyncSessionHandler::responder(db_path, 30, noop_ingest_tx());
         let meta = test_session_meta(SessionDirection::Inbound);
         let cancel = CancellationToken::new();
 

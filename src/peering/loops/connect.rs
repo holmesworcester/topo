@@ -1,11 +1,14 @@
 //! Connect-side loops: outbound QUIC connections and initiator sync sessions.
 
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::contracts::event_pipeline_contract::{BatchWriterFn, IngestFns};
+use crate::contracts::event_pipeline_contract::{IngestFns, IngestItem};
 use crate::contracts::peering_contract::{
     next_session_id, PeerFingerprint, SessionDirection, SessionHandler, SessionMeta, TenantId,
 };
@@ -20,7 +23,7 @@ use crate::sync::SyncSessionHandler;
 use crate::transport::{peer_identity_from_connection, DualConnection, QuicTransportSessionIo};
 
 use super::{
-    current_timestamp_ms, drain_batch_size, peer_fingerprint_from_hex,
+    current_timestamp_ms, drain_batch_size, peer_fingerprint_from_hex, shared_ingest_cap,
     spawn_peer_removal_cancellation_watch, IntroSpawnerFn, CONNECT_RETRY_DELAY, ENDPOINT_TTL_MS,
     SESSION_GAP, SYNC_SESSION_TIMEOUT_SECS,
 };
@@ -67,6 +70,19 @@ pub async fn connect_loop(
         }
     }
 
+    // Shared batch_writer: single writer thread for all outbound initiator
+    // sessions on this connect loop. Eliminates per-session writer overhead
+    // and SQLite WAL contention.
+    let ingest_cap = shared_ingest_cap();
+    let (shared_tx, shared_rx) = mpsc::channel::<IngestItem>(ingest_cap);
+    let shared_events = Arc::new(AtomicU64::new(0));
+    let writer_events = shared_events.clone();
+    let writer_db = db_path.to_string();
+    let bw = ingest.batch_writer;
+    let _writer_handle = std::thread::spawn(move || {
+        bw(writer_db, shared_rx, writer_events);
+    });
+
     // Use LocalSet so the intro listener (spawn_intro_listener uses spawn_local)
     // can run on the same runtime that drives the endpoint I/O.
     let local = tokio::task::LocalSet::new();
@@ -78,7 +94,7 @@ pub async fn connect_loop(
             remote,
             client_config,
             intro_spawner,
-            ingest.batch_writer,
+            shared_tx,
         ))
         .await
 }
@@ -90,7 +106,7 @@ async fn connect_loop_inner(
     remote: SocketAddr,
     client_config: Option<quinn::ClientConfig>,
     intro_spawner: IntroSpawnerFn,
-    batch_writer_fn: BatchWriterFn,
+    shared_ingest: mpsc::Sender<IngestItem>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Look up workspace SNI for this tenant (falls back to "localhost" if no trust anchor)
     let sni = {
@@ -103,7 +119,7 @@ async fn connect_loop_inner(
         }
     };
     let initiator_handler =
-        SyncSessionHandler::initiator(db_path.to_string(), SYNC_SESSION_TIMEOUT_SECS, batch_writer_fn);
+        SyncSessionHandler::initiator(db_path.to_string(), SYNC_SESSION_TIMEOUT_SECS, shared_ingest.clone());
 
     loop {
         info!("Connecting to {}...", remote);
@@ -178,7 +194,7 @@ async fn connect_loop_inner(
             peer_id.clone(),
             endpoint.clone(),
             client_config.clone(),
-            batch_writer_fn,
+            shared_ingest.clone(),
         );
 
         // Inner loop: repeated sync sessions on this connection

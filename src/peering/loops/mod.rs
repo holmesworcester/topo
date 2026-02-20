@@ -31,6 +31,9 @@ use crate::db::removal_watch::is_peer_removed;
 
 /// Function that spawns an intro listener for holepunch handling on a QUIC connection.
 /// Injected by the composition root so network/ doesn't depend on sync::punch.
+///
+/// The last parameter is a shared ingest sender — punch sessions reuse the
+/// parent loop's batch_writer instead of spawning their own.
 pub type IntroSpawnerFn = fn(
     quinn::Connection,
     String,
@@ -38,7 +41,7 @@ pub type IntroSpawnerFn = fn(
     String,
     quinn::Endpoint,
     Option<quinn::ClientConfig>,
-    crate::contracts::event_pipeline_contract::BatchWriterFn,
+    tokio::sync::mpsc::Sender<crate::contracts::event_pipeline_contract::IngestItem>,
 ) -> tokio::task::JoinHandle<()>;
 
 // ---------------------------------------------------------------------------

@@ -6,13 +6,15 @@
 //! link, runs a single negentropy sync session, and returns.
 
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use ed25519_dalek::SigningKey;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-use crate::contracts::event_pipeline_contract::BatchWriterFn;
+use crate::contracts::event_pipeline_contract::{BatchWriterFn, IngestItem};
 use crate::contracts::peering_contract::{
     next_session_id, PeerFingerprint, SessionDirection, SessionHandler, SessionMeta, TenantId,
 };
@@ -108,6 +110,15 @@ pub async fn bootstrap_sync_from_invite(
     // Stream materialization markers are now sent by
     // SyncSessionHandler::on_session for outbound sessions.
 
+    // Shared batch_writer for this one-shot bootstrap session.
+    let (ingest_tx, ingest_rx) = mpsc::channel::<IngestItem>(5000);
+    let writer_events = Arc::new(AtomicU64::new(0));
+    let writer_db = db_path.to_string();
+    let bw = batch_writer;
+    let writer_handle = std::thread::spawn(move || {
+        bw(writer_db, ingest_rx, writer_events);
+    });
+
     let peer_fp = peer_fingerprint_from_hex(&peer_id)?;
     let session_id = next_session_id();
     let meta = SessionMeta {
@@ -117,12 +128,16 @@ pub async fn bootstrap_sync_from_invite(
         remote_addr: connection.remote_address(),
         direction: SessionDirection::Outbound,
     };
-    let handler = SyncSessionHandler::initiator(db_path.to_string(), timeout_secs, batch_writer);
+    let handler = SyncSessionHandler::initiator(db_path.to_string(), timeout_secs, ingest_tx);
     let io = QuicTransportSessionIo::new(session_id, conn);
     handler
         .on_session(meta, Box::new(io), CancellationToken::new())
         .await
         .map_err(|e| format!("Bootstrap sync: {}", e))?;
+
+    // Drop handler to close the ingest channel, then join the writer thread.
+    drop(handler);
+    let _ = writer_handle.join();
 
     info!("Bootstrap sync complete");
 
@@ -162,6 +177,15 @@ pub fn start_bootstrap_responder(
     let ep = endpoint.clone();
 
     std::thread::spawn(move || {
+        // Shared batch_writer for bootstrap responder sessions.
+        let (ingest_tx, ingest_rx) = mpsc::channel::<IngestItem>(5000);
+        let writer_events = Arc::new(AtomicU64::new(0));
+        let writer_db = db_path.clone();
+        let bw = batch_writer;
+        let writer_handle = std::thread::spawn(move || {
+            bw(writer_db, ingest_rx, writer_events);
+        });
+
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -170,8 +194,13 @@ pub fn start_bootstrap_responder(
             let handler = SyncSessionHandler::responder(
                 db_path.clone(),
                 30,
-                batch_writer,
+                ingest_tx,
             );
+            // Keep connections alive until the endpoint closes so QUIC can
+            // deliver final frames (DoneAck, events) before the connection
+            // is torn down. Dropping a quinn::Connection sends
+            // CONNECTION_CLOSE which aborts in-flight stream data.
+            let mut _connections = Vec::new();
             // Accept up to 2 connections: the initial bootstrap sync and an
             // optional push-back sync where the joiner pushes its identity
             // chain events back after creation.
@@ -227,8 +256,10 @@ pub fn start_bootstrap_responder(
                 {
                     tracing::warn!("Bootstrap responder: sync error: {}", e);
                 }
+                _connections.push(connection);
             }
         });
+        let _ = writer_handle.join();
     });
 
     Ok((local_addr, endpoint))

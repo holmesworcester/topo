@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::contracts::event_pipeline_contract::{BatchWriterFn, IngestItem};
+use crate::contracts::event_pipeline_contract::IngestItem;
 use crate::contracts::peering_contract::{
     ControlIo, DataRecvIo, DataSendIo, SessionDirection, SessionHandler, TransportSessionIo,
     TransportSessionIoError, SessionMeta,
@@ -109,20 +109,22 @@ pub struct SyncSessionHandler {
     db_path: String,
     timeout_secs: u64,
     role: SessionRole,
-    shared_ingest: Option<mpsc::Sender<IngestItem>>,
+    shared_ingest: mpsc::Sender<IngestItem>,
     coordination: Option<Arc<PeerCoord>>,
-    batch_writer_fn: BatchWriterFn,
 }
 
 impl SyncSessionHandler {
-    pub fn initiator(db_path: String, timeout_secs: u64, batch_writer_fn: BatchWriterFn) -> Self {
+    pub fn initiator(
+        db_path: String,
+        timeout_secs: u64,
+        shared_ingest: mpsc::Sender<IngestItem>,
+    ) -> Self {
         Self {
             db_path,
             timeout_secs,
             role: SessionRole::Initiator,
-            shared_ingest: None,
+            shared_ingest,
             coordination: None,
-            batch_writer_fn,
         }
     }
 
@@ -130,8 +132,7 @@ impl SyncSessionHandler {
         db_path: String,
         timeout_secs: u64,
         coordination: Arc<PeerCoord>,
-        shared_ingest: Option<mpsc::Sender<IngestItem>>,
-        batch_writer_fn: BatchWriterFn,
+        shared_ingest: mpsc::Sender<IngestItem>,
     ) -> Self {
         Self {
             db_path,
@@ -139,34 +140,20 @@ impl SyncSessionHandler {
             role: SessionRole::Initiator,
             shared_ingest,
             coordination: Some(coordination),
-            batch_writer_fn,
         }
     }
 
-    pub fn responder(db_path: String, timeout_secs: u64, batch_writer_fn: BatchWriterFn) -> Self {
-        Self {
-            db_path,
-            timeout_secs,
-            role: SessionRole::Responder,
-            shared_ingest: None,
-            coordination: None,
-            batch_writer_fn,
-        }
-    }
-
-    pub fn responder_with_shared_ingest(
+    pub fn responder(
         db_path: String,
         timeout_secs: u64,
         shared_ingest: mpsc::Sender<IngestItem>,
-        batch_writer_fn: BatchWriterFn,
     ) -> Self {
         Self {
             db_path,
             timeout_secs,
             role: SessionRole::Responder,
-            shared_ingest: Some(shared_ingest),
+            shared_ingest,
             coordination: None,
-            batch_writer_fn,
         }
     }
 }
@@ -236,7 +223,6 @@ impl SessionHandler for SyncSessionHandler {
                     &tenant_id,
                     self.coordination.as_deref(),
                     self.shared_ingest.clone(),
-                    self.batch_writer_fn,
                 );
                 tokio::pin!(run);
                 tokio::select! {
@@ -254,7 +240,6 @@ impl SessionHandler for SyncSessionHandler {
                     &peer_id,
                     &tenant_id,
                     self.shared_ingest.clone(),
-                    self.batch_writer_fn,
                 );
                 tokio::pin!(run);
                 tokio::select! {

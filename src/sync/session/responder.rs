@@ -11,7 +11,7 @@ use negentropy::{Negentropy, Storage};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::contracts::event_pipeline_contract::{BatchWriterFn, IngestItem};
+use crate::contracts::event_pipeline_contract::IngestItem;
 use crate::db::{
     egress_queue::EgressQueue,
     open_connection,
@@ -25,23 +25,23 @@ use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
 
 use super::receiver::spawn_data_receiver;
 use super::{
-    session_ingest_cap, CONTROL_POLL_TIMEOUT, DATA_DRAIN_TIMEOUT, EGRESS_CLAIM_COUNT,
+    CONTROL_POLL_TIMEOUT, DATA_DRAIN_TIMEOUT, EGRESS_CLAIM_COUNT,
     EGRESS_SENT_TTL_MS, NEGENTROPY_FRAME_SIZE,
 };
 
 /// Run sync as the responder (server role) with dual streams.
 ///
-/// When `shared_ingest` is provided, events are sent to the shared channel
-/// instead of spawning a per-session batch_writer. This eliminates SQLite
-/// write contention when multiple sources sync concurrently.
+/// Callers must provide a `shared_ingest` sender connected to a shared
+/// batch_writer. The session never spawns its own writer thread.
+/// This eliminates SQLite write contention when multiple sources sync
+/// concurrently.
 pub async fn run_sync_responder<C, S, R>(
     conn: DualConnection<C, S, R>,
     db_path: &str,
     timeout_secs: u64,
     peer_id: &str,
     recorded_by: &str,
-    shared_ingest: Option<mpsc::Sender<IngestItem>>,
-    batch_writer_fn: BatchWriterFn,
+    shared_ingest: mpsc::Sender<IngestItem>,
 ) -> Result<SyncStats, Box<dyn std::error::Error + Send + Sync>>
 where
     C: StreamConn,
@@ -84,20 +84,7 @@ where
     let events_received = Arc::new(AtomicU64::new(0));
     let bytes_received = Arc::new(AtomicU64::new(0));
 
-    // Use shared ingest channel if provided, otherwise create per-session batch_writer
-    let (ingest_tx, writer_handle) = if let Some(shared_tx) = shared_ingest {
-        (shared_tx, None)
-    } else {
-        let ingest_cap = session_ingest_cap();
-        let (tx, rx) = mpsc::channel::<IngestItem>(ingest_cap);
-        let events_received_writer = events_received.clone();
-        let db_path_owned = db_path.to_string();
-        let bw = batch_writer_fn;
-        let handle = tokio::task::spawn_blocking(move || {
-            bw(db_path_owned, rx, events_received_writer)
-        });
-        (tx, Some(handle))
-    };
+    let ingest_tx = shared_ingest;
 
     let (shutdown_tx, data_drained_rx, recv_handle) = spawn_data_receiver(
         data_recv,
@@ -227,9 +214,6 @@ where
     let _ = shutdown_tx.send(());
     let _ = recv_handle.await;
     drop(ingest_tx);
-    if let Some(handle) = writer_handle {
-        let _ = handle.await;
-    }
 
     let stats = SyncStats {
         events_sent,

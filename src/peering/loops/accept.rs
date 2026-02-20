@@ -208,7 +208,7 @@ pub async fn accept_loop_with_ingest(
                     peer_id.clone(),
                     intro_endpoint,
                     intro_client_cfg,
-                    ingest.batch_writer,
+                    ingest_clone.clone(),
                 );
 
                 let peer_fp = match peer_fingerprint_from_hex(&peer_id) {
@@ -222,11 +222,10 @@ pub async fn accept_loop_with_ingest(
                         return;
                     }
                 };
-                let responder_handler = SyncSessionHandler::responder_with_shared_ingest(
+                let responder_handler = SyncSessionHandler::responder(
                     db_path_owned.clone(),
                     SYNC_SESSION_TIMEOUT_SECS,
                     ingest_clone.clone(),
-                    ingest.batch_writer,
                 );
 
                 loop {
