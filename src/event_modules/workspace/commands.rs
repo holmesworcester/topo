@@ -4,6 +4,7 @@
 //! - Creating a new workspace (full identity chain bootstrap)
 //! - Joining a workspace as a new user (invite acceptance)
 //! - Adding a new device to an existing workspace (device-link acceptance)
+//! - Creating user invites and device-link invites
 //!
 //! Service.rs calls these for event-domain work; transport/sync orchestration
 //! stays in service.
@@ -293,6 +294,126 @@ pub fn persist_link_signer_secrets(
         &link.peer_shared_key,
     )?;
     Ok(())
+}
+
+// ─── 3.1 Create user invite ───
+
+/// Result of creating a user or device-link invite.
+pub struct InviteResult {
+    pub invite_link: String,
+    pub invite_event_id: EventId,
+}
+
+/// Create a user invite for the workspace.
+///
+/// Event-domain logic: ensures content key material → creates invite event chain
+/// (UserInviteBoot + optional wrapped content key) → formats invite link.
+pub fn create_user_invite(
+    db: &Connection,
+    recorded_by: &str,
+    workspace_key: &SigningKey,
+    workspace_id: &EventId,
+    peer_shared_key: &SigningKey,
+    peer_shared_event_id: &EventId,
+    bootstrap_addr: &str,
+    bootstrap_spki: &[u8; 32],
+) -> Result<InviteResult, Box<dyn std::error::Error + Send + Sync>> {
+    let _ = crate::identity::ops::ensure_content_key_for_peer(
+        db,
+        recorded_by,
+        peer_shared_key,
+        peer_shared_event_id,
+    )?;
+
+    let ctx = crate::identity::ops::InviteBootstrapContext {
+        bootstrap_addr,
+        bootstrap_spki,
+    };
+    let invite = crate::identity::ops::create_user_invite(
+        db,
+        recorded_by,
+        workspace_key,
+        workspace_id,
+        Some(peer_shared_key),
+        Some(peer_shared_event_id),
+        Some(&ctx),
+    )?;
+
+    let invite_link =
+        crate::identity::invite_link::create_invite_link(&invite, bootstrap_addr, bootstrap_spki)?;
+
+    Ok(InviteResult {
+        invite_link,
+        invite_event_id: invite.invite_event_id,
+    })
+}
+
+// ─── 3.2 Create device-link invite ───
+
+/// Create a device-link invite for an existing user.
+///
+/// Event-domain logic: creates device invite event (DeviceInviteFirst) →
+/// formats invite link.
+pub fn create_device_link_invite(
+    db: &Connection,
+    recorded_by: &str,
+    user_key: &SigningKey,
+    user_event_id: &EventId,
+    workspace_id: &EventId,
+    bootstrap_addr: &str,
+    bootstrap_spki: &[u8; 32],
+) -> Result<InviteResult, Box<dyn std::error::Error + Send + Sync>> {
+    let ctx = crate::identity::ops::InviteBootstrapContext {
+        bootstrap_addr,
+        bootstrap_spki,
+    };
+    let invite = crate::identity::ops::create_device_link_invite(
+        db,
+        recorded_by,
+        user_key,
+        user_event_id,
+        workspace_id,
+        Some(&ctx),
+    )?;
+
+    let invite_link =
+        crate::identity::invite_link::create_invite_link(&invite, bootstrap_addr, bootstrap_spki)?;
+
+    Ok(InviteResult {
+        invite_link,
+        invite_event_id: invite.invite_event_id,
+    })
+}
+
+// ─── 3.3 Key loading helpers ───
+
+/// Load workspace signing key from local signer material.
+///
+/// Returns the workspace event ID and signing key, or None if not found.
+pub fn load_workspace_signing_key(
+    db: &Connection,
+    recorded_by: &str,
+) -> Result<Option<(EventId, SigningKey)>, Box<dyn std::error::Error + Send + Sync>> {
+    use rusqlite::OptionalExtension;
+    if let Some((eid_b64, key_bytes)) = db
+        .query_row(
+            "SELECT signer_event_id, private_key FROM local_signer_material
+             WHERE recorded_by = ?1 AND signer_kind = 1
+             LIMIT 1",
+            rusqlite::params![recorded_by],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
+        .optional()?
+    {
+        let key_arr: [u8; 32] = key_bytes
+            .try_into()
+            .map_err(|_| "bad signing key length in local signer table")?;
+        let signing_key = SigningKey::from_bytes(&key_arr);
+        let eid = crate::crypto::event_id_from_base64(&eid_b64)
+            .ok_or("bad workspace signer event_id")?;
+        return Ok(Some((eid, signing_key)));
+    }
+    Ok(None)
 }
 
 // ─── Private helpers ───

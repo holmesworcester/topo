@@ -958,36 +958,21 @@ pub fn svc_create_invite_conn(
     bootstrap_addr: &str,
     bootstrap_spki: &[u8; 32],
 ) -> ServiceResult<CreateInviteResponse> {
-    let _ = crate::identity::ops::ensure_content_key_for_peer(
-        db,
-        recorded_by,
-        peer_shared_key,
-        peer_shared_event_id,
-    )
-    .map_err(|e| ServiceError(format!("Failed to ensure content key: {}", e)))?;
-
-    let ctx = crate::identity::ops::InviteBootstrapContext {
-        bootstrap_addr,
-        bootstrap_spki,
-    };
-    let invite = crate::identity::ops::create_user_invite(
+    let result = workspace::commands::create_user_invite(
         db,
         recorded_by,
         workspace_key,
         workspace_id,
-        Some(peer_shared_key),
-        Some(peer_shared_event_id),
-        Some(&ctx),
+        peer_shared_key,
+        peer_shared_event_id,
+        bootstrap_addr,
+        bootstrap_spki,
     )
     .map_err(|e| ServiceError(format!("Failed to create invite: {}", e)))?;
 
-    let invite_link =
-        crate::identity::invite_link::create_invite_link(&invite, bootstrap_addr, bootstrap_spki)
-            .map_err(|e| ServiceError(format!("Failed to create invite link: {}", e)))?;
-
     Ok(CreateInviteResponse {
-        invite_link,
-        invite_event_id: event_id_to_base64(&invite.invite_event_id),
+        invite_link: result.invite_link,
+        invite_event_id: event_id_to_base64(&result.invite_event_id),
     })
 }
 
@@ -1001,27 +986,20 @@ pub fn svc_create_device_link_invite_conn(
     bootstrap_addr: &str,
     bootstrap_spki: &[u8; 32],
 ) -> ServiceResult<CreateInviteResponse> {
-    let ctx = crate::identity::ops::InviteBootstrapContext {
-        bootstrap_addr,
-        bootstrap_spki,
-    };
-    let invite = crate::identity::ops::create_device_link_invite(
+    let result = workspace::commands::create_device_link_invite(
         db,
         recorded_by,
         user_key,
         user_event_id,
         workspace_id,
-        Some(&ctx),
+        bootstrap_addr,
+        bootstrap_spki,
     )
     .map_err(|e| ServiceError(format!("Failed to create device link invite: {}", e)))?;
 
-    let invite_link =
-        crate::identity::invite_link::create_invite_link(&invite, bootstrap_addr, bootstrap_spki)
-            .map_err(|e| ServiceError(format!("Failed to create invite link: {}", e)))?;
-
     Ok(CreateInviteResponse {
-        invite_link,
-        invite_event_id: event_id_to_base64(&invite.invite_event_id),
+        invite_link: result.invite_link,
+        invite_event_id: event_id_to_base64(&result.invite_event_id),
     })
 }
 
@@ -1288,79 +1266,34 @@ pub fn svc_create_invite(
     let (recorded_by, db) =
         open_db_load(db_path).map_err(|e| ServiceError(format!("No transport identity: {}", e)))?;
 
-    // Load workspace key from local_peer_signers + workspace lookup
-    let workspace_id = db
-        .query_row(
-            "SELECT workspace_id FROM trust_anchors WHERE peer_id = ?1",
-            [&recorded_by],
-            |row| row.get::<_, String>(0),
-        )
-        .map_err(|_| ServiceError("No workspace found. Bootstrap a workspace first.".into()))?;
-
-    let ws_eid = event_id_from_base64(&workspace_id)
-        .ok_or_else(|| ServiceError("Invalid workspace_id in trust_anchors".into()))?;
-
-    // Load workspace signing key from projection-owned local_signer_material
-    let ws_key_bytes: Vec<u8> = db
-        .query_row(
-            "SELECT private_key FROM local_signer_material
-             WHERE recorded_by = ?1 AND signer_kind = 1
-             LIMIT 1",
-            [&recorded_by],
-            |row| row.get(0),
-        )
-        .map_err(|_| {
-            ServiceError(
-                "No workspace signing key found. Only workspace creators can invite.".into(),
-            )
-        })?;
-
-    if ws_key_bytes.len() != 32 {
-        return Err(ServiceError("Corrupt workspace key".into()));
-    }
-    let mut key_arr = [0u8; 32];
-    key_arr.copy_from_slice(&ws_key_bytes);
-    let workspace_key = SigningKey::from_bytes(&key_arr);
+    let ws_eid = resolve_workspace_for_peer(&db, &recorded_by)?;
+    let (_ws_signer_eid, workspace_key) =
+        workspace::commands::load_workspace_signing_key(&db, &recorded_by)
+            .map_err(|e| ServiceError(format!("{}", e)))?
+            .ok_or_else(|| {
+                ServiceError(
+                    "No workspace signing key found. Only workspace creators can invite.".into(),
+                )
+            })?;
 
     let (sender_peer_eid, sender_peer_key) = load_local_peer_signer(&db, &recorded_by)?
         .ok_or_else(|| ServiceError("No local peer signer found for invite creation.".into()))?;
-    let _ = crate::identity::ops::ensure_content_key_for_peer(
-        &db,
-        &recorded_by,
-        &sender_peer_key,
-        &sender_peer_eid,
-    )
-    .map_err(|e| ServiceError(format!("Failed to ensure content key: {}", e)))?;
 
     // Get local SPKI for the bootstrap address
-    let spki_hex = &recorded_by;
-    let spki_bytes = hex::decode(spki_hex)?;
+    let spki_bytes = hex::decode(&recorded_by)?;
     let mut bootstrap_spki = [0u8; 32];
     bootstrap_spki.copy_from_slice(&spki_bytes);
 
-    let ctx = crate::identity::ops::InviteBootstrapContext {
-        bootstrap_addr,
-        bootstrap_spki: &bootstrap_spki,
-    };
-    let invite = crate::identity::ops::create_user_invite(
+    svc_create_invite_conn(
         &db,
         &recorded_by,
         &workspace_key,
         &ws_eid,
-        Some(&sender_peer_key),
-        Some(&sender_peer_eid),
-        Some(&ctx),
+        &sender_peer_key,
+        &sender_peer_eid,
+        bootstrap_addr,
+        &bootstrap_spki,
     )
-    .map_err(|e| ServiceError(format!("Failed to create invite: {}", e)))?;
-
-    let invite_link =
-        crate::identity::invite_link::create_invite_link(&invite, bootstrap_addr, &bootstrap_spki)
-            .map_err(|e| ServiceError(format!("Failed to create invite link: {}", e)))?;
-
-    Ok(CreateInviteResponse {
-        invite_link,
-        invite_event_id: event_id_to_base64(&invite.invite_event_id),
-    })
 }
 
 /// Accept a user invite via bootstrap sync + identity chain creation.
@@ -1653,42 +1586,20 @@ pub fn svc_create_invite_with_spki(
     let (recorded_by, db) =
         open_db_load(db_path).map_err(|e| ServiceError(format!("No transport identity: {}", e)))?;
 
-    let workspace_id = db
-        .query_row(
-            "SELECT workspace_id FROM trust_anchors WHERE peer_id = ?1",
-            [&recorded_by],
-            |row| row.get::<_, String>(0),
-        )
-        .map_err(|_| ServiceError("No workspace found. Bootstrap a workspace first.".into()))?;
-
-    let ws_eid = event_id_from_base64(&workspace_id)
-        .ok_or_else(|| ServiceError("Invalid workspace_id in trust_anchors".into()))?;
-
-    let ws_key_bytes: Vec<u8> = db
-        .query_row(
-            "SELECT private_key FROM local_signer_material
-             WHERE recorded_by = ?1 AND signer_kind = 1
-             LIMIT 1",
-            [&recorded_by],
-            |row| row.get(0),
-        )
-        .map_err(|_| ServiceError("No workspace signing key found.".into()))?;
-
-    if ws_key_bytes.len() != 32 {
-        return Err(ServiceError("Corrupt workspace key".into()));
-    }
-    let mut key_arr = [0u8; 32];
-    key_arr.copy_from_slice(&ws_key_bytes);
-    let workspace_key = SigningKey::from_bytes(&key_arr);
+    let ws_eid = resolve_workspace_for_peer(&db, &recorded_by)?;
+    let (_ws_signer_eid, workspace_key) =
+        workspace::commands::load_workspace_signing_key(&db, &recorded_by)
+            .map_err(|e| ServiceError(format!("{}", e)))?
+            .ok_or_else(|| ServiceError("No workspace signing key found.".into()))?;
 
     let (sender_peer_eid, sender_peer_key) = load_local_peer_signer(&db, &recorded_by)?
         .ok_or_else(|| ServiceError("No local peer signer found.".into()))?;
 
     let spki_bytes = hex::decode(public_spki_hex)?;
-    let mut bootstrap_spki = [0u8; 32];
     if spki_bytes.len() != 32 {
         return Err(ServiceError("SPKI must be 32 bytes hex".into()));
     }
+    let mut bootstrap_spki = [0u8; 32];
     bootstrap_spki.copy_from_slice(&spki_bytes);
 
     svc_create_invite_conn(
