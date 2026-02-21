@@ -214,15 +214,33 @@ pub(crate) fn build_tenant_client_config(
 // Bootstrap autodial refresher
 // ---------------------------------------------------------------------------
 
+/// Dispatch a bootstrap dial target through `PeerDispatcher`.
+///
+/// Uses `"{tenant_id}@bootstrap"` as the dispatch key so bootstrap targets
+/// share the same dedup/reconnect mechanism as mDNS discovery targets.
+/// Returns `true` if a new connect loop should be spawned.
+pub(crate) fn dispatch_bootstrap_target(
+    dispatcher: &mut PeerDispatcher,
+    tenant_id: &str,
+    remote: SocketAddr,
+) -> bool {
+    let key = format!("{}@bootstrap", tenant_id);
+    let (action, _cancel_rx) = dispatcher.dispatch(&key, remote);
+    matches!(action, DiscoveryAction::Connect | DiscoveryAction::Reconnect)
+}
+
 /// Spawns a background thread that polls for new bootstrap autodial targets
 /// every second and starts connect loops for them. This is the primary
 /// mechanism by which the runtime discovers and connects to bootstrap peers
 /// after an invite is accepted (projection materializes trust rows -> autodial
 /// picks them up -> connect loop syncs prerequisites).
+///
+/// Uses `PeerDispatcher` for dedup/reconnect, the same dispatch mechanism
+/// used by mDNS discovery (R3/SC3 single-owner dispatch).
 pub(crate) fn spawn_bootstrap_refresher(
     db_path: String,
     endpoint: quinn::Endpoint,
-    mut launched: HashSet<(String, SocketAddr)>,
+    mut dispatcher: PeerDispatcher,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
 ) {
@@ -230,8 +248,7 @@ pub(crate) fn spawn_bootstrap_refresher(
         match collect_all_bootstrap_targets(&db_path) {
             Ok(targets) => {
                 for (tenant_id, remote) in targets {
-                    let key = (tenant_id.clone(), remote);
-                    if !launched.insert(key) {
+                    if !dispatch_bootstrap_target(&mut dispatcher, &tenant_id, remote) {
                         continue;
                     }
                     let cfg = match build_tenant_client_config(&db_path, &tenant_id) {

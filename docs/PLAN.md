@@ -1935,28 +1935,37 @@ Extracted from `accept_loop` to accept an external shared ingest channel. The ex
 
 ## 17.4 Node Daemon
 
-### 17.4.1 `src/node.rs`
+### 17.4.1 Runtime loop model
+
+The peering runtime (`src/peering/runtime/mod.rs::run_node`) implements a single conceptual loop:
+
+1. **Projected SQLite state**: `invite_bootstrap_trust` rows, PeerShared-derived trust, endpoint observations.
+2. **Target planner** (`src/peering/runtime/target_planner.rs`): single-owner module for all dial target planning. Collects bootstrap trust targets from SQL (`collect_all_bootstrap_targets`) and mDNS discovery candidates. Both sources dispatch through `PeerDispatcher` for dedup/reconnect.
+3. **Dial/accept supervisors**: `connect_loop` (outbound) and `accept_loop` (inbound) in `src/peering/loops/`. Manage QUIC connection lifecycle.
+4. **Transport↔peering seam**: `src/peering/loops/mod.rs::run_session` centralizes QUIC-to-session wiring (DualConnection, SessionMeta, QuicTransportSessionIo construction). Both accept and connect loops call this.
+5. **Sync session runner**: `SyncSessionHandler` (protocol-agnostic, invoked via `SessionHandler` contract).
+6. **Ingest writer** (`batch_writer`): single shared thread consuming `IngestItem` tuples, triggering projection cascade → back to step 1.
+
+### 17.4.2 `run_node` startup sequence
 
 ```rust
 pub async fn run_node(
     db_path: &str,
-    bind_ip: IpAddr,
+    bind: SocketAddr,
+    net_info_tx: Option<oneshot::Sender<NodeRuntimeNetInfo>>,
+    intro_spawner: IntroSpawnerFn,
+    ingest: IngestFns,
 ) -> Result<(), Box<dyn Error + Send + Sync>>
 ```
 
 Flow:
-1. Open shared DB, `create_tables()`.
-2. `discover_local_tenants(&db)` — JOIN `trust_anchors` with `local_transport_creds`.
-3. Fail if empty: "No local identities found."
-4. Spawn ONE shared `batch_writer` thread.
-5. Per tenant:
-   - Deserialize cert/key DER into rustls types.
-   - Verify SPKI fingerprint matches `peer_id`.
-   - Create QUIC endpoint via `create_dual_endpoint_dynamic` on `(bind_ip, 0)` (auto-assign port).
-   - Build per-tenant dynamic trust closure scoped to that `recorded_by`.
-   - Spawn `accept_loop_with_ingest` with shared ingest channel.
-   - Log actual bound port.
-6. Ctrl-C → close all endpoints.
+1. `setup_endpoint_and_tenants()` — discover local tenants, build multi-workspace cert resolver, create single QUIC endpoint.
+2. Spawn ONE shared `batch_writer` thread.
+3. (if discovery enabled) `launch_mdns_discovery()` — per-tenant mDNS advertisement and browse.
+4. Spawn `accept_loop_with_ingest` with shared ingest channel.
+5. `collect_all_bootstrap_targets()` + `dispatch_bootstrap_target()` — initial bootstrap dials via `PeerDispatcher`.
+6. `spawn_bootstrap_refresher()` — ongoing poll loop for new bootstrap targets (shares `PeerDispatcher`).
+7. Ctrl-C → close all endpoints.
 
 ### 17.4.2 Per-tenant dynamic trust
 
@@ -1970,9 +1979,9 @@ let is_allowed = move |peer_fp: &str| -> bool {
 
 This queries `trust_anchors` and PeerShared-derived SPKIs for that specific `recorded_by`, enabling isolated trust policies per tenant within the same process.
 
-### 17.4.3 `PeerDispatcher`
+### 17.4.3 `PeerDispatcher` and unified target planning
 
-Tracks discovered peer addresses and manages connection lifecycle:
+`PeerDispatcher` (in `src/peering/runtime/target_planner.rs`) tracks discovered peer addresses and manages connection lifecycle:
 
 ```rust
 pub struct PeerDispatcher {
@@ -1982,9 +1991,11 @@ pub struct PeerDispatcher {
 
 `DiscoveryAction` enum routes decisions: `Skip` (already connected at same address), `Connect` (new peer), `Reconnect` (address changed — cancel old `connect_loop` via `watch` channel, spawn new one).
 
+Both bootstrap trust targets and mDNS discovery targets dispatch through `PeerDispatcher`. Bootstrap targets use `dispatch_bootstrap_target()` which generates a composite dispatch key `"{tenant_id}@bootstrap"`. This ensures a single dispatch mechanism for all target sources.
+
 ### 17.4.4 CLI integration
 
-`src/main.rs` always calls `node::run_node()` for sync (single-tenant and multi-tenant handled uniformly). RPC server still runs alongside for queries.
+`src/main.rs` always calls `run_node()` for sync (single-tenant and multi-tenant handled uniformly). RPC server still runs alongside for queries.
 
 ---
 
@@ -2023,9 +2034,9 @@ Each tenant advertises under `_topo._udp.local.` with:
 
 `local_peer_ids` (the full set of all tenants on this node) filters out self-discoveries and other local tenants. This prevents unnecessary local connections.
 
-### 17.5.3 Integration in `node.rs`
+### 17.5.3 Integration in `run_node`
 
-After creating the shared endpoint and learning its bound port, node creates `TenantDiscovery` per tenant using that shared port. On trusted discovery, `PeerDispatcher` routes to tenant-specific `connect_loop`. Feature-gated with `#[cfg(feature = "discovery")]`.
+After creating the shared endpoint and learning its bound port, `run_node` creates `TenantDiscovery` per tenant using that shared port. On trusted discovery, `PeerDispatcher` (from `target_planner.rs`) routes to tenant-specific `connect_loop`. Feature-gated with `#[cfg(feature = "discovery")]`.
 
 ### 17.5.4 DNS label truncation
 

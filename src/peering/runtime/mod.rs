@@ -9,7 +9,6 @@ mod discovery;
 mod startup;
 pub(crate) mod target_planner;
 
-use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -25,7 +24,8 @@ use crate::peering::loops::{accept_loop_with_ingest, IntroSpawnerFn};
 
 use target_planner::{
     build_tenant_client_config, collect_all_bootstrap_targets,
-    spawn_bootstrap_refresher, spawn_connect_loop_thread,
+    dispatch_bootstrap_target, spawn_bootstrap_refresher, spawn_connect_loop_thread,
+    PeerDispatcher,
 };
 use startup::setup_endpoint_and_tenants;
 
@@ -145,7 +145,7 @@ pub async fn run_node(
         warn!("BOOTSTRAP AUTODIAL DISABLED by P7_DISABLE_PLACEHOLDER_AUTODIAL");
     } else {
         let autodial_targets = collect_all_bootstrap_targets(db_path)?;
-        let mut launched_autodial: HashSet<(String, SocketAddr)> = HashSet::new();
+        let mut dispatcher = PeerDispatcher::new();
         if !autodial_targets.is_empty() {
             warn!(
                 "BOOTSTRAP AUTODIAL: launching {} invite-seeded outbound dial(s)",
@@ -153,7 +153,9 @@ pub async fn run_node(
             );
         }
         for (tenant_id, remote) in autodial_targets {
-            launched_autodial.insert((tenant_id.clone(), remote));
+            if !dispatch_bootstrap_target(&mut dispatcher, &tenant_id, remote) {
+                continue;
+            }
             let cfg = match build_tenant_client_config(db_path, &tenant_id) {
                 Ok(c) => c,
                 Err(e) => {
@@ -181,11 +183,11 @@ pub async fn run_node(
                 ingest,
             );
         }
-        // Keep polling for runtime invite acceptance
+        // Keep polling for runtime invite acceptance (shares PeerDispatcher dedup state)
         spawn_bootstrap_refresher(
             db_path.to_string(),
             connect_endpoint.clone(),
-            launched_autodial,
+            dispatcher,
             intro_spawner,
             ingest,
         );

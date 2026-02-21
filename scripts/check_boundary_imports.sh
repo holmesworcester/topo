@@ -91,7 +91,7 @@ check_no_match 'workspace::commands::add_device_to_workspace' src/event_pipeline
 # Production runtime must not depend on test bootstrap helpers (R2/SC2)
 check_no_match 'testutil::bootstrap' src/peering/
 check_no_match 'testutil::bootstrap' src/service.rs
-check_no_match 'testutil::bootstrap' src/event_pipeline/
+check_no_match 'testutil::bootstrap' src/event_pipeline.rs
 # peering/workflows must not contain bootstrap module (moved to testutil)
 check_no_match 'mod bootstrap' src/peering/workflows/
 

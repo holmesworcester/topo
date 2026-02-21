@@ -1,39 +1,54 @@
-# Feedback: identity-eventization completion review
+# Feedback: peering readability + bootstrap discovery review
 
-Date: 2026-02-20  
-Reviewed against: `docs/planning/IDENTITY_EVENTIZATION_COMPLETION_INSTRUCTIONS.md`
+Date: 2026-02-21  
+Reviewed against: `docs/planning/PEERING_READABILITY_AND_BOOTSTRAP_DISCOVERY_PLAN.md`
 
-## Final verification snapshot
+## Findings
 
-- `rg` SC1 check: no matches in `src/identity/ops.rs`.
-- `rg` SC2/SC3 legacy-call check: no matches in `src/service.rs`, `src/event_pipeline.rs`, `src/event_modules`, `tests`.
-- `bash scripts/check_boundary_imports.sh`: pass.
-- `cargo check`: pass.
-- `cargo test --lib -q`: pass (457/457).
-- `cargo test --test scenario_test -q`: pass (65/65).
+1. **Medium - R3/SC3 not fully met: bootstrap and discovery still use separate dispatch ownership paths**
+   - Why this matters: the plan requires one planner/dispatcher path for both bootstrap-trust and mDNS targets. Current code still splits ownership: bootstrap uses a `HashSet` launch guard, while mDNS uses `PeerDispatcher` with reconnect/cancel behavior.
+   - Evidence:
+     - `src/peering/runtime/mod.rs:147` (bootstrap targets collected/launched directly in `run_node`)
+     - `src/peering/runtime/target_planner.rs:222` (bootstrap refresher uses `HashSet<(tenant, addr)>` dedupe only)
+     - `src/peering/runtime/discovery.rs:78` (separate `PeerDispatcher` loop and direct `connect_loop` spawn)
+   - Risk: behavior drift between bootstrap and discovery paths (e.g., address changes for bootstrap targets do not use the same reconnect/cancel semantics), plus continued split ownership/readability cost.
+   - Action:
+     - Move dispatch decisions for bootstrap and discovery into one planner-owned dispatch API.
+     - Reuse one cancellation/reconnect policy for both sources (PeerDispatcher-style).
+     - Make `run_node` and `discovery` thin callers of that single dispatch surface.
 
-## Findings status
+2. **Medium - Boundary leak in enforcement script: `event_pipeline` path check is non-functional**
+   - Why this matters: SC2 relies on boundary checks preventing production usage of test bootstrap helpers. One check points at a non-existent path, so violations in `src/event_pipeline.rs` would not be caught.
+   - Evidence:
+     - `scripts/check_boundary_imports.sh:111` uses `src/event_pipeline/` (directory does not exist; real file is `src/event_pipeline.rs`)
+   - Risk: silent policy bypass in CI for a required ownership boundary.
+   - Action:
+     - Change that check to `src/event_pipeline.rs`.
+     - Add a guard in `check_no_match` to fail when the target path is missing, so future typos cannot silently pass.
 
-No unresolved High/Medium findings remain.
+3. **Medium - SC5 docs parity gap: `docs/PLAN.md` does not reflect the enforced loop model**
+   - Why this matters: the plan explicitly requires both `docs/DESIGN.md` and `docs/PLAN.md` to describe the exact runtime model and ownership. `docs/DESIGN.md` was updated, but `docs/PLAN.md` still documents older node-daemon framing and does not state the new 6-step loop model/ownership mapping.
+   - Evidence:
+     - Requirement: `docs/planning/PEERING_READABILITY_AND_BOOTSTRAP_DISCOVERY_PLAN.md:99` and `docs/planning/PEERING_READABILITY_AND_BOOTSTRAP_DISCOVERY_PLAN.md:127`
+     - Current `docs/PLAN.md` sections still centered on older structure: `docs/PLAN.md:1936`, `docs/PLAN.md:2028`
+   - Risk: newcomer guidance mismatch and SC5 non-compliance despite code changes.
+   - Action:
+     - Add/update a `docs/PLAN.md` section matching the enforced runtime loop:
+       1) projected SQLite state,
+       2) target planner,
+       3) dial/accept supervisors,
+       4) sync session runner,
+       5) ingest writer,
+       6) projected SQLite state.
+     - Call out canonical ownership files: `src/peering/runtime/target_planner.rs` and `src/peering/loops/mod.rs`.
 
-## Resolved findings
+## Verification run
 
-1. **Resolved (High): SC3 identity-special pipeline callout**
-   - Fixed by routing post-drain retry through generic event-module hook dispatch.
-   - Evidence: `src/event_pipeline.rs` now calls `crate::event_modules::post_drain_hooks(...)`; module-specific logic lives in `src/event_modules/mod.rs`.
-
-2. **Resolved (Medium): SC4 canonical command coverage gap**
-   - Fixed by migrating fixtures/helpers to workspace command APIs.
-   - Evidence: `src/testutil.rs` uses `workspace::commands::create_user_invite_raw` and `workspace::commands::join_workspace_as_new_user`.
-
-3. **Resolved (Medium): SC5 boundary-check helper leak gap**
-   - Fixed by extending boundary checks to ban leaked helper-level workflow usage in forbidden layers.
-   - Evidence: `scripts/check_boundary_imports.sh` contains explicit checks for `identity::ops::create_user_invite_events` / `create_device_link_invite_events` leakage and passes.
-
-4. **Resolved (Low): evidence naming mismatch**
-   - Fixed by updating the evidence doc with concrete, existing test names and references.
-   - Evidence: `docs/planning/IDENTITY_EVENTIZATION_COMPLETION_EVIDENCE.md`.
-
-## Conclusion
-
-Branch satisfies SC1-SC5 with passing checks and no unresolved required work.
+- `rg -n "peering::workflows::bootstrap|workflows/bootstrap" src`
+- `rg -n "target planner|autodial|PeerDispatcher|launch_mdns_discovery|collect_placeholder_invite_autodial_targets|collect_all_bootstrap_targets" src/peering`
+- `bash scripts/check_boundary_imports.sh`
+- `cargo check`
+- `cargo test --lib -q`
+- `cargo test --test scenario_test -q`
+- `cargo test --test holepunch_test -q`
+- `cargo test --test projectors -q`
