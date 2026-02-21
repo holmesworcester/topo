@@ -6,9 +6,9 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::event_modules::projector_test_harness::fixtures::*;
-    use crate::event_modules::secret_shared::{project_pure, SecretSharedEvent};
-    use crate::event_modules::ParsedEvent;
+    use crate::harness::fixtures::*;
+    use topo::event_modules::secret_shared::{project_pure, SecretSharedEvent};
+    use topo::event_modules::ParsedEvent;
 
     const PEER: &str = "peer_alice";
     const EVENT_ID: &str = "ss_event_1";

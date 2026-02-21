@@ -6,10 +6,10 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::event_modules::projector_test_harness::fixtures::*;
-    use crate::event_modules::reaction::project_pure;
-    use crate::event_modules::reaction::ReactionEvent;
-    use crate::event_modules::ParsedEvent;
+    use crate::harness::fixtures::*;
+    use topo::event_modules::reaction::project_pure;
+    use topo::event_modules::reaction::ReactionEvent;
+    use topo::event_modules::ParsedEvent;
 
     const PEER: &str = "peer_alice";
     const EVENT_ID: &str = "rxn_event_1";
@@ -55,7 +55,7 @@ mod tests {
     #[test]
     fn test_reaction_skips_when_target_deleted() {
         let parsed = make_reaction();
-        let ctx = crate::projection::result::ContextSnapshot {
+        let ctx = topo::projection::result::ContextSnapshot {
             target_message_deleted: true,
             ..Default::default()
         };

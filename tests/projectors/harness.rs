@@ -5,10 +5,9 @@
 
 #[cfg(test)]
 pub mod fixtures {
-    use crate::projection::decision::ProjectionDecision;
-    use crate::projection::result::{
-        BootstrapContextSnapshot, ContextSnapshot, DeletionIntentInfo, EmitCommand,
-        ProjectorResult, WriteOp,
+    use topo::projection::decision::ProjectionDecision;
+    use topo::projection::result::{
+        BootstrapContextSnapshot, ContextSnapshot, EmitCommand, ProjectorResult, WriteOp,
     };
 
     /// Default ContextSnapshot with all fields at their zero/empty/false defaults.

@@ -9,10 +9,10 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::event_modules::message_deletion::project_pure;
-    use crate::event_modules::message_deletion::MessageDeletionEvent;
-    use crate::event_modules::projector_test_harness::fixtures::*;
-    use crate::event_modules::ParsedEvent;
+    use topo::event_modules::message_deletion::project_pure;
+    use topo::event_modules::message_deletion::MessageDeletionEvent;
+    use crate::harness::fixtures::*;
+    use topo::event_modules::ParsedEvent;
 
     const PEER: &str = "peer_alice";
     const EVENT_ID: &str = "del_event_1";
@@ -62,7 +62,7 @@ mod tests {
     #[test]
     fn test_deletion_rejects_non_message_target() {
         let parsed = make_deletion([1u8; 32], [2u8; 32]);
-        let ctx = crate::projection::result::ContextSnapshot {
+        let ctx = topo::projection::result::ContextSnapshot {
             target_is_non_message: true,
             ..Default::default()
         };
@@ -91,7 +91,7 @@ mod tests {
         let author = [2u8; 32];
         let author_b64 = b64(&author);
         let parsed = make_deletion([1u8; 32], author);
-        let ctx = crate::projection::result::ContextSnapshot {
+        let ctx = topo::projection::result::ContextSnapshot {
             target_tombstone_author: Some(author_b64),
             ..Default::default()
         };
@@ -107,7 +107,7 @@ mod tests {
     #[test]
     fn test_deletion_rejects_when_tombstoned_wrong_author() {
         let parsed = make_deletion([1u8; 32], [2u8; 32]);
-        let ctx = crate::projection::result::ContextSnapshot {
+        let ctx = topo::projection::result::ContextSnapshot {
             target_tombstone_author: Some(b64(&[99u8; 32])),
             ..Default::default()
         };

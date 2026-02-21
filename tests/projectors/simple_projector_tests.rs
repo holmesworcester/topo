@@ -6,9 +6,9 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::event_modules::projector_test_harness::fixtures::*;
-    use crate::event_modules::ParsedEvent;
-    use crate::projection::result::EmitCommand;
+    use crate::harness::fixtures::*;
+    use topo::event_modules::ParsedEvent;
+    use topo::projection::result::EmitCommand;
 
     const PEER: &str = "peer_alice";
     const EVENT_ID: &str = "simple_event_1";
@@ -17,7 +17,7 @@ mod tests {
 
     #[test]
     fn test_user_boot_valid() {
-        use crate::event_modules::user::{project_pure, UserBootEvent};
+        use topo::event_modules::user::{project_pure, UserBootEvent};
         let parsed = ParsedEvent::UserBoot(UserBootEvent {
             created_at_ms: 1000,
             public_key: [1u8; 32],
@@ -34,7 +34,7 @@ mod tests {
 
     #[test]
     fn test_user_ongoing_valid() {
-        use crate::event_modules::user::{project_pure, UserOngoingEvent};
+        use topo::event_modules::user::{project_pure, UserOngoingEvent};
         let parsed = ParsedEvent::UserOngoing(UserOngoingEvent {
             created_at_ms: 1001,
             public_key: [1u8; 32],
@@ -52,7 +52,7 @@ mod tests {
 
     #[test]
     fn test_admin_boot_valid() {
-        use crate::event_modules::admin::{project_pure, AdminBootEvent};
+        use topo::event_modules::admin::{project_pure, AdminBootEvent};
         let parsed = ParsedEvent::AdminBoot(AdminBootEvent {
             created_at_ms: 2000,
             public_key: [1u8; 32],
@@ -69,7 +69,7 @@ mod tests {
 
     #[test]
     fn test_admin_ongoing_valid() {
-        use crate::event_modules::admin::{project_pure, AdminOngoingEvent};
+        use topo::event_modules::admin::{project_pure, AdminOngoingEvent};
         let parsed = ParsedEvent::AdminOngoing(AdminOngoingEvent {
             created_at_ms: 2001,
             public_key: [1u8; 32],
@@ -87,7 +87,7 @@ mod tests {
 
     #[test]
     fn test_user_removed_writes_row() {
-        use crate::event_modules::user_removed::{project_pure, UserRemovedEvent};
+        use topo::event_modules::user_removed::{project_pure, UserRemovedEvent};
         let parsed = ParsedEvent::UserRemoved(UserRemovedEvent {
             created_at_ms: 3000,
             target_event_id: [1u8; 32],
@@ -105,7 +105,7 @@ mod tests {
 
     #[test]
     fn test_peer_removed_writes_row() {
-        use crate::event_modules::peer_removed::{project_pure, PeerRemovedEvent};
+        use topo::event_modules::peer_removed::{project_pure, PeerRemovedEvent};
         let parsed = ParsedEvent::PeerRemoved(PeerRemovedEvent {
             created_at_ms: 4000,
             target_event_id: [1u8; 32],
@@ -123,7 +123,7 @@ mod tests {
 
     #[test]
     fn test_secret_key_valid() {
-        use crate::event_modules::secret_key::{project_pure, SecretKeyEvent};
+        use topo::event_modules::secret_key::{project_pure, SecretKeyEvent};
         let parsed = ParsedEvent::SecretKey(SecretKeyEvent {
             created_at_ms: 5000,
             key_bytes: [0xAB; 32],
@@ -138,7 +138,7 @@ mod tests {
 
     #[test]
     fn test_transport_key_valid() {
-        use crate::event_modules::transport_key::{project_pure, TransportKeyEvent};
+        use topo::event_modules::transport_key::{project_pure, TransportKeyEvent};
         let parsed = ParsedEvent::TransportKey(TransportKeyEvent {
             created_at_ms: 6000,
             spki_fingerprint: [0xCC; 32],
@@ -156,7 +156,7 @@ mod tests {
 
     #[test]
     fn test_signed_memo_valid() {
-        use crate::event_modules::signed_memo::{project_pure, SignedMemoEvent};
+        use topo::event_modules::signed_memo::{project_pure, SignedMemoEvent};
         let parsed = ParsedEvent::SignedMemo(SignedMemoEvent {
             created_at_ms: 7000,
             content: "test memo".to_string(),
@@ -174,7 +174,7 @@ mod tests {
 
     #[test]
     fn test_message_attachment_valid() {
-        use crate::event_modules::message_attachment::{
+        use topo::event_modules::message_attachment::{
             project_pure, MessageAttachmentEvent,
         };
         let parsed = ParsedEvent::MessageAttachment(MessageAttachmentEvent {
@@ -204,7 +204,7 @@ mod tests {
 
     #[test]
     fn test_bench_dep_noop() {
-        use crate::event_modules::bench_dep::{project_pure, BenchDepEvent};
+        use topo::event_modules::bench_dep::{project_pure, BenchDepEvent};
         let parsed = ParsedEvent::BenchDep(BenchDepEvent {
             created_at_ms: 9000,
             dep_ids: vec![],

@@ -8,11 +8,11 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::event_modules::peer_shared::project_pure;
-    use crate::event_modules::peer_shared::{PeerSharedFirstEvent, PeerSharedOngoingEvent};
-    use crate::event_modules::projector_test_harness::fixtures::*;
-    use crate::event_modules::ParsedEvent;
-    use crate::projection::result::{EmitCommand, SqlVal, WriteOp};
+    use topo::event_modules::peer_shared::project_pure;
+    use topo::event_modules::peer_shared::{PeerSharedFirstEvent, PeerSharedOngoingEvent};
+    use crate::harness::fixtures::*;
+    use topo::event_modules::ParsedEvent;
+    use topo::projection::result::{EmitCommand, SqlVal, WriteOp};
 
     const PEER: &str = "peer_alice";
     const EVENT_ID: &str = "ps_event_1";

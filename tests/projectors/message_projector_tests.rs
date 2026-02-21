@@ -6,11 +6,11 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::event_modules::message::project_pure;
-    use crate::event_modules::message::MessageEvent;
-    use crate::event_modules::projector_test_harness::fixtures::*;
-    use crate::event_modules::ParsedEvent;
-    use crate::projection::result::DeletionIntentInfo;
+    use topo::event_modules::message::project_pure;
+    use topo::event_modules::message::MessageEvent;
+    use crate::harness::fixtures::*;
+    use topo::event_modules::ParsedEvent;
+    use topo::projection::result::DeletionIntentInfo;
 
     const PEER: &str = "peer_alice";
     const EVENT_ID: &str = "msg_event_1";
@@ -58,7 +58,7 @@ mod tests {
         let author = [2u8; 32];
         let author_b64 = b64(&author);
         let parsed = make_message(author);
-        let ctx = crate::projection::result::ContextSnapshot {
+        let ctx = topo::projection::result::ContextSnapshot {
             deletion_intents: vec![DeletionIntentInfo {
                 deletion_event_id: "del_event_1".to_string(),
                 author_id: author_b64,
@@ -80,7 +80,7 @@ mod tests {
     fn test_message_ignores_wrong_author_deletion_intent() {
         let author = [2u8; 32];
         let parsed = make_message(author);
-        let ctx = crate::projection::result::ContextSnapshot {
+        let ctx = topo::projection::result::ContextSnapshot {
             deletion_intents: vec![DeletionIntentInfo {
                 deletion_event_id: "del_event_2".to_string(),
                 author_id: b64(&[99u8; 32]), // different author

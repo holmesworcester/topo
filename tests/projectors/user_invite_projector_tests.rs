@@ -6,11 +6,11 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::event_modules::projector_test_harness::fixtures::*;
-    use crate::event_modules::user_invite::project_pure;
-    use crate::event_modules::user_invite::{UserInviteBootEvent, UserInviteOngoingEvent};
-    use crate::event_modules::ParsedEvent;
-    use crate::projection::result::EmitCommand;
+    use crate::harness::fixtures::*;
+    use topo::event_modules::user_invite::project_pure;
+    use topo::event_modules::user_invite::{UserInviteBootEvent, UserInviteOngoingEvent};
+    use topo::event_modules::ParsedEvent;
+    use topo::projection::result::EmitCommand;
 
     const PEER: &str = "peer_inviter";
     const EVENT_ID: &str = "ui_event_1";

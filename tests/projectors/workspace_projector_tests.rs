@@ -7,9 +7,9 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::event_modules::projector_test_harness::fixtures::*;
-    use crate::event_modules::workspace::{project_pure, WorkspaceEvent};
-    use crate::event_modules::ParsedEvent;
+    use crate::harness::fixtures::*;
+    use topo::event_modules::workspace::{project_pure, WorkspaceEvent};
+    use topo::event_modules::ParsedEvent;
 
     const PEER: &str = "peer_alice";
 

@@ -22,31 +22,6 @@ pub mod user_invite;
 pub mod user_removed;
 pub mod workspace;
 
-#[cfg(test)]
-pub mod projector_test_harness;
-#[cfg(test)]
-mod workspace_projector_tests;
-#[cfg(test)]
-mod invite_accepted_projector_tests;
-#[cfg(test)]
-mod message_projector_tests;
-#[cfg(test)]
-mod reaction_projector_tests;
-#[cfg(test)]
-mod message_deletion_projector_tests;
-#[cfg(test)]
-mod secret_shared_projector_tests;
-#[cfg(test)]
-mod file_slice_projector_tests;
-#[cfg(test)]
-mod user_invite_projector_tests;
-#[cfg(test)]
-mod device_invite_projector_tests;
-#[cfg(test)]
-mod peer_shared_projector_tests;
-#[cfg(test)]
-mod simple_projector_tests;
-
 use std::sync::OnceLock;
 
 pub use admin::{AdminBootEvent, AdminOngoingEvent};

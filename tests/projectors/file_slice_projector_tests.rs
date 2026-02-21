@@ -8,11 +8,11 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::event_modules::file_slice::project_pure;
-    use crate::event_modules::file_slice::FileSliceEvent;
-    use crate::event_modules::projector_test_harness::fixtures::*;
-    use crate::event_modules::ParsedEvent;
-    use crate::projection::result::EmitCommand;
+    use topo::event_modules::file_slice::project_pure;
+    use topo::event_modules::file_slice::FileSliceEvent;
+    use crate::harness::fixtures::*;
+    use topo::event_modules::ParsedEvent;
+    use topo::projection::result::EmitCommand;
 
     const PEER: &str = "peer_alice";
     const EVENT_ID: &str = "fs_event_1";
@@ -81,7 +81,7 @@ mod tests {
         let signer = [3u8; 32];
         let signer_b64 = b64(&signer);
         let parsed = make_file_slice([1u8; 32], signer);
-        let ctx = crate::projection::result::ContextSnapshot {
+        let ctx = topo::projection::result::ContextSnapshot {
             file_descriptors: vec![("desc_1".to_string(), signer_b64)],
             existing_file_slice: Some(("other_event".to_string(), "desc_1".to_string())),
             ..Default::default()
@@ -98,7 +98,7 @@ mod tests {
         let signer = [3u8; 32];
         let signer_b64 = b64(&signer);
         let parsed = make_file_slice([1u8; 32], signer);
-        let ctx = crate::projection::result::ContextSnapshot {
+        let ctx = topo::projection::result::ContextSnapshot {
             file_descriptors: vec![("desc_1".to_string(), signer_b64)],
             existing_file_slice: Some((EVENT_ID.to_string(), "desc_1".to_string())),
             ..Default::default()
