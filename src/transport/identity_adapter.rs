@@ -12,7 +12,7 @@ use crate::contracts::transport_identity_contract::{
     TransportIdentityAdapter, TransportIdentityError, TransportIdentityIntent,
 };
 
-/// Production adapter backed by `identity::transport` install functions.
+/// Production adapter backed by `transport::identity` install functions.
 pub struct ConcreteTransportIdentityAdapter;
 
 impl TransportIdentityAdapter for ConcreteTransportIdentityAdapter {
@@ -26,7 +26,7 @@ impl TransportIdentityAdapter for ConcreteTransportIdentityAdapter {
                 invite_private_key,
             } => {
                 let signing_key = ed25519_dalek::SigningKey::from_bytes(&invite_private_key);
-                crate::identity::transport::install_invite_bootstrap_transport_identity_conn(
+                crate::transport::identity::install_invite_bootstrap_transport_identity_conn(
                     conn,
                     &signing_key,
                 )
@@ -66,7 +66,7 @@ impl TransportIdentityAdapter for ConcreteTransportIdentityAdapter {
                 arr.copy_from_slice(&key_bytes);
                 let signing_key = ed25519_dalek::SigningKey::from_bytes(&arr);
 
-                crate::identity::transport::install_peer_key_transport_identity(conn, &signing_key)
+                crate::transport::identity::install_peer_key_transport_identity(conn, &signing_key)
                     .map_err(|e| TransportIdentityError::InstallFailed(e.to_string()))
             }
         }

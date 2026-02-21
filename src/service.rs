@@ -18,7 +18,7 @@ use crate::event_modules::{
     admin, message, message_deletion, peer_shared, reaction, transport_key, user, user_removed,
     workspace,
 };
-use crate::identity::transport::{load_transport_cert_required, load_transport_peer_id};
+use crate::transport::identity::{load_transport_cert_required, load_transport_peer_id};
 use crate::transport::create_dual_endpoint_dynamic;
 use crate::transport::identity_adapter::ConcreteTransportIdentityAdapter;
 
@@ -69,8 +69,8 @@ impl From<Box<dyn std::error::Error + Send + Sync>> for ServiceError {
     }
 }
 
-impl From<crate::identity::invite_link::InviteLinkError> for ServiceError {
-    fn from(e: crate::identity::invite_link::InviteLinkError) -> Self {
+impl From<crate::event_modules::workspace::invite_link::InviteLinkError> for ServiceError {
+    fn from(e: crate::event_modules::workspace::invite_link::InviteLinkError) -> Self {
         ServiceError(e.to_string())
     }
 }
@@ -1304,10 +1304,10 @@ pub async fn svc_accept_invite(
     username: &str,
     devicename: &str,
 ) -> ServiceResult<AcceptInviteResponse> {
-    let invite = crate::identity::invite_link::parse_invite_link(invite_link_str)
+    let invite = crate::event_modules::workspace::invite_link::parse_invite_link(invite_link_str)
         .map_err(|e| ServiceError(format!("Invalid invite link: {}", e)))?;
 
-    if invite.kind != crate::identity::invite_link::InviteLinkKind::User {
+    if invite.kind != crate::event_modules::workspace::invite_link::InviteLinkKind::User {
         return Err(ServiceError(
             "Expected a user invite link (quiet://invite/...)".into(),
         ));
@@ -1400,10 +1400,10 @@ pub async fn svc_accept_device_link(
     invite_link_str: &str,
     devicename: &str,
 ) -> ServiceResult<AcceptDeviceLinkResponse> {
-    let invite = crate::identity::invite_link::parse_invite_link(invite_link_str)
+    let invite = crate::event_modules::workspace::invite_link::parse_invite_link(invite_link_str)
         .map_err(|e| ServiceError(format!("Invalid invite link: {}", e)))?;
 
-    if invite.kind != crate::identity::invite_link::InviteLinkKind::DeviceLink {
+    if invite.kind != crate::event_modules::workspace::invite_link::InviteLinkKind::DeviceLink {
         return Err(ServiceError(
             "Expected a device link (quiet://link/...)".into(),
         ));
@@ -1430,7 +1430,7 @@ pub async fn svc_accept_device_link(
 
     let db = open_connection(db_path)?;
     let user_event_id = match invite.invite_type {
-        crate::identity::ops::InviteType::DeviceLink { user_event_id: uid } => uid,
+        crate::event_modules::workspace::identity_ops::InviteType::DeviceLink { user_event_id: uid } => uid,
         _ => return Err(ServiceError("Expected DeviceLink invite type".into())),
     };
 

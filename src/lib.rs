@@ -4,7 +4,6 @@ pub mod db;
 pub mod db_registry;
 pub mod event_modules;
 pub mod event_pipeline;
-pub mod identity;
 pub mod node;
 pub mod peering;
 pub mod projection;

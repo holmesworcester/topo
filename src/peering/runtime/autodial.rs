@@ -16,7 +16,7 @@ use crate::contracts::peering_contract::{PeerFingerprint, TenantId, TrustDecisio
 use crate::db::transport_creds::{list_local_peers, load_local_creds};
 use crate::db::transport_trust::list_active_invite_bootstrap_addrs;
 use crate::db::open_connection;
-use crate::identity::invite_link::parse_bootstrap_address;
+use crate::event_modules::workspace::invite_link::parse_bootstrap_address;
 use crate::peering::loops::IntroSpawnerFn;
 use crate::transport::{workspace_client_config, DynamicAllowFn, SqliteTrustOracle};
 

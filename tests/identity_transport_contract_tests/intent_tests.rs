@@ -73,7 +73,7 @@ fn concrete_adapter_install_peer_shared_from_signer() {
     assert_eq!(peer_id.len(), 64, "peer_id should be 32-byte hex");
 
     // Verify loaded peer_id matches
-    let loaded = topo::identity::transport::load_transport_peer_id(&conn).unwrap();
+    let loaded = topo::transport::identity::load_transport_peer_id(&conn).unwrap();
     assert_eq!(loaded, peer_id);
 }
 

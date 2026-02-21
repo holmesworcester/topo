@@ -2,7 +2,7 @@ use rusqlite::Connection;
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 
 use crate::db::transport_creds::{load_sole_local_creds, load_local_creds, store_local_creds};
-use crate::transport::{
+use super::{
     extract_spki_fingerprint, generate_self_signed_cert,
     generate_self_signed_cert_from_signing_key,
 };
