@@ -5,13 +5,10 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::contracts::event_pipeline_contract::{IngestFns, IngestItem};
-use crate::contracts::peering_contract::{
-    next_session_id, PeerFingerprint, SessionDirection, SessionHandler, SessionMeta, TenantId,
-};
+use crate::contracts::peering_contract::SessionDirection;
 use crate::db::health::{purge_expired_endpoints, record_endpoint_observation};
 use crate::db::open_connection;
 use crate::db::project_queue::ProjectQueue;
@@ -20,11 +17,11 @@ use crate::db::schema::create_tables;
 use crate::db::store::lookup_workspace_id;
 use crate::db::transport_trust::record_transport_binding;
 use crate::sync::SyncSessionHandler;
-use crate::transport::{peer_identity_from_connection, DualConnection, QuicTransportSessionIo};
+use crate::transport::peer_identity_from_connection;
 
 use super::{
-    current_timestamp_ms, drain_batch_size, peer_fingerprint_from_hex, shared_ingest_cap,
-    spawn_peer_removal_cancellation_watch, IntroSpawnerFn, CONNECT_RETRY_DELAY, ENDPOINT_TTL_MS,
+    current_timestamp_ms, drain_batch_size, peer_fingerprint_from_hex, run_session,
+    shared_ingest_cap, IntroSpawnerFn, CONNECT_RETRY_DELAY, ENDPOINT_TTL_MS,
     SESSION_GAP, SYNC_SESSION_TIMEOUT_SECS,
 };
 
@@ -222,47 +219,32 @@ async fn connect_loop_inner(
                 }
             }
 
-            let (ctrl_send, ctrl_recv) = match connection.open_bi().await {
+            let ctrl = match connection.open_bi().await {
                 Ok(streams) => streams,
                 Err(e) => {
                     info!("Connection dropped (control open): {}", e);
                     break;
                 }
             };
-            let (data_send, data_recv) = match connection.open_bi().await {
+            let data = match connection.open_bi().await {
                 Ok(streams) => streams,
                 Err(e) => {
                     info!("Connection dropped (data open): {}", e);
                     break;
                 }
             };
-            let conn = DualConnection::new(ctrl_send, ctrl_recv, data_send, data_recv);
 
-            let session_id = next_session_id();
-            let meta = SessionMeta {
-                session_id,
-                tenant: TenantId(current_rb.clone()),
-                peer: PeerFingerprint(peer_fp),
-                remote_addr: connection.remote_address(),
-                direction: SessionDirection::Outbound,
-            };
-            let io = QuicTransportSessionIo::new(session_id, conn);
-            let cancel = CancellationToken::new();
-            let watch = spawn_peer_removal_cancellation_watch(
-                db_path.to_string(),
-                current_rb.clone(),
+            run_session(
+                &initiator_handler,
+                ctrl,
+                data,
+                &current_rb,
                 peer_fp,
-                cancel.clone(),
-            );
-
-            if let Err(e) = initiator_handler
-                .on_session(meta, Box::new(io), cancel.clone())
-                .await
-            {
-                warn!("Initiator session error: {}", e);
-            }
-            cancel.cancel();
-            let _ = watch.await;
+                connection.remote_address(),
+                SessionDirection::Outbound,
+                db_path,
+            )
+            .await;
 
             tokio::time::sleep(SESSION_GAP).await;
         }

@@ -17,7 +17,7 @@ use crate::contracts::event_pipeline_contract::IngestFns;
 use crate::peering::loops::{connect_loop, IntroSpawnerFn};
 
 #[cfg(feature = "discovery")]
-use super::peer_dispatch::{
+use super::target_planner::{
     normalize_discovered_addr_for_local_bind, DiscoveryAction, PeerDispatcher,
 };
 

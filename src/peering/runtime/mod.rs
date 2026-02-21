@@ -5,10 +5,9 @@
 //! multi-workspace cert resolver, and routes all incoming events through a
 //! single shared batch_writer.
 
-mod autodial;
 mod discovery;
-mod peer_dispatch;
 mod startup;
+pub(crate) mod target_planner;
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -24,11 +23,10 @@ use crate::peering::nat::upnp::UpnpMappingReport;
 use crate::contracts::event_pipeline_contract::{IngestFns, IngestItem};
 use crate::peering::loops::{accept_loop_with_ingest, IntroSpawnerFn};
 
-use autodial::{
-    build_tenant_client_config, collect_placeholder_invite_autodial_targets,
-    spawn_placeholder_autodial_refresher,
+use target_planner::{
+    build_tenant_client_config, collect_all_bootstrap_targets,
+    spawn_bootstrap_refresher, spawn_connect_loop_thread,
 };
-use peer_dispatch::spawn_connect_loop_thread;
 use startup::setup_endpoint_and_tenants;
 
 /// Runtime networking information collected during node startup.
@@ -146,7 +144,7 @@ pub async fn run_node(
     if disable_placeholder_autodial {
         warn!("BOOTSTRAP AUTODIAL DISABLED by P7_DISABLE_PLACEHOLDER_AUTODIAL");
     } else {
-        let autodial_targets = collect_placeholder_invite_autodial_targets(db_path)?;
+        let autodial_targets = collect_all_bootstrap_targets(db_path)?;
         let mut launched_autodial: HashSet<(String, SocketAddr)> = HashSet::new();
         if !autodial_targets.is_empty() {
             warn!(
@@ -184,7 +182,7 @@ pub async fn run_node(
             );
         }
         // Keep polling for runtime invite acceptance
-        spawn_placeholder_autodial_refresher(
+        spawn_bootstrap_refresher(
             db_path.to_string(),
             connect_endpoint.clone(),
             launched_autodial,

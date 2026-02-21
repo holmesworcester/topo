@@ -1,10 +1,13 @@
-//! Bootstrap sync helpers for test infrastructure.
+//! Bootstrap sync helpers — test-only.
 //!
-//! In production, bootstrap connectivity is driven by projected SQL trust state
-//! and the ongoing autodial loop in `peering::runtime::autodial`. These helpers
-//! are used by test infrastructure to simulate the runtime bootstrap flow:
+//! Production bootstrap connectivity is driven by projected SQL trust state
+//! and the ongoing autodial loop in `peering::runtime::target_planner`. These helpers
+//! simulate the runtime bootstrap flow for test infrastructure only:
 //! `start_bootstrap_responder` serves prerequisite events, and
 //! `bootstrap_sync_from_invite` connects and fetches them.
+//!
+//! Moved from `peering::workflows::bootstrap` to enforce test-only ownership
+//! (R2/SC2 of PEERING_READABILITY_AND_BOOTSTRAP_DISCOVERY_PLAN).
 
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicU64;
@@ -148,8 +151,8 @@ pub async fn bootstrap_sync_from_invite(
 /// one connection, syncs, and exits. Returns the bound address and endpoint
 /// handle — caller must close the endpoint when done.
 ///
-/// Used by both interactive REPL and test helpers to let an in-process inviter
-/// serve prerequisite events to a joiner via real QUIC sync.
+/// Used by test helpers to let an in-process inviter serve prerequisite
+/// events to a joiner via real QUIC sync.
 pub fn start_bootstrap_responder(
     inviter_db_path: &str,
     inviter_identity: &str,

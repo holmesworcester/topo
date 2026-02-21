@@ -5,13 +5,11 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::contracts::event_pipeline_contract::{IngestFns, IngestItem};
 use crate::contracts::peering_contract::{
-    next_session_id, PeerFingerprint, SessionDirection, SessionHandler, SessionMeta, TenantId,
-    TrustDecision,
+    PeerFingerprint, SessionDirection, TenantId, TrustDecision,
 };
 use crate::db::health::{purge_expired_endpoints, record_endpoint_observation};
 use crate::db::open_connection;
@@ -20,13 +18,11 @@ use crate::db::removal_watch::is_peer_removed;
 use crate::db::schema::create_tables;
 use crate::db::transport_trust::record_transport_binding;
 use crate::sync::SyncSessionHandler;
-use crate::transport::{
-    peer_identity_from_connection, DualConnection, SqliteTrustOracle, QuicTransportSessionIo,
-};
+use crate::transport::{peer_identity_from_connection, SqliteTrustOracle};
 
 use super::{
-    current_timestamp_ms, drain_batch_size, peer_fingerprint_from_hex, shared_ingest_cap,
-    spawn_peer_removal_cancellation_watch, IntroSpawnerFn, ENDPOINT_TTL_MS, SESSION_GAP,
+    current_timestamp_ms, drain_batch_size, peer_fingerprint_from_hex, run_session,
+    shared_ingest_cap, IntroSpawnerFn, ENDPOINT_TTL_MS, SESSION_GAP,
     SYNC_SESSION_TIMEOUT_SECS,
 };
 
@@ -242,46 +238,32 @@ pub async fn accept_loop_with_ingest(
                         }
                     }
 
-                    let (ctrl_send, ctrl_recv) = match connection.accept_bi().await {
+                    let ctrl = match connection.accept_bi().await {
                         Ok(streams) => streams,
                         Err(e) => {
                             info!("Connection dropped (control accept): {}", e);
                             break;
                         }
                     };
-                    let (data_send, data_recv) = match connection.accept_bi().await {
+                    let data = match connection.accept_bi().await {
                         Ok(streams) => streams,
                         Err(e) => {
                             info!("Connection dropped (data accept): {}", e);
                             break;
                         }
                     };
-                    let conn = DualConnection::new(ctrl_send, ctrl_recv, data_send, data_recv);
-                    let session_id = next_session_id();
-                    let meta = SessionMeta {
-                        session_id,
-                        tenant: TenantId(recorded_by_owned.clone()),
-                        peer: PeerFingerprint(peer_fp),
-                        remote_addr: connection.remote_address(),
-                        direction: SessionDirection::Inbound,
-                    };
-                    let io = QuicTransportSessionIo::new(session_id, conn);
-                    let cancel = CancellationToken::new();
-                    let watch = spawn_peer_removal_cancellation_watch(
-                        db_path_owned.clone(),
-                        recorded_by_owned.clone(),
-                        peer_fp,
-                        cancel.clone(),
-                    );
 
-                    if let Err(e) = responder_handler
-                        .on_session(meta, Box::new(io), cancel.clone())
-                        .await
-                    {
-                        warn!("Responder session error: {}", e);
-                    }
-                    cancel.cancel();
-                    let _ = watch.await;
+                    run_session(
+                        &responder_handler,
+                        ctrl,
+                        data,
+                        &recorded_by_owned,
+                        peer_fp,
+                        connection.remote_address(),
+                        SessionDirection::Inbound,
+                        &db_path_owned,
+                    )
+                    .await;
 
                     tokio::time::sleep(SESSION_GAP).await;
                 }

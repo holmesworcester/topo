@@ -384,6 +384,27 @@ DNS label constraint: peer IDs (64 hex chars) are truncated to 59 chars in the m
 
 Same-host daemon discovery: when two daemons run on the same machine bound to `127.0.0.1`, they advertise a routable (non-loopback) IP via mDNS because multicast DNS does not discover services advertised on loopback addresses. The browse side compensates with `normalize_discovered_addr_for_local_bind`, which rewrites discovered non-loopback addresses back to loopback when the local daemon is bound to loopback. The advertise IP is always provided explicitly by the caller (`run_node`); discovery internals perform no implicit address inference.
 
+## 3.2.3 Peering runtime loop model
+
+The production peering runtime follows a single conceptual loop:
+
+1. **Projected SQLite state**: invite_bootstrap_trust rows, PeerShared-derived trust, endpoint observations.
+2. **Target planner** (`peering::runtime::target_planner`): single-owner module for all dial target planning. Collects bootstrap trust targets from SQL and mDNS discovery candidates. Routes both through `PeerDispatcher` for deduplication and reconnect management.
+3. **Dial/accept supervisors**: `connect_loop` (outbound) and `accept_loop` (inbound) manage QUIC connection lifecycle. Both use the centralized `run_session` transport seam (`peering::loops::run_session`) for session wiring.
+4. **Sync session runner** (`SyncSessionHandler`): protocol-agnostic session handler invoked via the `SessionHandler` contract.
+5. **Ingest writer** (`batch_writer`): single shared thread consuming `IngestItem` tuples from all concurrent sessions.
+6. **Projected SQLite state**: projection cascade updates trust rows, completing the loop.
+
+### Module ownership
+
+- **Target planning**: `src/peering/runtime/target_planner.rs` — the single source of truth for dial target decisions. Bootstrap autodial and mDNS discovery both route through this module.
+- **Transport seam**: `src/peering/loops/mod.rs::run_session` — centralized QUIC-to-session wiring. Accept and connect loops call this instead of duplicating DualConnection / SessionMeta / QuicTransportSessionIo construction.
+- **Bootstrap test helpers**: `src/testutil/bootstrap.rs` — test-only. Production runtime never depends on these; bootstrap progression is driven by the autodial loop polling projected SQL state.
+
+### Eventization boundary (peering)
+
+Durable trust/identity authority transitions are eventized (InviteAccepted, PeerShared, PeerRemoved). Transport runtime mechanics are NOT eventized: retry cadence, discovery timing, session lifecycle, and endpoint observations are ephemeral operational state managed by the peering runtime directly.
+
 ## 3.3 Table lifecycle and naming
 
 1. schema creation runs through ordered migrations,

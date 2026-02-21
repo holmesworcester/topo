@@ -77,8 +77,8 @@ check_no_match 'identity_ops::create_user_invite_events' src/service.rs
 check_no_match 'identity_ops::create_device_link_invite_events' src/service.rs
 check_no_match 'identity_ops::create_user_invite_events' src/event_pipeline.rs
 check_no_match 'identity_ops::create_device_link_invite_events' src/event_pipeline.rs
-check_no_match 'identity_ops::create_user_invite_events' src/testutil.rs
-check_no_match 'identity_ops::create_device_link_invite_events' src/testutil.rs
+check_no_match 'identity_ops::create_user_invite_events' src/testutil/
+check_no_match 'identity_ops::create_device_link_invite_events' src/testutil/
 
 # service.rs must not contain svc_bootstrap_workspace_conn
 check_no_match 'svc_bootstrap_workspace_conn' src/service.rs
@@ -86,6 +86,18 @@ check_no_match 'workspace::commands::retry_pending_invite_content_key_unwraps' s
 check_no_match 'workspace::commands::create_workspace' src/event_pipeline.rs
 check_no_match 'workspace::commands::join_workspace_as_new_user' src/event_pipeline.rs
 check_no_match 'workspace::commands::add_device_to_workspace' src/event_pipeline.rs
+
+# -- peering readability: bootstrap helpers must not be production-owned --
+# Production runtime must not depend on test bootstrap helpers (R2/SC2)
+check_no_match 'testutil::bootstrap' src/peering/
+check_no_match 'testutil::bootstrap' src/service.rs
+check_no_match 'testutil::bootstrap' src/event_pipeline/
+# peering/workflows must not contain bootstrap module (moved to testutil)
+check_no_match 'mod bootstrap' src/peering/workflows/
+
+# -- peering readability: target planning single ownership (R3/SC3) --
+# Target planning must live in target_planner, not scattered across runtime
+check_required 'mod target_planner' src/peering/runtime/mod.rs
 
 echo "=== Positive contract checks ==="
 

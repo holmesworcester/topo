@@ -1,9 +1,13 @@
 //! Connection-level orchestration: accept, connect, and download loops.
 //!
-//! Extracted from sync/engine.rs (Phase 4 of Option B refactor).
 //! These functions manage the lifecycle of individual QUIC connections and
 //! the sync sessions running on them. Session execution is delegated to
 //! `SessionHandler` -- no protocol logic lives here.
+//!
+//! The transport↔peering seam is [`run_session`]: both accept and connect
+//! loops call it to wire QUIC streams into session handler invocations,
+//! centralizing DualConnection / SessionMeta / QuicTransportSessionIo
+//! construction (R4/SC4 of the peering readability plan).
 //!
 //! Sub-modules:
 //!  - `accept`   -- accept_loop, accept_loop_with_ingest, resolve_tenant_for_peer
@@ -19,11 +23,19 @@ pub use accept::{accept_loop, accept_loop_with_ingest};
 pub use connect::connect_loop;
 pub use download::download_from_sources;
 
+use std::net::SocketAddr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio_util::sync::CancellationToken;
+use tracing::warn;
+
+use crate::contracts::peering_contract::{
+    next_session_id, PeerFingerprint, SessionDirection, SessionHandler, SessionMeta, TenantId,
+};
 use crate::db::open_connection;
 use crate::db::removal_watch::is_peer_removed;
+use crate::sync::SyncSessionHandler;
+use crate::transport::{DualConnection, QuicTransportSessionIo};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -103,6 +115,61 @@ pub(super) fn spawn_peer_removal_cancellation_watch(
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
     })
+}
+
+// ---------------------------------------------------------------------------
+// Transport↔peering session seam
+// ---------------------------------------------------------------------------
+
+/// Wire up and run a single sync session on pre-opened bi-directional streams.
+///
+/// This is the centralized transport↔peering seam (R4/SC4): it converts raw
+/// QUIC streams into the session handler contract. Both accept and connect
+/// loops call this instead of duplicating DualConnection / SessionMeta /
+/// QuicTransportSessionIo construction.
+pub(super) async fn run_session(
+    handler: &SyncSessionHandler,
+    ctrl_streams: (quinn::SendStream, quinn::RecvStream),
+    data_streams: (quinn::SendStream, quinn::RecvStream),
+    tenant_id: &str,
+    peer_fp: [u8; 32],
+    remote_addr: SocketAddr,
+    direction: SessionDirection,
+    db_path: &str,
+) {
+    let conn = DualConnection::new(
+        ctrl_streams.0, ctrl_streams.1,
+        data_streams.0, data_streams.1,
+    );
+    let session_id = next_session_id();
+    let meta = SessionMeta {
+        session_id,
+        tenant: TenantId(tenant_id.to_string()),
+        peer: PeerFingerprint(peer_fp),
+        remote_addr,
+        direction,
+    };
+    let io = QuicTransportSessionIo::new(session_id, conn);
+    let cancel = CancellationToken::new();
+    let watch = spawn_peer_removal_cancellation_watch(
+        db_path.to_string(),
+        tenant_id.to_string(),
+        peer_fp,
+        cancel.clone(),
+    );
+
+    if let Err(e) = handler
+        .on_session(meta, Box::new(io), cancel.clone())
+        .await
+    {
+        let label = match direction {
+            SessionDirection::Outbound => "Initiator",
+            SessionDirection::Inbound => "Responder",
+        };
+        warn!("{} session error: {}", label, e);
+    }
+    cancel.cancel();
+    let _ = watch.await;
 }
 
 pub(super) use crate::tuning::drain_batch_size;

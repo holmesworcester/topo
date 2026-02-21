@@ -1,3 +1,5 @@
+pub mod bootstrap;
+
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -106,13 +108,13 @@ pub struct Peer {
     _tempdir: tempfile::TempDir,
 }
 
-/// Delegate to the shared bootstrap responder in sync::bootstrap.
+/// Delegate to the test bootstrap responder.
 fn start_test_sync_endpoint(
     inviter_db_path: &str,
     inviter_identity: &str,
     invite_key: &SigningKey,
 ) -> Result<(SocketAddr, quinn::Endpoint), Box<dyn std::error::Error + Send + Sync>> {
-    crate::peering::workflows::bootstrap::start_bootstrap_responder(inviter_db_path, inviter_identity, invite_key, crate::event_pipeline::batch_writer)
+    bootstrap::start_bootstrap_responder(inviter_db_path, inviter_identity, invite_key, crate::event_pipeline::batch_writer)
 }
 
 impl Peer {
@@ -265,7 +267,7 @@ impl Peer {
         // In production this is done by the autodial loop; in tests we trigger
         // it directly. The batch_writer handles projection cascade and
         // recorded_by migration when the identity chain completes.
-        crate::peering::workflows::bootstrap::bootstrap_sync_from_invite(
+        crate::testutil::bootstrap::bootstrap_sync_from_invite(
             &peer.db_path,
             &result.peer_id,
             sync_addr,
