@@ -1,193 +1,112 @@
 # POC-7 Current Runtime Diagram
 
-This is a code-accurate explainer of the runtime shape in `poc-7` today.
-Source modules: `src/node.rs`, `src/peering/runtime/*`, `src/peering/loops/*`, `src/sync/*`, `src/event_pipeline.rs`, `src/projection/*`, `src/rpc/*`, `src/db/*`.
+Code-accurate runtime and data-flow snapshot for `master` in `poc-7`.
 
-## 1) Runtime topology (compact)
+Primary source modules:
+- `src/main.rs`
+- `src/node.rs`
+- `src/peering/runtime/*`
+- `src/peering/loops/*`
+- `src/sync/session/*`
+- `src/event_pipeline.rs`
+- `src/projection/apply/*`
+- `src/projection/create.rs`
+- `src/db/{project_queue.rs,egress_queue.rs,wanted.rs,transport_trust.rs}`
+
+## 1) Runtime Topology (Threads + Queues + DB)
 
 ```mermaid
 flowchart TD
     CLI["CLI (topo)"] --> MAIN["main.rs"]
-    MAIN --> RPC["RPC server + DaemonState"]
+    MAIN --> RPC["RPC server thread (Unix socket)"]
     MAIN --> NODE["node::run_node"]
 
-    RPC --> SVC["service::*"]
-    SVC --> DB[(Shared SQLite)]
+    RPC --> SVC["service + event_modules commands"]
+    SVC --> LOCAL["local create path\ncreate_*_event_sync"]
+    LOCAL --> DB_BASE["events + recorded_events + neg_items"]
+    LOCAL --> PROJ["project_one + cascade"]
 
     NODE --> START["setup_endpoint_and_tenants"]
-    START --> DB
-    START --> CERT["WorkspaceCertResolver"]
-    START --> TRUST["SqliteTrustOracle"]
-    CERT --> EP["Single QUIC endpoint"]
-    TRUST --> EP
+    START --> TRUST["SqliteTrustOracle\n(tenant-scoped allow/deny)"]
+    START --> EP["single QUIC endpoint"]
 
-    EP --> ACCEPT["accept_loop_with_ingest"]
-    EP --> CONNECT["connect_loop threads"]
-    ACCEPT --> INGEST["shared ingest channel"]
-    CONNECT --> INGEST
-    INGEST --> WRITER["batch_writer"]
+    NODE --> INGEST["shared ingest channel (mpsc)"]
+    INGEST --> WRITER["batch_writer thread"]
 
-    WRITER --> E1["events + recorded_events + neg_items"]
-    WRITER --> E2["project_queue + egress_queue"]
-    WRITER --> PROJ["project_one + cascade"]
+    EP --> ACCEPT["accept_loop_with_ingest thread"]
+    EP --> CONNECT["connect_loop threads\n(autodial / discovery / manual)"]
 
-    PROJ --> P1["valid/rejected/blocked"]
-    PROJ --> P2["projection tables"]
-    PROJ --> P3["transport trust tables"]
-    P3 --> TRUST
+    ACCEPT --> SESS["sync sessions\n(control + data streams)"]
+    CONNECT --> SESS
+
+    SESS --> CTRL["control stream\nNegOpen / NegMsg / HaveList / Done"]
+    SESS --> DATA["data stream\nEvent / DataDone"]
+
+    CTRL --> WANT["wanted_events"]
+    CTRL --> EGRESS["egress_queue"]
+    EGRESS --> SEND["Store::get_shared(events) -> Frame::Event send"]
+
+    DATA --> RECV["receiver task\nhash(blob) + tag recorded_by"]
+    RECV --> INGEST
+
+    WRITER --> DB_BASE
+    WRITER --> PROJ_Q["project_queue enqueue + drain"]
+    PROJ_Q --> PROJ
+
+    PROJ --> VALID["valid_events"]
+    PROJ --> BLOCKED["blocked_events + blocked_event_deps"]
+    PROJ --> REJECTED["rejected_events"]
+    PROJ --> READS["projection tables\n(messages, users, peers, channels, etc.)"]
+    PROJ --> TRUST_DB["transport trust tables\n(peer_shared + invite bootstrap)"]
+
+    TRUST_DB --> TRUST
 ```
 
-## 1b) Runtime topology (SQLite-centered)
+## 2) One Sync Session (Control/Data Flow)
 
 ```mermaid
 flowchart LR
-    CLI["CLI (topo)"] --> MAIN["main.rs"]
-    MAIN --> RPC["RPC server + DaemonState"]
-    MAIN --> NODE["node::run_node"]
+    NEG["Negentropy reconcile\n(NegOpen/NegMsg)"] --> IDS["have_ids + need_ids"]
+    IDS -->|peer needs my ids| ENQ["egress_queue.enqueue_events(peer_id, ids)"]
+    IDS -->|I need peer ids| HAVE["wanted_events.insert(ids)\n+ send HaveList(ids)"]
 
-    RPC --> SVC["service::*"]
+    ENQ --> CLAIM["egress_queue.claim_batch + mark_sent"]
+    CLAIM --> OUT["data_send: Frame::Event(blob)"]
+    OUT --> RX["peer receiver task"]
+    RX --> IN["ingest channel"]
+    IN --> WRITER["batch_writer"]
+    WRITER --> STORE["persist events/recorded/neg\n+ enqueue project_queue"]
+    STORE --> PROJ["project_one + cascade"]
 
-    NODE --> START["startup: tenants + cert resolver + endpoint config"]
-    START --> EP["single QUIC endpoint"]
-    EP --> LOOPS["accept/connect loops"]
-    LOOPS --> INGEST["shared ingest channel"]
-    INGEST --> WRITER["batch_writer"]
-    WRITER --> PROJ["project_one + cascade"]
-
-    DB[(SQLite DB)]
-
-    SVC --> DB
-    START --> DB
-    WRITER --> DB
-    PROJ --> DB
-
-    DB --> TRUST["tenant-scoped trust lookup"]
-    TRUST --> EP
+    OUT --> DD["DataDone"]
+    DD --> SHUT["Done / DoneAck shutdown protocol"]
 ```
 
-## 1c) Runtime topology (SQLite box with internal queues)
+## 3) Trust + Bootstrap Autodial Feedback Loop
 
 ```mermaid
 flowchart LR
-    CLI["CLI (topo)"] --> MAIN["main.rs"]
-    MAIN --> RPC["RPC server + DaemonState"]
-    MAIN --> NODE["node::run_node"]
+    INV["invite/device-link events\n+ bootstrap_context"] --> EMIT["projection emit_commands"]
+    EMIT --> PEND["pending_invite_bootstrap_trust"]
+    EMIT --> ACC["invite_bootstrap_trust"]
+    PEER["PeerShared projection"] --> SUPER["SupersedeBootstrapTrust"]
+    SUPER --> PEND
+    SUPER --> ACC
 
-    RPC --> SVC["service::*"]
-    NODE --> START["startup (tenants + endpoint config)"]
-    START --> EP["single QUIC endpoint"]
-    EP --> LOOPS["accept/connect loops"]
-    LOOPS --> INGEST["shared ingest channel"]
-    INGEST --> WRITER["batch_writer"]
-    WRITER --> PROJ["project_one + cascade"]
+    PEND --> ALLOW["is_peer_allowed / SqliteTrustOracle"]
+    ACC --> ALLOW
+    PEER --> ALLOW
+    ALLOW --> TLS["QUIC handshake allow/deny"]
 
-    subgraph SQLITE["SQLite DB (single file)"]
-        direction TB
-        Q1["project_queue"]
-        Q2["egress_queue"]
-        E1["events + recorded_events + neg_items"]
-        E2["valid/rejected/blocked"]
-        E3["projection tables"]
-        E4["transport trust tables"]
-    end
-
-    SVC --> SQLITE
-    START --> SQLITE
-    WRITER --> Q1
-    WRITER --> E1
-    PROJ --> E2
-    PROJ --> E3
-    PROJ --> E4
-    Q2 --> LOOPS
-    E4 --> EP
+    ACC --> AUTODIAL["autodial refresher\nlist_active_invite_bootstrap_addrs"]
+    AUTODIAL --> DIAL["spawn connect_loop_thread"]
+    DIAL --> SYNC["sync sessions"]
+    SYNC --> PEER
 ```
 
-## 1d) Runtime topology (dense, shorthand)
+## Current Data-Flow Facts
 
-```mermaid
-%%{init: {'flowchart': {'nodeSpacing': 14, 'rankSpacing': 14, 'curve': 'linear'}} }%%
-flowchart TB
-    C["CLI"] --> M["main"]
-    M --> R["RPC"]
-    M --> N["node"]
-    R --> S["svc"]
-    N --> U["startup"]
-    U --> E["endpoint"]
-    E --> A["accept"]
-    E --> K["connect"]
-    A --> I["ingest"]
-    K --> I
-    I --> W["writer"]
-    W --> P["project"]
-
-    T --> E
-
-    subgraph D["SQLite (single file)"]
-        direction TB
-        QP["project_q"]
-        QE["egress_q"]
-        EV["events/recorded/neg"]
-        VV["valid/reject/block"]
-        PJ["projection rows"]
-        TT["trust rows"]
-    end
-
-    S --> EV
-    S --> PJ
-    S --> TT
-    U --> TT
-    W --> EV
-    W --> QP
-    P --> VV
-    P --> PJ
-    P --> TT
-    QE --> A
-    QE --> K
-    TT --> T["trust oracle"]
-```
-
-Legend:
-- `svc` = `service::*`
-- `project_q` = `project_queue`
-- `egress_q` = `egress_queue`
-- `project` = `project_one + cascade`
-
-## 2) One sync session (compact phases)
-
-```mermaid
-flowchart TD
-    S1["1. QUIC+mTLS handshake<br/>+ tenant trust routing"] --> S2["2. Open 2 bi streams<br/>(control + data)"]
-    S2 --> S3["3. Reconcile on control<br/>NegOpen / NegMsg / HaveList"]
-    S3 --> S4["4. Data receiver task reads Event(blob)<br/>-> hashes -> IngestItem(recorded_by)"]
-    S4 --> S5["5. batch_writer persists + drains project_queue"]
-    S5 --> S6["6. project_one -> dep checks / signer verify / projector / cascade"]
-    S6 --> S7["7. Session shutdown<br/>DataDone, Done, DoneAck"]
-```
-
-## 3) Event ingest + projection convergence (compact)
-
-```mermaid
-flowchart TD
-    LOCAL["Local create<br/>(projection::create::*)"] --> LSTORE["Persist<br/>events + recorded_events + neg_items"]
-    LSTORE --> P["project_one"]
-
-    WIRE["Wire receive<br/>(sync receiver)"] --> BW["batch_writer"]
-    BW --> QSTORE["Persist + enqueue<br/>events/recorded_events/neg_items/project_queue"]
-    QSTORE --> DRAIN["drain project_queue"]
-    DRAIN --> P
-
-    P --> STEP["project_one_step<br/>parse + dep/type checks + signer verify + projector"]
-    STEP -->|Valid| OK["valid_events + projection tables"]
-    STEP -->|Block| BLK["blocked_events + blocked_event_deps"]
-    STEP -->|Reject| REJ["rejected_events"]
-    OK --> CAS["cascade_unblocked"]
-    CAS --> OK
-    CAS --> BLK
-```
-
-## Quick explanation script
-
-1. `poc-7` runs one QUIC endpoint and one writer thread per node, even for multiple local tenants.
-2. Trust is tenant-scoped in SQL but enforced dynamically during transport handshakes.
-3. Both local creates and network receives converge on the same projection entrypoint (`project_one`).
-4. Sync uses dual streams (control/data) with explicit shutdown (`DataDone`, `Done`, `DoneAck`).
+1. `egress_queue` is fed by sync control-plane `HaveList` messages, not by `batch_writer`.
+2. `batch_writer` is the shared ingest sink for wire-received events; it persists event blobs and drains `project_queue`.
+3. Local creates (`create_*_event_sync`) and wire receives both converge on `project_one` projection semantics.
+4. Projection outputs both user-facing read tables and transport trust tables; trust rows feed both handshake allow/deny and bootstrap autodial.
