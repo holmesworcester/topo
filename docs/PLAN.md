@@ -1561,6 +1561,20 @@ Definition of done:
 - Rust behavior matches TLA guard mapping in tests.
 - transport-credential modeling gap is either closed in TLA or explicitly tracked as open with linked follow-up artifact.
 
+### Identity eventization completion boundary
+
+Identity workflow orchestration is fully owned by `event_modules/workspace/commands.rs`:
+- `create_workspace`: full bootstrap chain + LocalSignerSecret emission + content key seed.
+- `join_workspace_as_new_user`: invite acceptance chain + content key unwrap.
+- `add_device_to_workspace`: device link acceptance chain.
+- `create_user_invite` / `create_device_link_invite`: invite event creation + content key wrap.
+- `retry_pending_invite_content_key_unwraps`: deferred content-key convergence.
+
+`identity/ops.rs` retains only `pub(crate)` primitive helpers (crypto, key wrap/unwrap, data types).
+`service.rs` routes to `workspace::commands` — no identity-specific orchestration.
+`event_pipeline.rs` calls `workspace::commands::retry_pending_invite_content_key_unwraps` — no identity-special callouts.
+Boundaries enforced by `scripts/check_boundary_imports.sh`.
+
 ## 15.11 PR slicing guidance (to reduce assistant mistakes)
 
 Recommended PR sequence:

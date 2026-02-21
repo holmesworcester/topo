@@ -67,6 +67,43 @@ check_no_match 'identity::ops::create_device_link_invite' src/service.rs
 check_no_match 'identity::ops::ensure_content_key_for_peer' src/service.rs
 check_no_match 'invite_link::create_invite_link' src/service.rs
 
+# -- identity eventization boundary (SC1-SC3): no workflow entrypoints in identity::ops --
+# identity::ops must not contain public workflow orchestration functions
+check_no_match 'pub fn bootstrap_workspace' src/identity/ops.rs
+check_no_match 'pub fn create_user_invite[^_]' src/identity/ops.rs
+check_no_match 'pub fn accept_user_invite' src/identity/ops.rs
+check_no_match 'pub fn create_device_link_invite[^_]' src/identity/ops.rs
+check_no_match 'pub fn accept_device_link' src/identity/ops.rs
+check_no_match 'pub fn retry_pending_invite_content_key_unwraps' src/identity/ops.rs
+
+# identity primitive helpers must not be called from service.rs, event_pipeline.rs, or tests
+# (they should go through workspace::commands APIs)
+check_no_match 'identity::ops::create_user_invite_events' src/service.rs
+check_no_match 'identity::ops::create_device_link_invite_events' src/service.rs
+check_no_match 'identity::ops::create_user_invite_events' src/event_pipeline.rs
+check_no_match 'identity::ops::create_device_link_invite_events' src/event_pipeline.rs
+check_no_match 'identity::ops::create_user_invite_events' src/testutil.rs
+check_no_match 'identity::ops::create_device_link_invite_events' src/testutil.rs
+
+# service.rs must not contain svc_bootstrap_workspace_conn
+check_no_match 'svc_bootstrap_workspace_conn' src/service.rs
+
+# service.rs must not call identity::ops workflow functions
+check_no_match 'identity::ops::bootstrap_workspace' src/service.rs
+check_no_match 'identity::ops::accept_user_invite' src/service.rs
+check_no_match 'identity::ops::accept_device_link' src/service.rs
+check_no_match 'identity::ops::retry_pending_invite_content_key_unwraps' src/service.rs
+
+# event_pipeline.rs must not call identity or workspace workflow functions directly
+check_no_match 'identity::ops::retry_pending_invite_content_key_unwraps' src/event_pipeline.rs
+check_no_match 'identity::ops::bootstrap_workspace' src/event_pipeline.rs
+check_no_match 'identity::ops::accept_user_invite' src/event_pipeline.rs
+check_no_match 'identity::ops::accept_device_link' src/event_pipeline.rs
+check_no_match 'workspace::commands::retry_pending_invite_content_key_unwraps' src/event_pipeline.rs
+check_no_match 'workspace::commands::create_workspace' src/event_pipeline.rs
+check_no_match 'workspace::commands::join_workspace_as_new_user' src/event_pipeline.rs
+check_no_match 'workspace::commands::add_device_to_workspace' src/event_pipeline.rs
+
 echo "=== Positive contract checks ==="
 
 # peering and sync must import from contracts, not event_pipeline
@@ -81,6 +118,22 @@ check_required 'TransportIdentityIntent' src/transport/identity_adapter.rs
 
 # projection must route through adapter contract, not raw install fns
 check_required 'ApplyTransportIdentityIntent' src/projection/
+
+# -- identity eventization positive checks (SC4): event-module commands own workflows --
+check_required 'pub fn create_workspace' src/event_modules/workspace/commands.rs
+check_required 'pub fn join_workspace_as_new_user' src/event_modules/workspace/commands.rs
+check_required 'pub fn add_device_to_workspace' src/event_modules/workspace/commands.rs
+check_required 'pub fn create_user_invite' src/event_modules/workspace/commands.rs
+check_required 'pub fn create_device_link_invite' src/event_modules/workspace/commands.rs
+check_required 'pub fn retry_pending_invite_content_key_unwraps' src/event_modules/workspace/commands.rs
+
+# service.rs routes to workspace::commands, not identity::ops
+check_required 'workspace::commands::create_workspace' src/service.rs
+check_required 'workspace::commands::join_workspace_as_new_user' src/service.rs
+check_required 'workspace::commands::add_device_to_workspace' src/service.rs
+
+# event_pipeline.rs uses generic post-drain hooks (not direct workspace/identity calls)
+check_required 'event_modules::post_drain_hooks' src/event_pipeline.rs
 
 if [ "$FAIL" -ne 0 ]; then
   echo "FAILED: boundary violations found" >&2

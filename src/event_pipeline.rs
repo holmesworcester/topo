@@ -307,23 +307,19 @@ pub fn batch_writer(
                             );
                         }
                     }
-                    // Invite content-key unwrap can be deferred: SecretShared may
-                    // arrive after accept flow. Retry pending unwraps after each
-                    // projection drain so key material converges from synced events.
-                    match crate::identity::ops::retry_pending_invite_content_key_unwraps(
-                        &db,
-                        &effective_rb,
-                    ) {
+                    // Run generic post-drain hooks registered by event modules
+                    // (e.g. deferred content-key unwrap retries).
+                    match crate::event_modules::post_drain_hooks(&db, &effective_rb) {
                         Ok(count) if count > 0 => {
                             tracing::info!(
-                                "post-drain invite content-key unwrap: tenant {} resolved {} pending key(s)",
+                                "post-drain hooks: tenant {} resolved {} item(s)",
                                 &effective_rb[..16.min(effective_rb.len())],
                                 count
                             );
                         }
                         Ok(_) => {}
                         Err(e) => warn!(
-                            "post-drain invite content-key unwrap failed for {}: {}",
+                            "post-drain hooks failed for {}: {}",
                             &effective_rb[..16.min(effective_rb.len())],
                             e
                         ),

@@ -5,6 +5,7 @@
 //! - Joining a workspace as a new user (invite acceptance)
 //! - Adding a new device to an existing workspace (device-link acceptance)
 //! - Creating user invites and device-link invites
+//! - Retrying pending invite content-key unwraps
 //!
 //! Service.rs calls these for event-domain work; transport/sync orchestration
 //! stays in service.
@@ -14,13 +15,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use ed25519_dalek::SigningKey;
 use rusqlite::Connection;
 
-use crate::crypto::EventId;
+use crate::crypto::{EventId, event_id_from_base64, event_id_to_base64};
 use crate::event_modules::{
     local_signer_secret::{
         LocalSignerSecretEvent, SIGNER_KIND_PEER_SHARED, SIGNER_KIND_USER, SIGNER_KIND_WORKSPACE,
     },
     DeviceInviteFirstEvent, InviteAcceptedEvent, ParsedEvent, PeerSharedFirstEvent,
     UserBootEvent, UserInviteBootEvent, WorkspaceEvent,
+};
+use crate::identity::ops::{
+    self, InviteBootstrapContext, JoinChain, LinkChain,
+    SIGNER_KIND_PENDING_INVITE_UNWRAP,
 };
 use crate::projection::apply::project_one;
 use crate::projection::create::{create_event_staged, create_event_sync, create_signed_event_sync, event_id_or_blocked};
@@ -60,7 +65,7 @@ pub struct CreateWorkspaceResult {
     pub peer_shared_key: SigningKey,
 }
 
-// ─── 2.1 Start workspace ───
+// ─── 1. Start workspace ───
 
 /// Create a new workspace with a full identity chain.
 ///
@@ -82,7 +87,6 @@ pub fn create_workspace(
 ) -> Result<CreateWorkspaceResult, Box<dyn std::error::Error + Send + Sync>> {
     // Idempotent check: if identity already exists, return it
     if let Some((eid, signing_key)) = load_local_peer_signer(db, recorded_by)? {
-        // Look up workspace_id from trust_anchors for the result
         let workspace_id = db
             .query_row(
                 "SELECT workspace_id FROM trust_anchors WHERE peer_id = ?1",
@@ -174,7 +178,7 @@ pub fn create_workspace(
     emit_local_signer_secret(db, recorded_by, &ws_eid, SIGNER_KIND_WORKSPACE, &workspace_key)?;
 
     // 8. Seed deterministic local content-key material
-    let _ = crate::identity::ops::ensure_content_key_for_peer(
+    let _ = ops::ensure_content_key_for_peer(
         db,
         recorded_by,
         &peer_shared_key,
@@ -188,7 +192,7 @@ pub fn create_workspace(
     })
 }
 
-// ─── 2.2 Join workspace as new user ───
+// ─── 2. Join workspace as new user ───
 
 /// Join a workspace by accepting a user invite.
 ///
@@ -206,19 +210,96 @@ pub fn join_workspace_as_new_user(
     workspace_id: EventId,
     username: &str,
     device_name: &str,
-) -> Result<crate::identity::ops::JoinChain, Box<dyn std::error::Error + Send + Sync>> {
-    let join = crate::identity::ops::accept_user_invite(
+) -> Result<JoinChain, Box<dyn std::error::Error + Send + Sync>> {
+    let mut rng = rand::thread_rng();
+
+    // Persist invite key material so content-key unwrap can be retried after
+    // late-arriving SecretShared prerequisites.
+    ops::store_pending_invite_unwrap_key(db, recorded_by, invite_event_id, invite_key)?;
+
+    // 1. InviteAccepted (local event) — binds trust anchor, triggers guard cascade
+    let ia_evt = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
+        created_at_ms: now_ms(),
+        invite_event_id: *invite_event_id,
+        workspace_id,
+    });
+    let invite_accepted_event_id = create_event_sync(db, recorded_by, &ia_evt)?;
+
+    // 2. UserBoot (signed by invite_key) — may block if invite event not yet synced.
+    // Tolerates Blocked: the event is stored and will project via cascade when
+    // the invite event arrives.
+    let user_key = SigningKey::generate(&mut rng);
+    let ub_evt = ParsedEvent::UserBoot(UserBootEvent {
+        created_at_ms: now_ms(),
+        public_key: user_key.verifying_key().to_bytes(),
+        username: username.to_string(),
+        signed_by: *invite_event_id,
+        signer_type: 2,
+        signature: [0u8; 64],
+    });
+    let user_event_id = event_id_or_blocked(create_signed_event_sync(
+        db,
+        recorded_by,
+        &ub_evt,
+        invite_key,
+    ))?;
+
+    // 3. DeviceInviteFirst (signed by user_key) — may block if UserBoot is blocked.
+    let device_invite_key = SigningKey::generate(&mut rng);
+    let dif_evt = ParsedEvent::DeviceInviteFirst(DeviceInviteFirstEvent {
+        created_at_ms: now_ms(),
+        public_key: device_invite_key.verifying_key().to_bytes(),
+        signed_by: user_event_id,
+        signer_type: 4,
+        signature: [0u8; 64],
+    });
+    let device_invite_event_id = event_id_or_blocked(create_signed_event_sync(
+        db,
+        recorded_by,
+        &dif_evt,
+        &user_key,
+    ))?;
+
+    // 4. PeerSharedFirst (signed by device_invite_key) — may block.
+    let peer_shared_key = SigningKey::generate(&mut rng);
+    let psf_evt = ParsedEvent::PeerSharedFirst(PeerSharedFirstEvent {
+        created_at_ms: now_ms(),
+        public_key: peer_shared_key.verifying_key().to_bytes(),
+        user_event_id,
+        device_name: device_name.to_string(),
+        signed_by: device_invite_event_id,
+        signer_type: 3,
+        signature: [0u8; 64],
+    });
+    let peer_shared_event_id = event_id_or_blocked(create_signed_event_sync(
+        db,
+        recorded_by,
+        &psf_evt,
+        &device_invite_key,
+    ))?;
+
+    // 5. Unwrap inviter-provided content key targeted at this invite (if present).
+    // May return None if the content key event hasn't been synced yet.
+    let content_key_event_id = ops::unwrap_content_key_from_invite(
         db,
         recorded_by,
         invite_key,
         invite_event_id,
-        workspace_id,
-        username,
-        device_name,
     )?;
-    // Content key may not be available yet if prereqs haven't been synced.
-    // It will be unwrapped when the content key event arrives via sync.
-    Ok(join)
+    if content_key_event_id.is_some() {
+        ops::clear_pending_invite_unwrap_key(db, recorded_by, invite_event_id)?;
+    }
+
+    Ok(JoinChain {
+        user_event_id,
+        user_key,
+        device_invite_event_id,
+        device_invite_key,
+        peer_shared_event_id,
+        peer_shared_key,
+        invite_accepted_event_id,
+        content_key_event_id,
+    })
 }
 
 /// Persist signer secrets for a join.
@@ -230,7 +311,7 @@ pub fn join_workspace_as_new_user(
 pub fn persist_join_signer_secrets(
     db: &Connection,
     recorded_by: &str,
-    join: &crate::identity::ops::JoinChain,
+    join: &JoinChain,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     emit_local_signer_secret(
         db,
@@ -249,7 +330,7 @@ pub fn persist_join_signer_secrets(
     Ok(())
 }
 
-// ─── 2.3 Add new device ───
+// ─── 3. Add new device ───
 
 /// Add a new device to an existing workspace by accepting a device link invite.
 ///
@@ -266,16 +347,42 @@ pub fn add_device_to_workspace(
     workspace_id: EventId,
     user_event_id: EventId,
     device_name: &str,
-) -> Result<crate::identity::ops::LinkChain, Box<dyn std::error::Error + Send + Sync>> {
-    crate::identity::ops::accept_device_link(
+) -> Result<LinkChain, Box<dyn std::error::Error + Send + Sync>> {
+    let mut rng = rand::thread_rng();
+
+    // 1. InviteAccepted (local event) — binds trust anchor, triggers guard cascade
+    let ia_evt = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
+        created_at_ms: now_ms(),
+        invite_event_id: *device_invite_event_id,
+        workspace_id,
+    });
+    let invite_accepted_event_id = create_event_sync(db, recorded_by, &ia_evt)?;
+
+    // 2. PeerSharedFirst (signed by device_invite_key) — may block if device invite
+    // event not yet synced. Tolerates Blocked: the event is stored and will project
+    // via cascade when prerequisites arrive.
+    let peer_shared_key = SigningKey::generate(&mut rng);
+    let psf_evt = ParsedEvent::PeerSharedFirst(PeerSharedFirstEvent {
+        created_at_ms: now_ms(),
+        public_key: peer_shared_key.verifying_key().to_bytes(),
+        user_event_id,
+        device_name: device_name.to_string(),
+        signed_by: *device_invite_event_id,
+        signer_type: 3,
+        signature: [0u8; 64],
+    });
+    let peer_shared_event_id = event_id_or_blocked(create_signed_event_sync(
         db,
         recorded_by,
+        &psf_evt,
         device_invite_key,
-        device_invite_event_id,
-        workspace_id,
-        user_event_id,
-        device_name,
-    )
+    ))?;
+
+    Ok(LinkChain {
+        peer_shared_event_id,
+        peer_shared_key,
+        invite_accepted_event_id,
+    })
 }
 
 /// Persist signer secrets for a device link.
@@ -284,7 +391,7 @@ pub fn add_device_to_workspace(
 pub fn persist_link_signer_secrets(
     db: &Connection,
     recorded_by: &str,
-    link: &crate::identity::ops::LinkChain,
+    link: &LinkChain,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     emit_local_signer_secret(
         db,
@@ -296,7 +403,7 @@ pub fn persist_link_signer_secrets(
     Ok(())
 }
 
-// ─── 3.1 Create user invite ───
+// ─── 4. Create user invite ───
 
 /// Result of creating a user or device-link invite.
 pub struct InviteResult {
@@ -318,18 +425,18 @@ pub fn create_user_invite(
     bootstrap_addr: &str,
     bootstrap_spki: &[u8; 32],
 ) -> Result<InviteResult, Box<dyn std::error::Error + Send + Sync>> {
-    let _ = crate::identity::ops::ensure_content_key_for_peer(
+    let _ = ops::ensure_content_key_for_peer(
         db,
         recorded_by,
         peer_shared_key,
         peer_shared_event_id,
     )?;
 
-    let ctx = crate::identity::ops::InviteBootstrapContext {
+    let ctx = InviteBootstrapContext {
         bootstrap_addr,
         bootstrap_spki,
     };
-    let invite = crate::identity::ops::create_user_invite(
+    let invite = ops::create_user_invite_events(
         db,
         recorded_by,
         workspace_key,
@@ -348,8 +455,8 @@ pub fn create_user_invite(
     crate::db::transport_trust::record_pending_invite_bootstrap_trust(
         db,
         recorded_by,
-        &crate::crypto::event_id_to_base64(&invite.invite_event_id),
-        &crate::crypto::event_id_to_base64(workspace_id),
+        &event_id_to_base64(&invite.invite_event_id),
+        &event_id_to_base64(workspace_id),
         &joiner_spki,
     )?;
 
@@ -362,7 +469,7 @@ pub fn create_user_invite(
     })
 }
 
-// ─── 3.2 Create device-link invite ───
+// ─── 5. Create device-link invite ───
 
 /// Create a device-link invite for an existing user.
 ///
@@ -377,11 +484,11 @@ pub fn create_device_link_invite(
     bootstrap_addr: &str,
     bootstrap_spki: &[u8; 32],
 ) -> Result<InviteResult, Box<dyn std::error::Error + Send + Sync>> {
-    let ctx = crate::identity::ops::InviteBootstrapContext {
+    let ctx = InviteBootstrapContext {
         bootstrap_addr,
         bootstrap_spki,
     };
-    let invite = crate::identity::ops::create_device_link_invite(
+    let invite = ops::create_device_link_invite_events(
         db,
         recorded_by,
         user_key,
@@ -399,8 +506,8 @@ pub fn create_device_link_invite(
     crate::db::transport_trust::record_pending_invite_bootstrap_trust(
         db,
         recorded_by,
-        &crate::crypto::event_id_to_base64(&invite.invite_event_id),
-        &crate::crypto::event_id_to_base64(workspace_id),
+        &event_id_to_base64(&invite.invite_event_id),
+        &event_id_to_base64(workspace_id),
         &joiner_spki,
     )?;
 
@@ -413,7 +520,55 @@ pub fn create_device_link_invite(
     })
 }
 
-// ─── 3.3 Key loading helpers ───
+// ─── 6. Retry pending invite content-key unwraps ───
+
+/// Retry pending content-key unwraps for invite accept flows.
+///
+/// Accept paths persist invite private keys in `local_signer_material` with
+/// `signer_kind=4` so runtime projection can retry unwrap when SecretShared
+/// arrives later via sync.
+pub fn retry_pending_invite_content_key_unwraps(
+    db: &Connection,
+    recorded_by: &str,
+) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    let mut stmt = db.prepare(
+        "SELECT signer_event_id, private_key
+         FROM local_signer_material
+         WHERE recorded_by = ?1 AND signer_kind = ?2",
+    )?;
+    let rows = stmt
+        .query_map(
+            rusqlite::params![recorded_by, SIGNER_KIND_PENDING_INVITE_UNWRAP],
+            |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            },
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(stmt);
+
+    let mut unwrapped = 0usize;
+    for (invite_event_b64, key_bytes) in rows {
+        let invite_event_id = match event_id_from_base64(&invite_event_b64) {
+            Some(eid) => eid,
+            None => continue,
+        };
+        if key_bytes.len() != 32 {
+            continue;
+        }
+        let mut key_arr = [0u8; 32];
+        key_arr.copy_from_slice(&key_bytes);
+        let invite_key = SigningKey::from_bytes(&key_arr);
+
+        if ops::unwrap_content_key_from_invite(db, recorded_by, &invite_key, &invite_event_id)?.is_some() {
+            ops::clear_pending_invite_unwrap_key(db, recorded_by, &invite_event_id)?;
+            unwrapped += 1;
+        }
+    }
+
+    Ok(unwrapped)
+}
+
+// ─── 7. Key loading helpers ───
 
 /// Load workspace signing key from local signer material.
 ///
@@ -442,6 +597,50 @@ pub fn load_workspace_signing_key(
         return Ok(Some((eid, signing_key)));
     }
     Ok(None)
+}
+
+// ─── 8. Test-only helpers ───
+
+/// Create a user invite without bootstrap context.
+/// Returns InviteData directly without formatting an invite link.
+/// Used by test fixtures and scenarios that handle bootstrap separately.
+pub fn create_user_invite_raw(
+    db: &Connection,
+    recorded_by: &str,
+    workspace_key: &SigningKey,
+    workspace_id: &EventId,
+    sender_peer_shared_key: Option<&SigningKey>,
+    sender_peer_shared_event_id: Option<&EventId>,
+) -> Result<crate::identity::ops::InviteData, Box<dyn std::error::Error + Send + Sync>> {
+    ops::create_user_invite_events(
+        db,
+        recorded_by,
+        workspace_key,
+        workspace_id,
+        sender_peer_shared_key,
+        sender_peer_shared_event_id,
+        None,
+    )
+}
+
+/// Create a device-link invite without bootstrap context.
+/// Returns InviteData directly without formatting an invite link.
+/// Used by test fixtures and scenarios that handle bootstrap separately.
+pub fn create_device_link_invite_raw(
+    db: &Connection,
+    recorded_by: &str,
+    user_key: &SigningKey,
+    user_event_id: &EventId,
+    workspace_id: &EventId,
+) -> Result<crate::identity::ops::InviteData, Box<dyn std::error::Error + Send + Sync>> {
+    ops::create_device_link_invite_events(
+        db,
+        recorded_by,
+        user_key,
+        user_event_id,
+        workspace_id,
+        None,
+    )
 }
 
 // ─── Private helpers ───
