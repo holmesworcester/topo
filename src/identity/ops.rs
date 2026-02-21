@@ -1,20 +1,26 @@
+//! Identity primitives and helpers.
+//!
+//! This module owns reusable crypto/data helpers for identity operations.
+//! Workflow orchestration (event creation sequences, invite flows) is owned
+//! by `event_modules::workspace::commands`.
+
 use ed25519_dalek::SigningKey;
 use rusqlite::Connection;
 
 use crate::crypto::{EventId, event_id_from_base64, event_id_to_base64, hash_event};
 use crate::event_modules::*;
 use crate::projection::create::{
-    create_event_sync, create_event_staged, create_signed_event_sync, create_signed_event_staged,
-    store_signed_event_only, project_event, event_id_or_blocked,
+    create_event_sync, create_signed_event_sync,
+    store_signed_event_only, project_event,
 };
 use crate::projection::encrypted::{wrap_key_for_recipient, unwrap_key_from_sender};
 use crate::projection::signer::{resolve_signer_key, SignerResolution};
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const SIGNER_KIND_PENDING_INVITE_UNWRAP: i64 = 4;
+pub(crate) const SIGNER_KIND_PENDING_INVITE_UNWRAP: i64 = 4;
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -65,45 +71,9 @@ fn deterministic_secret_key_event_id(
     Ok(hash_event(&encode_event(&sk_evt)?))
 }
 
-/// Ensure the local tenant has at least one content key + self-wrap materialized.
-/// Returns the canonical key_event_id to use in key-wrap and encrypted deps.
-pub fn ensure_content_key_for_peer(
-    conn: &Connection,
-    recorded_by: &str,
-    peer_shared_key: &SigningKey,
-    peer_shared_event_id: &EventId,
-) -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
-    let existing: Option<String> = conn
-        .query_row(
-            "SELECT event_id FROM secret_keys WHERE recorded_by = ?1 ORDER BY rowid ASC LIMIT 1",
-            rusqlite::params![recorded_by],
-            |row| row.get(0),
-        )
-        .ok();
-    if let Some(eid_b64) = existing {
-        let eid = event_id_from_base64(&eid_b64)
-            .ok_or("invalid secret_keys.event_id base64")?;
-        return Ok(eid);
-    }
-    create_content_key_and_self_wrap(conn, recorded_by, peer_shared_key, peer_shared_event_id)
-}
-
-/// Result of bootstrapping a full workspace identity chain.
-pub struct IdentityChain {
-    pub workspace_id: EventId,
-    pub workspace_key: SigningKey,
-    pub user_invite_event_id: EventId,
-    pub invite_key: SigningKey,
-    pub user_event_id: EventId,
-    pub user_key: SigningKey,
-    pub device_invite_event_id: EventId,
-    pub device_invite_key: SigningKey,
-    pub peer_shared_event_id: EventId,
-    pub peer_shared_key: SigningKey,
-    pub admin_event_id: EventId,
-    pub admin_key: SigningKey,
-    pub content_key_event_id: Option<EventId>,
-}
+// ---------------------------------------------------------------------------
+// Data types (shared across modules)
+// ---------------------------------------------------------------------------
 
 /// Result of accepting a user invite.
 pub struct JoinChain {
@@ -139,161 +109,6 @@ pub enum InviteType {
     DeviceLink { user_event_id: EventId },
 }
 
-/// Bootstrap a full workspace identity chain following the canonical sequence from scenario tests:
-/// Workspace -> UserInviteBoot -> InviteAccepted (trust anchor) -> UserBoot ->
-/// DeviceInviteFirst -> PeerSharedFirst -> AdminBoot.
-///
-/// InviteAccepted must come early to bind the trust anchor, which triggers a
-/// guard-cascade that unblocks the Workspace event and all its dependents.
-pub fn bootstrap_workspace(
-    conn: &Connection,
-    recorded_by: &str,
-    workspace_name: &str,
-    username: &str,
-    device_name: &str,
-) -> Result<IdentityChain, Box<dyn std::error::Error + Send + Sync>> {
-    let mut rng = rand::thread_rng();
-
-    // 1. Workspace event (unsigned) — guard-blocked until trust anchor exists
-    let workspace_key = SigningKey::generate(&mut rng);
-    let workspace_pub = workspace_key.verifying_key().to_bytes();
-    let net_evt = ParsedEvent::Workspace(WorkspaceEvent {
-        created_at_ms: now_ms(),
-        public_key: workspace_pub,
-        name: workspace_name.to_string(),
-    });
-    let workspace_id = create_event_staged(conn, recorded_by, &net_evt)?;
-
-    // 2. UserInviteBoot (signed by workspace_key) — blocked until Workspace is valid
-    let invite_key = SigningKey::generate(&mut rng);
-    let invite_pub = invite_key.verifying_key().to_bytes();
-    let uib_evt = ParsedEvent::UserInviteBoot(UserInviteBootEvent {
-        created_at_ms: now_ms(),
-        public_key: invite_pub,
-        workspace_id: workspace_id,
-        signed_by: workspace_id,
-        signer_type: 1,
-        signature: [0u8; 64],
-    });
-    let user_invite_event_id = create_signed_event_staged(
-        conn,
-        recorded_by,
-        &uib_evt,
-        &workspace_key,
-    )?;
-
-    // 3. InviteAccepted (local event) — binds trust anchor, triggers guard cascade
-    //    that unblocks Workspace -> UserInviteBoot -> and all downstream events
-    let ia_evt = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
-        created_at_ms: now_ms(),
-        invite_event_id: user_invite_event_id,
-        workspace_id: workspace_id,
-    });
-    let _invite_accepted_event_id = create_event_sync(conn, recorded_by, &ia_evt)?;
-
-    // 4. UserBoot (signed by invite_key) — should now project since cascade unblocked chain
-    let user_key = SigningKey::generate(&mut rng);
-    let user_pub = user_key.verifying_key().to_bytes();
-    let ub_evt = ParsedEvent::UserBoot(UserBootEvent {
-        created_at_ms: now_ms(),
-        public_key: user_pub,
-        username: username.to_string(),
-        signed_by: user_invite_event_id,
-        signer_type: 2,
-        signature: [0u8; 64],
-    });
-    let user_event_id = create_signed_event_sync(
-        conn,
-        recorded_by,
-        &ub_evt,
-        &invite_key,
-    )?;
-
-    // 5. DeviceInviteFirst (signed by user_key)
-    let device_invite_key = SigningKey::generate(&mut rng);
-    let device_invite_pub = device_invite_key.verifying_key().to_bytes();
-    let dif_evt = ParsedEvent::DeviceInviteFirst(DeviceInviteFirstEvent {
-        created_at_ms: now_ms(),
-        public_key: device_invite_pub,
-        signed_by: user_event_id,
-        signer_type: 4,
-        signature: [0u8; 64],
-    });
-    let device_invite_event_id = create_signed_event_sync(
-        conn,
-        recorded_by,
-        &dif_evt,
-        &user_key,
-    )?;
-
-    // 6. PeerSharedFirst (signed by device_invite_key)
-    let peer_shared_key = SigningKey::generate(&mut rng);
-    let peer_shared_pub = peer_shared_key.verifying_key().to_bytes();
-    let psf_evt = ParsedEvent::PeerSharedFirst(PeerSharedFirstEvent {
-        created_at_ms: now_ms(),
-        public_key: peer_shared_pub,
-        user_event_id,
-        device_name: device_name.to_string(),
-        signed_by: device_invite_event_id,
-        signer_type: 3,
-        signature: [0u8; 64],
-    });
-    let peer_shared_event_id = create_signed_event_sync(
-        conn,
-        recorded_by,
-        &psf_evt,
-        &device_invite_key,
-    )?;
-
-    // 7. AdminBoot (signed by workspace_key, dep: user_event)
-    let admin_key = SigningKey::generate(&mut rng);
-    let admin_pub = admin_key.verifying_key().to_bytes();
-    let ab_evt = ParsedEvent::AdminBoot(AdminBootEvent {
-        created_at_ms: now_ms(),
-        public_key: admin_pub,
-        user_event_id,
-        signed_by: workspace_id,
-        signer_type: 1,
-        signature: [0u8; 64],
-    });
-    let admin_event_id = create_signed_event_sync(
-        conn,
-        recorded_by,
-        &ab_evt,
-        &workspace_key,
-    )?;
-
-    // 8. Create deterministic local content key + self-wrap (bootstrap key seed).
-    let content_key_event_id = Some(ensure_content_key_for_peer(
-        conn,
-        recorded_by,
-        &peer_shared_key,
-        &peer_shared_event_id,
-    )?);
-
-    Ok(IdentityChain {
-        workspace_id,
-        workspace_key,
-        user_invite_event_id,
-        invite_key,
-        user_event_id,
-        user_key,
-        device_invite_event_id,
-        device_invite_key,
-        peer_shared_event_id,
-        peer_shared_key,
-        admin_event_id,
-        admin_key,
-        content_key_event_id,
-    })
-}
-
-/// Create a user invite (admin creates this). Returns InviteData with the private key
-/// needed for the invitee to accept.
-///
-/// If `sender_peer_shared_key` and `sender_peer_shared_event_id` are provided,
-/// wraps the workspace content key for the invitee's invite public key and
-/// creates a SecretShared event so the joiner can unwrap on acceptance.
 /// Bootstrap context for invite creation. When provided, bootstrap_context
 /// is written between event storage and projection so the projector can
 /// emit trust commands.
@@ -302,319 +117,37 @@ pub struct InviteBootstrapContext<'a> {
     pub bootstrap_spki: &'a [u8; 32],
 }
 
-pub fn create_user_invite(
-    conn: &Connection,
-    recorded_by: &str,
-    workspace_key: &SigningKey,
-    workspace_id: &EventId,
-    sender_peer_shared_key: Option<&SigningKey>,
-    sender_peer_shared_event_id: Option<&EventId>,
-    bootstrap_ctx: Option<&InviteBootstrapContext<'_>>,
-) -> Result<InviteData, Box<dyn std::error::Error + Send + Sync>> {
-    let mut rng = rand::thread_rng();
-    let invite_key = SigningKey::generate(&mut rng);
-    let invite_pub = invite_key.verifying_key().to_bytes();
+// ---------------------------------------------------------------------------
+// Reusable primitive helpers (pub(crate) for event-module command use)
+// ---------------------------------------------------------------------------
 
-    let evt = ParsedEvent::UserInviteBoot(UserInviteBootEvent {
-        created_at_ms: now_ms(),
-        public_key: invite_pub,
-        workspace_id: *workspace_id,
-        signed_by: *workspace_id,
-        signer_type: 1,
-        signature: [0u8; 64],
-    });
-
-    let invite_event_id = if let Some(ctx) = bootstrap_ctx {
-        // Split flow: store → write context → project
-        let eid = store_signed_event_only(conn, recorded_by, &evt, workspace_key)?;
-        crate::db::transport_trust::append_bootstrap_context(
-            conn,
-            recorded_by,
-            &event_id_to_base64(&eid),
-            &event_id_to_base64(workspace_id),
-            ctx.bootstrap_addr,
-            ctx.bootstrap_spki,
-        )?;
-        project_event(conn, recorded_by, &eid)?;
-        eid
-    } else {
-        // Normal flow: store + project inline (no bootstrap context needed)
-        create_signed_event_sync(conn, recorded_by, &evt, workspace_key)?
-    };
-
-    // Wrap content key for invitee if sender has peer_shared identity
-    if let (Some(ps_key), Some(ps_eid)) = (sender_peer_shared_key, sender_peer_shared_event_id) {
-        wrap_content_key_for_invite(
-            conn,
-            recorded_by,
-            ps_key,
-            ps_eid,
-            &invite_key.verifying_key(),
-            &invite_event_id,
-        )?;
-    }
-
-    Ok(InviteData {
-        invite_event_id,
-        invite_key,
-        workspace_id: *workspace_id,
-        invite_type: InviteType::User,
-    })
-}
-
-/// Accept a user invite: InviteAccepted (trust anchor) -> UserBoot -> DeviceInviteFirst ->
-/// PeerSharedFirst.
-///
-/// InviteAccepted must come first to bind the trust anchor and trigger the guard cascade
-/// that makes the copied Workspace/UserInviteBoot events valid.
-pub fn accept_user_invite(
-    conn: &Connection,
-    recorded_by: &str,
-    invite_key: &SigningKey,
-    invite_event_id: &EventId,
-    workspace_id: EventId,
-    username: &str,
-    device_name: &str,
-) -> Result<JoinChain, Box<dyn std::error::Error + Send + Sync>> {
-    let mut rng = rand::thread_rng();
-    // Persist invite key material so content-key unwrap can be retried after
-    // late-arriving SecretShared prerequisites.
-    store_pending_invite_unwrap_key(conn, recorded_by, invite_event_id, invite_key)?;
-
-    // 1. InviteAccepted (local event) — binds trust anchor, triggers guard cascade
-    let ia_evt = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
-        created_at_ms: now_ms(),
-        invite_event_id: *invite_event_id,
-        workspace_id: workspace_id,
-    });
-    let invite_accepted_event_id = create_event_sync(conn, recorded_by, &ia_evt)?;
-
-    // 2. UserBoot (signed by invite_key) — may block if invite event not yet synced.
-    // Tolerates Blocked: the event is stored and will project via cascade when
-    // the invite event arrives.
-    let user_key = SigningKey::generate(&mut rng);
-    let user_pub = user_key.verifying_key().to_bytes();
-    let ub_evt = ParsedEvent::UserBoot(UserBootEvent {
-        created_at_ms: now_ms(),
-        public_key: user_pub,
-        username: username.to_string(),
-        signed_by: *invite_event_id,
-        signer_type: 2,
-        signature: [0u8; 64],
-    });
-    let user_event_id = event_id_or_blocked(create_signed_event_sync(
-        conn,
-        recorded_by,
-        &ub_evt,
-        invite_key,
-    ))?;
-
-    // 3. DeviceInviteFirst (signed by user_key) — may block if UserBoot is blocked.
-    let device_invite_key = SigningKey::generate(&mut rng);
-    let device_invite_pub = device_invite_key.verifying_key().to_bytes();
-    let dif_evt = ParsedEvent::DeviceInviteFirst(DeviceInviteFirstEvent {
-        created_at_ms: now_ms(),
-        public_key: device_invite_pub,
-        signed_by: user_event_id,
-        signer_type: 4,
-        signature: [0u8; 64],
-    });
-    let device_invite_event_id = event_id_or_blocked(create_signed_event_sync(
-        conn,
-        recorded_by,
-        &dif_evt,
-        &user_key,
-    ))?;
-
-    // 4. PeerSharedFirst (signed by device_invite_key) — may block.
-    let peer_shared_key = SigningKey::generate(&mut rng);
-    let peer_shared_pub = peer_shared_key.verifying_key().to_bytes();
-    let psf_evt = ParsedEvent::PeerSharedFirst(PeerSharedFirstEvent {
-        created_at_ms: now_ms(),
-        public_key: peer_shared_pub,
-        user_event_id,
-        device_name: device_name.to_string(),
-        signed_by: device_invite_event_id,
-        signer_type: 3,
-        signature: [0u8; 64],
-    });
-    let peer_shared_event_id = event_id_or_blocked(create_signed_event_sync(
-        conn,
-        recorded_by,
-        &psf_evt,
-        &device_invite_key,
-    ))?;
-
-    // 5. Unwrap inviter-provided content key targeted at this invite (if present).
-    // May return None if the content key event hasn't been synced yet.
-    let content_key_event_id = unwrap_content_key_from_invite(
-        conn,
-        recorded_by,
-        invite_key,
-        invite_event_id,
-    )?;
-    if content_key_event_id.is_some() {
-        clear_pending_invite_unwrap_key(conn, recorded_by, invite_event_id)?;
-    }
-
-    Ok(JoinChain {
-        user_event_id,
-        user_key,
-        device_invite_event_id,
-        device_invite_key,
-        peer_shared_event_id,
-        peer_shared_key,
-        invite_accepted_event_id,
-        content_key_event_id,
-    })
-}
-
-/// Create a device link invite (user creates this for linking another device).
-pub fn create_device_link_invite(
-    conn: &Connection,
-    recorded_by: &str,
-    user_key: &SigningKey,
-    user_event_id: &EventId,
-    workspace_id: &EventId,
-    bootstrap_ctx: Option<&InviteBootstrapContext<'_>>,
-) -> Result<InviteData, Box<dyn std::error::Error + Send + Sync>> {
-    let mut rng = rand::thread_rng();
-    let device_invite_key = SigningKey::generate(&mut rng);
-    let device_invite_pub = device_invite_key.verifying_key().to_bytes();
-
-    let evt = ParsedEvent::DeviceInviteFirst(DeviceInviteFirstEvent {
-        created_at_ms: now_ms(),
-        public_key: device_invite_pub,
-        signed_by: *user_event_id,
-        signer_type: 4,
-        signature: [0u8; 64],
-    });
-
-    let invite_event_id = if let Some(ctx) = bootstrap_ctx {
-        // Split flow: store → write context → project
-        let eid = store_signed_event_only(conn, recorded_by, &evt, user_key)?;
-        crate::db::transport_trust::append_bootstrap_context(
-            conn,
-            recorded_by,
-            &event_id_to_base64(&eid),
-            &event_id_to_base64(workspace_id),
-            ctx.bootstrap_addr,
-            ctx.bootstrap_spki,
-        )?;
-        project_event(conn, recorded_by, &eid)?;
-        eid
-    } else {
-        // Normal flow: store + project inline
-        create_signed_event_sync(conn, recorded_by, &evt, user_key)?
-    };
-
-    Ok(InviteData {
-        invite_event_id,
-        invite_key: device_invite_key,
-        workspace_id: *workspace_id,
-        invite_type: InviteType::DeviceLink {
-            user_event_id: *user_event_id,
-        },
-    })
-}
-
-/// Accept a device link invite: InviteAccepted (trust anchor) -> PeerSharedFirst.
-pub fn accept_device_link(
-    conn: &Connection,
-    recorded_by: &str,
-    device_invite_key: &SigningKey,
-    device_invite_event_id: &EventId,
-    workspace_id: EventId,
-    user_event_id: EventId,
-    device_name: &str,
-) -> Result<LinkChain, Box<dyn std::error::Error + Send + Sync>> {
-    let mut rng = rand::thread_rng();
-
-    // 1. InviteAccepted (local event) — binds trust anchor, triggers guard cascade
-    let ia_evt = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
-        created_at_ms: now_ms(),
-        invite_event_id: *device_invite_event_id,
-        workspace_id: workspace_id,
-    });
-    let invite_accepted_event_id = create_event_sync(conn, recorded_by, &ia_evt)?;
-
-    // 2. PeerSharedFirst (signed by device_invite_key) — may block if device invite
-    // event not yet synced. Tolerates Blocked: the event is stored and will project
-    // via cascade when prerequisites arrive.
-    let peer_shared_key = SigningKey::generate(&mut rng);
-    let peer_shared_pub = peer_shared_key.verifying_key().to_bytes();
-    let psf_evt = ParsedEvent::PeerSharedFirst(PeerSharedFirstEvent {
-        created_at_ms: now_ms(),
-        public_key: peer_shared_pub,
-        user_event_id,
-        device_name: device_name.to_string(),
-        signed_by: *device_invite_event_id,
-        signer_type: 3,
-        signature: [0u8; 64],
-    });
-    let peer_shared_event_id = event_id_or_blocked(create_signed_event_sync(
-        conn,
-        recorded_by,
-        &psf_evt,
-        device_invite_key,
-    ))?;
-
-    Ok(LinkChain {
-        peer_shared_event_id,
-        peer_shared_key,
-        invite_accepted_event_id,
-    })
-}
-
-/// Generate a random 32-byte content secret key, create a local SecretKey event,
-/// then wrap it for our own peer_shared public key via SecretShared (self-wrap).
-/// Returns the SecretKey event_id on success.
-fn create_content_key_and_self_wrap(
+/// Ensure the local tenant has at least one content key + self-wrap materialized.
+/// Returns the canonical key_event_id to use in key-wrap and encrypted deps.
+pub(crate) fn ensure_content_key_for_peer(
     conn: &Connection,
     recorded_by: &str,
     peer_shared_key: &SigningKey,
     peer_shared_event_id: &EventId,
 ) -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
-    let mut rng = rand::thread_rng();
-
-    // 1. Generate random content key
-    let mut content_key_bytes = [0u8; 32];
-    rand::RngCore::fill_bytes(&mut rng, &mut content_key_bytes);
-
-    // 2. Create deterministic SecretKey event (local-only, stores the raw key)
-    let key_event_id = create_deterministic_secret_key_event(conn, recorded_by, content_key_bytes)?;
-
-    // 3. Wrap content key for self (peer_shared -> peer_shared)
-    let wrapped = wrap_key_for_recipient(
-        peer_shared_key,
-        &peer_shared_key.verifying_key(),
-        &content_key_bytes,
-    );
-
-    // 4. Create SecretShared event (self-wrap, signed by peer_shared_key)
-    let ss_evt = ParsedEvent::SecretShared(SecretSharedEvent {
-        created_at_ms: now_ms(),
-        key_event_id: key_event_id,
-        recipient_event_id: *peer_shared_event_id,
-        wrapped_key: wrapped,
-        signed_by: *peer_shared_event_id,
-        signer_type: 5,
-        signature: [0u8; 64],
-    });
-    let _ss_event_id = create_signed_event_sync(
-        conn,
-        recorded_by,
-        &ss_evt,
-        peer_shared_key,
-    )?;
-
-    Ok(key_event_id)
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT event_id FROM secret_keys WHERE recorded_by = ?1 ORDER BY rowid ASC LIMIT 1",
+            rusqlite::params![recorded_by],
+            |row| row.get(0),
+        )
+        .ok();
+    if let Some(eid_b64) = existing {
+        let eid = event_id_from_base64(&eid_b64)
+            .ok_or("invalid secret_keys.event_id base64")?;
+        return Ok(eid);
+    }
+    create_content_key_and_self_wrap(conn, recorded_by, peer_shared_key, peer_shared_event_id)
 }
 
 /// Wrap the workspace's content key for an invitee's invite public key.
 /// Looks up the first SecretKey event for this tenant, wraps it, and
 /// creates a SecretShared event with recipient_event_id = invite_event_id.
-fn wrap_content_key_for_invite(
+pub(crate) fn wrap_content_key_for_invite(
     conn: &Connection,
     recorded_by: &str,
     sender_peer_shared_key: &SigningKey,
@@ -622,7 +155,6 @@ fn wrap_content_key_for_invite(
     invite_public_key: &ed25519_dalek::VerifyingKey,
     invite_event_id: &EventId,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Ensure there is a canonical content key to wrap for the invitee.
     let key_event_id = ensure_content_key_for_peer(
         conn,
         recorded_by,
@@ -642,14 +174,12 @@ fn wrap_content_key_for_invite(
     let mut plaintext_key = [0u8; 32];
     plaintext_key.copy_from_slice(&key_bytes);
 
-    // Wrap for invitee's public key
     let wrapped = wrap_key_for_recipient(
         sender_peer_shared_key,
         invite_public_key,
         &plaintext_key,
     );
 
-    // Create SecretShared event (signed by sender's peer_shared_key)
     let ss_evt = ParsedEvent::SecretShared(SecretSharedEvent {
         created_at_ms: now_ms(),
         key_event_id,
@@ -669,56 +199,10 @@ fn wrap_content_key_for_invite(
     Ok(())
 }
 
-/// Retry pending content-key unwraps for invite accept flows.
-///
-/// Accept paths persist invite private keys in `local_signer_material` with
-/// `signer_kind=4` so runtime projection can retry unwrap when SecretShared
-/// arrives later via sync.
-pub fn retry_pending_invite_content_key_unwraps(
-    conn: &Connection,
-    recorded_by: &str,
-) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-    let mut stmt = conn.prepare(
-        "SELECT signer_event_id, private_key
-         FROM local_signer_material
-         WHERE recorded_by = ?1 AND signer_kind = ?2",
-    )?;
-    let rows = stmt
-        .query_map(
-            rusqlite::params![recorded_by, SIGNER_KIND_PENDING_INVITE_UNWRAP],
-            |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-            },
-        )?
-        .collect::<Result<Vec<_>, _>>()?;
-    drop(stmt);
-
-    let mut unwrapped = 0usize;
-    for (invite_event_b64, key_bytes) in rows {
-        let invite_event_id = match event_id_from_base64(&invite_event_b64) {
-            Some(eid) => eid,
-            None => continue,
-        };
-        if key_bytes.len() != 32 {
-            continue;
-        }
-        let mut key_arr = [0u8; 32];
-        key_arr.copy_from_slice(&key_bytes);
-        let invite_key = SigningKey::from_bytes(&key_arr);
-
-        if unwrap_content_key_from_invite(conn, recorded_by, &invite_key, &invite_event_id)?.is_some() {
-            clear_pending_invite_unwrap_key(conn, recorded_by, &invite_event_id)?;
-            unwrapped += 1;
-        }
-    }
-
-    Ok(unwrapped)
-}
-
 /// After accepting an invite, look up any SecretShared events targeted at
 /// the invite_event_id, unwrap using the invite private key and the sender's
 /// public key, and create a local SecretKey event for the decrypted content key.
-fn unwrap_content_key_from_invite(
+pub(crate) fn unwrap_content_key_from_invite(
     conn: &Connection,
     recorded_by: &str,
     invite_key: &SigningKey,
@@ -767,7 +251,9 @@ fn unwrap_content_key_from_invite(
     Ok(None)
 }
 
-fn store_pending_invite_unwrap_key(
+/// Persist invite key material so content-key unwrap can be retried after
+/// late-arriving SecretShared prerequisites.
+pub(crate) fn store_pending_invite_unwrap_key(
     conn: &Connection,
     recorded_by: &str,
     invite_event_id: &EventId,
@@ -788,7 +274,7 @@ fn store_pending_invite_unwrap_key(
     Ok(())
 }
 
-fn clear_pending_invite_unwrap_key(
+pub(crate) fn clear_pending_invite_unwrap_key(
     conn: &Connection,
     recorded_by: &str,
     invite_event_id: &EventId,
@@ -803,4 +289,155 @@ fn clear_pending_invite_unwrap_key(
         ],
     )?;
     Ok(())
+}
+
+/// Create a user invite event and wrap content key for invitee.
+/// This is the core event-creation primitive for user invites.
+pub(crate) fn create_user_invite_events(
+    conn: &Connection,
+    recorded_by: &str,
+    workspace_key: &SigningKey,
+    workspace_id: &EventId,
+    sender_peer_shared_key: Option<&SigningKey>,
+    sender_peer_shared_event_id: Option<&EventId>,
+    bootstrap_ctx: Option<&InviteBootstrapContext<'_>>,
+) -> Result<InviteData, Box<dyn std::error::Error + Send + Sync>> {
+    let mut rng = rand::thread_rng();
+    let invite_key = SigningKey::generate(&mut rng);
+    let invite_pub = invite_key.verifying_key().to_bytes();
+
+    let evt = ParsedEvent::UserInviteBoot(UserInviteBootEvent {
+        created_at_ms: now_ms(),
+        public_key: invite_pub,
+        workspace_id: *workspace_id,
+        signed_by: *workspace_id,
+        signer_type: 1,
+        signature: [0u8; 64],
+    });
+
+    let invite_event_id = if let Some(ctx) = bootstrap_ctx {
+        let eid = store_signed_event_only(conn, recorded_by, &evt, workspace_key)?;
+        crate::db::transport_trust::append_bootstrap_context(
+            conn,
+            recorded_by,
+            &event_id_to_base64(&eid),
+            &event_id_to_base64(workspace_id),
+            ctx.bootstrap_addr,
+            ctx.bootstrap_spki,
+        )?;
+        project_event(conn, recorded_by, &eid)?;
+        eid
+    } else {
+        create_signed_event_sync(conn, recorded_by, &evt, workspace_key)?
+    };
+
+    if let (Some(ps_key), Some(ps_eid)) = (sender_peer_shared_key, sender_peer_shared_event_id) {
+        wrap_content_key_for_invite(
+            conn,
+            recorded_by,
+            ps_key,
+            ps_eid,
+            &invite_key.verifying_key(),
+            &invite_event_id,
+        )?;
+    }
+
+    Ok(InviteData {
+        invite_event_id,
+        invite_key,
+        workspace_id: *workspace_id,
+        invite_type: InviteType::User,
+    })
+}
+
+/// Create a device link invite event.
+/// This is the core event-creation primitive for device-link invites.
+pub(crate) fn create_device_link_invite_events(
+    conn: &Connection,
+    recorded_by: &str,
+    user_key: &SigningKey,
+    user_event_id: &EventId,
+    workspace_id: &EventId,
+    bootstrap_ctx: Option<&InviteBootstrapContext<'_>>,
+) -> Result<InviteData, Box<dyn std::error::Error + Send + Sync>> {
+    let mut rng = rand::thread_rng();
+    let device_invite_key = SigningKey::generate(&mut rng);
+    let device_invite_pub = device_invite_key.verifying_key().to_bytes();
+
+    let evt = ParsedEvent::DeviceInviteFirst(DeviceInviteFirstEvent {
+        created_at_ms: now_ms(),
+        public_key: device_invite_pub,
+        signed_by: *user_event_id,
+        signer_type: 4,
+        signature: [0u8; 64],
+    });
+
+    let invite_event_id = if let Some(ctx) = bootstrap_ctx {
+        let eid = store_signed_event_only(conn, recorded_by, &evt, user_key)?;
+        crate::db::transport_trust::append_bootstrap_context(
+            conn,
+            recorded_by,
+            &event_id_to_base64(&eid),
+            &event_id_to_base64(workspace_id),
+            ctx.bootstrap_addr,
+            ctx.bootstrap_spki,
+        )?;
+        project_event(conn, recorded_by, &eid)?;
+        eid
+    } else {
+        create_signed_event_sync(conn, recorded_by, &evt, user_key)?
+    };
+
+    Ok(InviteData {
+        invite_event_id,
+        invite_key: device_invite_key,
+        workspace_id: *workspace_id,
+        invite_type: InviteType::DeviceLink {
+            user_event_id: *user_event_id,
+        },
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Private helpers
+// ---------------------------------------------------------------------------
+
+/// Generate a random 32-byte content secret key, create a local SecretKey event,
+/// then wrap it for our own peer_shared public key via SecretShared (self-wrap).
+fn create_content_key_and_self_wrap(
+    conn: &Connection,
+    recorded_by: &str,
+    peer_shared_key: &SigningKey,
+    peer_shared_event_id: &EventId,
+) -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
+    let mut rng = rand::thread_rng();
+
+    let mut content_key_bytes = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rng, &mut content_key_bytes);
+
+    let key_event_id = create_deterministic_secret_key_event(conn, recorded_by, content_key_bytes)?;
+
+    let wrapped = wrap_key_for_recipient(
+        peer_shared_key,
+        &peer_shared_key.verifying_key(),
+        &content_key_bytes,
+    );
+
+    let ss_evt = ParsedEvent::SecretShared(SecretSharedEvent {
+        created_at_ms: now_ms(),
+        key_event_id: key_event_id,
+        recipient_event_id: *peer_shared_event_id,
+        wrapped_key: wrapped,
+        signed_by: *peer_shared_event_id,
+        signer_type: 5,
+        signature: [0u8; 64],
+    });
+    let _ss_event_id = create_signed_event_sync(
+        conn,
+        recorded_by,
+        &ss_evt,
+        peer_shared_key,
+    )?;
+
+    Ok(key_event_id)
 }

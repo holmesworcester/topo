@@ -412,6 +412,19 @@ pub fn encode_event(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     (meta.encode)(event)
 }
 
+/// Generic post-projection-drain hooks.
+///
+/// Called by the event pipeline after draining the project queue for a tenant.
+/// Event modules register their post-drain maintenance here (e.g. deferred
+/// content-key unwrap retries). This keeps event_pipeline.rs free of
+/// module-specific callouts.
+pub fn post_drain_hooks(
+    conn: &rusqlite::Connection,
+    recorded_by: &str,
+) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    workspace::commands::retry_pending_invite_content_key_unwraps(conn, recorded_by)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

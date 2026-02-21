@@ -287,8 +287,11 @@ async fn test_zero_loss_stress() {
         );
     }
 
-    // Phase 2: full-set quiescence gate — require diff <= 2 on both sides,
-    // stable for 5 consecutive polls at 200ms, before dropping sync.
+    // Phase 2: full-set quiescence gate — require diff <= local_event_count on
+    // both sides, stable for 5 consecutive polls at 200ms, before dropping sync.
+    // Each peer creates 5 local-scope (non-synced) events during workspace
+    // bootstrap: InviteAccepted + SecretKey + 3×LocalSignerSecret.
+    let local_event_budget = 5;
     let quiesce_needed = 5u32;
     let mut quiesce_streak = 0u32;
     let phase2_timeout = Duration::from_secs(30);
@@ -299,7 +302,7 @@ async fn test_zero_loss_stress() {
         let a_only = a_ids.difference(&b_ids).count();
         let b_only = b_ids.difference(&a_ids).count();
 
-        if a_only <= 2 && b_only <= 2 {
+        if a_only <= local_event_budget && b_only <= local_event_budget {
             quiesce_streak += 1;
             if quiesce_streak >= quiesce_needed {
                 break;
@@ -336,8 +339,8 @@ async fn test_zero_loss_stress() {
 
     let alice_only: Vec<_> = alice_ids.difference(&bob_ids).collect();
     let bob_only: Vec<_> = bob_ids.difference(&alice_ids).collect();
-    assert!(alice_only.len() <= 2, "alice has too many unique events: {}", alice_only.len());
-    assert!(bob_only.len() <= 2, "bob has too many unique events: {}", bob_only.len());
+    assert!(alice_only.len() <= local_event_budget, "alice has too many unique events: {}", alice_only.len());
+    assert!(bob_only.len() <= local_event_budget, "bob has too many unique events: {}", bob_only.len());
 
     // Verify all original events survived on their own peer
     for id in &alice_ids_before {

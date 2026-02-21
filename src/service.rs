@@ -406,23 +406,6 @@ pub fn load_local_user_key(
     Ok(None)
 }
 
-pub fn svc_bootstrap_workspace_conn(
-    db: &rusqlite::Connection,
-    recorded_by: &str,
-    workspace_name: &str,
-    username: &str,
-    device_name: &str,
-) -> ServiceResult<crate::identity::ops::IdentityChain> {
-    crate::identity::ops::bootstrap_workspace(
-        db,
-        recorded_by,
-        workspace_name,
-        username,
-        device_name,
-    )
-    .map_err(|e| ServiceError(format!("{}", e)))
-}
-
 // ---------------------------------------------------------------------------
 // Predicate parsing (for assert commands)
 // ---------------------------------------------------------------------------
@@ -1447,7 +1430,7 @@ pub async fn svc_accept_device_link(
 
     let db = open_connection(db_path)?;
     let user_event_id = match invite.invite_type {
-        crate::identity::ops::InviteType::DeviceLink { user_event_id } => user_event_id,
+        crate::identity::ops::InviteType::DeviceLink { user_event_id: uid } => uid,
         _ => return Err(ServiceError("Expected DeviceLink invite type".into())),
     };
 

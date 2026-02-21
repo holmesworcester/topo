@@ -151,19 +151,36 @@ impl Peer {
         peer
     }
 
-    /// Bootstrap a full identity chain using the production `bootstrap_workspace` flow.
+    /// Bootstrap a full identity chain using the production `create_workspace` flow.
     fn bootstrap_identity_chain(&mut self) {
-        use crate::identity::ops::bootstrap_workspace;
+        use crate::event_modules::workspace::commands::create_workspace;
 
         let db = open_connection(&self.db_path).expect("failed to open db");
-        let chain = bootstrap_workspace(&db, &self.identity, "test-workspace", "test-user", "test-device")
+        let old_identity = self.identity.clone();
+        let result = create_workspace(&db, &old_identity, "test-workspace", "test-user", "test-device")
             .expect("failed to bootstrap workspace");
 
-        self.workspace_id = chain.workspace_id;
-        self.author_id = chain.user_event_id;
-        self.peer_shared_event_id = Some(chain.peer_shared_event_id);
-        self.peer_shared_signing_key = Some(chain.peer_shared_key);
-        self.workspace_signing_key = Some(chain.workspace_key);
+        // create_workspace emits LocalSignerSecret events which trigger transport
+        // identity installation. Reload the peer_id and migrate if changed.
+        let new_identity = crate::identity::transport::load_transport_peer_id(&db)
+            .expect("failed to load transport peer_id after create_workspace");
+        if new_identity != old_identity {
+            crate::db::migrate_recorded_by(&db, &old_identity, &new_identity)
+                .expect("recorded_by migration failed");
+        }
+        self.identity = new_identity.clone();
+
+        self.workspace_id = result.workspace_id;
+        // Look up user_event_id from the created identity chain
+        if let Ok(uid) = crate::service::resolve_user_event_id_for_signer(&db, &new_identity, &result.peer_shared_event_id) {
+            self.author_id = uid;
+        }
+        self.peer_shared_event_id = Some(result.peer_shared_event_id);
+        self.peer_shared_signing_key = Some(result.peer_shared_key);
+        // Load workspace signing key from local signer material
+        if let Ok(Some((_ws_eid, ws_key))) = crate::event_modules::workspace::commands::load_workspace_signing_key(&db, &new_identity) {
+            self.workspace_signing_key = Some(ws_key);
+        }
     }
 
     /// Create a new peer that joins an existing workspace created by `creator`
@@ -172,7 +189,7 @@ impl Peer {
     /// joiner fetches prerequisite events via bootstrap sync, then calls
     /// `accept_user_invite`. No direct DB-to-DB event copying.
     pub async fn new_in_workspace(name: &str, creator: &Peer) -> Self {
-        use crate::identity::ops::create_user_invite;
+        use crate::event_modules::workspace::commands::create_user_invite_raw;
         use crate::identity::invite_link::create_invite_link;
         use crate::identity::transport::expected_invite_bootstrap_spki_from_invite_key;
         use crate::db::transport_trust::record_pending_invite_bootstrap_trust;
@@ -205,15 +222,14 @@ impl Peer {
         let creator_peer_eid = creator.peer_shared_event_id
             .expect("creator has no peer_shared_event_id; use new_with_identity()");
 
-        // Creator issues an invite (creates UserInviteOngoing on creator's DB)
-        let invite = create_user_invite(
+        // Creator issues an invite via workspace::commands API
+        let invite = create_user_invite_raw(
             &creator_db,
             &creator.identity,
             workspace_key,
             &creator.workspace_id,
             Some(creator_peer_key),
             Some(&creator_peer_eid),
-            None,
         ).expect("failed to create user invite");
 
         // Register pending bootstrap trust so creator's endpoint allows the joiner
@@ -2254,6 +2270,26 @@ impl SharedDbNode {
             tenants.push(peer);
         }
 
+        // create_workspace installs PeerShared-derived transport identity via
+        // `DELETE FROM local_transport_creds` + insert.  In a shared-DB with
+        // multiple tenants each bootstrap wipes the previous tenants' creds.
+        // Re-install all tenants' PeerShared-derived certs so discover_local_tenants works.
+        if n > 1 {
+            let db = open_connection(&db_path).expect("failed to open shared db for cred restore");
+            for tenant in &tenants {
+                let ps_key = tenant.peer_shared_signing_key.as_ref()
+                    .expect("tenant missing peer_shared_signing_key after bootstrap");
+                let (cert, key) = crate::transport::generate_self_signed_cert_from_signing_key(ps_key)
+                    .expect("failed to regenerate PeerShared cert");
+                crate::db::transport_creds::store_local_creds(
+                    &db,
+                    &tenant.identity,
+                    cert.as_ref(),
+                    key.secret_pkcs8_der(),
+                ).expect("failed to re-store tenant transport creds");
+            }
+        }
+
         Self {
             db_path,
             tenants,
@@ -2310,9 +2346,9 @@ impl SharedDbNode {
     }
 
     /// Add a new tenant that joins an existing tenant's workspace (same DB)
-    /// using the production `create_user_invite` + `accept_user_invite` flow.
+    /// using the production workspace command APIs.
     pub fn add_tenant_in_workspace(&mut self, name: &str, creator_index: usize) {
-        use crate::identity::ops::{create_user_invite, accept_user_invite};
+        use crate::event_modules::workspace::commands::{create_user_invite_raw, join_workspace_as_new_user};
 
         let creator = &self.tenants[creator_index];
         let workspace_id = creator.workspace_id;
@@ -2340,15 +2376,14 @@ impl SharedDbNode {
             key.secret_pkcs8_der(),
         ).expect("failed to store creds");
 
-        // Creator issues an invite
-        let invite = create_user_invite(
+        // Creator issues an invite via workspace::commands API
+        let invite = create_user_invite_raw(
             &db,
             &creator_identity,
             &workspace_key,
             &workspace_id,
             Some(&creator_peer_key),
             Some(&creator_peer_eid),
-            None,
         ).expect("failed to create user invite");
 
         // The Workspace and UserInviteBoot events already exist in the shared DB.
@@ -2357,8 +2392,8 @@ impl SharedDbNode {
             &db, &tenant_identity, &[workspace_id, invite.invite_event_id],
         );
 
-        // Accept the invite (production flow)
-        let join = accept_user_invite(
+        // Accept the invite (production flow via workspace commands)
+        let join = join_workspace_as_new_user(
             &db, &tenant_identity, &invite.invite_key,
             &invite.invite_event_id, workspace_id,
             "test-user", "test-device",

@@ -236,19 +236,31 @@ Test the feature with both local integration tests and Linux netns NAT simulatio
 
 ## 2.4.1 Identity bootstrap operations
 
-High-level identity operations provide imperative APIs for workspace creation, invites, and device linking. These compose the low-level event creation primitives into correct sequences.
+High-level identity operations are owned by event-module commands (`event_modules/workspace/commands.rs`). They compose low-level event creation primitives (from `identity/ops.rs`) into correct sequences.
 
-**Bootstrap** (`bootstrap_workspace`): creates the full 8-event chain for a new workspace owner:
-Workspace → UserInviteBoot → InviteAccepted (trust anchor) → UserBoot → DeviceInviteFirst → PeerSharedFirst → AdminBoot.
+**Bootstrap** (`workspace::commands::create_workspace`): creates the identity chain for a new workspace owner:
+Workspace → InviteAccepted (trust anchor) → UserInviteBoot → UserBoot → DeviceInviteFirst → PeerSharedFirst + LocalSignerSecret events (peer_shared, user, workspace) + content key seed.
+The peer_shared LocalSignerSecret triggers `ApplyTransportIdentityIntent` on projection, installing a PeerShared-derived transport identity.
 
-**Invite** (`create_user_invite`): admin creates a UserInviteBoot event and returns portable invite data (event ID + signing key + workspace ID).
+**Invite** (`workspace::commands::create_user_invite`): admin creates a UserInviteBoot event and returns portable invite data (event ID + signing key + workspace ID). Wraps content key for invitee if sender keys are available.
 
-**Accept** (`accept_user_invite`): joiner consumes invite data and creates:
+**Accept** (`workspace::commands::join_workspace_as_new_user`): joiner consumes invite data and creates:
 InviteAccepted (trust anchor) → UserBoot → DeviceInviteFirst → PeerSharedFirst.
 Prerequisite: the joiner's DB must already contain the Workspace and UserInviteBoot events (copied from the inviter before or during sync).
 The acceptance path also unwraps bootstrap content-key material received via `secret_shared` events (wrapped to the invite public key at creation time) and materializes local `secret_key` events so that encrypted content received during bootstrap sync can be decrypted.
+Signer secrets (LocalSignerSecret events) are NOT emitted here; `persist_join_signer_secrets` is called separately after push-back sync completes.
 
-**Device link** (`create_device_link_invite` / `accept_device_link`): similar to user invite but creates a shorter chain (PeerSharedFirst only, skipping user/device_invite creation).
+**Device link** (`workspace::commands::create_device_link_invite` / `add_device_to_workspace`): similar to user invite but creates a shorter chain (PeerSharedFirst only, skipping user/device_invite creation).
+
+**Retry** (`workspace::commands::retry_pending_invite_content_key_unwraps`): retries content-key unwrap for invites where SecretShared prerequisites arrived late. Called from `event_pipeline.rs` after each projection drain.
+
+### Identity ownership boundary
+
+- `identity/ops.rs` owns reusable primitive helpers only (`pub(crate)`): key creation, content-key wrap/unwrap, pending invite storage, data types.
+- `event_modules/workspace/commands.rs` owns all workflow orchestration: workspace creation, invite creation/acceptance, device link flows, retry logic.
+- `service.rs` routes to `workspace::commands` APIs; it contains no identity-specific workflow orchestration.
+- `event_pipeline.rs` calls `workspace::commands::retry_pending_invite_content_key_unwraps` for post-drain content-key convergence.
+- Boundaries are machine-checked by `scripts/check_boundary_imports.sh`.
 
 All functions take `&Connection` and `recorded_by`, enabling multi-tenant operation where multiple identities share a single database.
 

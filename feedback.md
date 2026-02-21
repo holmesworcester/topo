@@ -1,55 +1,39 @@
-# Feedback: exec/todo-remaining-non-event-locality-instructions
+# Feedback: identity-eventization completion review
 
-Date: 2026-02-20
-Reviewed against: `docs/planning/TODO_REMAINING_NON_EVENT_LOCALITY_INSTRUCTIONS.md`
+Date: 2026-02-20  
+Reviewed against: `docs/planning/IDENTITY_EVENTIZATION_COMPLETION_INSTRUCTIONS.md`
 
-## Findings (post Stage 2+3 review)
+## Final verification snapshot
 
-### Fixed in this round
+- `rg` SC1 check: no matches in `src/identity/ops.rs`.
+- `rg` SC2/SC3 legacy-call check: no matches in `src/service.rs`, `src/event_pipeline.rs`, `src/event_modules`, `tests`.
+- `bash scripts/check_boundary_imports.sh`: pass.
+- `cargo check`: pass.
+- `cargo test --lib -q`: pass (457/457).
+- `cargo test --test scenario_test -q`: pass (65/65).
 
-1. **Low — Straggler "replication" comment in sync session module**
-   `src/sync/session/mod.rs:1`: "Replication session logic" → "Sync session logic"
-   Fixed.
+## Findings status
 
-2. **Low — Straggler "replication" comment in sync receiver**
-   `src/sync/session/receiver.rs:1`: "replication sessions" → "sync sessions"
-   Fixed.
+No unresolved High/Medium findings remain.
 
-3. **Low — Straggler "replication::session" reference in peering loops**
-   `src/peering/loops/mod.rs:46`: "replication::session" → "sync::session"
-   Fixed.
+## Resolved findings
 
-4. **Low — Straggler "event_runtime" reference in event_pipeline comment**
-   `src/event_pipeline/ingest_runtime.rs:31`: "event_runtime" → "event_pipeline", "projection::pipeline" → "projection::apply"
-   Fixed.
+1. **Resolved (High): SC3 identity-special pipeline callout**
+   - Fixed by routing post-drain retry through generic event-module hook dispatch.
+   - Evidence: `src/event_pipeline.rs` now calls `crate::event_modules::post_drain_hooks(...)`; module-specific logic lives in `src/event_modules/mod.rs`.
 
-### No remaining actionable findings
+2. **Resolved (Medium): SC4 canonical command coverage gap**
+   - Fixed by migrating fixtures/helpers to workspace command APIs.
+   - Evidence: `src/testutil.rs` uses `workspace::commands::create_user_invite_raw` and `workspace::commands::join_workspace_as_new_user`.
 
-After fixing the 4 straggler comments above:
+3. **Resolved (Medium): SC5 boundary-check helper leak gap**
+   - Fixed by extending boundary checks to ban leaked helper-level workflow usage in forbidden layers.
+   - Evidence: `scripts/check_boundary_imports.sh` contains explicit checks for `identity::ops::create_user_invite_events` / `create_device_link_invite_events` leakage and passes.
 
-- Zero `replication`, `event_runtime`, `src/network/`, or `src/events/` references remain in `src/`.
-- All mandatory grep checks pass clean.
-- `cargo check` passes.
-- `bash scripts/check_boundary_imports.sh` passes.
-- All quality gate tests pass (446 lib, 21 sync_contract, 11 identity_transport_contract, 4 holepunch).
+4. **Resolved (Low): evidence naming mismatch**
+   - Fixed by updating the evidence doc with concrete, existing test names and references.
+   - Evidence: `docs/planning/IDENTITY_EVENTIZATION_COMPLETION_EVIDENCE.md`.
 
-## What was verified
+## Conclusion
 
-1. Stage 1 rename closure: all 3 mandatory grep checks clean in src/tests/active docs.
-2. Stage 2 invite_accepted:
-   - Prerequisite-free projection: `INVITE_ACCEPTED_META.dep_fields: &[]`, `signer_required: false`
-   - Force-valid emission: `EmitCommand::RetryWorkspaceEvent` in `invite_accepted.rs:132`
-   - Standard cascade: `RetryWorkspaceEvent` → `project_one()` in `write_exec.rs:80-96`
-   - TLA conformance: `InviteAccepted` in `LocalRoots`, 4 invariants in `EventGraphSchema.tla`
-   - 5 projector tests + 1 integration test (`test_invite_accepted_guard_retry_on_workspace`)
-3. Stage 3 identity/transport boundary:
-   - Contract: `TransportIdentityIntent` + `TransportIdentityAdapter` in `transport_identity_contract.rs`
-   - Sole adapter: `ConcreteTransportIdentityAdapter` in `transport/identity_adapter.rs`
-   - No raw install leaks (boundary script enforces)
-   - Bootstrap path: contracts-only (no event_module imports)
-   - 11 contract tests passing
-4. Stage 4 docs consistency:
-   - Active docs use current vocabulary
-   - Archive docs have historical disclaimers
-   - TODO.md items 1-26 status matches code evidence
-   - Evidence matrix complete at `docs/planning/TODO_REMAINING_EVIDENCE.md`
+Branch satisfies SC1-SC5 with passing checks and no unresolved required work.
