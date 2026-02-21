@@ -1570,7 +1570,7 @@ Identity workflow orchestration is fully owned by `event_modules/workspace/comma
 - `create_user_invite` / `create_device_link_invite`: invite event creation + content key wrap.
 - `retry_pending_invite_content_key_unwraps`: deferred content-key convergence.
 
-`identity/ops.rs` retains only `pub(crate)` primitive helpers (crypto, key wrap/unwrap, data types).
+`event_modules/workspace/identity_ops.rs` owns `pub(crate)` primitive helpers (crypto, key wrap/unwrap, data types). The `src/identity/` module has been eliminated.
 `service.rs` routes to `workspace::commands` — no identity-specific orchestration.
 `event_pipeline.rs` calls `workspace::commands::retry_pending_invite_content_key_unwraps` — no identity-special callouts.
 Boundaries enforced by `scripts/check_boundary_imports.sh`.
@@ -1768,7 +1768,7 @@ This returns every local identity that has (a) accepted an invite and (b) has TL
 - `extract_spki_fingerprint()` — computes BLAKE2b-256 of SPKI
 - `validate_cert_key_match()` — validates cert/key consistency
 
-### 17.1.4 Refactored `src/identity/transport.rs`
+### 17.1.4 Refactored `src/transport/identity.rs` (moved from `src/identity/transport.rs`)
 
 All functions switched from file I/O to DB queries. Functions take `&Connection` instead of `db_path: &str` at the core, with convenience wrappers that open connections:
 
@@ -1806,7 +1806,7 @@ All cert-loading sites across the codebase were updated from file-based to DB-ba
 |------|-------|--------|
 | `src/main.rs` | 4 | `load_or_generate_cert` → `ensure_transport_cert_from_db` |
 | `src/service.rs` | 4 | same, conn already available in service context |
-| `src/identity/ops.rs` | 1 | `std::fs::read(cert_path)` → DB query |
+| `src/event_modules/workspace/identity_ops.rs` | 1 | `std::fs::read(cert_path)` → DB query |
 | `src/testutil.rs` | ~15 | all Peer methods use `ensure_transport_cert` |
 | `src/transport/mod.rs` | exports | removed file-based, added DB-based |
 
@@ -1820,7 +1820,7 @@ All cert-loading sites across the codebase were updated from file-based to DB-ba
 
 Manual identity chain construction in test helpers was replaced with production `identity_ops` functions. This ensures tests exercise the same code paths as the real daemon.
 
-### 17.2.1 `src/identity/ops.rs`
+### 17.2.1 `src/event_modules/workspace/identity_ops.rs` (moved from `src/identity/ops.rs`)
 
 Three high-level flows:
 
@@ -2172,8 +2172,9 @@ Tests in `tests/mdns_smoke.rs`:
 | `src/db/mod.rs` | Export `transport_creds` | 17.1 |
 | `src/transport/cert.rs` | Remove file I/O, keep generation + fingerprint | 17.1 |
 | `src/transport/mod.rs` | Update re-exports | 17.1 |
-| `src/identity/transport.rs` | Rewrite: `&Connection` instead of file paths, DB-only | 17.1 |
-| `src/identity/ops.rs` | Add `bootstrap_workspace`, `create_user_invite`, `accept_user_invite`, `create_device_link_invite`, `accept_device_link` | 17.2 |
+| `src/transport/identity.rs` | Moved from `src/identity/transport.rs`; `&Connection` API, DB-only | 17.1 |
+| `src/event_modules/workspace/identity_ops.rs` | Moved from `src/identity/ops.rs`; primitive helpers for identity operations | 17.2 |
+| `src/event_modules/workspace/invite_link.rs` | Moved from `src/identity/invite_link.rs`; invite link encode/decode | — |
 | `src/main.rs` | Update 4 cert-loading sites | 17.1 |
 | `src/service.rs` | Update 4 cert-loading sites, add `svc_node_status` | 17.1, 17.4 |
 | `src/peering/loops/` | `IngestItem` 3-tuple, `accept_loop_with_ingest` | 17.3 |

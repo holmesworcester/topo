@@ -1,5 +1,6 @@
 pub mod cert;
 pub mod connection;
+pub mod identity;
 pub mod identity_adapter;
 pub mod multi_workspace;
 pub mod transport_session_io;

@@ -61,44 +61,27 @@ check_no_match 'install_invite_bootstrap_transport_identity' src/event_modules/
 check_no_match 'install_peer_key_transport_identity' src/projection/
 check_no_match 'install_invite_bootstrap_transport_identity' src/projection/
 
-# -- event-module locality: service.rs must not call event-domain invite/identity ops directly --
-check_no_match 'identity::ops::create_user_invite' src/service.rs
-check_no_match 'identity::ops::create_device_link_invite' src/service.rs
-check_no_match 'identity::ops::ensure_content_key_for_peer' src/service.rs
-check_no_match 'invite_link::create_invite_link' src/service.rs
+# -- identity module elimination: no crate::identity:: imports anywhere --
+check_no_match 'crate::identity::' src/
+check_no_match 'pub mod identity;' src/lib.rs
 
-# -- identity eventization boundary (SC1-SC3): no workflow entrypoints in identity::ops --
-# identity::ops must not contain public workflow orchestration functions
-check_no_match 'pub fn bootstrap_workspace' src/identity/ops.rs
-check_no_match 'pub fn create_user_invite[^_]' src/identity/ops.rs
-check_no_match 'pub fn accept_user_invite' src/identity/ops.rs
-check_no_match 'pub fn create_device_link_invite[^_]' src/identity/ops.rs
-check_no_match 'pub fn accept_device_link' src/identity/ops.rs
-check_no_match 'pub fn retry_pending_invite_content_key_unwraps' src/identity/ops.rs
+# -- event-module locality: service.rs must not call event-domain invite/identity ops directly --
+check_no_match 'identity_ops::create_user_invite' src/service.rs
+check_no_match 'identity_ops::create_device_link_invite' src/service.rs
+check_no_match 'identity_ops::ensure_content_key_for_peer' src/service.rs
+check_no_match 'invite_link::create_invite_link' src/service.rs
 
 # identity primitive helpers must not be called from service.rs, event_pipeline.rs, or tests
 # (they should go through workspace::commands APIs)
-check_no_match 'identity::ops::create_user_invite_events' src/service.rs
-check_no_match 'identity::ops::create_device_link_invite_events' src/service.rs
-check_no_match 'identity::ops::create_user_invite_events' src/event_pipeline.rs
-check_no_match 'identity::ops::create_device_link_invite_events' src/event_pipeline.rs
-check_no_match 'identity::ops::create_user_invite_events' src/testutil.rs
-check_no_match 'identity::ops::create_device_link_invite_events' src/testutil.rs
+check_no_match 'identity_ops::create_user_invite_events' src/service.rs
+check_no_match 'identity_ops::create_device_link_invite_events' src/service.rs
+check_no_match 'identity_ops::create_user_invite_events' src/event_pipeline.rs
+check_no_match 'identity_ops::create_device_link_invite_events' src/event_pipeline.rs
+check_no_match 'identity_ops::create_user_invite_events' src/testutil.rs
+check_no_match 'identity_ops::create_device_link_invite_events' src/testutil.rs
 
 # service.rs must not contain svc_bootstrap_workspace_conn
 check_no_match 'svc_bootstrap_workspace_conn' src/service.rs
-
-# service.rs must not call identity::ops workflow functions
-check_no_match 'identity::ops::bootstrap_workspace' src/service.rs
-check_no_match 'identity::ops::accept_user_invite' src/service.rs
-check_no_match 'identity::ops::accept_device_link' src/service.rs
-check_no_match 'identity::ops::retry_pending_invite_content_key_unwraps' src/service.rs
-
-# event_pipeline.rs must not call identity or workspace workflow functions directly
-check_no_match 'identity::ops::retry_pending_invite_content_key_unwraps' src/event_pipeline.rs
-check_no_match 'identity::ops::bootstrap_workspace' src/event_pipeline.rs
-check_no_match 'identity::ops::accept_user_invite' src/event_pipeline.rs
-check_no_match 'identity::ops::accept_device_link' src/event_pipeline.rs
 check_no_match 'workspace::commands::retry_pending_invite_content_key_unwraps' src/event_pipeline.rs
 check_no_match 'workspace::commands::create_workspace' src/event_pipeline.rs
 check_no_match 'workspace::commands::join_workspace_as_new_user' src/event_pipeline.rs

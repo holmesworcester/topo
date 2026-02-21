@@ -18,7 +18,7 @@ use crate::event_modules::{
     UserRemovedEvent, PeerRemovedEvent, SecretSharedEvent,
     TransportKeyEvent,
 };
-use crate::identity::transport::{ensure_transport_peer_id, ensure_transport_cert};
+use crate::transport::identity::{ensure_transport_peer_id, ensure_transport_cert};
 use crate::projection::create::{create_event_sync, create_event_staged, create_signed_event_sync, create_signed_event_staged, create_encrypted_event_sync, CreateEventError};
 use crate::projection::apply::project_one;
 use crate::protocol::Frame;
@@ -162,7 +162,7 @@ impl Peer {
 
         // create_workspace emits LocalSignerSecret events which trigger transport
         // identity installation. Reload the peer_id and migrate if changed.
-        let new_identity = crate::identity::transport::load_transport_peer_id(&db)
+        let new_identity = crate::transport::identity::load_transport_peer_id(&db)
             .expect("failed to load transport peer_id after create_workspace");
         if new_identity != old_identity {
             crate::db::migrate_recorded_by(&db, &old_identity, &new_identity)
@@ -190,8 +190,8 @@ impl Peer {
     /// `accept_user_invite`. No direct DB-to-DB event copying.
     pub async fn new_in_workspace(name: &str, creator: &Peer) -> Self {
         use crate::event_modules::workspace::commands::create_user_invite_raw;
-        use crate::identity::invite_link::create_invite_link;
-        use crate::identity::transport::expected_invite_bootstrap_spki_from_invite_key;
+        use crate::event_modules::workspace::invite_link::create_invite_link;
+        use crate::transport::identity::expected_invite_bootstrap_spki_from_invite_key;
         use crate::db::transport_trust::record_pending_invite_bootstrap_trust;
 
         // Create a bare peer with DB tables but NO transport identity.
@@ -283,7 +283,7 @@ impl Peer {
         // Step 3: Load final identity — after cascade, transport peer_id
         // has transitioned from invite-derived to PeerShared-derived.
         let db = open_connection(&peer.db_path).expect("failed to open db");
-        let final_peer_id = crate::identity::transport::load_transport_peer_id(&db)
+        let final_peer_id = crate::transport::identity::load_transport_peer_id(&db)
             .expect("failed to load final transport peer_id");
         peer.identity = final_peer_id.clone();
         peer.workspace_id = creator.workspace_id;

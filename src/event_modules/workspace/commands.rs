@@ -23,8 +23,8 @@ use crate::event_modules::{
     DeviceInviteFirstEvent, InviteAcceptedEvent, ParsedEvent, PeerSharedFirstEvent,
     UserBootEvent, UserInviteBootEvent, WorkspaceEvent,
 };
-use crate::identity::ops::{
-    self, InviteBootstrapContext, JoinChain, LinkChain,
+use super::identity_ops::{
+    self as ops, InviteBootstrapContext, JoinChain, LinkChain,
     SIGNER_KIND_PENDING_INVITE_UNWRAP,
 };
 use crate::projection::apply::project_one;
@@ -449,7 +449,7 @@ pub fn create_user_invite(
     // Record pending bootstrap trust so the inviter's daemon trusts the
     // joiner's invite-derived cert when they connect via autodial.
     let joiner_spki =
-        crate::identity::transport::expected_invite_bootstrap_spki_from_invite_key(
+        crate::transport::identity::expected_invite_bootstrap_spki_from_invite_key(
             &invite.invite_key,
         )?;
     crate::db::transport_trust::record_pending_invite_bootstrap_trust(
@@ -461,7 +461,7 @@ pub fn create_user_invite(
     )?;
 
     let invite_link =
-        crate::identity::invite_link::create_invite_link(&invite, bootstrap_addr, bootstrap_spki)?;
+        super::invite_link::create_invite_link(&invite, bootstrap_addr, bootstrap_spki)?;
 
     Ok(InviteResult {
         invite_link,
@@ -500,7 +500,7 @@ pub fn create_device_link_invite(
     // Record pending bootstrap trust so the inviter's daemon trusts the
     // joiner's invite-derived cert when they connect via autodial.
     let joiner_spki =
-        crate::identity::transport::expected_invite_bootstrap_spki_from_invite_key(
+        crate::transport::identity::expected_invite_bootstrap_spki_from_invite_key(
             &invite.invite_key,
         )?;
     crate::db::transport_trust::record_pending_invite_bootstrap_trust(
@@ -512,7 +512,7 @@ pub fn create_device_link_invite(
     )?;
 
     let invite_link =
-        crate::identity::invite_link::create_invite_link(&invite, bootstrap_addr, bootstrap_spki)?;
+        super::invite_link::create_invite_link(&invite, bootstrap_addr, bootstrap_spki)?;
 
     Ok(InviteResult {
         invite_link,
@@ -611,7 +611,7 @@ pub fn create_user_invite_raw(
     workspace_id: &EventId,
     sender_peer_shared_key: Option<&SigningKey>,
     sender_peer_shared_event_id: Option<&EventId>,
-) -> Result<crate::identity::ops::InviteData, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<super::identity_ops::InviteData, Box<dyn std::error::Error + Send + Sync>> {
     ops::create_user_invite_events(
         db,
         recorded_by,
@@ -632,7 +632,7 @@ pub fn create_device_link_invite_raw(
     user_key: &SigningKey,
     user_event_id: &EventId,
     workspace_id: &EventId,
-) -> Result<crate::identity::ops::InviteData, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<super::identity_ops::InviteData, Box<dyn std::error::Error + Send + Sync>> {
     ops::create_device_link_invite_events(
         db,
         recorded_by,

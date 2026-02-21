@@ -85,7 +85,7 @@ impl DaemonState {
                 // the cached one stale.
                 if let Ok(conn) = crate::db::open_connection(&self.db_path) {
                     if let Ok(current) =
-                        crate::identity::transport::load_transport_peer_id(&conn)
+                        crate::transport::identity::load_transport_peer_id(&conn)
                     {
                         if current != *peer_id {
                             *self.active_peer.write().unwrap() = Some(current.clone());

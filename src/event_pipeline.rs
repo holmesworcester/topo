@@ -271,7 +271,7 @@ pub fn batch_writer(
                     // transition (e.g. LocalSignerSecret(PEER_SHARED) projected and
                     // installed PeerShared-derived identity), migrate all DB rows
                     // from the old recorded_by to the new peer_id.
-                    if let Ok(new_peer_id) = crate::identity::transport::load_transport_peer_id(&db)
+                    if let Ok(new_peer_id) = crate::transport::identity::load_transport_peer_id(&db)
                     {
                         if new_peer_id != *rb {
                             if let Err(e) = crate::db::migrate_recorded_by(&db, rb, &new_peer_id) {

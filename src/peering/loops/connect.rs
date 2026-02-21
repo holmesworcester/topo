@@ -204,7 +204,7 @@ async fn connect_loop_inner(
             // all rows to the new peer_id. The sync session must use the
             // current peer_id to find events.
             let current_rb = if let Ok(db) = open_connection(db_path) {
-                crate::identity::transport::load_transport_peer_id(&db)
+                crate::transport::identity::load_transport_peer_id(&db)
                     .unwrap_or_else(|_| recorded_by.to_string())
             } else {
                 recorded_by.to_string()
