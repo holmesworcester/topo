@@ -65,7 +65,7 @@ flowchart TD
 ## 2) One Sync Session (Control/Data Flow)
 
 ```mermaid
-flowchart LR
+flowchart TD
     NEG["Negentropy reconcile\n(NegOpen/NegMsg)"] --> IDS["have_ids + need_ids"]
     IDS -->|peer needs my ids| ENQ["egress_queue.enqueue_events(peer_id, ids)"]
     IDS -->|I need peer ids| HAVE["wanted_events.insert(ids)\n+ send HaveList(ids)"]
@@ -85,7 +85,7 @@ flowchart LR
 ## 3) Trust + Bootstrap Autodial Feedback Loop
 
 ```mermaid
-flowchart LR
+flowchart TD
     INV["invite/device-link events\n+ bootstrap_context"] --> EMIT["projection emit_commands"]
     EMIT --> PEND["pending_invite_bootstrap_trust"]
     EMIT --> ACC["invite_bootstrap_trust"]
@@ -102,6 +102,21 @@ flowchart LR
     AUTODIAL --> DIAL["spawn connect_loop_thread"]
     DIAL --> SYNC["sync sessions"]
     SYNC --> PEER
+```
+
+## 4) Simplified SQLite View (Cylinders)
+
+```mermaid
+flowchart TD
+    LOCAL["Local create + incoming sync events"] --> INGEST["shared ingest + batch_writer"]
+    INGEST --> STORE["events + recorded + neg persist"]
+    STORE --> QDB[("SQLite Queues")]
+    QDB --> APPLY["project_one + cascade"]
+    APPLY --> PDB[("SQLite Projections")]
+
+    CTRL["Sync control stream\n(HaveList / need_ids)"] --> QDB
+    PDB --> TRUST["transport trust decisions"]
+    TRUST --> NET["QUIC allow/deny + bootstrap autodial"]
 ```
 
 ## Current Data-Flow Facts
