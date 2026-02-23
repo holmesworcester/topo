@@ -481,7 +481,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Direct-only commands (no daemon needed)
         // ---------------------------------------------------------------
         Commands::CreateWorkspace { workspace_name, username, device_name } => {
-            let result = service::svc_create_workspace(db, &workspace_name, &username, &device_name)?;
+            let result = topo::event_modules::workspace::commands::create_workspace_for_db(db, &workspace_name, &username, &device_name)?;
             println!("peer_id:      {}", result.peer_id);
             println!("workspace_id: {}", result.workspace_id);
         }
@@ -495,7 +495,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             username,
             devicename,
         } => {
-            let result = service::svc_accept_invite(db, &invite, &username, &devicename).await?;
+            let result = topo::event_modules::workspace::commands::accept_invite(db, &invite, &username, &devicename)?;
             println!("Accepted invite");
             println!("  peer_id: {}", result.peer_id);
             println!("  user:    {}", result.user_event_id);

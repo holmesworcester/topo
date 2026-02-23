@@ -12,6 +12,6 @@ pub use wire::{
     REACTION_WIRE_SIZE,
     REACTION_TYPE_META,
 };
-pub use commands::{CreateReactionCmd, create, react, ReactResponse};
+pub use commands::{CreateReactionCmd, create, react, ReactResponse, react_for_peer};
 pub use queries::{ReactionRow, list_rows, list_for_message, count, ReactionItem, list, ReactionWithAuthor, list_for_message_with_authors};
 pub use projector::project_pure;

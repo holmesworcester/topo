@@ -148,10 +148,10 @@ check_required 'pub fn create_user_invite' src/event_modules/workspace/commands.
 check_required 'pub fn create_device_link_invite' src/event_modules/workspace/commands.rs
 check_required 'pub fn retry_pending_invite_content_key_unwraps' src/event_modules/workspace/commands.rs
 
-# service.rs routes to workspace::commands, not identity::ops
-check_required 'workspace::commands::create_workspace' src/service.rs
-check_required 'workspace::commands::join_workspace_as_new_user' src/service.rs
-check_required 'workspace::commands::add_device_to_workspace' src/service.rs
+# workspace command wrappers live in workspace/commands.rs (not service.rs)
+check_required 'pub fn create_workspace_for_db' src/event_modules/workspace/commands.rs
+check_required 'pub fn accept_invite' src/event_modules/workspace/commands.rs
+check_required 'pub fn accept_device_link' src/event_modules/workspace/commands.rs
 
 # event_pipeline.rs uses generic post-drain hooks (not direct workspace/identity calls)
 check_required 'event_modules::post_drain_hooks' src/event_pipeline.rs

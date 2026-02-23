@@ -12,5 +12,5 @@ pub use wire::{
     USER_BOOT_META, USER_ONGOING_META,
 };
 pub use queries::{UserRow, UserItem, list, list_items, count, first_event_id};
-pub use commands::{create_user_removed, remove_user};
+pub use commands::{create_user_removed, remove_user, BanResponse, ban_for_peer};
 pub use projector::project_pure;

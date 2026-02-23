@@ -9,6 +9,7 @@ pub use wire::{MessageEvent, parse_message, encode_message, MESSAGE_META, MESSAG
 pub use commands::{
     CreateMessageCmd, create, send, DeleteResponse,
     CreateMessageDeletionCmd, create_deletion, delete_message,
+    GenerateResponse, send_for_peer, delete_message_for_peer, generate_for_peer,
 };
 pub use queries::{
     MessageRow, list_rows, count,

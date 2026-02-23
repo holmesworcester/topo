@@ -1,12 +1,24 @@
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use crate::crypto::EventId;
 use crate::projection::create::create_signed_event_sync;
+use crate::service::open_db_for_peer;
 use ed25519_dalek::SigningKey;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use super::super::ParsedEvent;
 use super::super::message_deletion::MessageDeletionEvent;
+use super::super::peer_shared;
+use super::super::workspace;
 use super::wire::MessageEvent;
+
+fn current_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DeleteResponse {
@@ -114,4 +126,100 @@ pub fn delete_message(
     ).map_err(|e| format!("{}", e))?;
 
     Ok(hex::encode(target_event_id))
+}
+
+// ---------------------------------------------------------------------------
+// Peer-level command wrappers (moved from service.rs)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GenerateResponse {
+    pub count: usize,
+}
+
+/// Send a message as a specific peer (daemon provides the peer_id).
+pub fn send_for_peer(
+    db_path: &str,
+    peer_id: &str,
+    content: &str,
+) -> Result<super::SendResponse, Box<dyn std::error::Error + Send + Sync>> {
+    let (recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
+
+    let (signer_eid, signing_key) = peer_shared::load_local_peer_signer_required(&db, &recorded_by)?;
+    let workspace_id = workspace::resolve_workspace_for_peer(&db, &recorded_by)?;
+    let author_id = peer_shared::resolve_user_event_id(&db, &recorded_by, &signer_eid)?;
+
+    send(
+        &db,
+        &recorded_by,
+        &signer_eid,
+        &signing_key,
+        current_timestamp_ms(),
+        workspace_id,
+        author_id,
+        content,
+    )
+    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })
+}
+
+/// Delete a message as a specific peer.
+pub fn delete_message_for_peer(
+    db_path: &str,
+    peer_id: &str,
+    target_hex: &str,
+) -> Result<DeleteResponse, Box<dyn std::error::Error + Send + Sync>> {
+    let (recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
+
+    let (signer_eid, signing_key) = peer_shared::load_local_peer_signer_required(&db, &recorded_by)?;
+    let target_event_id = super::resolve(&db, &recorded_by, target_hex)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+    let author_id = peer_shared::resolve_user_event_id(&db, &recorded_by, &signer_eid)?;
+
+    let target = delete_message(
+        &db,
+        &recorded_by,
+        &signer_eid,
+        &signing_key,
+        current_timestamp_ms(),
+        author_id,
+        target_event_id,
+    )
+    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+
+    Ok(DeleteResponse { target })
+}
+
+/// Generate N test messages as a specific peer.
+pub fn generate_for_peer(
+    db_path: &str,
+    peer_id: &str,
+    count: usize,
+) -> Result<GenerateResponse, Box<dyn std::error::Error + Send + Sync>> {
+    let (recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
+
+    let (signer_eid, signing_key) = peer_shared::load_local_peer_signer_required(&db, &recorded_by)?;
+    let workspace_id = workspace::resolve_workspace_for_peer(&db, &recorded_by)?;
+    let author_id = peer_shared::resolve_user_event_id(&db, &recorded_by, &signer_eid)?;
+
+    db.execute("BEGIN", [])?;
+    for i in 0..count {
+        create(
+            &db,
+            &recorded_by,
+            &signer_eid,
+            &signing_key,
+            current_timestamp_ms(),
+            CreateMessageCmd {
+                workspace_id,
+                author_id,
+                content: format!("Message {}", i),
+            },
+        )
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("create event error: {}", e).into()
+        })?;
+    }
+    db.execute("COMMIT", [])?;
+
+    Ok(GenerateResponse { count })
 }

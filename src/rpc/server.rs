@@ -411,7 +411,7 @@ fn dispatch(
         }
 
         RpcMethod::CreateWorkspace { workspace_name, username, device_name } => {
-            match service::svc_create_workspace(db_path, &workspace_name, &username, &device_name) {
+            match workspace::commands::create_workspace_for_db(db_path, &workspace_name, &username, &device_name) {
                 Ok(resp) => {
                     // Auto-select newly created peer if none active
                     let mut ap = state.active_peer.write().unwrap();
@@ -426,28 +426,28 @@ fn dispatch(
 
         // ----- Commands that need active peer -----
         RpcMethod::Send { content } => match state.require_active_peer() {
-            Ok(peer_id) => match service::svc_send_for_peer(db_path, &peer_id, &content) {
+            Ok(peer_id) => match message::send_for_peer(db_path, &peer_id, &content) {
                 Ok(data) => RpcResponse::success(data),
                 Err(e) => RpcResponse::error(e.to_string()),
             },
             Err(e) => RpcResponse::error(e),
         },
         RpcMethod::Generate { count } => match state.require_active_peer() {
-            Ok(peer_id) => match service::svc_generate_for_peer(db_path, &peer_id, count) {
+            Ok(peer_id) => match message::generate_for_peer(db_path, &peer_id, count) {
                 Ok(data) => RpcResponse::success(data),
                 Err(e) => RpcResponse::error(e.to_string()),
             },
             Err(e) => RpcResponse::error(e),
         },
         RpcMethod::React { target, emoji } => match state.require_active_peer() {
-            Ok(peer_id) => match service::svc_react_for_peer(db_path, &peer_id, &target, &emoji) {
+            Ok(peer_id) => match reaction::react_for_peer(db_path, &peer_id, &target, &emoji) {
                 Ok(data) => RpcResponse::success(data),
                 Err(e) => RpcResponse::error(e.to_string()),
             },
             Err(e) => RpcResponse::error(e),
         },
         RpcMethod::DeleteMessage { target } => match state.require_active_peer() {
-            Ok(peer_id) => match service::svc_delete_message_for_peer(db_path, &peer_id, &target) {
+            Ok(peer_id) => match message::delete_message_for_peer(db_path, &peer_id, &target) {
                 Ok(data) => RpcResponse::success(data),
                 Err(e) => RpcResponse::error(e.to_string()),
             },
@@ -589,8 +589,8 @@ fn dispatch(
         }
         RpcMethod::CreateInvite { public_addr, public_spki } => {
             let result = match public_spki {
-                Some(ref spki) => service::svc_create_invite_with_spki(db_path, &public_addr, spki),
-                None => service::svc_create_invite(db_path, &public_addr),
+                Some(ref spki) => workspace::commands::create_invite_with_spki(db_path, &public_addr, spki),
+                None => workspace::commands::create_invite_for_db(db_path, &public_addr),
             };
             match result {
                 Ok(data) => {
@@ -644,7 +644,7 @@ fn dispatch(
         RpcMethod::CreateDeviceLink { public_addr, public_spki } => {
             match state.require_active_peer() {
                 Ok(peer_id) => {
-                    match service::svc_create_device_link_for_peer(
+                    match workspace::commands::create_device_link_for_peer(
                         db_path,
                         &peer_id,
                         &public_addr,
@@ -674,18 +674,11 @@ fn dispatch(
                 Ok(link) => link,
                 Err(e) => return RpcResponse::error(e),
             };
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => return RpcResponse::error(format!("failed to start runtime: {}", e)),
-            };
-            match rt.block_on(service::svc_accept_device_link(
+            match workspace::commands::accept_device_link(
                 db_path,
                 &resolved,
                 &devicename,
-            )) {
+            ) {
                 Ok(data) => {
                     // Auto-select if no active peer
                     let mut ap = state.active_peer.write().unwrap();
@@ -700,7 +693,7 @@ fn dispatch(
         RpcMethod::Ban { target } => {
             match state.require_active_peer() {
                 Ok(peer_id) => {
-                    match service::svc_ban_for_peer(db_path, &peer_id, &target) {
+                    match user::ban_for_peer(db_path, &peer_id, &target) {
                         Ok(data) => RpcResponse::success(data),
                         Err(e) => RpcResponse::error(e.to_string()),
                     }
@@ -795,25 +788,18 @@ fn dispatch(
             username,
             devicename,
         } => {
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => return RpcResponse::error(format!("failed to start runtime: {}", e)),
-            };
-            match rt.block_on(service::svc_accept_invite(
+            match workspace::commands::accept_invite(
                 db_path,
                 &invite,
                 &username,
                 &devicename,
-            )) {
+            ) {
                 Ok(data) => RpcResponse::success(data),
                 Err(e) => RpcResponse::error(e.to_string()),
             }
         }
         RpcMethod::View { limit } => match state.require_active_peer() {
-            Ok(peer_id) => match service::svc_view_for_peer(db_path, &peer_id, limit) {
+            Ok(peer_id) => match workspace::view_for_peer(db_path, &peer_id, limit) {
                 Ok(data) => RpcResponse::success(data),
                 Err(e) => RpcResponse::error(e.to_string()),
             },

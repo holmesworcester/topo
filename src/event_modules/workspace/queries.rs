@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::crypto::event_id_from_base64;
 use crate::event_modules::{admin, message, peer_shared, reaction, transport_key, user};
+use crate::service::open_db_for_peer;
 
 /// Look up the workspace_id for a peer from trust_anchors.
 pub fn resolve_workspace_for_peer(
@@ -182,4 +183,110 @@ pub fn keys(
         peers,
         admins,
     })
+}
+
+// ---------------------------------------------------------------------------
+// View types and functions (moved from service.rs)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ViewReaction {
+    pub emoji: String,
+    pub reactor_name: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ViewMessage {
+    pub id: String,
+    pub author_id: String,
+    pub author_name: String,
+    pub content: String,
+    pub created_at: i64,
+    pub reactions: Vec<ViewReaction>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ViewResponse {
+    pub workspace_name: String,
+    pub users: Vec<user::UserItem>,
+    pub accounts: Vec<peer_shared::AccountItem>,
+    pub own_user_event_id: String,
+    pub messages: Vec<ViewMessage>,
+}
+
+/// Build a full workspace view: workspace name, users, accounts, messages with reactions.
+pub fn view(
+    db: &Connection,
+    recorded_by: &str,
+    limit: usize,
+) -> Result<ViewResponse, Box<dyn std::error::Error + Send + Sync>> {
+    // Workspace name
+    let workspace_name = name(db, recorded_by).unwrap_or_default();
+
+    // Users
+    let users = user::list_items(db, recorded_by)?;
+
+    // Own user_event_id (for marking "you")
+    let own_user_eid: String =
+        if let Some((signer_eid, _)) = peer_shared::load_local_peer_signer(db, recorded_by)? {
+            peer_shared::resolve_user_event_id(db, recorded_by, &signer_eid)
+                .map(|eid| crate::crypto::event_id_to_base64(&eid))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+    // Accounts (peers)
+    let accounts: Vec<peer_shared::AccountItem> = peer_shared::list_accounts(db, recorded_by)?
+        .into_iter()
+        .map(|row| peer_shared::AccountItem {
+            event_id: row.event_id,
+            device_name: row.device_name,
+            user_event_id: row.user_event_id,
+            username: row.username,
+        })
+        .collect();
+
+    // Messages with author names
+    let msg_resp = message::list(db, recorded_by, limit)?;
+
+    // Reactions per message
+    let mut view_messages = Vec::with_capacity(msg_resp.messages.len());
+    for msg in msg_resp.messages {
+        let reactions: Vec<ViewReaction> =
+            reaction::list_for_message_with_authors(db, recorded_by, &msg.id_b64)?
+                .into_iter()
+                .map(|r| ViewReaction {
+                    emoji: r.emoji,
+                    reactor_name: r.reactor_name,
+                })
+                .collect();
+
+        view_messages.push(ViewMessage {
+            id: msg.id_b64,
+            author_id: msg.author_id,
+            author_name: msg.author_name,
+            content: msg.content,
+            created_at: msg.created_at,
+            reactions,
+        });
+    }
+
+    Ok(ViewResponse {
+        workspace_name,
+        users,
+        accounts,
+        own_user_event_id: own_user_eid,
+        messages: view_messages,
+    })
+}
+
+/// Build a full workspace view for a specific peer.
+pub fn view_for_peer(
+    db_path: &str,
+    peer_id: &str,
+    limit: usize,
+) -> Result<ViewResponse, Box<dyn std::error::Error + Send + Sync>> {
+    let (recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
+    view(&db, &recorded_by, limit)
 }

@@ -259,9 +259,9 @@ impl Peer {
             .expect("failed to create invite link");
 
         // Step 1: Accept invite — stores events (may block), materializes bootstrap trust
-        let result = crate::service::svc_accept_invite(
+        let result = crate::event_modules::workspace::commands::accept_invite(
             &peer.db_path, &invite_link, name, "device",
-        ).await.expect("failed to accept invite");
+        ).expect("failed to accept invite");
 
         // Step 2: Bootstrap sync — fetches prerequisites from creator.
         // In production this is done by the autodial loop; in tests we trigger
