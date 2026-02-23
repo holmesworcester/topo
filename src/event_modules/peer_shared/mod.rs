@@ -10,5 +10,10 @@ pub use wire::{
     PEER_SHARED_WIRE_SIZE,
     PEER_SHARED_FIRST_META, PEER_SHARED_ONGOING_META,
 };
-pub use queries::{count, list_event_ids, first_event_id, AccountRow, list_accounts};
+pub use queries::{
+    count, list_event_ids, first_event_id, AccountRow, list_accounts,
+    load_local_peer_signer, load_local_peer_signer_required, resolve_user_event_id,
+    load_local_user_key,
+    AccountItem, list_account_items, IdentityResponse, identity,
+};
 pub use projector::project_pure;

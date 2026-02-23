@@ -1,3 +1,4 @@
+pub mod assert;
 pub mod contracts;
 pub mod crypto;
 pub mod db;

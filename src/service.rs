@@ -3,21 +3,17 @@
 //! Functions return structured, serializable types suitable for JSON RPC responses.
 //! No printing to stdout — callers decide how to present results.
 
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::SigningKey;
-use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
 use crate::contracts::transport_identity_contract::{
     TransportIdentityAdapter, TransportIdentityIntent,
 };
-use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
+use crate::crypto::{event_id_to_base64, EventId};
 use crate::db::{open_connection, schema::create_tables, transport_trust::is_peer_allowed};
-use crate::event_modules::{
-    admin, message, message_deletion, peer_shared, reaction, transport_key, user, user_removed,
-    workspace,
-};
+use crate::event_modules::{message, peer_shared, reaction, user, workspace};
 use crate::transport::identity::{load_transport_cert_required, load_transport_peer_id};
 use crate::transport::create_dual_endpoint_dynamic;
 use crate::transport::identity_adapter::ConcreteTransportIdentityAdapter;
@@ -81,7 +77,7 @@ impl From<crate::event_modules::workspace::invite_link::InviteLinkError> for Ser
 
 /// Open DB, create tables, load existing transport peer ID.
 /// For read-only commands that require an existing identity.
-fn open_db_load(
+pub fn open_db_load(
     db_path: &str,
 ) -> Result<(String, rusqlite::Connection), Box<dyn std::error::Error + Send + Sync>> {
     let conn = open_connection(db_path)?;
@@ -91,7 +87,7 @@ fn open_db_load(
 }
 
 /// Open DB for a specific peer_id (used when daemon provides the active peer).
-fn open_db_for_peer(
+pub fn open_db_for_peer(
     db_path: &str,
     peer_id: &str,
 ) -> Result<(String, rusqlite::Connection), Box<dyn std::error::Error + Send + Sync>> {
@@ -105,8 +101,8 @@ fn require_local_peer_signer(
     db: &rusqlite::Connection,
     recorded_by: &str,
 ) -> ServiceResult<(crate::crypto::EventId, ed25519_dalek::SigningKey)> {
-    load_local_peer_signer(db, recorded_by)?
-        .ok_or_else(|| ServiceError("no identity — run `topo create-workspace` first".into()))
+    peer_shared::load_local_peer_signer_required(db, recorded_by)
+        .map_err(|e| ServiceError(e.to_string()))
 }
 
 /// Look up the workspace_id for a peer from trust_anchors.
@@ -114,15 +110,8 @@ pub fn resolve_workspace_for_peer(
     db: &rusqlite::Connection,
     peer_id: &str,
 ) -> ServiceResult<[u8; 32]> {
-    let ws_b64: String = db
-        .query_row(
-            "SELECT workspace_id FROM trust_anchors WHERE peer_id = ?1",
-            rusqlite::params![peer_id],
-            |row| row.get(0),
-        )
-        .map_err(|_| ServiceError(format!("no workspace found for peer {}", peer_id)))?;
-    event_id_from_base64(&ws_b64)
-        .ok_or_else(|| ServiceError(format!("invalid workspace_id in trust_anchors: {}", ws_b64)))
+    workspace::resolve_workspace_for_peer(db, peer_id)
+        .map_err(|e| ServiceError(e.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -148,50 +137,17 @@ pub struct NodeTenantItem {
 
 pub use crate::event_modules::message::{MessageItem, MessagesResponse, SendResponse};
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct StatusResponse {
-    pub events_count: i64,
-    pub messages_count: i64,
-    pub reactions_count: i64,
-    pub recorded_events_count: i64,
-    pub neg_items_count: i64,
-}
+pub use crate::event_modules::workspace::StatusResponse;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GenerateResponse {
     pub count: usize,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct AssertResponse {
-    pub pass: bool,
-    pub field: String,
-    pub actual: i64,
-    pub op: String,
-    pub expected: i64,
-    pub timed_out: bool,
-}
-
 pub use crate::event_modules::reaction::{ReactResponse, ReactionItem};
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct DeleteResponse {
-    pub target: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct UserItem {
-    pub event_id: String,
-    pub username: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct AccountItem {
-    pub event_id: String,
-    pub device_name: String,
-    pub user_event_id: String,
-    pub username: String,
-}
+pub use crate::event_modules::message::DeleteResponse;
+pub use crate::event_modules::user::UserItem;
+pub use crate::event_modules::peer_shared::{AccountItem, IdentityResponse};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ViewReaction {
@@ -218,23 +174,7 @@ pub struct ViewResponse {
     pub messages: Vec<ViewMessage>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct KeysResponse {
-    pub user_count: i64,
-    pub peer_count: i64,
-    pub admin_count: i64,
-    pub transport_count: i64,
-    pub users: Vec<String>,
-    pub peers: Vec<String>,
-    pub admins: Vec<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct WorkspaceItem {
-    pub event_id: String,
-    pub workspace_id: String,
-    pub name: String,
-}
+pub use crate::event_modules::workspace::{KeysResponse, WorkspaceItem};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateInviteResponse {
@@ -286,21 +226,8 @@ pub fn resolve_user_event_id_for_signer(
     recorded_by: &str,
     signer_eid: &EventId,
 ) -> ServiceResult<[u8; 32]> {
-    let signer_b64 = crate::crypto::event_id_to_base64(signer_eid);
-    let user_eid_b64: String = db
-        .query_row(
-            "SELECT COALESCE(user_event_id, '') FROM peers_shared WHERE recorded_by = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, &signer_b64],
-            |row| row.get(0),
-        )
-        .map_err(|_| ServiceError("no peer_shared entry found for signer — identity chain incomplete".into()))?;
-    if user_eid_b64.is_empty() {
-        return Err(ServiceError(
-            "peer_shared entry has no user_event_id (legacy row) — recreate database".into(),
-        ));
-    }
-    crate::crypto::event_id_from_base64(&user_eid_b64)
-        .ok_or_else(|| ServiceError("invalid user_event_id in peers_shared".into()))
+    peer_shared::resolve_user_event_id(db, recorded_by, signer_eid)
+        .map_err(|e| ServiceError(e.to_string()))
 }
 
 pub fn parse_workspace_hex(workspace_hex: &str) -> ServiceResult<[u8; 32]> {
@@ -326,37 +253,12 @@ pub fn parse_hex_event_id(hex_str: &str) -> ServiceResult<[u8; 32]> {
     Ok(eid)
 }
 
-fn decode_signing_key(key_bytes: Vec<u8>) -> ServiceResult<SigningKey> {
-    let key_arr: [u8; 32] = key_bytes
-        .try_into()
-        .map_err(|_| ServiceError("bad signing key length in local signer table".into()))?;
-    Ok(SigningKey::from_bytes(&key_arr))
-}
-
 fn load_local_peer_signer(
     db: &rusqlite::Connection,
     recorded_by: &str,
 ) -> ServiceResult<Option<(EventId, SigningKey)>> {
-    if let Some((eid_b64, key_bytes)) = db
-        .query_row(
-            "SELECT l.signer_event_id, l.private_key
-             FROM local_signer_material l
-             INNER JOIN peers_shared p
-               ON p.recorded_by = l.recorded_by AND p.event_id = l.signer_event_id
-             WHERE l.recorded_by = ?1 AND l.signer_kind = 3
-             LIMIT 1",
-            rusqlite::params![recorded_by],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
-        )
-        .optional()?
-    {
-        let signing_key = decode_signing_key(key_bytes)?;
-        let eid = event_id_from_base64(&eid_b64)
-            .ok_or_else(|| ServiceError("bad local peer signer event_id".into()))?;
-        return Ok(Some((eid, signing_key)));
-    }
-
-    Ok(None)
+    peer_shared::load_local_peer_signer(db, recorded_by)
+        .map_err(|e| ServiceError(e.to_string()))
 }
 
 /// Public accessor for loading the locally stored peer signer.
@@ -365,165 +267,23 @@ pub fn load_local_peer_signer_pub(
     db: &rusqlite::Connection,
     recorded_by: &str,
 ) -> ServiceResult<Option<(EventId, SigningKey)>> {
-    if let Some((eid_b64, key_bytes)) = db
-        .query_row(
-            "SELECT signer_event_id, private_key FROM local_signer_material
-             WHERE recorded_by = ?1 AND signer_kind = 3
-             LIMIT 1",
-            rusqlite::params![recorded_by],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
-        )
-        .optional()?
-    {
-        let signing_key = decode_signing_key(key_bytes)?;
-        let eid = event_id_from_base64(&eid_b64)
-            .ok_or_else(|| ServiceError("bad local peer signer event_id".into()))?;
-        return Ok(Some((eid, signing_key)));
-    }
-
-    Ok(None)
+    peer_shared::load_local_peer_signer(db, recorded_by)
+        .map_err(|e| ServiceError(e.to_string()))
 }
 
 pub fn load_local_user_key(
     db: &rusqlite::Connection,
     recorded_by: &str,
 ) -> ServiceResult<Option<(EventId, SigningKey)>> {
-    if let Some((eid_b64, key_bytes)) = db
-        .query_row(
-            "SELECT signer_event_id, private_key FROM local_signer_material
-             WHERE recorded_by = ?1 AND signer_kind = 2
-             LIMIT 1",
-            rusqlite::params![recorded_by],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
-        )
-        .optional()?
-    {
-        let signing_key = decode_signing_key(key_bytes)?;
-        let eid = event_id_from_base64(&eid_b64)
-            .ok_or_else(|| ServiceError("bad local user key event_id".into()))?;
-        return Ok(Some((eid, signing_key)));
-    }
-    Ok(None)
+    peer_shared::load_local_user_key(db, recorded_by)
+        .map_err(|e| ServiceError(e.to_string()))
 }
 
 // ---------------------------------------------------------------------------
-// Predicate parsing (for assert commands)
+// Assert re-exports (moved to src/assert.rs)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy)]
-pub enum Op {
-    Eq,
-    Ne,
-    Ge,
-    Le,
-    Gt,
-    Lt,
-}
-
-impl Op {
-    pub fn eval(self, actual: i64, expected: i64) -> bool {
-        match self {
-            Op::Eq => actual == expected,
-            Op::Ne => actual != expected,
-            Op::Ge => actual >= expected,
-            Op::Le => actual <= expected,
-            Op::Gt => actual > expected,
-            Op::Lt => actual < expected,
-        }
-    }
-
-    pub fn symbol(self) -> &'static str {
-        match self {
-            Op::Eq => "==",
-            Op::Ne => "!=",
-            Op::Ge => ">=",
-            Op::Le => "<=",
-            Op::Gt => ">",
-            Op::Lt => "<",
-        }
-    }
-}
-
-pub fn parse_predicate(s: &str) -> Result<(String, Op, i64), String> {
-    let parts: Vec<&str> = s.split_whitespace().collect();
-    if parts.len() != 3 {
-        return Err(format!(
-            "predicate must be \"field op value\", got {} parts: {:?}",
-            parts.len(),
-            s
-        ));
-    }
-    let field = parts[0].to_string();
-    let op = match parts[1] {
-        "==" => Op::Eq,
-        "!=" => Op::Ne,
-        ">=" => Op::Ge,
-        "<=" => Op::Le,
-        ">" => Op::Gt,
-        "<" => Op::Lt,
-        other => return Err(format!("unknown operator: {}", other)),
-    };
-    let value: i64 = parts[2]
-        .parse()
-        .map_err(|e| format!("invalid value '{}': {}", parts[2], e))?;
-    Ok((field, op, value))
-}
-
-pub fn query_field(
-    db: &rusqlite::Connection,
-    field: &str,
-    recorded_by: &str,
-) -> Result<i64, String> {
-    match field {
-        "store_count" | "events_count" => db
-            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
-            .map_err(|e| format!("query failed: {}", e)),
-        "message_count" => {
-            message::count(db, recorded_by).map_err(|e| format!("query failed: {}", e))
-        }
-        "reaction_count" => {
-            reaction::count(db, recorded_by).map_err(|e| format!("query failed: {}", e))
-        }
-        "neg_items_count" => db
-            .query_row("SELECT COUNT(*) FROM neg_items", [], |row| row.get(0))
-            .map_err(|e| format!("query failed: {}", e)),
-        "recorded_events_count" => db
-            .query_row(
-                "SELECT COUNT(*) FROM recorded_events WHERE peer_id = ?1",
-                rusqlite::params![recorded_by],
-                |row| row.get(0),
-            )
-            .map_err(|e| format!("query failed: {}", e)),
-        other if other.starts_with("has_event:") => {
-            let event_id = &other["has_event:".len()..];
-            let direct_count: i64 = db
-                .query_row(
-                    "SELECT COUNT(*) FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
-                    rusqlite::params![recorded_by, event_id],
-                    |row| row.get(0),
-                )
-                .map_err(|e| format!("query failed: {}", e))?;
-            if direct_count > 0 {
-                return Ok(direct_count);
-            }
-            if let Ok(event_id_bytes) = hex::decode(event_id) {
-                if event_id_bytes.len() == 32 {
-                    let mut eid = [0u8; 32];
-                    eid.copy_from_slice(&event_id_bytes);
-                    return db
-                        .query_row(
-                            "SELECT COUNT(*) FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
-                            rusqlite::params![recorded_by, event_id_to_base64(&eid)],
-                            |row| row.get(0),
-                        )
-                        .map_err(|e| format!("query failed: {}", e));
-                }
-            }
-            Ok(0)
-        }
-        other => Err(format!("unknown field: {}", other)),
-    }
-}
+pub use crate::assert::{Op, parse_predicate, query_field, AssertResponse};
 
 // ---------------------------------------------------------------------------
 // Service functions
@@ -541,7 +301,7 @@ pub fn svc_create_workspace(
     // Check if identity already exists
     if let Ok(peer_id) = load_transport_peer_id(&conn) {
         // Already bootstrapped — return existing workspace info
-        let workspaces = svc_workspaces_conn(&conn, &peer_id)?;
+        let workspaces = workspace::list_items(&conn, &peer_id)?;
         if let Some(ws) = workspaces.first() {
             return Ok(CreateWorkspaceResponse {
                 peer_id,
@@ -569,7 +329,7 @@ pub fn svc_create_workspace(
             .map_err(|e| ServiceError(format!("recorded_by migration failed: {}", e)))?;
     }
 
-    let workspaces = svc_workspaces_conn(&conn, &derived)?;
+    let workspaces = workspace::list_items(&conn, &derived)?;
     let workspace_id = workspaces
         .first()
         .map(|ws| ws.event_id.clone())
@@ -579,11 +339,6 @@ pub fn svc_create_workspace(
         peer_id: derived,
         workspace_id,
     })
-}
-
-pub fn svc_transport_identity(db_path: &str) -> ServiceResult<TransportIdentityResponse> {
-    let (fingerprint, _db) = open_db_load(db_path).map_err(|e| ServiceError(format!("{}", e)))?;
-    Ok(TransportIdentityResponse { fingerprint })
 }
 
 /// Node status: list local tenant identities discovered from DB.
@@ -598,19 +353,6 @@ pub fn svc_node_status(db_path: &str) -> ServiceResult<Vec<NodeTenantItem>> {
             workspace_id: t.workspace_id,
         })
         .collect())
-}
-
-pub fn svc_messages_conn(
-    db: &rusqlite::Connection,
-    recorded_by: &str,
-    limit: usize,
-) -> ServiceResult<MessagesResponse> {
-    Ok(message::list(db, recorded_by, limit)?)
-}
-
-pub fn svc_messages(db_path: &str, limit: usize) -> ServiceResult<MessagesResponse> {
-    let (recorded_by, db) = open_db_load(db_path)?;
-    svc_messages_conn(&db, &recorded_by, limit)
 }
 
 pub fn svc_send_conn(
@@ -658,40 +400,6 @@ pub fn svc_send_for_peer(
     )
 }
 
-pub fn svc_status_conn(
-    db: &rusqlite::Connection,
-    recorded_by: &str,
-) -> ServiceResult<StatusResponse> {
-    let events_count: i64 = db
-        .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
-        .unwrap_or(0);
-    let messages_count = message::count(db, recorded_by).unwrap_or(0);
-    let reactions_count = reaction::count(db, recorded_by).unwrap_or(0);
-    let neg_items_count: i64 = db
-        .query_row("SELECT COUNT(*) FROM neg_items", [], |row| row.get(0))
-        .unwrap_or(0);
-    let recorded_events_count: i64 = db
-        .query_row(
-            "SELECT COUNT(*) FROM recorded_events WHERE peer_id = ?1",
-            rusqlite::params![recorded_by],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-
-    Ok(StatusResponse {
-        events_count,
-        messages_count,
-        reactions_count,
-        recorded_events_count,
-        neg_items_count,
-    })
-}
-
-pub fn svc_status(db_path: &str) -> ServiceResult<StatusResponse> {
-    let (recorded_by, db) = open_db_load(db_path)?;
-    svc_status_conn(&db, &recorded_by)
-}
-
 pub fn svc_generate_for_peer(
     db_path: &str,
     peer_id: &str,
@@ -722,63 +430,6 @@ pub fn svc_generate_for_peer(
     db.execute("COMMIT", [])?;
 
     Ok(GenerateResponse { count })
-}
-
-pub fn svc_assert_now(db_path: &str, predicate_str: &str) -> ServiceResult<AssertResponse> {
-    let (recorded_by, db) = open_db_load(db_path)?;
-    let (field, op, expected) = parse_predicate(predicate_str).map_err(ServiceError)?;
-    let actual = query_field(&db, &field, &recorded_by).map_err(ServiceError)?;
-
-    Ok(AssertResponse {
-        pass: op.eval(actual, expected),
-        field,
-        actual,
-        op: op.symbol().to_string(),
-        expected,
-        timed_out: false,
-    })
-}
-
-pub fn svc_assert_eventually(
-    db_path: &str,
-    predicate_str: &str,
-    timeout_ms: u64,
-    interval_ms: u64,
-) -> ServiceResult<AssertResponse> {
-    let db = open_connection(db_path)?;
-    create_tables(&db)?;
-    let (field, op, expected) = parse_predicate(predicate_str).map_err(ServiceError)?;
-    let start = Instant::now();
-    let timeout = Duration::from_millis(timeout_ms);
-    let interval = Duration::from_millis(interval_ms);
-
-    loop {
-        // Re-resolve local transport identity every poll. During invite/bootstrap
-        // convergence, recorded_by can migrate from placeholder to peer-shared.
-        let recorded_by = load_transport_peer_id(&db).map_err(|e| ServiceError(e.to_string()))?;
-        let actual = query_field(&db, &field, &recorded_by).map_err(ServiceError)?;
-        if op.eval(actual, expected) {
-            return Ok(AssertResponse {
-                pass: true,
-                field,
-                actual,
-                op: op.symbol().to_string(),
-                expected,
-                timed_out: false,
-            });
-        }
-        if start.elapsed() >= timeout {
-            return Ok(AssertResponse {
-                pass: false,
-                field,
-                actual,
-                op: op.symbol().to_string(),
-                expected,
-                timed_out: true,
-            });
-        }
-        std::thread::sleep(interval);
-    }
 }
 
 pub fn svc_react_conn(
@@ -834,7 +485,7 @@ pub fn svc_delete_message_conn(
     author_id: [u8; 32],
     target_event_id: [u8; 32],
 ) -> ServiceResult<DeleteResponse> {
-    let target = message_deletion::delete_message(
+    let target = message::delete_message(
         db,
         recorded_by,
         signer_eid,
@@ -879,46 +530,6 @@ fn resolve_message_selector(
     message::resolve(db, recorded_by, selector).map_err(ServiceError)
 }
 
-pub fn svc_reactions_conn(
-    db: &rusqlite::Connection,
-    recorded_by: &str,
-) -> ServiceResult<Vec<ReactionItem>> {
-    Ok(reaction::list(db, recorded_by)?)
-}
-
-pub fn svc_reactions(db_path: &str) -> ServiceResult<Vec<ReactionItem>> {
-    let (recorded_by, db) = open_db_load(db_path)?;
-    svc_reactions_conn(&db, &recorded_by)
-}
-
-pub fn svc_reactions_for_message_conn(
-    db: &rusqlite::Connection,
-    recorded_by: &str,
-    target_event_id_b64: &str,
-) -> ServiceResult<Vec<String>> {
-    Ok(reaction::list_for_message(
-        db,
-        recorded_by,
-        target_event_id_b64,
-    )?)
-}
-
-pub fn svc_deleted_message_ids_conn(
-    db: &rusqlite::Connection,
-    recorded_by: &str,
-) -> ServiceResult<Vec<String>> {
-    Ok(message_deletion::list_deleted_ids(db, recorded_by)?)
-}
-
-/// Resolve a 1-based message number to its event ID.
-pub fn svc_message_event_id_by_num_conn(
-    db: &rusqlite::Connection,
-    recorded_by: &str,
-    msg_num: usize,
-) -> ServiceResult<crate::crypto::EventId> {
-    message::resolve_number(db, recorded_by, msg_num).map_err(ServiceError)
-}
-
 pub fn svc_remove_user_conn(
     db: &rusqlite::Connection,
     recorded_by: &str,
@@ -926,7 +537,7 @@ pub fn svc_remove_user_conn(
     signing_key: &SigningKey,
     target_event_id: crate::crypto::EventId,
 ) -> ServiceResult<DeleteResponse> {
-    let target = user_removed::remove_user(
+    let target = user::remove_user(
         db,
         recorded_by,
         signer_eid,
@@ -994,25 +605,6 @@ pub fn svc_create_device_link_invite_conn(
     })
 }
 
-pub fn svc_users_conn(
-    db: &rusqlite::Connection,
-    recorded_by: &str,
-) -> ServiceResult<Vec<UserItem>> {
-    let rows = user::list(db, recorded_by)?;
-    Ok(rows
-        .into_iter()
-        .map(|row| UserItem {
-            event_id: row.event_id,
-            username: row.username,
-        })
-        .collect())
-}
-
-pub fn svc_users(db_path: &str) -> ServiceResult<Vec<UserItem>> {
-    let (recorded_by, db) = open_db_load(db_path)?;
-    svc_users_conn(&db, &recorded_by)
-}
-
 pub fn svc_view_conn(
     db: &rusqlite::Connection,
     recorded_by: &str,
@@ -1022,7 +614,7 @@ pub fn svc_view_conn(
     let workspace_name = workspace::name(db, recorded_by).unwrap_or_default();
 
     // Users
-    let users = svc_users_conn(db, recorded_by)?;
+    let users = user::list_items(db, recorded_by)?;
 
     // Own user_event_id (for marking "you") — look up via local signer
     let own_user_eid: String =
@@ -1046,7 +638,7 @@ pub fn svc_view_conn(
         .collect();
 
     // Messages with author names
-    let msg_resp = svc_messages_conn(db, recorded_by, limit)?;
+    let msg_resp = message::list(db, recorded_by, limit)?;
 
     // Reactions per message — delegate to reaction module
     let mut view_messages = Vec::with_capacity(msg_resp.messages.len());
@@ -1079,11 +671,6 @@ pub fn svc_view_conn(
     })
 }
 
-pub fn svc_view(db_path: &str, limit: usize) -> ServiceResult<ViewResponse> {
-    let (recorded_by, db) = open_db_load(db_path)?;
-    svc_view_conn(&db, &recorded_by, limit)
-}
-
 pub fn svc_view_for_peer(
     db_path: &str,
     peer_id: &str,
@@ -1091,101 +678,6 @@ pub fn svc_view_for_peer(
 ) -> ServiceResult<ViewResponse> {
     let (recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
     svc_view_conn(&db, &recorded_by, limit)
-}
-
-pub fn svc_keys_conn(
-    db: &rusqlite::Connection,
-    recorded_by: &str,
-    summary: bool,
-) -> ServiceResult<KeysResponse> {
-    let user_count = user::count(db, recorded_by).unwrap_or(0);
-    let peer_count = peer_shared::count(db, recorded_by).unwrap_or(0);
-    let admin_count = admin::count(db, recorded_by).unwrap_or(0);
-    let transport_count = transport_key::count(db, recorded_by).unwrap_or(0);
-
-    let mut users = Vec::new();
-    let mut peers = Vec::new();
-    let mut admins = Vec::new();
-
-    if !summary {
-        users = user::list(db, recorded_by)?
-            .into_iter()
-            .map(|row| row.event_id)
-            .collect();
-
-        peers = peer_shared::list_event_ids(db, recorded_by)?;
-        admins = admin::list_event_ids(db, recorded_by)?;
-    }
-
-    Ok(KeysResponse {
-        user_count,
-        peer_count,
-        admin_count,
-        transport_count,
-        users,
-        peers,
-        admins,
-    })
-}
-
-pub fn svc_keys(db_path: &str, summary: bool) -> ServiceResult<KeysResponse> {
-    let (recorded_by, db) = open_db_load(db_path)?;
-    svc_keys_conn(&db, &recorded_by, summary)
-}
-
-pub fn svc_workspaces_conn(
-    db: &rusqlite::Connection,
-    recorded_by: &str,
-) -> ServiceResult<Vec<WorkspaceItem>> {
-    let rows = workspace::list(db, recorded_by)?;
-
-    use base64::Engine;
-    Ok(rows
-        .into_iter()
-        .map(|row| {
-            let name = if let Ok(bytes) =
-                base64::engine::general_purpose::STANDARD.decode(&row.workspace_id)
-            {
-                String::from_utf8_lossy(&bytes)
-                    .trim_end_matches('\0')
-                    .to_string()
-            } else {
-                row.workspace_id.clone()
-            };
-            WorkspaceItem {
-                event_id: row.event_id,
-                workspace_id: row.workspace_id,
-                name,
-            }
-        })
-        .collect())
-}
-
-pub fn svc_workspaces(db_path: &str) -> ServiceResult<Vec<WorkspaceItem>> {
-    let (recorded_by, db) = open_db_load(db_path)?;
-    svc_workspaces_conn(&db, &recorded_by)
-}
-
-pub fn svc_intro_attempts(
-    db_path: &str,
-    peer: Option<&str>,
-) -> ServiceResult<Vec<IntroAttemptItem>> {
-    let (recorded_by, db) = open_db_load(db_path)?;
-
-    let rows = crate::db::intro::list_intro_attempts(&db, &recorded_by, peer)?;
-    Ok(rows
-        .into_iter()
-        .map(|r| IntroAttemptItem {
-            intro_id: hex::encode(&r.intro_id),
-            other_peer_id: r.other_peer_id,
-            introduced_by_peer_id: r.introduced_by_peer_id,
-            origin_ip: r.origin_ip,
-            origin_port: r.origin_port,
-            status: r.status,
-            error: r.error,
-            created_at: r.created_at,
-        })
-        .collect())
 }
 
 pub async fn svc_intro(
@@ -1482,13 +974,6 @@ pub async fn svc_accept_device_link(
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct IdentityResponse {
-    pub transport_fingerprint: String,
-    pub user_event_id: Option<String>,
-    pub peer_shared_event_id: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub struct BanResponse {
     pub target: String,
     pub banned: bool,
@@ -1597,7 +1082,7 @@ pub fn svc_ban_for_peer(
 
     // Resolve target: numeric → user list index, or hex event ID
     let target_event_id = if let Ok(num) = target_selector.parse::<usize>() {
-        let users = svc_users_conn(&db, peer_id)?;
+        let users = user::list_items(&db, peer_id)?;
         if num == 0 || num > users.len() {
             return Err(ServiceError(format!(
                 "Invalid user number {}. Available: 1-{}",
@@ -1612,7 +1097,7 @@ pub fn svc_ban_for_peer(
         let num: usize = target_selector[1..]
             .parse()
             .map_err(|_| ServiceError(format!("Invalid user ref: {}", target_selector)))?;
-        let users = svc_users_conn(&db, peer_id)?;
+        let users = user::list_items(&db, peer_id)?;
         if num == 0 || num > users.len() {
             return Err(ServiceError(format!(
                 "Invalid user number {}. Available: 1-{}",
@@ -1632,20 +1117,6 @@ pub fn svc_ban_for_peer(
     Ok(BanResponse {
         target: hex::encode(target_event_id),
         banned: true,
-    })
-}
-
-/// Get combined identity info for a specific peer.
-pub fn svc_identity_for_peer(db_path: &str, peer_id: &str) -> ServiceResult<IdentityResponse> {
-    let (_recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
-
-    let user_event_id = user::first_event_id(&db, peer_id)?;
-    let peer_shared_event_id = peer_shared::first_event_id(&db, peer_id)?;
-
-    Ok(IdentityResponse {
-        transport_fingerprint: peer_id.to_string(),
-        user_event_id,
-        peer_shared_event_id,
     })
 }
 
@@ -1782,6 +1253,8 @@ mod tests {
 
     #[test]
     fn test_svc_assert_eventually_reloads_recorded_by_after_migration() {
+        use std::time::Duration;
+
         let (_dir, db_path) = temp_db_path();
         let old_peer_id = setup_workspace(&db_path);
 
@@ -1831,7 +1304,7 @@ mod tests {
             .unwrap();
         });
 
-        let resp = svc_assert_eventually(&db_path, "message_count >= 1", 2_000, 25).unwrap();
+        let resp = crate::assert::assert_eventually(&db_path, "message_count >= 1", 2_000, 25).unwrap();
         assert!(
             resp.pass,
             "assert_eventually should follow migrated identity"

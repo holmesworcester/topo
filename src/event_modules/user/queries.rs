@@ -1,4 +1,26 @@
 use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UserItem {
+    pub event_id: String,
+    pub username: String,
+}
+
+/// List user items (response type) from the database.
+pub fn list_items(
+    db: &Connection,
+    recorded_by: &str,
+) -> Result<Vec<UserItem>, rusqlite::Error> {
+    let rows = list(db, recorded_by)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| UserItem {
+            event_id: row.event_id,
+            username: row.username,
+        })
+        .collect())
+}
 
 pub struct UserRow {
     pub event_id: String,

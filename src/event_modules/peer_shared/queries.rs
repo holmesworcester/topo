@@ -1,4 +1,106 @@
+use ed25519_dalek::SigningKey;
 use rusqlite::Connection;
+use rusqlite::OptionalExtension;
+use serde::{Deserialize, Serialize};
+
+use crate::crypto::{event_id_from_base64, EventId};
+
+// ---------------------------------------------------------------------------
+// Identity helpers (moved from service.rs)
+// ---------------------------------------------------------------------------
+
+fn decode_signing_key(key_bytes: Vec<u8>) -> Result<SigningKey, String> {
+    let key_arr: [u8; 32] = key_bytes
+        .try_into()
+        .map_err(|_| "bad signing key length in local signer table".to_string())?;
+    Ok(SigningKey::from_bytes(&key_arr))
+}
+
+/// Load the local peer signer (signer_kind=3) from local_signer_material,
+/// joined with peers_shared to ensure the signer is projected.
+pub fn load_local_peer_signer(
+    db: &Connection,
+    recorded_by: &str,
+) -> Result<Option<(EventId, SigningKey)>, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some((eid_b64, key_bytes)) = db
+        .query_row(
+            "SELECT l.signer_event_id, l.private_key
+             FROM local_signer_material l
+             INNER JOIN peers_shared p
+               ON p.recorded_by = l.recorded_by AND p.event_id = l.signer_event_id
+             WHERE l.recorded_by = ?1 AND l.signer_kind = 3
+             LIMIT 1",
+            rusqlite::params![recorded_by],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
+        .optional()?
+    {
+        let signing_key = decode_signing_key(key_bytes)?;
+        let eid = event_id_from_base64(&eid_b64)
+            .ok_or_else(|| "bad local peer signer event_id".to_string())?;
+        return Ok(Some((eid, signing_key)));
+    }
+    Ok(None)
+}
+
+/// Like `load_local_peer_signer` but returns an error if no signer is found.
+pub fn load_local_peer_signer_required(
+    db: &Connection,
+    recorded_by: &str,
+) -> Result<(EventId, SigningKey), Box<dyn std::error::Error + Send + Sync>> {
+    load_local_peer_signer(db, recorded_by)?
+        .ok_or_else(|| "no identity — run `topo create-workspace` first".into())
+}
+
+/// Resolve the user_event_id for a specific signer from the peers_shared table.
+pub fn resolve_user_event_id(
+    db: &Connection,
+    recorded_by: &str,
+    signer_eid: &EventId,
+) -> Result<[u8; 32], Box<dyn std::error::Error + Send + Sync>> {
+    let signer_b64 = crate::crypto::event_id_to_base64(signer_eid);
+    let user_eid_b64: String = db
+        .query_row(
+            "SELECT COALESCE(user_event_id, '') FROM peers_shared WHERE recorded_by = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &signer_b64],
+            |row| row.get(0),
+        )
+        .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
+            "no peer_shared entry found for signer — identity chain incomplete".into()
+        })?;
+    if user_eid_b64.is_empty() {
+        return Err("peer_shared entry has no user_event_id (legacy row) — recreate database".into());
+    }
+    event_id_from_base64(&user_eid_b64)
+        .ok_or_else(|| "invalid user_event_id in peers_shared".into())
+}
+
+/// Load the local user key (signer_kind=2) from local_signer_material.
+pub fn load_local_user_key(
+    db: &Connection,
+    recorded_by: &str,
+) -> Result<Option<(EventId, SigningKey)>, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some((eid_b64, key_bytes)) = db
+        .query_row(
+            "SELECT signer_event_id, private_key FROM local_signer_material
+             WHERE recorded_by = ?1 AND signer_kind = 2
+             LIMIT 1",
+            rusqlite::params![recorded_by],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
+        .optional()?
+    {
+        let signing_key = decode_signing_key(key_bytes)?;
+        let eid = event_id_from_base64(&eid_b64)
+            .ok_or_else(|| "bad local user key event_id".to_string())?;
+        return Ok(Some((eid, signing_key)));
+    }
+    Ok(None)
+}
+
+// ---------------------------------------------------------------------------
+// Projection queries
+// ---------------------------------------------------------------------------
 
 pub fn count(
     db: &Connection,
@@ -67,4 +169,54 @@ pub fn list_accounts(
         })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+// ---------------------------------------------------------------------------
+// Response types & high-level query functions
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AccountItem {
+    pub event_id: String,
+    pub device_name: String,
+    pub user_event_id: String,
+    pub username: String,
+}
+
+/// List account items (response type) from the database.
+pub fn list_account_items(
+    db: &Connection,
+    recorded_by: &str,
+) -> Result<Vec<AccountItem>, rusqlite::Error> {
+    let rows = list_accounts(db, recorded_by)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| AccountItem {
+            event_id: row.event_id,
+            device_name: row.device_name,
+            user_event_id: row.user_event_id,
+            username: row.username,
+        })
+        .collect())
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct IdentityResponse {
+    pub transport_fingerprint: String,
+    pub user_event_id: Option<String>,
+    pub peer_shared_event_id: Option<String>,
+}
+
+/// Get combined identity info for a specific peer.
+pub fn identity(
+    db: &Connection,
+    recorded_by: &str,
+) -> Result<IdentityResponse, rusqlite::Error> {
+    let user_event_id = super::super::user::first_event_id(db, recorded_by)?;
+    let peer_shared_event_id = first_event_id(db, recorded_by)?;
+    Ok(IdentityResponse {
+        transport_fingerprint: recorded_by.to_string(),
+        user_event_id,
+        peer_shared_event_id,
+    })
 }

@@ -8,4 +8,7 @@ pub mod invite_link;
 // Re-export stable public API so callers import from `event_modules::workspace`.
 pub use wire::{WorkspaceEvent, parse_workspace, encode_workspace, WORKSPACE_META, WORKSPACE_WIRE_SIZE};
 pub use projector::project_pure;
-pub use queries::{WorkspaceRow, list, name};
+pub use queries::{
+    WorkspaceRow, list, name, resolve_workspace_for_peer,
+    WorkspaceItem, list_items, StatusResponse, status, KeysResponse, keys,
+};

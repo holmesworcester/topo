@@ -649,27 +649,5 @@ fn load_local_peer_signer(
     db: &Connection,
     recorded_by: &str,
 ) -> Result<Option<(EventId, SigningKey)>, Box<dyn std::error::Error + Send + Sync>> {
-    use rusqlite::OptionalExtension;
-    if let Some((eid_b64, key_bytes)) = db
-        .query_row(
-            "SELECT l.signer_event_id, l.private_key
-             FROM local_signer_material l
-             INNER JOIN peers_shared p
-               ON p.recorded_by = l.recorded_by AND p.event_id = l.signer_event_id
-             WHERE l.recorded_by = ?1 AND l.signer_kind = 3
-             LIMIT 1",
-            rusqlite::params![recorded_by],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
-        )
-        .optional()?
-    {
-        let key_arr: [u8; 32] = key_bytes
-            .try_into()
-            .map_err(|_| "bad signing key length in local signer table")?;
-        let signing_key = SigningKey::from_bytes(&key_arr);
-        let eid = crate::crypto::event_id_from_base64(&eid_b64)
-            .ok_or("bad local peer signer event_id")?;
-        return Ok(Some((eid, signing_key)));
-    }
-    Ok(None)
+    crate::event_modules::peer_shared::load_local_peer_signer(db, recorded_by)
 }

@@ -14,6 +14,7 @@ use serde::Serialize;
 use tracing::{info, warn};
 
 use crate::db::transport_creds::discover_local_tenants;
+use crate::event_modules::{message, peer_shared, reaction, user, workspace};
 use crate::node::NodeRuntimeNetInfo;
 use crate::rpc::protocol::*;
 use crate::service;
@@ -453,64 +454,136 @@ fn dispatch(
             Err(e) => RpcResponse::error(e),
         },
 
-        // ----- Read-only commands (no active peer needed) -----
-        RpcMethod::TransportIdentity => match service::svc_transport_identity(db_path) {
-            Ok(data) => RpcResponse::success(data),
-            Err(e) => RpcResponse::error(e.to_string()),
-        },
-        RpcMethod::Messages { limit } => match service::svc_messages(db_path, limit) {
-            Ok(data) => RpcResponse::success(data),
-            Err(e) => RpcResponse::error(e.to_string()),
-        },
-        RpcMethod::Status => match service::svc_status(db_path) {
-            Ok(data) => {
-                let mut json = serde_json::to_value(data).unwrap_or(serde_json::Value::Null);
-                // Merge runtime networking info if available.
-                if let Some(net_info) = state.runtime_net.read().unwrap().as_ref() {
-                    if let Ok(net_val) = serde_json::to_value(net_info) {
-                        json["runtime"] = net_val;
+        // ----- Read-only commands (call event modules directly) -----
+        RpcMethod::TransportIdentity => {
+            match service::open_db_load(db_path) {
+                Ok((fingerprint, _db)) => RpcResponse::success(
+                    service::TransportIdentityResponse { fingerprint },
+                ),
+                Err(e) => RpcResponse::error(e.to_string()),
+            }
+        }
+        RpcMethod::Messages { limit } => {
+            match service::open_db_load(db_path) {
+                Ok((recorded_by, db)) => match message::list(&db, &recorded_by, limit) {
+                    Ok(data) => RpcResponse::success(data),
+                    Err(e) => RpcResponse::error(e.to_string()),
+                },
+                Err(e) => RpcResponse::error(e.to_string()),
+            }
+        }
+        RpcMethod::Status => {
+            match service::open_db_load(db_path) {
+                Ok((recorded_by, db)) => {
+                    let data = workspace::status(&db, &recorded_by);
+                    let mut json = serde_json::to_value(data).unwrap_or(serde_json::Value::Null);
+                    if let Some(net_info) = state.runtime_net.read().unwrap().as_ref() {
+                        if let Ok(net_val) = serde_json::to_value(net_info) {
+                            json["runtime"] = net_val;
+                        }
+                    }
+                    RpcResponse {
+                        version: crate::rpc::protocol::PROTOCOL_VERSION,
+                        ok: true,
+                        error: None,
+                        data: Some(json),
                     }
                 }
-                RpcResponse {
-                    version: crate::rpc::protocol::PROTOCOL_VERSION,
-                    ok: true,
-                    error: None,
-                    data: Some(json),
-                }
+                Err(e) => RpcResponse::error(e.to_string()),
             }
-            Err(e) => RpcResponse::error(e.to_string()),
-        },
-        RpcMethod::AssertNow { predicate } => match service::svc_assert_now(db_path, &predicate) {
-            Ok(data) => RpcResponse::success(data),
-            Err(e) => RpcResponse::error(e.to_string()),
-        },
+        }
+        RpcMethod::AssertNow { predicate } => {
+            match service::open_db_load(db_path) {
+                Ok((recorded_by, db)) => {
+                    match crate::assert::parse_predicate(&predicate) {
+                        Ok((field, op, expected)) => {
+                            match crate::assert::query_field(&db, &field, &recorded_by) {
+                                Ok(actual) => RpcResponse::success(crate::assert::AssertResponse {
+                                    pass: op.eval(actual, expected),
+                                    field,
+                                    actual,
+                                    op: op.symbol().to_string(),
+                                    expected,
+                                    timed_out: false,
+                                }),
+                                Err(e) => RpcResponse::error(e),
+                            }
+                        }
+                        Err(e) => RpcResponse::error(e),
+                    }
+                }
+                Err(e) => RpcResponse::error(e.to_string()),
+            }
+        }
         RpcMethod::AssertEventually {
             predicate,
             timeout_ms,
             interval_ms,
-        } => match service::svc_assert_eventually(db_path, &predicate, timeout_ms, interval_ms) {
-            Ok(data) => RpcResponse::success(data),
-            Err(e) => RpcResponse::error(e.to_string()),
-        },
-        RpcMethod::Reactions => match service::svc_reactions(db_path) {
-            Ok(data) => RpcResponse::success(data),
-            Err(e) => RpcResponse::error(e.to_string()),
-        },
-        RpcMethod::Users => match service::svc_users(db_path) {
-            Ok(data) => RpcResponse::success(data),
-            Err(e) => RpcResponse::error(e.to_string()),
-        },
-        RpcMethod::Keys { summary } => match service::svc_keys(db_path, summary) {
-            Ok(data) => RpcResponse::success(data),
-            Err(e) => RpcResponse::error(e.to_string()),
-        },
-        RpcMethod::Workspaces => match service::svc_workspaces(db_path) {
-            Ok(data) => RpcResponse::success(data),
-            Err(e) => RpcResponse::error(e.to_string()),
-        },
-        RpcMethod::IntroAttempts { peer } => {
-            match service::svc_intro_attempts(db_path, peer.as_deref()) {
+        } => {
+            match crate::assert::assert_eventually(db_path, &predicate, timeout_ms, interval_ms) {
                 Ok(data) => RpcResponse::success(data),
+                Err(e) => RpcResponse::error(e.to_string()),
+            }
+        }
+        RpcMethod::Reactions => {
+            match service::open_db_load(db_path) {
+                Ok((recorded_by, db)) => match reaction::list(&db, &recorded_by) {
+                    Ok(data) => RpcResponse::success(data),
+                    Err(e) => RpcResponse::error(e.to_string()),
+                },
+                Err(e) => RpcResponse::error(e.to_string()),
+            }
+        }
+        RpcMethod::Users => {
+            match service::open_db_load(db_path) {
+                Ok((recorded_by, db)) => match user::list_items(&db, &recorded_by) {
+                    Ok(data) => RpcResponse::success(data),
+                    Err(e) => RpcResponse::error(e.to_string()),
+                },
+                Err(e) => RpcResponse::error(e.to_string()),
+            }
+        }
+        RpcMethod::Keys { summary } => {
+            match service::open_db_load(db_path) {
+                Ok((recorded_by, db)) => match workspace::keys(&db, &recorded_by, summary) {
+                    Ok(data) => RpcResponse::success(data),
+                    Err(e) => RpcResponse::error(e.to_string()),
+                },
+                Err(e) => RpcResponse::error(e.to_string()),
+            }
+        }
+        RpcMethod::Workspaces => {
+            match service::open_db_load(db_path) {
+                Ok((recorded_by, db)) => match workspace::list_items(&db, &recorded_by) {
+                    Ok(data) => RpcResponse::success(data),
+                    Err(e) => RpcResponse::error(e.to_string()),
+                },
+                Err(e) => RpcResponse::error(e.to_string()),
+            }
+        }
+        RpcMethod::IntroAttempts { peer } => {
+            match service::open_db_load(db_path) {
+                Ok((recorded_by, db)) => {
+                    match crate::db::intro::list_intro_attempts(&db, &recorded_by, peer.as_deref()) {
+                        Ok(rows) => {
+                            let items: Vec<service::IntroAttemptItem> = rows
+                                .into_iter()
+                                .map(|r| service::IntroAttemptItem {
+                                    intro_id: hex::encode(&r.intro_id),
+                                    other_peer_id: r.other_peer_id,
+                                    introduced_by_peer_id: r.introduced_by_peer_id,
+                                    origin_ip: r.origin_ip,
+                                    origin_port: r.origin_port,
+                                    status: r.status,
+                                    error: r.error,
+                                    created_at: r.created_at,
+                                })
+                                .collect();
+                            RpcResponse::success(items)
+                        }
+                        Err(e) => RpcResponse::error(e.to_string()),
+                    }
+                }
                 Err(e) => RpcResponse::error(e.to_string()),
             }
         }
@@ -638,8 +711,13 @@ fn dispatch(
         RpcMethod::Identity => {
             match state.require_active_peer() {
                 Ok(peer_id) => {
-                    match service::svc_identity_for_peer(db_path, &peer_id) {
-                        Ok(data) => RpcResponse::success(data),
+                    match service::open_db_for_peer(db_path, &peer_id) {
+                        Ok((_recorded_by, db)) => {
+                            match peer_shared::identity(&db, &peer_id) {
+                                Ok(data) => RpcResponse::success(data),
+                                Err(e) => RpcResponse::error(e.to_string()),
+                            }
+                        }
                         Err(e) => RpcResponse::error(e.to_string()),
                     }
                 }
