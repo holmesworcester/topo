@@ -123,30 +123,21 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    subgraph LOCAL_PATH["Local Create Path"]
-        CLI_CMD["CLI/RPC command"] --> SVC_CMD["service + event_modules command"]
-        SVC_CMD --> CREATE["create_*_event_sync"]
-        CREATE --> LOCAL_STORE["persist local event\n(events + recorded_events + neg_items)"]
-        CREATE --> LOCAL_PROJ["project_one + cascade"]
-    end
+    LOCAL["Local create events"] --> INGEST["shared ingest + batch_writer"]
 
-    subgraph SYNC_PATH["Incoming Sync Path"]
-        QUIC["QUIC endpoint"] --> LOOP["accept/connect loop"]
-        LOOP --> SESS["sync session"]
-        SESS --> DATA_IN["data stream: Frame::Event(blob)"]
-        DATA_IN --> RECV["receiver task\nhash(blob) + tag recorded_by"]
-        RECV --> INCOMING["incoming sync events\nIngestItem(event_id, blob, recorded_by)"]
-        INCOMING --> INGEST_CH["shared ingest channel"]
-        INGEST_CH --> WRITER["batch_writer"]
-        WRITER --> SYNC_STORE["persist sync event\n(events + recorded_events + neg_items)"]
-        WRITER --> PQ["project_queue enqueue + drain"]
-    end
+    QUIC["QUIC endpoint"] --> SESS["sync session (data stream)"]
+    SESS --> RECV["receiver task"]
+    RECV --> INCOMING["incoming sync events"]
+    INCOMING --> INGEST
 
-    LOCAL_STORE --> EVENT_DB[("SQLite Event Storage")]
-    SYNC_STORE --> EVENT_DB
-    PQ --> APPLY["project_one + cascade"]
-    LOCAL_PROJ --> PROJ_DB[("SQLite Projections")]
-    APPLY --> PROJ_DB
+    INGEST --> STORE["events + recorded + neg persist"]
+    STORE --> QDB[("SQLite Queues")]
+    QDB --> APPLY["project_one + cascade"]
+    APPLY --> PDB[("SQLite Projections")]
+
+    CTRL["Sync control stream\n(HaveList / need_ids)"] --> QDB
+    PDB --> TRUST["transport trust decisions"]
+    TRUST --> NET["QUIC allow/deny + bootstrap autodial"]
 ```
 
 ## Current Data-Flow Facts
