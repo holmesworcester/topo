@@ -17,9 +17,7 @@ use crate::db::schema::create_tables;
 use crate::db::store::lookup_workspace_id;
 use crate::db::transport_trust::record_transport_binding;
 use crate::sync::SyncSessionHandler;
-use crate::transport::{
-    dial_session_peer, open_outbound_session, TransportClientConfig, TransportEndpoint,
-};
+use crate::transport::{dial_session_provider, TransportClientConfig, TransportEndpoint};
 
 use super::{
     current_timestamp_ms, drain_batch_size, peer_fingerprint_from_hex, run_session,
@@ -125,17 +123,17 @@ async fn connect_loop_inner(
 
     loop {
         info!("Connecting to {}...", remote);
-        let connected =
-            match dial_session_peer(&endpoint, remote, &sni, client_config.as_ref()).await {
-                Ok(c) => c,
+        let provider =
+            match dial_session_provider(&endpoint, remote, &sni, client_config.as_ref()).await {
+                Ok(p) => p,
                 Err(e) => {
                     warn!("Failed to connect to {}: {}", remote, e);
                     tokio::time::sleep(CONNECT_RETRY_DELAY).await;
                     continue;
                 }
             };
-        let connection = connected.connection;
-        let peer_id = connected.peer_id;
+        let connection = provider.connection();
+        let peer_id = provider.peer_id().to_string();
         let peer_fp = match peer_fingerprint_from_hex(&peer_id) {
             Some(fp) => fp,
             None => {
@@ -208,8 +206,8 @@ async fn connect_loop_inner(
                 }
             }
 
-            let (session_id, io) = match open_outbound_session(&connection).await {
-                Ok(r) => r,
+            let session = match provider.next_session().await {
+                Ok(s) => s,
                 Err(e) => {
                     info!("Connection dropped: {}", e);
                     break;
@@ -218,11 +216,11 @@ async fn connect_loop_inner(
 
             run_session(
                 &initiator_handler,
-                session_id,
-                io,
+                session.session_id,
+                session.io,
                 &current_rb,
                 peer_fp,
-                connection.remote_address(),
+                session.remote_addr,
                 SessionDirection::Outbound,
                 db_path,
             )

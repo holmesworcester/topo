@@ -6,13 +6,10 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::contracts::event_pipeline_contract::{BatchWriterFn, IngestItem};
-use crate::contracts::peering_contract::{
-    PeerFingerprint, SessionDirection, SessionHandler, SessionMeta, TenantId,
-};
+use crate::contracts::peering_contract::SessionDirection;
 use crate::crypto::EventId;
 use crate::db::open_connection;
 use crate::db::schema::create_tables;
@@ -20,10 +17,10 @@ use crate::db::store::lookup_workspace_id;
 use crate::sync::session::run_coordinator;
 use crate::sync::PeerCoord;
 use crate::sync::SyncSessionHandler;
-use crate::transport::{dial_session_peer, open_outbound_session, TransportEndpoint};
+use crate::transport::{dial_session_provider, TransportEndpoint};
 
 use super::{
-    peer_fingerprint_from_hex, shared_ingest_cap, CONNECT_RETRY_DELAY, SESSION_GAP,
+    peer_fingerprint_from_hex, run_session, shared_ingest_cap, CONNECT_RETRY_DELAY, SESSION_GAP,
     SYNC_SESSION_TIMEOUT_SECS,
 };
 
@@ -119,16 +116,16 @@ pub async fn download_from_sources(
                 .unwrap();
             rt.block_on(async move {
                 loop {
-                    let connected = match dial_session_peer(&endpoint, remote, &sni, None).await {
-                        Ok(c) => c,
+                    let provider = match dial_session_provider(&endpoint, remote, &sni, None).await
+                    {
+                        Ok(p) => p,
                         Err(e) => {
                             warn!("Failed to connect to {}: {}", remote, e);
                             tokio::time::sleep(CONNECT_RETRY_DELAY).await;
                             continue;
                         }
                     };
-                    let connection = connected.connection;
-                    let peer_id = connected.peer_id;
+                    let peer_id = provider.peer_id().to_string();
                     let peer_fp = match peer_fingerprint_from_hex(&peer_id) {
                         Some(fp) => fp,
                         None => {
@@ -144,26 +141,25 @@ pub async fn download_from_sources(
 
                     // Inner loop: repeated sync sessions
                     loop {
-                        let (session_id, io) = match open_outbound_session(&connection).await {
-                            Ok(r) => r,
+                        let session = match provider.next_session().await {
+                            Ok(s) => s,
                             Err(e) => {
                                 info!("Connection dropped: {}", e);
                                 break;
                             }
                         };
 
-                        let meta = SessionMeta {
-                            session_id,
-                            tenant: TenantId(recorded_by.clone()),
-                            peer: PeerFingerprint(peer_fp),
-                            remote_addr: connection.remote_address(),
-                            direction: SessionDirection::Outbound,
-                        };
-
-                        if let Err(e) = handler.on_session(meta, io, CancellationToken::new()).await
-                        {
-                            warn!("Download session error: {}", e);
-                        }
+                        run_session(
+                            &handler,
+                            session.session_id,
+                            session.io,
+                            &recorded_by,
+                            peer_fp,
+                            session.remote_addr,
+                            SessionDirection::Outbound,
+                            &db_path,
+                        )
+                        .await;
 
                         tokio::time::sleep(SESSION_GAP).await;
                     }

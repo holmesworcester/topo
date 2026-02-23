@@ -17,8 +17,7 @@ use crate::db::schema::create_tables;
 use crate::db::transport_trust::record_transport_binding;
 use crate::sync::SyncSessionHandler;
 use crate::transport::{
-    accept_session_peer, open_inbound_session, resolve_trusting_tenant, TransportClientConfig,
-    TransportEndpoint,
+    accept_session_provider, resolve_trusting_tenant, TransportClientConfig, TransportEndpoint,
 };
 
 use super::{
@@ -115,8 +114,8 @@ pub async fn accept_loop_with_ingest(
 
     loop {
         info!("Waiting for incoming connection...");
-        let connected = match accept_session_peer(&endpoint).await {
-            Ok(Some(c)) => c,
+        let provider = match accept_session_provider(&endpoint).await {
+            Ok(Some(p)) => p,
             Ok(None) => {
                 info!("Endpoint closed, stopping accept_loop");
                 return Ok(());
@@ -126,8 +125,8 @@ pub async fn accept_loop_with_ingest(
                 continue;
             }
         };
-        let connection = connected.connection;
-        let peer_id = connected.peer_id;
+        let connection = provider.connection();
+        let peer_id = provider.peer_id().to_string();
         info!("Accepted connection from {}", peer_id);
 
         // Resolve which local tenant owns this connection.
@@ -230,8 +229,8 @@ pub async fn accept_loop_with_ingest(
                         }
                     }
 
-                    let (session_id, io) = match open_inbound_session(&connection).await {
-                        Ok(r) => r,
+                    let session = match provider.next_session().await {
+                        Ok(s) => s,
                         Err(e) => {
                             info!("Connection dropped: {}", e);
                             break;
@@ -240,11 +239,11 @@ pub async fn accept_loop_with_ingest(
 
                     run_session(
                         &responder_handler,
-                        session_id,
-                        io,
+                        session.session_id,
+                        session.io,
                         &recorded_by_owned,
                         peer_fp,
-                        connection.remote_address(),
+                        session.remote_addr,
                         SessionDirection::Inbound,
                         &db_path_owned,
                     )

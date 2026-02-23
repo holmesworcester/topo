@@ -114,6 +114,11 @@ check_no_match 'accept_peer\(' src/peering/
 # peering must not open session streams directly via session_factory
 check_no_match 'session_factory::open_session_io' src/peering/
 check_no_match 'session_factory::accept_session_io' src/peering/
+# peering loops must consume the provider seam (not peer/open split calls)
+check_no_match 'dial_session_peer\(' src/peering/loops/
+check_no_match 'accept_session_peer\(' src/peering/loops/
+check_no_match 'open_outbound_session\(' src/peering/
+check_no_match 'open_inbound_session\(' src/peering/
 # peering must not use quinn stream types (SendStream/RecvStream)
 check_no_match 'quinn::SendStream' src/peering/
 check_no_match 'quinn::RecvStream' src/peering/
@@ -149,10 +154,11 @@ check_required 'DualConnection::new' src/transport/session_factory.rs
 check_required 'pub async fn dial_peer' src/transport/connection_lifecycle.rs
 check_required 'pub async fn accept_peer' src/transport/connection_lifecycle.rs
 # transport peering boundary must provide orchestration-facing helpers
-check_required 'pub async fn dial_session_peer' src/transport/peering_boundary.rs
-check_required 'pub async fn accept_session_peer' src/transport/peering_boundary.rs
-check_required 'pub async fn open_outbound_session' src/transport/peering_boundary.rs
-check_required 'pub async fn open_inbound_session' src/transport/peering_boundary.rs
+check_required 'pub struct SessionProvider' src/transport/peering_boundary.rs
+check_required 'pub struct SessionEnvelope' src/transport/peering_boundary.rs
+check_required 'pub async fn dial_session_provider' src/transport/peering_boundary.rs
+check_required 'pub async fn accept_session_provider' src/transport/peering_boundary.rs
+check_required 'pub async fn next_session' src/transport/peering_boundary.rs
 check_required 'pub fn create_runtime_endpoint_for_tenants' src/transport/peering_boundary.rs
 check_required 'pub fn build_tenant_client_config_from_db' src/transport/peering_boundary.rs
 

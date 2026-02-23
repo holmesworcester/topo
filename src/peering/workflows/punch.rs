@@ -19,7 +19,7 @@ use crate::db::{
 use crate::protocol::Frame;
 use crate::sync::SyncSessionHandler;
 use crate::transport::{
-    dial_session_peer, open_outbound_session, read_intro_offer_frame, tenant_trusts_peer,
+    dial_session_provider, read_intro_offer_frame, tenant_trusts_peer, SessionProvider,
     TransportClientConfig, TransportConnection, TransportEndpoint,
 };
 
@@ -190,17 +190,17 @@ pub async fn handle_intro_offer(
         // Fallback to endpoint default for single-tenant test endpoints.
         match tokio::time::timeout(
             pace,
-            dial_session_peer(&endpoint, addr, "localhost", client_config.as_ref()),
+            dial_session_provider(&endpoint, addr, "localhost", client_config.as_ref()),
         )
         .await
         {
-            Ok(Ok(connected)) => {
+            Ok(Ok(provider)) => {
                 // Verify peer identity matches expected
-                if connected.peer_id != other_peer_hex {
+                if provider.peer_id() != other_peer_hex {
                     warn!(
                         "Punch connected but wrong peer: expected {}, got {}",
                         &other_peer_hex[..16],
-                        &connected.peer_id[..16.min(connected.peer_id.len())]
+                        &provider.peer_id()[..16.min(provider.peer_id().len())]
                     );
                     update_status(
                         db_path,
@@ -221,7 +221,7 @@ pub async fn handle_intro_offer(
                 // Preserve endpoint observations for peers reached via punched links.
                 // This enables future explicit intro calls between peers that were
                 // discovered through successful hole-punched connectivity.
-                let remote = connected.connection.remote_address();
+                let remote = provider.remote_addr();
                 if let Ok(db) = open_connection(db_path) {
                     let now_ms = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -240,7 +240,7 @@ pub async fn handle_intro_offer(
 
                 // Run normal sync on the direct connection
                 run_sync_on_punched_connection(
-                    connected.connection,
+                    provider,
                     db_path,
                     recorded_by,
                     &other_peer_hex,
@@ -266,14 +266,14 @@ pub async fn handle_intro_offer(
 
 /// After a successful hole punch, run a sync initiator session.
 async fn run_sync_on_punched_connection(
-    connection: TransportConnection,
+    provider: SessionProvider,
     db_path: &str,
     recorded_by: &str,
     peer_id: &str,
     shared_ingest: tokio::sync::mpsc::Sender<IngestItem>,
 ) {
-    let (session_id, io) = match open_outbound_session(&connection).await {
-        Ok(r) => r,
+    let session = match provider.next_session().await {
+        Ok(s) => s,
         Err(e) => {
             warn!("Failed to open streams on punched connection: {}", e);
             return;
@@ -293,15 +293,18 @@ async fn run_sync_on_punched_connection(
     };
 
     let meta = SessionMeta {
-        session_id,
+        session_id: session.session_id,
         tenant: TenantId(recorded_by.to_string()),
         peer: PeerFingerprint(peer_fp),
-        remote_addr: connection.remote_address(),
+        remote_addr: session.remote_addr,
         direction: SessionDirection::Outbound,
     };
     let handler = SyncSessionHandler::initiator(db_path.to_string(), 60, shared_ingest);
 
-    if let Err(e) = handler.on_session(meta, io, CancellationToken::new()).await {
+    if let Err(e) = handler
+        .on_session(meta, session.io, CancellationToken::new())
+        .await
+    {
         warn!("Punched sync error: {}", e);
     } else {
         info!("Punched sync complete");

@@ -30,6 +30,65 @@ pub type TransportConnection = quinn::Connection;
 pub type TransportClientConfig = quinn::ClientConfig;
 pub type TenantClientConfigs = HashMap<String, TransportClientConfig>;
 
+#[derive(Clone, Copy)]
+enum SessionOpenMode {
+    Outbound,
+    Inbound,
+}
+
+/// Transport-owned provider for repeated sync sessions over one QUIC connection.
+///
+/// Peering orchestration uses this to avoid touching stream-open details.
+#[derive(Clone)]
+pub struct SessionProvider {
+    connection: TransportConnection,
+    peer_id: String,
+    mode: SessionOpenMode,
+}
+
+/// One ready-to-run sync session from a [`SessionProvider`].
+pub struct SessionEnvelope {
+    pub peer_id: String,
+    pub remote_addr: SocketAddr,
+    pub session_id: u64,
+    pub io: Box<dyn TransportSessionIo>,
+}
+
+impl SessionProvider {
+    fn from_connected(connected: ConnectedPeer, mode: SessionOpenMode) -> Self {
+        Self {
+            connection: connected.connection,
+            peer_id: connected.peer_id,
+            mode,
+        }
+    }
+
+    pub fn peer_id(&self) -> &str {
+        &self.peer_id
+    }
+
+    pub fn remote_addr(&self) -> SocketAddr {
+        self.connection.remote_address()
+    }
+
+    pub fn connection(&self) -> TransportConnection {
+        self.connection.clone()
+    }
+
+    pub async fn next_session(&self) -> Result<SessionEnvelope, SessionOpenError> {
+        let (session_id, io) = match self.mode {
+            SessionOpenMode::Outbound => open_session_io(&self.connection).await?,
+            SessionOpenMode::Inbound => accept_session_io(&self.connection).await?,
+        };
+        Ok(SessionEnvelope {
+            peer_id: self.peer_id.clone(),
+            remote_addr: self.connection.remote_address(),
+            session_id,
+            io,
+        })
+    }
+}
+
 pub fn create_runtime_endpoint_for_tenants(
     bind_addr: SocketAddr,
     cert_resolver: Arc<WorkspaceCertResolver>,
@@ -128,10 +187,47 @@ pub async fn dial_session_peer(
     dial_peer(endpoint, remote, sni, client_config).await
 }
 
+pub async fn dial_session_provider(
+    endpoint: &TransportEndpoint,
+    remote: SocketAddr,
+    sni: &str,
+    client_config: Option<&TransportClientConfig>,
+) -> Result<SessionProvider, ConnectionLifecycleError> {
+    let connected = dial_session_peer(endpoint, remote, sni, client_config).await?;
+    Ok(SessionProvider::from_connected(
+        connected,
+        SessionOpenMode::Outbound,
+    ))
+}
+
 pub async fn accept_session_peer(
     endpoint: &TransportEndpoint,
 ) -> Result<Option<ConnectedPeer>, ConnectionLifecycleError> {
     accept_peer(endpoint).await
+}
+
+pub async fn accept_session_provider(
+    endpoint: &TransportEndpoint,
+) -> Result<Option<SessionProvider>, ConnectionLifecycleError> {
+    let connected = match accept_session_peer(endpoint).await? {
+        Some(c) => c,
+        None => return Ok(None),
+    };
+    Ok(Some(SessionProvider::from_connected(
+        connected,
+        SessionOpenMode::Inbound,
+    )))
+}
+
+pub fn outbound_session_provider_for_connection(
+    connection: TransportConnection,
+    peer_id: String,
+) -> SessionProvider {
+    SessionProvider {
+        connection,
+        peer_id,
+        mode: SessionOpenMode::Outbound,
+    }
 }
 
 pub async fn open_outbound_session(
@@ -168,10 +264,10 @@ mod tests {
     use std::net::SocketAddr;
     use std::sync::Arc;
 
+    use crate::db::open_connection;
     use crate::db::schema::create_tables;
     use crate::db::transport_creds::store_local_creds;
     use crate::db::transport_trust::record_pending_invite_bootstrap_trust;
-    use crate::db::open_connection;
     use crate::transport::{
         create_dual_endpoint, extract_spki_fingerprint, generate_self_signed_cert, AllowedPeers,
     };
@@ -238,7 +334,8 @@ mod tests {
         );
 
         let tenants = vec!["tenant-x".to_string(), "tenant-a".to_string()];
-        let resolved = resolve_trusting_tenant(db_path.to_str().unwrap(), &tenants, allowed).unwrap();
+        let resolved =
+            resolve_trusting_tenant(db_path.to_str().unwrap(), &tenants, allowed).unwrap();
         assert_eq!(resolved, Some("tenant-a".to_string()));
     }
 
@@ -250,11 +347,8 @@ mod tests {
         create_tables(&db).unwrap();
         drop(db);
 
-        let err = build_tenant_client_config_from_db(
-            db_path.to_str().unwrap(),
-            "missing-tenant",
-        )
-        .unwrap_err();
+        let err = build_tenant_client_config_from_db(db_path.to_str().unwrap(), "missing-tenant")
+            .unwrap_err();
         assert!(
             err.to_string().contains("local creds missing"),
             "unexpected error: {}",
@@ -309,5 +403,4 @@ mod tests {
             .expect("intro frame");
         assert_eq!(read, intro);
     }
-
 }
