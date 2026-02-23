@@ -65,6 +65,7 @@ pub async fn download_from_sources(
     let mut peer_coords = Vec::new();
     let mut report_rxs = Vec::new();
     let mut assign_txs = Vec::new();
+    let (wake_tx, _wake_rx) = std::sync::mpsc::channel::<()>();
 
     for i in 0..total {
         let (report_tx, report_rx) = std::sync::mpsc::channel::<Vec<EventId>>();
@@ -73,6 +74,7 @@ pub async fn download_from_sources(
             peer_idx: i,
             report_tx,
             assign_rx: std::sync::Mutex::new(assign_rx),
+            wake_tx: wake_tx.clone(),
         });
         report_rxs.push(report_rx);
         assign_txs.push(assign_tx);

@@ -4,7 +4,11 @@
 //! that auto-connect to discovered remote peers using `PeerDispatcher`.
 
 #[cfg(feature = "discovery")]
+use std::collections::HashMap;
+#[cfg(feature = "discovery")]
 use std::net::SocketAddr;
+#[cfg(feature = "discovery")]
+use std::sync::Arc;
 
 #[cfg(feature = "discovery")]
 use tracing::{info, warn};
@@ -12,7 +16,9 @@ use tracing::{info, warn};
 #[cfg(feature = "discovery")]
 use crate::contracts::event_pipeline_contract::IngestFns;
 #[cfg(feature = "discovery")]
-use crate::peering::loops::{connect_loop, IntroSpawnerFn};
+use crate::peering::loops::{connect_loop_with_coordination, IntroSpawnerFn};
+#[cfg(feature = "discovery")]
+use crate::sync::CoordinationManager;
 #[cfg(feature = "discovery")]
 use crate::transport::{TenantClientConfigs, TransportEndpoint};
 
@@ -22,6 +28,9 @@ use super::target_planner::{
 };
 
 /// Launch mDNS advertisement and browse threads for all tenants.
+///
+/// Each discovered peer registers with the tenant's `CoordinationManager`
+/// so its outbound sessions participate in coordinated multi-source download.
 ///
 /// Returns a `Vec<TenantDiscovery>` that must be kept alive to maintain
 /// mDNS service registration.
@@ -35,6 +44,7 @@ pub(crate) fn launch_mdns_discovery(
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
     db_path: &str,
+    coord_managers: &HashMap<String, Arc<CoordinationManager>>,
 ) -> Vec<crate::peering::discovery::TenantDiscovery> {
     let mut discovery_handles: Vec<crate::peering::discovery::TenantDiscovery> = Vec::new();
 
@@ -74,6 +84,7 @@ pub(crate) fn launch_mdns_discovery(
                                     continue;
                                 }
                             };
+                        let coord_mgr = coord_managers[&tenant.peer_id].clone();
                         std::thread::spawn(move || {
                             let mut dispatcher = PeerDispatcher::new();
                             while let Ok(peer) = rx.recv() {
@@ -107,6 +118,7 @@ pub(crate) fn launch_mdns_discovery(
                                 let db = db_path_disc.clone();
                                 let tid = tenant_id.clone();
                                 let cfg = Some(disc_client_cfg.clone());
+                                let coord = coord_mgr.register_peer();
                                 std::thread::spawn(move || {
                                     let rt = tokio::runtime::Builder::new_current_thread()
                                         .enable_all()
@@ -114,8 +126,8 @@ pub(crate) fn launch_mdns_discovery(
                                         .unwrap();
                                     rt.block_on(async move {
                                         tokio::select! {
-                                            _ = connect_loop(
-                                                &db, &tid, ep, dial_addr, cfg, intro_spawner, ingest,
+                                            _ = connect_loop_with_coordination(
+                                                &db, &tid, ep, dial_addr, cfg, intro_spawner, ingest, Some(coord),
                                             ) => {}
                                             _ = cancel.changed() => {}
                                         }

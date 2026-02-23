@@ -21,7 +21,7 @@ use std::time::Duration;
 // ---------------------------------------------------------------------------
 // Re-exports — preserve the existing public API surface
 // ---------------------------------------------------------------------------
-pub use coordinator::{run_coordinator, PeerCoord};
+pub use coordinator::{run_coordinator, CoordinationManager, PeerCoord};
 pub use data_plane::spawn_data_receiver;
 pub use initiator::run_sync_initiator;
 pub use responder::run_sync_responder;

@@ -16,6 +16,7 @@ use crate::db::removal_watch::is_peer_removed;
 use crate::db::schema::create_tables;
 use crate::db::store::lookup_workspace_id;
 use crate::db::transport_trust::record_transport_binding;
+use crate::sync::PeerCoord;
 use crate::sync::SyncSessionHandler;
 use crate::transport::{dial_session_provider, TransportClientConfig, TransportEndpoint};
 
@@ -36,6 +37,11 @@ use super::{
 ///
 /// When `client_config` is `Some`, outbound dials present the correct per-tenant
 /// cert and tenant-scoped trust.
+///
+/// The initiator participates in coordinated multi-source download: need_ids
+/// are reported to a coordinator thread that assigns events via greedy load
+/// balancing across all peers sharing the same coordinator. For single-peer
+/// scenarios the coordinator degenerates to pass-through assignment.
 pub async fn connect_loop(
     db_path: &str,
     recorded_by: &str,
@@ -44,6 +50,30 @@ pub async fn connect_loop(
     client_config: Option<TransportClientConfig>,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    connect_loop_with_coordination(
+        db_path,
+        recorded_by,
+        endpoint,
+        remote,
+        client_config,
+        intro_spawner,
+        ingest,
+        None,
+    )
+    .await
+}
+
+/// Coordinated connect loop variant used by runtime target planners.
+pub async fn connect_loop_with_coordination(
+    db_path: &str,
+    recorded_by: &str,
+    endpoint: TransportEndpoint,
+    remote: SocketAddr,
+    client_config: Option<TransportClientConfig>,
+    intro_spawner: IntroSpawnerFn,
+    ingest: IngestFns,
+    coordination: Option<Arc<PeerCoord>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     {
         let db = open_connection(db_path)?;
@@ -92,6 +122,7 @@ pub async fn connect_loop(
             client_config,
             intro_spawner,
             shared_tx,
+            coordination,
         ))
         .await
 }
@@ -104,6 +135,7 @@ async fn connect_loop_inner(
     client_config: Option<TransportClientConfig>,
     intro_spawner: IntroSpawnerFn,
     shared_ingest: mpsc::Sender<IngestItem>,
+    coordination: Option<Arc<PeerCoord>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Look up workspace SNI for this tenant (falls back to "localhost" if no trust anchor)
     let sni = {
@@ -115,11 +147,20 @@ async fn connect_loop_inner(
             crate::transport::multi_workspace::workspace_sni(&ws_id)
         }
     };
-    let initiator_handler = SyncSessionHandler::initiator(
-        db_path.to_string(),
-        SYNC_SESSION_TIMEOUT_SECS,
-        shared_ingest.clone(),
-    );
+    let initiator_handler = if let Some(coord) = coordination {
+        SyncSessionHandler::initiator_with_coordination(
+            db_path.to_string(),
+            SYNC_SESSION_TIMEOUT_SECS,
+            coord,
+            shared_ingest.clone(),
+        )
+    } else {
+        SyncSessionHandler::initiator(
+            db_path.to_string(),
+            SYNC_SESSION_TIMEOUT_SECS,
+            shared_ingest.clone(),
+        )
+    };
 
     loop {
         info!("Connecting to {}...", remote);

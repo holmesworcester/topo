@@ -108,6 +108,7 @@ pub fn maybe_report_coordination_need_ids(
         coord.peer_idx
     );
     let _ = coord.report_tx.send(report);
+    let _ = coord.wake_tx.send(());
     *coordination_reported = true;
 }
 

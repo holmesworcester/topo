@@ -24,7 +24,7 @@ use crate::db::open_connection;
 use crate::db::transport_creds::list_local_peers;
 use crate::db::transport_trust::list_active_invite_bootstrap_addrs;
 use crate::event_modules::workspace::invite_link::parse_bootstrap_address;
-use crate::peering::loops::{connect_loop, IntroSpawnerFn};
+use crate::peering::loops::{connect_loop_with_coordination, IntroSpawnerFn};
 use crate::transport::{
     build_tenant_client_config_from_db, TransportClientConfig, TransportEndpoint,
 };
@@ -104,6 +104,7 @@ pub(crate) fn spawn_connect_loop_thread(
     source: &'static str,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
+    coordination: std::sync::Arc<crate::sync::PeerCoord>,
 ) {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -111,7 +112,7 @@ pub(crate) fn spawn_connect_loop_thread(
             .build()
             .unwrap();
         rt.block_on(async move {
-            if let Err(e) = connect_loop(
+            if let Err(e) = connect_loop_with_coordination(
                 &db_path,
                 &tenant_id,
                 endpoint,
@@ -119,6 +120,7 @@ pub(crate) fn spawn_connect_loop_thread(
                 Some(cfg),
                 intro_spawner,
                 ingest,
+                Some(coordination),
             )
             .await
             {
@@ -222,12 +224,19 @@ pub(crate) fn dispatch_bootstrap_target(
 ///
 /// Uses `PeerDispatcher` for dedup/reconnect, the same dispatch mechanism
 /// used by mDNS discovery (R3/SC3 single-owner dispatch).
+///
+/// Each new connect loop registers with the tenant's `CoordinationManager`
+/// so outbound sessions participate in coordinated multi-source download.
 pub(crate) fn spawn_bootstrap_refresher(
     db_path: String,
     endpoint: TransportEndpoint,
     mut dispatcher: PeerDispatcher,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
+    coord_managers: std::collections::HashMap<
+        String,
+        std::sync::Arc<crate::sync::CoordinationManager>,
+    >,
 ) {
     std::thread::spawn(move || loop {
         match collect_all_bootstrap_targets(&db_path) {
@@ -252,6 +261,7 @@ pub(crate) fn spawn_bootstrap_refresher(
                         &tenant_id[..16.min(tenant_id.len())],
                         remote
                     );
+                    let coord = coord_managers[&tenant_id].register_peer();
                     spawn_connect_loop_thread(
                         db_path.clone(),
                         tenant_id,
@@ -261,6 +271,7 @@ pub(crate) fn spawn_bootstrap_refresher(
                         "bootstrap-autodial-refresh",
                         intro_spawner,
                         ingest,
+                        coord,
                     );
                 }
             }

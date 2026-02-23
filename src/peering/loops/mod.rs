@@ -11,8 +11,8 @@
 //!
 //! Sub-modules:
 //!  - `accept`   -- accept_loop, accept_loop_with_ingest, resolve_tenant_for_peer
-//!  - `connect`  -- connect_loop, connect_loop_inner
-//!  - `download` -- download_from_sources
+//!  - `connect`  -- connect_loop, connect_loop_with_coordination
+//!  - `download` -- download_from_sources (legacy helper)
 
 mod accept;
 mod connect;
@@ -20,7 +20,7 @@ mod download;
 
 // Re-export public API so callers can still `use crate::peering::loops::*`.
 pub use accept::{accept_loop, accept_loop_with_ingest};
-pub use connect::connect_loop;
+pub use connect::{connect_loop, connect_loop_with_coordination};
 pub use download::download_from_sources;
 
 use std::net::SocketAddr;

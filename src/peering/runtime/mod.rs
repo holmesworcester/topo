@@ -9,6 +9,7 @@ mod discovery;
 mod startup;
 pub(crate) mod target_planner;
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -21,6 +22,7 @@ use crate::peering::nat::upnp::UpnpMappingReport;
 
 use crate::contracts::event_pipeline_contract::{IngestFns, IngestItem};
 use crate::peering::loops::{accept_loop_with_ingest, IntroSpawnerFn};
+use crate::sync::CoordinationManager;
 
 use startup::setup_endpoint_and_tenants;
 use target_planner::{
@@ -74,6 +76,14 @@ pub async fn run_node(
         bw(writer_db, shared_rx, writer_events);
     });
 
+    // Per-tenant coordination managers: all outbound initiator sessions for a
+    // tenant share the same coordinator so download work is distributed across
+    // concurrently connected peers.
+    let coord_managers: HashMap<String, Arc<CoordinationManager>> = tenants
+        .iter()
+        .map(|t| (t.peer_id.clone(), Arc::new(CoordinationManager::new())))
+        .collect();
+
     // Keep discovery handles alive so mDNS services stay registered
     #[cfg(feature = "discovery")]
     let _discovery_handles = {
@@ -97,6 +107,7 @@ pub async fn run_node(
                 intro_spawner,
                 ingest,
                 db_path,
+                &coord_managers,
             )
         }
     };
@@ -172,6 +183,7 @@ pub async fn run_node(
                 &tenant_id[..16.min(tenant_id.len())],
                 remote
             );
+            let coord = coord_managers[&tenant_id].register_peer();
             spawn_connect_loop_thread(
                 db_path.to_string(),
                 tenant_id,
@@ -181,6 +193,7 @@ pub async fn run_node(
                 "bootstrap-autodial",
                 intro_spawner,
                 ingest,
+                coord,
             );
         }
         // Keep polling for runtime invite acceptance (shares PeerDispatcher dedup state)
@@ -190,6 +203,7 @@ pub async fn run_node(
             dispatcher,
             intro_spawner,
             ingest,
+            coord_managers.clone(),
         );
     }
 
