@@ -19,19 +19,23 @@ use crate::db::{
     store::{lookup_workspace_id, Store},
     wanted::WantedEvents,
 };
+use crate::protocol::Frame;
 use crate::runtime::SyncStats;
-use crate::protocol::{neg_id_to_event_id, Frame};
 use crate::sync::negentropy_sqlite::NegentropyStorageSqlite;
 use crate::transport::connection::ConnectionError;
 use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
 
-use super::coordinator::PeerCoord;
-use super::receiver::spawn_data_receiver;
-use super::{
-    CONTROL_POLL_TIMEOUT, DATA_DRAIN_TIMEOUT, EGRESS_CLAIM_COUNT,
-    EGRESS_SENT_TTL_MS, ENQUEUE_BATCH, HAVE_CHUNK, NEED_CHUNK,
-    NEGENTROPY_FRAME_SIZE,
+use super::control_plane::{
+    append_have_ids_to_pending, dispatch_assigned_need_ids, dispatch_need_ids_after_reconcile,
+    maybe_report_coordination_need_ids, maybe_take_coordination_assignment, send_done,
+    send_initial_neg_open, CoordinationAssignment,
 };
+use super::coordinator::PeerCoord;
+use super::data_plane::{
+    drain_egress_to_data_stream, enqueue_pending_have_to_egress, send_data_done,
+    spawn_data_receiver,
+};
+use super::{CONTROL_POLL_TIMEOUT, DATA_DRAIN_TIMEOUT, EGRESS_SENT_TTL_MS, NEGENTROPY_FRAME_SIZE};
 
 /// Run sync as the initiator (client role) with dual streams.
 /// Control stream: NegOpen, NegMsg, HaveList
@@ -110,10 +114,7 @@ where
     );
 
     let initial_msg = neg.initiate()?;
-    control
-        .send(&Frame::NegOpen { msg: initial_msg })
-        .await?;
-    control.flush().await?;
+    send_initial_neg_open(&mut control, initial_msg).await?;
 
     let mut reconciliation_done = false;
     let mut rounds = 0;
@@ -149,40 +150,15 @@ where
                     }
                 }
 
-                // Convert have_ids to EventIds and add to pending buffer
-                if !have_ids.is_empty() {
-                    pending_have.reserve(have_ids.len());
-                    for neg_id in have_ids.drain(..) {
-                        pending_have.push(neg_id_to_event_id(&neg_id));
-                    }
-                }
-
-                if !need_ids.is_empty() {
-                    if coordination.is_some() {
-                        // Buffer need_ids for coordinator assignment
-                        for neg_id in need_ids.drain(..) {
-                            coordinated_need_ids.push(neg_id_to_event_id(&neg_id));
-                        }
-                    } else {
-                        // No coordination: send HaveList immediately
-                        let mut batch: Vec<EventId> = Vec::with_capacity(NEED_CHUNK);
-                        for neg_id in need_ids.drain(..) {
-                            let event_id = neg_id_to_event_id(&neg_id);
-                            if wanted.insert(&event_id).unwrap_or(false) {
-                                batch.push(event_id);
-                            }
-                            if batch.len() >= NEED_CHUNK {
-                                control.send(&Frame::HaveList { ids: batch }).await?;
-                                control.flush().await?;
-                                batch = Vec::with_capacity(NEED_CHUNK);
-                            }
-                        }
-                        if !batch.is_empty() {
-                            control.send(&Frame::HaveList { ids: batch }).await?;
-                            control.flush().await?;
-                        }
-                    }
-                }
+                append_have_ids_to_pending(&mut have_ids, &mut pending_have);
+                dispatch_need_ids_after_reconcile(
+                    &mut control,
+                    &wanted,
+                    &mut need_ids,
+                    coordination.is_some(),
+                    &mut coordinated_need_ids,
+                )
+                .await?;
             }
             Ok(Ok(Frame::DoneAck)) => {
                 info!("Received DoneAck from responder");
@@ -202,111 +178,47 @@ where
         }
 
         // Coordination: after reconciliation, send need_ids to coordinator
-        if let Some(coord) = coordination {
-            if reconciliation_done && !coordination_reported {
-                let report = std::mem::take(&mut coordinated_need_ids);
-                info!(
-                    "Reporting {} need_ids to coordinator (peer {})",
-                    report.len(),
-                    coord.peer_idx
-                );
-                let _ = coord.report_tx.send(report);
-                coordination_reported = true;
-            }
-
-            // Poll for assignment (non-blocking so push path continues)
-            if coordination_pending && coordination_reported {
-                let assign_result = match coord.assign_rx.lock() {
-                    Ok(rx) => rx.try_recv(),
-                    Err(_) => Err(std::sync::mpsc::TryRecvError::Disconnected),
-                };
-                match assign_result {
-                    Ok(assigned) => {
-                        info!(
-                            "Received {} assigned events from coordinator (peer {})",
-                            assigned.len(),
-                            coord.peer_idx
-                        );
-                        // Send HaveList for assigned events
-                        let mut batch: Vec<EventId> = Vec::with_capacity(NEED_CHUNK);
-                        for event_id in assigned {
-                            if wanted.insert(&event_id).unwrap_or(false) {
-                                batch.push(event_id);
-                            }
-                            if batch.len() >= NEED_CHUNK {
-                                let _ = control.send(&Frame::HaveList { ids: batch }).await;
-                                let _ = control.flush().await;
-                                batch = Vec::with_capacity(NEED_CHUNK);
-                            }
-                        }
-                        if !batch.is_empty() {
-                            let _ = control.send(&Frame::HaveList { ids: batch }).await;
-                            let _ = control.flush().await;
-                        }
-                        coordination_pending = false;
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        coordination_pending = false;
-                    }
+        maybe_report_coordination_need_ids(
+            coordination,
+            reconciliation_done,
+            &mut coordination_reported,
+            &mut coordinated_need_ids,
+        );
+        match maybe_take_coordination_assignment(
+            coordination,
+            coordination_pending,
+            coordination_reported,
+        ) {
+            CoordinationAssignment::Assigned(assigned) => {
+                if let Some(coord) = coordination {
+                    info!(
+                        "Received {} assigned events from coordinator (peer {})",
+                        assigned.len(),
+                        coord.peer_idx
+                    );
                 }
+                dispatch_assigned_need_ids(&mut control, &wanted, assigned).await;
+                coordination_pending = false;
             }
+            CoordinationAssignment::Disconnected => {
+                coordination_pending = false;
+            }
+            CoordinationAssignment::Pending | CoordinationAssignment::NotReady => {}
         }
 
-        // Incrementally enqueue pending have_ids to egress queue
-        if !pending_have.is_empty() {
-            let drain_count = pending_have.len().min(ENQUEUE_BATCH);
-            let to_enqueue: Vec<EventId> = pending_have.drain(..drain_count).collect();
-            for chunk in to_enqueue.chunks(HAVE_CHUNK) {
-                let _ = egress.enqueue_events(peer_id, chunk);
-            }
-        }
-
-        // Stream events from DB queue on data stream
-        let mut sent_this_round = 0;
-        let mut blocked = false;
-        while !blocked {
-            let batch = egress
-                .claim_batch(peer_id, EGRESS_CLAIM_COUNT)
-                .unwrap_or_default();
-            if batch.is_empty() {
-                break;
-            }
-
-            let mut sent_rowids: Vec<i64> = Vec::with_capacity(batch.len());
-            for (rowid, event_id) in batch {
-                if let Ok(Some(blob)) = store.get_shared(&event_id) {
-                    let blob_len = blob.len() as u64;
-                    if data_send.send(&Frame::Event { blob }).await.is_ok() {
-                        events_sent += 1;
-                        bytes_sent += blob_len;
-                        sent_this_round += 1;
-                        sent_rowids.push(rowid);
-                    } else {
-                        blocked = true;
-                        break;
-                    }
-                } else {
-                    sent_rowids.push(rowid);
-                }
-            }
-            let _ = egress.mark_sent(&sent_rowids);
-        }
-
-        if sent_this_round > 0 {
-            let _ = data_send.flush().await;
-        }
+        enqueue_pending_have_to_egress(&egress, peer_id, &mut pending_have);
+        let send_stats =
+            drain_egress_to_data_stream(&egress, &store, peer_id, &mut data_send).await;
+        events_sent += send_stats.events_sent_delta;
+        bytes_sent += send_stats.bytes_sent_delta;
 
         // Once reconciliation is done, coordination resolved, pending_have drained,
         // and egress queue empty, send DataDone on data stream then Done on control.
         if reconciliation_done && !coordination_pending && pending_have.is_empty() && !done_sent {
             let pending_out = egress.count_pending(peer_id).unwrap_or(0);
             if pending_out == 0 {
-                let _ = data_send.flush().await;
-                data_send.send(&Frame::DataDone).await?;
-                data_send.flush().await?;
-                control.send(&Frame::Done).await?;
-                control.flush().await?;
+                send_data_done(&mut data_send).await?;
+                send_done(&mut control).await?;
                 done_sent = true;
                 info!(
                     "Sent DataDone+Done, waiting for DoneAck (sent {}, received {})",

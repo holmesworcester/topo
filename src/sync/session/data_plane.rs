@@ -1,7 +1,9 @@
-//! Data-stream receiver task for sync sessions.
+//! Data-plane helpers for sync sessions.
 //!
-//! Spawns a background task that reads events from the peer's data stream,
-//! tags each with `recorded_by`, and forwards them to the ingest channel.
+//! Owns data-stream and blob-movement concerns:
+//! - inbound event receiver task (`Event` / `DataDone`)
+//! - egress queue draining to data stream (`Event`)
+//! - completion marker emission on data stream (`DataDone`)
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -10,10 +12,96 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
 use crate::contracts::event_pipeline_contract::IngestItem;
-use crate::crypto::hash_event;
+use crate::crypto::{hash_event, EventId};
+use crate::db::{egress_queue::EgressQueue, store::Store};
 use crate::protocol::Frame;
 use crate::transport::connection::ConnectionError;
-use crate::transport::StreamRecv;
+use crate::transport::{StreamRecv, StreamSend};
+
+use super::{EGRESS_CLAIM_COUNT, ENQUEUE_BATCH, HAVE_CHUNK};
+
+pub struct DataPlaneSendStats {
+    pub events_sent_delta: u64,
+    pub bytes_sent_delta: u64,
+}
+
+pub fn enqueue_pending_have_to_egress(
+    egress: &EgressQueue<'_>,
+    peer_id: &str,
+    pending_have: &mut Vec<EventId>,
+) {
+    if pending_have.is_empty() {
+        return;
+    }
+
+    let drain_count = pending_have.len().min(ENQUEUE_BATCH);
+    let to_enqueue: Vec<EventId> = pending_have.drain(..drain_count).collect();
+    for chunk in to_enqueue.chunks(HAVE_CHUNK) {
+        let _ = egress.enqueue_events(peer_id, chunk);
+    }
+}
+
+pub async fn drain_egress_to_data_stream<S>(
+    egress: &EgressQueue<'_>,
+    store: &Store<'_>,
+    peer_id: &str,
+    data_send: &mut S,
+) -> DataPlaneSendStats
+where
+    S: StreamSend,
+{
+    let mut events_sent_delta = 0u64;
+    let mut bytes_sent_delta = 0u64;
+    let mut sent_any = false;
+    let mut blocked = false;
+
+    while !blocked {
+        let batch = egress
+            .claim_batch(peer_id, EGRESS_CLAIM_COUNT)
+            .unwrap_or_default();
+        if batch.is_empty() {
+            break;
+        }
+
+        let mut sent_rowids: Vec<i64> = Vec::with_capacity(batch.len());
+        for (rowid, event_id) in batch {
+            if let Ok(Some(blob)) = store.get_shared(&event_id) {
+                let blob_len = blob.len() as u64;
+                if data_send.send(&Frame::Event { blob }).await.is_ok() {
+                    events_sent_delta += 1;
+                    bytes_sent_delta += blob_len;
+                    sent_any = true;
+                    sent_rowids.push(rowid);
+                } else {
+                    blocked = true;
+                    break;
+                }
+            } else {
+                sent_rowids.push(rowid);
+            }
+        }
+        let _ = egress.mark_sent(&sent_rowids);
+    }
+
+    if sent_any {
+        let _ = data_send.flush().await;
+    }
+
+    DataPlaneSendStats {
+        events_sent_delta,
+        bytes_sent_delta,
+    }
+}
+
+pub async fn send_data_done<S>(data_send: &mut S) -> Result<(), ConnectionError>
+where
+    S: StreamSend,
+{
+    let _ = data_send.flush().await;
+    data_send.send(&Frame::DataDone).await?;
+    data_send.flush().await?;
+    Ok(())
+}
 
 /// Spawn data receiver task. Returns:
 /// - `shutdown_tx`: forced shutdown (timeout fallback only)

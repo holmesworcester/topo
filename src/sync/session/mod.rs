@@ -10,9 +10,10 @@
 //!    waits for initiator's DataDone to be consumed, then sends DoneAck.
 //! 4. Initiator receives DoneAck, waits for responder's DataDone, exits.
 
+pub mod control_plane;
 pub mod coordinator;
+pub mod data_plane;
 pub mod initiator;
-pub mod receiver;
 pub mod responder;
 
 use std::time::Duration;
@@ -21,8 +22,8 @@ use std::time::Duration;
 // Re-exports — preserve the existing public API surface
 // ---------------------------------------------------------------------------
 pub use coordinator::{run_coordinator, PeerCoord};
+pub use data_plane::spawn_data_receiver;
 pub use initiator::run_sync_initiator;
-pub use receiver::spawn_data_receiver;
 pub use responder::run_sync_responder;
 
 // ---------------------------------------------------------------------------

@@ -17,17 +17,15 @@ use crate::db::{
     open_connection,
     store::{lookup_workspace_id, Store},
 };
-use crate::runtime::SyncStats;
 use crate::protocol::Frame;
+use crate::runtime::SyncStats;
 use crate::sync::negentropy_sqlite::NegentropyStorageSqlite;
 use crate::transport::connection::ConnectionError;
 use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
 
-use super::receiver::spawn_data_receiver;
-use super::{
-    CONTROL_POLL_TIMEOUT, DATA_DRAIN_TIMEOUT, EGRESS_CLAIM_COUNT,
-    EGRESS_SENT_TTL_MS, NEGENTROPY_FRAME_SIZE,
-};
+use super::control_plane::send_done_ack;
+use super::data_plane::{drain_egress_to_data_stream, send_data_done, spawn_data_receiver};
+use super::{CONTROL_POLL_TIMEOUT, DATA_DRAIN_TIMEOUT, EGRESS_SENT_TTL_MS, NEGENTROPY_FRAME_SIZE};
 
 /// Run sync as the responder (server role) with dual streams.
 ///
@@ -141,39 +139,10 @@ where
             Err(_) => {}
         }
 
-        let mut sent_this_round = 0;
-        let mut blocked = false;
-        while !blocked {
-            let batch = egress
-                .claim_batch(peer_id, EGRESS_CLAIM_COUNT)
-                .unwrap_or_default();
-            if batch.is_empty() {
-                break;
-            }
-
-            let mut sent_rowids: Vec<i64> = Vec::with_capacity(batch.len());
-            for (rowid, event_id) in batch {
-                if let Ok(Some(blob)) = store.get_shared(&event_id) {
-                    let blob_len = blob.len() as u64;
-                    if data_send.send(&Frame::Event { blob }).await.is_ok() {
-                        events_sent += 1;
-                        bytes_sent += blob_len;
-                        sent_this_round += 1;
-                        sent_rowids.push(rowid);
-                    } else {
-                        blocked = true;
-                        break;
-                    }
-                } else {
-                    sent_rowids.push(rowid);
-                }
-            }
-            let _ = egress.mark_sent(&sent_rowids);
-        }
-
-        if sent_this_round > 0 {
-            let _ = data_send.flush().await;
-        }
+        let send_stats =
+            drain_egress_to_data_stream(&egress, &store, peer_id, &mut data_send).await;
+        events_sent += send_stats.events_sent_delta;
+        bytes_sent += send_stats.bytes_sent_delta;
 
         // After peer signalled Done and our egress queue is drained:
         // 1. Send DataDone on data stream (signals peer's data receiver)
@@ -182,9 +151,7 @@ where
         if peer_done {
             let pending_out = egress.count_pending(peer_id).unwrap_or(0);
             if pending_out == 0 {
-                let _ = data_send.flush().await;
-                data_send.send(&Frame::DataDone).await?;
-                data_send.flush().await?;
+                send_data_done(&mut data_send).await?;
 
                 let drain_timeout = DATA_DRAIN_TIMEOUT;
                 match tokio::time::timeout(drain_timeout, data_drained_rx).await {
@@ -193,8 +160,7 @@ where
                     Err(_) => warn!("Timed out waiting for inbound data drain"),
                 }
 
-                control.send(&Frame::DoneAck).await?;
-                control.flush().await?;
+                send_done_ack(&mut control).await?;
                 info!(
                     "Sent DoneAck (sent {}, received {})",
                     events_sent,
