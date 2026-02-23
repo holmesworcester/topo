@@ -1,5 +1,6 @@
 pub mod cert;
 pub mod connection;
+pub mod connection_lifecycle;
 pub mod identity;
 pub mod identity_adapter;
 pub mod intro_io;
@@ -13,6 +14,7 @@ pub use cert::{
     generate_self_signed_cert_from_signing_key, validate_cert_key_match,
 };
 pub use connection::{DualConnection, StreamConn, StreamRecv, StreamSend};
+pub use connection_lifecycle::{accept_peer, dial_peer, ConnectedPeer, ConnectionLifecycleError};
 pub use transport_session_io::{QuicTransportSessionIo, DEFAULT_SYNC_FRAME_MAX_BYTES};
 pub use trust_oracle::SqliteTrustOracle;
 

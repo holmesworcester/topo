@@ -7,8 +7,9 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 use tracing::{info, warn};
 
-use crate::protocol::Frame;
 use crate::protocol::encode_frame;
+use crate::protocol::Frame;
+use crate::transport::dial_peer;
 
 /// Build an IntroOffer message for `recipient` about `other_peer`.
 pub fn build_intro_offer(
@@ -21,7 +22,11 @@ pub fn build_intro_offer(
 ) -> Result<Frame, Box<dyn std::error::Error + Send + Sync>> {
     let other_peer_bytes = hex::decode(other_peer_id_hex)?;
     if other_peer_bytes.len() != 32 {
-        return Err(format!("other_peer_id must be 32 bytes, got {}", other_peer_bytes.len()).into());
+        return Err(format!(
+            "other_peer_id must be 32 bytes, got {}",
+            other_peer_bytes.len()
+        )
+        .into());
     }
     let mut other_peer_id = [0u8; 32];
     other_peer_id.copy_from_slice(&other_peer_bytes);
@@ -75,7 +80,7 @@ pub async fn run_intro(
     ttl_ms: u64,
     attempt_window_ms: u32,
 ) -> Result<IntroResult, Box<dyn std::error::Error + Send + Sync>> {
-    use crate::db::{open_connection, intro::freshest_endpoint};
+    use crate::db::{intro::freshest_endpoint, open_connection};
 
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
@@ -84,26 +89,48 @@ pub async fn run_intro(
     let db = open_connection(db_path)?;
 
     // Look up freshest endpoint for each peer
-    let ep_a = freshest_endpoint(&db, recorded_by, peer_a_hex, now_ms)?
-        .ok_or_else(|| format!("no non-expired endpoint observation for peer A ({})", &peer_a_hex[..16]))?;
-    let ep_b = freshest_endpoint(&db, recorded_by, peer_b_hex, now_ms)?
-        .ok_or_else(|| format!("no non-expired endpoint observation for peer B ({})", &peer_b_hex[..16]))?;
+    let ep_a = freshest_endpoint(&db, recorded_by, peer_a_hex, now_ms)?.ok_or_else(|| {
+        format!(
+            "no non-expired endpoint observation for peer A ({})",
+            &peer_a_hex[..16]
+        )
+    })?;
+    let ep_b = freshest_endpoint(&db, recorded_by, peer_b_hex, now_ms)?.ok_or_else(|| {
+        format!(
+            "no non-expired endpoint observation for peer B ({})",
+            &peer_b_hex[..16]
+        )
+    })?;
 
     drop(db);
 
     // Build IntroOffer for A about B
     let offer_for_a = build_intro_offer(
-        peer_b_hex, &ep_b.0, ep_b.1, ep_b.2 as u64, ttl_ms, attempt_window_ms,
+        peer_b_hex,
+        &ep_b.0,
+        ep_b.1,
+        ep_b.2 as u64,
+        ttl_ms,
+        attempt_window_ms,
     )?;
     // Build IntroOffer for B about A
     let offer_for_b = build_intro_offer(
-        peer_a_hex, &ep_a.0, ep_a.1, ep_a.2 as u64, ttl_ms, attempt_window_ms,
+        peer_a_hex,
+        &ep_a.0,
+        ep_a.1,
+        ep_a.2 as u64,
+        ttl_ms,
+        attempt_window_ms,
     )?;
 
     let addr_a: SocketAddr = format!("{}:{}", ep_a.0, ep_a.1).parse()?;
     let addr_b: SocketAddr = format!("{}:{}", ep_b.0, ep_b.1).parse()?;
 
-    let mut result = IntroResult { sent_to_a: false, sent_to_b: false, errors: Vec::new() };
+    let mut result = IntroResult {
+        sent_to_a: false,
+        sent_to_b: false,
+        errors: Vec::new(),
+    };
 
     // Send to A
     match send_intro_to_peer(endpoint, addr_a, &offer_for_a).await {
@@ -137,15 +164,18 @@ async fn send_intro_to_peer(
     addr: SocketAddr,
     offer: &Frame,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let connecting = endpoint.connect(addr, "localhost")?;
-    let connection = tokio::time::timeout(Duration::from_secs(5), connecting).await
-        .map_err(|_| "connection timeout")??;
-    send_intro_offer(&connection, offer).await?;
+    let connected = tokio::time::timeout(
+        Duration::from_secs(5),
+        dial_peer(endpoint, addr, "localhost", None),
+    )
+    .await
+    .map_err(|_| "connection timeout")??;
+    send_intro_offer(&connected.connection, offer).await?;
     // Yield to let the QUIC stack flush the uni stream data before closing.
     // connection.close() is immediate and discards unsent data; 200ms gives
     // the reliable-delivery layer time to retransmit if needed.
     tokio::time::sleep(Duration::from_millis(200)).await;
-    connection.close(0u32.into(), b"intro-sent");
+    connected.connection.close(0u32.into(), b"intro-sent");
     Ok(())
 }
 

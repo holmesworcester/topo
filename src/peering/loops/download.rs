@@ -20,7 +20,7 @@ use crate::db::store::lookup_workspace_id;
 use crate::sync::session::run_coordinator;
 use crate::sync::PeerCoord;
 use crate::sync::SyncSessionHandler;
-use crate::transport::peer_identity_from_connection;
+use crate::transport::dial_peer;
 
 use super::{
     peer_fingerprint_from_hex, shared_ingest_cap, CONNECT_RETRY_DELAY, SESSION_GAP,
@@ -119,29 +119,16 @@ pub async fn download_from_sources(
                 .unwrap();
             rt.block_on(async move {
                 loop {
-                    let connection = match endpoint.connect(remote, &sni) {
-                        Ok(connecting) => match connecting.await {
-                            Ok(c) => c,
-                            Err(e) => {
-                                warn!("Failed to connect to {}: {}", remote, e);
-                                tokio::time::sleep(CONNECT_RETRY_DELAY).await;
-                                continue;
-                            }
-                        },
+                    let connected = match dial_peer(&endpoint, remote, &sni, None).await {
+                        Ok(c) => c,
                         Err(e) => {
-                            warn!("Failed to initiate connection to {}: {}", remote, e);
+                            warn!("Failed to connect to {}: {}", remote, e);
                             tokio::time::sleep(CONNECT_RETRY_DELAY).await;
                             continue;
                         }
                     };
-                    let peer_id = match peer_identity_from_connection(&connection) {
-                        Some(id) => id,
-                        None => {
-                            warn!("Could not extract peer identity, retrying...");
-                            tokio::time::sleep(CONNECT_RETRY_DELAY).await;
-                            continue;
-                        }
-                    };
+                    let connection = connected.connection;
+                    let peer_id = connected.peer_id;
                     let peer_fp = match peer_fingerprint_from_hex(&peer_id) {
                         Some(fp) => fp,
                         None => {
@@ -157,13 +144,16 @@ pub async fn download_from_sources(
 
                     // Inner loop: repeated sync sessions
                     loop {
-                        let (session_id, io) = match crate::transport::session_factory::open_session_io(&connection).await {
-                            Ok(r) => r,
-                            Err(e) => {
-                                info!("Connection dropped: {}", e);
-                                break;
-                            }
-                        };
+                        let (session_id, io) =
+                            match crate::transport::session_factory::open_session_io(&connection)
+                                .await
+                            {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    info!("Connection dropped: {}", e);
+                                    break;
+                                }
+                            };
 
                         let meta = SessionMeta {
                             session_id,
@@ -173,9 +163,7 @@ pub async fn download_from_sources(
                             direction: SessionDirection::Outbound,
                         };
 
-                        if let Err(e) = handler
-                            .on_session(meta, io, CancellationToken::new())
-                            .await
+                        if let Err(e) = handler.on_session(meta, io, CancellationToken::new()).await
                         {
                             warn!("Download session error: {}", e);
                         }

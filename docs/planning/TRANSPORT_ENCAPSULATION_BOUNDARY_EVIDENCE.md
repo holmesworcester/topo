@@ -1,7 +1,7 @@
 # Transport Encapsulation Boundary Evidence
 
 Date: 2026-02-23
-Branch: `exec/transport-encapsulation-boundary-plan`
+Branch: `exec/transport-capsule-step2`
 
 ## Success Criteria Evidence
 
@@ -27,16 +27,20 @@ src/transport/session_factory.rs:56:        .accept_bi()
 
 Verified: all `open_bi()` and `accept_bi()` calls are in `src/transport/session_factory.rs`.
 
-### SC3: Peering loop code reads as orchestration only
+### SC3: Peering loop/workflow code reads as orchestration only
 
 ```bash
 $ rg -n "quinn::SendStream|quinn::RecvStream" src/peering/
 # No matches
+
+$ rg -n "endpoint\.connect_with\(|endpoint\.connect\(|endpoint\.accept\(|peer_identity_from_connection" src/peering/loops src/peering/workflows
+# No matches
 ```
 
-Peering retains only `quinn::Connection` and `quinn::Endpoint` for orchestration-level use:
-- `IntroSpawnerFn` type signature (connection lifecycle callback)
-- `send_intro_offer`, `handle_intro_offer`, `spawn_intro_listener` (intro/punch orchestration)
+Peering retains `quinn::Connection`/`quinn::Endpoint` values for orchestration-level
+ownership only, but dial/accept and peer-id extraction are now transport-owned:
+- `transport::connection_lifecycle::dial_peer()`
+- `transport::connection_lifecycle::accept_peer()`
 
 No stream-level types leak into peering. Stream wiring flows:
 1. Peering calls `transport::session_factory::open_session_io(&connection)` or `accept_session_io(&connection)`
@@ -54,7 +58,7 @@ Current branch still preserves the code-side boundary required for diagram
 simplification:
 1. Stream wiring moved to `src/transport/session_factory.rs`.
 2. Intro uni-stream parsing moved to `src/transport/intro_io.rs`.
-3. Peering uses only contract-level IO acquisition calls.
+3. QUIC dial/accept + peer identity extraction moved to `src/transport/connection_lifecycle.rs`.
 
 ### SC5: Core tests and boundary script pass
 
@@ -62,8 +66,8 @@ simplification:
 $ cargo check
 # Finished dev profile
 
-$ cargo test --lib -q
-# 409 passed; 0 failed
+$ cargo test transport::connection_lifecycle::tests:: -- --nocapture
+# 2 passed; 0 failed
 
 $ cargo test --test holepunch_test -q
 # 4 passed; 0 failed
@@ -80,16 +84,18 @@ $ bash scripts/check_boundary_imports.sh
 ### New files
 - `src/transport/session_factory.rs` — sole owner of sync session stream wiring (`open_session_io`, `accept_session_io`)
 - `src/transport/intro_io.rs` — intro uni-stream receive/parse helpers (`accept_and_read_intro`)
+- `src/transport/connection_lifecycle.rs` — sole owner of QUIC dial/accept + peer identity extraction (`dial_peer`, `accept_peer`)
 
 ### Modified files
-- `src/transport/mod.rs` — registered `session_factory` and `intro_io` modules
+- `src/transport/mod.rs` — registered `connection_lifecycle`, `session_factory`, and `intro_io` modules
 - `src/peering/loops/mod.rs` — `run_session()` now takes `(session_id, Box<dyn TransportSessionIo>)` instead of raw `quinn::SendStream`/`RecvStream`; removed `DualConnection`/`QuicTransportSessionIo` imports
-- `src/peering/loops/accept.rs` — calls `accept_session_io()` instead of `connection.accept_bi()` + manual wiring
-- `src/peering/loops/connect.rs` — calls `open_session_io()` instead of `connection.open_bi()` + manual wiring
-- `src/peering/loops/download.rs` — calls `open_session_io()` instead of inline `DualConnection::new` + `QuicTransportSessionIo::new`
-- `src/peering/workflows/punch.rs` — `run_sync_on_punched_connection` calls `open_session_io()`; `spawn_intro_listener` calls `accept_and_read_intro()`; removed `DualConnection`/`QuicTransportSessionIo`/`quinn::RecvStream` imports
+- `src/peering/loops/accept.rs` — calls `accept_peer()` for endpoint accept + peer-id extraction, then `accept_session_io()`
+- `src/peering/loops/connect.rs` — calls `dial_peer()` for outbound dial + peer-id extraction, then `open_session_io()`
+- `src/peering/loops/download.rs` — calls `dial_peer()` for outbound dial + peer-id extraction, then `open_session_io()`
+- `src/peering/workflows/intro.rs` — uses `dial_peer()` when sending IntroOffers
+- `src/peering/workflows/punch.rs` — uses `dial_peer()` in paced punch attempts; `run_sync_on_punched_connection` calls `open_session_io()`; `spawn_intro_listener` calls `accept_and_read_intro()`
 - `scripts/check_boundary_imports.sh` — added transport encapsulation forbidden edges + positive checks
-- `docs/DESIGN.md` — updated module ownership section for transport session factory
+- `docs/DESIGN.md` — updated module ownership section for transport connection lifecycle + session factory
 
 ## Boundary Script Rules Added
 
@@ -100,8 +106,12 @@ Forbidden edges:
 - `accept_bi(` in `src/peering/`
 - `quinn::SendStream` in `src/peering/`
 - `quinn::RecvStream` in `src/peering/`
+- `peer_identity_from_connection` in `src/peering/`
+- `endpoint.connect*` / `endpoint.accept` in `src/peering/loops/` and `src/peering/workflows/`
 
 Positive checks:
 - `open_session_io` in `src/transport/session_factory.rs`
 - `accept_session_io` in `src/transport/session_factory.rs`
 - `DualConnection::new` in `src/transport/session_factory.rs`
+- `dial_peer` in `src/transport/connection_lifecycle.rs`
+- `accept_peer` in `src/transport/connection_lifecycle.rs`

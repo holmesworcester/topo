@@ -18,12 +18,11 @@ use crate::db::removal_watch::is_peer_removed;
 use crate::db::schema::create_tables;
 use crate::db::transport_trust::record_transport_binding;
 use crate::sync::SyncSessionHandler;
-use crate::transport::{peer_identity_from_connection, SqliteTrustOracle};
+use crate::transport::{accept_peer, SqliteTrustOracle};
 
 use super::{
     current_timestamp_ms, drain_batch_size, peer_fingerprint_from_hex, run_session,
-    shared_ingest_cap, IntroSpawnerFn, ENDPOINT_TTL_MS, SESSION_GAP,
-    SYNC_SESSION_TIMEOUT_SECS,
+    shared_ingest_cap, IntroSpawnerFn, ENDPOINT_TTL_MS, SESSION_GAP, SYNC_SESSION_TIMEOUT_SECS,
 };
 
 // ---------------------------------------------------------------------------
@@ -115,27 +114,19 @@ pub async fn accept_loop_with_ingest(
 
     loop {
         info!("Waiting for incoming connection...");
-        let incoming = match endpoint.accept().await {
-            Some(inc) => inc,
-            None => {
+        let connected = match accept_peer(&endpoint).await {
+            Ok(Some(c)) => c,
+            Ok(None) => {
                 info!("Endpoint closed, stopping accept_loop");
                 return Ok(());
             }
-        };
-        let connection = match incoming.await {
-            Ok(c) => c,
             Err(e) => {
                 warn!("Failed to accept connection: {}", e);
                 continue;
             }
         };
-        let peer_id = match peer_identity_from_connection(&connection) {
-            Some(id) => id,
-            None => {
-                warn!("Rejected connection: could not extract peer identity");
-                continue;
-            }
-        };
+        let connection = connected.connection;
+        let peer_id = connected.peer_id;
         info!("Accepted connection from {}", peer_id);
 
         // Resolve which local tenant owns this connection.
@@ -238,13 +229,16 @@ pub async fn accept_loop_with_ingest(
                         }
                     }
 
-                    let (session_id, io) = match crate::transport::session_factory::accept_session_io(&connection).await {
-                        Ok(r) => r,
-                        Err(e) => {
-                            info!("Connection dropped: {}", e);
-                            break;
-                        }
-                    };
+                    let (session_id, io) =
+                        match crate::transport::session_factory::accept_session_io(&connection)
+                            .await
+                        {
+                            Ok(r) => r,
+                            Err(e) => {
+                                info!("Connection dropped: {}", e);
+                                break;
+                            }
+                        };
 
                     run_session(
                         &responder_handler,

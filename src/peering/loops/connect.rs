@@ -17,12 +17,12 @@ use crate::db::schema::create_tables;
 use crate::db::store::lookup_workspace_id;
 use crate::db::transport_trust::record_transport_binding;
 use crate::sync::SyncSessionHandler;
-use crate::transport::peer_identity_from_connection;
+use crate::transport::dial_peer;
 
 use super::{
     current_timestamp_ms, drain_batch_size, peer_fingerprint_from_hex, run_session,
-    shared_ingest_cap, IntroSpawnerFn, CONNECT_RETRY_DELAY, ENDPOINT_TTL_MS,
-    SESSION_GAP, SYNC_SESSION_TIMEOUT_SECS,
+    shared_ingest_cap, IntroSpawnerFn, CONNECT_RETRY_DELAY, ENDPOINT_TTL_MS, SESSION_GAP,
+    SYNC_SESSION_TIMEOUT_SECS,
 };
 
 // ---------------------------------------------------------------------------
@@ -34,8 +34,8 @@ use super::{
 /// Outer loop reconnects on connection drop. Inner loop runs repeated
 /// sync sessions on the same connection.
 ///
-/// When `client_config` is `Some`, outbound dials use `endpoint.connect_with()`
-/// to present the correct per-tenant cert and tenant-scoped trust.
+/// When `client_config` is `Some`, outbound dials present the correct per-tenant
+/// cert and tenant-scoped trust.
 pub async fn connect_loop(
     db_path: &str,
     recorded_by: &str,
@@ -115,38 +115,24 @@ async fn connect_loop_inner(
             crate::transport::multi_workspace::workspace_sni(&ws_id)
         }
     };
-    let initiator_handler =
-        SyncSessionHandler::initiator(db_path.to_string(), SYNC_SESSION_TIMEOUT_SECS, shared_ingest.clone());
+    let initiator_handler = SyncSessionHandler::initiator(
+        db_path.to_string(),
+        SYNC_SESSION_TIMEOUT_SECS,
+        shared_ingest.clone(),
+    );
 
     loop {
         info!("Connecting to {}...", remote);
-        let connection = match if let Some(ref cfg) = client_config {
-            endpoint.connect_with(cfg.clone(), remote, &sni)
-        } else {
-            endpoint.connect(remote, &sni)
-        } {
-            Ok(connecting) => match connecting.await {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!("Failed to connect to {}: {}", remote, e);
-                    tokio::time::sleep(CONNECT_RETRY_DELAY).await;
-                    continue;
-                }
-            },
+        let connected = match dial_peer(&endpoint, remote, &sni, client_config.as_ref()).await {
+            Ok(c) => c,
             Err(e) => {
-                warn!("Failed to initiate connection to {}: {}", remote, e);
+                warn!("Failed to connect to {}: {}", remote, e);
                 tokio::time::sleep(CONNECT_RETRY_DELAY).await;
                 continue;
             }
         };
-        let peer_id = match peer_identity_from_connection(&connection) {
-            Some(id) => id,
-            None => {
-                warn!("Could not extract peer identity, retrying...");
-                tokio::time::sleep(CONNECT_RETRY_DELAY).await;
-                continue;
-            }
-        };
+        let connection = connected.connection;
+        let peer_id = connected.peer_id;
         let peer_fp = match peer_fingerprint_from_hex(&peer_id) {
             Some(fp) => fp,
             None => {
@@ -219,13 +205,14 @@ async fn connect_loop_inner(
                 }
             }
 
-            let (session_id, io) = match crate::transport::session_factory::open_session_io(&connection).await {
-                Ok(r) => r,
-                Err(e) => {
-                    info!("Connection dropped: {}", e);
-                    break;
-                }
-            };
+            let (session_id, io) =
+                match crate::transport::session_factory::open_session_io(&connection).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        info!("Connection dropped: {}", e);
+                        break;
+                    }
+                };
 
             run_session(
                 &initiator_handler,

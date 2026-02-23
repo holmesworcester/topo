@@ -17,11 +17,9 @@ use crate::db::{
     intro::{insert_intro_attempt, intro_already_seen, update_intro_status},
     open_connection,
 };
-use crate::sync::SyncSessionHandler;
 use crate::protocol::Frame;
-use crate::transport::{
-    peer_identity_from_connection, SqliteTrustOracle,
-};
+use crate::sync::SyncSessionHandler;
+use crate::transport::{dial_peer, SqliteTrustOracle};
 
 const ENDPOINT_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 
@@ -195,82 +193,74 @@ pub async fn handle_intro_offer(
 
         // Use per-tenant config when available (node multi-tenant path).
         // Fallback to endpoint default for single-tenant test endpoints.
-        match if let Some(ref cfg) = client_config {
-            endpoint.connect_with(cfg.clone(), addr, "localhost")
-        } else {
-            endpoint.connect(addr, "localhost")
-        } {
-            Ok(connecting) => {
-                match tokio::time::timeout(pace, connecting).await {
-                    Ok(Ok(connection)) => {
-                        // Verify peer identity matches expected
-                        let actual_peer = peer_identity_from_connection(&connection);
-                        if actual_peer.as_deref() != Some(&other_peer_hex) {
-                            warn!(
-                                "Punch connected but wrong peer: expected {}, got {:?}",
-                                &other_peer_hex[..16],
-                                actual_peer.as_ref().map(|s| &s[..16])
-                            );
-                            update_status(
-                                db_path,
-                                recorded_by,
-                                &intro_id,
-                                "failed",
-                                Some("wrong peer identity"),
-                            );
-                            return;
-                        }
-
-                        info!(
-                            "Hole punch succeeded! Direct connection to {}",
-                            &other_peer_hex[..16]
-                        );
-                        update_status(db_path, recorded_by, &intro_id, "connected", None);
-
-                        // Preserve endpoint observations for peers reached via punched links.
-                        // This enables future explicit intro calls between peers that were
-                        // discovered through successful hole-punched connectivity.
-                        let remote = connection.remote_address();
-                        if let Ok(db) = open_connection(db_path) {
-                            let now_ms = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_millis() as i64;
-                            let _ = record_endpoint_observation(
-                                &db,
-                                recorded_by,
-                                &other_peer_hex,
-                                &remote.ip().to_string(),
-                                remote.port(),
-                                now_ms,
-                                ENDPOINT_TTL_MS,
-                            );
-                        }
-
-                        // Run normal sync on the direct connection
-                        run_sync_on_punched_connection(
-                            connection,
-                            db_path,
-                            recorded_by,
-                            &other_peer_hex,
-                            shared_ingest,
-                        )
-                        .await;
-                        return;
-                    }
-                    Ok(Err(e)) => {
-                        info!("Punch attempt #{} connect error: {}", attempt, e);
-                    }
-                    Err(_) => {
-                        if attempt <= 3 {
-                            info!("Punch attempt #{} timed out (200ms)", attempt);
-                        }
-                    }
+        match tokio::time::timeout(
+            pace,
+            dial_peer(&endpoint, addr, "localhost", client_config.as_ref()),
+        )
+        .await
+        {
+            Ok(Ok(connected)) => {
+                // Verify peer identity matches expected
+                if connected.peer_id != other_peer_hex {
+                    warn!(
+                        "Punch connected but wrong peer: expected {}, got {}",
+                        &other_peer_hex[..16],
+                        &connected.peer_id[..16.min(connected.peer_id.len())]
+                    );
+                    update_status(
+                        db_path,
+                        recorded_by,
+                        &intro_id,
+                        "failed",
+                        Some("wrong peer identity"),
+                    );
+                    return;
                 }
+
+                info!(
+                    "Hole punch succeeded! Direct connection to {}",
+                    &other_peer_hex[..16]
+                );
+                update_status(db_path, recorded_by, &intro_id, "connected", None);
+
+                // Preserve endpoint observations for peers reached via punched links.
+                // This enables future explicit intro calls between peers that were
+                // discovered through successful hole-punched connectivity.
+                let remote = connected.connection.remote_address();
+                if let Ok(db) = open_connection(db_path) {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as i64;
+                    let _ = record_endpoint_observation(
+                        &db,
+                        recorded_by,
+                        &other_peer_hex,
+                        &remote.ip().to_string(),
+                        remote.port(),
+                        now_ms,
+                        ENDPOINT_TTL_MS,
+                    );
+                }
+
+                // Run normal sync on the direct connection
+                run_sync_on_punched_connection(
+                    connected.connection,
+                    db_path,
+                    recorded_by,
+                    &other_peer_hex,
+                    shared_ingest,
+                )
+                .await;
+                return;
             }
-            Err(e) => {
-                warn!("Punch connect error: {}", e);
-                break;
+            Ok(Err(e)) => {
+                info!("Punch attempt #{} connect error: {}", attempt, e);
+            }
+            Err(_) => {
+                if attempt <= 3 {
+                    info!("Punch attempt #{} timed out (200ms)", attempt);
+                }
             }
         }
     }
@@ -287,13 +277,14 @@ async fn run_sync_on_punched_connection(
     peer_id: &str,
     shared_ingest: tokio::sync::mpsc::Sender<IngestItem>,
 ) {
-    let (session_id, io) = match crate::transport::session_factory::open_session_io(&connection).await {
-        Ok(r) => r,
-        Err(e) => {
-            warn!("Failed to open streams on punched connection: {}", e);
-            return;
-        }
-    };
+    let (session_id, io) =
+        match crate::transport::session_factory::open_session_io(&connection).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("Failed to open streams on punched connection: {}", e);
+                return;
+            }
+        };
 
     let peer_fp = match hex::decode(peer_id) {
         Ok(bytes) if bytes.len() == 32 => {
@@ -316,10 +307,7 @@ async fn run_sync_on_punched_connection(
     };
     let handler = SyncSessionHandler::initiator(db_path.to_string(), 60, shared_ingest);
 
-    if let Err(e) = handler
-        .on_session(meta, io, CancellationToken::new())
-        .await
-    {
+    if let Err(e) = handler.on_session(meta, io, CancellationToken::new()).await {
         warn!("Punched sync error: {}", e);
     } else {
         info!("Punched sync complete");
@@ -381,8 +369,7 @@ pub fn spawn_intro_listener(
                     let ingest = shared_ingest.clone();
 
                     // Spawn punch attempt as a local task — runs on the same
-                    // LocalSet / runtime that owns the endpoint I/O driver,
-                    // so endpoint.connect_with() can properly send/receive UDP.
+                    // LocalSet / runtime that owns the endpoint I/O driver.
                     tokio::task::spawn_local(async move {
                         handle_intro_offer(
                             &db_path,

@@ -109,6 +109,13 @@ check_no_match 'accept_bi(' src/peering/
 # peering must not use quinn stream types (SendStream/RecvStream)
 check_no_match 'quinn::SendStream' src/peering/
 check_no_match 'quinn::RecvStream' src/peering/
+# peering connection lifecycle must route through transport helpers
+check_no_match 'peer_identity_from_connection' src/peering/
+check_no_match 'endpoint\.connect_with\(' src/peering/loops/
+check_no_match 'endpoint\.connect\(' src/peering/loops/
+check_no_match 'endpoint\.accept\(' src/peering/loops/
+check_no_match 'endpoint\.connect_with\(' src/peering/workflows/
+check_no_match 'endpoint\.connect\(' src/peering/workflows/
 
 echo "=== Positive contract checks ==="
 
@@ -126,6 +133,9 @@ check_required 'TransportIdentityIntent' src/transport/identity_adapter.rs
 check_required 'open_session_io' src/transport/session_factory.rs
 check_required 'accept_session_io' src/transport/session_factory.rs
 check_required 'DualConnection::new' src/transport/session_factory.rs
+# transport connection lifecycle helpers must own dial/accept + peer identity
+check_required 'pub async fn dial_peer' src/transport/connection_lifecycle.rs
+check_required 'pub async fn accept_peer' src/transport/connection_lifecycle.rs
 
 # projection must route through adapter contract, not raw install fns
 check_required 'ApplyTransportIdentityIntent' src/projection/
