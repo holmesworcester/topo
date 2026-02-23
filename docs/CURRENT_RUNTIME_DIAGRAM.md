@@ -135,9 +135,12 @@ flowchart TD
     QDB --> APPLY["project_one + cascade"]
     APPLY --> PDB[("SQLite Projections")]
 
-    CTRL["Sync control stream\n(HaveList / need_ids)"] --> QDB
+    NEG["negentropy reconcile\n(need_ids)"] --> CTRL["Sync control stream\n(HaveList / need_ids)"]
+    COORD["optional coordinator assignment\n(download mode)"] --> CTRL
+    CTRL --> QDB
     PDB --> TRUST["transport trust decisions"]
     TRUST --> NET["QUIC allow/deny + bootstrap autodial"]
+    NET --> QUIC
 ```
 
 ## Current Data-Flow Facts
@@ -146,3 +149,4 @@ flowchart TD
 2. `batch_writer` is the shared ingest sink for wire-received events; it persists event blobs and drains `project_queue`.
 3. Local creates (`create_*_event_sync`) and wire receives both converge on `project_one` projection semantics.
 4. Projection outputs both user-facing read tables and transport trust tables; trust rows feed both handshake allow/deny and bootstrap autodial.
+5. `HaveList` IDs originate from negentropy `need_ids` (and optionally coordinator-assigned subsets in download mode), then land in `egress_queue`.
