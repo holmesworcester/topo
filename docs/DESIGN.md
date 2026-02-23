@@ -390,7 +390,7 @@ The production peering runtime follows a single conceptual loop:
 
 1. **Projected SQLite state**: invite_bootstrap_trust rows, PeerShared-derived trust, endpoint observations.
 2. **Target planner** (`peering::runtime::target_planner`): single-owner module for all dial target planning. Collects bootstrap trust targets from SQL and mDNS discovery candidates. Routes both through `PeerDispatcher` for deduplication and reconnect management.
-3. **Dial/accept supervisors**: `connect_loop` (outbound) and `accept_loop` (inbound) manage QUIC connection lifecycle. Both use the centralized `run_session` transport seam (`peering::loops::run_session`) for session wiring.
+3. **Dial/accept supervisors**: `connect_loop` (outbound) and `accept_loop` (inbound) manage QUIC connection lifecycle. Both call transport session factory methods to acquire ready-to-use `TransportSessionIo`, then delegate to `run_session` for orchestration.
 4. **Sync session runner** (`SyncSessionHandler`): protocol-agnostic session handler invoked via the `SessionHandler` contract.
 5. **Ingest writer** (`batch_writer`): single shared thread consuming `IngestItem` tuples from all concurrent sessions.
 6. **Projected SQLite state**: projection cascade updates trust rows, completing the loop.
@@ -398,7 +398,8 @@ The production peering runtime follows a single conceptual loop:
 ### Module ownership
 
 - **Target planning**: `src/peering/runtime/target_planner.rs` — the single source of truth for dial target decisions. Bootstrap autodial and mDNS discovery both route through this module.
-- **Transport seam**: `src/peering/loops/mod.rs::run_session` — centralized QUIC-to-session wiring. Accept and connect loops call this instead of duplicating DualConnection / SessionMeta / QuicTransportSessionIo construction.
+- **Transport session factory**: `src/transport/session_factory.rs` — sole owner of QUIC stream opening and `DualConnection` / `QuicTransportSessionIo` construction. Provides `open_session_io()` and `accept_session_io()` that return `(session_id, Box<dyn TransportSessionIo>)`.
+- **Peering orchestration seam**: `src/peering/loops/mod.rs::run_session` — wires session metadata, peer-removal cancellation, and the session handler together. Receives pre-built `TransportSessionIo` from the transport session factory.
 - **Bootstrap test helpers**: `src/testutil/bootstrap.rs` — test-only. Production runtime never depends on these; bootstrap progression is driven by the autodial loop polling projected SQL state.
 
 ### Eventization boundary (peering)

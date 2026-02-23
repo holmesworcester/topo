@@ -17,25 +17,13 @@ use crate::db::{
     intro::{insert_intro_attempt, intro_already_seen, update_intro_status},
     open_connection,
 };
-use crate::contracts::peering_contract::next_session_id;
 use crate::sync::SyncSessionHandler;
-use crate::protocol::{parse_frame, Frame};
+use crate::protocol::Frame;
 use crate::transport::{
-    peer_identity_from_connection, DualConnection, SqliteTrustOracle, QuicTransportSessionIo,
+    peer_identity_from_connection, SqliteTrustOracle,
 };
 
 const ENDPOINT_TTL_MS: i64 = 24 * 60 * 60 * 1000;
-
-/// Read an IntroOffer from a uni-directional recv stream.
-pub async fn read_intro_from_uni(
-    recv: &mut quinn::RecvStream,
-) -> Result<Frame, Box<dyn std::error::Error + Send + Sync>> {
-    // IntroOffer is 88 bytes fixed
-    let mut buf = vec![0u8; 88];
-    recv.read_exact(&mut buf).await?;
-    let (msg, _) = parse_frame(&buf)?;
-    Ok(msg)
-}
 
 /// Extract SocketAddr from IntroOffer fields.
 fn intro_offer_addr(
@@ -299,34 +287,13 @@ async fn run_sync_on_punched_connection(
     peer_id: &str,
     shared_ingest: tokio::sync::mpsc::Sender<IngestItem>,
 ) {
-    // Open streams and run initiator sync
-    let (ctrl_send, ctrl_recv) = match connection.open_bi().await {
-        Ok(s) => s,
+    let (session_id, io) = match crate::transport::session_factory::open_session_io(&connection).await {
+        Ok(r) => r,
         Err(e) => {
-            warn!("Failed to open control stream on punched connection: {}", e);
+            warn!("Failed to open streams on punched connection: {}", e);
             return;
         }
     };
-    let (data_send, data_recv) = match connection.open_bi().await {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("Failed to open data stream on punched connection: {}", e);
-            return;
-        }
-    };
-    let mut conn = DualConnection::new(ctrl_send, ctrl_recv, data_send, data_recv);
-
-    // Send markers (same as connect_loop)
-    let _ = conn
-        .control
-        .send(&Frame::HaveList { ids: vec![] })
-        .await;
-    let _ = conn
-        .data_send
-        .send(&Frame::HaveList { ids: vec![] })
-        .await;
-    let _ = conn.flush_control().await;
-    let _ = conn.flush_data().await;
 
     let peer_fp = match hex::decode(peer_id) {
         Ok(bytes) if bytes.len() == 32 => {
@@ -340,7 +307,6 @@ async fn run_sync_on_punched_connection(
         }
     };
 
-    let session_id = next_session_id();
     let meta = SessionMeta {
         session_id,
         tenant: TenantId(recorded_by.to_string()),
@@ -349,10 +315,9 @@ async fn run_sync_on_punched_connection(
         direction: SessionDirection::Outbound,
     };
     let handler = SyncSessionHandler::initiator(db_path.to_string(), 60, shared_ingest);
-    let io = QuicTransportSessionIo::new(session_id, conn);
 
     if let Err(e) = handler
-        .on_session(meta, Box::new(io), CancellationToken::new())
+        .on_session(meta, io, CancellationToken::new())
         .await
     {
         warn!("Punched sync error: {}", e);
@@ -379,16 +344,20 @@ pub fn spawn_intro_listener(
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_local(async move {
         loop {
-            let mut recv = match connection.accept_uni().await {
-                Ok(r) => r,
-                Err(_) => {
+            let frame = match crate::transport::session_factory::accept_and_read_intro(&connection).await {
+                Ok(None) => {
                     // Connection closed
                     break;
                 }
+                Ok(Some(f)) => f,
+                Err(e) => {
+                    warn!("Failed to read from uni stream: {}", e);
+                    continue;
+                }
             };
 
-            match read_intro_from_uni(&mut recv).await {
-                Ok(Frame::IntroOffer {
+            match frame {
+                Frame::IntroOffer {
                     intro_id,
                     other_peer_id,
                     origin_family,
@@ -397,7 +366,7 @@ pub fn spawn_intro_listener(
                     observed_at_ms,
                     expires_at_ms,
                     attempt_window_ms,
-                }) => {
+                } => {
                     info!(
                         "Received IntroOffer from {} for peer {}",
                         &introduced_by[..16],
@@ -434,11 +403,8 @@ pub fn spawn_intro_listener(
                         .await;
                     });
                 }
-                Ok(_) => {
+                _ => {
                     // Not an IntroOffer, ignore
-                }
-                Err(e) => {
-                    warn!("Failed to read from uni stream: {}", e);
                 }
             }
         }

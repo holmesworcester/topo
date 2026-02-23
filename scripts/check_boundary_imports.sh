@@ -99,6 +99,17 @@ check_no_match 'mod bootstrap' src/peering/workflows/
 # Target planning must live in target_planner, not scattered across runtime
 check_required 'mod target_planner' src/peering/runtime/mod.rs
 
+# -- transport encapsulation boundary --
+# peering must not directly construct DualConnection or QuicTransportSessionIo
+check_no_match 'DualConnection::new' src/peering/
+check_no_match 'QuicTransportSessionIo::new' src/peering/
+# peering must not call open_bi/accept_bi (stream wiring belongs to transport)
+check_no_match 'open_bi(' src/peering/
+check_no_match 'accept_bi(' src/peering/
+# peering must not use quinn stream types (SendStream/RecvStream)
+check_no_match 'quinn::SendStream' src/peering/
+check_no_match 'quinn::RecvStream' src/peering/
+
 echo "=== Positive contract checks ==="
 
 # peering and sync must import from contracts, not event_pipeline
@@ -110,6 +121,11 @@ check_required 'contracts::peering_contract' src/sync/
 # transport identity adapter must use contract types
 check_required 'TransportIdentityAdapter' src/transport/identity_adapter.rs
 check_required 'TransportIdentityIntent' src/transport/identity_adapter.rs
+
+# transport session factory must own stream wiring
+check_required 'open_session_io' src/transport/session_factory.rs
+check_required 'accept_session_io' src/transport/session_factory.rs
+check_required 'DualConnection::new' src/transport/session_factory.rs
 
 # projection must route through adapter contract, not raw install fns
 check_required 'ApplyTransportIdentityIntent' src/projection/

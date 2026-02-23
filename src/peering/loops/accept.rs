@@ -238,25 +238,18 @@ pub async fn accept_loop_with_ingest(
                         }
                     }
 
-                    let ctrl = match connection.accept_bi().await {
-                        Ok(streams) => streams,
+                    let (session_id, io) = match crate::transport::session_factory::accept_session_io(&connection).await {
+                        Ok(r) => r,
                         Err(e) => {
-                            info!("Connection dropped (control accept): {}", e);
-                            break;
-                        }
-                    };
-                    let data = match connection.accept_bi().await {
-                        Ok(streams) => streams,
-                        Err(e) => {
-                            info!("Connection dropped (data accept): {}", e);
+                            info!("Connection dropped: {}", e);
                             break;
                         }
                     };
 
                     run_session(
                         &responder_handler,
-                        ctrl,
-                        data,
+                        session_id,
+                        io,
                         &recorded_by_owned,
                         peer_fp,
                         connection.remote_address(),

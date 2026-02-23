@@ -30,12 +30,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use crate::contracts::peering_contract::{
-    next_session_id, PeerFingerprint, SessionDirection, SessionHandler, SessionMeta, TenantId,
+    PeerFingerprint, SessionDirection, SessionHandler, SessionMeta, TenantId, TransportSessionIo,
 };
 use crate::db::open_connection;
 use crate::db::removal_watch::is_peer_removed;
 use crate::sync::SyncSessionHandler;
-use crate::transport::{DualConnection, QuicTransportSessionIo};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -121,27 +120,22 @@ pub(super) fn spawn_peer_removal_cancellation_watch(
 // Transport↔peering session seam
 // ---------------------------------------------------------------------------
 
-/// Wire up and run a single sync session on pre-opened bi-directional streams.
+/// Run a single sync session using a pre-built `TransportSessionIo`.
 ///
-/// This is the centralized transport↔peering seam (R4/SC4): it converts raw
-/// QUIC streams into the session handler contract. Both accept and connect
-/// loops call this instead of duplicating DualConnection / SessionMeta /
-/// QuicTransportSessionIo construction.
+/// This is the peering orchestration seam: it wires session metadata,
+/// peer-removal cancellation, and the session handler together. Transport
+/// details (stream opening, `DualConnection`, `QuicTransportSessionIo`)
+/// are handled by `transport::session_factory` before this is called.
 pub(super) async fn run_session(
     handler: &SyncSessionHandler,
-    ctrl_streams: (quinn::SendStream, quinn::RecvStream),
-    data_streams: (quinn::SendStream, quinn::RecvStream),
+    session_id: u64,
+    io: Box<dyn TransportSessionIo>,
     tenant_id: &str,
     peer_fp: [u8; 32],
     remote_addr: SocketAddr,
     direction: SessionDirection,
     db_path: &str,
 ) {
-    let conn = DualConnection::new(
-        ctrl_streams.0, ctrl_streams.1,
-        data_streams.0, data_streams.1,
-    );
-    let session_id = next_session_id();
     let meta = SessionMeta {
         session_id,
         tenant: TenantId(tenant_id.to_string()),
@@ -149,7 +143,6 @@ pub(super) async fn run_session(
         remote_addr,
         direction,
     };
-    let io = QuicTransportSessionIo::new(session_id, conn);
     let cancel = CancellationToken::new();
     let watch = spawn_peer_removal_cancellation_watch(
         db_path.to_string(),
@@ -159,7 +152,7 @@ pub(super) async fn run_session(
     );
 
     if let Err(e) = handler
-        .on_session(meta, Box::new(io), cancel.clone())
+        .on_session(meta, io, cancel.clone())
         .await
     {
         let label = match direction {

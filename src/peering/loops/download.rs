@@ -11,7 +11,7 @@ use tracing::{info, warn};
 
 use crate::contracts::event_pipeline_contract::{BatchWriterFn, IngestItem};
 use crate::contracts::peering_contract::{
-    next_session_id, PeerFingerprint, SessionDirection, SessionHandler, SessionMeta, TenantId,
+    PeerFingerprint, SessionDirection, SessionHandler, SessionMeta, TenantId,
 };
 use crate::crypto::EventId;
 use crate::db::open_connection;
@@ -20,7 +20,7 @@ use crate::db::store::lookup_workspace_id;
 use crate::sync::session::run_coordinator;
 use crate::sync::PeerCoord;
 use crate::sync::SyncSessionHandler;
-use crate::transport::{peer_identity_from_connection, DualConnection, QuicTransportSessionIo};
+use crate::transport::peer_identity_from_connection;
 
 use super::{
     peer_fingerprint_from_hex, shared_ingest_cap, CONNECT_RETRY_DELAY, SESSION_GAP,
@@ -157,24 +157,14 @@ pub async fn download_from_sources(
 
                     // Inner loop: repeated sync sessions
                     loop {
-                        let (ctrl_send, ctrl_recv) = match connection.open_bi().await {
-                            Ok(s) => s,
+                        let (session_id, io) = match crate::transport::session_factory::open_session_io(&connection).await {
+                            Ok(r) => r,
                             Err(e) => {
-                                info!("Connection dropped (control): {}", e);
+                                info!("Connection dropped: {}", e);
                                 break;
                             }
                         };
-                        let (data_send, data_recv) = match connection.open_bi().await {
-                            Ok(s) => s,
-                            Err(e) => {
-                                info!("Connection dropped (data): {}", e);
-                                break;
-                            }
-                        };
-                        let conn =
-                            DualConnection::new(ctrl_send, ctrl_recv, data_send, data_recv);
 
-                        let session_id = next_session_id();
                         let meta = SessionMeta {
                             session_id,
                             tenant: TenantId(recorded_by.clone()),
@@ -182,10 +172,9 @@ pub async fn download_from_sources(
                             remote_addr: connection.remote_address(),
                             direction: SessionDirection::Outbound,
                         };
-                        let io = QuicTransportSessionIo::new(session_id, conn);
 
                         if let Err(e) = handler
-                            .on_session(meta, Box::new(io), CancellationToken::new())
+                            .on_session(meta, io, CancellationToken::new())
                             .await
                         {
                             warn!("Download session error: {}", e);

@@ -219,25 +219,18 @@ async fn connect_loop_inner(
                 }
             }
 
-            let ctrl = match connection.open_bi().await {
-                Ok(streams) => streams,
+            let (session_id, io) = match crate::transport::session_factory::open_session_io(&connection).await {
+                Ok(r) => r,
                 Err(e) => {
-                    info!("Connection dropped (control open): {}", e);
-                    break;
-                }
-            };
-            let data = match connection.open_bi().await {
-                Ok(streams) => streams,
-                Err(e) => {
-                    info!("Connection dropped (data open): {}", e);
+                    info!("Connection dropped: {}", e);
                     break;
                 }
             };
 
             run_session(
                 &initiator_handler,
-                ctrl,
-                data,
+                session_id,
+                io,
                 &current_rb,
                 peer_fp,
                 connection.remote_address(),
