@@ -55,13 +55,6 @@ enum Commands {
         device_name: String,
     },
 
-    /// Run continuous sync (Ctrl-C to stop) — legacy foreground mode
-    Sync {
-        /// Listen address
-        #[arg(short, long, default_value = "127.0.0.1:4433")]
-        bind: SocketAddr,
-    },
-
     /// Accept a user invite link (bootstrap sync + identity chain creation)
     #[command(name = "accept-invite")]
     AcceptInvite {
@@ -362,8 +355,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Init tracing for commands that need it
     match &cli.command {
-        Commands::Sync { .. }
-        | Commands::Start { .. }
+        Commands::Start { .. }
         | Commands::Intro { .. }
         | Commands::AcceptInvite { .. } => {
             let subscriber = FmtSubscriber::builder()
@@ -438,22 +430,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
             });
 
-            tokio::select! {
-                result = topo::node::run_node(db, bind, Some(net_tx)) => {
-                    result?;
+            // Foreground Ctrl-C uses the same daemon shutdown path as RPC Shutdown.
+            let ctrlc_notify = shutdown_notify.clone();
+            tokio::spawn(async move {
+                if tokio::signal::ctrl_c().await.is_ok() {
+                    info!("Shutdown requested via Ctrl-C");
+                    ctrlc_notify.notify_waiters();
                 }
-                _ = shutdown_notify.notified() => {
-                    info!("Shutdown requested via RPC");
-                }
-            }
+            });
+
+            let node_result = topo::node::run_node(db, bind, net_tx, shutdown_notify.clone()).await;
 
             // Signal RPC server to stop
             shutdown.store(true, Ordering::Relaxed);
+            shutdown_notify.notify_waiters();
             let _ = rpc_handle.join();
 
             // Clean up socket file
             let _ = std::fs::remove_file(&socket_path);
 
+            node_result?;
             info!("🐭 Topo daemon shut down cleanly");
         }
 
@@ -484,10 +480,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let result = topo::event_modules::workspace::commands::create_workspace_for_db(db, &workspace_name, &username, &device_name)?;
             println!("peer_id:      {}", result.peer_id);
             println!("workspace_id: {}", result.workspace_id);
-        }
-
-        Commands::Sync { bind } => {
-            topo::node::run_node(db, bind, None).await?;
         }
 
         Commands::AcceptInvite {

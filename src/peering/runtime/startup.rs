@@ -37,7 +37,7 @@ pub(crate) struct StartupResult {
 pub(crate) fn setup_endpoint_and_tenants(
     db_path: &str,
     bind: SocketAddr,
-    net_info_tx: Option<tokio::sync::oneshot::Sender<NodeRuntimeNetInfo>>,
+    net_info_tx: tokio::sync::oneshot::Sender<NodeRuntimeNetInfo>,
 ) -> Result<StartupResult, Box<dyn std::error::Error + Send + Sync>> {
     let db = open_connection(db_path)?;
     create_tables(&db)?;
@@ -141,13 +141,11 @@ pub(crate) fn setup_endpoint_and_tenants(
     );
 
     // Send runtime networking info back to caller (e.g. DaemonState in main.rs).
-    if let Some(tx) = net_info_tx {
-        let info = NodeRuntimeNetInfo {
-            listen_addr: local_addr.to_string(),
-            upnp: None,
-        };
-        let _ = tx.send(info);
-    }
+    let info = NodeRuntimeNetInfo {
+        listen_addr: local_addr.to_string(),
+        upnp: None,
+    };
+    let _ = net_info_tx.send(info);
 
     // Per-tenant outbound client configs
     let mut tenant_client_configs: TenantClientConfigs = HashMap::new();

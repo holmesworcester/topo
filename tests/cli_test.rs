@@ -496,9 +496,9 @@ fn test_cli_unpinned_peer_rejected() {
     let _ = bob.wait();
 }
 
-/// TRUST POLICY TEST: sync with no trusted peers is rejected at startup.
+/// TRUST POLICY TEST: daemon start with no trusted peers is rejected at startup.
 #[test]
-fn test_cli_sync_without_trust_fails() {
+fn test_cli_start_without_trust_fails() {
     let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let db = tmpdir
@@ -509,19 +509,19 @@ fn test_cli_sync_without_trust_fails() {
         .to_string();
     let port = random_port();
 
-    // Start sync with no identity chain (no trusted peers) — should fail immediately
+    // Start daemon with no identity chain (no trusted peers) — should fail immediately
     let output = Command::new(bin())
-        .arg("sync")
+        .arg("start")
         .arg("--bind")
         .arg(format!("127.0.0.1:{}", port))
         .arg("--db")
         .arg(&db)
         .output()
-        .expect("failed to run sync");
+        .expect("failed to run start");
 
     assert!(
         !output.status.success(),
-        "sync with no trusted peers should fail, but exited with {:?}",
+        "start with no trusted peers should fail, but exited with {:?}",
         output.status.code()
     );
 

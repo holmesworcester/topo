@@ -22,12 +22,11 @@ use crate::peering::nat::upnp::UpnpMappingReport;
 use crate::contracts::event_pipeline_contract::{IngestFns, IngestItem};
 use crate::peering::loops::{accept_loop_with_ingest, IntroSpawnerFn};
 
-use target_planner::{
-    build_tenant_client_config, collect_all_bootstrap_targets,
-    dispatch_bootstrap_target, spawn_bootstrap_refresher, spawn_connect_loop_thread,
-    PeerDispatcher,
-};
 use startup::setup_endpoint_and_tenants;
+use target_planner::{
+    build_tenant_client_config, collect_all_bootstrap_targets, dispatch_bootstrap_target,
+    spawn_bootstrap_refresher, spawn_connect_loop_thread, PeerDispatcher,
+};
 
 /// Runtime networking information collected during node startup.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,12 +45,13 @@ pub struct NodeRuntimeNetInfo {
 /// a single accept loop sharing a batch_writer thread. With `discovery` feature,
 /// also advertises via mDNS and auto-connects to discovered peers.
 ///
-/// If `net_info_tx` is provided, runtime networking info (listen addr + UPnP
-/// result) is sent as soon as the endpoint is bound and UPnP is attempted.
+/// Runtime networking info (listen addr + UPnP result) is sent as soon as the
+/// endpoint is bound and UPnP is attempted.
 pub async fn run_node(
     db_path: &str,
     bind: SocketAddr,
-    net_info_tx: Option<tokio::sync::oneshot::Sender<NodeRuntimeNetInfo>>,
+    net_info_tx: tokio::sync::oneshot::Sender<NodeRuntimeNetInfo>,
+    shutdown_notify: Arc<tokio::sync::Notify>,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -196,8 +196,8 @@ pub async fn run_node(
     // Drop our copy so writer exits when all accept loops drop theirs
     drop(shared_tx);
 
-    // Wait for Ctrl-C
-    tokio::signal::ctrl_c().await?;
+    // Wait for daemon shutdown signal (RPC Shutdown or foreground Ctrl-C).
+    shutdown_notify.notified().await;
     info!(
         "Shutting down ({} events received)",
         events_received.load(Ordering::Relaxed)
