@@ -20,7 +20,7 @@ use crate::db::store::lookup_workspace_id;
 use crate::sync::session::run_coordinator;
 use crate::sync::PeerCoord;
 use crate::sync::SyncSessionHandler;
-use crate::transport::dial_peer;
+use crate::transport::{dial_session_peer, open_outbound_session, TransportEndpoint};
 
 use super::{
     peer_fingerprint_from_hex, shared_ingest_cap, CONNECT_RETRY_DELAY, SESSION_GAP,
@@ -43,7 +43,7 @@ use super::{
 pub async fn download_from_sources(
     db_path: &str,
     recorded_by: &str,
-    endpoints: Vec<(quinn::Endpoint, SocketAddr)>,
+    endpoints: Vec<(TransportEndpoint, SocketAddr)>,
     batch_writer_fn: BatchWriterFn,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     {
@@ -119,7 +119,7 @@ pub async fn download_from_sources(
                 .unwrap();
             rt.block_on(async move {
                 loop {
-                    let connected = match dial_peer(&endpoint, remote, &sni, None).await {
+                    let connected = match dial_session_peer(&endpoint, remote, &sni, None).await {
                         Ok(c) => c,
                         Err(e) => {
                             warn!("Failed to connect to {}: {}", remote, e);
@@ -144,16 +144,13 @@ pub async fn download_from_sources(
 
                     // Inner loop: repeated sync sessions
                     loop {
-                        let (session_id, io) =
-                            match crate::transport::session_factory::open_session_io(&connection)
-                                .await
-                            {
-                                Ok(r) => r,
-                                Err(e) => {
-                                    info!("Connection dropped: {}", e);
-                                    break;
-                                }
-                            };
+                        let (session_id, io) = match open_outbound_session(&connection).await {
+                            Ok(r) => r,
+                            Err(e) => {
+                                info!("Connection dropped: {}", e);
+                                break;
+                            }
+                        };
 
                         let meta = SessionMeta {
                             session_id,

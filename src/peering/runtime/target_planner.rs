@@ -16,18 +16,18 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::Arc;
 
 use tracing::{info, warn};
 
 use crate::contracts::event_pipeline_contract::IngestFns;
-use crate::contracts::peering_contract::{PeerFingerprint, TenantId, TrustDecision};
 use crate::db::open_connection;
-use crate::db::transport_creds::{list_local_peers, load_local_creds};
+use crate::db::transport_creds::list_local_peers;
 use crate::db::transport_trust::list_active_invite_bootstrap_addrs;
 use crate::event_modules::workspace::invite_link::parse_bootstrap_address;
 use crate::peering::loops::{connect_loop, IntroSpawnerFn};
-use crate::transport::{workspace_client_config, DynamicAllowFn, SqliteTrustOracle};
+use crate::transport::{
+    build_tenant_client_config_from_db, TransportClientConfig, TransportEndpoint,
+};
 
 // ---------------------------------------------------------------------------
 // Discovery dispatch (PeerDispatcher)
@@ -98,9 +98,9 @@ pub(crate) fn normalize_discovered_addr_for_local_bind(
 pub(crate) fn spawn_connect_loop_thread(
     db_path: String,
     tenant_id: String,
-    endpoint: quinn::Endpoint,
+    endpoint: TransportEndpoint,
     remote: SocketAddr,
-    cfg: quinn::ClientConfig,
+    cfg: TransportClientConfig,
     source: &'static str,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
@@ -148,9 +148,7 @@ pub(crate) fn load_bootstrap_targets(
     let mut out = Vec::new();
     for tenant_id in tenant_ids {
         for addr_text in list_active_invite_bootstrap_addrs(&db, tenant_id)? {
-            match parse_bootstrap_address(&addr_text)
-                .and_then(|addr| addr.to_socket_addr())
-            {
+            match parse_bootstrap_address(&addr_text).and_then(|addr| addr.to_socket_addr()) {
                 Ok(addr) => {
                     let key = (tenant_id.clone(), addr);
                     if seen.insert(key.clone()) {
@@ -190,24 +188,8 @@ pub(crate) fn collect_all_bootstrap_targets(
 pub(crate) fn build_tenant_client_config(
     db_path: &str,
     tenant_id: &str,
-) -> Result<quinn::ClientConfig, Box<dyn std::error::Error + Send + Sync>> {
-    let db = open_connection(db_path)?;
-    let (cert_der, key_der) = load_local_creds(&db, tenant_id)?
-        .ok_or_else(|| format!("local creds missing for tenant {}", tenant_id))?;
-    drop(db);
-
-    let cert_der = rustls::pki_types::CertificateDer::from(cert_der);
-    let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(key_der);
-    let oracle = SqliteTrustOracle::new(db_path);
-    let tid = TenantId(tenant_id.to_string());
-    let tenant_allow: Arc<DynamicAllowFn> = Arc::new(move |peer_fp: &[u8; 32]| {
-        match oracle.check_sync(&tid, &PeerFingerprint(*peer_fp)) {
-            Ok(TrustDecision::Allow) => Ok(true),
-            Ok(TrustDecision::Deny) => Ok(false),
-            Err(e) => Err(e.to_string().into()),
-        }
-    });
-    workspace_client_config(cert_der, key_der, tenant_allow)
+) -> Result<TransportClientConfig, Box<dyn std::error::Error + Send + Sync>> {
+    build_tenant_client_config_from_db(db_path, tenant_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -226,7 +208,10 @@ pub(crate) fn dispatch_bootstrap_target(
 ) -> bool {
     let key = format!("{}@bootstrap", tenant_id);
     let (action, _cancel_rx) = dispatcher.dispatch(&key, remote);
-    matches!(action, DiscoveryAction::Connect | DiscoveryAction::Reconnect)
+    matches!(
+        action,
+        DiscoveryAction::Connect | DiscoveryAction::Reconnect
+    )
 }
 
 /// Spawns a background thread that polls for new bootstrap autodial targets
@@ -239,7 +224,7 @@ pub(crate) fn dispatch_bootstrap_target(
 /// used by mDNS discovery (R3/SC3 single-owner dispatch).
 pub(crate) fn spawn_bootstrap_refresher(
     db_path: String,
-    endpoint: quinn::Endpoint,
+    endpoint: TransportEndpoint,
     mut dispatcher: PeerDispatcher,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
@@ -446,10 +431,11 @@ mod tests {
             "ws-1",
             bootstrap_addr,
             &bootstrap_spki,
-        ).unwrap();
+        )
+        .unwrap();
 
-        let addrs = transport_trust::list_active_invite_bootstrap_addrs(&conn, recorded_by)
-            .unwrap();
+        let addrs =
+            transport_trust::list_active_invite_bootstrap_addrs(&conn, recorded_by).unwrap();
         assert_eq!(addrs.len(), 1, "must find one bootstrap addr");
         assert_eq!(addrs[0], bootstrap_addr);
 
@@ -466,15 +452,25 @@ mod tests {
         let recorded_by = "test-peer-2";
 
         let peer_pub: [u8; 32] = [0xDD; 32];
-        let bootstrap_spki = crate::transport::cert::spki_fingerprint_from_ed25519_pubkey(&peer_pub);
+        let bootstrap_spki =
+            crate::transport::cert::spki_fingerprint_from_ed25519_pubkey(&peer_pub);
         let bootstrap_addr = "10.0.0.1:5555";
 
         transport_trust::record_invite_bootstrap_trust(
-            &conn, recorded_by, "ia-2", "inv-2", "ws-2", bootstrap_addr, &bootstrap_spki,
-        ).unwrap();
+            &conn,
+            recorded_by,
+            "ia-2",
+            "inv-2",
+            "ws-2",
+            bootstrap_addr,
+            &bootstrap_spki,
+        )
+        .unwrap();
 
         assert_eq!(
-            transport_trust::list_active_invite_bootstrap_addrs(&conn, recorded_by).unwrap().len(),
+            transport_trust::list_active_invite_bootstrap_addrs(&conn, recorded_by)
+                .unwrap()
+                .len(),
             1
         );
 
@@ -482,7 +478,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            transport_trust::list_active_invite_bootstrap_addrs(&conn, recorded_by).unwrap().len(),
+            transport_trust::list_active_invite_bootstrap_addrs(&conn, recorded_by)
+                .unwrap()
+                .len(),
             0,
             "superseded bootstrap trust must not appear in autodial"
         );
@@ -509,11 +507,8 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let targets = load_bootstrap_targets(
-            db_path.to_str().unwrap(),
-            &[recorded_by.to_string()],
-        )
-        .unwrap();
+        let targets =
+            load_bootstrap_targets(db_path.to_str().unwrap(), &[recorded_by.to_string()]).unwrap();
 
         assert_eq!(targets.len(), 1, "hostname bootstrap should resolve");
         assert_eq!(targets[0].0, recorded_by);
@@ -535,20 +530,42 @@ mod tests {
         // Same bootstrap addr for two different tenants → should yield 2 targets
         // (dedup is per (tenant, addr), not per addr alone)
         transport_trust::record_invite_bootstrap_trust(
-            &conn, "tenant-a", "ia-a", "inv-a", "ws-a", bootstrap_addr, &bootstrap_spki,
-        ).unwrap();
+            &conn,
+            "tenant-a",
+            "ia-a",
+            "inv-a",
+            "ws-a",
+            bootstrap_addr,
+            &bootstrap_spki,
+        )
+        .unwrap();
         transport_trust::record_invite_bootstrap_trust(
-            &conn, "tenant-b", "ia-b", "inv-b", "ws-b", bootstrap_addr, &bootstrap_spki,
-        ).unwrap();
+            &conn,
+            "tenant-b",
+            "ia-b",
+            "inv-b",
+            "ws-b",
+            bootstrap_addr,
+            &bootstrap_spki,
+        )
+        .unwrap();
         drop(conn);
 
         let targets = load_bootstrap_targets(
             db_path.to_str().unwrap(),
             &["tenant-a".to_string(), "tenant-b".to_string()],
-        ).unwrap();
+        )
+        .unwrap();
 
-        assert_eq!(targets.len(), 2, "same addr for different tenants = 2 targets");
-        assert_ne!(targets[0].0, targets[1].0, "each target has different tenant");
+        assert_eq!(
+            targets.len(),
+            2,
+            "same addr for different tenants = 2 targets"
+        );
+        assert_ne!(
+            targets[0].0, targets[1].0,
+            "each target has different tenant"
+        );
     }
 
     #[test]
@@ -562,17 +579,29 @@ mod tests {
 
         // Two bootstrap trust rows for same tenant + same addr → only 1 target
         transport_trust::record_invite_bootstrap_trust(
-            &conn, "tenant-a", "ia-1", "inv-1", "ws-1", bootstrap_addr, &[0xAA; 32],
-        ).unwrap();
+            &conn,
+            "tenant-a",
+            "ia-1",
+            "inv-1",
+            "ws-1",
+            bootstrap_addr,
+            &[0xAA; 32],
+        )
+        .unwrap();
         transport_trust::record_invite_bootstrap_trust(
-            &conn, "tenant-a", "ia-2", "inv-2", "ws-2", bootstrap_addr, &[0xBB; 32],
-        ).unwrap();
+            &conn,
+            "tenant-a",
+            "ia-2",
+            "inv-2",
+            "ws-2",
+            bootstrap_addr,
+            &[0xBB; 32],
+        )
+        .unwrap();
         drop(conn);
 
-        let targets = load_bootstrap_targets(
-            db_path.to_str().unwrap(),
-            &["tenant-a".to_string()],
-        ).unwrap();
+        let targets =
+            load_bootstrap_targets(db_path.to_str().unwrap(), &["tenant-a".to_string()]).unwrap();
 
         assert_eq!(targets.len(), 1, "same tenant + same addr = 1 target");
     }
@@ -588,37 +617,49 @@ mod tests {
         let tenant = "tenant-progression";
 
         // Initially no targets
-        let targets = load_bootstrap_targets(
-            db_path.to_str().unwrap(),
-            &[tenant.to_string()],
-        ).unwrap();
+        let targets =
+            load_bootstrap_targets(db_path.to_str().unwrap(), &[tenant.to_string()]).unwrap();
         assert!(targets.is_empty(), "no targets before any trust rows");
 
         // Simulate InviteAccepted projection writing bootstrap trust
         transport_trust::record_invite_bootstrap_trust(
-            &conn, tenant, "ia-1", "inv-1", "ws-1", "10.0.0.1:4433", &[0xCC; 32],
-        ).unwrap();
+            &conn,
+            tenant,
+            "ia-1",
+            "inv-1",
+            "ws-1",
+            "10.0.0.1:4433",
+            &[0xCC; 32],
+        )
+        .unwrap();
 
         // Target appears
         drop(conn);
-        let targets = load_bootstrap_targets(
-            db_path.to_str().unwrap(),
-            &[tenant.to_string()],
-        ).unwrap();
+        let targets =
+            load_bootstrap_targets(db_path.to_str().unwrap(), &[tenant.to_string()]).unwrap();
         assert_eq!(targets.len(), 1, "target appears after trust row");
 
         // Simulate second invite acceptance → new bootstrap addr
         let conn = open_connection(&db_path).unwrap();
         transport_trust::record_invite_bootstrap_trust(
-            &conn, tenant, "ia-2", "inv-2", "ws-2", "10.0.0.2:4433", &[0xDD; 32],
-        ).unwrap();
+            &conn,
+            tenant,
+            "ia-2",
+            "inv-2",
+            "ws-2",
+            "10.0.0.2:4433",
+            &[0xDD; 32],
+        )
+        .unwrap();
         drop(conn);
 
-        let targets = load_bootstrap_targets(
-            db_path.to_str().unwrap(),
-            &[tenant.to_string()],
-        ).unwrap();
-        assert_eq!(targets.len(), 2, "second target appears after second trust row");
+        let targets =
+            load_bootstrap_targets(db_path.to_str().unwrap(), &[tenant.to_string()]).unwrap();
+        assert_eq!(
+            targets.len(),
+            2,
+            "second target appears after second trust row"
+        );
     }
 
     // -- Combined dispatch: bootstrap + discovery through same planner --
@@ -629,18 +670,34 @@ mod tests {
 
         // Bootstrap target (remote peer_id not known yet, use bootstrap addr as key)
         let (action, _) = d.dispatch("bootstrap-peer-1", addr(4433));
-        assert_eq!(action, DiscoveryAction::Connect, "bootstrap target dispatches as Connect");
+        assert_eq!(
+            action,
+            DiscoveryAction::Connect,
+            "bootstrap target dispatches as Connect"
+        );
 
         // mDNS discovery target for a different peer
         let (action, _) = d.dispatch("mdns-peer-2", addr(5000));
-        assert_eq!(action, DiscoveryAction::Connect, "discovery target dispatches as Connect");
+        assert_eq!(
+            action,
+            DiscoveryAction::Connect,
+            "discovery target dispatches as Connect"
+        );
 
         // Same bootstrap target again → skip
         let (action, _) = d.dispatch("bootstrap-peer-1", addr(4433));
-        assert_eq!(action, DiscoveryAction::Skip, "duplicate bootstrap target skipped");
+        assert_eq!(
+            action,
+            DiscoveryAction::Skip,
+            "duplicate bootstrap target skipped"
+        );
 
         // mDNS peer moves address → reconnect
         let (action, _) = d.dispatch("mdns-peer-2", addr(5001));
-        assert_eq!(action, DiscoveryAction::Reconnect, "discovery peer addr change reconnects");
+        assert_eq!(
+            action,
+            DiscoveryAction::Reconnect,
+            "discovery peer addr change reconnects"
+        );
     }
 }

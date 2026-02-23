@@ -4,8 +4,6 @@
 //! that auto-connect to discovered remote peers using `PeerDispatcher`.
 
 #[cfg(feature = "discovery")]
-use std::collections::HashMap;
-#[cfg(feature = "discovery")]
 use std::net::SocketAddr;
 
 #[cfg(feature = "discovery")]
@@ -15,6 +13,8 @@ use tracing::{info, warn};
 use crate::contracts::event_pipeline_contract::IngestFns;
 #[cfg(feature = "discovery")]
 use crate::peering::loops::{connect_loop, IntroSpawnerFn};
+#[cfg(feature = "discovery")]
+use crate::transport::{TenantClientConfigs, TransportEndpoint};
 
 #[cfg(feature = "discovery")]
 use super::target_planner::{
@@ -30,8 +30,8 @@ pub(crate) fn launch_mdns_discovery(
     tenants: &[crate::db::transport_creds::TenantInfo],
     local_addr: SocketAddr,
     local_peer_ids: &std::collections::HashSet<String>,
-    endpoint: &quinn::Endpoint,
-    tenant_client_configs: &HashMap<String, quinn::ClientConfig>,
+    endpoint: &TransportEndpoint,
+    tenant_client_configs: &TenantClientConfigs,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
     db_path: &str,

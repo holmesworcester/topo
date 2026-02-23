@@ -9,8 +9,7 @@ use tracing::{info, warn};
 
 use crate::contracts::event_pipeline_contract::IngestItem;
 use crate::contracts::peering_contract::{
-    PeerFingerprint, SessionDirection, SessionHandler, SessionMeta, TenantId, TrustDecision,
-    TrustOracle,
+    PeerFingerprint, SessionDirection, SessionHandler, SessionMeta, TenantId,
 };
 use crate::db::{
     health::record_endpoint_observation,
@@ -19,7 +18,10 @@ use crate::db::{
 };
 use crate::protocol::Frame;
 use crate::sync::SyncSessionHandler;
-use crate::transport::{dial_peer, SqliteTrustOracle};
+use crate::transport::{
+    dial_session_peer, open_outbound_session, read_intro_offer_frame, tenant_trusts_peer,
+    TransportClientConfig, TransportConnection, TransportEndpoint,
+};
 
 const ENDPOINT_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 
@@ -51,7 +53,7 @@ pub async fn handle_intro_offer(
     db_path: &str,
     recorded_by: &str,
     introduced_by: &str,
-    endpoint: quinn::Endpoint,
+    endpoint: TransportEndpoint,
     intro_id: [u8; 16],
     other_peer_id: [u8; 32],
     origin_family: u8,
@@ -60,7 +62,7 @@ pub async fn handle_intro_offer(
     observed_at_ms: u64,
     expires_at_ms: u64,
     attempt_window_ms: u32,
-    client_config: Option<quinn::ClientConfig>,
+    client_config: Option<TransportClientConfig>,
     shared_ingest: tokio::sync::mpsc::Sender<IngestItem>,
 ) {
     let now_ms = std::time::SystemTime::now()
@@ -95,15 +97,8 @@ pub async fn handle_intro_offer(
     }
 
     // Validate trust from SQL only. No DB = no trust authority.
-    let trusted = match SqliteTrustOracle::new(db_path)
-        .check(
-            &TenantId(recorded_by.to_string()),
-            &PeerFingerprint(other_peer_id),
-        )
-        .await
-    {
-        Ok(TrustDecision::Allow) => true,
-        Ok(TrustDecision::Deny) => false,
+    let trusted = match tenant_trusts_peer(db_path, recorded_by, other_peer_id) {
+        Ok(trusted) => trusted,
         Err(e) => {
             warn!("IntroOffer trust check failed: {}", e);
             false
@@ -195,7 +190,7 @@ pub async fn handle_intro_offer(
         // Fallback to endpoint default for single-tenant test endpoints.
         match tokio::time::timeout(
             pace,
-            dial_peer(&endpoint, addr, "localhost", client_config.as_ref()),
+            dial_session_peer(&endpoint, addr, "localhost", client_config.as_ref()),
         )
         .await
         {
@@ -271,20 +266,19 @@ pub async fn handle_intro_offer(
 
 /// After a successful hole punch, run a sync initiator session.
 async fn run_sync_on_punched_connection(
-    connection: quinn::Connection,
+    connection: TransportConnection,
     db_path: &str,
     recorded_by: &str,
     peer_id: &str,
     shared_ingest: tokio::sync::mpsc::Sender<IngestItem>,
 ) {
-    let (session_id, io) =
-        match crate::transport::session_factory::open_session_io(&connection).await {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("Failed to open streams on punched connection: {}", e);
-                return;
-            }
-        };
+    let (session_id, io) = match open_outbound_session(&connection).await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("Failed to open streams on punched connection: {}", e);
+            return;
+        }
+    };
 
     let peer_fp = match hex::decode(peer_id) {
         Ok(bytes) if bytes.len() == 32 => {
@@ -322,17 +316,17 @@ async fn run_sync_on_punched_connection(
 /// so the punch handler can hold `!Send` types (rusqlite) across awaits
 /// while sharing the same endpoint I/O driver as the parent runtime.
 pub fn spawn_intro_listener(
-    connection: quinn::Connection,
+    connection: TransportConnection,
     db_path: String,
     recorded_by: String,
     introduced_by: String,
-    endpoint: quinn::Endpoint,
-    client_config: Option<quinn::ClientConfig>,
+    endpoint: TransportEndpoint,
+    client_config: Option<TransportClientConfig>,
     shared_ingest: tokio::sync::mpsc::Sender<IngestItem>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_local(async move {
         loop {
-            let frame = match crate::transport::intro_io::accept_and_read_intro(&connection).await {
+            let frame = match read_intro_offer_frame(&connection).await {
                 Ok(None) => {
                     // Connection closed
                     break;

@@ -7,9 +7,10 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 use tracing::{info, warn};
 
-use crate::protocol::encode_frame;
 use crate::protocol::Frame;
-use crate::transport::dial_peer;
+use crate::transport::{
+    dial_session_peer, send_intro_offer_frame, TransportConnection, TransportEndpoint,
+};
 
 /// Build an IntroOffer message for `recipient` about `other_peer`.
 pub fn build_intro_offer(
@@ -59,20 +60,16 @@ pub fn build_intro_offer(
 /// Send an IntroOffer to a peer over an existing QUIC connection.
 /// Opens a new uni-directional stream, writes the encoded message, and finishes.
 pub async fn send_intro_offer(
-    connection: &quinn::Connection,
+    connection: &TransportConnection,
     msg: &Frame,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let encoded = encode_frame(msg);
-    let mut send_stream = connection.open_uni().await?;
-    send_stream.write_all(&encoded).await?;
-    send_stream.finish()?;
-    Ok(())
+    send_intro_offer_frame(connection, msg).await
 }
 
 /// Run a one-shot intro: look up freshest endpoints for peer_a and peer_b,
 /// connect to each, and send IntroOffer about the other.
 pub async fn run_intro(
-    endpoint: &quinn::Endpoint,
+    endpoint: &TransportEndpoint,
     db_path: &str,
     recorded_by: &str,
     peer_a_hex: &str,
@@ -160,13 +157,13 @@ pub async fn run_intro(
 }
 
 async fn send_intro_to_peer(
-    endpoint: &quinn::Endpoint,
+    endpoint: &TransportEndpoint,
     addr: SocketAddr,
     offer: &Frame,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let connected = tokio::time::timeout(
         Duration::from_secs(5),
-        dial_peer(endpoint, addr, "localhost", None),
+        dial_session_peer(endpoint, addr, "localhost", None),
     )
     .await
     .map_err(|_| "connection timeout")??;

@@ -100,15 +100,27 @@ check_no_match 'mod bootstrap' src/peering/workflows/
 check_required 'mod target_planner' src/peering/runtime/mod.rs
 
 # -- transport encapsulation boundary --
+# peering must not name QUIC concrete types directly
+check_no_match 'quinn::' src/peering/
 # peering must not directly construct DualConnection or QuicTransportSessionIo
 check_no_match 'DualConnection::new' src/peering/
 check_no_match 'QuicTransportSessionIo::new' src/peering/
 # peering must not call open_bi/accept_bi (stream wiring belongs to transport)
 check_no_match 'open_bi(' src/peering/
 check_no_match 'accept_bi(' src/peering/
+# peering must not call low-level dial/accept lifecycle helpers directly
+check_no_match 'dial_peer\(' src/peering/
+check_no_match 'accept_peer\(' src/peering/
+# peering must not open session streams directly via session_factory
+check_no_match 'session_factory::open_session_io' src/peering/
+check_no_match 'session_factory::accept_session_io' src/peering/
 # peering must not use quinn stream types (SendStream/RecvStream)
 check_no_match 'quinn::SendStream' src/peering/
 check_no_match 'quinn::RecvStream' src/peering/
+# peering runtime must not construct trust/config internals directly
+check_no_match 'SqliteTrustOracle' src/peering/
+check_no_match 'workspace_client_config' src/peering/
+check_no_match 'DynamicAllowFn' src/peering/
 # peering connection lifecycle must route through transport helpers
 check_no_match 'peer_identity_from_connection' src/peering/
 check_no_match 'endpoint\.connect_with\(' src/peering/loops/
@@ -136,6 +148,13 @@ check_required 'DualConnection::new' src/transport/session_factory.rs
 # transport connection lifecycle helpers must own dial/accept + peer identity
 check_required 'pub async fn dial_peer' src/transport/connection_lifecycle.rs
 check_required 'pub async fn accept_peer' src/transport/connection_lifecycle.rs
+# transport peering boundary must provide orchestration-facing helpers
+check_required 'pub async fn dial_session_peer' src/transport/peering_boundary.rs
+check_required 'pub async fn accept_session_peer' src/transport/peering_boundary.rs
+check_required 'pub async fn open_outbound_session' src/transport/peering_boundary.rs
+check_required 'pub async fn open_inbound_session' src/transport/peering_boundary.rs
+check_required 'pub fn create_runtime_endpoint_for_tenants' src/transport/peering_boundary.rs
+check_required 'pub fn build_tenant_client_config_from_db' src/transport/peering_boundary.rs
 
 # projection must route through adapter contract, not raw install fns
 check_required 'ApplyTransportIdentityIntent' src/projection/

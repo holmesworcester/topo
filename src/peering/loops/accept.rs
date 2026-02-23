@@ -8,9 +8,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::contracts::event_pipeline_contract::{IngestFns, IngestItem};
-use crate::contracts::peering_contract::{
-    PeerFingerprint, SessionDirection, TenantId, TrustDecision,
-};
+use crate::contracts::peering_contract::SessionDirection;
 use crate::db::health::{purge_expired_endpoints, record_endpoint_observation};
 use crate::db::open_connection;
 use crate::db::project_queue::ProjectQueue;
@@ -18,7 +16,10 @@ use crate::db::removal_watch::is_peer_removed;
 use crate::db::schema::create_tables;
 use crate::db::transport_trust::record_transport_binding;
 use crate::sync::SyncSessionHandler;
-use crate::transport::{accept_peer, SqliteTrustOracle};
+use crate::transport::{
+    accept_session_peer, open_inbound_session, resolve_trusting_tenant, TransportClientConfig,
+    TransportEndpoint,
+};
 
 use super::{
     current_timestamp_ms, drain_batch_size, peer_fingerprint_from_hex, run_session,
@@ -37,7 +38,7 @@ use super::{
 pub async fn accept_loop(
     db_path: &str,
     recorded_by: &str,
-    endpoint: quinn::Endpoint,
+    endpoint: TransportEndpoint,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -79,10 +80,10 @@ pub async fn accept_loop(
 pub async fn accept_loop_with_ingest(
     db_path: &str,
     tenant_peer_ids: &[String],
-    endpoint: quinn::Endpoint,
+    endpoint: TransportEndpoint,
     _allowed_peers: Option<crate::transport::AllowedPeers>,
     shared_ingest_tx: mpsc::Sender<IngestItem>,
-    tenant_client_configs: std::collections::HashMap<String, quinn::ClientConfig>,
+    tenant_client_configs: std::collections::HashMap<String, TransportClientConfig>,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -114,7 +115,7 @@ pub async fn accept_loop_with_ingest(
 
     loop {
         info!("Waiting for incoming connection...");
-        let connected = match accept_peer(&endpoint).await {
+        let connected = match accept_session_peer(&endpoint).await {
             Ok(Some(c)) => c,
             Ok(None) => {
                 info!("Endpoint closed, stopping accept_loop");
@@ -229,16 +230,13 @@ pub async fn accept_loop_with_ingest(
                         }
                     }
 
-                    let (session_id, io) =
-                        match crate::transport::session_factory::accept_session_io(&connection)
-                            .await
-                        {
-                            Ok(r) => r,
-                            Err(e) => {
-                                info!("Connection dropped: {}", e);
-                                break;
-                            }
-                        };
+                    let (session_id, io) = match open_inbound_session(&connection).await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            info!("Connection dropped: {}", e);
+                            break;
+                        }
+                    };
 
                     run_session(
                         &responder_handler,
@@ -269,14 +267,7 @@ fn resolve_tenant_for_peer(
     remote_peer_id: &str,
 ) -> Option<String> {
     let fp = peer_fingerprint_from_hex(remote_peer_id)?;
-    let oracle = SqliteTrustOracle::new(db_path);
-    for tenant_id in tenant_peer_ids {
-        if matches!(
-            oracle.check_sync(&TenantId(tenant_id.clone()), &PeerFingerprint(fp)),
-            Ok(TrustDecision::Allow)
-        ) {
-            return Some(tenant_id.clone());
-        }
-    }
-    None
+    resolve_trusting_tenant(db_path, tenant_peer_ids, fp)
+        .ok()
+        .flatten()
 }

@@ -10,13 +10,13 @@ use std::sync::Arc;
 
 use tracing::{error, info, warn};
 
-use crate::contracts::peering_contract::{PeerFingerprint, TenantId, TrustDecision};
 use crate::db::transport_creds::discover_local_tenants;
 use crate::db::{open_connection, schema::create_tables};
 use crate::transport::{
-    create_single_port_endpoint, extract_spki_fingerprint,
+    build_tenant_client_config_from_creds, create_runtime_endpoint_for_tenants,
+    extract_spki_fingerprint,
     multi_workspace::{workspace_sni, WorkspaceCertResolver},
-    workspace_client_config, DynamicAllowFn, SqliteTrustOracle,
+    TenantClientConfigs, TransportEndpoint,
 };
 use rustls::sign::CertifiedKey;
 
@@ -24,10 +24,10 @@ use super::NodeRuntimeNetInfo;
 
 /// Result of the startup phase: everything needed to run accept/connect loops.
 pub(crate) struct StartupResult {
-    pub(crate) endpoint: quinn::Endpoint,
+    pub(crate) endpoint: TransportEndpoint,
     pub(crate) local_addr: SocketAddr,
     pub(crate) tenants: Vec<crate::db::transport_creds::TenantInfo>,
-    pub(crate) tenant_client_configs: HashMap<String, quinn::ClientConfig>,
+    pub(crate) tenant_client_configs: TenantClientConfigs,
     /// Peer IDs of all local tenants (for mDNS self-filtering).
     pub(crate) local_peer_ids: HashSet<String>,
 }
@@ -123,29 +123,12 @@ pub(crate) fn setup_endpoint_and_tenants(
 
     let (default_cert_der, default_key_der) = default_cert.ok_or("No valid tenant certs found")?;
 
-    // Union trust closure for inbound (server) connections: accept if ANY tenant trusts
-    // the remote. Per-tenant outbound trust is handled by tenant_client_configs below.
-    let trust_oracle = SqliteTrustOracle::new(db_path);
     let tenant_peer_ids: Vec<String> = tenants.iter().map(|t| t.peer_id.clone()).collect();
-    let dynamic_allow: Arc<
-        dyn Fn(&[u8; 32]) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> + Send + Sync,
-    > = Arc::new(move |peer_fp: &[u8; 32]| {
-        for tenant_id in &tenant_peer_ids {
-            match trust_oracle.check_sync(&TenantId(tenant_id.clone()), &PeerFingerprint(*peer_fp))
-            {
-                Ok(TrustDecision::Allow) => return Ok(true),
-                Ok(TrustDecision::Deny) => {}
-                Err(e) => return Err(e.to_string().into()),
-            }
-        }
-        Ok(false)
-    });
-
-    // Create single QUIC endpoint
-    let endpoint = create_single_port_endpoint(
+    let endpoint = create_runtime_endpoint_for_tenants(
         bind,
         Arc::new(cert_resolver),
-        dynamic_allow,
+        db_path,
+        tenant_peer_ids,
         default_cert_der,
         default_key_der,
     )?;
@@ -167,20 +150,11 @@ pub(crate) fn setup_endpoint_and_tenants(
     }
 
     // Per-tenant outbound client configs
-    let mut tenant_client_configs: HashMap<String, quinn::ClientConfig> = HashMap::new();
+    let mut tenant_client_configs: TenantClientConfigs = HashMap::new();
     for tenant in &tenants {
         let cert_der = rustls::pki_types::CertificateDer::from(tenant.cert_der.clone());
         let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(tenant.key_der.clone());
-        let oracle = SqliteTrustOracle::new(db_path);
-        let tid = TenantId(tenant.peer_id.clone());
-        let tenant_allow: Arc<DynamicAllowFn> = Arc::new(move |peer_fp: &[u8; 32]| {
-            match oracle.check_sync(&tid, &PeerFingerprint(*peer_fp)) {
-                Ok(TrustDecision::Allow) => Ok(true),
-                Ok(TrustDecision::Deny) => Ok(false),
-                Err(e) => Err(e.to_string().into()),
-            }
-        });
-        match workspace_client_config(cert_der, key_der, tenant_allow) {
+        match build_tenant_client_config_from_creds(db_path, &tenant.peer_id, cert_der, key_der) {
             Ok(cfg) => {
                 tenant_client_configs.insert(tenant.peer_id.clone(), cfg);
             }

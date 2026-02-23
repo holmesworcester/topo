@@ -17,7 +17,9 @@ use crate::db::schema::create_tables;
 use crate::db::store::lookup_workspace_id;
 use crate::db::transport_trust::record_transport_binding;
 use crate::sync::SyncSessionHandler;
-use crate::transport::dial_peer;
+use crate::transport::{
+    dial_session_peer, open_outbound_session, TransportClientConfig, TransportEndpoint,
+};
 
 use super::{
     current_timestamp_ms, drain_batch_size, peer_fingerprint_from_hex, run_session,
@@ -39,9 +41,9 @@ use super::{
 pub async fn connect_loop(
     db_path: &str,
     recorded_by: &str,
-    endpoint: quinn::Endpoint,
+    endpoint: TransportEndpoint,
     remote: SocketAddr,
-    client_config: Option<quinn::ClientConfig>,
+    client_config: Option<TransportClientConfig>,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -99,9 +101,9 @@ pub async fn connect_loop(
 async fn connect_loop_inner(
     db_path: &str,
     recorded_by: &str,
-    endpoint: quinn::Endpoint,
+    endpoint: TransportEndpoint,
     remote: SocketAddr,
-    client_config: Option<quinn::ClientConfig>,
+    client_config: Option<TransportClientConfig>,
     intro_spawner: IntroSpawnerFn,
     shared_ingest: mpsc::Sender<IngestItem>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -123,14 +125,15 @@ async fn connect_loop_inner(
 
     loop {
         info!("Connecting to {}...", remote);
-        let connected = match dial_peer(&endpoint, remote, &sni, client_config.as_ref()).await {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("Failed to connect to {}: {}", remote, e);
-                tokio::time::sleep(CONNECT_RETRY_DELAY).await;
-                continue;
-            }
-        };
+        let connected =
+            match dial_session_peer(&endpoint, remote, &sni, client_config.as_ref()).await {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("Failed to connect to {}: {}", remote, e);
+                    tokio::time::sleep(CONNECT_RETRY_DELAY).await;
+                    continue;
+                }
+            };
         let connection = connected.connection;
         let peer_id = connected.peer_id;
         let peer_fp = match peer_fingerprint_from_hex(&peer_id) {
@@ -205,14 +208,13 @@ async fn connect_loop_inner(
                 }
             }
 
-            let (session_id, io) =
-                match crate::transport::session_factory::open_session_io(&connection).await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        info!("Connection dropped: {}", e);
-                        break;
-                    }
-                };
+            let (session_id, io) = match open_outbound_session(&connection).await {
+                Ok(r) => r,
+                Err(e) => {
+                    info!("Connection dropped: {}", e);
+                    break;
+                }
+            };
 
             run_session(
                 &initiator_handler,

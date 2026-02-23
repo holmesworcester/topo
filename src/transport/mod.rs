@@ -5,6 +5,7 @@ pub mod identity;
 pub mod identity_adapter;
 pub mod intro_io;
 pub mod multi_workspace;
+pub mod peering_boundary;
 pub mod session_factory;
 pub mod transport_session_io;
 pub mod trust_oracle;
@@ -15,6 +16,13 @@ pub use cert::{
 };
 pub use connection::{DualConnection, StreamConn, StreamRecv, StreamSend};
 pub use connection_lifecycle::{accept_peer, dial_peer, ConnectedPeer, ConnectionLifecycleError};
+pub use peering_boundary::{
+    accept_session_peer, build_tenant_client_config_from_creds, build_tenant_client_config_from_db,
+    create_runtime_endpoint_for_tenants, dial_session_peer, open_inbound_session,
+    open_outbound_session, read_intro_offer_frame, resolve_trusting_tenant, send_intro_offer_frame,
+    tenant_trusts_peer, TenantClientConfigs, TransportClientConfig, TransportConnection,
+    TransportEndpoint,
+};
 pub use transport_session_io::{QuicTransportSessionIo, DEFAULT_SYNC_FRAME_MAX_BYTES};
 pub use trust_oracle::SqliteTrustOracle;
 

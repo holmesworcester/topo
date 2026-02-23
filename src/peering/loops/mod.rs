@@ -46,12 +46,12 @@ use crate::sync::SyncSessionHandler;
 /// The last parameter is a shared ingest sender — punch sessions reuse the
 /// parent loop's batch_writer instead of spawning their own.
 pub type IntroSpawnerFn = fn(
-    quinn::Connection,
+    crate::transport::TransportConnection,
     String,
     String,
     String,
-    quinn::Endpoint,
-    Option<quinn::ClientConfig>,
+    crate::transport::TransportEndpoint,
+    Option<crate::transport::TransportClientConfig>,
     tokio::sync::mpsc::Sender<crate::contracts::event_pipeline_contract::IngestItem>,
 ) -> tokio::task::JoinHandle<()>;
 
@@ -75,7 +75,6 @@ pub(super) const CONNECT_RETRY_DELAY: Duration = Duration::from_secs(1);
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
-
 
 pub(crate) fn current_timestamp_ms() -> i64 {
     SystemTime::now()
@@ -151,10 +150,7 @@ pub(super) async fn run_session(
         cancel.clone(),
     );
 
-    if let Err(e) = handler
-        .on_session(meta, io, cancel.clone())
-        .await
-    {
+    if let Err(e) = handler.on_session(meta, io, cancel.clone()).await {
         let label = match direction {
             SessionDirection::Outbound => "Initiator",
             SessionDirection::Inbound => "Responder",
