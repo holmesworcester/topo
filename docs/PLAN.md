@@ -173,7 +173,7 @@ Build this before queue complexity.
 ### Status: COMPLETE
 
 Phase 1 is functionally complete. All deliverables are met:
-- `sync`, `send`, `messages`, `status`, `generate` CLI commands work.
+- `start`, `send`, `messages`, `status`, `generate` CLI commands work.
 - `assert-now` and `assert-eventually` commands enable deterministic scripting.
 - CLI integration tests use assert commands (no ad-hoc wait helpers).
 - JSON output is not required; human-readable output is sufficient.
@@ -1605,7 +1605,7 @@ Implemented and tested:
 3. One-shot intro dispatch via the `intro` CLI command (no background intro worker in daemon).
 4. Punch handler with paced QUIC dial, identity verification, and sync-on-success.
 5. `intro_attempts` table tracking full lifecycle (`received -> dialing -> connected | failed | expired | rejected`).
-6. CLI surface: `sync`, `intro` (one-shot), and `intro-attempts` (diagnostic).
+6. CLI surface: `start`, `intro` (one-shot), and `intro-attempts` (diagnostic).
 7. Linux netns/NAT integration test (`tests/netns_nat_test.sh`) with cone and symmetric modes.
 
 ### 16.2 Architecture decisions
@@ -1668,7 +1668,7 @@ Notes:
 - `src/peering/workflows/punch.rs`: IntroOffer receiver, punch dial loop, identity verification, sync-on-punched-connection, punched-peer endpoint observation persistence.
 - `src/peering/workflows/intro.rs`: one-shot intro send and endpoint lookup.
 - `src/peering/loops/accept.rs` and `src/peering/loops/connect.rs`: accept/connect loops with LocalSet, endpoint observation recording, intro listener call sites.
-- `src/main.rs`: CLI commands (`Intro`, `IntroAttempts`) and `sync` command wiring.
+- `src/main.rs`: CLI commands (`Intro`, `IntroAttempts`) and daemon `start` wiring.
 - `src/db/intro.rs`: `intro_attempts` table operations (insert, update status, query, dedup check) and freshest endpoint query.
 - `src/db/health.rs`: `record_endpoint_observation`, `purge_expired_endpoints`.
 - `tests/netns_nat_test.sh`: Linux netns NAT integration test (requires root/sudo).
@@ -1952,7 +1952,8 @@ The peering runtime (`src/peering/runtime/mod.rs::run_node`) implements a single
 pub async fn run_node(
     db_path: &str,
     bind: SocketAddr,
-    net_info_tx: Option<oneshot::Sender<NodeRuntimeNetInfo>>,
+    net_info_tx: oneshot::Sender<NodeRuntimeNetInfo>,
+    shutdown_notify: Arc<Notify>,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
 ) -> Result<(), Box<dyn Error + Send + Sync>>
@@ -1965,7 +1966,7 @@ Flow:
 4. Spawn `accept_loop_with_ingest` with shared ingest channel.
 5. `collect_all_bootstrap_targets()` + `dispatch_bootstrap_target()` — initial bootstrap dials via `PeerDispatcher`.
 6. `spawn_bootstrap_refresher()` — ongoing poll loop for new bootstrap targets (shares `PeerDispatcher`).
-7. Ctrl-C → close all endpoints.
+7. Wait for daemon shutdown signal (RPC `Shutdown` or foreground Ctrl-C).
 
 ### 17.4.2 Per-tenant dynamic trust
 
@@ -1995,7 +1996,7 @@ Both bootstrap trust targets and mDNS discovery targets dispatch through `PeerDi
 
 ### 17.4.4 CLI integration
 
-`src/main.rs` always calls `run_node()` for sync (single-tenant and multi-tenant handled uniformly). RPC server still runs alongside for queries.
+`src/main.rs` runs `run_node()` only inside `topo start` (single-tenant and multi-tenant handled uniformly). RPC server runs alongside for control and queries.
 
 ---
 
