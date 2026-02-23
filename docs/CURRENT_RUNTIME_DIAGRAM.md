@@ -4,7 +4,10 @@ Code-accurate runtime and data-flow snapshot for `master` in `poc-7`.
 
 Primary source modules:
 - `src/main.rs`
+- `src/rpc/server.rs`
 - `src/node.rs`
+- `src/service.rs`
+- `src/event_modules/*/{commands.rs,queries.rs}`
 - `src/peering/runtime/*`
 - `src/peering/loops/*`
 - `src/peering/workflows/*`
@@ -15,6 +18,22 @@ Primary source modules:
 - `src/projection/create.rs`
 - `src/db/{project_queue.rs,egress_queue.rs,wanted.rs,transport_trust.rs}`
 
+## 0) RPC Dispatch And Event Locality
+
+```mermaid
+flowchart TD
+    CLI["CLI (topo)"] --> RPC["rpc/server dispatch"]
+    RPC --> EM["event_modules commands + queries"]
+    RPC --> SVC["service.rs (thin helpers)"]
+
+    EM --> SVC
+    EM --> CREATE["create_*_event_sync / create_signed_event_sync"]
+    CREATE --> PROJ["project_one + cascade"]
+    PROJ --> READS["projection read tables"]
+
+    SVC --> INFRA["open_db_* helpers\nnode status\nintro transport helper"]
+```
+
 ## 1) Runtime Topology (Threads + Queues + DB)
 
 ```mermaid
@@ -23,8 +42,12 @@ flowchart TD
     MAIN --> RPC["RPC server thread (Unix socket)"]
     MAIN --> NODE["node::run_node"]
 
-    RPC --> SVC["service + event_modules commands"]
-    SVC --> LOCAL["local create path\ncreate_*_event_sync"]
+    RPC --> DISPATCH["rpc/server dispatch"]
+    DISPATCH --> EMQ["event_modules commands + queries"]
+    DISPATCH --> SVC["service.rs thin helpers\n(open_db_*, intro, node status)"]
+    EMQ --> SVC
+
+    EMQ --> LOCAL["local create path\ncreate_*_event_sync"]
     LOCAL --> INGEST["shared ingest channel (mpsc)"]
 
     NODE --> START["setup_endpoint_and_tenants"]
@@ -245,7 +268,8 @@ flowchart TD
 
 1. `egress_queue` is fed by sync control-plane `HaveList` messages, not by `batch_writer`.
 2. `batch_writer` is the shared ingest sink for wire-received events and local-create events; it persists event blobs and drains `project_queue`.
-3. Peering orchestration (`connect_loop`/`accept_loop`/workflows) no longer performs direct QUIC dial/accept or peer-id extraction; those are transport-owned in `connection_lifecycle`.
-4. QUIC stream wiring (`open_bi`/`accept_bi`, `DualConnection`, `QuicTransportSessionIo`) is transport-owned in `session_factory`.
-5. Projection outputs both user-facing read tables and transport trust tables; trust rows feed both handshake allow/deny and bootstrap autodial.
-6. `HaveList` IDs originate from negentropy `need_ids` (and optionally coordinator-assigned subsets in download mode), then land in `egress_queue`.
+3. RPC command/query dispatch is event-module owned; `service.rs` is now an infra helper layer (`open_db_*`, node status, intro transport helper).
+4. Peering orchestration (`connect_loop`/`accept_loop`/workflows) no longer performs direct QUIC dial/accept or peer-id extraction; those are transport-owned in `connection_lifecycle`.
+5. QUIC stream wiring (`open_bi`/`accept_bi`, `DualConnection`, `QuicTransportSessionIo`) is transport-owned in `session_factory`.
+6. Projection outputs both user-facing read tables and transport trust tables; trust rows feed both handshake allow/deny and bootstrap autodial.
+7. `HaveList` IDs originate from negentropy `need_ids` (and optionally coordinator-assigned subsets in download mode), then land in `egress_queue`.
