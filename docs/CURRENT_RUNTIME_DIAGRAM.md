@@ -140,9 +140,59 @@ flowchart TD
     TRUST --> NET["QUIC allow/deny + bootstrap autodial"]
 ```
 
+## 6) Draft: Prior Variant (Feedback + Explicit Control Inputs)
+
+```mermaid
+flowchart TD
+    LOCAL["Local create events"] --> INGEST["shared ingest + batch_writer"]
+
+    QUIC["QUIC endpoint"] --> SESS["sync session (data stream)"]
+    SESS --> RECV["receiver task"]
+    RECV --> INCOMING["incoming sync events"]
+    INCOMING --> INGEST
+
+    INGEST --> STORE["events + recorded + neg persist"]
+    STORE --> QDB[("SQLite Queues")]
+    QDB --> APPLY["project_one + cascade"]
+    APPLY --> PDB[("SQLite Projections")]
+
+    NEG["negentropy reconcile\n(need_ids)"] --> CTRL["Sync control stream\n(HaveList / need_ids)"]
+    COORD["optional coordinator assignment\n(download mode)"] --> CTRL
+    CTRL --> QDB
+    PDB --> TRUST["transport trust decisions"]
+    TRUST --> NET["QUIC allow/deny + bootstrap autodial"]
+    NET --> QUIC
+```
+
+## 7) Draft: Control Inputs Produced By Sync Session
+
+```mermaid
+flowchart TD
+    LOCAL["Local create events"] --> INGEST["shared ingest + batch_writer"]
+
+    QUIC["QUIC endpoint"] --> SESS["sync session"]
+    SESS --> RECV["receiver task (data stream)"]
+    RECV --> INCOMING["incoming sync events"]
+    INCOMING --> INGEST
+
+    SESS --> NEG["session reconciliation\n(negentropy have/need sets)"]
+    SESS --> COORD_IN["session gets coordinator assignment\n(optional download mode)"]
+    NEG --> CTRL["Sync control stream\n(HaveList / need_ids)"]
+    COORD_IN --> CTRL
+
+    INGEST --> STORE["events + recorded + neg persist"]
+    STORE --> QDB[("SQLite Queues")]
+    CTRL --> QDB
+    QDB --> APPLY["project_one + cascade"]
+    APPLY --> PDB[("SQLite Projections")]
+    PDB --> TRUST["transport trust decisions"]
+    TRUST --> NET["QUIC allow/deny + bootstrap autodial"]
+```
+
 ## Current Data-Flow Facts
 
 1. `egress_queue` is fed by sync control-plane `HaveList` messages, not by `batch_writer`.
 2. `batch_writer` is the shared ingest sink for wire-received events; it persists event blobs and drains `project_queue`.
 3. Local creates (`create_*_event_sync`) and wire receives both converge on `project_one` projection semantics.
 4. Projection outputs both user-facing read tables and transport trust tables; trust rows feed both handshake allow/deny and bootstrap autodial.
+5. `HaveList` IDs originate from negentropy `need_ids` (and optionally coordinator-assigned subsets in download mode), then land in `egress_queue`.
