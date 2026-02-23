@@ -344,7 +344,7 @@ pub fn spawn_intro_listener(
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_local(async move {
         loop {
-            let frame = match crate::transport::session_factory::accept_and_read_intro(&connection).await {
+            let frame = match crate::transport::intro_io::accept_and_read_intro(&connection).await {
                 Ok(None) => {
                     // Connection closed
                     break;

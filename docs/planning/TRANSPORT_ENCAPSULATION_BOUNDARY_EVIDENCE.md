@@ -46,16 +46,15 @@ No stream-level types leak into peering. Stream wiring flows:
 
 ### SC4: Runtime diagrams fit within the 3-diagram model
 
-Rewritten `docs/CURRENT_RUNTIME_DIAGRAM.md` contains exactly 3 canonical diagrams:
-- **L0 Runtime Loop** (5 boxes): planner → peering supervisor → transport capsule → sync session → ingest/projection
-- **L1 Transport Boundary** (inside capsule): endpoint, trust oracle, session factory, cert resolver, intro listener
-- **L2 Session Data Flow** (single session): ControlIo/DataSendIo/DataRecvIo contract types only
+Diagram rewrite is intentionally deferred by request while diagrams are being
+iterated on `master`. This branch keeps transport encapsulation changes and
+tests only, without modifying `docs/CURRENT_RUNTIME_DIAGRAM.md`.
 
-Diagram rules enforced:
-- Contract names only across boundaries (no concrete Rust types in L0/L2)
-- No arrows from peering to QUIC internals
-- Solid = data, dashed = control/orchestration
-- One level of detail per diagram
+Current branch still preserves the code-side boundary required for diagram
+simplification:
+1. Stream wiring moved to `src/transport/session_factory.rs`.
+2. Intro uni-stream parsing moved to `src/transport/intro_io.rs`.
+3. Peering uses only contract-level IO acquisition calls.
 
 ### SC5: Core tests and boundary script pass
 
@@ -79,17 +78,17 @@ $ bash scripts/check_boundary_imports.sh
 ## Files Changed
 
 ### New files
-- `src/transport/session_factory.rs` — sole owner of stream wiring (`open_session_io`, `accept_session_io`, `accept_and_read_intro`)
+- `src/transport/session_factory.rs` — sole owner of sync session stream wiring (`open_session_io`, `accept_session_io`)
+- `src/transport/intro_io.rs` — intro uni-stream receive/parse helpers (`accept_and_read_intro`)
 
 ### Modified files
-- `src/transport/mod.rs` — registered `session_factory` module
+- `src/transport/mod.rs` — registered `session_factory` and `intro_io` modules
 - `src/peering/loops/mod.rs` — `run_session()` now takes `(session_id, Box<dyn TransportSessionIo>)` instead of raw `quinn::SendStream`/`RecvStream`; removed `DualConnection`/`QuicTransportSessionIo` imports
 - `src/peering/loops/accept.rs` — calls `accept_session_io()` instead of `connection.accept_bi()` + manual wiring
 - `src/peering/loops/connect.rs` — calls `open_session_io()` instead of `connection.open_bi()` + manual wiring
 - `src/peering/loops/download.rs` — calls `open_session_io()` instead of inline `DualConnection::new` + `QuicTransportSessionIo::new`
 - `src/peering/workflows/punch.rs` — `run_sync_on_punched_connection` calls `open_session_io()`; `spawn_intro_listener` calls `accept_and_read_intro()`; removed `DualConnection`/`QuicTransportSessionIo`/`quinn::RecvStream` imports
 - `scripts/check_boundary_imports.sh` — added transport encapsulation forbidden edges + positive checks
-- `docs/CURRENT_RUNTIME_DIAGRAM.md` — rewritten to 3-diagram canonical model (L0/L1/L2)
 - `docs/DESIGN.md` — updated module ownership section for transport session factory
 
 ## Boundary Script Rules Added
