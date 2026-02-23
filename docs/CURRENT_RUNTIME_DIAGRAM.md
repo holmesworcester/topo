@@ -38,11 +38,15 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    CLI["CLI (topo)"] --> MAIN["main.rs"]
+    CLI["CLI (topo start)"] --> MAIN["main.rs"]
     MAIN --> RPC["RPC server thread (Unix socket)"]
     MAIN --> NODE["node::run_node"]
+    MAIN --> SIG["Ctrl-C signal task"]
+    SIG --> SHUT_N["shutdown_notify"]
 
     RPC --> DISPATCH["rpc/server dispatch"]
+    DISPATCH --> SHUT_REQ["RpcMethod::Shutdown"]
+    SHUT_REQ --> SHUT_N
     DISPATCH --> EMQ["event_modules commands + queries"]
     DISPATCH --> SVC["service.rs thin helpers\n(open_db_*, intro, node status)"]
     EMQ --> SVC
@@ -84,11 +88,11 @@ flowchart TD
     BOUND --> IIO
 
     FACT --> SYNC["SyncSessionHandler\n(on_session)"]
-    SYNC --> CTRL["control stream\nNegOpen / NegMsg / HaveList / Done"]
+    SYNC --> CTRL_STREAM["control stream\nNegOpen / NegMsg / HaveList / Done"]
     SYNC --> DATA["data stream\nEvent / DataDone"]
 
-    CTRL --> WANT["wanted_events"]
-    CTRL --> EGRESS["egress_queue"]
+    CTRL_STREAM --> WANT["wanted_events"]
+    CTRL_STREAM --> EGRESS["egress_queue"]
     EGRESS --> SEND["Store::get_shared(events)\n-> Frame::Event send"]
 
     DATA --> RECV["receiver task\nhash(blob) + tag recorded_by"]
@@ -102,6 +106,8 @@ flowchart TD
 
     TRUST_DB --> TRUST
     TRUST --> LIFE
+    SHUT_N --> NODE
+    SHUT_N --> RPC
 ```
 
 ## 2) One Sync Session (Control/Data Flow)
@@ -277,3 +283,4 @@ flowchart TD
 6. QUIC stream wiring (`open_bi`/`accept_bi`, `DualConnection`, `QuicTransportSessionIo`) is transport-owned in `session_factory`.
 7. Projection outputs both user-facing read tables and transport trust tables; trust rows feed both handshake allow/deny and bootstrap autodial.
 8. `HaveList` IDs originate from negentropy `need_ids` (and optionally coordinator-assigned subsets in download mode), then land in `egress_queue`.
+9. Foreground runtime is daemon-first (`topo start`): shutdown is coordinated by shared `shutdown_notify` (RPC `Shutdown` or Ctrl-C).
