@@ -162,3 +162,152 @@ pub async fn send_intro_offer_frame(
     send_stream.finish()?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
+    use crate::db::schema::create_tables;
+    use crate::db::transport_creds::store_local_creds;
+    use crate::db::transport_trust::record_pending_invite_bootstrap_trust;
+    use crate::db::open_connection;
+    use crate::transport::{
+        create_dual_endpoint, extract_spki_fingerprint, generate_self_signed_cert, AllowedPeers,
+    };
+
+    use super::*;
+
+    async fn endpoint_pair() -> Result<
+        (
+            TransportEndpoint,
+            TransportEndpoint,
+            SocketAddr,
+            String,
+            String,
+        ),
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        let (server_cert, server_key) = generate_self_signed_cert()?;
+        let (client_cert, client_key) = generate_self_signed_cert()?;
+
+        let server_fp = extract_spki_fingerprint(server_cert.as_ref())?;
+        let client_fp = extract_spki_fingerprint(client_cert.as_ref())?;
+
+        let server_ep = create_dual_endpoint(
+            "127.0.0.1:0".parse().unwrap(),
+            server_cert,
+            server_key,
+            Arc::new(AllowedPeers::from_fingerprints(vec![client_fp])),
+        )?;
+        let client_ep = create_dual_endpoint(
+            "127.0.0.1:0".parse().unwrap(),
+            client_cert,
+            client_key,
+            Arc::new(AllowedPeers::from_fingerprints(vec![server_fp])),
+        )?;
+        let server_addr = server_ep.local_addr()?;
+        Ok((
+            server_ep,
+            client_ep,
+            server_addr,
+            hex::encode(server_fp),
+            hex::encode(client_fp),
+        ))
+    }
+
+    #[test]
+    fn trust_resolution_uses_sql_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("trust.sqlite3");
+        let db = open_connection(&db_path).unwrap();
+        create_tables(&db).unwrap();
+
+        let allowed = [0xAB; 32];
+        record_pending_invite_bootstrap_trust(&db, "tenant-a", "invite-1", "ws-1", &allowed)
+            .unwrap();
+        drop(db);
+
+        assert!(
+            tenant_trusts_peer(db_path.to_str().unwrap(), "tenant-a", allowed).unwrap(),
+            "tenant-a should trust pending bootstrap spki"
+        );
+        assert!(
+            !tenant_trusts_peer(db_path.to_str().unwrap(), "tenant-a", [0xCD; 32]).unwrap(),
+            "unlisted peer must be denied"
+        );
+
+        let tenants = vec!["tenant-x".to_string(), "tenant-a".to_string()];
+        let resolved = resolve_trusting_tenant(db_path.to_str().unwrap(), &tenants, allowed).unwrap();
+        assert_eq!(resolved, Some("tenant-a".to_string()));
+    }
+
+    #[test]
+    fn tenant_client_config_from_db_requires_local_creds() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("client_config.sqlite3");
+        let db = open_connection(&db_path).unwrap();
+        create_tables(&db).unwrap();
+        drop(db);
+
+        let err = build_tenant_client_config_from_db(
+            db_path.to_str().unwrap(),
+            "missing-tenant",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("local creds missing"),
+            "unexpected error: {}",
+            err
+        );
+
+        let db = open_connection(&db_path).unwrap();
+        let (cert, key) = generate_self_signed_cert().unwrap();
+        store_local_creds(
+            &db,
+            "tenant-a",
+            cert.as_ref(),
+            key.secret_pkcs8_der().as_ref(),
+        )
+        .unwrap();
+        drop(db);
+
+        build_tenant_client_config_from_db(db_path.to_str().unwrap(), "tenant-a")
+            .expect("tenant config should build from stored creds");
+    }
+
+    #[tokio::test]
+    async fn boundary_wrappers_cover_dial_accept_and_intro_roundtrip() {
+        let (server_ep, client_ep, server_addr, server_peer_id, client_peer_id) =
+            endpoint_pair().await.expect("endpoint pair");
+
+        let (accepted_res, dialed_res) = tokio::join!(
+            accept_session_peer(&server_ep),
+            dial_session_peer(&client_ep, server_addr, "localhost", None)
+        );
+        let accepted = accepted_res.expect("accept").expect("accepted");
+        let dialed = dialed_res.expect("dial");
+        assert_eq!(accepted.peer_id, client_peer_id);
+        assert_eq!(dialed.peer_id, server_peer_id);
+
+        let intro = Frame::IntroOffer {
+            intro_id: [0x11; 16],
+            other_peer_id: [0x22; 32],
+            origin_family: 4,
+            origin_ip: [0; 16],
+            origin_port: 4433,
+            observed_at_ms: 10,
+            expires_at_ms: 100,
+            attempt_window_ms: 50,
+        };
+        send_intro_offer_frame(&dialed.connection, &intro)
+            .await
+            .expect("send intro");
+        let read = read_intro_offer_frame(&accepted.connection)
+            .await
+            .expect("read intro result")
+            .expect("intro frame");
+        assert_eq!(read, intro);
+    }
+
+}

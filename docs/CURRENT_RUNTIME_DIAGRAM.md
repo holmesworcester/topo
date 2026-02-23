@@ -11,7 +11,7 @@ Primary source modules:
 - `src/peering/runtime/*`
 - `src/peering/loops/*`
 - `src/peering/workflows/*`
-- `src/transport/{connection_lifecycle.rs,session_factory.rs,intro_io.rs}`
+- `src/transport/{peering_boundary.rs,connection_lifecycle.rs,session_factory.rs,intro_io.rs}`
 - `src/sync/session/*`
 - `src/event_pipeline.rs`
 - `src/projection/apply/*`
@@ -71,15 +71,17 @@ flowchart TD
     end
 
     subgraph TRANS["Transport Capsule"]
+      BOUND["peering_boundary\n(contract helpers)"]
       LIFE["connection_lifecycle\naccept_peer / dial_peer"]
       FACT["session_factory\naccept/open_session_io"]
       IIO["intro_io\naccept_and_read_intro"]
     end
 
-    ORCH --> LIFE
-    INTRO --> LIFE
-    LIFE --> FACT
-    INTRO --> IIO
+    ORCH --> BOUND
+    INTRO --> BOUND
+    BOUND --> LIFE
+    BOUND --> FACT
+    BOUND --> IIO
 
     FACT --> SYNC["SyncSessionHandler\n(on_session)"]
     SYNC --> CTRL["control stream\nNegOpen / NegMsg / HaveList / Done"]
@@ -106,8 +108,9 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    PEER["peering loop\n(connect/accept/download/punch)"] --> LIFE["connection_lifecycle\n(connected peer + peer_id)"]
-    LIFE --> FACT["session_factory\n(open/accept streams)"]
+    PEER["peering loop\n(connect/accept/download/punch)"] --> BOUND["transport::peering_boundary\n(dial/accept/session/intro helpers)"]
+    BOUND --> LIFE["connection_lifecycle\n(connected peer + peer_id)"]
+    BOUND --> FACT["session_factory\n(open/accept streams)"]
     FACT --> IO["TransportSessionIo + session_id"]
     IO --> HANDLER["SyncSessionHandler::on_session"]
 
@@ -269,7 +272,8 @@ flowchart TD
 1. `egress_queue` is fed by sync control-plane `HaveList` messages, not by `batch_writer`.
 2. `batch_writer` is the shared ingest sink for wire-received events and local-create events; it persists event blobs and drains `project_queue`.
 3. RPC command/query dispatch is event-module owned; `service.rs` is now an infra helper layer (`open_db_*`, node status, intro transport helper).
-4. Peering orchestration (`connect_loop`/`accept_loop`/workflows) no longer performs direct QUIC dial/accept or peer-id extraction; those are transport-owned in `connection_lifecycle`.
-5. QUIC stream wiring (`open_bi`/`accept_bi`, `DualConnection`, `QuicTransportSessionIo`) is transport-owned in `session_factory`.
-6. Projection outputs both user-facing read tables and transport trust tables; trust rows feed both handshake allow/deny and bootstrap autodial.
-7. `HaveList` IDs originate from negentropy `need_ids` (and optionally coordinator-assigned subsets in download mode), then land in `egress_queue`.
+4. Peering orchestration (`connect_loop`/`accept_loop`/workflows) now routes transport operations through `transport::peering_boundary`; peering no longer imports QUIC/trust internals directly.
+5. QUIC dial/accept + peer identity extraction are transport-owned in `connection_lifecycle`.
+6. QUIC stream wiring (`open_bi`/`accept_bi`, `DualConnection`, `QuicTransportSessionIo`) is transport-owned in `session_factory`.
+7. Projection outputs both user-facing read tables and transport trust tables; trust rows feed both handshake allow/deny and bootstrap autodial.
+8. `HaveList` IDs originate from negentropy `need_ids` (and optionally coordinator-assigned subsets in download mode), then land in `egress_queue`.
