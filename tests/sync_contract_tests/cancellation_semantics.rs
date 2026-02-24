@@ -22,7 +22,7 @@ async fn pre_cancelled_session_returns_error() {
         let handler = SyncSessionHandler::outbound(
             db_path,
             30,
-            topo::sync::CoordinationManager::new().register_peer(),
+            std::sync::Arc::new(topo::sync::CoordinationManager::new()),
             noop_ingest_tx(),
         );
         let meta = test_session_meta(SessionDirection::Outbound);
@@ -55,7 +55,7 @@ async fn mid_session_cancellation_terminates_handler() {
         let handler = SyncSessionHandler::outbound(
             db_path,
             30,
-            topo::sync::CoordinationManager::new().register_peer(),
+            std::sync::Arc::new(topo::sync::CoordinationManager::new()),
             noop_ingest_tx(),
         );
         let meta = test_session_meta(SessionDirection::Outbound);

@@ -299,10 +299,13 @@ async fn run_sync_on_punched_connection(
         remote_addr: session.remote_addr,
         direction: SessionDirection::Outbound,
     };
-    let _coordination_manager = CoordinationManager::new();
-    let coordination = _coordination_manager.register_peer();
-    let handler =
-        SyncSessionHandler::outbound(db_path.to_string(), 60, coordination, shared_ingest);
+    let coordination_manager = std::sync::Arc::new(CoordinationManager::new());
+    let handler = SyncSessionHandler::outbound(
+        db_path.to_string(),
+        60,
+        coordination_manager,
+        shared_ingest,
+    );
 
     if let Err(e) = handler
         .on_session(meta, session.io, CancellationToken::new())

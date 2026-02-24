@@ -2075,7 +2075,7 @@ pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Jo
     for (i, (endpoint, remote)) in sink_connectors.into_iter().enumerate() {
         let sink_db = sink.db_path.clone();
         let sink_identity = sink.identity.clone();
-        let coord = coord_manager.register_peer();
+        let coordination_manager = coord_manager.clone();
         handles.push(std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -2090,7 +2090,7 @@ pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Jo
                     None,
                     noop_intro_spawner,
                     test_ingest_fns(),
-                    coord,
+                    coordination_manager,
                 )
                 .await
                 {

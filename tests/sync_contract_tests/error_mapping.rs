@@ -66,7 +66,7 @@ async fn abrupt_close_surfaces_connection_lost() {
         let handler = SyncSessionHandler::outbound(
             db_path,
             30,
-            topo::sync::CoordinationManager::new().register_peer(),
+            std::sync::Arc::new(topo::sync::CoordinationManager::new()),
             noop_ingest_tx(),
         );
         let meta = test_session_meta(SessionDirection::Outbound);

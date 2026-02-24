@@ -104,7 +104,7 @@ pub(crate) fn spawn_connect_loop_thread(
     source: &'static str,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
-    coordination: std::sync::Arc<crate::sync::PeerCoord>,
+    coordination_manager: std::sync::Arc<crate::sync::CoordinationManager>,
 ) {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -120,7 +120,7 @@ pub(crate) fn spawn_connect_loop_thread(
                 Some(cfg),
                 intro_spawner,
                 ingest,
-                coordination,
+                coordination_manager,
             )
             .await
             {
@@ -261,7 +261,7 @@ pub(crate) fn spawn_bootstrap_refresher(
                         &tenant_id[..16.min(tenant_id.len())],
                         remote
                     );
-                    let coord = coord_managers[&tenant_id].register_peer();
+                    let coordination_manager = coord_managers[&tenant_id].clone();
                     spawn_connect_loop_thread(
                         db_path.clone(),
                         tenant_id,
@@ -271,7 +271,7 @@ pub(crate) fn spawn_bootstrap_refresher(
                         "bootstrap-autodial-refresh",
                         intro_spawner,
                         ingest,
-                        coord,
+                        coordination_manager,
                     );
                 }
             }

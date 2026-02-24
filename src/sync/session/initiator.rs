@@ -191,11 +191,15 @@ where
                 coordination_pending = false;
             }
             CoordinationAssignment::Disconnected => {
-                return Err(format!(
+                warn!(
                     "Coordinator assignment channel disconnected for peer {}",
                     coordination.peer_idx
-                )
-                .into());
+                );
+                // No direct/non-coordinated need dispatch is performed here.
+                // This session proceeds without pull assignments; subsequent
+                // sessions re-register coordination handles and recover.
+                coordinated_need_ids.clear();
+                coordination_pending = false;
             }
             CoordinationAssignment::Pending | CoordinationAssignment::NotReady => {}
         }

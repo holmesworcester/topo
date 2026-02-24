@@ -118,7 +118,7 @@ pub(crate) fn launch_mdns_discovery(
                                 let db = db_path_disc.clone();
                                 let tid = tenant_id.clone();
                                 let cfg = Some(disc_client_cfg.clone());
-                                let coord = coord_mgr.register_peer();
+                                let coordination_manager = coord_mgr.clone();
                                 std::thread::spawn(move || {
                                     let rt = tokio::runtime::Builder::new_current_thread()
                                         .enable_all()
@@ -127,7 +127,7 @@ pub(crate) fn launch_mdns_discovery(
                                     rt.block_on(async move {
                                         tokio::select! {
                                             _ = connect_loop_with_coordination(
-                                                &db, &tid, ep, dial_addr, cfg, intro_spawner, ingest, coord,
+                                                &db, &tid, ep, dial_addr, cfg, intro_spawner, ingest, coordination_manager,
                                             ) => {}
                                             _ = cancel.changed() => {}
                                         }

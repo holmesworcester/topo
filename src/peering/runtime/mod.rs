@@ -183,7 +183,7 @@ pub async fn run_node(
                 &tenant_id[..16.min(tenant_id.len())],
                 remote
             );
-            let coord = coord_managers[&tenant_id].register_peer();
+            let coordination_manager = coord_managers[&tenant_id].clone();
             spawn_connect_loop_thread(
                 db_path.to_string(),
                 tenant_id,
@@ -193,7 +193,7 @@ pub async fn run_node(
                 "bootstrap-autodial",
                 intro_spawner,
                 ingest,
-                coord,
+                coordination_manager,
             );
         }
         // Keep polling for runtime invite acceptance (shares PeerDispatcher dedup state)

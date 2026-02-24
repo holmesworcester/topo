@@ -125,10 +125,13 @@ pub async fn bootstrap_sync_from_invite(
         remote_addr: connection.remote_address(),
         direction: SessionDirection::Outbound,
     };
-    let _coordination_manager = CoordinationManager::new();
-    let coordination = _coordination_manager.register_peer();
-    let handler =
-        SyncSessionHandler::outbound(db_path.to_string(), timeout_secs, coordination, ingest_tx);
+    let coordination_manager = Arc::new(CoordinationManager::new());
+    let handler = SyncSessionHandler::outbound(
+        db_path.to_string(),
+        timeout_secs,
+        coordination_manager,
+        ingest_tx,
+    );
     let io = QuicTransportSessionIo::new(session_id, conn);
     handler
         .on_session(meta, Box::new(io), CancellationToken::new())

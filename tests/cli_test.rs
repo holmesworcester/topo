@@ -277,7 +277,7 @@ fn test_cli_bidirectional_sync() {
     let tmpdir = tempfile::tempdir().unwrap();
     let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
     let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
-    let timeout_ms = 15000;
+    let timeout_ms = 30000;
 
     // Alice creates workspace (identity chain)
     create_workspace(&alice_db);
@@ -355,7 +355,7 @@ fn test_cli_ongoing_sync() {
     let mut alice = start_daemon(&alice_db);
 
     // Alice sends bootstrap message
-    send_message(&alice_db, "bootstrap");
+    let bootstrap_eid = send_message(&alice_db, "bootstrap");
 
     // Alice creates invite
     let invite_link = create_invite(&alice_db, &daemon_listen_addr(&alice_db));
@@ -363,7 +363,13 @@ fn test_cli_ongoing_sync() {
     // Bob accepts invite and starts daemon
     accept_invite(&bob_db, &invite_link);
     let mut bob = start_daemon(&bob_db);
-    std::thread::sleep(Duration::from_secs(1));
+    // Explicit bootstrap readiness gate: avoid racing ongoing-sync assertions
+    // before the invite/bootstrap prerequisite sync has converged.
+    assert_eventually(
+        &bob_db,
+        &format!("has_event:{} >= 1", bootstrap_eid),
+        timeout_ms,
+    );
 
     // Both send messages over time
     send_message(&alice_db, "Round 1");

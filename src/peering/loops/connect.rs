@@ -16,7 +16,7 @@ use crate::db::removal_watch::is_peer_removed;
 use crate::db::schema::create_tables;
 use crate::db::store::lookup_workspace_id;
 use crate::db::transport_trust::record_transport_binding;
-use crate::sync::PeerCoord;
+use crate::sync::CoordinationManager;
 use crate::sync::SyncSessionHandler;
 use crate::transport::{dial_session_provider, TransportClientConfig, TransportEndpoint};
 
@@ -54,8 +54,7 @@ pub async fn connect_loop(
     // Default connect loop path is coordinated as well: a single-peer
     // coordinator degenerates to pass-through assignment but keeps one
     // initiator behavior across tests and runtime.
-    let coord_manager = crate::sync::CoordinationManager::new();
-    let coord = coord_manager.register_peer();
+    let coordination_manager = Arc::new(CoordinationManager::new());
     connect_loop_with_coordination(
         db_path,
         recorded_by,
@@ -64,7 +63,7 @@ pub async fn connect_loop(
         client_config,
         intro_spawner,
         ingest,
-        coord,
+        coordination_manager,
     )
     .await
 }
@@ -78,7 +77,7 @@ pub async fn connect_loop_with_coordination(
     client_config: Option<TransportClientConfig>,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
-    coordination: Arc<PeerCoord>,
+    coordination_manager: Arc<CoordinationManager>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     {
         let db = open_connection(db_path)?;
@@ -127,7 +126,7 @@ pub async fn connect_loop_with_coordination(
             client_config,
             intro_spawner,
             shared_tx,
-            coordination,
+            coordination_manager,
         ))
         .await
 }
@@ -140,7 +139,7 @@ async fn connect_loop_inner(
     client_config: Option<TransportClientConfig>,
     intro_spawner: IntroSpawnerFn,
     shared_ingest: mpsc::Sender<IngestItem>,
-    coordination: Arc<PeerCoord>,
+    coordination_manager: Arc<CoordinationManager>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Look up workspace SNI for this tenant (falls back to "localhost" if no trust anchor)
     let sni = {
@@ -155,7 +154,7 @@ async fn connect_loop_inner(
     let initiator_handler = SyncSessionHandler::outbound(
         db_path.to_string(),
         SYNC_SESSION_TIMEOUT_SECS,
-        coordination,
+        coordination_manager,
         shared_ingest.clone(),
     );
 
