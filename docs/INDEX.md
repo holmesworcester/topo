@@ -14,6 +14,7 @@ These are current specs, plans, and reference material.
 | [LOW_MEM_PERF_ANALYSIS.md](LOW_MEM_PERF_ANALYSIS.md) | Scaling analysis and memory-constrained architecture guidance |
 | [tla/projector_spec.md](tla/projector_spec.md) | Runtime-to-model mapping for projector semantics |
 | [planning/DISCREPANCY-MATRIX.md](planning/DISCREPANCY-MATRIX.md) | Current design/plan/code discrepancy matrix |
+| [planning/IDENTITY_TRANSPORT_BOUNDARY_EXECUTION_PLAN.md](planning/IDENTITY_TRANSPORT_BOUNDARY_EXECUTION_PLAN.md) | Active boundary plan for identity workflow vs transport materialization |
 
 ## Canonical Module Vocabulary
 
