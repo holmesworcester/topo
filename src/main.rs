@@ -508,7 +508,8 @@ fn spawn_runtime(
     state: Arc<DaemonState>,
     tenants: Vec<String>,
 ) -> ManagedRuntime {
-    *state.runtime_state.write().unwrap() = RuntimeState::Active;
+    // Runtime is Active only after listen_addr is reported.
+    *state.runtime_state.write().unwrap() = RuntimeState::IdleNoTenants;
     *state.runtime_net.write().unwrap() = None;
 
     let runtime_shutdown = Arc::new(tokio::sync::Notify::new());
@@ -521,6 +522,7 @@ fn spawn_runtime(
         if let Ok(info) = net_rx.await {
             println!("listen: {}", info.listen_addr);
             *state_for_net.runtime_net.write().unwrap() = Some(info);
+            *state_for_net.runtime_state.write().unwrap() = RuntimeState::Active;
         }
     });
 
@@ -727,9 +729,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             shutdown_notify.notify_waiters();
             let _ = runtime_manager.await;
             let _ = rpc_handle.join();
-
-            // Clean up socket file
-            let _ = std::fs::remove_file(&socket_path);
 
             info!("🐭 Topo daemon shut down cleanly");
         }

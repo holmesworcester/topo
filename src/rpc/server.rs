@@ -76,24 +76,22 @@ impl DaemonState {
     /// Create state with auto-selected peer if exactly one tenant exists.
     /// Seeds the default "general" channel.
     pub fn new(db_path: &str) -> Self {
-        let (active, runtime_state) = match crate::db::open_connection(db_path) {
+        let active = match crate::db::open_connection(db_path) {
             Ok(conn) => {
                 let _ = crate::db::schema::create_tables(&conn);
                 match discover_local_tenants(&conn) {
-                    Ok(tenants) if tenants.is_empty() => (None, RuntimeState::IdleNoTenants),
-                    Ok(tenants) if tenants.len() == 1 => {
-                        (Some(tenants[0].peer_id.clone()), RuntimeState::Active)
-                    }
-                    Ok(_) => (None, RuntimeState::Active),
-                    Err(_) => (None, RuntimeState::IdleNoTenants),
+                    Ok(tenants) if tenants.len() == 1 => Some(tenants[0].peer_id.clone()),
+                    Ok(_) => None,
+                    Err(_) => None,
                 }
             }
-            Err(_) => (None, RuntimeState::IdleNoTenants),
+            Err(_) => None,
         };
         DaemonState {
             db_path: db_path.to_string(),
             active_peer: RwLock::new(active),
-            runtime_state: RwLock::new(runtime_state),
+            // Runtime manager owns lifecycle transitions.
+            runtime_state: RwLock::new(RuntimeState::IdleNoTenants),
             runtime_net: RwLock::new(None),
             runtime_recheck: Notify::new(),
             invite_refs: RwLock::new(Vec::new()),
