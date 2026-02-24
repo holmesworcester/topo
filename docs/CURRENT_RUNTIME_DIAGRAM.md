@@ -94,9 +94,10 @@ flowchart TD
 ## 3) High-Level Runtime Boundaries
 
 ```mermaid
+%%{init: {"flowchart": {"wrappingWidth": 320}} }%%
 flowchart TD
     CTRL["Control"]
-    BOOT["Bootstrap"]
+    BOOT["Setup"]
     ORCH["Peering"]
     TRANS["Transport"]
     SYNC["Sync Engine"]
@@ -122,6 +123,7 @@ flowchart TD
 ## 4) Runtime Topology (Threads + Queues + DB, Reference)
 
 ```mermaid
+%%{init: {"flowchart": {"wrappingWidth": 340}} }%%
 flowchart TD
     subgraph CTRL["Control Plane"]
       CLI["CLI (topo start)"] --> MAIN["main.rs"]
@@ -139,7 +141,7 @@ flowchart TD
       EMQ --> LOCAL["local create path / create_*_event_sync"]
     end
 
-    subgraph BOOT["Bootstrap"]
+    subgraph BOOT["Setup"]
       START["setup_endpoint_and_tenants"]
       BOOT_WR["init shared ingest writer"]
       BOOT_COORD["init tenant coordination managers"]
