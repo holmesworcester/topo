@@ -135,10 +135,10 @@ Status: PASS
 
 File-level proof:
 - Runtime topology diagram shows wrapper -> shared supervisor ownership:
-  - `docs/CURRENT_RUNTIME_DIAGRAM.md:135-145`
-  - `docs/CURRENT_RUNTIME_DIAGRAM.md:154`
+  - `docs/CURRENT_RUNTIME_DIAGRAM.md:144-154`
+  - `docs/CURRENT_RUNTIME_DIAGRAM.md:168`
 - Data-flow facts reflect coordinated runtime initiator behavior:
-  - `docs/CURRENT_RUNTIME_DIAGRAM.md:199-201`
+  - `docs/CURRENT_RUNTIME_DIAGRAM.md:223-225`
 
 ---
 
@@ -146,7 +146,7 @@ File-level proof:
 
 1. `cargo check`
 ```text
-Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.81s
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.08s
 ```
 
 2. `rg -n "create_tables\\(|purge_expired_endpoints\\(|recover_expired\\(|drain_project_queue\\(" src/peering/loops`
