@@ -116,7 +116,10 @@ pub async fn download_from_sources(
                 .enable_all()
                 .build()
                 .unwrap();
-            rt.block_on(async move {
+            // `run_session` uses `spawn_local` for peer-removal cancellation watch.
+            // Mirror connect/accept loop runtime shape so session tasks can run.
+            let local = tokio::task::LocalSet::new();
+            rt.block_on(local.run_until(async move {
                 loop {
                     let provider = match dial_session_provider(&endpoint, remote, &sni, None).await
                     {
@@ -166,7 +169,7 @@ pub async fn download_from_sources(
                         tokio::time::sleep(SESSION_GAP).await;
                     }
                 }
-            });
+            }));
         }));
     }
 
