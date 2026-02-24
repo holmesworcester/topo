@@ -136,7 +136,7 @@ flowchart TD
       DISPATCH --> SHUT_REQ["RpcMethod::Shutdown"]
       SHUT_REQ --> SHUT_N
       DISPATCH --> EMQ["event_modules commands + queries"]
-      DISPATCH --> SVC["service.rs thin helpers (open_db_*, intro, node status)"]
+      DISPATCH --> SVC["service.rs helpers"]
       EMQ --> SVC
       EMQ --> LOCAL["local create path / create_*_event_sync"]
     end
@@ -156,7 +156,7 @@ flowchart TD
     subgraph PIPE["Event Pipeline"]
       LOCAL --> INGEST["shared ingest channel (mpsc)"]
       INGEST --> WRITER["batch_writer thread"]
-      WRITER --> P1["phase 1: persist events/recorded/sync state + enqueue project_queue"]
+      WRITER --> P1["Persist + enqueue"]
       P1 --> PROJ_Q["project_queue"]
       PROJ_Q --> P3
       P1 --> P2["phase 2: plan post-commit commands"]
@@ -180,7 +180,7 @@ flowchart TD
     end
 
     subgraph TRUST_POL["Transport Trust"]
-      TRUST["SqliteTrustOracle (tenant-scoped allow/deny)"]
+      TRUST["Trust policy"]
     end
 
     START --> EP
@@ -196,12 +196,12 @@ flowchart TD
 
     subgraph SYNC_ENG["Sync Engine"]
       SYNC["SyncSessionHandler (on_session)"]
-      CTRL_STREAM["control stream / sync control messages / HaveList / Done"]
-      DATA["data stream / Event / DataDone"]
+      CTRL_STREAM["Sync control"]
+      DATA["Sync data"]
       WANT["wanted_events"]
       EGRESS["egress_queue"]
-      SEND["Store::get_shared(events) -> Frame::Event send"]
-      RECV["receiver task / hash(blob) + tag recorded_by"]
+      SEND["Shared event send"]
+      RECV["Receive + source tag"]
 
       SYNC --> CTRL_STREAM
       SYNC --> DATA
@@ -218,8 +218,8 @@ flowchart TD
       VALID["valid_events"]
       BLOCKED["blocked_events + blocked_event_deps"]
       REJECTED["rejected_events"]
-      READS["projection tables (messages, users, peers, channels)"]
-      TRUST_DB["transport trust tables (peer_shared + invite bootstrap)"]
+      READS["Projection tables"]
+      TRUST_DB["Transport trust tables"]
     end
 
     PROJ --> VALID
@@ -233,6 +233,16 @@ flowchart TD
     SHUT_N --> NODE
     SHUT_N --> RPC
 ```
+
+**Runtime Topology Legend**
+- `service.rs helpers`: `open_db_*`, node status helpers, intro transport helper entry points.
+- `Persist + enqueue`: phase 1 persists events/recorded/sync state and enqueues `project_queue`.
+- `Sync control`: sync control stream messages including `HaveList` and `Done`.
+- `Sync data`: sync data stream frames (`Event`, `DataDone`).
+- `Shared event send`: `Store::get_shared(events) -> Frame::Event`.
+- `Projection tables`: projected read models (`messages`, `users`, `peers`, `channels`).
+- `Transport trust tables`: transport trust rows (`peer_shared`, invite bootstrap records).
+- `Trust policy`: tenant-scoped allow/deny decisions consumed by transport lifecycle.
 
 ## Current Data-Flow Facts
 
