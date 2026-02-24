@@ -23,7 +23,7 @@ use crate::contracts::peering_contract::{
     next_session_id, PeerFingerprint, SessionDirection, SessionHandler, SessionMeta, TenantId,
 };
 use crate::db::{open_connection, schema::create_tables};
-use crate::sync::SyncSessionHandler;
+use crate::sync::{CoordinationManager, SyncSessionHandler};
 
 use crate::transport::identity::{
     expected_invite_bootstrap_spki_from_invite_key, load_transport_cert_required_from_db,
@@ -125,7 +125,10 @@ pub async fn bootstrap_sync_from_invite(
         remote_addr: connection.remote_address(),
         direction: SessionDirection::Outbound,
     };
-    let handler = SyncSessionHandler::initiator(db_path.to_string(), timeout_secs, ingest_tx);
+    let _coordination_manager = CoordinationManager::new();
+    let coordination = _coordination_manager.register_peer();
+    let handler =
+        SyncSessionHandler::outbound(db_path.to_string(), timeout_secs, coordination, ingest_tx);
     let io = QuicTransportSessionIo::new(session_id, conn);
     handler
         .on_session(meta, Box::new(io), CancellationToken::new())

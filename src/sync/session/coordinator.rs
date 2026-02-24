@@ -113,10 +113,9 @@ impl CoordinationManager {
         let idx = self.next_idx.fetch_add(1, Ordering::Relaxed);
         let (report_tx, report_rx) = std::sync::mpsc::channel();
         let (assign_tx, assign_rx) = std::sync::mpsc::channel();
-        // Best-effort: if coordinator thread is gone, the PeerCoord's
-        // report_tx.send() will fail gracefully and the session falls
-        // back to requesting all need_ids (coordinator disconnect path
-        // in initiator.rs sets coordination_pending = false).
+        // Best-effort registration: if coordinator thread is gone, the
+        // PeerCoord report/assignment channels disconnect and the initiator
+        // session fails explicitly rather than bypassing coordination.
         let _ = self.register_tx.send(PeerRegistration {
             report_rx,
             assign_tx,

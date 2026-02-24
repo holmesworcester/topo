@@ -1,7 +1,7 @@
 //! Sync initiator (client role) with dual-stream transport.
 //!
 //! Drives negentropy reconciliation, pushes events the peer needs, and
-//! optionally coordinates pull work with a multi-source coordinator.
+//! coordinates pull work with a multi-source coordinator.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -42,9 +42,8 @@ use super::{CONTROL_POLL_TIMEOUT, DATA_DRAIN_TIMEOUT, EGRESS_SENT_TTL_MS, NEGENT
 /// Data stream: Event blobs
 ///
 /// Push (have_ids): always sends everything the peer needs.
-/// Pull (need_ids): when `coordination` is set, buffers need_ids and sends
-/// them to the coordinator for load-balanced assignment across peers.
-/// When coordination is None, requests all need_ids directly.
+/// Pull (need_ids): buffers need_ids and sends them to the coordinator for
+/// load-balanced assignment across peers.
 ///
 /// Callers must provide a `shared_ingest` sender connected to a shared
 /// batch_writer. The session never spawns its own writer thread.
@@ -54,7 +53,7 @@ pub async fn run_sync_initiator<C, S, R>(
     timeout_secs: u64,
     peer_id: &str,
     recorded_by: &str,
-    coordination: Option<&PeerCoord>,
+    coordination: &PeerCoord,
     shared_ingest: mpsc::Sender<IngestItem>,
 ) -> Result<SyncStats, Box<dyn std::error::Error + Send + Sync>>
 where
@@ -127,7 +126,7 @@ where
 
     // Coordination state: buffer need_ids during reconciliation, send to coordinator after
     let mut coordinated_need_ids: Vec<EventId> = Vec::new();
-    let mut coordination_pending = coordination.is_some();
+    let mut coordination_pending = true;
     let mut coordination_reported = false;
 
     loop {
@@ -151,14 +150,7 @@ where
                 }
 
                 append_have_ids_to_pending(&mut have_ids, &mut pending_have);
-                dispatch_need_ids_after_reconcile(
-                    &mut control,
-                    &wanted,
-                    &mut need_ids,
-                    coordination.is_some(),
-                    &mut coordinated_need_ids,
-                )
-                .await?;
+                dispatch_need_ids_after_reconcile(&mut need_ids, &mut coordinated_need_ids);
             }
             Ok(Ok(Frame::DoneAck)) => {
                 info!("Received DoneAck from responder");
@@ -183,25 +175,27 @@ where
             reconciliation_done,
             &mut coordination_reported,
             &mut coordinated_need_ids,
-        );
+        )?;
         match maybe_take_coordination_assignment(
             coordination,
             coordination_pending,
             coordination_reported,
         ) {
             CoordinationAssignment::Assigned(assigned) => {
-                if let Some(coord) = coordination {
-                    info!(
-                        "Received {} assigned events from coordinator (peer {})",
-                        assigned.len(),
-                        coord.peer_idx
-                    );
-                }
+                info!(
+                    "Received {} assigned events from coordinator (peer {})",
+                    assigned.len(),
+                    coordination.peer_idx
+                );
                 dispatch_assigned_need_ids(&mut control, &wanted, assigned).await;
                 coordination_pending = false;
             }
             CoordinationAssignment::Disconnected => {
-                coordination_pending = false;
+                return Err(format!(
+                    "Coordinator assignment channel disconnected for peer {}",
+                    coordination.peer_idx
+                )
+                .into());
             }
             CoordinationAssignment::Pending | CoordinationAssignment::NotReady => {}
         }

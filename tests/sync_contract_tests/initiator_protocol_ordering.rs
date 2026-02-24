@@ -85,8 +85,12 @@ async fn drive_empty_responder(peer: &mut FakePeerSide) {
 async fn initiator_outbound_sends_markers_then_negopen_then_done_sequence() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
-        let handler =
-            SyncSessionHandler::initiator(db_path, 30, noop_ingest_tx());
+        let handler = SyncSessionHandler::outbound(
+            db_path,
+            30,
+            topo::sync::CoordinationManager::new().register_peer(),
+            noop_ingest_tx(),
+        );
         let meta = test_session_meta(SessionDirection::Outbound);
         let cancel = CancellationToken::new();
 
@@ -119,8 +123,12 @@ async fn initiator_outbound_sends_markers_then_negopen_then_done_sequence() {
 async fn anticheat_markers_precede_negopen() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
-        let handler =
-            SyncSessionHandler::initiator(db_path, 30, noop_ingest_tx());
+        let handler = SyncSessionHandler::outbound(
+            db_path,
+            30,
+            topo::sync::CoordinationManager::new().register_peer(),
+            noop_ingest_tx(),
+        );
         let meta = test_session_meta(SessionDirection::Outbound);
         let cancel = CancellationToken::new();
 
@@ -157,8 +165,12 @@ async fn anticheat_markers_precede_negopen() {
 async fn anticheat_datadone_before_done() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
-        let handler =
-            SyncSessionHandler::initiator(db_path, 30, noop_ingest_tx());
+        let handler = SyncSessionHandler::outbound(
+            db_path,
+            30,
+            topo::sync::CoordinationManager::new().register_peer(),
+            noop_ingest_tx(),
+        );
         let meta = test_session_meta(SessionDirection::Outbound);
         let cancel = CancellationToken::new();
 
@@ -227,8 +239,12 @@ async fn anticheat_datadone_before_done() {
 async fn initiator_rejects_inbound_direction() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
-        let handler =
-            SyncSessionHandler::initiator(db_path, 30, noop_ingest_tx());
+        let handler = SyncSessionHandler::outbound(
+            db_path,
+            30,
+            topo::sync::CoordinationManager::new().register_peer(),
+            noop_ingest_tx(),
+        );
         let meta = test_session_meta(SessionDirection::Inbound);
         let cancel = CancellationToken::new();
 

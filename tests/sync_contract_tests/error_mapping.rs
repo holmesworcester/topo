@@ -63,8 +63,12 @@ async fn control_channel_half_close_terminates_handler() {
 async fn abrupt_close_surfaces_connection_lost() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
-        let handler =
-            SyncSessionHandler::initiator(db_path, 30, noop_ingest_tx());
+        let handler = SyncSessionHandler::outbound(
+            db_path,
+            30,
+            topo::sync::CoordinationManager::new().register_peer(),
+            noop_ingest_tx(),
+        );
         let meta = test_session_meta(SessionDirection::Outbound);
         let cancel = CancellationToken::new();
 

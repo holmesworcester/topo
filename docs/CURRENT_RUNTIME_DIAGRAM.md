@@ -195,6 +195,6 @@ flowchart TD
 5. QUIC dial/accept + peer identity extraction are transport-owned in `connection_lifecycle`.
 6. QUIC stream wiring (`open_bi`/`accept_bi`, `DualConnection`, `QuicTransportSessionIo`) is transport-owned in `session_factory`.
 7. Projection outputs both user-facing read tables and transport trust tables; trust rows feed both handshake allow/deny and bootstrap autodial.
-8. `HaveList` IDs originate from sync reconciliation `need_ids`; in current runtime they are coordinator-assigned subsets by default (autodial + mDNS), then land in `egress_queue`.
+8. `HaveList` IDs originate from sync reconciliation `need_ids`; runtime initiator sessions use coordinator-assigned subsets (autodial + mDNS), then land in `egress_queue`.
 9. Foreground runtime is daemon-first (`topo start`): shutdown is coordinated by shared `shutdown_notify` (RPC `Shutdown` or Ctrl-C).
-10. Non-coordinated `need_ids -> HaveList(all)` behavior still exists in legacy helper/test paths (`download_from_sources` / direct `connect_loop`) and is no longer the primary runtime shape.
+10. Runtime and helper initiator sessions both route pull assignment through the coordinator; there is no direct `need_ids -> HaveList(all)` bypass path.

@@ -152,7 +152,7 @@ async fn connect_loop_inner(
             crate::transport::multi_workspace::workspace_sni(&ws_id)
         }
     };
-    let initiator_handler = SyncSessionHandler::initiator_with_coordination(
+    let initiator_handler = SyncSessionHandler::outbound(
         db_path.to_string(),
         SYNC_SESSION_TIMEOUT_SECS,
         coordination,

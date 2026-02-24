@@ -11,12 +11,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::contracts::event_pipeline_contract::IngestItem;
 use crate::contracts::peering_contract::{
-    ControlIo, DataRecvIo, DataSendIo, SessionDirection, SessionHandler, TransportSessionIo,
-    TransportSessionIoError, SessionMeta,
+    ControlIo, DataRecvIo, DataSendIo, SessionDirection, SessionHandler, SessionMeta,
+    TransportSessionIo, TransportSessionIoError,
 };
-use crate::sync::session::{run_sync_initiator, run_sync_responder, PeerCoord};
 use crate::protocol::Frame;
 use crate::protocol::{encode_frame, parse_frame};
+use crate::sync::session::{run_sync_initiator, run_sync_responder, PeerCoord};
 use crate::transport::connection::ConnectionError;
 use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
 
@@ -33,10 +33,7 @@ struct ControlAdapter {
 impl StreamConn for ControlAdapter {
     async fn send(&mut self, msg: &Frame) -> Result<(), ConnectionError> {
         let frame = encode_frame(msg);
-        self.inner
-            .send(&frame)
-            .await
-            .map_err(|e| map_io_error(e))
+        self.inner.send(&frame).await.map_err(|e| map_io_error(e))
     }
 
     async fn flush(&mut self) -> Result<(), ConnectionError> {
@@ -45,8 +42,7 @@ impl StreamConn for ControlAdapter {
 
     async fn recv(&mut self) -> Result<Frame, ConnectionError> {
         let frame = self.inner.recv().await.map_err(|e| map_io_error(e))?;
-        let (msg, _) = parse_frame(&frame)
-            .map_err(|e| ConnectionError::Parse(e))?;
+        let (msg, _) = parse_frame(&frame).map_err(|e| ConnectionError::Parse(e))?;
         Ok(msg)
     }
 }
@@ -59,10 +55,7 @@ struct DataSendAdapter {
 impl StreamSend for DataSendAdapter {
     async fn send(&mut self, msg: &Frame) -> Result<(), ConnectionError> {
         let frame = encode_frame(msg);
-        self.inner
-            .send(&frame)
-            .await
-            .map_err(|e| map_io_error(e))
+        self.inner.send(&frame).await.map_err(|e| map_io_error(e))
     }
 
     async fn flush(&mut self) -> Result<(), ConnectionError> {
@@ -78,8 +71,7 @@ struct DataRecvAdapter {
 impl StreamRecv for DataRecvAdapter {
     async fn recv(&mut self) -> Result<Frame, ConnectionError> {
         let frame = self.inner.recv().await.map_err(|e| map_io_error(e))?;
-        let (msg, _) = parse_frame(&frame)
-            .map_err(|e| ConnectionError::Parse(e))?;
+        let (msg, _) = parse_frame(&frame).map_err(|e| ConnectionError::Parse(e))?;
         Ok(msg)
     }
 }
@@ -98,9 +90,9 @@ fn map_io_error(err: TransportSessionIoError) -> ConnectionError {
 // Session handler
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone)]
 pub enum SessionRole {
-    Initiator,
+    Initiator { coordination: Arc<PeerCoord> },
     Responder,
 }
 
@@ -110,25 +102,10 @@ pub struct SyncSessionHandler {
     timeout_secs: u64,
     role: SessionRole,
     shared_ingest: mpsc::Sender<IngestItem>,
-    coordination: Option<Arc<PeerCoord>>,
 }
 
 impl SyncSessionHandler {
-    pub fn initiator(
-        db_path: String,
-        timeout_secs: u64,
-        shared_ingest: mpsc::Sender<IngestItem>,
-    ) -> Self {
-        Self {
-            db_path,
-            timeout_secs,
-            role: SessionRole::Initiator,
-            shared_ingest,
-            coordination: None,
-        }
-    }
-
-    pub fn initiator_with_coordination(
+    pub fn outbound(
         db_path: String,
         timeout_secs: u64,
         coordination: Arc<PeerCoord>,
@@ -137,9 +114,8 @@ impl SyncSessionHandler {
         Self {
             db_path,
             timeout_secs,
-            role: SessionRole::Initiator,
+            role: SessionRole::Initiator { coordination },
             shared_ingest,
-            coordination: Some(coordination),
         }
     }
 
@@ -153,7 +129,6 @@ impl SyncSessionHandler {
             timeout_secs,
             role: SessionRole::Responder,
             shared_ingest,
-            coordination: None,
         }
     }
 }
@@ -213,15 +188,15 @@ impl SessionHandler for SyncSessionHandler {
                 .map_err(|e| format!("failed to flush data marker: {e}"))?;
         }
 
-        match (self.role, meta.direction) {
-            (SessionRole::Initiator, SessionDirection::Outbound) => {
+        match (&self.role, meta.direction) {
+            (SessionRole::Initiator { coordination }, SessionDirection::Outbound) => {
                 let run = run_sync_initiator(
                     conn,
                     &self.db_path,
                     self.timeout_secs,
                     &peer_id,
                     &tenant_id,
-                    self.coordination.as_deref(),
+                    coordination.as_ref(),
                     self.shared_ingest.clone(),
                 );
                 tokio::pin!(run);
@@ -249,7 +224,7 @@ impl SessionHandler for SyncSessionHandler {
                         .map_err(|e| format!("responder sync failed: {e}")),
                 }
             }
-            (SessionRole::Initiator, SessionDirection::Inbound) => {
+            (SessionRole::Initiator { .. }, SessionDirection::Inbound) => {
                 Err("initiator handler cannot run inbound sessions".to_string())
             }
             (SessionRole::Responder, SessionDirection::Outbound) => {

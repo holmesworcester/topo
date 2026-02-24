@@ -47,84 +47,57 @@ pub fn append_have_ids_to_pending(have_ids: &mut Vec<Id>, pending_have: &mut Vec
     }
 }
 
-pub async fn dispatch_need_ids_after_reconcile<C>(
-    control: &mut C,
-    wanted: &WantedEvents<'_>,
+pub fn dispatch_need_ids_after_reconcile(
     need_ids: &mut Vec<Id>,
-    coordination_enabled: bool,
     coordinated_need_ids: &mut Vec<EventId>,
-) -> Result<(), SyncError>
-where
-    C: StreamConn,
-{
+) {
     if need_ids.is_empty() {
-        return Ok(());
+        return;
     }
-
-    if coordination_enabled {
-        for neg_id in need_ids.drain(..) {
-            coordinated_need_ids.push(neg_id_to_event_id(&neg_id));
-        }
-        return Ok(());
-    }
-
-    let mut batch: Vec<EventId> = Vec::with_capacity(NEED_CHUNK);
+    coordinated_need_ids.reserve(need_ids.len());
     for neg_id in need_ids.drain(..) {
-        let event_id = neg_id_to_event_id(&neg_id);
-        if wanted.insert(&event_id).unwrap_or(false) {
-            batch.push(event_id);
-        }
-        if batch.len() >= NEED_CHUNK {
-            control.send(&Frame::HaveList { ids: batch }).await?;
-            control.flush().await?;
-            batch = Vec::with_capacity(NEED_CHUNK);
-        }
+        coordinated_need_ids.push(neg_id_to_event_id(&neg_id));
     }
-    if !batch.is_empty() {
-        control.send(&Frame::HaveList { ids: batch }).await?;
-        control.flush().await?;
-    }
-
-    Ok(())
 }
 
 pub fn maybe_report_coordination_need_ids(
-    coordination: Option<&PeerCoord>,
+    coordination: &PeerCoord,
     reconciliation_done: bool,
     coordination_reported: &mut bool,
     coordinated_need_ids: &mut Vec<EventId>,
-) {
-    let Some(coord) = coordination else {
-        return;
-    };
+) -> Result<(), SyncError> {
     if !reconciliation_done || *coordination_reported {
-        return;
+        return Ok(());
     }
 
     let report = std::mem::take(coordinated_need_ids);
     info!(
         "Reporting {} need_ids to coordinator (peer {})",
         report.len(),
-        coord.peer_idx
+        coordination.peer_idx
     );
-    let _ = coord.report_tx.send(report);
-    let _ = coord.wake_tx.send(());
+    coordination
+        .report_tx
+        .send(report)
+        .map_err(|_| "coordinator report channel disconnected".to_string())?;
+    coordination
+        .wake_tx
+        .send(())
+        .map_err(|_| "coordinator wake channel disconnected".to_string())?;
     *coordination_reported = true;
+    Ok(())
 }
 
 pub fn maybe_take_coordination_assignment(
-    coordination: Option<&PeerCoord>,
+    coordination: &PeerCoord,
     coordination_pending: bool,
     coordination_reported: bool,
 ) -> CoordinationAssignment {
-    let Some(coord) = coordination else {
-        return CoordinationAssignment::NotReady;
-    };
     if !coordination_pending || !coordination_reported {
         return CoordinationAssignment::NotReady;
     }
 
-    let assign_result = match coord.assign_rx.lock() {
+    let assign_result = match coordination.assign_rx.lock() {
         Ok(rx) => rx.try_recv(),
         Err(_) => Err(std::sync::mpsc::TryRecvError::Disconnected),
     };

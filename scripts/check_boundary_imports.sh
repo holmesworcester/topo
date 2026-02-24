@@ -45,6 +45,26 @@ check_only_allowed() {
   fi
 }
 
+check_no_match_text() {
+  local pattern="$1"
+  shift
+  if rg -n "$pattern" "$@" 2>/dev/null >/dev/null 2>&1; then
+    rg -n "$pattern" "$@" 2>/dev/null
+    echo "BOUNDARY VIOLATION: pattern '$pattern' matched in $*" >&2
+    FAIL=1
+  fi
+}
+
+check_no_match_multiline() {
+  local pattern="$1"
+  shift
+  if rg -n -U "$pattern" "$@" 2>/dev/null >/dev/null 2>&1; then
+    rg -n -U "$pattern" "$@" 2>/dev/null
+    echo "BOUNDARY VIOLATION: multiline pattern '$pattern' matched in $*" >&2
+    FAIL=1
+  fi
+}
+
 echo "=== Forbidden edges ==="
 
 # -- peering must not reach into internals --
@@ -161,6 +181,15 @@ check_no_match 'endpoint\.connect\(' src/peering/loops/
 check_no_match 'endpoint\.accept\(' src/peering/loops/
 check_no_match 'endpoint\.connect_with\(' src/peering/workflows/
 check_no_match 'endpoint\.connect\(' src/peering/workflows/
+
+# -- coordinated-download-only initiator enforcement --
+check_no_match 'coordination:\s*Option<(&|Arc<)PeerCoord' src/
+check_no_match 'SyncSessionHandler::initiator\(' src/
+check_no_match 'SyncSessionHandler::initiator\(' tests/
+check_no_match_multiline 'run_sync_initiator\([\s\S]{0,240}None' src tests
+check_no_match 'coordination_enabled' src/sync/session/
+check_no_match_text 'non-coordinated|legacy helper/test path' \
+  docs/CURRENT_RUNTIME_DIAGRAM.md docs/DESIGN.md docs/PLAN.md
 
 echo "=== Positive contract checks ==="
 

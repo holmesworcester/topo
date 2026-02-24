@@ -19,8 +19,12 @@ use crate::fake_session_io::{
 async fn pre_cancelled_session_returns_error() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
-        let handler =
-            SyncSessionHandler::initiator(db_path, 30, noop_ingest_tx());
+        let handler = SyncSessionHandler::outbound(
+            db_path,
+            30,
+            topo::sync::CoordinationManager::new().register_peer(),
+            noop_ingest_tx(),
+        );
         let meta = test_session_meta(SessionDirection::Outbound);
         let cancel = CancellationToken::new();
         cancel.cancel(); // pre-cancel
@@ -48,8 +52,12 @@ async fn pre_cancelled_session_returns_error() {
 async fn mid_session_cancellation_terminates_handler() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
-        let handler =
-            SyncSessionHandler::initiator(db_path, 30, noop_ingest_tx());
+        let handler = SyncSessionHandler::outbound(
+            db_path,
+            30,
+            topo::sync::CoordinationManager::new().register_peer(),
+            noop_ingest_tx(),
+        );
         let meta = test_session_meta(SessionDirection::Outbound);
         let cancel = CancellationToken::new();
 

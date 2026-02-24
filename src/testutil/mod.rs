@@ -2163,6 +2163,8 @@ pub async fn connect_sync_once(
     let writer_handle = std::thread::spawn(move || {
         crate::event_pipeline::batch_writer(writer_db, ingest_rx, writer_events);
     });
+    let _coordination_manager = crate::sync::CoordinationManager::new();
+    let coordination = _coordination_manager.register_peer();
 
     let stats = run_sync_initiator(
         conn,
@@ -2170,7 +2172,7 @@ pub async fn connect_sync_once(
         SYNC_SESSION_TIMEOUT_SECS,
         &peer_id,
         identity,
-        None,
+        coordination.as_ref(),
         ingest_tx,
     )
     .await?;
