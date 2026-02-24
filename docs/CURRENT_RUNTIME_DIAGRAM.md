@@ -189,65 +189,7 @@ flowchart TD
     TRUST --> LIFE
 ```
 
-## 5) Draft: Prior Variant (Historical, Pre-Default Coordination)
-
-```mermaid
-flowchart TD
-    LOCAL["Local create events"] --> INGEST["shared ingest + batch_writer"]
-
-    subgraph NET["Transport + Session"]
-      QEP["QUIC endpoint"] --> LIFE["connection_lifecycle"]
-      LIFE --> FACT["session_factory"]
-      FACT --> SESS["sync session"]
-      SESS --> RECV["receiver task"]
-    end
-
-    RECV --> INCOMING["incoming sync events"]
-    INCOMING --> INGEST
-
-    INGEST --> STORE["events + recorded + neg persist"]
-    STORE --> QDB[("SQLite Queues")]
-    QDB --> APPLY["project_one + cascade"]
-    APPLY --> PDB[("SQLite Projections")]
-
-    NEG["negentropy reconcile\n(need_ids)"] --> CTRL["Sync control stream\n(HaveList / need_ids)"]
-    COORD["optional coordinator assignment\n(download mode)"] --> CTRL
-    CTRL --> QDB
-
-    PDB --> TRUST["transport trust decisions"]
-    TRUST --> LIFE
-```
-
-## 6) Draft: Control Inputs Produced By Sync Session (Historical, Pre-Default Coordination)
-
-```mermaid
-flowchart TD
-    LOCAL["Local create events"] --> INGEST["shared ingest + batch_writer"]
-
-    QEP["QUIC endpoint"] --> LIFE["connection_lifecycle"]
-    LIFE --> FACT["session_factory"]
-    FACT --> SESS["sync session"]
-
-    SESS --> RECV["receiver task (data stream)"]
-    RECV --> INCOMING["incoming sync events"]
-    INCOMING --> INGEST
-
-    SESS --> NEG["session reconciliation\n(negentropy have/need sets)"]
-    SESS --> COORD_IN["session gets coordinator assignment\n(optional download mode)"]
-    NEG --> CTRL["Sync control stream\n(HaveList / need_ids)"]
-    COORD_IN --> CTRL
-
-    INGEST --> STORE["events + recorded + neg persist"]
-    STORE --> QDB[("SQLite Queues")]
-    CTRL --> QDB
-    QDB --> APPLY["project_one + cascade"]
-    APPLY --> PDB[("SQLite Projections")]
-
-    PDB --> TRUST["transport trust decisions"]
-    TRUST --> LIFE
-```
-
-## 7) Draft: QUIC Endpoints Loop (Include Other Peers)
+## 5) Draft: QUIC Endpoints Loop (Include Other Peers)
 
 ```mermaid
 flowchart TD
@@ -273,7 +215,7 @@ flowchart TD
     LCOORD -->|"assign need_ids"| P3
 ```
 
-## 8) Draft: Runtime-Coordinated Path + Peer Loop
+## 6) Draft: Runtime-Coordinated Path + Peer Loop
 
 ```mermaid
 flowchart TD
@@ -299,13 +241,13 @@ flowchart TD
     P3 --> LEP
 ```
 
-## 9) Multi-Source Simplification Snapshot (Local `master`)
+## 7) Multi-Source Simplification Snapshot (Local `master`)
 
 1. Runtime outbound sync (bootstrap autodial + mDNS discovery) now uses tenant-scoped `CoordinationManager` plus `connect_loop_with_coordination`.
 2. Sink download benchmarks (`start_sink_download`) were moved onto the same coordinated connect-loop path.
 3. Legacy helpers still exist (`download_from_sources`, `run_coordinator`) for compatibility/testing, so simplification is substantial but not yet a full single-path deletion.
 
-## 10) Draft: Current Control-Plane Truth (Runtime Default Coordination)
+## 8) Draft: Current Control-Plane Truth (Runtime Default Coordination)
 
 ```mermaid
 flowchart TD
