@@ -135,10 +135,10 @@ Status: PASS
 
 File-level proof:
 - Runtime topology diagram shows wrapper -> shared supervisor ownership:
-  - `docs/CURRENT_RUNTIME_DIAGRAM.md:144-154`
-  - `docs/CURRENT_RUNTIME_DIAGRAM.md:168`
+  - `docs/CURRENT_RUNTIME_DIAGRAM.md:171-181`
+  - `docs/CURRENT_RUNTIME_DIAGRAM.md:197`
 - Data-flow facts reflect coordinated runtime initiator behavior:
-  - `docs/CURRENT_RUNTIME_DIAGRAM.md:223-225`
+  - `docs/CURRENT_RUNTIME_DIAGRAM.md:252-254`
 
 ---
 
