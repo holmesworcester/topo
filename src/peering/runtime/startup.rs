@@ -46,9 +46,7 @@ pub(crate) fn setup_endpoint_and_tenants(
     drop(db);
 
     if tenants.is_empty() {
-        return Err(
-            "No local identities found. Bootstrap a workspace or accept an invite first.".into(),
-        );
+        return Err("local tenant set is empty".into());
     }
 
     info!("Discovered {} local tenant(s)", tenants.len());

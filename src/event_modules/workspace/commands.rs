@@ -174,15 +174,39 @@ pub fn create_workspace(
     });
     let psf_eid = create_signed_event_sync(db, recorded_by, &psf, &device_invite_key)?;
 
-    // 7. Emit local_signer_secret events for all three signing keys
-    emit_local_signer_secret(db, recorded_by, &psf_eid, SIGNER_KIND_PEER_SHARED, &peer_shared_key)?;
-    emit_local_signer_secret(db, recorded_by, &ub_eid, SIGNER_KIND_USER, &user_key)?;
-    emit_local_signer_secret(db, recorded_by, &ws_eid, SIGNER_KIND_WORKSPACE, &workspace_key)?;
+    // 7. Emit local_signer_secret events for all three signing keys.
+    // PeerShared signer projection may rotate transport identity and finalize
+    // tenant scope; refresh recorded_by before subsequent local writes.
+    let mut scoped_recorded_by = recorded_by.to_string();
+    emit_local_signer_secret(
+        db,
+        &scoped_recorded_by,
+        &psf_eid,
+        SIGNER_KIND_PEER_SHARED,
+        &peer_shared_key,
+    )?;
+    if let Ok(current_peer_id) = crate::transport::identity::load_transport_peer_id(db) {
+        scoped_recorded_by = current_peer_id;
+    }
+    emit_local_signer_secret(
+        db,
+        &scoped_recorded_by,
+        &ub_eid,
+        SIGNER_KIND_USER,
+        &user_key,
+    )?;
+    emit_local_signer_secret(
+        db,
+        &scoped_recorded_by,
+        &ws_eid,
+        SIGNER_KIND_WORKSPACE,
+        &workspace_key,
+    )?;
 
-    // 8. Seed deterministic local content-key material
+    // 8. Seed deterministic local content-key material.
     let _ = ops::ensure_content_key_for_peer(
         db,
-        recorded_by,
+        &scoped_recorded_by,
         &peer_shared_key,
         &psf_eid,
     )?;
@@ -315,16 +339,20 @@ pub fn persist_join_signer_secrets(
     recorded_by: &str,
     join: &JoinChain,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut scoped_recorded_by = recorded_by.to_string();
     emit_local_signer_secret(
         db,
-        recorded_by,
+        &scoped_recorded_by,
         &join.peer_shared_event_id,
         SIGNER_KIND_PEER_SHARED,
         &join.peer_shared_key,
     )?;
+    if let Ok(current_peer_id) = crate::transport::identity::load_transport_peer_id(db) {
+        scoped_recorded_by = current_peer_id;
+    }
     emit_local_signer_secret(
         db,
-        recorded_by,
+        &scoped_recorded_by,
         &join.user_event_id,
         SIGNER_KIND_USER,
         &join.user_key,

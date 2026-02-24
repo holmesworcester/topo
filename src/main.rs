@@ -1,16 +1,19 @@
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use clap::{CommandFactory, Parser, Subcommand};
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use topo::db::{open_connection, schema::create_tables};
+use topo::db::transport_creds::discover_local_tenants;
 use topo::db_registry::DbRegistry;
 use topo::rpc::client::{rpc_call, RpcClientError};
 use topo::rpc::protocol::RpcMethod;
-use topo::rpc::server::{run_rpc_server, DaemonState};
+use topo::rpc::server::{run_rpc_server, DaemonState, RuntimeState};
 use topo::service;
 
 #[derive(Parser)]
@@ -301,17 +304,102 @@ enum DbAction {
 }
 
 // ---------------------------------------------------------------------------
-// RPC helper: call daemon, fail if not running
+// RPC helpers: auto-start daemon for target DB/socket, then call.
 // ---------------------------------------------------------------------------
+
+fn target_socket_path(db: &str, socket: Option<&str>) -> PathBuf {
+    socket
+        .map(PathBuf::from)
+        .unwrap_or_else(|| service::socket_path_for_db(db))
+}
+
+fn status_matches_target_db(db: &str, data: Option<&serde_json::Value>) -> bool {
+    data.and_then(|v| v.get("daemon_db_path"))
+        .and_then(|v| v.as_str())
+        .map(|running_db| running_db == db)
+        .unwrap_or(true)
+}
+
+fn ensure_daemon_running(
+    db: &str,
+    socket: Option<&str>,
+) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    let sock = target_socket_path(db, socket);
+
+    match rpc_call(&sock, RpcMethod::Status) {
+        Ok(resp) => {
+            if resp.ok && status_matches_target_db(db, resp.data.as_ref()) {
+                return Ok(sock);
+            }
+            if let Some(err) = resp.error {
+                return Err(err.into());
+            }
+            return Err("daemon status probe failed".into());
+        }
+        Err(RpcClientError::DaemonNotRunning(_)) => {}
+        Err(_) => {
+            if sock.exists() {
+                let _ = std::fs::remove_file(&sock);
+            }
+        }
+    }
+
+    let mut cmd = std::process::Command::new(std::env::current_exe()?);
+    cmd.arg("--db").arg(db);
+    if let Some(sock_override) = socket {
+        cmd.arg("--socket").arg(sock_override);
+    }
+    cmd.arg("start")
+        .arg("--bind")
+        .arg("127.0.0.1:0")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let child = cmd.spawn()?;
+    let _pid = child.id();
+    drop(child);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut last_error = String::from("daemon did not become ready");
+    while Instant::now() < deadline {
+        match rpc_call(&sock, RpcMethod::Status) {
+            Ok(resp) => {
+                if resp.ok && status_matches_target_db(db, resp.data.as_ref()) {
+                    return Ok(sock);
+                }
+                if !status_matches_target_db(db, resp.data.as_ref()) {
+                    return Err(format!(
+                        "daemon socket {} is bound to a different db",
+                        sock.display()
+                    )
+                    .into());
+                }
+                last_error = resp.error.unwrap_or_else(|| "status probe failed".to_string());
+            }
+            Err(RpcClientError::DaemonNotRunning(_)) => {
+                last_error = "daemon not running yet".to_string();
+            }
+            Err(e) => {
+                last_error = e.to_string();
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    Err(format!(
+        "failed to auto-start daemon for {} via {}: {}",
+        db,
+        sock.display(),
+        last_error
+    )
+    .into())
+}
 
 fn rpc_require_daemon(
     db: &str,
     socket: Option<&str>,
     method: RpcMethod,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
-    let sock = socket
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| service::socket_path_for_db(db));
+    let sock = ensure_daemon_running(db, socket)?;
 
     match rpc_call(&sock, method) {
         Ok(resp) => {
@@ -323,7 +411,12 @@ fn rpc_require_daemon(
             Ok(resp.data.unwrap_or(serde_json::Value::Null))
         }
         Err(RpcClientError::DaemonNotRunning(_)) => {
-            Err("daemon not running — start with `topo start`".into())
+            Err(format!(
+                "daemon failed to start for {} (socket: {})",
+                db,
+                sock.display()
+            )
+            .into())
         }
         Err(e) => Err(e.to_string().into()),
     }
@@ -345,6 +438,192 @@ fn resolve_db_arg(raw: &str) -> Result<String, String> {
     }
     // For non-numeric selectors, resolve returns passthrough on miss, so this is fine.
     Ok(registry.resolve(raw).unwrap_or_else(|_| raw.to_string()))
+}
+
+struct ManagedRuntime {
+    tenants: Vec<String>,
+    shutdown_notify: Arc<tokio::sync::Notify>,
+    handle: tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
+}
+
+fn discover_tenant_peer_ids(
+    db_path: &str,
+) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let conn = open_connection(db_path)?;
+    create_tables(&conn)?;
+    let mut peers = discover_local_tenants(&conn)?
+        .into_iter()
+        .map(|t| t.peer_id)
+        .collect::<Vec<_>>();
+    peers.sort();
+    peers.dedup();
+    Ok(peers)
+}
+
+fn reconcile_single_tenant_identity_transition(
+    db_path: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let conn = open_connection(db_path)?;
+    create_tables(&conn)?;
+
+    let local_peers = topo::db::transport_creds::list_local_peers(&conn)?;
+    if local_peers.len() != 1 {
+        return Ok(());
+    }
+    let current = &local_peers[0];
+
+    let mut stmt = conn.prepare(
+        "SELECT peer_id FROM trust_anchors WHERE peer_id <> ?1
+         UNION
+         SELECT peer_id FROM recorded_events WHERE peer_id <> ?1
+         UNION
+         SELECT peer_id FROM valid_events WHERE peer_id <> ?1
+         UNION
+         SELECT peer_id FROM blocked_events WHERE peer_id <> ?1",
+    )?;
+    let stale_peer_ids = stmt
+        .query_map(rusqlite::params![current], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(stmt);
+
+    for stale in stale_peer_ids {
+        topo::db::finalize_identity(&conn, &stale, current)?;
+    }
+    Ok(())
+}
+
+async fn stop_runtime(runtime: ManagedRuntime) {
+    runtime.shutdown_notify.notify_one();
+    match tokio::time::timeout(Duration::from_secs(5), runtime.handle).await {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(e))) => tracing::warn!("runtime exited with error during stop: {}", e),
+        Ok(Err(e)) => tracing::warn!("runtime task join error during stop: {}", e),
+        Err(_) => tracing::warn!("timed out waiting for runtime to stop"),
+    }
+}
+
+fn spawn_runtime(
+    db_path: &str,
+    bind: SocketAddr,
+    state: Arc<DaemonState>,
+    tenants: Vec<String>,
+) -> ManagedRuntime {
+    *state.runtime_state.write().unwrap() = RuntimeState::Active;
+    *state.runtime_net.write().unwrap() = None;
+
+    let runtime_shutdown = Arc::new(tokio::sync::Notify::new());
+    let runtime_shutdown_for_task = runtime_shutdown.clone();
+    let db_for_task = db_path.to_string();
+
+    let (net_tx, net_rx) = tokio::sync::oneshot::channel::<topo::node::NodeRuntimeNetInfo>();
+    let state_for_net = state.clone();
+    tokio::spawn(async move {
+        if let Ok(info) = net_rx.await {
+            println!("listen: {}", info.listen_addr);
+            *state_for_net.runtime_net.write().unwrap() = Some(info);
+        }
+    });
+
+    let handle = tokio::spawn(async move {
+        topo::node::run_node(&db_for_task, bind, net_tx, runtime_shutdown_for_task).await
+    });
+
+    ManagedRuntime {
+        tenants,
+        shutdown_notify: runtime_shutdown,
+        handle,
+    }
+}
+
+async fn reevaluate_runtime(
+    db_path: &str,
+    bind: SocketAddr,
+    state: Arc<DaemonState>,
+    active_runtime: &mut Option<ManagedRuntime>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if let Err(e) = reconcile_single_tenant_identity_transition(db_path) {
+        tracing::warn!(
+            "identity transition reconciliation failed for {}: {}",
+            db_path,
+            e
+        );
+    }
+
+    if active_runtime
+        .as_ref()
+        .map(|runtime| runtime.handle.is_finished())
+        .unwrap_or(false)
+    {
+        let finished = active_runtime.take().unwrap();
+        match finished.handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!("runtime exited unexpectedly: {}", e),
+            Err(e) => tracing::warn!("runtime task join error: {}", e),
+        }
+        *state.runtime_net.write().unwrap() = None;
+    }
+
+    let tenants = discover_tenant_peer_ids(db_path)?;
+
+    if tenants.is_empty() {
+        if let Some(runtime) = active_runtime.take() {
+            stop_runtime(runtime).await;
+        }
+        *state.runtime_state.write().unwrap() = RuntimeState::IdleNoTenants;
+        *state.runtime_net.write().unwrap() = None;
+        return Ok(());
+    }
+
+    let restart_needed = match active_runtime.as_ref() {
+        Some(runtime) => runtime.tenants != tenants,
+        None => true,
+    };
+    if restart_needed {
+        if let Some(runtime) = active_runtime.take() {
+            stop_runtime(runtime).await;
+        }
+        tracing::info!("activating peering runtime ({} tenant(s))", tenants.len());
+        *active_runtime = Some(spawn_runtime(db_path, bind, state, tenants));
+    }
+
+    Ok(())
+}
+
+async fn run_runtime_manager(
+    db_path: &str,
+    bind: SocketAddr,
+    state: Arc<DaemonState>,
+    shutdown_flag: Arc<AtomicBool>,
+    daemon_shutdown: Arc<tokio::sync::Notify>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut active_runtime: Option<ManagedRuntime> = None;
+    let mut interval = tokio::time::interval(Duration::from_millis(500));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    reevaluate_runtime(db_path, bind, state.clone(), &mut active_runtime).await?;
+
+    loop {
+        if shutdown_flag.load(Ordering::Relaxed) {
+            if let Some(runtime) = active_runtime.take() {
+                stop_runtime(runtime).await;
+            }
+            return Ok(());
+        }
+        tokio::select! {
+            _ = daemon_shutdown.notified() => {
+                if let Some(runtime) = active_runtime.take() {
+                    stop_runtime(runtime).await;
+                }
+                return Ok(());
+            }
+            _ = state.runtime_recheck.notified() => {
+                reevaluate_runtime(db_path, bind, state.clone(), &mut active_runtime).await?;
+            }
+            _ = interval.tick() => {
+                reevaluate_runtime(db_path, bind, state.clone(), &mut active_runtime).await?;
+            }
+        }
+    }
 }
 
 #[tokio::main]
@@ -411,24 +690,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
             });
 
-            // Oneshot to receive runtime net info (listen addr) from node.
-            let (net_tx, net_rx) =
-                tokio::sync::oneshot::channel::<topo::node::NodeRuntimeNetInfo>();
-
             info!(
                 "🐭 Topo daemon started (db={}, socket={})",
                 db,
                 socket_path.display()
             );
-
-            // Spawn a task that waits for runtime net info and populates DaemonState.
-            let state_for_net = state.clone();
-            tokio::spawn(async move {
-                if let Ok(info) = net_rx.await {
-                    println!("listen: {}", info.listen_addr);
-                    *state_for_net.runtime_net.write().unwrap() = Some(info);
-                }
-            });
 
             // Foreground Ctrl-C uses the same daemon shutdown path as RPC Shutdown.
             let ctrlc_notify = shutdown_notify.clone();
@@ -439,17 +705,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
             });
 
-            let node_result = topo::node::run_node(db, bind, net_tx, shutdown_notify.clone()).await;
+            // Runtime manager keeps control daemon alive with explicit lifecycle:
+            // IdleNoTenants <-> Active.
+            let manager_state = state.clone();
+            let manager_shutdown = shutdown_notify.clone();
+            let manager_shutdown_flag = shutdown.clone();
+            let manager_db = db.to_string();
+            let runtime_manager = tokio::spawn(async move {
+                if let Err(e) =
+                    run_runtime_manager(&manager_db, bind, manager_state, manager_shutdown_flag, manager_shutdown).await
+                {
+                    tracing::error!("runtime manager error: {}", e);
+                }
+            });
+
+            // Wait until shutdown is requested by RPC stop or Ctrl-C.
+            shutdown_notify.notified().await;
 
             // Signal RPC server to stop
             shutdown.store(true, Ordering::Relaxed);
             shutdown_notify.notify_waiters();
+            let _ = runtime_manager.await;
             let _ = rpc_handle.join();
 
             // Clean up socket file
             let _ = std::fs::remove_file(&socket_path);
 
-            node_result?;
             info!("🐭 Topo daemon shut down cleanly");
         }
 
@@ -458,28 +739,74 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .as_ref()
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| service::socket_path_for_db(db));
+            let request_deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match rpc_call(&socket_path, RpcMethod::Shutdown) {
+                    Ok(_) => {
+                        break;
+                    }
+                    Err(RpcClientError::DaemonNotRunning(_)) if !socket_path.exists() => {
+                        println!("no daemon running for {}", db);
+                        return Ok(());
+                    }
+                    Err(RpcClientError::DaemonNotRunning(_)) => {}
+                    Err(RpcClientError::Protocol(msg))
+                        if msg.contains("Connection reset by peer")
+                            || msg.contains("Broken pipe") =>
+                    {}
+                    Err(RpcClientError::Io(e))
+                        if e.kind() == std::io::ErrorKind::ConnectionReset
+                            || e.kind() == std::io::ErrorKind::ConnectionRefused
+                            || e.kind() == std::io::ErrorKind::BrokenPipe =>
+                    {}
+                    Err(e) => {
+                        eprintln!("error stopping daemon: {}", e);
+                        std::process::exit(1);
+                    }
+                }
 
-            match rpc_call(&socket_path, RpcMethod::Shutdown) {
-                Ok(_) => {
-                    println!("daemon stopped");
-                }
-                Err(RpcClientError::DaemonNotRunning(_)) => {
-                    println!("no daemon running for {}", db);
-                }
-                Err(e) => {
-                    eprintln!("error stopping daemon: {}", e);
+                if Instant::now() >= request_deadline {
+                    eprintln!(
+                        "error stopping daemon: timed out sending shutdown to {}",
+                        socket_path.display()
+                    );
                     std::process::exit(1);
                 }
+                std::thread::sleep(Duration::from_millis(100));
             }
+
+            let down_deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < down_deadline {
+                match rpc_call(&socket_path, RpcMethod::Status) {
+                    Err(RpcClientError::DaemonNotRunning(_)) if !socket_path.exists() => {
+                        println!("daemon stopped");
+                        return Ok(());
+                    }
+                    _ => std::thread::sleep(Duration::from_millis(100)),
+                }
+            }
+            eprintln!(
+                "error stopping daemon: timed out waiting for daemon exit ({})",
+                socket_path.display()
+            );
+            std::process::exit(1);
         }
 
-        // ---------------------------------------------------------------
-        // Direct-only commands (no daemon needed)
-        // ---------------------------------------------------------------
         Commands::CreateWorkspace { workspace_name, username, device_name } => {
-            let result = topo::event_modules::workspace::commands::create_workspace_for_db(db, &workspace_name, &username, &device_name)?;
-            println!("peer_id:      {}", result.peer_id);
-            println!("workspace_id: {}", result.workspace_id);
+            let data = rpc_require_daemon(
+                db,
+                socket_override.as_deref(),
+                RpcMethod::CreateWorkspace {
+                    workspace_name,
+                    username,
+                    device_name,
+                },
+            )?;
+            println!("peer_id:      {}", data["peer_id"].as_str().unwrap_or(""));
+            println!(
+                "workspace_id: {}",
+                data["workspace_id"].as_str().unwrap_or("")
+            );
         }
 
         Commands::AcceptInvite {
@@ -487,11 +814,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             username,
             devicename,
         } => {
-            let result = topo::event_modules::workspace::commands::accept_invite(db, &invite, &username, &devicename)?;
+            let data = rpc_require_daemon(
+                db,
+                socket_override.as_deref(),
+                RpcMethod::AcceptInvite {
+                    invite,
+                    username,
+                    devicename,
+                },
+            )?;
             println!("Accepted invite");
-            println!("  peer_id: {}", result.peer_id);
-            println!("  user:    {}", result.user_event_id);
-            println!("  peer:    {}", result.peer_shared_event_id);
+            println!("  peer_id: {}", data["peer_id"].as_str().unwrap_or(""));
+            println!("  user:    {}", data["user_event_id"].as_str().unwrap_or(""));
+            println!(
+                "  peer:    {}",
+                data["peer_shared_event_id"].as_str().unwrap_or("")
+            );
         }
 
         // ---------------------------------------------------------------
@@ -591,6 +929,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             println!("  Reactions: {} projected", data["reactions_count"]);
             println!("  Recorded:  {} events", data["recorded_events_count"]);
             println!("  NegItems:  {} indexed", data["neg_items_count"]);
+            println!(
+                "  Runtime:   {}",
+                data["runtime_state"].as_str().unwrap_or("unknown")
+            );
             // Runtime networking info.
             if let Some(rt) = data.get("runtime") {
                 println!(
@@ -631,6 +973,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 } else {
                     println!("  UPnP:      not attempted (run `topo upnp` to try)");
                 }
+            }
+            if data.get("runtime").is_none() {
+                let state = data["runtime_state"].as_str().unwrap_or("");
+                if state == "IdleNoTenants" {
+                    println!("  Listen:    (idle; no tenants)");
+                } else {
+                    println!("  Listen:    (starting)");
+                }
+                println!("  UPnP:      not attempted");
             }
         }
 

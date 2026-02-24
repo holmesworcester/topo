@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, RwLock};
 
 use serde::Serialize;
+use tokio::sync::Notify;
 use tracing::{info, warn};
 
 use crate::db::transport_creds::discover_local_tenants;
@@ -41,9 +42,13 @@ pub struct ChannelAlias {
 pub struct DaemonState {
     pub db_path: String,
     pub active_peer: RwLock<Option<String>>,
+    /// Runtime lifecycle state.
+    pub runtime_state: RwLock<RuntimeState>,
     /// Runtime networking info (listen addr, UPnP result). Set once the
     /// QUIC endpoint is bound; UPnP result is populated by `topo upnp`.
     pub runtime_net: RwLock<Option<NodeRuntimeNetInfo>>,
+    /// Wake-up trigger for runtime state reevaluation after tenant-changing commands.
+    pub runtime_recheck: Notify,
     /// Invite/link strings stored by number (index+1 = invite ref number).
     pub invite_refs: RwLock<Vec<String>>,
     /// Channel aliases per peer_id.
@@ -52,49 +57,91 @@ pub struct DaemonState {
     pub active_channel: RwLock<HashMap<String, [u8; 32]>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeState {
+    IdleNoTenants,
+    Active,
+}
+
+impl RuntimeState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RuntimeState::IdleNoTenants => "IdleNoTenants",
+            RuntimeState::Active => "Active",
+        }
+    }
+}
+
 impl DaemonState {
     /// Create state with auto-selected peer if exactly one tenant exists.
     /// Seeds the default "general" channel.
     pub fn new(db_path: &str) -> Self {
-        let active = match crate::db::open_connection(db_path) {
+        let (active, runtime_state) = match crate::db::open_connection(db_path) {
             Ok(conn) => {
                 let _ = crate::db::schema::create_tables(&conn);
                 match discover_local_tenants(&conn) {
-                    Ok(tenants) if tenants.len() == 1 => Some(tenants[0].peer_id.clone()),
-                    _ => None,
+                    Ok(tenants) if tenants.is_empty() => (None, RuntimeState::IdleNoTenants),
+                    Ok(tenants) if tenants.len() == 1 => {
+                        (Some(tenants[0].peer_id.clone()), RuntimeState::Active)
+                    }
+                    Ok(_) => (None, RuntimeState::Active),
+                    Err(_) => (None, RuntimeState::IdleNoTenants),
                 }
             }
-            Err(_) => None,
+            Err(_) => (None, RuntimeState::IdleNoTenants),
         };
         DaemonState {
             db_path: db_path.to_string(),
             active_peer: RwLock::new(active),
+            runtime_state: RwLock::new(runtime_state),
             runtime_net: RwLock::new(None),
+            runtime_recheck: Notify::new(),
             invite_refs: RwLock::new(Vec::new()),
             channel_aliases: RwLock::new(HashMap::new()),
             active_channel: RwLock::new(HashMap::new()),
         }
     }
 
+    pub fn notify_runtime_recheck(&self) {
+        self.runtime_recheck.notify_waiters();
+    }
+
     fn require_active_peer(&self) -> Result<String, String> {
         let cached = self.active_peer.read().unwrap().clone();
-        match cached {
-            Some(ref peer_id) => Ok(peer_id.clone()),
-            None => {
-                // Try auto-discovery (daemon may have started before workspace was created)
-                if let Ok(conn) = crate::db::open_connection(&self.db_path) {
-                    let _ = crate::db::schema::create_tables(&conn);
-                    if let Ok(tenants) = discover_local_tenants(&conn) {
-                        if tenants.len() == 1 {
-                            let peer_id = tenants[0].peer_id.clone();
-                            *self.active_peer.write().unwrap() = Some(peer_id.clone());
-                            return Ok(peer_id);
-                        }
+
+        // Discover current tenant set so we can reject stale cached peers after
+        // identity finalization (old peer_id -> new peer_id transition).
+        let discovered = if let Ok(conn) = crate::db::open_connection(&self.db_path) {
+            let _ = crate::db::schema::create_tables(&conn);
+            discover_local_tenants(&conn).ok()
+        } else {
+            None
+        };
+
+        if let Some(peer_id) = cached {
+            match discovered.as_ref() {
+                Some(tenants) => {
+                    if tenants.iter().any(|t| t.peer_id == peer_id) {
+                        return Ok(peer_id);
                     }
+                    *self.active_peer.write().unwrap() = None;
                 }
-                Err("no active peer — run `topo use-peer <N>`".to_string())
+                None => {
+                    // Preserve previous behavior when discovery is unavailable.
+                    return Ok(peer_id);
+                }
             }
         }
+
+        if let Some(tenants) = discovered {
+            if tenants.len() == 1 {
+                let peer_id = tenants[0].peer_id.clone();
+                *self.active_peer.write().unwrap() = Some(peer_id.clone());
+                return Ok(peer_id);
+            }
+        }
+
+        Err("no active peer — run `topo use-peer <N>`".to_string())
     }
 
     /// Store an invite/link string and return its 1-based reference number.
@@ -324,7 +371,7 @@ fn dispatch(
     match method {
         RpcMethod::Shutdown => {
             shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
-            shutdown_notify.notify_one();
+            shutdown_notify.notify_waiters();
             RpcResponse::success(serde_json::json!({"shutdown": true}))
         }
 
@@ -402,6 +449,7 @@ fn dispatch(
                     if ap.is_none() {
                         *ap = Some(resp.peer_id.clone());
                     }
+                    state.notify_runtime_recheck();
                     RpcResponse::success(resp)
                 }
                 Err(e) => RpcResponse::error(e.to_string()),
@@ -457,23 +505,39 @@ fn dispatch(
             }
         }
         RpcMethod::Status => {
+            let with_runtime_state = |data: workspace::StatusResponse| {
+                let mut json = serde_json::to_value(data).unwrap_or(serde_json::Value::Null);
+                json["daemon_db_path"] = serde_json::json!(db_path);
+                json["runtime_state"] =
+                    serde_json::json!(state.runtime_state.read().unwrap().as_str());
+                if let Some(net_info) = state.runtime_net.read().unwrap().as_ref() {
+                    if let Ok(net_val) = serde_json::to_value(net_info) {
+                        json["runtime"] = net_val;
+                    }
+                }
+                RpcResponse {
+                    version: crate::rpc::protocol::PROTOCOL_VERSION,
+                    ok: true,
+                    error: None,
+                    data: Some(json),
+                }
+            };
+
             match service::open_db_load(db_path) {
                 Ok((recorded_by, db)) => {
                     let data = workspace::status(&db, &recorded_by);
-                    let mut json = serde_json::to_value(data).unwrap_or(serde_json::Value::Null);
-                    if let Some(net_info) = state.runtime_net.read().unwrap().as_ref() {
-                        if let Ok(net_val) = serde_json::to_value(net_info) {
-                            json["runtime"] = net_val;
-                        }
-                    }
-                    RpcResponse {
-                        version: crate::rpc::protocol::PROTOCOL_VERSION,
-                        ok: true,
-                        error: None,
-                        data: Some(json),
-                    }
+                    with_runtime_state(data)
                 }
-                Err(e) => RpcResponse::error(e.to_string()),
+                Err(_) => match crate::db::open_connection(db_path) {
+                    Ok(db) => {
+                        let _ = crate::db::schema::create_tables(&db);
+                        // Empty DB / pre-identity state: report control-plane readiness
+                        // with tenant-scoped counters at zero.
+                        let data = workspace::status(&db, "__idle__");
+                        with_runtime_state(data)
+                    }
+                    Err(e) => RpcResponse::error(e.to_string()),
+                },
             }
         }
         RpcMethod::AssertNow { predicate } => {
@@ -669,6 +733,7 @@ fn dispatch(
                     if ap.is_none() {
                         *ap = Some(data.peer_id.clone());
                     }
+                    state.notify_runtime_recheck();
                     RpcResponse::success(data)
                 }
                 Err(e) => RpcResponse::error(e.to_string()),
@@ -778,7 +843,14 @@ fn dispatch(
                 &username,
                 &devicename,
             ) {
-                Ok(data) => RpcResponse::success(data),
+                Ok(data) => {
+                    let mut ap = state.active_peer.write().unwrap();
+                    if ap.is_none() {
+                        *ap = Some(data.peer_id.clone());
+                    }
+                    state.notify_runtime_recheck();
+                    RpcResponse::success(data)
+                }
                 Err(e) => RpcResponse::error(e.to_string()),
             }
         }

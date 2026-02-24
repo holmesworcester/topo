@@ -4,6 +4,7 @@ use super::{EventError, ParsedEvent, EVENT_TYPE_LOCAL_SIGNER_SECRET};
 pub const SIGNER_KIND_WORKSPACE: u8 = 1;
 pub const SIGNER_KIND_USER: u8 = 2;
 pub const SIGNER_KIND_PEER_SHARED: u8 = 3;
+pub const SIGNER_KIND_PENDING_INVITE_UNWRAP: u8 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalSignerSecretEvent {
@@ -17,7 +18,7 @@ pub struct LocalSignerSecretEvent {
 /// [0]      type_code = 27
 /// [1..9]   created_at_ms (u64 LE)
 /// [9..41]  signer_event_id (32 bytes)
-/// [41]     signer_kind (u8: 1=workspace, 2=user, 3=peer_shared)
+/// [41]     signer_kind (u8: 1=workspace, 2=user, 3=peer_shared, 4=pending invite unwrap)
 /// [42..74] private_key_bytes (32 bytes)
 pub fn parse_local_signer_secret(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if blob.len() < 74 {
@@ -45,9 +46,9 @@ pub fn parse_local_signer_secret(blob: &[u8]) -> Result<ParsedEvent, EventError>
     signer_event_id.copy_from_slice(&blob[9..41]);
 
     let signer_kind = blob[41];
-    if signer_kind < 1 || signer_kind > 3 {
+    if signer_kind < 1 || signer_kind > 4 {
         return Err(EventError::InvalidMetadata(
-            "signer_kind must be 1, 2, or 3",
+            "signer_kind must be 1, 2, 3, or 4",
         ));
     }
 
@@ -68,9 +69,9 @@ pub fn encode_local_signer_secret(event: &ParsedEvent) -> Result<Vec<u8>, EventE
         _ => return Err(EventError::WrongVariant),
     };
 
-    if e.signer_kind < 1 || e.signer_kind > 3 {
+    if e.signer_kind < 1 || e.signer_kind > 4 {
         return Err(EventError::InvalidMetadata(
-            "signer_kind must be 1, 2, or 3",
+            "signer_kind must be 1, 2, 3, or 4",
         ));
     }
 
@@ -106,7 +107,7 @@ pub fn project_pure(
 
     let signer_eid_b64 = event_id_to_base64(&e.signer_event_id);
 
-    let ops = vec![
+    let mut ops = vec![
         WriteOp::Delete {
             table: "local_signer_material",
             where_clause: vec![
@@ -114,7 +115,12 @@ pub fn project_pure(
                 ("signer_event_id", SqlVal::Text(signer_eid_b64.clone())),
             ],
         },
-        WriteOp::InsertOrIgnore {
+    ];
+    // signer_kind=4 with all-zero key bytes is a delete tombstone.
+    let is_pending_tombstone =
+        e.signer_kind == SIGNER_KIND_PENDING_INVITE_UNWRAP && e.private_key_bytes == [0u8; 32];
+    if !is_pending_tombstone {
+        ops.push(WriteOp::InsertOrIgnore {
             table: "local_signer_material",
             columns: vec![
                 "recorded_by",
@@ -130,8 +136,8 @@ pub fn project_pure(
                 SqlVal::Blob(e.private_key_bytes.to_vec()),
                 SqlVal::Int(e.created_at_ms as i64),
             ],
-        },
-    ];
+        });
+    }
 
     if e.signer_kind == SIGNER_KIND_PEER_SHARED {
         ProjectorResult::valid_with_commands(
@@ -153,8 +159,10 @@ pub static LOCAL_SIGNER_SECRET_META: EventTypeMeta = EventTypeMeta {
     type_name: "local_signer_secret",
     projection_table: "local_signer_material",
     share_scope: ShareScope::Local,
-    dep_fields: &["signer_event_id"],
-    dep_field_type_codes: &[&[8, 14, 15, 16, 17]],
+    // No static dep gate: pending-invite unwrap keys (signer_kind=4) may refer
+    // to invite event IDs not yet synced locally.
+    dep_fields: &[],
+    dep_field_type_codes: &[],
     signer_required: false,
     signature_byte_len: 0,
     encryptable: false,
@@ -214,6 +222,21 @@ mod tests {
     }
 
     #[test]
+    fn test_roundtrip_pending_invite_unwrap() {
+        let e = LocalSignerSecretEvent {
+            created_at_ms: 6666666666666,
+            signer_event_id: [7u8; 32],
+            signer_kind: SIGNER_KIND_PENDING_INVITE_UNWRAP,
+            private_key_bytes: [8u8; 32],
+        };
+        let event = ParsedEvent::LocalSignerSecret(e);
+        let blob = encode_event(&event).unwrap();
+        assert_eq!(blob.len(), 74);
+        let parsed = parse_event(&blob).unwrap();
+        assert_eq!(parsed, event);
+    }
+
+    #[test]
     fn test_reject_invalid_signer_kind() {
         let mut blob = vec![EVENT_TYPE_LOCAL_SIGNER_SECRET];
         blob.extend_from_slice(&0u64.to_le_bytes());
@@ -225,7 +248,7 @@ mod tests {
         let mut blob2 = vec![EVENT_TYPE_LOCAL_SIGNER_SECRET];
         blob2.extend_from_slice(&0u64.to_le_bytes());
         blob2.extend_from_slice(&[0u8; 32]);
-        blob2.push(4); // invalid signer_kind
+        blob2.push(5); // invalid signer_kind
         blob2.extend_from_slice(&[0u8; 32]);
         assert!(parse_event(&blob2).is_err());
     }

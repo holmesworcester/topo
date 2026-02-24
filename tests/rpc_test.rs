@@ -1,7 +1,8 @@
 //! RPC tests: protocol roundtrip, daemon+CLI integration, command regression.
 
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Child, Command};
+use std::time::{Duration, Instant};
 
 fn bin() -> String {
     env!("CARGO_BIN_EXE_topo").to_string()
@@ -27,6 +28,67 @@ fn create_workspace(db: &str) {
         "create-workspace failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    // create-workspace auto-starts the daemon; most tests start it explicitly.
+    let _ = Command::new(bin()).args(["--db", db, "stop"]).output();
+}
+
+fn wait_for_socket(socket: &PathBuf) {
+    let start = Instant::now();
+    while !socket.exists() && start.elapsed().as_secs() < 5 {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        socket.exists(),
+        "daemon socket did not appear at {}",
+        socket.display()
+    );
+}
+
+fn status_via_rpc(socket: &PathBuf) -> serde_json::Value {
+    let resp = topo::rpc::client::rpc_call(socket, topo::rpc::protocol::RpcMethod::Status)
+        .expect("status RPC");
+    assert!(resp.ok, "status RPC should succeed: {:?}", resp.error);
+    resp.data.expect("status response missing data")
+}
+
+fn wait_for_runtime_state(socket: &PathBuf, expected: &str, timeout: Duration) -> serde_json::Value {
+    let start = Instant::now();
+    let mut last = serde_json::Value::Null;
+    while start.elapsed() < timeout {
+        let data = status_via_rpc(socket);
+        if data["runtime_state"].as_str() == Some(expected) {
+            return data;
+        }
+        last = data;
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!(
+        "runtime state did not reach {} within {:?}, last status={}",
+        expected, timeout, last
+    );
+}
+
+fn stop_daemon(db: &str, daemon: &mut Child) {
+    let _ = Command::new(bin()).args(["--db", db, "stop"]).output();
+    let start = Instant::now();
+    loop {
+        match daemon.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => {
+                if start.elapsed().as_secs() >= 5 {
+                    let _ = daemon.kill();
+                    let _ = daemon.wait();
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(_) => {
+                let _ = daemon.kill();
+                let _ = daemon.wait();
+                return;
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -594,6 +656,216 @@ fn daemon_cli_status_shows_listen_line() {
         stdout.contains("Listen:"),
         "status output should contain Listen line, got: {}",
         stdout
+    );
+}
+
+#[test]
+fn daemon_start_on_empty_db_reports_idle_runtime_state() {
+    let (_dir, db) = temp_db();
+    let socket = socket_path_for_db(&db);
+
+    let mut daemon = Command::new(bin())
+        .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
+        .spawn()
+        .unwrap();
+    wait_for_socket(&socket);
+
+    let out = Command::new(bin())
+        .args(["--db", &db, "status"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "status failed on empty DB daemon");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Runtime:   IdleNoTenants"),
+        "expected idle runtime state, got: {}",
+        stdout
+    );
+
+    stop_daemon(&db, &mut daemon);
+}
+
+#[test]
+fn create_workspace_autostarts_daemon_and_activates_runtime() {
+    let (_dir, db) = temp_db();
+    let socket = socket_path_for_db(&db);
+    assert!(!socket.exists(), "socket should not exist before command");
+
+    let out = Command::new(bin())
+        .args(["create-workspace", "--db", &db])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "create-workspace failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("peer_id:"), "missing peer_id output: {}", stdout);
+    assert!(
+        stdout.contains("workspace_id:"),
+        "missing workspace_id output: {}",
+        stdout
+    );
+    wait_for_socket(&socket);
+
+    let data = wait_for_runtime_state(&socket, "Active", Duration::from_secs(10));
+    assert!(
+        data.get("runtime")
+            .and_then(|rt| rt.get("listen_addr"))
+            .and_then(|v| v.as_str())
+            .is_some(),
+        "expected runtime.listen_addr in active state: {}",
+        data
+    );
+
+    let _ = Command::new(bin()).args(["--db", &db, "stop"]).output();
+}
+
+#[test]
+fn accept_invite_on_running_idle_daemon_activates_runtime_without_restart() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
+    let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
+
+    let alice_socket = socket_path_for_db(&alice_db);
+    let bob_socket = socket_path_for_db(&bob_db);
+
+    // Alice: bootstrap via RPC-only create-workspace (auto-starts daemon).
+    let create = Command::new(bin())
+        .args(["create-workspace", "--db", &alice_db])
+        .output()
+        .unwrap();
+    assert!(create.status.success(), "alice create-workspace failed");
+    wait_for_socket(&alice_socket);
+    let alice_status = wait_for_runtime_state(&alice_socket, "Active", Duration::from_secs(10));
+    let alice_listen = alice_status["runtime"]["listen_addr"]
+        .as_str()
+        .expect("alice runtime.listen_addr")
+        .to_string();
+
+    let invite_out = Command::new(bin())
+        .args(["--db", &alice_db, "create-invite", "--public-addr", &alice_listen])
+        .output()
+        .unwrap();
+    assert!(
+        invite_out.status.success(),
+        "create-invite failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&invite_out.stdout),
+        String::from_utf8_lossy(&invite_out.stderr)
+    );
+    let invite_link = String::from_utf8_lossy(&invite_out.stdout)
+        .lines()
+        .find(|line| line.starts_with("quiet://"))
+        .expect("create-invite output missing invite link")
+        .to_string();
+
+    // Bob: explicit daemon start on empty DB should stay idle first.
+    let mut bob_daemon = Command::new(bin())
+        .args(["--db", &bob_db, "start", "--bind", "127.0.0.1:0"])
+        .spawn()
+        .unwrap();
+    let bob_pid_before = bob_daemon.id();
+    wait_for_socket(&bob_socket);
+    let _ = wait_for_runtime_state(&bob_socket, "IdleNoTenants", Duration::from_secs(10));
+
+    // accept-invite must route through RPC and trigger runtime activation.
+    let accept = Command::new(bin())
+        .args([
+            "accept-invite",
+            "--db",
+            &bob_db,
+            "--invite",
+            &invite_link,
+            "--username",
+            "bob",
+            "--devicename",
+            "laptop",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        accept.status.success(),
+        "accept-invite failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&accept.stdout),
+        String::from_utf8_lossy(&accept.stderr)
+    );
+    assert!(
+        bob_daemon.try_wait().unwrap().is_none(),
+        "bob daemon should keep running (no restart required)"
+    );
+    assert_eq!(bob_daemon.id(), bob_pid_before, "daemon process should be unchanged");
+    let _ = wait_for_runtime_state(&bob_socket, "Active", Duration::from_secs(10));
+
+    let _ = Command::new(bin()).args(["--db", &alice_db, "stop"]).output();
+    stop_daemon(&bob_db, &mut bob_daemon);
+}
+
+#[test]
+fn db_scoped_commands_remain_isolated_between_daemons() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db_a = tmpdir.path().join("a.db").to_str().unwrap().to_string();
+    let db_b = tmpdir.path().join("b.db").to_str().unwrap().to_string();
+
+    let create_a = Command::new(bin())
+        .args(["create-workspace", "--db", &db_a])
+        .output()
+        .unwrap();
+    assert!(create_a.status.success());
+    let create_b = Command::new(bin())
+        .args(["create-workspace", "--db", &db_b])
+        .output()
+        .unwrap();
+    assert!(create_b.status.success());
+
+    let send_a = Command::new(bin())
+        .args(["--db", &db_a, "send", "db-a-message"])
+        .output()
+        .unwrap();
+    assert!(
+        send_a.status.success(),
+        "send on db A failed: {}",
+        String::from_utf8_lossy(&send_a.stderr)
+    );
+
+    let status_a = status_via_rpc(&socket_path_for_db(&db_a));
+    let status_b = status_via_rpc(&socket_path_for_db(&db_b));
+    assert!(
+        status_a["messages_count"].as_i64().unwrap_or(0) >= 1,
+        "db A should show at least one message: {}",
+        status_a
+    );
+    assert_eq!(
+        status_b["messages_count"].as_i64().unwrap_or(-1),
+        0,
+        "db B should remain unchanged: {}",
+        status_b
+    );
+
+    let _ = Command::new(bin()).args(["--db", &db_a, "stop"]).output();
+    let _ = Command::new(bin()).args(["--db", &db_b, "stop"]).output();
+}
+
+#[test]
+fn local_signer_secret_events_do_not_pass_shared_egress_gate() {
+    let (_dir, db) = temp_db();
+    create_workspace(&db);
+
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let local_event_b64: String = conn
+        .query_row(
+            "SELECT event_id FROM events WHERE event_type = 'local_signer_secret' LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let local_event_id =
+        topo::crypto::event_id_from_base64(&local_event_b64).expect("valid local event id");
+    let store = topo::db::store::Store::new(&conn);
+    assert!(
+        store.get_shared(&local_event_id).unwrap().is_none(),
+        "local_signer_secret must never be returned by shared egress gate"
     );
 }
 

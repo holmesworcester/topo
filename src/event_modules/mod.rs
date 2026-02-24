@@ -201,7 +201,13 @@ impl ParsedEvent {
             ],
             ParsedEvent::FileSlice(f) => vec![("signed_by", f.signed_by)],
             ParsedEvent::BenchDep(b) => b.dep_ids.iter().map(|id| ("dep_id", *id)).collect(),
-            ParsedEvent::LocalSignerSecret(l) => vec![("signer_event_id", l.signer_event_id)],
+            ParsedEvent::LocalSignerSecret(l) => {
+                if l.signer_kind == local_signer_secret::SIGNER_KIND_PENDING_INVITE_UNWRAP {
+                    Vec::new()
+                } else {
+                    vec![("signer_event_id", l.signer_event_id)]
+                }
+            }
         }
     }
 

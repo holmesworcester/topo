@@ -30,6 +30,23 @@ fn create_workspace(db: &str) {
         "create-workspace failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    // Wait until tenant discovery sees at least one peer before stopping it.
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(5) {
+        let peers = Command::new(bin())
+            .args(["--db", db, "peers"])
+            .output()
+            .expect("peers probe");
+        if peers.status.success() {
+            let stdout = String::from_utf8_lossy(&peers.stdout);
+            if stdout.lines().any(|line| line.trim_start().starts_with("1.")) {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // create-workspace auto-starts the daemon; callers decide daemon lifecycle.
+    let _ = Command::new(bin()).args(["--db", db, "stop"]).output();
 }
 
 fn start_daemon_with_options(db: &str, disable_placeholder_autodial: bool) -> Child {
@@ -130,7 +147,82 @@ fn start_daemon(db: &str) -> Child {
     start_daemon_with_options(db, false)
 }
 
+fn first_peer_index(peers_stdout: &str) -> Option<usize> {
+    peers_stdout.lines().find_map(|line| {
+        let trimmed = line.trim_start();
+        let dot_pos = trimmed.find('.')?;
+        let idx = &trimmed[..dot_pos];
+        if idx.chars().all(|c| c.is_ascii_digit()) {
+            idx.parse::<usize>().ok()
+        } else {
+            None
+        }
+    })
+}
+
+fn ensure_active_peer(db: &str, timeout: Duration) {
+    let start = Instant::now();
+    let mut last_active = String::new();
+    let mut last_peers = String::new();
+    let mut last_use_peer_err = String::new();
+
+    while start.elapsed() < timeout {
+        let active = Command::new(bin())
+            .args(["--db", db, "active-peer"])
+            .output()
+            .expect("failed to run active-peer");
+        if active.status.success() {
+            let active_stdout = String::from_utf8_lossy(&active.stdout).trim().to_string();
+            if !active_stdout.is_empty() && active_stdout != "(no active peer)" {
+                return;
+            }
+            last_active = active_stdout;
+        } else {
+            last_active = format!(
+                "error: {}",
+                String::from_utf8_lossy(&active.stderr).trim()
+            );
+        }
+
+        let peers = Command::new(bin())
+            .args(["--db", db, "peers"])
+            .output()
+            .expect("failed to run peers");
+        if peers.status.success() {
+            let peers_stdout = String::from_utf8_lossy(&peers.stdout).to_string();
+            if let Some(index) = first_peer_index(&peers_stdout) {
+                let use_peer = Command::new(bin())
+                    .arg("--db")
+                    .arg(db)
+                    .arg("use-peer")
+                    .arg(index.to_string())
+                    .output()
+                    .expect("failed to run use-peer");
+                if use_peer.status.success() {
+                    return;
+                }
+                last_use_peer_err = String::from_utf8_lossy(&use_peer.stderr).trim().to_string();
+            }
+            last_peers = peers_stdout;
+        } else {
+            last_peers = format!("error: {}", String::from_utf8_lossy(&peers.stderr).trim());
+        }
+
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    panic!(
+        "failed to establish active peer within {:?} (db={}): active={}, peers={}, use-peer-error={}",
+        timeout,
+        db,
+        last_active,
+        last_peers.replace('\n', " | "),
+        last_use_peer_err
+    );
+}
+
 fn send_message(db: &str, content: &str) -> String {
+    ensure_active_peer(db, Duration::from_secs(10));
     let start = Instant::now();
     loop {
         let output = Command::new(bin())
@@ -151,7 +243,10 @@ fn send_message(db: &str, content: &str) -> String {
 
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         let retryable = stderr.contains("no identity") || stderr.contains("no active peer");
-        if retryable && start.elapsed() < Duration::from_secs(5) {
+        if retryable && start.elapsed() < Duration::from_secs(20) {
+            if stderr.contains("no active peer") {
+                ensure_active_peer(db, Duration::from_secs(5));
+            }
             std::thread::sleep(Duration::from_millis(100));
             continue;
         }
@@ -243,7 +338,7 @@ fn create_invite(db: &str, bootstrap_addr: &str) -> String {
         .to_string()
 }
 
-/// Helper: run accept-invite CLI command (direct, pre-daemon).
+/// Helper: run accept-invite CLI command through daemon RPC.
 fn accept_invite(db: &str, invite_link: &str) {
     let output = Command::new(bin())
         .arg("accept-invite")
@@ -258,6 +353,23 @@ fn accept_invite(db: &str, invite_link: &str) {
         "accept-invite failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    // Ensure tenant discovery is persisted before stopping the auto-started daemon.
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(5) {
+        let peers = Command::new(bin())
+            .args(["--db", db, "peers"])
+            .output()
+            .expect("peers probe");
+        if peers.status.success() {
+            let stdout = String::from_utf8_lossy(&peers.stdout);
+            if stdout.lines().any(|line| line.trim_start().starts_with("1.")) {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // accept-invite auto-starts daemon; callers decide daemon lifecycle.
+    let _ = Command::new(bin()).args(["--db", db, "stop"]).output();
 }
 
 fn count_rows(db: &str, table: &str) -> i64 {
@@ -502,9 +614,9 @@ fn test_cli_unpinned_peer_rejected() {
     let _ = bob.wait();
 }
 
-/// TRUST POLICY TEST: daemon start with no trusted peers is rejected at startup.
+/// Daemon start on an empty DB should keep control plane up in IdleNoTenants state.
 #[test]
-fn test_cli_start_without_trust_fails() {
+fn test_cli_start_without_trust_starts_idle_runtime() {
     let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let db = tmpdir
@@ -513,30 +625,48 @@ fn test_cli_start_without_trust_fails() {
         .to_str()
         .unwrap()
         .to_string();
-    let port = random_port();
+    let socket = socket_path_for_db(&db);
 
-    // Start daemon with no identity chain (no trusted peers) — should fail immediately
-    let output = Command::new(bin())
+    let mut daemon = Command::new(bin())
         .arg("start")
         .arg("--bind")
-        .arg(format!("127.0.0.1:{}", port))
+        .arg(format!("127.0.0.1:{}", random_port()))
         .arg("--db")
         .arg(&db)
-        .output()
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
         .expect("failed to run start");
 
+    let start = Instant::now();
+    while !socket.exists() && start.elapsed().as_secs() < 5 {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(socket.exists(), "daemon socket did not appear");
+
+    let status = Command::new(bin())
+        .args(["--db", &db, "status"])
+        .output()
+        .expect("status command");
     assert!(
-        !output.status.success(),
-        "start with no trusted peers should fail, but exited with {:?}",
-        output.status.code()
+        status.status.success(),
+        "status should succeed on empty-db daemon: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        stdout.contains("Runtime:   IdleNoTenants"),
+        "status should show idle runtime state, got: {}",
+        stdout
     );
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("No local identities"),
-        "error should mention missing identities, got: {}",
-        stderr
-    );
+    let stop = Command::new(bin())
+        .args(["--db", &db, "stop"])
+        .output()
+        .expect("stop command");
+    assert!(stop.status.success(), "stop should succeed");
+
+    let _ = daemon.wait();
 }
 
 /// Bootstrap trust test using production create-invite / accept-invite CLI flow.

@@ -30,6 +30,8 @@ fn create_workspace(db: &str) {
         "create-workspace failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    // create-workspace auto-starts daemon; this suite controls daemon start explicitly.
+    let _ = Command::new(bin()).args(["--db", db, "stop"]).output();
 }
 
 fn start_daemon(db: &str, bind_port: u16) -> Child {
@@ -125,6 +127,8 @@ fn accept_invite(db: &str, invite_link: &str, username: &str, devicename: &str) 
         stdout.trim(),
         stderr.trim()
     );
+    // accept-invite auto-starts daemon; this suite controls daemon start explicitly.
+    let _ = Command::new(bin()).args(["--db", db, "stop"]).output();
 }
 
 fn assert_eventually(db: &str, predicate: &str, timeout_ms: u64) {

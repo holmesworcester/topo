@@ -90,6 +90,8 @@ fn create_workspace(db: &str) {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+    // create-workspace auto-starts daemon; tests start daemons explicitly.
+    let _ = run_topo(&["--db", db, "stop"]);
 }
 
 fn accept_invite(db: &str, invite_link: &str) {
@@ -110,6 +112,8 @@ fn accept_invite(db: &str, invite_link: &str) {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+    // accept-invite auto-starts daemon; tests start daemons explicitly.
+    let _ = run_topo(&["--db", db, "stop"]);
 }
 
 /// Run a topo subcommand that routes through the daemon via RPC (daemon-preferred commands).
@@ -131,6 +135,9 @@ fn topo_rpc_retry(db: &str, args: &[&str], timeout: Duration) -> Output {
             return out;
         }
         let stderr = String::from_utf8_lossy(&out.stderr);
+        if stderr.contains("no active peer") {
+            let _ = topo_rpc(db, &["use-peer", "1"]);
+        }
         if start.elapsed() >= timeout || !is_transient_rpc_startup_error(&stderr) {
             return out;
         }
@@ -194,6 +201,8 @@ fn topo_accept_invite(db: &str, invite_link: &str) {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+    // accept-invite auto-starts daemon; tests start daemons explicitly.
+    let _ = run_topo(&["--db", db, "stop"]);
 }
 
 fn topo_assert_eventually(db: &str, predicate: &str, timeout_ms: u64) -> Output {
@@ -308,7 +317,7 @@ fn test_daemon_cli_invite_lifecycle_works_without_restart() {
         &format!("127.0.0.1:{}", alice_port),
     );
 
-    // Bob accepts invite before starting daemon (direct command, does bootstrap sync).
+    // Bob accepts invite before starting daemon (daemon-routed CLI command).
     topo_accept_invite(&bob_db, &invite_link);
 
     // Bob starts daemon after accept-invite — auto-selects the shared workspace peer.

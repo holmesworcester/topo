@@ -18,7 +18,8 @@ use crate::projection::signer::{resolve_signer_key, SignerResolution};
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub(crate) const SIGNER_KIND_PENDING_INVITE_UNWRAP: i64 = 4;
+pub(crate) const SIGNER_KIND_PENDING_INVITE_UNWRAP: u8 =
+    crate::event_modules::local_signer_secret::SIGNER_KIND_PENDING_INVITE_UNWRAP;
 
 pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
@@ -259,18 +260,13 @@ pub(crate) fn store_pending_invite_unwrap_key(
     invite_event_id: &EventId,
     invite_key: &SigningKey,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    conn.execute(
-        "INSERT OR REPLACE INTO local_signer_material
-         (recorded_by, signer_event_id, signer_kind, private_key, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        rusqlite::params![
-            recorded_by,
-            event_id_to_base64(invite_event_id),
-            SIGNER_KIND_PENDING_INVITE_UNWRAP,
-            invite_key.to_bytes().to_vec(),
-            now_ms() as i64,
-        ],
-    )?;
+    let evt = ParsedEvent::LocalSignerSecret(LocalSignerSecretEvent {
+        created_at_ms: now_ms(),
+        signer_event_id: *invite_event_id,
+        signer_kind: SIGNER_KIND_PENDING_INVITE_UNWRAP,
+        private_key_bytes: invite_key.to_bytes(),
+    });
+    let _ = create_event_sync(conn, recorded_by, &evt)?;
     Ok(())
 }
 
@@ -279,15 +275,14 @@ pub(crate) fn clear_pending_invite_unwrap_key(
     recorded_by: &str,
     invite_event_id: &EventId,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    conn.execute(
-        "DELETE FROM local_signer_material
-         WHERE recorded_by = ?1 AND signer_event_id = ?2 AND signer_kind = ?3",
-        rusqlite::params![
-            recorded_by,
-            event_id_to_base64(invite_event_id),
-            SIGNER_KIND_PENDING_INVITE_UNWRAP,
-        ],
-    )?;
+    // signer_kind=4 with zero key bytes projects as a delete tombstone.
+    let evt = ParsedEvent::LocalSignerSecret(LocalSignerSecretEvent {
+        created_at_ms: now_ms(),
+        signer_event_id: *invite_event_id,
+        signer_kind: SIGNER_KIND_PENDING_INVITE_UNWRAP,
+        private_key_bytes: [0u8; 32],
+    });
+    let _ = create_event_sync(conn, recorded_by, &evt)?;
     Ok(())
 }
 
