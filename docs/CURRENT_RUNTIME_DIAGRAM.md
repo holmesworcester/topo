@@ -111,8 +111,17 @@ flowchart TD
       EMQ --> LOCAL["local create path / create_*_event_sync"]
     end
 
-    NODE --> START["setup_endpoint_and_tenants"]
-    START --> EP["single QUIC endpoint"]
+    subgraph BOOT["Runtime Bootstrap (node init only)"]
+      START["setup_endpoint_and_tenants"]
+      BOOT_WR["init shared ingest writer"]
+      BOOT_COORD["init tenant coordination managers"]
+      BOOT_TARGET["seed autodial + discovery planners"]
+      START --> BOOT_WR
+      START --> BOOT_COORD
+      START --> BOOT_TARGET
+    end
+
+    NODE --> START
     START --> TRUST["SqliteTrustOracle (tenant-scoped allow/deny)"]
 
     subgraph PIPE["Event Pipeline (shared ingest -> projection)"]
@@ -126,30 +135,27 @@ flowchart TD
       P3 --> PROJ["project_one + cascade"]
     end
 
-    subgraph SQLITE_Q["SQLite Queues"]
-      PROJ_Q
-      WANT["wanted_events"]
-      EGRESS["egress_queue"]
-    end
-
-    EP --> ACCEPT["accept_loop_with_ingest thread"]
-    EP --> CONNECT["connect_loop_with_coordination threads (autodial / discovery)"]
-
-    ACCEPT --> ORCH
-    CONNECT --> ORCH
-
     subgraph ORCH["Peering Orchestration"]
+      ACCEPT["accept_loop_with_ingest thread"]
+      CONNECT["connect_loop_with_coordination threads (autodial / discovery)"]
       CYCLE["loop lifecycle (retry/backoff/cancel)"]
       INTRO["intro/punch workflows"]
+      ACCEPT --> CYCLE
+      CONNECT --> CYCLE
     end
 
     subgraph TRANS["Transport Capsule"]
+      EP["single QUIC endpoint"]
       BOUND["peering_boundary (contract helpers)"]
       LIFE["connection_lifecycle / accept_peer / dial_peer"]
       FACT["session_factory / accept/open_session_io"]
       IIO["intro_io / accept_and_read_intro"]
     end
 
+    START --> EP
+    BOOT_WR --> WRITER
+    BOOT_COORD --> CONNECT
+    BOOT_TARGET --> CONNECT
     ORCH --> BOUND
     INTRO --> BOUND
     BOUND --> LIFE
@@ -160,6 +166,8 @@ flowchart TD
       SYNC["SyncSessionHandler (on_session)"]
       CTRL_STREAM["control stream / sync control messages / HaveList / Done"]
       DATA["data stream / Event / DataDone"]
+      WANT["wanted_events"]
+      EGRESS["egress_queue"]
       SEND["Store::get_shared(events) -> Frame::Event send"]
       RECV["receiver task / hash(blob) + tag recorded_by"]
 
@@ -174,11 +182,19 @@ flowchart TD
     FACT --> SYNC
     RECV --> INGEST
 
-    PROJ --> VALID["valid_events"]
-    PROJ --> BLOCKED["blocked_events + blocked_event_deps"]
-    PROJ --> REJECTED["rejected_events"]
-    PROJ --> READS["projection tables (messages, users, peers, channels)"]
-    PROJ --> TRUST_DB["transport trust tables (peer_shared + invite bootstrap)"]
+    subgraph PSTATE["SQLite Projection State"]
+      VALID["valid_events"]
+      BLOCKED["blocked_events + blocked_event_deps"]
+      REJECTED["rejected_events"]
+      READS["projection tables (messages, users, peers, channels)"]
+      TRUST_DB["transport trust tables (peer_shared + invite bootstrap)"]
+    end
+
+    PROJ --> VALID
+    PROJ --> BLOCKED
+    PROJ --> REJECTED
+    PROJ --> READS
+    PROJ --> TRUST_DB
 
     TRUST_DB --> TRUST
     TRUST --> LIFE
