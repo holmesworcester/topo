@@ -25,12 +25,12 @@ use crate::contracts::peering_contract::{
 use crate::db::{open_connection, schema::create_tables};
 use crate::sync::SyncSessionHandler;
 
+use crate::transport::identity::{
+    expected_invite_bootstrap_spki_from_invite_key, load_transport_cert_required_from_db,
+};
 use crate::transport::{
     create_dual_endpoint, peer_identity_from_connection, AllowedPeers, DualConnection,
     QuicTransportSessionIo,
-};
-use crate::transport::identity::{
-    expected_invite_bootstrap_spki_from_invite_key, load_transport_cert_required_from_db,
 };
 
 fn peer_fingerprint_from_hex(
@@ -54,7 +54,7 @@ fn peer_fingerprint_from_hex(
 /// Used by test infrastructure to simulate what the runtime autodial loop does
 /// in production: connect to the bootstrap peer, run a negentropy sync session
 /// to fetch prerequisite events, then close the connection. The batch_writer
-/// handles projection cascade and recorded_by migration.
+/// handles projection cascade.
 pub async fn bootstrap_sync_from_invite(
     db_path: &str,
     recorded_by: &str,
@@ -187,11 +187,7 @@ pub fn start_bootstrap_responder(
             .build()
             .expect("failed to create bootstrap responder runtime");
         rt.block_on(async move {
-            let handler = SyncSessionHandler::responder(
-                db_path.clone(),
-                30,
-                ingest_tx,
-            );
+            let handler = SyncSessionHandler::responder(db_path.clone(), 30, ingest_tx);
             // Keep connections alive until the endpoint closes so QUIC can
             // deliver final frames (DoneAck, events) before the connection
             // is torn down. Dropping a quinn::Connection sends

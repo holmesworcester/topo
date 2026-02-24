@@ -164,25 +164,18 @@ impl Peer {
         let result = create_workspace(&db, &old_identity, "test-workspace", "test-user", "test-device")
             .expect("failed to bootstrap workspace");
 
-        // create_workspace emits LocalSignerSecret events which trigger transport
-        // identity installation. Reload the peer_id and migrate if changed.
-        let new_identity = crate::transport::identity::load_transport_peer_id(&db)
-            .expect("failed to load transport peer_id after create_workspace");
-        if new_identity != old_identity {
-            crate::db::migrate_recorded_by(&db, &old_identity, &new_identity)
-                .expect("recorded_by migration failed");
-        }
-        self.identity = new_identity.clone();
+        // Keep event scope identity stable in tests; no recorded_by migration.
+        self.identity = old_identity.clone();
 
         self.workspace_id = result.workspace_id;
         // Look up user_event_id from the created identity chain
-        if let Ok(uid) = crate::service::resolve_user_event_id_for_signer(&db, &new_identity, &result.peer_shared_event_id) {
+        if let Ok(uid) = crate::service::resolve_user_event_id_for_signer(&db, &self.identity, &result.peer_shared_event_id) {
             self.author_id = uid;
         }
         self.peer_shared_event_id = Some(result.peer_shared_event_id);
         self.peer_shared_signing_key = Some(result.peer_shared_key);
         // Load workspace signing key from local signer material
-        if let Ok(Some((_ws_eid, ws_key))) = crate::event_modules::workspace::commands::load_workspace_signing_key(&db, &new_identity) {
+        if let Ok(Some((_ws_eid, ws_key))) = crate::event_modules::workspace::commands::load_workspace_signing_key(&db, &self.identity) {
             self.workspace_signing_key = Some(ws_key);
         }
     }
@@ -267,8 +260,7 @@ impl Peer {
 
         // Step 2: Bootstrap sync — fetches prerequisites from creator.
         // In production this is done by the autodial loop; in tests we trigger
-        // it directly. The batch_writer handles projection cascade and
-        // recorded_by migration when the identity chain completes.
+        // it directly. The batch_writer handles projection cascade.
         crate::testutil::bootstrap::bootstrap_sync_from_invite(
             &peer.db_path,
             &result.peer_id,
@@ -278,25 +270,23 @@ impl Peer {
             crate::event_pipeline::batch_writer,
         ).await.expect("failed bootstrap sync");
 
-        // Allow batch_writer to finish draining (projection cascade + migration)
+        // Allow batch_writer to finish draining projection cascade.
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
         // Clean up sync endpoint
         sync_endpoint.close(0u32.into(), b"bootstrap done");
 
-        // Step 3: Load final identity — after cascade, transport peer_id
-        // has transitioned from invite-derived to PeerShared-derived.
+        // Step 3: Keep tenant scope identity stable for event reads/writes.
         let db = open_connection(&peer.db_path).expect("failed to open db");
-        let final_peer_id = crate::transport::identity::load_transport_peer_id(&db)
-            .expect("failed to load final transport peer_id");
-        peer.identity = final_peer_id.clone();
+        let scoped_peer_id = result.peer_id.clone();
+        peer.identity = scoped_peer_id.clone();
         peer.workspace_id = creator.workspace_id;
 
         // Load signing key and user_event_id from DB
-        if let Ok(Some((eid, key))) = crate::service::load_local_peer_signer_pub(&db, &final_peer_id) {
+        if let Ok(Some((eid, key))) = crate::service::load_local_peer_signer_pub(&db, &scoped_peer_id) {
             peer.peer_shared_event_id = Some(eid);
             peer.peer_shared_signing_key = Some(key);
-            if let Ok(uid) = crate::service::resolve_user_event_id_for_signer(&db, &final_peer_id, &eid) {
+            if let Ok(uid) = crate::service::resolve_user_event_id_for_signer(&db, &scoped_peer_id, &eid) {
                 peer.author_id = uid;
             }
         }

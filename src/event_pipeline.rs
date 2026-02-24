@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -23,6 +24,111 @@ fn current_timestamp_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64
+}
+
+#[derive(Default)]
+struct PersistPhaseOutput {
+    persisted_event_ids: Vec<EventId>,
+    tenants_seen: HashSet<String>,
+}
+
+enum PostCommitCommand {
+    RemoveWanted {
+        event_id: EventId,
+    },
+    DrainProjectQueue {
+        tenant_id: String,
+        batch_size: usize,
+    },
+    LogProjectQueueHealth {
+        tenant_id: String,
+    },
+    RunPostDrainHooks {
+        tenant_id: String,
+    },
+}
+
+fn short_id(value: &str) -> &str {
+    &value[..16.min(value.len())]
+}
+
+fn build_post_commit_commands(
+    output: &PersistPhaseOutput,
+    batch_size: usize,
+) -> Vec<PostCommitCommand> {
+    let mut commands =
+        Vec::with_capacity(output.persisted_event_ids.len() + (output.tenants_seen.len() * 3));
+
+    for event_id in &output.persisted_event_ids {
+        commands.push(PostCommitCommand::RemoveWanted {
+            event_id: *event_id,
+        });
+    }
+
+    // Deterministic order makes the command phase easier to reason about.
+    let mut tenants: Vec<String> = output.tenants_seen.iter().cloned().collect();
+    tenants.sort();
+    for tenant_id in tenants {
+        commands.push(PostCommitCommand::DrainProjectQueue {
+            tenant_id: tenant_id.clone(),
+            batch_size,
+        });
+        commands.push(PostCommitCommand::LogProjectQueueHealth {
+            tenant_id: tenant_id.clone(),
+        });
+        commands.push(PostCommitCommand::RunPostDrainHooks { tenant_id });
+    }
+
+    commands
+}
+
+fn execute_post_commit_commands(
+    db: &rusqlite::Connection,
+    wanted: &WantedEvents<'_>,
+    pq: &ProjectQueue<'_>,
+    commands: &[PostCommitCommand],
+) {
+    for command in commands {
+        match command {
+            PostCommitCommand::RemoveWanted { event_id } => {
+                let _ = wanted.remove(event_id);
+            }
+            PostCommitCommand::DrainProjectQueue {
+                tenant_id,
+                batch_size,
+            } => {
+                if let Err(e) = pq.drain_with_limit(tenant_id, *batch_size, |conn, event_id_b64| {
+                    if let Some(eid) = event_id_from_base64(event_id_b64) {
+                        project_one(conn, tenant_id, &eid)
+                            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                    }
+                    Ok(())
+                }) {
+                    warn!("project_queue drain error for {}: {}", tenant_id, e);
+                }
+            }
+            PostCommitCommand::LogProjectQueueHealth { tenant_id } => {
+                if let Ok(h) = pq.health(tenant_id) {
+                    if h.pending > 0 || h.max_attempts > 0 {
+                        tracing::debug!(tenant=%tenant_id, pending=%h.pending, max_attempts=%h.max_attempts, oldest_age_ms=%h.oldest_age_ms, "project_queue health");
+                    }
+                }
+            }
+            PostCommitCommand::RunPostDrainHooks { tenant_id } => {
+                match crate::event_modules::post_drain_hooks(db, tenant_id) {
+                    Ok(count) if count > 0 => {
+                        tracing::info!(
+                            "post-drain hooks: tenant {} resolved {} item(s)",
+                            short_id(tenant_id),
+                            count
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => warn!("post-drain hooks failed for {}: {}", short_id(tenant_id), e),
+                }
+            }
+        }
+    }
 }
 
 /// Drain pending project_queue items for a tenant, projecting each event.
@@ -99,8 +205,7 @@ pub fn batch_writer(
     let reg = registry();
     let pq = ProjectQueue::new(&db);
     // Cache workspace_id per recorded_by to avoid repeated lookups
-    let mut workspace_cache: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
+    let mut workspace_cache: HashMap<String, String> = HashMap::new();
 
     let mut enqueue_stmt = match db.prepare(
         "INSERT OR IGNORE INTO project_queue (peer_id, event_id, available_at)
@@ -167,10 +272,11 @@ pub fn batch_writer(
             continue;
         }
 
-        // First pass: write blob storage, neg_items, recorded_events, enqueue for projection
-        let mut event_ids_persisted: Vec<EventId> = Vec::with_capacity(batch.len());
-        // Collect distinct tenants seen in this batch for per-tenant drain
-        let mut tenants_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Phase 1 (transactional): persist ingress rows and enqueue projection work.
+        let mut persist_output = PersistPhaseOutput {
+            persisted_event_ids: Vec::with_capacity(batch.len()),
+            tenants_seen: HashSet::new(),
+        };
         for (event_id, blob, recorded_by) in &batch {
             let event_id_b64 = event_id_to_base64(event_id);
 
@@ -236,95 +342,17 @@ pub fn batch_writer(
                             warn!("project_queue enqueue error for {}: {}", event_id_b64, e);
                         }
 
-                        tenants_seen.insert(recorded_by.clone());
-                        event_ids_persisted.push(*event_id);
+                        persist_output.tenants_seen.insert(recorded_by.clone());
+                        persist_output.persisted_event_ids.push(*event_id);
                     }
                 }
             }
         }
         match db.execute("COMMIT", []) {
             Ok(_) => {
-                // Remove from wanted only for successfully persisted items
-                for event_id in &event_ids_persisted {
-                    let _ = wanted.remove(event_id);
-                }
-
-                // Second pass: drain project_queue per tenant
-                let batch_sz = drain_batch_size();
-                for rb in &tenants_seen {
-                    if let Err(e) = pq.drain_with_limit(rb, batch_sz, |conn, event_id_b64| {
-                        if let Some(eid) = event_id_from_base64(event_id_b64) {
-                            project_one(conn, rb, &eid)
-                                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-                        }
-                        Ok(())
-                    }) {
-                        warn!("project_queue drain error for {}: {}", rb, e);
-                    }
-                    if let Ok(h) = pq.health(rb) {
-                        if h.pending > 0 || h.max_attempts > 0 {
-                            tracing::debug!(tenant=%rb, pending=%h.pending, max_attempts=%h.max_attempts, oldest_age_ms=%h.oldest_age_ms, "project_queue health");
-                        }
-                    }
-                    let mut effective_rb = rb.clone();
-                    // Post-drain: if projection cascade caused a transport identity
-                    // transition (e.g. LocalSignerSecret(PEER_SHARED) projected and
-                    // installed PeerShared-derived identity), migrate all DB rows
-                    // from the old recorded_by to the new peer_id.
-                    if let Ok(new_peer_id) = crate::transport::identity::load_transport_peer_id(&db)
-                    {
-                        if new_peer_id != *rb {
-                            if let Err(e) = crate::db::migrate_recorded_by(&db, rb, &new_peer_id) {
-                                warn!("post-drain recorded_by migration failed for {}: {}", rb, e);
-                            } else {
-                                tracing::info!(
-                                    "post-drain recorded_by migration: {} -> {}",
-                                    &rb[..16.min(rb.len())],
-                                    &new_peer_id[..16.min(new_peer_id.len())]
-                                );
-                                effective_rb = new_peer_id;
-                                workspace_cache.clear();
-                            }
-                        }
-                    }
-                    if effective_rb != *rb {
-                        // Migration can move queued rows from old->new peer_id while
-                        // some are still blocked/leased. Drain once under the new
-                        // identity immediately so cascade projection keeps moving.
-                        if let Err(e) =
-                            pq.drain_with_limit(&effective_rb, batch_sz, |conn, event_id_b64| {
-                                if let Some(eid) = event_id_from_base64(event_id_b64) {
-                                    project_one(conn, &effective_rb, &eid)
-                                        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-                                }
-                                Ok(())
-                            })
-                        {
-                            warn!(
-                                "post-migration project_queue drain error for {}: {}",
-                                &effective_rb[..16.min(effective_rb.len())],
-                                e
-                            );
-                        }
-                    }
-                    // Run generic post-drain hooks registered by event modules
-                    // (e.g. deferred content-key unwrap retries).
-                    match crate::event_modules::post_drain_hooks(&db, &effective_rb) {
-                        Ok(count) if count > 0 => {
-                            tracing::info!(
-                                "post-drain hooks: tenant {} resolved {} item(s)",
-                                &effective_rb[..16.min(effective_rb.len())],
-                                count
-                            );
-                        }
-                        Ok(_) => {}
-                        Err(e) => warn!(
-                            "post-drain hooks failed for {}: {}",
-                            &effective_rb[..16.min(effective_rb.len())],
-                            e
-                        ),
-                    }
-                }
+                // Phase 2 (post-commit): execute explicit side-effect commands.
+                let commands = build_post_commit_commands(&persist_output, drain_batch_size());
+                execute_post_commit_commands(&db, &wanted, &pq, &commands);
             }
             Err(e) => {
                 warn!("COMMIT failed, rolling back: {}", e);
@@ -334,6 +362,9 @@ pub fn batch_writer(
             }
         }
 
-        events_received.fetch_add(event_ids_persisted.len() as u64, Ordering::Relaxed);
+        events_received.fetch_add(
+            persist_output.persisted_event_ids.len() as u64,
+            Ordering::Relaxed,
+        );
     }
 }
