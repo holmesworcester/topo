@@ -16,6 +16,7 @@ These are current specs, plans, and reference material.
 | [planning/DISCREPANCY-MATRIX.md](planning/DISCREPANCY-MATRIX.md) | Current design/plan/code discrepancy matrix |
 | [planning/IDENTITY_TRANSPORT_BOUNDARY_EXECUTION_PLAN.md](planning/IDENTITY_TRANSPORT_BOUNDARY_EXECUTION_PLAN.md) | Active boundary plan for identity workflow vs transport materialization |
 | [planning/EVENT_PIPELINE_PHASE_BOUNDARY_EXECUTION_PLAN.md](planning/EVENT_PIPELINE_PHASE_BOUNDARY_EXECUTION_PLAN.md) | Active plan for explicit ingest phase boundaries and command-driven post-commit effects |
+| [planning/COORDINATED_DOWNLOAD_ONLY_EXECUTION_PLAN.md](planning/COORDINATED_DOWNLOAD_ONLY_EXECUTION_PLAN.md) | Active plan to remove all non-coordinated initiator download paths |
 
 ## Canonical Module Vocabulary
 
