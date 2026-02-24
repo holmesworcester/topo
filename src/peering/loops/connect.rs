@@ -1,29 +1,27 @@
 //! Connect-side loops: outbound QUIC connections and initiator sync sessions.
 
 use std::net::SocketAddr;
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
-use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::contracts::event_pipeline_contract::{IngestFns, IngestItem};
+use crate::contracts::event_pipeline_contract::IngestFns;
 use crate::contracts::peering_contract::SessionDirection;
 use crate::db::health::{purge_expired_endpoints, record_endpoint_observation};
 use crate::db::open_connection;
-use crate::db::project_queue::ProjectQueue;
-use crate::db::removal_watch::is_peer_removed;
-use crate::db::schema::create_tables;
 use crate::db::store::lookup_workspace_id;
 use crate::db::transport_trust::record_transport_binding;
 use crate::sync::CoordinationManager;
 use crate::sync::SyncSessionHandler;
 use crate::transport::{dial_session_provider, TransportClientConfig, TransportEndpoint};
 
+use super::supervisor::{
+    run_startup_preflight, spawn_shared_ingest_writer, supervise_connection_sessions,
+    SessionTenantResolver,
+};
 use super::{
-    current_timestamp_ms, drain_batch_size, peer_fingerprint_from_hex, run_session,
-    shared_ingest_cap, IntroSpawnerFn, CONNECT_RETRY_DELAY, ENDPOINT_TTL_MS, SESSION_GAP,
-    SYNC_SESSION_TIMEOUT_SECS,
+    current_timestamp_ms, peer_fingerprint_from_hex, IntroSpawnerFn, CONNECT_RETRY_DELAY,
+    ENDPOINT_TTL_MS, SYNC_SESSION_TIMEOUT_SECS,
 };
 
 // ---------------------------------------------------------------------------
@@ -79,40 +77,12 @@ pub async fn connect_loop_with_coordination(
     ingest: IngestFns,
     coordination_manager: Arc<CoordinationManager>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    {
-        let db = open_connection(db_path)?;
-        create_tables(&db)?;
-        let purged = purge_expired_endpoints(&db, current_timestamp_ms()).unwrap_or(0);
-        if purged > 0 {
-            info!("Purged {} expired endpoint observations", purged);
-        }
-        let pq = ProjectQueue::new(&db);
-        let recovered = pq.recover_expired().unwrap_or(0);
-        if recovered > 0 {
-            info!("Recovered {} expired project_queue leases", recovered);
-        }
-        let batch_sz = drain_batch_size();
-        let drained = (ingest.drain_queue)(db_path, recorded_by, batch_sz);
-        if drained > 0 {
-            info!(
-                "Processed {} pending project_queue items from previous session",
-                drained
-            );
-        }
-    }
+    let tenants = vec![recorded_by.to_string()];
+    run_startup_preflight(db_path, &tenants, ingest)?;
 
     // Shared batch_writer: single writer thread for all outbound initiator
-    // sessions on this connect loop. Eliminates per-session writer overhead
-    // and SQLite WAL contention.
-    let ingest_cap = shared_ingest_cap();
-    let (shared_tx, shared_rx) = mpsc::channel::<IngestItem>(ingest_cap);
-    let shared_events = Arc::new(AtomicU64::new(0));
-    let writer_events = shared_events.clone();
-    let writer_db = db_path.to_string();
-    let bw = ingest.batch_writer;
-    let _writer_handle = std::thread::spawn(move || {
-        bw(writer_db, shared_rx, writer_events);
-    });
+    // sessions on this connect loop.
+    let shared_ingest = spawn_shared_ingest_writer(db_path, ingest);
 
     // Use LocalSet so the intro listener (spawn_intro_listener uses spawn_local)
     // can run on the same runtime that drives the endpoint I/O.
@@ -125,7 +95,7 @@ pub async fn connect_loop_with_coordination(
             remote,
             client_config,
             intro_spawner,
-            shared_tx,
+            shared_ingest,
             coordination_manager,
         ))
         .await
@@ -138,7 +108,7 @@ async fn connect_loop_inner(
     remote: SocketAddr,
     client_config: Option<TransportClientConfig>,
     intro_spawner: IntroSpawnerFn,
-    shared_ingest: mpsc::Sender<IngestItem>,
+    shared_ingest: tokio::sync::mpsc::Sender<crate::contracts::event_pipeline_contract::IngestItem>,
     coordination_manager: Arc<CoordinationManager>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Look up workspace SNI for this tenant (falls back to "localhost" if no trust anchor)
@@ -218,51 +188,18 @@ async fn connect_loop_inner(
             shared_ingest.clone(),
         );
 
-        // Inner loop: repeated sync sessions on this connection
-        loop {
-            // Refresh current transport peer_id each session. During identity
-            // transitions the active tenant can change; session scoping should
-            // follow the current transport identity when available.
-            let current_rb = if let Ok(db) = open_connection(db_path) {
-                crate::transport::identity::load_transport_peer_id(&db)
-                    .unwrap_or_else(|_| recorded_by.to_string())
-            } else {
-                recorded_by.to_string()
-            };
-
-            // Check if peer has been removed -- deny further sessions
-            if let Ok(db) = open_connection(db_path) {
-                if is_peer_removed(&db, &current_rb, &peer_fp).unwrap_or(false) {
-                    warn!(
-                        "Peer {} has been removed -- closing connection",
-                        &peer_id[..16.min(peer_id.len())]
-                    );
-                    connection.close(2u32.into(), b"peer removed");
-                    break;
-                }
-            }
-
-            let session = match provider.next_session().await {
-                Ok(s) => s,
-                Err(e) => {
-                    info!("Connection dropped: {}", e);
-                    break;
-                }
-            };
-
-            run_session(
-                &initiator_handler,
-                session.session_id,
-                session.io,
-                &current_rb,
-                peer_fp,
-                session.remote_addr,
-                SessionDirection::Outbound,
-                db_path,
-            )
-            .await;
-
-            tokio::time::sleep(SESSION_GAP).await;
-        }
+        let tenant_resolver = SessionTenantResolver::TransportIdentity {
+            fallback: recorded_by.to_string(),
+        };
+        supervise_connection_sessions(
+            db_path,
+            &peer_id,
+            peer_fp,
+            &provider,
+            &initiator_handler,
+            SessionDirection::Outbound,
+            &tenant_resolver,
+        )
+        .await;
     }
 }

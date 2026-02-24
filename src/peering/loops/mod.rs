@@ -12,9 +12,11 @@
 //! Sub-modules:
 //!  - `accept`   -- accept_loop, accept_loop_with_ingest, resolve_tenant_for_peer
 //!  - `connect`  -- connect_loop, connect_loop_with_coordination
+//!  - `supervisor` -- shared preflight + session lifecycle supervision
 
 mod accept;
 mod connect;
+mod supervisor;
 
 // Re-export public API so callers can still `use crate::peering::loops::*`.
 pub use accept::{accept_loop, accept_loop_with_ingest};

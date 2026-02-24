@@ -299,13 +299,11 @@ async fn run_sync_on_punched_connection(
         remote_addr: session.remote_addr,
         direction: SessionDirection::Outbound,
     };
+    // Punched connections route through the same outbound coordinator model as
+    // connect-loop sessions so runtime initiator behavior stays consistent.
     let coordination_manager = std::sync::Arc::new(CoordinationManager::new());
-    let handler = SyncSessionHandler::outbound(
-        db_path.to_string(),
-        60,
-        coordination_manager,
-        shared_ingest,
-    );
+    let handler =
+        SyncSessionHandler::outbound(db_path.to_string(), 60, coordination_manager, shared_ingest);
 
     if let Err(e) = handler
         .on_session(meta, session.io, CancellationToken::new())
