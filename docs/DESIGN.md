@@ -64,6 +64,7 @@ Text slots use fixed-size UTF-8 with mandatory zero-padding: unused bytes after 
 Encrypted event wire size is deterministic by `inner_type_code` (inner types are fixed-size).
 File slice events use a canonical fixed ciphertext size; final plaintext chunks are padded before encryption.
 `signed_memo` events (type 4) are canonical shared signed text events with a fixed 1024-byte text slot and normal signer-field verification.
+`bench_dep` events (type 26) are fixed-size shared benchmark events for dependency/cascade performance testing; they are non-encryptable and project no domain rows beyond validity state.
 
 ## 1.3 Event identity and signatures
 
@@ -433,6 +434,7 @@ The production peering runtime follows a single conceptual loop:
 - **Target planning**: `src/peering/runtime/target_planner.rs` — the single source of truth for dial target decisions. Bootstrap autodial and mDNS discovery both route through this module.
 - **Transport connection lifecycle**: `src/transport/connection_lifecycle.rs` — sole owner of QUIC `connect/accept` and TLS peer identity extraction for peering paths (`dial_peer`, `accept_peer`).
 - **Transport session factory**: `src/transport/session_factory.rs` — sole owner of QUIC stream opening and `DualConnection` / `QuicTransportSessionIo` construction. Provides `open_session_io()` and `accept_session_io()` that return `(session_id, Box<dyn TransportSessionIo>)`.
+- **Transport session I/O adapter**: `src/transport/transport_session_io.rs` — sole owner of frame boundary validation (`parse_frame` exact-consumption), max-frame-size enforcement, and mapping between QUIC stream errors and `TransportSessionIoError`.
 - **Peering orchestration seam**: `src/peering/loops/mod.rs::run_session` — wires session metadata, peer-removal cancellation, and the session handler together. Receives pre-built `TransportSessionIo` from the transport session factory.
 - **Bootstrap test helpers**: `src/testutil/bootstrap.rs` — test-only. Production runtime never depends on these; bootstrap progression is driven by the autodial loop polling projected SQL state.
 
@@ -1113,6 +1115,12 @@ Initial event-size policy:
 Trust and key sets use SQL indexed point lookups, not full in-memory loading. The projection tables (`trust_anchors`, identity chain tables, bootstrap trust tables) are queried on demand with indexed `(recorded_by, ...)` keys.
 
 A bounded hot cache holds recently accessed keys to avoid redundant SQL round-trips during burst projection. The cache is size-limited and evicts LRU entries; it never grows unbounded.
+
+Runtime low-memory mode is enabled by env vars `LOW_MEM_IOS` or `LOW_MEM` (truthy except `0`/`false`). Queue/runtime tuning values are centralized in `src/tuning.rs`, including:
+1. projection drain/write batch sizing,
+2. shared ingest channel caps,
+3. session ingest caps,
+4. transport receive-buffer limits.
 
 Validation scale requirements: the low-memory path must remain stable at >= 1,000,000 canonical events on disk and >= 100,000 peer trust keys while staying within the 24 MiB steady-state RSS ceiling. Throughput may degrade to preserve the memory bound.
 
