@@ -164,39 +164,14 @@ flowchart TD
     SYNC --> PEER
 ```
 
-## 4) Simplified SQLite View (Cylinders)
+## 4) Simplified SQLite View (Collapsed Local + Incoming Paths)
 
 ```mermaid
 flowchart TD
     LOCAL["Local create events"] --> INGEST["shared ingest + batch_writer"]
 
-    subgraph NET["Peering + Transport Capsule"]
-      EP["QUIC endpoint"] --> LIFE["connection_lifecycle"]
-      LIFE --> FACT["session_factory"]
-      FACT --> SESS["sync sessions"]
-      SESS --> RECV["receiver task"]
-      RECV --> INCOMING["incoming sync events"]
-    end
-
-    INCOMING --> INGEST
-    INGEST --> STORE["events + recorded + neg persist"]
-    STORE --> QDB[("SQLite Queues")]
-    QDB --> APPLY["project_one + cascade"]
-    APPLY --> PDB[("SQLite Projections")]
-
-    CTRL["Sync control stream\n(HaveList / need_ids)"] --> QDB
-    PDB --> TRUST["transport trust decisions"]
-    TRUST --> LIFE
-```
-
-## 5) Draft: Split Local Create vs Incoming Sync Events
-
-```mermaid
-flowchart TD
-    LOCAL["Local create events"] --> INGEST["shared ingest + batch_writer"]
-
-    subgraph WIRE["Incoming Wire Path"]
-      QEP["QUIC endpoint"] --> LIFE["connection_lifecycle\naccept_peer / dial_peer"]
+    subgraph NET["Incoming Wire Path"]
+      EP["QUIC endpoint"] --> LIFE["connection_lifecycle\naccept_peer / dial_peer"]
       LIFE --> FACT["session_factory"]
       FACT --> SESS["sync session (data stream)"]
       SESS --> RECV["receiver task"]
@@ -204,7 +179,6 @@ flowchart TD
     end
 
     INCOMING --> INGEST
-
     INGEST --> STORE["events + recorded + neg persist"]
     STORE --> QDB[("SQLite Queues")]
     QDB --> APPLY["project_one + cascade"]
@@ -215,7 +189,7 @@ flowchart TD
     TRUST --> LIFE
 ```
 
-## 6) Draft: Prior Variant (Feedback + Explicit Control Inputs)
+## 5) Draft: Prior Variant (Historical, Pre-Default Coordination)
 
 ```mermaid
 flowchart TD
@@ -244,7 +218,7 @@ flowchart TD
     TRUST --> LIFE
 ```
 
-## 7) Draft: Control Inputs Produced By Sync Session
+## 6) Draft: Control Inputs Produced By Sync Session (Historical, Pre-Default Coordination)
 
 ```mermaid
 flowchart TD
@@ -273,6 +247,86 @@ flowchart TD
     TRUST --> LIFE
 ```
 
+## 7) Draft: QUIC Endpoints Loop (Include Other Peers)
+
+```mermaid
+flowchart TD
+    subgraph LOCAL["This node"]
+      LEP["QUIC endpoint (local)"]
+      LCOORD["CoordinationManager\n(tenant-scoped)"]
+      LEP --> LCOORD
+    end
+
+    subgraph OTHERS["Other peers (same workspace)"]
+      P1["Peer A QUIC endpoint"]
+      P2["Peer B QUIC endpoint"]
+      P3["Peer C QUIC endpoint"]
+    end
+
+    LEP -->|"sync sessions"| P1
+    P1 -->|"sync sessions"| P2
+    P2 -->|"sync sessions"| P3
+    P3 -->|"sync sessions"| LEP
+
+    LCOORD -->|"assign need_ids"| P1
+    LCOORD -->|"assign need_ids"| P2
+    LCOORD -->|"assign need_ids"| P3
+```
+
+## 8) Draft: Runtime-Coordinated Path + Peer Loop
+
+```mermaid
+flowchart TD
+    AUTO["autodial + mDNS targets"] --> LOOP["connect_loop_with_coordination threads"]
+    LOOP --> LEP["Local QUIC endpoint"]
+    LOOP --> HANDLER["SyncSessionHandler::initiator_with_coordination"]
+    HANDLER --> NEG["negentropy reconcile"]
+    NEG --> CTRL["control stream HaveList/need_ids"]
+    CTRL --> EQ["egress_queue"]
+    EQ --> DATA["data stream Event/DataDone"]
+    DATA --> INGEST["shared ingest + batch_writer"]
+    INGEST --> DB[("SQLite Queues + Projections")]
+
+    subgraph PEERS["Other peers"]
+      P1["Peer A endpoint"]
+      P2["Peer B endpoint"]
+      P3["Peer C endpoint"]
+    end
+
+    LEP --> P1
+    P1 --> P2
+    P2 --> P3
+    P3 --> LEP
+```
+
+## 9) Multi-Source Simplification Snapshot (Local `master`)
+
+1. Runtime outbound sync (bootstrap autodial + mDNS discovery) now uses tenant-scoped `CoordinationManager` plus `connect_loop_with_coordination`.
+2. Sink download benchmarks (`start_sink_download`) were moved onto the same coordinated connect-loop path.
+3. Legacy helpers still exist (`download_from_sources`, `run_coordinator`) for compatibility/testing, so simplification is substantial but not yet a full single-path deletion.
+
+## 10) Draft: Current Control-Plane Truth (Runtime Default Coordination)
+
+```mermaid
+flowchart TD
+    NEG["sync session negentropy\n(need_ids)"] --> REPORT["report need_ids\n(to tenant CoordinationManager)"]
+    REPORT --> COORD["CoordinationManager\n(runtime default path)"]
+    COORD --> ASSIGN["assigned need_ids\nfor this connection"]
+    ASSIGN --> HAVE["control stream HaveList(assigned ids)"]
+    HAVE --> EQ["egress_queue"]
+    EQ --> DATA["data stream Event/DataDone"]
+
+    subgraph RUNTIME["Production runtime target sources"]
+      AUTO["bootstrap autodial"] --> LOOP["connect_loop_with_coordination"]
+      MDNS["mDNS discovery"] --> LOOP
+    end
+
+    LOOP --> NEG
+
+    LEGACY["legacy/non-coordinated helper paths"] --> DIRECT["HaveList(all need_ids)"]
+    DIRECT --> EQ
+```
+
 ## Current Data-Flow Facts
 
 1. `egress_queue` is fed by sync control-plane `HaveList` messages, not by `batch_writer`.
@@ -282,5 +336,6 @@ flowchart TD
 5. QUIC dial/accept + peer identity extraction are transport-owned in `connection_lifecycle`.
 6. QUIC stream wiring (`open_bi`/`accept_bi`, `DualConnection`, `QuicTransportSessionIo`) is transport-owned in `session_factory`.
 7. Projection outputs both user-facing read tables and transport trust tables; trust rows feed both handshake allow/deny and bootstrap autodial.
-8. `HaveList` IDs originate from negentropy `need_ids` (and optionally coordinator-assigned subsets in download mode), then land in `egress_queue`.
+8. `HaveList` IDs originate from negentropy `need_ids`; in current runtime they are coordinator-assigned subsets by default (autodial + mDNS), then land in `egress_queue`.
 9. Foreground runtime is daemon-first (`topo start`): shutdown is coordinated by shared `shutdown_notify` (RPC `Shutdown` or Ctrl-C).
+10. Non-coordinated `need_ids -> HaveList(all)` behavior still exists in legacy helper/test paths (`download_from_sources` / direct `connect_loop`) and is no longer the primary runtime shape.
