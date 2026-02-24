@@ -299,7 +299,16 @@ async fn run_sync_on_punched_connection(
         remote_addr: session.remote_addr,
         direction: SessionDirection::Outbound,
     };
-    let handler = SyncSessionHandler::initiator(db_path.to_string(), 60, shared_ingest);
+    // Punched connections also use coordinated initiator semantics so runtime
+    // outbound sync behavior remains consistent with connect-loop supervision.
+    let coord_manager = crate::sync::CoordinationManager::new();
+    let coord = coord_manager.register_peer();
+    let handler = SyncSessionHandler::initiator_with_coordination(
+        db_path.to_string(),
+        60,
+        coord,
+        shared_ingest,
+    );
 
     if let Err(e) = handler
         .on_session(meta, session.io, CancellationToken::new())

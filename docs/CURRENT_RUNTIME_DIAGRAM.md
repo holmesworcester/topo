@@ -121,15 +121,16 @@ flowchart TD
       PROJ_Q --> PROJ["project_one + cascade"]
     end
 
-    EP --> ACCEPT["accept_loop_with_ingest thread"]
-    EP --> CONNECT["connect_loop_with_coordination threads (autodial / discovery)"]
+    EP --> ACCEPT_W["accept.rs wrappers (accept_loop / accept_loop_with_ingest)"]
+    EP --> CONNECT_W["connect.rs wrappers (connect_loop / connect_loop_with_coordination)"]
 
-    ACCEPT --> ORCH
-    CONNECT --> ORCH
-
-    subgraph ORCH["Peering Orchestration"]
-      CYCLE["loop lifecycle (retry/backoff/cancel)"]
+    subgraph ORCH["Peering Orchestration (collapsed ownership)"]
+      ACCEPT_W
+      CONNECT_W
+      SUP["loops/supervisor.rs (preflight + session supervision)"]
       INTRO["intro/punch workflows"]
+      ACCEPT_W --> SUP
+      CONNECT_W --> SUP
     end
 
     subgraph TRANS["Transport Capsule"]
@@ -139,7 +140,7 @@ flowchart TD
       IIO["intro_io / accept_and_read_intro"]
     end
 
-    ORCH --> BOUND
+    SUP --> BOUND
     INTRO --> BOUND
     BOUND --> LIFE
     BOUND --> FACT
@@ -177,6 +178,6 @@ flowchart TD
 5. QUIC dial/accept + peer identity extraction are transport-owned in `connection_lifecycle`.
 6. QUIC stream wiring (`open_bi`/`accept_bi`, `DualConnection`, `QuicTransportSessionIo`) is transport-owned in `session_factory`.
 7. Projection outputs both user-facing read tables and transport trust tables; trust rows feed both handshake allow/deny and bootstrap autodial.
-8. `HaveList` IDs originate from sync reconciliation `need_ids`; in current runtime they are coordinator-assigned subsets by default (autodial + mDNS), then land in `egress_queue`.
+8. `HaveList` IDs originate from sync reconciliation `need_ids`; runtime outbound paths use coordinator-assigned subsets (autodial, mDNS, and punched initiator sessions), then land in `egress_queue`.
 9. Foreground runtime is daemon-first (`topo start`): shutdown is coordinated by shared `shutdown_notify` (RPC `Shutdown` or Ctrl-C).
-10. Non-coordinated `need_ids -> HaveList(all)` behavior still exists in legacy helper/test paths (`download_from_sources` / direct `connect_loop`) and is no longer the primary runtime shape.
+10. Non-coordinated `need_ids -> HaveList(all)` behavior is now restricted to explicit test helpers; production peering runtime paths use coordinated initiator ownership.

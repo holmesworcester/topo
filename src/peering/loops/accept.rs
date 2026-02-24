@@ -1,28 +1,25 @@
 //! Accept-side connection loops: incoming QUIC connections and responder
 //! sync sessions.
 
-use std::sync::atomic::AtomicU64;
-use std::sync::Arc;
-
-use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::contracts::event_pipeline_contract::{IngestFns, IngestItem};
+use crate::contracts::event_pipeline_contract::IngestFns;
 use crate::contracts::peering_contract::SessionDirection;
 use crate::db::health::{purge_expired_endpoints, record_endpoint_observation};
 use crate::db::open_connection;
-use crate::db::project_queue::ProjectQueue;
-use crate::db::removal_watch::is_peer_removed;
-use crate::db::schema::create_tables;
 use crate::db::transport_trust::record_transport_binding;
 use crate::sync::SyncSessionHandler;
 use crate::transport::{
     accept_session_provider, resolve_trusting_tenant, TransportClientConfig, TransportEndpoint,
 };
 
+use super::supervisor::{
+    run_startup_preflight, spawn_shared_ingest_writer, supervise_connection_sessions,
+    SessionTenantResolver,
+};
 use super::{
-    current_timestamp_ms, drain_batch_size, peer_fingerprint_from_hex, run_session,
-    shared_ingest_cap, IntroSpawnerFn, ENDPOINT_TTL_MS, SESSION_GAP, SYNC_SESSION_TIMEOUT_SECS,
+    current_timestamp_ms, peer_fingerprint_from_hex, IntroSpawnerFn, ENDPOINT_TTL_MS,
+    SYNC_SESSION_TIMEOUT_SECS,
 };
 
 // ---------------------------------------------------------------------------
@@ -42,16 +39,7 @@ pub async fn accept_loop(
     ingest: IngestFns,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Shared batch_writer: single writer thread for all concurrent responder sessions.
-    // Eliminates SQLite WAL contention from multiple writers hitting the same DB.
-    let ingest_cap = shared_ingest_cap();
-    let (shared_ingest_tx, shared_ingest_rx) = mpsc::channel::<IngestItem>(ingest_cap);
-    let shared_events_received = Arc::new(AtomicU64::new(0));
-    let writer_events = shared_events_received.clone();
-    let writer_db_path = db_path.to_string();
-    let bw = ingest.batch_writer;
-    let _writer_handle = std::thread::spawn(move || {
-        bw(writer_db_path, shared_ingest_rx, writer_events);
-    });
+    let shared_ingest_tx = spawn_shared_ingest_writer(db_path, ingest);
 
     let tenant_ids = vec![recorded_by.to_string()];
     accept_loop_with_ingest(
@@ -81,36 +69,14 @@ pub async fn accept_loop_with_ingest(
     tenant_peer_ids: &[String],
     endpoint: TransportEndpoint,
     _allowed_peers: Option<crate::transport::AllowedPeers>,
-    shared_ingest_tx: mpsc::Sender<IngestItem>,
+    shared_ingest_tx: tokio::sync::mpsc::Sender<
+        crate::contracts::event_pipeline_contract::IngestItem,
+    >,
     tenant_client_configs: std::collections::HashMap<String, TransportClientConfig>,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    {
-        let db = open_connection(db_path)?;
-        create_tables(&db)?;
-        let purged = purge_expired_endpoints(&db, current_timestamp_ms()).unwrap_or(0);
-        if purged > 0 {
-            info!("Purged {} expired endpoint observations", purged);
-        }
-        let pq = ProjectQueue::new(&db);
-        let recovered = pq.recover_expired().unwrap_or(0);
-        if recovered > 0 {
-            info!("Recovered {} expired project_queue leases", recovered);
-        }
-        // Drain pending project_queue items for ALL tenants
-        let batch_sz = drain_batch_size();
-        for tenant_id in tenant_peer_ids {
-            let drained = (ingest.drain_queue)(db_path, tenant_id, batch_sz);
-            if drained > 0 {
-                info!(
-                    "Processed {} pending project_queue items for tenant {}",
-                    drained,
-                    &tenant_id[..16.min(tenant_id.len())]
-                );
-            }
-        }
-    }
+    run_startup_preflight(db_path, tenant_peer_ids, ingest)?;
 
     loop {
         info!("Waiting for incoming connection...");
@@ -214,43 +180,18 @@ pub async fn accept_loop_with_ingest(
                     SYNC_SESSION_TIMEOUT_SECS,
                     ingest_clone.clone(),
                 );
+                let tenant_resolver = SessionTenantResolver::Fixed(recorded_by_owned.clone());
 
-                loop {
-                    // Check if peer has been removed -- deny further sessions
-                    // and close the connection.
-                    if let Ok(db) = open_connection(&db_path_owned) {
-                        if is_peer_removed(&db, &recorded_by_owned, &peer_fp).unwrap_or(false) {
-                            warn!(
-                                "Peer {} has been removed -- closing connection",
-                                &peer_id[..16.min(peer_id.len())]
-                            );
-                            connection.close(2u32.into(), b"peer removed");
-                            break;
-                        }
-                    }
-
-                    let session = match provider.next_session().await {
-                        Ok(s) => s,
-                        Err(e) => {
-                            info!("Connection dropped: {}", e);
-                            break;
-                        }
-                    };
-
-                    run_session(
-                        &responder_handler,
-                        session.session_id,
-                        session.io,
-                        &recorded_by_owned,
-                        peer_fp,
-                        session.remote_addr,
-                        SessionDirection::Inbound,
-                        &db_path_owned,
-                    )
-                    .await;
-
-                    tokio::time::sleep(SESSION_GAP).await;
-                }
+                supervise_connection_sessions(
+                    &db_path_owned,
+                    &peer_id,
+                    peer_fp,
+                    &provider,
+                    &responder_handler,
+                    SessionDirection::Inbound,
+                    &tenant_resolver,
+                )
+                .await;
             }));
         });
     }
