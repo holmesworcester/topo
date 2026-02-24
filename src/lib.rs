@@ -1,21 +1,17 @@
-pub mod assert;
-pub mod contracts;
-pub mod crypto;
-pub mod db;
-pub mod db_registry;
 pub mod event_modules;
-pub mod event_pipeline;
-pub mod node;
-pub mod peering;
-pub mod projection;
-pub mod protocol;
-pub mod rpc;
 pub mod runtime;
-pub mod service;
-pub mod sync;
+pub mod shared;
+pub mod state;
 pub mod testutil;
-pub mod transport;
-pub mod tuning;
+
+pub use runtime::control::{assert, db_registry, node, rpc, service};
+pub use runtime::peering;
+pub use runtime::sync_engine as sync;
+pub use runtime::transport;
+pub use shared::{contracts, crypto, protocol, tuning};
+pub use state::db;
+pub use state::pipeline as event_pipeline;
+pub use state::projection_state as projection;
 
 #[cfg(test)]
 mod boundary_tests {

@@ -40,7 +40,7 @@ discovery = ["mdns-sd"]
 
 [[bin]]
 name = "topo"
-path = "src/main.rs"
+path = "src/runtime/control/main.rs"
 
 [dev-dependencies]
 
