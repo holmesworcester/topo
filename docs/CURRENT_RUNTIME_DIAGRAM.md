@@ -169,11 +169,12 @@ flowchart TD
     end
 
     subgraph TRANS["Transport"]
+      direction LR
       EP["single QUIC endpoint"]
       BOUND["peering_boundary (contract helpers)"]
-      LIFE["connection_lifecycle / accept_peer / dial_peer"]
-      FACT["session_factory / accept/open_session_io"]
-      IIO["intro_io / accept_and_read_intro"]
+      LIFE["connection lifecycle"]
+      FACT["session factory"]
+      IIO["intro io"]
       TRUST_READ["SQL trust read"]
     end
 
