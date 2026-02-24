@@ -146,12 +146,39 @@ pub fn query_field(
     }
 }
 
+fn resolve_assert_recorded_by(
+    db: &rusqlite::Connection,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let transport_peer_id = load_transport_peer_id(db)?;
+    let has_scope: bool = db.query_row(
+        "SELECT COUNT(*) > 0 FROM trust_anchors WHERE peer_id = ?1",
+        rusqlite::params![&transport_peer_id],
+        |row| row.get(0),
+    )?;
+    if has_scope {
+        return Ok(transport_peer_id);
+    }
+
+    let scoped_peers: Vec<String> = {
+        let mut stmt = db.prepare("SELECT DISTINCT peer_id FROM trust_anchors ORDER BY peer_id")?;
+        let peers = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        peers
+    };
+    if scoped_peers.len() == 1 {
+        return Ok(scoped_peers[0].clone());
+    }
+
+    Ok(transport_peer_id)
+}
+
 // ---------------------------------------------------------------------------
 // Polling assertion
 // ---------------------------------------------------------------------------
 
 /// Poll a predicate until it passes or times out.
-/// Re-resolves recorded_by each iteration (handles identity migration).
+/// Re-resolves tenant scope each iteration.
 pub fn assert_eventually(
     db_path: &str,
     predicate_str: &str,
@@ -166,7 +193,7 @@ pub fn assert_eventually(
     let interval = Duration::from_millis(interval_ms);
 
     loop {
-        let recorded_by = load_transport_peer_id(&db)?;
+        let recorded_by = resolve_assert_recorded_by(&db)?;
         let actual = query_field(&db, &field, &recorded_by)?;
         if op.eval(actual, expected) {
             return Ok(AssertResponse {
