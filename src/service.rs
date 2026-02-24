@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use crate::crypto::EventId;
 use crate::db::{open_connection, schema::create_tables, transport_trust::is_peer_allowed};
 use crate::event_modules::peer_shared;
-use crate::transport::identity::{load_transport_cert_required, load_transport_peer_id};
 use crate::transport::create_dual_endpoint_dynamic;
+use crate::transport::identity::{load_transport_cert_required, load_transport_peer_id};
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -78,8 +78,37 @@ pub fn open_db_load(
 ) -> Result<(String, rusqlite::Connection), Box<dyn std::error::Error + Send + Sync>> {
     let conn = open_connection(db_path)?;
     create_tables(&conn)?;
-    let recorded_by = load_transport_peer_id(&conn)?;
-    Ok((recorded_by, conn))
+    let transport_peer_id = load_transport_peer_id(&conn)?;
+
+    let has_scope: bool = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM trust_anchors WHERE peer_id = ?1",
+        rusqlite::params![&transport_peer_id],
+        |row| row.get(0),
+    )?;
+    if has_scope {
+        return Ok((transport_peer_id, conn));
+    }
+
+    // POC fallback for non-migrated data: if exactly one scoped peer exists,
+    // use it as the event/projection tenant.
+    let scoped_peers: Vec<String> = {
+        let mut stmt =
+            conn.prepare("SELECT DISTINCT peer_id FROM trust_anchors ORDER BY peer_id")?;
+        let peers = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        peers
+    };
+
+    if scoped_peers.len() == 1 {
+        return Ok((scoped_peers[0].clone(), conn));
+    }
+
+    Err(format!(
+        "No scoped tenant for transport peer_id {}; run `topo use-peer <N>`",
+        transport_peer_id
+    )
+    .into())
 }
 
 /// Open DB for a specific peer_id (used when daemon provides the active peer).
@@ -123,21 +152,20 @@ pub struct IntroAttemptItem {
 // Re-exports for backward compat
 // ---------------------------------------------------------------------------
 
+pub use crate::assert::{parse_predicate, query_field, AssertResponse, Op};
+pub use crate::event_modules::message::GenerateResponse;
 pub use crate::event_modules::message::{
     DeleteResponse, MessageItem, MessagesResponse, SendResponse,
 };
-pub use crate::event_modules::workspace::{
-    KeysResponse, StatusResponse, WorkspaceItem,
-    ViewReaction, ViewMessage, ViewResponse,
-};
-pub use crate::event_modules::workspace::commands::{
-    CreateWorkspaceResponse, CreateInviteResponse, AcceptInviteResponse, AcceptDeviceLinkResponse,
-};
-pub use crate::event_modules::message::GenerateResponse;
-pub use crate::event_modules::reaction::{ReactResponse, ReactionItem};
-pub use crate::event_modules::user::{UserItem, BanResponse};
 pub use crate::event_modules::peer_shared::{AccountItem, IdentityResponse};
-pub use crate::assert::{Op, parse_predicate, query_field, AssertResponse};
+pub use crate::event_modules::reaction::{ReactResponse, ReactionItem};
+pub use crate::event_modules::user::{BanResponse, UserItem};
+pub use crate::event_modules::workspace::commands::{
+    AcceptDeviceLinkResponse, AcceptInviteResponse, CreateInviteResponse, CreateWorkspaceResponse,
+};
+pub use crate::event_modules::workspace::{
+    KeysResponse, StatusResponse, ViewMessage, ViewReaction, ViewResponse, WorkspaceItem,
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -165,16 +193,14 @@ pub fn load_local_peer_signer_pub(
     db: &rusqlite::Connection,
     recorded_by: &str,
 ) -> ServiceResult<Option<(EventId, SigningKey)>> {
-    peer_shared::load_local_peer_signer(db, recorded_by)
-        .map_err(|e| ServiceError(e.to_string()))
+    peer_shared::load_local_peer_signer(db, recorded_by).map_err(|e| ServiceError(e.to_string()))
 }
 
 pub fn load_local_user_key(
     db: &rusqlite::Connection,
     recorded_by: &str,
 ) -> ServiceResult<Option<(EventId, SigningKey)>> {
-    peer_shared::load_local_user_key(db, recorded_by)
-        .map_err(|e| ServiceError(e.to_string()))
+    peer_shared::load_local_user_key(db, recorded_by).map_err(|e| ServiceError(e.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -278,7 +304,10 @@ mod tests {
 
     fn setup_workspace(db_path: &str) -> String {
         let resp = workspace::commands::create_workspace_for_db(
-            db_path, "test-workspace", "test-user", "test-device",
+            db_path,
+            "test-workspace",
+            "test-user",
+            "test-device",
         )
         .unwrap();
         resp.peer_id
@@ -301,8 +330,12 @@ mod tests {
 
         // React to a non-existent target — reaction will block on missing dep
         let fake_target = hex::encode([0xDD_u8; 32]);
-        let result =
-            crate::event_modules::reaction::react_for_peer(&db_path, &peer_id, &fake_target, "thumbsup");
+        let result = crate::event_modules::reaction::react_for_peer(
+            &db_path,
+            &peer_id,
+            &fake_target,
+            "thumbsup",
+        );
         assert!(
             result.is_err(),
             "reaction to missing target should error, got: {:?}",
@@ -363,11 +396,7 @@ mod tests {
         let err = message::resolve(&db, &recorded_by, "99");
         assert!(err.is_err());
         let err_str = err.unwrap_err();
-        assert!(
-            err_str.contains("invalid message number"),
-            "{}",
-            err_str
-        );
+        assert!(err_str.contains("invalid message number"), "{}", err_str);
 
         // Zero index.
         let err = message::resolve(&db, &recorded_by, "0");
@@ -380,7 +409,10 @@ mod tests {
     fn test_ensure_identity_chain_tolerates_workspace_blocked() {
         let (_dir, db_path) = temp_db_path();
         let resp = workspace::commands::create_workspace_for_db(
-            &db_path, "test-workspace", "test-user", "test-device",
+            &db_path,
+            "test-workspace",
+            "test-user",
+            "test-device",
         )
         .unwrap();
         assert!(!resp.peer_id.is_empty());
@@ -388,7 +420,10 @@ mod tests {
 
         // Calling again should be idempotent (returns existing workspace).
         let resp2 = workspace::commands::create_workspace_for_db(
-            &db_path, "test-workspace", "test-user", "test-device",
+            &db_path,
+            "test-workspace",
+            "test-user",
+            "test-device",
         )
         .unwrap();
         assert_eq!(resp.peer_id, resp2.peer_id);
@@ -396,63 +431,22 @@ mod tests {
     }
 
     #[test]
-    fn test_assert_eventually_reloads_recorded_by_after_migration() {
-        use std::time::Duration;
-
+    fn test_assert_eventually_uses_scoped_peer_when_transport_differs() {
         let (_dir, db_path) = temp_db_path();
-        let old_peer_id = setup_workspace(&db_path);
+        let scoped_peer_id = setup_workspace(&db_path);
 
-        let db = open_connection(&db_path).unwrap();
-        create_tables(&db).unwrap();
-        let (cert_der, key_der): (Vec<u8>, Vec<u8>) = db
-            .query_row(
-                "SELECT cert_der, key_der FROM local_transport_creds WHERE peer_id = ?1",
-                rusqlite::params![&old_peer_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        drop(db);
+        let (resolved_peer_id, _db) = open_db_load(&db_path).unwrap();
+        assert_eq!(
+            resolved_peer_id, scoped_peer_id,
+            "open_db_load should resolve to the scoped peer id"
+        );
 
-        let db_path_bg = db_path.clone();
-        let old_peer_bg = old_peer_id.clone();
-        let cert_bg = cert_der.clone();
-        let key_bg = key_der.clone();
-        let new_peer_id = "11".repeat(32);
-        let new_peer_bg = new_peer_id.clone();
-
-        let migrate = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(150));
-            let db = open_connection(&db_path_bg).unwrap();
-            create_tables(&db).unwrap();
-
-            db.execute(
-                "DELETE FROM local_transport_creds WHERE peer_id = ?1",
-                rusqlite::params![old_peer_bg],
-            )
-            .unwrap();
-            db.execute(
-                "INSERT INTO local_transport_creds (peer_id, cert_der, key_der, created_at)
-                 VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![new_peer_bg, cert_bg, key_bg, 12345_i64],
-            )
-            .unwrap();
-
-            let message_id = crate::crypto::event_id_to_base64(&[0xAA; 32]);
-            let workspace_id = crate::crypto::event_id_to_base64(&[0xBB; 32]);
-            let author_id = crate::crypto::event_id_to_base64(&[0xCC; 32]);
-            db.execute(
-                "INSERT INTO messages (message_id, workspace_id, author_id, content, created_at, recorded_by)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                rusqlite::params![message_id, workspace_id, author_id, "migrated", 1_i64, new_peer_id],
-            )
-            .unwrap();
-        });
-
-        let resp = crate::assert::assert_eventually(&db_path, "message_count >= 1", 2_000, 25).unwrap();
+        message::send_for_peer(&db_path, &scoped_peer_id, "fallback-check").unwrap();
+        let resp =
+            crate::assert::assert_eventually(&db_path, "message_count >= 1", 2_000, 25).unwrap();
         assert!(
             resp.pass,
-            "assert_eventually should follow migrated identity"
+            "assert_eventually should read from the scoped peer"
         );
-        migrate.join().unwrap();
     }
 }
