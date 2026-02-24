@@ -15,6 +15,7 @@ These are current specs, plans, and reference material.
 | [tla/projector_spec.md](tla/projector_spec.md) | Runtime-to-model mapping for projector semantics |
 | [planning/DISCREPANCY-MATRIX.md](planning/DISCREPANCY-MATRIX.md) | Current design/plan/code discrepancy matrix |
 | [planning/IDENTITY_TRANSPORT_BOUNDARY_EXECUTION_PLAN.md](planning/IDENTITY_TRANSPORT_BOUNDARY_EXECUTION_PLAN.md) | Active boundary plan for identity workflow vs transport materialization |
+| [planning/EVENT_PIPELINE_PHASE_BOUNDARY_EXECUTION_PLAN.md](planning/EVENT_PIPELINE_PHASE_BOUNDARY_EXECUTION_PLAN.md) | Active plan for explicit ingest phase boundaries and command-driven post-commit effects |
 
 ## Canonical Module Vocabulary
 
