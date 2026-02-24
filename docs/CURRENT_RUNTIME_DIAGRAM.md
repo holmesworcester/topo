@@ -100,7 +100,7 @@ flowchart TD
     ORCH["Peering"]
     TRANS["Transport"]
     SYNC["Sync Engine"]
-    PIPE["Pipeline"]
+    PIPE["Event Pipeline"]
     PSTATE["Projection State"]
     PEERS["Peers"]
 
@@ -172,10 +172,9 @@ flowchart TD
       direction LR
       EP["single QUIC endpoint"]
       BOUND["peering_boundary (contract helpers)"]
-      LIFE["connection lifecycle"]
+      LIFE["connection lifecycle + trust read"]
       FACT["session factory"]
       IIO["intro io"]
-      TRUST_READ["SQL trust read"]
     end
 
     START --> EP
@@ -223,8 +222,7 @@ flowchart TD
     PROJ --> READS
     PROJ --> TRUST_DB
 
-    TRUST_DB --> TRUST_READ
-    TRUST_READ --> LIFE
+    TRUST_DB --> LIFE
     SHUT_N --> NODE
     SHUT_N --> RPC
 ```
@@ -237,7 +235,7 @@ flowchart TD
 - `Shared event send`: `Store::get_shared(events) -> Frame::Event`.
 - `Projection tables`: projected read models (`messages`, `users`, `peers`, `channels`).
 - `Transport trust tables`: transport trust rows (`peer_shared`, invite bootstrap records).
-- `SQL trust read`: transport-owned tenant-scoped lookup via `db::transport_trust::is_peer_allowed`, consumed by connection lifecycle.
+- `connection lifecycle + trust read`: transport-owned tenant-scoped lookup via `db::transport_trust::is_peer_allowed` plus dial/accept identity handling.
 
 ## Current Data-Flow Facts
 
