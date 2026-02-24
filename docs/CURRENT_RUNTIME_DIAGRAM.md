@@ -56,8 +56,7 @@ flowchart TD
     APPLY --> PDB[("SQLite Projections")]
 
     CTRL["Sync control stream (HaveList / need_ids)"] --> QDB
-    PDB --> TRUST["SQL trust read"]
-    TRUST --> LIFE
+    PDB -->|trust rows| LIFE
 ```
 
 ## 2) One Sync Session (Control/Data Flow)
@@ -103,7 +102,6 @@ flowchart TD
     SYNC["Sync Engine"]
     PIPE["Pipeline"]
     PSTATE["Projection State"]
-    TRUST["Transport Trust"]
     PEERS["Peers"]
 
     CTRL --> BOOT
@@ -116,8 +114,7 @@ flowchart TD
     TRANS --> SYNC
     SYNC --> PIPE
     PIPE --> PSTATE
-    PSTATE --> TRUST
-    TRUST --> TRANS
+    PSTATE -->|trust rows| TRANS
 ```
 
 ## 4) Runtime Topology (Threads + Queues + DB, Reference)
@@ -177,14 +174,10 @@ flowchart TD
       LIFE["connection_lifecycle / accept_peer / dial_peer"]
       FACT["session_factory / accept/open_session_io"]
       IIO["intro_io / accept_and_read_intro"]
-    end
-
-    subgraph TRUST_POL["Transport Trust"]
-      TRUST["SQL trust read"]
+      TRUST_READ["SQL trust read"]
     end
 
     START --> EP
-    START --> TRUST
     BOOT_WR --> WRITER
     BOOT_COORD --> CONN_LOOPS
     BOOT_TARGET --> CONN_LOOPS
@@ -228,8 +221,8 @@ flowchart TD
     PROJ --> READS
     PROJ --> TRUST_DB
 
-    TRUST_DB --> TRUST
-    LIFE --> TRUST
+    TRUST_DB --> TRUST_READ
+    TRUST_READ --> LIFE
     SHUT_N --> NODE
     SHUT_N --> RPC
 ```
@@ -242,7 +235,7 @@ flowchart TD
 - `Shared event send`: `Store::get_shared(events) -> Frame::Event`.
 - `Projection tables`: projected read models (`messages`, `users`, `peers`, `channels`).
 - `Transport trust tables`: transport trust rows (`peer_shared`, invite bootstrap records).
-- `SQL trust read`: tenant-scoped allow/deny via `db::transport_trust::is_peer_allowed`, consumed by transport lifecycle.
+- `SQL trust read`: transport-owned tenant-scoped lookup via `db::transport_trust::is_peer_allowed`, consumed by connection lifecycle.
 
 ## Current Data-Flow Facts
 
@@ -256,4 +249,4 @@ flowchart TD
 8. `HaveList` IDs originate from sync reconciliation `need_ids`; runtime initiator sessions use coordinator-assigned subsets (autodial + mDNS), then land in `egress_queue`.
 9. Foreground runtime is daemon-first (`topo start`): shutdown is coordinated by shared `shutdown_notify` (RPC `Shutdown` or Ctrl-C).
 10. Runtime and helper initiator sessions both route pull assignment through the coordinator; there is no direct `need_ids -> HaveList(all)` bypass path.
-11. Transport trust checks now read `db::transport_trust::is_peer_allowed` directly; the separate trust-oracle adapter layer is removed.
+11. Transport trust checks now read `db::transport_trust::is_peer_allowed` directly inside transport; the separate trust-oracle adapter layer is removed.
