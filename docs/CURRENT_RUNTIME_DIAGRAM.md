@@ -42,8 +42,8 @@ flowchart TD
     OTHERS["Other peers"] -->|"sync sessions"| EP
 
     subgraph NET["Incoming Wire"]
-      EP["QUIC endpoint"] --> LIFE["connection_lifecycle / accept_peer / dial_peer"]
-      LIFE --> FACT["session_factory"]
+      EP["QUIC endpoint"] --> LIFE["connection lifecycle"]
+      LIFE --> FACT["session factory"]
       FACT --> SESS["sync session (data stream)"]
       SESS --> RECV["receiver task"]
       RECV --> INCOMING["incoming sync events"]
@@ -97,7 +97,7 @@ flowchart TD
 flowchart TD
     CTRL["Control"]
     BOOT["Setup"]
-    ORCH["Peering"]
+    RSUP["Runtime Supervisor"]
     TRANS["Transport"]
     SYNC["Sync Engine"]
     PIPE["Event Pipeline"]
@@ -106,10 +106,10 @@ flowchart TD
 
     CTRL --> BOOT
     CTRL --> PIPE
-    BOOT --> ORCH
+    BOOT --> RSUP
     BOOT --> TRANS
     BOOT --> PIPE
-    ORCH --> TRANS
+    RSUP --> TRANS
     PEERS --> TRANS
     TRANS --> SYNC
     SYNC --> PIPE
@@ -138,9 +138,7 @@ flowchart TD
       EMQ --> LOCAL["local create path / create_*_event_sync"]
     end
 
-    subgraph BOOT["Setup"]
-      START["setup_endpoint_and_tenants"]
-    end
+    START["setup_endpoint_and_tenants"]
 
     subgraph RUNTIME_SUP["Runtime Supervisor (single owner)"]
       RSUP["runtime::supervisor::RuntimeSupervisor"]
@@ -150,18 +148,15 @@ flowchart TD
       DISPATCHER["single target dispatcher"]
       ACCEPT_W["accept-loop worker"]
       CONNECT_W["connect-loop workers"]
-      BOOT_REFRESH["bootstrap refresher worker"]
-      DISC_ING["discovery ingress workers"]
+      INGRESS_W["target ingress workers"]
       RSUP --> RSTATE
       RSUP --> RCANCEL
       RSUP --> ACCEPT_W
-      RSUP --> BOOT_REFRESH
-      RSUP --> DISC_ING
+      RSUP --> INGRESS_W
       RSUP --> TARGET_Q
       TARGET_Q --> DISPATCHER
       DISPATCHER --> CONNECT_W
-      BOOT_REFRESH --> TARGET_Q
-      DISC_ING --> TARGET_Q
+      INGRESS_W --> TARGET_Q
     end
 
     NODE --> START
@@ -178,13 +173,6 @@ flowchart TD
       P3 --> PROJ["project_one + cascade"]
     end
 
-    subgraph ORCH["Peering"]
-      CONN_LOOPS["connection loops (accept + connect)"]
-      CYCLE["loop lifecycle (retry/backoff/cancel)"]
-      INTRO["intro/punch workflows"]
-      CONN_LOOPS --> CYCLE
-    end
-
     subgraph TRANS["Transport"]
       direction LR
       EP["single QUIC endpoint"]
@@ -196,10 +184,8 @@ flowchart TD
 
     START --> EP
     RSUP --> WRITER
-    ACCEPT_W --> CONN_LOOPS
-    CONNECT_W --> CONN_LOOPS
-    ORCH --> BOUND
-    INTRO --> BOUND
+    ACCEPT_W --> BOUND
+    CONNECT_W --> BOUND
     BOUND --> LIFE
     BOUND --> FACT
     BOUND --> IIO
@@ -245,7 +231,7 @@ flowchart TD
 ```
 
 **Runtime Topology Legend**
-- `runtime::supervisor::RuntimeSupervisor`: single owner for long-lived runtime workers (writer, accept loop, unified target dispatcher, bootstrap/discovery ingress).
+- `runtime::supervisor::RuntimeSupervisor`: single owner for long-lived runtime workers (writer, accept loop, unified target dispatcher, target ingress workers).
 - `service.rs helpers`: `open_db_*`, node status helpers, intro transport helper entry points.
 - `Persist + enqueue`: phase 1 persists events/recorded/sync state and enqueues `project_queue`.
 - `Sync control`: sync control stream messages including `HaveList` and `Done`.
