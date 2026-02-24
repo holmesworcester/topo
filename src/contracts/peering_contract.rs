@@ -32,20 +32,6 @@ pub struct SessionMeta {
     pub direction: SessionDirection,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TrustDecision {
-    Allow,
-    Deny,
-}
-
-#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
-pub enum TrustError {
-    #[error("trust store unavailable")]
-    StoreUnavailable,
-    #[error("trust oracle internal error: {0}")]
-    Internal(String),
-}
-
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum TransportSessionIoError {
     #[error("connection lost")]
@@ -58,15 +44,6 @@ pub enum TransportSessionIoError {
     Timeout,
     #[error("session io internal error: {0}")]
     Internal(String),
-}
-
-#[async_trait]
-pub trait TrustOracle: Send + Sync {
-    async fn check(
-        &self,
-        tenant: &TenantId,
-        peer: &PeerFingerprint,
-    ) -> Result<TrustDecision, TrustError>;
 }
 
 /// Control stream: bidirectional (send + recv) for negentropy and protocol messages.

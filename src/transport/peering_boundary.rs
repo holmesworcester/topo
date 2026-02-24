@@ -9,11 +9,10 @@ use std::sync::Arc;
 
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 
-use crate::contracts::peering_contract::{
-    PeerFingerprint, TenantId, TransportSessionIo, TrustDecision,
-};
+use crate::contracts::peering_contract::TransportSessionIo;
 use crate::db::open_connection;
 use crate::db::transport_creds::load_local_creds;
+use crate::db::transport_trust::is_peer_allowed;
 use crate::protocol::{encode_frame, Frame};
 
 use super::connection_lifecycle::{
@@ -21,9 +20,7 @@ use super::connection_lifecycle::{
 };
 use super::multi_workspace::WorkspaceCertResolver;
 use super::session_factory::{accept_session_io, open_session_io, SessionOpenError};
-use super::{
-    create_single_port_endpoint, workspace_client_config, DynamicAllowFn, SqliteTrustOracle,
-};
+use super::{create_single_port_endpoint, workspace_client_config, DynamicAllowFn};
 
 pub type TransportEndpoint = quinn::Endpoint;
 pub type TransportConnection = quinn::Connection;
@@ -97,14 +94,11 @@ pub fn create_runtime_endpoint_for_tenants(
     default_client_cert: CertificateDer<'static>,
     default_client_key: PrivatePkcs8KeyDer<'static>,
 ) -> Result<TransportEndpoint, Box<dyn std::error::Error + Send + Sync>> {
-    let trust_oracle = SqliteTrustOracle::new(db_path);
+    let db_path = db_path.to_string();
     let dynamic_allow: Arc<DynamicAllowFn> = Arc::new(move |peer_fp: &[u8; 32]| {
         for tenant_id in &tenant_peer_ids {
-            match trust_oracle.check_sync(&TenantId(tenant_id.clone()), &PeerFingerprint(*peer_fp))
-            {
-                Ok(TrustDecision::Allow) => return Ok(true),
-                Ok(TrustDecision::Deny) => {}
-                Err(e) => return Err(e.to_string().into()),
+            if tenant_trusts_peer(&db_path, tenant_id, *peer_fp)? {
+                return Ok(true);
             }
         }
         Ok(false)
@@ -125,14 +119,10 @@ pub fn build_tenant_client_config_from_creds(
     cert_der: CertificateDer<'static>,
     key_der: PrivatePkcs8KeyDer<'static>,
 ) -> Result<TransportClientConfig, Box<dyn std::error::Error + Send + Sync>> {
-    let oracle = SqliteTrustOracle::new(db_path);
-    let tid = TenantId(tenant_id.to_string());
+    let db_path = db_path.to_string();
+    let tenant_id = tenant_id.to_string();
     let tenant_allow: Arc<DynamicAllowFn> = Arc::new(move |peer_fp: &[u8; 32]| {
-        match oracle.check_sync(&tid, &PeerFingerprint(*peer_fp)) {
-            Ok(TrustDecision::Allow) => Ok(true),
-            Ok(TrustDecision::Deny) => Ok(false),
-            Err(e) => Err(e.to_string().into()),
-        }
+        tenant_trusts_peer(&db_path, &tenant_id, *peer_fp)
     });
     workspace_client_config(cert_der, key_der, tenant_allow)
 }
@@ -156,13 +146,8 @@ pub fn tenant_trusts_peer(
     tenant_id: &str,
     peer_fp: [u8; 32],
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    let oracle = SqliteTrustOracle::new(db_path);
-    let decision = oracle.check_sync(&TenantId(tenant_id.to_string()), &PeerFingerprint(peer_fp));
-    match decision {
-        Ok(TrustDecision::Allow) => Ok(true),
-        Ok(TrustDecision::Deny) => Ok(false),
-        Err(e) => Err(e.to_string().into()),
-    }
+    let db = open_connection(db_path)?;
+    is_peer_allowed(&db, tenant_id, &peer_fp)
 }
 
 pub fn resolve_trusting_tenant(

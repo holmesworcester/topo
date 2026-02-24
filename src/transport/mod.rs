@@ -8,7 +8,6 @@ pub mod multi_workspace;
 pub mod peering_boundary;
 pub mod session_factory;
 pub mod transport_session_io;
-pub mod trust_oracle;
 
 pub use cert::{
     extract_spki_fingerprint, generate_keypair, generate_self_signed_cert,
@@ -25,7 +24,6 @@ pub use peering_boundary::{
     TenantClientConfigs, TransportClientConfig, TransportConnection, TransportEndpoint,
 };
 pub use transport_session_io::{QuicTransportSessionIo, DEFAULT_SYNC_FRAME_MAX_BYTES};
-pub use trust_oracle::SqliteTrustOracle;
 
 use quinn::{ClientConfig, Endpoint, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};

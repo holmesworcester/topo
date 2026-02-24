@@ -32,7 +32,7 @@ These are the current source module names. Active docs should use these names ex
 | `projection/apply` | `src/projection/apply/` | Projection pipeline: `project_one`, cascade, context, dispatch, stages |
 | `projection` | `src/projection/` | Projection create, encrypted, signer, decision, emit helpers |
 | `identity` | `src/identity/` | Transport identity, identity ops (bootstrap, invite, accept) |
-| `transport` | `src/transport/` | Cert generation, mTLS, trust oracle, multi-workspace cert resolver |
+| `transport` | `src/transport/` | Cert generation, mTLS, SQL trust policy reads, multi-workspace cert resolver |
 | `db` | `src/db/` | Schema, migrations, queues, trust, removal watch |
 
 ### Superseded names (do not use in active docs)
