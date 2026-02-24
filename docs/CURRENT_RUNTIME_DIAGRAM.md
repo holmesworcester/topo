@@ -91,7 +91,35 @@ flowchart TD
     DD --> SHUT["Done / DoneAck shutdown protocol"]
 ```
 
-## 3) Runtime Topology (Threads + Queues + DB, Reference)
+## 3) High-Level Runtime Boundaries
+
+```mermaid
+flowchart TD
+    CTRL["Daemon Control Plane"]
+    BOOT["Runtime Bootstrap"]
+    ORCH["Peering Orchestration"]
+    TRANS["Transport Capsule"]
+    SYNC["Sync Engine"]
+    PIPE["Event Pipeline"]
+    PSTATE["SQLite Projection State"]
+    TRUST["Trust Oracle"]
+    PEERS["Other peers"]
+
+    CTRL --> BOOT
+    CTRL --> PIPE
+    BOOT --> ORCH
+    BOOT --> TRANS
+    BOOT --> PIPE
+    ORCH --> TRANS
+    PEERS --> TRANS
+    TRANS --> SYNC
+    SYNC --> PIPE
+    PIPE --> PSTATE
+    PSTATE --> TRUST
+    TRUST --> TRANS
+```
+
+## 4) Runtime Topology (Threads + Queues + DB, Reference)
 
 ```mermaid
 flowchart TD
@@ -122,7 +150,6 @@ flowchart TD
     end
 
     NODE --> START
-    START --> TRUST["SqliteTrustOracle (tenant-scoped allow/deny)"]
 
     subgraph PIPE["Event Pipeline (shared ingest -> projection)"]
       LOCAL --> INGEST["shared ingest channel (mpsc)"]
@@ -148,11 +175,13 @@ flowchart TD
       EP["single QUIC endpoint"]
       BOUND["peering_boundary (contract helpers)"]
       LIFE["connection_lifecycle / accept_peer / dial_peer"]
+      TRUST["SqliteTrustOracle (tenant-scoped allow/deny)"]
       FACT["session_factory / accept/open_session_io"]
       IIO["intro_io / accept_and_read_intro"]
     end
 
     START --> EP
+    START --> TRUST
     BOOT_WR --> WRITER
     BOOT_COORD --> CONNECT
     BOOT_TARGET --> CONNECT
@@ -197,7 +226,7 @@ flowchart TD
     PROJ --> TRUST_DB
 
     TRUST_DB --> TRUST
-    TRUST --> LIFE
+    LIFE --> TRUST
     SHUT_N --> NODE
     SHUT_N --> RPC
 ```
