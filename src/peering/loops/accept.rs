@@ -1,6 +1,7 @@
 //! Accept-side connection loops: incoming QUIC connections and responder
 //! sync sessions.
 
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::contracts::event_pipeline_contract::IngestFns;
@@ -28,9 +29,8 @@ use super::{
 
 /// Accept incoming connections and run responder sync sessions.
 ///
-/// Each incoming connection is handled on its own thread so multiple sources
-/// can sync simultaneously. A shared ingress dedup set prevents redundant
-/// batch_writer processing when multiple sources offer the same event.
+/// Each incoming connection is handled concurrently. A shared ingest writer
+/// is used for all responder sessions.
 pub async fn accept_loop(
     db_path: &str,
     recorded_by: &str,
@@ -42,10 +42,11 @@ pub async fn accept_loop(
     let shared_ingest_tx = spawn_shared_ingest_writer(db_path, ingest);
 
     let tenant_ids = vec![recorded_by.to_string()];
-    accept_loop_with_ingest(
+    accept_loop_with_ingest_until_cancel(
         db_path,
         &tenant_ids,
         endpoint,
+        CancellationToken::new(),
         None,
         shared_ingest_tx,
         std::collections::HashMap::new(),
@@ -68,6 +69,35 @@ pub async fn accept_loop_with_ingest(
     db_path: &str,
     tenant_peer_ids: &[String],
     endpoint: TransportEndpoint,
+    allowed_peers: Option<crate::transport::AllowedPeers>,
+    shared_ingest_tx: tokio::sync::mpsc::Sender<
+        crate::contracts::event_pipeline_contract::IngestItem,
+    >,
+    tenant_client_configs: std::collections::HashMap<String, TransportClientConfig>,
+    intro_spawner: IntroSpawnerFn,
+    ingest: IngestFns,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    accept_loop_with_ingest_until_cancel(
+        db_path,
+        tenant_peer_ids,
+        endpoint,
+        CancellationToken::new(),
+        allowed_peers,
+        shared_ingest_tx,
+        tenant_client_configs,
+        intro_spawner,
+        ingest,
+    )
+    .await
+}
+
+/// Cancellation-aware variant of [`accept_loop_with_ingest`] used by runtime
+/// supervision so shutdown can deterministically await all workers.
+pub async fn accept_loop_with_ingest_until_cancel(
+    db_path: &str,
+    tenant_peer_ids: &[String],
+    endpoint: TransportEndpoint,
+    shutdown: CancellationToken,
     _allowed_peers: Option<crate::transport::AllowedPeers>,
     shared_ingest_tx: tokio::sync::mpsc::Sender<
         crate::contracts::event_pipeline_contract::IngestItem,
@@ -76,21 +106,38 @@ pub async fn accept_loop_with_ingest(
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    struct ConnectionWorker {
+        cancel: CancellationToken,
+        join: std::thread::JoinHandle<()>,
+    }
+
     run_startup_preflight(db_path, tenant_peer_ids, ingest)?;
 
+    let mut connection_workers: Vec<ConnectionWorker> = Vec::new();
+
     loop {
+        if shutdown.is_cancelled() {
+            break;
+        }
+
         info!("Waiting for incoming connection...");
-        let provider = match accept_session_provider(&endpoint).await {
+        let provider = match tokio::select! {
+            _ = shutdown.cancelled() => {
+                break;
+            }
+            provider = accept_session_provider(&endpoint) => provider,
+        } {
             Ok(Some(p)) => p,
             Ok(None) => {
                 info!("Endpoint closed, stopping accept_loop");
-                return Ok(());
+                break;
             }
             Err(e) => {
                 warn!("Failed to accept connection: {}", e);
                 continue;
             }
         };
+
         let connection = provider.connection();
         let peer_id = provider.peer_id().to_string();
         info!("Accepted connection from {}", peer_id);
@@ -138,43 +185,47 @@ pub async fn accept_loop_with_ingest(
             }
         }
 
-        // Spawn a thread for this connection so multiple sources sync concurrently.
-        // Uses LocalSet so the intro listener (spawn_local) can run alongside
-        // the responder sync sessions on the same runtime.
+        // Spawn a supervised worker for this accepted connection.
         let db_path_owned = db_path.to_string();
         let recorded_by_owned = recorded_by;
         let ingest_clone = shared_ingest_tx.clone();
         let intro_endpoint = endpoint.clone();
         let intro_client_cfg = tenant_client_configs.get(&recorded_by_owned).cloned();
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
+        let provider_owned = provider.clone();
+        let peer_id_owned = peer_id.clone();
+        let worker_shutdown = shutdown.child_token();
+        let worker_cancel = worker_shutdown.clone();
+
+        let join = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .unwrap();
+                .expect("accept connection worker runtime");
             let local = tokio::task::LocalSet::new();
-            rt.block_on(local.run_until(async move {
-                // Spawn intro listener for uni-streams on this connection
+            runtime.block_on(local.run_until(async move {
+                // Spawn intro listener for uni-streams on this connection.
                 intro_spawner(
                     connection.clone(),
                     db_path_owned.clone(),
                     recorded_by_owned.clone(),
-                    peer_id.clone(),
+                    peer_id_owned.clone(),
                     intro_endpoint,
                     intro_client_cfg,
                     ingest_clone.clone(),
                 );
 
-                let peer_fp = match peer_fingerprint_from_hex(&peer_id) {
+                let peer_fp = match peer_fingerprint_from_hex(&peer_id_owned) {
                     Some(fp) => fp,
                     None => {
                         warn!(
                             "Invalid peer fingerprint on accepted connection: {}",
-                            &peer_id[..16.min(peer_id.len())]
+                            &peer_id_owned[..16.min(peer_id_owned.len())]
                         );
                         connection.close(1u32.into(), b"invalid peer fingerprint");
                         return;
                     }
                 };
+
                 let responder_handler = SyncSessionHandler::responder(
                     db_path_owned.clone(),
                     SYNC_SESSION_TIMEOUT_SECS,
@@ -184,17 +235,36 @@ pub async fn accept_loop_with_ingest(
 
                 supervise_connection_sessions(
                     &db_path_owned,
-                    &peer_id,
+                    &peer_id_owned,
                     peer_fp,
-                    &provider,
+                    &provider_owned,
                     &responder_handler,
                     SessionDirection::Inbound,
                     &tenant_resolver,
+                    worker_shutdown,
                 )
                 .await;
             }));
         });
+
+        connection_workers.push(ConnectionWorker {
+            cancel: worker_cancel,
+            join,
+        });
     }
+
+    endpoint.close(0u32.into(), b"runtime shutdown");
+    for worker in connection_workers {
+        worker.cancel.cancel();
+        let join_result = tokio::task::spawn_blocking(move || worker.join.join()).await;
+        match join_result {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => warn!("accept connection worker panicked"),
+            Err(e) => warn!("accept connection worker join task error: {}", e),
+        }
+    }
+
+    Ok(())
 }
 
 /// Resolve which local tenant trusts a given remote peer.

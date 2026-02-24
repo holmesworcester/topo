@@ -9,6 +9,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::contracts::event_pipeline_contract::{IngestFns, IngestItem};
@@ -111,10 +112,16 @@ pub(super) async fn supervise_connection_sessions(
     handler: &SyncSessionHandler,
     direction: SessionDirection,
     tenant_resolver: &SessionTenantResolver,
+    shutdown: CancellationToken,
 ) {
     let connection = provider.connection();
 
     loop {
+        if shutdown.is_cancelled() {
+            connection.close(0u32.into(), b"runtime shutdown");
+            break;
+        }
+
         let recorded_by = tenant_resolver.resolve(db_path);
 
         // Check if peer has been removed -- deny further sessions and close
@@ -130,7 +137,13 @@ pub(super) async fn supervise_connection_sessions(
             }
         }
 
-        let session = match provider.next_session().await {
+        let session = match tokio::select! {
+            _ = shutdown.cancelled() => {
+                connection.close(0u32.into(), b"runtime shutdown");
+                break;
+            }
+            session = provider.next_session() => session,
+        } {
             Ok(session) => session,
             Err(e) => {
                 info!("Connection dropped: {}", e);
@@ -150,7 +163,13 @@ pub(super) async fn supervise_connection_sessions(
         )
         .await;
 
-        tokio::time::sleep(SESSION_GAP).await;
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                connection.close(0u32.into(), b"runtime shutdown");
+                break;
+            }
+            _ = tokio::time::sleep(SESSION_GAP) => {}
+        }
     }
 }
 

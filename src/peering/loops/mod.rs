@@ -19,8 +19,11 @@ mod connect;
 mod supervisor;
 
 // Re-export public API so callers can still `use crate::peering::loops::*`.
+pub use accept::accept_loop_with_ingest_until_cancel;
 pub use accept::{accept_loop, accept_loop_with_ingest};
-pub use connect::{connect_loop, connect_loop_with_coordination};
+pub use connect::{
+    connect_loop, connect_loop_with_coordination, connect_loop_with_coordination_until_cancel,
+};
 
 use std::net::SocketAddr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

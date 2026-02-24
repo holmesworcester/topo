@@ -5,11 +5,10 @@
 //!
 //! - **Bootstrap target collection**: polls SQL invite_bootstrap_trust rows
 //!   (materialized by InviteAccepted projection) and yields dial targets.
-//! - **Discovery dispatch**: deduplicates mDNS-discovered peers and manages
-//!   connect_loop cancellation on address changes (`PeerDispatcher`).
-//! - **Connect loop spawning**: centralized `spawn_connect_loop_thread` used
-//!   by both target sources.
-//! - **Tenant client config**: builds per-tenant QUIC TLS configs from SQL creds.
+//! - **Discovery dispatch**: deduplicates mDNS-discovered peers and computes
+//!   connect/reconnect/skip actions (`PeerDispatcher`).
+//! - **Dispatch-key helpers**: deterministic keying for bootstrap + discovery
+//!   target streams so one runtime dispatcher can own lifecycle decisions.
 //!
 //! This consolidation satisfies R3/SC3 of the peering readability plan:
 //! one module is the source of truth for dial target planning.
@@ -17,17 +16,12 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 
-use tracing::{info, warn};
+use tracing::warn;
 
-use crate::contracts::event_pipeline_contract::IngestFns;
 use crate::db::open_connection;
 use crate::db::transport_creds::list_local_peers;
 use crate::db::transport_trust::list_active_invite_bootstrap_addrs;
 use crate::event_modules::workspace::invite_link::parse_bootstrap_address;
-use crate::peering::loops::{connect_loop_with_coordination, IntroSpawnerFn};
-use crate::transport::{
-    build_tenant_client_config_from_db, TransportClientConfig, TransportEndpoint,
-};
 
 // ---------------------------------------------------------------------------
 // Discovery dispatch (PeerDispatcher)
@@ -92,48 +86,15 @@ pub(crate) fn normalize_discovered_addr_for_local_bind(
 }
 
 // ---------------------------------------------------------------------------
-// Connect loop spawning (shared by bootstrap autodial and mDNS discovery)
+// Unified dispatch-keying for bootstrap + discovery ingestion
 // ---------------------------------------------------------------------------
 
-pub(crate) fn spawn_connect_loop_thread(
-    db_path: String,
-    tenant_id: String,
-    endpoint: TransportEndpoint,
-    remote: SocketAddr,
-    cfg: TransportClientConfig,
-    source: &'static str,
-    intro_spawner: IntroSpawnerFn,
-    ingest: IngestFns,
-    coordination_manager: std::sync::Arc<crate::sync::CoordinationManager>,
-) {
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async move {
-            if let Err(e) = connect_loop_with_coordination(
-                &db_path,
-                &tenant_id,
-                endpoint,
-                remote,
-                Some(cfg),
-                intro_spawner,
-                ingest,
-                coordination_manager,
-            )
-            .await
-            {
-                warn!(
-                    "{} connect_loop for {} to {} exited: {}",
-                    source,
-                    &tenant_id[..16.min(tenant_id.len())],
-                    remote,
-                    e
-                );
-            }
-        });
-    });
+pub(crate) fn bootstrap_dispatch_key(tenant_id: &str) -> String {
+    format!("{}@bootstrap", tenant_id)
+}
+
+pub(crate) fn discovery_dispatch_key(tenant_id: &str, peer_id: &str) -> String {
+    format!("{}@mdns:{}", tenant_id, peer_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -182,19 +143,6 @@ pub(crate) fn collect_all_bootstrap_targets(
 }
 
 // ---------------------------------------------------------------------------
-// Tenant client config
-// ---------------------------------------------------------------------------
-
-/// Build a per-tenant QUIC client config from SQL-stored credentials and
-/// a tenant-scoped trust oracle.
-pub(crate) fn build_tenant_client_config(
-    db_path: &str,
-    tenant_id: &str,
-) -> Result<TransportClientConfig, Box<dyn std::error::Error + Send + Sync>> {
-    build_tenant_client_config_from_db(db_path, tenant_id)
-}
-
-// ---------------------------------------------------------------------------
 // Bootstrap autodial refresher
 // ---------------------------------------------------------------------------
 
@@ -208,7 +156,7 @@ pub(crate) fn dispatch_bootstrap_target(
     tenant_id: &str,
     remote: SocketAddr,
 ) -> bool {
-    let key = format!("{}@bootstrap", tenant_id);
+    let key = bootstrap_dispatch_key(tenant_id);
     let (action, _cancel_rx) = dispatcher.dispatch(&key, remote);
     matches!(
         action,
@@ -216,69 +164,23 @@ pub(crate) fn dispatch_bootstrap_target(
     )
 }
 
-/// Spawns a background thread that polls for new bootstrap autodial targets
-/// every second and starts connect loops for them. This is the primary
-/// mechanism by which the runtime discovers and connects to bootstrap peers
-/// after an invite is accepted (projection materializes trust rows -> autodial
-/// picks them up -> connect loop syncs prerequisites).
+/// Dispatch a discovery dial target through `PeerDispatcher`.
 ///
-/// Uses `PeerDispatcher` for dedup/reconnect, the same dispatch mechanism
-/// used by mDNS discovery (R3/SC3 single-owner dispatch).
-///
-/// Each new connect loop registers with the tenant's `CoordinationManager`
-/// so outbound sessions participate in coordinated multi-source download.
-pub(crate) fn spawn_bootstrap_refresher(
-    db_path: String,
-    endpoint: TransportEndpoint,
-    mut dispatcher: PeerDispatcher,
-    intro_spawner: IntroSpawnerFn,
-    ingest: IngestFns,
-    coord_managers: std::collections::HashMap<
-        String,
-        std::sync::Arc<crate::sync::CoordinationManager>,
-    >,
-) {
-    std::thread::spawn(move || loop {
-        match collect_all_bootstrap_targets(&db_path) {
-            Ok(targets) => {
-                for (tenant_id, remote) in targets {
-                    if !dispatch_bootstrap_target(&mut dispatcher, &tenant_id, remote) {
-                        continue;
-                    }
-                    let cfg = match build_tenant_client_config(&db_path, &tenant_id) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            warn!(
-                                "Skipping bootstrap autodial refresh for {}: {}",
-                                &tenant_id[..16.min(tenant_id.len())],
-                                e
-                            );
-                            continue;
-                        }
-                    };
-                    info!(
-                        "BOOTSTRAP AUTODIAL REFRESH: tenant {} dialing invite bootstrap {}",
-                        &tenant_id[..16.min(tenant_id.len())],
-                        remote
-                    );
-                    let coordination_manager = coord_managers[&tenant_id].clone();
-                    spawn_connect_loop_thread(
-                        db_path.clone(),
-                        tenant_id,
-                        endpoint.clone(),
-                        remote,
-                        cfg,
-                        "bootstrap-autodial-refresh",
-                        intro_spawner,
-                        ingest,
-                        coordination_manager,
-                    );
-                }
-            }
-            Err(e) => warn!("BOOTSTRAP AUTODIAL REFRESH failed: {}", e),
-        }
-        std::thread::sleep(std::time::Duration::from_millis(1000));
-    });
+/// Discovery keys are tenant-scoped (`{tenant}@mdns:{peer}`) so one runtime
+/// dispatcher can safely handle multi-tenant streams without cross-tenant
+/// collisions.
+pub(crate) fn dispatch_discovery_target(
+    dispatcher: &mut PeerDispatcher,
+    tenant_id: &str,
+    peer_id: &str,
+    remote: SocketAddr,
+) -> bool {
+    let key = discovery_dispatch_key(tenant_id, peer_id);
+    let (action, _cancel_rx) = dispatcher.dispatch(&key, remote);
+    matches!(
+        action,
+        DiscoveryAction::Connect | DiscoveryAction::Reconnect
+    )
 }
 
 // ---------------------------------------------------------------------------

@@ -140,15 +140,32 @@ flowchart TD
 
     subgraph BOOT["Setup"]
       START["setup_endpoint_and_tenants"]
-      BOOT_WR["init shared ingest writer"]
-      BOOT_COORD["init tenant coordination managers"]
-      BOOT_TARGET["seed autodial + discovery planners"]
-      START --> BOOT_WR
-      START --> BOOT_COORD
-      START --> BOOT_TARGET
+    end
+
+    subgraph RUNTIME_SUP["Runtime Supervisor (single owner)"]
+      RSUP["runtime::supervisor::RuntimeSupervisor"]
+      RSTATE["state machine: IdleNoTenants <-> Active"]
+      RCANCEL["CancellationToken tree"]
+      TARGET_Q["unified target ingress queue"]
+      DISPATCHER["single target dispatcher"]
+      ACCEPT_W["accept-loop worker"]
+      CONNECT_W["connect-loop workers"]
+      BOOT_REFRESH["bootstrap refresher worker"]
+      DISC_ING["discovery ingress workers"]
+      RSUP --> RSTATE
+      RSUP --> RCANCEL
+      RSUP --> ACCEPT_W
+      RSUP --> BOOT_REFRESH
+      RSUP --> DISC_ING
+      RSUP --> TARGET_Q
+      TARGET_Q --> DISPATCHER
+      DISPATCHER --> CONNECT_W
+      BOOT_REFRESH --> TARGET_Q
+      DISC_ING --> TARGET_Q
     end
 
     NODE --> START
+    START --> RSUP
 
     subgraph PIPE["Event Pipeline"]
       LOCAL --> INGEST["shared ingest channel (mpsc)"]
@@ -178,9 +195,9 @@ flowchart TD
     end
 
     START --> EP
-    BOOT_WR --> WRITER
-    BOOT_COORD --> CONN_LOOPS
-    BOOT_TARGET --> CONN_LOOPS
+    RSUP --> WRITER
+    ACCEPT_W --> CONN_LOOPS
+    CONNECT_W --> CONN_LOOPS
     ORCH --> BOUND
     INTRO --> BOUND
     BOUND --> LIFE
@@ -223,11 +240,12 @@ flowchart TD
     PROJ --> TRUST_DB
 
     TRUST_DB --> LIFE
-    SHUT_N --> NODE
+    SHUT_N --> RSUP
     SHUT_N --> RPC
 ```
 
 **Runtime Topology Legend**
+- `runtime::supervisor::RuntimeSupervisor`: single owner for long-lived runtime workers (writer, accept loop, unified target dispatcher, bootstrap/discovery ingress).
 - `service.rs helpers`: `open_db_*`, node status helpers, intro transport helper entry points.
 - `Persist + enqueue`: phase 1 persists events/recorded/sync state and enqueues `project_queue`.
 - `Sync control`: sync control stream messages including `HaveList` and `Done`.

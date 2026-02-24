@@ -3,6 +3,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::contracts::event_pipeline_contract::IngestFns;
@@ -77,6 +78,32 @@ pub async fn connect_loop_with_coordination(
     ingest: IngestFns,
     coordination_manager: Arc<CoordinationManager>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    connect_loop_with_coordination_until_cancel(
+        db_path,
+        recorded_by,
+        endpoint,
+        remote,
+        client_config,
+        intro_spawner,
+        ingest,
+        coordination_manager,
+        CancellationToken::new(),
+    )
+    .await
+}
+
+/// Coordinated connect loop with explicit cancellation.
+pub async fn connect_loop_with_coordination_until_cancel(
+    db_path: &str,
+    recorded_by: &str,
+    endpoint: TransportEndpoint,
+    remote: SocketAddr,
+    client_config: Option<TransportClientConfig>,
+    intro_spawner: IntroSpawnerFn,
+    ingest: IngestFns,
+    coordination_manager: Arc<CoordinationManager>,
+    shutdown: CancellationToken,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let tenants = vec![recorded_by.to_string()];
     run_startup_preflight(db_path, &tenants, ingest)?;
 
@@ -97,6 +124,7 @@ pub async fn connect_loop_with_coordination(
             intro_spawner,
             shared_ingest,
             coordination_manager,
+            shutdown,
         ))
         .await
 }
@@ -110,6 +138,7 @@ async fn connect_loop_inner(
     intro_spawner: IntroSpawnerFn,
     shared_ingest: tokio::sync::mpsc::Sender<crate::contracts::event_pipeline_contract::IngestItem>,
     coordination_manager: Arc<CoordinationManager>,
+    shutdown: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Look up workspace SNI for this tenant (falls back to "localhost" if no trust anchor)
     let sni = {
@@ -129,16 +158,27 @@ async fn connect_loop_inner(
     );
 
     loop {
+        if shutdown.is_cancelled() {
+            break;
+        }
+
         info!("Connecting to {}...", remote);
-        let provider =
-            match dial_session_provider(&endpoint, remote, &sni, client_config.as_ref()).await {
-                Ok(p) => p,
-                Err(e) => {
-                    warn!("Failed to connect to {}: {}", remote, e);
-                    tokio::time::sleep(CONNECT_RETRY_DELAY).await;
-                    continue;
+        let provider = match tokio::select! {
+            _ = shutdown.cancelled() => {
+                break;
+            }
+            provider = dial_session_provider(&endpoint, remote, &sni, client_config.as_ref()) => provider,
+        } {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("Failed to connect to {}: {}", remote, e);
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = tokio::time::sleep(CONNECT_RETRY_DELAY) => {}
                 }
-            };
+                continue;
+            }
+        };
         let connection = provider.connection();
         let peer_id = provider.peer_id().to_string();
         let peer_fp = match peer_fingerprint_from_hex(&peer_id) {
@@ -148,7 +188,10 @@ async fn connect_loop_inner(
                     "Could not decode peer fingerprint from identity {}, retrying...",
                     &peer_id[..16.min(peer_id.len())]
                 );
-                tokio::time::sleep(CONNECT_RETRY_DELAY).await;
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = tokio::time::sleep(CONNECT_RETRY_DELAY) => {}
+                }
                 continue;
             }
         };
@@ -199,7 +242,10 @@ async fn connect_loop_inner(
             &initiator_handler,
             SessionDirection::Outbound,
             &tenant_resolver,
+            shutdown.clone(),
         )
         .await;
     }
+
+    Ok(())
 }

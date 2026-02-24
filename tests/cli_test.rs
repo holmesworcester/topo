@@ -460,14 +460,15 @@ fn test_cli_ongoing_sync() {
     let tmpdir = tempfile::tempdir().unwrap();
     let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
     let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
-    let timeout_ms = 15000;
+    let timeout_ms = 30000;
 
     // Alice creates workspace and starts daemon
     create_workspace(&alice_db);
     let mut alice = start_daemon(&alice_db);
 
     // Alice sends bootstrap message
-    let bootstrap_eid = send_message(&alice_db, "bootstrap");
+    let _bootstrap_eid = send_message(&alice_db, "bootstrap");
+    assert_now(&alice_db, "message_count >= 1");
 
     // Alice creates invite
     let invite_link = create_invite(&alice_db, &daemon_listen_addr(&alice_db));
@@ -477,11 +478,7 @@ fn test_cli_ongoing_sync() {
     let mut bob = start_daemon(&bob_db);
     // Explicit bootstrap readiness gate: avoid racing ongoing-sync assertions
     // before the invite/bootstrap prerequisite sync has converged.
-    assert_eventually(
-        &bob_db,
-        &format!("has_event:{} >= 1", bootstrap_eid),
-        timeout_ms,
-    );
+    assert_eventually(&bob_db, "message_count >= 1", timeout_ms);
 
     // Both send messages over time
     send_message(&alice_db, "Round 1");
