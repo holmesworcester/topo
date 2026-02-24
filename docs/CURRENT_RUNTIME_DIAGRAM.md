@@ -31,7 +31,7 @@ flowchart TD
     CREATE --> PROJ["project_one + cascade"]
     PROJ --> READS["projection read tables"]
 
-    SVC --> INFRA["open_db_* helpers\nnode status\nintro transport helper"]
+    SVC --> INFRA["open_db_* helpers / node status / intro transport helper"]
 ```
 
 ## 1) Simplified SQLite View (Collapsed Local + Incoming Paths)
@@ -42,7 +42,7 @@ flowchart TD
     OTHERS["Other peers"] -->|"sync sessions"| EP
 
     subgraph NET["Incoming Wire Path"]
-      EP["QUIC endpoint"] --> LIFE["connection_lifecycle\naccept_peer / dial_peer"]
+      EP["QUIC endpoint"] --> LIFE["connection_lifecycle / accept_peer / dial_peer"]
       LIFE --> FACT["session_factory"]
       FACT --> SESS["sync session (data stream)"]
       SESS --> RECV["receiver task"]
@@ -50,12 +50,12 @@ flowchart TD
     end
 
     INCOMING --> INGEST
-    INGEST --> STORE["events + recorded + neg persist"]
+    INGEST --> STORE["events + recorded + sync state persist"]
     STORE --> QDB[("SQLite Queues")]
     QDB --> APPLY["project_one + cascade"]
     APPLY --> PDB[("SQLite Projections")]
 
-    CTRL["Sync control stream\n(HaveList / need_ids)"] --> QDB
+    CTRL["Sync control stream (HaveList / need_ids)"] --> QDB
     PDB --> TRUST["transport trust decisions"]
     TRUST --> LIFE
 ```
@@ -64,17 +64,17 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    PEER["peering loop\n(connect/accept/download/punch)"] --> BOUND["transport::peering_boundary\n(dial/accept/session/intro helpers)"]
-    BOUND --> LIFE["connection_lifecycle\n(connected peer + peer_id)"]
-    BOUND --> FACT["session_factory\n(open/accept streams)"]
+    PEER["peering loop (connect/accept/download/punch)"] --> BOUND["transport::peering_boundary (dial/accept/session/intro helpers)"]
+    BOUND --> LIFE["connection_lifecycle (connected peer + peer_id)"]
+    BOUND --> FACT["session_factory (open/accept streams)"]
     FACT --> IO["TransportSessionIo + session_id"]
     IO --> HANDLER["SyncSessionHandler::on_session"]
 
-    HANDLER --> NEG["Negentropy reconcile\n(NegOpen/NegMsg)"]
-    NEG --> IDS["have_ids + need_ids"]
+    HANDLER --> SYNC_RECON["sync reconcile (control exchange)"]
+    SYNC_RECON --> IDS["have_ids + need_ids"]
 
     IDS -->|peer needs my ids| ENQ["egress_queue.enqueue_events(peer_id, ids)"]
-    IDS -->|I need peer ids| HAVE["wanted_events.insert(ids)\n+ send HaveList(ids)"]
+    IDS -->|I need peer ids| HAVE["wanted_events.insert(ids) + send HaveList(ids)"]
 
     ENQ --> CLAIM["egress_queue.claim_batch + mark_sent"]
     CLAIM --> OUT["data_send: Frame::Event(blob)"]
@@ -82,83 +82,61 @@ flowchart TD
     RX --> IN["ingest channel"]
 
     IN --> WRITER["batch_writer"]
-    WRITER --> STORE["persist events/recorded/neg\n+ enqueue project_queue"]
+    WRITER --> STORE["persist events/recorded/sync state + enqueue project_queue"]
     STORE --> PROJ["project_one + cascade"]
 
     OUT --> DD["DataDone"]
     DD --> SHUT["Done / DoneAck shutdown protocol"]
 ```
 
-## 3) Trust + Bootstrap Autodial Feedback Loop
+## 3) Runtime Topology (Threads + Queues + DB, Reference)
 
 ```mermaid
 flowchart TD
-    INV["invite/device-link events\n+ bootstrap_context"] --> EMIT["projection emit_commands"]
-    EMIT --> PEND["pending_invite_bootstrap_trust"]
-    EMIT --> ACC["invite_bootstrap_trust"]
+    subgraph CTRL["Daemon Control Plane (CLI + RPC + node lifecycle)"]
+      CLI["CLI (topo start)"] --> MAIN["main.rs"]
+      MAIN --> RPC["RPC server thread (Unix socket)"]
+      MAIN --> NODE["node::run_node"]
+      MAIN --> SIG["Ctrl-C signal task"]
+      SIG --> SHUT_N["shutdown_notify"]
 
-    PEER["PeerShared projection"] --> SUPER["SupersedeBootstrapTrust"]
-    SUPER --> PEND
-    SUPER --> ACC
-
-    PEND --> ALLOW["SqliteTrustOracle\nallow/deny"]
-    ACC --> ALLOW
-    PEER --> ALLOW
-
-    ALLOW --> LIFE["connection_lifecycle\n(handshake peer allow)"]
-
-    ACC --> AUTODIAL["autodial refresher\nlist_active_invite_bootstrap_addrs"]
-    AUTODIAL --> DIAL["spawn connect_loop_thread"]
-    DIAL --> LIFE
-    LIFE --> SYNC["sync sessions"]
-    SYNC --> PEER
-```
-
-## 4) Runtime Topology (Threads + Queues + DB, Reference)
-
-```mermaid
-flowchart TD
-    CLI["CLI (topo start)"] --> MAIN["main.rs"]
-    MAIN --> RPC["RPC server thread (Unix socket)"]
-    MAIN --> NODE["node::run_node"]
-    MAIN --> SIG["Ctrl-C signal task"]
-    SIG --> SHUT_N["shutdown_notify"]
-
-    RPC --> DISPATCH["rpc/server dispatch"]
-    DISPATCH --> SHUT_REQ["RpcMethod::Shutdown"]
-    SHUT_REQ --> SHUT_N
-    DISPATCH --> EMQ["event_modules commands + queries"]
-    DISPATCH --> SVC["service.rs thin helpers\n(open_db_*, intro, node status)"]
-    EMQ --> SVC
-
-    EMQ --> LOCAL["local create path\ncreate_*_event_sync"]
-    LOCAL --> INGEST["shared ingest channel (mpsc)"]
+      RPC --> DISPATCH["rpc/server dispatch"]
+      DISPATCH --> SHUT_REQ["RpcMethod::Shutdown"]
+      SHUT_REQ --> SHUT_N
+      DISPATCH --> EMQ["event_modules commands + queries"]
+      DISPATCH --> SVC["service.rs thin helpers (open_db_*, intro, node status)"]
+      EMQ --> SVC
+      EMQ --> LOCAL["local create path / create_*_event_sync"]
+    end
 
     NODE --> START["setup_endpoint_and_tenants"]
     START --> EP["single QUIC endpoint"]
-    START --> TRUST["SqliteTrustOracle\n(tenant-scoped allow/deny)"]
+    START --> TRUST["SqliteTrustOracle (tenant-scoped allow/deny)"]
 
-    INGEST --> WRITER["batch_writer thread"]
-    WRITER --> STORE["events + recorded_events + neg_items"]
-    STORE --> PROJ_Q["project_queue enqueue + drain"]
-    PROJ_Q --> PROJ["project_one + cascade"]
+    subgraph PIPE["Event Pipeline (shared ingest -> projection)"]
+      LOCAL --> INGEST["shared ingest channel (mpsc)"]
+      INGEST --> WRITER["batch_writer thread"]
+      WRITER --> STORE["events + recorded_events + sync state tables"]
+      STORE --> PROJ_Q["project_queue enqueue + drain"]
+      PROJ_Q --> PROJ["project_one + cascade"]
+    end
 
     EP --> ACCEPT["accept_loop_with_ingest thread"]
-    EP --> CONNECT["connect_loop_with_coordination threads\n(autodial / discovery)"]
+    EP --> CONNECT["connect_loop_with_coordination threads (autodial / discovery)"]
 
     ACCEPT --> ORCH
     CONNECT --> ORCH
 
     subgraph ORCH["Peering Orchestration"]
-      CYCLE["loop lifecycle\n(retry/backoff/cancel)"]
+      CYCLE["loop lifecycle (retry/backoff/cancel)"]
       INTRO["intro/punch workflows"]
     end
 
     subgraph TRANS["Transport Capsule"]
-      BOUND["peering_boundary\n(contract helpers)"]
-      LIFE["connection_lifecycle\naccept_peer / dial_peer"]
-      FACT["session_factory\naccept/open_session_io"]
-      IIO["intro_io\naccept_and_read_intro"]
+      BOUND["peering_boundary (contract helpers)"]
+      LIFE["connection_lifecycle / accept_peer / dial_peer"]
+      FACT["session_factory / accept/open_session_io"]
+      IIO["intro_io / accept_and_read_intro"]
     end
 
     ORCH --> BOUND
@@ -167,22 +145,22 @@ flowchart TD
     BOUND --> FACT
     BOUND --> IIO
 
-    FACT --> SYNC["SyncSessionHandler\n(on_session)"]
-    SYNC --> CTRL_STREAM["control stream\nNegOpen / NegMsg / HaveList / Done"]
-    SYNC --> DATA["data stream\nEvent / DataDone"]
+    FACT --> SYNC["SyncSessionHandler (on_session)"]
+    SYNC --> CTRL_STREAM["control stream / sync control messages / HaveList / Done"]
+    SYNC --> DATA["data stream / Event / DataDone"]
 
     CTRL_STREAM --> WANT["wanted_events"]
     CTRL_STREAM --> EGRESS["egress_queue"]
-    EGRESS --> SEND["Store::get_shared(events)\n-> Frame::Event send"]
+    EGRESS --> SEND["Store::get_shared(events) -> Frame::Event send"]
 
-    DATA --> RECV["receiver task\nhash(blob) + tag recorded_by"]
+    DATA --> RECV["receiver task / hash(blob) + tag recorded_by"]
     RECV --> INGEST
 
     PROJ --> VALID["valid_events"]
     PROJ --> BLOCKED["blocked_events + blocked_event_deps"]
     PROJ --> REJECTED["rejected_events"]
-    PROJ --> READS["projection tables\n(messages, users, peers, channels)"]
-    PROJ --> TRUST_DB["transport trust tables\n(peer_shared + invite bootstrap)"]
+    PROJ --> READS["projection tables (messages, users, peers, channels)"]
+    PROJ --> TRUST_DB["transport trust tables (peer_shared + invite bootstrap)"]
 
     TRUST_DB --> TRUST
     TRUST --> LIFE
@@ -199,6 +177,6 @@ flowchart TD
 5. QUIC dial/accept + peer identity extraction are transport-owned in `connection_lifecycle`.
 6. QUIC stream wiring (`open_bi`/`accept_bi`, `DualConnection`, `QuicTransportSessionIo`) is transport-owned in `session_factory`.
 7. Projection outputs both user-facing read tables and transport trust tables; trust rows feed both handshake allow/deny and bootstrap autodial.
-8. `HaveList` IDs originate from negentropy `need_ids`; in current runtime they are coordinator-assigned subsets by default (autodial + mDNS), then land in `egress_queue`.
+8. `HaveList` IDs originate from sync reconciliation `need_ids`; in current runtime they are coordinator-assigned subsets by default (autodial + mDNS), then land in `egress_queue`.
 9. Foreground runtime is daemon-first (`topo start`): shutdown is coordinated by shared `shutdown_notify` (RPC `Shutdown` or Ctrl-C).
 10. Non-coordinated `need_ids -> HaveList(all)` behavior still exists in legacy helper/test paths (`download_from_sources` / direct `connect_loop`) and is no longer the primary runtime shape.
