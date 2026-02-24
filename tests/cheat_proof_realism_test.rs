@@ -4,8 +4,11 @@
 //! - require invite-only autodial behavior,
 //! - require daemon CLI invite lifecycle support.
 
+use std::collections::HashSet;
+use std::net::UdpSocket;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 fn bin() -> String {
@@ -13,13 +16,45 @@ fn bin() -> String {
 }
 
 fn random_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().port()
+    static USED_PORTS: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
+    let used_ports = USED_PORTS.get_or_init(|| Mutex::new(HashSet::new()));
+    loop {
+        // Daemon QUIC bind is UDP, so reserve from UDP ephemeral space.
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = socket.local_addr().unwrap().port();
+        if used_ports.lock().unwrap().insert(port) {
+            return port;
+        }
+    }
 }
 
-fn wait_for_socket(path: &Path, timeout: Duration) {
+fn is_transient_rpc_startup_error(stderr: &str) -> bool {
+    stderr.contains("daemon not running")
+        || stderr.contains("Connection reset by peer")
+        || stderr.contains("no identity — run `topo create-workspace` first")
+        || stderr.contains("no active peer — run `topo use-peer <N>`")
+}
+
+fn wait_for_daemon_ready(db: &str, path: &Path, child: &mut Child, timeout: Duration) {
     let start = Instant::now();
-    while !path.exists() && start.elapsed() < timeout {
+    let mut last_status_err = String::new();
+    while start.elapsed() < timeout {
+        if let Some(status) = child
+            .try_wait()
+            .expect("failed to check daemon child status")
+        {
+            panic!(
+                "daemon exited before becoming ready (status: {}) for db {}",
+                status, db
+            );
+        }
+        if path.exists() {
+            let out = topo_rpc(db, &["status"]);
+            if out.status.success() {
+                return;
+            }
+            last_status_err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
     assert!(
@@ -27,6 +62,12 @@ fn wait_for_socket(path: &Path, timeout: Duration) {
         "daemon socket did not appear at {} within {:?}",
         path.display(),
         timeout
+    );
+    panic!(
+        "daemon socket appeared but daemon did not become RPC-ready within {:?} (db={}, last status error={})",
+        timeout,
+        db,
+        last_status_err
     );
 }
 
@@ -81,8 +122,26 @@ fn topo_rpc(db: &str, args: &[&str]) -> Output {
         .expect("failed to run topo")
 }
 
+fn topo_rpc_retry(db: &str, args: &[&str], timeout: Duration) -> Output {
+    let start = Instant::now();
+    let mut attempt = 0u32;
+    loop {
+        let out = topo_rpc(db, args);
+        if out.status.success() {
+            return out;
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if start.elapsed() >= timeout || !is_transient_rpc_startup_error(&stderr) {
+            return out;
+        }
+        attempt += 1;
+        let delay_ms = 25u64 * (1u64 << attempt.min(5));
+        std::thread::sleep(Duration::from_millis(delay_ms));
+    }
+}
+
 fn topo_send(db: &str, content: &str) -> String {
-    let out = topo_rpc(db, &["send", content]);
+    let out = topo_rpc_retry(db, &["send", content], Duration::from_secs(4));
     assert!(
         out.status.success(),
         "topo send failed: stdout={} stderr={}",
@@ -98,7 +157,11 @@ fn topo_send(db: &str, content: &str) -> String {
 }
 
 fn topo_create_invite(db: &str, bootstrap_addr: &str) -> String {
-    let out = topo_rpc(db, &["create-invite", "--public-addr", bootstrap_addr]);
+    let out = topo_rpc_retry(
+        db,
+        &["create-invite", "--public-addr", bootstrap_addr],
+        Duration::from_secs(3),
+    );
     assert!(
         out.status.success(),
         "topo create-invite failed: stdout={} stderr={}",
@@ -161,8 +224,8 @@ impl Daemon {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
 
-        let child = cmd.spawn().expect("failed to start topo daemon");
-        wait_for_socket(&socket, Duration::from_secs(5));
+        let mut child = cmd.spawn().expect("failed to start topo daemon");
+        wait_for_daemon_ready(db, &socket, &mut child, Duration::from_secs(5));
         Self { child: Some(child) }
     }
 }
