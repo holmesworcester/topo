@@ -119,9 +119,17 @@ flowchart TD
       LOCAL --> INGEST["shared ingest channel (mpsc)"]
       INGEST --> WRITER["batch_writer thread"]
       WRITER --> P1["phase 1: persist events/recorded/neg + enqueue project_queue"]
+      P1 --> PROJ_Q["project_queue"]
+      PROJ_Q --> P3
       P1 --> P2["phase 2: plan post-commit commands"]
       P2 --> P3["phase 3: execute effects boundary"]
       P3 --> PROJ["project_one + cascade"]
+    end
+
+    subgraph SQLITE_Q["SQLite Queues"]
+      PROJ_Q
+      WANT["wanted_events"]
+      EGRESS["egress_queue"]
     end
 
     EP --> ACCEPT["accept_loop_with_ingest thread"]
@@ -148,15 +156,22 @@ flowchart TD
     BOUND --> FACT
     BOUND --> IIO
 
-    FACT --> SYNC["SyncSessionHandler (on_session)"]
-    SYNC --> CTRL_STREAM["control stream / sync control messages / HaveList / Done"]
-    SYNC --> DATA["data stream / Event / DataDone"]
+    subgraph SYNC_ENG["Sync Engine (session protocol + transfer queues)"]
+      SYNC["SyncSessionHandler (on_session)"]
+      CTRL_STREAM["control stream / sync control messages / HaveList / Done"]
+      DATA["data stream / Event / DataDone"]
+      SEND["Store::get_shared(events) -> Frame::Event send"]
+      RECV["receiver task / hash(blob) + tag recorded_by"]
 
-    CTRL_STREAM --> WANT["wanted_events"]
-    CTRL_STREAM --> EGRESS["egress_queue"]
-    EGRESS --> SEND["Store::get_shared(events) -> Frame::Event send"]
+      SYNC --> CTRL_STREAM
+      SYNC --> DATA
+      CTRL_STREAM --> WANT
+      CTRL_STREAM --> EGRESS
+      EGRESS --> SEND
+      DATA --> RECV
+    end
 
-    DATA --> RECV["receiver task / hash(blob) + tag recorded_by"]
+    FACT --> SYNC
     RECV --> INGEST
 
     PROJ --> VALID["valid_events"]
