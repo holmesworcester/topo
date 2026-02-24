@@ -24,7 +24,9 @@ use crate::transport::identity::{ensure_transport_peer_id, ensure_transport_cert
 use crate::projection::create::{create_event_sync, create_event_staged, create_signed_event_sync, create_signed_event_staged, create_encrypted_event_sync, CreateEventError};
 use crate::projection::apply::project_one;
 use crate::protocol::Frame;
-use crate::peering::loops::{accept_loop, connect_loop, download_from_sources, SYNC_SESSION_TIMEOUT_SECS};
+use crate::peering::loops::{
+    accept_loop, connect_loop, connect_loop_with_coordination, SYNC_SESSION_TIMEOUT_SECS,
+};
 use crate::sync::session::run_sync_initiator;
 use crate::transport::{
     AllowedPeers,
@@ -1977,12 +1979,12 @@ pub fn start_multi_source(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Joi
 
 /// Start a sink-driven download topology: sink connects to all sources.
 ///
-/// Each source runs accept_loop (responder). The sink runs download_from_sources
-/// (initiator) connecting to all sources simultaneously with coordinated
-/// round-based assignment. A coordinator thread assigns events to peers using
-/// greedy load balancing; undelivered events get reassigned next round.
+/// Each source runs accept_loop (responder). The sink runs one
+/// `connect_loop_with_coordination` per source with a shared
+/// `CoordinationManager`, matching the production runtime path used by
+/// bootstrap/mDNS autodial.
 ///
-/// Returns thread handles for all source accept_loops and the sink download task.
+/// Returns thread handles for all source accept_loops and sink connect loops.
 pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::JoinHandle<()>> {
     use crate::db::transport_trust::{import_cli_pins_to_sql, is_peer_allowed};
 
@@ -2041,8 +2043,9 @@ pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Jo
         }));
     }
 
-    // Build per-source client endpoints for the sink with dynamic trust
-    let mut endpoint_pairs = Vec::new();
+    // Build per-source client endpoints for the sink with dynamic trust.
+    // These are driven by coordinated connect loops (runtime-faithful path).
+    let mut sink_connectors = Vec::new();
     for (i, _source) in sources.iter().enumerate() {
         let sink_db_path = sink.db_path.clone();
         let sink_recorded_by = sink.identity.clone();
@@ -2056,22 +2059,37 @@ pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Jo
             sink_cert.clone(), sink_key.clone_key(), allow_fn,
         ).expect("failed to create sink client endpoint");
 
-        endpoint_pairs.push((client_endpoint, source_addrs[i]));
+        sink_connectors.push((client_endpoint, source_addrs[i]));
     }
 
-    // Spawn download_from_sources for the sink
-    let sink_db = sink.db_path.clone();
-    let sink_identity = sink.identity.clone();
-    handles.push(std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async move {
-            if let Err(e) = download_from_sources(
-                &sink_db, &sink_identity, endpoint_pairs, crate::event_pipeline::batch_writer,
-            ).await {
-                tracing::warn!("sink download_from_sources exited: {}", e);
-            }
-        });
-    }));
+    let coord_manager = Arc::new(crate::sync::CoordinationManager::new());
+    for (i, (endpoint, remote)) in sink_connectors.into_iter().enumerate() {
+        let sink_db = sink.db_path.clone();
+        let sink_identity = sink.identity.clone();
+        let coord = coord_manager.register_peer();
+        handles.push(std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                if let Err(e) = connect_loop_with_coordination(
+                    &sink_db,
+                    &sink_identity,
+                    endpoint,
+                    remote,
+                    None,
+                    noop_intro_spawner,
+                    test_ingest_fns(),
+                    Some(coord),
+                )
+                .await
+                {
+                    tracing::warn!("sink connect_loop_with_coordination[{}] exited: {}", i, e);
+                }
+            });
+        }));
+    }
 
     handles
 }

@@ -14,6 +14,7 @@
 //! race condition (duplicate items from concurrent reads/writes to neg_items).
 
 use std::time::{Duration, Instant};
+use topo::crypto::event_id_to_base64;
 use topo::testutil::{
     Peer, start_chain, start_multi_source, start_sink_download,
     sync_until_converged, assert_eventually, clone_events_to,
@@ -506,11 +507,12 @@ async fn multi_source_partitioned_8x_100k() {
 
 /// Run a coordinated sink-driven download benchmark.
 ///
-/// All sources have identical data (cloned from S0). The sink connects to all
-/// sources as initiator, using coordinated round-based assignment to split
-/// downloads across sources. A coordinator thread collects need_ids from all
-/// peers, assigns events via greedy load balancing (least-loaded peer that
-/// has the event). Undelivered events re-appear in the next round.
+/// Sources share a large overlapping dataset (cloned from S0) plus one
+/// source-unique marker each. The sink connects to all sources as initiator
+/// using coordinated round-based assignment.
+///
+/// The unique marker per source gives a hard "no-cheat" proof that every source
+/// contributed real data to sink catchup.
 async fn run_sink_download_bench(source_count: usize, events_per_source: usize) {
     let sources: Vec<Peer> = (0..source_count)
         .map(|i| Peer::new_with_identity(&format!("ds{}", i)))
@@ -534,7 +536,18 @@ async fn run_sink_download_bench(source_count: usize, events_per_source: usize) 
         eprintln!("  Cloned to S1..S{}", source_count - 1);
     }
 
-    // Sample a convergence marker from S0
+    // Add one source-unique marker on each source so we can prove each source
+    // contributed data to sink catchup.
+    let source_markers: Vec<String> = sources
+        .iter()
+        .enumerate()
+        .map(|(i, source)| {
+            let marker = source.create_message(&format!("source-{}-unique-marker", i));
+            event_id_to_base64(&marker)
+        })
+        .collect();
+
+    // Sample a convergence marker from S0.
     let sample = sources[0].sample_event_ids(1)[0].clone();
 
     let rss_before = peak_rss_mib();
@@ -545,15 +558,26 @@ async fn run_sink_download_bench(source_count: usize, events_per_source: usize) 
 
     let timeout_secs = if events_per_source >= 100_000 { 600 } else { 120 };
     assert_eventually(
-        || sink.has_event(&sample),
+        || {
+            sink.has_event(&sample) && source_markers.iter().all(|marker| sink.has_event(marker))
+        },
         Duration::from_secs(timeout_secs),
-        "sink download receives sampled event",
+        "sink download receives sampled event and per-source unique markers",
     ).await;
 
     let wall_ms = start.elapsed().as_millis() as u64;
     let rss_after = peak_rss_mib();
     let events_per_sec = total_messages as f64 / (wall_ms as f64 / 1000.0);
     let mb_per_sec = events_per_sec * 100.0 / 1_000_000.0;
+
+    let contributing_sources = source_markers
+        .iter()
+        .filter(|marker| sink.has_event(marker))
+        .count();
+    assert_eq!(
+        contributing_sources, source_count,
+        "sink must receive at least one unique marker from each source"
+    );
 
     drop(handles);
 
@@ -566,6 +590,7 @@ async fn run_sink_download_bench(source_count: usize, events_per_source: usize) 
     eprintln!("  Catchup wall:     {} ms", wall_ms);
     eprintln!("  Events/s:         {:.0}", events_per_sec);
     eprintln!("  MB/s:             {:.2}", mb_per_sec);
+    eprintln!("  Contributing src: {}/{}", contributing_sources, source_count);
     eprintln!("  Sink store:       {}", sink.store_count());
     eprintln!("  Peak RSS:         {:.1} MiB (before: {:.1})", rss_after, rss_before);
     eprintln!();
