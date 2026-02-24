@@ -162,22 +162,13 @@ flowchart TD
       P3 --> PROJ["project_one + cascade"]
     end
 
-    subgraph SQLITE_Q["SQLite Queues"]
-      PROJ_Q
-      WANT["wanted_events"]
-      EGRESS["egress_queue"]
-    end
-
-    EP --> ACCEPT_W["accept.rs wrappers (accept_loop / accept_loop_with_ingest)"]
-    EP --> CONNECT_W["connect.rs wrappers (connect_loop / connect_loop_with_coordination)"]
-
-    subgraph ORCH["Peering Orchestration (collapsed ownership)"]
-      ACCEPT_W
-      CONNECT_W
-      SUP["loops/supervisor.rs (preflight + session supervision)"]
+    subgraph ORCH["Peering Orchestration"]
+      ACCEPT["accept_loop_with_ingest thread"]
+      CONNECT["connect_loop_with_coordination threads (autodial / discovery)"]
+      CYCLE["loop lifecycle (retry/backoff/cancel)"]
       INTRO["intro/punch workflows"]
-      ACCEPT_W --> SUP
-      CONNECT_W --> SUP
+      ACCEPT --> CYCLE
+      CONNECT --> CYCLE
     end
 
     subgraph TRANS["Transport Capsule"]
@@ -195,9 +186,9 @@ flowchart TD
     START --> EP
     START --> TRUST
     BOOT_WR --> WRITER
-    BOOT_COORD --> CONNECT_W
-    BOOT_TARGET --> CONNECT_W
-    SUP --> BOUND
+    BOOT_COORD --> CONNECT
+    BOOT_TARGET --> CONNECT
+    ORCH --> BOUND
     INTRO --> BOUND
     BOUND --> LIFE
     BOUND --> FACT
