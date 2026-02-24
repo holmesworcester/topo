@@ -208,11 +208,12 @@ flowchart TD
     RECV --> INGEST
 
     subgraph PSTATE["Projection State"]
+      direction LR
+      TRUST_DB["Transport trust tables"]
       VALID["valid_events"]
       BLOCKED["blocked_events + blocked_event_deps"]
       REJECTED["rejected_events"]
       READS["Projection tables"]
-      TRUST_DB["Transport trust tables"]
     end
 
     PROJ --> VALID
