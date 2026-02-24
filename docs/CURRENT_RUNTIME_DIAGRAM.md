@@ -41,7 +41,7 @@ flowchart TD
     LOCAL["Local create events"] --> INGEST["shared ingest + batch_writer"]
     OTHERS["Other peers"] -->|"sync sessions"| EP
 
-    subgraph NET["Incoming Wire Path"]
+    subgraph NET["Incoming Wire"]
       EP["QUIC endpoint"] --> LIFE["connection_lifecycle / accept_peer / dial_peer"]
       LIFE --> FACT["session_factory"]
       FACT --> SESS["sync session (data stream)"]
@@ -95,15 +95,15 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    CTRL["Daemon Control Plane"]
-    BOOT["Runtime Bootstrap"]
-    ORCH["Peering Orchestration"]
-    TRANS["Transport Capsule"]
+    CTRL["Control"]
+    BOOT["Bootstrap"]
+    ORCH["Peering"]
+    TRANS["Transport"]
     SYNC["Sync Engine"]
-    PIPE["Event Pipeline"]
-    PSTATE["SQLite Projection State"]
-    TRUST["Trust Oracle"]
-    PEERS["Other peers"]
+    PIPE["Pipeline"]
+    PSTATE["Projection State"]
+    TRUST["Transport Trust"]
+    PEERS["Peers"]
 
     CTRL --> BOOT
     CTRL --> PIPE
@@ -123,7 +123,7 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    subgraph CTRL["Daemon Control Plane (CLI + RPC + node lifecycle)"]
+    subgraph CTRL["Control Plane"]
       CLI["CLI (topo start)"] --> MAIN["main.rs"]
       MAIN --> RPC["RPC server thread (Unix socket)"]
       MAIN --> NODE["node::run_node"]
@@ -139,7 +139,7 @@ flowchart TD
       EMQ --> LOCAL["local create path / create_*_event_sync"]
     end
 
-    subgraph BOOT["Runtime Bootstrap (node init only)"]
+    subgraph BOOT["Bootstrap"]
       START["setup_endpoint_and_tenants"]
       BOOT_WR["init shared ingest writer"]
       BOOT_COORD["init tenant coordination managers"]
@@ -151,7 +151,7 @@ flowchart TD
 
     NODE --> START
 
-    subgraph PIPE["Event Pipeline (shared ingest -> projection)"]
+    subgraph PIPE["Event Pipeline"]
       LOCAL --> INGEST["shared ingest channel (mpsc)"]
       INGEST --> WRITER["batch_writer thread"]
       WRITER --> P1["phase 1: persist events/recorded/sync state + enqueue project_queue"]
@@ -162,16 +162,14 @@ flowchart TD
       P3 --> PROJ["project_one + cascade"]
     end
 
-    subgraph ORCH["Peering Orchestration"]
-      ACCEPT["accept_loop_with_ingest thread"]
-      CONNECT["connect_loop_with_coordination threads (autodial / discovery)"]
+    subgraph ORCH["Peering"]
+      CONN_LOOPS["connection loops (accept + connect)"]
       CYCLE["loop lifecycle (retry/backoff/cancel)"]
       INTRO["intro/punch workflows"]
-      ACCEPT --> CYCLE
-      CONNECT --> CYCLE
+      CONN_LOOPS --> CYCLE
     end
 
-    subgraph TRANS["Transport Capsule"]
+    subgraph TRANS["Transport"]
       EP["single QUIC endpoint"]
       BOUND["peering_boundary (contract helpers)"]
       LIFE["connection_lifecycle / accept_peer / dial_peer"]
@@ -179,22 +177,22 @@ flowchart TD
       IIO["intro_io / accept_and_read_intro"]
     end
 
-    subgraph TRUST_POL["Trust Policy"]
+    subgraph TRUST_POL["Transport Trust"]
       TRUST["SqliteTrustOracle (tenant-scoped allow/deny)"]
     end
 
     START --> EP
     START --> TRUST
     BOOT_WR --> WRITER
-    BOOT_COORD --> CONNECT
-    BOOT_TARGET --> CONNECT
+    BOOT_COORD --> CONN_LOOPS
+    BOOT_TARGET --> CONN_LOOPS
     ORCH --> BOUND
     INTRO --> BOUND
     BOUND --> LIFE
     BOUND --> FACT
     BOUND --> IIO
 
-    subgraph SYNC_ENG["Sync Engine (session protocol + transfer queues)"]
+    subgraph SYNC_ENG["Sync Engine"]
       SYNC["SyncSessionHandler (on_session)"]
       CTRL_STREAM["control stream / sync control messages / HaveList / Done"]
       DATA["data stream / Event / DataDone"]
@@ -214,7 +212,7 @@ flowchart TD
     FACT --> SYNC
     RECV --> INGEST
 
-    subgraph PSTATE["SQLite Projection State"]
+    subgraph PSTATE["Projection State"]
       VALID["valid_events"]
       BLOCKED["blocked_events + blocked_event_deps"]
       REJECTED["rejected_events"]
