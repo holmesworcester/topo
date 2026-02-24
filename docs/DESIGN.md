@@ -252,7 +252,7 @@ Signer secrets (LocalSignerSecret events) are NOT emitted here; `persist_join_si
 
 **Device link** (`workspace::commands::create_device_link_invite` / `add_device_to_workspace`): similar to user invite but creates a shorter chain (PeerSharedFirst only, skipping user/device_invite creation).
 
-**Retry** (`workspace::commands::retry_pending_invite_content_key_unwraps`): retries content-key unwrap for invites where SecretShared prerequisites arrived late. Called from `event_pipeline.rs` after each projection drain.
+**Retry** (`workspace::commands::retry_pending_invite_content_key_unwraps`): retries content-key unwrap for invites where SecretShared prerequisites arrived late. Called from `event_pipeline/effects.rs` after each projection drain.
 
 ### Identity ownership boundary
 
@@ -261,7 +261,7 @@ Signer secrets (LocalSignerSecret events) are NOT emitted here; `persist_join_si
 - `transport/identity.rs` owns transport cert/key/SPKI logic.
 - `event_modules/workspace/commands.rs` owns all workflow orchestration: workspace creation, invite creation/acceptance, device link flows, retry logic.
 - `service.rs` routes to `workspace::commands` APIs; it contains no identity-specific workflow orchestration.
-- `event_pipeline.rs` calls `workspace::commands::retry_pending_invite_content_key_unwraps` for post-drain content-key convergence.
+- `event_pipeline/effects.rs` calls `workspace::commands::retry_pending_invite_content_key_unwraps` for post-drain content-key convergence.
 - The `src/identity/` module has been eliminated. No `pub mod identity;` exists in `lib.rs`.
 - Boundaries are machine-checked by `scripts/check_boundary_imports.sh`.
 
@@ -353,12 +353,13 @@ When a `PeerRemoved` event is projected, the removed peer's SPKI is excluded fro
 
 ### Shared batch writer with tenant routing
 
-All tenants share a single `batch_writer` thread to avoid SQLite write contention. Each ingested event carries a `recorded_by` field (the 3-tuple `IngestItem = (event_id, blob, recorded_by)`). The batch writer:
+All tenants share a single `batch_writer` thread to avoid SQLite write contention. Each ingested event carries a `recorded_by` field (the 3-tuple `IngestItem = (event_id, blob, recorded_by)`). The batch writer runs three explicit phases:
 
-1. Inserts events into the shared `events` table.
-2. Records each event in `recorded_events` under the correct `recorded_by`.
-3. Enqueues into `project_queue` under the correct `recorded_by`.
-4. Drains `project_queue` per tenant (grouping by `recorded_by`).
+1. Persist phase (`event_pipeline/phases.rs`): inserts into `events`, `recorded_events`, and `neg_items`, and enqueues `project_queue` rows in one transaction.
+2. Planner phase (`event_pipeline/planner.rs`): deterministically maps `PersistPhaseOutput` to post-commit commands.
+3. Effects phase (`event_pipeline/effects.rs`): executes side effects through the executor boundary (wanted removal, queue drain/projection, queue health logging, post-drain hooks).
+
+Ownership statement: persist owns ingest SQL writes, planner owns command derivation, effects owns side effects, and `batch_writer` in `event_pipeline/mod.rs` owns sequencing/retry policy.
 
 This eliminates write contention while preserving per-tenant projection isolation.
 

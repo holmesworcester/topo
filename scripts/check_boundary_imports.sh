@@ -26,6 +26,25 @@ check_required() {
   fi
 }
 
+check_only_allowed() {
+  local pattern="$1"
+  local path="$2"
+  local allowed_re="$3"
+  local matches
+  matches=$(rg -n "$pattern" "$path" --glob '*.rs' 2>/dev/null | grep -v '^\S*:\s*//' || true)
+  if [ -z "$matches" ]; then
+    return
+  fi
+
+  local disallowed
+  disallowed=$(echo "$matches" | grep -Ev "$allowed_re" || true)
+  if [ -n "$disallowed" ]; then
+    echo "$disallowed"
+    echo "BOUNDARY VIOLATION: pattern '$pattern' matched outside allowed files in $path" >&2
+    FAIL=1
+  fi
+}
+
 echo "=== Forbidden edges ==="
 
 # -- peering must not reach into internals --
@@ -71,29 +90,38 @@ check_no_match 'identity_ops::create_device_link_invite' src/service.rs
 check_no_match 'identity_ops::ensure_content_key_for_peer' src/service.rs
 check_no_match 'invite_link::create_invite_link' src/service.rs
 
-# identity primitive helpers must not be called from service.rs, event_pipeline.rs, or tests
+# identity primitive helpers must not be called from service.rs, event_pipeline/, or tests
 # (they should go through workspace::commands APIs)
 check_no_match 'identity_ops::create_user_invite_events' src/service.rs
 check_no_match 'identity_ops::create_device_link_invite_events' src/service.rs
-check_no_match 'identity_ops::create_user_invite_events' src/event_pipeline.rs
-check_no_match 'identity_ops::create_device_link_invite_events' src/event_pipeline.rs
+check_no_match 'identity_ops::create_user_invite_events' src/event_pipeline/
+check_no_match 'identity_ops::create_device_link_invite_events' src/event_pipeline/
 check_no_match 'identity_ops::create_user_invite_events' src/testutil/
 check_no_match 'identity_ops::create_device_link_invite_events' src/testutil/
 
 # service.rs must not contain svc_bootstrap_workspace_conn
 check_no_match 'svc_bootstrap_workspace_conn' src/service.rs
-check_no_match 'workspace::commands::retry_pending_invite_content_key_unwraps' src/event_pipeline.rs
-check_no_match 'workspace::commands::create_workspace' src/event_pipeline.rs
-check_no_match 'workspace::commands::join_workspace_as_new_user' src/event_pipeline.rs
-check_no_match 'workspace::commands::add_device_to_workspace' src/event_pipeline.rs
+check_no_match 'workspace::commands::retry_pending_invite_content_key_unwraps' src/event_pipeline/
+check_no_match 'workspace::commands::create_workspace' src/event_pipeline/
+check_no_match 'workspace::commands::join_workspace_as_new_user' src/event_pipeline/
+check_no_match 'workspace::commands::add_device_to_workspace' src/event_pipeline/
 
 # -- peering readability: bootstrap helpers must not be production-owned --
 # Production runtime must not depend on test bootstrap helpers (R2/SC2)
 check_no_match 'testutil::bootstrap' src/peering/
 check_no_match 'testutil::bootstrap' src/service.rs
-check_no_match 'testutil::bootstrap' src/event_pipeline.rs
+check_no_match 'testutil::bootstrap' src/event_pipeline/
 # peering/workflows must not contain bootstrap module (moved to testutil)
 check_no_match 'mod bootstrap' src/peering/workflows/
+
+# -- event pipeline phase boundary checks --
+check_only_allowed 'project_one\(' src/event_pipeline '^src/event_pipeline/(effects|drain)\.rs:'
+check_only_allowed 'post_drain_hooks\(' src/event_pipeline '^src/event_pipeline/effects\.rs:'
+check_only_allowed 'wanted\.remove\(' src/event_pipeline '^src/event_pipeline/effects\.rs:'
+check_no_match 'use rusqlite|crate::db' src/event_pipeline/planner.rs
+check_no_match 'project_one\(' src/event_pipeline/mod.rs
+check_no_match 'post_drain_hooks\(' src/event_pipeline/mod.rs
+check_no_match 'wanted\.remove\(' src/event_pipeline/mod.rs
 
 # -- peering readability: target planning single ownership (R3/SC3) --
 # Target planning must live in target_planner, not scattered across runtime
@@ -178,8 +206,11 @@ check_required 'pub fn create_workspace_for_db' src/event_modules/workspace/comm
 check_required 'pub fn accept_invite' src/event_modules/workspace/commands.rs
 check_required 'pub fn accept_device_link' src/event_modules/workspace/commands.rs
 
-# event_pipeline.rs uses generic post-drain hooks (not direct workspace/identity calls)
-check_required 'event_modules::post_drain_hooks' src/event_pipeline.rs
+# event pipeline uses explicit persist/planner/effects phase entrypoints
+check_required 'run_persist_phase' src/event_pipeline/mod.rs
+check_required 'plan_post_commit_commands' src/event_pipeline/mod.rs
+check_required 'run_post_commit_effects' src/event_pipeline/mod.rs
+check_required 'event_modules::post_drain_hooks' src/event_pipeline/effects.rs
 
 if [ "$FAIL" -ne 0 ]; then
   echo "FAILED: boundary violations found" >&2

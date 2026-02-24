@@ -13,7 +13,7 @@ Primary source modules:
 - `src/peering/workflows/*`
 - `src/transport/{peering_boundary.rs,connection_lifecycle.rs,session_factory.rs,intro_io.rs}`
 - `src/sync/session/*`
-- `src/event_pipeline.rs`
+- `src/event_pipeline/{mod.rs,phases.rs,planner.rs,effects.rs,drain.rs}`
 - `src/projection/apply/*`
 - `src/projection/create.rs`
 - `src/db/{project_queue.rs,egress_queue.rs,wanted.rs,transport_trust.rs}`
@@ -82,8 +82,10 @@ flowchart TD
     RX --> IN["ingest channel"]
 
     IN --> WRITER["batch_writer"]
-    WRITER --> STORE["persist events/recorded/sync state + enqueue project_queue"]
-    STORE --> PROJ["project_one + cascade"]
+    WRITER --> P1["phase 1: persist + enqueue"]
+    P1 --> P2["phase 2: plan post-commit commands"]
+    P2 --> P3["phase 3: run effects executor"]
+    P3 --> PROJ["project_one + cascade"]
 
     OUT --> DD["DataDone"]
     DD --> SHUT["Done / DoneAck shutdown protocol"]
@@ -116,9 +118,10 @@ flowchart TD
     subgraph PIPE["Event Pipeline (shared ingest -> projection)"]
       LOCAL --> INGEST["shared ingest channel (mpsc)"]
       INGEST --> WRITER["batch_writer thread"]
-      WRITER --> STORE["events + recorded_events + sync state tables"]
-      STORE --> PROJ_Q["project_queue enqueue + drain"]
-      PROJ_Q --> PROJ["project_one + cascade"]
+      WRITER --> P1["phase 1: persist events/recorded/neg + enqueue project_queue"]
+      P1 --> P2["phase 2: plan post-commit commands"]
+      P2 --> P3["phase 3: execute effects boundary"]
+      P3 --> PROJ["project_one + cascade"]
     end
 
     EP --> ACCEPT["accept_loop_with_ingest thread"]
@@ -171,7 +174,7 @@ flowchart TD
 ## Current Data-Flow Facts
 
 1. `egress_queue` is fed by sync control-plane `HaveList` messages, not by `batch_writer`.
-2. `batch_writer` is the shared ingest sink for wire-received events and local-create events; it persists event blobs and drains `project_queue`.
+2. `batch_writer` is the shared ingest sink for wire-received events and local-create events; it runs explicit phases: persist transaction, post-commit command planning, and effects execution.
 3. RPC command/query dispatch is event-module owned; `service.rs` is now an infra helper layer (`open_db_*`, node status, intro transport helper).
 4. Peering orchestration (`connect_loop`/`accept_loop`/workflows) now routes transport operations through `transport::peering_boundary`; peering no longer imports QUIC/trust internals directly.
 5. QUIC dial/accept + peer identity extraction are transport-owned in `connection_lifecycle`.

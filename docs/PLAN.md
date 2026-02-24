@@ -42,7 +42,7 @@ Current code in Topo (post-move from `codex-simplified`) is a useful sync protot
 
 1. ~~Fixed-size wire/event assumptions~~ **RESOLVED**: wire protocol moved to `src/protocol.rs` with variable-length framing and `EVENT_MAX_BLOB_BYTES = 1 MiB` cap. No global fixed envelope size remains.
 2. ~~mTLS is not yet pinned/strict~~ **RESOLVED**: `src/transport/mod.rs` now uses `PinnedCertVerifier` with BLAKE2b-256 SPKI fingerprint pinning on both client and server sides. No permissive verifier remains in production paths.
-3. ~~Projection pipeline is still message-specific and sync-engine-coupled~~ **RESOLVED**: projection pipeline extracted to `src/projection/apply/` with global `project_one(recorded_by,event_id)` entrypoint. Ingest runtime in `src/event_pipeline.rs`.
+3. ~~Projection pipeline is still message-specific and sync-engine-coupled~~ **RESOLVED**: projection pipeline extracted to `src/projection/apply/` with global `project_one(recorded_by,event_id)` entrypoint. Ingest runtime now lives in `src/event_pipeline/{mod.rs,phases.rs,planner.rs,effects.rs,drain.rs}`.
 4. No dependency blocking model yet:
    - no `blocked_event_deps` / unblock/requeue flow.
 5. No per-tenant receive journal yet:
@@ -1572,7 +1572,7 @@ Identity workflow orchestration is fully owned by `event_modules/workspace/comma
 
 `event_modules/workspace/identity_ops.rs` owns `pub(crate)` primitive helpers (crypto, key wrap/unwrap, data types). The `src/identity/` module has been eliminated.
 `service.rs` routes to `workspace::commands` — no identity-specific orchestration.
-`event_pipeline.rs` calls `workspace::commands::retry_pending_invite_content_key_unwraps` — no identity-special callouts.
+`event_pipeline/effects.rs` calls `workspace::commands::retry_pending_invite_content_key_unwraps` — no identity-special callouts.
 Boundaries enforced by `scripts/check_boundary_imports.sh`.
 
 ## 15.11 PR slicing guidance (to reduce assistant mistakes)
@@ -1896,13 +1896,16 @@ The `recorded_by: String` parameter was removed. Per-item `recorded_by` is extra
 - `project_queue` enqueue
 - Per-tenant projection drain
 
-Drain phase groups items by tenant and drains per tenant:
-```rust
-let tenants: HashSet<String> = batch.iter().map(|(_, _, rb)| rb.clone()).collect();
-for rb in &tenants {
-    pq.drain_with_limit(rb, batch_sz, |conn, eid_b64| { ... });
-}
-```
+`batch_writer` in `src/event_pipeline/mod.rs` now sequences explicit internal phases:
+1. `run_persist_phase(...) -> PersistPhaseOutput` (`phases.rs`) for transactional ingest persistence.
+2. `plan_post_commit_commands(&PersistPhaseOutput, batch_size)` (`planner.rs`) for deterministic command planning.
+3. `run_post_commit_effects(...)` (`effects.rs`) for side-effect execution behind the executor boundary.
+
+Boundary validation commands:
+1. `cargo test -q event_pipeline`
+2. `bash scripts/check_boundary_imports.sh`
+3. `rg -n "project_one\\(|post_drain_hooks\\(|wanted\\.remove\\(" src/event_pipeline`
+4. `rg -n "use rusqlite|crate::db" src/event_pipeline/planner.rs` (expect empty output)
 
 ### 17.3.3 `spawn_data_receiver`
 
