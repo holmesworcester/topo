@@ -164,18 +164,29 @@ impl Peer {
         let result = create_workspace(&db, &old_identity, "test-workspace", "test-user", "test-device")
             .expect("failed to bootstrap workspace");
 
-        // Keep event scope identity stable in tests; no recorded_by migration.
-        self.identity = old_identity.clone();
+        // create_workspace emits LocalSignerSecret events which trigger transport
+        // identity installation. Reload peer_id and finalize identity if changed.
+        let new_identity = crate::transport::identity::load_transport_peer_id(&db)
+            .expect("failed to load transport peer_id after create_workspace");
+        if new_identity != old_identity {
+            crate::db::finalize_identity(&db, &old_identity, &new_identity)
+                .expect("identity finalization failed");
+        }
+        self.identity = new_identity.clone();
 
         self.workspace_id = result.workspace_id;
         // Look up user_event_id from the created identity chain
-        if let Ok(uid) = crate::service::resolve_user_event_id_for_signer(&db, &self.identity, &result.peer_shared_event_id) {
+        if let Ok(uid) =
+            crate::service::resolve_user_event_id_for_signer(&db, &new_identity, &result.peer_shared_event_id)
+        {
             self.author_id = uid;
         }
         self.peer_shared_event_id = Some(result.peer_shared_event_id);
         self.peer_shared_signing_key = Some(result.peer_shared_key);
         // Load workspace signing key from local signer material
-        if let Ok(Some((_ws_eid, ws_key))) = crate::event_modules::workspace::commands::load_workspace_signing_key(&db, &self.identity) {
+        if let Ok(Some((_ws_eid, ws_key))) =
+            crate::event_modules::workspace::commands::load_workspace_signing_key(&db, &new_identity)
+        {
             self.workspace_signing_key = Some(ws_key);
         }
     }
@@ -276,9 +287,17 @@ impl Peer {
         // Clean up sync endpoint
         sync_endpoint.close(0u32.into(), b"bootstrap done");
 
-        // Step 3: Keep tenant scope identity stable for event reads/writes.
+        // Step 3: Refresh to the current transport identity after bootstrap sync.
+        // LocalSignerSecret projection may have switched from invite-derived
+        // transport identity to PeerShared-derived identity.
         let db = open_connection(&peer.db_path).expect("failed to open db");
-        let scoped_peer_id = result.peer_id.clone();
+        let current_peer_id = crate::transport::identity::load_transport_peer_id(&db)
+            .unwrap_or_else(|_| result.peer_id.clone());
+        if current_peer_id != result.peer_id {
+            crate::db::finalize_identity(&db, &result.peer_id, &current_peer_id)
+                .expect("identity finalization after bootstrap sync failed");
+        }
+        let scoped_peer_id = current_peer_id;
         peer.identity = scoped_peer_id.clone();
         peer.workspace_id = creator.workspace_id;
 
@@ -2071,7 +2090,7 @@ pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Jo
                     None,
                     noop_intro_spawner,
                     test_ingest_fns(),
-                    Some(coord),
+                    coord,
                 )
                 .await
                 {

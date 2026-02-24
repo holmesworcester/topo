@@ -21,7 +21,7 @@ use std::time::Duration;
 // ---------------------------------------------------------------------------
 // Re-exports — preserve the existing public API surface
 // ---------------------------------------------------------------------------
-pub use coordinator::{run_coordinator, CoordinationManager, PeerCoord};
+pub use coordinator::{CoordinationManager, PeerCoord};
 pub use data_plane::spawn_data_receiver;
 pub use initiator::run_sync_initiator;
 pub use responder::run_sync_responder;
@@ -54,7 +54,7 @@ pub(super) const DATA_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// Non-blocking poll timeout for the control stream receive.
 pub(super) const CONTROL_POLL_TIMEOUT: Duration = Duration::from_millis(1);
 
-// -- Coordinator timing (B-coordinated / download_from_sources) --
+// -- Coordinator timing (coordinated sync sessions) --
 
 /// How long the coordinator waits (after the first peer reports) for
 /// remaining peers to finish reconciliation and report their need_ids.

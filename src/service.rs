@@ -89,7 +89,7 @@ pub fn open_db_load(
         return Ok((transport_peer_id, conn));
     }
 
-    // POC fallback for non-migrated data: if exactly one scoped peer exists,
+    // POC fallback for non-finalized identity state: if exactly one scoped peer exists,
     // use it as the event/projection tenant.
     let scoped_peers: Vec<String> = {
         let mut stmt =
@@ -103,9 +103,14 @@ pub fn open_db_load(
     if scoped_peers.len() == 1 {
         return Ok((scoped_peers[0].clone(), conn));
     }
+    if scoped_peers.is_empty() {
+        // Fresh DB / pre-workspace state: allow read paths to boot using
+        // transport identity even before tenant-scoped trust anchors exist.
+        return Ok((transport_peer_id, conn));
+    }
 
     Err(format!(
-        "No scoped tenant for transport peer_id {}; run `topo use-peer <N>`",
+        "No unambiguous scoped tenant for transport peer_id {}; run `topo use-peer <N>`",
         transport_peer_id
     )
     .into())

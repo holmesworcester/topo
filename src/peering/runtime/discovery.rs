@@ -127,7 +127,7 @@ pub(crate) fn launch_mdns_discovery(
                                     rt.block_on(async move {
                                         tokio::select! {
                                             _ = connect_loop_with_coordination(
-                                                &db, &tid, ep, dial_addr, cfg, intro_spawner, ingest, Some(coord),
+                                                &db, &tid, ep, dial_addr, cfg, intro_spawner, ingest, coord,
                                             ) => {}
                                             _ = cancel.changed() => {}
                                         }

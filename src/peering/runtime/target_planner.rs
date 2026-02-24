@@ -120,7 +120,7 @@ pub(crate) fn spawn_connect_loop_thread(
                 Some(cfg),
                 intro_spawner,
                 ingest,
-                Some(coordination),
+                coordination,
             )
             .await
             {

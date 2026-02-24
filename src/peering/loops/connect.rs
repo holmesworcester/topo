@@ -51,6 +51,11 @@ pub async fn connect_loop(
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Default connect loop path is coordinated as well: a single-peer
+    // coordinator degenerates to pass-through assignment but keeps one
+    // initiator behavior across tests and runtime.
+    let coord_manager = crate::sync::CoordinationManager::new();
+    let coord = coord_manager.register_peer();
     connect_loop_with_coordination(
         db_path,
         recorded_by,
@@ -59,7 +64,7 @@ pub async fn connect_loop(
         client_config,
         intro_spawner,
         ingest,
-        None,
+        coord,
     )
     .await
 }
@@ -73,7 +78,7 @@ pub async fn connect_loop_with_coordination(
     client_config: Option<TransportClientConfig>,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
-    coordination: Option<Arc<PeerCoord>>,
+    coordination: Arc<PeerCoord>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     {
         let db = open_connection(db_path)?;
@@ -135,7 +140,7 @@ async fn connect_loop_inner(
     client_config: Option<TransportClientConfig>,
     intro_spawner: IntroSpawnerFn,
     shared_ingest: mpsc::Sender<IngestItem>,
-    coordination: Option<Arc<PeerCoord>>,
+    coordination: Arc<PeerCoord>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Look up workspace SNI for this tenant (falls back to "localhost" if no trust anchor)
     let sni = {
@@ -147,20 +152,12 @@ async fn connect_loop_inner(
             crate::transport::multi_workspace::workspace_sni(&ws_id)
         }
     };
-    let initiator_handler = if let Some(coord) = coordination {
-        SyncSessionHandler::initiator_with_coordination(
-            db_path.to_string(),
-            SYNC_SESSION_TIMEOUT_SECS,
-            coord,
-            shared_ingest.clone(),
-        )
-    } else {
-        SyncSessionHandler::initiator(
-            db_path.to_string(),
-            SYNC_SESSION_TIMEOUT_SECS,
-            shared_ingest.clone(),
-        )
-    };
+    let initiator_handler = SyncSessionHandler::initiator_with_coordination(
+        db_path.to_string(),
+        SYNC_SESSION_TIMEOUT_SECS,
+        coordination,
+        shared_ingest.clone(),
+    );
 
     loop {
         info!("Connecting to {}...", remote);
@@ -224,9 +221,19 @@ async fn connect_loop_inner(
 
         // Inner loop: repeated sync sessions on this connection
         loop {
+            // Refresh current transport peer_id each session. During identity
+            // transitions the active tenant can change; session scoping should
+            // follow the current transport identity when available.
+            let current_rb = if let Ok(db) = open_connection(db_path) {
+                crate::transport::identity::load_transport_peer_id(&db)
+                    .unwrap_or_else(|_| recorded_by.to_string())
+            } else {
+                recorded_by.to_string()
+            };
+
             // Check if peer has been removed -- deny further sessions
             if let Ok(db) = open_connection(db_path) {
-                if is_peer_removed(&db, recorded_by, &peer_fp).unwrap_or(false) {
+                if is_peer_removed(&db, &current_rb, &peer_fp).unwrap_or(false) {
                     warn!(
                         "Peer {} has been removed -- closing connection",
                         &peer_id[..16.min(peer_id.len())]
@@ -248,7 +255,7 @@ async fn connect_loop_inner(
                 &initiator_handler,
                 session.session_id,
                 session.io,
-                recorded_by,
+                &current_rb,
                 peer_fp,
                 session.remote_addr,
                 SessionDirection::Outbound,
