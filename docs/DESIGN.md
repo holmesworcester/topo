@@ -63,6 +63,7 @@ No canonical event field uses a length prefix to determine body boundaries.
 Text slots use fixed-size UTF-8 with mandatory zero-padding: unused bytes after the canonical text content must be zero, and no non-zero bytes may appear after the text terminator.
 Encrypted event wire size is deterministic by `inner_type_code` (inner types are fixed-size).
 File slice events use a canonical fixed ciphertext size; final plaintext chunks are padded before encryption.
+`signed_memo` events (type 4) are canonical shared signed text events with a fixed 1024-byte text slot and normal signer-field verification.
 
 ## 1.3 Event identity and signatures
 
@@ -95,6 +96,20 @@ Safety rule:
 2. enforce global and per-frame-type max lengths.
 3. all canonical event types have fixed wire sizes; `payload_len` must exactly match the schema-defined size for the event type (or, for encrypted events, the size determined by `inner_type_code`).
 4. any mismatch rejects the frame.
+
+## 1.5 Dual-stream sync completion protocol
+
+Sync sessions use one control stream and one data stream.
+
+Completion frames:
+1. `Done` (control stream, initiator -> responder): initiator has finished producing outbound work for this round.
+2. `DataDone` (data stream, either direction): sender has no more `Event` frames on the data stream.
+3. `DoneAck` (control stream, responder -> initiator): responder confirms terminal completion.
+
+Completion invariants:
+1. responder sends `DoneAck` only after its egress is drained, it has sent its own `DataDone`, and it has observed peer `DataDone` on inbound data.
+2. initiator treats the session as complete only after `DoneAck`.
+3. this handshake gives explicit end-of-data semantics without relying on transport stream close timing.
 
 ---
 
@@ -223,6 +238,17 @@ Introductions are explicit and one-shot:
 
 Selection logic ("who to intro, when to retry") is intentionally outside the core protocol for now.
 
+### UPnP port mapping (operator-invoked)
+
+UPnP/IGD mapping is an optional transport reachability aid, separate from canonical protocol state.
+
+Rules:
+1. mapping is invoked explicitly via `topo upnp` (daemon RPC `Upnp`) using the daemon's actual bound QUIC listen address.
+2. result is a structured status report: `success | failed | not_attempted` with mapped external port/IP and optional gateway/error fields.
+3. loopback-bound listeners produce `not_attempted`; routable mapping requires non-loopback bind (`0.0.0.0` or explicit LAN IP).
+4. if mapping succeeds but the external IP is not publicly routable, runtime flags `double_nat = true` and warns.
+5. UPnP outcome is informational runtime metadata (`NodeRuntimeNetInfo.upnp`) and does not modify trust/projection/signature semantics.
+
 ### Testing
 
 Test the feature with both local integration tests and Linux netns NAT simulation:
@@ -253,6 +279,12 @@ Signer secrets (LocalSignerSecret events) are NOT emitted here; `persist_join_si
 **Device link** (`workspace::commands::create_device_link_invite` / `add_device_to_workspace`): similar to user invite but creates a shorter chain (PeerSharedFirst only, skipping user/device_invite creation).
 
 **Retry** (`workspace::commands::retry_pending_invite_content_key_unwraps`): retries content-key unwrap for invites where SecretShared prerequisites arrived late. Triggered via `event_modules::post_drain_hooks` from `event_pipeline/effects.rs` after each projection drain.
+
+Identity finalization step:
+1. bootstrap flows can begin under a temporary invite-derived `recorded_by` identity before the steady-state PeerShared-derived transport peer ID is installed,
+2. after transition, `finalize_identity(old, new)` rebinds tenant-scoped rows across projection/trust/pipeline tables in one transaction,
+3. finalization reconciles blocker/project-queue state (drop stale blocker edges, release stale leases, requeue newly unblocked events),
+4. if `old == new`, finalization is a no-op.
 
 ### Identity ownership boundary
 
@@ -859,6 +891,31 @@ inconsistent view during block rebuilding.
 2. local RPC control socket,
 3. unified CLI (`topo`) with subcommands that route through daemon when running, fall back to direct DB access otherwise.
 
+### RPC wire contract
+
+1. local RPC uses a versioned envelope (`RpcRequest.version`, `RpcResponse.version`),
+2. transport framing is `u32` big-endian length-prefixed JSON,
+3. server rejects oversized RPC frames (>16 MiB),
+4. daemon enforces a bounded concurrent RPC connection cap.
+
+### Daemon session-local state
+
+Daemon RPC state owns local UX/session aliases that are intentionally non-canonical:
+1. active peer selection for multi-tenant DBs,
+2. invite-link numeric references (session-local aliases to full `quiet://...` links),
+3. channel aliases + active-channel selection per peer.
+
+These are operator ergonomics, not protocol facts; they do not project into canonical event state.
+
+### DB registry selector contract
+
+CLI database selection supports a local registry (`~/.topo/db_registry.json`, overridable by `TOPO_REGISTRY_DIR`) with:
+1. alias names,
+2. 1-based numeric selectors,
+3. default DB selection for the implicit `--db server.db` case.
+
+Selectors resolve in priority order: existing path -> alias -> index -> passthrough path.
+
 ## 8.2 Testing and agent ergonomics
 
 Assertion-first commands are first-class:
@@ -1049,6 +1106,7 @@ Initial event-size policy:
 
 `file_slice` events (type 25, signed) are signed and validated like other canonical events.
 `message_attachment` events (type 24, signed) are file descriptors with deps on `message_id`, `key_event_id`, and `signed_by`.
+`signed_memo` events (type 4, signed) are fixed-size canonical memo entries projected into `signed_memos`.
 
 ### Low-memory trust and key strategy (`low_mem_ios`)
 
