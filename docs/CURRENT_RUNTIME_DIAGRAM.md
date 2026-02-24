@@ -56,7 +56,7 @@ flowchart TD
     APPLY --> PDB[("SQLite Projections")]
 
     CTRL["Sync control stream (HaveList / need_ids)"] --> QDB
-    PDB --> TRUST["transport trust decisions"]
+    PDB --> TRUST["SQL trust read"]
     TRUST --> LIFE
 ```
 
@@ -180,7 +180,7 @@ flowchart TD
     end
 
     subgraph TRUST_POL["Transport Trust"]
-      TRUST["Trust policy"]
+      TRUST["SQL trust read"]
     end
 
     START --> EP
@@ -242,7 +242,7 @@ flowchart TD
 - `Shared event send`: `Store::get_shared(events) -> Frame::Event`.
 - `Projection tables`: projected read models (`messages`, `users`, `peers`, `channels`).
 - `Transport trust tables`: transport trust rows (`peer_shared`, invite bootstrap records).
-- `Trust policy`: tenant-scoped allow/deny decisions consumed by transport lifecycle.
+- `SQL trust read`: tenant-scoped allow/deny via `db::transport_trust::is_peer_allowed`, consumed by transport lifecycle.
 
 ## Current Data-Flow Facts
 
@@ -256,3 +256,4 @@ flowchart TD
 8. `HaveList` IDs originate from sync reconciliation `need_ids`; runtime initiator sessions use coordinator-assigned subsets (autodial + mDNS), then land in `egress_queue`.
 9. Foreground runtime is daemon-first (`topo start`): shutdown is coordinated by shared `shutdown_notify` (RPC `Shutdown` or Ctrl-C).
 10. Runtime and helper initiator sessions both route pull assignment through the coordinator; there is no direct `need_ids -> HaveList(all)` bypass path.
+11. Transport trust checks now read `db::transport_trust::is_peer_allowed` directly; the separate trust-oracle adapter layer is removed.
