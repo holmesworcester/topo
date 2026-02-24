@@ -34,7 +34,7 @@ flowchart TD
     SVC --> INFRA["open_db_* helpers / node status / intro transport helper"]
 ```
 
-## 1) Simplified SQLite View (Collapsed Local + Incoming Paths)
+## 1) Unified Ingest to SQLite (Local + Wire Events)
 
 ```mermaid
 flowchart TD
@@ -154,7 +154,7 @@ flowchart TD
     subgraph PIPE["Event Pipeline (shared ingest -> projection)"]
       LOCAL --> INGEST["shared ingest channel (mpsc)"]
       INGEST --> WRITER["batch_writer thread"]
-      WRITER --> P1["phase 1: persist events/recorded/neg + enqueue project_queue"]
+      WRITER --> P1["phase 1: persist events/recorded/sync state + enqueue project_queue"]
       P1 --> PROJ_Q["project_queue"]
       PROJ_Q --> P3
       P1 --> P2["phase 2: plan post-commit commands"]
@@ -175,9 +175,12 @@ flowchart TD
       EP["single QUIC endpoint"]
       BOUND["peering_boundary (contract helpers)"]
       LIFE["connection_lifecycle / accept_peer / dial_peer"]
-      TRUST["SqliteTrustOracle (tenant-scoped allow/deny)"]
       FACT["session_factory / accept/open_session_io"]
       IIO["intro_io / accept_and_read_intro"]
+    end
+
+    subgraph TRUST_POL["Trust Policy"]
+      TRUST["SqliteTrustOracle (tenant-scoped allow/deny)"]
     end
 
     START --> EP
