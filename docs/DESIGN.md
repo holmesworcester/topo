@@ -148,7 +148,7 @@ Transport cert/key materialization is isolated behind a typed contract:
 - **`TransportIdentityAdapter`** (trait): executes the intent against the DB. The sole concrete implementation (`ConcreteTransportIdentityAdapter` in `src/transport/identity_adapter.rs`) is the **only** code that calls raw install functions (`install_peer_key_transport_identity`, `install_invite_bootstrap_transport_identity`).
 - **Event modules** emit `ApplyTransportIdentityIntent` commands (e.g., `local_signer_secret` projector for PeerShared signers).
 - **Projection pipeline** (`write_exec.rs`) routes intents through the adapter.
-- **Service layer** uses the adapter directly for invite-bootstrap identity during `svc_accept_invite` / `svc_accept_device_link`.
+- **Workspace command layer** uses the adapter directly for invite-bootstrap identity during `workspace::commands::accept_invite` / `workspace::commands::accept_device_link`.
 - **Boundary enforcement**: `scripts/check_boundary_imports.sh` prevents raw install calls from leaking into `service.rs`, `event_modules/`, or `projection/`.
 
 ## 2.3 Event-graph identity binding
@@ -252,7 +252,7 @@ Signer secrets (LocalSignerSecret events) are NOT emitted here; `persist_join_si
 
 **Device link** (`workspace::commands::create_device_link_invite` / `add_device_to_workspace`): similar to user invite but creates a shorter chain (PeerSharedFirst only, skipping user/device_invite creation).
 
-**Retry** (`workspace::commands::retry_pending_invite_content_key_unwraps`): retries content-key unwrap for invites where SecretShared prerequisites arrived late. Called from `event_pipeline/effects.rs` after each projection drain.
+**Retry** (`workspace::commands::retry_pending_invite_content_key_unwraps`): retries content-key unwrap for invites where SecretShared prerequisites arrived late. Triggered via `event_modules::post_drain_hooks` from `event_pipeline/effects.rs` after each projection drain.
 
 ### Identity ownership boundary
 
@@ -261,7 +261,7 @@ Signer secrets (LocalSignerSecret events) are NOT emitted here; `persist_join_si
 - `transport/identity.rs` owns transport cert/key/SPKI logic.
 - `event_modules/workspace/commands.rs` owns all workflow orchestration: workspace creation, invite creation/acceptance, device link flows, retry logic.
 - `service.rs` routes to `workspace::commands` APIs; it contains no identity-specific workflow orchestration.
-- `event_pipeline/effects.rs` calls `workspace::commands::retry_pending_invite_content_key_unwraps` for post-drain content-key convergence.
+- `event_pipeline/effects.rs` invokes `event_modules::post_drain_hooks`, which calls `workspace::commands::retry_pending_invite_content_key_unwraps` for post-drain content-key convergence.
 - The `src/identity/` module has been eliminated. No `pub mod identity;` exists in `lib.rs`.
 - Boundaries are machine-checked by `scripts/check_boundary_imports.sh`.
 
@@ -306,7 +306,7 @@ Rules:
 
 This preserves `poc-6`-style scoped reads/writes while keeping the schema ergonomic.
 
-**Known limitation:** The `neg_items` table (negentropy reconciliation index) is global — not scoped by tenant. A remote peer connecting to the shared endpoint and routed as tenant A can see event IDs from all tenants during negentropy, including tenant B in a different workspace. This is acceptable because multi-tenant nodes are single-operator (one person with multiple workspace memberships on one device). The operator already has direct DB access, and the stronger deanonymization signal — multiple tenants sharing the same IP address and mDNS advertisements — exists at the network layer regardless. Real pseudonym isolation requires separate nodes on separate network paths.
+**Known limitation:** The `neg_items` table is shared across tenants as one physical table. Negentropy reads are workspace-scoped (`workspace_id = ? OR workspace_id = ''`), so a tenant session does not enumerate other tenants' non-empty workspace buckets. The remaining leakage surface is rows written with empty `workspace_id` (bootstrap/pre-anchor window). Full pseudonym isolation still requires separate nodes on separate network paths.
 
 ## 3.2.1 Functional multitenancy: one node, N tenants
 
@@ -637,9 +637,9 @@ Design note:
 
 Three creation entry points exist:
 
-1. `persist_and_enqueue(event_blob, peer_id) -> event_id`,
-2. `create_event_sync(...) -> event_id`,
-3. `create_events_batch(events, project_now) -> Vec<event_id>`.
+1. `create_event_sync(...) -> event_id`,
+2. `create_signed_event_sync(...) -> event_id`,
+3. `create_encrypted_event_sync(...) -> event_id`.
 
 `create_event_sync` uses the same internal path as workers and returns success only when terminal state is `valid` for the target `recorded_by`.
 This preserves imperative orchestration ergonomics:
@@ -865,7 +865,6 @@ Assertion-first commands are first-class:
 
 1. `assert-now`,
 2. `assert-eventually`,
-3. optional `assert-stable`.
 
 `assert-eventually` is preferred over ad-hoc sleeps for both deterministic tests and agent self-play loops.
 
@@ -894,7 +893,7 @@ Projector-spec mapping: each Rust projector predicate maps to a named TLA guard.
 
 Tests are organized into three layers, each exercising a different scope of the TLA+ conformance contract:
 
-1. **Projector unit** (`src/event_modules/*_projector_tests.rs`) — pure function contract. Each test calls `project_pure(event, ctx)` directly with a hand-built `ContextSnapshot` and asserts decision, write_ops, and emit_commands. Covers event-local predicates (trust anchor, signer mismatch, deletion author, bootstrap trust emission, file slice auth).
+1. **Projector unit** (`tests/projectors/*_projector_tests.rs`) — pure function contract. Each test calls `project_pure(event, ctx)` directly with a hand-built `ContextSnapshot` and asserts decision, write_ops, and emit_commands. Covers event-local predicates (trust anchor, signer mismatch, deletion author, bootstrap trust emission, file slice auth).
 2. **Pipeline integration** (`src/projection/apply/tests/`) — shared pipeline stages. Tests exercise `project_one_step` end-to-end through dep presence, dep type checks, signer resolution, encrypted wrapper decrypt/dispatch, and cascade unblock. Uses a real SQLite DB with the full projection pipeline.
 3. **Replay/order conformance** (`src/projection/apply/tests/`) — model-critical convergence properties. Source-isomorphism tests replay the same events in different orderings and assert identical terminal state. Covers out-of-order convergence, idempotent replay, stable terminal state, and deletion two-stage convergence.
 
@@ -1153,8 +1152,8 @@ The projection pipeline (`src/projection/apply/`) is orchestration-only:
 The service layer (`src/service.rs`) is a thin orchestrator:
 
 - DB open/close and connection management
-- Auth (key loading, `require_local_peer_signer`)
-- Cross-module composition (e.g. `svc_view_conn` combines workspace::name + message::list + reaction::list_for_message_with_authors)
+- Auth/key helpers (`load_local_peer_signer_pub`, `load_local_user_key`)
+- Cross-module composition is routed through RPC handlers and event-module queries (for example `workspace::view` combines workspace/message/reaction/user projections)
 - Non-event-specific logic (identity bootstrap, invite flows, predicate/assert system)
 - Error mapping from module results to `ServiceError`
 
@@ -1170,28 +1169,27 @@ fn(&str, &str, &ParsedEvent, &ContextSnapshot) -> ProjectorResult
 
 ### Service command routing
 
-Service command handlers call event-module command APIs directly. Example flows:
+RPC command handlers (`src/rpc/server.rs`) call event-module command APIs directly. Example flows:
 
-- `svc_send_conn` -> `message::send`
-- `svc_react_conn` -> `reaction::react`
-- `svc_delete_message_conn` -> `message_deletion::delete_message`
-- `svc_remove_user_conn` -> `user_removed::remove_user`
-- `svc_create_workspace` -> `workspace::commands::create_workspace`
-- `svc_accept_invite` -> `workspace::commands::join_workspace_as_new_user`
-- `svc_accept_device_link` -> `workspace::commands::add_device_to_workspace`
-- `svc_create_invite_conn` -> `workspace::commands::create_user_invite`
-- `svc_create_device_link_invite_conn` -> `workspace::commands::create_device_link_invite`
-- `svc_create_invite` / `svc_create_invite_with_spki` -> `workspace::commands::load_workspace_signing_key` + `create_user_invite`
+- `RpcMethod::Send` -> `message::send_for_peer`
+- `RpcMethod::React` -> `reaction::react_for_peer`
+- `RpcMethod::DeleteMessage` -> `message::delete_message_for_peer`
+- `RpcMethod::Ban` -> `user::ban_for_peer`
+- `RpcMethod::CreateWorkspace` -> `workspace::commands::create_workspace_for_db`
+- `RpcMethod::AcceptInvite` -> `workspace::commands::accept_invite`
+- `RpcMethod::AcceptLink` -> `workspace::commands::accept_device_link`
+- `RpcMethod::CreateInvite` -> `workspace::commands::create_invite_for_db` / `workspace::commands::create_invite_with_spki`
+- `RpcMethod::CreateDeviceLink` -> `workspace::commands::create_device_link_for_peer`
 
 ### Service query routing
 
-Service query handlers call event-module query APIs directly. Example flows:
+RPC query handlers (`src/rpc/server.rs`) call event-module query APIs directly. Example flows:
 
-- `svc_messages_conn` -> `message::list`
-- `svc_reactions_conn` -> `reaction::list`
-- `svc_users_conn` -> `user::list`
-- `svc_workspaces_conn` -> `workspace::list`
-- `svc_keys_conn` -> `user::count`, `peer_shared::count`, `admin::count`, `transport_key::count`
+- `RpcMethod::Messages` -> `message::list`
+- `RpcMethod::Reactions` -> `reaction::list`
+- `RpcMethod::Users` -> `user::list_items`
+- `RpcMethod::Workspaces` -> `workspace::list_items`
+- `RpcMethod::Keys` -> `workspace::keys` (which aggregates `user`, `peer_shared`, `admin`, and `transport_key` counts)
 
 ## 14.4 Module split rule
 
