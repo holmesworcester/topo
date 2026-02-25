@@ -97,9 +97,7 @@ flowchart TD
 flowchart TD
     CTRL["Control"]
     BOOT["Setup"]
-    subgraph RSUP_BOX["Runtime Supervisor"]
-      RSUP["Supervisor"]
-    end
+    RSUP["Supervisor"]
     TRANS["Transport"]
     SYNC["Sync Engine"]
     PIPE["Event Pipeline"]
@@ -143,7 +141,7 @@ flowchart TD
     START["setup_endpoint_and_tenants"]
 
     subgraph RUNTIME_SUP["Runtime Supervisor"]
-      RSUP["RuntimeSupervisor"]
+      RSUP["Supervisor"]
       RSTATE["state machine: IdleNoTenants <-> Active"]
       RCANCEL["CancellationToken tree"]
       TARGET_Q["unified target ingress queue"]
