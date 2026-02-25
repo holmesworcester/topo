@@ -873,7 +873,7 @@ fn local_signer_secret_events_do_not_pass_shared_egress_gate() {
 fn shutdown_handler_does_not_call_process_exit() {
     // Source-level guard: verify that the RPC server dispatch does NOT contain
     // process::exit. This is a simple grep-style check to prevent regression.
-    let server_source = include_str!("../src/rpc/server.rs");
+    let server_source = include_str!("../src/runtime/control/rpc/server.rs");
     assert!(
         !server_source.contains("process::exit"),
         "RPC server must not call process::exit; use coordinated shutdown instead"
