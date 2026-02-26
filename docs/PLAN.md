@@ -178,6 +178,25 @@ Phase 1 is functionally complete. All deliverables are met:
 - CLI integration tests use assert commands (no ad-hoc wait helpers).
 - JSON output is not required; human-readable output is sufficient.
 
+### Required RPC and selector contract
+
+Phase 1 CLI/daemon shape must preserve the following runtime contract:
+
+1. RPC envelope is versioned on both request and response (`RpcRequest.version`, `RpcResponse.version`).
+2. RPC transport framing is `u32` big-endian length-prefixed JSON.
+3. Oversized RPC frames are rejected (`> 16 MiB`).
+4. Daemon enforces a bounded concurrent RPC connection cap.
+
+Session-local daemon state (non-canonical by design):
+1. active peer selection for multi-tenant DBs,
+2. invite-link numeric aliases to full invite links,
+3. channel aliases and active-channel selection per peer.
+
+DB registry selector contract:
+1. selector registry file: `~/.topo/db_registry.json` (overridable by `TOPO_REGISTRY_DIR`),
+2. supports alias selectors, 1-based numeric selectors, and default DB selection,
+3. selector resolution order is: existing path -> alias -> index -> passthrough path.
+
 ---
 
 ## 4. Phase 2: mTLS + QUIC Baseline
@@ -246,6 +265,19 @@ Historical reference branches (`poc-7-mtls`, `poc-7=codex-attempt`) are no longe
    - local TLS cert/public/private key material is represented by local events with normal dependency ordering.
    - runtime may materialize active TLS objects from projected event state.
    - persisted files are optional cache, not policy authority.
+
+### Sync session completion protocol (required)
+
+Sync sessions use one control stream and one data stream with explicit completion frames:
+
+1. `Done` (control stream, initiator -> responder): initiator has finished outbound work for this round.
+2. `DataDone` (data stream, either direction): sender has no more `Event` frames on data stream.
+3. `DoneAck` (control stream, responder -> initiator): responder confirms terminal completion.
+
+Completion invariants:
+1. responder sends `DoneAck` only after egress is drained, it has sent its own `DataDone`, and it has observed peer `DataDone` on inbound data,
+2. initiator treats session as complete only after `DoneAck`,
+3. protocol must not rely on stream-close timing for end-of-data semantics.
 
 ## 4.3 Implementation checklist (assistant-safe)
 
@@ -350,6 +382,11 @@ This supports deterministic parsing by type dispatch and fixed offsets (langsec-
 - it must exactly match the schema-defined fixed size for the event type,
 - for encrypted events it must match the size determined by `inner_type_code`,
 - any mismatch rejects the frame.
+
+Frame safety bounds (required):
+- enforce a global max frame payload length before allocation/decode,
+- enforce per-frame-type max lengths,
+- reject any frame where declared `payload_len` exceeds global or frame-type bounds.
 
 ## 5.3 Signer and recording semantics (explicit)
 
@@ -1575,6 +1612,12 @@ Identity workflow orchestration is fully owned by `event_modules/workspace/comma
 `event_pipeline/effects.rs` calls `workspace::commands::retry_pending_invite_content_key_unwraps` — no identity-special callouts.
 Boundaries enforced by `scripts/check_boundary_imports.sh`.
 
+Identity finalization requirement:
+1. bootstrap may begin under a temporary invite-derived `recorded_by`,
+2. after steady-state PeerShared identity materializes, call `finalize_identity(old_recorded_by, new_recorded_by)` transactionally,
+3. finalization must rebind tenant-scoped projection/trust/pipeline rows and reconcile blocker/project-queue state (drop stale blocker edges, release stale leases, requeue newly unblocked events),
+4. if `old_recorded_by == new_recorded_by`, finalization is a no-op.
+
 ## 15.11 PR slicing guidance (to reduce assistant mistakes)
 
 Recommended PR sequence:
@@ -2038,6 +2081,11 @@ Each tenant advertises under `_topo._udp.local.` with:
 
 `local_peer_ids` (the full set of all tenants on this node) filters out self-discoveries and other local tenants. This prevents unnecessary local connections.
 
+Same-host loopback normalization rule:
+1. same-machine daemons bound to `127.0.0.1` may advertise non-loopback addresses for mDNS reachability,
+2. browse-side must normalize discovered non-loopback addresses back to loopback when local daemon is loopback-bound (`normalize_discovered_addr_for_local_bind`),
+3. advertised IP is explicit runtime input from `run_node`; discovery internals must not infer addresses implicitly.
+
 ### 17.5.3 Integration in `run_node`
 
 After creating the shared endpoint and learning its bound port, `run_node` creates `TenantDiscovery` per tenant using that shared port. On trusted discovery, `PeerDispatcher` (from `target_planner.rs`) routes to tenant-specific `connect_loop`. Feature-gated with `#[cfg(feature = "discovery")]`.
@@ -2306,6 +2354,12 @@ Goal: establish a test suite where successful P2P bootstrap and sync cannot be f
 3. Reason for inclusion anyway: it reduces manual router/NAT setup friction during realism testing and makes invite bootstrap trials faster to run.
 4. Current behavior is intentionally best-effort/manual (`topo upnp`); there is no long-running lease-refresh manager in daemon scope.
 5. Expected limitation: some networks (for example CGNAT or non-UPnP routers) still require manual bootstrap endpoints even with this feature.
+
+UPnP response contract:
+1. `topo upnp` reports structured outcome status: `success | failed | not_attempted`,
+2. report includes mapped external port/IP plus optional gateway/error fields,
+3. loopback-bound listeners return `not_attempted`,
+4. if mapping succeeds but external IP is not publicly routable, report `double_nat = true` and warn.
 
 ## 19. Event-module locality (Options 1+2+4+5)
 
