@@ -89,6 +89,27 @@ pub fn encode_local_signer_secret(event: &ParsedEvent) -> Result<Vec<u8>, EventE
 use crate::crypto::event_id_to_base64;
 use crate::contracts::transport_identity_contract::TransportIdentityIntent;
 use crate::projection::result::{ContextSnapshot, EmitCommand, ProjectorResult, SqlVal, WriteOp};
+use rusqlite::Connection;
+
+pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS local_signer_material (
+            recorded_by TEXT NOT NULL,
+            signer_event_id TEXT NOT NULL,
+            signer_kind INTEGER NOT NULL,
+            private_key BLOB NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (recorded_by, signer_event_id)
+        );
+        ",
+    )?;
+    Ok(())
+}
+
+pub fn identity_rebind_recorded_by_tables() -> &'static [&'static str] {
+    &["local_signer_material"]
+}
 
 /// Pure projector: LocalSignerSecret → local_signer_material table.
 /// UPSERT by (recorded_by, signer_event_id): Delete existing + InsertOrIgnore.

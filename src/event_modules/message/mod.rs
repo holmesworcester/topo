@@ -18,6 +18,33 @@ pub use queries::{
 };
 pub use projector::project_pure;
 
+use rusqlite::Connection;
+
+pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS messages (
+            message_id TEXT NOT NULL,
+            workspace_id TEXT NOT NULL,
+            author_id TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            recorded_by TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (recorded_by, message_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_messages_workspace
+            ON messages(workspace_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_messages_recorded
+            ON messages(recorded_by, created_at DESC);
+        ",
+    )?;
+    Ok(())
+}
+
+pub fn identity_rebind_recorded_by_tables() -> &'static [&'static str] {
+    &["messages"]
+}
+
 // --- Response types (moved from service.rs) ---
 
 use serde::{Deserialize, Serialize};

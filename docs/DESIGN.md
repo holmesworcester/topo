@@ -444,12 +444,13 @@ Durable trust/identity authority transitions are eventized (InviteAccepted, Peer
 
 ## 3.3 Table lifecycle and naming
 
-1. schema creation runs through ordered migrations,
-2. event modules register their projection table migrations,
-3. startup performs migration + registry/schema consistency checks and fails fast on mismatch,
-4. prototype schema epoch is explicit (`schema_epoch`) and enforced at startup,
-5. legacy DB layouts from prior prototype epochs are intentionally rejected (no backward migration; recreate DB),
-6. each event module declares explicit `event_type` and `projection_table`; no inferred naming heuristics.
+1. startup schema is epoch-only: `ensure_schema_epoch` + `ensure_all_schema`,
+2. no `schema_migrations` table or versioned migration runner is required in active startup/operation,
+3. each owner module defines its own idempotent `ensure_schema(conn)` (event projection tables in `event_modules/*`, queue/infra tables in `state/db/*`),
+4. central bootstrap calls owner `ensure_schema` in deterministic order,
+5. prototype schema epoch is explicit (`schema_epoch`) and enforced at startup,
+6. legacy DB layouts from prior prototype epochs are intentionally rejected (no backward migration; recreate DB),
+7. each event module declares explicit `event_type` and `projection_table`; no inferred naming heuristics.
 
 ---
 

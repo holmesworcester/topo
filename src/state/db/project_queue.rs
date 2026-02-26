@@ -6,6 +6,62 @@ pub struct ProjectQueue<'a> {
     conn: &'a Connection,
 }
 
+pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS valid_events (
+            peer_id TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            PRIMARY KEY (peer_id, event_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS rejected_events (
+            peer_id TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            rejected_at INTEGER NOT NULL,
+            PRIMARY KEY (peer_id, event_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS blocked_event_deps (
+            peer_id TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            blocker_event_id TEXT NOT NULL,
+            PRIMARY KEY (peer_id, event_id, blocker_event_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_blocked_by_dep_covering
+            ON blocked_event_deps(peer_id, blocker_event_id, event_id);
+
+        CREATE TABLE IF NOT EXISTS blocked_events (
+            peer_id TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            deps_remaining INTEGER NOT NULL,
+            PRIMARY KEY (peer_id, event_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS project_queue (
+            peer_id TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            available_at INTEGER NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            lease_until INTEGER,
+            PRIMARY KEY (peer_id, event_id)
+        );
+        ",
+    )?;
+    Ok(())
+}
+
+pub fn identity_rebind_peer_id_tables() -> &'static [&'static str] {
+    &[
+        "valid_events",
+        "rejected_events",
+        "blocked_event_deps",
+        "blocked_events",
+        "project_queue",
+    ]
+}
+
 impl<'a> ProjectQueue<'a> {
     pub fn new(conn: &'a Connection) -> Self {
         Self { conn }

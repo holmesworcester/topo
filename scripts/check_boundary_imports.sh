@@ -104,6 +104,10 @@ check_no_match 'install_invite_bootstrap_transport_identity' src/projection/
 check_no_match 'crate::identity::' src/
 check_no_match 'pub mod identity;' src/lib.rs
 
+# -- db boundary hardening: state/db must not depend on transport runtime --
+check_no_match 'crate::transport::' src/state/db/
+check_no_match 'crate::runtime::transport::' src/state/db/
+
 # -- event-module locality: service.rs must not call event-domain invite/identity ops directly --
 check_no_match 'identity_ops::create_user_invite' src/service.rs
 check_no_match 'identity_ops::create_device_link_invite' src/service.rs

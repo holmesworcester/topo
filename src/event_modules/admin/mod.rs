@@ -10,3 +10,23 @@ pub use wire::{
     AdminOngoingEvent, ADMIN_BOOT_META, ADMIN_BOOT_WIRE_SIZE, ADMIN_ONGOING_META,
     ADMIN_ONGOING_WIRE_SIZE,
 };
+
+use rusqlite::Connection;
+
+pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS admins (
+            recorded_by TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            public_key BLOB NOT NULL,
+            PRIMARY KEY (recorded_by, event_id)
+        );
+        ",
+    )?;
+    Ok(())
+}
+
+pub fn identity_rebind_recorded_by_tables() -> &'static [&'static str] {
+    &["admins"]
+}

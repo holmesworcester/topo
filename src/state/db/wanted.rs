@@ -8,6 +8,18 @@ pub struct WantedEvents<'a> {
     conn: &'a Connection,
 }
 
+pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS wanted_events (
+            id BLOB PRIMARY KEY,
+            first_seen_at INTEGER NOT NULL
+        );
+        ",
+    )?;
+    Ok(())
+}
+
 impl<'a> WantedEvents<'a> {
     pub fn new(conn: &'a Connection) -> Self {
         Self { conn }

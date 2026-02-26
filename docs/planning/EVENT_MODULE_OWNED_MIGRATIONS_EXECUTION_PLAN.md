@@ -1,4 +1,4 @@
-# Event-Module-Owned Migrations Execution Plan
+# Event-Module-Owned Schema Execution Plan (Epoch-Only, No Migrations)
 
 Branch: `exec/event-module-owned-migrations-plan`  
 Worktree: `/home/holmes/poc-7-event-module-owned-migrations-plan`
@@ -10,131 +10,140 @@ Do not execute this plan in any other worktree.
 
 ## Goal
 
-Make event modules own their SQL read-model schema/migrations locally so adding or evolving a module table does not require editing one central migration monolith.
+Make schema ownership local to the code that owns behavior:
+
+1. Event module read-model tables are owned by their event modules.
+2. Queue/infra tables are owned by their queue/infra modules.
+3. DB bootstrap is epoch-based only (no migration runner in scope for this POC).
+4. Layer boundary leaks are removed (`state/db` must not depend on `runtime/transport`).
 
 ## Why This Exists
 
-Today we have two central-locality bottlenecks:
+Current issues:
 
-1. `src/state/db/migrations.rs` contains most table DDL for all modules.
-2. `src/state/db/mod.rs` has hardcoded projection-table lists (for identity rebinding).
+1. Central DDL ownership is scattered/ambiguous (`schema.rs` + `migrations.rs`).
+2. Event concerns and queue concerns are not fully colocated with their modules.
+3. `state/db` has boundary leaks to transport runtime helpers (for example `removal_watch.rs` importing transport cert/SPKI helpers; similar leak pattern in related DB modules).
 
-This scatters event concerns away from their module code and forces unrelated central edits.
+This hurts locality, readability, and diagram clarity.
 
 ## Scope
 
 In scope:
 
-- Introduce a module-owned migration contract.
-- Move module table migrations from central `migrations.rs` into module-local files.
-- Replace hardcoded projection table lists in `src/state/db/mod.rs` with module-owned registration/metadata.
-- Keep infra/system tables under `state/db` ownership.
+- Remove migration-runner dependency from bootstrap path (POC epoch model only).
+- Move table DDL into owning modules (`event_modules/*`, `state/db/project_queue.rs`, `state/db/egress_queue.rs`, etc.).
+- Keep one central bootstrap orchestrator that calls module-owned `ensure_schema` in deterministic order.
+- Keep/strengthen `schema_epoch` gating.
+- Remove `state/db -> runtime/transport` boundary leaks, including `removal_watch` and related modules.
 
 Out of scope:
 
-- No event wire/protocol redesign.
-- No behavior changes to invite/sync/runtime flow.
-- No backwards-compat promise for legacy developer DB snapshots (POC stance). Fresh DB behavior + tests are the source of truth.
+- Backward compatibility for legacy DB snapshots.
+- Wire/protocol redesign.
+- Runtime behavior redesign unrelated to schema ownership/boundaries.
 
 ## Target Architecture
 
-### 1) Migration contract (shared)
+### 1) Epoch-only bootstrap contract
 
-Create a shared contract in `src/state/db` (name as needed), e.g.:
+Create/use a single bootstrap entrypoint (name as needed):
 
-- `ModuleMigration { module, version, name, sql }`
-- `ModuleSchemaSpec { module, migrations, identity_rebind_targets }`
-- `IdentityRebindTarget { table, column }`
+- `ensure_schema_epoch(conn)`
+- `ensure_all_schema(conn)`
 
-### 2) Module-local schema ownership
+`ensure_all_schema` calls owner modules in fixed order and is idempotent.
 
-Each event module that owns projection/read tables gets a local schema file, e.g.:
+No `schema_migrations` table, no versioned migration runner in active path.
 
-- `src/event_modules/message/schema.rs`
-- `src/event_modules/reaction/schema.rs`
-- `src/event_modules/workspace/schema.rs`
-- etc.
+### 2) Owner-local DDL
 
-Each module exports its own `ModuleSchemaSpec` with:
+Each owner module exports `ensure_schema(conn)`:
 
-- module-owned migrations
-- module-owned identity rebinding targets (`recorded_by` tables, etc.)
+- Event modules own their projection/read tables.
+- Queue modules own queue tables.
+- Infra DB modules own infra tables.
 
-### 3) Central runner becomes orchestrator only
+Central bootstrap orchestrates; owners define SQL.
 
-`src/state/db/migrations.rs` should:
+### 3) Identity rebinding locality
 
-- own infra/system migrations only
-- run module migrations from module registry in deterministic order
-- no longer carry module table SQL bodies
+`finalize_identity` table targets must be registry-driven or owner-specified metadata, not hardcoded monolith lists.
 
-### 4) `db/mod.rs` locality fix
+### 4) Boundary hardening (`removal_watch` and related)
 
-`src/state/db/mod.rs` should stop hardcoding projection table names for identity rebinding.  
-It should iterate module-provided `identity_rebind_targets` from the same schema registry.
+`state/db` modules must not import runtime transport code.
+
+Required cleanup:
+
+- Remove `state/db/removal_watch.rs -> runtime/transport/*` dependency.
+- Remove equivalent dependency pattern from related DB modules (for example `transport_trust.rs` if present).
+- Move shared SPKI/crypto derivation helpers to a neutral shared layer (e.g. `src/shared/crypto/*`) and depend on that from both sides.
 
 ## Ownership Boundary
 
-Infra/system tables remain in `state/db` migration ownership (examples):
+Queue/infra examples (owned under `state/db`):
 
-- `events`, `valid_events`, `rejected_events`, `blocked_event_deps`, `blocked_events`
-- `project_queue`, `egress_queue`, `ingress_queue`, `recorded_events`, `store`
-- `schema_migrations` (or equivalent migration state tables)
+- `project_queue` (in `project_queue.rs`)
+- `egress_queue` (in `egress_queue.rs`)
+- `wanted_events` (in `wanted.rs`)
+- pipeline/infra tables (`events`, `valid_events`, etc.)
 
-Event-module-owned tables move to module schema ownership (examples):
+Event-module examples (owned under `event_modules/*`):
 
 - `messages`, `reactions`, `deleted_messages`, `deletion_intents`
-- `workspaces`, `users`, `peers_shared`, `admins`, `user_invites`, `device_invites`, `invite_accepted`
-- `secret_keys`, `secret_shared`, `transport_keys`, `peer_transport_bindings`
-- `message_attachments`, `file_slices`, `local_signer_material`, etc.
+- `workspaces`, `users`, `peers_shared`, `admins`, invites, secret-sharing tables
+- attachment/read-model tables owned by attachment module(s)
 
-Exact final mapping should be explicit in code via module schema specs.
+Exact ownership must be explicit in code.
 
 ## Implementation Sequence
 
 1. Rebase this branch on latest `master`.
-2. Add migration contract types and module-schema registry plumbing.
-3. Add module-local `schema.rs` files and migrate SQL from central file module-by-module.
-4. Update migration runner to execute module schema specs.
-5. Replace hardcoded projection table list in `src/state/db/mod.rs` with registry-driven identity rebinding targets.
-6. Remove moved SQL from central `migrations.rs`.
-7. Add tests for migration locality and registry-driven identity rebinding.
-8. Update docs (`docs/DESIGN.md`, `docs/PLAN.md`) with the new ownership pattern.
+2. Introduce/finalize epoch-only bootstrap orchestration API.
+3. Remove `run_migrations` from active bootstrap path.
+4. Move queue table DDL into queue owner modules.
+5. Move event table DDL into event-module owners.
+6. Replace hardcoded identity-rebind table lists with owner metadata/registry.
+7. Remove `state/db` boundary leaks to runtime transport:
+   - `removal_watch`
+   - related modules with same dependency pattern.
+8. Delete/retire obsolete migration-runner code and tests that no longer apply.
+9. Add/adjust tests and static checks.
+10. Update `docs/DESIGN.md` and `docs/PLAN.md` with the epoch-only + owner-local pattern.
 
 ## Strict Success Criteria (SC)
 
-1. Module table DDL is defined in module-local schema files, not central monolith.
-2. `src/state/db/migrations.rs` no longer contains module-table SQL (infra only).
-3. `src/state/db/mod.rs` no longer hardcodes module projection table names for identity rebinding.
-4. Module registry drives both:
-   - module migration execution
-   - identity rebinding target iteration
-5. `cargo check` passes.
-6. `cargo test` passes for migration/identity-related coverage and existing runtime/CLI smoke coverage used in this repo.
-7. `docs/DESIGN.md` and `docs/PLAN.md` document:
-   - where new table migrations go
-   - how to register module schema
-   - how identity rebinding ownership works
+1. Active bootstrap path is epoch-only; no migration runner required.
+2. `schema_migrations` is not required for startup/operation.
+3. Queue table DDL lives in queue modules (`project_queue`, `egress_queue`, etc.).
+4. Event projection/read-model DDL lives in owning event modules.
+5. `finalize_identity` does not depend on a hardcoded monolithic table-name list.
+6. `state/db/removal_watch.rs` has no dependency on runtime transport modules.
+7. Related DB boundary leaks (same pattern) are removed.
+8. Shared crypto/SPKI helper location is neutral and reused from both sides.
+9. `cargo check` passes.
+10. Relevant tests pass (schema/bootstrap, identity finalization, removal-watch/trust boundary behavior).
 
 ## No-Cheat Validation
 
-Add explicit checks/tests so locality regressions are hard to hide:
+Add explicit checks/tests:
 
-1. A test that fails if module table DDL appears in `src/state/db/migrations.rs`.
-2. A test that fails if `finalize_identity` depends on a hardcoded table-name list.
-3. A test that validates module migration registry order is deterministic and idempotent.
-4. A focused integration test:
-   - create workspace
-   - send message/react
-   - run identity finalization path
-   - verify module-owned tables were migrated/rebound correctly.
+1. Guard check: fail if `run_migrations`/`schema_migrations` is required in active bootstrap path.
+2. Guard check: fail if `src/state/db/*` imports `src/runtime/transport/*`.
+3. Test that each owner `ensure_schema` is idempotent and called by central bootstrap.
+4. Integration test:
+   - bootstrap fresh DB
+   - run key event flows (workspace/message/reaction)
+   - run identity finalization
+   - assert owner tables exist and rebinding works
+5. Regression test for removal watch/trust behavior after boundary helper relocation.
 
 ## Completion Workflow
 
-1. Rebase this branch on latest `master` before finalizing.
-2. Run required checks/tests.
-3. Get review feedback (Codex CLI review) and address all findings.
+1. Rebase branch on latest `master` before finalizing.
+2. Run checks/tests and record evidence.
+3. Get Codex CLI review and address all findings.
 4. Re-run checks/tests.
 5. Commit on this worktree branch with a clear message.
 6. Report completion with evidence summary.
-

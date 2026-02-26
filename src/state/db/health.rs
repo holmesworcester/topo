@@ -1,5 +1,30 @@
 use rusqlite::{Connection, Result as SqliteResult, params};
 
+pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS peer_endpoint_observations (
+            recorded_by TEXT NOT NULL,
+            via_peer_id TEXT NOT NULL,
+            origin_ip TEXT NOT NULL,
+            origin_port INTEGER NOT NULL,
+            observed_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            PRIMARY KEY (recorded_by, via_peer_id, origin_ip, origin_port, observed_at)
+        );
+        CREATE INDEX IF NOT EXISTS idx_peer_endpoint_expires
+            ON peer_endpoint_observations(recorded_by, via_peer_id, expires_at);
+        CREATE INDEX IF NOT EXISTS idx_peer_endpoint_lookup
+            ON peer_endpoint_observations(recorded_by, via_peer_id, origin_ip, origin_port);
+        ",
+    )?;
+    Ok(())
+}
+
+pub fn identity_rebind_recorded_by_tables() -> &'static [&'static str] {
+    &["peer_endpoint_observations"]
+}
+
 /// Count blocked events for a peer (entries in blocked_event_deps).
 pub fn blocked_event_count(conn: &Connection, peer_id: &str) -> SqliteResult<i64> {
     conn.query_row(

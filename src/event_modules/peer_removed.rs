@@ -70,6 +70,26 @@ pub fn encode_peer_removed(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
 
 use crate::crypto::event_id_to_base64;
 use crate::projection::result::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
+use rusqlite::Connection;
+
+pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS removed_entities (
+            recorded_by TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            target_event_id TEXT NOT NULL,
+            removal_type TEXT NOT NULL,
+            PRIMARY KEY (recorded_by, event_id)
+        );
+        ",
+    )?;
+    Ok(())
+}
+
+pub fn identity_rebind_recorded_by_tables() -> &'static [&'static str] {
+    &["removed_entities"]
+}
 
 /// Pure projector: PeerRemoved → removed_entities table.
 pub fn project_pure(

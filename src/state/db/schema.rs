@@ -1,7 +1,5 @@
 use rusqlite::{Connection, ErrorCode, OptionalExtension, Result as SqliteResult};
 
-use super::migrations::run_migrations;
-
 /// Prototype schema epoch for the workspace-era database layout.
 ///
 /// This prototype intentionally does not support backward migration from older
@@ -37,7 +35,7 @@ fn incompatible_epoch_error(detail: &str) -> rusqlite::Error {
 /// - Current epoch DB: proceed.
 /// - Legacy migrated DB (has schema_migrations but no schema_epoch): reject.
 /// - Wrong/invalid epoch: reject.
-fn enforce_schema_epoch(conn: &Connection) -> SqliteResult<()> {
+pub fn ensure_schema_epoch(conn: &Connection) -> SqliteResult<()> {
     let has_epoch = table_exists(conn, "schema_epoch")?;
     if has_epoch {
         let epoch_opt: Option<i64> = conn
@@ -60,8 +58,6 @@ fn enforce_schema_epoch(conn: &Connection) -> SqliteResult<()> {
         return Ok(());
     }
 
-    // Legacy DBs already migrated by older prototype versions have schema_migrations
-    // but no schema_epoch marker. Reject these explicitly.
     let has_migrations = table_exists(conn, "schema_migrations")?;
     if has_migrations {
         return Err(incompatible_epoch_error(
@@ -69,7 +65,6 @@ fn enforce_schema_epoch(conn: &Connection) -> SqliteResult<()> {
         ));
     }
 
-    // Fresh DB: initialize epoch marker.
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_epoch (
             epoch INTEGER NOT NULL
@@ -82,84 +77,31 @@ fn enforce_schema_epoch(conn: &Connection) -> SqliteResult<()> {
     Ok(())
 }
 
-/// Create all tables for the sync system.
-pub fn create_tables(conn: &Connection) -> SqliteResult<()> {
-    enforce_schema_epoch(conn)?;
-
-    // Run column-rename migrations before DDL so that existing DBs with
-    // `network_event_id` get renamed to `workspace_id` before the
-    // CREATE INDEX references the new column name.
-    run_migrations(conn)?;
-
-    conn.execute_batch(
-        "
-        -- Events we want but don't have yet (from refs we've seen)
-        CREATE TABLE IF NOT EXISTS wanted_events (
-            id BLOB PRIMARY KEY,        -- 32-byte Event ID
-            first_seen_at INTEGER NOT NULL
-        );
-
-        -- Message projection table
-        CREATE TABLE IF NOT EXISTS messages (
-            message_id TEXT NOT NULL,
-            workspace_id TEXT NOT NULL,
-            author_id TEXT NOT NULL,
-            content TEXT NOT NULL,
-            created_at INTEGER NOT NULL,
-            recorded_by TEXT NOT NULL DEFAULT '',
-            PRIMARY KEY (recorded_by, message_id)
-        );
-        CREATE INDEX IF NOT EXISTS idx_messages_workspace ON messages(workspace_id, created_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_messages_recorded ON messages(recorded_by, created_at DESC);
-
-        -- Per-tenant receive/create journal
-        CREATE TABLE IF NOT EXISTS recorded_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            peer_id TEXT NOT NULL,
-            event_id TEXT NOT NULL,
-            recorded_at INTEGER NOT NULL,
-            source TEXT NOT NULL,
-            UNIQUE(peer_id, event_id)
-        );
-        CREATE INDEX IF NOT EXISTS idx_recorded_peer_order ON recorded_events(peer_id, id);
-
-        -- Negentropy items: sorted by (workspace_id, ts, id) for range-based reconciliation
-        CREATE TABLE IF NOT EXISTS neg_items (
-            workspace_id TEXT NOT NULL DEFAULT '',
-            ts INTEGER NOT NULL,        -- created_at_ms timestamp
-            id BLOB NOT NULL,           -- 32-byte event ID (raw, not base64)
-            PRIMARY KEY (workspace_id, ts, id)
-        ) WITHOUT ROWID;
-
-        -- Negentropy block index: sparse index every B items for O(1) index lookup
-        CREATE TABLE IF NOT EXISTS neg_blocks (
-            block_idx INTEGER PRIMARY KEY,  -- block number (item_index / B)
-            ts INTEGER NOT NULL,            -- timestamp of first item in block
-            id BLOB NOT NULL,               -- id of first item in block
-            count INTEGER NOT NULL          -- cumulative count up to this block
-        );
-
-        -- Negentropy metadata: tracks rebuild state
-        CREATE TABLE IF NOT EXISTS neg_meta (
-            key TEXT PRIMARY KEY,
-            value INTEGER NOT NULL
-        );
-        ",
-    )?;
+/// Ensure all schema owned by infra and event modules in a deterministic order.
+pub fn ensure_all_schema(conn: &Connection) -> SqliteResult<()> {
+    ensure_schema_epoch(conn)?;
+    super::ensure_infra_schema(conn)?;
+    crate::event_modules::ensure_schema(conn)?;
     Ok(())
+}
+
+/// Backward-compatible entrypoint used throughout the codebase.
+pub fn create_tables(conn: &Connection) -> SqliteResult<()> {
+    ensure_all_schema(conn)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::open_in_memory;
+    use std::fs;
+    use std::path::PathBuf;
 
     #[test]
     fn test_create_tables() {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
 
-        // Verify tables exist
         let tables: Vec<String> = conn
             .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
             .unwrap()
@@ -168,13 +110,21 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
 
-        assert!(tables.contains(&"wanted_events".to_string()));
+        // Infra-owned tables
+        assert!(tables.contains(&"events".to_string()));
+        assert!(tables.contains(&"project_queue".to_string()));
+        assert!(tables.contains(&"egress_queue".to_string()));
+        assert!(tables.contains(&"bootstrap_context".to_string()));
+
+        // Event-owned tables
+        assert!(tables.contains(&"workspaces".to_string()));
         assert!(tables.contains(&"messages".to_string()));
-        assert!(tables.contains(&"neg_items".to_string()));
-        assert!(tables.contains(&"neg_blocks".to_string()));
-        assert!(tables.contains(&"neg_meta".to_string()));
-        assert!(tables.contains(&"recorded_events".to_string()));
+        assert!(tables.contains(&"reactions".to_string()));
+        assert!(tables.contains(&"deletion_intents".to_string()));
+
+        // Epoch-only startup guard
         assert!(tables.contains(&"schema_epoch".to_string()));
+        assert!(!tables.contains(&"schema_migrations".to_string()));
 
         let epoch: i64 = conn
             .query_row("SELECT epoch FROM schema_epoch LIMIT 1", [], |row| row.get(0))
@@ -186,7 +136,7 @@ mod tests {
     fn test_create_tables_idempotent() {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
-        create_tables(&conn).unwrap(); // Should not fail
+        create_tables(&conn).unwrap();
 
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM schema_epoch", [], |row| row.get(0))
@@ -198,8 +148,6 @@ mod tests {
     fn test_reject_legacy_db_without_epoch_marker() {
         let conn = open_in_memory().unwrap();
 
-        // Simulate an older prototype DB that already has migration state but no
-        // schema_epoch marker.
         conn.execute_batch(
             "
             CREATE TABLE schema_migrations (
@@ -222,4 +170,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_state_db_has_no_transport_runtime_imports() {
+        let db_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/state/db");
+        for entry in fs::read_dir(db_dir).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("rs") {
+                continue;
+            }
+            let content = fs::read_to_string(&path).unwrap();
+            let has_transport_import = content.lines().any(|line| {
+                let trimmed = line.trim_start();
+                trimmed.starts_with("use crate::transport::")
+                    || trimmed.starts_with("use crate::runtime::transport::")
+            });
+            assert!(
+                !has_transport_import,
+                "state/db module {} must not import crate::transport",
+                path.display()
+            );
+        }
+    }
 }

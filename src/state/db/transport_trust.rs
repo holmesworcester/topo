@@ -2,8 +2,7 @@ use rusqlite::Connection;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::info;
 
-use crate::transport::AllowedPeers;
-use crate::transport::cert::spki_fingerprint_from_ed25519_pubkey;
+use crate::crypto::{AllowedPeers, spki_fingerprint_from_ed25519_pubkey};
 
 /// Pending bootstrap trust from locally-created invites is temporary.
 /// If a peer never joins, this entry should not authorize transport forever.
@@ -35,6 +34,75 @@ fn decode_32_byte_blob(blob: Vec<u8>) -> Option<[u8; 32]> {
     let mut fp = [0u8; 32];
     fp.copy_from_slice(&blob);
     Some(fp)
+}
+
+pub fn ensure_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS peer_transport_bindings (
+            recorded_by TEXT NOT NULL,
+            peer_id TEXT NOT NULL,
+            spki_fingerprint BLOB NOT NULL,
+            bound_at INTEGER NOT NULL,
+            PRIMARY KEY (recorded_by, peer_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_transport_bindings_spki
+            ON peer_transport_bindings(recorded_by, spki_fingerprint);
+
+        CREATE TABLE IF NOT EXISTS invite_bootstrap_trust (
+            recorded_by TEXT NOT NULL,
+            invite_accepted_event_id TEXT NOT NULL,
+            invite_event_id TEXT NOT NULL,
+            workspace_id TEXT NOT NULL,
+            bootstrap_addr TEXT NOT NULL,
+            bootstrap_spki_fingerprint BLOB NOT NULL,
+            accepted_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            superseded_at INTEGER,
+            PRIMARY KEY (recorded_by, invite_accepted_event_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_invite_bootstrap_spki
+            ON invite_bootstrap_trust(recorded_by, bootstrap_spki_fingerprint);
+        CREATE INDEX IF NOT EXISTS idx_invite_bootstrap_live
+            ON invite_bootstrap_trust(recorded_by, superseded_at, expires_at);
+
+        CREATE TABLE IF NOT EXISTS pending_invite_bootstrap_trust (
+            recorded_by TEXT NOT NULL,
+            invite_event_id TEXT NOT NULL,
+            workspace_id TEXT NOT NULL,
+            expected_bootstrap_spki_fingerprint BLOB NOT NULL,
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            superseded_at INTEGER,
+            PRIMARY KEY (recorded_by, invite_event_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_pending_invite_bootstrap_spki
+            ON pending_invite_bootstrap_trust(recorded_by, expected_bootstrap_spki_fingerprint);
+        CREATE INDEX IF NOT EXISTS idx_pending_invite_bootstrap_live
+            ON pending_invite_bootstrap_trust(recorded_by, superseded_at, expires_at);
+
+        CREATE TABLE IF NOT EXISTS bootstrap_context (
+            recorded_by TEXT NOT NULL,
+            invite_event_id TEXT NOT NULL,
+            workspace_id TEXT NOT NULL,
+            bootstrap_addr TEXT NOT NULL,
+            bootstrap_spki_fingerprint BLOB NOT NULL,
+            observed_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_bootstrap_context_lookup
+            ON bootstrap_context(recorded_by, invite_event_id, observed_at DESC);
+        ",
+    )?;
+    Ok(())
+}
+
+pub fn identity_rebind_recorded_by_tables() -> &'static [&'static str] {
+    &[
+        "peer_transport_bindings",
+        "invite_bootstrap_trust",
+        "pending_invite_bootstrap_trust",
+        "bootstrap_context",
+    ]
 }
 
 /// Append a bootstrap context observation — local durable context used as

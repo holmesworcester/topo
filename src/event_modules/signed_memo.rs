@@ -109,6 +109,28 @@ pub fn encode_signed_memo(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
 
 use crate::crypto::event_id_to_base64;
 use crate::projection::result::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
+use rusqlite::Connection;
+
+pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS signed_memos (
+            event_id TEXT NOT NULL,
+            signed_by TEXT NOT NULL,
+            signer_type INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            recorded_by TEXT NOT NULL,
+            PRIMARY KEY (recorded_by, event_id)
+        );
+        ",
+    )?;
+    Ok(())
+}
+
+pub fn identity_rebind_recorded_by_tables() -> &'static [&'static str] {
+    &["signed_memos"]
+}
 
 /// Pure projector: SignedMemo → signed_memos table insert.
 pub fn project_pure(

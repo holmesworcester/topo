@@ -17,3 +17,25 @@ pub use queries::{
     AccountItem, list_account_items, IdentityResponse, identity,
 };
 pub use projector::project_pure;
+
+use rusqlite::Connection;
+
+pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS peers_shared (
+            recorded_by TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            public_key BLOB NOT NULL,
+            user_event_id TEXT,
+            device_name TEXT,
+            PRIMARY KEY (recorded_by, event_id)
+        );
+        ",
+    )?;
+    Ok(())
+}
+
+pub fn identity_rebind_recorded_by_tables() -> &'static [&'static str] {
+    &["peers_shared"]
+}
