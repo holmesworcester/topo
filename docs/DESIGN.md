@@ -1,33 +1,37 @@
-# Topo Protocol Design (Post-PLAN End State)
+# Topo Protocol Proof-of-Concept Design
 
-> **Status: Active** — Topo target protocol design describing the post-PLAN end state.
+Topo is a proposed protocol for making it much easier to build full-featured local-first, peer-to-peer, end-to-end encrypted apps for communication and collaboration, informed by years of work on [Quiet](https://tryquiet.org), a peer-to-peer Slack alternative.
 
-This document describes the target protocol and runtime shape after completing all phases in `PLAN.md`.
-It is intentionally practical: one coherent model, one projection path, one dependency mechanism, and operational behavior that is easy to test with real QUIC daemons.
+This document describes the design of a proof-of-concept for Topo, focusing on a minimal feature set to establish that Topo permits (and ideally, makes easy) several aspects of realism, i.e. stuff you'd need when building a real workplace comms app for real users:
 
-Terminology note:
-`Topo` is the project and runtime name used throughout this repository.
-`workspace` is the term for the logical peer set and shared protocol context; "network" refers only to transport/networking concerns.
+1. **Encryption & Auth** - the ability to build modern, scalable, high-usability group encryption schemes with user removal
+2. **User-facing Features** - the ability to straightforwardly build Slack-like features in a shared workspace, with a principled, straightforward, but flexible approach to handling concurrent user actions
+3. **Boring API for Frontends** - it should be straightforward to contain complexity in the backend and provide a boring API that keeps frontend development highly conventional (e.g., letting frontends fetch a paginated message list with attachments, reactions, usernames, and avatars should be easy) 
+3. **Deletion & Disappearing Messages** - the ability to delete things (lots of p2p or local-first protocols make deletion hard 🤦)
+3. **P2P Networking** - the ability to discover peers, holepunch, and build swarms both from cloud nodes and user devices
+4. **Files** - performant, multi-source file downloads for images and attachments
+5. **Performance** - messages should sync and arrive fast, for workspaces with up to 10GB of messages and attachments 
+6. **Multi-tenancy** - Users should be able to join many different separate workspaces, or join the same workspaces with multiple accounts, and this should not be a headache. 
+7. **Cloud / Client Isomorphism** - Most workspaces will need or want an always-on cloud node for reliability; this should not require a separate implementation.   
+7. **NSE / Client Isomorphism** - iOS notifications must be fetched by a Notification Service Extension running in a low-memory environment; this should not require a separate implementation
+11. **Testing & Simulation** - It should be trivial to test interactions between multiple accounts on the same machine, and to test robustness against concurrency and reordering. It should also be low-cost for an LLM to "self-QA" its work.
 
-## Why?
+Here are somme principles we've followed to achieve this realism: 
 
-The design goal is to keep protocol behavior auditable while still supporting real-time chat behavior and agent-friendly automation:
-
-1. canonical data stays event-sourced and replayable,
-2. transport and sync are real (QUIC + mTLS), not simulator paths,
-3. projection logic is deterministic and convergent,
-4. CLI workflows remain synchronous enough for imperative command chains.
-
-## How?
+1. **Event Sourcing** - All canonical data is expressed as events, and state can be generated/restored deterministically by replaying events. 
+2. **Convergence Testing** - Tests check that for all relevant scenarios, reverse reorderings of events, or duplicated event replays, yield the same state.    
+2. **Conventional Networking** - All networking happens over QUIC with transport layer security provided by mTLS
+3. **Real Networking in Tests** - All multi-client tests are realistic as possible: real networking using CLI-controlled daemons with local peer discovery.
+4. **Easy Synchronous Testing Workflows** - CLI workflows remain synchronous enough for imperative command chains (create workspace with user, invite user, join as user, etc.)
 
 We split concerns aggressively:
 
 1. Canonical events are durable facts.
 2. Runtime protocol traffic (sync/intros/holepunch control) is not canonical event data.
-3. Projection is the only way canonical events affect application state.
-4. Blocking/unblocking is uniform across normal and encrypted events.
-5. Multitenancy is first-class with `recorded_by` scoping on shared tables.
-6. Policy-appropriate blocked rows after sync are normal, not failure.
+3. "Projection" (processing an event into additional rows in a local SQlite table) is the only way canonical events affect application state, and is performed by pure functions (projectors)
+4. All events are content-addressed with a hash id.
+4. Events that require order to be meaningful or validated declare their dependencies explicitly, and blocking/unblocking is uniform across normal and encrypted events. (We even use the same blocking/unblocking mechanism for missing keys!)
+5. Multitenancy is a first class feature and event sourced, with `recorded_by` scoping on shared tables (e.g. one message table, scoped to many different local users, where any known message can be recorded or "seen" by one or more users.)
 
 ---
 
@@ -49,22 +53,26 @@ Blocked-event normalcy rule:
 2. some events are expected to remain blocked for a tenant (for example encrypted content or key-share events where that tenant is not a recipient),
 3. post-sync blocked presence must be interpreted with policy context, not as automatic failure.
 
+A note for LLM implementers: policy-appropriate blocked rows after sync can be normal, not a failure.
+
 ## 1.2 Event format
 
-Events are flat and schema-defined.
+All events are flat and schema-defined with a fixed length, and with fixed-length fields.
 
-Rules:
+Rules (for LLM implementers):
 1. no universal `deps` field,
 2. no universal `payload` envelope,
 3. any schema field marked as `event_id` reference is a dependency source.
 
-Field kinds are schema-driven (`fixed_bytes`, integers), and each event type has deterministic field order and fixed total wire size.
-No canonical event field uses a length prefix to determine body boundaries.
-Text slots use fixed-size UTF-8 with mandatory zero-padding: unused bytes after the canonical text content must be zero, and no non-zero bytes may appear after the text terminator.
-Encrypted event wire size is deterministic by `inner_type_code` (inner types are fixed-size).
-File slice events use a canonical fixed ciphertext size; final plaintext chunks are padded before encryption.
-`signed_memo` events (type 4) are canonical shared signed text events with a fixed 1024-byte text slot and normal signer-field verification.
-`bench_dep` events (type 26) are fixed-size shared benchmark events for dependency/cascade performance testing; they are non-encryptable and project no domain rows beyond validity state.
+More details:
+
+1. Field kinds are schema-driven (`fixed_bytes`, integers), and each event type has deterministic field order and fixed total wire size.
+2. No canonical event field uses a length prefix to determine body boundaries.
+3. Text slots use fixed-size UTF-8 with mandatory zero-padding: unused bytes after the canonical text content must be zero, and no non-zero bytes may appear after the text terminator.
+4. Encrypted event wire size is deterministic by `inner_type_code` (inner types are fixed-size).
+5. File slice events use a canonical fixed ciphertext size; final plaintext chunks are padded before encryption.
+6. `signed_memo` events (type 4) are canonical shared signed text events with a fixed 1024-byte text slot and normal signer-field verification.
+7. `bench_dep` events (type 26) are fixed-size shared benchmark events for dependency/cascade performance testing; they are non-encryptable and project no domain rows beyond validity state.
 
 ## 1.3 Event identity and signatures
 
