@@ -153,7 +153,7 @@ rg -n "SyncSessionHandler::initiator\\(" src/peering src/node src/main
 
 cargo test -q --test sync_contract_tests
 cargo test -q --test scenario_test
-cargo test -q --test sync_graph_test multi_source_coordinated_2x_5k
+cargo test -q --test sync_graph_test catchup_2x_5k
 
 cargo test --release -q --test perf_test perf_sync_50k -- --nocapture
 cargo test --release -q --test perf_test perf_sync_10k -- --nocapture
