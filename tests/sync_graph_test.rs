@@ -266,20 +266,6 @@ async fn catchup_2x_5k() {
     run_catchup_bench(2, 5_000).await;
 }
 
-/// Catchup: 1 source, 100k events (solo baseline).
-#[tokio::test]
-#[ignore]
-async fn catchup_1x_100k() {
-    run_catchup_bench(1, 100_000).await;
-}
-
-/// Catchup: 2 sources, 100k overlapping events.
-#[tokio::test]
-#[ignore]
-async fn catchup_2x_100k() {
-    run_catchup_bench(2, 100_000).await;
-}
-
 /// Catchup: 4 sources, 100k overlapping events.
 #[tokio::test]
 #[ignore]
