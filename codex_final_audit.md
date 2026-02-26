@@ -27,7 +27,7 @@ Mid-review: `feedback.md`
 - `bash scripts/check_boundary_imports.sh`: PASS
 - `cargo test --test holepunch_test -q`: PASS
 - `cargo test --test cli_test -q`: PASS
-- `cargo test --test sync_graph_test multi_source_coordinated_2x_5k -q`: PASS
+- `cargo test --test sync_graph_test catchup_2x_5k -q`: PASS
 - `cargo test runtime::supervisor::tests -q`: PASS
 
 ## Feedback Closure

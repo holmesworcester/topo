@@ -158,7 +158,7 @@ bash scripts/check_boundary_imports.sh
 # Runtime regression tests
 cargo test --test holepunch_test -q
 cargo test --test cli_test -q
-cargo test --test sync_graph_test multi_source_coordinated_2x_5k -q
+cargo test --test sync_graph_test catchup_2x_5k -q
 ```
 
 Expected interpretation:

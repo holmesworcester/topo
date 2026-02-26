@@ -1,7 +1,6 @@
 pub mod bootstrap;
 
 use std::net::SocketAddr;
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -23,17 +22,13 @@ use crate::event_modules::{
 use crate::transport::identity::{ensure_transport_peer_id, ensure_transport_cert};
 use crate::projection::create::{create_event_sync, create_event_staged, create_signed_event_sync, create_signed_event_staged, create_encrypted_event_sync, CreateEventError};
 use crate::projection::apply::project_one;
-use crate::protocol::Frame;
 use crate::peering::loops::{
-    accept_loop, connect_loop, connect_loop_with_coordination, SYNC_SESSION_TIMEOUT_SECS,
+    accept_loop, connect_loop, connect_loop_with_coordination,
 };
-use crate::sync::session::run_sync_initiator;
 use crate::transport::{
     AllowedPeers,
-    DualConnection,
     create_dual_endpoint_dynamic,
     extract_spki_fingerprint,
-    peer_identity_from_connection,
 };
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use ed25519_dalek::SigningKey;
@@ -2004,88 +1999,6 @@ pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Jo
     }
 
     handles
-}
-
-/// Connect to a remote peer, run one sync session, and close the connection.
-///
-/// Uses dynamic trust (`is_peer_allowed`) at each TLS handshake, matching
-/// production behavior. The caller must have seeded trust rows (e.g. via
-/// `import_cli_pins_to_sql`) before the connection will succeed.
-///
-/// Used for B0 multi-source baseline testing where sources connect sequentially
-/// (one session each) to a sink running accept_loop.
-pub async fn connect_sync_once(
-    db_path: &str,
-    identity: &str,
-    remote_addr: SocketAddr,
-    remote_fp: [u8; 32],
-) -> Result<crate::runtime::SyncStats, Box<dyn std::error::Error + Send + Sync>> {
-    use crate::db::transport_trust::{import_cli_pins_to_sql, is_peer_allowed};
-
-    let (_, cert, key) = ensure_transport_cert(
-        &open_connection(db_path)?
-    )?;
-
-    // Seed trust for the remote peer
-    {
-        let db = open_connection(db_path)?;
-        let pins = AllowedPeers::from_fingerprints(vec![remote_fp]);
-        import_cli_pins_to_sql(&db, identity, &pins)?;
-    }
-
-    let db_path_owned = db_path.to_string();
-    let identity_owned = identity.to_string();
-    let allow_fn: Arc<crate::transport::DynamicAllowFn> =
-        Arc::new(move |fp: &[u8; 32]| {
-            let db = open_connection(&db_path_owned)?;
-            is_peer_allowed(&db, &identity_owned, fp)
-        });
-    let endpoint = create_dual_endpoint_dynamic(
-        "0.0.0.0:0".parse().unwrap(), cert, key, allow_fn,
-    )?;
-
-    let connection = endpoint.connect(remote_addr, "localhost")?.await?;
-    let peer_id = peer_identity_from_connection(&connection)
-        .ok_or_else(|| "could not extract peer identity".to_string())?;
-
-    let (ctrl_send, ctrl_recv) = connection.open_bi().await?;
-    let (data_send, data_recv) = connection.open_bi().await?;
-    let mut conn = DualConnection::new(ctrl_send, ctrl_recv, data_send, data_recv);
-
-    // Send markers to materialize lazy QUIC streams on the receiver
-    conn.control.send(&Frame::HaveList { ids: vec![] }).await?;
-    conn.data_send.send(&Frame::HaveList { ids: vec![] }).await?;
-    conn.flush_control().await?;
-    conn.flush_data().await?;
-
-    // Shared writer for this one-shot initiator session.
-    let (ingest_tx, ingest_rx) =
-        tokio::sync::mpsc::channel::<crate::contracts::event_pipeline_contract::IngestItem>(5000);
-    let writer_events = Arc::new(AtomicU64::new(0));
-    let writer_db = db_path.to_string();
-    let writer_handle = std::thread::spawn(move || {
-        crate::event_pipeline::batch_writer(writer_db, ingest_rx, writer_events);
-    });
-    let _coordination_manager = crate::sync::CoordinationManager::new();
-    let coordination = _coordination_manager.register_peer();
-
-    let stats = run_sync_initiator(
-        conn,
-        db_path,
-        SYNC_SESSION_TIMEOUT_SECS,
-        &peer_id,
-        identity,
-        coordination.as_ref(),
-        ingest_tx,
-    )
-    .await?;
-
-    let _ = writer_handle.join();
-
-    connection.close(0u32.into(), b"done");
-    endpoint.close(0u32.into(), b"done");
-
-    Ok(stats)
 }
 
 /// Start a sink's accept_loop and return the handle and listen address.

@@ -92,7 +92,7 @@ Minimum required test run after refactor:
 1. `cargo check`
 2. `bash scripts/check_boundary_imports.sh`
 3. `cargo test --test sync_contract_tests -q`
-4. `cargo test --test sync_graph_test multi_source_coordinated_2x_5k -q`
+4. `cargo test --test sync_graph_test catchup_2x_5k -q`
 5. `cargo test --test holepunch_test -q`
 6. `cargo test --test cli_test -q`
 
