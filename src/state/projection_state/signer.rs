@@ -1,6 +1,7 @@
 use rusqlite::Connection;
 
 use crate::crypto::event_id_to_base64;
+pub use crate::crypto::{sign_event_bytes, verify_ed25519_signature};
 
 /// Result of resolving a signer key from the database.
 #[derive(Debug, PartialEq)]
@@ -72,30 +73,6 @@ pub fn resolve_signer_key(
     let mut public_key = [0u8; 32];
     public_key.copy_from_slice(&blob[9..41]);
     Ok(SignerResolution::Found(public_key))
-}
-
-/// Verify an Ed25519 signature over the given message bytes.
-pub fn verify_ed25519_signature(public_key: &[u8; 32], message: &[u8], signature: &[u8]) -> bool {
-    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-
-    let vk = match VerifyingKey::from_bytes(public_key) {
-        Ok(k) => k,
-        Err(_) => return false,
-    };
-
-    let sig = match Signature::from_slice(signature) {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-
-    vk.verify(message, &sig).is_ok()
-}
-
-/// Sign bytes with an Ed25519 signing key, returning a 64-byte signature.
-pub fn sign_event_bytes(signing_key: &ed25519_dalek::SigningKey, signing_bytes: &[u8]) -> [u8; 64] {
-    use ed25519_dalek::Signer;
-    let sig = signing_key.sign(signing_bytes);
-    sig.to_bytes()
 }
 
 #[cfg(test)]
