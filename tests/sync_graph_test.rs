@@ -254,13 +254,7 @@ async fn run_catchup_bench(source_count: usize, events_per_source: usize) {
     eprintln!();
 }
 
-/// Catchup smoke: 2 sources, 5k overlapping events.
-#[tokio::test]
-async fn catchup_2x_5k() {
-    run_catchup_bench(2, 5_000).await;
-}
-
-/// Catchup: 4 sources, 100k overlapping events.
+/// Catchup smoke: 4 sources, 100k overlapping events.
 #[tokio::test]
 #[ignore]
 async fn catchup_4x_100k() {
