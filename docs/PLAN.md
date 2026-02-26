@@ -36,37 +36,13 @@ Scheduling note:
 - Phase 6 and Phase 7 must be complete before starting identity projectors in Phase 12.
 - Phase 13 depends on Phase 12 identity flows (bootstrap_workspace, accept_user_invite) being stable.
 
-## 1.1 `codex-simplified` baseline gap audit (current state)
+## 1.1 Historical gap audit note
 
-Current code in Topo (post-move from `codex-simplified`) is a useful sync prototype, but has deliberate gaps relative to this plan:
-
-1. ~~Fixed-size wire/event assumptions~~ **RESOLVED**: wire protocol moved to `src/protocol.rs` with variable-length framing and `EVENT_MAX_BLOB_BYTES = 1 MiB` cap. No global fixed envelope size remains.
-2. ~~mTLS is not yet pinned/strict~~ **RESOLVED**: `src/transport/mod.rs` now uses `PinnedCertVerifier` with BLAKE2b-256 SPKI fingerprint pinning on both client and server sides. No permissive verifier remains in production paths.
-3. ~~Projection pipeline is still message-specific and sync-engine-coupled~~ **RESOLVED**: projection pipeline extracted to `src/projection/apply/` with global `project_one(recorded_by,event_id)` entrypoint. Ingest runtime now lives in `src/event_pipeline/{mod.rs,phases.rs,planner.rs,effects.rs,drain.rs}`.
-4. No dependency blocking model yet:
-   - no `blocked_event_deps` / unblock/requeue flow.
-5. No per-tenant receive journal yet:
-   - no `recorded_events(recorded_by,event_id,recorded_at,source)` in active code path.
-6. No queue family from this plan yet:
-   - no `project_queue` / `egress_queue` lease-retry helpers shared across workers.
-7. Identity/trust-anchor/removal model not implemented:
-   - no split invite types (`user_invite`, `device_invite`) and no TLA-derived identity projector guards.
-8. No shared signer substrate yet:
-   - no uniform `signed_by` dependency blocking + signature verification ordering across event types.
-9. No two-tier multitenancy verification yet:
-   - no Phase 3 routing smoke coverage and no post-projector scoped-projection gate.
-
-Gap-to-phase mapping:
-- wire framing + schema normalization -> `Phase 4`
-- strict pinned mTLS -> `Phase 2`
-- provisional workspace routing smoke -> `Phase 3`
-- projector entrypoint + dep/blocking core -> `Phase 5`
-- shared signer dependency + signature pipeline -> `Phase 6`
-- scoped multitenancy projection/query gate -> `Phase 7`
-- encryption adapter + key deps -> `Phase 8`
-- queue/worker architecture -> `Phase 9`
-- deletion/emits explicit rules -> `Phase 10`
-- trust-anchor/invite/removal/sender-keys -> `Phase 12`
+The earlier `codex-simplified` gap audit served bootstrapping and is now historical.
+For active work:
+- use this PLAN for build order, scope cuts, and phase exit criteria,
+- use [DESIGN.md](./DESIGN.md) for normative behavior and invariants,
+- use git history/PR notes for resolved-gap chronology.
 
 ---
 
@@ -124,6 +100,10 @@ These are required, not optional:
    - `invite_accepted` is a local anchor-binding event, not a global invite-presence gate.
    - trust-anchor gating belongs on root workspace event validity.
    - do not use pre-projection raw-blob capture tables as authority for trust-anchor binding.
+11. Identity finalization requirement.
+   - bootstrap may begin under temporary invite-derived `recorded_by`,
+   - once steady-state PeerShared identity materializes, call `finalize_identity(old, new)` transactionally,
+   - finalization must rebind tenant-scoped projection/trust/pipeline rows and reconcile blocker/project-queue state.
 
 ## 2.2 CLI Architecture Principle
 
@@ -180,22 +160,12 @@ Phase 1 is functionally complete. All deliverables are met:
 
 ### Required RPC and selector contract
 
-Phase 1 CLI/daemon shape must preserve the following runtime contract:
+Phase 1 CLI/daemon shape must preserve:
 
-1. RPC envelope is versioned on both request and response (`RpcRequest.version`, `RpcResponse.version`).
-2. RPC transport framing is `u32` big-endian length-prefixed JSON.
-3. Oversized RPC frames are rejected (`> 16 MiB`).
-4. Daemon enforces a bounded concurrent RPC connection cap.
-
-Session-local daemon state (non-canonical by design):
-1. active peer selection for multi-tenant DBs,
-2. invite-link numeric aliases to full invite links,
-3. channel aliases and active-channel selection per peer.
-
-DB registry selector contract:
-1. selector registry file: `~/.topo/db_registry.json` (overridable by `TOPO_REGISTRY_DIR`),
-2. supports alias selectors, 1-based numeric selectors, and default DB selection,
-3. selector resolution order is: existing path -> alias -> index -> passthrough path.
+1. versioned request/response envelopes and bounded frame size (`<= 16 MiB`) over length-prefixed JSON RPC framing,
+2. bounded concurrent RPC connection handling in daemon,
+3. selector-registry behavior (`~/.topo/db_registry.json` / `TOPO_REGISTRY_DIR`) with resolution order:
+   - existing path -> alias -> numeric index -> passthrough path.
 
 ---
 
@@ -218,104 +188,45 @@ DB registry selector contract:
 - Reconnect/retry behavior is stable across daemon restarts.
 - mTLS identity is plumbed into peer/session context.
 
-## 4.1 mTLS implementation (current state)
+## 4.1 Transport status and source of truth
 
-Phase 2 mTLS is implemented in the main codebase:
-- `src/transport/mod.rs`: `PinnedCertVerifier` with BLAKE2b-256 SPKI fingerprint pinning (both client and server).
-- `src/transport/cert.rs`: self-signed certificate generation and SPKI extraction helpers.
+Phase 2 transport hardening is implemented and should be maintained as strict mTLS + QUIC with pinned peer identity checks.
 
-Historical reference branches (`poc-7-mtls`, `poc-7=codex-attempt`) are no longer needed for implementation guidance.
+Normative transport requirements now live in [DESIGN.md](./DESIGN.md):
+- transport/auth model: §2.1-§2.5,
+- trust-source lifecycle: §9.5,
+- multitenant runtime integration: §3.2.1-§3.2.3.
 
-## 4.2 Required mTLS design
+## 4.2 Implementation focus for ongoing work
 
-1. Every peer has a persistent cert identity per profile:
-   - certificate DER
-   - private key PKCS#8 DER
-   - extracted SPKI bytes (for pinning / identity lookup)
-2. Current Phase 2 implementation status (transitional):
-   - daemon startup config supplies allowed remote cert public keys (SPKI pins).
-   - local cert/key are file-backed per profile.
-3. Required end-state trust source:
-   - transport allow/deny must be derived from SQL trust state rooted in identity:
-     - PeerShared-derived SPKIs (steady-state; SPKI computed directly from PeerShared public key),
-     - accepted invite-link bootstrap rows (`invite_bootstrap_trust`),
-     - inviter-side pending invite bootstrap rows (`pending_invite_bootstrap_trust`),
-     - bootstrap rows are TTL-bounded and consumed when matching steady-state trust appears,
-     - not CLI/file pin lists as authority.
-   - **Trust rows are projection-owned state**: `invite_bootstrap_trust` and `pending_invite_bootstrap_trust` rows are produced by projection from invite events + local `bootstrap_context` (an append-only local durable context table). The service layer writes context rows only, not trust rows directly. This follows the poc-6 invite trust cascade precedent where `invite_accepted` projection drives trust-anchor establishment.
-   - shorthand model term: `TrustedPeerSet = PeerShared_SPKIs U invite_bootstrap_trust U pending_invite_bootstrap_trust`.
-   - trust inputs are not only `invite`/`invite_accepted`; they include the full identity policy graph (for example peer/user/device/admin/removal state).
-4. Done: CLI/profile SPKI allowlist (`--pin-peer`) removed as trust authority.
-   File cert/key is a local cache/materialization artifact, not authority.
-5. Pin peers by expected SPKI from active projected trust state, not by socket address.
-6. Enforce pinning on both sides:
-   - server verifies client cert SPKI against pinned store
-   - client verifies server cert SPKI against pinned store
-7. No production fallback to `SkipServerVerification`.
-8. Use long-lived cert keys for peer authentication in transport:
-   - QUIC uses TLS 1.3 handshake key agreement, so session keys still get forward secrecy.
-9. Connection identity mapping for metadata/projection context:
-   - `recorded_by` = local identity bound to the local cert/private key used for this daemon/profile.
-   - `via_peer_id` = remote identity resolved from authenticated remote cert SPKI mapping.
-10. Scope for this phase: invited-member allowlist with removal policy.
-   - Removal events (`PeerRemoved`) deny new TLS handshakes and tear down active sessions.
-11. Identity-phase migration rule:
-   - once Phase 12 identity model lands, transport policy runs from projected identity events (`peer_id -> cert SPKI`) and related projected policy rows.
-12. TLS key material modeling rule (end-state):
-   - local TLS cert/public/private key material is represented by local events with normal dependency ordering.
-   - runtime may materialize active TLS objects from projected event state.
-   - persisted files are optional cache, not policy authority.
+When touching transport in future phases:
+1. preserve strict pinning and reject-any-untrusted behavior on both client and server,
+2. keep transport trust SQL-backed and projection-owned (no ad-hoc authority path),
+3. keep session identity mapping explicit (`recorded_by`, `via_peer_id`),
+4. keep cert/key materialization behind the established transport-identity contract boundary.
 
 ### Sync session completion protocol (required)
 
-Sync sessions use one control stream and one data stream with explicit completion frames:
+Sync sessions use explicit completion frames and must not rely on stream-close timing:
 
-1. `Done` (control stream, initiator -> responder): initiator has finished outbound work for this round.
-2. `DataDone` (data stream, either direction): sender has no more `Event` frames on data stream.
-3. `DoneAck` (control stream, responder -> initiator): responder confirms terminal completion.
+1. `Done` (initiator control stream) means initiator is outbound-complete for the round.
+2. `DataDone` (data stream, either direction) means no more data frames from that sender.
+3. `DoneAck` (responder control stream) is sent only after responder drain and both `DataDone` observations.
 
-Completion invariants:
-1. responder sends `DoneAck` only after egress is drained, it has sent its own `DataDone`, and it has observed peer `DataDone` on inbound data,
-2. initiator treats session as complete only after `DoneAck`,
-3. protocol must not rely on stream-close timing for end-of-data semantics.
+Initiator completion is `DoneAck`-gated.
 
-## 4.3 Implementation checklist (assistant-safe)
+## 4.3 Transport regression checklist
 
-1. Port cert helper types/functions from mtls branch (`SelfSignedCert`, base64 SPKI helpers).
-2. Add `PeerKeyStore` trait + concrete store:
-   - transitional source: CLI/profile allowlist of permitted SPKI pins (completed Phase 2 behavior).
-   - required source: projected identity mapping (`peer_id -> expected SPKI`) and related projected policy state.
-   - reverse lookup by `SPKI -> peer_id` once identity mapping exists.
-   - TODO (retrofit completed Phase 2 behavior): switch verifier default from transitional source to projected source.
-3. Add `PinnedCertVerifier` implementing:
-   - `rustls::client::danger::ServerCertVerifier`
-   - `rustls::verify::ClientCertVerifier` (or `rustls::server::danger::ClientCertVerifier` depending on rustls version in branch)
-4. Server endpoint:
-   - use `.with_client_cert_verifier(...)`
-   - use `.with_single_cert(...)`
-5. Client endpoint:
-   - use custom cert verifier with pinned store
-   - use `.with_client_auth_cert(...)`
-6. Add positive and negative tests:
-   - pinned peer connects successfully
-   - unpinned peer is rejected
-7. Plumb authenticated connection identity into sync session context:
-   - local `recorded_by` from local cert profile identity.
-   - remote `via_peer_id` from verified remote cert SPKI lookup (or pre-identity stable key id derived from SPKI).
-8. Reject connections where verified cert SPKI is not in the active allowlist source (projected source in end-state; transitional source only until retrofit is complete).
-9. Add local TLS credential materialization path from projected local key events.
-   - if file serialization exists, treat it as cache of projected state.
-   - reject startup when cache conflicts with projected key state.
+For any transport-affecting PR, require:
+1. positive/negative handshake tests,
+2. reconnect/retry tests across daemon restarts,
+3. removal-policy tests (new handshakes denied; active sessions torn down).
 
-## 4.4 Common mTLS mistakes to avoid
+## 4.4 Anti-regression constraints
 
-- Do not generate a new certificate each startup for the same profile in daemon mode.
-- Do not identify peers by `remote_address()` for policy decisions.
-- Do not leave optional insecure mode on by default.
-- Do not invent a second transport-only peer identifier when `peer_id` mapping already exists.
-- Do not couple event-level authorization to transport identity; transport and event signatures are complementary.
-- Do not forget the mandatory retrofit: transitional CLI/profile SPKI allowlist must be removed as policy authority once identity projection lands.
-- Do not treat file cert/key storage as trust authority.
+- No permissive verifier in production paths.
+- No socket-address-based trust decisions.
+- No separate transport identity authority outside projected trust state.
 
 ---
 
@@ -333,7 +244,7 @@ Goal: validate basic workspace/tenant separation early, before deep projector/id
 ### Scope boundaries
 
 - This is a routing/scope smoke phase, not full identity semantics.
-- It uses the same temporary trust source as Phase 2 (CLI/profile allowlist), not identity events.
+- It uses the active transport trust policy from [DESIGN.md](./DESIGN.md) §2.1-§2.2 and does not introduce a parallel trust path.
 - Signature/dependency enforcement is still deferred to Phase 6.
 
 ### Exit criteria
@@ -386,7 +297,7 @@ This supports deterministic parsing by type dispatch and fixed offsets (langsec-
 Frame safety bounds (required):
 - enforce a global max frame payload length before allocation/decode,
 - enforce per-frame-type max lengths,
-- reject any frame where declared `payload_len` exceeds global or frame-type bounds.
+- reject any frame where declared `payload_len` exceeds either bound.
 
 ## 5.3 Signer and recording semantics (explicit)
 
@@ -1378,366 +1289,51 @@ Fastest coherent milestone:
 
 ---
 
-## 15. Assistant Execution Playbook (High-detail)
+## 15. Assistant Execution Playbook (Condensed)
 
-Use this section as the implementation contract. If code conflicts with this section, update code to match this section unless user overrides.
+Use this section as an execution-process checklist only.
+Normative protocol/runtime behavior is defined in [DESIGN.md](./DESIGN.md).
 
-## 15.1 Cross-phase non-negotiables
+## 15.1 Cross-phase execution rules
 
-1. No alternate projection path:
-   - all projection must converge on `project_one(recorded_by,event_id)`.
-   - `project_one_step` (internal, non-cascading) is used only within the cascade worklist as a performance optimization; it shares all projection stages with `project_one`.
-2. No alternate dependency resolver:
-   - dependency refs come from schema metadata only.
-3. No insecure transport default:
-   - pinned mTLS required unless explicitly running dedicated test mode.
-4. No fixed global event blob size after Phase 4.
-5. No queue-specific retry logic duplication:
-   - shared claim/lease/retry/backoff helpers only.
-6. No per-tenant table fanout:
-   - shared projection tables with tenant-scoped keys/indices only.
-7. No cross-table direct projection for emitted events:
-   - emitted events must project via their own event projector/autowrite path.
-8. No alternate signer pipeline:
-   - all signed event types use the same dependency-then-signature-verification ordering.
+1. Build in the phase order from §1 unless explicitly overridden.
+2. Treat phase exit criteria in this PLAN as release gates.
+3. Use DESIGN as the normative source for protocol semantics and invariants.
+4. Keep one projection path, one dependency engine, one signer pipeline, and tenant-scoped shared tables (see DESIGN §4-§5, §14).
+5. For transport work, preserve strict mTLS and SQL-backed trust evaluation (see DESIGN §2, §9.5).
 
-## 15.2 Phase 1 implementation checklist (CLI + daemon)
+## 15.2 PR slicing guidance
 
-Must implement:
-1. daemon process with profile-scoped db path and control socket.
-2. non-interactive CLI for create/query/assert operations.
-3. stable JSON output and non-zero exit on assertion failure.
-
-Common mistakes:
-- embedding business logic in CLI command handlers instead of daemon API.
-- relying on sleep/wait commands rather than assertion semantics.
-
-Definition of done:
-- two daemons exchange at least one message via real QUIC,
-- `assert-eventually` based scripts run deterministically.
-
-## 15.3 Phase 2 implementation checklist (mTLS baseline)
-
-Must implement:
-1. persistent cert identity per profile.
-2. pinned-cert verifier on both client and server.
-3. Transitional allowlist source in completed Phase 2 is CLI/profile supplied cert SPKI pins, not socket address.
-4. session context binds:
-   - local `recorded_by` from local cert profile identity.
-   - remote `via_peer_id` from verified cert SPKI mapping (identity-backed once Phase 12 lands).
-5. unit/integration tests for allowed and denied peers.
-6. migration note implemented:
-   - Phase 12 switches allowlist source to projected identity events (`peer_id -> cert SPKI`).
-7. TODO (mandatory retrofit before final Phase 12 sign-off):
-   - remove CLI/file pin authority and run transport trust solely from projected identity graph state.
-   - represent local TLS cert/private key material as event-backed state; file artifacts remain cache only.
-
-Common mistakes:
-- using generated ephemeral cert each restart in daemon mode.
-- leaving permissive cert verifier as default behavior.
-
-Definition of done:
-- unpinned peer connection fails at handshake,
-- pinned invited peer sync succeeds repeatedly across daemon restarts.
-
-## 15.4 Phase 4 implementation checklist (schema + wire + recording)
-
-Must implement:
-1. event registry metadata describing fields and dependency refs.
-2. length-prefixed sync framing with variable event lengths by type.
-3. minimal `recorded_events` journaling and endpoint observation table.
-4. tenant wrapper APIs for subjective reads/writes.
-5. standard replay harness with mandatory checks:
-   - replay once,
-   - replay twice (idempotency),
-   - reverse-order replay.
-6. scenario test runner hook that executes replay harness after each scenario test touching canonical events.
-
-Common mistakes:
-- retaining fixed `ENVELOPE_SIZE` assumptions in parser/send path.
-- inferring dependencies from ad-hoc code instead of schema metadata.
-- treating replay checks as optional/manual instead of default harness behavior.
-
-Definition of done:
-- at least two event types decode via schema-driven parsers,
-- replay invariants pass in standard harness (`once`, `twice`, `reverse-order`) after every scenario test.
-
-## 15.5 Phase 5 implementation checklist (projector + blocked deps)
-
-Must implement:
-1. `project_one(recorded_by,event_id)` entrypoint.
-2. dependency persistence tables (`blocked_event_deps` + `blocked_events` header).
-3. counter-based Kahn cascade unblock (`deps_remaining` decrement path + post-cascade dep-row cleanup).
-4. `create_event_sync` success-only-on-valid contract.
-5. explicit DRY split enforcement:
-   - shared pipeline handles deps/signer/queues/terminal writes,
-   - per-event projector handles predicate + effect declaration only.
-
-Common mistakes:
-- adding a separate local create fast-path projector.
-- storing full dependency graph prematurely.
-
-Definition of done:
-- out-of-order events with multiple blockers converge correctly,
-- imperative command chains (`a=create_sync(); b=create_sync(depends_on=a)`) work without waits.
-
-## 15.5A Phase 6 implementation checklist (signer substrate)
-
-Must implement:
-1. schema metadata for signer fields (`signed_by`, `signer_type`, `signature`).
-2. signer dependency blocking via `blocked_event_deps`.
-3. signer resolution + signature verification after dependency resolution and before policy checks.
-4. invalid signature -> `Reject` (not `Block`).
-5. shared signer helper path across all signed event families.
-6. deterministic unsigned exemption:
-   - schema flag (for example `signer_required=false`) for deterministic emitted types,
-   - signer pipeline skips only those explicitly marked types.
-
-Common mistakes:
-- verifying signatures before dependency resolution.
-- creating identity-specific signature paths that diverge from core projector flow.
-
-Definition of done:
-- signer-missing blocks then unblocks when signer arrives,
-- invalid signatures deterministically reject,
-- signed cleartext and signed encrypted-wrapper events follow the same signer pipeline,
-- deterministic emitted unsigned events validate via deterministic derivation checks and remain replay/reproject stable.
-
-## 15.6 Phase 8 implementation checklist (encrypted adapter)
-
-Must implement:
-1. encrypted wrapper as a normal registry type.
-2. mandatory `inner_type_code` field in encrypted wrapper schema.
-3. materialization adapter (decrypt -> inner `EventView` -> normal projector).
-4. enforce `inner_type_code` == decoded inner type.
-5. nested encrypted rejection.
-6. PSK harness tests before identity wrapping.
-
-Common mistakes:
-- introducing a separate persisted plaintext queue too early.
-- introducing separate dependency logic for key blockers.
-- making `inner_type_code` optional while relying on variable-length ciphertext framing.
-
-Definition of done:
-- missing key blocks, wrong key rejects, correct key projects,
-- reorder/replay invariants hold for encrypted events.
-
-## 15.7 Phase 9 implementation checklist (durable queues/workers)
-
-Must implement:
-1. queue tables (`project`, `egress`) with transactional boundaries.
-2. shared queue helper functions for claim/lease/retry.
-3. egress creation from reconciliation and request-list producers.
-4. queue cleanup + TTL maintenance jobs.
-5. ingest path writes canonical rows + `project_queue` enqueue atomically before projection drain.
-
-Common mistakes:
-- using one generic jobs table for all queues.
-- mixing canonical durable rows and operational queue rows in one table.
-
-Definition of done:
-- crash/restart recovers and completes pending work,
-- retries/backoff and lease recovery are observable and deterministic.
-
-## 15.8 Phase 10 implementation checklist (special projectors)
-
-Must implement:
-1. explicit deletion/tombstone/cascade projector.
-2. explicit deterministic emitted-event handling.
-
-Common mistakes:
-- forcing deletion into generic auto-write logic.
-
-Definition of done:
-- deletion-before-target and target-before-deletion converge identically.
-
-## 15.9 Phase 11 implementation checklist (hardening)
-
-Must implement:
-1. batch/index tuning driven by measurements.
-2. queue health metrics (`age`, `attempts`, blocked counts).
-3. endpoint observation TTL purging.
-4. `low_mem_ios` mode with explicit knobs (SQLite cache, channel/batch limits, worker concurrency caps).
-5. long-run memory test at million-event scale showing `<= 24 MiB` steady-state RSS target in low-memory mode.
-6. low-memory trust lookup path that avoids full in-memory keyset loading (SQL indexed lookup + bounded hot cache).
-7. large-identity-set memory test (for example `>= 100_000` peer trust keys) within low-memory ceiling.
-
-Common mistakes:
-- premature micro-optimizations before invariant/test stability.
-- optimizing throughput in low-memory mode at the cost of memory bound violations.
-
-Definition of done:
-- long-running sync remains stable and bounded in memory/storage.
-- low-memory mode is reliable and repeatable under iOS NSE-style memory limits.
-
-## 15.10 Phase 12 implementation checklist (TLA-first identity)
-
-Must implement:
-1. TLA model updated first for split invites and trust-anchor guards.
-2. projector predicate mapping table from TLA guards.
-3. split invite events (`user_invite`, `device_invite`) with shared helper core.
-4. sender-subjective O(n) key wrapping baseline (no key history yet).
-5. removal excludes removed peers from subsequent wraps.
-6. preserve Phase 6 signer pipeline (do not add identity-specific signature fast paths).
-7. transport mTLS trust source switched to projected identity graph policy (retrofit completed; no CLI/file pin authority in steady state).
-8. local TLS cert/public/private key material modeled as events and materialized from projected local event state.
-9. guard placement correction:
-   - `invite_accepted` is local trust-anchor binding from carried `workspace_id` (no invite-presence dep gate) per peer scope.
-   - trust-anchor guard applies on root workspace events only.
-10. remove/avoid pre-projection trust-binding capture paths (for example raw-blob `invite_workspace_bindings` capture) as authority.
-11. TLA transport-credential scope extension plan exists and is linked (credential/trust transitions modeled; handshake/session keys may remain abstract).
-
-Common mistakes:
-- implementing projector rules before guard/model freeze.
-- re-introducing multimodal invite event (`mode=*`).
-- adding a separate invite-presence gate to `invite_accepted` instead of enforcing identity admission through normal signer/dependency chain checks.
-- forgetting to track the transport-credential TLA scope gap explicitly.
-
-Definition of done:
-- TLA invariants pass for bootstrap, join, device-link, and removal flows,
-- Rust behavior matches TLA guard mapping in tests.
-- transport-credential modeling gap is either closed in TLA or explicitly tracked as open with linked follow-up artifact.
-
-### Identity eventization completion boundary
-
-Identity workflow orchestration is fully owned by `event_modules/workspace/commands.rs`:
-- `create_workspace`: full bootstrap chain + LocalSignerSecret emission + content key seed.
-- `join_workspace_as_new_user`: invite acceptance chain + content key unwrap.
-- `add_device_to_workspace`: device link acceptance chain.
-- `create_user_invite` / `create_device_link_invite`: invite event creation + content key wrap.
-- `retry_pending_invite_content_key_unwraps`: deferred content-key convergence.
-
-`event_modules/workspace/identity_ops.rs` owns `pub(crate)` primitive helpers (crypto, key wrap/unwrap, data types). The `src/identity/` module has been eliminated.
-`service.rs` routes to `workspace::commands` — no identity-specific orchestration.
-`event_pipeline/effects.rs` calls `workspace::commands::retry_pending_invite_content_key_unwraps` — no identity-special callouts.
-Boundaries enforced by `scripts/check_boundary_imports.sh`.
-
-Identity finalization requirement:
-1. bootstrap may begin under a temporary invite-derived `recorded_by`,
-2. after steady-state PeerShared identity materializes, call `finalize_identity(old_recorded_by, new_recorded_by)` transactionally,
-3. finalization must rebind tenant-scoped projection/trust/pipeline rows and reconcile blocker/project-queue state (drop stale blocker edges, release stale leases, requeue newly unblocked events),
-4. if `old_recorded_by == new_recorded_by`, finalization is a no-op.
-
-## 15.11 PR slicing guidance (to reduce assistant mistakes)
-
-Recommended PR sequence:
-1. transport mTLS hardening only.
-2. wire framing + schema registry scaffolding.
-3. projector entrypoint + dependency resolver + blocked deps.
-4. create_sync API contract and tests.
-5. signer substrate (Phase 6): signer dep blocking + signature ordering tests.
-6. encrypted adapter + PSK tests.
-7. queue/worker architecture and shared queue helper extraction.
-8. deletion special-case projector.
-9. TLA model update + identity phase implementation.
+Recommended sequence:
+1. transport-only changes,
+2. schema/wire changes,
+3. projection and dependency changes,
+4. signer substrate,
+5. encrypted adapter,
+6. queue/worker changes,
+7. identity/TLA changes.
 
 Rule:
-- each PR must include at least one failing test made to pass by that PR.
+- each PR must include failing tests made to pass by that PR.
+
+## 15.3 Required evidence for phase completion
+
+1. tests cover the new behavior and key regressions,
+2. replay/reorder/reproject invariants still pass,
+3. tenant-isolation checks still pass,
+4. DESIGN references are updated if semantics change.
 
 ---
 
 ## 16. NAT Traversal and Hole Punch (Transport Extension)
 
-This section documents the hole-punch implementation on the `quic-holepunch` branch and guidance for future builders.
+Normative NAT/hole-punch behavior is defined in [DESIGN.md](./DESIGN.md) §2.4.
+This PLAN keeps only execution-level expectations:
 
-### 16.1 Current implementation status
-
-Implemented and tested:
-1. `IntroOffer` wire message (88 bytes fixed, type `0x30`) on uni-directional QUIC streams.
-2. Endpoint observation recording in `peer_endpoint_observations` from accept/connect loops and successful punched connections.
-3. One-shot intro dispatch via the `intro` CLI command (no background intro worker in daemon).
-4. Punch handler with paced QUIC dial, identity verification, and sync-on-success.
-5. `intro_attempts` table tracking full lifecycle (`received -> dialing -> connected | failed | expired | rejected`).
-6. CLI surface: `start`, `intro` (one-shot), and `intro-attempts` (diagnostic).
-7. Linux netns/NAT integration test (`tests/netns_nat_test.sh`) with cone and symmetric modes.
-
-### 16.2 Architecture decisions
-
-1. **Shared endpoint**: Intro offer handling and punch dialing run on the same QUIC endpoint as sync. This is required for NAT compatibility because punch packets must originate from the same UDP socket/port that the NAT has already mapped.
-
-2. **spawn_local for punch handlers**: Punch attempts use `tokio::task::spawn_local` on a `LocalSet` instead of `tokio::spawn` or `spawn_blocking`. This is because:
-   - Quinn endpoints are tied to a specific runtime's I/O driver.
-   - Rusqlite connections are `!Send`.
-   - `spawn_local` satisfies both constraints by running on the same runtime/thread.
-
-3. **No canonical intro events**: IntroOffers and punch attempts are runtime protocol state, not canonical events. They are recorded in operational tables (`peer_endpoint_observations`, `intro_attempts`) with TTL-based cleanup.
-
-4. **Introducer is a role, not a node type**: Any trusted peer with endpoint observations for two peers can issue an explicit intro call. There is no dedicated relay/TURN server in the current design.
-
-5. **Concurrent accept_loop**: The accept loop spawns each connection handler as a `spawn_local` task so the introducer can serve multiple peers simultaneously rather than blocking on one connection's sync session.
-
-### 16.3 NAT compatibility requirements
-
-The current implementation works with EIM (Endpoint-Independent Mapping) NATs, which are the most common home router type:
-
-1. **Port preservation**: The NAT must use the same external port for all destinations from a given internal `(ip, port)`. This is the defining property of EIM.
-2. **Simultaneous open**: Both peers must send packets to each other within a short window so that each creates an outgoing NAT mapping before the other's packets arrive.
-3. **No phantom conntrack entries**: On Linux, unsolicited incoming packets can create conntrack entries that interfere with port-preserving masquerade. The netns test uses `raw` table `notrack` + `INPUT` chain drops to prevent this. Real routers vary in whether they exhibit this behavior.
-
-NAT types that will NOT work:
-- Symmetric/port-dependent NATs (different external port per destination).
-- NATs with very short UDP timeout (< attempt window).
-- CGN (Carrier-Grade NAT) with unpredictable mapping behavior.
-
-### 16.4 Explicit intro flow
-
-The current intro flow is intentionally minimal:
-1. An operator/controller calls `topo intro --peer-a <fpA> --peer-b <fpB>`.
-2. The introducer resolves freshest non-expired endpoint observations for both peers.
-3. It sends one `IntroOffer` to each peer over uni-directional QUIC streams.
-4. Receivers validate trust/expiry/dedup, then run paced dial attempts inside `attempt_window_ms`.
-5. On success, peers record `connected` in `intro_attempts`, persist observed endpoint metadata, and run direct sync.
-
-There is no built-in pair selection scheduler in the daemon. Selection policy and retry cadence belong in a higher-level connection job.
-
-### 16.5 How to test
-
-Run from repo root:
-1. `cargo test --test holepunch_test`
-2. `cargo test test_record_endpoint_observation`
-3. `cargo build --release`
-4. `sudo tests/netns_nat_test.sh --cone` (expected: PASS)
-5. `sudo tests/netns_nat_test.sh --symmetric` (expected: FAIL, by design)
-6. `sudo tests/netns_nat_test.sh --cleanup`
-
-Notes:
-1. The netns script requires `ip`, `nft`, and root privileges.
-2. In cone mode, script success means at least one peer reports `intro_attempts` status `connected`.
-3. In symmetric mode, failure is the expected result and validates NAT-type sensitivity.
-4. On unexpected mismatch, the script dumps nft rulesets, conntrack state (if present), and recent daemon logs.
-
-### 16.6 Key implementation files
-
-- `src/peering/workflows/punch.rs`: IntroOffer receiver, punch dial loop, identity verification, sync-on-punched-connection, punched-peer endpoint observation persistence.
-- `src/peering/workflows/intro.rs`: one-shot intro send and endpoint lookup.
-- `src/peering/loops/accept.rs` and `src/peering/loops/connect.rs`: accept/connect loops with LocalSet, endpoint observation recording, intro listener call sites.
-- `src/main.rs`: CLI commands (`Intro`, `IntroAttempts`) and daemon `start` wiring.
-- `src/db/intro.rs`: `intro_attempts` table operations (insert, update status, query, dedup check) and freshest endpoint query.
-- `src/db/health.rs`: `record_endpoint_observation`, `purge_expired_endpoints`.
-- `tests/netns_nat_test.sh`: Linux netns NAT integration test (requires root/sudo).
-- `tests/holepunch_test.rs`: localhost integration tests for trust/expiry/happy-path intro and punch behavior.
-
-### 16.7 Future work for builders
-
-1. **Connection job for intro scheduling**: Add an external or embedded scheduler that decides who to intro and when (rate limits, retry backoff, target degree, freshness thresholds).
-2. **STUN integration**: Add STUN client discovery to improve mapped endpoint freshness and reduce stale-observation failures.
-3. **TURN fallback**: For symmetric NATs where hole punch cannot work, relay traffic through an introducer/TURN role.
-4. **Connection quality tracking**: Track latency/stability of direct paths and prefer direct links over relay links when healthy.
-5. **Multi-path sync**: Use relay and direct paths together for redundancy and throughput.
-6. **IPv6 traversal coverage**: Expand test coverage for IPv6 intro and direct dialing.
-7. **Intro protocol hardening**: Optionally sign IntroOffers so trust is portable beyond the authenticated transport channel.
-
-### 16.8 Common pitfalls for builders
-
-1. **Cross-runtime endpoint I/O**: Quinn endpoints are bound to a specific tokio runtime's I/O driver. If you `spawn_blocking` with a new runtime and try to `endpoint.connect()`, the QUIC handshake will never complete because the UDP I/O is driven by the original runtime. Use `spawn_local` on the same `LocalSet` instead.
-
-2. **Phantom conntrack on Linux**: When testing with nftables masquerade, unsolicited incoming UDP packets create conntrack entries even if they're dropped by the forward/input filter. These phantom entries cause masquerade to remap source ports, breaking EIM. Prevent with `raw` table `notrack` for new WAN-incoming packets and `INPUT` chain drops before conntrack confirm.
-
-3. **QUIC endpoint must be dual-mode**: The same endpoint must be both client and server (via `create_dual_endpoint`) so that when A dials B and B dials A simultaneously, both sides can accept the other's connection.
-
-4. **Intro timing matters**: Both peers must receive IntroOffers and start dialing within each other's attempt windows. A controller may need repeated one-shot `intro` calls when peers are unstable.
-
-5. **LocalSet is required**: Both `accept_loop` and `connect_loop` wrap their inner logic in a `LocalSet::run_until()` to provide the context needed by `spawn_local` in `spawn_intro_listener`. Forgetting this causes a panic at runtime.
+1. keep intro/hole-punch runtime-only (non-canonical),
+2. keep explicit one-shot intro API and no hidden auto-pair scheduler in core runtime,
+3. keep endpoint observation TTL + cleanup behavior,
+4. preserve coverage with integration + netns NAT tests.
 
 ---
 
@@ -1745,552 +1341,37 @@ Notes:
 
 ### Status: COMPLETE
 
-One node hosting N local tenant identities in a shared SQLite DB with one shared QUIC endpoint, tenant-scoped workspace binding, and tenant-scoped trust policy. The DB itself is the tenant registry — no explicit registration step. Tenants are discovered by joining `trust_anchors` with `local_transport_creds`.
+One node can host N tenant identities in one DB with one shared QUIC endpoint and tenant-scoped routing/trust.
+Detailed architecture and invariants are documented in [DESIGN.md](./DESIGN.md) §3.2.1-§3.2.3, §2.5, §8, and §14.
 
-### Key insight
+## 17.1 Completed outcomes
 
-The DB already IS the tenant registry. `trust_anchors(peer_id, workspace_id)` contains every local identity that has accepted an invite (populated by `invite_accepted`, which is local-only). All projection tables scope by `(recorded_by, event_id)`. The only missing pieces were: (a) storing TLS cert/key material per tenant in the DB, and (b) a node daemon that reads this state and runs one shared QUIC endpoint with tenant-scoped cert selection/routing.
+1. transport credentials are DB-resident and tenant-discoverable,
+2. runtime supports shared endpoint + tenant routing + dynamic trust checks,
+3. shared ingest/batch writer supports tenant-tagged ingest items,
+4. mDNS supports per-tenant discovery with self-filtering.
 
----
+## 17.2 Ongoing regression guards
 
-## 17.1 DB-Only TLS Credential Storage
+1. no filesystem cert authority regression,
+2. no cross-tenant projection/query leakage regression,
+3. no reintroduction of event-count-based convergence assertions,
+4. no bypass of workspace command ownership boundaries.
 
-Cert/key DER blobs live exclusively in SQLite. No `.cert.der` / `.key.der` files on disk. Transport credentials are derived from PeerShared signing keys during identity bootstrap (workspace creation or invite acceptance) and stored in the DB.
+## 17.3 Validation suite expectations
 
-### 17.1.1 Migration 26: `local_transport_creds`
+1. multi-tenant shared-DB scenario coverage,
+2. mDNS/discovery smoke coverage,
+3. cross-tenant leakage checks in scenario tests,
+4. application-level convergence/assertion style in tests.
 
-```sql
-CREATE TABLE local_transport_creds (
-    peer_id TEXT PRIMARY KEY,
-    cert_der BLOB NOT NULL,
-    key_der BLOB NOT NULL,
-    created_at INTEGER NOT NULL
-);
-```
+## 17.4 Same-host loopback normalization rule
 
-Populated during identity bootstrap: PeerShared-derived cert/key is installed by `install_peer_key_transport_identity`, or invite-derived cert/key by `install_invite_bootstrap_transport_identity`. Added in `src/db/migrations.rs`.
-
-### 17.1.2 `src/db/transport_creds.rs`
-
-CRUD operations for the `local_transport_creds` table:
-
-```rust
-pub fn store_local_creds(conn, peer_id, cert_der, key_der) -> Result<()>
-pub fn load_local_creds(conn, peer_id) -> Result<Option<(Vec<u8>, Vec<u8>)>>
-pub fn load_sole_local_creds(conn) -> Result<Option<(String, Vec<u8>, Vec<u8>)>>
-pub fn list_local_peers(conn) -> Result<Vec<String>>
-pub fn discover_local_tenants(conn) -> Result<Vec<TenantInfo>>
-```
-
-`TenantInfo` carries `peer_id`, `workspace_id`, `cert_der`, `key_der`.
-
-`load_sole_local_creds` returns the single local credential when exactly one exists; errors if multiple exist. Used by single-tenant CLI mode to avoid ambiguity.
-
-`discover_local_tenants` is the core multi-tenant query:
-
-```sql
-SELECT t.peer_id, t.workspace_id, c.cert_der, c.key_der
-FROM trust_anchors t
-JOIN local_transport_creds c ON t.peer_id = c.peer_id
-```
-
-This returns every local identity that has (a) accepted an invite and (b) has TLS material. No registration needed.
-
-### 17.1.3 Filesystem cert elimination
-
-**Removed:**
-- `transport_cert_paths_from_db()` — file path derivation
-- `write_cert_and_key()` — file writes
-- `load_or_generate_cert()` — file-based load/generate
-- `atomic_write()` and `set_owner_only_permissions()` — dead code
-- File-based tests in `cert.rs`
-
-**Kept:**
-- `generate_self_signed_cert()` — generates in memory
-- `generate_self_signed_cert_from_signing_key()` — deterministic generation for invites
-- `extract_spki_fingerprint()` — computes BLAKE2b-256 of SPKI
-- `validate_cert_key_match()` — validates cert/key consistency
-
-### 17.1.4 Refactored `src/transport/identity.rs` (moved from `src/identity/transport.rs`)
-
-All functions switched from file I/O to DB queries. Functions take `&Connection` instead of `db_path: &str` at the core, with convenience wrappers that open connections:
-
-```rust
-// Core (take &Connection):
-pub fn load_transport_peer_id(conn) -> Result<String>
-pub fn ensure_transport_peer_id(conn) -> Result<String>
-pub fn ensure_transport_cert(conn) -> Result<(String, CertificateDer, PrivatePkcs8KeyDer)>
-pub fn load_transport_cert(conn, peer_id) -> Result<(CertificateDer, PrivatePkcs8KeyDer)>
-
-// Convenience (open connection from db_path):
-pub fn load_transport_peer_id_from_db(db_path) -> Result<String>
-pub fn ensure_transport_peer_id_from_db(db_path) -> Result<String>
-pub fn ensure_transport_cert_from_db(db_path) -> Result<(String, CertificateDer, PrivatePkcs8KeyDer)>
-
-// Invite bootstrap (deterministic cert from invite key):
-pub fn expected_invite_bootstrap_spki_from_invite_key(invite_key) -> [u8; 32]
-pub fn install_invite_bootstrap_transport_identity(db_path, invite_key) -> Result<String>
-
-// TransportKey event creation (removed — no longer created during bootstrap):
-// ensure_transport_key_event has been removed; PeerShared-derived SPKIs serve as trust source
-```
-
-TransportKey event creation has been removed from the identity bootstrap flow. PeerShared-derived SPKIs now serve as the sole steady-state transport trust source.
-
-### 17.1.4.1 Transport identity materialization contract
-
-Transport cert/key materialization is isolated behind `TransportIdentityIntent` (enum) + `TransportIdentityAdapter` (trait) in `src/contracts/transport_identity_contract.rs`. The sole concrete implementation (`ConcreteTransportIdentityAdapter` in `src/transport/identity_adapter.rs`) is the only code that calls `install_peer_key_transport_identity` and `install_invite_bootstrap_transport_identity`. Event modules emit `ApplyTransportIdentityIntent` commands (e.g., `local_signer_secret` projector for PeerShared signers); the projection pipeline routes them through the adapter; the service layer uses the adapter for invite-bootstrap identity. Boundary enforcement in `scripts/check_boundary_imports.sh` prevents raw install calls from leaking into `service.rs`, `event_modules/`, or `projection/`.
-
-### 17.1.5 Caller updates
-
-All cert-loading sites across the codebase were updated from file-based to DB-based:
-
-| File | Sites | Change |
-|------|-------|--------|
-| `src/main.rs` | 4 | `load_or_generate_cert` → `ensure_transport_cert_from_db` |
-| `src/service.rs` | 4 | same, conn already available in service context |
-| `src/event_modules/workspace/identity_ops.rs` | 1 | `std::fs::read(cert_path)` → DB query |
-| `src/testutil.rs` | ~15 | all Peer methods use `ensure_transport_cert` |
-| `src/transport/mod.rs` | exports | removed file-based, added DB-based |
-
-### Exit criteria (Phase 17.1)
-
-`cargo test` passes. Zero cert files on disk. All cert material in `local_transport_creds` table. `discover_local_tenants` returns the right peers.
+1. loopback-bound daemons may advertise non-loopback IPs for mDNS reachability,
+2. browse-side must normalize discovered non-loopback addresses back to loopback when local daemon is loopback-bound,
+3. advertised IP must be explicit runtime input, not inferred implicitly by discovery internals.
 
 ---
-
-## 17.2 Production Identity Flows
-
-Manual identity chain construction in test helpers was replaced with production `identity_ops` functions. This ensures tests exercise the same code paths as the real daemon.
-
-### 17.2.1 `src/event_modules/workspace/identity_ops.rs` (moved from `src/identity/ops.rs`)
-
-Three high-level flows:
-
-**Bootstrap (creator):**
-```rust
-pub fn bootstrap_workspace(conn, recorded_by) -> Result<IdentityChain>
-```
-Creates: Workspace → UserInviteBoot → InviteAccepted (trust anchor) → UserBoot → DeviceInviteFirst → PeerSharedFirst → AdminBoot (7 identity events + content key events).
-
-**Invite (admin):**
-```rust
-pub fn create_user_invite(conn, recorded_by, workspace_key, workspace_id) -> Result<InviteData>
-```
-Creates UserInviteBoot event signed by workspace key. Returns `InviteData { invite_event_id, invite_key, workspace_id, invite_type }`.
-
-**Accept (joiner):**
-```rust
-pub fn accept_user_invite(conn, recorded_by, invite_key, invite_event_id, workspace_id) -> Result<JoinChain>
-```
-Creates: InviteAccepted → UserBoot → DeviceInviteFirst → PeerSharedFirst. Joiner must pre-copy Workspace + UserInviteBoot events into their DB before calling this.
-
-**Device link:**
-```rust
-pub fn create_device_link_invite(conn, recorded_by, user_key, user_event_id, workspace_id) -> Result<InviteData>
-pub fn accept_device_link(conn, recorded_by, device_invite_key, device_invite_event_id, workspace_id) -> Result<LinkChain>
-```
-
-All functions take `&Connection` and `recorded_by`, enabling multi-tenant operation on shared DBs.
-
-### 17.2.2 Result types
-
-```rust
-pub struct IdentityChain {
-    pub workspace_id: [u8; 32],
-    pub workspace_key: SigningKey,
-    pub peer_shared_event_id: [u8; 32],
-    pub peer_shared_key: SigningKey,
-    // ... plus all intermediate event IDs and keys
-}
-
-pub struct JoinChain {
-    pub peer_shared_event_id: [u8; 32],
-    pub peer_shared_key: SigningKey,
-    pub invite_accepted_event_id: [u8; 32],
-    // ... plus intermediate keys
-}
-```
-
----
-
-## 17.3 Multi-Tenant Batch Writer
-
-The sync engine's ingest channel was changed from a 2-tuple to a 3-tuple carrying the tenant identity.
-
-### 17.3.1 `IngestItem` type
-
-```rust
-pub type IngestItem = (EventId, Vec<u8>, String);  // (event_id, blob, recorded_by)
-```
-
-### 17.3.2 `batch_writer` signature
-
-```rust
-pub fn batch_writer(
-    db_path: String,
-    mut rx: mpsc::Receiver<IngestItem>,
-    events_received: Arc<AtomicU64>,
-)
-```
-
-The `recorded_by: String` parameter was removed. Per-item `recorded_by` is extracted from each `IngestItem` for:
-- `recorded_events` INSERT
-- `project_queue` enqueue
-- Per-tenant projection drain
-
-`batch_writer` in `src/event_pipeline/mod.rs` now sequences explicit internal phases:
-1. `run_persist_phase(...) -> PersistPhaseOutput` (`phases.rs`) for transactional ingest persistence.
-2. `plan_post_commit_commands(&PersistPhaseOutput, batch_size)` (`planner.rs`) for deterministic command planning.
-3. `run_post_commit_effects(...)` (`effects.rs`) for side-effect execution behind the executor boundary.
-
-Boundary validation commands:
-1. `cargo test -q event_pipeline`
-2. `bash scripts/check_boundary_imports.sh`
-3. `rg -n "project_one\\(|post_drain_hooks\\(|wanted\\.remove\\(" src/event_pipeline`
-4. `rg -n "use rusqlite|crate::db" src/event_pipeline/planner.rs` (expect empty output)
-
-### 17.3.3 `spawn_data_receiver`
-
-```rust
-pub fn spawn_data_receiver<R>(
-    data_recv: R,
-    ingest_tx: Sender<IngestItem>,
-    bytes_received: Arc<AtomicU64>,
-    recorded_by: String,
-)
-```
-
-Tags every received event with `recorded_by` before sending to the shared ingest channel. This ensures no event enters the shared writer without tenant identification.
-
-### 17.3.4 `accept_loop_with_ingest`
-
-```rust
-pub async fn accept_loop_with_ingest(
-    db_path: &str,
-    recorded_by: &str,
-    endpoint: Endpoint,
-    allowed_peers: Option<AllowedPeers>,
-    shared_ingest_tx: Sender<IngestItem>,
-) -> Result<()>
-```
-
-Extracted from `accept_loop` to accept an external shared ingest channel. The existing `accept_loop` becomes a wrapper that spawns a local `batch_writer` and delegates.
-
----
-
-## 17.4 Node Daemon
-
-### 17.4.1 Runtime loop model
-
-The peering runtime (`src/peering/runtime/mod.rs::run_node`) implements a single conceptual loop:
-
-1. **Projected SQLite state**: `invite_bootstrap_trust` rows, PeerShared-derived trust, endpoint observations.
-2. **Target planner** (`src/peering/runtime/target_planner.rs`): single-owner module for all dial target planning. Collects bootstrap trust targets from SQL (`collect_all_bootstrap_targets`) and mDNS discovery candidates. Both sources dispatch through `PeerDispatcher` for dedup/reconnect.
-3. **Dial/accept supervisors**: `connect_loop` (outbound) and `accept_loop` (inbound) in `src/peering/loops/`. Manage QUIC connection lifecycle.
-4. **Transport↔peering seam**: `src/peering/loops/mod.rs::run_session` centralizes QUIC-to-session wiring (DualConnection, SessionMeta, QuicTransportSessionIo construction). Both accept and connect loops call this.
-5. **Sync session runner**: `SyncSessionHandler` (protocol-agnostic, invoked via `SessionHandler` contract).
-6. **Ingest writer** (`batch_writer`): single shared thread consuming `IngestItem` tuples, triggering projection cascade → back to step 1.
-
-### 17.4.2 `run_node` startup sequence
-
-```rust
-pub async fn run_node(
-    db_path: &str,
-    bind: SocketAddr,
-    net_info_tx: oneshot::Sender<NodeRuntimeNetInfo>,
-    shutdown_notify: Arc<Notify>,
-    intro_spawner: IntroSpawnerFn,
-    ingest: IngestFns,
-) -> Result<(), Box<dyn Error + Send + Sync>>
-```
-
-Flow:
-1. `setup_endpoint_and_tenants()` — discover local tenants, build multi-workspace cert resolver, create single QUIC endpoint.
-2. Spawn ONE shared `batch_writer` thread.
-3. (if discovery enabled) `launch_mdns_discovery()` — per-tenant mDNS advertisement and browse.
-4. Spawn `accept_loop_with_ingest` with shared ingest channel.
-5. `collect_all_bootstrap_targets()` + `dispatch_bootstrap_target()` — initial bootstrap dials via `PeerDispatcher`.
-6. `spawn_bootstrap_refresher()` — ongoing poll loop for new bootstrap targets (shares `PeerDispatcher`).
-7. Wait for daemon shutdown signal (RPC `Shutdown` or foreground Ctrl-C).
-
-### 17.4.2 Per-tenant dynamic trust
-
-Each tenant's QUIC endpoint gets a closure that checks transport trust in real-time:
-
-```rust
-let is_allowed = move |peer_fp: &str| -> bool {
-    is_peer_allowed(&db_path, &recorded_by, peer_fp, &allowed_peers)
-};
-```
-
-This queries `trust_anchors` and PeerShared-derived SPKIs for that specific `recorded_by`, enabling isolated trust policies per tenant within the same process.
-
-### 17.4.3 `PeerDispatcher` and unified target planning
-
-`PeerDispatcher` (in `src/peering/runtime/target_planner.rs`) tracks discovered peer addresses and manages connection lifecycle:
-
-```rust
-pub struct PeerDispatcher {
-    known: HashMap<String, (SocketAddr, watch::Sender<()>)>,
-}
-```
-
-`DiscoveryAction` enum routes decisions: `Skip` (already connected at same address), `Connect` (new peer), `Reconnect` (address changed — cancel old `connect_loop` via `watch` channel, spawn new one).
-
-Both bootstrap trust targets and mDNS discovery targets dispatch through `PeerDispatcher`. Bootstrap targets use `dispatch_bootstrap_target()` which generates a composite dispatch key `"{tenant_id}@bootstrap"`. This ensures a single dispatch mechanism for all target sources.
-
-### 17.4.4 CLI integration
-
-`src/main.rs` runs `run_node()` only inside `topo start` (single-tenant and multi-tenant handled uniformly). RPC server runs alongside for control and queries.
-
----
-
-## 17.5 mDNS/DNS-SD Discovery
-
-### 17.5.1 `src/peering/discovery.rs` (feature-gated: `discovery`)
-
-```toml
-# Cargo.toml
-mdns-sd = { version = "0.11", optional = true }
-
-[features]
-default = ["discovery"]
-discovery = ["mdns-sd"]
-```
-
-### 17.5.2 `TenantDiscovery`
-
-```rust
-pub struct TenantDiscovery {
-    peer_id: String,
-    daemon: ServiceDaemon,
-    local_peer_ids: HashSet<String>,
-}
-
-impl TenantDiscovery {
-    pub fn new(peer_id, port, local_peer_ids) -> Result<Self>
-    pub fn browse(&self) -> Result<Receiver<DiscoveredPeer>>
-}
-```
-
-Each tenant advertises under `_topo._udp.local.` with:
-- Instance name: `p7-{peer_id_truncated_to_59_chars}` (DNS labels max 63 bytes).
-- TXT property: `peer_id={full_64_hex_chars}` for exact matching.
-- Explicit local non-loopback IPv4 address (discovered via UDP socket connect to 8.8.8.8).
-
-`local_peer_ids` (the full set of all tenants on this node) filters out self-discoveries and other local tenants. This prevents unnecessary local connections.
-
-Same-host loopback normalization rule:
-1. same-machine daemons bound to `127.0.0.1` may advertise non-loopback addresses for mDNS reachability,
-2. browse-side must normalize discovered non-loopback addresses back to loopback when local daemon is loopback-bound (`normalize_discovered_addr_for_local_bind`),
-3. advertised IP is explicit runtime input from `run_node`; discovery internals must not infer addresses implicitly.
-
-### 17.5.3 Integration in `run_node`
-
-After creating the shared endpoint and learning its bound port, `run_node` creates `TenantDiscovery` per tenant using that shared port. On trusted discovery, `PeerDispatcher` (from `target_planner.rs`) routes to tenant-specific `connect_loop`. Feature-gated with `#[cfg(feature = "discovery")]`.
-
-### 17.5.4 DNS label truncation
-
-Peer IDs are 64 hex chars. With the `p7-` prefix (3 chars), using all 64 would produce a 67-char label exceeding the 63-byte DNS limit. The instance name truncates to 59 chars of the peer ID (62 total with prefix). The full peer ID is always available in the TXT property for exact matching.
-
----
-
-## 17.6 Test Infrastructure
-
-### 17.6.1 `SharedDbNode` test helper
-
-```rust
-pub struct SharedDbNode {
-    pub db_path: String,
-    pub tenants: Vec<Peer>,
-    _tempdir: TempDir,
-}
-```
-
-Creates N tenants in one shared DB. Each tenant gets:
-- Unique self-signed cert (stored via `store_local_creds`).
-- Full identity chain via `bootstrap_identity_chain()`.
-- Own `workspace_id`, `peer_shared_event_id`, `peer_shared_signing_key`.
-
-```rust
-impl SharedDbNode {
-    pub fn new(n: usize) -> Self           // N independent-workspace tenants
-    pub fn add_tenant_in_workspace(        // join existing tenant's workspace
-        &mut self, name: &str, creator_index: usize,
-    )
-    pub fn verify_all_invariants(&self)    // cross-tenant leakage check
-}
-```
-
-`add_tenant_in_workspace` uses the production invite flow:
-1. Generate distinct cert for new tenant, store in shared DB.
-2. Creator issues invite via `create_user_invite`.
-3. Copy prerequisite events (Workspace + UserInviteBoot) from creator to joiner.
-4. Joiner accepts via `accept_user_invite` → full identity chain (no TransportKey — PeerShared-derived).
-
-### 17.6.2 `Peer` construction
-
-Three constructors matching different test needs:
-
-| Constructor | Identity | Workspace | Use case |
-|-------------|----------|-----------|----------|
-| `Peer::new(name)` | Transport only | None | Manual identity tests |
-| `Peer::new_with_identity(name)` | Full bootstrap | Own | Independent peer tests |
-| `Peer::new_in_workspace(name, creator)` | Join flow (async) | Creator's | Same-workspace tests |
-
-`new_with_identity` calls `bootstrap_workspace` (production flow). `new_in_workspace` (async) creates a real invite, starts a temp QUIC sync endpoint for the creator, and calls `svc_accept_invite` which performs bootstrap sync + identity chain creation — no direct DB-to-DB event copying.
-
-### 17.6.3 Closure-based `sync_until_converged`
-
-```rust
-pub async fn sync_until_converged<F: Fn() -> bool>(
-    peer_a: &Peer,
-    peer_b: &Peer,
-    check: F,
-    timeout: Duration,
-) -> SyncMetrics
-```
-
-Replaced the old `expected_count: i64` parameter with a generic closure. Metrics (events transferred, throughput) are computed from before/after `store_count()` internally.
-
-### 17.6.4 Application-level convergence pattern
-
-Tests use `has_event()` on specific event IDs for convergence detection, and meaningful projection counts for assertions:
-
-```rust
-// Convergence: sample a specific event, wait for it to arrive
-let sample = alice.sample_event_ids(1)[0].clone();
-let metrics = sync_until_converged(
-    &alice, &bob,
-    || bob.has_event(&sample),
-    Duration::from_secs(120),
-).await;
-
-// Assertion: application-level data, not raw event counts
-assert_eq!(alice.message_count(), 5_000);
-assert_eq!(bob.message_count(), 5_000);
-```
-
-This pattern is resilient to identity chain size changes (6 events → 8 events → future changes). Tests never assert on `store_count()`, `recorded_events_count()`, or `neg_items_count()`.
-
-For bidirectional zero-loss verification, sample multiple events from both sides:
-```rust
-let alice_samples = alice.sample_event_ids(50);
-let bob_samples = bob.sample_event_ids(50);
-sync_until_converged(&alice, &bob,
-    || alice_samples.iter().all(|s| bob.has_event(s))
-        && bob_samples.iter().all(|s| alice.has_event(s)),
-    Duration::from_secs(120),
-).await;
-```
-
-### 17.6.5 Cross-tenant leakage detection
-
-```rust
-pub fn assert_no_cross_tenant_leakage(
-    db_path: &str,
-    tenant_workspaces: &[(String, [u8; 32])],
-)
-```
-
-Checks:
-1. `recorded_events` and `valid_events` are pairwise disjoint for tenants in different workspaces.
-2. No unexpected `recorded_by` values in projection tables (messages, reactions, signed_memos, secret_keys).
-3. Overlaps expected for same-workspace tenants (after sync).
-
-Wired into `SharedDbNode::verify_all_invariants()` and run after every multi-tenant scenario test.
-
----
-
-## 17.7 Scenario Tests
-
-Tests in `tests/scenario_test.rs`:
-
-| Test | Topology | Verifies |
-|------|----------|----------|
-| `test_shared_db_same_workspace_two_tenants` | 2 tenants, same workspace, 1 DB | Messages project for both tenants |
-| `test_shared_db_two_tenants_different_workspaces` | 2 tenants, different workspaces, 1 DB | Zero cross-workspace event overlap |
-| `test_shared_db_no_cross_tenant_leakage` | 2 tenants, shared DB | Projection table isolation |
-| `test_shared_db_sync_with_external_peer` | 1 node tenant + 1 standalone peer | Node tenant syncs with external peer |
-| `test_shared_db_tenant_discovery` | 2+ tenants, shared DB | `discover_local_tenants` returns correct set |
-| `test_cross_tenant_dep_scoping_after_sync` | 2 tenants, shared DB, sync | Dependency blocking scoped by recorded_by |
-| `test_svc_node_status` | 2 tenants | `svc_node_status` returns correct tenant list |
-| `test_mdns_two_peers_discover_and_sync` | 2 standalone peers | mDNS advertise/browse/sync |
-| `test_mdns_multitenant_self_filtering_and_sync` | Node with 2 tenants + external peer | Self-filtering, external peer sync |
-
-Tests in `tests/mdns_smoke.rs`:
-| Test | Verifies |
-|------|----------|
-| `mdns_advertise_and_browse` | Basic mDNS register/resolve round-trip |
-
----
-
-## 17.8 Implementation Files
-
-| File | Action | Phase |
-|------|--------|-------|
-| `src/db/migrations.rs` | Migration 26: `local_transport_creds` | 17.1 |
-| `src/db/transport_creds.rs` | **New** — store/load/list/discover creds from DB | 17.1 |
-| `src/db/mod.rs` | Export `transport_creds` | 17.1 |
-| `src/transport/cert.rs` | Remove file I/O, keep generation + fingerprint | 17.1 |
-| `src/transport/mod.rs` | Update re-exports | 17.1 |
-| `src/transport/identity.rs` | Moved from `src/identity/transport.rs`; `&Connection` API, DB-only | 17.1 |
-| `src/event_modules/workspace/identity_ops.rs` | Moved from `src/identity/ops.rs`; primitive helpers for identity operations | 17.2 |
-| `src/event_modules/workspace/invite_link.rs` | Moved from `src/identity/invite_link.rs`; invite link encode/decode | — |
-| `src/main.rs` | Update 4 cert-loading sites | 17.1 |
-| `src/service.rs` | Update 4 cert-loading sites, add `svc_node_status` | 17.1, 17.4 |
-| `src/peering/loops/` | `IngestItem` 3-tuple, `accept_loop_with_ingest` | 17.3 |
-| `src/peering/runtime/` | `PeerDispatcher`, `run_node` multi-tenant daemon | 17.3, 17.4 |
-| `src/node.rs` | Thin composition root delegating to `peering::runtime` | 17.4 |
-| `src/peering/discovery.rs` | mDNS per-tenant discovery | 17.5 |
-| `src/lib.rs` | Export `node`, `peering` | 17.4, 17.5 |
-| `Cargo.toml` | `mdns-sd` dep + `discovery` feature | 17.5 |
-| `src/testutil.rs` | `SharedDbNode`, closure-based `sync_until_converged`, `new_in_workspace`, `add_tenant_in_workspace`, leakage checks | 17.6 |
-| `tests/scenario_test.rs` | Multi-tenant + mDNS scenario tests, application-level assertions | 17.7 |
-| `tests/mdns_smoke.rs` | **New** — mDNS integration test | 17.7 |
-| `tests/perf_test.rs` | Closure-based convergence, application-level assertions | 17.6 |
-| `tests/low_mem_test.rs` | Same | 17.6 |
-| `tests/sync_graph_test.rs` | Same | 17.6 |
-
----
-
-## 17.9 Assistant Execution Playbook (Phase 13)
-
-### Must implement
-
-1. `local_transport_creds` table with store/load/list/discover operations.
-2. `discover_local_tenants` query joining `trust_anchors` with `local_transport_creds`.
-3. All cert operations via DB, zero filesystem cert paths.
-4. `IngestItem` 3-tuple `(event_id, blob, recorded_by)` everywhere in sync engine.
-5. `accept_loop_with_ingest` accepting external shared ingest channel.
-6. `run_node` single shared QUIC endpoint with `WorkspaceCertResolver`, tenant-scoped routing, and shared batch writer.
-7. Per-tenant dynamic trust closure from `trust_anchors`/PeerShared-derived SPKIs.
-8. mDNS per-tenant advertise + browse with self-filtering.
-9. `SharedDbNode` test helper using production identity flows.
-10. Application-level test assertions (never `store_count`, always `message_count`/`has_event`/etc.).
-
-### Common mistakes
-
-- **Filesystem cert remnants**: Do not read or write `.cert.der` / `.key.der` files. All cert material lives in `local_transport_creds`.
-- **Hardcoded event counts in tests**: Identity chain size may change. Test convergence with `has_event()` on specific event IDs, assert with `message_count()` / `peer_shared_count()` / etc.
-- **Single-sample convergence for large syncs**: A single `has_event` sample may pass after only partial transfer. For zero-loss or high-volume tests, sample 50+ events from both sides.
-- **Global neg_items**: All tenants share one `neg_items` table. A remote peer connecting to the shared endpoint (routed as tenant A) will see event IDs from all tenants during negentropy. This is acceptable for single-operator nodes.
-- **DNS label overflow**: Peer IDs are 64 hex chars. Instance names must stay under 63 bytes. Truncate peer ID in instance name; use TXT property for full ID.
-- **Self-discovery in mDNS**: Pass the full set of local tenant peer IDs to `TenantDiscovery::new` so it can filter them all out, not just its own.
-- **Forgetting per-tenant drain**: `batch_writer` must group ingested items by `recorded_by` and drain `project_queue` per tenant. A single drain call with one `recorded_by` misses events from other tenants in the same batch.
-
-### Definition of done
-
-- `topo start` discovers tenants from DB, starts QUIC endpoint with multi-workspace cert resolver, syncs with external peers.
-- Two tenants on same node in different workspaces have zero event overlap after sync.
-- Two tenants on same node in same workspace both project synced messages.
-- mDNS self-filtering prevents local-only connections; external peers discovered and synced.
-- Cross-tenant leakage check passes after every multi-tenant scenario test.
-- All test files use application-level convergence and assertions (no `store_count`).
-
----
-
 ## 18. Cheat-Proof Realism Tests (`cheat-proof-tests` branch)
 
 Goal: establish a test suite where successful P2P bootstrap and sync cannot be faked by local process shortcuts, shared filesystem state, or manual operator dials.
@@ -2356,127 +1437,17 @@ Goal: establish a test suite where successful P2P bootstrap and sync cannot be f
 5. Expected limitation: some networks (for example CGNAT or non-UPnP routers) still require manual bootstrap endpoints even with this feature.
 
 UPnP response contract:
-1. `topo upnp` reports structured outcome status: `success | failed | not_attempted`,
-2. report includes mapped external port/IP plus optional gateway/error fields,
+1. `topo upnp` reports status `success | failed | not_attempted`,
+2. output includes mapped external port/IP plus optional gateway/error fields,
 3. loopback-bound listeners return `not_attempted`,
-4. if mapping succeeds but external IP is not publicly routable, report `double_nat = true` and warn.
+4. when mapping succeeds but external IP is not publicly routable, report `double_nat = true` and warn.
 
-## 19. Event-module locality (Options 1+2+4+5)
+## 19. Event-module locality
 
-### 19.1 Motivation
+Normative locality/layering rules are defined in [DESIGN.md](./DESIGN.md) §14.
+Plan-level enforcement remains:
 
-`service.rs` previously embedded event-specific SQL queries, event construction logic, and response type definitions for all event types. This scattered event-specific concerns: message SQL lived far from `MessageEvent` schema, reaction queries were disconnected from `ReactionEvent`, etc.
-
-Similarly, projector logic for all event types lived in two central files (`projection/projectors.rs` for content events, `projection/identity.rs` for identity events) with a large match statement in `apply.rs` routing to them. This violated locality — to understand message projection you had to jump to a different module.
-
-### 19.2 Approach (Options 1+2)
-
-Moved event-specific command (create), query helpers, and **projector functions** into event-owned modules, making `service.rs` a thin orchestrator and `apply.rs` an orchestration-only pipeline.
-
-**Event modules gained:**
-- `CreateXxxCmd` structs — input params for creating events
-- `create()` — builds `ParsedEvent`, calls `create_signed_event_sync`, returns `EventId`
-- `query_list()`, `query_count()`, `resolve_by_number()`, `resolve_selector()` — SQL against projection tables
-- `project_pure()` — pure projector function registered in `EventTypeMeta.projector`
-
-**Registry-driven projector dispatch:**
-- `EventTypeMeta` gained a `projector` field: `fn(&str, &str, &ParsedEvent, &ContextSnapshot) -> ProjectorResult`
-- `dispatch_pure_projector` in `apply.rs` uses registry lookup — no central match statement
-- Deleted: `src/projection/projectors.rs` (content event splay) and `src/projection/identity.rs` (identity event splay)
-
-**Service routing (dispatch retired):**
-- Service routes directly to event-module command/query APIs.
-- `src/event_modules/dispatch.rs` was removed to avoid a second service routing surface.
-
-**Shared utilities added to `src/crypto/mod.rs`:**
-- `event_id_from_hex()` — parse hex event ID
-- `b64_to_hex()` — base64 to hex conversion
-
-### 19.3 Service-to-event-module locality (Option 5)
-
-Moved response types and event-local command/query ownership into event modules, making service.rs orchestration-only for event domains.
-
-**Event modules gained (Option 5):**
-- Response types (`MessageItem`, `MessagesResponse`, `SendResponse`, `ReactResponse`, `ReactionItem`) — owned by event modules, re-exported by service.rs
-- Event-local command/query APIs used directly by service (`create`, `send`, `list`, `count`, `resolve`, etc.)
-- Workflow commands are first-class event-module command APIs (not a special service-only category).
-
-**Module split pattern applied:**
-- `message` module converted from flat file to directory (`message/{mod,wire,commands,queries}.rs`) as the pilot for the split pattern
-- Split rule: when a module exceeds ~300-400 LOC or mixes 3+ concerns, split into `wire.rs`, `commands.rs`, `queries.rs`, `projector.rs`
-
-**Workspace workflow locality examples (implemented):**
-- Service wrappers route onboarding flows to workspace command APIs:
-  - `svc_create_workspace` -> `workspace::commands::create_workspace`
-  - `svc_accept_invite` -> `workspace::commands::join_workspace_as_new_user`
-  - `svc_accept_device_link` -> `workspace::commands::add_device_to_workspace`
-- Service wrappers route invite creation to workspace command APIs:
-  - `svc_create_invite_conn` -> `workspace::commands::create_user_invite`
-  - `svc_create_device_link_invite_conn` -> `workspace::commands::create_device_link_invite`
-  - `svc_create_invite` / `svc_create_invite_with_spki` -> key loading + `create_user_invite`
-- If workspace command surface grows, split by workflow while preserving module-local ownership:
-
-```
-src/event_modules/workspace/
-  commands/
-    mod.rs
-    create_workspace.rs
-    join_workspace_as_new_user.rs
-    add_device_to_workspace.rs
-```
-
-### 19.4 Service.rs delegation table
-
-| service.rs function | Delegates to |
-|---|---|
-| `svc_send_conn` | `message::send` |
-| `svc_messages_conn` | `message::list` |
-| `svc_react_conn` | `reaction::react` |
-| `svc_reactions_conn` | `reaction::list` |
-| `svc_reactions_for_message_conn` | `reaction::list_for_message` |
-| `svc_delete_message_conn` | `message_deletion::delete_message` |
-| `svc_deleted_message_ids_conn` | `message_deletion::list_deleted_ids` |
-| `svc_remove_user_conn` | `user_removed::remove_user` |
-| `svc_message_event_id_by_num_conn` | `message::resolve_number` |
-| `resolve_message_selector` | `message::resolve` |
-| `svc_create_workspace` | `workspace::commands::create_workspace` |
-| `svc_accept_invite` | `workspace::commands::join_workspace_as_new_user` |
-| `svc_accept_device_link` | `workspace::commands::add_device_to_workspace` |
-| `svc_create_invite_conn` | `workspace::commands::create_user_invite` |
-| `svc_create_device_link_invite_conn` | `workspace::commands::create_device_link_invite` |
-| `svc_create_invite` | `workspace::commands::load_workspace_signing_key` + `create_user_invite` |
-| `svc_create_invite_with_spki` | `workspace::commands::load_workspace_signing_key` + `create_user_invite` |
-| `svc_status_conn` message/reaction counts | `message::count` + `reaction::count` |
-| `query_field` message/reaction counts | `message::count` + `reaction::count` |
-| `svc_users_conn` | `user::list` |
-| `svc_keys_conn` counts | `user::count` + `peer_shared::count` + `admin::count` + `transport_key::count` |
-| `svc_workspaces_conn` | `workspace::list` |
-
-### 19.5 What service.rs retains
-
-- DB open/close (`open_db_load`, `open_db_for_peer`)
-- Auth (key loading, `require_local_peer_signer`)
-- Cross-module orchestration (`svc_view_conn` combines messages, reactions, users)
-- Shared response types (`DeleteResponse`, `StatusResponse`, `ViewResponse`, etc.)
-- Invite flow orchestration (bootstrap sync, transport setup — event-domain logic delegated to workspace::commands)
-- Predicate/assert system
-- Service-level helpers (`current_timestamp_ms`, `parse_workspace_hex`)
-
-### 19.5 What apply.rs retains (orchestration-only)
-
-- Dependency presence check + block row writes
-- Dependency type enforcement
-- Signer verification (uniform, not event-type-specific)
-- Context snapshot construction
-- Registry-driven projector dispatch
-- Write-op execution and emit-command handling
-- **No event-type-specific projection logic** — that lives in event modules
-
-### 19.6 Boundary rules (normative)
-
-1. Event-specific commands, queries, response types, and projectors belong in event modules.
-2. `service.rs` is orchestration glue: DB context, auth, cross-module joins, error mapping.
-3. `apply.rs` is pipeline orchestration: dependency checks, signer verification, registry dispatch.
-4. Multi-step event-domain workflows belong in owning event-module command APIs (`commands.rs` or `commands/`), not in service.
-5. Long event modules must split into `wire/commands/queries/projector` structure, and long command surfaces split into `commands/` by workflow (see DESIGN §14.4).
-6. Wire layout constants (wire sizes, offsets) are owned by the event module — not in a global monolith. Shared cross-event primitives live in `src/event_modules/layout/common.rs` (see DESIGN §14.5).
+1. event-type-specific commands/queries/projectors stay in event modules,
+2. `service.rs` remains orchestration-only,
+3. projection pipeline remains orchestration-only,
+4. module boundary checks stay automated in CI where available.
