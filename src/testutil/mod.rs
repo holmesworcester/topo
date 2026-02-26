@@ -198,8 +198,8 @@ impl Peer {
     /// `accept_user_invite`. No direct DB-to-DB event copying.
     pub async fn new_in_workspace(name: &str, creator: &Peer) -> Self {
         use crate::event_modules::workspace::commands::create_user_invite_raw;
+        use crate::event_modules::workspace::identity_ops::expected_invite_bootstrap_spki_from_invite_key;
         use crate::event_modules::workspace::invite_link::create_invite_link;
-        use crate::transport::identity::expected_invite_bootstrap_spki_from_invite_key;
         use crate::db::transport_trust::record_pending_invite_bootstrap_trust;
 
         // Create a bare peer with DB tables but NO transport identity.

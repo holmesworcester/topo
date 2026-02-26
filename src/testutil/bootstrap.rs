@@ -23,11 +23,10 @@ use crate::contracts::peering_contract::{
     next_session_id, PeerFingerprint, SessionDirection, SessionHandler, SessionMeta, TenantId,
 };
 use crate::db::{open_connection, schema::create_tables};
+use crate::event_modules::workspace::identity_ops::expected_invite_bootstrap_spki_from_invite_key;
 use crate::sync::{CoordinationManager, SyncSessionHandler};
 
-use crate::transport::identity::{
-    expected_invite_bootstrap_spki_from_invite_key, load_transport_cert_required_from_db,
-};
+use crate::transport::identity::load_transport_cert_required_from_db;
 use crate::transport::{
     create_dual_endpoint, peer_identity_from_connection, AllowedPeers, DualConnection,
     QuicTransportSessionIo,

@@ -192,17 +192,8 @@ pub fn install_peer_key_transport_identity(
 }
 
 // ---------------------------------------------------------------------------
-// Invite bootstrap identity
+// Invite bootstrap identity materialization
 // ---------------------------------------------------------------------------
-
-/// Derive the expected bootstrap transport SPKI fingerprint for an invitee from
-/// the invite signing key material.
-pub fn expected_invite_bootstrap_spki_from_invite_key(
-    invite_key: &ed25519_dalek::SigningKey,
-) -> Result<[u8; 32], Box<dyn std::error::Error + Send + Sync>> {
-    let (cert_der, _) = generate_self_signed_cert_from_signing_key(invite_key)?;
-    extract_spki_fingerprint(cert_der.as_ref())
-}
 
 /// Install a deterministic transport cert/key derived from the invite signing
 /// key into the database. This makes invitee transport identity predictable
@@ -231,14 +222,6 @@ mod tests {
     use crate::db::open_in_memory;
     use crate::db::schema::create_tables;
     use ed25519_dalek::SigningKey;
-
-    #[test]
-    fn test_expected_invite_bootstrap_spki_is_deterministic() {
-        let invite_key = SigningKey::from_bytes(&[9u8; 32]);
-        let fp1 = expected_invite_bootstrap_spki_from_invite_key(&invite_key).unwrap();
-        let fp2 = expected_invite_bootstrap_spki_from_invite_key(&invite_key).unwrap();
-        assert_eq!(fp1, fp2);
-    }
 
     #[test]
     fn test_ensure_transport_peer_id_generates_and_persists() {
@@ -293,8 +276,10 @@ mod tests {
         let loaded = load_transport_peer_id(&conn).unwrap();
         assert_eq!(installed, loaded);
 
-        let expected =
-            hex::encode(expected_invite_bootstrap_spki_from_invite_key(&invite_key).unwrap());
+        let expected = {
+            let (cert_der, _) = generate_self_signed_cert_from_signing_key(&invite_key).unwrap();
+            hex::encode(extract_spki_fingerprint(cert_der.as_ref()).unwrap())
+        };
         assert_eq!(loaded, expected);
     }
 

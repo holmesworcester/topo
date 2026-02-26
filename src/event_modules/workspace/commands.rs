@@ -478,10 +478,7 @@ pub fn create_user_invite(
 
     // Record pending bootstrap trust so the inviter's daemon trusts the
     // joiner's invite-derived cert when they connect via autodial.
-    let joiner_spki =
-        crate::transport::identity::expected_invite_bootstrap_spki_from_invite_key(
-            &invite.invite_key,
-        )?;
+    let joiner_spki = ops::expected_invite_bootstrap_spki_from_invite_key(&invite.invite_key)?;
     crate::db::transport_trust::record_pending_invite_bootstrap_trust(
         db,
         recorded_by,
@@ -529,10 +526,7 @@ pub fn create_device_link_invite(
 
     // Record pending bootstrap trust so the inviter's daemon trusts the
     // joiner's invite-derived cert when they connect via autodial.
-    let joiner_spki =
-        crate::transport::identity::expected_invite_bootstrap_spki_from_invite_key(
-            &invite.invite_key,
-        )?;
+    let joiner_spki = ops::expected_invite_bootstrap_spki_from_invite_key(&invite.invite_key)?;
     crate::db::transport_trust::record_pending_invite_bootstrap_trust(
         db,
         recorded_by,

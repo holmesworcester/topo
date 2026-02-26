@@ -15,6 +15,7 @@ use crate::projection::create::{
 };
 use crate::projection::encrypted::{wrap_key_for_recipient, unwrap_key_from_sender};
 use crate::projection::signer::{resolve_signer_key, SignerResolution};
+use crate::transport::{extract_spki_fingerprint, generate_self_signed_cert_from_signing_key};
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -116,6 +117,15 @@ pub enum InviteType {
 pub struct InviteBootstrapContext<'a> {
     pub bootstrap_addr: &'a str,
     pub bootstrap_spki: &'a [u8; 32],
+}
+
+/// Derive the expected bootstrap transport SPKI fingerprint for an invitee from
+/// invite signing key material.
+pub(crate) fn expected_invite_bootstrap_spki_from_invite_key(
+    invite_key: &SigningKey,
+) -> Result<[u8; 32], Box<dyn std::error::Error + Send + Sync>> {
+    let (cert_der, _) = generate_self_signed_cert_from_signing_key(invite_key)?;
+    extract_spki_fingerprint(cert_der.as_ref())
 }
 
 // ---------------------------------------------------------------------------
