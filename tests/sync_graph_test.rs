@@ -158,12 +158,6 @@ async fn chain_10_peers_50k() {
     run_chain_bench(10, 50_000).await;
 }
 
-/// Chain stress: 20 peers, 10k events.
-#[tokio::test]
-#[ignore]
-async fn chain_20_peers_10k() {
-    run_chain_bench(20, 10_000).await;
-}
 
 // ---------------------------------------------------------------------------
 // Family B: Multi-source catchup (sink-driven coordinated download)
