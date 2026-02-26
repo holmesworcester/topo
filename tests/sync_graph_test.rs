@@ -138,23 +138,16 @@ async fn run_chain_bench(n: usize, event_count: usize) {
     eprintln!();
 }
 
-/// Chain smoke: 5 peers, 10k events.
+/// 10-hop chain smoke: 10 peers, 10k events.
 #[tokio::test]
-async fn chain_5_peers_10k() {
-    run_chain_bench(5, 10_000).await;
-}
-
-/// Chain primary: 10 peers, 10k events.
-#[tokio::test]
-#[ignore]
-async fn chain_10_peers_10k() {
+async fn ten_hop_chain_10k() {
     run_chain_bench(10, 10_000).await;
 }
 
-/// Chain primary: 10 peers, 50k events.
+/// 10-hop chain: 10 peers, 50k events.
 #[tokio::test]
 #[ignore]
-async fn chain_10_peers_50k() {
+async fn ten_hop_chain_50k() {
     run_chain_bench(10, 50_000).await;
 }
 
