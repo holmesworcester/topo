@@ -519,13 +519,14 @@ Projectors must not access the database directly. Fields include:
 
 - `trust_anchor_workspace_id` — trust anchor for this tenant
 - `target_message_author` / `target_tombstone_author` — for deletion auth
-- `deletion_intent` — pre-existing deletion intent (for delete-before-create convergence)
+- `deletion_intents` — pre-existing deletion intents (for delete-before-create convergence)
 - `target_message_deleted` — for reaction skip-on-delete
 - `recipient_removed` — for SecretShared removal exclusion
 - `file_descriptors` / `existing_file_slice` — for FileSlice authorization
-- `secret_key_bytes` — for Encrypted event decryption
 - `bootstrap_context` — local bootstrap context (addr + SPKI) for invite trust materialization
 - `is_local_create` — whether the event was locally created (from `recorded_events.source`); gates `WritePendingBootstrapTrust` emission so only the invite creator materializes pending trust
+
+Encrypted key resolution/decryption is handled in the encrypted-wrapper stage (`projection/encrypted.rs`), not via `ContextSnapshot`.
 
 ### Command/effect execution stage semantics
 

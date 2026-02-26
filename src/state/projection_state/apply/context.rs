@@ -242,19 +242,5 @@ pub(crate) fn build_context_snapshot(
         };
     }
 
-    // Encrypted context — secret key bytes
-    if let ParsedEvent::Encrypted(enc) = parsed {
-        let key_b64 = event_id_to_base64(&enc.key_event_id);
-        ctx.secret_key_bytes = match conn.query_row(
-            "SELECT key_bytes FROM secret_keys WHERE recorded_by = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, &key_b64],
-            |row| row.get::<_, Vec<u8>>(0),
-        ) {
-            Ok(k) => Some(k),
-            Err(rusqlite::Error::QueryReturnedNoRows) => None,
-            Err(e) => return Err(e.into()),
-        };
-    }
-
     Ok(ctx)
 }

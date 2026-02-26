@@ -189,9 +189,6 @@ pub struct ContextSnapshot {
     /// For FileSlice: existing slice info (event_id, descriptor_event_id) if slot occupied.
     pub existing_file_slice: Option<(String, String)>,
 
-    /// For Encrypted: the decryption key bytes (if secret_key is available).
-    pub secret_key_bytes: Option<Vec<u8>>,
-
     /// For invite events (UserInviteBoot, DeviceInviteFirst, InviteAccepted):
     /// local bootstrap context if available. Populated from `bootstrap_context`
     /// table so projectors can emit trust writes without the service layer.
