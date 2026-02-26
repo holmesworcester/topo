@@ -1,3 +1,12 @@
+//! Shared queue primitives for DB-backed runtime queues.
+//!
+//! This module centralizes logic reused by queue implementations:
+//! - `src/state/db/project_queue.rs` (projection retry/lease workflow)
+//! - `src/state/db/egress_queue.rs` (egress enqueue/send timestamps)
+//!
+//! Keeping these helpers here ensures retry timing and queue-health reporting
+//! stay consistent when multiple queues evolve.
+
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const BACKOFF_BASE_MS: i64 = 1000;
@@ -25,6 +34,9 @@ pub fn backoff_ms(attempts: i64) -> i64 {
 }
 
 /// Recover expired leases on a given table by clearing lease_until.
+///
+/// Currently used by `ProjectQueue::recover_expired` to re-expose rows
+/// that were claimed but never acknowledged (for example after a crash).
 /// Returns the number of rows recovered.
 pub fn recover_expired_leases(
     conn: &rusqlite::Connection,
