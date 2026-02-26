@@ -25,35 +25,38 @@ fn peak_rss_mib() -> f64 {
     0.0
 }
 
-/// 50k one-way sync: generate on one side, sync to empty peer.
-/// Reports MB/s, events/s, wall time, and peak memory.
+/// 50k one-way sync: generate on one side, sync until all 50k messages
+/// are projected on the receiving peer. Reports msgs/s, wall time,
+/// and peak memory.
 #[tokio::test]
 async fn perf_sync_50k() {
+    const N: i64 = 50_000;
+
     let alice = Peer::new_with_identity("alice");
-    let bob = Peer::new_with_identity("bob");
+    let bob = Peer::new_in_workspace("bob", &alice).await;
 
     let gen_start = Instant::now();
-    alice.batch_create_messages(50_000);
+    alice.batch_create_messages(N as usize);
     let gen_secs = gen_start.elapsed().as_secs_f64();
-    eprintln!("Generated 50k events in {:.2}s", gen_secs);
+    eprintln!("Generated {N} messages in {gen_secs:.2}s");
 
     let rss_before = peak_rss_mib();
 
-    let sample = alice.sample_event_ids(1)[0].clone();
     let metrics = sync_until_converged(
-        &alice, &bob, || bob.has_event(&sample), Duration::from_secs(300),
+        &alice, &bob, || bob.message_count() == N, Duration::from_secs(300),
     ).await;
 
     let rss_after = peak_rss_mib();
 
-    assert_eq!(alice.message_count(), 50_000);
+    assert_eq!(bob.message_count(), N);
+
+    let msgs_per_sec = N as f64 / metrics.wall_secs;
 
     eprintln!();
     eprintln!("=== 50k one-way sync ===");
     eprintln!("  Wall time:    {:.2}s", metrics.wall_secs);
-    eprintln!("  Events:       {}", metrics.events_transferred);
-    eprintln!("  Events/s:     {:.0}", metrics.events_per_sec);
-    eprintln!("  Throughput:   {:.2} MiB/s", metrics.throughput_mib_s);
+    eprintln!("  Messages:     {N}");
+    eprintln!("  Msgs/s:       {msgs_per_sec:.0}");
     eprintln!("  Peak RSS:     {:.1} MiB (before: {:.1}, after: {:.1})",
         rss_after, rss_before, rss_after);
     eprintln!();
