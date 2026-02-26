@@ -72,6 +72,35 @@ pub fn encode_invite_accepted(event: &ParsedEvent) -> Result<Vec<u8>, EventError
 
 use crate::crypto::event_id_to_base64;
 use crate::projection::result::{ContextSnapshot, EmitCommand, ProjectorResult, SqlVal, WriteOp};
+use rusqlite::Connection;
+
+pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS invite_accepted (
+            recorded_by TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            invite_event_id TEXT NOT NULL,
+            workspace_id TEXT NOT NULL,
+            PRIMARY KEY (recorded_by, event_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS trust_anchors (
+            peer_id TEXT NOT NULL PRIMARY KEY,
+            workspace_id TEXT NOT NULL
+        );
+        ",
+    )?;
+    Ok(())
+}
+
+pub fn identity_rebind_recorded_by_tables() -> &'static [&'static str] {
+    &["invite_accepted"]
+}
+
+pub fn identity_rebind_peer_id_tables() -> &'static [&'static str] {
+    &["trust_anchors"]
+}
 
 /// Pure projector: InviteAccepted — local trust-anchor binding.
 ///

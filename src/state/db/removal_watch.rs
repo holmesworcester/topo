@@ -10,7 +10,7 @@
 
 use rusqlite::Connection;
 
-use crate::transport::cert::spki_fingerprint_from_ed25519_pubkey;
+use crate::crypto::spki_fingerprint_from_ed25519_pubkey;
 
 /// Check whether a peer identified by hex SPKI fingerprint has been removed.
 ///
@@ -120,7 +120,7 @@ pub fn removed_peer_spki_fingerprints(
 mod tests {
     use super::*;
     use crate::db::{open_in_memory, schema::create_tables};
-    use crate::transport::cert::spki_fingerprint_from_ed25519_pubkey;
+    use crate::crypto::spki_fingerprint_from_ed25519_pubkey;
 
     #[test]
     fn test_is_peer_removed_false_when_no_removal() {

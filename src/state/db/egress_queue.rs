@@ -7,6 +7,33 @@ pub struct EgressQueue<'a> {
     conn: &'a Connection,
 }
 
+pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS egress_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            connection_id TEXT NOT NULL,
+            frame_type TEXT NOT NULL DEFAULT 'event',
+            event_id BLOB,
+            payload BLOB,
+            enqueued_at INTEGER NOT NULL,
+            available_at INTEGER NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            lease_until INTEGER,
+            sent_at INTEGER,
+            dedupe_key TEXT
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_egress_pending_event
+            ON egress_queue(connection_id, event_id)
+            WHERE frame_type = 'event' AND sent_at IS NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_egress_dedupe
+            ON egress_queue(dedupe_key)
+            WHERE dedupe_key IS NOT NULL AND sent_at IS NULL;
+        ",
+    )?;
+    Ok(())
+}
+
 impl<'a> EgressQueue<'a> {
     pub fn new(conn: &'a Connection) -> Self {
         Self { conn }

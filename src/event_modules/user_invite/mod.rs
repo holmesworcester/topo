@@ -8,3 +8,23 @@ pub use wire::{
     parse_user_invite_ongoing, UserInviteBootEvent, UserInviteOngoingEvent, USER_INVITE_BOOT_META,
     USER_INVITE_BOOT_WIRE_SIZE, USER_INVITE_ONGOING_META, USER_INVITE_ONGOING_WIRE_SIZE,
 };
+
+use rusqlite::Connection;
+
+pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS user_invites (
+            recorded_by TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            public_key BLOB NOT NULL,
+            PRIMARY KEY (recorded_by, event_id)
+        );
+        ",
+    )?;
+    Ok(())
+}
+
+pub fn identity_rebind_recorded_by_tables() -> &'static [&'static str] {
+    &["user_invites"]
+}

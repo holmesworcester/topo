@@ -69,6 +69,27 @@ pub fn encode_transport_key(event: &ParsedEvent) -> Result<Vec<u8>, EventError> 
 // === Projector (event-module locality) ===
 
 use crate::projection::result::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
+use rusqlite::Connection;
+
+pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS transport_keys (
+            recorded_by TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            spki_fingerprint BLOB NOT NULL,
+            PRIMARY KEY (recorded_by, event_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_transport_keys_spki
+            ON transport_keys(recorded_by, spki_fingerprint);
+        ",
+    )?;
+    Ok(())
+}
+
+pub fn identity_rebind_recorded_by_tables() -> &'static [&'static str] {
+    &["transport_keys"]
+}
 
 /// Pure projector: TransportKey → transport_keys table.
 pub fn project_pure(
@@ -110,8 +131,6 @@ pub static TRANSPORT_KEY_META: EventTypeMeta = EventTypeMeta {
 };
 
 // === Query APIs (event-module locality) ===
-
-use rusqlite::Connection;
 
 pub fn count(
     db: &Connection,

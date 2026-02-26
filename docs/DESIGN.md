@@ -517,7 +517,7 @@ Durable trust/identity authority transitions are eventized (InviteAccepted, Peer
 
 ## 3.3 Table lifecycle and naming
 
-1. schema creation runs through ordered migrations, <!-- Do we still care about migrations in the poc or should we call them out of scope? -->
+1. startup schema is epoch-only: `ensure_schema_epoch` + `ensure_all_schema`,
 2. no `schema_migrations` table or versioned migration runner is required in active startup/operation,
 3. each owner module defines its own idempotent `ensure_schema(conn)` (event projection tables in `event_modules/*`, queue/infra tables in `state/db/*`),
 4. central bootstrap calls owner `ensure_schema` in deterministic order,

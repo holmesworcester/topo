@@ -64,6 +64,26 @@ pub fn encode_secret_key(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
 // === Projector (event-module locality) ===
 
 use crate::projection::result::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
+use rusqlite::Connection;
+
+pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS secret_keys (
+            event_id TEXT NOT NULL,
+            key_bytes BLOB NOT NULL,
+            created_at INTEGER NOT NULL,
+            recorded_by TEXT NOT NULL,
+            PRIMARY KEY (recorded_by, event_id)
+        );
+        ",
+    )?;
+    Ok(())
+}
+
+pub fn identity_rebind_recorded_by_tables() -> &'static [&'static str] {
+    &["secret_keys"]
+}
 
 /// Pure projector: SecretKey → secret_keys table insert.
 pub fn project_pure(

@@ -23,6 +23,7 @@ pub mod user_removed;
 pub mod workspace;
 
 use std::sync::OnceLock;
+use rusqlite::Connection;
 
 pub use admin::{AdminBootEvent, AdminOngoingEvent};
 pub use bench_dep::BenchDepEvent;
@@ -76,6 +77,58 @@ pub const EVENT_TYPE_LOCAL_SIGNER_SECRET: u8 = 27;
 
 /// Max event blob size: 1 MiB
 pub const EVENT_MAX_BLOB_BYTES: usize = 1024 * 1024;
+
+pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
+    workspace::ensure_schema(conn)?;
+    invite_accepted::ensure_schema(conn)?;
+    user_invite::ensure_schema(conn)?;
+    device_invite::ensure_schema(conn)?;
+    user::ensure_schema(conn)?;
+    peer_shared::ensure_schema(conn)?;
+    admin::ensure_schema(conn)?;
+    peer_removed::ensure_schema(conn)?;
+    message::ensure_schema(conn)?;
+    reaction::ensure_schema(conn)?;
+    message_deletion::ensure_schema(conn)?;
+    message_attachment::ensure_schema(conn)?;
+    file_slice::ensure_schema(conn)?;
+    signed_memo::ensure_schema(conn)?;
+    secret_key::ensure_schema(conn)?;
+    secret_shared::ensure_schema(conn)?;
+    transport_key::ensure_schema(conn)?;
+    local_signer_secret::ensure_schema(conn)?;
+    Ok(())
+}
+
+pub fn identity_rebind_recorded_by_tables() -> Vec<&'static str> {
+    let mut tables = Vec::new();
+    tables.extend(workspace::identity_rebind_recorded_by_tables());
+    tables.extend(invite_accepted::identity_rebind_recorded_by_tables());
+    tables.extend(user_invite::identity_rebind_recorded_by_tables());
+    tables.extend(device_invite::identity_rebind_recorded_by_tables());
+    tables.extend(user::identity_rebind_recorded_by_tables());
+    tables.extend(peer_shared::identity_rebind_recorded_by_tables());
+    tables.extend(admin::identity_rebind_recorded_by_tables());
+    tables.extend(peer_removed::identity_rebind_recorded_by_tables());
+    tables.extend(message::identity_rebind_recorded_by_tables());
+    tables.extend(reaction::identity_rebind_recorded_by_tables());
+    tables.extend(message_deletion::identity_rebind_recorded_by_tables());
+    tables.extend(message_attachment::identity_rebind_recorded_by_tables());
+    tables.extend(file_slice::identity_rebind_recorded_by_tables());
+    tables.extend(signed_memo::identity_rebind_recorded_by_tables());
+    tables.extend(secret_key::identity_rebind_recorded_by_tables());
+    tables.extend(secret_shared::identity_rebind_recorded_by_tables());
+    tables.extend(transport_key::identity_rebind_recorded_by_tables());
+    tables.extend(local_signer_secret::identity_rebind_recorded_by_tables());
+    tables
+}
+
+pub fn identity_rebind_peer_id_tables() -> Vec<&'static str> {
+    let mut tables = Vec::new();
+    tables.extend(invite_accepted::identity_rebind_peer_id_tables());
+    tables.extend(file_slice::identity_rebind_peer_id_tables());
+    tables
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParsedEvent {

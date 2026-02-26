@@ -94,6 +94,27 @@ pub fn encode_secret_shared(event: &ParsedEvent) -> Result<Vec<u8>, EventError> 
 
 use crate::crypto::event_id_to_base64;
 use crate::projection::result::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
+use rusqlite::Connection;
+
+pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS secret_shared (
+            recorded_by TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            key_event_id TEXT NOT NULL,
+            recipient_event_id TEXT NOT NULL,
+            wrapped_key BLOB NOT NULL,
+            PRIMARY KEY (recorded_by, event_id)
+        );
+        ",
+    )?;
+    Ok(())
+}
+
+pub fn identity_rebind_recorded_by_tables() -> &'static [&'static str] {
+    &["secret_shared"]
+}
 
 /// Pure projector: SecretShared → secret_shared table.
 /// Rejects if recipient has been removed (InvRemovalExclusion).

@@ -13,3 +13,27 @@ pub use queries::{
     WorkspaceItem, list_items, StatusResponse, status, KeysResponse, keys,
     ViewReaction, ViewMessage, ViewResponse, view, view_for_peer,
 };
+
+use rusqlite::Connection;
+
+pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS workspaces (
+            recorded_by TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            workspace_id TEXT NOT NULL,
+            public_key BLOB NOT NULL,
+            name TEXT,
+            PRIMARY KEY (recorded_by, event_id)
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_workspaces_single_per_peer
+            ON workspaces(recorded_by, workspace_id);
+        ",
+    )?;
+    Ok(())
+}
+
+pub fn identity_rebind_recorded_by_tables() -> &'static [&'static str] {
+    &["workspaces"]
+}

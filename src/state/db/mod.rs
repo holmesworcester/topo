@@ -1,7 +1,6 @@
 pub mod egress_queue;
 pub mod health;
 pub mod intro;
-pub mod migrations;
 pub mod project_queue;
 pub mod queue;
 pub mod removal_watch;
@@ -61,6 +60,33 @@ fn apply_pragmas(conn: &Connection) -> SqliteResult<()> {
 
 use crate::tuning::low_mem_mode;
 
+pub fn ensure_infra_schema(conn: &Connection) -> SqliteResult<()> {
+    wanted::ensure_schema(conn)?;
+    store::ensure_schema(conn)?;
+    project_queue::ensure_schema(conn)?;
+    egress_queue::ensure_schema(conn)?;
+    health::ensure_schema(conn)?;
+    intro::ensure_schema(conn)?;
+    transport_trust::ensure_schema(conn)?;
+    transport_creds::ensure_schema(conn)?;
+    Ok(())
+}
+
+fn identity_rebind_recorded_by_tables() -> Vec<&'static str> {
+    let mut tables = crate::event_modules::identity_rebind_recorded_by_tables();
+    tables.extend(health::identity_rebind_recorded_by_tables());
+    tables.extend(intro::identity_rebind_recorded_by_tables());
+    tables.extend(transport_trust::identity_rebind_recorded_by_tables());
+    tables
+}
+
+fn identity_rebind_peer_id_tables() -> Vec<&'static str> {
+    let mut tables = crate::event_modules::identity_rebind_peer_id_tables();
+    tables.extend(project_queue::identity_rebind_peer_id_tables());
+    tables.extend(store::identity_rebind_peer_id_tables());
+    tables
+}
+
 /// Finalize identity by rebinding all `recorded_by` / `peer_id` references from
 /// `old` to `new` across projection, trust, and pipeline tables in one transaction.
 /// This is used when a joiner transitions from invite-derived transport identity
@@ -74,55 +100,11 @@ pub fn finalize_identity(conn: &Connection, old: &str, new: &str) -> Result<(), 
     // preventing partial state on constraint errors.
     let tx = conn.unchecked_transaction()?;
 
-    // Projection tables (recorded_by column)
-    for table in &[
-        "workspaces",
-        "invite_accepted",
-        "user_invites",
-        "device_invites",
-        "users",
-        "peers_shared",
-        "admins",
-        "removed_entities",
-        "secret_shared",
-        "transport_keys",
-        "peer_transport_bindings",
-        "messages",
-        "reactions",
-        "signed_memos",
-        "secret_keys",
-        "deleted_messages",
-        "deletion_intents",
-        "message_attachments",
-        "file_slices",
-        "intro_attempts",
-        "peer_endpoint_observations",
-        "local_signer_material",
-    ] {
+    for table in identity_rebind_recorded_by_tables() {
         update_identity_column_lossy(&tx, table, "recorded_by", old, new)?;
     }
 
-    // Trust tables (recorded_by column)
-    update_identity_column_lossy(&tx, "invite_bootstrap_trust", "recorded_by", old, new)?;
-    update_identity_column_lossy(
-        &tx,
-        "pending_invite_bootstrap_trust",
-        "recorded_by",
-        old,
-        new,
-    )?;
-    update_identity_column_lossy(&tx, "bootstrap_context", "recorded_by", old, new)?;
-
-    // Pipeline tables (peer_id column)
-    for table in &[
-        "valid_events",
-        "rejected_events",
-        "blocked_event_deps",
-        "blocked_events",
-        "project_queue",
-        "trust_anchors",
-        "recorded_events",
-    ] {
+    for table in identity_rebind_peer_id_tables() {
         update_identity_column_lossy(&tx, table, "peer_id", old, new)?;
     }
 

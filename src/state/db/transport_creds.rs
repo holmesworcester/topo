@@ -1,6 +1,20 @@
 use rusqlite::Connection;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS local_transport_creds (
+            peer_id TEXT PRIMARY KEY,
+            cert_der BLOB NOT NULL,
+            key_der BLOB NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+        ",
+    )?;
+    Ok(())
+}
+
 /// Store TLS cert/key DER blobs for a local peer identity.
 pub fn store_local_creds(
     conn: &Connection,

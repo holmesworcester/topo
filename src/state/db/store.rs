@@ -12,6 +12,55 @@ pub const SQL_INSERT_RECORDED_EVENT: &str =
     "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
      VALUES (?1, ?2, ?3, ?4)";
 
+pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS events (
+            event_id TEXT PRIMARY KEY,
+            event_type TEXT NOT NULL,
+            blob BLOB NOT NULL,
+            share_scope TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            inserted_at INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS recorded_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            peer_id TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            recorded_at INTEGER NOT NULL,
+            source TEXT NOT NULL,
+            UNIQUE(peer_id, event_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_recorded_peer_order ON recorded_events(peer_id, id);
+
+        CREATE TABLE IF NOT EXISTS neg_items (
+            workspace_id TEXT NOT NULL DEFAULT '',
+            ts INTEGER NOT NULL,
+            id BLOB NOT NULL,
+            PRIMARY KEY (workspace_id, ts, id)
+        ) WITHOUT ROWID;
+
+        CREATE TABLE IF NOT EXISTS neg_blocks (
+            block_idx INTEGER PRIMARY KEY,
+            ts INTEGER NOT NULL,
+            id BLOB NOT NULL,
+            count INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS neg_meta (
+            key TEXT PRIMARY KEY,
+            value INTEGER NOT NULL
+        );
+        ",
+    )?;
+    Ok(())
+}
+
+pub fn identity_rebind_peer_id_tables() -> &'static [&'static str] {
+    &["recorded_events"]
+}
+
 pub fn parse_share_scope(scope: &str) -> Option<ShareScope> {
     match scope {
         "shared" => Some(ShareScope::Shared),
