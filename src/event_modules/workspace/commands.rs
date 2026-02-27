@@ -13,7 +13,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::SigningKey;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::{EventId, event_id_from_base64, event_id_to_base64};
@@ -87,12 +87,50 @@ pub fn create_workspace(
     username: &str,
     device_name: &str,
 ) -> Result<CreateWorkspaceResult, Box<dyn std::error::Error + Send + Sync>> {
-    // Idempotent check: if identity already exists, return it
+    // Idempotent check: if identity already exists, return it.
+    // Check the input recorded_by first, then fall back to any signer_kind=3
+    // entry (covers pre-derived workspaces where recorded_by ≠ derived_peer_id).
     if let Some((eid, signing_key)) = load_local_peer_signer(db, recorded_by)? {
         let workspace_id = db
             .query_row(
                 "SELECT workspace_id FROM trust_anchors WHERE peer_id = ?1",
                 rusqlite::params![recorded_by],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|b64| crate::crypto::event_id_from_base64(&b64))
+            .unwrap_or([0u8; 32]);
+        return Ok(CreateWorkspaceResult {
+            workspace_id,
+            peer_shared_event_id: eid,
+            peer_shared_key: signing_key,
+        });
+    }
+    // Broader check: any PeerShared signer exists (recorded_by may differ
+    // from input after pre-derive generates a derived identity).
+    if let Some((actual_rb, eid, signing_key)) = db
+        .query_row(
+            "SELECT l.recorded_by, l.signer_event_id, l.private_key
+             FROM local_signer_material l
+             INNER JOIN peers_shared p
+               ON p.recorded_by = l.recorded_by AND p.event_id = l.signer_event_id
+             WHERE l.signer_kind = 3
+             LIMIT 1",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Vec<u8>>(2)?)),
+        )
+        .optional()?
+    {
+        let key_arr: [u8; 32] = signing_key
+            .try_into()
+            .map_err(|_| "bad signing key length in local signer table".to_string())?;
+        let signing_key = SigningKey::from_bytes(&key_arr);
+        let eid = crate::crypto::event_id_from_base64(&eid)
+            .ok_or_else(|| "bad local peer signer event_id".to_string())?;
+        let workspace_id = db
+            .query_row(
+                "SELECT workspace_id FROM trust_anchors WHERE peer_id = ?1",
+                rusqlite::params![actual_rb],
                 |row| row.get::<_, String>(0),
             )
             .ok()
