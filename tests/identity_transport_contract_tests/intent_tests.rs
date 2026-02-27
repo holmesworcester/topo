@@ -16,6 +16,34 @@ fn setup_db() -> rusqlite::Connection {
 // --- Concrete adapter tests ---
 
 #[test]
+fn concrete_adapter_install_bootstrap_from_invite_key_roundtrip() {
+    let conn = setup_db();
+    let adapter = ConcreteTransportIdentityAdapter;
+    let key_bytes = [7u8; 32];
+
+    let peer_id = adapter
+        .apply_intent(
+            &conn,
+            TransportIdentityIntent::InstallBootstrapIdentityFromInviteKey {
+                invite_private_key: key_bytes,
+            },
+        )
+        .unwrap();
+
+    // Verify deterministic: same key -> same peer_id.
+    let peer_id2 = adapter
+        .apply_intent(
+            &conn,
+            TransportIdentityIntent::InstallBootstrapIdentityFromInviteKey {
+                invite_private_key: key_bytes,
+            },
+        )
+        .unwrap();
+    assert_eq!(peer_id, peer_id2);
+    assert_eq!(peer_id.len(), 64, "peer_id should be 32-byte hex");
+}
+
+#[test]
 fn concrete_adapter_install_peer_shared_from_signer() {
     let conn = setup_db();
     let adapter = ConcreteTransportIdentityAdapter;
@@ -98,7 +126,11 @@ fn concrete_adapter_invalid_key_material_error() {
     assert!(result.is_err());
     match result.unwrap_err() {
         TransportIdentityError::InvalidKeyMaterial(msg) => {
-            assert!(msg.contains("16"), "should mention actual key length, got: {}", msg);
+            assert!(
+                msg.contains("16"),
+                "should mention actual key length, got: {}",
+                msg
+            );
         }
         other => panic!("expected InvalidKeyMaterial, got {:?}", other),
     }
@@ -113,9 +145,8 @@ fn fake_adapter_records_intents() {
 
     fake.apply_intent(
         &conn,
-        TransportIdentityIntent::InstallPeerSharedIdentityFromSigner {
-            recorded_by: "rb1".to_string(),
-            signer_event_id: [1u8; 32],
+        TransportIdentityIntent::InstallBootstrapIdentityFromInviteKey {
+            invite_private_key: [1u8; 32],
         },
     )
     .unwrap();
@@ -129,13 +160,21 @@ fn fake_adapter_records_intents() {
     )
     .unwrap();
 
+    fake.apply_intent(
+        &conn,
+        TransportIdentityIntent::InstallPeerSharedIdentityFromSigner {
+            recorded_by: "rb3".to_string(),
+            signer_event_id: [3u8; 32],
+        },
+    )
+    .unwrap();
+
     let intents = fake.applied_intents();
-    assert_eq!(intents.len(), 2);
+    assert_eq!(intents.len(), 3);
     assert_eq!(
         intents[0],
-        TransportIdentityIntent::InstallPeerSharedIdentityFromSigner {
-            recorded_by: "rb1".to_string(),
-            signer_event_id: [1u8; 32],
+        TransportIdentityIntent::InstallBootstrapIdentityFromInviteKey {
+            invite_private_key: [1u8; 32],
         }
     );
     assert_eq!(
@@ -143,6 +182,13 @@ fn fake_adapter_records_intents() {
         TransportIdentityIntent::InstallPeerSharedIdentityFromSigner {
             recorded_by: "rb2".to_string(),
             signer_event_id: [2u8; 32],
+        }
+    );
+    assert_eq!(
+        intents[2],
+        TransportIdentityIntent::InstallPeerSharedIdentityFromSigner {
+            recorded_by: "rb3".to_string(),
+            signer_event_id: [3u8; 32],
         }
     );
 }
@@ -155,9 +201,8 @@ fn fake_adapter_returns_configured_peer_id() {
     let result = fake
         .apply_intent(
             &conn,
-            TransportIdentityIntent::InstallPeerSharedIdentityFromSigner {
-                recorded_by: "rb".to_string(),
-                signer_event_id: [0u8; 32],
+            TransportIdentityIntent::InstallBootstrapIdentityFromInviteKey {
+                invite_private_key: [0u8; 32],
             },
         )
         .unwrap();

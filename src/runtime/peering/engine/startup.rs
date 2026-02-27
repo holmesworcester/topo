@@ -76,12 +76,18 @@ pub(crate) fn setup_endpoint_and_tenants(
             }
         };
         let expected_peer_id = hex::encode(fp);
-        if expected_peer_id != tenant.peer_id {
+        if expected_peer_id != tenant.transport_peer_id {
             error!(
-                "SPKI mismatch for tenant {}: cert yields {}",
-                tenant.peer_id, expected_peer_id
+                "SPKI mismatch for tenant {} transport identity {}: cert yields {}",
+                tenant.peer_id, tenant.transport_peer_id, expected_peer_id
             );
             continue;
+        }
+        if tenant.transport_peer_id != tenant.peer_id {
+            warn!(
+                "Tenant {} using transitional transport identity {} (bootstrap pre-derive)",
+                tenant.peer_id, tenant.transport_peer_id
+            );
         }
 
         let cert_der = rustls::pki_types::CertificateDer::from(tenant.cert_der.clone());

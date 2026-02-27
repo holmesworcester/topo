@@ -231,16 +231,9 @@ async fn connect_loop_inner(
             shared_ingest.clone(),
         );
 
-        // Resolve tenant identity once per connection (not per session).
-        // Identity transitions only happen during discrete CLI commands
-        // (create_workspace, accept_invite), never during active sync.
-        let current_rb = if let Ok(db) = open_connection(db_path) {
-            crate::transport::identity::load_transport_peer_id(&db)
-                .unwrap_or_else(|_| recorded_by.to_string())
-        } else {
-            recorded_by.to_string()
-        };
-        let tenant_resolver = SessionTenantResolver::Fixed(current_rb);
+        // Keep session scope pinned to the planner-assigned tenant.
+        // Transport cert rotation can lag tenant scoping during bootstrap.
+        let tenant_resolver = SessionTenantResolver::Fixed(recorded_by.to_string());
         supervise_connection_sessions(
             db_path,
             &peer_id,

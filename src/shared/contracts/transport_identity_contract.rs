@@ -12,6 +12,9 @@ use rusqlite::Connection;
 /// materialise into cert/key state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransportIdentityIntent {
+    /// Install a deterministic transport cert derived from the invite signing
+    /// key for invite bootstrap handshakes.
+    InstallBootstrapIdentityFromInviteKey { invite_private_key: [u8; 32] },
     /// Install a deterministic transport cert derived from the PeerShared
     /// signing key, replacing any prior identity (random or invite-derived).
     InstallPeerSharedIdentityFromSigner {

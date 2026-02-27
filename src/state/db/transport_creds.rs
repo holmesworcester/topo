@@ -56,11 +56,9 @@ pub fn load_local_creds(
 pub fn load_sole_local_creds(
     conn: &Connection,
 ) -> Result<Option<(String, Vec<u8>, Vec<u8>)>, Box<dyn std::error::Error + Send + Sync>> {
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM local_transport_creds",
-        [],
-        |row| row.get(0),
-    )?;
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM local_transport_creds", [], |row| {
+        row.get(0)
+    })?;
     if count == 0 {
         return Ok(None);
     }
@@ -68,7 +66,8 @@ pub fn load_sole_local_creds(
         return Err(format!(
             "Multiple local identities found ({}). Multi-tenant is handled automatically.",
             count
-        ).into());
+        )
+        .into());
     }
     match conn.query_row(
         "SELECT peer_id, cert_der, key_der FROM local_transport_creds LIMIT 1",
@@ -102,6 +101,7 @@ pub fn list_local_peers(
 pub struct TenantInfo {
     pub peer_id: String,
     pub workspace_id: String,
+    pub transport_peer_id: String,
     pub cert_der: Vec<u8>,
     pub key_der: Vec<u8>,
 }
@@ -109,21 +109,58 @@ pub struct TenantInfo {
 pub fn discover_local_tenants(
     conn: &Connection,
 ) -> Result<Vec<TenantInfo>, Box<dyn std::error::Error + Send + Sync>> {
+    // Normal case: trust anchor and transport identity already converged.
     let mut stmt = conn.prepare(
-        "SELECT t.peer_id, t.workspace_id, c.cert_der, c.key_der
+        "SELECT t.peer_id, t.workspace_id, c.peer_id, c.cert_der, c.key_der
          FROM trust_anchors t
          JOIN local_transport_creds c ON t.peer_id = c.peer_id",
     )?;
-    let tenants = stmt
+    let mut tenants = stmt
         .query_map([], |row| {
             Ok(TenantInfo {
                 peer_id: row.get(0)?,
                 workspace_id: row.get(1)?,
-                cert_der: row.get(2)?,
-                key_der: row.get(3)?,
+                transport_peer_id: row.get(2)?,
+                cert_der: row.get(3)?,
+                key_der: row.get(4)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
+
+    if !tenants.is_empty() {
+        return Ok(tenants);
+    }
+
+    // Transitional bootstrap fallback:
+    // invite acceptance pre-derives tenant peer_id before bootstrap sync, while
+    // the local transport cert may still be invite-derived until projection
+    // installs the PeerShared-derived cert.
+    let trust_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM trust_anchors", [], |row| row.get(0))?;
+    let creds_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM local_transport_creds", [], |row| {
+            row.get(0)
+        })?;
+    if trust_count == 1 && creds_count == 1 {
+        let (tenant_peer_id, workspace_id): (String, String) = conn.query_row(
+            "SELECT peer_id, workspace_id FROM trust_anchors LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let (transport_peer_id, cert_der, key_der): (String, Vec<u8>, Vec<u8>) = conn.query_row(
+            "SELECT peer_id, cert_der, key_der FROM local_transport_creds LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        tenants.push(TenantInfo {
+            peer_id: tenant_peer_id,
+            workspace_id,
+            transport_peer_id,
+            cert_der,
+            key_der,
+        });
+    }
+
     Ok(tenants)
 }
 
@@ -178,8 +215,11 @@ mod tests {
         store_local_creds(&conn, "peer2", b"c2", b"k2").unwrap();
 
         let err = load_sole_local_creds(&conn).unwrap_err();
-        assert!(err.to_string().contains("Multiple local identities"),
-            "should reject ambiguous multi-tenant DB, got: {}", err);
+        assert!(
+            err.to_string().contains("Multiple local identities"),
+            "should reject ambiguous multi-tenant DB, got: {}",
+            err
+        );
     }
 
     #[test]
@@ -231,6 +271,7 @@ mod tests {
         assert_eq!(tenants.len(), 1);
         assert_eq!(tenants[0].peer_id, "peer1");
         assert_eq!(tenants[0].workspace_id, "ws1");
+        assert_eq!(tenants[0].transport_peer_id, "peer1");
 
         // Trust anchor without creds should not appear
         conn.execute(
@@ -243,5 +284,24 @@ mod tests {
         // Add creds for peer2
         store_local_creds(&conn, "peer2", b"cert2", b"key2").unwrap();
         assert_eq!(discover_local_tenants(&conn).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_discover_local_tenants_transitional_fallback() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO trust_anchors (peer_id, workspace_id) VALUES ('derived_peer', 'ws1')",
+            [],
+        )
+        .unwrap();
+        store_local_creds(&conn, "invite_peer", b"cert1", b"key1").unwrap();
+
+        let tenants = discover_local_tenants(&conn).unwrap();
+        assert_eq!(tenants.len(), 1);
+        assert_eq!(tenants[0].peer_id, "derived_peer");
+        assert_eq!(tenants[0].transport_peer_id, "invite_peer");
+        assert_eq!(tenants[0].workspace_id, "ws1");
     }
 }
