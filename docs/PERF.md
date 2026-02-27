@@ -4,7 +4,7 @@
 
 ## Test Environment
 - SQLite on disk (WAL mode, NORMAL sync)
-- In-process sim transport (no real QUIC sockets)
+- QUIC transport (localhost, certificate-pinned)
 - 512-byte envelopes
 - Linux x86_64, release build
 
@@ -26,7 +26,7 @@ cargo test --release --test sync_graph_test -- --nocapture --include-ignored --t
 cargo test --release --test low_mem_test -- --nocapture
 ```
 
-## Results (2026-02-26)
+## Results (2026-02-27)
 
 ### Core Sync (`perf_test.rs`)
 
@@ -36,12 +36,11 @@ Each peer generates 5k events, syncs both directions.
 
 | Metric | Value |
 |--------|-------|
-| Event generation | 0.92s |
-| Sync wall time | 1.22s |
-| Events transferred | 6,199 |
-| Events/s | 5,099 |
-| Throughput | 0.49 MiB/s |
-| Peak RSS | 317.6 MiB |
+| Event generation | 0.82s |
+| Sync wall time | 1.02s |
+| Messages synced | 10,000 |
+| Msgs/s | 9,783 |
+| Peak RSS | 134.8 MiB |
 
 #### 50k one-way sync
 
@@ -49,38 +48,35 @@ One peer generates 50k events, syncs to an empty peer.
 
 | Metric | Value |
 |--------|-------|
-| Event generation | 5.47s |
-| Sync wall time | 1.42s |
-| Events transferred | 2,598 |
-| Events/s | 1,835 |
-| Throughput | 0.18 MiB/s |
-| Peak RSS | 444.4 MiB |
-
-#### 100k one-way sync
-
-| Metric | Value |
-|--------|-------|
-| Event generation | 10.64s |
-| Sync wall time | 17.40s |
-| Events transferred | 76,523 |
-| Events/s | 4,398 |
-| Throughput | 0.42 MiB/s |
-| Peak RSS | 877.2 MiB |
-
-#### 200k one-way sync
-
-| Metric | Value |
-|--------|-------|
-| Event generation | 23.34s |
-| Sync wall time | 17.76s |
-| Events transferred | 36,673 |
-| Events/s | 2,065 |
-| Throughput | 0.20 MiB/s |
-| Peak RSS | 1,241.3 MiB |
+| Event generation | 4.65s |
+| Sync wall time | 6.73s |
+| Messages synced | 50,000 |
+| Msgs/s | 7,431 |
+| Peak RSS | 230.4 MiB |
 
 #### 500k one-way sync
 
-Timed out (>20 min). Convergence not reached within budget.
+One peer generates 500k events, syncs to an empty peer.
+Single session, 62 negentropy rounds (256 KB frame size).
+
+| Metric | Value |
+|--------|-------|
+| Event generation | 47s |
+| Sync wall time | 116s |
+| Messages synced | 500,000 |
+| Msgs/s | 4,300 |
+| Peak RSS | 488.5 MiB |
+
+Throughput profile (receiver-side message count):
+
+| Phase | Events | Time | Msgs/s |
+|-------|--------|------|--------|
+| 0-250k | 250,000 | 31s | 8,065 |
+| 250k-400k | 150,000 | 49s | 3,061 |
+| 400k-500k | 100,000 | 36s | 2,778 |
+
+Tail-phase slowdown is gated by receiver-side batch_writer throughput
+(SQLite insert rate degrades as tables grow).
 
 #### 10k continuous sync (inject while syncing)
 
@@ -89,11 +85,28 @@ in 100-event batches while sync is running.
 
 | Metric | Value |
 |--------|-------|
-| Inject time | 0.73s |
-| Total wall time | 6.40s |
-| Events/s | 1,562 |
-| Throughput | 0.15 MiB/s |
-| Peak RSS | 448.3 MiB |
+| Inject time | 0.57s |
+| Total wall time | 3.60s |
+| Events/s | 2,775 |
+| Throughput | 0.26 MiB/s |
+| Peak RSS | 176.3 MiB |
+
+### Negentropy Frame Size Tuning
+
+Per-round reconciliation cost scales super-linearly with frame size.
+256 KB is the sweet spot: larger frames reduce round count but each
+round takes disproportionately longer.
+
+| Frame Size | Rounds | Reconcile | Wall Time | Msgs/s |
+|------------|--------|-----------|-----------|--------|
+| 64 KB | 245 | 295s | 303s | 1,648 |
+| 128 KB | 123 | 152s | 162s | 3,087 |
+| **256 KB** | **62** | **131s** | **141s** | **3,555** |
+| 512 KB | 31 | 105s | 117s | 4,267 |
+| 1 MB | 16 | 543s | killed | - |
+
+512 KB is ~10% faster on 500k but regresses 50k by ~7%.
+1 MB is catastrophic: 34s/round due to super-linear fingerprint cost.
 
 ### File Attachment Throughput (`file_throughput.rs`)
 
@@ -113,7 +126,7 @@ Multi-peer topology benchmarks. All require `--test-threads=1`.
 
 #### 10-hop chain: 10 peers, 10k events
 
-Events injected at P0, propagate through P0↔P1↔...↔P9.
+Events injected at P0, propagate through P0-P1-...-P9.
 
 | Metric | Value |
 |--------|-------|
@@ -171,11 +184,12 @@ Verifies sync stays within iOS NSE memory budget (24 MiB per instance, 48 MiB pr
 ## Key Design Points
 
 1. **No blob prefetch**: blobs fetched on demand, not cached in memory
-2. **Channel + spawn_blocking**: async network I/O, sync SQLite writes in separate thread
-3. **Batch transactions**: BEGIN/COMMIT around event batches
-4. **Interleaved send/recv**: drain receives before sending to avoid flow control deadlock
-5. **Inline projection**: project in same transaction as store
-6. **Coordinated download**: sink-driven round-based assignment avoids redundant transfers from overlapping sources
+2. **Reconciliation worker thread**: neg.reconcile() runs on a dedicated OS thread so egress drain continues during 100-400ms reconciliation calls
+3. **Immediate egress deletion**: sent items are deleted (not marked) to keep the egress table small during bulk transfers
+4. **Batch transactions**: BEGIN/COMMIT around event batches
+5. **Streaming pull dispatch**: HaveList frames sent during reconciliation rounds, not deferred until reconciliation completes
+6. **Inline projection**: project in same transaction as store
+7. **Coordinated download**: sink-driven round-based assignment avoids redundant transfers from overlapping sources
 
 ## Environment Variables
 
