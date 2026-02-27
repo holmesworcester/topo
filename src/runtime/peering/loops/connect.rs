@@ -231,9 +231,16 @@ async fn connect_loop_inner(
             shared_ingest.clone(),
         );
 
-        let tenant_resolver = SessionTenantResolver::TransportIdentity {
-            fallback: recorded_by.to_string(),
+        // Resolve tenant identity once per connection (not per session).
+        // Identity transitions only happen during discrete CLI commands
+        // (create_workspace, accept_invite), never during active sync.
+        let current_rb = if let Ok(db) = open_connection(db_path) {
+            crate::transport::identity::load_transport_peer_id(&db)
+                .unwrap_or_else(|_| recorded_by.to_string())
+        } else {
+            recorded_by.to_string()
         };
+        let tenant_resolver = SessionTenantResolver::Fixed(current_rb);
         supervise_connection_sessions(
             db_path,
             &peer_id,

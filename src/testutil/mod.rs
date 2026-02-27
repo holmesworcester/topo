@@ -159,14 +159,10 @@ impl Peer {
         let result = create_workspace(&db, &old_identity, "test-workspace", "test-user", "test-device")
             .expect("failed to bootstrap workspace");
 
-        // create_workspace emits LocalSignerSecret events which trigger transport
-        // identity installation. Reload peer_id and finalize identity if changed.
+        // create_workspace pre-derives the PeerShared transport identity and writes
+        // all events under it, so no finalize_identity rewrite is needed.
         let new_identity = crate::transport::identity::load_transport_peer_id(&db)
             .expect("failed to load transport peer_id after create_workspace");
-        if new_identity != old_identity {
-            crate::db::finalize_identity(&db, &old_identity, &new_identity)
-                .expect("identity finalization failed");
-        }
         self.identity = new_identity.clone();
 
         self.workspace_id = result.workspace_id;

@@ -28,22 +28,12 @@ use super::{current_timestamp_ms, drain_batch_size, run_session, shared_ingest_c
 pub(super) enum SessionTenantResolver {
     /// Use a fixed tenant for all sessions on this connection.
     Fixed(String),
-    /// Resolve from transport identity each session; fallback to the provided tenant.
-    TransportIdentity { fallback: String },
 }
 
 impl SessionTenantResolver {
-    fn resolve(&self, db_path: &str) -> String {
+    fn resolve(&self, _db_path: &str) -> String {
         match self {
             Self::Fixed(tenant_id) => tenant_id.clone(),
-            Self::TransportIdentity { fallback } => {
-                if let Ok(db) = open_connection(db_path) {
-                    crate::transport::identity::load_transport_peer_id(&db)
-                        .unwrap_or_else(|_| fallback.clone())
-                } else {
-                    fallback.clone()
-                }
-            }
         }
     }
 }
@@ -151,6 +141,9 @@ pub(super) async fn supervise_connection_sessions(
             }
         };
 
+        let session_start = std::time::Instant::now();
+        info!("Starting session {} ({:?})", session.session_id, direction);
+
         run_session(
             handler,
             session.session_id,
@@ -162,6 +155,8 @@ pub(super) async fn supervise_connection_sessions(
             db_path,
         )
         .await;
+
+        info!("Session {} finished in {}ms", session.session_id, session_start.elapsed().as_millis());
 
         tokio::select! {
             _ = shutdown.cancelled() => {
