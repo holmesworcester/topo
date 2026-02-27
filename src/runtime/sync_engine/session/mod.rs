@@ -31,7 +31,10 @@ pub use responder::run_sync_responder;
 // ---------------------------------------------------------------------------
 
 /// Negentropy frame size limit.
-pub(super) const NEGENTROPY_FRAME_SIZE: u64 = 64 * 1024;
+/// Larger frames pack more range fingerprints per round, reducing round count
+/// at the cost of larger per-round messages. 256 KB cuts 500k-item rounds
+/// from ~245 to ~60.
+pub(super) const NEGENTROPY_FRAME_SIZE: u64 = 256 * 1024;
 
 /// Max event IDs sent per HaveList message during reconciliation.
 pub(super) const HAVE_CHUNK: usize = 1000;
