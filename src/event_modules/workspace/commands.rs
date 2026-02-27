@@ -107,6 +107,17 @@ pub fn create_workspace(
 
     let mut rng = rand::thread_rng();
 
+    // Pre-derive peer_id from PeerShared key so all events are written under
+    // the correct recorded_by from the start (no finalize_identity needed).
+    // Pure crypto derivation — transport cert is installed via projection when
+    // the PeerShared LocalSignerSecret is emitted in step 7.
+    let peer_shared_key = SigningKey::generate(&mut rng);
+    let derived_peer_id = hex::encode(
+        crate::crypto::spki_fingerprint_from_ed25519_pubkey(
+            &peer_shared_key.verifying_key().to_bytes()
+        )
+    );
+
     // 1. Workspace event (unsigned, staged — guard-blocked until trust anchor)
     let workspace_key = SigningKey::generate(&mut rng);
     let ws = ParsedEvent::Workspace(WorkspaceEvent {
@@ -114,7 +125,7 @@ pub fn create_workspace(
         public_key: workspace_key.verifying_key().to_bytes(),
         name: workspace_name.to_string(),
     });
-    let ws_eid = create_event_staged(db, recorded_by, &ws)?;
+    let ws_eid = create_event_staged(db, &derived_peer_id, &ws)?;
 
     // 2. InviteAccepted (local event — binds trust anchor, unblocks workspace)
     let ia = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
@@ -122,8 +133,8 @@ pub fn create_workspace(
         invite_event_id: ws_eid,
         workspace_id: ws_eid,
     });
-    let _ia_eid = create_event_sync(db, recorded_by, &ia)?;
-    project_one(db, recorded_by, &ws_eid)
+    let _ia_eid = create_event_sync(db, &derived_peer_id, &ia)?;
+    project_one(db, &derived_peer_id, &ws_eid)
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
 
     // 3. UserInviteBoot (signed by workspace_key)
@@ -136,7 +147,7 @@ pub fn create_workspace(
         signer_type: 1,
         signature: [0u8; 64],
     });
-    let uib_eid = create_signed_event_sync(db, recorded_by, &uib, &workspace_key)?;
+    let uib_eid = create_signed_event_sync(db, &derived_peer_id, &uib, &workspace_key)?;
 
     // 4. UserBoot (signed by invite_key)
     let user_key = SigningKey::generate(&mut rng);
@@ -148,7 +159,7 @@ pub fn create_workspace(
         signer_type: 2,
         signature: [0u8; 64],
     });
-    let ub_eid = create_signed_event_sync(db, recorded_by, &ub, &invite_key)?;
+    let ub_eid = create_signed_event_sync(db, &derived_peer_id, &ub, &invite_key)?;
 
     // 5. DeviceInviteFirst (signed by user_key)
     let device_invite_key = SigningKey::generate(&mut rng);
@@ -159,10 +170,9 @@ pub fn create_workspace(
         signer_type: 4,
         signature: [0u8; 64],
     });
-    let dif_eid = create_signed_event_sync(db, recorded_by, &dif, &user_key)?;
+    let dif_eid = create_signed_event_sync(db, &derived_peer_id, &dif, &user_key)?;
 
-    // 6. PeerSharedFirst (signed by device_invite_key)
-    let peer_shared_key = SigningKey::generate(&mut rng);
+    // 6. PeerSharedFirst (signed by device_invite_key; key pre-generated above)
     let psf = ParsedEvent::PeerSharedFirst(PeerSharedFirstEvent {
         created_at_ms: now_ms(),
         public_key: peer_shared_key.verifying_key().to_bytes(),
@@ -172,32 +182,27 @@ pub fn create_workspace(
         signer_type: 3,
         signature: [0u8; 64],
     });
-    let psf_eid = create_signed_event_sync(db, recorded_by, &psf, &device_invite_key)?;
+    let psf_eid = create_signed_event_sync(db, &derived_peer_id, &psf, &device_invite_key)?;
 
     // 7. Emit local_signer_secret events for all three signing keys.
-    // PeerShared signer projection may rotate transport identity and finalize
-    // tenant scope; refresh recorded_by before subsequent local writes.
-    let mut scoped_recorded_by = recorded_by.to_string();
+    // Transport identity is already installed, so all writes use derived_peer_id.
     emit_local_signer_secret(
         db,
-        &scoped_recorded_by,
+        &derived_peer_id,
         &psf_eid,
         SIGNER_KIND_PEER_SHARED,
         &peer_shared_key,
     )?;
-    if let Ok(current_peer_id) = crate::transport::identity::load_transport_peer_id(db) {
-        scoped_recorded_by = current_peer_id;
-    }
     emit_local_signer_secret(
         db,
-        &scoped_recorded_by,
+        &derived_peer_id,
         &ub_eid,
         SIGNER_KIND_USER,
         &user_key,
     )?;
     emit_local_signer_secret(
         db,
-        &scoped_recorded_by,
+        &derived_peer_id,
         &ws_eid,
         SIGNER_KIND_WORKSPACE,
         &workspace_key,
@@ -206,7 +211,7 @@ pub fn create_workspace(
     // 8. Seed deterministic local content-key material.
     let _ = ops::ensure_content_key_for_peer(
         db,
-        &scoped_recorded_by,
+        &derived_peer_id,
         &peer_shared_key,
         &psf_eid,
     )?;
@@ -729,24 +734,20 @@ pub fn create_workspace_for_db(
         }
     }
 
-    // Bootstrap new identity chain via workspace command API
-    let bootstrap_rb = format!("bootstrap-{}", now_ms());
+    // Bootstrap new identity chain via workspace command API.
+    // create_workspace pre-derives the PeerShared transport identity and writes
+    // all events under it, so no finalize_identity rewrite is needed.
     let _result = create_workspace(
         &conn,
-        &bootstrap_rb,
+        "bootstrap",
         workspace_name,
         username,
         device_name,
     )?;
-    // Transport identity already installed by projection path: emit_local_signer_secret
-    // for PEER_SHARED triggers ApplyTransportIdentityIntent inside create_workspace.
     let derived = load_transport_peer_id(&conn)
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
             format!("load transport peer id failed: {}", e).into()
         })?;
-    if derived != bootstrap_rb {
-        crate::db::finalize_identity(&conn, &bootstrap_rb, &derived)?;
-    }
 
     let workspaces = super::list_items(&conn, &derived)?;
     let workspace_id = workspaces
