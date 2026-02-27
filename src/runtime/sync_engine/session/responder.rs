@@ -2,6 +2,9 @@
 //!
 //! Handles incoming negentropy reconciliation, serves requested events
 //! from the egress queue, and follows the shutdown protocol (DataDone / DoneAck).
+//!
+//! Reconciliation runs on a dedicated OS thread so the main loop can
+//! continue draining the egress queue during the 100-400ms reconcile() calls.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -61,22 +64,49 @@ where
     );
 
     let db = open_connection(db_path)?;
-    let neg_db = open_connection(db_path)?;
 
     let egress = EgressQueue::new(&db);
     let _ = egress.clear_connection(peer_id);
 
     let ws_id = lookup_workspace_id(&db, recorded_by);
-    let neg_storage = NegentropyStorageSqlite::new(&neg_db, &ws_id);
 
-    neg_db
-        .execute("BEGIN", [])
-        .map_err(|e| format!("Failed to begin snapshot: {}", e))?;
-    neg_storage
-        .rebuild_blocks()
-        .map_err(|e| format!("Failed to rebuild blocks: {}", e))?;
+    // Spawn reconciliation on a dedicated OS thread.
+    // neg_db, neg_storage, neg are !Send (SQLite + RefCell) so they must
+    // live entirely on one thread. The worker receives NegMsg bytes, runs
+    // reconcile(), and sends the response bytes back.
+    let db_path_for_neg = db_path.to_string();
+    let ws_id_for_neg = ws_id.clone();
+    let (neg_req_tx, neg_req_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let (neg_resp_tx, neg_resp_rx) =
+        std::sync::mpsc::channel::<Result<Vec<u8>, String>>();
 
-    let mut neg = Negentropy::new(Storage::Borrowed(&neg_storage), NEGENTROPY_FRAME_SIZE)?;
+    let neg_worker = std::thread::spawn(move || {
+        let neg_db =
+            open_connection(&db_path_for_neg).expect("neg worker: open_connection");
+        let neg_storage = NegentropyStorageSqlite::new(&neg_db, &ws_id_for_neg);
+        neg_db
+            .execute("BEGIN", [])
+            .expect("neg worker: BEGIN");
+        neg_storage
+            .rebuild_blocks()
+            .expect("neg worker: rebuild_blocks");
+
+        let item_count = neg_storage.size().unwrap_or(0);
+        info!("Negentropy storage has {} items (responder)", item_count);
+
+        let mut neg =
+            Negentropy::new(Storage::Borrowed(&neg_storage), NEGENTROPY_FRAME_SIZE)
+                .expect("neg worker: Negentropy::new");
+
+        while let Ok(msg) = neg_req_rx.recv() {
+            let result = neg.reconcile(&msg).map_err(|e| format!("{}", e));
+            if neg_resp_tx.send(result).is_err() {
+                break;
+            }
+        }
+
+        let _ = neg_db.execute("COMMIT", []);
+    });
 
     let store = Store::new(&db);
 
@@ -92,9 +122,6 @@ where
         recorded_by.to_string(),
     );
 
-    let neg_item_count = neg_storage.size().unwrap_or(0);
-    info!("Negentropy storage has {} items (responder)", neg_item_count);
-
     let mut events_sent: u64 = 0;
     let mut bytes_sent: u64 = 0;
     let mut rounds = 0;
@@ -103,6 +130,7 @@ where
     let sync_start = Instant::now();
     let reconcile_start = Instant::now();
     let mut last_bytes_received = 0u64;
+    let mut reconciling = false;
 
     loop {
         // Data receiver runs in a separate task — check if it received data
@@ -120,21 +148,44 @@ where
             break;
         }
 
+        // Check for reconciliation response from worker thread
+        if reconciling {
+            match neg_resp_rx.try_recv() {
+                Ok(Ok(response)) => {
+                    reconciling = false;
+                    last_activity = Instant::now();
+                    if response.is_empty() {
+                        info!(
+                            "Reconciliation complete: {} rounds, {}ms",
+                            rounds,
+                            reconcile_start.elapsed().as_millis()
+                        );
+                    } else {
+                        control.send(&Frame::NegMsg { msg: response }).await?;
+                        control.flush().await?;
+                    }
+                }
+                Ok(Err(e)) => {
+                    return Err(e.into());
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    // Worker still processing — continue draining egress
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    return Err("neg worker disconnected".into());
+                }
+            }
+        }
+
         match tokio::time::timeout(CONTROL_POLL_TIMEOUT, control.recv()).await {
             Ok(Ok(Frame::NegOpen { msg })) | Ok(Ok(Frame::NegMsg { msg })) => {
                 last_activity = Instant::now();
                 rounds += 1;
-
-                let response = neg.reconcile(&msg)?;
-                if response.is_empty() {
-                    info!(
-                        "Reconciliation complete: {} rounds, {}ms",
-                        rounds, reconcile_start.elapsed().as_millis()
-                    );
-                } else {
-                    control.send(&Frame::NegMsg { msg: response }).await?;
-                    control.flush().await?;
-                }
+                // Hand off to worker thread — non-blocking
+                neg_req_tx
+                    .send(msg)
+                    .map_err(|_| "neg worker channel closed".to_string())?;
+                reconciling = true;
             }
             Ok(Ok(Frame::HaveList { ids })) => {
                 last_activity = Instant::now();
@@ -161,6 +212,7 @@ where
             Err(_) => {}
         }
 
+        // Drain egress to data stream — runs even while worker is reconciling
         let send_stats =
             drain_egress_to_data_stream(&egress, &store, peer_id, &mut data_send).await;
         events_sent += send_stats.events_sent_delta;
@@ -173,7 +225,7 @@ where
         // 1. Send DataDone on data stream (signals peer's data receiver)
         // 2. Wait for peer's DataDone to be consumed by our data receiver
         // 3. Only then send DoneAck on control
-        if peer_done {
+        if peer_done && !reconciling {
             let pending_out = egress.count_pending(peer_id).unwrap_or(0);
             if pending_out == 0 {
                 send_data_done(&mut data_send).await?;
@@ -201,7 +253,9 @@ where
         let _ = egress.clear_connection(peer_id);
         let _ = egress.cleanup_sent(EGRESS_SENT_TTL_MS);
     }
-    let _ = neg_db.execute("COMMIT", []);
+    // Drop the request channel to signal the worker to exit
+    drop(neg_req_tx);
+    let _ = neg_worker.join();
     let _ = shutdown_tx.send(());
     let _ = recv_handle.await;
     drop(ingest_tx);
