@@ -71,7 +71,7 @@ where
     for neg_id in need_ids.drain(..) {
         let event_id = neg_id_to_event_id(&neg_id);
         coordinated_need_ids.push(event_id);
-        if wanted.insert(&event_id).unwrap_or(false) {
+        if wanted.insert(&event_id)? {
             batch.push(event_id);
         }
         if batch.len() >= NEED_CHUNK {
@@ -136,24 +136,26 @@ pub async fn dispatch_assigned_need_ids<C>(
     control: &mut C,
     wanted: &WantedEvents<'_>,
     assigned: Vec<EventId>,
-) where
+) -> Result<(), SyncError>
+where
     C: StreamConn,
 {
     let mut batch: Vec<EventId> = Vec::with_capacity(NEED_CHUNK);
     for event_id in assigned {
-        if wanted.insert(&event_id).unwrap_or(false) {
+        if wanted.insert(&event_id)? {
             batch.push(event_id);
         }
         if batch.len() >= NEED_CHUNK {
-            let _ = control.send(&Frame::HaveList { ids: batch }).await;
-            let _ = control.flush().await;
+            control.send(&Frame::HaveList { ids: batch }).await?;
+            control.flush().await?;
             batch = Vec::with_capacity(NEED_CHUNK);
         }
     }
     if !batch.is_empty() {
-        let _ = control.send(&Frame::HaveList { ids: batch }).await;
-        let _ = control.flush().await;
+        control.send(&Frame::HaveList { ids: batch }).await?;
+        control.flush().await?;
     }
+    Ok(())
 }
 
 pub async fn send_done<C>(control: &mut C) -> Result<(), SyncError>

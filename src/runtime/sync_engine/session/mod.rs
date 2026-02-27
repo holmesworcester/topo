@@ -32,9 +32,21 @@ pub use responder::run_sync_responder;
 
 /// Negentropy frame size limit.
 /// Larger frames pack more range fingerprints per round, reducing round count
-/// at the cost of larger per-round messages. 256 KB cuts 500k-item rounds
-/// from ~245 to ~60.
-pub(super) const NEGENTROPY_FRAME_SIZE: u64 = 256 * 1024;
+/// at the cost of larger per-round messages.
+///
+/// Override with `NEG_FRAME_KB` env var for tuning (e.g. NEG_FRAME_KB=1024).
+pub(super) fn neg_frame_size() -> u64 {
+    const DEFAULT_KB: u64 = 256;
+    const MIN_KB: u64 = 16;
+    const MAX_KB: u64 = 4096;
+
+    std::env::var("NEG_FRAME_KB")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(|kb| kb.clamp(MIN_KB, MAX_KB))
+        .unwrap_or(DEFAULT_KB)
+        * 1024
+}
 
 /// Max event IDs sent per HaveList message during reconciliation.
 pub(super) const HAVE_CHUNK: usize = 1000;
