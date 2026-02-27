@@ -62,37 +62,41 @@ async fn perf_sync_50k() {
     eprintln!();
 }
 
-/// 10k bidirectional sync: generate 5k on each side, sync to convergence.
-/// Reports MB/s, events/s, wall time, and peak memory.
+/// 10k bidirectional sync: generate 5k on each side, sync until all 10k
+/// messages are projected on both peers.
 #[tokio::test]
 async fn perf_sync_10k() {
+    const N: i64 = 5_000;
+
     let alice = Peer::new_with_identity("alice");
-    let bob = Peer::new_with_identity("bob");
+    let bob = Peer::new_in_workspace("bob", &alice).await;
 
     let gen_start = Instant::now();
-    alice.batch_create_messages(5_000);
-    bob.batch_create_messages(5_000);
+    alice.batch_create_messages(N as usize);
+    bob.batch_create_messages(N as usize);
     let gen_secs = gen_start.elapsed().as_secs_f64();
-    eprintln!("Generated 10k events (5k each) in {:.2}s", gen_secs);
+    eprintln!("Generated {} messages ({N} each) in {gen_secs:.2}s", N * 2);
 
     let rss_before = peak_rss_mib();
 
-    let sample = alice.sample_event_ids(1)[0].clone();
     let metrics = sync_until_converged(
-        &alice, &bob, || bob.has_event(&sample), Duration::from_secs(120),
+        &alice, &bob,
+        || alice.message_count() == N * 2 && bob.message_count() == N * 2,
+        Duration::from_secs(120),
     ).await;
 
     let rss_after = peak_rss_mib();
 
-    assert_eq!(alice.message_count(), 5_000);
-    assert_eq!(bob.message_count(), 5_000);
+    assert_eq!(alice.message_count(), N * 2);
+    assert_eq!(bob.message_count(), N * 2);
+
+    let msgs_per_sec = (N * 2) as f64 / metrics.wall_secs;
 
     eprintln!();
     eprintln!("=== 10k bidirectional sync ===");
     eprintln!("  Wall time:    {:.2}s", metrics.wall_secs);
-    eprintln!("  Events:       {}", metrics.events_transferred);
-    eprintln!("  Events/s:     {:.0}", metrics.events_per_sec);
-    eprintln!("  Throughput:   {:.2} MiB/s", metrics.throughput_mib_s);
+    eprintln!("  Messages:     {}", N * 2);
+    eprintln!("  Msgs/s:       {msgs_per_sec:.0}");
     eprintln!("  Peak RSS:     {:.1} MiB (before: {:.1}, after: {:.1})",
         rss_after, rss_before, rss_after);
     eprintln!();
@@ -192,32 +196,33 @@ async fn perf_continuous_10k() {
 #[tokio::test]
 #[ignore]
 async fn perf_sync_100k() {
+    const N: i64 = 100_000;
+
     let alice = Peer::new_with_identity("alice");
-    let bob = Peer::new_with_identity("bob");
+    let bob = Peer::new_in_workspace("bob", &alice).await;
 
     let gen_start = Instant::now();
-    alice.batch_create_messages(100_000);
+    alice.batch_create_messages(N as usize);
     let gen_secs = gen_start.elapsed().as_secs_f64();
-    eprintln!("Generated 100k events in {:.2}s", gen_secs);
+    eprintln!("Generated {N} messages in {gen_secs:.2}s");
 
     let rss_before = peak_rss_mib();
 
-    let sample = alice.sample_event_ids(1)[0].clone();
     let metrics = sync_until_converged(
-        &alice, &bob, || bob.has_event(&sample), Duration::from_secs(600),
+        &alice, &bob, || bob.message_count() == N, Duration::from_secs(600),
     ).await;
 
     let rss_after = peak_rss_mib();
 
-    assert_eq!(alice.message_count(), 100_000);
+    assert_eq!(bob.message_count(), N);
+
+    let msgs_per_sec = N as f64 / metrics.wall_secs;
 
     eprintln!();
     eprintln!("=== 100k one-way sync ===");
-    eprintln!("  Generation:   {:.2}s", gen_secs);
     eprintln!("  Wall time:    {:.2}s", metrics.wall_secs);
-    eprintln!("  Events:       {}", metrics.events_transferred);
-    eprintln!("  Events/s:     {:.0}", metrics.events_per_sec);
-    eprintln!("  Throughput:   {:.2} MiB/s", metrics.throughput_mib_s);
+    eprintln!("  Messages:     {N}");
+    eprintln!("  Msgs/s:       {msgs_per_sec:.0}");
     eprintln!("  Peak RSS:     {:.1} MiB (before: {:.1}, after: {:.1})",
         rss_after, rss_before, rss_after);
     eprintln!();
@@ -227,32 +232,33 @@ async fn perf_sync_100k() {
 #[tokio::test]
 #[ignore]
 async fn perf_sync_200k() {
+    const N: i64 = 200_000;
+
     let alice = Peer::new_with_identity("alice");
-    let bob = Peer::new_with_identity("bob");
+    let bob = Peer::new_in_workspace("bob", &alice).await;
 
     let gen_start = Instant::now();
-    alice.batch_create_messages(200_000);
+    alice.batch_create_messages(N as usize);
     let gen_secs = gen_start.elapsed().as_secs_f64();
-    eprintln!("Generated 200k events in {:.2}s", gen_secs);
+    eprintln!("Generated {N} messages in {gen_secs:.2}s");
 
     let rss_before = peak_rss_mib();
 
-    let sample = alice.sample_event_ids(1)[0].clone();
     let metrics = sync_until_converged(
-        &alice, &bob, || bob.has_event(&sample), Duration::from_secs(600),
+        &alice, &bob, || bob.message_count() == N, Duration::from_secs(600),
     ).await;
 
     let rss_after = peak_rss_mib();
 
-    assert_eq!(alice.message_count(), 200_000);
+    assert_eq!(bob.message_count(), N);
+
+    let msgs_per_sec = N as f64 / metrics.wall_secs;
 
     eprintln!();
     eprintln!("=== 200k one-way sync ===");
-    eprintln!("  Generation:   {:.2}s", gen_secs);
     eprintln!("  Wall time:    {:.2}s", metrics.wall_secs);
-    eprintln!("  Events:       {}", metrics.events_transferred);
-    eprintln!("  Events/s:     {:.0}", metrics.events_per_sec);
-    eprintln!("  Throughput:   {:.2} MiB/s", metrics.throughput_mib_s);
+    eprintln!("  Messages:     {N}");
+    eprintln!("  Msgs/s:       {msgs_per_sec:.0}");
     eprintln!("  Peak RSS:     {:.1} MiB (before: {:.1}, after: {:.1})",
         rss_after, rss_before, rss_after);
     eprintln!();
@@ -262,32 +268,33 @@ async fn perf_sync_200k() {
 #[tokio::test]
 #[ignore]
 async fn perf_sync_500k() {
+    const N: i64 = 500_000;
+
     let alice = Peer::new_with_identity("alice");
-    let bob = Peer::new_with_identity("bob");
+    let bob = Peer::new_in_workspace("bob", &alice).await;
 
     let gen_start = Instant::now();
-    alice.batch_create_messages(500_000);
+    alice.batch_create_messages(N as usize);
     let gen_secs = gen_start.elapsed().as_secs_f64();
-    eprintln!("Generated 500k events in {:.2}s", gen_secs);
+    eprintln!("Generated {N} messages in {gen_secs:.2}s");
 
     let rss_before = peak_rss_mib();
 
-    let sample = alice.sample_event_ids(1)[0].clone();
     let metrics = sync_until_converged(
-        &alice, &bob, || bob.has_event(&sample), Duration::from_secs(1200),
+        &alice, &bob, || bob.message_count() == N, Duration::from_secs(1200),
     ).await;
 
     let rss_after = peak_rss_mib();
 
-    assert_eq!(alice.message_count(), 500_000);
+    assert_eq!(bob.message_count(), N);
+
+    let msgs_per_sec = N as f64 / metrics.wall_secs;
 
     eprintln!();
     eprintln!("=== 500k one-way sync ===");
-    eprintln!("  Generation:   {:.2}s", gen_secs);
     eprintln!("  Wall time:    {:.2}s", metrics.wall_secs);
-    eprintln!("  Events:       {}", metrics.events_transferred);
-    eprintln!("  Events/s:     {:.0}", metrics.events_per_sec);
-    eprintln!("  Throughput:   {:.2} MiB/s", metrics.throughput_mib_s);
+    eprintln!("  Messages:     {N}");
+    eprintln!("  Msgs/s:       {msgs_per_sec:.0}");
     eprintln!("  Peak RSS:     {:.1} MiB (before: {:.1}, after: {:.1})",
         rss_after, rss_before, rss_after);
     eprintln!();
