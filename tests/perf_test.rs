@@ -268,6 +268,12 @@ async fn perf_sync_200k() {
 #[tokio::test]
 #[ignore]
 async fn perf_sync_500k() {
+    // Enable tracing for sync diagnostics
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new("info"))
+        .with_writer(std::io::stderr)
+        .try_init();
+
     const N: i64 = 500_000;
 
     let alice = Peer::new_with_identity("alice");
@@ -280,19 +286,49 @@ async fn perf_sync_500k() {
 
     let rss_before = peak_rss_mib();
 
-    let metrics = sync_until_converged(
-        &alice, &bob, || bob.message_count() == N, Duration::from_secs(1200),
-    ).await;
+    let sync_start = Instant::now();
+    let sync = start_peers_pinned(&alice, &bob);
+
+    // Poll with progress reporting
+    let timeout = Duration::from_secs(1200);
+    let mut last_count = 0i64;
+    let mut last_report = Instant::now();
+    loop {
+        if bob.message_count() >= N {
+            break;
+        }
+        if sync_start.elapsed() >= timeout {
+            let count = bob.message_count();
+            eprintln!("TIMEOUT: bob has {}/{} messages, alice store={}, bob store={}",
+                count, N, alice.store_count(), bob.store_count());
+            panic!("500k sync timed out after {}s", timeout.as_secs());
+        }
+        if last_report.elapsed() >= Duration::from_secs(5) {
+            let count = bob.message_count();
+            let delta = count - last_count;
+            let elapsed = sync_start.elapsed().as_secs();
+            eprintln!(
+                "[+{}s] bob messages: {}/{} (delta: +{}), stores: alice={} bob={}, RSS: {:.0} MiB",
+                elapsed, count, N, delta, alice.store_count(), bob.store_count(), peak_rss_mib()
+            );
+            last_count = count;
+            last_report = Instant::now();
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    let wall_secs = sync_start.elapsed().as_secs_f64();
+    drop(sync);
 
     let rss_after = peak_rss_mib();
 
     assert_eq!(bob.message_count(), N);
 
-    let msgs_per_sec = N as f64 / metrics.wall_secs;
+    let msgs_per_sec = N as f64 / wall_secs;
 
     eprintln!();
     eprintln!("=== 500k one-way sync ===");
-    eprintln!("  Wall time:    {:.2}s", metrics.wall_secs);
+    eprintln!("  Wall time:    {:.2}s", wall_secs);
     eprintln!("  Messages:     {N}");
     eprintln!("  Msgs/s:       {msgs_per_sec:.0}");
     eprintln!("  Peak RSS:     {:.1} MiB (before: {:.1}, after: {:.1})",

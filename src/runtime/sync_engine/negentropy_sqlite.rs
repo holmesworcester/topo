@@ -58,6 +58,7 @@ impl<'a> NegentropyStorageSqlite<'a> {
     /// This is O(N) but streaming and memory-flat.
     /// Call before sync when items have been inserted.
     pub fn rebuild_blocks(&self) -> Result<(), rusqlite::Error> {
+        let start = std::time::Instant::now();
         self.ensure_session_table()?;
 
         // Clear existing session blocks
@@ -94,6 +95,11 @@ impl<'a> NegentropyStorageSqlite<'a> {
 
         // Update cached size
         *self.cached_size.borrow_mut() = Some(row_idx);
+
+        tracing::info!(
+            "rebuild_blocks: {} items, {} blocks in {}ms",
+            row_idx, block_idx, start.elapsed().as_millis()
+        );
 
         Ok(())
     }

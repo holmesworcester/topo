@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use negentropy::{Negentropy, Storage};
+use negentropy::{Negentropy, NegentropyStorageBase, Storage};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -52,10 +52,11 @@ where
         data_recv,
     } = conn;
     let start = Instant::now();
-    let timeout = Duration::from_secs(timeout_secs);
+    let activity_timeout = Duration::from_secs(timeout_secs);
+    let mut last_activity = Instant::now();
 
     info!(
-        "Starting negentropy sync (responder, dual-stream) for {} seconds",
+        "Starting negentropy sync (responder, dual-stream), activity timeout {}s",
         timeout_secs
     );
 
@@ -91,32 +92,52 @@ where
         recorded_by.to_string(),
     );
 
+    let neg_item_count = neg_storage.size().unwrap_or(0);
+    info!("Negentropy storage has {} items (responder)", neg_item_count);
+
     let mut events_sent: u64 = 0;
     let mut bytes_sent: u64 = 0;
     let mut rounds = 0;
     let mut peer_done = false;
     let mut completed = false;
     let sync_start = Instant::now();
+    let reconcile_start = Instant::now();
+    let mut last_bytes_received = 0u64;
 
     loop {
-        if start.elapsed() >= timeout {
-            warn!("Timeout");
+        // Data receiver runs in a separate task — check if it received data
+        let current_bytes = bytes_received.load(Ordering::Relaxed);
+        if current_bytes > last_bytes_received {
+            last_activity = Instant::now();
+            last_bytes_received = current_bytes;
+        }
+        if last_activity.elapsed() >= activity_timeout {
+            warn!(
+                "Activity timeout ({}s idle, {}s total)",
+                activity_timeout.as_secs(),
+                start.elapsed().as_secs()
+            );
             break;
         }
 
         match tokio::time::timeout(CONTROL_POLL_TIMEOUT, control.recv()).await {
             Ok(Ok(Frame::NegOpen { msg })) | Ok(Ok(Frame::NegMsg { msg })) => {
+                last_activity = Instant::now();
                 rounds += 1;
 
                 let response = neg.reconcile(&msg)?;
                 if response.is_empty() {
-                    info!("Reconciliation complete in {} rounds", rounds);
+                    info!(
+                        "Reconciliation complete: {} rounds, {}ms",
+                        rounds, reconcile_start.elapsed().as_millis()
+                    );
                 } else {
                     control.send(&Frame::NegMsg { msg: response }).await?;
                     control.flush().await?;
                 }
             }
             Ok(Ok(Frame::HaveList { ids })) => {
+                last_activity = Instant::now();
                 if ids.is_empty() {
                     continue;
                 }
@@ -124,6 +145,7 @@ where
                 let _ = egress.enqueue_events(peer_id, &ids);
             }
             Ok(Ok(Frame::Done)) => {
+                last_activity = Instant::now();
                 info!("Received Done from initiator");
                 peer_done = true;
             }
@@ -143,6 +165,9 @@ where
             drain_egress_to_data_stream(&egress, &store, peer_id, &mut data_send).await;
         events_sent += send_stats.events_sent_delta;
         bytes_sent += send_stats.bytes_sent_delta;
+        if send_stats.events_sent_delta > 0 {
+            last_activity = Instant::now();
+        }
 
         // After peer signalled Done and our egress queue is drained:
         // 1. Send DataDone on data stream (signals peer's data receiver)
