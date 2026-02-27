@@ -81,10 +81,6 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-pub fn identity_rebind_recorded_by_tables() -> &'static [&'static str] {
-    &["secret_keys"]
-}
-
 /// Pure projector: SecretKey → secret_keys table insert.
 pub fn project_pure(
     recorded_by: &str,

@@ -18,7 +18,7 @@ use topo::service;
 
 #[derive(Parser)]
 #[command(name = "topo")]
-#[command(about = "🐭 Topo — peer-to-peer encrypted sync")]
+#[command(about = "\u{1f42d} Topo \u{2014} peer-to-peer encrypted sync")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -460,38 +460,6 @@ fn discover_tenant_peer_ids(
     Ok(peers)
 }
 
-fn reconcile_single_tenant_identity_transition(
-    db_path: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let conn = open_connection(db_path)?;
-    create_tables(&conn)?;
-
-    let local_peers = topo::db::transport_creds::list_local_peers(&conn)?;
-    if local_peers.len() != 1 {
-        return Ok(());
-    }
-    let current = &local_peers[0];
-
-    let mut stmt = conn.prepare(
-        "SELECT peer_id FROM trust_anchors WHERE peer_id <> ?1
-         UNION
-         SELECT peer_id FROM recorded_events WHERE peer_id <> ?1
-         UNION
-         SELECT peer_id FROM valid_events WHERE peer_id <> ?1
-         UNION
-         SELECT peer_id FROM blocked_events WHERE peer_id <> ?1",
-    )?;
-    let stale_peer_ids = stmt
-        .query_map(rusqlite::params![current], |row| row.get::<_, String>(0))?
-        .collect::<Result<Vec<_>, _>>()?;
-    drop(stmt);
-
-    for stale in stale_peer_ids {
-        topo::db::finalize_identity(&conn, &stale, current)?;
-    }
-    Ok(())
-}
-
 async fn stop_runtime(runtime: ManagedRuntime) {
     runtime.shutdown_notify.notify_one();
     match tokio::time::timeout(Duration::from_secs(5), runtime.handle).await {
@@ -543,14 +511,6 @@ async fn reevaluate_runtime(
     state: Arc<DaemonState>,
     active_runtime: &mut Option<ManagedRuntime>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if let Err(e) = reconcile_single_tenant_identity_transition(db_path) {
-        tracing::warn!(
-            "identity transition reconciliation failed for {}: {}",
-            db_path,
-            e
-        );
-    }
-
     if active_runtime
         .as_ref()
         .map(|runtime| runtime.handle.is_finished())
@@ -693,7 +653,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             });
 
             info!(
-                "🐭 Topo daemon started (db={}, socket={})",
+                "\u{1f42d} Topo daemon started (db={}, socket={})",
                 db,
                 socket_path.display()
             );
@@ -730,7 +690,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let _ = runtime_manager.await;
             let _ = rpc_handle.join();
 
-            info!("🐭 Topo daemon shut down cleanly");
+            info!("\u{1f42d} Topo daemon shut down cleanly");
         }
 
         Commands::Stop => {
@@ -1385,7 +1345,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         ext_port, ext_ip
                     );
                     if data["double_nat"].as_bool().unwrap_or(false) {
-                        println!("warning: double-NAT detected — external IP {} is not publicly routable; port forwarding may not be reachable from the internet", ext_ip);
+                        println!("warning: double-NAT detected \u{2014} external IP {} is not publicly routable; port forwarding may not be reachable from the internet", ext_ip);
                     }
                 }
                 "failed" => {

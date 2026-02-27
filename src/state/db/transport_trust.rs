@@ -96,15 +96,6 @@ pub fn ensure_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     Ok(())
 }
 
-pub fn identity_rebind_recorded_by_tables() -> &'static [&'static str] {
-    &[
-        "peer_transport_bindings",
-        "invite_bootstrap_trust",
-        "pending_invite_bootstrap_trust",
-        "bootstrap_context",
-    ]
-}
-
 /// Append a bootstrap context observation — local durable context used as
 /// projection input when materializing trust rows from events.
 ///

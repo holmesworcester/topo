@@ -278,17 +278,10 @@ impl Peer {
         // Clean up sync endpoint
         sync_endpoint.close(0u32.into(), b"bootstrap done");
 
-        // Step 3: Refresh to the current transport identity after bootstrap sync.
-        // LocalSignerSecret projection may have switched from invite-derived
-        // transport identity to PeerShared-derived identity.
+        // Step 3: With pre-derive, the peer_id is already the final
+        // PeerShared-derived identity — no finalize_identity needed.
         let db = open_connection(&peer.db_path).expect("failed to open db");
-        let current_peer_id = crate::transport::identity::load_transport_peer_id(&db)
-            .unwrap_or_else(|_| result.peer_id.clone());
-        if current_peer_id != result.peer_id {
-            crate::db::finalize_identity(&db, &result.peer_id, &current_peer_id)
-                .expect("identity finalization after bootstrap sync failed");
-        }
-        let scoped_peer_id = current_peer_id;
+        let scoped_peer_id = result.peer_id.clone();
         peer.identity = scoped_peer_id.clone();
         peer.workspace_id = creator.workspace_id;
 
@@ -2236,10 +2229,12 @@ impl SharedDbNode {
         );
 
         // Accept the invite (production flow via workspace commands)
+        let peer_shared_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
         let join = join_workspace_as_new_user(
             &db, &tenant_identity, &invite.invite_key,
             &invite.invite_event_id, workspace_id,
             "test-user", "test-device",
+            peer_shared_key,
         ).expect("failed to accept user invite");
 
         let dummy_tempdir = tempfile::tempdir().expect("failed to create dummy tempdir");

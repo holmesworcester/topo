@@ -25,10 +25,6 @@ pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
     Ok(())
 }
 
-pub fn identity_rebind_recorded_by_tables() -> &'static [&'static str] {
-    &["intro_attempts"]
-}
-
 /// Insert a new intro attempt record (status = 'received').
 pub fn insert_intro_attempt(
     conn: &Connection,

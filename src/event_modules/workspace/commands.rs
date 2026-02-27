@@ -279,6 +279,7 @@ pub fn join_workspace_as_new_user(
     workspace_id: EventId,
     username: &str,
     device_name: &str,
+    peer_shared_key: SigningKey,
 ) -> Result<JoinChain, Box<dyn std::error::Error + Send + Sync>> {
     let mut rng = rand::thread_rng();
 
@@ -330,7 +331,6 @@ pub fn join_workspace_as_new_user(
     ))?;
 
     // 4. PeerSharedFirst (signed by device_invite_key) — may block.
-    let peer_shared_key = SigningKey::generate(&mut rng);
     let psf_evt = ParsedEvent::PeerSharedFirst(PeerSharedFirstEvent {
         created_at_ms: now_ms(),
         public_key: peer_shared_key.verifying_key().to_bytes(),
@@ -377,25 +377,24 @@ pub fn join_workspace_as_new_user(
 /// on projection, which installs the PeerShared-derived transport identity.
 /// Events may block if the identity chain hasn't completed yet; they will
 /// project via cascade when prerequisites arrive.
+///
+/// With pre-derive, `recorded_by` is already the final PeerShared-derived
+/// identity, so no scoping or load_transport_peer_id is needed.
 pub fn persist_join_signer_secrets(
     db: &Connection,
     recorded_by: &str,
     join: &JoinChain,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut scoped_recorded_by = recorded_by.to_string();
     emit_local_signer_secret(
         db,
-        &scoped_recorded_by,
+        recorded_by,
         &join.peer_shared_event_id,
         SIGNER_KIND_PEER_SHARED,
         &join.peer_shared_key,
     )?;
-    if let Ok(current_peer_id) = crate::transport::identity::load_transport_peer_id(db) {
-        scoped_recorded_by = current_peer_id;
-    }
     emit_local_signer_secret(
         db,
-        &scoped_recorded_by,
+        recorded_by,
         &join.user_event_id,
         SIGNER_KIND_USER,
         &join.user_key,
@@ -420,9 +419,8 @@ pub fn add_device_to_workspace(
     workspace_id: EventId,
     user_event_id: EventId,
     device_name: &str,
+    peer_shared_key: SigningKey,
 ) -> Result<LinkChain, Box<dyn std::error::Error + Send + Sync>> {
-    let mut rng = rand::thread_rng();
-
     // 1. InviteAccepted (local event) — binds trust anchor, triggers guard cascade
     let ia_evt = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
         created_at_ms: now_ms(),
@@ -434,7 +432,6 @@ pub fn add_device_to_workspace(
     // 2. PeerSharedFirst (signed by device_invite_key) — may block if device invite
     // event not yet synced. Tolerates Blocked: the event is stored and will project
     // via cascade when prerequisites arrive.
-    let peer_shared_key = SigningKey::generate(&mut rng);
     let psf_evt = ParsedEvent::PeerSharedFirst(PeerSharedFirstEvent {
         created_at_ms: now_ms(),
         public_key: peer_shared_key.verifying_key().to_bytes(),
@@ -890,20 +887,16 @@ pub fn create_invite_with_spki(
 
 /// Accept a user invite via projection-first flow.
 ///
-/// NOT async. Parses link, installs bootstrap identity, records bootstrap
-/// context, creates identity chain, persists secrets, and finalizes identity.
+/// NOT async. Parses link, pre-derives PeerShared identity, records bootstrap
+/// context, creates identity chain, and persists secrets. No finalize_identity
+/// needed — all events are written under the final peer_id from the start.
 pub fn accept_invite(
     db_path: &str,
     invite_link_str: &str,
     username: &str,
     devicename: &str,
 ) -> Result<AcceptInviteResponse, Box<dyn std::error::Error + Send + Sync>> {
-    use crate::contracts::transport_identity_contract::{
-        TransportIdentityAdapter, TransportIdentityIntent,
-    };
     use crate::db::{open_connection, schema::create_tables};
-    use crate::transport::identity::load_transport_peer_id;
-    use crate::transport::identity_adapter::ConcreteTransportIdentityAdapter;
 
     let invite = super::invite_link::parse_invite_link(invite_link_str)
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
@@ -918,30 +911,36 @@ pub fn accept_invite(
     let invite_event_id = invite.invite_event_id;
     let workspace_id = invite.workspace_id;
 
-    // Initialize DB and install bootstrap transport identity
-    let recorded_by = {
+    // Pre-derive peer_id from PeerShared key so all events are written under
+    // the correct recorded_by from the start (no finalize_identity needed).
+    let mut rng = rand::thread_rng();
+    let peer_shared_key = SigningKey::generate(&mut rng);
+    let derived_peer_id = hex::encode(
+        crate::crypto::spki_fingerprint_from_ed25519_pubkey(
+            &peer_shared_key.verifying_key().to_bytes()
+        )
+    );
+
+    // Initialize DB and install invite-derived bootstrap transport identity.
+    // The bootstrap cert is needed for the initial QUIC handshake with the
+    // inviter (who expects the invite-derived SPKI). The PeerShared-derived
+    // transport identity is installed later via projection cascade
+    // (ApplyTransportIdentityIntent::InstallPeerSharedIdentityFromSigner).
+    let db = {
         let db = open_connection(db_path)?;
         create_tables(&db)?;
-        let adapter = ConcreteTransportIdentityAdapter;
-        adapter
-            .apply_intent(
-                &db,
-                TransportIdentityIntent::InstallInviteBootstrapIdentity {
-                    invite_private_key: invite_key.to_bytes(),
-                },
-            )
+        crate::transport::identity::install_peer_key_transport_identity(&db, &invite_key)
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                format!("Failed to install bootstrap identity: {}", e).into()
-            })?
+                format!("Failed to install bootstrap transport identity: {}", e).into()
+            })?;
+        db
     };
-
-    let db = open_connection(db_path)?;
 
     // Record bootstrap context BEFORE accept so InviteAccepted projection
     // materializes trust rows.
     crate::db::transport_trust::append_bootstrap_context(
         &db,
-        &recorded_by,
+        &derived_peer_id,
         &event_id_to_base64(&invite_event_id),
         &event_id_to_base64(&workspace_id),
         &invite.bootstrap_addr,
@@ -951,29 +950,22 @@ pub fn accept_invite(
     // Accept the invite: creates identity chain via workspace command API.
     let join = join_workspace_as_new_user(
         &db,
-        &recorded_by,
+        &derived_peer_id,
         &invite_key,
         &invite_event_id,
         workspace_id,
         username,
         devicename,
+        peer_shared_key,
     )?;
 
     let psf_b64 = event_id_to_base64(&join.peer_shared_event_id);
 
     // Persist signer secrets.
-    persist_join_signer_secrets(&db, &recorded_by, &join)?;
-
-    // Load current transport peer_id and finalize identity if it has
-    // already transitioned.
-    let new_peer_id = load_transport_peer_id(&db)
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("load transport peer id failed: {}", e).into()
-        })?;
-    crate::db::finalize_identity(&db, &recorded_by, &new_peer_id)?;
+    persist_join_signer_secrets(&db, &derived_peer_id, &join)?;
 
     Ok(AcceptInviteResponse {
-        peer_id: new_peer_id,
+        peer_id: derived_peer_id,
         user_event_id: event_id_to_base64(&join.user_event_id),
         peer_shared_event_id: psf_b64,
     })
@@ -982,17 +974,13 @@ pub fn accept_invite(
 /// Accept a device link invite via projection-first flow.
 ///
 /// NOT async. Mirrors `accept_invite` but for device-link invites.
+/// Pre-derives PeerShared identity so no finalize_identity is needed.
 pub fn accept_device_link(
     db_path: &str,
     invite_link_str: &str,
     devicename: &str,
 ) -> Result<AcceptDeviceLinkResponse, Box<dyn std::error::Error + Send + Sync>> {
-    use crate::contracts::transport_identity_contract::{
-        TransportIdentityAdapter, TransportIdentityIntent,
-    };
     use crate::db::{open_connection, schema::create_tables};
-    use crate::transport::identity::load_transport_peer_id;
-    use crate::transport::identity_adapter::ConcreteTransportIdentityAdapter;
 
     let invite = super::invite_link::parse_invite_link(invite_link_str)
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
@@ -1007,24 +995,29 @@ pub fn accept_device_link(
     let invite_event_id = invite.invite_event_id;
     let workspace_id = invite.workspace_id;
 
-    // Initialize DB and install bootstrap transport identity
-    let recorded_by = {
+    // Pre-derive peer_id from PeerShared key so all events are written under
+    // the correct recorded_by from the start (no finalize_identity needed).
+    let mut rng = rand::thread_rng();
+    let peer_shared_key = SigningKey::generate(&mut rng);
+    let derived_peer_id = hex::encode(
+        crate::crypto::spki_fingerprint_from_ed25519_pubkey(
+            &peer_shared_key.verifying_key().to_bytes()
+        )
+    );
+
+    // Initialize DB and install invite-derived bootstrap transport identity.
+    // Same pattern as accept_invite: invite-derived cert for QUIC handshake,
+    // PeerShared-derived transport identity installed later via projection cascade.
+    let db = {
         let db = open_connection(db_path)?;
         create_tables(&db)?;
-        let adapter = ConcreteTransportIdentityAdapter;
-        adapter
-            .apply_intent(
-                &db,
-                TransportIdentityIntent::InstallInviteBootstrapIdentity {
-                    invite_private_key: invite_key.to_bytes(),
-                },
-            )
+        crate::transport::identity::install_peer_key_transport_identity(&db, &invite_key)
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                format!("Failed to install bootstrap identity: {}", e).into()
-            })?
+                format!("Failed to install bootstrap transport identity: {}", e).into()
+            })?;
+        db
     };
 
-    let db = open_connection(db_path)?;
     let user_event_id = match invite.invite_type {
         super::identity_ops::InviteType::DeviceLink { user_event_id: uid } => uid,
         _ => return Err("Expected DeviceLink invite type".into()),
@@ -1034,7 +1027,7 @@ pub fn accept_device_link(
     // materializes trust rows.
     crate::db::transport_trust::append_bootstrap_context(
         &db,
-        &recorded_by,
+        &derived_peer_id,
         &event_id_to_base64(&invite_event_id),
         &event_id_to_base64(&workspace_id),
         &invite.bootstrap_addr,
@@ -1044,29 +1037,22 @@ pub fn accept_device_link(
     // Accept the device link: creates identity chain.
     let link = add_device_to_workspace(
         &db,
-        &recorded_by,
+        &derived_peer_id,
         &invite_key,
         &invite_event_id,
         workspace_id,
         user_event_id,
         devicename,
+        peer_shared_key,
     )?;
 
     let psf_b64 = event_id_to_base64(&link.peer_shared_event_id);
 
     // Persist signer secrets.
-    persist_link_signer_secrets(&db, &recorded_by, &link)?;
-
-    // Load current transport peer_id and finalize identity if it has
-    // already transitioned.
-    let new_peer_id = load_transport_peer_id(&db)
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("load transport peer id failed: {}", e).into()
-        })?;
-    crate::db::finalize_identity(&db, &recorded_by, &new_peer_id)?;
+    persist_link_signer_secrets(&db, &derived_peer_id, &link)?;
 
     Ok(AcceptDeviceLinkResponse {
-        peer_id: new_peer_id,
+        peer_id: derived_peer_id,
         peer_shared_event_id: psf_b64,
     })
 }

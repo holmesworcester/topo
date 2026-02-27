@@ -21,10 +21,6 @@ pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
     Ok(())
 }
 
-pub fn identity_rebind_recorded_by_tables() -> &'static [&'static str] {
-    &["peer_endpoint_observations"]
-}
-
 /// Count blocked events for a peer (entries in blocked_event_deps).
 pub fn blocked_event_count(conn: &Connection, peer_id: &str) -> SqliteResult<i64> {
     conn.query_row(

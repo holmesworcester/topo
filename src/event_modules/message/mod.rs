@@ -41,10 +41,6 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-pub fn identity_rebind_recorded_by_tables() -> &'static [&'static str] {
-    &["messages"]
-}
-
 // --- Response types (moved from service.rs) ---
 
 use serde::{Deserialize, Serialize};

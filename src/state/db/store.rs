@@ -57,10 +57,6 @@ pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
     Ok(())
 }
 
-pub fn identity_rebind_peer_id_tables() -> &'static [&'static str] {
-    &["recorded_events"]
-}
-
 pub fn parse_share_scope(scope: &str) -> Option<ShareScope> {
     match scope {
         "shared" => Some(ShareScope::Shared),

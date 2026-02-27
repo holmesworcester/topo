@@ -52,16 +52,6 @@ pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
     Ok(())
 }
 
-pub fn identity_rebind_peer_id_tables() -> &'static [&'static str] {
-    &[
-        "valid_events",
-        "rejected_events",
-        "blocked_event_deps",
-        "blocked_events",
-        "project_queue",
-    ]
-}
-
 impl<'a> ProjectQueue<'a> {
     pub fn new(conn: &'a Connection) -> Self {
         Self { conn }

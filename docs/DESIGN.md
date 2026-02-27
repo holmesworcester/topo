@@ -160,11 +160,11 @@ Conceptually:
 
 Transport cert/key materialization is isolated behind a typed contract:
 
-- **`TransportIdentityIntent`** (enum): describes *what* identity change is needed (invite-bootstrap install, PeerShared-derived install).
-- **`TransportIdentityAdapter`** (trait): executes the intent against the DB. The sole concrete implementation (`ConcreteTransportIdentityAdapter` in `src/transport/identity_adapter.rs`) is the **only** code that calls raw install functions (`install_peer_key_transport_identity`, `install_invite_bootstrap_transport_identity`).
+- **`TransportIdentityIntent`** (enum): describes *what* identity change is needed (PeerShared-derived install).
+- **`TransportIdentityAdapter`** (trait): executes the intent against the DB. The sole concrete implementation (`ConcreteTransportIdentityAdapter` in `src/transport/identity_adapter.rs`) is the **only** code that calls the raw install function (`install_peer_key_transport_identity`).
 - **Event modules** emit `ApplyTransportIdentityIntent` commands (e.g., `local_signer_secret` projector for PeerShared signers).
 - **Projection pipeline** (`write_exec.rs`) routes intents through the adapter.
-- **Workspace command layer** uses the adapter directly for invite-bootstrap identity during `workspace::commands::accept_invite` / `workspace::commands::accept_device_link`.
+- **Workspace command layer** calls `install_peer_key_transport_identity` directly with the invite key to install the bootstrap transport identity during `accept_invite` / `accept_device_link`. The PeerShared-derived identity replaces it later via projection cascade.
 - **Boundary enforcement**: `scripts/check_boundary_imports.sh` prevents raw install calls from leaking into `service.rs`, `event_modules/`, or `projection/`.
 
 ## 2.3 Event-graph identity binding
@@ -281,17 +281,20 @@ Signer secrets (LocalSignerSecret events) are NOT emitted here; `persist_join_si
 
 **Retry** (`workspace::commands::retry_pending_invite_content_key_unwraps`): retries content-key unwrap for invites where SecretShared prerequisites arrived late. Triggered via `event_modules::post_drain_hooks` from `event_pipeline/effects.rs` after each projection drain.
 
-Identity finalization:
-- **Workspace creation** (`create_workspace`): pre-derives the PeerShared key
-  and computes `derived_peer_id = hex(spki_fingerprint(pubkey))` before writing
-  any events. All events are written under the correct `recorded_by` from the
-  start, eliminating the need for `finalize_identity`. The transport cert is
-  installed via projection when the PeerShared LocalSignerSecret is emitted.
-- **Invite acceptance / device link**: these flows begin under a temporary
-  invite-derived `recorded_by` before the PeerShared identity materializes.
-  After transition, `finalize_identity(old, new)` rebinds tenant-scoped rows
-  across projection/trust/pipeline tables in one transaction, reconciles
-  blocker/project-queue state, and is a no-op if `old == new`.
+Identity pre-derive:
+
+All three creation paths pre-derive `recorded_by` from the PeerShared key
+(`derived_peer_id = hex(spki_fingerprint(pubkey))`) before writing any events,
+so all events are written under the final peer_id from the start.
+
+- **Workspace creation** (`create_workspace`): pre-derives PeerShared key,
+  installs PeerShared-derived transport cert directly. No bootstrap sync needed.
+- **Invite acceptance / device link** (`accept_invite`, `accept_device_link`):
+  pre-derives PeerShared key for `recorded_by`, but installs an invite-derived
+  bootstrap transport cert (needed for the initial QUIC handshake — the inviter
+  expects the invite-derived SPKI). The PeerShared-derived transport identity
+  replaces it later via projection cascade
+  (`ApplyTransportIdentityIntent::InstallPeerSharedIdentityFromSigner`).
 - **Connect loop**: identity is resolved once per QUIC connection (not per
   session). Identity transitions only happen during discrete CLI commands,
   never during active sync, so per-session re-lookup is unnecessary overhead.

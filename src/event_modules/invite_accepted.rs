@@ -94,14 +94,6 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-pub fn identity_rebind_recorded_by_tables() -> &'static [&'static str] {
-    &["invite_accepted"]
-}
-
-pub fn identity_rebind_peer_id_tables() -> &'static [&'static str] {
-    &["trust_anchors"]
-}
-
 /// Pure projector: InviteAccepted — local trust-anchor binding.
 ///
 /// Binds directly from InviteAcceptedEvent fields. Uses first-write-wins

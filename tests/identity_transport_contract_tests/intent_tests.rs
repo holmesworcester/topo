@@ -16,34 +16,6 @@ fn setup_db() -> rusqlite::Connection {
 // --- Concrete adapter tests ---
 
 #[test]
-fn concrete_adapter_install_invite_bootstrap_roundtrip() {
-    let conn = setup_db();
-    let adapter = ConcreteTransportIdentityAdapter;
-    let key_bytes = [7u8; 32];
-
-    let peer_id = adapter
-        .apply_intent(
-            &conn,
-            TransportIdentityIntent::InstallInviteBootstrapIdentity {
-                invite_private_key: key_bytes,
-            },
-        )
-        .unwrap();
-
-    // Verify deterministic: same key → same peer_id
-    let peer_id2 = adapter
-        .apply_intent(
-            &conn,
-            TransportIdentityIntent::InstallInviteBootstrapIdentity {
-                invite_private_key: key_bytes,
-            },
-        )
-        .unwrap();
-    assert_eq!(peer_id, peer_id2);
-    assert_eq!(peer_id.len(), 64, "peer_id should be 32-byte hex");
-}
-
-#[test]
 fn concrete_adapter_install_peer_shared_from_signer() {
     let conn = setup_db();
     let adapter = ConcreteTransportIdentityAdapter;
@@ -141,8 +113,9 @@ fn fake_adapter_records_intents() {
 
     fake.apply_intent(
         &conn,
-        TransportIdentityIntent::InstallInviteBootstrapIdentity {
-            invite_private_key: [1u8; 32],
+        TransportIdentityIntent::InstallPeerSharedIdentityFromSigner {
+            recorded_by: "rb1".to_string(),
+            signer_event_id: [1u8; 32],
         },
     )
     .unwrap();
@@ -150,7 +123,7 @@ fn fake_adapter_records_intents() {
     fake.apply_intent(
         &conn,
         TransportIdentityIntent::InstallPeerSharedIdentityFromSigner {
-            recorded_by: "rb".to_string(),
+            recorded_by: "rb2".to_string(),
             signer_event_id: [2u8; 32],
         },
     )
@@ -160,14 +133,15 @@ fn fake_adapter_records_intents() {
     assert_eq!(intents.len(), 2);
     assert_eq!(
         intents[0],
-        TransportIdentityIntent::InstallInviteBootstrapIdentity {
-            invite_private_key: [1u8; 32],
+        TransportIdentityIntent::InstallPeerSharedIdentityFromSigner {
+            recorded_by: "rb1".to_string(),
+            signer_event_id: [1u8; 32],
         }
     );
     assert_eq!(
         intents[1],
         TransportIdentityIntent::InstallPeerSharedIdentityFromSigner {
-            recorded_by: "rb".to_string(),
+            recorded_by: "rb2".to_string(),
             signer_event_id: [2u8; 32],
         }
     );
@@ -181,8 +155,9 @@ fn fake_adapter_returns_configured_peer_id() {
     let result = fake
         .apply_intent(
             &conn,
-            TransportIdentityIntent::InstallInviteBootstrapIdentity {
-                invite_private_key: [0u8; 32],
+            TransportIdentityIntent::InstallPeerSharedIdentityFromSigner {
+                recorded_by: "rb".to_string(),
+                signer_event_id: [0u8; 32],
             },
         )
         .unwrap();

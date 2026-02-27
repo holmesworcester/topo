@@ -107,10 +107,6 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-pub fn identity_rebind_recorded_by_tables() -> &'static [&'static str] {
-    &["local_signer_material"]
-}
-
 /// Pure projector: LocalSignerSecret → local_signer_material table.
 /// UPSERT by (recorded_by, signer_event_id): Delete existing + InsertOrIgnore.
 /// Emits `ApplyTransportIdentityIntent(InstallPeerSharedIdentityFromSigner)`

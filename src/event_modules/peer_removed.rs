@@ -87,10 +87,6 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-pub fn identity_rebind_recorded_by_tables() -> &'static [&'static str] {
-    &["removed_entities"]
-}
-
 /// Pure projector: PeerRemoved → removed_entities table.
 pub fn project_pure(
     recorded_by: &str,

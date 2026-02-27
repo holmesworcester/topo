@@ -128,10 +128,6 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-pub fn identity_rebind_recorded_by_tables() -> &'static [&'static str] {
-    &["signed_memos"]
-}
-
 /// Pure projector: SignedMemo → signed_memos table insert.
 pub fn project_pure(
     recorded_by: &str,
