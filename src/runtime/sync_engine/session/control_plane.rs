@@ -7,7 +7,6 @@
 //! - Session completion control markers (`Done` / `DoneAck`)
 
 use negentropy::Id;
-use tracing::info;
 
 use crate::crypto::EventId;
 use crate::db::wanted::WantedEvents;
@@ -47,17 +46,46 @@ pub fn append_have_ids_to_pending(have_ids: &mut Vec<Id>, pending_have: &mut Vec
     }
 }
 
-pub fn dispatch_need_ids_after_reconcile(
+/// Dispatch need_ids discovered during a reconciliation round.
+///
+/// Sends HaveList frames immediately (streaming pull — events start flowing
+/// during reconciliation) AND buffers need_ids for coordinator reporting.
+/// The `wanted` table deduplicates: when the coordinator later assigns events
+/// that were already dispatched here, `dispatch_assigned_need_ids` skips them.
+pub async fn dispatch_need_ids_after_reconcile<C>(
+    control: &mut C,
+    wanted: &WantedEvents<'_>,
     need_ids: &mut Vec<Id>,
     coordinated_need_ids: &mut Vec<EventId>,
-) {
+) -> Result<(), SyncError>
+where
+    C: StreamConn,
+{
     if need_ids.is_empty() {
-        return;
+        return Ok(());
     }
+
+    // Stream HaveList immediately AND buffer for coordinator
+    let mut batch: Vec<EventId> = Vec::with_capacity(NEED_CHUNK);
     coordinated_need_ids.reserve(need_ids.len());
     for neg_id in need_ids.drain(..) {
-        coordinated_need_ids.push(neg_id_to_event_id(&neg_id));
+        let event_id = neg_id_to_event_id(&neg_id);
+        coordinated_need_ids.push(event_id);
+        if wanted.insert(&event_id).unwrap_or(false) {
+            batch.push(event_id);
+        }
+        if batch.len() >= NEED_CHUNK {
+            control.send(&Frame::HaveList { ids: batch }).await?;
+            control.flush().await?;
+            batch = Vec::with_capacity(NEED_CHUNK);
+        }
     }
+    if !batch.is_empty() {
+        control.send(&Frame::HaveList { ids: batch }).await?;
+        control.flush().await?;
+    }
+
+    Ok(())
 }
 
 pub fn maybe_report_coordination_need_ids(
@@ -71,11 +99,6 @@ pub fn maybe_report_coordination_need_ids(
     }
 
     let report = std::mem::take(coordinated_need_ids);
-    info!(
-        "Reporting {} need_ids to coordinator (peer {})",
-        report.len(),
-        coordination.peer_idx
-    );
     coordination
         .report_tx
         .send(report)

@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use negentropy::{Id, Negentropy, Storage};
+use negentropy::{Id, Negentropy, NegentropyStorageBase, Storage};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -26,7 +26,7 @@ use crate::transport::connection::ConnectionError;
 use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
 
 use super::control_plane::{
-    append_have_ids_to_pending, dispatch_assigned_need_ids, dispatch_need_ids_after_reconcile,
+    append_have_ids_to_pending, dispatch_need_ids_after_reconcile,
     maybe_report_coordination_need_ids, maybe_take_coordination_assignment, send_done,
     send_initial_neg_open, CoordinationAssignment,
 };
@@ -67,10 +67,11 @@ where
         data_recv,
     } = conn;
     let start = Instant::now();
-    let timeout = Duration::from_secs(timeout_secs);
+    let activity_timeout = Duration::from_secs(timeout_secs);
+    let mut last_activity = Instant::now();
 
     info!(
-        "Starting negentropy sync (initiator, dual-stream) for {} seconds",
+        "Starting negentropy sync (initiator, dual-stream), activity timeout {}s",
         timeout_secs
     );
 
@@ -112,6 +113,9 @@ where
         recorded_by.to_string(),
     );
 
+    let neg_item_count = neg_storage.size().unwrap_or(0);
+    info!("Negentropy storage has {} items (initiator)", neg_item_count);
+
     let initial_msg = neg.initiate()?;
     send_initial_neg_open(&mut control, initial_msg).await?;
 
@@ -121,6 +125,7 @@ where
     let mut completed = false;
     let mut done_sent = false;
     let sync_start = Instant::now();
+    let reconcile_start = Instant::now();
     // Pending have_ids buffer: populated by reconciliation, drained incrementally
     let mut pending_have: Vec<EventId> = Vec::new();
 
@@ -128,15 +133,27 @@ where
     let mut coordinated_need_ids: Vec<EventId> = Vec::new();
     let mut coordination_pending = true;
     let mut coordination_reported = false;
+    let mut last_bytes_received = 0u64;
 
     loop {
-        if start.elapsed() >= timeout {
-            warn!("Timeout");
+        // Data receiver runs in a separate task — check if it received data
+        let current_bytes = bytes_received.load(Ordering::Relaxed);
+        if current_bytes > last_bytes_received {
+            last_activity = Instant::now();
+            last_bytes_received = current_bytes;
+        }
+        if last_activity.elapsed() >= activity_timeout {
+            warn!(
+                "Activity timeout ({}s idle, {}s total)",
+                activity_timeout.as_secs(),
+                start.elapsed().as_secs()
+            );
             break;
         }
 
         match tokio::time::timeout(CONTROL_POLL_TIMEOUT, control.recv()).await {
             Ok(Ok(Frame::NegMsg { msg })) => {
+                last_activity = Instant::now();
                 rounds += 1;
                 match neg.reconcile_with_ids(&msg, &mut have_ids, &mut need_ids)? {
                     Some(next_msg) => {
@@ -144,13 +161,23 @@ where
                         control.flush().await?;
                     }
                     None => {
-                        info!("Reconciliation complete in {} rounds", rounds);
+                        info!(
+                            "Reconciliation complete: {} rounds, {}ms, have={} need={}",
+                            rounds, reconcile_start.elapsed().as_millis(),
+                            have_ids.len(), need_ids.len()
+                        );
                         reconciliation_done = true;
                     }
                 }
 
                 append_have_ids_to_pending(&mut have_ids, &mut pending_have);
-                dispatch_need_ids_after_reconcile(&mut need_ids, &mut coordinated_need_ids);
+                dispatch_need_ids_after_reconcile(
+                    &mut control,
+                    &wanted,
+                    &mut need_ids,
+                    &mut coordinated_need_ids,
+                )
+                .await?;
             }
             Ok(Ok(Frame::DoneAck)) => {
                 info!("Received DoneAck from responder");
@@ -182,12 +209,14 @@ where
             coordination_reported,
         ) {
             CoordinationAssignment::Assigned(assigned) => {
+                // HaveList frames were already streamed during reconciliation,
+                // so the coordinator assignment is informational only — all
+                // assigned events are already in the wanted table and were
+                // sent to the responder. Skip the redundant dispatch.
                 info!(
-                    "Received {} assigned events from coordinator (peer {})",
-                    assigned.len(),
-                    coordination.peer_idx
+                    "Coordinator assigned {} events (peer {})",
+                    assigned.len(), coordination.peer_idx
                 );
-                dispatch_assigned_need_ids(&mut control, &wanted, assigned).await;
                 coordination_pending = false;
             }
             CoordinationAssignment::Disconnected => {
@@ -209,11 +238,17 @@ where
             drain_egress_to_data_stream(&egress, &store, peer_id, &mut data_send).await;
         events_sent += send_stats.events_sent_delta;
         bytes_sent += send_stats.bytes_sent_delta;
+        if send_stats.events_sent_delta > 0 {
+            last_activity = Instant::now();
+        }
 
         // Once reconciliation is done, coordination resolved, pending_have drained,
         // and egress queue empty, send DataDone on data stream then Done on control.
         if reconciliation_done && !coordination_pending && pending_have.is_empty() && !done_sent {
             let pending_out = egress.count_pending(peer_id).unwrap_or(0);
+            if pending_out > 0 && start.elapsed().as_secs() % 5 == 0 {
+                info!("Draining egress: {} pending, {} sent so far", pending_out, events_sent);
+            }
             if pending_out == 0 {
                 send_data_done(&mut data_send).await?;
                 send_done(&mut control).await?;
