@@ -35,7 +35,7 @@ use super::data_plane::{
     drain_egress_to_data_stream, enqueue_pending_have_to_egress, send_data_done,
     spawn_data_receiver,
 };
-use super::{CONTROL_POLL_TIMEOUT, DATA_DRAIN_TIMEOUT, EGRESS_SENT_TTL_MS, NEGENTROPY_FRAME_SIZE};
+use super::{CONTROL_POLL_TIMEOUT, DATA_DRAIN_TIMEOUT, EGRESS_SENT_TTL_MS, neg_frame_size};
 
 /// Run sync as the initiator (client role) with dual streams.
 /// Control stream: NegOpen, NegMsg, HaveList
@@ -93,7 +93,7 @@ where
         .rebuild_blocks()
         .map_err(|e| format!("Failed to rebuild blocks: {}", e))?;
 
-    let mut neg = Negentropy::new(Storage::Borrowed(&neg_storage), NEGENTROPY_FRAME_SIZE)?;
+    let mut neg = Negentropy::new(Storage::Borrowed(&neg_storage), neg_frame_size())?;
 
     let store = Store::new(&db);
 
@@ -134,6 +134,7 @@ where
     let mut coordination_pending = true;
     let mut coordination_reported = false;
     let mut last_bytes_received = 0u64;
+    let mut last_egress_log = Instant::now();
 
     loop {
         // Data receiver runs in a separate task — check if it received data
@@ -242,12 +243,15 @@ where
             last_activity = Instant::now();
         }
 
-        // Once reconciliation is done, coordination resolved, pending_have drained,
-        // and egress queue empty, send DataDone on data stream then Done on control.
-        if reconciliation_done && !coordination_pending && pending_have.is_empty() && !done_sent {
+        // Once reconciliation is done, pending_have is drained, and egress queue
+        // is empty, send DataDone on data stream then Done on control.
+        // Coordinator assignment is informational for streaming pull and must not
+        // gate session completion.
+        if reconciliation_done && pending_have.is_empty() && !done_sent {
             let pending_out = egress.count_pending(peer_id).unwrap_or(0);
-            if pending_out > 0 && start.elapsed().as_secs() % 5 == 0 {
+            if pending_out > 0 && last_egress_log.elapsed() >= Duration::from_secs(5) {
                 info!("Draining egress: {} pending, {} sent so far", pending_out, events_sent);
+                last_egress_log = Instant::now();
             }
             if pending_out == 0 {
                 send_data_done(&mut data_send).await?;
