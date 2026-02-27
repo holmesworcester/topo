@@ -21,6 +21,13 @@ impl TransportIdentityAdapter for ConcreteTransportIdentityAdapter {
         intent: TransportIdentityIntent,
     ) -> Result<String, TransportIdentityError> {
         match intent {
+            TransportIdentityIntent::InstallBootstrapIdentityFromInviteKey {
+                invite_private_key,
+            } => {
+                let signing_key = ed25519_dalek::SigningKey::from_bytes(&invite_private_key);
+                crate::transport::identity::install_peer_key_transport_identity(conn, &signing_key)
+                    .map_err(|e| TransportIdentityError::InstallFailed(e.to_string()))
+            }
             TransportIdentityIntent::InstallPeerSharedIdentityFromSigner {
                 recorded_by,
                 signer_event_id,
@@ -40,9 +47,10 @@ impl TransportIdentityAdapter for ConcreteTransportIdentityAdapter {
                     .map_err(|e| TransportIdentityError::InstallFailed(e.to_string()))?
                     .flatten();
 
-                let key_bytes = key_bytes.ok_or_else(|| TransportIdentityError::SignerKeyNotFound {
-                    recorded_by: recorded_by.clone(),
-                })?;
+                let key_bytes =
+                    key_bytes.ok_or_else(|| TransportIdentityError::SignerKeyNotFound {
+                        recorded_by: recorded_by.clone(),
+                    })?;
 
                 if key_bytes.len() != 32 {
                     return Err(TransportIdentityError::InvalidKeyMaterial(format!(

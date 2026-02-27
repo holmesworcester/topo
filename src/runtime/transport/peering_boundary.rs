@@ -11,7 +11,7 @@ use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 
 use crate::contracts::peering_contract::TransportSessionIo;
 use crate::db::open_connection;
-use crate::db::transport_creds::load_local_creds;
+use crate::db::transport_creds::discover_local_tenants;
 use crate::db::transport_trust::is_peer_allowed;
 use crate::protocol::{encode_frame, Frame};
 
@@ -121,9 +121,8 @@ pub fn build_tenant_client_config_from_creds(
 ) -> Result<TransportClientConfig, Box<dyn std::error::Error + Send + Sync>> {
     let db_path = db_path.to_string();
     let tenant_id = tenant_id.to_string();
-    let tenant_allow: Arc<DynamicAllowFn> = Arc::new(move |peer_fp: &[u8; 32]| {
-        tenant_trusts_peer(&db_path, &tenant_id, *peer_fp)
-    });
+    let tenant_allow: Arc<DynamicAllowFn> =
+        Arc::new(move |peer_fp: &[u8; 32]| tenant_trusts_peer(&db_path, &tenant_id, *peer_fp));
     workspace_client_config(cert_der, key_der, tenant_allow)
 }
 
@@ -132,8 +131,13 @@ pub fn build_tenant_client_config_from_db(
     tenant_id: &str,
 ) -> Result<TransportClientConfig, Box<dyn std::error::Error + Send + Sync>> {
     let db = open_connection(db_path)?;
-    let (cert_der, key_der) = load_local_creds(&db, tenant_id)?
+    let tenants = discover_local_tenants(&db)?;
+    let tenant = tenants
+        .into_iter()
+        .find(|t| t.peer_id == tenant_id)
         .ok_or_else(|| format!("local creds missing for tenant {}", tenant_id))?;
+    let cert_der = tenant.cert_der;
+    let key_der = tenant.key_der;
     drop(db);
 
     let cert_der = CertificateDer::from(cert_der);

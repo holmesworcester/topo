@@ -16,21 +16,22 @@ use ed25519_dalek::SigningKey;
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
-use crate::crypto::{EventId, event_id_from_base64, event_id_to_base64};
-use crate::service::{open_db_for_peer, open_db_load};
+use super::identity_ops::{
+    self as ops, InviteBootstrapContext, JoinChain, LinkChain, SIGNER_KIND_PENDING_INVITE_UNWRAP,
+};
+use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
 use crate::event_modules::{
     local_signer_secret::{
         LocalSignerSecretEvent, SIGNER_KIND_PEER_SHARED, SIGNER_KIND_USER, SIGNER_KIND_WORKSPACE,
     },
-    DeviceInviteFirstEvent, InviteAcceptedEvent, ParsedEvent, PeerSharedFirstEvent,
-    UserBootEvent, UserInviteBootEvent, WorkspaceEvent,
-};
-use super::identity_ops::{
-    self as ops, InviteBootstrapContext, JoinChain, LinkChain,
-    SIGNER_KIND_PENDING_INVITE_UNWRAP,
+    DeviceInviteFirstEvent, InviteAcceptedEvent, ParsedEvent, PeerSharedFirstEvent, UserBootEvent,
+    UserInviteBootEvent, WorkspaceEvent,
 };
 use crate::projection::apply::project_one;
-use crate::projection::create::{create_event_staged, create_event_sync, create_signed_event_sync, event_id_or_blocked};
+use crate::projection::create::{
+    create_event_staged, create_event_sync, create_signed_event_sync, event_id_or_blocked,
+};
+use crate::service::{open_db_for_peer, open_db_load};
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -117,7 +118,13 @@ pub fn create_workspace(
              WHERE l.signer_kind = 3
              LIMIT 1",
             [],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Vec<u8>>(2)?)),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            },
         )
         .optional()?
     {
@@ -150,11 +157,9 @@ pub fn create_workspace(
     // Pure crypto derivation — transport cert is installed via projection when
     // the PeerShared LocalSignerSecret is emitted in step 7.
     let peer_shared_key = SigningKey::generate(&mut rng);
-    let derived_peer_id = hex::encode(
-        crate::crypto::spki_fingerprint_from_ed25519_pubkey(
-            &peer_shared_key.verifying_key().to_bytes()
-        )
-    );
+    let derived_peer_id = hex::encode(crate::crypto::spki_fingerprint_from_ed25519_pubkey(
+        &peer_shared_key.verifying_key().to_bytes(),
+    ));
 
     // 1. Workspace event (unsigned, staged — guard-blocked until trust anchor)
     let workspace_key = SigningKey::generate(&mut rng);
@@ -231,13 +236,7 @@ pub fn create_workspace(
         SIGNER_KIND_PEER_SHARED,
         &peer_shared_key,
     )?;
-    emit_local_signer_secret(
-        db,
-        &derived_peer_id,
-        &ub_eid,
-        SIGNER_KIND_USER,
-        &user_key,
-    )?;
+    emit_local_signer_secret(db, &derived_peer_id, &ub_eid, SIGNER_KIND_USER, &user_key)?;
     emit_local_signer_secret(
         db,
         &derived_peer_id,
@@ -247,12 +246,7 @@ pub fn create_workspace(
     )?;
 
     // 8. Seed deterministic local content-key material.
-    let _ = ops::ensure_content_key_for_peer(
-        db,
-        &derived_peer_id,
-        &peer_shared_key,
-        &psf_eid,
-    )?;
+    let _ = ops::ensure_content_key_for_peer(db, &derived_peer_id, &peer_shared_key, &psf_eid)?;
 
     Ok(CreateWorkspaceResult {
         workspace_id: ws_eid,
@@ -349,12 +343,8 @@ pub fn join_workspace_as_new_user(
 
     // 5. Unwrap inviter-provided content key targeted at this invite (if present).
     // May return None if the content key event hasn't been synced yet.
-    let content_key_event_id = ops::unwrap_content_key_from_invite(
-        db,
-        recorded_by,
-        invite_key,
-        invite_event_id,
-    )?;
+    let content_key_event_id =
+        ops::unwrap_content_key_from_invite(db, recorded_by, invite_key, invite_event_id)?;
     if content_key_event_id.is_some() {
         ops::clear_pending_invite_unwrap_key(db, recorded_by, invite_event_id)?;
     }
@@ -495,12 +485,8 @@ pub fn create_user_invite(
     bootstrap_addr: &str,
     bootstrap_spki: &[u8; 32],
 ) -> Result<InviteResult, Box<dyn std::error::Error + Send + Sync>> {
-    let _ = ops::ensure_content_key_for_peer(
-        db,
-        recorded_by,
-        peer_shared_key,
-        peer_shared_event_id,
-    )?;
+    let _ =
+        ops::ensure_content_key_for_peer(db, recorded_by, peer_shared_key, peer_shared_event_id)?;
 
     let ctx = InviteBootstrapContext {
         bootstrap_addr,
@@ -603,9 +589,7 @@ pub fn retry_pending_invite_content_key_unwraps(
     let rows = stmt
         .query_map(
             rusqlite::params![recorded_by, SIGNER_KIND_PENDING_INVITE_UNWRAP],
-            |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-            },
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
         )?
         .collect::<Result<Vec<_>, _>>()?;
     drop(stmt);
@@ -623,7 +607,9 @@ pub fn retry_pending_invite_content_key_unwraps(
         key_arr.copy_from_slice(&key_bytes);
         let invite_key = SigningKey::from_bytes(&key_arr);
 
-        if ops::unwrap_content_key_from_invite(db, recorded_by, &invite_key, &invite_event_id)?.is_some() {
+        if ops::unwrap_content_key_from_invite(db, recorded_by, &invite_key, &invite_event_id)?
+            .is_some()
+        {
             ops::clear_pending_invite_unwrap_key(db, recorded_by, &invite_event_id)?;
             unwrapped += 1;
         }
@@ -656,8 +642,8 @@ pub fn load_workspace_signing_key(
             .try_into()
             .map_err(|_| "bad signing key length in local signer table")?;
         let signing_key = SigningKey::from_bytes(&key_arr);
-        let eid = crate::crypto::event_id_from_base64(&eid_b64)
-            .ok_or("bad workspace signer event_id")?;
+        let eid =
+            crate::crypto::event_id_from_base64(&eid_b64).ok_or("bad workspace signer event_id")?;
         return Ok(Some((eid, signing_key)));
     }
     Ok(None)
@@ -772,15 +758,9 @@ pub fn create_workspace_for_db(
     // Bootstrap new identity chain via workspace command API.
     // create_workspace pre-derives the PeerShared transport identity and writes
     // all events under it, so no finalize_identity rewrite is needed.
-    let _result = create_workspace(
-        &conn,
-        "bootstrap",
-        workspace_name,
-        username,
-        device_name,
-    )?;
-    let derived = load_transport_peer_id(&conn)
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+    let _result = create_workspace(&conn, "bootstrap", workspace_name, username, device_name)?;
+    let derived =
+        load_transport_peer_id(&conn).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
             format!("load transport peer id failed: {}", e).into()
         })?;
 
@@ -801,8 +781,8 @@ pub fn create_invite_for_db(
     db_path: &str,
     bootstrap_addr: &str,
 ) -> Result<CreateInviteResponse, Box<dyn std::error::Error + Send + Sync>> {
-    let (recorded_by, db) = open_db_load(db_path)
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+    let (recorded_by, db) =
+        open_db_load(db_path).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
             format!("No transport identity: {}", e).into()
         })?;
 
@@ -845,8 +825,8 @@ pub fn create_invite_with_spki(
     public_addr: &str,
     public_spki_hex: &str,
 ) -> Result<CreateInviteResponse, Box<dyn std::error::Error + Send + Sync>> {
-    let (recorded_by, db) = open_db_load(db_path)
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+    let (recorded_by, db) =
+        open_db_load(db_path).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
             format!("No transport identity: {}", e).into()
         })?;
 
@@ -896,12 +876,17 @@ pub fn accept_invite(
     username: &str,
     devicename: &str,
 ) -> Result<AcceptInviteResponse, Box<dyn std::error::Error + Send + Sync>> {
+    use crate::contracts::transport_identity_contract::{
+        TransportIdentityAdapter, TransportIdentityIntent,
+    };
     use crate::db::{open_connection, schema::create_tables};
+    use crate::transport::identity_adapter::ConcreteTransportIdentityAdapter;
 
-    let invite = super::invite_link::parse_invite_link(invite_link_str)
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+    let invite = super::invite_link::parse_invite_link(invite_link_str).map_err(
+        |e| -> Box<dyn std::error::Error + Send + Sync> {
             format!("Invalid invite link: {}", e).into()
-        })?;
+        },
+    )?;
 
     if invite.kind != super::invite_link::InviteLinkKind::User {
         return Err("Expected a user invite link (quiet://invite/...)".into());
@@ -915,11 +900,9 @@ pub fn accept_invite(
     // the correct recorded_by from the start (no finalize_identity needed).
     let mut rng = rand::thread_rng();
     let peer_shared_key = SigningKey::generate(&mut rng);
-    let derived_peer_id = hex::encode(
-        crate::crypto::spki_fingerprint_from_ed25519_pubkey(
-            &peer_shared_key.verifying_key().to_bytes()
-        )
-    );
+    let derived_peer_id = hex::encode(crate::crypto::spki_fingerprint_from_ed25519_pubkey(
+        &peer_shared_key.verifying_key().to_bytes(),
+    ));
 
     // Initialize DB and install invite-derived bootstrap transport identity.
     // The bootstrap cert is needed for the initial QUIC handshake with the
@@ -929,7 +912,14 @@ pub fn accept_invite(
     let db = {
         let db = open_connection(db_path)?;
         create_tables(&db)?;
-        crate::transport::identity::install_peer_key_transport_identity(&db, &invite_key)
+        let adapter = ConcreteTransportIdentityAdapter;
+        adapter
+            .apply_intent(
+                &db,
+                TransportIdentityIntent::InstallBootstrapIdentityFromInviteKey {
+                    invite_private_key: invite_key.to_bytes(),
+                },
+            )
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
                 format!("Failed to install bootstrap transport identity: {}", e).into()
             })?;
@@ -980,12 +970,17 @@ pub fn accept_device_link(
     invite_link_str: &str,
     devicename: &str,
 ) -> Result<AcceptDeviceLinkResponse, Box<dyn std::error::Error + Send + Sync>> {
+    use crate::contracts::transport_identity_contract::{
+        TransportIdentityAdapter, TransportIdentityIntent,
+    };
     use crate::db::{open_connection, schema::create_tables};
+    use crate::transport::identity_adapter::ConcreteTransportIdentityAdapter;
 
-    let invite = super::invite_link::parse_invite_link(invite_link_str)
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+    let invite = super::invite_link::parse_invite_link(invite_link_str).map_err(
+        |e| -> Box<dyn std::error::Error + Send + Sync> {
             format!("Invalid invite link: {}", e).into()
-        })?;
+        },
+    )?;
 
     if invite.kind != super::invite_link::InviteLinkKind::DeviceLink {
         return Err("Expected a device link (quiet://link/...)".into());
@@ -999,11 +994,9 @@ pub fn accept_device_link(
     // the correct recorded_by from the start (no finalize_identity needed).
     let mut rng = rand::thread_rng();
     let peer_shared_key = SigningKey::generate(&mut rng);
-    let derived_peer_id = hex::encode(
-        crate::crypto::spki_fingerprint_from_ed25519_pubkey(
-            &peer_shared_key.verifying_key().to_bytes()
-        )
-    );
+    let derived_peer_id = hex::encode(crate::crypto::spki_fingerprint_from_ed25519_pubkey(
+        &peer_shared_key.verifying_key().to_bytes(),
+    ));
 
     // Initialize DB and install invite-derived bootstrap transport identity.
     // Same pattern as accept_invite: invite-derived cert for QUIC handshake,
@@ -1011,7 +1004,14 @@ pub fn accept_device_link(
     let db = {
         let db = open_connection(db_path)?;
         create_tables(&db)?;
-        crate::transport::identity::install_peer_key_transport_identity(&db, &invite_key)
+        let adapter = ConcreteTransportIdentityAdapter;
+        adapter
+            .apply_intent(
+                &db,
+                TransportIdentityIntent::InstallBootstrapIdentityFromInviteKey {
+                    invite_private_key: invite_key.to_bytes(),
+                },
+            )
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
                 format!("Failed to install bootstrap transport identity: {}", e).into()
             })?;
@@ -1067,13 +1067,12 @@ pub fn create_device_link_for_peer(
     let (_recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
 
     // Load user key from local_user_keys
-    let (user_event_id, user_key) =
-        crate::event_modules::peer_shared::load_local_user_key(&db, peer_id)?.ok_or_else(
-            || -> Box<dyn std::error::Error + Send + Sync> {
-                "No local user key found. Only workspace creators/inviters can create device links."
-                    .into()
-            },
-        )?;
+    let (user_event_id, user_key) = crate::event_modules::peer_shared::load_local_user_key(
+        &db, peer_id,
+    )?
+    .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
+        "No local user key found. Only workspace creators/inviters can create device links.".into()
+    })?;
 
     let workspace_id = super::resolve_workspace_for_peer(&db, peer_id)?;
 
