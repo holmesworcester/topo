@@ -100,36 +100,6 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-pub fn identity_rebind_recorded_by_tables() -> Vec<&'static str> {
-    let mut tables = Vec::new();
-    tables.extend(workspace::identity_rebind_recorded_by_tables());
-    tables.extend(invite_accepted::identity_rebind_recorded_by_tables());
-    tables.extend(user_invite::identity_rebind_recorded_by_tables());
-    tables.extend(device_invite::identity_rebind_recorded_by_tables());
-    tables.extend(user::identity_rebind_recorded_by_tables());
-    tables.extend(peer_shared::identity_rebind_recorded_by_tables());
-    tables.extend(admin::identity_rebind_recorded_by_tables());
-    tables.extend(peer_removed::identity_rebind_recorded_by_tables());
-    tables.extend(message::identity_rebind_recorded_by_tables());
-    tables.extend(reaction::identity_rebind_recorded_by_tables());
-    tables.extend(message_deletion::identity_rebind_recorded_by_tables());
-    tables.extend(message_attachment::identity_rebind_recorded_by_tables());
-    tables.extend(file_slice::identity_rebind_recorded_by_tables());
-    tables.extend(signed_memo::identity_rebind_recorded_by_tables());
-    tables.extend(secret_key::identity_rebind_recorded_by_tables());
-    tables.extend(secret_shared::identity_rebind_recorded_by_tables());
-    tables.extend(transport_key::identity_rebind_recorded_by_tables());
-    tables.extend(local_signer_secret::identity_rebind_recorded_by_tables());
-    tables
-}
-
-pub fn identity_rebind_peer_id_tables() -> Vec<&'static str> {
-    let mut tables = Vec::new();
-    tables.extend(invite_accepted::identity_rebind_peer_id_tables());
-    tables.extend(file_slice::identity_rebind_peer_id_tables());
-    tables
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParsedEvent {
     Message(MessageEvent),

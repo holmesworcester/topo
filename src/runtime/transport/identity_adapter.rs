@@ -1,8 +1,7 @@
 //! Concrete `TransportIdentityAdapter` implementation.
 //!
 //! This is the **sole** module that calls raw transport identity install
-//! functions (`install_peer_key_transport_identity`,
-//! `install_invite_bootstrap_transport_identity_conn`). All other code
+//! functions (`install_peer_key_transport_identity`). All other code
 //! (service, projection, event_modules) must go through the adapter trait.
 
 use rusqlite::Connection;
@@ -22,16 +21,6 @@ impl TransportIdentityAdapter for ConcreteTransportIdentityAdapter {
         intent: TransportIdentityIntent,
     ) -> Result<String, TransportIdentityError> {
         match intent {
-            TransportIdentityIntent::InstallInviteBootstrapIdentity {
-                invite_private_key,
-            } => {
-                let signing_key = ed25519_dalek::SigningKey::from_bytes(&invite_private_key);
-                crate::transport::identity::install_invite_bootstrap_transport_identity_conn(
-                    conn,
-                    &signing_key,
-                )
-                .map_err(|e| TransportIdentityError::InstallFailed(e.to_string()))
-            }
             TransportIdentityIntent::InstallPeerSharedIdentityFromSigner {
                 recorded_by,
                 signer_event_id,

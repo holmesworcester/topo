@@ -208,7 +208,7 @@ Transport cert/key materialization is isolated behind a typed contract:
 - **Projection pipeline** (`write_exec.rs`) routes intents through the adapter.
 - **Downgrade guard**: bootstrap install is rejected once a PeerShared-derived identity has been installed (`BootstrapAfterPeerSharedDenied`), enforcing one-way transition.
 - **Credential source tracking**: `local_transport_creds.source` records `random | bootstrap | peershared` for runtime guard checks and diagnostics.
-- **Boundary enforcement**: `scripts/check_boundary_imports.sh` prevents raw install calls from leaking into `service.rs`, `event_modules/`, or `projection/`. <!-- Is this the right abstraction? -->
+- **Boundary enforcement**: `scripts/check_boundary_imports.sh` prevents raw install calls from leaking into `service.rs`, `event_modules/`, or `projection/`.
 
 ## 2.3 Event-graph identity binding
 

@@ -112,10 +112,6 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-pub fn identity_rebind_recorded_by_tables() -> &'static [&'static str] {
-    &["secret_shared"]
-}
-
 /// Pure projector: SecretShared → secret_shared table.
 /// Rejects if recipient has been removed (InvRemovalExclusion).
 pub fn project_pure(

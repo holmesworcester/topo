@@ -35,7 +35,3 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     )?;
     Ok(())
 }
-
-pub fn identity_rebind_recorded_by_tables() -> &'static [&'static str] {
-    &["peers_shared"]
-}
