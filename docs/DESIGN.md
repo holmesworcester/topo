@@ -281,11 +281,20 @@ Signer secrets (LocalSignerSecret events) are NOT emitted here; `persist_join_si
 
 **Retry** (`workspace::commands::retry_pending_invite_content_key_unwraps`): retries content-key unwrap for invites where SecretShared prerequisites arrived late. Triggered via `event_modules::post_drain_hooks` from `event_pipeline/effects.rs` after each projection drain.
 
-Identity finalization step:
-1. bootstrap flows can begin under a temporary invite-derived `recorded_by` identity before the steady-state PeerShared-derived transport peer ID is installed,
-2. after transition, `finalize_identity(old, new)` rebinds tenant-scoped rows across projection/trust/pipeline tables in one transaction,
-3. finalization reconciles blocker/project-queue state (drop stale blocker edges, release stale leases, requeue newly unblocked events),
-4. if `old == new`, finalization is a no-op.
+Identity finalization:
+- **Workspace creation** (`create_workspace`): pre-derives the PeerShared key
+  and computes `derived_peer_id = hex(spki_fingerprint(pubkey))` before writing
+  any events. All events are written under the correct `recorded_by` from the
+  start, eliminating the need for `finalize_identity`. The transport cert is
+  installed via projection when the PeerShared LocalSignerSecret is emitted.
+- **Invite acceptance / device link**: these flows begin under a temporary
+  invite-derived `recorded_by` before the PeerShared identity materializes.
+  After transition, `finalize_identity(old, new)` rebinds tenant-scoped rows
+  across projection/trust/pipeline tables in one transaction, reconciles
+  blocker/project-queue state, and is a no-op if `old == new`.
+- **Connect loop**: identity is resolved once per QUIC connection (not per
+  session). Identity transitions only happen during discrete CLI commands,
+  never during active sync, so per-session re-lookup is unnecessary overhead.
 
 ### Identity ownership boundary
 
@@ -809,15 +818,28 @@ assigns events to peers using round-based greedy load balancing:
 
 1. **Discovery**: each peer runs negentropy with its source, discovering need_ids
    (events the sink needs). Push (have_ids) proceeds immediately.
-2. **Report**: after reconciliation, each peer sends its need_ids to the coordinator
-   via a per-peer channel.
-3. **Assignment**: the coordinator collects reports (short collection window after
+2. **Streaming pull**: during reconciliation, each peer sends HaveList frames
+   immediately as need_ids are discovered (pipelining data transfer with
+   reconciliation). Need_ids are also buffered for coordinator reporting.
+3. **Report**: after reconciliation completes, each peer sends its full need_ids
+   to the coordinator via a per-peer channel.
+4. **Assignment**: the coordinator collects reports (short collection window after
    first report), builds an event-to-peer availability map, sorts by availability
    ascending (unique events first), and assigns each event to the least-loaded peer
    that has it.
-4. **Transfer**: each peer receives its assigned subset and sends HaveList only for
-   those events. Events flow into a shared batch_writer.
-5. **Forget**: assignments are discarded after each round. Next round starts fresh.
+5. **Transfer**: since HaveList was already streamed during reconciliation, the
+   coordinator assignment is informational for the reporting peer (the `wanted`
+   table deduplicates). For multi-peer scenarios, other peers receive their
+   assigned subsets normally.
+6. **Forget**: assignments are discarded after each round. Next round starts fresh.
+
+**Critical invariant — streaming pull dispatch.** HaveList frames MUST be sent
+during reconciliation rounds, not deferred until after reconciliation completes.
+Buffering need_ids until post-reconciliation creates a pipeline stall: events
+cannot flow until reconciliation finishes AND the coordinator round-trips. This
+serializes ~1 second of overhead that should be pipelined. The `wanted` table
+provides natural dedup so streaming dispatch is safe even with coordinator
+assignment afterward.
 
 Key properties:
 - Events available from one peer are assigned to that peer (no choice).
@@ -851,13 +873,14 @@ Do not add an in-memory dedup set in front of the shared writer:
 - The set grows without bound for long-running daemons (~90 bytes per EventId).
 - `INSERT OR IGNORE` in `batch_writer` handles duplicates correctly and cheaply.
 
-**Coordinator for pull, not push.** Each peer still pushes all have_ids
-(events the remote needs from us) without coordination — the push path runs
-at full speed. Only the pull path (need_ids — events we want) goes through
-coordinator assignment. After reconciliation, each peer reports its discovered
-need_ids to the coordinator thread, which assigns each event to the
-least-loaded peer that has it. This eliminates redundant downloads of the same
-event from multiple sources.
+**Coordinator for pull rebalancing, not gating.** Each peer still pushes all
+have_ids without coordination — the push path runs at full speed. The pull
+path streams HaveList during reconciliation (so events flow immediately) and
+also reports need_ids to the coordinator for multi-peer load balancing. The
+coordinator assigns each event to the least-loaded peer that has it, reducing
+redundant downloads when multiple sources share the same events. For
+single-peer sync, the coordinator degenerates to pass-through (all events
+assigned to the sole peer, which already streamed them).
 
 **Round-based reassignment.** Assignments are discarded after each round. If a
 peer fails to deliver its assigned events (slow, disconnected), those events
