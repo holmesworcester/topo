@@ -351,8 +351,6 @@ so all events are written under the final peer_id from the start.
 - **Connect loop**: identity is resolved once per QUIC connection (not per
   session). Identity transitions only happen during discrete CLI commands,
   never during active sync, so per-session re-lookup is unnecessary overhead.
-<!-- add: this lets bootstrap rely on natural sync of deps -->
-<!-- ?? -->
 
 ### Identity ownership boundary
 

@@ -100,10 +100,10 @@ These are required, not optional:
    - `invite_accepted` is a local anchor-binding event, not a global invite-presence gate.
    - trust-anchor gating belongs on root workspace event validity.
    - do not use pre-projection raw-blob capture tables as authority for trust-anchor binding.
-11. Identity finalization requirement.
-   - bootstrap may begin under temporary invite-derived `recorded_by`,
-   - once steady-state PeerShared identity materializes, call `finalize_identity(old, new)` transactionally,
-   - finalization must rebind tenant-scoped projection/trust/pipeline rows and reconcile blocker/project-queue state.
+11. Identity finalization.
+   - `create_workspace` pre-derives the PeerShared key and writes all events under the correct `recorded_by` from the start — no `finalize_identity` needed.
+   - invite acceptance / device link flows begin under temporary invite-derived `recorded_by`; once PeerShared identity materializes, `finalize_identity(old, new)` rebinds tenant-scoped rows transactionally.
+   - connect loop resolves identity once per QUIC connection, not per session (identity transitions only happen during discrete CLI commands).
 
 ## 2.2 CLI Architecture Principle
 
@@ -989,12 +989,16 @@ Required changes from the 1:1 sync model:
 2. **Thread-per-connection.** Each connection spawns a `std::thread` with a dedicated
    single-threaded tokio runtime. Isolates connection failures and allows sharing the
    `mpsc::Sender` to the batch_writer across connections.
-3. **Coordinator thread for pull assignment.** After negentropy reconciliation, each peer
+3. **Coordinator thread for pull rebalancing.** After negentropy reconciliation, each peer
    reports its discovered need_ids to a coordinator that assigns each event to the
    least-loaded peer that has it (greedy load balancing, unique-events-first ordering).
-4. **Push uncoordinated, pull coordinated.** Have_ids (outbound) stream immediately — no
-   coordinator involvement. Only need_ids (inbound) go through assignment. Push runs at
-   full speed during the coordination window.
+   For single-peer, the coordinator is pass-through (all events already streamed).
+4. **Push uncoordinated, pull streams then coordinates.** Have_ids (outbound) stream
+   immediately. Need_ids (inbound) are dispatched as HaveList during reconciliation
+   rounds (streaming pull — events flow immediately) AND reported to the coordinator
+   after reconciliation for multi-peer rebalancing. The `wanted` table deduplicates.
+   **Do not defer HaveList until after reconciliation** — this creates a pipeline stall
+   that serializes ~1s of overhead on the critical path.
 5. **Round-based reassignment.** Assignments are discarded after each round. Undelivered
    events re-appear as need_ids next round and get reassigned to a different peer.
 6. **Short collection window (~20ms).** Coordinator waits briefly after the first peer
