@@ -29,6 +29,9 @@ pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
         CREATE UNIQUE INDEX IF NOT EXISTS idx_egress_dedupe
             ON egress_queue(dedupe_key)
             WHERE dedupe_key IS NOT NULL AND sent_at IS NULL;
+        CREATE INDEX IF NOT EXISTS idx_egress_claim
+            ON egress_queue(connection_id, id)
+            WHERE sent_at IS NULL;
         ",
     )?;
     Ok(())
@@ -100,18 +103,22 @@ impl<'a> EgressQueue<'a> {
         Ok(result)
     }
 
-    /// Mark items as sent by rowid.
+    /// Mark items as sent by deleting them from the queue.
+    ///
+    /// Previously this updated `sent_at` and kept rows for TTL-based cleanup.
+    /// Deleting immediately keeps the table small during bulk transfers,
+    /// preventing progressive scan degradation. Session-end `clear_connection`
+    /// handles any stragglers.
     pub fn mark_sent(&self, rowids: &[i64]) -> SqliteResult<()> {
         if rowids.is_empty() {
             return Ok(());
         }
-        let now = current_timestamp_ms();
         self.conn.execute("BEGIN", [])?;
         let mut stmt = self.conn.prepare(
-            "UPDATE egress_queue SET sent_at = ?1, lease_until = NULL WHERE id = ?2",
+            "DELETE FROM egress_queue WHERE id = ?1",
         )?;
         for rowid in rowids {
-            stmt.execute(params![now, rowid])?;
+            stmt.execute(params![rowid])?;
         }
         self.conn.execute("COMMIT", [])?;
         Ok(())
@@ -226,7 +233,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cleanup_sent() {
+    fn test_mark_sent_deletes() {
         let conn = setup();
         let eq = EgressQueue::new(&conn);
 
@@ -237,17 +244,7 @@ mod tests {
         let rowids: Vec<i64> = claimed.iter().map(|(r, _)| *r).collect();
         eq.mark_sent(&rowids).unwrap();
 
-        // Backdate sent_at to make items "old"
-        conn.execute(
-            "UPDATE egress_queue SET sent_at = sent_at - 600000",
-            [],
-        ).unwrap();
-
-        // Cleanup items older than 300 seconds
-        let cleaned = eq.cleanup_sent(300_000).unwrap();
-        assert_eq!(cleaned, 2);
-
-        // Total row count should be 0
+        // mark_sent now deletes rows — total count should be 0
         let total: i64 = conn.query_row(
             "SELECT COUNT(*) FROM egress_queue",
             [], |row| row.get(0),

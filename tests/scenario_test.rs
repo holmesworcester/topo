@@ -1246,16 +1246,11 @@ async fn test_egress_queue_lifecycle() {
     let pending = eq.count_pending(conn_id).unwrap();
     assert_eq!(pending, 0);
 
-    // Cleanup sent with a large age threshold; recent rows should not be purged.
+    // mark_sent now deletes rows, so cleanup_sent finds nothing
     let purged = eq.cleanup_sent(300_000).unwrap();
     assert_eq!(purged, 0);
 
-    // Backdate and cleanup
-    db.execute("UPDATE egress_queue SET sent_at = sent_at - 600000", []).unwrap();
-    let purged = eq.cleanup_sent(300_000).unwrap();
-    assert_eq!(purged, 3);
-
-    // Re-enqueue should work (dedup index only blocks unsent)
+    // Re-enqueue should work (sent rows are deleted, dedup index cleared)
     let enqueued = eq.enqueue_events(conn_id, &[msg1, msg2]).unwrap();
     assert_eq!(enqueued, 2);
 
