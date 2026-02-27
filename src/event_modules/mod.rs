@@ -16,7 +16,6 @@ pub mod registry;
 pub mod secret_key;
 pub mod secret_shared;
 pub mod signed_memo;
-pub mod transport_key;
 pub mod user;
 pub mod user_invite;
 pub mod user_removed;
@@ -42,7 +41,6 @@ pub use registry::{EventRegistry, EventTypeMeta, ShareScope};
 pub use secret_key::SecretKeyEvent;
 pub use secret_shared::SecretSharedEvent;
 pub use signed_memo::SignedMemoEvent;
-pub use transport_key::TransportKeyEvent;
 pub use user::{UserBootEvent, UserOngoingEvent};
 pub use user_invite::{UserInviteBootEvent, UserInviteOngoingEvent};
 pub use user_removed::UserRemovedEvent;
@@ -69,7 +67,6 @@ pub const EVENT_TYPE_ADMIN_ONGOING: u8 = 19;
 pub const EVENT_TYPE_USER_REMOVED: u8 = 20;
 pub const EVENT_TYPE_PEER_REMOVED: u8 = 21;
 pub const EVENT_TYPE_SECRET_SHARED: u8 = 22;
-pub const EVENT_TYPE_TRANSPORT_KEY: u8 = 23;
 pub const EVENT_TYPE_MESSAGE_ATTACHMENT: u8 = 24;
 pub const EVENT_TYPE_FILE_SLICE: u8 = 25;
 pub const EVENT_TYPE_BENCH_DEP: u8 = 26;
@@ -95,7 +92,6 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     signed_memo::ensure_schema(conn)?;
     secret_key::ensure_schema(conn)?;
     secret_shared::ensure_schema(conn)?;
-    transport_key::ensure_schema(conn)?;
     local_signer_secret::ensure_schema(conn)?;
     Ok(())
 }
@@ -118,7 +114,6 @@ pub fn identity_rebind_recorded_by_tables() -> Vec<&'static str> {
     tables.extend(signed_memo::identity_rebind_recorded_by_tables());
     tables.extend(secret_key::identity_rebind_recorded_by_tables());
     tables.extend(secret_shared::identity_rebind_recorded_by_tables());
-    tables.extend(transport_key::identity_rebind_recorded_by_tables());
     tables.extend(local_signer_secret::identity_rebind_recorded_by_tables());
     tables
 }
@@ -153,7 +148,6 @@ pub enum ParsedEvent {
     UserRemoved(UserRemovedEvent),
     PeerRemoved(PeerRemovedEvent),
     SecretShared(SecretSharedEvent),
-    TransportKey(TransportKeyEvent),
     MessageAttachment(MessageAttachmentEvent),
     FileSlice(FileSliceEvent),
     BenchDep(BenchDepEvent),
@@ -184,7 +178,6 @@ impl ParsedEvent {
             ParsedEvent::UserRemoved(r) => r.created_at_ms,
             ParsedEvent::PeerRemoved(r) => r.created_at_ms,
             ParsedEvent::SecretShared(s) => s.created_at_ms,
-            ParsedEvent::TransportKey(t) => t.created_at_ms,
             ParsedEvent::MessageAttachment(a) => a.created_at_ms,
             ParsedEvent::FileSlice(f) => f.created_at_ms,
             ParsedEvent::BenchDep(b) => b.created_at_ms,
@@ -246,7 +239,6 @@ impl ParsedEvent {
                 ("recipient_event_id", s.recipient_event_id),
                 ("signed_by", s.signed_by),
             ],
-            ParsedEvent::TransportKey(t) => vec![("signed_by", t.signed_by)],
             ParsedEvent::MessageAttachment(a) => vec![
                 ("message_id", a.message_id),
                 ("key_event_id", a.key_event_id),
@@ -287,7 +279,6 @@ impl ParsedEvent {
             ParsedEvent::UserRemoved(_) => EVENT_TYPE_USER_REMOVED,
             ParsedEvent::PeerRemoved(_) => EVENT_TYPE_PEER_REMOVED,
             ParsedEvent::SecretShared(_) => EVENT_TYPE_SECRET_SHARED,
-            ParsedEvent::TransportKey(_) => EVENT_TYPE_TRANSPORT_KEY,
             ParsedEvent::MessageAttachment(_) => EVENT_TYPE_MESSAGE_ATTACHMENT,
             ParsedEvent::FileSlice(_) => EVENT_TYPE_FILE_SLICE,
             ParsedEvent::BenchDep(_) => EVENT_TYPE_BENCH_DEP,
@@ -313,7 +304,6 @@ impl ParsedEvent {
             ParsedEvent::UserRemoved(r) => Some((r.signed_by, r.signer_type)),
             ParsedEvent::PeerRemoved(r) => Some((r.signed_by, r.signer_type)),
             ParsedEvent::SecretShared(s) => Some((s.signed_by, s.signer_type)),
-            ParsedEvent::TransportKey(t) => Some((t.signed_by, t.signer_type)),
             ParsedEvent::FileSlice(f) => Some((f.signed_by, f.signer_type)),
             ParsedEvent::Message(m) => Some((m.signed_by, m.signer_type)),
             ParsedEvent::Reaction(r) => Some((r.signed_by, r.signer_type)),
@@ -416,7 +406,6 @@ pub fn registry() -> &'static EventRegistry {
             &user_removed::USER_REMOVED_META,
             &peer_removed::PEER_REMOVED_META,
             &secret_shared::SECRET_SHARED_META,
-            &transport_key::TRANSPORT_KEY_META,
             &message_attachment::MESSAGE_ATTACHMENT_META,
             &file_slice::FILE_SLICE_META,
             &bench_dep::BENCH_DEP_META,
@@ -783,22 +772,6 @@ mod tests {
     }
 
     #[test]
-    fn test_transport_key_roundtrip() {
-        let e = TransportKeyEvent {
-            created_at_ms: 1400,
-            spki_fingerprint: [59u8; 32],
-            signed_by: [60u8; 32],
-            signer_type: 5,
-            signature: [61u8; 64],
-        };
-        let event = ParsedEvent::TransportKey(e);
-        let blob = encode_event(&event).unwrap();
-        assert_eq!(blob.len(), transport_key::TRANSPORT_KEY_WIRE_SIZE);
-        let parsed = parse_event(&blob).unwrap();
-        assert_eq!(parsed, event);
-    }
-
-    #[test]
     fn test_registry_lookup() {
         let reg = registry();
         let msg_meta = reg.lookup(EVENT_TYPE_MESSAGE).unwrap();
@@ -859,7 +832,7 @@ mod tests {
         );
         // Identity/infrastructure types must NOT be encryptable
         for code in [
-            5, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 26, 27,
+            5, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 26, 27,
         ] {
             let meta = reg.lookup(code).unwrap();
             assert!(

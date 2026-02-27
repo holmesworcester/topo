@@ -85,7 +85,7 @@ pub fn ensure_all_schema(conn: &Connection) -> SqliteResult<()> {
     Ok(())
 }
 
-/// Backward-compatible entrypoint used throughout the codebase.
+/// Canonical schema entrypoint used throughout the codebase.
 pub fn create_tables(conn: &Connection) -> SqliteResult<()> {
     ensure_all_schema(conn)
 }

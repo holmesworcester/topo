@@ -28,7 +28,7 @@ Changes to this document require TLA+ model re-verification.
 | 20 | UserRemoved | UserRemoved | 138B | Shared | No | Yes | 64 | 5 (peer_shared) |
 | 21 | PeerRemoved | PeerRemoved | 138B | Shared | No | Yes | 64 | 5 (peer_shared) |
 | 22 | SecretShared | SecretShared | 202B | Shared | No | Yes | 64 | 5 (peer_shared) |
-| 23 | TransportKey | — | 138B | Shared | No | Yes | 64 | runtime (1..5) |
+| 23 | Retired (code reserved) | — | — | — | — | — | — | — |
 | 24 | MessageAttachment | — | 633B | Shared | Yes | Yes | 64 | runtime (1..5) |
 | 25 | FileSlice | — | 262286B | Shared | Yes | Yes | 64 | runtime (1..5) |
 | 26 | BenchDep | — | 345B | Shared | No | No | 0 | — |
@@ -70,7 +70,7 @@ Changes to this document require TLA+ model re-verification.
 | 20 | {target_event_id, signed_by} | [target_event_id, signed_by] |
 | 21 | {target_event_id, signed_by} | [target_event_id, signed_by] |
 | 22 | {recipient_event_id, signed_by} | [recipient_event_id, signed_by] (key_event_id is a hint, validated at materialization) |
-| 23 | {signed_by} | [signed_by] |
+| 23 | {} | [] |
 | 24 | {message_id, key_event_id, signed_by} | [message_id, key_event_id, signed_by] |
 | 25 | {signed_by} | [signed_by] |
 | 26 | {dep_id × 10 slots} | [dep_id × non-zero slots] |
@@ -108,7 +108,7 @@ Changes to this document require TLA+ model re-verification.
 | 20 | project_user_removed | removed_entities | — |
 | 21 | project_peer_removed | removed_entities | — |
 | 22 | project_secret_shared | secret_shared | bootstrap: wrap to invite key; runtime: wrap to PeerShared key |
-| 23 | project_transport_key | transport_keys | — |
+| 23 | retired | — | rejected as unknown type |
 | 24 | project_message_attachment | message_attachments | — |
 | 25 | project_file_slice | file_slices | signature verification |
 | 26 | (none) | valid_events | dependency benchmark event; no projection table side effects |

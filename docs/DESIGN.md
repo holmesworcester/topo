@@ -35,6 +35,8 @@ We split concerns aggressively:
 
 ## 1.1 Event classes
 
+The protocol separates durable facts from runtime control traffic into three event classes.
+
 1. Canonical shared events:
    - durable and shareable across peers.
 2. Canonical local-only events:
@@ -67,6 +69,8 @@ File slice events use a canonical fixed ciphertext size; final plaintext chunks 
 `bench_dep` events (type 26) are fixed-size shared benchmark events for dependency/cascade performance testing; they are non-encryptable and project no domain rows beyond validity state.
 
 ## 1.3 Event identity and signatures
+
+Canonical identity and authenticity are defined at the event layer with explicit signer metadata.
 
 1. canonical event bytes are content-addressed (`event_id` from canonical bytes),
 2. signed events carry canonical signer fields:
@@ -121,7 +125,7 @@ Transport identity is derived from event-layer peer identity:
 1. **Transport identity** (mTLS scope): cert/key material, SPKI fingerprints, `peer_id` derived from BLAKE2b-256 of X.509 SPKI. Managed by `transport/identity.rs`.
 2. **Event-graph identity** (identity layer scope): Ed25519 keys, signer chains, trust anchors, and identity events (types 8-22). Managed by the `projection/identity` module.
 
-Transport certs are deterministically derived from PeerShared Ed25519 signing keys, so the two identity scopes are unified. `TransportKey` events (type 23) are retained for backward-compatible event parsing but are **not** authoritative for trust decisions. All steady-state transport trust is derived from PeerShared Ed25519 public keys via `spki_fingerprint_from_ed25519_pubkey()`.
+Transport certs are deterministically derived from PeerShared Ed25519 signing keys, so the two identity scopes are unified. There is no separate `TransportKey` event source in the active prototype epoch; steady-state transport trust is derived from PeerShared Ed25519 public keys via `spki_fingerprint_from_ed25519_pubkey()`.
 
 ## 2.1 QUIC + mTLS
 
@@ -134,7 +138,7 @@ Rules:
    - `invite_bootstrap_trust` rows produced by projection from `InviteAccepted` events + local `bootstrap_context`,
    - `pending_invite_bootstrap_trust` rows produced by projection from invite events (UserInviteBoot, DeviceInviteFirst) + local `bootstrap_context`,
    - trust rows are projection-owned state; the service layer writes `bootstrap_context` rows only, not trust rows directly,
-3. no permissive verifier in production mode.
+3. no permissive verifier; all runtime handshakes use pinned SPKI trust checks.
 
 ## 2.2 Transport identity binding
 
@@ -177,9 +181,12 @@ Event-graph identity is event-defined:
 
 ### Display names (POC placeholder)
 
-Workspace, user, and device events carry a 64-byte cleartext name text slot. This is POC convenience for human-readable CLI output. In a production system (cf. poc-6), display names would be encrypted profile fields — only visible to peers holding the workspace content key — with fallback display (truncated ID) when the key is unavailable. The cleartext approach here avoids the complexity of encrypted profile infrastructure while enabling a usable demo.
+Display names use a simple POC model that favors readable CLI output over privacy.
 
-Content events (Message, Reaction, MessageDeletion) declare `author_id` as a dependency field pointing to User events (type 14/15). The dependency system blocks projection until the referenced User event exists, and the projector verifies that the signer's peer_shared `user_event_id` matches the claimed `author_id`. This enables direct `messages.author_id = users.event_id` JOINs for display name resolution.
+1. Workspace, user, and device events carry a fixed 64-byte cleartext name slot.
+2. Production intent is encrypted profile fields with truncated-ID fallback when keys are unavailable.
+3. Content events carry `author_id` dependencies on user events; projection blocks until the user exists and verifies signer/user linkage.
+4. This enables direct `messages.author_id = users.event_id` joins for display resolution.
 
 ## 2.4 NAT traversal and hole punch
 
@@ -289,6 +296,8 @@ Identity finalization step:
 
 ### Identity ownership boundary
 
+Ownership boundaries keep workflow orchestration and primitives separated so identity logic remains local and enforceable.
+
 - `event_modules/workspace/identity_ops.rs` owns reusable primitive helpers only (`pub(crate)`): key creation, content-key wrap/unwrap, pending invite storage, data types.
 - `event_modules/workspace/invite_link.rs` owns invite link encode/decode.
 - `transport/identity.rs` owns transport cert/key/SPKI logic.
@@ -301,6 +310,8 @@ Identity finalization step:
 All functions take `&Connection` and `recorded_by`, enabling multi-tenant operation where multiple identities share a single database.
 
 ## 2.5 Recording identity semantics
+
+These fields separate event authorship semantics from local recording and transport context.
 
 1. `signed_by`: canonical signer event reference used for signature/policy checks.
 2. `signer_type`: signer keyspace discriminator (`workspace | user_invite | device_invite | user | peer_shared`).
@@ -431,6 +442,8 @@ The production peering runtime follows a single conceptual loop:
 
 ### Module ownership
 
+Each runtime layer has a single owner module to avoid duplicated connection planning and transport wiring logic.
+
 - **Target planning**: `src/peering/runtime/target_planner.rs` — the single source of truth for dial target decisions. Bootstrap autodial and mDNS discovery both route through this module.
 - **Transport connection lifecycle**: `src/transport/connection_lifecycle.rs` — sole owner of QUIC `connect/accept` and TLS peer identity extraction for peering paths (`dial_peer`, `accept_peer`).
 - **Transport session factory**: `src/transport/session_factory.rs` — sole owner of QUIC stream opening and `DualConnection` / `QuicTransportSessionIo` construction. Provides `open_session_io()` and `accept_session_io()` that return `(session_id, Box<dyn TransportSessionIo>)`.
@@ -443,6 +456,8 @@ The production peering runtime follows a single conceptual loop:
 Durable trust/identity authority transitions are eventized (InviteAccepted, PeerShared, PeerRemoved). Transport runtime mechanics are NOT eventized: retry cadence, discovery timing, session lifecycle, and endpoint observations are ephemeral operational state managed by the peering runtime directly.
 
 ## 3.3 Table lifecycle and naming
+
+Schema lifecycle is deliberately simple and owner-driven for this prototype epoch.
 
 1. startup schema is epoch-only: `ensure_schema_epoch` + `ensure_all_schema`,
 2. no `schema_migrations` table or versioned migration runner is required in active startup/operation,
@@ -501,10 +516,14 @@ ProjectorResult {
 
 ### WriteOp types
 
+Projectors express deterministic state mutations using a small fixed write-op surface.
+
 1. `InsertOrIgnore { table, columns, values }` — immutable, idempotent materialization.
 2. `Delete { table, where_clause }` — explicit row removal (tombstone cascades).
 
 ### EmitCommand types
+
+Projectors emit follow-on commands only for explicit, deterministic side effects.
 
 1. `RetryWorkspaceEvent { workspace_id }` — re-project the specific workspace event after trust anchor set by invite_accepted.
 2. `RetryFileSliceGuards { file_id }` — re-project file_slice events after descriptor arrives.
@@ -540,6 +559,8 @@ final state.
 
 ### Pipeline/projector split (DRY contract)
 
+The system enforces a strict separation between shared pipeline stages and event-specific projector logic.
+
 1. shared pipeline code handles:
    - event load/decode dispatch,
    - dependency extraction and blocking,
@@ -554,6 +575,8 @@ final state.
    signature pipeline, or queue/terminal-write paths.
 
 ### Default write policy
+
+These defaults keep projection writes idempotent and replay-safe.
 
 1. immutable and idempotent materialization uses `InsertOrIgnore`,
 2. avoid `INSERT OR REPLACE`,
@@ -737,6 +760,8 @@ Materialization is an adapter step, not a second projection system.
 
 ## 6.3 Plaintext policy
 
+Encrypted materialization keeps plaintext handling intentionally minimal in the baseline.
+
 1. default: no persisted plaintext queue,
 2. plaintext exists in memory during projection only,
 3. optional short-lived cache can be added later for performance.
@@ -782,6 +807,8 @@ Egress rows are produced by:
 For canonical event transfer, egress rows carry `event_id`; canonical blob is read at send time.
 
 ## 7.4 Dedupe and purge
+
+Queue dedupe and cleanup rules preserve correctness while keeping operational tables bounded.
 
 1. `project_queue` is transient and purged on terminal decision,
 2. enqueue uses dedupe guards and skips terminal/blocked states,
@@ -891,11 +918,15 @@ inconsistent view during block rebuilding.
 
 ## 8.1 Operational shape
 
+The CLI/daemon contract defines one operational surface with predictable routing behavior.
+
 1. one daemon per profile/peer (`topo start`),
 2. local RPC control socket,
 3. unified CLI (`topo`) with subcommands that route through daemon when running, fall back to direct DB access otherwise.
 
 ### RPC wire contract
+
+Local RPC framing is intentionally strict and versioned to keep daemon/CLI interactions robust.
 
 1. local RPC uses a versioned envelope (`RpcRequest.version`, `RpcResponse.version`),
 2. transport framing is `u32` big-endian length-prefixed JSON,
@@ -1021,7 +1052,7 @@ This eliminates raw PSK bootstrap inputs; all key acquisition flows through the 
 
 ## 9.5 Transport credential lifecycle model
 
-This section covers the lifecycle state machine for the three trust sources: PeerShared-derived SPKIs (steady-state), `invite_bootstrap_trust`, and `pending_invite_bootstrap_trust`. The `transport_keys` table is populated by TransportKey event projection but is **not** consulted for trust decisions.
+This section covers the lifecycle state machine for the three trust sources: PeerShared-derived SPKIs (steady-state), `invite_bootstrap_trust`, and `pending_invite_bootstrap_trust`.
 
 Supersession: when a PeerShared event is projected, the PeerShared projector emits a `SupersedeBootstrapTrust` command that marks matching `invite_bootstrap_trust` and `pending_invite_bootstrap_trust` entries as superseded. This happens at projection time, not on trust check reads — trust check reads (`is_peer_allowed`, `allowed_peers_from_db`) are pure queries with no write side-effects.
 
@@ -1094,6 +1125,8 @@ This makes tests resilient to identity chain structure changes while still verif
 ---
 
 # 11. Performance and Operational Defaults
+
+Operational defaults prioritize predictable resource usage and observability over peak throughput.
 
 1. use SQLite WAL mode and prepared statements,
 2. batch worker operations with measured sizing,
@@ -1257,7 +1290,7 @@ RPC query handlers (`src/rpc/server.rs`) call event-module query APIs directly. 
 - `RpcMethod::Reactions` -> `reaction::list`
 - `RpcMethod::Users` -> `user::list_items`
 - `RpcMethod::Workspaces` -> `workspace::list_items`
-- `RpcMethod::Keys` -> `workspace::keys` (which aggregates `user`, `peer_shared`, `admin`, and `transport_key` counts)
+- `RpcMethod::Keys` -> `workspace::keys` (which aggregates `user`, `peer_shared`, and `admin` counts)
 
 ## 14.4 Module split rule
 

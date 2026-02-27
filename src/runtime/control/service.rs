@@ -154,7 +154,7 @@ pub struct IntroAttemptItem {
 }
 
 // ---------------------------------------------------------------------------
-// Re-exports for backward compat
+// Re-exports for RPC/service response wiring
 // ---------------------------------------------------------------------------
 
 pub use crate::assert::{parse_predicate, query_field, AssertResponse, Op};

@@ -28,7 +28,6 @@ const CANONICAL_EVENT_FILES: &[&str] = &[
     "src/event_modules/admin/wire.rs",
     "src/event_modules/user_removed.rs",
     "src/event_modules/peer_removed.rs",
-    "src/event_modules/transport_key.rs",
 ];
 
 /// Denied field names that indicate variable-length wire format logic.
@@ -126,23 +125,28 @@ fn all_canonical_event_files_exist() {
 fn all_registered_types_have_fixed_wire_size() {
     use topo::event_modules::{layout, registry};
 
-    // For each type code 1..=26, verify the registry has an entry
+    // For each active type code, verify the registry has an entry
     // and encoding produces a deterministic-length blob.
     let reg = registry();
-    for code in 1u8..=26 {
-        if code == 3 {
-            continue; // type 3 is unused (gap in type code allocation)
-        }
-        let meta = reg.lookup(code);
+    let active_codes: &[u8] = &[
+        1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 24, 25,
+        26, 27,
+    ];
+    for code in active_codes {
+        let meta = reg.lookup(*code);
         assert!(
             meta.is_some(),
             "type code {} missing from registry — all canonical types must be registered",
             code
         );
     }
+    assert!(
+        reg.lookup(23).is_none(),
+        "type code 23 should be unregistered (transport_key removed)"
+    );
 
     // Verify encrypted wire size is deterministic for all encryptable inner types
-    let encryptable_codes: Vec<u8> = (1..=26u8)
+    let encryptable_codes: Vec<u8> = (1..=27u8)
         .filter(|c| reg.lookup(*c).map_or(false, |m| m.encryptable))
         .collect();
 
