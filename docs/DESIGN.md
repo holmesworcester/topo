@@ -351,11 +351,14 @@ so all events are written under the final peer_id from the start.
   session). Identity transitions only happen during discrete CLI commands,
   never during active sync, so per-session re-lookup is unnecessary overhead.
 
+Concrete replay example (why pre-derive matters):
+1. joiner accepts invite and immediately writes `InviteAccepted`, `UserBoot`, and `PeerSharedFirst` under pre-derived `recorded_by = derived_peer_id`,
+2. sync then replays older inviter-side events plus late `SecretShared` dependencies in arbitrary order,
+3. because all local rows were already written under final `recorded_by`, unblock/retry/project paths operate on one tenant keyspace with no remap/finalize migration step.
+
 ### Identity ownership boundary
 
-<!-- This is getting very implementation specific no? Make generic to language and filenames -->
-
-- `event_modules/workspace/identity_ops.rs` owns reusable primitive helpers only (`pub(crate)`): key creation <!-- ??-->, content-key wrap/unwrap <!-- not in crypto???-->, pending invite storage, data types.
+- `event_modules/workspace/identity_ops.rs` owns reusable primitive helpers only (`pub(crate)`): key creation, content-key wrap/unwrap, pending invite storage, data types.
 - `event_modules/workspace/invite_link.rs` owns invite link encode/decode.
 - `transport/identity.rs` owns transport cert/key/SPKI logic.
 - `event_modules/workspace/commands.rs` owns all workflow orchestration: workspace creation, invite creation/acceptance, device link flows, retry logic.
@@ -1048,6 +1051,11 @@ Invite-workspace binding: `invite_accepted` binds the trust anchor directly from
 
 Projector-spec mapping: each Rust projector predicate maps to a named TLA guard. The full mapping is maintained in `docs/tla/projector_spec.md`. Any divergence between projector logic and TLA guards is treated as a spec bug that must be resolved before adding new behavior.
 
+TLA conformance cadence:
+1. rerun TLA conformance checks whenever changes touch projector guards, `ContextSnapshot` fields, emit-command semantics, trust lifecycle logic, or any `docs/tla/*` model/spec mapping,
+2. treat those checks as pre-merge gates for such changes (`scripts/check_projector_tla_conformance.py`, `scripts/check_projector_tla_bijection.py`),
+3. rerun before release/perf-baseline cuts to ensure design+implementation+mapping are still aligned.
+
 ### Layered conformance model
 
 Tests are organized into three layers, each exercising a different scope of the TLA+ conformance contract:
@@ -1079,7 +1087,13 @@ Required semantics:
 1. workspace is not valid until trust anchor exists,
 2. invite events and invites are not forced-valid,
 3. normal signer/dependency chain still governs validity,
-4. bootstrap transport trust rows (`invite_bootstrap_trust`, `pending_invite_bootstrap_trust`) are projection-owned state, produced by invite <!-- invite_accepted? what is an invite projector? --> projectors reading local `bootstrap_context` and emitting `WritePendingBootstrapTrust` / `WriteAcceptedBootstrapTrust` commands. The service layer writes `bootstrap_context` rows only, not trust rows directly. This follows the same poc-6 cascade pattern where `invite_accepted` projection drives trust establishment. <!-- it might be helpful to go over event naming, and then just use event names here-->
+4. bootstrap transport trust rows (`invite_bootstrap_trust`, `pending_invite_bootstrap_trust`) are projection-owned state, produced by concrete event projectors:
+   - `user_invite` projector emits `WritePendingBootstrapTrust`,
+   - `device_invite` projector emits `WritePendingBootstrapTrust`,
+   - `invite_accepted` projector emits `WriteAcceptedBootstrapTrust`,
+   - `peer_shared` projector emits `SupersedeBootstrapTrust`.
+   Projectors read local `bootstrap_context`; the service layer writes `bootstrap_context` rows only, never trust rows directly.
+   This follows the same poc-6 cascade pattern where `invite_accepted` projection drives trust establishment.
 
 Self-invite bootstrap stays explicit:
 
@@ -1149,6 +1163,14 @@ TLC-verified invariants (from `TransportCredentialLifecycle.tla`, mapped to Rust
 
 Abstract boundary: TLS handshake and session-key derivation remain unmodeled. The TLA spec covers trust-source state transitions but not the cryptographic session establishment that consumes them.
 
+## 9.6 Narrative walkthrough (bootstrap to steady-state)
+
+1. Inviter creates `UserInviteBoot` (or `DeviceInviteFirst`) and local `bootstrap_context`; projector emits `WritePendingBootstrapTrust`.
+2. Joiner accepts invite and projects `InviteAccepted`; projector writes trust anchor and emits `WriteAcceptedBootstrapTrust`.
+3. Initial handshake succeeds using bootstrap trust rows while full identity chains are still converging.
+4. `PeerSharedFirst/Ongoing` projects; projector emits `SupersedeBootstrapTrust` so bootstrap trust is consumed once steady-state PeerShared-derived trust exists.
+5. Ongoing sync/dial/accept paths then rely on steady-state trust (`is_peer_allowed` over PeerShared-derived + still-live bootstrap rows), with normal dependency block/unblock behavior in the same tenant keyspace.
+
 ---
 
 # 10. Convergence and Test Invariants
@@ -1210,14 +1232,14 @@ This makes tests resilient to identity chain structure changes while still verif
 2. batch worker operations with measured sizing,
 3. keep queue purge policies explicit and predictable,
 4. monitor blocked counts, queue age, retries, lease churn,
-5. provide `low_mem_ios` mode targeting `<= 24 MiB` steady-state RSS (iOS NSE), <!-- Have we really done this? We're roughly in range but do we have a plausible story for syncing large message setes under 24MiB? -->
+5. provide `low_mem_ios` mode with a target of `<= 24 MiB` steady-state RSS for constrained runtimes (including iOS NSE),
 6. in `low_mem_ios`, enforce strict in-flight bounds and prefer reduced throughput over memory spikes.
 
-Initial event-size policy: <!-- does this belong in this section? -->
+Initial event-size policy:
 
 1. `EVENT_MAX_BLOB_BYTES = 1 MiB` soft cap,
 2. `FILE_SLICE_TARGET_BYTES = 256 KiB`,
-3. `FILE_SLICE_MAX_BYTES = 1_048_430` (`EVENT_MAX_BLOB_BYTES - 146 bytes wire overhead`). <!-- wait file slices are variable size? i thought we fixed a size?-->
+3. `FILE_SLICE_MAX_BYTES = 1_048_430` (`EVENT_MAX_BLOB_BYTES - 146 bytes wire overhead`).
 
 `file_slice` events (type 25, signed) are signed and validated like other canonical events.
 `message_attachment` events (type 24, signed) are file descriptors with deps on `message_id`, `key_event_id`, and `signed_by`.
@@ -1233,7 +1255,9 @@ Runtime low-memory mode is enabled by env vars `LOW_MEM_IOS` or `LOW_MEM` (truth
 3. session ingest caps,
 4. transport receive-buffer limits.
 
-Validation scale requirements: the low-memory path must remain stable at >= 1,000,000 canonical events on disk and >= 100,000 peer trust keys while staying within the 24 MiB steady-state RSS ceiling. Throughput may degrade to preserve the memory bound.
+Unbounded-set clarification: canonical event history and trust rows can grow large on disk; low-memory mode bounds in-memory working set (queues, buffers, caches) rather than total persisted dataset size.
+
+Validation scale requirements: the low-memory path must remain stable at >= 1,000,000 canonical events on disk and >= 100,000 peer trust keys while targeting a 24 MiB steady-state RSS ceiling on representative constrained devices. Throughput may degrade to preserve the memory bound.
 
 ---
 
