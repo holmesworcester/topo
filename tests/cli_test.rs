@@ -47,6 +47,7 @@ fn create_workspace(db: &str) {
     }
     // create-workspace auto-starts the daemon; callers decide daemon lifecycle.
     let _ = Command::new(bin()).args(["--db", db, "stop"]).output();
+    wait_for_daemon_stopped(db, Duration::from_secs(10));
 }
 
 fn start_daemon_with_options(db: &str, disable_placeholder_autodial: bool) -> Child {
@@ -67,10 +68,16 @@ fn start_daemon_with_options(db: &str, disable_placeholder_autodial: bool) -> Ch
 
     // Wait for socket to appear, checking that daemon hasn't exited early.
     let start = std::time::Instant::now();
-    while !socket.exists() && start.elapsed().as_secs() < 5 {
+    loop {
         // Check if process already exited (immediate crash / bind failure).
         if let Some(status) = child.try_wait().expect("failed to check daemon status") {
             panic!("daemon exited immediately with {} (db={})", status, db);
+        }
+        if socket.exists() {
+            break;
+        }
+        if start.elapsed().as_secs() >= 5 {
+            break;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -121,6 +128,33 @@ fn wait_for_daemon_ready(db: &str, timeout: Duration) {
         std::thread::sleep(Duration::from_millis(50));
     }
     panic!("daemon did not become ready for RPC within {:?}", timeout);
+}
+
+fn wait_for_daemon_stopped(db: &str, timeout: Duration) {
+    let socket = socket_path_for_db(db);
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if !socket.exists() {
+            return;
+        }
+
+        let rpc_alive = topo::rpc::client::rpc_call(&socket, topo::rpc::protocol::RpcMethod::Status)
+            .map(|resp| resp.ok)
+            .unwrap_or(false);
+        if !rpc_alive {
+            let _ = std::fs::remove_file(&socket);
+            if !socket.exists() {
+                return;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!(
+        "daemon did not stop within {:?} (db={}, socket={})",
+        timeout,
+        db,
+        socket.display()
+    );
 }
 
 fn daemon_listen_addr(db: &str) -> String {
@@ -370,6 +404,7 @@ fn accept_invite(db: &str, invite_link: &str) {
     }
     // accept-invite auto-starts daemon; callers decide daemon lifecycle.
     let _ = Command::new(bin()).args(["--db", db, "stop"]).output();
+    wait_for_daemon_stopped(db, Duration::from_secs(10));
 }
 
 fn count_rows(db: &str, table: &str) -> i64 {

@@ -11,11 +11,6 @@ fn bin() -> String {
     env!("CARGO_BIN_EXE_topo").to_string()
 }
 
-fn random_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().port()
-}
-
 fn socket_path_for_db(db: &str) -> PathBuf {
     topo::service::socket_path_for_db(db)
 }
@@ -32,25 +27,93 @@ fn create_workspace(db: &str) {
     );
     // create-workspace auto-starts daemon; this suite controls daemon start explicitly.
     let _ = Command::new(bin()).args(["--db", db, "stop"]).output();
+    wait_for_daemon_stopped(db, Duration::from_secs(10));
 }
 
-fn start_daemon(db: &str, bind_port: u16) -> Child {
+fn wait_for_daemon_ready(db: &str, timeout: Duration) {
+    let socket = socket_path_for_db(db);
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        if socket.exists() {
+            if let Ok(resp) =
+                topo::rpc::client::rpc_call(&socket, topo::rpc::protocol::RpcMethod::Status)
+            {
+                if resp.ok {
+                    return;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("daemon did not become ready for RPC within {:?}", timeout);
+}
+
+fn wait_for_daemon_stopped(db: &str, timeout: Duration) {
+    let socket = socket_path_for_db(db);
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        if !socket.exists() {
+            return;
+        }
+
+        let rpc_alive = topo::rpc::client::rpc_call(&socket, topo::rpc::protocol::RpcMethod::Status)
+            .map(|resp| resp.ok)
+            .unwrap_or(false);
+        if !rpc_alive {
+            let _ = std::fs::remove_file(&socket);
+            if !socket.exists() {
+                return;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!(
+        "daemon did not stop within {:?} (db={}, socket={})",
+        timeout,
+        db,
+        socket.display()
+    );
+}
+
+fn daemon_listen_addr(db: &str) -> String {
+    let socket = socket_path_for_db(db);
+    let resp = topo::rpc::client::rpc_call(&socket, topo::rpc::protocol::RpcMethod::Status)
+        .expect("status RPC for listen addr");
+    assert!(resp.ok, "status RPC returned error");
+    let data = resp.data.expect("status response missing data");
+    data.get("runtime")
+        .and_then(|r| r.get("listen_addr"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .expect("status response missing runtime.listen_addr")
+}
+
+fn start_daemon(db: &str) -> Child {
     let socket = socket_path_for_db(db);
     let mut cmd = Command::new(bin());
     cmd.arg("--db")
         .arg(db)
         .arg("start")
         .arg("--bind")
-        .arg(format!("127.0.0.1:{}", bind_port))
+        .arg("127.0.0.1:0")
         .env("P7_DISABLE_DISCOVERY", "1")
         .env("RUST_LOG", "topo::event_pipeline=debug,topo::peering::runtime::autodial=debug,topo::projection=debug,topo::sync::session=info,topo=warn")
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
 
-    let child = cmd.spawn().expect("failed to start daemon");
+    let mut child = cmd.spawn().expect("failed to start daemon");
 
     let start = std::time::Instant::now();
-    while !socket.exists() && start.elapsed().as_secs() < 5 {
+    loop {
+        if let Some(status) = child.try_wait().expect("failed to check daemon status") {
+            panic!("daemon exited immediately with {} (db={})", status, db);
+        }
+        if socket.exists() {
+            break;
+        }
+        if start.elapsed().as_secs() >= 5 {
+            break;
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
     assert!(
@@ -58,6 +121,7 @@ fn start_daemon(db: &str, bind_port: u16) -> Child {
         "daemon socket did not appear at {}",
         socket.display()
     );
+    wait_for_daemon_ready(db, Duration::from_secs(15));
 
     child
 }
@@ -129,6 +193,7 @@ fn accept_invite(db: &str, invite_link: &str, username: &str, devicename: &str) 
     );
     // accept-invite auto-starts daemon; this suite controls daemon start explicitly.
     let _ = Command::new(bin()).args(["--db", db, "stop"]).output();
+    wait_for_daemon_stopped(db, Duration::from_secs(10));
 }
 
 fn assert_eventually(db: &str, predicate: &str, timeout_ms: u64) {
@@ -202,18 +267,15 @@ fn test_two_process_invite_and_sync() {
     let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
     let timeout_ms = 15000;
 
-    let alice_port = random_port();
-    let bob_port = random_port();
-
     // Step 1: Alice creates workspace and starts daemon.
     create_workspace(&alice_db);
-    let mut alice_daemon = start_daemon(&alice_db, alice_port);
+    let mut alice_daemon = start_daemon(&alice_db);
 
     // Alice sends initial message via daemon.
     let alice_first_eid = send_message(&alice_db, "Hello world from alice");
 
     // Step 2: Alice creates an invite pointing to her sync address (via daemon RPC).
-    let invite_link = create_invite(&alice_db, &format!("127.0.0.1:{}", alice_port));
+    let invite_link = create_invite(&alice_db, &daemon_listen_addr(&alice_db));
     assert!(
         invite_link.starts_with("quiet://invite/"),
         "Expected quiet://invite/ link, got: {}",
@@ -226,7 +288,7 @@ fn test_two_process_invite_and_sync() {
 
     // Bob's daemon handles bootstrap sync via autodial: the runtime discovers
     // bootstrap trust from projected SQL state and dials Alice's sync address.
-    let mut bob_daemon = start_daemon(&bob_db, bob_port);
+    let mut bob_daemon = start_daemon(&bob_db);
 
     // Wait for Bob's bootstrap sync to complete: Alice's first message must be
     // projected (requires full identity chain cascade + message projection).
