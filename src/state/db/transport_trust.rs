@@ -350,7 +350,7 @@ fn peer_shared_spki_fingerprints(
 ) -> Result<Vec<[u8; 32]>, Box<dyn std::error::Error + Send + Sync>> {
     let mut out = HashSet::new();
 
-    // Primary path: use projected transport_fingerprint directly.
+    // Transport trust resolution is projection-backed only.
     let mut stmt = conn.prepare(
         "SELECT p.transport_fingerprint FROM peers_shared p
          WHERE p.recorded_by = ?1
@@ -378,41 +378,6 @@ fn peer_shared_spki_fingerprints(
         .collect();
     out.extend(direct_fps);
 
-    // Legacy fallback: rows missing projected transport_fingerprint.
-    let mut stmt = conn.prepare(
-        "SELECT p.public_key FROM peers_shared p
-         WHERE p.recorded_by = ?1
-           AND (p.transport_fingerprint IS NULL OR length(p.transport_fingerprint) != 32)
-           AND NOT EXISTS (
-             SELECT 1 FROM removed_entities r
-             WHERE r.recorded_by = p.recorded_by
-               AND r.target_event_id = p.event_id
-           )
-           AND NOT EXISTS (
-             SELECT 1 FROM removed_entities r
-             WHERE r.recorded_by = p.recorded_by
-               AND p.user_event_id IS NOT NULL
-               AND r.target_event_id = p.user_event_id
-               AND r.removal_type = 'user'
-           )",
-    )?;
-    let fallback_fps: Vec<[u8; 32]> = stmt
-        .query_map(rusqlite::params![recorded_by], |row| {
-            Ok(row.get::<_, Vec<u8>>(0)?)
-        })?
-        .filter_map(|r| {
-            let blob = r.ok()?;
-            if blob.len() == 32 {
-                let mut key = [0u8; 32];
-                key.copy_from_slice(&blob);
-                Some(spki_fingerprint_from_ed25519_pubkey(&key))
-            } else {
-                None
-            }
-        })
-        .collect();
-    out.extend(fallback_fps);
-
     Ok(out.into_iter().collect())
 }
 
@@ -422,7 +387,7 @@ fn is_peer_shared_spki(
     recorded_by: &str,
     spki_fingerprint: &[u8; 32],
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    let direct_match: bool = conn.query_row(
+    let matched: bool = conn.query_row(
         "SELECT EXISTS (
             SELECT 1 FROM peers_shared p
             WHERE p.recorded_by = ?1
@@ -443,42 +408,7 @@ fn is_peer_shared_spki(
         rusqlite::params![recorded_by, spki_fingerprint.as_slice()],
         |row| row.get(0),
     )?;
-    if direct_match {
-        return Ok(true);
-    }
-
-    // Legacy fallback for rows not yet projected with transport_fingerprint.
-    let mut stmt = conn.prepare(
-        "SELECT p.public_key FROM peers_shared p
-         WHERE p.recorded_by = ?1
-           AND (p.transport_fingerprint IS NULL OR length(p.transport_fingerprint) != 32)
-           AND NOT EXISTS (
-             SELECT 1 FROM removed_entities r
-             WHERE r.recorded_by = p.recorded_by
-               AND r.target_event_id = p.event_id
-           )
-           AND NOT EXISTS (
-             SELECT 1 FROM removed_entities r
-             WHERE r.recorded_by = p.recorded_by
-               AND p.user_event_id IS NOT NULL
-               AND r.target_event_id = p.user_event_id
-               AND r.removal_type = 'user'
-           )",
-    )?;
-    let mut rows = stmt.query(rusqlite::params![recorded_by])?;
-    while let Some(row) = rows.next()? {
-        let blob: Vec<u8> = row.get(0)?;
-        if blob.len() != 32 {
-            continue;
-        }
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&blob);
-        let derived = spki_fingerprint_from_ed25519_pubkey(&key);
-        if &derived == spki_fingerprint {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    Ok(matched)
 }
 
 /// Build AllowedPeers from SQL trust sources only.
@@ -621,13 +551,7 @@ pub fn has_any_trusted_peer(
             OR EXISTS(
                 SELECT 1 FROM peers_shared
                 WHERE recorded_by = ?1
-                  AND (
-                    length(transport_fingerprint) = 32
-                    OR (
-                        (transport_fingerprint IS NULL OR length(transport_fingerprint) != 32)
-                        AND length(public_key) = 32
-                    )
-                  )
+                  AND length(transport_fingerprint) = 32
                   AND NOT EXISTS (
                     SELECT 1 FROM removed_entities r
                     WHERE r.recorded_by = peers_shared.recorded_by
@@ -1286,14 +1210,17 @@ mod tests {
         let peer_event_id = "peer_shared_evt1";
 
         // Insert a peers_shared row
-        conn.execute(
-            "INSERT INTO peers_shared (recorded_by, event_id, public_key)
-             VALUES (?1, ?2, ?3)",
-            rusqlite::params![recorded_by, peer_event_id, peer_pubkey.as_slice()],
-        ).unwrap();
-
-        // Compute expected SPKI fingerprint
         let spki = spki_fingerprint_from_ed25519_pubkey(&peer_pubkey);
+        conn.execute(
+            "INSERT INTO peers_shared (recorded_by, event_id, public_key, transport_fingerprint)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                recorded_by,
+                peer_event_id,
+                peer_pubkey.as_slice(),
+                spki.as_slice()
+            ],
+        ).unwrap();
 
         // Before removal: peer should be trusted
         assert!(is_peer_allowed(&conn, recorded_by, &spki).unwrap(),

@@ -224,28 +224,5 @@ fn supersede_bootstrap_if_peer_shared_exists(
         .map_err(|e| -> Box<dyn std::error::Error> { e })?;
         return Ok(());
     }
-
-    // Legacy fallback for rows without projected transport_fingerprint.
-    use crate::transport::cert::spki_fingerprint_from_ed25519_pubkey;
-    let mut stmt = conn.prepare(
-        "SELECT public_key FROM peers_shared
-         WHERE recorded_by = ?1
-           AND (transport_fingerprint IS NULL OR length(transport_fingerprint) != 32)",
-    )?;
-    let mut rows = stmt.query(rusqlite::params![recorded_by])?;
-    while let Some(row) = rows.next()? {
-        let pk_blob: Vec<u8> = row.get(0)?;
-        if pk_blob.len() != 32 {
-            continue;
-        }
-        let pk: [u8; 32] = pk_blob.try_into().unwrap();
-        let derived = spki_fingerprint_from_ed25519_pubkey(&pk);
-        if derived.as_slice() == spki_fingerprint.as_slice() {
-            drop(rows);
-            crate::db::transport_trust::supersede_bootstrap_for_peer_shared(conn, recorded_by, &pk)
-                .map_err(|e| -> Box<dyn std::error::Error> { e })?;
-            return Ok(());
-        }
-    }
     Ok(())
 }

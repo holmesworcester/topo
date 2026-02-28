@@ -11,7 +11,6 @@
 use rusqlite::Connection;
 use std::collections::HashSet;
 
-use crate::crypto::spki_fingerprint_from_ed25519_pubkey;
 use crate::event_modules::peer_shared::resolve_event_id_by_transport_fingerprint;
 
 /// Check whether a peer identified by hex SPKI fingerprint has been removed.
@@ -24,69 +23,29 @@ pub fn is_peer_removed(
     recorded_by: &str,
     spki_fingerprint: &[u8; 32],
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    if let Some(event_id) =
+    let Some(event_id) =
         resolve_event_id_by_transport_fingerprint(conn, recorded_by, spki_fingerprint)?
-    {
-        let removed: bool = conn.query_row(
-            "SELECT EXISTS (
-                SELECT 1 FROM removed_entities
-                WHERE recorded_by = ?1 AND target_event_id = ?2
-            ) OR EXISTS (
-                SELECT 1 FROM removed_entities r
-                WHERE r.recorded_by = ?1
-                  AND r.removal_type = 'user'
-                  AND r.target_event_id = (
-                    SELECT p.user_event_id FROM peers_shared p
-                    WHERE p.recorded_by = ?1 AND p.event_id = ?2 AND p.user_event_id IS NOT NULL
-                  )
-            )",
-            rusqlite::params![recorded_by, &event_id],
-            |row| row.get(0),
-        )?;
-        return Ok(removed);
-    }
+    else {
+        return Ok(false);
+    };
 
-    // Legacy fallback for rows without transport_fingerprint projection.
-    let mut stmt = conn.prepare(
-        "SELECT p.event_id, p.public_key FROM peers_shared p
-         WHERE p.recorded_by = ?1
-           AND (p.transport_fingerprint IS NULL OR length(p.transport_fingerprint) != 32)",
+    let removed: bool = conn.query_row(
+        "SELECT EXISTS (
+            SELECT 1 FROM removed_entities
+            WHERE recorded_by = ?1 AND target_event_id = ?2
+        ) OR EXISTS (
+            SELECT 1 FROM removed_entities r
+            WHERE r.recorded_by = ?1
+              AND r.removal_type = 'user'
+              AND r.target_event_id = (
+                SELECT p.user_event_id FROM peers_shared p
+                WHERE p.recorded_by = ?1 AND p.event_id = ?2 AND p.user_event_id IS NOT NULL
+              )
+        )",
+        rusqlite::params![recorded_by, &event_id],
+        |row| row.get(0),
     )?;
-    let mut rows = stmt.query(rusqlite::params![recorded_by])?;
-    while let Some(row) = rows.next()? {
-        let event_id: String = row.get(0)?;
-        let pubkey_blob: Vec<u8> = row.get(1)?;
-        if pubkey_blob.len() != 32 {
-            continue;
-        }
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&pubkey_blob);
-        let derived_spki = spki_fingerprint_from_ed25519_pubkey(&key);
-        if &derived_spki != spki_fingerprint {
-            continue;
-        }
-
-        let removed: bool = conn.query_row(
-            "SELECT EXISTS (
-                SELECT 1 FROM removed_entities
-                WHERE recorded_by = ?1 AND target_event_id = ?2
-            ) OR EXISTS (
-                SELECT 1 FROM removed_entities r
-                WHERE r.recorded_by = ?1
-                  AND r.removal_type = 'user'
-                  AND r.target_event_id = (
-                    SELECT p.user_event_id FROM peers_shared p
-                    WHERE p.recorded_by = ?1 AND p.event_id = ?2 AND p.user_event_id IS NOT NULL
-                  )
-            )",
-            rusqlite::params![recorded_by, &event_id],
-            |r| r.get(0),
-        )?;
-        if removed {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    Ok(removed)
 }
 
 /// Return a list of hex-encoded SPKI fingerprints for all removed peers.
@@ -98,7 +57,7 @@ pub fn removed_peer_spki_fingerprints(
 ) -> Result<Vec<[u8; 32]>, Box<dyn std::error::Error + Send + Sync>> {
     let mut out = HashSet::new();
 
-    // Primary path: read projected transport_fingerprint directly.
+    // Transport removal watch is projection-backed only.
     let mut stmt = conn.prepare(
         "SELECT p.transport_fingerprint FROM peers_shared p
          WHERE p.recorded_by = ?1
@@ -134,43 +93,6 @@ pub fn removed_peer_spki_fingerprints(
         .collect();
     out.extend(direct_fps);
 
-    // Legacy fallback for rows without projected transport_fingerprint.
-    let mut stmt = conn.prepare(
-        "SELECT p.public_key FROM peers_shared p
-         WHERE p.recorded_by = ?1
-           AND (p.transport_fingerprint IS NULL OR length(p.transport_fingerprint) != 32)
-           AND (
-             EXISTS (
-               SELECT 1 FROM removed_entities r
-               WHERE r.recorded_by = p.recorded_by
-                 AND r.target_event_id = p.event_id
-             )
-             OR EXISTS (
-               SELECT 1 FROM removed_entities r
-               WHERE r.recorded_by = p.recorded_by
-                 AND p.user_event_id IS NOT NULL
-                 AND r.target_event_id = p.user_event_id
-                 AND r.removal_type = 'user'
-             )
-           )",
-    )?;
-    let fallback_fps: Vec<[u8; 32]> = stmt
-        .query_map(rusqlite::params![recorded_by], |row| {
-            Ok(row.get::<_, Vec<u8>>(0)?)
-        })?
-        .filter_map(|r| {
-            let blob = r.ok()?;
-            if blob.len() == 32 {
-                let mut key = [0u8; 32];
-                key.copy_from_slice(&blob);
-                Some(spki_fingerprint_from_ed25519_pubkey(&key))
-            } else {
-                None
-            }
-        })
-        .collect();
-    out.extend(fallback_fps);
-
     Ok(out.into_iter().collect())
 }
 
@@ -190,8 +112,9 @@ mod tests {
         let spki = spki_fingerprint_from_ed25519_pubkey(&pubkey);
 
         conn.execute(
-            "INSERT INTO peers_shared (recorded_by, event_id, public_key) VALUES (?1, ?2, ?3)",
-            rusqlite::params![recorded_by, "ps_evt1", pubkey.as_slice()],
+            "INSERT INTO peers_shared (recorded_by, event_id, public_key, transport_fingerprint)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![recorded_by, "ps_evt1", pubkey.as_slice(), spki.as_slice()],
         )
         .unwrap();
 
@@ -208,8 +131,9 @@ mod tests {
         let spki = spki_fingerprint_from_ed25519_pubkey(&pubkey);
 
         conn.execute(
-            "INSERT INTO peers_shared (recorded_by, event_id, public_key) VALUES (?1, ?2, ?3)",
-            rusqlite::params![recorded_by, "ps_evt1", pubkey.as_slice()],
+            "INSERT INTO peers_shared (recorded_by, event_id, public_key, transport_fingerprint)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![recorded_by, "ps_evt1", pubkey.as_slice(), spki.as_slice()],
         )
         .unwrap();
 
@@ -231,15 +155,18 @@ mod tests {
         let pubkey_a: [u8; 32] = [0x01; 32];
         let pubkey_b: [u8; 32] = [0x02; 32];
         let spki_a = spki_fingerprint_from_ed25519_pubkey(&pubkey_a);
+        let spki_b = spki_fingerprint_from_ed25519_pubkey(&pubkey_b);
 
         conn.execute(
-            "INSERT INTO peers_shared (recorded_by, event_id, public_key) VALUES (?1, ?2, ?3)",
-            rusqlite::params![recorded_by, "ps_a", pubkey_a.as_slice()],
+            "INSERT INTO peers_shared (recorded_by, event_id, public_key, transport_fingerprint)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![recorded_by, "ps_a", pubkey_a.as_slice(), spki_a.as_slice()],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO peers_shared (recorded_by, event_id, public_key) VALUES (?1, ?2, ?3)",
-            rusqlite::params![recorded_by, "ps_b", pubkey_b.as_slice()],
+            "INSERT INTO peers_shared (recorded_by, event_id, public_key, transport_fingerprint)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![recorded_by, "ps_b", pubkey_b.as_slice(), spki_b.as_slice()],
         )
         .unwrap();
 
@@ -265,8 +192,9 @@ mod tests {
 
         // Tenant A has the peer, removes it
         conn.execute(
-            "INSERT INTO peers_shared (recorded_by, event_id, public_key) VALUES (?1, ?2, ?3)",
-            rusqlite::params!["tenant_a", "ps_evt1", pubkey.as_slice()],
+            "INSERT INTO peers_shared (recorded_by, event_id, public_key, transport_fingerprint)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params!["tenant_a", "ps_evt1", pubkey.as_slice(), spki.as_slice()],
         )
         .unwrap();
         conn.execute(
@@ -295,12 +223,26 @@ mod tests {
 
         // Both peers linked to same user
         conn.execute(
-            "INSERT INTO peers_shared (recorded_by, event_id, public_key, user_event_id) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![recorded_by, "ps_a", pubkey_a.as_slice(), user_event_id],
+            "INSERT INTO peers_shared (recorded_by, event_id, public_key, transport_fingerprint, user_event_id)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                recorded_by,
+                "ps_a",
+                pubkey_a.as_slice(),
+                spki_a.as_slice(),
+                user_event_id
+            ],
         ).unwrap();
         conn.execute(
-            "INSERT INTO peers_shared (recorded_by, event_id, public_key, user_event_id) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![recorded_by, "ps_b", pubkey_b.as_slice(), user_event_id],
+            "INSERT INTO peers_shared (recorded_by, event_id, public_key, transport_fingerprint, user_event_id)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                recorded_by,
+                "ps_b",
+                pubkey_b.as_slice(),
+                spki_b.as_slice(),
+                user_event_id
+            ],
         ).unwrap();
 
         // Before removal: neither peer is removed

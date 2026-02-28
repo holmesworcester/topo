@@ -15,7 +15,7 @@ Implemented outcomes:
 4. Command-layer direct pending bootstrap trust writes were removed from invite creation paths.
 5. Invite pending bootstrap trust still materializes via projection/autowrite.
 6. Transport boundary readability improved with explicit `transport_fingerprint()` accessors.
-7. Trust/removal SQL paths now prefer indexed `transport_fingerprint` lookups, with legacy fallback.
+7. Trust/removal SQL paths now use indexed `transport_fingerprint` lookups only.
 
 ## Simplifying Power
 
