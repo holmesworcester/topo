@@ -10,6 +10,7 @@ use rusqlite::OptionalExtension;
 use crate::contracts::transport_identity_contract::{
     TransportIdentityAdapter, TransportIdentityError, TransportIdentityIntent,
 };
+use crate::db::transport_creds::{has_creds_with_source, CRED_SOURCE_PEER_SHARED};
 
 /// Production adapter backed by `transport::identity` install functions.
 pub struct ConcreteTransportIdentityAdapter;
@@ -24,8 +25,16 @@ impl TransportIdentityAdapter for ConcreteTransportIdentityAdapter {
             TransportIdentityIntent::InstallBootstrapIdentityFromInviteKey {
                 invite_private_key,
             } => {
+                if has_creds_with_source(conn, CRED_SOURCE_PEER_SHARED)
+                    .map_err(|e| TransportIdentityError::InstallFailed(e.to_string()))?
+                {
+                    return Err(TransportIdentityError::BootstrapAfterPeerSharedDenied);
+                }
                 let signing_key = ed25519_dalek::SigningKey::from_bytes(&invite_private_key);
-                crate::transport::identity::install_peer_key_transport_identity(conn, &signing_key)
+                crate::transport::identity::install_invite_bootstrap_transport_identity(
+                    conn,
+                    &signing_key,
+                )
                     .map_err(|e| TransportIdentityError::InstallFailed(e.to_string()))
             }
             TransportIdentityIntent::InstallPeerSharedIdentityFromSigner {
@@ -67,5 +76,60 @@ impl TransportIdentityAdapter for ConcreteTransportIdentityAdapter {
                     .map_err(|e| TransportIdentityError::InstallFailed(e.to_string()))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::open_in_memory;
+    use crate::db::schema::create_tables;
+    use crate::transport::identity::install_peer_key_transport_identity;
+
+    #[test]
+    fn bootstrap_install_sets_bootstrap_source() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let adapter = ConcreteTransportIdentityAdapter;
+
+        let result = adapter.apply_intent(
+            &conn,
+            TransportIdentityIntent::InstallBootstrapIdentityFromInviteKey {
+                invite_private_key: [7u8; 32],
+            },
+        );
+        assert!(result.is_ok(), "bootstrap install should succeed");
+
+        let source: String = conn
+            .query_row("SELECT source FROM local_transport_creds LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(source, "bootstrap");
+    }
+
+    #[test]
+    fn bootstrap_install_rejected_after_peershared() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let adapter = ConcreteTransportIdentityAdapter;
+
+        let peer_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        install_peer_key_transport_identity(&conn, &peer_key).unwrap();
+
+        let result = adapter.apply_intent(
+            &conn,
+            TransportIdentityIntent::InstallBootstrapIdentityFromInviteKey {
+                invite_private_key: [11u8; 32],
+            },
+        );
+        assert!(
+            matches!(
+                result,
+                Err(TransportIdentityError::BootstrapAfterPeerSharedDenied)
+            ),
+            "expected BootstrapAfterPeerSharedDenied, got: {:?}",
+            result
+        );
     }
 }

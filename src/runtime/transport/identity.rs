@@ -1,10 +1,12 @@
 use rusqlite::Connection;
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 
-use crate::db::transport_creds::{load_sole_local_creds, load_local_creds, store_local_creds};
 use super::{
-    extract_spki_fingerprint, generate_self_signed_cert,
-    generate_self_signed_cert_from_signing_key,
+    extract_spki_fingerprint, generate_self_signed_cert, generate_self_signed_cert_from_signing_key,
+};
+use crate::db::transport_creds::{
+    has_creds_with_source, load_local_creds, load_sole_local_creds, store_local_creds_with_source,
+    CRED_SOURCE_BOOTSTRAP, CRED_SOURCE_PEER_SHARED, CRED_SOURCE_RANDOM,
 };
 
 // ---------------------------------------------------------------------------
@@ -47,7 +49,13 @@ pub fn ensure_transport_peer_id(
     let (cert_der, key_der) = generate_self_signed_cert()?;
     let fp = extract_spki_fingerprint(cert_der.as_ref())?;
     let peer_id = hex::encode(fp);
-    store_local_creds(conn, &peer_id, cert_der.as_ref(), key_der.secret_pkcs8_der())?;
+    store_local_creds_with_source(
+        conn,
+        &peer_id,
+        cert_der.as_ref(),
+        key_der.secret_pkcs8_der(),
+        CRED_SOURCE_RANDOM,
+    )?;
     Ok(peer_id)
 }
 
@@ -71,7 +79,13 @@ pub fn ensure_transport_cert(
     let (cert_der, key_der) = generate_self_signed_cert()?;
     let fp = extract_spki_fingerprint(cert_der.as_ref())?;
     let peer_id = hex::encode(fp);
-    store_local_creds(conn, &peer_id, cert_der.as_ref(), key_der.secret_pkcs8_der())?;
+    store_local_creds_with_source(
+        conn,
+        &peer_id,
+        cert_der.as_ref(),
+        key_der.secret_pkcs8_der(),
+        CRED_SOURCE_RANDOM,
+    )?;
     Ok((peer_id, cert_der, key_der))
 }
 
@@ -174,6 +188,35 @@ pub fn load_transport_cert_required_from_db(
 // Peer-key-derived transport identity (for all roles)
 // ---------------------------------------------------------------------------
 
+/// Install a deterministic transport cert/key derived from an invite signing key.
+///
+/// This is only valid during bootstrap before a PeerShared-derived transport
+/// identity has been installed.
+pub fn install_invite_bootstrap_transport_identity(
+    conn: &Connection,
+    invite_signing_key: &ed25519_dalek::SigningKey,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    if has_creds_with_source(conn, CRED_SOURCE_PEER_SHARED)? {
+        return Err(
+            "bootstrap transport identity install denied: peershared identity already installed"
+                .into(),
+        );
+    }
+    conn.execute("DELETE FROM local_transport_creds", [])?;
+
+    let (cert_der, key_der) = generate_self_signed_cert_from_signing_key(invite_signing_key)?;
+    let fp = extract_spki_fingerprint(cert_der.as_ref())?;
+    let peer_id = hex::encode(fp);
+    store_local_creds_with_source(
+        conn,
+        &peer_id,
+        cert_der.as_ref(),
+        key_der.secret_pkcs8_der(),
+        CRED_SOURCE_BOOTSTRAP,
+    )?;
+    Ok(peer_id)
+}
+
 /// Install a deterministic transport cert/key derived from a PeerShared signing
 /// key. This replaces any prior transport identity (random or invite-derived)
 /// so that `recorded_by` (SPKI fingerprint) matches the event-layer peer identity.
@@ -187,7 +230,13 @@ pub fn install_peer_key_transport_identity(
     let (cert_der, key_der) = generate_self_signed_cert_from_signing_key(peer_signing_key)?;
     let fp = extract_spki_fingerprint(cert_der.as_ref())?;
     let peer_id = hex::encode(fp);
-    store_local_creds(conn, &peer_id, cert_der.as_ref(), key_der.secret_pkcs8_der())?;
+    store_local_creds_with_source(
+        conn,
+        &peer_id,
+        cert_der.as_ref(),
+        key_der.secret_pkcs8_der(),
+        CRED_SOURCE_PEER_SHARED,
+    )?;
     Ok(peer_id)
 }
 
@@ -284,6 +333,9 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(count, 0, "load_transport_cert_required must never generate creds");
+        assert_eq!(
+            count, 0,
+            "load_transport_cert_required must never generate creds"
+        );
     }
 }

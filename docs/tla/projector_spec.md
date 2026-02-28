@@ -312,7 +312,9 @@ The TLA model does not distinguish bootstrap vs runtime SecretShared structurall
 ## Transport Credential Lifecycle (TransportCredentialLifecycle.tla)
 
 Standalone module modeling runtime SPKI credential and trust-store state transitions.
-Single-credential-per-peer (no rotation/revocation). Trust sources: PeerShared-derived
+Current flow is two-step: invite acceptance may install an invite-derived bootstrap
+credential first, then projection installs the PeerShared-derived credential.
+Arbitrary rotation/revocation is out of scope. Trust sources: PeerShared-derived
 SPKIs (steady-state) ∪ invite_bootstrap_trust ∪ pending_invite_bootstrap_trust.
 Not an extension of EventGraphSchema — trust-source inputs are nondeterministic,
 abstracting over the event graph.
@@ -326,6 +328,7 @@ abstracting over the event graph.
 | InvTrustSourcesWellFormed | All trust table rows contain valid 32-byte SPKI fingerprints |
 | InvMutualAuthSymmetry | Mutual CanAuthenticate requires both peers have active credentials |
 | InvPendingTrustOnlyOnInviter | is_local_create gate: pending bootstrap trust exists only on invite creator's trust store |
+| InvCredentialSourceConsistency | local credential presence/source consistency during bootstrap→PeerShared transition |
 
 ### Multi-tenant trust scoping (collapse-single-tenant, 2026-02-17)
 
