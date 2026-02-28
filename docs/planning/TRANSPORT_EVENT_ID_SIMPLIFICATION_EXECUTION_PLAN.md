@@ -19,12 +19,12 @@ In scope:
 3. Add query API to resolve event-graph peer identity from transport fingerprint.
 4. Remove direct command-layer pending-bootstrap trust writes in workspace invite creation paths (use projected outcome instead).
 5. Improve naming clarity in transport boundary APIs/comments (`transport_fingerprint` terminology).
-6. Validate with targeted tests.
+6. Add runtime dial behavior: ongoing identity first, bootstrap-fallback identity on trust rejection.
+7. Validate with targeted tests.
 
 Out of scope:
 1. Invite-link expiry schema/payload changes.
 2. Bootstrap key expiry derivation from invite expiry.
-3. Full runtime dial fallback implementation by alternate client cert in this patch.
 
 ## Success Criteria
 
@@ -33,6 +33,8 @@ Functional criteria:
 2. There is an indexed lookup path: `(recorded_by, transport_fingerprint) -> peer_shared_event_id`.
 3. Workspace invite creation no longer writes pending bootstrap trust directly via `record_pending_invite_bootstrap_trust`.
 4. Pending bootstrap trust still appears via normal projection flow for local invite creation.
+5. Outbound dial policy is ongoing-first, with bootstrap fallback attempted only on trust-rejection handshakes.
+6. Bootstrap-fallback sessions are bounded (single sync session then close).
 
 Correctness criteria:
 1. Existing projector and runtime tests pass for affected modules.
@@ -99,6 +101,20 @@ Deliverable:
    - complexity retained by hard constraints,
    - next simplification candidates.
 
+### Phase 6: Runtime fallback wiring
+
+Deliverable:
+1. Add optional tenant bootstrap-fallback client config builder derived from projected pending invite key material.
+2. Wire connect-loop dial policy:
+   - attempt ongoing identity first,
+   - retry with bootstrap fallback only for mTLS trust-rejection failures.
+3. Restrict fallback use to bootstrap-ingress workers (not discovery workers).
+4. Bound bootstrap-fallback connections to one sync session before close.
+
+Checks:
+1. Unit coverage for trust-rejection classification and fallback-config availability.
+2. Runtime peering tests continue passing.
+
 ## Future Work (Explicit)
 
 1. Add invite expiry to invite-link payload + projected invite state.
@@ -114,4 +130,9 @@ Completed in this branch:
 3. Phase 3 command-side pending trust writes removed from workspace invite creation paths.
 4. Phase 4 naming clarity pass completed with explicit `transport_fingerprint()` accessors on transport boundary wrappers.
 5. Phase 5 validation completed with targeted Rust tests; TLC execution is currently blocked in this workspace because `tlc2.TLC` (jar/classpath) is unavailable.
-6. Follow-up simplification: removed trust-specific projection `EmitCommand` variants (`WritePendingBootstrapTrust`, `WriteAcceptedBootstrapTrust`, `SupersedeBootstrapTrust`) by projecting trust rows directly and consuming bootstrap trust via `peer_shared` write ops.
+6. Phase 6 runtime fallback wiring completed:
+   - added `build_tenant_bootstrap_fallback_client_config_from_db`,
+   - connect loops now dial ongoing-first and retry with bootstrap fallback only for trust-rejection failures,
+   - fallback is enabled only for bootstrap-ingress workers,
+   - fallback connections run one sync session then close.
+7. Follow-up simplification: removed trust-specific projection `EmitCommand` variants (`WritePendingBootstrapTrust`, `WriteAcceptedBootstrapTrust`, `SupersedeBootstrapTrust`) by projecting trust rows directly and consuming bootstrap trust via `peer_shared` write ops.

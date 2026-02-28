@@ -103,8 +103,10 @@ pub(super) async fn supervise_connection_sessions(
     direction: SessionDirection,
     tenant_resolver: &SessionTenantResolver,
     shutdown: CancellationToken,
+    max_sessions: Option<usize>,
 ) {
     let connection = provider.connection();
+    let mut sessions_completed = 0usize;
 
     loop {
         if shutdown.is_cancelled() {
@@ -155,6 +157,16 @@ pub(super) async fn supervise_connection_sessions(
             db_path,
         )
         .await;
+        sessions_completed += 1;
+        if max_sessions.is_some_and(|limit| sessions_completed >= limit) {
+            info!(
+                "Connection {} reached session budget {}; closing",
+                short_peer_id(peer_id),
+                sessions_completed
+            );
+            connection.close(0u32.into(), b"session budget reached");
+            break;
+        }
 
         info!("Session {} finished in {}ms", session.session_id, session_start.elapsed().as_millis());
 
