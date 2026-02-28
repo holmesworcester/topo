@@ -17,7 +17,6 @@ use crate::event_modules::{
     DeviceInviteFirstEvent, UserBootEvent,
     PeerSharedFirstEvent, AdminBootEvent,
     UserRemovedEvent, PeerRemovedEvent, SecretSharedEvent,
-    TransportKeyEvent,
 };
 use crate::transport::identity::{ensure_transport_peer_id, ensure_transport_cert};
 use crate::projection::create::{create_event_sync, create_event_staged, create_signed_event_sync, create_signed_event_staged, create_encrypted_event_sync, CreateEventError};
@@ -142,7 +141,7 @@ impl Peer {
 
     /// Create a new peer with a full identity chain via the production
     /// `bootstrap_workspace` flow (Workspace → UserInviteBoot → InviteAccepted →
-    /// UserBoot → DeviceInviteFirst → PeerSharedFirst → AdminBoot → TransportKey).
+    /// UserBoot → DeviceInviteFirst → PeerSharedFirst → AdminBoot).
     /// Content events (Message, Reaction, etc.) are signed with the PeerShared key.
     pub fn new_with_identity(name: &str) -> Self {
         let mut peer = Self::new(name);
@@ -318,13 +317,6 @@ impl Peer {
     pub fn spki_fingerprint(&self) -> [u8; 32] {
         let (cert, _) = self.cert_and_key();
         extract_spki_fingerprint(cert.as_ref()).expect("failed to extract fingerprint")
-    }
-
-    /// Publish a TransportKey event binding this peer's transport cert to its identity chain.
-    /// Requires identity chain (use new_with_identity).
-    pub fn publish_transport_key(&self) -> EventId {
-        let fp = self.spki_fingerprint();
-        self.create_transport_key(fp, self.signing_key(), &self.signer_eid())
     }
 
     /// Create a message and insert it into all relevant tables.
@@ -696,25 +688,6 @@ impl Peer {
             .expect("failed to create secret_shared")
     }
 
-    /// Create a TransportKey event (signed by PeerShared key). Returns the event ID.
-    pub fn create_transport_key(
-        &self,
-        spki_fingerprint: [u8; 32],
-        signing_key: &ed25519_dalek::SigningKey,
-        peer_shared_event_id: &EventId,
-    ) -> EventId {
-        let db = open_connection(&self.db_path).expect("failed to open db");
-        let evt = ParsedEvent::TransportKey(TransportKeyEvent {
-            created_at_ms: current_timestamp_ms(),
-            spki_fingerprint,
-            signed_by: *peer_shared_event_id,
-            signer_type: 5,
-            signature: [0u8; 64],
-        });
-        create_signed_event_sync(&db, &self.identity, &evt, signing_key)
-            .expect("failed to create transport_key")
-    }
-
     /// Create multiple messages. Uses a transaction for speed at scale.
     /// Requires identity chain.
     pub fn batch_create_messages(&self, count: usize) {
@@ -943,16 +916,6 @@ impl Peer {
         ).unwrap_or(0)
     }
 
-    /// Count transport_keys projected for this peer.
-    pub fn transport_key_count(&self) -> i64 {
-        let db = open_connection(&self.db_path).expect("failed to open db");
-        db.query_row(
-            "SELECT COUNT(*) FROM transport_keys WHERE recorded_by = ?1",
-            rusqlite::params![&self.identity],
-            |row| row.get(0),
-        ).unwrap_or(0)
-    }
-
     /// Get the recorded_at timestamp for a specific event (by base64 event_id).
     pub fn recorded_at_for_event(&self, event_id_b64: &str) -> Option<i64> {
         let db = open_connection(&self.db_path).expect("failed to open db");
@@ -993,7 +956,7 @@ impl Peer {
 
     /// Insert `count` synthetic pending_invite_bootstrap_trust rows for this peer.
     /// Returns the generated SPKI fingerprints.
-    pub fn seed_transport_keys(&self, count: usize) -> Vec<[u8; 32]> {
+    pub fn seed_pending_bootstrap_trust(&self, count: usize) -> Vec<[u8; 32]> {
         use std::time::{SystemTime, UNIX_EPOCH};
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1046,7 +1009,6 @@ const FINGERPRINT_TABLES: &[FingerprintTable] = &[
     FingerprintTable { name: "admins",               scope: Scope::RecordedBy, order: "ORDER BY event_id" },
     FingerprintTable { name: "removed_entities",     scope: Scope::RecordedBy, order: "ORDER BY event_id" },
     FingerprintTable { name: "secret_shared",        scope: Scope::RecordedBy, order: "ORDER BY event_id" },
-    FingerprintTable { name: "transport_keys",       scope: Scope::RecordedBy, order: "ORDER BY event_id" },
     // Trust anchor (uses peer_id as scope key, written by identity projector)
     FingerprintTable { name: "trust_anchors",        scope: Scope::PeerId, order: "ORDER BY peer_id" },
 ];
@@ -1216,7 +1178,6 @@ fn clear_projection_tables(db: &rusqlite::Connection, recorded_by: &str) {
     db.execute("DELETE FROM secret_shared WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
     db.execute("DELETE FROM trust_anchors WHERE peer_id = ?1", rusqlite::params![recorded_by]).ok();
     db.execute("DELETE FROM peer_transport_bindings WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
-    db.execute("DELETE FROM transport_keys WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
     // — Deletion intents (deterministic projection state, must be cleared for replay)
     db.execute("DELETE FROM deletion_intents WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
     // — Operational state (must be cleared for correct re-projection)
@@ -1558,7 +1519,7 @@ pub fn start_peers_pinned(
 /// Start continuous sync between two peers using dynamic DB trust lookup.
 /// Trust is resolved from SQL at each TLS handshake, matching production
 /// behavior (`is_peer_allowed`). Caller must have seeded trust rows
-/// (via `publish_transport_key` + sync, `import_cli_pins_to_sql`, or invite
+/// (via `import_cli_pins_to_sql`, or invite
 /// bootstrap) before peers will accept connections.
 ///
 /// REALISM HELPER: production-matching dynamic trust. Used in holepunch
@@ -2696,7 +2657,7 @@ mod fingerprint_tests {
             "deleted_messages", "message_attachments", "file_slices",
             "workspaces", "invite_accepted", "user_invites", "device_invites",
             "users", "peers_shared", "admins", "removed_entities",
-            "secret_shared", "transport_keys", "trust_anchors",
+            "secret_shared", "trust_anchors",
         ];
         let excluded_tables = [
             "valid_events", "rejected_events", "blocked_event_deps", "blocked_events",

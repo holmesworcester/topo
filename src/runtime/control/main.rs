@@ -1097,7 +1097,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             println!("  Users: {}", data["user_count"]);
             println!("  Peers: {}", data["peer_count"]);
             println!("  Admins: {}", data["admin_count"]);
-            println!("  TransportKeys: {}", data["transport_count"]);
             if !summary {
                 if let Some(users) = data["users"].as_array() {
                     for eid in users {

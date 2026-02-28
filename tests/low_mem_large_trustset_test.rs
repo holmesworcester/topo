@@ -57,7 +57,7 @@ fn large_trustset_allow_deny_correctness() {
     let _env = EnvGuard::enable_low_mem_ios();
 
     let alice = Peer::new_with_identity("alice_trustset_correctness");
-    let fps = alice.seed_transport_keys(100_000);
+    let fps = alice.seed_pending_bootstrap_trust(100_000);
 
     let db = open_connection(&alice.db_path).expect("open db");
 
@@ -86,7 +86,7 @@ fn low_mem_large_trustset_budget() {
     let _env = EnvGuard::enable_low_mem_ios();
 
     let alice = Peer::new_with_identity("alice_trustset_budget");
-    let fps = alice.seed_transport_keys(100_000);
+    let fps = alice.seed_pending_bootstrap_trust(100_000);
 
     let db = open_connection(&alice.db_path).expect("open db");
 

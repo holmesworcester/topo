@@ -112,8 +112,6 @@ both `pass` and `break` polarity unless waived.
 | SPEC_USR_INSERT_01 | InvDeps | CHK_USR_INSERT | projector_unit | — | waiver:insert_or_ignore_no_break |
 | SPEC_SK_INSERT_01 | InvEncryptedKey | CHK_SK_INSERT | projector_unit | simple_projector_tests::tests::test_secret_key_valid | pass |
 | SPEC_SK_INSERT_01 | InvEncryptedKey | CHK_SK_INSERT | projector_unit | — | waiver:insert_or_ignore_no_break |
-| SPEC_TK_INSERT_01 | InvPeerSharedTrustMatchesCarried | CHK_TK_INSERT | projector_unit | simple_projector_tests::tests::test_transport_key_valid | pass |
-| SPEC_TK_INSERT_01 | InvPeerSharedTrustMatchesCarried | CHK_TK_INSERT | projector_unit | — | waiver:insert_or_ignore_no_break |
 | SPEC_SM_INSERT_01 | InvDeps | CHK_SM_INSERT | projector_unit | simple_projector_tests::tests::test_signed_memo_valid | pass |
 | SPEC_SM_INSERT_01 | InvDeps | CHK_SM_INSERT | projector_unit | — | waiver:insert_or_ignore_no_break |
 | SPEC_MA_INSERT_01 | InvDeps | CHK_MA_INSERT | projector_unit | simple_projector_tests::tests::test_message_attachment_valid | pass |

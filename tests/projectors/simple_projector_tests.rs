@@ -1,7 +1,7 @@
 //! Pure projector conformance tests for simple projectors that do straight inserts
 //! with no guards beyond type matching.
 //!
-//! Covers: User, Admin, UserRemoved, PeerRemoved, SecretKey, TransportKey,
+//! Covers: User, Admin, UserRemoved, PeerRemoved, SecretKey,
 //!         MessageAttachment, BenchDep.
 
 #[cfg(test)]
@@ -131,24 +131,6 @@ mod tests {
         let result = project_pure(PEER, EVENT_ID, &parsed, &empty_ctx());
         assert_valid(&result);
         assert_writes_to_table(&result, "secret_keys");
-        assert_no_commands(&result);
-    }
-
-    // ── TransportKey ──
-
-    #[test]
-    fn test_transport_key_valid() {
-        use topo::event_modules::transport_key::{project_pure, TransportKeyEvent};
-        let parsed = ParsedEvent::TransportKey(TransportKeyEvent {
-            created_at_ms: 6000,
-            spki_fingerprint: [0xCC; 32],
-            signed_by: [2u8; 32],
-            signer_type: 5,
-            signature: [0u8; 64],
-        });
-        let result = project_pure(PEER, EVENT_ID, &parsed, &empty_ctx());
-        assert_valid(&result);
-        assert_writes_to_table(&result, "transport_keys");
         assert_no_commands(&result);
     }
 
