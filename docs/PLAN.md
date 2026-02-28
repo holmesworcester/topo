@@ -100,10 +100,13 @@ These are required, not optional:
    - `invite_accepted` is a local anchor-binding event, not a global invite-presence gate.
    - trust-anchor gating belongs on root workspace event validity.
    - do not use pre-projection raw-blob capture tables as authority for trust-anchor binding.
-11. Identity finalization.
-   - `create_workspace` pre-derives the PeerShared key and writes all events under the correct `recorded_by` from the start — no `finalize_identity` needed.
-   - invite acceptance / device link flows begin under temporary invite-derived `recorded_by`; once PeerShared identity materializes, `finalize_identity(old, new)` rebinds tenant-scoped rows transactionally.
+11. Identity pre-derive.
+   - `create_workspace`, `accept_invite`, and `accept_device_link` pre-derive the PeerShared key and write events under the final `recorded_by` from first write — no `finalize_identity`.
+   - invite acceptance / device link may install invite-derived bootstrap transport certs first, but tenant scope key remains final and projection later installs PeerShared-derived transport identity.
    - connect loop resolves identity once per QUIC connection, not per session (identity transitions only happen during discrete CLI commands).
+12. Transport fingerprint bridge.
+   - `peer_shared` projection materializes deterministic `peers_shared.transport_fingerprint` and indexes `(recorded_by, transport_fingerprint)`.
+   - trust/removal lookup paths use projected `transport_fingerprint` rows and do not fallback to runtime scan+derive over `peers_shared.public_key`.
 
 ## 2.2 CLI Architecture Principle
 
@@ -1165,6 +1168,7 @@ Previous gap: TLA models were identity/event-causality models that did not encod
 **What is now modeled** (TransportCredentialLifecycle.tla):
 - Local credential lifecycle: single credential per peer (no rotation/revocation in POC).
 - Three-source trust store: PeerShared-derived SPKIs, invite_bootstrap_trust, pending_invite_bootstrap_trust.
+- PeerShared trust source is represented as projected `peers_shared.transport_fingerprint` values (indexed by `(recorded_by, transport_fingerprint)`), matching runtime lookup shape.
 - Supersession: PeerShared projector emits `SupersedeBootstrapTrust` command at projection time, which removes matching bootstrap/pending entries. Trust check reads are pure (no write side-effects).
 - TTL expiry of bootstrap trust sources.
 - Trust removal (peer_removed cascading, user_removed transitive denial via `peers_shared.user_event_id`).

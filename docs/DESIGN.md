@@ -185,7 +185,7 @@ All peer transport uses QUIC with strict pinned mTLS.
 Rules:
 1. each daemon profile has persistent cert/private key material,
 2. peer allow/deny policy is based on SQL trust state:
-   - PeerShared-derived SPKIs (steady-state; SPKI computed directly from PeerShared public key),
+   - PeerShared-derived transport fingerprints from projected `peers_shared.transport_fingerprint` rows (deterministically computed from PeerShared public key at projection time),
    - `invite_bootstrap_trust` rows produced by projection from `InviteAccepted` events + local `bootstrap_context`,
    - `pending_invite_bootstrap_trust` rows produced by projection from invite events (UserInviteBoot, DeviceInviteFirst) + local `bootstrap_context`,
    - trust rows are projection-owned state; the service layer writes `bootstrap_context` rows only, not trust rows directly,
@@ -196,7 +196,7 @@ Rules:
 Transport peer identity is SPKI-derived:
 
 1. `peer_id = hex(BLAKE2b-256(cert_SPKI))`,
-2. SPKI is computed directly from PeerShared public key (deterministic cert derivation),
+2. `peer_shared` projection materializes `peers_shared.transport_fingerprint` as that deterministic SPKI fingerprint and indexes `(recorded_by, transport_fingerprint)`,
 3. the `peer_transport_bindings` table is observation telemetry keyed by `(recorded_by, peer_id)`, where `recorded_by` is the local tenant key and `peer_id` is the remote transport fingerprint; `spki_fingerprint` stores the raw 32-byte SPKI for lookup/diagnostics,
 4. `invite_bootstrap_trust` stores accepted invite-link bootstrap tuples
    (`bootstrap_addr`, inviter SPKI) used before PeerShared-derived trust appears,
@@ -205,6 +205,7 @@ Transport peer identity is SPKI-derived:
 6. accepted/pending bootstrap rows are time-bounded and consumed at projection time
    (PeerShared projector emits `SupersedeBootstrapTrust`) when matching steady-state
    PeerShared-derived trust appears. Trust check reads are pure (no write side-effects).
+7. trust/removal lookups use projected `transport_fingerprint` rows and do not scan/derive fallback from `peers_shared.public_key`.
 
 Runtime rule: handshake verification queries SQL trust state per connection creation; projected peer keys are not treated as in-memory authority.
 
@@ -486,7 +487,7 @@ All tenants on a device share a single UDP port. The server uses `WorkspaceCertR
 ### Per-tenant dynamic trust
 
 The single QUIC endpoint uses a union trust closure that accepts connections trusted by **any** local tenant. Post-handshake, `resolve_tenant_for_peer` checks `is_peer_allowed` for each tenant to determine routing. The trust closure queries three trust sources for each tenant's `recorded_by`:
-- **PeerShared-derived SPKIs** (primary steady-state; SPKI computed directly from PeerShared public key),
+- **PeerShared-derived transport fingerprints** (primary steady-state; from projected `peers_shared.transport_fingerprint`),
 - `invite_bootstrap_trust` rows (accepted invite-link bootstrap, TTL-bounded),
 - `pending_invite_bootstrap_trust` rows (inviter-side pre-handshake, TTL-bounded).
 
@@ -494,7 +495,7 @@ Trust checks are **tenant-scoped** (`recorded_by`-partitioned). Value-level trus
 
 ### Removal-driven session teardown
 
-When a `PeerRemoved` event is projected, the removed peer's SPKI is excluded from trust lookups (via `NOT EXISTS (removed_entities)` in `peer_shared_spki_fingerprints`). When a `UserRemoved` event is projected, all peers linked to that user via `peers_shared.user_event_id` are transitively denied. Additionally:
+When a `PeerRemoved` event is projected, trust lookups and removal-watch checks use indexed `(recorded_by, transport_fingerprint)` projection rows plus `removed_entities` predicates to deny the removed peer. When a `UserRemoved` event is projected, all peers linked to that user via `peers_shared.user_event_id` are transitively denied. Additionally:
 - New TLS handshakes are denied: `is_peer_allowed` returns false for removed peers and for peers whose owning user has been removed.
 - Active sessions are torn down: between sync sessions, both `accept_loop` and `connect_loop` check `is_peer_removed` for the connected peer's SPKI. If the peer has been directly removed or its user has been removed, the QUIC connection is closed with error code 2 ("peer removed").
 
@@ -1183,6 +1184,7 @@ Required semantics:
    - `invite_accepted` projector emits `WriteAcceptedBootstrapTrust`,
    - `peer_shared` projector emits `SupersedeBootstrapTrust`.
    Projectors read local `bootstrap_context`; the service layer writes `bootstrap_context` rows only, never trust rows directly.
+   Invite command paths do not write pending bootstrap trust directly; local invite events are projected and materialize pending trust through this command path.
    This follows the same poc-6 cascade pattern where `invite_accepted` projection drives trust establishment.
 
 Self-invite bootstrap stays explicit:
@@ -1234,6 +1236,8 @@ This section covers the lifecycle state machine for the three trust sources: Pee
 Credential transition model: invite acceptance may install a bootstrap transport cert first; projection later installs the PeerShared-derived cert. Runtime enforces one-way transition (no bootstrap-after-PeerShared downgrade).
 
 Supersession: when a PeerShared event is projected, the PeerShared projector emits a `SupersedeBootstrapTrust` command that marks matching `invite_bootstrap_trust` and `pending_invite_bootstrap_trust` entries as superseded. This happens at projection time, not on trust check reads — trust check reads (`is_peer_allowed`, `allowed_peers_from_db`) are pure queries with no write side-effects.
+
+Lookup shape: trust and removal queries resolve peers via projected `peers_shared.transport_fingerprint` (indexed by `(recorded_by, transport_fingerprint)`), not by runtime fallback scans over `peers_shared.public_key`.
 
 TTL expiry: bootstrap trust rows are time-bounded. Unconsumed entries expire and are purged.
 
