@@ -1,4 +1,4 @@
-# create_event_sync Semantics: Investigation Findings
+# create_event_synchronous Semantics: Investigation Findings
 
 > **Historical findings; completed. Retained for reference.**
 
@@ -17,13 +17,13 @@ Worktree: `/home/holmes/poc-7-create-event-sync-plan`
 
 | Function | Blocked behavior | Purpose |
 |---|---|---|
-| `create_event_sync` | `Err(Blocked{event_id, missing})` | Strict: success only on Valid |
-| `create_signed_event_sync` | `Err(Blocked{event_id, missing})` | Strict: success only on Valid |
-| `create_encrypted_event_sync` | `Err(Blocked{event_id, missing})` | Strict (delegates to `create_event_sync`) |
+| `create_event_synchronous` | `Err(Blocked{event_id, missing})` | Strict: success only on Valid |
+| `create_signed_event_synchronous` | `Err(Blocked{event_id, missing})` | Strict: success only on Valid |
+| `create_encrypted_event_synchronous` | `Err(Blocked{event_id, missing})` | Strict (delegates to `create_event_synchronous`) |
 | `create_event_staged` | `Ok(event_id)` on Blocked | Lenient: blocked-as-success for bootstrap flows |
 | `create_signed_event_staged` | `Ok(event_id)` on Blocked | Lenient: blocked-as-success for bootstrap flows |
 
-The staged variants are thin wrappers calling `event_id_or_blocked(create_event_sync(...))` (line 41-47, 220-239).
+The staged variants are thin wrappers calling `event_id_or_blocked(create_event_synchronous(...))` (line 41-47, 220-239).
 
 ### Service wrapper (`src/service.rs:88-98`)
 
@@ -45,25 +45,25 @@ This mirrors `event_id_or_blocked` but is owned by the service layer. It convert
 
 | Line | Function | API call | Blocked handling | Notes |
 |---|---|---|---|---|
-| 355 | `ensure_identity_chain` | `unwrap_event_id(create_event_sync(...))` | **OK** | Workspace bootstrap; intentionally tolerates blocking before trust anchor |
-| 362 | `ensure_identity_chain` | `create_event_sync(...)` | **Err** | InviteAccepted; should always succeed (is the trust anchor) |
-| 376,387,398,409 | `ensure_identity_chain` | `create_signed_event_sync(...)` | **Err** | Post-cascade identity events; Blocked would be a bug |
-| **607** | **`svc_send`** | **`unwrap_event_id(create_signed_event_sync(...))`** | **OK** | **Message — Blocked silently returns success** |
-| 681 | `svc_generate` | `create_signed_event_sync(...)` | **Err** | Blocked propagates as error |
-| **773** | **`svc_react`** | **`unwrap_event_id(create_signed_event_sync(...))`** | **OK** | **Reaction — Blocked silently returns success** |
-| **801** | **`svc_delete_message`** | **`unwrap_event_id(create_signed_event_sync(...))`** | **OK** | **Deletion — Blocked silently returns success** |
+| 355 | `ensure_identity_chain` | `unwrap_event_id(create_event_synchronous(...))` | **OK** | Workspace bootstrap; intentionally tolerates blocking before trust anchor |
+| 362 | `ensure_identity_chain` | `create_event_synchronous(...)` | **Err** | InviteAccepted; should always succeed (is the trust anchor) |
+| 376,387,398,409 | `ensure_identity_chain` | `create_signed_event_synchronous(...)` | **Err** | Post-cascade identity events; Blocked would be a bug |
+| **607** | **`svc_send`** | **`unwrap_event_id(create_signed_event_synchronous(...))`** | **OK** | **Message — Blocked silently returns success** |
+| 681 | `svc_generate` | `create_signed_event_synchronous(...)` | **Err** | Blocked propagates as error |
+| **773** | **`svc_react`** | **`unwrap_event_id(create_signed_event_synchronous(...))`** | **OK** | **Reaction — Blocked silently returns success** |
+| **801** | **`svc_delete_message`** | **`unwrap_event_id(create_signed_event_synchronous(...))`** | **OK** | **Deletion — Blocked silently returns success** |
 
 ### 3.2 main.rs — CLI commands
 
 | Line | Function | API call | Blocked handling | Notes |
 |---|---|---|---|---|
 | 617 | `ensure_identity_chain` | `create_event_staged(...)` | **OK** | Workspace bootstrap; same intent as service |
-| 625 | `ensure_identity_chain` | `create_event_sync(...)` | **Err** | InviteAccepted |
-| 637,648,660,670 | `ensure_identity_chain` | `create_signed_event_sync(...)` | **Err** | Post-cascade; Blocked = bug |
-| 702 | `send_message` | `create_signed_event_sync(...)` | **Err** | Message — Blocked is an error |
-| 777 | `generate_messages` | `create_signed_event_sync(...)` | **Err** | Blocked is an error |
-| 1102 | `cli_react` | `create_signed_event_sync(...)` | **Err** | Reaction — Blocked is an error |
-| 1133 | `cli_delete_message` | `create_signed_event_sync(...)` | **Err** | Deletion — Blocked is an error |
+| 625 | `ensure_identity_chain` | `create_event_synchronous(...)` | **Err** | InviteAccepted |
+| 637,648,660,670 | `ensure_identity_chain` | `create_signed_event_synchronous(...)` | **Err** | Post-cascade; Blocked = bug |
+| 702 | `send_message` | `create_signed_event_synchronous(...)` | **Err** | Message — Blocked is an error |
+| 777 | `generate_messages` | `create_signed_event_synchronous(...)` | **Err** | Blocked is an error |
+| 1102 | `cli_react` | `create_signed_event_synchronous(...)` | **Err** | Reaction — Blocked is an error |
+| 1133 | `cli_delete_message` | `create_signed_event_synchronous(...)` | **Err** | Deletion — Blocked is an error |
 
 ### 3.3 identity_ops.rs
 
@@ -71,28 +71,28 @@ This mirrors `event_id_or_blocked` but is owned by the service layer. It convert
 |---|---|---|---|---|
 | 92 | `bootstrap_identity_chain` | `create_event_staged(...)` | **OK** | Workspace — intentional pre-trust-anchor staging |
 | 105 | `bootstrap_identity_chain` | `create_signed_event_staged(...)` | **OK** | UserInviteBoot — intentional pre-trust-anchor staging |
-| 119 | `bootstrap_identity_chain` | `create_event_sync(...)` | **Err** | InviteAccepted — trust anchor, must succeed |
-| 131,148,165,183 | `bootstrap_identity_chain` | `create_signed_event_sync(...)` | **Err** | Post-cascade events — must succeed |
-| 236 | `create_user_invite` | `create_signed_event_sync(...)` | **Err** | |
-| 271,283,300,317 | `accept_user_invite` | `create_event_sync / create_signed_event_sync` | **Err** | |
-| 364 | `create_device_link` | `create_signed_event_sync(...)` | **Err** | |
+| 119 | `bootstrap_identity_chain` | `create_event_synchronous(...)` | **Err** | InviteAccepted — trust anchor, must succeed |
+| 131,148,165,183 | `bootstrap_identity_chain` | `create_signed_event_synchronous(...)` | **Err** | Post-cascade events — must succeed |
+| 236 | `create_user_invite` | `create_signed_event_synchronous(...)` | **Err** | |
+| 271,283,300,317 | `accept_user_invite` | `create_event_synchronous / create_signed_event_synchronous` | **Err** | |
+| 364 | `create_device_link` | `create_signed_event_synchronous(...)` | **Err** | |
 | 392,404 | `accept_device_link` | mixed | **Err** | |
-| 449 | `create_transport_key_if_possible` | `create_signed_event_sync(...)` | **Err** | |
+| 449 | `create_transport_key_if_possible` | `create_signed_event_synchronous(...)` | **Err** | |
 
 ### 3.4 interactive.rs
 
 | Line | Function | API call | Blocked handling |
 |---|---|---|---|
-| 584 | send message | `create_signed_event_sync(...)` | **Err** |
-| 727 | reaction | `create_signed_event_sync(...)` | **Err** |
-| 808 | deletion | `create_signed_event_sync(...)` | **Err** |
-| 1486 | signed memo | `create_signed_event_sync(...)` | **Err** |
+| 584 | send message | `create_signed_event_synchronous(...)` | **Err** |
+| 727 | reaction | `create_signed_event_synchronous(...)` | **Err** |
+| 808 | deletion | `create_signed_event_synchronous(...)` | **Err** |
+| 1486 | signed memo | `create_signed_event_synchronous(...)` | **Err** |
 
 ### 3.5 transport_identity.rs
 
 | Line | Function | API call | Blocked handling |
 |---|---|---|---|
-| 224 | transport key creation | `create_signed_event_sync(...)` | **Err** |
+| 224 | transport key creation | `create_signed_event_synchronous(...)` | **Err** |
 
 ### 3.6 testutil.rs
 
@@ -100,7 +100,7 @@ Correctly uses staged APIs (`create_event_staged`, `create_signed_event_staged`)
 
 ### 3.7 Test files
 
-- `tests/perf_test.rs:334`: `create_signed_event_sync` — expects success
+- `tests/perf_test.rs:334`: `create_signed_event_synchronous` — expects success
 - `tests/scenario_test.rs`: mix of staged and strict APIs, all appropriate to context
 
 ## 4. Key Findings
@@ -124,10 +124,10 @@ The `create_event_staged` / `create_signed_event_staged` APIs are used exclusive
 ### Finding 4: PLAN contract is clear
 
 `docs/PLAN.md:600-602` states:
-> default `create_event_sync` must return success only when the created event is `valid` for `recorded_by`.
+> default `create_event_synchronous` must return success only when the created event is `valid` for `recorded_by`.
 > if terminal state is `blocked` or `rejected`, return an error containing `event_id` + terminal reason.
 
-The core `create_event_sync` already satisfies this contract. The contract violation exists only in the service-layer `unwrap_event_id` wrapper applied to content-event call sites.
+The core `create_event_synchronous` already satisfies this contract. The contract violation exists only in the service-layer `unwrap_event_id` wrapper applied to content-event call sites.
 
 ### Finding 5: No caller actually depends on Blocked-as-success for content events
 
@@ -156,7 +156,7 @@ Remove `unwrap_event_id` from content-event service paths. Let `svc_send`, `svc_
 
 **Migration steps (POC-style, no compatibility):**
 1. Remove `unwrap_event_id` calls from `svc_send` (line 607), `svc_react` (line 773), `svc_delete_message` (line 801).
-2. Replace with direct `create_signed_event_sync(...)` calls, converting `CreateEventError` to `ServiceError` via `.map_err(|e| ServiceError(format!("{}", e)))`.
+2. Replace with direct `create_signed_event_synchronous(...)` calls, converting `CreateEventError` to `ServiceError` via `.map_err(|e| ServiceError(format!("{}", e)))`.
 3. Keep `unwrap_event_id` only for `ensure_identity_chain` workspace bootstrap (line 355), where Blocked-as-success is correct and intentional.
 4. Add service-layer unit tests for Blocked propagation.
 5. Run full regression gate.
@@ -192,11 +192,11 @@ Keep `unwrap_event_id` but add a `status` field to `SendResponse`/`ReactResponse
 
 ### Option C: Eliminate `unwrap_event_id` entirely, use staged APIs where Blocked-OK is needed
 
-Remove `unwrap_event_id` from service.rs entirely. For the workspace bootstrap case in `ensure_identity_chain`, switch to `create_event_staged` (already available) instead of `unwrap_event_id(create_event_sync(...))`.
+Remove `unwrap_event_id` from service.rs entirely. For the workspace bootstrap case in `ensure_identity_chain`, switch to `create_event_staged` (already available) instead of `unwrap_event_id(create_event_synchronous(...))`.
 
 **API impact:** Same as Option A for content events.
 
-**Additional cleanup:** `ensure_identity_chain` in service.rs (line 355) switches from `unwrap_event_id(create_event_sync(...))` to `create_event_staged(...)`, matching the main.rs pattern.
+**Additional cleanup:** `ensure_identity_chain` in service.rs (line 355) switches from `unwrap_event_id(create_event_synchronous(...))` to `create_event_staged(...)`, matching the main.rs pattern.
 
 **Advantage over A:** Eliminates the `unwrap_event_id` function entirely. All Blocked-as-success semantics flow through the well-named `create_event_staged` / `create_signed_event_staged` APIs.
 
@@ -207,7 +207,7 @@ Remove `unwrap_event_id` from service.rs entirely. For the workspace bootstrap c
 **Option C** is recommended.
 
 Rationale:
-1. Aligns with PLAN contract (success-only-on-valid for `create_event_sync`).
+1. Aligns with PLAN contract (success-only-on-valid for `create_event_synchronous`).
 2. Eliminates the service-layer `unwrap_event_id` entirely — all Blocked-as-OK flows through explicitly named staged APIs.
 3. Resolves the CLI/service behavioral divergence.
 4. Follows POC replacement policy: one canonical behavior, no compatibility wrapper.
@@ -219,8 +219,8 @@ Rationale:
 If Option C is approved:
 
 1. `src/service.rs`:
-   - Line 355: replace `unwrap_event_id(create_event_sync(db, recorded_by, &ws))` with `create_event_staged(db, recorded_by, &ws).map_err(|e| ServiceError(format!("{}", e)))`.
-   - Lines 607, 773, 801: replace `unwrap_event_id(create_signed_event_sync(...))` with `create_signed_event_sync(...).map_err(|e| ServiceError(format!("{}", e)))`.
+   - Line 355: replace `unwrap_event_id(create_event_synchronous(db, recorded_by, &ws))` with `create_event_staged(db, recorded_by, &ws).map_err(|e| ServiceError(format!("{}", e)))`.
+   - Lines 607, 773, 801: replace `unwrap_event_id(create_signed_event_synchronous(...))` with `create_signed_event_synchronous(...).map_err(|e| ServiceError(format!("{}", e)))`.
    - Delete the `unwrap_event_id` function (lines 88-98) and its doc comment (lines 80-91).
    - Add `create_event_staged` to the import from `crate::projection::create`.
 2. Add service-layer tests verifying:

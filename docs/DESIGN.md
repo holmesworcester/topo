@@ -744,11 +744,11 @@ Design note:
 
 Three creation entry points exist:
 
-1. `create_event_sync(...) -> event_id`, <!-- why do these functions have the word "sync" in them? is there any async create? -->
-2. `create_signed_event_sync(...) -> event_id`,
-3. `create_encrypted_event_sync(...) -> event_id`.
+1. `create_event_synchronous(...) -> event_id`,
+2. `create_signed_event_synchronous(...) -> event_id`,
+3. `create_encrypted_event_synchronous(...) -> event_id`.
 
-`create_event_sync` uses the same internal path as workers and returns success only when terminal state is `valid` for the target `recorded_by`.
+`create_event_synchronous` uses the same internal path as workers and returns success only when terminal state is `valid` for the target `recorded_by`.
 This preserves imperative orchestration ergonomics:
 
 1. create event A synchronously,
@@ -1316,7 +1316,7 @@ Event modules (`src/event_modules/<type>.rs` or `src/event_modules/<type>/`) own
 
 1. **Wire** — struct definition, parse/encode, wire layout, `EventTypeMeta`.
 2. **Projector** — `project_pure()` function: the pure projector for this event type. Takes `(recorded_by, event_id_b64, &ParsedEvent, &ContextSnapshot)` and returns `ProjectorResult`. Registered in `EventTypeMeta.projector` so the pipeline dispatches via registry lookup with no central match statement.
-3. **Commands** — `CreateXxxCmd` struct + `create()` function that builds the `ParsedEvent`, calls `create_signed_event_sync`, and returns `EventId`. High-level conn-level helpers (e.g. `send`, `react`) and multi-step workflows (e.g. workspace onboarding) are first-class command APIs in this layer.
+3. **Commands** — `CreateXxxCmd` struct + `create()` function that builds the `ParsedEvent`, calls `create_signed_event_synchronous`, and returns `EventId`. High-level conn-level helpers (e.g. `send`, `react`) and multi-step workflows (e.g. workspace onboarding) are first-class command APIs in this layer.
 4. **Queries** — `list()`, `count()`, `resolve()`, `list_for_message_with_authors()`, etc. — SQL against projection tables scoped by `recorded_by`. All event-specific SQL lives here.
 5. **Response types** — serializable structs for the event domain (e.g. `MessageItem`, `MessagesResponse`, `SendResponse`). Owned by the event module, re-exported by service.rs for external callers.
 
