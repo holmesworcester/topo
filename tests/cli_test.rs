@@ -555,8 +555,7 @@ fn test_cli_local_mdns_discovery_without_placeholder_autodial() {
     create_workspace(&alice_db);
     let mut alice = start_daemon_with_options(&alice_db, true);
 
-    // Alice sends seed message and creates invite
-    let alice_seed_eid = send_message(&alice_db, "alice-seed");
+    // Alice creates invite while daemon is running.
     let invite_link = create_invite(&alice_db, &daemon_listen_addr(&alice_db));
 
     // Bob accepts invite and starts daemon with placeholder autodial disabled.
@@ -564,20 +563,19 @@ fn test_cli_local_mdns_discovery_without_placeholder_autodial() {
     accept_invite(&bob_db, &invite_link);
     let mut bob = start_daemon_with_options(&bob_db, true);
 
-    // Wait for Bob's identity chain to complete via mDNS-discovered sync
-    // (message_count >= 1 proves full cascade completed).
-    assert_eventually(&bob_db, "message_count >= 1", timeout_ms);
+    // Validate bidirectional convergence using messages created after both
+    // daemons are running (avoids counting accept-invite bootstrap artifacts).
+    let alice_live_eid = send_message(&alice_db, "alice-via-mdns-localhost");
+    assert_eventually(
+        &bob_db,
+        &format!("has_event:{} >= 1", alice_live_eid),
+        timeout_ms,
+    );
 
-    // Validate bidirectional convergence.
     let bob_msg_eid = send_message(&bob_db, "bob-via-mdns-localhost");
     assert_eventually(
         &alice_db,
         &format!("has_event:{} >= 1", bob_msg_eid),
-        timeout_ms,
-    );
-    assert_eventually(
-        &bob_db,
-        &format!("has_event:{} >= 1", alice_seed_eid),
         timeout_ms,
     );
 

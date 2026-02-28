@@ -111,8 +111,9 @@ check_no_match 'crate::identity::' src/
 check_no_match 'pub mod identity;' src/lib.rs
 
 # -- db boundary hardening: state/db must not depend on transport runtime --
-check_no_match 'crate::transport::' src/state/db/
-check_no_match 'crate::runtime::transport::' src/state/db/
+# Match actual `use` imports only to avoid false positives in string literals.
+check_no_match '^[[:space:]]*use[[:space:]]+crate::transport::' src/state/db/
+check_no_match '^[[:space:]]*use[[:space:]]+crate::runtime::transport::' src/state/db/
 
 # -- event-module locality: service.rs must not call event-domain invite/identity ops directly --
 check_no_match 'identity_ops::create_user_invite' "$SERVICE_PATH"

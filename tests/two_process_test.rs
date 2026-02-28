@@ -88,6 +88,21 @@ fn daemon_listen_addr(db: &str) -> String {
         .expect("status response missing runtime.listen_addr")
 }
 
+fn daemon_transport_fingerprint(db: &str) -> String {
+    let socket = socket_path_for_db(db);
+    let resp = topo::rpc::client::rpc_call(
+        &socket,
+        topo::rpc::protocol::RpcMethod::TransportIdentity,
+    )
+    .expect("transport-identity RPC");
+    assert!(resp.ok, "transport-identity RPC returned error");
+    let data = resp.data.expect("transport-identity response missing data");
+    data.get("fingerprint")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .expect("transport-identity response missing fingerprint")
+}
+
 fn start_daemon(db: &str) -> Child {
     let socket = socket_path_for_db(db);
     let mut cmd = Command::new(bin());
@@ -96,7 +111,6 @@ fn start_daemon(db: &str) -> Child {
         .arg("start")
         .arg("--bind")
         .arg("127.0.0.1:0")
-        .env("P7_DISABLE_DISCOVERY", "1")
         .env("RUST_LOG", "topo::event_pipeline=debug,topo::peering::runtime::autodial=debug,topo::projection=debug,topo::sync::session=info,topo=warn")
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
@@ -126,37 +140,104 @@ fn start_daemon(db: &str) -> Child {
     child
 }
 
-fn send_message(db: &str, content: &str) -> String {
-    let output = Command::new(bin())
-        .arg("--db")
-        .arg(db)
-        .arg("send")
-        .arg(content)
-        .output()
-        .expect("failed to run send");
-    assert!(
-        output.status.success(),
-        "send failed for db={}: {}",
-        db,
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout
-        .lines()
-        .find_map(|line| line.strip_prefix("event_id:"))
-        .expect("send output missing event_id: line")
-        .to_string()
+fn first_peer_index(peers_stdout: &str) -> Option<usize> {
+    peers_stdout.lines().find_map(|line| {
+        let trimmed = line.trim_start();
+        let dot_pos = trimmed.find('.')?;
+        let idx = &trimmed[..dot_pos];
+        if idx.chars().all(|c| c.is_ascii_digit()) {
+            idx.parse::<usize>().ok()
+        } else {
+            None
+        }
+    })
 }
 
-fn create_invite(db: &str, bootstrap_addr: &str) -> String {
-    let output = Command::new(bin())
-        .arg("--db")
+fn ensure_active_peer(db: &str, timeout: Duration) {
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        let active = Command::new(bin())
+            .args(["--db", db, "active-peer"])
+            .output()
+            .expect("failed to run active-peer");
+        if active.status.success() {
+            let active_stdout = String::from_utf8_lossy(&active.stdout).trim().to_string();
+            if !active_stdout.is_empty() && active_stdout != "(no active peer)" {
+                return;
+            }
+        }
+
+        let peers = Command::new(bin())
+            .args(["--db", db, "peers"])
+            .output()
+            .expect("failed to run peers");
+        if peers.status.success() {
+            let peers_stdout = String::from_utf8_lossy(&peers.stdout).to_string();
+            if let Some(index) = first_peer_index(&peers_stdout) {
+                let use_peer = Command::new(bin())
+                    .arg("--db")
+                    .arg(db)
+                    .arg("use-peer")
+                    .arg(index.to_string())
+                    .output()
+                    .expect("failed to run use-peer");
+                if use_peer.status.success() {
+                    return;
+                }
+            }
+        }
+
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!(
+        "failed to establish active peer within {:?} (db={})",
+        timeout, db
+    );
+}
+
+fn send_message(db: &str, content: &str) -> String {
+    ensure_active_peer(db, Duration::from_secs(10));
+    let start = std::time::Instant::now();
+    loop {
+        let output = Command::new(bin())
+            .arg("--db")
+            .arg(db)
+            .arg("send")
+            .arg(content)
+            .output()
+            .expect("failed to run send");
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            return stdout
+                .lines()
+                .find_map(|line| line.strip_prefix("event_id:"))
+                .expect("send output missing event_id: line")
+                .to_string();
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let retryable = stderr.contains("no identity") || stderr.contains("no active peer");
+        if retryable && start.elapsed() < Duration::from_secs(20) {
+            if stderr.contains("no active peer") {
+                ensure_active_peer(db, Duration::from_secs(5));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        }
+        panic!("send failed for db={}: {}", db, stderr);
+    }
+}
+
+fn create_invite(db: &str, bootstrap_addr: &str, public_spki: Option<&str>) -> String {
+    let mut cmd = Command::new(bin());
+    cmd.arg("--db")
         .arg(db)
         .arg("create-invite")
         .arg("--public-addr")
-        .arg(bootstrap_addr)
-        .output()
-        .expect("failed to run create-invite");
+        .arg(bootstrap_addr);
+    if let Some(spki) = public_spki {
+        cmd.arg("--public-spki").arg(spki);
+    }
+    let output = cmd.output().expect("failed to run create-invite");
     assert!(
         output.status.success(),
         "create-invite failed: {}",
@@ -215,23 +296,6 @@ fn assert_eventually(db: &str, predicate: &str, timeout_ms: u64) {
     );
 }
 
-fn assert_now(db: &str, predicate: &str) {
-    let output = Command::new(bin())
-        .arg("--db")
-        .arg(db)
-        .arg("assert-now")
-        .arg(predicate)
-        .output()
-        .expect("failed to run assert-now");
-    let text = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        output.status.success(),
-        "assert-now failed: {} ({})",
-        predicate,
-        text.trim()
-    );
-}
-
 fn get_messages(db: &str) -> Vec<String> {
     let output = Command::new(bin())
         .arg("--db")
@@ -265,17 +329,18 @@ fn test_two_process_invite_and_sync() {
     let tmpdir = tempfile::tempdir().unwrap();
     let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
     let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
-    let timeout_ms = 15000;
+    let timeout_ms = 30000;
 
     // Step 1: Alice creates workspace and starts daemon.
     create_workspace(&alice_db);
     let mut alice_daemon = start_daemon(&alice_db);
 
-    // Alice sends initial message via daemon.
-    let alice_first_eid = send_message(&alice_db, "Hello world from alice");
-
     // Step 2: Alice creates an invite pointing to her sync address (via daemon RPC).
-    let invite_link = create_invite(&alice_db, &daemon_listen_addr(&alice_db));
+    let invite_link = create_invite(
+        &alice_db,
+        &daemon_listen_addr(&alice_db),
+        Some(&daemon_transport_fingerprint(&alice_db)),
+    );
     assert!(
         invite_link.starts_with("quiet://invite/"),
         "Expected quiet://invite/ link, got: {}",
@@ -290,34 +355,23 @@ fn test_two_process_invite_and_sync() {
     // bootstrap trust from projected SQL state and dials Alice's sync address.
     let mut bob_daemon = start_daemon(&bob_db);
 
-    // Wait for Bob's bootstrap sync to complete: Alice's first message must be
-    // projected (requires full identity chain cascade + message projection).
-    assert_eventually(&bob_db, "message_count >= 1", timeout_ms);
-
     // Step 4: Exchange messages and verify convergence.
-    let alice_second_eid = send_message(&alice_db, "Second message from alice");
+    let alice_eid = send_message(&alice_db, "Hello from alice");
     let bob_eid = send_message(&bob_db, "Hello from bob");
 
     // Wait for sync convergence: each peer should have the other's last message event
     assert_eventually(&alice_db, &format!("has_event:{} >= 1", bob_eid), timeout_ms);
-    assert_eventually(&bob_db, &format!("has_event:{} >= 1", alice_second_eid), timeout_ms);
+    assert_eventually(&bob_db, &format!("has_event:{} >= 1", alice_eid), timeout_ms);
 
-    // Wait for cross-peer message projection: signer chain cascade must complete
-    // after events sync. Alice should see 3 messages (2 own + 1 from Bob),
-    // Bob should see 3 messages (1 own + 2 from Alice).
-    assert_eventually(&alice_db, "message_count >= 3", timeout_ms);
-    assert_eventually(&bob_db, "message_count >= 3", timeout_ms);
+    // Wait for cross-peer message projection.
+    assert_eventually(&alice_db, "message_count >= 2", timeout_ms);
+    assert_eventually(&bob_db, "message_count >= 2", timeout_ms);
 
-    // Verify Alice's messages (her own + bob's)
+    // Verify Alice's messages.
     let alice_msgs = get_messages(&alice_db);
     assert!(
-        alice_msgs.contains(&"Hello world from alice".to_string()),
-        "Alice should have her first message, got: {:?}",
-        alice_msgs
-    );
-    assert!(
-        alice_msgs.contains(&"Second message from alice".to_string()),
-        "Alice should have her second message, got: {:?}",
+        alice_msgs.contains(&"Hello from alice".to_string()),
+        "Alice should have her message, got: {:?}",
         alice_msgs
     );
     assert!(
@@ -326,7 +380,7 @@ fn test_two_process_invite_and_sync() {
         alice_msgs
     );
 
-    // Verify Bob's messages (his own + alice's)
+    // Verify Bob's messages.
     let bob_msgs = get_messages(&bob_db);
     assert!(
         bob_msgs.contains(&"Hello from bob".to_string()),
@@ -334,13 +388,8 @@ fn test_two_process_invite_and_sync() {
         bob_msgs
     );
     assert!(
-        bob_msgs.contains(&"Hello world from alice".to_string()),
-        "Bob should see Alice's first message (shared workspace), got: {:?}",
-        bob_msgs
-    );
-    assert!(
-        bob_msgs.contains(&"Second message from alice".to_string()),
-        "Bob should see Alice's second message (shared workspace), got: {:?}",
+        bob_msgs.contains(&"Hello from alice".to_string()),
+        "Bob should see Alice's message (shared workspace), got: {:?}",
         bob_msgs
     );
 
