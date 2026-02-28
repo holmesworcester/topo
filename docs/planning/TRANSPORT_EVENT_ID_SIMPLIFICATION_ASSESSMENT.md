@@ -16,6 +16,10 @@ Implemented outcomes:
 5. Invite pending bootstrap trust still materializes via projection/autowrite.
 6. Transport boundary readability improved with explicit `transport_fingerprint()` accessors.
 7. Trust/removal SQL paths now use indexed `transport_fingerprint` lookups only.
+8. Remaining trust-specific projection `EmitCommand` indirection was removed:
+   - invite projectors now write bootstrap trust rows directly (`pending_invite_bootstrap_trust`, `invite_bootstrap_trust`),
+   - `peer_shared` projector now directly consumes matching bootstrap trust rows via deletes,
+   - apply-stage trust command handlers were removed.
 
 ## Simplifying Power
 
@@ -24,6 +28,7 @@ Implemented outcomes:
 1. Removed one authority path (service/command side) for pending bootstrap trust writes during invite creation.
 2. Removed repeated scan-and-derive SPKI logic from hot trust/removal checks when projected fingerprints exist.
 3. Made transport-to-event reasoning explicit and queryable by adding direct index-backed mapping.
+4. Collapsed trust materialization/supersession into regular projection writes, reducing special post-write command flow.
 
 ### Complexity Still Present (By Constraint)
 
@@ -45,6 +50,5 @@ The model is now cleaner where it matters operationally:
 
 ## Remaining High-Value Simplifications
 
-1. Remove remaining projection `EmitCommand` trust writes by projecting trust rows directly in-table (if projector contract evolution is accepted).
-2. Add invite-expiry-derived bootstrap-key TTL policy (`bootstrap_key_expires_at = invite_expires_at + grace`) in a follow-up.
-3. Add explicit retry-based ongoing-first/bootstrap-fallback dial policy at connection lifecycle boundary (still out of scope in this change).
+1. Add invite-expiry-derived bootstrap-key TTL policy (`bootstrap_key_expires_at = invite_expires_at + grace`) in a follow-up.
+2. Add explicit retry-based ongoing-first/bootstrap-fallback dial policy at connection lifecycle boundary (still out of scope in this change).

@@ -7,10 +7,10 @@ use crate::crypto::{AllowedPeers, spki_fingerprint_from_ed25519_pubkey};
 
 /// Pending bootstrap trust from locally-created invites is temporary.
 /// If a peer never joins, this entry should not authorize transport forever.
-const PENDING_INVITE_BOOTSTRAP_TTL_MS: i64 = 24 * 60 * 60 * 1000;
+pub(crate) const PENDING_INVITE_BOOTSTRAP_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 /// Accepted bootstrap trust is also temporary until steady-state transport key
 /// trust converges for that same SPKI.
-const ACCEPTED_INVITE_BOOTSTRAP_TTL_MS: i64 = 24 * 60 * 60 * 1000;
+pub(crate) const ACCEPTED_INVITE_BOOTSTRAP_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// Workspace sentinel for CLI-pin-imported bootstrap trust rows.
 const CLI_PIN_WORKSPACE: &str = "cli-bootstrap";
@@ -419,8 +419,8 @@ pub fn allowed_peers_from_db(
     conn: &Connection,
     recorded_by: &str,
 ) -> Result<AllowedPeers, Box<dyn std::error::Error + Send + Sync>> {
-    // Supersession is now handled at projection time (PeerShared projector
-    // emits SupersedeBootstrapTrust). Trust check reads are pure.
+    // Supersession is handled at projection time via PeerShared writes.
+    // Trust check reads are pure.
     let now = now_ms_i64();
     let mut stmt = conn.prepare(
         "SELECT DISTINCT bootstrap_spki_fingerprint AS spki_fingerprint
@@ -458,8 +458,8 @@ pub fn is_peer_allowed(
     recorded_by: &str,
     spki_fingerprint: &[u8; 32],
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    // Supersession is now handled at projection time (PeerShared projector
-    // emits SupersedeBootstrapTrust). Trust check reads are pure.
+    // Supersession is handled at projection time via PeerShared writes.
+    // Trust check reads are pure.
     // Check PeerShared-derived SPKIs first (primary steady-state trust source)
     if is_peer_shared_spki(conn, recorded_by, spki_fingerprint)? {
         return Ok(true);
@@ -496,8 +496,8 @@ pub fn trusted_peer_count(
     conn: &Connection,
     recorded_by: &str,
 ) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
-    // Supersession is now handled at projection time (PeerShared projector
-    // emits SupersedeBootstrapTrust). Trust check reads are pure.
+    // Supersession is handled at projection time via PeerShared writes.
+    // Trust check reads are pure.
     let now = now_ms_i64();
     let bootstrap_count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM (
@@ -529,8 +529,8 @@ pub fn has_any_trusted_peer(
     conn: &Connection,
     recorded_by: &str,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    // Supersession is now handled at projection time (PeerShared projector
-    // emits SupersedeBootstrapTrust). Trust check reads are pure.
+    // Supersession is handled at projection time via PeerShared writes.
+    // Trust check reads are pure.
     let now = now_ms_i64();
     let has_any: i64 = conn.query_row(
         "SELECT
@@ -1442,7 +1442,7 @@ mod tests {
             "Stage 3b: pending trust allows matching SPKI before PeerShared");
 
         insert_peer_shared(&conn, inviter, "ps_match", &matching_pubkey);
-        // Supersession now happens at projection time via SupersedeBootstrapTrust
+        // Supersession now happens at projection time via PeerShared writes
         supersede_bootstrap_for_peer_shared(&conn, inviter, &matching_pubkey).unwrap();
         assert!(is_peer_allowed(&conn, inviter, &matching_spki).unwrap(),
             "Stage 3b: SPKI still allowed after PeerShared (via PeerShared path)");
@@ -1525,7 +1525,7 @@ mod tests {
     ///
     /// After eventization (Phase 5), is_peer_allowed and allowed_peers_from_db
     /// are pure read-only queries. Supersession is handled at projection time
-    /// by the PeerShared projector emitting SupersedeBootstrapTrust commands.
+    /// by PeerShared projection writes.
     /// This test verifies that reads do NOT mutate the database.
     #[test]
     fn characterization_trust_check_reads_are_pure() {

@@ -1,11 +1,10 @@
 use super::super::ParsedEvent;
 use crate::crypto::event_id_to_base64;
-use crate::projection::result::{ContextSnapshot, EmitCommand, ProjectorResult, SqlVal, WriteOp};
+use crate::projection::result::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
 
 /// Pure projector: PeerShared (First or Ongoing) → peers_shared table.
-/// Emits SupersedeBootstrapTrust so that bootstrap trust rows matching
-/// this peer's derived SPKI are superseded at projection time rather
-/// than at trust-check read time.
+/// Also consumes bootstrap trust rows matching this peer's transport fingerprint,
+/// so steady-state peer trust naturally supersedes bootstrap trust.
 pub fn project_pure(
     recorded_by: &str,
     event_id_b64: &str,
@@ -20,7 +19,8 @@ pub fn project_pure(
 
     let user_event_id_b64 = event_id_to_base64(user_event_id);
     let transport_fingerprint = crate::crypto::spki_fingerprint_from_ed25519_pubkey(public_key);
-    let ops = vec![WriteOp::InsertOrIgnore {
+    let ops = vec![
+        WriteOp::InsertOrIgnore {
         table: "peers_shared",
         columns: vec![
             "recorded_by",
@@ -38,9 +38,27 @@ pub fn project_pure(
             SqlVal::Text(user_event_id_b64),
             SqlVal::Text(device_name.to_string()),
         ],
-    }];
-    let commands = vec![EmitCommand::SupersedeBootstrapTrust {
-        peer_shared_public_key: *public_key,
-    }];
-    ProjectorResult::valid_with_commands(ops, commands)
+        },
+        WriteOp::Delete {
+            table: "pending_invite_bootstrap_trust",
+            where_clause: vec![
+                ("recorded_by", SqlVal::Text(recorded_by.to_string())),
+                (
+                    "expected_bootstrap_spki_fingerprint",
+                    SqlVal::Blob(transport_fingerprint.to_vec()),
+                ),
+            ],
+        },
+        WriteOp::Delete {
+            table: "invite_bootstrap_trust",
+            where_clause: vec![
+                ("recorded_by", SqlVal::Text(recorded_by.to_string())),
+                (
+                    "bootstrap_spki_fingerprint",
+                    SqlVal::Blob(transport_fingerprint.to_vec()),
+                ),
+            ],
+        },
+    ];
+    ProjectorResult::valid(ops)
 }

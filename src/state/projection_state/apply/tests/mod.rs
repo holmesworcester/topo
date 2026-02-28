@@ -5199,8 +5199,7 @@ fn test_full_bootstrap_progression_from_projected_sql_state() {
     // Verify PeerShared supersedes bootstrap trust
     let still_allowed =
         crate::db::transport_trust::is_peer_allowed(&conn, recorded_by, &bootstrap_spki).unwrap();
-    // Bootstrap trust should be superseded once PeerShared projects
-    // (the PeerShared projector emits SupersedeBootstrapTrust).
+    // Bootstrap trust should be superseded once PeerShared projects.
     // The bootstrap SPKI was fake ([0xEE; 32]), not derived from peer_shared_pub,
     // so it should NOT be superseded by this PeerShared. It remains allowed until TTL.
     assert!(
@@ -5296,7 +5295,7 @@ fn test_bootstrap_trust_superseded_by_matching_peer_shared() {
     // Instead, let's use a fresh recorded_by to avoid conflict, or adjust the approach.
 
     // Actually, we just need to project PeerSharedFirst with matching public_key.
-    // The PeerShared projector emits SupersedeBootstrapTrust regardless of workspace.
+    // The PeerShared projector consumes matching bootstrap trust regardless of workspace.
     // So we can use the existing identity chain from make_identity_chain.
     // Let's use a different approach: manually insert a peers_shared row and then
     // call the supersession function, OR build a full chain under a second identity.
@@ -5309,8 +5308,8 @@ fn test_bootstrap_trust_superseded_by_matching_peer_shared() {
     // and verify supersession happens.
     // We need: workspace valid + InviteAccepted + UserInviteBoot + UserBoot + DeviceInviteFirst + PeerSharedFirst
     // The workspace event needs to match trust anchor workspace_id ([0xAA;32]).
-    // Since we can't control the hash, let's verify supersession via the
-    // SupersedeBootstrapTrust emit command directly.
+    // Since we can't control the hash, verify supersession via the
+    // transport-trust supersession helper directly.
     crate::db::transport_trust::supersede_bootstrap_for_peer_shared(
         &conn,
         recorded_by,
@@ -5321,12 +5320,14 @@ fn test_bootstrap_trust_superseded_by_matching_peer_shared() {
     // After supersession, bootstrap SPKI is superseded, but PeerShared-derived SPKI
     // should still be allowed if there's a peers_shared row. Let's insert one.
     conn.execute(
-        "INSERT INTO peers_shared (recorded_by, event_id, public_key, user_event_id, device_name)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO peers_shared
+         (recorded_by, event_id, public_key, transport_fingerprint, user_event_id, device_name)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         rusqlite::params![
             recorded_by,
             "fake-psf-eid",
             peer_shared_pub.as_slice(),
+            bootstrap_spki.as_slice(),
             "fake-user-eid",
             "device"
         ],

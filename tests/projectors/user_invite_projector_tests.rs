@@ -1,7 +1,7 @@
 //! Pure projector conformance tests for UserInvite (types 10-11).
 //!
 //! TLA+ guards tested:
-//!   SPEC_PENDING_TRUST_01 — InvPendingBootstrapTrustSource (emit + no-emit)
+//!   SPEC_PENDING_TRUST_01 — InvPendingBootstrapTrustSource (write + no-write)
 //!   SPEC_PENDING_INVITER_01 — InvPendingTrustOnlyOnInviter (local gate)
 
 #[cfg(test)]
@@ -10,7 +10,6 @@ mod tests {
     use topo::event_modules::user_invite::project_pure;
     use topo::event_modules::user_invite::{UserInviteBootEvent, UserInviteOngoingEvent};
     use topo::event_modules::ParsedEvent;
-    use topo::projection::result::EmitCommand;
 
     const PEER: &str = "peer_inviter";
     const EVENT_ID: &str = "ui_event_1";
@@ -40,16 +39,15 @@ mod tests {
     // ── SPEC_PENDING_TRUST_01: pass (Boot + local + bootstrap) ──
 
     #[test]
-    fn test_user_invite_boot_emits_pending_trust() {
+    fn test_user_invite_boot_writes_pending_trust() {
         let parsed = make_user_invite_boot([5u8; 32]);
         let ctx = ctx_with_bootstrap("ws_1", true); // is_local_create = true
 
         let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
         assert_valid(&result);
         assert_writes_to_table(&result, "user_invites");
-        assert_emits_command(&result, "WritePendingBootstrapTrust", |c| {
-            matches!(c, EmitCommand::WritePendingBootstrapTrust { .. })
-        });
+        assert_writes_to_table(&result, "pending_invite_bootstrap_trust");
+        assert_no_commands(&result);
     }
 
     // ── SPEC_PENDING_TRUST_01: break (Ongoing — never emits pending trust) ──
@@ -62,13 +60,8 @@ mod tests {
         let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
         assert_valid(&result);
         assert_writes_to_table(&result, "user_invites");
-        assert!(
-            !result
-                .emit_commands
-                .iter()
-                .any(|c| matches!(c, EmitCommand::WritePendingBootstrapTrust { .. })),
-            "Ongoing variant should never emit WritePendingBootstrapTrust"
-        );
+        assert_no_write_to_table(&result, "pending_invite_bootstrap_trust");
+        assert_no_commands(&result);
     }
 
     // ── SPEC_PENDING_INVITER_01: break (Boot but NOT local create) ──
@@ -80,13 +73,8 @@ mod tests {
 
         let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
         assert_valid(&result);
-        assert!(
-            !result
-                .emit_commands
-                .iter()
-                .any(|c| matches!(c, EmitCommand::WritePendingBootstrapTrust { .. })),
-            "non-local Boot invite should not emit WritePendingBootstrapTrust"
-        );
+        assert_no_write_to_table(&result, "pending_invite_bootstrap_trust");
+        assert_no_commands(&result);
     }
 
     // ── basic valid projection ──

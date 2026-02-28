@@ -1109,9 +1109,9 @@ mod tests {
                 .expect("load workspace key")
                 .expect("workspace key must exist");
 
-        let bootstrap_spki_bytes = hex::decode(&recorded_by).expect("decode local transport fp");
-        let mut bootstrap_spki = [0u8; 32];
-        bootstrap_spki.copy_from_slice(&bootstrap_spki_bytes);
+        // Use a bootstrap SPKI that is not already present in peers_shared so
+        // pending bootstrap trust is materialized by projection.
+        let bootstrap_spki = [0xAB; 32];
 
         let invite = create_user_invite(
             &conn,
