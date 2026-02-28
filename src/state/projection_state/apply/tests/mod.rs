@@ -8,7 +8,7 @@ use crate::db::{
 use crate::event_modules::{
     self as events, registry, BenchDepEvent, EncryptedEvent, FileSliceEvent,
     MessageAttachmentEvent, MessageDeletionEvent, MessageEvent, ParsedEvent, ReactionEvent,
-    SecretKeyEvent, SignedMemoEvent, WorkspaceEvent, EVENT_TYPE_ENCRYPTED, EVENT_TYPE_FILE_SLICE,
+    SecretKeyEvent, WorkspaceEvent, EVENT_TYPE_ENCRYPTED, EVENT_TYPE_FILE_SLICE,
     EVENT_TYPE_MESSAGE, EVENT_TYPE_MESSAGE_DELETION, EVENT_TYPE_REACTION,
 };
 use crate::projection::decision::ProjectionDecision;
@@ -452,25 +452,6 @@ fn make_attachment_signed(
     (parsed, blob)
 }
 
-fn make_signed_memo(
-    signing_key: &SigningKey,
-    signer_event_id: &EventId,
-    content: &str,
-) -> (ParsedEvent, Vec<u8>) {
-    let memo = SignedMemoEvent {
-        created_at_ms: now_ms(),
-        signed_by: *signer_event_id,
-        signer_type: 5,
-        content: content.to_string(),
-        signature: [0u8; 64],
-    };
-    let event = ParsedEvent::SignedMemo(memo);
-    let mut blob = events::encode_event(&event).unwrap();
-    sign_blob(signing_key, &mut blob);
-    let parsed = events::parse_event(&blob).unwrap();
-    (parsed, blob)
-}
-
 fn setup() -> Connection {
     let conn = open_in_memory().unwrap();
     create_tables(&conn).unwrap();
@@ -820,122 +801,6 @@ fn test_retired_type3_peer_key_blob_rejected() {
 }
 
 #[test]
-fn test_project_signed_memo_valid() {
-    let conn = setup();
-    let recorded_by = "peer1";
-
-    // Create identity chain as signer
-    let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
-
-    // Now create a signed memo referencing the signer
-    let (_memo, memo_blob) = make_signed_memo(&signing_key, &signer_eid, "hello signed");
-    let memo_eid = insert_event_raw(&conn, recorded_by, &memo_blob);
-
-    let result = project_one(&conn, recorded_by, &memo_eid).unwrap();
-    assert_eq!(result, ProjectionDecision::Valid);
-
-    // Verify in signed_memos table
-    let memo_b64 = event_id_to_base64(&memo_eid);
-    let count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM signed_memos WHERE event_id = ?1 AND recorded_by = ?2",
-            rusqlite::params![&memo_b64, recorded_by],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(count, 1);
-}
-
-#[test]
-fn test_signed_memo_blocks_on_missing_signer() {
-    let conn = setup();
-    let recorded_by = "peer1";
-    let mut rng = rand::thread_rng();
-    let signing_key = SigningKey::generate(&mut rng);
-
-    // Create a memo referencing a non-existent signer event
-    let fake_signer_id = [99u8; 32];
-    let (_memo, memo_blob) = make_signed_memo(&signing_key, &fake_signer_id, "blocked memo");
-    let memo_eid = insert_event_raw(&conn, recorded_by, &memo_blob);
-
-    let result = project_one(&conn, recorded_by, &memo_eid).unwrap();
-    match result {
-        ProjectionDecision::Block { missing } => {
-            assert_eq!(missing.len(), 1);
-            assert_eq!(missing[0], fake_signer_id);
-        }
-        other => panic!("expected Block, got {:?}", other),
-    }
-}
-
-#[test]
-fn test_signed_memo_unblocks_when_signer_arrives() {
-    let conn = setup();
-    let recorded_by = "peer1";
-
-    // Build identity chain without inserting (deferred)
-    let (signer_eid, signing_key, chain_blobs) = build_identity_chain_deferred(recorded_by);
-
-    // Create and insert signed memo BEFORE signer exists
-    let (_memo, memo_blob) = make_signed_memo(&signing_key, &signer_eid, "out of order");
-    let memo_eid = insert_event_raw(&conn, recorded_by, &memo_blob);
-
-    // Project memo — should block on missing signer
-    let result = project_one(&conn, recorded_by, &memo_eid).unwrap();
-    assert!(matches!(result, ProjectionDecision::Block { .. }));
-
-    // Now insert and project the full identity chain
-    insert_and_project_identity_chain(&conn, recorded_by, &chain_blobs);
-
-    // Memo should have been auto-unblocked via cascade
-    let memo_b64 = event_id_to_base64(&memo_eid);
-    let valid: bool = conn
-        .query_row(
-            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, &memo_b64],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert!(
-        valid,
-        "signed memo should be auto-projected after signer key arrives"
-    );
-
-    // Verify in signed_memos table
-    let count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM signed_memos WHERE event_id = ?1 AND recorded_by = ?2",
-            rusqlite::params![&memo_b64, recorded_by],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(count, 1);
-}
-
-#[test]
-fn test_signed_memo_invalid_signature_rejects() {
-    let conn = setup();
-    let recorded_by = "peer1";
-    let mut rng = rand::thread_rng();
-    let wrong_key = SigningKey::generate(&mut rng);
-
-    // Create identity chain as signer
-    let (signer_eid, _signing_key) = make_identity_chain(&conn, recorded_by);
-
-    // Sign the memo with the WRONG key (not the identity chain's key)
-    let (_memo, memo_blob) = make_signed_memo(&wrong_key, &signer_eid, "bad signature");
-    let memo_eid = insert_event_raw(&conn, recorded_by, &memo_blob);
-
-    let result = project_one(&conn, recorded_by, &memo_eid).unwrap();
-    match result {
-        ProjectionDecision::Reject { reason } => {
-            assert!(reason.contains("invalid signature"), "reason: {}", reason);
-        }
-        other => panic!("expected Reject, got {:?}", other),
-    }
-}
-
-#[test]
 fn test_signed_content_events_project_with_identity_chain() {
     // Verify that signed messages and reactions project correctly through
     // the pipeline with proper identity chains.
@@ -1078,47 +943,41 @@ fn test_cross_tenant_projection_isolation() {
 
 #[test]
 fn test_cross_tenant_signer_isolation() {
-    // Identity chain projected for tenant_a only; signed memo should block for tenant_b
+    // Identity chain projected for tenant_a only; message should block for tenant_b
     let conn = setup();
     let tenant_a = "tenant_a";
     let tenant_b = "tenant_b";
 
-    // Create identity chain for tenant_a
+    // Create identity chain for tenant_a (includes workspace + full chain)
     let (signer_eid, signing_key) = make_identity_chain(&conn, tenant_a);
 
-    // Create signed memo (correct signature)
-    let (_memo, memo_blob) = make_signed_memo(&signing_key, &signer_eid, "tenant isolation test");
-    let memo_eid = insert_event_raw(&conn, tenant_a, &memo_blob);
+    // Create message (correct signature)
+    let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "tenant isolation test");
+    let msg_eid = insert_event_raw(&conn, tenant_a, &msg_blob);
 
     // Project for tenant_a — should be Valid
-    let r_a = project_one(&conn, tenant_a, &memo_eid).unwrap();
+    let r_a = project_one(&conn, tenant_a, &msg_eid).unwrap();
     assert_eq!(r_a, ProjectionDecision::Valid);
 
-    // Also record the memo + signer for tenant_b
-    insert_recorded_event(&conn, tenant_b, &memo_eid, now_ms() as i64, "test").unwrap();
+    // Also record the message + signer for tenant_b
+    insert_recorded_event(&conn, tenant_b, &msg_eid, now_ms() as i64, "test").unwrap();
     insert_recorded_event(&conn, tenant_b, &signer_eid, now_ms() as i64, "test").unwrap();
 
-    // Project memo for tenant_b — should BLOCK (signer dep not valid for B)
-    let r_b = project_one(&conn, tenant_b, &memo_eid).unwrap();
-    match r_b {
-        ProjectionDecision::Block { missing } => {
-            assert_eq!(missing.len(), 1);
-            assert_eq!(missing[0], signer_eid);
-        }
-        other => panic!("expected Block for tenant_b, got {:?}", other),
-    }
+    // Project message for tenant_b — should BLOCK (signer dep not valid for B)
+    let r_b = project_one(&conn, tenant_b, &msg_eid).unwrap();
+    assert!(matches!(r_b, ProjectionDecision::Block { .. }));
 
-    // Verify: signed_memos has 1 row for A, 0 for B
+    // Verify: messages has 1 row for A, 0 for B
     let sm_a: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM signed_memos WHERE recorded_by = ?1",
+            "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
             rusqlite::params![tenant_a],
             |row| row.get(0),
         )
         .unwrap();
     let sm_b: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM signed_memos WHERE recorded_by = ?1",
+            "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
             rusqlite::params![tenant_b],
             |row| row.get(0),
         )
@@ -1137,11 +996,11 @@ fn test_rejection_recorded_durably() {
     // Create identity chain as signer
     let (signer_eid, _signing_key) = make_identity_chain(&conn, recorded_by);
 
-    // Sign memo with wrong key
-    let (_memo, memo_blob) = make_signed_memo(&wrong_key, &signer_eid, "bad sig");
-    let memo_eid = insert_event_raw(&conn, recorded_by, &memo_blob);
+    // Sign message with wrong key
+    let (_msg, msg_blob) = make_message_signed(&wrong_key, &signer_eid, "bad sig");
+    let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
 
-    let result = project_one(&conn, recorded_by, &memo_eid).unwrap();
+    let result = project_one(&conn, recorded_by, &msg_eid).unwrap();
     match result {
         ProjectionDecision::Reject { ref reason } => {
             assert!(reason.contains("invalid signature"), "reason: {}", reason);
@@ -1150,11 +1009,11 @@ fn test_rejection_recorded_durably() {
     }
 
     // Verify row exists in rejected_events
-    let memo_b64 = event_id_to_base64(&memo_eid);
+    let msg_b64 = event_id_to_base64(&msg_eid);
     let rej_reason: String = conn
         .query_row(
             "SELECT reason FROM rejected_events WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, &memo_b64],
+            rusqlite::params![recorded_by, &msg_b64],
             |row| row.get(0),
         )
         .unwrap();
@@ -1168,17 +1027,17 @@ fn test_rejected_event_not_retried() {
     let mut rng = rand::thread_rng();
     let wrong_key = SigningKey::generate(&mut rng);
 
-    // Sign memo with wrong key against existing identity-chain signer.
+    // Sign message with wrong key against existing identity-chain signer.
     let (real_signer_eid, _real_signing_key) = make_identity_chain(&conn, recorded_by);
-    let (_memo, memo_blob) = make_signed_memo(&wrong_key, &real_signer_eid, "bad sig again");
-    let memo_eid = insert_event_raw(&conn, recorded_by, &memo_blob);
+    let (_msg, msg_blob) = make_message_signed(&wrong_key, &real_signer_eid, "bad sig again");
+    let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
 
     // First call: Reject
-    let r1 = project_one(&conn, recorded_by, &memo_eid).unwrap();
+    let r1 = project_one(&conn, recorded_by, &msg_eid).unwrap();
     assert!(matches!(r1, ProjectionDecision::Reject { .. }));
 
     // Second call: AlreadyProcessed (not Reject again)
-    let r2 = project_one(&conn, recorded_by, &memo_eid).unwrap();
+    let r2 = project_one(&conn, recorded_by, &msg_eid).unwrap();
     assert_eq!(r2, ProjectionDecision::AlreadyProcessed);
 }
 
@@ -2743,14 +2602,16 @@ fn test_unsupported_signer_type_rejects() {
     let signing_key = SigningKey::generate(&mut rng);
     let (signer_eid, _signing_key) = make_identity_chain(&conn, recorded_by);
 
-    // Create a signed memo but mutate signer_type byte to 255
-    let (_memo, mut memo_blob) = make_signed_memo(&signing_key, &signer_eid, "bad signer type");
-    // signer_type is at byte offset 41 in the wire format
-    memo_blob[41] = 255;
+    // Create a message but mutate signer_type byte to 255
+    let (_msg, mut msg_blob) = make_message_signed(&signing_key, &signer_eid, "bad signer type");
+    // signer_type is at the signer_type offset in message wire format
+    // message layout: type(1) + created_at(8) + workspace_id(32) + author_id(32) + content(1024) + signed_by(32) + signer_type(1) + signature(64)
+    // signer_type offset = 1 + 8 + 32 + 32 + 1024 + 32 = 1129
+    msg_blob[1129] = 255;
     // Re-hash since blob changed
-    let memo_eid = insert_event_raw(&conn, recorded_by, &memo_blob);
+    let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
 
-    let result = project_one(&conn, recorded_by, &memo_eid).unwrap();
+    let result = project_one(&conn, recorded_by, &msg_eid).unwrap();
     match result {
         ProjectionDecision::Reject { reason } => {
             assert!(
@@ -2763,11 +2624,11 @@ fn test_unsupported_signer_type_rejects() {
     }
 
     // Verify rejected_events row exists
-    let memo_b64 = event_id_to_base64(&memo_eid);
+    let msg_b64 = event_id_to_base64(&msg_eid);
     let rej_count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM rejected_events WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, &memo_b64],
+            rusqlite::params![recorded_by, &msg_b64],
             |row| row.get(0),
         )
         .unwrap();
@@ -2961,19 +2822,19 @@ fn test_rejected_events_recorded_for_invalid_sig() {
     // Create identity chain as signer
     let (signer_eid, _signing_key) = make_identity_chain(&conn, recorded_by);
 
-    // Sign the memo with the WRONG key
-    let (_memo, memo_blob) = make_signed_memo(&wrong_key, &signer_eid, "bad sig memo");
-    let memo_eid = insert_event_raw(&conn, recorded_by, &memo_blob);
+    // Sign the message with the WRONG key
+    let (_msg, msg_blob) = make_message_signed(&wrong_key, &signer_eid, "bad sig msg");
+    let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
 
-    let result = project_one(&conn, recorded_by, &memo_eid).unwrap();
+    let result = project_one(&conn, recorded_by, &msg_eid).unwrap();
     assert!(matches!(result, ProjectionDecision::Reject { .. }));
 
     // Verify rejected_events row exists with correct reason
-    let memo_b64 = event_id_to_base64(&memo_eid);
+    let msg_b64 = event_id_to_base64(&msg_eid);
     let rej_reason: String = conn
         .query_row(
             "SELECT reason FROM rejected_events WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, &memo_b64],
+            rusqlite::params![recorded_by, &msg_b64],
             |row| row.get(0),
         )
         .unwrap();

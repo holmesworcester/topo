@@ -11,7 +11,6 @@ use std::fs;
 const CANONICAL_EVENT_FILES: &[&str] = &[
     "src/event_modules/message/wire.rs",
     "src/event_modules/reaction/wire.rs",
-    "src/event_modules/signed_memo.rs",
     "src/event_modules/encrypted.rs",
     "src/event_modules/file_slice/wire.rs",
     "src/event_modules/message_attachment/wire.rs",
@@ -130,8 +129,8 @@ fn all_registered_types_have_fixed_wire_size() {
     // and encoding produces a deterministic-length blob.
     let reg = registry();
     for code in 1u8..=26 {
-        if code == 3 {
-            continue; // type 3 is unused (gap in type code allocation)
+        if code == 3 || code == 4 {
+            continue; // type 3, 4 are unused (gap in type code allocation)
         }
         let meta = reg.lookup(code);
         assert!(

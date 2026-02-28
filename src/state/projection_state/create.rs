@@ -341,11 +341,10 @@ mod tests {
     use super::*;
     use crate::db::{open_in_memory, schema::create_tables};
     use crate::event_modules::{
-        MessageEvent, ReactionEvent, SignedMemoEvent,
+        MessageEvent, ReactionEvent,
         WorkspaceEvent, InviteAcceptedEvent, UserInviteBootEvent,
         UserBootEvent, DeviceInviteFirstEvent, PeerSharedFirstEvent,
     };
-    use crate::projection::signer::sign_event_bytes;
     use ed25519_dalek::SigningKey;
 
     fn now_ms() -> u64 {
@@ -365,13 +364,6 @@ mod tests {
             name: "test-workspace".to_string(),
         });
         create_event_staged(conn, recorded_by, &ws).unwrap()
-    }
-
-    /// Helper: sign a blob in-place (overwrite last 64 bytes).
-    fn sign_blob(key: &SigningKey, blob: &mut Vec<u8>) {
-        let len = blob.len();
-        let sig = sign_event_bytes(key, &blob[..len - 64]);
-        blob[len - 64..].copy_from_slice(&sig);
     }
 
     /// Create a minimal identity chain for the given tenant.
@@ -585,31 +577,33 @@ mod tests {
         let conn = setup();
         let recorded_by = "peer1";
 
-        let (signer_eid, signing_key, _user_event_id) = make_identity_chain(&conn, recorded_by);
+        let (signer_eid, signing_key, user_event_id) = make_identity_chain(&conn, recorded_by);
 
-        // Create signed memo with PeerShared signer
-        let memo = ParsedEvent::SignedMemo(SignedMemoEvent {
+        // Create signed message with PeerShared signer
+        let msg = ParsedEvent::Message(MessageEvent {
             created_at_ms: now_ms(),
+            workspace_id: [1u8; 32],
+            author_id: user_event_id,
+            content: "signed content".to_string(),
             signed_by: signer_eid,
             signer_type: 5,
-            content: "signed content".to_string(),
             signature: [0u8; 64], // placeholder, will be overwritten
         });
 
-        let memo_eid = create_signed_event_sync(&conn, recorded_by, &memo, &signing_key).unwrap();
-        let memo_b64 = event_id_to_base64(&memo_eid);
+        let msg_eid = create_signed_event_sync(&conn, recorded_by, &msg, &signing_key).unwrap();
+        let msg_b64 = event_id_to_base64(&msg_eid);
 
         // Should be valid
         let valid: bool = conn.query_row(
             "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, &memo_b64], |row| row.get(0),
+            rusqlite::params![recorded_by, &msg_b64], |row| row.get(0),
         ).unwrap();
         assert!(valid);
 
-        // Should be in signed_memos table
+        // Should be in messages table
         let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM signed_memos WHERE event_id = ?1 AND recorded_by = ?2",
-            rusqlite::params![&memo_b64, recorded_by], |row| row.get(0),
+            "SELECT COUNT(*) FROM messages WHERE message_id = ?1 AND recorded_by = ?2",
+            rusqlite::params![&msg_b64, recorded_by], |row| row.get(0),
         ).unwrap();
         assert_eq!(count, 1);
     }

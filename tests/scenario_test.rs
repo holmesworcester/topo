@@ -728,164 +728,6 @@ async fn test_multi_dep_blocking_sync() {
     harness.finish();
 }
 
-/// Integration test: Alice creates SignedMemo + message, Bob syncs, both valid.
-#[tokio::test]
-async fn test_signed_event_sync() {
-    let alice = Peer::new_with_identity("alice");
-    let bob = Peer::new_with_identity("bob");
-    let harness = ScenarioHarness::new();
-    harness.track(&alice);
-    harness.track(&bob);
-
-    // Alice creates a SignedMemo using her PeerShared identity chain key
-    let signer_eid = alice.peer_shared_event_id.unwrap();
-    let signing_key = alice.peer_shared_signing_key.as_ref().unwrap().clone();
-    let memo_eid = alice.create_signed_memo(&signer_eid, &signing_key, "Hello signed world");
-    let memo_b64 = event_id_to_base64(&memo_eid);
-
-    assert_eq!(alice.signed_memo_count(), 1);
-
-    // Sync to Bob
-    let sync = start_peers_pinned(&alice, &bob);
-
-    assert_eventually(
-        || bob.has_event(&memo_b64),
-        Duration::from_secs(15),
-        "bob should receive alice's SignedMemo event",
-    ).await;
-
-    drop(sync);
-
-    // SignedMemo is stored on Bob but not projected: signer chain from foreign network
-    // (InviteAccepted is Local-scoped, not synced). Only locally-created signed memos project.
-    assert_eq!(alice.signed_memo_count(), 1);
-
-    harness.finish();
-}
-
-/// Integration test: signed memo syncs alongside messages; verify store convergence.
-#[tokio::test]
-async fn test_signed_event_out_of_order_sync() {
-    let alice = Peer::new_with_identity("alice");
-    let bob = Peer::new_with_identity("bob");
-    let harness = ScenarioHarness::new();
-    harness.track(&alice);
-    harness.track(&bob);
-
-    // Alice creates SignedMemo (using PeerShared key) + a message
-    let signer_eid = alice.peer_shared_event_id.unwrap();
-    let signing_key = alice.peer_shared_signing_key.as_ref().unwrap().clone();
-    let memo_eid = alice.create_signed_memo(&signer_eid, &signing_key, "Out of order memo");
-    let memo_b64 = event_id_to_base64(&memo_eid);
-    let alice_msg = alice.create_message("Normal message");
-    let alice_msg_b64 = event_id_to_base64(&alice_msg);
-
-    // Bob creates a message too
-    let bob_msg = bob.create_message("Bob's message");
-    let bob_msg_b64 = event_id_to_base64(&bob_msg);
-
-    // Sync
-    let sync = start_peers_pinned(&alice, &bob);
-
-    assert_eventually(
-        || bob.has_event(&alice_msg_b64) && bob.has_event(&memo_b64) && alice.has_event(&bob_msg_b64),
-        Duration::from_secs(15),
-        "both peers should receive each other's events",
-    ).await;
-
-    drop(sync);
-
-    // SignedMemo + messages stored on both sides, but only locally-created ones are projected
-    // (remote signer chains from foreign network; InviteAccepted is Local-scoped, not synced)
-    assert_eq!(alice.signed_memo_count(), 1);
-    assert_eq!(bob.message_count(), 1);
-
-    harness.finish();
-}
-
-/// Integration test: wrong-key memo rejected on remote peer.
-#[tokio::test]
-async fn test_invalid_signature_rejected_after_sync() {
-    use ed25519_dalek::SigningKey;
-    use topo::crypto::event_id_to_base64;
-
-    let alice = Peer::new_with_identity("alice");
-    let bob = Peer::new_with_identity("bob");
-    let harness = ScenarioHarness::new();
-    harness.track(&alice);
-    harness.track(&bob);
-
-    let mut rng = rand::thread_rng();
-    let wrong_key = SigningKey::generate(&mut rng);
-    let signer_eid = alice.peer_shared_event_id.unwrap();
-
-    // Alice creates a signed memo but signs with the WRONG key (simulating corruption)
-    // We need to do this manually since create_signed_memo uses proper signing
-    let bad_memo_event_id_b64: String;
-    {
-        use topo::event_modules::{SignedMemoEvent, ParsedEvent, encode_event};
-        use topo::projection::signer::sign_event_bytes;
-        use topo::crypto::hash_event;
-
-        let db = open_connection(&alice.db_path).expect("open alice db");
-        let memo = ParsedEvent::SignedMemo(SignedMemoEvent {
-            created_at_ms: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64,
-            signed_by: signer_eid,
-            signer_type: 5,
-            content: "bad signature memo".to_string(),
-            signature: [0u8; 64],
-        });
-        let mut blob = encode_event(&memo).unwrap();
-
-        // Sign with wrong key
-        let sig_len = 64;
-        let blob_len = blob.len();
-        let signing_bytes = &blob[..blob_len - sig_len];
-        let sig = sign_event_bytes(&wrong_key, signing_bytes);
-        blob[blob_len - sig_len..].copy_from_slice(&sig);
-
-        // Store directly (bypassing create_signed_event_sync validation)
-        let event_id = hash_event(&blob);
-        let event_id_b64 = event_id_to_base64(&event_id);
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
-
-        db.execute(
-            "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
-             VALUES (?1, ?2, ?3, 'shared', ?4, ?5)",
-            rusqlite::params![&event_id_b64, "signed_memo", &blob, now_ms, now_ms],
-        ).unwrap();
-        db.execute(
-            "INSERT OR IGNORE INTO neg_items (ts, id) VALUES (?1, ?2)",
-            rusqlite::params![now_ms, event_id.as_slice()],
-        ).unwrap();
-        db.execute(
-            "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
-             VALUES (?1, ?2, ?3, 'local_create')",
-            rusqlite::params![&alice.identity, &event_id_b64, now_ms],
-        ).unwrap();
-        bad_memo_event_id_b64 = event_id_b64;
-        // Don't project — it would be rejected. The blob will sync via negentropy.
-    }
-
-    // Sync to Bob
-    let sync = start_peers_pinned(&alice, &bob);
-
-    assert_eventually(
-        || bob.has_event(&bad_memo_event_id_b64),
-        Duration::from_secs(15),
-        "bob should receive alice's bad-signature memo event via sync",
-    ).await;
-
-    drop(sync);
-
-    // Bob should NOT project the bad-signature memo.
-    assert_eq!(bob.signed_memo_count(), 0, "bad-signature memo should be rejected, not projected");
-
-    harness.finish();
-}
-
 /// Integration test: verify valid_events are tenant-scoped after sync.
 /// Alice creates message + reaction, syncs to Bob. Both converge to 2 events.
 /// valid_events are per-tenant, and projection invariants hold.
@@ -1614,7 +1456,7 @@ async fn test_endpoint_observations_recorded() {
 async fn test_encrypted_inner_unsupported_signer_rejects_durably() {
     use topo::crypto::hash_event;
     use topo::event_modules::{
-        EncryptedEvent, ParsedEvent, SignedMemoEvent, EVENT_TYPE_SIGNED_MEMO, encode_event,
+        EncryptedEvent, MessageEvent, ParsedEvent, EVENT_TYPE_MESSAGE, encode_event,
     };
     use topo::projection::encrypted::encrypt_event_blob;
     use topo::projection::apply::project_one;
@@ -1627,13 +1469,15 @@ async fn test_encrypted_inner_unsupported_signer_rejects_durably() {
     let key_bytes: [u8; 32] = rand::random();
     let sk_eid = alice.create_secret_key(key_bytes);
 
-    // Create an inner SignedMemo with signer_type=255 (unsupported)
+    // Create an inner Message with signer_type=255 (unsupported)
     // signed_by references an existing PeerShared signer event, but signer_type is invalid
-    let inner = ParsedEvent::SignedMemo(SignedMemoEvent {
+    let inner = ParsedEvent::Message(MessageEvent {
         created_at_ms: 999999u64,
+        workspace_id: [0u8; 32],
+        author_id: alice.peer_shared_event_id.unwrap(),
+        content: "bad signer type".to_string(),
         signed_by: alice.peer_shared_event_id.unwrap(),
         signer_type: 255, // unsupported
-        content: "bad signer type".to_string(),
         signature: [0u8; 64],
     });
     let inner_blob = encode_event(&inner).unwrap();
@@ -1643,7 +1487,7 @@ async fn test_encrypted_inner_unsupported_signer_rejects_durably() {
     let wrapper = ParsedEvent::Encrypted(EncryptedEvent {
         created_at_ms: 999999u64,
         key_event_id: sk_eid,
-        inner_type_code: EVENT_TYPE_SIGNED_MEMO,
+        inner_type_code: EVENT_TYPE_MESSAGE,
         nonce,
         ciphertext,
         auth_tag,

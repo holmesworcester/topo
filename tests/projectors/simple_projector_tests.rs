@@ -2,7 +2,7 @@
 //! with no guards beyond type matching.
 //!
 //! Covers: User, Admin, UserRemoved, PeerRemoved, SecretKey, TransportKey,
-//!         SignedMemo, MessageAttachment, BenchDep.
+//!         MessageAttachment, BenchDep.
 
 #[cfg(test)]
 mod tests {
@@ -149,24 +149,6 @@ mod tests {
         let result = project_pure(PEER, EVENT_ID, &parsed, &empty_ctx());
         assert_valid(&result);
         assert_writes_to_table(&result, "transport_keys");
-        assert_no_commands(&result);
-    }
-
-    // ── SignedMemo ──
-
-    #[test]
-    fn test_signed_memo_valid() {
-        use topo::event_modules::signed_memo::{project_pure, SignedMemoEvent};
-        let parsed = ParsedEvent::SignedMemo(SignedMemoEvent {
-            created_at_ms: 7000,
-            content: "test memo".to_string(),
-            signed_by: [2u8; 32],
-            signer_type: 5,
-            signature: [0u8; 64],
-        });
-        let result = project_pure(PEER, EVENT_ID, &parsed, &empty_ctx());
-        assert_valid(&result);
-        assert_writes_to_table(&result, "signed_memos");
         assert_no_commands(&result);
     }
 

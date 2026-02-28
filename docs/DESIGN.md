@@ -104,8 +104,7 @@ More details:
 3. Text slots use fixed-size UTF-8 with mandatory zero-padding: unused bytes after the canonical text content must be zero, and no non-zero bytes may appear after the text terminator.
 4. Encrypted event wire size is deterministic by `inner_type_code` (inner types are fixed-size).
 5. File slice events use a canonical fixed ciphertext size; final plaintext chunks are padded before encryption.
-6. `signed_memo` events (type 4) are canonical shared signed text events with a fixed 1024-byte text slot and normal signer-field verification. <!-- What is a signed memo and where do we use them? -->
-7. `bench_dep` events (type 26) are fixed-size shared benchmark events for dependency/cascade performance testing; they are non-encryptable and project no domain rows beyond validity state.
+6. `bench_dep` events (type 26) are fixed-size shared benchmark events for dependency/cascade performance testing; they are non-encryptable and project no domain rows beyond validity state.
 
 ## 1.3 Event identity and signatures
 
@@ -1222,8 +1221,6 @@ Initial event-size policy: <!-- does this belong in this section? -->
 
 `file_slice` events (type 25, signed) are signed and validated like other canonical events.
 `message_attachment` events (type 24, signed) are file descriptors with deps on `message_id`, `key_event_id`, and `signed_by`.
-`signed_memo` events (type 4, signed) are fixed-size canonical memo entries projected into `signed_memos`.
-
 ### Low-memory trust and key strategy (`low_mem_ios`)
 
 Trust and key sets use SQL indexed point lookups, not full in-memory loading. The projection tables (`trust_anchors`, identity chain tables, bootstrap trust tables) are queried on demand with indexed `(recorded_by, ...)` keys.
