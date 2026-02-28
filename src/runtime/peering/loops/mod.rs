@@ -23,6 +23,7 @@ pub use accept::accept_loop_with_ingest_until_cancel;
 pub use accept::{accept_loop, accept_loop_with_ingest};
 pub use connect::{
     connect_loop, connect_loop_with_coordination, connect_loop_with_coordination_until_cancel,
+    connect_loop_with_coordination_until_cancel_with_fallback,
 };
 
 use std::net::SocketAddr;

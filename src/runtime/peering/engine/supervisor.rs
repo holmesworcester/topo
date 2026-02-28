@@ -21,13 +21,13 @@ use tracing::{info, warn};
 use crate::contracts::event_pipeline_contract::{IngestFns, IngestItem};
 use crate::db::transport_creds::TenantInfo;
 use crate::peering::loops::{
-    accept_loop_with_ingest_until_cancel, connect_loop_with_coordination_until_cancel,
+    accept_loop_with_ingest_until_cancel, connect_loop_with_coordination_until_cancel_with_fallback,
     IntroSpawnerFn,
 };
 use crate::sync::CoordinationManager;
 use crate::transport::{
-    build_tenant_client_config_from_db, TenantClientConfigs, TransportClientConfig,
-    TransportEndpoint,
+    build_tenant_bootstrap_fallback_client_config_from_db, build_tenant_client_config_from_db,
+    TenantClientConfigs, TransportClientConfig, TransportEndpoint,
 };
 
 use super::target_planner::{
@@ -80,6 +80,7 @@ enum WorkerExitDisposition {
 #[derive(Clone)]
 struct TenantDispatchContext {
     client_config: TransportClientConfig,
+    bootstrap_fallback_client_config: Option<TransportClientConfig>,
     coordination_manager: Arc<CoordinationManager>,
 }
 
@@ -376,6 +377,19 @@ fn build_tenant_contexts(
             tenant_id.clone(),
             TenantDispatchContext {
                 client_config,
+                bootstrap_fallback_client_config:
+                    match build_tenant_bootstrap_fallback_client_config_from_db(db_path, tenant_id)
+                    {
+                        Ok(cfg) => cfg,
+                        Err(e) => {
+                            warn!(
+                                "Bootstrap fallback config unavailable for tenant {}: {}",
+                                short_peer_id(tenant_id),
+                                e
+                            );
+                            None
+                        }
+                    },
                 coordination_manager: Arc::new(CoordinationManager::new()),
             },
         );
@@ -582,6 +596,7 @@ async fn run_target_dispatcher(
                 dispatch_discovery_target(&mut dispatcher, &event.tenant_id, peer_id, event.remote)
             }
         };
+        let allow_bootstrap_fallback = matches!(&event.source, TargetIngressSource::Bootstrap);
 
         if !should_spawn {
             continue;
@@ -599,6 +614,21 @@ async fn run_target_dispatcher(
                 Ok(client_config) => {
                     let context = TenantDispatchContext {
                         client_config,
+                        bootstrap_fallback_client_config:
+                            match build_tenant_bootstrap_fallback_client_config_from_db(
+                                &db_path,
+                                &event.tenant_id,
+                            ) {
+                                Ok(cfg) => cfg,
+                                Err(err) => {
+                                    warn!(
+                                        "Bootstrap fallback config unavailable for tenant {}: {}",
+                                        short_peer_id(&event.tenant_id),
+                                        err
+                                    );
+                                    None
+                                }
+                            },
                         coordination_manager: Arc::new(CoordinationManager::new()),
                     };
                     tenant_contexts.insert(event.tenant_id.clone(), context.clone());
@@ -637,6 +667,7 @@ async fn run_target_dispatcher(
                     ingest,
                     worker_cancel,
                     dispatch_key,
+                    allow_bootstrap_fallback,
                 ));
             }
         });
@@ -675,13 +706,14 @@ async fn run_connect_worker(
     ingest: IngestFns,
     shutdown: CancellationToken,
     dispatch_key: String,
+    allow_bootstrap_fallback: bool,
 ) {
     loop {
         if shutdown.is_cancelled() {
             break;
         }
 
-        let result = connect_loop_with_coordination_until_cancel(
+        let result = connect_loop_with_coordination_until_cancel_with_fallback(
             &db_path,
             &tenant_id,
             endpoint.clone(),
@@ -691,6 +723,11 @@ async fn run_connect_worker(
             ingest,
             context.coordination_manager.clone(),
             shutdown.clone(),
+            if allow_bootstrap_fallback {
+                context.bootstrap_fallback_client_config.clone()
+            } else {
+                None
+            },
         )
         .await;
 

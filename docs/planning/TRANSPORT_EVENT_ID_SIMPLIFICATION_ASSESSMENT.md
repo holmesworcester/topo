@@ -20,6 +20,8 @@ Implemented outcomes:
    - invite projectors now write bootstrap trust rows directly (`pending_invite_bootstrap_trust`, `invite_bootstrap_trust`),
    - `peer_shared` projector now directly consumes matching bootstrap trust rows via deletes,
    - apply-stage trust command handlers were removed.
+9. Runtime dial policy now uses ongoing identity first, with bootstrap-fallback retry only for trust-rejection mTLS failures.
+10. Bootstrap-fallback outbound connections are bounded to one sync session before close, keeping fallback behavior narrow.
 
 ## Simplifying Power
 
@@ -29,6 +31,7 @@ Implemented outcomes:
 2. Removed repeated scan-and-derive SPKI logic from hot trust/removal checks when projected fingerprints exist.
 3. Made transport-to-event reasoning explicit and queryable by adding direct index-backed mapping.
 4. Collapsed trust materialization/supersession into regular projection writes, reducing special post-write command flow.
+5. Replaced broad bootstrap/ongoing transport-state branching with a constrained dial-boundary retry rule.
 
 ### Complexity Still Present (By Constraint)
 
@@ -51,4 +54,4 @@ The model is now cleaner where it matters operationally:
 ## Remaining High-Value Simplifications
 
 1. Add invite-expiry-derived bootstrap-key TTL policy (`bootstrap_key_expires_at = invite_expires_at + grace`) in a follow-up.
-2. Add explicit retry-based ongoing-first/bootstrap-fallback dial policy at connection lifecycle boundary (still out of scope in this change).
+2. Tighten fallback-key selection from "latest pending invite key per tenant" to target-correlated selection when multiple invites are concurrently active.

@@ -14,7 +14,10 @@ use crate::db::store::lookup_workspace_id;
 use crate::db::transport_trust::record_transport_binding;
 use crate::sync::CoordinationManager;
 use crate::sync::SyncSessionHandler;
-use crate::transport::{dial_session_provider, TransportClientConfig, TransportEndpoint};
+use crate::transport::{
+    dial_session_provider, ConnectionLifecycleError, SessionProvider, TransportClientConfig,
+    TransportEndpoint,
+};
 
 use super::supervisor::{
     run_startup_preflight, spawn_shared_ingest_writer, supervise_connection_sessions,
@@ -104,6 +107,35 @@ pub async fn connect_loop_with_coordination_until_cancel(
     coordination_manager: Arc<CoordinationManager>,
     shutdown: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    connect_loop_with_coordination_until_cancel_with_fallback(
+        db_path,
+        recorded_by,
+        endpoint,
+        remote,
+        client_config,
+        intro_spawner,
+        ingest,
+        coordination_manager,
+        shutdown,
+        None,
+    )
+    .await
+}
+
+/// Coordinated connect loop with explicit cancellation and an optional
+/// bootstrap-fallback client config.
+pub async fn connect_loop_with_coordination_until_cancel_with_fallback(
+    db_path: &str,
+    recorded_by: &str,
+    endpoint: TransportEndpoint,
+    remote: SocketAddr,
+    client_config: Option<TransportClientConfig>,
+    intro_spawner: IntroSpawnerFn,
+    ingest: IngestFns,
+    coordination_manager: Arc<CoordinationManager>,
+    shutdown: CancellationToken,
+    bootstrap_fallback_client_config: Option<TransportClientConfig>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let tenants = vec![recorded_by.to_string()];
     run_startup_preflight(db_path, &tenants, ingest)?;
 
@@ -125,6 +157,7 @@ pub async fn connect_loop_with_coordination_until_cancel(
             shared_ingest,
             coordination_manager,
             shutdown,
+            bootstrap_fallback_client_config,
         ))
         .await
 }
@@ -139,6 +172,7 @@ async fn connect_loop_inner(
     shared_ingest: tokio::sync::mpsc::Sender<crate::contracts::event_pipeline_contract::IngestItem>,
     coordination_manager: Arc<CoordinationManager>,
     shutdown: CancellationToken,
+    bootstrap_fallback_client_config: Option<TransportClientConfig>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Look up workspace SNI for this tenant (falls back to "localhost" if no trust anchor)
     let sni = {
@@ -163,13 +197,19 @@ async fn connect_loop_inner(
         }
 
         info!("Connecting to {}...", remote);
-        let provider = match tokio::select! {
+        let dial_outcome = match tokio::select! {
             _ = shutdown.cancelled() => {
                 break;
             }
-            provider = dial_session_provider(&endpoint, remote, &sni, client_config.as_ref()) => provider,
+            outcome = dial_provider_ongoing_first(
+                &endpoint,
+                remote,
+                &sni,
+                client_config.as_ref(),
+                bootstrap_fallback_client_config.as_ref(),
+            ) => outcome,
         } {
-            Ok(p) => p,
+            Ok(outcome) => outcome,
             Err(e) => {
                 warn!("Failed to connect to {}: {}", remote, e);
                 tokio::select! {
@@ -179,6 +219,8 @@ async fn connect_loop_inner(
                 continue;
             }
         };
+        let provider = dial_outcome.provider;
+        let used_bootstrap_fallback = dial_outcome.used_bootstrap_fallback;
         let connection = provider.connection();
         let peer_id = provider.peer_id().to_string();
         let peer_fp = match peer_fingerprint_from_hex(&peer_id) {
@@ -227,13 +269,22 @@ async fn connect_loop_inner(
             recorded_by.to_string(),
             peer_id.clone(),
             endpoint.clone(),
-            client_config.clone(),
+            if used_bootstrap_fallback {
+                bootstrap_fallback_client_config.clone()
+            } else {
+                client_config.clone()
+            },
             shared_ingest.clone(),
         );
 
         // Keep session scope pinned to the planner-assigned tenant.
         // Transport cert rotation can lag tenant scoping during bootstrap.
         let tenant_resolver = SessionTenantResolver::Fixed(recorded_by.to_string());
+        let max_sessions = if used_bootstrap_fallback {
+            Some(1usize)
+        } else {
+            None
+        };
         supervise_connection_sessions(
             db_path,
             &peer_id,
@@ -243,9 +294,82 @@ async fn connect_loop_inner(
             SessionDirection::Outbound,
             &tenant_resolver,
             shutdown.clone(),
+            max_sessions,
         )
         .await;
     }
 
     Ok(())
+}
+
+struct DialOutcome {
+    provider: SessionProvider,
+    used_bootstrap_fallback: bool,
+}
+
+async fn dial_provider_ongoing_first(
+    endpoint: &TransportEndpoint,
+    remote: SocketAddr,
+    sni: &str,
+    ongoing_client_config: Option<&TransportClientConfig>,
+    bootstrap_fallback_client_config: Option<&TransportClientConfig>,
+) -> Result<DialOutcome, ConnectionLifecycleError> {
+    match dial_session_provider(endpoint, remote, sni, ongoing_client_config).await {
+        Ok(provider) => Ok(DialOutcome {
+            provider,
+            used_bootstrap_fallback: false,
+        }),
+        Err(primary_err) => {
+            let Some(fallback_cfg) = bootstrap_fallback_client_config else {
+                return Err(primary_err);
+            };
+            if !is_mtls_trust_rejection(&primary_err) {
+                return Err(primary_err);
+            }
+            info!(
+                "Primary mTLS dial to {} rejected by trust policy; retrying with bootstrap fallback cert",
+                remote
+            );
+            match dial_session_provider(endpoint, remote, sni, Some(fallback_cfg)).await {
+                Ok(provider) => Ok(DialOutcome {
+                    provider,
+                    used_bootstrap_fallback: true,
+                }),
+                Err(fallback_err) => Err(ConnectionLifecycleError::Dial(format!(
+                    "primary and bootstrap-fallback dials failed to {}: primary={}, fallback={}",
+                    remote, primary_err, fallback_err
+                ))),
+            }
+        }
+    }
+}
+
+fn is_mtls_trust_rejection(err: &ConnectionLifecycleError) -> bool {
+    let ConnectionLifecycleError::Dial(msg) = err else {
+        return false;
+    };
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("not in allowed set") || lower.contains("peer fingerprint")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mtls_rejection_classifier_matches_transport_verifier_errors() {
+        let err = ConnectionLifecycleError::Dial(
+            "handshake to 127.0.0.1:4433: peer fingerprint deadbeef not in allowed set"
+                .to_string(),
+        );
+        assert!(is_mtls_trust_rejection(&err));
+    }
+
+    #[test]
+    fn mtls_rejection_classifier_ignores_non_trust_failures() {
+        let err = ConnectionLifecycleError::Dial(
+            "handshake to 127.0.0.1:4433: connection refused".to_string(),
+        );
+        assert!(!is_mtls_trust_rejection(&err));
+    }
 }

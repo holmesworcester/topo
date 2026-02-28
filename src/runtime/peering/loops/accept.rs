@@ -242,6 +242,7 @@ pub async fn accept_loop_with_ingest_until_cancel(
                     SessionDirection::Inbound,
                     &tenant_resolver,
                     worker_shutdown,
+                    None,
                 )
                 .await;
             }));

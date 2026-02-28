@@ -7,6 +7,8 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use ed25519_dalek::SigningKey;
+use rusqlite::OptionalExtension;
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 
 use crate::contracts::peering_contract::TransportSessionIo;
@@ -149,6 +151,45 @@ pub fn build_tenant_client_config_from_db(
     let cert_der = CertificateDer::from(cert_der);
     let key_der = PrivatePkcs8KeyDer::from(key_der);
     build_tenant_client_config_from_creds(db_path, tenant_id, cert_der, key_der)
+}
+
+/// Build an optional bootstrap-fallback client config for a tenant.
+///
+/// Fallback identity is derived from the latest pending invite unwrap key
+/// (`local_signer_material.signer_kind = 4`) for this tenant. This enables
+/// retrying outbound bootstrap dials when permanent transport identity is
+/// rejected by a peer that has not yet converged peer_shared trust.
+pub fn build_tenant_bootstrap_fallback_client_config_from_db(
+    db_path: &str,
+    tenant_id: &str,
+) -> Result<Option<TransportClientConfig>, Box<dyn std::error::Error + Send + Sync>> {
+    let db = open_connection(db_path)?;
+    let key_bytes: Option<Vec<u8>> = db
+        .query_row(
+            "SELECT private_key
+             FROM local_signer_material
+             WHERE recorded_by = ?1
+               AND signer_kind = 4
+               AND length(private_key) = 32
+             ORDER BY created_at DESC, rowid DESC
+             LIMIT 1",
+            rusqlite::params![tenant_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(key_bytes) = key_bytes else {
+        return Ok(None);
+    };
+    if key_bytes.len() != 32 {
+        return Ok(None);
+    }
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&key_bytes);
+    let signing_key = SigningKey::from_bytes(&key);
+    let (cert_der, key_der) =
+        crate::transport::generate_self_signed_cert_from_signing_key(&signing_key)?;
+    let cfg = build_tenant_client_config_from_creds(db_path, tenant_id, cert_der, key_der)?;
+    Ok(Some(cfg))
 }
 
 pub fn tenant_trusts_peer(
@@ -363,6 +404,51 @@ mod tests {
 
         build_tenant_client_config_from_db(db_path.to_str().unwrap(), "tenant-a")
             .expect("tenant config should build from stored creds");
+    }
+
+    #[test]
+    fn bootstrap_fallback_client_config_present_when_pending_invite_key_exists() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("fallback_cfg.sqlite3");
+        let db = open_connection(&db_path).unwrap();
+        create_tables(&db).unwrap();
+
+        db.execute(
+            "INSERT INTO local_signer_material
+             (recorded_by, signer_event_id, signer_kind, private_key, created_at)
+             VALUES (?1, ?2, 4, ?3, ?4)",
+            rusqlite::params![
+                "tenant-a",
+                "invite-eid",
+                vec![7u8; 32],
+                12345_i64,
+            ],
+        )
+        .unwrap();
+        drop(db);
+
+        let cfg = build_tenant_bootstrap_fallback_client_config_from_db(
+            db_path.to_str().unwrap(),
+            "tenant-a",
+        )
+        .expect("fallback config query should succeed");
+        assert!(cfg.is_some(), "pending invite key should yield fallback config");
+    }
+
+    #[test]
+    fn bootstrap_fallback_client_config_absent_without_pending_invite_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("fallback_cfg_empty.sqlite3");
+        let db = open_connection(&db_path).unwrap();
+        create_tables(&db).unwrap();
+        drop(db);
+
+        let cfg = build_tenant_bootstrap_fallback_client_config_from_db(
+            db_path.to_str().unwrap(),
+            "tenant-a",
+        )
+        .expect("fallback config query should succeed");
+        assert!(cfg.is_none(), "no pending invite key means no fallback config");
     }
 
     #[tokio::test]
