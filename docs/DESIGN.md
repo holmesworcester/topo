@@ -468,7 +468,7 @@ This eliminates write contention while preserving per-tenant projection isolatio
 
 ### TLS credential storage
 
-Transport cert/key DER <!--DER?--> blobs live exclusively in the `local_transport_creds` SQLite table (with `source` marker: `random | bootstrap | peershared`). No cert files exist on disk. Credentials are stored during identity bootstrap and loaded at endpoint creation time. Bootstrap identity install is one-way gated: after a PeerShared install, bootstrap install is denied. This keeps all node state in one database file.
+Transport cert/key DER blobs live exclusively in the `local_transport_creds` SQLite table (with `source` marker: `random | bootstrap | peershared`). No cert files exist on disk. Credentials are stored during identity bootstrap and loaded at endpoint creation time. Bootstrap identity install is one-way gated: after a PeerShared install, bootstrap install is denied. This keeps all node state in one database file.
 
 ## 3.2.2 LAN peer discovery (mDNS/DNS-SD)
 
