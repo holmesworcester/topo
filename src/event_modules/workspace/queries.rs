@@ -2,7 +2,7 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::event_id_from_base64;
-use crate::event_modules::{admin, message, peer_shared, reaction, transport_key, user};
+use crate::event_modules::{admin, message, peer_shared, reaction, user};
 use crate::service::open_db_for_peer;
 
 /// Look up the workspace_id for a peer from trust_anchors.
@@ -144,7 +144,6 @@ pub struct KeysResponse {
     pub user_count: i64,
     pub peer_count: i64,
     pub admin_count: i64,
-    pub transport_count: i64,
     pub users: Vec<String>,
     pub peers: Vec<String>,
     pub admins: Vec<String>,
@@ -159,8 +158,6 @@ pub fn keys(
     let user_count = user::count(db, recorded_by).unwrap_or(0);
     let peer_count = peer_shared::count(db, recorded_by).unwrap_or(0);
     let admin_count = admin::count(db, recorded_by).unwrap_or(0);
-    let transport_count = transport_key::count(db, recorded_by).unwrap_or(0);
-
     let mut users = Vec::new();
     let mut peers = Vec::new();
     let mut admins = Vec::new();
@@ -178,7 +175,6 @@ pub fn keys(
         user_count,
         peer_count,
         admin_count,
-        transport_count,
         users,
         peers,
         admins,
