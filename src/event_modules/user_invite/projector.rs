@@ -3,8 +3,7 @@ use crate::projection::result::{ContextSnapshot, ProjectorResult, SqlVal, WriteO
 
 /// Pure projector: UserInvite (Boot or Ongoing) → user_invites table.
 /// When bootstrap_context is available (locally-created invite), this is a
-/// Boot variant, and no matching PeerShared trust exists yet, it also writes
-/// a pending_invite_bootstrap_trust row.
+/// Boot variant, it also writes a pending_invite_bootstrap_trust row.
 pub fn project_pure(
     recorded_by: &str,
     event_id_b64: &str,
@@ -27,7 +26,7 @@ pub fn project_pure(
         ],
     }];
 
-    if is_boot && ctx.is_local_create && !ctx.bootstrap_spki_already_peer_shared {
+    if is_boot && ctx.is_local_create {
         if let Some(ref bc) = ctx.bootstrap_context {
             let expected_spki = crate::transport::cert::spki_fingerprint_from_ed25519_pubkey(public_key);
             ops.push(WriteOp::InsertOrIgnore {
