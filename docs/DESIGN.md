@@ -723,7 +723,7 @@ Why bootstrap trust uses emitted commands instead of direct projector SQL:
 3. command execution centralizes idempotence and out-of-order handling (including bidirectional supersession when PeerShared and bootstrap rows arrive in either order),
 4. trust-check functions (`is_peer_allowed`, `allowed_peers_from_db`) stay read-only, which keeps runtime behavior easier to reason about.
 
-TODO (future simplification): attempt a projection-only bootstrap design where these trust rows can be expressed as plain `write_ops` (no bootstrap emit commands) while preserving purity, replay determinism, and out-of-order supersession correctness.
+For future work: attempt a projection-only bootstrap design where these trust rows can be expressed as plain `write_ops` (no bootstrap emit commands) while preserving purity, replay determinism, and out-of-order supersession correctness.
 
 ### ContextSnapshot
 
