@@ -10,7 +10,7 @@ use rusqlite::Connection;
 use crate::crypto::{EventId, event_id_from_base64, event_id_to_base64, hash_event};
 use crate::event_modules::*;
 use crate::projection::create::{
-    create_event_sync, create_signed_event_sync,
+    create_event_synchronous, create_signed_event_synchronous,
     store_signed_event_only, project_event,
 };
 use crate::projection::encrypted::{wrap_key_for_recipient, unwrap_key_from_sender};
@@ -56,7 +56,7 @@ fn create_deterministic_secret_key_event(
         created_at_ms: deterministic_content_key_created_at_ms(&key_bytes),
         key_bytes,
     });
-    let created = create_event_sync(conn, recorded_by, &sk_evt)?;
+    let created = create_event_synchronous(conn, recorded_by, &sk_evt)?;
     if created != expected {
         return Err("secret_key event_id mismatch for deterministic key material".into());
     }
@@ -200,7 +200,7 @@ pub(crate) fn wrap_content_key_for_invite(
         signer_type: 5,
         signature: [0u8; 64],
     });
-    let _ss_event_id = create_signed_event_sync(
+    let _ss_event_id = create_signed_event_synchronous(
         conn,
         recorded_by,
         &ss_evt,
@@ -276,7 +276,7 @@ pub(crate) fn store_pending_invite_unwrap_key(
         signer_kind: SIGNER_KIND_PENDING_INVITE_UNWRAP,
         private_key_bytes: invite_key.to_bytes(),
     });
-    let _ = create_event_sync(conn, recorded_by, &evt)?;
+    let _ = create_event_synchronous(conn, recorded_by, &evt)?;
     Ok(())
 }
 
@@ -292,7 +292,7 @@ pub(crate) fn clear_pending_invite_unwrap_key(
         signer_kind: SIGNER_KIND_PENDING_INVITE_UNWRAP,
         private_key_bytes: [0u8; 32],
     });
-    let _ = create_event_sync(conn, recorded_by, &evt)?;
+    let _ = create_event_synchronous(conn, recorded_by, &evt)?;
     Ok(())
 }
 
@@ -333,7 +333,7 @@ pub(crate) fn create_user_invite_events(
         project_event(conn, recorded_by, &eid)?;
         eid
     } else {
-        create_signed_event_sync(conn, recorded_by, &evt, workspace_key)?
+        create_signed_event_synchronous(conn, recorded_by, &evt, workspace_key)?
     };
 
     if let (Some(ps_key), Some(ps_eid)) = (sender_peer_shared_key, sender_peer_shared_event_id) {
@@ -390,7 +390,7 @@ pub(crate) fn create_device_link_invite_events(
         project_event(conn, recorded_by, &eid)?;
         eid
     } else {
-        create_signed_event_sync(conn, recorded_by, &evt, user_key)?
+        create_signed_event_synchronous(conn, recorded_by, &evt, user_key)?
     };
 
     Ok(InviteData {
@@ -437,7 +437,7 @@ fn create_content_key_and_self_wrap(
         signer_type: 5,
         signature: [0u8; 64],
     });
-    let _ss_event_id = create_signed_event_sync(
+    let _ss_event_id = create_signed_event_synchronous(
         conn,
         recorded_by,
         &ss_evt,

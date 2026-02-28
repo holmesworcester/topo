@@ -19,7 +19,7 @@ use crate::event_modules::{
     UserRemovedEvent, PeerRemovedEvent, SecretSharedEvent,
 };
 use crate::transport::identity::{ensure_transport_peer_id, ensure_transport_cert};
-use crate::projection::create::{create_event_sync, create_event_staged, create_signed_event_sync, create_signed_event_staged, create_encrypted_event_sync, CreateEventError};
+use crate::projection::create::{create_event_synchronous, create_event_staged, create_signed_event_synchronous, create_signed_event_staged, create_encrypted_event_synchronous, CreateEventError};
 use crate::projection::apply::project_one;
 use crate::peering::loops::{
     accept_loop, connect_loop, connect_loop_with_coordination,
@@ -332,7 +332,7 @@ impl Peer {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        create_signed_event_sync(&db, &self.identity, &msg, self.signing_key())
+        create_signed_event_synchronous(&db, &self.identity, &msg, self.signing_key())
             .expect("failed to create message")
     }
 
@@ -361,7 +361,7 @@ impl Peer {
             created_at_ms: current_timestamp_ms(),
             key_bytes,
         });
-        create_event_sync(&db, &self.identity, &sk).expect("failed to create secret_key")
+        create_event_synchronous(&db, &self.identity, &sk).expect("failed to create secret_key")
     }
 
     /// Create a SecretKey event with deterministic key bytes and timestamp.
@@ -373,7 +373,7 @@ impl Peer {
             created_at_ms,
             key_bytes,
         });
-        create_event_sync(&db, &self.identity, &sk).expect("failed to create secret_key")
+        create_event_synchronous(&db, &self.identity, &sk).expect("failed to create secret_key")
     }
 
     /// Create an encrypted message. The inner message is signed with the PeerShared key,
@@ -390,17 +390,17 @@ impl Peer {
             signature: [0u8; 64],
         });
         // Sign the inner event, then encrypt the signed blob
-        self.create_encrypted_signed_event_sync(&db, key_event_id, &inner)
+        self.create_encrypted_signed_event_synchronous(&db, key_event_id, &inner)
     }
 
     /// Sign an inner event, encrypt the signed blob, wrap in EncryptedEvent, store + project.
-    fn create_encrypted_signed_event_sync(
+    fn create_encrypted_signed_event_synchronous(
         &self,
         db: &rusqlite::Connection,
         key_event_id: &EventId,
         inner_event: &ParsedEvent,
     ) -> EventId {
-        create_encrypted_event_sync(db, &self.identity, key_event_id, inner_event, Some(self.signing_key()))
+        create_encrypted_event_synchronous(db, &self.identity, key_event_id, inner_event, Some(self.signing_key()))
             .expect("failed to create encrypted signed event")
     }
 
@@ -416,7 +416,7 @@ impl Peer {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        create_signed_event_sync(&db, &self.identity, &del, self.signing_key())
+        create_signed_event_synchronous(&db, &self.identity, &del, self.signing_key())
             .expect("failed to create message_deletion")
     }
 
@@ -432,7 +432,7 @@ impl Peer {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        self.create_encrypted_signed_event_sync(&db, key_event_id, &inner)
+        self.create_encrypted_signed_event_synchronous(&db, key_event_id, &inner)
     }
 
     // --- Identity event helpers ---
@@ -457,7 +457,7 @@ impl Peer {
             public_key,
             name: "test-workspace".to_string(),
         });
-        create_event_sync(&db, &self.identity, &ws)
+        create_event_synchronous(&db, &self.identity, &ws)
     }
 
     /// Create an InviteAccepted event (local). Returns the event ID.
@@ -468,7 +468,7 @@ impl Peer {
             invite_event_id: *invite_event_id,
             workspace_id,
         });
-        create_event_sync(&db, &self.identity, &ia).expect("failed to create invite_accepted")
+        create_event_synchronous(&db, &self.identity, &ia).expect("failed to create invite_accepted")
     }
 
     /// Try to create an InviteAccepted event. Returns Result to allow handling rejection.
@@ -479,7 +479,7 @@ impl Peer {
             invite_event_id: *invite_event_id,
             workspace_id,
         });
-        create_event_sync(&db, &self.identity, &ia)
+        create_event_synchronous(&db, &self.identity, &ia)
     }
 
     /// Create a UserInviteBoot event (signed by workspace key). Returns the event ID.
@@ -541,7 +541,7 @@ impl Peer {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        create_signed_event_sync(&db, &self.identity, &evt, signing_key)
+        create_signed_event_synchronous(&db, &self.identity, &evt, signing_key)
             .expect("failed to create user_invite_ongoing")
     }
 
@@ -623,7 +623,7 @@ impl Peer {
             signer_type: 1,
             signature: [0u8; 64],
         });
-        create_signed_event_sync(&db, &self.identity, &evt, signing_key)
+        create_signed_event_synchronous(&db, &self.identity, &evt, signing_key)
             .expect("failed to create admin_boot")
     }
 
@@ -642,7 +642,7 @@ impl Peer {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        create_signed_event_sync(&db, &self.identity, &evt, signing_key)
+        create_signed_event_synchronous(&db, &self.identity, &evt, signing_key)
             .expect("failed to create user_removed")
     }
 
@@ -661,7 +661,7 @@ impl Peer {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        create_signed_event_sync(&db, &self.identity, &evt, signing_key)
+        create_signed_event_synchronous(&db, &self.identity, &evt, signing_key)
             .expect("failed to create peer_removed")
     }
 
@@ -684,7 +684,7 @@ impl Peer {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        create_signed_event_sync(&db, &self.identity, &evt, signing_key)
+        create_signed_event_synchronous(&db, &self.identity, &evt, signing_key)
             .expect("failed to create secret_shared")
     }
 
@@ -703,7 +703,7 @@ impl Peer {
                 signer_type: 5,
                 signature: [0u8; 64],
             });
-            create_signed_event_sync(&db, &self.identity, &msg, self.signing_key())
+            create_signed_event_synchronous(&db, &self.identity, &msg, self.signing_key())
                 .expect("failed to create message");
         }
         db.execute("COMMIT", []).expect("failed to commit");

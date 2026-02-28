@@ -352,7 +352,7 @@ fn inject_messages_batched(
     use std::time::{SystemTime, UNIX_EPOCH};
     use topo::db::open_connection;
     use topo::event_modules::{MessageEvent, ParsedEvent};
-    use topo::projection::create::create_signed_event_sync;
+    use topo::projection::create::create_signed_event_synchronous;
 
     let db = open_connection(db_path).expect("failed to open db");
 
@@ -374,7 +374,7 @@ fn inject_messages_batched(
                 signer_type: 5,
                 signature: [0u8; 64],
             });
-            create_signed_event_sync(&db, recorded_by, &msg, signing_key).expect("create_signed_event_sync failed");
+            create_signed_event_synchronous(&db, recorded_by, &msg, signing_key).expect("create_signed_event_synchronous failed");
         }
         db.execute("COMMIT", []).expect("failed to commit");
         i = end;
