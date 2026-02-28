@@ -10,19 +10,97 @@ Terminology note:
 `Topo` is the project and runtime name used throughout this repository.
 `workspace` is the term for the logical peer set and shared protocol context; "network" refers only to transport/networking concerns.
 
+## TODO (From design-doc-updates comment review)
+
+These TODOs mirror the requested changes captured in inline `<!-- ... -->` comments.
+Do not remove inline comments until each corresponding TODO is accepted and resolved.
+
+1. [x] Clarify whether "recorded" is event-sourced.
+2. [x] Explain `signed_memo` purpose and usage.
+3. [x] Explain why sync uses control + data streams.
+7. [x] Explain SQL trust checks vs in-memory trust.
+8. [x] Reconfirm boundary-enforcement abstraction.
+9. [x] Reposition naming sections not transport-specific.
+10. [x] Number Display names subsection.
+11. [x] Number Author dependency subsection.
+12. [x] Generalize freshness-by-query pattern.
+16. [x] Add netns testing setup detail.
+17. [x] Add note that pre-derive supports natural dependency sync during bootstrap.
+18. [x] Resolve placeholder `??` comments by turning them into explicit clarification TODOs.
+19. [x] Reduce implementation-specific detail in conceptual sections and use appendix references.
+22. [x] Clarify known limitation wording around pseudonym isolation.
+23. [x] Explain why certs matter in tenant discovery.
+24. [x] Remove repetition in multitenant runtime narrative.
+26. [x] Expand shared batch writer section with runtime narrative.
+27. [x] Explain planner phase in plain terms.
+28. [x] Replace "command derivation" with clearer phrase.
+29. [x] Define "DER" once on first use.
+31. [x] Mention supervisor in runtime loop sections.
+32. [x] Clarify whether dial/accept loops are separate and coordinated.
+33. [x] Reword "eventization boundary" toward "event-sourced authority boundary".
+34. [x] Align schema lifecycle wording with epoch-only prototype policy.
+36. [x] Add internal references for file-slice guard-block command.
+37. [x] Explain why bootstrap trust writes are emitted commands rather than direct projector DB calls.
+38. [x] Explain `WriteAcceptedBootstrapTrust` command role in same style.
+39. [x] Explain `SupersedeBootstrapTrust` command role in same style.
+40. [ ] Clarify whether context fields include dependency snapshots.
+41. [x] Add reference for "observations" concept.
+42. [x] Refresh trust-anchor handling wording to current flow.
+43. [x] Clarify "no full persisted dependency graph" statement.
+44. [x] Clarify "dependencies extracted per attempt" statement with example.
+45. [x] Add transaction/atomicity note around stale-row cleanup.
+46. [x] Add measurement source for claimed counter-path speedup.
+47. [ ] Clarify `_sync` naming in create APIs after discussion.
+48. [x] Rename "Materialization adapter" wording to projection terminology.
+49. [x] Rewrite "Materialization is an adapter step" for clarity.
+50. [x] Explicitly list canonically plaintext event families and scope.
+51. [x] Add references for each egress producer category.
+52. [x] Enumerate control protocol producers concretely.
+53. [x] Define "terminal decision" in queue lifecycle text.
+54. [x] Rephrase multi-source download section as default path.
+55. [x] Add/link a negentropy implementation explanation section.
+56. [x] Clarify unbounded-set discussion in relation to low-memory support.
+57. [x] Validate/update collection window value.
+58. [x] Define policy for language-specific vs implementation-specific notes in DESIGN.
+59. [x] Add line that CLI/daemon shape is for operability/testing, not core protocol semantics.
+60. [ ] Define/document cadence for TLA conformance re-verification.
+61. [ ] Clarify "invite projectors" naming using concrete event names after approval.
+62. [x] Recheck transport credential lifecycle section for latest identity changes.
+63. [x] Add references for scenario/testing harness when invariants depend on it.
+64. [x] Expand replay invariants list to include all listed checks.
+65. [ ] Add narrative walkthrough section after proposed format review.
+66. [ ] Reassess low-memory iOS claim precision and caveats after discussion.
+67. [x] Reposition event-size policy with clearer section boundaries.
+68. [x] Clarify fixed-size file-slice semantics vs final chunk padding.
+69. [x] Verify whether bounded hot cache exists; remove inaccurate claim.
+70. [x] Update "additional content event families" examples to reflect current implementation.
+71. [x] Define "autowrite" where first used.
+72. [x] Clarify when special projector logic is necessary.
+73. [x] Reduce redundant file-spec statements with cross-references.
+74. [x] Resolve missing `docs/group-encryption-design-aspects.md` reference.
+75. [x] Clarify which history-availability policy pieces already exist in baseline.
+76. [x] Replace awkward wording such as "Folderized events".
+77. [x] Clarify "conn-level helpers" wording with concrete meaning.
+
+### `??` Clarification TODOs
+
+1. [ ] Clarify the identity-prederive note in section 2.4.1 with a concrete bootstrap-dependency replay example.
+3. [x] Clarify `neg_items` bootstrap-window leakage wording and define "pseudonym isolation" precisely for this POC.
+4. [x] Replace the ambiguous "adapter step" wording in encrypted projection flow with concrete stage language.
+
 ## Requirements
 
 1. **Encryption & Auth** - it should be straightforward to implement and validate modern, scalable, high-usability group encryption schemes with user removal (DCKGA, TreeKEM, etc.) from the ground up, so they can be tailored to product needs
 1. **Deletion & Disappearing Messages** - deletion and disappearing messages should be straightforward (lots of p2p and local-first protocols make deletion hard 🤦)
-1. **P2P Networking** - peer discovery, STUN-like connection across NATs, and TURN-like relay should be straightforward without additional depedencies, and adaptable to product needs
+1. **P2P Networking** - peer discovery, STUN-like connection across NATs, and TURN-like relay should be straightforward without additional dependencies, and adaptable to product needs
 1. **Files** - multi-source file downloads (for images and attachments) should be performant (network-bound) and flexible
 1. **Performance** - workspace state (messages, etc.) and files should sync quickly, up to 10GB of messages and attachments (we assume groups are using some global retention limit for security and that each workspace's data is bounded, or that users will resort to cloud hosting for long-term storage)
 1. **Multi-tenancy** - It should be trivial to support many workspaces in the main client, join the same workspaces with multiple accounts in the same client, or host thousands of workspaces in a cloud node
 1. **Cloud / Client Isomorphism** - Cloud nodes should not require a separate implementation.
 1. **NSE / Client Isomorphism** - iOS background notification fetch (memory-constrained) should not require a separate implementation
-1. **Local netorking** - The protocol should be capable of zeroconf discovering and networking over LANs.
+1. **Local networking** - The protocol should be capable of zeroconf discovering and networking over LANs.
 1. **Testing & Simulation** - It should be trivial to test interactions between multiple accounts on the same machine, with a toy interface that mimics the requirements of a production Slack Electron or React Native app, and to test robustness against concurrency and reordering. It should also be low-cost for an LLM to "self-QA" its work.
-1. **Ergonommic Feature Development** - once complex features like auth, deletion, encryption, and forward secrecy are in place, it should be possible to build user-facing, Slack-like features (reactions, channels, threads, user profiles, etc.) with minimal friction
+1. **Ergonomic Feature Development** - once complex features like auth, deletion, encryption, and forward secrecy are in place, it should be possible to build user-facing, Slack-like features (reactions, channels, threads, user profiles, etc.) with minimal friction
 1. **Boring API for Frontends** - the backend should fully contain the complexity of the p2p stack and provide a boring API that keeps frontend development highly conventional (e.g., letting frontends fetch a paginated message list with attachments, reactions, usernames, and avatars should be easy)
 
 Primary tools/stragies used:
@@ -30,10 +108,9 @@ Primary tools/stragies used:
 1. **Event Sourcing** - Canonical events are durable facts. All canonical data is expressed as events, and state can be generated/restored deterministically by replaying events.
 1. **Content Addressing** - All events are identified by the hash of the canonicalized event (the encrypted version if encrypted, the signed plaintext version if not)
 1. **Explicit Semantic Dependency** - Rather than making events depend arbitrarily on prior events (like Automerge, OrbitDB) application developers decide what depencies are important for product needs and make them required event fields pointing to dependency event id's
-1. **Dependency-agnostic Set Reconciliation** - We use a set reconcilation algorithm (Negentropy) that eventually and efficiently syncs all events we don't yet have, without using the dependency graph (as OrbitDB or Git would)
+1. **Dependency-agnostic Set Reconciliation** - We use a set reconciliation algorithm (Negentropy) that eventually and efficiently syncs all events we don't yet have, without using the dependency graph (as OrbitDB or Git would)
 1. **Topological Sort** - Events block when dependencies are missing, and unblock with topological sort (Khan's algorithm).
 1. **Keys Are Just Dependencies** - There are no special queues for events with missing signer or decryption keys: these are just declared dependencies (key material is stored in events with id's) and block/unblock accordingly.
-1. **Dependency-Oblivious Set Reconciliation** - Rather than
 1. **Projection** - Events are queued for validation and "projected" (materialized) into SQLite rows in atomic transactions
 1. **Deterministic Query-time Winners** - Rather than applying destructive database updates that can create ordering problems, events updating a single state instead add rows using INSERT OR IGNORE; a single winner is determined at query time.
 1. **Flat, Fixed-length Events** - To simplify secure parsing, all events and fields are fixed-length and canonicalized
@@ -44,7 +121,7 @@ Primary tools/stragies used:
 1. **Convergence Testing** - Tests check that for all relevant scenarios, reverse reorderings of events, or duplicated event replays, yield the same state.
 1. **Real Networking in Tests** - All multi-client tests are realistic as possible: real networking using CLI-controlled daemons with local peer discovery.
 1. **Easy Synchronous Testing Workflows** - CLI workflows remain synchronous enough for imperative command chains (create workspace with user, invite user, join as user, etc.)
-1. **Multitenancy** - Multiple user accounts are workspaces are first class features and event sourced, with `recorded_by` scoping on shared tables (e.g. one message table, scoped to many different local users, where any known message can be recorded or "seen" by one or more users--scoping guardrails prevent accidental reads/writes across workspaces) <!-- Question: is "recorded" currently event sourced? Do we have `recorded` events?-->
+1. **Multitenancy** - Multiple user accounts/workspaces are first-class, with `recorded_by` scoping on shared tables (for example one message table, scoped to many local users). Canonical facts remain event-sourced in `events`; `recorded_events` is a local tenant ingest journal used to decide which canonical events replay for each tenant.
 
 ## Why?
 
@@ -65,6 +142,16 @@ We split concerns aggressively:
 4. Blocking/unblocking is uniform across normal and encrypted events.
 5. Multitenancy is first-class with `recorded_by` scoping on shared tables.
 6. Policy-appropriate blocked rows after sync are normal, not failure.
+7. Freshness and winners are query-time decisions over append-only rows (for example `MAX(observed_at)`, first-write-wins trust anchors), not in-place mutable "current" rows.
+
+---
+
+## Documentation scope policy
+
+1. Main sections describe protocol semantics and runtime invariants in language-agnostic terms.
+2. Rust file/module paths are included only when they materially reduce ambiguity for implementers.
+3. Dense implementation maps and file ownership details belong in appendices.
+4. When both appear, conceptual text comes first and implementation references are cross-linked.
 
 ---
 
@@ -104,7 +191,8 @@ More details:
 3. Text slots use fixed-size UTF-8 with mandatory zero-padding: unused bytes after the canonical text content must be zero, and no non-zero bytes may appear after the text terminator.
 4. Encrypted event wire size is deterministic by `inner_type_code` (inner types are fixed-size).
 5. File slice events use a canonical fixed ciphertext size; final plaintext chunks are padded before encryption.
-6. `bench_dep` events (type 26) are fixed-size shared benchmark events for dependency/cascade performance testing; they are non-encryptable and project no domain rows beyond validity state.
+6. `signed_memo` events (type 4) are currently placeholder canonical shared signed text events with a fixed 1024-byte text slot and normal signer-field verification. They project into `signed_memos` but are not part of core product flows and are candidates for removal in a later cleanup pass.
+7. `bench_dep` events (type 26) are fixed-size shared benchmark events for dependency/cascade performance testing; they are non-encryptable and project no domain rows beyond validity state.
 
 ## 1.3 Event identity and signatures
 
@@ -140,7 +228,12 @@ Safety rule:
 
 ## 1.5 Dual-stream sync completion protocol
 
-Sync sessions use one control stream and one data stream. <!--Add a note on why; look at commit history for why we added this; I think it was perf related-->
+Sync sessions use one control stream and one data stream.
+
+Why split streams:
+1. keeps large event transfer (`Event` frames) from head-of-line blocking control semantics (`Done`, `DoneAck`),
+2. makes completion semantics explicit (data completion vs control completion),
+3. improves practical throughput and observability by separating reconciliation/control chatter from bulk payload flow.
 
 Completion frames:
 1. `Done` (control stream, initiator -> responder): initiator has finished producing outbound work for this round.
@@ -161,7 +254,7 @@ Transport identity is derived from event-layer peer identity:
 1. **Transport identity** (mTLS scope): cert/key material, SPKI fingerprints, `peer_id` derived from BLAKE2b-256 of X.509 SPKI. Managed by `transport/identity.rs`.
 2. **Event-graph identity** (identity layer scope): Ed25519 keys, signer chains, trust anchors, and identity events (types 8-22). Managed by the `projection/identity` module.
 
-Transport certs are deterministically derived from PeerShared Ed25519 signing keys, so the two identity scopes are unified. All transport trust is derived from PeerShared Ed25519 public keys via `spki_fingerprint_from_ed25519_pubkey()`.
+Transport certs are deterministically derived from PeerShared Ed25519 signing keys, so the two identity scopes are unified. `TransportKey` events (type 23) are legacy, deprecated, and scheduled for removal; when present they remain parseable but are **not** authoritative for trust decisions. All steady-state transport trust is derived from PeerShared Ed25519 public keys via `spki_fingerprint_from_ed25519_pubkey()`.
 
 ## 2.1 QUIC + mTLS
 
@@ -181,8 +274,8 @@ Rules:
 Transport peer identity is SPKI-derived:
 
 1. `peer_id = hex(BLAKE2b-256(cert_SPKI))`,
-2. SPKI is computed directly from PeerShared public key (deterministic cert derivation), <!-- We probably should rename peer_id since it seems like the event id of a `peer` evernt-->
-3. the `peer_transport_bindings` table records observed connections, <!-- by event layer PeerShared id's or transport layer id's? -->
+2. SPKI is computed directly from PeerShared public key (deterministic cert derivation),
+3. the `peer_transport_bindings` table is observation telemetry keyed by `(recorded_by, peer_id)`, where `recorded_by` is the local tenant key and `peer_id` is the remote transport fingerprint; `spki_fingerprint` stores the raw 32-byte SPKI for lookup/diagnostics,
 4. `invite_bootstrap_trust` stores accepted invite-link bootstrap tuples
    (`bootstrap_addr`, inviter SPKI) used before PeerShared-derived trust appears,
 5. `pending_invite_bootstrap_trust` stores inviter-side expected invitee SPKI
@@ -191,7 +284,12 @@ Transport peer identity is SPKI-derived:
    (PeerShared projector emits `SupersedeBootstrapTrust`) when matching steady-state
    PeerShared-derived trust appears. Trust check reads are pure (no write side-effects).
 
-Runtime rule: handshake verification queries SQL trust state per connection creation; projected peer keys are not treated as in-memory authority. <!--Add why: I think because in memory peers would become a problem in low mem contexts or on cloud nodes serving many peers -->
+Runtime rule: handshake verification queries SQL trust state per connection creation; projected peer keys are not treated as in-memory authority.
+
+Why this is SQL-first:
+1. restart-safe: no trust bootstrap gap after process restart,
+2. low-memory friendly: avoids unbounded in-memory trust sets,
+3. multi-tenant safe: one node can host many tenants with tenant-scoped indexed lookups.
 
 Conceptually:
 `TrustedPeerSet = PeerShared_SPKIs ∪ invite_bootstrap_trust ∪ pending_invite_bootstrap_trust`.
@@ -201,13 +299,17 @@ Conceptually:
 Transport cert/key materialization is isolated behind a typed contract:
 
 - **`TransportIdentityIntent`** (enum): describes *what* identity change is needed (`InstallBootstrapIdentityFromInviteKey` or `InstallPeerSharedIdentityFromSigner`).
-- **`TransportIdentityAdapter`** (trait): executes the intent against the DB. The sole concrete implementation (`ConcreteTransportIdentityAdapter` in `src/transport/identity_adapter.rs`) is the **only** code that calls raw install functions (`install_invite_bootstrap_transport_identity`, `install_peer_key_transport_identity`).
+- **`TransportIdentityAdapter`** (trait): executes the intent against the DB. The sole concrete implementation (`ConcreteTransportIdentityAdapter` in `src/runtime/transport/identity_adapter.rs`) is the **only** code that calls raw install functions (`install_invite_bootstrap_transport_identity`, `install_peer_key_transport_identity`).
 - **Workspace command layer** (`accept_invite` / `accept_device_link`) installs invite-derived bootstrap identity via the adapter intent path (not raw transport calls).
 - **Event modules** emit `ApplyTransportIdentityIntent` commands (e.g., `local_signer_secret` projector for PeerShared signers).
 - **Projection pipeline** (`write_exec.rs`) routes intents through the adapter.
 - **Downgrade guard**: bootstrap install is rejected once a PeerShared-derived identity has been installed (`BootstrapAfterPeerSharedDenied`), enforcing one-way transition.
 - **Credential source tracking**: `local_transport_creds.source` records `random | bootstrap | peershared` for runtime guard checks and diagnostics.
-- **Boundary enforcement**: `scripts/check_boundary_imports.sh` prevents raw install calls from leaking into `service.rs`, `event_modules/`, or `projection/`.
+- **Boundary enforcement**: layered controls enforce this boundary:
+  1. typed intent contract (`TransportIdentityIntent`),
+  2. single adapter implementation (`ConcreteTransportIdentityAdapter`),
+  3. static import guard (`scripts/check_boundary_imports.sh`),
+  4. contract tests (`tests/identity_transport_contract_tests/*`).
 
 ## 2.3 Event-graph identity binding
 
@@ -218,14 +320,13 @@ Identity is event-defined; transport identity must use event-layer identity as i
 3. projected identity determines which peers are allowed to sync.
 4. identity and signatures determine what events are valid (who can do what)
 
-<!-- We might need to move these sections on naming because they aren't relevant to transport -->
-### Display names (POC placeholder) <!-- add section number-->
+### 2.3.1 Display names (POC placeholder)
 
 Encrypting workspace and event names is straightforward given group key agreement (see: poc-6), but it adds complexity and is out of the scope of this proof-of-concept design.
 
-As a plceholder, workspace, user, and device events carry a 64-byte cleartext name text slot. 
+As a placeholder, workspace, user, and device events carry a 64-byte cleartext name text slot.
 
-### Author Dependency <!-- add section number -->
+### 2.3.2 Author dependency
 
 Content events (Message, Reaction, MessageDeletion) declare `author_id` as a dependency field pointing to User events (type 14/15). The dependency system blocks projection until the referenced User event exists, and the projector verifies that the signer's peer_shared `user_event_id` matches the claimed `author_id`. This enables direct `messages.author_id = users.event_id` JOINs for display name resolution.
 
@@ -234,7 +335,7 @@ Content events (Message, Reaction, MessageDeletion) declare `author_id` as a dep
 Direct peer-to-peer connectivity through NAT is a transport optimization, not a canonical protocol concern.
 
 Principles:
-1. Hole punch is opportunistic — sync via normal-operation set reconcilation and an intermediary peer is always the fallback.
+1. Hole punch is opportunistic — sync via normal-operation set reconciliation and an intermediary peer is always the fallback.
 2. Introduction data (endpoint observations, IntroOffers) is runtime protocol state, not canonical events.
 3. The introducer role is a behavior of any peer that has active connections to multiple other peers — it is not a special node type.
 4. Punch success depends on NAT behavior (EIM = endpoint-independent mapping). Symmetric/port-dependent NATs will not work with the current approach.
@@ -246,7 +347,7 @@ After a successful hole-punched connection, it also records the punched peer's o
 
 Rules:
 1. Observations are append-only with `INSERT OR IGNORE`.
-2. Freshness is determined by `MAX(observed_at)` query, not in-place update. <!-- Might be worth adding this as a univeral rule -->
+2. Freshness is determined by `MAX(observed_at)` query, not in-place update.
 3. Observations expire via `expires_at` and are periodically purged.
 4. Observations are scoped by `recorded_by` (the observer) and `via_peer_id` (the observed peer).
 
@@ -262,13 +363,14 @@ An introducer sends `IntroOffer` messages to two peers so they can attempt a dir
 Receiver validation:
 1. Expired offers are dropped and recorded as `expired`.
 2. Offers for untrusted peers (not in `AllowedPeers`) are rejected.
-3. Duplicate `intro_id` values are silently skipped. <!-- how long do we keep id's around for? is this needed?-->
+3. Duplicate `intro_id` values are silently skipped per `(recorded_by, intro_id)`.
+4. `intro_attempts` rows currently have no TTL purge; dedupe horizon is DB-retention lifetime in this POC.
 
 ### Hole punch dial protocol
 
 After receiving a valid IntroOffer, the peer attempts paced QUIC connections to the introduced peer's observed address:
 
-1. Dial attempts are paced at 200ms intervals within the `attempt_window_ms` (default 4s). <!-- Realistic? -->
+1. Dial attempts are paced at 200ms intervals within the `attempt_window_ms` (default 4s). The 200ms pace is the current implementation default and can be promoted to a tuning knob if field data requires it.
 2. Each attempt uses `endpoint.connect()` on the same QUIC endpoint (sharing the UDP socket and local port).
 3. On successful connection, the peer verifies the remote peer's identity matches the expected `other_peer_id`.
 4. On identity match, a normal sync session runs on the punched connection.
@@ -276,7 +378,7 @@ After receiving a valid IntroOffer, the peer attempts paced QUIC connections to 
 
 NAT traversal relies on simultaneous open: both peers dial each other at roughly the same time, creating outgoing NAT mappings that allow the other's packets through.
 
-<!-- For mobile devices with GPS-accurate clocks, can we do better than this for timing? Do we need to? -->
+Timing uses local monotonic timers for pacing and local wall-clock checks for offer expiry. The protocol does not require GPS-grade or globally synchronized clocks; skew mainly affects whether a borderline-stale offer is attempted vs dropped.
 
 ### Explicit intro API
 
@@ -311,7 +413,12 @@ Test the feature with both local integration tests and Linux netns NAT simulatio
 5. `sudo tests/netns_nat_test.sh --symmetric` (expected fail)
 6. `sudo tests/netns_nat_test.sh --cleanup`
 
-<!--include more details on the netns testing setup? -->
+Netns runbook notes:
+1. The script creates five namespaces (`hp_i`, `hp_na`, `hp_nb`, `hp_a`, `hp_b`) and a public bridge.
+2. `--cone` mode configures endpoint-independent mapping and should permit successful hole punch.
+3. `--symmetric` mode configures randomized source-port NAT and should fail direct hole punch.
+4. On success, temp logs are removed; on failure, logs are preserved under `/tmp/hp_nat_test.*` for diagnosis.
+5. Always run `--cleanup` after interrupted runs to remove namespaces and bridge state.
 
 ## 2.4.1 Identity bootstrap operations
 
@@ -331,7 +438,7 @@ Signer secrets (LocalSignerSecret events) are NOT emitted here; `persist_join_si
 
 **Device link** (`workspace::commands::create_device_link_invite` / `add_device_to_workspace`): similar to user invite but creates a shorter chain (PeerSharedFirst only, skipping user/device_invite creation).
 
-**Retry** (`workspace::commands::retry_pending_invite_content_key_unwraps`): retries content-key unwrap for invites where SecretShared prerequisites arrived late. Triggered via `event_modules::post_drain_hooks` from `event_pipeline/effects.rs` after each projection drain.
+**Retry** (`workspace::commands::retry_pending_invite_content_key_unwraps`): retries content-key unwrap for invites where SecretShared prerequisites arrived late. Triggered via `event_modules::post_drain_hooks` from `state/pipeline/effects.rs` after each projection drain.
 
 Identity pre-derive:
 
@@ -351,21 +458,23 @@ so all events are written under the final peer_id from the start.
   session). Identity transitions only happen during discrete CLI commands,
   never during active sync, so per-session re-lookup is unnecessary overhead.
 
-Concrete replay example (why pre-derive matters):
-1. joiner accepts invite and immediately writes `InviteAccepted`, `UserBoot`, and `PeerSharedFirst` under pre-derived `recorded_by = derived_peer_id`,
-2. sync then replays older inviter-side events plus late `SecretShared` dependencies in arbitrary order,
-3. because all local rows were already written under final `recorded_by`, unblock/retry/project paths operate on one tenant keyspace with no remap/finalize migration step.
+Pre-derive implication:
+1. because `recorded_by` is final before any event write, bootstrap does not need a special remap/finalize pass,
+2. dependency blocking/unblocking behaves identically to steady-state sync,
+3. replay naturally converges through normal dependency resolution for the same tenant key.
 
 ### Identity ownership boundary
 
-- `event_modules/workspace/identity_ops.rs` owns reusable primitive helpers only (`pub(crate)`): key creation, content-key wrap/unwrap, pending invite storage, data types.
-- `event_modules/workspace/invite_link.rs` owns invite link encode/decode.
-- `transport/identity.rs` owns transport cert/key/SPKI logic.
-- `event_modules/workspace/commands.rs` owns all workflow orchestration: workspace creation, invite creation/acceptance, device link flows, retry logic.
-- `service.rs` routes to `workspace::commands` APIs; it contains no identity-specific workflow orchestration.
-- `event_pipeline/effects.rs` invokes `event_modules::post_drain_hooks`, which calls `workspace::commands::retry_pending_invite_content_key_unwraps` for post-drain content-key convergence.
-- The `src/identity/` module has been eliminated. No `pub mod identity;` exists in `lib.rs`.
-- Boundaries are machine-checked by `scripts/check_boundary_imports.sh`.
+Conceptual ownership:
+1. **Event commands own workflows** (workspace creation, invite creation/acceptance, device linking, retry paths).
+2. **Crypto modules own cryptographic primitives** (`shared/crypto/*`, `projection/encrypted.rs` for wrap/unwrap, hash/sign/verify operations).
+3. **Identity helpers own event-domain composition** (`event_modules/workspace/identity_ops.rs`: deterministic key-event materialization, invite helper assembly, bootstrap helper data shaping) and call crypto primitives rather than redefining them.
+4. **Transport adapter owns cert/key/SPKI materialization** and is invoked via typed intents, not direct calls from event modules.
+5. **Projection pipeline owns deterministic application order** (`write_ops` then `emit_commands`) and post-drain hooks.
+6. **Service/RPC layer owns orchestration only** (routing, db open/close, error mapping), not identity policy logic.
+7. **Boundary checks are automated** (import guard script + contract tests).
+
+Concrete Rust file mapping is in Appendix A (implementation map).
 
 All functions take `&Connection` and `recorded_by`, enabling multi-tenant operation where multiple identities share a single database.
 
@@ -373,10 +482,12 @@ All functions take `&Connection` and `recorded_by`, enabling multi-tenant operat
 
 1. `signed_by`: canonical signer event reference used for signature/policy checks.
 2. `signer_type`: signer keyspace discriminator (`workspace | user_invite | device_invite | user | peer_shared`).
-3. `recorded_by`: local tenant transport peer identity that recorded/projected the event.
+3. `recorded_by`: local tenant scope key that recorded/projected the event; in the current implementation this key is the local transport peer fingerprint selected during bootstrap.
 4. `via_peer_id`: authenticated remote transport peer for ingress metadata.
 
 `recorded_by` is derived from authenticated local daemon/profile transport identity, not from event payload claims.
+Legacy naming note: some tenant-scoped tables still use the column name `peer_id` for this same local scope key domain (for example `recorded_events.peer_id`). In this document, `recorded_by` is the canonical term.
+Naming rule: `peer_id` means a transport identity fingerprint (local or remote by context). `event_id` means a canonical event hash; these domains are never interchangeable.
 
 ---
 
@@ -402,19 +513,19 @@ Shared physical tables are used across peers.
 
 Rules:
 1. no per-tenant table fanout,
-2. subjective rows include tenant scope (`peer_id` or `recorded_by` <!-- difference?-->),
+2. subjective rows include tenant scope using the same local tenant-key domain (column name is `recorded_by` in newer tables and legacy `peer_id` in older ones),
 3. composite identity/index shape is tenant-first, typically `(peer_id, event_id)`,
 4. query APIs are tenant-bound wrappers rather than raw unrestricted DB handles.
 
 This preserves scoped reads/writes while keeping the schema ergonomic.
 
-**Known limitation:** The `neg_items` table is shared across tenants as one physical table. Negentropy reads are workspace-scoped (`workspace_id = ? OR workspace_id = ''`), so a tenant session does not enumerate other tenants' non-empty workspace buckets. <!-- ??--> The remaining leakage surface is rows written with empty `workspace_id` (bootstrap/pre-anchor window). <!-- ??--> Full pseudonym isolation <!-- define--> still requires separate nodes on separate network paths.
+**Known limitation:** `neg_items` is one shared physical table. Negentropy reads are workspace-scoped (`workspace_id = ? OR workspace_id = ''`), so tenants do not enumerate other tenants' non-empty workspace buckets. Remaining leakage risk is limited to rows with empty `workspace_id` during bootstrap/pre-anchor windows. In this document, **pseudonym isolation** means preventing any cross-tenant metadata correlation at the node level; full pseudonym isolation still requires separate node instances on separate network paths.
 
 ## 3.2.1 Functional multitenancy: one node, N tenants
 
 A single node process can host N tenant identities in one shared SQLite database, with one shared QUIC endpoint plus tenant-scoped workspace binding and trust policy.
 
-The DB is the tenant registry. No explicit tenant registration step is required. The node discovers its tenants by joining two tables: <!-- Why do certs matter here? Why aren't we at event layer auth by now? -->
+The DB is the tenant registry. No explicit tenant registration step is required. The node discovers its tenants by joining two tables:
 
 ```sql
 SELECT t.peer_id, t.workspace_id, c.cert_der, c.key_der
@@ -422,11 +533,14 @@ FROM trust_anchors t
 JOIN local_transport_creds c ON t.peer_id = c.peer_id
 ``` 
 
-`trust_anchors` is populated by `invite_accepted` (local-only, part of the identity bootstrap). `local_transport_creds` is populated during identity bootstrap: invite acceptance may install an invite-derived bootstrap cert first, then projection installs the PeerShared-derived cert. Any identity that has both a workspace binding and TLS material is a local tenant.
+`trust_anchors` is populated by `invite_accepted` (local-only, part of the identity bootstrap). `local_transport_creds` is populated during identity bootstrap: invite acceptance may install an invite-derived bootstrap cert first, then projection installs the PeerShared-derived cert.
+
+Why certs are part of discovery:
+1. event-layer identity establishes who the tenant is,
+2. transport credentials establish that the tenant can actually terminate mTLS handshakes,
+3. the daemon needs both to start accept/dial loops safely (identity without certs cannot serve transport; certs without anchor cannot map to workspace scope).
 
 ### Node daemon architecture
-
-<!-- section has some repetition -->
 
 The node daemon (`run_node`) operates as follows:
 
@@ -447,7 +561,7 @@ The single QUIC endpoint uses a union trust closure that accepts connections tru
 - `invite_bootstrap_trust` rows (accepted invite-link bootstrap, TTL-bounded),
 - `pending_invite_bootstrap_trust` rows (inviter-side pre-handshake, TTL-bounded).
 
-Trust checks are **tenant-scoped** (`recorded_by`-partitioned). Value-level trust-set overlap is allowed (the same SPKI may appear in multiple tenants' trust rows), and the union closure permits the shared endpoint to accept connections for any local tenant. (`trust_anchors` is used only for tenant discovery at startup, not for per-connection verification.) <!-- why only at startup and what does this mean?-->
+Trust checks are **tenant-scoped** (`recorded_by`-partitioned). Value-level trust-set overlap is allowed (the same SPKI may appear in multiple tenants' trust rows), and the union closure permits the shared endpoint to accept connections for any local tenant. `trust_anchors` is read during startup tenant discovery (to enumerate local tenant/workspace bindings), but per-connection authorization uses `is_peer_allowed` over PeerShared/bootstrap trust tables, not `trust_anchors`.
 
 ### Removal-driven session teardown
 
@@ -457,29 +571,44 @@ When a `PeerRemoved` event is projected, the removed peer's SPKI is excluded fro
 
 ### Shared batch writer with tenant routing
 
-<!--this section seems to need a bitmore narrative; in addition to roles, what actually happens?-->
-All tenants share a single `batch_writer` thread to avoid SQLite write contention. Each ingested event carries a `recorded_by` field (the 3-tuple `IngestItem = (event_id, blob, recorded_by)`). The batch writer runs three explicit phases:
+All tenants share a single `batch_writer` thread to avoid SQLite write contention.
+Each ingested event carries `recorded_by` (`IngestItem = (event_id, blob, recorded_by)`), so one writer can safely persist mixed-tenant ingress without cross-tenant state confusion.
 
-1. Persist phase (`event_pipeline/phases.rs`): inserts into `events`, `recorded_events`, and `neg_items`, and enqueues `project_queue` rows in one transaction.
-2. Planner phase (`event_pipeline/planner.rs`): deterministically maps `PersistPhaseOutput` to post-commit commands. <!-- explain this a bit more?-->
-3. Effects phase (`event_pipeline/effects.rs`): executes side effects through the executor boundary (wanted removal, queue drain/projection, queue health logging, post-drain hooks).
+Per batch:
+1. collect ingress tuples from concurrent sessions,
+2. persist canonical rows once (`events`) and tenant receipt rows (`recorded_events`) in one transaction,
+3. enqueue tenant-scoped projection work (`project_queue`),
+4. commit,
+5. run post-commit effects (queue drain, health logging, post-drain hooks).
 
-Ownership statement: persist owns ingest SQL writes, planner owns command derivation <!-- what does derivation mean here?-->, effects owns side effects, and `batch_writer` in `event_pipeline/mod.rs` owns sequencing/retry policy.
+The batch writer runs three explicit phases:
+
+1. Persist phase (`state/pipeline/phases.rs`): inserts into `events`, `recorded_events`, and `neg_items`, and enqueues `project_queue` rows in one transaction.
+2. Planner phase (`state/pipeline/planner.rs`): deterministically maps `PersistPhaseOutput` to a post-commit command list (for example drain tenant queues seen in the batch, log queue health, run post-drain hooks).
+3. Effects phase (`state/pipeline/effects.rs`): executes side effects through the executor boundary (wanted removal, queue drain/projection, queue health logging, post-drain hooks).
+
+Ownership statement: persist owns ingest SQL writes, planner owns deterministic command mapping, effects owns side-effect execution, and `batch_writer` in `state/pipeline/mod.rs` owns sequencing/retry policy.
 
 This eliminates write contention while preserving per-tenant projection isolation.
 
 ### TLS credential storage
 
-Transport cert/key DER blobs live exclusively in the `local_transport_creds` SQLite table (with `source` marker: `random | bootstrap | peershared`). No cert files exist on disk. Credentials are stored during identity bootstrap and loaded at endpoint creation time. Bootstrap identity install is one-way gated: after a PeerShared install, bootstrap install is denied. This keeps all node state in one database file.
+Transport cert/key **DER** (ASN.1 Distinguished Encoding Rules) blobs live exclusively in the `local_transport_creds` SQLite table (with `source` marker: `random | bootstrap | peershared`). No cert files exist on disk. Credentials are stored during identity bootstrap and loaded at endpoint creation time. Bootstrap identity install is one-way gated: after a PeerShared install, bootstrap install is denied. This keeps all node state in one database file.
 
 ## 3.2.2 LAN peer discovery (mDNS/DNS-SD)
 
-Multi-tenant nodes advertise each tenant on the local network under the `_topo._udp.local.` service type. Each tenant registers a separate mDNS service instance with its actual bound port and full `peer_id` in a TXT property.
+Multi-tenant nodes advertise each tenant on the local network under the `_topo._udp.local.` service type. Each tenant registers a separate mDNS service instance with its actual bound port and full transport `peer_id` (SPKI-derived fingerprint) in a TXT property.
 
 Discovery rules:
-1. **Self-filtering**: the browser receives the full set of local tenant peer IDs and filters them out, preventing unnecessary local connections. <!-- Should peer_id be signed and sig checked to stop spoofing? What are implications of spoofing? Also what is peer_id here? Transport peer_id? or the event id? -->
+1. **Self-filtering**: the browser receives the full set of local tenant transport peer IDs and filters them out, preventing unnecessary local connections.
 2. **Trust gating**: discovered peers are only dialed if they pass the tenant's dynamic trust check.
 3. **Address churn**: when a previously-discovered peer re-advertises at a different address, the old `connect_loop` is cancelled via a `watch` channel and a new one is spawned.
+
+mDNS authenticity model (POC):
+1. mDNS advertisements are treated as unauthenticated discovery hints (address + claimed peer_id),
+2. an attacker can spoof mDNS TXT records and cause extra dial attempts,
+3. spoofed advertisements cannot bypass identity/auth: session acceptance still requires mTLS identity and tenant-scoped `is_peer_allowed` trust checks,
+4. authoritative peer identity for the session is the TLS/SPKI-derived peer fingerprint observed at handshake, not the mDNS TXT claim.
 
 Out-of-scope note (current POC):
 1. same-instance communication between two local tenants in the same workspace is not implemented as a special intra-daemon delivery path,
@@ -493,31 +622,31 @@ Same-host daemon discovery: when two daemons run on the same machine bound to `1
 ## 3.2.3 Peering runtime loop model
 
 The production peering runtime follows a single conceptual loop:
-<!-- should this section mention supervisor?-->
 
 1. **Projected SQLite state**: invite_bootstrap_trust rows, PeerShared-derived trust, endpoint observations.
-2. **Target planner** (`peering::runtime::target_planner`): single-owner module for all dial target planning. Collects bootstrap trust targets from SQL and mDNS discovery candidates. Routes both through `PeerDispatcher` for deduplication and reconnect management.
-3. **Dial/accept supervisors**: `connect_loop` (outbound) and `accept_loop` (inbound) manage retry/backoff and session scheduling. <!-- are these separate loops now --> QUIC dial/accept + peer identity extraction flows through `transport::connection_lifecycle`, and stream wiring flows through `transport::session_factory`.
-4. **Sync session runner** (`SyncSessionHandler`): protocol-agnostic session handler invoked via the `SessionHandler` contract.
-5. **Ingest writer** (`batch_writer`): single shared thread consuming `IngestItem` tuples from all concurrent sessions.
-6. **Projected SQLite state**: projection cascade updates trust rows, completing the loop.
+2. **Target planner** (`runtime::peering::target_planner`): single-owner module for all dial target planning. Collects bootstrap trust targets from SQL and mDNS discovery candidates. Routes both through `PeerDispatcher` for deduplication and reconnect management.
+3. **Supervisor layer**: startup preflight + loop orchestration live in the peering supervisor.
+4. **Dial/accept loops**: `connect_loop` (outbound) and `accept_loop` (inbound) are separate long-running loops coordinated by shared projected state and cancellation/watch channels. QUIC dial/accept + peer identity extraction flows through `transport::connection_lifecycle`, and stream wiring flows through `transport::session_factory`.
+5. **Sync session runner** (`SyncSessionHandler`): protocol-agnostic session handler invoked via the `SessionHandler` contract.
+6. **Ingest writer** (`batch_writer`): single shared thread consuming `IngestItem` tuples from all concurrent sessions.
+7. **Projected SQLite state**: projection cascade updates trust rows, completing the loop.
 
 ### Module ownership
 
-- **Target planning**: `src/peering/runtime/target_planner.rs` — the single source of truth for dial target decisions. Bootstrap autodial and mDNS discovery both route through this module.
-- **Transport connection lifecycle**: `src/transport/connection_lifecycle.rs` — sole owner of QUIC `connect/accept` and TLS peer identity extraction for peering paths (`dial_peer`, `accept_peer`).
-- **Transport session factory**: `src/transport/session_factory.rs` — sole owner of QUIC stream opening and `DualConnection` / `QuicTransportSessionIo` construction. Provides `open_session_io()` and `accept_session_io()` that return `(session_id, Box<dyn TransportSessionIo>)`.
-- **Transport session I/O adapter**: `src/transport/transport_session_io.rs` — sole owner of frame boundary validation (`parse_frame` exact-consumption), max-frame-size enforcement, and mapping between QUIC stream errors and `TransportSessionIoError`.
-- **Peering orchestration seam**: `src/peering/loops/mod.rs::run_session` — wires session metadata, peer-removal cancellation, and the session handler together. Receives pre-built `TransportSessionIo` from the transport session factory.
+- **Target planning**: `src/runtime/peering/target_planner.rs` — the single source of truth for dial target decisions. Bootstrap autodial and mDNS discovery both route through this module.
+- **Transport connection lifecycle**: `src/runtime/transport/connection_lifecycle.rs` — sole owner of QUIC `connect/accept` and TLS peer identity extraction for peering paths (`dial_peer`, `accept_peer`).
+- **Transport session factory**: `src/runtime/transport/session_factory.rs` — sole owner of QUIC stream opening and `DualConnection` / `QuicTransportSessionIo` construction. Provides `open_session_io()` and `accept_session_io()` that return `(session_id, Box<dyn TransportSessionIo>)`.
+- **Transport session I/O adapter**: `src/runtime/transport/transport_session_io.rs` — sole owner of frame boundary validation (`parse_frame` exact-consumption), max-frame-size enforcement, and mapping between QUIC stream errors and `TransportSessionIoError`.
+- **Peering orchestration seam**: `src/runtime/peering/loops/mod.rs::run_session` — wires session metadata, peer-removal cancellation, and the session handler together. Receives pre-built `TransportSessionIo` from the transport session factory.
 - **Bootstrap test helpers**: `src/testutil/bootstrap.rs` — test-only. Production runtime never depends on these; bootstrap progression is driven by the autodial loop polling projected SQL state.
 
-### Eventization boundary (peering) <!-- We should say "event sourced" or "depend on event source" here instead of eventized -->
+### Event-sourced authority boundary (peering)
 
-Durable trust/identity authority transitions are eventized (InviteAccepted, PeerShared, PeerRemoved). Transport runtime mechanics are NOT eventized: retry cadence, discovery timing, session lifecycle, and endpoint observations are ephemeral operational state managed by the peering runtime directly.
+Durable trust/identity authority transitions are event-sourced (InviteAccepted, PeerShared, PeerRemoved). Transport runtime mechanics are not canonical facts: retry cadence, discovery timing, session lifecycle, and endpoint observations are ephemeral operational state managed by the peering runtime directly.
 
 ## 3.3 Table lifecycle and naming
 
-1. startup schema is epoch-only: `ensure_schema_epoch` + `ensure_all_schema`,
+1. schema creation runs through deterministic owner `ensure_schema` calls (no migration history playback in this POC),
 2. no `schema_migrations` table or versioned migration runner is required in active startup/operation,
 3. each owner module defines its own idempotent `ensure_schema(conn)` (event projection tables in `event_modules/*`, queue/infra tables in `state/db/*`),
 4. central bootstrap calls owner `ensure_schema` in deterministic order,
@@ -544,12 +673,7 @@ This applies to:
 No alternate projection path is allowed.
 
 Internal two-layer model: `project_one` is the sole public entrypoint.
-Internally it delegates to `project_one_step` <!-- why are project_one and project_one_step separate functions? --> (the 7-step single-event <!-- fix line wrapping here (no hard wrap?) and make consistent across doc -->
-algorithm without cascade), then runs cascade-unblock if the result is
-`Valid`. The Kahn cascade worklist calls `project_one_step` directly to
-avoid redundant recursive cascade; Phase 2 guard retries call back into
-`project_one` for proper recursive cascade. This split is a cascade
-optimization, not an alternate projection path — all projection stages
+Internally it delegates to `project_one_step` (the 7-step single-event algorithm without cascade), then runs cascade-unblock if the result is `Valid`. The Kahn cascade worklist calls `project_one_step` directly to avoid redundant recursive cascade; Phase 2 guard retries call back into `project_one` for proper recursive cascade. This split isolates "single-event apply logic" from "cascade orchestration" for readability and testability while keeping one canonical ingest path. It is a cascade optimization, not an alternate projection path — all projection stages
 (dep check, type check, signer verify, projector dispatch) are shared.
 
 ## 4.2 Pure functional projector contract
@@ -581,10 +705,18 @@ ProjectorResult {
 
 1. `RetryWorkspaceEvent { workspace_id }` — re-project the specific workspace event after trust anchor set by invite_accepted.
 2. `RetryFileSliceGuards { file_id }` — re-project file_slice events after descriptor arrives.
-3. `RecordFileSliceGuardBlock { file_id, event_id }` — record guard-block for pending file_slices. <!-- This should include a reference to another section or more detail. GENERAL NOTE: we should be using internal doc references more for explanation. -->
-4. `WritePendingBootstrapTrust { invite_event_id, workspace_id, expected_bootstrap_spki_fingerprint }` — materialize inviter-side pending trust from invite event + bootstrap context. Emitted by UserInviteBoot and DeviceInviteFirst projectors. <!-- Why isn't this normal projection?-->
-5. `WriteAcceptedBootstrapTrust { invite_accepted_event_id, invite_event_id, workspace_id, bootstrap_addr, bootstrap_spki_fingerprint }` — materialize joiner-side accepted trust from InviteAccepted event + bootstrap context. Emitted by InviteAccepted projector. <!-- Why isn't this normal projection?-->
-6. `SupersedeBootstrapTrust { peer_shared_public_key }` — supersede bootstrap trust rows whose SPKI matches a PeerShared-derived SPKI. Emitted by PeerShared projectors so trust check reads are pure. Follows the poc-6 invite trust cascade pattern where projection drives trust state. <!-- Why isn't this normal projection?-->
+3. `RecordFileSliceGuardBlock { file_id, event_id }` — record guard-block for pending file_slices; consumed by `RetryFileSliceGuards` after descriptor projection (see section 12.2 file attachment flow and section 5.2 cascade lifecycle).
+4. `WritePendingBootstrapTrust { invite_event_id, workspace_id, expected_bootstrap_spki_fingerprint }` — materialize inviter-side pending trust from invite event + local bootstrap context. Emitted by UserInviteBoot and DeviceInviteFirst projectors.
+5. `WriteAcceptedBootstrapTrust { invite_accepted_event_id, invite_event_id, workspace_id, bootstrap_addr, bootstrap_spki_fingerprint }` — materialize joiner-side accepted trust from InviteAccepted event + local bootstrap context. Emitted by InviteAccepted projector.
+6. `SupersedeBootstrapTrust { peer_shared_public_key }` — supersede bootstrap trust rows whose SPKI matches a PeerShared-derived SPKI. Emitted by PeerShared projectors so trust check reads remain pure queries.
+
+Why bootstrap trust uses emitted commands instead of direct projector SQL:
+1. it preserves the pure projector contract (`event + context -> decision + write_ops + emit_commands`) and keeps trust-side effects in one executor path,
+2. bootstrap trust writes are context-dependent local side effects (`bootstrap_context`, `is_local_create`), so emitting explicit commands makes this dependency visible and testable,
+3. command execution centralizes idempotence and out-of-order handling (including bidirectional supersession when PeerShared and bootstrap rows arrive in either order),
+4. trust-check functions (`is_peer_allowed`, `allowed_peers_from_db`) stay read-only, which keeps runtime behavior easier to reason about.
+
+TODO (future simplification): attempt a projection-only bootstrap design where these trust rows can be expressed as plain `write_ops` (no bootstrap emit commands) while preserving purity, replay determinism, and out-of-order supersession correctness.
 
 ### ContextSnapshot
 
@@ -633,7 +765,7 @@ final state.
 3. deletions are explicit `Delete` WriteOps (never hidden side effects).
 
 Endpoint observation policy:
-1. observations <!-- Explain what these are and/or include a reference to where we explain them --> are append-only rows with TTL (`observed_at`, `expires_at`),
+1. observations (runtime endpoint observations from section 2.4 "Endpoint observations") are append-only rows with TTL (`observed_at`, `expires_at`),
 2. ingest uses `INSERT OR IGNORE` (no in-place refresh),
 3. derive `first_seen`/`last_seen` via `MIN(observed_at)`/`MAX(observed_at)` queries when needed.
 
@@ -643,6 +775,8 @@ If projector `A` emits event `B`:
 
 1. emit canonical `B` only (normal persistence/queue path),
 2. allow `B` to project through `B`'s own projector/autowrite table.
+
+`autowrite` means the projector's default deterministic write path: `InsertOrIgnore` materialization into its owned projection table with no cross-module side effects.
 
 Projectors should not directly write into another event type's projection table except rare, explicitly documented operational exceptions.
 
@@ -656,7 +790,7 @@ Deterministic emitted-event rule detail:
 Some behavior stays explicit by design:
 
 1. deletion/tombstone cascades (`message_deletion` and related checks),
-2. trust-anchor handling in `invite_accepted`, <!-- Can we update this? -->
+2. trust-anchor handling in `invite_accepted` (first-write-wins anchor write + explicit `RetryWorkspaceEvent` replay trigger),
 3. identity/removal policy checks from TLA guards.
 
 ### Deletion intent + tombstone lifecycle
@@ -721,9 +855,9 @@ Rules:
 3. `deps_remaining` is written from that deduped blocker set,
 4. `blocked_event_deps` stays the canonical "currently blocked?" source for queue admission checks; `blocked_events` is a performance header for cascade scheduling.
 
-We still do not require a full persisted dependency graph for baseline projection. <!-- what does this mean? -->
+We do not persist a global transitive dependency graph as an always-updated materialized structure. Instead, we persist only currently-blocked edges needed for unblock scheduling (`blocked_event_deps`) plus per-event blocked headers (`blocked_events`).
 
-Dependencies are extracted per attempt from schema metadata. <!-- what does this mean?-->
+Dependencies are extracted per projection attempt from schema metadata for the current event type. Example: projecting a `Reaction` reads its declared dependency fields (`target_event_id`, `author_id`, `signed_by`) from the parsed event, checks presence in `valid_events`, and writes block rows only for missing deps.
 
 ## 5.2 Counter-based Kahn cascade unblock
 
@@ -736,22 +870,22 @@ Unblocking uses a counter-driven Kahn-style cascade:
 
 Implementation detail:
 1. `blocked_event_deps` is read-only during per-step cascade work,
-2. stale rows are bulk-cleaned only after cascade transitions occur (valid/rejected terminal rows), <!-- do we need a note about tx's and atomicity here? -->
+2. stale rows are bulk-cleaned only after cascade transitions occur (valid/rejected terminal rows); this cleanup runs in the same projection transaction boundary as terminal-state writes so readers do not observe partial unblock state,
 3. guard retries run after this dep cleanup so guard queries see current state. 
 
 Design note:
 1. a SQL-only cascade (`DELETE ... RETURNING` + zero-row checks) is simpler,
-2. current branch measurements showed the counter path roughly 2x faster in the topo-cascade workload <!-- include reference or explanation--> so counter-based cascade is the default. 
+2. local benchmark runs during refactor showed the counter path materially faster in `tests/topo_cascade_test.rs` workloads (exact multiplier environment-dependent), so counter-based cascade is the default.
 
 ## 5.3 Event creation API
 
 Three creation entry points exist:
 
-1. `create_event_synchronous(...) -> event_id`,
-2. `create_signed_event_synchronous(...) -> event_id`,
-3. `create_encrypted_event_synchronous(...) -> event_id`.
+1. `create_event_sync(...) -> event_id`, <!-- why do these functions have the word "sync" in them? is there any async create? -->
+2. `create_signed_event_sync(...) -> event_id`,
+3. `create_encrypted_event_sync(...) -> event_id`.
 
-`create_event_synchronous` uses the same internal path as workers and returns success only when terminal state is `valid` for the target `recorded_by`.
+`create_event_sync` uses the same internal path as workers and returns success only when terminal state is `valid` for the target `recorded_by`.
 This preserves imperative orchestration ergonomics:
 
 1. create event A synchronously,
@@ -790,7 +924,7 @@ Wrapper field rule:
 3. no `ciphertext_len` field exists in the canonical wire format; the parser computes expected ciphertext size from `inner_type_code`.
 4. if we later adopt padded/opaque envelopes, this can be revisited deliberately.
 
-## 6.2 Materialization adapter <!-- Why do we call this materialization here instead of projection? -->
+## 6.2 Projection adapter stage
 
 Projection flow:
 
@@ -807,14 +941,20 @@ Projection flow:
 11. run normal inner signer + projector stages,
 12. mark outer event valid only if inner projection succeeds.
 
-Materialization is an adapter step, not a second projection system. <!--??-->
+Decryption is an adapter stage inside the same projection pipeline, not a second projection system.
 
 ## 6.3 Plaintext policy
 
-<!--note that some events are canonically plaintext and that this applies to encrypted events-->
 1. default: no persisted plaintext queue,
 2. plaintext exists in memory during projection only,
 3. optional short-lived cache can be added later for performance.
+
+Current canonical plaintext families:
+1. identity/auth chain events (`workspace`, `invite_accepted`, `user_invite`, `device_invite`, `user`, `peer_shared`, `admin`, removals),
+2. local identity/support events (`local_signer_secret`, `secret_key`, bootstrap helper events),
+3. content metadata events that are intentionally cleartext in this POC (`message_attachment`, `file_slice`, `reaction`, `message_deletion`, `signed_memo`, `bench_dep`).
+
+Encrypted wrapper events remain canonical but carry ciphertext payloads whose inner event type is validated by `inner_type_code` before inner projection.
 
 ---
 
@@ -849,18 +989,16 @@ Queue claim/lease/retry/backoff logic is DRY and shared across `project_queue` a
 
 Egress rows are produced by:
 
-<!-- This should include references to each kind of thing -->
-
-1. negentropy reconciliation decisions,
-2. incoming have-list responses,
-3. control protocol producers, <!-- Which? an we include references? -->
-4. optional proactive send pathways.
+1. negentropy reconciliation decisions (`runtime/sync_engine/session/control_plane.rs`),
+2. incoming `HaveList` responses and need buffering (`runtime/sync_engine/session/initiator.rs`),
+3. control protocol producers (`Frame::NegOpen`, `Frame::NegMsg`, `Frame::HaveList`, `Frame::Done`, `Frame::DataDone`, `Frame::DoneAck`, `Frame::IntroOffer`) in `shared/protocol.rs`,
+4. optional proactive send pathways (future optimization hooks in this queue model).
 
 For canonical event transfer, egress rows carry `event_id`; canonical blob is read at send time.
 
 ## 7.4 Dedupe and purge
 
-1. `project_queue` is transient and purged on terminal decision, <!-- what is terminal decision? -->
+1. `project_queue` is transient and purged on terminal decision (`Valid`, `Reject`, or `AlreadyProcessed` for the `(peer_id, event_id)` projection target),
 2. enqueue uses dedupe guards and skips terminal/blocked states,
 3. duplicate enqueue races are safe via `INSERT OR IGNORE` plus terminal fast-drop checks,
 4. `attempts` is retry bookkeeping (backoff, lease recovery, alert thresholds), not business truth.
@@ -881,8 +1019,7 @@ Can be eventual:
 
 ## 7.6 Multi-source download coordination
 
-When a sink downloads from multiple sources concurrently, <!-- Just in this case? Should we rephrase to "So that a sink can download..." now that it's the only/default behavior? --> a coordinator thread
-assigns events to peers using round-based greedy load balancing:
+Multi-source coordinated download is the default pull path. A coordinator thread assigns events to peers using round-based greedy load balancing:
 
 1. **Discovery**: each peer runs negentropy with its source, discovering need_ids
    (events the sink needs). Push (have_ids) proceeds immediately.
@@ -918,8 +1055,6 @@ Key properties:
 
 ### Implementation decisions
 
-<!-- where do we describe how negentropy works and what implementation we use or how it works etc -->
-
 A naive negentropy implementation runs one session per peer pair: each session
 has its own `batch_writer` thread for persistence, and after reconciliation it
 sends HaveList for all need_ids and streams all have_ids directly. This works
@@ -940,7 +1075,7 @@ write contention entirely — only one thread ever holds the SQLite write lock.
 Do not add an in-memory dedup set in front of the shared writer:
 - Pre-writer dedup causes data loss if the writer transaction rolls back
   (event marked "seen" but never persisted; peer retransmissions silently dropped).
-- The set grows without bound for long-running daemons (~90 bytes per EventId). <!-- should we address this for lowmem support? -->
+- A global in-memory "seen set" grows without bound for long-running daemons (~90 bytes per EventId), which conflicts with low-memory goals.
 - `INSERT OR IGNORE` in `batch_writer` handles duplicates correctly and cheaply.
 
 **Coordinator for pull rebalancing, not gating.** Each peer still pushes all
@@ -957,7 +1092,7 @@ peer fails to deliver its assigned events (slow, disconnected), those events
 re-appear as need_ids in the next negentropy round and get reassigned to a
 different peer. No permanent affinity between events and peers.
 
-**Short collection window (~20ms).** <!-- is 20ms still the time? --> The coordinator waits briefly after the
+**Short collection window (500ms default).** The coordinator waits briefly after the
 first peer reports, then assigns. Stragglers report next round and get fresh
 assignments. This prevents convoy effects where all peers run at the speed
 of the slowest reconciliation.
@@ -966,7 +1101,7 @@ of the slowest reconciliation.
 with a dedicated single-threaded tokio runtime. This isolates connection
 failures, avoids `!Send` constraints from `rusqlite` leaking into the async
 task graph, and allows each connection to share the `mpsc::Sender` to the
-shared batch_writer. <!-- how should we think about rust specific and implementation specific notes? -->
+shared batch_writer.
 
 **Incremental egress enqueue.** Have_ids from reconciliation are buffered and
 drained incrementally per main loop iteration rather than enqueued in one burst.
@@ -978,11 +1113,25 @@ the negentropy storage sees a consistent read snapshot of the events table.
 Without this, concurrent writes from the batch_writer can produce an
 inconsistent view during block rebuilding.
 
+## 7.7 Negentropy implementation notes
+
+Baseline implementation:
+1. `neg_items` stores shared-event membership tuples (`workspace_id`, timestamp, event id bytes).
+2. Per-session block indexes are rebuilt into `session_blocks` for reconciliation rounds.
+3. Control-plane reconciliation uses `NegOpen` and `NegMsg` frames; results drive `HaveList`.
+4. Data-plane transfer streams `Event` frames while reconciliation can continue in parallel.
+5. Multi-source coordination does not replace negentropy; it consumes per-peer `need_ids` discovered by negentropy.
+
+Primary code references:
+1. `src/runtime/sync_engine/negentropy_sqlite.rs`
+2. `src/runtime/sync_engine/session/control_plane.rs`
+3. `src/shared/protocol.rs`
+
 ---
 
 # 8. CLI and Daemon Contract
 
-<!-- Add line about this being useful for testing and demo'ing POC but not fundamental to the protocol design -->
+The CLI/daemon operational shape is primarily for operability, testing, and demo workflows in this POC; it is not itself part of canonical protocol semantics.
 
 ## 8.1 Operational shape
 
@@ -1030,7 +1179,7 @@ Assertion-first commands are first-class:
 
 A secure Slack alternative requires a clear notion of team membership, Signal/Slack-like invite links, end-to-end encryption, and message history provision.
 
-For reliabilty reasons we bias towards making key agreement a layer on top of the auth CRDT, not the same as the auth CRDT or necessary to read the auth CRDT. (Thought it should be possible to build either such design with this protocol.) 
+For reliability reasons we bias toward making key agreement a layer on top of the auth CRDT, not the same as the auth CRDT or necessary to read the auth CRDT. (Though it should be possible to build either such design with this protocol.)
 
 We explore a simple placeholder model of this "plaintext signed auth graph as basis for group key agreement" type here.
 
@@ -1051,20 +1200,15 @@ Invite-workspace binding: `invite_accepted` binds the trust anchor directly from
 
 Projector-spec mapping: each Rust projector predicate maps to a named TLA guard. The full mapping is maintained in `docs/tla/projector_spec.md`. Any divergence between projector logic and TLA guards is treated as a spec bug that must be resolved before adding new behavior.
 
-TLA conformance cadence:
-1. rerun TLA conformance checks whenever changes touch projector guards, `ContextSnapshot` fields, emit-command semantics, trust lifecycle logic, or any `docs/tla/*` model/spec mapping,
-2. treat those checks as pre-merge gates for such changes (`scripts/check_projector_tla_conformance.py`, `scripts/check_projector_tla_bijection.py`),
-3. rerun before release/perf-baseline cuts to ensure design+implementation+mapping are still aligned.
-
 ### Layered conformance model
 
 Tests are organized into three layers, each exercising a different scope of the TLA+ conformance contract:
 
 1. **Projector unit** (`tests/projectors/*_projector_tests.rs`) — pure function contract. Each test calls `project_pure(event, ctx)` directly with a hand-built `ContextSnapshot` and asserts decision, write_ops, and emit_commands. Covers event-local predicates (trust anchor, signer mismatch, deletion author, bootstrap trust emission, file slice auth).
-2. **Pipeline integration** (`src/projection/apply/tests/`) — shared pipeline stages. Tests exercise `project_one_step` end-to-end through dep presence, dep type checks, signer resolution, encrypted wrapper decrypt/dispatch, and cascade unblock. Uses a real SQLite DB with the full projection pipeline.
-3. **Replay/order conformance** (`src/projection/apply/tests/`) — model-critical convergence properties. Source-isomorphism tests replay the same events in different orderings and assert identical terminal state. Covers out-of-order convergence, idempotent replay, stable terminal state, and deletion two-stage convergence.
+2. **Pipeline integration** (`src/state/projection_state/apply/tests/`) — shared pipeline stages. Tests exercise `project_one_step` end-to-end through dep presence, dep type checks, signer resolution, encrypted wrapper decrypt/dispatch, and cascade unblock. Uses a real SQLite DB with the full projection pipeline.
+3. **Replay/order conformance** (`src/state/projection_state/apply/tests/`) — model-critical convergence properties. Source-isomorphism tests replay the same events in different orderings and assert identical terminal state. Covers out-of-order convergence, idempotent replay, stable terminal state, and deletion two-stage convergence.
 
-Coverage is tracked in `docs/tla/projector_conformance_matrix.md` (spec_id → check_id → test_id with pass/break polarity) and enforced by CI gate scripts (`scripts/check_projector_tla_conformance.py`, `scripts/check_projector_tla_bijection.py`). <!-- let's check this again -->
+Coverage is tracked in `docs/tla/projector_conformance_matrix.md` (spec_id → check_id → test_id with pass/break polarity) and enforced by CI gate scripts (`scripts/check_projector_tla_conformance.py`, `scripts/check_projector_tla_bijection.py`).
 
 ## 9.2 Invite model
 
@@ -1087,13 +1231,7 @@ Required semantics:
 1. workspace is not valid until trust anchor exists,
 2. invite events and invites are not forced-valid,
 3. normal signer/dependency chain still governs validity,
-4. bootstrap transport trust rows (`invite_bootstrap_trust`, `pending_invite_bootstrap_trust`) are projection-owned state, produced by concrete event projectors:
-   - `user_invite` projector emits `WritePendingBootstrapTrust`,
-   - `device_invite` projector emits `WritePendingBootstrapTrust`,
-   - `invite_accepted` projector emits `WriteAcceptedBootstrapTrust`,
-   - `peer_shared` projector emits `SupersedeBootstrapTrust`.
-   Projectors read local `bootstrap_context`; the service layer writes `bootstrap_context` rows only, never trust rows directly.
-   This follows the same poc-6 cascade pattern where `invite_accepted` projection drives trust establishment.
+4. bootstrap transport trust rows (`invite_bootstrap_trust`, `pending_invite_bootstrap_trust`) are projection-owned state, produced by invite <!-- invite_accepted? what is an invite projector? --> projectors reading local `bootstrap_context` and emitting `WritePendingBootstrapTrust` / `WriteAcceptedBootstrapTrust` commands. The service layer writes `bootstrap_context` rows only, not trust rows directly. This follows the same poc-6 cascade pattern where `invite_accepted` projection drives trust establishment. <!-- it might be helpful to go over event naming, and then just use event names here-->
 
 Self-invite bootstrap stays explicit:
 
@@ -1127,7 +1265,7 @@ Historical re-encryption or key history request/response mechanism is out of sco
 
 Bootstrap key acquisition uses the same `secret_shared` event type and wrap/unwrap logic as runtime sender-keys. The only difference is the recipient: at invite creation the inviter wraps content-key material to the invite public key (X25519-derived from the Ed25519 invite signing key), rather than to a peer's PeerShared public key.
 
-(In this way we demonstrate that the auth graph is compatible with the goal of sharing key history (access to existing messages) with new users and devices, a potentail requirement of a Slack-like workplace messenger.)
+(In this way we demonstrate that the auth graph is compatible with the goal of sharing key history (access to existing messages) with new users and devices, a potential requirement of a Slack-like workplace messenger.)
 
 Flow:
 1. At invite creation, the inviter wraps current content key(s) to the invite key via `secret_shared` events (delivered during bootstrap sync, not embedded in the invite link payload).
@@ -1139,7 +1277,7 @@ All key acquisition flows through the same event-backed wrap/unwrap path.
 
 ## 9.5 Transport credential lifecycle model
 
-This section covers the lifecycle state machine for the three trust sources: PeerShared-derived SPKIs (steady-state), `invite_bootstrap_trust`, and `pending_invite_bootstrap_trust`.
+This section covers the lifecycle state machine for the three trust sources: PeerShared-derived SPKIs (steady-state), `invite_bootstrap_trust`, and `pending_invite_bootstrap_trust`. The `transport_keys` table may still be populated by legacy TransportKey event projection, but it is deprecated/scheduled for removal and is **not** consulted for trust decisions.
 
 Credential transition model: invite acceptance may install a bootstrap transport cert first; projection later installs the PeerShared-derived cert. Runtime enforces one-way transition (no bootstrap-after-PeerShared downgrade).
 
@@ -1163,19 +1301,9 @@ TLC-verified invariants (from `TransportCredentialLifecycle.tla`, mapped to Rust
 
 Abstract boundary: TLS handshake and session-key derivation remain unmodeled. The TLA spec covers trust-source state transitions but not the cryptographic session establishment that consumes them.
 
-## 9.6 Narrative walkthrough (bootstrap to steady-state)
-
-1. Inviter creates `UserInviteBoot` (or `DeviceInviteFirst`) and local `bootstrap_context`; projector emits `WritePendingBootstrapTrust`.
-2. Joiner accepts invite and projects `InviteAccepted`; projector writes trust anchor and emits `WriteAcceptedBootstrapTrust`.
-3. Initial handshake succeeds using bootstrap trust rows while full identity chains are still converging.
-4. `PeerSharedFirst/Ongoing` projects; projector emits `SupersedeBootstrapTrust` so bootstrap trust is consumed once steady-state PeerShared-derived trust exists.
-5. Ongoing sync/dial/accept paths then rely on steady-state trust (`is_peer_allowed` over PeerShared-derived + still-live bootstrap rows), with normal dependency block/unblock behavior in the same tenant keyspace.
-
 ---
 
 # 10. Convergence and Test Invariants
-
-<!-- this implies some testing harness. where do we discuss that? can we reference it? is it adequately described? -->
 
 The system is accepted only if these invariants hold:
 
@@ -1197,9 +1325,10 @@ The system is accepted only if these invariants hold:
 Operational queue rows are excluded from end-state equality fingerprints.
 
 Harness policy:
-1. replay invariants (`once`, `twice`, `reverse-order`) <!-- What about the others listed above? --> are standard checks in the scenario harness.
-2. they run after every scenario test that mutates canonical event store rows.
+1. replay invariants (`once`, `twice`, `reverse-order`, shuffled reorder, reproject-no-clear idempotency) are standard checks in the scenario harness.
+2. they run after scenario tests that mutate canonical event-store rows.
 3. checks are computed from deterministic table-state fingerprints over event-store-derived state.
+4. implementation references: `src/testutil/mod.rs` (`verify_projection_invariants`) and scenario coverage in `tests/scenario_test.rs`.
 
 ## 10.1 Application-level test assertions
 
@@ -1232,22 +1361,24 @@ This makes tests resilient to identity chain structure changes while still verif
 2. batch worker operations with measured sizing,
 3. keep queue purge policies explicit and predictable,
 4. monitor blocked counts, queue age, retries, lease churn,
-5. provide `low_mem_ios` mode with a target of `<= 24 MiB` steady-state RSS for constrained runtimes (including iOS NSE),
+5. provide `low_mem_ios` mode targeting `<= 24 MiB` steady-state RSS (iOS NSE), <!-- Have we really done this? We're roughly in range but do we have a plausible story for syncing large message setes under 24MiB? -->
 6. in `low_mem_ios`, enforce strict in-flight bounds and prefer reduced throughput over memory spikes.
 
-Initial event-size policy:
+Operational payload caps for this prototype (wire-format specifics in section 1.2 and file-flow details in section 12.2):
 
 1. `EVENT_MAX_BLOB_BYTES = 1 MiB` soft cap,
 2. `FILE_SLICE_TARGET_BYTES = 256 KiB`,
-3. `FILE_SLICE_MAX_BYTES = 1_048_430` (`EVENT_MAX_BLOB_BYTES - 146 bytes wire overhead`).
+3. `FILE_SLICE_CIPHERTEXT_BYTES = 262_144` (fixed canonical ciphertext payload per file-slice event).
 
 `file_slice` events (type 25, signed) are signed and validated like other canonical events.
 `message_attachment` events (type 24, signed) are file descriptors with deps on `message_id`, `key_event_id`, and `signed_by`.
+`signed_memo` events (type 4, signed) are placeholder fixed-size canonical memo entries projected into `signed_memos`.
+
 ### Low-memory trust and key strategy (`low_mem_ios`)
 
 Trust and key sets use SQL indexed point lookups, not full in-memory loading. The projection tables (`trust_anchors`, identity chain tables, bootstrap trust tables) are queried on demand with indexed `(recorded_by, ...)` keys.
 
-A bounded hot cache holds recently accessed keys to avoid redundant SQL round-trips during burst projection. The cache is size-limited and evicts LRU entries; it never grows unbounded. <!-- do we still have a cache? -->
+There is no dedicated unbounded in-memory trust/key hot cache in baseline; low-memory behavior relies on indexed SQL lookups plus statement caching (`prepare_cached`).
 
 Runtime low-memory mode is enabled by env vars `LOW_MEM_IOS` or `LOW_MEM` (truthy except `0`/`false`). Queue/runtime tuning values are centralized in `src/tuning.rs`, including:
 1. projection drain/write batch sizing,
@@ -1255,9 +1386,7 @@ Runtime low-memory mode is enabled by env vars `LOW_MEM_IOS` or `LOW_MEM` (truth
 3. session ingest caps,
 4. transport receive-buffer limits.
 
-Unbounded-set clarification: canonical event history and trust rows can grow large on disk; low-memory mode bounds in-memory working set (queues, buffers, caches) rather than total persisted dataset size.
-
-Validation scale requirements: the low-memory path must remain stable at >= 1,000,000 canonical events on disk and >= 100,000 peer trust keys while targeting a 24 MiB steady-state RSS ceiling on representative constrained devices. Throughput may degrade to preserve the memory bound.
+Validation scale requirements: the low-memory path must remain stable at >= 1,000,000 canonical events on disk and >= 100,000 peer trust keys while staying within the 24 MiB steady-state RSS ceiling. Throughput may degrade to preserve the memory bound.
 
 ---
 
@@ -1267,11 +1396,11 @@ The completed prototype is deliberately minimal but extension-friendly.
 
 ## 12.1 Richer content surface
 
-Additional content event families (reactions <!-- didn't we add these to the POC already? should we add them in the design here? -->, edits, richer thread semantics, moderation signals) can be added by:
+Current baseline already includes reactions, message deletion, attachments, and file slices. Additional families (for example edits, richer thread semantics, moderation signals) can be added by:
 
 1. declaring schema + projection table metadata,
-2. using default autowrite where possible, <!-- do we define what we mean by autowrite here? -->
-3. introducing explicit special projector logic only when policy semantics require it. <!-- is this ever necessary-->
+2. using default **autowrite** where possible (projector returns deterministic `InsertOrIgnore` writes only, no emitted commands),
+3. introducing explicit special projector logic only when policy semantics require it (for example trust-anchor retries, bootstrap trust supersession, deletion intent/tombstone coupling, or guard-block retry flows).
 
 ## 12.2 File attachments and large payload flows
 
@@ -1279,7 +1408,7 @@ Attachments and slice streaming fit naturally:
 
 1. large payload events remain canonical typed events with fixed wire sizes,
 2. file slices use a canonical fixed ciphertext size; final plaintext chunks are zero-padded before encryption,
-3. deps and signatures continue to gate integrity and ordering. <!-- do we have a clear spec for files in this document? If so why is this here?-->
+3. deps and signatures continue to gate integrity and ordering (wire/layout details in section 1.2; queue transfer behavior in section 7.6).
 
 ## 12.3 Proactive 1-hop gossip on send
 
@@ -1291,11 +1420,11 @@ Beyond pull/reconcile sync, send-time proactive push can be layered as an egress
 
 ## 12.4 Subjective encryption with history provision
 
-The baseline sender-subjective O(n) wrap model can incrementally evolve toward the subjective-encryption plan in `docs/group-encryption-design-aspects.md`: <!-- is this doc in the poc-7 project currently? if not move it in -->
+The baseline sender-subjective O(n) wrap model can incrementally evolve toward a future group-encryption design note (not yet committed in this repository):
 
 1. introduce update-path style shared key structure for better asymptotics,
 2. add key request/response healing for inactive peers,
-3. add history-availability policy and provisioning events for newly linked devices/users, <!-- we kind of already have this in our poc baseline in this design?-->
+3. add explicit history-availability policy and provisioning events for newly linked devices/users (baseline already has invite bootstrap key distribution and pending-unwrap retry, but not full long-horizon history policy controls),
 4. eventually optimize recipient-cover selection (e.g. TreeKEM) while preserving the same canonical dependency/projection model.
 
 This extension path is intentionally additive: it does not require a new storage or projection architecture.
@@ -1340,11 +1469,11 @@ Event modules (`src/event_modules/<type>.rs` or `src/event_modules/<type>/`) own
 
 1. **Wire** — struct definition, parse/encode, wire layout, `EventTypeMeta`.
 2. **Projector** — `project_pure()` function: the pure projector for this event type. Takes `(recorded_by, event_id_b64, &ParsedEvent, &ContextSnapshot)` and returns `ProjectorResult`. Registered in `EventTypeMeta.projector` so the pipeline dispatches via registry lookup with no central match statement.
-3. **Commands** — `CreateXxxCmd` struct + `create()` function that builds the `ParsedEvent`, calls `create_signed_event_synchronous`, and returns `EventId`. High-level conn-level helpers (e.g. `send`, `react`) and multi-step workflows (e.g. workspace onboarding) are first-class command APIs in this layer.
+3. **Commands** — `CreateXxxCmd` struct + `create()` function that builds the `ParsedEvent`, calls `create_signed_event_sync`, and returns `EventId`. High-level command helpers callable from service/RPC routes (for example `send`, `react`) and multi-step workflows (for example workspace onboarding) are first-class command APIs in this layer.
 4. **Queries** — `list()`, `count()`, `resolve()`, `list_for_message_with_authors()`, etc. — SQL against projection tables scoped by `recorded_by`. All event-specific SQL lives here.
 5. **Response types** — serializable structs for the event domain (e.g. `MessageItem`, `MessagesResponse`, `SendResponse`). Owned by the event module, re-exported by service.rs for external callers.
 
-The projection pipeline (`src/projection/apply/`) is orchestration-only:
+The projection pipeline (`src/state/projection_state/apply/`) is orchestration-only:
 
 - Dependency presence check + block row writes
 - Dependency type enforcement
@@ -1373,7 +1502,7 @@ fn(&str, &str, &ParsedEvent, &ContextSnapshot) -> ProjectorResult
 
 ### Service command routing
 
-RPC command handlers (`src/rpc/server.rs`) call event-module command APIs directly. Example flows:
+RPC command handlers (`src/runtime/control/rpc/server.rs`) call event-module command APIs directly. Example flows:
 
 - `RpcMethod::Send` -> `message::send_for_peer`
 - `RpcMethod::React` -> `reaction::react_for_peer`
@@ -1387,13 +1516,13 @@ RPC command handlers (`src/rpc/server.rs`) call event-module command APIs direct
 
 ### Service query routing
 
-RPC query handlers (`src/rpc/server.rs`) call event-module query APIs directly. Example flows:
+RPC query handlers (`src/runtime/control/rpc/server.rs`) call event-module query APIs directly. Example flows:
 
 - `RpcMethod::Messages` -> `message::list`
 - `RpcMethod::Reactions` -> `reaction::list`
 - `RpcMethod::Users` -> `user::list_items`
 - `RpcMethod::Workspaces` -> `workspace::list_items`
-- `RpcMethod::Keys` -> `workspace::keys` (which aggregates `user`, `peer_shared`, and `admin` counts)
+- `RpcMethod::Keys` -> `workspace::keys` (which aggregates `user`, `peer_shared`, `admin`, and `transport_key` counts)
 
 ## 14.4 Module split rule
 
@@ -1432,7 +1561,7 @@ This keeps workflow locality (all workspace lifecycle commands under workspace) 
 Wire layout constants (wire sizes, text-slot budgets, field offset modules) are owned by the event module that defines the event type:
 
 1. **Single-file events** (`foo.rs`): layout constants live inline in `foo.rs`.
-2. **Folderized <!-- This word feels silly ---> events** (`foo/`): layout constants live in `foo/layout.rs`.
+2. **Directory-scoped events** (`foo/`): layout constants live in `foo/layout.rs`.
 3. **Shared cross-event primitives** (`COMMON_HEADER_BYTES`, `SIGNATURE_TRAILER_BYTES`, text-slot helpers, encrypted envelope helpers) live in `src/event_modules/layout/common.rs`.
 4. **Event modules must not import another event module's layout constants.** Cross-event wire math (e.g. `encrypted_inner_wire_size`) belongs in `layout/common.rs` and imports the needed per-event wire sizes.
 
@@ -1452,8 +1581,46 @@ When adding a new event type:
 2. **Add `project_pure()`** — the pure projector function. Set `EventTypeMeta.projector = project_pure`. This is where all projection semantics for this event type live.
 3. Add `CreateXxxCmd` + `create()` for command paths.
 4. Add `query_*()` functions for any projection-table queries.
-5. Add response types and conn-level <!-- is this clear? --> helpers in the event module.
+5. Add response types and service/RPC-facing convenience helpers in the event module.
 6. Wire service call sites directly to the new module command/query APIs where relevant.
 7. Wire service.rs to call the event module functions, mapping errors to `ServiceError`.
 
 **Rule**: Event projection semantics MUST live in event modules, not in central projector files. The pipeline must not contain event-type-specific logic beyond context snapshot construction.
+
+---
+
+# 15. Appendix: Implementation Map
+
+This appendix holds concrete Rust file/module references so conceptual sections stay readable.
+
+## 15.1 Projection pipeline map
+
+1. Canonical entrypoint: `src/state/projection_state/apply/project_one.rs`
+2. Dependency and signer stages: `src/state/projection_state/apply/stages.rs`
+3. Context snapshot builder: `src/state/projection_state/apply/context.rs`
+4. Write/emit executor: `src/state/projection_state/apply/write_exec.rs`
+5. Cascade scheduler: `src/state/projection_state/apply/cascade.rs`
+6. Batch writer orchestration: `src/state/pipeline/mod.rs`
+7. Pipeline persist/planner/effects: `src/state/pipeline/phases.rs`, `src/state/pipeline/planner.rs`, `src/state/pipeline/effects.rs`
+
+## 15.2 Peering/runtime map
+
+1. Peering supervisor and startup preflight: `src/runtime/peering/loops/supervisor.rs`
+2. Dial loop: `src/runtime/peering/loops/connect.rs`
+3. Accept loop: `src/runtime/peering/loops/accept.rs`
+4. Session runner seam: `src/runtime/peering/loops/mod.rs`
+5. Target planning: `src/runtime/peering/target_planner.rs`
+6. QUIC dial/accept lifecycle: `src/runtime/transport/connection_lifecycle.rs`
+7. Session I/O construction: `src/runtime/transport/session_factory.rs`
+8. Session I/O adapter: `src/runtime/transport/transport_session_io.rs`
+
+## 15.3 Identity and transport boundary map
+
+1. Workspace identity workflows: `src/event_modules/workspace/commands.rs`
+2. Identity helper primitives: `src/event_modules/workspace/identity_ops.rs`
+3. Invite link codec: `src/event_modules/workspace/invite_link.rs`
+4. Transport identity adapter contract: `src/shared/contracts/transport_identity_contract.rs`
+5. Transport identity adapter implementation: `src/runtime/transport/identity_adapter.rs`
+6. Transport cert/key install/load helpers: `src/runtime/transport/identity.rs`
+7. Trust SQL tables + helpers: `src/state/db/transport_trust.rs`
+8. Boundary guard script: `scripts/check_boundary_imports.sh`

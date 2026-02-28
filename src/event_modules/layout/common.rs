@@ -26,7 +26,7 @@ pub const NAME_BYTES: usize = 64;
 /// Identity-pubkey-with-signer layout: type(1) + created_at(8) + public_key(32)
 ///   + signed_by(32) + signer_type(1) + signature(64) = 138
 /// Used by: DeviceInviteFirst(12), DeviceInviteOngoing(13),
-///          UserRemoved(20), PeerRemoved(21)
+///          UserRemoved(20), PeerRemoved(21), TransportKey(23)
 pub const IDENTITY_PUBKEY_SIGNED_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32 + SIGNATURE_TRAILER_BYTES;
 
 // ─── Encrypted envelope helpers ───
@@ -80,6 +80,7 @@ pub fn encrypted_inner_wire_size(inner_type_code: u8) -> Option<usize> {
         20 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE),    // UserRemoved
         21 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE),    // PeerRemoved
         22 => Some(SECRET_SHARED_WIRE_SIZE),             // SecretShared
+        23 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE),    // TransportKey
         24 => Some(MESSAGE_ATTACHMENT_WIRE_SIZE),         // MessageAttachment
         25 => Some(FILE_SLICE_WIRE_SIZE),                // FileSlice
         26 => Some(BENCH_DEP_WIRE_SIZE),                 // BenchDep

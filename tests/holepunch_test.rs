@@ -43,14 +43,14 @@ fn drain_project_queue(db_path: &str, identity: &str) {
 /// Functional intro test with realistic transport trust and endpoint discovery.
 ///
 /// All three peers share the same workspace so identity chains validate
-/// across peers through normal sync (PeerShared-derived trust projects correctly).
+/// across peers through normal sync (TransportKey events project correctly).
 /// Uses dynamic DB trust lookup (matching production behavior) and derives
 /// endpoint observations from organic sync traffic (no manual DB writes).
 ///
 /// Three-peer intro happy path:
 /// 1. A <-> I, B <-> I sync via dynamic-trust dual endpoints
 ///    (gives I organic endpoint observations for A and B,
-///    and relays identity chains so trust entries project at each peer)
+///    and relays identity chains so TransportKey events project at each peer)
 /// 2. I sends IntroOffer to A and B using organically observed addresses
 /// 3. A and B dial each other using identity-derived trust and sync messages
 #[tokio::test]
@@ -59,6 +59,11 @@ async fn test_three_peer_intro_happy_path() {
     let intro = Peer::new_with_identity("introducer");
     let peer_a = Peer::new_in_workspace("peer_a", &intro).await;
     let peer_b = Peer::new_in_workspace("peer_b", &intro).await;
+
+    // Publish TransportKey events binding each peer's TLS cert to its identity chain
+    intro.publish_transport_key();
+    peer_a.publish_transport_key();
+    peer_b.publish_transport_key();
 
     // Each peer creates a unique event to sync.
     peer_a.create_message("peer_a bootstrap message");
@@ -71,7 +76,7 @@ async fn test_three_peer_intro_happy_path() {
 
     // Trust is derived from PeerShared events synced during workspace join.
     // No CLI pins needed — all peers share the same workspace so identity chains
-    // project trust entries at each peer after sync.
+    // project TransportKey trust entries at each peer after sync.
 
     // Create dynamic dual endpoints for all three peers.
     // Trust is resolved from SQL at each TLS handshake (production behavior).
@@ -152,7 +157,7 @@ async fn test_three_peer_intro_happy_path() {
             "organic observation for B should match B's dual endpoint port");
     }
 
-    // Wait for trust projection to complete at A and B.
+    // Wait for TransportKey projection to complete at A and B.
     {
         let a_path = peer_a.db_path.clone();
         let a_ident = peer_a.identity.clone();
@@ -173,7 +178,7 @@ async fn test_three_peer_intro_happy_path() {
                 a_ok && b_ok
             },
             Duration::from_secs(15),
-            "Trust projection at A and B",
+            "TransportKey projection at A and B",
         ).await;
     }
 
@@ -185,7 +190,7 @@ async fn test_three_peer_intro_happy_path() {
     // --- Phase 2: I sends IntroOffer to A and B ---
     // A and B's dual endpoints are still alive at the same addresses.
     // Start accept_loops so they can receive intros and punched connections.
-    // Dynamic trust now includes identity-derived entries (from PeerShared events).
+    // Dynamic trust now includes identity-derived entries (from TransportKey events).
     let a_ep2 = ep_a.clone();
     let a_db2 = peer_a.db_path.clone();
     let a_id2 = peer_a.identity.clone();

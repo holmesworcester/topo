@@ -929,7 +929,7 @@ async fn test_project_queue_crash_recovery() {
 
     let alice = Peer::new_with_identity("alice");
 
-    // Create messages via create_event_synchronous (bypasses queue, projects inline)
+    // Create messages via create_event_sync (bypasses queue, projects inline)
     let _msg1 = alice.create_message("Recovery message 1");
     let _msg2 = alice.create_message("Recovery message 2");
     let _msg3 = alice.create_message("Recovery message 3");
@@ -1006,7 +1006,7 @@ async fn test_project_queue_crash_recovery() {
     harness.finish();
 }
 
-/// Integration test: verify project_queue drain works end-to-end with create_event_synchronous events.
+/// Integration test: verify project_queue drain works end-to-end with create_event_sync events.
 #[tokio::test]
 async fn test_project_queue_drain_after_batch() {
     let harness = ScenarioHarness::skip("tests queue dedup guard, not projection invariants");
@@ -1015,7 +1015,7 @@ async fn test_project_queue_drain_after_batch() {
 
     let alice = Peer::new_with_identity("alice");
 
-    // Create events (projected inline by create_event_synchronous)
+    // Create events (projected inline by create_event_sync)
     alice.batch_create_messages(5);
     assert_eq!(alice.scoped_message_count(), 5);
 
@@ -2388,6 +2388,131 @@ fn test_identity_replay_invariants() {
     harness.finish();
 }
 
+#[test]
+fn test_transport_key_projects_without_auto_binding() {
+    let alice = Peer::new("alice");
+    let harness = ScenarioHarness::new();
+    harness.track(&alice);
+    let chain = bootstrap_peer(&alice);
+
+    // Create a TransportKey event signed by PeerShared
+    let spki_fp: [u8; 32] = [0xAB; 32];
+    let _tk_eid = alice.create_transport_key(
+        spki_fp,
+        &chain.peer_shared_key,
+        &chain.peer_shared_eid,
+    );
+
+    let db = open_connection(&alice.db_path).unwrap();
+
+    // Verify transport_keys projection table populated
+    let tk_count: i64 = db.query_row(
+        "SELECT COUNT(*) FROM transport_keys WHERE recorded_by = ?1",
+        rusqlite::params![&alice.identity],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(tk_count, 1, "transport_keys should have 1 entry");
+
+    // Verify SPKI fingerprint matches
+    let stored_spki: Vec<u8> = db.query_row(
+        "SELECT spki_fingerprint FROM transport_keys WHERE recorded_by = ?1",
+        rusqlite::params![&alice.identity],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(stored_spki, spki_fp.to_vec());
+
+    // peer_transport_bindings should NOT be auto-populated by projection
+    let binding_count: i64 = db.query_row(
+        "SELECT COUNT(*) FROM peer_transport_bindings WHERE recorded_by = ?1",
+        rusqlite::params![&alice.identity],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(binding_count, 0, "peer_transport_bindings should NOT be auto-populated");
+
+    // transport_keys are no longer authoritative for trust — PeerShared-derived SPKIs are.
+    // The transport_keys SPKI should NOT appear in allowed_peers (unless it also matches
+    // a PeerShared-derived SPKI).
+    let allowed = topo::db::transport_trust::allowed_peers_from_db(&db, &alice.identity).unwrap();
+    assert!(!allowed.contains(&spki_fp), "transport_keys SPKI should not be in allowed set (non-authoritative)");
+
+    // But PeerShared-derived SPKI should be in allowed set
+    let ps_spki = topo::transport::cert::spki_fingerprint_from_ed25519_pubkey(
+        &chain.peer_shared_key.verifying_key().to_bytes()
+    );
+    assert!(allowed.contains(&ps_spki), "PeerShared-derived SPKI should be in allowed set");
+
+    harness.finish();
+}
+
+
+#[test]
+fn test_transport_key_invalid_sig_rejected() {
+    let harness = ScenarioHarness::skip("uses catch_unwind; projection may be partial after panic");
+    use ed25519_dalek::SigningKey;
+
+    let alice = Peer::new("alice");
+    let chain = bootstrap_peer(&alice);
+
+    // Create a TransportKey with wrong signing key (not the peer_shared key)
+    let wrong_key = SigningKey::generate(&mut rand::thread_rng());
+    let spki_fp: [u8; 32] = [0xCD; 32];
+
+    // This should fail because the wrong key doesn't match peer_shared's public key
+    let result = std::panic::catch_unwind(|| {
+        alice.create_transport_key(
+            spki_fp,
+            &wrong_key,
+            &chain.peer_shared_eid,
+        );
+    });
+
+    // create_signed_event_sync verifies the signature during projection,
+    // so it should either panic or the event should be rejected
+    if result.is_ok() {
+        // If it didn't panic, check that the event was rejected
+        let db = open_connection(&alice.db_path).unwrap();
+        let tk_count: i64 = db.query_row(
+            "SELECT COUNT(*) FROM transport_keys WHERE recorded_by = ?1",
+            rusqlite::params![&alice.identity],
+            |row| row.get(0),
+        ).unwrap();
+        let rejected_count: i64 = db.query_row(
+            "SELECT COUNT(*) FROM rejected_events WHERE peer_id = ?1",
+            rusqlite::params![&alice.identity],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(tk_count, 0, "invalid-sig transport key should not project");
+        assert!(rejected_count > 0, "invalid-sig transport key should be rejected");
+    }
+    // If it panicked, that's also acceptable — signature verification failed
+
+    harness.finish();
+}
+
+#[test]
+fn test_transport_key_replay_invariants() {
+    let alice = Peer::new_with_identity("alice");
+    let harness = ScenarioHarness::new();
+    harness.track(&alice);
+    let ps_eid = alice.peer_shared_event_id.unwrap();
+    let ps_key = alice.peer_shared_signing_key.as_ref().unwrap();
+
+    // Create a TransportKey event
+    let spki_fp: [u8; 32] = [0xEF; 32];
+    alice.create_transport_key(
+        spki_fp,
+        ps_key,
+        &ps_eid,
+    );
+
+    // Also create some content
+    alice.create_message("after transport key");
+
+    // Verify replay invariants (forward, double, reverse)
+    harness.finish();
+}
+
+
 // =============================================================================
 // Phase 7 logic fixes: corrected guard and binding semantics
 // =============================================================================
@@ -2875,7 +3000,7 @@ async fn test_identity_then_messaging() {
 #[tokio::test]
 async fn test_device_link_via_sync() {
     use topo::event_modules::{DeviceInviteOngoingEvent, PeerSharedOngoingEvent, ParsedEvent};
-    use topo::projection::create::{create_signed_event_synchronous, create_signed_event_staged};
+    use topo::projection::create::{create_signed_event_sync, create_signed_event_staged};
 
     let phone = Peer::new("phone");
     let laptop = Peer::new("laptop");
@@ -2900,7 +3025,7 @@ async fn test_device_link_via_sync() {
         signer_type: 4,
         signature: [0u8; 64],
     });
-    let laptop_di_eid = create_signed_event_synchronous(
+    let laptop_di_eid = create_signed_event_sync(
         &db, &phone.identity, &di_evt, &phone_chain.user_key,
     ).expect("create device_invite_ongoing");
     drop(db);

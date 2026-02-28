@@ -92,6 +92,9 @@ MessageDeletion == "message_deletion"
 MessageAttachment == "message_attachment"
 FileSlice == "file_slice"
 
+\* Transport trust
+TransportKey == "transport_key"
+
 \* Sender-subjective encryption
 SecretKey == "secret_key"
 SecretShared == "secret_shared"
@@ -122,6 +125,7 @@ FullEventTypes == {
     LocalSignerSecret,
     Channel, Message, MessageReaction, MessageDeletion,
     MessageAttachment, FileSlice,
+    TransportKey,
     SecretKey, SecretShared, Encrypted,
     UserRemoved, PeerRemoved
 }
@@ -156,6 +160,7 @@ IdentityEvents == {
     PeerSharedFirst, PeerSharedOngoing,
     AdminBoot, AdminOngoing,
     LocalSignerSecret,
+    TransportKey,
     UserRemoved, PeerRemoved
 } \cup AllWorkspaceEvents
 
@@ -207,6 +212,7 @@ RawDeps(e) ==
        [] e = MessageDeletion -> {Message}
        [] e = MessageAttachment -> {Message, SecretKey}
        [] e = FileSlice -> {}
+       [] e = TransportKey -> {}
 
        \* Encryption: secret_key is local (deterministic event ID from key bytes);
        \* secret_shared wraps key to recipient (PeerShared for runtime, invite key for bootstrap);
@@ -251,6 +257,7 @@ SignerDep(e) ==
        [] e = MessageDeletion -> PeerSharedSignerEvents
        [] e = MessageAttachment -> PeerSharedSignerEvents
        [] e = FileSlice -> PeerSharedSignerEvents
+       [] e = TransportKey -> PeerSharedSignerEvents
 
        \* Encryption: secret_shared signed by sender peer
        [] e = SecretShared -> PeerSharedSignerEvents

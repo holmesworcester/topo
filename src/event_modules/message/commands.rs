@@ -1,7 +1,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::crypto::EventId;
-use crate::projection::create::create_signed_event_synchronous;
+use crate::projection::create::create_signed_event_sync;
 use crate::service::open_db_for_peer;
 use ed25519_dalek::SigningKey;
 use rusqlite::Connection;
@@ -48,7 +48,7 @@ pub fn create(
         signer_type: 5,
         signature: [0u8; 64],
     });
-    let eid = create_signed_event_synchronous(db, recorded_by, &msg, signing_key)?;
+    let eid = create_signed_event_sync(db, recorded_by, &msg, signing_key)?;
     Ok(eid)
 }
 
@@ -103,7 +103,7 @@ pub fn create_deletion(
         signer_type: 5,
         signature: [0u8; 64],
     });
-    let eid = create_signed_event_synchronous(db, recorded_by, &del, signing_key)?;
+    let eid = create_signed_event_sync(db, recorded_by, &del, signing_key)?;
     Ok(eid)
 }
 

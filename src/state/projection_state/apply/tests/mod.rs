@@ -48,7 +48,7 @@ fn user_for_signer(signer_eid: &EventId) -> EventId {
 }
 
 /// Insert a blob into events + neg_items + recorded_events (simulating what
-/// batch_writer or create_event_synchronous does before calling project_one).
+/// batch_writer or create_event_sync does before calling project_one).
 fn insert_event_raw(conn: &Connection, recorded_by: &str, blob: &[u8]) -> EventId {
     let event_id = hash_event(blob);
     let ts = now_ms();

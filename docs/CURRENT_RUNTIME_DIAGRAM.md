@@ -27,7 +27,7 @@ flowchart TD
     RPC --> SVC["service.rs (thin helpers)"]
 
     EM --> SVC
-    EM --> CREATE["create_*_event_synchronous / create_signed_event_synchronous"]
+    EM --> CREATE["create_*_event_sync / create_signed_event_sync"]
     CREATE --> PROJ["project_one + cascade"]
     PROJ --> READS["projection read tables"]
 
@@ -135,7 +135,7 @@ flowchart TD
       DISPATCH --> EMQ["event_modules commands + queries"]
       DISPATCH --> SVC["service.rs helpers"]
       EMQ --> SVC
-      EMQ --> LOCAL["local create path / create_*_event_synchronous"]
+      EMQ --> LOCAL["local create path / create_*_event_sync"]
     end
 
     START["setup_endpoint_and_tenants"]

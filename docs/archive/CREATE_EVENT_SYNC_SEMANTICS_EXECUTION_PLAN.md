@@ -1,4 +1,4 @@
-# create_event_synchronous Semantics Investigation: Execution And Handoff Plan
+# create_event_sync Semantics Investigation: Execution And Handoff Plan
 
 > **Historical plan; completed. Retained for reference.**
 
@@ -9,15 +9,15 @@ Base commit: `47e2982` (`origin/master` at branch creation)
 
 ## Objective
 
-Investigate and decide the `create_event_synchronous` contract before implementation changes.
+Investigate and decide the `create_event_sync` contract before implementation changes.
 
 Primary TODO target:
 
-1. `P1: Investigate and decide create_event_synchronous service semantics before implementation changes`
+1. `P1: Investigate and decide create_event_sync service semantics before implementation changes`
 
 ## Decision To Make
 
-Whether `create_event_synchronous` should:
+Whether `create_event_sync` should:
 
 1. return success only for `Valid` terminal outcomes, or
 2. continue allowing wrapped/translated `Blocked` outcomes as success-like behavior in some service paths.
@@ -48,7 +48,7 @@ Required commands:
 
 Tasks:
 
-1. Enumerate all `create_event_synchronous` and wrapper call sites.
+1. Enumerate all `create_event_sync` and wrapper call sites.
 2. For each call site, document expected behavior when projection returns:
    - `Valid`,
    - `Block`,
