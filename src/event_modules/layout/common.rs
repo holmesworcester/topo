@@ -58,7 +58,6 @@ pub fn encrypted_inner_wire_size(inner_type_code: u8) -> Option<usize> {
     use super::super::peer_shared::PEER_SHARED_WIRE_SIZE;
     use super::super::reaction::REACTION_WIRE_SIZE;
     use super::super::secret_shared::SECRET_SHARED_WIRE_SIZE;
-    use super::super::signed_memo::SIGNED_MEMO_WIRE_SIZE;
     use super::super::user::USER_WIRE_SIZE;
     use super::super::user_invite::USER_INVITE_BOOT_WIRE_SIZE;
     use super::super::workspace::WORKSPACE_WIRE_SIZE;
@@ -66,7 +65,6 @@ pub fn encrypted_inner_wire_size(inner_type_code: u8) -> Option<usize> {
     match inner_type_code {
         1 => Some(MESSAGE_WIRE_SIZE),                   // Message
         2 => Some(REACTION_WIRE_SIZE),                  // Reaction
-        4 => Some(SIGNED_MEMO_WIRE_SIZE),               // SignedMemo
         7 => Some(MESSAGE_DELETION_WIRE_SIZE),           // MessageDeletion
         8 => Some(WORKSPACE_WIRE_SIZE),                  // Workspace
         10 => Some(USER_INVITE_BOOT_WIRE_SIZE),          // UserInviteBoot
@@ -242,7 +240,6 @@ mod tests {
     fn test_per_event_wire_sizes() {
         use super::super::super::message::MESSAGE_WIRE_SIZE;
         use super::super::super::reaction::REACTION_WIRE_SIZE;
-        use super::super::super::signed_memo::SIGNED_MEMO_WIRE_SIZE;
         use super::super::super::message_attachment::MESSAGE_ATTACHMENT_WIRE_SIZE;
         use super::super::super::file_slice::FILE_SLICE_WIRE_SIZE;
         use super::super::super::bench_dep::BENCH_DEP_WIRE_SIZE;
@@ -258,7 +255,6 @@ mod tests {
 
         assert_eq!(MESSAGE_WIRE_SIZE, 1194);
         assert_eq!(REACTION_WIRE_SIZE, 234);
-        assert_eq!(SIGNED_MEMO_WIRE_SIZE, 1130);
         assert_eq!(MESSAGE_ATTACHMENT_WIRE_SIZE, 633);
         assert_eq!(FILE_SLICE_WIRE_SIZE, 262286);
         assert_eq!(BENCH_DEP_WIRE_SIZE, 345);
@@ -282,14 +278,12 @@ mod tests {
     fn test_encrypted_inner_wire_size_known() {
         use super::super::super::message::wire::MESSAGE_WIRE_SIZE;
         use super::super::super::reaction::REACTION_WIRE_SIZE;
-        use super::super::super::signed_memo::SIGNED_MEMO_WIRE_SIZE;
         use super::super::super::message_attachment::MESSAGE_ATTACHMENT_WIRE_SIZE;
         use super::super::super::file_slice::FILE_SLICE_WIRE_SIZE;
         use super::super::super::bench_dep::BENCH_DEP_WIRE_SIZE;
 
         assert_eq!(encrypted_inner_wire_size(1), Some(MESSAGE_WIRE_SIZE));
         assert_eq!(encrypted_inner_wire_size(2), Some(REACTION_WIRE_SIZE));
-        assert_eq!(encrypted_inner_wire_size(4), Some(SIGNED_MEMO_WIRE_SIZE));
         assert_eq!(encrypted_inner_wire_size(24), Some(MESSAGE_ATTACHMENT_WIRE_SIZE));
         assert_eq!(encrypted_inner_wire_size(25), Some(FILE_SLICE_WIRE_SIZE));
         assert_eq!(encrypted_inner_wire_size(26), Some(BENCH_DEP_WIRE_SIZE));

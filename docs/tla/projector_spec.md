@@ -9,7 +9,7 @@ Changes to this document require TLA+ model re-verification.
 | 1 | Message | Message | 1194B | Shared | Yes | Yes | 64 | runtime (1..5) |
 | 2 | Reaction | MessageReaction | 234B | Shared | Yes | Yes | 64 | runtime (1..5) |
 | 3 | Retired (code reserved) | Peer (legacy) | — | — | — | — | — | — |
-| 4 | SignedMemo | — | 1130B | Shared | Yes | Yes | 64 | runtime (1..5) |
+| 4 | Retired (code reserved) | — | — | — | — | — | — | — |
 | 5 | Encrypted | Encrypted | 70+inner_size | Shared | No | No | 0 | — |
 | 6 | SecretKey | SecretKey | 41B | Local | Yes | No | 0 | — |
 | 7 | MessageDeletion | MessageDeletion | 170B | Shared | Yes | Yes | 64 | runtime (1..5) |
@@ -89,7 +89,7 @@ Changes to this document require TLA+ model re-verification.
 | 1 | project_message | messages | — |
 | 2 | project_reaction | reactions | skip if target deleted |
 | 3 | retired (peer_key) | — | rejected as unknown type |
-| 4 | project_signed_memo | signed_memos | — |
+| 4 | retired (signed_memo) | — | rejected as unknown type |
 | 5 | project_encrypted | (dispatches inner) | decrypt → admissibility check → shared dep/signer/dispatch stages |
 | 6 | project_secret_key | secret_keys | — |
 | 7 | project_message_deletion | deleted_messages | author auth + cascade |
@@ -196,12 +196,6 @@ Message (1): type_code(1) | created_at_ms(8) | workspace_id(32) | author_id(32) 
 Reaction (2): type_code(1) | created_at_ms(8) | target_event_id(32) | author_id(32) | emoji(64) | signed_by(32) | signer_type(1) | signature(64) = 234B
 ```
 - emoji: fixed 64-byte UTF-8 slot, zero-padded after text
-
-### 1130B fixed signed (SignedMemo)
-```
-SignedMemo (4): type_code(1) | created_at_ms(8) | signed_by(32) | signer_type(1) | content(1024) | signature(64) = 1130B
-```
-- content: fixed 1024-byte UTF-8 slot, zero-padded after text
 
 ### 70+inner_size fixed unsigned (Encrypted)
 ```

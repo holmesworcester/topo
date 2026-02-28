@@ -15,7 +15,6 @@ pub mod reaction;
 pub mod registry;
 pub mod secret_key;
 pub mod secret_shared;
-pub mod signed_memo;
 pub mod transport_key;
 pub mod user;
 pub mod user_invite;
@@ -41,7 +40,6 @@ pub use reaction::ReactionEvent;
 pub use registry::{EventRegistry, EventTypeMeta, ShareScope};
 pub use secret_key::SecretKeyEvent;
 pub use secret_shared::SecretSharedEvent;
-pub use signed_memo::SignedMemoEvent;
 pub use transport_key::TransportKeyEvent;
 pub use user::{UserBootEvent, UserOngoingEvent};
 pub use user_invite::{UserInviteBootEvent, UserInviteOngoingEvent};
@@ -50,7 +48,6 @@ pub use workspace::WorkspaceEvent;
 
 pub const EVENT_TYPE_MESSAGE: u8 = 1;
 pub const EVENT_TYPE_REACTION: u8 = 2;
-pub const EVENT_TYPE_SIGNED_MEMO: u8 = 4;
 pub const EVENT_TYPE_ENCRYPTED: u8 = 5;
 pub const EVENT_TYPE_SECRET_KEY: u8 = 6;
 pub const EVENT_TYPE_MESSAGE_DELETION: u8 = 7;
@@ -92,7 +89,6 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     message_deletion::ensure_schema(conn)?;
     message_attachment::ensure_schema(conn)?;
     file_slice::ensure_schema(conn)?;
-    signed_memo::ensure_schema(conn)?;
     secret_key::ensure_schema(conn)?;
     secret_shared::ensure_schema(conn)?;
     transport_key::ensure_schema(conn)?;
@@ -104,7 +100,6 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
 pub enum ParsedEvent {
     Message(MessageEvent),
     Reaction(ReactionEvent),
-    SignedMemo(SignedMemoEvent),
     Encrypted(EncryptedEvent),
     SecretKey(SecretKeyEvent),
     MessageDeletion(MessageDeletionEvent),
@@ -135,7 +130,6 @@ impl ParsedEvent {
         match self {
             ParsedEvent::Message(m) => m.created_at_ms,
             ParsedEvent::Reaction(r) => r.created_at_ms,
-            ParsedEvent::SignedMemo(s) => s.created_at_ms,
             ParsedEvent::Encrypted(e) => e.created_at_ms,
             ParsedEvent::SecretKey(s) => s.created_at_ms,
             ParsedEvent::MessageDeletion(d) => d.created_at_ms,
@@ -172,7 +166,6 @@ impl ParsedEvent {
                 ("author_id", r.author_id),
                 ("signed_by", r.signed_by),
             ],
-            ParsedEvent::SignedMemo(s) => vec![("signed_by", s.signed_by)],
             ParsedEvent::Encrypted(e) => vec![("key_event_id", e.key_event_id)],
             ParsedEvent::SecretKey(_) => vec![],
             ParsedEvent::MessageDeletion(d) => vec![("signed_by", d.signed_by)],
@@ -238,7 +231,6 @@ impl ParsedEvent {
         match self {
             ParsedEvent::Message(_) => EVENT_TYPE_MESSAGE,
             ParsedEvent::Reaction(_) => EVENT_TYPE_REACTION,
-            ParsedEvent::SignedMemo(_) => EVENT_TYPE_SIGNED_MEMO,
             ParsedEvent::Encrypted(_) => EVENT_TYPE_ENCRYPTED,
             ParsedEvent::SecretKey(_) => EVENT_TYPE_SECRET_KEY,
             ParsedEvent::MessageDeletion(_) => EVENT_TYPE_MESSAGE_DELETION,
@@ -269,7 +261,6 @@ impl ParsedEvent {
     /// Returns None for unsigned types.
     pub fn signer_fields(&self) -> Option<([u8; 32], u8)> {
         match self {
-            ParsedEvent::SignedMemo(m) => Some((m.signed_by, m.signer_type)),
             ParsedEvent::UserInviteBoot(u) => Some((u.signed_by, u.signer_type)),
             ParsedEvent::UserInviteOngoing(u) => Some((u.signed_by, u.signer_type)),
             ParsedEvent::DeviceInviteFirst(d) => Some((d.signed_by, d.signer_type)),
@@ -367,7 +358,6 @@ pub fn registry() -> &'static EventRegistry {
         EventRegistry::new(&[
             &message::MESSAGE_META,
             &reaction::REACTION_TYPE_META,
-            &signed_memo::SIGNED_MEMO_META,
             &encrypted::ENCRYPTED_META,
             &secret_key::SECRET_KEY_META,
             &message_deletion::MESSAGE_DELETION_META,
@@ -465,23 +455,6 @@ mod tests {
 
         let event = ParsedEvent::Reaction(rxn.clone());
         let blob = encode_event(&event).unwrap();
-        let parsed = parse_event(&blob).unwrap();
-        assert_eq!(parsed, event);
-    }
-
-    #[test]
-    fn test_signed_memo_roundtrip() {
-        let memo = SignedMemoEvent {
-            created_at_ms: 2222222222222,
-            signed_by: [6u8; 32],
-            signer_type: 5,
-            content: "signed content".to_string(),
-            signature: [7u8; 64],
-        };
-
-        let event = ParsedEvent::SignedMemo(memo.clone());
-        let blob = encode_event(&event).unwrap();
-        assert_eq!(blob.len(), signed_memo::SIGNED_MEMO_WIRE_SIZE);
         let parsed = parse_event(&blob).unwrap();
         assert_eq!(parsed, event);
     }
@@ -783,12 +756,6 @@ mod tests {
         assert!(rxn_meta.signer_required);
         assert_eq!(rxn_meta.signature_byte_len, 64);
 
-        let sm_meta = reg.lookup(EVENT_TYPE_SIGNED_MEMO).unwrap();
-        assert_eq!(sm_meta.type_name, "signed_memo");
-        assert_eq!(sm_meta.projection_table, "signed_memos");
-        assert!(sm_meta.signer_required);
-        assert_eq!(sm_meta.signature_byte_len, 64);
-
         let del_meta = reg.lookup(EVENT_TYPE_MESSAGE_DELETION).unwrap();
         assert_eq!(del_meta.type_name, "message_deletion");
         assert_eq!(del_meta.projection_table, "deleted_messages");
@@ -820,11 +787,11 @@ mod tests {
             .filter(|c| reg.lookup(*c).map_or(false, |m| m.encryptable))
             .collect();
         // Must match the admissible set from projector_spec:
-        // message(1), reaction(2), signed_memo(4), secret_key(6),
+        // message(1), reaction(2), secret_key(6),
         // message_deletion(7), message_attachment(24), file_slice(25)
         assert_eq!(
             encryptable_codes,
-            vec![1, 2, 4, 6, 7, 24, 25],
+            vec![1, 2, 6, 7, 24, 25],
             "encryptable set drifted from expected admissible inner types"
         );
         // Identity/infrastructure types must NOT be encryptable
@@ -930,22 +897,6 @@ mod tests {
     }
 
     #[test]
-    fn test_dep_field_values_signed_memo() {
-        let signer_id = [42u8; 32];
-        let memo = ParsedEvent::SignedMemo(SignedMemoEvent {
-            created_at_ms: 300,
-            signed_by: signer_id,
-            signer_type: 5,
-            content: "test".to_string(),
-            signature: [0u8; 64],
-        });
-        let deps = memo.dep_field_values();
-        assert_eq!(deps.len(), 1);
-        assert_eq!(deps[0].0, "signed_by");
-        assert_eq!(deps[0].1, signer_id);
-    }
-
-    #[test]
     fn test_dep_field_values_message_deletion() {
         let target = [55u8; 32];
         let del = ParsedEvent::MessageDeletion(MessageDeletionEvent {
@@ -980,18 +931,6 @@ mod tests {
 
     #[test]
     fn test_signer_fields_signed() {
-        let signer_id = [42u8; 32];
-        let memo = ParsedEvent::SignedMemo(SignedMemoEvent {
-            created_at_ms: 300,
-            signed_by: signer_id,
-            signer_type: 5,
-            content: "test".to_string(),
-            signature: [0u8; 64],
-        });
-        let (id, st) = memo.signer_fields().unwrap();
-        assert_eq!(id, signer_id);
-        assert_eq!(st, 5);
-
         // Message signed type
         let msg_signer = [77u8; 32];
         let msg = ParsedEvent::Message(MessageEvent {
@@ -1046,16 +985,6 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(extract_event_type(&rxn_blob), Some(EVENT_TYPE_REACTION));
-
-        let memo_blob = encode_event(&ParsedEvent::SignedMemo(SignedMemoEvent {
-            created_at_ms: 0,
-            signed_by: [0u8; 32],
-            signer_type: 5,
-            content: "".to_string(),
-            signature: [0u8; 64],
-        }))
-        .unwrap();
-        assert_eq!(extract_event_type(&memo_blob), Some(EVENT_TYPE_SIGNED_MEMO));
 
         let ws_blob = encode_event(&ParsedEvent::Workspace(WorkspaceEvent {
             created_at_ms: 0,

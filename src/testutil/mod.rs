@@ -12,7 +12,7 @@ use crate::db::{
 };
 use crate::event_modules::{
     MessageEvent, MessageDeletionEvent, ReactionEvent, SecretKeyEvent,
-    SignedMemoEvent, ParsedEvent,
+    ParsedEvent,
     WorkspaceEvent, InviteAcceptedEvent, UserInviteBootEvent, UserInviteOngoingEvent,
     DeviceInviteFirstEvent, UserBootEvent,
     PeerSharedFirstEvent, AdminBootEvent,
@@ -359,26 +359,6 @@ impl Peer {
         });
         create_signed_event_staged(&db, &self.identity, &rxn, self.signing_key())
             .expect("failed to create reaction")
-    }
-
-    /// Create a SignedMemo event with proper Ed25519 signature.
-    /// Returns the event ID.
-    pub fn create_signed_memo(
-        &self,
-        signer_key_eid: &EventId,
-        signing_key: &ed25519_dalek::SigningKey,
-        content: &str,
-    ) -> EventId {
-        let db = open_connection(&self.db_path).expect("failed to open db");
-        let memo = ParsedEvent::SignedMemo(SignedMemoEvent {
-            created_at_ms: current_timestamp_ms(),
-            signed_by: *signer_key_eid,
-            signer_type: 5,
-            content: content.to_string(),
-            signature: [0u8; 64], // placeholder, overwritten by create_signed_event_sync
-        });
-        create_signed_event_sync(&db, &self.identity, &memo, signing_key)
-            .expect("failed to create signed_memo")
     }
 
     /// Create a SecretKey event with the given key bytes.
@@ -784,16 +764,6 @@ impl Peer {
         ).unwrap_or(0)
     }
 
-    /// Count rows in the signed_memos projection table scoped to this peer.
-    pub fn signed_memo_count(&self) -> i64 {
-        let db = open_connection(&self.db_path).expect("failed to open db");
-        db.query_row(
-            "SELECT COUNT(*) FROM signed_memos WHERE recorded_by = ?1",
-            rusqlite::params![&self.identity],
-            |row| row.get(0),
-        ).unwrap_or(0)
-    }
-
     /// Count rows in the secret_keys projection table scoped to this peer.
     pub fn secret_key_count(&self) -> i64 {
         let db = open_connection(&self.db_path).expect("failed to open db");
@@ -1062,7 +1032,6 @@ const FINGERPRINT_TABLES: &[FingerprintTable] = &[
     // Content projections
     FingerprintTable { name: "messages",            scope: Scope::RecordedBy, order: "ORDER BY message_id" },
     FingerprintTable { name: "reactions",            scope: Scope::RecordedBy, order: "ORDER BY event_id" },
-    FingerprintTable { name: "signed_memos",         scope: Scope::RecordedBy, order: "ORDER BY event_id" },
     FingerprintTable { name: "secret_keys",          scope: Scope::RecordedBy, order: "ORDER BY event_id" },
     FingerprintTable { name: "deleted_messages",     scope: Scope::RecordedBy, order: "ORDER BY message_id" },
     FingerprintTable { name: "message_attachments",  scope: Scope::RecordedBy, order: "ORDER BY event_id" },
@@ -1229,8 +1198,6 @@ fn clear_projection_tables(db: &rusqlite::Connection, recorded_by: &str) {
         .expect("failed to clear messages");
     db.execute("DELETE FROM reactions WHERE recorded_by = ?1", rusqlite::params![recorded_by])
         .expect("failed to clear reactions");
-    db.execute("DELETE FROM signed_memos WHERE recorded_by = ?1", rusqlite::params![recorded_by])
-        .expect("failed to clear signed_memos");
     db.execute("DELETE FROM secret_keys WHERE recorded_by = ?1", rusqlite::params![recorded_by])
         .expect("failed to clear secret_keys");
     db.execute("DELETE FROM deleted_messages WHERE recorded_by = ?1", rusqlite::params![recorded_by])
@@ -2439,7 +2406,7 @@ pub fn assert_no_cross_tenant_leakage(db_path: &str, tenant_workspaces: &[(Strin
     }
 
     // Verify no unexpected peer_ids in projection tables
-    for table in &["messages", "reactions", "signed_memos", "secret_keys", "deleted_messages"] {
+    for table in &["messages", "reactions", "secret_keys", "deleted_messages"] {
         let query = format!("SELECT DISTINCT recorded_by FROM {}", table);
         let mut stmt = db.prepare(&query).expect("failed to prepare");
         let found_ids: Vec<String> = stmt
@@ -2725,7 +2692,7 @@ mod fingerprint_tests {
         // Verify that FINGERPRINT_TABLES covers all projection tables
         // and excludes operational tables.
         let projection_tables = [
-            "messages", "reactions", "signed_memos", "secret_keys",
+            "messages", "reactions", "secret_keys",
             "deleted_messages", "message_attachments", "file_slices",
             "workspaces", "invite_accepted", "user_invites", "device_invites",
             "users", "peers_shared", "admins", "removed_entities",

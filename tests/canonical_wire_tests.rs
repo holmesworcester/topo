@@ -3,12 +3,11 @@
 
 use topo::event_modules::{
     self as events, EventError, ParsedEvent,
-    MessageEvent, ReactionEvent, SignedMemoEvent, EncryptedEvent,
+    MessageEvent, ReactionEvent, EncryptedEvent,
     FileSliceEvent, MessageAttachmentEvent, BenchDepEvent,
 };
 use topo::event_modules::message::layout::offsets as message_offsets;
 use topo::event_modules::reaction::offsets as reaction_offsets;
-use topo::event_modules::signed_memo::signed_memo_offsets;
 use topo::event_modules::message_attachment::attachment_offsets;
 use topo::event_modules::layout::common::{encrypted_inner_wire_size, encrypted_wire_size, ENCRYPTED_HEADER_BYTES};
 
@@ -71,26 +70,6 @@ fn golden_bytes_reaction() {
     // emoji: 4 bytes of 👍 then zeros
     assert_eq!(&blob[73..77], "\u{1f44d}".as_bytes());
     assert!(blob[77..73 + 64].iter().all(|&b| b == 0));
-}
-
-#[test]
-fn golden_bytes_signed_memo() {
-    let memo = ParsedEvent::SignedMemo(SignedMemoEvent {
-        created_at_ms: 2000,
-        signed_by: [0x55; 32],
-        signer_type: 5,
-        content: "memo".to_string(),
-        signature: [0x66; 64],
-    });
-    let blob = events::encode_event(&memo).unwrap();
-    assert_eq!(blob.len(), events::signed_memo::SIGNED_MEMO_WIRE_SIZE);
-    assert_eq!(blob[0], 4);
-    assert_eq!(&blob[9..41], &[0x55; 32]);
-    assert_eq!(blob[41], 5);
-    assert_eq!(&blob[42..46], b"memo");
-    assert!(blob[46..42 + 1024].iter().all(|&b| b == 0));
-    let sig_off = signed_memo_offsets::SIGNATURE;
-    assert_eq!(&blob[sig_off..sig_off + 64], &[0x66; 64]);
 }
 
 #[test]
@@ -201,20 +180,6 @@ fn truncation_reaction() {
 }
 
 #[test]
-fn truncation_signed_memo() {
-    let memo = ParsedEvent::SignedMemo(SignedMemoEvent {
-        created_at_ms: 100,
-        signed_by: [0u8; 32],
-        signer_type: 5,
-        content: "x".to_string(),
-        signature: [0u8; 64],
-    });
-    let blob = events::encode_event(&memo).unwrap();
-    let err = events::parse_event(&blob[..blob.len() - 1]).unwrap_err();
-    assert!(matches!(err, EventError::TooShort { .. }));
-}
-
-#[test]
 fn truncation_encrypted() {
     let ct_size = encrypted_inner_wire_size(1).unwrap();
     let enc = ParsedEvent::Encrypted(EncryptedEvent {
@@ -299,22 +264,6 @@ fn nonzero_padding_reaction_emoji() {
     let mut blob = events::encode_event(&rxn).unwrap();
     let emoji_start = reaction_offsets::EMOJI;
     blob[emoji_start + 2] = 0xFF; // after "x\0"
-    let err = events::parse_event(&blob).unwrap_err();
-    assert!(matches!(err, EventError::TextSlot(_)));
-}
-
-#[test]
-fn nonzero_padding_signed_memo_content() {
-    let memo = ParsedEvent::SignedMemo(SignedMemoEvent {
-        created_at_ms: 100,
-        signed_by: [0u8; 32],
-        signer_type: 5,
-        content: "b".to_string(),
-        signature: [0u8; 64],
-    });
-    let mut blob = events::encode_event(&memo).unwrap();
-    let content_start = signed_memo_offsets::CONTENT;
-    blob[content_start + 2] = 0xFF;
     let err = events::parse_event(&blob).unwrap_err();
     assert!(matches!(err, EventError::TextSlot(_)));
 }
@@ -618,17 +567,6 @@ fn idempotent_reaction() {
         signed_by: [7u8; 32],
         signer_type: 5,
         signature: [8u8; 64],
-    }));
-}
-
-#[test]
-fn idempotent_signed_memo() {
-    assert_idempotent(&ParsedEvent::SignedMemo(SignedMemoEvent {
-        created_at_ms: 300,
-        signed_by: [9u8; 32],
-        signer_type: 5,
-        content: "memo content".to_string(),
-        signature: [10u8; 64],
     }));
 }
 
