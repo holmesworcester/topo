@@ -44,26 +44,6 @@ pub enum EmitCommand {
     RetryFileSliceGuards { file_id: String },
     /// Record a guard-block for a file_slice awaiting its descriptor.
     RecordFileSliceGuardBlock { file_id: String, event_id: String },
-    /// Write pending invite bootstrap trust from projection (inviter side).
-    /// Emitted by invite projectors when local bootstrap_context exists.
-    WritePendingBootstrapTrust {
-        invite_event_id: String,
-        workspace_id: String,
-        expected_bootstrap_spki_fingerprint: [u8; 32],
-    },
-    /// Write accepted invite bootstrap trust from projection (joiner side).
-    /// Emitted by InviteAccepted projector when bootstrap_context exists.
-    WriteAcceptedBootstrapTrust {
-        invite_accepted_event_id: String,
-        invite_event_id: String,
-        workspace_id: String,
-        bootstrap_addr: String,
-        bootstrap_spki_fingerprint: [u8; 32],
-    },
-    /// Supersede bootstrap trust rows whose SPKI matches a newly-projected
-    /// PeerShared-derived SPKI. Emitted by PeerShared projectors so that
-    /// trust check reads are pure (no write side-effects).
-    SupersedeBootstrapTrust { peer_shared_public_key: [u8; 32] },
     /// Apply a typed transport identity transition via the adapter boundary.
     /// Replaces the former ad-hoc RefreshTransportCreds marker.
     ApplyTransportIdentityIntent {
@@ -195,10 +175,16 @@ pub struct ContextSnapshot {
     pub bootstrap_context: Option<BootstrapContextSnapshot>,
 
     /// Whether this event was locally created (source = 'local' in recorded_events).
-    /// Used to gate pending bootstrap trust emission: only locally-created invite
-    /// events should emit WritePendingBootstrapTrust. Synced invite events on the
-    /// joiner side must NOT emit pending trust even if bootstrap_context exists.
+    /// Used to gate pending bootstrap trust writes: only locally-created invite
+    /// events should write pending trust rows. Synced invite events on the
+    /// joiner side must NOT write pending trust even if bootstrap_context exists.
     pub is_local_create: bool,
+
+    /// True when `bootstrap_context.bootstrap_spki_fingerprint` is already present
+    /// as a projected (non-removed) `peers_shared.transport_fingerprint`.
+    /// Used to avoid writing bootstrap trust rows that are already superseded by
+    /// steady-state peer trust.
+    pub bootstrap_spki_already_peer_shared: bool,
 }
 
 /// Bootstrap context read from the `bootstrap_context` table, passed to

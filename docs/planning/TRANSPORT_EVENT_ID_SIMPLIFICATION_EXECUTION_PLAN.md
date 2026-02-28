@@ -24,8 +24,7 @@ In scope:
 Out of scope:
 1. Invite-link expiry schema/payload changes.
 2. Bootstrap key expiry derivation from invite expiry.
-3. Full removal of bootstrap trust emit commands (kept for now to avoid broad projection-contract break).
-4. Full runtime dial fallback implementation by alternate client cert in this patch.
+3. Full runtime dial fallback implementation by alternate client cert in this patch.
 
 ## Success Criteria
 
@@ -115,3 +114,4 @@ Completed in this branch:
 3. Phase 3 command-side pending trust writes removed from workspace invite creation paths.
 4. Phase 4 naming clarity pass completed with explicit `transport_fingerprint()` accessors on transport boundary wrappers.
 5. Phase 5 validation completed with targeted Rust tests; TLC execution is currently blocked in this workspace because `tlc2.TLC` (jar/classpath) is unavailable.
+6. Follow-up simplification: removed trust-specific projection `EmitCommand` variants (`WritePendingBootstrapTrust`, `WriteAcceptedBootstrapTrust`, `SupersedeBootstrapTrust`) by projecting trust rows directly and consuming bootstrap trust via `peer_shared` write ops.

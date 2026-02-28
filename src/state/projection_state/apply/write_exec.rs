@@ -130,60 +130,6 @@ pub(crate) fn execute_emit_commands(
                     rusqlite::params![recorded_by, file_id, event_id],
                 )?;
             }
-            EmitCommand::WritePendingBootstrapTrust {
-                invite_event_id,
-                workspace_id,
-                expected_bootstrap_spki_fingerprint,
-            } => {
-                crate::db::transport_trust::record_pending_invite_bootstrap_trust(
-                    conn,
-                    recorded_by,
-                    invite_event_id,
-                    workspace_id,
-                    expected_bootstrap_spki_fingerprint,
-                )?;
-                // Bidirectional supersession: if PeerShared already projected
-                // for this SPKI, supersede the just-written bootstrap row.
-                supersede_bootstrap_if_peer_shared_exists(
-                    conn,
-                    recorded_by,
-                    expected_bootstrap_spki_fingerprint,
-                )?;
-            }
-            EmitCommand::WriteAcceptedBootstrapTrust {
-                invite_accepted_event_id,
-                invite_event_id,
-                workspace_id,
-                bootstrap_addr,
-                bootstrap_spki_fingerprint,
-            } => {
-                crate::db::transport_trust::record_invite_bootstrap_trust(
-                    conn,
-                    recorded_by,
-                    invite_accepted_event_id,
-                    invite_event_id,
-                    workspace_id,
-                    bootstrap_addr,
-                    bootstrap_spki_fingerprint,
-                )?;
-                // Bidirectional supersession: if PeerShared already projected
-                // for this SPKI, supersede the just-written bootstrap row.
-                supersede_bootstrap_if_peer_shared_exists(
-                    conn,
-                    recorded_by,
-                    bootstrap_spki_fingerprint,
-                )?;
-            }
-            EmitCommand::SupersedeBootstrapTrust {
-                peer_shared_public_key,
-            } => {
-                crate::db::transport_trust::supersede_bootstrap_for_peer_shared(
-                    conn,
-                    recorded_by,
-                    peer_shared_public_key,
-                )
-                .map_err(|e| -> Box<dyn std::error::Error> { e })?;
-            }
             EmitCommand::ApplyTransportIdentityIntent { intent } => {
                 use crate::contracts::transport_identity_contract::TransportIdentityAdapter;
                 let adapter = crate::transport::identity_adapter::ConcreteTransportIdentityAdapter;
@@ -192,37 +138,6 @@ pub(crate) fn execute_emit_commands(
                     .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
             }
         }
-    }
-    Ok(())
-}
-
-/// Bidirectional supersession helper: check if any peers_shared row for this
-/// recorded_by has an SPKI matching the given fingerprint. If so, supersede
-/// bootstrap trust for that peer. This handles the case where PeerShared is
-/// already projected when bootstrap trust is written (out-of-order replay).
-fn supersede_bootstrap_if_peer_shared_exists(
-    conn: &Connection,
-    recorded_by: &str,
-    spki_fingerprint: &[u8; 32],
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Primary path: direct lookup via projected transport_fingerprint index.
-    let direct_exists: bool = conn.query_row(
-        "SELECT EXISTS(
-            SELECT 1 FROM peers_shared
-            WHERE recorded_by = ?1
-              AND transport_fingerprint = ?2
-        )",
-        rusqlite::params![recorded_by, spki_fingerprint.as_slice()],
-        |row| row.get(0),
-    )?;
-    if direct_exists {
-        crate::db::transport_trust::supersede_bootstrap_for_transport_fingerprint(
-            conn,
-            recorded_by,
-            spki_fingerprint,
-        )
-        .map_err(|e| -> Box<dyn std::error::Error> { e })?;
-        return Ok(());
     }
     Ok(())
 }

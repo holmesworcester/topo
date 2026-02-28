@@ -3,6 +3,34 @@ use crate::crypto::event_id_to_base64;
 use crate::event_modules::ParsedEvent;
 use rusqlite::Connection;
 
+fn bootstrap_spki_already_peer_shared(
+    conn: &Connection,
+    recorded_by: &str,
+    spki_fingerprint: &[u8; 32],
+) -> Result<bool, rusqlite::Error> {
+    conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM peers_shared p
+            WHERE p.recorded_by = ?1
+              AND p.transport_fingerprint = ?2
+              AND NOT EXISTS (
+                SELECT 1 FROM removed_entities r
+                WHERE r.recorded_by = p.recorded_by
+                  AND r.target_event_id = p.event_id
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM removed_entities r
+                WHERE r.recorded_by = p.recorded_by
+                  AND p.user_event_id IS NOT NULL
+                  AND r.target_event_id = p.user_event_id
+                  AND r.removal_type = 'user'
+              )
+        )",
+        rusqlite::params![recorded_by, spki_fingerprint.as_slice()],
+        |row| row.get(0),
+    )
+}
+
 /// Verify that the signer's peer_shared row maps to the claimed author_id.
 ///
 /// Returns:
@@ -78,8 +106,8 @@ pub(crate) fn build_context_snapshot(
         _ => {}
     }
 
-    // Local-create flag — needed by invite events to gate pending trust emission.
-    // Only locally-created invite events should emit WritePendingBootstrapTrust.
+    // Local-create flag — needed by invite events to gate pending trust writes.
+    // Only locally-created invite events should write pending bootstrap trust.
     // `recorded_events.source` historically used both "local" and "local_create".
     match parsed {
         ParsedEvent::UserInviteBoot(_)
@@ -96,7 +124,7 @@ pub(crate) fn build_context_snapshot(
         _ => {}
     }
 
-    // Bootstrap context — needed by invite events for trust materialization
+    // Bootstrap context — needed by invite events for trust materialization.
     match parsed {
         ParsedEvent::UserInviteBoot(_)
         | ParsedEvent::DeviceInviteFirst(_)
@@ -112,6 +140,11 @@ pub(crate) fn build_context_snapshot(
             if let Some(bc) = crate::db::transport_trust::read_bootstrap_context(
                 conn, recorded_by, &lookup_invite_eid,
             ).map_err(|e| -> Box<dyn std::error::Error> { e })? {
+                ctx.bootstrap_spki_already_peer_shared = bootstrap_spki_already_peer_shared(
+                    conn,
+                    recorded_by,
+                    &bc.bootstrap_spki_fingerprint,
+                )?;
                 ctx.bootstrap_context = Some(super::super::result::BootstrapContextSnapshot {
                     workspace_id: bc.workspace_id,
                     bootstrap_addr: bc.bootstrap_addr,

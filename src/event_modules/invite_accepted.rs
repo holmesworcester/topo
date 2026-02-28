@@ -100,9 +100,8 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
 /// (INSERT OR IGNORE) for trust anchor immutability; rejects on mismatch.
 /// Emits RetryWorkspaceEvent targeting the specific workspace_id so the
 /// guard-blocked workspace event can unblock through normal projection + cascade.
-/// When bootstrap_context is available, emits WriteAcceptedBootstrapTrust
-/// so the projection pipeline materializes accepted trust instead of the
-/// service layer.
+/// When bootstrap_context is available (and not already superseded by a
+/// projected PeerShared transport fingerprint), also writes invite_bootstrap_trust.
 pub fn project_pure(
     recorded_by: &str,
     event_id_b64: &str,
@@ -127,7 +126,7 @@ pub fn project_pure(
         }
     }
 
-    let ops = vec![
+    let mut ops = vec![
         // Projection table
         WriteOp::InsertOrIgnore {
             table: "invite_accepted",
@@ -150,24 +149,45 @@ pub fn project_pure(
         },
     ];
 
-    let mut commands = vec![EmitCommand::RetryWorkspaceEvent {
+    let commands = vec![EmitCommand::RetryWorkspaceEvent {
         workspace_id: workspace_id_b64.clone(),
     }];
 
-    // Emit accepted bootstrap trust when local context exists (joiner side)
-    if let Some(ref bc) = ctx.bootstrap_context {
-        commands.push(EmitCommand::WriteAcceptedBootstrapTrust {
-            invite_accepted_event_id: event_id_b64.to_string(),
-            invite_event_id: invite_eid_b64,
-            workspace_id: workspace_id_b64,
-            bootstrap_addr: bc.bootstrap_addr.clone(),
-            bootstrap_spki_fingerprint: bc.bootstrap_spki_fingerprint,
-        });
+    // Materialize accepted bootstrap trust when local context exists (joiner side)
+    // and no matching steady-state PeerShared trust has already projected.
+    if !ctx.bootstrap_spki_already_peer_shared {
+        if let Some(ref bc) = ctx.bootstrap_context {
+            let accepted_at = ia.created_at_ms as i64;
+            ops.push(WriteOp::InsertOrIgnore {
+                table: "invite_bootstrap_trust",
+                columns: vec![
+                    "recorded_by",
+                    "invite_accepted_event_id",
+                    "invite_event_id",
+                    "workspace_id",
+                    "bootstrap_addr",
+                    "bootstrap_spki_fingerprint",
+                    "accepted_at",
+                    "expires_at",
+                ],
+                values: vec![
+                    SqlVal::Text(recorded_by.to_string()),
+                    SqlVal::Text(event_id_b64.to_string()),
+                    SqlVal::Text(invite_eid_b64),
+                    SqlVal::Text(workspace_id_b64),
+                    SqlVal::Text(bc.bootstrap_addr.clone()),
+                    SqlVal::Blob(bc.bootstrap_spki_fingerprint.to_vec()),
+                    SqlVal::Int(accepted_at),
+                    SqlVal::Int(
+                        accepted_at + crate::db::transport_trust::ACCEPTED_INVITE_BOOTSTRAP_TTL_MS,
+                    ),
+                ],
+            });
+        }
     }
 
     ProjectorResult::valid_with_commands(ops, commands)
 }
-
 pub static INVITE_ACCEPTED_META: EventTypeMeta = EventTypeMeta {
     type_code: EVENT_TYPE_INVITE_ACCEPTED,
     type_name: "invite_accepted",

@@ -3,8 +3,8 @@
 //! TLA+ guards tested:
 //!   SPEC_PEER_SHARED_TRUST_01 — InvPeerSharedTrustSource (valid insert)
 //!   SPEC_PEER_SHARED_TRUST_02 — InvPeerSharedTrustMatchesCarried (correct fields)
-//!   SPEC_BOOTSTRAP_CONSUMED_01 — InvBootstrapConsumedByPeerShared (SupersedeBootstrapTrust)
-//!   SPEC_PENDING_CONSUMED_01 — InvPendingBootstrapTrustConsumedByPeerShared (same command)
+//!   SPEC_BOOTSTRAP_CONSUMED_01 — InvBootstrapConsumedByPeerShared (write-time delete)
+//!   SPEC_PENDING_CONSUMED_01 — InvPendingBootstrapTrustConsumedByPeerShared (write-time delete)
 
 #[cfg(test)]
 mod tests {
@@ -13,7 +13,7 @@ mod tests {
     use crate::harness::fixtures::*;
     use topo::crypto::spki_fingerprint_from_ed25519_pubkey;
     use topo::event_modules::ParsedEvent;
-    use topo::projection::result::{EmitCommand, SqlVal, WriteOp};
+    use topo::projection::result::{SqlVal, WriteOp};
 
     const PEER: &str = "peer_alice";
     const EVENT_ID: &str = "ps_event_1";
@@ -93,33 +93,30 @@ mod tests {
     // ── SPEC_BOOTSTRAP_CONSUMED_01 + SPEC_PENDING_CONSUMED_01: pass ──
 
     #[test]
-    fn test_peer_shared_emits_supersede() {
+    fn test_peer_shared_consumes_bootstrap_trust() {
         let pk = [5u8; 32];
         let parsed = make_peer_shared_first(pk, [6u8; 32]);
         let ctx = empty_ctx();
 
         let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
         assert_valid(&result);
-        assert_emits_command(&result, "SupersedeBootstrapTrust", |c| match c {
-            EmitCommand::SupersedeBootstrapTrust {
-                peer_shared_public_key,
-            } => *peer_shared_public_key == pk,
-            _ => false,
-        });
+        assert_deletes_from_table(&result, "pending_invite_bootstrap_trust");
+        assert_deletes_from_table(&result, "invite_bootstrap_trust");
+        assert_no_commands(&result);
     }
 
-    // ── Both variants emit the same command ──
+    // ── Both variants perform the same bootstrap-trust deletes ──
 
     #[test]
-    fn test_peer_shared_ongoing_also_emits_supersede() {
+    fn test_peer_shared_ongoing_also_consumes_bootstrap_trust() {
         let pk = [5u8; 32];
         let parsed = make_peer_shared_ongoing(pk, [6u8; 32]);
         let ctx = empty_ctx();
 
         let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
         assert_valid(&result);
-        assert_emits_command(&result, "SupersedeBootstrapTrust", |c| {
-            matches!(c, EmitCommand::SupersedeBootstrapTrust { .. })
-        });
+        assert_deletes_from_table(&result, "pending_invite_bootstrap_trust");
+        assert_deletes_from_table(&result, "invite_bootstrap_trust");
+        assert_no_commands(&result);
     }
 }

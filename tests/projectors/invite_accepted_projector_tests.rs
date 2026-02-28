@@ -4,7 +4,7 @@
 //!   SPEC_ANCHOR_IMMUTABLE_01 — InvTrustAnchorImmutable (write pass)
 //!   SPEC_ANCHOR_IMMUTABLE_02 — InvTrustAnchorImmutable (conflict reject)
 //!   SPEC_ANCHOR_SOURCE_01   — InvTrustAnchorSource (trust_anchors written)
-//!   SPEC_BOOTSTRAP_TRUST_01 — InvBootstrapTrustSource (emit/no-emit)
+//!   SPEC_BOOTSTRAP_TRUST_01 — InvBootstrapTrustSource (write/no-write)
 
 #[cfg(test)]
 mod tests {
@@ -66,18 +66,16 @@ mod tests {
     // ── SPEC_BOOTSTRAP_TRUST_01: pass ──
 
     #[test]
-    fn test_invite_accepted_emits_bootstrap_trust() {
+    fn test_invite_accepted_writes_bootstrap_trust() {
         let ws_id = [10u8; 32];
         let parsed = make_invite_accepted([5u8; 32], ws_id);
         let ctx = ctx_with_bootstrap(&b64(&ws_id), false); // bootstrap_context present
 
         let result = project_pure(PEER, "event_ia_4", &parsed, &ctx);
         assert_valid(&result);
+        assert_writes_to_table(&result, "invite_bootstrap_trust");
         assert_emits_command(&result, "RetryWorkspaceEvent", |c| {
             matches!(c, EmitCommand::RetryWorkspaceEvent { .. })
-        });
-        assert_emits_command(&result, "WriteAcceptedBootstrapTrust", |c| {
-            matches!(c, EmitCommand::WriteAcceptedBootstrapTrust { .. })
         });
     }
 
@@ -91,16 +89,10 @@ mod tests {
 
         let result = project_pure(PEER, "event_ia_5", &parsed, &ctx);
         assert_valid(&result);
-        // Should emit RetryWorkspaceEvent but NOT WriteAcceptedBootstrapTrust
+        // Should emit RetryWorkspaceEvent but NOT write invite_bootstrap_trust.
         assert_emits_command(&result, "RetryWorkspaceEvent", |c| {
             matches!(c, EmitCommand::RetryWorkspaceEvent { .. })
         });
-        assert!(
-            !result
-                .emit_commands
-                .iter()
-                .any(|c| matches!(c, EmitCommand::WriteAcceptedBootstrapTrust { .. })),
-            "should not emit WriteAcceptedBootstrapTrust without bootstrap context"
-        );
+        assert_no_write_to_table(&result, "invite_bootstrap_trust");
     }
 }
