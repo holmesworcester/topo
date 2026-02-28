@@ -1,6 +1,11 @@
 use rusqlite::Connection;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub const CRED_SOURCE_UNKNOWN: &str = "unknown";
+pub const CRED_SOURCE_RANDOM: &str = "random";
+pub const CRED_SOURCE_BOOTSTRAP: &str = "bootstrap";
+pub const CRED_SOURCE_PEER_SHARED: &str = "peershared";
+
 pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "
@@ -8,10 +13,32 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
             peer_id TEXT PRIMARY KEY,
             cert_der BLOB NOT NULL,
             key_der BLOB NOT NULL,
-            created_at INTEGER NOT NULL
+            created_at INTEGER NOT NULL,
+            source TEXT NOT NULL DEFAULT 'unknown'
         );
         ",
     )?;
+    // Schema epoch is fixed for this POC, but allow additive column convergence so
+    // existing DBs in this epoch continue to open.
+    let has_source = {
+        let mut stmt = conn.prepare("PRAGMA table_info(local_transport_creds)")?;
+        let mut rows = stmt.query([])?;
+        let mut found = false;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            if name == "source" {
+                found = true;
+                break;
+            }
+        }
+        found
+    };
+    if !has_source {
+        conn.execute(
+            "ALTER TABLE local_transport_creds ADD COLUMN source TEXT NOT NULL DEFAULT 'unknown'",
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -22,15 +49,39 @@ pub fn store_local_creds(
     cert_der: &[u8],
     key_der: &[u8],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    store_local_creds_with_source(conn, peer_id, cert_der, key_der, CRED_SOURCE_UNKNOWN)
+}
+
+/// Store TLS cert/key DER blobs for a local peer identity with explicit source.
+pub fn store_local_creds_with_source(
+    conn: &Connection,
+    peer_id: &str,
+    cert_der: &[u8],
+    key_der: &[u8],
+    source: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64;
     conn.execute(
-        "INSERT OR REPLACE INTO local_transport_creds (peer_id, cert_der, key_der, created_at) VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![peer_id, cert_der, key_der, now],
+        "INSERT OR REPLACE INTO local_transport_creds (peer_id, cert_der, key_der, created_at, source) VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![peer_id, cert_der, key_der, now, source],
     )?;
     Ok(())
+}
+
+/// Return true if any local credential row has the given source marker.
+pub fn has_creds_with_source(
+    conn: &Connection,
+    source: &str,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let exists: i64 = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM local_transport_creds WHERE source = ?1 LIMIT 1)",
+        rusqlite::params![source],
+        |row| row.get(0),
+    )?;
+    Ok(exists != 0)
 }
 
 /// Load cert/key DER blobs for a specific peer identity.
@@ -303,5 +354,46 @@ mod tests {
         assert_eq!(tenants[0].peer_id, "derived_peer");
         assert_eq!(tenants[0].transport_peer_id, "invite_peer");
         assert_eq!(tenants[0].workspace_id, "ws1");
+    }
+
+    #[test]
+    fn test_has_creds_with_source() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        store_local_creds_with_source(&conn, "peer1", b"cert1", b"key1", CRED_SOURCE_BOOTSTRAP)
+            .unwrap();
+
+        assert!(has_creds_with_source(&conn, CRED_SOURCE_BOOTSTRAP).unwrap());
+        assert!(!has_creds_with_source(&conn, CRED_SOURCE_PEER_SHARED).unwrap());
+    }
+
+    #[test]
+    fn test_ensure_schema_adds_source_column_for_legacy_table_shape() {
+        let conn = open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE local_transport_creds (
+                peer_id TEXT PRIMARY KEY,
+                cert_der BLOB NOT NULL,
+                key_der BLOB NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            ",
+        )
+        .unwrap();
+
+        ensure_schema(&conn).unwrap();
+
+        let mut stmt = conn.prepare("PRAGMA table_info(local_transport_creds)").unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        let mut has_source = false;
+        while let Some(row) = rows.next().unwrap() {
+            let name: String = row.get(1).unwrap();
+            if name == "source" {
+                has_source = true;
+                break;
+            }
+        }
+        assert!(has_source, "ensure_schema should add source column");
     }
 }

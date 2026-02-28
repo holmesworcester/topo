@@ -28,6 +28,8 @@ pub enum TransportIdentityIntent {
 pub enum TransportIdentityError {
     #[error("transport identity install failed: {0}")]
     InstallFailed(String),
+    #[error("bootstrap transport identity install denied after peershared identity is active")]
+    BootstrapAfterPeerSharedDenied,
     #[error("signer key not found for recorded_by={recorded_by}")]
     SignerKeyNotFound { recorded_by: String },
     #[error("invalid key material: {0}")]

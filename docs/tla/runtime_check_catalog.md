@@ -90,6 +90,7 @@ an explicit `NON_MODELED::<reason>` waiver.
 | CHK_TCL_TRUSTED_MEMBERS | projection/trust_store | InvTrustedPeerSetMembers | transport_credential |
 | CHK_TCL_BOOTSTRAP_MATCH | projection/trust_store | InvBootstrapTrustMatchesCarried | transport_credential |
 | CHK_TCL_PENDING_MATCH | projection/trust_store | InvPendingBootstrapTrustMatchesCarried | transport_credential |
+| CHK_TCL_CRED_SOURCE_CONSISTENCY | transport/identity_adapter + transport_creds | InvCredentialSourceConsistency | transport_credential |
 
 ## Replay/Order Checks
 
