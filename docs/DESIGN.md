@@ -1,8 +1,14 @@
-# Topo Protocol Proof-of-Concept Design
+# Topo Protocol Design (Post-PLAN End State)
+
+> **Status: Active** — Topo target protocol design describing the post-PLAN end state.
 
 Topo is a draft protocol design for building full-featured local-first, peer-to-peer, end-to-end encrypted communication and collaboration tools.
 
 This draft design focuses on the minimal necessary feature set to prove the protocol's suitability for building a viable secure replacement for Slack.
+
+Terminology note:
+`Topo` is the project and runtime name used throughout this repository.
+`workspace` is the term for the logical peer set and shared protocol context; "network" refers only to transport/networking concerns.
 
 ## Requirements
 
@@ -12,33 +18,53 @@ This draft design focuses on the minimal necessary feature set to prove the prot
 1. **Files** - multi-source file downloads (for images and attachments) should be performant (network-bound) and flexible
 1. **Performance** - workspace state (messages, etc.) and files should sync quickly, up to 10GB of messages and attachments (we assume groups are using some global retention limit for security and that each workspace's data is bounded, or that users will resort to cloud hosting for long-term storage)
 1. **Multi-tenancy** - It should be trivial to support many workspaces in the main client, join the same workspaces with multiple accounts in the same client, or host thousands of workspaces in a cloud node
-1. **Cloud / Client Isomorphism** - Cloud nodes should not require a separate implementation.   
+1. **Cloud / Client Isomorphism** - Cloud nodes should not require a separate implementation.
 1. **NSE / Client Isomorphism** - iOS background notification fetch (memory-constrained) should not require a separate implementation
 1. **Local netorking** - The protocol should be capable of zeroconf discovering and networking over LANs.
 1. **Testing & Simulation** - It should be trivial to test interactions between multiple accounts on the same machine, with a toy interface that mimics the requirements of a production Slack Electron or React Native app, and to test robustness against concurrency and reordering. It should also be low-cost for an LLM to "self-QA" its work.
 1. **Ergonommic Feature Development** - once complex features like auth, deletion, encryption, and forward secrecy are in place, it should be possible to build user-facing, Slack-like features (reactions, channels, threads, user profiles, etc.) with minimal friction
 1. **Boring API for Frontends** - the backend should fully contain the complexity of the p2p stack and provide a boring API that keeps frontend development highly conventional (e.g., letting frontends fetch a paginated message list with attachments, reactions, usernames, and avatars should be easy)
 
-Primary tools/stragies used: 
+Primary tools/stragies used:
 
-1. **Event Sourcing** - Canonical events are durable facts. All canonical data is expressed as events, and state can be generated/restored deterministically by replaying events. 
+1. **Event Sourcing** - Canonical events are durable facts. All canonical data is expressed as events, and state can be generated/restored deterministically by replaying events.
 1. **Content Addressing** - All events are identified by the hash of the canonicalized event (the encrypted version if encrypted, the signed plaintext version if not)
 1. **Explicit Semantic Dependency** - Rather than making events depend arbitrarily on prior events (like Automerge, OrbitDB) application developers decide what depencies are important for product needs and make them required event fields pointing to dependency event id's
-1. **Dependency-agnostic Set Reconciliation** - We use a set reconcilation algorithm (Negentropy) that eventually and efficiently syncs all events we don't yet have, without using the dependency graph (as OrbitDB or Git would)  
+1. **Dependency-agnostic Set Reconciliation** - We use a set reconcilation algorithm (Negentropy) that eventually and efficiently syncs all events we don't yet have, without using the dependency graph (as OrbitDB or Git would)
 1. **Topological Sort** - Events block when dependencies are missing, and unblock with topological sort (Khan's algorithm).
 1. **Keys Are Just Dependencies** - There are no special queues for events with missing signer or decryption keys: these are just declared dependencies (key material is stored in events with id's) and block/unblock accordingly.
-1. **Dependency-Oblivious Set Reconciliation** - Rather than 
+1. **Dependency-Oblivious Set Reconciliation** - Rather than
 1. **Projection** - Events are queued for validation and "projected" (materialized) into SQLite rows in atomic transactions
-1. **Deterministic Query-time Winners** - Rather than applying destructive database updates that can create ordering problems, events updating a single state instead add rows using INSERT OR IGNORE; a single winner is determined at query time. 
+1. **Deterministic Query-time Winners** - Rather than applying destructive database updates that can create ordering problems, events updating a single state instead add rows using INSERT OR IGNORE; a single winner is determined at query time.
 1. **Flat, Fixed-length Events** - To simplify secure parsing, all events and fields are fixed-length and canonicalized
 1. **Ephemeral Protocol Messages** - Runtime protocol traffic (sync/intros/holepunch control) is not canonical event data.
 1. **Conventional Networking Primitives** - All networking (including local networking) happens over QUIC with transport layer security provided by mTLS, but transport identity depends on the event-sourced auth layer for checking incoming and outgoing connections, and dropping connections.
-1. **In-band Relay, Discovery, Intro** - Rather than using STUN/TURN libraries, mutually reachable (non-NAT) peers or cloud nodes can relay data through normal sync operation, and introduce NAT'ed peers by their observed addresses/ports 
-1. **QUIC Holepunching** - Once intro'ed by a mutually reachable peer, peers holepunch with simultaneous QUIC connections   
-1. **Convergence Testing** - Tests check that for all relevant scenarios, reverse reorderings of events, or duplicated event replays, yield the same state.    
+1. **In-band Relay, Discovery, Intro** - Rather than using STUN/TURN libraries, mutually reachable (non-NAT) peers or cloud nodes can relay data through normal sync operation, and introduce NAT'ed peers by their observed addresses/ports
+1. **QUIC Holepunching** - Once intro'ed by a mutually reachable peer, peers holepunch with simultaneous QUIC connections
+1. **Convergence Testing** - Tests check that for all relevant scenarios, reverse reorderings of events, or duplicated event replays, yield the same state.
 1. **Real Networking in Tests** - All multi-client tests are realistic as possible: real networking using CLI-controlled daemons with local peer discovery.
 1. **Easy Synchronous Testing Workflows** - CLI workflows remain synchronous enough for imperative command chains (create workspace with user, invite user, join as user, etc.)
 1. **Multitenancy** - Multiple user accounts are workspaces are first class features and event sourced, with `recorded_by` scoping on shared tables (e.g. one message table, scoped to many different local users, where any known message can be recorded or "seen" by one or more users--scoping guardrails prevent accidental reads/writes across workspaces) <!-- Question: is "recorded" currently event sourced? Do we have `recorded` events?-->
+
+## Why?
+
+The design goal is to keep protocol behavior auditable while still supporting real-time chat behavior and agent-friendly automation:
+
+1. canonical data stays event-sourced and replayable,
+2. transport and sync are real (QUIC + mTLS), not simulator paths,
+3. projection logic is deterministic and convergent,
+4. CLI workflows remain synchronous enough for imperative command chains.
+
+## How?
+
+We split concerns aggressively:
+
+1. Canonical events are durable facts.
+2. Runtime protocol traffic (sync/intros/holepunch control) is not canonical event data.
+3. Projection is the only way canonical events affect application state.
+4. Blocking/unblocking is uniform across normal and encrypted events.
+5. Multitenancy is first-class with `recorded_by` scoping on shared tables.
+6. Policy-appropriate blocked rows after sync are normal, not failure.
 
 ---
 
@@ -64,7 +90,7 @@ Blocked-event normalcy rule:
 
 ## 1.2 Event format
 
-All events are flat and schema-defined with a fixed length, and with fixed-length fields.
+Events are flat and schema-defined.
 
 Rules:
 1. no universal `deps` field,
@@ -175,11 +201,13 @@ Conceptually:
 
 Transport cert/key materialization is isolated behind a typed contract:
 
-- **`TransportIdentityIntent`** (enum): describes *what* identity change is needed (invite-bootstrap install, PeerShared-derived install).
-- **`TransportIdentityAdapter`** (trait): executes the intent against the DB. The sole concrete implementation (`ConcreteTransportIdentityAdapter` in `src/transport/identity_adapter.rs`) is the **only** code that calls raw install functions (`install_peer_key_transport_identity`, `install_invite_bootstrap_transport_identity`).
+- **`TransportIdentityIntent`** (enum): describes *what* identity change is needed (`InstallBootstrapIdentityFromInviteKey` or `InstallPeerSharedIdentityFromSigner`).
+- **`TransportIdentityAdapter`** (trait): executes the intent against the DB. The sole concrete implementation (`ConcreteTransportIdentityAdapter` in `src/transport/identity_adapter.rs`) is the **only** code that calls raw install functions (`install_invite_bootstrap_transport_identity`, `install_peer_key_transport_identity`).
+- **Workspace command layer** (`accept_invite` / `accept_device_link`) installs invite-derived bootstrap identity via the adapter intent path (not raw transport calls).
 - **Event modules** emit `ApplyTransportIdentityIntent` commands (e.g., `local_signer_secret` projector for PeerShared signers).
 - **Projection pipeline** (`write_exec.rs`) routes intents through the adapter.
-- **Workspace command layer** uses the adapter directly for invite-bootstrap identity during `workspace::commands::accept_invite` / `workspace::commands::accept_device_link`.
+- **Downgrade guard**: bootstrap install is rejected once a PeerShared-derived identity has been installed (`BootstrapAfterPeerSharedDenied`), enforcing one-way transition.
+- **Credential source tracking**: `local_transport_creds.source` records `random | bootstrap | peershared` for runtime guard checks and diagnostics.
 - **Boundary enforcement**: `scripts/check_boundary_imports.sh` prevents raw install calls from leaking into `service.rs`, `event_modules/`, or `projection/`. <!-- Is this the right abstraction? -->
 
 ## 2.3 Event-graph identity binding
@@ -306,11 +334,25 @@ Signer secrets (LocalSignerSecret events) are NOT emitted here; `persist_join_si
 
 **Retry** (`workspace::commands::retry_pending_invite_content_key_unwraps`): retries content-key unwrap for invites where SecretShared prerequisites arrived late. Triggered via `event_modules::post_drain_hooks` from `event_pipeline/effects.rs` after each projection drain.
 
-Identity finalization step:
-1. bootstrap flows can begin under a temporary invite-derived `recorded_by` identity before the steady-state PeerShared-derived transport peer ID is installed, <!-- add: this lets bootstrap rely on natural sync of deps -->
-2. after transition, `finalize_identity(old, new)` rebinds tenant-scoped rows across projection/trust/pipeline tables in one transaction,
-3. finalization reconciles blocker/project-queue state (drop stale blocker edges, release stale leases <!-- ??-->, requeue newly unblocked events),
-4. if `old == new`, finalization is a no-op.
+Identity pre-derive:
+
+All three creation paths pre-derive `recorded_by` from the PeerShared key
+(`derived_peer_id = hex(spki_fingerprint(pubkey))`) before writing any events,
+so all events are written under the final peer_id from the start.
+
+- **Workspace creation** (`create_workspace`): pre-derives PeerShared key,
+  installs PeerShared-derived transport cert directly. No bootstrap sync needed.
+- **Invite acceptance / device link** (`accept_invite`, `accept_device_link`):
+  pre-derives PeerShared key for `recorded_by`, but installs an invite-derived
+  bootstrap transport cert (needed for the initial QUIC handshake — the inviter
+  expects the invite-derived SPKI). The PeerShared-derived transport identity
+  replaces it later via projection cascade
+  (`ApplyTransportIdentityIntent::InstallPeerSharedIdentityFromSigner`).
+- **Connect loop**: identity is resolved once per QUIC connection (not per
+  session). Identity transitions only happen during discrete CLI commands,
+  never during active sync, so per-session re-lookup is unnecessary overhead.
+<!-- add: this lets bootstrap rely on natural sync of deps -->
+<!-- ?? -->
 
 ### Identity ownership boundary
 
@@ -380,7 +422,7 @@ FROM trust_anchors t
 JOIN local_transport_creds c ON t.peer_id = c.peer_id
 ``` 
 
-`trust_anchors` is populated by `invite_accepted` (local-only, part of the identity bootstrap). `local_transport_creds` is populated during identity bootstrap (cert derived from PeerShared Ed25519 key). Any identity that has both a workspace binding and TLS material is a local tenant.
+`trust_anchors` is populated by `invite_accepted` (local-only, part of the identity bootstrap). `local_transport_creds` is populated during identity bootstrap: invite acceptance may install an invite-derived bootstrap cert first, then projection installs the PeerShared-derived cert. Any identity that has both a workspace binding and TLS material is a local tenant.
 
 ### Node daemon architecture
 
@@ -428,7 +470,7 @@ This eliminates write contention while preserving per-tenant projection isolatio
 
 ### TLS credential storage
 
-Transport cert/key DER <!--DER?--> blobs live exclusively in the `local_transport_creds` SQLite table. No cert files exist on disk. Credentials are stored during identity bootstrap and loaded at endpoint creation time. This keeps all node state in one database file.
+Transport cert/key DER <!--DER?--> blobs live exclusively in the `local_transport_creds` SQLite table (with `source` marker: `random | bootstrap | peershared`). No cert files exist on disk. Credentials are stored during identity bootstrap and loaded at endpoint creation time. Bootstrap identity install is one-way gated: after a PeerShared install, bootstrap install is denied. This keeps all node state in one database file.
 
 ## 3.2.2 LAN peer discovery (mDNS/DNS-SD)
 
@@ -476,11 +518,12 @@ Durable trust/identity authority transitions are eventized (InviteAccepted, Peer
 ## 3.3 Table lifecycle and naming
 
 1. schema creation runs through ordered migrations, <!-- Do we still care about migrations in the poc or should we call them out of scope? -->
-2. event modules register their projection table migrations,
-3. startup performs migration + registry/schema consistency checks and fails fast on mismatch,
-4. prototype schema epoch is explicit (`schema_epoch`) and enforced at startup,
-5. legacy DB layouts from prior prototype epochs are intentionally rejected (no backward migration; recreate DB),
-6. each event module declares explicit `event_type` and `projection_table`; no inferred naming heuristics.
+2. no `schema_migrations` table or versioned migration runner is required in active startup/operation,
+3. each owner module defines its own idempotent `ensure_schema(conn)` (event projection tables in `event_modules/*`, queue/infra tables in `state/db/*`),
+4. central bootstrap calls owner `ensure_schema` in deterministic order,
+5. prototype schema epoch is explicit (`schema_epoch`) and enforced at startup,
+6. legacy DB layouts from prior prototype epochs are intentionally rejected (no backward migration; recreate DB),
+7. each event module declares explicit `event_type` and `projection_table`; no inferred naming heuristics.
 
 ---
 
@@ -550,13 +593,14 @@ Projectors must not access the database directly. Fields include: <!-- Do fields
 
 - `trust_anchor_workspace_id` — trust anchor for this tenant
 - `target_message_author` / `target_tombstone_author` — for deletion auth
-- `deletion_intent` — pre-existing deletion intent (for delete-before-create convergence)
+- `deletion_intents` — pre-existing deletion intents (for delete-before-create convergence)
 - `target_message_deleted` — for reaction skip-on-delete
 - `recipient_removed` — for SecretShared removal exclusion
 - `file_descriptors` / `existing_file_slice` — for FileSlice authorization
-- `secret_key_bytes` — for Encrypted event decryption
 - `bootstrap_context` — local bootstrap context (addr + SPKI) for invite trust materialization
 - `is_local_create` — whether the event was locally created (from `recorded_events.source`); gates `WritePendingBootstrapTrust` emission so only the invite creator materializes pending trust
+
+Encrypted key resolution/decryption is handled in the encrypted-wrapper stage (`projection/encrypted.rs`), not via `ContextSnapshot`.
 
 ### Command/effect execution stage semantics
 
@@ -842,15 +886,28 @@ assigns events to peers using round-based greedy load balancing:
 
 1. **Discovery**: each peer runs negentropy with its source, discovering need_ids
    (events the sink needs). Push (have_ids) proceeds immediately.
-2. **Report**: after reconciliation, each peer sends its need_ids to the coordinator
-   via a per-peer channel.
-3. **Assignment**: the coordinator collects reports (short collection window after
+2. **Streaming pull**: during reconciliation, each peer sends HaveList frames
+   immediately as need_ids are discovered (pipelining data transfer with
+   reconciliation). Need_ids are also buffered for coordinator reporting.
+3. **Report**: after reconciliation completes, each peer sends its full need_ids
+   to the coordinator via a per-peer channel.
+4. **Assignment**: the coordinator collects reports (short collection window after
    first report), builds an event-to-peer availability map, sorts by availability
    ascending (unique events first), and assigns each event to the least-loaded peer
    that has it.
-4. **Transfer**: each peer receives its assigned subset and sends HaveList only for
-   those events. Events flow into a shared batch_writer.
-5. **Forget**: assignments are discarded after each round. Next round starts fresh.
+5. **Transfer**: since HaveList was already streamed during reconciliation, the
+   coordinator assignment is informational for the reporting peer (the `wanted`
+   table deduplicates). For multi-peer scenarios, other peers receive their
+   assigned subsets normally.
+6. **Forget**: assignments are discarded after each round. Next round starts fresh.
+
+**Critical invariant — streaming pull dispatch.** HaveList frames MUST be sent
+during reconciliation rounds, not deferred until after reconciliation completes.
+Buffering need_ids until post-reconciliation creates a pipeline stall: events
+cannot flow until reconciliation finishes AND the coordinator round-trips. This
+serializes ~1 second of overhead that should be pipelined. The `wanted` table
+provides natural dedup so streaming dispatch is safe even with coordinator
+assignment afterward.
 
 Key properties:
 - Events available from one peer are assigned to that peer (no choice).
@@ -886,13 +943,14 @@ Do not add an in-memory dedup set in front of the shared writer:
 - The set grows without bound for long-running daemons (~90 bytes per EventId). <!-- should we address this for lowmem support? -->
 - `INSERT OR IGNORE` in `batch_writer` handles duplicates correctly and cheaply.
 
-**Coordinator for pull, not push.** Each peer still pushes all have_ids
-(events the remote needs from us) without coordination — the push path runs
-at full speed. Only the pull path (need_ids — events we want) goes through
-coordinator assignment. After reconciliation, each peer reports its discovered
-need_ids to the coordinator thread, which assigns each event to the
-least-loaded peer that has it. This eliminates redundant downloads of the same
-event from multiple sources.
+**Coordinator for pull rebalancing, not gating.** Each peer still pushes all
+have_ids without coordination — the push path runs at full speed. The pull
+path streams HaveList during reconciliation (so events flow immediately) and
+also reports need_ids to the coordinator for multi-peer load balancing. The
+coordinator assigns each event to the least-loaded peer that has it, reducing
+redundant downloads when multiple sources share the same events. For
+single-peer sync, the coordinator degenerates to pass-through (all events
+assigned to the sole peer, which already streamed them).
 
 **Round-based reassignment.** Assignments are discarded after each round. If a
 peer fails to deliver its assigned events (slow, disconnected), those events
@@ -1072,6 +1130,8 @@ All key acquisition flows through the same event-backed wrap/unwrap path.
 
 This section covers the lifecycle state machine for the three trust sources: PeerShared-derived SPKIs (steady-state), `invite_bootstrap_trust`, and `pending_invite_bootstrap_trust`. The `transport_keys` table is populated by TransportKey event projection but is **not** consulted for trust decisions.
 
+Credential transition model: invite acceptance may install a bootstrap transport cert first; projection later installs the PeerShared-derived cert. Runtime enforces one-way transition (no bootstrap-after-PeerShared downgrade).
+
 Supersession: when a PeerShared event is projected, the PeerShared projector emits a `SupersedeBootstrapTrust` command that marks matching `invite_bootstrap_trust` and `pending_invite_bootstrap_trust` entries as superseded. This happens at projection time, not on trust check reads — trust check reads (`is_peer_allowed`, `allowed_peers_from_db`) are pure queries with no write side-effects.
 
 TTL expiry: bootstrap trust rows are time-bounded. Unconsumed entries expire and are purged.
@@ -1080,14 +1140,15 @@ Removal cascade: `peer_removed` cascades trust removal across all three sources 
 
 Invite ownership: `inviteCreator` tracks which peer created each invite SPKI. Only the invite creator (inviter) may materialize pending bootstrap trust — the joiner must not emit `WritePendingBootstrapTrust` when syncing the invite event. This is enforced by the `is_local_create` flag in `ContextSnapshot`, populated from `recorded_events.source`. The TLA+ model captures this via the `inviteCreator[s] = p` guard on `AddPendingBootstrapTrust` and the `InvPendingTrustOnlyOnInviter` invariant.
 
-TLC-verified invariants (from `TransportCredentialLifecycle.tla`, POC-simplified single-credential-per-peer model, mapped to Rust checks in `docs/tla/projector_spec.md`):
+TLC-verified invariants (from `TransportCredentialLifecycle.tla`, mapped to Rust checks in `docs/tla/projector_spec.md`):
 1. `InvSPKIUniqueness` — no two peers share an active SPKI,
 2. `InvBootstrapConsumedByPeerShared` — bootstrap trust disjoint from PeerShared trust,
 3. `InvPendingConsumedByPeerShared` — pending trust disjoint from PeerShared trust,
 4. `InvTrustSetIsExactUnion` — trust set is exact union of three sources,
 5. `InvTrustSourcesWellFormed` — all trust sets contain valid SPKIs,
 6. `InvMutualAuthSymmetry` — mutual auth requires both peers have credentials,
-7. `InvPendingTrustOnlyOnInviter` — pending trust exists only on invite creator's store.
+7. `InvPendingTrustOnlyOnInviter` — pending trust exists only on invite creator's store,
+8. `InvCredentialSourceConsistency` — credential presence and source are consistent across bootstrap→PeerShared transition.
 
 Abstract boundary: TLS handshake and session-key derivation remain unmodeled. The TLA spec covers trust-source state transitions but not the cryptographic session establishment that consumes them.
 
