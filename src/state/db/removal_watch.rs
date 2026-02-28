@@ -9,8 +9,10 @@
 //! The sync engine calls this periodically to close sessions for removed peers.
 
 use rusqlite::Connection;
+use std::collections::HashSet;
 
 use crate::crypto::spki_fingerprint_from_ed25519_pubkey;
+use crate::event_modules::peer_shared::resolve_event_id_by_transport_fingerprint;
 
 /// Check whether a peer identified by hex SPKI fingerprint has been removed.
 ///
@@ -22,51 +24,66 @@ pub fn is_peer_removed(
     recorded_by: &str,
     spki_fingerprint: &[u8; 32],
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    // Find PeerShared events whose derived SPKI matches the given fingerprint
+    if let Some(event_id) =
+        resolve_event_id_by_transport_fingerprint(conn, recorded_by, spki_fingerprint)?
+    {
+        let removed: bool = conn.query_row(
+            "SELECT EXISTS (
+                SELECT 1 FROM removed_entities
+                WHERE recorded_by = ?1 AND target_event_id = ?2
+            ) OR EXISTS (
+                SELECT 1 FROM removed_entities r
+                WHERE r.recorded_by = ?1
+                  AND r.removal_type = 'user'
+                  AND r.target_event_id = (
+                    SELECT p.user_event_id FROM peers_shared p
+                    WHERE p.recorded_by = ?1 AND p.event_id = ?2 AND p.user_event_id IS NOT NULL
+                  )
+            )",
+            rusqlite::params![recorded_by, &event_id],
+            |row| row.get(0),
+        )?;
+        return Ok(removed);
+    }
+
+    // Legacy fallback for rows without transport_fingerprint projection.
     let mut stmt = conn.prepare(
         "SELECT p.event_id, p.public_key FROM peers_shared p
-         WHERE p.recorded_by = ?1",
+         WHERE p.recorded_by = ?1
+           AND (p.transport_fingerprint IS NULL OR length(p.transport_fingerprint) != 32)",
     )?;
-    let rows: Vec<(String, Vec<u8>)> = stmt
-        .query_map(rusqlite::params![recorded_by], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    for (event_id, pubkey_blob) in rows {
+    let mut rows = stmt.query(rusqlite::params![recorded_by])?;
+    while let Some(row) = rows.next()? {
+        let event_id: String = row.get(0)?;
+        let pubkey_blob: Vec<u8> = row.get(1)?;
         if pubkey_blob.len() != 32 {
             continue;
         }
         let mut key = [0u8; 32];
         key.copy_from_slice(&pubkey_blob);
         let derived_spki = spki_fingerprint_from_ed25519_pubkey(&key);
-        if &derived_spki == spki_fingerprint {
-            // Found the PeerShared event for this SPKI. Check if it's been directly removed.
-            let removed: bool = conn.query_row(
-                "SELECT COUNT(*) > 0 FROM removed_entities
-                 WHERE recorded_by = ?1 AND target_event_id = ?2",
-                rusqlite::params![recorded_by, &event_id],
-                |row| row.get(0),
-            )?;
-            if removed {
-                return Ok(true);
-            }
-            // Check if the peer's user has been removed (transitive user_removed denial).
-            let user_removed: bool = conn.query_row(
-                "SELECT COUNT(*) > 0 FROM removed_entities r
-                 WHERE r.recorded_by = ?1
-                   AND r.removal_type = 'user'
-                   AND r.target_event_id = (
-                     SELECT p.user_event_id FROM peers_shared p
-                     WHERE p.recorded_by = ?1 AND p.event_id = ?2 AND p.user_event_id IS NOT NULL
-                   )",
-                rusqlite::params![recorded_by, &event_id],
-                |row| row.get(0),
-            )?;
-            if user_removed {
-                return Ok(true);
-            }
+        if &derived_spki != spki_fingerprint {
+            continue;
+        }
+
+        let removed: bool = conn.query_row(
+            "SELECT EXISTS (
+                SELECT 1 FROM removed_entities
+                WHERE recorded_by = ?1 AND target_event_id = ?2
+            ) OR EXISTS (
+                SELECT 1 FROM removed_entities r
+                WHERE r.recorded_by = ?1
+                  AND r.removal_type = 'user'
+                  AND r.target_event_id = (
+                    SELECT p.user_event_id FROM peers_shared p
+                    WHERE p.recorded_by = ?1 AND p.event_id = ?2 AND p.user_event_id IS NOT NULL
+                  )
+            )",
+            rusqlite::params![recorded_by, &event_id],
+            |r| r.get(0),
+        )?;
+        if removed {
+            return Ok(true);
         }
     }
     Ok(false)
@@ -79,9 +96,49 @@ pub fn removed_peer_spki_fingerprints(
     conn: &Connection,
     recorded_by: &str,
 ) -> Result<Vec<[u8; 32]>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut out = HashSet::new();
+
+    // Primary path: read projected transport_fingerprint directly.
+    let mut stmt = conn.prepare(
+        "SELECT p.transport_fingerprint FROM peers_shared p
+         WHERE p.recorded_by = ?1
+           AND length(p.transport_fingerprint) = 32
+           AND (
+             EXISTS (
+               SELECT 1 FROM removed_entities r
+               WHERE r.recorded_by = p.recorded_by
+                 AND r.target_event_id = p.event_id
+             )
+             OR EXISTS (
+               SELECT 1 FROM removed_entities r
+               WHERE r.recorded_by = p.recorded_by
+                 AND p.user_event_id IS NOT NULL
+                 AND r.target_event_id = p.user_event_id
+               AND r.removal_type = 'user'
+             )
+           )",
+    )?;
+    let direct_fps: Vec<[u8; 32]> = stmt
+        .query_map(rusqlite::params![recorded_by], |row| {
+            Ok(row.get::<_, Vec<u8>>(0)?)
+        })?
+        .filter_map(|r| {
+            let blob = r.ok()?;
+            if blob.len() != 32 {
+                return None;
+            }
+            let mut fp = [0u8; 32];
+            fp.copy_from_slice(&blob);
+            Some(fp)
+        })
+        .collect();
+    out.extend(direct_fps);
+
+    // Legacy fallback for rows without projected transport_fingerprint.
     let mut stmt = conn.prepare(
         "SELECT p.public_key FROM peers_shared p
          WHERE p.recorded_by = ?1
+           AND (p.transport_fingerprint IS NULL OR length(p.transport_fingerprint) != 32)
            AND (
              EXISTS (
                SELECT 1 FROM removed_entities r
@@ -97,10 +154,9 @@ pub fn removed_peer_spki_fingerprints(
              )
            )",
     )?;
-    let fps: Vec<[u8; 32]> = stmt
+    let fallback_fps: Vec<[u8; 32]> = stmt
         .query_map(rusqlite::params![recorded_by], |row| {
-            let blob: Vec<u8> = row.get(0)?;
-            Ok(blob)
+            Ok(row.get::<_, Vec<u8>>(0)?)
         })?
         .filter_map(|r| {
             let blob = r.ok()?;
@@ -113,7 +169,9 @@ pub fn removed_peer_spki_fingerprints(
             }
         })
         .collect();
-    Ok(fps)
+    out.extend(fallback_fps);
+
+    Ok(out.into_iter().collect())
 }
 
 #[cfg(test)]

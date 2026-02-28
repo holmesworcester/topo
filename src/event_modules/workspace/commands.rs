@@ -502,17 +502,6 @@ pub fn create_user_invite(
         Some(&ctx),
     )?;
 
-    // Record pending bootstrap trust so the inviter's daemon trusts the
-    // joiner's invite-derived cert when they connect via autodial.
-    let joiner_spki = ops::expected_invite_bootstrap_spki_from_invite_key(&invite.invite_key)?;
-    crate::db::transport_trust::record_pending_invite_bootstrap_trust(
-        db,
-        recorded_by,
-        &event_id_to_base64(&invite.invite_event_id),
-        &event_id_to_base64(workspace_id),
-        &joiner_spki,
-    )?;
-
     let invite_link =
         super::invite_link::create_invite_link(&invite, bootstrap_addr, bootstrap_spki)?;
 
@@ -548,17 +537,6 @@ pub fn create_device_link_invite(
         user_event_id,
         workspace_id,
         Some(&ctx),
-    )?;
-
-    // Record pending bootstrap trust so the inviter's daemon trusts the
-    // joiner's invite-derived cert when they connect via autodial.
-    let joiner_spki = ops::expected_invite_bootstrap_spki_from_invite_key(&invite.invite_key)?;
-    crate::db::transport_trust::record_pending_invite_bootstrap_trust(
-        db,
-        recorded_by,
-        &event_id_to_base64(&invite.invite_event_id),
-        &event_id_to_base64(workspace_id),
-        &joiner_spki,
     )?;
 
     let invite_link =
@@ -1109,4 +1087,56 @@ pub fn create_device_link_for_peer(
         invite_link: result.invite_link,
         invite_event_id: event_id_to_base64(&result.invite_event_id),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{open_in_memory, schema::create_tables};
+
+    #[test]
+    fn create_user_invite_materializes_pending_bootstrap_trust_via_projection() {
+        let conn = open_in_memory().expect("open in-memory db");
+        create_tables(&conn).expect("create tables");
+
+        let workspace = create_workspace(&conn, "bootstrap", "ws", "alice", "laptop")
+            .expect("create workspace");
+        let recorded_by = hex::encode(crate::crypto::spki_fingerprint_from_ed25519_pubkey(
+            &workspace.peer_shared_key.verifying_key().to_bytes(),
+        ));
+        let (_workspace_signer_eid, workspace_key) =
+            load_workspace_signing_key(&conn, &recorded_by)
+                .expect("load workspace key")
+                .expect("workspace key must exist");
+
+        let bootstrap_spki_bytes = hex::decode(&recorded_by).expect("decode local transport fp");
+        let mut bootstrap_spki = [0u8; 32];
+        bootstrap_spki.copy_from_slice(&bootstrap_spki_bytes);
+
+        let invite = create_user_invite(
+            &conn,
+            &recorded_by,
+            &workspace_key,
+            &workspace.workspace_id,
+            &workspace.peer_shared_key,
+            &workspace.peer_shared_event_id,
+            "127.0.0.1:4433",
+            &bootstrap_spki,
+        )
+        .expect("create user invite");
+
+        let invite_event_b64 = event_id_to_base64(&invite.invite_event_id);
+        let pending_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pending_invite_bootstrap_trust
+                 WHERE recorded_by = ?1 AND invite_event_id = ?2",
+                rusqlite::params![recorded_by, invite_event_b64],
+                |row| row.get(0),
+            )
+            .expect("query pending rows");
+        assert_eq!(
+            pending_rows, 1,
+            "pending trust row should be materialized by projection path"
+        );
+    }
 }

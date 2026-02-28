@@ -12,7 +12,15 @@ use crate::transport::peer_identity_from_connection;
 /// A successful transport connection with verified peer identity.
 pub struct ConnectedPeer {
     pub connection: quinn::Connection,
+    /// Hex-encoded peer certificate SPKI fingerprint (transport identity).
     pub peer_id: String,
+}
+
+impl ConnectedPeer {
+    /// Canonical transport-facing name for `peer_id`.
+    pub fn transport_fingerprint(&self) -> &str {
+        &self.peer_id
+    }
 }
 
 #[derive(Debug, Error)]
@@ -28,11 +36,11 @@ pub enum ConnectionLifecycleError {
 fn into_connected_peer(
     connection: quinn::Connection,
 ) -> Result<ConnectedPeer, ConnectionLifecycleError> {
-    let peer_id = peer_identity_from_connection(&connection)
+    let transport_fingerprint = peer_identity_from_connection(&connection)
         .ok_or(ConnectionLifecycleError::MissingPeerIdentity)?;
     Ok(ConnectedPeer {
         connection,
-        peer_id,
+        peer_id: transport_fingerprint,
     })
 }
 

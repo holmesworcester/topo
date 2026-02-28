@@ -11,6 +11,7 @@ mod tests {
     use topo::event_modules::peer_shared::project_pure;
     use topo::event_modules::peer_shared::{PeerSharedFirstEvent, PeerSharedOngoingEvent};
     use crate::harness::fixtures::*;
+    use topo::crypto::spki_fingerprint_from_ed25519_pubkey;
     use topo::event_modules::ParsedEvent;
     use topo::projection::result::{EmitCommand, SqlVal, WriteOp};
 
@@ -74,6 +75,15 @@ mod tests {
             // public_key column should contain our key
             let pk_idx = columns.iter().position(|c| *c == "public_key").unwrap();
             assert_eq!(values[pk_idx], SqlVal::Blob(pk.to_vec()));
+            // transport_fingerprint is deterministic from public_key
+            let fp_idx = columns
+                .iter()
+                .position(|c| *c == "transport_fingerprint")
+                .unwrap();
+            assert_eq!(
+                values[fp_idx],
+                SqlVal::Blob(spki_fingerprint_from_ed25519_pubkey(&pk).to_vec())
+            );
             // user_event_id column should be base64 of our user event
             let ue_idx = columns.iter().position(|c| *c == "user_event_id").unwrap();
             assert_eq!(values[ue_idx], SqlVal::Text(b64(&user_eid)));

@@ -39,12 +39,14 @@ enum SessionOpenMode {
 #[derive(Clone)]
 pub struct SessionProvider {
     connection: TransportConnection,
+    /// Hex-encoded peer certificate SPKI fingerprint.
     peer_id: String,
     mode: SessionOpenMode,
 }
 
 /// One ready-to-run sync session from a [`SessionProvider`].
 pub struct SessionEnvelope {
+    /// Hex-encoded peer certificate SPKI fingerprint.
     pub peer_id: String,
     pub remote_addr: SocketAddr,
     pub session_id: u64,
@@ -61,6 +63,10 @@ impl SessionProvider {
     }
 
     pub fn peer_id(&self) -> &str {
+        &self.peer_id
+    }
+
+    pub fn transport_fingerprint(&self) -> &str {
         &self.peer_id
     }
 

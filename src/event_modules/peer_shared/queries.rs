@@ -139,6 +139,27 @@ pub fn first_event_id(
     .optional()
 }
 
+/// Resolve a projected peer_shared event_id by transport fingerprint.
+///
+/// Uses `(recorded_by, transport_fingerprint)` lookup to map transport identity
+/// back to canonical event-graph identity.
+pub fn resolve_event_id_by_transport_fingerprint(
+    db: &Connection,
+    recorded_by: &str,
+    transport_fingerprint: &[u8; 32],
+) -> Result<Option<String>, rusqlite::Error> {
+    db.query_row(
+        "SELECT event_id
+         FROM peers_shared
+         WHERE recorded_by = ?1
+           AND transport_fingerprint = ?2
+         LIMIT 1",
+        rusqlite::params![recorded_by, transport_fingerprint.as_slice()],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+}
+
 pub struct AccountRow {
     pub event_id: String,
     pub device_name: String,
@@ -219,4 +240,43 @@ pub fn identity(
         user_event_id,
         peer_shared_event_id,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::spki_fingerprint_from_ed25519_pubkey;
+    use crate::db::{open_in_memory, schema::create_tables};
+
+    #[test]
+    fn resolve_event_id_by_transport_fingerprint_uses_projected_index() {
+        let conn = open_in_memory().expect("open in-memory db");
+        create_tables(&conn).expect("create tables");
+
+        let recorded_by = "tenant-a";
+        let event_id = "ps-event-1";
+        let public_key: [u8; 32] = [0x11; 32];
+        let transport_fingerprint = spki_fingerprint_from_ed25519_pubkey(&public_key);
+
+        conn.execute(
+            "INSERT INTO peers_shared
+             (recorded_by, event_id, public_key, transport_fingerprint)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                recorded_by,
+                event_id,
+                public_key.as_slice(),
+                transport_fingerprint.as_slice(),
+            ],
+        )
+        .expect("insert peers_shared row");
+
+        let resolved = resolve_event_id_by_transport_fingerprint(
+            &conn,
+            recorded_by,
+            &transport_fingerprint,
+        )
+        .expect("resolve event id");
+        assert_eq!(resolved.as_deref(), Some(event_id));
+    }
 }

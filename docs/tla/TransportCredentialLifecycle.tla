@@ -41,17 +41,20 @@ EXTENDS FiniteSets
 \*
 \* CONSTANTS:
 \*   Peers — set of peer identifiers
-\*   SPKIs — set of abstract SPKI fingerprint values
+\*   SPKIs — set of abstract transport_fingerprint values (SPKI fingerprints)
+\*   PeerEvents — set of abstract peer_shared event ids
 
-CONSTANTS Peers, SPKIs
+CONSTANTS Peers, SPKIs, PeerEvents
 
-VARIABLES localCred, credSource, peerSharedTrust, bootstrapTrust, pendingBootstrapTrust, inviteCreator
+VARIABLES localCred, credSource, peerSharedTrust, bootstrapTrust, pendingBootstrapTrust, inviteCreator, peerSharedEventForSPKI
 
-vars == <<localCred, credSource, peerSharedTrust, bootstrapTrust, pendingBootstrapTrust, inviteCreator>>
+vars == <<localCred, credSource, peerSharedTrust, bootstrapTrust, pendingBootstrapTrust, inviteCreator, peerSharedEventForSPKI>>
 
 \* ---- Helper: "none" sentinel for absent credential ----
 None == "none"
+NoneEvent == "none_event"
 CredSources == {"none", "bootstrap", "peershared"}
+EventIds == PeerEvents \union {NoneEvent}
 
 \* ---- Derived operators ----
 
@@ -72,6 +75,25 @@ CanAuthenticate(p, q) ==
     /\ localCred[q] # None
     /\ localCred[q] \in TrustedSPKIs(p)
 
+\* Canonical mapping: projected peer_shared event id for a transport fingerprint.
+ResolvePeerSharedEvent(p, transportFingerprint) ==
+    peerSharedEventForSPKI[p][transportFingerprint]
+
+\* Ongoing-first / bootstrap-fallback dial preference.
+CanDialOngoing(p, q) ==
+    /\ localCred[q] # None
+    /\ localCred[q] \in peerSharedTrust[p]
+
+CanDialBootstrapFallback(p, q) ==
+    /\ localCred[q] # None
+    /\ ~CanDialOngoing(p, q)
+    /\ localCred[q] \in (bootstrapTrust[p] \union pendingBootstrapTrust[p])
+
+DialPreference(p, q) ==
+    IF CanDialOngoing(p, q) THEN "ongoing"
+    ELSE IF CanDialBootstrapFallback(p, q) THEN "bootstrap_fallback"
+    ELSE "deny"
+
 \* All SPKIs currently in use as active credentials.
 AllActiveCredentials == {localCred[p] : p \in Peers} \ {None}
 
@@ -84,6 +106,7 @@ TypeOK ==
         /\ peerSharedTrust[p] \subseteq SPKIs
         /\ bootstrapTrust[p] \subseteq SPKIs
         /\ pendingBootstrapTrust[p] \subseteq SPKIs
+        /\ peerSharedEventForSPKI[p] \in [SPKIs -> EventIds]
     /\ inviteCreator \in [SPKIs -> Peers \union {None}]
 
 \* ---- Init ----
@@ -95,6 +118,7 @@ Init ==
     /\ bootstrapTrust = [p \in Peers |-> {}]
     /\ pendingBootstrapTrust = [p \in Peers |-> {}]
     /\ inviteCreator = [s \in SPKIs |-> None]
+    /\ peerSharedEventForSPKI = [p \in Peers |-> [s \in SPKIs |-> NoneEvent]]
 
 \* ---- Actions ----
 
@@ -107,7 +131,7 @@ InstallBootstrapCred(p, s) ==
     /\ s \notin (AllActiveCredentials \ {localCred[p]})
     /\ localCred' = [localCred EXCEPT ![p] = s]
     /\ credSource' = [credSource EXCEPT ![p] = "bootstrap"]
-    /\ UNCHANGED <<peerSharedTrust, bootstrapTrust, pendingBootstrapTrust, inviteCreator>>
+    /\ UNCHANGED <<peerSharedTrust, bootstrapTrust, pendingBootstrapTrust, inviteCreator, peerSharedEventForSPKI>>
 
 \* 2. InstallPeerSharedCred(p, s)
 \*    Deterministic cert install from PeerShared signer material.
@@ -117,16 +141,18 @@ InstallPeerSharedCred(p, s) ==
     /\ s \notin (AllActiveCredentials \ {localCred[p]})
     /\ localCred' = [localCred EXCEPT ![p] = s]
     /\ credSource' = [credSource EXCEPT ![p] = "peershared"]
-    /\ UNCHANGED <<peerSharedTrust, bootstrapTrust, pendingBootstrapTrust, inviteCreator>>
+    /\ UNCHANGED <<peerSharedTrust, bootstrapTrust, pendingBootstrapTrust, inviteCreator, peerSharedEventForSPKI>>
 
-\* 3. AddPeerSharedTrust(p, s)
+\* 3. AddPeerSharedTrust(p, s, e)
 \*    Steady-state trust derived from a valid PeerShared event.
 \*    Automatically supersedes matching bootstrap and pending bootstrap entries.
-\*    Rust: peer_shared_spki_fingerprints() + supersede_*_if_peer_shared_trust_exists().
-AddPeerSharedTrust(p, s) ==
+\*    Rust: peers_shared.transport_fingerprint index stores (transport_fingerprint -> event_id).
+AddPeerSharedTrust(p, s, e) ==
     /\ s \in SPKIs
+    /\ e \in PeerEvents
     /\ s \notin peerSharedTrust[p]
     /\ peerSharedTrust' = [peerSharedTrust EXCEPT ![p] = @ \union {s}]
+    /\ peerSharedEventForSPKI' = [peerSharedEventForSPKI EXCEPT ![p][s] = e]
     \* Supersede: remove from bootstrap and pending if present
     /\ bootstrapTrust' = [bootstrapTrust EXCEPT ![p] = @ \ {s}]
     /\ pendingBootstrapTrust' = [pendingBootstrapTrust EXCEPT ![p] = @ \ {s}]
@@ -141,7 +167,7 @@ AddBootstrapTrust(p, s) ==
     /\ s \notin peerSharedTrust[p]
     /\ s \notin bootstrapTrust[p]
     /\ bootstrapTrust' = [bootstrapTrust EXCEPT ![p] = @ \union {s}]
-    /\ UNCHANGED <<localCred, credSource, peerSharedTrust, pendingBootstrapTrust, inviteCreator>>
+    /\ UNCHANGED <<localCred, credSource, peerSharedTrust, pendingBootstrapTrust, inviteCreator, peerSharedEventForSPKI>>
 
 \* 5a. CreateInvite(p, s)
 \*    Inviter creates an invite, establishing ownership of the invite SPKI.
@@ -151,7 +177,7 @@ CreateInvite(p, s) ==
     /\ s \in SPKIs
     /\ inviteCreator[s] = None
     /\ inviteCreator' = [inviteCreator EXCEPT ![s] = p]
-    /\ UNCHANGED <<localCred, credSource, peerSharedTrust, bootstrapTrust, pendingBootstrapTrust>>
+    /\ UNCHANGED <<localCred, credSource, peerSharedTrust, bootstrapTrust, pendingBootstrapTrust, peerSharedEventForSPKI>>
 
 \* 5b. AddPendingBootstrapTrust(p, s)
 \*    Inviter-side pending bootstrap trust.
@@ -164,7 +190,7 @@ AddPendingBootstrapTrust(p, s) ==
     /\ s \notin peerSharedTrust[p]
     /\ s \notin pendingBootstrapTrust[p]
     /\ pendingBootstrapTrust' = [pendingBootstrapTrust EXCEPT ![p] = @ \union {s}]
-    /\ UNCHANGED <<localCred, credSource, peerSharedTrust, bootstrapTrust, inviteCreator>>
+    /\ UNCHANGED <<localCred, credSource, peerSharedTrust, bootstrapTrust, inviteCreator, peerSharedEventForSPKI>>
 
 \* 6. ExpireBootstrapTrust(p, s)
 \*    TTL expiry of accepted bootstrap trust.
@@ -172,7 +198,7 @@ AddPendingBootstrapTrust(p, s) ==
 ExpireBootstrapTrust(p, s) ==
     /\ s \in bootstrapTrust[p]
     /\ bootstrapTrust' = [bootstrapTrust EXCEPT ![p] = @ \ {s}]
-    /\ UNCHANGED <<localCred, credSource, peerSharedTrust, pendingBootstrapTrust, inviteCreator>>
+    /\ UNCHANGED <<localCred, credSource, peerSharedTrust, pendingBootstrapTrust, inviteCreator, peerSharedEventForSPKI>>
 
 \* 7. ExpirePendingBootstrapTrust(p, s)
 \*    TTL expiry of pending bootstrap trust.
@@ -180,7 +206,7 @@ ExpireBootstrapTrust(p, s) ==
 ExpirePendingBootstrapTrust(p, s) ==
     /\ s \in pendingBootstrapTrust[p]
     /\ pendingBootstrapTrust' = [pendingBootstrapTrust EXCEPT ![p] = @ \ {s}]
-    /\ UNCHANGED <<localCred, credSource, peerSharedTrust, bootstrapTrust, inviteCreator>>
+    /\ UNCHANGED <<localCred, credSource, peerSharedTrust, bootstrapTrust, inviteCreator, peerSharedEventForSPKI>>
 
 \* 8. RemovePeerSharedTrust(p, s)
 \*    Removal of steady-state trust (e.g. peer_removed projection).
@@ -188,6 +214,7 @@ ExpirePendingBootstrapTrust(p, s) ==
 RemovePeerSharedTrust(p, s) ==
     /\ s \in peerSharedTrust[p]
     /\ peerSharedTrust' = [peerSharedTrust EXCEPT ![p] = @ \ {s}]
+    /\ peerSharedEventForSPKI' = [peerSharedEventForSPKI EXCEPT ![p][s] = NoneEvent]
     /\ UNCHANGED <<localCred, credSource, bootstrapTrust, pendingBootstrapTrust, inviteCreator>>
 
 \* ---- Next-state relation ----
@@ -196,13 +223,14 @@ Next ==
     \/ \E p \in Peers, s \in SPKIs :
         \/ InstallBootstrapCred(p, s)
         \/ InstallPeerSharedCred(p, s)
-        \/ AddPeerSharedTrust(p, s)
         \/ AddBootstrapTrust(p, s)
         \/ CreateInvite(p, s)
         \/ AddPendingBootstrapTrust(p, s)
         \/ ExpireBootstrapTrust(p, s)
         \/ ExpirePendingBootstrapTrust(p, s)
         \/ RemovePeerSharedTrust(p, s)
+    \/ \E p \in Peers, s \in SPKIs, e \in PeerEvents :
+        AddPeerSharedTrust(p, s, e)
 
 \* ---- Specification ----
 
@@ -264,5 +292,22 @@ InvCredentialSourceConsistency ==
     \A p \in Peers :
         /\ (localCred[p] = None) <=> (credSource[p] = "none")
         /\ (credSource[p] # "none") => (localCred[p] # None)
+
+\* Inv9: PeerShared trust and transport_fingerprint→event_id index are exact.
+InvPeerSharedIndexExact ==
+    \A p \in Peers, s \in SPKIs :
+        (ResolvePeerSharedEvent(p, s) # NoneEvent) <=> (s \in peerSharedTrust[p])
+
+\* Inv10: Ongoing cert trust is preferred whenever available.
+InvOngoingPreferredWhenAvailable ==
+    \A p, q \in Peers :
+        CanDialOngoing(p, q) => DialPreference(p, q) = "ongoing"
+
+\* Inv11: Bootstrap dial is fallback-only (used only when ongoing is unavailable).
+InvBootstrapFallbackOnlyWhenNeeded ==
+    \A p, q \in Peers :
+        DialPreference(p, q) = "bootstrap_fallback"
+        => /\ ~CanDialOngoing(p, q)
+           /\ localCred[q] \in (bootstrapTrust[p] \union pendingBootstrapTrust[p])
 
 ====

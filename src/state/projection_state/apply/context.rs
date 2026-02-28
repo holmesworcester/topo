@@ -80,6 +80,7 @@ pub(crate) fn build_context_snapshot(
 
     // Local-create flag — needed by invite events to gate pending trust emission.
     // Only locally-created invite events should emit WritePendingBootstrapTrust.
+    // `recorded_events.source` historically used both "local" and "local_create".
     match parsed {
         ParsedEvent::UserInviteBoot(_)
         | ParsedEvent::DeviceInviteFirst(_) => {
@@ -88,7 +89,7 @@ pub(crate) fn build_context_snapshot(
                 rusqlite::params![recorded_by, event_id_b64],
                 |row| row.get::<_, String>(0),
             ) {
-                Ok(source) => source == "local",
+                Ok(source) => source == "local" || source == "local_create",
                 Err(_) => false,
             };
         }

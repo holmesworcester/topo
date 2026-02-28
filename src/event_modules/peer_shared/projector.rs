@@ -19,13 +19,22 @@ pub fn project_pure(
     };
 
     let user_event_id_b64 = event_id_to_base64(user_event_id);
+    let transport_fingerprint = crate::crypto::spki_fingerprint_from_ed25519_pubkey(public_key);
     let ops = vec![WriteOp::InsertOrIgnore {
         table: "peers_shared",
-        columns: vec!["recorded_by", "event_id", "public_key", "user_event_id", "device_name"],
+        columns: vec![
+            "recorded_by",
+            "event_id",
+            "public_key",
+            "transport_fingerprint",
+            "user_event_id",
+            "device_name",
+        ],
         values: vec![
             SqlVal::Text(recorded_by.to_string()),
             SqlVal::Text(event_id_b64.to_string()),
             SqlVal::Blob(public_key.to_vec()),
+            SqlVal::Blob(transport_fingerprint.to_vec()),
             SqlVal::Text(user_event_id_b64),
             SqlVal::Text(device_name.to_string()),
         ],
