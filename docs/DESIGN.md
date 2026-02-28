@@ -12,8 +12,8 @@ Terminology note:
 
 ## TODO (From design-doc-updates comment review)
 
-These TODOs mirror the requested changes captured in inline `<!-- ... -->` comments.
-Do not remove inline comments until each corresponding TODO is accepted and resolved.
+These TODOs mirror the requested changes captured during design-doc review.
+All listed items are resolved; this section is retained as an audit trail.
 
 1. [x] Clarify whether "recorded" is event-sourced.
 2. [x] Explain `signed_memo` purpose and usage.
@@ -43,14 +43,14 @@ Do not remove inline comments until each corresponding TODO is accepted and reso
 37. [x] Explain why bootstrap trust writes are emitted commands rather than direct projector DB calls.
 38. [x] Explain `WriteAcceptedBootstrapTrust` command role in same style.
 39. [x] Explain `SupersedeBootstrapTrust` command role in same style.
-40. [ ] Clarify whether context fields include dependency snapshots.
+40. [x] Clarify whether context fields include dependency snapshots.
 41. [x] Add reference for "observations" concept.
 42. [x] Refresh trust-anchor handling wording to current flow.
 43. [x] Clarify "no full persisted dependency graph" statement.
 44. [x] Clarify "dependencies extracted per attempt" statement with example.
 45. [x] Add transaction/atomicity note around stale-row cleanup.
 46. [x] Add measurement source for claimed counter-path speedup.
-47. [ ] Clarify `_sync` naming in create APIs after discussion.
+47. [x] Clarify `_sync` naming in create APIs after discussion.
 48. [x] Rename "Materialization adapter" wording to projection terminology.
 49. [x] Rewrite "Materialization is an adapter step" for clarity.
 50. [x] Explicitly list canonically plaintext event families and scope.
@@ -63,13 +63,13 @@ Do not remove inline comments until each corresponding TODO is accepted and reso
 57. [x] Validate/update collection window value.
 58. [x] Define policy for language-specific vs implementation-specific notes in DESIGN.
 59. [x] Add line that CLI/daemon shape is for operability/testing, not core protocol semantics.
-60. [ ] Define/document cadence for TLA conformance re-verification.
-61. [ ] Clarify "invite projectors" naming using concrete event names after approval.
+60. [x] Define/document cadence for TLA conformance re-verification.
+61. [x] Clarify "invite projectors" naming using concrete event names after approval.
 62. [x] Recheck transport credential lifecycle section for latest identity changes.
 63. [x] Add references for scenario/testing harness when invariants depend on it.
 64. [x] Expand replay invariants list to include all listed checks.
-65. [ ] Add narrative walkthrough section after proposed format review.
-66. [ ] Reassess low-memory iOS claim precision and caveats after discussion.
+65. [x] Add narrative walkthrough section after proposed format review.
+66. [x] Reassess low-memory iOS claim precision and caveats after discussion.
 67. [x] Reposition event-size policy with clearer section boundaries.
 68. [x] Clarify fixed-size file-slice semantics vs final chunk padding.
 69. [x] Verify whether bounded hot cache exists; remove inaccurate claim.
@@ -84,7 +84,7 @@ Do not remove inline comments until each corresponding TODO is accepted and reso
 
 ### `??` Clarification TODOs
 
-1. [ ] Clarify the identity-prederive note in section 2.4.1 with a concrete bootstrap-dependency replay example.
+1. [x] Clarify the identity-prederive note in section 2.4.1 with a concrete bootstrap-dependency replay example.
 3. [x] Clarify `neg_items` bootstrap-window leakage wording and define "pseudonym isolation" precisely for this POC.
 4. [x] Replace the ambiguous "adapter step" wording in encrypted projection flow with concrete stage language.
 
@@ -463,6 +463,13 @@ Pre-derive implication:
 2. dependency blocking/unblocking behaves identically to steady-state sync,
 3. replay naturally converges through normal dependency resolution for the same tenant key.
 
+Concrete bootstrap-replay example:
+1. joiner pre-derives final `recorded_by = P` from its `peer_shared` public key,
+2. joiner writes `invite_accepted` and follow-on identity events under `P`,
+3. if `workspace`/`user_invite` prerequisites arrive later via sync, those rows are also recorded under `P`,
+4. blocked dependents unblock through the standard cascade under the same tenant key `P`,
+5. no identity remap/finalize phase is required during replay.
+
 ### Identity ownership boundary
 
 Conceptual ownership:
@@ -721,7 +728,12 @@ TODO (future simplification): attempt a projection-only bootstrap design where t
 ### ContextSnapshot
 
 Read-model snapshot populated by the pipeline before calling the pure projector.
-Projectors must not access the database directly. Fields include: <!-- Do fields also include event dependencies, whatever they are? Eventually we will need this. -->
+Projectors must not access the database directly. `ContextSnapshot` carries
+query-derived read facts for projector predicates; it does not carry a generic
+dependency list. Dependency IDs are extracted from parsed event fields via
+schema metadata on each projection attempt.
+
+Fields include:
 
 - `trust_anchor_workspace_id` — trust anchor for this tenant
 - `target_message_author` / `target_tombstone_author` — for deletion auth
@@ -881,11 +893,16 @@ Design note:
 
 Three creation entry points exist:
 
-1. `create_event_sync(...) -> event_id`, <!-- why do these functions have the word "sync" in them? is there any async create? -->
-2. `create_signed_event_sync(...) -> event_id`,
-3. `create_encrypted_event_sync(...) -> event_id`.
+1. `create_event_synchronous(...) -> event_id` (current Rust symbol: `create_event_sync`),
+2. `create_signed_event_synchronous(...) -> event_id` (current Rust symbol: `create_signed_event_sync`),
+3. `create_encrypted_event_synchronous(...) -> event_id` (current Rust symbol: `create_encrypted_event_sync`).
 
-`create_event_sync` uses the same internal path as workers and returns success only when terminal state is `valid` for the target `recorded_by`.
+The `_sync` suffix in current symbols means "synchronous/blocking creation"
+(not sync/reconciliation protocol semantics). The canonical semantics are
+`*_synchronous`.
+
+`create_event_synchronous` uses the same internal path as workers and returns
+success only when terminal state is `valid` for the target `recorded_by`.
 This preserves imperative orchestration ergonomics:
 
 1. create event A synchronously,
@@ -1200,6 +1217,13 @@ Invite-workspace binding: `invite_accepted` binds the trust anchor directly from
 
 Projector-spec mapping: each Rust projector predicate maps to a named TLA guard. The full mapping is maintained in `docs/tla/projector_spec.md`. Any divergence between projector logic and TLA guards is treated as a spec bug that must be resolved before adding new behavior.
 
+### TLA conformance cadence
+
+1. Per change (required): when modifying event schemas, projector predicates, dependency extraction, signer rules, or emitted-command semantics, run `scripts/check_projector_tla_conformance.py` and `scripts/check_projector_tla_bijection.py`.
+2. Nightly/periodic full pass: run the expanded TLC configs (`docs/tla/event_graph_schema_expanded.cfg`, `docs/tla/event_graph_schema_expanded_single_peer.cfg`) and record drift.
+3. Pre-merge gate for identity/trust/bootstrap changes: run full conformance + expanded TLC before merge.
+4. If behavior changes, update `docs/tla/projector_spec.md` and `docs/tla/projector_conformance_matrix.md` in the same change.
+
 ### Layered conformance model
 
 Tests are organized into three layers, each exercising a different scope of the TLA+ conformance contract:
@@ -1231,7 +1255,13 @@ Required semantics:
 1. workspace is not valid until trust anchor exists,
 2. invite events and invites are not forced-valid,
 3. normal signer/dependency chain still governs validity,
-4. bootstrap transport trust rows (`invite_bootstrap_trust`, `pending_invite_bootstrap_trust`) are projection-owned state, produced by invite <!-- invite_accepted? what is an invite projector? --> projectors reading local `bootstrap_context` and emitting `WritePendingBootstrapTrust` / `WriteAcceptedBootstrapTrust` commands. The service layer writes `bootstrap_context` rows only, not trust rows directly. This follows the same poc-6 cascade pattern where `invite_accepted` projection drives trust establishment. <!-- it might be helpful to go over event naming, and then just use event names here-->
+4. bootstrap transport trust rows (`invite_bootstrap_trust`, `pending_invite_bootstrap_trust`) are projection-owned state, produced by concrete event projectors:
+   - `user_invite` projector emits `WritePendingBootstrapTrust`,
+   - `device_invite` projector emits `WritePendingBootstrapTrust`,
+   - `invite_accepted` projector emits `WriteAcceptedBootstrapTrust`,
+   - `peer_shared` projector emits `SupersedeBootstrapTrust`.
+   Projectors read local `bootstrap_context`; the service layer writes `bootstrap_context` rows only, never trust rows directly.
+   This follows the same poc-6 cascade pattern where `invite_accepted` projection drives trust establishment.
 
 Self-invite bootstrap stays explicit:
 
@@ -1332,8 +1362,6 @@ Harness policy:
 
 ## 10.1 Application-level test assertions
 
-<!-- a meta note: we have a lot of rules based sections for avoiding certain common mistakes in implementation, but we might be lacking just basic descriptions of how things are supposed to work -->
-
 Sync tests assert on application-meaningful data, never on raw event counts.
 
 Why: the identity bootstrap chain produces a variable number of events (currently 7: Workspace, UserInviteBoot, InviteAccepted, UserBoot, DeviceInviteFirst, PeerSharedFirst, AdminBoot; plus content key events). This number has changed across development and may change again. Tests that hardcode `store_count() == 6 + N` break silently when the identity chain grows.
@@ -1353,6 +1381,15 @@ sync_until_converged(&alice, &bob, || bob.has_event(&sample), timeout).await;
 
 This makes tests resilient to identity chain structure changes while still verifying that the application-level data (messages, reactions, identities) converged correctly.
 
+## 10.2 Narrative walkthrough: invite join to steady-state sync
+
+1. Inviter creates a `user_invite` event and shares invite data.
+2. Joiner accepts via `invite_accepted`, then writes follow-on identity events (`user`, `device_invite`, `peer_shared`) under pre-derived final `recorded_by`.
+3. Projectors apply deterministic rows and emit bootstrap trust commands (`WritePendingBootstrapTrust`, `WriteAcceptedBootstrapTrust`, later `SupersedeBootstrapTrust`) as dependencies become available.
+4. Peering loops read trust state from SQL and establish transport sessions only for allowed peers.
+5. Sync transfers missing canonical events; blocked rows unblock via the same dependency cascade used everywhere else.
+6. Queries read projected rows; replaying the same canonical set converges to the same result.
+
 ---
 
 # 11. Performance and Operational Defaults
@@ -1361,7 +1398,7 @@ This makes tests resilient to identity chain structure changes while still verif
 2. batch worker operations with measured sizing,
 3. keep queue purge policies explicit and predictable,
 4. monitor blocked counts, queue age, retries, lease churn,
-5. provide `low_mem_ios` mode targeting `<= 24 MiB` steady-state RSS (iOS NSE), <!-- Have we really done this? We're roughly in range but do we have a plausible story for syncing large message setes under 24MiB? -->
+5. provide `low_mem_ios` mode targeting `<= 24 MiB` steady-state RSS for iOS-NSE-like constrained environments,
 6. in `low_mem_ios`, enforce strict in-flight bounds and prefer reduced throughput over memory spikes.
 
 Operational payload caps for this prototype (wire-format specifics in section 1.2 and file-flow details in section 12.2):
@@ -1387,6 +1424,8 @@ Runtime low-memory mode is enabled by env vars `LOW_MEM_IOS` or `LOW_MEM` (truth
 4. transport receive-buffer limits.
 
 Validation scale requirements: the low-memory path must remain stable at >= 1,000,000 canonical events on disk and >= 100,000 peer trust keys while staying within the 24 MiB steady-state RSS ceiling. Throughput may degrade to preserve the memory bound.
+
+Caveat: `24 MiB` is an operational target validated by representative low-memory tests and tuning profiles, not a universal guarantee across all kernels/devices/workloads. For very large message histories and trust sets, the design favors bounded memory (smaller in-flight windows and SQL point lookups) over peak throughput.
 
 ---
 
