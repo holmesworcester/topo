@@ -160,11 +160,13 @@ Conceptually:
 
 Transport cert/key materialization is isolated behind a typed contract:
 
-- **`TransportIdentityIntent`** (enum): describes *what* identity change is needed (PeerShared-derived install).
-- **`TransportIdentityAdapter`** (trait): executes the intent against the DB. The sole concrete implementation (`ConcreteTransportIdentityAdapter` in `src/transport/identity_adapter.rs`) is the **only** code that calls the raw install function (`install_peer_key_transport_identity`).
+- **`TransportIdentityIntent`** (enum): describes *what* identity change is needed (`InstallBootstrapIdentityFromInviteKey` or `InstallPeerSharedIdentityFromSigner`).
+- **`TransportIdentityAdapter`** (trait): executes the intent against the DB. The sole concrete implementation (`ConcreteTransportIdentityAdapter` in `src/transport/identity_adapter.rs`) is the **only** code that calls raw install functions (`install_invite_bootstrap_transport_identity`, `install_peer_key_transport_identity`).
+- **Workspace command layer** (`accept_invite` / `accept_device_link`) installs invite-derived bootstrap identity via the adapter intent path (not raw transport calls).
 - **Event modules** emit `ApplyTransportIdentityIntent` commands (e.g., `local_signer_secret` projector for PeerShared signers).
 - **Projection pipeline** (`write_exec.rs`) routes intents through the adapter.
-- **Workspace command layer** calls `install_peer_key_transport_identity` directly with the invite key to install the bootstrap transport identity during `accept_invite` / `accept_device_link`. The PeerShared-derived identity replaces it later via projection cascade.
+- **Downgrade guard**: bootstrap install is rejected once a PeerShared-derived identity has been installed (`BootstrapAfterPeerSharedDenied`), enforcing one-way transition.
+- **Credential source tracking**: `local_transport_creds.source` records `random | bootstrap | peershared` for runtime guard checks and diagnostics.
 - **Boundary enforcement**: `scripts/check_boundary_imports.sh` prevents raw install calls from leaking into `service.rs`, `event_modules/`, or `projection/`.
 
 ## 2.3 Event-graph identity binding
@@ -365,7 +367,7 @@ FROM trust_anchors t
 JOIN local_transport_creds c ON t.peer_id = c.peer_id
 ```
 
-`trust_anchors` is populated by `invite_accepted` (local-only, part of the identity bootstrap). `local_transport_creds` is populated during identity bootstrap (cert derived from PeerShared Ed25519 key). Any identity that has both a workspace binding and TLS material is a local tenant.
+`trust_anchors` is populated by `invite_accepted` (local-only, part of the identity bootstrap). `local_transport_creds` is populated during identity bootstrap: invite acceptance may install an invite-derived bootstrap cert first, then projection installs the PeerShared-derived cert. Any identity that has both a workspace binding and TLS material is a local tenant.
 
 ### Node daemon architecture
 
@@ -410,7 +412,7 @@ This eliminates write contention while preserving per-tenant projection isolatio
 
 ### TLS credential storage
 
-Transport cert/key DER blobs live exclusively in the `local_transport_creds` SQLite table. No cert files exist on disk. Credentials are stored during identity bootstrap and loaded at endpoint creation time. This keeps all node state in one database file.
+Transport cert/key DER blobs live exclusively in the `local_transport_creds` SQLite table (with `source` marker: `random | bootstrap | peershared`). No cert files exist on disk. Credentials are stored during identity bootstrap and loaded at endpoint creation time. Bootstrap identity install is one-way gated: after a PeerShared install, bootstrap install is denied. This keeps all node state in one database file.
 
 ## 3.2.2 LAN peer discovery (mDNS/DNS-SD)
 
@@ -1049,6 +1051,8 @@ This eliminates raw PSK bootstrap inputs; all key acquisition flows through the 
 
 This section covers the lifecycle state machine for the three trust sources: PeerShared-derived SPKIs (steady-state), `invite_bootstrap_trust`, and `pending_invite_bootstrap_trust`. The `transport_keys` table is populated by TransportKey event projection but is **not** consulted for trust decisions.
 
+Credential transition model: invite acceptance may install a bootstrap transport cert first; projection later installs the PeerShared-derived cert. Runtime enforces one-way transition (no bootstrap-after-PeerShared downgrade).
+
 Supersession: when a PeerShared event is projected, the PeerShared projector emits a `SupersedeBootstrapTrust` command that marks matching `invite_bootstrap_trust` and `pending_invite_bootstrap_trust` entries as superseded. This happens at projection time, not on trust check reads — trust check reads (`is_peer_allowed`, `allowed_peers_from_db`) are pure queries with no write side-effects.
 
 TTL expiry: bootstrap trust rows are time-bounded. Unconsumed entries expire and are purged.
@@ -1057,14 +1061,15 @@ Removal cascade: `peer_removed` cascades trust removal across all three sources 
 
 Invite ownership: `inviteCreator` tracks which peer created each invite SPKI. Only the invite creator (inviter) may materialize pending bootstrap trust — the joiner must not emit `WritePendingBootstrapTrust` when syncing the invite event. This is enforced by the `is_local_create` flag in `ContextSnapshot`, populated from `recorded_events.source`. The TLA+ model captures this via the `inviteCreator[s] = p` guard on `AddPendingBootstrapTrust` and the `InvPendingTrustOnlyOnInviter` invariant.
 
-TLC-verified invariants (from `TransportCredentialLifecycle.tla`, POC-simplified single-credential-per-peer model, mapped to Rust checks in `docs/tla/projector_spec.md`):
+TLC-verified invariants (from `TransportCredentialLifecycle.tla`, mapped to Rust checks in `docs/tla/projector_spec.md`):
 1. `InvSPKIUniqueness` — no two peers share an active SPKI,
 2. `InvBootstrapConsumedByPeerShared` — bootstrap trust disjoint from PeerShared trust,
 3. `InvPendingConsumedByPeerShared` — pending trust disjoint from PeerShared trust,
 4. `InvTrustSetIsExactUnion` — trust set is exact union of three sources,
 5. `InvTrustSourcesWellFormed` — all trust sets contain valid SPKIs,
 6. `InvMutualAuthSymmetry` — mutual auth requires both peers have credentials,
-7. `InvPendingTrustOnlyOnInviter` — pending trust exists only on invite creator's store.
+7. `InvPendingTrustOnlyOnInviter` — pending trust exists only on invite creator's store,
+8. `InvCredentialSourceConsistency` — credential presence and source are consistent across bootstrap→PeerShared transition.
 
 Abstract boundary: TLS handshake and session-key derivation remain unmodeled. The TLA spec covers trust-source state transitions but not the cryptographic session establishment that consumes them.
 
