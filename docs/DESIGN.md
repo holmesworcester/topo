@@ -176,7 +176,7 @@ Transport identity is derived from event-layer peer identity:
 1. **Transport identity** (mTLS scope): cert/key material, SPKI fingerprints, `peer_id` derived from BLAKE2b-256 of X.509 SPKI. Managed by `src/runtime/transport/identity.rs` via `src/runtime/transport/identity_adapter.rs`.
 2. **Event-graph identity** (identity layer scope): Ed25519 keys, signer chains, trust anchors, and identity events (types 8-22). Owned by event modules (for example `src/event_modules/workspace/*`, `src/event_modules/invite_accepted.rs`, `src/event_modules/peer_shared/*`, `src/event_modules/local_signer_secret.rs`) and executed through the generic projection pipeline (`src/state/projection_state/apply/*`).
 
-Transport certs are deterministically derived from PeerShared Ed25519 signing keys, so the two identity scopes are unified. `TransportKey` events (type 23) are legacy, deprecated, and scheduled for removal; when present they remain parseable but are **not** authoritative for trust decisions. All steady-state transport trust is derived from PeerShared Ed25519 public keys via `spki_fingerprint_from_ed25519_pubkey()`.
+Transport certs are deterministically derived from PeerShared Ed25519 signing keys, so the two identity scopes are unified. All transport trust is derived from PeerShared Ed25519 public keys via `spki_fingerprint_from_ed25519_pubkey()`.
 
 ## 2.1 QUIC + mTLS
 
@@ -1232,7 +1232,7 @@ All key acquisition flows through the same event-backed wrap/unwrap path.
 
 ## 9.5 Transport credential lifecycle model
 
-This section covers the lifecycle state machine for the three trust sources: PeerShared-derived SPKIs (steady-state), `invite_bootstrap_trust`, and `pending_invite_bootstrap_trust`. The `transport_keys` table may still be populated by legacy TransportKey event projection, but it is deprecated/scheduled for removal and is **not** consulted for trust decisions.
+This section covers the lifecycle state machine for the three trust sources: PeerShared-derived SPKIs (steady-state), `invite_bootstrap_trust`, and `pending_invite_bootstrap_trust`.
 
 Credential transition model: invite acceptance may install a bootstrap transport cert first; projection later installs the PeerShared-derived cert. Runtime enforces one-way transition (no bootstrap-after-PeerShared downgrade).
 
@@ -1489,7 +1489,7 @@ RPC query handlers (`src/runtime/control/rpc/server.rs`) call event-module query
 - `RpcMethod::Reactions` -> `reaction::list`
 - `RpcMethod::Users` -> `user::list_items`
 - `RpcMethod::Workspaces` -> `workspace::list_items`
-- `RpcMethod::Keys` -> `workspace::keys` (which aggregates `user`, `peer_shared`, `admin`, and `transport_key` counts)
+- `RpcMethod::Keys` -> `workspace::keys` (which aggregates `user`, `peer_shared`, and `admin` counts)
 
 ## 14.4 Module split rule
 
