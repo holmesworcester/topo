@@ -489,36 +489,13 @@ pub fn is_peer_allowed(
 
 /// Count the total number of distinct trusted peer fingerprints from SQL
 /// trust sources (PeerShared-derived SPKIs + accepted/pending invite bootstrap trust).
-/// Returns the deduplicated count without materializing the full set.
 pub fn trusted_peer_count(
     conn: &Connection,
     recorded_by: &str,
 ) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
     // Supersession is handled at projection time via PeerShared writes.
     // Trust check reads are pure.
-    let now = now_ms_i64();
-    let bootstrap_count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM (
-            SELECT DISTINCT bootstrap_spki_fingerprint AS spki_fingerprint
-              FROM invite_bootstrap_trust
-              WHERE recorded_by = ?1
-                AND length(bootstrap_spki_fingerprint) = 32
-                AND superseded_at IS NULL
-                AND expires_at > ?2
-            UNION
-            SELECT DISTINCT expected_bootstrap_spki_fingerprint AS spki_fingerprint
-              FROM pending_invite_bootstrap_trust
-              WHERE recorded_by = ?1
-                AND length(expected_bootstrap_spki_fingerprint) = 32
-                AND superseded_at IS NULL
-                AND expires_at > ?2
-        )",
-        rusqlite::params![recorded_by, now],
-        |row| row.get(0),
-    )?;
-    let peer_shared_count = peer_shared_spki_fingerprints(conn, recorded_by)?.len() as i64;
-    // Approximate: doesn't dedupe across sources but sufficient for trust checks
-    Ok(bootstrap_count + peer_shared_count)
+    Ok(allowed_peers_from_db(conn, recorded_by)?.len() as i64)
 }
 
 /// Check whether any trusted peer fingerprints exist in SQL trust sources
@@ -1198,6 +1175,41 @@ mod tests {
 
         // Cross-tenant isolation: different recorded_by sees 0
         assert_eq!(trusted_peer_count(&conn, "other_peer").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_trusted_peer_count_dedupes_overlap_across_sources() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+
+        let recorded_by = "count_dedupe";
+        let pubkey: [u8; 32] = [0x42; 32];
+        let spki = insert_peer_shared(&conn, recorded_by, "ps-overlap", &pubkey);
+
+        record_invite_bootstrap_trust(
+            &conn,
+            recorded_by,
+            "ia-overlap",
+            "invite-overlap",
+            "ws-overlap",
+            "127.0.0.1:4433",
+            &spki,
+        )
+        .unwrap();
+        record_pending_invite_bootstrap_trust(
+            &conn,
+            recorded_by,
+            "invite-overlap-pending",
+            "ws-overlap",
+            &spki,
+        )
+        .unwrap();
+
+        assert_eq!(
+            trusted_peer_count(&conn, recorded_by).unwrap(),
+            1,
+            "same fingerprint in peers_shared + bootstrap rows should count once"
+        );
     }
 
     #[test]
