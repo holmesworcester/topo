@@ -555,7 +555,7 @@ Same-host daemon discovery: when two daemons run on the same machine bound to `1
 The production peering runtime follows a single conceptual loop:
 
 1. **Projected SQLite state**: invite_bootstrap_trust rows, PeerShared-derived trust, endpoint observations.
-2. **Target planner** (`runtime::peering::target_planner`): single-owner module for all dial target planning. Collects bootstrap trust targets from SQL and mDNS discovery candidates. Routes both through `PeerDispatcher` for deduplication and reconnect management.
+2. **Target planner** (`runtime::peering::engine::target_planner`): single-owner module for all dial target planning. Collects bootstrap trust targets from SQL and mDNS discovery candidates. Routes both through `PeerDispatcher` for deduplication and reconnect management.
 3. **Supervisor layer**: startup preflight + loop orchestration live in the peering supervisor.
 4. **Dial/accept loops**: `connect_loop` (outbound) and `accept_loop` (inbound) are separate long-running loops coordinated by shared projected state and cancellation/watch channels. QUIC dial/accept + peer identity extraction flows through `transport::connection_lifecycle`, and stream wiring flows through `transport::session_factory`.
 5. **Sync session runner** (`SyncSessionHandler`): protocol-agnostic session handler invoked via the `SessionHandler` contract.
@@ -564,7 +564,7 @@ The production peering runtime follows a single conceptual loop:
 
 ### Module ownership
 
-- **Target planning**: `src/runtime/peering/target_planner.rs` — the single source of truth for dial target decisions. Bootstrap autodial and mDNS discovery both route through this module.
+- **Target planning**: `src/runtime/peering/engine/target_planner.rs` — the single source of truth for dial target decisions. Bootstrap autodial and mDNS discovery both route through this module.
 - **Transport connection lifecycle**: `src/runtime/transport/connection_lifecycle.rs` — sole owner of QUIC `connect/accept` and TLS peer identity extraction for peering paths (`dial_peer`, `accept_peer`).
 - **Transport session factory**: `src/runtime/transport/session_factory.rs` — sole owner of QUIC stream opening and `DualConnection` / `QuicTransportSessionIo` construction. Provides `open_session_io()` and `accept_session_io()` that return `(session_id, Box<dyn TransportSessionIo>)`.
 - **Transport session I/O adapter**: `src/runtime/transport/transport_session_io.rs` — sole owner of frame boundary validation (`parse_frame` exact-consumption), max-frame-size enforcement, and mapping between QUIC stream errors and `TransportSessionIoError`.
@@ -1344,7 +1344,7 @@ Trust and key sets use SQL indexed point lookups, not full in-memory loading. Th
 
 There is no dedicated unbounded in-memory trust/key hot cache in baseline; low-memory behavior relies on indexed SQL lookups plus statement caching (`prepare_cached`).
 
-Runtime low-memory mode is enabled by env vars `LOW_MEM_IOS` or `LOW_MEM` (truthy except `0`/`false`). Queue/runtime tuning values are centralized in `src/tuning.rs`, including:
+Runtime low-memory mode is enabled by env vars `LOW_MEM_IOS` or `LOW_MEM` (truthy except `0`/`false`). Queue/runtime tuning values are centralized in `src/shared/tuning.rs`, including:
 1. projection drain/write batch sizing,
 2. shared ingest channel caps,
 3. session ingest caps,
@@ -1571,11 +1571,11 @@ This appendix holds concrete Rust file/module references so conceptual sections 
 
 ## 15.2 Peering/runtime map
 
-1. Peering supervisor and startup preflight: `src/runtime/peering/loops/supervisor.rs`
+1. Runtime task-graph supervisor: `src/runtime/peering/engine/supervisor.rs`
 2. Dial loop: `src/runtime/peering/loops/connect.rs`
 3. Accept loop: `src/runtime/peering/loops/accept.rs`
 4. Session runner seam: `src/runtime/peering/loops/mod.rs`
-5. Target planning: `src/runtime/peering/target_planner.rs`
+5. Target planning: `src/runtime/peering/engine/target_planner.rs`
 6. QUIC dial/accept lifecycle: `src/runtime/transport/connection_lifecycle.rs`
 7. Session I/O construction: `src/runtime/transport/session_factory.rs`
 8. Session I/O adapter: `src/runtime/transport/transport_session_io.rs`
