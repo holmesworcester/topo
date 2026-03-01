@@ -387,7 +387,7 @@ Pre-derive implication:
 2. dependency blocking/unblocking behaves identically to steady-state sync,
 3. replay naturally converges through normal dependency resolution for the same tenant key.
 
-Concrete bootstrap-replay example:
+Concrete bootstrap-replay example (why pre-derive matters):
 1. joiner pre-derives final `recorded_by = P` from its `peer_shared` public key,
 2. joiner writes `invite_accepted` and follow-on identity events under `P`,
 3. if `workspace`/`user_invite` prerequisites arrive later via sync, those rows are also recorded under `P`,
@@ -1160,6 +1160,7 @@ Projector-spec mapping: each Rust projector predicate maps to a named TLA guard.
 2. Nightly/periodic full pass: run the expanded TLC configs (`docs/tla/event_graph_schema_expanded.cfg`, `docs/tla/event_graph_schema_expanded_single_peer.cfg`) and record drift.
 3. Pre-merge gate for identity/trust/bootstrap changes: run full conformance + expanded TLC before merge.
 4. If behavior changes, update `docs/tla/projector_spec.md` and `docs/tla/projector_conformance_matrix.md` in the same change.
+5. Before release and perf-baseline cuts, rerun the same conformance checks so design+code+mapping stay aligned.
 
 ### Layered conformance model
 
@@ -1215,6 +1216,14 @@ Guard placement rules:
 4. bootstrap transport trust is persisted in SQL and queried at connection creation time; projected peer keys are not treated as in-memory-only authority.
 
 This approach makes first-user creation and device linking isomorphic to subsequent-user additions and device linking. Auth graph logic is easy to get wrong, so this simplification is valuable. 
+
+### 9.3.1 Bootstrap-to-steady-state trust walkthrough
+
+1. Inviter projects `user_invite`/`device_invite` and emits `WritePendingBootstrapTrust` from local `bootstrap_context`.
+2. Joiner accepts invite (`invite_accepted`) and emits `WriteAcceptedBootstrapTrust` for its scoped tenant.
+3. Initial sync sessions may authenticate via bootstrap trust rows while full identity events are still converging.
+4. `peer_shared` projection emits `SupersedeBootstrapTrust`, consuming bootstrap trust once steady-state PeerShared trust is present.
+5. Ongoing dial/accept checks then use SQL trust queries (`is_peer_allowed`) with no trust writes in read paths.
 
 ## 9.4 Sender-subjective encryption proof-of-concept
 
@@ -1338,7 +1347,7 @@ This makes tests resilient to identity chain structure changes while still verif
 2. batch worker operations with measured sizing,
 3. keep queue purge policies explicit and predictable,
 4. monitor blocked counts, queue age, retries, lease churn,
-5. provide `low_mem_ios` mode targeting `<= 24 MiB` steady-state RSS for iOS-NSE-like constrained environments,
+5. provide `low_mem_ios` mode with a target of `<= 24 MiB` steady-state RSS for constrained runtimes (including iOS NSE),
 6. in `low_mem_ios`, enforce strict in-flight bounds and prefer reduced throughput over memory spikes.
 
 Operational payload caps for this prototype (wire-format specifics in section 1.2 and file-flow details in section 12.2):
@@ -1356,6 +1365,7 @@ Retired event type 4 is rejected by unknown-type dispatch in this epoch.
 Trust and key sets use SQL indexed point lookups, not full in-memory loading. The projection tables (`trust_anchors`, identity chain tables, bootstrap trust tables) are queried on demand with indexed `(recorded_by, ...)` keys.
 
 There is no dedicated unbounded in-memory trust/key hot cache in baseline; low-memory behavior relies on indexed SQL lookups plus statement caching (`prepare_cached`).
+Clarification: canonical event/trust datasets can grow large on disk; low-memory mode bounds in-memory working set (queues, buffers, caches), not total persisted history.
 
 Runtime low-memory mode is enabled by env vars `LOW_MEM_IOS` or `LOW_MEM` (truthy except `0`/`false`). Queue/runtime tuning values are centralized in `src/shared/tuning.rs`, including:
 1. projection drain/write batch sizing,
@@ -1363,7 +1373,7 @@ Runtime low-memory mode is enabled by env vars `LOW_MEM_IOS` or `LOW_MEM` (truth
 3. session ingest caps,
 4. transport receive-buffer limits.
 
-Validation scale requirements: the low-memory path must remain stable at >= 1,000,000 canonical events on disk and >= 100,000 peer trust keys while staying within the 24 MiB steady-state RSS ceiling. Throughput may degrade to preserve the memory bound.
+Validation scale requirements: the low-memory path must remain stable at >= 1,000,000 canonical events on disk and >= 100,000 peer trust keys while targeting a 24 MiB steady-state RSS envelope on representative constrained devices. Throughput may degrade to preserve bounded memory.
 
 Caveat: `24 MiB` is an operational target validated by representative low-memory tests and tuning profiles, not a universal guarantee across all kernels/devices/workloads. For very large message histories and trust sets, the design favors bounded memory (smaller in-flight windows and SQL point lookups) over peak throughput.
 
