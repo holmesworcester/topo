@@ -20,9 +20,10 @@ EXTENDS FiniteSets
 \* - no recorded_by/peer_id migration exists; scope stays pre-derived
 \* - no arbitrary rotation/revocation machinery exists
 \*
-\* Trust-source inputs (AddPeerSharedTrust, AddBootstrapTrust,
-\* AddPendingBootstrapTrust) are modeled as nondeterministic, abstracting
-\* over the event graph.
+\* Trust-source inputs are modeled as projection effects. In particular,
+\* local invite creation projects pending bootstrap trust in the same step
+\* (CreateInviteLocal), matching the code path where create+project are
+\* synchronous.
 \*
 \* Invite ownership: inviteCreator tracks which peer created each invite SPKI.
 \* Pending bootstrap trust may only be added by the invite creator (inviter).
@@ -37,18 +38,20 @@ EXTENDS FiniteSets
 \*   peerSharedTrust        → PeerShared-derived SPKIs (peer_shared_spki_fingerprints())
 \*   bootstrapTrust         → invite_bootstrap_trust (non-expired, non-superseded)
 \*   pendingBootstrapTrust  → pending_invite_bootstrap_trust (non-expired, non-superseded)
-\*   inviteCreator          → is_local_create check on UserInviteBoot/DeviceInviteFirst
+\*   inviteCreator          → local invite ownership (is_local_create gate)
+\*   UseBuggyPendingGate    → legacy bug toggle: suppress pending trust when
+\*                            bootstrap context SPKI is already in peerSharedTrust
 \*
 \* CONSTANTS:
 \*   Peers — set of peer identifiers
 \*   SPKIs — set of abstract transport_fingerprint values (SPKI fingerprints)
 \*   PeerEvents — set of abstract peer_shared event ids
 
-CONSTANTS Peers, SPKIs, PeerEvents
+CONSTANTS Peers, SPKIs, PeerEvents, UseBuggyPendingGate
 
-VARIABLES localCred, credSource, peerSharedTrust, bootstrapTrust, pendingBootstrapTrust, inviteCreator, peerSharedEventForSPKI
+VARIABLES localCred, credSource, peerSharedTrust, bootstrapTrust, pendingBootstrapTrust, inviteCreator, peerSharedEventForSPKI, pendingProjectionViolation
 
-vars == <<localCred, credSource, peerSharedTrust, bootstrapTrust, pendingBootstrapTrust, inviteCreator, peerSharedEventForSPKI>>
+vars == <<localCred, credSource, peerSharedTrust, bootstrapTrust, pendingBootstrapTrust, inviteCreator, peerSharedEventForSPKI, pendingProjectionViolation>>
 
 \* ---- Helper: "none" sentinel for absent credential ----
 None == "none"
@@ -100,6 +103,7 @@ AllActiveCredentials == {localCred[p] : p \in Peers} \ {None}
 \* ---- Type invariant ----
 
 TypeOK ==
+    /\ UseBuggyPendingGate \in BOOLEAN
     /\ \A p \in Peers :
         /\ localCred[p] \in SPKIs \union {None}
         /\ credSource[p] \in CredSources
@@ -108,6 +112,7 @@ TypeOK ==
         /\ pendingBootstrapTrust[p] \subseteq SPKIs
         /\ peerSharedEventForSPKI[p] \in [SPKIs -> EventIds]
     /\ inviteCreator \in [SPKIs -> Peers \union {None}]
+    /\ pendingProjectionViolation \in BOOLEAN
 
 \* ---- Init ----
 
@@ -119,6 +124,7 @@ Init ==
     /\ pendingBootstrapTrust = [p \in Peers |-> {}]
     /\ inviteCreator = [s \in SPKIs |-> None]
     /\ peerSharedEventForSPKI = [p \in Peers |-> [s \in SPKIs |-> NoneEvent]]
+    /\ pendingProjectionViolation = FALSE
 
 \* ---- Actions ----
 
@@ -131,7 +137,7 @@ InstallBootstrapCred(p, s) ==
     /\ s \notin (AllActiveCredentials \ {localCred[p]})
     /\ localCred' = [localCred EXCEPT ![p] = s]
     /\ credSource' = [credSource EXCEPT ![p] = "bootstrap"]
-    /\ UNCHANGED <<peerSharedTrust, bootstrapTrust, pendingBootstrapTrust, inviteCreator, peerSharedEventForSPKI>>
+    /\ UNCHANGED <<peerSharedTrust, bootstrapTrust, pendingBootstrapTrust, inviteCreator, peerSharedEventForSPKI, pendingProjectionViolation>>
 
 \* 2. InstallPeerSharedCred(p, s)
 \*    Deterministic cert install from PeerShared signer material.
@@ -141,7 +147,7 @@ InstallPeerSharedCred(p, s) ==
     /\ s \notin (AllActiveCredentials \ {localCred[p]})
     /\ localCred' = [localCred EXCEPT ![p] = s]
     /\ credSource' = [credSource EXCEPT ![p] = "peershared"]
-    /\ UNCHANGED <<peerSharedTrust, bootstrapTrust, pendingBootstrapTrust, inviteCreator, peerSharedEventForSPKI>>
+    /\ UNCHANGED <<peerSharedTrust, bootstrapTrust, pendingBootstrapTrust, inviteCreator, peerSharedEventForSPKI, pendingProjectionViolation>>
 
 \* 3. AddPeerSharedTrust(p, s, e)
 \*    Steady-state trust derived from a valid PeerShared event.
@@ -156,7 +162,7 @@ AddPeerSharedTrust(p, s, e) ==
     \* Supersede: remove from bootstrap and pending if present
     /\ bootstrapTrust' = [bootstrapTrust EXCEPT ![p] = @ \ {s}]
     /\ pendingBootstrapTrust' = [pendingBootstrapTrust EXCEPT ![p] = @ \ {s}]
-    /\ UNCHANGED <<localCred, credSource, inviteCreator>>
+    /\ UNCHANGED <<localCred, credSource, inviteCreator, pendingProjectionViolation>>
 
 \* 4. AddBootstrapTrust(p, s)
 \*    Accepted invite bootstrap trust (joiner side).
@@ -167,17 +173,37 @@ AddBootstrapTrust(p, s) ==
     /\ s \notin peerSharedTrust[p]
     /\ s \notin bootstrapTrust[p]
     /\ bootstrapTrust' = [bootstrapTrust EXCEPT ![p] = @ \union {s}]
-    /\ UNCHANGED <<localCred, credSource, peerSharedTrust, pendingBootstrapTrust, inviteCreator, peerSharedEventForSPKI>>
+    /\ UNCHANGED <<localCred, credSource, peerSharedTrust, pendingBootstrapTrust, inviteCreator, peerSharedEventForSPKI, pendingProjectionViolation>>
 
 \* 5a. CreateInvite(p, s)
-\*    Inviter creates an invite, establishing ownership of the invite SPKI.
-\*    Must happen before AddPendingBootstrapTrust for this SPKI.
-\*    Rust: create_user_invite / create_device_link_invite (local create).
-CreateInvite(p, s) ==
+\*    Inviter creates an invite and projects pending bootstrap trust in the
+\*    same local step (store + project flow).
+\*    Rust: create_user_invite / create_device_link_invite + projector write.
+\*
+\*    Fixed behavior: pending trust write depends only on local-create + invite
+\*    SPKI not already steady-state trusted.
+\*    Legacy bug (UseBuggyPendingGate = TRUE): incorrectly suppresses pending
+\*    trust when inviter bootstrap context SPKI (localCred[p]) is already
+\*    in peerSharedTrust[p].
+CreateInviteLocal(p, s) ==
     /\ s \in SPKIs
+    /\ localCred[p] # None
+    /\ s # localCred[p]
     /\ inviteCreator[s] = None
     /\ inviteCreator' = [inviteCreator EXCEPT ![s] = p]
-    /\ UNCHANGED <<localCred, credSource, peerSharedTrust, bootstrapTrust, pendingBootstrapTrust, peerSharedEventForSPKI>>
+    /\ pendingBootstrapTrust' =
+        [pendingBootstrapTrust EXCEPT
+            ![p] =
+                IF s \in peerSharedTrust[p] THEN @
+                ELSE IF UseBuggyPendingGate /\ (localCred[p] \in peerSharedTrust[p]) THEN @
+                ELSE @ \union {s}
+        ]
+    /\ pendingProjectionViolation' =
+        (pendingProjectionViolation
+            \/ (s \notin peerSharedTrust[p]
+                /\ UseBuggyPendingGate
+                /\ localCred[p] \in peerSharedTrust[p]))
+    /\ UNCHANGED <<localCred, credSource, peerSharedTrust, bootstrapTrust, peerSharedEventForSPKI>>
 
 \* 5b. AddPendingBootstrapTrust(p, s)
 \*    Inviter-side pending bootstrap trust.
@@ -190,7 +216,7 @@ AddPendingBootstrapTrust(p, s) ==
     /\ s \notin peerSharedTrust[p]
     /\ s \notin pendingBootstrapTrust[p]
     /\ pendingBootstrapTrust' = [pendingBootstrapTrust EXCEPT ![p] = @ \union {s}]
-    /\ UNCHANGED <<localCred, credSource, peerSharedTrust, bootstrapTrust, inviteCreator, peerSharedEventForSPKI>>
+    /\ UNCHANGED <<localCred, credSource, peerSharedTrust, bootstrapTrust, inviteCreator, peerSharedEventForSPKI, pendingProjectionViolation>>
 
 \* 6. ExpireBootstrapTrust(p, s)
 \*    TTL expiry of accepted bootstrap trust.
@@ -198,7 +224,7 @@ AddPendingBootstrapTrust(p, s) ==
 ExpireBootstrapTrust(p, s) ==
     /\ s \in bootstrapTrust[p]
     /\ bootstrapTrust' = [bootstrapTrust EXCEPT ![p] = @ \ {s}]
-    /\ UNCHANGED <<localCred, credSource, peerSharedTrust, pendingBootstrapTrust, inviteCreator, peerSharedEventForSPKI>>
+    /\ UNCHANGED <<localCred, credSource, peerSharedTrust, pendingBootstrapTrust, inviteCreator, peerSharedEventForSPKI, pendingProjectionViolation>>
 
 \* 7. ExpirePendingBootstrapTrust(p, s)
 \*    TTL expiry of pending bootstrap trust.
@@ -206,7 +232,7 @@ ExpireBootstrapTrust(p, s) ==
 ExpirePendingBootstrapTrust(p, s) ==
     /\ s \in pendingBootstrapTrust[p]
     /\ pendingBootstrapTrust' = [pendingBootstrapTrust EXCEPT ![p] = @ \ {s}]
-    /\ UNCHANGED <<localCred, credSource, peerSharedTrust, bootstrapTrust, inviteCreator, peerSharedEventForSPKI>>
+    /\ UNCHANGED <<localCred, credSource, peerSharedTrust, bootstrapTrust, inviteCreator, peerSharedEventForSPKI, pendingProjectionViolation>>
 
 \* 8. RemovePeerSharedTrust(p, s)
 \*    Removal of steady-state trust (e.g. peer_removed projection).
@@ -215,7 +241,7 @@ RemovePeerSharedTrust(p, s) ==
     /\ s \in peerSharedTrust[p]
     /\ peerSharedTrust' = [peerSharedTrust EXCEPT ![p] = @ \ {s}]
     /\ peerSharedEventForSPKI' = [peerSharedEventForSPKI EXCEPT ![p][s] = NoneEvent]
-    /\ UNCHANGED <<localCred, credSource, bootstrapTrust, pendingBootstrapTrust, inviteCreator>>
+    /\ UNCHANGED <<localCred, credSource, bootstrapTrust, pendingBootstrapTrust, inviteCreator, pendingProjectionViolation>>
 
 \* ---- Next-state relation ----
 
@@ -224,7 +250,7 @@ Next ==
         \/ InstallBootstrapCred(p, s)
         \/ InstallPeerSharedCred(p, s)
         \/ AddBootstrapTrust(p, s)
-        \/ CreateInvite(p, s)
+        \/ CreateInviteLocal(p, s)
         \/ AddPendingBootstrapTrust(p, s)
         \/ ExpireBootstrapTrust(p, s)
         \/ ExpirePendingBootstrapTrust(p, s)
@@ -309,5 +335,11 @@ InvBootstrapFallbackOnlyWhenNeeded ==
         DialPreference(p, q) = "bootstrap_fallback"
         => /\ ~CanDialOngoing(p, q)
            /\ localCred[q] \in (bootstrapTrust[p] \union pendingBootstrapTrust[p])
+
+\* Local create+project contract: if invite SPKI is not already steady-state
+\* trusted for inviter p, CreateInviteLocal must materialize pending trust in
+\* the same transition. This state bit is latched on first violation.
+InvLocalInviteProjectsPending ==
+    ~pendingProjectionViolation
 
 ====
