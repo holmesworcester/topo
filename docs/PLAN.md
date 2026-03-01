@@ -1145,23 +1145,26 @@ Not in scope yet:
 
 ## 11.7 TLA-to-projector conformance rule
 
-- Keep model alignment with `docs/tla/EventGraphSchema.tla` (including `event_graph_schema_bootstrap.cfg`) and `docs/tla/TransportCredentialLifecycle.tla`.
+- Keep model alignment with `docs/tla/EventGraphSchema.tla` (including `event_graph_schema_bootstrap.cfg`), `docs/tla/TransportCredentialLifecycle.tla`, and `docs/tla/UnifiedBridge.tla`.
+- Treat `BootstrapGraph.tla` as retired/deleted in this epoch; do not add new checks there.
 - Extend/adjust model events for split invites (`user_invite`, `device_invite`).
 - For each identity-phase projector, include a referenced guard list in comments/docs.
 - Treat divergence between projector logic and TLA guards as a spec bug that must be resolved before adding behavior.
 
 ### Conformance gating (CI-enforced)
 
-Two CI gate scripts enforce bidirectional coverage between TLA+ guards and runtime checks:
+Four CI gate scripts enforce bidirectional coverage between TLA+ guards and runtime checks:
 
 1. **`scripts/check_projector_tla_conformance.py`** — every `spec_id` in the conformance matrix has at least one linked test; guard-level `spec_id`s have both pass and break polarity; every `check_id` exists in the catalog; every `spec_id` maps to at least one `check_id`.
 2. **`scripts/check_projector_tla_bijection.py`** — every TLA guard in `projector_spec.md` maps to at least one `check_id` in the runtime check catalog; every `check_id` maps to a `tla_guard_id` or explicit `NON_MODELED::` waiver; every `check_id` has at least one linked test row.
+3. **`scripts/check_bridge_conformance.py`** — every `CHK_BRIDGE_*` check in the runtime catalog has non-waiver pass coverage and (except liveness checks) non-waiver break coverage; disallows bridge regressions to TLC-only waivers.
+4. **`scripts/check_tcl_conformance.py`** — every `CHK_TCL_*` check in the runtime catalog has non-waiver pass+break coverage and disallows TCL regressions to integration-effect-only waivers.
 
 Artifacts: `docs/tla/runtime_check_catalog.md` (check_id → guard mapping), `docs/tla/projector_conformance_matrix.md` (spec_id → check_id → test_id with polarity). Waivers (`NON_MODELED::`) require inline rationale and are reviewed as spec debt.
 
-## 11.8 TLA transport-credential lifecycle (gap closed)
+## 11.8 TLA transport-credential and bridge layers (gaps closed)
 
-**Status:** Closed. `docs/tla/TransportCredentialLifecycle.tla` models the runtime transport credential and trust-store layer.
+**Status:** Closed. `docs/tla/TransportCredentialLifecycle.tla` models the runtime transport credential/trust-store layer, and `docs/tla/UnifiedBridge.tla` models the cross-layer trust-to-connection invariants and progress properties.
 
 Previous gap: TLA models were identity/event-causality models that did not encode mTLS credential lifecycle (SPKI generation/rotation/revocation, projected trust-set state transitions).
 

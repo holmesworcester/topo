@@ -113,7 +113,7 @@ More details:
 3. Text slots use fixed-size UTF-8 with mandatory zero-padding: unused bytes after the canonical text content must be zero, and no non-zero bytes may appear after the text terminator.
 4. Encrypted event wire size is deterministic by `inner_type_code` (inner types are fixed-size).
 5. File slice events use a canonical fixed ciphertext size; final plaintext chunks are padded before encryption.
-6. `signed_memo` events (type 4) are currently placeholder canonical shared signed text events with a fixed 1024-byte text slot and normal signer-field verification. They project into `signed_memos` but are not part of core product flows and are candidates for removal in a later cleanup pass.
+6. Event type 4 (`signed_memo`) is retired in this epoch and rejected as an unknown type by runtime dispatch; it is not part of the active parser/projector surface.
 7. `bench_dep` events (type 26) are fixed-size shared benchmark events for dependency/cascade performance testing; they are non-encryptable and project no domain rows beyond validity state.
 
 ## 1.3 Event identity and signatures
@@ -901,7 +901,7 @@ Decryption is an adapter stage inside the same projection pipeline, not a second
 Current canonical plaintext families:
 1. identity/auth chain events (`workspace`, `invite_accepted`, `user_invite`, `device_invite`, `user`, `peer_shared`, `admin`, removals),
 2. local identity/support events (`local_signer_secret`, `secret_key`, bootstrap helper events),
-3. content metadata events that are intentionally cleartext in this POC (`message_attachment`, `file_slice`, `reaction`, `message_deletion`, `signed_memo`, `bench_dep`).
+3. content metadata events that are intentionally cleartext in this POC (`message_attachment`, `file_slice`, `reaction`, `message_deletion`, `bench_dep`).
 
 Encrypted wrapper events remain canonical but carry ciphertext payloads whose inner event type is validated by `inner_type_code` before inner projection.
 
@@ -1344,7 +1344,7 @@ Operational payload caps for this prototype (wire-format specifics in section 1.
 
 `file_slice` events (type 25, signed) are signed and validated like other canonical events.
 `message_attachment` events (type 24, signed) are file descriptors with deps on `message_id`, `key_event_id`, and `signed_by`.
-`signed_memo` events (type 4, signed) are placeholder fixed-size canonical memo entries projected into `signed_memos`.
+Event type 4 (`signed_memo`) is retired in this epoch; unknown-type dispatch rejection is the expected behavior.
 
 ### Low-memory trust and key strategy (`low_mem_ios`)
 
