@@ -203,8 +203,9 @@ Transport peer identity is SPKI-derived:
 5. `pending_invite_bootstrap_trust` stores inviter-side expected invitee SPKI
    until PeerShared-derived trust consumes it,
 6. accepted/pending bootstrap rows are time-bounded and consumed at projection time
-   (PeerShared projector emits `SupersedeBootstrapTrust`) when matching steady-state
-   PeerShared-derived trust appears. Trust check reads are pure (no write side-effects).
+   (PeerShared projector issues deterministic `Delete` write-ops for matching SPKIs)
+   when steady-state PeerShared-derived trust appears. Trust check reads are pure
+   (no write side-effects).
 7. trust/removal lookups use projected `transport_fingerprint` rows and do not scan/derive fallback from `peers_shared.public_key`.
 
 Runtime rule: handshake verification queries SQL trust state per connection creation; projected peer keys are not treated as in-memory authority.
@@ -640,17 +641,13 @@ ProjectorResult {
 1. `RetryWorkspaceEvent { workspace_id }` — re-project the specific workspace event after trust anchor set by invite_accepted.
 2. `RetryFileSliceGuards { file_id }` — re-project file_slice events after descriptor arrives.
 3. `RecordFileSliceGuardBlock { file_id, event_id }` — record guard-block for pending file_slices; consumed by `RetryFileSliceGuards` after descriptor projection (see section 12.2 file attachment flow and section 5.2 cascade lifecycle).
-4. `WritePendingBootstrapTrust { invite_event_id, workspace_id, expected_bootstrap_spki_fingerprint }` — materialize inviter-side pending trust from invite event + local bootstrap context. Emitted by UserInviteBoot and DeviceInviteFirst projectors.
-5. `WriteAcceptedBootstrapTrust { invite_accepted_event_id, invite_event_id, workspace_id, bootstrap_addr, bootstrap_spki_fingerprint }` — materialize joiner-side accepted trust from InviteAccepted event + local bootstrap context. Emitted by InviteAccepted projector.
-6. `SupersedeBootstrapTrust { peer_shared_public_key }` — supersede bootstrap trust rows whose SPKI matches a PeerShared-derived SPKI. Emitted by PeerShared projectors so trust check reads remain pure queries.
+4. `ApplyTransportIdentityIntent { intent }` — apply typed transport identity transitions through the `TransportIdentityAdapter` boundary.
 
-Why bootstrap trust uses emitted commands instead of direct projector SQL:
-1. it preserves the pure projector contract (`event + context -> decision + write_ops + emit_commands`) and keeps trust-side effects in one executor path,
-2. bootstrap trust writes are context-dependent local side effects (`bootstrap_context`, `is_local_create`), so emitting explicit commands makes this dependency visible and testable,
-3. command execution centralizes idempotence and out-of-order handling (including bidirectional supersession when PeerShared and bootstrap rows arrive in either order),
-4. trust-check functions (`is_peer_allowed`, `allowed_peers_from_db`) stay read-only, which keeps runtime behavior easier to reason about.
-
-For future work: attempt a projection-only bootstrap design where these trust rows can be expressed as plain `write_ops` (no bootstrap emit commands) while preserving purity, replay determinism, and out-of-order supersession correctness.
+Bootstrap trust materialization uses projector `WriteOp`s (not `EmitCommand`s):
+1. `user_invite`/`device_invite` projectors write pending bootstrap trust rows when `is_local_create` and `bootstrap_context` are present,
+2. `invite_accepted` projector writes accepted bootstrap trust rows when `bootstrap_context` is present,
+3. `peer_shared` projector consumes matching bootstrap trust rows using deterministic `Delete` write-ops,
+4. trust-check functions (`is_peer_allowed`, `allowed_peers_from_db`) remain read-only.
 
 ### ContextSnapshot
 
@@ -675,7 +672,7 @@ Fields include:
 - `recipient_removed` — for SecretShared removal exclusion
 - `file_descriptors` / `existing_file_slice` — for FileSlice authorization
 - `bootstrap_context` — local bootstrap context (addr + SPKI) for invite trust materialization
-- `is_local_create` — whether the event was locally created (from `recorded_events.source`); gates `WritePendingBootstrapTrust` emission so only the invite creator materializes pending trust
+- `is_local_create` — whether the event was locally created (from `recorded_events.source`); gates pending bootstrap trust `InsertOrIgnore` writes so only the invite creator materializes pending trust
 
 Encrypted key resolution/decryption is handled in the encrypted-wrapper stage (`projection/encrypted.rs`), not via `ContextSnapshot`.
 
@@ -1194,10 +1191,10 @@ Required semantics:
 2. invite events and invites are not forced-valid,
 3. normal signer/dependency chain still governs validity,
 4. bootstrap transport trust rows (`invite_bootstrap_trust`, `pending_invite_bootstrap_trust`) are projection-owned state, produced by concrete event projectors:
-   - `user_invite` projector emits `WritePendingBootstrapTrust`,
-   - `device_invite` projector emits `WritePendingBootstrapTrust`,
-   - `invite_accepted` projector emits `WriteAcceptedBootstrapTrust`,
-   - `peer_shared` projector emits `SupersedeBootstrapTrust`.
+   - `user_invite` projector writes pending bootstrap trust rows (boot variant, local-create gated),
+   - `device_invite` projector writes pending bootstrap trust rows (first variant, local-create gated),
+   - `invite_accepted` projector writes accepted bootstrap trust rows using local `bootstrap_context`,
+   - `peer_shared` projector deletes matching bootstrap trust rows when steady-state trust appears.
    Projectors read local `bootstrap_context`; the service layer writes `bootstrap_context` rows only, never trust rows directly.
    Invite command paths do not write pending bootstrap trust directly; local invite events are projected and materialize pending trust through this command path.
    This follows the same poc-6 cascade pattern where `invite_accepted` projection drives trust establishment.
@@ -1219,10 +1216,10 @@ This approach makes first-user creation and device linking isomorphic to subsequ
 
 ### 9.3.1 Bootstrap-to-steady-state trust walkthrough
 
-1. Inviter projects `user_invite`/`device_invite` and emits `WritePendingBootstrapTrust` from local `bootstrap_context`.
-2. Joiner accepts invite (`invite_accepted`) and emits `WriteAcceptedBootstrapTrust` for its scoped tenant.
+1. Inviter projects `user_invite`/`device_invite` and writes pending bootstrap trust rows from local `bootstrap_context`.
+2. Joiner accepts invite (`invite_accepted`) and writes accepted bootstrap trust rows for its scoped tenant.
 3. Initial sync sessions may authenticate via bootstrap trust rows while full identity events are still converging.
-4. `peer_shared` projection emits `SupersedeBootstrapTrust`, consuming bootstrap trust once steady-state PeerShared trust is present.
+4. `peer_shared` projection consumes matching bootstrap trust rows with deterministic `Delete` write-ops once steady-state PeerShared trust is present.
 5. Ongoing dial/accept checks then use SQL trust queries (`is_peer_allowed`) with no trust writes in read paths.
 
 ## 9.4 Sender-subjective encryption proof-of-concept
@@ -1258,7 +1255,7 @@ This section covers the lifecycle state machine for the three trust sources: Pee
 
 Credential transition model: invite acceptance may install a bootstrap transport cert first; projection later installs the PeerShared-derived cert. Runtime enforces one-way transition (no bootstrap-after-PeerShared downgrade).
 
-Supersession: when a PeerShared event is projected, the PeerShared projector emits a `SupersedeBootstrapTrust` command that marks matching `invite_bootstrap_trust` and `pending_invite_bootstrap_trust` entries as superseded. This happens at projection time, not on trust check reads — trust check reads (`is_peer_allowed`, `allowed_peers_from_db`) are pure queries with no write side-effects.
+Consumption: when a PeerShared event is projected, the PeerShared projector deletes matching `invite_bootstrap_trust` and `pending_invite_bootstrap_trust` entries for that SPKI in the same projection apply transaction. This happens at projection time, not on trust check reads — trust check reads (`is_peer_allowed`, `allowed_peers_from_db`) are pure queries with no write side-effects.
 
 Lookup shape: trust and removal queries resolve peers via projected `peers_shared.transport_fingerprint` (indexed by `(recorded_by, transport_fingerprint)`), not by runtime fallback scans over `peers_shared.public_key`.
 
@@ -1266,7 +1263,7 @@ TTL expiry: bootstrap trust rows are time-bounded. Unconsumed entries expire and
 
 Removal cascade: `peer_removed` cascades trust removal across all three sources for the affected peer.
 
-Invite ownership: `inviteCreator` tracks which peer created each invite SPKI. Only the invite creator (inviter) may materialize pending bootstrap trust — the joiner must not emit `WritePendingBootstrapTrust` when syncing the invite event. This is enforced by the `is_local_create` flag in `ContextSnapshot`, populated from `recorded_events.source`. The TLA+ model captures this via the `inviteCreator[s] = p` guard on `AddPendingBootstrapTrust` and the `InvPendingTrustOnlyOnInviter` invariant.
+Invite ownership: `inviteCreator` tracks which peer created each invite SPKI. Only the invite creator (inviter) may materialize pending bootstrap trust — the joiner must not write pending bootstrap trust when syncing the invite event. This is enforced by the `is_local_create` flag in `ContextSnapshot`, populated from `recorded_events.source`. The TLA+ model captures this via the `inviteCreator[s] = p` guard on `AddPendingBootstrapTrust` and the `InvPendingTrustOnlyOnInviter` invariant.
 
 TLC-verified invariants (from `TransportCredentialLifecycle.tla`, mapped to Rust checks in `docs/tla/projector_spec.md`):
 1. `InvSPKIUniqueness` — no two peers share an active SPKI,
@@ -1334,7 +1331,7 @@ This makes tests resilient to identity chain structure changes while still verif
 
 1. Inviter creates a `user_invite` event and shares invite data.
 2. Joiner accepts via `invite_accepted`, then writes follow-on identity events (`user`, `device_invite`, `peer_shared`) under pre-derived final `recorded_by`.
-3. Projectors apply deterministic rows and emit bootstrap trust commands (`WritePendingBootstrapTrust`, `WriteAcceptedBootstrapTrust`, later `SupersedeBootstrapTrust`) as dependencies become available.
+3. Projectors apply deterministic rows and materialize/consume bootstrap trust through normal `WriteOp` rows (`InsertOrIgnore` on invite paths, `Delete` on matching `peer_shared`).
 4. Peering loops read trust state from SQL and establish transport sessions only for allowed peers.
 5. Sync transfers missing canonical events; blocked rows unblock via the same dependency cascade used everywhere else.
 6. Queries read projected rows; replaying the same canonical set converges to the same result.
