@@ -400,6 +400,11 @@ mod tests {
             key.secret_pkcs8_der().as_ref(),
         )
         .unwrap();
+        db.execute(
+            "INSERT INTO trust_anchors (peer_id, workspace_id) VALUES (?1, ?2)",
+            rusqlite::params!["tenant-a", "ws-1"],
+        )
+        .unwrap();
         drop(db);
 
         build_tenant_client_config_from_db(db_path.to_str().unwrap(), "tenant-a")
