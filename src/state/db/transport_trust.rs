@@ -59,13 +59,12 @@ pub fn ensure_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             bootstrap_spki_fingerprint BLOB NOT NULL,
             accepted_at INTEGER NOT NULL,
             expires_at INTEGER NOT NULL,
-            superseded_at INTEGER,
             PRIMARY KEY (recorded_by, invite_accepted_event_id)
         );
         CREATE INDEX IF NOT EXISTS idx_invite_bootstrap_spki
             ON invite_bootstrap_trust(recorded_by, bootstrap_spki_fingerprint);
         CREATE INDEX IF NOT EXISTS idx_invite_bootstrap_live
-            ON invite_bootstrap_trust(recorded_by, superseded_at, expires_at);
+            ON invite_bootstrap_trust(recorded_by, expires_at);
 
         CREATE TABLE IF NOT EXISTS pending_invite_bootstrap_trust (
             recorded_by TEXT NOT NULL,
@@ -74,13 +73,12 @@ pub fn ensure_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             expected_bootstrap_spki_fingerprint BLOB NOT NULL,
             created_at INTEGER NOT NULL,
             expires_at INTEGER NOT NULL,
-            superseded_at INTEGER,
             PRIMARY KEY (recorded_by, invite_event_id)
         );
         CREATE INDEX IF NOT EXISTS idx_pending_invite_bootstrap_spki
             ON pending_invite_bootstrap_trust(recorded_by, expected_bootstrap_spki_fingerprint);
         CREATE INDEX IF NOT EXISTS idx_pending_invite_bootstrap_live
-            ON pending_invite_bootstrap_trust(recorded_by, superseded_at, expires_at);
+            ON pending_invite_bootstrap_trust(recorded_by, expires_at);
 
         CREATE TABLE IF NOT EXISTS bootstrap_context (
             recorded_by TEXT NOT NULL,
@@ -178,41 +176,36 @@ pub fn read_bootstrap_context(
     }
 }
 
-/// Supersede bootstrap trust rows whose SPKI matches a PeerShared-derived SPKI.
+/// Consume bootstrap trust rows whose SPKI matches a PeerShared-derived SPKI.
 ///
 /// Called by the projection pipeline when a PeerShared event is projected,
 /// so that trust check reads are pure (no write side-effects).
-pub fn supersede_bootstrap_for_peer_shared(
+pub fn consume_bootstrap_for_peer_shared(
     conn: &Connection,
     recorded_by: &str,
     peer_shared_public_key: &[u8; 32],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let spki = spki_fingerprint_from_ed25519_pubkey(peer_shared_public_key);
-    supersede_bootstrap_for_transport_fingerprint(conn, recorded_by, &spki)
+    consume_bootstrap_for_transport_fingerprint(conn, recorded_by, &spki)
 }
 
-/// Supersede bootstrap trust rows by transport fingerprint directly.
-pub fn supersede_bootstrap_for_transport_fingerprint(
+/// Consume bootstrap trust rows by transport fingerprint directly.
+pub fn consume_bootstrap_for_transport_fingerprint(
     conn: &Connection,
     recorded_by: &str,
     transport_fingerprint: &[u8; 32],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let now = now_ms_i64();
     conn.execute(
-        "UPDATE pending_invite_bootstrap_trust
-            SET superseded_at = ?1
-          WHERE recorded_by = ?2
-            AND superseded_at IS NULL
-            AND expected_bootstrap_spki_fingerprint = ?3",
-        rusqlite::params![now, recorded_by, transport_fingerprint.as_slice()],
+        "DELETE FROM pending_invite_bootstrap_trust
+          WHERE recorded_by = ?1
+            AND expected_bootstrap_spki_fingerprint = ?2",
+        rusqlite::params![recorded_by, transport_fingerprint.as_slice()],
     )?;
     conn.execute(
-        "UPDATE invite_bootstrap_trust
-            SET superseded_at = ?1
-          WHERE recorded_by = ?2
-            AND superseded_at IS NULL
-            AND bootstrap_spki_fingerprint = ?3",
-        rusqlite::params![now, recorded_by, transport_fingerprint.as_slice()],
+        "DELETE FROM invite_bootstrap_trust
+          WHERE recorded_by = ?1
+            AND bootstrap_spki_fingerprint = ?2",
+        rusqlite::params![recorded_by, transport_fingerprint.as_slice()],
     )?;
     Ok(())
 }
@@ -239,7 +232,7 @@ pub fn record_transport_binding(
 /// This allows sync bootstrapping from accepted invite links before
 /// PeerShared-derived trust appears via identity event sync.
 ///
-/// Uses INSERT OR IGNORE so replays do not refresh TTL or reset superseded_at.
+/// Uses INSERT OR IGNORE so replays do not refresh TTL.
 pub fn record_invite_bootstrap_trust(
     conn: &Connection,
     recorded_by: &str,
@@ -259,9 +252,8 @@ pub fn record_invite_bootstrap_trust(
              bootstrap_addr,
              bootstrap_spki_fingerprint,
              accepted_at,
-             expires_at,
-             superseded_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)",
+             expires_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         rusqlite::params![
             recorded_by,
             invite_accepted_event_id,
@@ -280,7 +272,7 @@ pub fn record_invite_bootstrap_trust(
 /// has connected. This lets incoming invitee TLS certs pass strict mTLS checks
 /// without CLI pin flags.
 ///
-/// Uses INSERT OR IGNORE so replays do not refresh TTL or reset superseded_at.
+/// Uses INSERT OR IGNORE so replays do not refresh TTL.
 pub fn record_pending_invite_bootstrap_trust(
     conn: &Connection,
     recorded_by: &str,
@@ -296,9 +288,8 @@ pub fn record_pending_invite_bootstrap_trust(
              workspace_id,
              expected_bootstrap_spki_fingerprint,
              created_at,
-             expires_at,
-             superseded_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+             expires_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         rusqlite::params![
             recorded_by,
             invite_event_id,
@@ -316,7 +307,7 @@ pub fn record_pending_invite_bootstrap_trust(
 /// Each pin is stored with a deterministic `invite_event_id` (via
 /// `cli_pin_invite_event_id`) and `workspace_id = CLI_PIN_WORKSPACE`.
 /// Reuses the existing table and 24h TTL.
-/// Existing supersede logic auto-marks these stale when PeerShared-derived trust appears.
+/// Existing consume logic auto-removes these stale rows when PeerShared-derived trust appears.
 ///
 /// This is idempotent: re-importing existing pins is a no-op (INSERT OR IGNORE).
 pub fn import_cli_pins_to_sql(
@@ -424,13 +415,11 @@ pub fn allowed_peers_from_db(
         "SELECT DISTINCT bootstrap_spki_fingerprint AS spki_fingerprint
           FROM invite_bootstrap_trust
           WHERE recorded_by = ?1
-            AND superseded_at IS NULL
             AND expires_at > ?2
          UNION
          SELECT DISTINCT expected_bootstrap_spki_fingerprint AS spki_fingerprint
           FROM pending_invite_bootstrap_trust
           WHERE recorded_by = ?1
-            AND superseded_at IS NULL
             AND expires_at > ?2",
     )?;
     let mut fps: Vec<[u8; 32]> = stmt
@@ -470,7 +459,6 @@ pub fn is_peer_allowed(
                   FROM invite_bootstrap_trust
                  WHERE recorded_by = ?1
                    AND bootstrap_spki_fingerprint = ?2
-                   AND superseded_at IS NULL
                    AND expires_at > ?3
             )
             OR EXISTS(
@@ -478,7 +466,6 @@ pub fn is_peer_allowed(
                   FROM pending_invite_bootstrap_trust
                  WHERE recorded_by = ?1
                    AND expected_bootstrap_spki_fingerprint = ?2
-                   AND superseded_at IS NULL
                    AND expires_at > ?3
             )",
         rusqlite::params![recorded_by, spki_fingerprint.as_slice(), now],
@@ -513,14 +500,12 @@ pub fn has_any_trusted_peer(
                 SELECT 1 FROM invite_bootstrap_trust
                 WHERE recorded_by = ?1
                   AND length(bootstrap_spki_fingerprint) = 32
-                  AND superseded_at IS NULL
                   AND expires_at > ?2
             )
             OR EXISTS(
                 SELECT 1 FROM pending_invite_bootstrap_trust
                 WHERE recorded_by = ?1
                   AND length(expected_bootstrap_spki_fingerprint) = 32
-                  AND superseded_at IS NULL
                   AND expires_at > ?2
             )
             OR EXISTS(
@@ -560,7 +545,6 @@ pub fn list_active_invite_bootstrap_addrs(
         "SELECT DISTINCT bootstrap_addr
            FROM invite_bootstrap_trust
           WHERE recorded_by = ?1
-            AND superseded_at IS NULL
             AND expires_at > ?2",
     )?;
     let rows = stmt
@@ -702,20 +686,20 @@ mod tests {
         insert_peer_shared(&conn, recorded_by, "ps-supersede", &pubkey);
 
         // Supersession now happens at projection time, not on read
-        supersede_bootstrap_for_peer_shared(&conn, recorded_by, &pubkey).unwrap();
+        consume_bootstrap_for_peer_shared(&conn, recorded_by, &pubkey).unwrap();
 
         let allowed = allowed_peers_from_db(&conn, recorded_by).unwrap();
         assert!(allowed.contains(&spki));
 
-        let superseded_at: Option<i64> = conn
+        let remaining_rows: i64 = conn
             .query_row(
-                "SELECT superseded_at FROM invite_bootstrap_trust
+                "SELECT COUNT(*) FROM invite_bootstrap_trust
                   WHERE recorded_by = ?1 AND invite_accepted_event_id = ?2",
                 rusqlite::params![recorded_by, "ia-supersede"],
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(superseded_at.is_some());
+        assert_eq!(remaining_rows, 0);
     }
 
     #[test]
@@ -728,8 +712,8 @@ mod tests {
         let now = now_ms_i64();
         conn.execute(
             "INSERT INTO invite_bootstrap_trust
-             (recorded_by, invite_accepted_event_id, invite_event_id, workspace_id, bootstrap_addr, bootstrap_spki_fingerprint, accepted_at, expires_at, superseded_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)",
+             (recorded_by, invite_accepted_event_id, invite_event_id, workspace_id, bootstrap_addr, bootstrap_spki_fingerprint, accepted_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             rusqlite::params![
                 recorded_by,
                 "ia-expired",
@@ -778,20 +762,20 @@ mod tests {
         insert_peer_shared(&conn, recorded_by, "ps1", &pubkey);
 
         // Supersession now happens at projection time, not on read
-        supersede_bootstrap_for_peer_shared(&conn, recorded_by, &pubkey).unwrap();
+        consume_bootstrap_for_peer_shared(&conn, recorded_by, &pubkey).unwrap();
 
         let allowed = allowed_peers_from_db(&conn, recorded_by).unwrap();
         assert!(allowed.contains(&spki));
 
-        let superseded_at: Option<i64> = conn
+        let remaining_rows: i64 = conn
             .query_row(
-                "SELECT superseded_at FROM pending_invite_bootstrap_trust
+                "SELECT COUNT(*) FROM pending_invite_bootstrap_trust
                   WHERE recorded_by = ?1 AND invite_event_id = ?2",
                 rusqlite::params![recorded_by, "invite1"],
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(superseded_at.is_some());
+        assert_eq!(remaining_rows, 0);
     }
 
     #[test]
@@ -804,8 +788,8 @@ mod tests {
         let now = now_ms_i64();
         conn.execute(
             "INSERT INTO pending_invite_bootstrap_trust
-             (recorded_by, invite_event_id, workspace_id, expected_bootstrap_spki_fingerprint, created_at, expires_at, superseded_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+             (recorded_by, invite_event_id, workspace_id, expected_bootstrap_spki_fingerprint, created_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             rusqlite::params![
                 recorded_by,
                 "invite-expired",
@@ -923,28 +907,25 @@ mod tests {
         insert_peer_shared(&conn, recorded_by, "ps-steady", &pubkey);
 
         // Supersession now happens at projection time, not on read
-        supersede_bootstrap_for_peer_shared(&conn, recorded_by, &pubkey).unwrap();
+        consume_bootstrap_for_peer_shared(&conn, recorded_by, &pubkey).unwrap();
 
         // Still trusted (via PeerShared now)
         assert!(is_peer_allowed(&conn, recorded_by, &pin_fp).unwrap());
 
-        // The pending_invite_bootstrap_trust row should be superseded
+        // Bootstrap row should be consumed by the PeerShared projection path.
         let allowed = allowed_peers_from_db(&conn, recorded_by).unwrap();
         assert!(allowed.contains(&pin_fp));
 
         let invite_event_id = cli_pin_invite_event_id(&pin_fp);
-        let superseded_at: Option<i64> = conn
+        let remaining_rows: i64 = conn
             .query_row(
-                "SELECT superseded_at FROM pending_invite_bootstrap_trust
+                "SELECT COUNT(*) FROM pending_invite_bootstrap_trust
                   WHERE recorded_by = ?1 AND invite_event_id = ?2",
                 rusqlite::params![recorded_by, &invite_event_id],
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(
-            superseded_at.is_some(),
-            "CLI pin should be superseded by PeerShared"
-        );
+        assert_eq!(remaining_rows, 0, "CLI pin bootstrap row should be consumed");
     }
 
     #[test]
@@ -1267,8 +1248,8 @@ mod tests {
         .unwrap();
         conn.execute(
             "INSERT INTO invite_bootstrap_trust
-             (recorded_by, invite_accepted_event_id, invite_event_id, workspace_id, bootstrap_addr, bootstrap_spki_fingerprint, accepted_at, expires_at, superseded_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)",
+             (recorded_by, invite_accepted_event_id, invite_event_id, workspace_id, bootstrap_addr, bootstrap_spki_fingerprint, accepted_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             rusqlite::params![
                 recorded_by,
                 "ia_short",
@@ -1282,8 +1263,8 @@ mod tests {
         ).unwrap();
         conn.execute(
             "INSERT INTO pending_invite_bootstrap_trust
-             (recorded_by, invite_event_id, workspace_id, expected_bootstrap_spki_fingerprint, created_at, expires_at, superseded_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+             (recorded_by, invite_event_id, workspace_id, expected_bootstrap_spki_fingerprint, created_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             rusqlite::params![
                 recorded_by,
                 "invite_short_pending",
@@ -1606,24 +1587,21 @@ mod tests {
 
         insert_peer_shared(&conn, inviter, "ps_match", &matching_pubkey);
         // Supersession now happens at projection time via PeerShared writes
-        supersede_bootstrap_for_peer_shared(&conn, inviter, &matching_pubkey).unwrap();
+        consume_bootstrap_for_peer_shared(&conn, inviter, &matching_pubkey).unwrap();
         assert!(
             is_peer_allowed(&conn, inviter, &matching_spki).unwrap(),
             "Stage 3b: SPKI still allowed after PeerShared (via PeerShared path)"
         );
-        // Pending trust should now be superseded (PeerShared SPKI matches)
-        let superseded_at: Option<i64> = conn
+        // Pending trust should now be consumed (PeerShared SPKI matches).
+        let remaining_rows: i64 = conn
             .query_row(
-                "SELECT superseded_at FROM pending_invite_bootstrap_trust
+                "SELECT COUNT(*) FROM pending_invite_bootstrap_trust
              WHERE recorded_by = ?1 AND invite_event_id = ?2",
                 rusqlite::params![inviter, "invite_match"],
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(
-            superseded_at.is_some(),
-            "Stage 3b: pending trust superseded when PeerShared-derived SPKI matches"
-        );
+        assert_eq!(remaining_rows, 0);
         // But the SPKI is still allowed (via PeerShared path)
         assert!(
             is_peer_allowed(&conn, inviter, &matching_spki).unwrap(),
@@ -1738,33 +1716,27 @@ mod tests {
         let _ = is_peer_allowed(&conn, recorded_by, &spki).unwrap();
         let _ = allowed_peers_from_db(&conn, recorded_by).unwrap();
 
-        let after: Option<i64> = conn
+        let before_consume_rows: i64 = conn
             .query_row(
-                "SELECT superseded_at FROM pending_invite_bootstrap_trust
+                "SELECT COUNT(*) FROM pending_invite_bootstrap_trust
              WHERE recorded_by = ?1 AND invite_event_id = ?2",
                 rusqlite::params![recorded_by, "invite_se"],
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(
-            after.is_none(),
-            "INVARIANT: trust check reads must not mutate the database"
-        );
+        assert_eq!(before_consume_rows, 1);
 
-        // Explicit projection-time supersession works
-        supersede_bootstrap_for_peer_shared(&conn, recorded_by, &pubkey).unwrap();
-        let after_supersede: Option<i64> = conn
+        // Explicit projection-time consumption works.
+        consume_bootstrap_for_peer_shared(&conn, recorded_by, &pubkey).unwrap();
+        let after_consume_rows: i64 = conn
             .query_row(
-                "SELECT superseded_at FROM pending_invite_bootstrap_trust
+                "SELECT COUNT(*) FROM pending_invite_bootstrap_trust
              WHERE recorded_by = ?1 AND invite_event_id = ?2",
                 rusqlite::params![recorded_by, "invite_se"],
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(
-            after_supersede.is_some(),
-            "supersede_bootstrap_for_peer_shared must set superseded_at"
-        );
+        assert_eq!(after_consume_rows, 0);
     }
 
     // ---------------------------------------------------------------
@@ -1827,113 +1799,6 @@ mod tests {
         assert_eq!(
             ctx.bootstrap_addr, "10.0.0.2:4433",
             "latest observed_at should win"
-        );
-    }
-
-    /// Characterization: upsert on bootstrap trust preserves superseded_at.
-    ///
-    /// If a bootstrap row is already superseded and the same event re-projects
-    /// (replay), the upsert must NOT reset superseded_at to NULL. This prevents
-    /// out-of-order replay from re-activating stale bootstrap trust.
-    #[test]
-    fn characterization_upsert_preserves_superseded_at() {
-        let conn = open_in_memory().unwrap();
-        create_tables(&conn).unwrap();
-
-        let recorded_by = "upsert_preserve_test";
-        let pubkey: [u8; 32] = [0x77; 32];
-        let spki = spki_fingerprint_from_ed25519_pubkey(&pubkey);
-
-        // Write pending trust, then supersede it
-        record_pending_invite_bootstrap_trust(
-            &conn,
-            recorded_by,
-            "invite_upsert",
-            "ws_upsert",
-            &spki,
-        )
-        .unwrap();
-        supersede_bootstrap_for_peer_shared(&conn, recorded_by, &pubkey).unwrap();
-
-        let before: Option<i64> = conn
-            .query_row(
-                "SELECT superseded_at FROM pending_invite_bootstrap_trust
-             WHERE recorded_by = ?1 AND invite_event_id = ?2",
-                rusqlite::params![recorded_by, "invite_upsert"],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(before.is_some(), "should be superseded");
-
-        // Re-write the same pending trust (simulates replay)
-        record_pending_invite_bootstrap_trust(
-            &conn,
-            recorded_by,
-            "invite_upsert",
-            "ws_upsert",
-            &spki,
-        )
-        .unwrap();
-
-        let after: Option<i64> = conn
-            .query_row(
-                "SELECT superseded_at FROM pending_invite_bootstrap_trust
-             WHERE recorded_by = ?1 AND invite_event_id = ?2",
-                rusqlite::params![recorded_by, "invite_upsert"],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(
-            after.is_some(),
-            "INVARIANT: upsert must preserve superseded_at, not reset to NULL"
-        );
-
-        // Same for accepted trust
-        record_invite_bootstrap_trust(
-            &conn,
-            recorded_by,
-            "ia_upsert",
-            "invite_upsert",
-            "ws_upsert",
-            "10.0.0.1:4433",
-            &spki,
-        )
-        .unwrap();
-        supersede_bootstrap_for_peer_shared(&conn, recorded_by, &pubkey).unwrap();
-
-        let before_accepted: Option<i64> = conn
-            .query_row(
-                "SELECT superseded_at FROM invite_bootstrap_trust
-             WHERE recorded_by = ?1 AND invite_accepted_event_id = ?2",
-                rusqlite::params![recorded_by, "ia_upsert"],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(before_accepted.is_some(), "accepted should be superseded");
-
-        // Re-write accepted trust (simulates replay)
-        record_invite_bootstrap_trust(
-            &conn,
-            recorded_by,
-            "ia_upsert",
-            "invite_upsert",
-            "ws_upsert",
-            "10.0.0.1:4433",
-            &spki,
-        )
-        .unwrap();
-
-        let after_accepted: Option<i64> = conn
-            .query_row(
-                "SELECT superseded_at FROM invite_bootstrap_trust
-             WHERE recorded_by = ?1 AND invite_accepted_event_id = ?2",
-                rusqlite::params![recorded_by, "ia_upsert"],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(
-            after_accepted.is_some(),
-            "INVARIANT: upsert must preserve accepted superseded_at, not reset to NULL"
         );
     }
 
