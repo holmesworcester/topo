@@ -11,6 +11,10 @@
 ## Running Performance Tests
 
 ```bash
+# Preferred: strict serial runner (prevents cross-test interference)
+scripts/run_perf_serial.sh core
+scripts/run_perf_serial.sh full
+
 # Core sync benchmarks
 cargo test --release --test perf_test -- --nocapture
 cargo test --release --test perf_test -- --nocapture --include-ignored
