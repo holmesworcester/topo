@@ -172,6 +172,7 @@ impl SessionHandler for SyncSessionHandler {
 
         let peer_id = hex::encode(meta.peer.0);
         let tenant_id = meta.tenant.0.clone();
+        let ingress_source_tag = format!("quic_recv:{}@{}", peer_id, meta.remote_addr);
 
         // For outbound sessions, send stream materialization markers before
         // starting the sync protocol. These empty HaveList messages force
@@ -209,6 +210,7 @@ impl SessionHandler for SyncSessionHandler {
                     self.timeout_secs,
                     &peer_id,
                     &tenant_id,
+                    &ingress_source_tag,
                     coordination.as_ref(),
                     self.shared_ingest.clone(),
                 );
@@ -227,6 +229,7 @@ impl SessionHandler for SyncSessionHandler {
                     self.timeout_secs,
                     &peer_id,
                     &tenant_id,
+                    &ingress_source_tag,
                     self.shared_ingest.clone(),
                 );
                 tokio::pin!(run);

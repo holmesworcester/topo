@@ -42,6 +42,7 @@ pub async fn run_sync_responder<C, S, R>(
     timeout_secs: u64,
     peer_id: &str,
     recorded_by: &str,
+    ingress_source_tag: &str,
     shared_ingest: mpsc::Sender<IngestItem>,
 ) -> Result<SyncStats, Box<dyn std::error::Error + Send + Sync>>
 where
@@ -115,6 +116,7 @@ where
         ingest_tx.clone(),
         bytes_received.clone(),
         recorded_by.to_string(),
+        ingress_source_tag.to_string(),
     );
 
     let mut events_sent: u64 = 0;

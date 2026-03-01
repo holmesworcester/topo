@@ -3,11 +3,12 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
-/// Ingest channel item: (event_id, blob, recorded_by_tenant_id).
+/// Ingest channel item:
+/// `(event_id, blob, recorded_by_tenant_id, source_tag)`.
 ///
 /// Shared between peering, sync, and event_pipeline layers so that
 /// callers never import event_pipeline internals directly.
-pub type IngestItem = ([u8; 32], Vec<u8>, String);
+pub type IngestItem = ([u8; 32], Vec<u8>, String, String);
 
 /// Batch writer entry point.  Blocks the calling thread draining `rx` and
 /// writing events to storage until the channel is closed.

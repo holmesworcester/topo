@@ -338,7 +338,7 @@ CREATE TABLE recorded_events (
     peer_id TEXT NOT NULL,             -- semantic: recorded_by
     event_id TEXT NOT NULL,
     recorded_at INTEGER NOT NULL,      -- local receive/create time for this tenant
-    source TEXT NOT NULL,              -- local_create | quic_recv | import
+    source TEXT NOT NULL,              -- local_create | emitted | import | quic_recv:<peer_id>@<ip:port>
     UNIQUE(peer_id, event_id)
 );
 CREATE INDEX idx_recorded_peer_order ON recorded_events(peer_id, id);
@@ -1016,6 +1016,9 @@ Test families (in `sync_graph_test.rs`):
 - **Family A (chain):** N-peer chain propagation (tail convergence, per-hop latency).
 - **Family B (multi-source):** 1–8 concurrent sources with varying event counts.
   B0 = serialized baseline, B1 = coordinator-assigned, B2/B3 = variants.
+- **Family C (multi-source large-file):** all non-sink sources seeded with identical
+  file-slice sets; sink asserts exact file-slice ID set and substantial per-source
+  ingest share from `recorded_events.source` attribution.
 
 ---
 

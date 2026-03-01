@@ -850,6 +850,40 @@ impl Peer {
         .unwrap_or(0)
     }
 
+    /// Count recorded events by `source` for a given event type.
+    ///
+    /// Uses `source LIKE '<prefix>%'` so callers can isolate transport-ingest
+    /// rows (e.g. `quic_recv:`) from local-created rows.
+    pub fn recorded_event_type_counts_by_source(
+        &self,
+        event_type: &str,
+        source_prefix: &str,
+    ) -> std::collections::BTreeMap<String, i64> {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        let like = format!("{}%", source_prefix);
+        let mut stmt = db
+            .prepare(
+                "SELECT re.source, COUNT(*)
+                   FROM recorded_events re
+                   JOIN events e ON e.event_id = re.event_id
+                  WHERE re.peer_id = ?1
+                    AND e.event_type = ?2
+                    AND re.source LIKE ?3
+               GROUP BY re.source
+               ORDER BY re.source",
+            )
+            .expect("prepare source histogram query");
+
+        stmt.query_map(rusqlite::params![&self.identity, event_type, like], |row| {
+            let source: String = row.get(0)?;
+            let count: i64 = row.get(1)?;
+            Ok((source, count))
+        })
+        .expect("query source histogram")
+        .collect::<Result<std::collections::BTreeMap<_, _>, _>>()
+        .expect("collect source histogram")
+    }
+
     /// Return sorted set of all store IDs (base64-encoded).
     pub fn store_ids(&self) -> std::collections::BTreeSet<String> {
         let db = open_connection(&self.db_path).expect("failed to open db");
@@ -862,6 +896,30 @@ impl Peer {
             .collect::<Result<std::collections::BTreeSet<_>, _>>()
             .expect("collect");
         ids
+    }
+
+    /// Return sorted set of all shared-scope store IDs (base64-encoded).
+    pub fn shared_store_ids(&self) -> std::collections::BTreeSet<String> {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        let mut stmt = db
+            .prepare("SELECT event_id FROM events WHERE share_scope = 'shared' ORDER BY event_id")
+            .expect("prepare");
+        stmt.query_map([], |row| row.get::<_, String>(0))
+            .expect("query")
+            .collect::<Result<std::collections::BTreeSet<_>, _>>()
+            .expect("collect")
+    }
+
+    /// Return sorted set of event IDs for a specific `event_type`.
+    pub fn event_ids_by_type(&self, event_type: &str) -> std::collections::BTreeSet<String> {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        let mut stmt = db
+            .prepare("SELECT event_id FROM events WHERE event_type = ?1 ORDER BY event_id")
+            .expect("prepare");
+        stmt.query_map(rusqlite::params![event_type], |row| row.get::<_, String>(0))
+            .expect("query")
+            .collect::<Result<std::collections::BTreeSet<_>, _>>()
+            .expect("collect")
     }
 
     /// Count messages scoped to this peer's recorded_by identity.
