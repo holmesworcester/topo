@@ -22,3 +22,18 @@ jobs:
 
       - name: Run boundary import check
         run: bash scripts/check_boundary_imports.sh
+
+  fmt:
+    name: Rust Formatting Gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+          components: rustfmt
+
+      - name: Check rustfmt
+        run: cargo fmt --all -- --check
