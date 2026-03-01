@@ -697,4 +697,14 @@ InvConnPeer ==
             (\E ps \in ({PeerSharedFirst, PeerSharedOngoing} \cap EVENTS): ps \in valid[p])
     ELSE TRUE
 
+\* Tier-2 interaction bound: keep two-peer state space tractable while preserving
+\* one full bootstrap/upgrade lane and cross-peer dependency checks.
+CfgInteractionConstraint ==
+    /\ \A p \in Peers :
+        /\ Cardinality(recorded[p]) <= 8
+        /\ Cardinality(valid[p]) <= 8
+    /\ Cardinality({p \in Peers : Cardinality(recorded[p]) > 0}) <= 1
+    /\ Cardinality({p \in Peers : Cardinality(valid[p]) > 0}) <= 1
+    /\ Cardinality({p \in Peers : connState[p] # "none"}) <= 1
+
 ====

@@ -58,10 +58,10 @@ Current models split concerns (event graph vs transport lifecycle). This can hid
    - Explicit tier policy:
      - Tier 1 (`fast_gate`) must converge and be CI-required.
      - Tier 2 (`interaction`) must remain bounded and run for trust/bootstrap changes.
-     - Tier 3 (`deep`) runs nightly/manual with fixed budget ceilings.
+     - Tier 3 (`deep`) runs manual/ad-hoc with fixed budget ceilings.
    - Concrete runtime budgets:
      - CI-fast target: <= 2 minutes per config on baseline dev machine.
-     - Deep-run target: <= 20 minutes for nightly/manual validation.
+     - Deep-run target: <= 20 minutes for manual/ad-hoc validation.
 
 ## Success criteria (strict)
 1. There is an executable model-check workflow that can demonstrate:

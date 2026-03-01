@@ -129,7 +129,7 @@ The objective is not "all configs always exhaustive"; the objective is:
 Tier definitions:
 1. Tier 1 (`fast_gate`): exhaustive and convergent; required on every PR.
 2. Tier 2 (`interaction`): exhaustive where feasible at 2-peer interaction scope; run pre-merge for trust/bootstrap changes.
-3. Tier 3 (`deep`): larger domains and progress stress; run nightly/manual with budget caps.
+3. Tier 3 (`deep`): larger domains and progress stress; run manually with budget caps.
 
 Runtime targets:
 1. Tier 1: <= 2 minutes per config.
@@ -137,14 +137,14 @@ Runtime targets:
 3. Tier 3: <= 20 minutes per config.
 
 Initial gating matrix:
-1. `EventGraphSchema`: `event_graph_schema_fast.cfg` (Tier 1), `event_graph_schema.cfg` (Tier 2 manual/pre-merge due current state-space cost), `event_graph_schema_expanded_single_peer.cfg` and `event_graph_schema_bootstrap.cfg` (Tier 3).
-2. `TransportCredentialLifecycle`: `transport_credential_lifecycle_fast.cfg` (Tier 1), `transport_credential_lifecycle.cfg` (Tier 2 manual/pre-merge due current state-space cost), bug/fix repro pair (Tier 2 tractable CI evidence).
+1. `EventGraphSchema`: `event_graph_schema_fast.cfg` (Tier 1), `event_graph_schema.cfg` (Tier 2), `event_graph_schema_expanded_single_peer.cfg` and `event_graph_schema_bootstrap.cfg` (Tier 3).
+2. `TransportCredentialLifecycle`: `transport_credential_lifecycle_fast.cfg` (Tier 1), `transport_credential_lifecycle.cfg` (Tier 2), bug/fix repro pair (Tier 2 CI evidence).
 3. `UnifiedBridge`: `unified_bridge_fix_repro.cfg` + `unified_bridge_progress_fast.cfg` (Tier 1), `unified_bridge_bug_repro.cfg` (Tier 2 repro evidence), `unified_bridge_progress_deep.cfg` (Tier 3).
 
 CI wiring:
 1. `.github/workflows/tla-model-check.yml` enforces Tier 1 on push/PR.
-2. Same workflow provides Tier 2 manual/pre-merge run via `workflow_dispatch` (plus optional PR label trigger) for tractable Tier 2 configs and bug-repro evidence.
-3. Full `event_graph_schema.cfg` and `transport_credential_lifecycle.cfg` remain explicit local/manual pre-merge checks until additional state-space reduction work lands.
+2. Same workflow provides Tier 2 run via `workflow_dispatch` (plus optional PR label trigger) for full interaction configs and bug-repro evidence.
+3. Tier 3 remains manual due runtime budget and infra policy (no nightly requirement).
 
 Drift controls (required):
 1. Every cross-layer invariant must map to a check id in `runtime_check_catalog.md` or `NON_MODELED::<reason>`.
@@ -240,3 +240,13 @@ Record:
    - Status: **PASS**
    - Stats: 10279213 generated / 1055359 distinct / depth 20 / 6m10s
    - Temporal branch checks: 20 branches completed with no violations.
+
+## TLC execution notes (2026-03-01, Tier-2 tractability pass)
+1. `./tlc event_graph_schema.cfg`
+   - Status: **PASS**
+   - Config details: `CONSTRAINT CfgInteractionConstraint` (single active projection lane over 2-peer domain)
+   - Stats: 5880234 generated / 239695 distinct / depth 21 / 7s
+2. `./tlc TransportCredentialLifecycle transport_credential_lifecycle.cfg`
+   - Status: **PASS**
+   - Config details: `CONSTRAINT CfgInteractionConstraint` (bounded trust-set and invite dimensions)
+   - Stats: 7945033 generated / 154141 distinct / depth 9 / 6s

@@ -59,6 +59,8 @@ jobs:
           set -euo pipefail
           cd docs/tla
           chmod +x ./tlc
+          ./tlc event_graph_schema.cfg
+          ./tlc TransportCredentialLifecycle transport_credential_lifecycle.cfg
           ./tlc TransportCredentialLifecycle transport_credential_lifecycle_fix_repro.cfg
           ./tlc UnifiedBridge unified_bridge_progress_deep.cfg
 
@@ -77,7 +79,6 @@ jobs:
           fi
           echo "observed expected failing counterexample in unified_bridge_bug_repro.cfg"
 
-      - name: Note full Tier 2 status
+      - name: Note Tier 3 status
         run: |
-          echo "event_graph_schema.cfg and transport_credential_lifecycle.cfg remain manual pre-merge due current state-space cost;"
-          echo "run locally per docs/tla/UNIFIED_MODEL_PLAN.md when trust/bootstrap logic changes."
+          echo "Tier 3 deep configs remain manual/ad-hoc by policy (no nightly requirement)."

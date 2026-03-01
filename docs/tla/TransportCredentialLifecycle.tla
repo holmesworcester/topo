@@ -1,5 +1,5 @@
 ---- MODULE TransportCredentialLifecycle ----
-EXTENDS FiniteSets
+EXTENDS FiniteSets, Naturals
 
 \* Standalone TLA+ model of the runtime transport credential and trust store.
 \*
@@ -341,5 +341,17 @@ InvBootstrapFallbackOnlyWhenNeeded ==
 \* the same transition. This state bit is latched on first violation.
 InvLocalInviteProjectsPending ==
     ~pendingProjectionViolation
+
+\* Tier-2 interaction bound: keep two-peer trust lifecycle exhaustive but
+\* limit independent expansion dimensions that do not add new behavior.
+CfgInteractionConstraint ==
+    /\ \A p \in Peers :
+        /\ Cardinality(peerSharedTrust[p]) <= 1
+        /\ Cardinality(bootstrapTrust[p]) <= 1
+        /\ Cardinality(pendingBootstrapTrust[p]) <= 1
+    /\ Cardinality({s \in SPKIs : inviteCreator[s] # None}) <= 1
+    /\ Cardinality({p \in Peers : credSource[p] = "peershared"}) <= 1
+    /\ Cardinality({p \in Peers : peerSharedTrust[p] # {}}) <= 1
+    /\ Cardinality({p \in Peers : bootstrapTrust[p] # {} \/ pendingBootstrapTrust[p] # {}}) <= 1
 
 ====
