@@ -39,7 +39,7 @@ pub fn load_transport_peer_id(
 ///
 /// Acceptable callers: `Peer::new()` in test harness, initial CLI `transport-identity`
 /// command before any workspace exists. All other paths must go through the event-derived
-/// identity flow (bootstrap_workspace → install_peer_key_transport_identity).
+/// identity flow (`create_workspace`/invite acceptance → install_peer_key_transport_identity).
 pub fn ensure_transport_peer_id(
     conn: &Connection,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
@@ -94,7 +94,7 @@ pub fn ensure_transport_cert(
 /// This is the **production** path for loading transport identity. Unlike
 /// `ensure_transport_cert`, it never silently generates a new random identity.
 /// The caller must have already established identity through the event-derived
-/// flow (bootstrap_workspace, accept_invite, or install_peer_key_transport_identity).
+/// flow (`create_workspace`, `accept_invite`, or install_peer_key_transport_identity).
 pub fn load_transport_cert_required(
     conn: &Connection,
 ) -> Result<

@@ -141,8 +141,8 @@ impl Peer {
     }
 
     /// Create a new peer with a full identity chain via the production
-    /// `bootstrap_workspace` flow (Workspace → UserInviteBoot → InviteAccepted →
-    /// UserBoot → DeviceInviteFirst → PeerSharedFirst → AdminBoot → TransportKey).
+    /// `create_workspace` flow (Workspace → InviteAccepted → UserInviteBoot →
+    /// UserBoot → DeviceInviteFirst → PeerSharedFirst + local signer secrets).
     /// Content events (Message, Reaction, etc.) are signed with the PeerShared key.
     pub fn new_with_identity(name: &str) -> Self {
         let mut peer = Self::new(name);
