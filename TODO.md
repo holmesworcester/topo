@@ -72,7 +72,7 @@ Evidence: current docs explicitly allow variable event payloads (`docs/DESIGN.md
 
 1. `message` (`content_len`): `src/events/message.rs:20`, `src/events/message.rs:50`
 2. `reaction` (`emoji_len`): `src/events/reaction.rs:20`, `src/events/reaction.rs:48`
-3. `signed_memo` (`content_len`): `src/events/signed_memo.rs:18`, `src/events/signed_memo.rs:43`
+3. retired type-4 event (`content_len`): `src/events/type4_legacy.rs` (historical)
 4. `encrypted` (`ciphertext_len`): `src/events/encrypted.rs:20`, `src/events/encrypted.rs:48`
 5. `file_slice` (`ciphertext_len`): `src/events/file_slice.rs:25`, `src/events/file_slice.rs:54`
 6. `message_attachment` (`filename_len` + `mime_len`): `src/events/message_attachment.rs:31`, `src/events/message_attachment.rs:90`

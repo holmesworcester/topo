@@ -95,7 +95,7 @@ Move projectors first for:
 
 1. message
 2. reaction
-3. signed_memo
+3. retired type-4 event (historical)
 4. secret_key
 5. message_attachment
 6. file_slice

@@ -44,6 +44,7 @@ an explicit `NON_MODELED::<reason>` waiver.
 | CHK_DI_PENDING_BOOTSTRAP_SRC | event_modules/device_invite::project_pure | InvPendingBootstrapTrustSource | projector_local |
 | CHK_USR_INSERT | event_modules/user::project_pure | InvDeps | projector_local |
 | CHK_PS_INSERT | event_modules/peer_shared::project_pure | InvPeerSharedTrustSource | projector_local |
+| CHK_PS_MATCH_CARRIED | event_modules/peer_shared::project_pure | InvPeerSharedTrustMatchesCarried | projector_local |
 | CHK_PS_SUPERSEDE | event_modules/peer_shared::project_pure | InvBootstrapConsumedByPeerShared | projector_local |
 | CHK_ADM_INSERT | event_modules/admin::project_pure | InvAdminChain | projector_local |
 | CHK_UR_INSERT | event_modules/user_removed::project_pure | InvRemovalAdmin | projector_local |

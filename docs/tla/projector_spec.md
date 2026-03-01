@@ -88,7 +88,7 @@ Changes to this document require TLA+ model re-verification.
 | 1 | project_message | messages | — |
 | 2 | project_reaction | reactions | skip if target deleted |
 | 3 | retired (peer_key) | — | rejected as unknown type |
-| 4 | retired (signed_memo) | — | rejected as unknown type |
+| 4 | retired (type4_legacy) | — | rejected as unknown type |
 | 5 | project_encrypted | (dispatches inner) | decrypt → admissibility check → shared dep/signer/dispatch stages |
 | 6 | project_secret_key | secret_keys | — |
 | 7 | project_message_deletion | deleted_messages | author auth + cascade |
