@@ -94,11 +94,16 @@ async fn low_mem_ios_budget_smoke_10k() {
     alice.batch_create_messages(5_000);
     bob.batch_create_messages(5_000);
 
-    let sample = alice.sample_event_ids(1)[0].clone();
+    // Count-based convergence gate: no marker events.
+    let alice_store_before_sync = alice.store_count();
+    let bob_store_before_sync = bob.store_count();
+    let expected_alice_store = alice_store_before_sync + bob_store_before_sync;
+    let expected_bob_store = bob_store_before_sync + alice_store_before_sync;
+
     let _metrics = sync_until_converged(
         &alice,
         &bob,
-        || bob.has_event(&sample),
+        || alice.store_count() >= expected_alice_store && bob.store_count() >= expected_bob_store,
         Duration::from_secs(180),
     )
     .await;
@@ -135,11 +140,15 @@ async fn low_mem_ios_budget_soak_million() {
     let bob = Peer::new_with_identity("bob_lowmem_soak");
 
     alice.batch_create_messages(events);
-    let sample = alice.sample_event_ids(1)[0].clone();
+    // Count-based convergence gate: wait for bob to ingest alice's store.
+    let alice_store_before_sync = alice.store_count();
+    let bob_store_before_sync = bob.store_count();
+    let expected_bob_store = bob_store_before_sync + alice_store_before_sync;
+
     let _metrics = sync_until_converged(
         &alice,
         &bob,
-        || bob.has_event(&sample),
+        || bob.store_count() >= expected_bob_store,
         Duration::from_secs(3600),
     )
     .await;
