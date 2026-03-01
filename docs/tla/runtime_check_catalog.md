@@ -50,7 +50,6 @@ an explicit `NON_MODELED::<reason>` waiver.
 | CHK_PR_INSERT | event_modules/peer_removed::project_pure | InvRemovalAdmin | projector_local |
 | CHK_SK_INSERT | event_modules/secret_key::project_pure | InvEncryptedKey | projector_local |
 | CHK_TK_INSERT | event_modules/transport_key::project_pure | InvPeerSharedTrustMatchesCarried | projector_local |
-| CHK_SM_INSERT | event_modules/signed_memo::project_pure | InvDeps | projector_local |
 | CHK_BD_NOOP | event_modules/bench_dep::project_pure | NON_MODELED::benchmark_only | projector_local |
 | CHK_IA_INVITE_RECORDED | event_modules/invite_accepted::project_pure | NON_MODELED::no_prior_invite_required | projector_local |
 | CHK_IA_ANCHOR_SOURCE | event_modules/invite_accepted::project_pure | InvTrustAnchorSource | projector_local |

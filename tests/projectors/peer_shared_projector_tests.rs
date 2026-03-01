@@ -128,4 +128,14 @@ mod tests {
         assert_deletes_from_table(&result, "invite_bootstrap_trust");
         assert_no_commands(&result);
     }
+
+    #[test]
+    fn test_peer_shared_rejects_non_peer_shared_event() {
+        let parsed = ParsedEvent::SecretKey(topo::event_modules::secret_key::SecretKeyEvent {
+            created_at_ms: 1,
+            key_bytes: [1u8; 32],
+        });
+        let result = project_pure(PEER, EVENT_ID, &parsed, &empty_ctx());
+        assert_reject(&result);
+    }
 }

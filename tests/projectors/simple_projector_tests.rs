@@ -1,7 +1,7 @@
 //! Pure projector conformance tests for simple projectors that do straight inserts
 //! with no guards beyond type matching.
 //!
-//! Covers: User, Admin, UserRemoved, PeerRemoved, SecretKey,
+//! Covers: User, Admin, UserRemoved, PeerRemoved, SecretKey, TransportKey,
 //!         MessageAttachment, BenchDep.
 
 #[cfg(test)]
@@ -12,6 +12,14 @@ mod tests {
 
     const PEER: &str = "peer_alice";
     const EVENT_ID: &str = "simple_event_1";
+
+    fn unrelated_event() -> ParsedEvent {
+        ParsedEvent::BenchDep(topo::event_modules::bench_dep::BenchDepEvent {
+            created_at_ms: 42,
+            dep_ids: vec![],
+            payload: [0u8; 16],
+        })
+    }
 
     // ── User (Boot) ──
 
@@ -48,6 +56,13 @@ mod tests {
         assert_writes_to_table(&result, "users");
     }
 
+    #[test]
+    fn test_user_rejects_non_user_event() {
+        use topo::event_modules::user::project_pure;
+        let result = project_pure(PEER, EVENT_ID, &unrelated_event(), &empty_ctx());
+        assert_reject(&result);
+    }
+
     // ── Admin (Boot) ──
 
     #[test]
@@ -81,6 +96,13 @@ mod tests {
         let result = project_pure(PEER, EVENT_ID, &parsed, &empty_ctx());
         assert_valid(&result);
         assert_writes_to_table(&result, "admins");
+    }
+
+    #[test]
+    fn test_admin_rejects_non_admin_event() {
+        use topo::event_modules::admin::project_pure;
+        let result = project_pure(PEER, EVENT_ID, &unrelated_event(), &empty_ctx());
+        assert_reject(&result);
     }
 
     // ── UserRemoved ──
@@ -134,11 +156,45 @@ mod tests {
         assert_no_commands(&result);
     }
 
+    #[test]
+    fn test_secret_key_rejects_non_secret_key_event() {
+        use topo::event_modules::secret_key::project_pure;
+        let result = project_pure(PEER, EVENT_ID, &unrelated_event(), &empty_ctx());
+        assert_reject(&result);
+    }
+
+    // ── TransportKey ──
+
+    #[test]
+    fn test_transport_key_valid() {
+        use topo::event_modules::transport_key::{project_pure, TransportKeyEvent};
+        let parsed = ParsedEvent::TransportKey(TransportKeyEvent {
+            created_at_ms: 6000,
+            spki_fingerprint: [0xCC; 32],
+            signed_by: [2u8; 32],
+            signer_type: 5,
+            signature: [0u8; 64],
+        });
+        let result = project_pure(PEER, EVENT_ID, &parsed, &empty_ctx());
+        assert_valid(&result);
+        assert_writes_to_table(&result, "transport_keys");
+        assert_no_commands(&result);
+    }
+
+    #[test]
+    fn test_transport_key_rejects_non_transport_key_event() {
+        use topo::event_modules::transport_key::project_pure;
+        let result = project_pure(PEER, EVENT_ID, &unrelated_event(), &empty_ctx());
+        assert_reject(&result);
+    }
+
     // ── MessageAttachment ──
 
     #[test]
     fn test_message_attachment_valid() {
-        use topo::event_modules::message_attachment::{project_pure, MessageAttachmentEvent};
+        use topo::event_modules::message_attachment::{
+            project_pure, MessageAttachmentEvent,
+        };
         let parsed = ParsedEvent::MessageAttachment(MessageAttachmentEvent {
             created_at_ms: 8000,
             message_id: [1u8; 32],
@@ -162,6 +218,13 @@ mod tests {
         });
     }
 
+    #[test]
+    fn test_message_attachment_rejects_non_attachment_event() {
+        use topo::event_modules::message_attachment::project_pure;
+        let result = project_pure(PEER, EVENT_ID, &unrelated_event(), &empty_ctx());
+        assert_reject(&result);
+    }
+
     // ── BenchDep (no-op projector) ──
 
     #[test]
@@ -174,10 +237,19 @@ mod tests {
         });
         let result = project_pure(PEER, EVENT_ID, &parsed, &empty_ctx());
         assert_valid(&result);
-        assert!(
-            result.write_ops.is_empty(),
-            "bench_dep should have no write_ops"
-        );
+        assert!(result.write_ops.is_empty(), "bench_dep should have no write_ops");
         assert_no_commands(&result);
+    }
+
+    #[test]
+    fn test_bench_dep_rejects_non_bench_dep_event() {
+        use topo::event_modules::bench_dep::project_pure;
+        let result = project_pure(PEER, EVENT_ID, &ParsedEvent::SecretKey(
+            topo::event_modules::secret_key::SecretKeyEvent {
+                created_at_ms: 1,
+                key_bytes: [9u8; 32],
+            },
+        ), &empty_ctx());
+        assert_reject(&result);
     }
 }

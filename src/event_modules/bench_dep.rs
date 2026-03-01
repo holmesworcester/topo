@@ -115,9 +115,13 @@ use crate::projection::result::{ContextSnapshot, ProjectorResult};
 pub fn project_pure(
     _recorded_by: &str,
     _event_id_b64: &str,
-    _parsed: &ParsedEvent,
+    parsed: &ParsedEvent,
     _ctx: &ContextSnapshot,
 ) -> ProjectorResult {
+    match parsed {
+        ParsedEvent::BenchDep(_) => {}
+        _ => return ProjectorResult::reject("not a bench_dep event".to_string()),
+    }
     ProjectorResult::valid(vec![])
 }
 

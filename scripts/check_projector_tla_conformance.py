@@ -163,6 +163,9 @@ def main() -> int:
         tid = row.get("test_id", "")
         if not tid or tid == "—":
             continue
+        # TLC config targets are model-check artifacts, not Rust test functions.
+        if tid.startswith("tlc::"):
+            continue
         # Check if any cargo test path ends with the matrix test_id
         if not any(p == tid or p.endswith("::" + tid) for p in real_test_paths):
             # In fallback mode, also try matching just the function name

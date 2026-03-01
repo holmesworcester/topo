@@ -73,4 +73,14 @@ mod tests {
         assert_no_write_to_table(&result, "pending_invite_bootstrap_trust");
         assert_no_commands(&result);
     }
+
+    #[test]
+    fn test_device_invite_rejects_non_device_invite_event() {
+        let parsed = ParsedEvent::SecretKey(topo::event_modules::secret_key::SecretKeyEvent {
+            created_at_ms: 1,
+            key_bytes: [1u8; 32],
+        });
+        let result = project_pure(PEER, EVENT_ID, &parsed, &empty_ctx());
+        assert_reject(&result);
+    }
 }

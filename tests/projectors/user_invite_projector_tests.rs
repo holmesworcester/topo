@@ -89,4 +89,14 @@ mod tests {
         assert_writes_to_table(&result, "user_invites");
         assert_no_commands(&result);
     }
+
+    #[test]
+    fn test_user_invite_rejects_non_user_invite_event() {
+        let parsed = ParsedEvent::SecretKey(topo::event_modules::secret_key::SecretKeyEvent {
+            created_at_ms: 1,
+            key_bytes: [1u8; 32],
+        });
+        let result = project_pure(PEER, EVENT_ID, &parsed, &empty_ctx());
+        assert_reject(&result);
+    }
 }
