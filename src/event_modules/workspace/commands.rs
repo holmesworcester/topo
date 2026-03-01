@@ -698,8 +698,11 @@ pub fn create_workspace_for_db(
     let conn = open_connection(db_path)?;
     create_tables(&conn)?;
 
+    let mut create_scope: Option<String> = None;
+
     // Check if identity already exists
     if let Ok(peer_id) = load_transport_peer_id(&conn) {
+        create_scope = Some(peer_id.clone());
         // Already bootstrapped — return existing workspace info
         let workspaces = super::list_items(&conn, &peer_id)?;
         if let Some(ws) = workspaces.first() {
@@ -713,7 +716,8 @@ pub fn create_workspace_for_db(
     // Bootstrap new identity chain via workspace command API.
     // create_workspace pre-derives the PeerShared transport identity and writes
     // all events under it, so no finalize_identity rewrite is needed.
-    let _result = create_workspace(&conn, "bootstrap", workspace_name, username, device_name)?;
+    let recorded_by = create_scope.as_deref().unwrap_or("bootstrap");
+    let _result = create_workspace(&conn, recorded_by, workspace_name, username, device_name)?;
     let derived =
         load_transport_peer_id(&conn).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
             format!("load transport peer id failed: {}", e).into()
@@ -1144,5 +1148,44 @@ mod tests {
             "unexpected error: {}",
             err
         );
+    }
+
+    #[test]
+    fn create_workspace_for_db_scopes_to_existing_transport_identity_when_workspace_missing() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let db_path = dir.path().join("db.sqlite");
+        let db_path = db_path.to_string_lossy().to_string();
+        let conn = crate::db::open_connection(&db_path).expect("open db");
+        create_tables(&conn).expect("create tables");
+
+        // Seed only local transport creds (no workspace/trust anchor rows yet).
+        let (cert, key) = crate::transport::generate_self_signed_cert().expect("generate cert");
+        let fp = crate::transport::extract_spki_fingerprint(cert.as_ref()).expect("extract spki");
+        let seeded_peer_id = hex::encode(fp);
+        crate::db::transport_creds::store_local_creds(
+            &conn,
+            &seeded_peer_id,
+            cert.as_ref(),
+            key.secret_pkcs8_der(),
+        )
+        .expect("store transport creds");
+        drop(conn);
+
+        let resp = create_workspace_for_db(&db_path, "ws", "alice", "laptop")
+            .expect("create workspace should succeed with existing scoped transport identity");
+        assert!(
+            !resp.workspace_id.is_empty(),
+            "workspace id should be populated"
+        );
+        assert!(
+            !resp.peer_id.is_empty(),
+            "peer id should be populated"
+        );
+
+        // Resulting transport identity should be the active local identity after create.
+        let conn2 = crate::db::open_connection(&db_path).expect("re-open db");
+        let loaded_peer_id =
+            crate::transport::identity::load_transport_peer_id(&conn2).expect("load peer id");
+        assert_eq!(loaded_peer_id, resp.peer_id);
     }
 }

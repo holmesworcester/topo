@@ -1431,7 +1431,8 @@ These rules are mandatory. Violations must be fixed before merge.
 
 ## 14.2 Layering convention
 
-Event modules (`src/event_modules/<type>.rs` or `src/event_modules/<type>/`) own five concerns:
+Event modules (`src/event_modules/<type>/`) own five concerns. During migration,
+some event types may remain single-file under `src/event_modules/<type>.rs`.
 
 1. **Wire** — struct definition, parse/encode, wire layout, `EventTypeMeta`.
 2. **Projector** — `project_pure()` function: the pure projector for this event type. Takes `(recorded_by, event_id_b64, &ParsedEvent, &ContextSnapshot)` and returns `ProjectorResult`. Registered in `EventTypeMeta.projector` so the pipeline dispatches via registry lookup with no central match statement.
@@ -1543,7 +1544,7 @@ The `invite_accepted` projector emits `RetryWorkspaceEvent { workspace_id }` aft
 
 When adding a new event type:
 
-1. Define the event struct, parse/encode, and `EventTypeMeta` in `src/event_modules/<type>.rs` (or `<type>/wire.rs` if split).
+1. Define the event struct, parse/encode, and `EventTypeMeta` in `src/event_modules/<type>/wire.rs` (or in `src/event_modules/<type>.rs` for legacy single-file modules).
 2. **Add `project_pure()`** — the pure projector function. Set `EventTypeMeta.projector = project_pure`. This is where all projection semantics for this event type live.
 3. Add `CreateXxxCmd` + `create()` for command paths.
 4. Add `query_*()` functions for any projection-table queries.
