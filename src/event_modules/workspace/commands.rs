@@ -88,9 +88,8 @@ pub fn create_workspace(
     username: &str,
     device_name: &str,
 ) -> Result<CreateWorkspaceResult, Box<dyn std::error::Error + Send + Sync>> {
-    // Idempotent check: if identity already exists, return it.
-    // Check the input recorded_by first, then fall back to any signer_kind=3
-    // entry (covers pre-derived workspaces where recorded_by ≠ derived_peer_id).
+    // Idempotent check: if this tenant identity already exists, return it.
+    // Strictly scoped by the provided recorded_by; no cross-tenant fallback.
     if let Some((eid, signing_key)) = load_local_peer_signer(db, recorded_by)? {
         let workspace_id = db
             .query_row(
@@ -106,28 +105,6 @@ pub fn create_workspace(
             peer_shared_event_id: eid,
             peer_shared_key: signing_key,
         });
-    }
-    // Single-tenant compatibility fallback:
-    // allow callers with a bootstrap/non-canonical recorded_by to resolve the
-    // existing identity chain only when there is exactly one local transport
-    // identity. In multi-tenant DBs this must not select an arbitrary signer.
-    if let Ok(Some((sole_peer_id, _, _))) = crate::db::transport_creds::load_sole_local_creds(db) {
-        if let Some((eid, signing_key)) = load_local_peer_signer(db, &sole_peer_id)? {
-            let workspace_id = db
-                .query_row(
-                    "SELECT workspace_id FROM trust_anchors WHERE peer_id = ?1",
-                    rusqlite::params![sole_peer_id],
-                    |row| row.get::<_, String>(0),
-                )
-                .ok()
-                .and_then(|b64| crate::crypto::event_id_from_base64(&b64))
-                .unwrap_or([0u8; 32]);
-            return Ok(CreateWorkspaceResult {
-                workspace_id,
-                peer_shared_event_id: eid,
-                peer_shared_key: signing_key,
-            });
-        }
     }
 
     let mut rng = rand::thread_rng();
