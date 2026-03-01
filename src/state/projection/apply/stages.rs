@@ -1,6 +1,5 @@
 use super::super::decision::ProjectionDecision;
 use super::super::encrypted::project_encrypted;
-use super::super::result::EmitCommand;
 use super::super::signer::{resolve_signer_key, verify_ed25519_signature, SignerResolution};
 use crate::crypto::{event_id_to_base64, EventId};
 use crate::event_modules::{registry, ParsedEvent};
@@ -174,29 +173,19 @@ pub(crate) fn apply_projection(
     // Dispatch to pure projector
     let result = dispatch_pure_projector(recorded_by, event_id_b64, parsed, &ctx);
 
-    // Apply: execute write_ops transactionally
-    if matches!(result.decision, ProjectionDecision::Valid)
-        || matches!(result.decision, ProjectionDecision::AlreadyProcessed)
-    {
-        execute_write_ops(conn, &result.write_ops)?;
-    }
-
-    // Execute emitted commands (only on Valid)
-    if matches!(result.decision, ProjectionDecision::Valid) {
-        execute_emit_commands(conn, recorded_by, &result.emit_commands)?;
-    }
-
-    // Handle guard-block commands even on Block decisions (e.g., file_slice guard blocks)
-    if matches!(result.decision, ProjectionDecision::Block { .. }) {
-        for cmd in &result.emit_commands {
-            if let EmitCommand::RecordFileSliceGuardBlock { file_id, event_id } = cmd {
-                conn.execute(
-                    "INSERT OR IGNORE INTO file_slice_guard_blocks (peer_id, file_id, event_id)
-                     VALUES (?1, ?2, ?3)",
-                    rusqlite::params![recorded_by, file_id, event_id],
-                )?;
-            }
+    // Explicit per-decision side-effect policy:
+    // - Valid: apply write_ops and emitted commands.
+    // - Block: apply emitted commands only (for block-side effects).
+    // - Reject / AlreadyProcessed: no side effects.
+    match result.decision {
+        ProjectionDecision::Valid => {
+            execute_write_ops(conn, &result.write_ops)?;
+            execute_emit_commands(conn, recorded_by, &result.emit_commands)?;
         }
+        ProjectionDecision::Block { .. } => {
+            execute_emit_commands(conn, recorded_by, &result.emit_commands)?;
+        }
+        ProjectionDecision::Reject { .. } | ProjectionDecision::AlreadyProcessed => {}
     }
 
     Ok(result.decision)

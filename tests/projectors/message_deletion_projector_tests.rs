@@ -5,7 +5,7 @@
 //!   CHK_DEL_NON_MESSAGE — type constraint rejection
 //!   CHK_DEL_INTENT — intent always recorded
 //!   CHK_DEL_TOMBSTONE — tombstone + cascade when target exists
-//!   CHK_DEL_IDEMPOTENT — AlreadyProcessed when already tombstoned
+//!   CHK_DEL_IDEMPOTENT — valid no-op when already tombstoned
 
 #[cfg(test)]
 mod tests {
@@ -100,7 +100,7 @@ mod tests {
         };
 
         let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
-        assert_already_processed(&result);
+        assert_valid(&result);
         // Should still record intent
         assert_writes_to_table(&result, "deletion_intents");
     }

@@ -60,7 +60,9 @@ pub enum EmitCommand {
 /// They are only applied when `decision` is `Valid`.
 ///
 /// `emit_commands` are follow-on actions to run after write_ops commit.
-/// They are only executed when `decision` is `Valid`.
+/// They are executed for:
+/// - `Valid` decisions (normal post-write follow-ons), and
+/// - `Block` decisions (block-side effects such as file-slice guard rows).
 #[derive(Debug, Clone)]
 pub struct ProjectorResult {
     pub decision: super::decision::ProjectionDecision,
