@@ -66,7 +66,8 @@ pub fn parse_file_slice(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     let mut file_id = [0u8; 32];
     file_id.copy_from_slice(&blob[off::FILE_ID..off::SLICE_NUMBER]);
 
-    let slice_number = u32::from_le_bytes(blob[off::SLICE_NUMBER..off::CIPHERTEXT].try_into().unwrap());
+    let slice_number =
+        u32::from_le_bytes(blob[off::SLICE_NUMBER..off::CIPHERTEXT].try_into().unwrap());
 
     let ciphertext = blob[off::CIPHERTEXT..off::CIPHERTEXT + FILE_SLICE_CIPHERTEXT_BYTES].to_vec();
 
@@ -105,7 +106,8 @@ pub fn encode_file_slice(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     buf[off::CREATED_AT..off::FILE_ID].copy_from_slice(&fs.created_at_ms.to_le_bytes());
     buf[off::FILE_ID..off::SLICE_NUMBER].copy_from_slice(&fs.file_id);
     buf[off::SLICE_NUMBER..off::CIPHERTEXT].copy_from_slice(&fs.slice_number.to_le_bytes());
-    buf[off::CIPHERTEXT..off::CIPHERTEXT + FILE_SLICE_CIPHERTEXT_BYTES].copy_from_slice(&fs.ciphertext);
+    buf[off::CIPHERTEXT..off::CIPHERTEXT + FILE_SLICE_CIPHERTEXT_BYTES]
+        .copy_from_slice(&fs.ciphertext);
     buf[off::SIGNED_BY..off::SIGNER_TYPE].copy_from_slice(&fs.signed_by);
     buf[off::SIGNER_TYPE] = fs.signer_type;
     buf[off::SIGNATURE..off::SIGNATURE + 64].copy_from_slice(&fs.signature);
@@ -126,6 +128,7 @@ pub static FILE_SLICE_META: EventTypeMeta = EventTypeMeta {
     parse: parse_file_slice,
     encode: encode_file_slice,
     projector: super::projector::project_pure,
+    context_loader: super::projector::build_projector_context,
 };
 
 #[cfg(test)]

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use super::{EventError, ParsedEvent};
 use crate::projection::result::{ContextSnapshot, ProjectorResult};
+use rusqlite::Connection;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShareScope {
@@ -37,6 +38,25 @@ pub struct EventTypeMeta {
     /// Module-owned pure projector function. The pipeline dispatches to this
     /// via registry lookup — no central match statement required.
     pub projector: fn(&str, &str, &ParsedEvent, &ContextSnapshot) -> ProjectorResult,
+    /// Module-owned projector context loader. Projector-specific context queries
+    /// belong in the owning event module, not in shared apply code.
+    pub context_loader: fn(
+        &Connection,
+        &str,
+        &str,
+        &ParsedEvent,
+    ) -> Result<ContextSnapshot, Box<dyn std::error::Error>>,
+}
+
+/// Default context loader for event types whose projectors do not require
+/// additional DB-derived context.
+pub fn load_empty_context(
+    _conn: &Connection,
+    _recorded_by: &str,
+    _event_id_b64: &str,
+    _parsed: &ParsedEvent,
+) -> Result<ContextSnapshot, Box<dyn std::error::Error>> {
+    Ok(ContextSnapshot::default())
 }
 
 pub struct EventRegistry {

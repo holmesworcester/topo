@@ -1,6 +1,5 @@
 use super::layout::common::{
-    ENCRYPTED_AUTH_TAG_BYTES,
-    encrypted_wire_size, encrypted_inner_wire_size,
+    encrypted_inner_wire_size, encrypted_wire_size, ENCRYPTED_AUTH_TAG_BYTES,
 };
 use super::registry::{EventTypeMeta, ShareScope};
 use super::{EventError, ParsedEvent, EVENT_TYPE_ENCRYPTED};
@@ -75,7 +74,8 @@ pub fn parse_encrypted(blob: &[u8]) -> Result<ParsedEvent, EventError> {
         });
     }
 
-    let created_at_ms = u64::from_le_bytes(blob[off::CREATED_AT..off::KEY_EVENT_ID].try_into().unwrap());
+    let created_at_ms =
+        u64::from_le_bytes(blob[off::CREATED_AT..off::KEY_EVENT_ID].try_into().unwrap());
 
     let mut key_event_id = [0u8; 32];
     key_event_id.copy_from_slice(&blob[off::KEY_EVENT_ID..off::INNER_TYPE_CODE]);
@@ -110,7 +110,9 @@ pub fn encode_encrypted(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         .ok_or(EventError::InvalidEncryptedInnerType(enc.inner_type_code))?;
 
     if enc.ciphertext.len() != expected_ct_size {
-        return Err(EventError::InvalidMetadata("ciphertext size does not match inner_type_code"));
+        return Err(EventError::InvalidMetadata(
+            "ciphertext size does not match inner_type_code",
+        ));
     }
 
     let total = encrypted_wire_size(expected_ct_size);
@@ -156,4 +158,5 @@ pub static ENCRYPTED_META: EventTypeMeta = EventTypeMeta {
     parse: parse_encrypted,
     encode: encode_encrypted,
     projector: project_pure,
+    context_loader: crate::event_modules::registry::load_empty_context,
 };

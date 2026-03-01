@@ -466,7 +466,7 @@ Entry-point requirement:
 - Internal cascade optimization: `project_one_step` (the 7-step algorithm without cascade) is used by the Kahn cascade worklist to avoid redundant recursive cascade. `apply_projection` executes `emit_commands` (which handles guard retries), so the cascade only manages Kahn dependency unblocking. All projection stages are shared; the split is a performance optimization, not an alternate path.
 
 Apply engine execution stages:
-1. Pipeline builds `ContextSnapshot` from DB (the only DB reads the projector needs).
+1. Pipeline resolves `EventTypeMeta` and calls the event-module-owned `context_loader(conn, recorded_by, event_id_b64, parsed)` to build `ContextSnapshot`.
 2. Pipeline calls pure projector → receives `ProjectorResult`.
 3. Pipeline executes `write_ops` transactionally (only on Valid/AlreadyProcessed).
 4. Pipeline executes `emit_commands` via explicit handlers (only on Valid).
@@ -477,13 +477,14 @@ DRY split (required):
   1. canonical event load/decode dispatch,
   2. dependency extraction + missing-dependency block writes,
   3. signer resolution + signature verification ordering (Phase 6),
-  4. building `ContextSnapshot` from the database,
+  4. orchestrating context loading via `EventTypeMeta.context_loader` (no projector-specific SQL in pipeline files),
   5. executing `write_ops` and `emit_commands`,
   6. terminal state writes (`valid`/`block`/`reject`) + queue transitions.
 - Per-event projector code owns only:
   1. event-specific predicate/policy checks,
   2. returning `ProjectorResult` with deterministic `write_ops` and `emit_commands`.
-- Per-event projector code must not access the database, implement its own dependency walker, signer verifier, queue handling, or terminal-state writer.
+- Event modules own projector-specific SQL context queries through module-local context loaders (`queries.rs` or projector-local helpers).
+- Per-event projector functions (`project_pure`) must not access the database, implement their own dependency walker, signer verifier, queue handling, or terminal-state writer.
 
 ### Default behavior
 

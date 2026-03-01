@@ -9,9 +9,9 @@ pub const USER_REMOVED_WIRE_SIZE: usize = IDENTITY_PUBKEY_SIGNED_WIRE_SIZE;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserRemovedEvent {
     pub created_at_ms: u64,
-    pub target_event_id: [u8; 32],  // User event being removed
-    pub signed_by: [u8; 32],        // signer event_id (PeerShared event — admin)
-    pub signer_type: u8,            // 5 = peer_shared
+    pub target_event_id: [u8; 32], // User event being removed
+    pub signed_by: [u8; 32],       // signer event_id (PeerShared event — admin)
+    pub signer_type: u8,           // 5 = peer_shared
     pub signature: [u8; 64],
 }
 
@@ -24,13 +24,22 @@ pub struct UserRemovedEvent {
 /// [74..138]  signature (64 bytes)
 pub fn parse_user_removed(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if blob.len() < IDENTITY_PUBKEY_SIGNED_WIRE_SIZE {
-        return Err(EventError::TooShort { expected: IDENTITY_PUBKEY_SIGNED_WIRE_SIZE, actual: blob.len() });
+        return Err(EventError::TooShort {
+            expected: IDENTITY_PUBKEY_SIGNED_WIRE_SIZE,
+            actual: blob.len(),
+        });
     }
     if blob.len() > IDENTITY_PUBKEY_SIGNED_WIRE_SIZE {
-        return Err(EventError::TrailingData { expected: IDENTITY_PUBKEY_SIGNED_WIRE_SIZE, actual: blob.len() });
+        return Err(EventError::TrailingData {
+            expected: IDENTITY_PUBKEY_SIGNED_WIRE_SIZE,
+            actual: blob.len(),
+        });
     }
     if blob[0] != EVENT_TYPE_USER_REMOVED {
-        return Err(EventError::WrongType { expected: EVENT_TYPE_USER_REMOVED, actual: blob[0] });
+        return Err(EventError::WrongType {
+            expected: EVENT_TYPE_USER_REMOVED,
+            actual: blob[0],
+        });
     }
 
     let created_at_ms = u64::from_le_bytes(blob[1..9].try_into().unwrap());
@@ -110,6 +119,7 @@ pub static USER_REMOVED_META: EventTypeMeta = EventTypeMeta {
     parse: parse_user_removed,
     encode: encode_user_removed,
     projector: project_pure,
+    context_loader: crate::event_modules::registry::load_empty_context,
 };
 
 // === Command/Query APIs (event-module locality) ===
@@ -152,9 +162,14 @@ pub fn remove_user(
     target_event_id: EventId,
 ) -> Result<String, String> {
     create(
-        db, recorded_by, signer_eid, signing_key, created_at_ms,
+        db,
+        recorded_by,
+        signer_eid,
+        signing_key,
+        created_at_ms,
         CreateUserRemovedCmd { target_event_id },
-    ).map_err(|e| format!("{}", e))?;
+    )
+    .map_err(|e| format!("{}", e))?;
 
     Ok(hex::encode(target_event_id))
 }

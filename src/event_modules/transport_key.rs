@@ -9,9 +9,9 @@ pub const TRANSPORT_KEY_WIRE_SIZE: usize = IDENTITY_PUBKEY_SIGNED_WIRE_SIZE;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportKeyEvent {
     pub created_at_ms: u64,
-    pub spki_fingerprint: [u8; 32],  // BLAKE2b-256 of cert SPKI
-    pub signed_by: [u8; 32],         // signer event_id (PeerShared event)
-    pub signer_type: u8,             // 5 = peer_shared
+    pub spki_fingerprint: [u8; 32], // BLAKE2b-256 of cert SPKI
+    pub signed_by: [u8; 32],        // signer event_id (PeerShared event)
+    pub signer_type: u8,            // 5 = peer_shared
     pub signature: [u8; 64],
 }
 
@@ -24,13 +24,22 @@ pub struct TransportKeyEvent {
 /// [74..138]  signature (64 bytes)
 pub fn parse_transport_key(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if blob.len() < IDENTITY_PUBKEY_SIGNED_WIRE_SIZE {
-        return Err(EventError::TooShort { expected: IDENTITY_PUBKEY_SIGNED_WIRE_SIZE, actual: blob.len() });
+        return Err(EventError::TooShort {
+            expected: IDENTITY_PUBKEY_SIGNED_WIRE_SIZE,
+            actual: blob.len(),
+        });
     }
     if blob.len() > IDENTITY_PUBKEY_SIGNED_WIRE_SIZE {
-        return Err(EventError::TrailingData { expected: IDENTITY_PUBKEY_SIGNED_WIRE_SIZE, actual: blob.len() });
+        return Err(EventError::TrailingData {
+            expected: IDENTITY_PUBKEY_SIGNED_WIRE_SIZE,
+            actual: blob.len(),
+        });
     }
     if blob[0] != EVENT_TYPE_TRANSPORT_KEY {
-        return Err(EventError::WrongType { expected: EVENT_TYPE_TRANSPORT_KEY, actual: blob[0] });
+        return Err(EventError::WrongType {
+            expected: EVENT_TYPE_TRANSPORT_KEY,
+            actual: blob[0],
+        });
     }
 
     let created_at_ms = u64::from_le_bytes(blob[1..9].try_into().unwrap());
@@ -124,14 +133,12 @@ pub static TRANSPORT_KEY_META: EventTypeMeta = EventTypeMeta {
     parse: parse_transport_key,
     encode: encode_transport_key,
     projector: project_pure,
+    context_loader: crate::event_modules::registry::load_empty_context,
 };
 
 // === Query APIs (event-module locality) ===
 
-pub fn count(
-    db: &Connection,
-    recorded_by: &str,
-) -> Result<i64, rusqlite::Error> {
+pub fn count(db: &Connection, recorded_by: &str) -> Result<i64, rusqlite::Error> {
     db.query_row(
         "SELECT COUNT(*) FROM transport_keys WHERE recorded_by = ?1",
         rusqlite::params![recorded_by],

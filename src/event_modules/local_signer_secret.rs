@@ -86,8 +86,8 @@ pub fn encode_local_signer_secret(event: &ParsedEvent) -> Result<Vec<u8>, EventE
 
 // === Projector (event-module locality) ===
 
-use crate::crypto::event_id_to_base64;
 use crate::contracts::transport_identity_contract::TransportIdentityIntent;
+use crate::crypto::event_id_to_base64;
 use crate::projection::result::{ContextSnapshot, EmitCommand, ProjectorResult, SqlVal, WriteOp};
 use rusqlite::Connection;
 
@@ -124,15 +124,13 @@ pub fn project_pure(
 
     let signer_eid_b64 = event_id_to_base64(&e.signer_event_id);
 
-    let mut ops = vec![
-        WriteOp::Delete {
-            table: "local_signer_material",
-            where_clause: vec![
-                ("recorded_by", SqlVal::Text(recorded_by.to_string())),
-                ("signer_event_id", SqlVal::Text(signer_eid_b64.clone())),
-            ],
-        },
-    ];
+    let mut ops = vec![WriteOp::Delete {
+        table: "local_signer_material",
+        where_clause: vec![
+            ("recorded_by", SqlVal::Text(recorded_by.to_string())),
+            ("signer_event_id", SqlVal::Text(signer_eid_b64.clone())),
+        ],
+    }];
     // signer_kind=4 with all-zero key bytes is a delete tombstone.
     let is_pending_tombstone =
         e.signer_kind == SIGNER_KIND_PENDING_INVITE_UNWRAP && e.private_key_bytes == [0u8; 32];
@@ -186,6 +184,7 @@ pub static LOCAL_SIGNER_SECRET_META: EventTypeMeta = EventTypeMeta {
     parse: parse_local_signer_secret,
     encode: encode_local_signer_secret,
     projector: project_pure,
+    context_loader: crate::event_modules::registry::load_empty_context,
 };
 
 #[cfg(test)]

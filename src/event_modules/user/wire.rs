@@ -1,9 +1,5 @@
 use super::super::layout::common::{
-    COMMON_HEADER_BYTES,
-    SIGNATURE_TRAILER_BYTES,
-    NAME_BYTES,
-    read_text_slot,
-    write_text_slot,
+    read_text_slot, write_text_slot, COMMON_HEADER_BYTES, NAME_BYTES, SIGNATURE_TRAILER_BYTES,
 };
 use super::super::registry::{EventTypeMeta, ShareScope};
 use super::super::{EventError, ParsedEvent, EVENT_TYPE_USER_BOOT, EVENT_TYPE_USER_ONGOING};
@@ -49,16 +45,26 @@ pub struct UserOngoingEvent {
 
 pub fn parse_user_boot(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if blob.len() < USER_WIRE_SIZE {
-        return Err(EventError::TooShort { expected: USER_WIRE_SIZE, actual: blob.len() });
+        return Err(EventError::TooShort {
+            expected: USER_WIRE_SIZE,
+            actual: blob.len(),
+        });
     }
     if blob.len() > USER_WIRE_SIZE {
-        return Err(EventError::TrailingData { expected: USER_WIRE_SIZE, actual: blob.len() });
+        return Err(EventError::TrailingData {
+            expected: USER_WIRE_SIZE,
+            actual: blob.len(),
+        });
     }
     if blob[0] != EVENT_TYPE_USER_BOOT {
-        return Err(EventError::WrongType { expected: EVENT_TYPE_USER_BOOT, actual: blob[0] });
+        return Err(EventError::WrongType {
+            expected: EVENT_TYPE_USER_BOOT,
+            actual: blob[0],
+        });
     }
 
-    let created_at_ms = u64::from_le_bytes(blob[off::CREATED_AT..off::PUBLIC_KEY].try_into().unwrap());
+    let created_at_ms =
+        u64::from_le_bytes(blob[off::CREATED_AT..off::PUBLIC_KEY].try_into().unwrap());
     let mut public_key = [0u8; 32];
     public_key.copy_from_slice(&blob[off::PUBLIC_KEY..off::USERNAME]);
 
@@ -90,8 +96,11 @@ pub fn encode_user_boot(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     buf[off::TYPE_CODE] = EVENT_TYPE_USER_BOOT;
     buf[off::CREATED_AT..off::PUBLIC_KEY].copy_from_slice(&e.created_at_ms.to_le_bytes());
     buf[off::PUBLIC_KEY..off::USERNAME].copy_from_slice(&e.public_key);
-    write_text_slot(&e.username, &mut buf[off::USERNAME..off::USERNAME + NAME_BYTES])
-        .map_err(EventError::TextSlot)?;
+    write_text_slot(
+        &e.username,
+        &mut buf[off::USERNAME..off::USERNAME + NAME_BYTES],
+    )
+    .map_err(EventError::TextSlot)?;
     buf[off::SIGNED_BY..off::SIGNER_TYPE].copy_from_slice(&e.signed_by);
     buf[off::SIGNER_TYPE] = e.signer_type;
     buf[off::SIGNATURE..off::SIGNATURE + 64].copy_from_slice(&e.signature);
@@ -100,16 +109,26 @@ pub fn encode_user_boot(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
 
 pub fn parse_user_ongoing(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if blob.len() < USER_WIRE_SIZE {
-        return Err(EventError::TooShort { expected: USER_WIRE_SIZE, actual: blob.len() });
+        return Err(EventError::TooShort {
+            expected: USER_WIRE_SIZE,
+            actual: blob.len(),
+        });
     }
     if blob.len() > USER_WIRE_SIZE {
-        return Err(EventError::TrailingData { expected: USER_WIRE_SIZE, actual: blob.len() });
+        return Err(EventError::TrailingData {
+            expected: USER_WIRE_SIZE,
+            actual: blob.len(),
+        });
     }
     if blob[0] != EVENT_TYPE_USER_ONGOING {
-        return Err(EventError::WrongType { expected: EVENT_TYPE_USER_ONGOING, actual: blob[0] });
+        return Err(EventError::WrongType {
+            expected: EVENT_TYPE_USER_ONGOING,
+            actual: blob[0],
+        });
     }
 
-    let created_at_ms = u64::from_le_bytes(blob[off::CREATED_AT..off::PUBLIC_KEY].try_into().unwrap());
+    let created_at_ms =
+        u64::from_le_bytes(blob[off::CREATED_AT..off::PUBLIC_KEY].try_into().unwrap());
     let mut public_key = [0u8; 32];
     public_key.copy_from_slice(&blob[off::PUBLIC_KEY..off::USERNAME]);
 
@@ -141,8 +160,11 @@ pub fn encode_user_ongoing(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     buf[off::TYPE_CODE] = EVENT_TYPE_USER_ONGOING;
     buf[off::CREATED_AT..off::PUBLIC_KEY].copy_from_slice(&e.created_at_ms.to_le_bytes());
     buf[off::PUBLIC_KEY..off::USERNAME].copy_from_slice(&e.public_key);
-    write_text_slot(&e.username, &mut buf[off::USERNAME..off::USERNAME + NAME_BYTES])
-        .map_err(EventError::TextSlot)?;
+    write_text_slot(
+        &e.username,
+        &mut buf[off::USERNAME..off::USERNAME + NAME_BYTES],
+    )
+    .map_err(EventError::TextSlot)?;
     buf[off::SIGNED_BY..off::SIGNER_TYPE].copy_from_slice(&e.signed_by);
     buf[off::SIGNER_TYPE] = e.signer_type;
     buf[off::SIGNATURE..off::SIGNATURE + 64].copy_from_slice(&e.signature);
@@ -162,6 +184,7 @@ pub static USER_BOOT_META: EventTypeMeta = EventTypeMeta {
     parse: parse_user_boot,
     encode: encode_user_boot,
     projector: super::projector::project_pure,
+    context_loader: crate::event_modules::registry::load_empty_context,
 };
 
 pub static USER_ONGOING_META: EventTypeMeta = EventTypeMeta {
@@ -177,6 +200,7 @@ pub static USER_ONGOING_META: EventTypeMeta = EventTypeMeta {
     parse: parse_user_ongoing,
     encode: encode_user_ongoing,
     projector: super::projector::project_pure,
+    context_loader: crate::event_modules::registry::load_empty_context,
 };
 
 #[cfg(test)]

@@ -11,8 +11,7 @@ pub const BENCH_DEP_MAX_SLOTS: usize = 10;
 pub const BENCH_DEP_SLOTS_BYTES: usize = BENCH_DEP_MAX_SLOTS * 32;
 
 /// BenchDep (type 26): type(1) + created_at(8) + dep_slots(320) + payload(16) = 345
-pub const BENCH_DEP_WIRE_SIZE: usize =
-    COMMON_HEADER_BYTES + BENCH_DEP_SLOTS_BYTES + 16;
+pub const BENCH_DEP_WIRE_SIZE: usize = COMMON_HEADER_BYTES + BENCH_DEP_SLOTS_BYTES + 16;
 
 mod bench_dep_offsets {
     pub const TYPE_CODE: usize = 0;
@@ -57,7 +56,8 @@ pub fn parse_bench_dep(blob: &[u8]) -> Result<ParsedEvent, EventError> {
         });
     }
 
-    let created_at_ms = u64::from_le_bytes(blob[off::CREATED_AT..off::DEP_SLOTS].try_into().unwrap());
+    let created_at_ms =
+        u64::from_le_bytes(blob[off::CREATED_AT..off::DEP_SLOTS].try_into().unwrap());
 
     // Read all 10 slots, collect non-zero ones as deps
     let mut dep_ids = Vec::new();
@@ -134,6 +134,7 @@ pub static BENCH_DEP_META: EventTypeMeta = EventTypeMeta {
     parse: parse_bench_dep,
     encode: encode_bench_dep,
     projector: project_pure,
+    context_loader: crate::event_modules::registry::load_empty_context,
 };
 
 #[cfg(test)]

@@ -2,7 +2,10 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::event_id_from_base64;
-use crate::event_modules::{admin, message, peer_shared, reaction, transport_key, user};
+use crate::event_modules::{
+    admin, message, peer_shared, reaction, transport_key, user, ParsedEvent,
+};
+use crate::projection::result::ContextSnapshot;
 use crate::service::open_db_for_peer;
 
 /// Look up the workspace_id for a peer from trust_anchors.
@@ -23,15 +26,39 @@ pub fn resolve_workspace_for_peer(
         .ok_or_else(|| format!("invalid workspace_id in trust_anchors: {}", ws_b64).into())
 }
 
+/// Build projector-local context for Workspace projection.
+pub fn build_projector_context(
+    db: &Connection,
+    recorded_by: &str,
+    _event_id_b64: &str,
+    parsed: &ParsedEvent,
+) -> Result<ContextSnapshot, Box<dyn std::error::Error>> {
+    if !matches!(parsed, ParsedEvent::Workspace(_)) {
+        return Err("workspace context loader called for non-workspace event".into());
+    }
+
+    let trust_anchor_workspace_id = match db.query_row(
+        "SELECT workspace_id FROM trust_anchors WHERE peer_id = ?1",
+        rusqlite::params![recorded_by],
+        |row| row.get::<_, String>(0),
+    ) {
+        Ok(v) => Some(v),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(e) => return Err(e.into()),
+    };
+
+    Ok(ContextSnapshot {
+        trust_anchor_workspace_id,
+        ..ContextSnapshot::default()
+    })
+}
+
 pub struct WorkspaceRow {
     pub event_id: String,
     pub workspace_id: String,
 }
 
-pub fn list(
-    db: &Connection,
-    recorded_by: &str,
-) -> Result<Vec<WorkspaceRow>, rusqlite::Error> {
+pub fn list(db: &Connection, recorded_by: &str) -> Result<Vec<WorkspaceRow>, rusqlite::Error> {
     let mut stmt =
         db.prepare("SELECT event_id, workspace_id FROM workspaces WHERE recorded_by = ?1")?;
     let rows = stmt
@@ -46,10 +73,7 @@ pub fn list(
 }
 
 /// Return the workspace display name for the first workspace, or empty string.
-pub fn name(
-    db: &Connection,
-    recorded_by: &str,
-) -> Result<String, rusqlite::Error> {
+pub fn name(db: &Connection, recorded_by: &str) -> Result<String, rusqlite::Error> {
     use rusqlite::OptionalExtension;
     Ok(db
         .query_row(
@@ -110,10 +134,7 @@ pub struct StatusResponse {
 }
 
 /// Query workspace status counts.
-pub fn status(
-    db: &Connection,
-    recorded_by: &str,
-) -> StatusResponse {
+pub fn status(db: &Connection, recorded_by: &str) -> StatusResponse {
     let events_count: i64 = db
         .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
         .unwrap_or(0);

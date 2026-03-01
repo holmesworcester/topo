@@ -15,9 +15,9 @@ pub const ADMIN_ONGOING_WIRE_SIZE: usize = ADMIN_BOOT_WIRE_SIZE;
 pub struct AdminBootEvent {
     pub created_at_ms: u64,
     pub public_key: [u8; 32],
-    pub user_event_id: [u8; 32],  // dep: User event
-    pub signed_by: [u8; 32],      // signer event_id (Workspace event)
-    pub signer_type: u8,          // 1 = workspace
+    pub user_event_id: [u8; 32], // dep: User event
+    pub signed_by: [u8; 32],     // signer event_id (Workspace event)
+    pub signer_type: u8,         // 1 = workspace
     pub signature: [u8; 64],
 }
 
@@ -25,9 +25,9 @@ pub struct AdminBootEvent {
 pub struct AdminOngoingEvent {
     pub created_at_ms: u64,
     pub public_key: [u8; 32],
-    pub admin_boot_event_id: [u8; 32],  // dep: AdminBoot event
-    pub signed_by: [u8; 32],            // signer event_id (PeerShared event)
-    pub signer_type: u8,                // 5 = peer_shared
+    pub admin_boot_event_id: [u8; 32], // dep: AdminBoot event
+    pub signed_by: [u8; 32],           // signer event_id (PeerShared event)
+    pub signer_type: u8,               // 5 = peer_shared
     pub signature: [u8; 64],
 }
 
@@ -41,13 +41,22 @@ pub struct AdminOngoingEvent {
 /// [106..170] signature (64 bytes)
 pub fn parse_admin_boot(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if blob.len() < ADMIN_BOOT_WIRE_SIZE {
-        return Err(EventError::TooShort { expected: ADMIN_BOOT_WIRE_SIZE, actual: blob.len() });
+        return Err(EventError::TooShort {
+            expected: ADMIN_BOOT_WIRE_SIZE,
+            actual: blob.len(),
+        });
     }
     if blob.len() > ADMIN_BOOT_WIRE_SIZE {
-        return Err(EventError::TrailingData { expected: ADMIN_BOOT_WIRE_SIZE, actual: blob.len() });
+        return Err(EventError::TrailingData {
+            expected: ADMIN_BOOT_WIRE_SIZE,
+            actual: blob.len(),
+        });
     }
     if blob[0] != EVENT_TYPE_ADMIN_BOOT {
-        return Err(EventError::WrongType { expected: EVENT_TYPE_ADMIN_BOOT, actual: blob[0] });
+        return Err(EventError::WrongType {
+            expected: EVENT_TYPE_ADMIN_BOOT,
+            actual: blob[0],
+        });
     }
 
     let created_at_ms = u64::from_le_bytes(blob[1..9].try_into().unwrap());
@@ -97,13 +106,22 @@ pub fn encode_admin_boot(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
 /// [106..170] signature (64 bytes)
 pub fn parse_admin_ongoing(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if blob.len() < ADMIN_ONGOING_WIRE_SIZE {
-        return Err(EventError::TooShort { expected: ADMIN_ONGOING_WIRE_SIZE, actual: blob.len() });
+        return Err(EventError::TooShort {
+            expected: ADMIN_ONGOING_WIRE_SIZE,
+            actual: blob.len(),
+        });
     }
     if blob.len() > ADMIN_ONGOING_WIRE_SIZE {
-        return Err(EventError::TrailingData { expected: ADMIN_ONGOING_WIRE_SIZE, actual: blob.len() });
+        return Err(EventError::TrailingData {
+            expected: ADMIN_ONGOING_WIRE_SIZE,
+            actual: blob.len(),
+        });
     }
     if blob[0] != EVENT_TYPE_ADMIN_ONGOING {
-        return Err(EventError::WrongType { expected: EVENT_TYPE_ADMIN_ONGOING, actual: blob[0] });
+        return Err(EventError::WrongType {
+            expected: EVENT_TYPE_ADMIN_ONGOING,
+            actual: blob[0],
+        });
     }
 
     let created_at_ms = u64::from_le_bytes(blob[1..9].try_into().unwrap());
@@ -156,6 +174,7 @@ pub static ADMIN_BOOT_META: EventTypeMeta = EventTypeMeta {
     parse: parse_admin_boot,
     encode: encode_admin_boot,
     projector: super::projector::project_pure,
+    context_loader: crate::event_modules::registry::load_empty_context,
 };
 
 pub static ADMIN_ONGOING_META: EventTypeMeta = EventTypeMeta {
@@ -171,4 +190,5 @@ pub static ADMIN_ONGOING_META: EventTypeMeta = EventTypeMeta {
     parse: parse_admin_ongoing,
     encode: encode_admin_ongoing,
     projector: super::projector::project_pure,
+    context_loader: crate::event_modules::registry::load_empty_context,
 };

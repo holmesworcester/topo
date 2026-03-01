@@ -93,18 +93,16 @@ pub fn project_pure(
         _ => return ProjectorResult::reject("not a secret_key event".to_string()),
     };
 
-    let ops = vec![
-        WriteOp::InsertOrIgnore {
-            table: "secret_keys",
-            columns: vec!["event_id", "key_bytes", "created_at", "recorded_by"],
-            values: vec![
-                SqlVal::Text(event_id_b64.to_string()),
-                SqlVal::Blob(sk.key_bytes.to_vec()),
-                SqlVal::Int(sk.created_at_ms as i64),
-                SqlVal::Text(recorded_by.to_string()),
-            ],
-        },
-    ];
+    let ops = vec![WriteOp::InsertOrIgnore {
+        table: "secret_keys",
+        columns: vec!["event_id", "key_bytes", "created_at", "recorded_by"],
+        values: vec![
+            SqlVal::Text(event_id_b64.to_string()),
+            SqlVal::Blob(sk.key_bytes.to_vec()),
+            SqlVal::Int(sk.created_at_ms as i64),
+            SqlVal::Text(recorded_by.to_string()),
+        ],
+    }];
     ProjectorResult::valid(ops)
 }
 
@@ -121,4 +119,5 @@ pub static SECRET_KEY_META: EventTypeMeta = EventTypeMeta {
     parse: parse_secret_key,
     encode: encode_secret_key,
     projector: project_pure,
+    context_loader: crate::event_modules::registry::load_empty_context,
 };
