@@ -160,7 +160,7 @@ pub static DEVICE_INVITE_FIRST_META: EventTypeMeta = EventTypeMeta {
     parse: parse_device_invite_first,
     encode: encode_device_invite_first,
     projector: super::projector::project_pure,
-    context_loader: super::projector::build_projector_context,
+    context_loader: super::projection_context::build_projector_context,
 };
 
 pub static DEVICE_INVITE_ONGOING_META: EventTypeMeta = EventTypeMeta {
@@ -176,5 +176,5 @@ pub static DEVICE_INVITE_ONGOING_META: EventTypeMeta = EventTypeMeta {
     parse: parse_device_invite_ongoing,
     encode: encode_device_invite_ongoing,
     projector: super::projector::project_pure,
-    context_loader: super::projector::build_projector_context,
+    context_loader: super::projection_context::build_projector_context,
 };

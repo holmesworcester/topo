@@ -117,5 +117,5 @@ pub static MESSAGE_META: EventTypeMeta = EventTypeMeta {
     parse: parse_message,
     encode: encode_message,
     projector: super::projector::project_pure,
-    context_loader: super::queries::build_projector_context,
+    context_loader: super::projection_context::build_projector_context,
 };

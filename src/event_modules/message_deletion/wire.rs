@@ -104,5 +104,5 @@ pub static MESSAGE_DELETION_META: EventTypeMeta = EventTypeMeta {
     parse: parse_message_deletion,
     encode: encode_message_deletion,
     projector: super::projector::project_pure,
-    context_loader: super::queries::build_projector_context,
+    context_loader: super::projection_context::build_projector_context,
 };
