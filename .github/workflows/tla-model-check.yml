@@ -1,0 +1,83 @@
+name: TLA Model Check
+
+on:
+  push:
+    paths:
+      - 'docs/tla/**'
+      - 'src/runtime/**'
+      - '.github/workflows/tla-model-check.yml'
+  pull_request:
+    paths:
+      - 'docs/tla/**'
+      - 'src/runtime/**'
+      - '.github/workflows/tla-model-check.yml'
+  workflow_dispatch:
+
+jobs:
+  tla-tier1:
+    name: TLA Tier 1 Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Run Tier 1 model checks
+        run: |
+          set -euo pipefail
+          cd docs/tla
+          chmod +x ./tlc
+          ./tlc event_graph_schema_fast.cfg
+          ./tlc TransportCredentialLifecycle transport_credential_lifecycle_fast.cfg
+          ./tlc UnifiedBridge unified_bridge_fix_repro.cfg
+          ./tlc UnifiedBridge unified_bridge_progress_fast.cfg
+
+  tla-tier2:
+    name: TLA Tier 2 Gate (Manual/Pre-merge)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+       contains(join(github.event.pull_request.labels.*.name, ','), 'tla-tier2'))
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Run Tier 2 tractable model checks
+        run: |
+          set -euo pipefail
+          cd docs/tla
+          chmod +x ./tlc
+          ./tlc TransportCredentialLifecycle transport_credential_lifecycle_fix_repro.cfg
+          ./tlc UnifiedBridge unified_bridge_progress_deep.cfg
+
+      - name: Validate expected bug repro failures
+        run: |
+          set -euo pipefail
+          cd docs/tla
+          if ./tlc TransportCredentialLifecycle transport_credential_lifecycle_bug_repro.cfg; then
+            echo "expected transport_credential_lifecycle_bug_repro.cfg to fail but it passed"
+            exit 1
+          fi
+          echo "observed expected failing counterexample in transport_credential_lifecycle_bug_repro.cfg"
+          if ./tlc UnifiedBridge unified_bridge_bug_repro.cfg; then
+            echo "expected unified_bridge_bug_repro.cfg to fail but it passed"
+            exit 1
+          fi
+          echo "observed expected failing counterexample in unified_bridge_bug_repro.cfg"
+
+      - name: Note full Tier 2 status
+        run: |
+          echo "event_graph_schema.cfg and transport_credential_lifecycle.cfg remain manual pre-merge due current state-space cost;"
+          echo "run locally per docs/tla/UNIFIED_MODEL_PLAN.md when trust/bootstrap logic changes."

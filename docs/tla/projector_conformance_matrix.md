@@ -172,6 +172,43 @@ both `pass` and `break` polarity unless waived.
 | SPEC_TCL_CRED_SOURCE_01 | InvCredentialSourceConsistency | CHK_TCL_CRED_SOURCE_CONSISTENCY | transport_credential | apply::tests::test_signed_content_events_project_with_identity_chain | pass |
 | SPEC_TCL_CRED_SOURCE_01 | InvCredentialSourceConsistency | CHK_TCL_CRED_SOURCE_CONSISTENCY | transport_credential | — | waiver:integration_effect_only |
 
+## UnifiedBridge Invariants
+
+| spec_id | source | check_id | layer | test_id | polarity |
+|---------|--------|----------|-------|---------|----------|
+| SPEC_BR_ROW_RUNTIME_01 | BrInv_RowToMaterializedExactness | CHK_BRIDGE_ROW_TO_RUNTIME_TRUST | bridge_integration | apply::tests::test_signed_content_events_project_with_identity_chain | pass |
+| SPEC_BR_ROW_RUNTIME_01 | BrInv_RowToMaterializedExactness | CHK_BRIDGE_ROW_TO_RUNTIME_TRUST | bridge_integration | — | waiver:integration_effect_only |
+| SPEC_BR_PENDING_LOCAL_01 | BrInv_PendingOnlyOnInviter | CHK_BRIDGE_PENDING_LOCAL_CREATE | projector_unit | user_invite_projector_tests::tests::test_user_invite_boot_emits_pending_trust | pass |
+| SPEC_BR_PENDING_LOCAL_01 | BrInv_PendingOnlyOnInviter | CHK_BRIDGE_PENDING_LOCAL_CREATE | projector_unit | user_invite_projector_tests::tests::test_user_invite_no_pending_when_not_local | break |
+| SPEC_BR_PENDING_LOCAL_02 | BrInv_PendingOnlyOnInviter | CHK_BRIDGE_PENDING_LOCAL_CREATE | projector_unit | device_invite_projector_tests::tests::test_device_invite_first_emits_pending_trust | pass |
+| SPEC_BR_PENDING_LOCAL_02 | BrInv_PendingOnlyOnInviter | CHK_BRIDGE_PENDING_LOCAL_CREATE | projector_unit | device_invite_projector_tests::tests::test_device_invite_no_pending_when_not_local | break |
+| SPEC_BR_ALLOWED_AUTH_01 | BrInv_AllowedPeerMatchesAuthDecision | CHK_BRIDGE_ALLOWED_PEER_AUTH | bridge_integration | tlc::UnifiedBridge::unified_bridge_fix_repro.cfg | pass |
+| SPEC_BR_ALLOWED_AUTH_01 | BrInv_AllowedPeerMatchesAuthDecision | CHK_BRIDGE_ALLOWED_PEER_AUTH | bridge_integration | — | waiver:model_exercised_in_tlc |
+| SPEC_BR_ONGOING_PREF_01 | BrInv_OngoingPreferred | CHK_BRIDGE_ONGOING_PREFERENCE | runtime_unit | bootstrap_dial_context::tests::primary_success_is_ongoing_mode | pass |
+| SPEC_BR_ONGOING_PREF_01 | BrInv_OngoingPreferred | CHK_BRIDGE_ONGOING_PREFERENCE | runtime_unit | connect::tests::fallback_policy_allows_typed_trust_rejection_with_fallback_cfg | break |
+| SPEC_BR_FALLBACK_01 | BrInv_BootstrapFallbackOnlyWhenNeeded | CHK_BRIDGE_BOOTSTRAP_FALLBACK | runtime_unit | connect::tests::fallback_policy_allows_typed_trust_rejection_with_fallback_cfg | pass |
+| SPEC_BR_FALLBACK_01 | BrInv_BootstrapFallbackOnlyWhenNeeded | CHK_BRIDGE_BOOTSTRAP_FALLBACK | runtime_unit | connect::tests::fallback_policy_denies_generic_dial_errors | break |
+| SPEC_BR_CTX_DET_01 | BrInv_BootstrapContextDeterministic | CHK_BRIDGE_BOOTSTRAP_CTX_DETERMINISM | runtime_unit | bootstrap_dial_context::tests::decision_is_deterministic_for_same_inputs | pass |
+| SPEC_BR_CTX_DET_01 | BrInv_BootstrapContextDeterministic | CHK_BRIDGE_BOOTSTRAP_CTX_DETERMINISM | runtime_unit | bootstrap_dial_context::tests::non_trust_errors_do_not_use_fallback | break |
+| SPEC_BR_SEC_CONN_01 | BrSec_ConnectionRequiresAuthorization | CHK_BRIDGE_SEC_CONN_AUTHZ | bridge_integration | tlc::UnifiedBridge::unified_bridge_fix_repro.cfg | pass |
+| SPEC_BR_SEC_CONN_01 | BrSec_ConnectionRequiresAuthorization | CHK_BRIDGE_SEC_CONN_AUTHZ | bridge_integration | — | waiver:model_exercised_in_tlc |
+| SPEC_BR_SEC_PROV_01 | BrSec_NoTrustWithoutProvenance | CHK_BRIDGE_SEC_TRUST_PROVENANCE | bridge_integration | tlc::UnifiedBridge::unified_bridge_fix_repro.cfg | pass |
+| SPEC_BR_SEC_PROV_01 | BrSec_NoTrustWithoutProvenance | CHK_BRIDGE_SEC_TRUST_PROVENANCE | bridge_integration | — | waiver:model_exercised_in_tlc |
+| SPEC_BR_SEC_PENDING_01 | BrSec_NoPendingTrustOnJoiner | CHK_BRIDGE_SEC_PENDING_INVITER_ONLY | projector_unit | user_invite_projector_tests::tests::test_user_invite_no_pending_when_not_local | break |
+| SPEC_BR_SEC_PENDING_01 | BrSec_NoPendingTrustOnJoiner | CHK_BRIDGE_SEC_PENDING_INVITER_ONLY | projector_unit | user_invite_projector_tests::tests::test_user_invite_boot_emits_pending_trust | pass |
+| SPEC_BR_SEC_BIND_01 | BrSec_SourceBindingConsistency | CHK_BRIDGE_SEC_SOURCE_BINDING | bridge_integration | tlc::UnifiedBridge::unified_bridge_fix_repro.cfg | pass |
+| SPEC_BR_SEC_BIND_01 | BrSec_SourceBindingConsistency | CHK_BRIDGE_SEC_SOURCE_BINDING | bridge_integration | — | waiver:model_exercised_in_tlc |
+| SPEC_BR_SEC_REMOVE_01 | BrSec_RemovalDeniesConnectivity | CHK_BRIDGE_SEC_REMOVAL_DENY | bridge_integration | tlc::UnifiedBridge::unified_bridge_progress_fast.cfg | pass |
+| SPEC_BR_SEC_REMOVE_01 | BrSec_RemovalDeniesConnectivity | CHK_BRIDGE_SEC_REMOVAL_DENY | bridge_integration | — | waiver:model_exercised_in_tlc |
+| SPEC_BR_SEC_COLLIDE_01 | BrSec_NoIdentityCollisionInAuthPath | CHK_BRIDGE_SEC_IDENTITY_COLLISION | bridge_integration | tlc::UnifiedBridge::unified_bridge_fix_repro.cfg | pass |
+| SPEC_BR_SEC_COLLIDE_01 | BrSec_NoIdentityCollisionInAuthPath | CHK_BRIDGE_SEC_IDENTITY_COLLISION | bridge_integration | — | waiver:model_exercised_in_tlc |
+| SPEC_BR_LIVE_BOOTSTRAP_01 | BrLive_BootstrapConnectEventually | CHK_BRIDGE_BOOTSTRAP_PROGRESS | tla_liveness | tlc::UnifiedBridge::unified_bridge_progress_fast.cfg | pass |
+| SPEC_BR_LIVE_BOOTSTRAP_01 | BrLive_BootstrapConnectEventually | CHK_BRIDGE_BOOTSTRAP_PROGRESS | tla_liveness | — | waiver:liveness_counterexamples_tracked_in_bug_cfg |
+| SPEC_BR_LIVE_UPGRADE_01 | BrLive_PeerUpgradeEventually | CHK_BRIDGE_UPGRADE_PROGRESS | tla_liveness | tlc::UnifiedBridge::unified_bridge_progress_fast.cfg | pass |
+| SPEC_BR_LIVE_UPGRADE_01 | BrLive_PeerUpgradeEventually | CHK_BRIDGE_UPGRADE_PROGRESS | tla_liveness | — | waiver:liveness_counterexamples_tracked_in_bug_cfg |
+| SPEC_BR_LIVE_SYNC_01 | BrLive_BootstrapCompletionSyncEventually | CHK_BRIDGE_SYNC_COMPLETION_PROGRESS | tla_liveness | tlc::UnifiedBridge::unified_bridge_progress_fast.cfg | pass |
+| SPEC_BR_LIVE_SYNC_01 | BrLive_BootstrapCompletionSyncEventually | CHK_BRIDGE_SYNC_COMPLETION_PROGRESS | tla_liveness | — | waiver:liveness_counterexamples_tracked_in_bug_cfg |
+
 ## Replay/Order Conformance
 
 | spec_id | source | check_id | layer | test_id | polarity |

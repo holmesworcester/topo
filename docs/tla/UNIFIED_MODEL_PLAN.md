@@ -62,6 +62,9 @@ Each write intent must map to a Rust projection path in a table in this file.
    bootstrap fallback selected only when ongoing path unavailable and bootstrap/pending trust exists.
 7. `BrInv_RowToMaterializedExactness`:
    materialized trust sets are exact reductions of write-intent rows (after supersession/expiry rules).
+8. `BrInv_BootstrapContextDeterministic`:
+   canonical dial context decision (`ongoing` / `bootstrap_fallback` / `deny`) is deterministic
+   from runtime trust state and connection-state materialization is consistent with that decision.
 
 ## Security bridge invariants (required)
 1. `BrSec_ConnectionRequiresAuthorization`:
@@ -114,8 +117,8 @@ Fast CI domain (target <= 2 minutes):
 
 Deep domain (target <= 20 minutes):
 1. `Peers = {alice, bob}`
-2. Expanded SPKI/event sets
-3. Add additional transitions around supersession/expiry
+2. Expanded transition envelopes (removal/provenance/upgrade) with bounded directional scope
+3. Increase selected cardinality bounds over fast where tractable
 
 ## Convergence policy (CI + deep)
 The objective is not "all configs always exhaustive"; the objective is:
@@ -134,9 +137,14 @@ Runtime targets:
 3. Tier 3: <= 20 minutes per config.
 
 Initial gating matrix:
-1. `EventGraphSchema`: `event_graph_schema_fast.cfg` (Tier 1), `event_graph_schema.cfg` (Tier 2), `event_graph_schema_expanded_single_peer.cfg` and `event_graph_schema_bootstrap.cfg` (Tier 3).
-2. `TransportCredentialLifecycle`: `transport_credential_lifecycle_fast.cfg` (Tier 1), `transport_credential_lifecycle.cfg` (Tier 2), bug/fix repro pair (Tier 2/Tier 3 depending domain).
+1. `EventGraphSchema`: `event_graph_schema_fast.cfg` (Tier 1), `event_graph_schema.cfg` (Tier 2 manual/pre-merge due current state-space cost), `event_graph_schema_expanded_single_peer.cfg` and `event_graph_schema_bootstrap.cfg` (Tier 3).
+2. `TransportCredentialLifecycle`: `transport_credential_lifecycle_fast.cfg` (Tier 1), `transport_credential_lifecycle.cfg` (Tier 2 manual/pre-merge due current state-space cost), bug/fix repro pair (Tier 2 tractable CI evidence).
 3. `UnifiedBridge`: `unified_bridge_fix_repro.cfg` + `unified_bridge_progress_fast.cfg` (Tier 1), `unified_bridge_bug_repro.cfg` (Tier 2 repro evidence), `unified_bridge_progress_deep.cfg` (Tier 3).
+
+CI wiring:
+1. `.github/workflows/tla-model-check.yml` enforces Tier 1 on push/PR.
+2. Same workflow provides Tier 2 manual/pre-merge run via `workflow_dispatch` (plus optional PR label trigger) for tractable Tier 2 configs and bug-repro evidence.
+3. Full `event_graph_schema.cfg` and `transport_credential_lifecycle.cfg` remain explicit local/manual pre-merge checks until additional state-space reduction work lands.
 
 Drift controls (required):
 1. Every cross-layer invariant must map to a check id in `runtime_check_catalog.md` or `NON_MODELED::<reason>`.
@@ -171,24 +179,35 @@ Drift controls (required):
 | `RT_TrustedSPKIs` | `allowed_peers_from_db()` trust union |
 | `RT_CanAuthorize` | `is_peer_allowed()` and transport trust check |
 | `RT_DialPreference` | connect-loop ongoing-first with bootstrap fallback |
+| `CtxMode` | canonical `derive_bootstrap_dial_context` decision helper (`runtime/transport/bootstrap_dial_context.rs`) |
 
 ## Runtime check catalog status
 Bridge check ids are now listed in `docs/tla/runtime_check_catalog.md` under
-`Unified Bridge Checks (Planned Integration Surface)`:
+`Unified Bridge Checks`:
 1. `CHK_BRIDGE_ROW_TO_RUNTIME_TRUST`
 2. `CHK_BRIDGE_PENDING_LOCAL_CREATE`
 3. `CHK_BRIDGE_ALLOWED_PEER_AUTH`
 4. `CHK_BRIDGE_ONGOING_PREFERENCE`
 5. `CHK_BRIDGE_BOOTSTRAP_FALLBACK`
-6. `CHK_BRIDGE_BOOTSTRAP_PROGRESS`
-7. `CHK_BRIDGE_UPGRADE_PROGRESS`
-8. `CHK_BRIDGE_SYNC_COMPLETION_PROGRESS`
-9. `CHK_BRIDGE_SEC_CONN_AUTHZ`
-10. `CHK_BRIDGE_SEC_TRUST_PROVENANCE`
-11. `CHK_BRIDGE_SEC_PENDING_INVITER_ONLY`
-12. `CHK_BRIDGE_SEC_SOURCE_BINDING`
-13. `CHK_BRIDGE_SEC_REMOVAL_DENY`
-14. `CHK_BRIDGE_SEC_IDENTITY_COLLISION`
+6. `CHK_BRIDGE_BOOTSTRAP_CTX_DETERMINISM`
+7. `CHK_BRIDGE_BOOTSTRAP_PROGRESS`
+8. `CHK_BRIDGE_UPGRADE_PROGRESS`
+9. `CHK_BRIDGE_SYNC_COMPLETION_PROGRESS`
+10. `CHK_BRIDGE_SEC_CONN_AUTHZ`
+11. `CHK_BRIDGE_SEC_TRUST_PROVENANCE`
+12. `CHK_BRIDGE_SEC_PENDING_INVITER_ONLY`
+13. `CHK_BRIDGE_SEC_SOURCE_BINDING`
+14. `CHK_BRIDGE_SEC_REMOVAL_DENY`
+15. `CHK_BRIDGE_SEC_IDENTITY_COLLISION`
+
+## Product-goal coverage table
+| Product goal | UnifiedBridge property/invariant | Runtime check id(s) | Validation config |
+|---|---|---|---|
+| Bootstrap connect viability | `BrLive_BootstrapConnectEventually` | `CHK_BRIDGE_BOOTSTRAP_PROGRESS` | `unified_bridge_progress_fast.cfg` |
+| Bootstrap completion sync sufficiency | `BrLive_BootstrapCompletionSyncEventually` | `CHK_BRIDGE_SYNC_COMPLETION_PROGRESS` | `unified_bridge_progress_fast.cfg` |
+| Ongoing upgrade viability | `BrLive_PeerUpgradeEventually` | `CHK_BRIDGE_UPGRADE_PROGRESS`, `CHK_BRIDGE_ONGOING_PREFERENCE` | `unified_bridge_progress_fast.cfg` |
+| Fallback path behavior | `BrInv_BootstrapFallbackOnlyWhenNeeded`, `BrLive_FallbackAttemptEventually` | `CHK_BRIDGE_BOOTSTRAP_FALLBACK`, `CHK_BRIDGE_BOOTSTRAP_CTX_DETERMINISM` | `unified_bridge_fix_repro.cfg`, `unified_bridge_progress_fast.cfg` |
+| Removal deny convergence | `BrSec_RemovalDeniesConnectivity`, `BrLive_RemovalConvergesToDeny` | `CHK_BRIDGE_SEC_REMOVAL_DENY` | `unified_bridge_progress_fast.cfg` |
 
 ## TLC execution notes template
 1. `cd docs/tla`
@@ -208,12 +227,16 @@ Record:
 1. `./tlc UnifiedBridge unified_bridge_bug_repro.cfg`
    - Status: **FAIL (expected)**
    - Invariant: `BrInv_LocalInviteProjectsPending`
-   - Stats: 3584 generated / 1907 distinct / depth 8 / 0s
+   - Stats: 5300 generated / 2455 distinct / depth 7 / 0s
    - Counterexample: `PW_ProjectPendingSuppressed` triggers when inviter local credential is already peer_shared-trusted, dropping pending write intent.
 2. `./tlc UnifiedBridge unified_bridge_fix_repro.cfg`
    - Status: **PASS**
    - Stats: 1720185 generated / 161047 distinct / depth 18 / 7s
 3. `./tlc UnifiedBridge unified_bridge_progress_fast.cfg`
    - Status: **PASS**
-   - Stats: 3740535 generated / 358255 distinct / depth 19 / 1m49s
+   - Stats: 3740535 generated / 358255 distinct / depth 19 / 2m24s
+   - Temporal branch checks: 20 branches completed with no violations.
+4. `./tlc UnifiedBridge unified_bridge_progress_deep.cfg`
+   - Status: **PASS**
+   - Stats: 10279213 generated / 1055359 distinct / depth 20 / 6m10s
    - Temporal branch checks: 20 branches completed with no violations.

@@ -92,7 +92,7 @@ an explicit `NON_MODELED::<reason>` waiver.
 | CHK_TCL_PENDING_MATCH | projection/trust_store | InvPendingBootstrapTrustMatchesCarried | transport_credential |
 | CHK_TCL_CRED_SOURCE_CONSISTENCY | transport/identity_adapter + transport_creds | InvCredentialSourceConsistency | transport_credential |
 
-## Unified Bridge Checks (Planned Integration Surface)
+## Unified Bridge Checks
 
 | check_id | owner | tla_guard_id | category |
 |----------|-------|-------------|----------|
@@ -101,6 +101,7 @@ an explicit `NON_MODELED::<reason>` waiver.
 | CHK_BRIDGE_ALLOWED_PEER_AUTH | runtime/transport/authz | BrInv_AllowedPeerMatchesAuthDecision | unified_bridge |
 | CHK_BRIDGE_ONGOING_PREFERENCE | runtime/transport/bootstrap_dial_context + runtime/peering/loops/connect | BrInv_OngoingPreferred | unified_bridge |
 | CHK_BRIDGE_BOOTSTRAP_FALLBACK | runtime/transport/bootstrap_dial_context + runtime/peering/loops/connect | BrInv_BootstrapFallbackOnlyWhenNeeded | unified_bridge |
+| CHK_BRIDGE_BOOTSTRAP_CTX_DETERMINISM | runtime/transport/bootstrap_dial_context + runtime/peering/loops/connect | BrInv_BootstrapContextDeterministic | unified_bridge |
 | CHK_BRIDGE_BOOTSTRAP_PROGRESS | runtime/peering/bootstrap + sync loops | BrLive_BootstrapConnectEventually | unified_bridge |
 | CHK_BRIDGE_UPGRADE_PROGRESS | runtime/peering/loops/connect | BrLive_PeerUpgradeEventually | unified_bridge |
 | CHK_BRIDGE_SYNC_COMPLETION_PROGRESS | runtime/sync + projection/apply | BrLive_BootstrapCompletionSyncEventually | unified_bridge |

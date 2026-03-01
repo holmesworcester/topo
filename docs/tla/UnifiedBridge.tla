@@ -51,6 +51,7 @@ vars ==
 NonePeer == "none_peer"
 NoneSPKI == "none_spki"
 ConnStates == {"none", "deny", "invite", "peer"}
+CtxModes == {"ongoing", "bootstrap_fallback", "deny"}
 PeerSPKIPairs == Peers \X SPKIs
 
 ASSUME /\ NonePeer \notin Peers
@@ -82,6 +83,12 @@ CanDialFallback(p, q) ==
 CanAuthorize(p, q) == CanDialOngoing(p, q) \/ CanDialFallback(p, q)
 
 DialPreference(p, q) ==
+    IF CanDialOngoing(p, q) THEN "ongoing"
+    ELSE IF CanDialFallback(p, q) THEN "bootstrap_fallback"
+    ELSE "deny"
+
+\* Canonical bootstrap dial context decision (mirrors runtime canonical helper).
+CtxMode(p, q) ==
     IF CanDialOngoing(p, q) THEN "ongoing"
     ELSE IF CanDialFallback(p, q) THEN "bootstrap_fallback"
     ELSE "deny"
@@ -341,9 +348,12 @@ CfgProgressFastConstraint ==
 
 CfgProgressDeepConstraint ==
     /\ Cardinality(efRemovedFacts) <= 2
-    /\ Cardinality(efPeerSharedFacts) <= 4
-    /\ Cardinality(efBootstrapFacts) <= 3
-    /\ Cardinality(efPendingFacts) <= 3
+    /\ Cardinality(efPeerSharedFacts) <= 3
+    /\ Cardinality(efBootstrapFacts) <= 2
+    /\ Cardinality(efPendingFacts) <= 2
+    /\ pwConnState["bob"]["alice"] = "none"
+    /\ syncComplete["bob"]["alice"] = FALSE
+    /\ fallbackAttempted["bob"]["alice"] = FALSE
 
 \* ---- Core bridge invariants ----
 
@@ -384,6 +394,12 @@ BrInv_RowToMaterializedExactness ==
 
 BrInv_LocalInviteProjectsPending ==
     ~pendingProjectionViolation
+
+BrInv_BootstrapContextDeterministic ==
+    \A p \in Peers, q \in Peers :
+        /\ CtxMode(p, q) \in CtxModes
+        /\ (pwConnState[p][q] = "peer" => CtxMode(p, q) = "ongoing")
+        /\ (pwConnState[p][q] = "invite" => CtxMode(p, q) = "bootstrap_fallback")
 
 \* ---- Security bridge invariants ----
 

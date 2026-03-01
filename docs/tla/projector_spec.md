@@ -321,6 +321,34 @@ abstracting over the event graph.
 | InvPendingTrustOnlyOnInviter | is_local_create gate: pending bootstrap trust exists only on invite creator's trust store |
 | InvCredentialSourceConsistency | local credential presence/source consistency during bootstrap→PeerShared transition |
 
+## Unified bridge model (UnifiedBridge.tla)
+
+`UnifiedBridge.tla` is the cross-layer integration model binding:
+1. event facts (`EF_*`),
+2. projection write-intents (`PW_*`),
+3. runtime trust/connection outcomes (`RT_*`, `CtxMode`).
+
+The bridge covers trust-source coherence, security invariants, and product-goal
+progress properties over bootstrap/upgrade/fallback behavior.
+
+| UnifiedBridge invariant/property | Runtime check / implementation owner |
+|----------------------------------|--------------------------------------|
+| BrInv_RowToMaterializedExactness | CHK_BRIDGE_ROW_TO_RUNTIME_TRUST (projection/trust_store + runtime/transport) |
+| BrInv_PendingOnlyOnInviter | CHK_BRIDGE_PENDING_LOCAL_CREATE (user_invite + device_invite projectors) |
+| BrInv_AllowedPeerMatchesAuthDecision | CHK_BRIDGE_ALLOWED_PEER_AUTH (runtime/transport/authz) |
+| BrInv_OngoingPreferred | CHK_BRIDGE_ONGOING_PREFERENCE (runtime/transport/bootstrap_dial_context + connect loop) |
+| BrInv_BootstrapFallbackOnlyWhenNeeded | CHK_BRIDGE_BOOTSTRAP_FALLBACK (runtime/transport/bootstrap_dial_context + connect loop) |
+| BrInv_BootstrapContextDeterministic | CHK_BRIDGE_BOOTSTRAP_CTX_DETERMINISM (runtime/transport/bootstrap_dial_context + connect loop) |
+| BrSec_ConnectionRequiresAuthorization | CHK_BRIDGE_SEC_CONN_AUTHZ |
+| BrSec_NoTrustWithoutProvenance | CHK_BRIDGE_SEC_TRUST_PROVENANCE |
+| BrSec_NoPendingTrustOnJoiner | CHK_BRIDGE_SEC_PENDING_INVITER_ONLY |
+| BrSec_SourceBindingConsistency | CHK_BRIDGE_SEC_SOURCE_BINDING |
+| BrSec_RemovalDeniesConnectivity | CHK_BRIDGE_SEC_REMOVAL_DENY |
+| BrSec_NoIdentityCollisionInAuthPath | CHK_BRIDGE_SEC_IDENTITY_COLLISION |
+| BrLive_BootstrapConnectEventually | CHK_BRIDGE_BOOTSTRAP_PROGRESS |
+| BrLive_PeerUpgradeEventually | CHK_BRIDGE_UPGRADE_PROGRESS |
+| BrLive_BootstrapCompletionSyncEventually | CHK_BRIDGE_SYNC_COMPLETION_PROGRESS |
+
 ### Multi-tenant trust scoping (collapse-single-tenant, 2026-02-17)
 
 The TLA+ `CanAuthenticate(p, q)` models per-tenant trust: peer `p` admits peer `q`
@@ -390,3 +418,14 @@ counterexample shows Bob (joiner) materializing pending trust for Alice's (invit
 Rust mapping: `is_local_create` field in `ContextSnapshot` (populated from
 `recorded_events.source`) gates `WritePendingBootstrapTrust` emission in
 UserInviteBoot and DeviceInviteFirst projectors.
+
+### UnifiedBridge integration checks (2026-02-28)
+
+1. `cd docs/tla && ./tlc UnifiedBridge unified_bridge_bug_repro.cfg`
+   - fails as expected on `BrInv_LocalInviteProjectsPending`.
+2. `cd docs/tla && ./tlc UnifiedBridge unified_bridge_fix_repro.cfg`
+   - passes (bridge safety + security invariants).
+3. `cd docs/tla && ./tlc UnifiedBridge unified_bridge_progress_fast.cfg`
+   - passes (safety + temporal progress properties).
+4. `cd docs/tla && ./tlc UnifiedBridge unified_bridge_progress_deep.cfg`
+   - passes (expanded deep domain; 10.3M generated / 1.06M distinct / depth 20).
