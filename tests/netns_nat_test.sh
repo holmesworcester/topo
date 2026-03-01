@@ -287,9 +287,14 @@ log "I = ${FP_I:0:16}..."
 log "A = ${FP_A:0:16}..."
 log "B = ${FP_B:0:16}..."
 
-# Seed additional messages after invite acceptance.
-"$BIN" send "hello from A" --db "$DB_A" >/dev/null
-"$BIN" send "hello from B" --db "$DB_B" >/dev/null
+# Seed additional messages after invite acceptance and capture event IDs.
+SEND_A_OUT=$("$BIN" send "hello from A" --db "$DB_A")
+SEND_B_OUT=$("$BIN" send "hello from B" --db "$DB_B")
+MSG_A_EID=$(echo "$SEND_A_OUT" | sed -n 's/^event_id://p' | tail -n1)
+MSG_B_EID=$(echo "$SEND_B_OUT" | sed -n 's/^event_id://p' | tail -n1)
+if [[ -z "$MSG_A_EID" || -z "$MSG_B_EID" ]]; then
+    fail "Failed to parse seed message event IDs"
+fi
 
 log "Starting peer A (behind NAT)..."
 ip netns exec "${PREFIX}_a" env RUST_LOG=info "$BIN" sync \
@@ -308,14 +313,14 @@ PIDS+=($!)
 # ---------------------------------------------------------------------------
 # Phase 1: Relay sync convergence
 # ---------------------------------------------------------------------------
-log "Waiting for relay sync convergence (3 messages each)..."
-if ! "$BIN" assert-eventually "store_count >= 3" --db "$DB_A" --timeout-ms 20000 2>/dev/null; then
-    fail "A did not converge via relay"
+log "Waiting for relay sync convergence (cross-peer message IDs)..."
+if ! "$BIN" assert-eventually "has_event:${MSG_B_EID} >= 1" --db "$DB_A" --timeout-ms 20000 2>/dev/null; then
+    fail "A did not receive B's seed message via relay"
 fi
-if ! "$BIN" assert-eventually "store_count >= 3" --db "$DB_B" --timeout-ms 20000 2>/dev/null; then
-    fail "B did not converge via relay"
+if ! "$BIN" assert-eventually "has_event:${MSG_A_EID} >= 1" --db "$DB_B" --timeout-ms 20000 2>/dev/null; then
+    fail "B did not receive A's seed message via relay"
 fi
-log "Relay sync OK: A=3, B=3"
+log "Relay sync OK: A/B observed each other's seed message IDs"
 
 # ---------------------------------------------------------------------------
 # Phase 2: Explicit intro API calls + punch polling
@@ -361,11 +366,19 @@ done
 # ---------------------------------------------------------------------------
 if $PUNCH_OK; then
     log "Punch connected! Verifying direct sync..."
-    "$BIN" send "direct-from-A" --db "$DB_A" >/dev/null
-    "$BIN" send "direct-from-B" --db "$DB_B" >/dev/null
+    SEND_A2_OUT=$("$BIN" send "direct-from-A" --db "$DB_A")
+    SEND_B2_OUT=$("$BIN" send "direct-from-B" --db "$DB_B")
+    DIRECT_A_EID=$(echo "$SEND_A2_OUT" | sed -n 's/^event_id://p' | tail -n1)
+    DIRECT_B_EID=$(echo "$SEND_B2_OUT" | sed -n 's/^event_id://p' | tail -n1)
+    if [[ -z "$DIRECT_A_EID" || -z "$DIRECT_B_EID" ]]; then
+        fail "Failed to parse direct message event IDs"
+    fi
 
-    if "$BIN" assert-eventually "store_count >= 5" --db "$DB_A" --timeout-ms 15000 2>/dev/null; then
-        "$BIN" assert-eventually "store_count >= 5" --db "$DB_B" --timeout-ms 15000 2>/dev/null || true
+    if ! "$BIN" assert-eventually "has_event:${DIRECT_B_EID} >= 1" --db "$DB_A" --timeout-ms 15000 2>/dev/null; then
+        fail "A did not receive B's direct message after punch"
+    fi
+    if ! "$BIN" assert-eventually "has_event:${DIRECT_A_EID} >= 1" --db "$DB_B" --timeout-ms 15000 2>/dev/null; then
+        fail "B did not receive A's direct message after punch"
     fi
 fi
 

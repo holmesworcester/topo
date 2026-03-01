@@ -423,8 +423,8 @@ fn service_predicate_parsing() {
     assert_eq!(op.symbol(), "==");
     assert_eq!(val, 10);
 
-    let (field, op, val) = parse_predicate("store_count >= 0").unwrap();
-    assert_eq!(field, "store_count");
+    let (field, op, val) = parse_predicate("recorded_events_count >= 0").unwrap();
+    assert_eq!(field, "recorded_events_count");
     assert_eq!(op.symbol(), ">=");
     assert_eq!(val, 0);
 

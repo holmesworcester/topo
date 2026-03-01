@@ -8,26 +8,130 @@ set -euo pipefail
 #   scripts/run_perf_serial.sh            # core suite
 #   scripts/run_perf_serial.sh core
 #   scripts/run_perf_serial.sh full
+#
+# By default, this script also updates docs/PERF.md auto-results section.
+# To disable docs writes for a local run:
+#   WRITE_PERF_MD=0 scripts/run_perf_serial.sh core
 
 MODE="${1:-core}"
+WRITE_PERF_MD="${WRITE_PERF_MD:-1}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+PERF_MD="${REPO_ROOT}/docs/PERF.md"
+TMP_DIR="$(mktemp -d)"
+AUTO_RESULTS_FILE="${TMP_DIR}/auto_results.md"
+
+cleanup() {
+  rm -rf "${TMP_DIR}"
+}
+trap cleanup EXIT
+
+SUMMARY_PATTERN='^(===|  Setup:|  Blocking:|  Cascade:|  Cascade rate:|  Total:|  Wall time:|  Messages:|  Msgs/s:|  Peak RSS:|  Catchup wall|  Events/s|  Throughput:|  Tail converge|  All converge|  Hop latency|Generated)'
+
+append_auto_result() {
+  local label="$1"
+  local cmd_rendered="$2"
+  local log_path="$3"
+
+  {
+    echo "### ${label}"
+    echo
+    echo '```bash'
+    echo "${cmd_rendered}"
+    echo '```'
+    echo
+    echo '```text'
+    if rg -q "${SUMMARY_PATTERN}" "${log_path}"; then
+      rg "${SUMMARY_PATTERN}" "${log_path}"
+    else
+      cat "${log_path}"
+    fi
+    echo '```'
+    echo
+  } >> "${AUTO_RESULTS_FILE}"
+}
 
 run() {
+  local label="$1"
+  shift
+  local log_path="${TMP_DIR}/$(echo "${label}" | tr ' ' '_' | tr -cd '[:alnum:]_.-').log"
+  local cmd_rendered
+  cmd_rendered="$(printf "%q " "$@")"
+
   echo
   echo ">>> $*"
-  "$@"
+  "$@" 2>&1 | tee "${log_path}"
+
+  if [[ "${WRITE_PERF_MD}" == "1" ]]; then
+    append_auto_result "${label}" "${cmd_rendered}" "${log_path}"
+  fi
+}
+
+ensure_perf_md_markers() {
+  if rg -q "^<!-- PERF_AUTO_RESULTS_START -->$" "${PERF_MD}"; then
+    return
+  fi
+
+  cat >> "${PERF_MD}" <<'EOF'
+
+### Auto-Generated Latest Serial Run
+
+This section is updated by `scripts/run_perf_serial.sh` when `WRITE_PERF_MD=1`.
+
+<!-- PERF_AUTO_RESULTS_START -->
+_Not generated yet. Run `scripts/run_perf_serial.sh core`._
+<!-- PERF_AUTO_RESULTS_END -->
+EOF
+}
+
+replace_perf_md_auto_section() {
+  local replacement_file="$1"
+  local tmp_out="${TMP_DIR}/PERF.md.out"
+
+  awk \
+    -v start='<!-- PERF_AUTO_RESULTS_START -->' \
+    -v end='<!-- PERF_AUTO_RESULTS_END -->' \
+    -v repl_file="${replacement_file}" '
+      BEGIN {
+        while ((getline line < repl_file) > 0) {
+          repl = repl line "\n";
+        }
+        close(repl_file);
+      }
+      {
+        if ($0 == start) {
+          print;
+          printf "%s", repl;
+          in_block = 1;
+          next;
+        }
+        if (in_block) {
+          if ($0 == end) {
+            in_block = 0;
+            print;
+          }
+          next;
+        }
+        print;
+      }
+    ' "${PERF_MD}" > "${tmp_out}"
+
+  mv "${tmp_out}" "${PERF_MD}"
 }
 
 case "$MODE" in
   core)
-    run cargo +stable test --release --test perf_test -- --nocapture --test-threads=1
-    run cargo +stable test --release --test file_throughput -- --nocapture --test-threads=1
-    run cargo +stable test --release --test sync_graph_test ten_hop_chain_10k -- --nocapture --test-threads=1
+    run "Core Sync (perf_test)" cargo +stable test --release --test perf_test -- --nocapture --test-threads=1
+    run "File Throughput (file_throughput)" cargo +stable test --release --test file_throughput -- --nocapture --test-threads=1
+    run "Sync Graph (ten_hop_chain_10k)" cargo +stable test --release --test sync_graph_test ten_hop_chain_10k -- --nocapture --test-threads=1
+    run "Topo Cascade (topo_cascade_10k)" cargo +stable test --release --test topo_cascade_test topo_cascade_10k -- --nocapture --test-threads=1
     ;;
   full)
-    run cargo +stable test --release --test perf_test -- --nocapture --include-ignored --test-threads=1
-    run cargo +stable test --release --test file_throughput -- --nocapture --include-ignored --test-threads=1
-    run cargo +stable test --release --test sync_graph_test -- --nocapture --include-ignored --test-threads=1
-    run cargo +stable test --release --test low_mem_test -- --nocapture --include-ignored --test-threads=1
+    run "Core Sync (perf_test, include ignored)" cargo +stable test --release --test perf_test -- --nocapture --include-ignored --test-threads=1
+    run "File Throughput (file_throughput, include ignored)" cargo +stable test --release --test file_throughput -- --nocapture --include-ignored --test-threads=1
+    run "Sync Graph (all, include ignored)" cargo +stable test --release --test sync_graph_test -- --nocapture --include-ignored --test-threads=1
+    run "Topo Cascade (topo_cascade_10k)" cargo +stable test --release --test topo_cascade_test topo_cascade_10k -- --nocapture --test-threads=1
+    run "Low-Memory (low_mem_test, include ignored)" cargo +stable test --release --test low_mem_test -- --nocapture --include-ignored --test-threads=1
     ;;
   *)
     echo "unknown mode: $MODE"
@@ -35,3 +139,15 @@ case "$MODE" in
     exit 2
     ;;
 esac
+
+if [[ "${WRITE_PERF_MD}" == "1" ]]; then
+  ensure_perf_md_markers
+  {
+    echo "_Generated by \`scripts/run_perf_serial.sh ${MODE}\` on $(date -u +"%Y-%m-%d %H:%M:%S UTC")._"
+    echo
+    cat "${AUTO_RESULTS_FILE}"
+  } > "${TMP_DIR}/replacement.md"
+  replace_perf_md_auto_section "${TMP_DIR}/replacement.md"
+  echo
+  echo "Updated ${PERF_MD} auto-results section."
+fi

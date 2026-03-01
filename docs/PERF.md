@@ -12,8 +12,13 @@
 
 ```bash
 # Preferred: strict serial runner (prevents cross-test interference)
+# Also auto-updates this doc's "Auto-Generated Latest Serial Run" section.
 scripts/run_perf_serial.sh core
 scripts/run_perf_serial.sh full
+
+# Optional: run serial perf suite without writing docs/PERF.md
+WRITE_PERF_MD=0 scripts/run_perf_serial.sh core
+WRITE_PERF_MD=0 scripts/run_perf_serial.sh full
 
 # Core sync benchmarks
 cargo test --release --test perf_test -- --nocapture
@@ -21,6 +26,10 @@ cargo test --release --test perf_test -- --nocapture --include-ignored
 
 # File attachment throughput
 cargo test --release --test file_throughput -- --nocapture --include-ignored
+
+# Topo-sort cascade benchmark
+cargo test --release --test topo_cascade_test topo_cascade_10k -- --nocapture --test-threads=1
+cargo test --release --test topo_cascade_test -- --nocapture --include-ignored --test-threads=1
 
 # Sync graph (chain + catchup) — requires --test-threads=1
 cargo test --release --test sync_graph_test -- --nocapture --test-threads=1
@@ -136,6 +145,22 @@ Single-threaded, no sync — pure local write path.
 | 100 MB | 400 | 0.531s | 188.4 | 179.67 | 754 |
 | 1 GB | 4,096 | 5.167s | 198.2 | 189.02 | 793 |
 
+### Topo Cascade (`topo_cascade_test.rs`)
+
+Worst-case projector cascade benchmark using `bench_dep` events:
+each event depends on up to 10 prior events, inserted in reverse order to maximize block/unblock depth.
+
+#### 10k cascade (`topo_cascade_10k`, 2026-03-01)
+
+| Metric | Value |
+|--------|-------|
+| Setup | 0.071s |
+| Blocking phase | 2.216s |
+| Cascade phase | 1.442s |
+| Cascade rate | 6,930 events/s |
+| Total | 3.729s |
+| Peak RSS | 59.2 MiB |
+
 ### Sync Graph (`sync_graph_test.rs`)
 
 Multi-peer topology benchmarks. All require `--test-threads=1`.
@@ -226,6 +251,14 @@ On low-memory catchup strategy:
 1. Current path already keeps memory bounded mostly by connection/cache/channel limits; larger history should increase wall time more than RSS.
 2. There is no unavoidable SQLite memory floor proportional to total historical rows; practical floor is per-connection overhead + active query working set + WAL pressure.
 3. For stronger guarantees, the next protocol step is segmented catchup (time-window or bounded-range rounds) so old history is replayed in deterministic chunks.
+
+### Auto-Generated Latest Serial Run
+
+This section is updated by `scripts/run_perf_serial.sh` when `WRITE_PERF_MD=1`.
+
+<!-- PERF_AUTO_RESULTS_START -->
+_Not generated yet. Run `scripts/run_perf_serial.sh core`._
+<!-- PERF_AUTO_RESULTS_END -->
 
 ## Key Design Points
 
