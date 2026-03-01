@@ -1117,8 +1117,7 @@ Use `poc-6` as reference behavior for end-to-end test setup:
 
 ## 11.5 Crude sender-keys model (phase-1 style, no key history yet)
 
-Use the sender-subjective O(n) baseline from `docs/group-encryption-design-aspects.md`
-("Maximally simple.../Phase 4: baseline correctness and healing with O(n) key broadcast"):
+Use the sender-subjective O(n) baseline ("maximally simple phase-1/phase-4 style key broadcast"):
 - sender creates a fresh local-only `secret` key event per message,
 - sender emits one `secret_shared` key-wrap event per perceived eligible recipient peer pubkey,
 - encrypted content event references the key event id through normal dependency fields,
