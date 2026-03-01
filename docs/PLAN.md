@@ -34,7 +34,7 @@ Scheduling note:
   - Phase 7 proves scoped projection/query separation once projector + signer substrate exist.
 - `signed_by` dependency blocking + signature verification ordering is tackled in Phase 6.
 - Phase 6 and Phase 7 must be complete before starting identity projectors in Phase 12.
-- Phase 13 depends on Phase 12 identity flows (bootstrap_workspace, accept_user_invite) being stable.
+- Phase 13 depends on Phase 12 identity flows (`create_workspace`, `join_workspace_as_new_user`, `add_device_to_workspace`) being stable.
 
 ## 1.1 Historical gap audit note
 
@@ -104,6 +104,7 @@ These are required, not optional:
    - `create_workspace`, `accept_invite`, and `accept_device_link` pre-derive the PeerShared key and write events under the final `recorded_by` from first write — no `finalize_identity`.
    - invite acceptance / device link may install invite-derived bootstrap transport certs first, but tenant scope key remains final and projection later installs PeerShared-derived transport identity.
    - connect loop resolves identity once per QUIC connection, not per session (identity transitions only happen during discrete CLI commands).
+   - `create_workspace` is strictly tenant-scoped once local creds exist: `recorded_by` must match a known local tenant peer ID in `local_transport_creds`; unscoped aliases are rejected. Fresh DB bootstrap (no local creds) remains allowed.
 12. Transport fingerprint bridge.
    - `peer_shared` projection materializes deterministic `peers_shared.transport_fingerprint` and indexes `(recorded_by, transport_fingerprint)`.
    - trust/removal lookup paths use projected `transport_fingerprint` rows and do not fallback to runtime scan+derive over `peers_shared.public_key`.
@@ -112,7 +113,7 @@ These are required, not optional:
 
 Every CLI instance is a real peer-to-peer device. All user-facing commands go through daemon RPC to the service layer:
 
-1. **One service layer**: business logic lives in event modules (`src/event_modules/`) for event-specific concerns and `src/service.rs` for orchestration. CLI subcommands are thin UI adapters that call daemon RPC, which dispatches to service functions.
+1. **One service layer**: business logic lives in event modules (`src/event_modules/`) for event-specific concerns and `src/runtime/control/service.rs` for orchestration. CLI subcommands are thin UI adapters that call daemon RPC, which dispatches to service functions.
 2. **Real networking**: invite acceptance uses real QUIC bootstrap sync, not in-process event copying. The daemon manages ongoing sync with discovered peers.
 3. **Testing equivalence**: CLI integration tests exercise the full path (CLI binary → RPC → service → DB/sync). No separate interactive surface exists; the daemon-backed CLI is the single command interface.
 4. **No synthetic shortcuts**: no `copy_event_chain`, no direct DB-to-DB event transfers, no bypass of the sync/projection pipeline. Every event flows through the same ingest path it would in production.
@@ -383,12 +384,11 @@ CREATE INDEX idx_peer_endpoint_lookup
 ## 5.6 Table creation and naming conventions (required)
 
 Table lifecycle:
-1. Use a migration runner with ordered schema versions (`schema_migrations` table).
-2. Core tables are created by core migrations (`events`, queues, `recorded_events`, etc.).
-3. Event projection tables are created by event-module migrations registered in the event registry.
-4. Startup must run migration + registry/schema consistency checks and fail fast on mismatch.
-5. Prototype schema epoch is explicit (`schema_epoch`) and checked at startup.
-6. No backward compatibility is provided across prototype epochs: if an old DB is detected (legacy `schema_migrations` without current epoch marker), startup must fail with a clear "recreate DB" error.
+1. Schema creation uses deterministic owner `ensure_schema(conn)` calls (no migration history playback in this POC).
+2. Core tables are created by core owner modules (`state/db/*`); event projection tables are created by event-module owner `ensure_schema` functions.
+3. Startup runs deterministic schema bootstrap plus registry/schema consistency checks and fails fast on mismatch.
+4. Prototype schema epoch is explicit (`schema_epoch`) and checked at startup.
+5. No backward compatibility is provided across prototype epochs: if an old DB is detected (legacy `schema_migrations` without current epoch marker), startup fails with a clear "recreate DB" error.
 
 Naming and ownership:
 1. Do not infer table names by pluralization heuristics.
@@ -631,7 +631,7 @@ The codebase provides two create-and-project entry points reflecting distinct ca
 
 1. **`create_event_sync`** (strict, PLAN-normative): returns `Ok(event_id)` only when projection reaches `Valid` or `AlreadyProcessed`. Returns `Err(Blocked { event_id, missing })` or `Err(Rejected { event_id, reason })` otherwise. All user-facing service commands (`svc_send`, `svc_react`, `svc_delete_message`, `svc_generate`) use this API.
 
-2. **`create_event_staged`** (lenient, bootstrap-only): wraps `Blocked` errors into `Ok(event_id)` via `event_id_or_blocked`. Used exclusively in identity bootstrap paths (`bootstrap_workspace`, `ensure_identity_chain`) where events like `Workspace` are created before their trust-anchor dependency exists and are expected to block until the anchor arrives.
+2. **`create_event_staged`** (lenient, bootstrap-only): wraps `Blocked` errors into `Ok(event_id)` via `event_id_or_blocked`. Used in identity bootstrap command paths (for example `create_workspace`, `join_workspace_as_new_user`, `add_device_to_workspace`) where events like `Workspace` can be created before their trust-anchor dependency exists and are expected to block until the anchor arrives.
 
 This split is intentional and correct: it preserves the strict contract for user-facing orchestration while allowing bootstrap chains to store pre-dependency events without aborting.
 
@@ -1456,6 +1456,6 @@ Normative locality/layering rules are defined in [DESIGN.md](./DESIGN.md) §14.
 Plan-level enforcement remains:
 
 1. event-type-specific commands/queries/projectors stay in event modules,
-2. `service.rs` remains orchestration-only,
+2. `src/runtime/control/service.rs` remains orchestration-only,
 3. projection pipeline remains orchestration-only,
 4. module boundary checks stay automated in CI where available.

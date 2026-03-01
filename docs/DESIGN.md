@@ -173,8 +173,8 @@ Completion invariants:
 
 Transport identity is derived from event-layer peer identity:
 
-1. **Transport identity** (mTLS scope): cert/key material, SPKI fingerprints, `peer_id` derived from BLAKE2b-256 of X.509 SPKI. Managed by `transport/identity.rs`.
-2. **Event-graph identity** (identity layer scope): Ed25519 keys, signer chains, trust anchors, and identity events (types 8-22). Managed by the `projection/identity` module.
+1. **Transport identity** (mTLS scope): cert/key material, SPKI fingerprints, `peer_id` derived from BLAKE2b-256 of X.509 SPKI. Managed by `src/runtime/transport/identity.rs` via `src/runtime/transport/identity_adapter.rs`.
+2. **Event-graph identity** (identity layer scope): Ed25519 keys, signer chains, trust anchors, and identity events (types 8-22). Owned by event modules (for example `src/event_modules/workspace/*`, `src/event_modules/invite_accepted.rs`, `src/event_modules/peer_shared/*`, `src/event_modules/local_signer_secret.rs`) and executed through the generic projection pipeline (`src/state/projection_state/apply/*`).
 
 Transport certs are deterministically derived from PeerShared Ed25519 signing keys, so the two identity scopes are unified. `TransportKey` events (type 23) are legacy, deprecated, and scheduled for removal; when present they remain parseable but are **not** authoritative for trust decisions. All steady-state transport trust is derived from PeerShared Ed25519 public keys via `spki_fingerprint_from_ed25519_pubkey()`.
 
@@ -350,6 +350,7 @@ High-level identity operations are owned by event-module commands (`event_module
 **Bootstrap** (`workspace::commands::create_workspace`): creates the identity chain for a new workspace owner:
 Workspace → InviteAccepted (trust anchor) → UserInviteBoot → UserBoot → DeviceInviteFirst → PeerSharedFirst + LocalSignerSecret events (peer_shared, user, workspace) + content key seed.
 The peer_shared LocalSignerSecret triggers `ApplyTransportIdentityIntent` on projection, installing a PeerShared-derived transport identity.
+Scope rule: `create_workspace` is tenant-scoped. If local transport credentials already exist, `recorded_by` must match a known local tenant peer ID in `local_transport_creds`; unscoped aliases (for example `"bootstrap"`) are rejected. Fresh DB bootstrap (no local creds) is still allowed.
 
 **Invite** (`workspace::commands::create_user_invite`): admin creates a UserInviteBoot event and returns portable invite data (event ID + signing key + workspace ID). Wraps content key for invitee if sender keys are available.
 
@@ -1418,13 +1419,13 @@ For developer ergonomics it will be helpful to have event-related logic in the m
 
 These rules are mandatory. Violations must be fixed before merge.
 
-1. **Event-module locality rule**: Event modules (`src/event_modules/<type>/`) own all event-type-specific behavior: wire format, projector, commands, queries, and response types. No event-type-specific SQL or logic may live in `service.rs` or the projection pipeline.
+1. **Event-module locality rule**: Event modules (`src/event_modules/<type>/`) own all event-type-specific behavior: wire format, projector, commands, queries, and response types. No event-type-specific SQL or logic may live in `src/runtime/control/service.rs` or the projection pipeline.
 
-2. **Service orchestration-only rule**: `service.rs` is a thin orchestrator. It handles DB open/close, auth/key loading, cross-module composition, non-event-specific logic (identity bootstrap, invite flows, predicate/assert), and error mapping. It must not contain event-type-specific SQL — it calls event-module APIs.
+2. **Service orchestration-only rule**: `src/runtime/control/service.rs` is a thin orchestrator. It handles DB open/close, auth/key loading, cross-module composition, non-event-specific logic (identity bootstrap, invite flows, predicate/assert), and error mapping. It must not contain event-type-specific SQL — it calls event-module APIs.
 
 3. **Direct module routing rule**: Service routes event-local operations directly to event-module command/query APIs (for example: `message::send`, `reaction::list`, `workspace::name`). There is no central `EventCommand`/`EventQuery` service dispatcher.
 
-4. **Workflow-command locality rule**: Multi-step event-domain workflows are still commands and belong in the owning event module `commands.rs` (or `commands/` when split), not in `service.rs`. Example: workspace onboarding workflows (`create_workspace`, `join_workspace_as_new_user`, `add_device_to_workspace`) live in `workspace::commands`.
+4. **Workflow-command locality rule**: Multi-step event-domain workflows are still commands and belong in the owning event module `commands.rs` (or `commands/` when split), not in `src/runtime/control/service.rs`. Example: workspace onboarding workflows (`create_workspace`, `join_workspace_as_new_user`, `add_device_to_workspace`) live in `workspace::commands`.
 
 5. **Module split rule**: When an event module exceeds ~300-400 LOC or mixes 3+ concerns, split into a directory module (see 14.4).
 
@@ -1436,7 +1437,7 @@ Event modules (`src/event_modules/<type>.rs` or `src/event_modules/<type>/`) own
 2. **Projector** — `project_pure()` function: the pure projector for this event type. Takes `(recorded_by, event_id_b64, &ParsedEvent, &ContextSnapshot)` and returns `ProjectorResult`. Registered in `EventTypeMeta.projector` so the pipeline dispatches via registry lookup with no central match statement.
 3. **Commands** — `CreateXxxCmd` struct + `create()` function that builds the `ParsedEvent`, calls `create_signed_event_sync`, and returns `EventId`. High-level command helpers callable from service/RPC routes (for example `send`, `react`) and multi-step workflows (for example workspace onboarding) are first-class command APIs in this layer.
 4. **Queries** — `list()`, `count()`, `resolve()`, `list_for_message_with_authors()`, etc. — SQL against projection tables scoped by `recorded_by`. All event-specific SQL lives here.
-5. **Response types** — serializable structs for the event domain (e.g. `MessageItem`, `MessagesResponse`, `SendResponse`). Owned by the event module, re-exported by service.rs for external callers.
+5. **Response types** — serializable structs for the event domain (e.g. `MessageItem`, `MessagesResponse`, `SendResponse`). Owned by the event module, re-exported by `src/runtime/control/service.rs` for external callers.
 
 The projection pipeline (`src/state/projection_state/apply/`) is orchestration-only:
 
@@ -1447,7 +1448,7 @@ The projection pipeline (`src/state/projection_state/apply/`) is orchestration-o
 - Registry-driven projector dispatch: `(meta.projector)(recorded_by, event_id_b64, parsed, ctx)`
 - Write-op execution and emit-command handling
 
-The service layer (`src/service.rs`) is a thin orchestrator:
+The service layer (`src/runtime/control/service.rs`) is a thin orchestrator:
 
 - DB open/close and connection management
 - Auth/key helpers (`load_local_peer_signer_pub`, `load_local_user_key`)
@@ -1548,7 +1549,7 @@ When adding a new event type:
 4. Add `query_*()` functions for any projection-table queries.
 5. Add response types and service/RPC-facing convenience helpers in the event module.
 6. Wire service call sites directly to the new module command/query APIs where relevant.
-7. Wire service.rs to call the event module functions, mapping errors to `ServiceError`.
+7. Wire `src/runtime/control/service.rs` to call the event module functions, mapping errors to `ServiceError`.
 
 **Rule**: Event projection semantics MUST live in event modules, not in central projector files. The pipeline must not contain event-type-specific logic beyond context snapshot construction.
 
