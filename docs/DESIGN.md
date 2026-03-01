@@ -521,7 +521,7 @@ The batch writer runs three explicit phases:
 2. Planner phase (`state/pipeline/planner.rs`): deterministically maps `PersistPhaseOutput` to a post-commit command list (for example drain tenant queues seen in the batch, log queue health, run post-drain hooks).
 3. Effects phase (`state/pipeline/effects.rs`): executes side effects through the executor boundary (wanted removal, queue drain/projection, queue health logging, post-drain hooks).
 
-The projection drain (`project_queue::drain_with_limit`) runs each projection in autocommit mode and batches dequeue DELETEs via `mark_done_batch` (one `BEGIN`/`COMMIT` per claim cycle). Individual projection failures are retried with exponential backoff via `mark_retry`. During the drain, `drain_project_queue_on_connection` defers WAL autocheckpointing (`PRAGMA wal_autocheckpoint = 0`) to avoid checkpoint stalls between autocommit writes, restoring the default after drain completes. Crash safety is provided by the queue: interrupted drains leave events in `project_queue` for re-projection on the next cycle.
+The projection drain (`project_queue::drain_with_limit`) runs each projection in autocommit mode and batches dequeue DELETEs via `mark_done_batch` (one `BEGIN`/`COMMIT` per claim cycle). Individual projection failures are retried with exponential backoff via `mark_retry`. During the drain (outside low_mem mode), `drain_project_queue_on_connection` defers WAL autocheckpointing (`PRAGMA wal_autocheckpoint = 0`) to avoid checkpoint stalls between autocommit writes, restoring the default after drain completes. In low_mem mode this is skipped to keep WAL growth bounded. Crash safety is provided by the queue: interrupted drains leave events in `project_queue` for re-projection on the next cycle.
 
 Ownership statement: persist owns ingest SQL writes, planner owns deterministic command mapping, effects owns side-effect execution, and `batch_writer` in `state/pipeline/mod.rs` owns sequencing/retry policy.
 
@@ -931,7 +931,7 @@ Current runtime ingest/worker shape:
    - decode + canonical insert (`events`, `neg_items`, `recorded_events`) + `project_queue` enqueue in one transaction,
    - commit, then drain `project_queue`.
 2. project worker/drain:
-   - claim batch, project each event in autocommit (`valid|block|reject`), batch-dequeue successes, mark retry on failure. WAL autocheckpoint deferred during drain.
+   - claim batch, project each event in autocommit (`valid|block|reject`), batch-dequeue successes, mark retry on failure. WAL autocheckpoint deferred during drain (skipped in low_mem mode).
 3. egress worker:
    - claim per connection, send frame, mark sent or retry.
 4. cleanup worker:

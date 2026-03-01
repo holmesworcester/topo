@@ -120,7 +120,7 @@ Final approach targets two sources of per-batch overhead:
 
 1. **Batch dequeue**: Replace individual `mark_done` DELETEs (one autocommit per event) with `mark_done_batch` (one BEGIN/COMMIT per claim cycle of 100 events). Reduces ~1000 autocommit DELETEs per writer batch to ~10 batch transactions.
 
-2. **Deferred WAL autocheckpoint**: Set `PRAGMA wal_autocheckpoint = 0` during the drain, restoring to 1000 after. This prevents WAL checkpoint stalls between autocommit projection writes. The WAL grows during drain but checkpoints on the next persist-phase COMMIT.
+2. **Deferred WAL autocheckpoint**: Set `PRAGMA wal_autocheckpoint = 0` during the drain, restoring to 1000 after. This prevents WAL checkpoint stalls between autocommit projection writes. Gated off in `low_mem` mode to keep WAL growth bounded on constrained-storage devices. The WAL grows during drain but checkpoints on the next persist-phase COMMIT.
 
 Rationale:
 - Projection writes remain autocommit (no cascade interaction risk)

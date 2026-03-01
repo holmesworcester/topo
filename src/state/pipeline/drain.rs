@@ -2,6 +2,7 @@ use crate::crypto::event_id_from_base64;
 use crate::db::open_connection;
 use crate::db::project_queue::ProjectQueue;
 use crate::projection::apply::project_one;
+use crate::tuning::low_mem_mode;
 
 /// Drain pending project_queue items for a tenant, projecting each event.
 ///
@@ -25,13 +26,14 @@ pub(super) fn drain_project_queue_on_connection(
     tenant_id: &str,
     batch_size: usize,
 ) -> rusqlite::Result<usize> {
-    // Defer WAL autocheckpoints during the drain. Projection writes are
-    // autocommit (one implicit transaction per SQL statement), so the default
-    // wal_autocheckpoint=1000 triggers frequent checkpoints that stall the
-    // writer. Deferring keeps all drain writes in the WAL and lets a single
-    // checkpoint run after the drain completes (when autocheckpoint is restored
-    // and the next COMMIT triggers it).
-    let _ = db.execute_batch("PRAGMA wal_autocheckpoint = 0");
+    // Defer WAL autocheckpoints during the drain to avoid checkpoint stalls
+    // between autocommit projection writes. Skipped in low_mem mode where
+    // open_connection sets wal_autocheckpoint=1000 + journal_size_limit to
+    // bound WAL growth on constrained-storage devices.
+    let deferred_checkpoint = !low_mem_mode();
+    if deferred_checkpoint {
+        let _ = db.execute_batch("PRAGMA wal_autocheckpoint = 0");
+    }
 
     let pq = ProjectQueue::new(db);
     let tenant = tenant_id.to_string();
@@ -44,8 +46,9 @@ pub(super) fn drain_project_queue_on_connection(
         Ok(())
     });
 
-    // Restore WAL autocheckpoint to default.
-    let _ = db.execute_batch("PRAGMA wal_autocheckpoint = 1000");
+    if deferred_checkpoint {
+        let _ = db.execute_batch("PRAGMA wal_autocheckpoint = 1000");
+    }
 
     result
 }

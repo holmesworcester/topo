@@ -942,7 +942,7 @@ The projection drain path (`drain_project_queue_on_connection` + `drain_with_lim
 
 1. **Batch dequeue**: `drain_with_limit` collects successfully-projected event IDs and dequeues them via `mark_done_batch` (one `BEGIN`/`COMMIT` per claim cycle) instead of individual `mark_done` DELETEs per event. Reduces ~1000 autocommit DELETEs per writer batch to ~10 batch transactions.
 
-2. **Deferred WAL checkpoint**: `drain_project_queue_on_connection` sets `PRAGMA wal_autocheckpoint = 0` during the drain, restoring to 1000 after. This prevents WAL checkpoint stalls between autocommit projection writes.
+2. **Deferred WAL checkpoint**: `drain_project_queue_on_connection` sets `PRAGMA wal_autocheckpoint = 0` during the drain, restoring to 1000 after. This prevents WAL checkpoint stalls between autocommit projection writes. Skipped in `low_mem` mode where WAL growth must remain bounded.
 
 - Projection writes remain autocommit (each `project_one` call commits independently), preserving cascade-unblock correctness.
 - On projection failure, events are retried with exponential backoff via `mark_retry`.
