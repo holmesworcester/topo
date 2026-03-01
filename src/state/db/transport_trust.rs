@@ -474,17 +474,6 @@ pub fn is_peer_allowed(
     Ok(allowed != 0)
 }
 
-/// Count the total number of distinct trusted peer fingerprints from SQL
-/// trust sources (PeerShared-derived SPKIs + accepted/pending invite bootstrap trust).
-pub fn trusted_peer_count(
-    conn: &Connection,
-    recorded_by: &str,
-) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
-    // Supersession is handled at projection time via PeerShared writes.
-    // Trust check reads are pure.
-    Ok(allowed_peers_from_db(conn, recorded_by)?.len() as i64)
-}
-
 /// Check whether any trusted peer fingerprints exist in SQL trust sources
 /// without materializing the full set. Uses EXISTS for early exit.
 pub fn has_any_trusted_peer(

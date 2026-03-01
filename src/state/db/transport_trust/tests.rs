@@ -571,11 +571,11 @@
         let spki_pending: [u8; 32] = [3u8; 32];
 
         // Empty → count should be 0
-        assert_eq!(trusted_peer_count(&conn, recorded_by).unwrap(), 0);
+        assert_eq!(allowed_peers_from_db(&conn, recorded_by).unwrap().len(), 0);
 
         // Add PeerShared row
         insert_peer_shared(&conn, recorded_by, "ps1", &pubkey_ps);
-        assert_eq!(trusted_peer_count(&conn, recorded_by).unwrap(), 1);
+        assert_eq!(allowed_peers_from_db(&conn, recorded_by).unwrap().len(), 1);
 
         // Add accepted invite bootstrap trust
         record_invite_bootstrap_trust(
@@ -588,15 +588,15 @@
             &spki_bootstrap,
         )
         .unwrap();
-        assert_eq!(trusted_peer_count(&conn, recorded_by).unwrap(), 2);
+        assert_eq!(allowed_peers_from_db(&conn, recorded_by).unwrap().len(), 2);
 
         // Add pending invite bootstrap trust
         record_pending_invite_bootstrap_trust(&conn, recorded_by, "invite2", "ws2", &spki_pending)
             .unwrap();
-        assert_eq!(trusted_peer_count(&conn, recorded_by).unwrap(), 3);
+        assert_eq!(allowed_peers_from_db(&conn, recorded_by).unwrap().len(), 3);
 
         // Cross-tenant isolation: different recorded_by sees 0
-        assert_eq!(trusted_peer_count(&conn, "other_peer").unwrap(), 0);
+        assert_eq!(allowed_peers_from_db(&conn, "other_peer").unwrap().len(), 0);
     }
 
     #[test]
@@ -628,7 +628,7 @@
         .unwrap();
 
         assert_eq!(
-            trusted_peer_count(&conn, recorded_by).unwrap(),
+            allowed_peers_from_db(&conn, recorded_by).unwrap().len(),
             1,
             "same fingerprint in peers_shared + bootstrap rows should count once"
         );
@@ -716,7 +716,7 @@
             ],
         ).unwrap();
 
-        assert_eq!(trusted_peer_count(&conn, recorded_by).unwrap(), 0);
+        assert_eq!(allowed_peers_from_db(&conn, recorded_by).unwrap().len(), 0);
         assert!(!has_any_trusted_peer(&conn, recorded_by).unwrap());
     }
 
