@@ -12,6 +12,7 @@
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 use tokio::sync::mpsc;
@@ -31,6 +32,10 @@ use crate::transport::{
     create_dual_endpoint, peer_identity_from_connection, AllowedPeers, DualConnection,
     QuicTransportSessionIo,
 };
+
+const BOOTSTRAP_CONNECT_ATTEMPTS: usize = 5;
+const BOOTSTRAP_CONNECT_RETRY_DELAY: Duration = Duration::from_millis(250);
+const BOOTSTRAP_CONNECT_TIMEOUT_CAP_SECS: u64 = 5;
 
 fn peer_fingerprint_from_hex(
     peer_id: &str,
@@ -78,15 +83,15 @@ pub async fn bootstrap_sync_from_invite(
         hex::encode(&bootstrap_spki[..8])
     );
 
-    let connection = endpoint
-        .connect(bootstrap_addr, "localhost")?
-        .await
-        .map_err(|e| {
-            format!(
-                "Bootstrap sync: failed to connect to {}: {}",
-                bootstrap_addr, e
-            )
-        })?;
+    // Retry connection setup to absorb transient listener startup or mDNS race windows.
+    let dial_timeout_secs = timeout_secs.clamp(1, BOOTSTRAP_CONNECT_TIMEOUT_CAP_SECS);
+    let connection = connect_bootstrap_with_retry(
+        &endpoint,
+        bootstrap_addr,
+        BOOTSTRAP_CONNECT_ATTEMPTS,
+        dial_timeout_secs,
+    )
+    .await?;
 
     let peer_id = peer_identity_from_connection(&connection)
         .ok_or("Bootstrap sync: could not extract peer identity")?;
@@ -147,6 +152,58 @@ pub async fn bootstrap_sync_from_invite(
     endpoint.wait_idle().await;
 
     Ok(())
+}
+
+async fn connect_bootstrap_with_retry(
+    endpoint: &quinn::Endpoint,
+    bootstrap_addr: SocketAddr,
+    attempts: usize,
+    dial_timeout_secs: u64,
+) -> Result<quinn::Connection, Box<dyn std::error::Error + Send + Sync>> {
+    let mut last_err = String::new();
+    for attempt in 1..=attempts {
+        let connecting = match endpoint.connect(bootstrap_addr, "localhost") {
+            Ok(connecting) => connecting,
+            Err(e) => {
+                last_err = format!("initiate to {}: {}", bootstrap_addr, e);
+                if attempt < attempts {
+                    info!(
+                        "Bootstrap sync dial attempt {}/{} failed ({}); retrying...",
+                        attempt, attempts, last_err
+                    );
+                    tokio::time::sleep(BOOTSTRAP_CONNECT_RETRY_DELAY).await;
+                    continue;
+                }
+                break;
+            }
+        };
+        match tokio::time::timeout(Duration::from_secs(dial_timeout_secs), connecting).await {
+            Ok(Ok(connection)) => return Ok(connection),
+            Ok(Err(e)) => {
+                last_err = format!("handshake to {}: {}", bootstrap_addr, e);
+            }
+            Err(_) => {
+                last_err = format!(
+                    "handshake to {} timed out after {}s",
+                    bootstrap_addr, dial_timeout_secs
+                );
+            }
+        }
+
+        if attempt < attempts {
+            info!(
+                "Bootstrap sync dial attempt {}/{} failed ({}); retrying...",
+                attempt, attempts, last_err
+            );
+            tokio::time::sleep(BOOTSTRAP_CONNECT_RETRY_DELAY).await;
+        }
+    }
+
+    Err(format!(
+        "Bootstrap sync: failed to connect to {} after {} attempts: {}",
+        bootstrap_addr, attempts, last_err
+    )
+    .into())
 }
 
 /// Start a temporary QUIC sync endpoint that serves one bootstrap connection.

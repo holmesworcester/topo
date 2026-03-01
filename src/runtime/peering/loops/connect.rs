@@ -28,6 +28,9 @@ use super::{
     ENDPOINT_TTL_MS, SYNC_SESSION_TIMEOUT_SECS,
 };
 
+const STALE_DIAL_TARGET_MARKER: &str = "stale_dial_target";
+const STALE_DIAL_FAILURE_THRESHOLD: u32 = 8;
+
 // ---------------------------------------------------------------------------
 // Connect loops
 // ---------------------------------------------------------------------------
@@ -190,6 +193,7 @@ async fn connect_loop_inner(
         coordination_manager,
         shared_ingest.clone(),
     );
+    let mut consecutive_stale_dial_failures: u32 = 0;
 
     loop {
         if shutdown.is_cancelled() {
@@ -212,6 +216,18 @@ async fn connect_loop_inner(
             Ok(outcome) => outcome,
             Err(e) => {
                 warn!("Failed to connect to {}: {}", remote, e);
+                if is_stale_dial_failure(&e) {
+                    consecutive_stale_dial_failures += 1;
+                    if consecutive_stale_dial_failures >= STALE_DIAL_FAILURE_THRESHOLD {
+                        return Err(std::io::Error::other(format!(
+                            "{} remote={} failures={} last_error={}",
+                            STALE_DIAL_TARGET_MARKER, remote, consecutive_stale_dial_failures, e
+                        ))
+                        .into());
+                    }
+                } else {
+                    consecutive_stale_dial_failures = 0;
+                }
                 tokio::select! {
                     _ = shutdown.cancelled() => break,
                     _ = tokio::time::sleep(CONNECT_RETRY_DELAY) => {}
@@ -219,6 +235,7 @@ async fn connect_loop_inner(
                 continue;
             }
         };
+        consecutive_stale_dial_failures = 0;
         let provider = dial_outcome.provider;
         let used_bootstrap_fallback = dial_outcome.used_bootstrap_fallback;
         let connection = provider.connection();
@@ -302,6 +319,22 @@ async fn connect_loop_inner(
     Ok(())
 }
 
+fn is_stale_dial_failure(err: &ConnectionLifecycleError) -> bool {
+    match err {
+        ConnectionLifecycleError::Dial(msg) => {
+            let m = msg.to_ascii_lowercase();
+            m.contains("timed out")
+                || m.contains("timeout")
+                || m.contains("connection refused")
+                || m.contains("network is unreachable")
+                || m.contains("no route to host")
+                || m.contains("unreachable")
+        }
+        ConnectionLifecycleError::DialTrustRejected(_) => false,
+        ConnectionLifecycleError::Accept(_) | ConnectionLifecycleError::MissingPeerIdentity => false,
+    }
+}
+
 struct DialOutcome {
     provider: SessionProvider,
     used_bootstrap_fallback: bool,
@@ -377,5 +410,21 @@ mod tests {
         );
         let decision = derive_bootstrap_dial_context(Some(&err), false);
         assert_eq!(decision.mode, BootstrapDialMode::Deny);
+    }
+
+    #[test]
+    fn stale_classifier_marks_timeout_like_dial_errors() {
+        let err = ConnectionLifecycleError::Dial(
+            "handshake to 127.0.0.1:4433: timed out".to_string(),
+        );
+        assert!(is_stale_dial_failure(&err));
+    }
+
+    #[test]
+    fn stale_classifier_does_not_mark_trust_rejections() {
+        let err = ConnectionLifecycleError::DialTrustRejected(
+            "handshake to 127.0.0.1:4433: trust_rejected".to_string(),
+        );
+        assert!(!is_stale_dial_failure(&err));
     }
 }

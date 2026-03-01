@@ -1,0 +1,44 @@
+name: Scenario Flake Hunt
+
+on:
+  workflow_dispatch:
+    inputs:
+      repeats:
+        description: "Number of repeated runs"
+        required: false
+        default: "20"
+      test_name:
+        description: "Scenario test name filter"
+        required: false
+        default: "test_mdns_multitenant_self_filtering_and_sync"
+
+jobs:
+  flake-hunt:
+    name: Repeat Scenario Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+
+      - name: Run repeated scenario test
+        env:
+          RUST_BACKTRACE: "1"
+        run: |
+          set -euo pipefail
+          bash scripts/run_scenario_flake_hunt.sh \
+            "${{ github.event.inputs.repeats || '20' }}" \
+            "${{ github.event.inputs.test_name || 'test_mdns_multitenant_self_filtering_and_sync' }}" \
+            "target/flake-logs"
+
+      - name: Upload flake logs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: scenario-flake-logs
+          path: target/flake-logs
+          if-no-files-found: ignore

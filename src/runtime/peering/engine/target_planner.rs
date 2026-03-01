@@ -72,6 +72,10 @@ impl PeerDispatcher {
         self.known.insert(peer_id.to_string(), (addr, cancel_tx));
         (action, Some(cancel_rx))
     }
+
+    pub(crate) fn forget(&mut self, peer_id: &str) {
+        self.known.remove(peer_id);
+    }
 }
 
 pub(crate) fn normalize_discovered_addr_for_local_bind(
@@ -289,6 +293,17 @@ mod tests {
         let (b2, _) = d.dispatch("peer-b", addr(2000));
         assert_eq!(a2, DiscoveryAction::Reconnect);
         assert_eq!(b2, DiscoveryAction::Skip);
+    }
+
+    #[test]
+    fn test_forget_clears_dispatch_slot() {
+        let mut d = PeerDispatcher::new();
+        d.dispatch("peer-a", addr(1000));
+        d.forget("peer-a");
+
+        let (action, rx) = d.dispatch("peer-a", addr(1000));
+        assert_eq!(action, DiscoveryAction::Connect);
+        assert!(rx.is_some(), "forgotten peer should be connectable again");
     }
 
     // -- Address normalization tests --

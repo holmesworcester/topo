@@ -36,6 +36,8 @@ use super::target_planner::{
     PeerDispatcher,
 };
 
+const STALE_DIAL_TARGET_MARKER: &str = "stale_dial_target";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RuntimeState {
     IdleNoTenants,
@@ -581,6 +583,8 @@ async fn run_target_dispatcher(
             break;
         };
 
+        reap_finished_connect_workers(&mut active_workers, &mut dispatcher).await;
+
         let dispatch_key = match &event.source {
             TargetIngressSource::Bootstrap => bootstrap_dispatch_key(&event.tenant_id),
             TargetIngressSource::Discovery { peer_id } => {
@@ -696,6 +700,27 @@ async fn join_connect_worker(worker: ActiveConnectWorker) {
     .await;
 }
 
+async fn reap_finished_connect_workers(
+    active_workers: &mut HashMap<String, ActiveConnectWorker>,
+    dispatcher: &mut PeerDispatcher,
+) {
+    let finished_keys: Vec<String> = active_workers
+        .iter()
+        .filter_map(|(key, worker)| worker.join.is_finished().then_some(key.clone()))
+        .collect();
+
+    for key in finished_keys {
+        if let Some(worker) = active_workers.remove(&key) {
+            join_connect_worker(worker).await;
+            dispatcher.forget(&key);
+            warn!(
+                "connect worker {} exited; cleared dispatch slot for fresh target ingress",
+                key
+            );
+        }
+    }
+}
+
 async fn run_connect_worker(
     db_path: String,
     tenant_id: String,
@@ -735,15 +760,25 @@ async fn run_connect_worker(
             break;
         }
 
-        match result {
-            Ok(()) => warn!(
-                "connect worker {} exited unexpectedly; restarting with backoff",
+        let stale_target = match &result {
+            Ok(()) => {
+                warn!("connect worker {} exited unexpectedly", dispatch_key);
+                false
+            }
+            Err(e) => {
+                warn!(
+                    "connect worker {} failed: {}; restarting with backoff",
+                    dispatch_key, e
+                );
+                e.to_string().contains(STALE_DIAL_TARGET_MARKER)
+            }
+        };
+        if stale_target {
+            warn!(
+                "connect worker {} marked dial target stale; exiting for fresh target resolution",
                 dispatch_key
-            ),
-            Err(e) => warn!(
-                "connect worker {} failed: {}; restarting with backoff",
-                dispatch_key, e
-            ),
+            );
+            break;
         }
 
         tokio::select! {
