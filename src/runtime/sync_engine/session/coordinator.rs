@@ -24,6 +24,9 @@ use super::{
 /// `assign_rx` for its assigned subset.
 pub struct PeerCoord {
     pub peer_idx: usize,
+    /// Snapshot of total registered peers at the time this peer was created.
+    /// Used for deterministic ownership: `hash(event_id) % total_peers == peer_idx`.
+    pub total_peers: Arc<AtomicUsize>,
     pub report_tx: std::sync::mpsc::Sender<Vec<EventId>>,
     pub assign_rx: std::sync::Mutex<std::sync::mpsc::Receiver<Vec<EventId>>>,
     /// Signal the coordinator to wake up immediately after reporting need_ids.
@@ -122,6 +125,7 @@ impl CoordinationManager {
         });
         Arc::new(PeerCoord {
             peer_idx: idx,
+            total_peers: self.next_idx.clone(),
             report_tx,
             assign_rx: std::sync::Mutex::new(assign_rx),
             wake_tx: self.wake_tx.clone(),

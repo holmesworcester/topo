@@ -85,7 +85,7 @@ async fn initiator_outbound_sends_markers_then_negopen_then_done_sequence() {
         let handler = SyncSessionHandler::outbound(
             db_path,
             30,
-            std::sync::Arc::new(topo::sync::CoordinationManager::new()),
+            std::sync::Arc::new(topo::sync::CoordinationManager::new()).register_peer(),
             noop_ingest_tx(),
         );
         let meta = test_session_meta(SessionDirection::Outbound);
@@ -119,7 +119,7 @@ async fn anticheat_markers_precede_negopen() {
         let handler = SyncSessionHandler::outbound(
             db_path,
             30,
-            std::sync::Arc::new(topo::sync::CoordinationManager::new()),
+            std::sync::Arc::new(topo::sync::CoordinationManager::new()).register_peer(),
             noop_ingest_tx(),
         );
         let meta = test_session_meta(SessionDirection::Outbound);
@@ -161,7 +161,7 @@ async fn anticheat_datadone_before_done() {
         let handler = SyncSessionHandler::outbound(
             db_path,
             30,
-            std::sync::Arc::new(topo::sync::CoordinationManager::new()),
+            std::sync::Arc::new(topo::sync::CoordinationManager::new()).register_peer(),
             noop_ingest_tx(),
         );
         let meta = test_session_meta(SessionDirection::Outbound);
@@ -228,7 +228,7 @@ async fn initiator_rejects_inbound_direction() {
         let handler = SyncSessionHandler::outbound(
             db_path,
             30,
-            std::sync::Arc::new(topo::sync::CoordinationManager::new()),
+            std::sync::Arc::new(topo::sync::CoordinationManager::new()).register_peer(),
             noop_ingest_tx(),
         );
         let meta = test_session_meta(SessionDirection::Inbound);

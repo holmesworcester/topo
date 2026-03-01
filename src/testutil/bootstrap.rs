@@ -125,10 +125,11 @@ pub async fn bootstrap_sync_from_invite(
         direction: SessionDirection::Outbound,
     };
     let coordination_manager = Arc::new(CoordinationManager::new());
+    let coordination = coordination_manager.register_peer();
     let handler = SyncSessionHandler::outbound(
         db_path.to_string(),
         timeout_secs,
-        coordination_manager,
+        coordination,
         ingest_tx,
     );
     let io = QuicTransportSessionIo::new(session_id, conn);

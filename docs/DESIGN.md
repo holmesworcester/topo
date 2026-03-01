@@ -968,41 +968,45 @@ Can be eventual:
 
 ## 7.6 Multi-source download coordination
 
-Multi-source coordinated download is the default pull path. A coordinator thread assigns events to peers using round-based greedy load balancing:
+Multi-source download uses deterministic per-event ownership to split work
+across concurrent sessions without a central coordinator barrier:
 
-1. **Discovery**: each peer runs negentropy with its source, discovering need_ids
-   (events the sink needs). Push (have_ids) proceeds immediately.
-2. **Streaming pull**: during reconciliation, each peer sends HaveList frames
-   immediately as need_ids are discovered (pipelining data transfer with
-   reconciliation). Need_ids are also buffered for coordinator reporting.
-3. **Report**: after reconciliation completes, each peer sends its full need_ids
-   to the coordinator via a per-peer channel.
-4. **Assignment**: the coordinator collects reports (short collection window after
-   first report), builds an event-to-peer availability map, sorts by availability
-   ascending (unique events first), and assigns each event to the least-loaded peer
-   that has it.
-5. **Transfer**: since HaveList was already streamed during reconciliation, the
-   coordinator assignment is informational for the reporting peer (the `wanted`
-   table deduplicates). For multi-peer scenarios, other peers receive their
-   assigned subsets normally.
-6. **Forget**: assignments are discarded after each round. Next round starts fresh.
+1. **Discovery**: each session runs negentropy with its source, discovering
+   need_ids (events the sink needs). Push (have_ids) proceeds immediately.
+2. **Streaming ownership dispatch**: as need_ids are discovered during
+   reconciliation, each is routed through an ownership predicate:
+   `hash(event_id[0..8]) % total_peers == peer_idx`. Owned events get
+   HaveList immediately (pipelining data transfer with reconciliation).
+   Non-owned events are buffered for fallback.
+3. **Threshold-based claim-all**: when need_ids count is small (below
+   `total_peers * 20`), the session claims ALL need_ids regardless of
+   ownership. This handles source-unique events (identity chains, markers)
+   that only exist at one source and cannot be downloaded by their
+   deterministic "owner" peer which connects to a different source.
+4. **Fallback discard**: after reconciliation, buffered non-owned events
+   are discarded. Their deterministic owners handle them from their
+   respective sources (or the threshold rule claims them when counts are
+   small enough).
 
 **Critical invariant — streaming pull dispatch.** HaveList frames MUST be sent
 during reconciliation rounds, not deferred until after reconciliation completes.
-Buffering need_ids until post-reconciliation creates a pipeline stall: events
-cannot flow until reconciliation finishes AND the coordinator round-trips. This
-serializes ~1 second of overhead that should be pipelined. The `wanted` table
-provides natural dedup so streaming dispatch is safe even with coordinator
-assignment afterward.
+The `wanted` table provides natural dedup so streaming dispatch is safe.
 
 Key properties:
-- Events available from one peer are assigned to that peer (no choice).
-- Events available from many peers are spread evenly across them.
-- Slow peers' undelivered events re-appear as need_ids next round and get reassigned.
-- Push path (egress streaming) continues during coordination wait.
-- Per-peer channels prevent round-mixing between fast and slow peers.
+- Single-peer degenerates naturally: `total_peers <= 1` means all events owned.
+- Work division is deterministic — no coordinator barrier, no collection window.
+- Source-unique events handled by threshold fallback without cross-source state.
+- Undelivered events re-appear as need_ids in the next session cycle.
+- Push path (egress streaming) runs independently during pull dispatch.
 - Sink-side transfer accounting can be audited via `recorded_events.source`
   tags (`quic_recv:<peer_id>@<ip:port>`) and grouped by source peer.
+
+### Pre-registration of peers
+
+All `PeerCoord` handles must be registered before spawning connect loop threads.
+This ensures `total_peers` is correct from the first session. Without
+pre-registration, early threads see `total_peers=1` and claim all events,
+defeating the ownership split.
 
 ### Implementation decisions
 
@@ -1029,24 +1033,16 @@ Do not add an in-memory dedup set in front of the shared writer:
 - A global in-memory "seen set" grows without bound for long-running daemons (~90 bytes per EventId), which conflicts with low-memory goals.
 - `INSERT OR IGNORE` in `batch_writer` handles duplicates correctly and cheaply.
 
-**Coordinator for pull rebalancing, not gating.** Each peer still pushes all
-have_ids without coordination — the push path runs at full speed. The pull
-path streams HaveList during reconciliation (so events flow immediately) and
-also reports need_ids to the coordinator for multi-peer load balancing. The
-coordinator assigns each event to the least-loaded peer that has it, reducing
-redundant downloads when multiple sources share the same events. For
-single-peer sync, the coordinator degenerates to pass-through (all events
-assigned to the sole peer, which already streamed them).
+**Deterministic ownership for pull splitting.** Each peer pushes all have_ids
+without coordination — the push path runs at full speed. The pull path uses
+`hash(event_id) % total_peers` to split need_ids across sessions, so each
+source sends roughly `1/N` of the shared events. For single-peer sync,
+ownership degenerates naturally (all events owned).
 
-**Round-based reassignment.** Assignments are discarded after each round. If a
-peer fails to deliver its assigned events (slow, disconnected), those events
-re-appear as need_ids in the next negentropy round and get reassigned to a
-different peer. No permanent affinity between events and peers.
-
-**Short collection window (500ms default).** The coordinator waits briefly after the
-first peer reports, then assigns. Stragglers report next round and get fresh
-assignments. This prevents convoy effects where all peers run at the speed
-of the slowest reconciliation.
+**Session-cycle reassignment.** Each session starts fresh with a new negentropy
+snapshot. If a peer fails to deliver its owned events (slow, disconnected),
+those events re-appear as need_ids in the next session cycle and get claimed
+by the next session connecting to a source that has them.
 
 **Thread-per-connection.** Each incoming connection spawns a `std::thread`
 with a dedicated single-threaded tokio runtime. This isolates connection

@@ -7,12 +7,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::crypto::{event_id_to_base64, EventId};
 use crate::db::{open_connection, schema::create_tables, store::insert_recorded_event};
 use crate::event_modules::{
-    AdminBootEvent, DeviceInviteFirstEvent, InviteAcceptedEvent, MessageDeletionEvent,
-    MessageEvent, ParsedEvent, PeerRemovedEvent, PeerSharedFirstEvent, ReactionEvent,
-    SecretKeyEvent, SecretSharedEvent, UserBootEvent, UserInviteBootEvent, UserInviteOngoingEvent,
-    UserRemovedEvent, WorkspaceEvent,
+    AdminBootEvent, DeviceInviteFirstEvent, FileSliceEvent, InviteAcceptedEvent,
+    MessageAttachmentEvent, MessageDeletionEvent, MessageEvent, ParsedEvent, PeerRemovedEvent,
+    PeerSharedFirstEvent, ReactionEvent, SecretKeyEvent, SecretSharedEvent, UserBootEvent,
+    UserInviteBootEvent, UserInviteOngoingEvent, UserRemovedEvent, WorkspaceEvent,
 };
-use crate::peering::loops::{accept_loop, connect_loop, connect_loop_with_coordination};
+use crate::peering::loops::{
+    accept_loop, connect_loop, connect_loop_with_shared_ingest,
+};
 use crate::projection::apply::project_one;
 use crate::projection::create::{
     create_encrypted_event_synchronous, create_event_staged, create_event_synchronous,
@@ -774,6 +776,149 @@ impl Peer {
                 .expect("failed to create message");
         }
         db.execute("COMMIT", []).expect("failed to commit");
+    }
+
+    /// Create a file consisting of `total_slices` file slices.
+    ///
+    /// Builds all required prerequisites (message, secret_key, attachment
+    /// descriptor) and then batch-creates the slices. Returns the file_id
+    /// used for all slices. Requires identity chain (use new_with_identity).
+    pub fn batch_create_file_slices(&self, total_slices: usize) -> [u8; 32] {
+        use crate::event_modules::file_slice::FILE_SLICE_CIPHERTEXT_BYTES;
+        use crate::projection::signer::sign_event_bytes;
+
+        let db = open_connection(&self.db_path).expect("failed to open db");
+
+        // Parent message
+        let msg = ParsedEvent::Message(MessageEvent {
+            created_at_ms: current_timestamp_ms(),
+            workspace_id: self.workspace_id,
+            author_id: self.author_id,
+            content: format!("file-parent-{}", self.name),
+            signed_by: self.signer_eid(),
+            signer_type: 5,
+            signature: [0u8; 64],
+        });
+        let msg_eid =
+            create_signed_event_staged(&db, &self.identity, &msg, self.signing_key())
+                .expect("failed to create parent message");
+
+        // Secret key for attachment
+        let sk = ParsedEvent::SecretKey(SecretKeyEvent {
+            created_at_ms: current_timestamp_ms(),
+            key_bytes: [0xBB; 32],
+        });
+        let sk_eid = create_event_staged(&db, &self.identity, &sk)
+            .expect("failed to create secret_key");
+
+        let file_id: [u8; 32] = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            self.name.hash(&mut hasher);
+            current_timestamp_ms().hash(&mut hasher);
+            let h = hasher.finish().to_le_bytes();
+            let mut fid = [0u8; 32];
+            fid[..8].copy_from_slice(&h);
+            fid[8..16].copy_from_slice(&h);
+            fid
+        };
+
+        let slice_size = FILE_SLICE_CIPHERTEXT_BYTES;
+        let file_bytes = total_slices * slice_size;
+
+        // Message attachment descriptor
+        let att = ParsedEvent::MessageAttachment(MessageAttachmentEvent {
+            created_at_ms: current_timestamp_ms(),
+            message_id: msg_eid,
+            file_id,
+            blob_bytes: file_bytes as u64,
+            total_slices: total_slices as u32,
+            slice_bytes: slice_size as u32,
+            root_hash: [0xAA; 32],
+            key_event_id: sk_eid,
+            filename: format!("bench-{}.bin", self.name),
+            mime_type: "application/octet-stream".to_string(),
+            signed_by: self.signer_eid(),
+            signer_type: 5,
+            signature: [0u8; 64],
+        });
+        let att_eid =
+            create_signed_event_staged(&db, &self.identity, &att, self.signing_key())
+                .expect("failed to create message_attachment");
+        project_one(&db, &self.identity, &att_eid).expect("failed to project attachment");
+
+        // Batch-create file slices inside a transaction
+        let ciphertext: Vec<u8> = vec![0xAB; FILE_SLICE_CIPHERTEXT_BYTES];
+        let signing_key = self.signing_key().clone();
+
+        db.execute("BEGIN", []).expect("failed to begin");
+        for i in 0..total_slices as u32 {
+            // Use a single timestamp for both the blob's created_at and the
+            // neg_items ts. If these diverge, the sink's batch_writer (which
+            // extracts created_at from the blob) inserts a different neg_items
+            // key than the source, causing negentropy to never converge.
+            let created_at = current_timestamp_ms();
+            let fs = ParsedEvent::FileSlice(FileSliceEvent {
+                created_at_ms: created_at,
+                file_id,
+                slice_number: i,
+                ciphertext: ciphertext.clone(),
+                signed_by: self.signer_eid(),
+                signer_type: 5,
+                signature: [0u8; 64],
+            });
+            let mut blob = crate::event_modules::encode_event(&fs)
+                .expect("failed to encode file_slice");
+            let blob_len = blob.len();
+            let sig = sign_event_bytes(&signing_key, &blob[..blob_len - 64]);
+            blob[blob_len - 64..].copy_from_slice(&sig);
+
+            let event_id = crate::crypto::hash_event(&blob);
+            let event_id_b64 = event_id_to_base64(&event_id);
+
+            // Insert into events, neg_items, recorded_events — all use the
+            // same created_at that is embedded in the blob so that the
+            // neg_items (ts, id) key matches what a receiving batch_writer
+            // would extract from the blob.
+            db.execute(
+                "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
+                 VALUES (?1, ?2, ?3, 'shared', ?4, ?5)",
+                rusqlite::params![&event_id_b64, "file_slice", blob.as_slice(), created_at as i64, created_at as i64],
+            ).expect("failed to insert file_slice event");
+            db.execute(
+                "INSERT OR IGNORE INTO neg_items (ts, id) VALUES (?1, ?2)",
+                rusqlite::params![created_at as i64, event_id.as_slice()],
+            ).expect("failed to insert neg_item");
+            db.execute(
+                "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
+                 VALUES (?1, ?2, ?3, 'local')",
+                rusqlite::params![&self.identity, &event_id_b64, created_at as i64],
+            ).expect("failed to insert recorded_event");
+
+            // Project (validates the signature + authorization chain)
+            project_one(&db, &self.identity, &event_id).expect("failed to project file_slice");
+        }
+        db.execute("COMMIT", []).expect("failed to commit");
+
+        file_id
+    }
+
+    /// Query file-slice event counts grouped by ingest source.
+    ///
+    /// Returns a map of source_peer → event_count. Uses events + recorded_events
+    /// tables (no projection required). Module-local query helper.
+    pub fn file_slice_event_counts_by_source(&self) -> std::collections::HashMap<String, i64> {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        crate::event_modules::file_slice::file_slice_event_counts_by_source(
+            &db,
+            &self.identity,
+        )
+    }
+
+    /// Count file_slice events received by this peer (no projection required).
+    pub fn file_slice_event_count(&self) -> i64 {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        crate::event_modules::file_slice::file_slice_event_count(&db, &self.identity)
     }
 
     /// Count events in the events table.
@@ -2236,7 +2381,7 @@ pub fn start_chain(peers: &[Peer]) -> Vec<std::thread::JoinHandle<()>> {
 /// Start a sink-driven download topology: sink connects to all sources.
 ///
 /// Each source runs accept_loop (responder). The sink runs one
-/// `connect_loop_with_coordination` per source with a shared
+/// `connect_loop_with_shared_ingest` per source with a shared
 /// `CoordinationManager`, matching the production runtime path used by
 /// bootstrap/mDNS autodial.
 ///
@@ -2328,31 +2473,54 @@ pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Jo
         sink_connectors.push((client_endpoint, source_addrs[i]));
     }
 
+    // Spawn ONE shared batch_writer for the sink so events from all sources
+    // interleave in a single channel.  Without this, each connect_loop spawns
+    // its own writer and concurrent writers race on INSERT OR IGNORE, causing
+    // one source to dominate attribution.
+    let ingest_fns = test_ingest_fns();
+    let ingest_cap = crate::tuning::shared_ingest_cap();
+    let (shared_tx, shared_rx) =
+        tokio::sync::mpsc::channel::<crate::contracts::event_pipeline_contract::IngestItem>(
+            ingest_cap,
+        );
+    let writer_db = sink.db_path.clone();
+    let writer_events = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let batch_writer_fn = ingest_fns.batch_writer;
+    let _writer_handle = std::thread::spawn(move || {
+        batch_writer_fn(writer_db, shared_rx, writer_events);
+    });
+
+    // Pre-register ALL peers before spawning threads. This ensures
+    // total_peers is correct from the very first reconciliation round,
+    // preventing race conditions where fast threads see total_peers=1
+    // and request all events.
     let coord_manager = Arc::new(crate::sync::CoordinationManager::new());
-    for (i, (endpoint, remote)) in sink_connectors.into_iter().enumerate() {
+    let peer_coords: Vec<_> = (0..sink_connectors.len())
+        .map(|_| coord_manager.register_peer())
+        .collect();
+    for ((endpoint, remote), coordination) in
+        sink_connectors.into_iter().zip(peer_coords)
+    {
         let sink_db = sink.db_path.clone();
         let sink_identity = sink.identity.clone();
-        let coordination_manager = coord_manager.clone();
+        let sink_ingest = shared_tx.clone();
         handles.push(std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .unwrap();
             rt.block_on(async move {
-                if let Err(e) = connect_loop_with_coordination(
+                let _ = connect_loop_with_shared_ingest(
                     &sink_db,
                     &sink_identity,
                     endpoint,
                     remote,
-                    None,
                     noop_intro_spawner,
                     test_ingest_fns(),
-                    coordination_manager,
+                    coordination,
+                    sink_ingest,
                 )
-                .await
-                {
-                    tracing::warn!("sink connect_loop_with_coordination[{}] exited: {}", i, e);
-                }
+                .await;
             });
         }));
     }
@@ -2931,6 +3099,10 @@ pub fn clone_events_to(source: &Peer, targets: &[&Peer]) {
 
     for target in targets {
         let tgt_db = open_connection(&target.db_path).expect("failed to open target db");
+        // Use target's workspace_id so neg_items entries match the target's
+        // neg_storage scope and don't create duplicates when the target later
+        // receives the same events from sync (which inserts with target ws_id).
+        let tgt_ws_id = crate::db::store::lookup_workspace_id(&tgt_db, &target.identity);
         tgt_db.execute("BEGIN", []).expect("failed to begin");
 
         for (event_id, event_type, blob, share_scope, created_at, inserted_at) in &events {
@@ -2944,8 +3116,8 @@ pub fn clone_events_to(source: &Peer, targets: &[&Peer]) {
         for (ts, id) in &neg_items {
             tgt_db
                 .execute(
-                    "INSERT OR IGNORE INTO neg_items (ts, id) VALUES (?1, ?2)",
-                    rusqlite::params![ts, id.as_slice()],
+                    "INSERT OR IGNORE INTO neg_items (workspace_id, ts, id) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![&tgt_ws_id, ts, id.as_slice()],
                 )
                 .expect("failed to insert neg_item");
         }

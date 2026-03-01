@@ -991,20 +991,21 @@ Required changes from the 1:1 sync model:
 2. **Thread-per-connection.** Each connection spawns a `std::thread` with a dedicated
    single-threaded tokio runtime. Isolates connection failures and allows sharing the
    `mpsc::Sender` to the batch_writer across connections.
-3. **Coordinator thread for pull rebalancing.** After negentropy reconciliation, each peer
-   reports its discovered need_ids to a coordinator that assigns each event to the
-   least-loaded peer that has it (greedy load balancing, unique-events-first ordering).
-   For single-peer, the coordinator is pass-through (all events already streamed).
-4. **Push uncoordinated, pull streams then coordinates.** Have_ids (outbound) stream
+3. **Deterministic per-event ownership for pull splitting.** Each need_id is routed
+   through `hash(event_id[0..8]) % total_peers == peer_idx`. Owned events get
+   HaveList immediately during reconciliation (streaming pull). Non-owned events
+   are buffered for fallback discard. No coordinator barrier on the hot path.
+4. **Push uncoordinated, pull streams with ownership.** Have_ids (outbound) stream
    immediately. Need_ids (inbound) are dispatched as HaveList during reconciliation
-   rounds (streaming pull — events flow immediately) AND reported to the coordinator
-   after reconciliation for multi-peer rebalancing. The `wanted` table deduplicates.
+   rounds based on ownership. The `wanted` table deduplicates.
    **Do not defer HaveList until after reconciliation** — this creates a pipeline stall
    that serializes ~1s of overhead on the critical path.
-5. **Round-based reassignment.** Assignments are discarded after each round. Undelivered
-   events re-appear as need_ids next round and get reassigned to a different peer.
-6. **Short collection window (~20ms).** Coordinator waits briefly after the first peer
-   reports. Stragglers report next round. Prevents convoy effects from slow reconciliation.
+5. **Threshold-based claim-all for source-unique events.** When `need_ids.len() <=
+   total_peers * 20`, the session claims ALL need_ids regardless of ownership.
+   Handles source-unique events (identity chains, markers) that only exist at one
+   source and cannot be downloaded by their deterministic "owner" peer.
+6. **Pre-registration of peers.** All PeerCoord handles registered before spawning
+   connect loop threads. Ensures `total_peers` is correct from the first session.
 7. **Incremental egress enqueue.** Have_ids buffered and drained in batches per main loop
    iteration so event streaming is not starved by large reconciliation results.
 8. **Negentropy snapshot ordering.** `BEGIN` must precede `rebuild_blocks()` so the storage
@@ -1013,10 +1014,9 @@ Required changes from the 1:1 sync model:
 Test families (in `sync_graph_test.rs`):
 - **Family A (chain):** N-peer chain propagation (tail convergence, per-hop latency).
 - **Family B (multi-source):** 1–8 concurrent sources with varying event counts.
-  B0 = serialized baseline, B1 = coordinator-assigned, B2/B3 = variants.
 - **Family C (multi-source large-file):** all non-sink sources seeded with identical
   file-slice sets; sink asserts exact file-slice ID set and substantial per-source
-  ingest share from `recorded_events.source` attribution.
+  ingest share from `recorded_events.source` attribution (>=5% per source).
 
 ---
 

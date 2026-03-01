@@ -100,9 +100,9 @@ pub(super) fn run_persist_phase(
 
                     persist_output.tenants_seen.insert(recorded_by.clone());
                     persist_output.persisted_event_ids.push(*event_id);
-                }
-            }
-        }
+                } else {}
+            } else {}
+        } else {}
     }
 
     persist_output

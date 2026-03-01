@@ -143,6 +143,12 @@ pub async fn connect_loop_with_coordination_until_cancel_with_fallback(
     // sessions on this connect loop.
     let shared_ingest = spawn_shared_ingest_writer(db_path, ingest);
 
+    // Register this connect loop's peer before starting sessions.
+    // The PeerCoord is reused across reconnect sessions — in the streaming
+    // ownership model, only peer_idx and total_peers matter (no coordinator
+    // channels), so reuse is safe.
+    let coordination = coordination_manager.register_peer();
+
     // Use LocalSet so the intro listener (spawn_intro_listener uses spawn_local)
     // can run on the same runtime that drives the endpoint I/O.
     let local = tokio::task::LocalSet::new();
@@ -155,9 +161,45 @@ pub async fn connect_loop_with_coordination_until_cancel_with_fallback(
             client_config,
             intro_spawner,
             shared_ingest,
-            coordination_manager,
+            coordination,
             shutdown,
             bootstrap_fallback_client_config,
+        ))
+        .await
+}
+
+/// Coordinated connect loop that reuses a pre-existing shared ingest sender.
+///
+/// Used for multi-source download where all connect loops targeting the same
+/// sink DB share a single batch_writer for fair source attribution. Without
+/// this, each connect loop spawns its own batch_writer and concurrent writers
+/// race on `INSERT OR IGNORE`, causing one source to dominate attribution.
+pub async fn connect_loop_with_shared_ingest(
+    db_path: &str,
+    recorded_by: &str,
+    endpoint: TransportEndpoint,
+    remote: SocketAddr,
+    intro_spawner: IntroSpawnerFn,
+    ingest: IngestFns,
+    coordination: Arc<crate::sync::session::coordinator::PeerCoord>,
+    shared_ingest: tokio::sync::mpsc::Sender<crate::contracts::event_pipeline_contract::IngestItem>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let tenants = vec![recorded_by.to_string()];
+    run_startup_preflight(db_path, &tenants, ingest)?;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(connect_loop_inner(
+            db_path,
+            recorded_by,
+            endpoint,
+            remote,
+            None,
+            intro_spawner,
+            shared_ingest,
+            coordination,
+            CancellationToken::new(),
+            None,
         ))
         .await
 }
@@ -170,7 +212,7 @@ async fn connect_loop_inner(
     client_config: Option<TransportClientConfig>,
     intro_spawner: IntroSpawnerFn,
     shared_ingest: tokio::sync::mpsc::Sender<crate::contracts::event_pipeline_contract::IngestItem>,
-    coordination_manager: Arc<CoordinationManager>,
+    coordination: Arc<crate::sync::session::coordinator::PeerCoord>,
     shutdown: CancellationToken,
     bootstrap_fallback_client_config: Option<TransportClientConfig>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -187,10 +229,9 @@ async fn connect_loop_inner(
     let initiator_handler = SyncSessionHandler::outbound(
         db_path.to_string(),
         SYNC_SESSION_TIMEOUT_SECS,
-        coordination_manager,
+        coordination,
         shared_ingest.clone(),
     );
-
     loop {
         if shutdown.is_cancelled() {
             break;

@@ -9,7 +9,7 @@ PEERING_PATH="src/runtime/peering/"
 SYNC_PATH="src/runtime/sync_engine/"
 PIPELINE_PATH="src/state/pipeline/"
 SERVICE_PATH="src/runtime/control/service.rs"
-PROJECTION_PATH="src/state/projection_state/"
+PROJECTION_PATH="src/state/projection/"
 TRANSPORT_PATH="src/runtime/transport/"
 
 check_no_match() {
@@ -241,14 +241,17 @@ check_required 'pub fn create_user_invite' src/event_modules/workspace/commands.
 check_required 'pub fn create_device_link_invite' src/event_modules/workspace/commands.rs
 check_required 'pub fn retry_pending_invite_content_key_unwraps' src/event_modules/workspace/commands.rs
 
-# workspace command wrappers live in workspace/commands.rs (not service.rs)
-check_required 'pub fn create_workspace_for_db' src/event_modules/workspace/commands.rs
-check_required 'pub fn accept_invite' src/event_modules/workspace/commands.rs
-check_required 'pub fn accept_device_link' src/event_modules/workspace/commands.rs
+# workspace DB-path command wrappers are implemented in commands_api.rs and
+# re-exported from workspace/commands.rs for stable callsites.
+check_required 'pub fn create_workspace_for_db' src/event_modules/workspace/commands_api.rs
+check_required 'pub fn accept_invite' src/event_modules/workspace/commands_api.rs
+check_required 'pub fn accept_device_link' src/event_modules/workspace/commands_api.rs
+check_required 'create_workspace_for_db' src/event_modules/workspace/commands.rs
+check_required 'accept_invite' src/event_modules/workspace/commands.rs
+check_required 'accept_device_link' src/event_modules/workspace/commands.rs
 
-# event pipeline uses explicit persist/planner/effects phase entrypoints
+# event pipeline uses explicit persist/effects phase entrypoints
 check_required 'run_persist_phase' src/state/pipeline/mod.rs
-check_required 'plan_post_commit_commands' src/state/pipeline/mod.rs
 check_required 'run_post_commit_effects' src/state/pipeline/mod.rs
 check_required 'event_modules::post_drain_hooks' src/state/pipeline/effects.rs
 
