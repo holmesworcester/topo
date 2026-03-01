@@ -88,10 +88,10 @@ Throughput profile (receiver-side message count):
 Tail-phase slowdown is gated by receiver-side batch_writer throughput
 (SQLite insert rate degrades as tables grow).
 
-Mitigations to prioritize:
-1. Keep writer batches bounded by page/byte budget (not only count) so commit cost stays flatter at high table cardinality.
-2. Use staged backfill projection policy for large catchup windows (durable store first, deferred projection in bounded chunks).
-3. Increase checkpoint discipline during long runs (`wal_autocheckpoint`, explicit passive checkpoints between large rounds).
+Investigation order (profiling-first):
+1. Profile first (CPU + SQLite + WAL timing) on the 250k->500k tail to confirm dominant stall source before tuning.
+2. If commit cost dominates, bound writer batches by page/byte budget (not only count) so commit latency stays flatter at high cardinality.
+3. If WAL pressure appears in profile, tune checkpoint policy (`wal_autocheckpoint`, explicit passive checkpoints between large rounds) and re-measure.
 4. Re-verify projection table indexes against dominant write/read paths for high-cardinality tails (`messages`, `recorded_events`, `valid_events`).
 
 #### 10k continuous sync (inject while syncing)
@@ -167,14 +167,14 @@ Events injected at P0, propagate through P0-P1-...-P9.
 | Peak RSS | 1,755.3 MiB |
 
 Why this appears much faster than 10k:
-1. Chain benchmark "tail converge" is marker-based (single sampled event), not full-dataset completion.
-2. Events/s is derived from total injected events divided by marker time, so larger injections inflate apparent throughput.
-3. Use hop-latency and RSS trends as primary comparators here; for true transfer throughput, use one-way or catchup benchmarks.
+1. Chain timing now uses full store-count convergence per peer; no sampled marker events.
+2. Fixed setup/connection costs are amortized more at 50k, so apparent throughput improves with larger batches.
+3. Treat chain results as topology behavior (hop-delay + memory) rather than canonical bulk-throughput numbers.
 
 #### Multi-source catchup: 4 sources, 100k events
 
 Sink connects to all sources as initiator using coordinated round-based assignment.
-Each source contributes at least one unique marker, proving all sources participated.
+All sources are pre-seeded with the same dataset; sink success requires exact ID-set equality with the union of source stores.
 
 | Metric | Value |
 |--------|-------|
@@ -182,8 +182,7 @@ Each source contributes at least one unique marker, proving all sources particip
 | Events/s | 16,439 |
 | MB/s | 1.64 |
 | MiB/s (same estimator) | 1.56 |
-| Contributing sources | 4/4 |
-| Sink store | 22,949 |
+| Sink store | 100,000 |
 | Peak RSS | 689.4 MiB |
 
 #### Multi-source catchup: 8 sources, 100k events
@@ -194,17 +193,17 @@ Each source contributes at least one unique marker, proving all sources particip
 | Events/s | 10,412 |
 | MB/s | 1.04 |
 | MiB/s (same estimator) | 0.99 |
-| Contributing sources | 8/8 |
-| Sink store | 14,908 |
+| Sink store | 100,000 |
 | Peak RSS | 1,370.3 MiB |
 
 ### Planned Benchmark Gap: Multi-Source Large-File Catchup
 
 Files dominate real-world transfer volume, so event-only catchup is not enough.
 Next benchmark to add:
-1. 4-8 source peers, each with overlapping large file-slice sets plus per-source unique slices.
-2. Sink runs coordinated multi-source catchup; report per-source contribution, wall time, MB/s, MiB/s, and peak RSS.
-3. Keep it `#[ignore]` in CI but runnable in regular perf sweeps.
+1. 4-8 source peers where all sources except sink are seeded with the same large file slice set.
+2. Add sink-side source attribution for received slices/events (origin peer identity and/or endpoint) so we can verify work split across sources, not just final set equality.
+3. Report wall time, MB/s, MiB/s, peak RSS, and per-source slice/event contribution histogram.
+4. Keep it `#[ignore]` in CI but runnable in regular perf sweeps.
 
 ### Low-Memory Budget (`low_mem_test.rs`)
 

@@ -9,8 +9,8 @@
 //! NOTE: --test-threads=1 is required; concurrent heavy tests trigger a negentropy
 //! race condition (duplicate items from concurrent reads/writes to neg_items).
 
+use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
-use topo::crypto::event_id_to_base64;
 use topo::testutil::{assert_eventually, clone_events_to, start_chain, start_sink_download, Peer};
 
 /// Read peak resident set size from /proc/self/status (Linux only).
@@ -29,26 +29,50 @@ fn peak_rss_mib() -> f64 {
     0.0
 }
 
-/// Compute per-hop latencies (ms) from sampled events across a chain.
-/// Returns a sorted vector of all per-hop delays observed.
-fn compute_hop_latencies(peers: &[Peer], sample_event_ids: &[String]) -> Vec<f64> {
-    let mut hop_delays: Vec<f64> = Vec::new();
-    for eid in sample_event_ids {
-        let mut timestamps: Vec<Option<i64>> = Vec::new();
-        for peer in peers {
-            timestamps.push(peer.recorded_at_for_event(eid));
-        }
-        for i in 0..timestamps.len() - 1 {
-            if let (Some(t_prev), Some(t_next)) = (timestamps[i], timestamps[i + 1]) {
-                let delay_ms = (t_next - t_prev) as f64;
-                if delay_ms >= 0.0 {
-                    hop_delays.push(delay_ms);
-                }
-            }
-        }
+/// Compute per-hop delays (ms) from full-convergence timestamps across a chain.
+fn compute_hop_delays(reach_ms: &[u64]) -> Vec<f64> {
+    let mut hop_delays = Vec::with_capacity(reach_ms.len().saturating_sub(1));
+    for window in reach_ms.windows(2) {
+        hop_delays.push(window[1].saturating_sub(window[0]) as f64);
     }
     hop_delays.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     hop_delays
+}
+
+/// Wait until each peer reaches full store convergence and return per-peer
+/// convergence timestamps (ms since `start`) in peer order.
+async fn wait_for_full_convergence_times(
+    peers: &[Peer],
+    expected_store_count: i64,
+    timeout: Duration,
+    start: Instant,
+) -> Vec<u64> {
+    let mut reached: Vec<Option<u64>> = vec![None; peers.len()];
+    loop {
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        for (i, peer) in peers.iter().enumerate() {
+            if reached[i].is_none() && peer.store_count() == expected_store_count {
+                reached[i] = Some(elapsed_ms);
+            }
+        }
+
+        if reached.iter().all(Option::is_some) {
+            return reached
+                .into_iter()
+                .map(|ts| ts.expect("all peers reached convergence"))
+                .collect();
+        }
+
+        let counts: Vec<i64> = peers.iter().map(Peer::store_count).collect();
+        assert!(
+            start.elapsed() < timeout,
+            "chain full convergence timed out after {:?}: counts={:?}, expected={}",
+            timeout,
+            counts,
+            expected_store_count
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 fn percentile(sorted: &[f64], pct: f64) -> f64 {
@@ -82,40 +106,37 @@ async fn run_chain_bench(n: usize, event_count: usize) {
     let gen_secs = gen_start.elapsed().as_secs_f64();
     eprintln!("Generated {} events at P0 in {:.2}s", event_count, gen_secs);
 
-    // Sample an event from P0 to use as convergence marker
-    let sample = peers[0].sample_event_ids(1)[0].clone();
+    // Count-based convergence target: union of all pre-sync store IDs.
+    let expected_store_count = {
+        let mut ids = BTreeSet::new();
+        for peer in &peers {
+            ids.extend(peer.store_ids());
+        }
+        ids.len() as i64
+    };
 
     let rss_before = peak_rss_mib();
     let start = Instant::now();
 
     let handles = start_chain(&peers);
 
-    let timeout = Duration::from_secs(600);
-
-    // Wait for tail peer to have the sampled event
-    assert_eventually(
-        || peers[n - 1].has_event(&sample),
-        timeout,
-        &format!("chain tail P{} receives sampled event", n - 1),
+    // Count-only timing: convergence is measured from per-peer store_count.
+    let convergence_ms = wait_for_full_convergence_times(
+        &peers,
+        expected_store_count,
+        Duration::from_secs(600),
+        start,
     )
     .await;
-
-    let tail_wall_ms = start.elapsed().as_millis() as u64;
-
-    // Wait for ALL peers to have the sampled event
-    assert_eventually(
-        || peers.iter().all(|p| p.has_event(&sample)),
-        Duration::from_secs(60),
-        "all peers receive sampled event",
-    )
-    .await;
-
-    let all_wall_ms = start.elapsed().as_millis() as u64;
+    let tail_wall_ms = convergence_ms[n - 1];
+    let all_wall_ms = *convergence_ms
+        .iter()
+        .max()
+        .expect("non-empty convergence timestamps");
     let rss_after = peak_rss_mib();
 
-    // Sample events for hop latency analysis
-    let sample_ids = peers[0].sample_event_ids(200);
-    let hop_delays = compute_hop_latencies(&peers, &sample_ids);
+    // Hop delay analysis from adjacent peer convergence timestamps.
+    let hop_delays = compute_hop_delays(&convergence_ms);
     let hop_p50 = percentile(&hop_delays, 0.50);
     let hop_p95 = percentile(&hop_delays, 0.95);
 
@@ -161,26 +182,27 @@ async fn ten_hop_chain_50k() {
 
 /// Run a coordinated sink-driven download benchmark.
 ///
-/// Sources share a large overlapping dataset (cloned from S0) plus one
-/// source-unique marker each. The sink connects to all sources as initiator
-/// using coordinated round-based assignment.
-///
-/// The unique marker per source gives a hard "no-cheat" proof that every source
-/// contributed real data to sink catchup.
+/// Sources share the same pre-seeded dataset (cloned from S0). The sink
+/// connects to all sources as initiator using coordinated round-based assignment.
 async fn run_catchup_bench(source_count: usize, events_per_source: usize) {
-    let sources: Vec<Peer> = (0..source_count)
-        .map(|i| Peer::new_with_identity(&format!("ds{}", i)))
-        .collect();
+    assert!(source_count >= 1, "source_count must be >= 1");
+    let mut sources: Vec<Peer> = Vec::with_capacity(source_count);
+    // S0 owns canonical event generation identity chain.
+    sources.push(Peer::new_with_identity("ds0"));
+    // Remaining sources are transport-only peers; clone S0 dataset into them.
+    for i in 1..source_count {
+        sources.push(Peer::new(&format!("ds{}", i)));
+    }
     let sink = Peer::new_with_identity("dsink");
 
     // Generate events at S0 only
     let gen_start = Instant::now();
     sources[0].batch_create_messages(events_per_source);
     let gen_secs = gen_start.elapsed().as_secs_f64();
-    let total_messages = events_per_source as i64;
+    let seeded_messages = events_per_source as i64;
     eprintln!(
         "Generated {} events at S0 in {:.2}s, cloning to {} sources...",
-        total_messages,
+        seeded_messages,
         gen_secs,
         source_count - 1
     );
@@ -192,19 +214,12 @@ async fn run_catchup_bench(source_count: usize, events_per_source: usize) {
         eprintln!("  Cloned to S1..S{}", source_count - 1);
     }
 
-    // Add one source-unique marker on each source so we can prove each source
-    // contributed data to sink catchup.
-    let source_markers: Vec<String> = sources
+    // Count-based convergence target: union of all source store IDs.
+    let expected_sink_ids: BTreeSet<String> = sources
         .iter()
-        .enumerate()
-        .map(|(i, source)| {
-            let marker = source.create_message(&format!("source-{}-unique-marker", i));
-            event_id_to_base64(&marker)
-        })
+        .flat_map(|s| s.store_ids().into_iter())
         .collect();
-
-    // Sample a convergence marker from S0.
-    let sample = sources[0].sample_event_ids(1)[0].clone();
+    let expected_sink_count = expected_sink_ids.len() as i64;
 
     let rss_before = peak_rss_mib();
     let start = Instant::now();
@@ -218,24 +233,22 @@ async fn run_catchup_bench(source_count: usize, events_per_source: usize) {
         120
     };
     assert_eventually(
-        || sink.has_event(&sample) && source_markers.iter().all(|marker| sink.has_event(marker)),
+        || sink.store_count() == expected_sink_count,
         Duration::from_secs(timeout_secs),
-        "sink download receives sampled event and per-source unique markers",
+        &format!("sink reaches expected store_count={}", expected_sink_count),
     )
     .await;
 
     let wall_ms = start.elapsed().as_millis() as u64;
     let rss_after = peak_rss_mib();
-    let events_per_sec = total_messages as f64 / (wall_ms as f64 / 1000.0);
+    let events_per_sec = expected_sink_count as f64 / (wall_ms as f64 / 1000.0);
     let mb_per_sec = events_per_sec * 100.0 / 1_000_000.0;
 
-    let contributing_sources = source_markers
-        .iter()
-        .filter(|marker| sink.has_event(marker))
-        .count();
+    // Exact set equality validates full dataset catchup (no marker shortcuts).
+    let sink_ids = sink.store_ids();
     assert_eq!(
-        contributing_sources, source_count,
-        "sink must receive at least one unique marker from each source"
+        sink_ids, expected_sink_ids,
+        "sink store IDs must match union of source store IDs"
     );
 
     drop(handles);
@@ -245,14 +258,10 @@ async fn run_catchup_bench(source_count: usize, events_per_source: usize) {
         "=== Multi-source catchup: {} sources x {} events (sink-driven rounds) ===",
         source_count, events_per_source,
     );
-    eprintln!("  Unique events:    {}", total_messages);
+    eprintln!("  Unique events:    {}", expected_sink_count);
     eprintln!("  Catchup wall:     {} ms", wall_ms);
     eprintln!("  Events/s:         {:.0}", events_per_sec);
     eprintln!("  MB/s:             {:.2}", mb_per_sec);
-    eprintln!(
-        "  Contributing src: {}/{}",
-        contributing_sources, source_count
-    );
     eprintln!("  Sink store:       {}", sink.store_count());
     eprintln!(
         "  Peak RSS:         {:.1} MiB (before: {:.1})",

@@ -133,14 +133,15 @@ async fn test_sync_10k() {
     let gen_secs = gen_start.elapsed().as_secs_f64();
     eprintln!("Generated 10k events in {:.2}s", gen_secs);
 
-    // Pick a sample event from alice's store to use as convergence marker
-    let sample_ids = alice.sample_event_ids(1);
-    let marker_b64 = sample_ids[0].clone();
+    // Count-based convergence gate: bob must ingest alice's full pre-sync store.
+    let alice_store_before_sync = alice.store_count();
+    let bob_store_before_sync = bob.store_count();
+    let expected_bob_store = bob_store_before_sync + alice_store_before_sync;
 
     let metrics = sync_until_converged(
         &alice,
         &bob,
-        || bob.has_event(&marker_b64),
+        || bob.store_count() >= expected_bob_store,
         Duration::from_secs(120),
     )
     .await;
@@ -265,52 +266,21 @@ async fn test_zero_loss_stress() {
         "bob should have 5000 messages before sync"
     );
 
-    // Sample multiple events from both sides to ensure full bidirectional sync.
-    // A single sample can pass after only a partial transfer.
-    // Use shared-scope samples so phase-1 only checks sync-eligible IDs.
-    let alice_samples = alice.sample_shared_event_ids(50);
-    let bob_samples = bob.sample_shared_event_ids(50);
-
-    // Phase 1: sample-based fast convergence gate (sync stays running).
+    // Count/set-based convergence only (no marker/sample phase).
     let a_before = alice.store_count();
     let b_before = bob.store_count();
     let start = Instant::now();
     let sync = start_peers_pinned(&alice, &bob);
 
-    // Phase 1 is a fast gate, not an authoritative correctness check.
-    // If it times out, continue to phase 2 (full-set quiescence), which is the
-    // strict correctness gate for this test.
-    let phase1_timeout = Duration::from_secs(120);
-    let phase1_start = Instant::now();
-    let mut phase1_ok = false;
-    loop {
-        if alice_samples.iter().all(|s| bob.has_event(s))
-            && bob_samples.iter().all(|s| alice.has_event(s))
-        {
-            phase1_ok = true;
-            break;
-        }
-        if phase1_start.elapsed() >= phase1_timeout {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    if !phase1_ok {
-        eprintln!(
-            "phase 1 sample gate did not converge in {:?}; continuing to phase 2",
-            phase1_timeout
-        );
-    }
-
-    // Phase 2: full-set quiescence gate — require diff <= local_event_count on
+    // Full-set quiescence gate — require diff <= local_event_count on
     // both sides, stable for 5 consecutive polls at 200ms, before dropping sync.
     // Each peer creates 5 local-scope (non-synced) events during workspace
     // bootstrap: InviteAccepted + SecretKey + 3×LocalSignerSecret.
     let local_event_budget = 5;
     let quiesce_needed = 5u32;
     let mut quiesce_streak = 0u32;
-    let phase2_timeout = Duration::from_secs(30);
-    let phase2_start = Instant::now();
+    let quiesce_timeout = Duration::from_secs(120);
+    let quiesce_start = Instant::now();
     loop {
         let a_ids = alice.store_ids();
         let b_ids = bob.store_ids();
@@ -327,8 +297,8 @@ async fn test_zero_loss_stress() {
         }
 
         assert!(
-            phase2_start.elapsed() < phase2_timeout,
-            "phase 2 quiescence timed out: alice_only={}, bob_only={}",
+            quiesce_start.elapsed() < quiesce_timeout,
+            "quiescence timed out: alice_only={}, bob_only={}",
             a_only,
             b_only,
         );
@@ -593,14 +563,15 @@ async fn test_sync_50k() {
     let gen_secs = gen_start.elapsed().as_secs_f64();
     eprintln!("Generated 50k events in {:.2}s", gen_secs);
 
-    // Pick a sample event from alice's store to use as convergence marker
-    let sample_ids = alice.sample_event_ids(1);
-    let marker_b64 = sample_ids[0].clone();
+    // Count-based convergence gate: bob must ingest alice's full pre-sync store.
+    let alice_store_before_sync = alice.store_count();
+    let bob_store_before_sync = bob.store_count();
+    let expected_bob_store = bob_store_before_sync + alice_store_before_sync;
 
     let metrics = sync_until_converged(
         &alice,
         &bob,
-        || bob.has_event(&marker_b64),
+        || bob.store_count() >= expected_bob_store,
         Duration::from_secs(300),
     )
     .await;
