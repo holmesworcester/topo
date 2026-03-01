@@ -387,7 +387,7 @@ mod tests {
             1
         );
 
-        transport_trust::supersede_bootstrap_for_peer_shared(&conn, recorded_by, &peer_pub)
+        transport_trust::consume_bootstrap_for_peer_shared(&conn, recorded_by, &peer_pub)
             .unwrap();
 
         assert_eq!(

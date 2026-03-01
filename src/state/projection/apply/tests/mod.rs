@@ -5309,7 +5309,7 @@ fn test_bootstrap_trust_superseded_by_matching_peer_shared() {
     // The workspace event needs to match trust anchor workspace_id ([0xAA;32]).
     // Since we can't control the hash, verify supersession via the
     // transport-trust supersession helper directly.
-    crate::db::transport_trust::supersede_bootstrap_for_peer_shared(
+    crate::db::transport_trust::consume_bootstrap_for_peer_shared(
         &conn,
         recorded_by,
         &peer_shared_pub,

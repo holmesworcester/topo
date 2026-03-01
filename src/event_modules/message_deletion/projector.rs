@@ -1,6 +1,5 @@
 use super::super::ParsedEvent;
 use crate::crypto::event_id_to_base64;
-use crate::projection::decision::ProjectionDecision;
 use crate::projection::result::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
 
 /// Pure projector: MessageDeletion -> two-stage deletion intent + tombstone model.
@@ -62,11 +61,7 @@ pub fn project_pure(
                 SqlVal::Int(del.created_at_ms as i64),
             ],
         }];
-        return ProjectorResult {
-            decision: ProjectionDecision::AlreadyProcessed,
-            write_ops: ops,
-            emit_commands: Vec::new(),
-        };
+        return ProjectorResult::valid(ops);
     }
 
     // Always record deletion intent (idempotent via INSERT OR IGNORE)

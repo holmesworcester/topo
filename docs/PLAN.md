@@ -454,9 +454,7 @@ enum EmitCommand {
     RetryWorkspaceEvent { workspace_id },
     RetryFileSliceGuards { file_id },
     RecordFileSliceGuardBlock { file_id, event_id },
-    WritePendingBootstrapTrust { invite_event_id, workspace_id, expected_bootstrap_spki_fingerprint },
-    WriteAcceptedBootstrapTrust { invite_accepted_event_id, invite_event_id, workspace_id, bootstrap_addr, bootstrap_spki_fingerprint },
-    SupersedeBootstrapTrust { peer_shared_public_key },
+    ApplyTransportIdentityIntent { intent },
 }
 ```
 
@@ -468,9 +466,9 @@ Entry-point requirement:
 Apply engine execution stages:
 1. Pipeline resolves `EventTypeMeta` and calls the event-module-owned `context_loader(conn, recorded_by, event_id_b64, parsed)` to build `ContextSnapshot`.
 2. Pipeline calls pure projector → receives `ProjectorResult`.
-3. Pipeline executes `write_ops` transactionally (only on Valid/AlreadyProcessed).
-4. Pipeline executes `emit_commands` via explicit handlers (only on Valid).
-5. Pipeline handles guard-block commands on Block decisions (e.g., file_slice guard blocks).
+3. Pipeline executes `write_ops` transactionally only on `Valid`.
+4. Pipeline executes `emit_commands` via explicit handlers on `Valid` and `Block`.
+5. `Reject` and `AlreadyProcessed` execute no write ops and no emitted commands.
 
 DRY split (required):
 - Shared projection pipeline code owns:
@@ -516,7 +514,7 @@ Deterministic emitted-event exception (still under this rule):
 
 - `message_deletion` uses the two-stage deletion intent + tombstone model (see Phase 10).
 - deterministic emitted-event patterns (for example key material derivations) using the unsigned deterministic exception above.
-- identity-specific exceptions (`invite_accepted` trust-anchor binding via `RetryWorkspaceEvent { workspace_id }` command, removal enforcement, bootstrap trust materialization via `WritePendingBootstrapTrust`/`WriteAcceptedBootstrapTrust` commands, supersession via `SupersedeBootstrapTrust` command) implemented via EmitCommand handlers.
+- identity-specific exceptions (`invite_accepted` trust-anchor binding via `RetryWorkspaceEvent { workspace_id }`, removal enforcement, transport identity intent application) implemented via explicit projector decisions + `WriteOp`/`EmitCommand` handling.
 
 ### Deletion intent + tombstone contract (Phase 10)
 
@@ -594,7 +592,7 @@ Implementation shape:
 - If remaining deps are > 0, keep it blocked.
 - If remaining deps reach 0, delete the `blocked_events` row and project the event through the canonical entrypoint.
 - When a projected event becomes `Valid`, use it as the next blocker in the same cascade worklist.
-- If projection returns `Block { missing }` (for example encrypted inner deps), write deduped blocker rows plus a new `blocked_events` header row.
+- If projection returns `Block { missing }` (for example encrypted inner deps), blocker rows are written by the shared dependency stage (`check_deps_and_block`) before returning `Block`.
 - Keep `blocked_event_deps` read-only inside the per-step cascade loop.
 - After cascade transitions occur, bulk-clean `blocked_event_deps` rows for events now terminal (`valid` or `rejected`).
 - Run guard retries after dep cleanup so guard queries see current dep state.
@@ -1086,7 +1084,8 @@ Required behavior:
 - invites are never force-valid; they validate only through signer/dependency chain.
 - accepted invite links produce bootstrap transport trust tuples in SQL via projection:
   - service layer writes local `bootstrap_context` rows (inviter address + SPKI fingerprint from invite link),
-  - invite projectors read `bootstrap_context` and emit `WritePendingBootstrapTrust` / `WriteAcceptedBootstrapTrust` commands,
+  - invite projectors read `bootstrap_context` and write bootstrap trust rows via deterministic `WriteOp::InsertOrIgnore`,
+  - peer_shared projector consumes matching bootstrap trust rows via deterministic `WriteOp::Delete`,
   - trust rows are looked up by sync on each connection/handshake (no in-memory-only trust authority).
   - this follows the same poc-6 cascade pattern where `invite_accepted` projection drives trust-anchor establishment and workspace event unblocking.
 
@@ -1175,7 +1174,7 @@ Previous gap: TLA models were identity/event-causality models that did not encod
 - Local credential lifecycle: single credential per peer (no rotation/revocation in POC).
 - Three-source trust store: PeerShared-derived SPKIs, invite_bootstrap_trust, pending_invite_bootstrap_trust.
 - PeerShared trust source is represented as projected `peers_shared.transport_fingerprint` values (indexed by `(recorded_by, transport_fingerprint)`), matching runtime lookup shape.
-- Supersession: PeerShared projector emits `SupersedeBootstrapTrust` command at projection time, which removes matching bootstrap/pending entries. Trust check reads are pure (no write side-effects).
+- Consumption: PeerShared projector emits deterministic `WriteOp::Delete` rows at projection time, removing matching bootstrap/pending entries. Trust check reads are pure (no write side-effects).
 - TTL expiry of bootstrap trust sources.
 - Trust removal (peer_removed cascading, user_removed transitive denial via `peers_shared.user_event_id`).
 - Invite ownership: `inviteCreator` variable tracks which peer created each invite SPKI. The `CreateInvite` action establishes ownership; `AddPendingBootstrapTrust` is guarded by `inviteCreator[s] = p` so only the invite creator can materialize pending trust.

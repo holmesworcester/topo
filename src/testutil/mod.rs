@@ -1159,8 +1159,8 @@ impl Peer {
             fps.push(fp);
             db.execute(
                 "INSERT OR IGNORE INTO pending_invite_bootstrap_trust
-                 (recorded_by, invite_event_id, workspace_id, expected_bootstrap_spki_fingerprint, created_at, expires_at, superseded_at)
-                 VALUES (?1, ?2, 'synthetic_ws', ?3, ?4, ?5, NULL)",
+                 (recorded_by, invite_event_id, workspace_id, expected_bootstrap_spki_fingerprint, created_at, expires_at)
+                 VALUES (?1, ?2, 'synthetic_ws', ?3, ?4, ?5)",
                 rusqlite::params![&self.identity, format!("synthetic_inv_{}", i), fp.as_slice(), now, expires_at],
             ).expect("failed to insert pending_invite_bootstrap_trust");
         }

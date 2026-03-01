@@ -90,25 +90,9 @@ pub(crate) fn project_one_step(
             return Ok((decision, Some(parsed)));
         }
         ProjectionDecision::Block { ref missing } => {
-            // Inner deps missing (encrypted events). Write block records if non-empty.
-            if !missing.is_empty() {
-                let mut unique_blockers = missing.clone();
-                unique_blockers.sort_unstable();
-                unique_blockers.dedup();
-                for dep_id in &unique_blockers {
-                    let dep_b64 = event_id_to_base64(dep_id);
-                    conn.execute(
-                        "INSERT OR IGNORE INTO blocked_event_deps (peer_id, event_id, blocker_event_id)
-                         VALUES (?1, ?2, ?3)",
-                        rusqlite::params![recorded_by, &event_id_b64, &dep_b64],
-                    )?;
-                }
-                conn.execute(
-                    "INSERT OR IGNORE INTO blocked_events (peer_id, event_id, deps_remaining)
-                     VALUES (?1, ?2, ?3)",
-                    rusqlite::params![recorded_by, &event_id_b64, unique_blockers.len() as i64],
-                )?;
-            }
+            // Dependency-stage block rows are written in check_deps_and_block().
+            // Projector-level guard blocks (missing == []) rely on emitted commands.
+            let _ = missing;
             return Ok((decision, Some(parsed)));
         }
         _ => {}

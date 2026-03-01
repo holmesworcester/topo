@@ -402,7 +402,7 @@ Conceptual ownership:
 2. **Crypto modules own cryptographic primitives** (`shared/crypto/*`, `projection/encrypted.rs` for wrap/unwrap, hash/sign/verify operations).
 3. **Identity helpers own event-domain composition** (`event_modules/workspace/identity_ops.rs`: deterministic key-event materialization, invite helper assembly, bootstrap helper data shaping) and call crypto primitives rather than redefining them.
 4. **Transport adapter owns cert/key/SPKI materialization** and is invoked via typed intents, not direct calls from event modules.
-5. **Projection pipeline owns deterministic application order** (`write_ops` then `emit_commands`) and post-drain hooks.
+5. **Projection pipeline owns deterministic decision-conditioned apply order** (`Valid`: `write_ops` then `emit_commands`; `Block`: `emit_commands` only) and post-drain hooks.
 6. **Service/RPC layer owns orchestration only** (routing, db open/close, error mapping), not identity policy logic.
 7. **Boundary checks are automated** (import guard script + contract tests).
 
@@ -516,13 +516,12 @@ Per batch:
 4. commit,
 5. run post-commit effects (queue drain, health logging, post-drain hooks).
 
-The batch writer runs three explicit phases:
+The batch writer runs two explicit phases:
 
 1. Persist phase (`state/pipeline/phases.rs`): inserts into `events`, `recorded_events`, and `neg_items`, and enqueues `project_queue` rows in one transaction.
-2. Planner phase (`state/pipeline/planner.rs`): deterministically maps `PersistPhaseOutput` to a post-commit command list (for example drain tenant queues seen in the batch, log queue health, run post-drain hooks).
-3. Effects phase (`state/pipeline/effects.rs`): executes side effects through the executor boundary (wanted removal, queue drain/projection, queue health logging, post-drain hooks).
+2. Effects phase (`state/pipeline/effects.rs`): executes side effects directly from `PersistPhaseOutput` through the executor boundary (wanted removal, queue drain/projection, queue health logging, post-drain hooks).
 
-Ownership statement: persist owns ingest SQL writes, planner owns deterministic command mapping, effects owns side-effect execution, and `batch_writer` in `state/pipeline/mod.rs` owns sequencing/retry policy.
+Ownership statement: persist owns ingest SQL writes, effects owns side-effect execution from persisted output, and `batch_writer` in `state/pipeline/mod.rs` owns sequencing/retry policy.
 
 This eliminates write contention while preserving per-tenant projection isolation.
 
@@ -627,9 +626,10 @@ ProjectorResult {
 }
 ```
 
-- `write_ops` are only applied when `decision` is `Valid` (or `AlreadyProcessed` for
-  idempotent intent writes).
-- `emit_commands` are only executed when `decision` is `Valid`.
+- `write_ops` are applied only when `decision` is `Valid`.
+- `emit_commands` are executed on:
+  - `Valid` (normal post-write follow-ons),
+  - `Block` (block-side effects such as file-slice guard row recording).
 
 ### WriteOp types
 
@@ -1595,7 +1595,7 @@ This appendix holds concrete Rust file/module references so conceptual sections 
 4. Write/emit executor: `src/state/projection/apply/write_exec.rs`
 5. Cascade scheduler: `src/state/projection/apply/cascade.rs`
 6. Batch writer orchestration: `src/state/pipeline/mod.rs`
-7. Pipeline persist/planner/effects: `src/state/pipeline/phases.rs`, `src/state/pipeline/planner.rs`, `src/state/pipeline/effects.rs`
+7. Pipeline persist/effects: `src/state/pipeline/phases.rs`, `src/state/pipeline/effects.rs`
 
 ## 15.2 Peering/runtime map
 

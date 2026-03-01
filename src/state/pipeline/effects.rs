@@ -2,17 +2,18 @@ use crate::db::project_queue::ProjectQueue;
 use crate::db::wanted::WantedEvents;
 
 use super::drain::drain_project_queue_on_connection;
-use super::phases::PostCommitCommand;
+use super::phases::PersistPhaseOutput;
 
 pub(super) trait PostCommitEffectsExecutor {
-    fn execute_post_commit_commands(&self, commands: &[PostCommitCommand]);
+    fn run_post_commit_effects(&self, persist_output: &PersistPhaseOutput, batch_size: usize);
 }
 
 pub(super) fn run_post_commit_effects<E: PostCommitEffectsExecutor>(
     executor: &E,
-    commands: &[PostCommitCommand],
+    persist_output: &PersistPhaseOutput,
+    batch_size: usize,
 ) {
-    executor.execute_post_commit_commands(commands);
+    executor.run_post_commit_effects(persist_output, batch_size);
 }
 
 pub(super) struct SqlitePostCommitEffectsExecutor<'a> {
@@ -26,56 +27,46 @@ impl<'a> SqlitePostCommitEffectsExecutor<'a> {
 }
 
 impl PostCommitEffectsExecutor for SqlitePostCommitEffectsExecutor<'_> {
-    fn execute_post_commit_commands(&self, commands: &[PostCommitCommand]) {
+    fn run_post_commit_effects(&self, persist_output: &PersistPhaseOutput, batch_size: usize) {
         let wanted = WantedEvents::new(self.db);
         let pq = ProjectQueue::new(self.db);
 
-        for command in commands {
-            match command {
-                PostCommitCommand::RemoveWanted { event_id } => {
-                    let _ = wanted.remove(event_id);
+        for event_id in &persist_output.persisted_event_ids {
+            let _ = wanted.remove(event_id);
+        }
+
+        // Keep tenant ordering deterministic for readability and reproducible logs.
+        let mut tenants: Vec<String> = persist_output.tenants_seen.iter().cloned().collect();
+        tenants.sort();
+
+        for tenant_id in tenants {
+            if let Err(e) = drain_project_queue_on_connection(self.db, &tenant_id, batch_size) {
+                tracing::warn!("project_queue drain error for {}: {}", tenant_id, e);
+            }
+
+            if let Ok(h) = pq.health(&tenant_id) {
+                if h.pending > 0 || h.max_attempts > 0 {
+                    tracing::debug!(
+                        tenant = %tenant_id,
+                        pending = %h.pending,
+                        max_attempts = %h.max_attempts,
+                        oldest_age_ms = %h.oldest_age_ms,
+                        "project_queue health"
+                    );
                 }
-                PostCommitCommand::DrainProjectQueue {
-                    tenant_id,
-                    batch_size,
-                } => {
-                    if let Err(e) =
-                        drain_project_queue_on_connection(self.db, tenant_id, *batch_size)
-                    {
-                        tracing::warn!("project_queue drain error for {}: {}", tenant_id, e);
-                    }
+            }
+
+            match crate::event_modules::post_drain_hooks(self.db, &tenant_id) {
+                Ok(count) if count > 0 => {
+                    tracing::info!(
+                        "post-drain hooks: tenant {} resolved {} item(s)",
+                        short_id(&tenant_id),
+                        count
+                    );
                 }
-                PostCommitCommand::LogProjectQueueHealth { tenant_id } => {
-                    if let Ok(h) = pq.health(tenant_id) {
-                        if h.pending > 0 || h.max_attempts > 0 {
-                            tracing::debug!(
-                                tenant = %tenant_id,
-                                pending = %h.pending,
-                                max_attempts = %h.max_attempts,
-                                oldest_age_ms = %h.oldest_age_ms,
-                                "project_queue health"
-                            );
-                        }
-                    }
-                }
-                PostCommitCommand::RunPostDrainHooks { tenant_id } => {
-                    match crate::event_modules::post_drain_hooks(self.db, tenant_id) {
-                        Ok(count) if count > 0 => {
-                            tracing::info!(
-                                "post-drain hooks: tenant {} resolved {} item(s)",
-                                short_id(tenant_id),
-                                count
-                            );
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            tracing::warn!(
-                                "post-drain hooks failed for {}: {}",
-                                short_id(tenant_id),
-                                e
-                            )
-                        }
-                    }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!("post-drain hooks failed for {}: {}", short_id(&tenant_id), e)
                 }
             }
         }
@@ -109,18 +100,13 @@ mod tests {
         )
         .unwrap();
 
-        let commands = vec![
-            PostCommitCommand::RemoveWanted {
-                event_id: wanted_id,
-            },
-            PostCommitCommand::DrainProjectQueue {
-                tenant_id: "tenant-a".to_string(),
-                batch_size: 16,
-            },
-        ];
+        let persist_output = PersistPhaseOutput {
+            persisted_event_ids: vec![wanted_id],
+            tenants_seen: std::collections::HashSet::from(["tenant-a".to_string()]),
+        };
         let executor = SqlitePostCommitEffectsExecutor::new(&conn);
 
-        run_post_commit_effects(&executor, &commands);
+        run_post_commit_effects(&executor, &persist_output, 16);
 
         let wanted_count: i64 = conn
             .query_row(
@@ -155,18 +141,13 @@ mod tests {
 
         conn.execute("DROP TABLE project_queue", []).unwrap();
 
-        let commands = vec![
-            PostCommitCommand::DrainProjectQueue {
-                tenant_id: "tenant-a".to_string(),
-                batch_size: 8,
-            },
-            PostCommitCommand::RemoveWanted {
-                event_id: wanted_id,
-            },
-        ];
+        let persist_output = PersistPhaseOutput {
+            persisted_event_ids: vec![wanted_id],
+            tenants_seen: std::collections::HashSet::from(["tenant-a".to_string()]),
+        };
         let executor = SqlitePostCommitEffectsExecutor::new(&conn);
 
-        run_post_commit_effects(&executor, &commands);
+        run_post_commit_effects(&executor, &persist_output, 8);
 
         let wanted_count: i64 = conn
             .query_row(

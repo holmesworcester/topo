@@ -289,6 +289,36 @@ pub(crate) fn clear_pending_invite_unwrap_key(
     Ok(())
 }
 
+fn create_invite_event_with_optional_bootstrap_context(
+    conn: &Connection,
+    recorded_by: &str,
+    event: &ParsedEvent,
+    signer: &SigningKey,
+    workspace_id: &EventId,
+    bootstrap_ctx: Option<&InviteBootstrapContext<'_>>,
+) -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(ctx) = bootstrap_ctx {
+        let event_id = store_signed_event_only(conn, recorded_by, event, signer)?;
+        crate::db::transport_trust::append_bootstrap_context(
+            conn,
+            recorded_by,
+            &event_id_to_base64(&event_id),
+            &event_id_to_base64(workspace_id),
+            ctx.bootstrap_addr,
+            ctx.bootstrap_spki,
+        )?;
+        project_event(conn, recorded_by, &event_id)?;
+        Ok(event_id)
+    } else {
+        Ok(create_signed_event_synchronous(
+            conn,
+            recorded_by,
+            event,
+            signer,
+        )?)
+    }
+}
+
 /// Create a user invite event and wrap content key for invitee.
 /// This is the core event-creation primitive for user invites.
 pub(crate) fn create_user_invite_events(
@@ -313,21 +343,14 @@ pub(crate) fn create_user_invite_events(
         signature: [0u8; 64],
     });
 
-    let invite_event_id = if let Some(ctx) = bootstrap_ctx {
-        let eid = store_signed_event_only(conn, recorded_by, &evt, workspace_key)?;
-        crate::db::transport_trust::append_bootstrap_context(
-            conn,
-            recorded_by,
-            &event_id_to_base64(&eid),
-            &event_id_to_base64(workspace_id),
-            ctx.bootstrap_addr,
-            ctx.bootstrap_spki,
-        )?;
-        project_event(conn, recorded_by, &eid)?;
-        eid
-    } else {
-        create_signed_event_synchronous(conn, recorded_by, &evt, workspace_key)?
-    };
+    let invite_event_id = create_invite_event_with_optional_bootstrap_context(
+        conn,
+        recorded_by,
+        &evt,
+        workspace_key,
+        workspace_id,
+        bootstrap_ctx,
+    )?;
 
     if let (Some(ps_key), Some(ps_eid)) = (sender_peer_shared_key, sender_peer_shared_event_id) {
         wrap_content_key_for_invite(
@@ -370,21 +393,14 @@ pub(crate) fn create_device_link_invite_events(
         signature: [0u8; 64],
     });
 
-    let invite_event_id = if let Some(ctx) = bootstrap_ctx {
-        let eid = store_signed_event_only(conn, recorded_by, &evt, user_key)?;
-        crate::db::transport_trust::append_bootstrap_context(
-            conn,
-            recorded_by,
-            &event_id_to_base64(&eid),
-            &event_id_to_base64(workspace_id),
-            ctx.bootstrap_addr,
-            ctx.bootstrap_spki,
-        )?;
-        project_event(conn, recorded_by, &eid)?;
-        eid
-    } else {
-        create_signed_event_synchronous(conn, recorded_by, &evt, user_key)?
-    };
+    let invite_event_id = create_invite_event_with_optional_bootstrap_context(
+        conn,
+        recorded_by,
+        &evt,
+        user_key,
+        workspace_id,
+        bootstrap_ctx,
+    )?;
 
     Ok(InviteData {
         invite_event_id,
