@@ -56,9 +56,10 @@ fn wait_for_daemon_stopped(db: &str, timeout: Duration) {
             return;
         }
 
-        let rpc_alive = topo::rpc::client::rpc_call(&socket, topo::rpc::protocol::RpcMethod::Status)
-            .map(|resp| resp.ok)
-            .unwrap_or(false);
+        let rpc_alive =
+            topo::rpc::client::rpc_call(&socket, topo::rpc::protocol::RpcMethod::Status)
+                .map(|resp| resp.ok)
+                .unwrap_or(false);
         if !rpc_alive {
             let _ = std::fs::remove_file(&socket);
             if !socket.exists() {
@@ -90,11 +91,9 @@ fn daemon_listen_addr(db: &str) -> String {
 
 fn daemon_transport_fingerprint(db: &str) -> String {
     let socket = socket_path_for_db(db);
-    let resp = topo::rpc::client::rpc_call(
-        &socket,
-        topo::rpc::protocol::RpcMethod::TransportIdentity,
-    )
-    .expect("transport-identity RPC");
+    let resp =
+        topo::rpc::client::rpc_call(&socket, topo::rpc::protocol::RpcMethod::TransportIdentity)
+            .expect("transport-identity RPC");
     assert!(resp.ok, "transport-identity RPC returned error");
     let data = resp.data.expect("transport-identity response missing data");
     data.get("fingerprint")
@@ -360,8 +359,16 @@ fn test_two_process_invite_and_sync() {
     let bob_eid = send_message(&bob_db, "Hello from bob");
 
     // Wait for sync convergence: each peer should have the other's last message event
-    assert_eventually(&alice_db, &format!("has_event:{} >= 1", bob_eid), timeout_ms);
-    assert_eventually(&bob_db, &format!("has_event:{} >= 1", alice_eid), timeout_ms);
+    assert_eventually(
+        &alice_db,
+        &format!("has_event:{} >= 1", bob_eid),
+        timeout_ms,
+    );
+    assert_eventually(
+        &bob_db,
+        &format!("has_event:{} >= 1", alice_eid),
+        timeout_ms,
+    );
 
     // Wait for cross-peer message projection.
     assert_eventually(&alice_db, "message_count >= 2", timeout_ms);

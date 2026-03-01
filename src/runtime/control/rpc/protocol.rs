@@ -115,10 +115,18 @@ pub enum RpcMethod {
     },
 }
 
-fn default_workspace_name() -> String { "workspace".to_string() }
-fn default_username() -> String { "user".to_string() }
-fn default_device_name() -> String { "device".to_string() }
-fn default_view_limit() -> usize { 50 }
+fn default_workspace_name() -> String {
+    "workspace".to_string()
+}
+fn default_username() -> String {
+    "user".to_string()
+}
+fn default_device_name() -> String {
+    "device".to_string()
+}
+fn default_view_limit() -> usize {
+    50
+}
 
 // ---------------------------------------------------------------------------
 // Response

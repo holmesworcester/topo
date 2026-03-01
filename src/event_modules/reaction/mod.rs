@@ -1,20 +1,18 @@
-pub mod wire;
-pub mod projector;
 pub mod commands;
+pub mod projector;
 pub mod queries;
+pub mod wire;
 
 // Re-export stable public API so callers import from `event_modules::reaction`.
-pub use wire::{
-    ReactionEvent,
-    parse_reaction,
-    encode_reaction,
-    offsets,
-    REACTION_WIRE_SIZE,
-    REACTION_TYPE_META,
-};
-pub use commands::{CreateReactionCmd, create, react, ReactResponse, react_for_peer};
-pub use queries::{ReactionRow, list_rows, list_for_message, count, ReactionItem, list, ReactionWithAuthor, list_for_message_with_authors};
+pub use commands::{create, react, react_for_peer, CreateReactionCmd, ReactResponse};
 pub use projector::project_pure;
+pub use queries::{
+    count, list, list_for_message, list_for_message_with_authors, list_rows, ReactionItem,
+    ReactionRow, ReactionWithAuthor,
+};
+pub use wire::{
+    encode_reaction, offsets, parse_reaction, ReactionEvent, REACTION_TYPE_META, REACTION_WIRE_SIZE,
+};
 
 use rusqlite::Connection;
 

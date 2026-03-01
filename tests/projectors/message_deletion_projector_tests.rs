@@ -9,9 +9,9 @@
 
 #[cfg(test)]
 mod tests {
+    use crate::harness::fixtures::*;
     use topo::event_modules::message_deletion::project_pure;
     use topo::event_modules::message_deletion::MessageDeletionEvent;
-    use crate::harness::fixtures::*;
     use topo::event_modules::ParsedEvent;
 
     const PEER: &str = "peer_alice";
@@ -42,7 +42,10 @@ mod tests {
         assert_writes_to_table(&result, "deletion_intents");
         assert_writes_to_table(&result, "deleted_messages");
         // Cascade: should also delete from messages and reactions
-        assert!(result.write_ops.len() >= 3, "expected intent + tombstone + cascade ops");
+        assert!(
+            result.write_ops.len() >= 3,
+            "expected intent + tombstone + cascade ops"
+        );
     }
 
     // ── SPEC_DEL_AUTHOR_01: break (wrong author) ──

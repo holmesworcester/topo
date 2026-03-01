@@ -39,7 +39,10 @@ fn create_workspace(db: &str) {
             .expect("peers probe");
         if peers.status.success() {
             let stdout = String::from_utf8_lossy(&peers.stdout);
-            if stdout.lines().any(|line| line.trim_start().starts_with("1.")) {
+            if stdout
+                .lines()
+                .any(|line| line.trim_start().starts_with("1."))
+            {
                 break;
             }
         }
@@ -138,9 +141,10 @@ fn wait_for_daemon_stopped(db: &str, timeout: Duration) {
             return;
         }
 
-        let rpc_alive = topo::rpc::client::rpc_call(&socket, topo::rpc::protocol::RpcMethod::Status)
-            .map(|resp| resp.ok)
-            .unwrap_or(false);
+        let rpc_alive =
+            topo::rpc::client::rpc_call(&socket, topo::rpc::protocol::RpcMethod::Status)
+                .map(|resp| resp.ok)
+                .unwrap_or(false);
         if !rpc_alive {
             let _ = std::fs::remove_file(&socket);
             if !socket.exists() {
@@ -212,10 +216,7 @@ fn ensure_active_peer(db: &str, timeout: Duration) {
             }
             last_active = active_stdout;
         } else {
-            last_active = format!(
-                "error: {}",
-                String::from_utf8_lossy(&active.stderr).trim()
-            );
+            last_active = format!("error: {}", String::from_utf8_lossy(&active.stderr).trim());
         }
 
         let peers = Command::new(bin())
@@ -396,7 +397,10 @@ fn accept_invite(db: &str, invite_link: &str) {
             .expect("peers probe");
         if peers.status.success() {
             let stdout = String::from_utf8_lossy(&peers.stdout);
-            if stdout.lines().any(|line| line.trim_start().starts_with("1.")) {
+            if stdout
+                .lines()
+                .any(|line| line.trim_start().starts_with("1."))
+            {
                 break;
             }
         }

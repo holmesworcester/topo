@@ -28,7 +28,8 @@ pub fn project_pure(
 
     if is_boot && ctx.is_local_create {
         if let Some(ref bc) = ctx.bootstrap_context {
-            let expected_spki = crate::transport::cert::spki_fingerprint_from_ed25519_pubkey(public_key);
+            let expected_spki =
+                crate::transport::cert::spki_fingerprint_from_ed25519_pubkey(public_key);
             ops.push(WriteOp::InsertOrIgnore {
                 table: "pending_invite_bootstrap_trust",
                 columns: vec![

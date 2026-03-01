@@ -99,8 +99,8 @@ pub fn removed_peer_spki_fingerprints(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{open_in_memory, schema::create_tables};
     use crate::crypto::spki_fingerprint_from_ed25519_pubkey;
+    use crate::db::{open_in_memory, schema::create_tables};
 
     #[test]
     fn test_is_peer_removed_false_when_no_removal() {
@@ -248,7 +248,9 @@ mod tests {
         // Before removal: neither peer is removed
         assert!(!is_peer_removed(&conn, recorded_by, &spki_a).unwrap());
         assert!(!is_peer_removed(&conn, recorded_by, &spki_b).unwrap());
-        assert!(removed_peer_spki_fingerprints(&conn, recorded_by).unwrap().is_empty());
+        assert!(removed_peer_spki_fingerprints(&conn, recorded_by)
+            .unwrap()
+            .is_empty());
 
         // Remove the user (transitive removal of both peers)
         conn.execute(

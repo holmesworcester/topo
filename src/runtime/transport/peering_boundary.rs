@@ -422,12 +422,7 @@ mod tests {
             "INSERT INTO local_signer_material
              (recorded_by, signer_event_id, signer_kind, private_key, created_at)
              VALUES (?1, ?2, 4, ?3, ?4)",
-            rusqlite::params![
-                "tenant-a",
-                "invite-eid",
-                vec![7u8; 32],
-                12345_i64,
-            ],
+            rusqlite::params!["tenant-a", "invite-eid", vec![7u8; 32], 12345_i64,],
         )
         .unwrap();
         drop(db);
@@ -437,7 +432,10 @@ mod tests {
             "tenant-a",
         )
         .expect("fallback config query should succeed");
-        assert!(cfg.is_some(), "pending invite key should yield fallback config");
+        assert!(
+            cfg.is_some(),
+            "pending invite key should yield fallback config"
+        );
     }
 
     #[test]
@@ -453,7 +451,10 @@ mod tests {
             "tenant-a",
         )
         .expect("fallback config query should succeed");
-        assert!(cfg.is_none(), "no pending invite key means no fallback config");
+        assert!(
+            cfg.is_none(),
+            "no pending invite key means no fallback config"
+        );
     }
 
     #[tokio::test]

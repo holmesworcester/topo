@@ -1,8 +1,8 @@
-pub use super::layout::{MESSAGE_WIRE_SIZE, MESSAGE_CONTENT_BYTES};
-use super::layout::offsets as off;
 use super::super::layout::common::{read_text_slot, write_text_slot};
 use super::super::registry::{EventTypeMeta, ShareScope};
 use super::super::{EventError, ParsedEvent, EVENT_TYPE_MESSAGE};
+use super::layout::offsets as off;
+pub use super::layout::{MESSAGE_CONTENT_BYTES, MESSAGE_WIRE_SIZE};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageEvent {
@@ -44,7 +44,8 @@ pub fn parse_message(blob: &[u8]) -> Result<ParsedEvent, EventError> {
         });
     }
 
-    let created_at_ms = u64::from_le_bytes(blob[off::CREATED_AT..off::WORKSPACE_ID].try_into().unwrap());
+    let created_at_ms =
+        u64::from_le_bytes(blob[off::CREATED_AT..off::WORKSPACE_ID].try_into().unwrap());
 
     let mut workspace_id = [0u8; 32];
     workspace_id.copy_from_slice(&blob[off::WORKSPACE_ID..off::AUTHOR_ID]);
@@ -91,8 +92,11 @@ pub fn encode_message(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     buf[off::CREATED_AT..off::WORKSPACE_ID].copy_from_slice(&msg.created_at_ms.to_le_bytes());
     buf[off::WORKSPACE_ID..off::AUTHOR_ID].copy_from_slice(&msg.workspace_id);
     buf[off::AUTHOR_ID..off::CONTENT].copy_from_slice(&msg.author_id);
-    write_text_slot(&msg.content, &mut buf[off::CONTENT..off::CONTENT + MESSAGE_CONTENT_BYTES])
-        .map_err(EventError::TextSlot)?;
+    write_text_slot(
+        &msg.content,
+        &mut buf[off::CONTENT..off::CONTENT + MESSAGE_CONTENT_BYTES],
+    )
+    .map_err(EventError::TextSlot)?;
     buf[off::SIGNED_BY..off::SIGNER_TYPE].copy_from_slice(&msg.signed_by);
     buf[off::SIGNER_TYPE] = msg.signer_type;
     buf[off::SIGNATURE..off::SIGNATURE + 64].copy_from_slice(&msg.signature);

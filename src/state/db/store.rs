@@ -1,4 +1,4 @@
-use rusqlite::{Connection, Result as SqliteResult, params};
+use rusqlite::{params, Connection, Result as SqliteResult};
 
 use crate::crypto::{event_id_to_base64, EventId};
 use crate::event_modules::ShareScope;
@@ -97,7 +97,10 @@ pub fn insert_neg_item_if_shared(
     workspace_id: &str,
 ) -> SqliteResult<()> {
     if share_scope == ShareScope::Shared {
-        conn.execute(SQL_INSERT_NEG_ITEM, params![workspace_id, created_at_ms, event_id.as_slice()])?;
+        conn.execute(
+            SQL_INSERT_NEG_ITEM,
+            params![workspace_id, created_at_ms, event_id.as_slice()],
+        )?;
     }
     Ok(())
 }
@@ -197,7 +200,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn now_ms() -> i64 {
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
     }
 
     fn setup() -> Connection {

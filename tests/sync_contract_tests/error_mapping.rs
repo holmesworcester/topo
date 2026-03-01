@@ -11,13 +11,13 @@ use tokio_util::sync::CancellationToken;
 use topo::contracts::peering_contract::{
     SessionDirection, SessionHandler, TransportSessionIo, TransportSessionIoError,
 };
-use topo::sync::session_handler::SyncSessionHandler;
 use topo::protocol::Frame;
+use topo::sync::session_handler::SyncSessionHandler;
 
 use crate::fake_session_io::{
     create_test_db, empty_negentropy_storage, fake_session_io_pair,
-    fake_session_io_pair_with_config, noop_ingest_tx, run_local, test_session_meta,
-    FakeIoConfig, ProtocolViolation,
+    fake_session_io_pair_with_config, noop_ingest_tx, run_local, test_session_meta, FakeIoConfig,
+    ProtocolViolation,
 };
 
 /// When the peer drops the control channel (half-close), the handler should
@@ -26,8 +26,7 @@ use crate::fake_session_io::{
 async fn control_channel_half_close_terminates_handler() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
-        let handler =
-            SyncSessionHandler::responder(db_path, 30, noop_ingest_tx());
+        let handler = SyncSessionHandler::responder(db_path, 30, noop_ingest_tx());
         let meta = test_session_meta(SessionDirection::Inbound);
         let cancel = CancellationToken::new();
 
@@ -112,8 +111,7 @@ async fn abrupt_close_surfaces_connection_lost() {
 async fn normal_roundtrip_completes_successfully() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
-        let handler =
-            SyncSessionHandler::responder(db_path, 30, noop_ingest_tx());
+        let handler = SyncSessionHandler::responder(db_path, 30, noop_ingest_tx());
         let meta = test_session_meta(SessionDirection::Inbound);
         let cancel = CancellationToken::new();
 
@@ -121,20 +119,13 @@ async fn normal_roundtrip_completes_successfully() {
 
         let handler_task = tokio::task::spawn_local({
             let cancel = cancel.clone();
-            async move {
-                handler
-                    .on_session(meta, Box::new(fake_io), cancel)
-                    .await
-            }
+            async move { handler.on_session(meta, Box::new(fake_io), cancel).await }
         });
 
         // Normal protocol: NegOpen → NegMsg → Done → DoneAck
         let storage = empty_negentropy_storage();
-        let mut neg = negentropy::Negentropy::new(
-            negentropy::Storage::Borrowed(&storage),
-            0,
-        )
-        .unwrap();
+        let mut neg =
+            negentropy::Negentropy::new(negentropy::Storage::Borrowed(&storage), 0).unwrap();
         let initial_msg = neg.initiate().unwrap();
         peer.send_control_msg(&Frame::NegOpen { msg: initial_msg })
             .await;
@@ -274,9 +265,17 @@ async fn out_of_order_data_delivery() {
     let f2 = parts.data_recv.recv().await.expect("recv 2 failed");
     let f3 = parts.data_recv.recv().await.expect("recv 3 failed");
 
-    assert_eq!(f1, vec![0xCC], "first received frame should be C (last sent)");
+    assert_eq!(
+        f1,
+        vec![0xCC],
+        "first received frame should be C (last sent)"
+    );
     assert_eq!(f2, vec![0xBB], "second received frame should be B");
-    assert_eq!(f3, vec![0xAA], "third received frame should be A (first sent)");
+    assert_eq!(
+        f3,
+        vec![0xAA],
+        "third received frame should be A (first sent)"
+    );
 
     // After all frames consumed, next recv should signal channel closed.
     let eof = parts.data_recv.recv().await;
@@ -303,8 +302,7 @@ async fn out_of_order_data_delivery() {
 async fn fragmented_data_frames_handler_completes() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
-        let handler =
-            SyncSessionHandler::responder(db_path, 30, noop_ingest_tx());
+        let handler = SyncSessionHandler::responder(db_path, 30, noop_ingest_tx());
         let meta = test_session_meta(SessionDirection::Inbound);
         let cancel = CancellationToken::new();
 
@@ -316,21 +314,14 @@ async fn fragmented_data_frames_handler_completes() {
 
         let handler_task = tokio::task::spawn_local({
             let cancel = cancel.clone();
-            async move {
-                handler
-                    .on_session(meta, Box::new(fake_io), cancel)
-                    .await
-            }
+            async move { handler.on_session(meta, Box::new(fake_io), cancel).await }
         });
 
         // Drive the normal protocol: NegOpen -> NegMsg -> then send events
         // on the data channel, which will be fragmented.
         let storage = empty_negentropy_storage();
-        let mut neg = negentropy::Negentropy::new(
-            negentropy::Storage::Borrowed(&storage),
-            0,
-        )
-        .unwrap();
+        let mut neg =
+            negentropy::Negentropy::new(negentropy::Storage::Borrowed(&storage), 0).unwrap();
         let initial_msg = neg.initiate().unwrap();
         peer.send_control_msg(&Frame::NegOpen { msg: initial_msg })
             .await;
@@ -340,8 +331,10 @@ async fn fragmented_data_frames_handler_completes() {
 
         // Send an Event with a multi-byte payload that WILL be fragmented.
         // The data receiver will get a partial frame and fail to parse it.
-        peer.send_data_msg(&Frame::Event { blob: vec![0xAA; 100] })
-            .await;
+        peer.send_data_msg(&Frame::Event {
+            blob: vec![0xAA; 100],
+        })
+        .await;
 
         // Send DataDone (1-byte message, not fragmented since len==1) and
         // Done on control to drive the session toward completion.
@@ -402,7 +395,10 @@ async fn fragmentation_splits_data_frames_into_chunks() {
     // The two chunks together should equal the original frame.
     let mut reassembled = chunk1;
     reassembled.extend(chunk2);
-    assert_eq!(reassembled, original, "reassembled chunks should match original");
+    assert_eq!(
+        reassembled, original,
+        "reassembled chunks should match original"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -420,8 +416,7 @@ async fn fragmentation_splits_data_frames_into_chunks() {
 async fn garbage_control_frame_terminates_handler() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
-        let handler =
-            SyncSessionHandler::responder(db_path, 30, noop_ingest_tx());
+        let handler = SyncSessionHandler::responder(db_path, 30, noop_ingest_tx());
         let meta = test_session_meta(SessionDirection::Inbound);
         let cancel = CancellationToken::new();
 
@@ -433,11 +428,7 @@ async fn garbage_control_frame_terminates_handler() {
 
         let handler_task = tokio::task::spawn_local({
             let cancel = cancel.clone();
-            async move {
-                handler
-                    .on_session(meta, Box::new(fake_io), cancel)
-                    .await
-            }
+            async move { handler.on_session(meta, Box::new(fake_io), cancel).await }
         });
 
         // The handler will receive garbage as its first control frame and
@@ -470,8 +461,7 @@ async fn garbage_control_frame_terminates_handler() {
 async fn duplicate_done_violation_terminates_handler() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
-        let handler =
-            SyncSessionHandler::responder(db_path, 30, noop_ingest_tx());
+        let handler = SyncSessionHandler::responder(db_path, 30, noop_ingest_tx());
         let meta = test_session_meta(SessionDirection::Inbound);
         let cancel = CancellationToken::new();
 
@@ -483,21 +473,14 @@ async fn duplicate_done_violation_terminates_handler() {
 
         let handler_task = tokio::task::spawn_local({
             let cancel = cancel.clone();
-            async move {
-                handler
-                    .on_session(meta, Box::new(fake_io), cancel)
-                    .await
-            }
+            async move { handler.on_session(meta, Box::new(fake_io), cancel).await }
         });
 
         // Drive the normal protocol up to Done, which will be duplicated
         // by the FakeControlIo violation injection.
         let storage = empty_negentropy_storage();
-        let mut neg = negentropy::Negentropy::new(
-            negentropy::Storage::Borrowed(&storage),
-            0,
-        )
-        .unwrap();
+        let mut neg =
+            negentropy::Negentropy::new(negentropy::Storage::Borrowed(&storage), 0).unwrap();
         let initial_msg = neg.initiate().unwrap();
         peer.send_control_msg(&Frame::NegOpen { msg: initial_msg })
             .await;

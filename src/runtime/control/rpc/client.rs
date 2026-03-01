@@ -30,8 +30,8 @@ pub fn rpc_call(socket_path: &Path, method: RpcMethod) -> Result<RpcResponse, Rp
     stream.write_all(&frame)?;
     stream.flush()?;
 
-    let resp: RpcResponse = decode_frame(&mut stream)
-        .map_err(|e| RpcClientError::Protocol(e.to_string()))?;
+    let resp: RpcResponse =
+        decode_frame(&mut stream).map_err(|e| RpcClientError::Protocol(e.to_string()))?;
     Ok(resp)
 }
 

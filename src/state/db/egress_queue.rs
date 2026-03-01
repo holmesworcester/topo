@@ -1,7 +1,7 @@
-use rusqlite::{Connection, Result as SqliteResult, params};
+use rusqlite::{params, Connection, Result as SqliteResult};
 
-use crate::crypto::EventId;
 use super::queue::current_timestamp_ms;
+use crate::crypto::EventId;
 
 pub struct EgressQueue<'a> {
     conn: &'a Connection,
@@ -45,7 +45,11 @@ impl<'a> EgressQueue<'a> {
     /// Enqueue a batch of events for a connection. Deduped by partial unique index
     /// on (connection_id, event_id) WHERE frame_type='event' AND sent_at IS NULL.
     /// Returns number inserted.
-    pub fn enqueue_events(&self, connection_id: &str, event_ids: &[EventId]) -> SqliteResult<usize> {
+    pub fn enqueue_events(
+        &self,
+        connection_id: &str,
+        event_ids: &[EventId],
+    ) -> SqliteResult<usize> {
         if event_ids.is_empty() {
             return Ok(0);
         }
@@ -114,9 +118,9 @@ impl<'a> EgressQueue<'a> {
             return Ok(());
         }
         self.conn.execute("BEGIN", [])?;
-        let mut stmt = self.conn.prepare(
-            "DELETE FROM egress_queue WHERE id = ?1",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("DELETE FROM egress_queue WHERE id = ?1")?;
         for rowid in rowids {
             stmt.execute(params![rowid])?;
         }
@@ -191,7 +195,10 @@ mod tests {
         let id = make_event_id(1);
         eq.enqueue_events("conn1", &[id]).unwrap();
         let inserted = eq.enqueue_events("conn1", &[id]).unwrap();
-        assert_eq!(inserted, 0, "duplicate event_id for same connection should be ignored");
+        assert_eq!(
+            inserted, 0,
+            "duplicate event_id for same connection should be ignored"
+        );
 
         let count = eq.count_pending("conn1").unwrap();
         assert_eq!(count, 1);
@@ -245,10 +252,9 @@ mod tests {
         eq.mark_sent(&rowids).unwrap();
 
         // mark_sent now deletes rows — total count should be 0
-        let total: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM egress_queue",
-            [], |row| row.get(0),
-        ).unwrap();
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM egress_queue", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(total, 0);
     }
 

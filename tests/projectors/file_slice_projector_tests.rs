@@ -8,9 +8,9 @@
 
 #[cfg(test)]
 mod tests {
+    use crate::harness::fixtures::*;
     use topo::event_modules::file_slice::project_pure;
     use topo::event_modules::file_slice::FileSliceEvent;
-    use crate::harness::fixtures::*;
     use topo::event_modules::ParsedEvent;
     use topo::projection::result::EmitCommand;
 
@@ -106,6 +106,9 @@ mod tests {
 
         let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
         assert_valid(&result);
-        assert!(result.write_ops.is_empty(), "idempotent replay should produce no writes");
+        assert!(
+            result.write_ops.is_empty(),
+            "idempotent replay should produce no writes"
+        );
     }
 }

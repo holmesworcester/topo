@@ -64,13 +64,18 @@ pub fn react(
     emoji: &str,
 ) -> Result<ReactResponse, String> {
     let eid = create(
-        db, recorded_by, signer_eid, signing_key, created_at_ms,
+        db,
+        recorded_by,
+        signer_eid,
+        signing_key,
+        created_at_ms,
         CreateReactionCmd {
             target_event_id,
             author_id,
             emoji: emoji.to_string(),
         },
-    ).map_err(|e| format!("{}", e))?;
+    )
+    .map_err(|e| format!("{}", e))?;
 
     Ok(ReactResponse {
         emoji: emoji.to_string(),
@@ -91,7 +96,8 @@ pub fn react_for_peer(
 ) -> Result<ReactResponse, Box<dyn std::error::Error + Send + Sync>> {
     let (recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
 
-    let (signer_eid, signing_key) = peer_shared::load_local_peer_signer_required(&db, &recorded_by)?;
+    let (signer_eid, signing_key) =
+        peer_shared::load_local_peer_signer_required(&db, &recorded_by)?;
     let target_event_id = message::resolve(&db, &recorded_by, target_hex)
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
     let author_id = peer_shared::resolve_user_event_id(&db, &recorded_by, &signer_eid)?;

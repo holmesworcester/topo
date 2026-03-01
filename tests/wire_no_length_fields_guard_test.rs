@@ -47,19 +47,15 @@ const DENIED_FIELD_NAMES: &[&str] = &[
 
 /// Denied function/macro patterns that indicate variable-length parsing logic.
 /// Parser control flow must not be driven by untrusted length fields.
-const DENIED_PARSE_PATTERNS: &[&str] = &[
-    "take_bytes(",
-    "read_var(",
-    "nom::bytes::complete::take(",
-];
+const DENIED_PARSE_PATTERNS: &[&str] = &["take_bytes(", "read_var(", "nom::bytes::complete::take("];
 
 #[test]
 fn no_length_fields_in_canonical_events() {
     let mut violations = Vec::new();
 
     for file in CANONICAL_EVENT_FILES {
-        let contents = fs::read_to_string(file)
-            .unwrap_or_else(|e| panic!("failed to read {}: {}", file, e));
+        let contents =
+            fs::read_to_string(file).unwrap_or_else(|e| panic!("failed to read {}: {}", file, e));
 
         for denied in DENIED_FIELD_NAMES {
             for (line_num, line) in contents.lines().enumerate() {

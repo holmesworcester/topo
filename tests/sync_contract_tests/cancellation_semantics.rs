@@ -10,8 +10,7 @@ use topo::contracts::peering_contract::{SessionDirection, SessionHandler};
 use topo::sync::session_handler::SyncSessionHandler;
 
 use crate::fake_session_io::{
-    create_test_db, fake_session_io_pair, noop_ingest_tx, run_local,
-    test_session_meta,
+    create_test_db, fake_session_io_pair, noop_ingest_tx, run_local, test_session_meta,
 };
 
 /// Session cancelled BEFORE on_session starts should return error immediately.
@@ -31,9 +30,7 @@ async fn pre_cancelled_session_returns_error() {
 
         let (fake_io, _peer) = fake_session_io_pair(meta.session_id);
 
-        let result = handler
-            .on_session(meta, Box::new(fake_io), cancel)
-            .await;
+        let result = handler.on_session(meta, Box::new(fake_io), cancel).await;
         assert!(result.is_err(), "pre-cancelled session should fail");
         let err = result.unwrap_err();
         assert!(
@@ -103,8 +100,7 @@ async fn mid_session_cancellation_terminates_handler() {
 async fn responder_cancellation_terminates_handler() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
-        let handler =
-            SyncSessionHandler::responder(db_path, 30, noop_ingest_tx());
+        let handler = SyncSessionHandler::responder(db_path, 30, noop_ingest_tx());
         let meta = test_session_meta(SessionDirection::Inbound);
         let cancel = CancellationToken::new();
 

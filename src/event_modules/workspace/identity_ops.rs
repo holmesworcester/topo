@@ -7,13 +7,12 @@
 use ed25519_dalek::SigningKey;
 use rusqlite::Connection;
 
-use crate::crypto::{EventId, event_id_from_base64, event_id_to_base64, hash_event};
+use crate::crypto::{event_id_from_base64, event_id_to_base64, hash_event, EventId};
 use crate::event_modules::*;
 use crate::projection::create::{
-    create_event_sync, create_signed_event_sync,
-    store_signed_event_only, project_event,
+    create_event_sync, create_signed_event_sync, project_event, store_signed_event_only,
 };
-use crate::projection::encrypted::{wrap_key_for_recipient, unwrap_key_from_sender};
+use crate::projection::encrypted::{unwrap_key_from_sender, wrap_key_for_recipient};
 use crate::projection::signer::{resolve_signer_key, SignerResolution};
 use crate::transport::{extract_spki_fingerprint, generate_self_signed_cert_from_signing_key};
 
@@ -148,8 +147,7 @@ pub(crate) fn ensure_content_key_for_peer(
         )
         .ok();
     if let Some(eid_b64) = existing {
-        let eid = event_id_from_base64(&eid_b64)
-            .ok_or("invalid secret_keys.event_id base64")?;
+        let eid = event_id_from_base64(&eid_b64).ok_or("invalid secret_keys.event_id base64")?;
         return Ok(eid);
     }
     create_content_key_and_self_wrap(conn, recorded_by, peer_shared_key, peer_shared_event_id)
@@ -185,11 +183,7 @@ pub(crate) fn wrap_content_key_for_invite(
     let mut plaintext_key = [0u8; 32];
     plaintext_key.copy_from_slice(&key_bytes);
 
-    let wrapped = wrap_key_for_recipient(
-        sender_peer_shared_key,
-        invite_public_key,
-        &plaintext_key,
-    );
+    let wrapped = wrap_key_for_recipient(sender_peer_shared_key, invite_public_key, &plaintext_key);
 
     let ss_evt = ParsedEvent::SecretShared(SecretSharedEvent {
         created_at_ms: now_ms(),
@@ -200,12 +194,8 @@ pub(crate) fn wrap_content_key_for_invite(
         signer_type: 5,
         signature: [0u8; 64],
     });
-    let _ss_event_id = create_signed_event_sync(
-        conn,
-        recorded_by,
-        &ss_evt,
-        sender_peer_shared_key,
-    )?;
+    let _ss_event_id =
+        create_signed_event_sync(conn, recorded_by, &ss_evt, sender_peer_shared_key)?;
 
     Ok(())
 }
@@ -240,7 +230,8 @@ pub(crate) fn unwrap_content_key_from_invite(
             continue;
         }
 
-        let sender_key = match resolve_signer_key(conn, recorded_by, ss.signer_type, &ss.signed_by) {
+        let sender_key = match resolve_signer_key(conn, recorded_by, ss.signer_type, &ss.signed_by)
+        {
             Ok(SignerResolution::Found(k)) => k,
             Ok(_) => continue,
             Err(_) => continue,
@@ -255,7 +246,8 @@ pub(crate) fn unwrap_content_key_from_invite(
         if expected_key_event_id != ss.key_event_id {
             continue;
         }
-        let local_key_event_id = create_deterministic_secret_key_event(conn, recorded_by, plaintext_key)?;
+        let local_key_event_id =
+            create_deterministic_secret_key_event(conn, recorded_by, plaintext_key)?;
         return Ok(Some(local_key_event_id));
     }
 
@@ -437,12 +429,7 @@ fn create_content_key_and_self_wrap(
         signer_type: 5,
         signature: [0u8; 64],
     });
-    let _ss_event_id = create_signed_event_sync(
-        conn,
-        recorded_by,
-        &ss_evt,
-        peer_shared_key,
-    )?;
+    let _ss_event_id = create_signed_event_sync(conn, recorded_by, &ss_evt, peer_shared_key)?;
 
     Ok(key_event_id)
 }

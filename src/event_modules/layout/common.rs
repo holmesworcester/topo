@@ -27,7 +27,8 @@ pub const NAME_BYTES: usize = 64;
 ///   + signed_by(32) + signer_type(1) + signature(64) = 138
 /// Used by: DeviceInviteFirst(12), DeviceInviteOngoing(13),
 ///          UserRemoved(20), PeerRemoved(21)
-pub const IDENTITY_PUBKEY_SIGNED_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32 + SIGNATURE_TRAILER_BYTES;
+pub const IDENTITY_PUBKEY_SIGNED_WIRE_SIZE: usize =
+    COMMON_HEADER_BYTES + 32 + SIGNATURE_TRAILER_BYTES;
 
 // ─── Encrypted envelope helpers ───
 
@@ -63,26 +64,26 @@ pub fn encrypted_inner_wire_size(inner_type_code: u8) -> Option<usize> {
     use super::super::workspace::WORKSPACE_WIRE_SIZE;
 
     match inner_type_code {
-        1 => Some(MESSAGE_WIRE_SIZE),                   // Message
-        2 => Some(REACTION_WIRE_SIZE),                  // Reaction
-        7 => Some(MESSAGE_DELETION_WIRE_SIZE),           // MessageDeletion
-        8 => Some(WORKSPACE_WIRE_SIZE),                  // Workspace
-        10 => Some(USER_INVITE_BOOT_WIRE_SIZE),          // UserInviteBoot
-        11 => Some(USER_INVITE_BOOT_WIRE_SIZE),          // UserInviteOngoing (same layout)
-        12 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE),    // DeviceInviteFirst
-        13 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE),    // DeviceInviteOngoing
-        14 => Some(USER_WIRE_SIZE),                        // UserBoot
-        15 => Some(USER_WIRE_SIZE),                        // UserOngoing
-        16 => Some(PEER_SHARED_WIRE_SIZE),                 // PeerSharedFirst
-        17 => Some(PEER_SHARED_WIRE_SIZE),                 // PeerSharedOngoing
-        18 => Some(ADMIN_BOOT_WIRE_SIZE),                // AdminBoot
-        19 => Some(ADMIN_BOOT_WIRE_SIZE),                // AdminOngoing (same layout)
-        20 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE),    // UserRemoved
-        21 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE),    // PeerRemoved
-        22 => Some(SECRET_SHARED_WIRE_SIZE),             // SecretShared
-        24 => Some(MESSAGE_ATTACHMENT_WIRE_SIZE),         // MessageAttachment
-        25 => Some(FILE_SLICE_WIRE_SIZE),                // FileSlice
-        26 => Some(BENCH_DEP_WIRE_SIZE),                 // BenchDep
+        1 => Some(MESSAGE_WIRE_SIZE),                 // Message
+        2 => Some(REACTION_WIRE_SIZE),                // Reaction
+        7 => Some(MESSAGE_DELETION_WIRE_SIZE),        // MessageDeletion
+        8 => Some(WORKSPACE_WIRE_SIZE),               // Workspace
+        10 => Some(USER_INVITE_BOOT_WIRE_SIZE),       // UserInviteBoot
+        11 => Some(USER_INVITE_BOOT_WIRE_SIZE),       // UserInviteOngoing (same layout)
+        12 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE), // DeviceInviteFirst
+        13 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE), // DeviceInviteOngoing
+        14 => Some(USER_WIRE_SIZE),                   // UserBoot
+        15 => Some(USER_WIRE_SIZE),                   // UserOngoing
+        16 => Some(PEER_SHARED_WIRE_SIZE),            // PeerSharedFirst
+        17 => Some(PEER_SHARED_WIRE_SIZE),            // PeerSharedOngoing
+        18 => Some(ADMIN_BOOT_WIRE_SIZE),             // AdminBoot
+        19 => Some(ADMIN_BOOT_WIRE_SIZE),             // AdminOngoing (same layout)
+        20 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE), // UserRemoved
+        21 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE), // PeerRemoved
+        22 => Some(SECRET_SHARED_WIRE_SIZE),          // SecretShared
+        24 => Some(MESSAGE_ATTACHMENT_WIRE_SIZE),     // MessageAttachment
+        25 => Some(FILE_SLICE_WIRE_SIZE),             // FileSlice
+        26 => Some(BENCH_DEP_WIRE_SIZE),              // BenchDep
         // Cannot encrypt: encrypted(5), secret_key(6), invite_accepted(9)
         _ => None,
     }
@@ -102,8 +103,7 @@ pub fn read_text_slot(slot: &[u8]) -> Result<String, TextSlotError> {
     }
 
     // Validate UTF-8
-    let text = std::str::from_utf8(&slot[..content_end])
-        .map_err(|_| TextSlotError::InvalidUtf8)?;
+    let text = std::str::from_utf8(&slot[..content_end]).map_err(|_| TextSlotError::InvalidUtf8)?;
 
     Ok(text.to_string())
 }
@@ -237,20 +237,22 @@ mod tests {
 
     #[test]
     fn test_per_event_wire_sizes() {
-        use super::super::super::message::MESSAGE_WIRE_SIZE;
-        use super::super::super::reaction::REACTION_WIRE_SIZE;
-        use super::super::super::message_attachment::MESSAGE_ATTACHMENT_WIRE_SIZE;
-        use super::super::super::file_slice::FILE_SLICE_WIRE_SIZE;
-        use super::super::super::bench_dep::BENCH_DEP_WIRE_SIZE;
-        use super::super::super::workspace::WORKSPACE_WIRE_SIZE;
-        use super::super::super::user::USER_WIRE_SIZE;
-        use super::super::super::peer_shared::PEER_SHARED_WIRE_SIZE;
-        use super::super::super::secret_key::SECRET_KEY_WIRE_SIZE;
-        use super::super::super::message_deletion::MESSAGE_DELETION_WIRE_SIZE;
-        use super::super::super::invite_accepted::INVITE_ACCEPTED_WIRE_SIZE;
-        use super::super::super::user_invite::{USER_INVITE_BOOT_WIRE_SIZE, USER_INVITE_ONGOING_WIRE_SIZE};
         use super::super::super::admin::{ADMIN_BOOT_WIRE_SIZE, ADMIN_ONGOING_WIRE_SIZE};
+        use super::super::super::bench_dep::BENCH_DEP_WIRE_SIZE;
+        use super::super::super::file_slice::FILE_SLICE_WIRE_SIZE;
+        use super::super::super::invite_accepted::INVITE_ACCEPTED_WIRE_SIZE;
+        use super::super::super::message::MESSAGE_WIRE_SIZE;
+        use super::super::super::message_attachment::MESSAGE_ATTACHMENT_WIRE_SIZE;
+        use super::super::super::message_deletion::MESSAGE_DELETION_WIRE_SIZE;
+        use super::super::super::peer_shared::PEER_SHARED_WIRE_SIZE;
+        use super::super::super::reaction::REACTION_WIRE_SIZE;
+        use super::super::super::secret_key::SECRET_KEY_WIRE_SIZE;
         use super::super::super::secret_shared::SECRET_SHARED_WIRE_SIZE;
+        use super::super::super::user::USER_WIRE_SIZE;
+        use super::super::super::user_invite::{
+            USER_INVITE_BOOT_WIRE_SIZE, USER_INVITE_ONGOING_WIRE_SIZE,
+        };
+        use super::super::super::workspace::WORKSPACE_WIRE_SIZE;
 
         assert_eq!(MESSAGE_WIRE_SIZE, 1194);
         assert_eq!(REACTION_WIRE_SIZE, 234);
@@ -275,15 +277,18 @@ mod tests {
 
     #[test]
     fn test_encrypted_inner_wire_size_known() {
-        use super::super::super::message::wire::MESSAGE_WIRE_SIZE;
-        use super::super::super::reaction::REACTION_WIRE_SIZE;
-        use super::super::super::message_attachment::MESSAGE_ATTACHMENT_WIRE_SIZE;
-        use super::super::super::file_slice::FILE_SLICE_WIRE_SIZE;
         use super::super::super::bench_dep::BENCH_DEP_WIRE_SIZE;
+        use super::super::super::file_slice::FILE_SLICE_WIRE_SIZE;
+        use super::super::super::message::wire::MESSAGE_WIRE_SIZE;
+        use super::super::super::message_attachment::MESSAGE_ATTACHMENT_WIRE_SIZE;
+        use super::super::super::reaction::REACTION_WIRE_SIZE;
 
         assert_eq!(encrypted_inner_wire_size(1), Some(MESSAGE_WIRE_SIZE));
         assert_eq!(encrypted_inner_wire_size(2), Some(REACTION_WIRE_SIZE));
-        assert_eq!(encrypted_inner_wire_size(24), Some(MESSAGE_ATTACHMENT_WIRE_SIZE));
+        assert_eq!(
+            encrypted_inner_wire_size(24),
+            Some(MESSAGE_ATTACHMENT_WIRE_SIZE)
+        );
         assert_eq!(encrypted_inner_wire_size(25), Some(FILE_SLICE_WIRE_SIZE));
         assert_eq!(encrypted_inner_wire_size(26), Some(BENCH_DEP_WIRE_SIZE));
     }

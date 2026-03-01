@@ -75,19 +75,24 @@ pub fn project_pure(
         }
     }
 
-    let ops = vec![
-        WriteOp::InsertOrIgnore {
-            table: "file_slices",
-            columns: vec!["recorded_by", "file_id", "slice_number", "event_id", "created_at", "descriptor_event_id"],
-            values: vec![
-                SqlVal::Text(recorded_by.to_string()),
-                SqlVal::Text(file_id_b64),
-                SqlVal::Int(fs.slice_number as i64),
-                SqlVal::Text(event_id_b64.to_string()),
-                SqlVal::Int(fs.created_at_ms as i64),
-                SqlVal::Text(descriptor_event_id),
-            ],
-        },
-    ];
+    let ops = vec![WriteOp::InsertOrIgnore {
+        table: "file_slices",
+        columns: vec![
+            "recorded_by",
+            "file_id",
+            "slice_number",
+            "event_id",
+            "created_at",
+            "descriptor_event_id",
+        ],
+        values: vec![
+            SqlVal::Text(recorded_by.to_string()),
+            SqlVal::Text(file_id_b64),
+            SqlVal::Int(fs.slice_number as i64),
+            SqlVal::Text(event_id_b64.to_string()),
+            SqlVal::Int(fs.created_at_ms as i64),
+            SqlVal::Text(descriptor_event_id),
+        ],
+    }];
     ProjectorResult::valid(ops)
 }

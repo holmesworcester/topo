@@ -8,12 +8,12 @@ pub fn neg_id_to_event_id(id: &Id) -> EventId {
 }
 
 /// Sync message types
-pub const MSG_TYPE_NEG_OPEN: u8 = 0x10;   // Initial negentropy message
-pub const MSG_TYPE_NEG_MSG: u8 = 0x11;    // Negentropy response
-pub const MSG_TYPE_HAVE_LIST: u8 = 0x12;  // List of IDs client needs from server
-pub const MSG_TYPE_EVENT: u8 = 0x03;      // Event blob (variable length)
-pub const MSG_TYPE_DONE: u8 = 0x20;      // Initiator signals all events sent
-pub const MSG_TYPE_DONE_ACK: u8 = 0x21;  // Responder acknowledges done
+pub const MSG_TYPE_NEG_OPEN: u8 = 0x10; // Initial negentropy message
+pub const MSG_TYPE_NEG_MSG: u8 = 0x11; // Negentropy response
+pub const MSG_TYPE_HAVE_LIST: u8 = 0x12; // List of IDs client needs from server
+pub const MSG_TYPE_EVENT: u8 = 0x03; // Event blob (variable length)
+pub const MSG_TYPE_DONE: u8 = 0x20; // Initiator signals all events sent
+pub const MSG_TYPE_DONE_ACK: u8 = 0x21; // Responder acknowledges done
 pub const MSG_TYPE_DATA_DONE: u8 = 0x22; // Sent on data stream: no more events will follow
 pub const MSG_TYPE_INTRO_OFFER: u8 = 0x30; // Intro offer for hole punching
 
@@ -51,7 +51,6 @@ pub enum Frame {
         attempt_window_ms: u32,
     },
 }
-
 
 /// Parse a frame from bytes
 pub fn parse_frame(input: &[u8]) -> Result<(Frame, usize), ParseError> {
@@ -153,16 +152,19 @@ pub fn parse_frame(input: &[u8]) -> Result<(Frame, usize), ParseError> {
             let attempt_window_ms = u32::from_le_bytes(input[pos..pos + 4].try_into().unwrap());
             pos += 4;
             debug_assert_eq!(pos, INTRO_OFFER_SIZE);
-            Ok((Frame::IntroOffer {
-                intro_id,
-                other_peer_id,
-                origin_family,
-                origin_ip,
-                origin_port,
-                observed_at_ms,
-                expires_at_ms,
-                attempt_window_ms,
-            }, INTRO_OFFER_SIZE))
+            Ok((
+                Frame::IntroOffer {
+                    intro_id,
+                    other_peer_id,
+                    origin_family,
+                    origin_ip,
+                    origin_port,
+                    observed_at_ms,
+                    expires_at_ms,
+                    attempt_window_ms,
+                },
+                INTRO_OFFER_SIZE,
+            ))
         }
         _ => Err(ParseError::UnknownType(msg_type)),
     }
@@ -244,7 +246,9 @@ impl std::fmt::Display for ParseError {
             ParseError::InsufficientData => write!(f, "insufficient data"),
             ParseError::UnknownType(t) => write!(f, "unknown message type: {}", t),
             ParseError::EventTooLarge(len) => write!(f, "event too large: {} bytes", len),
-            ParseError::NegMessageTooLarge(len) => write!(f, "negentropy message too large: {} bytes", len),
+            ParseError::NegMessageTooLarge(len) => {
+                write!(f, "negentropy message too large: {} bytes", len)
+            }
             ParseError::TooManyIds(count) => write!(f, "too many IDs in have_list: {}", count),
         }
     }
@@ -258,7 +262,9 @@ mod tests {
 
     #[test]
     fn test_neg_open_roundtrip() {
-        let msg = Frame::NegOpen { msg: vec![1, 2, 3, 4, 5] };
+        let msg = Frame::NegOpen {
+            msg: vec![1, 2, 3, 4, 5],
+        };
         let encoded = encode_frame(&msg);
         assert_eq!(encoded.len(), 10); // 1 + 4 + 5
 
@@ -269,7 +275,9 @@ mod tests {
 
     #[test]
     fn test_neg_msg_roundtrip() {
-        let msg = Frame::NegMsg { msg: vec![10, 20, 30] };
+        let msg = Frame::NegMsg {
+            msg: vec![10, 20, 30],
+        };
         let encoded = encode_frame(&msg);
         assert_eq!(encoded.len(), 8); // 1 + 4 + 3
 
@@ -365,7 +373,10 @@ mod tests {
             origin_ip: {
                 // IPv4 192.168.1.100 mapped to 16-byte field
                 let mut ip = [0u8; 16];
-                ip[12] = 192; ip[13] = 168; ip[14] = 1; ip[15] = 100;
+                ip[12] = 192;
+                ip[13] = 168;
+                ip[14] = 1;
+                ip[15] = 100;
                 ip
             },
             origin_port: 12345,
@@ -419,12 +430,18 @@ mod tests {
         buf.extend_from_slice(&oversized_len.to_le_bytes());
         buf.extend_from_slice(&vec![0u8; MAX_NEG_MSG_BYTES + 1]);
         let result = parse_frame(&buf);
-        assert_eq!(result, Err(ParseError::NegMessageTooLarge(MAX_NEG_MSG_BYTES + 1)));
+        assert_eq!(
+            result,
+            Err(ParseError::NegMessageTooLarge(MAX_NEG_MSG_BYTES + 1))
+        );
 
         // Also test NEG_MSG
         buf[0] = MSG_TYPE_NEG_MSG;
         let result = parse_frame(&buf);
-        assert_eq!(result, Err(ParseError::NegMessageTooLarge(MAX_NEG_MSG_BYTES + 1)));
+        assert_eq!(
+            result,
+            Err(ParseError::NegMessageTooLarge(MAX_NEG_MSG_BYTES + 1))
+        );
     }
 
     #[test]

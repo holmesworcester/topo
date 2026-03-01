@@ -1,4 +1,4 @@
-use rusqlite::{Connection, Result as SqliteResult, params};
+use rusqlite::{params, Connection, Result as SqliteResult};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::crypto::EventId;
@@ -37,10 +37,8 @@ impl<'a> WantedEvents<'a> {
 
     /// Remove a wanted event
     pub fn remove(&self, id: &EventId) -> SqliteResult<()> {
-        self.conn.execute(
-            "DELETE FROM wanted_events WHERE id = ?1",
-            params![&id[..]],
-        )?;
+        self.conn
+            .execute("DELETE FROM wanted_events WHERE id = ?1", params![&id[..]])?;
         Ok(())
     }
 

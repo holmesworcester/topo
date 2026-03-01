@@ -8,8 +8,8 @@
 
 #[cfg(test)]
 mod tests {
-    use topo::event_modules::invite_accepted::{project_pure, InviteAcceptedEvent};
     use crate::harness::fixtures::*;
+    use topo::event_modules::invite_accepted::{project_pure, InviteAcceptedEvent};
     use topo::event_modules::ParsedEvent;
     use topo::projection::result::EmitCommand;
 

@@ -28,7 +28,11 @@ pub fn project_pure(
     // Check for pre-existing deletion intents (delete-before-create convergence).
     // Multiple intents may exist (different deletion events targeting this message).
     // Find the first one whose author matches the message author.
-    if let Some(intent) = ctx.deletion_intents.iter().find(|i| i.author_id == author_id_b64) {
+    if let Some(intent) = ctx
+        .deletion_intents
+        .iter()
+        .find(|i| i.author_id == author_id_b64)
+    {
         // Message was already targeted for deletion before it arrived.
         // Record the tombstone immediately using the original deletion event ID
         // for replay invariance.

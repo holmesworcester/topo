@@ -5,9 +5,7 @@
 
 use std::time::Duration;
 
-use topo::testutil::{Peer, sync_until_converged};
-
-
+use topo::testutil::{sync_until_converged, Peer};
 
 fn peak_rss_mib() -> Option<f64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
@@ -97,7 +95,13 @@ async fn low_mem_ios_budget_smoke_10k() {
     bob.batch_create_messages(5_000);
 
     let sample = alice.sample_event_ids(1)[0].clone();
-    let _metrics = sync_until_converged(&alice, &bob, || bob.has_event(&sample), Duration::from_secs(180)).await;
+    let _metrics = sync_until_converged(
+        &alice,
+        &bob,
+        || bob.has_event(&sample),
+        Duration::from_secs(180),
+    )
+    .await;
 
     assert_eq!(alice.message_count(), 5_000);
     assert_eq!(bob.message_count(), 5_000);
@@ -132,7 +136,13 @@ async fn low_mem_ios_budget_soak_million() {
 
     alice.batch_create_messages(events);
     let sample = alice.sample_event_ids(1)[0].clone();
-    let _metrics = sync_until_converged(&alice, &bob, || bob.has_event(&sample), Duration::from_secs(3600)).await;
+    let _metrics = sync_until_converged(
+        &alice,
+        &bob,
+        || bob.has_event(&sample),
+        Duration::from_secs(3600),
+    )
+    .await;
 
     assert_eq!(alice.message_count(), events as i64);
 

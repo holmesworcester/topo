@@ -1,16 +1,9 @@
 use super::super::layout::common::{
-    COMMON_HEADER_BYTES,
-    SIGNATURE_TRAILER_BYTES,
-    NAME_BYTES,
-    read_text_slot,
-    write_text_slot,
+    read_text_slot, write_text_slot, COMMON_HEADER_BYTES, NAME_BYTES, SIGNATURE_TRAILER_BYTES,
 };
 use super::super::registry::{EventTypeMeta, ShareScope};
 use super::super::{
-    EventError,
-    ParsedEvent,
-    EVENT_TYPE_PEER_SHARED_FIRST,
-    EVENT_TYPE_PEER_SHARED_ONGOING,
+    EventError, ParsedEvent, EVENT_TYPE_PEER_SHARED_FIRST, EVENT_TYPE_PEER_SHARED_ONGOING,
 };
 
 // --- Layout (owned by this module) ---
@@ -58,16 +51,26 @@ pub struct PeerSharedOngoingEvent {
 
 pub fn parse_peer_shared_first(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if blob.len() < PEER_SHARED_WIRE_SIZE {
-        return Err(EventError::TooShort { expected: PEER_SHARED_WIRE_SIZE, actual: blob.len() });
+        return Err(EventError::TooShort {
+            expected: PEER_SHARED_WIRE_SIZE,
+            actual: blob.len(),
+        });
     }
     if blob.len() > PEER_SHARED_WIRE_SIZE {
-        return Err(EventError::TrailingData { expected: PEER_SHARED_WIRE_SIZE, actual: blob.len() });
+        return Err(EventError::TrailingData {
+            expected: PEER_SHARED_WIRE_SIZE,
+            actual: blob.len(),
+        });
     }
     if blob[0] != EVENT_TYPE_PEER_SHARED_FIRST {
-        return Err(EventError::WrongType { expected: EVENT_TYPE_PEER_SHARED_FIRST, actual: blob[0] });
+        return Err(EventError::WrongType {
+            expected: EVENT_TYPE_PEER_SHARED_FIRST,
+            actual: blob[0],
+        });
     }
 
-    let created_at_ms = u64::from_le_bytes(blob[off::CREATED_AT..off::PUBLIC_KEY].try_into().unwrap());
+    let created_at_ms =
+        u64::from_le_bytes(blob[off::CREATED_AT..off::PUBLIC_KEY].try_into().unwrap());
     let mut public_key = [0u8; 32];
     public_key.copy_from_slice(&blob[off::PUBLIC_KEY..off::USER_EVENT_ID]);
     let mut user_event_id = [0u8; 32];
@@ -103,8 +106,11 @@ pub fn encode_peer_shared_first(event: &ParsedEvent) -> Result<Vec<u8>, EventErr
     buf[off::CREATED_AT..off::PUBLIC_KEY].copy_from_slice(&e.created_at_ms.to_le_bytes());
     buf[off::PUBLIC_KEY..off::USER_EVENT_ID].copy_from_slice(&e.public_key);
     buf[off::USER_EVENT_ID..off::DEVICE_NAME].copy_from_slice(&e.user_event_id);
-    write_text_slot(&e.device_name, &mut buf[off::DEVICE_NAME..off::DEVICE_NAME + NAME_BYTES])
-        .map_err(EventError::TextSlot)?;
+    write_text_slot(
+        &e.device_name,
+        &mut buf[off::DEVICE_NAME..off::DEVICE_NAME + NAME_BYTES],
+    )
+    .map_err(EventError::TextSlot)?;
     buf[off::SIGNED_BY..off::SIGNER_TYPE].copy_from_slice(&e.signed_by);
     buf[off::SIGNER_TYPE] = e.signer_type;
     buf[off::SIGNATURE..off::SIGNATURE + 64].copy_from_slice(&e.signature);
@@ -113,16 +119,26 @@ pub fn encode_peer_shared_first(event: &ParsedEvent) -> Result<Vec<u8>, EventErr
 
 pub fn parse_peer_shared_ongoing(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if blob.len() < PEER_SHARED_WIRE_SIZE {
-        return Err(EventError::TooShort { expected: PEER_SHARED_WIRE_SIZE, actual: blob.len() });
+        return Err(EventError::TooShort {
+            expected: PEER_SHARED_WIRE_SIZE,
+            actual: blob.len(),
+        });
     }
     if blob.len() > PEER_SHARED_WIRE_SIZE {
-        return Err(EventError::TrailingData { expected: PEER_SHARED_WIRE_SIZE, actual: blob.len() });
+        return Err(EventError::TrailingData {
+            expected: PEER_SHARED_WIRE_SIZE,
+            actual: blob.len(),
+        });
     }
     if blob[0] != EVENT_TYPE_PEER_SHARED_ONGOING {
-        return Err(EventError::WrongType { expected: EVENT_TYPE_PEER_SHARED_ONGOING, actual: blob[0] });
+        return Err(EventError::WrongType {
+            expected: EVENT_TYPE_PEER_SHARED_ONGOING,
+            actual: blob[0],
+        });
     }
 
-    let created_at_ms = u64::from_le_bytes(blob[off::CREATED_AT..off::PUBLIC_KEY].try_into().unwrap());
+    let created_at_ms =
+        u64::from_le_bytes(blob[off::CREATED_AT..off::PUBLIC_KEY].try_into().unwrap());
     let mut public_key = [0u8; 32];
     public_key.copy_from_slice(&blob[off::PUBLIC_KEY..off::USER_EVENT_ID]);
     let mut user_event_id = [0u8; 32];
@@ -158,8 +174,11 @@ pub fn encode_peer_shared_ongoing(event: &ParsedEvent) -> Result<Vec<u8>, EventE
     buf[off::CREATED_AT..off::PUBLIC_KEY].copy_from_slice(&e.created_at_ms.to_le_bytes());
     buf[off::PUBLIC_KEY..off::USER_EVENT_ID].copy_from_slice(&e.public_key);
     buf[off::USER_EVENT_ID..off::DEVICE_NAME].copy_from_slice(&e.user_event_id);
-    write_text_slot(&e.device_name, &mut buf[off::DEVICE_NAME..off::DEVICE_NAME + NAME_BYTES])
-        .map_err(EventError::TextSlot)?;
+    write_text_slot(
+        &e.device_name,
+        &mut buf[off::DEVICE_NAME..off::DEVICE_NAME + NAME_BYTES],
+    )
+    .map_err(EventError::TextSlot)?;
     buf[off::SIGNED_BY..off::SIGNER_TYPE].copy_from_slice(&e.signed_by);
     buf[off::SIGNER_TYPE] = e.signer_type;
     buf[off::SIGNATURE..off::SIGNATURE + 64].copy_from_slice(&e.signature);

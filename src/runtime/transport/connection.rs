@@ -2,8 +2,8 @@ use async_trait::async_trait;
 use quinn::{RecvStream, SendStream};
 use tokio::io::AsyncWriteExt;
 
-use crate::protocol::{encode_frame, parse_frame, Frame};
 use crate::protocol::ParseError;
+use crate::protocol::{encode_frame, parse_frame, Frame};
 
 use crate::tuning::max_recv_buffer;
 
@@ -52,7 +52,11 @@ pub struct RecvConnection {
 /// Data stream: Event blobs
 ///
 /// This prevents large event transfers from blocking control messages.
-pub struct DualConnection<C: StreamConn = Connection, S: StreamSend = SendConnection, R: StreamRecv = RecvConnection> {
+pub struct DualConnection<
+    C: StreamConn = Connection,
+    S: StreamSend = SendConnection,
+    R: StreamRecv = RecvConnection,
+> {
     pub control: C,
     pub data_send: S,
     pub data_recv: R,
@@ -84,7 +88,6 @@ impl<C: StreamConn, S: StreamSend, R: StreamRecv> DualConnection<C, S, R> {
     pub async fn flush_data(&mut self) -> Result<(), ConnectionError> {
         self.data_send.flush().await
     }
-
 }
 
 impl Connection {
@@ -130,7 +133,9 @@ impl Connection {
             }
 
             if self.recv_buffer.len() > max_recv_buffer() {
-                return Err(ConnectionError::Parse(ParseError::EventTooLarge(self.recv_buffer.len())));
+                return Err(ConnectionError::Parse(ParseError::EventTooLarge(
+                    self.recv_buffer.len(),
+                )));
             }
 
             // Read more data
@@ -190,7 +195,9 @@ impl RecvConnection {
             }
 
             if self.recv_buffer.len() > max_recv_buffer() {
-                return Err(ConnectionError::Parse(ParseError::EventTooLarge(self.recv_buffer.len())));
+                return Err(ConnectionError::Parse(ParseError::EventTooLarge(
+                    self.recv_buffer.len(),
+                )));
             }
 
             let mut buf = [0u8; 4096];

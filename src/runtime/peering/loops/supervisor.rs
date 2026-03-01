@@ -168,7 +168,11 @@ pub(super) async fn supervise_connection_sessions(
             break;
         }
 
-        info!("Session {} finished in {}ms", session.session_id, session_start.elapsed().as_millis());
+        info!(
+            "Session {} finished in {}ms",
+            session.session_id,
+            session_start.elapsed().as_millis()
+        );
 
         tokio::select! {
             _ = shutdown.cancelled() => {

@@ -11,10 +11,7 @@
 
 use std::time::{Duration, Instant};
 use topo::crypto::event_id_to_base64;
-use topo::testutil::{
-    Peer, start_chain, start_sink_download,
-    assert_eventually, clone_events_to,
-};
+use topo::testutil::{assert_eventually, clone_events_to, start_chain, start_sink_download, Peer};
 
 /// Read peak resident set size from /proc/self/status (Linux only).
 fn peak_rss_mib() -> f64 {
@@ -131,9 +128,16 @@ async fn run_chain_bench(n: usize, event_count: usize) {
     eprintln!("  Tail converge:    {} ms", tail_wall_ms);
     eprintln!("  All converge:     {} ms", all_wall_ms);
     eprintln!("  Events/s (tail):  {:.0}", events_per_sec);
-    eprintln!("  Hop latency P50:  {:.1} ms ({} samples)", hop_p50, hop_delays.len());
+    eprintln!(
+        "  Hop latency P50:  {:.1} ms ({} samples)",
+        hop_p50,
+        hop_delays.len()
+    );
     eprintln!("  Hop latency P95:  {:.1} ms", hop_p95);
-    eprintln!("  Peak RSS:         {:.1} MiB (before: {:.1})", rss_after, rss_before);
+    eprintln!(
+        "  Peak RSS:         {:.1} MiB (before: {:.1})",
+        rss_after, rss_before
+    );
     print_chain_counts(&peers);
     eprintln!();
 }
@@ -150,7 +154,6 @@ async fn ten_hop_chain_10k() {
 async fn ten_hop_chain_50k() {
     run_chain_bench(10, 50_000).await;
 }
-
 
 // ---------------------------------------------------------------------------
 // Family B: Multi-source catchup (sink-driven coordinated download)
@@ -177,7 +180,9 @@ async fn run_catchup_bench(source_count: usize, events_per_source: usize) {
     let total_messages = events_per_source as i64;
     eprintln!(
         "Generated {} events at S0 in {:.2}s, cloning to {} sources...",
-        total_messages, gen_secs, source_count - 1
+        total_messages,
+        gen_secs,
+        source_count - 1
     );
 
     // Clone S0's data to all other sources (overlapping data)
@@ -207,14 +212,17 @@ async fn run_catchup_bench(source_count: usize, events_per_source: usize) {
     // Sink-driven download: sink connects to all sources with claimed set
     let handles = start_sink_download(&sources, &sink);
 
-    let timeout_secs = if events_per_source >= 100_000 { 600 } else { 120 };
+    let timeout_secs = if events_per_source >= 100_000 {
+        600
+    } else {
+        120
+    };
     assert_eventually(
-        || {
-            sink.has_event(&sample) && source_markers.iter().all(|marker| sink.has_event(marker))
-        },
+        || sink.has_event(&sample) && source_markers.iter().all(|marker| sink.has_event(marker)),
         Duration::from_secs(timeout_secs),
         "sink download receives sampled event and per-source unique markers",
-    ).await;
+    )
+    .await;
 
     let wall_ms = start.elapsed().as_millis() as u64;
     let rss_after = peak_rss_mib();
@@ -241,9 +249,15 @@ async fn run_catchup_bench(source_count: usize, events_per_source: usize) {
     eprintln!("  Catchup wall:     {} ms", wall_ms);
     eprintln!("  Events/s:         {:.0}", events_per_sec);
     eprintln!("  MB/s:             {:.2}", mb_per_sec);
-    eprintln!("  Contributing src: {}/{}", contributing_sources, source_count);
+    eprintln!(
+        "  Contributing src: {}/{}",
+        contributing_sources, source_count
+    );
     eprintln!("  Sink store:       {}", sink.store_count());
-    eprintln!("  Peak RSS:         {:.1} MiB (before: {:.1})", rss_after, rss_before);
+    eprintln!(
+        "  Peak RSS:         {:.1} MiB (before: {:.1})",
+        rss_after, rss_before
+    );
     eprintln!();
 }
 

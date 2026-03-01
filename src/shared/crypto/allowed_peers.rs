@@ -59,4 +59,3 @@ impl AllowedPeers {
         self.fingerprints.iter().copied().collect()
     }
 }
-

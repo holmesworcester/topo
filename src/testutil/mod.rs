@@ -5,32 +5,23 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::crypto::{event_id_to_base64, EventId};
-use crate::db::{
-    open_connection,
-    schema::create_tables,
-    store::insert_recorded_event,
-};
+use crate::db::{open_connection, schema::create_tables, store::insert_recorded_event};
 use crate::event_modules::{
-    MessageEvent, MessageDeletionEvent, ReactionEvent, SecretKeyEvent,
-    ParsedEvent,
-    WorkspaceEvent, InviteAcceptedEvent, UserInviteBootEvent, UserInviteOngoingEvent,
-    DeviceInviteFirstEvent, UserBootEvent,
-    PeerSharedFirstEvent, AdminBootEvent,
-    UserRemovedEvent, PeerRemovedEvent, SecretSharedEvent,
+    AdminBootEvent, DeviceInviteFirstEvent, InviteAcceptedEvent, MessageDeletionEvent,
+    MessageEvent, ParsedEvent, PeerRemovedEvent, PeerSharedFirstEvent, ReactionEvent,
+    SecretKeyEvent, SecretSharedEvent, UserBootEvent, UserInviteBootEvent, UserInviteOngoingEvent,
+    UserRemovedEvent, WorkspaceEvent,
 };
-use crate::transport::identity::{ensure_transport_peer_id, ensure_transport_cert};
-use crate::projection::create::{create_event_sync, create_event_staged, create_signed_event_sync, create_signed_event_staged, create_encrypted_event_sync, CreateEventError};
+use crate::peering::loops::{accept_loop, connect_loop, connect_loop_with_coordination};
 use crate::projection::apply::project_one;
-use crate::peering::loops::{
-    accept_loop, connect_loop, connect_loop_with_coordination,
+use crate::projection::create::{
+    create_encrypted_event_sync, create_event_staged, create_event_sync,
+    create_signed_event_staged, create_signed_event_sync, CreateEventError,
 };
-use crate::transport::{
-    AllowedPeers,
-    create_dual_endpoint_dynamic,
-    extract_spki_fingerprint,
-};
-use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+use crate::transport::identity::{ensure_transport_cert, ensure_transport_peer_id};
+use crate::transport::{create_dual_endpoint_dynamic, extract_spki_fingerprint, AllowedPeers};
 use ed25519_dalek::SigningKey;
+use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 
 /// No-op intro spawner for tests that don't need holepunch.
 pub fn noop_intro_spawner(
@@ -40,7 +31,9 @@ pub fn noop_intro_spawner(
     _peer_id: String,
     _endpoint: quinn::Endpoint,
     _client_config: Option<quinn::ClientConfig>,
-    _shared_ingest: tokio::sync::mpsc::Sender<crate::contracts::event_pipeline_contract::IngestItem>,
+    _shared_ingest: tokio::sync::mpsc::Sender<
+        crate::contracts::event_pipeline_contract::IngestItem,
+    >,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_local(async {})
 }
@@ -80,10 +73,7 @@ impl std::fmt::Display for SyncMetrics {
         write!(
             f,
             "{} events in {:.2}s ({:.0} events/s, {:.2} MiB/s)",
-            self.events_transferred,
-            self.wall_secs,
-            self.events_per_sec,
-            self.throughput_mib_s,
+            self.events_transferred, self.wall_secs, self.events_per_sec, self.throughput_mib_s,
         )
     }
 }
@@ -110,15 +100,24 @@ fn start_test_sync_endpoint(
     inviter_identity: &str,
     invite_key: &SigningKey,
 ) -> Result<(SocketAddr, quinn::Endpoint), Box<dyn std::error::Error + Send + Sync>> {
-    bootstrap::start_bootstrap_responder(inviter_db_path, inviter_identity, invite_key, crate::event_pipeline::batch_writer)
+    bootstrap::start_bootstrap_responder(
+        inviter_db_path,
+        inviter_identity,
+        invite_key,
+        crate::event_pipeline::batch_writer,
+    )
 }
 
 impl Peer {
     /// Create a new peer with a fresh temp database (no identity chain).
     pub fn new(name: &str) -> Self {
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
-        let db_path = tempdir.path().join(format!("{}.db", name))
-            .to_str().unwrap().to_string();
+        let db_path = tempdir
+            .path()
+            .join(format!("{}.db", name))
+            .to_str()
+            .unwrap()
+            .to_string();
 
         let db = open_connection(&db_path).expect("failed to open db");
         create_tables(&db).expect("failed to create tables");
@@ -155,8 +154,14 @@ impl Peer {
 
         let db = open_connection(&self.db_path).expect("failed to open db");
         let old_identity = self.identity.clone();
-        let result = create_workspace(&db, &old_identity, "test-workspace", "test-user", "test-device")
-            .expect("failed to bootstrap workspace");
+        let result = create_workspace(
+            &db,
+            &old_identity,
+            "test-workspace",
+            "test-user",
+            "test-device",
+        )
+        .expect("failed to bootstrap workspace");
 
         // create_workspace pre-derives the PeerShared transport identity and writes
         // all events under it, so no finalize_identity rewrite is needed.
@@ -166,16 +171,21 @@ impl Peer {
 
         self.workspace_id = result.workspace_id;
         // Look up user_event_id from the created identity chain
-        if let Ok(uid) =
-            crate::service::resolve_user_event_id_for_signer(&db, &new_identity, &result.peer_shared_event_id)
-        {
+        if let Ok(uid) = crate::service::resolve_user_event_id_for_signer(
+            &db,
+            &new_identity,
+            &result.peer_shared_event_id,
+        ) {
             self.author_id = uid;
         }
         self.peer_shared_event_id = Some(result.peer_shared_event_id);
         self.peer_shared_signing_key = Some(result.peer_shared_key);
         // Load workspace signing key from local signer material
         if let Ok(Some((_ws_eid, ws_key))) =
-            crate::event_modules::workspace::commands::load_workspace_signing_key(&db, &new_identity)
+            crate::event_modules::workspace::commands::load_workspace_signing_key(
+                &db,
+                &new_identity,
+            )
         {
             self.workspace_signing_key = Some(ws_key);
         }
@@ -187,16 +197,20 @@ impl Peer {
     /// joiner fetches prerequisite events via bootstrap sync, then calls
     /// `accept_user_invite`. No direct DB-to-DB event copying.
     pub async fn new_in_workspace(name: &str, creator: &Peer) -> Self {
+        use crate::db::transport_trust::record_pending_invite_bootstrap_trust;
         use crate::event_modules::workspace::commands::create_user_invite_raw;
         use crate::event_modules::workspace::identity_ops::expected_invite_bootstrap_spki_from_invite_key;
         use crate::event_modules::workspace::invite_link::create_invite_link;
-        use crate::db::transport_trust::record_pending_invite_bootstrap_trust;
 
         // Create a bare peer with DB tables but NO transport identity.
         // svc_accept_invite will install the invite-derived identity.
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
-        let db_path = tempdir.path().join(format!("{}.db", name))
-            .to_str().unwrap().to_string();
+        let db_path = tempdir
+            .path()
+            .join(format!("{}.db", name))
+            .to_str()
+            .unwrap()
+            .to_string();
         {
             let db = open_connection(&db_path).expect("failed to open db");
             create_tables(&db).expect("failed to create tables");
@@ -213,11 +227,16 @@ impl Peer {
             _tempdir: tempdir,
         };
         let creator_db = open_connection(&creator.db_path).expect("failed to open creator db");
-        let workspace_key = creator.workspace_signing_key.as_ref()
+        let workspace_key = creator
+            .workspace_signing_key
+            .as_ref()
             .expect("creator has no workspace_signing_key; use new_with_identity()");
-        let creator_peer_key = creator.peer_shared_signing_key.as_ref()
+        let creator_peer_key = creator
+            .peer_shared_signing_key
+            .as_ref()
             .expect("creator has no peer_shared_signing_key; use new_with_identity()");
-        let creator_peer_eid = creator.peer_shared_event_id
+        let creator_peer_eid = creator
+            .peer_shared_event_id
             .expect("creator has no peer_shared_event_id; use new_with_identity()");
 
         // Creator issues an invite via workspace::commands API
@@ -228,7 +247,8 @@ impl Peer {
             &creator.workspace_id,
             Some(creator_peer_key),
             Some(&creator_peer_eid),
-        ).expect("failed to create user invite");
+        )
+        .expect("failed to create user invite");
 
         // Register pending bootstrap trust so creator's endpoint allows the joiner
         let pending_spki = expected_invite_bootstrap_spki_from_invite_key(&invite.invite_key)
@@ -239,15 +259,14 @@ impl Peer {
             &event_id_to_base64(&invite.invite_event_id),
             &event_id_to_base64(&creator.workspace_id),
             &pending_spki,
-        ).expect("failed to record pending bootstrap trust");
+        )
+        .expect("failed to record pending bootstrap trust");
         drop(creator_db);
 
         // Start a temp sync endpoint for the creator
-        let (sync_addr, sync_endpoint) = start_test_sync_endpoint(
-            &creator.db_path,
-            &creator.identity,
-            &invite.invite_key,
-        ).expect("failed to start temp sync endpoint");
+        let (sync_addr, sync_endpoint) =
+            start_test_sync_endpoint(&creator.db_path, &creator.identity, &invite.invite_key)
+                .expect("failed to start temp sync endpoint");
 
         // Build invite link with creator's bootstrap address and SPKI
         let creator_spki = creator.spki_fingerprint();
@@ -256,8 +275,12 @@ impl Peer {
 
         // Step 1: Accept invite — stores events (may block), materializes bootstrap trust
         let result = crate::event_modules::workspace::commands::accept_invite(
-            &peer.db_path, &invite_link, name, "device",
-        ).expect("failed to accept invite");
+            &peer.db_path,
+            &invite_link,
+            name,
+            "device",
+        )
+        .expect("failed to accept invite");
 
         // Step 2: Bootstrap sync — fetches prerequisites from creator.
         // In production this is done by the autodial loop; in tests we trigger
@@ -269,7 +292,9 @@ impl Peer {
             &creator_spki,
             10,
             crate::event_pipeline::batch_writer,
-        ).await.expect("failed bootstrap sync");
+        )
+        .await
+        .expect("failed bootstrap sync");
 
         // Allow batch_writer to finish draining projection cascade.
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
@@ -285,10 +310,14 @@ impl Peer {
         peer.workspace_id = creator.workspace_id;
 
         // Load signing key and user_event_id from DB
-        if let Ok(Some((eid, key))) = crate::service::load_local_peer_signer_pub(&db, &scoped_peer_id) {
+        if let Ok(Some((eid, key))) =
+            crate::service::load_local_peer_signer_pub(&db, &scoped_peer_id)
+        {
             peer.peer_shared_event_id = Some(eid);
             peer.peer_shared_signing_key = Some(key);
-            if let Ok(uid) = crate::service::resolve_user_event_id_for_signer(&db, &scoped_peer_id, &eid) {
+            if let Ok(uid) =
+                crate::service::resolve_user_event_id_for_signer(&db, &scoped_peer_id, &eid)
+            {
                 peer.author_id = uid;
             }
         }
@@ -298,12 +327,15 @@ impl Peer {
 
     /// Get the PeerShared signer event_id. Panics if no identity chain.
     fn signer_eid(&self) -> EventId {
-        self.peer_shared_event_id.expect("Peer has no identity chain; use new_with_identity()")
+        self.peer_shared_event_id
+            .expect("Peer has no identity chain; use new_with_identity()")
     }
 
     /// Get a reference to the PeerShared signing key. Panics if no identity chain.
     fn signing_key(&self) -> &SigningKey {
-        self.peer_shared_signing_key.as_ref().expect("Peer has no identity chain; use new_with_identity()")
+        self.peer_shared_signing_key
+            .as_ref()
+            .expect("Peer has no identity chain; use new_with_identity()")
     }
 
     /// Load (or generate) the transport certificate and private key for this peer.
@@ -367,7 +399,11 @@ impl Peer {
     /// Create a SecretKey event with deterministic key bytes and timestamp.
     /// Two peers calling this with the same args produce the same blob -> same event_id.
     /// This is used for PSK materialization in tests where both peers need the same key.
-    pub fn create_secret_key_deterministic(&self, key_bytes: [u8; 32], created_at_ms: u64) -> EventId {
+    pub fn create_secret_key_deterministic(
+        &self,
+        key_bytes: [u8; 32],
+        created_at_ms: u64,
+    ) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
         let sk = ParsedEvent::SecretKey(SecretKeyEvent {
             created_at_ms,
@@ -400,8 +436,14 @@ impl Peer {
         key_event_id: &EventId,
         inner_event: &ParsedEvent,
     ) -> EventId {
-        create_encrypted_event_sync(db, &self.identity, key_event_id, inner_event, Some(self.signing_key()))
-            .expect("failed to create encrypted signed event")
+        create_encrypted_event_sync(
+            db,
+            &self.identity,
+            key_event_id,
+            inner_event,
+            Some(self.signing_key()),
+        )
+        .expect("failed to create encrypted signed event")
     }
 
     /// Create a MessageDeletion event targeting the given message event.
@@ -422,7 +464,11 @@ impl Peer {
 
     /// Create an encrypted MessageDeletion event.
     /// Returns the encrypted event ID. Requires identity chain.
-    pub fn create_encrypted_deletion(&self, key_event_id: &EventId, target_event_id: &EventId) -> EventId {
+    pub fn create_encrypted_deletion(
+        &self,
+        key_event_id: &EventId,
+        target_event_id: &EventId,
+    ) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
         let inner = ParsedEvent::MessageDeletion(MessageDeletionEvent {
             created_at_ms: current_timestamp_ms(),
@@ -445,8 +491,7 @@ impl Peer {
             public_key,
             name: "test-workspace".to_string(),
         });
-        create_event_staged(&db, &self.identity, &ws)
-            .expect("failed to create workspace")
+        create_event_staged(&db, &self.identity, &ws).expect("failed to create workspace")
     }
 
     /// Try to create a Workspace event. Returns Result to allow handling rejection.
@@ -461,7 +506,11 @@ impl Peer {
     }
 
     /// Create an InviteAccepted event (local). Returns the event ID.
-    pub fn create_invite_accepted(&self, invite_event_id: &EventId, workspace_id: [u8; 32]) -> EventId {
+    pub fn create_invite_accepted(
+        &self,
+        invite_event_id: &EventId,
+        workspace_id: [u8; 32],
+    ) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
         let ia = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
             created_at_ms: current_timestamp_ms(),
@@ -472,7 +521,11 @@ impl Peer {
     }
 
     /// Try to create an InviteAccepted event. Returns Result to allow handling rejection.
-    pub fn try_create_invite_accepted(&self, invite_event_id: &EventId, workspace_id: [u8; 32]) -> Result<EventId, CreateEventError> {
+    pub fn try_create_invite_accepted(
+        &self,
+        invite_event_id: &EventId,
+        workspace_id: [u8; 32],
+    ) -> Result<EventId, CreateEventError> {
         let db = open_connection(&self.db_path).expect("failed to open db");
         let ia = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
             created_at_ms: current_timestamp_ms(),
@@ -490,7 +543,8 @@ impl Peer {
     ) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
         let public_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng())
-            .verifying_key().to_bytes();
+            .verifying_key()
+            .to_bytes();
         let evt = ParsedEvent::UserInviteBoot(UserInviteBootEvent {
             created_at_ms: current_timestamp_ms(),
             public_key,
@@ -734,7 +788,8 @@ impl Peer {
             "SELECT COUNT(*) FROM reactions WHERE recorded_by = ?1",
             rusqlite::params![&self.identity],
             |row| row.get(0),
-        ).unwrap_or(0)
+        )
+        .unwrap_or(0)
     }
 
     /// Count rows in the secret_keys projection table scoped to this peer.
@@ -744,7 +799,8 @@ impl Peer {
             "SELECT COUNT(*) FROM secret_keys WHERE recorded_by = ?1",
             rusqlite::params![&self.identity],
             |row| row.get(0),
-        ).unwrap_or(0)
+        )
+        .unwrap_or(0)
     }
 
     /// Count rows in the neg_items table (events advertised for sync).
@@ -761,7 +817,8 @@ impl Peer {
             "SELECT COUNT(*) > 0 FROM events WHERE event_id = ?1",
             rusqlite::params![event_id_b64],
             |row| row.get(0),
-        ).unwrap_or(false)
+        )
+        .unwrap_or(false)
     }
 
     /// Count rows in the deleted_messages projection table scoped to this peer.
@@ -771,7 +828,8 @@ impl Peer {
             "SELECT COUNT(*) FROM deleted_messages WHERE recorded_by = ?1",
             rusqlite::params![&self.identity],
             |row| row.get(0),
-        ).unwrap_or(0)
+        )
+        .unwrap_or(0)
     }
 
     /// Count rows in the events table.
@@ -788,7 +846,8 @@ impl Peer {
             "SELECT COUNT(*) FROM recorded_events WHERE peer_id = ?1",
             rusqlite::params![&self.identity],
             |row| row.get(0),
-        ).unwrap_or(0)
+        )
+        .unwrap_or(0)
     }
 
     /// Return sorted set of all store IDs (base64-encoded).
@@ -797,7 +856,8 @@ impl Peer {
         let mut stmt = db
             .prepare("SELECT event_id FROM events ORDER BY event_id")
             .expect("prepare");
-        let ids = stmt.query_map([], |row| row.get::<_, String>(0))
+        let ids = stmt
+            .query_map([], |row| row.get::<_, String>(0))
             .expect("query")
             .collect::<Result<std::collections::BTreeSet<_>, _>>()
             .expect("collect");
@@ -811,7 +871,8 @@ impl Peer {
             "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
             rusqlite::params![&self.identity],
             |row| row.get(0),
-        ).unwrap_or(0)
+        )
+        .unwrap_or(0)
     }
 
     // --- Identity projection count helpers ---
@@ -823,7 +884,8 @@ impl Peer {
             "SELECT COUNT(*) FROM valid_events WHERE peer_id = ?1",
             rusqlite::params![&self.identity],
             |row| row.get(0),
-        ).unwrap_or(0)
+        )
+        .unwrap_or(0)
     }
 
     /// Count rejected events for this peer.
@@ -833,7 +895,8 @@ impl Peer {
             "SELECT COUNT(*) FROM rejected_events WHERE peer_id = ?1",
             rusqlite::params![&self.identity],
             |row| row.get(0),
-        ).unwrap_or(0)
+        )
+        .unwrap_or(0)
     }
 
     /// Count blocked event deps for this peer.
@@ -843,7 +906,8 @@ impl Peer {
             "SELECT COUNT(DISTINCT event_id) FROM blocked_event_deps WHERE peer_id = ?1",
             rusqlite::params![&self.identity],
             |row| row.get(0),
-        ).unwrap_or(0)
+        )
+        .unwrap_or(0)
     }
 
     /// Count workspaces projected for this peer.
@@ -853,7 +917,8 @@ impl Peer {
             "SELECT COUNT(*) FROM workspaces WHERE recorded_by = ?1",
             rusqlite::params![&self.identity],
             |row| row.get(0),
-        ).unwrap_or(0)
+        )
+        .unwrap_or(0)
     }
 
     /// Count user invites projected for this peer.
@@ -863,7 +928,8 @@ impl Peer {
             "SELECT COUNT(*) FROM user_invites WHERE recorded_by = ?1",
             rusqlite::params![&self.identity],
             |row| row.get(0),
-        ).unwrap_or(0)
+        )
+        .unwrap_or(0)
     }
 
     /// Count users projected for this peer.
@@ -873,7 +939,8 @@ impl Peer {
             "SELECT COUNT(*) FROM users WHERE recorded_by = ?1",
             rusqlite::params![&self.identity],
             |row| row.get(0),
-        ).unwrap_or(0)
+        )
+        .unwrap_or(0)
     }
 
     /// Count device invites projected for this peer.
@@ -883,7 +950,8 @@ impl Peer {
             "SELECT COUNT(*) FROM device_invites WHERE recorded_by = ?1",
             rusqlite::params![&self.identity],
             |row| row.get(0),
-        ).unwrap_or(0)
+        )
+        .unwrap_or(0)
     }
 
     /// Count peers_shared projected for this peer.
@@ -893,7 +961,8 @@ impl Peer {
             "SELECT COUNT(*) FROM peers_shared WHERE recorded_by = ?1",
             rusqlite::params![&self.identity],
             |row| row.get(0),
-        ).unwrap_or(0)
+        )
+        .unwrap_or(0)
     }
 
     /// Count admins projected for this peer.
@@ -903,7 +972,8 @@ impl Peer {
             "SELECT COUNT(*) FROM admins WHERE recorded_by = ?1",
             rusqlite::params![&self.identity],
             |row| row.get(0),
-        ).unwrap_or(0)
+        )
+        .unwrap_or(0)
     }
 
     /// Count invite_accepted projected for this peer.
@@ -913,7 +983,8 @@ impl Peer {
             "SELECT COUNT(*) FROM invite_accepted WHERE recorded_by = ?1",
             rusqlite::params![&self.identity],
             |row| row.get(0),
-        ).unwrap_or(0)
+        )
+        .unwrap_or(0)
     }
 
     /// Get the recorded_at timestamp for a specific event (by base64 event_id).
@@ -923,35 +994,42 @@ impl Peer {
             "SELECT recorded_at FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
             rusqlite::params![&self.identity, event_id_b64],
             |row| row.get(0),
-        ).ok()
+        )
+        .ok()
     }
 
     /// Get a random sample of event IDs (base64) from the events table.
     pub fn sample_event_ids(&self, count: usize) -> Vec<String> {
         let db = open_connection(&self.db_path).expect("failed to open db");
-        let mut stmt = db.prepare(
-            "SELECT event_id FROM events ORDER BY RANDOM() LIMIT ?1"
-        ).expect("prepare");
-        stmt.query_map(rusqlite::params![count as i64], |row| row.get::<_, String>(0))
-            .expect("query")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("collect")
+        let mut stmt = db
+            .prepare("SELECT event_id FROM events ORDER BY RANDOM() LIMIT ?1")
+            .expect("prepare");
+        stmt.query_map(rusqlite::params![count as i64], |row| {
+            row.get::<_, String>(0)
+        })
+        .expect("query")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect")
     }
 
     /// Get a random sample of sync-eligible (shared-scope) event IDs (base64).
     pub fn sample_shared_event_ids(&self, count: usize) -> Vec<String> {
         let db = open_connection(&self.db_path).expect("failed to open db");
-        let mut stmt = db.prepare(
-            "SELECT event_id
+        let mut stmt = db
+            .prepare(
+                "SELECT event_id
              FROM events
              WHERE share_scope = 'shared'
              ORDER BY RANDOM()
              LIMIT ?1",
-        ).expect("prepare");
-        stmt.query_map(rusqlite::params![count as i64], |row| row.get::<_, String>(0))
-            .expect("query")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("collect")
+            )
+            .expect("prepare");
+        stmt.query_map(rusqlite::params![count as i64], |row| {
+            row.get::<_, String>(0)
+        })
+        .expect("query")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect")
     }
 
     /// Insert `count` synthetic pending_invite_bootstrap_trust rows for this peer.
@@ -993,24 +1071,88 @@ impl Peer {
 /// Excludes operational/transient tables per PLAN §12.4.
 const FINGERPRINT_TABLES: &[FingerprintTable] = &[
     // Content projections
-    FingerprintTable { name: "messages",            scope: Scope::RecordedBy, order: "ORDER BY message_id" },
-    FingerprintTable { name: "reactions",            scope: Scope::RecordedBy, order: "ORDER BY event_id" },
-    FingerprintTable { name: "secret_keys",          scope: Scope::RecordedBy, order: "ORDER BY event_id" },
-    FingerprintTable { name: "deleted_messages",     scope: Scope::RecordedBy, order: "ORDER BY message_id" },
-    FingerprintTable { name: "message_attachments",  scope: Scope::RecordedBy, order: "ORDER BY event_id" },
-    FingerprintTable { name: "file_slices",          scope: Scope::RecordedBy, order: "ORDER BY file_id, slice_number" },
+    FingerprintTable {
+        name: "messages",
+        scope: Scope::RecordedBy,
+        order: "ORDER BY message_id",
+    },
+    FingerprintTable {
+        name: "reactions",
+        scope: Scope::RecordedBy,
+        order: "ORDER BY event_id",
+    },
+    FingerprintTable {
+        name: "secret_keys",
+        scope: Scope::RecordedBy,
+        order: "ORDER BY event_id",
+    },
+    FingerprintTable {
+        name: "deleted_messages",
+        scope: Scope::RecordedBy,
+        order: "ORDER BY message_id",
+    },
+    FingerprintTable {
+        name: "message_attachments",
+        scope: Scope::RecordedBy,
+        order: "ORDER BY event_id",
+    },
+    FingerprintTable {
+        name: "file_slices",
+        scope: Scope::RecordedBy,
+        order: "ORDER BY file_id, slice_number",
+    },
     // Identity projections
-    FingerprintTable { name: "workspaces",           scope: Scope::RecordedBy, order: "ORDER BY event_id" },
-    FingerprintTable { name: "invite_accepted",      scope: Scope::RecordedBy, order: "ORDER BY event_id" },
-    FingerprintTable { name: "user_invites",         scope: Scope::RecordedBy, order: "ORDER BY event_id" },
-    FingerprintTable { name: "device_invites",       scope: Scope::RecordedBy, order: "ORDER BY event_id" },
-    FingerprintTable { name: "users",                scope: Scope::RecordedBy, order: "ORDER BY event_id" },
-    FingerprintTable { name: "peers_shared",         scope: Scope::RecordedBy, order: "ORDER BY event_id" },
-    FingerprintTable { name: "admins",               scope: Scope::RecordedBy, order: "ORDER BY event_id" },
-    FingerprintTable { name: "removed_entities",     scope: Scope::RecordedBy, order: "ORDER BY event_id" },
-    FingerprintTable { name: "secret_shared",        scope: Scope::RecordedBy, order: "ORDER BY event_id" },
+    FingerprintTable {
+        name: "workspaces",
+        scope: Scope::RecordedBy,
+        order: "ORDER BY event_id",
+    },
+    FingerprintTable {
+        name: "invite_accepted",
+        scope: Scope::RecordedBy,
+        order: "ORDER BY event_id",
+    },
+    FingerprintTable {
+        name: "user_invites",
+        scope: Scope::RecordedBy,
+        order: "ORDER BY event_id",
+    },
+    FingerprintTable {
+        name: "device_invites",
+        scope: Scope::RecordedBy,
+        order: "ORDER BY event_id",
+    },
+    FingerprintTable {
+        name: "users",
+        scope: Scope::RecordedBy,
+        order: "ORDER BY event_id",
+    },
+    FingerprintTable {
+        name: "peers_shared",
+        scope: Scope::RecordedBy,
+        order: "ORDER BY event_id",
+    },
+    FingerprintTable {
+        name: "admins",
+        scope: Scope::RecordedBy,
+        order: "ORDER BY event_id",
+    },
+    FingerprintTable {
+        name: "removed_entities",
+        scope: Scope::RecordedBy,
+        order: "ORDER BY event_id",
+    },
+    FingerprintTable {
+        name: "secret_shared",
+        scope: Scope::RecordedBy,
+        order: "ORDER BY event_id",
+    },
     // Trust anchor (uses peer_id as scope key, written by identity projector)
-    FingerprintTable { name: "trust_anchors",        scope: Scope::PeerId, order: "ORDER BY peer_id" },
+    FingerprintTable {
+        name: "trust_anchors",
+        scope: Scope::PeerId,
+        order: "ORDER BY peer_id",
+    },
 ];
 
 struct FingerprintTable {
@@ -1020,7 +1162,10 @@ struct FingerprintTable {
 }
 
 #[derive(Clone, Copy)]
-enum Scope { RecordedBy, PeerId }
+enum Scope {
+    RecordedBy,
+    PeerId,
+}
 
 /// Per-table fingerprint diagnostic record.
 #[derive(Debug)]
@@ -1039,15 +1184,24 @@ struct ProjectionFingerprint {
 
 impl ProjectionFingerprint {
     /// Format per-table diagnostics for assertion failure messages.
-    fn diff_report(&self, other: &ProjectionFingerprint, self_label: &str, other_label: &str) -> String {
+    fn diff_report(
+        &self,
+        other: &ProjectionFingerprint,
+        self_label: &str,
+        other_label: &str,
+    ) -> String {
         let mut lines = Vec::new();
         for (a, b) in self.tables.iter().zip(other.tables.iter()) {
             if a.hash != b.hash || a.row_count != b.row_count {
                 lines.push(format!(
                     "  {}: {} rows={} hash={} | {} rows={} hash={}",
                     a.table,
-                    self_label, a.row_count, hex(&a.hash[..8]),
-                    other_label, b.row_count, hex(&b.hash[..8]),
+                    self_label,
+                    a.row_count,
+                    hex(&a.hash[..8]),
+                    other_label,
+                    b.row_count,
+                    hex(&b.hash[..8]),
                 ));
             }
         }
@@ -1070,8 +1224,8 @@ fn compute_projection_fingerprint(
     db: &rusqlite::Connection,
     recorded_by: &str,
 ) -> ProjectionFingerprint {
-    use blake2::{Blake2b, Digest};
     use blake2::digest::consts::U32;
+    use blake2::{Blake2b, Digest};
     type Blake2b256 = Blake2b<U32>;
 
     let mut overall = Blake2b256::new();
@@ -1085,7 +1239,7 @@ fn compute_projection_fingerprint(
 
         let where_clause = match ft.scope {
             Scope::RecordedBy => "WHERE recorded_by = ?1",
-            Scope::PeerId     => "WHERE peer_id = ?1",
+            Scope::PeerId => "WHERE peer_id = ?1",
         };
         let query = format!("SELECT * FROM {} {} {}", ft.name, where_clause, ft.order);
         let mut row_count: i64 = 0;
@@ -1145,7 +1299,10 @@ fn compute_projection_fingerprint(
     let result = overall.finalize();
     let mut fp = [0u8; 32];
     fp.copy_from_slice(&result);
-    ProjectionFingerprint { overall: fp, tables }
+    ProjectionFingerprint {
+        overall: fp,
+        tables,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1156,39 +1313,124 @@ fn compute_projection_fingerprint(
 /// re-projection from events produces a fresh state.
 fn clear_projection_tables(db: &rusqlite::Connection, recorded_by: &str) {
     // — Content projections
-    db.execute("DELETE FROM messages WHERE recorded_by = ?1", rusqlite::params![recorded_by])
-        .expect("failed to clear messages");
-    db.execute("DELETE FROM reactions WHERE recorded_by = ?1", rusqlite::params![recorded_by])
-        .expect("failed to clear reactions");
-    db.execute("DELETE FROM secret_keys WHERE recorded_by = ?1", rusqlite::params![recorded_by])
-        .expect("failed to clear secret_keys");
-    db.execute("DELETE FROM deleted_messages WHERE recorded_by = ?1", rusqlite::params![recorded_by])
-        .expect("failed to clear deleted_messages");
-    db.execute("DELETE FROM message_attachments WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
-    db.execute("DELETE FROM file_slices WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
+    db.execute(
+        "DELETE FROM messages WHERE recorded_by = ?1",
+        rusqlite::params![recorded_by],
+    )
+    .expect("failed to clear messages");
+    db.execute(
+        "DELETE FROM reactions WHERE recorded_by = ?1",
+        rusqlite::params![recorded_by],
+    )
+    .expect("failed to clear reactions");
+    db.execute(
+        "DELETE FROM secret_keys WHERE recorded_by = ?1",
+        rusqlite::params![recorded_by],
+    )
+    .expect("failed to clear secret_keys");
+    db.execute(
+        "DELETE FROM deleted_messages WHERE recorded_by = ?1",
+        rusqlite::params![recorded_by],
+    )
+    .expect("failed to clear deleted_messages");
+    db.execute(
+        "DELETE FROM message_attachments WHERE recorded_by = ?1",
+        rusqlite::params![recorded_by],
+    )
+    .ok();
+    db.execute(
+        "DELETE FROM file_slices WHERE recorded_by = ?1",
+        rusqlite::params![recorded_by],
+    )
+    .ok();
     // — Identity projections
-    db.execute("DELETE FROM workspaces WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
-    db.execute("DELETE FROM invite_accepted WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
-    db.execute("DELETE FROM user_invites WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
-    db.execute("DELETE FROM device_invites WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
-    db.execute("DELETE FROM users WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
-    db.execute("DELETE FROM peers_shared WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
-    db.execute("DELETE FROM admins WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
-    db.execute("DELETE FROM removed_entities WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
-    db.execute("DELETE FROM secret_shared WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
-    db.execute("DELETE FROM trust_anchors WHERE peer_id = ?1", rusqlite::params![recorded_by]).ok();
-    db.execute("DELETE FROM peer_transport_bindings WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
+    db.execute(
+        "DELETE FROM workspaces WHERE recorded_by = ?1",
+        rusqlite::params![recorded_by],
+    )
+    .ok();
+    db.execute(
+        "DELETE FROM invite_accepted WHERE recorded_by = ?1",
+        rusqlite::params![recorded_by],
+    )
+    .ok();
+    db.execute(
+        "DELETE FROM user_invites WHERE recorded_by = ?1",
+        rusqlite::params![recorded_by],
+    )
+    .ok();
+    db.execute(
+        "DELETE FROM device_invites WHERE recorded_by = ?1",
+        rusqlite::params![recorded_by],
+    )
+    .ok();
+    db.execute(
+        "DELETE FROM users WHERE recorded_by = ?1",
+        rusqlite::params![recorded_by],
+    )
+    .ok();
+    db.execute(
+        "DELETE FROM peers_shared WHERE recorded_by = ?1",
+        rusqlite::params![recorded_by],
+    )
+    .ok();
+    db.execute(
+        "DELETE FROM admins WHERE recorded_by = ?1",
+        rusqlite::params![recorded_by],
+    )
+    .ok();
+    db.execute(
+        "DELETE FROM removed_entities WHERE recorded_by = ?1",
+        rusqlite::params![recorded_by],
+    )
+    .ok();
+    db.execute(
+        "DELETE FROM secret_shared WHERE recorded_by = ?1",
+        rusqlite::params![recorded_by],
+    )
+    .ok();
+    db.execute(
+        "DELETE FROM trust_anchors WHERE peer_id = ?1",
+        rusqlite::params![recorded_by],
+    )
+    .ok();
+    db.execute(
+        "DELETE FROM peer_transport_bindings WHERE recorded_by = ?1",
+        rusqlite::params![recorded_by],
+    )
+    .ok();
     // — Deletion intents (deterministic projection state, must be cleared for replay)
-    db.execute("DELETE FROM deletion_intents WHERE recorded_by = ?1", rusqlite::params![recorded_by]).ok();
+    db.execute(
+        "DELETE FROM deletion_intents WHERE recorded_by = ?1",
+        rusqlite::params![recorded_by],
+    )
+    .ok();
     // — Operational state (must be cleared for correct re-projection)
-    db.execute("DELETE FROM valid_events WHERE peer_id = ?1", rusqlite::params![recorded_by])
-        .expect("failed to clear valid_events");
-    db.execute("DELETE FROM blocked_event_deps WHERE peer_id = ?1", rusqlite::params![recorded_by])
-        .expect("failed to clear blocked_event_deps");
-    db.execute("DELETE FROM blocked_events WHERE peer_id = ?1", rusqlite::params![recorded_by]).ok();
-    db.execute("DELETE FROM rejected_events WHERE peer_id = ?1", rusqlite::params![recorded_by])
-        .expect("failed to clear rejected_events");
-    db.execute("DELETE FROM project_queue WHERE peer_id = ?1", rusqlite::params![recorded_by]).ok();
+    db.execute(
+        "DELETE FROM valid_events WHERE peer_id = ?1",
+        rusqlite::params![recorded_by],
+    )
+    .expect("failed to clear valid_events");
+    db.execute(
+        "DELETE FROM blocked_event_deps WHERE peer_id = ?1",
+        rusqlite::params![recorded_by],
+    )
+    .expect("failed to clear blocked_event_deps");
+    db.execute(
+        "DELETE FROM blocked_events WHERE peer_id = ?1",
+        rusqlite::params![recorded_by],
+    )
+    .ok();
+    db.execute(
+        "DELETE FROM rejected_events WHERE peer_id = ?1",
+        rusqlite::params![recorded_by],
+    )
+    .expect("failed to clear rejected_events");
+    db.execute(
+        "DELETE FROM project_queue WHERE peer_id = ?1",
+        rusqlite::params![recorded_by],
+    )
+    .ok();
 }
 
 /// Clear all projection and operational tables for a tenant, then re-project
@@ -1210,7 +1452,10 @@ fn replay_and_fingerprint(
         order
     );
     let mut stmt = db.prepare(&query).expect("failed to prepare events query");
-    let event_ids: Vec<String> = stmt.query_map(rusqlite::params![recorded_by], |row| row.get::<_, String>(0))
+    let event_ids: Vec<String> = stmt
+        .query_map(rusqlite::params![recorded_by], |row| {
+            row.get::<_, String>(0)
+        })
         .expect("failed to query events")
         .collect::<Result<Vec<_>, _>>()
         .expect("failed to collect events");
@@ -1236,7 +1481,10 @@ fn replay_no_clear_and_fingerprint(
          WHERE e.event_id IN (SELECT event_id FROM recorded_events WHERE peer_id = ?1)
          ORDER BY created_at ASC, event_id ASC";
     let mut stmt = db.prepare(query).expect("failed to prepare events query");
-    let event_ids: Vec<String> = stmt.query_map(rusqlite::params![recorded_by], |row| row.get::<_, String>(0))
+    let event_ids: Vec<String> = stmt
+        .query_map(rusqlite::params![recorded_by], |row| {
+            row.get::<_, String>(0)
+        })
         .expect("failed to query events")
         .collect::<Result<Vec<_>, _>>()
         .expect("failed to collect events");
@@ -1265,7 +1513,10 @@ fn replay_shuffled_and_fingerprint(
          WHERE e.event_id IN (SELECT event_id FROM recorded_events WHERE peer_id = ?1)
          ORDER BY created_at ASC, event_id ASC";
     let mut stmt = db.prepare(query).expect("failed to prepare events query");
-    let mut event_ids: Vec<String> = stmt.query_map(rusqlite::params![recorded_by], |row| row.get::<_, String>(0))
+    let mut event_ids: Vec<String> = stmt
+        .query_map(rusqlite::params![recorded_by], |row| {
+            row.get::<_, String>(0)
+        })
         .expect("failed to query events")
         .collect::<Result<Vec<_>, _>>()
         .expect("failed to collect events");
@@ -1317,7 +1568,11 @@ pub fn verify_projection_invariants(peer: &Peer) {
     );
 
     // 3. Reverse-order replay
-    let rev = replay_and_fingerprint(&db, &peer.identity, "ORDER BY created_at DESC, event_id DESC");
+    let rev = replay_and_fingerprint(
+        &db,
+        &peer.identity,
+        "ORDER BY created_at DESC, event_id DESC",
+    );
     assert!(
         fwd.overall == rev.overall,
         "Reverse replay fingerprint mismatch for peer '{}':\n{}",
@@ -1380,16 +1635,20 @@ pub fn start_peers(
         cert_a,
         key_a,
         dynamic_allow_a,
-    ).expect("failed to create dynamic dual endpoint for A");
+    )
+    .expect("failed to create dynamic dual endpoint for A");
 
-    let listener_addr = listener_endpoint.local_addr().expect("failed to get listener addr");
+    let listener_addr = listener_endpoint
+        .local_addr()
+        .expect("failed to get listener addr");
 
     let connector_endpoint = create_dual_endpoint_dynamic(
         "127.0.0.1:0".parse().unwrap(),
         cert_b,
         key_b,
         dynamic_allow_b,
-    ).expect("failed to create dynamic dual endpoint for B");
+    )
+    .expect("failed to create dynamic dual endpoint for B");
 
     let a_db = peer_a.db_path.clone();
     let a_identity = peer_a.identity.clone();
@@ -1402,7 +1661,15 @@ pub fn start_peers(
             .build()
             .unwrap();
         rt.block_on(async move {
-            if let Err(e) = accept_loop(&a_db, &a_identity, listener_endpoint, noop_intro_spawner, test_ingest_fns()).await {
+            if let Err(e) = accept_loop(
+                &a_db,
+                &a_identity,
+                listener_endpoint,
+                noop_intro_spawner,
+                test_ingest_fns(),
+            )
+            .await
+            {
                 tracing::warn!("accept_loop exited: {}", e);
             }
         });
@@ -1414,7 +1681,17 @@ pub fn start_peers(
             .build()
             .unwrap();
         rt.block_on(async move {
-            if let Err(e) = connect_loop(&b_db, &b_identity, connector_endpoint, listener_addr, None, noop_intro_spawner, test_ingest_fns()).await {
+            if let Err(e) = connect_loop(
+                &b_db,
+                &b_identity,
+                connector_endpoint,
+                listener_addr,
+                None,
+                noop_intro_spawner,
+                test_ingest_fns(),
+            )
+            .await
+            {
                 tracing::warn!("connect_loop exited: {}", e);
             }
         });
@@ -1473,16 +1750,20 @@ pub fn start_peers_pinned(
         cert_a,
         key_a,
         dynamic_allow_a,
-    ).expect("failed to create dynamic dual endpoint for A");
+    )
+    .expect("failed to create dynamic dual endpoint for A");
 
-    let listener_addr = listener_endpoint.local_addr().expect("failed to get listener addr");
+    let listener_addr = listener_endpoint
+        .local_addr()
+        .expect("failed to get listener addr");
 
     let connector_endpoint = create_dual_endpoint_dynamic(
         "127.0.0.1:0".parse().unwrap(),
         cert_b,
         key_b,
         dynamic_allow_b,
-    ).expect("failed to create dynamic dual endpoint for B");
+    )
+    .expect("failed to create dynamic dual endpoint for B");
 
     let a_db = peer_a.db_path.clone();
     let a_identity = peer_a.identity.clone();
@@ -1495,7 +1776,15 @@ pub fn start_peers_pinned(
             .build()
             .unwrap();
         rt.block_on(async move {
-            if let Err(e) = accept_loop(&a_db, &a_identity, listener_endpoint, noop_intro_spawner, test_ingest_fns()).await {
+            if let Err(e) = accept_loop(
+                &a_db,
+                &a_identity,
+                listener_endpoint,
+                noop_intro_spawner,
+                test_ingest_fns(),
+            )
+            .await
+            {
                 tracing::warn!("accept_loop exited: {}", e);
             }
         });
@@ -1507,7 +1796,17 @@ pub fn start_peers_pinned(
             .build()
             .unwrap();
         rt.block_on(async move {
-            if let Err(e) = connect_loop(&b_db, &b_identity, connector_endpoint, listener_addr, None, noop_intro_spawner, test_ingest_fns()).await {
+            if let Err(e) = connect_loop(
+                &b_db,
+                &b_identity,
+                connector_endpoint,
+                listener_addr,
+                None,
+                noop_intro_spawner,
+                test_ingest_fns(),
+            )
+            .await
+            {
                 tracing::warn!("connect_loop exited: {}", e);
             }
         });
@@ -1580,7 +1879,15 @@ pub fn start_peers_dynamic(
             .build()
             .unwrap();
         rt.block_on(async move {
-            if let Err(e) = accept_loop(&a_db, &a_identity, listener_endpoint, noop_intro_spawner, test_ingest_fns()).await {
+            if let Err(e) = accept_loop(
+                &a_db,
+                &a_identity,
+                listener_endpoint,
+                noop_intro_spawner,
+                test_ingest_fns(),
+            )
+            .await
+            {
                 tracing::warn!("accept_loop exited: {}", e);
             }
         });
@@ -1592,8 +1899,16 @@ pub fn start_peers_dynamic(
             .build()
             .unwrap();
         rt.block_on(async move {
-            if let Err(e) =
-                connect_loop(&b_db, &b_identity, connector_endpoint, listener_addr, None, noop_intro_spawner, test_ingest_fns()).await
+            if let Err(e) = connect_loop(
+                &b_db,
+                &b_identity,
+                connector_endpoint,
+                listener_addr,
+                None,
+                noop_intro_spawner,
+                test_ingest_fns(),
+            )
+            .await
             {
                 tracing::warn!("connect_loop exited: {}", e);
             }
@@ -1606,9 +1921,7 @@ pub fn start_peers_dynamic(
 /// Create a QUIC endpoint with dynamic DB trust lookup for a test peer.
 /// Returns the endpoint (dual-role: accepts and connects).
 /// Trust is resolved from SQL at each TLS handshake, matching production behavior.
-pub fn create_dynamic_endpoint_for_peer(
-    peer: &Peer,
-) -> quinn::Endpoint {
+pub fn create_dynamic_endpoint_for_peer(peer: &Peer) -> quinn::Endpoint {
     create_dynamic_endpoint_for_peer_bind(peer, "127.0.0.1:0".parse().unwrap())
 }
 
@@ -1629,13 +1942,8 @@ pub fn create_dynamic_endpoint_for_peer_bind(
             is_peer_allowed(&db, &recorded_by, peer_fp)
         });
 
-    create_dual_endpoint_dynamic(
-        bind_addr,
-        cert,
-        key,
-        dynamic_allow,
-    )
-    .expect("failed to create dynamic endpoint for peer")
+    create_dual_endpoint_dynamic(bind_addr, cert, key, dynamic_allow)
+        .expect("failed to create dynamic endpoint for peer")
 }
 
 /// Start sync, wait for a caller-defined convergence check, return metrics.
@@ -1660,7 +1968,11 @@ pub async fn sync_until_converged<F: Fn() -> bool>(
     let b_after = peer_b.store_count();
     let events_transferred = ((a_after - a_before) + (b_after - b_before)) as u64;
     let bytes_transferred = events_transferred * 100;
-    let events_per_sec = if wall_secs > 0.0 { events_transferred as f64 / wall_secs } else { 0.0 };
+    let events_per_sec = if wall_secs > 0.0 {
+        events_transferred as f64 / wall_secs
+    } else {
+        0.0
+    };
     let throughput_mib_s = (bytes_transferred as f64) / (1024.0 * 1024.0) / wall_secs.max(0.001);
 
     SyncMetrics {
@@ -1709,34 +2021,31 @@ pub fn start_chain(peers: &[Peer]) -> Vec<std::thread::JoinHandle<()>> {
     }
 
     // Seed mutual trust between adjacent peers via CLI pin import
-    for i in 0..n-1 {
+    for i in 0..n - 1 {
         let db_left = open_connection(&peers[i].db_path).expect("failed to open db");
-        let pins = AllowedPeers::from_fingerprints(vec![fingerprints[i+1]]);
-        import_cli_pins_to_sql(&db_left, &peers[i].identity, &pins)
-            .expect("failed to import pins");
+        let pins = AllowedPeers::from_fingerprints(vec![fingerprints[i + 1]]);
+        import_cli_pins_to_sql(&db_left, &peers[i].identity, &pins).expect("failed to import pins");
 
-        let db_right = open_connection(&peers[i+1].db_path).expect("failed to open db");
+        let db_right = open_connection(&peers[i + 1].db_path).expect("failed to open db");
         let pins = AllowedPeers::from_fingerprints(vec![fingerprints[i]]);
-        import_cli_pins_to_sql(&db_right, &peers[i+1].identity, &pins)
+        import_cli_pins_to_sql(&db_right, &peers[i + 1].identity, &pins)
             .expect("failed to import pins");
     }
 
     // Create server endpoints for peers 0..n-2 with dynamic trust
     let mut server_addrs: Vec<SocketAddr> = Vec::new();
     let mut server_endpoints: Vec<quinn::Endpoint> = Vec::new();
-    for i in 0..n-1 {
+    for i in 0..n - 1 {
         let (cert, key) = peers[i].cert_and_key();
         let db_path = peers[i].db_path.clone();
         let recorded_by = peers[i].identity.clone();
-        let allow_fn: Arc<crate::transport::DynamicAllowFn> =
-            Arc::new(move |fp: &[u8; 32]| {
-                let db = open_connection(&db_path)?;
-                is_peer_allowed(&db, &recorded_by, fp)
-            });
-        let endpoint = create_dual_endpoint_dynamic(
-            "127.0.0.1:0".parse().unwrap(),
-            cert, key, allow_fn,
-        ).expect("failed to create chain server endpoint");
+        let allow_fn: Arc<crate::transport::DynamicAllowFn> = Arc::new(move |fp: &[u8; 32]| {
+            let db = open_connection(&db_path)?;
+            is_peer_allowed(&db, &recorded_by, fp)
+        });
+        let endpoint =
+            create_dual_endpoint_dynamic("127.0.0.1:0".parse().unwrap(), cert, key, allow_fn)
+                .expect("failed to create chain server endpoint");
         let addr = endpoint.local_addr().expect("failed to get local addr");
         server_addrs.push(addr);
         server_endpoints.push(endpoint);
@@ -1748,15 +2057,13 @@ pub fn start_chain(peers: &[Peer]) -> Vec<std::thread::JoinHandle<()>> {
         let (cert, key) = peers[i].cert_and_key();
         let db_path = peers[i].db_path.clone();
         let recorded_by = peers[i].identity.clone();
-        let allow_fn: Arc<crate::transport::DynamicAllowFn> =
-            Arc::new(move |fp: &[u8; 32]| {
-                let db = open_connection(&db_path)?;
-                is_peer_allowed(&db, &recorded_by, fp)
-            });
-        let endpoint = create_dual_endpoint_dynamic(
-            "0.0.0.0:0".parse().unwrap(),
-            cert, key, allow_fn,
-        ).expect("failed to create chain client endpoint");
+        let allow_fn: Arc<crate::transport::DynamicAllowFn> = Arc::new(move |fp: &[u8; 32]| {
+            let db = open_connection(&db_path)?;
+            is_peer_allowed(&db, &recorded_by, fp)
+        });
+        let endpoint =
+            create_dual_endpoint_dynamic("0.0.0.0:0".parse().unwrap(), cert, key, allow_fn)
+                .expect("failed to create chain client endpoint");
         client_endpoints.push(endpoint);
     }
 
@@ -1772,7 +2079,15 @@ pub fn start_chain(peers: &[Peer]) -> Vec<std::thread::JoinHandle<()>> {
                 .build()
                 .unwrap();
             rt.block_on(async move {
-                if let Err(e) = accept_loop(&db_path, &identity, endpoint, noop_intro_spawner, test_ingest_fns()).await {
+                if let Err(e) = accept_loop(
+                    &db_path,
+                    &identity,
+                    endpoint,
+                    noop_intro_spawner,
+                    test_ingest_fns(),
+                )
+                .await
+                {
                     tracing::warn!("chain accept_loop[{}] exited: {}", i, e);
                 }
             });
@@ -1791,7 +2106,17 @@ pub fn start_chain(peers: &[Peer]) -> Vec<std::thread::JoinHandle<()>> {
                 .build()
                 .unwrap();
             rt.block_on(async move {
-                if let Err(e) = connect_loop(&db_path, &identity, endpoint, remote, None, noop_intro_spawner, test_ingest_fns()).await {
+                if let Err(e) = connect_loop(
+                    &db_path,
+                    &identity,
+                    endpoint,
+                    remote,
+                    None,
+                    noop_intro_spawner,
+                    test_ingest_fns(),
+                )
+                .await
+                {
                     tracing::warn!("chain connect_loop[{}] exited: {}", i, e);
                 }
             });
@@ -1840,16 +2165,16 @@ pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Jo
         let (cert, key) = source.cert_and_key();
         let src_db_path = source.db_path.clone();
         let src_recorded_by = source.identity.clone();
-        let allow_fn: Arc<crate::transport::DynamicAllowFn> =
-            Arc::new(move |fp: &[u8; 32]| {
-                let db = open_connection(&src_db_path)?;
-                is_peer_allowed(&db, &src_recorded_by, fp)
-            });
-        let server_endpoint = create_dual_endpoint_dynamic(
-            "127.0.0.1:0".parse().unwrap(),
-            cert, key, allow_fn,
-        ).expect("failed to create source server endpoint");
-        let addr = server_endpoint.local_addr().expect("failed to get source addr");
+        let allow_fn: Arc<crate::transport::DynamicAllowFn> = Arc::new(move |fp: &[u8; 32]| {
+            let db = open_connection(&src_db_path)?;
+            is_peer_allowed(&db, &src_recorded_by, fp)
+        });
+        let server_endpoint =
+            create_dual_endpoint_dynamic("127.0.0.1:0".parse().unwrap(), cert, key, allow_fn)
+                .expect("failed to create source server endpoint");
+        let addr = server_endpoint
+            .local_addr()
+            .expect("failed to get source addr");
         source_addrs.push(addr);
 
         let db_path = source.db_path.clone();
@@ -1860,7 +2185,15 @@ pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Jo
                 .build()
                 .unwrap();
             rt.block_on(async move {
-                if let Err(e) = accept_loop(&db_path, &identity, server_endpoint, noop_intro_spawner, test_ingest_fns()).await {
+                if let Err(e) = accept_loop(
+                    &db_path,
+                    &identity,
+                    server_endpoint,
+                    noop_intro_spawner,
+                    test_ingest_fns(),
+                )
+                .await
+                {
                     tracing::warn!("source accept_loop exited: {}", e);
                 }
             });
@@ -1873,15 +2206,17 @@ pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Jo
     for (i, _source) in sources.iter().enumerate() {
         let sink_db_path = sink.db_path.clone();
         let sink_recorded_by = sink.identity.clone();
-        let allow_fn: Arc<crate::transport::DynamicAllowFn> =
-            Arc::new(move |fp: &[u8; 32]| {
-                let db = open_connection(&sink_db_path)?;
-                is_peer_allowed(&db, &sink_recorded_by, fp)
-            });
+        let allow_fn: Arc<crate::transport::DynamicAllowFn> = Arc::new(move |fp: &[u8; 32]| {
+            let db = open_connection(&sink_db_path)?;
+            is_peer_allowed(&db, &sink_recorded_by, fp)
+        });
         let client_endpoint = create_dual_endpoint_dynamic(
             "0.0.0.0:0".parse().unwrap(),
-            sink_cert.clone(), sink_key.clone_key(), allow_fn,
-        ).expect("failed to create sink client endpoint");
+            sink_cert.clone(),
+            sink_key.clone_key(),
+            allow_fn,
+        )
+        .expect("failed to create sink client endpoint");
 
         sink_connectors.push((client_endpoint, source_addrs[i]));
     }
@@ -1933,22 +2268,19 @@ pub fn start_sink_accept(
     {
         let db = open_connection(&sink.db_path).expect("failed to open sink db");
         let pins = AllowedPeers::from_fingerprints(allowed_fps);
-        import_cli_pins_to_sql(&db, &sink.identity, &pins)
-            .expect("failed to import pins for sink");
+        import_cli_pins_to_sql(&db, &sink.identity, &pins).expect("failed to import pins for sink");
     }
 
     let (cert, key) = sink.cert_and_key();
     let sink_db_path = sink.db_path.clone();
     let sink_recorded_by = sink.identity.clone();
-    let allow_fn: Arc<crate::transport::DynamicAllowFn> =
-        Arc::new(move |fp: &[u8; 32]| {
-            let db = open_connection(&sink_db_path)?;
-            is_peer_allowed(&db, &sink_recorded_by, fp)
-        });
-    let endpoint = create_dual_endpoint_dynamic(
-        "127.0.0.1:0".parse().unwrap(),
-        cert, key, allow_fn,
-    ).expect("failed to create sink server endpoint");
+    let allow_fn: Arc<crate::transport::DynamicAllowFn> = Arc::new(move |fp: &[u8; 32]| {
+        let db = open_connection(&sink_db_path)?;
+        is_peer_allowed(&db, &sink_recorded_by, fp)
+    });
+    let endpoint =
+        create_dual_endpoint_dynamic("127.0.0.1:0".parse().unwrap(), cert, key, allow_fn)
+            .expect("failed to create sink server endpoint");
     let addr = endpoint.local_addr().expect("failed to get sink addr");
 
     let db_path = sink.db_path.clone();
@@ -1959,7 +2291,15 @@ pub fn start_sink_accept(
             .build()
             .unwrap();
         rt.block_on(async move {
-            if let Err(e) = accept_loop(&db_path, &identity, endpoint, noop_intro_spawner, test_ingest_fns()).await {
+            if let Err(e) = accept_loop(
+                &db_path,
+                &identity,
+                endpoint,
+                noop_intro_spawner,
+                test_ingest_fns(),
+            )
+            .await
+            {
                 tracing::warn!("sink accept_loop exited: {}", e);
             }
         });
@@ -2018,7 +2358,12 @@ impl SharedDbNode {
     pub fn new(n: usize) -> Self {
         assert!(n >= 1, "need at least 1 tenant");
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
-        let db_path = tempdir.path().join("shared.db").to_str().unwrap().to_string();
+        let db_path = tempdir
+            .path()
+            .join("shared.db")
+            .to_str()
+            .unwrap()
+            .to_string();
 
         // Initialize DB once
         {
@@ -2041,16 +2386,20 @@ impl SharedDbNode {
         if n > 1 {
             let db = open_connection(&db_path).expect("failed to open shared db for cred restore");
             for tenant in &tenants {
-                let ps_key = tenant.peer_shared_signing_key.as_ref()
+                let ps_key = tenant
+                    .peer_shared_signing_key
+                    .as_ref()
                     .expect("tenant missing peer_shared_signing_key after bootstrap");
-                let (cert, key) = crate::transport::generate_self_signed_cert_from_signing_key(ps_key)
-                    .expect("failed to regenerate PeerShared cert");
+                let (cert, key) =
+                    crate::transport::generate_self_signed_cert_from_signing_key(ps_key)
+                        .expect("failed to regenerate PeerShared cert");
                 crate::db::transport_creds::store_local_creds(
                     &db,
                     &tenant.identity,
                     cert.as_ref(),
                     key.secret_pkcs8_der(),
-                ).expect("failed to re-store tenant transport creds");
+                )
+                .expect("failed to re-store tenant transport creds");
             }
         }
 
@@ -2071,8 +2420,8 @@ impl SharedDbNode {
         // We need a separate identity for each tenant. The first call to
         // ensure_transport_peer_id generates one cert; subsequent tenants
         // need distinct certs. Generate a new cert for this tenant.
-        let (cert, key) = crate::transport::generate_self_signed_cert()
-            .expect("failed to generate cert");
+        let (cert, key) =
+            crate::transport::generate_self_signed_cert().expect("failed to generate cert");
         let fp = extract_spki_fingerprint(cert.as_ref()).expect("failed to extract SPKI");
         let tenant_identity = hex::encode(fp);
 
@@ -2083,7 +2432,8 @@ impl SharedDbNode {
             &tenant_identity,
             cert.as_ref(),
             key.secret_pkcs8_der(),
-        ).expect("failed to store creds");
+        )
+        .expect("failed to store creds");
 
         let author_id: [u8; 32] = rand::random();
 
@@ -2112,23 +2462,30 @@ impl SharedDbNode {
     /// Add a new tenant that joins an existing tenant's workspace (same DB)
     /// using the production workspace command APIs.
     pub fn add_tenant_in_workspace(&mut self, name: &str, creator_index: usize) {
-        use crate::event_modules::workspace::commands::{create_user_invite_raw, join_workspace_as_new_user};
+        use crate::event_modules::workspace::commands::{
+            create_user_invite_raw, join_workspace_as_new_user,
+        };
 
         let creator = &self.tenants[creator_index];
         let workspace_id = creator.workspace_id;
-        let workspace_key = creator.workspace_signing_key.as_ref()
+        let workspace_key = creator
+            .workspace_signing_key
+            .as_ref()
             .expect("creator has no workspace_signing_key")
             .clone();
-        let creator_peer_key = creator.peer_shared_signing_key.as_ref()
+        let creator_peer_key = creator
+            .peer_shared_signing_key
+            .as_ref()
             .expect("creator has no peer_shared_signing_key")
             .clone();
-        let creator_peer_eid = creator.peer_shared_event_id
+        let creator_peer_eid = creator
+            .peer_shared_event_id
             .expect("creator has no peer_shared_event_id");
         let creator_identity = creator.identity.clone();
 
         // Create a new transport identity in the shared DB
-        let (cert, key) = crate::transport::generate_self_signed_cert()
-            .expect("failed to generate cert");
+        let (cert, key) =
+            crate::transport::generate_self_signed_cert().expect("failed to generate cert");
         let fp = extract_spki_fingerprint(cert.as_ref()).expect("failed to extract SPKI");
         let tenant_identity = hex::encode(fp);
 
@@ -2138,7 +2495,8 @@ impl SharedDbNode {
             &tenant_identity,
             cert.as_ref(),
             key.secret_pkcs8_der(),
-        ).expect("failed to store creds");
+        )
+        .expect("failed to store creds");
 
         // Creator issues an invite via workspace::commands API
         let invite = create_user_invite_raw(
@@ -2148,22 +2506,30 @@ impl SharedDbNode {
             &workspace_id,
             Some(&creator_peer_key),
             Some(&creator_peer_eid),
-        ).expect("failed to create user invite");
+        )
+        .expect("failed to create user invite");
 
         // The Workspace and UserInviteBoot events already exist in the shared DB.
         // Record them for this new tenant and project (white-box shared-DB prerequisite).
         record_shared_db_events_for_tenant(
-            &db, &tenant_identity, &[workspace_id, invite.invite_event_id],
+            &db,
+            &tenant_identity,
+            &[workspace_id, invite.invite_event_id],
         );
 
         // Accept the invite (production flow via workspace commands)
         let peer_shared_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
         let join = join_workspace_as_new_user(
-            &db, &tenant_identity, &invite.invite_key,
-            &invite.invite_event_id, workspace_id,
-            "test-user", "test-device",
+            &db,
+            &tenant_identity,
+            &invite.invite_key,
+            &invite.invite_event_id,
+            workspace_id,
+            "test-user",
+            "test-device",
             peer_shared_key,
-        ).expect("failed to accept user invite");
+        )
+        .expect("failed to accept user invite");
 
         let dummy_tempdir = tempfile::tempdir().expect("failed to create dummy tempdir");
 
@@ -2192,7 +2558,9 @@ impl SharedDbNode {
         for tenant in &self.tenants {
             verify_projection_invariants(tenant);
         }
-        let tenant_workspaces: Vec<(String, String)> = self.tenants.iter()
+        let tenant_workspaces: Vec<(String, String)> = self
+            .tenants
+            .iter()
             .map(|t| (t.identity.clone(), hex::encode(t.workspace_id)))
             .collect();
         assert_no_cross_tenant_leakage(&self.db_path, &tenant_workspaces);
@@ -2255,8 +2623,10 @@ impl<'a> ScenarioHarness<'a> {
         }
         let tracked = self.peers.borrow().len() + self.shared_db_nodes.borrow().len();
         if tracked == 0 {
-            panic!("ScenarioHarness::finish() with zero tracked subjects. \
-                    Use ScenarioHarness::skip(reason) to opt out.");
+            panic!(
+                "ScenarioHarness::finish() with zero tracked subjects. \
+                    Use ScenarioHarness::skip(reason) to opt out."
+            );
         }
         for peer in self.peers.borrow().iter() {
             verify_projection_invariants(peer);
@@ -2286,15 +2656,21 @@ impl Drop for ScenarioHarness<'_> {
 pub fn assert_no_cross_tenant_leakage(db_path: &str, tenant_workspaces: &[(String, String)]) {
     let db = open_connection(db_path).expect("failed to open db");
 
-    let tenant_ids: Vec<&str> = tenant_workspaces.iter().map(|(id, _)| id.as_str()).collect();
+    let tenant_ids: Vec<&str> = tenant_workspaces
+        .iter()
+        .map(|(id, _)| id.as_str())
+        .collect();
     let known_ids: std::collections::HashSet<&str> = tenant_ids.iter().copied().collect();
 
     // Collect recorded event_ids per tenant
-    let mut recorded_per_tenant: std::collections::HashMap<&str, std::collections::HashSet<String>> = std::collections::HashMap::new();
+    let mut recorded_per_tenant: std::collections::HashMap<
+        &str,
+        std::collections::HashSet<String>,
+    > = std::collections::HashMap::new();
     for tid in &tenant_ids {
-        let mut stmt = db.prepare(
-            "SELECT event_id FROM recorded_events WHERE peer_id = ?1"
-        ).expect("failed to prepare stmt");
+        let mut stmt = db
+            .prepare("SELECT event_id FROM recorded_events WHERE peer_id = ?1")
+            .expect("failed to prepare stmt");
         let events: std::collections::HashSet<String> = stmt
             .query_map([tid], |row| row.get::<_, String>(0))
             .expect("failed to query")
@@ -2314,18 +2690,23 @@ pub fn assert_no_cross_tenant_leakage(db_path: &str, tenant_workspaces: &[(Strin
             let a = recorded_per_tenant.get(id_a.as_str()).unwrap();
             let b = recorded_per_tenant.get(id_b.as_str()).unwrap();
             let overlap: Vec<&String> = a.intersection(b).collect();
-            assert!(overlap.is_empty(),
+            assert!(
+                overlap.is_empty(),
                 "Cross-workspace leakage in recorded_events between {} and {}: {:?}",
-                &id_a[..16], &id_b[..16], overlap);
+                &id_a[..16],
+                &id_b[..16],
+                overlap
+            );
         }
     }
 
     // Collect valid event_ids per tenant
-    let mut valid_per_tenant: std::collections::HashMap<&str, std::collections::HashSet<String>> = std::collections::HashMap::new();
+    let mut valid_per_tenant: std::collections::HashMap<&str, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
     for tid in &tenant_ids {
-        let mut stmt = db.prepare(
-            "SELECT event_id FROM valid_events WHERE peer_id = ?1"
-        ).expect("failed to prepare stmt");
+        let mut stmt = db
+            .prepare("SELECT event_id FROM valid_events WHERE peer_id = ?1")
+            .expect("failed to prepare stmt");
         let events: std::collections::HashSet<String> = stmt
             .query_map([tid], |row| row.get::<_, String>(0))
             .expect("failed to query")
@@ -2344,9 +2725,13 @@ pub fn assert_no_cross_tenant_leakage(db_path: &str, tenant_workspaces: &[(Strin
             let a = valid_per_tenant.get(id_a.as_str()).unwrap();
             let b = valid_per_tenant.get(id_b.as_str()).unwrap();
             let overlap: Vec<&String> = a.intersection(b).collect();
-            assert!(overlap.is_empty(),
+            assert!(
+                overlap.is_empty(),
                 "Cross-workspace leakage in valid_events between {} and {}: {:?}",
-                &id_a[..16], &id_b[..16], overlap);
+                &id_a[..16],
+                &id_b[..16],
+                overlap
+            );
         }
     }
 
@@ -2360,9 +2745,12 @@ pub fn assert_no_cross_tenant_leakage(db_path: &str, tenant_workspaces: &[(Strin
             .collect::<Result<Vec<_>, _>>()
             .expect("failed to collect");
         for found_id in &found_ids {
-            assert!(known_ids.contains(found_id.as_str()),
+            assert!(
+                known_ids.contains(found_id.as_str()),
                 "Unknown peer_id '{}...' in {} table",
-                &found_id[..16.min(found_id.len())], table);
+                &found_id[..16.min(found_id.len())],
+                table
+            );
         }
     }
 
@@ -2376,9 +2764,12 @@ pub fn assert_no_cross_tenant_leakage(db_path: &str, tenant_workspaces: &[(Strin
             .collect::<Result<Vec<_>, _>>()
             .expect("failed to collect");
         for found_id in &found_ids {
-            assert!(known_ids.contains(found_id.as_str()),
+            assert!(
+                known_ids.contains(found_id.as_str()),
                 "Unknown peer_id '{}...' in {} table",
-                &found_id[..16.min(found_id.len())], table);
+                &found_id[..16.min(found_id.len())],
+                table
+            );
         }
     }
 }
@@ -2399,9 +2790,11 @@ pub fn clone_events_to(source: &Peer, targets: &[&Peer]) {
     let src_db = open_connection(&source.db_path).expect("failed to open source db");
 
     // Read all events
-    let mut events_stmt = src_db.prepare(
-        "SELECT event_id, event_type, blob, share_scope, created_at, inserted_at FROM events"
-    ).expect("failed to prepare events query");
+    let mut events_stmt = src_db
+        .prepare(
+            "SELECT event_id, event_type, blob, share_scope, created_at, inserted_at FROM events",
+        )
+        .expect("failed to prepare events query");
     let events: Vec<(String, String, Vec<u8>, String, i64, i64)> = events_stmt
         .query_map([], |row| {
             Ok((
@@ -2418,7 +2811,9 @@ pub fn clone_events_to(source: &Peer, targets: &[&Peer]) {
         .expect("failed to collect events");
 
     // Read all neg_items
-    let mut neg_stmt = src_db.prepare("SELECT ts, id FROM neg_items").expect("failed to prepare neg_items query");
+    let mut neg_stmt = src_db
+        .prepare("SELECT ts, id FROM neg_items")
+        .expect("failed to prepare neg_items query");
     let neg_items: Vec<(i64, Vec<u8>)> = neg_stmt
         .query_map([], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
@@ -2440,10 +2835,12 @@ pub fn clone_events_to(source: &Peer, targets: &[&Peer]) {
         }
 
         for (ts, id) in &neg_items {
-            tgt_db.execute(
-                "INSERT OR IGNORE INTO neg_items (ts, id) VALUES (?1, ?2)",
-                rusqlite::params![ts, id.as_slice()],
-            ).expect("failed to insert neg_item");
+            tgt_db
+                .execute(
+                    "INSERT OR IGNORE INTO neg_items (ts, id) VALUES (?1, ?2)",
+                    rusqlite::params![ts, id.as_slice()],
+                )
+                .expect("failed to insert neg_item");
         }
 
         tgt_db.execute("COMMIT", []).expect("failed to commit");
@@ -2477,13 +2874,21 @@ mod fingerprint_tests {
             "INSERT INTO workspaces (recorded_by, event_id, workspace_id, public_key)
              VALUES (?1, 'eid1', 'ws1', X'00')",
             rusqlite::params![peer_id],
-        ).unwrap();
+        )
+        .unwrap();
 
         let fp1 = compute_projection_fingerprint(&db, peer_id);
         let fp2 = compute_projection_fingerprint(&db, peer_id);
-        assert_eq!(fp1.overall, fp2.overall, "fingerprint must be deterministic");
+        assert_eq!(
+            fp1.overall, fp2.overall,
+            "fingerprint must be deterministic"
+        );
         for (a, b) in fp1.tables.iter().zip(fp2.tables.iter()) {
-            assert_eq!(a.hash, b.hash, "table {} hash must be deterministic", a.table);
+            assert_eq!(
+                a.hash, b.hash,
+                "table {} hash must be deterministic",
+                a.table
+            );
             assert_eq!(a.row_count, b.row_count);
         }
     }
@@ -2503,12 +2908,21 @@ mod fingerprint_tests {
         ).unwrap();
 
         let fp_one_msg = compute_projection_fingerprint(&db, peer_id);
-        assert_ne!(fp_empty.overall, fp_one_msg.overall,
-            "fingerprint must change when projection state changes");
+        assert_ne!(
+            fp_empty.overall, fp_one_msg.overall,
+            "fingerprint must change when projection state changes"
+        );
 
         // The messages table hash should differ
-        let msg_idx = fp_empty.tables.iter().position(|t| t.table == "messages").unwrap();
-        assert_ne!(fp_empty.tables[msg_idx].hash, fp_one_msg.tables[msg_idx].hash);
+        let msg_idx = fp_empty
+            .tables
+            .iter()
+            .position(|t| t.table == "messages")
+            .unwrap();
+        assert_ne!(
+            fp_empty.tables[msg_idx].hash,
+            fp_one_msg.tables[msg_idx].hash
+        );
         assert_eq!(fp_one_msg.tables[msg_idx].row_count, 1);
 
         // Add another message
@@ -2519,8 +2933,10 @@ mod fingerprint_tests {
         ).unwrap();
 
         let fp_two_msg = compute_projection_fingerprint(&db, peer_id);
-        assert_ne!(fp_one_msg.overall, fp_two_msg.overall,
-            "fingerprint must change when more rows are added");
+        assert_ne!(
+            fp_one_msg.overall, fp_two_msg.overall,
+            "fingerprint must change when more rows are added"
+        );
         assert_eq!(fp_two_msg.tables[msg_idx].row_count, 2);
     }
 
@@ -2545,11 +2961,19 @@ mod fingerprint_tests {
 
         let fp_goodbye = compute_projection_fingerprint(&db, peer_id);
 
-        let msg_idx = fp_hello.tables.iter().position(|t| t.table == "messages").unwrap();
-        assert_eq!(fp_hello.tables[msg_idx].row_count, fp_goodbye.tables[msg_idx].row_count,
-            "row counts should be equal");
-        assert_ne!(fp_hello.overall, fp_goodbye.overall,
-            "fingerprint must detect content changes that count-only checks miss");
+        let msg_idx = fp_hello
+            .tables
+            .iter()
+            .position(|t| t.table == "messages")
+            .unwrap();
+        assert_eq!(
+            fp_hello.tables[msg_idx].row_count, fp_goodbye.tables[msg_idx].row_count,
+            "row counts should be equal"
+        );
+        assert_ne!(
+            fp_hello.overall, fp_goodbye.overall,
+            "fingerprint must detect content changes that count-only checks miss"
+        );
     }
 
     #[test]
@@ -2570,21 +2994,26 @@ mod fingerprint_tests {
         db.execute(
             "INSERT INTO valid_events (peer_id, event_id) VALUES (?1, 'eid-op-test')",
             rusqlite::params![peer_id],
-        ).unwrap();
+        )
+        .unwrap();
         db.execute(
             "INSERT INTO blocked_event_deps (peer_id, event_id, blocker_event_id)
              VALUES (?1, 'eid-blocked', 'eid-blocker')",
             rusqlite::params![peer_id],
-        ).unwrap();
+        )
+        .unwrap();
         db.execute(
             "INSERT INTO rejected_events (peer_id, event_id, reason, rejected_at)
              VALUES (?1, 'eid-rej', 'bad', 1000)",
             rusqlite::params![peer_id],
-        ).unwrap();
+        )
+        .unwrap();
 
         let fp_after = compute_projection_fingerprint(&db, peer_id);
-        assert_eq!(fp_before.overall, fp_after.overall,
-            "operational table changes must not affect projection fingerprint");
+        assert_eq!(
+            fp_before.overall, fp_after.overall,
+            "operational table changes must not affect projection fingerprint"
+        );
     }
 
     #[test]
@@ -2599,27 +3028,39 @@ mod fingerprint_tests {
             "INSERT INTO workspaces (recorded_by, event_id, workspace_id, public_key)
              VALUES (?1, 'ws-eid', 'ws1', X'AABB')",
             rusqlite::params![peer_id],
-        ).unwrap();
+        )
+        .unwrap();
         db.execute(
             "INSERT INTO users (recorded_by, event_id, public_key)
              VALUES (?1, 'user-eid', X'CCDD')",
             rusqlite::params![peer_id],
-        ).unwrap();
+        )
+        .unwrap();
         db.execute(
             "INSERT INTO peers_shared (recorded_by, event_id, public_key)
              VALUES (?1, 'ps-eid', X'EEFF')",
             rusqlite::params![peer_id],
-        ).unwrap();
+        )
+        .unwrap();
 
         let fp_identity = compute_projection_fingerprint(&db, peer_id);
-        assert_ne!(fp_empty.overall, fp_identity.overall,
-            "identity projection tables must be included in fingerprint");
+        assert_ne!(
+            fp_empty.overall, fp_identity.overall,
+            "identity projection tables must be included in fingerprint"
+        );
 
         // Verify per-table: workspaces, users, peers_shared all changed
         for name in &["workspaces", "users", "peers_shared"] {
-            let idx = fp_empty.tables.iter().position(|t| t.table == *name).unwrap();
-            assert_ne!(fp_empty.tables[idx].hash, fp_identity.tables[idx].hash,
-                "table {} must contribute to fingerprint", name);
+            let idx = fp_empty
+                .tables
+                .iter()
+                .position(|t| t.table == *name)
+                .unwrap();
+            assert_ne!(
+                fp_empty.tables[idx].hash, fp_identity.tables[idx].hash,
+                "table {} must contribute to fingerprint",
+                name
+            );
         }
     }
 
@@ -2638,14 +3079,18 @@ mod fingerprint_tests {
         let fp_b = compute_projection_fingerprint(&db, "peer-b");
 
         // Peer A's fingerprint should differ from peer B's (which is empty)
-        assert_ne!(fp_a.overall, fp_b.overall,
-            "fingerprints must be tenant-scoped");
+        assert_ne!(
+            fp_a.overall, fp_b.overall,
+            "fingerprints must be tenant-scoped"
+        );
 
         // Peer B's fingerprint should match an empty DB fingerprint
         let (_dir2, _path2, db2) = fresh_db();
         let fp_empty = compute_projection_fingerprint(&db2, "peer-b");
-        assert_eq!(fp_b.overall, fp_empty.overall,
-            "empty-scoped fingerprint should be identical across DBs");
+        assert_eq!(
+            fp_b.overall, fp_empty.overall,
+            "empty-scoped fingerprint should be identical across DBs"
+        );
     }
 
     #[test]
@@ -2653,31 +3098,57 @@ mod fingerprint_tests {
         // Verify that FINGERPRINT_TABLES covers all projection tables
         // and excludes operational tables.
         let projection_tables = [
-            "messages", "reactions", "secret_keys",
-            "deleted_messages", "message_attachments", "file_slices",
-            "workspaces", "invite_accepted", "user_invites", "device_invites",
-            "users", "peers_shared", "admins", "removed_entities",
-            "secret_shared", "trust_anchors",
+            "messages",
+            "reactions",
+            "secret_keys",
+            "deleted_messages",
+            "message_attachments",
+            "file_slices",
+            "workspaces",
+            "invite_accepted",
+            "user_invites",
+            "device_invites",
+            "users",
+            "peers_shared",
+            "admins",
+            "removed_entities",
+            "secret_shared",
+            "trust_anchors",
         ];
         let excluded_tables = [
-            "valid_events", "rejected_events", "blocked_event_deps", "blocked_events",
-            "project_queue", "egress_queue",
-            "peer_endpoint_observations", "intro_attempts",
-            "peer_transport_bindings", "invite_bootstrap_trust",
-            "pending_invite_bootstrap_trust", "local_transport_creds",
-            "file_slice_guard_blocks", "neg_items",
-            "events", "recorded_events",
+            "valid_events",
+            "rejected_events",
+            "blocked_event_deps",
+            "blocked_events",
+            "project_queue",
+            "egress_queue",
+            "peer_endpoint_observations",
+            "intro_attempts",
+            "peer_transport_bindings",
+            "invite_bootstrap_trust",
+            "pending_invite_bootstrap_trust",
+            "local_transport_creds",
+            "file_slice_guard_blocks",
+            "neg_items",
+            "events",
+            "recorded_events",
         ];
 
         let table_names: Vec<&str> = FINGERPRINT_TABLES.iter().map(|t| t.name).collect();
 
         for expected in &projection_tables {
-            assert!(table_names.contains(expected),
-                "projection table '{}' must be in FINGERPRINT_TABLES", expected);
+            assert!(
+                table_names.contains(expected),
+                "projection table '{}' must be in FINGERPRINT_TABLES",
+                expected
+            );
         }
         for excluded in &excluded_tables {
-            assert!(!table_names.contains(excluded),
-                "operational table '{}' must NOT be in FINGERPRINT_TABLES", excluded);
+            assert!(
+                !table_names.contains(excluded),
+                "operational table '{}' must NOT be in FINGERPRINT_TABLES",
+                excluded
+            );
         }
     }
 }

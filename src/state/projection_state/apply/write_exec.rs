@@ -83,11 +83,13 @@ pub(crate) fn execute_emit_commands(
                 // Only attempt if the event exists and is not yet in a terminal state
                 // (the workspace event may arrive later, in which case it will project
                 // normally since the trust anchor is already set).
-                let exists: bool = conn.query_row(
-                    "SELECT COUNT(*) > 0 FROM events WHERE event_id = ?1",
-                    rusqlite::params![workspace_id],
-                    |row| row.get(0),
-                ).unwrap_or(false);
+                let exists: bool = conn
+                    .query_row(
+                        "SELECT COUNT(*) > 0 FROM events WHERE event_id = ?1",
+                        rusqlite::params![workspace_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(false);
                 if exists {
                     if let Some(event_id) = event_id_from_base64(workspace_id) {
                         let _ = super::project_one(conn, recorded_by, &event_id)?;

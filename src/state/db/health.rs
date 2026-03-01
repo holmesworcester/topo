@@ -1,4 +1,4 @@
-use rusqlite::{Connection, Result as SqliteResult, params};
+use rusqlite::{params, Connection, Result as SqliteResult};
 
 pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
     conn.execute_batch(
@@ -52,7 +52,14 @@ pub fn record_endpoint_observation(
         "INSERT OR IGNORE INTO peer_endpoint_observations
          (recorded_by, via_peer_id, origin_ip, origin_port, observed_at, expires_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![recorded_by, via_peer_id, origin_ip, origin_port as i64, observed_at_ms, observed_at_ms + ttl_ms],
+        params![
+            recorded_by,
+            via_peer_id,
+            origin_ip,
+            origin_port as i64,
+            observed_at_ms,
+            observed_at_ms + ttl_ms
+        ],
     )?;
     Ok(())
 }
@@ -106,22 +113,27 @@ mod tests {
              (recorded_by, via_peer_id, origin_ip, origin_port, observed_at, expires_at)
              VALUES ('me', 'peer1', '1.2.3.4', 5000, 1000, 2000)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO peer_endpoint_observations
              (recorded_by, via_peer_id, origin_ip, origin_port, observed_at, expires_at)
              VALUES ('me', 'peer2', '5.6.7.8', 6000, 1000, 3000)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Purge with cutoff at 2500 — first should be deleted, second kept
         let purged = purge_expired_endpoints(&conn, 2500).unwrap();
         assert_eq!(purged, 1);
 
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM peer_endpoint_observations",
-            [], |row| row.get(0),
-        ).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM peer_endpoint_observations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 1);
     }
 
@@ -135,22 +147,27 @@ mod tests {
              (recorded_by, via_peer_id, origin_ip, origin_port, observed_at, expires_at)
              VALUES ('me', 'peer1', '1.2.3.4', 5000, 1000, 999999999)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO peer_endpoint_observations
              (recorded_by, via_peer_id, origin_ip, origin_port, observed_at, expires_at)
              VALUES ('me', 'peer2', '5.6.7.8', 6000, 2000, 999999999)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Purge with current-ish cutoff — nothing should be deleted
         let purged = purge_expired_endpoints(&conn, 100000).unwrap();
         assert_eq!(purged, 0);
 
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM peer_endpoint_observations",
-            [], |row| row.get(0),
-        ).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM peer_endpoint_observations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 2);
     }
 
@@ -164,7 +181,8 @@ mod tests {
              (recorded_by, via_peer_id, origin_ip, origin_port, observed_at, expires_at)
              VALUES ('me', 'peer1', '1.2.3.4', 5000, 1000, 2000)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Purge at exactly 2000 — should delete (expires_at <= now)
         let purged = purge_expired_endpoints(&conn, 2000).unwrap();
@@ -175,18 +193,25 @@ mod tests {
     fn test_record_endpoint_observation() {
         let conn = setup();
 
-        record_endpoint_observation(&conn, "me", "peer1", "10.0.0.1", 4433, 5000, 86400000).unwrap();
+        record_endpoint_observation(&conn, "me", "peer1", "10.0.0.1", 4433, 5000, 86400000)
+            .unwrap();
 
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM peer_endpoint_observations WHERE via_peer_id = 'peer1'",
-            [], |row| row.get(0),
-        ).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM peer_endpoint_observations WHERE via_peer_id = 'peer1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 1);
 
-        let expires_at: i64 = conn.query_row(
-            "SELECT expires_at FROM peer_endpoint_observations WHERE via_peer_id = 'peer1'",
-            [], |row| row.get(0),
-        ).unwrap();
+        let expires_at: i64 = conn
+            .query_row(
+                "SELECT expires_at FROM peer_endpoint_observations WHERE via_peer_id = 'peer1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(expires_at, 5000 + 86400000);
     }
 }

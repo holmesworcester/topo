@@ -9,6 +9,7 @@ pub mod peering_boundary;
 pub mod session_factory;
 pub mod transport_session_io;
 
+pub use crate::crypto::AllowedPeers;
 pub use cert::{
     extract_spki_fingerprint, generate_keypair, generate_self_signed_cert,
     generate_self_signed_cert_from_signing_key, validate_cert_key_match,
@@ -16,16 +17,15 @@ pub use cert::{
 pub use connection::{DualConnection, StreamConn, StreamRecv, StreamSend};
 pub use connection_lifecycle::{accept_peer, dial_peer, ConnectedPeer, ConnectionLifecycleError};
 pub use peering_boundary::{
-    accept_session_peer, accept_session_provider, build_tenant_client_config_from_creds,
-    build_tenant_bootstrap_fallback_client_config_from_db, build_tenant_client_config_from_db,
-    create_runtime_endpoint_for_tenants, dial_session_peer, dial_session_provider,
-    open_inbound_session, open_outbound_session, outbound_session_provider_for_connection,
-    read_intro_offer_frame, resolve_trusting_tenant, send_intro_offer_frame, tenant_trusts_peer,
-    SessionEnvelope, SessionProvider, TenantClientConfigs, TransportClientConfig,
-    TransportConnection, TransportEndpoint,
+    accept_session_peer, accept_session_provider,
+    build_tenant_bootstrap_fallback_client_config_from_db, build_tenant_client_config_from_creds,
+    build_tenant_client_config_from_db, create_runtime_endpoint_for_tenants, dial_session_peer,
+    dial_session_provider, open_inbound_session, open_outbound_session,
+    outbound_session_provider_for_connection, read_intro_offer_frame, resolve_trusting_tenant,
+    send_intro_offer_frame, tenant_trusts_peer, SessionEnvelope, SessionProvider,
+    TenantClientConfigs, TransportClientConfig, TransportConnection, TransportEndpoint,
 };
 pub use transport_session_io::{QuicTransportSessionIo, DEFAULT_SYNC_FRAME_MAX_BYTES};
-pub use crate::crypto::AllowedPeers;
 
 use quinn::{ClientConfig, Endpoint, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};

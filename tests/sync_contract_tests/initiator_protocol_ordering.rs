@@ -8,12 +8,12 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use topo::contracts::peering_contract::{SessionDirection, SessionHandler};
-use topo::sync::session_handler::SyncSessionHandler;
 use topo::protocol::Frame;
+use topo::sync::session_handler::SyncSessionHandler;
 
 use crate::fake_session_io::{
-    create_test_db, empty_negentropy_storage, fake_session_io_pair, noop_ingest_tx,
-    run_local, test_session_meta, FakePeerSide,
+    create_test_db, empty_negentropy_storage, fake_session_io_pair, noop_ingest_tx, run_local,
+    test_session_meta, FakePeerSide,
 };
 
 /// Drive the responder side of an empty-DB sync from the test harness.
@@ -53,11 +53,8 @@ async fn drive_empty_responder(peer: &mut FakePeerSide) {
     // 3. Respond with NegMsg to complete reconciliation.
     if let Frame::NegOpen { msg } = neg_open {
         let storage = empty_negentropy_storage();
-        let mut neg = negentropy::Negentropy::new(
-            negentropy::Storage::Borrowed(&storage),
-            0,
-        )
-        .unwrap();
+        let mut neg =
+            negentropy::Negentropy::new(negentropy::Storage::Borrowed(&storage), 0).unwrap();
         let response = neg.reconcile(&msg).unwrap();
         peer.send_control_msg(&Frame::NegMsg { msg: response })
             .await;
@@ -98,11 +95,7 @@ async fn initiator_outbound_sends_markers_then_negopen_then_done_sequence() {
 
         let handler_task = tokio::task::spawn_local({
             let cancel = cancel.clone();
-            async move {
-                handler
-                    .on_session(meta, Box::new(fake_io), cancel)
-                    .await
-            }
+            async move { handler.on_session(meta, Box::new(fake_io), cancel).await }
         });
 
         drive_empty_responder(&mut peer).await;
@@ -194,11 +187,8 @@ async fn anticheat_datadone_before_done() {
             .unwrap();
         if let Frame::NegOpen { msg } = neg_open {
             let storage = empty_negentropy_storage();
-            let mut neg = negentropy::Negentropy::new(
-                negentropy::Storage::Borrowed(&storage),
-                0,
-            )
-            .unwrap();
+            let mut neg =
+                negentropy::Negentropy::new(negentropy::Storage::Borrowed(&storage), 0).unwrap();
             let response = neg.reconcile(&msg).unwrap();
             peer.send_control_msg(&Frame::NegMsg { msg: response })
                 .await;
@@ -220,11 +210,7 @@ async fn anticheat_datadone_before_done() {
             .recv_control_msg_timeout(Duration::from_secs(5))
             .await
             .expect("expected Done on control stream");
-        assert_eq!(
-            done,
-            Frame::Done,
-            "ANTI-CHEAT: Done must follow DataDone"
-        );
+        assert_eq!(done, Frame::Done, "ANTI-CHEAT: Done must follow DataDone");
 
         // Send completion
         peer.send_data_msg(&Frame::DataDone).await;
@@ -250,9 +236,7 @@ async fn initiator_rejects_inbound_direction() {
 
         let (fake_io, _peer) = fake_session_io_pair(meta.session_id);
 
-        let result = handler
-            .on_session(meta, Box::new(fake_io), cancel)
-            .await;
+        let result = handler.on_session(meta, Box::new(fake_io), cancel).await;
         assert!(result.is_err());
         assert!(
             result

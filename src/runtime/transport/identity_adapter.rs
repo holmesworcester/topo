@@ -35,7 +35,7 @@ impl TransportIdentityAdapter for ConcreteTransportIdentityAdapter {
                     conn,
                     &signing_key,
                 )
-                    .map_err(|e| TransportIdentityError::InstallFailed(e.to_string()))
+                .map_err(|e| TransportIdentityError::InstallFailed(e.to_string()))
             }
             TransportIdentityIntent::InstallPeerSharedIdentityFromSigner {
                 recorded_by,
@@ -101,9 +101,11 @@ mod tests {
         assert!(result.is_ok(), "bootstrap install should succeed");
 
         let source: String = conn
-            .query_row("SELECT source FROM local_transport_creds LIMIT 1", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT source FROM local_transport_creds LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(source, "bootstrap");
     }

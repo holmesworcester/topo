@@ -1,19 +1,16 @@
-pub mod wire;
-pub mod projector;
 pub mod commands;
+pub mod projector;
 pub mod queries;
+pub mod wire;
 
 // Re-export stable public API so callers import from `event_modules::message_deletion`.
-pub use wire::{
-    MessageDeletionEvent,
-    parse_message_deletion,
-    encode_message_deletion,
-    MESSAGE_DELETION_WIRE_SIZE,
-    MESSAGE_DELETION_META,
-};
-pub use commands::{CreateMessageDeletionCmd, create, delete_message};
-pub use queries::list_deleted_ids;
+pub use commands::{create, delete_message, CreateMessageDeletionCmd};
 pub use projector::project_pure;
+pub use queries::list_deleted_ids;
+pub use wire::{
+    encode_message_deletion, parse_message_deletion, MessageDeletionEvent, MESSAGE_DELETION_META,
+    MESSAGE_DELETION_WIRE_SIZE,
+};
 
 use rusqlite::Connection;
 

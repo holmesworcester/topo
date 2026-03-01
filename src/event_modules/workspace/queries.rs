@@ -28,10 +28,7 @@ pub struct WorkspaceRow {
     pub workspace_id: String,
 }
 
-pub fn list(
-    db: &Connection,
-    recorded_by: &str,
-) -> Result<Vec<WorkspaceRow>, rusqlite::Error> {
+pub fn list(db: &Connection, recorded_by: &str) -> Result<Vec<WorkspaceRow>, rusqlite::Error> {
     let mut stmt =
         db.prepare("SELECT event_id, workspace_id FROM workspaces WHERE recorded_by = ?1")?;
     let rows = stmt
@@ -46,10 +43,7 @@ pub fn list(
 }
 
 /// Return the workspace display name for the first workspace, or empty string.
-pub fn name(
-    db: &Connection,
-    recorded_by: &str,
-) -> Result<String, rusqlite::Error> {
+pub fn name(db: &Connection, recorded_by: &str) -> Result<String, rusqlite::Error> {
     use rusqlite::OptionalExtension;
     Ok(db
         .query_row(
@@ -110,10 +104,7 @@ pub struct StatusResponse {
 }
 
 /// Query workspace status counts.
-pub fn status(
-    db: &Connection,
-    recorded_by: &str,
-) -> StatusResponse {
+pub fn status(db: &Connection, recorded_by: &str) -> StatusResponse {
     let events_count: i64 = db
         .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
         .unwrap_or(0);

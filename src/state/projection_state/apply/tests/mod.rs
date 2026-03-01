@@ -1378,7 +1378,7 @@ fn test_encrypted_inner_type_mismatch_rejects() {
 
 #[test]
 fn test_encrypted_nested_rejects() {
-    use crate::event_modules::layout::common::{ENCRYPTED_HEADER_BYTES, ENCRYPTED_AUTH_TAG_BYTES};
+    use crate::event_modules::layout::common::{ENCRYPTED_AUTH_TAG_BYTES, ENCRYPTED_HEADER_BYTES};
 
     let conn = setup();
     let recorded_by = "peer1";
@@ -1398,9 +1398,7 @@ fn test_encrypted_nested_rejects() {
 
     // Manually build an outer encrypted blob with inner_type_code=5
     let (nonce, raw_ct, auth_tag) = encrypt_event_blob(&key_bytes, &inner_enc_blob).unwrap();
-    let total = ENCRYPTED_HEADER_BYTES
-        + raw_ct.len()
-        + ENCRYPTED_AUTH_TAG_BYTES;
+    let total = ENCRYPTED_HEADER_BYTES + raw_ct.len() + ENCRYPTED_AUTH_TAG_BYTES;
     let mut buf = vec![0u8; total];
     buf[0] = EVENT_TYPE_ENCRYPTED;
     buf[1..9].copy_from_slice(&now_ms().to_le_bytes());
@@ -4973,8 +4971,7 @@ fn test_invite_accepted_materializes_bootstrap_trust_from_projection() {
 
     // The bootstrap address must be queryable via list_active_invite_bootstrap_addrs
     let addrs =
-        crate::db::transport_trust::list_active_invite_bootstrap_addrs(&conn, recorded_by)
-            .unwrap();
+        crate::db::transport_trust::list_active_invite_bootstrap_addrs(&conn, recorded_by).unwrap();
     assert_eq!(addrs.len(), 1, "must have one active bootstrap addr");
     assert_eq!(addrs[0], bootstrap_addr, "bootstrap addr must match");
 
@@ -5115,9 +5112,12 @@ fn test_full_bootstrap_progression_from_projected_sql_state() {
 
     // Verify trust materialized
     let addrs =
-        crate::db::transport_trust::list_active_invite_bootstrap_addrs(&conn, recorded_by)
-            .unwrap();
-    assert_eq!(addrs.len(), 1, "bootstrap addr must be available for autodial");
+        crate::db::transport_trust::list_active_invite_bootstrap_addrs(&conn, recorded_by).unwrap();
+    assert_eq!(
+        addrs.len(),
+        1,
+        "bootstrap addr must be available for autodial"
+    );
 
     // Step 2: Workspace arrives via sync (simulating what autodial would fetch)
     insert_event_raw(&conn, recorded_by, &ws_blob);
@@ -5271,8 +5271,7 @@ fn test_bootstrap_trust_superseded_by_matching_peer_shared() {
 
     // Bootstrap addr must appear in autodial list
     let addrs_before =
-        crate::db::transport_trust::list_active_invite_bootstrap_addrs(&conn, recorded_by)
-            .unwrap();
+        crate::db::transport_trust::list_active_invite_bootstrap_addrs(&conn, recorded_by).unwrap();
     assert_eq!(addrs_before.len(), 1);
 
     // Now build and project a full identity chain with PeerShared whose public_key
@@ -5336,8 +5335,7 @@ fn test_bootstrap_trust_superseded_by_matching_peer_shared() {
 
     // Bootstrap addr must be gone from autodial list (superseded)
     let addrs_after =
-        crate::db::transport_trust::list_active_invite_bootstrap_addrs(&conn, recorded_by)
-            .unwrap();
+        crate::db::transport_trust::list_active_invite_bootstrap_addrs(&conn, recorded_by).unwrap();
     assert_eq!(
         addrs_after.len(),
         0,

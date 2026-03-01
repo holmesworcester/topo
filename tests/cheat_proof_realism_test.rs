@@ -312,10 +312,7 @@ fn test_daemon_cli_invite_lifecycle_works_without_restart() {
     let _alice = Daemon::start(&alice_db, alice_port);
 
     // Create invite while Alice's daemon is running (via RPC).
-    let invite_link = topo_create_invite(
-        &alice_db,
-        &format!("127.0.0.1:{}", alice_port),
-    );
+    let invite_link = topo_create_invite(&alice_db, &format!("127.0.0.1:{}", alice_port));
 
     // Bob accepts invite before starting daemon (daemon-routed CLI command).
     topo_accept_invite(&bob_db, &invite_link);

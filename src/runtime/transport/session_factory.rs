@@ -72,9 +72,13 @@ mod tests {
 
     use super::{accept_session_io, open_session_io};
 
-    async fn connected_pair(
-    ) -> Result<
-        (quinn::Endpoint, quinn::Connection, quinn::Endpoint, quinn::Connection),
+    async fn connected_pair() -> Result<
+        (
+            quinn::Endpoint,
+            quinn::Connection,
+            quinn::Endpoint,
+            quinn::Connection,
+        ),
         Box<dyn std::error::Error + Send + Sync>,
     > {
         let (server_cert, server_key) = generate_self_signed_cert()?;
@@ -140,8 +144,9 @@ mod tests {
             Ok::<(), String>(())
         });
 
-        let (client_session_id, client_io) =
-            open_session_io(&client_conn).await.expect("open_session_io");
+        let (client_session_id, client_io) = open_session_io(&client_conn)
+            .await
+            .expect("open_session_io");
         assert!(client_session_id > 0);
         let mut parts = client_io.split();
         let marker = encode_frame(&Frame::HaveList { ids: vec![] });
@@ -182,12 +187,17 @@ mod tests {
             .await
             .expect("write data marker");
 
-        let (server_session_id, server_io) =
-            accept_session_io(&server_conn).await.expect("accept_session_io");
+        let (server_session_id, server_io) = accept_session_io(&server_conn)
+            .await
+            .expect("accept_session_io");
         assert!(server_session_id > 0);
 
         let mut server_parts = server_io.split();
-        let recv = server_parts.control.recv().await.expect("recv control frame");
+        let recv = server_parts
+            .control
+            .recv()
+            .await
+            .expect("recv control frame");
         let (parsed, consumed) = parse_frame(&recv).expect("parse recv frame");
         assert_eq!(consumed, recv.len());
         match parsed {

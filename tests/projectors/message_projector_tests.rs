@@ -6,9 +6,9 @@
 
 #[cfg(test)]
 mod tests {
+    use crate::harness::fixtures::*;
     use topo::event_modules::message::project_pure;
     use topo::event_modules::message::MessageEvent;
-    use crate::harness::fixtures::*;
     use topo::event_modules::ParsedEvent;
     use topo::projection::result::DeletionIntentInfo;
 

@@ -174,8 +174,10 @@ mod tests {
         let fp_direct = spki_fingerprint_from_ed25519_pubkey(&pubkey);
         let (cert, _) = generate_self_signed_cert_from_signing_key(&key).unwrap();
         let fp_cert = extract_spki_fingerprint(cert.as_ref()).unwrap();
-        assert_eq!(fp_direct, fp_cert,
-            "direct pubkey SPKI fingerprint must match cert-derived fingerprint");
+        assert_eq!(
+            fp_direct, fp_cert,
+            "direct pubkey SPKI fingerprint must match cert-derived fingerprint"
+        );
     }
 
     #[test]
@@ -183,8 +185,15 @@ mod tests {
         let (cert1, _) = generate_self_signed_cert().unwrap();
         let (_, key2) = generate_self_signed_cert().unwrap();
         let result = validate_cert_key_match(&cert1, &key2);
-        assert!(result.is_err(), "expected error for mismatched cert/key pair");
+        assert!(
+            result.is_err(),
+            "expected error for mismatched cert/key pair"
+        );
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("cert/key mismatch"), "error should mention mismatch: {}", err);
+        assert!(
+            err.contains("cert/key mismatch"),
+            "error should mention mismatch: {}",
+            err
+        );
     }
 }

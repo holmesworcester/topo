@@ -15,8 +15,8 @@ pub mod offsets {
     pub const AUTHOR_ID: usize = 41;
     pub const CONTENT: usize = 73;
     pub const SIGNED_BY: usize = 73 + super::MESSAGE_CONTENT_BYTES; // 1097
-    pub const SIGNER_TYPE: usize = SIGNED_BY + 32;                   // 1129
-    pub const SIGNATURE: usize = SIGNER_TYPE + 1;                    // 1130
+    pub const SIGNER_TYPE: usize = SIGNED_BY + 32; // 1129
+    pub const SIGNATURE: usize = SIGNER_TYPE + 1; // 1130
 }
 
 #[cfg(test)]

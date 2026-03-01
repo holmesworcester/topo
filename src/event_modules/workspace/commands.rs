@@ -116,9 +116,10 @@ pub fn create_workspace(
         rusqlite::params![recorded_by],
         |row| row.get(0),
     )?;
-    let creds_count: i64 = db.query_row("SELECT COUNT(*) FROM local_transport_creds", [], |row| {
-        row.get(0)
-    })?;
+    let creds_count: i64 =
+        db.query_row("SELECT COUNT(*) FROM local_transport_creds", [], |row| {
+            row.get(0)
+        })?;
     if !known_tenant && creds_count > 0 {
         return Err(format!(
             "create_workspace requires scoped tenant identity; recorded_by {} has no local transport creds",
@@ -1177,10 +1178,7 @@ mod tests {
             !resp.workspace_id.is_empty(),
             "workspace id should be populated"
         );
-        assert!(
-            !resp.peer_id.is_empty(),
-            "peer id should be populated"
-        );
+        assert!(!resp.peer_id.is_empty(), "peer id should be populated");
 
         // Resulting transport identity should be the active local identity after create.
         let conn2 = crate::db::open_connection(&db_path).expect("re-open db");

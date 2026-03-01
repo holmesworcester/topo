@@ -3,8 +3,8 @@ use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 
-use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
 use super::identity_ops::{InviteData, InviteType};
+use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
 
 const INVITE_PREFIX: &str = "quiet://invite/";
 const LINK_PREFIX: &str = "quiet://link/";
@@ -82,14 +82,11 @@ pub fn parse_bootstrap_address(bootstrap_addr: &str) -> Result<BootstrapAddress,
         });
     }
 
-    let (host_raw, port_raw) =
-        bootstrap_addr
-            .rsplit_once(':')
-            .ok_or_else(|| {
-                InviteLinkError::InvalidPayload(
-                    "bootstrap_addr must be host:port (IPv6 must be [addr]:port)".to_string(),
-                )
-            })?;
+    let (host_raw, port_raw) = bootstrap_addr.rsplit_once(':').ok_or_else(|| {
+        InviteLinkError::InvalidPayload(
+            "bootstrap_addr must be host:port (IPv6 must be [addr]:port)".to_string(),
+        )
+    })?;
     let port: u16 = port_raw.parse().map_err(|_| {
         InviteLinkError::InvalidPayload(format!("invalid bootstrap port '{}'", port_raw))
     })?;
@@ -203,8 +200,8 @@ pub fn parse_invite_link(link: &str) -> Result<ParsedInviteLink, InviteLinkError
     let payload_json = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(code)
         .map_err(|e| InviteLinkError::Decode(e.to_string()))?;
-    let payload: InviteLinkPayload =
-        serde_json::from_slice(&payload_json).map_err(|e| InviteLinkError::Decode(e.to_string()))?;
+    let payload: InviteLinkPayload = serde_json::from_slice(&payload_json)
+        .map_err(|e| InviteLinkError::Decode(e.to_string()))?;
     let InviteLinkPayload {
         version,
         kind: payload_kind,
@@ -240,7 +237,8 @@ pub fn parse_invite_link(link: &str) -> Result<ParsedInviteLink, InviteLinkError
     let mut invite_private_key = [0u8; 32];
     invite_private_key.copy_from_slice(&key_bytes);
 
-    let spki_bytes = hex::decode(bootstrap_spki).map_err(|e| InviteLinkError::Decode(e.to_string()))?;
+    let spki_bytes =
+        hex::decode(bootstrap_spki).map_err(|e| InviteLinkError::Decode(e.to_string()))?;
     if spki_bytes.len() != 32 {
         return Err(InviteLinkError::InvalidPayload(format!(
             "bootstrap_spki must be 32 bytes, got {}",
@@ -291,10 +289,7 @@ pub fn parse_invite_link(link: &str) -> Result<ParsedInviteLink, InviteLinkError
 
 /// Re-encode an invite link with a different bootstrap address.
 /// Decodes the payload, swaps the bootstrap_addr, and re-encodes.
-pub fn rewrite_bootstrap_addr(
-    link: &str,
-    new_addr: &str,
-) -> Result<String, InviteLinkError> {
+pub fn rewrite_bootstrap_addr(link: &str, new_addr: &str) -> Result<String, InviteLinkError> {
     let (prefix, code) = if let Some(code) = link.strip_prefix(INVITE_PREFIX) {
         (INVITE_PREFIX, code)
     } else if let Some(code) = link.strip_prefix(LINK_PREFIX) {
@@ -397,8 +392,8 @@ mod tests {
             invite_type: InviteType::User,
         };
         let bootstrap_spki = [14u8; 32];
-        let link = create_invite_link(&invite, "[2001:4860:4860::8888]:4433", &bootstrap_spki)
-            .unwrap();
+        let link =
+            create_invite_link(&invite, "[2001:4860:4860::8888]:4433", &bootstrap_spki).unwrap();
         let parsed = parse_invite_link(&link).unwrap();
         assert_eq!(parsed.bootstrap_addr, "[2001:4860:4860::8888]:4433");
         assert_eq!(

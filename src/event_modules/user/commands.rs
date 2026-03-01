@@ -1,15 +1,15 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::crypto::EventId;
-use crate::event_modules::user_removed::{UserRemovedEvent, CreateUserRemovedCmd};
+use crate::event_modules::user_removed::{CreateUserRemovedCmd, UserRemovedEvent};
 use crate::projection::create::create_signed_event_sync;
 use crate::service::open_db_for_peer;
 use ed25519_dalek::SigningKey;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
-use super::super::ParsedEvent;
 use super::super::peer_shared;
+use super::super::ParsedEvent;
 
 fn current_timestamp_ms() -> u64 {
     SystemTime::now()
@@ -47,9 +47,14 @@ pub fn remove_user(
     target_event_id: EventId,
 ) -> Result<String, String> {
     create_user_removed(
-        db, recorded_by, signer_eid, signing_key, created_at_ms,
+        db,
+        recorded_by,
+        signer_eid,
+        signing_key,
+        created_at_ms,
         CreateUserRemovedCmd { target_event_id },
-    ).map_err(|e| format!("{}", e))?;
+    )
+    .map_err(|e| format!("{}", e))?;
 
     Ok(hex::encode(target_event_id))
 }
@@ -78,36 +83,28 @@ pub fn ban_for_peer(
     let target_event_id = if let Ok(num) = target_selector.parse::<usize>() {
         let users = super::list_items(&db, peer_id)?;
         if num == 0 || num > users.len() {
-            return Err(format!(
-                "Invalid user number {}. Available: 1-{}",
-                num,
-                users.len()
-            )
-            .into());
+            return Err(
+                format!("Invalid user number {}. Available: 1-{}", num, users.len()).into(),
+            );
         }
-        crate::crypto::event_id_from_base64(&users[num - 1].event_id)
-            .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
-                "Invalid event ID for user".into()
-            })?
+        crate::crypto::event_id_from_base64(&users[num - 1].event_id).ok_or_else(
+            || -> Box<dyn std::error::Error + Send + Sync> { "Invalid event ID for user".into() },
+        )?
     } else if target_selector.starts_with('#') {
-        let num: usize = target_selector[1..]
-            .parse()
-            .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
+        let num: usize = target_selector[1..].parse().map_err(
+            |_| -> Box<dyn std::error::Error + Send + Sync> {
                 format!("Invalid user ref: {}", target_selector).into()
-            })?;
+            },
+        )?;
         let users = super::list_items(&db, peer_id)?;
         if num == 0 || num > users.len() {
-            return Err(format!(
-                "Invalid user number {}. Available: 1-{}",
-                num,
-                users.len()
-            )
-            .into());
+            return Err(
+                format!("Invalid user number {}. Available: 1-{}", num, users.len()).into(),
+            );
         }
-        crate::crypto::event_id_from_base64(&users[num - 1].event_id)
-            .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
-                "Invalid event ID for user".into()
-            })?
+        crate::crypto::event_id_from_base64(&users[num - 1].event_id).ok_or_else(
+            || -> Box<dyn std::error::Error + Send + Sync> { "Invalid event ID for user".into() },
+        )?
     } else {
         // Hex event ID
         let bytes = hex::decode(target_selector)?;

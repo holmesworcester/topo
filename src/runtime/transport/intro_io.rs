@@ -43,9 +43,13 @@ mod tests {
 
     use super::accept_and_read_intro;
 
-    async fn connected_pair(
-    ) -> Result<
-        (quinn::Endpoint, quinn::Connection, quinn::Endpoint, quinn::Connection),
+    async fn connected_pair() -> Result<
+        (
+            quinn::Endpoint,
+            quinn::Connection,
+            quinn::Endpoint,
+            quinn::Connection,
+        ),
         Box<dyn std::error::Error + Send + Sync>,
     > {
         let (server_cert, server_key) = generate_self_signed_cert()?;

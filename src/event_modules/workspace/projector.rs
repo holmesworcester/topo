@@ -27,19 +27,23 @@ pub fn project_pure(
         }
         Some(anchor_wid) if anchor_wid == &workspace_id_b64 => {
             // Trust anchor matches — project
-            let ops = vec![
-                WriteOp::InsertOrIgnore {
-                    table: "workspaces",
-                    columns: vec!["recorded_by", "event_id", "workspace_id", "public_key", "name"],
-                    values: vec![
-                        SqlVal::Text(recorded_by.to_string()),
-                        SqlVal::Text(event_id_b64.to_string()),
-                        SqlVal::Text(workspace_id_b64),
-                        SqlVal::Blob(ws.public_key.to_vec()),
-                        SqlVal::Text(ws.name.clone()),
-                    ],
-                },
-            ];
+            let ops = vec![WriteOp::InsertOrIgnore {
+                table: "workspaces",
+                columns: vec![
+                    "recorded_by",
+                    "event_id",
+                    "workspace_id",
+                    "public_key",
+                    "name",
+                ],
+                values: vec![
+                    SqlVal::Text(recorded_by.to_string()),
+                    SqlVal::Text(event_id_b64.to_string()),
+                    SqlVal::Text(workspace_id_b64),
+                    SqlVal::Blob(ws.public_key.to_vec()),
+                    SqlVal::Text(ws.name.clone()),
+                ],
+            }];
             ProjectorResult::valid(ops)
         }
         Some(_) => {

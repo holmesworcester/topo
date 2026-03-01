@@ -181,7 +181,10 @@ impl DaemonState {
     /// Get the active channel for a peer, defaulting to "general".
     pub fn active_channel_for_peer(&self, peer_id: &str) -> [u8; 32] {
         let active = self.active_channel.read().unwrap();
-        active.get(peer_id).copied().unwrap_or_else(default_channel_id)
+        active
+            .get(peer_id)
+            .copied()
+            .unwrap_or_else(default_channel_id)
     }
 
     /// Set the active channel for a peer.
@@ -319,7 +322,9 @@ fn handle_connection(
 }
 
 #[allow(dead_code)] // used by tests; will be called when auto-UPnP bootstrap is re-enabled
-fn resolve_bootstrap_from_upnp(upnp: &crate::peering::nat::upnp::UpnpMappingReport) -> Result<String, String> {
+fn resolve_bootstrap_from_upnp(
+    upnp: &crate::peering::nat::upnp::UpnpMappingReport,
+) -> Result<String, String> {
     if upnp.status != crate::peering::nat::upnp::UpnpMappingStatus::Success {
         let status = match &upnp.status {
             crate::peering::nat::upnp::UpnpMappingStatus::Success => "success",
@@ -439,8 +444,17 @@ fn dispatch(
             }
         }
 
-        RpcMethod::CreateWorkspace { workspace_name, username, device_name } => {
-            match workspace::commands::create_workspace_for_db(db_path, &workspace_name, &username, &device_name) {
+        RpcMethod::CreateWorkspace {
+            workspace_name,
+            username,
+            device_name,
+        } => {
+            match workspace::commands::create_workspace_for_db(
+                db_path,
+                &workspace_name,
+                &username,
+                &device_name,
+            ) {
                 Ok(resp) => {
                     // Auto-select newly created peer if none active
                     let mut ap = state.active_peer.write().unwrap();
@@ -485,23 +499,19 @@ fn dispatch(
         },
 
         // ----- Read-only commands (call event modules directly) -----
-        RpcMethod::TransportIdentity => {
-            match service::open_db_load(db_path) {
-                Ok((fingerprint, _db)) => RpcResponse::success(
-                    service::TransportIdentityResponse { fingerprint },
-                ),
-                Err(e) => RpcResponse::error(e.to_string()),
+        RpcMethod::TransportIdentity => match service::open_db_load(db_path) {
+            Ok((fingerprint, _db)) => {
+                RpcResponse::success(service::TransportIdentityResponse { fingerprint })
             }
-        }
-        RpcMethod::Messages { limit } => {
-            match service::open_db_load(db_path) {
-                Ok((recorded_by, db)) => match message::list(&db, &recorded_by, limit) {
-                    Ok(data) => RpcResponse::success(data),
-                    Err(e) => RpcResponse::error(e.to_string()),
-                },
+            Err(e) => RpcResponse::error(e.to_string()),
+        },
+        RpcMethod::Messages { limit } => match service::open_db_load(db_path) {
+            Ok((recorded_by, db)) => match message::list(&db, &recorded_by, limit) {
+                Ok(data) => RpcResponse::success(data),
                 Err(e) => RpcResponse::error(e.to_string()),
-            }
-        }
+            },
+            Err(e) => RpcResponse::error(e.to_string()),
+        },
         RpcMethod::Status => {
             let with_runtime_state = |data: workspace::StatusResponse| {
                 let mut json = serde_json::to_value(data).unwrap_or(serde_json::Value::Null);
@@ -538,104 +548,93 @@ fn dispatch(
                 },
             }
         }
-        RpcMethod::AssertNow { predicate } => {
-            match service::open_db_load(db_path) {
-                Ok((recorded_by, db)) => {
-                    match crate::assert::parse_predicate(&predicate) {
-                        Ok((field, op, expected)) => {
-                            match crate::assert::query_field(&db, &field, &recorded_by) {
-                                Ok(actual) => RpcResponse::success(crate::assert::AssertResponse {
-                                    pass: op.eval(actual, expected),
-                                    field,
-                                    actual,
-                                    op: op.symbol().to_string(),
-                                    expected,
-                                    timed_out: false,
-                                }),
-                                Err(e) => RpcResponse::error(e),
-                            }
-                        }
+        RpcMethod::AssertNow { predicate } => match service::open_db_load(db_path) {
+            Ok((recorded_by, db)) => match crate::assert::parse_predicate(&predicate) {
+                Ok((field, op, expected)) => {
+                    match crate::assert::query_field(&db, &field, &recorded_by) {
+                        Ok(actual) => RpcResponse::success(crate::assert::AssertResponse {
+                            pass: op.eval(actual, expected),
+                            field,
+                            actual,
+                            op: op.symbol().to_string(),
+                            expected,
+                            timed_out: false,
+                        }),
                         Err(e) => RpcResponse::error(e),
                     }
                 }
-                Err(e) => RpcResponse::error(e.to_string()),
-            }
-        }
+                Err(e) => RpcResponse::error(e),
+            },
+            Err(e) => RpcResponse::error(e.to_string()),
+        },
         RpcMethod::AssertEventually {
             predicate,
             timeout_ms,
             interval_ms,
-        } => {
-            match crate::assert::assert_eventually(db_path, &predicate, timeout_ms, interval_ms) {
+        } => match crate::assert::assert_eventually(db_path, &predicate, timeout_ms, interval_ms) {
+            Ok(data) => RpcResponse::success(data),
+            Err(e) => RpcResponse::error(e.to_string()),
+        },
+        RpcMethod::Reactions => match service::open_db_load(db_path) {
+            Ok((recorded_by, db)) => match reaction::list(&db, &recorded_by) {
                 Ok(data) => RpcResponse::success(data),
                 Err(e) => RpcResponse::error(e.to_string()),
-            }
-        }
-        RpcMethod::Reactions => {
-            match service::open_db_load(db_path) {
-                Ok((recorded_by, db)) => match reaction::list(&db, &recorded_by) {
-                    Ok(data) => RpcResponse::success(data),
-                    Err(e) => RpcResponse::error(e.to_string()),
-                },
+            },
+            Err(e) => RpcResponse::error(e.to_string()),
+        },
+        RpcMethod::Users => match service::open_db_load(db_path) {
+            Ok((recorded_by, db)) => match user::list_items(&db, &recorded_by) {
+                Ok(data) => RpcResponse::success(data),
                 Err(e) => RpcResponse::error(e.to_string()),
-            }
-        }
-        RpcMethod::Users => {
-            match service::open_db_load(db_path) {
-                Ok((recorded_by, db)) => match user::list_items(&db, &recorded_by) {
-                    Ok(data) => RpcResponse::success(data),
-                    Err(e) => RpcResponse::error(e.to_string()),
-                },
+            },
+            Err(e) => RpcResponse::error(e.to_string()),
+        },
+        RpcMethod::Keys { summary } => match service::open_db_load(db_path) {
+            Ok((recorded_by, db)) => match workspace::keys(&db, &recorded_by, summary) {
+                Ok(data) => RpcResponse::success(data),
                 Err(e) => RpcResponse::error(e.to_string()),
-            }
-        }
-        RpcMethod::Keys { summary } => {
-            match service::open_db_load(db_path) {
-                Ok((recorded_by, db)) => match workspace::keys(&db, &recorded_by, summary) {
-                    Ok(data) => RpcResponse::success(data),
-                    Err(e) => RpcResponse::error(e.to_string()),
-                },
+            },
+            Err(e) => RpcResponse::error(e.to_string()),
+        },
+        RpcMethod::Workspaces => match service::open_db_load(db_path) {
+            Ok((recorded_by, db)) => match workspace::list_items(&db, &recorded_by) {
+                Ok(data) => RpcResponse::success(data),
                 Err(e) => RpcResponse::error(e.to_string()),
-            }
-        }
-        RpcMethod::Workspaces => {
-            match service::open_db_load(db_path) {
-                Ok((recorded_by, db)) => match workspace::list_items(&db, &recorded_by) {
-                    Ok(data) => RpcResponse::success(data),
-                    Err(e) => RpcResponse::error(e.to_string()),
-                },
-                Err(e) => RpcResponse::error(e.to_string()),
-            }
-        }
-        RpcMethod::IntroAttempts { peer } => {
-            match service::open_db_load(db_path) {
-                Ok((recorded_by, db)) => {
-                    match crate::db::intro::list_intro_attempts(&db, &recorded_by, peer.as_deref()) {
-                        Ok(rows) => {
-                            let items: Vec<service::IntroAttemptItem> = rows
-                                .into_iter()
-                                .map(|r| service::IntroAttemptItem {
-                                    intro_id: hex::encode(&r.intro_id),
-                                    other_peer_id: r.other_peer_id,
-                                    introduced_by_peer_id: r.introduced_by_peer_id,
-                                    origin_ip: r.origin_ip,
-                                    origin_port: r.origin_port,
-                                    status: r.status,
-                                    error: r.error,
-                                    created_at: r.created_at,
-                                })
-                                .collect();
-                            RpcResponse::success(items)
-                        }
-                        Err(e) => RpcResponse::error(e.to_string()),
+            },
+            Err(e) => RpcResponse::error(e.to_string()),
+        },
+        RpcMethod::IntroAttempts { peer } => match service::open_db_load(db_path) {
+            Ok((recorded_by, db)) => {
+                match crate::db::intro::list_intro_attempts(&db, &recorded_by, peer.as_deref()) {
+                    Ok(rows) => {
+                        let items: Vec<service::IntroAttemptItem> = rows
+                            .into_iter()
+                            .map(|r| service::IntroAttemptItem {
+                                intro_id: hex::encode(&r.intro_id),
+                                other_peer_id: r.other_peer_id,
+                                introduced_by_peer_id: r.introduced_by_peer_id,
+                                origin_ip: r.origin_ip,
+                                origin_port: r.origin_port,
+                                status: r.status,
+                                error: r.error,
+                                created_at: r.created_at,
+                            })
+                            .collect();
+                        RpcResponse::success(items)
                     }
+                    Err(e) => RpcResponse::error(e.to_string()),
                 }
-                Err(e) => RpcResponse::error(e.to_string()),
             }
-        }
-        RpcMethod::CreateInvite { public_addr, public_spki } => {
+            Err(e) => RpcResponse::error(e.to_string()),
+        },
+        RpcMethod::CreateInvite {
+            public_addr,
+            public_spki,
+        } => {
             let result = match public_spki {
-                Some(ref spki) => workspace::commands::create_invite_with_spki(db_path, &public_addr, spki),
+                Some(ref spki) => {
+                    workspace::commands::create_invite_with_spki(db_path, &public_addr, spki)
+                }
                 None => workspace::commands::create_invite_for_db(db_path, &public_addr),
             };
             match result {
@@ -687,44 +686,41 @@ fn dispatch(
                 }
             }
         }
-        RpcMethod::CreateDeviceLink { public_addr, public_spki } => {
-            match state.require_active_peer() {
-                Ok(peer_id) => {
-                    match workspace::commands::create_device_link_for_peer(
-                        db_path,
-                        &peer_id,
-                        &public_addr,
-                        public_spki.as_deref(),
-                    ) {
-                        Ok(data) => {
-                            if let Some(link) = serde_json::to_value(&data)
-                                .ok()
-                                .and_then(|v| v["invite_link"].as_str().map(|s| s.to_string()))
-                            {
-                                let num = state.add_invite_ref(link);
-                                let mut resp_data = serde_json::to_value(&data).unwrap();
-                                resp_data["invite_ref"] = serde_json::json!(num);
-                                RpcResponse::success(resp_data)
-                            } else {
-                                RpcResponse::success(data)
-                            }
+        RpcMethod::CreateDeviceLink {
+            public_addr,
+            public_spki,
+        } => match state.require_active_peer() {
+            Ok(peer_id) => {
+                match workspace::commands::create_device_link_for_peer(
+                    db_path,
+                    &peer_id,
+                    &public_addr,
+                    public_spki.as_deref(),
+                ) {
+                    Ok(data) => {
+                        if let Some(link) = serde_json::to_value(&data)
+                            .ok()
+                            .and_then(|v| v["invite_link"].as_str().map(|s| s.to_string()))
+                        {
+                            let num = state.add_invite_ref(link);
+                            let mut resp_data = serde_json::to_value(&data).unwrap();
+                            resp_data["invite_ref"] = serde_json::json!(num);
+                            RpcResponse::success(resp_data)
+                        } else {
+                            RpcResponse::success(data)
                         }
-                        Err(e) => RpcResponse::error(e.to_string()),
                     }
+                    Err(e) => RpcResponse::error(e.to_string()),
                 }
-                Err(e) => RpcResponse::error(e),
             }
-        }
+            Err(e) => RpcResponse::error(e),
+        },
         RpcMethod::AcceptLink { invite, devicename } => {
             let resolved = match state.resolve_invite_ref(&invite) {
                 Ok(link) => link,
                 Err(e) => return RpcResponse::error(e),
             };
-            match workspace::commands::accept_device_link(
-                db_path,
-                &resolved,
-                &devicename,
-            ) {
+            match workspace::commands::accept_device_link(db_path, &resolved, &devicename) {
                 Ok(data) => {
                     // Auto-select if no active peer
                     let mut ap = state.active_peer.write().unwrap();
@@ -737,67 +733,53 @@ fn dispatch(
                 Err(e) => RpcResponse::error(e.to_string()),
             }
         }
-        RpcMethod::Ban { target } => {
-            match state.require_active_peer() {
-                Ok(peer_id) => {
-                    match user::ban_for_peer(db_path, &peer_id, &target) {
-                        Ok(data) => RpcResponse::success(data),
-                        Err(e) => RpcResponse::error(e.to_string()),
-                    }
-                }
-                Err(e) => RpcResponse::error(e),
-            }
-        }
-        RpcMethod::Identity => {
-            match state.require_active_peer() {
-                Ok(peer_id) => {
-                    match service::open_db_for_peer(db_path, &peer_id) {
-                        Ok((_recorded_by, db)) => {
-                            match peer_shared::identity(&db, &peer_id) {
-                                Ok(data) => RpcResponse::success(data),
-                                Err(e) => RpcResponse::error(e.to_string()),
-                            }
-                        }
-                        Err(e) => RpcResponse::error(e.to_string()),
-                    }
-                }
-                Err(e) => RpcResponse::error(e),
-            }
-        }
-        RpcMethod::Channels => {
-            match state.require_active_peer() {
-                Ok(peer_id) => {
-                    let channels = state.channels_for_peer(&peer_id);
-                    let active = state.active_channel_for_peer(&peer_id);
-                    let items: Vec<serde_json::Value> = channels
-                        .iter()
-                        .enumerate()
-                        .map(|(i, ch)| {
-                            serde_json::json!({
-                                "index": i + 1,
-                                "name": ch.name,
-                                "active": ch.channel_id == active,
-                            })
+        RpcMethod::Ban { target } => match state.require_active_peer() {
+            Ok(peer_id) => match user::ban_for_peer(db_path, &peer_id, &target) {
+                Ok(data) => RpcResponse::success(data),
+                Err(e) => RpcResponse::error(e.to_string()),
+            },
+            Err(e) => RpcResponse::error(e),
+        },
+        RpcMethod::Identity => match state.require_active_peer() {
+            Ok(peer_id) => match service::open_db_for_peer(db_path, &peer_id) {
+                Ok((_recorded_by, db)) => match peer_shared::identity(&db, &peer_id) {
+                    Ok(data) => RpcResponse::success(data),
+                    Err(e) => RpcResponse::error(e.to_string()),
+                },
+                Err(e) => RpcResponse::error(e.to_string()),
+            },
+            Err(e) => RpcResponse::error(e),
+        },
+        RpcMethod::Channels => match state.require_active_peer() {
+            Ok(peer_id) => {
+                let channels = state.channels_for_peer(&peer_id);
+                let active = state.active_channel_for_peer(&peer_id);
+                let items: Vec<serde_json::Value> = channels
+                    .iter()
+                    .enumerate()
+                    .map(|(i, ch)| {
+                        serde_json::json!({
+                            "index": i + 1,
+                            "name": ch.name,
+                            "active": ch.channel_id == active,
                         })
-                        .collect();
-                    RpcResponse::success(items)
-                }
-                Err(e) => RpcResponse::error(e),
+                    })
+                    .collect();
+                RpcResponse::success(items)
             }
-        }
-        RpcMethod::NewChannel { name } => {
-            match state.require_active_peer() {
-                Ok(peer_id) => {
-                    let (num, channel_id) = state.add_channel(&peer_id, &name);
-                    RpcResponse::success(serde_json::json!({
-                        "index": num,
-                        "name": name,
-                        "channel_id": hex::encode(channel_id),
-                    }))
-                }
-                Err(e) => RpcResponse::error(e),
+            Err(e) => RpcResponse::error(e),
+        },
+        RpcMethod::NewChannel { name } => match state.require_active_peer() {
+            Ok(peer_id) => {
+                let (num, channel_id) = state.add_channel(&peer_id, &name);
+                RpcResponse::success(serde_json::json!({
+                    "index": num,
+                    "name": name,
+                    "channel_id": hex::encode(channel_id),
+                }))
             }
-        }
+            Err(e) => RpcResponse::error(e),
+        },
         RpcMethod::UseChannel { selector } => {
             match state.require_active_peer() {
                 Ok(peer_id) => {
@@ -834,24 +816,17 @@ fn dispatch(
             invite,
             username,
             devicename,
-        } => {
-            match workspace::commands::accept_invite(
-                db_path,
-                &invite,
-                &username,
-                &devicename,
-            ) {
-                Ok(data) => {
-                    let mut ap = state.active_peer.write().unwrap();
-                    if ap.is_none() {
-                        *ap = Some(data.peer_id.clone());
-                    }
-                    state.notify_runtime_recheck();
-                    RpcResponse::success(data)
+        } => match workspace::commands::accept_invite(db_path, &invite, &username, &devicename) {
+            Ok(data) => {
+                let mut ap = state.active_peer.write().unwrap();
+                if ap.is_none() {
+                    *ap = Some(data.peer_id.clone());
                 }
-                Err(e) => RpcResponse::error(e.to_string()),
+                state.notify_runtime_recheck();
+                RpcResponse::success(data)
             }
-        }
+            Err(e) => RpcResponse::error(e.to_string()),
+        },
         RpcMethod::View { limit } => match state.require_active_peer() {
             Ok(peer_id) => match workspace::view_for_peer(db_path, &peer_id, limit) {
                 Ok(data) => RpcResponse::success(data),
@@ -912,7 +887,12 @@ mod tests {
 
     #[test]
     fn bootstrap_resolution_rejects_non_public_ip() {
-        let report = mk_report(UpnpMappingStatus::Success, Some("10.0.0.8"), Some(4433), None);
+        let report = mk_report(
+            UpnpMappingStatus::Success,
+            Some("10.0.0.8"),
+            Some(4433),
+            None,
+        );
         let err = resolve_bootstrap_from_upnp(&report).unwrap_err();
         assert!(err.contains("not publicly routable"));
     }

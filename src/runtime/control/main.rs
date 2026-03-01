@@ -8,8 +8,8 @@ use clap::{CommandFactory, Parser, Subcommand};
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
-use topo::db::{open_connection, schema::create_tables};
 use topo::db::transport_creds::discover_local_tenants;
+use topo::db::{open_connection, schema::create_tables};
 use topo::db_registry::DbRegistry;
 use topo::rpc::client::{rpc_call, RpcClientError};
 use topo::rpc::protocol::RpcMethod;
@@ -373,7 +373,9 @@ fn ensure_daemon_running(
                     )
                     .into());
                 }
-                last_error = resp.error.unwrap_or_else(|| "status probe failed".to_string());
+                last_error = resp
+                    .error
+                    .unwrap_or_else(|| "status probe failed".to_string());
             }
             Err(RpcClientError::DaemonNotRunning(_)) => {
                 last_error = "daemon not running yet".to_string();
@@ -410,14 +412,12 @@ fn rpc_require_daemon(
             }
             Ok(resp.data.unwrap_or(serde_json::Value::Null))
         }
-        Err(RpcClientError::DaemonNotRunning(_)) => {
-            Err(format!(
-                "daemon failed to start for {} (socket: {})",
-                db,
-                sock.display()
-            )
-            .into())
-        }
+        Err(RpcClientError::DaemonNotRunning(_)) => Err(format!(
+            "daemon failed to start for {} (socket: {})",
+            db,
+            sock.display()
+        )
+        .into()),
         Err(e) => Err(e.to_string().into()),
     }
 }
@@ -591,14 +591,13 @@ async fn run_runtime_manager(
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cli = Cli::parse();
-    let db = &resolve_db_arg(&cli.db).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+    let db = &resolve_db_arg(&cli.db)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
     let socket_override = cli.socket.clone();
 
     // Init tracing for commands that need it
     match &cli.command {
-        Commands::Start { .. }
-        | Commands::Intro { .. }
-        | Commands::AcceptInvite { .. } => {
+        Commands::Start { .. } | Commands::Intro { .. } | Commands::AcceptInvite { .. } => {
             let subscriber = FmtSubscriber::builder()
                 .with_max_level(Level::INFO)
                 .finish();
@@ -674,8 +673,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let manager_shutdown_flag = shutdown.clone();
             let manager_db = db.to_string();
             let runtime_manager = tokio::spawn(async move {
-                if let Err(e) =
-                    run_runtime_manager(&manager_db, bind, manager_state, manager_shutdown_flag, manager_shutdown).await
+                if let Err(e) = run_runtime_manager(
+                    &manager_db,
+                    bind,
+                    manager_state,
+                    manager_shutdown_flag,
+                    manager_shutdown,
+                )
+                .await
                 {
                     tracing::error!("runtime manager error: {}", e);
                 }
@@ -711,13 +716,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     Err(RpcClientError::DaemonNotRunning(_)) => {}
                     Err(RpcClientError::Protocol(msg))
                         if msg.contains("Connection reset by peer")
-                            || msg.contains("Broken pipe") =>
-                    {}
+                            || msg.contains("Broken pipe") => {}
                     Err(RpcClientError::Io(e))
                         if e.kind() == std::io::ErrorKind::ConnectionReset
                             || e.kind() == std::io::ErrorKind::ConnectionRefused
-                            || e.kind() == std::io::ErrorKind::BrokenPipe =>
-                    {}
+                            || e.kind() == std::io::ErrorKind::BrokenPipe => {}
                     Err(e) => {
                         eprintln!("error stopping daemon: {}", e);
                         std::process::exit(1);
@@ -751,7 +754,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             std::process::exit(1);
         }
 
-        Commands::CreateWorkspace { workspace_name, username, device_name } => {
+        Commands::CreateWorkspace {
+            workspace_name,
+            username,
+            device_name,
+        } => {
             let data = rpc_require_daemon(
                 db,
                 socket_override.as_deref(),
@@ -784,7 +791,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             )?;
             println!("Accepted invite");
             println!("  peer_id: {}", data["peer_id"].as_str().unwrap_or(""));
-            println!("  user:    {}", data["user_event_id"].as_str().unwrap_or(""));
+            println!(
+                "  user:    {}",
+                data["user_event_id"].as_str().unwrap_or("")
+            );
             println!(
                 "  peer:    {}",
                 data["peer_shared_event_id"].as_str().unwrap_or("")
@@ -850,11 +860,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
 
         Commands::View { limit } => {
-            let data = rpc_require_daemon(
-                db,
-                socket_override.as_deref(),
-                RpcMethod::View { limit },
-            )?;
+            let data =
+                rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::View { limit })?;
             show_view(&data);
         }
 
@@ -1185,11 +1192,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         }
 
-        Commands::CreateInvite { public_addr, public_spki } => {
+        Commands::CreateInvite {
+            public_addr,
+            public_spki,
+        } => {
             let data = rpc_require_daemon(
                 db,
                 socket_override.as_deref(),
-                RpcMethod::CreateInvite { public_addr, public_spki },
+                RpcMethod::CreateInvite {
+                    public_addr,
+                    public_spki,
+                },
             )?;
             println!("{}", data["invite_link"].as_str().unwrap_or(""));
             if let Some(num) = data["invite_ref"].as_u64() {
@@ -1197,11 +1210,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         }
 
-        Commands::Link { public_addr, public_spki } => {
+        Commands::Link {
+            public_addr,
+            public_spki,
+        } => {
             let data = rpc_require_daemon(
                 db,
                 socket_override.as_deref(),
-                RpcMethod::CreateDeviceLink { public_addr, public_spki },
+                RpcMethod::CreateDeviceLink {
+                    public_addr,
+                    public_spki,
+                },
             )?;
             println!("{}", data["invite_link"].as_str().unwrap_or(""));
             if let Some(num) = data["invite_ref"].as_u64() {
@@ -1233,7 +1252,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Commands::Identity => {
             let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::Identity)?;
             println!("IDENTITY:");
-            println!("  Transport: {}", data["transport_fingerprint"].as_str().unwrap_or(""));
+            println!(
+                "  Transport: {}",
+                data["transport_fingerprint"].as_str().unwrap_or("")
+            );
             match data["user_event_id"].as_str() {
                 Some(uid) => println!("  User:      {}", &uid[..uid.len().min(16)]),
                 None => println!("  User:      (none)"),
@@ -1249,7 +1271,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             println!("CHANNELS:");
             if let Some(items) = data.as_array() {
                 for item in items {
-                    let marker = if item["active"].as_bool().unwrap_or(false) { "*" } else { " " };
+                    let marker = if item["active"].as_bool().unwrap_or(false) {
+                        "*"
+                    } else {
+                        " "
+                    };
                     let idx = item["index"].as_u64().unwrap_or(0);
                     let name = item["name"].as_str().unwrap_or("");
                     println!("  {}{}. #{}", marker, idx, name);
@@ -1285,49 +1311,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // ---------------------------------------------------------------
         // DB registry management (no daemon needed)
         // ---------------------------------------------------------------
-        Commands::Db { action } => {
-            match action {
-                DbAction::Add { path, name } => {
-                    let mut registry = DbRegistry::load();
-                    registry.add(&path, name.as_deref())?;
-                    registry.save()?;
-                    let display_name = name.as_deref().unwrap_or("(none)");
-                    println!("Added {} (alias: {})", path, display_name);
-                }
-                DbAction::List => {
-                    let registry = DbRegistry::load();
-                    if registry.entries.is_empty() {
-                        println!("No databases registered.");
-                        println!("  Use `topo db add <path> --name <alias>` to register one.");
-                    } else {
-                        println!("DATABASES:");
-                        for (i, entry) in registry.entries.iter().enumerate() {
-                            let marker = if entry.is_default { "*" } else { " " };
-                            let name = entry.name.as_deref().unwrap_or("-");
-                            println!("  {}{}. {} ({})", marker, i + 1, name, entry.path);
-                        }
+        Commands::Db { action } => match action {
+            DbAction::Add { path, name } => {
+                let mut registry = DbRegistry::load();
+                registry.add(&path, name.as_deref())?;
+                registry.save()?;
+                let display_name = name.as_deref().unwrap_or("(none)");
+                println!("Added {} (alias: {})", path, display_name);
+            }
+            DbAction::List => {
+                let registry = DbRegistry::load();
+                if registry.entries.is_empty() {
+                    println!("No databases registered.");
+                    println!("  Use `topo db add <path> --name <alias>` to register one.");
+                } else {
+                    println!("DATABASES:");
+                    for (i, entry) in registry.entries.iter().enumerate() {
+                        let marker = if entry.is_default { "*" } else { " " };
+                        let name = entry.name.as_deref().unwrap_or("-");
+                        println!("  {}{}. {} ({})", marker, i + 1, name, entry.path);
                     }
                 }
-                DbAction::Remove { selector } => {
-                    let mut registry = DbRegistry::load();
-                    let removed = registry.remove(&selector)?;
-                    registry.save()?;
-                    println!("Removed {}", removed.path);
-                }
-                DbAction::Rename { selector, new_name } => {
-                    let mut registry = DbRegistry::load();
-                    registry.rename(&selector, &new_name)?;
-                    registry.save()?;
-                    println!("Renamed to {}", new_name);
-                }
-                DbAction::Default { selector } => {
-                    let mut registry = DbRegistry::load();
-                    registry.set_default(&selector)?;
-                    registry.save()?;
-                    println!("Default set to {}", selector);
-                }
             }
-        }
+            DbAction::Remove { selector } => {
+                let mut registry = DbRegistry::load();
+                let removed = registry.remove(&selector)?;
+                registry.save()?;
+                println!("Removed {}", removed.path);
+            }
+            DbAction::Rename { selector, new_name } => {
+                let mut registry = DbRegistry::load();
+                registry.rename(&selector, &new_name)?;
+                registry.save()?;
+                println!("Renamed to {}", new_name);
+            }
+            DbAction::Default { selector } => {
+                let mut registry = DbRegistry::load();
+                registry.set_default(&selector)?;
+                registry.save()?;
+                println!("Default set to {}", selector);
+            }
+        },
 
         Commands::Upnp => {
             let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::Upnp)?;

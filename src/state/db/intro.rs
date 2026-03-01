@@ -1,4 +1,4 @@
-use rusqlite::{Connection, Result as SqliteResult, params};
+use rusqlite::{params, Connection, Result as SqliteResult};
 
 pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
     conn.execute_batch(
@@ -140,7 +140,11 @@ pub fn freshest_endpoint(
          ORDER BY observed_at DESC LIMIT 1",
     )?;
     let mut rows = stmt.query_map(params![recorded_by, via_peer_id, now_ms], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u16, row.get::<_, i64>(2)?))
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)? as u16,
+            row.get::<_, i64>(2)?,
+        ))
     })?;
     match rows.next() {
         Some(Ok(r)) => Ok(Some(r)),
@@ -199,18 +203,36 @@ mod tests {
         assert!(!intro_already_seen(&conn, "me", &id).unwrap());
 
         let inserted = insert_intro_attempt(
-            &conn, "me", &id, "introducer1", "peerB",
-            "1.2.3.4", 5000, 1000, 31000, 2000,
-        ).unwrap();
+            &conn,
+            "me",
+            &id,
+            "introducer1",
+            "peerB",
+            "1.2.3.4",
+            5000,
+            1000,
+            31000,
+            2000,
+        )
+        .unwrap();
         assert!(inserted);
 
         assert!(intro_already_seen(&conn, "me", &id).unwrap());
 
         // Duplicate insert is ignored
         let inserted2 = insert_intro_attempt(
-            &conn, "me", &id, "introducer1", "peerB",
-            "1.2.3.4", 5000, 1000, 31000, 3000,
-        ).unwrap();
+            &conn,
+            "me",
+            &id,
+            "introducer1",
+            "peerB",
+            "1.2.3.4",
+            5000,
+            1000,
+            31000,
+            3000,
+        )
+        .unwrap();
         assert!(!inserted2);
     }
 
@@ -220,9 +242,9 @@ mod tests {
         let id = [0xBBu8; 16];
 
         insert_intro_attempt(
-            &conn, "me", &id, "intro1", "peerC",
-            "10.0.0.1", 4433, 1000, 31000, 2000,
-        ).unwrap();
+            &conn, "me", &id, "intro1", "peerC", "10.0.0.1", 4433, 1000, 31000, 2000,
+        )
+        .unwrap();
 
         let updated = update_intro_status(&conn, "me", &id, "dialing", None, 3000).unwrap();
         assert!(updated);
@@ -244,13 +266,13 @@ mod tests {
         let conn = setup();
 
         insert_intro_attempt(
-            &conn, "me", &[1u8; 16], "intro1", "peerA",
-            "1.1.1.1", 100, 1000, 31000, 2000,
-        ).unwrap();
+            &conn, "me", &[1u8; 16], "intro1", "peerA", "1.1.1.1", 100, 1000, 31000, 2000,
+        )
+        .unwrap();
         insert_intro_attempt(
-            &conn, "me", &[2u8; 16], "intro1", "peerB",
-            "2.2.2.2", 200, 1000, 31000, 3000,
-        ).unwrap();
+            &conn, "me", &[2u8; 16], "intro1", "peerB", "2.2.2.2", 200, 1000, 31000, 3000,
+        )
+        .unwrap();
 
         let all = list_intro_attempts(&conn, "me", None).unwrap();
         assert_eq!(all.len(), 2);
@@ -266,18 +288,26 @@ mod tests {
         use crate::db::health::record_endpoint_observation;
 
         // No observations
-        assert!(freshest_endpoint(&conn, "me", "peer1", 5000).unwrap().is_none());
+        assert!(freshest_endpoint(&conn, "me", "peer1", 5000)
+            .unwrap()
+            .is_none());
 
         // Add two observations at different times
-        record_endpoint_observation(&conn, "me", "peer1", "10.0.0.1", 4433, 1000, 86400000).unwrap();
-        record_endpoint_observation(&conn, "me", "peer1", "10.0.0.2", 5000, 2000, 86400000).unwrap();
+        record_endpoint_observation(&conn, "me", "peer1", "10.0.0.1", 4433, 1000, 86400000)
+            .unwrap();
+        record_endpoint_observation(&conn, "me", "peer1", "10.0.0.2", 5000, 2000, 86400000)
+            .unwrap();
 
         // Should get the newer one
-        let (ip, port, _observed) = freshest_endpoint(&conn, "me", "peer1", 3000).unwrap().unwrap();
+        let (ip, port, _observed) = freshest_endpoint(&conn, "me", "peer1", 3000)
+            .unwrap()
+            .unwrap();
         assert_eq!(ip, "10.0.0.2");
         assert_eq!(port, 5000);
 
         // If both expired, returns None
-        assert!(freshest_endpoint(&conn, "me", "peer1", 86400000 + 3000).unwrap().is_none());
+        assert!(freshest_endpoint(&conn, "me", "peer1", 86400000 + 3000)
+            .unwrap()
+            .is_none());
     }
 }

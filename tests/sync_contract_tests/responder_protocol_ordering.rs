@@ -8,20 +8,19 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use topo::contracts::peering_contract::{SessionDirection, SessionHandler};
-use topo::sync::session_handler::SyncSessionHandler;
 use topo::protocol::Frame;
+use topo::sync::session_handler::SyncSessionHandler;
 
 use crate::fake_session_io::{
-    create_test_db, empty_negentropy_storage, fake_session_io_pair, noop_ingest_tx,
-    run_local, test_session_meta,
+    create_test_db, empty_negentropy_storage, fake_session_io_pair, noop_ingest_tx, run_local,
+    test_session_meta,
 };
 
 #[tokio::test]
 async fn responder_inbound_replies_negmsg_then_doneack() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
-        let handler =
-            SyncSessionHandler::responder(db_path, 30, noop_ingest_tx());
+        let handler = SyncSessionHandler::responder(db_path, 30, noop_ingest_tx());
         let meta = test_session_meta(SessionDirection::Inbound);
         let cancel = CancellationToken::new();
 
@@ -29,29 +28,20 @@ async fn responder_inbound_replies_negmsg_then_doneack() {
 
         let handler_task = tokio::task::spawn_local({
             let cancel = cancel.clone();
-            async move {
-                handler
-                    .on_session(meta, Box::new(fake_io), cancel)
-                    .await
-            }
+            async move { handler.on_session(meta, Box::new(fake_io), cancel).await }
         });
 
         // Simulate the initiator side:
         // 1. Send NegOpen with empty negentropy
         let storage = empty_negentropy_storage();
-        let mut neg = negentropy::Negentropy::new(
-            negentropy::Storage::Borrowed(&storage),
-            0,
-        )
-        .unwrap();
+        let mut neg =
+            negentropy::Negentropy::new(negentropy::Storage::Borrowed(&storage), 0).unwrap();
         let initial_msg = neg.initiate().unwrap();
         peer.send_control_msg(&Frame::NegOpen { msg: initial_msg })
             .await;
 
         // 2. Responder should reply with NegMsg
-        let neg_msg = peer
-            .recv_control_msg_timeout(Duration::from_secs(5))
-            .await;
+        let neg_msg = peer.recv_control_msg_timeout(Duration::from_secs(5)).await;
         if let Some(Frame::NegMsg { msg }) = &neg_msg {
             let mut have_ids = Vec::new();
             let mut need_ids = Vec::new();
@@ -90,8 +80,7 @@ async fn responder_inbound_replies_negmsg_then_doneack() {
 async fn anticheat_responder_datadone_before_doneack() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
-        let handler =
-            SyncSessionHandler::responder(db_path, 30, noop_ingest_tx());
+        let handler = SyncSessionHandler::responder(db_path, 30, noop_ingest_tx());
         let meta = test_session_meta(SessionDirection::Inbound);
         let cancel = CancellationToken::new();
 
@@ -106,11 +95,8 @@ async fn anticheat_responder_datadone_before_doneack() {
 
         // Drive initiator side: NegOpen → Done
         let storage = empty_negentropy_storage();
-        let mut neg = negentropy::Negentropy::new(
-            negentropy::Storage::Borrowed(&storage),
-            0,
-        )
-        .unwrap();
+        let mut neg =
+            negentropy::Negentropy::new(negentropy::Storage::Borrowed(&storage), 0).unwrap();
         let initial_msg = neg.initiate().unwrap();
         peer.send_control_msg(&Frame::NegOpen { msg: initial_msg })
             .await;
@@ -153,16 +139,13 @@ async fn anticheat_responder_datadone_before_doneack() {
 async fn responder_rejects_outbound_direction() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
-        let handler =
-            SyncSessionHandler::responder(db_path, 30, noop_ingest_tx());
+        let handler = SyncSessionHandler::responder(db_path, 30, noop_ingest_tx());
         let meta = test_session_meta(SessionDirection::Outbound);
         let cancel = CancellationToken::new();
 
         let (fake_io, _peer) = fake_session_io_pair(meta.session_id);
 
-        let result = handler
-            .on_session(meta, Box::new(fake_io), cancel)
-            .await;
+        let result = handler.on_session(meta, Box::new(fake_io), cancel).await;
         assert!(result.is_err());
         assert!(
             result
@@ -179,8 +162,7 @@ async fn responder_rejects_outbound_direction() {
 async fn responder_ignores_empty_havelist_marker() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
-        let handler =
-            SyncSessionHandler::responder(db_path, 30, noop_ingest_tx());
+        let handler = SyncSessionHandler::responder(db_path, 30, noop_ingest_tx());
         let meta = test_session_meta(SessionDirection::Inbound);
         let cancel = CancellationToken::new();
 
@@ -199,11 +181,8 @@ async fn responder_ignores_empty_havelist_marker() {
 
         // Then proceed with normal protocol
         let storage = empty_negentropy_storage();
-        let mut neg = negentropy::Negentropy::new(
-            negentropy::Storage::Borrowed(&storage),
-            0,
-        )
-        .unwrap();
+        let mut neg =
+            negentropy::Negentropy::new(negentropy::Storage::Borrowed(&storage), 0).unwrap();
         let initial_msg = neg.initiate().unwrap();
         peer.send_control_msg(&Frame::NegOpen { msg: initial_msg })
             .await;

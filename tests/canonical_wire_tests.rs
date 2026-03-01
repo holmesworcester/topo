@@ -1,15 +1,16 @@
 //! Golden-byte, negative parse, and idempotent encode/decode tests
 //! for all canonical event types with fixed wire layouts.
 
-use topo::event_modules::{
-    self as events, EventError, ParsedEvent,
-    MessageEvent, ReactionEvent, EncryptedEvent,
-    FileSliceEvent, MessageAttachmentEvent, BenchDepEvent,
+use topo::event_modules::layout::common::{
+    encrypted_inner_wire_size, encrypted_wire_size, ENCRYPTED_HEADER_BYTES,
 };
 use topo::event_modules::message::layout::offsets as message_offsets;
-use topo::event_modules::reaction::offsets as reaction_offsets;
 use topo::event_modules::message_attachment::attachment_offsets;
-use topo::event_modules::layout::common::{encrypted_inner_wire_size, encrypted_wire_size, ENCRYPTED_HEADER_BYTES};
+use topo::event_modules::reaction::offsets as reaction_offsets;
+use topo::event_modules::{
+    self as events, BenchDepEvent, EncryptedEvent, EventError, FileSliceEvent,
+    MessageAttachmentEvent, MessageEvent, ParsedEvent, ReactionEvent,
+};
 
 // ─── Golden-byte tests ───
 //
@@ -33,7 +34,10 @@ fn golden_bytes_message() {
     // Type code
     assert_eq!(blob[0], 1);
     // created_at_ms LE
-    assert_eq!(&blob[1..9], &[0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]);
+    assert_eq!(
+        &blob[1..9],
+        &[0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]
+    );
     // workspace_id
     assert_eq!(&blob[9..41], &[0xAA; 32]);
     // author_id
@@ -113,7 +117,10 @@ fn golden_bytes_message_attachment() {
         signature: [0x06; 64],
     });
     let blob = events::encode_event(&att).unwrap();
-    assert_eq!(blob.len(), events::message_attachment::MESSAGE_ATTACHMENT_WIRE_SIZE);
+    assert_eq!(
+        blob.len(),
+        events::message_attachment::MESSAGE_ATTACHMENT_WIRE_SIZE
+    );
     assert_eq!(blob[0], 24);
     // filename at offset 153
     assert_eq!(&blob[153..161], b"test.bin");

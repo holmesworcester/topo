@@ -27,11 +27,11 @@ pub fn resolve_signer_key(
 ) -> Result<SignerResolution, Box<dyn std::error::Error>> {
     // Valid type codes for each signer_type
     let valid_type_codes: &[u8] = match signer_type {
-        1 => &[8],          // Workspace
-        2 => &[10, 11],     // UserInviteBoot, UserInviteOngoing
-        3 => &[12, 13],     // DeviceInviteFirst, DeviceInviteOngoing
-        4 => &[14, 15],     // UserBoot, UserOngoing
-        5 => &[16, 17],     // PeerSharedFirst, PeerSharedOngoing
+        1 => &[8],      // Workspace
+        2 => &[10, 11], // UserInviteBoot, UserInviteOngoing
+        3 => &[12, 13], // DeviceInviteFirst, DeviceInviteOngoing
+        4 => &[14, 15], // UserBoot, UserOngoing
+        5 => &[16, 17], // PeerSharedFirst, PeerSharedOngoing
         _ => {
             return Ok(SignerResolution::Invalid(format!(
                 "unsupported signer_type: {}",
@@ -84,12 +84,15 @@ mod tests {
         schema::create_tables,
         store::{insert_event, insert_recorded_event},
     };
-    use crate::event_modules::{PeerSharedFirstEvent, ParsedEvent, encode_event};
+    use crate::event_modules::{encode_event, ParsedEvent, PeerSharedFirstEvent};
     use ed25519_dalek::SigningKey;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn now_ms() -> u64 {
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
     }
 
     fn setup() -> rusqlite::Connection {
@@ -121,7 +124,8 @@ mod tests {
         conn.execute(
             "INSERT OR IGNORE INTO valid_events (peer_id, event_id) VALUES (?1, ?2)",
             rusqlite::params![recorded_by, &event_id_b64],
-        ).unwrap();
+        )
+        .unwrap();
         insert_recorded_event(conn, recorded_by, &event_id, ts, "test").unwrap();
         event_id
     }

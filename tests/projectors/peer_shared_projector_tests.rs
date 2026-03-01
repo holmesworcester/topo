@@ -8,10 +8,10 @@
 
 #[cfg(test)]
 mod tests {
-    use topo::event_modules::peer_shared::project_pure;
-    use topo::event_modules::peer_shared::{PeerSharedFirstEvent, PeerSharedOngoingEvent};
     use crate::harness::fixtures::*;
     use topo::crypto::spki_fingerprint_from_ed25519_pubkey;
+    use topo::event_modules::peer_shared::project_pure;
+    use topo::event_modules::peer_shared::{PeerSharedFirstEvent, PeerSharedOngoingEvent};
     use topo::event_modules::ParsedEvent;
     use topo::projection::result::{SqlVal, WriteOp};
 
@@ -67,11 +67,20 @@ mod tests {
         assert_valid(&result);
 
         let insert = result.write_ops.iter().find(|op| {
-            matches!(op, WriteOp::InsertOrIgnore { table: "peers_shared", .. })
+            matches!(
+                op,
+                WriteOp::InsertOrIgnore {
+                    table: "peers_shared",
+                    ..
+                }
+            )
         });
         assert!(insert.is_some(), "expected InsertOrIgnore to peers_shared");
 
-        if let Some(WriteOp::InsertOrIgnore { columns, values, .. }) = insert {
+        if let Some(WriteOp::InsertOrIgnore {
+            columns, values, ..
+        }) = insert
+        {
             // public_key column should contain our key
             let pk_idx = columns.iter().position(|c| *c == "public_key").unwrap();
             assert_eq!(values[pk_idx], SqlVal::Blob(pk.to_vec()));

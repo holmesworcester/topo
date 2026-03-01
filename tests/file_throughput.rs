@@ -8,18 +8,17 @@
 use std::time::Instant;
 
 use ed25519_dalek::SigningKey;
+use rusqlite::Connection;
+use tempfile::NamedTempFile;
 use topo::crypto::{event_id_to_base64, hash_event, EventId};
 use topo::db::{open_connection, schema::create_tables};
 use topo::event_modules::{
-    self as events, FileSliceEvent, MessageAttachmentEvent, MessageEvent, ParsedEvent,
-    SecretKeyEvent, WorkspaceEvent, InviteAcceptedEvent, UserInviteBootEvent,
-    UserBootEvent, DeviceInviteFirstEvent, PeerSharedFirstEvent,
-    file_slice::FILE_SLICE_CIPHERTEXT_BYTES,
+    self as events, file_slice::FILE_SLICE_CIPHERTEXT_BYTES, DeviceInviteFirstEvent,
+    FileSliceEvent, InviteAcceptedEvent, MessageAttachmentEvent, MessageEvent, ParsedEvent,
+    PeerSharedFirstEvent, SecretKeyEvent, UserBootEvent, UserInviteBootEvent, WorkspaceEvent,
 };
 use topo::projection::apply::project_one;
 use topo::projection::signer::sign_event_bytes;
-use rusqlite::Connection;
-use tempfile::NamedTempFile;
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -159,10 +158,7 @@ fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (EventId, Signin
 }
 
 /// Create prerequisite events (identity chain, signed message, secret key) and return IDs + signing key.
-fn create_prereqs(
-    conn: &Connection,
-    recorded_by: &str,
-) -> (EventId, EventId, EventId, SigningKey) {
+fn create_prereqs(conn: &Connection, recorded_by: &str) -> (EventId, EventId, EventId, SigningKey) {
     let (signer_eid, signing_key, user_event_id) = make_identity_chain(conn, recorded_by);
 
     // Signed message

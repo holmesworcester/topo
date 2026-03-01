@@ -1,7 +1,8 @@
 use async_trait::async_trait;
 
 use crate::contracts::peering_contract::{
-    ControlIo, DataRecvIo, DataSendIo, TransportSessionIo, TransportSessionIoError, TransportSessionIoParts,
+    ControlIo, DataRecvIo, DataSendIo, TransportSessionIo, TransportSessionIoError,
+    TransportSessionIoParts,
 };
 use crate::protocol::ParseError;
 use crate::protocol::{encode_frame, parse_frame, Frame};
@@ -61,14 +62,20 @@ fn map_connection_error(err: ConnectionError, max_frame_size: usize) -> Transpor
         ConnectionError::Parse(parse) => map_parse_error(parse, max_frame_size),
         ConnectionError::Io(e) => TransportSessionIoError::Internal(format!("io: {e}")),
         ConnectionError::Quinn(e) => TransportSessionIoError::Internal(format!("quinn write: {e}")),
-        ConnectionError::QuinnRead(e) => TransportSessionIoError::Internal(format!("quinn read: {e}")),
-        ConnectionError::QuinnClose(e) => TransportSessionIoError::Internal(format!("quinn close: {e}")),
+        ConnectionError::QuinnRead(e) => {
+            TransportSessionIoError::Internal(format!("quinn read: {e}"))
+        }
+        ConnectionError::QuinnClose(e) => {
+            TransportSessionIoError::Internal(format!("quinn close: {e}"))
+        }
     }
 }
 
-fn decode_exact_frame(frame: &[u8], max_frame_size: usize) -> Result<Frame, TransportSessionIoError> {
-    let (msg, consumed) =
-        parse_frame(frame).map_err(|e| map_parse_error(e, max_frame_size))?;
+fn decode_exact_frame(
+    frame: &[u8],
+    max_frame_size: usize,
+) -> Result<Frame, TransportSessionIoError> {
+    let (msg, consumed) = parse_frame(frame).map_err(|e| map_parse_error(e, max_frame_size))?;
 
     if consumed != frame.len() {
         return Err(TransportSessionIoError::PeerViolation(format!(
@@ -412,7 +419,11 @@ mod tests {
         let mut frame = encode_frame(&Frame::Done);
         frame.push(0);
 
-        let err = parts.control.send(&frame).await.expect_err("expected error");
+        let err = parts
+            .control
+            .send(&frame)
+            .await
+            .expect_err("expected error");
         assert!(matches!(err, TransportSessionIoError::PeerViolation(_)));
     }
 
@@ -445,7 +456,11 @@ mod tests {
         let (mut parts, _control_state, _data_send_state) = build_io(vec![], vec![]);
         let oversized = vec![0u8; DEFAULT_SYNC_FRAME_MAX_BYTES + 1];
 
-        let err = parts.data_send.send(&oversized).await.expect_err("expected error");
+        let err = parts
+            .data_send
+            .send(&oversized)
+            .await
+            .expect_err("expected error");
         assert_eq!(
             err,
             TransportSessionIoError::FrameTooLarge {

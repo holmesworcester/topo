@@ -20,8 +20,8 @@ pub mod user_invite;
 pub mod user_removed;
 pub mod workspace;
 
-use std::sync::OnceLock;
 use rusqlite::Connection;
+use std::sync::OnceLock;
 
 pub use admin::{AdminBootEvent, AdminOngoingEvent};
 pub use bench_dep::BenchDepEvent;

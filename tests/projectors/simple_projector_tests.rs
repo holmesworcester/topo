@@ -138,9 +138,7 @@ mod tests {
 
     #[test]
     fn test_message_attachment_valid() {
-        use topo::event_modules::message_attachment::{
-            project_pure, MessageAttachmentEvent,
-        };
+        use topo::event_modules::message_attachment::{project_pure, MessageAttachmentEvent};
         let parsed = ParsedEvent::MessageAttachment(MessageAttachmentEvent {
             created_at_ms: 8000,
             message_id: [1u8; 32],
@@ -176,7 +174,10 @@ mod tests {
         });
         let result = project_pure(PEER, EVENT_ID, &parsed, &empty_ctx());
         assert_valid(&result);
-        assert!(result.write_ops.is_empty(), "bench_dep should have no write_ops");
+        assert!(
+            result.write_ops.is_empty(),
+            "bench_dep should have no write_ops"
+        );
         assert_no_commands(&result);
     }
 }

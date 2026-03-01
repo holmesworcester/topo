@@ -69,7 +69,9 @@ pub fn resolve_user_event_id(
             "no peer_shared entry found for signer — identity chain incomplete".into()
         })?;
     if user_eid_b64.is_empty() {
-        return Err("peer_shared entry has no user_event_id (legacy row) — recreate database".into());
+        return Err(
+            "peer_shared entry has no user_event_id (legacy row) — recreate database".into(),
+        );
     }
     event_id_from_base64(&user_eid_b64)
         .ok_or_else(|| "invalid user_event_id in peers_shared".into())
@@ -102,10 +104,7 @@ pub fn load_local_user_key(
 // Projection queries
 // ---------------------------------------------------------------------------
 
-pub fn count(
-    db: &Connection,
-    recorded_by: &str,
-) -> Result<i64, rusqlite::Error> {
+pub fn count(db: &Connection, recorded_by: &str) -> Result<i64, rusqlite::Error> {
     db.query_row(
         "SELECT COUNT(*) FROM peers_shared WHERE recorded_by = ?1",
         rusqlite::params![recorded_by],
@@ -114,13 +113,12 @@ pub fn count(
 }
 
 /// List event_ids for all peer_shared rows.
-pub fn list_event_ids(
-    db: &Connection,
-    recorded_by: &str,
-) -> Result<Vec<String>, rusqlite::Error> {
+pub fn list_event_ids(db: &Connection, recorded_by: &str) -> Result<Vec<String>, rusqlite::Error> {
     let mut stmt = db.prepare("SELECT event_id FROM peers_shared WHERE recorded_by = ?1")?;
     let rows = stmt
-        .query_map(rusqlite::params![recorded_by], |row| row.get::<_, String>(0))?
+        .query_map(rusqlite::params![recorded_by], |row| {
+            row.get::<_, String>(0)
+        })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
 }
@@ -229,10 +227,7 @@ pub struct IdentityResponse {
 }
 
 /// Get combined identity info for a specific peer.
-pub fn identity(
-    db: &Connection,
-    recorded_by: &str,
-) -> Result<IdentityResponse, rusqlite::Error> {
+pub fn identity(db: &Connection, recorded_by: &str) -> Result<IdentityResponse, rusqlite::Error> {
     let user_event_id = super::super::user::first_event_id(db, recorded_by)?;
     let peer_shared_event_id = first_event_id(db, recorded_by)?;
     Ok(IdentityResponse {
@@ -271,12 +266,9 @@ mod tests {
         )
         .expect("insert peers_shared row");
 
-        let resolved = resolve_event_id_by_transport_fingerprint(
-            &conn,
-            recorded_by,
-            &transport_fingerprint,
-        )
-        .expect("resolve event id");
+        let resolved =
+            resolve_event_id_by_transport_fingerprint(&conn, recorded_by, &transport_fingerprint)
+                .expect("resolve event id");
         assert_eq!(resolved.as_deref(), Some(event_id));
     }
 }

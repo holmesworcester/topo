@@ -77,16 +77,12 @@ where
     let db_path_for_neg = db_path.to_string();
     let ws_id_for_neg = ws_id.clone();
     let (neg_req_tx, neg_req_rx) = std::sync::mpsc::channel::<Vec<u8>>();
-    let (neg_resp_tx, neg_resp_rx) =
-        std::sync::mpsc::channel::<Result<Vec<u8>, String>>();
+    let (neg_resp_tx, neg_resp_rx) = std::sync::mpsc::channel::<Result<Vec<u8>, String>>();
 
     let neg_worker = std::thread::spawn(move || {
-        let neg_db =
-            open_connection(&db_path_for_neg).expect("neg worker: open_connection");
+        let neg_db = open_connection(&db_path_for_neg).expect("neg worker: open_connection");
         let neg_storage = NegentropyStorageSqlite::new(&neg_db, &ws_id_for_neg);
-        neg_db
-            .execute("BEGIN", [])
-            .expect("neg worker: BEGIN");
+        neg_db.execute("BEGIN", []).expect("neg worker: BEGIN");
         neg_storage
             .rebuild_blocks()
             .expect("neg worker: rebuild_blocks");
@@ -94,9 +90,8 @@ where
         let item_count = neg_storage.size().unwrap_or(0);
         info!("Negentropy storage has {} items (responder)", item_count);
 
-        let mut neg =
-            Negentropy::new(Storage::Borrowed(&neg_storage), NEGENTROPY_FRAME_SIZE)
-                .expect("neg worker: Negentropy::new");
+        let mut neg = Negentropy::new(Storage::Borrowed(&neg_storage), NEGENTROPY_FRAME_SIZE)
+            .expect("neg worker: Negentropy::new");
 
         while let Ok(msg) = neg_req_rx.recv() {
             let result = neg.reconcile(&msg).map_err(|e| format!("{}", e));

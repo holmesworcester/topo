@@ -51,7 +51,11 @@ fn status_via_rpc(socket: &PathBuf) -> serde_json::Value {
     resp.data.expect("status response missing data")
 }
 
-fn wait_for_runtime_state(socket: &PathBuf, expected: &str, timeout: Duration) -> serde_json::Value {
+fn wait_for_runtime_state(
+    socket: &PathBuf,
+    expected: &str,
+    timeout: Duration,
+) -> serde_json::Value {
     let start = Instant::now();
     let mut last = serde_json::Value::Null;
     while start.elapsed() < timeout {
@@ -221,9 +225,7 @@ fn rpc_all_methods_serialize() {
             invite: "quiet://link/test".into(),
             devicename: "device".into(),
         },
-        RpcMethod::Ban {
-            target: "1".into(),
-        },
+        RpcMethod::Ban { target: "1".into() },
         RpcMethod::Identity,
         RpcMethod::Channels,
         RpcMethod::NewChannel {
@@ -702,7 +704,11 @@ fn create_workspace_autostarts_daemon_and_activates_runtime() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("peer_id:"), "missing peer_id output: {}", stdout);
+    assert!(
+        stdout.contains("peer_id:"),
+        "missing peer_id output: {}",
+        stdout
+    );
     assert!(
         stdout.contains("workspace_id:"),
         "missing workspace_id output: {}",
@@ -746,7 +752,13 @@ fn accept_invite_on_running_idle_daemon_activates_runtime_without_restart() {
         .to_string();
 
     let invite_out = Command::new(bin())
-        .args(["--db", &alice_db, "create-invite", "--public-addr", &alice_listen])
+        .args([
+            "--db",
+            &alice_db,
+            "create-invite",
+            "--public-addr",
+            &alice_listen,
+        ])
         .output()
         .unwrap();
     assert!(
@@ -795,10 +807,16 @@ fn accept_invite_on_running_idle_daemon_activates_runtime_without_restart() {
         bob_daemon.try_wait().unwrap().is_none(),
         "bob daemon should keep running (no restart required)"
     );
-    assert_eq!(bob_daemon.id(), bob_pid_before, "daemon process should be unchanged");
+    assert_eq!(
+        bob_daemon.id(),
+        bob_pid_before,
+        "daemon process should be unchanged"
+    );
     let _ = wait_for_runtime_state(&bob_socket, "Active", Duration::from_secs(10));
 
-    let _ = Command::new(bin()).args(["--db", &alice_db, "stop"]).output();
+    let _ = Command::new(bin())
+        .args(["--db", &alice_db, "stop"])
+        .output();
     stop_daemon(&bob_db, &mut bob_daemon);
 }
 
@@ -914,8 +932,14 @@ fn rpc_identity_command() {
 
     assert!(out.status.success(), "identity failed: {:?}", out);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("IDENTITY:"), "should contain IDENTITY header");
-    assert!(stdout.contains("Transport:"), "should contain Transport line");
+    assert!(
+        stdout.contains("IDENTITY:"),
+        "should contain IDENTITY header"
+    );
+    assert!(
+        stdout.contains("Transport:"),
+        "should contain Transport line"
+    );
     assert!(stdout.contains("User:"), "should contain User line");
     assert!(stdout.contains("Peer:"), "should contain Peer line");
 }
@@ -944,7 +968,11 @@ fn rpc_channel_lifecycle() {
         .unwrap();
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("general"), "should have default 'general' channel, got: {}", stdout);
+    assert!(
+        stdout.contains("general"),
+        "should have default 'general' channel, got: {}",
+        stdout
+    );
 
     // Create a new channel
     let out = Command::new(bin())
@@ -962,7 +990,10 @@ fn rpc_channel_lifecycle() {
         .unwrap();
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("random"), "should show switched channel name");
+    assert!(
+        stdout.contains("random"),
+        "should show switched channel name"
+    );
 
     // Verify channels list now shows 2
     let out = Command::new(bin())
@@ -997,7 +1028,13 @@ fn rpc_invite_ref_resolution() {
 
     // Create invite — should get ref #1
     let out = Command::new(bin())
-        .args(["--db", &db, "create-invite", "--public-addr", "127.0.0.1:4433"])
+        .args([
+            "--db",
+            &db,
+            "create-invite",
+            "--public-addr",
+            "127.0.0.1:4433",
+        ])
         .output()
         .unwrap();
     assert!(out.status.success(), "create-invite failed: {:?}", out);

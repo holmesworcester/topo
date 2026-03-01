@@ -62,6 +62,9 @@ mod tests {
 
         let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
         assert_valid(&result);
-        assert!(result.write_ops.is_empty(), "should produce no write ops when target deleted");
+        assert!(
+            result.write_ops.is_empty(),
+            "should produce no write ops when target deleted"
+        );
     }
 }

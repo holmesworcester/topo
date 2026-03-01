@@ -359,8 +359,7 @@ mod tests {
     #[test]
     fn mtls_rejection_classifier_matches_transport_verifier_errors() {
         let err = ConnectionLifecycleError::Dial(
-            "handshake to 127.0.0.1:4433: peer fingerprint deadbeef not in allowed set"
-                .to_string(),
+            "handshake to 127.0.0.1:4433: peer fingerprint deadbeef not in allowed set".to_string(),
         );
         assert!(is_mtls_trust_rejection(&err));
     }

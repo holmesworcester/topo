@@ -1,4 +1,6 @@
-use crate::event_modules::layout::common::{COMMON_HEADER_BYTES, NAME_BYTES, read_text_slot, write_text_slot};
+use crate::event_modules::layout::common::{
+    read_text_slot, write_text_slot, COMMON_HEADER_BYTES, NAME_BYTES,
+};
 use crate::event_modules::registry::{EventTypeMeta, ShareScope};
 use crate::event_modules::{EventError, ParsedEvent, EVENT_TYPE_WORKSPACE};
 
@@ -19,8 +21,8 @@ use workspace_offsets as off;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceEvent {
     pub created_at_ms: u64,
-    pub public_key: [u8; 32],  // Ed25519 verifying key for the workspace
-    pub name: String,           // Workspace display name (64-byte text slot)
+    pub public_key: [u8; 32], // Ed25519 verifying key for the workspace
+    pub name: String,         // Workspace display name (64-byte text slot)
 }
 
 /// Wire format (105 bytes fixed):
@@ -48,13 +50,14 @@ pub fn parse_workspace(blob: &[u8]) -> Result<ParsedEvent, EventError> {
         });
     }
 
-    let created_at_ms = u64::from_le_bytes(blob[off::CREATED_AT..off::PUBLIC_KEY].try_into().unwrap());
+    let created_at_ms =
+        u64::from_le_bytes(blob[off::CREATED_AT..off::PUBLIC_KEY].try_into().unwrap());
 
     let mut public_key = [0u8; 32];
     public_key.copy_from_slice(&blob[off::PUBLIC_KEY..off::NAME]);
 
-    let name = read_text_slot(&blob[off::NAME..off::NAME + NAME_BYTES])
-        .map_err(EventError::TextSlot)?;
+    let name =
+        read_text_slot(&blob[off::NAME..off::NAME + NAME_BYTES]).map_err(EventError::TextSlot)?;
 
     Ok(ParsedEvent::Workspace(WorkspaceEvent {
         created_at_ms,
@@ -99,6 +102,9 @@ mod layout_tests {
     use crate::event_modules::layout;
     #[test]
     fn offsets_consistent() {
-        assert_eq!(workspace_offsets::NAME + layout::common::NAME_BYTES, WORKSPACE_WIRE_SIZE);
+        assert_eq!(
+            workspace_offsets::NAME + layout::common::NAME_BYTES,
+            WORKSPACE_WIRE_SIZE
+        );
     }
 }

@@ -8,10 +8,7 @@ pub struct UserItem {
 }
 
 /// List user items (response type) from the database.
-pub fn list_items(
-    db: &Connection,
-    recorded_by: &str,
-) -> Result<Vec<UserItem>, rusqlite::Error> {
+pub fn list_items(db: &Connection, recorded_by: &str) -> Result<Vec<UserItem>, rusqlite::Error> {
     let rows = list(db, recorded_by)?;
     Ok(rows
         .into_iter()
@@ -27,13 +24,9 @@ pub struct UserRow {
     pub username: String,
 }
 
-pub fn list(
-    db: &Connection,
-    recorded_by: &str,
-) -> Result<Vec<UserRow>, rusqlite::Error> {
-    let mut stmt = db.prepare(
-        "SELECT event_id, COALESCE(username, '') FROM users WHERE recorded_by = ?1"
-    )?;
+pub fn list(db: &Connection, recorded_by: &str) -> Result<Vec<UserRow>, rusqlite::Error> {
+    let mut stmt =
+        db.prepare("SELECT event_id, COALESCE(username, '') FROM users WHERE recorded_by = ?1")?;
     let rows = stmt
         .query_map(rusqlite::params![recorded_by], |row| {
             Ok(UserRow {
@@ -45,10 +38,7 @@ pub fn list(
     Ok(rows)
 }
 
-pub fn count(
-    db: &Connection,
-    recorded_by: &str,
-) -> Result<i64, rusqlite::Error> {
+pub fn count(db: &Connection, recorded_by: &str) -> Result<i64, rusqlite::Error> {
     db.query_row(
         "SELECT COUNT(*) FROM users WHERE recorded_by = ?1",
         rusqlite::params![recorded_by],

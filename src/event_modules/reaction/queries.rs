@@ -8,10 +8,7 @@ pub struct ReactionRow {
     pub emoji: String,
 }
 
-pub fn list_rows(
-    db: &Connection,
-    recorded_by: &str,
-) -> Result<Vec<ReactionRow>, rusqlite::Error> {
+pub fn list_rows(db: &Connection, recorded_by: &str) -> Result<Vec<ReactionRow>, rusqlite::Error> {
     let mut stmt = db
         .prepare("SELECT event_id, target_event_id, emoji FROM reactions WHERE recorded_by = ?1")?;
     let rows = stmt
@@ -31,9 +28,8 @@ pub fn list_for_message(
     recorded_by: &str,
     target_event_id_b64: &str,
 ) -> Result<Vec<String>, rusqlite::Error> {
-    let mut stmt = db.prepare(
-        "SELECT emoji FROM reactions WHERE recorded_by = ?1 AND target_event_id = ?2",
-    )?;
+    let mut stmt =
+        db.prepare("SELECT emoji FROM reactions WHERE recorded_by = ?1 AND target_event_id = ?2")?;
     let emojis = stmt
         .query_map(rusqlite::params![recorded_by, target_event_id_b64], |row| {
             row.get::<_, String>(0)
@@ -42,10 +38,7 @@ pub fn list_for_message(
     Ok(emojis)
 }
 
-pub fn count(
-    db: &Connection,
-    recorded_by: &str,
-) -> Result<i64, rusqlite::Error> {
+pub fn count(db: &Connection, recorded_by: &str) -> Result<i64, rusqlite::Error> {
     db.query_row(
         "SELECT COUNT(*) FROM reactions WHERE recorded_by = ?1",
         rusqlite::params![recorded_by],
@@ -61,10 +54,7 @@ pub struct ReactionItem {
 }
 
 /// Assemble a list of ReactionItems from the database.
-pub fn list(
-    db: &Connection,
-    recorded_by: &str,
-) -> Result<Vec<ReactionItem>, rusqlite::Error> {
+pub fn list(db: &Connection, recorded_by: &str) -> Result<Vec<ReactionItem>, rusqlite::Error> {
     let rows = list_rows(db, recorded_by)?;
     Ok(rows
         .into_iter()

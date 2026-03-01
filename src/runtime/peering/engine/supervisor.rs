@@ -21,8 +21,8 @@ use tracing::{info, warn};
 use crate::contracts::event_pipeline_contract::{IngestFns, IngestItem};
 use crate::db::transport_creds::TenantInfo;
 use crate::peering::loops::{
-    accept_loop_with_ingest_until_cancel, connect_loop_with_coordination_until_cancel_with_fallback,
-    IntroSpawnerFn,
+    accept_loop_with_ingest_until_cancel,
+    connect_loop_with_coordination_until_cancel_with_fallback, IntroSpawnerFn,
 };
 use crate::sync::CoordinationManager;
 use crate::transport::{

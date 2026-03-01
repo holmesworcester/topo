@@ -1,23 +1,20 @@
-pub mod wire;
 pub mod projector;
 pub mod queries;
+pub mod wire;
 
 // Re-export stable public API so callers import from `event_modules::peer_shared`.
-pub use wire::{
-    PeerSharedFirstEvent, PeerSharedOngoingEvent,
-    parse_peer_shared_first, encode_peer_shared_first,
-    parse_peer_shared_ongoing, encode_peer_shared_ongoing,
-    PEER_SHARED_WIRE_SIZE,
-    PEER_SHARED_FIRST_META, PEER_SHARED_ONGOING_META,
-};
-pub use queries::{
-    count, list_event_ids, first_event_id, AccountRow, list_accounts,
-    load_local_peer_signer, load_local_peer_signer_required, resolve_user_event_id,
-    resolve_event_id_by_transport_fingerprint,
-    load_local_user_key,
-    AccountItem, list_account_items, IdentityResponse, identity,
-};
 pub use projector::project_pure;
+pub use queries::{
+    count, first_event_id, identity, list_account_items, list_accounts, list_event_ids,
+    load_local_peer_signer, load_local_peer_signer_required, load_local_user_key,
+    resolve_event_id_by_transport_fingerprint, resolve_user_event_id, AccountItem, AccountRow,
+    IdentityResponse,
+};
+pub use wire::{
+    encode_peer_shared_first, encode_peer_shared_ongoing, parse_peer_shared_first,
+    parse_peer_shared_ongoing, PeerSharedFirstEvent, PeerSharedOngoingEvent,
+    PEER_SHARED_FIRST_META, PEER_SHARED_ONGOING_META, PEER_SHARED_WIRE_SIZE,
+};
 
 use rusqlite::Connection;
 

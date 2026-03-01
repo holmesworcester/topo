@@ -1,22 +1,17 @@
-pub mod layout;
-pub mod wire;
 pub mod commands;
-pub mod queries;
+pub mod layout;
 pub mod projector;
+pub mod queries;
+pub mod wire;
 
 // Re-export stable public API so callers import from `event_modules::message`.
-pub use wire::{MessageEvent, parse_message, encode_message, MESSAGE_META, MESSAGE_WIRE_SIZE};
 pub use commands::{
-    CreateMessageCmd, create, send, DeleteResponse,
-    CreateMessageDeletionCmd, create_deletion, delete_message,
-    GenerateResponse, send_for_peer, delete_message_for_peer, generate_for_peer,
-};
-pub use queries::{
-    MessageRow, list_rows, count,
-    resolve_number, resolve,
-    list, list_deleted_ids,
+    create, create_deletion, delete_message, delete_message_for_peer, generate_for_peer, send,
+    send_for_peer, CreateMessageCmd, CreateMessageDeletionCmd, DeleteResponse, GenerateResponse,
 };
 pub use projector::project_pure;
+pub use queries::{count, list, list_deleted_ids, list_rows, resolve, resolve_number, MessageRow};
+pub use wire::{encode_message, parse_message, MessageEvent, MESSAGE_META, MESSAGE_WIRE_SIZE};
 
 use rusqlite::Connection;
 

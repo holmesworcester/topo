@@ -1,18 +1,17 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use topo::crypto::{event_id_from_base64, event_id_to_base64};
+use topo::db::open_connection;
+use topo::peering::loops::{accept_loop, connect_loop};
 use topo::testutil::{
     assert_eventually, start_peers_pinned, sync_until_converged, Peer, ScenarioHarness,
     SharedDbNode,
 };
-use topo::transport::{
-    AllowedPeers, create_client_endpoint, create_server_endpoint,
-    extract_spki_fingerprint, peer_identity_from_connection,
-};
-use topo::peering::loops::{accept_loop, connect_loop};
 use topo::testutil::{noop_intro_spawner, test_ingest_fns};
-use topo::db::open_connection;
-
+use topo::transport::{
+    create_client_endpoint, create_server_endpoint, extract_spki_fingerprint,
+    peer_identity_from_connection, AllowedPeers,
+};
 
 #[tokio::test]
 async fn test_two_peer_bidirectional_sync() {
@@ -38,7 +37,8 @@ async fn test_two_peer_bidirectional_sync() {
         || bob.has_event(&alice_marker_b64) && alice.has_event(&bob_marker_b64),
         Duration::from_secs(15),
         "both peers should receive each other's marker events",
-    ).await;
+    )
+    .await;
 
     // Only locally-created messages are projected (remote messages are blocked
     // because their signer chain is from a different network)
@@ -69,7 +69,8 @@ async fn test_one_way_sync() {
         || bob.has_event(&marker_b64),
         Duration::from_secs(15),
         "bob should receive alice's events including marker",
-    ).await;
+    )
+    .await;
 
     drop(sync);
 
@@ -100,7 +101,8 @@ async fn test_concurrent_create_and_sync() {
         || bob.has_event(&alice_msg_b64) && alice.has_event(&bob_msg_b64),
         Duration::from_secs(15),
         "both peers should receive each other's messages",
-    ).await;
+    )
+    .await;
 
     // Create more messages — sync loop picks them up
     let another = alice.create_message("Another from Alice");
@@ -110,7 +112,8 @@ async fn test_concurrent_create_and_sync() {
         || bob.has_event(&another_b64),
         Duration::from_secs(15),
         "bob gets the new message via live sync",
-    ).await;
+    )
+    .await;
 
     drop(sync);
 
@@ -135,10 +138,12 @@ async fn test_sync_10k() {
     let marker_b64 = sample_ids[0].clone();
 
     let metrics = sync_until_converged(
-        &alice, &bob,
+        &alice,
+        &bob,
         || bob.has_event(&marker_b64),
         Duration::from_secs(120),
-    ).await;
+    )
+    .await;
 
     eprintln!("10k sync: {}", metrics);
 
@@ -176,7 +181,8 @@ async fn test_recorded_events_isolation() {
         || bob.has_event(&alice_marker_b64) && alice.has_event(&bob_marker_b64),
         Duration::from_secs(15),
         "both peers should receive each other's marker events",
-    ).await;
+    )
+    .await;
 
     drop(sync);
 
@@ -217,7 +223,8 @@ async fn test_reaction_sync() {
         || bob.has_event(&msg2_b64) && alice.has_event(&bob_rxn2_b64),
         Duration::from_secs(15),
         "both peers should receive each other's events",
-    ).await;
+    )
+    .await;
 
     drop(sync);
 
@@ -247,8 +254,16 @@ async fn test_zero_loss_stress() {
 
     let alice_ids_before = alice.store_ids();
     let bob_ids_before = bob.store_ids();
-    assert_eq!(alice.message_count(), 5_000, "alice should have 5000 messages before sync");
-    assert_eq!(bob.message_count(), 5_000, "bob should have 5000 messages before sync");
+    assert_eq!(
+        alice.message_count(),
+        5_000,
+        "alice should have 5000 messages before sync"
+    );
+    assert_eq!(
+        bob.message_count(),
+        5_000,
+        "bob should have 5000 messages before sync"
+    );
 
     // Sample multiple events from both sides to ensure full bidirectional sync.
     // A single sample can pass after only a partial transfer.
@@ -314,7 +329,8 @@ async fn test_zero_loss_stress() {
         assert!(
             phase2_start.elapsed() < phase2_timeout,
             "phase 2 quiescence timed out: alice_only={}, bob_only={}",
-            a_only, b_only,
+            a_only,
+            b_only,
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
@@ -325,7 +341,11 @@ async fn test_zero_loss_stress() {
     let a_after = alice.store_count();
     let b_after = bob.store_count();
     let events_transferred = ((a_after - a_before) + (b_after - b_before)) as u64;
-    let events_per_sec = if wall_secs > 0.0 { events_transferred as f64 / wall_secs } else { 0.0 };
+    let events_per_sec = if wall_secs > 0.0 {
+        events_transferred as f64 / wall_secs
+    } else {
+        0.0
+    };
     let bytes_transferred = events_transferred * 100;
     let throughput_mib_s = (bytes_transferred as f64) / (1024.0 * 1024.0) / wall_secs.max(0.001);
     eprintln!(
@@ -339,8 +359,16 @@ async fn test_zero_loss_stress() {
 
     let alice_only: Vec<_> = alice_ids.difference(&bob_ids).collect();
     let bob_only: Vec<_> = bob_ids.difference(&alice_ids).collect();
-    assert!(alice_only.len() <= local_event_budget, "alice has too many unique events: {}", alice_only.len());
-    assert!(bob_only.len() <= local_event_budget, "bob has too many unique events: {}", bob_only.len());
+    assert!(
+        alice_only.len() <= local_event_budget,
+        "alice has too many unique events: {}",
+        alice_only.len()
+    );
+    assert!(
+        bob_only.len() <= local_event_budget,
+        "bob has too many unique events: {}",
+        bob_only.len()
+    );
 
     // Verify all original events survived on their own peer
     for id in &alice_ids_before {
@@ -376,7 +404,8 @@ async fn test_recorded_at_monotonicity() {
         || bob.has_event(&third_b64),
         Duration::from_secs(15),
         "bob should receive alice's events including the last message",
-    ).await;
+    )
+    .await;
 
     drop(sync);
 
@@ -391,7 +420,11 @@ async fn test_recorded_at_monotonicity() {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
 
-        assert!(timestamps.len() >= 3, "expected >= 3 recorded events for {}", peer.name);
+        assert!(
+            timestamps.len() >= 3,
+            "expected >= 3 recorded events for {}",
+            peer.name
+        );
 
         for window in timestamps.windows(2) {
             assert!(
@@ -472,7 +505,8 @@ async fn test_cross_workspace_isolation() {
         || peer_a2.has_event(&a1_marker_b64) && peer_a1.has_event(&a2_marker_b64),
         Duration::from_secs(15),
         "workspace A peers should exchange marker events",
-    ).await;
+    )
+    .await;
     drop(sync_a);
 
     // Sync workspace B peers
@@ -481,7 +515,8 @@ async fn test_cross_workspace_isolation() {
         || peer_b2.has_event(&b1_marker_b64) && peer_b1.has_event(&b2_marker_b64),
         Duration::from_secs(15),
         "workspace B peers should exchange marker events",
-    ).await;
+    )
+    .await;
     drop(sync_b);
 
     // Verify scoped messages: only locally-created messages are projected (foreign signer blocked)
@@ -563,10 +598,12 @@ async fn test_sync_50k() {
     let marker_b64 = sample_ids[0].clone();
 
     let metrics = sync_until_converged(
-        &alice, &bob,
+        &alice,
+        &bob,
         || bob.has_event(&marker_b64),
         Duration::from_secs(300),
-    ).await;
+    )
+    .await;
 
     eprintln!("50k sync: {}", metrics);
 
@@ -599,25 +636,18 @@ async fn test_peer_identity_extraction_live_handshake() {
     let allowed_for_a = Arc::new(AllowedPeers::from_fingerprints(vec![fp_b]));
     let allowed_for_b = Arc::new(AllowedPeers::from_fingerprints(vec![fp_a]));
 
-    let server_ep = create_server_endpoint(
-        "127.0.0.1:0".parse().unwrap(),
-        cert_a, key_a, allowed_for_a,
-    ).unwrap();
+    let server_ep =
+        create_server_endpoint("127.0.0.1:0".parse().unwrap(), cert_a, key_a, allowed_for_a)
+            .unwrap();
     let addr = server_ep.local_addr().unwrap();
 
-    let client_ep = create_client_endpoint(
-        "0.0.0.0:0".parse().unwrap(),
-        cert_b, key_b, allowed_for_b,
-    ).unwrap();
+    let client_ep =
+        create_client_endpoint("0.0.0.0:0".parse().unwrap(), cert_b, key_b, allowed_for_b).unwrap();
 
     // Client connects, server accepts
     let (client_conn, server_conn) = tokio::join!(
-        async {
-            client_ep.connect(addr, "localhost").unwrap().await.unwrap()
-        },
-        async {
-            server_ep.accept().await.unwrap().await.unwrap()
-        }
+        async { client_ep.connect(addr, "localhost").unwrap().await.unwrap() },
+        async { server_ep.accept().await.unwrap().await.unwrap() }
     );
 
     // Extract identities from live connections
@@ -625,11 +655,13 @@ async fn test_peer_identity_extraction_live_handshake() {
     let server_sees_client = peer_identity_from_connection(&server_conn);
 
     assert_eq!(
-        client_sees_server.as_deref(), Some(expected_a.as_str()),
+        client_sees_server.as_deref(),
+        Some(expected_a.as_str()),
         "client should see server's (Alice's) fingerprint"
     );
     assert_eq!(
-        server_sees_client.as_deref(), Some(expected_b.as_str()),
+        server_sees_client.as_deref(),
+        Some(expected_b.as_str()),
         "server should see client's (Bob's) fingerprint"
     );
 
@@ -668,7 +700,8 @@ async fn test_out_of_order_reaction_sync() {
         || bob.has_event(&msg_id_b64) && alice.has_event(&rxn_id_b64),
         Duration::from_secs(15),
         "both peers should receive each other's events",
-    ).await;
+    )
+    .await;
 
     drop(sync);
 
@@ -715,7 +748,8 @@ async fn test_multi_dep_blocking_sync() {
         || bob.has_event(&msg3_b64) && alice.has_event(&bob_rxn3_b64),
         Duration::from_secs(15),
         "both peers should receive each other's events",
-    ).await;
+    )
+    .await;
 
     drop(sync);
 
@@ -755,7 +789,8 @@ async fn test_cross_tenant_dep_scoping_after_sync() {
         || bob.has_event(&msg_b64) && bob.has_event(&rxn_b64),
         Duration::from_secs(15),
         "bob should receive alice's message and reaction events",
-    ).await;
+    )
+    .await;
 
     drop(sync);
 
@@ -768,17 +803,26 @@ async fn test_cross_tenant_dep_scoping_after_sync() {
     let alice_db = open_connection(&alice.db_path).expect("open alice db");
     let bob_db = open_connection(&bob.db_path).expect("open bob db");
 
-    let alice_valid: i64 = alice_db.query_row(
-        "SELECT COUNT(*) FROM valid_events WHERE peer_id = ?1",
-        rusqlite::params![&alice.identity],
-        |row| row.get(0),
-    ).unwrap();
-    let bob_valid: i64 = bob_db.query_row(
-        "SELECT COUNT(*) FROM valid_events WHERE peer_id = ?1",
-        rusqlite::params![&bob.identity],
-        |row| row.get(0),
-    ).unwrap();
-    assert!(alice_valid > bob_valid, "Alice should have more valid events due to content (alice={}, bob={})", alice_valid, bob_valid);
+    let alice_valid: i64 = alice_db
+        .query_row(
+            "SELECT COUNT(*) FROM valid_events WHERE peer_id = ?1",
+            rusqlite::params![&alice.identity],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let bob_valid: i64 = bob_db
+        .query_row(
+            "SELECT COUNT(*) FROM valid_events WHERE peer_id = ?1",
+            rusqlite::params![&bob.identity],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        alice_valid > bob_valid,
+        "Alice should have more valid events due to content (alice={}, bob={})",
+        alice_valid,
+        bob_valid
+    );
 
     harness.finish();
 }
@@ -799,7 +843,10 @@ async fn test_encrypted_event_sync() {
     let fixed_ts = 4_000_000u64;
     let sk_eid_alice = alice.create_secret_key_deterministic(key_bytes, fixed_ts);
     let sk_eid_bob = bob.create_secret_key_deterministic(key_bytes, fixed_ts);
-    assert_eq!(sk_eid_alice, sk_eid_bob, "deterministic PSK materialization should match");
+    assert_eq!(
+        sk_eid_alice, sk_eid_bob,
+        "deterministic PSK materialization should match"
+    );
 
     let enc_eid = alice.create_encrypted_message(&sk_eid_alice, "Hello encrypted world");
     let enc_b64 = event_id_to_base64(&enc_eid);
@@ -816,7 +863,8 @@ async fn test_encrypted_event_sync() {
         || bob.has_event(&enc_b64),
         Duration::from_secs(15),
         "bob should receive alice's encrypted event",
-    ).await;
+    )
+    .await;
 
     drop(sync);
 
@@ -860,10 +908,15 @@ async fn test_encrypted_out_of_order_sync() {
     let sync1 = start_peers_pinned(&alice, &bob);
 
     assert_eventually(
-        || bob.has_event(&enc_b64) && bob.has_event(&alice_msg_b64) && alice.has_event(&bob_msg_b64),
+        || {
+            bob.has_event(&enc_b64)
+                && bob.has_event(&alice_msg_b64)
+                && alice.has_event(&bob_msg_b64)
+        },
         Duration::from_secs(15),
         "phase 1: both peers should have synced shared events",
-    ).await;
+    )
+    .await;
 
     drop(sync1);
 
@@ -872,16 +925,24 @@ async fn test_encrypted_out_of_order_sync() {
     // Bob: only his own message projected (Alice's normal message blocked by foreign signer)
     assert_eq!(bob.scoped_message_count(), 1);
     let bob_db = open_connection(&bob.db_path).expect("open bob db");
-    let blocked_before: i64 = bob_db.query_row(
-        "SELECT COUNT(*) FROM blocked_event_deps WHERE peer_id = ?1",
-        rusqlite::params![&bob.identity],
-        |row| row.get(0),
-    ).unwrap();
-    assert!(blocked_before >= 1, "encrypted wrapper should be blocked until key appears");
+    let blocked_before: i64 = bob_db
+        .query_row(
+            "SELECT COUNT(*) FROM blocked_event_deps WHERE peer_id = ?1",
+            rusqlite::params![&bob.identity],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        blocked_before >= 1,
+        "encrypted wrapper should be blocked until key appears"
+    );
 
     // Materialize the matching key locally on Bob; this should unblock encrypted wrapper.
     let sk_eid_bob = bob.create_secret_key_deterministic(key_bytes, fixed_ts);
-    assert_eq!(sk_eid_bob, sk_eid, "bob key materialization should match alice key event id");
+    assert_eq!(
+        sk_eid_bob, sk_eid,
+        "bob key materialization should match alice key event id"
+    );
 
     // After key materialization, the encrypted wrapper unblocks. But the inner message
     // has signed_by = Alice's PeerShared (foreign signer), so it gets rejected.
@@ -938,67 +999,136 @@ async fn test_project_queue_crash_recovery() {
 
     // Now simulate a crash scenario: clear ALL projection state and re-enqueue ALL events
     let db = open_connection(&alice.db_path).expect("open db");
-    db.execute("DELETE FROM messages WHERE recorded_by = ?1", rusqlite::params![&alice.identity]).unwrap();
-    db.execute("DELETE FROM workspaces WHERE recorded_by = ?1", rusqlite::params![&alice.identity]).unwrap();
-    db.execute("DELETE FROM invite_accepted WHERE recorded_by = ?1", rusqlite::params![&alice.identity]).unwrap();
-    db.execute("DELETE FROM user_invites WHERE recorded_by = ?1", rusqlite::params![&alice.identity]).unwrap();
-    db.execute("DELETE FROM users WHERE recorded_by = ?1", rusqlite::params![&alice.identity]).unwrap();
-    db.execute("DELETE FROM device_invites WHERE recorded_by = ?1", rusqlite::params![&alice.identity]).unwrap();
-    db.execute("DELETE FROM peers_shared WHERE recorded_by = ?1", rusqlite::params![&alice.identity]).unwrap();
-    db.execute("DELETE FROM trust_anchors WHERE peer_id = ?1", rusqlite::params![&alice.identity]).unwrap();
-    db.execute("DELETE FROM valid_events WHERE peer_id = ?1", rusqlite::params![&alice.identity]).unwrap();
-    db.execute("DELETE FROM blocked_event_deps WHERE peer_id = ?1", rusqlite::params![&alice.identity]).unwrap();
-    db.execute("DELETE FROM rejected_events WHERE peer_id = ?1", rusqlite::params![&alice.identity]).unwrap();
+    db.execute(
+        "DELETE FROM messages WHERE recorded_by = ?1",
+        rusqlite::params![&alice.identity],
+    )
+    .unwrap();
+    db.execute(
+        "DELETE FROM workspaces WHERE recorded_by = ?1",
+        rusqlite::params![&alice.identity],
+    )
+    .unwrap();
+    db.execute(
+        "DELETE FROM invite_accepted WHERE recorded_by = ?1",
+        rusqlite::params![&alice.identity],
+    )
+    .unwrap();
+    db.execute(
+        "DELETE FROM user_invites WHERE recorded_by = ?1",
+        rusqlite::params![&alice.identity],
+    )
+    .unwrap();
+    db.execute(
+        "DELETE FROM users WHERE recorded_by = ?1",
+        rusqlite::params![&alice.identity],
+    )
+    .unwrap();
+    db.execute(
+        "DELETE FROM device_invites WHERE recorded_by = ?1",
+        rusqlite::params![&alice.identity],
+    )
+    .unwrap();
+    db.execute(
+        "DELETE FROM peers_shared WHERE recorded_by = ?1",
+        rusqlite::params![&alice.identity],
+    )
+    .unwrap();
+    db.execute(
+        "DELETE FROM trust_anchors WHERE peer_id = ?1",
+        rusqlite::params![&alice.identity],
+    )
+    .unwrap();
+    db.execute(
+        "DELETE FROM valid_events WHERE peer_id = ?1",
+        rusqlite::params![&alice.identity],
+    )
+    .unwrap();
+    db.execute(
+        "DELETE FROM blocked_event_deps WHERE peer_id = ?1",
+        rusqlite::params![&alice.identity],
+    )
+    .unwrap();
+    db.execute(
+        "DELETE FROM rejected_events WHERE peer_id = ?1",
+        rusqlite::params![&alice.identity],
+    )
+    .unwrap();
 
     // Enqueue ALL recorded events into project_queue (simulating full crash recovery)
     let pq = ProjectQueue::new(&db);
     let all_eids: Vec<String> = {
-        let mut stmt = db.prepare(
-            "SELECT event_id FROM recorded_events WHERE peer_id = ?1"
-        ).unwrap();
-        stmt.query_map(rusqlite::params![&alice.identity], |row| row.get::<_, String>(0))
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap()
+        let mut stmt = db
+            .prepare("SELECT event_id FROM recorded_events WHERE peer_id = ?1")
+            .unwrap();
+        stmt.query_map(rusqlite::params![&alice.identity], |row| {
+            row.get::<_, String>(0)
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
     };
     for eid_b64 in &all_eids {
         pq.enqueue(&alice.identity, eid_b64).unwrap();
     }
-    assert!(all_eids.len() >= 3 + 1, "should have identity events + 3 messages, got {}", all_eids.len());
+    assert!(
+        all_eids.len() >= 3 + 1,
+        "should have identity events + 3 messages, got {}",
+        all_eids.len()
+    );
 
     // Verify nothing projected yet
-    let msg_count: i64 = db.query_row(
-        "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
-        rusqlite::params![&alice.identity], |row| row.get(0),
-    ).unwrap();
+    let msg_count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
+            rusqlite::params![&alice.identity],
+            |row| row.get(0),
+        )
+        .unwrap();
     assert_eq!(msg_count, 0);
 
     // Run recovery: recover expired leases + drain
     let recovered = pq.recover_expired().unwrap();
     assert_eq!(recovered, 0);
 
-    let drained = pq.drain(&alice.identity, |conn, eid_b64| {
-        if let Some(eid) = event_id_from_base64(eid_b64) {
-            project_one(conn, &alice.identity, &eid)
-                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-        }
-        Ok(())
-    }).unwrap();
-    assert_eq!(drained, all_eids.len(), "all enqueued events should be drained");
+    let drained = pq
+        .drain(&alice.identity, |conn, eid_b64| {
+            if let Some(eid) = event_id_from_base64(eid_b64) {
+                project_one(conn, &alice.identity, &eid)
+                    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        drained,
+        all_eids.len(),
+        "all enqueued events should be drained"
+    );
 
     // Verify all messages projected
-    let msg_count: i64 = db.query_row(
-        "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
-        rusqlite::params![&alice.identity], |row| row.get(0),
-    ).unwrap();
+    let msg_count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
+            rusqlite::params![&alice.identity],
+            |row| row.get(0),
+        )
+        .unwrap();
     assert_eq!(msg_count, 3);
 
     // Verify valid_events: at least identity + messages should be valid
-    let valid_count: i64 = db.query_row(
-        "SELECT COUNT(*) FROM valid_events WHERE peer_id = ?1",
-        rusqlite::params![&alice.identity], |row| row.get(0),
-    ).unwrap();
-    assert!(valid_count >= 3, "at least the 3 messages should be valid, got {}", valid_count);
+    let valid_count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM valid_events WHERE peer_id = ?1",
+            rusqlite::params![&alice.identity],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        valid_count >= 3,
+        "at least the 3 messages should be valid, got {}",
+        valid_count
+    );
 
     // Queue should be empty
     assert_eq!(pq.count_pending(&alice.identity).unwrap(), 0);
@@ -1023,7 +1153,8 @@ async fn test_project_queue_drain_after_batch() {
     let db = open_connection(&alice.db_path).expect("open db");
     let pq = ProjectQueue::new(&db);
 
-    let event_ids: Vec<String> = db.prepare("SELECT event_id FROM events")
+    let event_ids: Vec<String> = db
+        .prepare("SELECT event_id FROM events")
         .unwrap()
         .query_map([], |row| row.get::<_, String>(0))
         .unwrap()
@@ -1032,16 +1163,21 @@ async fn test_project_queue_drain_after_batch() {
 
     let refs: Vec<&str> = event_ids.iter().map(|s| s.as_str()).collect();
     let inserted = pq.enqueue_batch(&alice.identity, &refs).unwrap();
-    assert_eq!(inserted, 0, "guard should prevent re-enqueue of already-valid events");
+    assert_eq!(
+        inserted, 0,
+        "guard should prevent re-enqueue of already-valid events"
+    );
 
     // Drain should process nothing (queue empty)
-    let drained = pq.drain(&alice.identity, |conn, eid_b64| {
-        if let Some(eid) = event_id_from_base64(eid_b64) {
-            project_one(conn, &alice.identity, &eid)
-                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-        }
-        Ok(())
-    }).unwrap();
+    let drained = pq
+        .drain(&alice.identity, |conn, eid_b64| {
+            if let Some(eid) = event_id_from_base64(eid_b64) {
+                project_one(conn, &alice.identity, &eid)
+                    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+            }
+            Ok(())
+        })
+        .unwrap();
     assert_eq!(drained, 0);
 
     // State unchanged
@@ -1053,7 +1189,8 @@ async fn test_project_queue_drain_after_batch() {
 /// Integration test: egress_queue lifecycle — enqueue, claim, send, cleanup.
 #[tokio::test]
 async fn test_egress_queue_lifecycle() {
-    let harness = ScenarioHarness::skip("tests egress queue lifecycle, no projection state involved");
+    let harness =
+        ScenarioHarness::skip("tests egress queue lifecycle, no projection state involved");
     use topo::db::egress_queue::EgressQueue;
 
     let alice = Peer::new_with_identity("alice");
@@ -1130,7 +1267,8 @@ async fn test_deletion_sync() {
         || bob.has_event(&msg_b64) && bob.has_event(&rxn_b64),
         Duration::from_secs(15),
         "bob should receive alice's message and reaction",
-    ).await;
+    )
+    .await;
 
     drop(sync);
 
@@ -1153,14 +1291,27 @@ async fn test_deletion_sync() {
         || bob.has_event(&del_b64),
         Duration::from_secs(15),
         "bob should receive alice's deletion event",
-    ).await;
+    )
+    .await;
 
     drop(sync2);
 
     // Bob: all of Alice's events blocked (foreign signer), including deletion
-    assert_eq!(bob.message_count(), 0, "bob: no messages projected (foreign signer)");
-    assert_eq!(bob.reaction_count(), 0, "bob: no reactions projected (foreign signer)");
-    assert_eq!(bob.deleted_message_count(), 0, "bob: no tombstones (deletion blocked too)");
+    assert_eq!(
+        bob.message_count(),
+        0,
+        "bob: no messages projected (foreign signer)"
+    );
+    assert_eq!(
+        bob.reaction_count(),
+        0,
+        "bob: no reactions projected (foreign signer)"
+    );
+    assert_eq!(
+        bob.deleted_message_count(),
+        0,
+        "bob: no tombstones (deletion blocked too)"
+    );
 
     harness.finish();
 }
@@ -1193,13 +1344,18 @@ async fn test_deletion_before_target_sync() {
         || bob.has_event(&del_b64),
         Duration::from_secs(15),
         "bob should receive alice's deletion event",
-    ).await;
+    )
+    .await;
 
     drop(sync);
 
     // Bob: Alice's events blocked (foreign signer)
     assert_eq!(bob.message_count(), 0, "bob: no messages (foreign signer)");
-    assert_eq!(bob.deleted_message_count(), 0, "bob: no tombstones (foreign signer)");
+    assert_eq!(
+        bob.deleted_message_count(),
+        0,
+        "bob: no tombstones (foreign signer)"
+    );
 
     harness.finish();
 }
@@ -1225,11 +1381,13 @@ async fn test_encrypted_deletion() {
 
     // Get the inner message's event_id from the messages table
     let alice_db = open_connection(&alice.db_path).expect("open alice db");
-    let inner_msg_id: String = alice_db.query_row(
-        "SELECT message_id FROM messages WHERE recorded_by = ?1",
-        rusqlite::params![&alice.identity],
-        |row| row.get(0),
-    ).unwrap();
+    let inner_msg_id: String = alice_db
+        .query_row(
+            "SELECT message_id FROM messages WHERE recorded_by = ?1",
+            rusqlite::params![&alice.identity],
+            |row| row.get(0),
+        )
+        .unwrap();
     let inner_msg_eid = event_id_from_base64(&inner_msg_id).expect("parse inner msg id");
     drop(alice_db);
 
@@ -1272,7 +1430,8 @@ async fn test_deletion_replay_invariants() {
         || bob.has_event(&del_b64),
         Duration::from_secs(15),
         "bob should receive alice's deletion event",
-    ).await;
+    )
+    .await;
 
     drop(sync);
 
@@ -1300,7 +1459,10 @@ async fn test_local_only_events_not_synced() {
     let fixed_ts = 3000000u64;
     let sk_eid = alice.create_secret_key_deterministic(key_bytes, fixed_ts);
     let sk_eid_bob = bob.create_secret_key_deterministic(key_bytes, fixed_ts);
-    assert_eq!(sk_eid, sk_eid_bob, "deterministic PSK should produce same event_id");
+    assert_eq!(
+        sk_eid, sk_eid_bob,
+        "deterministic PSK should produce same event_id"
+    );
 
     // Alice creates encrypted message + normal message
     let enc_eid = alice.create_encrypted_message(&sk_eid, "Encrypted for local-only test");
@@ -1315,7 +1477,8 @@ async fn test_local_only_events_not_synced() {
         || bob.has_event(&enc_b64) && bob.has_event(&alice_msg_b64),
         Duration::from_secs(15),
         "bob should receive alice's encrypted and normal messages",
-    ).await;
+    )
+    .await;
 
     drop(sync);
 
@@ -1326,7 +1489,10 @@ async fn test_local_only_events_not_synced() {
 
     // Verify Alice's SK event_id IS in bob's events (because bob created his own copy)
     let sk_b64 = event_id_to_base64(&sk_eid);
-    assert!(bob.has_event(&sk_b64), "bob should have the SK event (his own local copy)");
+    assert!(
+        bob.has_event(&sk_b64),
+        "bob should have the SK event (his own local copy)"
+    );
 
     harness.finish();
 }
@@ -1361,21 +1527,31 @@ async fn test_psk_two_set_isolation() {
         || bob.has_event(&enc_b64) && bob.has_event(&alice_msg_b64),
         Duration::from_secs(15),
         "bob should receive alice's encrypted and cleartext events",
-    ).await;
+    )
+    .await;
 
     drop(sync);
 
     // Bob: normal message blocked (foreign signer), encrypted blocked (missing key dep)
-    assert_eq!(bob.scoped_message_count(), 0, "bob should see no messages (foreign signer + missing key)");
+    assert_eq!(
+        bob.scoped_message_count(),
+        0,
+        "bob should see no messages (foreign signer + missing key)"
+    );
 
     // Verify the encrypted event is blocked
     let bob_db = open_connection(&bob.db_path).expect("open bob db");
-    let blocked: i64 = bob_db.query_row(
-        "SELECT COUNT(*) FROM blocked_event_deps WHERE peer_id = ?1",
-        rusqlite::params![&bob.identity],
-        |row| row.get(0),
-    ).unwrap();
-    assert!(blocked >= 1, "events should be blocked (foreign signer + missing key dep)");
+    let blocked: i64 = bob_db
+        .query_row(
+            "SELECT COUNT(*) FROM blocked_event_deps WHERE peer_id = ?1",
+            rusqlite::params![&bob.identity],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        blocked >= 1,
+        "events should be blocked (foreign signer + missing key dep)"
+    );
 
     harness.finish();
 }
@@ -1402,7 +1578,8 @@ async fn test_endpoint_observations_recorded() {
         || bob.has_event(&marker_b64),
         Duration::from_secs(15),
         "bob should receive alice's message event",
-    ).await;
+    )
+    .await;
 
     drop(sync);
 
@@ -1410,43 +1587,68 @@ async fn test_endpoint_observations_recorded() {
     let alice_db = open_connection(&alice.db_path).expect("open alice db");
     let bob_db = open_connection(&bob.db_path).expect("open bob db");
 
-    let alice_obs: i64 = alice_db.query_row(
-        "SELECT COUNT(*) FROM peer_endpoint_observations WHERE recorded_by = ?1",
-        rusqlite::params![&alice.identity],
-        |row| row.get(0),
-    ).unwrap();
+    let alice_obs: i64 = alice_db
+        .query_row(
+            "SELECT COUNT(*) FROM peer_endpoint_observations WHERE recorded_by = ?1",
+            rusqlite::params![&alice.identity],
+            |row| row.get(0),
+        )
+        .unwrap();
 
-    let bob_obs: i64 = bob_db.query_row(
-        "SELECT COUNT(*) FROM peer_endpoint_observations WHERE recorded_by = ?1",
-        rusqlite::params![&bob.identity],
-        |row| row.get(0),
-    ).unwrap();
+    let bob_obs: i64 = bob_db
+        .query_row(
+            "SELECT COUNT(*) FROM peer_endpoint_observations WHERE recorded_by = ?1",
+            rusqlite::params![&bob.identity],
+            |row| row.get(0),
+        )
+        .unwrap();
 
     // Both should have recorded at least one observation
-    assert!(alice_obs >= 1, "alice should have endpoint observations, got {}", alice_obs);
-    assert!(bob_obs >= 1, "bob should have endpoint observations, got {}", bob_obs);
+    assert!(
+        alice_obs >= 1,
+        "alice should have endpoint observations, got {}",
+        alice_obs
+    );
+    assert!(
+        bob_obs >= 1,
+        "bob should have endpoint observations, got {}",
+        bob_obs
+    );
 
     // Purge with past cutoff (0) should keep all (all have future expires_at)
     let purged = purge_expired_endpoints(&alice_db, 0).unwrap();
     assert_eq!(purged, 0, "purge with past cutoff should keep all");
 
-    let still_there: i64 = alice_db.query_row(
-        "SELECT COUNT(*) FROM peer_endpoint_observations WHERE recorded_by = ?1",
-        rusqlite::params![&alice.identity],
-        |row| row.get(0),
-    ).unwrap();
-    assert_eq!(still_there, alice_obs, "observations should still be there after past-cutoff purge");
+    let still_there: i64 = alice_db
+        .query_row(
+            "SELECT COUNT(*) FROM peer_endpoint_observations WHERE recorded_by = ?1",
+            rusqlite::params![&alice.identity],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        still_there, alice_obs,
+        "observations should still be there after past-cutoff purge"
+    );
 
     // Purge with far-future cutoff should remove all
     let purged = purge_expired_endpoints(&alice_db, i64::MAX).unwrap();
-    assert!(purged >= 1, "purge with far-future cutoff should remove observations");
+    assert!(
+        purged >= 1,
+        "purge with far-future cutoff should remove observations"
+    );
 
-    let remaining: i64 = alice_db.query_row(
-        "SELECT COUNT(*) FROM peer_endpoint_observations WHERE recorded_by = ?1",
-        rusqlite::params![&alice.identity],
-        |row| row.get(0),
-    ).unwrap();
-    assert_eq!(remaining, 0, "no observations should remain after far-future purge");
+    let remaining: i64 = alice_db
+        .query_row(
+            "SELECT COUNT(*) FROM peer_endpoint_observations WHERE recorded_by = ?1",
+            rusqlite::params![&alice.identity],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        remaining, 0,
+        "no observations should remain after far-future purge"
+    );
 
     harness.finish();
 }
@@ -1456,10 +1658,10 @@ async fn test_endpoint_observations_recorded() {
 async fn test_encrypted_inner_unsupported_signer_rejects_durably() {
     use topo::crypto::hash_event;
     use topo::event_modules::{
-        EncryptedEvent, MessageEvent, ParsedEvent, EVENT_TYPE_MESSAGE, encode_event,
+        encode_event, EncryptedEvent, MessageEvent, ParsedEvent, EVENT_TYPE_MESSAGE,
     };
-    use topo::projection::encrypted::encrypt_event_blob;
     use topo::projection::apply::project_one;
+    use topo::projection::encrypted::encrypt_event_blob;
 
     let alice = Peer::new_with_identity("alice");
     let harness = ScenarioHarness::new();
@@ -1517,7 +1719,8 @@ async fn test_encrypted_inner_unsupported_signer_rejects_durably() {
     match result {
         topo::projection::decision::ProjectionDecision::Reject { reason } => {
             assert!(
-                reason.contains("unsupported signer_type") || reason.contains("signer resolution failed"),
+                reason.contains("unsupported signer_type")
+                    || reason.contains("signer resolution failed"),
                 "unexpected rejection reason: {}",
                 reason
             );
@@ -1583,11 +1786,8 @@ fn bootstrap_peer(peer: &Peer) -> BootstrapChain {
     // 2. UserInviteBoot (signed by workspace)
     let invite_key = SigningKey::generate(&mut rng);
     let invite_pubkey = invite_key.verifying_key().to_bytes();
-    let user_invite_eid = peer.create_user_invite_boot_with_key(
-        invite_pubkey,
-        &workspace_key,
-        &workspace_eid,
-    );
+    let user_invite_eid =
+        peer.create_user_invite_boot_with_key(invite_pubkey, &workspace_key, &workspace_eid);
 
     // 3. InviteAccepted (local, binds trust anchor)
     let invite_accepted_eid = peer.create_invite_accepted(&user_invite_eid, workspace_id);
@@ -1600,11 +1800,8 @@ fn bootstrap_peer(peer: &Peer) -> BootstrapChain {
     // 5. DeviceInviteFirst (signed by user)
     let device_invite_key = SigningKey::generate(&mut rng);
     let device_invite_pubkey = device_invite_key.verifying_key().to_bytes();
-    let device_invite_eid = peer.create_device_invite_first(
-        device_invite_pubkey,
-        &user_key,
-        &user_eid,
-    );
+    let device_invite_eid =
+        peer.create_device_invite_first(device_invite_pubkey, &user_key, &user_eid);
 
     // 6. PeerSharedFirst (signed by device_invite)
     let peer_shared_key = SigningKey::generate(&mut rng);
@@ -1619,12 +1816,7 @@ fn bootstrap_peer(peer: &Peer) -> BootstrapChain {
     // 7. AdminBoot (signed by workspace, dep on user)
     let admin_key = SigningKey::generate(&mut rng);
     let admin_pubkey = admin_key.verifying_key().to_bytes();
-    let admin_eid = peer.create_admin_boot(
-        admin_pubkey,
-        &workspace_key,
-        &user_eid,
-        &workspace_eid,
-    );
+    let admin_eid = peer.create_admin_boot(admin_pubkey, &workspace_key, &user_eid, &workspace_eid);
 
     BootstrapChain {
         workspace_key,
@@ -1654,20 +1846,27 @@ fn test_bootstrap_sequence() {
     let db = open_connection(&alice.db_path).unwrap();
 
     // Verify trust anchor was set correctly
-    let anchor: String = db.query_row(
-        "SELECT workspace_id FROM trust_anchors WHERE peer_id = ?1",
-        rusqlite::params![&alice.identity],
-        |row| row.get(0),
-    ).expect("trust anchor should exist");
+    let anchor: String = db
+        .query_row(
+            "SELECT workspace_id FROM trust_anchors WHERE peer_id = ?1",
+            rusqlite::params![&alice.identity],
+            |row| row.get(0),
+        )
+        .expect("trust anchor should exist");
     let expected_nid = event_id_to_base64(&chain.workspace_id);
-    assert_eq!(anchor, expected_nid, "trust anchor should match workspace_id");
+    assert_eq!(
+        anchor, expected_nid,
+        "trust anchor should match workspace_id"
+    );
 
     // Verify all events are valid
-    let valid_count: i64 = db.query_row(
-        "SELECT COUNT(*) FROM valid_events WHERE peer_id = ?1",
-        rusqlite::params![&alice.identity],
-        |row| row.get(0),
-    ).unwrap();
+    let valid_count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM valid_events WHERE peer_id = ?1",
+            rusqlite::params![&alice.identity],
+            |row| row.get(0),
+        )
+        .unwrap();
     // At least the bootstrap chain should be valid.
     assert!(
         valid_count >= 7,
@@ -1676,53 +1875,70 @@ fn test_bootstrap_sequence() {
     );
 
     // Verify projection tables
-    let net_count: i64 = db.query_row(
-        "SELECT COUNT(*) FROM workspaces WHERE recorded_by = ?1",
-        rusqlite::params![&alice.identity],
-        |row| row.get(0),
-    ).unwrap();
-    assert_eq!(net_count, 1, "one trust-anchored workspace should be projected");
+    let net_count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM workspaces WHERE recorded_by = ?1",
+            rusqlite::params![&alice.identity],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        net_count, 1,
+        "one trust-anchored workspace should be projected"
+    );
 
-    let user_invite_count: i64 = db.query_row(
-        "SELECT COUNT(*) FROM user_invites WHERE recorded_by = ?1",
-        rusqlite::params![&alice.identity],
-        |row| row.get(0),
-    ).unwrap();
+    let user_invite_count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM user_invites WHERE recorded_by = ?1",
+            rusqlite::params![&alice.identity],
+            |row| row.get(0),
+        )
+        .unwrap();
     assert_eq!(user_invite_count, 1);
 
-    let user_count: i64 = db.query_row(
-        "SELECT COUNT(*) FROM users WHERE recorded_by = ?1",
-        rusqlite::params![&alice.identity],
-        |row| row.get(0),
-    ).unwrap();
+    let user_count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM users WHERE recorded_by = ?1",
+            rusqlite::params![&alice.identity],
+            |row| row.get(0),
+        )
+        .unwrap();
     assert_eq!(user_count, 1);
 
-    let di_count: i64 = db.query_row(
-        "SELECT COUNT(*) FROM device_invites WHERE recorded_by = ?1",
-        rusqlite::params![&alice.identity],
-        |row| row.get(0),
-    ).unwrap();
+    let di_count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM device_invites WHERE recorded_by = ?1",
+            rusqlite::params![&alice.identity],
+            |row| row.get(0),
+        )
+        .unwrap();
     assert_eq!(di_count, 1);
 
-    let ps_count: i64 = db.query_row(
-        "SELECT COUNT(*) FROM peers_shared WHERE recorded_by = ?1",
-        rusqlite::params![&alice.identity],
-        |row| row.get(0),
-    ).unwrap();
+    let ps_count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM peers_shared WHERE recorded_by = ?1",
+            rusqlite::params![&alice.identity],
+            |row| row.get(0),
+        )
+        .unwrap();
     assert_eq!(ps_count, 1);
 
-    let admin_count: i64 = db.query_row(
-        "SELECT COUNT(*) FROM admins WHERE recorded_by = ?1",
-        rusqlite::params![&alice.identity],
-        |row| row.get(0),
-    ).unwrap();
+    let admin_count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM admins WHERE recorded_by = ?1",
+            rusqlite::params![&alice.identity],
+            |row| row.get(0),
+        )
+        .unwrap();
     assert_eq!(admin_count, 1);
 
-    let ia_count: i64 = db.query_row(
-        "SELECT COUNT(*) FROM invite_accepted WHERE recorded_by = ?1",
-        rusqlite::params![&alice.identity],
-        |row| row.get(0),
-    ).unwrap();
+    let ia_count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM invite_accepted WHERE recorded_by = ?1",
+            rusqlite::params![&alice.identity],
+            |row| row.get(0),
+        )
+        .unwrap();
     assert_eq!(ia_count, 1);
 
     harness.finish();
@@ -1738,11 +1954,13 @@ fn test_out_of_order_identity() {
     let db = open_connection(&alice.db_path).unwrap();
 
     use ed25519_dalek::SigningKey;
-    use topo::event_modules::{encode_event, ParsedEvent, WorkspaceEvent, UserInviteBootEvent, UserBootEvent};
-    use topo::projection::signer::sign_event_bytes;
-    use topo::projection::apply::project_one;
     use topo::crypto::hash_event;
     use topo::event_modules::registry;
+    use topo::event_modules::{
+        encode_event, ParsedEvent, UserBootEvent, UserInviteBootEvent, WorkspaceEvent,
+    };
+    use topo::projection::apply::project_one;
+    use topo::projection::signer::sign_event_bytes;
 
     let mut rng = rand::thread_rng();
     let workspace_key = SigningKey::generate(&mut rng);
@@ -1753,7 +1971,9 @@ fn test_out_of_order_identity() {
     let user_pubkey = user_key.verifying_key().to_bytes();
 
     let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
     let reg = registry();
 
     // Pre-build Workspace blob to get workspace_eid
@@ -1761,7 +1981,8 @@ fn test_out_of_order_identity() {
         created_at_ms: now_ms,
         public_key: workspace_pubkey,
         name: "test-workspace".to_string(),
-    })).unwrap();
+    }))
+    .unwrap();
     let workspace_eid = hash_event(&net_blob);
     let workspace_id = workspace_eid;
 
@@ -1773,7 +1994,8 @@ fn test_out_of_order_identity() {
         signed_by: workspace_eid,
         signer_type: 1,
         signature: [0u8; 64],
-    })).unwrap();
+    }))
+    .unwrap();
     let sig_offset = uib_blob.len() - 64;
     let sig = sign_event_bytes(&workspace_key, &uib_blob[..sig_offset]);
     uib_blob[sig_offset..].copy_from_slice(&sig);
@@ -1787,7 +2009,8 @@ fn test_out_of_order_identity() {
         signed_by: user_invite_eid,
         signer_type: 2,
         signature: [0u8; 64],
-    })).unwrap();
+    }))
+    .unwrap();
     let sig_offset = ub_blob.len() - 64;
     let sig = sign_event_bytes(&invite_key, &ub_blob[..sig_offset]);
     ub_blob[sig_offset..].copy_from_slice(&sig);
@@ -1809,15 +2032,24 @@ fn test_out_of_order_identity() {
     // Project UserBoot — should Block (signed_by dep user_invite_eid not valid)
     let result = project_one(&db, &alice.identity, &user_eid).unwrap();
     assert!(
-        matches!(result, topo::projection::decision::ProjectionDecision::Block { .. }),
-        "UserBoot should block when UserInviteBoot is not yet present, got {:?}", result,
+        matches!(
+            result,
+            topo::projection::decision::ProjectionDecision::Block { .. }
+        ),
+        "UserBoot should block when UserInviteBoot is not yet present, got {:?}",
+        result,
     );
-    let valid_before: bool = db.query_row(
-        "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-        rusqlite::params![&alice.identity, &user_b64],
-        |row| row.get(0),
-    ).unwrap();
-    assert!(!valid_before, "UserBoot should not be valid before invite chain");
+    let valid_before: bool = db
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![&alice.identity, &user_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        !valid_before,
+        "UserBoot should not be valid before invite chain"
+    );
 
     // Insert Workspace raw + project → Block (no trust anchor yet)
     let net_b64 = event_id_to_base64(&workspace_eid);
@@ -1833,8 +2065,12 @@ fn test_out_of_order_identity() {
     ).unwrap();
     let net_result = project_one(&db, &alice.identity, &workspace_eid).unwrap();
     assert!(
-        matches!(net_result, topo::projection::decision::ProjectionDecision::Block { .. }),
-        "Workspace should block (no trust anchor yet), got {:?}", net_result,
+        matches!(
+            net_result,
+            topo::projection::decision::ProjectionDecision::Block { .. }
+        ),
+        "Workspace should block (no trust anchor yet), got {:?}",
+        net_result,
     );
 
     // Insert UserInviteBoot raw + project → Block (signed_by = workspace_eid not valid)
@@ -1851,8 +2087,12 @@ fn test_out_of_order_identity() {
     ).unwrap();
     let uib_result = project_one(&db, &alice.identity, &user_invite_eid).unwrap();
     assert!(
-        matches!(uib_result, topo::projection::decision::ProjectionDecision::Block { .. }),
-        "UserInviteBoot should block (workspace dep not valid), got {:?}", uib_result,
+        matches!(
+            uib_result,
+            topo::projection::decision::ProjectionDecision::Block { .. }
+        ),
+        "UserInviteBoot should block (workspace dep not valid), got {:?}",
+        uib_result,
     );
 
     // Create InviteAccepted → sets trust anchor, triggers retry_guard_blocked_events
@@ -1860,26 +2100,38 @@ fn test_out_of_order_identity() {
     let _ia_eid = alice.create_invite_accepted(&user_invite_eid, workspace_id);
 
     // Assert full cascade completed — UserBoot should now be valid
-    let valid_after: bool = db.query_row(
-        "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-        rusqlite::params![&alice.identity, &user_b64],
-        |row| row.get(0),
-    ).unwrap();
-    assert!(valid_after, "UserBoot should be valid after cascade from invite chain");
+    let valid_after: bool = db
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![&alice.identity, &user_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        valid_after,
+        "UserBoot should be valid after cascade from invite chain"
+    );
 
     // Verify intermediate events are also valid
-    let net_valid: bool = db.query_row(
-        "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-        rusqlite::params![&alice.identity, &net_b64],
-        |row| row.get(0),
-    ).unwrap();
-    assert!(net_valid, "Workspace should be valid after trust anchor set");
+    let net_valid: bool = db
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![&alice.identity, &net_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        net_valid,
+        "Workspace should be valid after trust anchor set"
+    );
 
-    let uib_valid: bool = db.query_row(
-        "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-        rusqlite::params![&alice.identity, &uib_b64],
-        |row| row.get(0),
-    ).unwrap();
+    let uib_valid: bool = db
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![&alice.identity, &uib_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
     assert!(uib_valid, "UserInviteBoot should be valid after cascade");
 
     harness.finish();
@@ -1908,12 +2160,17 @@ fn test_foreign_workspace_excluded() {
         Ok(eid) => {
             // If it wasn't rejected at creation time, check DB state
             let foreign_b64 = event_id_to_base64(&eid);
-            let foreign_valid: bool = db.query_row(
-                "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-                rusqlite::params![&alice.identity, &foreign_b64],
-                |row| row.get(0),
-            ).unwrap();
-            assert!(!foreign_valid, "foreign workspace event should NOT be valid");
+            let foreign_valid: bool = db
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+                    rusqlite::params![&alice.identity, &foreign_b64],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(
+                !foreign_valid,
+                "foreign workspace event should NOT be valid"
+            );
         }
     }
 
@@ -1923,7 +2180,10 @@ fn test_foreign_workspace_excluded() {
         rusqlite::params![&alice.identity],
         |row| row.get(0),
     ).unwrap();
-    assert!(rejected_count > 0, "foreign workspace event should be rejected");
+    assert!(
+        rejected_count > 0,
+        "foreign workspace event should be rejected"
+    );
 
     harness.finish();
 }
@@ -1950,11 +2210,13 @@ fn test_removal_enforcement() {
     );
 
     let removal_b64 = event_id_to_base64(&removal_eid);
-    let valid: bool = db.query_row(
-        "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-        rusqlite::params![&alice.identity, &removal_b64],
-        |row| row.get(0),
-    ).unwrap();
+    let valid: bool = db
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![&alice.identity, &removal_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
     assert!(valid, "user_removed should be valid");
 
     // Verify removed_entities table updated
@@ -1963,7 +2225,10 @@ fn test_removal_enforcement() {
         rusqlite::params![&alice.identity],
         |row| row.get(0),
     ).unwrap();
-    assert_eq!(removed_count, 1, "removed_entities should have one user removal");
+    assert_eq!(
+        removed_count, 1,
+        "removed_entities should have one user removal"
+    );
 
     harness.finish();
 }
@@ -1991,18 +2256,22 @@ fn test_secret_shared_key_wrap() {
 
     let db = open_connection(&alice.db_path).unwrap();
     let ss_b64 = event_id_to_base64(&ss_eid);
-    let valid: bool = db.query_row(
-        "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-        rusqlite::params![&alice.identity, &ss_b64],
-        |row| row.get(0),
-    ).unwrap();
+    let valid: bool = db
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![&alice.identity, &ss_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
     assert!(valid, "secret_shared should be valid");
 
-    let ss_count: i64 = db.query_row(
-        "SELECT COUNT(*) FROM secret_shared WHERE recorded_by = ?1",
-        rusqlite::params![&alice.identity],
-        |row| row.get(0),
-    ).unwrap();
+    let ss_count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM secret_shared WHERE recorded_by = ?1",
+            rusqlite::params![&alice.identity],
+            |row| row.get(0),
+        )
+        .unwrap();
     assert_eq!(ss_count, 1, "secret_shared should be in projection table");
 
     harness.finish();
@@ -2013,9 +2282,9 @@ fn test_secret_shared_key_wrap() {
 /// then unblocks via cascade after Bob's identity chain events are synced in.
 #[test]
 fn test_secret_shared_blocks_until_signer_valid() {
+    use topo::event_modules::{ParsedEvent, SecretSharedEvent};
     use topo::projection::apply::project_one;
     use topo::projection::create::create_signed_event_staged;
-    use topo::event_modules::{ParsedEvent, SecretSharedEvent};
 
     let alice = Peer::new("alice");
     let bob = Peer::new("bob");
@@ -2036,7 +2305,9 @@ fn test_secret_shared_blocks_until_signer_valid() {
     let wrapped_key: [u8; 32] = rand::random();
     let ss_event = ParsedEvent::SecretShared(SecretSharedEvent {
         created_at_ms: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64,
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64,
         key_event_id: sk_eid,
         recipient_event_id: bob_join.peer_shared_eid,
         wrapped_key,
@@ -2046,38 +2317,53 @@ fn test_secret_shared_blocks_until_signer_valid() {
     });
     let alice_db = open_connection(&alice.db_path).unwrap();
     let ss_eid = create_signed_event_staged(
-        &alice_db, &alice.identity, &ss_event, &chain.peer_shared_key,
-    ).expect("staged create should succeed even if blocked");
+        &alice_db,
+        &alice.identity,
+        &ss_event,
+        &chain.peer_shared_key,
+    )
+    .expect("staged create should succeed even if blocked");
     let ss_b64 = event_id_to_base64(&ss_eid);
 
     // SecretShared should be blocked: recipient_event_id (Bob's PeerShared) is not
     // valid in Alice's DB yet.
-    let blocked_count: i64 = alice_db.query_row(
-        "SELECT COUNT(*) FROM blocked_event_deps WHERE peer_id = ?1 AND event_id = ?2",
-        rusqlite::params![&alice.identity, &ss_b64],
-        |row| row.get(0),
-    ).unwrap();
-    assert!(blocked_count >= 1,
-        "SecretShared should block — Bob's PeerShared not yet valid in Alice's DB");
+    let blocked_count: i64 = alice_db
+        .query_row(
+            "SELECT COUNT(*) FROM blocked_event_deps WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![&alice.identity, &ss_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        blocked_count >= 1,
+        "SecretShared should block — Bob's PeerShared not yet valid in Alice's DB"
+    );
 
     // Now simulate sync: copy Bob's shared events to Alice's DB and project them.
     let bob_db = open_connection(&bob.db_path).unwrap();
     let bob_events: Vec<(String, Vec<u8>)> = {
-        let mut stmt = bob_db.prepare(
-            "SELECT e.event_id, e.blob FROM events e
+        let mut stmt = bob_db
+            .prepare(
+                "SELECT e.event_id, e.blob FROM events e
              INNER JOIN recorded_events re ON e.event_id = re.event_id
              WHERE re.peer_id = ?1
-             ORDER BY e.created_at ASC"
-        ).unwrap();
+             ORDER BY e.created_at ASC",
+            )
+            .unwrap();
         stmt.query_map(rusqlite::params![&bob.identity], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-        }).unwrap().collect::<Result<Vec<_>, _>>().unwrap()
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
     };
 
     use topo::event_modules::registry;
     let reg = registry();
     let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
     for (eid_b64, blob) in &bob_events {
         let meta = reg.lookup(blob[0]).unwrap();
         if meta.share_scope.as_str() == "local" {
@@ -2097,20 +2383,29 @@ fn test_secret_shared_blocks_until_signer_valid() {
     }
 
     // After Bob's chain arrives and cascades, SecretShared should now be valid.
-    let ss_valid: bool = alice_db.query_row(
-        "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-        rusqlite::params![&alice.identity, &ss_b64],
-        |row| row.get(0),
-    ).unwrap();
-    assert!(ss_valid,
-        "SecretShared should be valid after Bob's identity chain arrived via cascade");
+    let ss_valid: bool = alice_db
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![&alice.identity, &ss_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        ss_valid,
+        "SecretShared should be valid after Bob's identity chain arrived via cascade"
+    );
 
-    let ss_projected: i64 = alice_db.query_row(
-        "SELECT COUNT(*) FROM secret_shared WHERE recorded_by = ?1",
-        rusqlite::params![&alice.identity],
-        |row| row.get(0),
-    ).unwrap();
-    assert!(ss_projected >= 1, "SecretShared should be in projection table after cascade");
+    let ss_projected: i64 = alice_db
+        .query_row(
+            "SELECT COUNT(*) FROM secret_shared WHERE recorded_by = ?1",
+            rusqlite::params![&alice.identity],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        ss_projected >= 1,
+        "SecretShared should be in projection table after cascade"
+    );
 
     harness.finish();
 }
@@ -2138,11 +2433,13 @@ fn test_encrypted_blocks_then_unblocks_on_key_materialization() {
     // of ciphertext BEFORE key materialization).
     let alice_db = open_connection(&alice.db_path).unwrap();
     let enc_b64 = event_id_to_base64(&enc_eid);
-    let enc_blob: Vec<u8> = alice_db.query_row(
-        "SELECT blob FROM events WHERE event_id = ?1",
-        rusqlite::params![&enc_b64],
-        |row| row.get(0),
-    ).unwrap();
+    let enc_blob: Vec<u8> = alice_db
+        .query_row(
+            "SELECT blob FROM events WHERE event_id = ?1",
+            rusqlite::params![&enc_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
 
     let bob_db = open_connection(&bob.db_path).unwrap();
     use topo::event_modules::registry;
@@ -2151,7 +2448,9 @@ fn test_encrypted_blocks_then_unblocks_on_key_materialization() {
     let reg = registry();
     let enc_meta = reg.lookup(enc_blob[0]).unwrap();
     let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
     bob_db.execute(
         "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -2164,22 +2463,33 @@ fn test_encrypted_blocks_then_unblocks_on_key_materialization() {
 
     // Project the encrypted event on Bob — should block (key_event_id dep not in valid_events).
     let result = project_one(&bob_db, &bob.identity, &enc_eid).unwrap();
-    assert!(matches!(result, ProjectionDecision::Block { .. }),
-        "Encrypted should block when key dep is missing: {:?}", result);
+    assert!(
+        matches!(result, ProjectionDecision::Block { .. }),
+        "Encrypted should block when key dep is missing: {:?}",
+        result
+    );
 
     // Verify key-dep blocking is recorded.
     let key_b64 = event_id_to_base64(&sk_eid);
-    let blocked_on_key: bool = bob_db.query_row(
-        "SELECT COUNT(*) > 0 FROM blocked_event_deps
+    let blocked_on_key: bool = bob_db
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM blocked_event_deps
          WHERE peer_id = ?1 AND event_id = ?2 AND blocker_event_id = ?3",
-        rusqlite::params![&bob.identity, &enc_b64, &key_b64],
-        |row| row.get(0),
-    ).unwrap();
-    assert!(blocked_on_key, "Encrypted should be blocked specifically on key_event_id dep");
+            rusqlite::params![&bob.identity, &enc_b64, &key_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        blocked_on_key,
+        "Encrypted should be blocked specifically on key_event_id dep"
+    );
 
     // Step 3: Materialize the same deterministic key on Bob.
     let bob_sk_eid = bob.create_secret_key_deterministic(key_bytes, fixed_ts);
-    assert_eq!(bob_sk_eid, sk_eid, "Deterministic key event IDs must match across peers");
+    assert_eq!(
+        bob_sk_eid, sk_eid,
+        "Deterministic key event IDs must match across peers"
+    );
 
     // After key materialization, re-project the encrypted wrapper once to assert
     // current dependency semantics directly from the projection decision:
@@ -2195,8 +2505,11 @@ fn test_encrypted_blocks_then_unblocks_on_key_materialization() {
 
     // Bob doesn't see Alice's encrypted message (foreign signer → inner rejected),
     // which is correct cross-workspace behavior.
-    assert_eq!(bob.scoped_message_count(), 0,
-        "Bob should not see Alice's message (foreign signer in separate workspace)");
+    assert_eq!(
+        bob.scoped_message_count(),
+        0,
+        "Bob should not see Alice's message (foreign signer in separate workspace)"
+    );
 
     harness.finish();
 }
@@ -2206,10 +2519,10 @@ fn test_encrypted_blocks_then_unblocks_on_key_materialization() {
 /// that underpins the invite key wrap/unwrap bootstrap flow.
 #[test]
 fn test_deterministic_key_event_id_matches_across_peers() {
-    use topo::projection::encrypted::{wrap_key_for_recipient, unwrap_key_from_sender};
     use ed25519_dalek::SigningKey;
-    use topo::event_modules::{encode_event, ParsedEvent, SecretKeyEvent};
     use topo::crypto::hash_event;
+    use topo::event_modules::{encode_event, ParsedEvent, SecretKeyEvent};
+    use topo::projection::encrypted::{unwrap_key_from_sender, wrap_key_for_recipient};
 
     let alice = Peer::new_with_identity("alice_det_key");
     let bob = Peer::new_with_identity("bob_det_key");
@@ -2238,24 +2551,21 @@ fn test_deterministic_key_event_id_matches_across_peers() {
     let mut rng = rand::thread_rng();
     let sender_key = SigningKey::generate(&mut rng);
     let invite_key = SigningKey::generate(&mut rng);
-    let wrapped = wrap_key_for_recipient(
-        &sender_key,
-        &invite_key.verifying_key(),
-        &plaintext_key,
-    );
+    let wrapped = wrap_key_for_recipient(&sender_key, &invite_key.verifying_key(), &plaintext_key);
 
     // Bob unwraps using the invite private key and sender's public key.
-    let unwrapped = unwrap_key_from_sender(
-        &invite_key,
-        &sender_key.verifying_key(),
-        &wrapped,
+    let unwrapped = unwrap_key_from_sender(&invite_key, &sender_key.verifying_key(), &wrapped);
+    assert_eq!(
+        unwrapped, plaintext_key,
+        "Unwrapped key must match original plaintext"
     );
-    assert_eq!(unwrapped, plaintext_key, "Unwrapped key must match original plaintext");
 
     // Bob materializes the deterministic secret_key from unwrapped bytes.
     let bob_sk_eid = bob.create_secret_key_deterministic(unwrapped, deterministic_ts);
-    assert_eq!(bob_sk_eid, alice_sk_eid,
-        "Deterministic key event ID must match between inviter and invitee");
+    assert_eq!(
+        bob_sk_eid, alice_sk_eid,
+        "Deterministic key event ID must match between inviter and invitee"
+    );
 
     // Also verify via manual event construction that the event_id matches.
     let sk_evt = ParsedEvent::SecretKey(SecretKeyEvent {
@@ -2263,7 +2573,10 @@ fn test_deterministic_key_event_id_matches_across_peers() {
         key_bytes: plaintext_key,
     });
     let expected_eid = hash_event(&encode_event(&sk_evt).unwrap());
-    assert_eq!(expected_eid, alice_sk_eid, "Manual hash matches create_secret_key_deterministic");
+    assert_eq!(
+        expected_eid, alice_sk_eid,
+        "Manual hash matches create_secret_key_deterministic"
+    );
 
     harness.finish();
 }
@@ -2273,8 +2586,8 @@ fn test_deterministic_key_event_id_matches_across_peers() {
 /// becomes decryptable (or at least unblocked) on Bob's side.
 #[test]
 fn test_wrap_unwrap_encrypted_convergence() {
-    use topo::projection::encrypted::{wrap_key_for_recipient, unwrap_key_from_sender};
     use ed25519_dalek::SigningKey;
+    use topo::projection::encrypted::{unwrap_key_from_sender, wrap_key_for_recipient};
 
     let alice = Peer::new_with_identity("alice_conv");
     let bob = Peer::new_with_identity("bob_conv");
@@ -2300,7 +2613,11 @@ fn test_wrap_unwrap_encrypted_convergence() {
 
     // Alice creates an encrypted message.
     let enc_eid = alice.create_encrypted_message(&alice_sk_eid, "Wrapped key convergence test");
-    assert_eq!(alice.scoped_message_count(), 1, "Alice should see her encrypted message");
+    assert_eq!(
+        alice.scoped_message_count(),
+        1,
+        "Alice should see her encrypted message"
+    );
 
     // Simulate invite wrap/unwrap with fresh key pairs.
     let mut rng = rand::thread_rng();
@@ -2308,18 +2625,10 @@ fn test_wrap_unwrap_encrypted_convergence() {
     let invite_key = SigningKey::generate(&mut rng);
 
     // Alice wraps the content key for the invite key.
-    let wrapped = wrap_key_for_recipient(
-        &sender_key,
-        &invite_key.verifying_key(),
-        &plaintext_key,
-    );
+    let wrapped = wrap_key_for_recipient(&sender_key, &invite_key.verifying_key(), &plaintext_key);
 
     // Bob unwraps using the invite private key and sender's public key.
-    let unwrapped = unwrap_key_from_sender(
-        &invite_key,
-        &sender_key.verifying_key(),
-        &wrapped,
-    );
+    let unwrapped = unwrap_key_from_sender(&invite_key, &sender_key.verifying_key(), &wrapped);
     assert_eq!(unwrapped, plaintext_key);
 
     // Bob materializes the deterministic key.
@@ -2329,20 +2638,24 @@ fn test_wrap_unwrap_encrypted_convergence() {
     // Copy the encrypted event to Bob's DB (simulating sync).
     let alice_db = open_connection(&alice.db_path).unwrap();
     let enc_b64 = event_id_to_base64(&enc_eid);
-    let enc_blob: Vec<u8> = alice_db.query_row(
-        "SELECT blob FROM events WHERE event_id = ?1",
-        rusqlite::params![&enc_b64],
-        |row| row.get(0),
-    ).unwrap();
+    let enc_blob: Vec<u8> = alice_db
+        .query_row(
+            "SELECT blob FROM events WHERE event_id = ?1",
+            rusqlite::params![&enc_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
 
     let bob_db = open_connection(&bob.db_path).unwrap();
     use topo::event_modules::registry;
-    use topo::projection::decision::ProjectionDecision;
     use topo::projection::apply::project_one;
+    use topo::projection::decision::ProjectionDecision;
     let reg = registry();
     let enc_meta = reg.lookup(enc_blob[0]).unwrap();
     let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
     bob_db.execute(
         "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -2364,13 +2677,18 @@ fn test_wrap_unwrap_encrypted_convergence() {
     }
 
     // Explicitly verify no key-dep blocker row exists for this event.
-    let blocked_on_key: i64 = bob_db.query_row(
-        "SELECT COUNT(*) FROM blocked_event_deps
+    let blocked_on_key: i64 = bob_db
+        .query_row(
+            "SELECT COUNT(*) FROM blocked_event_deps
          WHERE peer_id = ?1 AND event_id = ?2 AND blocker_event_id = ?3",
-        rusqlite::params![&bob.identity, &enc_b64, &event_id_to_base64(&alice_sk_eid)],
-        |row| row.get(0),
-    ).unwrap();
-    assert_eq!(blocked_on_key, 0, "key_event_id blocker should be absent after key materialization");
+            rusqlite::params![&bob.identity, &enc_b64, &event_id_to_base64(&alice_sk_eid)],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        blocked_on_key, 0,
+        "key_event_id blocker should be absent after key materialization"
+    );
 
     harness.finish();
 }
@@ -2409,21 +2727,31 @@ fn test_invite_accepted_no_prior_invite_required() {
     let ia_eid = alice.create_invite_accepted(&fake_invite_eid, workspace_id);
 
     let ia_b64 = event_id_to_base64(&ia_eid);
-    let valid: bool = db.query_row(
-        "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-        rusqlite::params![&alice.identity, &ia_b64],
-        |row| row.get(0),
-    ).unwrap();
-    assert!(valid, "invite_accepted should be valid without prior invite event (no HasRecordedInvite guard)");
+    let valid: bool = db
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![&alice.identity, &ia_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        valid,
+        "invite_accepted should be valid without prior invite event (no HasRecordedInvite guard)"
+    );
 
     // Trust anchor should be set from the event's own workspace_id
-    let anchor: String = db.query_row(
-        "SELECT workspace_id FROM trust_anchors WHERE peer_id = ?1",
-        rusqlite::params![&alice.identity],
-        |row| row.get(0),
-    ).expect("trust anchor should exist");
+    let anchor: String = db
+        .query_row(
+            "SELECT workspace_id FROM trust_anchors WHERE peer_id = ?1",
+            rusqlite::params![&alice.identity],
+            |row| row.get(0),
+        )
+        .expect("trust anchor should exist");
     let expected_nid = event_id_to_base64(&workspace_id);
-    assert_eq!(anchor, expected_nid, "trust anchor should match invite_accepted event's workspace_id");
+    assert_eq!(
+        anchor, expected_nid,
+        "trust anchor should match invite_accepted event's workspace_id"
+    );
 
     harness.finish();
 }
@@ -2449,11 +2777,13 @@ fn test_trust_anchor_immutability() {
     // First invite_accepted sets the trust anchor
     let ia1_eid = alice.create_invite_accepted(&fake_invite_1, workspace_id_1);
     let ia1_b64 = event_id_to_base64(&ia1_eid);
-    let valid1: bool = db.query_row(
-        "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-        rusqlite::params![&alice.identity, &ia1_b64],
-        |row| row.get(0),
-    ).unwrap();
+    let valid1: bool = db
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![&alice.identity, &ia1_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
     assert!(valid1, "first invite_accepted should be valid");
 
     // Second invite_accepted with different workspace_id should be rejected
@@ -2469,21 +2799,28 @@ fn test_trust_anchor_immutability() {
         }
         Ok(eid) => {
             let eid_b64 = event_id_to_base64(&eid);
-            let rejected: bool = db.query_row(
-                "SELECT COUNT(*) > 0 FROM rejected_events WHERE peer_id = ?1 AND event_id = ?2",
-                rusqlite::params![&alice.identity, &eid_b64],
-                |row| row.get(0),
-            ).unwrap();
-            assert!(rejected, "conflicting invite_accepted should be in rejected_events");
+            let rejected: bool = db
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM rejected_events WHERE peer_id = ?1 AND event_id = ?2",
+                    rusqlite::params![&alice.identity, &eid_b64],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(
+                rejected,
+                "conflicting invite_accepted should be in rejected_events"
+            );
         }
     }
 
     // Trust anchor should still be the first one
-    let anchor: String = db.query_row(
-        "SELECT workspace_id FROM trust_anchors WHERE peer_id = ?1",
-        rusqlite::params![&alice.identity],
-        |row| row.get(0),
-    ).expect("trust anchor should still exist");
+    let anchor: String = db
+        .query_row(
+            "SELECT workspace_id FROM trust_anchors WHERE peer_id = ?1",
+            rusqlite::params![&alice.identity],
+            |row| row.get(0),
+        )
+        .expect("trust anchor should still exist");
     let expected_nid = event_id_to_base64(&workspace_id_1);
     assert_eq!(anchor, expected_nid, "trust anchor should not have changed");
 
@@ -2494,7 +2831,8 @@ fn test_trust_anchor_immutability() {
 /// invite-like blob into events should not alter trust binding state.
 #[test]
 fn test_no_blob_capture_trust_influence() {
-    let harness = ScenarioHarness::skip("raw blob insertion without project_one; no projection to replay");
+    let harness =
+        ScenarioHarness::skip("raw blob insertion without project_one; no projection to replay");
     let alice = Peer::new("alice");
     let db = open_connection(&alice.db_path).unwrap();
 
@@ -2520,15 +2858,21 @@ fn test_no_blob_capture_trust_influence() {
         "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
          VALUES (?1, ?2, 0, 'test')",
         rusqlite::params![&alice.identity, &fake_b64],
-    ).unwrap();
+    )
+    .unwrap();
 
     // Trust anchor should be unset
-    let anchor_count: i64 = db.query_row(
-        "SELECT COUNT(*) FROM trust_anchors WHERE peer_id = ?1",
-        rusqlite::params![&alice.identity],
-        |row| row.get(0),
-    ).unwrap();
-    assert_eq!(anchor_count, 0, "trust anchor should not be set by raw blob presence");
+    let anchor_count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM trust_anchors WHERE peer_id = ?1",
+            rusqlite::params![&alice.identity],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        anchor_count, 0,
+        "trust anchor should not be set by raw blob presence"
+    );
 
     harness.finish();
 }
@@ -2569,39 +2913,51 @@ fn test_true_out_of_order_identity_chain() {
     let ia_eid = alice.create_invite_accepted(&dummy_invite_eid, workspace_id);
 
     let ia_b64 = event_id_to_base64(&ia_eid);
-    let ia_valid: bool = db.query_row(
-        "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-        rusqlite::params![&alice.identity, &ia_b64],
-        |row| row.get(0),
-    ).unwrap();
-    assert!(ia_valid, "invite_accepted should be immediately valid (no HasRecordedInvite guard)");
+    let ia_valid: bool = db
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![&alice.identity, &ia_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        ia_valid,
+        "invite_accepted should be immediately valid (no HasRecordedInvite guard)"
+    );
 
     // Step 2: Create the precomputed workspace event (same event_id as trust anchor).
     let workspace_eid = create_event_staged(&db, &alice.identity, &workspace_event)
         .expect("workspace should create once trust anchor exists");
 
     let net_b64 = event_id_to_base64(&workspace_eid);
-    let net_valid: bool = db.query_row(
-        "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-        rusqlite::params![&alice.identity, &net_b64],
-        |row| row.get(0),
-    ).unwrap();
-    assert!(net_valid, "workspace event should be valid (trust anchor matches)");
-
-    // Step 3: Create UserInviteBoot (signed by workspace)
-    let user_invite_eid = alice.create_user_invite_boot_with_key(
-        invite_pubkey,
-        &workspace_key,
-        &workspace_eid,
+    let net_valid: bool = db
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![&alice.identity, &net_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        net_valid,
+        "workspace event should be valid (trust anchor matches)"
     );
 
+    // Step 3: Create UserInviteBoot (signed by workspace)
+    let user_invite_eid =
+        alice.create_user_invite_boot_with_key(invite_pubkey, &workspace_key, &workspace_eid);
+
     let ui_b64 = event_id_to_base64(&user_invite_eid);
-    let ui_valid: bool = db.query_row(
-        "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-        rusqlite::params![&alice.identity, &ui_b64],
-        |row| row.get(0),
-    ).unwrap();
-    assert!(ui_valid, "user_invite_boot should be valid (workspace is valid signer)");
+    let ui_valid: bool = db
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![&alice.identity, &ui_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        ui_valid,
+        "user_invite_boot should be valid (workspace is valid signer)"
+    );
 
     // Step 4: Create UserBoot (signed by invite key)
     let user_key = SigningKey::generate(&mut rng);
@@ -2609,11 +2965,13 @@ fn test_true_out_of_order_identity_chain() {
     let user_eid = alice.create_user_boot(user_pubkey, &invite_key, &user_invite_eid);
 
     let user_b64 = event_id_to_base64(&user_eid);
-    let user_valid: bool = db.query_row(
-        "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-        rusqlite::params![&alice.identity, &user_b64],
-        |row| row.get(0),
-    ).unwrap();
+    let user_valid: bool = db
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![&alice.identity, &user_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
     assert!(user_valid, "user_boot should be valid after full chain");
 
     harness.finish();
@@ -2639,11 +2997,7 @@ struct JoinChain {
     invite_accepted_eid: [u8; 32],
 }
 
-fn join_workspace(
-    joiner: &Peer,
-    alice_chain: &BootstrapChain,
-    alice: &Peer,
-) -> JoinChain {
+fn join_workspace(joiner: &Peer, alice_chain: &BootstrapChain, alice: &Peer) -> JoinChain {
     use ed25519_dalek::SigningKey;
 
     let mut rng = rand::thread_rng();
@@ -2659,7 +3013,8 @@ fn join_workspace(
     );
 
     // Joiner accepts the invite (local event, binds trust anchor to Alice's workspace_id)
-    let invite_accepted_eid = joiner.create_invite_accepted(&user_invite_eid, alice_chain.workspace_id);
+    let invite_accepted_eid =
+        joiner.create_invite_accepted(&user_invite_eid, alice_chain.workspace_id);
 
     // Joiner creates UserBoot (signed by the invite key Alice gave)
     let user_key = SigningKey::generate(&mut rng);
@@ -2669,11 +3024,8 @@ fn join_workspace(
     // Joiner creates DeviceInviteFirst (signed by joiner's user key)
     let device_invite_key = SigningKey::generate(&mut rng);
     let device_invite_pubkey = device_invite_key.verifying_key().to_bytes();
-    let device_invite_eid = joiner.create_device_invite_first(
-        device_invite_pubkey,
-        &user_key,
-        &user_eid,
-    );
+    let device_invite_eid =
+        joiner.create_device_invite_first(device_invite_pubkey, &user_key, &user_eid);
 
     // Joiner creates PeerSharedFirst (signed by device invite)
     let peer_shared_key = SigningKey::generate(&mut rng);
@@ -2723,7 +3075,8 @@ async fn test_two_peer_identity_join_and_sync() {
         || alice.peer_shared_count() == 2 && bob.peer_shared_count() == 2,
         Duration::from_secs(15),
         "both peers should converge on 2 peers_shared",
-    ).await;
+    )
+    .await;
 
     drop(sync);
 
@@ -2734,16 +3087,32 @@ async fn test_two_peer_identity_join_and_sync() {
     // - 2 device_invites
     // - 2 peers_shared
     // - 1 admin (Alice's)
-    assert_eq!(alice.workspace_count(), 1, "Alice should have 1 trust-anchored workspace");
-    assert_eq!(bob.workspace_count(), 1, "Bob should have 1 trust-anchored workspace");
+    assert_eq!(
+        alice.workspace_count(),
+        1,
+        "Alice should have 1 trust-anchored workspace"
+    );
+    assert_eq!(
+        bob.workspace_count(),
+        1,
+        "Bob should have 1 trust-anchored workspace"
+    );
 
-    assert_eq!(alice.user_invite_count(), 2, "Alice: boot + ongoing invites");
+    assert_eq!(
+        alice.user_invite_count(),
+        2,
+        "Alice: boot + ongoing invites"
+    );
     assert_eq!(bob.user_invite_count(), 2, "Bob: boot + ongoing invites");
 
     assert_eq!(alice.user_count(), 2, "Alice sees 2 users");
     assert_eq!(bob.user_count(), 2, "Bob sees 2 users");
 
-    assert_eq!(alice.device_invite_count(), 2, "Alice sees 2 device invites");
+    assert_eq!(
+        alice.device_invite_count(),
+        2,
+        "Alice sees 2 device invites"
+    );
     assert_eq!(bob.device_invite_count(), 2, "Bob sees 2 device invites");
 
     assert_eq!(alice.peer_shared_count(), 2, "Alice sees 2 peers_shared");
@@ -2791,7 +3160,11 @@ async fn test_identity_cascade_via_sync() {
     let user_eid_b64 = event_id_to_base64(&user_eid);
 
     // Confirm UserBoot is blocked before sync
-    assert_eq!(bob.user_count(), 0, "Bob's UserBoot should be blocked (missing signer dep)");
+    assert_eq!(
+        bob.user_count(),
+        0,
+        "Bob's UserBoot should be blocked (missing signer dep)"
+    );
     assert!(bob.blocked_dep_count() > 0, "Bob should have blocked deps");
 
     // Sync — Alice's events flow to Bob, unblocking the cascade
@@ -2801,23 +3174,34 @@ async fn test_identity_cascade_via_sync() {
     assert_eventually(
         || {
             let db = open_connection(&bob.db_path).unwrap();
-            let valid: bool = db.query_row(
-                "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-                rusqlite::params![&bob.identity, &user_eid_b64],
-                |row| row.get(0),
-            ).unwrap_or(false);
+            let valid: bool = db
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+                    rusqlite::params![&bob.identity, &user_eid_b64],
+                    |row| row.get(0),
+                )
+                .unwrap_or(false);
             valid
         },
         Duration::from_secs(15),
         "Bob's specific UserBoot should cascade to valid after sync",
-    ).await;
+    )
+    .await;
 
     drop(sync);
 
     // Bob should now have Alice's full identity chain projected plus his own user
-    assert_eq!(bob.workspace_count(), 1, "Bob should have Alice's workspace");
+    assert_eq!(
+        bob.workspace_count(),
+        1,
+        "Bob should have Alice's workspace"
+    );
     assert_eq!(bob.user_invite_count(), 2, "Bob should have both invites");
-    assert_eq!(bob.user_count(), 2, "Both Alice's and Bob's users should be valid");
+    assert_eq!(
+        bob.user_count(),
+        2,
+        "Both Alice's and Bob's users should be valid"
+    );
 
     harness.finish();
 }
@@ -2851,7 +3235,8 @@ async fn test_identity_then_messaging() {
         || alice.peer_shared_count() == 2 && bob.peer_shared_count() == 2,
         Duration::from_secs(15),
         "identity should converge",
-    ).await;
+    )
+    .await;
     drop(sync);
 
     // Now both peers send messages
@@ -2864,7 +3249,8 @@ async fn test_identity_then_messaging() {
         || alice.scoped_message_count() == 2 && bob.scoped_message_count() == 2,
         Duration::from_secs(15),
         "messages should converge after identity sync",
-    ).await;
+    )
+    .await;
     drop(sync);
 
     harness.finish();
@@ -2874,8 +3260,8 @@ async fn test_identity_then_messaging() {
 /// for Laptop, Laptop joins with PeerSharedOngoing, both sync and converge.
 #[tokio::test]
 async fn test_device_link_via_sync() {
-    use topo::event_modules::{DeviceInviteOngoingEvent, PeerSharedOngoingEvent, ParsedEvent};
-    use topo::projection::create::{create_signed_event_sync, create_signed_event_staged};
+    use topo::event_modules::{DeviceInviteOngoingEvent, ParsedEvent, PeerSharedOngoingEvent};
+    use topo::projection::create::{create_signed_event_staged, create_signed_event_sync};
 
     let phone = Peer::new("phone");
     let laptop = Peer::new("laptop");
@@ -2894,15 +3280,17 @@ async fn test_device_link_via_sync() {
     let db = open_connection(&phone.db_path).unwrap();
     let di_evt = ParsedEvent::DeviceInviteOngoing(DeviceInviteOngoingEvent {
         created_at_ms: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64,
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64,
         public_key: laptop_di_pubkey,
         signed_by: phone_chain.user_eid,
         signer_type: 4,
         signature: [0u8; 64],
     });
-    let laptop_di_eid = create_signed_event_sync(
-        &db, &phone.identity, &di_evt, &phone_chain.user_key,
-    ).expect("create device_invite_ongoing");
+    let laptop_di_eid =
+        create_signed_event_sync(&db, &phone.identity, &di_evt, &phone_chain.user_key)
+            .expect("create device_invite_ongoing");
     drop(db);
 
     // Laptop accepts the invite (local, sets trust anchor)
@@ -2916,7 +3304,9 @@ async fn test_device_link_via_sync() {
     let db = open_connection(&laptop.db_path).unwrap();
     let ps_evt = ParsedEvent::PeerSharedOngoing(PeerSharedOngoingEvent {
         created_at_ms: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64,
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64,
         public_key: laptop_ps_pubkey,
         user_event_id: phone_chain.user_eid,
         device_name: "laptop".to_string(),
@@ -2924,13 +3314,16 @@ async fn test_device_link_via_sync() {
         signer_type: 3,
         signature: [0u8; 64],
     });
-    let _laptop_ps_eid = create_signed_event_staged(
-        &db, &laptop.identity, &ps_evt, &laptop_di_key,
-    ).expect("create peer_shared_ongoing");
+    let _laptop_ps_eid = create_signed_event_staged(&db, &laptop.identity, &ps_evt, &laptop_di_key)
+        .expect("create peer_shared_ongoing");
     drop(db);
 
     // Laptop's PeerSharedOngoing is blocked — signed_by dep (DeviceInviteOngoing) is on Phone
-    assert_eq!(laptop.peer_shared_count(), 0, "Laptop's peer_shared should be blocked before sync");
+    assert_eq!(
+        laptop.peer_shared_count(),
+        0,
+        "Laptop's peer_shared should be blocked before sync"
+    );
 
     // Sync — Phone's events flow to Laptop, unblocking Laptop's chain
     let sync = start_peers_pinned(&phone, &laptop);
@@ -2939,7 +3332,8 @@ async fn test_device_link_via_sync() {
         || phone.peer_shared_count() == 2 && laptop.peer_shared_count() == 2,
         Duration::from_secs(15),
         "both devices should see 2 peers_shared after sync",
-    ).await;
+    )
+    .await;
 
     drop(sync);
 
@@ -2968,8 +3362,10 @@ async fn test_foreign_workspace_rejected_via_sync() {
     let bob_chain = bootstrap_peer(&bob);
 
     // Sanity: different workspace_ids
-    assert_ne!(alice_chain.workspace_id, bob_chain.workspace_id,
-        "workspaces should differ");
+    assert_ne!(
+        alice_chain.workspace_id, bob_chain.workspace_id,
+        "workspaces should differ"
+    );
 
     // Before sync: each peer has only its own trust-anchored workspace projected.
     assert_eq!(alice.workspace_count(), 1);
@@ -2984,22 +3380,33 @@ async fn test_foreign_workspace_rejected_via_sync() {
         || alice.rejected_event_count() > 0 && bob.rejected_event_count() > 0,
         Duration::from_secs(15),
         "both peers should have rejected foreign workspace events",
-    ).await;
+    )
+    .await;
 
     drop(sync);
 
     // Each peer should still have only its own workspace projected —
     // the foreign bootstrap workspace event is rejected by the trust anchor guard.
-    assert_eq!(alice.workspace_count(), 1,
-        "Alice should still have exactly 1 workspace (foreign rejected)");
-    assert_eq!(bob.workspace_count(), 1,
-        "Bob should still have exactly 1 workspace (foreign rejected)");
+    assert_eq!(
+        alice.workspace_count(),
+        1,
+        "Alice should still have exactly 1 workspace (foreign rejected)"
+    );
+    assert_eq!(
+        bob.workspace_count(),
+        1,
+        "Bob should still have exactly 1 workspace (foreign rejected)"
+    );
 
     // Foreign identity events should be rejected, not just blocked
-    assert!(alice.rejected_event_count() > 0,
-        "Alice should have rejected foreign workspace events");
-    assert!(bob.rejected_event_count() > 0,
-        "Bob should have rejected foreign workspace events");
+    assert!(
+        alice.rejected_event_count() > 0,
+        "Alice should have rejected foreign workspace events"
+    );
+    assert!(
+        bob.rejected_event_count() > 0,
+        "Bob should have rejected foreign workspace events"
+    );
 
     // Each peer's own identity state is unaffected
     assert_eq!(alice.user_count(), 1, "Alice's own user unchanged");
@@ -3023,18 +3430,30 @@ async fn test_shared_db_two_tenants_different_workspaces() {
     let t1 = &node.tenants[1];
 
     // Each tenant has its own workspace
-    assert_ne!(t0.workspace_id, t1.workspace_id,
-        "tenants should have distinct workspaces");
-    assert_ne!(t0.identity, t1.identity,
-        "tenants should have distinct identities");
+    assert_ne!(
+        t0.workspace_id, t1.workspace_id,
+        "tenants should have distinct workspaces"
+    );
+    assert_ne!(
+        t0.identity, t1.identity,
+        "tenants should have distinct identities"
+    );
 
     // Create messages per tenant
     t0.batch_create_messages(3);
     t1.batch_create_messages(2);
 
     // Verify each tenant's scoped message count
-    assert_eq!(t0.scoped_message_count(), 3, "tenant 0 should have 3 projected messages");
-    assert_eq!(t1.scoped_message_count(), 2, "tenant 1 should have 2 projected messages");
+    assert_eq!(
+        t0.scoped_message_count(),
+        3,
+        "tenant 0 should have 3 projected messages"
+    );
+    assert_eq!(
+        t1.scoped_message_count(),
+        2,
+        "tenant 1 should have 2 projected messages"
+    );
 
     // Verify per-tenant projection invariants + no cross-tenant leakage
     harness.finish();
@@ -3056,8 +3475,10 @@ async fn test_shared_db_tenant_discovery() {
     for tenant_info in &tenants {
         let fp = extract_spki_fingerprint(&tenant_info.cert_der).unwrap();
         let expected_id = hex::encode(fp);
-        assert_eq!(expected_id, tenant_info.peer_id,
-            "SPKI fingerprint should match peer_id");
+        assert_eq!(
+            expected_id, tenant_info.peer_id,
+            "SPKI fingerprint should match peer_id"
+        );
     }
 
     // Verify all tenant IDs are unique
@@ -3085,9 +3506,9 @@ async fn test_shared_db_no_cross_tenant_leakage() {
 
     // Get event_ids recorded by t0
     let t0_events: Vec<String> = {
-        let mut stmt = db.prepare(
-            "SELECT event_id FROM recorded_events WHERE peer_id = ?1"
-        ).unwrap();
+        let mut stmt = db
+            .prepare("SELECT event_id FROM recorded_events WHERE peer_id = ?1")
+            .unwrap();
         stmt.query_map([&t0.identity], |row| row.get::<_, String>(0))
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
@@ -3096,9 +3517,9 @@ async fn test_shared_db_no_cross_tenant_leakage() {
 
     // Get event_ids recorded by t1
     let t1_events: Vec<String> = {
-        let mut stmt = db.prepare(
-            "SELECT event_id FROM recorded_events WHERE peer_id = ?1"
-        ).unwrap();
+        let mut stmt = db
+            .prepare("SELECT event_id FROM recorded_events WHERE peer_id = ?1")
+            .unwrap();
         stmt.query_map([&t1.identity], |row| row.get::<_, String>(0))
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
@@ -3111,35 +3532,43 @@ async fn test_shared_db_no_cross_tenant_leakage() {
     let t0_set: std::collections::HashSet<&str> = t0_events.iter().map(|s| s.as_str()).collect();
     let t1_set: std::collections::HashSet<&str> = t1_events.iter().map(|s| s.as_str()).collect();
     let overlap: Vec<&&str> = t0_set.intersection(&t1_set).collect();
-    assert!(overlap.is_empty(),
+    assert!(
+        overlap.is_empty(),
         "recorded_events should have zero overlap between tenants, but found {}: {:?}",
-        overlap.len(), overlap);
+        overlap.len(),
+        overlap
+    );
 
     // Verify valid_events are also isolated
     let t0_valid: Vec<String> = {
-        let mut stmt = db.prepare(
-            "SELECT event_id FROM valid_events WHERE peer_id = ?1"
-        ).unwrap();
+        let mut stmt = db
+            .prepare("SELECT event_id FROM valid_events WHERE peer_id = ?1")
+            .unwrap();
         stmt.query_map([&t0.identity], |row| row.get::<_, String>(0))
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap()
     };
     let t1_valid: Vec<String> = {
-        let mut stmt = db.prepare(
-            "SELECT event_id FROM valid_events WHERE peer_id = ?1"
-        ).unwrap();
+        let mut stmt = db
+            .prepare("SELECT event_id FROM valid_events WHERE peer_id = ?1")
+            .unwrap();
         stmt.query_map([&t1.identity], |row| row.get::<_, String>(0))
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap()
     };
-    let t0_valid_set: std::collections::HashSet<&str> = t0_valid.iter().map(|s| s.as_str()).collect();
-    let t1_valid_set: std::collections::HashSet<&str> = t1_valid.iter().map(|s| s.as_str()).collect();
+    let t0_valid_set: std::collections::HashSet<&str> =
+        t0_valid.iter().map(|s| s.as_str()).collect();
+    let t1_valid_set: std::collections::HashSet<&str> =
+        t1_valid.iter().map(|s| s.as_str()).collect();
     let valid_overlap: Vec<&&str> = t0_valid_set.intersection(&t1_valid_set).collect();
-    assert!(valid_overlap.is_empty(),
+    assert!(
+        valid_overlap.is_empty(),
         "valid_events should have zero overlap between tenants, but found {}: {:?}",
-        valid_overlap.len(), valid_overlap);
+        valid_overlap.len(),
+        valid_overlap
+    );
 
     // Also verify via the comprehensive helper
     harness.finish();
@@ -3173,7 +3602,8 @@ async fn test_shared_db_sync_with_external_peer() {
         || external.has_event(&tenant_marker_b64) && tenant.has_event(&ext_marker_b64),
         Duration::from_secs(15),
         "tenant and external should exchange marker events",
-    ).await;
+    )
+    .await;
 
     harness.finish();
 }
@@ -3212,10 +3642,14 @@ async fn test_shared_db_same_workspace_two_tenants() {
     let t0 = &node.tenants[0];
     let t1 = &node.tenants[1];
 
-    assert_eq!(t0.workspace_id, t1.workspace_id,
-        "both tenants should share the same workspace");
-    assert_ne!(t0.identity, t1.identity,
-        "tenants should have distinct identities");
+    assert_eq!(
+        t0.workspace_id, t1.workspace_id,
+        "both tenants should share the same workspace"
+    );
+    assert_ne!(
+        t0.identity, t1.identity,
+        "tenants should have distinct identities"
+    );
 
     // Both tenants create messages
     t0.batch_create_messages(2);
@@ -3224,29 +3658,49 @@ async fn test_shared_db_same_workspace_two_tenants() {
     let db = open_connection(&node.db_path).unwrap();
 
     // Both tenants should have recorded the shared Workspace event
-    let t0_has_ws: bool = db.query_row(
-        "SELECT COUNT(*) > 0 FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
-        rusqlite::params![&t0.identity, &topo::crypto::event_id_to_base64(&creator_workspace)],
-        |row| row.get(0),
-    ).unwrap();
-    let t1_has_ws: bool = db.query_row(
-        "SELECT COUNT(*) > 0 FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
-        rusqlite::params![&t1.identity, &topo::crypto::event_id_to_base64(&creator_workspace)],
-        |row| row.get(0),
-    ).unwrap();
-    assert!(t0_has_ws, "tenant 0 should have recorded the workspace event");
-    assert!(t1_has_ws, "tenant 1 should have recorded the workspace event");
+    let t0_has_ws: bool = db
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![
+                &t0.identity,
+                &topo::crypto::event_id_to_base64(&creator_workspace)
+            ],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let t1_has_ws: bool = db
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![
+                &t1.identity,
+                &topo::crypto::event_id_to_base64(&creator_workspace)
+            ],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        t0_has_ws,
+        "tenant 0 should have recorded the workspace event"
+    );
+    assert!(
+        t1_has_ws,
+        "tenant 1 should have recorded the workspace event"
+    );
 
     // The workspace event_id should appear in both tenants' recorded_events —
     // this is the legitimate overlap that the workspace-aware leakage check allows.
     let ws_b64 = topo::crypto::event_id_to_base64(&creator_workspace);
-    let tenants_with_ws: i64 = db.query_row(
-        "SELECT COUNT(DISTINCT peer_id) FROM recorded_events WHERE event_id = ?1",
-        rusqlite::params![&ws_b64],
-        |row| row.get(0),
-    ).unwrap();
-    assert_eq!(tenants_with_ws, 2,
-        "workspace event should be recorded by both tenants");
+    let tenants_with_ws: i64 = db
+        .query_row(
+            "SELECT COUNT(DISTINCT peer_id) FROM recorded_events WHERE event_id = ?1",
+            rusqlite::params![&ws_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        tenants_with_ws, 2,
+        "workspace event should be recorded by both tenants"
+    );
 
     // Projection invariants should hold — verify_all_invariants uses the
     // workspace-aware check that allows overlap for same-workspace tenants.
@@ -3314,22 +3768,32 @@ async fn test_mdns_two_peers_discover_and_sync() {
             }
         }
         None
-    }).await.expect("browse task panicked");
+    })
+    .await
+    .expect("browse task panicked");
 
-    let discovered_peer = discovered
-        .expect("Bob should discover Alice via mDNS within 15s");
-    assert_eq!(discovered_peer.peer_id, alice.identity,
-        "discovered peer_id should match Alice");
-    assert_eq!(discovered_peer.addr.port(), port_a,
-        "discovered port should match Alice's endpoint");
+    let discovered_peer = discovered.expect("Bob should discover Alice via mDNS within 15s");
+    assert_eq!(
+        discovered_peer.peer_id, alice.identity,
+        "discovered peer_id should match Alice"
+    );
+    assert_eq!(
+        discovered_peer.addr.port(),
+        port_a,
+        "discovered port should match Alice's endpoint"
+    );
 
     // Start sync using the mDNS-discovered address
     let a_db = alice.db_path.clone();
     let a_id = alice.identity.clone();
     let _a_handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all().build().unwrap();
-        rt.block_on(async { let _ = accept_loop(&a_db, &a_id, ep_a, noop_intro_spawner, test_ingest_fns()).await; });
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let _ = accept_loop(&a_db, &a_id, ep_a, noop_intro_spawner, test_ingest_fns()).await;
+        });
     });
 
     let b_db = bob.db_path.clone();
@@ -3337,8 +3801,21 @@ async fn test_mdns_two_peers_discover_and_sync() {
     let remote = discovered_peer.addr;
     let _b_handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all().build().unwrap();
-        rt.block_on(async { let _ = connect_loop(&b_db, &b_id, ep_b, remote, None, noop_intro_spawner, test_ingest_fns()).await; });
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let _ = connect_loop(
+                &b_db,
+                &b_id,
+                ep_b,
+                remote,
+                None,
+                noop_intro_spawner,
+                test_ingest_fns(),
+            )
+            .await;
+        });
     });
 
     // Wait for sync convergence using marker events
@@ -3346,7 +3823,8 @@ async fn test_mdns_two_peers_discover_and_sync() {
         || bob.has_event(&alice_marker_b64) && alice.has_event(&bob_marker_b64),
         Duration::from_secs(15),
         "peers should converge after mDNS-discovered sync",
-    ).await;
+    )
+    .await;
 
     drop(disc_a);
     drop(disc_b);
@@ -3396,17 +3874,17 @@ async fn test_mdns_multitenant_self_filtering_and_sync() {
     let port_ext = ep_ext.local_addr().unwrap().port();
 
     // Node tenants share local_peer_ids (same-node self-filtering)
-    let node_local: HashSet<String> = [
-        t0.identity.clone(), t1.identity.clone(),
-    ].into_iter().collect();
+    let node_local: HashSet<String> = [t0.identity.clone(), t1.identity.clone()]
+        .into_iter()
+        .collect();
     let ext_local: HashSet<String> = [ext.identity.clone()].into_iter().collect();
 
     let disc_t0 = TenantDiscovery::new(&t0.identity, port_t0, node_local.clone(), &advertise_ip)
         .expect("mDNS t0");
-    let disc_t1 = TenantDiscovery::new(&t1.identity, port_t1, node_local, &advertise_ip)
-        .expect("mDNS t1");
-    let disc_ext = TenantDiscovery::new(&ext.identity, port_ext, ext_local, &advertise_ip)
-        .expect("mDNS ext");
+    let disc_t1 =
+        TenantDiscovery::new(&t1.identity, port_t1, node_local, &advertise_ip).expect("mDNS t1");
+    let disc_ext =
+        TenantDiscovery::new(&ext.identity, port_ext, ext_local, &advertise_ip).expect("mDNS ext");
 
     // --- Assertion 1: t0 discovers ext but NOT t1 (self-filtered) ---
     let browse_t0 = disc_t0.browse().expect("browse t0");
@@ -3418,7 +3896,9 @@ async fn test_mdns_multitenant_self_filtering_and_sync() {
         while Instant::now() < deadline {
             match browse_t0.recv_timeout(Duration::from_millis(500)) {
                 Ok(peer) => {
-                    if peer.peer_id == ext_id { found_ext = true; }
+                    if peer.peer_id == ext_id {
+                        found_ext = true;
+                    }
                     found.push(peer);
                     if found_ext {
                         // Wait a bit longer to catch any self-filtering failures
@@ -3434,14 +3914,19 @@ async fn test_mdns_multitenant_self_filtering_and_sync() {
             }
         }
         found
-    }).await.expect("t0 browse panicked");
+    })
+    .await
+    .expect("t0 browse panicked");
 
-    let t0_found_ids: Vec<&str> = t0_discoveries.iter()
-        .map(|p| p.peer_id.as_str()).collect();
-    assert!(t0_found_ids.contains(&ext.identity.as_str()),
-        "t0 should discover external peer via mDNS");
-    assert!(!t0_found_ids.contains(&t1.identity.as_str()),
-        "t0 should NOT discover co-located t1 (self-filtering)");
+    let t0_found_ids: Vec<&str> = t0_discoveries.iter().map(|p| p.peer_id.as_str()).collect();
+    assert!(
+        t0_found_ids.contains(&ext.identity.as_str()),
+        "t0 should discover external peer via mDNS"
+    );
+    assert!(
+        !t0_found_ids.contains(&t1.identity.as_str()),
+        "t0 should NOT discover co-located t1 (self-filtering)"
+    );
 
     // --- Assertion 2: ext discovers both t0 and t1 ---
     let browse_ext = disc_ext.browse().expect("browse ext");
@@ -3454,8 +3939,7 @@ async fn test_mdns_multitenant_self_filtering_and_sync() {
             match browse_ext.recv_timeout(Duration::from_millis(500)) {
                 Ok(peer) => {
                     found.push(peer);
-                    let ids: Vec<&str> = found.iter()
-                        .map(|p| p.peer_id.as_str()).collect();
+                    let ids: Vec<&str> = found.iter().map(|p| p.peer_id.as_str()).collect();
                     if ids.contains(&t0_id.as_str()) && ids.contains(&t1_id2.as_str()) {
                         break;
                     }
@@ -3465,47 +3949,70 @@ async fn test_mdns_multitenant_self_filtering_and_sync() {
             }
         }
         found
-    }).await.expect("ext browse panicked");
+    })
+    .await
+    .expect("ext browse panicked");
 
-    let ext_found_ids: Vec<&str> = ext_discoveries.iter()
-        .map(|p| p.peer_id.as_str()).collect();
-    assert!(ext_found_ids.contains(&t0.identity.as_str()),
-        "external should discover t0");
-    assert!(ext_found_ids.contains(&t1.identity.as_str()),
-        "external should discover t1");
+    let ext_found_ids: Vec<&str> = ext_discoveries.iter().map(|p| p.peer_id.as_str()).collect();
+    assert!(
+        ext_found_ids.contains(&t0.identity.as_str()),
+        "external should discover t0"
+    );
+    assert!(
+        ext_found_ids.contains(&t1.identity.as_str()),
+        "external should discover t1"
+    );
 
     // --- Assertion 3: sync works via mDNS-discovered address ---
     // ext discovered t0 earlier; use t0's address for connect_loop.
     // Since we also discovered ext from t0, verify the ext address too.
-    let ext_disc = t0_discoveries.iter()
-        .find(|p| p.peer_id == ext.identity).unwrap();
+    let ext_disc = t0_discoveries
+        .iter()
+        .find(|p| p.peer_id == ext.identity)
+        .unwrap();
     eprintln!("mDNS: t0 discovered ext at {}", ext_disc.addr);
 
     // ext connects to t0 (not the other way around)
-    let t0_disc = ext_discoveries.iter()
-        .find(|p| p.peer_id == t0.identity).unwrap();
+    let t0_disc = ext_discoveries
+        .iter()
+        .find(|p| p.peer_id == t0.identity)
+        .unwrap();
     eprintln!("mDNS: ext discovered t0 at {}", t0_disc.addr);
 
     // Use 127.0.0.1 with t0's port (endpoints bound to 0.0.0.0)
-    let t0_connect_addr = std::net::SocketAddr::new(
-        "127.0.0.1".parse().unwrap(), t0_disc.addr.port(),
-    );
+    let t0_connect_addr =
+        std::net::SocketAddr::new("127.0.0.1".parse().unwrap(), t0_disc.addr.port());
 
     let t0_db = t0.db_path.clone();
     let t0_id = t0.identity.clone();
     let _t0_handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all().build().unwrap();
-        rt.block_on(async { let _ = accept_loop(&t0_db, &t0_id, ep_t0, noop_intro_spawner, test_ingest_fns()).await; });
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let _ = accept_loop(&t0_db, &t0_id, ep_t0, noop_intro_spawner, test_ingest_fns()).await;
+        });
     });
 
     let ext_db = ext.db_path.clone();
     let ext_identity = ext.identity.clone();
     let _ext_handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all().build().unwrap();
+            .enable_all()
+            .build()
+            .unwrap();
         rt.block_on(async {
-            let _ = connect_loop(&ext_db, &ext_identity, ep_ext, t0_connect_addr, None, noop_intro_spawner, test_ingest_fns()).await;
+            let _ = connect_loop(
+                &ext_db,
+                &ext_identity,
+                ep_ext,
+                t0_connect_addr,
+                None,
+                noop_intro_spawner,
+                test_ingest_fns(),
+            )
+            .await;
         });
     });
 
@@ -3514,7 +4021,8 @@ async fn test_mdns_multitenant_self_filtering_and_sync() {
         || ext.has_event(&t0_marker_b64) && t0.has_event(&ext_marker_b64),
         Duration::from_secs(15),
         "t0 and external should converge via mDNS-discovered sync",
-    ).await;
+    )
+    .await;
 
     drop(disc_t0);
     drop(disc_t1);
@@ -3537,11 +4045,12 @@ async fn test_mdns_multitenant_self_filtering_and_sync() {
 #[tokio::test]
 async fn test_connect_with_presents_correct_tenant_cert() {
     use topo::transport::{
-        create_single_port_endpoint, create_dual_endpoint, generate_self_signed_cert,
-        workspace_client_config, multi_workspace::WorkspaceCertResolver,
+        create_dual_endpoint, create_single_port_endpoint, generate_self_signed_cert,
+        multi_workspace::WorkspaceCertResolver, workspace_client_config,
     };
 
-    let harness = ScenarioHarness::skip("transport-layer cert presentation test, no projection peers");
+    let harness =
+        ScenarioHarness::skip("transport-layer cert presentation test, no projection peers");
 
     // Create two identities: "default" (first tenant) and "actual" (second tenant).
     let (default_cert, default_key) = generate_self_signed_cert().unwrap();
@@ -3558,7 +4067,8 @@ async fn test_connect_with_presents_correct_tenant_cert() {
         server_cert.clone(),
         server_key.clone_key(),
         server_allowed,
-    ).unwrap();
+    )
+    .unwrap();
     let server_addr = server_ep.local_addr().unwrap();
 
     // Spawn server accept
@@ -3572,9 +4082,8 @@ async fn test_connect_with_presents_correct_tenant_cert() {
     });
 
     // Client endpoint: default cert is "default" (the wrong one for this test)
-    let allow_server: Arc<topo::transport::DynamicAllowFn> = Arc::new(move |fp: &[u8; 32]| {
-        Ok(*fp == server_fp)
-    });
+    let allow_server: Arc<topo::transport::DynamicAllowFn> =
+        Arc::new(move |fp: &[u8; 32]| Ok(*fp == server_fp));
     let resolver = WorkspaceCertResolver::new();
     let client_ep = create_single_port_endpoint(
         "127.0.0.1:0".parse().unwrap(),
@@ -3582,7 +4091,8 @@ async fn test_connect_with_presents_correct_tenant_cert() {
         allow_server.clone(),
         default_cert.clone(),
         default_key.clone_key(),
-    ).unwrap();
+    )
+    .unwrap();
 
     // Build per-tenant client config for "actual" tenant (correct cert + trust)
     let sfp = server_fp;
@@ -3590,7 +4100,8 @@ async fn test_connect_with_presents_correct_tenant_cert() {
         actual_cert.clone(),
         actual_key.clone_key(),
         Arc::new(move |fp: &[u8; 32]| Ok(*fp == sfp)),
-    ).unwrap();
+    )
+    .unwrap();
 
     // connect_with: should present "actual" cert → server accepts
     let conn = client_ep
@@ -3600,11 +4111,15 @@ async fn test_connect_with_presents_correct_tenant_cert() {
         .expect("connect_with should succeed: server trusts actual tenant cert");
 
     // Server side: verify the client presented "actual" cert identity
-    let server_conn = server_accept.await.unwrap().expect("server should have accepted");
+    let server_conn = server_accept
+        .await
+        .unwrap()
+        .expect("server should have accepted");
     let server_saw_peer = peer_identity_from_connection(&server_conn)
         .expect("server should see client cert identity");
     assert_eq!(
-        server_saw_peer, hex::encode(actual_fp),
+        server_saw_peer,
+        hex::encode(actual_fp),
         "server should see the actual tenant's identity, not the default"
     );
 
@@ -3634,11 +4149,11 @@ async fn test_connect_with_presents_correct_tenant_cert() {
 #[tokio::test]
 async fn test_tenant_scoped_outbound_trust_rejects_untrusted_server() {
     use topo::transport::{
-        generate_self_signed_cert,
-        workspace_client_config, create_dual_endpoint,
+        create_dual_endpoint, generate_self_signed_cert, workspace_client_config,
     };
 
-    let harness = ScenarioHarness::skip("transport-layer trust rejection test, no projection peers");
+    let harness =
+        ScenarioHarness::skip("transport-layer trust rejection test, no projection peers");
 
     // Create client and two servers
     let (client_cert, client_key) = generate_self_signed_cert().unwrap();
@@ -3653,16 +4168,20 @@ async fn test_tenant_scoped_outbound_trust_rejects_untrusted_server() {
     let client_allowed = Arc::new(AllowedPeers::from_fingerprints(vec![client_fp]));
     let trusted_ep = create_dual_endpoint(
         "127.0.0.1:0".parse().unwrap(),
-        trusted_cert.clone(), trusted_key.clone_key(),
+        trusted_cert.clone(),
+        trusted_key.clone_key(),
         client_allowed.clone(),
-    ).unwrap();
+    )
+    .unwrap();
     let trusted_addr = trusted_ep.local_addr().unwrap();
 
     let untrusted_ep = create_dual_endpoint(
         "127.0.0.1:0".parse().unwrap(),
-        untrusted_cert.clone(), untrusted_key.clone_key(),
+        untrusted_cert.clone(),
+        untrusted_key.clone_key(),
         client_allowed,
-    ).unwrap();
+    )
+    .unwrap();
     let untrusted_addr = untrusted_ep.local_addr().unwrap();
 
     // Client: create endpoint + tenant config that ONLY trusts "trusted_server"
@@ -3670,22 +4189,32 @@ async fn test_tenant_scoped_outbound_trust_rejects_untrusted_server() {
     let tenant_trust: Arc<topo::transport::DynamicAllowFn> = Arc::new(move |fp: &[u8; 32]| {
         Ok(*fp == trusted_fp) // only trusts the trusted server
     });
-    let tenant_config = workspace_client_config(
-        client_cert.clone(), client_key.clone_key(), tenant_trust,
-    ).unwrap();
+    let tenant_config =
+        workspace_client_config(client_cert.clone(), client_key.clone_key(), tenant_trust).unwrap();
 
     // Spawn accept on both servers
     let te = trusted_ep.clone();
-    tokio::spawn(async move { if let Some(inc) = te.accept().await { let _ = inc.await; } });
+    tokio::spawn(async move {
+        if let Some(inc) = te.accept().await {
+            let _ = inc.await;
+        }
+    });
     let ue = untrusted_ep.clone();
-    tokio::spawn(async move { if let Some(inc) = ue.accept().await { let _ = inc.await; } });
+    tokio::spawn(async move {
+        if let Some(inc) = ue.accept().await {
+            let _ = inc.await;
+        }
+    });
 
     // Connect to trusted server → should succeed
     let good_conn = client_ep
         .connect_with(tenant_config.clone(), trusted_addr, "localhost")
         .unwrap()
         .await;
-    assert!(good_conn.is_ok(), "should succeed: client trusts this server");
+    assert!(
+        good_conn.is_ok(),
+        "should succeed: client trusts this server"
+    );
 
     // Connect to untrusted server → should fail (client rejects server cert)
     let bad_conn = client_ep
@@ -3716,21 +4245,21 @@ async fn test_tenant_scoped_outbound_trust_rejects_untrusted_server() {
 /// Proves: run_node's workspace_client_config correctly scopes outbound trust per-tenant.
 #[tokio::test]
 async fn test_run_node_multitenant_outbound_isolation() {
-    use std::collections::HashMap;
-    use std::sync::atomic::AtomicU64;
-    use topo::db::transport_creds::discover_local_tenants;
-    use topo::db::transport_trust::{import_cli_pins_to_sql, is_peer_allowed};
-    use topo::transport::{
-        create_single_port_endpoint, workspace_client_config,
-        multi_workspace::{WorkspaceCertResolver, workspace_sni},
-        DynamicAllowFn,
-    };
-    use topo::peering::loops::accept_loop_with_ingest;
-    use topo::contracts::event_pipeline_contract::IngestItem;
-    use topo::event_pipeline::batch_writer;
     use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
     use rustls::sign::CertifiedKey;
+    use std::collections::HashMap;
+    use std::sync::atomic::AtomicU64;
     use tokio::sync::mpsc;
+    use topo::contracts::event_pipeline_contract::IngestItem;
+    use topo::db::transport_creds::discover_local_tenants;
+    use topo::db::transport_trust::{import_cli_pins_to_sql, is_peer_allowed};
+    use topo::event_pipeline::batch_writer;
+    use topo::peering::loops::accept_loop_with_ingest;
+    use topo::transport::{
+        create_single_port_endpoint,
+        multi_workspace::{workspace_sni, WorkspaceCertResolver},
+        workspace_client_config, DynamicAllowFn,
+    };
 
     // --- Two multi-tenant nodes ---
     let node_a = SharedDbNode::new(2);
@@ -3754,14 +4283,34 @@ async fn test_run_node_multitenant_outbound_isolation() {
     // a0 trusts b0, a1 trusts b1 (inbound: A accepts both)
     {
         let db = open_connection(&node_a.db_path).unwrap();
-        import_cli_pins_to_sql(&db, &a0.identity, &AllowedPeers::from_fingerprints(vec![fp(b0)])).unwrap();
-        import_cli_pins_to_sql(&db, &a1.identity, &AllowedPeers::from_fingerprints(vec![fp(b1)])).unwrap();
+        import_cli_pins_to_sql(
+            &db,
+            &a0.identity,
+            &AllowedPeers::from_fingerprints(vec![fp(b0)]),
+        )
+        .unwrap();
+        import_cli_pins_to_sql(
+            &db,
+            &a1.identity,
+            &AllowedPeers::from_fingerprints(vec![fp(b1)]),
+        )
+        .unwrap();
     }
     // b0 trusts a0, b1 trusts a1 (outbound: per-tenant client trust)
     {
         let db = open_connection(&node_b.db_path).unwrap();
-        import_cli_pins_to_sql(&db, &b0.identity, &AllowedPeers::from_fingerprints(vec![fp(a0)])).unwrap();
-        import_cli_pins_to_sql(&db, &b1.identity, &AllowedPeers::from_fingerprints(vec![fp(a1)])).unwrap();
+        import_cli_pins_to_sql(
+            &db,
+            &b0.identity,
+            &AllowedPeers::from_fingerprints(vec![fp(a0)]),
+        )
+        .unwrap();
+        import_cli_pins_to_sql(
+            &db,
+            &b1.identity,
+            &AllowedPeers::from_fingerprints(vec![fp(a1)]),
+        )
+        .unwrap();
     }
 
     // Create marker events on a0 (to be synced to b0 if connection succeeds)
@@ -3783,8 +4332,11 @@ async fn test_run_node_multitenant_outbound_isolation() {
         let cert_der = CertificateDer::from(t.cert_der.clone());
         let key_der = PrivatePkcs8KeyDer::from(t.key_der.clone());
         let ck = CertifiedKey::from_der(
-            vec![cert_der.clone()], key_der.clone_key().into(), &provider,
-        ).unwrap();
+            vec![cert_der.clone()],
+            key_der.clone_key().into(),
+            &provider,
+        )
+        .unwrap();
         let sni = workspace_sni(&t.workspace_id);
         cert_resolver_a.add(sni, Arc::new(ck));
         if default_cert_a.is_none() {
@@ -3812,7 +4364,8 @@ async fn test_run_node_multitenant_outbound_isolation() {
         union_allow,
         default_cert_der,
         default_key_der,
-    ).unwrap();
+    )
+    .unwrap();
     let addr_a = endpoint_a.local_addr().unwrap();
 
     // Shared batch_writer for A (same as run_node)
@@ -3829,11 +4382,21 @@ async fn test_run_node_multitenant_outbound_isolation() {
     let a_ids: Vec<String> = tenants_a.iter().map(|t| t.peer_id.clone()).collect();
     let _accept = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all().build().unwrap();
+            .enable_all()
+            .build()
+            .unwrap();
         rt.block_on(async move {
             let _ = accept_loop_with_ingest(
-                &a_db, &a_ids, endpoint_a, None, ingest_tx, HashMap::new(), noop_intro_spawner, test_ingest_fns(),
-            ).await;
+                &a_db,
+                &a_ids,
+                endpoint_a,
+                None,
+                ingest_tx,
+                HashMap::new(),
+                noop_intro_spawner,
+                test_ingest_fns(),
+            )
+            .await;
         });
     });
 
@@ -3865,8 +4428,11 @@ async fn test_run_node_multitenant_outbound_isolation() {
         let cert_der = CertificateDer::from(t.cert_der.clone());
         let key_der = PrivatePkcs8KeyDer::from(t.key_der.clone());
         let ck = CertifiedKey::from_der(
-            vec![cert_der.clone()], key_der.clone_key().into(), &provider,
-        ).unwrap();
+            vec![cert_der.clone()],
+            key_der.clone_key().into(),
+            &provider,
+        )
+        .unwrap();
         cert_resolver_b.add(workspace_sni(&t.workspace_id), Arc::new(ck));
         if default_cert_b.is_none() {
             default_cert_b = Some((cert_der, key_der));
@@ -3878,7 +4444,9 @@ async fn test_run_node_multitenant_outbound_isolation() {
     let b_union_allow: Arc<DynamicAllowFn> = Arc::new(move |peer_fp: &[u8; 32]| {
         let db = open_connection(&db_path_b_trust)?;
         for tid in &b_tenant_ids {
-            if is_peer_allowed(&db, tid, peer_fp)? { return Ok(true); }
+            if is_peer_allowed(&db, tid, peer_fp)? {
+                return Ok(true);
+            }
         }
         Ok(false)
     });
@@ -3888,7 +4456,8 @@ async fn test_run_node_multitenant_outbound_isolation() {
         b_union_allow,
         b_def_cert,
         b_def_key,
-    ).unwrap();
+    )
+    .unwrap();
 
     // --- Spawn connect_loops for each B tenant (same as run_node) ---
     // b0's config trusts a0 (= A's fallback cert) → should succeed
@@ -3898,9 +4467,20 @@ async fn test_run_node_multitenant_outbound_isolation() {
     let b0_id = b0.identity.clone();
     let _b0_connect = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all().build().unwrap();
+            .enable_all()
+            .build()
+            .unwrap();
         rt.block_on(async move {
-            let _ = connect_loop(&b0_db, &b0_id, ep_b0, addr_a, Some(b0_cfg), noop_intro_spawner, test_ingest_fns()).await;
+            let _ = connect_loop(
+                &b0_db,
+                &b0_id,
+                ep_b0,
+                addr_a,
+                Some(b0_cfg),
+                noop_intro_spawner,
+                test_ingest_fns(),
+            )
+            .await;
         });
     });
 
@@ -3911,9 +4491,20 @@ async fn test_run_node_multitenant_outbound_isolation() {
     let b1_id = b1.identity.clone();
     let _b1_connect = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all().build().unwrap();
+            .enable_all()
+            .build()
+            .unwrap();
         rt.block_on(async move {
-            let _ = connect_loop(&b1_db, &b1_id, ep_b1, addr_a, Some(b1_cfg), noop_intro_spawner, test_ingest_fns()).await;
+            let _ = connect_loop(
+                &b1_db,
+                &b1_id,
+                ep_b1,
+                addr_a,
+                Some(b1_cfg),
+                noop_intro_spawner,
+                test_ingest_fns(),
+            )
+            .await;
         });
     });
 
@@ -3927,11 +4518,13 @@ async fn test_run_node_multitenant_outbound_isolation() {
                 "SELECT COUNT(*) > 0 FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
                 rusqlite::params![&b0.identity, &a0_marker_b64],
                 |row| row.get::<_, bool>(0),
-            ).unwrap_or(false)
+            )
+            .unwrap_or(false)
         },
         Duration::from_secs(15),
         "b0 should record a0's marker (b0 trusts a0 = A's fallback cert)",
-    ).await;
+    )
+    .await;
 
     // b1 should NOT have recorded a0's marker. b1's per-tenant workspace_client_config
     // only trusts a1's cert, but A presents a0 as its fallback — TLS fails, no sync.
@@ -3942,7 +4535,8 @@ async fn test_run_node_multitenant_outbound_isolation() {
             "SELECT COUNT(*) > 0 FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
             rusqlite::params![&b1.identity, &a0_marker_b64],
             |row| row.get::<_, bool>(0),
-        ).unwrap_or(false)
+        )
+        .unwrap_or(false)
     };
     assert!(
         !b1_has_marker,
@@ -3965,8 +4559,7 @@ fn test_scenario_harness_guard() {
     let mut test_fns: Vec<(usize, String)> = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
-        let is_fn_def = (trimmed.starts_with("fn test_")
-            || trimmed.starts_with("async fn test_"))
+        let is_fn_def = (trimmed.starts_with("fn test_") || trimmed.starts_with("async fn test_"))
             && trimmed.contains('(');
         if !is_fn_def {
             continue;

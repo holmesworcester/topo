@@ -48,7 +48,7 @@ impl<'a> NegentropyStorageSqlite<'a> {
                 ts INTEGER NOT NULL,
                 id BLOB NOT NULL,
                 count INTEGER NOT NULL
-            )"
+            )",
         )?;
         Ok(())
     }
@@ -71,7 +71,7 @@ impl<'a> NegentropyStorageSqlite<'a> {
         )?;
 
         let mut insert_stmt = self.conn.prepare(
-            "INSERT INTO session_blocks (block_idx, ts, id, count) VALUES (?1, ?2, ?3, ?4)"
+            "INSERT INTO session_blocks (block_idx, ts, id, count) VALUES (?1, ?2, ?3, ?4)",
         )?;
 
         let mut row_idx: usize = 0;
@@ -82,12 +82,7 @@ impl<'a> NegentropyStorageSqlite<'a> {
             if row_idx % BLOCK_SIZE == 0 {
                 let ts: i64 = row.get(0)?;
                 let id: Vec<u8> = row.get(1)?;
-                insert_stmt.execute(rusqlite::params![
-                    block_idx as i64,
-                    ts,
-                    id,
-                    row_idx as i64
-                ])?;
+                insert_stmt.execute(rusqlite::params![block_idx as i64, ts, id, row_idx as i64])?;
                 block_idx += 1;
             }
             row_idx += 1;
@@ -98,7 +93,9 @@ impl<'a> NegentropyStorageSqlite<'a> {
 
         tracing::info!(
             "rebuild_blocks: {} items, {} blocks in {}ms",
-            row_idx, block_idx, start.elapsed().as_millis()
+            row_idx,
+            block_idx,
+            start.elapsed().as_millis()
         );
 
         Ok(())
@@ -106,9 +103,9 @@ impl<'a> NegentropyStorageSqlite<'a> {
 
     /// Get the (ts, id) key for a given block index
     fn get_block_start(&self, block_idx: usize) -> Result<Option<(i64, Vec<u8>)>, rusqlite::Error> {
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT ts, id FROM session_blocks WHERE block_idx = ?"
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT ts, id FROM session_blocks WHERE block_idx = ?")?;
 
         let result = stmt.query_row([block_idx as i64], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
@@ -138,7 +135,8 @@ impl NegentropyStorageBase for NegentropyStorageSqlite<'_> {
         }
 
         // Otherwise query and cache
-        let count: i64 = self.conn
+        let count: i64 = self
+            .conn
             .query_row(
                 "SELECT COUNT(*) FROM neg_items WHERE workspace_id = ?1 OR workspace_id = ''",
                 rusqlite::params![&self.workspace_id],
@@ -156,9 +154,7 @@ impl NegentropyStorageBase for NegentropyStorageSqlite<'_> {
         let offset = i % BLOCK_SIZE;
 
         // Get block start key
-        let (block_ts, block_id) = match self.get_block_start(block_idx)
-            .map_err(|e| sql_err(e))?
-        {
+        let (block_ts, block_id) = match self.get_block_start(block_idx).map_err(|e| sql_err(e))? {
             Some(v) => v,
             None => return Ok(None), // Block doesn't exist
         };
@@ -174,7 +170,7 @@ impl NegentropyStorageBase for NegentropyStorageSqlite<'_> {
                 let ts: i64 = row.get(0)?;
                 let id: Vec<u8> = row.get(1)?;
                 Ok((ts, id))
-            }
+            },
         );
 
         match result {
@@ -199,9 +195,7 @@ impl NegentropyStorageBase for NegentropyStorageSqlite<'_> {
         let offset_in_block = begin % BLOCK_SIZE;
 
         // Get block start key
-        let (block_ts, block_id) = match self.get_block_start(block_idx)
-            .map_err(|e| sql_err(e))?
-        {
+        let (block_ts, block_id) = match self.get_block_start(block_idx).map_err(|e| sql_err(e))? {
             Some(v) => v,
             None => return Ok(()), // No items
         };
@@ -211,13 +205,15 @@ impl NegentropyStorageBase for NegentropyStorageSqlite<'_> {
             "SELECT ts, id FROM neg_items WHERE (workspace_id = ?1 OR workspace_id = '') AND (ts, id) >= (?2, ?3) ORDER BY ts, id LIMIT ?4 OFFSET ?5"
         ).map_err(|e| sql_err(e))?;
 
-        let mut rows = stmt.query(rusqlite::params![
-            &self.workspace_id,
-            block_ts,
-            block_id,
-            count as i64,
-            offset_in_block as i64
-        ]).map_err(|e| sql_err(e))?;
+        let mut rows = stmt
+            .query(rusqlite::params![
+                &self.workspace_id,
+                block_ts,
+                block_id,
+                count as i64,
+                offset_in_block as i64
+            ])
+            .map_err(|e| sql_err(e))?;
 
         let mut idx = begin;
         while let Some(row) = rows.next().map_err(|e| sql_err(e))? {
@@ -251,13 +247,15 @@ impl NegentropyStorageBase for NegentropyStorageSqlite<'_> {
                 "SELECT block_idx, count FROM session_blocks WHERE (ts, id) <= (?, ?) ORDER BY block_idx DESC LIMIT 1"
             )?;
 
-            let (block_idx, block_start_count): (i64, i64) = stmt.query_row(
-                rusqlite::params![target_ts, target_id.as_slice()],
-                |row| Ok((row.get(0)?, row.get(1)?))
-            ).unwrap_or((0, 0));
+            let (block_idx, block_start_count): (i64, i64) = stmt
+                .query_row(rusqlite::params![target_ts, target_id.as_slice()], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .unwrap_or((0, 0));
 
             // Now scan within that block to find exact position
-            let block_start = self.get_block_start(block_idx as usize)?
+            let block_start = self
+                .get_block_start(block_idx as usize)?
                 .unwrap_or((0, vec![0u8; 32]));
 
             let mut scan_stmt = self.conn.prepare_cached(
@@ -297,9 +295,9 @@ mod tests {
     use crate::db::{open_in_memory, schema::create_tables};
 
     fn insert_test_items(conn: &Connection, count: usize) {
-        let mut stmt = conn.prepare(
-            "INSERT INTO neg_items (ts, id) VALUES (?, ?)"
-        ).unwrap();
+        let mut stmt = conn
+            .prepare("INSERT INTO neg_items (ts, id) VALUES (?, ?)")
+            .unwrap();
 
         for i in 0..count {
             let ts = (i * 1000) as i64; // 1 second apart
@@ -332,9 +330,9 @@ mod tests {
         storage.rebuild_blocks().unwrap();
 
         // Should have 2 blocks (in session_blocks TEMP table)
-        let block_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM session_blocks", [], |row| row.get(0)
-        ).unwrap();
+        let block_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_blocks", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(block_count, 2);
     }
 
@@ -372,10 +370,12 @@ mod tests {
         storage.rebuild_blocks().unwrap();
 
         let mut items = Vec::new();
-        storage.iterate(10, 20, &mut |item, idx| {
-            items.push((item.timestamp, idx));
-            Ok(true)
-        }).unwrap();
+        storage
+            .iterate(10, 20, &mut |item, idx| {
+                items.push((item.timestamp, idx));
+                Ok(true)
+            })
+            .unwrap();
 
         assert_eq!(items.len(), 10);
         assert_eq!(items[0], (10000, 10));
@@ -417,10 +417,12 @@ mod tests {
         let end = BLOCK_SIZE + 10;
 
         let mut items = Vec::new();
-        storage.iterate(start, end, &mut |item, idx| {
-            items.push((item.timestamp, idx));
-            Ok(true)
-        }).unwrap();
+        storage
+            .iterate(start, end, &mut |item, idx| {
+                items.push((item.timestamp, idx));
+                Ok(true)
+            })
+            .unwrap();
 
         assert_eq!(items.len(), 20);
     }
@@ -431,9 +433,9 @@ mod tests {
         create_tables(&conn).unwrap();
 
         // Insert items with SAME timestamp but different IDs (simulates rapid event generation)
-        let mut stmt = conn.prepare(
-            "INSERT INTO neg_items (ts, id) VALUES (?, ?)"
-        ).unwrap();
+        let mut stmt = conn
+            .prepare("INSERT INTO neg_items (ts, id) VALUES (?, ?)")
+            .unwrap();
 
         let ts = 1000i64; // Same timestamp for all
         for i in 0..100 {
@@ -450,11 +452,16 @@ mod tests {
 
         // Iterate all items
         let mut count = 0;
-        storage.iterate(0, 100, &mut |_item, _idx| {
-            count += 1;
-            Ok(true)
-        }).unwrap();
-        assert_eq!(count, 100, "Should iterate all 100 items with same timestamp");
+        storage
+            .iterate(0, 100, &mut |_item, _idx| {
+                count += 1;
+                Ok(true)
+            })
+            .unwrap();
+        assert_eq!(
+            count, 100,
+            "Should iterate all 100 items with same timestamp"
+        );
 
         // Test find_lower_bound with items that have same ts but different id
         let mut id50 = [0u8; 32];
@@ -476,9 +483,9 @@ mod tests {
         create_tables(&conn).unwrap();
 
         // Insert items with same timestamp pattern as real events
-        let mut stmt = conn.prepare(
-            "INSERT INTO neg_items (ts, id) VALUES (?, ?)"
-        ).unwrap();
+        let mut stmt = conn
+            .prepare("INSERT INTO neg_items (ts, id) VALUES (?, ?)")
+            .unwrap();
 
         let mut inmem = NegentropyStorageVector::with_capacity(1000);
 
@@ -504,12 +511,10 @@ mod tests {
             let inmem_item = inmem.get_item(i).unwrap().unwrap();
             assert_eq!(
                 sqlite_item.timestamp, inmem_item.timestamp,
-                "Timestamp mismatch at index {}", i
+                "Timestamp mismatch at index {}",
+                i
             );
-            assert_eq!(
-                sqlite_item.id, inmem_item.id,
-                "ID mismatch at index {}", i
-            );
+            assert_eq!(sqlite_item.id, inmem_item.id, "ID mismatch at index {}", i);
         }
     }
 }

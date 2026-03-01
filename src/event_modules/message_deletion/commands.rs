@@ -42,12 +42,17 @@ pub fn delete_message(
     target_event_id: [u8; 32],
 ) -> Result<String, String> {
     create(
-        db, recorded_by, signer_eid, signing_key, created_at_ms,
+        db,
+        recorded_by,
+        signer_eid,
+        signing_key,
+        created_at_ms,
         CreateMessageDeletionCmd {
             target_event_id,
             author_id,
         },
-    ).map_err(|e| format!("{}", e))?;
+    )
+    .map_err(|e| format!("{}", e))?;
 
     Ok(hex::encode(target_event_id))
 }

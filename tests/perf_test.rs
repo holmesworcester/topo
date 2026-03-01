@@ -4,9 +4,7 @@
 //! Slow tests: cargo test --release --test perf_test -- --nocapture --ignored
 
 use std::time::{Duration, Instant};
-use topo::testutil::{Peer, assert_eventually, start_peers_pinned, sync_until_converged};
-
-
+use topo::testutil::{assert_eventually, start_peers_pinned, sync_until_converged, Peer};
 
 /// Read peak resident set size from /proc/self/status (Linux only).
 fn peak_rss_mib() -> f64 {
@@ -43,8 +41,12 @@ async fn perf_sync_50k() {
     let rss_before = peak_rss_mib();
 
     let metrics = sync_until_converged(
-        &alice, &bob, || bob.message_count() == N, Duration::from_secs(300),
-    ).await;
+        &alice,
+        &bob,
+        || bob.message_count() == N,
+        Duration::from_secs(300),
+    )
+    .await;
 
     let rss_after = peak_rss_mib();
 
@@ -57,8 +59,10 @@ async fn perf_sync_50k() {
     eprintln!("  Wall time:    {:.2}s", metrics.wall_secs);
     eprintln!("  Messages:     {N}");
     eprintln!("  Msgs/s:       {msgs_per_sec:.0}");
-    eprintln!("  Peak RSS:     {:.1} MiB (before: {:.1}, after: {:.1})",
-        rss_after, rss_before, rss_after);
+    eprintln!(
+        "  Peak RSS:     {:.1} MiB (before: {:.1}, after: {:.1})",
+        rss_after, rss_before, rss_after
+    );
     eprintln!();
 }
 
@@ -80,10 +84,12 @@ async fn perf_sync_10k() {
     let rss_before = peak_rss_mib();
 
     let metrics = sync_until_converged(
-        &alice, &bob,
+        &alice,
+        &bob,
         || alice.message_count() == N * 2 && bob.message_count() == N * 2,
         Duration::from_secs(120),
-    ).await;
+    )
+    .await;
 
     let rss_after = peak_rss_mib();
 
@@ -97,8 +103,10 @@ async fn perf_sync_10k() {
     eprintln!("  Wall time:    {:.2}s", metrics.wall_secs);
     eprintln!("  Messages:     {}", N * 2);
     eprintln!("  Msgs/s:       {msgs_per_sec:.0}");
-    eprintln!("  Peak RSS:     {:.1} MiB (before: {:.1}, after: {:.1})",
-        rss_after, rss_before, rss_after);
+    eprintln!(
+        "  Peak RSS:     {:.1} MiB (before: {:.1}, after: {:.1})",
+        rss_after, rss_before, rss_after
+    );
     eprintln!();
 }
 
@@ -128,20 +136,46 @@ async fn perf_continuous_10k() {
     let alice_channel = alice.workspace_id;
     let alice_identity = alice.identity.clone();
     let alice_signer_eid = alice.peer_shared_event_id.expect("alice has identity");
-    let alice_signing_key = alice.peer_shared_signing_key.clone().expect("alice has signing key");
+    let alice_signing_key = alice
+        .peer_shared_signing_key
+        .clone()
+        .expect("alice has signing key");
     let bob_db = bob.db_path.clone();
     let bob_author = bob.author_id;
     let bob_channel = bob.workspace_id;
     let bob_identity = bob.identity.clone();
     let bob_signer_eid = bob.peer_shared_event_id.expect("bob has identity");
-    let bob_signing_key = bob.peer_shared_signing_key.clone().expect("bob has signing key");
+    let bob_signing_key = bob
+        .peer_shared_signing_key
+        .clone()
+        .expect("bob has signing key");
 
     let alice_writer = std::thread::spawn(move || {
-        inject_messages_batched(&alice_db, alice_channel, alice_author, "alice", 5_000, 100, &alice_identity, alice_signer_eid, &alice_signing_key);
+        inject_messages_batched(
+            &alice_db,
+            alice_channel,
+            alice_author,
+            "alice",
+            5_000,
+            100,
+            &alice_identity,
+            alice_signer_eid,
+            &alice_signing_key,
+        );
     });
 
     let bob_writer = std::thread::spawn(move || {
-        inject_messages_batched(&bob_db, bob_channel, bob_author, "bob", 5_000, 100, &bob_identity, bob_signer_eid, &bob_signing_key);
+        inject_messages_batched(
+            &bob_db,
+            bob_channel,
+            bob_author,
+            "bob",
+            5_000,
+            100,
+            &bob_identity,
+            bob_signer_eid,
+            &bob_signing_key,
+        );
     });
 
     alice_writer.join().expect("alice writer panicked");
@@ -155,8 +189,12 @@ async fn perf_continuous_10k() {
 
     // Wait for convergence (projection + minimal store sanity).
     assert_eventually(
-        || alice.message_count() == expected_messages && bob.message_count() == expected_messages
-            && alice.store_count() >= expected_messages && bob.store_count() >= expected_messages,
+        || {
+            alice.message_count() == expected_messages
+                && bob.message_count() == expected_messages
+                && alice.store_count() >= expected_messages
+                && bob.store_count() >= expected_messages
+        },
         Duration::from_secs(300),
         &format!(
             "convergence to {} projected messages (store: a={}, b={}; projected: a={}, b={})",
@@ -166,7 +204,8 @@ async fn perf_continuous_10k() {
             alice.message_count(),
             bob.message_count(),
         ),
-    ).await;
+    )
+    .await;
 
     let wall_secs = start.elapsed().as_secs_f64();
     let rss_after = peak_rss_mib();
@@ -183,12 +222,17 @@ async fn perf_continuous_10k() {
 
     eprintln!();
     eprintln!("=== 10k continuous sync (inject while syncing) ===");
-    eprintln!("  Wall time:    {:.2}s (inject: {:.2}s)", wall_secs, inject_secs);
+    eprintln!(
+        "  Wall time:    {:.2}s (inject: {:.2}s)",
+        wall_secs, inject_secs
+    );
     eprintln!("  Events:       {}", events_transferred);
     eprintln!("  Events/s:     {:.0}", events_per_sec);
     eprintln!("  Throughput:   {:.2} MiB/s", throughput_mib_s);
-    eprintln!("  Peak RSS:     {:.1} MiB (before: {:.1}, after: {:.1})",
-        rss_after, rss_before, rss_after);
+    eprintln!(
+        "  Peak RSS:     {:.1} MiB (before: {:.1}, after: {:.1})",
+        rss_after, rss_before, rss_after
+    );
     eprintln!();
 }
 
@@ -209,8 +253,12 @@ async fn perf_sync_100k() {
     let rss_before = peak_rss_mib();
 
     let metrics = sync_until_converged(
-        &alice, &bob, || bob.message_count() == N, Duration::from_secs(600),
-    ).await;
+        &alice,
+        &bob,
+        || bob.message_count() == N,
+        Duration::from_secs(600),
+    )
+    .await;
 
     let rss_after = peak_rss_mib();
 
@@ -223,8 +271,10 @@ async fn perf_sync_100k() {
     eprintln!("  Wall time:    {:.2}s", metrics.wall_secs);
     eprintln!("  Messages:     {N}");
     eprintln!("  Msgs/s:       {msgs_per_sec:.0}");
-    eprintln!("  Peak RSS:     {:.1} MiB (before: {:.1}, after: {:.1})",
-        rss_after, rss_before, rss_after);
+    eprintln!(
+        "  Peak RSS:     {:.1} MiB (before: {:.1}, after: {:.1})",
+        rss_after, rss_before, rss_after
+    );
     eprintln!();
 }
 
@@ -245,8 +295,12 @@ async fn perf_sync_200k() {
     let rss_before = peak_rss_mib();
 
     let metrics = sync_until_converged(
-        &alice, &bob, || bob.message_count() == N, Duration::from_secs(600),
-    ).await;
+        &alice,
+        &bob,
+        || bob.message_count() == N,
+        Duration::from_secs(600),
+    )
+    .await;
 
     let rss_after = peak_rss_mib();
 
@@ -259,8 +313,10 @@ async fn perf_sync_200k() {
     eprintln!("  Wall time:    {:.2}s", metrics.wall_secs);
     eprintln!("  Messages:     {N}");
     eprintln!("  Msgs/s:       {msgs_per_sec:.0}");
-    eprintln!("  Peak RSS:     {:.1} MiB (before: {:.1}, after: {:.1})",
-        rss_after, rss_before, rss_after);
+    eprintln!(
+        "  Peak RSS:     {:.1} MiB (before: {:.1}, after: {:.1})",
+        rss_after, rss_before, rss_after
+    );
     eprintln!();
 }
 
@@ -299,8 +355,13 @@ async fn perf_sync_500k() {
         }
         if sync_start.elapsed() >= timeout {
             let count = bob.message_count();
-            eprintln!("TIMEOUT: bob has {}/{} messages, alice store={}, bob store={}",
-                count, N, alice.store_count(), bob.store_count());
+            eprintln!(
+                "TIMEOUT: bob has {}/{} messages, alice store={}, bob store={}",
+                count,
+                N,
+                alice.store_count(),
+                bob.store_count()
+            );
             panic!("500k sync timed out after {}s", timeout.as_secs());
         }
         if last_report.elapsed() >= Duration::from_secs(5) {
@@ -309,7 +370,13 @@ async fn perf_sync_500k() {
             let elapsed = sync_start.elapsed().as_secs();
             eprintln!(
                 "[+{}s] bob messages: {}/{} (delta: +{}), stores: alice={} bob={}, RSS: {:.0} MiB",
-                elapsed, count, N, delta, alice.store_count(), bob.store_count(), peak_rss_mib()
+                elapsed,
+                count,
+                N,
+                delta,
+                alice.store_count(),
+                bob.store_count(),
+                peak_rss_mib()
             );
             last_count = count;
             last_report = Instant::now();
@@ -331,8 +398,10 @@ async fn perf_sync_500k() {
     eprintln!("  Wall time:    {:.2}s", wall_secs);
     eprintln!("  Messages:     {N}");
     eprintln!("  Msgs/s:       {msgs_per_sec:.0}");
-    eprintln!("  Peak RSS:     {:.1} MiB (before: {:.1}, after: {:.1})",
-        rss_after, rss_before, rss_after);
+    eprintln!(
+        "  Peak RSS:     {:.1} MiB (before: {:.1}, after: {:.1})",
+        rss_after, rss_before, rss_after
+    );
     eprintln!();
 }
 
@@ -374,7 +443,8 @@ fn inject_messages_batched(
                 signer_type: 5,
                 signature: [0u8; 64],
             });
-            create_signed_event_sync(&db, recorded_by, &msg, signing_key).expect("create_signed_event_sync failed");
+            create_signed_event_sync(&db, recorded_by, &msg, signing_key)
+                .expect("create_signed_event_sync failed");
         }
         db.execute("COMMIT", []).expect("failed to commit");
         i = end;

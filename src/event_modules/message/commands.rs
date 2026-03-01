@@ -7,10 +7,10 @@ use ed25519_dalek::SigningKey;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
-use super::super::ParsedEvent;
 use super::super::message_deletion::MessageDeletionEvent;
 use super::super::peer_shared;
 use super::super::workspace;
+use super::super::ParsedEvent;
 use super::wire::MessageEvent;
 
 fn current_timestamp_ms() -> u64 {
@@ -64,13 +64,18 @@ pub fn send(
     content: &str,
 ) -> Result<super::SendResponse, String> {
     let eid = create(
-        db, recorded_by, signer_eid, signing_key, created_at_ms,
+        db,
+        recorded_by,
+        signer_eid,
+        signing_key,
+        created_at_ms,
         CreateMessageCmd {
             workspace_id,
             author_id,
             content: content.to_string(),
         },
-    ).map_err(|e| format!("{}", e))?;
+    )
+    .map_err(|e| format!("{}", e))?;
 
     Ok(super::SendResponse {
         content: content.to_string(),
@@ -118,12 +123,17 @@ pub fn delete_message(
     target_event_id: [u8; 32],
 ) -> Result<String, String> {
     create_deletion(
-        db, recorded_by, signer_eid, signing_key, created_at_ms,
+        db,
+        recorded_by,
+        signer_eid,
+        signing_key,
+        created_at_ms,
         CreateMessageDeletionCmd {
             target_event_id,
             author_id,
         },
-    ).map_err(|e| format!("{}", e))?;
+    )
+    .map_err(|e| format!("{}", e))?;
 
     Ok(hex::encode(target_event_id))
 }
@@ -145,7 +155,8 @@ pub fn send_for_peer(
 ) -> Result<super::SendResponse, Box<dyn std::error::Error + Send + Sync>> {
     let (recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
 
-    let (signer_eid, signing_key) = peer_shared::load_local_peer_signer_required(&db, &recorded_by)?;
+    let (signer_eid, signing_key) =
+        peer_shared::load_local_peer_signer_required(&db, &recorded_by)?;
     let workspace_id = workspace::resolve_workspace_for_peer(&db, &recorded_by)?;
     let author_id = peer_shared::resolve_user_event_id(&db, &recorded_by, &signer_eid)?;
 
@@ -170,7 +181,8 @@ pub fn delete_message_for_peer(
 ) -> Result<DeleteResponse, Box<dyn std::error::Error + Send + Sync>> {
     let (recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
 
-    let (signer_eid, signing_key) = peer_shared::load_local_peer_signer_required(&db, &recorded_by)?;
+    let (signer_eid, signing_key) =
+        peer_shared::load_local_peer_signer_required(&db, &recorded_by)?;
     let target_event_id = super::resolve(&db, &recorded_by, target_hex)
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
     let author_id = peer_shared::resolve_user_event_id(&db, &recorded_by, &signer_eid)?;
@@ -197,7 +209,8 @@ pub fn generate_for_peer(
 ) -> Result<GenerateResponse, Box<dyn std::error::Error + Send + Sync>> {
     let (recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
 
-    let (signer_eid, signing_key) = peer_shared::load_local_peer_signer_required(&db, &recorded_by)?;
+    let (signer_eid, signing_key) =
+        peer_shared::load_local_peer_signer_required(&db, &recorded_by)?;
     let workspace_id = workspace::resolve_workspace_for_peer(&db, &recorded_by)?;
     let author_id = peer_shared::resolve_user_event_id(&db, &recorded_by, &signer_eid)?;
 

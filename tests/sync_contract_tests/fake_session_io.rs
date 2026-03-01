@@ -23,7 +23,8 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use topo::contracts::peering_contract::{
-    ControlIo, DataRecvIo, DataSendIo, TransportSessionIo, TransportSessionIoError, TransportSessionIoParts,
+    ControlIo, DataRecvIo, DataSendIo, TransportSessionIo, TransportSessionIoError,
+    TransportSessionIoParts,
 };
 use topo::protocol::{encode_frame, parse_frame, Frame};
 
@@ -223,7 +224,8 @@ impl ControlIo for FakeControlIo {
             }
         }
 
-        let frame = self.rx
+        let frame = self
+            .rx
             .recv()
             .await
             .ok_or(TransportSessionIoError::ConnectionLost)?;
@@ -458,10 +460,7 @@ impl FakePeerSide {
     }
 
     /// Receive and decode a Frame from the data channel with timeout.
-    pub async fn recv_data_msg_timeout(
-        &mut self,
-        timeout: std::time::Duration,
-    ) -> Option<Frame> {
+    pub async fn recv_data_msg_timeout(&mut self, timeout: std::time::Duration) -> Option<Frame> {
         match tokio::time::timeout(timeout, self.data_recv.recv()).await {
             Ok(Some(frame)) => {
                 let (msg, _) = parse_frame(&frame).expect("invalid frame from handler");
@@ -526,10 +525,15 @@ pub fn noop_batch_writer(
 
 /// Create a no-op ingest sender for tests that don't exercise event ingestion.
 /// Spawns a background thread that drains the channel to prevent backpressure.
-pub fn noop_ingest_tx() -> tokio::sync::mpsc::Sender<topo::contracts::event_pipeline_contract::IngestItem> {
+pub fn noop_ingest_tx(
+) -> tokio::sync::mpsc::Sender<topo::contracts::event_pipeline_contract::IngestItem> {
     let (tx, rx) = tokio::sync::mpsc::channel(100);
     std::thread::spawn(move || {
-        noop_batch_writer(String::new(), rx, std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)));
+        noop_batch_writer(
+            String::new(),
+            rx,
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        );
     });
     tx
 }

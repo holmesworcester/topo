@@ -1,4 +1,4 @@
-use crate::crypto::{self, EventId, b64_to_hex, event_id_from_base64};
+use crate::crypto::{self, b64_to_hex, event_id_from_base64, EventId};
 use rusqlite::Connection;
 
 pub struct MessageRow {
@@ -49,10 +49,7 @@ pub fn list_rows(
     Ok(rows)
 }
 
-pub fn count(
-    db: &Connection,
-    recorded_by: &str,
-) -> Result<i64, rusqlite::Error> {
+pub fn count(db: &Connection, recorded_by: &str) -> Result<i64, rusqlite::Error> {
     db.query_row(
         "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
         rusqlite::params![recorded_by],
@@ -60,11 +57,7 @@ pub fn count(
     )
 }
 
-pub fn resolve_number(
-    db: &Connection,
-    recorded_by: &str,
-    num: usize,
-) -> Result<EventId, String> {
+pub fn resolve_number(db: &Connection, recorded_by: &str, num: usize) -> Result<EventId, String> {
     if num == 0 {
         return Err("message number must be >= 1".into());
     }
@@ -75,16 +68,16 @@ pub fn resolve_number(
         .query_row(rusqlite::params![recorded_by, num - 1], |row| row.get(0))
         .ok();
     match msg_id_b64 {
-        Some(b64) => {
-            event_id_from_base64(&b64)
-                .ok_or_else(|| format!("invalid event ID for message {}", num))
-        }
+        Some(b64) => event_id_from_base64(&b64)
+            .ok_or_else(|| format!("invalid event ID for message {}", num)),
         None => {
-            let total: i64 = db.query_row(
-                "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
-                rusqlite::params![recorded_by],
-                |row| row.get(0),
-            ).map_err(|e| e.to_string())?;
+            let total: i64 = db
+                .query_row(
+                    "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
+                    rusqlite::params![recorded_by],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())?;
             Err(format!(
                 "invalid message number {}; available: 1-{}",
                 num, total
@@ -93,11 +86,7 @@ pub fn resolve_number(
     }
 }
 
-pub fn resolve(
-    db: &Connection,
-    recorded_by: &str,
-    selector: &str,
-) -> Result<EventId, String> {
+pub fn resolve(db: &Connection, recorded_by: &str, selector: &str) -> Result<EventId, String> {
     let stripped = selector.strip_prefix('#').unwrap_or(selector);
     if let Ok(num) = stripped.parse::<usize>() {
         resolve_number(db, recorded_by, num)
@@ -139,9 +128,7 @@ pub fn list_deleted_ids(
     db: &Connection,
     recorded_by: &str,
 ) -> Result<Vec<String>, rusqlite::Error> {
-    let mut stmt = db.prepare(
-        "SELECT message_id FROM deleted_messages WHERE recorded_by = ?1",
-    )?;
+    let mut stmt = db.prepare("SELECT message_id FROM deleted_messages WHERE recorded_by = ?1")?;
     let ids = stmt
         .query_map(rusqlite::params![recorded_by], |row| {
             row.get::<_, String>(0)

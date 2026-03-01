@@ -25,4 +25,3 @@ pub fn spki_fingerprint_from_ed25519_pubkey(pubkey: &[u8; 32]) -> [u8; 32] {
     fp.copy_from_slice(&result);
     fp
 }
-

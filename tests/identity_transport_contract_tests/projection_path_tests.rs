@@ -42,10 +42,7 @@ fn peer_shared_signer_emits_install_intent() {
                 }
             );
         }
-        other => panic!(
-            "expected ApplyTransportIdentityIntent, got {:?}",
-            other
-        ),
+        other => panic!("expected ApplyTransportIdentityIntent, got {:?}", other),
     }
 }
 
@@ -109,9 +106,5 @@ fn no_duplicate_intents_emitted() {
     });
 
     let cmds = project("rb", &event);
-    assert_eq!(
-        cmds.len(),
-        1,
-        "must emit exactly one intent, no duplicates"
-    );
+    assert_eq!(cmds.len(), 1, "must emit exactly one intent, no duplicates");
 }

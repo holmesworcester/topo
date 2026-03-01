@@ -26,10 +26,7 @@ mod boundary_tests {
         if !result.status.success() {
             let stderr = String::from_utf8_lossy(&result.stderr);
             let stdout = String::from_utf8_lossy(&result.stdout);
-            panic!(
-                "Boundary import check failed:\n{}\n{}",
-                stdout, stderr
-            );
+            panic!("Boundary import check failed:\n{}\n{}", stdout, stderr);
         }
     }
 }

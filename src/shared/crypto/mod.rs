@@ -1,7 +1,7 @@
-use blake2::{Blake2b, Digest};
-use blake2::digest::consts::U32;
-use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use aes_gcm::aead::Aead;
+use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+use blake2::digest::consts::U32;
+use blake2::{Blake2b, Digest};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 
 pub type EventId = [u8; 32];
@@ -70,14 +70,14 @@ pub fn encrypt_event_blob(
 ) -> Result<([u8; 12], Vec<u8>, [u8; 16]), Box<dyn std::error::Error>> {
     use rand::RngCore;
 
-    let cipher = Aes256Gcm::new_from_slice(key)
-        .map_err(|e| format!("aes-gcm key init: {}", e))?;
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| format!("aes-gcm key init: {}", e))?;
 
     let mut nonce_bytes = [0u8; 12];
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
 
-    let ciphertext_with_tag = cipher.encrypt(nonce, plaintext)
+    let ciphertext_with_tag = cipher
+        .encrypt(nonce, plaintext)
         .map_err(|e| format!("aes-gcm encrypt: {}", e))?;
 
     // aes-gcm appends the 16-byte tag to the ciphertext
@@ -96,15 +96,15 @@ pub fn decrypt_event_blob(
     ciphertext: &[u8],
     auth_tag: &[u8; 16],
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let cipher = Aes256Gcm::new_from_slice(key)
-        .map_err(|e| format!("aes-gcm key init: {}", e))?;
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| format!("aes-gcm key init: {}", e))?;
     let nonce_obj = Nonce::from_slice(nonce);
 
     let mut ct_with_tag = Vec::with_capacity(ciphertext.len() + 16);
     ct_with_tag.extend_from_slice(ciphertext);
     ct_with_tag.extend_from_slice(auth_tag);
 
-    let plaintext = cipher.decrypt(nonce_obj, ct_with_tag.as_slice())
+    let plaintext = cipher
+        .decrypt(nonce_obj, ct_with_tag.as_slice())
         .map_err(|e| format!("aes-gcm decrypt: {}", e))?;
     Ok(plaintext)
 }
@@ -132,10 +132,7 @@ pub fn sign_event_bytes(signing_key: &SigningKey, signing_bytes: &[u8]) -> [u8; 
 
 /// Derive a 32-byte shared wrap key from a local Ed25519 private key and
 /// a remote Ed25519 public key via X25519 Diffie-Hellman.
-fn derive_wrap_key(
-    local_private: &SigningKey,
-    remote_public: &VerifyingKey,
-) -> [u8; 32] {
+fn derive_wrap_key(local_private: &SigningKey, remote_public: &VerifyingKey) -> [u8; 32] {
     // Convert Ed25519 keys to X25519 (Montgomery form)
     let local_scalar = local_private.to_scalar();
     let remote_point = remote_public.to_montgomery();
@@ -273,16 +270,10 @@ mod tests {
         let sender_key = SigningKey::generate(&mut rng);
         let recipient_key = SigningKey::generate(&mut rng);
         let plaintext_key = [0x42u8; 32];
-        let wrapped = wrap_key_for_recipient(
-            &sender_key,
-            &recipient_key.verifying_key(),
-            &plaintext_key,
-        );
-        let unwrapped = unwrap_key_from_sender(
-            &recipient_key,
-            &sender_key.verifying_key(),
-            &wrapped,
-        );
+        let wrapped =
+            wrap_key_for_recipient(&sender_key, &recipient_key.verifying_key(), &plaintext_key);
+        let unwrapped =
+            unwrap_key_from_sender(&recipient_key, &sender_key.verifying_key(), &wrapped);
         assert_eq!(unwrapped, plaintext_key);
     }
 }

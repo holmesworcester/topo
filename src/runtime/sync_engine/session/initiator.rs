@@ -114,7 +114,10 @@ where
     );
 
     let neg_item_count = neg_storage.size().unwrap_or(0);
-    info!("Negentropy storage has {} items (initiator)", neg_item_count);
+    info!(
+        "Negentropy storage has {} items (initiator)",
+        neg_item_count
+    );
 
     let initial_msg = neg.initiate()?;
     send_initial_neg_open(&mut control, initial_msg).await?;
@@ -164,8 +167,10 @@ where
                     None => {
                         info!(
                             "Reconciliation complete: {} rounds, {}ms, have={} need={}",
-                            rounds, reconcile_start.elapsed().as_millis(),
-                            have_ids.len(), need_ids.len()
+                            rounds,
+                            reconcile_start.elapsed().as_millis(),
+                            have_ids.len(),
+                            need_ids.len()
                         );
                         reconciliation_done = true;
                     }
@@ -216,7 +221,8 @@ where
                 // sent to the responder. Skip the redundant dispatch.
                 info!(
                     "Coordinator assigned {} events (peer {})",
-                    assigned.len(), coordination.peer_idx
+                    assigned.len(),
+                    coordination.peer_idx
                 );
                 coordination_pending = false;
             }
@@ -250,7 +256,10 @@ where
         if reconciliation_done && pending_have.is_empty() && !done_sent {
             let pending_out = egress.count_pending(peer_id).unwrap_or(0);
             if pending_out > 0 && last_egress_log.elapsed() >= Duration::from_secs(5) {
-                info!("Draining egress: {} pending, {} sent so far", pending_out, events_sent);
+                info!(
+                    "Draining egress: {} pending, {} sent so far",
+                    pending_out, events_sent
+                );
                 last_egress_log = Instant::now();
             }
             if pending_out == 0 {

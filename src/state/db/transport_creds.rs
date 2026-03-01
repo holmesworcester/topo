@@ -384,7 +384,9 @@ mod tests {
 
         ensure_schema(&conn).unwrap();
 
-        let mut stmt = conn.prepare("PRAGMA table_info(local_transport_creds)").unwrap();
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(local_transport_creds)")
+            .unwrap();
         let mut rows = stmt.query([]).unwrap();
         let mut has_source = false;
         while let Some(row) = rows.next().unwrap() {

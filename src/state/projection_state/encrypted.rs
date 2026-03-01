@@ -1,15 +1,12 @@
 use rusqlite::Connection;
 
-pub use crate::crypto::{
-    decrypt_event_blob,
-    encrypt_event_blob,
-    wrap_key_for_recipient,
-    unwrap_key_from_sender,
-};
-use crate::crypto::event_id_to_base64;
-use crate::event_modules::{self as events, EncryptedEvent, EVENT_TYPE_ENCRYPTED};
-use super::decision::ProjectionDecision;
 use super::apply::run_dep_and_projection_stages;
+use super::decision::ProjectionDecision;
+use crate::crypto::event_id_to_base64;
+pub use crate::crypto::{
+    decrypt_event_blob, encrypt_event_blob, unwrap_key_from_sender, wrap_key_for_recipient,
+};
+use crate::event_modules::{self as events, EncryptedEvent, EVENT_TYPE_ENCRYPTED};
 
 /// Project an encrypted event: decrypt, parse inner, verify admissibility,
 /// then hand off to shared pipeline stages (dep check, signer verify,
@@ -131,20 +128,14 @@ mod tests {
 
         let plaintext_key = [0x42u8; 32];
 
-        let wrapped = wrap_key_for_recipient(
-            &sender_key,
-            &recipient_key.verifying_key(),
-            &plaintext_key,
-        );
+        let wrapped =
+            wrap_key_for_recipient(&sender_key, &recipient_key.verifying_key(), &plaintext_key);
 
         // Wrapped key should differ from plaintext
         assert_ne!(wrapped, plaintext_key);
 
-        let unwrapped = unwrap_key_from_sender(
-            &recipient_key,
-            &sender_key.verifying_key(),
-            &wrapped,
-        );
+        let unwrapped =
+            unwrap_key_from_sender(&recipient_key, &sender_key.verifying_key(), &wrapped);
 
         assert_eq!(unwrapped, plaintext_key);
     }
@@ -158,18 +149,11 @@ mod tests {
 
         let plaintext_key = [0xAB; 32];
 
-        let wrapped = wrap_key_for_recipient(
-            &sender_key,
-            &recipient_key.verifying_key(),
-            &plaintext_key,
-        );
+        let wrapped =
+            wrap_key_for_recipient(&sender_key, &recipient_key.verifying_key(), &plaintext_key);
 
         // Wrong recipient cannot unwrap
-        let bad_unwrap = unwrap_key_from_sender(
-            &wrong_key,
-            &sender_key.verifying_key(),
-            &wrapped,
-        );
+        let bad_unwrap = unwrap_key_from_sender(&wrong_key, &sender_key.verifying_key(), &wrapped);
         assert_ne!(bad_unwrap, plaintext_key);
     }
 
@@ -182,16 +166,8 @@ mod tests {
         let key_a = [0x11u8; 32];
         let key_b = [0x22u8; 32];
 
-        let wrapped_a = wrap_key_for_recipient(
-            &sender_key,
-            &recipient_key.verifying_key(),
-            &key_a,
-        );
-        let wrapped_b = wrap_key_for_recipient(
-            &sender_key,
-            &recipient_key.verifying_key(),
-            &key_b,
-        );
+        let wrapped_a = wrap_key_for_recipient(&sender_key, &recipient_key.verifying_key(), &key_a);
+        let wrapped_b = wrap_key_for_recipient(&sender_key, &recipient_key.verifying_key(), &key_b);
 
         assert_ne!(wrapped_a, wrapped_b);
     }

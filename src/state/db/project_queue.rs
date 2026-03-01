@@ -1,6 +1,6 @@
-use rusqlite::{Connection, Result as SqliteResult, params};
+use rusqlite::{params, Connection, Result as SqliteResult};
 
-use super::queue::{current_timestamp_ms, backoff_ms, recover_expired_leases, QueueHealth};
+use super::queue::{backoff_ms, current_timestamp_ms, recover_expired_leases, QueueHealth};
 
 pub struct ProjectQueue<'a> {
     conn: &'a Connection,
@@ -157,9 +157,9 @@ impl<'a> ProjectQueue<'a> {
             return Ok(());
         }
         self.conn.execute("BEGIN", [])?;
-        let mut stmt = self.conn.prepare(
-            "DELETE FROM project_queue WHERE peer_id = ?1 AND event_id = ?2",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("DELETE FROM project_queue WHERE peer_id = ?1 AND event_id = ?2")?;
         for eid in event_ids {
             stmt.execute(params![peer_id, eid])?;
         }
@@ -222,7 +222,11 @@ impl<'a> ProjectQueue<'a> {
             params![peer_id, now],
             |row| row.get(0),
         )?;
-        Ok(QueueHealth { pending, max_attempts, oldest_age_ms })
+        Ok(QueueHealth {
+            pending,
+            max_attempts,
+            oldest_age_ms,
+        })
     }
 
     /// Claim-process-done loop. Processes all pending items for a peer.
@@ -241,7 +245,12 @@ impl<'a> ProjectQueue<'a> {
     ///
     /// Projection runs in autocommit mode. On failure we keep projection side
     /// effects (for example blocked dependency rows) and only schedule retry.
-    pub fn drain_with_limit<F>(&self, peer_id: &str, batch_size: usize, mut project_fn: F) -> SqliteResult<usize>
+    pub fn drain_with_limit<F>(
+        &self,
+        peer_id: &str,
+        batch_size: usize,
+        mut project_fn: F,
+    ) -> SqliteResult<usize>
     where
         F: FnMut(&Connection, &str) -> Result<(), Box<dyn std::error::Error>>,
     {
@@ -278,9 +287,9 @@ impl<'a> ProjectQueue<'a> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::queue::current_timestamp_ms;
     use super::*;
     use crate::db::{open_in_memory, schema::create_tables};
-    use super::super::queue::current_timestamp_ms;
 
     fn setup() -> Connection {
         let conn = open_in_memory().unwrap();
@@ -295,10 +304,13 @@ mod tests {
         let inserted = pq.enqueue("peer1", "event_abc").unwrap();
         assert!(inserted);
 
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM project_queue WHERE peer_id = 'peer1'",
-            [], |row| row.get(0),
-        ).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM project_queue WHERE peer_id = 'peer1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 1);
     }
 
@@ -309,7 +321,8 @@ mod tests {
         conn.execute(
             "INSERT INTO valid_events (peer_id, event_id) VALUES ('peer1', 'event_abc')",
             [],
-        ).unwrap();
+        )
+        .unwrap();
 
         let pq = ProjectQueue::new(&conn);
         let inserted = pq.enqueue("peer1", "event_abc").unwrap();
@@ -354,10 +367,13 @@ mod tests {
 
         pq.mark_done("peer1", "event_abc").unwrap();
 
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM project_queue WHERE peer_id = 'peer1'",
-            [], |row| row.get(0),
-        ).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM project_queue WHERE peer_id = 'peer1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 0);
     }
 
@@ -399,7 +415,10 @@ mod tests {
             [], |row| row.get(0),
         ).unwrap();
         let now = current_timestamp_ms();
-        assert!(available_at > now, "available_at should be in the future after retry");
+        assert!(
+            available_at > now,
+            "available_at should be in the future after retry"
+        );
 
         // lease_until should be cleared
         let lease: Option<i64> = conn.query_row(
@@ -449,10 +468,12 @@ mod tests {
         pq.enqueue("peer1", "event_c").unwrap();
 
         let mut processed = Vec::new();
-        let count = pq.drain("peer1", |_conn, eid| {
-            processed.push(eid.to_string());
-            Ok(())
-        }).unwrap();
+        let count = pq
+            .drain("peer1", |_conn, eid| {
+                processed.push(eid.to_string());
+                Ok(())
+            })
+            .unwrap();
 
         assert_eq!(count, 3);
         assert_eq!(processed.len(), 3);
@@ -461,10 +482,13 @@ mod tests {
         assert!(processed.contains(&"event_c".to_string()));
 
         // Queue should be empty
-        let remaining: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM project_queue WHERE peer_id = 'peer1'",
-            [], |row| row.get(0),
-        ).unwrap();
+        let remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM project_queue WHERE peer_id = 'peer1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(remaining, 0);
     }
 
@@ -479,13 +503,15 @@ mod tests {
 
         // Callback that fails for event_b
         let mut processed = Vec::new();
-        let count = pq.drain("peer1", |_conn, eid| {
-            if eid == "event_b" {
-                return Err("simulated failure".into());
-            }
-            processed.push(eid.to_string());
-            Ok(())
-        }).unwrap();
+        let count = pq
+            .drain("peer1", |_conn, eid| {
+                if eid == "event_b" {
+                    return Err("simulated failure".into());
+                }
+                processed.push(eid.to_string());
+                Ok(())
+            })
+            .unwrap();
 
         // event_a and event_c succeeded
         assert_eq!(count, 2);
@@ -497,20 +523,29 @@ mod tests {
             "SELECT attempts FROM project_queue WHERE peer_id = 'peer1' AND event_id = 'event_b'",
             [], |row| row.get(0),
         ).unwrap();
-        assert!(attempts >= 1, "failed item should have incremented attempts");
+        assert!(
+            attempts >= 1,
+            "failed item should have incremented attempts"
+        );
 
         // event_b should have a future available_at (backoff)
         let available_at: i64 = conn.query_row(
             "SELECT available_at FROM project_queue WHERE peer_id = 'peer1' AND event_id = 'event_b'",
             [], |row| row.get(0),
         ).unwrap();
-        assert!(available_at > current_timestamp_ms(), "failed item should be delayed by backoff");
+        assert!(
+            available_at > current_timestamp_ms(),
+            "failed item should be delayed by backoff"
+        );
 
         // Successfully completed items should be gone
-        let remaining: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM project_queue WHERE peer_id = 'peer1'",
-            [], |row| row.get(0),
-        ).unwrap();
+        let remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM project_queue WHERE peer_id = 'peer1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(remaining, 1, "only the failed item should remain");
     }
 
@@ -523,17 +558,20 @@ mod tests {
         pq.enqueue("peer1", "event_b").unwrap();
 
         // Callback that always fails
-        let count = pq.drain("peer1", |_conn, _eid| {
-            Err("always fail".into())
-        }).unwrap();
+        let count = pq
+            .drain("peer1", |_conn, _eid| Err("always fail".into()))
+            .unwrap();
 
         assert_eq!(count, 0, "no items should be counted as processed");
 
         // Both items should remain in queue
-        let remaining: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM project_queue WHERE peer_id = 'peer1'",
-            [], |row| row.get(0),
-        ).unwrap();
+        let remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM project_queue WHERE peer_id = 'peer1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(remaining, 2, "all items should remain after total failure");
     }
 
@@ -546,29 +584,40 @@ mod tests {
         pq.enqueue("peer1", "event_b").unwrap();
 
         // Projector that writes to valid_events (simulating real projection)
-        let count = pq.drain("peer1", |conn, eid| {
-            conn.execute(
-                "INSERT INTO valid_events (peer_id, event_id) VALUES ('peer1', ?1)",
-                params![eid],
-            )?;
-            Ok(())
-        }).unwrap();
+        let count = pq
+            .drain("peer1", |conn, eid| {
+                conn.execute(
+                    "INSERT INTO valid_events (peer_id, event_id) VALUES ('peer1', ?1)",
+                    params![eid],
+                )?;
+                Ok(())
+            })
+            .unwrap();
 
         assert_eq!(count, 2);
 
         // Both valid_events rows must exist (projection committed)
-        let valid_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM valid_events WHERE peer_id = 'peer1'",
-            [], |row| row.get(0),
-        ).unwrap();
+        let valid_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM valid_events WHERE peer_id = 'peer1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(valid_count, 2, "projection writes should be committed");
 
         // Queue must be empty (dequeue committed atomically with projection)
-        let queue_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM project_queue WHERE peer_id = 'peer1'",
-            [], |row| row.get(0),
-        ).unwrap();
-        assert_eq!(queue_count, 0, "queue rows should be deleted atomically with projection");
+        let queue_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM project_queue WHERE peer_id = 'peer1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            queue_count, 0,
+            "queue rows should be deleted atomically with projection"
+        );
     }
 
     #[test]
@@ -580,16 +629,18 @@ mod tests {
         pq.enqueue("peer1", "event_b").unwrap();
 
         // Projector that writes to valid_events but fails for event_b
-        let count = pq.drain("peer1", |conn, eid| {
-            conn.execute(
-                "INSERT INTO valid_events (peer_id, event_id) VALUES ('peer1', ?1)",
-                params![eid],
-            )?;
-            if eid == "event_b" {
-                return Err("simulated failure after write".into());
-            }
-            Ok(())
-        }).unwrap();
+        let count = pq
+            .drain("peer1", |conn, eid| {
+                conn.execute(
+                    "INSERT INTO valid_events (peer_id, event_id) VALUES ('peer1', ?1)",
+                    params![eid],
+                )?;
+                if eid == "event_b" {
+                    return Err("simulated failure after write".into());
+                }
+                Ok(())
+            })
+            .unwrap();
 
         assert_eq!(count, 1, "only event_a should succeed");
 
@@ -629,14 +680,16 @@ mod tests {
 
         pq.enqueue("peer1", "event_blocked").unwrap();
 
-        let count = pq.drain("peer1", |conn, eid| {
-            conn.execute(
-                "INSERT INTO blocked_event_deps (peer_id, event_id, blocker_event_id)
+        let count = pq
+            .drain("peer1", |conn, eid| {
+                conn.execute(
+                    "INSERT INTO blocked_event_deps (peer_id, event_id, blocker_event_id)
                  VALUES ('peer1', ?1, 'missing_dep')",
-                params![eid],
-            )?;
-            Err("simulated failure after blocker write".into())
-        }).unwrap();
+                    params![eid],
+                )?;
+                Err("simulated failure after blocker write".into())
+            })
+            .unwrap();
 
         assert_eq!(count, 0, "failed projection should not count as success");
 
@@ -675,16 +728,23 @@ mod tests {
         conn.execute(
             "INSERT INTO valid_events (peer_id, event_id) VALUES ('peer1', 'event_b')",
             [],
-        ).unwrap();
+        )
+        .unwrap();
 
         let ids = vec!["event_a", "event_b", "event_c"];
         let inserted = pq.enqueue_batch("peer1", &ids).unwrap();
-        assert_eq!(inserted, 2, "event_b should be skipped (valid_events guard)");
+        assert_eq!(
+            inserted, 2,
+            "event_b should be skipped (valid_events guard)"
+        );
 
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM project_queue WHERE peer_id = 'peer1'",
-            [], |row| row.get(0),
-        ).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM project_queue WHERE peer_id = 'peer1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 2);
     }
 
@@ -717,5 +777,4 @@ mod tests {
         assert_eq!(h.pending, 2); // both still in queue
         assert_eq!(h.max_attempts, 1); // event_a retried once
     }
-
 }
