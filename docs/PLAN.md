@@ -1145,7 +1145,7 @@ Not in scope yet:
 
 ## 11.7 TLA-to-projector conformance rule
 
-- Keep model alignment with `docs/tla/BootstrapGraph.tla` and `docs/tla/EventGraphSchema.tla`.
+- Keep model alignment with `docs/tla/EventGraphSchema.tla` (including `event_graph_schema_bootstrap.cfg`) and `docs/tla/TransportCredentialLifecycle.tla`.
 - Extend/adjust model events for split invites (`user_invite`, `device_invite`).
 - For each identity-phase projector, include a referenced guard list in comments/docs.
 - Treat divergence between projector logic and TLA guards as a spec bug that must be resolved before adding behavior.

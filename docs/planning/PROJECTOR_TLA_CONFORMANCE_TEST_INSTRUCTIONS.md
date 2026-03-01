@@ -42,7 +42,7 @@ Treat "TLA conformance" as a layered test contract, not one test style.
 Use these files as normative mapping inputs:
 1. `docs/tla/projector_spec.md`
 2. `docs/tla/EventGraphSchema.tla`
-3. `docs/tla/BootstrapGraph.tla`
+3. `docs/tla/event_graph_schema_bootstrap.cfg`
 4. `docs/tla/TransportCredentialLifecycle.tla`
 
 If behavior changes are needed:

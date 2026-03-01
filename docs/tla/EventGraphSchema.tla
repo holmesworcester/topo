@@ -509,6 +509,14 @@ InvSingleWorkspace ==
         \A n1, n2 \in Workspaces:
             (n1 \in valid[p] /\ n2 \in valid[p]) => n1 = n2
 
+\* Legacy-compatible explicit name used by projector/runtime guard mappings.
+\* Equivalent to InvWorkspaceAnchor: any valid workspace event must be the
+\* workspace bound by invite_accepted trust-anchor materialization.
+InvForeignWorkspaceExcluded ==
+    \A p \in Peers:
+        \A n \in Workspaces:
+            (n \in valid[p]) => n = trustAnchor[p]
+
 \* Trust anchor requires invite_accepted to be valid.
 InvTrustAnchorSource ==
     IF InviteAccepted \in EVENTS

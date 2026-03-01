@@ -8,7 +8,7 @@ Goal: track and close high-impact discrepancies between `docs/DESIGN.md`, `docs/
 
 For any TODO that changes protocol semantics, trust-source semantics, dependency/guard rules, or identity/key lifecycle behavior:
 
-1. Update relevant TLA modules under `docs/tla/` (for example `EventGraphSchema.tla`, `TransportCredentialLifecycle.tla`, `BootstrapGraph.tla`) before Rust implementation changes.
+1. Update relevant TLA modules under `docs/tla/` (for example `EventGraphSchema.tla` and `TransportCredentialLifecycle.tla`) before Rust implementation changes.
 2. Run TLC/model checks and confirm expected invariants/counterexamples before coding the semantic change.
 3. Implement Rust changes to match the validated model.
 4. Update `docs/tla/projector_spec.md` mapping rows and any DESIGN/PLAN invariant lists.

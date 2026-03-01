@@ -111,5 +111,5 @@ Historical feedback artifacts, completed execution plans, and superseded plannin
 | Directory | Description |
 |-----------|-------------|
 | `planning/` | Execution plans and discrepancy tracking for active workstreams |
-| `tla/` | TLA+ formal models and configs (BootstrapGraph, EventGraphSchema, transport lifecycle) |
+| `tla/` | TLA+ formal models and configs (EventGraphSchema, transport lifecycle, unified bridge planning) |
 | `archive/` | Historical plans, feedback docs, and superseded material |
