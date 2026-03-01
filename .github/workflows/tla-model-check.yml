@@ -27,6 +27,11 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      - name: Validate UnifiedBridge conformance coverage
+        run: |
+          set -euo pipefail
+          python3 scripts/check_bridge_conformance.py
+
       - name: Run Tier 1 model checks
         run: |
           set -euo pipefail
