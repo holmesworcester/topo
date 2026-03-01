@@ -2,7 +2,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::crypto::EventId;
 use crate::event_modules::user_removed::{CreateUserRemovedCmd, UserRemovedEvent};
-use crate::projection::create::create_signed_event_sync;
+use crate::projection::create::create_signed_event_synchronous;
 use crate::service::open_db_for_peer;
 use ed25519_dalek::SigningKey;
 use rusqlite::Connection;
@@ -33,7 +33,7 @@ pub fn create_user_removed(
         signer_type: 5,
         signature: [0u8; 64],
     });
-    let eid = create_signed_event_sync(db, recorded_by, &ur, signing_key)?;
+    let eid = create_signed_event_synchronous(db, recorded_by, &ur, signing_key)?;
     Ok(eid)
 }
 

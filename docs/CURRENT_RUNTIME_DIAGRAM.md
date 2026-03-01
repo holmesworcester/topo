@@ -27,7 +27,7 @@ flowchart TD
     RPC --> SVC["service.rs (thin helpers)"]
 
     EM --> SVC
-    EM --> CREATE["create_*_event_sync / create_signed_event_sync"]
+    EM --> CREATE["create_*_event_sync / create_signed_event_synchronous"]
     CREATE --> PROJ["project_one + cascade"]
     PROJ --> READS["projection read tables"]
 

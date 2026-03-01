@@ -29,7 +29,8 @@ use crate::event_modules::{
 };
 use crate::projection::apply::project_one;
 use crate::projection::create::{
-    create_event_staged, create_event_sync, create_signed_event_sync, event_id_or_blocked,
+    create_event_staged, create_event_synchronous, create_signed_event_synchronous,
+    event_id_or_blocked,
 };
 use crate::service::{open_db_for_peer, open_db_load};
 
@@ -55,7 +56,7 @@ fn emit_local_signer_secret(
         signer_kind,
         private_key_bytes: signing_key.to_bytes(),
     });
-    event_id_or_blocked(create_event_sync(db, recorded_by, &evt))
+    event_id_or_blocked(create_event_synchronous(db, recorded_by, &evt))
         .map_err(|e| format!("emit local_signer_secret failed: {}", e).into())
 }
 
@@ -154,7 +155,7 @@ pub fn create_workspace(
         invite_event_id: ws_eid,
         workspace_id: ws_eid,
     });
-    let _ia_eid = create_event_sync(db, &derived_peer_id, &ia)?;
+    let _ia_eid = create_event_synchronous(db, &derived_peer_id, &ia)?;
     project_one(db, &derived_peer_id, &ws_eid)
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
 
@@ -168,7 +169,7 @@ pub fn create_workspace(
         signer_type: 1,
         signature: [0u8; 64],
     });
-    let uib_eid = create_signed_event_sync(db, &derived_peer_id, &uib, &workspace_key)?;
+    let uib_eid = create_signed_event_synchronous(db, &derived_peer_id, &uib, &workspace_key)?;
 
     // 4. UserBoot (signed by invite_key)
     let user_key = SigningKey::generate(&mut rng);
@@ -180,7 +181,7 @@ pub fn create_workspace(
         signer_type: 2,
         signature: [0u8; 64],
     });
-    let ub_eid = create_signed_event_sync(db, &derived_peer_id, &ub, &invite_key)?;
+    let ub_eid = create_signed_event_synchronous(db, &derived_peer_id, &ub, &invite_key)?;
 
     // 5. DeviceInviteFirst (signed by user_key)
     let device_invite_key = SigningKey::generate(&mut rng);
@@ -191,7 +192,7 @@ pub fn create_workspace(
         signer_type: 4,
         signature: [0u8; 64],
     });
-    let dif_eid = create_signed_event_sync(db, &derived_peer_id, &dif, &user_key)?;
+    let dif_eid = create_signed_event_synchronous(db, &derived_peer_id, &dif, &user_key)?;
 
     // 6. PeerSharedFirst (signed by device_invite_key; key pre-generated above)
     let psf = ParsedEvent::PeerSharedFirst(PeerSharedFirstEvent {
@@ -203,7 +204,7 @@ pub fn create_workspace(
         signer_type: 3,
         signature: [0u8; 64],
     });
-    let psf_eid = create_signed_event_sync(db, &derived_peer_id, &psf, &device_invite_key)?;
+    let psf_eid = create_signed_event_synchronous(db, &derived_peer_id, &psf, &device_invite_key)?;
 
     // 7. Emit local_signer_secret events for all three signing keys.
     // Transport identity is already installed, so all writes use derived_peer_id.
@@ -265,7 +266,7 @@ pub fn join_workspace_as_new_user(
         invite_event_id: *invite_event_id,
         workspace_id,
     });
-    let invite_accepted_event_id = create_event_sync(db, recorded_by, &ia_evt)?;
+    let invite_accepted_event_id = create_event_synchronous(db, recorded_by, &ia_evt)?;
 
     // 2. UserBoot (signed by invite_key) — may block if invite event not yet synced.
     // Tolerates Blocked: the event is stored and will project via cascade when
@@ -279,7 +280,7 @@ pub fn join_workspace_as_new_user(
         signer_type: 2,
         signature: [0u8; 64],
     });
-    let user_event_id = event_id_or_blocked(create_signed_event_sync(
+    let user_event_id = event_id_or_blocked(create_signed_event_synchronous(
         db,
         recorded_by,
         &ub_evt,
@@ -295,7 +296,7 @@ pub fn join_workspace_as_new_user(
         signer_type: 4,
         signature: [0u8; 64],
     });
-    let device_invite_event_id = event_id_or_blocked(create_signed_event_sync(
+    let device_invite_event_id = event_id_or_blocked(create_signed_event_synchronous(
         db,
         recorded_by,
         &dif_evt,
@@ -312,7 +313,7 @@ pub fn join_workspace_as_new_user(
         signer_type: 3,
         signature: [0u8; 64],
     });
-    let peer_shared_event_id = event_id_or_blocked(create_signed_event_sync(
+    let peer_shared_event_id = event_id_or_blocked(create_signed_event_synchronous(
         db,
         recorded_by,
         &psf_evt,
@@ -395,7 +396,7 @@ pub fn add_device_to_workspace(
         invite_event_id: *device_invite_event_id,
         workspace_id,
     });
-    let invite_accepted_event_id = create_event_sync(db, recorded_by, &ia_evt)?;
+    let invite_accepted_event_id = create_event_synchronous(db, recorded_by, &ia_evt)?;
 
     // 2. PeerSharedFirst (signed by device_invite_key) — may block if device invite
     // event not yet synced. Tolerates Blocked: the event is stored and will project
@@ -409,7 +410,7 @@ pub fn add_device_to_workspace(
         signer_type: 3,
         signature: [0u8; 64],
     });
-    let peer_shared_event_id = event_id_or_blocked(create_signed_event_sync(
+    let peer_shared_event_id = event_id_or_blocked(create_signed_event_synchronous(
         db,
         recorded_by,
         &psf_evt,

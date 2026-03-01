@@ -828,9 +828,9 @@ Design note:
 
 Three creation entry points exist:
 
-1. `create_event_synchronous(...) -> event_id` (current Rust symbol: `create_event_sync`),
-2. `create_signed_event_synchronous(...) -> event_id` (current Rust symbol: `create_signed_event_sync`),
-3. `create_encrypted_event_synchronous(...) -> event_id` (current Rust symbol: `create_encrypted_event_sync`).
+1. `create_event_synchronous(...) -> event_id` (current Rust symbol: `create_event_synchronous`),
+2. `create_signed_event_synchronous(...) -> event_id` (current Rust symbol: `create_signed_event_synchronous`),
+3. `create_encrypted_event_synchronous(...) -> event_id` (current Rust symbol: `create_encrypted_event_synchronous`).
 
 The `_sync` suffix in current symbols means "synchronous/blocking creation"
 (not sync/reconciliation protocol semantics). The canonical semantics are
@@ -1450,7 +1450,7 @@ some event types may remain single-file under `src/event_modules/<type>.rs`.
 1. **Wire** — struct definition, parse/encode, wire layout, `EventTypeMeta`.
 2. **Projector** — `project_pure()` function: the pure projector for this event type. Takes `(recorded_by, event_id_b64, &ParsedEvent, &ContextSnapshot)` and returns `ProjectorResult`. Registered in `EventTypeMeta.projector` so the pipeline dispatches via registry lookup with no central match statement.
 3. **Projector context loader** — `build_projector_context(...)` (location: `queries.rs` or projector-local helper) performs projector-specific SQL reads and returns `ContextSnapshot`. Registered in `EventTypeMeta.context_loader`.
-4. **Commands** — `CreateXxxCmd` struct + `create()` function that builds the `ParsedEvent`, calls `create_signed_event_sync`, and returns `EventId`. High-level command helpers callable from service/RPC routes (for example `send`, `react`) and multi-step workflows (for example workspace onboarding) are first-class command APIs in this layer.
+4. **Commands** — `CreateXxxCmd` struct + `create()` function that builds the `ParsedEvent`, calls `create_signed_event_synchronous`, and returns `EventId`. High-level command helpers callable from service/RPC routes (for example `send`, `react`) and multi-step workflows (for example workspace onboarding) are first-class command APIs in this layer.
 5. **Queries** — `list()`, `count()`, `resolve()`, `list_for_message_with_authors()`, etc. — SQL against projection tables scoped by `recorded_by`. All event-specific SQL lives here.
 6. **Response types** — serializable structs for the event domain (e.g. `MessageItem`, `MessagesResponse`, `SendResponse`). Owned by the event module, re-exported by `src/runtime/control/service.rs` for external callers.
 

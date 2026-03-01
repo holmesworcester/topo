@@ -7,8 +7,8 @@ use std::net::SocketAddr;
 
 use thiserror::Error;
 
-use crate::transport::peer_identity_from_connection;
 use super::TRUST_REJECTION_MARKER;
+use crate::transport::peer_identity_from_connection;
 
 /// A successful transport connection with verified peer identity.
 pub struct ConnectedPeer {

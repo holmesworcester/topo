@@ -85,6 +85,6 @@ Given the clarified intent, Phase 7 should include a focused TLA/spec revision b
 
 ## Open question (plan conformance)
 
-- `create_event_sync` currently returns success for `Block` (`src/projection/create.rs:94`).
+- `create_event_synchronous` currently returns success for `Block` (`src/projection/create.rs:94`).
 - In Phase 7, guard-blocked identity events make this path common.
 - If the intended contract is “sync create returns only when terminal valid,” this now diverges and should be made explicit (or fixed).

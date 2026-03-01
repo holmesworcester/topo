@@ -961,7 +961,7 @@ async fn test_project_queue_crash_recovery() {
 
     let alice = Peer::new_with_identity("alice");
 
-    // Create messages via create_event_sync (bypasses queue, projects inline)
+    // Create messages via create_event_synchronous (bypasses queue, projects inline)
     let _msg1 = alice.create_message("Recovery message 1");
     let _msg2 = alice.create_message("Recovery message 2");
     let _msg3 = alice.create_message("Recovery message 3");
@@ -1107,7 +1107,7 @@ async fn test_project_queue_crash_recovery() {
     harness.finish();
 }
 
-/// Integration test: verify project_queue drain works end-to-end with create_event_sync events.
+/// Integration test: verify project_queue drain works end-to-end with create_event_synchronous events.
 #[tokio::test]
 async fn test_project_queue_drain_after_batch() {
     let harness = ScenarioHarness::skip("tests queue dedup guard, not projection invariants");
@@ -1116,7 +1116,7 @@ async fn test_project_queue_drain_after_batch() {
 
     let alice = Peer::new_with_identity("alice");
 
-    // Create events (projected inline by create_event_sync)
+    // Create events (projected inline by create_event_synchronous)
     alice.batch_create_messages(5);
     assert_eq!(alice.scoped_message_count(), 5);
 
@@ -3232,7 +3232,7 @@ async fn test_identity_then_messaging() {
 #[tokio::test]
 async fn test_device_link_via_sync() {
     use topo::event_modules::{DeviceInviteOngoingEvent, ParsedEvent, PeerSharedOngoingEvent};
-    use topo::projection::create::{create_signed_event_staged, create_signed_event_sync};
+    use topo::projection::create::{create_signed_event_staged, create_signed_event_synchronous};
 
     let phone = Peer::new("phone");
     let laptop = Peer::new("laptop");
@@ -3260,7 +3260,7 @@ async fn test_device_link_via_sync() {
         signature: [0u8; 64],
     });
     let laptop_di_eid =
-        create_signed_event_sync(&db, &phone.identity, &di_evt, &phone_chain.user_key)
+        create_signed_event_synchronous(&db, &phone.identity, &di_evt, &phone_chain.user_key)
             .expect("create device_invite_ongoing");
     drop(db);
 

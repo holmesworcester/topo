@@ -16,7 +16,7 @@ use topo::db::open_connection;
 use topo::event_modules::{
     file_slice::FILE_SLICE_CIPHERTEXT_BYTES, FileSliceEvent, MessageAttachmentEvent, ParsedEvent,
 };
-use topo::projection::create::create_signed_event_sync;
+use topo::projection::create::create_signed_event_synchronous;
 use topo::testutil::{assert_eventually, clone_events_to, start_chain, start_sink_download, Peer};
 
 /// Read peak resident set size from /proc/self/status (Linux only).
@@ -320,7 +320,7 @@ fn seed_large_file_on_source(source: &Peer, total_slices: u32) {
         signer_type: 5,
         signature: [0u8; 64],
     });
-    create_signed_event_sync(&db, &source.identity, &att, signing_key)
+    create_signed_event_synchronous(&db, &source.identity, &att, signing_key)
         .expect("create message_attachment");
 
     let ciphertext = vec![0xC3; FILE_SLICE_CIPHERTEXT_BYTES];
@@ -334,7 +334,7 @@ fn seed_large_file_on_source(source: &Peer, total_slices: u32) {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        create_signed_event_sync(&db, &source.identity, &fs, signing_key)
+        create_signed_event_synchronous(&db, &source.identity, &fs, signing_key)
             .expect("create file_slice");
     }
 }

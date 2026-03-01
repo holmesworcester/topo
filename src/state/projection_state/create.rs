@@ -142,7 +142,7 @@ fn store_blob_and_project(
 
 /// Create a new event: encode, hash, write to events/neg_items/recorded_events,
 /// then project via `project_one`. Returns the event_id on success.
-pub fn create_event_sync(
+pub fn create_event_synchronous(
     conn: &Connection,
     recorded_by: &str,
     event: &ParsedEvent,
@@ -162,7 +162,7 @@ pub fn create_event_sync(
 
 /// Create a signed event: encode with zero-placeholder signature, sign the
 /// canonical bytes, overwrite signature, then store and project.
-pub fn create_signed_event_sync(
+pub fn create_signed_event_synchronous(
     conn: &Connection,
     recorded_by: &str,
     event: &ParsedEvent,
@@ -179,7 +179,7 @@ pub fn create_signed_event_sync(
 
     if meta.signature_byte_len == 0 {
         return Err(CreateEventError::EncodeError(
-            "create_signed_event_sync called for unsigned type".to_string(),
+            "create_signed_event_synchronous called for unsigned type".to_string(),
         ));
     }
 
@@ -274,7 +274,7 @@ pub fn project_event_staged(
 ///
 /// If `signing_key` is provided, the inner blob is signed before encryption
 /// (signature is inside the ciphertext — signer identity hidden from non-recipients).
-pub fn create_encrypted_event_sync(
+pub fn create_encrypted_event_synchronous(
     conn: &Connection,
     recorded_by: &str,
     key_event_id: &EventId,
@@ -336,8 +336,8 @@ pub fn create_encrypted_event_sync(
         auth_tag,
     });
 
-    // 6. Use existing create_event_sync for the wrapper
-    create_event_sync(conn, recorded_by, &wrapper)
+    // 6. Use existing create_event_synchronous for the wrapper
+    create_event_synchronous(conn, recorded_by, &wrapper)
 }
 
 /// Staged create: persist and enqueue an event even if it is Blocked.
@@ -349,7 +349,7 @@ pub fn create_event_staged(
     recorded_by: &str,
     event: &ParsedEvent,
 ) -> Result<EventId, CreateEventError> {
-    event_id_or_blocked(create_event_sync(conn, recorded_by, event))
+    event_id_or_blocked(create_event_synchronous(conn, recorded_by, event))
 }
 
 /// Staged signed create: persist and enqueue a signed event even if it is Blocked.
@@ -362,7 +362,7 @@ pub fn create_signed_event_staged(
     event: &ParsedEvent,
     signing_key: &ed25519_dalek::SigningKey,
 ) -> Result<EventId, CreateEventError> {
-    event_id_or_blocked(create_signed_event_sync(
+    event_id_or_blocked(create_signed_event_synchronous(
         conn,
         recorded_by,
         event,
@@ -422,7 +422,7 @@ mod tests {
             invite_event_id: net_eid,
             workspace_id: net_eid,
         });
-        let _ia_eid = create_event_sync(conn, recorded_by, &ia_event).unwrap();
+        let _ia_eid = create_event_synchronous(conn, recorded_by, &ia_event).unwrap();
 
         // Re-project workspace now that trust anchor exists
         project_one(conn, recorded_by, &net_eid).unwrap();
@@ -436,7 +436,8 @@ mod tests {
             signer_type: 1,
             signature: [0u8; 64],
         });
-        let uib_eid = create_signed_event_sync(conn, recorded_by, &uib, &workspace_key).unwrap();
+        let uib_eid =
+            create_signed_event_synchronous(conn, recorded_by, &uib, &workspace_key).unwrap();
 
         let user_key = SigningKey::generate(&mut rng);
         let ub = ParsedEvent::UserBoot(UserBootEvent {
@@ -447,7 +448,7 @@ mod tests {
             signer_type: 2,
             signature: [0u8; 64],
         });
-        let ub_eid = create_signed_event_sync(conn, recorded_by, &ub, &invite_key).unwrap();
+        let ub_eid = create_signed_event_synchronous(conn, recorded_by, &ub, &invite_key).unwrap();
 
         let device_invite_key = SigningKey::generate(&mut rng);
         let dif = ParsedEvent::DeviceInviteFirst(DeviceInviteFirstEvent {
@@ -457,7 +458,7 @@ mod tests {
             signer_type: 4,
             signature: [0u8; 64],
         });
-        let dif_eid = create_signed_event_sync(conn, recorded_by, &dif, &user_key).unwrap();
+        let dif_eid = create_signed_event_synchronous(conn, recorded_by, &dif, &user_key).unwrap();
 
         let peer_shared_key = SigningKey::generate(&mut rng);
         let psf = ParsedEvent::PeerSharedFirst(PeerSharedFirstEvent {
@@ -470,13 +471,13 @@ mod tests {
             signature: [0u8; 64],
         });
         let psf_eid =
-            create_signed_event_sync(conn, recorded_by, &psf, &device_invite_key).unwrap();
+            create_signed_event_synchronous(conn, recorded_by, &psf, &device_invite_key).unwrap();
 
         (psf_eid, peer_shared_key, ub_eid)
     }
 
     #[test]
-    fn test_create_message_sync() {
+    fn test_create_message_synchronous() {
         let conn = setup();
         let recorded_by = "peer1";
         let net_eid = setup_workspace_event(&conn, recorded_by);
@@ -493,7 +494,7 @@ mod tests {
             signature: [0u8; 64],
         });
 
-        let eid = create_signed_event_sync(&conn, recorded_by, &msg, &signing_key).unwrap();
+        let eid = create_signed_event_synchronous(&conn, recorded_by, &msg, &signing_key).unwrap();
         let eid_b64 = event_id_to_base64(&eid);
 
         // events table
@@ -544,7 +545,8 @@ mod tests {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        let msg_eid = create_signed_event_sync(&conn, recorded_by, &msg, &signing_key).unwrap();
+        let msg_eid =
+            create_signed_event_synchronous(&conn, recorded_by, &msg, &signing_key).unwrap();
 
         let rxn = ParsedEvent::Reaction(ReactionEvent {
             created_at_ms: now_ms(),
@@ -555,7 +557,8 @@ mod tests {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        let rxn_eid = create_signed_event_sync(&conn, recorded_by, &rxn, &signing_key).unwrap();
+        let rxn_eid =
+            create_signed_event_synchronous(&conn, recorded_by, &rxn, &signing_key).unwrap();
 
         // Both valid
         let msg_b64 = event_id_to_base64(&msg_eid);
@@ -591,7 +594,8 @@ mod tests {
         });
 
         // Event is stored but blocked — returns Blocked error with event_id
-        let err = create_signed_event_sync(&conn, recorded_by, &rxn, &signing_key).unwrap_err();
+        let err =
+            create_signed_event_synchronous(&conn, recorded_by, &rxn, &signing_key).unwrap_err();
         let (eid, missing) = match err {
             CreateEventError::Blocked { event_id, missing } => (event_id, missing),
             other => panic!("expected Blocked, got: {}", other),
@@ -631,7 +635,7 @@ mod tests {
     }
 
     #[test]
-    fn test_create_signed_event_sync() {
+    fn test_create_signed_event_synchronous() {
         let conn = setup();
         let recorded_by = "peer1";
 
@@ -648,7 +652,8 @@ mod tests {
             signature: [0u8; 64], // placeholder, will be overwritten
         });
 
-        let msg_eid = create_signed_event_sync(&conn, recorded_by, &msg, &signing_key).unwrap();
+        let msg_eid =
+            create_signed_event_synchronous(&conn, recorded_by, &msg, &signing_key).unwrap();
         let msg_b64 = event_id_to_base64(&msg_eid);
 
         // Should be valid
@@ -673,8 +678,8 @@ mod tests {
     }
 
     #[test]
-    fn test_create_signed_event_sync_returns_blocked_error() {
-        // Verify strict API: create_signed_event_sync returns Err(Blocked) for
+    fn test_create_signed_event_synchronous_returns_blocked_error() {
+        // Verify strict API: create_signed_event_synchronous returns Err(Blocked) for
         // events with missing dependencies.
         let conn = setup();
         let recorded_by = "peer1";
@@ -692,7 +697,7 @@ mod tests {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        let result = create_signed_event_sync(&conn, recorded_by, &rxn, &signing_key);
+        let result = create_signed_event_synchronous(&conn, recorded_by, &rxn, &signing_key);
         match result {
             Err(CreateEventError::Blocked { event_id, missing }) => {
                 assert_eq!(missing.len(), 1);
@@ -756,7 +761,7 @@ mod tests {
         assert!(!in_valid, "blocked event should not be in valid_events");
     }
 
-    /// PLAN §6.4 contract: `create_event_sync` returns Ok only for Valid events.
+    /// PLAN §6.4 contract: `create_event_synchronous` returns Ok only for Valid events.
     /// A message with all deps satisfied must return Ok(event_id) and be in valid_events.
     #[test]
     fn test_create_event_sync_contract_valid_only() {
@@ -774,7 +779,7 @@ mod tests {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        let result = create_signed_event_sync(&conn, recorded_by, &msg, &signing_key);
+        let result = create_signed_event_synchronous(&conn, recorded_by, &msg, &signing_key);
         assert!(
             result.is_ok(),
             "PLAN §6.4: valid event must return Ok, got: {:?}",
@@ -796,7 +801,7 @@ mod tests {
         );
     }
 
-    /// PLAN §6.4 contract: `create_event_sync` returns Err(Blocked) with event_id
+    /// PLAN §6.4 contract: `create_event_synchronous` returns Err(Blocked) with event_id
     /// and missing deps when a dependency is unresolved.
     #[test]
     fn test_create_event_sync_contract_blocked_returns_err_with_event_id() {
@@ -814,7 +819,7 @@ mod tests {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        let result = create_signed_event_sync(&conn, recorded_by, &rxn, &signing_key);
+        let result = create_signed_event_synchronous(&conn, recorded_by, &rxn, &signing_key);
 
         match result {
             Err(CreateEventError::Blocked { event_id, missing }) => {

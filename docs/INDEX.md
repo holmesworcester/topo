@@ -69,8 +69,8 @@ Historical feedback artifacts, completed execution plans, and superseded plannin
 | Document | Description |
 |----------|-------------|
 | [archive/CLI_BOOTSTRAP_TEST_REALISM_EXECUTION_PLAN.md](archive/CLI_BOOTSTRAP_TEST_REALISM_EXECUTION_PLAN.md) | Completed: CLI bootstrap test realism |
-| [archive/CREATE_EVENT_SYNC_SEMANTICS_EXECUTION_PLAN.md](archive/CREATE_EVENT_SYNC_SEMANTICS_EXECUTION_PLAN.md) | Completed: create_event_sync semantics investigation |
-| [archive/CREATE_EVENT_SYNC_SEMANTICS_FINDINGS.md](archive/CREATE_EVENT_SYNC_SEMANTICS_FINDINGS.md) | Completed: create_event_sync semantics findings |
+| [archive/CREATE_EVENT_SYNC_SEMANTICS_EXECUTION_PLAN.md](archive/CREATE_EVENT_SYNC_SEMANTICS_EXECUTION_PLAN.md) | Completed: create_event_synchronous semantics investigation |
+| [archive/CREATE_EVENT_SYNC_SEMANTICS_FINDINGS.md](archive/CREATE_EVENT_SYNC_SEMANTICS_FINDINGS.md) | Completed: create_event_synchronous semantics findings |
 | [archive/FIXED_LENGTH_FIELDS_EXECUTION_PLAN.md](archive/FIXED_LENGTH_FIELDS_EXECUTION_PLAN.md) | Completed: fixed-length event fields |
 | [archive/HOLEPUNCH_TEST_REALISM_EXECUTION_PLAN.md](archive/HOLEPUNCH_TEST_REALISM_EXECUTION_PLAN.md) | Completed: hole-punch test realism |
 | [archive/IDENTITY_RENAME_PLAN.md](archive/IDENTITY_RENAME_PLAN.md) | Completed: transport identity rename |

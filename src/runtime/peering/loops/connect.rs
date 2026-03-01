@@ -15,7 +15,7 @@ use crate::db::transport_trust::record_transport_binding;
 use crate::sync::CoordinationManager;
 use crate::sync::SyncSessionHandler;
 use crate::transport::{
-    dial_session_provider, derive_bootstrap_dial_context, BootstrapDialMode,
+    derive_bootstrap_dial_context, dial_session_provider, BootstrapDialMode,
     ConnectionLifecycleError, SessionProvider, TransportClientConfig, TransportEndpoint,
 };
 
@@ -363,8 +363,9 @@ mod tests {
 
     #[test]
     fn fallback_policy_denies_generic_dial_errors() {
-        let err =
-            ConnectionLifecycleError::Dial("handshake to 127.0.0.1:4433: connection refused".to_string());
+        let err = ConnectionLifecycleError::Dial(
+            "handshake to 127.0.0.1:4433: connection refused".to_string(),
+        );
         let decision = derive_bootstrap_dial_context(Some(&err), true);
         assert_eq!(decision.mode, BootstrapDialMode::Deny);
     }

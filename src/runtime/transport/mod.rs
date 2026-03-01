@@ -11,12 +11,12 @@ pub mod session_factory;
 pub mod transport_session_io;
 
 pub use crate::crypto::AllowedPeers;
+pub use bootstrap_dial_context::{
+    derive_bootstrap_dial_context, BootstrapDialContext, BootstrapDialMode,
+};
 pub use cert::{
     extract_spki_fingerprint, generate_keypair, generate_self_signed_cert,
     generate_self_signed_cert_from_signing_key, validate_cert_key_match,
-};
-pub use bootstrap_dial_context::{
-    derive_bootstrap_dial_context, BootstrapDialContext, BootstrapDialMode,
 };
 pub use connection::{DualConnection, StreamConn, StreamRecv, StreamSend};
 pub use connection_lifecycle::{accept_peer, dial_peer, ConnectedPeer, ConnectionLifecycleError};

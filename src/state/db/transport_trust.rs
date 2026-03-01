@@ -879,10 +879,8 @@ mod tests {
         let alice_spki: [u8; 32] = [0xA1; 32];
         let bob_spki: [u8; 32] = [0xB2; 32];
 
-        record_pending_invite_bootstrap_trust(&conn, alice, "invite-a", "ws", &bob_spki)
-            .unwrap();
-        record_pending_invite_bootstrap_trust(&conn, bob, "invite-b", "ws", &alice_spki)
-            .unwrap();
+        record_pending_invite_bootstrap_trust(&conn, alice, "invite-a", "ws", &bob_spki).unwrap();
+        record_pending_invite_bootstrap_trust(&conn, bob, "invite-b", "ws", &alice_spki).unwrap();
 
         assert!(
             is_peer_allowed(&conn, alice, &bob_spki).unwrap(),

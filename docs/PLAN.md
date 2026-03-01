@@ -609,17 +609,17 @@ Do not route in-call cascade fanout through `project_queue`.
 Use one primitive with two entry points:
 
 - `persist_and_enqueue(event_blob, peer_id) -> event_id`
-- `create_event_sync(...) -> event_id`
+- `create_event_synchronous(...) -> event_id`
 - `create_events_batch(events, project_now: bool) -> Vec<EventId>`
 
-`create_event_sync` should inline projection until terminal (`valid`, `blocked`, or `rejected`) so command chains can immediately use prior event ids.
+`create_event_synchronous` should inline projection until terminal (`valid`, `blocked`, or `rejected`) so command chains can immediately use prior event ids.
 
 Imperative orchestration contract (poc-6 style ergonomics):
-- default `create_event_sync` must return success only when the created event is `valid` for `recorded_by`.
+- default `create_event_synchronous` must return success only when the created event is `valid` for `recorded_by`.
 - if terminal state is `blocked` or `rejected`, return an error containing `event_id` + terminal reason.
 - this guarantees call-site sequencing:
-  - `a = create_event_sync(...)`
-  - `b = create_event_sync(depends_on=a, ...)`
+  - `a = create_event_synchronous(...)`
+  - `b = create_event_synchronous(depends_on=a, ...)`
 
 Implementation note:
 - even synchronous create uses the same internal pipeline:
@@ -630,14 +630,14 @@ Implementation note:
 
 The codebase provides two create-and-project entry points reflecting distinct caller needs:
 
-1. **`create_event_sync`** (strict, PLAN-normative): returns `Ok(event_id)` only when projection reaches `Valid` or `AlreadyProcessed`. Returns `Err(Blocked { event_id, missing })` or `Err(Rejected { event_id, reason })` otherwise. All user-facing service commands (`svc_send`, `svc_react`, `svc_delete_message`, `svc_generate`) use this API.
+1. **`create_event_synchronous`** (strict, PLAN-normative): returns `Ok(event_id)` only when projection reaches `Valid` or `AlreadyProcessed`. Returns `Err(Blocked { event_id, missing })` or `Err(Rejected { event_id, reason })` otherwise. All user-facing service commands (`svc_send`, `svc_react`, `svc_delete_message`, `svc_generate`) use this API.
 
 2. **`create_event_staged`** (lenient, bootstrap-only): wraps `Blocked` errors into `Ok(event_id)` via `event_id_or_blocked`. Used in identity bootstrap command paths (for example `create_workspace`, `join_workspace_as_new_user`, `add_device_to_workspace`) where events like `Workspace` can be created before their trust-anchor dependency exists and are expected to block until the anchor arrives.
 
 This split is intentional and correct: it preserves the strict contract for user-facing orchestration while allowing bootstrap chains to store pre-dependency events without aborting.
 
 Test index for this contract:
-- `test_create_signed_event_sync_returns_blocked_error` — strict API blocked→Err
+- `test_create_signed_event_synchronous_returns_blocked_error` — strict API blocked→Err
 - `test_create_signed_event_staged_returns_ok_on_blocked` — staged API blocked→Ok
 - `test_create_reaction_before_target` — blocked event DB state
 - `test_react_errors_on_blocked` — service layer propagation
@@ -1196,7 +1196,7 @@ Config files: `transport_credential_lifecycle_fast.cfg` (2 peers, 3 SPKIs), `tra
 
 - CLI commands are deterministic and script-friendly.
 - Prefer `assert-eventually` over ad-hoc sleeps/waits.
-- `create_event_sync` chaining works for imperative orchestration:
+- `create_event_synchronous` chaining works for imperative orchestration:
   - event A created+projected synchronously,
   - event B created next line with dependency on A,
   - B succeeds without manual waits.

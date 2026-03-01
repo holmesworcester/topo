@@ -44,7 +44,7 @@ Realism-first rule for ordering: finish test-fidelity items up front (copying ev
 6. ~~`P1: Deprecate --pin-peer from product code and design after invite-trust maturity`~~ **DONE**: `--pin-peer` removed from product sync CLI/runtime trust authority; residual references are test-plan/archival artifacts only.
 7. ~~`P0: Make scenario replay invariants mandatory by default (opt-out only)`~~ **DONE**: scenario tests now go through mandatory `ScenarioHarness` replay checks unless explicitly skipped.
 8. ~~`P0: Bring scenario invariant harness fully in line with PLAN (fingerprints + full invariant set)`~~ **DONE**: deterministic full-state fingerprint replay checks are now active for forward/idempotent/reverse/shuffled replay paths, with mandatory ScenarioHarness replay verification by default.
-9. ~~`P1: Investigate and decide create_event_sync service semantics before implementation changes`~~ **DONE**: strict `create_event_sync` and bootstrap-only `create_event_staged` semantics are explicitly captured in PLAN §6.4 and covered by contract tests (`test_create_event_sync_contract_valid_only`, `test_create_event_sync_contract_blocked_returns_err_with_event_id`).
+9. ~~`P1: Investigate and decide create_event_synchronous service semantics before implementation changes`~~ **DONE**: strict `create_event_synchronous` and bootstrap-only `create_event_staged` semantics are explicitly captured in PLAN §6.4 and covered by contract tests (`test_create_event_sync_contract_valid_only`, `test_create_event_sync_contract_blocked_returns_err_with_event_id`).
 10. ~~`P1: Investigate simplification of project_one/project_one_core split to better match one-path intent`~~ **DONE**: Investigated and resolved. Decision: keep two-layer model (`project_one` public entrypoint + `project_one_step` internal non-cascading step) as justified cascade optimization. Renamed `project_one_core` → `project_one_step` with clear doc comments. Added 7 source-isomorphism invariance tests proving direct/cascade/reverse-order convergence. Updated DESIGN.md §4.1, PLAN.md §5/§15.1, and TLA projector_spec.md to explicitly document the internal split.
 11. ~~`P0: Unify transport identity architecture (single event-derived peer identity, no rotation sidecar)`~~ **DONE**: single event-derived identity authority is canonical. `transport_key` removed as trust authority; transport allow/deny now uses PeerShared-derived SPKIs + bootstrap trust only. No rotation sidecar, no silent regeneration. TLA models (`EventGraphSchema`, `TransportCredentialLifecycle`) rewritten and verified. DESIGN/PLAN/projector_spec aligned.
 12. ~~`P2: Resolve disjoint trust sets docs/code mismatch`~~ **DONE**: docs now match code semantics (tenant-scoped trust checks with permitted cross-tenant SPKI overlap).
@@ -406,12 +406,12 @@ Acceptance:
 2. Standard harness covers PLAN 12.4 checks in default flow.
 3. Per-test opt-out remains explicit and justified.
 
-## ~~P1: Investigate and decide `create_event_sync` service semantics before implementation changes~~ DONE
+## ~~P1: Investigate and decide `create_event_synchronous` service semantics before implementation changes~~ DONE
 
 Decision and closure:
 
 1. Keep two explicit create APIs with distinct contracts:
-   - `create_event_sync`: strict user-facing contract, success only on `Valid`/`AlreadyProcessed`.
+   - `create_event_synchronous`: strict user-facing contract, success only on `Valid`/`AlreadyProcessed`.
    - `create_event_staged`: bootstrap-only helper that preserves blocked event ids.
 2. PLAN now captures this split explicitly (`docs/PLAN.md` §6.4).
 3. Contract tests are present and green:
@@ -636,4 +636,4 @@ Items deferred from the Option 1+2 event-locality refactor:
 
 3. **Event module list queries for peers/admins**: `svc_keys_conn` still uses inline SQL for the detailed (non-summary) peers and admins lists. Adding `query_list` to `peer_shared` and `admin` modules would complete the migration.
 
-4. **Encrypted event dispatch**: The `dispatch.rs` `EventCommand` enum currently covers only the four signed content event types (message, reaction, message_deletion, user_removed). Encrypted event creation follows a different path through `create_encrypted_event_sync` and was left out of scope.
+4. **Encrypted event dispatch**: The `dispatch.rs` `EventCommand` enum currently covers only the four signed content event types (message, reaction, message_deletion, user_removed). Encrypted event creation follows a different path through `create_encrypted_event_synchronous` and was left out of scope.
