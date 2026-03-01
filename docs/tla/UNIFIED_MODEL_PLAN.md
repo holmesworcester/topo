@@ -151,6 +151,7 @@ Drift controls (required):
 2. Model-only guards that are not implemented in code must be removed or explicitly waived.
 3. Bug-mode counterexample and fix-mode pass must remain runnable under the same reduced domain.
 4. `scripts/check_bridge_conformance.py` must pass in CI: no `waiver:model_exercised_in_tlc` / `waiver:integration_effect_only` rows for `CHK_BRIDGE_*`, and non-liveness bridge checks retain non-waiver pass+break evidence.
+5. `scripts/check_tcl_conformance.py` must pass in CI: no `waiver:integration_effect_only` rows for `CHK_TCL_*`, and each TCL check retains non-waiver pass+break evidence.
 
 ## Best-use gap closure checklist
 1. Establish mandatory Tier 1 convergent checks for all three model families.

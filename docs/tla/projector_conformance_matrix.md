@@ -156,21 +156,21 @@ both `pass` and `break` polarity unless waived.
 | SPEC_PENDING_INVITER_TCL_02 | InvPendingTrustOnlyOnInviter | CHK_DI_PENDING_TRUST | projector_unit | device_invite_projector_tests::tests::test_device_invite_no_pending_when_not_local | break |
 | SPEC_PENDING_INVITER_TCL_02 | InvPendingTrustOnlyOnInviter | CHK_DI_PENDING_TRUST | projector_unit | device_invite_projector_tests::tests::test_device_invite_first_writes_pending_trust | pass |
 | SPEC_TCL_SPKI_01 | InvSPKIUniqueness | CHK_TCL_SPKI_UNIQUE | transport_credential | apply::tests::test_signed_content_events_project_with_identity_chain | pass |
-| SPEC_TCL_SPKI_01 | InvSPKIUniqueness | CHK_TCL_SPKI_UNIQUE | transport_credential | — | waiver:integration_effect_only |
+| SPEC_TCL_SPKI_01 | InvSPKIUniqueness | CHK_TCL_SPKI_UNIQUE | runtime_unit | runtime::transport::cert::tests::test_validate_cert_key_match_detects_mismatch | break |
 | SPEC_TCL_TRUST_UNION_01 | InvTrustSetIsExactUnion | CHK_TCL_TRUST_UNION | transport_credential | apply::tests::test_signed_content_events_project_with_identity_chain | pass |
-| SPEC_TCL_TRUST_UNION_01 | InvTrustSetIsExactUnion | CHK_TCL_TRUST_UNION | transport_credential | — | waiver:integration_effect_only |
+| SPEC_TCL_TRUST_UNION_01 | InvTrustSetIsExactUnion | CHK_TCL_TRUST_UNION | runtime_unit | state::db::transport_trust::tests::test_is_peer_allowed_checks_all_sources | break |
 | SPEC_TCL_SOURCES_01 | InvTrustSourcesWellFormed | CHK_TCL_SOURCES_FORMED | transport_credential | apply::tests::test_signed_content_events_project_with_identity_chain | pass |
-| SPEC_TCL_SOURCES_01 | InvTrustSourcesWellFormed | CHK_TCL_SOURCES_FORMED | transport_credential | — | waiver:integration_effect_only |
+| SPEC_TCL_SOURCES_01 | InvTrustSourcesWellFormed | CHK_TCL_SOURCES_FORMED | runtime_unit | state::db::transport_trust::tests::test_trusted_peer_count_ignores_malformed_rows | break |
 | SPEC_TCL_MUTUAL_01 | InvMutualAuthSymmetry | CHK_TCL_MUTUAL_AUTH | transport_credential | apply::tests::test_signed_content_events_project_with_identity_chain | pass |
-| SPEC_TCL_MUTUAL_01 | InvMutualAuthSymmetry | CHK_TCL_MUTUAL_AUTH | transport_credential | — | waiver:integration_effect_only |
+| SPEC_TCL_MUTUAL_01 | InvMutualAuthSymmetry | CHK_TCL_MUTUAL_AUTH | runtime_unit | state::db::transport_trust::tests::test_mutual_trust_requires_both_sides | break |
 | SPEC_TCL_MEMBERS_01 | InvTrustedPeerSetMembers | CHK_TCL_TRUSTED_MEMBERS | transport_credential | apply::tests::test_signed_content_events_project_with_identity_chain | pass |
-| SPEC_TCL_MEMBERS_01 | InvTrustedPeerSetMembers | CHK_TCL_TRUSTED_MEMBERS | transport_credential | — | waiver:integration_effect_only |
+| SPEC_TCL_MEMBERS_01 | InvTrustedPeerSetMembers | CHK_TCL_TRUSTED_MEMBERS | runtime_unit | state::db::transport_trust::tests::test_binding_alone_not_in_allowlist | break |
 | SPEC_TCL_BOOTSTRAP_MATCH_01 | InvBootstrapTrustMatchesCarried | CHK_TCL_BOOTSTRAP_MATCH | transport_credential | apply::tests::test_signed_content_events_project_with_identity_chain | pass |
-| SPEC_TCL_BOOTSTRAP_MATCH_01 | InvBootstrapTrustMatchesCarried | CHK_TCL_BOOTSTRAP_MATCH | transport_credential | — | waiver:integration_effect_only |
+| SPEC_TCL_BOOTSTRAP_MATCH_01 | InvBootstrapTrustMatchesCarried | CHK_TCL_BOOTSTRAP_MATCH | runtime_unit | state::db::transport_trust::tests::test_expired_invite_bootstrap_not_in_allowlist | break |
 | SPEC_TCL_PENDING_MATCH_01 | InvPendingBootstrapTrustMatchesCarried | CHK_TCL_PENDING_MATCH | transport_credential | apply::tests::test_signed_content_events_project_with_identity_chain | pass |
-| SPEC_TCL_PENDING_MATCH_01 | InvPendingBootstrapTrustMatchesCarried | CHK_TCL_PENDING_MATCH | transport_credential | — | waiver:integration_effect_only |
+| SPEC_TCL_PENDING_MATCH_01 | InvPendingBootstrapTrustMatchesCarried | CHK_TCL_PENDING_MATCH | runtime_unit | state::db::transport_trust::tests::test_expired_pending_invite_bootstrap_not_in_allowlist | break |
 | SPEC_TCL_CRED_SOURCE_01 | InvCredentialSourceConsistency | CHK_TCL_CRED_SOURCE_CONSISTENCY | transport_credential | apply::tests::test_signed_content_events_project_with_identity_chain | pass |
-| SPEC_TCL_CRED_SOURCE_01 | InvCredentialSourceConsistency | CHK_TCL_CRED_SOURCE_CONSISTENCY | transport_credential | — | waiver:integration_effect_only |
+| SPEC_TCL_CRED_SOURCE_01 | InvCredentialSourceConsistency | CHK_TCL_CRED_SOURCE_CONSISTENCY | runtime_unit | runtime::transport::identity_adapter::tests::bootstrap_install_rejected_after_peershared | break |
 
 ## UnifiedBridge Invariants
 

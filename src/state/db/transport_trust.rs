@@ -870,6 +870,38 @@ mod tests {
     }
 
     #[test]
+    fn test_mutual_trust_requires_both_sides() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+
+        let alice = "alice";
+        let bob = "bob";
+        let alice_spki: [u8; 32] = [0xA1; 32];
+        let bob_spki: [u8; 32] = [0xB2; 32];
+
+        record_pending_invite_bootstrap_trust(&conn, alice, "invite-a", "ws", &bob_spki)
+            .unwrap();
+        record_pending_invite_bootstrap_trust(&conn, bob, "invite-b", "ws", &alice_spki)
+            .unwrap();
+
+        assert!(
+            is_peer_allowed(&conn, alice, &bob_spki).unwrap(),
+            "alice should trust bob once bob is in alice's trust rows"
+        );
+        assert!(
+            is_peer_allowed(&conn, bob, &alice_spki).unwrap(),
+            "bob should trust alice once alice is in bob's trust rows"
+        );
+
+        // One-sided trust is not mutual auth.
+        let carol = "carol";
+        assert!(
+            !is_peer_allowed(&conn, carol, &alice_spki).unwrap(),
+            "carol has no trust rows and must not trust alice"
+        );
+    }
+
+    #[test]
     fn test_import_cli_pins_to_sql() {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();

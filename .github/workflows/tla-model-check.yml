@@ -32,6 +32,11 @@ jobs:
           set -euo pipefail
           python3 scripts/check_bridge_conformance.py
 
+      - name: Validate TCL conformance coverage
+        run: |
+          set -euo pipefail
+          python3 scripts/check_tcl_conformance.py
+
       - name: Run Tier 1 model checks
         run: |
           set -euo pipefail
