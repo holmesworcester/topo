@@ -106,6 +106,26 @@ pub fn create_workspace(
             peer_shared_key: signing_key,
         });
     }
+    // Strict scope check:
+    // - Fresh DB (no local creds): allow bootstrap.
+    // - Existing DB with local creds: recorded_by must identify a known tenant.
+    // This prevents unscoped aliases (e.g. "bootstrap") from acting on an
+    // arbitrary tenant in multi-tenant databases.
+    let known_tenant: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM local_transport_creds WHERE peer_id = ?1 LIMIT 1)",
+        rusqlite::params![recorded_by],
+        |row| row.get(0),
+    )?;
+    let creds_count: i64 = db.query_row("SELECT COUNT(*) FROM local_transport_creds", [], |row| {
+        row.get(0)
+    })?;
+    if !known_tenant && creds_count > 0 {
+        return Err(format!(
+            "create_workspace requires scoped tenant identity; recorded_by {} has no local transport creds",
+            recorded_by
+        )
+        .into());
+    }
 
     let mut rng = rand::thread_rng();
 
@@ -1094,6 +1114,35 @@ mod tests {
         assert_eq!(
             pending_rows, 1,
             "pending trust row should be materialized by projection path"
+        );
+    }
+
+    #[test]
+    fn create_workspace_rejects_unscoped_recorded_by_when_creds_exist() {
+        let conn = open_in_memory().expect("open in-memory db");
+        create_tables(&conn).expect("create tables");
+
+        // Seed an existing tenant identity.
+        let (cert, key) = crate::transport::generate_self_signed_cert().expect("generate cert");
+        let fp = crate::transport::extract_spki_fingerprint(cert.as_ref()).expect("extract spki");
+        let tenant_peer_id = hex::encode(fp);
+        crate::db::transport_creds::store_local_creds(
+            &conn,
+            &tenant_peer_id,
+            cert.as_ref(),
+            key.secret_pkcs8_der(),
+        )
+        .expect("store transport creds");
+
+        let err = match create_workspace(&conn, "bootstrap", "ws", "alice", "laptop") {
+            Ok(_) => panic!("unscoped recorded_by should be rejected when creds exist"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string()
+                .contains("create_workspace requires scoped tenant identity"),
+            "unexpected error: {}",
+            err
         );
     }
 }
