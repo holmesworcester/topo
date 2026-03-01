@@ -128,8 +128,6 @@ both `pass` and `break` polarity unless waived.
 | SPEC_DISPATCH_01 | (registry) | CHK_DISPATCH_UNKNOWN_TYPE | pipeline_integration | apply::tests::test_retired_type3_peer_key_blob_rejected | break |
 | SPEC_REJECTION_01 | (durable rejection) | CHK_REJECTION_RECORD | pipeline_integration | apply::tests::test_file_slice_invalid_signature_rejects | pass |
 | SPEC_REJECTION_01 | (durable rejection) | CHK_REJECTION_RECORD | pipeline_integration | apply::tests::test_project_message_valid | break |
-| SPEC_INVITE_RECORDED_01 | InvInviteAcceptedRecorded | CHK_IA_INVITE_RECORDED | projector_unit | invite_accepted_projector_tests::tests::test_invite_accepted_writes_trust_anchor | pass |
-| SPEC_INVITE_RECORDED_01 | InvInviteAcceptedRecorded | CHK_IA_INVITE_RECORDED | projector_unit | invite_accepted_projector_tests::tests::test_invite_accepted_rejects_anchor_conflict | break |
 | SPEC_ANCHOR_SOURCE_02 | InvTrustAnchorSource | CHK_IA_ANCHOR_SOURCE | projector_unit | invite_accepted_projector_tests::tests::test_invite_accepted_writes_trust_anchor | pass |
 | SPEC_ANCHOR_SOURCE_02 | InvTrustAnchorSource | CHK_IA_ANCHOR_SOURCE | projector_unit | invite_accepted_projector_tests::tests::test_invite_accepted_rejects_anchor_conflict | break |
 | SPEC_BOOTSTRAP_TRUST_CONSUME_01 | InvBootstrapTrustConsumedByPeerShared | CHK_PS_BOOTSTRAP_TRUST_CONSUME | projector_unit | peer_shared_projector_tests::tests::test_peer_shared_consumes_bootstrap_trust | pass |

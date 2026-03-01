@@ -33,11 +33,11 @@ Maps each TODO section/item to file/test proof of completion.
 | Force-valid workspace command emission | `EmitCommand::RetryWorkspaceEvent { workspace_id }` emitted (`src/event_modules/invite_accepted.rs:132`) |
 | Standard apply + unblock cascade | `RetryWorkspaceEvent` handled via `project_one()` in `src/projection/apply/write_exec.rs:80-96` |
 | No service-triggered bootstrap hacks | Service layer uses `bootstrap_sync_from_invite()` (real QUIC sync), not event copies |
-| TLA conformance | `docs/tla/EventGraphSchema.tla`: `InviteAccepted` in `LocalRoots`, invariants `InvTrustAnchorImmutable`, `InvTrustAnchorSource`, `InvInviteAcceptedRecorded`, `InvBootstrapTrustSource` |
+| TLA conformance | `docs/tla/EventGraphSchema.tla`: `InviteAccepted` in `LocalRoots`, invariants `InvTrustAnchorImmutable`, `InvTrustAnchorSource`, `InvBootstrapTrustSource` |
 | TLA conformance (bootstrap) | `docs/tla/EventGraphSchema.tla` + `docs/tla/event_graph_schema_bootstrap.cfg`: concrete bootstrap sequence modeled |
 | Projector tests (pass/break) | `src/event_modules/invite_accepted_projector_tests.rs`: 5 tests covering SPEC_ANCHOR_IMMUTABLE, SPEC_ANCHOR_SOURCE, SPEC_BOOTSTRAP_TRUST |
 | Integration test | `src/projection/apply/tests/mod.rs:3872`: `test_invite_accepted_guard_retry_on_workspace` |
-| Runtime check catalog | `docs/tla/runtime_check_catalog.md`: CHK_IA_TRUST_ANCHOR_WRITE, CHK_IA_TRUST_ANCHOR_CONFLICT, CHK_IA_RETRY_GUARDS, CHK_IA_BOOTSTRAP_TRUST, CHK_IA_INVITE_RECORDED, CHK_IA_ANCHOR_SOURCE |
+| Runtime check catalog | `docs/tla/runtime_check_catalog.md`: CHK_IA_TRUST_ANCHOR_WRITE, CHK_IA_TRUST_ANCHOR_CONFLICT, CHK_IA_RETRY_GUARDS, CHK_IA_BOOTSTRAP_TRUST, CHK_IA_ANCHOR_SOURCE |
 | Bootstrap/join tests | `two_process_test` and `cheat_proof_realism_test` failures are pre-existing on master (same QUIC connection-lost error), not regressions from this branch |
 
 ## Stage 3: Identity <-> transport boundary closure

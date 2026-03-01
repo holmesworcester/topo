@@ -283,18 +283,6 @@ PeerDeps(p, e) == ResolveWorkspace(p, RawDeps(e) \cup SignerDep(e))
 \* Workspace events require matching trust anchor binding.
 Guard(p, e) == IF IsWorkspaceEvent(e) THEN trustAnchor[p] = WorkspaceEventId(e) ELSE TRUE
 
-\* poc-6 alignment: invite_accepted projects only after at least one invite
-\* event is recorded for this peer perspective.
-\* NOTE: This is a MODEL-LEVEL ordering guard, not a runtime dep-gate.
-\* Runtime has dep_fields: &[] (no invite-presence dependency field) per
-\* DESIGN.md §8.3 / PLAN.md §12.1. Bootstrap sync workflow guarantees
-\* invite events arrive before invite_accepted is created. The guard
-\* constrains TLC exploration to realistic orderings only.
-HasRecordedInvite(p) ==
-    IF (InviteEvents \cap EVENTS) = {}
-    THEN TRUE
-    ELSE \E ie \in (InviteEvents \cap EVENTS): ie \in recorded[p]
-
 \* Trusted peer set abstraction used by runtime transport checks.
 \* This models the union of:
 \* - PeerShared-derived SPKIs (primary steady-state trust)
@@ -366,7 +354,6 @@ Project(p, e) ==
     /\ e \notin valid[p]
     /\ PeerDeps(p, e) \subseteq valid[p]
     /\ Guard(p, e)
-    /\ IF e = InviteAccepted THEN HasRecordedInvite(p) ELSE TRUE
     \* Mismatch rejection: invite_accepted blocked if anchor already set differently
     /\ IF e = InviteAccepted /\ trustAnchor[p] /= "none"
        THEN trustAnchor[p] = inviteCarriedWorkspace[p]
@@ -521,14 +508,6 @@ InvForeignWorkspaceExcluded ==
 InvTrustAnchorSource ==
     IF InviteAccepted \in EVENTS
     THEN \A p \in Peers: (trustAnchor[p] /= "none") => (InviteAccepted \in valid[p])
-    ELSE TRUE
-
-\* poc-6 alignment: invite_accepted validity implies invite material was recorded.
-InvInviteAcceptedRecorded ==
-    IF InviteAccepted \in EVENTS /\ (InviteEvents \cap EVENTS) /= {}
-    THEN \A p \in Peers:
-        (InviteAccepted \in valid[p]) =>
-            (\E ie \in (InviteEvents \cap EVENTS): ie \in recorded[p])
     ELSE TRUE
 
 \* Trust anchor always matches the event-carried workspace_id.

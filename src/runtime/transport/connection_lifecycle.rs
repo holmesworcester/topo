@@ -8,6 +8,7 @@ use std::net::SocketAddr;
 use thiserror::Error;
 
 use crate::transport::peer_identity_from_connection;
+use super::TRUST_REJECTION_MARKER;
 
 /// A successful transport connection with verified peer identity.
 pub struct ConnectedPeer {
@@ -27,6 +28,8 @@ impl ConnectedPeer {
 pub enum ConnectionLifecycleError {
     #[error("dial failed: {0}")]
     Dial(String),
+    #[error("dial rejected by trust policy: {0}")]
+    DialTrustRejected(String),
     #[error("accept failed: {0}")]
     Accept(String),
     #[error("missing peer identity from TLS session")]
@@ -58,9 +61,14 @@ pub async fn dial_peer(
     }
     .map_err(|e| ConnectionLifecycleError::Dial(format!("initiate to {remote}: {e}")))?;
 
-    let connection = connecting
-        .await
-        .map_err(|e| ConnectionLifecycleError::Dial(format!("handshake to {remote}: {e}")))?;
+    let connection = connecting.await.map_err(|e| {
+        let msg = format!("handshake to {remote}: {e}");
+        if msg.contains(TRUST_REJECTION_MARKER) {
+            ConnectionLifecycleError::DialTrustRejected(msg)
+        } else {
+            ConnectionLifecycleError::Dial(msg)
+        }
+    })?;
 
     into_connected_peer(connection)
 }

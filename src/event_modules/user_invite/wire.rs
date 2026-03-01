@@ -70,6 +70,11 @@ pub fn parse_user_invite_boot(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     let mut signed_by = [0u8; 32];
     signed_by.copy_from_slice(&blob[73..105]);
     let signer_type = blob[105];
+    if signer_type != 1 {
+        return Err(EventError::InvalidMetadata(
+            "user_invite_boot signer_type must be 1 (workspace)",
+        ));
+    }
     let mut signature = [0u8; 64];
     signature.copy_from_slice(&blob[106..170]);
 
@@ -135,6 +140,11 @@ pub fn parse_user_invite_ongoing(blob: &[u8]) -> Result<ParsedEvent, EventError>
     let mut signed_by = [0u8; 32];
     signed_by.copy_from_slice(&blob[73..105]);
     let signer_type = blob[105];
+    if signer_type != 5 {
+        return Err(EventError::InvalidMetadata(
+            "user_invite_ongoing signer_type must be 5 (peer_shared)",
+        ));
+    }
     let mut signature = [0u8; 64];
     signature.copy_from_slice(&blob[106..170]);
 
@@ -170,7 +180,7 @@ pub static USER_INVITE_BOOT_META: EventTypeMeta = EventTypeMeta {
     projection_table: "user_invites",
     share_scope: ShareScope::Shared,
     dep_fields: &["signed_by"],
-    dep_field_type_codes: &[&[]],
+    dep_field_type_codes: &[&[8]],
     signer_required: true,
     signature_byte_len: 64,
     encryptable: false,
@@ -186,7 +196,7 @@ pub static USER_INVITE_ONGOING_META: EventTypeMeta = EventTypeMeta {
     projection_table: "user_invites",
     share_scope: ShareScope::Shared,
     dep_fields: &["admin_event_id", "signed_by"],
-    dep_field_type_codes: &[&[18, 19], &[]],
+    dep_field_type_codes: &[&[18, 19], &[16, 17]],
     signer_required: true,
     signature_byte_len: 64,
     encryptable: false,
@@ -195,3 +205,28 @@ pub static USER_INVITE_ONGOING_META: EventTypeMeta = EventTypeMeta {
     projector: super::projector::project_pure,
     context_loader: super::projection_context::build_projector_context,
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_user_invite_boot_rejects_wrong_signer_type() {
+        let mut blob = vec![0u8; USER_INVITE_BOOT_WIRE_SIZE];
+        blob[0] = EVENT_TYPE_USER_INVITE_BOOT;
+        blob[105] = 5;
+
+        let err = parse_user_invite_boot(&blob).expect_err("should reject wrong signer type");
+        assert!(matches!(err, EventError::InvalidMetadata(_)));
+    }
+
+    #[test]
+    fn parse_user_invite_ongoing_rejects_wrong_signer_type() {
+        let mut blob = vec![0u8; USER_INVITE_ONGOING_WIRE_SIZE];
+        blob[0] = EVENT_TYPE_USER_INVITE_ONGOING;
+        blob[105] = 1;
+
+        let err = parse_user_invite_ongoing(&blob).expect_err("should reject wrong signer type");
+        assert!(matches!(err, EventError::InvalidMetadata(_)));
+    }
+}

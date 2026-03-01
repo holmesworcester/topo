@@ -272,7 +272,6 @@ The following parser-level canonicalization guarantees are enforced in Rust but 
 | InvSingleWorkspace | At most one workspace row per peer in workspaces table |
 | InvTrustAnchorImmutable | test_bootstrap_sequence: trust anchor is immutable once set; mismatch rejected |
 | InvTrustAnchorSource | invite_accepted must be valid for trust anchor to be set |
-| InvInviteAcceptedRecorded | invite_accepted can become valid only when invite material is recorded in the same peer scope |
 | InvBootstrapTrustSource | bootstrap transport trust (`invite_bootstrap_trust`) is derived only from valid `invite_accepted` |
 | InvBootstrapTrustMatchesCarried | bootstrap trust identity matches invite-carried bootstrap identity fields |
 | InvBootstrapTrustConsumedByPeerShared | bootstrap trust is consumed when equivalent PeerShared-derived trust appears |

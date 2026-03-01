@@ -37,6 +37,8 @@ use tracing::warn;
 pub type DynamicAllowFn =
     dyn Fn(&[u8; 32]) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> + Send + Sync;
 
+pub(crate) const TRUST_REJECTION_MARKER: &str = "trust_rejected";
+
 #[derive(Clone)]
 enum AllowPolicy {
     Static(Arc<AllowedPeers>),
@@ -104,7 +106,8 @@ impl PinnedCertVerifier {
                 "rejected peer certificate: fingerprint not in allowed set"
             );
             Err(rustls::Error::General(format!(
-                "peer fingerprint {} not in allowed set",
+                "{}: peer fingerprint {} not in allowed set",
+                TRUST_REJECTION_MARKER,
                 hex::encode(fp)
             )))
         }

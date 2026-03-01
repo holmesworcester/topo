@@ -323,7 +323,7 @@ async fn dial_provider_ongoing_first(
             let Some(fallback_cfg) = bootstrap_fallback_client_config else {
                 return Err(primary_err);
             };
-            if !is_mtls_trust_rejection(&primary_err) {
+            if !matches!(primary_err, ConnectionLifecycleError::DialTrustRejected(_)) {
                 return Err(primary_err);
             }
             info!(
@@ -344,31 +344,25 @@ async fn dial_provider_ongoing_first(
     }
 }
 
-fn is_mtls_trust_rejection(err: &ConnectionLifecycleError) -> bool {
-    let ConnectionLifecycleError::Dial(msg) = err else {
-        return false;
-    };
-    let lower = msg.to_ascii_lowercase();
-    lower.contains("not in allowed set") || lower.contains("peer fingerprint")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn mtls_rejection_classifier_matches_transport_verifier_errors() {
-        let err = ConnectionLifecycleError::Dial(
-            "handshake to 127.0.0.1:4433: peer fingerprint deadbeef not in allowed set".to_string(),
-        );
-        assert!(is_mtls_trust_rejection(&err));
+    fn fallback_triggers_only_for_typed_trust_rejection() {
+        assert!(matches!(
+            ConnectionLifecycleError::DialTrustRejected(
+                "handshake to 127.0.0.1:4433: trust_rejected: peer fingerprint deadbeef not in allowed set".to_string()
+            ),
+            ConnectionLifecycleError::DialTrustRejected(_)
+        ));
     }
 
     #[test]
-    fn mtls_rejection_classifier_ignores_non_trust_failures() {
-        let err = ConnectionLifecycleError::Dial(
-            "handshake to 127.0.0.1:4433: connection refused".to_string(),
-        );
-        assert!(!is_mtls_trust_rejection(&err));
+    fn fallback_does_not_trigger_for_generic_dial_errors() {
+        assert!(!matches!(
+            ConnectionLifecycleError::Dial("handshake to 127.0.0.1:4433: connection refused".to_string()),
+            ConnectionLifecycleError::DialTrustRejected(_)
+        ));
     }
 }

@@ -38,12 +38,12 @@ State surfaces:
 
 ## Write-intent abstraction (required)
 Model projection writes as explicit actions (not only derived equality):
-1. `PW_InsertPeerSharedTrust(p, spki, event_id)`
-2. `PW_InsertBootstrapTrust(p, spki)`
-3. `PW_InsertPendingBootstrapTrust(p, spki)`
-4. `PW_DeleteBootstrapTrust(p, spki)` when superseded
-5. `PW_DeletePendingBootstrapTrust(p, spki)` when superseded
-6. `PW_SetConnState(p, state)` for invite/peer progression
+1. `PW_ProjectPeerShared(p, spki)` (insert + supersede bootstrap/pending rows)
+2. `PW_ProjectBootstrap(p, spki)`
+3. `PW_ProjectPendingWrite(p, spki)`
+4. `PW_ProjectPendingSuppressed(p, spki)` (bug toggle path, for repro only)
+5. `PW_DialOngoing(p, q)` / `PW_DialBootstrapFallback(p, q)` / `PW_UpgradeConn(p, q)`
+6. `PW_Deny(p, q)` when removal/exclusion is established
 
 Each write intent must map to a Rust projection path in a table in this file.
 
@@ -117,6 +117,39 @@ Deep domain (target <= 20 minutes):
 2. Expanded SPKI/event sets
 3. Add additional transitions around supersession/expiry
 
+## Convergence policy (CI + deep)
+The objective is not "all configs always exhaustive"; the objective is:
+1. mandatory convergent gate configs in CI,
+2. bounded interaction/deep configs for extra coverage,
+3. no model/code drift for guarded behavior.
+
+Tier definitions:
+1. Tier 1 (`fast_gate`): exhaustive and convergent; required on every PR.
+2. Tier 2 (`interaction`): exhaustive where feasible at 2-peer interaction scope; run pre-merge for trust/bootstrap changes.
+3. Tier 3 (`deep`): larger domains and progress stress; run nightly/manual with budget caps.
+
+Runtime targets:
+1. Tier 1: <= 2 minutes per config.
+2. Tier 2: <= 8 minutes per config (or documented as manual pre-merge when not CI-tractable).
+3. Tier 3: <= 20 minutes per config.
+
+Initial gating matrix:
+1. `EventGraphSchema`: `event_graph_schema_fast.cfg` (Tier 1), `event_graph_schema.cfg` (Tier 2), `event_graph_schema_expanded_single_peer.cfg` and `event_graph_schema_bootstrap.cfg` (Tier 3).
+2. `TransportCredentialLifecycle`: `transport_credential_lifecycle_fast.cfg` (Tier 1), `transport_credential_lifecycle.cfg` (Tier 2), bug/fix repro pair (Tier 2/Tier 3 depending domain).
+3. `UnifiedBridge`: `unified_bridge_fix_repro.cfg` + `unified_bridge_progress_fast.cfg` (Tier 1), `unified_bridge_bug_repro.cfg` (Tier 2 repro evidence), `unified_bridge_progress_deep.cfg` (Tier 3).
+
+Drift controls (required):
+1. Every cross-layer invariant must map to a check id in `runtime_check_catalog.md` or `NON_MODELED::<reason>`.
+2. Model-only guards that are not implemented in code must be removed or explicitly waived.
+3. Bug-mode counterexample and fix-mode pass must remain runnable under the same reduced domain.
+
+## Best-use gap closure checklist
+1. Establish mandatory Tier 1 convergent checks for all three model families.
+2. Keep Tier 2 and Tier 3 runs bounded and documented with command + elapsed time + states explored.
+3. Keep bridge invariants scoped to trust/connection-critical surfaces first; avoid unrelated SQL breadth.
+4. Maintain explicit mapping tables: event facts -> write intents -> runtime decisions.
+5. Treat any model/code mismatch as a first-class defect (update code or update model; no silent drift).
+
 ## Proposed files
 1. `docs/tla/UnifiedBridge.tla`
 2. `docs/tla/unified_bridge_bug_repro.cfg`
@@ -129,16 +162,19 @@ Deep domain (target <= 20 minutes):
 |---|---|
 | `EF_InviteCreator` | `recorded_events.source` / `is_local_create` |
 | `EF_RemovalOrExclusion` | `user_removed` / `peer_removed` projection effects |
-| `PW_InsertPendingBootstrapTrust` | projector `WritePendingBootstrapTrust` |
-| `PW_InsertBootstrapTrust` | `record_invite_bootstrap_trust()` path |
-| `PW_InsertPeerSharedTrust` | `peer_shared_spki_fingerprints()` materialization |
-| `PW_DeletePeerSharedTrust` | peer removal/exclusion trust deletion path |
+| `PW_ProjectPendingWrite` | projector `WritePendingBootstrapTrust` |
+| `PW_ProjectBootstrap` | `record_invite_bootstrap_trust()` path |
+| `PW_ProjectPeerShared` | `peer_shared_spki_fingerprints()` materialization + supersession of bootstrap/pending trust rows |
+| `PW_DialBootstrapFallback` | `runtime/peering/loops/connect` fallback branch |
+| `PW_DialOngoing` / `PW_UpgradeConn` | ongoing-first dial/upgrade behavior in `runtime/peering/loops/connect` |
+| `PW_Deny` | removal/exclusion deny path in transport authz + connect lifecycle |
 | `RT_TrustedSPKIs` | `allowed_peers_from_db()` trust union |
-| `RT_CanAuthenticate` | `is_peer_allowed()` and transport trust check |
+| `RT_CanAuthorize` | `is_peer_allowed()` and transport trust check |
 | `RT_DialPreference` | connect-loop ongoing-first with bootstrap fallback |
 
-## Runtime check catalog update plan
-Add new check ids in `docs/tla/runtime_check_catalog.md`:
+## Runtime check catalog status
+Bridge check ids are now listed in `docs/tla/runtime_check_catalog.md` under
+`Unified Bridge Checks (Planned Integration Surface)`:
 1. `CHK_BRIDGE_ROW_TO_RUNTIME_TRUST`
 2. `CHK_BRIDGE_PENDING_LOCAL_CREATE`
 3. `CHK_BRIDGE_ALLOWED_PEER_AUTH`
@@ -167,3 +203,17 @@ Record:
 3. states / distinct states
 4. violation or pass status
 5. brief counterexample summary when failing
+
+## TLC execution notes (2026-02-28)
+1. `./tlc UnifiedBridge unified_bridge_bug_repro.cfg`
+   - Status: **FAIL (expected)**
+   - Invariant: `BrInv_LocalInviteProjectsPending`
+   - Stats: 3584 generated / 1907 distinct / depth 8 / 0s
+   - Counterexample: `PW_ProjectPendingSuppressed` triggers when inviter local credential is already peer_shared-trusted, dropping pending write intent.
+2. `./tlc UnifiedBridge unified_bridge_fix_repro.cfg`
+   - Status: **PASS**
+   - Stats: 1720185 generated / 161047 distinct / depth 18 / 7s
+3. `./tlc UnifiedBridge unified_bridge_progress_fast.cfg`
+   - Status: **PASS**
+   - Stats: 3740535 generated / 358255 distinct / depth 19 / 1m49s
+   - Temporal branch checks: 20 branches completed with no violations.

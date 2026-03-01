@@ -55,6 +55,10 @@ Current models split concerns (event graph vs transport lifecycle). This can hid
 6. Feasibility assessment:
    - State-space cost estimates.
    - Recommended constant domains for fast CI checks vs deeper runs.
+   - Explicit tier policy:
+     - Tier 1 (`fast_gate`) must converge and be CI-required.
+     - Tier 2 (`interaction`) must remain bounded and run for trust/bootstrap changes.
+     - Tier 3 (`deep`) runs nightly/manual with fixed budget ceilings.
    - Concrete runtime budgets:
      - CI-fast target: <= 2 minutes per config on baseline dev machine.
      - Deep-run target: <= 20 minutes for nightly/manual validation.
@@ -69,6 +73,7 @@ Current models split concerns (event graph vs transport lifecycle). This can hid
 5. At least one executable progress/liveness check demonstrates bootstrap completion viability (connect + sync + upgrade) under documented fairness assumptions.
 6. At least one bridge check is defined at row-write level (write-intent semantics), not only derived trust-set equality.
 7. Security invariants are explicit bridge checks (not implied indirectly by general trust-coherence invariants).
+8. A gate matrix is documented showing which configs are Tier 1/2/3 and which are mandatory in CI.
 
 ## No-cheat checks
 1. No invariant may reference only one layer if it claims cross-layer correctness.

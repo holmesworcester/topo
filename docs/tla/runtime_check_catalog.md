@@ -52,7 +52,7 @@ an explicit `NON_MODELED::<reason>` waiver.
 | CHK_TK_INSERT | event_modules/transport_key::project_pure | InvPeerSharedTrustMatchesCarried | projector_local |
 | CHK_SM_INSERT | event_modules/signed_memo::project_pure | InvDeps | projector_local |
 | CHK_BD_NOOP | event_modules/bench_dep::project_pure | NON_MODELED::benchmark_only | projector_local |
-| CHK_IA_INVITE_RECORDED | event_modules/invite_accepted::project_pure | InvInviteAcceptedRecorded | projector_local |
+| CHK_IA_INVITE_RECORDED | event_modules/invite_accepted::project_pure | NON_MODELED::no_prior_invite_required | projector_local |
 | CHK_IA_ANCHOR_SOURCE | event_modules/invite_accepted::project_pure | InvTrustAnchorSource | projector_local |
 | CHK_PS_BOOTSTRAP_TRUST_CONSUME | event_modules/peer_shared::project_pure | InvBootstrapTrustConsumedByPeerShared | projector_local |
 | CHK_PS_PENDING_CONSUME | event_modules/peer_shared::project_pure | InvPendingConsumedByPeerShared | projector_local |
@@ -91,6 +91,25 @@ an explicit `NON_MODELED::<reason>` waiver.
 | CHK_TCL_BOOTSTRAP_MATCH | projection/trust_store | InvBootstrapTrustMatchesCarried | transport_credential |
 | CHK_TCL_PENDING_MATCH | projection/trust_store | InvPendingBootstrapTrustMatchesCarried | transport_credential |
 | CHK_TCL_CRED_SOURCE_CONSISTENCY | transport/identity_adapter + transport_creds | InvCredentialSourceConsistency | transport_credential |
+
+## Unified Bridge Checks (Planned Integration Surface)
+
+| check_id | owner | tla_guard_id | category |
+|----------|-------|-------------|----------|
+| CHK_BRIDGE_ROW_TO_RUNTIME_TRUST | projection/trust_store + runtime/transport | BrInv_RowToMaterializedExactness | unified_bridge |
+| CHK_BRIDGE_PENDING_LOCAL_CREATE | event_modules/user_invite + event_modules/device_invite | BrInv_PendingOnlyOnInviter | unified_bridge |
+| CHK_BRIDGE_ALLOWED_PEER_AUTH | runtime/transport/authz | BrInv_AllowedPeerMatchesAuthDecision | unified_bridge |
+| CHK_BRIDGE_ONGOING_PREFERENCE | runtime/peering/loops/connect | BrInv_OngoingPreferred | unified_bridge |
+| CHK_BRIDGE_BOOTSTRAP_FALLBACK | runtime/peering/loops/connect | BrInv_BootstrapFallbackOnlyWhenNeeded | unified_bridge |
+| CHK_BRIDGE_BOOTSTRAP_PROGRESS | runtime/peering/bootstrap + sync loops | BrLive_BootstrapConnectEventually | unified_bridge |
+| CHK_BRIDGE_UPGRADE_PROGRESS | runtime/peering/loops/connect | BrLive_PeerUpgradeEventually | unified_bridge |
+| CHK_BRIDGE_SYNC_COMPLETION_PROGRESS | runtime/sync + projection/apply | BrLive_BootstrapCompletionSyncEventually | unified_bridge |
+| CHK_BRIDGE_SEC_CONN_AUTHZ | runtime/transport/authz | BrSec_ConnectionRequiresAuthorization | unified_bridge |
+| CHK_BRIDGE_SEC_TRUST_PROVENANCE | projection/trust_store | BrSec_NoTrustWithoutProvenance | unified_bridge |
+| CHK_BRIDGE_SEC_PENDING_INVITER_ONLY | event_modules/user_invite + event_modules/device_invite | BrSec_NoPendingTrustOnJoiner | unified_bridge |
+| CHK_BRIDGE_SEC_SOURCE_BINDING | runtime/transport + projection/trust_store | BrSec_SourceBindingConsistency | unified_bridge |
+| CHK_BRIDGE_SEC_REMOVAL_DENY | event_modules/peer_removed + runtime/transport/authz | BrSec_RemovalDeniesConnectivity | unified_bridge |
+| CHK_BRIDGE_SEC_IDENTITY_COLLISION | transport/identity_adapter + transport_creds | BrSec_NoIdentityCollisionInAuthPath | unified_bridge |
 
 ## Replay/Order Checks
 
