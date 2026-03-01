@@ -175,6 +175,8 @@ Why this appears much faster than 10k:
 
 Sink connects to all sources as initiator using coordinated round-based assignment.
 All sources are pre-seeded with the same dataset; sink success requires exact ID-set equality with the union of source stores.
+Ingest attribution is recorded in `recorded_events.source` as
+`quic_recv:<peer_id>@<ip:port>` for sink-side per-source accounting.
 
 | Metric | Value |
 |--------|-------|
@@ -196,14 +198,19 @@ All sources are pre-seeded with the same dataset; sink success requires exact ID
 | Sink store | 100,000 |
 | Peak RSS | 1,370.3 MiB |
 
-### Planned Benchmark Gap: Multi-Source Large-File Catchup
+### Multi-Source Large-File Catchup Harness (Implemented)
 
-Files dominate real-world transfer volume, so event-only catchup is not enough.
-Next benchmark to add:
-1. 4-8 source peers where all sources except sink are seeded with the same large file slice set.
-2. Add sink-side source attribution for received slices/events (origin peer identity and/or endpoint) so we can verify work split across sources, not just final set equality.
-3. Report wall time, MB/s, MiB/s, peak RSS, and per-source slice/event contribution histogram.
-4. Keep it `#[ignore]` in CI but runnable in regular perf sweeps.
+Files dominate transfer volume, so we now keep a dedicated large-file catchup harness in `sync_graph_test.rs`:
+1. Seed source `S0` with signed `message_attachment + file_slice` events.
+2. Clone that exact dataset to all non-sink sources.
+3. Run sink-driven multi-source catchup.
+4. Assert sink `file_slice` event-id set exactly equals the seeded set.
+5. Attribute each received file slice by source from `recorded_events.source` (`quic_recv:<peer_id>@<ip:port>`).
+6. Assert each source contributes a substantial slice share, not just `>0`:
+   at least `min_fair_share_fraction * (total_slices / source_count)`; current smoke config uses `10%` of fair share.
+
+Run:
+`cargo test --release --test sync_graph_test catchup_large_file_4x_1024_slices -- --ignored --nocapture --test-threads=1`
 
 ### Low-Memory Budget (`low_mem_test.rs`)
 

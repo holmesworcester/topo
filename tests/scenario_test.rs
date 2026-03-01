@@ -421,7 +421,7 @@ async fn test_recorded_at_monotonicity() {
     let bob_db = open_connection(&bob.db_path).expect("open bob db");
     let bob_min_recv: i64 = bob_db
         .query_row(
-            "SELECT MIN(recorded_at) FROM recorded_events WHERE peer_id = ?1 AND source = 'quic_recv'",
+            "SELECT MIN(recorded_at) FROM recorded_events WHERE peer_id = ?1 AND source LIKE 'quic_recv:%'",
             rusqlite::params![&bob.identity],
             |row| row.get(0),
         )

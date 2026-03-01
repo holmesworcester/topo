@@ -31,7 +31,7 @@ fn prewarm_workspace_cache(
     batch: &[IngestItem],
     workspace_cache: &mut HashMap<String, String>,
 ) {
-    for (_, _, recorded_by) in batch {
+    for (_, _, recorded_by, _) in batch {
         if workspace_cache.contains_key(recorded_by) {
             continue;
         }

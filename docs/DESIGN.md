@@ -503,7 +503,10 @@ When a `PeerRemoved` event is projected, trust lookups and removal-watch checks 
 ### Shared batch writer with tenant routing
 
 All tenants share a single `batch_writer` thread to avoid SQLite write contention.
-Each ingested event carries `recorded_by` (`IngestItem = (event_id, blob, recorded_by)`), so one writer can safely persist mixed-tenant ingress without cross-tenant state confusion.
+Each ingested event carries `recorded_by` and source attribution
+(`IngestItem = (event_id, blob, recorded_by, source_tag)`), so one writer can
+safely persist mixed-tenant ingress without cross-tenant state confusion while
+retaining per-peer ingest provenance in `recorded_events.source`.
 
 Per batch:
 1. collect ingress tuples from concurrent sessions,
@@ -1001,6 +1004,8 @@ Key properties:
 - Slow peers' undelivered events re-appear as need_ids next round and get reassigned.
 - Push path (egress streaming) continues during coordination wait.
 - Per-peer channels prevent round-mixing between fast and slow peers.
+- Sink-side transfer accounting can be audited via `recorded_events.source`
+  tags (`quic_recv:<peer_id>@<ip:port>`) and grouped by source peer.
 
 ### Implementation decisions
 

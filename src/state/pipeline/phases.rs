@@ -53,7 +53,7 @@ pub(super) fn run_persist_phase(
         tenants_seen: HashSet::new(),
     };
 
-    for (event_id, blob, recorded_by) in batch {
+    for (event_id, blob, recorded_by, source_tag) in batch {
         let event_id_b64 = event_id_to_base64(event_id);
 
         if let Some(created_at_ms) = events::extract_created_at_ms(blob) {
@@ -100,7 +100,7 @@ pub(super) fn run_persist_phase(
                         recorded_by,
                         &event_id_b64,
                         recorded_at,
-                        "quic_recv"
+                        source_tag
                     ]) {
                         tracing::warn!("recorded_events insert error for {}: {}", event_id_b64, e);
                         continue;

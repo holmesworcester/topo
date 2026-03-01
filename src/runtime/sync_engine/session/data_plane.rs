@@ -115,6 +115,7 @@ pub fn spawn_data_receiver<R>(
     ingest_tx: mpsc::Sender<IngestItem>,
     bytes_received: Arc<AtomicU64>,
     recorded_by: String,
+    source_tag: String,
 ) -> (
     oneshot::Sender<()>,
     oneshot::Receiver<()>,
@@ -137,7 +138,11 @@ where
                         Ok(Frame::Event { blob }) => {
                             bytes_received.fetch_add(blob.len() as u64, Ordering::Relaxed);
                             let event_id = hash_event(&blob);
-                            if ingest_tx.send((event_id, blob, recorded_by.clone())).await.is_err() {
+                            if ingest_tx
+                                .send((event_id, blob, recorded_by.clone(), source_tag.clone()))
+                                .await
+                                .is_err()
+                            {
                                 warn!("Ingest channel closed");
                                 break;
                             }

@@ -11,6 +11,12 @@
 
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
+use topo::crypto::hash_event;
+use topo::db::open_connection;
+use topo::event_modules::{
+    file_slice::FILE_SLICE_CIPHERTEXT_BYTES, FileSliceEvent, MessageAttachmentEvent, ParsedEvent,
+};
+use topo::projection::create::create_signed_event_sync;
 use topo::testutil::{assert_eventually, clone_events_to, start_chain, start_sink_download, Peer};
 
 /// Read peak resident set size from /proc/self/status (Linux only).
@@ -214,10 +220,10 @@ async fn run_catchup_bench(source_count: usize, events_per_source: usize) {
         eprintln!("  Cloned to S1..S{}", source_count - 1);
     }
 
-    // Count-based convergence target: union of all source store IDs.
+    // Count-based convergence target: union of all source shared store IDs.
     let expected_sink_ids: BTreeSet<String> = sources
         .iter()
-        .flat_map(|s| s.store_ids().into_iter())
+        .flat_map(|s| s.shared_store_ids().into_iter())
         .collect();
     let expected_sink_count = expected_sink_ids.len() as i64;
 
@@ -245,10 +251,10 @@ async fn run_catchup_bench(source_count: usize, events_per_source: usize) {
     let mb_per_sec = events_per_sec * 100.0 / 1_000_000.0;
 
     // Exact set equality validates full dataset catchup (no marker shortcuts).
-    let sink_ids = sink.store_ids();
+    let sink_ids = sink.shared_store_ids();
     assert_eq!(
         sink_ids, expected_sink_ids,
-        "sink store IDs must match union of source store IDs"
+        "sink shared store IDs must match union of source shared store IDs"
     );
 
     drop(handles);
@@ -282,4 +288,197 @@ async fn catchup_4x_100k() {
 #[ignore]
 async fn catchup_8x_100k() {
     run_catchup_bench(8, 100_000).await;
+}
+
+fn seed_large_file_on_source(source: &Peer, total_slices: u32) {
+    let signer_eid = source
+        .peer_shared_event_id
+        .expect("source must have peer_shared signer event");
+    let signing_key = source
+        .peer_shared_signing_key
+        .as_ref()
+        .expect("source must have peer_shared signing key");
+    let db = open_connection(&source.db_path).expect("open source db");
+
+    let msg_id = source.create_message("multi-source large-file anchor");
+    let key_id = source.create_secret_key([0xA5; 32]);
+    let file_id =
+        hash_event(format!("multi-source-file:{}:{}", source.identity, total_slices).as_bytes());
+
+    let att = ParsedEvent::MessageAttachment(MessageAttachmentEvent {
+        created_at_ms: 1_700_000_000_000,
+        message_id: msg_id,
+        file_id,
+        blob_bytes: total_slices as u64 * FILE_SLICE_CIPHERTEXT_BYTES as u64,
+        total_slices,
+        slice_bytes: FILE_SLICE_CIPHERTEXT_BYTES as u32,
+        root_hash: [0x5A; 32],
+        key_event_id: key_id,
+        filename: "multi-source-bench.bin".to_string(),
+        mime_type: "application/octet-stream".to_string(),
+        signed_by: signer_eid,
+        signer_type: 5,
+        signature: [0u8; 64],
+    });
+    create_signed_event_sync(&db, &source.identity, &att, signing_key)
+        .expect("create message_attachment");
+
+    let ciphertext = vec![0xC3; FILE_SLICE_CIPHERTEXT_BYTES];
+    for slice in 0..total_slices {
+        let fs = ParsedEvent::FileSlice(FileSliceEvent {
+            created_at_ms: 1_700_000_000_000 + slice as u64 + 1,
+            file_id,
+            slice_number: slice,
+            ciphertext: ciphertext.clone(),
+            signed_by: signer_eid,
+            signer_type: 5,
+            signature: [0u8; 64],
+        });
+        create_signed_event_sync(&db, &source.identity, &fs, signing_key)
+            .expect("create file_slice");
+    }
+}
+
+fn per_source_slice_counts(sink: &Peer, sources: &[Peer]) -> Vec<(String, i64)> {
+    let by_source = sink.recorded_event_type_counts_by_source("file_slice", "quic_recv:");
+    sources
+        .iter()
+        .map(|source| {
+            let prefix = format!("quic_recv:{}@", source.identity);
+            let count = by_source
+                .iter()
+                .filter(|(tag, _)| tag.starts_with(&prefix))
+                .map(|(_, count)| *count)
+                .sum::<i64>();
+            (source.identity.clone(), count)
+        })
+        .collect()
+}
+
+/// Run a coordinated multi-source large-file catchup benchmark.
+///
+/// All sources except sink are seeded with identical file-slice data.
+/// Success requires:
+/// 1) sink file-slice ID set equals source set exactly
+/// 2) every source contributes a substantial share of ingested slices
+async fn run_multi_source_large_file_catchup_bench(
+    source_count: usize,
+    total_slices: u32,
+    min_fair_share_fraction: f64,
+) {
+    assert!(source_count >= 2, "source_count must be >= 2");
+    assert!(total_slices > 0, "total_slices must be > 0");
+    assert!(
+        min_fair_share_fraction > 0.0 && min_fair_share_fraction <= 1.0,
+        "min_fair_share_fraction must be in (0, 1]"
+    );
+
+    let mut sources: Vec<Peer> = Vec::with_capacity(source_count);
+    sources.push(Peer::new_with_identity("fs0"));
+    for i in 1..source_count {
+        sources.push(Peer::new(&format!("fs{}", i)));
+    }
+    let sink = Peer::new_with_identity("fssink");
+
+    let seed_start = Instant::now();
+    seed_large_file_on_source(&sources[0], total_slices);
+    let seed_secs = seed_start.elapsed().as_secs_f64();
+
+    let targets: Vec<&Peer> = sources[1..].iter().collect();
+    if !targets.is_empty() {
+        clone_events_to(&sources[0], &targets);
+    }
+
+    let expected_slice_ids = sources[0].event_ids_by_type("file_slice");
+    assert_eq!(
+        expected_slice_ids.len(),
+        total_slices as usize,
+        "source seed file-slice count mismatch"
+    );
+
+    let rss_before = peak_rss_mib();
+    let start = Instant::now();
+    let handles = start_sink_download(&sources, &sink);
+
+    assert_eventually(
+        || sink.event_ids_by_type("file_slice").len() == expected_slice_ids.len(),
+        Duration::from_secs(900),
+        &format!(
+            "sink reaches expected file_slice count={}",
+            expected_slice_ids.len()
+        ),
+    )
+    .await;
+
+    let wall_ms = start.elapsed().as_millis() as u64;
+    let sink_slice_ids = sink.event_ids_by_type("file_slice");
+    assert_eq!(
+        sink_slice_ids, expected_slice_ids,
+        "sink file_slice IDs must match seeded source set"
+    );
+
+    let per_source = per_source_slice_counts(&sink, &sources);
+    let total_attributed: i64 = per_source.iter().map(|(_, c)| *c).sum();
+    assert_eq!(
+        total_attributed, total_slices as i64,
+        "sum of source-attributed file_slice ingest must equal total slices"
+    );
+
+    let fair_share = total_slices as f64 / source_count as f64;
+    let min_substantial = (fair_share * min_fair_share_fraction).floor() as i64;
+    let min_substantial = min_substantial.max(1);
+    for (source_id, count) in &per_source {
+        assert!(
+            *count >= min_substantial,
+            "source {} contribution too small: {} < {} (fair_share={:.2}, fraction={:.2})",
+            source_id,
+            count,
+            min_substantial,
+            fair_share,
+            min_fair_share_fraction
+        );
+    }
+
+    let rss_after = peak_rss_mib();
+    let secs = wall_ms as f64 / 1000.0;
+    let mib = (total_slices as f64 * FILE_SLICE_CIPHERTEXT_BYTES as f64) / (1024.0 * 1024.0);
+    let mib_per_sec = mib / secs.max(0.001);
+    drop(handles);
+
+    eprintln!();
+    eprintln!(
+        "=== Multi-source large-file catchup: {} sources, {} slices ===",
+        source_count, total_slices
+    );
+    eprintln!("  Seed time:         {:.2}s", seed_secs);
+    eprintln!("  Catchup wall:      {} ms", wall_ms);
+    eprintln!("  Volume:            {:.1} MiB", mib);
+    eprintln!("  Throughput:        {:.2} MiB/s", mib_per_sec);
+    eprintln!(
+        "  Min/source floor:  {} slices ({:.0}% of fair share)",
+        min_substantial,
+        min_fair_share_fraction * 100.0
+    );
+    for (source_id, count) in per_source {
+        eprintln!("  Source {}: {} slices", source_id, count);
+    }
+    eprintln!(
+        "  Peak RSS:          {:.1} MiB (before: {:.1})",
+        rss_after, rss_before
+    );
+    eprintln!();
+}
+
+/// Large-file catchup smoke (ignored by default): 4 identical sources, 1024 slices (~256 MiB).
+#[tokio::test]
+#[ignore]
+async fn catchup_large_file_4x_1024_slices() {
+    run_multi_source_large_file_catchup_bench(4, 1_024, 0.10).await;
+}
+
+/// Large-file catchup scalability run (ignored): 8 identical sources, 1024 slices (~256 MiB).
+#[tokio::test]
+#[ignore]
+async fn catchup_large_file_8x_1024_slices() {
+    run_multi_source_large_file_catchup_bench(8, 1_024, 0.10).await;
 }
