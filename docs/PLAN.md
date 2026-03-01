@@ -639,9 +639,9 @@ Test index for this contract:
 - `test_create_signed_event_sync_returns_blocked_error` — strict API blocked→Err
 - `test_create_signed_event_staged_returns_ok_on_blocked` — staged API blocked→Ok
 - `test_create_reaction_before_target` — blocked event DB state
-- `test_svc_react_errors_on_blocked` — service layer propagation
-- `test_svc_delete_errors_on_blocked` — service layer propagation
-- `test_svc_send_succeeds_on_valid` — valid→Ok
+- `test_react_errors_on_blocked` — service layer propagation
+- `test_delete_of_missing_target_writes_intent` — service-layer delete behavior
+- `test_send_succeeds_on_valid` — valid→Ok
 - `test_ensure_identity_chain_tolerates_workspace_blocked` — staged bootstrap
 - `test_create_event_sync_contract_valid_only` — explicit §6.4 contract
 - `test_create_event_sync_contract_blocked_returns_err_with_event_id` — error shape contract

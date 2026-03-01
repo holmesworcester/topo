@@ -1291,7 +1291,7 @@ Harness policy:
 
 Sync tests assert on application-meaningful data, never on raw event counts.
 
-Why: the identity bootstrap chain produces a variable number of events (currently 7: Workspace, UserInviteBoot, InviteAccepted, UserBoot, DeviceInviteFirst, PeerSharedFirst, AdminBoot; plus content key events). This number has changed across development and may change again. Tests that hardcode `store_count() == 6 + N` break silently when the identity chain grows.
+Why: the identity bootstrap chain produces a variable number of events (workspace/identity events plus local signer/content-key materialization). This count has changed across development and may change again. Tests that hardcode `store_count() == K + N` break silently when bootstrap composition changes.
 
 Rules:
 1. **Convergence detection** uses `has_event(event_id)` on a specific known event, not `store_count >= N`.
