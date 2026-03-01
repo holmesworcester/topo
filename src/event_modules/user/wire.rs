@@ -184,6 +184,7 @@ pub static USER_BOOT_META: EventTypeMeta = EventTypeMeta {
     parse: parse_user_boot,
     encode: encode_user_boot,
     projector: super::projector::project_pure,
+    context_loader: crate::event_modules::registry::load_empty_context,
 };
 
 pub static USER_ONGOING_META: EventTypeMeta = EventTypeMeta {
@@ -199,6 +200,7 @@ pub static USER_ONGOING_META: EventTypeMeta = EventTypeMeta {
     parse: parse_user_ongoing,
     encode: encode_user_ongoing,
     projector: super::projector::project_pure,
+    context_loader: crate::event_modules::registry::load_empty_context,
 };
 
 #[cfg(test)]

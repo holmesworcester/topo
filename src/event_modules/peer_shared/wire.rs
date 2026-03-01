@@ -198,6 +198,7 @@ pub static PEER_SHARED_FIRST_META: EventTypeMeta = EventTypeMeta {
     parse: parse_peer_shared_first,
     encode: encode_peer_shared_first,
     projector: super::projector::project_pure,
+    context_loader: crate::event_modules::registry::load_empty_context,
 };
 
 pub static PEER_SHARED_ONGOING_META: EventTypeMeta = EventTypeMeta {
@@ -213,6 +214,7 @@ pub static PEER_SHARED_ONGOING_META: EventTypeMeta = EventTypeMeta {
     parse: parse_peer_shared_ongoing,
     encode: encode_peer_shared_ongoing,
     projector: super::projector::project_pure,
+    context_loader: crate::event_modules::registry::load_empty_context,
 };
 
 #[cfg(test)]

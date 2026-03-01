@@ -134,4 +134,5 @@ pub static REACTION_TYPE_META: EventTypeMeta = EventTypeMeta {
     parse: parse_reaction,
     encode: encode_reaction,
     projector: super::projector::project_pure,
+    context_loader: super::queries::build_projector_context,
 };

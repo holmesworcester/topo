@@ -74,6 +74,34 @@ use crate::crypto::event_id_to_base64;
 use crate::projection::result::{ContextSnapshot, EmitCommand, ProjectorResult, SqlVal, WriteOp};
 use rusqlite::Connection;
 
+fn bootstrap_spki_already_peer_shared(
+    conn: &Connection,
+    recorded_by: &str,
+    spki_fingerprint: &[u8; 32],
+) -> Result<bool, rusqlite::Error> {
+    conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM peers_shared p
+            WHERE p.recorded_by = ?1
+              AND p.transport_fingerprint = ?2
+              AND NOT EXISTS (
+                SELECT 1 FROM removed_entities r
+                WHERE r.recorded_by = p.recorded_by
+                  AND r.target_event_id = p.event_id
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM removed_entities r
+                WHERE r.recorded_by = p.recorded_by
+                  AND p.user_event_id IS NOT NULL
+                  AND r.target_event_id = p.user_event_id
+                  AND r.removal_type = 'user'
+              )
+        )",
+        rusqlite::params![recorded_by, spki_fingerprint.as_slice()],
+        |row| row.get(0),
+    )
+}
+
 pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "
@@ -92,6 +120,51 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
         ",
     )?;
     Ok(())
+}
+
+/// Build projector-local context for InviteAccepted projection.
+pub fn build_projector_context(
+    conn: &Connection,
+    recorded_by: &str,
+    _event_id_b64: &str,
+    parsed: &ParsedEvent,
+) -> Result<ContextSnapshot, Box<dyn std::error::Error>> {
+    let ia = match parsed {
+        ParsedEvent::InviteAccepted(ia) => ia,
+        _ => {
+            return Err(
+                "invite_accepted context loader called for non-invite_accepted event".into(),
+            )
+        }
+    };
+
+    let mut ctx = ContextSnapshot::default();
+    let invite_event_id_b64 = event_id_to_base64(&ia.invite_event_id);
+
+    ctx.trust_anchor_workspace_id = match conn.query_row(
+        "SELECT workspace_id FROM trust_anchors WHERE peer_id = ?1",
+        rusqlite::params![recorded_by],
+        |row| row.get::<_, String>(0),
+    ) {
+        Ok(v) => Some(v),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(e) => return Err(e.into()),
+    };
+
+    if let Some(bc) =
+        crate::db::transport_trust::read_bootstrap_context(conn, recorded_by, &invite_event_id_b64)
+            .map_err(|e| -> Box<dyn std::error::Error> { e })?
+    {
+        ctx.bootstrap_spki_already_peer_shared =
+            bootstrap_spki_already_peer_shared(conn, recorded_by, &bc.bootstrap_spki_fingerprint)?;
+        ctx.bootstrap_context = Some(crate::projection::result::BootstrapContextSnapshot {
+            workspace_id: bc.workspace_id,
+            bootstrap_addr: bc.bootstrap_addr,
+            bootstrap_spki_fingerprint: bc.bootstrap_spki_fingerprint,
+        });
+    }
+
+    Ok(ctx)
 }
 
 /// Pure projector: InviteAccepted — local trust-anchor binding.
@@ -201,4 +274,5 @@ pub static INVITE_ACCEPTED_META: EventTypeMeta = EventTypeMeta {
     parse: parse_invite_accepted,
     encode: encode_invite_accepted,
     projector: project_pure,
+    context_loader: build_projector_context,
 };

@@ -112,6 +112,31 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Build projector-local context for SecretShared projection.
+pub fn build_projector_context(
+    conn: &Connection,
+    recorded_by: &str,
+    _event_id_b64: &str,
+    parsed: &ParsedEvent,
+) -> Result<ContextSnapshot, Box<dyn std::error::Error>> {
+    let ss = match parsed {
+        ParsedEvent::SecretShared(ss) => ss,
+        _ => return Err("secret_shared context loader called for non-secret_shared event".into()),
+    };
+
+    let recipient_b64 = event_id_to_base64(&ss.recipient_event_id);
+    let recipient_removed = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM removed_entities WHERE recorded_by = ?1 AND target_event_id = ?2",
+        rusqlite::params![recorded_by, &recipient_b64],
+        |row| row.get(0),
+    )?;
+
+    Ok(ContextSnapshot {
+        recipient_removed,
+        ..ContextSnapshot::default()
+    })
+}
+
 /// Pure projector: SecretShared → secret_shared table.
 /// Rejects if recipient has been removed (InvRemovalExclusion).
 pub fn project_pure(
@@ -165,4 +190,5 @@ pub static SECRET_SHARED_META: EventTypeMeta = EventTypeMeta {
     parse: parse_secret_shared,
     encode: encode_secret_shared,
     projector: project_pure,
+    context_loader: build_projector_context,
 };

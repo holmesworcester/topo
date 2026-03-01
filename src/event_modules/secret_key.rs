@@ -119,4 +119,5 @@ pub static SECRET_KEY_META: EventTypeMeta = EventTypeMeta {
     parse: parse_secret_key,
     encode: encode_secret_key,
     projector: project_pure,
+    context_loader: crate::event_modules::registry::load_empty_context,
 };

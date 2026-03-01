@@ -135,4 +135,5 @@ pub static PEER_REMOVED_META: EventTypeMeta = EventTypeMeta {
     parse: parse_peer_removed,
     encode: encode_peer_removed,
     projector: project_pure,
+    context_loader: crate::event_modules::registry::load_empty_context,
 };

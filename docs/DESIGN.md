@@ -651,11 +651,17 @@ For future work: attempt a projection-only bootstrap design where these trust ro
 
 ### ContextSnapshot
 
-Read-model snapshot populated by the pipeline before calling the pure projector.
+Read-model snapshot populated before calling the pure projector.
 Projectors must not access the database directly. `ContextSnapshot` carries
 query-derived read facts for projector predicates; it does not carry a generic
 dependency list. Dependency IDs are extracted from parsed event fields via
 schema metadata on each projection attempt.
+
+Context ownership rule:
+1. projector-specific context queries are owned by the event module via
+   `EventTypeMeta.context_loader`,
+2. shared pipeline code invokes the module-owned loader and remains free of
+   projector-specific SQL branches.
 
 Fields include:
 
@@ -685,14 +691,16 @@ final state.
    - event load/decode dispatch,
    - dependency extraction and blocking,
    - signer resolution and signature verification ordering,
-   - building the `ContextSnapshot` from the database,
+   - invoking `EventTypeMeta.context_loader` to build `ContextSnapshot`,
    - executing `write_ops` and `emit_commands`,
    - queue/state transitions and terminal status writes.
 2. per-event projector code handles:
    - event-specific predicate/policy logic,
    - returning `ProjectorResult` with deterministic `write_ops` and `emit_commands`.
-3. per-event projectors do not access the database, implement custom dependency resolution,
-   signature pipeline, or queue/terminal-write paths.
+3. projector-specific SQL context queries live in event modules (`queries.rs` or
+   projector-local helpers), not in shared pipeline files.
+4. per-event projector functions do not access the database, implement custom
+   dependency resolution, signature pipeline, or queue/terminal-write paths.
 
 ### Default write policy
 
@@ -1436,16 +1444,17 @@ some event types may remain single-file under `src/event_modules/<type>.rs`.
 
 1. **Wire** — struct definition, parse/encode, wire layout, `EventTypeMeta`.
 2. **Projector** — `project_pure()` function: the pure projector for this event type. Takes `(recorded_by, event_id_b64, &ParsedEvent, &ContextSnapshot)` and returns `ProjectorResult`. Registered in `EventTypeMeta.projector` so the pipeline dispatches via registry lookup with no central match statement.
-3. **Commands** — `CreateXxxCmd` struct + `create()` function that builds the `ParsedEvent`, calls `create_signed_event_sync`, and returns `EventId`. High-level command helpers callable from service/RPC routes (for example `send`, `react`) and multi-step workflows (for example workspace onboarding) are first-class command APIs in this layer.
-4. **Queries** — `list()`, `count()`, `resolve()`, `list_for_message_with_authors()`, etc. — SQL against projection tables scoped by `recorded_by`. All event-specific SQL lives here.
-5. **Response types** — serializable structs for the event domain (e.g. `MessageItem`, `MessagesResponse`, `SendResponse`). Owned by the event module, re-exported by `src/runtime/control/service.rs` for external callers.
+3. **Projector context loader** — `build_projector_context(...)` (location: `queries.rs` or projector-local helper) performs projector-specific SQL reads and returns `ContextSnapshot`. Registered in `EventTypeMeta.context_loader`.
+4. **Commands** — `CreateXxxCmd` struct + `create()` function that builds the `ParsedEvent`, calls `create_signed_event_sync`, and returns `EventId`. High-level command helpers callable from service/RPC routes (for example `send`, `react`) and multi-step workflows (for example workspace onboarding) are first-class command APIs in this layer.
+5. **Queries** — `list()`, `count()`, `resolve()`, `list_for_message_with_authors()`, etc. — SQL against projection tables scoped by `recorded_by`. All event-specific SQL lives here.
+6. **Response types** — serializable structs for the event domain (e.g. `MessageItem`, `MessagesResponse`, `SendResponse`). Owned by the event module, re-exported by `src/runtime/control/service.rs` for external callers.
 
 The projection pipeline (`src/state/projection_state/apply/`) is orchestration-only:
 
 - Dependency presence check + block row writes
 - Dependency type enforcement
 - Signer verification (uniform across all signed events)
-- Context snapshot construction
+- Context loading orchestration via `EventTypeMeta.context_loader`
 - Registry-driven projector dispatch: `(meta.projector)(recorded_by, event_id_b64, parsed, ctx)`
 - Write-op execution and emit-command handling
 
@@ -1461,10 +1470,16 @@ The service layer (`src/runtime/control/service.rs`) is a thin orchestrator:
 
 ### Projector dispatch
 
-`EventTypeMeta` includes a `projector` function pointer with the uniform signature:
+`EventTypeMeta` includes:
+1. a `projector` function pointer with the uniform signature:
 
 ```rust
 fn(&str, &str, &ParsedEvent, &ContextSnapshot) -> ProjectorResult
+```
+2. a `context_loader` function pointer with the uniform signature:
+
+```rust
+fn(&Connection, &str, &str, &ParsedEvent) -> Result<ContextSnapshot, Box<dyn Error>>
 ```
 
 ### Service command routing
@@ -1552,7 +1567,7 @@ When adding a new event type:
 6. Wire service call sites directly to the new module command/query APIs where relevant.
 7. Wire `src/runtime/control/service.rs` to call the event module functions, mapping errors to `ServiceError`.
 
-**Rule**: Event projection semantics MUST live in event modules, not in central projector files. The pipeline must not contain event-type-specific logic beyond context snapshot construction.
+**Rule**: Event projection semantics MUST live in event modules, not in central projector files. The pipeline must not contain event-type-specific SQL logic; it only orchestrates module-owned context loaders.
 
 ---
 
@@ -1564,7 +1579,7 @@ This appendix holds concrete Rust file/module references so conceptual sections 
 
 1. Canonical entrypoint: `src/state/projection_state/apply/project_one.rs`
 2. Dependency and signer stages: `src/state/projection_state/apply/stages.rs`
-3. Context snapshot builder: `src/state/projection_state/apply/context.rs`
+3. Module-owned context loaders: `src/event_modules/*/(queries.rs|projector.rs)` via `EventTypeMeta.context_loader`
 4. Write/emit executor: `src/state/projection_state/apply/write_exec.rs`
 5. Cascade scheduler: `src/state/projection_state/apply/cascade.rs`
 6. Batch writer orchestration: `src/state/pipeline/mod.rs`

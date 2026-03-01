@@ -7,7 +7,6 @@ use crate::event_modules::{registry, ParsedEvent};
 use rusqlite::Connection;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::context::build_context_snapshot;
 use super::dispatch::dispatch_pure_projector;
 use super::write_exec::{execute_emit_commands, execute_write_ops};
 
@@ -169,8 +168,8 @@ pub(crate) fn apply_projection(
         return project_encrypted(conn, recorded_by, event_id_b64, enc);
     }
 
-    // Build context snapshot — the only DB reads the projector needs
-    let ctx = build_context_snapshot(conn, recorded_by, event_id_b64, parsed)?;
+    // Build projector context via event-module-owned loader.
+    let ctx = (meta.context_loader)(conn, recorded_by, event_id_b64, parsed)?;
 
     // Dispatch to pure projector
     let result = dispatch_pure_projector(recorded_by, event_id_b64, parsed, &ctx);

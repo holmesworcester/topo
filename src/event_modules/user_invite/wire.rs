@@ -177,6 +177,7 @@ pub static USER_INVITE_BOOT_META: EventTypeMeta = EventTypeMeta {
     parse: parse_user_invite_boot,
     encode: encode_user_invite_boot,
     projector: super::projector::project_pure,
+    context_loader: super::projector::build_projector_context,
 };
 
 pub static USER_INVITE_ONGOING_META: EventTypeMeta = EventTypeMeta {
@@ -192,4 +193,5 @@ pub static USER_INVITE_ONGOING_META: EventTypeMeta = EventTypeMeta {
     parse: parse_user_invite_ongoing,
     encode: encode_user_invite_ongoing,
     projector: super::projector::project_pure,
+    context_loader: super::projector::build_projector_context,
 };

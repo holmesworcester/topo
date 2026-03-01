@@ -2,7 +2,8 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::event_id_from_base64;
-use crate::event_modules::{admin, message, peer_shared, reaction, user};
+use crate::event_modules::{admin, message, peer_shared, reaction, user, ParsedEvent};
+use crate::projection::result::ContextSnapshot;
 use crate::service::open_db_for_peer;
 
 /// Look up the workspace_id for a peer from trust_anchors.
@@ -21,6 +22,33 @@ pub fn resolve_workspace_for_peer(
         })?;
     event_id_from_base64(&ws_b64)
         .ok_or_else(|| format!("invalid workspace_id in trust_anchors: {}", ws_b64).into())
+}
+
+/// Build projector-local context for Workspace projection.
+pub fn build_projector_context(
+    db: &Connection,
+    recorded_by: &str,
+    _event_id_b64: &str,
+    parsed: &ParsedEvent,
+) -> Result<ContextSnapshot, Box<dyn std::error::Error>> {
+    if !matches!(parsed, ParsedEvent::Workspace(_)) {
+        return Err("workspace context loader called for non-workspace event".into());
+    }
+
+    let trust_anchor_workspace_id = match db.query_row(
+        "SELECT workspace_id FROM trust_anchors WHERE peer_id = ?1",
+        rusqlite::params![recorded_by],
+        |row| row.get::<_, String>(0),
+    ) {
+        Ok(v) => Some(v),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(e) => return Err(e.into()),
+    };
+
+    Ok(ContextSnapshot {
+        trust_anchor_workspace_id,
+        ..ContextSnapshot::default()
+    })
 }
 
 pub struct WorkspaceRow {

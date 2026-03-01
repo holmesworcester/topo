@@ -238,6 +238,7 @@ pub static MESSAGE_ATTACHMENT_META: EventTypeMeta = EventTypeMeta {
     parse: parse_message_attachment,
     encode: encode_message_attachment,
     projector: super::projector::project_pure,
+    context_loader: crate::event_modules::registry::load_empty_context,
 };
 
 #[cfg(test)]

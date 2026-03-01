@@ -184,6 +184,7 @@ pub static LOCAL_SIGNER_SECRET_META: EventTypeMeta = EventTypeMeta {
     parse: parse_local_signer_secret,
     encode: encode_local_signer_secret,
     projector: project_pure,
+    context_loader: crate::event_modules::registry::load_empty_context,
 };
 
 #[cfg(test)]

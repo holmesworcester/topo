@@ -158,4 +158,5 @@ pub static ENCRYPTED_META: EventTypeMeta = EventTypeMeta {
     parse: parse_encrypted,
     encode: encode_encrypted,
     projector: project_pure,
+    context_loader: crate::event_modules::registry::load_empty_context,
 };

@@ -180,6 +180,7 @@ pub static SIGNED_MEMO_META: EventTypeMeta = EventTypeMeta {
     parse: parse_signed_memo,
     encode: encode_signed_memo,
     projector: project_pure,
+    context_loader: crate::event_modules::registry::load_empty_context,
 };
 
 #[cfg(test)]

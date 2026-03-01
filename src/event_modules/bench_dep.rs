@@ -134,6 +134,7 @@ pub static BENCH_DEP_META: EventTypeMeta = EventTypeMeta {
     parse: parse_bench_dep,
     encode: encode_bench_dep,
     projector: project_pure,
+    context_loader: crate::event_modules::registry::load_empty_context,
 };
 
 #[cfg(test)]

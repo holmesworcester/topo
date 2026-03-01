@@ -119,6 +119,7 @@ pub static USER_REMOVED_META: EventTypeMeta = EventTypeMeta {
     parse: parse_user_removed,
     encode: encode_user_removed,
     projector: project_pure,
+    context_loader: crate::event_modules::registry::load_empty_context,
 };
 
 // === Command/Query APIs (event-module locality) ===

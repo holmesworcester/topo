@@ -174,6 +174,7 @@ pub static ADMIN_BOOT_META: EventTypeMeta = EventTypeMeta {
     parse: parse_admin_boot,
     encode: encode_admin_boot,
     projector: super::projector::project_pure,
+    context_loader: crate::event_modules::registry::load_empty_context,
 };
 
 pub static ADMIN_ONGOING_META: EventTypeMeta = EventTypeMeta {
@@ -189,4 +190,5 @@ pub static ADMIN_ONGOING_META: EventTypeMeta = EventTypeMeta {
     parse: parse_admin_ongoing,
     encode: encode_admin_ongoing,
     projector: super::projector::project_pure,
+    context_loader: crate::event_modules::registry::load_empty_context,
 };
