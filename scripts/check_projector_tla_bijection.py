@@ -59,14 +59,22 @@ NOT_GUARDS = {
 
 
 def extract_tla_guards_from_spec(path: Path) -> set[str]:
-    """Extract all Inv* guard names from the projector_spec.md invariant tables."""
+    """Extract guard names from projector_spec.md mapping tables."""
     guards = set()
-    text = path.read_text()
-    # Match Inv* identifiers in table cells and inline references
-    for m in re.finditer(r'\bInv\w+\b', text):
-        name = m.group()
-        if name not in NOT_GUARDS:
-            guards.add(name)
+    rows = parse_markdown_table(path)
+    guard_columns = (
+        "TLA+ Invariant",
+        "UnifiedBridge invariant/property",
+    )
+    for row in rows:
+        for col in guard_columns:
+            value = row.get(col, "")
+            if not value:
+                continue
+            for m in re.finditer(r'\b(?:Inv\w+|BrInv_\w+|BrSec_\w+|BrLive_\w+)\b', value):
+                name = m.group()
+                if name not in NOT_GUARDS:
+                    guards.add(name)
     return guards
 
 

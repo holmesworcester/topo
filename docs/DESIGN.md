@@ -113,7 +113,7 @@ More details:
 3. Text slots use fixed-size UTF-8 with mandatory zero-padding: unused bytes after the canonical text content must be zero, and no non-zero bytes may appear after the text terminator.
 4. Encrypted event wire size is deterministic by `inner_type_code` (inner types are fixed-size).
 5. File slice events use a canonical fixed ciphertext size; final plaintext chunks are padded before encryption.
-6. Event type 4 (`signed_memo`) is retired in this epoch and rejected as an unknown type by runtime dispatch; it is not part of the active parser/projector surface.
+6. Retired event type 4 is rejected as an unknown type by runtime dispatch; it is not part of the active parser/projector surface.
 7. `bench_dep` events (type 26) are fixed-size shared benchmark events for dependency/cascade performance testing; they are non-encryptable and project no domain rows beyond validity state.
 
 ## 1.3 Event identity and signatures
@@ -1344,7 +1344,7 @@ Operational payload caps for this prototype (wire-format specifics in section 1.
 
 `file_slice` events (type 25, signed) are signed and validated like other canonical events.
 `message_attachment` events (type 24, signed) are file descriptors with deps on `message_id`, `key_event_id`, and `signed_by`.
-Event type 4 (`signed_memo`) is retired in this epoch; unknown-type dispatch rejection is the expected behavior.
+Retired event type 4 is rejected by unknown-type dispatch in this epoch.
 
 ### Low-memory trust and key strategy (`low_mem_ios`)
 

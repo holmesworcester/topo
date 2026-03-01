@@ -95,7 +95,7 @@ Recommended order:
 
 1. `message` (folderized)
 2. `reaction`
-3. `signed_memo`
+3. retired type-4 event (historical)
 4. `workspace`, `user`, `peer_shared`
 5. attachment/file-slice/encrypted
 6. remaining identity/admin/invite/remove modules

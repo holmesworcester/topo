@@ -36,7 +36,7 @@ Event types currently using variable-length canonical wire components:
 
 1. `message` (`content_len`) (`src/events/message.rs`)
 2. `reaction` (`emoji_len`) (`src/events/reaction.rs`)
-3. `signed_memo` (`content_len`) (`src/events/signed_memo.rs`)
+3. retired type-4 event (`content_len`) (`src/events/type4_legacy.rs`, historical)
 4. `encrypted` (`ciphertext_len`) (`src/events/encrypted.rs`)
 5. `file_slice` (`ciphertext_len`) (`src/events/file_slice.rs`)
 6. `message_attachment` (`filename_len`, `mime_len`) (`src/events/message_attachment.rs`)

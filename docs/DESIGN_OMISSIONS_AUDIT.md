@@ -53,9 +53,9 @@ Status:
    - Backed by `~/.topo/db_registry.json` with selector-resolution semantics [db_registry.rs](/home/holmes/poc-7/src/db_registry.rs:1), [db_registry.rs](/home/holmes/poc-7/src/db_registry.rs:123).
    - `DESIGN.md` does not document this operational contract in section 8 [DESIGN.md](/home/holmes/poc-7/docs/DESIGN.md:854).
 
-6. **SignedMemo event type is omitted from design narrative**
-   - Canonical event type 4 is present in registry and parser/projector stack [mod.rs](/home/holmes/poc-7/src/event_modules/mod.rs:52), [signed_memo.rs](/home/holmes/poc-7/src/event_modules/signed_memo.rs:143).
-   - `DESIGN.md` explicitly references several specific non-identity event types (message/reaction/deletion/attachment/file_slice), but not `signed_memo` [DESIGN.md](/home/holmes/poc-7/docs/DESIGN.md:1051).
+6. **Retired event type 4 status was omitted from design narrative**
+   - Canonical event type 4 existed historically in earlier parser/projector stacks.
+   - `DESIGN.md` now documents event type 4 as retired/unknown-type rejected in the current epoch.
 
 ## Additional omissions found in second sweep
 
