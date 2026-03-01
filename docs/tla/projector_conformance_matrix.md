@@ -112,8 +112,6 @@ both `pass` and `break` polarity unless waived.
 | SPEC_USR_INSERT_01 | InvDeps | CHK_USR_INSERT | projector_unit | simple_projector_tests::tests::test_user_rejects_non_user_event | break |
 | SPEC_SK_INSERT_01 | InvEncryptedKey | CHK_SK_INSERT | projector_unit | simple_projector_tests::tests::test_secret_key_valid | pass |
 | SPEC_SK_INSERT_01 | InvEncryptedKey | CHK_SK_INSERT | projector_unit | simple_projector_tests::tests::test_secret_key_rejects_non_secret_key_event | break |
-| SPEC_TK_INSERT_01 | InvPeerSharedTrustMatchesCarried | CHK_TK_INSERT | projector_unit | simple_projector_tests::tests::test_transport_key_valid | pass |
-| SPEC_TK_INSERT_01 | InvPeerSharedTrustMatchesCarried | CHK_TK_INSERT | projector_unit | simple_projector_tests::tests::test_transport_key_rejects_non_transport_key_event | break |
 | SPEC_MA_INSERT_01 | InvDeps | CHK_MA_INSERT | projector_unit | simple_projector_tests::tests::test_message_attachment_valid | pass |
 | SPEC_MA_INSERT_01 | InvDeps | CHK_MA_INSERT | projector_unit | simple_projector_tests::tests::test_message_attachment_rejects_non_attachment_event | break |
 | SPEC_MA_RETRY_01 | InvFileSliceAuth | CHK_MA_RETRY_GUARD | projector_unit | simple_projector_tests::tests::test_message_attachment_valid | pass |
