@@ -25,14 +25,27 @@ pub(super) fn drain_project_queue_on_connection(
     tenant_id: &str,
     batch_size: usize,
 ) -> rusqlite::Result<usize> {
+    // Defer WAL autocheckpoints during the drain. Projection writes are
+    // autocommit (one implicit transaction per SQL statement), so the default
+    // wal_autocheckpoint=1000 triggers frequent checkpoints that stall the
+    // writer. Deferring keeps all drain writes in the WAL and lets a single
+    // checkpoint run after the drain completes (when autocheckpoint is restored
+    // and the next COMMIT triggers it).
+    let _ = db.execute_batch("PRAGMA wal_autocheckpoint = 0");
+
     let pq = ProjectQueue::new(db);
     let tenant = tenant_id.to_string();
 
-    pq.drain_with_limit(&tenant, batch_size, |conn, event_id_b64| {
+    let result = pq.drain_with_limit(&tenant, batch_size, |conn, event_id_b64| {
         if let Some(event_id) = event_id_from_base64(event_id_b64) {
             project_one(conn, &tenant, &event_id)
                 .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
         }
         Ok(())
-    })
+    });
+
+    // Restore WAL autocheckpoint to default.
+    let _ = db.execute_batch("PRAGMA wal_autocheckpoint = 1000");
+
+    result
 }

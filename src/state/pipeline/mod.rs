@@ -6,10 +6,10 @@ mod planner;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use crate::contracts::event_pipeline_contract::IngestItem;
 use crate::db::open_connection;
@@ -114,6 +114,8 @@ pub fn batch_writer(
     let reg = registry();
     let mut workspace_cache: HashMap<String, String> = HashMap::new();
     let effects_executor = SqlitePostCommitEffectsExecutor::new(&db);
+    let mut cumulative_events: u64 = 0;
+    let mut profile_epoch = Instant::now();
 
     loop {
         let first = match rx.blocking_recv() {
@@ -129,6 +131,8 @@ pub fn batch_writer(
                 break;
             }
         }
+
+        let batch_len = batch.len();
 
         prewarm_workspace_cache(&db, &batch, &mut workspace_cache);
 
@@ -157,6 +161,7 @@ pub fn batch_writer(
             continue;
         }
 
+        let t_persist = Instant::now();
         let persist_output = run_persist_phase(
             &db,
             &batch,
@@ -167,7 +172,9 @@ pub fn batch_writer(
             &mut events_stmt,
             &mut enqueue_stmt,
         );
+        let persist_ms = t_persist.elapsed().as_millis();
 
+        let t_commit = Instant::now();
         match commit_and_run_post_commit_effects(
             &db,
             &persist_output,
@@ -182,11 +189,21 @@ pub fn batch_writer(
                 continue;
             }
         }
+        let commit_and_effects_ms = t_commit.elapsed().as_millis();
 
-        events_received.fetch_add(
-            persist_output.persisted_event_ids.len() as u64,
-            Ordering::Relaxed,
-        );
+        let persisted_count = persist_output.persisted_event_ids.len() as u64;
+        cumulative_events += persisted_count;
+        events_received.fetch_add(persisted_count, Ordering::Relaxed);
+
+        // Profile logging: emit every 10k events to avoid log noise
+        if cumulative_events / 10_000 != (cumulative_events - persisted_count) / 10_000 {
+            let epoch_ms = profile_epoch.elapsed().as_millis();
+            info!(
+                "WRITER_PROFILE: cumulative={} batch={} persist={}ms commit+effects={}ms epoch_10k={}ms",
+                cumulative_events, batch_len, persist_ms, commit_and_effects_ms, epoch_ms,
+            );
+            profile_epoch = Instant::now();
+        }
     }
 }
 

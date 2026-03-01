@@ -521,6 +521,8 @@ The batch writer runs three explicit phases:
 2. Planner phase (`state/pipeline/planner.rs`): deterministically maps `PersistPhaseOutput` to a post-commit command list (for example drain tenant queues seen in the batch, log queue health, run post-drain hooks).
 3. Effects phase (`state/pipeline/effects.rs`): executes side effects through the executor boundary (wanted removal, queue drain/projection, queue health logging, post-drain hooks).
 
+The projection drain (`project_queue::drain_with_limit`) runs each projection in autocommit mode and batches dequeue DELETEs via `mark_done_batch` (one `BEGIN`/`COMMIT` per claim cycle). Individual projection failures are retried with exponential backoff via `mark_retry`. During the drain, `drain_project_queue_on_connection` defers WAL autocheckpointing (`PRAGMA wal_autocheckpoint = 0`) to avoid checkpoint stalls between autocommit writes, restoring the default after drain completes. Crash safety is provided by the queue: interrupted drains leave events in `project_queue` for re-projection on the next cycle.
+
 Ownership statement: persist owns ingest SQL writes, planner owns deterministic command mapping, effects owns side-effect execution, and `batch_writer` in `state/pipeline/mod.rs` owns sequencing/retry policy.
 
 This eliminates write contention while preserving per-tenant projection isolation.
@@ -929,7 +931,7 @@ Current runtime ingest/worker shape:
    - decode + canonical insert (`events`, `neg_items`, `recorded_events`) + `project_queue` enqueue in one transaction,
    - commit, then drain `project_queue`.
 2. project worker/drain:
-   - claim, project (`valid|block|reject`), dequeue.
+   - claim batch, project each event in autocommit (`valid|block|reject`), batch-dequeue successes, mark retry on failure. WAL autocheckpoint deferred during drain.
 3. egress worker:
    - claim per connection, send frame, mark sent or retry.
 4. cleanup worker:
@@ -1348,7 +1350,9 @@ This makes tests resilient to identity chain structure changes while still verif
 3. keep queue purge policies explicit and predictable,
 4. monitor blocked counts, queue age, retries, lease churn,
 5. provide `low_mem_ios` mode with a target of `<= 24 MiB` steady-state RSS for constrained runtimes (including iOS NSE),
-6. in `low_mem_ios`, enforce strict in-flight bounds and prefer reduced throughput over memory spikes.
+6. in `low_mem_ios`, enforce strict in-flight bounds and prefer reduced throughput over memory spikes,
+7. use serial perf measurement (`--test-threads=1`, `scripts/run_perf_serial.sh`) for tail profiling to avoid cross-test interference; profile before tuning,
+8. projection drain uses batch dequeue (`mark_done_batch`) and deferred WAL autocheckpoint to reduce per-batch overhead at high cardinality.
 
 Operational payload caps for this prototype (wire-format specifics in section 1.2 and file-flow details in section 12.2):
 
