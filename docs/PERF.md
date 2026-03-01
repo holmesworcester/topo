@@ -4,8 +4,8 @@
 
 ## Test Environment
 - SQLite on disk (WAL mode, NORMAL sync)
-- QUIC transport (localhost, certificate-pinned)
-- 512-byte envelopes
+- QUIC transport (localhost, certificate-pinned <!-- are we really doing certificate pinning? -->)
+- 512-byte envelopes <!-- is this still true? -->
 - Linux x86_64, release build
 
 ## Running Performance Tests
@@ -45,10 +45,11 @@ Each peer generates 5k events, syncs both directions.
 #### 50k one-way sync
 
 One peer generates 50k events, syncs to an empty peer.
+<!-- we should add MiB/s throughput numbers to all these graphs -->
 
 | Metric | Value |
 |--------|-------|
-| Event generation | 4.65s |
+| Event generation | 4.65s | 
 | Sync wall time | 6.73s |
 | Messages synced | 50,000 |
 | Msgs/s | 7,431 |
@@ -76,7 +77,7 @@ Throughput profile (receiver-side message count):
 | 400k-500k | 100,000 | 36s | 2,778 |
 
 Tail-phase slowdown is gated by receiver-side batch_writer throughput
-(SQLite insert rate degrades as tables grow).
+(SQLite insert rate degrades as tables grow). <!-- what can we do about this? -->
 
 #### 10k continuous sync (inject while syncing)
 
@@ -139,9 +140,11 @@ Events injected at P0, propagate through P0-P1-...-P9.
 
 #### 10-hop chain: 10 peers, 50k events
 
+<!-- why is this so much faster? -->
+
 | Metric | Value |
 |--------|-------|
-| Tail converge | 3,668 ms |
+| Tail converge | 3,668 ms |  
 | All converge | 3,672 ms |
 | Events/s (tail) | 13,631 |
 | Hop latency P50 | 2,929 ms |
@@ -173,13 +176,15 @@ Each source contributes at least one unique marker, proving all sources particip
 | Sink store | 14,908 |
 | Peak RSS | 1,370.3 MiB |
 
+<!-- we should add a multi-source large file perf test. that's more interesting than events and more impactful on perf since files dominate -->
+
 ### Low-Memory Budget (`low_mem_test.rs`)
 
 Verifies sync stays within iOS NSE memory budget (24 MiB per instance, 48 MiB process).
 `LOW_MEM_IOS=1` enabled. Pass/fail only — no throughput metrics.
 
 - **10k smoke**: PASS (2 peers, 5k each)
-- **1M soak** (`#[ignore]`): long-running hardening test
+- **1M soak** (`#[ignore]`): long-running hardening test <!-- let's get a large test that we can run more regularly? also, is there some way we can limit lowmem sync to most recent data first, or step it through time segments, so that no matter how much data there is we'll never push past its limits? or is there some sqlite mem limit here that is impossible to escape? -->
 
 ## Key Design Points
 
