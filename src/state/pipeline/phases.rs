@@ -14,23 +14,6 @@ pub(super) struct PersistPhaseOutput {
     pub tenants_seen: HashSet<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum PostCommitCommand {
-    RemoveWanted {
-        event_id: EventId,
-    },
-    DrainProjectQueue {
-        tenant_id: String,
-        batch_size: usize,
-    },
-    LogProjectQueueHealth {
-        tenant_id: String,
-    },
-    RunPostDrainHooks {
-        tenant_id: String,
-    },
-}
-
 fn current_timestamp_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

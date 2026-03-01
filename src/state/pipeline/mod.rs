@@ -1,7 +1,6 @@
 mod drain;
 mod effects;
 mod phases;
-mod planner;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -49,14 +48,13 @@ fn commit_and_run_post_commit_effects<E: PostCommitEffectsExecutor>(
     batch_size: usize,
 ) -> rusqlite::Result<()> {
     db.execute("COMMIT", [])?;
-    let commands = planner::plan_post_commit_commands(persist_output, batch_size);
-    run_post_commit_effects(effects_executor, &commands);
+    run_post_commit_effects(effects_executor, persist_output, batch_size);
     Ok(())
 }
 
 /// Batch writer task - drains channel and writes to SQLite in batches.
-/// Phase 1 persists ingest rows in a transaction, phase 2 plans post-commit
-/// commands, and phase 3 executes side effects through the executor boundary.
+/// Phase 1 persists ingest rows in a transaction, then post-commit effects
+/// run directly from persisted output through the executor boundary.
 ///
 /// Each item carries its own `recorded_by`, enabling a single writer to serve
 /// multiple tenants sharing one DB.
@@ -196,17 +194,19 @@ mod tests {
     use std::collections::HashSet;
 
     use super::effects::PostCommitEffectsExecutor;
-    use super::phases::{PersistPhaseOutput, PostCommitCommand};
+    use super::phases::PersistPhaseOutput;
     use super::*;
 
     #[derive(Default)]
     struct RecordingExecutor {
-        invocations: RefCell<Vec<Vec<PostCommitCommand>>>,
+        invocations: RefCell<Vec<(PersistPhaseOutput, usize)>>,
     }
 
     impl PostCommitEffectsExecutor for RecordingExecutor {
-        fn execute_post_commit_commands(&self, commands: &[PostCommitCommand]) {
-            self.invocations.borrow_mut().push(commands.to_vec());
+        fn run_post_commit_effects(&self, persist_output: &PersistPhaseOutput, batch_size: usize) {
+            self.invocations
+                .borrow_mut()
+                .push((persist_output.clone(), batch_size));
         }
     }
 
@@ -241,15 +241,16 @@ mod tests {
 
         let executor = RecordingExecutor::default();
         let persist_output = sample_persist_output();
-        let expected_commands = planner::plan_post_commit_commands(&persist_output, 16);
 
         commit_and_run_post_commit_effects(&db, &persist_output, &executor, 16).unwrap();
 
         let invocations = executor.invocations.borrow();
         assert_eq!(invocations.len(), 1, "effects should run once after commit");
+        let (recorded_output, recorded_batch_size) = &invocations[0];
         assert_eq!(
-            invocations[0], expected_commands,
-            "effects should receive the planned command list"
+            recorded_output, &persist_output,
+            "effects should receive persist output directly"
         );
+        assert_eq!(*recorded_batch_size, 16, "effects should receive batch size");
     }
 }
