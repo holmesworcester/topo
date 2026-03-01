@@ -99,8 +99,8 @@ an explicit `NON_MODELED::<reason>` waiver.
 | CHK_BRIDGE_ROW_TO_RUNTIME_TRUST | projection/trust_store + runtime/transport | BrInv_RowToMaterializedExactness | unified_bridge |
 | CHK_BRIDGE_PENDING_LOCAL_CREATE | event_modules/user_invite + event_modules/device_invite | BrInv_PendingOnlyOnInviter | unified_bridge |
 | CHK_BRIDGE_ALLOWED_PEER_AUTH | runtime/transport/authz | BrInv_AllowedPeerMatchesAuthDecision | unified_bridge |
-| CHK_BRIDGE_ONGOING_PREFERENCE | runtime/peering/loops/connect | BrInv_OngoingPreferred | unified_bridge |
-| CHK_BRIDGE_BOOTSTRAP_FALLBACK | runtime/peering/loops/connect | BrInv_BootstrapFallbackOnlyWhenNeeded | unified_bridge |
+| CHK_BRIDGE_ONGOING_PREFERENCE | runtime/transport/bootstrap_dial_context + runtime/peering/loops/connect | BrInv_OngoingPreferred | unified_bridge |
+| CHK_BRIDGE_BOOTSTRAP_FALLBACK | runtime/transport/bootstrap_dial_context + runtime/peering/loops/connect | BrInv_BootstrapFallbackOnlyWhenNeeded | unified_bridge |
 | CHK_BRIDGE_BOOTSTRAP_PROGRESS | runtime/peering/bootstrap + sync loops | BrLive_BootstrapConnectEventually | unified_bridge |
 | CHK_BRIDGE_UPGRADE_PROGRESS | runtime/peering/loops/connect | BrLive_PeerUpgradeEventually | unified_bridge |
 | CHK_BRIDGE_SYNC_COMPLETION_PROGRESS | runtime/sync + projection/apply | BrLive_BootstrapCompletionSyncEventually | unified_bridge |
