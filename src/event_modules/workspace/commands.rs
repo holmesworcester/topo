@@ -13,7 +13,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::SigningKey;
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use super::identity_ops::{
@@ -107,47 +107,27 @@ pub fn create_workspace(
             peer_shared_key: signing_key,
         });
     }
-    // Broader check: any PeerShared signer exists (recorded_by may differ
-    // from input after pre-derive generates a derived identity).
-    if let Some((actual_rb, eid, signing_key)) = db
-        .query_row(
-            "SELECT l.recorded_by, l.signer_event_id, l.private_key
-             FROM local_signer_material l
-             INNER JOIN peers_shared p
-               ON p.recorded_by = l.recorded_by AND p.event_id = l.signer_event_id
-             WHERE l.signer_kind = 3
-             LIMIT 1",
-            [],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Vec<u8>>(2)?,
-                ))
-            },
-        )
-        .optional()?
-    {
-        let key_arr: [u8; 32] = signing_key
-            .try_into()
-            .map_err(|_| "bad signing key length in local signer table".to_string())?;
-        let signing_key = SigningKey::from_bytes(&key_arr);
-        let eid = crate::crypto::event_id_from_base64(&eid)
-            .ok_or_else(|| "bad local peer signer event_id".to_string())?;
-        let workspace_id = db
-            .query_row(
-                "SELECT workspace_id FROM trust_anchors WHERE peer_id = ?1",
-                rusqlite::params![actual_rb],
-                |row| row.get::<_, String>(0),
-            )
-            .ok()
-            .and_then(|b64| crate::crypto::event_id_from_base64(&b64))
-            .unwrap_or([0u8; 32]);
-        return Ok(CreateWorkspaceResult {
-            workspace_id,
-            peer_shared_event_id: eid,
-            peer_shared_key: signing_key,
-        });
+    // Single-tenant compatibility fallback:
+    // allow callers with a bootstrap/non-canonical recorded_by to resolve the
+    // existing identity chain only when there is exactly one local transport
+    // identity. In multi-tenant DBs this must not select an arbitrary signer.
+    if let Ok(Some((sole_peer_id, _, _))) = crate::db::transport_creds::load_sole_local_creds(db) {
+        if let Some((eid, signing_key)) = load_local_peer_signer(db, &sole_peer_id)? {
+            let workspace_id = db
+                .query_row(
+                    "SELECT workspace_id FROM trust_anchors WHERE peer_id = ?1",
+                    rusqlite::params![sole_peer_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok()
+                .and_then(|b64| crate::crypto::event_id_from_base64(&b64))
+                .unwrap_or([0u8; 32]);
+            return Ok(CreateWorkspaceResult {
+                workspace_id,
+                peer_shared_event_id: eid,
+                peer_shared_key: signing_key,
+            });
+        }
     }
 
     let mut rng = rand::thread_rng();
