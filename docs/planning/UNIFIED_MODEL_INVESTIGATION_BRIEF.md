@@ -33,6 +33,7 @@ Current models split concerns (event graph vs transport lifecycle). This can hid
    - Local create/project behavior consistency (`is_local_create`-gated behavior).
    - Allowed-peer semantics vs connection acceptance/rejection.
    - Outbound dial path preference correctness (ongoing first, bootstrap fallback only as needed).
+   - Security properties (authorization, provenance, impersonation resistance, and removal-deny semantics).
 3. **Projection row-write modeling requirement (explicit):**
    - Model projection as abstract write-intent actions (insert/delete/upsert) for the trust and connection-critical surfaces, not only final set equality.
    - Minimum covered row surfaces:
@@ -67,6 +68,7 @@ Current models split concerns (event graph vs transport lifecycle). This can hid
 4. Documentation explains exactly how each modeled variable maps to Rust runtime/projection code.
 5. At least one executable progress/liveness check demonstrates bootstrap completion viability (connect + sync + upgrade) under documented fairness assumptions.
 6. At least one bridge check is defined at row-write level (write-intent semantics), not only derived trust-set equality.
+7. Security invariants are explicit bridge checks (not implied indirectly by general trust-coherence invariants).
 
 ## No-cheat checks
 1. No invariant may reference only one layer if it claims cross-layer correctness.
@@ -75,6 +77,7 @@ Current models split concerns (event graph vs transport lifecycle). This can hid
 4. A fixed-mode run must complete with no invariant violations under the same reduced constant domain.
 5. Progress checks must not be satisfied vacuously by disabling actions; fairness assumptions and enabledness conditions must be documented.
 6. Any row-write bridge must name the modeled write action and the corresponding Rust projection path.
+7. Security checks must include at least one negative property ("must never happen"), such as unauthorized connection acceptance.
 
 ## Deliverables
 1. `docs/tla/UNIFIED_MODEL_PLAN.md` with architecture decision and mapping table.

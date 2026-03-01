@@ -63,6 +63,20 @@ Each write intent must map to a Rust projection path in a table in this file.
 7. `BrInv_RowToMaterializedExactness`:
    materialized trust sets are exact reductions of write-intent rows (after supersession/expiry rules).
 
+## Security bridge invariants (required)
+1. `BrSec_ConnectionRequiresAuthorization`:
+   any accepted/active connection state must imply remote active credential is authorized by runtime trust policy for that peer context.
+2. `BrSec_NoTrustWithoutProvenance`:
+   no materialized trust entry may exist without admissible event cause and corresponding projection write intent.
+3. `BrSec_NoPendingTrustOnJoiner`:
+   pending bootstrap trust must never materialize for non-inviter contexts (anti-privilege-escalation property).
+4. `BrSec_SourceBindingConsistency`:
+   credential source and trust-source labels cannot disagree with their event/row provenance.
+5. `BrSec_RemovalDeniesConnectivity`:
+   once removal/exclusion cause is projected for a peer relation, ongoing authorization for that relation is denied (or forced to fallback/deny, based on policy).
+6. `BrSec_NoIdentityCollisionInAuthPath`:
+   identity used for authorization is unique and cannot authenticate as multiple peers in the same state.
+
 ## Progress properties (liveness)
 Use explicit fairness assumptions over projection and connection transition families.
 
@@ -74,6 +88,8 @@ Use explicit fairness assumptions over projection and connection transition fami
    once connected and admissible, eventually required bootstrap-completion facts are projected/materialized.
 4. `BrLive_FallbackAttemptEventually`:
    if ongoing unavailable and bootstrap trust available, eventually fallback dial path is chosen/attempted.
+5. `BrLive_RemovalConvergesToDeny`:
+   once removal/exclusion is established, eventual auth outcome converges to deny for the removed relation.
 
 ## Fairness assumptions
 Document and encode at minimum:
@@ -112,9 +128,11 @@ Deep domain (target <= 20 minutes):
 | Bridge surface | Rust/runtime concept |
 |---|---|
 | `EF_InviteCreator` | `recorded_events.source` / `is_local_create` |
+| `EF_RemovalOrExclusion` | `user_removed` / `peer_removed` projection effects |
 | `PW_InsertPendingBootstrapTrust` | projector `WritePendingBootstrapTrust` |
 | `PW_InsertBootstrapTrust` | `record_invite_bootstrap_trust()` path |
 | `PW_InsertPeerSharedTrust` | `peer_shared_spki_fingerprints()` materialization |
+| `PW_DeletePeerSharedTrust` | peer removal/exclusion trust deletion path |
 | `RT_TrustedSPKIs` | `allowed_peers_from_db()` trust union |
 | `RT_CanAuthenticate` | `is_peer_allowed()` and transport trust check |
 | `RT_DialPreference` | connect-loop ongoing-first with bootstrap fallback |
@@ -129,6 +147,12 @@ Add new check ids in `docs/tla/runtime_check_catalog.md`:
 6. `CHK_BRIDGE_BOOTSTRAP_PROGRESS`
 7. `CHK_BRIDGE_UPGRADE_PROGRESS`
 8. `CHK_BRIDGE_SYNC_COMPLETION_PROGRESS`
+9. `CHK_BRIDGE_SEC_CONN_AUTHZ`
+10. `CHK_BRIDGE_SEC_TRUST_PROVENANCE`
+11. `CHK_BRIDGE_SEC_PENDING_INVITER_ONLY`
+12. `CHK_BRIDGE_SEC_SOURCE_BINDING`
+13. `CHK_BRIDGE_SEC_REMOVAL_DENY`
+14. `CHK_BRIDGE_SEC_IDENTITY_COLLISION`
 
 ## TLC execution notes template
 1. `cd docs/tla`
