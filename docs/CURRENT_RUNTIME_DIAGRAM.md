@@ -241,6 +241,121 @@ flowchart TD
 - `Transport trust tables`: transport trust rows (`peer_shared`, invite bootstrap records).
 - `connection lifecycle + trust read`: transport-owned tenant-scoped lookup via `db::transport_trust::is_peer_allowed` plus dial/accept identity handling.
 
+## 5) Bootstrap Event DAG (Alice/Bob/Carol, Multi-device)
+
+Main DAG uses two collapsed repeated blocks to keep repeated invite-accept patterns DRY:
+- `JOIN(...)`: expanded in `5.1 User Join Subgraph`.
+- `DEVICE_ADD(...)`: expanded in `5.2 Device Add Subgraph`.
+
+```mermaid
+flowchart LR
+    subgraph A["Alice (inviter)"]
+      A0["A0 Workspace"]
+      A1["A1 InviteAccepted (self anchor)"]
+      A2["A2 UserInviteBoot (self)"]
+      A3["A3 UserBoot (alice)"]
+      A4["A4 DeviceInviteFirst (alice-laptop)"]
+      A5["A5 PeerSharedFirst (alice-laptop)"]
+      A6["A6 DeviceInviteFirst (link alice-phone)"]
+      A7["A7 PeerSharedFirst (alice-phone)"]
+      A8["A8 UserInviteBoot (for Bob)"]
+      A9["A9 UserInviteBoot (for Carol)"]
+      A10["A10 SecretShared (content key -> Bob invite)"]
+      A11["A11 SecretShared (content key -> Carol invite)"]
+    end
+
+    A0 --> A1 --> A2 --> A3 --> A4 --> A5
+    A3 --> A6 --> A7
+    A3 --> A7
+    A0 --> A8
+    A0 --> A9
+    A8 --> A10
+    A9 --> A11
+    A5 --> A10
+    A5 --> A11
+
+    BJ["JOIN(Bob)"]
+    CJ["JOIN(Carol)"]
+    A8 --> BJ
+    A10 --> BJ
+    A9 --> CJ
+    A11 --> CJ
+
+    BUSER["B.user (from JOIN)"]
+    BPSL["B.peer_shared laptop (from JOIN)"]
+    CUSER["C.user (from JOIN)"]
+    CPSL["C.peer_shared laptop (from JOIN)"]
+    BJ --> BUSER
+    BJ --> BPSL
+    CJ --> CUSER
+    CJ --> CPSL
+
+    BDI["B DeviceInviteFirst (link bob-phone)"]
+    CDI["C DeviceInviteFirst (link carol-tablet)"]
+    BUSER --> BDI
+    CUSER --> CDI
+
+    BADD["DEVICE_ADD(Bob phone)"]
+    CADD["DEVICE_ADD(Carol tablet)"]
+    BDI --> BADD
+    CDI --> CADD
+    BUSER --> BADD
+    CUSER --> CADD
+
+    BPSP["B.peer_shared phone"]
+    CPST["C.peer_shared tablet"]
+    BADD --> BPSP
+    CADD --> CPST
+
+    M1["M1 message (alice-phone: hi)"]
+    M2["M2 message (bob-phone: hey)"]
+    M3["M3 message (carol-laptop: ship it)"]
+
+    A3 --> M1
+    A7 --> M1
+    BUSER --> M2
+    BPSP --> M2
+    CUSER --> M3
+    CPSL --> M3
+```
+
+### 5.1 User Join Subgraph (expanded)
+
+`workspace::commands::join_workspace_as_new_user` + `persist_join_signer_secrets`.
+
+```mermaid
+flowchart LR
+    INV["UserInviteBoot invite event"] --> IA["InviteAccepted (local trust anchor)"]
+    INV --> UB["UserBoot (signed_by = invite_event_id)"]
+    UB --> DIF["DeviceInviteFirst (signed_by = user_event_id)"]
+    DIF --> PSF["PeerSharedFirst (signed_by = device_invite_event_id)"]
+    UB --> PSF
+
+    INV --> SS["SecretShared (recipient_event_id = invite_event_id)"]
+    SS -. optional timing .-> SK["SecretKey (unwrapped content key)"]
+
+    PSF --> LSP["LocalSignerSecret (peer_shared)"]
+    UB --> LSU["LocalSignerSecret (user)"]
+
+    IA -. guard-unblock / retry .-> UB
+    IA -. guard-unblock / retry .-> DIF
+    IA -. guard-unblock / retry .-> PSF
+```
+
+### 5.2 Device Add Subgraph (expanded)
+
+`workspace::commands::add_device_to_workspace` + `persist_link_signer_secrets`.
+
+```mermaid
+flowchart LR
+    USER["Existing UserBoot"] --> DINV["DeviceInviteFirst link invite"]
+    DINV --> IA["InviteAccepted (local trust anchor)"]
+    DINV --> PSF["PeerSharedFirst (new device)"]
+    USER --> PSF
+    PSF --> LSP["LocalSignerSecret (peer_shared)"]
+    IA -. guard-unblock / retry .-> PSF
+```
+
 ## Current Data-Flow Facts
 
 1. `egress_queue` is fed by sync control-plane `HaveList` messages, not by `batch_writer`.
