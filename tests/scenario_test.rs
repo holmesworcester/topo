@@ -133,15 +133,15 @@ async fn test_sync_10k() {
     let gen_secs = gen_start.elapsed().as_secs_f64();
     eprintln!("Generated 10k events in {:.2}s", gen_secs);
 
-    // Count-based convergence gate: bob must ingest alice's full pre-sync store.
-    let alice_store_before_sync = alice.store_count();
-    let bob_store_before_sync = bob.store_count();
-    let expected_bob_store = bob_store_before_sync + alice_store_before_sync;
+    // Convergence gate on stored Message events (canonical events table).
+    let alice_messages_before_sync = alice.stored_message_event_count();
+    let bob_messages_before_sync = bob.stored_message_event_count();
+    let expected_bob_messages = bob_messages_before_sync + alice_messages_before_sync;
 
     let metrics = sync_until_converged(
         &alice,
         &bob,
-        || bob.store_count() >= expected_bob_store,
+        || bob.stored_message_event_count() >= expected_bob_messages,
         Duration::from_secs(120),
     )
     .await;
@@ -267,8 +267,8 @@ async fn test_zero_loss_stress() {
     );
 
     // Count/set-based convergence only (no marker/sample phase).
-    let a_before = alice.store_count();
-    let b_before = bob.store_count();
+    let a_before = alice.stored_message_event_count();
+    let b_before = bob.stored_message_event_count();
     let start = Instant::now();
     let sync = start_peers_pinned(&alice, &bob);
 
@@ -308,19 +308,19 @@ async fn test_zero_loss_stress() {
     let wall_secs = start.elapsed().as_secs_f64();
     drop(sync);
 
-    let a_after = alice.store_count();
-    let b_after = bob.store_count();
-    let events_transferred = ((a_after - a_before) + (b_after - b_before)) as u64;
+    let a_after = alice.stored_message_event_count();
+    let b_after = bob.stored_message_event_count();
+    let message_events_transferred = ((a_after - a_before) + (b_after - b_before)) as u64;
     let events_per_sec = if wall_secs > 0.0 {
-        events_transferred as f64 / wall_secs
+        message_events_transferred as f64 / wall_secs
     } else {
         0.0
     };
-    let bytes_transferred = events_transferred * 100;
+    let bytes_transferred = message_events_transferred * 100;
     let throughput_mib_s = (bytes_transferred as f64) / (1024.0 * 1024.0) / wall_secs.max(0.001);
     eprintln!(
         "zero-loss stress: {} events in {:.2}s ({:.0} events/s, {:.2} MiB/s)",
-        events_transferred, wall_secs, events_per_sec, throughput_mib_s,
+        message_events_transferred, wall_secs, events_per_sec, throughput_mib_s,
     );
 
     // Final assertions on the quiesced state.
@@ -563,15 +563,15 @@ async fn test_sync_50k() {
     let gen_secs = gen_start.elapsed().as_secs_f64();
     eprintln!("Generated 50k events in {:.2}s", gen_secs);
 
-    // Count-based convergence gate: bob must ingest alice's full pre-sync store.
-    let alice_store_before_sync = alice.store_count();
-    let bob_store_before_sync = bob.store_count();
-    let expected_bob_store = bob_store_before_sync + alice_store_before_sync;
+    // Convergence gate on stored Message events (canonical events table).
+    let alice_messages_before_sync = alice.stored_message_event_count();
+    let bob_messages_before_sync = bob.stored_message_event_count();
+    let expected_bob_messages = bob_messages_before_sync + alice_messages_before_sync;
 
     let metrics = sync_until_converged(
         &alice,
         &bob,
-        || bob.store_count() >= expected_bob_store,
+        || bob.stored_message_event_count() >= expected_bob_messages,
         Duration::from_secs(300),
     )
     .await;

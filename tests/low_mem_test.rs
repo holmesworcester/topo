@@ -94,16 +94,19 @@ async fn low_mem_ios_budget_smoke_10k() {
     alice.batch_create_messages(5_000);
     bob.batch_create_messages(5_000);
 
-    // Count-based convergence gate: no marker events.
-    let alice_store_before_sync = alice.store_count();
-    let bob_store_before_sync = bob.store_count();
-    let expected_alice_store = alice_store_before_sync + bob_store_before_sync;
-    let expected_bob_store = bob_store_before_sync + alice_store_before_sync;
+    // Convergence gate on stored Message events (canonical events table).
+    let alice_messages_before_sync = alice.stored_message_event_count();
+    let bob_messages_before_sync = bob.stored_message_event_count();
+    let expected_alice_messages = alice_messages_before_sync + bob_messages_before_sync;
+    let expected_bob_messages = bob_messages_before_sync + alice_messages_before_sync;
 
     let _metrics = sync_until_converged(
         &alice,
         &bob,
-        || alice.store_count() >= expected_alice_store && bob.store_count() >= expected_bob_store,
+        || {
+            alice.stored_message_event_count() >= expected_alice_messages
+                && bob.stored_message_event_count() >= expected_bob_messages
+        },
         Duration::from_secs(180),
     )
     .await;
@@ -140,15 +143,15 @@ async fn low_mem_ios_budget_soak_million() {
     let bob = Peer::new_with_identity("bob_lowmem_soak");
 
     alice.batch_create_messages(events);
-    // Count-based convergence gate: wait for bob to ingest alice's store.
-    let alice_store_before_sync = alice.store_count();
-    let bob_store_before_sync = bob.store_count();
-    let expected_bob_store = bob_store_before_sync + alice_store_before_sync;
+    // Convergence gate: wait for bob to ingest alice's Message events.
+    let alice_messages_before_sync = alice.stored_message_event_count();
+    let bob_messages_before_sync = bob.stored_message_event_count();
+    let expected_bob_messages = bob_messages_before_sync + alice_messages_before_sync;
 
     let _metrics = sync_until_converged(
         &alice,
         &bob,
-        || bob.store_count() >= expected_bob_store,
+        || bob.stored_message_event_count() >= expected_bob_messages,
         Duration::from_secs(3600),
     )
     .await;

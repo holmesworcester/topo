@@ -53,6 +53,18 @@ fn current_timestamp_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// Open a lightweight connection for polling counts during active sync.
+/// Avoids reapplying full connection pragmas on each poll, which can
+/// contend with writers and cause transient open failures.
+fn open_count_connection(db_path: &str) -> Option<rusqlite::Connection> {
+    let db = match rusqlite::Connection::open(db_path) {
+        Ok(db) => db,
+        Err(_) => return None,
+    };
+    let _ = db.busy_timeout(Duration::from_millis(200));
+    Some(db)
+}
+
 /// Timing breakdown returned after sync completes.
 #[derive(Debug, Clone)]
 pub struct SyncMetrics {
@@ -767,19 +779,52 @@ impl Peer {
     /// Count events in the events table.
     /// Returns -1 if the database can't be opened (transient contention).
     pub fn store_count(&self) -> i64 {
-        let db = match open_connection(&self.db_path) {
-            Ok(db) => db,
-            Err(_) => return -1,
+        let db = match open_count_connection(&self.db_path) {
+            Some(db) => db,
+            None => return -1,
         };
         db.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
             .unwrap_or(0)
     }
 
+    /// Count sync-eligible shared-scope events in the events table.
+    /// Returns -1 if the database can't be opened (transient contention).
+    pub fn shared_store_count(&self) -> i64 {
+        let db = match open_count_connection(&self.db_path) {
+            Some(db) => db,
+            None => return -1,
+        };
+        db.query_row(
+            "SELECT COUNT(*) FROM events WHERE share_scope = 'shared'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0)
+    }
+
     /// Count rows in the messages projection table (all, unscoped).
     pub fn message_count(&self) -> i64 {
-        let db = open_connection(&self.db_path).expect("failed to open db");
+        let db = match open_count_connection(&self.db_path) {
+            Some(db) => db,
+            None => return -1,
+        };
         db.query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
             .unwrap_or(0)
+    }
+
+    /// Count stored message events from canonical `events` by event_type.
+    /// Includes local and synced remote message events.
+    pub fn stored_message_event_count(&self) -> i64 {
+        let db = match open_count_connection(&self.db_path) {
+            Some(db) => db,
+            None => return -1,
+        };
+        db.query_row(
+            "SELECT COUNT(*) FROM events WHERE event_type = 'message'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0)
     }
 
     /// Count rows in the reactions projection table scoped to this peer.
@@ -813,7 +858,10 @@ impl Peer {
 
     /// Check if a specific event_id (base64) exists in the events table.
     pub fn has_event(&self, event_id_b64: &str) -> bool {
-        let db = open_connection(&self.db_path).expect("failed to open db");
+        let db = match open_count_connection(&self.db_path) {
+            Some(db) => db,
+            None => return false,
+        };
         db.query_row(
             "SELECT COUNT(*) > 0 FROM events WHERE event_id = ?1",
             rusqlite::params![event_id_b64],
@@ -2012,8 +2060,8 @@ pub async fn sync_until_converged<F: Fn() -> bool>(
     check: F,
     timeout: Duration,
 ) -> SyncMetrics {
-    let a_before = peer_a.store_count();
-    let b_before = peer_b.store_count();
+    let a_before = peer_a.shared_store_count();
+    let b_before = peer_b.shared_store_count();
 
     let start = Instant::now();
     let sync = start_peers_pinned(peer_a, peer_b);
@@ -2023,8 +2071,8 @@ pub async fn sync_until_converged<F: Fn() -> bool>(
     let wall_secs = start.elapsed().as_secs_f64();
     drop(sync);
 
-    let a_after = peer_a.store_count();
-    let b_after = peer_b.store_count();
+    let a_after = peer_a.shared_store_count();
+    let b_after = peer_b.shared_store_count();
     let events_transferred = ((a_after - a_before) + (b_after - b_before)) as u64;
     let bytes_transferred = events_transferred * 100;
     let events_per_sec = if wall_secs > 0.0 {

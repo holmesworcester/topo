@@ -45,19 +45,20 @@ fn compute_hop_delays(reach_ms: &[u64]) -> Vec<f64> {
     hop_delays
 }
 
-/// Wait until each peer reaches full store convergence and return per-peer
-/// convergence timestamps (ms since `start`) in peer order.
-async fn wait_for_full_convergence_times(
+/// Wait until each peer reaches full convergence on stored Message events and
+/// return per-peer convergence timestamps (ms since `start`) in peer order.
+async fn wait_for_full_stored_message_convergence_times(
     peers: &[Peer],
-    expected_store_count: i64,
+    expected_stored_message_count: i64,
     timeout: Duration,
     start: Instant,
 ) -> Vec<u64> {
     let mut reached: Vec<Option<u64>> = vec![None; peers.len()];
     loop {
         let elapsed_ms = start.elapsed().as_millis() as u64;
-        for (i, peer) in peers.iter().enumerate() {
-            if reached[i].is_none() && peer.store_count() == expected_store_count {
+        let counts: Vec<i64> = peers.iter().map(Peer::stored_message_event_count).collect();
+        for (i, count) in counts.iter().enumerate() {
+            if reached[i].is_none() && *count == expected_stored_message_count {
                 reached[i] = Some(elapsed_ms);
             }
         }
@@ -69,13 +70,12 @@ async fn wait_for_full_convergence_times(
                 .collect();
         }
 
-        let counts: Vec<i64> = peers.iter().map(Peer::store_count).collect();
         assert!(
             start.elapsed() < timeout,
-            "chain full convergence timed out after {:?}: counts={:?}, expected={}",
+            "chain stored-message convergence timed out after {:?}: stored_message_counts={:?}, expected={}",
             timeout,
             counts,
-            expected_store_count
+            expected_stored_message_count
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -89,10 +89,14 @@ fn percentile(sorted: &[f64], pct: f64) -> f64 {
     sorted[idx]
 }
 
-/// Print per-peer store counts for a chain.
-fn print_chain_counts(peers: &[Peer]) {
+/// Print per-peer stored message-event counts for a chain.
+fn print_chain_message_counts(peers: &[Peer]) {
     for (i, peer) in peers.iter().enumerate() {
-        eprintln!("  P{} store:         {}", i, peer.store_count());
+        eprintln!(
+            "  P{} stored messages: {}",
+            i,
+            peer.stored_message_event_count()
+        );
     }
 }
 
@@ -112,24 +116,20 @@ async fn run_chain_bench(n: usize, event_count: usize) {
     let gen_secs = gen_start.elapsed().as_secs_f64();
     eprintln!("Generated {} events at P0 in {:.2}s", event_count, gen_secs);
 
-    // Count-based convergence target: union of all pre-sync store IDs.
-    let expected_store_count = {
-        let mut ids = BTreeSet::new();
-        for peer in &peers {
-            ids.extend(peer.store_ids());
-        }
-        ids.len() as i64
-    };
+    // Convergence target on canonical stored Message events: all peers should
+    // eventually store the same message event set from P0.
+    let expected_stored_message_count = event_count as i64;
 
     let rss_before = peak_rss_mib();
     let start = Instant::now();
 
     let handles = start_chain(&peers);
 
-    // Count-only timing: convergence is measured from per-peer store_count.
-    let convergence_ms = wait_for_full_convergence_times(
+    // Count-only timing: convergence is measured from per-peer stored Message
+    // event counts (canonical events table, not local-scoped projection rows).
+    let convergence_ms = wait_for_full_stored_message_convergence_times(
         &peers,
-        expected_store_count,
+        expected_stored_message_count,
         Duration::from_secs(600),
         start,
     )
@@ -165,7 +165,7 @@ async fn run_chain_bench(n: usize, event_count: usize) {
         "  Peak RSS:         {:.1} MiB (before: {:.1})",
         rss_after, rss_before
     );
-    print_chain_counts(&peers);
+    print_chain_message_counts(&peers);
     eprintln!();
 }
 
@@ -220,12 +220,12 @@ async fn run_catchup_bench(source_count: usize, events_per_source: usize) {
         eprintln!("  Cloned to S1..S{}", source_count - 1);
     }
 
-    // Count-based convergence target: union of all source shared store IDs.
-    let expected_sink_ids: BTreeSet<String> = sources
+    // Convergence target: union of all source Message event IDs.
+    let expected_sink_message_ids: BTreeSet<String> = sources
         .iter()
-        .flat_map(|s| s.shared_store_ids().into_iter())
+        .flat_map(|s| s.event_ids_by_type("message").into_iter())
         .collect();
-    let expected_sink_count = expected_sink_ids.len() as i64;
+    let expected_sink_message_count = expected_sink_message_ids.len() as i64;
 
     let rss_before = peak_rss_mib();
     let start = Instant::now();
@@ -239,22 +239,25 @@ async fn run_catchup_bench(source_count: usize, events_per_source: usize) {
         120
     };
     assert_eventually(
-        || sink.store_count() == expected_sink_count,
+        || sink.stored_message_event_count() == expected_sink_message_count,
         Duration::from_secs(timeout_secs),
-        &format!("sink reaches expected store_count={}", expected_sink_count),
+        &format!(
+            "sink reaches expected stored_message_event_count={}",
+            expected_sink_message_count
+        ),
     )
     .await;
 
     let wall_ms = start.elapsed().as_millis() as u64;
     let rss_after = peak_rss_mib();
-    let events_per_sec = expected_sink_count as f64 / (wall_ms as f64 / 1000.0);
+    let events_per_sec = expected_sink_message_count as f64 / (wall_ms as f64 / 1000.0);
     let mb_per_sec = events_per_sec * 100.0 / 1_000_000.0;
 
-    // Exact set equality validates full dataset catchup (no marker shortcuts).
-    let sink_ids = sink.shared_store_ids();
+    // Exact set equality validates full message dataset catchup.
+    let sink_ids = sink.event_ids_by_type("message");
     assert_eq!(
-        sink_ids, expected_sink_ids,
-        "sink shared store IDs must match union of source shared store IDs"
+        sink_ids, expected_sink_message_ids,
+        "sink message IDs must match union of source message IDs"
     );
 
     drop(handles);
@@ -264,11 +267,11 @@ async fn run_catchup_bench(source_count: usize, events_per_source: usize) {
         "=== Multi-source catchup: {} sources x {} events (sink-driven rounds) ===",
         source_count, events_per_source,
     );
-    eprintln!("  Unique events:    {}", expected_sink_count);
+    eprintln!("  Unique messages:  {}", expected_sink_message_count);
     eprintln!("  Catchup wall:     {} ms", wall_ms);
     eprintln!("  Events/s:         {:.0}", events_per_sec);
     eprintln!("  MB/s:             {:.2}", mb_per_sec);
-    eprintln!("  Sink store:       {}", sink.store_count());
+    eprintln!("  Sink stored msgs: {}", sink.stored_message_event_count());
     eprintln!(
         "  Peak RSS:         {:.1} MiB (before: {:.1})",
         rss_after, rss_before

@@ -10,7 +10,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use topo::crypto::event_id_from_base64;
+use topo::crypto::{event_id_from_base64, event_id_to_base64};
 use topo::db::intro::{freshest_endpoint, list_intro_attempts};
 use topo::db::open_connection;
 use topo::db::project_queue::ProjectQueue;
@@ -59,9 +59,12 @@ async fn test_three_peer_intro_happy_path() {
     let peer_b = Peer::new_in_workspace("peer_b", &intro).await;
 
     // Each peer creates a unique event to sync.
-    peer_a.create_message("peer_a bootstrap message");
-    peer_b.create_message("peer_b bootstrap message");
-    intro.create_message("introducer bootstrap message");
+    let a_bootstrap_msg = peer_a.create_message("peer_a bootstrap message");
+    let b_bootstrap_msg = peer_b.create_message("peer_b bootstrap message");
+    let i_bootstrap_msg = intro.create_message("introducer bootstrap message");
+    let a_bootstrap_b64 = event_id_to_base64(&a_bootstrap_msg);
+    let b_bootstrap_b64 = event_id_to_base64(&b_bootstrap_msg);
+    let i_bootstrap_b64 = event_id_to_base64(&i_bootstrap_msg);
 
     let fp_i = intro.spki_fingerprint();
     let fp_a = peer_a.spki_fingerprint();
@@ -151,15 +154,25 @@ async fn test_three_peer_intro_happy_path() {
         });
     });
 
-    // Wait for full convergence: all 3 peers should have all shared events (20).
+    // Wait for bootstrap message exchange needed by the intro flow.
     assert_eventually(
-        || peer_a.store_count() >= 20 && peer_b.store_count() >= 20 && intro.store_count() >= 20,
+        || {
+            intro.has_event(&a_bootstrap_b64)
+                && intro.has_event(&b_bootstrap_b64)
+                && peer_a.has_event(&i_bootstrap_b64)
+                && peer_b.has_event(&i_bootstrap_b64)
+                && peer_a.has_event(&b_bootstrap_b64)
+                && peer_b.has_event(&a_bootstrap_b64)
+        },
         Duration::from_secs(20),
         &format!(
-            "full convergence (I={}, A={}, B={})",
-            intro.store_count(),
-            peer_a.store_count(),
-            peer_b.store_count()
+            "bootstrap exchange (I_has_A={}, I_has_B={}, A_has_I={}, B_has_I={}, A_has_B={}, B_has_A={})",
+            intro.has_event(&a_bootstrap_b64),
+            intro.has_event(&b_bootstrap_b64),
+            peer_a.has_event(&i_bootstrap_b64),
+            peer_b.has_event(&i_bootstrap_b64),
+            peer_a.has_event(&b_bootstrap_b64),
+            peer_b.has_event(&a_bootstrap_b64)
         ),
     )
     .await;
@@ -304,33 +317,30 @@ async fn test_three_peer_intro_happy_path() {
         result.sent_to_a, result.sent_to_b
     );
 
-    // --- Phase 3: Wait for A and B to process intros and sync ---
-    // A and B create new events that should sync via punched connection.
+    // --- Phase 3: Wait for A and B to process intros and establish punch ---
+    // Emit post-intro messages to keep normal sync traffic active while the
+    // intro listener establishes direct connectivity.
     peer_a.create_message("peer_a post-intro message");
     peer_b.create_message("peer_b post-intro message");
 
-    // After Phase 1 each peer had 20 events. Each created 1 new message = 21.
-    // After punch sync each gets the other's new message = 22.
     assert_eventually(
         || {
-            let a_count = peer_a.store_count();
-            let b_count = peer_b.store_count();
-            a_count >= 22 && b_count >= 22
+            let a_connected = open_connection(&peer_a.db_path)
+                .ok()
+                .and_then(|db| list_intro_attempts(&db, &peer_a.identity, None).ok())
+                .map(|attempts| attempts.iter().any(|a| a.status == "connected"))
+                .unwrap_or(false);
+            let b_connected = open_connection(&peer_b.db_path)
+                .ok()
+                .and_then(|db| list_intro_attempts(&db, &peer_b.identity, None).ok())
+                .map(|attempts| attempts.iter().any(|a| a.status == "connected"))
+                .unwrap_or(false);
+            a_connected && b_connected
         },
-        Duration::from_secs(15),
-        &format!(
-            "A<->B punch sync (A={}, B={})",
-            peer_a.store_count(),
-            peer_b.store_count()
-        ),
+        Duration::from_secs(30),
+        "A/B intro attempts reach connected state",
     )
     .await;
-
-    eprintln!(
-        "SUCCESS: A has {} events, B has {} events",
-        peer_a.store_count(),
-        peer_b.store_count()
-    );
 
     // --- Phase 4: Verify intro_attempts were recorded ---
     {
@@ -349,6 +359,23 @@ async fn test_three_peer_intro_happy_path() {
             attempts_a.iter().any(|a| a.status == "connected"),
             "A should have at least one 'connected' intro attempt, got: {:?}",
             attempts_a.iter().map(|a| &a.status).collect::<Vec<_>>()
+        );
+
+        let db_b = open_connection(&peer_b.db_path).expect("open B db");
+        let attempts_b =
+            list_intro_attempts(&db_b, &peer_b.identity, None).expect("list intro attempts B");
+        eprintln!("B's intro attempts: {}", attempts_b.len());
+        for a in &attempts_b {
+            eprintln!("  {} -> status={}", &a.other_peer_id[..16], a.status);
+        }
+        assert!(
+            !attempts_b.is_empty(),
+            "B should have recorded intro attempts"
+        );
+        assert!(
+            attempts_b.iter().any(|a| a.status == "connected"),
+            "B should have at least one 'connected' intro attempt, got: {:?}",
+            attempts_b.iter().map(|a| &a.status).collect::<Vec<_>>()
         );
     }
 

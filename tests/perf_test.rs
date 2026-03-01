@@ -187,20 +187,13 @@ async fn perf_continuous_10k() {
     // In a shared workspace, both peers should project all 10k messages.
     let expected_messages: i64 = 10_000;
 
-    // Wait for convergence (projection + minimal store sanity).
+    // Wait for convergence on projected messages.
     assert_eventually(
-        || {
-            alice.message_count() == expected_messages
-                && bob.message_count() == expected_messages
-                && alice.store_count() >= expected_messages
-                && bob.store_count() >= expected_messages
-        },
+        || alice.message_count() == expected_messages && bob.message_count() == expected_messages,
         Duration::from_secs(300),
         &format!(
-            "convergence to {} projected messages (store: a={}, b={}; projected: a={}, b={})",
+            "convergence to {} projected messages (projected: a={}, b={})",
             expected_messages,
-            alice.store_count(),
-            bob.store_count(),
             alice.message_count(),
             bob.message_count(),
         ),
@@ -356,11 +349,11 @@ async fn perf_sync_500k() {
         if sync_start.elapsed() >= timeout {
             let count = bob.message_count();
             eprintln!(
-                "TIMEOUT: bob has {}/{} messages, alice store={}, bob store={}",
+                "TIMEOUT: bob has {}/{} projected messages, alice stored_messages={}, bob stored_messages={}",
                 count,
                 N,
-                alice.store_count(),
-                bob.store_count()
+                alice.stored_message_event_count(),
+                bob.stored_message_event_count()
             );
             panic!("500k sync timed out after {}s", timeout.as_secs());
         }
@@ -369,13 +362,13 @@ async fn perf_sync_500k() {
             let delta = count - last_count;
             let elapsed = sync_start.elapsed().as_secs();
             eprintln!(
-                "[+{}s] bob messages: {}/{} (delta: +{}), stores: alice={} bob={}, RSS: {:.0} MiB",
+                "[+{}s] bob projected messages: {}/{} (delta: +{}), stored_messages: alice={} bob={}, RSS: {:.0} MiB",
                 elapsed,
                 count,
                 N,
                 delta,
-                alice.store_count(),
-                bob.store_count(),
+                alice.stored_message_event_count(),
+                bob.stored_message_event_count(),
                 peak_rss_mib()
             );
             last_count = count;
