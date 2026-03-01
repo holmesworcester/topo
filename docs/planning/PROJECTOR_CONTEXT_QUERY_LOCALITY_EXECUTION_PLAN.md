@@ -26,7 +26,7 @@ Replace the current ad hoc centralized projector-context assembly with a princip
 
 Projector context is currently built in one central function:
 
-- `src/state/projection_state/apply/context.rs::build_context_snapshot`
+- `src/state/projection/apply/context.rs::build_context_snapshot`
 
 This file currently mixes projector-specific context reads across event modules.
 
@@ -92,7 +92,7 @@ Success criteria:
 
 ### Phase 3: Remove/Collapse Legacy Central Context Assembly
 
-1. Delete or reduce `src/state/projection_state/apply/context.rs` so it no longer owns projector-specific context assembly.
+1. Delete or reduce `src/state/projection/apply/context.rs` so it no longer owns projector-specific context assembly.
 2. Keep only truly pipeline-shared concerns in shared pipeline modules.
 
 Success criteria:

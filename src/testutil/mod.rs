@@ -2953,7 +2953,7 @@ mod fingerprint_tests {
     }
 
     #[test]
-    fn fingerprint_changes_with_projection_state() {
+    fn fingerprint_changes_with_projection() {
         let (_dir, _path, db) = fresh_db();
         let peer_id = "fp-test-peer";
 

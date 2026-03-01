@@ -11,7 +11,7 @@ pub use runtime::transport;
 pub use shared::{contracts, crypto, protocol, tuning};
 pub use state::db;
 pub use state::pipeline as event_pipeline;
-pub use state::projection_state as projection;
+pub use state::projection;
 
 #[cfg(test)]
 mod boundary_tests {

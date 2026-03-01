@@ -18,8 +18,8 @@ Method:
    - `codex exec -C /home/holmes/poc-7-projector-context-query-locality-instructions "Review this branch against docs/planning/PROJECTOR_CONTEXT_QUERY_LOCALITY_EXECUTION_PLAN.md ..."`
    - Both attempts failed due upstream stream disconnect (`error sending request for url (https://chatgpt.com/backend-api/codex/responses)`).
 2. Performed manual same-branch review with command evidence:
-   - `rg -n "build_context_snapshot|mod context;|context_loader\)\(" src/state/projection_state/apply`
-   - `test ! -f src/state/projection_state/apply/context.rs`
+   - `rg -n "build_context_snapshot|mod context;|context_loader\)\(" src/state/projection/apply`
+   - `test ! -f src/state/projection/apply/context.rs`
    - `rg -n "build_projector_context\(" src/event_modules`
    - `rg -n "EventTypeMeta\s*\{" src/event_modules | wc -l`
    - `rg -n "context_loader:" src/event_modules | wc -l`
@@ -31,7 +31,7 @@ No High or Medium findings.
 Notes:
 - `EventTypeMeta` literals and `context_loader` fields are count-aligned (`27` and `27`).
 - Shared apply path calls `meta.context_loader` and no longer references central `build_context_snapshot`.
-- `src/state/projection_state/apply/context.rs` is removed.
+- `src/state/projection/apply/context.rs` is removed.
 
 ## Acceptance
 

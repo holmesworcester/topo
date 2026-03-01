@@ -174,7 +174,7 @@ Completion invariants:
 Transport identity is derived from event-layer peer identity:
 
 1. **Transport identity** (mTLS scope): cert/key material, SPKI fingerprints, `peer_id` derived from BLAKE2b-256 of X.509 SPKI. Managed by `src/runtime/transport/identity.rs` via `src/runtime/transport/identity_adapter.rs`.
-2. **Event-graph identity** (identity layer scope): Ed25519 keys, signer chains, trust anchors, and identity events (types 8-22). Owned by event modules (for example `src/event_modules/workspace/*`, `src/event_modules/invite_accepted.rs`, `src/event_modules/peer_shared/*`, `src/event_modules/local_signer_secret.rs`) and executed through the generic projection pipeline (`src/state/projection_state/apply/*`).
+2. **Event-graph identity** (identity layer scope): Ed25519 keys, signer chains, trust anchors, and identity events (types 8-22). Owned by event modules (for example `src/event_modules/workspace/*`, `src/event_modules/invite_accepted.rs`, `src/event_modules/peer_shared/*`, `src/event_modules/local_signer_secret.rs`) and executed through the generic projection pipeline (`src/state/projection/apply/*`).
 
 Transport certs are deterministically derived from PeerShared Ed25519 signing keys, so the two identity scopes are unified. All transport trust is derived from PeerShared Ed25519 public keys via `spki_fingerprint_from_ed25519_pubkey()`.
 
@@ -1167,8 +1167,8 @@ Projector-spec mapping: each Rust projector predicate maps to a named TLA guard.
 Tests are organized into three layers, each exercising a different scope of the TLA+ conformance contract:
 
 1. **Projector unit** (`tests/projectors/*_projector_tests.rs`) — pure function contract. Each test calls `project_pure(event, ctx)` directly with a hand-built `ContextSnapshot` and asserts decision, write_ops, and emit_commands. Covers event-local predicates (trust anchor, signer mismatch, deletion author, bootstrap trust emission, file slice auth).
-2. **Pipeline integration** (`src/state/projection_state/apply/tests/`) — shared pipeline stages. Tests exercise `project_one_step` end-to-end through dep presence, dep type checks, signer resolution, encrypted wrapper decrypt/dispatch, and cascade unblock. Uses a real SQLite DB with the full projection pipeline.
-3. **Replay/order conformance** (`src/state/projection_state/apply/tests/`) — model-critical convergence properties. Source-isomorphism tests replay the same events in different orderings and assert identical terminal state. Covers out-of-order convergence, idempotent replay, stable terminal state, and deletion two-stage convergence.
+2. **Pipeline integration** (`src/state/projection/apply/tests/`) — shared pipeline stages. Tests exercise `project_one_step` end-to-end through dep presence, dep type checks, signer resolution, encrypted wrapper decrypt/dispatch, and cascade unblock. Uses a real SQLite DB with the full projection pipeline.
+3. **Replay/order conformance** (`src/state/projection/apply/tests/`) — model-critical convergence properties. Source-isomorphism tests replay the same events in different orderings and assert identical terminal state. Covers out-of-order convergence, idempotent replay, stable terminal state, and deletion two-stage convergence.
 
 Coverage is tracked in `docs/tla/projector_conformance_matrix.md` (spec_id → check_id → test_id with pass/break polarity) and enforced by CI gate scripts (`scripts/check_projector_tla_conformance.py`, `scripts/check_projector_tla_bijection.py`).
 
@@ -1464,7 +1464,7 @@ some event types may remain single-file under `src/event_modules/<type>.rs`.
 5. **Queries** — `list()`, `count()`, `resolve()`, `list_for_message_with_authors()`, etc. — SQL against projection tables scoped by `recorded_by`. All event-specific SQL lives here.
 6. **Response types** — serializable structs for the event domain (e.g. `MessageItem`, `MessagesResponse`, `SendResponse`). Owned by the event module, re-exported by `src/runtime/control/service.rs` for external callers.
 
-The projection pipeline (`src/state/projection_state/apply/`) is orchestration-only:
+The projection pipeline (`src/state/projection/apply/`) is orchestration-only:
 
 - Dependency presence check + block row writes
 - Dependency type enforcement
@@ -1592,11 +1592,11 @@ This appendix holds concrete Rust file/module references so conceptual sections 
 
 ## 15.1 Projection pipeline map
 
-1. Canonical entrypoint: `src/state/projection_state/apply/project_one.rs`
-2. Dependency and signer stages: `src/state/projection_state/apply/stages.rs`
+1. Canonical entrypoint: `src/state/projection/apply/project_one.rs`
+2. Dependency and signer stages: `src/state/projection/apply/stages.rs`
 3. Module-owned context loaders: `src/event_modules/*/(queries.rs|projector.rs)` via `EventTypeMeta.context_loader`
-4. Write/emit executor: `src/state/projection_state/apply/write_exec.rs`
-5. Cascade scheduler: `src/state/projection_state/apply/cascade.rs`
+4. Write/emit executor: `src/state/projection/apply/write_exec.rs`
+5. Cascade scheduler: `src/state/projection/apply/cascade.rs`
 6. Batch writer orchestration: `src/state/pipeline/mod.rs`
 7. Pipeline persist/planner/effects: `src/state/pipeline/phases.rs`, `src/state/pipeline/planner.rs`, `src/state/pipeline/effects.rs`
 

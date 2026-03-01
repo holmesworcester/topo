@@ -12,7 +12,7 @@ Worktree: `/home/holmes/poc-7-projector-context-query-locality-instructions`
 | Phase 0: Baseline + safety net command set | PASS | Required command set executed and recorded below; no undocumented failures. |
 | Phase 1: Context loader contract | PASS | `EventTypeMeta.context_loader` added in `src/event_modules/registry.rs`; default `load_empty_context` provided. |
 | Phase 2: Module-local projector context ownership | PASS | `build_projector_context(...)` implemented in target modules (`workspace`, `invite_accepted`, `user_invite`, `device_invite`, `message`, `message_deletion`, `reaction`, `secret_shared`, `file_slice`). |
-| Phase 3: Legacy central context assembly removed | PASS | `src/state/projection_state/apply/context.rs` deleted; apply path now invokes `meta.context_loader` in `src/state/projection_state/apply/stages.rs`. |
+| Phase 3: Legacy central context assembly removed | PASS | `src/state/projection/apply/context.rs` deleted; apply path now invokes `meta.context_loader` in `src/state/projection/apply/stages.rs`. |
 | Phase 4: Tests and conformance | PASS | All required checks below passed. |
 | Phase 5: PLAN + DESIGN sync | PASS | `docs/PLAN.md` and `docs/DESIGN.md` updated to reflect module-owned context query model and pipeline boundary. |
 | Phase 6: Review and acceptance | PASS | Review artifact at `docs/planning/PROJECTOR_CONTEXT_QUERY_LOCALITY_FEEDBACK.md` records explicit acceptance with no unresolved High/Medium findings. |
@@ -86,8 +86,8 @@ All targeted commands completed successfully (no test failures).
 Commands:
 
 ```bash
-rg -n "build_context_snapshot|mod context;|context_loader\)\(" src/state/projection_state/apply
-test ! -f src/state/projection_state/apply/context.rs && echo "context.rs deleted: PASS"
+rg -n "build_context_snapshot|mod context;|context_loader\)\(" src/state/projection/apply
+test ! -f src/state/projection/apply/context.rs && echo "context.rs deleted: PASS"
 rg -n "build_projector_context\(" src/event_modules
 rg -n "EventTypeMeta\s*\{" src/event_modules | wc -l
 rg -n "context_loader:" src/event_modules | wc -l

@@ -47,7 +47,7 @@ src/
 ├── state/
 │   ├── db/
 │   ├── pipeline/
-│   └── projection_state/
+│   └── projection/
 │       └── apply/
 │           └── tests/
 └── testutil/
@@ -72,7 +72,7 @@ src/
 - `src/transport/*` -> `src/runtime/transport/*`
 - `src/sync/*` -> `src/runtime/sync_engine/*`
 - `src/event_pipeline/*` -> `src/state/pipeline/*`
-- `src/projection/*` -> `src/state/projection_state/*`
+- `src/projection/*` -> `src/state/projection/*`
 - `src/db/*` -> `src/state/db/*`
 - `src/contracts/*` -> `src/shared/contracts/*`
 - `src/crypto/*` -> `src/shared/crypto/*`
