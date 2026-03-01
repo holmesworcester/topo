@@ -159,7 +159,7 @@ both `pass` and `break` polarity unless waived.
 | SPEC_TCL_TRUST_UNION_01 | InvTrustSetIsExactUnion | CHK_TCL_TRUST_UNION | transport_credential | apply::tests::test_signed_content_events_project_with_identity_chain | pass |
 | SPEC_TCL_TRUST_UNION_01 | InvTrustSetIsExactUnion | CHK_TCL_TRUST_UNION | runtime_unit | state::db::transport_trust::tests::test_is_peer_allowed_checks_all_sources | break |
 | SPEC_TCL_SOURCES_01 | InvTrustSourcesWellFormed | CHK_TCL_SOURCES_FORMED | transport_credential | apply::tests::test_signed_content_events_project_with_identity_chain | pass |
-| SPEC_TCL_SOURCES_01 | InvTrustSourcesWellFormed | CHK_TCL_SOURCES_FORMED | runtime_unit | state::db::transport_trust::tests::test_trusted_peer_count_ignores_malformed_rows | break |
+| SPEC_TCL_SOURCES_01 | InvTrustSourcesWellFormed | CHK_TCL_SOURCES_FORMED | runtime_unit | state::db::transport_trust::tests::test_allowed_peers_count_ignores_malformed_rows | break |
 | SPEC_TCL_MUTUAL_01 | InvMutualAuthSymmetry | CHK_TCL_MUTUAL_AUTH | transport_credential | apply::tests::test_signed_content_events_project_with_identity_chain | pass |
 | SPEC_TCL_MUTUAL_01 | InvMutualAuthSymmetry | CHK_TCL_MUTUAL_AUTH | runtime_unit | state::db::transport_trust::tests::test_mutual_trust_requires_both_sides | break |
 | SPEC_TCL_MEMBERS_01 | InvTrustedPeerSetMembers | CHK_TCL_TRUSTED_MEMBERS | transport_credential | apply::tests::test_signed_content_events_project_with_identity_chain | pass |

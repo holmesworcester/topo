@@ -3245,7 +3245,7 @@ async fn test_device_link_via_sync() {
     // Phone bootstraps full identity chain
     let phone_chain = bootstrap_peer(&phone);
 
-    // Phone creates a DeviceInviteOngoing for Laptop (signed by Phone's User key)
+    // Phone creates a DeviceInviteOngoing for Laptop (signed by Phone's PeerShared key)
     let laptop_di_key = ed25519_dalek::SigningKey::generate(&mut rng);
     let laptop_di_pubkey = laptop_di_key.verifying_key().to_bytes();
     let db = open_connection(&phone.db_path).unwrap();
@@ -3255,12 +3255,12 @@ async fn test_device_link_via_sync() {
             .unwrap()
             .as_millis() as u64,
         public_key: laptop_di_pubkey,
-        signed_by: phone_chain.user_eid,
-        signer_type: 4,
+        signed_by: phone_chain.peer_shared_eid,
+        signer_type: 5,
         signature: [0u8; 64],
     });
     let laptop_di_eid =
-        create_signed_event_synchronous(&db, &phone.identity, &di_evt, &phone_chain.user_key)
+        create_signed_event_synchronous(&db, &phone.identity, &di_evt, &phone_chain.peer_shared_key)
             .expect("create device_invite_ongoing");
     drop(db);
 

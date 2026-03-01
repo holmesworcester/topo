@@ -561,7 +561,7 @@
     }
 
     #[test]
-    fn test_trusted_peer_count() {
+    fn test_allowed_peers_count() {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
 
@@ -600,7 +600,7 @@
     }
 
     #[test]
-    fn test_trusted_peer_count_dedupes_overlap_across_sources() {
+    fn test_allowed_peers_count_dedupes_overlap_across_sources() {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
 
@@ -675,7 +675,7 @@
     }
 
     #[test]
-    fn test_trusted_peer_count_ignores_malformed_rows() {
+    fn test_allowed_peers_count_ignores_malformed_rows() {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
 
