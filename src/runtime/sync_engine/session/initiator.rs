@@ -24,6 +24,7 @@ use crate::runtime::SyncStats;
 use crate::sync::negentropy_sqlite::NegentropyStorageSqlite;
 use crate::transport::connection::ConnectionError;
 use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
+use crate::tuning::low_mem_mode;
 
 use super::control_plane::{
     append_have_ids_to_pending, dispatch_assigned_events, dispatch_owned_need_ids,
@@ -79,6 +80,7 @@ where
 
     let db = open_connection(db_path)?;
     let neg_db = open_connection(db_path)?;
+    let use_snapshot = !low_mem_mode();
 
     let egress = EgressQueue::new(&db);
     let wanted = WantedEvents::new(&db);
@@ -89,9 +91,11 @@ where
         .ok_or_else(|| format!("no trust anchor for peer_id={}, cannot start sync", recorded_by))?;
     let neg_storage = NegentropyStorageSqlite::new(&neg_db, &ws_id);
 
-    neg_db
-        .execute("BEGIN", [])
-        .map_err(|e| format!("Failed to begin snapshot: {}", e))?;
+    if use_snapshot {
+        neg_db
+            .execute("BEGIN", [])
+            .map_err(|e| format!("Failed to begin snapshot: {}", e))?;
+    }
     neg_storage
         .rebuild_blocks()
         .map_err(|e| format!("Failed to rebuild blocks: {}", e))?;
@@ -280,7 +284,9 @@ where
         let _ = wanted.clear();
         let _ = egress.cleanup_sent(EGRESS_SENT_TTL_MS);
     }
-    let _ = neg_db.execute("COMMIT", []);
+    if use_snapshot {
+        let _ = neg_db.execute("COMMIT", []);
+    }
 
     // Wait for inbound data drain: data receiver exits on peer's DataDone.
     if completed {

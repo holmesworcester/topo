@@ -239,13 +239,14 @@ Run:
 
 ### Low-Memory Budget (`low_mem_test.rs`)
 
-Verifies sync stays within iOS NSE memory budget (24 MiB per instance, 48 MiB process).
-`LOW_MEM_IOS=1` enabled. Pass/fail only — no throughput metrics.
+`low_mem_test.rs` is an in-process sanity suite (both peers in one process).
+Authoritative budget gating uses `scripts/run_lowmem_regimen.sh`, which runs
+two separate daemon processes and enforces per-daemon peak RSS (VmHWM) against
+the 24 MiB target.
 
-- **10k smoke**: PASS (2 peers, 5k each)
-- **1M soak** (`#[ignore]`): long-running hardening test
-- **Recommended regular large run**: execute soak test at 100k with stricter timeout/budget, e.g.
-  `LOW_MEM_IOS_SOAK_EVENTS=100000 LOW_MEM_IOS_SOAK_BUDGET_MIB=24 cargo test --release --test low_mem_test low_mem_ios_budget_soak_million -- --ignored --nocapture`
+- **Regimen smoke (10k total, 5k/peer)**: currently fails 24 MiB per-daemon target (~30-38 MiB peaks)
+- **Regimen soak (100k one-way)**: currently fails 24 MiB per-daemon target (~39 MiB sender, ~85 MiB receiver)
+- **Standard command**: `scripts/run_lowmem_regimen.sh soak`
 
 On low-memory catchup strategy:
 1. Current path already keeps memory bounded mostly by connection/cache/channel limits; larger history should increase wall time more than RSS.

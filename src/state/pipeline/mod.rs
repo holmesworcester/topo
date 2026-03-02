@@ -16,7 +16,7 @@ use crate::db::store::{
     lookup_workspace_id, SQL_INSERT_EVENT, SQL_INSERT_NEG_ITEM, SQL_INSERT_RECORDED_EVENT,
 };
 use crate::event_modules::registry;
-use crate::tuning::{drain_batch_size, write_batch_cap};
+use crate::tuning::{drain_batch_size, low_mem_mode, write_batch_cap};
 
 use self::effects::{
     run_post_commit_effects, PostCommitEffectsExecutor, SqlitePostCommitEffectsExecutor,
@@ -47,7 +47,62 @@ fn commit_and_run_post_commit_effects<E: PostCommitEffectsExecutor>(
     batch_size: usize,
 ) -> rusqlite::Result<()> {
     db.execute("COMMIT", [])?;
+    enforce_low_mem_wal_cap(db)?;
     run_post_commit_effects(effects_executor, persist_output, batch_size);
+    Ok(())
+}
+
+fn low_mem_wal_cap_bytes() -> i64 {
+    const DEFAULT_CAP_MIB: i64 = 12;
+    let cap_mib = std::env::var("LOW_MEM_WAL_CAP_MIB")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_CAP_MIB);
+    cap_mib * 1024 * 1024
+}
+
+fn wal_checkpoint_stats(
+    db: &rusqlite::Connection,
+    mode: &str,
+) -> rusqlite::Result<(i64, i64, i64)> {
+    db.query_row(&format!("PRAGMA wal_checkpoint({mode})"), [], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+    })
+}
+
+fn enforce_low_mem_wal_cap(db: &rusqlite::Connection) -> rusqlite::Result<()> {
+    if !low_mem_mode() {
+        return Ok(());
+    }
+
+    let page_size: i64 = db.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+    let cap_bytes = low_mem_wal_cap_bytes();
+    let (_, log_frames, _) = wal_checkpoint_stats(db, "PASSIVE")?;
+    let wal_bytes = log_frames.saturating_mul(page_size);
+    if wal_bytes <= cap_bytes {
+        return Ok(());
+    }
+
+    tracing::warn!(
+        wal_bytes,
+        cap_bytes,
+        log_frames,
+        "low-mem WAL above cap; forcing TRUNCATE checkpoint"
+    );
+    let _ = wal_checkpoint_stats(db, "TRUNCATE")?;
+
+    let (_, post_frames, _) = wal_checkpoint_stats(db, "PASSIVE")?;
+    let post_bytes = post_frames.saturating_mul(page_size);
+    if post_bytes > cap_bytes {
+        tracing::warn!(
+            wal_bytes = post_bytes,
+            cap_bytes,
+            log_frames = post_frames,
+            "low-mem WAL still above cap after TRUNCATE (likely active reader)"
+        );
+    }
+
     Ok(())
 }
 

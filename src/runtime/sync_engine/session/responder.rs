@@ -25,6 +25,7 @@ use crate::runtime::SyncStats;
 use crate::sync::negentropy_sqlite::NegentropyStorageSqlite;
 use crate::transport::connection::ConnectionError;
 use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
+use crate::tuning::low_mem_mode;
 
 use super::control_plane::send_done_ack;
 use super::data_plane::{drain_egress_to_data_stream, send_data_done, spawn_data_receiver};
@@ -65,6 +66,7 @@ where
     );
 
     let db = open_connection(db_path)?;
+    let use_snapshot = !low_mem_mode();
 
     let egress = EgressQueue::new(&db);
     let _ = egress.clear_connection(peer_id);
@@ -84,7 +86,9 @@ where
     let neg_worker = std::thread::spawn(move || {
         let neg_db = open_connection(&db_path_for_neg).expect("neg worker: open_connection");
         let neg_storage = NegentropyStorageSqlite::new(&neg_db, &ws_id_for_neg);
-        neg_db.execute("BEGIN", []).expect("neg worker: BEGIN");
+        if use_snapshot {
+            neg_db.execute("BEGIN", []).expect("neg worker: BEGIN");
+        }
         neg_storage
             .rebuild_blocks()
             .expect("neg worker: rebuild_blocks");
@@ -102,7 +106,9 @@ where
             }
         }
 
-        let _ = neg_db.execute("COMMIT", []);
+        if use_snapshot {
+            let _ = neg_db.execute("COMMIT", []);
+        }
     });
 
     let store = Store::new(&db);

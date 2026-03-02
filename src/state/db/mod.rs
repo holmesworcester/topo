@@ -37,7 +37,7 @@ fn apply_pragmas(conn: &Connection) -> SqliteResult<()> {
             PRAGMA cache_size = -1024;
             PRAGMA temp_store = FILE;
             PRAGMA mmap_size = 0;
-            PRAGMA wal_autocheckpoint = 1000;
+            PRAGMA wal_autocheckpoint = 256;
             PRAGMA journal_size_limit = 1048576;
             PRAGMA busy_timeout = 5000;
             PRAGMA foreign_keys = OFF;
