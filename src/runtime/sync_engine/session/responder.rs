@@ -235,8 +235,9 @@ where
             let ingest_used = ingest_cap.saturating_sub(ingest_tx.capacity());
             let sqlite_global = memtrace::sqlite_global_memory();
             let sqlite_db = memtrace::sqlite_db_memory(&db);
+            let allocator = memtrace::allocator_memory();
             let line = format!(
-                "LOWMEM_MEMTRACE responder peer={} rounds={} reconciling={} peer_done={} egress_pending={} ingest_used={}/{} sqlite_mem_cur={} sqlite_mem_high={} sqlite_pcache_ovfl_cur={} sqlite_pcache_ovfl_high={} db_cache={} db_schema={} db_stmt={} bytes_rx={} bytes_tx={}",
+                "LOWMEM_MEMTRACE responder peer={} rounds={} reconciling={} peer_done={} egress_pending={} ingest_used={}/{} sqlite_mem_cur={} sqlite_mem_high={} sqlite_pcache_ovfl_cur={} sqlite_pcache_ovfl_high={} db_cache={} db_schema={} db_stmt={} mall_arena={} mall_used={} mall_free={} mall_mmap={} bytes_rx={} bytes_tx={}",
                 peer_id,
                 rounds,
                 reconciling,
@@ -255,6 +256,10 @@ where
                 sqlite_db.map(|s| s.cache_used_bytes).unwrap_or(-1),
                 sqlite_db.map(|s| s.schema_used_bytes).unwrap_or(-1),
                 sqlite_db.map(|s| s.stmt_used_bytes).unwrap_or(-1),
+                allocator.map(|s| s.arena_bytes).unwrap_or(-1),
+                allocator.map(|s| s.used_bytes).unwrap_or(-1),
+                allocator.map(|s| s.free_bytes).unwrap_or(-1),
+                allocator.map(|s| s.mmap_bytes).unwrap_or(-1),
                 bytes_received.load(Ordering::Relaxed),
                 bytes_sent,
             );

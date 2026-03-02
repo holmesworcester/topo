@@ -2195,6 +2195,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "igd-next",
+ "libc",
  "mdns-sd",
  "negentropy",
  "nom",

@@ -37,6 +37,14 @@ pub struct SqliteGlobalMemStats {
     pub pagecache_overflow_high_bytes: i64,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AllocatorMemStats {
+    pub arena_bytes: i64,
+    pub used_bytes: i64,
+    pub free_bytes: i64,
+    pub mmap_bytes: i64,
+}
+
 fn read_db_status(db: *mut ffi::sqlite3, op: i32) -> Option<(i64, i64)> {
     let mut current = 0;
     let mut highwater = 0;
@@ -90,4 +98,21 @@ pub fn sqlite_global_memory() -> Option<SqliteGlobalMemStats> {
         pagecache_overflow_bytes,
         pagecache_overflow_high_bytes,
     })
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub fn allocator_memory() -> Option<AllocatorMemStats> {
+    // SAFETY: mallinfo2 is a read-only process allocator statistics query.
+    let stats = unsafe { libc::mallinfo2() };
+    Some(AllocatorMemStats {
+        arena_bytes: i64::try_from(stats.arena).ok()?,
+        used_bytes: i64::try_from(stats.uordblks).ok()?,
+        free_bytes: i64::try_from(stats.fordblks).ok()?,
+        mmap_bytes: i64::try_from(stats.hblkhd).ok()?,
+    })
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+pub fn allocator_memory() -> Option<AllocatorMemStats> {
+    None
 }

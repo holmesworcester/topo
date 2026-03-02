@@ -230,6 +230,10 @@ MAX_INIT_DB_NEG_STMT=0
 MAX_RESP_DB_CACHE=0
 MAX_RESP_DB_SCHEMA=0
 MAX_RESP_DB_STMT=0
+MAX_MALL_ARENA=0
+MAX_MALL_USED=0
+MAX_MALL_FREE=0
+MAX_MALL_MMAP=0
 EOF
     return 0
   fi
@@ -280,6 +284,14 @@ EOF
           split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_init_db_neg_schema) max_init_db_neg_schema = a[2]
         } else if ($i ~ /^db_neg_stmt=/) {
           split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_init_db_neg_stmt) max_init_db_neg_stmt = a[2]
+        } else if ($i ~ /^mall_arena=/) {
+          split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_mall_arena) max_mall_arena = a[2]
+        } else if ($i ~ /^mall_used=/) {
+          split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_mall_used) max_mall_used = a[2]
+        } else if ($i ~ /^mall_free=/) {
+          split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_mall_free) max_mall_free = a[2]
+        } else if ($i ~ /^mall_mmap=/) {
+          split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_mall_mmap) max_mall_mmap = a[2]
         }
       }
     }
@@ -306,6 +318,14 @@ EOF
           split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_resp_db_schema) max_resp_db_schema = a[2]
         } else if ($i ~ /^db_stmt=/) {
           split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_resp_db_stmt) max_resp_db_stmt = a[2]
+        } else if ($i ~ /^mall_arena=/) {
+          split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_mall_arena) max_mall_arena = a[2]
+        } else if ($i ~ /^mall_used=/) {
+          split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_mall_used) max_mall_used = a[2]
+        } else if ($i ~ /^mall_free=/) {
+          split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_mall_free) max_mall_free = a[2]
+        } else if ($i ~ /^mall_mmap=/) {
+          split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_mall_mmap) max_mall_mmap = a[2]
         }
       }
     }
@@ -356,6 +376,10 @@ EOF
       printf "MAX_RESP_DB_CACHE=%d\n", max_resp_db_cache
       printf "MAX_RESP_DB_SCHEMA=%d\n", max_resp_db_schema
       printf "MAX_RESP_DB_STMT=%d\n", max_resp_db_stmt
+      printf "MAX_MALL_ARENA=%d\n", max_mall_arena
+      printf "MAX_MALL_USED=%d\n", max_mall_used
+      printf "MAX_MALL_FREE=%d\n", max_mall_free
+      printf "MAX_MALL_MMAP=%d\n", max_mall_mmap
     }
   ' "${memtrace_log}" > "${out_file}"
 }
@@ -530,8 +554,12 @@ EOF
     anon_pct=0
   fi
 
-  local sqlite_mem_kb anon_minus_sqlite_kb
+  local sqlite_mem_kb mall_arena_kb mall_used_kb mall_free_kb mall_mmap_kb anon_minus_sqlite_kb
   sqlite_mem_kb=$(( (MAX_SQLITE_MEM_CUR + 1023) / 1024 ))
+  mall_arena_kb=$(( (MAX_MALL_ARENA + 1023) / 1024 ))
+  mall_used_kb=$(( (MAX_MALL_USED + 1023) / 1024 ))
+  mall_free_kb=$(( (MAX_MALL_FREE + 1023) / 1024 ))
+  mall_mmap_kb=$(( (MAX_MALL_MMAP + 1023) / 1024 ))
   anon_minus_sqlite_kb=$(( max_anon - sqlite_mem_kb ))
   if [ "${anon_minus_sqlite_kb}" -lt 0 ]; then
     anon_minus_sqlite_kb=0
@@ -589,6 +617,10 @@ EOF
     echo "MAX_RESP_DB_CACHE=${MAX_RESP_DB_CACHE}"
     echo "MAX_RESP_DB_SCHEMA=${MAX_RESP_DB_SCHEMA}"
     echo "MAX_RESP_DB_STMT=${MAX_RESP_DB_STMT}"
+    echo "MAX_MALL_ARENA=${MAX_MALL_ARENA}"
+    echo "MAX_MALL_USED=${MAX_MALL_USED}"
+    echo "MAX_MALL_FREE=${MAX_MALL_FREE}"
+    echo "MAX_MALL_MMAP=${MAX_MALL_MMAP}"
     echo "MAX_BOB_ANON_MINUS_SQLITE_KB=${anon_minus_sqlite_kb}"
   } > "${summary_file}"
 
@@ -601,6 +633,7 @@ EOF
   echo "2) SQLite tracked heap (process-global): ${MAX_SQLITE_MEM_CUR} bytes (~${sqlite_mem_kb} KB)"
   echo "3) Receiver anon minus tracked SQLite heap: ${anon_minus_sqlite_kb} KB"
   echo "3a) Anon breakdown (unlabeled/heap/stack/named/[bracket-other]): ${max_anon_unlabeled}/${max_anon_heap}/${max_anon_stack}/${max_anon_named}/${max_anon_other_bracket} KB"
+  echo "3b) glibc allocator (arena/used/free/mmap): ${mall_arena_kb}/${mall_used_kb}/${mall_free_kb}/${mall_mmap_kb} KB"
   if [ "${MAX_RESP_INGEST_CAP}" -gt 0 ]; then
     echo "4) Responder ingest queue pressure: ${MAX_RESP_INGEST_USED}/${MAX_RESP_INGEST_CAP}"
   fi

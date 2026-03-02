@@ -277,8 +277,9 @@ where
             let sqlite_global = memtrace::sqlite_global_memory();
             let sqlite_main = memtrace::sqlite_db_memory(&db);
             let sqlite_neg = memtrace::sqlite_db_memory(&neg_db);
+            let allocator = memtrace::allocator_memory();
             let line = format!(
-                "LOWMEM_MEMTRACE initiator peer={} rounds={} have={} need={} have_cap={} need_cap={} pending_have={} pending_have_cap={} fallback_need={} fallback_cap={} wanted={} need_queue={} egress_pending={} ingest_used={}/{} sqlite_mem_cur={} sqlite_mem_high={} sqlite_pcache_ovfl_cur={} sqlite_pcache_ovfl_high={} db_main_cache={} db_main_schema={} db_main_stmt={} db_neg_cache={} db_neg_schema={} db_neg_stmt={} bytes_rx={} bytes_tx={}",
+                "LOWMEM_MEMTRACE initiator peer={} rounds={} have={} need={} have_cap={} need_cap={} pending_have={} pending_have_cap={} fallback_need={} fallback_cap={} wanted={} need_queue={} egress_pending={} ingest_used={}/{} sqlite_mem_cur={} sqlite_mem_high={} sqlite_pcache_ovfl_cur={} sqlite_pcache_ovfl_high={} db_main_cache={} db_main_schema={} db_main_stmt={} db_neg_cache={} db_neg_schema={} db_neg_stmt={} mall_arena={} mall_used={} mall_free={} mall_mmap={} bytes_rx={} bytes_tx={}",
                 peer_id,
                 rounds,
                 have_ids.len(),
@@ -308,6 +309,10 @@ where
                 sqlite_neg.map(|s| s.cache_used_bytes).unwrap_or(-1),
                 sqlite_neg.map(|s| s.schema_used_bytes).unwrap_or(-1),
                 sqlite_neg.map(|s| s.stmt_used_bytes).unwrap_or(-1),
+                allocator.map(|s| s.arena_bytes).unwrap_or(-1),
+                allocator.map(|s| s.used_bytes).unwrap_or(-1),
+                allocator.map(|s| s.free_bytes).unwrap_or(-1),
+                allocator.map(|s| s.mmap_bytes).unwrap_or(-1),
                 bytes_received.load(Ordering::Relaxed),
                 bytes_sent,
             );
