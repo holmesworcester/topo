@@ -64,6 +64,7 @@ where
         }
 
         let mut sent_rowids: Vec<i64> = Vec::with_capacity(batch.len());
+        let mut missing_count = 0u64;
         for (rowid, event_id) in batch {
             if let Ok(Some(blob)) = store.get_shared(&event_id) {
                 let blob_len = blob.len() as u64;
@@ -77,8 +78,12 @@ where
                     break;
                 }
             } else {
+                missing_count += 1;
                 sent_rowids.push(rowid);
             }
+        }
+        if missing_count > 0 {
+            tracing::debug!("{} events missing from store (not shared?)", missing_count);
         }
         let _ = egress.mark_sent(&sent_rowids);
     }

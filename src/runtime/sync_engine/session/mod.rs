@@ -58,14 +58,21 @@ pub(super) const DATA_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// Non-blocking poll timeout for the control stream receive.
 pub(super) const CONTROL_POLL_TIMEOUT: Duration = Duration::from_millis(1);
 
-// -- Coordinator timing (coordinated sync sessions) --
+// -- Coordinator timing (advisory, not on pull-dispatch hot path) --
+// The coordinator thread still runs for health/metrics but does not gate
+// HaveList dispatch.  Pull work division uses deterministic ownership
+// (hash-based split in control_plane::is_event_owned).
 
 /// How long the coordinator waits (after the first peer reports) for
 /// remaining peers to finish reconciliation and report their need_ids.
-pub(super) const COORDINATOR_COLLECTION_WINDOW: Duration = Duration::from_millis(500);
+pub(super) const COORDINATOR_COLLECTION_WINDOW: Duration = Duration::from_secs(2);
 
 /// Coordinator busy-poll interval while waiting for the first peer report.
 pub(super) const COORDINATOR_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Coordinator poll interval within the collection window.
 pub(super) const COORDINATOR_COLLECTION_POLL: Duration = Duration::from_millis(2);
+
+/// Timeout for waiting on coordinator assignment of fallback events.
+/// After this duration, the session proceeds without the fallback subset.
+pub(super) const FALLBACK_ASSIGNMENT_TIMEOUT: Duration = Duration::from_secs(5);

@@ -190,7 +190,6 @@ where
                 if ids.is_empty() {
                     continue;
                 }
-
                 let _ = egress.enqueue_events(peer_id, &ids);
             }
             Ok(Ok(Frame::Done)) => {

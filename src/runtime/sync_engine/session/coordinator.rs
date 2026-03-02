@@ -24,10 +24,11 @@ use super::{
 /// `assign_rx` for its assigned subset.
 pub struct PeerCoord {
     pub peer_idx: usize,
+    /// Snapshot of total registered peers at the time this peer was created.
+    /// Used for deterministic ownership: `hash(event_id) % total_peers == peer_idx`.
+    pub total_peers: Arc<AtomicUsize>,
     pub report_tx: std::sync::mpsc::Sender<Vec<EventId>>,
     pub assign_rx: std::sync::Mutex<std::sync::mpsc::Receiver<Vec<EventId>>>,
-    /// Signal the coordinator to wake up immediately after reporting need_ids.
-    pub(crate) wake_tx: std::sync::mpsc::Sender<()>,
 }
 
 /// Assign events to peers using greedy load balancing.
@@ -87,7 +88,9 @@ struct PeerRegistration {
 pub struct CoordinationManager {
     register_tx: std::sync::mpsc::Sender<PeerRegistration>,
     next_idx: Arc<AtomicUsize>,
-    wake_tx: std::sync::mpsc::Sender<()>,
+    /// Kept alive so the coordinator thread's `wake_rx` doesn't disconnect
+    /// (which would cause busy spinning instead of timed polling).
+    _wake_tx: std::sync::mpsc::Sender<()>,
 }
 
 impl CoordinationManager {
@@ -101,7 +104,7 @@ impl CoordinationManager {
         CoordinationManager {
             register_tx,
             next_idx: Arc::new(AtomicUsize::new(0)),
-            wake_tx,
+            _wake_tx: wake_tx,
         }
     }
 
@@ -122,9 +125,9 @@ impl CoordinationManager {
         });
         Arc::new(PeerCoord {
             peer_idx: idx,
+            total_peers: self.next_idx.clone(),
             report_tx,
             assign_rx: std::sync::Mutex::new(assign_rx),
-            wake_tx: self.wake_tx.clone(),
         })
     }
 }

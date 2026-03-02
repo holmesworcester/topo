@@ -1,7 +1,7 @@
 //! Sync initiator (client role) with dual-stream transport.
 //!
 //! Drives negentropy reconciliation, pushes events the peer needs, and
-//! coordinates pull work with a multi-source coordinator.
+//! uses deterministic ownership for multi-source pull work division.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -26,9 +26,8 @@ use crate::transport::connection::ConnectionError;
 use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
 
 use super::control_plane::{
-    append_have_ids_to_pending, dispatch_need_ids_after_reconcile,
-    maybe_report_coordination_need_ids, maybe_take_coordination_assignment, send_done,
-    send_initial_neg_open, CoordinationAssignment,
+    append_have_ids_to_pending, dispatch_assigned_events, dispatch_owned_need_ids,
+    report_fallback_need_ids, send_done, send_initial_neg_open, try_poll_coordinator_assignment,
 };
 use super::coordinator::PeerCoord;
 use super::data_plane::{
@@ -42,8 +41,10 @@ use super::{CONTROL_POLL_TIMEOUT, DATA_DRAIN_TIMEOUT, EGRESS_SENT_TTL_MS, NEGENT
 /// Data stream: Event blobs
 ///
 /// Push (have_ids): always sends everything the peer needs.
-/// Pull (need_ids): buffers need_ids and sends them to the coordinator for
-/// load-balanced assignment across peers.
+/// Pull (need_ids): dispatched immediately during reconciliation using
+/// deterministic ownership. Each event is owned by exactly one peer
+/// (hash-based split), so multi-source sessions naturally divide work
+/// without a coordinator barrier.
 ///
 /// Callers must provide a `shared_ingest` sender connected to a shared
 /// batch_writer. The session never spawns its own writer thread.
@@ -135,10 +136,12 @@ where
     // Pending have_ids buffer: populated by reconciliation, drained incrementally
     let mut pending_have: Vec<EventId> = Vec::new();
 
-    // Coordination state: buffer need_ids during reconciliation, send to coordinator after
-    let mut coordinated_need_ids: Vec<EventId> = Vec::new();
-    let mut coordination_pending = true;
-    let mut coordination_reported = false;
+    // Fallback buffer: non-owned need_ids reported to coordinator after reconciliation
+    let mut fallback_need_ids: Vec<EventId> = Vec::new();
+    let mut fallback_reported = false;
+    let mut fallback_dispatched = false;
+    let mut fallback_report_time: Option<Instant> = None;
+
     let mut last_bytes_received = 0u64;
     let mut last_egress_log = Instant::now();
 
@@ -180,11 +183,15 @@ where
                 }
 
                 append_have_ids_to_pending(&mut have_ids, &mut pending_have);
-                dispatch_need_ids_after_reconcile(
+
+                // Streaming ownership dispatch: owned events get HaveList
+                // immediately, non-owned buffer for fallback.
+                dispatch_owned_need_ids(
                     &mut control,
                     &wanted,
                     &mut need_ids,
-                    &mut coordinated_need_ids,
+                    &mut fallback_need_ids,
+                    coordination,
                 )
                 .await?;
             }
@@ -205,42 +212,34 @@ where
             Err(_) => {}
         }
 
-        // Coordination: after reconciliation, send need_ids to coordinator
-        maybe_report_coordination_need_ids(
-            coordination,
-            reconciliation_done,
-            &mut coordination_reported,
-            &mut coordinated_need_ids,
-        )?;
-        match maybe_take_coordination_assignment(
-            coordination,
-            coordination_pending,
-            coordination_reported,
-        ) {
-            CoordinationAssignment::Assigned(assigned) => {
-                // HaveList frames were already streamed during reconciliation,
-                // so the coordinator assignment is informational only — all
-                // assigned events are already in the wanted table and were
-                // sent to the responder. Skip the redundant dispatch.
-                info!(
-                    "Coordinator assigned {} events (peer {})",
-                    assigned.len(),
-                    coordination.peer_idx
-                );
-                coordination_pending = false;
+        // After reconciliation, report non-owned events to coordinator for
+        // reassignment instead of discarding them.
+        if reconciliation_done && !fallback_reported {
+            if fallback_need_ids.is_empty() {
+                // No fallback events — nothing to report or wait for.
+                fallback_reported = true;
+                fallback_dispatched = true;
+            } else {
+                report_fallback_need_ids(&mut fallback_need_ids, coordination);
+                fallback_reported = true;
+                fallback_report_time = Some(Instant::now());
             }
-            CoordinationAssignment::Disconnected => {
-                warn!(
-                    "Coordinator assignment channel disconnected for peer {}",
-                    coordination.peer_idx
-                );
-                // No direct/non-coordinated need dispatch is performed here.
-                // This session proceeds without pull assignments; subsequent
-                // sessions re-register coordination handles and recover.
-                coordinated_need_ids.clear();
-                coordination_pending = false;
+        }
+
+        // Poll for coordinator assignment (non-blocking)
+        if fallback_reported && !fallback_dispatched {
+            if let Some(assigned) = try_poll_coordinator_assignment(coordination) {
+                let dispatched =
+                    dispatch_assigned_events(&mut control, &wanted, assigned).await?;
+                info!("Coordinator assigned {} events to this session", dispatched);
+                fallback_dispatched = true;
+            } else if fallback_report_time
+                .map(|t| t.elapsed() > super::FALLBACK_ASSIGNMENT_TIMEOUT)
+                .unwrap_or(false)
+            {
+                info!("Coordinator assignment timeout, proceeding without fallback");
+                fallback_dispatched = true;
             }
-            CoordinationAssignment::Pending | CoordinationAssignment::NotReady => {}
         }
 
         enqueue_pending_have_to_egress(&egress, peer_id, &mut pending_have);
@@ -252,11 +251,9 @@ where
             last_activity = Instant::now();
         }
 
-        // Once reconciliation is done, pending_have is drained, and egress queue
-        // is empty, send DataDone on data stream then Done on control.
-        // Coordinator assignment is informational for streaming pull and must not
-        // gate session completion.
-        if reconciliation_done && pending_have.is_empty() && !done_sent {
+        // Once reconciliation is done, fallback is dispatched, pending_have
+        // is drained, and egress queue is empty, send DataDone+Done.
+        if reconciliation_done && fallback_dispatched && pending_have.is_empty() && !done_sent {
             let pending_out = egress.count_pending(peer_id).unwrap_or(0);
             if pending_out > 0 && last_egress_log.elapsed() >= Duration::from_secs(5) {
                 info!(
