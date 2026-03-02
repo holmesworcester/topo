@@ -30,7 +30,9 @@ use crate::tuning::{low_mem_memtrace, low_mem_mode};
 
 use super::control_plane::send_done_ack;
 use super::data_plane::{drain_egress_to_data_stream, send_data_done, spawn_data_receiver};
-use super::{CONTROL_POLL_TIMEOUT, DATA_DRAIN_TIMEOUT, EGRESS_SENT_TTL_MS, NEGENTROPY_FRAME_SIZE};
+use super::{
+    negentropy_frame_size, CONTROL_POLL_TIMEOUT, DATA_DRAIN_TIMEOUT, EGRESS_SENT_TTL_MS,
+};
 
 /// Run sync as the responder (server role) with dual streams.
 ///
@@ -97,7 +99,7 @@ where
         let item_count = neg_storage.size().unwrap_or(0);
         info!("Negentropy storage has {} items (responder)", item_count);
 
-        let mut neg = Negentropy::new(Storage::Borrowed(&neg_storage), NEGENTROPY_FRAME_SIZE)
+        let mut neg = Negentropy::new(Storage::Borrowed(&neg_storage), negentropy_frame_size())
             .expect("neg worker: Negentropy::new");
 
         while let Ok(msg) = neg_req_rx.recv() {

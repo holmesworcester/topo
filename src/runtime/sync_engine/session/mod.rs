@@ -18,6 +18,8 @@ pub mod responder;
 
 use std::time::Duration;
 
+use crate::tuning::low_mem_mode;
+
 // ---------------------------------------------------------------------------
 // Re-exports — preserve the existing public API surface
 // ---------------------------------------------------------------------------
@@ -31,23 +33,50 @@ pub use responder::run_sync_responder;
 // ---------------------------------------------------------------------------
 
 /// Negentropy frame size limit.
-/// Larger frames pack more range fingerprints per round, reducing round count
-/// at the cost of larger per-round messages. 256 KB is the sweet spot:
-/// per-round cost scales super-linearly, so 512 KB gains ~10% on 500k but
-/// regresses 50k by ~7%, and 1 MB is catastrophic (34s/round).
-pub(super) const NEGENTROPY_FRAME_SIZE: u64 = 256 * 1024;
+/// Low-memory mode uses a smaller frame to reduce peak control-buffer pressure.
+pub(super) fn negentropy_frame_size() -> u64 {
+    if low_mem_mode() {
+        64 * 1024
+    } else {
+        256 * 1024
+    }
+}
 
 /// Max event IDs sent per HaveList message during reconciliation.
-pub(super) const HAVE_CHUNK: usize = 1000;
+pub(super) fn have_chunk() -> usize {
+    if low_mem_mode() {
+        64
+    } else {
+        1000
+    }
+}
 
 /// Max event IDs sent per NeedList/HaveList request during reconciliation.
-pub(super) const NEED_CHUNK: usize = 1000;
+pub(super) fn need_chunk() -> usize {
+    if low_mem_mode() {
+        64
+    } else {
+        1000
+    }
+}
 
 /// Max events to enqueue into the egress queue per main-loop iteration.
-pub(super) const ENQUEUE_BATCH: usize = 5000;
+pub(super) fn enqueue_batch() -> usize {
+    if low_mem_mode() {
+        128
+    } else {
+        5000
+    }
+}
 
 /// Max events per egress claim (one send batch to the data stream).
-pub(super) const EGRESS_CLAIM_COUNT: usize = 500;
+pub(super) fn egress_claim_count() -> usize {
+    if low_mem_mode() {
+        32
+    } else {
+        500
+    }
+}
 
 /// Max age (ms) for sent egress entries before cleanup.
 pub(super) const EGRESS_SENT_TTL_MS: i64 = 300_000;

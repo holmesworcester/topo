@@ -21,7 +21,7 @@ use crate::tuning::low_mem_memtrace;
 use crate::transport::connection::ConnectionError;
 use crate::transport::{StreamRecv, StreamSend};
 
-use super::{EGRESS_CLAIM_COUNT, ENQUEUE_BATCH, HAVE_CHUNK};
+use super::{egress_claim_count, enqueue_batch, have_chunk};
 
 pub struct DataPlaneSendStats {
     pub events_sent_delta: u64,
@@ -37,9 +37,9 @@ pub fn enqueue_pending_have_to_egress(
         return;
     }
 
-    let drain_count = pending_have.len().min(ENQUEUE_BATCH);
+    let drain_count = pending_have.len().min(enqueue_batch());
     let to_enqueue: Vec<EventId> = pending_have.drain(..drain_count).collect();
-    for chunk in to_enqueue.chunks(HAVE_CHUNK) {
+    for chunk in to_enqueue.chunks(have_chunk()) {
         let _ = egress.enqueue_events(peer_id, chunk);
     }
 }
@@ -60,7 +60,7 @@ where
 
     while !blocked {
         let batch = egress
-            .claim_batch(peer_id, EGRESS_CLAIM_COUNT)
+            .claim_batch(peer_id, egress_claim_count())
             .unwrap_or_default();
         if batch.is_empty() {
             break;

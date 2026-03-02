@@ -37,7 +37,9 @@ use super::data_plane::{
     drain_egress_to_data_stream, enqueue_pending_have_to_egress, send_data_done,
     spawn_data_receiver,
 };
-use super::{CONTROL_POLL_TIMEOUT, DATA_DRAIN_TIMEOUT, EGRESS_SENT_TTL_MS, NEGENTROPY_FRAME_SIZE};
+use super::{
+    negentropy_frame_size, CONTROL_POLL_TIMEOUT, DATA_DRAIN_TIMEOUT, EGRESS_SENT_TTL_MS,
+};
 
 /// Run sync as the initiator (client role) with dual streams.
 /// Control stream: NegOpen, NegMsg, HaveList
@@ -104,7 +106,7 @@ where
         .rebuild_blocks()
         .map_err(|e| format!("Failed to rebuild blocks: {}", e))?;
 
-    let mut neg = Negentropy::new(Storage::Borrowed(&neg_storage), NEGENTROPY_FRAME_SIZE)?;
+    let mut neg = Negentropy::new(Storage::Borrowed(&neg_storage), negentropy_frame_size())?;
 
     let store = Store::new(&db);
 

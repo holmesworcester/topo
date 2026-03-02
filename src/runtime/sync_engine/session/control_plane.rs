@@ -18,7 +18,7 @@ use crate::tuning::{low_mem_mode, low_mem_wanted_high_watermark, low_mem_wanted_
 use crate::transport::StreamConn;
 
 use super::coordinator::PeerCoord;
-use super::NEED_CHUNK;
+use super::need_chunk;
 
 pub type SyncError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -117,9 +117,10 @@ where
     // queue up to current credit. This keeps large backlogs off anonymous heap.
     let mut remaining_credit = owned_credit;
     let mut queued_dispatched = 0usize;
+    let need_chunk = need_chunk();
     if low_mem_mode() && remaining_credit > 0 {
         loop {
-            let pull = remaining_credit.min(NEED_CHUNK);
+            let pull = remaining_credit.min(need_chunk);
             let queued = need_queue.peek_batch(peer_id, pull)?;
             if queued.is_empty() {
                 break;
@@ -146,7 +147,7 @@ where
     // When need_ids are few, claim all — these are likely source-unique events
     // that can only be fetched from this specific source.
     let claim_all = need_ids.len() <= total_peers * FALLBACK_THRESHOLD_FACTOR;
-    let mut batch: Vec<EventId> = Vec::with_capacity(NEED_CHUNK);
+    let mut batch: Vec<EventId> = Vec::with_capacity(need_chunk);
     let mut owned_sent_now = 0usize;
     let mut deferred_owned = 0usize;
     let mut deferred_to_queue: Vec<EventId> = Vec::new();
@@ -159,10 +160,10 @@ where
                 let _ = wanted.insert(&event_id);
                 batch.push(event_id);
                 owned_sent_now += 1;
-                if batch.len() >= NEED_CHUNK {
+                if batch.len() >= need_chunk {
                     control.send(&Frame::HaveList { ids: batch }).await?;
                     control.flush().await?;
-                    batch = Vec::with_capacity(NEED_CHUNK);
+                    batch = Vec::with_capacity(need_chunk);
                 }
             } else {
                 deferred_owned += 1;
@@ -189,7 +190,7 @@ where
         need_ids.clear();
         // Reconciliation can transiently expand this buffer to very large
         // capacities; trim aggressively in low-memory mode.
-        if need_ids.capacity() > (NEED_CHUNK * 16) {
+        if need_ids.capacity() > (need_chunk * 16) {
             need_ids.shrink_to(0);
         }
     } else {
@@ -267,14 +268,15 @@ where
     let count = assigned.len();
     info!("Dispatching {} coordinator-assigned events", count);
 
-    let mut batch: Vec<EventId> = Vec::with_capacity(NEED_CHUNK);
+    let need_chunk = need_chunk();
+    let mut batch: Vec<EventId> = Vec::with_capacity(need_chunk);
     for event_id in assigned {
         let _ = wanted.insert(&event_id);
         batch.push(event_id);
-        if batch.len() >= NEED_CHUNK {
+        if batch.len() >= need_chunk {
             control.send(&Frame::HaveList { ids: batch }).await?;
             control.flush().await?;
-            batch = Vec::with_capacity(NEED_CHUNK);
+            batch = Vec::with_capacity(need_chunk);
         }
     }
     if !batch.is_empty() {
