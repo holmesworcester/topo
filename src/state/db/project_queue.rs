@@ -243,8 +243,11 @@ impl<'a> ProjectQueue<'a> {
 
     /// Like `drain` but with a configurable claim batch size.
     ///
-    /// Projection runs in autocommit mode. On failure we keep projection side
-    /// effects (for example blocked dependency rows) and only schedule retry.
+    /// Projection runs in autocommit mode (each `project_fn` call commits
+    /// independently). Successful projections are dequeued in a single
+    /// batch transaction via `mark_done_batch` to amortize DELETE overhead.
+    /// On failure we keep projection side effects (for example blocked
+    /// dependency rows) and schedule retry with exponential backoff.
     pub fn drain_with_limit<F>(
         &self,
         peer_id: &str,
@@ -260,20 +263,20 @@ impl<'a> ProjectQueue<'a> {
             if batch.is_empty() {
                 break;
             }
-            let mut succeeded = 0usize;
+            let mut succeeded_ids: Vec<&str> = Vec::new();
             for event_id_b64 in &batch {
                 match project_fn(self.conn, event_id_b64) {
                     Ok(()) => {
-                        self.conn.execute(
-                            "DELETE FROM project_queue WHERE peer_id = ?1 AND event_id = ?2",
-                            params![peer_id, event_id_b64],
-                        )?;
-                        succeeded += 1;
+                        succeeded_ids.push(event_id_b64);
                     }
                     Err(_) => {
                         let _ = self.mark_retry(peer_id, event_id_b64);
                     }
                 }
+            }
+            let succeeded = succeeded_ids.len();
+            if !succeeded_ids.is_empty() {
+                self.mark_done_batch(peer_id, &succeeded_ids)?;
             }
             total += succeeded;
             // If entire batch failed, stop draining to avoid infinite loop
@@ -531,7 +534,7 @@ mod tests {
         // event_b should have a future available_at (backoff)
         let available_at: i64 = conn.query_row(
             "SELECT available_at FROM project_queue WHERE peer_id = 'peer1' AND event_id = 'event_b'",
-            [], |row| row.get(0),
+             [], |row| row.get(0),
         ).unwrap();
         assert!(
             available_at > current_timestamp_ms(),

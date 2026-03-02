@@ -919,6 +919,38 @@ Start simple, then tune.
 - Add invariants/metrics for blocked counts, retry growth, and queue age.
 - Add a dedicated `low_mem_ios` runtime mode for iOS NSE constraints.
 
+### 10.0 Profiling-first tail regression workflow
+
+When investigating sync performance degradation at high cardinality (e.g. 500k+ events):
+
+1. **Baseline capture**: run serial perf suite (`scripts/run_perf_serial.sh core`) and the target tail benchmark in isolation with `--test-threads=1`. Record wall time, msgs/s, peak RSS, and environment details (filesystem type, hardware).
+2. **Tail profiling**: add per-batch timing instrumentation to `batch_writer` (persist_ms, commit+effects_ms, epoch_10k_ms via `WRITER_PROFILE` log lines). Identify whether tail slowdown is writer-side (persist/drain) or protocol-side (negentropy reconciliation stalls causing data starvation).
+3. **Root-cause ranking**: rank bottlenecks by measured contribution. Common patterns:
+   - Negentropy round latency scaling super-linearly with item count (protocol-level, deep fix).
+   - Autocommit overhead in projection drain (transaction batching fix).
+   - SQLite page cache pressure when dataset exceeds `cache_size` (tuning knob).
+4. **Fix one bottleneck**: apply only the top-ranked implementable fix. Verify no regression on core suite before measuring tail improvement.
+5. **Evidence artifact**: document baseline, profiling data, root-cause ranking, fix rationale, and post-fix comparison in `docs/planning/` for auditability.
+
+Operational constraint: serial perf measurements (`--test-threads=1`) must be used for tail profiling to avoid cross-test interference. Stale test processes (e.g. from timed-out `sync_graph_test`) must be killed before re-running, as they hold tmpfs resources and cause spurious failures.
+
+### 10.0.1 Implemented: batch dequeue + deferred WAL checkpoint
+
+The projection drain path (`drain_project_queue_on_connection` + `drain_with_limit`) applies two optimizations to reduce per-batch overhead:
+
+1. **Batch dequeue**: `drain_with_limit` collects successfully-projected event IDs and dequeues them via `mark_done_batch` (one `BEGIN`/`COMMIT` per claim cycle) instead of individual `mark_done` DELETEs per event. Reduces ~1000 autocommit DELETEs per writer batch to ~10 batch transactions.
+
+2. **Deferred WAL checkpoint**: `drain_project_queue_on_connection` sets `PRAGMA wal_autocheckpoint = 0` during the drain, restoring to 1000 after. This prevents WAL checkpoint stalls between autocommit projection writes. Skipped in `low_mem` mode where WAL growth must remain bounded.
+
+- Projection writes remain autocommit (each `project_one` call commits independently), preserving cascade-unblock correctness.
+- On projection failure, events are retried with exponential backoff via `mark_retry`.
+- Crash safety: `project_queue` provides recovery; interrupted drains leave events in the queue for re-projection.
+- Operational note: WAL grows during drain proportional to pending event count. Disk space must accommodate this. The next persist-phase COMMIT triggers a checkpoint that processes accumulated WAL pages.
+
+Profiling evidence: 500k one-way sync improved from 170.93s (2,925 msgs/s) to 106.75s (4,684 msgs/s) — 37.5% wall time reduction, 60% throughput improvement. Core suite (10k, 50k) showed no regressions.
+
+Note: wrapping all projection writes in a single transaction was attempted first but abandoned — it caused ~0.06% of events to be left unprojected at 500k scale due to cascade_unblocked bulk cleanup interacting with the transaction scope.
+
 `low_mem_ios` requirements:
 - target steady-state RSS at or below `24 MiB` during sustained sync/projection.
 - keep memory bounded with strict in-flight caps (queue claims, decode buffers, batch sizes).
