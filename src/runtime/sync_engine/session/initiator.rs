@@ -84,7 +84,8 @@ where
     let _ = egress.clear_connection(peer_id);
     let _ = wanted.clear();
 
-    let ws_id = lookup_workspace_id(&db, recorded_by);
+    let ws_id = lookup_workspace_id(&db, recorded_by)
+        .ok_or_else(|| format!("no trust anchor for peer_id={}, cannot start sync", recorded_by))?;
     let neg_storage = NegentropyStorageSqlite::new(&neg_db, &ws_id);
 
     neg_db

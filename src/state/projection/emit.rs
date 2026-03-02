@@ -52,8 +52,15 @@ pub fn emit_deterministic_event(
             created_at_ms,
             now_ms,
         )?;
-        let ws_id = lookup_workspace_id(conn, recorded_by);
-        insert_neg_item_if_shared(conn, meta.share_scope, created_at_ms, &event_id, &ws_id)?;
+        if let Some(ws_id) = lookup_workspace_id(conn, recorded_by) {
+            insert_neg_item_if_shared(conn, meta.share_scope, created_at_ms, &event_id, &ws_id)?;
+        } else if meta.share_scope == crate::event_modules::registry::ShareScope::Shared {
+            tracing::warn!(
+                "no trust anchor for {}, shared event {} missing from neg_items",
+                recorded_by,
+                crate::crypto::event_id_to_base64(&event_id)
+            );
+        }
     }
 
     // Always record for this tenant and project (even if event already existed globally)

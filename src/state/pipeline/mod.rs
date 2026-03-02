@@ -34,8 +34,7 @@ fn prewarm_workspace_cache(
         if workspace_cache.contains_key(recorded_by) {
             continue;
         }
-        let workspace_id = lookup_workspace_id(db, recorded_by);
-        if !workspace_id.is_empty() {
+        if let Some(workspace_id) = lookup_workspace_id(db, recorded_by) {
             workspace_cache.insert(recorded_by.clone(), workspace_id);
         }
     }

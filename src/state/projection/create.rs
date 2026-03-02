@@ -96,9 +96,16 @@ fn store_blob_only(
     )
     .map_err(|e| CreateEventError::DbError(e.to_string()))?;
 
-    let ws_id = lookup_workspace_id(conn, recorded_by);
-    insert_neg_item_if_shared(conn, meta.share_scope, created_at_ms, &event_id, &ws_id)
-        .map_err(|e| CreateEventError::DbError(e.to_string()))?;
+    if let Some(ws_id) = lookup_workspace_id(conn, recorded_by) {
+        insert_neg_item_if_shared(conn, meta.share_scope, created_at_ms, &event_id, &ws_id)
+            .map_err(|e| CreateEventError::DbError(e.to_string()))?;
+    } else if meta.share_scope == crate::event_modules::registry::ShareScope::Shared {
+        tracing::warn!(
+            "no trust anchor for {}, shared event {} missing from neg_items",
+            recorded_by,
+            crate::crypto::event_id_to_base64(&event_id)
+        );
+    }
 
     insert_recorded_event(conn, recorded_by, &event_id, now_ms, "local_create")
         .map_err(|e| CreateEventError::DbError(e.to_string()))?;

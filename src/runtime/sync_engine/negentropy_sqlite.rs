@@ -64,10 +64,12 @@ impl<'a> NegentropyStorageSqlite<'a> {
         // Clear existing session blocks
         self.conn.execute("DELETE FROM session_blocks", [])?;
 
-        // Stream through all items: include workspace-scoped items plus any
-        // with empty workspace_id (pre-trust-anchor items stored before projection).
+        // Single workspace-scoped scan. The trust anchor is always seeded
+        // before any events are stored, so no empty-workspace_id fallback
+        // is needed. This uses the (workspace_id, ts, id) primary key
+        // directly — no temp B-tree sort.
         let mut stmt = self.conn.prepare(
-            "SELECT ts, id FROM neg_items WHERE workspace_id = ?1 OR workspace_id = '' ORDER BY ts, id"
+            "SELECT ts, id FROM neg_items WHERE workspace_id = ?1 ORDER BY ts, id"
         )?;
 
         let mut insert_stmt = self.conn.prepare(
@@ -138,7 +140,7 @@ impl NegentropyStorageBase for NegentropyStorageSqlite<'_> {
         let count: i64 = self
             .conn
             .query_row(
-                "SELECT COUNT(*) FROM neg_items WHERE workspace_id = ?1 OR workspace_id = ''",
+                "SELECT COUNT(*) FROM neg_items WHERE workspace_id = ?1",
                 rusqlite::params![&self.workspace_id],
                 |row| row.get(0),
             )
@@ -161,7 +163,7 @@ impl NegentropyStorageBase for NegentropyStorageSqlite<'_> {
 
         // Fetch item at offset within block
         let mut stmt = self.conn.prepare_cached(
-            "SELECT ts, id FROM neg_items WHERE (workspace_id = ?1 OR workspace_id = '') AND (ts, id) >= (?2, ?3) ORDER BY ts, id LIMIT 1 OFFSET ?4"
+            "SELECT ts, id FROM neg_items WHERE workspace_id = ?1 AND (ts, id) >= (?2, ?3) ORDER BY ts, id LIMIT 1 OFFSET ?4"
         ).map_err(|e| sql_err(e))?;
 
         let result = stmt.query_row(
@@ -202,7 +204,7 @@ impl NegentropyStorageBase for NegentropyStorageSqlite<'_> {
 
         // Query items starting from begin position
         let mut stmt = self.conn.prepare_cached(
-            "SELECT ts, id FROM neg_items WHERE (workspace_id = ?1 OR workspace_id = '') AND (ts, id) >= (?2, ?3) ORDER BY ts, id LIMIT ?4 OFFSET ?5"
+            "SELECT ts, id FROM neg_items WHERE workspace_id = ?1 AND (ts, id) >= (?2, ?3) ORDER BY ts, id LIMIT ?4 OFFSET ?5"
         ).map_err(|e| sql_err(e))?;
 
         let mut rows = stmt
@@ -259,7 +261,7 @@ impl NegentropyStorageBase for NegentropyStorageSqlite<'_> {
                 .unwrap_or((0, vec![0u8; 32]));
 
             let mut scan_stmt = self.conn.prepare_cached(
-                "SELECT ts, id FROM neg_items WHERE (workspace_id = ?1 OR workspace_id = '') AND (ts, id) >= (?2, ?3) ORDER BY ts, id LIMIT ?4"
+                "SELECT ts, id FROM neg_items WHERE workspace_id = ?1 AND (ts, id) >= (?2, ?3) ORDER BY ts, id LIMIT ?4"
             )?;
 
             let limit = BLOCK_SIZE + 1; // Scan at most one block plus one

@@ -69,7 +69,8 @@ where
     let egress = EgressQueue::new(&db);
     let _ = egress.clear_connection(peer_id);
 
-    let ws_id = lookup_workspace_id(&db, recorded_by);
+    let ws_id = lookup_workspace_id(&db, recorded_by)
+        .ok_or_else(|| format!("no trust anchor for peer_id={}, cannot start sync", recorded_by))?;
 
     // Spawn reconciliation on a dedicated OS thread.
     // neg_db, neg_storage, neg are !Send (SQLite + RefCell) so they must

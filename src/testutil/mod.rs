@@ -496,6 +496,9 @@ impl Peer {
     // --- Identity event helpers ---
 
     /// Create a Workspace event. Returns the event ID.
+    ///
+    /// Pre-seeds the trust anchor so that neg_items gets the correct
+    /// workspace_id from the start (same pattern as commands::create_workspace).
     pub fn create_workspace(&self, public_key: [u8; 32]) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
         let ws = ParsedEvent::Workspace(WorkspaceEvent {
@@ -503,7 +506,20 @@ impl Peer {
             public_key,
             name: "test-workspace".to_string(),
         });
-        create_event_staged(&db, &self.identity, &ws).expect("failed to create workspace")
+        // Pre-compute event_id and seed trust anchor before storing
+        let ws_blob =
+            crate::event_modules::encode_event(&ws).expect("failed to encode workspace event");
+        let ws_eid = crate::crypto::hash_event(&ws_blob);
+        let ws_eid_b64 = event_id_to_base64(&ws_eid);
+        db.execute(
+            "INSERT OR IGNORE INTO trust_anchors (peer_id, workspace_id) VALUES (?1, ?2)",
+            rusqlite::params![&self.identity, &ws_eid_b64],
+        )
+        .expect("failed to seed trust anchor");
+        let ws_eid2 =
+            create_event_staged(&db, &self.identity, &ws).expect("failed to create workspace");
+        assert_eq!(ws_eid, ws_eid2, "pre-computed workspace event_id mismatch");
+        ws_eid
     }
 
     /// Try to create a Workspace event. Returns Result to allow handling rejection.
@@ -2917,13 +2933,17 @@ pub fn clone_events_to(source: &Peer, targets: &[&Peer]) {
         .collect::<Result<Vec<_>, _>>()
         .expect("failed to collect events");
 
-    // Read all neg_items
+    // Read all neg_items (including workspace_id)
     let mut neg_stmt = src_db
-        .prepare("SELECT ts, id FROM neg_items")
+        .prepare("SELECT workspace_id, ts, id FROM neg_items")
         .expect("failed to prepare neg_items query");
-    let neg_items: Vec<(i64, Vec<u8>)> = neg_stmt
+    let neg_items: Vec<(String, i64, Vec<u8>)> = neg_stmt
         .query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
         })
         .expect("failed to query neg_items")
         .collect::<Result<Vec<_>, _>>()
@@ -2941,11 +2961,11 @@ pub fn clone_events_to(source: &Peer, targets: &[&Peer]) {
             ).expect("failed to insert event");
         }
 
-        for (ts, id) in &neg_items {
+        for (workspace_id, ts, id) in &neg_items {
             tgt_db
                 .execute(
-                    "INSERT OR IGNORE INTO neg_items (ts, id) VALUES (?1, ?2)",
-                    rusqlite::params![ts, id.as_slice()],
+                    "INSERT OR IGNORE INTO neg_items (workspace_id, ts, id) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![workspace_id, ts, id.as_slice()],
                 )
                 .expect("failed to insert neg_item");
         }

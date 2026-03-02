@@ -44,25 +44,31 @@ pub(super) fn run_persist_phase(
                 if let Some(meta) = reg.lookup(type_code) {
                     // Only insert into neg_items for shared events (defense-in-depth)
                     if meta.share_scope == ShareScope::Shared {
-                        // Look up workspace_id; cache only non-empty values
-                        // (empty means trust anchor not yet projected).
+                        // Look up workspace_id from cache or trust_anchors table.
+                        // Skip neg_items insert if trust anchor is missing — this
+                        // should not happen after bootstrap.
                         let ws_id = if let Some(cached) = workspace_cache.get(recorded_by) {
-                            cached.clone()
+                            Some(cached.clone())
+                        } else if let Some(ws) = lookup_workspace_id(db, recorded_by) {
+                            workspace_cache.insert(recorded_by.clone(), ws.clone());
+                            Some(ws)
                         } else {
-                            let ws = lookup_workspace_id(db, recorded_by);
-                            if !ws.is_empty() {
-                                workspace_cache.insert(recorded_by.clone(), ws.clone());
-                            }
-                            ws
+                            tracing::warn!(
+                                "no trust anchor for {}, skipping neg_items for {}",
+                                recorded_by, event_id_b64
+                            );
+                            None
                         };
-                        if let Err(e) = neg_items_stmt.execute(rusqlite::params![
-                            &ws_id,
-                            created_at_ms as i64,
-                            event_id.as_slice()
-                        ]) {
-                            // Non-fatal: neg_items is a reconciliation cache;
-                            // event will be re-added on next sync session.
-                            tracing::warn!("neg_items insert error for {}: {}", event_id_b64, e);
+                        if let Some(ws_id) = ws_id {
+                            if let Err(e) = neg_items_stmt.execute(rusqlite::params![
+                                &ws_id,
+                                created_at_ms as i64,
+                                event_id.as_slice()
+                            ]) {
+                                // Non-fatal: neg_items is a reconciliation cache;
+                                // event will be re-added on next sync session.
+                                tracing::warn!("neg_items insert error for {}: {}", event_id_b64, e);
+                            }
                         }
                     }
 

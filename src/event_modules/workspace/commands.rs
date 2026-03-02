@@ -18,7 +18,7 @@ use rusqlite::Connection;
 use super::identity_ops::{
     self as ops, InviteBootstrapContext, JoinChain, LinkChain, SIGNER_KIND_PENDING_INVITE_UNWRAP,
 };
-use crate::crypto::{event_id_from_base64, EventId};
+use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
 use crate::event_modules::{
     local_signer_secret::{
         LocalSignerSecretEvent, SIGNER_KIND_PEER_SHARED, SIGNER_KIND_USER, SIGNER_KIND_WORKSPACE,
@@ -138,16 +138,34 @@ pub fn create_workspace(
         &peer_shared_key.verifying_key().to_bytes(),
     ));
 
-    // 1. Workspace event (unsigned, staged — guard-blocked until trust anchor)
+    // 1. Pre-compute workspace event_id so we can seed the trust anchor
+    //    before any events are stored. This ensures lookup_workspace_id()
+    //    returns the correct value for neg_items insertion from the start,
+    //    avoiding empty-workspace_id rows.
     let workspace_key = SigningKey::generate(&mut rng);
     let ws = ParsedEvent::Workspace(WorkspaceEvent {
         created_at_ms: now_ms(),
         public_key: workspace_key.verifying_key().to_bytes(),
         name: workspace_name.to_string(),
     });
-    let ws_eid = create_event_staged(db, &derived_peer_id, &ws)?;
+    let ws_blob = crate::event_modules::encode_event(&ws)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
+    let ws_eid = crate::crypto::hash_event(&ws_blob);
+    let ws_eid_b64 = event_id_to_base64(&ws_eid);
 
-    // 2. InviteAccepted (local event — binds trust anchor, unblocks workspace)
+    // 2. Seed trust anchor before any event storage. InviteAccepted's
+    //    INSERT OR IGNORE will be a no-op since the row already exists.
+    db.execute(
+        "INSERT OR IGNORE INTO trust_anchors (peer_id, workspace_id) VALUES (?1, ?2)",
+        rusqlite::params![&derived_peer_id, &ws_eid_b64],
+    )
+    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
+
+    // 3. Workspace event (staged — guard may still block, re-projected below)
+    let ws_eid2 = create_event_staged(db, &derived_peer_id, &ws)?;
+    assert_eq!(ws_eid, ws_eid2, "pre-computed workspace event_id mismatch");
+
+    // 4. InviteAccepted (local event — trust anchor already seeded above)
     let ia = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
         created_at_ms: now_ms(),
         invite_event_id: ws_eid,

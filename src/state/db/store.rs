@@ -107,14 +107,17 @@ pub fn insert_neg_item_if_shared(
 
 /// Look up the workspace_id (base64 event_id of the Network/Workspace event)
 /// for a given peer_id from the trust_anchors table.
-/// Returns "" if no trust anchor exists yet (bootstrap-in-progress).
-pub fn lookup_workspace_id(conn: &Connection, peer_id: &str) -> String {
+/// Returns None if no trust anchor exists (should not happen after bootstrap).
+/// Panics on unexpected DB errors (schema/IO) to avoid masking failures.
+pub fn lookup_workspace_id(conn: &Connection, peer_id: &str) -> Option<String> {
+    use rusqlite::OptionalExtension;
     conn.query_row(
         "SELECT workspace_id FROM trust_anchors WHERE peer_id = ?1",
         params![peer_id],
         |row| row.get::<_, String>(0),
     )
-    .unwrap_or_default()
+    .optional()
+    .expect("lookup_workspace_id: unexpected DB error querying trust_anchors")
 }
 
 pub fn insert_recorded_event(

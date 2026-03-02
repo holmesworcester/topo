@@ -177,14 +177,12 @@ async fn connect_loop_inner(
     shutdown: CancellationToken,
     bootstrap_fallback_client_config: Option<TransportClientConfig>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Look up workspace SNI for this tenant (falls back to "localhost" if no trust anchor)
+    // Look up workspace SNI for this tenant
     let sni = {
         let db = open_connection(db_path)?;
-        let ws_id = lookup_workspace_id(&db, recorded_by);
-        if ws_id.is_empty() {
-            "localhost".to_string()
-        } else {
-            crate::transport::multi_workspace::workspace_sni(&ws_id)
+        match lookup_workspace_id(&db, recorded_by) {
+            Some(ws_id) => crate::transport::multi_workspace::workspace_sni(&ws_id),
+            None => "localhost".to_string(),
         }
     };
     let initiator_handler = SyncSessionHandler::outbound(
