@@ -6,7 +6,7 @@
 #[cfg(test)]
 pub mod fixtures {
     use topo::projection::decision::ProjectionDecision;
-    use topo::projection::result::{
+    use topo::projection::contract::{
         BootstrapContextSnapshot, ContextSnapshot, EmitCommand, ProjectorResult, WriteOp,
     };
 

@@ -1,5 +1,5 @@
 use crate::event_modules::ParsedEvent;
-use crate::projection::result::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
+use crate::projection::contract::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
 
 /// Pure projector: Workspace guard — trust_anchors must match workspace event_id.
 /// Returns Block if no trust anchor yet, Reject if mismatch.

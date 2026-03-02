@@ -1,5 +1,5 @@
 use super::super::ParsedEvent;
-use crate::projection::result::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
+use crate::projection::contract::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
 
 /// Pure projector: DeviceInvite (First or Ongoing) → device_invites table.
 /// When bootstrap_context is available (locally-created invite), this is a

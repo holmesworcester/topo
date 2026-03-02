@@ -71,7 +71,7 @@ pub fn encode_invite_accepted(event: &ParsedEvent) -> Result<Vec<u8>, EventError
 // === Projector (event-module locality) ===
 
 use crate::crypto::event_id_to_base64;
-use crate::projection::result::{ContextSnapshot, EmitCommand, ProjectorResult, SqlVal, WriteOp};
+use crate::projection::contract::{ContextSnapshot, EmitCommand, ProjectorResult, SqlVal, WriteOp};
 use rusqlite::Connection;
 
 fn bootstrap_spki_already_peer_shared(
@@ -157,7 +157,7 @@ pub fn build_projector_context(
     {
         ctx.bootstrap_spki_already_peer_shared =
             bootstrap_spki_already_peer_shared(conn, recorded_by, &bc.bootstrap_spki_fingerprint)?;
-        ctx.bootstrap_context = Some(crate::projection::result::BootstrapContextSnapshot {
+        ctx.bootstrap_context = Some(crate::projection::contract::BootstrapContextSnapshot {
             workspace_id: bc.workspace_id,
             bootstrap_addr: bc.bootstrap_addr,
             bootstrap_spki_fingerprint: bc.bootstrap_spki_fingerprint,

@@ -7,7 +7,7 @@ use topo::event_modules::local_signer_secret::{
     LocalSignerSecretEvent, SIGNER_KIND_PEER_SHARED, SIGNER_KIND_USER, SIGNER_KIND_WORKSPACE,
 };
 use topo::event_modules::ParsedEvent;
-use topo::projection::result::{ContextSnapshot, EmitCommand};
+use topo::projection::contract::{ContextSnapshot, EmitCommand};
 
 fn project(recorded_by: &str, event: &ParsedEvent) -> Vec<EmitCommand> {
     let result = topo::event_modules::local_signer_secret::project_pure(

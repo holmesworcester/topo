@@ -1,5 +1,5 @@
 use crate::event_modules::ParsedEvent;
-use crate::projection::result::ContextSnapshot;
+use crate::projection::contract::ContextSnapshot;
 use rusqlite::Connection;
 
 /// Build projector-local context for Workspace projection.

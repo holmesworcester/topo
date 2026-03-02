@@ -65,7 +65,7 @@ mod tests {
     #[test]
     fn test_deletion_rejects_non_message_target() {
         let parsed = make_deletion([1u8; 32], [2u8; 32]);
-        let ctx = topo::projection::result::ContextSnapshot {
+        let ctx = topo::projection::contract::ContextSnapshot {
             target_is_non_message: true,
             ..Default::default()
         };
@@ -94,7 +94,7 @@ mod tests {
         let author = [2u8; 32];
         let author_b64 = b64(&author);
         let parsed = make_deletion([1u8; 32], author);
-        let ctx = topo::projection::result::ContextSnapshot {
+        let ctx = topo::projection::contract::ContextSnapshot {
             target_tombstone_author: Some(author_b64),
             ..Default::default()
         };
@@ -110,7 +110,7 @@ mod tests {
     #[test]
     fn test_deletion_rejects_when_tombstoned_wrong_author() {
         let parsed = make_deletion([1u8; 32], [2u8; 32]);
-        let ctx = topo::projection::result::ContextSnapshot {
+        let ctx = topo::projection::contract::ContextSnapshot {
             target_tombstone_author: Some(b64(&[99u8; 32])),
             ..Default::default()
         };

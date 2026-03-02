@@ -55,7 +55,7 @@ mod tests {
     #[test]
     fn test_reaction_skips_when_target_deleted() {
         let parsed = make_reaction();
-        let ctx = topo::projection::result::ContextSnapshot {
+        let ctx = topo::projection::contract::ContextSnapshot {
             target_message_deleted: true,
             ..Default::default()
         };

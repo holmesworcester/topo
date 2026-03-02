@@ -1,6 +1,6 @@
 use crate::crypto::event_id_to_base64;
 use crate::event_modules::ParsedEvent;
-use crate::projection::result::ContextSnapshot;
+use crate::projection::contract::ContextSnapshot;
 use rusqlite::Connection;
 
 fn signer_user_mismatch_reason(

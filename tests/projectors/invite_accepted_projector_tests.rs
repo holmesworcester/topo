@@ -11,7 +11,7 @@ mod tests {
     use crate::harness::fixtures::*;
     use topo::event_modules::invite_accepted::{project_pure, InviteAcceptedEvent};
     use topo::event_modules::ParsedEvent;
-    use topo::projection::result::EmitCommand;
+    use topo::projection::contract::EmitCommand;
 
     const PEER: &str = "peer_joiner";
 

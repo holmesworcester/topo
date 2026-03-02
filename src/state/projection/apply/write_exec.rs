@@ -1,4 +1,4 @@
-use super::super::result::{EmitCommand, SqlVal, WriteOp};
+use super::super::contract::{EmitCommand, SqlVal, WriteOp};
 use crate::crypto::event_id_from_base64;
 use rusqlite::Connection;
 

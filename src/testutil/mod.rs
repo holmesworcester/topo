@@ -441,11 +441,11 @@ impl Peer {
             signature: [0u8; 64],
         });
         // Sign the inner event, then encrypt the signed blob
-        self.create_encrypted_signed_event_sync(&db, key_event_id, &inner)
+        self.create_encrypted_signed_event_synchronous(&db, key_event_id, &inner)
     }
 
     /// Sign an inner event, encrypt the signed blob, wrap in EncryptedEvent, store + project.
-    fn create_encrypted_signed_event_sync(
+    fn create_encrypted_signed_event_synchronous(
         &self,
         db: &rusqlite::Connection,
         key_event_id: &EventId,
@@ -493,7 +493,7 @@ impl Peer {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        self.create_encrypted_signed_event_sync(&db, key_event_id, &inner)
+        self.create_encrypted_signed_event_synchronous(&db, key_event_id, &inner)
     }
 
     // --- Identity event helpers ---

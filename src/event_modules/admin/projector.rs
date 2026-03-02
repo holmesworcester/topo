@@ -1,5 +1,5 @@
 use super::super::ParsedEvent;
-use crate::projection::result::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
+use crate::projection::contract::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
 
 /// Pure projector: Admin (Boot or Ongoing) → admins table.
 pub fn project_pure(

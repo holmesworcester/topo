@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use super::super::ParsedEvent;
 use crate::crypto::event_id_to_base64;
-use crate::projection::result::ContextSnapshot;
+use crate::projection::contract::ContextSnapshot;
 use rusqlite::Connection;
 
 /// Build projector-local context for FileSlice projection.

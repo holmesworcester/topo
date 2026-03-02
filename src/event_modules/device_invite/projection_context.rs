@@ -1,5 +1,5 @@
 use super::super::ParsedEvent;
-use crate::projection::result::{BootstrapContextSnapshot, ContextSnapshot};
+use crate::projection::contract::{BootstrapContextSnapshot, ContextSnapshot};
 use rusqlite::Connection;
 
 /// Build projector-local context for DeviceInvite projection.

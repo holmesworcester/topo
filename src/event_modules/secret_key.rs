@@ -63,7 +63,7 @@ pub fn encode_secret_key(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
 
 // === Projector (event-module locality) ===
 
-use crate::projection::result::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
+use crate::projection::contract::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
 use rusqlite::Connection;
 
 pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {

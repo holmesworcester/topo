@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use super::{EventError, ParsedEvent};
-use crate::projection::result::{ContextSnapshot, ProjectorResult};
+use crate::projection::contract::{ContextSnapshot, ProjectorResult};
 use rusqlite::Connection;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

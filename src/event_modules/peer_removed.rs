@@ -78,7 +78,7 @@ pub fn encode_peer_removed(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
 // === Projector (event-module locality) ===
 
 use crate::crypto::event_id_to_base64;
-use crate::projection::result::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
+use crate::projection::contract::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
 use rusqlite::Connection;
 
 pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
