@@ -208,6 +208,7 @@ MAX_INIT_HAVE_CAP=0
 MAX_INIT_NEED_CAP=0
 MAX_INIT_PENDING_HAVE_CAP=0
 MAX_INIT_FALLBACK_CAP=0
+MAX_INIT_NEED_QUEUE=0
 MAX_INIT_INGEST_USED=0
 MAX_INIT_INGEST_CAP=0
 MAX_RESP_INGEST_USED=0
@@ -250,6 +251,8 @@ EOF
           split($i,a,"="); if (a[2] > max_init_pending_have_cap) max_init_pending_have_cap = a[2]
         } else if ($i ~ /^fallback_cap=/) {
           split($i,a,"="); if (a[2] > max_init_fallback_cap) max_init_fallback_cap = a[2]
+        } else if ($i ~ /^need_queue=/) {
+          split($i,a,"="); if (a[2] > max_init_need_queue) max_init_need_queue = a[2]
         } else if ($i ~ /^ingest_used=/) {
           split($i,a,"="); split(a[2],b,"/")
           used = b[1] + 0; cap = b[2] + 0
@@ -331,6 +334,7 @@ EOF
       printf "MAX_INIT_NEED_CAP=%d\n", max_init_need_cap
       printf "MAX_INIT_PENDING_HAVE_CAP=%d\n", max_init_pending_have_cap
       printf "MAX_INIT_FALLBACK_CAP=%d\n", max_init_fallback_cap
+      printf "MAX_INIT_NEED_QUEUE=%d\n", max_init_need_queue
       printf "MAX_INIT_INGEST_USED=%d\n", max_init_ingest_used
       printf "MAX_INIT_INGEST_CAP=%d\n", max_init_ingest_cap
       printf "MAX_RESP_INGEST_USED=%d\n", max_resp_ingest_used
@@ -563,6 +567,7 @@ EOF
     echo "MAX_INIT_NEED_CAP=${MAX_INIT_NEED_CAP}"
     echo "MAX_INIT_PENDING_HAVE_CAP=${MAX_INIT_PENDING_HAVE_CAP}"
     echo "MAX_INIT_FALLBACK_CAP=${MAX_INIT_FALLBACK_CAP}"
+    echo "MAX_INIT_NEED_QUEUE=${MAX_INIT_NEED_QUEUE}"
     echo "MAX_INIT_INGEST_USED=${MAX_INIT_INGEST_USED}"
     echo "MAX_INIT_INGEST_CAP=${MAX_INIT_INGEST_CAP}"
     echo "MAX_RESP_INGEST_USED=${MAX_RESP_INGEST_USED}"
@@ -604,6 +609,7 @@ EOF
   fi
   echo "6) Receiver wanted backlog peak: ${MAX_INIT_WANTED}"
   echo "7) Initiator vector caps (have/need/pending/fallback): ${MAX_INIT_HAVE_CAP}/${MAX_INIT_NEED_CAP}/${MAX_INIT_PENDING_HAVE_CAP}/${MAX_INIT_FALLBACK_CAP}"
+  echo "7a) Deferred need queue peak (DB-backed): ${MAX_INIT_NEED_QUEUE}"
   echo "8) Receiver db-shm peak: ${max_db_shm} KB (non-dominant if small)"
   if [ -s "${bob_anon_regions}" ]; then
     echo "Top anonymous regions by RSS:"

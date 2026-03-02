@@ -11,6 +11,7 @@ use negentropy::Id;
 use tracing::info;
 
 use crate::crypto::EventId;
+use crate::db::need_queue::NeedQueue;
 use crate::db::wanted::WantedEvents;
 use crate::protocol::{neg_id_to_event_id, Frame};
 use crate::tuning::{low_mem_mode, low_mem_wanted_high_watermark, low_mem_wanted_low_watermark};
@@ -71,6 +72,8 @@ const FALLBACK_THRESHOLD_FACTOR: usize = 20;
 pub async fn dispatch_owned_need_ids<C>(
     control: &mut C,
     wanted: &WantedEvents<'_>,
+    need_queue: &NeedQueue<'_>,
+    peer_id: &str,
     need_ids: &mut Vec<Id>,
     fallback_need_ids: &mut Vec<EventId>,
     coordination: &PeerCoord,
@@ -79,10 +82,6 @@ pub async fn dispatch_owned_need_ids<C>(
 where
     C: StreamConn,
 {
-    if need_ids.is_empty() {
-        return Ok(());
-    }
-
     let peer_idx = coordination.peer_idx;
     let total_peers = coordination.total_peers.load(Ordering::Relaxed);
     let pending_wanted = wanted
@@ -91,9 +90,6 @@ where
         .and_then(|v| usize::try_from(v).ok())
         .unwrap_or(0);
 
-    // When need_ids are few, claim all — these are likely source-unique events
-    // that can only be fetched from this specific source.
-    let claim_all = need_ids.len() <= total_peers * FALLBACK_THRESHOLD_FACTOR;
     let (low_watermark, high_watermark) = if low_mem_mode() {
         let high = low_mem_wanted_high_watermark().max(1);
         let low = low_mem_wanted_low_watermark().min(high.saturating_sub(1));
@@ -117,18 +113,52 @@ where
         usize::MAX
     };
 
+    // In low-memory mode, first drain deferred need IDs from the DB-backed
+    // queue up to current credit. This keeps large backlogs off anonymous heap.
+    let mut remaining_credit = owned_credit;
+    let mut queued_dispatched = 0usize;
+    if low_mem_mode() && remaining_credit > 0 {
+        loop {
+            let pull = remaining_credit.min(NEED_CHUNK);
+            let queued = need_queue.peek_batch(peer_id, pull)?;
+            if queued.is_empty() {
+                break;
+            }
+            for event_id in &queued {
+                let _ = wanted.insert(event_id);
+            }
+            let queued_len = queued.len();
+            control.send(&Frame::HaveList { ids: queued.clone() }).await?;
+            control.flush().await?;
+            let _ = need_queue.remove_many(peer_id, &queued)?;
+            queued_dispatched += queued_len;
+            remaining_credit = remaining_credit.saturating_sub(queued_len);
+            if remaining_credit == 0 {
+                break;
+            }
+        }
+    }
+
+    if need_ids.is_empty() {
+        return Ok(());
+    }
+
+    // When need_ids are few, claim all — these are likely source-unique events
+    // that can only be fetched from this specific source.
+    let claim_all = need_ids.len() <= total_peers * FALLBACK_THRESHOLD_FACTOR;
     let mut batch: Vec<EventId> = Vec::with_capacity(NEED_CHUNK);
-    let mut owned_count = 0usize;
+    let mut owned_sent_now = 0usize;
     let mut deferred_owned = 0usize;
+    let mut deferred_to_queue: Vec<EventId> = Vec::new();
     let mut remaining_need_ids: Vec<Id> = Vec::new();
 
     for neg_id in need_ids.drain(..) {
         let event_id = neg_id_to_event_id(&neg_id);
         if claim_all || is_event_owned(&event_id, peer_idx, total_peers) {
-            if owned_count < owned_credit {
+            if owned_sent_now < remaining_credit {
                 let _ = wanted.insert(&event_id);
                 batch.push(event_id);
-                owned_count += 1;
+                owned_sent_now += 1;
                 if batch.len() >= NEED_CHUNK {
                     control.send(&Frame::HaveList { ids: batch }).await?;
                     control.flush().await?;
@@ -136,19 +166,37 @@ where
                 }
             } else {
                 deferred_owned += 1;
-                remaining_need_ids.push(neg_id);
+                if low_mem_mode() {
+                    deferred_to_queue.push(event_id);
+                } else {
+                    remaining_need_ids.push(neg_id);
+                }
             }
         } else {
             fallback_need_ids.push(event_id);
         }
     }
-    *need_ids = remaining_need_ids;
 
     if !batch.is_empty() {
         control.send(&Frame::HaveList { ids: batch }).await?;
         control.flush().await?;
     }
 
+    if low_mem_mode() {
+        if !deferred_to_queue.is_empty() {
+            let _ = need_queue.insert_many(peer_id, &deferred_to_queue)?;
+        }
+        need_ids.clear();
+        // Reconciliation can transiently expand this buffer to very large
+        // capacities; trim aggressively in low-memory mode.
+        if need_ids.capacity() > (NEED_CHUNK * 16) {
+            need_ids.shrink_to(0);
+        }
+    } else {
+        *need_ids = remaining_need_ids;
+    }
+
+    let owned_count = queued_dispatched + owned_sent_now;
     if owned_count > 0 || !fallback_need_ids.is_empty() {
         info!(
             "Ownership dispatch: {} claimed (sent), {} deferred, peer_idx={}, total={}, claim_all={}",

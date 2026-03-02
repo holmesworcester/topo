@@ -15,6 +15,7 @@ use crate::contracts::event_pipeline_contract::IngestItem;
 use crate::crypto::EventId;
 use crate::db::{
     egress_queue::EgressQueue,
+    need_queue::NeedQueue,
     open_connection,
     store::{lookup_workspace_id, Store},
     wanted::WantedEvents,
@@ -85,8 +86,10 @@ where
 
     let egress = EgressQueue::new(&db);
     let wanted = WantedEvents::new(&db);
+    let need_queue = NeedQueue::new(&db);
     let _ = egress.clear_connection(peer_id);
     let _ = wanted.clear();
+    let _ = need_queue.clear(peer_id);
 
     let ws_id = lookup_workspace_id(&db, recorded_by)
         .ok_or_else(|| format!("no trust anchor for peer_id={}, cannot start sync", recorded_by))?;
@@ -212,12 +215,13 @@ where
             Err(_) => {}
         }
 
-        // Streaming ownership dispatch: owned events get HaveList immediately
-        // when wanted backlog is below watermark; otherwise they remain in
-        // `need_ids` and are retried on subsequent loop ticks.
+        // Streaming ownership dispatch: in low-mem mode, owned IDs that exceed
+        // current credit are queued in SQLite and retried from there.
         dispatch_owned_need_ids(
             &mut control,
             &wanted,
+            &need_queue,
+            peer_id,
             &mut need_ids,
             &mut fallback_need_ids,
             coordination,
@@ -267,13 +271,14 @@ where
         if memtrace_enabled && last_memtrace.elapsed() >= memtrace_interval {
             let egress_pending = egress.count_pending(peer_id).unwrap_or(-1);
             let wanted_pending = wanted.count().unwrap_or(-1);
+            let need_queue_pending = need_queue.count(peer_id).unwrap_or(-1);
             let ingest_cap = ingest_tx.max_capacity();
             let ingest_used = ingest_cap.saturating_sub(ingest_tx.capacity());
             let sqlite_global = memtrace::sqlite_global_memory();
             let sqlite_main = memtrace::sqlite_db_memory(&db);
             let sqlite_neg = memtrace::sqlite_db_memory(&neg_db);
             let line = format!(
-                "LOWMEM_MEMTRACE initiator peer={} rounds={} have={} need={} have_cap={} need_cap={} pending_have={} pending_have_cap={} fallback_need={} fallback_cap={} wanted={} egress_pending={} ingest_used={}/{} sqlite_mem_cur={} sqlite_mem_high={} sqlite_pcache_ovfl_cur={} sqlite_pcache_ovfl_high={} db_main_cache={} db_main_schema={} db_main_stmt={} db_neg_cache={} db_neg_schema={} db_neg_stmt={} bytes_rx={} bytes_tx={}",
+                "LOWMEM_MEMTRACE initiator peer={} rounds={} have={} need={} have_cap={} need_cap={} pending_have={} pending_have_cap={} fallback_need={} fallback_cap={} wanted={} need_queue={} egress_pending={} ingest_used={}/{} sqlite_mem_cur={} sqlite_mem_high={} sqlite_pcache_ovfl_cur={} sqlite_pcache_ovfl_high={} db_main_cache={} db_main_schema={} db_main_stmt={} db_neg_cache={} db_neg_schema={} db_neg_stmt={} bytes_rx={} bytes_tx={}",
                 peer_id,
                 rounds,
                 have_ids.len(),
@@ -285,6 +290,7 @@ where
                 fallback_need_ids.len(),
                 fallback_need_ids.capacity(),
                 wanted_pending,
+                need_queue_pending,
                 egress_pending,
                 ingest_used,
                 ingest_cap,
@@ -311,8 +317,10 @@ where
 
         // Once reconciliation is done, fallback is dispatched, pending_have
         // is drained, and egress queue is empty, send DataDone+Done.
+        let pending_need_queue = need_queue.count(peer_id).unwrap_or(0);
         if reconciliation_done
             && need_ids.is_empty()
+            && pending_need_queue == 0
             && fallback_dispatched
             && pending_have.is_empty()
             && !done_sent
@@ -341,6 +349,7 @@ where
     if completed {
         let _ = egress.clear_connection(peer_id);
         let _ = wanted.clear();
+        let _ = need_queue.clear(peer_id);
         let _ = egress.cleanup_sent(EGRESS_SENT_TTL_MS);
     }
     if use_snapshot {
