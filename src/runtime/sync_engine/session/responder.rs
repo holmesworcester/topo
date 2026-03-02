@@ -233,8 +233,10 @@ where
             let egress_pending = egress.count_pending(peer_id).unwrap_or(-1);
             let ingest_cap = ingest_tx.max_capacity();
             let ingest_used = ingest_cap.saturating_sub(ingest_tx.capacity());
+            let sqlite_global = memtrace::sqlite_global_memory();
+            let sqlite_db = memtrace::sqlite_db_memory(&db);
             let line = format!(
-                "LOWMEM_MEMTRACE responder peer={} rounds={} reconciling={} peer_done={} egress_pending={} ingest_used={}/{} bytes_rx={} bytes_tx={}",
+                "LOWMEM_MEMTRACE responder peer={} rounds={} reconciling={} peer_done={} egress_pending={} ingest_used={}/{} sqlite_mem_cur={} sqlite_mem_high={} sqlite_pcache_ovfl_cur={} sqlite_pcache_ovfl_high={} db_cache={} db_schema={} db_stmt={} bytes_rx={} bytes_tx={}",
                 peer_id,
                 rounds,
                 reconciling,
@@ -242,6 +244,17 @@ where
                 egress_pending,
                 ingest_used,
                 ingest_cap,
+                sqlite_global.map(|s| s.memory_used_bytes).unwrap_or(-1),
+                sqlite_global.map(|s| s.memory_high_bytes).unwrap_or(-1),
+                sqlite_global
+                    .map(|s| s.pagecache_overflow_bytes)
+                    .unwrap_or(-1),
+                sqlite_global
+                    .map(|s| s.pagecache_overflow_high_bytes)
+                    .unwrap_or(-1),
+                sqlite_db.map(|s| s.cache_used_bytes).unwrap_or(-1),
+                sqlite_db.map(|s| s.schema_used_bytes).unwrap_or(-1),
+                sqlite_db.map(|s| s.stmt_used_bytes).unwrap_or(-1),
                 bytes_received.load(Ordering::Relaxed),
                 bytes_sent,
             );

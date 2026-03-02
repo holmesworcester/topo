@@ -116,17 +116,21 @@ sample_smaps_breakdown() {
   local db_shm="${db}-shm"
   local db_wal="${db}-wal"
   awk -v db="${db}" -v dbshm="${db_shm}" -v dbwal="${db_wal}" '
-    BEGIN { current = "anon"; total = 0 }
+    BEGIN { current = "anon_unlabeled"; total = 0 }
     /^[0-9a-f]+-[0-9a-f]+[[:space:]]/ {
       path = ""
       if (NF >= 6) {
         path = $6
         for (i = 7; i <= NF; i++) path = path " " $i
       }
-      current = "anon"
+      current = "anon_unlabeled"
       if (path == db) current = "db"
       else if (path == dbshm) current = "db_shm"
       else if (path == dbwal) current = "db_wal"
+      else if (path == "[heap]") current = "anon_heap"
+      else if (path ~ /^\[stack/) current = "anon_stack"
+      else if (path ~ /^\[anon:/) current = "anon_named"
+      else if (path ~ /^\[/) current = "anon_other_bracket"
       else if (path ~ /^\//) current = "file_other"
     }
     /^Rss:[[:space:]]+/ {
@@ -135,10 +139,45 @@ sample_smaps_breakdown() {
       total += v
     }
     END {
-      printf "anon_kb=%d db_kb=%d db_shm_kb=%d db_wal_kb=%d file_other_kb=%d total_kb=%d\n",
-             rss["anon"], rss["db"], rss["db_shm"], rss["db_wal"], rss["file_other"], total
+      anon_total = rss["anon_unlabeled"] + rss["anon_heap"] + rss["anon_stack"] + rss["anon_named"] + rss["anon_other_bracket"]
+      printf "anon_kb=%d anon_unlabeled_kb=%d anon_heap_kb=%d anon_stack_kb=%d anon_named_kb=%d anon_other_bracket_kb=%d db_kb=%d db_shm_kb=%d db_wal_kb=%d file_other_kb=%d total_kb=%d\n",
+             anon_total, rss["anon_unlabeled"], rss["anon_heap"], rss["anon_stack"], rss["anon_named"], rss["anon_other_bracket"], rss["db"], rss["db_shm"], rss["db_wal"], rss["file_other"], total
     }
   ' "/proc/${pid}/smaps" 2>/dev/null | awk -v ts="$(date +%s)" '{print ts, $0}' >> "${out_log}"
+}
+
+capture_top_anon_regions() {
+  local pid="$1"
+  local out_file="$2"
+  awk '
+    function flush_region() {
+      if (!in_region) return
+      if (path == "" || path ~ /^\[/) {
+        display = path
+        if (display == "") display = "<anonymous>"
+        printf "%10d KB  range=%s perms=%s path=%s\n", rss_kb, range, perms, display
+      }
+    }
+    /^[0-9a-f]+-[0-9a-f]+[[:space:]]/ {
+      flush_region()
+      in_region = 1
+      rss_kb = 0
+      range = $1
+      perms = $2
+      path = ""
+      if (NF >= 6) {
+        path = $6
+        for (i = 7; i <= NF; i++) path = path " " $i
+      }
+      next
+    }
+    /^Rss:[[:space:]]+/ {
+      rss_kb = $2 + 0
+    }
+    END {
+      flush_region()
+    }
+  ' "/proc/${pid}/smaps" 2>/dev/null | sort -nr | head -n 25 > "${out_file}"
 }
 
 stop_daemon() {
@@ -165,6 +204,10 @@ MEMTRACE_PRESENT=0
 MAX_INIT_WANTED=0
 MAX_INIT_PENDING_HAVE=0
 MAX_INIT_FALLBACK_NEED=0
+MAX_INIT_HAVE_CAP=0
+MAX_INIT_NEED_CAP=0
+MAX_INIT_PENDING_HAVE_CAP=0
+MAX_INIT_FALLBACK_CAP=0
 MAX_INIT_INGEST_USED=0
 MAX_INIT_INGEST_CAP=0
 MAX_RESP_INGEST_USED=0
@@ -173,6 +216,19 @@ MAX_DATA_INGEST_USED=0
 MAX_DATA_INGEST_CAP=0
 MAX_DATA_EVENTS_INGESTED=0
 MAX_DATA_BLOB=0
+MAX_SQLITE_MEM_CUR=0
+MAX_SQLITE_MEM_HIGH=0
+MAX_SQLITE_PCACHE_OVFL_CUR=0
+MAX_SQLITE_PCACHE_OVFL_HIGH=0
+MAX_INIT_DB_MAIN_CACHE=0
+MAX_INIT_DB_MAIN_SCHEMA=0
+MAX_INIT_DB_MAIN_STMT=0
+MAX_INIT_DB_NEG_CACHE=0
+MAX_INIT_DB_NEG_SCHEMA=0
+MAX_INIT_DB_NEG_STMT=0
+MAX_RESP_DB_CACHE=0
+MAX_RESP_DB_SCHEMA=0
+MAX_RESP_DB_STMT=0
 EOF
     return 0
   fi
@@ -186,6 +242,14 @@ EOF
           split($i,a,"="); if (a[2] > max_init_pending_have) max_init_pending_have = a[2]
         } else if ($i ~ /^fallback_need=/) {
           split($i,a,"="); if (a[2] > max_init_fallback_need) max_init_fallback_need = a[2]
+        } else if ($i ~ /^have_cap=/) {
+          split($i,a,"="); if (a[2] > max_init_have_cap) max_init_have_cap = a[2]
+        } else if ($i ~ /^need_cap=/) {
+          split($i,a,"="); if (a[2] > max_init_need_cap) max_init_need_cap = a[2]
+        } else if ($i ~ /^pending_have_cap=/) {
+          split($i,a,"="); if (a[2] > max_init_pending_have_cap) max_init_pending_have_cap = a[2]
+        } else if ($i ~ /^fallback_cap=/) {
+          split($i,a,"="); if (a[2] > max_init_fallback_cap) max_init_fallback_cap = a[2]
         } else if ($i ~ /^ingest_used=/) {
           split($i,a,"="); split(a[2],b,"/")
           used = b[1] + 0; cap = b[2] + 0
@@ -193,6 +257,26 @@ EOF
             max_init_ingest_used = used
             max_init_ingest_cap = cap
           }
+        } else if ($i ~ /^sqlite_mem_cur=/) {
+          split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_sqlite_mem_cur) max_sqlite_mem_cur = a[2]
+        } else if ($i ~ /^sqlite_mem_high=/) {
+          split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_sqlite_mem_high) max_sqlite_mem_high = a[2]
+        } else if ($i ~ /^sqlite_pcache_ovfl_cur=/) {
+          split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_sqlite_pcache_ovfl_cur) max_sqlite_pcache_ovfl_cur = a[2]
+        } else if ($i ~ /^sqlite_pcache_ovfl_high=/) {
+          split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_sqlite_pcache_ovfl_high) max_sqlite_pcache_ovfl_high = a[2]
+        } else if ($i ~ /^db_main_cache=/) {
+          split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_init_db_main_cache) max_init_db_main_cache = a[2]
+        } else if ($i ~ /^db_main_schema=/) {
+          split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_init_db_main_schema) max_init_db_main_schema = a[2]
+        } else if ($i ~ /^db_main_stmt=/) {
+          split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_init_db_main_stmt) max_init_db_main_stmt = a[2]
+        } else if ($i ~ /^db_neg_cache=/) {
+          split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_init_db_neg_cache) max_init_db_neg_cache = a[2]
+        } else if ($i ~ /^db_neg_schema=/) {
+          split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_init_db_neg_schema) max_init_db_neg_schema = a[2]
+        } else if ($i ~ /^db_neg_stmt=/) {
+          split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_init_db_neg_stmt) max_init_db_neg_stmt = a[2]
         }
       }
     }
@@ -205,6 +289,20 @@ EOF
             max_resp_ingest_used = used
             max_resp_ingest_cap = cap
           }
+        } else if ($i ~ /^sqlite_mem_cur=/) {
+          split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_sqlite_mem_cur) max_sqlite_mem_cur = a[2]
+        } else if ($i ~ /^sqlite_mem_high=/) {
+          split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_sqlite_mem_high) max_sqlite_mem_high = a[2]
+        } else if ($i ~ /^sqlite_pcache_ovfl_cur=/) {
+          split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_sqlite_pcache_ovfl_cur) max_sqlite_pcache_ovfl_cur = a[2]
+        } else if ($i ~ /^sqlite_pcache_ovfl_high=/) {
+          split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_sqlite_pcache_ovfl_high) max_sqlite_pcache_ovfl_high = a[2]
+        } else if ($i ~ /^db_cache=/) {
+          split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_resp_db_cache) max_resp_db_cache = a[2]
+        } else if ($i ~ /^db_schema=/) {
+          split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_resp_db_schema) max_resp_db_schema = a[2]
+        } else if ($i ~ /^db_stmt=/) {
+          split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_resp_db_stmt) max_resp_db_stmt = a[2]
         }
       }
     }
@@ -229,6 +327,10 @@ EOF
       printf "MAX_INIT_WANTED=%d\n", max_init_wanted
       printf "MAX_INIT_PENDING_HAVE=%d\n", max_init_pending_have
       printf "MAX_INIT_FALLBACK_NEED=%d\n", max_init_fallback_need
+      printf "MAX_INIT_HAVE_CAP=%d\n", max_init_have_cap
+      printf "MAX_INIT_NEED_CAP=%d\n", max_init_need_cap
+      printf "MAX_INIT_PENDING_HAVE_CAP=%d\n", max_init_pending_have_cap
+      printf "MAX_INIT_FALLBACK_CAP=%d\n", max_init_fallback_cap
       printf "MAX_INIT_INGEST_USED=%d\n", max_init_ingest_used
       printf "MAX_INIT_INGEST_CAP=%d\n", max_init_ingest_cap
       printf "MAX_RESP_INGEST_USED=%d\n", max_resp_ingest_used
@@ -237,6 +339,19 @@ EOF
       printf "MAX_DATA_INGEST_CAP=%d\n", max_data_ingest_cap
       printf "MAX_DATA_EVENTS_INGESTED=%d\n", max_data_events
       printf "MAX_DATA_BLOB=%d\n", max_data_blob
+      printf "MAX_SQLITE_MEM_CUR=%d\n", max_sqlite_mem_cur
+      printf "MAX_SQLITE_MEM_HIGH=%d\n", max_sqlite_mem_high
+      printf "MAX_SQLITE_PCACHE_OVFL_CUR=%d\n", max_sqlite_pcache_ovfl_cur
+      printf "MAX_SQLITE_PCACHE_OVFL_HIGH=%d\n", max_sqlite_pcache_ovfl_high
+      printf "MAX_INIT_DB_MAIN_CACHE=%d\n", max_init_db_main_cache
+      printf "MAX_INIT_DB_MAIN_SCHEMA=%d\n", max_init_db_main_schema
+      printf "MAX_INIT_DB_MAIN_STMT=%d\n", max_init_db_main_stmt
+      printf "MAX_INIT_DB_NEG_CACHE=%d\n", max_init_db_neg_cache
+      printf "MAX_INIT_DB_NEG_SCHEMA=%d\n", max_init_db_neg_schema
+      printf "MAX_INIT_DB_NEG_STMT=%d\n", max_init_db_neg_stmt
+      printf "MAX_RESP_DB_CACHE=%d\n", max_resp_db_cache
+      printf "MAX_RESP_DB_SCHEMA=%d\n", max_resp_db_schema
+      printf "MAX_RESP_DB_STMT=%d\n", max_resp_db_stmt
     }
   ' "${memtrace_log}" > "${out_file}"
 }
@@ -249,6 +364,7 @@ run_asymmetric_proxy() {
   local bob_db="${run_dir}/bob.db"
   local samples_log="${run_dir}/samples.log"
   local bob_smaps_log="${run_dir}/bob_smaps.log"
+  local bob_anon_regions="${run_dir}/bob_anon_regions.txt"
   local memtrace_log="${run_dir}/memtrace.log"
   local memtrace_summary="${run_dir}/memtrace_summary.env"
   local summary_file="${run_dir}/summary.txt"
@@ -346,6 +462,7 @@ run_asymmetric_proxy() {
     --timeout-ms "${assert_timeout_ms}" --interval-ms 200 >/dev/null
 
   sleep 2
+  capture_top_anon_regions "${bob_pid}" "${bob_anon_regions}"
   if [ -n "${sampler_pid}" ]; then
     kill "${sampler_pid}" >/dev/null 2>&1 || true
     wait "${sampler_pid}" >/dev/null 2>&1 || true
@@ -376,12 +493,17 @@ $(awk '
 ' "${samples_log}")
 EOF
 
-  local max_anon max_db max_db_shm max_db_wal max_file_other max_total
-  read -r max_anon max_db max_db_shm max_db_wal max_file_other max_total <<EOF
+  local max_anon max_anon_unlabeled max_anon_heap max_anon_stack max_anon_named max_anon_other_bracket max_db max_db_shm max_db_wal max_file_other max_total
+  read -r max_anon max_anon_unlabeled max_anon_heap max_anon_stack max_anon_named max_anon_other_bracket max_db max_db_shm max_db_wal max_file_other max_total <<EOF
 $(awk '
   {
     for (i=1; i<=NF; i++) {
       if ($i ~ /^anon_kb=/) { split($i,a,"="); if (a[2] > max_anon) max_anon = a[2] }
+      if ($i ~ /^anon_unlabeled_kb=/) { split($i,a,"="); if (a[2] > max_anon_unlabeled) max_anon_unlabeled = a[2] }
+      if ($i ~ /^anon_heap_kb=/) { split($i,a,"="); if (a[2] > max_anon_heap) max_anon_heap = a[2] }
+      if ($i ~ /^anon_stack_kb=/) { split($i,a,"="); if (a[2] > max_anon_stack) max_anon_stack = a[2] }
+      if ($i ~ /^anon_named_kb=/) { split($i,a,"="); if (a[2] > max_anon_named) max_anon_named = a[2] }
+      if ($i ~ /^anon_other_bracket_kb=/) { split($i,a,"="); if (a[2] > max_anon_other_bracket) max_anon_other_bracket = a[2] }
       if ($i ~ /^db_kb=/) { split($i,a,"="); if (a[2] > max_db) max_db = a[2] }
       if ($i ~ /^db_shm_kb=/) { split($i,a,"="); if (a[2] > max_db_shm) max_db_shm = a[2] }
       if ($i ~ /^db_wal_kb=/) { split($i,a,"="); if (a[2] > max_db_wal) max_db_wal = a[2] }
@@ -389,7 +511,7 @@ $(awk '
       if ($i ~ /^total_kb=/) { split($i,a,"="); if (a[2] > max_total) max_total = a[2] }
     }
   }
-  END { printf "%d %d %d %d %d %d\n", max_anon, max_db, max_db_shm, max_db_wal, max_file_other, max_total }
+  END { printf "%d %d %d %d %d %d %d %d %d %d %d\n", max_anon, max_anon_unlabeled, max_anon_heap, max_anon_stack, max_anon_named, max_anon_other_bracket, max_db, max_db_shm, max_db_wal, max_file_other, max_total }
 ' "${bob_smaps_log}")
 EOF
 
@@ -404,6 +526,13 @@ EOF
     anon_pct=0
   fi
 
+  local sqlite_mem_kb anon_minus_sqlite_kb
+  sqlite_mem_kb=$(( (MAX_SQLITE_MEM_CUR + 1023) / 1024 ))
+  anon_minus_sqlite_kb=$(( max_anon - sqlite_mem_kb ))
+  if [ "${anon_minus_sqlite_kb}" -lt 0 ]; then
+    anon_minus_sqlite_kb=0
+  fi
+
   {
     echo "RUN_DIR=${run_dir}"
     echo "ALICE_PID=${alice_pid}"
@@ -415,6 +544,11 @@ EOF
     echo "MAX_ALICE_SHM_KB=${max_alice_shm}"
     echo "MAX_BOB_SHM_KB=${max_bob_shm}"
     echo "MAX_BOB_ANON_KB=${max_anon}"
+    echo "MAX_BOB_ANON_UNLABELED_KB=${max_anon_unlabeled}"
+    echo "MAX_BOB_ANON_HEAP_KB=${max_anon_heap}"
+    echo "MAX_BOB_ANON_STACK_KB=${max_anon_stack}"
+    echo "MAX_BOB_ANON_NAMED_KB=${max_anon_named}"
+    echo "MAX_BOB_ANON_OTHER_BRACKET_KB=${max_anon_other_bracket}"
     echo "MAX_BOB_DB_KB=${max_db}"
     echo "MAX_BOB_DB_SHM_KB=${max_db_shm}"
     echo "MAX_BOB_DB_WAL_KB=${max_db_wal}"
@@ -425,6 +559,10 @@ EOF
     echo "MAX_INIT_WANTED=${MAX_INIT_WANTED}"
     echo "MAX_INIT_PENDING_HAVE=${MAX_INIT_PENDING_HAVE}"
     echo "MAX_INIT_FALLBACK_NEED=${MAX_INIT_FALLBACK_NEED}"
+    echo "MAX_INIT_HAVE_CAP=${MAX_INIT_HAVE_CAP}"
+    echo "MAX_INIT_NEED_CAP=${MAX_INIT_NEED_CAP}"
+    echo "MAX_INIT_PENDING_HAVE_CAP=${MAX_INIT_PENDING_HAVE_CAP}"
+    echo "MAX_INIT_FALLBACK_CAP=${MAX_INIT_FALLBACK_CAP}"
     echo "MAX_INIT_INGEST_USED=${MAX_INIT_INGEST_USED}"
     echo "MAX_INIT_INGEST_CAP=${MAX_INIT_INGEST_CAP}"
     echo "MAX_RESP_INGEST_USED=${MAX_RESP_INGEST_USED}"
@@ -433,6 +571,20 @@ EOF
     echo "MAX_DATA_INGEST_CAP=${MAX_DATA_INGEST_CAP}"
     echo "MAX_DATA_EVENTS_INGESTED=${MAX_DATA_EVENTS_INGESTED}"
     echo "MAX_DATA_BLOB=${MAX_DATA_BLOB}"
+    echo "MAX_SQLITE_MEM_CUR=${MAX_SQLITE_MEM_CUR}"
+    echo "MAX_SQLITE_MEM_HIGH=${MAX_SQLITE_MEM_HIGH}"
+    echo "MAX_SQLITE_PCACHE_OVFL_CUR=${MAX_SQLITE_PCACHE_OVFL_CUR}"
+    echo "MAX_SQLITE_PCACHE_OVFL_HIGH=${MAX_SQLITE_PCACHE_OVFL_HIGH}"
+    echo "MAX_INIT_DB_MAIN_CACHE=${MAX_INIT_DB_MAIN_CACHE}"
+    echo "MAX_INIT_DB_MAIN_SCHEMA=${MAX_INIT_DB_MAIN_SCHEMA}"
+    echo "MAX_INIT_DB_MAIN_STMT=${MAX_INIT_DB_MAIN_STMT}"
+    echo "MAX_INIT_DB_NEG_CACHE=${MAX_INIT_DB_NEG_CACHE}"
+    echo "MAX_INIT_DB_NEG_SCHEMA=${MAX_INIT_DB_NEG_SCHEMA}"
+    echo "MAX_INIT_DB_NEG_STMT=${MAX_INIT_DB_NEG_STMT}"
+    echo "MAX_RESP_DB_CACHE=${MAX_RESP_DB_CACHE}"
+    echo "MAX_RESP_DB_SCHEMA=${MAX_RESP_DB_SCHEMA}"
+    echo "MAX_RESP_DB_STMT=${MAX_RESP_DB_STMT}"
+    echo "MAX_BOB_ANON_MINUS_SQLITE_KB=${anon_minus_sqlite_kb}"
   } > "${summary_file}"
 
   banner "Proxy Summary"
@@ -441,19 +593,28 @@ EOF
   echo
   echo "Big Users (heuristic):"
   echo "1) Receiver anonymous memory: ${max_anon} KB (${anon_pct}% of total ${max_total} KB)"
+  echo "2) SQLite tracked heap (process-global): ${MAX_SQLITE_MEM_CUR} bytes (~${sqlite_mem_kb} KB)"
+  echo "3) Receiver anon minus tracked SQLite heap: ${anon_minus_sqlite_kb} KB"
+  echo "3a) Anon breakdown (unlabeled/heap/stack/named/[bracket-other]): ${max_anon_unlabeled}/${max_anon_heap}/${max_anon_stack}/${max_anon_named}/${max_anon_other_bracket} KB"
   if [ "${MAX_RESP_INGEST_CAP}" -gt 0 ]; then
-    echo "2) Responder ingest queue pressure: ${MAX_RESP_INGEST_USED}/${MAX_RESP_INGEST_CAP}"
+    echo "4) Responder ingest queue pressure: ${MAX_RESP_INGEST_USED}/${MAX_RESP_INGEST_CAP}"
   fi
   if [ "${MAX_DATA_INGEST_CAP}" -gt 0 ]; then
-    echo "3) Data receiver ingest queue pressure: ${MAX_DATA_INGEST_USED}/${MAX_DATA_INGEST_CAP}"
+    echo "5) Data receiver ingest queue pressure: ${MAX_DATA_INGEST_USED}/${MAX_DATA_INGEST_CAP}"
   fi
-  echo "4) Receiver wanted backlog peak: ${MAX_INIT_WANTED}"
-  echo "5) Receiver db-shm peak: ${max_db_shm} KB (non-dominant if small)"
+  echo "6) Receiver wanted backlog peak: ${MAX_INIT_WANTED}"
+  echo "7) Initiator vector caps (have/need/pending/fallback): ${MAX_INIT_HAVE_CAP}/${MAX_INIT_NEED_CAP}/${MAX_INIT_PENDING_HAVE_CAP}/${MAX_INIT_FALLBACK_CAP}"
+  echo "8) Receiver db-shm peak: ${max_db_shm} KB (non-dominant if small)"
+  if [ -s "${bob_anon_regions}" ]; then
+    echo "Top anonymous regions by RSS:"
+    sed -n '1,5p' "${bob_anon_regions}"
+  fi
   echo
   echo "Artifacts:"
   echo "  ${summary_file}"
   echo "  ${samples_log}"
   echo "  ${bob_smaps_log}"
+  echo "  ${bob_anon_regions}"
   echo "  ${memtrace_log}"
 }
 
@@ -485,4 +646,3 @@ case "${MODE}" in
     exit 2
     ;;
 esac
-

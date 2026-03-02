@@ -269,18 +269,39 @@ where
             let wanted_pending = wanted.count().unwrap_or(-1);
             let ingest_cap = ingest_tx.max_capacity();
             let ingest_used = ingest_cap.saturating_sub(ingest_tx.capacity());
+            let sqlite_global = memtrace::sqlite_global_memory();
+            let sqlite_main = memtrace::sqlite_db_memory(&db);
+            let sqlite_neg = memtrace::sqlite_db_memory(&neg_db);
             let line = format!(
-                "LOWMEM_MEMTRACE initiator peer={} rounds={} have={} need={} pending_have={} fallback_need={} wanted={} egress_pending={} ingest_used={}/{} bytes_rx={} bytes_tx={}",
+                "LOWMEM_MEMTRACE initiator peer={} rounds={} have={} need={} have_cap={} need_cap={} pending_have={} pending_have_cap={} fallback_need={} fallback_cap={} wanted={} egress_pending={} ingest_used={}/{} sqlite_mem_cur={} sqlite_mem_high={} sqlite_pcache_ovfl_cur={} sqlite_pcache_ovfl_high={} db_main_cache={} db_main_schema={} db_main_stmt={} db_neg_cache={} db_neg_schema={} db_neg_stmt={} bytes_rx={} bytes_tx={}",
                 peer_id,
                 rounds,
                 have_ids.len(),
                 need_ids.len(),
+                have_ids.capacity(),
+                need_ids.capacity(),
                 pending_have.len(),
+                pending_have.capacity(),
                 fallback_need_ids.len(),
+                fallback_need_ids.capacity(),
                 wanted_pending,
                 egress_pending,
                 ingest_used,
                 ingest_cap,
+                sqlite_global.map(|s| s.memory_used_bytes).unwrap_or(-1),
+                sqlite_global.map(|s| s.memory_high_bytes).unwrap_or(-1),
+                sqlite_global
+                    .map(|s| s.pagecache_overflow_bytes)
+                    .unwrap_or(-1),
+                sqlite_global
+                    .map(|s| s.pagecache_overflow_high_bytes)
+                    .unwrap_or(-1),
+                sqlite_main.map(|s| s.cache_used_bytes).unwrap_or(-1),
+                sqlite_main.map(|s| s.schema_used_bytes).unwrap_or(-1),
+                sqlite_main.map(|s| s.stmt_used_bytes).unwrap_or(-1),
+                sqlite_neg.map(|s| s.cache_used_bytes).unwrap_or(-1),
+                sqlite_neg.map(|s| s.schema_used_bytes).unwrap_or(-1),
+                sqlite_neg.map(|s| s.stmt_used_bytes).unwrap_or(-1),
                 bytes_received.load(Ordering::Relaxed),
                 bytes_sent,
             );
