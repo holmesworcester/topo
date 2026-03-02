@@ -141,7 +141,10 @@ async fn run_chain_bench(n: usize, event_count: usize) {
     let hop_p50 = percentile(&hop_delays, 0.50);
     let hop_p95 = percentile(&hop_delays, 0.95);
 
-    let events_per_sec = event_count as f64 / (tail_wall_ms as f64 / 1000.0);
+    let tail_secs = tail_wall_ms as f64 / 1000.0;
+    let events_per_sec = event_count as f64 / tail_secs;
+    let msg_bytes = topo::event_modules::message::MESSAGE_WIRE_SIZE;
+    let mb_per_sec = events_per_sec * msg_bytes as f64 / (1024.0 * 1024.0);
 
     drop(handles);
 
@@ -150,6 +153,7 @@ async fn run_chain_bench(n: usize, event_count: usize) {
     eprintln!("  Tail converge:    {} ms", tail_wall_ms);
     eprintln!("  All converge:     {} ms", all_wall_ms);
     eprintln!("  Events/s (tail):  {:.0}", events_per_sec);
+    eprintln!("  MB/s (tail):      {:.1}", mb_per_sec);
     eprintln!(
         "  Hop latency P50:  {:.1} ms ({} samples)",
         hop_p50,
@@ -245,8 +249,10 @@ async fn run_catchup_bench(source_count: usize, events_per_source: usize) {
 
     let wall_ms = start.elapsed().as_millis() as u64;
     let rss_after = peak_rss_mib();
-    let events_per_sec = expected_sink_message_count as f64 / (wall_ms as f64 / 1000.0);
-    let mb_per_sec = events_per_sec * 100.0 / 1_000_000.0;
+    let wall_secs = wall_ms as f64 / 1000.0;
+    let events_per_sec = expected_sink_message_count as f64 / wall_secs;
+    let msg_bytes = topo::event_modules::message::MESSAGE_WIRE_SIZE;
+    let mb_per_sec = events_per_sec * msg_bytes as f64 / (1024.0 * 1024.0);
 
     // Exact set equality validates full message dataset catchup.
     let sink_ids = sink.event_ids_by_type("message");
@@ -371,12 +377,20 @@ async fn run_catchup_large_file(source_count: usize, total_slices: usize) {
     let source_counts = sink.file_slice_event_counts_by_source();
     let total_attributed: i64 = source_counts.values().sum();
 
+    let wall_secs = wall_ms as f64 / 1000.0;
+    let events_per_sec = total_slices as f64 / wall_secs;
+    let blob_bytes = topo::event_modules::file_slice::FILE_SLICE_WIRE_SIZE;
+    let total_bytes = total_slices as f64 * blob_bytes as f64;
+    let mb_per_sec = total_bytes / wall_secs / (1024.0 * 1024.0);
+
     eprintln!();
     eprintln!(
         "=== Multi-source file catchup: {} sources x {} slices ===",
         source_count, total_slices
     );
     eprintln!("  Catchup wall:     {} ms", wall_ms);
+    eprintln!("  Events/s:         {:.0}", events_per_sec);
+    eprintln!("  MB/s:             {:.1}", mb_per_sec);
     eprintln!("  Total attributed: {}", total_attributed);
     eprintln!(
         "  Peak RSS:         {:.1} MiB (before: {:.1})",
