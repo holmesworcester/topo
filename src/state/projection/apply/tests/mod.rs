@@ -209,7 +209,7 @@ fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (EventId, Signin
 /// are in dependency order (Network, InviteAccepted, UserInviteBoot, etc.).
 /// Caller must insert_event_raw + project_one each blob in order.
 fn build_identity_chain_deferred(
-    recorded_by: &str,
+    _recorded_by: &str,
 ) -> (EventId, SigningKey, Vec<(EventId, Vec<u8>)>) {
     let mut rng = rand::thread_rng();
 
@@ -494,7 +494,7 @@ fn test_project_message_valid() {
 fn test_project_reaction_valid() {
     let conn = setup();
     let recorded_by = "peer1";
-    let net_eid = setup_workspace_event(&conn, recorded_by);
+    let _net_eid = setup_workspace_event(&conn, recorded_by);
 
     // Create identity chain once for this tenant
     let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
@@ -567,7 +567,7 @@ fn test_project_reaction_blocked() {
 fn test_project_unblock_cascade() {
     let conn = setup();
     let recorded_by = "peer1";
-    let net_eid = setup_workspace_event(&conn, recorded_by);
+    let _net_eid = setup_workspace_event(&conn, recorded_by);
 
     // Create identity chain for signing
     let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
@@ -707,7 +707,7 @@ fn test_already_processed() {
 fn test_multi_blocker() {
     let conn = setup();
     let recorded_by = "peer1";
-    let net_eid = setup_workspace_event(&conn, recorded_by);
+    let _net_eid = setup_workspace_event(&conn, recorded_by);
 
     // Create identity chain for signing
     let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
@@ -806,7 +806,7 @@ fn test_signed_content_events_project_with_identity_chain() {
     // the pipeline with proper identity chains.
     let conn = setup();
     let recorded_by = "peer1";
-    let net_eid = setup_workspace_event(&conn, recorded_by);
+    let _net_eid = setup_workspace_event(&conn, recorded_by);
 
     // Create identity chain once for this tenant
     let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
@@ -828,7 +828,7 @@ fn test_dep_global_existence_not_sufficient() {
     let conn = setup();
     let tenant_a = "tenant_a";
     let tenant_b = "tenant_b";
-    let net_eid_a = setup_workspace_event(&conn, tenant_a);
+    let _net_eid_a = setup_workspace_event(&conn, tenant_a);
 
     // Tenant A creates and projects a message
     let (_msg, msg_blob) = make_message(&conn, tenant_a, "target for A");
@@ -1046,8 +1046,8 @@ fn test_two_tenant_contexts_single_db() {
     let conn = setup();
     let tenant_a = "tenant_a";
     let tenant_b = "tenant_b";
-    let net_eid_a = setup_workspace_event(&conn, tenant_a);
-    let net_eid_b = setup_workspace_event(&conn, tenant_b);
+    let _net_eid_a = setup_workspace_event(&conn, tenant_a);
+    let _net_eid_b = setup_workspace_event(&conn, tenant_b);
 
     // Each tenant creates a message with its own identity chain
     let (_msg_a, msg_a_blob) = make_message(&conn, tenant_a, "hello from A");
@@ -1185,7 +1185,7 @@ fn test_project_secret_key_valid() {
 fn test_encrypted_message_valid() {
     let conn = setup();
     let recorded_by = "peer1";
-    let net_eid = setup_workspace_event(&conn, recorded_by);
+    let _net_eid = setup_workspace_event(&conn, recorded_by);
     let key_bytes: [u8; 32] = rand::random();
 
     // Create and project secret key
@@ -1251,7 +1251,7 @@ fn test_encrypted_blocks_on_missing_key() {
 fn test_encrypted_unblocks_when_key_arrives() {
     let conn = setup();
     let recorded_by = "peer1";
-    let net_eid = setup_workspace_event(&conn, recorded_by);
+    let _net_eid = setup_workspace_event(&conn, recorded_by);
     let key_bytes: [u8; 32] = rand::random();
 
     // Pre-compute key event_id
@@ -1464,7 +1464,7 @@ fn test_encrypted_inner_dep_blocks() {
 fn test_encrypted_inner_dep_unblocks() {
     let conn = setup();
     let recorded_by = "peer1";
-    let net_eid = setup_workspace_event(&conn, recorded_by);
+    let _net_eid = setup_workspace_event(&conn, recorded_by);
     let key_bytes: [u8; 32] = rand::random();
 
     // Create and project key
@@ -1550,7 +1550,7 @@ fn test_encrypted_cross_tenant_isolation() {
     let conn = setup();
     let tenant_a = "tenant_a";
     let tenant_b = "tenant_b";
-    let net_eid_a = setup_workspace_event(&conn, tenant_a);
+    let _net_eid_a = setup_workspace_event(&conn, tenant_a);
     let key_bytes: [u8; 32] = rand::random();
 
     // Create and project key for tenant_a only
@@ -2124,7 +2124,7 @@ fn make_deletion(
 fn test_project_message_deletion_valid() {
     let conn = setup();
     let recorded_by = "peer1";
-    let net_eid = setup_workspace_event(&conn, recorded_by);
+    let _net_eid = setup_workspace_event(&conn, recorded_by);
 
     // Create identity chain once for this tenant
     let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
@@ -2178,7 +2178,7 @@ fn test_project_message_deletion_valid() {
 fn test_deletion_cascades_reactions() {
     let conn = setup();
     let recorded_by = "peer1";
-    let net_eid = setup_workspace_event(&conn, recorded_by);
+    let _net_eid = setup_workspace_event(&conn, recorded_by);
 
     // Create identity chain once for this tenant
     let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
@@ -2274,7 +2274,7 @@ fn test_deletion_intent_only_on_missing_target() {
 fn test_deletion_intent_then_target_arrives() {
     let conn = setup();
     let recorded_by = "peer1";
-    let net_eid = setup_workspace_event(&conn, recorded_by);
+    let _net_eid = setup_workspace_event(&conn, recorded_by);
 
     // Create identity chain for signing
     let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
@@ -2334,7 +2334,7 @@ fn test_deletion_intent_then_target_arrives() {
 fn test_deletion_wrong_author_rejects() {
     let conn = setup();
     let recorded_by = "peer1";
-    let net_eid = setup_workspace_event(&conn, recorded_by);
+    let _net_eid = setup_workspace_event(&conn, recorded_by);
 
     // Create identity chain once for this tenant
     let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
@@ -2365,7 +2365,7 @@ fn test_deletion_wrong_author_rejects() {
 fn test_deletion_idempotent() {
     let conn = setup();
     let recorded_by = "peer1";
-    let net_eid = setup_workspace_event(&conn, recorded_by);
+    let _net_eid = setup_workspace_event(&conn, recorded_by);
 
     // Create identity chain for signing
     let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
@@ -2411,7 +2411,7 @@ fn test_deletion_idempotent() {
 fn test_reaction_after_deletion_skipped() {
     let conn = setup();
     let recorded_by = "peer1";
-    let net_eid = setup_workspace_event(&conn, recorded_by);
+    let _net_eid = setup_workspace_event(&conn, recorded_by);
 
     // Create identity chain once for this tenant
     let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
@@ -2761,7 +2761,7 @@ fn test_emit_local_share_scope_no_neg_items() {
 fn test_post_tombstone_wrong_author_deletion_rejects() {
     let conn = setup();
     let recorded_by = "peer1";
-    let net_eid = setup_workspace_event(&conn, recorded_by);
+    let _net_eid = setup_workspace_event(&conn, recorded_by);
 
     // Create identity chain for signing
     let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
@@ -3143,7 +3143,7 @@ fn test_file_slice_tenant_isolation() {
 fn test_project_attachment_valid() {
     let conn = setup();
     let recorded_by = "peer1";
-    let net_eid = setup_workspace_event(&conn, recorded_by);
+    let _net_eid = setup_workspace_event(&conn, recorded_by);
 
     // Create identity chain once for this tenant
     let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
@@ -3252,7 +3252,7 @@ fn test_attachment_blocks_on_both_missing() {
 fn test_attachment_cascade_unblock() {
     let conn = setup();
     let recorded_by = "peer1";
-    let net_eid = setup_workspace_event(&conn, recorded_by);
+    let _net_eid = setup_workspace_event(&conn, recorded_by);
 
     // Create identity chain for signing
     let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
@@ -3904,16 +3904,6 @@ fn test_file_slice_guard_retry_after_cascaded_attachment() {
 fn count_valid(conn: &Connection, recorded_by: &str) -> i64 {
     conn.query_row(
         "SELECT COUNT(*) FROM valid_events WHERE peer_id = ?1",
-        rusqlite::params![recorded_by],
-        |row| row.get(0),
-    )
-    .unwrap()
-}
-
-/// Count rejected events for a tenant.
-fn count_rejected(conn: &Connection, recorded_by: &str) -> i64 {
-    conn.query_row(
-        "SELECT COUNT(*) FROM rejected_events WHERE peer_id = ?1",
         rusqlite::params![recorded_by],
         |row| row.get(0),
     )
@@ -5285,7 +5275,7 @@ fn test_bootstrap_trust_superseded_by_matching_peer_shared() {
         name: "supersede-ws".to_string(),
     });
     let ws_blob = events::encode_event(&ws_event).unwrap();
-    let ws_eid = insert_event_raw(&conn, recorded_by, &ws_blob);
+    let _ws_eid = insert_event_raw(&conn, recorded_by, &ws_blob);
     // Use the workspace_id from the trust anchor (already set by InviteAccepted above)
     // We need to use the same workspace_id. Actually, the workspace event's event_id
     // must match the trust anchor's workspace_id.

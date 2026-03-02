@@ -114,14 +114,6 @@ pub mod fixtures {
         }
     }
 
-    pub fn assert_already_processed(result: &ProjectorResult) {
-        assert!(
-            matches!(result.decision, ProjectionDecision::AlreadyProcessed),
-            "expected AlreadyProcessed, got {:?}",
-            result.decision
-        );
-    }
-
     /// Assert that write_ops contain an InsertOrIgnore to the given table.
     pub fn assert_writes_to_table(result: &ProjectorResult, table: &str) {
         assert!(

@@ -108,8 +108,6 @@ mod tests {
 
     #[test]
     fn test_resolver_selects_by_sni() {
-        use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
-
         let provider = rustls::crypto::ring::default_provider();
 
         let mut resolver = WorkspaceCertResolver::new();
