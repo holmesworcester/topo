@@ -146,6 +146,7 @@ where
     let mut fallback_reported = false;
     let mut fallback_dispatched = false;
     let mut fallback_report_time: Option<Instant> = None;
+    let mut wanted_backpressure_active = false;
 
     let mut last_bytes_received = 0u64;
     let mut last_egress_log = Instant::now();
@@ -193,16 +194,6 @@ where
 
                 append_have_ids_to_pending(&mut have_ids, &mut pending_have);
 
-                // Streaming ownership dispatch: owned events get HaveList
-                // immediately, non-owned buffer for fallback.
-                dispatch_owned_need_ids(
-                    &mut control,
-                    &wanted,
-                    &mut need_ids,
-                    &mut fallback_need_ids,
-                    coordination,
-                )
-                .await?;
             }
             Ok(Ok(Frame::DoneAck)) => {
                 info!("Received DoneAck from responder");
@@ -220,6 +211,19 @@ where
             }
             Err(_) => {}
         }
+
+        // Streaming ownership dispatch: owned events get HaveList immediately
+        // when wanted backlog is below watermark; otherwise they remain in
+        // `need_ids` and are retried on subsequent loop ticks.
+        dispatch_owned_need_ids(
+            &mut control,
+            &wanted,
+            &mut need_ids,
+            &mut fallback_need_ids,
+            coordination,
+            &mut wanted_backpressure_active,
+        )
+        .await?;
 
         // After reconciliation, report non-owned events to coordinator for
         // reassignment instead of discarding them.
@@ -286,7 +290,12 @@ where
 
         // Once reconciliation is done, fallback is dispatched, pending_have
         // is drained, and egress queue is empty, send DataDone+Done.
-        if reconciliation_done && fallback_dispatched && pending_have.is_empty() && !done_sent {
+        if reconciliation_done
+            && need_ids.is_empty()
+            && fallback_dispatched
+            && pending_have.is_empty()
+            && !done_sent
+        {
             let pending_out = egress.count_pending(peer_id).unwrap_or(0);
             if pending_out > 0 && last_egress_log.elapsed() >= Duration::from_secs(5) {
                 info!(

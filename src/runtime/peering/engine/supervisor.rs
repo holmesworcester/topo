@@ -25,6 +25,7 @@ use crate::peering::loops::{
     connect_loop_with_coordination_until_cancel_with_fallback, IntroSpawnerFn,
 };
 use crate::sync::CoordinationManager;
+use crate::tuning::shared_ingest_cap;
 use crate::transport::{
     build_tenant_bootstrap_fallback_client_config_from_db, build_tenant_client_config_from_db,
     TenantClientConfigs, TransportClientConfig, TransportEndpoint,
@@ -157,7 +158,7 @@ impl RuntimeSupervisor {
         let tenant_ids: Vec<String> = self.tenants.iter().map(|t| t.peer_id.clone()).collect();
         let tenant_contexts = build_tenant_contexts(&self.db_path, &tenant_ids);
 
-        let ingest_cap = if tenant_ids.len() > 1 { 10000 } else { 5000 };
+        let ingest_cap = shared_ingest_cap();
         let (shared_tx, shared_rx) = mpsc::channel::<IngestItem>(ingest_cap);
         let events_received = Arc::new(AtomicU64::new(0));
 

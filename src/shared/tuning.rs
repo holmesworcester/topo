@@ -20,6 +20,12 @@ pub fn read_bool_env(name: &str) -> bool {
     }
 }
 
+fn read_usize_env(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+}
+
 // -- Ingest pipeline --
 pub fn drain_batch_size() -> usize {
     if low_mem_mode() {
@@ -39,7 +45,7 @@ pub fn write_batch_cap() -> usize {
 // -- Peering --
 pub fn shared_ingest_cap() -> usize {
     if low_mem_mode() {
-        1000
+        read_usize_env("LOW_MEM_SHARED_INGEST_CAP").unwrap_or(512)
     } else {
         10000
     }
@@ -61,4 +67,12 @@ pub fn max_recv_buffer() -> usize {
     } else {
         2 * 1024 * 1024
     }
+}
+
+pub fn low_mem_wanted_high_watermark() -> usize {
+    read_usize_env("LOW_MEM_WANTED_HIGH_WATERMARK").unwrap_or(2000)
+}
+
+pub fn low_mem_wanted_low_watermark() -> usize {
+    read_usize_env("LOW_MEM_WANTED_LOW_WATERMARK").unwrap_or(1000)
 }

@@ -13,6 +13,7 @@ use tracing::info;
 use crate::crypto::EventId;
 use crate::db::wanted::WantedEvents;
 use crate::protocol::{neg_id_to_event_id, Frame};
+use crate::tuning::{low_mem_mode, low_mem_wanted_high_watermark, low_mem_wanted_low_watermark};
 use crate::transport::StreamConn;
 
 use super::coordinator::PeerCoord;
@@ -73,6 +74,7 @@ pub async fn dispatch_owned_need_ids<C>(
     need_ids: &mut Vec<Id>,
     fallback_need_ids: &mut Vec<EventId>,
     coordination: &PeerCoord,
+    wanted_backpressure_active: &mut bool,
 ) -> Result<(), SyncError>
 where
     C: StreamConn,
@@ -83,29 +85,64 @@ where
 
     let peer_idx = coordination.peer_idx;
     let total_peers = coordination.total_peers.load(Ordering::Relaxed);
+    let pending_wanted = wanted
+        .count()
+        .ok()
+        .and_then(|v| usize::try_from(v).ok())
+        .unwrap_or(0);
 
     // When need_ids are few, claim all — these are likely source-unique events
     // that can only be fetched from this specific source.
     let claim_all = need_ids.len() <= total_peers * FALLBACK_THRESHOLD_FACTOR;
+    let (low_watermark, high_watermark) = if low_mem_mode() {
+        let high = low_mem_wanted_high_watermark().max(1);
+        let low = low_mem_wanted_low_watermark().min(high.saturating_sub(1));
+        (low, high)
+    } else {
+        (0, usize::MAX)
+    };
+    if low_mem_mode() && *wanted_backpressure_active && pending_wanted <= low_watermark {
+        *wanted_backpressure_active = false;
+    }
+    if low_mem_mode() && pending_wanted >= high_watermark {
+        *wanted_backpressure_active = true;
+    }
+    let owned_credit = if low_mem_mode() {
+        if *wanted_backpressure_active {
+            0
+        } else {
+            high_watermark.saturating_sub(pending_wanted)
+        }
+    } else {
+        usize::MAX
+    };
 
     let mut batch: Vec<EventId> = Vec::with_capacity(NEED_CHUNK);
     let mut owned_count = 0usize;
+    let mut deferred_owned = 0usize;
+    let mut remaining_need_ids: Vec<Id> = Vec::new();
 
     for neg_id in need_ids.drain(..) {
         let event_id = neg_id_to_event_id(&neg_id);
         if claim_all || is_event_owned(&event_id, peer_idx, total_peers) {
-            let _ = wanted.insert(&event_id);
-            batch.push(event_id);
-            owned_count += 1;
-            if batch.len() >= NEED_CHUNK {
-                control.send(&Frame::HaveList { ids: batch }).await?;
-                control.flush().await?;
-                batch = Vec::with_capacity(NEED_CHUNK);
+            if owned_count < owned_credit {
+                let _ = wanted.insert(&event_id);
+                batch.push(event_id);
+                owned_count += 1;
+                if batch.len() >= NEED_CHUNK {
+                    control.send(&Frame::HaveList { ids: batch }).await?;
+                    control.flush().await?;
+                    batch = Vec::with_capacity(NEED_CHUNK);
+                }
+            } else {
+                deferred_owned += 1;
+                remaining_need_ids.push(neg_id);
             }
         } else {
             fallback_need_ids.push(event_id);
         }
     }
+    *need_ids = remaining_need_ids;
 
     if !batch.is_empty() {
         control.send(&Frame::HaveList { ids: batch }).await?;
@@ -120,6 +157,16 @@ where
             peer_idx,
             total_peers,
             claim_all
+        );
+    }
+    if deferred_owned > 0 {
+        info!(
+            "Wanted backpressure: deferred {} owned need_ids (wanted_pending={}, high={}, low={}, backpressure_active={})",
+            deferred_owned,
+            pending_wanted,
+            high_watermark,
+            low_watermark,
+            *wanted_backpressure_active
         );
     }
 
