@@ -14,6 +14,7 @@ use crate::event_modules::{
 };
 use crate::peering::loops::{
     accept_loop, connect_loop, connect_loop_with_shared_ingest,
+    connect_loop_with_shared_ingest_until_cancel,
 };
 use crate::projection::apply::project_one;
 use crate::projection::create::{
@@ -2526,6 +2527,175 @@ pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Jo
     }
 
     handles
+}
+
+/// Handles from a sink-driven download topology with per-source shutdown control.
+pub struct SinkDownloadHandles {
+    pub thread_handles: Vec<std::thread::JoinHandle<()>>,
+    /// Source server endpoints (cloned); close to simulate source failure.
+    pub source_endpoints: Vec<crate::transport::TransportEndpoint>,
+    /// Per-connect-loop cancellation tokens; cancel to stop a sink's connect loop.
+    pub connect_shutdowns: Vec<tokio_util::sync::CancellationToken>,
+}
+
+impl SinkDownloadHandles {
+    /// Shut down a specific source's accept loop by closing its QUIC endpoint,
+    /// and cancel the corresponding connect loop so it stops retrying.
+    pub fn shutdown_source(&self, idx: usize) {
+        self.source_endpoints[idx].close(0u32.into(), b"test-shutdown");
+        self.connect_shutdowns[idx].cancel();
+    }
+}
+
+/// Like [`start_sink_download`] but returns [`SinkDownloadHandles`] with
+/// per-source shutdown control for simulating peer dropout.
+pub fn start_sink_download_with_shutdown(
+    sources: &[Peer],
+    sink: &Peer,
+) -> SinkDownloadHandles {
+    use crate::db::transport_trust::{import_cli_pins_to_sql, is_peer_allowed};
+
+    assert!(!sources.is_empty(), "need at least one source");
+
+    let (sink_cert, sink_key) = sink.cert_and_key();
+    let sink_fp = sink.spki_fingerprint();
+
+    // Seed mutual trust
+    let source_fps: Vec<[u8; 32]> = sources.iter().map(|s| s.spki_fingerprint()).collect();
+    {
+        let db_sink = open_connection(&sink.db_path).expect("failed to open sink db");
+        let pins = AllowedPeers::from_fingerprints(source_fps);
+        import_cli_pins_to_sql(&db_sink, &sink.identity, &pins)
+            .expect("failed to import pins for sink");
+    }
+    for source in sources {
+        let db_src = open_connection(&source.db_path).expect("failed to open source db");
+        let pins = AllowedPeers::from_fingerprints(vec![sink_fp]);
+        import_cli_pins_to_sql(&db_src, &source.identity, &pins)
+            .expect("failed to import pins for source");
+    }
+
+    let mut handles = Vec::new();
+    let mut source_addrs = Vec::new();
+    let mut source_endpoints = Vec::new();
+
+    // Start accept_loop for each source with dynamic trust
+    for source in sources {
+        let (cert, key) = source.cert_and_key();
+        let src_db_path = source.db_path.clone();
+        let src_recorded_by = source.identity.clone();
+        let allow_fn: Arc<crate::transport::DynamicAllowFn> = Arc::new(move |fp: &[u8; 32]| {
+            let db = open_connection(&src_db_path)?;
+            is_peer_allowed(&db, &src_recorded_by, fp)
+        });
+        let server_endpoint =
+            create_dual_endpoint_dynamic("127.0.0.1:0".parse().unwrap(), cert, key, allow_fn)
+                .expect("failed to create source server endpoint");
+        let addr = server_endpoint
+            .local_addr()
+            .expect("failed to get source addr");
+        source_addrs.push(addr);
+        source_endpoints.push(server_endpoint.clone());
+
+        let db_path = source.db_path.clone();
+        let identity = source.identity.clone();
+        handles.push(std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                if let Err(e) = accept_loop(
+                    &db_path,
+                    &identity,
+                    server_endpoint,
+                    noop_intro_spawner,
+                    test_ingest_fns(),
+                )
+                .await
+                {
+                    tracing::warn!("source accept_loop exited: {}", e);
+                }
+            });
+        }));
+    }
+
+    // Build per-source client endpoints for the sink with dynamic trust.
+    let mut sink_connectors = Vec::new();
+    for (i, _source) in sources.iter().enumerate() {
+        let sink_db_path = sink.db_path.clone();
+        let sink_recorded_by = sink.identity.clone();
+        let allow_fn: Arc<crate::transport::DynamicAllowFn> = Arc::new(move |fp: &[u8; 32]| {
+            let db = open_connection(&sink_db_path)?;
+            is_peer_allowed(&db, &sink_recorded_by, fp)
+        });
+        let client_endpoint = create_dual_endpoint_dynamic(
+            "0.0.0.0:0".parse().unwrap(),
+            sink_cert.clone(),
+            sink_key.clone_key(),
+            allow_fn,
+        )
+        .expect("failed to create sink client endpoint");
+
+        sink_connectors.push((client_endpoint, source_addrs[i]));
+    }
+
+    // Shared batch_writer for the sink
+    let ingest_fns = test_ingest_fns();
+    let ingest_cap = crate::tuning::shared_ingest_cap();
+    let (shared_tx, shared_rx) =
+        tokio::sync::mpsc::channel::<crate::contracts::event_pipeline_contract::IngestItem>(
+            ingest_cap,
+        );
+    let writer_db = sink.db_path.clone();
+    let writer_events = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let batch_writer_fn = ingest_fns.batch_writer;
+    let _writer_handle = std::thread::spawn(move || {
+        batch_writer_fn(writer_db, shared_rx, writer_events);
+    });
+
+    // Pre-register ALL peers before spawning threads.
+    let coord_manager = Arc::new(crate::sync::CoordinationManager::new());
+    let peer_coords: Vec<_> = (0..sink_connectors.len())
+        .map(|_| coord_manager.register_peer())
+        .collect();
+
+    let mut connect_shutdowns = Vec::new();
+    for ((endpoint, remote), coordination) in
+        sink_connectors.into_iter().zip(peer_coords)
+    {
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        connect_shutdowns.push(shutdown.clone());
+        let sink_db = sink.db_path.clone();
+        let sink_identity = sink.identity.clone();
+        let sink_ingest = shared_tx.clone();
+        handles.push(std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let _ = connect_loop_with_shared_ingest_until_cancel(
+                    &sink_db,
+                    &sink_identity,
+                    endpoint,
+                    remote,
+                    noop_intro_spawner,
+                    test_ingest_fns(),
+                    coordination,
+                    sink_ingest,
+                    shutdown,
+                )
+                .await;
+            });
+        }));
+    }
+
+    SinkDownloadHandles {
+        thread_handles: handles,
+        source_endpoints,
+        connect_shutdowns,
+    }
 }
 
 /// Start a sink's accept_loop and return the handle and listen address.

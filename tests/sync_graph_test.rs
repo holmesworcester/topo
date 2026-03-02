@@ -12,7 +12,10 @@
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 use topo::crypto::event_id_to_base64;
-use topo::testutil::{assert_eventually, clone_events_to, start_chain, start_sink_download, Peer};
+use topo::testutil::{
+    assert_eventually, clone_events_to, start_chain, start_sink_download,
+    start_sink_download_with_shutdown, Peer,
+};
 
 /// Read peak resident set size from /proc/self/status (Linux only).
 fn peak_rss_mib() -> f64 {
@@ -450,4 +453,158 @@ async fn catchup_large_file_4x_1024_slices() {
 #[ignore]
 async fn catchup_large_file_8x_1024_slices() {
     run_catchup_large_file(8, 1024).await;
+}
+
+// ---------------------------------------------------------------------------
+// Family D: Ownership correctness regression tests
+// ---------------------------------------------------------------------------
+
+/// Test: non-uniform source data exposes the ownership threshold bug.
+///
+/// Each source has shared events (cloned) plus unique events only on that source.
+/// When unique events exceed the claim-all threshold (total_peers * 20), the
+/// ownership hash discards non-owned unique events. Since those events only exist
+/// at one source, they're never fetched — a permanent convergence stall.
+#[tokio::test]
+async fn catchup_non_uniform_sources() {
+    let source_count = 4;
+    let shared_count = 50;
+    // Must exceed total_peers * FALLBACK_THRESHOLD_FACTOR (4*20=80) after
+    // the first session claims its owned subset (~25%). 200 * 0.75 = 150 > 80,
+    // so the remaining source-unique events permanently stall without the fix.
+    let unique_per_source = 200;
+
+    let sources: Vec<Peer> = (0..source_count)
+        .map(|i| Peer::new_with_identity(&format!("nu{}", i)))
+        .collect();
+    let sink = Peer::new_with_identity("nusink");
+
+    // Create shared messages at S0
+    for i in 0..shared_count {
+        sources[0].create_message(&format!("shared-{}", i));
+    }
+
+    // Clone shared data to S1..S3
+    let targets: Vec<&Peer> = sources[1..].iter().collect();
+    clone_events_to(&sources[0], &targets);
+
+    // Create unique messages at each source (AFTER cloning)
+    let mut unique_ids: Vec<Vec<String>> = Vec::new();
+    for (src_idx, source) in sources.iter().enumerate() {
+        let mut ids = Vec::new();
+        for j in 0..unique_per_source {
+            let eid = source.create_message(&format!("unique-s{}-{}", src_idx, j));
+            ids.push(event_id_to_base64(&eid));
+        }
+        unique_ids.push(ids);
+    }
+
+    // Total expected message events at sink:
+    // shared_count + source_count * unique_per_source
+    let total_expected = (shared_count + source_count * unique_per_source) as i64;
+
+    let start = Instant::now();
+    let handles = start_sink_download(&sources, &sink);
+
+    // Wait for all messages to arrive
+    assert_eventually(
+        || sink.stored_message_event_count() >= total_expected,
+        Duration::from_secs(120),
+        &format!(
+            "sink receives all {} messages (current: {})",
+            total_expected,
+            sink.stored_message_event_count()
+        ),
+    )
+    .await;
+
+    let wall_ms = start.elapsed().as_millis();
+    drop(handles);
+
+    // Verify every source's unique events made it to the sink
+    for (src_idx, ids) in unique_ids.iter().enumerate() {
+        let missing: Vec<&str> = ids.iter().filter(|id| !sink.has_event(id)).map(|s| s.as_str()).collect();
+        assert!(
+            missing.is_empty(),
+            "source {} has {} unique events missing at sink (first: {:?})",
+            src_idx,
+            missing.len(),
+            missing.first()
+        );
+    }
+
+    eprintln!();
+    eprintln!("=== Non-uniform sources: {} sources, {} shared + {} unique/source ===", source_count, shared_count, unique_per_source);
+    eprintln!("  Total expected: {}", total_expected);
+    eprintln!("  Sink received:  {}", sink.stored_message_event_count());
+    eprintln!("  Wall time:      {} ms", wall_ms);
+    eprintln!();
+}
+
+/// Test: dead peer creates a permanent ownership black hole.
+///
+/// All sources share identical data.  Source[2] is shut down immediately after
+/// sync starts.  Events that hash to dead peer 2's ownership bucket are never
+/// fetched because (a) the dead peer never runs, and (b) other peers discard
+/// those events via `drain_fallback_need_ids` when count > threshold.
+#[tokio::test]
+async fn catchup_dead_peer_dropout() {
+    let source_count = 4;
+    // Large enough that session 2 can't finish syncing before we kill it.
+    // With 10k events, negentropy reconciliation + data transfer takes
+    // hundreds of ms on localhost, well beyond the ~7ms shutdown delay.
+    let event_count = 10_000;
+
+    let sources: Vec<Peer> = (0..source_count)
+        .map(|i| Peer::new_with_identity(&format!("dp{}", i)))
+        .collect();
+    let sink = Peer::new_with_identity("dpsink");
+
+    // Create events at S0
+    sources[0].batch_create_messages(event_count);
+
+    // Clone to all other sources (identical data)
+    let targets: Vec<&Peer> = sources[1..].iter().collect();
+    clone_events_to(&sources[0], &targets);
+
+    let expected_count = event_count as i64;
+
+    let start = Instant::now();
+    let dl_handles = start_sink_download_with_shutdown(&sources, &sink);
+
+    // Immediately kill source[2] — simulates peer dropout.
+    // This closes the QUIC endpoint (severing any active connection) and
+    // cancels the connect loop so it stops retrying.
+    dl_handles.shutdown_source(2);
+    eprintln!("  Shut down source 2 at {:?}", start.elapsed());
+
+    // Wait for convergence: sink must get ALL events despite dead source.
+    assert_eventually(
+        || sink.stored_message_event_count() >= expected_count,
+        Duration::from_secs(120),
+        &format!(
+            "sink receives all {} messages despite dead source (current: {})",
+            expected_count,
+            sink.stored_message_event_count()
+        ),
+    )
+    .await;
+
+    let wall_ms = start.elapsed().as_millis();
+    drop(dl_handles);
+
+    eprintln!();
+    eprintln!("=== Dead peer dropout: {} sources, source[2] killed, {} events ===", source_count, event_count);
+    eprintln!("  Expected: {}", expected_count);
+    eprintln!("  Sink received: {}", sink.stored_message_event_count());
+    eprintln!("  Wall time: {} ms", wall_ms);
+    eprintln!();
+
+    assert_eq!(
+        sink.stored_message_event_count(),
+        expected_count,
+        "sink must have all {} messages even with dead source (got {})",
+        expected_count,
+        sink.stored_message_event_count(),
+    );
 }

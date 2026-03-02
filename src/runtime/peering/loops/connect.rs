@@ -184,6 +184,33 @@ pub async fn connect_loop_with_shared_ingest(
     coordination: Arc<crate::sync::session::coordinator::PeerCoord>,
     shared_ingest: tokio::sync::mpsc::Sender<crate::contracts::event_pipeline_contract::IngestItem>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    connect_loop_with_shared_ingest_until_cancel(
+        db_path,
+        recorded_by,
+        endpoint,
+        remote,
+        intro_spawner,
+        ingest,
+        coordination,
+        shared_ingest,
+        CancellationToken::new(),
+    )
+    .await
+}
+
+/// Like [`connect_loop_with_shared_ingest`] but accepts an external
+/// cancellation token for test-driven shutdown.
+pub async fn connect_loop_with_shared_ingest_until_cancel(
+    db_path: &str,
+    recorded_by: &str,
+    endpoint: TransportEndpoint,
+    remote: SocketAddr,
+    intro_spawner: IntroSpawnerFn,
+    ingest: IngestFns,
+    coordination: Arc<crate::sync::session::coordinator::PeerCoord>,
+    shared_ingest: tokio::sync::mpsc::Sender<crate::contracts::event_pipeline_contract::IngestItem>,
+    shutdown: CancellationToken,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let tenants = vec![recorded_by.to_string()];
     run_startup_preflight(db_path, &tenants, ingest)?;
 
@@ -198,7 +225,7 @@ pub async fn connect_loop_with_shared_ingest(
             intro_spawner,
             shared_ingest,
             coordination,
-            CancellationToken::new(),
+            shutdown,
             None,
         ))
         .await

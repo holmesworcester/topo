@@ -26,8 +26,8 @@ use crate::transport::connection::ConnectionError;
 use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
 
 use super::control_plane::{
-    append_have_ids_to_pending, dispatch_owned_need_ids, drain_fallback_need_ids, send_done,
-    send_initial_neg_open,
+    append_have_ids_to_pending, dispatch_assigned_events, dispatch_owned_need_ids,
+    report_fallback_need_ids, send_done, send_initial_neg_open, try_poll_coordinator_assignment,
 };
 use super::coordinator::PeerCoord;
 use super::data_plane::{
@@ -135,9 +135,11 @@ where
     // Pending have_ids buffer: populated by reconciliation, drained incrementally
     let mut pending_have: Vec<EventId> = Vec::new();
 
-    // Fallback buffer: non-owned need_ids dispatched after reconciliation
+    // Fallback buffer: non-owned need_ids reported to coordinator after reconciliation
     let mut fallback_need_ids: Vec<EventId> = Vec::new();
+    let mut fallback_reported = false;
     let mut fallback_dispatched = false;
+    let mut fallback_report_time: Option<Instant> = None;
 
     let mut last_bytes_received = 0u64;
     let mut last_egress_log = Instant::now();
@@ -209,12 +211,34 @@ where
             Err(_) => {}
         }
 
-        // After reconciliation, discard non-owned events. Source-unique events
-        // are handled by the threshold logic in dispatch_owned_need_ids (claim_all
-        // when need_ids are few).
-        if reconciliation_done && !fallback_dispatched {
-            drain_fallback_need_ids(&mut fallback_need_ids);
-            fallback_dispatched = true;
+        // After reconciliation, report non-owned events to coordinator for
+        // reassignment instead of discarding them.
+        if reconciliation_done && !fallback_reported {
+            if fallback_need_ids.is_empty() {
+                // No fallback events — nothing to report or wait for.
+                fallback_reported = true;
+                fallback_dispatched = true;
+            } else {
+                report_fallback_need_ids(&mut fallback_need_ids, coordination);
+                fallback_reported = true;
+                fallback_report_time = Some(Instant::now());
+            }
+        }
+
+        // Poll for coordinator assignment (non-blocking)
+        if fallback_reported && !fallback_dispatched {
+            if let Some(assigned) = try_poll_coordinator_assignment(coordination) {
+                let dispatched =
+                    dispatch_assigned_events(&mut control, &wanted, assigned).await?;
+                info!("Coordinator assigned {} events to this session", dispatched);
+                fallback_dispatched = true;
+            } else if fallback_report_time
+                .map(|t| t.elapsed() > super::FALLBACK_ASSIGNMENT_TIMEOUT)
+                .unwrap_or(false)
+            {
+                info!("Coordinator assignment timeout, proceeding without fallback");
+                fallback_dispatched = true;
+            }
         }
 
         enqueue_pending_have_to_egress(&egress, peer_id, &mut pending_have);
@@ -226,9 +250,9 @@ where
             last_activity = Instant::now();
         }
 
-        // Once reconciliation is done, pending_have is drained, and egress
-        // queue is empty, send DataDone on data stream then Done on control.
-        if reconciliation_done && pending_have.is_empty() && !done_sent {
+        // Once reconciliation is done, fallback is dispatched, pending_have
+        // is drained, and egress queue is empty, send DataDone+Done.
+        if reconciliation_done && fallback_dispatched && pending_have.is_empty() && !done_sent {
             let pending_out = egress.count_pending(peer_id).unwrap_or(0);
             if pending_out > 0 && last_egress_log.elapsed() >= Duration::from_secs(5) {
                 info!(

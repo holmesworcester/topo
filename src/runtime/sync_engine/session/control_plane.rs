@@ -126,20 +126,67 @@ where
     Ok(())
 }
 
-/// Drain non-owned fallback events, discarding them.
+/// Report non-owned fallback events to the coordinator for reassignment.
 ///
-/// In a healthy multi-source scenario, each session only requests its
-/// deterministically owned events. Non-owned events are handled by their
-/// respective owners. Source-unique events are handled by the threshold
-/// logic in `dispatch_owned_need_ids` (claim_all when need_ids are few).
-pub fn drain_fallback_need_ids(fallback_need_ids: &mut Vec<EventId>) {
-    if !fallback_need_ids.is_empty() {
-        info!(
-            "Discarding {} non-owned need_ids (handled by other sources)",
-            fallback_need_ids.len()
-        );
-        fallback_need_ids.clear();
+/// Instead of discarding non-owned events, sends them to the coordinator
+/// thread which assigns them via greedy load balancing. This handles:
+/// - Source-unique events that only exist at one source
+/// - Events owned by dead peers that never connect
+pub fn report_fallback_need_ids(fallback_need_ids: &mut Vec<EventId>, coordination: &PeerCoord) {
+    if fallback_need_ids.is_empty() {
+        info!("No fallback need_ids to report to coordinator");
+        return;
     }
+    info!(
+        "Reporting {} fallback need_ids to coordinator (peer_idx={})",
+        fallback_need_ids.len(),
+        coordination.peer_idx,
+    );
+    let ids: Vec<EventId> = fallback_need_ids.drain(..).collect();
+    if coordination.report_tx.send(ids).is_err() {
+        info!("Coordinator channel disconnected, fallback events lost");
+    }
+}
+
+/// Non-blocking poll for coordinator assignment.
+pub fn try_poll_coordinator_assignment(coordination: &PeerCoord) -> Option<Vec<EventId>> {
+    let rx = coordination.assign_rx.lock().ok()?;
+    match rx.try_recv() {
+        Ok(assigned) => Some(assigned),
+        Err(_) => None,
+    }
+}
+
+/// Dispatch coordinator-assigned events by sending HaveList.
+pub async fn dispatch_assigned_events<C>(
+    control: &mut C,
+    wanted: &WantedEvents<'_>,
+    assigned: Vec<EventId>,
+) -> Result<usize, SyncError>
+where
+    C: StreamConn,
+{
+    if assigned.is_empty() {
+        return Ok(0);
+    }
+    let count = assigned.len();
+    info!("Dispatching {} coordinator-assigned events", count);
+
+    let mut batch: Vec<EventId> = Vec::with_capacity(NEED_CHUNK);
+    for event_id in assigned {
+        let _ = wanted.insert(&event_id);
+        batch.push(event_id);
+        if batch.len() >= NEED_CHUNK {
+            control.send(&Frame::HaveList { ids: batch }).await?;
+            control.flush().await?;
+            batch = Vec::with_capacity(NEED_CHUNK);
+        }
+    }
+    if !batch.is_empty() {
+        control.send(&Frame::HaveList { ids: batch }).await?;
+        control.flush().await?;
+    }
+    Ok(count)
 }
 
 pub async fn send_done<C>(control: &mut C) -> Result<(), SyncError>
