@@ -166,3 +166,82 @@ LOW_MEM_IOS=1 cargo test --release --test perf_test perf_sync_50k -- --nocapture
 
 Confirms low-memory mode itself works correctly and delivers ~3x memory
 reduction (55.6 MiB vs ~170 MiB in normal mode).
+
+---
+
+## Rebased 500k Evidence (WAL Cap, March 2 2026)
+
+Branch: `exec/lowmem-gordian-cap12`
+Date: 2026-03-02
+
+### Code state under test
+
+- Rebased on `master`
+- Coordinator bypass removed (not part of this slice)
+- DB-side low-memory cap active:
+  - `PRAGMA wal_autocheckpoint=256` in low-memory mode
+  - post-commit WAL hard cap via `LOW_MEM_WAL_CAP_MIB` (tested with `12`)
+
+### Run A: both peers lowmem (500k soak)
+
+**Command:**
+```
+LOW_MEM_WAL_CAP_MIB=12 TOPO_CMD_TIMEOUT_SECS=900 \
+LOW_MEM_IOS_SMOKE_EVENTS_PER_PEER=10 LOW_MEM_IOS_BUDGET_MIB=2000 \
+LOW_MEM_IOS_SOAK_EVENTS=500000 LOW_MEM_IOS_SOAK_BUDGET_MIB=2000 \
+scripts/run_lowmem_regimen.sh soak
+```
+
+**Result:**
+```
+[lowmem-soak] alice peak_rss=64.27 MiB
+[lowmem-soak] bob   peak_rss=49.97 MiB
+```
+
+Sampler maxima (`/tmp/rebased_500k_samples.log`):
+```
+MAX_ALICE_RSS_KB=71032
+MAX_BOB_RSS_KB=50456
+MAX_ALICE_SHM_KB=2752
+MAX_BOB_SHM_KB=160
+```
+
+### Run B: sender normal, receiver lowmem (500k soak, realism mode)
+
+Setup:
+- `alice`: normal mode
+- `bob`: `LOW_MEM=1 LOW_MEM_WAL_CAP_MIB=12`
+
+Run artifacts:
+- `target/lowmem-regimen/onepeer-1772466598-2080010/`
+- `samples.log` in same directory
+
+**Result:**
+```
+ALICE_PEAK_VMHWM_MIB=245.48
+BOB_PEAK_VMHWM_MIB=49.59
+```
+
+Sample-log maxima:
+```
+MAX_ALICE_RSS_KB=208184
+MAX_BOB_RSS_KB=49192
+MAX_ALICE_SHM_KB=4512
+MAX_BOB_SHM_KB=160
+```
+
+On-disk WAL/shm at end (`bob`):
+```
+bob.db-shm = 160K
+bob.db-wal = 1.0M
+```
+
+### Interpretation
+
+1. Receiver memory stayed around ~50 MiB in both lowmem-vs-lowmem and
+   normal-vs-lowmem runs; enabling lowmem only on receiver is realistic and
+   does not regress receiver peak in this 500k case.
+2. `db-shm` residency is tiny (`~160 KiB`) under the cap, so SHM is no longer
+   a dominant contributor.
+3. Remaining receiver peak is primarily app/runtime + non-SHM SQLite resident
+   footprint, which is the next optimization target.
