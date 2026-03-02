@@ -7,6 +7,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
@@ -15,6 +16,8 @@ use crate::contracts::event_pipeline_contract::IngestItem;
 use crate::crypto::{hash_event, EventId};
 use crate::db::{egress_queue::EgressQueue, store::Store};
 use crate::protocol::Frame;
+use crate::runtime::memtrace;
+use crate::tuning::low_mem_memtrace;
 use crate::transport::connection::ConnectionError;
 use crate::transport::{StreamRecv, StreamSend};
 
@@ -129,10 +132,16 @@ pub fn spawn_data_receiver<R>(
 where
     R: StreamRecv + Send + 'static,
 {
+    let memtrace_enabled = low_mem_memtrace();
+    let memtrace_file = std::env::var("LOW_MEM_MEMTRACE_FILE").ok();
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
     let (data_done_tx, data_done_rx) = oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
         let mut data_done_tx = Some(data_done_tx);
+        let mut events_ingested: u64 = 0;
+        let mut max_blob_size: usize = 0;
+        let memtrace_interval = Duration::from_secs(2);
+        let mut last_memtrace = Instant::now();
         loop {
             tokio::select! {
                 _ = &mut shutdown_rx => {
@@ -142,6 +151,7 @@ where
                     match msg {
                         Ok(Frame::Event { blob }) => {
                             bytes_received.fetch_add(blob.len() as u64, Ordering::Relaxed);
+                            max_blob_size = max_blob_size.max(blob.len());
                             let event_id = hash_event(&blob);
                             if ingest_tx
                                 .send((event_id, blob, recorded_by.clone(), source_tag.clone()))
@@ -150,6 +160,22 @@ where
                             {
                                 warn!("Ingest channel closed");
                                 break;
+                            }
+                            events_ingested += 1;
+                            if memtrace_enabled && last_memtrace.elapsed() >= memtrace_interval {
+                                let ingest_cap = ingest_tx.max_capacity();
+                                let ingest_used = ingest_cap.saturating_sub(ingest_tx.capacity());
+                                let line = format!(
+                                    "LOWMEM_MEMTRACE data_rx source={} events_ingested={} max_blob={} ingest_used={}/{} bytes_rx={}",
+                                    source_tag,
+                                    events_ingested,
+                                    max_blob_size,
+                                    ingest_used,
+                                    ingest_cap,
+                                    bytes_received.load(Ordering::Relaxed),
+                                );
+                                memtrace::emit(&line, memtrace_file.as_deref());
+                                last_memtrace = Instant::now();
                             }
                         }
                         Ok(Frame::DataDone) => {

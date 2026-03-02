@@ -19,7 +19,9 @@ use crate::db::open_connection;
 use crate::db::project_queue::ProjectQueue;
 use crate::db::removal_watch::is_peer_removed;
 use crate::db::schema::create_tables;
+use crate::runtime::memtrace;
 use crate::sync::SyncSessionHandler;
+use crate::tuning::{low_mem_memtrace, low_mem_mode};
 use crate::transport::SessionProvider;
 
 use super::{current_timestamp_ms, drain_batch_size, run_session, shared_ingest_cap, SESSION_GAP};
@@ -83,6 +85,15 @@ pub(super) fn spawn_shared_ingest_writer(
     ingest: IngestFns,
 ) -> mpsc::Sender<IngestItem> {
     let ingest_cap = shared_ingest_cap();
+    if low_mem_memtrace() {
+        let line = format!(
+            "LOWMEM_MEMTRACE shared_ingest_config cap={} low_mem={}",
+            ingest_cap,
+            low_mem_mode()
+        );
+        let memtrace_file = std::env::var("LOW_MEM_MEMTRACE_FILE").ok();
+        memtrace::emit(&line, memtrace_file.as_deref());
+    }
     let (shared_tx, shared_rx) = mpsc::channel::<IngestItem>(ingest_cap);
     let writer_events = Arc::new(AtomicU64::new(0));
     let writer_db = db_path.to_string();

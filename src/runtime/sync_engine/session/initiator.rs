@@ -20,11 +20,12 @@ use crate::db::{
     wanted::WantedEvents,
 };
 use crate::protocol::Frame;
+use crate::runtime::memtrace;
 use crate::runtime::SyncStats;
 use crate::sync::negentropy_sqlite::NegentropyStorageSqlite;
 use crate::transport::connection::ConnectionError;
 use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
-use crate::tuning::low_mem_mode;
+use crate::tuning::{low_mem_memtrace, low_mem_mode};
 
 use super::control_plane::{
     append_have_ids_to_pending, dispatch_assigned_events, dispatch_owned_need_ids,
@@ -148,6 +149,10 @@ where
 
     let mut last_bytes_received = 0u64;
     let mut last_egress_log = Instant::now();
+    let memtrace_enabled = low_mem_memtrace();
+    let memtrace_interval = Duration::from_secs(2);
+    let memtrace_file = std::env::var("LOW_MEM_MEMTRACE_FILE").ok();
+    let mut last_memtrace = Instant::now();
 
     loop {
         // Data receiver runs in a separate task — check if it received data
@@ -253,6 +258,30 @@ where
         bytes_sent += send_stats.bytes_sent_delta;
         if send_stats.events_sent_delta > 0 {
             last_activity = Instant::now();
+        }
+
+        if memtrace_enabled && last_memtrace.elapsed() >= memtrace_interval {
+            let egress_pending = egress.count_pending(peer_id).unwrap_or(-1);
+            let wanted_pending = wanted.count().unwrap_or(-1);
+            let ingest_cap = ingest_tx.max_capacity();
+            let ingest_used = ingest_cap.saturating_sub(ingest_tx.capacity());
+            let line = format!(
+                "LOWMEM_MEMTRACE initiator peer={} rounds={} have={} need={} pending_have={} fallback_need={} wanted={} egress_pending={} ingest_used={}/{} bytes_rx={} bytes_tx={}",
+                peer_id,
+                rounds,
+                have_ids.len(),
+                need_ids.len(),
+                pending_have.len(),
+                fallback_need_ids.len(),
+                wanted_pending,
+                egress_pending,
+                ingest_used,
+                ingest_cap,
+                bytes_received.load(Ordering::Relaxed),
+                bytes_sent,
+            );
+            memtrace::emit(&line, memtrace_file.as_deref());
+            last_memtrace = Instant::now();
         }
 
         // Once reconciliation is done, fallback is dispatched, pending_have

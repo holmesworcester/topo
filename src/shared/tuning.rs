@@ -8,6 +8,11 @@ pub fn low_mem_mode() -> bool {
     read_bool_env("LOW_MEM_IOS") || read_bool_env("LOW_MEM")
 }
 
+/// Enables periodic low-memory runtime queue/vector instrumentation logs.
+pub fn low_mem_memtrace() -> bool {
+    read_bool_env("LOW_MEM_MEMTRACE")
+}
+
 pub fn read_bool_env(name: &str) -> bool {
     match std::env::var(name) {
         Ok(v) => v != "0" && v.to_lowercase() != "false",

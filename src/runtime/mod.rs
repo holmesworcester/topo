@@ -1,4 +1,5 @@
 pub mod control;
+pub mod memtrace;
 pub mod peering;
 pub mod setup;
 pub mod sync_engine;
