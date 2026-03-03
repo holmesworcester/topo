@@ -31,6 +31,19 @@ PERF_LOWMEM_DELTA_BRACKET=50000 \
 PERF_LOWMEM_FILES_SLICES=400 \
 scripts/run_perf_serial.sh lowmem
 
+# Optional lowmem proof-of-concept overrides
+# (24MB iOS target, 22MB enforced Linux receiver cap)
+PERF_LOWMEM_BUDGET_KB=24576 \
+PERF_LOWMEM_CGROUP_ENFORCE=1 \
+PERF_LOWMEM_CGROUP_LIMIT_KB=22528 \
+PERF_LOWMEM_POC_MSG_BASELINE=1000000 \
+PERF_LOWMEM_POC_MSG_DELTA=10000 \
+PERF_LOWMEM_POC_REALISM_FILE_BASELINE=500000 \
+PERF_LOWMEM_POC_REALISM_FILE_COUNT=100 \
+PERF_LOWMEM_POC_FILE_COUNT=10000 \
+PERF_LOWMEM_POC_FILE_SIZE_MIB=1 \
+scripts/run_perf_serial.sh lowmem
+
 # Core sync benchmarks
 cargo test --release --test perf_test -- --nocapture
 cargo test --release --test perf_test -- --nocapture --include-ignored
@@ -263,10 +276,43 @@ the 24 MiB target.
 - **Standard command**: `scripts/run_lowmem_regimen.sh soak`
 - **Delta matrix + file proxy command**: `scripts/run_perf_serial.sh lowmem`
 
-On low-memory catchup strategy:
-1. Current path already keeps memory bounded mostly by connection/cache/channel limits; larger history should increase wall time more than RSS.
-2. There is no unavoidable SQLite memory floor proportional to total historical rows; practical floor is per-connection overhead + active query working set + WAL pressure.
-3. For stronger guarantees, the next protocol step is segmented catchup (time-window or bounded-range rounds) so old history is replayed in deterministic chunks.
+### Lowmem Proof-of-Concept (24 MiB iOS Target, 22 MiB Linux Hard Cap)
+
+Dedicated lowmem POC scenarios are run by `scripts/run_perf_serial.sh lowmem` as:
+1. `Lowmem POC Messages (1M+10k, 24MB gate)`
+2. `Lowmem POC Files Realism (500k+100x1MiB, 24MB gate)`
+3. `Lowmem POC Files Extreme (0+10k x1MiB, 24MB gate)`
+
+Each lowmem proxy summary now includes:
+- `LOWMEM_BUDGET_KB` (default `24576`)
+- `PASS_UNDER_24MB` (`1` pass / `0` fail)
+- `CGROUP_ENFORCED`, `CGROUP_LIMIT_KB`, `CGROUP_OOM`, `CGROUP_OOM_KILL`
+- `MAX_BOB_TOTAL_KB` (receiver peak working-set snapshot from smaps categories)
+
+Hard-cap policy used for Linux realism in lowmem POC:
+1. Receiver daemon (`bob`) is moved into a dedicated cgroup v2 with `memory.max=22 MiB` and `memory.swap.max=0`.
+2. The run fails fast if `memory.events:oom_kill > 0` (kernel-enforced kill).
+3. We gate at 22 MiB on Linux to keep margin for iOS Jetsam differences (`phys_footprint` vs Linux RSS/smaps accounting), while targeting 24 MiB on-device.
+
+Realism notes:
+1. Message POC (`1M + 10k`) is the closest proxy for background-notification catchup with a large already-synced workspace.
+2. File realism POC (`500k + 100x1MiB`) models large baseline plus moderate new file traffic.
+3. File extreme POC (`0 + 10k x1MiB`) is intentionally stress-biased for transfer volume and memory flatness, not day-to-day baseline realism.
+
+Latest cgroup-enforced snapshot (2026-03-03):
+
+| Scenario | Result | Receiver Peak (`MAX_BOB_TOTAL_KB`) | 24 MiB Gate | 22 MiB cgroup |
+|---|---:|---:|---:|---:|
+| Message realism: `500,000 + 10,000` | `10,000/10,000` msgs synced | `18,764` KB | PASS | PASS (`CGROUP_OOM_KILL=0`) |
+| File realism: `500,000 + 100 x 1MiB` | `400/400` slices synced | `14,088` KB | PASS | PASS (`CGROUP_OOM_KILL=0`) |
+
+Baseline impact (file realism proxy):
+1. In this harness, receiver peak RSS did not scale up with larger pre-synced baseline at these points.
+2. Transfer size and ingest backpressure knobs (`wanted` watermark + DB-backed `need_queue`) dominated memory shape more than baseline cardinality.
+
+Non-lowmem regression spot checks (2026-03-03):
+1. `cargo +stable test --release --test perf_test perf_sync_10k -- --nocapture --test-threads=1` passed (`Msgs/s: 12315`).
+2. `cargo +stable test --release --test sync_graph_test catchup_large_file_4x_400_slices -- --ignored --nocapture --test-threads=1` passed (`Catchup wall: 2250 ms`, all 400 slices attributed).
 
 ### Auto-Generated Latest Serial Run
 

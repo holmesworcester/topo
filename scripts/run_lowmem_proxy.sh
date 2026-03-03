@@ -31,10 +31,17 @@ ASYM_EVENTS="${LOWMEM_PROXY_EVENTS:-50000}"
 WAL_CAP_MIB="${LOW_MEM_WAL_CAP_MIB:-12}"
 LARGE_BASE_EVENTS="${LOWMEM_PROXY_BASE_EVENTS:-500000}"
 LARGE_DELTA_EVENTS="${LOWMEM_PROXY_DELTA_EVENTS:-10000}"
+LARGE_DELTA_KIND="${LOWMEM_PROXY_DELTA_KIND:-messages}"
+LARGE_DELTA_FILES="${LOWMEM_PROXY_DELTA_FILES:-100}"
+LARGE_DELTA_FILE_MIB="${LOWMEM_PROXY_DELTA_FILE_MIB:-1}"
 LARGE_TIMEOUT_SECS="${LOWMEM_PROXY_LARGE_TIMEOUT_SECS:-3600}"
 LARGE_MARKER_MESSAGES="${LOWMEM_PROXY_DELTA_MARKER_MESSAGES:-3}"
 
 LOWMEM_MEMTRACE_ENABLED="${LOW_MEM_MEMTRACE:-1}"
+LOWMEM_BUDGET_KB="${LOWMEM_PROXY_BUDGET_KB:-24576}"
+LOWMEM_CGROUP_ENFORCE="${LOWMEM_PROXY_CGROUP_ENFORCE:-0}"
+LOWMEM_CGROUP_LIMIT_KB="${LOWMEM_PROXY_CGROUP_LIMIT_KB:-22528}"
+LOWMEM_CGROUP_PARENT="${LOWMEM_PROXY_CGROUP_PARENT:-}"
 
 export TMPDIR="${TMPDIR:-${SCRIPT_ROOT}/target/tmp}"
 mkdir -p "${RUN_ROOT}" "${TMPDIR}"
@@ -54,9 +61,123 @@ run_topo_long() {
   timeout "${LARGE_TIMEOUT_SECS}" "${TOPO_BIN}" "$@"
 }
 
+default_cgroup_parent() {
+  local rel parent
+  rel="$(awk -F: 'NR==1{print $3}' /proc/self/cgroup)"
+  if [ -z "${rel}" ]; then
+    return 1
+  fi
+  if [ "${rel}" = "/" ] || [ "${rel%/*}" = "${rel}" ]; then
+    parent="/sys/fs/cgroup"
+  else
+    parent="/sys/fs/cgroup${rel%/*}"
+  fi
+  if [ ! -d "${parent}" ]; then
+    return 1
+  fi
+  printf '%s\n' "${parent}"
+}
+
+create_limited_cgroup() {
+  local name="$1"
+  local limit_kb="$2"
+  local parent="${LOWMEM_CGROUP_PARENT}"
+  if [ -z "${parent}" ]; then
+    parent="$(default_cgroup_parent)" || {
+      echo "error: failed to resolve cgroup parent for lowmem cap" >&2
+      return 1
+    }
+  fi
+  if [ ! -d "${parent}" ]; then
+    echo "error: cgroup parent does not exist: ${parent}" >&2
+    return 1
+  fi
+  local cg="${parent}/${name}"
+  mkdir "${cg}" || {
+    echo "error: failed to create cgroup: ${cg}" >&2
+    return 1
+  }
+
+  local limit_bytes=$((limit_kb * 1024))
+  if ! echo "${limit_bytes}" > "${cg}/memory.max"; then
+    echo "error: failed to set memory.max on ${cg}" >&2
+    rmdir "${cg}" >/dev/null 2>&1 || true
+    return 1
+  fi
+  if [ -w "${cg}/memory.swap.max" ]; then
+    echo 0 > "${cg}/memory.swap.max" || true
+  fi
+  if [ -w "${cg}/memory.oom.group" ]; then
+    echo 1 > "${cg}/memory.oom.group" || true
+  fi
+  printf '%s\n' "${cg}"
+}
+
+attach_pid_to_cgroup() {
+  local pid="$1"
+  local cg="$2"
+  if [ ! -w "${cg}/cgroup.procs" ]; then
+    echo "error: cannot attach pid=${pid} to cgroup=${cg} (cgroup.procs not writable)" >&2
+    return 1
+  fi
+  echo "${pid}" > "${cg}/cgroup.procs"
+}
+
+cgroup_memory_event_value() {
+  local cg="$1"
+  local key="$2"
+  if [ -r "${cg}/memory.events" ]; then
+    awk -v k="${key}" '$1 == k { print $2; found=1 } END { if (!found) print 0 }' "${cg}/memory.events"
+  else
+    echo 0
+  fi
+}
+
+check_process_and_cgroup_health() {
+  local pid="${1:-}"
+  local cg="${2:-}"
+  local label="${3:-process}"
+
+  if [ -n "${cg}" ] && [ -d "${cg}" ]; then
+    local oom oom_kill
+    oom="$(cgroup_memory_event_value "${cg}" "oom")"
+    oom_kill="$(cgroup_memory_event_value "${cg}" "oom_kill")"
+    if [ "${oom_kill}" -gt 0 ]; then
+      echo "error: ${label} hit cgroup OOM (oom=${oom} oom_kill=${oom_kill} cgroup=${cg})" >&2
+      return 1
+    fi
+  fi
+
+  if [ -n "${pid}" ] && ! kill -0 "${pid}" 2>/dev/null; then
+    local oom=0 oom_kill=0
+    if [ -n "${cg}" ] && [ -d "${cg}" ]; then
+      oom="$(cgroup_memory_event_value "${cg}" "oom")"
+      oom_kill="$(cgroup_memory_event_value "${cg}" "oom_kill")"
+    fi
+    echo "error: ${label} exited before convergence (pid=${pid} oom=${oom} oom_kill=${oom_kill})" >&2
+    return 1
+  fi
+  return 0
+}
+
+cleanup_limited_cgroup() {
+  local cg="$1"
+  if [ -z "${cg}" ] || [ ! -d "${cg}" ]; then
+    return 0
+  fi
+  if [ -r "${cg}/cgroup.procs" ]; then
+    while read -r pid; do
+      if [ -n "${pid}" ]; then
+        kill "${pid}" >/dev/null 2>&1 || true
+      fi
+    done < "${cg}/cgroup.procs"
+  fi
+  rmdir "${cg}" >/dev/null 2>&1 || true
+}
+
 is_retryable_resource_error() {
   local msg="$1"
-  grep -qiE "Resource temporarily unavailable \(os error 11\)|daemon not running yet" <<<"${msg}"
+  grep -qiE "Resource temporarily unavailable \(os error 11\)|daemon not running yet|database is locked" <<<"${msg}"
 }
 
 run_topo_retry() {
@@ -240,6 +361,36 @@ capture_top_anon_regions() {
 stop_daemon() {
   local db="$1"
   run_topo --db "${db}" stop >/dev/null 2>&1 || true
+  local deadline=$(( $(date +%s) + 20 ))
+  while true; do
+    local pids
+    pids="$(ps -eo pid=,args= | awk -v db="${db}" 'index($0, "--db " db " start") {print $1}')"
+    if [ -z "${pids}" ]; then
+      return 0
+    fi
+    if [ "$(date +%s)" -ge "${deadline}" ]; then
+      kill ${pids} >/dev/null 2>&1 || true
+      return 0
+    fi
+    sleep 0.2
+  done
+}
+
+checkpoint_truncate_wal() {
+  local db="$1"
+  python3 - "${db}" <<'PY'
+import sqlite3
+import sys
+
+db = sys.argv[1]
+try:
+    conn = sqlite3.connect(db, timeout=30)
+    conn.execute("PRAGMA busy_timeout = 30000")
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    conn.close()
+except Exception as e:
+    print(f"warn: wal checkpoint failed for {db}: {e}", file=sys.stderr)
+PY
 }
 
 messages_count_for_db() {
@@ -291,14 +442,40 @@ finally:
 PY
 }
 
+file_slice_count_for_db() {
+  local db="$1"
+  python3 - "${db}" <<'PY'
+import sqlite3
+import sys
+db = sys.argv[1]
+try:
+    conn = sqlite3.connect(db, timeout=5)
+    conn.execute("PRAGMA busy_timeout = 5000")
+    cur = conn.execute("SELECT COUNT(*) FROM events WHERE event_type = 'file_slice'")
+    row = cur.fetchone()
+    print(int(row[0] if row else 0))
+except sqlite3.Error:
+    print(-1)
+finally:
+    try:
+        conn.close()
+    except Exception:
+        pass
+PY
+}
+
 wait_for_message_count() {
   local db="$1"
   local min_count="$2"
   local timeout_secs="$3"
   local interval_secs="${4:-1}"
+  local watch_pid="${5:-}"
+  local watch_cgroup="${6:-}"
+  local watch_label="${7:-receiver}"
   local start now count
   start="$(date +%s)"
   while true; do
+    check_process_and_cgroup_health "${watch_pid}" "${watch_cgroup}" "${watch_label}" || return 1
     count="$(messages_count_for_db "${db}")"
     if [ "${count}" -ge "${min_count}" ]; then
       return 0
@@ -306,6 +483,31 @@ wait_for_message_count() {
     now="$(date +%s)"
     if [ $((now - start)) -ge "${timeout_secs}" ]; then
       echo "error: timed out waiting for message_count >= ${min_count} in ${db} (last=${count})" >&2
+      return 1
+    fi
+    sleep "${interval_secs}"
+  done
+}
+
+wait_for_file_slice_count() {
+  local db="$1"
+  local min_count="$2"
+  local timeout_secs="$3"
+  local interval_secs="${4:-1}"
+  local watch_pid="${5:-}"
+  local watch_cgroup="${6:-}"
+  local watch_label="${7:-receiver}"
+  local start now count
+  start="$(date +%s)"
+  while true; do
+    check_process_and_cgroup_health "${watch_pid}" "${watch_cgroup}" "${watch_label}" || return 1
+    count="$(file_slice_count_for_db "${db}")"
+    if [ "${count}" -ge "${min_count}" ]; then
+      return 0
+    fi
+    now="$(date +%s)"
+    if [ $((now - start)) -ge "${timeout_secs}" ]; then
+      echo "error: timed out waiting for file_slice_count >= ${min_count} in ${db} (last=${count})" >&2
       return 1
     fi
     sleep "${interval_secs}"
@@ -525,6 +727,7 @@ run_asymmetric_proxy() {
   local summary_file="${run_dir}/summary.txt"
   local alice_pid=""
   local bob_pid=""
+  local bob_cgroup=""
   local sampler_pid=""
   local smaps_pid=""
 
@@ -544,6 +747,7 @@ run_asymmetric_proxy() {
     fi
     stop_daemon "${alice_db}"
     stop_daemon "${bob_db}"
+    cleanup_limited_cgroup "${bob_cgroup}"
   }
   trap cleanup_asym RETURN
 
@@ -584,6 +788,11 @@ run_asymmetric_proxy() {
   if [ -z "${alice_pid}" ] || [ -z "${bob_pid}" ]; then
     echo "error: failed to resolve daemon PIDs (alice=${alice_pid} bob=${bob_pid})" >&2
     return 1
+  fi
+
+  if [ "${LOWMEM_CGROUP_ENFORCE}" = "1" ]; then
+    bob_cgroup="$(create_limited_cgroup "lowmem-proxy-asym-bob-$$_$(date +%s)" "${LOWMEM_CGROUP_LIMIT_KB}")"
+    attach_pid_to_cgroup "${bob_pid}" "${bob_cgroup}"
   fi
 
   (
@@ -681,6 +890,20 @@ EOF
     anon_pct=0
   fi
 
+  local pass_under_budget=0
+  if [ "${max_total}" -le "${LOWMEM_BUDGET_KB}" ]; then
+    pass_under_budget=1
+  fi
+
+  local cgroup_enforced=0 cgroup_limit_kb=0 cgroup_oom=0 cgroup_oom_kill=0 cgroup_path=""
+  if [ -n "${bob_cgroup}" ]; then
+    cgroup_enforced=1
+    cgroup_limit_kb="${LOWMEM_CGROUP_LIMIT_KB}"
+    cgroup_oom="$(cgroup_memory_event_value "${bob_cgroup}" "oom")"
+    cgroup_oom_kill="$(cgroup_memory_event_value "${bob_cgroup}" "oom_kill")"
+    cgroup_path="${bob_cgroup}"
+  fi
+
   local sqlite_mem_kb mall_arena_kb mall_used_kb mall_free_kb mall_mmap_kb anon_minus_sqlite_kb
   sqlite_mem_kb=$(( (MAX_SQLITE_MEM_CUR + 1023) / 1024 ))
   mall_arena_kb=$(( (MAX_MALL_ARENA + 1023) / 1024 ))
@@ -713,6 +936,13 @@ EOF
     echo "MAX_BOB_DB_WAL_KB=${max_db_wal}"
     echo "MAX_BOB_FILE_OTHER_KB=${max_file_other}"
     echo "MAX_BOB_TOTAL_KB=${max_total}"
+    echo "LOWMEM_BUDGET_KB=${LOWMEM_BUDGET_KB}"
+    echo "PASS_UNDER_24MB=${pass_under_budget}"
+    echo "CGROUP_ENFORCED=${cgroup_enforced}"
+    echo "CGROUP_LIMIT_KB=${cgroup_limit_kb}"
+    echo "CGROUP_OOM=${cgroup_oom}"
+    echo "CGROUP_OOM_KILL=${cgroup_oom_kill}"
+    echo "CGROUP_PATH=${cgroup_path}"
     echo "MAX_BOB_ANON_PCT=${anon_pct}"
     echo "MEMTRACE_PRESENT=${MEMTRACE_PRESENT}"
     echo "MAX_INIT_WANTED=${MAX_INIT_WANTED}"
@@ -782,6 +1012,11 @@ EOF
   echo "  ${bob_smaps_log}"
   echo "  ${bob_anon_regions}"
   echo "  ${memtrace_log}"
+
+  if [ "${cgroup_oom_kill}" -gt 0 ]; then
+    echo "error: receiver exceeded enforced cgroup limit (${cgroup_limit_kb} KB) and was OOM-killed" >&2
+    return 1
+  fi
 }
 
 run_large_delta_proxy() {
@@ -798,6 +1033,7 @@ run_large_delta_proxy() {
   local summary_file="${run_dir}/summary.txt"
   local alice_pid=""
   local bob_pid=""
+  local bob_cgroup=""
   local sampler_pid=""
   local smaps_pid=""
 
@@ -805,11 +1041,34 @@ run_large_delta_proxy() {
   : > "${samples_log}"
   : > "${bob_smaps_log}"
 
+  local delta_kind="${LARGE_DELTA_KIND}"
   local marker_messages="${LARGE_MARKER_MESSAGES}"
-  if [ "${marker_messages}" -gt "${LARGE_DELTA_EVENTS}" ]; then
-    marker_messages="${LARGE_DELTA_EVENTS}"
-  fi
-  local generated_delta_events=$((LARGE_DELTA_EVENTS - marker_messages))
+  local generated_delta_events=0
+  local file_delta_files=0
+  local file_delta_size_mib=0
+  local expected_file_slices=0
+
+  case "${delta_kind}" in
+    messages)
+      if [ "${marker_messages}" -gt "${LARGE_DELTA_EVENTS}" ]; then
+        marker_messages="${LARGE_DELTA_EVENTS}"
+      fi
+      generated_delta_events=$((LARGE_DELTA_EVENTS - marker_messages))
+      ;;
+    files)
+      file_delta_files="${LARGE_DELTA_FILES}"
+      file_delta_size_mib="${LARGE_DELTA_FILE_MIB}"
+      local file_size_bytes=$((file_delta_size_mib * 1024 * 1024))
+      local slice_size=262144
+      local slices_per_file=$(( (file_size_bytes + slice_size - 1) / slice_size ))
+      expected_file_slices=$((file_delta_files * slices_per_file))
+      ;;
+    *)
+      echo "error: unsupported LOWMEM_PROXY_DELTA_KIND=${delta_kind} (expected messages|files)" >&2
+      return 1
+      ;;
+  esac
+
   local marker_prefix="delta-notify-$$-$(date +%s)"
 
   cleanup_delta() {
@@ -824,6 +1083,7 @@ run_large_delta_proxy() {
     fi
     stop_daemon "${alice_db}"
     stop_daemon "${bob_db}"
+    cleanup_limited_cgroup "${bob_cgroup}"
   }
   trap cleanup_delta RETURN
 
@@ -862,8 +1122,12 @@ run_large_delta_proxy() {
 
   local pre_delta_count
   pre_delta_count="$(messages_count_for_db "${bob_db}")"
+  local pre_delta_file_slices
+  pre_delta_file_slices="$(file_slice_count_for_db "${bob_db}")"
 
   stop_daemon "${bob_db}"
+  checkpoint_truncate_wal "${bob_db}"
+  checkpoint_truncate_wal "${alice_db}"
 
   LOW_MEM=1 \
   LOW_MEM_WAL_CAP_MIB="${WAL_CAP_MIB}" \
@@ -877,6 +1141,11 @@ run_large_delta_proxy() {
   if [ -z "${alice_pid}" ] || [ -z "${bob_pid}" ]; then
     echo "error: failed to resolve daemon PIDs (alice=${alice_pid} bob=${bob_pid})" >&2
     return 1
+  fi
+
+  if [ "${LOWMEM_CGROUP_ENFORCE}" = "1" ]; then
+    bob_cgroup="$(create_limited_cgroup "lowmem-proxy-delta-bob-$$_$(date +%s)" "${LOWMEM_CGROUP_LIMIT_KB}")"
+    attach_pid_to_cgroup "${bob_pid}" "${bob_cgroup}"
   fi
 
   (
@@ -904,14 +1173,31 @@ run_large_delta_proxy() {
   for i in $(seq 1 "${marker_messages}"); do
     run_topo_retry 5 --db "${alice_db}" send "${marker_prefix}-msg-${i}" >/dev/null
   done
-  if [ "${generated_delta_events}" -gt 0 ]; then
-    run_topo_long_retry 3 --db "${alice_db}" generate --count "${generated_delta_events}" >/dev/null
+  if [ "${delta_kind}" = "messages" ]; then
+    if [ "${generated_delta_events}" -gt 0 ]; then
+      run_topo_long_retry 3 --db "${alice_db}" generate --count "${generated_delta_events}" >/dev/null
+    fi
+  else
+    if [ "${file_delta_files}" -gt 0 ]; then
+      run_topo_long_retry 3 --db "${alice_db}" generate-files \
+        --count "${file_delta_files}" \
+        --size-mib "${file_delta_size_mib}" >/dev/null
+    fi
   fi
 
-  local expected_total
-  expected_total=$((LARGE_BASE_EVENTS + LARGE_DELTA_EVENTS))
-  wait_for_message_count "${alice_db}" "${expected_total}" "${LARGE_TIMEOUT_SECS}" 1
-  wait_for_message_count "${bob_db}" "${expected_total}" "${LARGE_TIMEOUT_SECS}" 1
+  local expected_total_messages
+  if [ "${delta_kind}" = "messages" ]; then
+    expected_total_messages=$((LARGE_BASE_EVENTS + LARGE_DELTA_EVENTS))
+  else
+    expected_total_messages=$((LARGE_BASE_EVENTS + marker_messages + file_delta_files))
+  fi
+  local delta_message_budget=$((expected_total_messages - LARGE_BASE_EVENTS))
+  wait_for_message_count "${alice_db}" "${expected_total_messages}" "${LARGE_TIMEOUT_SECS}" 1
+  wait_for_message_count "${bob_db}" "${expected_total_messages}" "${LARGE_TIMEOUT_SECS}" 1 "${bob_pid}" "${bob_cgroup}" "receiver bob"
+  if [ "${delta_kind}" = "files" ] && [ "${expected_file_slices}" -gt 0 ]; then
+    wait_for_file_slice_count "${alice_db}" "${expected_file_slices}" "${LARGE_TIMEOUT_SECS}" 1
+    wait_for_file_slice_count "${bob_db}" "${expected_file_slices}" "${LARGE_TIMEOUT_SECS}" 1 "${bob_pid}" "${bob_cgroup}" "receiver bob"
+  fi
 
   local marker_synced
   marker_synced="$(messages_with_prefix_for_db "${bob_db}" "${marker_prefix}")"
@@ -922,6 +1208,8 @@ run_large_delta_proxy() {
 
   local post_delta_count
   post_delta_count="$(messages_count_for_db "${bob_db}")"
+  local post_delta_file_slices
+  post_delta_file_slices="$(file_slice_count_for_db "${bob_db}")"
 
   sleep 2
   capture_top_anon_regions "${bob_pid}" "${bob_anon_regions}"
@@ -988,6 +1276,20 @@ EOF
     anon_pct=0
   fi
 
+  local pass_under_budget=0
+  if [ "${max_total}" -le "${LOWMEM_BUDGET_KB}" ]; then
+    pass_under_budget=1
+  fi
+
+  local cgroup_enforced=0 cgroup_limit_kb=0 cgroup_oom=0 cgroup_oom_kill=0 cgroup_path=""
+  if [ -n "${bob_cgroup}" ]; then
+    cgroup_enforced=1
+    cgroup_limit_kb="${LOWMEM_CGROUP_LIMIT_KB}"
+    cgroup_oom="$(cgroup_memory_event_value "${bob_cgroup}" "oom")"
+    cgroup_oom_kill="$(cgroup_memory_event_value "${bob_cgroup}" "oom_kill")"
+    cgroup_path="${bob_cgroup}"
+  fi
+
   local sqlite_mem_kb mall_arena_kb mall_used_kb mall_free_kb mall_mmap_kb anon_minus_sqlite_kb
   sqlite_mem_kb=$(( (MAX_SQLITE_MEM_CUR + 1023) / 1024 ))
   mall_arena_kb=$(( (MAX_MALL_ARENA + 1023) / 1024 ))
@@ -1002,11 +1304,18 @@ EOF
   {
     echo "RUN_DIR=${run_dir}"
     echo "SCENARIO=large_delta"
+    echo "DELTA_KIND=${delta_kind}"
     echo "BASE_EVENTS=${LARGE_BASE_EVENTS}"
-    echo "DELTA_EVENTS=${LARGE_DELTA_EVENTS}"
+    echo "DELTA_EVENTS=${delta_message_budget}"
+    echo "DELTA_FILES=${file_delta_files}"
+    echo "DELTA_FILE_SIZE_MIB=${file_delta_size_mib}"
+    echo "DELTA_FILE_SLICES_EXPECTED=${expected_file_slices}"
     echo "PRE_DELTA_MESSAGES=${pre_delta_count}"
     echo "POST_DELTA_MESSAGES=${post_delta_count}"
     echo "DELTA_MESSAGES_OBSERVED=$((post_delta_count - pre_delta_count))"
+    echo "PRE_DELTA_FILE_SLICES=${pre_delta_file_slices}"
+    echo "POST_DELTA_FILE_SLICES=${post_delta_file_slices}"
+    echo "DELTA_FILE_SLICES_OBSERVED=$((post_delta_file_slices - pre_delta_file_slices))"
     echo "DELTA_MARKER_PREFIX=${marker_prefix}"
     echo "DELTA_MARKERS_EXPECTED=${marker_messages}"
     echo "DELTA_MARKERS_SYNCED=${marker_synced}"
@@ -1029,6 +1338,13 @@ EOF
     echo "MAX_BOB_DB_WAL_KB=${max_db_wal}"
     echo "MAX_BOB_FILE_OTHER_KB=${max_file_other}"
     echo "MAX_BOB_TOTAL_KB=${max_total}"
+    echo "LOWMEM_BUDGET_KB=${LOWMEM_BUDGET_KB}"
+    echo "PASS_UNDER_24MB=${pass_under_budget}"
+    echo "CGROUP_ENFORCED=${cgroup_enforced}"
+    echo "CGROUP_LIMIT_KB=${cgroup_limit_kb}"
+    echo "CGROUP_OOM=${cgroup_oom}"
+    echo "CGROUP_OOM_KILL=${cgroup_oom_kill}"
+    echo "CGROUP_PATH=${cgroup_path}"
     echo "MAX_BOB_ANON_PCT=${anon_pct}"
     echo "MEMTRACE_PRESENT=${MEMTRACE_PRESENT}"
     echo "MAX_INIT_WANTED=${MAX_INIT_WANTED}"
@@ -1098,7 +1414,41 @@ EOF
   echo "  ${bob_smaps_log}"
   echo "  ${bob_anon_regions}"
   echo "  ${memtrace_log}"
+
+  if [ "${cgroup_oom_kill}" -gt 0 ]; then
+    echo "error: receiver exceeded enforced cgroup limit (${cgroup_limit_kb} KB) and was OOM-killed" >&2
+    return 1
+  fi
 }
+
+case "${MODE}" in
+  delta10k)
+    LARGE_DELTA_KIND="messages"
+    ;;
+  deltafiles)
+    LARGE_DELTA_KIND="files"
+    ;;
+  deltafilesfast)
+    LARGE_DELTA_KIND="files"
+    LARGE_BASE_EVENTS=0
+    # Keep one small marker to reliably trigger a sync round for file-only deltas.
+    LARGE_MARKER_MESSAGES=1
+    if [ -z "${LOWMEM_PROXY_DELTA_FILES+x}" ]; then
+      LARGE_DELTA_FILES=10
+    fi
+    if [ -z "${LOWMEM_PROXY_DELTA_FILE_MIB+x}" ]; then
+      LARGE_DELTA_FILE_MIB=1
+    fi
+    ;;
+  deltafilesquick)
+    LARGE_DELTA_KIND="files"
+    LARGE_BASE_EVENTS=0
+    LARGE_MARKER_MESSAGES=1
+    LARGE_DELTA_FILES="${LOWMEM_PROXY_QUICK_DELTA_FILES:-10}"
+    LARGE_DELTA_FILE_MIB="${LOWMEM_PROXY_QUICK_DELTA_FILE_MIB:-1}"
+    LARGE_TIMEOUT_SECS="${LOWMEM_PROXY_QUICK_TIMEOUT_SECS:-180}"
+    ;;
+esac
 
 banner "Low-Memory Proxy"
 echo "  MODE=${MODE}"
@@ -1110,11 +1460,18 @@ echo "  LOWMEM_PROXY_SMOKE_EVENTS_PER_PEER=${SMOKE_EVENTS_PER_PEER}"
 echo "  LOWMEM_PROXY_SMOKE_BUDGET_MIB=${SMOKE_BUDGET_MIB}"
 echo "  LOWMEM_PROXY_EVENTS=${ASYM_EVENTS}"
 echo "  LOWMEM_PROXY_BASE_EVENTS=${LARGE_BASE_EVENTS}"
+echo "  LOWMEM_PROXY_DELTA_KIND=${LARGE_DELTA_KIND}"
 echo "  LOWMEM_PROXY_DELTA_EVENTS=${LARGE_DELTA_EVENTS}"
+echo "  LOWMEM_PROXY_DELTA_FILES=${LARGE_DELTA_FILES}"
+echo "  LOWMEM_PROXY_DELTA_FILE_MIB=${LARGE_DELTA_FILE_MIB}"
 echo "  LOWMEM_PROXY_LARGE_TIMEOUT_SECS=${LARGE_TIMEOUT_SECS}"
 echo "  LOWMEM_PROXY_DELTA_MARKER_MESSAGES=${LARGE_MARKER_MESSAGES}"
 echo "  LOW_MEM_WAL_CAP_MIB=${WAL_CAP_MIB}"
 echo "  LOW_MEM_MEMTRACE=${LOWMEM_MEMTRACE_ENABLED}"
+echo "  LOWMEM_PROXY_BUDGET_KB=${LOWMEM_BUDGET_KB}"
+echo "  LOWMEM_PROXY_CGROUP_ENFORCE=${LOWMEM_CGROUP_ENFORCE}"
+echo "  LOWMEM_PROXY_CGROUP_LIMIT_KB=${LOWMEM_CGROUP_LIMIT_KB}"
+echo "  LOWMEM_PROXY_CGROUP_PARENT=${LOWMEM_CGROUP_PARENT:-auto}"
 
 case "${MODE}" in
   smoke)
@@ -1126,12 +1483,21 @@ case "${MODE}" in
   delta10k)
     run_large_delta_proxy
     ;;
+  deltafiles)
+    run_large_delta_proxy
+    ;;
+  deltafilesfast)
+    run_large_delta_proxy
+    ;;
+  deltafilesquick)
+    run_large_delta_proxy
+    ;;
   proxy)
     run_smoke_proxy
     run_asymmetric_proxy
     ;;
   *)
-    echo "usage: scripts/run_lowmem_proxy.sh [smoke|asym50k|delta10k|proxy]"
+    echo "usage: scripts/run_lowmem_proxy.sh [smoke|asym50k|delta10k|deltafiles|deltafilesfast|deltafilesquick|proxy]"
     exit 2
     ;;
 esac
