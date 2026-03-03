@@ -116,3 +116,14 @@ pub fn allocator_memory() -> Option<AllocatorMemStats> {
 pub fn allocator_memory() -> Option<AllocatorMemStats> {
     None
 }
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub fn allocator_trim() -> bool {
+    // SAFETY: malloc_trim is a process-global allocator maintenance call.
+    unsafe { libc::malloc_trim(0) != 0 }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+pub fn allocator_trim() -> bool {
+    false
+}

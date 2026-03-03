@@ -1,5 +1,9 @@
 use std::net::SocketAddr;
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -15,6 +19,7 @@ use topo::rpc::client::{rpc_call, RpcClientError};
 use topo::rpc::protocol::RpcMethod;
 use topo::rpc::server::{run_rpc_server, DaemonState, RuntimeState};
 use topo::service;
+use topo::tuning::{apply_low_mem_allocator_tuning, low_mem_mode};
 
 #[derive(Parser)]
 #[command(name = "topo")]
@@ -30,6 +35,72 @@ struct Cli {
     /// Custom RPC socket path (default: <db>.topo.sock)
     #[arg(long, global = true)]
     socket: Option<String>,
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+const GLIBC_TCACHE_COUNT_OFF: &str = "glibc.malloc.tcache_count=0";
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+const GLIBC_TCACHE_MAX_OFF: &str = "glibc.malloc.tcache_max=0";
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn has_glibc_tunable(existing: &str, needle: &str) -> bool {
+    existing.split(':').any(|part| part.trim() == needle)
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn merged_low_mem_glibc_tunables(existing: &str) -> String {
+    let mut tunables = existing.to_string();
+    if !has_glibc_tunable(&tunables, GLIBC_TCACHE_COUNT_OFF) {
+        if !tunables.is_empty() {
+            tunables.push(':');
+        }
+        tunables.push_str(GLIBC_TCACHE_COUNT_OFF);
+    }
+    if !has_glibc_tunable(&tunables, GLIBC_TCACHE_MAX_OFF) {
+        if !tunables.is_empty() {
+            tunables.push(':');
+        }
+        tunables.push_str(GLIBC_TCACHE_MAX_OFF);
+    }
+    tunables
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn maybe_reexec_low_mem_with_allocator_env() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+{
+    if !low_mem_mode() {
+        return Ok(());
+    }
+    if std::env::var_os("_TOPO_LOW_MEM_ALLOC_READY").is_some() {
+        return Ok(());
+    }
+    let tunables = std::env::var("GLIBC_TUNABLES").unwrap_or_default();
+    if std::env::var_os("MALLOC_ARENA_MAX").is_some()
+        && std::env::var_os("MALLOC_TRIM_THRESHOLD_").is_some()
+        && std::env::var_os("MALLOC_MMAP_THRESHOLD_").is_some()
+        && has_glibc_tunable(&tunables, GLIBC_TCACHE_COUNT_OFF)
+        && has_glibc_tunable(&tunables, GLIBC_TCACHE_MAX_OFF)
+    {
+        return Ok(());
+    }
+
+    let exe = std::env::current_exe()?;
+    let mut cmd = Command::new(exe);
+    cmd.args(std::env::args_os().skip(1));
+    cmd.env("MALLOC_ARENA_MAX", "1");
+    cmd.env("MALLOC_TRIM_THRESHOLD_", "0");
+    cmd.env("MALLOC_MMAP_THRESHOLD_", "16384");
+    cmd.env("MALLOC_TOP_PAD_", "0");
+    cmd.env("GLIBC_TUNABLES", merged_low_mem_glibc_tunables(&tunables));
+    cmd.env("_TOPO_LOW_MEM_ALLOC_READY", "1");
+    let err = cmd.exec();
+    Err(format!("low-mem allocator re-exec failed: {err}").into())
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn maybe_reexec_low_mem_with_allocator_env() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+{
+    Ok(())
 }
 
 #[derive(Subcommand)]
@@ -590,6 +661,8 @@ async fn run_runtime_manager(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    maybe_reexec_low_mem_with_allocator_env()?;
+    apply_low_mem_allocator_tuning();
     let cli = Cli::parse();
     let db = &resolve_db_arg(&cli.db)
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;

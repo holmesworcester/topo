@@ -36,7 +36,7 @@ pub use responder::run_sync_responder;
 /// Low-memory mode uses a smaller frame to reduce peak control-buffer pressure.
 pub(super) fn negentropy_frame_size() -> u64 {
     if low_mem_mode() {
-        64 * 1024
+        8 * 1024
     } else {
         256 * 1024
     }
@@ -45,7 +45,7 @@ pub(super) fn negentropy_frame_size() -> u64 {
 /// Max event IDs sent per HaveList message during reconciliation.
 pub(super) fn have_chunk() -> usize {
     if low_mem_mode() {
-        64
+        4
     } else {
         1000
     }
@@ -54,7 +54,7 @@ pub(super) fn have_chunk() -> usize {
 /// Max event IDs sent per NeedList/HaveList request during reconciliation.
 pub(super) fn need_chunk() -> usize {
     if low_mem_mode() {
-        64
+        4
     } else {
         1000
     }
@@ -63,7 +63,7 @@ pub(super) fn need_chunk() -> usize {
 /// Max events to enqueue into the egress queue per main-loop iteration.
 pub(super) fn enqueue_batch() -> usize {
     if low_mem_mode() {
-        128
+        4
     } else {
         5000
     }
@@ -72,7 +72,7 @@ pub(super) fn enqueue_batch() -> usize {
 /// Max events per egress claim (one send batch to the data stream).
 pub(super) fn egress_claim_count() -> usize {
     if low_mem_mode() {
-        32
+        1
     } else {
         500
     }

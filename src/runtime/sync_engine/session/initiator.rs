@@ -37,9 +37,7 @@ use super::data_plane::{
     drain_egress_to_data_stream, enqueue_pending_have_to_egress, send_data_done,
     spawn_data_receiver,
 };
-use super::{
-    negentropy_frame_size, CONTROL_POLL_TIMEOUT, DATA_DRAIN_TIMEOUT, EGRESS_SENT_TTL_MS,
-};
+use super::{negentropy_frame_size, CONTROL_POLL_TIMEOUT, DATA_DRAIN_TIMEOUT, EGRESS_SENT_TTL_MS};
 
 /// Run sync as the initiator (client role) with dual streams.
 /// Control stream: NegOpen, NegMsg, HaveList
@@ -93,8 +91,12 @@ where
     let _ = wanted.clear();
     let _ = need_queue.clear(peer_id);
 
-    let ws_id = lookup_workspace_id(&db, recorded_by)
-        .ok_or_else(|| format!("no trust anchor for peer_id={}, cannot start sync", recorded_by))?;
+    let ws_id = lookup_workspace_id(&db, recorded_by).ok_or_else(|| {
+        format!(
+            "no trust anchor for peer_id={}, cannot start sync",
+            recorded_by
+        )
+    })?;
     let neg_storage = NegentropyStorageSqlite::new(&neg_db, &ws_id);
 
     if use_snapshot {
@@ -159,6 +161,7 @@ where
     let memtrace_interval = Duration::from_secs(2);
     let memtrace_file = std::env::var("LOW_MEM_MEMTRACE_FILE").ok();
     let mut last_memtrace = Instant::now();
+    let mut last_alloc_trim = Instant::now();
 
     loop {
         // Data receiver runs in a separate task — check if it received data
@@ -198,7 +201,6 @@ where
                 }
 
                 append_have_ids_to_pending(&mut have_ids, &mut pending_have);
-
             }
             Ok(Ok(Frame::DoneAck)) => {
                 info!("Received DoneAck from responder");
@@ -248,8 +250,7 @@ where
         // Poll for coordinator assignment (non-blocking)
         if fallback_reported && !fallback_dispatched {
             if let Some(assigned) = try_poll_coordinator_assignment(coordination) {
-                let dispatched =
-                    dispatch_assigned_events(&mut control, &wanted, assigned).await?;
+                let dispatched = dispatch_assigned_events(&mut control, &wanted, assigned).await?;
                 info!("Coordinator assigned {} events to this session", dispatched);
                 fallback_dispatched = true;
             } else if fallback_report_time
@@ -268,6 +269,11 @@ where
         bytes_sent += send_stats.bytes_sent_delta;
         if send_stats.events_sent_delta > 0 {
             last_activity = Instant::now();
+        }
+
+        if low_mem_mode() && last_alloc_trim.elapsed() >= Duration::from_millis(100) {
+            let _ = memtrace::allocator_trim();
+            last_alloc_trim = Instant::now();
         }
 
         if memtrace_enabled && last_memtrace.elapsed() >= memtrace_interval {

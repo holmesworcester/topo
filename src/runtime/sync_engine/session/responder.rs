@@ -30,9 +30,7 @@ use crate::tuning::{low_mem_memtrace, low_mem_mode};
 
 use super::control_plane::send_done_ack;
 use super::data_plane::{drain_egress_to_data_stream, send_data_done, spawn_data_receiver};
-use super::{
-    negentropy_frame_size, CONTROL_POLL_TIMEOUT, DATA_DRAIN_TIMEOUT, EGRESS_SENT_TTL_MS,
-};
+use super::{negentropy_frame_size, CONTROL_POLL_TIMEOUT, DATA_DRAIN_TIMEOUT, EGRESS_SENT_TTL_MS};
 
 /// Run sync as the responder (server role) with dual streams.
 ///
@@ -74,8 +72,12 @@ where
     let egress = EgressQueue::new(&db);
     let _ = egress.clear_connection(peer_id);
 
-    let ws_id = lookup_workspace_id(&db, recorded_by)
-        .ok_or_else(|| format!("no trust anchor for peer_id={}, cannot start sync", recorded_by))?;
+    let ws_id = lookup_workspace_id(&db, recorded_by).ok_or_else(|| {
+        format!(
+            "no trust anchor for peer_id={}, cannot start sync",
+            recorded_by
+        )
+    })?;
 
     // Spawn reconciliation on a dedicated OS thread.
     // neg_db, neg_storage, neg are !Send (SQLite + RefCell) so they must
@@ -142,6 +144,7 @@ where
     let memtrace_interval = Duration::from_secs(2);
     let memtrace_file = std::env::var("LOW_MEM_MEMTRACE_FILE").ok();
     let mut last_memtrace = Instant::now();
+    let mut last_alloc_trim = Instant::now();
 
     loop {
         // Data receiver runs in a separate task — check if it received data
@@ -229,6 +232,11 @@ where
         bytes_sent += send_stats.bytes_sent_delta;
         if send_stats.events_sent_delta > 0 {
             last_activity = Instant::now();
+        }
+
+        if low_mem_mode() && last_alloc_trim.elapsed() >= Duration::from_millis(100) {
+            let _ = memtrace::allocator_trim();
+            last_alloc_trim = Instant::now();
         }
 
         if memtrace_enabled && last_memtrace.elapsed() >= memtrace_interval {
