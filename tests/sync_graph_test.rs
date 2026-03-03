@@ -309,7 +309,11 @@ async fn catchup_8x_100k() {
 /// 1. Sink received all expected file-slice events (via events + recorded_events).
 /// 2. Every non-sink source contributed a meaningful share of slices
 ///    (source attribution via `recorded_events.source`).
-async fn run_catchup_large_file(source_count: usize, total_slices: usize) {
+async fn run_catchup_large_file(
+    source_count: usize,
+    total_slices: usize,
+    min_contributing_sources: usize,
+) {
     let sources: Vec<Peer> = (0..source_count)
         .map(|i| Peer::new_with_identity(&format!("fs{}", i)))
         .collect();
@@ -434,10 +438,19 @@ async fn run_catchup_large_file(source_count: usize, total_slices: usize) {
         .values()
         .filter(|&&c| c >= floor)
         .count();
-    assert_eq!(
-        contributing, source_count,
-        "all {} sources must contribute >= {} slices each; got: {:?}",
-        source_count, floor, source_counts,
+    assert!(
+        min_contributing_sources >= 1 && min_contributing_sources <= source_count,
+        "invalid min_contributing_sources={} for source_count={}",
+        min_contributing_sources,
+        source_count,
+    );
+    assert!(
+        contributing >= min_contributing_sources,
+        "expected >= {} contributing sources (>= {} slices each), got {} with counts {:?}",
+        min_contributing_sources,
+        floor,
+        contributing,
+        source_counts,
     );
 }
 
@@ -445,14 +458,24 @@ async fn run_catchup_large_file(source_count: usize, total_slices: usize) {
 #[tokio::test]
 #[ignore]
 async fn catchup_large_file_4x_1024_slices() {
-    run_catchup_large_file(4, 1024).await;
+    run_catchup_large_file(4, 1024, 4).await;
+}
+
+/// Multi-source file: 4 sources, 400 slices (100 MiB).
+///
+/// Proxy for "100 files x 1 MiB" delta volume, represented in canonical
+/// 256 KiB file-slice events (4 slices per MiB file).
+#[tokio::test]
+#[ignore]
+async fn catchup_large_file_4x_400_slices() {
+    run_catchup_large_file(4, 400, 3).await;
 }
 
 /// Multi-source file: 8 sources, 1024 slices (256 MiB).
 #[tokio::test]
 #[ignore]
 async fn catchup_large_file_8x_1024_slices() {
-    run_catchup_large_file(8, 1024).await;
+    run_catchup_large_file(8, 1024, 8).await;
 }
 
 // ---------------------------------------------------------------------------

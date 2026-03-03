@@ -56,7 +56,7 @@ run_topo_long() {
 
 is_retryable_resource_error() {
   local msg="$1"
-  grep -qi "Resource temporarily unavailable (os error 11)" <<<"${msg}"
+  grep -qiE "Resource temporarily unavailable \(os error 11\)|daemon not running yet" <<<"${msg}"
 }
 
 run_topo_retry() {
@@ -201,6 +201,11 @@ sample_smaps_breakdown() {
 capture_top_anon_regions() {
   local pid="$1"
   local out_file="$2"
+  local smaps_path="/proc/${pid}/smaps"
+  if [ ! -r "${smaps_path}" ]; then
+    echo "smaps unavailable for pid=${pid}" > "${out_file}"
+    return 0
+  fi
   awk '
     function flush_region() {
       if (!in_region) return
@@ -229,7 +234,7 @@ capture_top_anon_regions() {
     END {
       flush_region()
     }
-  ' "/proc/${pid}/smaps" 2>/dev/null | sort -nr | head -n 25 > "${out_file}"
+  ' "${smaps_path}" 2>/dev/null | sort -nr | head -n 25 > "${out_file}"
 }
 
 stop_daemon() {
