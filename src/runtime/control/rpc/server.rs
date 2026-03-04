@@ -735,6 +735,207 @@ fn dispatch(
             },
             Err(e) => RpcResponse::error(e),
         },
+
+        // ----- Subscription commands -----
+        RpcMethod::SubCreate {
+            name,
+            event_type,
+            delivery_mode,
+            spec_json,
+        } => match state.require_active_peer() {
+            Ok(peer_id) => {
+                use crate::event_modules::subscription;
+
+                // P2: Reject unsupported event types early.
+                if !subscription::matcher::is_supported_event_type(&event_type) {
+                    return RpcResponse::error(format!(
+                        "unsupported event type '{}'; supported: {}",
+                        event_type,
+                        subscription::matcher::supported_event_types().join(", "),
+                    ));
+                }
+
+                let dm = match subscription::DeliveryMode::from_str(&delivery_mode) {
+                    Ok(d) => d,
+                    Err(e) => return RpcResponse::error(e),
+                };
+                let mut spec: subscription::SubscriptionSpec = if spec_json.is_empty() {
+                    subscription::SubscriptionSpec {
+                        event_type: event_type.clone(),
+                        since: None,
+                        filters: vec![],
+                    }
+                } else {
+                    match serde_json::from_str(&spec_json) {
+                        Ok(s) => s,
+                        Err(e) => return RpcResponse::error(format!("invalid spec: {}", e)),
+                    }
+                };
+
+                // Enforce spec.event_type matches the top-level event_type arg.
+                if spec.event_type != event_type {
+                    return RpcResponse::error(format!(
+                        "spec.event_type '{}' does not match event_type '{}'",
+                        spec.event_type, event_type,
+                    ));
+                }
+
+                // P2b: Validate filter fields and operators against the matcher.
+                if let Err(e) = subscription::matcher::validate_spec(&event_type, &spec) {
+                    return RpcResponse::error(format!("invalid spec: {}", e));
+                }
+
+                // Normalize since.event_id: accept hex (from CLI) and convert to base64
+                // (which is the internal storage format in the events table).
+                if let Some(ref mut since) = spec.since {
+                    if !since.event_id.is_empty() {
+                        // If it looks like hex (64 hex chars = 32 bytes), convert to base64.
+                        if since.event_id.len() == 64 && since.event_id.chars().all(|c| c.is_ascii_hexdigit()) {
+                            if let Some(eid) = crate::crypto::event_id_from_hex(&since.event_id) {
+                                since.event_id = crate::crypto::event_id_to_base64(&eid);
+                            }
+                        }
+                    }
+                }
+
+                // P1: Resolve since_event_id to its created_at_ms when not provided.
+                if let Some(ref mut since) = spec.since {
+                    if !since.event_id.is_empty() && since.created_at_ms == 0 {
+                        match service::open_db_for_peer(db_path, &peer_id) {
+                            Ok((_rb, ref db)) => {
+                                match subscription::queries::resolve_event_created_at(
+                                    db,
+                                    &since.event_id,
+                                ) {
+                                    Ok(ts) => since.created_at_ms = ts,
+                                    Err(e) => {
+                                        return RpcResponse::error(format!(
+                                            "cannot resolve since_event_id '{}': {}",
+                                            since.event_id, e
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                return RpcResponse::error(format!(
+                                    "cannot resolve since_event_id: {}",
+                                    e
+                                ));
+                            }
+                        }
+                    }
+                }
+
+                match service::open_db_for_peer(db_path, &peer_id) {
+                    Ok((recorded_by, db)) => {
+                        match subscription::create_subscription(
+                            &db,
+                            &recorded_by,
+                            &name,
+                            &event_type,
+                            dm,
+                            &spec,
+                        ) {
+                            Ok(sub) => RpcResponse::success(sub),
+                            Err(e) => RpcResponse::error(e),
+                        }
+                    }
+                    Err(e) => RpcResponse::error(e.to_string()),
+                }
+            }
+            Err(e) => RpcResponse::error(e),
+        },
+        RpcMethod::SubList => match state.require_active_peer() {
+            Ok(peer_id) => match service::open_db_for_peer(db_path, &peer_id) {
+                Ok((recorded_by, db)) => {
+                    use crate::event_modules::subscription;
+                    match subscription::list_subscriptions(&db, &recorded_by) {
+                        Ok(subs) => RpcResponse::success(subs),
+                        Err(e) => RpcResponse::error(e),
+                    }
+                }
+                Err(e) => RpcResponse::error(e.to_string()),
+            },
+            Err(e) => RpcResponse::error(e),
+        },
+        RpcMethod::SubDisable { subscription_id } => match state.require_active_peer() {
+            Ok(peer_id) => match service::open_db_for_peer(db_path, &peer_id) {
+                Ok((recorded_by, db)) => {
+                    use crate::event_modules::subscription;
+                    match subscription::set_enabled(&db, &recorded_by, &subscription_id, false) {
+                        Ok(()) => RpcResponse::success(serde_json::json!({"disabled": true})),
+                        Err(e) => RpcResponse::error(e),
+                    }
+                }
+                Err(e) => RpcResponse::error(e.to_string()),
+            },
+            Err(e) => RpcResponse::error(e),
+        },
+        RpcMethod::SubEnable { subscription_id } => match state.require_active_peer() {
+            Ok(peer_id) => match service::open_db_for_peer(db_path, &peer_id) {
+                Ok((recorded_by, db)) => {
+                    use crate::event_modules::subscription;
+                    match subscription::set_enabled(&db, &recorded_by, &subscription_id, true) {
+                        Ok(()) => RpcResponse::success(serde_json::json!({"enabled": true})),
+                        Err(e) => RpcResponse::error(e),
+                    }
+                }
+                Err(e) => RpcResponse::error(e.to_string()),
+            },
+            Err(e) => RpcResponse::error(e),
+        },
+        RpcMethod::SubPoll {
+            subscription_id,
+            after_seq,
+            limit,
+        } => match state.require_active_peer() {
+            Ok(peer_id) => match service::open_db_for_peer(db_path, &peer_id) {
+                Ok((recorded_by, db)) => {
+                    use crate::event_modules::subscription;
+                    match subscription::poll_feed(
+                        &db,
+                        &recorded_by,
+                        &subscription_id,
+                        after_seq,
+                        limit,
+                    ) {
+                        Ok(items) => RpcResponse::success(items),
+                        Err(e) => RpcResponse::error(e),
+                    }
+                }
+                Err(e) => RpcResponse::error(e.to_string()),
+            },
+            Err(e) => RpcResponse::error(e),
+        },
+        RpcMethod::SubAck {
+            subscription_id,
+            through_seq,
+        } => match state.require_active_peer() {
+            Ok(peer_id) => match service::open_db_for_peer(db_path, &peer_id) {
+                Ok((recorded_by, db)) => {
+                    use crate::event_modules::subscription;
+                    match subscription::ack_feed(&db, &recorded_by, &subscription_id, through_seq) {
+                        Ok(()) => RpcResponse::success(serde_json::json!({"acked": true})),
+                        Err(e) => RpcResponse::error(e),
+                    }
+                }
+                Err(e) => RpcResponse::error(e.to_string()),
+            },
+            Err(e) => RpcResponse::error(e),
+        },
+        RpcMethod::SubState { subscription_id } => match state.require_active_peer() {
+            Ok(peer_id) => match service::open_db_for_peer(db_path, &peer_id) {
+                Ok((recorded_by, db)) => {
+                    use crate::event_modules::subscription;
+                    match subscription::get_state(&db, &recorded_by, &subscription_id) {
+                        Ok(state) => RpcResponse::success(state),
+                        Err(e) => RpcResponse::error(e),
+                    }
+                }
+                Err(e) => RpcResponse::error(e.to_string()),
+            },
+            Err(e) => RpcResponse::error(e),
+        },
     }
 }
 

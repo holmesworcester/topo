@@ -113,6 +113,41 @@ pub enum RpcMethod {
         #[serde(default = "default_view_limit")]
         limit: usize,
     },
+    /// Create a local subscription.
+    SubCreate {
+        name: String,
+        event_type: String,
+        delivery_mode: String,
+        #[serde(default)]
+        spec_json: String,
+    },
+    /// List all subscriptions for the active peer.
+    SubList,
+    /// Disable a subscription.
+    SubDisable {
+        subscription_id: String,
+    },
+    /// Enable a subscription.
+    SubEnable {
+        subscription_id: String,
+    },
+    /// Poll feed items from a subscription.
+    SubPoll {
+        subscription_id: String,
+        #[serde(default)]
+        after_seq: i64,
+        #[serde(default = "default_sub_poll_limit")]
+        limit: usize,
+    },
+    /// Acknowledge feed items through a given seq.
+    SubAck {
+        subscription_id: String,
+        through_seq: i64,
+    },
+    /// Get subscription state (pending count, dirty flag, cursors).
+    SubState {
+        subscription_id: String,
+    },
 }
 
 fn default_workspace_name() -> String {
@@ -125,6 +160,9 @@ fn default_device_name() -> String {
     "device".to_string()
 }
 fn default_view_limit() -> usize {
+    50
+}
+fn default_sub_poll_limit() -> usize {
     50
 }
 

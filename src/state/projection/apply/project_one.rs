@@ -76,7 +76,8 @@ pub(crate) fn project_one_step(
     };
 
     // 4-6. Shared dep/signer/projection stages
-    let decision = run_dep_and_projection_stages(
+    // For encrypted events, inner_parsed contains the decrypted inner event.
+    let (decision, inner_parsed) = run_dep_and_projection_stages(
         conn,
         recorded_by,
         &event_id_b64,
@@ -98,11 +99,41 @@ pub(crate) fn project_one_step(
         _ => {}
     }
 
-    // 7. Write terminal state
-    conn.execute(
-        "INSERT OR IGNORE INTO valid_events (peer_id, event_id) VALUES (?1, ?2)",
-        rusqlite::params![recorded_by, &event_id_b64],
-    )?;
+    // 7. Write terminal state + subscription hook atomically.
+    //    Wrapped in a savepoint so that if the subscription hook fails, the
+    //    valid_events row is also rolled back. This prevents a crash window
+    //    where an event is marked valid but subscriptions never receive it.
+    conn.execute_batch("SAVEPOINT project_valid")?;
+    let commit_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        conn.execute(
+            "INSERT OR IGNORE INTO valid_events (peer_id, event_id) VALUES (?1, ?2)",
+            rusqlite::params![recorded_by, &event_id_b64],
+        )?;
+
+        // 8. Subscription hook: evaluate active subscriptions for this event.
+        //    For encrypted events, use the decrypted inner event for matching.
+        let sub_event = inner_parsed.as_ref().unwrap_or(&parsed);
+        crate::event_modules::subscription::matcher::on_projected_event(
+            conn,
+            recorded_by,
+            &event_id_b64,
+            sub_event,
+        )
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+
+        Ok(())
+    })();
+
+    match commit_result {
+        Ok(()) => {
+            conn.execute_batch("RELEASE project_valid")?;
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK TO project_valid");
+            let _ = conn.execute_batch("RELEASE project_valid");
+            return Err(e);
+        }
+    }
 
     Ok((ProjectionDecision::Valid, Some(parsed)))
 }

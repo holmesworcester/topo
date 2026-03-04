@@ -120,7 +120,7 @@ pub(crate) fn apply_projection(
     event_id_b64: &str,
     blob: &[u8],
     parsed: &ParsedEvent,
-) -> Result<ProjectionDecision, Box<dyn std::error::Error>> {
+) -> Result<(ProjectionDecision, Option<ParsedEvent>), Box<dyn std::error::Error>> {
     let meta = registry()
         .lookup(parsed.event_type_code())
         .ok_or_else(|| format!("unknown type code {}", parsed.event_type_code()))?;
@@ -134,28 +134,28 @@ pub(crate) fn apply_projection(
         let resolution = resolve_signer_key(conn, recorded_by, signer_type, &signer_event_id)?;
         match resolution {
             SignerResolution::NotFound => {
-                return Ok(ProjectionDecision::Reject {
+                return Ok((ProjectionDecision::Reject {
                     reason: "signer key not found".to_string(),
-                });
+                }, None));
             }
             SignerResolution::Invalid(msg) => {
-                return Ok(ProjectionDecision::Reject {
+                return Ok((ProjectionDecision::Reject {
                     reason: format!("signer resolution failed: {}", msg),
-                });
+                }, None));
             }
             SignerResolution::Found(key) => {
                 let sig_len = meta.signature_byte_len;
                 if blob.len() < sig_len {
-                    return Ok(ProjectionDecision::Reject {
+                    return Ok((ProjectionDecision::Reject {
                         reason: "blob too short for signature".to_string(),
-                    });
+                    }, None));
                 }
                 let signing_bytes = &blob[..blob.len() - sig_len];
                 let sig_bytes = &blob[blob.len() - sig_len..];
                 if !verify_ed25519_signature(&key, signing_bytes, sig_bytes) {
-                    return Ok(ProjectionDecision::Reject {
+                    return Ok((ProjectionDecision::Reject {
                         reason: "invalid signature".to_string(),
-                    });
+                    }, None));
                 }
             }
         }
@@ -163,8 +163,11 @@ pub(crate) fn apply_projection(
 
     // Encrypted events still use the old flow (they decrypt and recurse
     // through run_dep_and_projection_stages for the inner event).
+    // Returns (decision, Some(inner_parsed)) so the caller can fire the
+    // subscription hook after the valid_events write.
     if let ParsedEvent::Encrypted(enc) = parsed {
-        return project_encrypted(conn, recorded_by, event_id_b64, enc);
+        let (decision, inner) = project_encrypted(conn, recorded_by, event_id_b64, enc)?;
+        return Ok((decision, inner));
     }
 
     // Build projector context via event-module-owned loader.
@@ -188,11 +191,15 @@ pub(crate) fn apply_projection(
         ProjectionDecision::Reject { .. } | ProjectionDecision::AlreadyProcessed => {}
     }
 
-    Ok(result.decision)
+    Ok((result.decision, None))
 }
 
 /// Shared dependency/signer/projection stage bundle used by cleartext and
 /// decrypted-inner flows.
+///
+/// Returns `(decision, Option<inner_parsed>)` where `inner_parsed` is `Some`
+/// only for encrypted events that decrypted successfully — used by
+/// `project_one_step` to fire the subscription hook with the inner event.
 ///
 /// Stages:
 /// 1. Dependency presence check + block row writes
@@ -205,10 +212,10 @@ pub(crate) fn run_dep_and_projection_stages(
     blob: &[u8],
     parsed: &ParsedEvent,
     enforce_dep_types: bool,
-) -> Result<ProjectionDecision, Box<dyn std::error::Error>> {
+) -> Result<(ProjectionDecision, Option<ParsedEvent>), Box<dyn std::error::Error>> {
     let deps = parsed.dep_field_values();
     if let Some(block) = check_deps_and_block(conn, recorded_by, event_id_b64, &deps)? {
-        return Ok(block);
+        return Ok((block, None));
     }
 
     if enforce_dep_types {
@@ -217,7 +224,7 @@ pub(crate) fn run_dep_and_projection_stages(
             .ok_or_else(|| format!("unknown type code {}", parsed.event_type_code()))?;
         if !meta.dep_field_type_codes.is_empty() {
             if let Some(reason) = check_dep_types(conn, &deps, meta.dep_field_type_codes)? {
-                return Ok(ProjectionDecision::Reject { reason });
+                return Ok((ProjectionDecision::Reject { reason }, None));
             }
         }
     }

@@ -6,7 +6,7 @@ use crate::crypto::event_id_to_base64;
 pub use crate::crypto::{
     decrypt_event_blob, encrypt_event_blob, unwrap_key_from_sender, wrap_key_for_recipient,
 };
-use crate::event_modules::{self as events, EncryptedEvent, EVENT_TYPE_ENCRYPTED};
+use crate::event_modules::{self as events, EncryptedEvent, ParsedEvent, EVENT_TYPE_ENCRYPTED};
 
 /// Project an encrypted event: decrypt, parse inner, verify admissibility,
 /// then hand off to shared pipeline stages (dep check, signer verify,
@@ -24,7 +24,7 @@ pub fn project_encrypted(
     recorded_by: &str,
     event_id_b64: &str,
     enc: &EncryptedEvent,
-) -> Result<ProjectionDecision, Box<dyn std::error::Error>> {
+) -> Result<(ProjectionDecision, Option<ParsedEvent>), Box<dyn std::error::Error>> {
     // 1. Resolve key from secret_keys table
     let key_bytes: Vec<u8> = match conn.query_row(
         "SELECT key_bytes FROM secret_keys WHERE recorded_by = ?1 AND event_id = ?2",
@@ -33,17 +33,17 @@ pub fn project_encrypted(
     ) {
         Ok(k) => k,
         Err(rusqlite::Error::QueryReturnedNoRows) => {
-            return Ok(ProjectionDecision::Reject {
+            return Ok((ProjectionDecision::Reject {
                 reason: "secret key not found in secret_keys table".to_string(),
-            });
+            }, None));
         }
         Err(e) => return Err(e.into()),
     };
 
     if key_bytes.len() != 32 {
-        return Ok(ProjectionDecision::Reject {
+        return Ok((ProjectionDecision::Reject {
             reason: format!("secret key has wrong length: {}", key_bytes.len()),
-        });
+        }, None));
     }
 
     let mut key_arr = [0u8; 32];
@@ -53,9 +53,9 @@ pub fn project_encrypted(
     let plaintext = match decrypt_event_blob(&key_arr, &enc.nonce, &enc.ciphertext, &enc.auth_tag) {
         Ok(pt) => pt,
         Err(_) => {
-            return Ok(ProjectionDecision::Reject {
+            return Ok((ProjectionDecision::Reject {
                 reason: "decryption failed (wrong key or corrupted)".to_string(),
-            });
+            }, None));
         }
     };
 
@@ -63,28 +63,28 @@ pub fn project_encrypted(
     let inner_parsed = match events::parse_event(&plaintext) {
         Ok(p) => p,
         Err(e) => {
-            return Ok(ProjectionDecision::Reject {
+            return Ok((ProjectionDecision::Reject {
                 reason: format!("inner event parse error: {}", e),
-            });
+            }, None));
         }
     };
 
     // 4. Verify inner type matches inner_type_code
     if inner_parsed.event_type_code() != enc.inner_type_code {
-        return Ok(ProjectionDecision::Reject {
+        return Ok((ProjectionDecision::Reject {
             reason: format!(
                 "inner type mismatch: outer declares {}, inner is {}",
                 enc.inner_type_code,
                 inner_parsed.event_type_code()
             ),
-        });
+        }, None));
     }
 
     // 5. Reject nested encryption
     if enc.inner_type_code == EVENT_TYPE_ENCRYPTED {
-        return Ok(ProjectionDecision::Reject {
+        return Ok((ProjectionDecision::Reject {
             reason: "nested encryption not allowed".to_string(),
-        });
+        }, None));
     }
 
     // 6. Reject disallowed inner families via registry metadata
@@ -93,26 +93,37 @@ pub fn project_encrypted(
     match inner_meta {
         Some(m) if m.encryptable => {}
         _ => {
-            return Ok(ProjectionDecision::Reject {
+            return Ok((ProjectionDecision::Reject {
                 reason: format!(
                     "event type {} is not admissible inside encrypted wrappers",
                     inner_code
                 ),
-            });
+            }, None));
         }
     }
 
     // Shared dep/signer/projection stages (outer event_id anchors block/reject rows).
     // Dep type checking remains disabled for decrypted inners because their deps may
     // intentionally target encrypted wrapper type-codes.
-    run_dep_and_projection_stages(
+    let (decision, _) = run_dep_and_projection_stages(
         conn,
         recorded_by,
         event_id_b64,
         &plaintext,
         &inner_parsed,
         false,
-    )
+    )?;
+
+    // Return the inner parsed event so the caller (project_one_step) can fire
+    // the subscription hook after the valid_events write, avoiding duplicate
+    // delivery on projection retry.
+    let inner = if matches!(decision, ProjectionDecision::Valid) {
+        Some(inner_parsed)
+    } else {
+        None
+    };
+
+    Ok((decision, inner))
 }
 
 #[cfg(test)]

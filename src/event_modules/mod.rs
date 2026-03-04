@@ -18,6 +18,7 @@ pub mod secret_shared;
 pub mod user;
 pub mod user_invite;
 pub mod user_removed;
+pub mod subscription;
 pub mod workspace;
 
 use rusqlite::Connection;
@@ -84,6 +85,7 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     secret_key::ensure_schema(conn)?;
     secret_shared::ensure_schema(conn)?;
     local_signer_secret::ensure_schema(conn)?;
+    subscription::ensure_schema(conn)?;
     Ok(())
 }
 

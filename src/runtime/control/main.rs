@@ -358,6 +358,88 @@ enum Commands {
         action: DbAction,
     },
 
+    /// Create a local subscription
+    #[command(name = "sub-create")]
+    SubCreate {
+        /// Subscription name
+        #[arg(long)]
+        name: String,
+        /// Event type to subscribe to (e.g. "message")
+        #[arg(long)]
+        event_type: String,
+        /// Delivery mode: full|id|has_changed
+        #[arg(long, default_value = "full")]
+        delivery: String,
+        /// Since timestamp (ms) — only match events after this time
+        #[arg(long)]
+        since_ms: Option<u64>,
+        /// Since event ID — only match events after this cursor
+        #[arg(long)]
+        since_event_id: Option<String>,
+        /// JSON spec (overrides --since-ms/--since-event-id if provided)
+        #[arg(long)]
+        spec: Option<String>,
+    },
+
+    /// List subscriptions
+    #[command(name = "sub-list")]
+    SubList,
+
+    /// Poll subscription feed
+    #[command(name = "sub-poll")]
+    SubPoll {
+        /// Subscription ID
+        #[arg(long)]
+        sub: String,
+        /// Only return items after this seq (exclusive)
+        #[arg(long, default_value = "0")]
+        after_seq: i64,
+        /// Max items to return
+        #[arg(long, default_value = "50")]
+        limit: usize,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Get subscription state (pending count, dirty flag, cursors)
+    #[command(name = "sub-state")]
+    SubState {
+        /// Subscription ID
+        #[arg(long)]
+        sub: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Acknowledge feed items through a given seq
+    #[command(name = "sub-ack")]
+    SubAck {
+        /// Subscription ID
+        #[arg(long)]
+        sub: String,
+        /// Acknowledge through this seq (inclusive)
+        #[arg(long)]
+        through_seq: i64,
+    },
+
+    /// Disable a subscription
+    #[command(name = "sub-disable")]
+    SubDisable {
+        /// Subscription ID
+        #[arg(long)]
+        sub: String,
+    },
+
+    /// Enable a subscription
+    #[command(name = "sub-enable")]
+    SubEnable {
+        /// Subscription ID
+        #[arg(long)]
+        sub: String,
+    },
+
     /// Attempt UPnP port forwarding for the daemon's QUIC listen port.
     /// Requires daemon listening on non-loopback (for example `--bind 0.0.0.0:...`).
     Upnp,
@@ -1466,6 +1548,171 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 println!("Default set to {}", selector);
             }
         },
+
+        // ---------------------------------------------------------------
+        // Subscription commands
+        // ---------------------------------------------------------------
+        Commands::SubCreate {
+            name,
+            event_type,
+            delivery,
+            since_ms,
+            since_event_id,
+            spec,
+        } => {
+            let spec_json = if let Some(raw) = spec {
+                raw
+            } else {
+                let since = if since_ms.is_some() || since_event_id.is_some() {
+                    Some(serde_json::json!({
+                        "created_at_ms": since_ms.unwrap_or(0),
+                        "event_id": since_event_id.unwrap_or_default(),
+                    }))
+                } else {
+                    None
+                };
+                let spec_obj = serde_json::json!({
+                    "event_type": event_type,
+                    "since": since,
+                    "filters": [],
+                });
+                serde_json::to_string(&spec_obj).unwrap()
+            };
+            let data = rpc_require_daemon(
+                db,
+                socket_override.as_deref(),
+                RpcMethod::SubCreate {
+                    name,
+                    event_type,
+                    delivery_mode: delivery,
+                    spec_json,
+                },
+            )?;
+            let sub_id = data["subscription_id"].as_str().unwrap_or("?");
+            let sub_name = data["name"].as_str().unwrap_or("?");
+            println!("Created subscription \"{}\" (id: {})", sub_name, sub_id);
+        }
+
+        Commands::SubList => {
+            let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::SubList)?;
+            if let Some(items) = data.as_array() {
+                if items.is_empty() {
+                    println!("No subscriptions.");
+                } else {
+                    println!("SUBSCRIPTIONS:");
+                    for item in items {
+                        let enabled = if item["enabled"].as_bool().unwrap_or(false) {
+                            "on"
+                        } else {
+                            "off"
+                        };
+                        let name = item["name"].as_str().unwrap_or("?");
+                        let sub_id = item["subscription_id"].as_str().unwrap_or("?");
+                        let et = item["event_type"].as_str().unwrap_or("?");
+                        let dm = item["delivery_mode"].as_str().unwrap_or("?");
+                        println!(
+                            "  [{}] \"{}\" type={} delivery={} id={}",
+                            enabled, name, et, dm, sub_id
+                        );
+                    }
+                }
+            }
+        }
+
+        Commands::SubPoll {
+            sub,
+            after_seq,
+            limit,
+            json,
+        } => {
+            let data = rpc_require_daemon(
+                db,
+                socket_override.as_deref(),
+                RpcMethod::SubPoll {
+                    subscription_id: sub,
+                    after_seq,
+                    limit,
+                },
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&data).unwrap_or_default());
+            } else if let Some(items) = data.as_array() {
+                if items.is_empty() {
+                    println!("(no new items)");
+                } else {
+                    for item in items {
+                        let seq = item["seq"].as_i64().unwrap_or(0);
+                        let etype = item["event_type"].as_str().unwrap_or("?");
+                        let eid = item["event_id"].as_str().unwrap_or("?");
+                        let payload = &item["payload"];
+                        if let Some(content) = payload["content"].as_str() {
+                            println!("  seq={} {} event={} content={:?}", seq, etype, &eid[..eid.len().min(12)], content);
+                        } else {
+                            println!("  seq={} {} event={}", seq, etype, &eid[..eid.len().min(12)]);
+                        }
+                    }
+                }
+            }
+        }
+
+        Commands::SubState { sub, json } => {
+            let data = rpc_require_daemon(
+                db,
+                socket_override.as_deref(),
+                RpcMethod::SubState {
+                    subscription_id: sub,
+                },
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&data).unwrap_or_default());
+            } else {
+                let pending = data["pending_count"].as_i64().unwrap_or(0);
+                let dirty = data["dirty"].as_bool().unwrap_or(false);
+                let next_seq = data["next_seq"].as_i64().unwrap_or(0);
+                let latest = data["latest_event_id"].as_str().unwrap_or("");
+                println!(
+                    "pending={} dirty={} next_seq={} latest_event={}",
+                    pending,
+                    dirty,
+                    next_seq,
+                    if latest.is_empty() { "(none)" } else { &latest[..latest.len().min(12)] },
+                );
+            }
+        }
+
+        Commands::SubAck { sub, through_seq } => {
+            let _data = rpc_require_daemon(
+                db,
+                socket_override.as_deref(),
+                RpcMethod::SubAck {
+                    subscription_id: sub,
+                    through_seq,
+                },
+            )?;
+            println!("Acked through seq {}", through_seq);
+        }
+
+        Commands::SubDisable { sub } => {
+            let _data = rpc_require_daemon(
+                db,
+                socket_override.as_deref(),
+                RpcMethod::SubDisable {
+                    subscription_id: sub,
+                },
+            )?;
+            println!("Subscription disabled.");
+        }
+
+        Commands::SubEnable { sub } => {
+            let _data = rpc_require_daemon(
+                db,
+                socket_override.as_deref(),
+                RpcMethod::SubEnable {
+                    subscription_id: sub,
+                },
+            )?;
+            println!("Subscription enabled.");
+        }
 
         Commands::Upnp => {
             let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::Upnp)?;
