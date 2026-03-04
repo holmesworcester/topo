@@ -2,7 +2,7 @@
 
 A proof-of-concept sketch of the (work-in-progress) Topo protocol: an event-sourced, end-to-end encrypted, peer-to-peer stack for building complex applications, such as team chat.
 
-Informed by work on [Quiet](https://github.com/TryQuiet); see [Motivations](#Motivation) below for more detail.
+Informed by work on [Quiet](https://github.com/TryQuiet); see [Motivation](#Motivation) below for more detail.
 
 
 ## Start Here
