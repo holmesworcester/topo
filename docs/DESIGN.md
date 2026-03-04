@@ -64,7 +64,7 @@ The design goal is to keep protocol behavior auditable while still supporting re
 3. projection logic is deterministic and convergent,
 4. CLI workflows remain synchronous enough for imperative command chains.
 
-## How it Works
+## How it Works (Narrative Overview)
 
 ### Daemon Start
 
@@ -121,6 +121,147 @@ After creation/join/linking settles, day-to-day behavior is not a new phase. Pee
 ### Frontend Ergonomic API
 
 Our daemon provides a placeholder RPC API that is capable of serving whatever queries are desired, and accepting commands with the minimal convenient set of parameters needed to execute them. For example, the CLI can request a message list that includes not just message content but user information, reactions, file attachments, download progress, etc, with limits and ranges for lazy loading. Developers benefit from event-module locality: when adding functionality to, say, messages or reactions, everything they need to modify is in the same content-thematic cluster of create, project, and query functions. Queries and commands are strictly scoped by peer, to avoid accidental intermingling of local data in development or testing. Unlike most p2p or local-first frameworks, you aren't on your own to build complex state management layer and deal with state duplication and concurrency problems; there is no middleware and frontends can be maximally simple. Because our "server" is local and only serves one client, frequent polling is a simple-but-effective way to keep frontend and backend state in constant sync. 
+
+## Adding Event-Layer Functionality
+
+This is the concrete workflow for adding a user-facing feature as event-layer functionality, using a new multi-valued message attachment type (`message_unfurl`) as the example. The same flow applies to `message_reply` (or any other "many per message" relation): one canonical event per attachment item, all keyed by `message_id`.
+
+### Example Feature: Multi-Valued `message_unfurl`
+
+Goal: each message can have zero, one, or many unfurls.
+
+Data shape: store one `message_unfurl` event per unfurl.  
+Store metadata (`url`, `title`, optional `image_url`) in the unfurl event.  
+Do not mutate the `message` row in place to add unfurls.
+
+### 1. Create The Event Module
+
+Add a new module directory:
+
+```text
+src/event_modules/message_unfurl/
+  mod.rs
+  wire.rs
+  projector.rs
+  queries.rs
+```
+
+Model and wire format in [wire.rs](/home/holmes/poc-7/src/event_modules/message_attachment/wire.rs)-style:
+
+```rust
+pub struct MessageUnfurlEvent {
+    pub created_at_ms: u64,
+    pub message_id: [u8; 32],   // dep: message
+    pub url: String,            // fixed-size text slot
+    pub title: String,          // fixed-size text slot
+    pub image_url: String,      // fixed-size text slot, "" when absent
+    pub signed_by: [u8; 32],    // dep: signer
+    pub signer_type: u8,
+    pub signature: [u8; 64],
+}
+
+pub static MESSAGE_UNFURL_META: EventTypeMeta = EventTypeMeta {
+    type_code: EVENT_TYPE_MESSAGE_UNFURL,
+    type_name: "message_unfurl",
+    projection_table: "message_unfurls",
+    share_scope: ShareScope::Shared,
+    dep_fields: &["message_id", "signed_by"],
+    dep_field_type_codes: &[&[1], &[]], // message, signer-resolved
+    signer_required: true,
+    signature_byte_len: 64,
+    encryptable: true,
+    parse: parse_message_unfurl,
+    encode: encode_message_unfurl,
+    projector: super::projector::project_pure,
+    context_loader: crate::event_modules::registry::load_empty_context,
+};
+```
+
+### 2. Add Projection Table + Projector
+
+In `message_unfurl/mod.rs`, define schema with tenant scope and message fanout index:
+
+```sql
+CREATE TABLE IF NOT EXISTS message_unfurls (
+  recorded_by TEXT NOT NULL,
+  event_id TEXT NOT NULL,
+  message_id TEXT NOT NULL,
+  url TEXT NOT NULL,
+  title TEXT NOT NULL,
+  image_url TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  signer_event_id TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (recorded_by, event_id)
+);
+CREATE INDEX IF NOT EXISTS idx_msg_unfurls_message
+  ON message_unfurls(recorded_by, message_id);
+```
+
+In `message_unfurl/projector.rs`, emit `InsertOrIgnore` into `message_unfurls`.  
+This is what makes "many unfurls per message" natural: multiple events with same `message_id`, different `event_id`.
+
+### 3. Register The Type In Core Event Registry
+
+Update [mod.rs](/home/holmes/poc-7/src/event_modules/mod.rs):
+
+1. `pub mod message_unfurl;`
+2. `pub use message_unfurl::MessageUnfurlEvent;`
+3. Allocate a new `EVENT_TYPE_MESSAGE_UNFURL` code.
+4. Add `message_unfurl::ensure_schema(conn)?` to `ensure_schema`.
+5. Add `ParsedEvent::MessageUnfurl(...)`.
+6. Add entries in `dep_field_values`, `event_type_code`, and `signer_fields`.
+7. Add `&message_unfurl::MESSAGE_UNFURL_META` to `registry()`.
+
+If encryptable, also add wire size mapping in [common.rs](/home/holmes/poc-7/src/event_modules/layout/common.rs) `encrypted_inner_wire_size(...)`.
+
+### 4. Add Queries And Include In Message View
+
+Create `message_unfurl::queries::list_for_message(...)` (same pattern as [queries.rs](/home/holmes/poc-7/src/event_modules/message_attachment/queries.rs)).
+
+Then update [queries.rs](/home/holmes/poc-7/src/event_modules/message/queries.rs):
+
+1. import `message_unfurl`,
+2. fetch unfurls alongside reactions/attachments,
+3. add `unfurls: Vec<UnfurlSummary>` to [mod.rs](/home/holmes/poc-7/src/event_modules/message/mod.rs) `MessageItem`, where each `UnfurlSummary` carries `url`, `title`, and `image_url`.
+
+This is the only place the "messages API shape" changes; canonical history remains event-sourced.
+
+### 5. Add Command Path
+
+Add a command entrypoint where user-facing sends are already implemented:
+
+1. either in [commands.rs](/home/holmes/poc-7/src/event_modules/message/commands.rs),
+2. or a focused `message_unfurl/commands.rs`.
+
+Use `create_signed_event_synchronous(...)` to emit one `message_unfurl` event per unfurl.  
+If the message does not exist yet, the unfurl event blocks and later unblocks via normal cascade.
+
+### 6. Wire RPC/CLI To The New Command
+
+If this feature is externally callable:
+
+1. add RPC method in [protocol.rs](/home/holmes/poc-7/src/runtime/control/rpc/protocol.rs),
+2. route in [server.rs](/home/holmes/poc-7/src/runtime/control/rpc/server.rs),
+3. call event-module command/query APIs.
+
+No event logic belongs in RPC/service routing; those layers orchestrate only.
+
+### 7. Tests You Add In The Same Change
+
+1. Roundtrip/meta tests in [mod.rs](/home/holmes/poc-7/src/event_modules/mod.rs) (parse/encode, dep fields, signer fields, registry lookup).
+2. Projector tests in `tests/projectors/` for valid insert + dep/signer blocking behavior.
+3. Pipeline integration tests in `src/state/projection/apply/tests/` for unblock/cascade behavior.
+4. Scenario/API test proving messages can return multiple unfurls for one message.
+
+### `message_reply` Variant
+
+If you implement reply references instead of unfurls, use the same flow with:
+
+1. `message_reply` event fields: `message_id`, `target_message_id`, signer fields,
+2. deps: `["message_id", "target_message_id", "signed_by"]`,
+3. projection table keyed by `(recorded_by, event_id)` with index on `(recorded_by, message_id)`.
+
+You still get "multiple replies attached to one message" by emitting multiple `message_reply` events with the same `message_id`.
 
 ---
 
