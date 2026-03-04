@@ -154,6 +154,31 @@ fn rpc_all_methods_serialize() {
         },
         RpcMethod::Peers,
         RpcMethod::Upnp,
+        RpcMethod::SubCreate {
+            name: "inbox".into(),
+            event_type: "message".into(),
+            delivery_mode: "full".into(),
+            spec_json: String::new(),
+        },
+        RpcMethod::SubList,
+        RpcMethod::SubDisable {
+            subscription_id: "sub_1".into(),
+        },
+        RpcMethod::SubEnable {
+            subscription_id: "sub_1".into(),
+        },
+        RpcMethod::SubPoll {
+            subscription_id: "sub_1".into(),
+            after_seq: 0,
+            limit: 50,
+        },
+        RpcMethod::SubAck {
+            subscription_id: "sub_1".into(),
+            through_seq: 10,
+        },
+        RpcMethod::SubState {
+            subscription_id: "sub_1".into(),
+        },
     ];
 
     for method in methods {

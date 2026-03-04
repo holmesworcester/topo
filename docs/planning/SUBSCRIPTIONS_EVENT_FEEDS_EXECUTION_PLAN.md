@@ -236,6 +236,26 @@ Scenarios:
    - 2-3 peers syncing while subscription polling runs,
    - assert no deadlocks/timeouts and expected latency bound for new message visibility.
 
+## Daemon log output for subscription matches
+
+When the daemon has active subscriptions, the projection hook emits `tracing::info!`
+lines for every subscription match — giving real-time visibility into the subscription
+engine directly in `topo start` output.
+
+Format:
+```
+INFO topo::subscriptions: [sub "inbox"] message by @alice (event abc1…) — full delivery, seq 47
+INFO topo::subscriptions: [sub "changed"] message — has_changed, pending: 12
+```
+
+This fires at the same point the feed row / state update is written, so the log shows
+exactly what a polling consumer would see, with no additional overhead. For `full`/`id`
+modes the log includes event type, subscription name, short event ID, and seq number.
+For `has_changed` mode it shows the updated pending count.
+
+Implementation: a single `tracing::info!` call in the subscription hook's match-dispatch
+path, immediately after the feed/state write. No extra machinery required.
+
 ## Alternative designs (if needed)
 
 ### Option B: Poll-only scanner (no projection hook)
@@ -286,6 +306,7 @@ Not recommended for primary implementation.
 4. Subscription logic is backend-contained and event-module-local for filter semantics.
 5. CLI can show subscription feed/state and behaves like a thin frontend client.
 6. Tests pass under normal and sync-churn conditions.
+7. Daemon logs subscription matches in real time via `tracing::info!` during `topo start`.
 
 ## Final step
 

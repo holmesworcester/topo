@@ -5,6 +5,7 @@ mod deletion;
 mod identity;
 mod identity_sync;
 mod shared_db;
+mod subscription;
 mod transport;
 
 #[cfg(feature = "discovery")]
@@ -22,6 +23,7 @@ fn test_scenario_harness_guard() {
         ("identity", include_str!("identity.rs")),
         ("identity_sync", include_str!("identity_sync.rs")),
         ("shared_db", include_str!("shared_db.rs")),
+        ("subscription", include_str!("subscription.rs")),
         ("transport", include_str!("transport.rs")),
         ("mdns", include_str!("mdns.rs")),
     ];
