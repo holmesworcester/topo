@@ -19,7 +19,7 @@ Terminology note:
 1. **Performance** - workspace state (messages, etc.) and files should sync quickly, up to 10GB of messages and attachments (we assume groups are using some global retention limit for security and that each workspace's data is bounded, or that users will resort to cloud hosting for long-term storage)
 1. **Multi-tenancy** - It should be trivial to support many workspaces in the main client, join the same workspaces with multiple accounts in the same client, or host thousands of workspaces in a cloud node
 1. **Cloud / Client Isomorphism** - Cloud nodes should not require a separate implementation.
-1. **NSE / Client Isomorphism** - iOS background notification fetch (memory-constrained) should not require a separate implementation
+1. **NSE / Client Isomorphism** - iOS background notification fetch (memory-constrained) should not require a separate implementation, so it should run in less than 24MB of RAM as required by iOS Notification Service Extensions (NSE's). 
 1. **Local networking** - The protocol should be capable of zeroconf discovering and networking over LANs.
 1. **Testing & Simulation** - It should be trivial to test interactions between multiple accounts on the same machine, with a toy interface that mimics the requirements of a production Slack Electron or React Native app, and to test robustness against concurrency and reordering. It should also be low-cost for an LLM to "self-QA" its work.
 1. **Ergonomic Feature Development** - once complex features like auth, deletion, encryption, and forward secrecy are in place, it should be possible to build user-facing, Slack-like features (reactions, channels, threads, user profiles, etc.) with minimal friction
@@ -27,6 +27,7 @@ Terminology note:
 
 Primary tools/stragies used:
 
+1. **SQLite-centricity** - All persistance, including files, is in SQLite.
 1. **Event Sourcing** - Canonical events are durable facts. All canonical data is expressed as events, and state can be generated/restored deterministically by replaying events.
 1. **Content Addressing** - All events are identified by the hash of the canonicalized event (the encrypted version if encrypted, the signed plaintext version if not)
 1. **Explicit Semantic Dependency** - Rather than making events depend arbitrarily on prior events (like Automerge, OrbitDB) application developers decide what depencies are important for product needs and make them required event fields pointing to dependency event id's
@@ -38,7 +39,7 @@ Primary tools/stragies used:
 1. **Flat, Fixed-length Events** - To simplify secure parsing, all events and fields are fixed-length and canonicalized
 1. **Ephemeral Protocol Messages** - Runtime protocol traffic (sync/intros/holepunch control) is not canonical event data.
 1. **Conventional Networking Primitives** - All networking (including local networking) happens over QUIC with transport layer security provided by mTLS, but transport identity depends on the event-sourced auth layer for checking incoming and outgoing connections, and dropping connections.
-1. **In-band Relay, Discovery, Intro** - Rather than using STUN/TURN libraries, mutually reachable (non-NAT) peers or cloud nodes can relay data through normal sync operation, and introduce NAT'ed peers by their observed addresses/ports
+1. **In-band Relay, Discovery, Intro** - Reliable notifications are a requirement, so always-online sync-capable nodes are a requirement, so dedicated STUN/TURN servers and relay servers are inadequate, and we can rely on reachable (non-NAT) peers or cloud nodes to relay data through normal sync operation, and introduce NAT'ed peers by their observed addresses/ports.
 1. **QUIC Holepunching** - Once intro'ed by a mutually reachable peer, peers holepunch with simultaneous QUIC connections
 1. **Convergence Testing** - Tests check that for all relevant scenarios, reverse reorderings of events, or duplicated event replays, yield the same state.
 1. **Real Networking in Tests** - All multi-client tests are realistic as possible: real networking using CLI-controlled daemons with local peer discovery.
@@ -74,6 +75,7 @@ We split concerns aggressively:
 2. Rust file/module paths are included only when they materially reduce ambiguity for implementers.
 3. Dense implementation maps and file ownership details belong in appendices.
 4. When both appear, conceptual text comes first and implementation references are cross-linked.
+5. Runtime/topology visuals are maintained in [DESIGN_DIAGRAMS.md](./DESIGN_DIAGRAMS.md); this file links to those diagrams where flow shape matters.
 
 ---
 
@@ -556,6 +558,8 @@ DNS label constraint: peer IDs (64 hex chars) are truncated to 59 chars in the m
 Same-host daemon discovery: when two daemons run on the same machine bound to `127.0.0.1`, they advertise a routable (non-loopback) IP via mDNS because multicast DNS does not discover services advertised on loopback addresses. The browse side compensates with `normalize_discovered_addr_for_local_bind`, which rewrites discovered non-loopback addresses back to loopback when the local daemon is bound to loopback. The advertise IP is always provided explicitly by the caller (`run_node`); discovery internals perform no implicit address inference.
 
 ## 3.2.3 Peering runtime loop model
+
+Runtime flow reference: [DESIGN_DIAGRAMS.md](./DESIGN_DIAGRAMS.md) sections `1` (unified ingest), `2` (sync session control/data), `3` (high-level boundaries), and `4` (runtime topology).
 
 The production peering runtime follows a single conceptual loop:
 
@@ -1087,6 +1091,8 @@ The CLI/daemon operational shape is primarily for operability, testing, and demo
 1. one daemon per profile/peer (`topo start`),
 2. local RPC control socket,
 3. unified CLI (`topo`) with subcommands that route through daemon when running, fall back to direct DB access otherwise.
+
+RPC and locality flow reference: [DESIGN_DIAGRAMS.md](./DESIGN_DIAGRAMS.md) section `0` ("RPC Dispatch And Event Locality").
 
 ### RPC wire contract
 

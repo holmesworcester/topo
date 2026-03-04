@@ -42,6 +42,7 @@ The earlier `codex-simplified` gap audit served bootstrapping and is now histori
 For active work:
 - use this PLAN for build order, scope cuts, and phase exit criteria,
 - use [DESIGN.md](./DESIGN.md) for normative behavior and invariants,
+- use [DESIGN_DIAGRAMS.md](./DESIGN_DIAGRAMS.md) for code-accurate runtime control/data-flow topology,
 - use git history/PR notes for resolved-gap chronology.
 
 ---
@@ -807,6 +808,8 @@ Separate queue tables stay simpler operationally.
 
 ## 8.3 Worker stages
 
+Runtime flow reference: [DESIGN_DIAGRAMS.md](./DESIGN_DIAGRAMS.md) sections `1`, `2`, and `4`.
+
 1. `ingest receiver path` (current runtime): QUIC frame -> ingest channel -> transactional canonical insert -> record by tenant -> enqueue project.
 2. `project worker`: claim row -> project path (`valid`/`block`/`reject`) -> dequeue.
 3. `egress worker`: dequeue by `connection_id` -> send frame -> mark `sent_at`/retry.
@@ -1307,11 +1310,15 @@ Behavior tests:
 
 ## 12.7 Real QUIC system tests
 
+Topology reference: [DESIGN_DIAGRAMS.md](./DESIGN_DIAGRAMS.md) sections `2` (one sync session) and `4` (runtime topology).
+
 - 2-node bootstrap and sync.
 - 3-node out-of-order convergence.
 - reconnect/retry/backoff behavior.
 
 ## 12.8 Low-memory realism tests (Linux-only)
+
+Topology reference: [DESIGN_DIAGRAMS.md](./DESIGN_DIAGRAMS.md) section `4` (threads/queues/DB topology) for interpreting runtime memory shape during these tests.
 
 1. Fast default lowmem lane:
    - `cargo test --release --test low_mem_test -- --nocapture` (functional lowmem smoke, no RSS gate),

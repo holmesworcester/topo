@@ -123,9 +123,8 @@ FAIL  low_mem_soak_100000     — 72.21 MiB > 24 MiB budget (28.42s)
 ```
 
 **Analysis:** The 100k soak exceeds the 24 MiB per-instance budget as expected.
-This is consistent with `docs/LOW_MEM_PERF_ANALYSIS.md` which documents that
-500k events with LOW_MEM_IOS=1 uses ~87 MiB peak RSS. At 100k events, 72 MiB is
-proportional. Achieving <24 MiB at 100k requires architectural changes:
+This run reflected an architectural gap in the old regimen approach; at that
+time, achieving <24 MiB at 100k implied structural changes such as:
 - Separate blob store from index (append-only file + mmap)
 - Streaming negentropy without full rebuild
 - Columnar projection storage
