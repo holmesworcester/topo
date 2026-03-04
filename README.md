@@ -4,7 +4,7 @@ A proof-of-concept sketch of the (work-in-progress) Topo protocol: an event-sour
 
 Informed by work on [Quiet](https://github.com/TryQuiet).
 
-See [Motivation](docs/DESIGN.md#Motivation) and [How It Works](docs/DESIGN.md#How_It_Works) for more detail.
+See [Motivation](docs/DESIGN.md#motivation) and [How It Works](docs/DESIGN.md#how-it-works) for more detail.
 
 **TL;DR:** 
 command 🡪 create event 🡪 sign, encrypt, hash 🡪 peer via QUIC 🡪 check mTLS against event source of truth 🡪 set reconcile 🡪 topo sort 🡪 decrypt 🡪 SQLite 🡪 query
