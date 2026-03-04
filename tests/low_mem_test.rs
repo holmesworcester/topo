@@ -1,7 +1,8 @@
 //! Low-memory mode budget tests.
 //!
 //! These tests enforce bounded memory behavior under `LOW_MEM_IOS=1`.
-//! The soak test is ignored by default because it is long-running.
+//! RSS-sampling tests are ignored by default because authoritative
+//! hard-cap validation comes from the daemon + cgroup proxy harness.
 
 use std::time::Duration;
 
@@ -37,20 +38,13 @@ fn current_rss_mib() -> Option<f64> {
 
 struct EnvGuard {
     prev_low_mem_ios: Option<String>,
-    prev_low_mem: Option<String>,
 }
 
 impl EnvGuard {
     fn enable_low_mem_ios() -> Self {
         let prev_low_mem_ios = std::env::var("LOW_MEM_IOS").ok();
-        let prev_low_mem = std::env::var("LOW_MEM").ok();
         std::env::set_var("LOW_MEM_IOS", "1");
-        // Keep both low-memory env flags aligned for bench helpers.
-        std::env::set_var("LOW_MEM", "1");
-        Self {
-            prev_low_mem_ios,
-            prev_low_mem,
-        }
+        Self { prev_low_mem_ios }
     }
 }
 
@@ -59,10 +53,6 @@ impl Drop for EnvGuard {
         match &self.prev_low_mem_ios {
             Some(v) => std::env::set_var("LOW_MEM_IOS", v),
             None => std::env::remove_var("LOW_MEM_IOS"),
-        }
-        match &self.prev_low_mem {
-            Some(v) => std::env::set_var("LOW_MEM", v),
-            None => std::env::remove_var("LOW_MEM"),
         }
     }
 }
@@ -85,6 +75,38 @@ fn rss_budget_mib_from_env(var: &str, default: f64) -> f64 {
 
 #[tokio::test]
 #[cfg(target_os = "linux")]
+async fn low_mem_ios_functional_smoke_2k() {
+    let _env = EnvGuard::enable_low_mem_ios();
+
+    let alice = Peer::new_with_identity("alice_lowmem_functional");
+    let bob = Peer::new_with_identity("bob_lowmem_functional");
+
+    alice.batch_create_messages(1_000);
+    bob.batch_create_messages(1_000);
+
+    let alice_messages_before_sync = alice.stored_message_event_count();
+    let bob_messages_before_sync = bob.stored_message_event_count();
+    let expected_alice_messages = alice_messages_before_sync + bob_messages_before_sync;
+    let expected_bob_messages = bob_messages_before_sync + alice_messages_before_sync;
+
+    let _metrics = sync_until_converged(
+        &alice,
+        &bob,
+        || {
+            alice.stored_message_event_count() >= expected_alice_messages
+                && bob.stored_message_event_count() >= expected_bob_messages
+        },
+        Duration::from_secs(120),
+    )
+    .await;
+
+    assert_eq!(alice.message_count(), 1_000);
+    assert_eq!(bob.message_count(), 1_000);
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+#[ignore = "RSS-sampling sanity only; use lowmem proxy/cgroup for hard gates"]
 async fn low_mem_ios_budget_smoke_10k() {
     let _env = EnvGuard::enable_low_mem_ios();
 
@@ -129,7 +151,7 @@ async fn low_mem_ios_budget_smoke_10k() {
 
 #[tokio::test]
 #[cfg(target_os = "linux")]
-#[ignore = "long-running soak; run explicitly during hardening"]
+#[ignore = "long-running RSS-sampling soak; run explicitly"]
 async fn low_mem_ios_budget_soak_million() {
     let _env = EnvGuard::enable_low_mem_ios();
 

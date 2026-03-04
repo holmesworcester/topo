@@ -805,6 +805,8 @@ impl Peer {
         use crate::projection::signer::sign_event_bytes;
 
         let db = open_connection(&self.db_path).expect("failed to open db");
+        let workspace_id = crate::db::store::lookup_workspace_id(&db, &self.identity)
+            .expect("missing trust anchor workspace_id for file-slice benchmark");
 
         // Parent message
         let msg = ParsedEvent::Message(MessageEvent {
@@ -903,8 +905,8 @@ impl Peer {
                 rusqlite::params![&event_id_b64, "file_slice", blob.as_slice(), created_at as i64, created_at as i64],
             ).expect("failed to insert file_slice event");
             db.execute(
-                "INSERT OR IGNORE INTO neg_items (ts, id) VALUES (?1, ?2)",
-                rusqlite::params![created_at as i64, event_id.as_slice()],
+                "INSERT OR IGNORE INTO neg_items (workspace_id, ts, id) VALUES (?1, ?2, ?3)",
+                rusqlite::params![&workspace_id, created_at as i64, event_id.as_slice()],
             ).expect("failed to insert neg_item");
             db.execute(
                 "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)

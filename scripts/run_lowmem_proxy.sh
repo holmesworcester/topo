@@ -773,7 +773,7 @@ run_asymmetric_proxy() {
     return 1
   fi
 
-  LOW_MEM=1 \
+  LOW_MEM_IOS=1 \
   LOW_MEM_WAL_CAP_MIB="${WAL_CAP_MIB}" \
   LOW_MEM_MEMTRACE="${LOWMEM_MEMTRACE_ENABLED}" \
   LOW_MEM_MEMTRACE_FILE="${memtrace_log}" \
@@ -1129,7 +1129,7 @@ run_large_delta_proxy() {
   checkpoint_truncate_wal "${bob_db}"
   checkpoint_truncate_wal "${alice_db}"
 
-  LOW_MEM=1 \
+  LOW_MEM_IOS=1 \
   LOW_MEM_WAL_CAP_MIB="${WAL_CAP_MIB}" \
   LOW_MEM_MEMTRACE="${LOWMEM_MEMTRACE_ENABLED}" \
   LOW_MEM_MEMTRACE_FILE="${memtrace_log}" \

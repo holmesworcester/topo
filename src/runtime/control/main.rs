@@ -193,6 +193,17 @@ enum Commands {
         count: usize,
     },
 
+    /// Generate synthetic file events (message + attachment + file slices)
+    #[command(name = "generate-files")]
+    GenerateFiles {
+        /// Number of files to generate
+        #[arg(short, long, default_value = "10")]
+        count: usize,
+        /// File size in MiB per file
+        #[arg(long, default_value = "1")]
+        size_mib: usize,
+    },
+
     /// Assert a predicate holds right now (exit 0 = pass, exit 1 = fail)
     AssertNow {
         /// Predicate: "field op value" (e.g. "store_count >= 10")
@@ -1031,6 +1042,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 RpcMethod::Generate { count },
             )?;
             println!("Generated {} messages in {}", data["count"], db);
+        }
+
+        Commands::GenerateFiles { count, size_mib } => {
+            let data = rpc_require_daemon(
+                db,
+                socket_override.as_deref(),
+                RpcMethod::GenerateFiles { count, size_mib },
+            )?;
+            println!(
+                "Generated {} files ({} MiB each, {} slices/file, total slices {}) in {}",
+                data["files"],
+                data["file_size_mib"],
+                data["slices_per_file"],
+                data["total_slices"],
+                db
+            );
         }
 
         Commands::AssertNow { predicate } => {

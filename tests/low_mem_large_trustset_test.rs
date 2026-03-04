@@ -19,19 +19,13 @@ fn current_rss_mib() -> Option<f64> {
 
 struct EnvGuard {
     prev_low_mem_ios: Option<String>,
-    prev_low_mem: Option<String>,
 }
 
 impl EnvGuard {
     fn enable_low_mem_ios() -> Self {
         let prev_low_mem_ios = std::env::var("LOW_MEM_IOS").ok();
-        let prev_low_mem = std::env::var("LOW_MEM").ok();
         std::env::set_var("LOW_MEM_IOS", "1");
-        std::env::set_var("LOW_MEM", "1");
-        Self {
-            prev_low_mem_ios,
-            prev_low_mem,
-        }
+        Self { prev_low_mem_ios }
     }
 }
 
@@ -40,10 +34,6 @@ impl Drop for EnvGuard {
         match &self.prev_low_mem_ios {
             Some(v) => std::env::set_var("LOW_MEM_IOS", v),
             None => std::env::remove_var("LOW_MEM_IOS"),
-        }
-        match &self.prev_low_mem {
-            Some(v) => std::env::set_var("LOW_MEM", v),
-            None => std::env::remove_var("LOW_MEM"),
         }
     }
 }

@@ -11,7 +11,7 @@
 
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
-use topo::crypto::event_id_to_base64;
+use topo::crypto::{event_id_from_base64, event_id_to_base64};
 use topo::testutil::{
     assert_eventually, clone_events_to, start_chain, start_sink_download,
     start_sink_download_with_shutdown, Peer,
@@ -222,6 +222,21 @@ async fn run_catchup_bench(source_count: usize, events_per_source: usize) {
         eprintln!("  Cloned to S1..S{}", source_count - 1);
     }
 
+    // Debug aid: show deterministic ownership buckets that the sink-side
+    // initiator sessions are expected to follow (hash(event_id) % source_count).
+    let mut expected_owner_counts = vec![0usize; source_count];
+    for event_id_b64 in sources[0].event_ids_by_type("file_slice") {
+        if let Some(event_id) = event_id_from_base64(&event_id_b64) {
+            let h = u64::from_le_bytes(event_id[..8].try_into().unwrap());
+            let owner = (h as usize) % source_count;
+            expected_owner_counts[owner] += 1;
+        }
+    }
+    eprintln!(
+        "  Expected owner buckets (peer_idx -> slices): {:?}",
+        expected_owner_counts
+    );
+
     // Convergence target: union of all source Message event IDs.
     let expected_sink_message_ids: BTreeSet<String> = sources
         .iter()
@@ -337,6 +352,35 @@ async fn run_catchup_large_file(
         eprintln!("  Cloned to S1..S{}", source_count - 1);
     }
 
+    // Debug aid: deterministic ownership buckets for file_slice IDs
+    // and source SPKI mapping used by quic_recv attribution keys.
+    let mut expected_owner_counts = vec![0usize; source_count];
+    for event_id_b64 in sources[0].event_ids_by_type("file_slice") {
+        if let Some(event_id) = event_id_from_base64(&event_id_b64) {
+            let h = u64::from_le_bytes(event_id[..8].try_into().unwrap());
+            let owner = (h as usize) % source_count;
+            expected_owner_counts[owner] += 1;
+        }
+    }
+    eprintln!(
+        "  Expected owner buckets (peer_idx -> slices): {:?}",
+        expected_owner_counts
+    );
+    for (idx, source) in sources.iter().enumerate() {
+        let fp_hex: String = source
+            .spki_fingerprint()
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect();
+        let file_slice_count = source.event_ids_by_type("file_slice").len();
+        let message_count = source.event_ids_by_type("message").len();
+        eprintln!("  Source map: S{} -> {}", idx, fp_hex);
+        eprintln!(
+            "    Source counts: file_slice={} message={}",
+            file_slice_count, message_count
+        );
+    }
+
     // Add per-source unique marker messages
     let source_markers: Vec<String> = sources
         .iter()
@@ -382,6 +426,7 @@ async fn run_catchup_large_file(
 
     // === Source attribution assertions ===
     let source_counts = sink.file_slice_event_counts_by_source();
+    let message_source_counts = sink.recorded_event_type_counts_by_source("message", "quic_recv:");
     let total_attributed: i64 = source_counts.values().sum();
 
     let wall_secs = wall_ms as f64 / 1000.0;
@@ -407,6 +452,10 @@ async fn run_catchup_large_file(
         let pct = *count as f64 / total_slices as f64 * 100.0;
         eprintln!("  Source {}: {} slices ({:.1}%)", source, count, pct);
     }
+    eprintln!(
+        "  Message attribution sources (quic_recv): {:?}",
+        message_source_counts
+    );
     eprintln!();
 
     // 1. Sink received all file_slice events

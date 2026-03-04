@@ -1119,8 +1119,15 @@ Assertion-first commands are first-class:
 
 1. `assert-now`,
 2. `assert-eventually`,
+3. low-memory realism/perf harnesses: `scripts/run_lowmem_proxy.sh`, `scripts/run_perf_serial.sh lowmem` (Linux-only).
 
 `assert-eventually` is preferred over ad-hoc sleeps for both deterministic tests and agent self-play loops.
+
+Low-memory Linux-only note:
+1. proxy/regimen harnesses sample `/proc/<pid>/status` and `/proc/<pid>/smaps`,
+2. hard-ceiling validation uses cgroup v2 (`memory.max`, `memory.events`),
+3. RSS-sampling tests in `tests/low_mem_test.rs` are sanity checks (ignored by default for budget assertions),
+4. non-Linux platforms should use functional low-memory tests and device-native profiling instead of the Linux proxy gate.
 
 ---
 
@@ -1357,22 +1364,29 @@ Operational payload caps for this prototype (wire-format specifics in section 1.
 `message_attachment` events (type 24, signed) are file descriptors with deps on `message_id`, `key_event_id`, and `signed_by`.
 Retired event type 4 is rejected by unknown-type dispatch in this epoch.
 
-### Low-memory trust and key strategy (`low_mem_ios`)
+### Low-memory strategy (`low_mem_ios`)
 
 Trust and key sets use SQL indexed point lookups, not full in-memory loading. The projection tables (`trust_anchors`, identity chain tables, bootstrap trust tables) are queried on demand with indexed `(recorded_by, ...)` keys.
 
-There is no dedicated unbounded in-memory trust/key hot cache in baseline; low-memory behavior relies on indexed SQL lookups plus statement caching (`prepare_cached`).
-Clarification: canonical event/trust datasets can grow large on disk; low-memory mode bounds in-memory working set (queues, buffers, caches), not total persisted history.
+There is no dedicated unbounded in-memory trust/key hot cache; low-memory behavior relies on indexed SQL lookups plus statement caching (`prepare_cached`).
 
-Runtime low-memory mode is enabled by env vars `LOW_MEM_IOS` or `LOW_MEM` (truthy except `0`/`false`). Queue/runtime tuning values are centralized in `src/shared/tuning.rs`, including:
+Canonical event/trust datasets can grow large on disk; low-memory mode bounds in-memory working set (queues, buffers, caches), not total persisted history.
+
+Runtime low-memory mode is enabled by env var `LOW_MEM_IOS` (truthy except `0`/`false`). Queue/runtime tuning values are centralized in `src/shared/tuning.rs`, including:
 1. projection drain/write batch sizing,
 2. shared ingest channel caps,
 3. session ingest caps,
 4. transport receive-buffer limits.
 
-Validation scale requirements: the low-memory path must remain stable at >= 1,000,000 canonical events on disk and >= 100,000 peer trust keys while targeting a 24 MiB steady-state RSS envelope on representative constrained devices. Throughput may degrade to preserve bounded memory.
+Validation scale requirements: the low-memory path must remain stable at >= 1,000,000 canonical events on disk and >= 100,000 peer trust keys, for sync deltas > 10,000 events or files while targeting a 24 MiB steady-state RSS envelope on representative constrained devices. Throughput may degrade to preserve bounded memory. For very large message histories and trust sets, the design favors bounded memory (smaller in-flight windows and SQL point lookups) over peak throughput.
 
-Caveat: `24 MiB` is an operational target validated by representative low-memory tests and tuning profiles, not a universal guarantee across all kernels/devices/workloads. For very large message histories and trust sets, the design favors bounded memory (smaller in-flight windows and SQL point lookups) over peak throughput.
+Caveat: `24 MiB` is an operational target validated by representative low-memory tests and tuning profiles, not a universal guarantee across all kernels/devices/workloads.
+
+Validation harness platform scope:
+1. low-memory proxy/regimen perf gates are Linux-only (`/proc` + cgroup v2),
+2. Linux proof runs use a stricter receiver hard cap (`22 MiB`) as margin against iOS `24 MiB` operational target differences in memory accounting.
+3. default serial lowmem perf lane is fast (`50k+10k` message delta + moderate file delta) and cgroup-enforced,
+4. 1M-scale and extreme file-volume lowmem scenarios remain available but opt-in for hardening cycles.
 
 ---
 

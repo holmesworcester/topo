@@ -28,6 +28,10 @@ pub enum RpcMethod {
     Generate {
         count: usize,
     },
+    GenerateFiles {
+        count: usize,
+        size_mib: usize,
+    },
     AssertNow {
         predicate: String,
     },

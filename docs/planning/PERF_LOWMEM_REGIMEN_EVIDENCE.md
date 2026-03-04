@@ -124,7 +124,7 @@ FAIL  low_mem_soak_100000     — 72.21 MiB > 24 MiB budget (28.42s)
 
 **Analysis:** The 100k soak exceeds the 24 MiB per-instance budget as expected.
 This is consistent with `docs/LOW_MEM_PERF_ANALYSIS.md` which documents that
-500k events with LOW_MEM=1 uses ~87 MiB peak RSS. At 100k events, 72 MiB is
+500k events with LOW_MEM_IOS=1 uses ~87 MiB peak RSS. At 100k events, 72 MiB is
 proportional. Achieving <24 MiB at 100k requires architectural changes:
 - Separate blob store from index (append-only file + mmap)
 - Streaming negentropy without full rebuild
@@ -157,7 +157,7 @@ Interpretation:
 - The prior "smoke passes under 48 MiB process budget" result is no longer the
   active regimen criterion.
 
-### Verification: 50k perf_sync with LOW_MEM=1 (reference)
+### Verification: 50k perf_sync with LOW_MEM_IOS=1 (reference)
 
 ```
 LOW_MEM_IOS=1 cargo test --release --test perf_test perf_sync_50k -- --nocapture
@@ -210,7 +210,7 @@ MAX_BOB_SHM_KB=160
 
 Setup:
 - `alice`: normal mode
-- `bob`: `LOW_MEM=1 LOW_MEM_WAL_CAP_MIB=12`
+- `bob`: `LOW_MEM_IOS=1 LOW_MEM_WAL_CAP_MIB=12`
 
 Run artifacts:
 - `target/lowmem-regimen/onepeer-1772466598-2080010/`

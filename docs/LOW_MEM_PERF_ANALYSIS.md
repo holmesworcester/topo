@@ -15,7 +15,7 @@ Benchmarked on master (`78cdf82`), 2026-02-07.
 | 200k | 10,332 | 19.4s | 219 MiB |
 | 500k | 6,180 | 80.9s | 253 MiB |
 
-### LOW_MEM=1
+### LOW_MEM_IOS=1
 
 | Size | Events/s | Wall Time | Peak RSS (2 peers) |
 |------|----------|-----------|---------------------|
@@ -28,12 +28,12 @@ All tests are one-way sync (generate on alice, sync to empty bob).
 
 ### Observations
 
-- **LOW_MEM is faster at scale**: 500k went from 80.9s to 68.7s. The smaller SQLite cache (1 MiB vs 64 MiB) causes less memory pressure at large dataset sizes.
+- **LOW_MEM_IOS is faster at scale**: 500k went from 80.9s to 68.7s. The smaller SQLite cache (1 MiB vs 64 MiB) causes less memory pressure at large dataset sizes.
 - **Throughput degrades ~2.4x from 50k to 500k** in both modes, suggesting negentropy reconciliation cost grows with set size.
 - **Memory savings are dramatic**: 253 MiB to 87 MiB at 500k (2.9x reduction). At 50k: 83 to 24 MiB (3.5x).
 - **No correctness issues** at any scale in either mode.
 
-## Memory Breakdown (LOW_MEM, 500k, per peer)
+## Memory Breakdown (LOW_MEM_IOS, 500k, per peer)
 
 The test harness runs two peers in one process. The 87 MiB total means roughly 40-44 MiB per peer, plus ~8 MiB shared baseline (Rust runtime, tokio, QUIC/TLS, SQLite library code).
 

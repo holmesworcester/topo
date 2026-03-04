@@ -24,11 +24,15 @@ WRITE_PERF_MD=0 scripts/run_perf_serial.sh full
 
 # Optional lowmem matrix overrides
 # (defaults shown)
-PERF_LOWMEM_BASELINE_SMALL=500000 \
+PERF_LOWMEM_BASELINE_SMALL=50000 \
 PERF_LOWMEM_BASELINE_LARGE=1000000 \
 PERF_LOWMEM_DELTA_TARGET=10000 \
 PERF_LOWMEM_DELTA_BRACKET=50000 \
-PERF_LOWMEM_FILES_SLICES=400 \
+PERF_LOWMEM_FILE_BASELINE=50000 \
+PERF_LOWMEM_FILE_COUNT=20 \
+PERF_LOWMEM_FILE_SIZE_MIB=1 \
+PERF_LOWMEM_CGROUP_ENFORCE=1 \
+PERF_LOWMEM_CGROUP_LIMIT_KB=22528 \
 scripts/run_perf_serial.sh lowmem
 
 # Optional lowmem proof-of-concept overrides
@@ -36,6 +40,9 @@ scripts/run_perf_serial.sh lowmem
 PERF_LOWMEM_BUDGET_KB=24576 \
 PERF_LOWMEM_CGROUP_ENFORCE=1 \
 PERF_LOWMEM_CGROUP_LIMIT_KB=22528 \
+PERF_LOWMEM_POC_ENABLE=1 \
+PERF_LOWMEM_RUN_LARGE_TARGET=1 \
+PERF_LOWMEM_RUN_SMALL_BRACKET=1 \
 PERF_LOWMEM_POC_MSG_BASELINE=1000000 \
 PERF_LOWMEM_POC_MSG_DELTA=10000 \
 PERF_LOWMEM_POC_REALISM_FILE_BASELINE=500000 \
@@ -62,7 +69,11 @@ cargo test --release --test sync_graph_test -- --nocapture --include-ignored --t
 # Low-memory budget tests
 cargo test --release --test low_mem_test -- --nocapture
 
-# Dedicated lowmem proxy delta harness (direct)
+# Low-memory RSS-sampling tests (ignored by default)
+cargo test --release --test low_mem_test -- --ignored --nocapture --test-threads=1
+
+# Dedicated lowmem proxy delta harness (direct, Linux-only)
+# Requires /proc/<pid>/{status,smaps}; cgroup-enforced mode also requires cgroup v2.
 scripts/run_lowmem_proxy.sh delta10k
 ```
 
@@ -124,11 +135,6 @@ Throughput profile (receiver-side message count):
 Tail-phase slowdown is gated by receiver-side batch_writer throughput
 (SQLite insert rate degrades as tables grow).
 
-Investigation order (profiling-first):
-1. Profile first (CPU + SQLite + WAL timing) on the 250k->500k tail to confirm dominant stall source before tuning.
-2. If commit cost dominates, bound writer batches by page/byte budget (not only count) so commit latency stays flatter at high cardinality.
-3. If WAL pressure appears in profile, tune checkpoint policy (`wal_autocheckpoint`, explicit passive checkpoints between large rounds) and re-measure.
-4. Re-verify projection table indexes against dominant write/read paths for high-cardinality tails (`messages`, `recorded_events`, `valid_events`).
 
 #### 10k continuous sync (inject while syncing)
 
@@ -145,7 +151,7 @@ in 100-event batches while sync is running.
 
 ### Negentropy Frame Size Tuning
 
-Per-round reconciliation cost scales super-linearly with frame size.
+Exchanged negentropy (sync protocol) control messages have a max fame size. Per-round reconciliation cost scales super-linearly with this frame size.
 256 KB is the sweet spot: larger frames reduce round count but each
 round takes disproportionately longer.
 
@@ -261,24 +267,64 @@ Files dominate transfer volume, so we now keep a dedicated large-file catchup ha
 6. Assert each source contributes a substantial slice share, not just `>0`:
    at least `min_fair_share_fraction * (total_slices / source_count)`; current smoke config uses `10%` of fair share.
 
+Latest large-file multi-source snapshot (2026-03-03, Linux, `--ignored --nocapture --test-threads=1`):
+
+| Test | Result | Catchup wall | Events/s | MB/s | Peak RSS |
+|---|---|---:|---:|---:|---:|
+| `catchup_large_file_4x_400_slices` | PASS | `2232 ms` | `179` | `44.8` | `686.4 MiB` |
+| `catchup_large_file_4x_1024_slices` | FAIL (contributor-floor assert) | `2241 ms` | `457` | `114.3` | `686.4 MiB` |
+| `catchup_large_file_8x_1024_slices` | FAIL (contributor-floor assert) | `2443 ms` | `419` | `104.8` | `1186.4 MiB` |
+
+Failure detail observed:
+1. `4x1024`: expected `>= 4` contributing sources, observed `3`.
+2. `8x1024`: expected `>= 8` contributing sources, observed `7`.
+3. Throughput and attribution metrics were still emitted before the fairness assertion fired.
+
 Run:
 `cargo test --release --test sync_graph_test catchup_large_file_4x_1024_slices -- --ignored --nocapture --test-threads=1`
 
-### Low-Memory Budget (`low_mem_test.rs`)
+### Low-Memory Test Split
 
-`low_mem_test.rs` is an in-process sanity suite (both peers in one process).
-Authoritative budget gating uses `scripts/run_lowmem_regimen.sh`, which runs
-two separate daemon processes and enforces per-daemon peak RSS (VmHWM) against
-the 24 MiB target.
+Low-memory coverage is intentionally split into two lanes:
 
-- **Regimen smoke (10k total, 5k/peer)**: currently fails 24 MiB per-daemon target (~30-38 MiB peaks)
-- **Regimen soak (100k one-way)**: currently fails 24 MiB per-daemon target (~39 MiB sender, ~85 MiB receiver)
-- **Standard command**: `scripts/run_lowmem_regimen.sh soak`
-- **Delta matrix + file proxy command**: `scripts/run_perf_serial.sh lowmem`
+1. **Functional lane (fast, default in `low_mem_test`)**
+   - Goal: quickly prove lowmem-mode sync still works functionally.
+   - Runs by default: `low_mem_ios_functional_smoke_2k`.
+   - Kept but ignored by default (RSS-sampling sanity only):
+     - `low_mem_ios_budget_smoke_10k`
+     - `low_mem_ios_budget_soak_million`
+   - Command:
+     - `cargo test --release --test low_mem_test -- --nocapture`
+
+2. **Realism lane (daemon + Linux memory accounting)**
+   - Goal: approximate constrained-runtime kill behavior with process isolation.
+   - Harness: `scripts/run_lowmem_proxy.sh` (real daemons, `/proc` RSS/smaps).
+   - Hard-cap option: cgroup v2 (`memory.max`, `memory.events`).
+   - This is the memory gate to trust for release decisions, not in-process RSS sampling.
+
+3. **Default lowmem perf command (fast realism matrix)**
+   - Command: `scripts/run_perf_serial.sh lowmem`
+   - Default scenarios:
+     - message delta: `50k baseline + 10k messages`
+     - file delta: `50k baseline + 20 x 1MiB files`
+   - Default enforcement:
+     - `LOWMEM_PROXY_CGROUP_ENFORCE=1`
+     - `LOWMEM_PROXY_CGROUP_LIMIT_KB=22528` (22 MiB Linux receiver hard cap)
+
+4. **Large/slow scenarios (opt-in hardening lane)**
+   - These do not run by default in `run_perf_serial.sh lowmem`.
+   - Enable with:
+     - `PERF_LOWMEM_POC_ENABLE=1`
+     - `PERF_LOWMEM_RUN_LARGE_TARGET=1`
+     - `PERF_LOWMEM_RUN_SMALL_BRACKET=1`
 
 ### Lowmem Proof-of-Concept (24 MiB iOS Target, 22 MiB Linux Hard Cap)
 
-Dedicated lowmem POC scenarios are run by `scripts/run_perf_serial.sh lowmem` as:
+<!-- This should get merged with the previous section into a single coherent section-->
+
+Platform note: this POC gate is Linux-only because it depends on `/proc` memory accounting and cgroup v2 `memory.max` / `memory.events`.
+
+Optional lowmem POC scenarios (`scripts/run_perf_serial.sh lowmem` with POC envs enabled):
 1. `Lowmem POC Messages (1M+10k, 24MB gate)`
 2. `Lowmem POC Files Realism (500k+100x1MiB, 24MB gate)`
 3. `Lowmem POC Files Extreme (0+10k x1MiB, 24MB gate)`
@@ -319,21 +365,48 @@ Non-lowmem regression spot checks (2026-03-03):
 This section is updated by `scripts/run_perf_serial.sh` when `WRITE_PERF_MD=1`.
 
 <!-- PERF_AUTO_RESULTS_START -->
-_Generated by `scripts/run_perf_serial.sh lowmem` on 2026-03-03 02:57:09 UTC._
+_Refreshed from `WRITE_PERF_MD=0 scripts/run_perf_serial.sh lowmem` output on 2026-03-03 (auto-write mode was flaky in this sandbox due intermittent daemon auto-start `os error 1`)._
 
-### Large File Catchup (4x400 slices, 100x1MiB proxy)
+### Lowmem Delta (50000+10000 messages)
 
 ```bash
-cargo +stable test --release --test sync_graph_test catchup_large_file_4x_400_slices -- --ignored --nocapture --test-threads=1 
+env LOWMEM_PROXY_BASE_EVENTS=50000 LOWMEM_PROXY_DELTA_EVENTS=10000 LOWMEM_PROXY_BUDGET_KB=24576 LOWMEM_PROXY_CGROUP_ENFORCE=1 LOWMEM_PROXY_CGROUP_LIMIT_KB=22528 scripts/run_lowmem_proxy.sh delta10k
 ```
 
 ```text
-=== Multi-source file catchup: 4 sources x 400 slices ===
-  Catchup wall:     2249 ms
-  Events/s:         178
-  MB/s:             44.5
-  Total attributed: 400
-  Peak RSS:         264.6 MiB (before: 174.2)
+RUN_DIR=/home/holmes/poc-7-lowmem-gordian/target/lowmem-proxy/delta-3414689_1772561432
+SCENARIO=large_delta
+DELTA_KIND=messages
+BASE_EVENTS=50000
+DELTA_EVENTS=10000
+DELTA_MESSAGES_OBSERVED=10000
+MAX_BOB_TOTAL_KB=18964
+PASS_UNDER_24MB=1
+CGROUP_ENFORCED=1
+CGROUP_LIMIT_KB=22528
+CGROUP_OOM_KILL=0
+MAX_INIT_NEED_QUEUE=9987
+```
+
+### Lowmem Delta Files (50000+20x1MiB)
+
+```bash
+env LOWMEM_PROXY_BASE_EVENTS=50000 LOWMEM_PROXY_DELTA_FILES=20 LOWMEM_PROXY_DELTA_FILE_MIB=1 LOWMEM_PROXY_BUDGET_KB=24576 LOWMEM_PROXY_CGROUP_ENFORCE=1 LOWMEM_PROXY_CGROUP_LIMIT_KB=22528 scripts/run_lowmem_proxy.sh deltafiles
+```
+
+```text
+RUN_DIR=/home/holmes/poc-7-lowmem-gordian/target/lowmem-proxy/delta-3417912_1772561466
+SCENARIO=large_delta
+DELTA_KIND=files
+BASE_EVENTS=50000
+DELTA_FILES=20
+DELTA_FILE_SLICES_EXPECTED=80
+DELTA_FILE_SLICES_OBSERVED=80
+MAX_BOB_TOTAL_KB=14348
+PASS_UNDER_24MB=1
+CGROUP_ENFORCED=1
+CGROUP_LIMIT_KB=22528
+CGROUP_OOM_KILL=0
 ```
 
 <!-- PERF_AUTO_RESULTS_END -->

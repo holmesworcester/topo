@@ -483,6 +483,18 @@ fn dispatch(
             },
             Err(e) => RpcResponse::error(e),
         },
+        RpcMethod::GenerateFiles { count, size_mib } => match state.require_active_peer() {
+            Ok(peer_id) => match message::generate_files_for_peer(
+                db_path,
+                &peer_id,
+                count,
+                size_mib,
+            ) {
+                Ok(data) => RpcResponse::success(data),
+                Err(e) => RpcResponse::error(e.to_string()),
+            },
+            Err(e) => RpcResponse::error(e),
+        },
         RpcMethod::React { target, emoji } => match state.require_active_peer() {
             Ok(peer_id) => match reaction::react_for_peer(db_path, &peer_id, &target, &emoji) {
                 Ok(data) => RpcResponse::success(data),

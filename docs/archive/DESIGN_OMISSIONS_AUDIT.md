@@ -68,7 +68,7 @@ Status:
    - Module-ownership section previously documented `connection_lifecycle` and `session_factory` but not this adapter seam.
 
 9. **Low-memory tuning control surface underdocumented**
-   - Runtime low-memory mode is controlled by `LOW_MEM_IOS` / `LOW_MEM` and centralized in `src/tuning.rs` [tuning.rs](/home/holmes/poc-7/src/tuning.rs:1).
+   - Runtime low-memory mode is controlled by `LOW_MEM_IOS` and centralized in `src/tuning.rs` [tuning.rs](/home/holmes/poc-7/src/tuning.rs:1).
    - `DESIGN.md` described goals (`low_mem_ios`) but not the runtime toggle and centralized tuning surface.
 
 ## Remediation status

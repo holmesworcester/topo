@@ -960,6 +960,11 @@ Note: wrapping all projection writes in a single transaction was attempted first
 - degrade throughput before violating memory ceiling (memory safety over speed).
 - validate at scale (`>= 1_000_000` canonical events on disk) with stable memory.
 - include large-identity-set validation (for example `>= 100_000` peer trust keys) while preserving memory ceiling.
+- Linux realism gate for this phase:
+  - lowmem proxy/regimen perf harnesses are Linux-only (`/proc` + cgroup v2 dependencies),
+  - hard-cap validation should run receiver (`bob`) with cgroup v2 `memory.max=22528 KiB` and `memory.swap.max=0`,
+  - passing runs must show both `PASS_UNDER_24MB=1` and `CGROUP_OOM_KILL=0`,
+  - RSS-sampling budget tests in `low_mem_test.rs` are sanity-only and ignored by default.
 
 Recommended initial size policy:
 - `EVENT_MAX_BLOB_BYTES = 1_048_576` (1 MiB soft cap)
@@ -1305,6 +1310,23 @@ Behavior tests:
 - 2-node bootstrap and sync.
 - 3-node out-of-order convergence.
 - reconnect/retry/backoff behavior.
+
+## 12.8 Low-memory realism tests (Linux-only)
+
+1. Fast default lowmem lane:
+   - `cargo test --release --test low_mem_test -- --nocapture` (functional lowmem smoke, no RSS gate),
+   - `scripts/run_perf_serial.sh lowmem` (fast cgroup-enforced matrix).
+2. RSS-sampling sanity lane (ignored by default):
+   - `cargo test --release --test low_mem_test -- --ignored --nocapture --test-threads=1`
+3. Run lowmem realism through daemon-based proxy harness, not in-process unit tests:
+   - `scripts/run_lowmem_proxy.sh delta10k`
+   - `scripts/run_lowmem_proxy.sh deltafiles`
+4. For release/perf evidence at larger scales, enable optional serial lowmem POC matrix:
+   - `PERF_LOWMEM_POC_ENABLE=1 PERF_LOWMEM_RUN_LARGE_TARGET=1 PERF_LOWMEM_RUN_SMALL_BRACKET=1 scripts/run_perf_serial.sh lowmem`
+5. Linux-only contract for these runs:
+   - requires `/proc/<pid>/status` and `/proc/<pid>/smaps`,
+   - cgroup hard-cap mode requires cgroup v2 (`memory.max`, `memory.events`),
+   - when enforced cap is enabled, treat any `CGROUP_OOM_KILL > 0` as failure.
 
 ---
 
