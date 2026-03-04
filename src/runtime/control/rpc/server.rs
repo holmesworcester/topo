@@ -552,6 +552,13 @@ fn dispatch(
             },
             Err(e) => RpcResponse::error(e.to_string()),
         },
+        RpcMethod::Peers => match service::open_db_load(db_path) {
+            Ok((recorded_by, db)) => match peer_shared::list_peers(&db, &recorded_by) {
+                Ok(data) => RpcResponse::success(data),
+                Err(e) => RpcResponse::error(e.to_string()),
+            },
+            Err(e) => RpcResponse::error(e.to_string()),
+        },
         RpcMethod::Workspaces => match service::open_db_load(db_path) {
             Ok((recorded_by, db)) => match workspace::list_items(&db, &recorded_by) {
                 Ok(data) => RpcResponse::success(data),
