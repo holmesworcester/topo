@@ -468,11 +468,10 @@ fn test_cli_bidirectional_sync() {
         &format!("has_event:{} >= 1", bob_eid),
         timeout_ms,
     );
-    assert_eventually(
-        &bob_db,
-        &format!("has_event:{} >= 1", alice_eid),
-        timeout_ms,
-    );
+    // Wait for message decryption: encrypted messages require key materialization
+    // and cascade unblocking before they appear in the messages table.
+    assert_eventually(&alice_db, "message_count >= 3", timeout_ms);
+    assert_eventually(&bob_db, "message_count >= 3", timeout_ms);
 
     // Verify specific message content arrived on both sides
     let alice_msgs = get_messages(&alice_db);

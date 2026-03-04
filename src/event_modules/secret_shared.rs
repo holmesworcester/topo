@@ -93,7 +93,11 @@ pub fn encode_secret_shared(event: &ParsedEvent) -> Result<Vec<u8>, EventError> 
 // === Projector (event-module locality) ===
 
 use crate::crypto::event_id_to_base64;
-use crate::projection::contract::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
+use crate::projection::contract::{
+    ContextSnapshot, EmitCommand, ProjectorResult, SqlVal, UnwrappedKeyMaterial, WriteOp,
+};
+use crate::projection::encrypted::unwrap_key_from_sender;
+use crate::projection::signer::{resolve_signer_key, SignerResolution};
 use rusqlite::Connection;
 
 pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
@@ -113,6 +117,10 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 /// Build projector-local context for SecretShared projection.
+///
+/// Attempts DH unwrap if the recipient_event_id matches a local private key
+/// (either a pending invite key or the local PeerShared key). On success,
+/// sets `unwrapped_key_material` so the projector can emit MaterializeSecretKey.
 pub fn build_projector_context(
     conn: &Connection,
     recorded_by: &str,
@@ -125,20 +133,125 @@ pub fn build_projector_context(
     };
 
     let recipient_b64 = event_id_to_base64(&ss.recipient_event_id);
-    let recipient_removed = conn.query_row(
+    let recipient_removed: bool = conn.query_row(
         "SELECT COUNT(*) > 0 FROM removed_entities WHERE recorded_by = ?1 AND target_event_id = ?2",
         rusqlite::params![recorded_by, &recipient_b64],
         |row| row.get(0),
     )?;
 
+    // Check if this key is already materialized locally — skip unwrap if so.
+    let key_b64 = event_id_to_base64(&ss.key_event_id);
+    let key_already_exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM secret_keys WHERE recorded_by = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &key_b64],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    if recipient_removed || key_already_exists {
+        return Ok(ContextSnapshot {
+            recipient_removed,
+            ..ContextSnapshot::default()
+        });
+    }
+
+    // Try to find a local private key for the recipient.
+    // Check pending invite keys (signer_kind=4) and PeerShared keys (signer_kind=3).
+    let unwrapped = try_unwrap_for_local_recipient(conn, recorded_by, ss);
+
     Ok(ContextSnapshot {
         recipient_removed,
+        unwrapped_key_material: unwrapped,
         ..ContextSnapshot::default()
     })
 }
 
+/// Attempt DH unwrap using the local private key matching the recipient.
+fn try_unwrap_for_local_recipient(
+    conn: &Connection,
+    recorded_by: &str,
+    ss: &SecretSharedEvent,
+) -> Option<UnwrappedKeyMaterial> {
+    use crate::event_modules::local_signer_secret::{
+        SIGNER_KIND_PENDING_INVITE_UNWRAP,
+    };
+
+    let recipient_b64 = event_id_to_base64(&ss.recipient_event_id);
+
+    // Look up local_signer_material for this recipient event_id.
+    let (private_key_bytes, signer_kind): (Vec<u8>, u8) = conn
+        .query_row(
+            "SELECT private_key, signer_kind FROM local_signer_material
+             WHERE recorded_by = ?1 AND signer_event_id = ?2
+             AND private_key != X'0000000000000000000000000000000000000000000000000000000000000000'
+             LIMIT 1",
+            rusqlite::params![recorded_by, &recipient_b64],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .ok()?;
+
+    if private_key_bytes.len() != 32 {
+        return None;
+    }
+    let mut key_arr = [0u8; 32];
+    key_arr.copy_from_slice(&private_key_bytes);
+    let local_key = ed25519_dalek::SigningKey::from_bytes(&key_arr);
+
+    // Resolve sender public key.
+    let sender_key = match resolve_signer_key(conn, recorded_by, ss.signer_type, &ss.signed_by) {
+        Ok(SignerResolution::Found(k)) => k,
+        _ => return None,
+    };
+    let sender_pub = ed25519_dalek::VerifyingKey::from_bytes(&sender_key).ok()?;
+
+    // DH unwrap.
+    let plaintext_key = unwrap_key_from_sender(&local_key, &sender_pub, &ss.wrapped_key);
+
+    // Verify deterministic key event ID matches.
+    let expected_id = deterministic_secret_key_event_id(&plaintext_key).ok()?;
+    if expected_id != ss.key_event_id {
+        return None;
+    }
+
+    let clear_invite = if signer_kind == SIGNER_KIND_PENDING_INVITE_UNWRAP {
+        Some(recipient_b64)
+    } else {
+        None
+    };
+
+    Some(UnwrappedKeyMaterial {
+        key_bytes: plaintext_key,
+        clear_invite_signer_event_id: clear_invite,
+    })
+}
+
+/// Deterministic secret_key event ID from key bytes (same logic as identity_ops).
+fn deterministic_secret_key_event_id(
+    key_bytes: &[u8; 32],
+) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+    use blake2::digest::consts::U8;
+    use blake2::{Blake2b, Digest};
+
+    let mut hasher = Blake2b::<U8>::new();
+    hasher.update(b"poc7-content-key-created-at-v1");
+    hasher.update(key_bytes);
+    let digest = hasher.finalize();
+    let mut ts_bytes = [0u8; 8];
+    ts_bytes.copy_from_slice(&digest[..8]);
+    let created_at_ms = u64::from_le_bytes(ts_bytes);
+
+    let sk_evt = ParsedEvent::SecretKey(super::SecretKeyEvent {
+        created_at_ms,
+        key_bytes: *key_bytes,
+    });
+    let blob = super::encode_event(&sk_evt)?;
+    Ok(crate::crypto::hash_event(&blob))
+}
+
 /// Pure projector: SecretShared → secret_shared table.
 /// Rejects if recipient has been removed (InvRemovalExclusion).
+/// Emits MaterializeSecretKey if context loader resolved an unwrapped key.
 pub fn project_pure(
     recorded_by: &str,
     event_id_b64: &str,
@@ -174,7 +287,17 @@ pub fn project_pure(
             SqlVal::Blob(ss.wrapped_key.to_vec()),
         ],
     }];
-    ProjectorResult::valid(ops)
+
+    let commands = if let Some(ref material) = ctx.unwrapped_key_material {
+        vec![EmitCommand::MaterializeSecretKey {
+            key_bytes: material.key_bytes,
+            clear_invite_signer_event_id: material.clear_invite_signer_event_id.clone(),
+        }]
+    } else {
+        vec![]
+    };
+
+    ProjectorResult::valid_with_commands(ops, commands)
 }
 
 pub static SECRET_SHARED_META: EventTypeMeta = EventTypeMeta {

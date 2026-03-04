@@ -7,7 +7,7 @@ pub use projection_context::{file_slice_event_count, file_slice_event_counts_by_
 pub use projector::project_pure;
 pub use wire::{
     encode_file_slice, parse_file_slice, FileSliceEvent, FILE_SLICE_CIPHERTEXT_BYTES,
-    FILE_SLICE_MAX_BYTES, FILE_SLICE_META, FILE_SLICE_WIRE_SIZE,
+    FILE_SLICE_MAX_BYTES, FILE_SLICE_META, FILE_SLICE_PLAINTEXT_BYTES, FILE_SLICE_WIRE_SIZE,
 };
 
 use rusqlite::Connection;

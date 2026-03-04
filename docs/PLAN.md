@@ -753,6 +753,27 @@ Test harness contract:
 
 The same `secret_shared` event type and wrap/unwrap projector logic is used for both bootstrap (wrap to invite key) and runtime (wrap to peer key) key distribution. Only the recipient key source differs.
 
+## 7.7 Encryption key policy (implemented)
+
+Key model:
+- **Workspace content key**: one shared AES-256 key per workspace for message/reaction/deletion content. Created at workspace bootstrap; distributed to joiners via invite-key wrapping through `secret_shared` events.
+- **Per-attachment key**: each file attachment gets a fresh random AES-256 key (`rand::random::<[u8; 32]>()`). Referenced by `message_attachment.key_event_id`. Wrapped to all workspace peers via `wrap_attachment_key_for_peers`. Never reused across attachments.
+
+File slice encryption:
+- AES-256-GCM with deterministic nonce: `Blake2b-96("poc7-file-slice-nonce" || file_id || slice_number_le)`.
+- AAD: `file_id || slice_number_le` (binds slice metadata to ciphertext integrity).
+- File slices are signed events with field-level encryption, not encrypted wrappers.
+
+Crypto-shred on message deletion:
+- Deletion cascades to `file_slices` and `message_attachments` rows for the target message.
+- Encrypted file data becomes inaccessible through normal read/query paths.
+- Raw event blobs remain in the events table (compaction out of scope).
+
+Key materialization paths (dep-driven, single unified path):
+1. Each `secret_shared` event's context_loader attempts DH unwrap using the local private key (invite or PeerShared) matching the recipient.
+2. On success, the projector emits `MaterializeSecretKey`, which creates a deterministic `secret_key` event and cascades unblock.
+3. No imperative scanning or post-drain retry hooks needed — the dep engine naturally handles ordering.
+
 ---
 
 ## 8. Phase 9: Durable Queues and Workers
@@ -1160,7 +1181,11 @@ Use `poc-6` as reference behavior for end-to-end test setup:
 
 ## 11.5 Crude sender-keys model (phase-1 style, no key history yet)
 
-Use the sender-subjective O(n) baseline ("maximally simple phase-1/phase-4 style key broadcast"):
+> **Superseded by §7.7**: The implemented model uses a single shared workspace content key
+> (not per-message keys). The description below preserves the original design exploration
+> for context. See §7.7 for the actual implemented key policy.
+
+Original design exploration (not implemented as-is):
 - sender creates a fresh local-only `secret` key event per message,
 - sender emits one `secret_shared` key-wrap event per perceived eligible recipient peer pubkey,
 - encrypted content event references the key event id through normal dependency fields,

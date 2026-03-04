@@ -49,6 +49,16 @@ pub enum EmitCommand {
     ApplyTransportIdentityIntent {
         intent: crate::contracts::transport_identity_contract::TransportIdentityIntent,
     },
+    /// Materialize a SecretKey event from unwrapped key bytes.
+    /// Emitted by the secret_shared projector after successful DH unwrap
+    /// in the context loader. The handler creates a deterministic SecretKey
+    /// event and cascades unblock for any encrypted events waiting on it.
+    MaterializeSecretKey {
+        key_bytes: [u8; 32],
+        /// If this was an invite-key unwrap, clear the pending invite key
+        /// from local_signer_material after successful materialization.
+        clear_invite_signer_event_id: Option<String>,
+    },
 }
 
 /// The pure projector contract: everything a projector returns.
@@ -151,6 +161,12 @@ pub struct ContextSnapshot {
     /// references a non-message event and should be rejected.
     pub target_is_non_message: bool,
 
+    /// For MessageDeletion: file_ids from message_attachments for the target message.
+    /// Used for crypto-shred cascade: when a message is deleted, its attachments
+    /// and file slices must also be removed so encrypted file data becomes
+    /// inaccessible through normal read paths.
+    pub target_attachment_file_ids: Vec<String>,
+
     /// For Message: pre-existing deletion intents for this message_id.
     /// Multiple intents may exist (one per deletion event targeting this message).
     /// Used for delete-before-create convergence — the message projector finds the
@@ -164,6 +180,11 @@ pub struct ContextSnapshot {
 
     /// For SecretShared: whether the recipient has been removed.
     pub recipient_removed: bool,
+
+    /// For SecretShared: unwrapped key bytes if the local peer has the private key
+    /// for this recipient and DH unwrap + deterministic key ID verification succeeded.
+    /// Set by the context loader; consumed by the projector to emit MaterializeSecretKey.
+    pub unwrapped_key_material: Option<UnwrappedKeyMaterial>,
 
     /// For FileSlice: descriptor info (event_id, signer_event_id) for the file_id.
     /// Empty vec means no descriptor exists yet (guard-block).
@@ -187,6 +208,16 @@ pub struct ContextSnapshot {
     /// Used to avoid writing bootstrap trust rows that are already superseded by
     /// steady-state peer trust.
     pub bootstrap_spki_already_peer_shared: bool,
+}
+
+/// Unwrapped key material from SecretShared DH unwrap.
+#[derive(Debug, Clone)]
+pub struct UnwrappedKeyMaterial {
+    pub key_bytes: [u8; 32],
+    /// If unwrap was done with an invite key, this holds the signer_event_id
+    /// so the invite key can be cleared from local_signer_material after
+    /// the SecretKey event is created.
+    pub clear_invite_signer_event_id: Option<String>,
 }
 
 /// Bootstrap context read from the `bootstrap_context` table, passed to

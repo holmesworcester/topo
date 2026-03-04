@@ -7,6 +7,11 @@ use super::super::{EventError, ParsedEvent, EVENT_TYPE_FILE_SLICE};
 /// FileSlice: canonical fixed ciphertext size (256 KiB)
 pub const FILE_SLICE_CIPHERTEXT_BYTES: usize = 262_144;
 
+/// Maximum plaintext per file slice when encrypted with AES-256-GCM.
+/// AES-GCM appends a 16-byte auth tag, so plaintext must be 16 bytes shorter
+/// to fit in the fixed-size ciphertext field.
+pub const FILE_SLICE_PLAINTEXT_BYTES: usize = FILE_SLICE_CIPHERTEXT_BYTES - 16;
+
 /// FileSlice (type 25): type(1) + created_at(8) + file_id(32) + slice_number(4)
 ///   + ciphertext(262144) + signed_by(32) + signer_type(1) + signature(64) = 262286
 pub const FILE_SLICE_WIRE_SIZE: usize =

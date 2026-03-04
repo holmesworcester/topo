@@ -2,9 +2,10 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::crypto::EventId;
-use crate::event_modules::file_slice::FILE_SLICE_CIPHERTEXT_BYTES;
-use crate::projection::create::create_signed_event_synchronous;
+use crate::event_modules::file_slice::{FILE_SLICE_CIPHERTEXT_BYTES, FILE_SLICE_PLAINTEXT_BYTES};
+use crate::projection::create::create_encrypted_event_synchronous;
 use crate::projection::create::create_event_synchronous;
+use crate::projection::create::create_signed_event_synchronous;
 use crate::service::open_db_for_peer;
 use ed25519_dalek::SigningKey;
 use rusqlite::Connection;
@@ -24,6 +25,17 @@ fn current_timestamp_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// Resolve the workspace content key for content encryption.
+/// Ensures a content key exists (creates one if needed) and returns its event_id.
+fn resolve_content_key(
+    db: &Connection,
+    recorded_by: &str,
+    signer_eid: &EventId,
+    signing_key: &SigningKey,
+) -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
+    workspace::identity_ops::ensure_content_key_for_peer(db, recorded_by, signing_key, signer_eid)
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DeleteResponse {
     pub target: String,
@@ -35,6 +47,8 @@ pub struct CreateMessageCmd {
     pub content: String,
 }
 
+/// Create an encrypted message event. The inner message is signed and then
+/// wrapped in an `encrypted` event using the workspace content key.
 pub fn create(
     db: &Connection,
     recorded_by: &str,
@@ -43,6 +57,7 @@ pub fn create(
     created_at_ms: u64,
     cmd: CreateMessageCmd,
 ) -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
+    let key_event_id = resolve_content_key(db, recorded_by, signer_eid, signing_key)?;
     let msg = ParsedEvent::Message(MessageEvent {
         created_at_ms,
         workspace_id: cmd.workspace_id,
@@ -52,11 +67,17 @@ pub fn create(
         signer_type: 5,
         signature: [0u8; 64],
     });
-    let eid = create_signed_event_synchronous(db, recorded_by, &msg, signing_key)?;
+    let eid = create_encrypted_event_synchronous(
+        db,
+        recorded_by,
+        &key_event_id,
+        &msg,
+        Some(signing_key),
+    )?;
     Ok(eid)
 }
 
-/// High-level send command: creates a message event and returns a SendResponse.
+/// High-level send command: creates an encrypted message event and returns a SendResponse.
 pub fn send(
     db: &Connection,
     recorded_by: &str,
@@ -88,7 +109,7 @@ pub fn send(
 }
 
 // ---------------------------------------------------------------------------
-// Message deletion commands (moved from message_deletion/commands.rs)
+// Message deletion commands
 // ---------------------------------------------------------------------------
 
 pub struct CreateMessageDeletionCmd {
@@ -96,6 +117,7 @@ pub struct CreateMessageDeletionCmd {
     pub author_id: [u8; 32],
 }
 
+/// Create an encrypted message deletion event.
 pub fn create_deletion(
     db: &Connection,
     recorded_by: &str,
@@ -104,6 +126,7 @@ pub fn create_deletion(
     created_at_ms: u64,
     cmd: CreateMessageDeletionCmd,
 ) -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
+    let key_event_id = resolve_content_key(db, recorded_by, signer_eid, signing_key)?;
     let del = ParsedEvent::MessageDeletion(MessageDeletionEvent {
         created_at_ms,
         target_event_id: cmd.target_event_id,
@@ -112,11 +135,17 @@ pub fn create_deletion(
         signer_type: 5,
         signature: [0u8; 64],
     });
-    let eid = create_signed_event_synchronous(db, recorded_by, &del, signing_key)?;
+    let eid = create_encrypted_event_synchronous(
+        db,
+        recorded_by,
+        &key_event_id,
+        &del,
+        Some(signing_key),
+    )?;
     Ok(eid)
 }
 
-/// High-level delete command: creates a message_deletion event and returns target hex.
+/// High-level delete command: creates an encrypted message_deletion event.
 pub fn delete_message(
     db: &Connection,
     recorded_by: &str,
@@ -143,7 +172,7 @@ pub fn delete_message(
 }
 
 // ---------------------------------------------------------------------------
-// Peer-level command wrappers (moved from service.rs)
+// Peer-level command wrappers
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -166,7 +195,8 @@ fn slices_for_file_size_mib(file_size_mib: usize) -> Result<usize, String> {
     let file_size_bytes = file_size_mib
         .checked_mul(1024 * 1024)
         .ok_or_else(|| "file_size_mib overflow".to_string())?;
-    Ok(file_size_bytes.div_ceil(FILE_SLICE_CIPHERTEXT_BYTES))
+    // Chunk by plaintext capacity (ciphertext - GCM tag)
+    Ok(file_size_bytes.div_ceil(FILE_SLICE_PLAINTEXT_BYTES))
 }
 
 /// Send a message as a specific peer (daemon provides the peer_id).
@@ -262,10 +292,10 @@ pub fn generate_for_peer(
 /// Generate N synthetic files as a specific peer.
 ///
 /// Each generated file creates:
-/// - 1 parent `message`
-/// - 1 `secret_key`
-/// - 1 `message_attachment`
-/// - `slices_per_file` `file_slice` events
+/// - 1 parent `message` (encrypted wrapper with workspace content key)
+/// - 1 per-attachment `secret_key` (local, unique per attachment)
+/// - 1 `message_attachment` (encrypted wrapper with workspace content key)
+/// - `slices_per_file` `file_slice` events (signed, ciphertext encrypted with attachment key)
 pub fn generate_files_for_peer(
     db_path: &str,
     peer_id: &str,
@@ -285,11 +315,10 @@ pub fn generate_files_for_peer(
         peer_shared::load_local_peer_signer_required(&db, &recorded_by)?;
     let workspace_id = workspace::resolve_workspace_for_peer(&db, &recorded_by)?;
     let author_id = peer_shared::resolve_user_event_id(&db, &recorded_by, &signer_eid)?;
-    let slice_bytes_u32 = FILE_SLICE_CIPHERTEXT_BYTES as u32;
-    let ciphertext: Vec<u8> = vec![0xAB; FILE_SLICE_CIPHERTEXT_BYTES];
-
+    let content_key_eid = resolve_content_key(&db, &recorded_by, &signer_eid, &signing_key)?;
     db.execute("BEGIN", [])?;
     for i in 0..files {
+        // Encrypted parent message (workspace content key)
         let message_event_id = create(
             &db,
             &recorded_by,
@@ -306,50 +335,70 @@ pub fn generate_files_for_peer(
             format!("create parent message error: {}", e).into()
         })?;
 
-        let key_event_id = create_event_synchronous(
+        // Per-attachment secret key (unique per attachment, never reused)
+        let file_key_bytes: [u8; 32] = rand::random();
+        let file_key_event_id = create_event_synchronous(
             &db,
             &recorded_by,
             &ParsedEvent::SecretKey(SecretKeyEvent {
                 created_at_ms: current_timestamp_ms(),
-                key_bytes: rand::random::<[u8; 32]>(),
+                key_bytes: file_key_bytes,
             }),
         )
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
             format!("create secret_key error: {}", e).into()
         })?;
 
+        // Wrap attachment key for all workspace peers via SecretShared events.
+        workspace::identity_ops::wrap_attachment_key_for_peers(
+            &db, &recorded_by, &signing_key, &signer_eid,
+            &file_key_event_id, &file_key_bytes,
+        ).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("wrap attachment key error: {}", e).into()
+        })?;
+
         let file_id = rand::random::<[u8; 32]>();
         let blob_bytes = (slices_per_file as u64)
-            .checked_mul(FILE_SLICE_CIPHERTEXT_BYTES as u64)
+            .checked_mul(FILE_SLICE_PLAINTEXT_BYTES as u64)
             .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
                 "blob_bytes overflow".into()
             })?;
 
-        create_signed_event_synchronous(
+        // Encrypted message_attachment metadata (workspace content key)
+        let attachment_inner = ParsedEvent::MessageAttachment(MessageAttachmentEvent {
+            created_at_ms: current_timestamp_ms(),
+            message_id: message_event_id,
+            file_id,
+            blob_bytes,
+            total_slices: slices_per_file as u32,
+            slice_bytes: FILE_SLICE_CIPHERTEXT_BYTES as u32,
+            root_hash: [0xAA; 32],
+            key_event_id: file_key_event_id,
+            filename: format!("file-{}.bin", i),
+            mime_type: "application/octet-stream".to_string(),
+            signed_by: signer_eid,
+            signer_type: 5,
+            signature: [0u8; 64],
+        });
+        create_encrypted_event_synchronous(
             &db,
             &recorded_by,
-            &ParsedEvent::MessageAttachment(MessageAttachmentEvent {
-                created_at_ms: current_timestamp_ms(),
-                message_id: message_event_id,
-                file_id,
-                blob_bytes,
-                total_slices: slices_per_file as u32,
-                slice_bytes: slice_bytes_u32,
-                root_hash: [0xAA; 32],
-                key_event_id,
-                filename: format!("file-{}.bin", i),
-                mime_type: "application/octet-stream".to_string(),
-                signed_by: signer_eid,
-                signer_type: 5,
-                signature: [0u8; 64],
-            }),
-            &signing_key,
+            &content_key_eid,
+            &attachment_inner,
+            Some(&signing_key),
         )
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
             format!("create message_attachment error: {}", e).into()
         })?;
 
+        // File slices: ciphertext encrypted directly with per-attachment key.
+        // Slices are signed events (not encrypted wrappers) — the ciphertext field
+        // carries real AES-256-GCM encrypted file data using the attachment key.
         for slice_number in 0..slices_per_file {
+            let plaintext_chunk = vec![0xAB; FILE_SLICE_PLAINTEXT_BYTES];
+            let ciphertext =
+                encrypt_file_slice(&file_key_bytes, &file_id, slice_number as u32, &plaintext_chunk)?;
+
             create_signed_event_synchronous(
                 &db,
                 &recorded_by,
@@ -357,7 +406,7 @@ pub fn generate_files_for_peer(
                     created_at_ms: current_timestamp_ms(),
                     file_id,
                     slice_number: slice_number as u32,
-                    ciphertext: ciphertext.clone(),
+                    ciphertext,
                     signed_by: signer_eid,
                     signer_type: 5,
                     signature: [0u8; 64],
@@ -377,6 +426,88 @@ pub fn generate_files_for_peer(
         slices_per_file,
         total_slices,
     })
+}
+
+/// Encrypt a file slice with the attachment key using AES-256-GCM.
+///
+/// Nonce derivation (deterministic):
+///   nonce = Blake2b-96("poc7-file-slice-nonce" || file_id || slice_number_le)
+///
+/// AAD (additional authenticated data):
+///   aad = file_id (32 bytes) || slice_number (4 bytes LE)
+///   This cryptographically binds the file_id and slice_number to the ciphertext,
+///   preventing an attacker from transplanting ciphertext between different file_id
+///   or slice_number values — any such tampering fails AEAD verification.
+///
+/// Returns ciphertext || auth_tag (AES-GCM appends the 16-byte tag).
+///
+/// Safety argument for deterministic nonce:
+///   The nonce is unique per (key, file_id, slice_number) triple. Since each
+///   attachment uses a unique key, and (file_id, slice_number) pairs are unique
+///   within a file, no two encrypt calls under the same key share a nonce.
+pub fn encrypt_file_slice(
+    key: &[u8; 32],
+    file_id: &[u8; 32],
+    slice_number: u32,
+    plaintext: &[u8],
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    use aes_gcm::{aead::Aead, aead::Payload, Aes256Gcm, KeyInit, Nonce};
+    use blake2::digest::consts::U12;
+    use blake2::{Blake2b, Digest};
+
+    // Deterministic nonce: Blake2b-96("poc7-file-slice-nonce" || file_id || slice_number_le)
+    let mut hasher = Blake2b::<U12>::new();
+    hasher.update(b"poc7-file-slice-nonce");
+    hasher.update(file_id);
+    hasher.update(&slice_number.to_le_bytes());
+    let nonce_bytes: [u8; 12] = hasher.finalize().into();
+
+    // AAD: file_id || slice_number_le — binds metadata to ciphertext integrity.
+    let mut aad = Vec::with_capacity(36);
+    aad.extend_from_slice(file_id);
+    aad.extend_from_slice(&slice_number.to_le_bytes());
+
+    let cipher = Aes256Gcm::new_from_slice(key)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() })?;
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let ciphertext = cipher
+        .encrypt(nonce, Payload { msg: plaintext, aad: &aad })
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() })?;
+
+    Ok(ciphertext)
+}
+
+/// Decrypt a file slice with the attachment key using AES-256-GCM.
+/// Uses the same deterministic nonce and AAD derivation as `encrypt_file_slice`.
+pub fn decrypt_file_slice(
+    key: &[u8; 32],
+    file_id: &[u8; 32],
+    slice_number: u32,
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    use aes_gcm::{aead::Aead, aead::Payload, Aes256Gcm, KeyInit, Nonce};
+    use blake2::digest::consts::U12;
+    use blake2::{Blake2b, Digest};
+
+    let mut hasher = Blake2b::<U12>::new();
+    hasher.update(b"poc7-file-slice-nonce");
+    hasher.update(file_id);
+    hasher.update(&slice_number.to_le_bytes());
+    let nonce_bytes: [u8; 12] = hasher.finalize().into();
+
+    // AAD must match encryption — file_id || slice_number_le.
+    let mut aad = Vec::with_capacity(36);
+    aad.extend_from_slice(file_id);
+    aad.extend_from_slice(&slice_number.to_le_bytes());
+
+    let cipher = Aes256Gcm::new_from_slice(key)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() })?;
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let plaintext = cipher
+        .decrypt(nonce, Payload { msg: ciphertext, aad: &aad })
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() })?;
+
+    Ok(plaintext)
 }
 
 // ---------------------------------------------------------------------------
@@ -417,6 +548,9 @@ fn mime_from_extension(ext: &str) -> &'static str {
 }
 
 /// Send a message with a file attachment as a specific peer.
+///
+/// Message and attachment metadata → encrypted wrappers (workspace content key).
+/// File slices → signed events with ciphertext encrypted directly by attachment key.
 pub fn send_file_for_peer(
     db_path: &str,
     peer_id: &str,
@@ -444,7 +578,9 @@ pub fn send_file_for_peer(
         peer_shared::load_local_peer_signer_required(&db, &recorded_by)?;
     let workspace_id = workspace::resolve_workspace_for_peer(&db, &recorded_by)?;
     let author_id = peer_shared::resolve_user_event_id(&db, &recorded_by, &signer_eid)?;
+    let content_key_eid = resolve_content_key(&db, &recorded_by, &signer_eid, &signing_key)?;
 
+    // Encrypted parent message (workspace content key)
     let message_event_id = create(
         &db,
         &recorded_by,
@@ -458,50 +594,65 @@ pub fn send_file_for_peer(
         },
     )?;
 
-    let key_event_id = create_event_synchronous(
+    // Per-attachment secret key (unique, never reused across attachments)
+    let file_key_bytes: [u8; 32] = rand::random();
+    let file_key_event_id = create_event_synchronous(
         &db,
         &recorded_by,
         &ParsedEvent::SecretKey(SecretKeyEvent {
             created_at_ms: current_timestamp_ms(),
-            key_bytes: rand::random::<[u8; 32]>(),
+            key_bytes: file_key_bytes,
         }),
+    )?;
+
+    // Wrap attachment key for all workspace peers via SecretShared events.
+    workspace::identity_ops::wrap_attachment_key_for_peers(
+        &db, &recorded_by, &signing_key, &signer_eid,
+        &file_key_event_id, &file_key_bytes,
     )?;
 
     let file_id = rand::random::<[u8; 32]>();
     let num_slices = if file_size == 0 {
         1
     } else {
-        (file_size as usize).div_ceil(FILE_SLICE_CIPHERTEXT_BYTES)
+        (file_size as usize).div_ceil(FILE_SLICE_PLAINTEXT_BYTES)
     };
 
-    create_signed_event_synchronous(
+    // Encrypted message_attachment metadata (workspace content key)
+    let attachment_inner = ParsedEvent::MessageAttachment(MessageAttachmentEvent {
+        created_at_ms: current_timestamp_ms(),
+        message_id: message_event_id,
+        file_id,
+        blob_bytes: file_size,
+        total_slices: num_slices as u32,
+        slice_bytes: FILE_SLICE_CIPHERTEXT_BYTES as u32,
+        root_hash: [0u8; 32],
+        key_event_id: file_key_event_id,
+        filename: filename.clone(),
+        mime_type,
+        signed_by: signer_eid,
+        signer_type: 5,
+        signature: [0u8; 64],
+    });
+    create_encrypted_event_synchronous(
         &db,
         &recorded_by,
-        &ParsedEvent::MessageAttachment(MessageAttachmentEvent {
-            created_at_ms: current_timestamp_ms(),
-            message_id: message_event_id,
-            file_id,
-            blob_bytes: file_size,
-            total_slices: num_slices as u32,
-            slice_bytes: FILE_SLICE_CIPHERTEXT_BYTES as u32,
-            root_hash: [0u8; 32],
-            key_event_id,
-            filename: filename.clone(),
-            mime_type,
-            signed_by: signer_eid,
-            signer_type: 5,
-            signature: [0u8; 64],
-        }),
-        &signing_key,
+        &content_key_eid,
+        &attachment_inner,
+        Some(&signing_key),
     )?;
 
+    // File slices: ciphertext encrypted directly with per-attachment key.
     for slice_number in 0..num_slices {
-        let start = slice_number * FILE_SLICE_CIPHERTEXT_BYTES;
-        let mut ciphertext = vec![0u8; FILE_SLICE_CIPHERTEXT_BYTES];
-        let end = (start + FILE_SLICE_CIPHERTEXT_BYTES).min(file_data.len());
+        let start = slice_number * FILE_SLICE_PLAINTEXT_BYTES;
+        let mut plaintext = vec![0u8; FILE_SLICE_PLAINTEXT_BYTES];
+        let end = (start + FILE_SLICE_PLAINTEXT_BYTES).min(file_data.len());
         if start < file_data.len() {
-            ciphertext[..end - start].copy_from_slice(&file_data[start..end]);
+            plaintext[..end - start].copy_from_slice(&file_data[start..end]);
         }
+
+        let ciphertext =
+            encrypt_file_slice(&file_key_bytes, &file_id, slice_number as u32, &plaintext)?;
 
         create_signed_event_synchronous(
             &db,
@@ -525,4 +676,88 @@ pub fn send_file_for_peer(
         filename,
         file_size,
     })
+}
+
+#[cfg(test)]
+mod file_slice_encryption_tests {
+    use super::{decrypt_file_slice, encrypt_file_slice};
+
+    /// SC-7: Round-trip encrypt→decrypt produces original plaintext.
+    #[test]
+    fn test_round_trip() {
+        let key: [u8; 32] = rand::random();
+        let file_id: [u8; 32] = rand::random();
+        let plaintext = b"hello world file slice content";
+        let ct = encrypt_file_slice(&key, &file_id, 0, plaintext).unwrap();
+        assert_ne!(&ct[..plaintext.len()], plaintext, "ciphertext must differ from plaintext");
+        let pt = decrypt_file_slice(&key, &file_id, 0, &ct).unwrap();
+        assert_eq!(pt, plaintext);
+    }
+
+    /// Determinism: same inputs produce identical ciphertext.
+    #[test]
+    fn test_deterministic() {
+        let key: [u8; 32] = [42u8; 32];
+        let file_id: [u8; 32] = [7u8; 32];
+        let plaintext = vec![0xAB; 1024];
+        let ct1 = encrypt_file_slice(&key, &file_id, 3, &plaintext).unwrap();
+        let ct2 = encrypt_file_slice(&key, &file_id, 3, &plaintext).unwrap();
+        assert_eq!(ct1, ct2);
+    }
+
+    /// Different slice numbers produce different ciphertext (nonce differs).
+    #[test]
+    fn test_different_slices_differ() {
+        let key: [u8; 32] = [42u8; 32];
+        let file_id: [u8; 32] = [7u8; 32];
+        let plaintext = vec![0xAB; 1024];
+        let ct0 = encrypt_file_slice(&key, &file_id, 0, &plaintext).unwrap();
+        let ct1 = encrypt_file_slice(&key, &file_id, 1, &plaintext).unwrap();
+        assert_ne!(ct0, ct1);
+    }
+
+    /// AAD binding: decrypting with wrong file_id fails.
+    #[test]
+    fn test_wrong_file_id_fails_decrypt() {
+        let key: [u8; 32] = rand::random();
+        let file_id: [u8; 32] = [1u8; 32];
+        let wrong_file_id: [u8; 32] = [2u8; 32];
+        let ct = encrypt_file_slice(&key, &file_id, 0, b"data").unwrap();
+        // Nonce also changes with file_id, so decrypt should fail.
+        let result = decrypt_file_slice(&key, &wrong_file_id, 0, &ct);
+        assert!(result.is_err(), "decrypt with wrong file_id must fail");
+    }
+
+    /// AAD binding: decrypting with wrong slice_number fails.
+    #[test]
+    fn test_wrong_slice_number_fails_decrypt() {
+        let key: [u8; 32] = rand::random();
+        let file_id: [u8; 32] = rand::random();
+        let ct = encrypt_file_slice(&key, &file_id, 5, b"data").unwrap();
+        let result = decrypt_file_slice(&key, &file_id, 6, &ct);
+        assert!(result.is_err(), "decrypt with wrong slice_number must fail");
+    }
+
+    /// Wrong key fails decrypt.
+    #[test]
+    fn test_wrong_key_fails_decrypt() {
+        let key: [u8; 32] = [1u8; 32];
+        let wrong_key: [u8; 32] = [2u8; 32];
+        let file_id: [u8; 32] = rand::random();
+        let ct = encrypt_file_slice(&key, &file_id, 0, b"secret").unwrap();
+        let result = decrypt_file_slice(&wrong_key, &file_id, 0, &ct);
+        assert!(result.is_err(), "decrypt with wrong key must fail");
+    }
+
+    /// SC-13: Different attachment keys produce different ciphertext for same content.
+    #[test]
+    fn test_different_keys_differ() {
+        let key1: [u8; 32] = [1u8; 32];
+        let key2: [u8; 32] = [2u8; 32];
+        let file_id: [u8; 32] = [7u8; 32];
+        let plaintext = b"same content";
+        let ct1 = encrypt_file_slice(&key1, &file_id, 0, plaintext).unwrap();
+        let ct2 = encrypt_file_slice(&key2, &file_id, 0, plaintext).unwrap();
+        assert_ne!(ct1, ct2);
+    }
 }

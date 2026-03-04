@@ -13,8 +13,7 @@ use crate::projection::create::{
     create_event_synchronous, create_signed_event_synchronous, project_event,
     store_signed_event_only,
 };
-use crate::projection::encrypted::{unwrap_key_from_sender, wrap_key_for_recipient};
-use crate::projection::signer::{resolve_signer_key, SignerResolution};
+use crate::projection::encrypted::wrap_key_for_recipient;
 use crate::transport::{extract_spki_fingerprint, generate_self_signed_cert_from_signing_key};
 
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -46,7 +45,11 @@ fn deterministic_content_key_created_at_ms(key_bytes: &[u8; 32]) -> u64 {
     u64::from_le_bytes(out)
 }
 
-fn create_deterministic_secret_key_event(
+/// Create a deterministic SecretKey event from raw key bytes.
+///
+/// Called from the `MaterializeSecretKey` emit-command handler in write_exec.rs
+/// when a SecretShared projection successfully unwraps a key via DH.
+pub(crate) fn create_deterministic_secret_key_event_public(
     conn: &Connection,
     recorded_by: &str,
     key_bytes: [u8; 32],
@@ -94,6 +97,7 @@ pub struct LinkChain {
     pub peer_shared_event_id: EventId,
     pub peer_shared_key: SigningKey,
     pub invite_accepted_event_id: EventId,
+    pub content_key_event_id: Option<EventId>,
 }
 
 /// Data needed to transfer an invite between accounts.
@@ -201,59 +205,9 @@ pub(crate) fn wrap_content_key_for_invite(
     Ok(())
 }
 
-/// After accepting an invite, look up any SecretShared events targeted at
-/// the invite_event_id, unwrap using the invite private key and the sender's
-/// public key, and create a local SecretKey event for the decrypted content key.
-pub(crate) fn unwrap_content_key_from_invite(
-    conn: &Connection,
-    recorded_by: &str,
-    invite_key: &SigningKey,
-    invite_event_id: &EventId,
-) -> Result<Option<EventId>, Box<dyn std::error::Error + Send + Sync>> {
-    let mut stmt = conn.prepare(
-        "SELECT e.blob FROM events e
-         INNER JOIN recorded_events re ON re.event_id = e.event_id
-         WHERE re.peer_id = ?1 AND e.event_type = ?2",
-    )?;
-    let mut rows = stmt.query(rusqlite::params![recorded_by, "secret_shared"])?;
-
-    while let Some(row) = rows.next()? {
-        let blob: Vec<u8> = row.get(0)?;
-        let parsed = match parse_event(&blob) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        let ss = match parsed {
-            ParsedEvent::SecretShared(ss) => ss,
-            _ => continue,
-        };
-        if ss.recipient_event_id != *invite_event_id {
-            continue;
-        }
-
-        let sender_key = match resolve_signer_key(conn, recorded_by, ss.signer_type, &ss.signed_by)
-        {
-            Ok(SignerResolution::Found(k)) => k,
-            Ok(_) => continue,
-            Err(_) => continue,
-        };
-        let sender_pub = match ed25519_dalek::VerifyingKey::from_bytes(&sender_key) {
-            Ok(vk) => vk,
-            Err(_) => continue,
-        };
-
-        let plaintext_key = unwrap_key_from_sender(invite_key, &sender_pub, &ss.wrapped_key);
-        let expected_key_event_id = deterministic_secret_key_event_id(&plaintext_key)?;
-        if expected_key_event_id != ss.key_event_id {
-            continue;
-        }
-        let local_key_event_id =
-            create_deterministic_secret_key_event(conn, recorded_by, plaintext_key)?;
-        return Ok(Some(local_key_event_id));
-    }
-
-    Ok(None)
-}
+// Key unwrap is now dep-driven: each SecretShared event's context_loader
+// attempts DH unwrap directly, and the projector emits MaterializeSecretKey.
+// No imperative scanning functions needed.
 
 /// Persist invite key material so content-key unwrap can be retried after
 /// late-arriving SecretShared prerequisites.
@@ -412,6 +366,69 @@ pub(crate) fn create_device_link_invite_events(
     })
 }
 
+/// Wrap an attachment key for all known peers in the workspace via SecretShared events.
+/// This distributes the per-attachment key so recipients can decrypt file slices.
+pub(crate) fn wrap_attachment_key_for_peers(
+    conn: &Connection,
+    recorded_by: &str,
+    sender_peer_shared_key: &SigningKey,
+    sender_peer_shared_event_id: &EventId,
+    attachment_key_event_id: &EventId,
+    attachment_key_bytes: &[u8; 32],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Query all peer_shared public keys for this workspace (excluding removed entities).
+    let mut stmt = conn.prepare(
+        "SELECT p.event_id, p.public_key FROM peers_shared p
+         WHERE p.recorded_by = ?1
+         AND NOT EXISTS (
+             SELECT 1 FROM removed_entities r
+             WHERE r.recorded_by = p.recorded_by AND r.target_event_id = p.event_id
+         )",
+    )?;
+    let mut rows = stmt.query(rusqlite::params![recorded_by])?;
+    let sender_eid_b64 = event_id_to_base64(sender_peer_shared_event_id);
+
+    while let Some(row) = rows.next()? {
+        let peer_eid_b64: String = row.get(0)?;
+        let peer_pub_bytes: Vec<u8> = row.get(1)?;
+
+        // Skip self — self-wrap is implicit via the local SecretKey event.
+        if peer_eid_b64 == sender_eid_b64 {
+            continue;
+        }
+        if peer_pub_bytes.len() != 32 {
+            continue;
+        }
+
+        let mut pub_arr = [0u8; 32];
+        pub_arr.copy_from_slice(&peer_pub_bytes);
+        let recipient_pub = match ed25519_dalek::VerifyingKey::from_bytes(&pub_arr) {
+            Ok(vk) => vk,
+            Err(_) => continue,
+        };
+        let recipient_event_id = match event_id_from_base64(&peer_eid_b64) {
+            Some(eid) => eid,
+            None => continue,
+        };
+
+        let wrapped =
+            wrap_key_for_recipient(sender_peer_shared_key, &recipient_pub, attachment_key_bytes);
+
+        let ss_evt = ParsedEvent::SecretShared(SecretSharedEvent {
+            created_at_ms: now_ms(),
+            key_event_id: *attachment_key_event_id,
+            recipient_event_id,
+            wrapped_key: wrapped,
+            signed_by: *sender_peer_shared_event_id,
+            signer_type: 5,
+            signature: [0u8; 64],
+        });
+        let _ = create_signed_event_synchronous(conn, recorded_by, &ss_evt, sender_peer_shared_key)?;
+    }
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Private helpers
 // ---------------------------------------------------------------------------
@@ -429,7 +446,7 @@ fn create_content_key_and_self_wrap(
     let mut content_key_bytes = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rng, &mut content_key_bytes);
 
-    let key_event_id = create_deterministic_secret_key_event(conn, recorded_by, content_key_bytes)?;
+    let key_event_id = create_deterministic_secret_key_event_public(conn, recorded_by, content_key_bytes)?;
 
     let wrapped = wrap_key_for_recipient(
         peer_shared_key,

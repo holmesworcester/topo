@@ -799,6 +799,11 @@ async fn test_cross_tenant_dep_scoping_after_sync() {
 }
 
 /// Integration test: Alice creates a PSK + encrypted message → syncs to Bob → Bob projects.
+///
+/// NOTE: This test uses manual deterministic key materialization (not invite-flow key
+/// distribution) intentionally. It isolates the encrypted event sync and projection
+/// pipeline from the key distribution protocol. Key distribution is tested separately
+/// via CLI integration tests (test_cli_bidirectional_sync) and invite flow tests.
 #[tokio::test]
 async fn test_encrypted_event_sync() {
     let alice = Peer::new_with_identity("alice");
@@ -850,6 +855,10 @@ async fn test_encrypted_event_sync() {
 }
 
 /// Integration test: Encrypted event syncs before key → blocks → key syncs → cascade unblocks.
+///
+/// NOTE: Manual key materialization is intentional here — this test isolates the
+/// block/unblock cascade mechanics (dependency engine) from the key distribution
+/// protocol. The full key distribution flow is tested via CLI integration tests.
 #[tokio::test]
 async fn test_encrypted_out_of_order_sync() {
     let alice = Peer::new_with_identity("alice");

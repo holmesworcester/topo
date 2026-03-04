@@ -9,6 +9,7 @@ mod tests {
     use crate::harness::fixtures::*;
     use topo::event_modules::secret_shared::{project_pure, SecretSharedEvent};
     use topo::event_modules::ParsedEvent;
+    use topo::projection::contract::{ContextSnapshot, EmitCommand, UnwrappedKeyMaterial};
 
     const PEER: &str = "peer_alice";
     const EVENT_ID: &str = "ss_event_1";
@@ -28,14 +29,34 @@ mod tests {
     // ── SPEC_REMOVAL_EXCLUSION_01: pass ──
 
     #[test]
-    fn test_secret_shared_valid() {
+    fn test_secret_shared_valid_no_local_key() {
         let parsed = make_secret_shared();
         let ctx = empty_ctx();
 
         let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
         assert_valid(&result);
         assert_writes_to_table(&result, "secret_shared");
-        assert_no_commands(&result);
+        // No MaterializeSecretKey when context has no unwrapped_key_material
+        assert!(result.emit_commands.is_empty());
+    }
+
+    #[test]
+    fn test_secret_shared_valid_with_unwrapped_key() {
+        let parsed = make_secret_shared();
+        let ctx = ContextSnapshot {
+            unwrapped_key_material: Some(UnwrappedKeyMaterial {
+                key_bytes: [42u8; 32],
+                clear_invite_signer_event_id: None,
+            }),
+            ..Default::default()
+        };
+
+        let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
+        assert_valid(&result);
+        assert_writes_to_table(&result, "secret_shared");
+        assert_emits_command(&result, "MaterializeSecretKey", |cmd| {
+            matches!(cmd, EmitCommand::MaterializeSecretKey { .. })
+        });
     }
 
     // ── SPEC_REMOVAL_EXCLUSION_01: break ──
