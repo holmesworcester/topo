@@ -825,7 +825,7 @@ fn test_cli_ban_user() {
 }
 
 #[test]
-fn test_cli_workspaces_alias() {
+fn test_cli_workspaces() {
     let tmpdir = tempfile::tempdir().unwrap();
     let db = tmpdir
         .path()
@@ -837,18 +837,6 @@ fn test_cli_workspaces_alias() {
     create_workspace(&db);
     let _daemon = start_daemon(&db);
 
-    // Test both "networks" and "workspaces" alias
-    let out = Command::new(bin())
-        .args(["--db", &db, "networks"])
-        .output()
-        .expect("networks command");
-    assert!(out.status.success());
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("WORKSPACES"),
-        "networks should show WORKSPACES header"
-    );
-
     let out = Command::new(bin())
         .args(["--db", &db, "workspaces"])
         .output()
@@ -857,7 +845,7 @@ fn test_cli_workspaces_alias() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("WORKSPACES"),
-        "workspaces alias should work"
+        "workspaces should show WORKSPACES header"
     );
 }
 

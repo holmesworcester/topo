@@ -258,8 +258,7 @@ enum Commands {
     },
 
     /// List workspaces from projection
-    #[command(alias = "workspaces")]
-    Networks,
+    Workspaces,
 
     /// Show event dependency tree
     #[command(name = "event-tree")]
@@ -1170,7 +1169,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         }
 
-        Commands::Networks => {
+        Commands::Workspaces => {
             let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::Workspaces)?;
             println!("WORKSPACES ({}):", db);
             if let Some(items) = data.as_array() {
