@@ -1019,3 +1019,195 @@ fn test_cli_react_by_message_number() {
     );
 
 }
+
+#[test]
+fn test_cli_event_tree_shows_structure() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = tmpdir
+        .path()
+        .join("event_tree.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // create-workspace populates the db with identity chain events.
+    create_workspace(&db);
+
+    // event-tree is a local command — no daemon needed.
+    let out = Command::new(bin())
+        .args(["--db", &db, "event-tree"])
+        .output()
+        .expect("event-tree command");
+    assert!(
+        out.status.success(),
+        "event-tree failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    // Should contain the root workspace event.
+    assert!(
+        stdout.contains("workspace"),
+        "event-tree should show workspace event, got:\n{}",
+        stdout
+    );
+    // Should contain tree connectors (proves hierarchy is rendered).
+    assert!(
+        stdout.contains("├──") || stdout.contains("└──"),
+        "event-tree should show tree connectors, got:\n{}",
+        stdout
+    );
+    // Should contain the root marker.
+    assert!(
+        stdout.contains("root"),
+        "event-tree should mark root events, got:\n{}",
+        stdout
+    );
+    // Should show event count footer.
+    assert!(
+        stdout.contains("events."),
+        "event-tree should show event count, got:\n{}",
+        stdout
+    );
+    // Parenthesized short IDs.
+    assert!(
+        stdout.contains("("),
+        "event-tree should show parenthesized IDs, got:\n{}",
+        stdout
+    );
+}
+
+#[test]
+fn test_cli_event_list_shows_all_events() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = tmpdir
+        .path()
+        .join("event_list.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    create_workspace(&db);
+
+    let out = Command::new(bin())
+        .args(["--db", &db, "event-list"])
+        .output()
+        .expect("event-list command");
+    assert!(
+        out.status.success(),
+        "event-list failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    // Should show the column header.
+    assert!(
+        stdout.contains("ID") && stdout.contains("TYPE") && stdout.contains("DEPS"),
+        "event-list should show column headers, got:\n{}",
+        stdout
+    );
+    // Should contain workspace event type.
+    assert!(
+        stdout.contains("workspace"),
+        "event-list should show workspace event, got:\n{}",
+        stdout
+    );
+    // Should show dep references with parenthesized IDs.
+    assert!(
+        stdout.contains("signed_by:"),
+        "event-list should show dep fields, got:\n{}",
+        stdout
+    );
+    // Should show event count footer.
+    assert!(
+        stdout.contains("events."),
+        "event-list should show event count, got:\n{}",
+        stdout
+    );
+}
+
+#[test]
+fn test_cli_event_tree_empty_db() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = tmpdir
+        .path()
+        .join("empty.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // Don't create workspace — just ensure the db/tables exist.
+    let out = Command::new(bin())
+        .args(["--db", &db, "event-tree"])
+        .output()
+        .expect("event-tree command");
+    assert!(
+        out.status.success(),
+        "event-tree on empty db failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("no events"),
+        "event-tree on empty db should say no events, got:\n{}",
+        stdout
+    );
+}
+
+#[test]
+fn test_cli_event_list_empty_db() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = tmpdir
+        .path()
+        .join("empty_list.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let out = Command::new(bin())
+        .args(["--db", &db, "event-list"])
+        .output()
+        .expect("event-list command");
+    assert!(
+        out.status.success(),
+        "event-list on empty db failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("no events"),
+        "event-list on empty db should say no events, got:\n{}",
+        stdout
+    );
+}
+
+#[test]
+fn test_cli_event_tree_cross_refs_shown() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = tmpdir
+        .path()
+        .join("cross_ref.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    create_workspace(&db);
+
+    let out = Command::new(bin())
+        .args(["--db", &db, "event-tree"])
+        .output()
+        .expect("event-tree command");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    // peer_shared_first has two deps (user_event_id + signed_by);
+    // the tree parent is user_event_id, so signed_by should appear as a cross-ref.
+    let has_cross_ref = stdout.lines().any(|line| {
+        line.contains("peer_shared_first") && line.contains("[") && line.contains("signed_by:")
+    });
+    assert!(
+        has_cross_ref,
+        "event-tree should show cross-ref annotation on peer_shared_first, got:\n{}",
+        stdout
+    );
+}

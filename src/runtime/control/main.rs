@@ -14,6 +14,8 @@ use tracing_subscriber::FmtSubscriber;
 
 use topo::db::transport_creds::discover_local_tenants;
 use topo::db::{open_connection, schema::create_tables};
+use topo::event_modules::parse_event;
+use topo::shared::crypto::event_id_to_base64;
 use topo::db_registry::DbRegistry;
 use topo::rpc::client::{rpc_call, RpcClientError};
 use topo::rpc::protocol::RpcMethod;
@@ -258,6 +260,14 @@ enum Commands {
     /// List workspaces from projection
     #[command(alias = "workspaces")]
     Networks,
+
+    /// Show event dependency tree
+    #[command(name = "event-tree")]
+    EventTree,
+
+    /// List all events with their dependencies
+    #[command(name = "event-list")]
+    EventList,
 
     /// Send intro offers to two peers so they can hole-punch a direct connection
     Intro {
@@ -1181,6 +1191,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         }
 
+        Commands::EventTree => {
+            let events = load_events_with_deps(db)?;
+            print_event_tree(&events);
+        }
+
+        Commands::EventList => {
+            let events = load_events_with_deps(db)?;
+            print_event_list(&events);
+        }
+
         Commands::Intro {
             peer_a,
             peer_b,
@@ -1401,6 +1421,249 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 fn short_id(b64: &str) -> &str {
     &b64[..b64.len().min(8)]
+}
+
+// ---------------------------------------------------------------------------
+// event-tree / event-list helpers
+// ---------------------------------------------------------------------------
+
+struct EventInfo {
+    id_b64: String,
+    event_type: String,
+    created_at_ms: u64,
+    /// (field_name, dep_id_b64) — ordered: most structural first, signed_by last.
+    deps: Vec<(String, String)>,
+}
+
+fn load_events_with_deps(
+    db: &str,
+) -> Result<Vec<EventInfo>, Box<dyn std::error::Error + Send + Sync>> {
+    let conn = open_connection(db)?;
+    create_tables(&conn)?;
+    let mut stmt =
+        conn.prepare("SELECT event_id, event_type, blob, created_at FROM events ORDER BY inserted_at")?;
+    let rows = stmt.query_map([], |row| {
+        let id: String = row.get(0)?;
+        let etype: String = row.get(1)?;
+        let blob: Vec<u8> = row.get(2)?;
+        // created_at may be a large u64 stored as i64 in sqlite; read as i64 and cast.
+        let created_at: i64 = row.get(3)?;
+        let created_at = created_at as u64;
+        Ok((id, etype, blob, created_at))
+    })?;
+    let mut events = Vec::new();
+    for row in rows {
+        let (id_b64, event_type, blob, created_at_ms) = row?;
+        let deps = match parse_event(&blob) {
+            Ok(parsed) => parsed
+                .dep_field_values()
+                .into_iter()
+                .map(|(field, raw_id)| (field.to_string(), event_id_to_base64(&raw_id)))
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        events.push(EventInfo {
+            id_b64,
+            event_type,
+            created_at_ms,
+            deps,
+        });
+    }
+    Ok(events)
+}
+
+fn print_event_tree(events: &[EventInfo]) {
+    use std::collections::{HashMap, HashSet};
+
+    if events.is_empty() {
+        println!("(no events)");
+        return;
+    }
+
+    let id_set: HashSet<&str> = events.iter().map(|e| e.id_b64.as_str()).collect();
+
+    // For each event, pick the first dep as tree parent (if it exists in the db).
+    // Events with no valid tree parent are roots.
+    let mut parent_of: HashMap<&str, &str> = HashMap::new();
+    for e in events {
+        for (_, dep_id) in &e.deps {
+            if id_set.contains(dep_id.as_str()) {
+                parent_of.insert(&e.id_b64, dep_id.as_str());
+                break;
+            }
+        }
+    }
+
+    // Build children map.
+    let mut children: HashMap<&str, Vec<&str>> = HashMap::new();
+    for e in events {
+        if let Some(&parent) = parent_of.get(e.id_b64.as_str()) {
+            children.entry(parent).or_default().push(&e.id_b64);
+        }
+    }
+
+    // Roots: events with no tree parent.
+    let roots: Vec<&str> = events
+        .iter()
+        .filter(|e| !parent_of.contains_key(e.id_b64.as_str()))
+        .map(|e| e.id_b64.as_str())
+        .collect();
+
+    let event_map: HashMap<&str, &EventInfo> =
+        events.iter().map(|e| (e.id_b64.as_str(), e)).collect();
+
+    // Print each root tree, then lone roots.
+    let mut first = true;
+    for root in &roots {
+        let has_children = children.contains_key(root);
+        if !first && has_children {
+            println!();
+        }
+        print_tree_node(root, "", true, true, &children, &event_map, &parent_of);
+        if has_children {
+            first = false;
+        }
+    }
+
+    println!(
+        "\n{} events. Tree parent = first dependency; siblings in insertion order.",
+        events.len()
+    );
+}
+
+fn print_tree_node(
+    id: &str,
+    prefix: &str,
+    is_last: bool,
+    is_root: bool,
+    children: &std::collections::HashMap<&str, Vec<&str>>,
+    event_map: &std::collections::HashMap<&str, &EventInfo>,
+    parent_of: &std::collections::HashMap<&str, &str>,
+) {
+    let info = event_map[id];
+    let connector = if is_root {
+        ""
+    } else if is_last {
+        "└── "
+    } else {
+        "├── "
+    };
+
+    let short = short_id(&info.id_b64);
+
+    // Collect cross-ref deps (deps that aren't the tree parent).
+    let tree_parent = parent_of.get(id).copied();
+    let cross_refs: Vec<String> = info
+        .deps
+        .iter()
+        .filter(|(_, dep_id)| Some(dep_id.as_str()) != tree_parent)
+        .map(|(field, dep_id)| format!("{}: {}", field, short_id(dep_id)))
+        .collect();
+
+    let suffix = if !cross_refs.is_empty() {
+        format!("  [{}]", cross_refs.join(", "))
+    } else if tree_parent.is_none() {
+        " \u{2190} root".to_string()
+    } else {
+        String::new()
+    };
+
+    println!(
+        "{}{}({}) {}{}",
+        prefix, connector, short, info.event_type, suffix
+    );
+
+    if let Some(kids) = children.get(id) {
+        let new_prefix = if is_root {
+            String::new()
+        } else if is_last {
+            format!("{}    ", prefix)
+        } else {
+            format!("{}\u{2502}   ", prefix)
+        };
+        for (i, kid) in kids.iter().enumerate() {
+            let kid_is_last = i == kids.len() - 1;
+            print_tree_node(kid, &new_prefix, kid_is_last, false, children, event_map, parent_of);
+        }
+    }
+}
+
+fn format_timestamp_ms(ms: u64) -> String {
+    // Reject zero or clearly bogus timestamps (before 2020 or after 2100).
+    if ms == 0 || ms < 1_577_836_800_000 || ms > 4_102_444_800_000 {
+        return "\u{2014}".to_string(); // em-dash
+    }
+    let secs = (ms / 1000) as i64;
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    // Use libc localtime_r for formatting without pulling in chrono.
+    let mut tm = std::mem::MaybeUninit::<libc::tm>::uninit();
+    let tm = unsafe {
+        libc::localtime_r(&secs as *const i64, tm.as_mut_ptr());
+        tm.assume_init()
+    };
+
+    let mut buf = [0u8; 64];
+    let now_year = {
+        let mut now_tm = std::mem::MaybeUninit::<libc::tm>::uninit();
+        unsafe {
+            libc::localtime_r(&now_secs as *const i64, now_tm.as_mut_ptr());
+            now_tm.assume_init().tm_year
+        }
+    };
+    let same_year = tm.tm_year == now_year;
+    let fmt: &[u8] = if same_year {
+        b"%b %d %H:%M:%S\0"
+    } else {
+        b"%Y %b %d %H:%M:%S\0"
+    };
+    let len = unsafe {
+        libc::strftime(
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len(),
+            fmt.as_ptr() as *const libc::c_char,
+            &tm,
+        )
+    };
+    String::from_utf8_lossy(&buf[..len]).to_string()
+}
+
+fn print_event_list(events: &[EventInfo]) {
+    if events.is_empty() {
+        println!("(no events)");
+        return;
+    }
+
+    println!(
+        "  {:<12} {:<24} {:<20} {}",
+        "ID", "TYPE", "CREATED", "DEPS"
+    );
+    for e in events {
+        let short = format!("({})", short_id(&e.id_b64));
+        let ts = format_timestamp_ms(e.created_at_ms);
+
+        let deps_str = if e.deps.is_empty() {
+            "\u{2014}".to_string() // em-dash
+        } else {
+            e.deps
+                .iter()
+                .map(|(field, dep_id)| format!("{}: ({})", field, short_id(dep_id)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+
+        println!(
+            "  {:<12} {:<24} {:<20} {}",
+            short, e.event_type, ts, deps_str
+        );
+    }
+    println!(
+        "\n{} events. Sorted by insertion order.",
+        events.len()
+    );
 }
 
 fn system_hostname() -> String {

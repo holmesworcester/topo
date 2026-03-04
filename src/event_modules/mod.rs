@@ -152,6 +152,10 @@ impl ParsedEvent {
 
     /// Extract dependency event IDs from schema-marked fields.
     /// Returns (field_name, raw_32_byte_id) pairs.
+    ///
+    /// **Ordering is semantic**: the most structural dep is listed first
+    /// (e.g. `user_event_id` before `signed_by`). The `event-tree` command
+    /// uses the first dep as the tree parent, so keep structural deps first.
     pub fn dep_field_values(&self) -> Vec<(&'static str, [u8; 32])> {
         match self {
             ParsedEvent::Message(m) => vec![("author_id", m.author_id), ("signed_by", m.signed_by)],
