@@ -1102,3 +1102,337 @@ fn peers_shows_remote_after_invite_accept() {
     stop_daemon(&alice_db, &mut alice_daemon);
     stop_daemon(&bob_db, &mut bob_daemon);
 }
+
+// ---------------------------------------------------------------------------
+// 8. RPC CLI demo surface tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rpc_methods_lists_all_known_methods() {
+    let out = Command::new(bin())
+        .args(["rpc", "methods"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "rpc methods failed: {:?}", out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("RPC METHODS"), "should show header");
+    assert!(stdout.contains("Status"), "should list Status");
+    assert!(stdout.contains("Send"), "should list Send");
+    assert!(stdout.contains("Messages"), "should list Messages");
+    assert!(stdout.contains("Peers"), "should list Peers");
+    assert!(stdout.contains("View"), "should list View");
+}
+
+#[test]
+fn rpc_methods_json_output() {
+    let out = Command::new(bin())
+        .args(["rpc", "methods", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "rpc methods --json failed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("should be valid JSON");
+    let arr = parsed.as_array().expect("should be an array");
+    assert!(arr.len() >= 25, "should list at least 25 methods, got {}", arr.len());
+    for entry in arr {
+        assert!(entry["name"].is_string(), "method should have name");
+        assert!(entry["purpose"].is_string(), "method should have purpose");
+    }
+}
+
+#[test]
+fn rpc_describe_known_method() {
+    let out = Command::new(bin())
+        .args(["rpc", "describe", "Send"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "rpc describe Send failed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Send:"), "should show method name header");
+    assert!(stdout.contains("content"), "should show content parameter");
+    assert!(stdout.contains("Example:"), "should show example");
+}
+
+#[test]
+fn rpc_describe_json_output() {
+    let out = Command::new(bin())
+        .args(["rpc", "describe", "Send", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "rpc describe --json failed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("should be valid JSON");
+    assert_eq!(parsed["name"].as_str(), Some("Send"));
+    assert!(parsed["params"].is_array(), "should have params array");
+}
+
+#[test]
+fn rpc_describe_unknown_method_fails() {
+    let out = Command::new(bin())
+        .args(["rpc", "describe", "NoSuchMethod"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "should fail for unknown method");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("unknown method"), "should mention unknown method");
+}
+
+#[test]
+fn rpc_describe_case_insensitive() {
+    let out = Command::new(bin())
+        .args(["rpc", "describe", "status"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "rpc describe should be case-insensitive");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Status:"), "should show Status header");
+}
+
+#[test]
+fn rpc_call_method_json_status() {
+    let (_dir, db) = temp_db();
+    let socket = socket_path_for_db(&db);
+
+    create_workspace(&db);
+
+    let _daemon = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
+            .spawn()
+            .unwrap(),
+    );
+
+    wait_for_socket(&socket);
+
+    let out = Command::new(bin())
+        .args([
+            "--db", &db, "rpc", "call",
+            "--method-json", r#"{"type":"Status"}"#,
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "rpc call --method-json Status failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("should be valid JSON");
+    assert!(parsed["ok"].as_bool().unwrap_or(false), "should be ok=true");
+    assert!(parsed["version"].is_number(), "should have version");
+}
+
+#[test]
+fn rpc_call_request_json() {
+    let (_dir, db) = temp_db();
+    let socket = socket_path_for_db(&db);
+
+    create_workspace(&db);
+
+    let _daemon = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
+            .spawn()
+            .unwrap(),
+    );
+
+    wait_for_socket(&socket);
+
+    let out = Command::new(bin())
+        .args([
+            "--db", &db, "rpc", "call",
+            "--request-json", r#"{"version":1,"method":{"type":"Status"}}"#,
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "rpc call --request-json failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("should be valid JSON");
+    assert!(parsed["ok"].as_bool().unwrap_or(false), "should be ok=true");
+}
+
+#[test]
+fn rpc_call_invalid_json_fails() {
+    let (_dir, db) = temp_db();
+
+    let out = Command::new(bin())
+        .args([
+            "--db", &db, "rpc", "call",
+            "--method-json", "not json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!out.status.success(), "should fail on invalid JSON");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("invalid method JSON"),
+        "should mention invalid JSON, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn rpc_call_method_json_missing_type_fails() {
+    let out = Command::new(bin())
+        .args(["rpc", "call", "--method-json", r#"{"bogus":"field"}"#])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "should fail on missing type");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("\"type\" field"),
+        "should mention type field, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn rpc_call_request_json_missing_version_fails() {
+    let out = Command::new(bin())
+        .args(["rpc", "call", "--request-json", r#"{"type":"Status"}"#])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "should fail on missing version");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("\"version\" field"),
+        "should mention version field, got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("--method-json"),
+        "should hint about --method-json, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn rpc_call_no_input_fails() {
+    let out = Command::new(bin())
+        .args(["rpc", "call"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "should fail with no input");
+}
+
+#[test]
+fn catalog_drift_test_method_count_matches_protocol() {
+    let catalog_names = topo::rpc::catalog::method_names();
+
+    let known_methods = vec![
+        "Status", "Messages", "Send", "SendFile", "Generate", "GenerateFiles",
+        "AssertNow", "AssertEventually", "TransportIdentity", "React",
+        "DeleteMessage", "Reactions", "Users", "Keys", "Workspaces",
+        "IntroAttempts", "CreateInvite", "AcceptInvite", "CreateDeviceLink",
+        "AcceptLink", "Ban", "Identity", "Shutdown", "Tenants", "UseTenant",
+        "ActiveTenant", "CreateWorkspace", "Peers", "Upnp", "View",
+    ];
+
+    for method in &known_methods {
+        assert!(
+            catalog_names.contains(method),
+            "catalog missing method: {}",
+            method
+        );
+    }
+    assert_eq!(
+        catalog_names.len(),
+        known_methods.len(),
+        "catalog has {} methods, protocol has {} — drift detected",
+        catalog_names.len(),
+        known_methods.len()
+    );
+}
+
+#[test]
+fn rpc_call_file_input() {
+    let (_dir, db) = temp_db();
+    let socket = socket_path_for_db(&db);
+
+    create_workspace(&db);
+
+    let _daemon = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
+            .spawn()
+            .unwrap(),
+    );
+
+    wait_for_socket(&socket);
+
+    let tmpdir = tempfile::tempdir().unwrap();
+    let file_path = tmpdir.path().join("req.json");
+    std::fs::write(&file_path, r#"{"version":1,"method":{"type":"Status"}}"#).unwrap();
+
+    let out = Command::new(bin())
+        .args([
+            "--db", &db, "rpc", "call",
+            "--file", file_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "rpc call --file failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("should be valid JSON");
+    assert!(parsed["ok"].as_bool().unwrap_or(false), "should be ok=true");
+}
+
+#[test]
+fn rpc_call_stdin_input() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let (_dir, db) = temp_db();
+    let socket = socket_path_for_db(&db);
+
+    create_workspace(&db);
+
+    let _daemon = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
+            .spawn()
+            .unwrap(),
+    );
+
+    wait_for_socket(&socket);
+
+    let mut child = Command::new(bin())
+        .args([
+            "--db", &db, "rpc", "call", "--stdin",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(br#"{"version":1,"method":{"type":"Status"}}"#)
+        .unwrap();
+
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "rpc call --stdin failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("should be valid JSON");
+    assert!(parsed["ok"].as_bool().unwrap_or(false), "should be ok=true");
+}

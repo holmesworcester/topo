@@ -17,8 +17,9 @@ use topo::db::{open_connection, schema::create_tables};
 use topo::event_modules::parse_event;
 use topo::shared::crypto::event_id_to_base64;
 use topo::db_registry::DbRegistry;
-use topo::rpc::client::{rpc_call, RpcClientError};
-use topo::rpc::protocol::RpcMethod;
+use topo::rpc::catalog;
+use topo::rpc::client::{rpc_call, rpc_call_raw, RpcClientError};
+use topo::rpc::protocol::{RpcMethod, PROTOCOL_VERSION};
 use topo::rpc::server::{run_rpc_server, DaemonState, RuntimeState};
 use topo::service;
 use topo::tuning::{apply_low_mem_allocator_tuning, low_mem_mode};
@@ -440,9 +441,48 @@ enum Commands {
         sub: String,
     },
 
+    /// Raw RPC demo surface: list methods, describe parameters, submit raw JSON calls
+    Rpc {
+        #[command(subcommand)]
+        action: RpcAction,
+    },
+
     /// Attempt UPnP port forwarding for the daemon's QUIC listen port.
     /// Requires daemon listening on non-loopback (for example `--bind 0.0.0.0:...`).
     Upnp,
+}
+
+#[derive(Subcommand)]
+enum RpcAction {
+    /// List all available RPC methods
+    Methods {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Describe a specific RPC method and its parameters
+    Describe {
+        /// Method name (case-insensitive)
+        method: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Submit a raw RPC call using JSON
+    Call {
+        /// JSON-encoded RpcMethod (auto-wrapped in request envelope)
+        #[arg(long, group = "input")]
+        method_json: Option<String>,
+        /// JSON-encoded full RpcRequest
+        #[arg(long, group = "input")]
+        request_json: Option<String>,
+        /// Read full RpcRequest JSON from a file
+        #[arg(long, group = "input")]
+        file: Option<String>,
+        /// Read full RpcRequest JSON from stdin
+        #[arg(long, group = "input")]
+        stdin: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -479,6 +519,33 @@ enum DbAction {
 // ---------------------------------------------------------------------------
 // RPC helpers: auto-start daemon for target DB/socket, then call.
 // ---------------------------------------------------------------------------
+
+/// Validate that a JSON value looks like an RpcRequest envelope before sending.
+fn validate_request_envelope(v: &serde_json::Value) {
+    if v.get("version").is_none() {
+        eprintln!("error: request JSON must have a \"version\" field");
+        eprintln!("  Hint: did you mean --method-json? (auto-wraps in {{\"version\":1,\"method\":...}})");
+        eprintln!("  Full request format: {{\"version\":1,\"method\":{{\"type\":\"Status\"}}}}");
+        std::process::exit(1);
+    }
+    if !v["version"].is_number() {
+        eprintln!("error: \"version\" must be a number, got: {}", v["version"]);
+        std::process::exit(1);
+    }
+    if v.get("method").is_none() || v["method"].is_null() {
+        eprintln!("error: request JSON must have a \"method\" field");
+        eprintln!("  Full request format: {{\"version\":1,\"method\":{{\"type\":\"Status\"}}}}");
+        std::process::exit(1);
+    }
+    // Try to deserialize the method portion for better errors.
+    if let Err(e) = serde_json::from_value::<RpcMethod>(v["method"].clone()) {
+        eprintln!("error: invalid method in request: {}", e);
+        if let Some(type_name) = v["method"].get("type").and_then(|t| t.as_str()) {
+            eprintln!("  Hint: run `topo rpc describe {}` to see required parameters", type_name);
+        }
+        std::process::exit(1);
+    }
+}
 
 fn target_socket_path(db: &str, socket: Option<&str>) -> PathBuf {
     socket
@@ -1713,6 +1780,163 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             )?;
             println!("Subscription enabled.");
         }
+
+        // ---------------------------------------------------------------
+        // RPC demo surface
+        // ---------------------------------------------------------------
+        Commands::Rpc { action } => match action {
+            RpcAction::Methods { json } => {
+                let methods = catalog::all_methods();
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&methods).unwrap()
+                    );
+                } else {
+                    println!("RPC METHODS ({}):\n", methods.len());
+                    for m in methods {
+                        println!("  {:<22} {}", m.name, m.purpose);
+                    }
+                }
+            }
+            RpcAction::Describe { method, json } => {
+                let method = method.trim();
+                match catalog::describe(method) {
+                    Some(info) => {
+                        if json {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&info).unwrap()
+                            );
+                        } else {
+                            println!("{}:", info.name);
+                            println!("  {}\n", info.purpose);
+                            if info.params.is_empty() {
+                                println!("  Parameters: (none)");
+                            } else {
+                                println!("  Parameters:");
+                                for p in info.params {
+                                    let req = if p.required { "required" } else { "optional" };
+                                    let default = match p.default {
+                                        Some(d) => format!(", default={}", d),
+                                        None => String::new(),
+                                    };
+                                    println!(
+                                        "    {:<20} {} ({}{})",
+                                        p.name, p.param_type, req, default
+                                    );
+                                }
+                            }
+                            println!("\n  Example:");
+                            println!("    {}", info.example_json);
+                        }
+                    }
+                    None => {
+                        eprintln!("error: unknown method {:?}", method);
+                        eprintln!("  Run `topo rpc methods` to see available methods.");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            RpcAction::Call {
+                method_json,
+                request_json,
+                file,
+                stdin,
+            } => {
+                let sock = target_socket_path(db, socket_override.as_deref());
+
+                // Parse the input into a JSON value representing a full RpcRequest.
+                let request_value: serde_json::Value = if let Some(mj) = method_json {
+                    // method_json: parse as RpcMethod, wrap in request envelope.
+                    // Pre-validate by deserializing as RpcMethod — gives specific
+                    // serde errors (missing field, wrong type, unknown variant)
+                    // instead of a generic "daemon closed connection" later.
+                    let _method: RpcMethod = serde_json::from_str(&mj).map_err(|e| {
+                        eprintln!("error: invalid method JSON: {}", e);
+                        if let Some(type_name) = serde_json::from_str::<serde_json::Value>(&mj)
+                            .ok()
+                            .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(String::from))
+                        {
+                            eprintln!("  Hint: run `topo rpc describe {}` to see required parameters", type_name);
+                        } else {
+                            eprintln!("  Hint: method JSON must have a \"type\" field (e.g. {{\"type\":\"Status\"}})");
+                        }
+                        std::process::exit(1);
+                    }).unwrap();
+                    let method_val: serde_json::Value =
+                        serde_json::from_str(&mj).unwrap();
+                    serde_json::json!({
+                        "version": PROTOCOL_VERSION,
+                        "method": method_val
+                    })
+                } else if let Some(rj) = request_json {
+                    let v: serde_json::Value = serde_json::from_str(&rj).map_err(|e| {
+                        eprintln!("error: invalid request JSON: {}", e);
+                        std::process::exit(1);
+                    }).unwrap();
+                    validate_request_envelope(&v);
+                    v
+                } else if let Some(path) = file {
+                    let contents = std::fs::read_to_string(&path).map_err(|e| {
+                        eprintln!("error: cannot read file {:?}: {}", path, e);
+                        std::process::exit(1);
+                    }).unwrap();
+                    let v: serde_json::Value = serde_json::from_str(&contents).map_err(|e| {
+                        eprintln!("error: invalid JSON in file {:?}: {}", path, e);
+                        std::process::exit(1);
+                    }).unwrap();
+                    validate_request_envelope(&v);
+                    v
+                } else if stdin {
+                    let mut buf = String::new();
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf).map_err(|e| {
+                        eprintln!("error: failed to read stdin: {}", e);
+                        std::process::exit(1);
+                    }).unwrap();
+                    let v: serde_json::Value = serde_json::from_str(&buf).map_err(|e| {
+                        eprintln!("error: invalid JSON from stdin: {}", e);
+                        std::process::exit(1);
+                    }).unwrap();
+                    validate_request_envelope(&v);
+                    v
+                } else {
+                    eprintln!("error: specify one of --method-json, --request-json, --file, or --stdin");
+                    std::process::exit(1);
+                };
+
+                match rpc_call_raw(&sock, &request_value) {
+                    Ok(resp) => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&resp).unwrap()
+                        );
+                        if !resp.ok {
+                            std::process::exit(1);
+                        }
+                    }
+                    Err(RpcClientError::DaemonNotRunning(_)) => {
+                        eprintln!(
+                            "daemon is not running for {} — start it with: topo --db {} start",
+                            db, db
+                        );
+                        std::process::exit(1);
+                    }
+                    Err(RpcClientError::Protocol(msg))
+                        if msg.contains("fill whole buffer") || msg.contains("unexpected eof") =>
+                    {
+                        eprintln!("error: daemon closed connection — the request JSON was likely malformed or unrecognized");
+                        eprintln!("  Hint: use --method-json for method-only JSON (auto-wraps in request envelope)");
+                        eprintln!("  Hint: use --request-json for full {{\"version\":1,\"method\":...}} envelopes");
+                        std::process::exit(1);
+                    }
+                    Err(e) => {
+                        eprintln!("error: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+        },
 
         Commands::Upnp => {
             let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::Upnp)?;

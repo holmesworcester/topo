@@ -9,18 +9,7 @@ use crate::rpc::protocol::*;
 
 /// Send an RPC request to the daemon and return the response.
 pub fn rpc_call(socket_path: &Path, method: RpcMethod) -> Result<RpcResponse, RpcClientError> {
-    let mut stream = UnixStream::connect(socket_path).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound
-            || e.kind() == std::io::ErrorKind::ConnectionRefused
-        {
-            RpcClientError::DaemonNotRunning(socket_path.display().to_string())
-        } else {
-            RpcClientError::Io(e)
-        }
-    })?;
-
-    stream.set_read_timeout(Some(Duration::from_secs(120)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+    let mut stream = connect_stream(socket_path)?;
 
     let req = RpcRequest {
         version: PROTOCOL_VERSION,
@@ -33,6 +22,40 @@ pub fn rpc_call(socket_path: &Path, method: RpcMethod) -> Result<RpcResponse, Rp
     let resp: RpcResponse =
         decode_frame(&mut stream).map_err(|e| RpcClientError::Protocol(e.to_string()))?;
     Ok(resp)
+}
+
+/// Send a pre-built RPC request (as raw JSON value) and return the response.
+/// Used by `topo rpc call` to send arbitrary JSON payloads.
+pub fn rpc_call_raw(
+    socket_path: &Path,
+    request: &serde_json::Value,
+) -> Result<RpcResponse, RpcClientError> {
+    let mut stream = connect_stream(socket_path)?;
+
+    let frame = encode_frame(request).map_err(RpcClientError::Json)?;
+    stream.write_all(&frame)?;
+    stream.flush()?;
+
+    let resp: RpcResponse =
+        decode_frame(&mut stream).map_err(|e| RpcClientError::Protocol(e.to_string()))?;
+    Ok(resp)
+}
+
+fn connect_stream(socket_path: &Path) -> Result<UnixStream, RpcClientError> {
+    let stream = UnixStream::connect(socket_path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound
+            || e.kind() == std::io::ErrorKind::ConnectionRefused
+        {
+            RpcClientError::DaemonNotRunning(socket_path.display().to_string())
+        } else {
+            RpcClientError::Io(e)
+        }
+    })?;
+
+    stream.set_read_timeout(Some(Duration::from_secs(120)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+
+    Ok(stream)
 }
 
 #[derive(Debug)]
