@@ -70,7 +70,7 @@ This mirrors `event_id_or_blocked` but is owned by the service layer. It convert
 | Line | Function | API call | Blocked handling | Notes |
 |---|---|---|---|---|
 | 92 | `bootstrap_identity_chain` | `create_event_staged(...)` | **OK** | Workspace — intentional pre-trust-anchor staging |
-| 105 | `bootstrap_identity_chain` | `create_signed_event_staged(...)` | **OK** | UserInviteBoot — intentional pre-trust-anchor staging |
+| 105 | `bootstrap_identity_chain` | `create_signed_event_staged(...)` | **OK** | UserInvite — intentional pre-trust-anchor staging |
 | 119 | `bootstrap_identity_chain` | `create_event_synchronous(...)` | **Err** | InviteAccepted — trust anchor, must succeed |
 | 131,148,165,183 | `bootstrap_identity_chain` | `create_signed_event_synchronous(...)` | **Err** | Post-cascade events — must succeed |
 | 236 | `create_user_invite` | `create_signed_event_synchronous(...)` | **Err** | |

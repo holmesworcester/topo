@@ -15,19 +15,20 @@ Changes to this document require TLA+ model re-verification.
 | 7 | MessageDeletion | MessageDeletion | 170B | Shared | Yes | Yes | 64 | runtime (1..5) |
 | 8 | Workspace | Workspace | 73B | Shared | No | No | 0 | — |
 | 9 | InviteAccepted | InviteAccepted | 73B | Local | No | No | 0 | — |
-| 10 | UserInviteBoot | UserInviteBoot | 170B | Shared | No | Yes | 64 | 1 (workspace) |
-| 11 | UserInviteOngoing | UserInviteOngoing | 170B | Shared | No | Yes | 64 | 5 (peer_shared) |
-| 12 | DeviceInviteFirst | DeviceInviteFirst | 138B | Shared | No | Yes | 64 | 4 (user) |
-| 13 | DeviceInviteOngoing | DeviceInviteOngoing | 138B | Shared | No | Yes | 64 | 5 (peer_shared) |
-| 14 | UserBoot | UserBoot | 138B | Shared | No | Yes | 64 | 2 (user_invite) |
-| 15 | UserOngoing | UserOngoing | 138B | Shared | No | Yes | 64 | 2 (user_invite) |
-| 16 | PeerSharedFirst | PeerSharedFirst | 138B | Shared | No | Yes | 64 | 3 (device_invite) |
-| 17 | PeerSharedOngoing | PeerSharedOngoing | 138B | Shared | No | Yes | 64 | 3 (device_invite) |
-| 18 | AdminBoot | AdminBoot | 170B | Shared | No | Yes | 64 | 1 (workspace) |
-| 19 | AdminOngoing | AdminOngoing | 170B | Shared | No | Yes | 64 | 5 (peer_shared) |
+| 10 | UserInvite | UserInvite | 170B | Shared | No | Yes | 64 | 1 (workspace) |
+| 11 | Retired (code reserved) | — | — | — | — | — | — | — |
+| 12 | DeviceInvite | DeviceInvite | 138B | Shared | No | Yes | 64 | 4 (user) |
+| 13 | Retired (code reserved) | — | — | — | — | — | — | — |
+| 14 | User | User | 138B | Shared | No | Yes | 64 | 2 (user_invite) |
+| 15 | Retired (code reserved) | — | — | — | — | — | — | — |
+| 16 | PeerShared | PeerShared | 138B | Shared | No | Yes | 64 | 3 (device_invite) |
+| 17 | Retired (code reserved) | — | — | — | — | — | — | — |
+| 18 | Admin | Admin | 170B | Shared | No | Yes | 64 | 1 (workspace) |
+| 19 | Retired (code reserved) | — | — | — | — | — | — | — |
 | 20 | UserRemoved | UserRemoved | 138B | Shared | No | Yes | 64 | 5 (peer_shared) |
 | 21 | PeerRemoved | PeerRemoved | 138B | Shared | No | Yes | 64 | 5 (peer_shared) |
 | 22 | SecretShared | SecretShared | 202B | Shared | No | Yes | 64 | 5 (peer_shared) |
+| 23 | Retired (code reserved) | — | — | — | — | — | — | — |
 | 24 | MessageAttachment | — | 633B | Shared | Yes | Yes | 64 | runtime (1..5) |
 | 25 | FileSlice | — | 262286B | Shared | Yes | Yes | 64 | runtime (1..5) |
 | 26 | BenchDep | — | 345B | Shared | No | No | 0 | — |
@@ -38,10 +39,10 @@ Changes to this document require TLA+ model re-verification.
 | signer_type | Resolves From | Valid Event Type Codes | Key Extraction |
 |-------------|--------------|------------------------|----------------|
 | 1 | Workspace | 8 | public_key at [9..41] |
-| 2 | UserInvite (Boot/Ongoing) | 10, 11 | public_key at [9..41] |
-| 3 | DeviceInvite (First/Ongoing) | 12, 13 | public_key at [9..41] |
-| 4 | User (Boot/Ongoing) | 14, 15 | public_key at [9..41] |
-| 5 | PeerShared (First/Ongoing) | 16, 17 | public_key at [9..41] |
+| 2 | UserInvite | 10 | public_key at [9..41] |
+| 3 | DeviceInvite | 12 | public_key at [9..41] |
+| 4 | User | 14 | public_key at [9..41] |
+| 5 | PeerShared | 16 | public_key at [9..41] |
 
 ## Dependencies (TLA+ RawDeps → Rust dep_field_values)
 
@@ -49,27 +50,27 @@ Changes to this document require TLA+ model re-verification.
 |------|-------------|-----------------|
 | 1 | {signed_by} | [signed_by] |
 | 2 | {target_event_id, signed_by} | [target_event_id, signed_by] |
-| 3 | {} | [] |
-| 4 | {signed_by} | [signed_by] |
+| 3 | retired (code reserved) | [] |
+| 4 | retired (code reserved) | [] |
 | 5 | {key_event_id} | [key_event_id] |
 | 6 | {} | [] |
 | 7 | {target_event_id, signed_by} | [target_event_id, signed_by] |
 | 8 | {} | [] |
 | 9 | {} | [] |
 | 10 | {signed_by} | [signed_by] (workspace_id is reference, not dep) |
-| 11 | {admin_event_id, signed_by} | [admin_event_id, signed_by] |
+| 11 | retired (code reserved) | [] |
 | 12 | {signed_by} | [signed_by] |
-| 13 | {signed_by} | [signed_by] |
+| 13 | retired (code reserved) | [] |
 | 14 | {signed_by} | [signed_by] |
-| 15 | {signed_by} | [signed_by] |
+| 15 | retired (code reserved) | [] |
 | 16 | {user_event_id, signed_by} | [user_event_id, signed_by] |
-| 17 | {user_event_id, signed_by} | [user_event_id, signed_by] |
+| 17 | retired (code reserved) | [] |
 | 18 | {user_event_id, signed_by} | [user_event_id, signed_by] |
-| 19 | {admin_boot_event_id, signed_by} | [admin_boot_event_id, signed_by] |
+| 19 | retired (code reserved) | [] |
 | 20 | {target_event_id, signed_by} | [target_event_id, signed_by] |
 | 21 | {target_event_id, signed_by} | [target_event_id, signed_by] |
 | 22 | {recipient_event_id, signed_by} | [recipient_event_id, signed_by] (key_event_id is a hint, validated at materialization) |
-| 23 | {signed_by} | [signed_by] |
+| 23 | retired (code reserved) | [] |
 | 24 | {message_id, key_event_id, signed_by} | [message_id, key_event_id, signed_by] |
 | 25 | {signed_by} | [signed_by] |
 | 26 | {dep_id × 10 slots} | [dep_id × non-zero slots] |
@@ -95,18 +96,19 @@ Changes to this document require TLA+ model re-verification.
 | 8 | project_workspace | workspaces | TrustAnchorMatch guard |
 | 9 | project_invite_accepted | invite_accepted | writes trust_anchors (first-write-wins immutable); emits WriteAcceptedBootstrapTrust |
 | 10 | project_user_invite | user_invites | emits WritePendingBootstrapTrust (gated by is_local_create) |
-| 11 | project_user_invite | user_invites | — |
+| 11 | retired (code reserved) | — | rejected as unknown type |
 | 12 | project_device_invite | device_invites | emits WritePendingBootstrapTrust (gated by is_local_create) |
-| 13 | project_device_invite | device_invites | — |
+| 13 | retired (code reserved) | — | rejected as unknown type |
 | 14 | project_user | users | — |
-| 15 | project_user | users | — |
+| 15 | retired (code reserved) | — | rejected as unknown type |
 | 16 | project_peer_shared | peers_shared | emits SupersedeBootstrapTrust |
-| 17 | project_peer_shared | peers_shared | emits SupersedeBootstrapTrust |
+| 17 | retired (code reserved) | — | rejected as unknown type |
 | 18 | project_admin | admins | — |
-| 19 | project_admin | admins | — |
+| 19 | retired (code reserved) | — | rejected as unknown type |
 | 20 | project_user_removed | removed_entities | — |
 | 21 | project_peer_removed | removed_entities | — |
 | 22 | project_secret_shared | secret_shared | bootstrap: wrap to invite key; runtime: wrap to PeerShared key |
+| 23 | retired (code reserved) | — | rejected as unknown type |
 | 24 | project_message_attachment | message_attachments | — |
 | 25 | project_file_slice | file_slices | signature verification |
 | 26 | (none) | valid_events | dependency benchmark event; no projection table side effects |
@@ -162,7 +164,7 @@ InviteAccepted (9):  type_code(1) | created_at_ms(8) | invite_event_id(32) | wor
 ```
 type_code(1) | created_at_ms(8) | public_key_or_target(32) | signed_by(32) | signer_type(1) | signature(64)  = 138B
 ```
-- Types 12-15: field at [9..41] is public_key
+- Types 12, 14: field at [9..41] is public_key
 - Types 20-21: field at [9..41] is target_event_id
 
 ### 170B signed (UserInvite, PeerShared, Admin)
@@ -170,10 +172,8 @@ type_code(1) | created_at_ms(8) | public_key_or_target(32) | signed_by(32) | sig
 type_code(1) | created_at_ms(8) | public_key(32) | extra_dep_id(32) | signed_by(32) | signer_type(1) | signature(64)  = 170B
 ```
 - Type 10: extra_dep_id = workspace_id (reference, not a dep)
-- Type 11: extra_dep_id = admin_event_id (dep)
-- Types 16-17: extra_dep_id = user_event_id (dep, UserBoot or UserOngoing)
+- Type 16: extra_dep_id = user_event_id (dep, User)
 - Type 18: extra_dep_id = user_event_id (dep)
-- Type 19: extra_dep_id = admin_boot_event_id (dep)
 
 ### 202B signed (SecretShared)
 ```
@@ -281,9 +281,9 @@ The following parser-level canonicalization guarantees are enforced in Rust but 
 | InvPeerSharedTrustMatchesCarried | PeerShared-derived trust identity matches event-derived peer identity |
 | InvPendingBootstrapTrustConsumedByPeerShared | pending bootstrap trust is consumed when equivalent PeerShared-derived trust appears |
 | InvTrustedPeerSetMembers | `TrustedPeerSet` members come only from PeerShared-derived SPKIs, bootstrap trust, or pending bootstrap trust |
-| InvUserInviteChain | test_bootstrap_sequence: UserBoot requires UserInviteBoot valid |
-| InvDeviceInviteChain | test_bootstrap_sequence: PeerSharedFirst requires DeviceInviteFirst valid |
-| InvAdminChain | test_bootstrap_sequence: AdminOngoing requires AdminBoot valid |
+| InvUserInviteChain | test_bootstrap_sequence: User requires UserInvite valid |
+| InvDeviceInviteChain | test_bootstrap_sequence: PeerShared requires DeviceInvite valid |
+| InvAdminChain | test_bootstrap_sequence: Admin requires User valid |
 | InvForeignWorkspaceExcluded | test_foreign_workspace_excluded |
 | InvRemovalAdmin | test_removal_enforcement: removal requires admin context |
 | InvAllValidRequireWorkspace | test_bootstrap_sequence: non-local events require workspace valid |
@@ -298,7 +298,7 @@ The following parser-level canonicalization guarantees are enforced in Rust but 
 
 When a joiner accepts an invite, the acceptance path unwraps bootstrap content-key material (from the invite link) and materializes local `secret_key` events with deterministic event IDs. The deterministic ID derivation (BLAKE2b of key bytes → `created_at_ms`) ensures that both inviter and joiner produce matching `key_event_id` values without out-of-band coordination. This enables encrypted events referencing those keys to unblock via normal cascade after key materialization.
 
-The TLA model does not distinguish bootstrap vs runtime SecretShared structurally — both use the same event type with identical dependency semantics ({PeerSharedOngoing}). The `key_event_id` field is a hint validated at materialization time, not a hard dependency. The bootstrap/runtime distinction is a key-source detail below the model's abstraction boundary.
+The TLA model does not distinguish bootstrap vs runtime SecretShared structurally — both use the same event type with identical dependency semantics ({PeerShared}). The `key_event_id` field is a hint validated at materialization time, not a hard dependency. The bootstrap/runtime distinction is a key-source detail below the model's abstraction boundary.
 
 ## Transport Credential Lifecycle (TransportCredentialLifecycle.tla)
 
@@ -417,7 +417,7 @@ counterexample shows Bob (joiner) materializing pending trust for Alice's (invit
 
 Rust mapping: `is_local_create` field in `ContextSnapshot` (populated from
 `recorded_events.source`) gates `WritePendingBootstrapTrust` emission in
-UserInviteBoot and DeviceInviteFirst projectors.
+UserInvite and DeviceInvite projectors.
 
 ### UnifiedBridge integration checks (2026-02-28)
 

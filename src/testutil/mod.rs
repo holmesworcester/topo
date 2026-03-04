@@ -37,10 +37,10 @@ impl Drop for DaemonGuard {
 use crate::crypto::{event_id_to_base64, EventId};
 use crate::db::{open_connection, schema::create_tables, store::insert_recorded_event};
 use crate::event_modules::{
-    AdminBootEvent, DeviceInviteFirstEvent, FileSliceEvent, InviteAcceptedEvent,
+    AdminEvent, DeviceInviteEvent, FileSliceEvent, InviteAcceptedEvent,
     MessageAttachmentEvent, MessageDeletionEvent, MessageEvent, ParsedEvent, PeerRemovedEvent,
-    PeerSharedFirstEvent, ReactionEvent, SecretKeyEvent, SecretSharedEvent, UserBootEvent,
-    UserInviteBootEvent, UserInviteOngoingEvent, UserRemovedEvent, WorkspaceEvent,
+    PeerSharedEvent, ReactionEvent, SecretKeyEvent, SecretSharedEvent, UserEvent,
+    UserInviteEvent, UserRemovedEvent, WorkspaceEvent,
 };
 use crate::peering::loops::{
     accept_loop, connect_loop, connect_loop_with_shared_ingest,
@@ -184,8 +184,8 @@ impl Peer {
     }
 
     /// Create a new peer with a full identity chain via the production
-    /// `create_workspace` flow (Workspace → InviteAccepted → UserInviteBoot →
-    /// UserBoot → DeviceInviteFirst → PeerSharedFirst + local signer secrets).
+    /// `create_workspace` flow (Workspace → InviteAccepted → UserInvite →
+    /// User → DeviceInvite → PeerShared + local signer secrets).
     /// Content events (Message, Reaction, etc.) are signed with the PeerShared key.
     pub fn new_with_identity(name: &str) -> Self {
         let mut peer = Self::new(name);
@@ -597,8 +597,8 @@ impl Peer {
         create_event_synchronous(&db, &self.identity, &ia)
     }
 
-    /// Create a UserInviteBoot event (signed by workspace key). Returns the event ID.
-    pub fn create_user_invite_boot(
+    /// Create a UserInvite event (signed by workspace key). Returns the event ID.
+    pub fn create_user_invite(
         &self,
         signing_key: &ed25519_dalek::SigningKey,
         workspace_id: &EventId,
@@ -607,7 +607,7 @@ impl Peer {
         let public_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng())
             .verifying_key()
             .to_bytes();
-        let evt = ParsedEvent::UserInviteBoot(UserInviteBootEvent {
+        let evt = ParsedEvent::UserInvite(UserInviteEvent {
             created_at_ms: current_timestamp_ms(),
             public_key,
             workspace_id: *workspace_id,
@@ -616,18 +616,18 @@ impl Peer {
             signature: [0u8; 64],
         });
         create_signed_event_staged(&db, &self.identity, &evt, signing_key)
-            .expect("failed to create user_invite_boot")
+            .expect("failed to create user_invite")
     }
 
-    /// Create a UserInviteBoot with a specific public key. Returns the event ID.
-    pub fn create_user_invite_boot_with_key(
+    /// Create a UserInvite with a specific public key. Returns the event ID.
+    pub fn create_user_invite_with_key(
         &self,
         invite_public_key: [u8; 32],
         signing_key: &ed25519_dalek::SigningKey,
         workspace_id: &EventId,
     ) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
-        let evt = ParsedEvent::UserInviteBoot(UserInviteBootEvent {
+        let evt = ParsedEvent::UserInvite(UserInviteEvent {
             created_at_ms: current_timestamp_ms(),
             public_key: invite_public_key,
             workspace_id: *workspace_id,
@@ -636,40 +636,18 @@ impl Peer {
             signature: [0u8; 64],
         });
         create_signed_event_staged(&db, &self.identity, &evt, signing_key)
-            .expect("failed to create user_invite_boot")
+            .expect("failed to create user_invite")
     }
 
-    /// Create a UserInviteOngoing event (signed by PeerShared key, dep on admin).
-    /// Used when an existing admin invites a new user.
-    pub fn create_user_invite_ongoing(
-        &self,
-        invite_public_key: [u8; 32],
-        signing_key: &ed25519_dalek::SigningKey,
-        peer_shared_event_id: &EventId,
-        admin_event_id: &EventId,
-    ) -> EventId {
-        let db = open_connection(&self.db_path).expect("failed to open db");
-        let evt = ParsedEvent::UserInviteOngoing(UserInviteOngoingEvent {
-            created_at_ms: current_timestamp_ms(),
-            public_key: invite_public_key,
-            admin_event_id: *admin_event_id,
-            signed_by: *peer_shared_event_id,
-            signer_type: 5,
-            signature: [0u8; 64],
-        });
-        create_signed_event_synchronous(&db, &self.identity, &evt, signing_key)
-            .expect("failed to create user_invite_ongoing")
-    }
-
-    /// Create a UserBoot event (signed by UserInvite key). Returns the event ID.
-    pub fn create_user_boot(
+    /// Create a User event (signed by UserInvite key). Returns the event ID.
+    pub fn create_user(
         &self,
         user_public_key: [u8; 32],
         signing_key: &ed25519_dalek::SigningKey,
         user_invite_event_id: &EventId,
     ) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
-        let evt = ParsedEvent::UserBoot(UserBootEvent {
+        let evt = ParsedEvent::User(UserEvent {
             created_at_ms: current_timestamp_ms(),
             public_key: user_public_key,
             username: "test-user".to_string(),
@@ -678,18 +656,18 @@ impl Peer {
             signature: [0u8; 64],
         });
         create_signed_event_staged(&db, &self.identity, &evt, signing_key)
-            .expect("failed to create user_boot")
+            .expect("failed to create user")
     }
 
-    /// Create a DeviceInviteFirst event (signed by User key). Returns the event ID.
-    pub fn create_device_invite_first(
+    /// Create a DeviceInvite event (signed by User key). Returns the event ID.
+    pub fn create_device_invite(
         &self,
         device_invite_public_key: [u8; 32],
         signing_key: &ed25519_dalek::SigningKey,
         user_event_id: &EventId,
     ) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
-        let evt = ParsedEvent::DeviceInviteFirst(DeviceInviteFirstEvent {
+        let evt = ParsedEvent::DeviceInvite(DeviceInviteEvent {
             created_at_ms: current_timestamp_ms(),
             public_key: device_invite_public_key,
             signed_by: *user_event_id,
@@ -697,11 +675,11 @@ impl Peer {
             signature: [0u8; 64],
         });
         create_signed_event_staged(&db, &self.identity, &evt, signing_key)
-            .expect("failed to create device_invite_first")
+            .expect("failed to create device_invite")
     }
 
-    /// Create a PeerSharedFirst event (signed by DeviceInvite key). Returns the event ID.
-    pub fn create_peer_shared_first(
+    /// Create a PeerShared event (signed by DeviceInvite key). Returns the event ID.
+    pub fn create_peer_shared(
         &self,
         peer_shared_public_key: [u8; 32],
         signing_key: &ed25519_dalek::SigningKey,
@@ -709,7 +687,7 @@ impl Peer {
         user_event_id: &EventId,
     ) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
-        let evt = ParsedEvent::PeerSharedFirst(PeerSharedFirstEvent {
+        let evt = ParsedEvent::PeerShared(PeerSharedEvent {
             created_at_ms: current_timestamp_ms(),
             public_key: peer_shared_public_key,
             user_event_id: *user_event_id,
@@ -719,11 +697,11 @@ impl Peer {
             signature: [0u8; 64],
         });
         create_signed_event_staged(&db, &self.identity, &evt, signing_key)
-            .expect("failed to create peer_shared_first")
+            .expect("failed to create peer_shared")
     }
 
-    /// Create an AdminBoot event (signed by Workspace key, dep on User). Returns the event ID.
-    pub fn create_admin_boot(
+    /// Create an Admin event (signed by Workspace key, dep on User). Returns the event ID.
+    pub fn create_admin(
         &self,
         admin_public_key: [u8; 32],
         signing_key: &ed25519_dalek::SigningKey,
@@ -731,7 +709,7 @@ impl Peer {
         workspace_id: &EventId,
     ) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
-        let evt = ParsedEvent::AdminBoot(AdminBootEvent {
+        let evt = ParsedEvent::Admin(AdminEvent {
             created_at_ms: current_timestamp_ms(),
             public_key: admin_public_key,
             user_event_id: *user_event_id,
@@ -740,7 +718,7 @@ impl Peer {
             signature: [0u8; 64],
         });
         create_signed_event_synchronous(&db, &self.identity, &evt, signing_key)
-            .expect("failed to create admin_boot")
+            .expect("failed to create admin")
     }
 
     /// Create a UserRemoved event (signed by PeerShared key — admin). Returns the event ID.
@@ -3002,7 +2980,7 @@ impl SharedDbNode {
         )
         .expect("failed to create user invite");
 
-        // The Workspace and UserInviteBoot events already exist in the shared DB.
+        // The Workspace and UserInvite events already exist in the shared DB.
         // Record them for this new tenant and project (white-box shared-DB prerequisite).
         record_shared_db_events_for_tenant(
             &db,

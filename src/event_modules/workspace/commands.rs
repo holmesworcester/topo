@@ -23,8 +23,8 @@ use crate::event_modules::{
     local_signer_secret::{
         LocalSignerSecretEvent, SIGNER_KIND_PEER_SHARED, SIGNER_KIND_USER, SIGNER_KIND_WORKSPACE,
     },
-    DeviceInviteFirstEvent, InviteAcceptedEvent, ParsedEvent, PeerSharedFirstEvent, UserBootEvent,
-    UserInviteBootEvent, WorkspaceEvent,
+    DeviceInviteEvent, InviteAcceptedEvent, ParsedEvent, PeerSharedEvent, UserEvent,
+    UserInviteEvent, WorkspaceEvent,
 };
 use crate::projection::apply::project_one;
 use crate::projection::create::{
@@ -71,8 +71,8 @@ pub struct CreateWorkspaceResult {
 
 /// Create a new workspace with a full identity chain.
 ///
-/// Creates: Workspace → InviteAccepted (trust anchor) → UserInviteBoot →
-/// UserBoot → DeviceInviteFirst → PeerSharedFirst + local signer secrets +
+/// Creates: Workspace → InviteAccepted (trust anchor) → UserInvite →
+/// User → DeviceInvite → PeerShared + local signer secrets +
 /// content key material.
 ///
 /// Returns the peer_shared event ID and signing key needed for transport
@@ -175,9 +175,9 @@ pub fn create_workspace(
     project_one(db, &derived_peer_id, &ws_eid)
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
 
-    // 3. UserInviteBoot (signed by workspace_key)
+    // 3. UserInvite (signed by workspace_key)
     let invite_key = SigningKey::generate(&mut rng);
-    let uib = ParsedEvent::UserInviteBoot(UserInviteBootEvent {
+    let uib = ParsedEvent::UserInvite(UserInviteEvent {
         created_at_ms: now_ms(),
         public_key: invite_key.verifying_key().to_bytes(),
         workspace_id: ws_eid,
@@ -187,9 +187,9 @@ pub fn create_workspace(
     });
     let uib_eid = create_signed_event_synchronous(db, &derived_peer_id, &uib, &workspace_key)?;
 
-    // 4. UserBoot (signed by invite_key)
+    // 4. User (signed by invite_key)
     let user_key = SigningKey::generate(&mut rng);
-    let ub = ParsedEvent::UserBoot(UserBootEvent {
+    let ub = ParsedEvent::User(UserEvent {
         created_at_ms: now_ms(),
         public_key: user_key.verifying_key().to_bytes(),
         username: username.to_string(),
@@ -199,9 +199,9 @@ pub fn create_workspace(
     });
     let ub_eid = create_signed_event_synchronous(db, &derived_peer_id, &ub, &invite_key)?;
 
-    // 5. DeviceInviteFirst (signed by user_key)
+    // 5. DeviceInvite (signed by user_key)
     let device_invite_key = SigningKey::generate(&mut rng);
-    let dif = ParsedEvent::DeviceInviteFirst(DeviceInviteFirstEvent {
+    let dif = ParsedEvent::DeviceInvite(DeviceInviteEvent {
         created_at_ms: now_ms(),
         public_key: device_invite_key.verifying_key().to_bytes(),
         signed_by: ub_eid,
@@ -210,8 +210,8 @@ pub fn create_workspace(
     });
     let dif_eid = create_signed_event_synchronous(db, &derived_peer_id, &dif, &user_key)?;
 
-    // 6. PeerSharedFirst (signed by device_invite_key; key pre-generated above)
-    let psf = ParsedEvent::PeerSharedFirst(PeerSharedFirstEvent {
+    // 6. PeerShared (signed by device_invite_key; key pre-generated above)
+    let psf = ParsedEvent::PeerShared(PeerSharedEvent {
         created_at_ms: now_ms(),
         public_key: peer_shared_key.verifying_key().to_bytes(),
         user_event_id: ub_eid,
@@ -254,7 +254,7 @@ pub fn create_workspace(
 
 /// Join a workspace by accepting a user invite.
 ///
-/// Creates: InviteAccepted → UserBoot → DeviceInviteFirst → PeerSharedFirst +
+/// Creates: InviteAccepted → User → DeviceInvite → PeerShared +
 /// unwraps bootstrap content key.
 ///
 /// Returns the JoinChain with keys/ids needed by service for transport setup.
@@ -284,11 +284,11 @@ pub fn join_workspace_as_new_user(
     });
     let invite_accepted_event_id = create_event_synchronous(db, recorded_by, &ia_evt)?;
 
-    // 2. UserBoot (signed by invite_key) — may block if invite event not yet synced.
+    // 2. User (signed by invite_key) — may block if invite event not yet synced.
     // Tolerates Blocked: the event is stored and will project via cascade when
     // the invite event arrives.
     let user_key = SigningKey::generate(&mut rng);
-    let ub_evt = ParsedEvent::UserBoot(UserBootEvent {
+    let ub_evt = ParsedEvent::User(UserEvent {
         created_at_ms: now_ms(),
         public_key: user_key.verifying_key().to_bytes(),
         username: username.to_string(),
@@ -303,9 +303,9 @@ pub fn join_workspace_as_new_user(
         invite_key,
     ))?;
 
-    // 3. DeviceInviteFirst (signed by user_key) — may block if UserBoot is blocked.
+    // 3. DeviceInvite (signed by user_key) — may block if User is blocked.
     let device_invite_key = SigningKey::generate(&mut rng);
-    let dif_evt = ParsedEvent::DeviceInviteFirst(DeviceInviteFirstEvent {
+    let dif_evt = ParsedEvent::DeviceInvite(DeviceInviteEvent {
         created_at_ms: now_ms(),
         public_key: device_invite_key.verifying_key().to_bytes(),
         signed_by: user_event_id,
@@ -319,8 +319,8 @@ pub fn join_workspace_as_new_user(
         &user_key,
     ))?;
 
-    // 4. PeerSharedFirst (signed by device_invite_key) — may block.
-    let psf_evt = ParsedEvent::PeerSharedFirst(PeerSharedFirstEvent {
+    // 4. PeerShared (signed by device_invite_key) — may block.
+    let psf_evt = ParsedEvent::PeerShared(PeerSharedEvent {
         created_at_ms: now_ms(),
         public_key: peer_shared_key.verifying_key().to_bytes(),
         user_event_id,
@@ -391,7 +391,7 @@ pub fn persist_join_signer_secrets(
 
 /// Add a new device to an existing workspace by accepting a device link invite.
 ///
-/// Creates: InviteAccepted → PeerSharedFirst.
+/// Creates: InviteAccepted → PeerShared.
 ///
 /// Returns the LinkChain with keys/ids needed by service for transport setup.
 /// Signer secrets are NOT emitted here — call `persist_link_signer_secrets`
@@ -414,10 +414,10 @@ pub fn add_device_to_workspace(
     });
     let invite_accepted_event_id = create_event_synchronous(db, recorded_by, &ia_evt)?;
 
-    // 2. PeerSharedFirst (signed by device_invite_key) — may block if device invite
+    // 2. PeerShared (signed by device_invite_key) — may block if device invite
     // event not yet synced. Tolerates Blocked: the event is stored and will project
     // via cascade when prerequisites arrive.
-    let psf_evt = ParsedEvent::PeerSharedFirst(PeerSharedFirstEvent {
+    let psf_evt = ParsedEvent::PeerShared(PeerSharedEvent {
         created_at_ms: now_ms(),
         public_key: peer_shared_key.verifying_key().to_bytes(),
         user_event_id,
@@ -469,7 +469,7 @@ pub struct InviteResult {
 /// Create a user invite for the workspace.
 ///
 /// Event-domain logic: ensures content key material → creates invite event chain
-/// (UserInviteBoot + optional wrapped content key) → formats invite link.
+/// (UserInvite + optional wrapped content key) → formats invite link.
 pub fn create_user_invite(
     db: &Connection,
     recorded_by: &str,
@@ -510,7 +510,7 @@ pub fn create_user_invite(
 
 /// Create a device-link invite for an existing user.
 ///
-/// Event-domain logic: creates device invite event (DeviceInviteFirst) →
+/// Event-domain logic: creates device invite event (DeviceInvite) →
 /// formats invite link.
 pub fn create_device_link_invite(
     db: &Connection,

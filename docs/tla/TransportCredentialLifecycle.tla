@@ -303,12 +303,12 @@ InvMutualAuthSymmetry ==
 
 \* Inv7: Pending bootstrap trust can only exist on the invite creator's trust store.
 \* This catches the joiner-side pending trust emission bug: if a joiner syncs a
-\* UserInviteBoot event and the projector emits WritePendingBootstrapTrust without
+\* UserInvite event and the projector emits WritePendingBootstrapTrust without
 \* checking is_local_create, the joiner's trust store gets a pending trust row that
 \* should only exist on the inviter side.
 \*
 \* Rust check: is_local_create flag in ContextSnapshot gates WritePendingBootstrapTrust
-\* emission in UserInviteBoot and DeviceInviteFirst projectors.
+\* emission in UserInvite and DeviceInvite projectors.
 InvPendingTrustOnlyOnInviter ==
     \A p \in Peers, s \in SPKIs :
         s \in pendingBootstrapTrust[p] => inviteCreator[s] = p

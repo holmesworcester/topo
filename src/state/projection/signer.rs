@@ -27,11 +27,11 @@ pub fn resolve_signer_key(
 ) -> Result<SignerResolution, Box<dyn std::error::Error>> {
     // Valid type codes for each signer_type
     let valid_type_codes: &[u8] = match signer_type {
-        1 => &[8],      // Workspace
-        2 => &[10, 11], // UserInviteBoot, UserInviteOngoing
-        3 => &[12, 13], // DeviceInviteFirst, DeviceInviteOngoing
-        4 => &[14, 15], // UserBoot, UserOngoing
-        5 => &[16, 17], // PeerSharedFirst, PeerSharedOngoing
+        1 => &[8],  // Workspace
+        2 => &[10], // UserInvite
+        3 => &[12], // DeviceInvite
+        4 => &[14], // User
+        5 => &[16], // PeerShared
         _ => {
             return Ok(SignerResolution::Invalid(format!(
                 "unsupported signer_type: {}",
@@ -84,7 +84,7 @@ mod tests {
         schema::create_tables,
         store::{insert_event, insert_recorded_event},
     };
-    use crate::event_modules::{encode_event, ParsedEvent, PeerSharedFirstEvent};
+    use crate::event_modules::{encode_event, ParsedEvent, PeerSharedEvent};
     use ed25519_dalek::SigningKey;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -169,7 +169,7 @@ mod tests {
         let signing_key = SigningKey::generate(&mut rng);
         let public_key = signing_key.verifying_key().to_bytes();
 
-        let signer_event = ParsedEvent::PeerSharedFirst(PeerSharedFirstEvent {
+        let signer_event = ParsedEvent::PeerShared(PeerSharedEvent {
             created_at_ms: now_ms(),
             public_key,
             user_event_id: [0u8; 32],
@@ -243,7 +243,7 @@ mod tests {
         let signing_key = SigningKey::generate(&mut rng);
         let public_key = signing_key.verifying_key().to_bytes();
 
-        let signer_event = ParsedEvent::PeerSharedFirst(PeerSharedFirstEvent {
+        let signer_event = ParsedEvent::PeerShared(PeerSharedEvent {
             created_at_ms: now_ms(),
             public_key,
             user_event_id: [0u8; 32],

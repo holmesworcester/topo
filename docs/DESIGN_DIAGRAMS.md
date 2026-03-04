@@ -252,14 +252,14 @@ flowchart LR
     subgraph A["Alice (inviter)"]
       A0["A0 Workspace"]
       A1["A1 InviteAccepted (self anchor)"]
-      A2["A2 UserInviteBoot (self)"]
-      A3["A3 UserBoot (alice)"]
-      A4["A4 DeviceInviteFirst (alice-laptop)"]
-      A5["A5 PeerSharedFirst (alice-laptop)"]
-      A6["A6 DeviceInviteFirst (link alice-phone)"]
-      A7["A7 PeerSharedFirst (alice-phone)"]
-      A8["A8 UserInviteBoot (for Bob)"]
-      A9["A9 UserInviteBoot (for Carol)"]
+      A2["A2 UserInvite (self)"]
+      A3["A3 User (alice)"]
+      A4["A4 DeviceInvite (alice-laptop)"]
+      A5["A5 PeerShared (alice-laptop)"]
+      A6["A6 DeviceInvite (link alice-phone)"]
+      A7["A7 PeerShared (alice-phone)"]
+      A8["A8 UserInvite (for Bob)"]
+      A9["A9 UserInvite (for Carol)"]
       A10["A10 SecretShared (content key -> Bob invite)"]
       A11["A11 SecretShared (content key -> Carol invite)"]
     end
@@ -290,8 +290,8 @@ flowchart LR
     CJ --> CUSER
     CJ --> CPSL
 
-    BDI["B DeviceInviteFirst (link bob-phone)"]
-    CDI["C DeviceInviteFirst (link carol-tablet)"]
+    BDI["B DeviceInvite (link bob-phone)"]
+    CDI["C DeviceInvite (link carol-tablet)"]
     BUSER --> BDI
     CUSER --> CDI
 
@@ -325,10 +325,10 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-    INV["UserInviteBoot invite event"] --> IA["InviteAccepted (local trust anchor)"]
-    INV --> UB["UserBoot (signed_by = invite_event_id)"]
-    UB --> DIF["DeviceInviteFirst (signed_by = user_event_id)"]
-    DIF --> PSF["PeerSharedFirst (signed_by = device_invite_event_id)"]
+    INV["UserInvite invite event"] --> IA["InviteAccepted (local trust anchor)"]
+    INV --> UB["User (signed_by = invite_event_id)"]
+    UB --> DIF["DeviceInvite (signed_by = user_event_id)"]
+    DIF --> PSF["PeerShared (signed_by = device_invite_event_id)"]
     UB --> PSF
 
     INV --> SS["SecretShared (recipient_event_id = invite_event_id)"]
@@ -348,9 +348,9 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-    USER["Existing UserBoot"] --> DINV["DeviceInviteFirst link invite"]
+    USER["Existing User"] --> DINV["DeviceInvite link invite"]
     DINV --> IA["InviteAccepted (local trust anchor)"]
-    DINV --> PSF["PeerSharedFirst (new device)"]
+    DINV --> PSF["PeerShared (new device)"]
     USER --> PSF
     PSF --> LSP["LocalSignerSecret (peer_shared)"]
     IA -. guard-unblock / retry .-> PSF

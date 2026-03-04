@@ -19,7 +19,7 @@ Test check:
   - capture happens before projection in sync ingest path: `src/sync/engine.rs:216`.
   - capture logic trusts raw blob type/offset and does `INSERT OR IGNORE` first-write-wins: `src/projection/identity.rs:272`, `src/projection/identity.rs:282`, `src/projection/identity.rs:287`.
 - Impact:
-  - malformed or signature-invalid `user_invite_boot` blobs can still set `invite_network_bindings`.
+  - malformed or signature-invalid `user_invite` blobs can still set `invite_network_bindings`.
   - because first write wins, a poisoned early binding can persist and affect trust-anchor decisions later.
 - Recommended fix:
   - remove `invite_network_bindings` capture from recording path (`src/projection/create.rs:83`, `src/sync/engine.rs:216`) and remove the table if no longer needed.
@@ -54,12 +54,12 @@ Test check:
 ### 4. Medium: “out-of-order identity” scenario test is not actually out-of-order
 
 - Evidence:
-  - test comment says UserBoot is recorded before UserInviteBoot: `tests/scenario_test.rs:1809`.
-  - implementation records `UserInviteBoot` before `UserBoot`: `tests/scenario_test.rs:1833`, `tests/scenario_test.rs:1846`.
+  - test comment says User is recorded before UserInvite: `tests/scenario_test.rs:1809`.
+  - implementation records `UserInvite` before `User`: `tests/scenario_test.rs:1833`, `tests/scenario_test.rs:1846`.
 - Impact:
   - true out-of-order unblock path for this chain is not tested.
 - Recommended fix:
-  - build/store `UserBoot` first via raw insert helper (or explicit helper that allows missing dep), then project invite path and assert unblock.
+  - build/store `User` first via raw insert helper (or explicit helper that allows missing dep), then project invite path and assert unblock.
 
 ### 5. Low: TLA projector spec updates required (plus existing `Encrypted` scope mismatch)
 

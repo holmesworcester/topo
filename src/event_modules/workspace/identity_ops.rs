@@ -334,7 +334,7 @@ pub(crate) fn create_user_invite_events(
     let invite_key = SigningKey::generate(&mut rng);
     let invite_pub = invite_key.verifying_key().to_bytes();
 
-    let evt = ParsedEvent::UserInviteBoot(UserInviteBootEvent {
+    let evt = ParsedEvent::UserInvite(UserInviteEvent {
         created_at_ms: now_ms(),
         public_key: invite_pub,
         workspace_id: *workspace_id,
@@ -385,7 +385,7 @@ pub(crate) fn create_device_link_invite_events(
     let device_invite_key = SigningKey::generate(&mut rng);
     let device_invite_pub = device_invite_key.verifying_key().to_bytes();
 
-    let evt = ParsedEvent::DeviceInviteFirst(DeviceInviteFirstEvent {
+    let evt = ParsedEvent::DeviceInvite(DeviceInviteEvent {
         created_at_ms: now_ms(),
         public_key: device_invite_pub,
         signed_by: *user_event_id,

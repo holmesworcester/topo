@@ -36,40 +36,40 @@ fn bootstrap_peer(peer: &Peer) -> BootstrapChain {
     let workspace_eid = peer.create_workspace(workspace_pubkey);
     let workspace_id = workspace_eid;
 
-    // 2. UserInviteBoot (signed by workspace)
+    // 2. UserInvite (signed by workspace)
     let invite_key = SigningKey::generate(&mut rng);
     let invite_pubkey = invite_key.verifying_key().to_bytes();
     let user_invite_eid =
-        peer.create_user_invite_boot_with_key(invite_pubkey, &workspace_key, &workspace_eid);
+        peer.create_user_invite_with_key(invite_pubkey, &workspace_key, &workspace_eid);
 
     // 3. InviteAccepted (local, binds trust anchor)
     let invite_accepted_eid = peer.create_invite_accepted(&user_invite_eid, workspace_id);
 
-    // 4. UserBoot (signed by user_invite)
+    // 4. User (signed by user_invite)
     let user_key = SigningKey::generate(&mut rng);
     let user_pubkey = user_key.verifying_key().to_bytes();
-    let user_eid = peer.create_user_boot(user_pubkey, &invite_key, &user_invite_eid);
+    let user_eid = peer.create_user(user_pubkey, &invite_key, &user_invite_eid);
 
-    // 5. DeviceInviteFirst (signed by user)
+    // 5. DeviceInvite (signed by user)
     let device_invite_key = SigningKey::generate(&mut rng);
     let device_invite_pubkey = device_invite_key.verifying_key().to_bytes();
     let device_invite_eid =
-        peer.create_device_invite_first(device_invite_pubkey, &user_key, &user_eid);
+        peer.create_device_invite(device_invite_pubkey, &user_key, &user_eid);
 
-    // 6. PeerSharedFirst (signed by device_invite)
+    // 6. PeerShared (signed by device_invite)
     let peer_shared_key = SigningKey::generate(&mut rng);
     let peer_shared_pubkey = peer_shared_key.verifying_key().to_bytes();
-    let peer_shared_eid = peer.create_peer_shared_first(
+    let peer_shared_eid = peer.create_peer_shared(
         peer_shared_pubkey,
         &device_invite_key,
         &device_invite_eid,
         &user_eid,
     );
 
-    // 7. AdminBoot (signed by workspace, dep on user)
+    // 7. Admin (signed by workspace, dep on user)
     let admin_key = SigningKey::generate(&mut rng);
     let admin_pubkey = admin_key.verifying_key().to_bytes();
-    let admin_eid = peer.create_admin_boot(admin_pubkey, &workspace_key, &user_eid, &workspace_eid);
+    let admin_eid = peer.create_admin(admin_pubkey, &workspace_key, &user_eid, &workspace_eid);
 
     BootstrapChain {
         workspace_key,
@@ -90,7 +90,7 @@ fn bootstrap_peer(peer: &Peer) -> BootstrapChain {
 }
 
 /// Helper: bootstrap Bob as a new user joining Alice's workspace.
-/// Alice creates a UserInviteOngoing for Bob, Bob accepts and builds his own chain.
+/// Alice creates a UserInvite for Bob, Bob accepts and builds his own chain.
 /// Returns Bob's BootstrapChain (reuses BootstrapChain struct for consistency).
 #[allow(dead_code)]
 struct JoinChain {
@@ -110,35 +110,34 @@ fn join_workspace(joiner: &Peer, alice_chain: &BootstrapChain, alice: &Peer) -> 
 
     let mut rng = rand::thread_rng();
 
-    // Alice creates a UserInviteOngoing for the joiner (signed by Alice's PeerShared)
+    // Alice creates a UserInvite for the joiner (signed by workspace).
     let invite_key = SigningKey::generate(&mut rng);
     let invite_pubkey = invite_key.verifying_key().to_bytes();
-    let user_invite_eid = alice.create_user_invite_ongoing(
+    let user_invite_eid = alice.create_user_invite_with_key(
         invite_pubkey,
-        &alice_chain.peer_shared_key,
-        &alice_chain.peer_shared_eid,
-        &alice_chain.admin_eid,
+        &alice_chain.workspace_key,
+        &alice_chain.workspace_eid,
     );
 
     // Joiner accepts the invite (local event, binds trust anchor to Alice's workspace_id)
     let invite_accepted_eid =
         joiner.create_invite_accepted(&user_invite_eid, alice_chain.workspace_id);
 
-    // Joiner creates UserBoot (signed by the invite key Alice gave)
+    // Joiner creates User (signed by the invite key Alice gave)
     let user_key = SigningKey::generate(&mut rng);
     let user_pubkey = user_key.verifying_key().to_bytes();
-    let user_eid = joiner.create_user_boot(user_pubkey, &invite_key, &user_invite_eid);
+    let user_eid = joiner.create_user(user_pubkey, &invite_key, &user_invite_eid);
 
-    // Joiner creates DeviceInviteFirst (signed by joiner's user key)
+    // Joiner creates DeviceInvite (signed by joiner's user key)
     let device_invite_key = SigningKey::generate(&mut rng);
     let device_invite_pubkey = device_invite_key.verifying_key().to_bytes();
     let device_invite_eid =
-        joiner.create_device_invite_first(device_invite_pubkey, &user_key, &user_eid);
+        joiner.create_device_invite(device_invite_pubkey, &user_key, &user_eid);
 
-    // Joiner creates PeerSharedFirst (signed by device invite)
+    // Joiner creates PeerShared (signed by device invite)
     let peer_shared_key = SigningKey::generate(&mut rng);
     let peer_shared_pubkey = peer_shared_key.verifying_key().to_bytes();
-    let peer_shared_eid = joiner.create_peer_shared_first(
+    let peer_shared_eid = joiner.create_peer_shared(
         peer_shared_pubkey,
         &device_invite_key,
         &device_invite_eid,
@@ -268,7 +267,7 @@ fn test_bootstrap_sequence() {
 
 #[test]
 fn test_out_of_order_identity() {
-    // Record UserBoot BEFORE UserInviteBoot — UserBoot blocks on missing dep,
+    // Record User BEFORE UserInvite — User blocks on missing dep,
     // then cascades when the full invite chain is created afterward.
     let alice = Peer::new("alice");
     let harness = ScenarioHarness::new();
@@ -279,7 +278,7 @@ fn test_out_of_order_identity() {
     use topo::crypto::hash_event;
     use topo::event_modules::registry;
     use topo::event_modules::{
-        encode_event, ParsedEvent, UserBootEvent, UserInviteBootEvent, WorkspaceEvent,
+        encode_event, ParsedEvent, UserEvent, UserInviteEvent, WorkspaceEvent,
     };
     use topo::projection::apply::project_one;
     use topo::projection::signer::sign_event_bytes;
@@ -308,8 +307,8 @@ fn test_out_of_order_identity() {
     let workspace_eid = hash_event(&net_blob);
     let workspace_id = workspace_eid;
 
-    // Pre-build UserInviteBoot blob (signed by workspace) to get user_invite_eid
-    let mut uib_blob = encode_event(&ParsedEvent::UserInviteBoot(UserInviteBootEvent {
+    // Pre-build UserInvite blob (signed by workspace) to get user_invite_eid
+    let mut uib_blob = encode_event(&ParsedEvent::UserInvite(UserInviteEvent {
         created_at_ms: now_ms + 1,
         public_key: invite_pubkey,
         workspace_id,
@@ -323,8 +322,8 @@ fn test_out_of_order_identity() {
     uib_blob[sig_offset..].copy_from_slice(&sig);
     let user_invite_eid = hash_event(&uib_blob);
 
-    // Build UserBoot blob (signed by invite_key, signed_by = user_invite_eid)
-    let mut ub_blob = encode_event(&ParsedEvent::UserBoot(UserBootEvent {
+    // Build User blob (signed by invite_key, signed_by = user_invite_eid)
+    let mut ub_blob = encode_event(&ParsedEvent::User(UserEvent {
         created_at_ms: now_ms + 2,
         public_key: user_pubkey,
         username: "test-user".to_string(),
@@ -338,7 +337,7 @@ fn test_out_of_order_identity() {
     ub_blob[sig_offset..].copy_from_slice(&sig);
     let user_eid = hash_event(&ub_blob);
 
-    // Insert UserBoot RAW first (truly out-of-order!)
+    // Insert User RAW first (truly out-of-order!)
     let user_b64 = event_id_to_base64(&user_eid);
     let ub_meta = reg.lookup(ub_blob[0]).unwrap();
     db.execute(
@@ -351,14 +350,14 @@ fn test_out_of_order_identity() {
         rusqlite::params![&alice.identity, &user_b64, now_ms as i64],
     ).unwrap();
 
-    // Project UserBoot — should Block (signed_by dep user_invite_eid not valid)
+    // Project User — should Block (signed_by dep user_invite_eid not valid)
     let result = project_one(&db, &alice.identity, &user_eid).unwrap();
     assert!(
         matches!(
             result,
             topo::projection::decision::ProjectionDecision::Block { .. }
         ),
-        "UserBoot should block when UserInviteBoot is not yet present, got {:?}",
+        "User should block when UserInvite is not yet present, got {:?}",
         result,
     );
     let valid_before: bool = db
@@ -370,7 +369,7 @@ fn test_out_of_order_identity() {
         .unwrap();
     assert!(
         !valid_before,
-        "UserBoot should not be valid before invite chain"
+        "User should not be valid before invite chain"
     );
 
     // Insert Workspace raw + project → Block (no trust anchor yet)
@@ -395,7 +394,7 @@ fn test_out_of_order_identity() {
         net_result,
     );
 
-    // Insert UserInviteBoot raw + project → Block (signed_by = workspace_eid not valid)
+    // Insert UserInvite raw + project → Block (signed_by = workspace_eid not valid)
     let uib_b64 = event_id_to_base64(&user_invite_eid);
     let uib_meta = reg.lookup(uib_blob[0]).unwrap();
     db.execute(
@@ -413,15 +412,15 @@ fn test_out_of_order_identity() {
             uib_result,
             topo::projection::decision::ProjectionDecision::Block { .. }
         ),
-        "UserInviteBoot should block (workspace dep not valid), got {:?}",
+        "UserInvite should block (workspace dep not valid), got {:?}",
         uib_result,
     );
 
     // Create InviteAccepted → sets trust anchor, triggers retry_guard_blocked_events
-    // which re-projects Workspace → Valid → cascades UserInviteBoot → Valid → cascades UserBoot → Valid
+    // which re-projects Workspace → Valid → cascades UserInvite → Valid → cascades User → Valid
     let _ia_eid = alice.create_invite_accepted(&user_invite_eid, workspace_id);
 
-    // Assert full cascade completed — UserBoot should now be valid
+    // Assert full cascade completed — User should now be valid
     let valid_after: bool = db
         .query_row(
             "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
@@ -431,7 +430,7 @@ fn test_out_of_order_identity() {
         .unwrap();
     assert!(
         valid_after,
-        "UserBoot should be valid after cascade from invite chain"
+        "User should be valid after cascade from invite chain"
     );
 
     // Verify intermediate events are also valid
@@ -454,7 +453,7 @@ fn test_out_of_order_identity() {
             |row| row.get(0),
         )
         .unwrap();
-    assert!(uib_valid, "UserInviteBoot should be valid after cascade");
+    assert!(uib_valid, "UserInvite should be valid after cascade");
 
     harness.finish();
 }
@@ -518,10 +517,10 @@ fn test_removal_enforcement() {
     let chain = bootstrap_peer(&alice);
 
     // Create a "Bob" user event to be removed
-    // For simplicity, create a second user_boot (as if Bob joined)
+    // For simplicity, create a second user (as if Bob joined)
     let bob_user_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
     let _bob_user_pubkey = bob_user_key.verifying_key().to_bytes();
-    // We'll create a second UserInviteOngoing for Bob, signed by Alice's PeerShared
+    // We'll create a second UserInvite for Bob, signed by Alice's PeerShared
     let db = open_connection(&alice.db_path).unwrap();
 
     // Alice removes her own user (target = user_eid, signed by peer_shared)
@@ -1158,12 +1157,12 @@ fn test_no_blob_capture_trust_influence() {
     let alice = Peer::new("alice");
     let db = open_connection(&alice.db_path).unwrap();
 
-    // Manually craft a blob that looks like a UserInviteBoot (type 10) with a specific
+    // Manually craft a blob that looks like a UserInvite (type 10) with a specific
     // workspace_id, and insert it directly into the events table (simulating raw ingress).
     // Under old semantics, a pre-projection capture path could influence trust state.
     // Under corrected semantics, this should have no effect.
     let fake_workspace_id: [u8; 32] = [0xAA; 32];
-    let mut fake_blob = vec![10u8]; // type code for UserInviteBoot
+    let mut fake_blob = vec![10u8]; // type code for UserInvite
     fake_blob.extend_from_slice(&[0u8; 40]); // created_at_ms(8) + public_key(32)
     fake_blob.extend_from_slice(&fake_workspace_id); // workspace_id at [41..73]
     fake_blob.extend_from_slice(&[0u8; 97]); // rest of the 170B blob
@@ -1173,7 +1172,7 @@ fn test_no_blob_capture_trust_influence() {
 
     db.execute(
         "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
-         VALUES (?1, 'user_invite_boot', ?2, 'shared', 0, 0)",
+         VALUES (?1, 'user_invite', ?2, 'shared', 0, 0)",
         rusqlite::params![&fake_b64, &fake_blob],
     ).unwrap();
     db.execute(
@@ -1264,9 +1263,9 @@ fn test_true_out_of_order_identity_chain() {
         "workspace event should be valid (trust anchor matches)"
     );
 
-    // Step 3: Create UserInviteBoot (signed by workspace)
+    // Step 3: Create UserInvite (signed by workspace)
     let user_invite_eid =
-        alice.create_user_invite_boot_with_key(invite_pubkey, &workspace_key, &workspace_eid);
+        alice.create_user_invite_with_key(invite_pubkey, &workspace_key, &workspace_eid);
 
     let ui_b64 = event_id_to_base64(&user_invite_eid);
     let ui_valid: bool = db
@@ -1278,13 +1277,13 @@ fn test_true_out_of_order_identity_chain() {
         .unwrap();
     assert!(
         ui_valid,
-        "user_invite_boot should be valid (workspace is valid signer)"
+        "user_invite should be valid (workspace is valid signer)"
     );
 
-    // Step 4: Create UserBoot (signed by invite key)
+    // Step 4: Create User (signed by invite key)
     let user_key = SigningKey::generate(&mut rng);
     let user_pubkey = user_key.verifying_key().to_bytes();
-    let user_eid = alice.create_user_boot(user_pubkey, &invite_key, &user_invite_eid);
+    let user_eid = alice.create_user(user_pubkey, &invite_key, &user_invite_eid);
 
     let user_b64 = event_id_to_base64(&user_eid);
     let user_valid: bool = db
@@ -1294,7 +1293,7 @@ fn test_true_out_of_order_identity_chain() {
             |row| row.get(0),
         )
         .unwrap();
-    assert!(user_valid, "user_boot should be valid after full chain");
+    assert!(user_valid, "user should be valid after full chain");
 
     harness.finish();
 }

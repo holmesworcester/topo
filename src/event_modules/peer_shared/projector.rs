@@ -2,7 +2,7 @@ use super::super::ParsedEvent;
 use crate::crypto::event_id_to_base64;
 use crate::projection::contract::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
 
-/// Pure projector: PeerShared (First or Ongoing) → peers_shared table.
+/// Pure projector: PeerShared -> peers_shared table.
 /// Also consumes bootstrap trust rows matching this peer's transport fingerprint,
 /// so steady-state peer trust naturally supersedes bootstrap trust.
 pub fn project_pure(
@@ -12,8 +12,7 @@ pub fn project_pure(
     _ctx: &ContextSnapshot,
 ) -> ProjectorResult {
     let (public_key, user_event_id, device_name) = match parsed {
-        ParsedEvent::PeerSharedFirst(p) => (&p.public_key, &p.user_event_id, &p.device_name),
-        ParsedEvent::PeerSharedOngoing(p) => (&p.public_key, &p.user_event_id, &p.device_name),
+        ParsedEvent::PeerShared(p) => (&p.public_key, &p.user_event_id, &p.device_name),
         _ => return ProjectorResult::reject("not a peer_shared event".to_string()),
     };
 

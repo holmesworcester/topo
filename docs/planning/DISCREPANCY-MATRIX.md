@@ -154,8 +154,8 @@ Base: `dd3a1f0` (current master)
 
 | Source | Says |
 |--------|------|
-| **DESIGN.md:222** | Bootstrap creates: "Workspace → UserInviteBoot → InviteAccepted → UserBoot → DeviceInviteFirst → PeerSharedFirst → AdminBoot → **TransportKey**" |
-| **DESIGN.md:228** | Accept creates: "InviteAccepted → UserBoot → DeviceInviteFirst → PeerSharedFirst → **TransportKey**" |
+| **DESIGN.md:222** | Bootstrap creates: "Workspace → UserInvite → InviteAccepted → User → DeviceInvite → PeerShared → Admin → **TransportKey**" |
+| **DESIGN.md:228** | Accept creates: "InviteAccepted → User → DeviceInvite → PeerShared → **TransportKey**" |
 
 **Discrepancy**: Bootstrap chain ends with TransportKey event creation. If transport identity is now derived from PeerShared, TransportKey may be vestigial in the bootstrap chain.
 

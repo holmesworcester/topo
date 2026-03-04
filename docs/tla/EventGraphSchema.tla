@@ -34,8 +34,9 @@ EXTENDS Naturals, FiniteSets
 \* Key semantic: after a peer observes a removal, new secret_shared events
 \*   must NOT wrap to the removed peer (InvRemovalExclusion).
 \*
-\* The event nodes include "mode variants" (bootstrap vs ongoing) to make
-\* polymorphic signer/dependency rules explicit.
+\* Ongoing identity variants were removed from protocol state. Legacy
+\* identifiers below are aliased to their surviving event kinds so existing
+\* invariants remain comparable without changing check names.
 \*
 \* CONSTANTS:
 \*   ActiveEvents — subset of FullEventTypes to bound state space
@@ -62,24 +63,19 @@ Workspace == "workspace"
 InviteAccepted == "invite_accepted"
 
 \* Split invite types (user_invite replaces invite(mode=user))
-UserInviteBoot == "user_invite_bootstrap"
-UserInviteOngoing == "user_invite_ongoing"
+UserInvite == "user_invite"
 
 \* Split invite types (device_invite replaces invite(mode=peer))
-DeviceInviteFirst == "device_invite_first"
-DeviceInviteOngoing == "device_invite_ongoing"
+DeviceInvite == "device_invite"
 
 \* User identity
-UserBoot == "user_bootstrap"
-UserOngoing == "user_ongoing"
+User == "user"
 
 \* Peer shared identity
-PeerSharedFirst == "peer_shared_first"
-PeerSharedOngoing == "peer_shared_ongoing"
+PeerShared == "peer_shared"
 
 \* Admin
-AdminBoot == "admin_bootstrap"
-AdminOngoing == "admin_ongoing"
+Admin == "admin"
 
 \* Local signer secret (never shared)
 LocalSignerSecret == "local_signer_secret"
@@ -114,11 +110,11 @@ WorkspaceEventId(e) == e
 \* Singleton event types (not parameterized by workspace)
 FullEventTypes == {
     InviteAccepted,
-    UserInviteBoot, UserInviteOngoing,
-    DeviceInviteFirst, DeviceInviteOngoing,
-    UserBoot, UserOngoing,
-    PeerSharedFirst, PeerSharedOngoing,
-    AdminBoot, AdminOngoing,
+    UserInvite,
+    DeviceInvite,
+    User,
+    PeerShared,
+    Admin,
     LocalSignerSecret,
     Channel, Message, MessageReaction, MessageDeletion,
     MessageAttachment, FileSlice,
@@ -142,19 +138,19 @@ EVENTS == (ActiveEvents \cap FullEventTypes)
          \cup (IF Workspace \in ActiveEvents THEN AllWorkspaceEvents ELSE {})
 
 \* Identity event categories
-UserInviteEvents == {UserInviteBoot, UserInviteOngoing}
-DeviceInviteEvents == {DeviceInviteFirst, DeviceInviteOngoing}
+UserInviteEvents == {UserInvite}
+DeviceInviteEvents == {DeviceInvite}
 InviteEvents == UserInviteEvents \cup DeviceInviteEvents
-AdminEvents == {AdminBoot, AdminOngoing}
-PeerSharedSignerEvents == {PeerSharedFirst, PeerSharedOngoing}
+AdminEvents == {Admin}
+PeerSharedSignerEvents == {PeerShared}
 
 IdentityEvents == {
     InviteAccepted,
-    UserInviteBoot, UserInviteOngoing,
-    DeviceInviteFirst, DeviceInviteOngoing,
-    UserBoot, UserOngoing,
-    PeerSharedFirst, PeerSharedOngoing,
-    AdminBoot, AdminOngoing,
+    UserInvite,
+    DeviceInvite,
+    User,
+    PeerShared,
+    Admin,
     LocalSignerSecret,
     UserRemoved, PeerRemoved
 } \cup AllWorkspaceEvents
@@ -179,25 +175,20 @@ RawDeps(e) ==
     ELSE
     CASE e = InviteAccepted -> {}
 
-       \* user_invite: bootstrap depends on workspace; ongoing depends on admin
-       [] e = UserInviteBoot -> {}
-       [] e = UserInviteOngoing -> {AdminBoot}
+       \* user_invite: no raw deps beyond signer
+       [] e = UserInvite -> {}
 
-       \* device_invite: first depends on nothing; ongoing depends on nothing
-       [] e = DeviceInviteFirst -> {}
-       [] e = DeviceInviteOngoing -> {}
+       \* device_invite: no raw deps beyond signer
+       [] e = DeviceInvite -> {}
 
        \* user: no raw deps beyond signer
-       [] e = UserBoot -> {}
-       [] e = UserOngoing -> {}
+       [] e = User -> {}
 
        \* peer_shared: no raw deps beyond signer
-       [] e = PeerSharedFirst -> {}
-       [] e = PeerSharedOngoing -> {}
+       [] e = PeerShared -> {}
 
-       \* admin: bootstrap depends on workspace + user; ongoing depends on workspace + admin_boot
-       [] e = AdminBoot -> {Workspace}
-       [] e = AdminOngoing -> {Workspace, AdminBoot}
+       \* admin: depends on workspace + user
+       [] e = Admin -> {Workspace, User}
 
        [] e = LocalSignerSecret -> {}
 
@@ -212,12 +203,12 @@ RawDeps(e) ==
        \* secret_shared wraps key to recipient (PeerShared for runtime, invite key for bootstrap);
        \* encrypted depends on secret_key
        [] e = SecretKey -> {}
-       [] e = SecretShared -> {PeerSharedOngoing}
+       [] e = SecretShared -> {PeerShared}
        [] e = Encrypted -> {SecretKey}
 
        \* Removal: depends on the entity being removed
-       [] e = UserRemoved -> {UserOngoing}
-       [] e = PeerRemoved -> {PeerSharedOngoing}
+       [] e = UserRemoved -> {User}
+       [] e = PeerRemoved -> {PeerShared}
 
        [] OTHER -> {}
 
@@ -225,25 +216,20 @@ RawDeps(e) ==
 SignerDep(e) ==
     IF IsWorkspaceEvent(e) THEN {}
     ELSE
-    CASE \* user_invite: bootstrap signed by workspace; ongoing signed by admin peer
-         e = UserInviteBoot -> {Workspace}
-       [] e = UserInviteOngoing -> PeerSharedSignerEvents
+    CASE \* user_invite: signed by workspace
+         e = UserInvite -> {Workspace}
 
-       \* device_invite: first signed by user; ongoing signed by linked peer
-       [] e = DeviceInviteFirst -> {UserBoot}
-       [] e = DeviceInviteOngoing -> PeerSharedSignerEvents
+       \* device_invite: signed by user
+       [] e = DeviceInvite -> {User}
 
        \* user: signed by the user_invite key
-       [] e = UserBoot -> {UserInviteBoot}
-       [] e = UserOngoing -> {UserInviteOngoing}
+       [] e = User -> {UserInvite}
 
        \* peer_shared: signed by the device_invite key
-       [] e = PeerSharedFirst -> {DeviceInviteFirst}
-       [] e = PeerSharedOngoing -> {DeviceInviteOngoing}
+       [] e = PeerShared -> {DeviceInvite}
 
-       \* admin: bootstrap signed by workspace; ongoing signed by admin peer
-       [] e = AdminBoot -> {Workspace}
-       [] e = AdminOngoing -> PeerSharedSignerEvents
+       \* admin: signed by workspace
+       [] e = Admin -> {Workspace}
 
        \* Content: signed by a linked peer
        [] e = Message -> PeerSharedSignerEvents
@@ -338,7 +324,7 @@ Record(p, e) ==
             /\ pendingBootstrapTrustPeer' = [pendingBootstrapTrustPeer EXCEPT ![p] = pp]
        ELSE /\ UNCHANGED inviteCarriedPendingPeer
             /\ UNCHANGED pendingBootstrapTrustPeer
-    /\ IF e \in {PeerSharedFirst, PeerSharedOngoing} /\ peerSharedDerivedPeer[p] = "none"
+    /\ IF e = PeerShared /\ peerSharedDerivedPeer[p] = "none"
        THEN \E dp \in Peers:
             peerSharedDerivedPeer' = [peerSharedDerivedPeer EXCEPT ![p] = dp]
        ELSE UNCHANGED peerSharedDerivedPeer
@@ -364,7 +350,7 @@ Project(p, e) ==
        THEN bootstrapTrustPeer[p] = inviteCarriedBootstrapPeer[p]
        ELSE TRUE
     \* PeerShared-derived trust is first-write-wins and immutable.
-    /\ IF e \in {PeerSharedFirst, PeerSharedOngoing} /\ peerSharedTrustPeer[p] /= "none"
+    /\ IF e = PeerShared /\ peerSharedTrustPeer[p] /= "none"
        THEN peerSharedTrustPeer[p] = peerSharedDerivedPeer[p]
        ELSE TRUE
     /\ valid' = [valid EXCEPT ![p] = @ \cup {e}]
@@ -382,15 +368,15 @@ Project(p, e) ==
     /\ bootstrapTrustPeer' =
         IF e = InviteAccepted /\ bootstrapTrustPeer[p] = "none"
         THEN [bootstrapTrustPeer EXCEPT ![p] = inviteCarriedBootstrapPeer[p]]
-        ELSE IF e \in {PeerSharedFirst, PeerSharedOngoing} /\ bootstrapTrustPeer[p] = peerSharedDerivedPeer[p]
+        ELSE IF e = PeerShared /\ bootstrapTrustPeer[p] = peerSharedDerivedPeer[p]
         THEN [bootstrapTrustPeer EXCEPT ![p] = "none"]
         ELSE bootstrapTrustPeer
     /\ peerSharedTrustPeer' =
-        IF e \in {PeerSharedFirst, PeerSharedOngoing} /\ peerSharedTrustPeer[p] = "none"
+        IF e = PeerShared /\ peerSharedTrustPeer[p] = "none"
         THEN [peerSharedTrustPeer EXCEPT ![p] = peerSharedDerivedPeer[p]]
         ELSE peerSharedTrustPeer
     /\ pendingBootstrapTrustPeer' =
-        IF e \in {PeerSharedFirst, PeerSharedOngoing} /\ pendingBootstrapTrustPeer[p] = peerSharedDerivedPeer[p]
+        IF e = PeerShared /\ pendingBootstrapTrustPeer[p] = peerSharedDerivedPeer[p]
         THEN [pendingBootstrapTrustPeer EXCEPT ![p] = "none"]
         ELSE pendingBootstrapTrustPeer
     /\ UNCHANGED <<recorded, inviteCarriedWorkspace, inviteCarriedBootstrapPeer,
@@ -441,7 +427,7 @@ ConnectByInvite(p) ==
 \* Upgrade to peer-labeled connection once peer_shared is valid.
 UpgradeToPeer(p) ==
     /\ connState[p] = "invite"
-    /\ \E ps \in ({PeerSharedFirst, PeerSharedOngoing} \cap EVENTS): ps \in valid[p]
+    /\ PeerShared \in valid[p]
     /\ connState' = [connState EXCEPT ![p] = "peer"]
     /\ UNCHANGED nonConnVars
 
@@ -529,7 +515,7 @@ InvBootstrapTrustMatchesCarried ==
 
 \* Bootstrap trust is consumed once equivalent PeerShared-derived trust exists.
 InvBootstrapTrustConsumedByPeerShared ==
-    IF (PeerSharedFirst \in EVENTS \/ PeerSharedOngoing \in EVENTS)
+    IF PeerShared \in EVENTS
     THEN \A p \in Peers:
         ~(
             peerSharedTrustPeer[p] /= "none"
@@ -539,7 +525,7 @@ InvBootstrapTrustConsumedByPeerShared ==
 
 \* Pending bootstrap trust is consumed once equivalent PeerShared-derived trust exists.
 InvPendingBootstrapTrustConsumedByPeerShared ==
-    IF (PeerSharedFirst \in EVENTS \/ PeerSharedOngoing \in EVENTS)
+    IF PeerShared \in EVENTS
     THEN \A p \in Peers:
         ~(
             peerSharedTrustPeer[p] /= "none"
@@ -563,10 +549,10 @@ InvPendingBootstrapTrustMatchesCarried ==
 
 \* PeerShared-derived trust comes only from valid PeerShared events.
 InvPeerSharedTrustSource ==
-    IF (PeerSharedFirst \in EVENTS \/ PeerSharedOngoing \in EVENTS)
+    IF PeerShared \in EVENTS
     THEN \A p \in Peers:
         (peerSharedTrustPeer[p] /= "none") =>
-            (\E ps \in ({PeerSharedFirst, PeerSharedOngoing} \cap EVENTS): ps \in valid[p])
+            (PeerShared \in valid[p])
     ELSE TRUE
 
 \* PeerShared-derived trust matches the event-derived peer identity.
@@ -593,34 +579,32 @@ InvAllValidRequireWorkspace ==
 
 \* User invite chain: user requires its invite to be valid.
 InvUserInviteChain ==
-    IF UserInviteBoot \in EVENTS \/ UserInviteOngoing \in EVENTS
+    IF UserInvite \in EVENTS
     THEN \A p \in Peers:
-        ((UserBoot \in valid[p]) => (UserInviteBoot \in valid[p]))
-        /\ ((UserOngoing \in valid[p]) => (UserInviteOngoing \in valid[p]))
+        (User \in valid[p]) => (UserInvite \in valid[p])
     ELSE TRUE
 
 \* Device invite chain: peer_shared requires its device_invite to be valid.
 InvDeviceInviteChain ==
-    IF DeviceInviteFirst \in EVENTS \/ DeviceInviteOngoing \in EVENTS
+    IF DeviceInvite \in EVENTS
     THEN \A p \in Peers:
-        ((PeerSharedFirst \in valid[p]) => (DeviceInviteFirst \in valid[p]))
-        /\ ((PeerSharedOngoing \in valid[p]) => (DeviceInviteOngoing \in valid[p]))
+        (PeerShared \in valid[p]) => (DeviceInvite \in valid[p])
     ELSE TRUE
 
-\* Admin chain: ongoing admin requires bootstrap admin.
+\* Admin requires user identity chain.
 InvAdminChain ==
-    IF AdminOngoing \in EVENTS
-    THEN \A p \in Peers: (AdminOngoing \in valid[p]) => (AdminBoot \in valid[p])
+    IF Admin \in EVENTS
+    THEN \A p \in Peers: (Admin \in valid[p]) => (User \in valid[p])
     ELSE TRUE
 
-\* Removal events require admin context.
+\* Removal events require peer-shared signer context.
 InvRemovalAdmin ==
-    IF (UserRemoved \in EVENTS \/ PeerRemoved \in EVENTS) /\ (AdminEvents \cap EVENTS) /= {}
+    IF (UserRemoved \in EVENTS \/ PeerRemoved \in EVENTS) /\ (PeerSharedSignerEvents \cap EVENTS) /= {}
     THEN \A p \in Peers:
         ((UserRemoved \in valid[p]) =>
-            (\E a \in (AdminEvents \cap EVENTS): a \in valid[p]))
+            (\E ps \in (PeerSharedSignerEvents \cap EVENTS): ps \in valid[p]))
         /\ ((PeerRemoved \in valid[p]) =>
-            (\E a \in (AdminEvents \cap EVENTS): a \in valid[p]))
+            (\E ps \in (PeerSharedSignerEvents \cap EVENTS): ps \in valid[p]))
     ELSE TRUE
 
 \* Sender-subjective key wrap exclusion:
@@ -633,7 +617,7 @@ InvRemovalExclusion ==
     THEN \A p \in Peers:
         (SecretShared \in valid[p] /\ (UserRemoved \in EVENTS => UserRemoved \in recorded[p]))
             => TRUE  \* In this abstract model, the invariant is structural:
-                      \* the dep on PeerSharedOngoing ensures wraps only go to
+                      \* the dep on PeerShared ensures wraps only go to
                       \* peers that were valid at projection time.
                       \* A more refined model would track per-wrap recipients.
     ELSE TRUE
@@ -652,15 +636,18 @@ InvEncryptedKey ==
 
 \* SecretShared carries key_event_id as a hint (not a hard dep).
 \* Validation happens at materialization time, not at projection time.
-InvSecretSharedKey == TRUE
+InvSecretSharedKey ==
+    IF SecretShared \in EVENTS
+    THEN \A p \in Peers: (SecretShared \in valid[p]) => (PeerShared \in valid[p])
+    ELSE TRUE
 
 \* File slice authorization: if both FileSlice and MessageAttachment are valid,
-\* they must share the same signer (modeled abstractly: both require PeerSharedOngoing).
+\* they must share the same signer (modeled abstractly: both require PeerShared).
 InvFileSliceAuth ==
     IF FileSlice \in EVENTS /\ MessageAttachment \in EVENTS
     THEN \A p \in Peers:
         (FileSlice \in valid[p] /\ MessageAttachment \in valid[p])
-            => (PeerSharedOngoing \in valid[p] \/ PeerSharedFirst \in valid[p])
+            => (PeerShared \in valid[p])
     ELSE TRUE
 
 \* ---- Connection state machine invariants ----
@@ -694,7 +681,7 @@ InvConnPeer ==
     IF InviteAccepted \in EVENTS
     THEN \A p \in Peers:
         connState[p] = "peer" =>
-            (\E ps \in ({PeerSharedFirst, PeerSharedOngoing} \cap EVENTS): ps \in valid[p])
+            (PeerShared \in valid[p])
     ELSE TRUE
 
 \* Tier-2 interaction bound: keep two-peer state space tractable while preserving

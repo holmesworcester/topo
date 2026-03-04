@@ -35,40 +35,40 @@ fn bootstrap_peer(peer: &Peer) -> BootstrapChain {
     let workspace_eid = peer.create_workspace(workspace_pubkey);
     let workspace_id = workspace_eid;
 
-    // 2. UserInviteBoot (signed by workspace)
+    // 2. UserInvite (signed by workspace)
     let invite_key = SigningKey::generate(&mut rng);
     let invite_pubkey = invite_key.verifying_key().to_bytes();
     let user_invite_eid =
-        peer.create_user_invite_boot_with_key(invite_pubkey, &workspace_key, &workspace_eid);
+        peer.create_user_invite_with_key(invite_pubkey, &workspace_key, &workspace_eid);
 
     // 3. InviteAccepted (local, binds trust anchor)
     let invite_accepted_eid = peer.create_invite_accepted(&user_invite_eid, workspace_id);
 
-    // 4. UserBoot (signed by user_invite)
+    // 4. User (signed by user_invite)
     let user_key = SigningKey::generate(&mut rng);
     let user_pubkey = user_key.verifying_key().to_bytes();
-    let user_eid = peer.create_user_boot(user_pubkey, &invite_key, &user_invite_eid);
+    let user_eid = peer.create_user(user_pubkey, &invite_key, &user_invite_eid);
 
-    // 5. DeviceInviteFirst (signed by user)
+    // 5. DeviceInvite (signed by user)
     let device_invite_key = SigningKey::generate(&mut rng);
     let device_invite_pubkey = device_invite_key.verifying_key().to_bytes();
     let device_invite_eid =
-        peer.create_device_invite_first(device_invite_pubkey, &user_key, &user_eid);
+        peer.create_device_invite(device_invite_pubkey, &user_key, &user_eid);
 
-    // 6. PeerSharedFirst (signed by device_invite)
+    // 6. PeerShared (signed by device_invite)
     let peer_shared_key = SigningKey::generate(&mut rng);
     let peer_shared_pubkey = peer_shared_key.verifying_key().to_bytes();
-    let peer_shared_eid = peer.create_peer_shared_first(
+    let peer_shared_eid = peer.create_peer_shared(
         peer_shared_pubkey,
         &device_invite_key,
         &device_invite_eid,
         &user_eid,
     );
 
-    // 7. AdminBoot (signed by workspace, dep on user)
+    // 7. Admin (signed by workspace, dep on user)
     let admin_key = SigningKey::generate(&mut rng);
     let admin_pubkey = admin_key.verifying_key().to_bytes();
-    let admin_eid = peer.create_admin_boot(admin_pubkey, &workspace_key, &user_eid, &workspace_eid);
+    let admin_eid = peer.create_admin(admin_pubkey, &workspace_key, &user_eid, &workspace_eid);
 
     BootstrapChain {
         workspace_key,
@@ -105,35 +105,34 @@ fn join_workspace(joiner: &Peer, alice_chain: &BootstrapChain, alice: &Peer) -> 
 
     let mut rng = rand::thread_rng();
 
-    // Alice creates a UserInviteOngoing for the joiner (signed by Alice's PeerShared)
+    // Alice creates a UserInvite for the joiner (signed by workspace).
     let invite_key = SigningKey::generate(&mut rng);
     let invite_pubkey = invite_key.verifying_key().to_bytes();
-    let user_invite_eid = alice.create_user_invite_ongoing(
+    let user_invite_eid = alice.create_user_invite_with_key(
         invite_pubkey,
-        &alice_chain.peer_shared_key,
-        &alice_chain.peer_shared_eid,
-        &alice_chain.admin_eid,
+        &alice_chain.workspace_key,
+        &alice_chain.workspace_eid,
     );
 
     // Joiner accepts the invite (local event, binds trust anchor to Alice's workspace_id)
     let invite_accepted_eid =
         joiner.create_invite_accepted(&user_invite_eid, alice_chain.workspace_id);
 
-    // Joiner creates UserBoot (signed by the invite key Alice gave)
+    // Joiner creates User (signed by the invite key Alice gave)
     let user_key = SigningKey::generate(&mut rng);
     let user_pubkey = user_key.verifying_key().to_bytes();
-    let user_eid = joiner.create_user_boot(user_pubkey, &invite_key, &user_invite_eid);
+    let user_eid = joiner.create_user(user_pubkey, &invite_key, &user_invite_eid);
 
-    // Joiner creates DeviceInviteFirst (signed by joiner's user key)
+    // Joiner creates DeviceInvite (signed by joiner's user key)
     let device_invite_key = SigningKey::generate(&mut rng);
     let device_invite_pubkey = device_invite_key.verifying_key().to_bytes();
     let device_invite_eid =
-        joiner.create_device_invite_first(device_invite_pubkey, &user_key, &user_eid);
+        joiner.create_device_invite(device_invite_pubkey, &user_key, &user_eid);
 
-    // Joiner creates PeerSharedFirst (signed by device invite)
+    // Joiner creates PeerShared (signed by device invite)
     let peer_shared_key = SigningKey::generate(&mut rng);
     let peer_shared_pubkey = peer_shared_key.verifying_key().to_bytes();
-    let peer_shared_eid = joiner.create_peer_shared_first(
+    let peer_shared_eid = joiner.create_peer_shared(
         peer_shared_pubkey,
         &device_invite_key,
         &device_invite_eid,
@@ -164,7 +163,7 @@ async fn test_two_peer_identity_join_and_sync() {
     // Alice bootstraps her full identity chain
     let alice_chain = bootstrap_peer(&alice);
 
-    // Alice creates a UserInviteOngoing for Bob
+    // Alice creates a UserInvite for Bob
     // Bob needs the invite to exist on Alice's side; sync will deliver it
     let _bob_join = join_workspace(&bob, &alice_chain, &alice);
 
@@ -243,35 +242,34 @@ async fn test_identity_cascade_via_sync() {
     let mut rng = rand::thread_rng();
     let invite_key = ed25519_dalek::SigningKey::generate(&mut rng);
     let invite_pubkey = invite_key.verifying_key().to_bytes();
-    let user_invite_eid = alice.create_user_invite_ongoing(
+    let user_invite_eid = alice.create_user_invite_with_key(
         invite_pubkey,
-        &alice_chain.peer_shared_key,
-        &alice_chain.peer_shared_eid,
-        &alice_chain.admin_eid,
+        &alice_chain.workspace_key,
+        &alice_chain.workspace_eid,
     );
 
     // Bob accepts the invite locally — this sets his trust anchor
     let _ia_eid = bob.create_invite_accepted(&user_invite_eid, alice_chain.workspace_id);
 
-    // Bob creates UserBoot signed by the invite — but the invite event is on
+    // Bob creates User signed by the invite — but the invite event is on
     // Alice's side, not Bob's. So this will block on the signed_by dep.
     let _user_key = ed25519_dalek::SigningKey::generate(&mut rng);
     let user_pubkey = _user_key.verifying_key().to_bytes();
-    let user_eid = bob.create_user_boot(user_pubkey, &invite_key, &user_invite_eid);
+    let user_eid = bob.create_user(user_pubkey, &invite_key, &user_invite_eid);
     let user_eid_b64 = event_id_to_base64(&user_eid);
 
-    // Confirm UserBoot is blocked before sync
+    // Confirm User is blocked before sync
     assert_eq!(
         bob.user_count(),
         0,
-        "Bob's UserBoot should be blocked (missing signer dep)"
+        "Bob's User should be blocked (missing signer dep)"
     );
     assert!(bob.blocked_dep_count() > 0, "Bob should have blocked deps");
 
     // Sync — Alice's events flow to Bob, unblocking the cascade
     let sync = start_peers_pinned(&alice, &bob);
 
-    // Wait for Bob's specific UserBoot event to become valid, not just any user
+    // Wait for Bob's specific User event to become valid, not just any user
     assert_eventually(
         || {
             let db = open_connection(&bob.db_path).unwrap();
@@ -285,7 +283,7 @@ async fn test_identity_cascade_via_sync() {
             valid
         },
         Duration::from_secs(15),
-        "Bob's specific UserBoot should cascade to valid after sync",
+        "Bob's specific User should cascade to valid after sync",
     )
     .await;
 
@@ -357,11 +355,11 @@ async fn test_identity_then_messaging() {
     harness.finish();
 }
 
-/// Alice bootstraps on two devices (Phone and Laptop). Phone creates a DeviceInviteOngoing
-/// for Laptop, Laptop joins with PeerSharedOngoing, both sync and converge.
+/// Alice bootstraps on two devices (Phone and Laptop). Phone creates a DeviceInvite
+/// for Laptop, Laptop joins with PeerShared, both sync and converge.
 #[tokio::test]
 async fn test_device_link_via_sync() {
-    use topo::event_modules::{DeviceInviteOngoingEvent, ParsedEvent, PeerSharedOngoingEvent};
+    use topo::event_modules::{DeviceInviteEvent, ParsedEvent, PeerSharedEvent};
     use topo::projection::create::{create_signed_event_staged, create_signed_event_synchronous};
 
     let phone = Peer::new("phone");
@@ -375,35 +373,35 @@ async fn test_device_link_via_sync() {
     // Phone bootstraps full identity chain
     let phone_chain = bootstrap_peer(&phone);
 
-    // Phone creates a DeviceInviteOngoing for Laptop (signed by Phone's PeerShared key)
+    // Phone creates a DeviceInvite for Laptop (signed by Phone's User key).
     let laptop_di_key = ed25519_dalek::SigningKey::generate(&mut rng);
     let laptop_di_pubkey = laptop_di_key.verifying_key().to_bytes();
     let db = open_connection(&phone.db_path).unwrap();
-    let di_evt = ParsedEvent::DeviceInviteOngoing(DeviceInviteOngoingEvent {
+    let di_evt = ParsedEvent::DeviceInvite(DeviceInviteEvent {
         created_at_ms: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64,
         public_key: laptop_di_pubkey,
-        signed_by: phone_chain.peer_shared_eid,
-        signer_type: 5,
+        signed_by: phone_chain.user_eid,
+        signer_type: 4,
         signature: [0u8; 64],
     });
     let laptop_di_eid =
-        create_signed_event_synchronous(&db, &phone.identity, &di_evt, &phone_chain.peer_shared_key)
-            .expect("create device_invite_ongoing");
+        create_signed_event_synchronous(&db, &phone.identity, &di_evt, &phone_chain.user_key)
+            .expect("create device_invite");
     drop(db);
 
     // Laptop accepts the invite (local, sets trust anchor)
     let _ia_eid = laptop.create_invite_accepted(&laptop_di_eid, phone_chain.workspace_id);
 
-    // Laptop creates PeerSharedOngoing (signed by the device invite key Phone gave).
-    // This will be blocked because the signed_by dep (DeviceInviteOngoing) is on Phone.
+    // Laptop creates PeerShared (signed by the device invite key Phone gave).
+    // This will be blocked because the signed_by dep (DeviceInvite) is on Phone.
     // Use staged API since blocking is expected (dep will arrive via sync).
     let laptop_ps_key = ed25519_dalek::SigningKey::generate(&mut rng);
     let laptop_ps_pubkey = laptop_ps_key.verifying_key().to_bytes();
     let db = open_connection(&laptop.db_path).unwrap();
-    let ps_evt = ParsedEvent::PeerSharedOngoing(PeerSharedOngoingEvent {
+    let ps_evt = ParsedEvent::PeerShared(PeerSharedEvent {
         created_at_ms: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -416,10 +414,10 @@ async fn test_device_link_via_sync() {
         signature: [0u8; 64],
     });
     let _laptop_ps_eid = create_signed_event_staged(&db, &laptop.identity, &ps_evt, &laptop_di_key)
-        .expect("create peer_shared_ongoing");
+        .expect("create peer_shared");
     drop(db);
 
-    // Laptop's PeerSharedOngoing is blocked — signed_by dep (DeviceInviteOngoing) is on Phone
+    // Laptop's PeerShared is blocked — signed_by dep (DeviceInvite) is on Phone
     assert_eq!(
         laptop.peer_shared_count(),
         0,

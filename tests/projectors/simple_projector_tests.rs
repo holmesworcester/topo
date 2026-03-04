@@ -21,12 +21,12 @@ mod tests {
         })
     }
 
-    // ── User (Boot) ──
+    // ── User ──
 
     #[test]
-    fn test_user_boot_valid() {
-        use topo::event_modules::user::{project_pure, UserBootEvent};
-        let parsed = ParsedEvent::UserBoot(UserBootEvent {
+    fn test_user_valid() {
+        use topo::event_modules::user::{project_pure, UserEvent};
+        let parsed = ParsedEvent::User(UserEvent {
             created_at_ms: 1000,
             public_key: [1u8; 32],
             username: "alice".to_string(),
@@ -41,9 +41,9 @@ mod tests {
     }
 
     #[test]
-    fn test_user_ongoing_valid() {
-        use topo::event_modules::user::{project_pure, UserOngoingEvent};
-        let parsed = ParsedEvent::UserOngoing(UserOngoingEvent {
+    fn test_user_valid_second_sample() {
+        use topo::event_modules::user::{project_pure, UserEvent};
+        let parsed = ParsedEvent::User(UserEvent {
             created_at_ms: 1001,
             public_key: [1u8; 32],
             username: "alice".to_string(),
@@ -63,12 +63,12 @@ mod tests {
         assert_reject(&result);
     }
 
-    // ── Admin (Boot) ──
+    // ── Admin ──
 
     #[test]
-    fn test_admin_boot_valid() {
-        use topo::event_modules::admin::{project_pure, AdminBootEvent};
-        let parsed = ParsedEvent::AdminBoot(AdminBootEvent {
+    fn test_admin_valid() {
+        use topo::event_modules::admin::{project_pure, AdminEvent};
+        let parsed = ParsedEvent::Admin(AdminEvent {
             created_at_ms: 2000,
             public_key: [1u8; 32],
             user_event_id: [2u8; 32],
@@ -80,22 +80,6 @@ mod tests {
         assert_valid(&result);
         assert_writes_to_table(&result, "admins");
         assert_no_commands(&result);
-    }
-
-    #[test]
-    fn test_admin_ongoing_valid() {
-        use topo::event_modules::admin::{project_pure, AdminOngoingEvent};
-        let parsed = ParsedEvent::AdminOngoing(AdminOngoingEvent {
-            created_at_ms: 2001,
-            public_key: [1u8; 32],
-            admin_boot_event_id: [2u8; 32],
-            signed_by: [3u8; 32],
-            signer_type: 5,
-            signature: [0u8; 64],
-        });
-        let result = project_pure(PEER, EVENT_ID, &parsed, &empty_ctx());
-        assert_valid(&result);
-        assert_writes_to_table(&result, "admins");
     }
 
     #[test]
