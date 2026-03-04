@@ -554,14 +554,12 @@ Scope rule: `create_workspace` is tenant-scoped. If local transport credentials 
 **Invite** (`workspace::commands::create_user_invite`): admin creates a UserInvite event and returns portable invite data (event ID + signing key + workspace ID). Wraps content key for invitee if sender keys are available.
 
 **Accept** (`workspace::commands::join_workspace_as_new_user`): joiner consumes invite data and creates:
-InviteAccepted (trust anchor) → User → DeviceInvite → PeerShared.
-Prerequisite: the joiner's DB must already contain the Workspace and UserInvite events (copied from the inviter before or during sync).
-The acceptance path also unwraps bootstrap content-key material received via `secret_shared` events (wrapped to the invite public key at creation time) and materializes local `secret_key` events so that encrypted content received during bootstrap sync can be decrypted.
+InviteAccepted (trust anchor) → UserBoot → DeviceInviteFirst → PeerSharedFirst.
+Prerequisite: the joiner's DB must already contain the Workspace and UserInviteBoot events (copied from the inviter before or during sync).
+The acceptance path stores the invite private key in `local_signer_material` (signer_kind=4) so that when `secret_shared` events targeting this invite project, their context_loader can perform DH unwrap and emit `MaterializeSecretKey` to create local `secret_key` events. This is fully dep-driven — no imperative scanning.
 Signer secrets (LocalSignerSecret events) are NOT emitted here; `persist_join_signer_secrets` is called separately after push-back sync completes.
 
-**Device link** (`workspace::commands::create_device_link_invite` / `add_device_to_workspace`): similar to user invite but creates a shorter chain (PeerShared only, skipping user/device_invite creation).
-
-**Retry** (`workspace::commands::retry_pending_invite_content_key_unwraps`): retries content-key unwrap for invites where SecretShared prerequisites arrived late. Triggered via `event_modules::post_drain_hooks` from `state/pipeline/effects.rs` after each projection drain.
+**Device link** (`workspace::commands::create_device_link_invite` / `add_device_to_workspace`): similar to user invite but creates a shorter chain (PeerSharedFirst only, skipping user/device_invite creation). Key unwrap follows the same dep-driven path via `secret_shared` projection.
 
 Identity pre-derive:
 
@@ -1103,7 +1101,9 @@ Decryption is an adapter stage inside the same projection pipeline, not a second
 Current canonical plaintext families:
 1. identity/auth chain events (`workspace`, `invite_accepted`, `user_invite`, `device_invite`, `user`, `peer_shared`, `admin`, removals),
 2. local identity/support events (`local_signer_secret`, `secret_key`, bootstrap helper events),
-3. content metadata events that are intentionally cleartext in this POC (`message_attachment`, `file_slice`, `reaction`, `message_deletion`, `bench_dep`).
+3. non-encryptable utility events (`bench_dep`).
+
+All content events (`message`, `reaction`, `message_deletion`, `message_attachment`) are created as encrypted wrappers in production command paths. File slices use field-level AES-256-GCM encryption (the ciphertext field carries real encrypted data, not the event-wrapper approach) and are created as signed events.
 
 Encrypted wrapper events remain canonical but carry ciphertext payloads whose inner event type is validated by `inner_type_code` before inner projection.
 
@@ -1471,18 +1471,31 @@ This approach makes first-user creation and device linking isomorphic to subsequ
 4. `peer_shared` projection consumes matching bootstrap trust rows with deterministic `Delete` write-ops once steady-state PeerShared trust is present.
 5. Ongoing dial/accept checks then use SQL trust queries (`is_peer_allowed`) with no trust writes in read paths.
 
-## 9.4 Sender-subjective encryption proof-of-concept
+## 9.4 Sender-subjective encryption
 
-The proof-of-concept requires that we show that modern group key agreement schemes are possible with this approach, but we do not seek to build one, instead opting for a simple placeholder.  
+All content events (`message`, `reaction`, `message_deletion`, `message_attachment`) are created through `create_encrypted_event_synchronous`, which wraps them as `encrypted` (type 5) events referencing a workspace content key.
 
-For each encrypted message in the prototype:
-
-1. sender creates a fresh local key event,
-2. sender emits one key-wrap event per currently eligible recipient peer pubkey,
-3. encrypted content references key dependency via normal event refs.
+Key model:
+- **Workspace content key**: one shared AES-256 key per workspace, used for message/reaction/deletion content. Distributed via `secret_shared` wrapping to all joiners during invite acceptance.
+- **Per-attachment key**: each file attachment gets a unique AES-256 key. The attachment's `key_event_id` references this key. Attachment keys are wrapped to all workspace peers via `secret_shared` events and are never reused across attachments.
+- **File slice encryption**: uses AES-256-GCM with deterministic nonce (`Blake2b-96("poc7-file-slice-nonce" || file_id || slice_number_le)`) and AAD (`file_id || slice_number_le`). File slices are signed events with field-level encryption, not encrypted wrappers.
 
 After observing `user_removed` or `peer_removed`, sender excludes removed recipients from subsequent wraps.
-Historical re-encryption or key history request/response mechanism is out of scope for the proof-of-concept.
+
+Key materialization on the recipient side (dep-driven):
+1. `secret_shared` events block on their `recipient_event_id` and `signed_by` dependencies via the normal dep engine.
+2. When a `secret_shared` event projects, its context_loader (`build_projector_context`) looks up the local private key matching the recipient (invite key with `signer_kind=4` or PeerShared key with `signer_kind=3` from `local_signer_material`).
+3. If a matching private key exists, the context_loader performs DH unwrap (`unwrap_key_from_sender`), verifies the deterministic key event ID, and sets `unwrapped_key_material` on the `ContextSnapshot`.
+4. The pure projector emits `MaterializeSecretKey` with the unwrapped key bytes.
+5. The `MaterializeSecretKey` handler in `write_exec.rs` creates a deterministic `secret_key` event and cascades unblock for any encrypted events blocked on that key.
+6. If the unwrap used an invite key (`signer_kind=4`), the handler also clears the invite key from `local_signer_material`.
+
+Crypto-shred on message deletion:
+- When a message is deleted, the deletion projector cascades removal of `message_attachments` and `file_slices` rows for that message.
+- This ensures encrypted file data is no longer accessible through normal read/query paths.
+- Raw event blobs remain in the events table (full event-store compaction is out of scope).
+
+Historical re-encryption or key rotation is out of scope for this proof-of-concept.
 
 ### 9.4.1 Bootstrap key distribution via invite-key wrap/unwrap
 

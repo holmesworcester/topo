@@ -1,13 +1,13 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::crypto::EventId;
-use crate::projection::create::create_signed_event_synchronous;
+use crate::projection::create::create_encrypted_event_synchronous;
 use crate::service::open_db_for_peer;
 use ed25519_dalek::SigningKey;
 use rusqlite::Connection;
 
 use super::super::ParsedEvent;
-use super::super::{message, peer_shared};
+use super::super::{message, peer_shared, workspace};
 use super::wire::ReactionEvent;
 
 use serde::{Deserialize, Serialize};
@@ -19,12 +19,23 @@ fn current_timestamp_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// Resolve the workspace content key for content encryption.
+fn resolve_content_key(
+    db: &Connection,
+    recorded_by: &str,
+    signer_eid: &EventId,
+    signing_key: &SigningKey,
+) -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
+    workspace::identity_ops::ensure_content_key_for_peer(db, recorded_by, signing_key, signer_eid)
+}
+
 pub struct CreateReactionCmd {
     pub target_event_id: [u8; 32],
     pub author_id: [u8; 32],
     pub emoji: String,
 }
 
+/// Create an encrypted reaction event.
 pub fn create(
     db: &Connection,
     recorded_by: &str,
@@ -33,6 +44,7 @@ pub fn create(
     created_at_ms: u64,
     cmd: CreateReactionCmd,
 ) -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
+    let key_event_id = resolve_content_key(db, recorded_by, signer_eid, signing_key)?;
     let rxn = ParsedEvent::Reaction(ReactionEvent {
         created_at_ms,
         target_event_id: cmd.target_event_id,
@@ -42,7 +54,13 @@ pub fn create(
         signer_type: 5,
         signature: [0u8; 64],
     });
-    let eid = create_signed_event_synchronous(db, recorded_by, &rxn, signing_key)?;
+    let eid = create_encrypted_event_synchronous(
+        db,
+        recorded_by,
+        &key_event_id,
+        &rxn,
+        Some(signing_key),
+    )?;
     Ok(eid)
 }
 
@@ -52,7 +70,7 @@ pub struct ReactResponse {
     pub event_id: String,
 }
 
-/// High-level react command: creates a reaction event and returns a ReactResponse.
+/// High-level react command: creates an encrypted reaction event.
 pub fn react(
     db: &Connection,
     recorded_by: &str,
@@ -84,7 +102,7 @@ pub fn react(
 }
 
 // ---------------------------------------------------------------------------
-// Peer-level command wrapper (moved from service.rs)
+// Peer-level command wrapper
 // ---------------------------------------------------------------------------
 
 /// React to a message as a specific peer.

@@ -129,4 +129,64 @@ mod tests {
         let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
         assert_reject_contains(&result, "signer peer not linked to author user");
     }
+
+    // ── SC-14: Crypto-shred cascade — file slices and attachments deleted ──
+
+    #[test]
+    fn test_deletion_cascades_file_slices_and_attachments() {
+        let author = [2u8; 32];
+        let author_b64 = b64(&author);
+        let parsed = make_deletion([1u8; 32], author);
+
+        let file_id_a = b64(&[10u8; 32]);
+        let file_id_b = b64(&[11u8; 32]);
+
+        let ctx = topo::projection::contract::ContextSnapshot {
+            target_message_author: Some(author_b64),
+            target_attachment_file_ids: vec![file_id_a.clone(), file_id_b.clone()],
+            ..Default::default()
+        };
+
+        let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
+        assert_valid(&result);
+
+        // Should have: intent + tombstone + delete messages + delete reactions
+        //   + delete file_slices(file_a) + delete file_slices(file_b) + delete message_attachments
+        assert_writes_to_table(&result, "deletion_intents");
+        assert_writes_to_table(&result, "deleted_messages");
+
+        let delete_ops: Vec<_> = result
+            .write_ops
+            .iter()
+            .filter(|op| matches!(op, topo::projection::contract::WriteOp::Delete { .. }))
+            .collect();
+
+        // Expect: messages, reactions, file_slices(a), file_slices(b), message_attachments = 5 deletes
+        assert_eq!(
+            delete_ops.len(),
+            5,
+            "expected 5 delete ops (messages + reactions + 2 file_slices + message_attachments), got {}",
+            delete_ops.len()
+        );
+
+        // Verify file_slices deletes reference correct file_ids
+        let file_slice_deletes: Vec<_> = result
+            .write_ops
+            .iter()
+            .filter(|op| {
+                matches!(op, topo::projection::contract::WriteOp::Delete { table: "file_slices", .. })
+            })
+            .collect();
+        assert_eq!(file_slice_deletes.len(), 2, "expected 2 file_slices deletes");
+
+        // Verify message_attachments delete exists
+        let attachment_deletes: Vec<_> = result
+            .write_ops
+            .iter()
+            .filter(|op| {
+                matches!(op, topo::projection::contract::WriteOp::Delete { table: "message_attachments", .. })
+            })
+            .collect();
+        assert_eq!(attachment_deletes.len(), 1, "expected 1 message_attachments delete");
+    }
 }

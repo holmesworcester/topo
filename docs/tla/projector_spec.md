@@ -368,6 +368,26 @@ The union inbound gate is a routing optimization that does not weaken the model
 invariant: once routed, each sync session operates within a single tenant's trust
 boundary. No TLA+ model changes required.
 
+## Encryption Lifecycle Model (EncryptionLifecycle.tla)
+
+Standalone module modeling the encryption key lifecycle: key creation, SecretShared
+wrapping, unwrap/materialization, encrypted content dependency, and cascade unblocking.
+Complements EventGraphSchema by zooming into the encryption subsystem with per-key,
+per-wrap, per-content state tracking.
+
+| TLA+ Invariant | Rust Check |
+|----------------|------------|
+| InvEncryptedDependsOnMaterializedKey | Encrypted content decryptable only if local secret_key exists (InvEncryptedKey in EventGraphSchema + cascade unblock in apply/cascade.rs) |
+| InvUnwrapOnlyForLocalRecipient | Key materialization via unwrap requires valid SecretShared targeting this recipient (secret_shared::build_projector_context context_loader) |
+| InvDeterministicKeyIdFromUnwrap | Materialized secret_key event ID matches deterministic derivation from unwrapped key bytes (secret_shared::deterministic_secret_key_event_id) |
+| InvNoPhantomSecretKey | Non-local secret_key materialization traceable to valid SecretShared unwrap path (write_exec.rs MaterializeSecretKey handler) |
+| InvBlockedEncryptedUnblocksAfterKey | Encrypted content blocked only on key unblocks when key materializes (cascade_unblocked in apply/cascade.rs) |
+| InvContentWritesAreEncrypted | Decryptable content always has key reference (enforced by create_encrypted_event_synchronous) |
+
+TLC status (run on 2026-03-04):
+1. `./tlc EncryptionLifecycle encryption_lifecycle_fast.cfg` — passes (2 peers, 2 keys, 1 content; 21,529 states)
+2. `./tlc EncryptionLifecycle encryption_lifecycle_expanded.cfg` — passes (2 peers, 3 keys, 2 contents; 4,608,257 states, 544,512 distinct)
+
 ## TLA Verification Notes
 
 ### collapse-encrypted-inner refactor (2026-02-16)

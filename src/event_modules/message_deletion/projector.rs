@@ -112,7 +112,9 @@ pub fn project_pure(
             ],
         });
 
-        // Cascade: delete message and its reactions (explicit write ops, not hidden side effects)
+        // Cascade: delete message, reactions, attachments, and file slices.
+        // Crypto-shred: removing file slices and attachment metadata ensures
+        // encrypted file data is no longer accessible through normal read paths.
         ops.push(WriteOp::Delete {
             table: "messages",
             where_clause: vec![
@@ -124,7 +126,27 @@ pub fn project_pure(
             table: "reactions",
             where_clause: vec![
                 ("recorded_by", SqlVal::Text(recorded_by.to_string())),
-                ("target_event_id", SqlVal::Text(target_b64)),
+                ("target_event_id", SqlVal::Text(target_b64.clone())),
+            ],
+        });
+
+        // Delete file slices for each attachment (must come before attachment delete).
+        for file_id in &ctx.target_attachment_file_ids {
+            ops.push(WriteOp::Delete {
+                table: "file_slices",
+                where_clause: vec![
+                    ("recorded_by", SqlVal::Text(recorded_by.to_string())),
+                    ("file_id", SqlVal::Text(file_id.clone())),
+                ],
+            });
+        }
+
+        // Delete attachment metadata rows.
+        ops.push(WriteOp::Delete {
+            table: "message_attachments",
+            where_clause: vec![
+                ("recorded_by", SqlVal::Text(recorded_by.to_string())),
+                ("message_id", SqlVal::Text(target_b64)),
             ],
         });
 

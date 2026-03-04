@@ -86,6 +86,19 @@ pub fn build_projector_context(
         Err(e) => return Err(e.into()),
     };
 
+    // Collect attachment file_ids for crypto-shred cascade.
+    // Only needed when target message exists (tombstone cascade path).
+    if ctx.target_message_author.is_some() {
+        let mut stmt = conn.prepare(
+            "SELECT file_id FROM message_attachments WHERE recorded_by = ?1 AND message_id = ?2",
+        )?;
+        let mut rows = stmt.query(rusqlite::params![recorded_by, &target_b64])?;
+        while let Some(row) = rows.next()? {
+            ctx.target_attachment_file_ids
+                .push(row.get::<_, String>(0)?);
+        }
+    }
+
     if ctx.target_message_author.is_none() && ctx.target_tombstone_author.is_none() {
         ctx.target_is_non_message = conn.query_row(
             "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",

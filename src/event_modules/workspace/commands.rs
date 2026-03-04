@@ -5,7 +5,7 @@
 //! - Joining a workspace as a new user (invite acceptance)
 //! - Adding a new device to an existing workspace (device-link acceptance)
 //! - Creating user invites and device-link invites
-//! - Retrying pending invite content-key unwraps
+//! - Key unwrap is dep-driven via SecretShared projection (no imperative retry)
 //!
 //! Service.rs calls these for event-domain work; transport/sync orchestration
 //! stays in service.
@@ -15,10 +15,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use ed25519_dalek::SigningKey;
 use rusqlite::Connection;
 
-use super::identity_ops::{
-    self as ops, InviteBootstrapContext, JoinChain, LinkChain, SIGNER_KIND_PENDING_INVITE_UNWRAP,
-};
-use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
+use super::identity_ops::{self as ops, InviteBootstrapContext, JoinChain, LinkChain};
+use crate::crypto::{event_id_to_base64, EventId};
 use crate::event_modules::{
     local_signer_secret::{
         LocalSignerSecretEvent, SIGNER_KIND_PEER_SHARED, SIGNER_KIND_USER, SIGNER_KIND_WORKSPACE,
@@ -336,13 +334,9 @@ pub fn join_workspace_as_new_user(
         &device_invite_key,
     ))?;
 
-    // 5. Unwrap inviter-provided content key targeted at this invite (if present).
-    // May return None if the content key event hasn't been synced yet.
-    let content_key_event_id =
-        ops::unwrap_content_key_from_invite(db, recorded_by, invite_key, invite_event_id)?;
-    if content_key_event_id.is_some() {
-        ops::clear_pending_invite_unwrap_key(db, recorded_by, invite_event_id)?;
-    }
+    // Key unwrap is dep-driven: when SecretShared events targeting this invite
+    // project, their context_loader performs DH unwrap and emits MaterializeSecretKey.
+    // No imperative scanning needed here.
 
     Ok(JoinChain {
         user_event_id,
@@ -352,7 +346,7 @@ pub fn join_workspace_as_new_user(
         peer_shared_event_id,
         peer_shared_key,
         invite_accepted_event_id,
-        content_key_event_id,
+        content_key_event_id: None,
     })
 }
 
@@ -433,10 +427,17 @@ pub fn add_device_to_workspace(
         device_invite_key,
     ))?;
 
+    // 3. Store pending invite key for deferred content-key unwrap (same as user invite flow).
+    ops::store_pending_invite_unwrap_key(db, recorded_by, device_invite_event_id, device_invite_key)?;
+
+    // Key unwrap is dep-driven: when SecretShared events targeting this invite
+    // project, their context_loader performs DH unwrap and emits MaterializeSecretKey.
+
     Ok(LinkChain {
         peer_shared_event_id,
         peer_shared_key,
         invite_accepted_event_id,
+        content_key_event_id: None,
     })
 }
 
@@ -510,8 +511,8 @@ pub fn create_user_invite(
 
 /// Create a device-link invite for an existing user.
 ///
-/// Event-domain logic: creates device invite event (DeviceInvite) →
-/// formats invite link.
+/// Event-domain logic: ensures content key material → creates device invite event
+/// (DeviceInviteFirst) → wraps content key for invitee → formats invite link.
 pub fn create_device_link_invite(
     db: &Connection,
     recorded_by: &str,
@@ -534,6 +535,24 @@ pub fn create_device_link_invite(
         Some(&ctx),
     )?;
 
+    // Wrap content key for the device-link invitee so the new device can decrypt content.
+    // Load peer_shared key for the wrapping operation.
+    // Fail-closed: if signer load fails or returns None, the invite creation must fail
+    // (device-link joiners MUST receive equivalent content-key coverage — SC-6).
+    let (ps_eid, ps_key) =
+        crate::event_modules::peer_shared::load_local_peer_signer(db, recorded_by)?
+            .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
+                "device-link invite requires local peer_shared signer for content-key wrap".into()
+            })?;
+    ops::wrap_content_key_for_invite(
+        db,
+        recorded_by,
+        &ps_key,
+        &ps_eid,
+        &invite.invite_key.verifying_key(),
+        &invite.invite_event_id,
+    )?;
+
     let invite_link =
         super::invite_link::create_invite_link(&invite, bootstrap_addr, bootstrap_spki)?;
 
@@ -543,53 +562,8 @@ pub fn create_device_link_invite(
     })
 }
 
-// ─── 6. Retry pending invite content-key unwraps ───
-
-/// Retry pending content-key unwraps for invite accept flows.
-///
-/// Accept paths persist invite private keys in `local_signer_material` with
-/// `signer_kind=4` so runtime projection can retry unwrap when SecretShared
-/// arrives later via sync.
-pub fn retry_pending_invite_content_key_unwraps(
-    db: &Connection,
-    recorded_by: &str,
-) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-    let mut stmt = db.prepare(
-        "SELECT signer_event_id, private_key
-         FROM local_signer_material
-         WHERE recorded_by = ?1 AND signer_kind = ?2",
-    )?;
-    let rows = stmt
-        .query_map(
-            rusqlite::params![recorded_by, SIGNER_KIND_PENDING_INVITE_UNWRAP],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
-        )?
-        .collect::<Result<Vec<_>, _>>()?;
-    drop(stmt);
-
-    let mut unwrapped = 0usize;
-    for (invite_event_b64, key_bytes) in rows {
-        let invite_event_id = match event_id_from_base64(&invite_event_b64) {
-            Some(eid) => eid,
-            None => continue,
-        };
-        if key_bytes.len() != 32 {
-            continue;
-        }
-        let mut key_arr = [0u8; 32];
-        key_arr.copy_from_slice(&key_bytes);
-        let invite_key = SigningKey::from_bytes(&key_arr);
-
-        if ops::unwrap_content_key_from_invite(db, recorded_by, &invite_key, &invite_event_id)?
-            .is_some()
-        {
-            ops::clear_pending_invite_unwrap_key(db, recorded_by, &invite_event_id)?;
-            unwrapped += 1;
-        }
-    }
-
-    Ok(unwrapped)
-}
+// Key unwrap retry is no longer needed: SecretShared projection handles unwrap
+// dep-driven via context_loader + MaterializeSecretKey emit command.
 
 // ─── 7. Key loading helpers ───
 
