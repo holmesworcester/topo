@@ -88,6 +88,38 @@ cargo test --release --test sync_graph_test -- --nocapture --test-threads=1
 scripts/run_perf_serial.sh lowmem
 ```
 
+## RPC Demo from CLI
+
+Discover RPC methods and submit raw JSON calls without building a client:
+
+```bash
+# List all available RPC methods
+topo rpc methods
+
+# Describe a specific method's parameters and example payload
+topo rpc describe Send
+
+# Start a daemon, then submit raw RPC calls
+topo --db demo.db start --bind 127.0.0.1:7443
+topo --db demo.db rpc call --method-json '{"type":"Status"}'
+topo --db demo.db rpc call --method-json '{"type":"Send","content":"hello from raw rpc"}'
+topo --db demo.db rpc call --method-json '{"type":"Messages","limit":10}'
+
+# Full request envelope (explicit version field)
+topo --db demo.db rpc call --request-json '{"version":1,"method":{"type":"Status"}}'
+
+# From a file
+echo '{"version":1,"method":{"type":"Status"}}' > req.json
+topo --db demo.db rpc call --file req.json
+
+# From stdin (full request envelope)
+echo '{"version":1,"method":{"type":"Status"}}' | topo --db demo.db rpc call --stdin
+
+# JSON output for scripting
+topo rpc methods --json
+topo rpc describe Send --json
+```
+
 ## Architecture
 
 ```text
