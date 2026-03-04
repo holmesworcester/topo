@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::crypto::EventId;
@@ -375,5 +376,153 @@ pub fn generate_files_for_peer(
         file_size_mib,
         slices_per_file,
         total_slices,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// send-file: message + attachment from a real file on disk
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SendFileResponse {
+    pub content: String,
+    pub event_id: String,
+    pub filename: String,
+    pub file_size: u64,
+}
+
+fn mime_from_extension(ext: &str) -> &'static str {
+    match ext {
+        "txt" | "log" | "md" => "text/plain",
+        "html" | "htm" => "text/html",
+        "css" => "text/css",
+        "js" => "application/javascript",
+        "json" => "application/json",
+        "xml" => "application/xml",
+        "pdf" => "application/pdf",
+        "zip" => "application/zip",
+        "gz" | "gzip" => "application/gzip",
+        "tar" => "application/x-tar",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        "webp" => "image/webp",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Send a message with a file attachment as a specific peer.
+pub fn send_file_for_peer(
+    db_path: &str,
+    peer_id: &str,
+    content: &str,
+    file_path: &str,
+) -> Result<SendFileResponse, Box<dyn std::error::Error + Send + Sync>> {
+    let path = Path::new(file_path);
+    let file_data = std::fs::read(path)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("failed to read {}: {}", file_path, e).into()
+        })?;
+    let file_size = file_data.len() as u64;
+    let filename = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".to_string());
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let mime_type = mime_from_extension(&ext).to_string();
+
+    let (recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
+    let (signer_eid, signing_key) =
+        peer_shared::load_local_peer_signer_required(&db, &recorded_by)?;
+    let workspace_id = workspace::resolve_workspace_for_peer(&db, &recorded_by)?;
+    let author_id = peer_shared::resolve_user_event_id(&db, &recorded_by, &signer_eid)?;
+
+    let message_event_id = create(
+        &db,
+        &recorded_by,
+        &signer_eid,
+        &signing_key,
+        current_timestamp_ms(),
+        CreateMessageCmd {
+            workspace_id,
+            author_id,
+            content: content.to_string(),
+        },
+    )?;
+
+    let key_event_id = create_event_synchronous(
+        &db,
+        &recorded_by,
+        &ParsedEvent::SecretKey(SecretKeyEvent {
+            created_at_ms: current_timestamp_ms(),
+            key_bytes: rand::random::<[u8; 32]>(),
+        }),
+    )?;
+
+    let file_id = rand::random::<[u8; 32]>();
+    let num_slices = if file_size == 0 {
+        1
+    } else {
+        (file_size as usize).div_ceil(FILE_SLICE_CIPHERTEXT_BYTES)
+    };
+
+    create_signed_event_synchronous(
+        &db,
+        &recorded_by,
+        &ParsedEvent::MessageAttachment(MessageAttachmentEvent {
+            created_at_ms: current_timestamp_ms(),
+            message_id: message_event_id,
+            file_id,
+            blob_bytes: file_size,
+            total_slices: num_slices as u32,
+            slice_bytes: FILE_SLICE_CIPHERTEXT_BYTES as u32,
+            root_hash: [0u8; 32],
+            key_event_id,
+            filename: filename.clone(),
+            mime_type,
+            signed_by: signer_eid,
+            signer_type: 5,
+            signature: [0u8; 64],
+        }),
+        &signing_key,
+    )?;
+
+    for slice_number in 0..num_slices {
+        let start = slice_number * FILE_SLICE_CIPHERTEXT_BYTES;
+        let mut ciphertext = vec![0u8; FILE_SLICE_CIPHERTEXT_BYTES];
+        let end = (start + FILE_SLICE_CIPHERTEXT_BYTES).min(file_data.len());
+        if start < file_data.len() {
+            ciphertext[..end - start].copy_from_slice(&file_data[start..end]);
+        }
+
+        create_signed_event_synchronous(
+            &db,
+            &recorded_by,
+            &ParsedEvent::FileSlice(FileSliceEvent {
+                created_at_ms: current_timestamp_ms(),
+                file_id,
+                slice_number: slice_number as u32,
+                ciphertext,
+                signed_by: signer_eid,
+                signer_type: 5,
+                signature: [0u8; 64],
+            }),
+            &signing_key,
+        )?;
+    }
+
+    Ok(SendFileResponse {
+        content: content.to_string(),
+        event_id: hex::encode(message_event_id),
+        filename,
+        file_size,
     })
 }

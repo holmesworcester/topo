@@ -329,14 +329,18 @@ fn assert_eventually(db: &str, predicate: &str, timeout_ms: u64) {
     );
 }
 
-fn get_messages(db: &str) -> Vec<String> {
+fn get_messages_raw(db: &str) -> String {
     let output = Command::new(bin())
         .arg("--db")
         .arg(db)
         .arg("messages")
         .output()
         .expect("failed to run messages");
-    let text = String::from_utf8_lossy(&output.stdout);
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
+fn get_messages(db: &str) -> Vec<String> {
+    let text = get_messages_raw(db);
     // Parse numbered lines like "    1. Hello from Alice"
     text.lines()
         .filter_map(|line| {
@@ -1017,5 +1021,147 @@ fn test_cli_react_by_message_number() {
         "expected error message, got: {}",
         stderr
     );
+}
 
+#[test]
+fn test_cli_messages_include_reactions() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = tmpdir
+        .path()
+        .join("enrich.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    create_workspace(&db);
+    let _daemon = start_daemon(&db);
+
+    // Send a message and react to it.
+    send_message(&db, "hello world");
+    let out = Command::new(bin())
+        .args(["--db", &db, "react", "--target", "1", "thumbsup"])
+        .output()
+        .expect("react");
+    assert!(out.status.success(), "react failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    // Add a second different reaction to the same message.
+    let out = Command::new(bin())
+        .args(["--db", &db, "react", "--target", "1", "fire"])
+        .output()
+        .expect("react fire");
+    assert!(out.status.success(), "react fire failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    // `topo messages` output should contain both reactions as real emoji.
+    let raw = get_messages_raw(&db);
+    assert!(
+        raw.contains("\u{1f44d}"),
+        "expected thumbsup emoji in messages output, got:\n{}",
+        raw
+    );
+    assert!(
+        raw.contains("\u{1f525}"),
+        "expected fire emoji in messages output, got:\n{}",
+        raw
+    );
+    // Should NOT contain the text shortcode — only real emoji.
+    assert!(
+        !raw.contains("thumbsup"),
+        "should render emoji glyph, not shortcode name, got:\n{}",
+        raw
+    );
+}
+
+#[test]
+fn test_cli_send_file_and_messages_display() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = tmpdir
+        .path()
+        .join("sendfile.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // Create a temp file to attach.
+    let file_path = tmpdir.path().join("notes.txt");
+    std::fs::write(&file_path, "These are my notes.\n").unwrap();
+
+    create_workspace(&db);
+    let _daemon = start_daemon(&db);
+
+    // send-file with content + attachment
+    let out = Command::new(bin())
+        .args([
+            "--db",
+            &db,
+            "send-file",
+            "Check out my notes",
+            "--file",
+            file_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("send-file");
+    assert!(
+        out.status.success(),
+        "send-file failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("notes.txt"), "send-file output should show filename, got: {}", stdout);
+
+    // `topo messages` should show the message and the attachment.
+    let raw = get_messages_raw(&db);
+    assert!(
+        raw.contains("Check out my notes"),
+        "messages should contain message content, got:\n{}",
+        raw
+    );
+    assert!(
+        raw.contains("notes.txt"),
+        "messages should contain filename, got:\n{}",
+        raw
+    );
+    // Local files should be complete (all slices present) → ✔
+    assert!(
+        raw.contains("\u{2714}"),
+        "local attachment should show checkmark (complete), got:\n{}",
+        raw
+    );
+}
+
+#[test]
+fn test_cli_generate_files_messages_display() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = tmpdir
+        .path()
+        .join("genfiles.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    create_workspace(&db);
+    let _daemon = start_daemon(&db);
+
+    // generate-files creates synthetic message + attachment
+    let out = Command::new(bin())
+        .args(["--db", &db, "generate-files", "--count", "1", "--size-mib", "1"])
+        .output()
+        .expect("generate-files");
+    assert!(
+        out.status.success(),
+        "generate-files failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // `topo messages` should show the attachment with filename and checkmark.
+    let raw = get_messages_raw(&db);
+    assert!(
+        raw.contains("file-0.bin"),
+        "messages should contain synthetic filename, got:\n{}",
+        raw
+    );
+    assert!(
+        raw.contains("\u{2714}"),
+        "local attachment should show checkmark (complete), got:\n{}",
+        raw
+    );
 }

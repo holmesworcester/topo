@@ -411,6 +411,15 @@ fn dispatch(
             },
             Err(e) => RpcResponse::error(e),
         },
+        RpcMethod::SendFile { content, file_path } => match state.require_active_peer() {
+            Ok(peer_id) => {
+                match message::send_file_for_peer(db_path, &peer_id, &content, &file_path) {
+                    Ok(data) => RpcResponse::success(data),
+                    Err(e) => RpcResponse::error(e.to_string()),
+                }
+            }
+            Err(e) => RpcResponse::error(e),
+        },
         RpcMethod::Generate { count } => match state.require_active_peer() {
             Ok(peer_id) => match message::generate_for_peer(db_path, &peer_id, count) {
                 Ok(data) => RpcResponse::success(data),
