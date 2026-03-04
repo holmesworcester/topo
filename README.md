@@ -1,16 +1,8 @@
 # 🐭 Topo
 
-A proof-of-concept sketch of the (work-in-progress) Topo protocol: an event-sourced, end-to-end encrypted, peer-to-peer stack for building complex applications, such as team chat.
+A proof-of-concept sketch of the (work-in-progress) Topo protocol: an event-sourced, end-to-end encrypted, batteries-included, peer-to-peer backend for building complex applications such as team chat.
 
 Informed by work on [Quiet](https://github.com/TryQuiet); see [Motivation](#Motivation) below for more detail.
-
-
-## Start Here
-
-- **[docs/DESIGN.md](./docs/DESIGN.md)** - Protocol/runtime design and invariants
-- **[docs/PLAN.md](./docs/PLAN.md)** - LLM-friendly implementation plan
-- **[docs/PERF.md](./docs/PERF.md)** - Performance results
-- **[High-Level Runtime Boundaries Diagram](./docs/DESIGN_DIAGRAMS.md#3-high-level-runtime-boundaries)** - Architecture at a glance
 
 ## Quick Start
 
@@ -27,7 +19,7 @@ You can test the proof-of-concept by playing with its CLI either locally, over a
 cargo run --bin topo -- --help
 ```
 
-### "Screenshots"
+### CLI Preview
 
 Alice creates a workspace and invites Bob, who then accepts:
 
@@ -103,9 +95,9 @@ docs/
   PERF.md                # Benchmarks and perf evidence
 ```
 
-### High-level Design & Data Flow
+### High Level Data Flow
 
-See: [DESIGN_DIAGRAMS.md](DESIGN_DIAGRAMS.md) for more detail.
+See: [DESIGN_DIAGRAMS.md](DESIGN_DIAGRAMS.md) for more.
 
 ```mermaid
 %%{init: {"flowchart": {"wrappingWidth": 320}} }%%
@@ -157,6 +149,9 @@ cd docs/tla
 - **[docs/PLAN.md](./docs/PLAN.md)** - Execution phases, acceptance criteria, and test gates
 - **[docs/DESIGN_DIAGRAMS.md](./docs/DESIGN_DIAGRAMS.md)** - Code-accurate runtime/data-flow diagrams
 - **[docs/INDEX.md](./docs/INDEX.md)** - Documentation index
+- **[docs/PERF.md](./docs/PERF.md)** - Performance results
+- **[High-Level Runtime Boundaries Diagram](./docs/DESIGN_DIAGRAMS.md#3-high-level-runtime-boundaries)** - Architecture at a glance
+
 
 ## Motivation
 
@@ -171,7 +166,7 @@ We think there is a simpler way, one that doesn't:
 
 This PoC exists to prove the practicality of a principled approach that uses [event sourcing](https://martinfowler.com/eaaDev/EventSourcing.html), [range-based set reconciliation](https://aljoscha-meyer.de/assets/landing/rbsr.pdf),  [topological sort](https://en.wikipedia.org/wiki/Topological_sorting), and [materialization](https://en.wikipedia.org/wiki/Materialized_view) or "projection" of p2p-synced, decrypted events into SQLite tables that can be easily queried by an API.
 
-What I think it proves works:
+### What it (seeks to) prove practical
 
 * **SQLite for everything** - You can simplify state management by using SQLite for everything, even file slices, for GBs of messages/files
 * **Everything can be an event** - You can model all data, even file slices, as events, encrypt them (and store them all in SQLite)
@@ -190,11 +185,11 @@ What I think it proves works:
 
 ## Stretch Goal 
 
-A protocol that is simpler than BitTorrent but adequate for building a reliably p2p Slack replacement.
+A protocol that is simple enough to implement in a weekend project but adequate for building a reliably p2p Slack replacement.
 
 ## Status
 
-Not there yet.
+Not simple enough yet.
 
 ## Why "Topo"?
 
