@@ -108,7 +108,7 @@ enum Commands {
     /// Start the daemon (runs sync + RPC server)
     Start {
         /// Listen address for QUIC sync
-        #[arg(short, long, default_value = "127.0.0.1:4433")]
+        #[arg(short, long, default_value = "0.0.0.0:4433")]
         bind: SocketAddr,
     },
 
@@ -124,9 +124,12 @@ enum Commands {
         /// Your username
         #[arg(long, default_value = "user")]
         username: String,
-        /// Device name for this peer
-        #[arg(long, default_value = "device")]
-        device_name: String,
+        /// Device name for this peer (defaults to system hostname)
+        #[arg(long)]
+        device_name: Option<String>,
+        /// Public address to embed in auto-generated invite link
+        #[arg(long)]
+        public_addr: Option<String>,
     },
 
     /// Accept a user invite link (bootstrap sync + identity chain creation)
@@ -138,9 +141,9 @@ enum Commands {
         /// Username for the new identity
         #[arg(long, default_value = "user")]
         username: String,
-        /// Device name for the new identity
-        #[arg(long, default_value = "device")]
-        devicename: String,
+        /// Device name for the new identity (defaults to system hostname)
+        #[arg(long)]
+        devicename: Option<String>,
     },
 
     // -------------------------------------------------------------------
@@ -307,9 +310,9 @@ enum Commands {
         /// Device link (topo://link/...)
         #[arg(long)]
         invite: String,
-        /// Device name for the new identity
-        #[arg(long, default_value = "device")]
-        devicename: String,
+        /// Device name for the new identity (defaults to system hostname)
+        #[arg(long)]
+        devicename: Option<String>,
     },
 
     /// Ban (remove) a user from the workspace
@@ -417,7 +420,7 @@ fn ensure_daemon_running(
     }
     cmd.arg("start")
         .arg("--bind")
-        .arg("127.0.0.1:0")
+        .arg("0.0.0.0:0")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     let child = cmd.spawn()?;
@@ -826,21 +829,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             workspace_name,
             username,
             device_name,
+            public_addr,
         } => {
-            let data = rpc_require_daemon(
-                db,
-                socket_override.as_deref(),
-                RpcMethod::CreateWorkspace {
-                    workspace_name,
-                    username,
-                    device_name,
-                },
-            )?;
-            println!("peer_id:      {}", data["peer_id"].as_str().unwrap_or(""));
+            let device_name = device_name.unwrap_or_else(system_hostname);
+            let sock = ensure_daemon_running(db, socket_override.as_deref())?;
+            let data = match rpc_call(&sock, RpcMethod::CreateWorkspace {
+                workspace_name,
+                username,
+                device_name,
+            }) {
+                Ok(resp) => {
+                    if !resp.ok {
+                        if let Some(err) = resp.error {
+                            return Err(err.into());
+                        }
+                    }
+                    resp.data.unwrap_or(serde_json::Value::Null)
+                }
+                Err(e) => return Err(e.to_string().into()),
+            };
+            println!(
+                "peer_id:      {}",
+                short_id(data["peer_id"].as_str().unwrap_or(""))
+            );
             println!(
                 "workspace_id: {}",
-                data["workspace_id"].as_str().unwrap_or("")
+                short_id(data["workspace_id"].as_str().unwrap_or(""))
             );
+
+            if let Some(addr) = public_addr {
+                match rpc_call(&sock, RpcMethod::CreateInvite {
+                    public_addr: addr,
+                    public_spki: None,
+                }) {
+                    Ok(resp) if resp.ok => {
+                        if let Some(link) = resp.data.as_ref().and_then(|d| d["invite_link"].as_str()) {
+                            println!("invite:       {}", link);
+                        }
+                    }
+                    _ => {
+                        eprintln!("warning: workspace created but invite generation failed");
+                    }
+                }
+            }
         }
 
         Commands::AcceptInvite {
@@ -848,6 +879,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             username,
             devicename,
         } => {
+            let devicename = devicename.unwrap_or_else(system_hostname);
             let data = rpc_require_daemon(
                 db,
                 socket_override.as_deref(),
@@ -858,14 +890,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 },
             )?;
             println!("Accepted invite");
-            println!("  peer_id: {}", data["peer_id"].as_str().unwrap_or(""));
+            println!(
+                "  peer_id: {}",
+                short_id(data["peer_id"].as_str().unwrap_or(""))
+            );
             println!(
                 "  user:    {}",
-                data["user_event_id"].as_str().unwrap_or("")
+                short_id(data["user_event_id"].as_str().unwrap_or(""))
             );
             println!(
                 "  peer:    {}",
-                data["peer_shared_event_id"].as_str().unwrap_or("")
+                short_id(data["peer_shared_event_id"].as_str().unwrap_or(""))
             );
         }
 
@@ -1313,6 +1348,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
 
         Commands::AcceptLink { invite, devicename } => {
+            let devicename = devicename.unwrap_or_else(system_hostname);
             let data = rpc_require_daemon(
                 db,
                 socket_override.as_deref(),
@@ -1320,7 +1356,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             )?;
             let peer_id = data["peer_id"].as_str().unwrap_or("");
             println!("Accepted device link");
-            println!("  peer_id: {}", peer_id);
+            println!("  peer_id: {}", short_id(peer_id));
         }
 
         Commands::Ban { user } => {
@@ -1442,6 +1478,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 fn short_id(b64: &str) -> &str {
     &b64[..b64.len().min(8)]
+}
+
+fn system_hostname() -> String {
+    let mut buf = [0u8; 256];
+    let ret = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+    if ret == 0 {
+        let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        String::from_utf8_lossy(&buf[..len]).into_owned()
+    } else {
+        "device".to_string()
+    }
 }
 
 fn format_timestamp(ms: i64) -> String {

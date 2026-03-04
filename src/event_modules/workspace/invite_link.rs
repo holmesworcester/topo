@@ -10,6 +10,9 @@ const INVITE_PREFIX: &str = "topo://invite/";
 const LINK_PREFIX: &str = "topo://link/";
 const INVITE_LINK_VERSION: u8 = 2;
 
+/// Default QUIC sync port — omitted from display strings when matched.
+pub const DEFAULT_PORT: u16 = 4433;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InviteLinkKind {
     User,
@@ -43,8 +46,11 @@ impl BootstrapAddress {
 
     pub fn to_bootstrap_addr_string(&self) -> String {
         match self {
+            BootstrapAddress::Ipv4 { ip, port } if *port == DEFAULT_PORT => format!("{}", ip),
             BootstrapAddress::Ipv4 { ip, port } => format!("{}:{}", ip, port),
+            BootstrapAddress::Ipv6 { ip, port } if *port == DEFAULT_PORT => format!("[{}]", ip),
             BootstrapAddress::Ipv6 { ip, port } => format!("[{}]:{}", ip, port),
+            BootstrapAddress::Hostname { host, port } if *port == DEFAULT_PORT => host.clone(),
             BootstrapAddress::Hostname { host, port } => format!("{}:{}", host, port),
         }
     }
@@ -69,6 +75,7 @@ impl BootstrapAddress {
 }
 
 pub fn parse_bootstrap_address(bootstrap_addr: &str) -> Result<BootstrapAddress, InviteLinkError> {
+    // Try full socket addr first (e.g. "1.2.3.4:5555", "[::1]:5555")
     if let Ok(sock) = bootstrap_addr.parse::<SocketAddr>() {
         return Ok(match sock.ip() {
             IpAddr::V4(ip) => BootstrapAddress::Ipv4 {
@@ -82,15 +89,50 @@ pub fn parse_bootstrap_address(bootstrap_addr: &str) -> Result<BootstrapAddress,
         });
     }
 
-    let (host_raw, port_raw) = bootstrap_addr.rsplit_once(':').ok_or_else(|| {
-        InviteLinkError::InvalidPayload(
-            "bootstrap_addr must be host:port (IPv6 must be [addr]:port)".to_string(),
-        )
-    })?;
-    let port: u16 = port_raw.parse().map_err(|_| {
-        InviteLinkError::InvalidPayload(format!("invalid bootstrap port '{}'", port_raw))
-    })?;
-    let host = host_raw.trim();
+    // Bare IPv4 (e.g. "100.64.1.20")
+    if let Ok(ip) = bootstrap_addr.parse::<Ipv4Addr>() {
+        return Ok(BootstrapAddress::Ipv4 {
+            ip,
+            port: DEFAULT_PORT,
+        });
+    }
+
+    // Bracketed IPv6 without port (e.g. "[::1]")
+    if bootstrap_addr.starts_with('[') && bootstrap_addr.ends_with(']') {
+        let inner = &bootstrap_addr[1..bootstrap_addr.len() - 1];
+        if let Ok(ip) = inner.parse::<Ipv6Addr>() {
+            return Ok(BootstrapAddress::Ipv6 {
+                ip,
+                port: DEFAULT_PORT,
+            });
+        }
+    }
+
+    // host:port form
+    if let Some((host_raw, port_raw)) = bootstrap_addr.rsplit_once(':') {
+        // Only treat as host:port if port_raw parses as u16
+        // (avoids misparse of unbracketed IPv6)
+        if let Ok(port) = port_raw.parse::<u16>() {
+            let host = host_raw.trim();
+            if host.is_empty() {
+                return Err(InviteLinkError::InvalidPayload(
+                    "bootstrap hostname is empty".to_string(),
+                ));
+            }
+            if host.contains(':') {
+                return Err(InviteLinkError::InvalidPayload(
+                    "bootstrap IPv6 addresses must use [addr]:port form".to_string(),
+                ));
+            }
+            return Ok(BootstrapAddress::Hostname {
+                host: host.to_string(),
+                port,
+            });
+        }
+    }
+
+    // Bare hostname (e.g. "ryzen", "example.com") — infer default port
+    let host = bootstrap_addr.trim();
     if host.is_empty() {
         return Err(InviteLinkError::InvalidPayload(
             "bootstrap hostname is empty".to_string(),
@@ -103,7 +145,7 @@ pub fn parse_bootstrap_address(bootstrap_addr: &str) -> Result<BootstrapAddress,
     }
     Ok(BootstrapAddress::Hostname {
         host: host.to_string(),
-        port,
+        port: DEFAULT_PORT,
     })
 }
 
@@ -333,7 +375,8 @@ mod tests {
         assert_eq!(parsed.invite_event_id, invite.invite_event_id);
         assert_eq!(parsed.invite_private_key, invite.invite_key.to_bytes());
         assert_eq!(parsed.workspace_id, invite.workspace_id);
-        assert_eq!(parsed.bootstrap_addr, bootstrap_addr);
+        // Port 4433 is the default, so display string omits it
+        assert_eq!(parsed.bootstrap_addr, "127.0.0.1");
         assert_eq!(
             parsed.bootstrap_addr_typed,
             BootstrapAddress::Ipv4 {
@@ -395,7 +438,7 @@ mod tests {
         let link =
             create_invite_link(&invite, "[2001:4860:4860::8888]:4433", &bootstrap_spki).unwrap();
         let parsed = parse_invite_link(&link).unwrap();
-        assert_eq!(parsed.bootstrap_addr, "[2001:4860:4860::8888]:4433");
+        assert_eq!(parsed.bootstrap_addr, "[2001:4860:4860::8888]");
         assert_eq!(
             parsed.bootstrap_addr_typed,
             BootstrapAddress::Ipv6 {
@@ -424,6 +467,51 @@ mod tests {
                 port: 7000
             }
         );
+    }
+
+    #[test]
+    fn test_bare_ipv4_infers_default_port() {
+        let addr = parse_bootstrap_address("100.64.1.20").unwrap();
+        assert_eq!(
+            addr,
+            BootstrapAddress::Ipv4 {
+                ip: "100.64.1.20".parse().unwrap(),
+                port: DEFAULT_PORT
+            }
+        );
+        assert_eq!(addr.to_bootstrap_addr_string(), "100.64.1.20");
+    }
+
+    #[test]
+    fn test_bare_hostname_infers_default_port() {
+        let addr = parse_bootstrap_address("ryzen").unwrap();
+        assert_eq!(
+            addr,
+            BootstrapAddress::Hostname {
+                host: "ryzen".to_string(),
+                port: DEFAULT_PORT
+            }
+        );
+        assert_eq!(addr.to_bootstrap_addr_string(), "ryzen");
+    }
+
+    #[test]
+    fn test_bare_bracketed_ipv6_infers_default_port() {
+        let addr = parse_bootstrap_address("[::1]").unwrap();
+        assert_eq!(
+            addr,
+            BootstrapAddress::Ipv6 {
+                ip: "::1".parse().unwrap(),
+                port: DEFAULT_PORT
+            }
+        );
+        assert_eq!(addr.to_bootstrap_addr_string(), "[::1]");
+    }
+
+    #[test]
+    fn test_non_default_port_shown_in_display() {
+        let addr = parse_bootstrap_address("10.0.0.1:5555").unwrap();
+        assert_eq!(addr.to_bootstrap_addr_string(), "10.0.0.1:5555");
     }
 
     #[test]
