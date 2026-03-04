@@ -4,6 +4,9 @@ A proof-of-concept sketch of the (work-in-progress) Topo protocol: an event-sour
 
 Informed by work on [Quiet](https://github.com/TryQuiet); see [Motivation](#Motivation) below for more detail.
 
+TL;DR: 
+command 🡪 create event 🡪 sign, encrypt, hash 🡪 peer via QUIC 🡪 check mTLS against event source of truth 🡪 set reconcile 🡪 topo sort 🡪 decrypt 🡪 SQLite 🡪 query
+
 > **🚨 VIBE-CODED & NOT FOR PRODUCTION USE 🚨**
 
 ## Quick Start
@@ -195,4 +198,4 @@ Not simple enough yet.
 
 ## Why "Topo"?
 
-Topo means mouse. We built this as part of research for [Quiet](https://tryquiet.org). Mice are quiet ("quiet as a mouse"). 🐭
+[Topo sort](https://en.wikipedia.org/wiki/Topological_sorting) is something it does a lot. Topo means "mouse" in Italian. We built it for [Quiet](https://tryquiet.org). Mice are quiet ("quiet as a mouse"). 🐭
