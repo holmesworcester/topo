@@ -3,10 +3,11 @@
 > **Status: Active** — Current benchmark results and testing guide.
 
 ## Test Environment
-- SQLite on disk (WAL mode, NORMAL sync)
-- QUIC transport (localhost) with SPKI fingerprint allowlist enforcement (`PinnedCertVerifier` + `AllowedPeers`)
-- Message benchmarks use current message wire size: 1,194 bytes/event (`MESSAGE_WIRE_SIZE`, includes fixed 1,024-byte content slot)
-- Linux x86_64, release build
+- OS: Linux 6.17.0-8-generic x86_64
+- CPU: AMD RYZEN AI MAX+ 395 w/ Radeon 8060S (16 cores / 32 threads, 64 MiB L3)
+- RAM: 122 GiB system memory
+- Build: Rust `--release` profile
+- Storage/DB: SQLite on disk (WAL mode, `synchronous=NORMAL`)
 
 ## Running Performance Tests
 
