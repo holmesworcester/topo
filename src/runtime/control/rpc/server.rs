@@ -15,7 +15,7 @@ use tokio::sync::Notify;
 use tracing::{info, warn};
 
 use crate::db::transport_creds::discover_local_tenants;
-use crate::event_modules::{message, peer_shared, reaction, user, workspace};
+use crate::event_modules::{message, message_attachment, peer_shared, reaction, user, workspace};
 use crate::node::NodeRuntimeNetInfo;
 use crate::rpc::protocol::*;
 use crate::service;
@@ -484,11 +484,8 @@ fn dispatch(
             Err(e) => RpcResponse::error(e),
         },
         RpcMethod::GenerateFiles { count, size_mib } => match state.require_active_peer() {
-            Ok(peer_id) => match message::generate_files_for_peer(
-                db_path,
-                &peer_id,
-                count,
-                size_mib,
+            Ok(peer_id) => match message_attachment::generate_files_for_peer(
+                db_path, &peer_id, count, size_mib,
             ) {
                 Ok(data) => RpcResponse::success(data),
                 Err(e) => RpcResponse::error(e.to_string()),

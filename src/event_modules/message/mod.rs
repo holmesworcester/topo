@@ -8,8 +8,7 @@ pub mod wire;
 // Re-export stable public API so callers import from `event_modules::message`.
 pub use commands::{
     create, create_deletion, delete_message, delete_message_for_peer, generate_for_peer, send,
-    send_for_peer, CreateMessageCmd, CreateMessageDeletionCmd, DeleteResponse,
-    GenerateFilesResponse, GenerateResponse, generate_files_for_peer,
+    send_for_peer, CreateMessageCmd, CreateMessageDeletionCmd, DeleteResponse, GenerateResponse,
 };
 pub use projector::project_pure;
 pub use queries::{count, list, list_deleted_ids, list_rows, resolve, resolve_number, MessageRow};
