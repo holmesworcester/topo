@@ -25,8 +25,8 @@ mod tests {
 
     #[test]
     fn test_user_boot_valid() {
-        use topo::event_modules::user::{project_pure, UserBootEvent};
-        let parsed = ParsedEvent::UserBoot(UserBootEvent {
+        use topo::event_modules::user::{project_pure, UserEvent};
+        let parsed = ParsedEvent::User(UserEvent {
             created_at_ms: 1000,
             public_key: [1u8; 32],
             username: "alice".to_string(),
@@ -42,8 +42,8 @@ mod tests {
 
     #[test]
     fn test_user_ongoing_valid() {
-        use topo::event_modules::user::{project_pure, UserOngoingEvent};
-        let parsed = ParsedEvent::UserOngoing(UserOngoingEvent {
+        use topo::event_modules::user::{project_pure, UserEvent};
+        let parsed = ParsedEvent::User(UserEvent {
             created_at_ms: 1001,
             public_key: [1u8; 32],
             username: "alice".to_string(),
@@ -84,8 +84,8 @@ mod tests {
 
     #[test]
     fn test_admin_ongoing_valid() {
-        use topo::event_modules::admin::{project_pure, AdminOngoingEvent};
-        let parsed = ParsedEvent::AdminOngoing(AdminOngoingEvent {
+        use topo::event_modules::admin::{project_pure, AdminBootEvent};
+        let parsed = ParsedEvent::AdminBoot(AdminBootEvent {
             created_at_ms: 2001,
             public_key: [1u8; 32],
             admin_boot_event_id: [2u8; 32],

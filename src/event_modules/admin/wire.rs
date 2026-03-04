@@ -1,6 +1,6 @@
 use super::super::layout::common::{COMMON_HEADER_BYTES, SIGNATURE_TRAILER_BYTES};
 use super::super::registry::{EventTypeMeta, ShareScope};
-use super::super::{EventError, ParsedEvent, EVENT_TYPE_ADMIN_BOOT, EVENT_TYPE_ADMIN_ONGOING};
+use super::super::{EventError, ParsedEvent, EVENT_TYPE_ADMIN_BOOT, EVENT_TYPE_ADMIN_BOOT};
 
 // ─── Layout (owned by this module) ───
 
@@ -8,8 +8,8 @@ use super::super::{EventError, ParsedEvent, EVENT_TYPE_ADMIN_BOOT, EVENT_TYPE_AD
 ///                     + signed_by(32) + signer_type(1) + signature(64) = 170
 pub const ADMIN_BOOT_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32 + 32 + SIGNATURE_TRAILER_BYTES;
 
-/// AdminOngoing (type 19): same layout as AdminBoot = 170
-pub const ADMIN_ONGOING_WIRE_SIZE: usize = ADMIN_BOOT_WIRE_SIZE;
+/// AdminBoot (type 19): same layout as AdminBoot = 170
+pub const ADMIN_BOOT_WIRE_SIZE: usize = ADMIN_BOOT_WIRE_SIZE;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdminBootEvent {
@@ -22,7 +22,7 @@ pub struct AdminBootEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AdminOngoingEvent {
+pub struct AdminBootEvent {
     pub created_at_ms: u64,
     pub public_key: [u8; 32],
     pub admin_boot_event_id: [u8; 32], // dep: AdminBoot event
@@ -96,7 +96,7 @@ pub fn encode_admin_boot(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     Ok(buf)
 }
 
-/// Wire format for AdminOngoing (170 bytes fixed):
+/// Wire format for AdminBoot (170 bytes fixed):
 /// [0]        type_code = 19
 /// [1..9]     created_at_ms (u64 LE)
 /// [9..41]    public_key (32 bytes)
@@ -104,22 +104,22 @@ pub fn encode_admin_boot(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
 /// [73..105]  signed_by (32 bytes)
 /// [105]      signer_type (1 byte)
 /// [106..170] signature (64 bytes)
-pub fn parse_admin_ongoing(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    if blob.len() < ADMIN_ONGOING_WIRE_SIZE {
+pub fn parse_admin_boot(blob: &[u8]) -> Result<ParsedEvent, EventError> {
+    if blob.len() < ADMIN_BOOT_WIRE_SIZE {
         return Err(EventError::TooShort {
-            expected: ADMIN_ONGOING_WIRE_SIZE,
+            expected: ADMIN_BOOT_WIRE_SIZE,
             actual: blob.len(),
         });
     }
-    if blob.len() > ADMIN_ONGOING_WIRE_SIZE {
+    if blob.len() > ADMIN_BOOT_WIRE_SIZE {
         return Err(EventError::TrailingData {
-            expected: ADMIN_ONGOING_WIRE_SIZE,
+            expected: ADMIN_BOOT_WIRE_SIZE,
             actual: blob.len(),
         });
     }
-    if blob[0] != EVENT_TYPE_ADMIN_ONGOING {
+    if blob[0] != EVENT_TYPE_ADMIN_BOOT {
         return Err(EventError::WrongType {
-            expected: EVENT_TYPE_ADMIN_ONGOING,
+            expected: EVENT_TYPE_ADMIN_BOOT,
             actual: blob[0],
         });
     }
@@ -135,7 +135,7 @@ pub fn parse_admin_ongoing(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     let mut signature = [0u8; 64];
     signature.copy_from_slice(&blob[106..170]);
 
-    Ok(ParsedEvent::AdminOngoing(AdminOngoingEvent {
+    Ok(ParsedEvent::AdminBoot(AdminBootEvent {
         created_at_ms,
         public_key,
         admin_boot_event_id,
@@ -145,13 +145,13 @@ pub fn parse_admin_ongoing(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     }))
 }
 
-pub fn encode_admin_ongoing(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
+pub fn encode_admin_boot(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     let e = match event {
-        ParsedEvent::AdminOngoing(v) => v,
+        ParsedEvent::AdminBoot(v) => v,
         _ => return Err(EventError::WrongVariant),
     };
-    let mut buf = Vec::with_capacity(ADMIN_ONGOING_WIRE_SIZE);
-    buf.push(EVENT_TYPE_ADMIN_ONGOING);
+    let mut buf = Vec::with_capacity(ADMIN_BOOT_WIRE_SIZE);
+    buf.push(EVENT_TYPE_ADMIN_BOOT);
     buf.extend_from_slice(&e.created_at_ms.to_le_bytes());
     buf.extend_from_slice(&e.public_key);
     buf.extend_from_slice(&e.admin_boot_event_id);
@@ -177,8 +177,8 @@ pub static ADMIN_BOOT_META: EventTypeMeta = EventTypeMeta {
     context_loader: crate::event_modules::registry::load_empty_context,
 };
 
-pub static ADMIN_ONGOING_META: EventTypeMeta = EventTypeMeta {
-    type_code: EVENT_TYPE_ADMIN_ONGOING,
+pub static ADMIN_BOOT_META: EventTypeMeta = EventTypeMeta {
+    type_code: EVENT_TYPE_ADMIN_BOOT,
     type_name: "admin_ongoing",
     projection_table: "admins",
     share_scope: ShareScope::Shared,
@@ -187,8 +187,8 @@ pub static ADMIN_ONGOING_META: EventTypeMeta = EventTypeMeta {
     signer_required: true,
     signature_byte_len: 64,
     encryptable: false,
-    parse: parse_admin_ongoing,
-    encode: encode_admin_ongoing,
+    parse: parse_admin_boot,
+    encode: encode_admin_boot,
     projector: super::projector::project_pure,
     context_loader: crate::event_modules::registry::load_empty_context,
 };

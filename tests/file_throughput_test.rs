@@ -15,7 +15,7 @@ use topo::db::{open_connection, schema::create_tables};
 use topo::event_modules::{
     self as events, file_slice::FILE_SLICE_CIPHERTEXT_BYTES, DeviceInviteFirstEvent,
     FileSliceEvent, InviteAcceptedEvent, MessageAttachmentEvent, MessageEvent, ParsedEvent,
-    PeerSharedFirstEvent, SecretKeyEvent, UserBootEvent, UserInviteBootEvent, WorkspaceEvent,
+    PeerSharedFirstEvent, SecretKeyEvent, UserEvent, UserInviteBootEvent, WorkspaceEvent,
 };
 use topo::projection::apply::project_one;
 use topo::projection::signer::sign_event_bytes;
@@ -74,7 +74,7 @@ fn sign_blob(key: &SigningKey, blob: &mut Vec<u8>) {
 }
 
 /// Bootstrap a full identity chain: Workspace → InviteAccepted → UserInviteBoot →
-/// UserBoot → DeviceInviteFirst → PeerSharedFirst. Returns (peer_shared_eid, signing_key).
+/// User → DeviceInviteFirst → PeerSharedFirst. Returns (peer_shared_eid, signing_key).
 fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (EventId, SigningKey, EventId) {
     let mut rng = rand::thread_rng();
 
@@ -113,7 +113,7 @@ fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (EventId, Signin
     project_one(conn, recorded_by, &uib_eid).unwrap();
 
     let user_key = SigningKey::generate(&mut rng);
-    let ub = ParsedEvent::UserBoot(UserBootEvent {
+    let ub = ParsedEvent::User(UserEvent {
         created_at_ms: now_ms(),
         public_key: user_key.verifying_key().to_bytes(),
         username: "bench-user".to_string(),

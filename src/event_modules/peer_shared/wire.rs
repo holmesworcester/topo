@@ -3,7 +3,7 @@ use super::super::layout::common::{
 };
 use super::super::registry::{EventTypeMeta, ShareScope};
 use super::super::{
-    EventError, ParsedEvent, EVENT_TYPE_PEER_SHARED_FIRST, EVENT_TYPE_PEER_SHARED_ONGOING,
+    EventError, ParsedEvent, EVENT_TYPE_PEER_SHARED_FIRST, EVENT_TYPE_PEER_SHARED_FIRST,
 };
 
 // --- Layout (owned by this module) ---
@@ -39,7 +39,7 @@ pub struct PeerSharedFirstEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PeerSharedOngoingEvent {
+pub struct PeerSharedFirstEvent {
     pub created_at_ms: u64,
     pub public_key: [u8; 32],
     pub user_event_id: [u8; 32],
@@ -117,7 +117,7 @@ pub fn encode_peer_shared_first(event: &ParsedEvent) -> Result<Vec<u8>, EventErr
     Ok(buf)
 }
 
-pub fn parse_peer_shared_ongoing(blob: &[u8]) -> Result<ParsedEvent, EventError> {
+pub fn parse_peer_shared_first(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if blob.len() < PEER_SHARED_WIRE_SIZE {
         return Err(EventError::TooShort {
             expected: PEER_SHARED_WIRE_SIZE,
@@ -130,9 +130,9 @@ pub fn parse_peer_shared_ongoing(blob: &[u8]) -> Result<ParsedEvent, EventError>
             actual: blob.len(),
         });
     }
-    if blob[0] != EVENT_TYPE_PEER_SHARED_ONGOING {
+    if blob[0] != EVENT_TYPE_PEER_SHARED_FIRST {
         return Err(EventError::WrongType {
-            expected: EVENT_TYPE_PEER_SHARED_ONGOING,
+            expected: EVENT_TYPE_PEER_SHARED_FIRST,
             actual: blob[0],
         });
     }
@@ -153,7 +153,7 @@ pub fn parse_peer_shared_ongoing(blob: &[u8]) -> Result<ParsedEvent, EventError>
     let mut signature = [0u8; 64];
     signature.copy_from_slice(&blob[off::SIGNATURE..off::SIGNATURE + 64]);
 
-    Ok(ParsedEvent::PeerSharedOngoing(PeerSharedOngoingEvent {
+    Ok(ParsedEvent::PeerSharedFirst(PeerSharedFirstEvent {
         created_at_ms,
         public_key,
         user_event_id,
@@ -164,13 +164,13 @@ pub fn parse_peer_shared_ongoing(blob: &[u8]) -> Result<ParsedEvent, EventError>
     }))
 }
 
-pub fn encode_peer_shared_ongoing(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
+pub fn encode_peer_shared_first(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     let e = match event {
-        ParsedEvent::PeerSharedOngoing(v) => v,
+        ParsedEvent::PeerSharedFirst(v) => v,
         _ => return Err(EventError::WrongVariant),
     };
     let mut buf = vec![0u8; PEER_SHARED_WIRE_SIZE];
-    buf[off::TYPE_CODE] = EVENT_TYPE_PEER_SHARED_ONGOING;
+    buf[off::TYPE_CODE] = EVENT_TYPE_PEER_SHARED_FIRST;
     buf[off::CREATED_AT..off::PUBLIC_KEY].copy_from_slice(&e.created_at_ms.to_le_bytes());
     buf[off::PUBLIC_KEY..off::USER_EVENT_ID].copy_from_slice(&e.public_key);
     buf[off::USER_EVENT_ID..off::DEVICE_NAME].copy_from_slice(&e.user_event_id);
@@ -201,8 +201,8 @@ pub static PEER_SHARED_FIRST_META: EventTypeMeta = EventTypeMeta {
     context_loader: crate::event_modules::registry::load_empty_context,
 };
 
-pub static PEER_SHARED_ONGOING_META: EventTypeMeta = EventTypeMeta {
-    type_code: EVENT_TYPE_PEER_SHARED_ONGOING,
+pub static PEER_SHARED_FIRST_META: EventTypeMeta = EventTypeMeta {
+    type_code: EVENT_TYPE_PEER_SHARED_FIRST,
     type_name: "peer_shared_ongoing",
     projection_table: "peers_shared",
     share_scope: ShareScope::Shared,
@@ -211,8 +211,8 @@ pub static PEER_SHARED_ONGOING_META: EventTypeMeta = EventTypeMeta {
     signer_required: true,
     signature_byte_len: 64,
     encryptable: false,
-    parse: parse_peer_shared_ongoing,
-    encode: encode_peer_shared_ongoing,
+    parse: parse_peer_shared_first,
+    encode: encode_peer_shared_first,
     projector: super::projector::project_pure,
     context_loader: crate::event_modules::registry::load_empty_context,
 };

@@ -13,7 +13,7 @@ pub fn project_pure(
 ) -> ProjectorResult {
     let (public_key, user_event_id, device_name) = match parsed {
         ParsedEvent::PeerSharedFirst(p) => (&p.public_key, &p.user_event_id, &p.device_name),
-        ParsedEvent::PeerSharedOngoing(p) => (&p.public_key, &p.user_event_id, &p.device_name),
+        ParsedEvent::PeerSharedFirst(p) => (&p.public_key, &p.user_event_id, &p.device_name),
         _ => return ProjectorResult::reject("not a peer_shared event".to_string()),
     };
 

@@ -1,13 +1,13 @@
 use super::super::layout::common::IDENTITY_PUBKEY_SIGNED_WIRE_SIZE;
 use super::super::registry::{EventTypeMeta, ShareScope};
 use super::super::{
-    EventError, ParsedEvent, EVENT_TYPE_DEVICE_INVITE_FIRST, EVENT_TYPE_DEVICE_INVITE_ONGOING,
+    EventError, ParsedEvent, EVENT_TYPE_DEVICE_INVITE_FIRST, EVENT_TYPE_DEVICE_INVITE_FIRST,
 };
 
 // ─── Layout (owned by this module) ───
 
 pub const DEVICE_INVITE_FIRST_WIRE_SIZE: usize = IDENTITY_PUBKEY_SIGNED_WIRE_SIZE;
-pub const DEVICE_INVITE_ONGOING_WIRE_SIZE: usize = IDENTITY_PUBKEY_SIGNED_WIRE_SIZE;
+pub const DEVICE_INVITE_FIRST_WIRE_SIZE: usize = IDENTITY_PUBKEY_SIGNED_WIRE_SIZE;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceInviteFirstEvent {
@@ -19,7 +19,7 @@ pub struct DeviceInviteFirstEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeviceInviteOngoingEvent {
+pub struct DeviceInviteFirstEvent {
     pub created_at_ms: u64,
     pub public_key: [u8; 32],
     pub signed_by: [u8; 32], // signer event_id (PeerShared event)
@@ -99,7 +99,7 @@ pub fn encode_device_invite_first(event: &ParsedEvent) -> Result<Vec<u8>, EventE
 /// [41..73]   signed_by (32 bytes)
 /// [73]       signer_type (1 byte)
 /// [74..138]  signature (64 bytes)
-pub fn parse_device_invite_ongoing(blob: &[u8]) -> Result<ParsedEvent, EventError> {
+pub fn parse_device_invite_first(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if blob.len() < IDENTITY_PUBKEY_SIGNED_WIRE_SIZE {
         return Err(EventError::TooShort {
             expected: IDENTITY_PUBKEY_SIGNED_WIRE_SIZE,
@@ -112,9 +112,9 @@ pub fn parse_device_invite_ongoing(blob: &[u8]) -> Result<ParsedEvent, EventErro
             actual: blob.len(),
         });
     }
-    if blob[0] != EVENT_TYPE_DEVICE_INVITE_ONGOING {
+    if blob[0] != EVENT_TYPE_DEVICE_INVITE_FIRST {
         return Err(EventError::WrongType {
-            expected: EVENT_TYPE_DEVICE_INVITE_ONGOING,
+            expected: EVENT_TYPE_DEVICE_INVITE_FIRST,
             actual: blob[0],
         });
     }
@@ -133,7 +133,7 @@ pub fn parse_device_invite_ongoing(blob: &[u8]) -> Result<ParsedEvent, EventErro
     let mut signature = [0u8; 64];
     signature.copy_from_slice(&blob[74..138]);
 
-    Ok(ParsedEvent::DeviceInviteOngoing(DeviceInviteOngoingEvent {
+    Ok(ParsedEvent::DeviceInviteFirst(DeviceInviteFirstEvent {
         created_at_ms,
         public_key,
         signed_by,
@@ -142,13 +142,13 @@ pub fn parse_device_invite_ongoing(blob: &[u8]) -> Result<ParsedEvent, EventErro
     }))
 }
 
-pub fn encode_device_invite_ongoing(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
+pub fn encode_device_invite_first(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     let e = match event {
-        ParsedEvent::DeviceInviteOngoing(v) => v,
+        ParsedEvent::DeviceInviteFirst(v) => v,
         _ => return Err(EventError::WrongVariant),
     };
     let mut buf = Vec::with_capacity(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE);
-    buf.push(EVENT_TYPE_DEVICE_INVITE_ONGOING);
+    buf.push(EVENT_TYPE_DEVICE_INVITE_FIRST);
     buf.extend_from_slice(&e.created_at_ms.to_le_bytes());
     buf.extend_from_slice(&e.public_key);
     buf.extend_from_slice(&e.signed_by);
@@ -173,8 +173,8 @@ pub static DEVICE_INVITE_FIRST_META: EventTypeMeta = EventTypeMeta {
     context_loader: super::projection_context::build_projector_context,
 };
 
-pub static DEVICE_INVITE_ONGOING_META: EventTypeMeta = EventTypeMeta {
-    type_code: EVENT_TYPE_DEVICE_INVITE_ONGOING,
+pub static DEVICE_INVITE_FIRST_META: EventTypeMeta = EventTypeMeta {
+    type_code: EVENT_TYPE_DEVICE_INVITE_FIRST,
     type_name: "device_invite_ongoing",
     projection_table: "device_invites",
     share_scope: ShareScope::Shared,
@@ -183,8 +183,8 @@ pub static DEVICE_INVITE_ONGOING_META: EventTypeMeta = EventTypeMeta {
     signer_required: true,
     signature_byte_len: 64,
     encryptable: false,
-    parse: parse_device_invite_ongoing,
-    encode: encode_device_invite_ongoing,
+    parse: parse_device_invite_first,
+    encode: encode_device_invite_first,
     projector: super::projector::project_pure,
     context_loader: super::projection_context::build_projector_context,
 };
@@ -206,10 +206,10 @@ mod tests {
     #[test]
     fn parse_device_invite_ongoing_rejects_wrong_signer_type() {
         let mut blob = vec![0u8; IDENTITY_PUBKEY_SIGNED_WIRE_SIZE];
-        blob[0] = EVENT_TYPE_DEVICE_INVITE_ONGOING;
+        blob[0] = EVENT_TYPE_DEVICE_INVITE_FIRST;
         blob[73] = 4;
 
-        let err = parse_device_invite_ongoing(&blob).expect_err("should reject wrong signer type");
+        let err = parse_device_invite_first(&blob).expect_err("should reject wrong signer type");
         assert!(matches!(err, EventError::InvalidMetadata(_)));
     }
 }

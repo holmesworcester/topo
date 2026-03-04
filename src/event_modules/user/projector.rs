@@ -9,8 +9,8 @@ pub fn project_pure(
     _ctx: &ContextSnapshot,
 ) -> ProjectorResult {
     let (public_key, username) = match parsed {
-        ParsedEvent::UserBoot(u) => (&u.public_key, &u.username),
-        ParsedEvent::UserOngoing(u) => (&u.public_key, &u.username),
+        ParsedEvent::User(u) => (&u.public_key, &u.username),
+        ParsedEvent::User(u) => (&u.public_key, &u.username),
         _ => return ProjectorResult::reject("not a user event".to_string()),
     };
 

@@ -39,8 +39,8 @@ use crate::db::{open_connection, schema::create_tables, store::insert_recorded_e
 use crate::event_modules::{
     AdminBootEvent, DeviceInviteFirstEvent, FileSliceEvent, InviteAcceptedEvent,
     MessageAttachmentEvent, MessageDeletionEvent, MessageEvent, ParsedEvent, PeerRemovedEvent,
-    PeerSharedFirstEvent, ReactionEvent, SecretKeyEvent, SecretSharedEvent, UserBootEvent,
-    UserInviteBootEvent, UserInviteOngoingEvent, UserRemovedEvent, WorkspaceEvent,
+    PeerSharedFirstEvent, ReactionEvent, SecretKeyEvent, SecretSharedEvent, UserEvent,
+    UserInviteBootEvent, UserInviteBootEvent, UserRemovedEvent, WorkspaceEvent,
 };
 use crate::peering::loops::{
     accept_loop, connect_loop, connect_loop_with_shared_ingest,
@@ -185,7 +185,7 @@ impl Peer {
 
     /// Create a new peer with a full identity chain via the production
     /// `create_workspace` flow (Workspace → InviteAccepted → UserInviteBoot →
-    /// UserBoot → DeviceInviteFirst → PeerSharedFirst + local signer secrets).
+    /// User → DeviceInviteFirst → PeerSharedFirst + local signer secrets).
     /// Content events (Message, Reaction, etc.) are signed with the PeerShared key.
     pub fn new_with_identity(name: &str) -> Self {
         let mut peer = Self::new(name);
@@ -639,7 +639,7 @@ impl Peer {
             .expect("failed to create user_invite_boot")
     }
 
-    /// Create a UserInviteOngoing event (signed by PeerShared key, dep on admin).
+    /// Create a UserInviteBoot event (signed by PeerShared key, dep on admin).
     /// Used when an existing admin invites a new user.
     pub fn create_user_invite_ongoing(
         &self,
@@ -649,7 +649,7 @@ impl Peer {
         admin_event_id: &EventId,
     ) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
-        let evt = ParsedEvent::UserInviteOngoing(UserInviteOngoingEvent {
+        let evt = ParsedEvent::UserInviteBoot(UserInviteBootEvent {
             created_at_ms: current_timestamp_ms(),
             public_key: invite_public_key,
             admin_event_id: *admin_event_id,
@@ -661,7 +661,7 @@ impl Peer {
             .expect("failed to create user_invite_ongoing")
     }
 
-    /// Create a UserBoot event (signed by UserInvite key). Returns the event ID.
+    /// Create a User event (signed by UserInvite key). Returns the event ID.
     pub fn create_user_boot(
         &self,
         user_public_key: [u8; 32],
@@ -669,7 +669,7 @@ impl Peer {
         user_invite_event_id: &EventId,
     ) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
-        let evt = ParsedEvent::UserBoot(UserBootEvent {
+        let evt = ParsedEvent::User(UserEvent {
             created_at_ms: current_timestamp_ms(),
             public_key: user_public_key,
             username: "test-user".to_string(),

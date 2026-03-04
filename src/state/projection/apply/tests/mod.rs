@@ -82,7 +82,7 @@ fn insert_event_raw(conn: &Connection, recorded_by: &str, blob: &[u8]) -> EventI
 }
 
 use crate::event_modules::{
-    DeviceInviteFirstEvent, InviteAcceptedEvent, PeerSharedFirstEvent, UserBootEvent,
+    DeviceInviteFirstEvent, InviteAcceptedEvent, PeerSharedFirstEvent, UserEvent,
     UserInviteBootEvent,
 };
 
@@ -149,10 +149,10 @@ fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (EventId, Signin
     let uib_eid = insert_event_raw(conn, recorded_by, &uib_blob);
     project_one(conn, recorded_by, &uib_eid).unwrap();
 
-    // 4. UserBoot (signed by invite key)
+    // 4. User (signed by invite key)
     let user_key = SigningKey::generate(&mut rng);
     let user_pub = user_key.verifying_key().to_bytes();
-    let ub = UserBootEvent {
+    let ub = UserEvent {
         created_at_ms: now_ms(),
         public_key: user_pub,
         username: "user".to_string(),
@@ -160,7 +160,7 @@ fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (EventId, Signin
         signer_type: 2,
         signature: [0u8; 64],
     };
-    let ub_event = ParsedEvent::UserBoot(ub);
+    let ub_event = ParsedEvent::User(ub);
     let mut ub_blob = events::encode_event(&ub_event).unwrap();
     sign_blob(&invite_key, &mut ub_blob);
     let ub_eid = insert_event_raw(conn, recorded_by, &ub_blob);
@@ -249,10 +249,10 @@ fn build_identity_chain_deferred(
     sign_blob(&workspace_key, &mut uib_blob);
     let uib_eid = hash_event(&uib_blob);
 
-    // 4. UserBoot (signed by invite key)
+    // 4. User (signed by invite key)
     let user_key = SigningKey::generate(&mut rng);
     let user_pub = user_key.verifying_key().to_bytes();
-    let ub = UserBootEvent {
+    let ub = UserEvent {
         created_at_ms: now_ms(),
         public_key: user_pub,
         username: "user".to_string(),
@@ -260,7 +260,7 @@ fn build_identity_chain_deferred(
         signer_type: 2,
         signature: [0u8; 64],
     };
-    let ub_event = ParsedEvent::UserBoot(ub);
+    let ub_event = ParsedEvent::User(ub);
     let mut ub_blob = events::encode_event(&ub_event).unwrap();
     sign_blob(&invite_key, &mut ub_blob);
     let ub_eid = hash_event(&ub_blob);
@@ -3365,7 +3365,7 @@ fn test_file_slice_wrong_signer_rejected() {
     let recorded_by = "peer1";
     let mut rng = rand::thread_rng();
 
-    // Build a shared identity chain up through UserBoot, then branch
+    // Build a shared identity chain up through User, then branch
     // into two separate PeerSharedFirst signers (A and B).
 
     // 1. Workspace
@@ -3407,10 +3407,10 @@ fn test_file_slice_wrong_signer_rejected() {
     let uib_eid = insert_event_raw(&conn, recorded_by, &uib_blob);
     project_one(&conn, recorded_by, &uib_eid).unwrap();
 
-    // 4. UserBoot (signed by invite key)
+    // 4. User (signed by invite key)
     let user_key = SigningKey::generate(&mut rng);
     let user_pub = user_key.verifying_key().to_bytes();
-    let ub = UserBootEvent {
+    let ub = UserEvent {
         created_at_ms: now_ms(),
         public_key: user_pub,
         username: "user".to_string(),
@@ -3418,7 +3418,7 @@ fn test_file_slice_wrong_signer_rejected() {
         signer_type: 2,
         signature: [0u8; 64],
     };
-    let ub_event = ParsedEvent::UserBoot(ub);
+    let ub_event = ParsedEvent::User(ub);
     let mut ub_blob = events::encode_event(&ub_event).unwrap();
     sign_blob(&invite_key, &mut ub_blob);
     let ub_eid = insert_event_raw(&conn, recorded_by, &ub_blob);
@@ -3459,7 +3459,7 @@ fn test_file_slice_wrong_signer_rejected() {
     project_one(&conn, recorded_by, &signer_a_eid).unwrap();
     register_signer_user(signer_a_eid, ub_eid);
 
-    // 5b. DeviceInviteFirst B (signed by user key — branching from same UserBoot)
+    // 5b. DeviceInviteFirst B (signed by user key — branching from same User)
     let device_invite_key_b = SigningKey::generate(&mut rng);
     let device_invite_pub_b = device_invite_key_b.verifying_key().to_bytes();
     let dif_b = DeviceInviteFirstEvent {
@@ -5128,7 +5128,7 @@ fn test_full_bootstrap_progression_from_projected_sql_state() {
     // Step 4: Full identity chain completes
     let user_key = SigningKey::generate(&mut rng);
     let user_pub = user_key.verifying_key().to_bytes();
-    let ub = UserBootEvent {
+    let ub = UserEvent {
         created_at_ms: now_ms(),
         public_key: user_pub,
         username: "testuser".to_string(),
@@ -5136,14 +5136,14 @@ fn test_full_bootstrap_progression_from_projected_sql_state() {
         signer_type: 2,
         signature: [0u8; 64],
     };
-    let ub_event = ParsedEvent::UserBoot(ub);
+    let ub_event = ParsedEvent::User(ub);
     let mut ub_blob = events::encode_event(&ub_event).unwrap();
     sign_blob(&invite_key, &mut ub_blob);
     let ub_eid = insert_event_raw(&conn, recorded_by, &ub_blob);
     assert_eq!(
         project_one(&conn, recorded_by, &ub_eid).unwrap(),
         ProjectionDecision::Valid,
-        "UserBoot must project"
+        "User must project"
     );
 
     let device_invite_key = SigningKey::generate(&mut rng);
@@ -5295,7 +5295,7 @@ fn test_bootstrap_trust_superseded_by_matching_peer_shared() {
 
     // For cleanliness, directly insert a PeerSharedFirst with the target public_key
     // and verify supersession happens.
-    // We need: workspace valid + InviteAccepted + UserInviteBoot + UserBoot + DeviceInviteFirst + PeerSharedFirst
+    // We need: workspace valid + InviteAccepted + UserInviteBoot + User + DeviceInviteFirst + PeerSharedFirst
     // The workspace event needs to match trust anchor workspace_id ([0xAA;32]).
     // Since we can't control the hash, verify supersession via the
     // transport-trust supersession helper directly.

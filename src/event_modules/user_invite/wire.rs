@@ -1,7 +1,7 @@
 use super::super::layout::common::{COMMON_HEADER_BYTES, SIGNATURE_TRAILER_BYTES};
 use super::super::registry::{EventTypeMeta, ShareScope};
 use super::super::{
-    EventError, ParsedEvent, EVENT_TYPE_USER_INVITE_BOOT, EVENT_TYPE_USER_INVITE_ONGOING,
+    EventError, ParsedEvent, EVENT_TYPE_USER_INVITE_BOOT, EVENT_TYPE_USER_INVITE_BOOT,
 };
 
 // ─── Layout (owned by this module) ───
@@ -11,8 +11,8 @@ use super::super::{
 pub const USER_INVITE_BOOT_WIRE_SIZE: usize =
     COMMON_HEADER_BYTES + 32 + 32 + SIGNATURE_TRAILER_BYTES;
 
-/// UserInviteOngoing (type 11): same layout as UserInviteBoot = 170
-pub const USER_INVITE_ONGOING_WIRE_SIZE: usize = USER_INVITE_BOOT_WIRE_SIZE;
+/// UserInviteBoot (type 11): same layout as UserInviteBoot = 170
+pub const USER_INVITE_BOOT_WIRE_SIZE: usize = USER_INVITE_BOOT_WIRE_SIZE;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserInviteBootEvent {
@@ -25,7 +25,7 @@ pub struct UserInviteBootEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UserInviteOngoingEvent {
+pub struct UserInviteBootEvent {
     pub created_at_ms: u64,
     pub public_key: [u8; 32],     // Ed25519 key for this invite
     pub admin_event_id: [u8; 32], // dep: admin event authorizing this invite
@@ -104,7 +104,7 @@ pub fn encode_user_invite_boot(event: &ParsedEvent) -> Result<Vec<u8>, EventErro
     Ok(buf)
 }
 
-/// Wire format for UserInviteOngoing (170 bytes fixed):
+/// Wire format for UserInviteBoot (170 bytes fixed):
 /// [0]        type_code = 11
 /// [1..9]     created_at_ms (u64 LE)
 /// [9..41]    public_key (32 bytes)
@@ -112,22 +112,22 @@ pub fn encode_user_invite_boot(event: &ParsedEvent) -> Result<Vec<u8>, EventErro
 /// [73..105]  signed_by (32 bytes)
 /// [105]      signer_type (1 byte)
 /// [106..170] signature (64 bytes)
-pub fn parse_user_invite_ongoing(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    if blob.len() < USER_INVITE_ONGOING_WIRE_SIZE {
+pub fn parse_user_invite_boot(blob: &[u8]) -> Result<ParsedEvent, EventError> {
+    if blob.len() < USER_INVITE_BOOT_WIRE_SIZE {
         return Err(EventError::TooShort {
-            expected: USER_INVITE_ONGOING_WIRE_SIZE,
+            expected: USER_INVITE_BOOT_WIRE_SIZE,
             actual: blob.len(),
         });
     }
-    if blob.len() > USER_INVITE_ONGOING_WIRE_SIZE {
+    if blob.len() > USER_INVITE_BOOT_WIRE_SIZE {
         return Err(EventError::TrailingData {
-            expected: USER_INVITE_ONGOING_WIRE_SIZE,
+            expected: USER_INVITE_BOOT_WIRE_SIZE,
             actual: blob.len(),
         });
     }
-    if blob[0] != EVENT_TYPE_USER_INVITE_ONGOING {
+    if blob[0] != EVENT_TYPE_USER_INVITE_BOOT {
         return Err(EventError::WrongType {
-            expected: EVENT_TYPE_USER_INVITE_ONGOING,
+            expected: EVENT_TYPE_USER_INVITE_BOOT,
             actual: blob[0],
         });
     }
@@ -148,7 +148,7 @@ pub fn parse_user_invite_ongoing(blob: &[u8]) -> Result<ParsedEvent, EventError>
     let mut signature = [0u8; 64];
     signature.copy_from_slice(&blob[106..170]);
 
-    Ok(ParsedEvent::UserInviteOngoing(UserInviteOngoingEvent {
+    Ok(ParsedEvent::UserInviteBoot(UserInviteBootEvent {
         created_at_ms,
         public_key,
         admin_event_id,
@@ -158,13 +158,13 @@ pub fn parse_user_invite_ongoing(blob: &[u8]) -> Result<ParsedEvent, EventError>
     }))
 }
 
-pub fn encode_user_invite_ongoing(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
+pub fn encode_user_invite_boot(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     let e = match event {
-        ParsedEvent::UserInviteOngoing(v) => v,
+        ParsedEvent::UserInviteBoot(v) => v,
         _ => return Err(EventError::WrongVariant),
     };
-    let mut buf = Vec::with_capacity(USER_INVITE_ONGOING_WIRE_SIZE);
-    buf.push(EVENT_TYPE_USER_INVITE_ONGOING);
+    let mut buf = Vec::with_capacity(USER_INVITE_BOOT_WIRE_SIZE);
+    buf.push(EVENT_TYPE_USER_INVITE_BOOT);
     buf.extend_from_slice(&e.created_at_ms.to_le_bytes());
     buf.extend_from_slice(&e.public_key);
     buf.extend_from_slice(&e.admin_event_id);
@@ -190,8 +190,8 @@ pub static USER_INVITE_BOOT_META: EventTypeMeta = EventTypeMeta {
     context_loader: super::projection_context::build_projector_context,
 };
 
-pub static USER_INVITE_ONGOING_META: EventTypeMeta = EventTypeMeta {
-    type_code: EVENT_TYPE_USER_INVITE_ONGOING,
+pub static USER_INVITE_BOOT_META: EventTypeMeta = EventTypeMeta {
+    type_code: EVENT_TYPE_USER_INVITE_BOOT,
     type_name: "user_invite_ongoing",
     projection_table: "user_invites",
     share_scope: ShareScope::Shared,
@@ -200,8 +200,8 @@ pub static USER_INVITE_ONGOING_META: EventTypeMeta = EventTypeMeta {
     signer_required: true,
     signature_byte_len: 64,
     encryptable: false,
-    parse: parse_user_invite_ongoing,
-    encode: encode_user_invite_ongoing,
+    parse: parse_user_invite_boot,
+    encode: encode_user_invite_boot,
     projector: super::projector::project_pure,
     context_loader: super::projection_context::build_projector_context,
 };
@@ -222,11 +222,11 @@ mod tests {
 
     #[test]
     fn parse_user_invite_ongoing_rejects_wrong_signer_type() {
-        let mut blob = vec![0u8; USER_INVITE_ONGOING_WIRE_SIZE];
-        blob[0] = EVENT_TYPE_USER_INVITE_ONGOING;
+        let mut blob = vec![0u8; USER_INVITE_BOOT_WIRE_SIZE];
+        blob[0] = EVENT_TYPE_USER_INVITE_BOOT;
         blob[105] = 1;
 
-        let err = parse_user_invite_ongoing(&blob).expect_err("should reject wrong signer type");
+        let err = parse_user_invite_boot(&blob).expect_err("should reject wrong signer type");
         assert!(matches!(err, EventError::InvalidMetadata(_)));
     }
 }

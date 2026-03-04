@@ -8,7 +8,7 @@
 mod tests {
     use crate::harness::fixtures::*;
     use topo::event_modules::user_invite::project_pure;
-    use topo::event_modules::user_invite::{UserInviteBootEvent, UserInviteOngoingEvent};
+    use topo::event_modules::user_invite::{UserInviteBootEvent, UserInviteBootEvent};
     use topo::event_modules::ParsedEvent;
 
     const PEER: &str = "peer_inviter";
@@ -26,7 +26,7 @@ mod tests {
     }
 
     fn make_user_invite_ongoing(public_key: [u8; 32]) -> ParsedEvent {
-        ParsedEvent::UserInviteOngoing(UserInviteOngoingEvent {
+        ParsedEvent::UserInviteBoot(UserInviteBootEvent {
             created_at_ms: 8001,
             public_key,
             admin_event_id: [11u8; 32],

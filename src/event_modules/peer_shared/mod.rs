@@ -11,9 +11,9 @@ pub use queries::{
     IdentityResponse, PeerItem,
 };
 pub use wire::{
-    encode_peer_shared_first, encode_peer_shared_ongoing, parse_peer_shared_first,
-    parse_peer_shared_ongoing, PeerSharedFirstEvent, PeerSharedOngoingEvent,
-    PEER_SHARED_FIRST_META, PEER_SHARED_ONGOING_META, PEER_SHARED_WIRE_SIZE,
+    encode_peer_shared_first, encode_peer_shared_first, parse_peer_shared_first,
+    parse_peer_shared_first, PeerSharedFirstEvent, PeerSharedFirstEvent,
+    PEER_SHARED_FIRST_META, PEER_SHARED_FIRST_META, PEER_SHARED_WIRE_SIZE,
 };
 
 use rusqlite::Connection;

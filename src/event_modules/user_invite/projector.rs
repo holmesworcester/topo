@@ -12,7 +12,7 @@ pub fn project_pure(
 ) -> ProjectorResult {
     let (public_key, created_at_ms, is_boot) = match parsed {
         ParsedEvent::UserInviteBoot(ui) => (&ui.public_key, ui.created_at_ms as i64, true),
-        ParsedEvent::UserInviteOngoing(ui) => (&ui.public_key, ui.created_at_ms as i64, false),
+        ParsedEvent::UserInviteBoot(ui) => (&ui.public_key, ui.created_at_ms as i64, false),
         _ => return ProjectorResult::reject("not a user_invite event".to_string()),
     };
 

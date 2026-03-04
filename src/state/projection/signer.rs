@@ -28,10 +28,10 @@ pub fn resolve_signer_key(
     // Valid type codes for each signer_type
     let valid_type_codes: &[u8] = match signer_type {
         1 => &[8],      // Workspace
-        2 => &[10, 11], // UserInviteBoot, UserInviteOngoing
-        3 => &[12, 13], // DeviceInviteFirst, DeviceInviteOngoing
-        4 => &[14, 15], // UserBoot, UserOngoing
-        5 => &[16, 17], // PeerSharedFirst, PeerSharedOngoing
+        2 => &[10, 11], // UserInviteBoot, UserInviteBoot
+        3 => &[12, 13], // DeviceInviteFirst, DeviceInviteFirst
+        4 => &[14, 15], // User, User
+        5 => &[16, 17], // PeerSharedFirst, PeerSharedFirst
         _ => {
             return Ok(SignerResolution::Invalid(format!(
                 "unsupported signer_type: {}",

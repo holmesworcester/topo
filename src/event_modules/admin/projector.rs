@@ -10,7 +10,7 @@ pub fn project_pure(
 ) -> ProjectorResult {
     let public_key = match parsed {
         ParsedEvent::AdminBoot(a) => &a.public_key,
-        ParsedEvent::AdminOngoing(a) => &a.public_key,
+        ParsedEvent::AdminBoot(a) => &a.public_key,
         _ => return ProjectorResult::reject("not an admin event".to_string()),
     };
 

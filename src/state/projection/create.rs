@@ -383,7 +383,7 @@ mod tests {
     use crate::db::{open_in_memory, schema::create_tables};
     use crate::event_modules::{
         DeviceInviteFirstEvent, InviteAcceptedEvent, MessageEvent, PeerSharedFirstEvent,
-        ReactionEvent, UserBootEvent, UserInviteBootEvent, WorkspaceEvent,
+        ReactionEvent, UserEvent, UserInviteBootEvent, WorkspaceEvent,
     };
     use ed25519_dalek::SigningKey;
 
@@ -447,7 +447,7 @@ mod tests {
             create_signed_event_synchronous(conn, recorded_by, &uib, &workspace_key).unwrap();
 
         let user_key = SigningKey::generate(&mut rng);
-        let ub = ParsedEvent::UserBoot(UserBootEvent {
+        let ub = ParsedEvent::User(UserEvent {
             created_at_ms: now_ms(),
             public_key: user_key.verifying_key().to_bytes(),
             username: "test-user".to_string(),

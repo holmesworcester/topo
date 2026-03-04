@@ -8,7 +8,7 @@
 mod tests {
     use crate::harness::fixtures::*;
     use topo::event_modules::device_invite::project_pure;
-    use topo::event_modules::device_invite::{DeviceInviteFirstEvent, DeviceInviteOngoingEvent};
+    use topo::event_modules::device_invite::{DeviceInviteFirstEvent, DeviceInviteFirstEvent};
     use topo::event_modules::ParsedEvent;
 
     const PEER: &str = "peer_inviter";
@@ -25,7 +25,7 @@ mod tests {
     }
 
     fn make_device_invite_ongoing(public_key: [u8; 32]) -> ParsedEvent {
-        ParsedEvent::DeviceInviteOngoing(DeviceInviteOngoingEvent {
+        ParsedEvent::DeviceInviteFirst(DeviceInviteFirstEvent {
             created_at_ms: 9001,
             public_key,
             signed_by: [3u8; 32],

@@ -12,7 +12,7 @@ pub fn project_pure(
 ) -> ProjectorResult {
     let (public_key, created_at_ms, is_first) = match parsed {
         ParsedEvent::DeviceInviteFirst(di) => (&di.public_key, di.created_at_ms as i64, true),
-        ParsedEvent::DeviceInviteOngoing(di) => (&di.public_key, di.created_at_ms as i64, false),
+        ParsedEvent::DeviceInviteFirst(di) => (&di.public_key, di.created_at_ms as i64, false),
         _ => return ProjectorResult::reject("not a device_invite event".to_string()),
     };
 

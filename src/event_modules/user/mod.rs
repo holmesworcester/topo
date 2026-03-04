@@ -8,8 +8,8 @@ pub use commands::{ban_for_peer, create_user_removed, remove_user, BanResponse};
 pub use projector::project_pure;
 pub use queries::{count, first_event_id, list, list_items, UserItem, UserRow};
 pub use wire::{
-    encode_user_boot, encode_user_ongoing, parse_user_boot, parse_user_ongoing, UserBootEvent,
-    UserOngoingEvent, USER_BOOT_META, USER_ONGOING_META, USER_WIRE_SIZE,
+    encode_user, encode_user, parse_user, parse_user, UserEvent,
+    UserEvent, USER_META, USER_META, USER_WIRE_SIZE,
 };
 
 use rusqlite::Connection;

@@ -25,7 +25,7 @@ pub const NAME_BYTES: usize = 64;
 
 /// Identity-pubkey-with-signer layout: type(1) + created_at(8) + public_key(32)
 ///   + signed_by(32) + signer_type(1) + signature(64) = 138
-/// Used by: DeviceInviteFirst(12), DeviceInviteOngoing(13),
+/// Used by: DeviceInviteFirst(12), DeviceInviteFirst(13),
 ///          UserRemoved(20), PeerRemoved(21)
 pub const IDENTITY_PUBKEY_SIGNED_WIRE_SIZE: usize =
     COMMON_HEADER_BYTES + 32 + SIGNATURE_TRAILER_BYTES;
@@ -69,15 +69,15 @@ pub fn encrypted_inner_wire_size(inner_type_code: u8) -> Option<usize> {
         7 => Some(MESSAGE_DELETION_WIRE_SIZE),        // MessageDeletion
         8 => Some(WORKSPACE_WIRE_SIZE),               // Workspace
         10 => Some(USER_INVITE_BOOT_WIRE_SIZE),       // UserInviteBoot
-        11 => Some(USER_INVITE_BOOT_WIRE_SIZE),       // UserInviteOngoing (same layout)
+        11 => Some(USER_INVITE_BOOT_WIRE_SIZE),       // UserInviteBoot (same layout)
         12 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE), // DeviceInviteFirst
-        13 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE), // DeviceInviteOngoing
-        14 => Some(USER_WIRE_SIZE),                   // UserBoot
-        15 => Some(USER_WIRE_SIZE),                   // UserOngoing
+        13 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE), // DeviceInviteFirst
+        14 => Some(USER_WIRE_SIZE),                   // User
+        15 => Some(USER_WIRE_SIZE),                   // User
         16 => Some(PEER_SHARED_WIRE_SIZE),            // PeerSharedFirst
-        17 => Some(PEER_SHARED_WIRE_SIZE),            // PeerSharedOngoing
+        17 => Some(PEER_SHARED_WIRE_SIZE),            // PeerSharedFirst
         18 => Some(ADMIN_BOOT_WIRE_SIZE),             // AdminBoot
-        19 => Some(ADMIN_BOOT_WIRE_SIZE),             // AdminOngoing (same layout)
+        19 => Some(ADMIN_BOOT_WIRE_SIZE),             // AdminBoot (same layout)
         20 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE), // UserRemoved
         21 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE), // PeerRemoved
         22 => Some(SECRET_SHARED_WIRE_SIZE),          // SecretShared
@@ -237,7 +237,7 @@ mod tests {
 
     #[test]
     fn test_per_event_wire_sizes() {
-        use super::super::super::admin::{ADMIN_BOOT_WIRE_SIZE, ADMIN_ONGOING_WIRE_SIZE};
+        use super::super::super::admin::{ADMIN_BOOT_WIRE_SIZE, ADMIN_BOOT_WIRE_SIZE};
         use super::super::super::bench_dep::BENCH_DEP_WIRE_SIZE;
         use super::super::super::file_slice::FILE_SLICE_WIRE_SIZE;
         use super::super::super::invite_accepted::INVITE_ACCEPTED_WIRE_SIZE;
@@ -250,7 +250,7 @@ mod tests {
         use super::super::super::secret_shared::SECRET_SHARED_WIRE_SIZE;
         use super::super::super::user::USER_WIRE_SIZE;
         use super::super::super::user_invite::{
-            USER_INVITE_BOOT_WIRE_SIZE, USER_INVITE_ONGOING_WIRE_SIZE,
+            USER_INVITE_BOOT_WIRE_SIZE, USER_INVITE_BOOT_WIRE_SIZE,
         };
         use super::super::super::workspace::WORKSPACE_WIRE_SIZE;
 
@@ -266,9 +266,9 @@ mod tests {
         assert_eq!(MESSAGE_DELETION_WIRE_SIZE, 170);
         assert_eq!(INVITE_ACCEPTED_WIRE_SIZE, 73);
         assert_eq!(USER_INVITE_BOOT_WIRE_SIZE, 170);
-        assert_eq!(USER_INVITE_ONGOING_WIRE_SIZE, 170);
+        assert_eq!(USER_INVITE_BOOT_WIRE_SIZE, 170);
         assert_eq!(ADMIN_BOOT_WIRE_SIZE, 170);
-        assert_eq!(ADMIN_ONGOING_WIRE_SIZE, 170);
+        assert_eq!(ADMIN_BOOT_WIRE_SIZE, 170);
         assert_eq!(SECRET_SHARED_WIRE_SIZE, 202);
         assert_eq!(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE, 138);
     }

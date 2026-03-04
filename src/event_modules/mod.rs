@@ -23,9 +23,9 @@ pub mod workspace;
 use rusqlite::Connection;
 use std::sync::OnceLock;
 
-pub use admin::{AdminBootEvent, AdminOngoingEvent};
+pub use admin::{AdminBootEvent, AdminBootEvent};
 pub use bench_dep::BenchDepEvent;
-pub use device_invite::{DeviceInviteFirstEvent, DeviceInviteOngoingEvent};
+pub use device_invite::{DeviceInviteFirstEvent, DeviceInviteFirstEvent};
 pub use encrypted::EncryptedEvent;
 pub use file_slice::FileSliceEvent;
 pub use invite_accepted::InviteAcceptedEvent;
@@ -34,13 +34,13 @@ pub use message::MessageEvent;
 pub use message_attachment::MessageAttachmentEvent;
 pub use message_deletion::MessageDeletionEvent;
 pub use peer_removed::PeerRemovedEvent;
-pub use peer_shared::{PeerSharedFirstEvent, PeerSharedOngoingEvent};
+pub use peer_shared::{PeerSharedFirstEvent, PeerSharedFirstEvent};
 pub use reaction::ReactionEvent;
 pub use registry::{EventRegistry, EventTypeMeta, ShareScope};
 pub use secret_key::SecretKeyEvent;
 pub use secret_shared::SecretSharedEvent;
-pub use user::{UserBootEvent, UserOngoingEvent};
-pub use user_invite::{UserInviteBootEvent, UserInviteOngoingEvent};
+pub use user::{UserEvent, UserEvent};
+pub use user_invite::{UserInviteBootEvent, UserInviteBootEvent};
 pub use user_removed::UserRemovedEvent;
 pub use workspace::WorkspaceEvent;
 
@@ -52,15 +52,15 @@ pub const EVENT_TYPE_MESSAGE_DELETION: u8 = 7;
 pub const EVENT_TYPE_WORKSPACE: u8 = 8;
 pub const EVENT_TYPE_INVITE_ACCEPTED: u8 = 9;
 pub const EVENT_TYPE_USER_INVITE_BOOT: u8 = 10;
-pub const EVENT_TYPE_USER_INVITE_ONGOING: u8 = 11;
+pub const EVENT_TYPE_USER_INVITE_BOOT: u8 = 11;
 pub const EVENT_TYPE_DEVICE_INVITE_FIRST: u8 = 12;
-pub const EVENT_TYPE_DEVICE_INVITE_ONGOING: u8 = 13;
-pub const EVENT_TYPE_USER_BOOT: u8 = 14;
-pub const EVENT_TYPE_USER_ONGOING: u8 = 15;
+pub const EVENT_TYPE_DEVICE_INVITE_FIRST: u8 = 13;
+pub const EVENT_TYPE_USER: u8 = 14;
+pub const EVENT_TYPE_USER: u8 = 15;
 pub const EVENT_TYPE_PEER_SHARED_FIRST: u8 = 16;
-pub const EVENT_TYPE_PEER_SHARED_ONGOING: u8 = 17;
+pub const EVENT_TYPE_PEER_SHARED_FIRST: u8 = 17;
 pub const EVENT_TYPE_ADMIN_BOOT: u8 = 18;
-pub const EVENT_TYPE_ADMIN_ONGOING: u8 = 19;
+pub const EVENT_TYPE_ADMIN_BOOT: u8 = 19;
 pub const EVENT_TYPE_USER_REMOVED: u8 = 20;
 pub const EVENT_TYPE_PEER_REMOVED: u8 = 21;
 pub const EVENT_TYPE_SECRET_SHARED: u8 = 22;
@@ -102,15 +102,15 @@ pub enum ParsedEvent {
     Workspace(WorkspaceEvent),
     InviteAccepted(InviteAcceptedEvent),
     UserInviteBoot(UserInviteBootEvent),
-    UserInviteOngoing(UserInviteOngoingEvent),
+    UserInviteBoot(UserInviteBootEvent),
     DeviceInviteFirst(DeviceInviteFirstEvent),
-    DeviceInviteOngoing(DeviceInviteOngoingEvent),
-    UserBoot(UserBootEvent),
-    UserOngoing(UserOngoingEvent),
+    DeviceInviteFirst(DeviceInviteFirstEvent),
+    User(UserEvent),
+    User(UserEvent),
     PeerSharedFirst(PeerSharedFirstEvent),
-    PeerSharedOngoing(PeerSharedOngoingEvent),
+    PeerSharedFirst(PeerSharedFirstEvent),
     AdminBoot(AdminBootEvent),
-    AdminOngoing(AdminOngoingEvent),
+    AdminBoot(AdminBootEvent),
     UserRemoved(UserRemovedEvent),
     PeerRemoved(PeerRemovedEvent),
     SecretShared(SecretSharedEvent),
@@ -131,15 +131,15 @@ impl ParsedEvent {
             ParsedEvent::Workspace(w) => w.created_at_ms,
             ParsedEvent::InviteAccepted(a) => a.created_at_ms,
             ParsedEvent::UserInviteBoot(u) => u.created_at_ms,
-            ParsedEvent::UserInviteOngoing(u) => u.created_at_ms,
+            ParsedEvent::UserInviteBoot(u) => u.created_at_ms,
             ParsedEvent::DeviceInviteFirst(d) => d.created_at_ms,
-            ParsedEvent::DeviceInviteOngoing(d) => d.created_at_ms,
-            ParsedEvent::UserBoot(u) => u.created_at_ms,
-            ParsedEvent::UserOngoing(u) => u.created_at_ms,
+            ParsedEvent::DeviceInviteFirst(d) => d.created_at_ms,
+            ParsedEvent::User(u) => u.created_at_ms,
+            ParsedEvent::User(u) => u.created_at_ms,
             ParsedEvent::PeerSharedFirst(p) => p.created_at_ms,
-            ParsedEvent::PeerSharedOngoing(p) => p.created_at_ms,
+            ParsedEvent::PeerSharedFirst(p) => p.created_at_ms,
             ParsedEvent::AdminBoot(a) => a.created_at_ms,
-            ParsedEvent::AdminOngoing(a) => a.created_at_ms,
+            ParsedEvent::AdminBoot(a) => a.created_at_ms,
             ParsedEvent::UserRemoved(r) => r.created_at_ms,
             ParsedEvent::PeerRemoved(r) => r.created_at_ms,
             ParsedEvent::SecretShared(s) => s.created_at_ms,
@@ -171,19 +171,19 @@ impl ParsedEvent {
             ParsedEvent::InviteAccepted(_) => vec![],
             // UserInviteBoot: signed_by is a dep (workspace_id is reference, not dep)
             ParsedEvent::UserInviteBoot(u) => vec![("signed_by", u.signed_by)],
-            ParsedEvent::UserInviteOngoing(u) => vec![
+            ParsedEvent::UserInviteBoot(u) => vec![
                 ("admin_event_id", u.admin_event_id),
                 ("signed_by", u.signed_by),
             ],
             ParsedEvent::DeviceInviteFirst(d) => vec![("signed_by", d.signed_by)],
-            ParsedEvent::DeviceInviteOngoing(d) => vec![("signed_by", d.signed_by)],
-            ParsedEvent::UserBoot(u) => vec![("signed_by", u.signed_by)],
-            ParsedEvent::UserOngoing(u) => vec![("signed_by", u.signed_by)],
+            ParsedEvent::DeviceInviteFirst(d) => vec![("signed_by", d.signed_by)],
+            ParsedEvent::User(u) => vec![("signed_by", u.signed_by)],
+            ParsedEvent::User(u) => vec![("signed_by", u.signed_by)],
             ParsedEvent::PeerSharedFirst(p) => vec![
                 ("user_event_id", p.user_event_id),
                 ("signed_by", p.signed_by),
             ],
-            ParsedEvent::PeerSharedOngoing(p) => vec![
+            ParsedEvent::PeerSharedFirst(p) => vec![
                 ("user_event_id", p.user_event_id),
                 ("signed_by", p.signed_by),
             ],
@@ -191,7 +191,7 @@ impl ParsedEvent {
                 ("user_event_id", a.user_event_id),
                 ("signed_by", a.signed_by),
             ],
-            ParsedEvent::AdminOngoing(a) => vec![
+            ParsedEvent::AdminBoot(a) => vec![
                 ("admin_boot_event_id", a.admin_boot_event_id),
                 ("signed_by", a.signed_by),
             ],
@@ -234,15 +234,15 @@ impl ParsedEvent {
             ParsedEvent::Workspace(_) => EVENT_TYPE_WORKSPACE,
             ParsedEvent::InviteAccepted(_) => EVENT_TYPE_INVITE_ACCEPTED,
             ParsedEvent::UserInviteBoot(_) => EVENT_TYPE_USER_INVITE_BOOT,
-            ParsedEvent::UserInviteOngoing(_) => EVENT_TYPE_USER_INVITE_ONGOING,
+            ParsedEvent::UserInviteBoot(_) => EVENT_TYPE_USER_INVITE_BOOT,
             ParsedEvent::DeviceInviteFirst(_) => EVENT_TYPE_DEVICE_INVITE_FIRST,
-            ParsedEvent::DeviceInviteOngoing(_) => EVENT_TYPE_DEVICE_INVITE_ONGOING,
-            ParsedEvent::UserBoot(_) => EVENT_TYPE_USER_BOOT,
-            ParsedEvent::UserOngoing(_) => EVENT_TYPE_USER_ONGOING,
+            ParsedEvent::DeviceInviteFirst(_) => EVENT_TYPE_DEVICE_INVITE_FIRST,
+            ParsedEvent::User(_) => EVENT_TYPE_USER,
+            ParsedEvent::User(_) => EVENT_TYPE_USER,
             ParsedEvent::PeerSharedFirst(_) => EVENT_TYPE_PEER_SHARED_FIRST,
-            ParsedEvent::PeerSharedOngoing(_) => EVENT_TYPE_PEER_SHARED_ONGOING,
+            ParsedEvent::PeerSharedFirst(_) => EVENT_TYPE_PEER_SHARED_FIRST,
             ParsedEvent::AdminBoot(_) => EVENT_TYPE_ADMIN_BOOT,
-            ParsedEvent::AdminOngoing(_) => EVENT_TYPE_ADMIN_ONGOING,
+            ParsedEvent::AdminBoot(_) => EVENT_TYPE_ADMIN_BOOT,
             ParsedEvent::UserRemoved(_) => EVENT_TYPE_USER_REMOVED,
             ParsedEvent::PeerRemoved(_) => EVENT_TYPE_PEER_REMOVED,
             ParsedEvent::SecretShared(_) => EVENT_TYPE_SECRET_SHARED,
@@ -258,15 +258,15 @@ impl ParsedEvent {
     pub fn signer_fields(&self) -> Option<([u8; 32], u8)> {
         match self {
             ParsedEvent::UserInviteBoot(u) => Some((u.signed_by, u.signer_type)),
-            ParsedEvent::UserInviteOngoing(u) => Some((u.signed_by, u.signer_type)),
+            ParsedEvent::UserInviteBoot(u) => Some((u.signed_by, u.signer_type)),
             ParsedEvent::DeviceInviteFirst(d) => Some((d.signed_by, d.signer_type)),
-            ParsedEvent::DeviceInviteOngoing(d) => Some((d.signed_by, d.signer_type)),
-            ParsedEvent::UserBoot(u) => Some((u.signed_by, u.signer_type)),
-            ParsedEvent::UserOngoing(u) => Some((u.signed_by, u.signer_type)),
+            ParsedEvent::DeviceInviteFirst(d) => Some((d.signed_by, d.signer_type)),
+            ParsedEvent::User(u) => Some((u.signed_by, u.signer_type)),
+            ParsedEvent::User(u) => Some((u.signed_by, u.signer_type)),
             ParsedEvent::PeerSharedFirst(p) => Some((p.signed_by, p.signer_type)),
-            ParsedEvent::PeerSharedOngoing(p) => Some((p.signed_by, p.signer_type)),
+            ParsedEvent::PeerSharedFirst(p) => Some((p.signed_by, p.signer_type)),
             ParsedEvent::AdminBoot(a) => Some((a.signed_by, a.signer_type)),
-            ParsedEvent::AdminOngoing(a) => Some((a.signed_by, a.signer_type)),
+            ParsedEvent::AdminBoot(a) => Some((a.signed_by, a.signer_type)),
             ParsedEvent::UserRemoved(r) => Some((r.signed_by, r.signer_type)),
             ParsedEvent::PeerRemoved(r) => Some((r.signed_by, r.signer_type)),
             ParsedEvent::SecretShared(s) => Some((s.signed_by, s.signer_type)),
@@ -359,15 +359,15 @@ pub fn registry() -> &'static EventRegistry {
             &workspace::WORKSPACE_META,
             &invite_accepted::INVITE_ACCEPTED_META,
             &user_invite::USER_INVITE_BOOT_META,
-            &user_invite::USER_INVITE_ONGOING_META,
+            &user_invite::USER_INVITE_BOOT_META,
             &device_invite::DEVICE_INVITE_FIRST_META,
-            &device_invite::DEVICE_INVITE_ONGOING_META,
-            &user::USER_BOOT_META,
-            &user::USER_ONGOING_META,
+            &device_invite::DEVICE_INVITE_FIRST_META,
+            &user::USER_META,
+            &user::USER_META,
             &peer_shared::PEER_SHARED_FIRST_META,
-            &peer_shared::PEER_SHARED_ONGOING_META,
+            &peer_shared::PEER_SHARED_FIRST_META,
             &admin::ADMIN_BOOT_META,
-            &admin::ADMIN_ONGOING_META,
+            &admin::ADMIN_BOOT_META,
             &user_removed::USER_REMOVED_META,
             &peer_removed::PEER_REMOVED_META,
             &secret_shared::SECRET_SHARED_META,
@@ -518,7 +518,7 @@ mod tests {
 
     #[test]
     fn test_user_invite_ongoing_roundtrip() {
-        let e = UserInviteOngoingEvent {
+        let e = UserInviteBootEvent {
             created_at_ms: 200,
             public_key: [18u8; 32],
             admin_event_id: [19u8; 32],
@@ -526,9 +526,9 @@ mod tests {
             signer_type: 5,
             signature: [21u8; 64],
         };
-        let event = ParsedEvent::UserInviteOngoing(e);
+        let event = ParsedEvent::UserInviteBoot(e);
         let blob = encode_event(&event).unwrap();
-        assert_eq!(blob.len(), user_invite::USER_INVITE_ONGOING_WIRE_SIZE);
+        assert_eq!(blob.len(), user_invite::USER_INVITE_BOOT_WIRE_SIZE);
         let parsed = parse_event(&blob).unwrap();
         assert_eq!(parsed, event);
     }
@@ -551,23 +551,23 @@ mod tests {
 
     #[test]
     fn test_device_invite_ongoing_roundtrip() {
-        let e = DeviceInviteOngoingEvent {
+        let e = DeviceInviteFirstEvent {
             created_at_ms: 400,
             public_key: [25u8; 32],
             signed_by: [26u8; 32],
             signer_type: 5,
             signature: [27u8; 64],
         };
-        let event = ParsedEvent::DeviceInviteOngoing(e);
+        let event = ParsedEvent::DeviceInviteFirst(e);
         let blob = encode_event(&event).unwrap();
-        assert_eq!(blob.len(), device_invite::DEVICE_INVITE_ONGOING_WIRE_SIZE);
+        assert_eq!(blob.len(), device_invite::DEVICE_INVITE_FIRST_WIRE_SIZE);
         let parsed = parse_event(&blob).unwrap();
         assert_eq!(parsed, event);
     }
 
     #[test]
     fn test_user_boot_roundtrip() {
-        let e = UserBootEvent {
+        let e = UserEvent {
             created_at_ms: 500,
             public_key: [28u8; 32],
             username: "test-user".to_string(),
@@ -575,7 +575,7 @@ mod tests {
             signer_type: 2,
             signature: [30u8; 64],
         };
-        let event = ParsedEvent::UserBoot(e);
+        let event = ParsedEvent::User(e);
         let blob = encode_event(&event).unwrap();
         assert_eq!(blob.len(), user::USER_WIRE_SIZE);
         let parsed = parse_event(&blob).unwrap();
@@ -584,7 +584,7 @@ mod tests {
 
     #[test]
     fn test_user_ongoing_roundtrip() {
-        let e = UserOngoingEvent {
+        let e = UserEvent {
             created_at_ms: 600,
             public_key: [31u8; 32],
             username: "test-user".to_string(),
@@ -592,7 +592,7 @@ mod tests {
             signer_type: 2,
             signature: [33u8; 64],
         };
-        let event = ParsedEvent::UserOngoing(e);
+        let event = ParsedEvent::User(e);
         let blob = encode_event(&event).unwrap();
         assert_eq!(blob.len(), user::USER_WIRE_SIZE);
         let parsed = parse_event(&blob).unwrap();
@@ -619,7 +619,7 @@ mod tests {
 
     #[test]
     fn test_peer_shared_ongoing_roundtrip() {
-        let e = PeerSharedOngoingEvent {
+        let e = PeerSharedFirstEvent {
             created_at_ms: 800,
             public_key: [37u8; 32],
             user_event_id: [98u8; 32],
@@ -628,7 +628,7 @@ mod tests {
             signer_type: 3,
             signature: [39u8; 64],
         };
-        let event = ParsedEvent::PeerSharedOngoing(e);
+        let event = ParsedEvent::PeerSharedFirst(e);
         let blob = encode_event(&event).unwrap();
         assert_eq!(blob.len(), peer_shared::PEER_SHARED_WIRE_SIZE);
         let parsed = parse_event(&blob).unwrap();
@@ -654,7 +654,7 @@ mod tests {
 
     #[test]
     fn test_admin_ongoing_roundtrip() {
-        let e = AdminOngoingEvent {
+        let e = AdminBootEvent {
             created_at_ms: 1000,
             public_key: [44u8; 32],
             admin_boot_event_id: [45u8; 32],
@@ -662,9 +662,9 @@ mod tests {
             signer_type: 5,
             signature: [47u8; 64],
         };
-        let event = ParsedEvent::AdminOngoing(e);
+        let event = ParsedEvent::AdminBoot(e);
         let blob = encode_event(&event).unwrap();
-        assert_eq!(blob.len(), admin::ADMIN_ONGOING_WIRE_SIZE);
+        assert_eq!(blob.len(), admin::ADMIN_BOOT_WIRE_SIZE);
         let parsed = parse_event(&blob).unwrap();
         assert_eq!(parsed, event);
     }
@@ -925,7 +925,7 @@ mod tests {
         assert_eq!(st, 5);
 
         // Identity signed types
-        let ub = ParsedEvent::UserBoot(UserBootEvent {
+        let ub = ParsedEvent::User(UserEvent {
             created_at_ms: 100,
             public_key: [0u8; 32],
             username: "test-user".to_string(),
@@ -1340,8 +1340,8 @@ mod tests {
         assert!(matches!(err, EventError::TrailingData { expected, actual }
             if expected == invite_accepted::INVITE_ACCEPTED_WIRE_SIZE && actual == invite_accepted::INVITE_ACCEPTED_WIRE_SIZE + 1));
 
-        // UserBoot (202 bytes fixed)
-        let ub = ParsedEvent::UserBoot(UserBootEvent {
+        // User (202 bytes fixed)
+        let ub = ParsedEvent::User(UserEvent {
             created_at_ms: 100,
             public_key: [0u8; 32],
             username: "test-user".to_string(),

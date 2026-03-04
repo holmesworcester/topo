@@ -11,7 +11,7 @@ mod tests {
     use crate::harness::fixtures::*;
     use topo::crypto::spki_fingerprint_from_ed25519_pubkey;
     use topo::event_modules::peer_shared::project_pure;
-    use topo::event_modules::peer_shared::{PeerSharedFirstEvent, PeerSharedOngoingEvent};
+    use topo::event_modules::peer_shared::{PeerSharedFirstEvent, PeerSharedFirstEvent};
     use topo::event_modules::ParsedEvent;
     use topo::projection::contract::{SqlVal, WriteOp};
 
@@ -31,7 +31,7 @@ mod tests {
     }
 
     fn make_peer_shared_ongoing(public_key: [u8; 32], user_event_id: [u8; 32]) -> ParsedEvent {
-        ParsedEvent::PeerSharedOngoing(PeerSharedOngoingEvent {
+        ParsedEvent::PeerSharedFirst(PeerSharedFirstEvent {
             created_at_ms: 10001,
             public_key,
             user_event_id,
