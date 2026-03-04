@@ -132,7 +132,7 @@ check_no_match 'identity_ops::create_device_link_invite_events' src/testutil/
 
 # service.rs must not contain svc_bootstrap_workspace_conn
 check_no_match 'svc_bootstrap_workspace_conn' "$SERVICE_PATH"
-check_no_match 'workspace::commands::retry_pending_invite_content_key_unwraps' "$PIPELINE_PATH"
+# retry_pending_invite_content_key_unwraps removed: key unwrap is dep-driven via SecretShared projection
 check_no_match 'workspace::commands::create_workspace' "$PIPELINE_PATH"
 check_no_match 'workspace::commands::join_workspace_as_new_user' "$PIPELINE_PATH"
 check_no_match 'workspace::commands::add_device_to_workspace' "$PIPELINE_PATH"
@@ -239,7 +239,7 @@ check_required 'pub fn join_workspace_as_new_user' src/event_modules/workspace/c
 check_required 'pub fn add_device_to_workspace' src/event_modules/workspace/commands.rs
 check_required 'pub fn create_user_invite' src/event_modules/workspace/commands.rs
 check_required 'pub fn create_device_link_invite' src/event_modules/workspace/commands.rs
-check_required 'pub fn retry_pending_invite_content_key_unwraps' src/event_modules/workspace/commands.rs
+# retry_pending_invite_content_key_unwraps removed: key unwrap is dep-driven
 
 # workspace DB-path command wrappers are implemented in commands_api.rs and
 # re-exported from workspace/commands.rs for stable callsites.
@@ -254,6 +254,28 @@ check_required 'accept_device_link' src/event_modules/workspace/commands.rs
 check_required 'run_persist_phase' src/state/pipeline/mod.rs
 check_required 'run_post_commit_effects' src/state/pipeline/mod.rs
 check_required 'event_modules::post_drain_hooks' src/state/pipeline/effects.rs
+
+echo "=== Encryption anti-fake guard ==="
+# Command-layer content writes must go through encryption pipeline, not emit raw
+# shared content events. Only testutil/ and low-level test fixtures may create raw
+# content events directly.
+#
+# File slice events are allowed to use create_signed_event_synchronous because
+# their ciphertext field carries real AES-encrypted data using the per-attachment key.
+# All other content types (message, reaction, deletion, attachment) must use
+# create_encrypted_event_synchronous.
+
+# reaction::commands must not call create_signed_event_synchronous (should use encrypted)
+check_no_match 'create_signed_event_synchronous' src/event_modules/reaction/commands.rs
+# message_deletion::commands must not call create_signed_event_synchronous (should use encrypted)
+check_no_match 'create_signed_event_synchronous' src/event_modules/message_deletion/commands.rs
+
+# message::commands: create_signed_event_synchronous is allowed ONLY for FileSlice creation.
+# Verify no ParsedEvent::Message/Reaction/MessageDeletion/MessageAttachment uses it.
+check_no_match 'create_signed_event_synchronous.*Message[^A]' src/event_modules/message/commands.rs
+check_no_match 'create_signed_event_synchronous.*Reaction' src/event_modules/message/commands.rs
+check_no_match 'create_signed_event_synchronous.*MessageDeletion' src/event_modules/message/commands.rs
+check_no_match 'create_signed_event_synchronous.*MessageAttachment' src/event_modules/message/commands.rs
 
 if [ "$FAIL" -ne 0 ]; then
   echo "FAILED: boundary violations found" >&2

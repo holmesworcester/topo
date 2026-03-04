@@ -46,6 +46,7 @@ jobs:
           ./tlc TransportCredentialLifecycle transport_credential_lifecycle_fast.cfg
           ./tlc UnifiedBridge unified_bridge_fix_repro.cfg
           ./tlc UnifiedBridge unified_bridge_progress_fast.cfg
+          ./tlc EncryptionLifecycle encryption_lifecycle_fast.cfg
 
   tla-tier2:
     name: TLA Tier 2 Gate (Manual/Pre-merge)
@@ -73,6 +74,7 @@ jobs:
           ./tlc TransportCredentialLifecycle transport_credential_lifecycle.cfg
           ./tlc TransportCredentialLifecycle transport_credential_lifecycle_fix_repro.cfg
           ./tlc UnifiedBridge unified_bridge_progress_deep.cfg
+          ./tlc EncryptionLifecycle encryption_lifecycle_expanded.cfg
 
       - name: Validate expected bug repro failures
         run: |

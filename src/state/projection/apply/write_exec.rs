@@ -139,6 +139,36 @@ pub(crate) fn execute_emit_commands(
                     .apply_intent(conn, intent.clone())
                     .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
             }
+            EmitCommand::MaterializeSecretKey {
+                key_bytes,
+                clear_invite_signer_event_id,
+            } => {
+                // Create a deterministic SecretKey event from the unwrapped key bytes.
+                // This is the dep-driven path: SecretShared projection resolved the key
+                // in its context loader, so we just materialize it here.
+                let key_event_id =
+                    crate::event_modules::workspace::identity_ops::create_deterministic_secret_key_event_public(
+                        conn,
+                        recorded_by,
+                        *key_bytes,
+                    );
+                if let Ok(key_event_id) = key_event_id {
+                    // Clear the invite key from local_signer_material if applicable.
+                    if let Some(signer_eid_b64) = clear_invite_signer_event_id {
+                        if let Some(signer_eid) = event_id_from_base64(signer_eid_b64) {
+                            let _ =
+                                crate::event_modules::workspace::identity_ops::clear_pending_invite_unwrap_key(
+                                    conn,
+                                    recorded_by,
+                                    &signer_eid,
+                                );
+                        }
+                    }
+                    // Cascade unblock for anything waiting on this key.
+                    let key_b64 = crate::crypto::event_id_to_base64(&key_event_id);
+                    let _ = super::cascade::cascade_unblocked(conn, recorded_by, &key_b64, None);
+                }
+            }
         }
     }
     Ok(())

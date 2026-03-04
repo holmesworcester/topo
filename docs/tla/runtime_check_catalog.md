@@ -111,6 +111,21 @@ an explicit `NON_MODELED::<reason>` waiver.
 | CHK_BRIDGE_SEC_REMOVAL_DENY | event_modules/peer_removed + runtime/transport/authz | BrSec_RemovalDeniesConnectivity | unified_bridge |
 | CHK_BRIDGE_SEC_IDENTITY_COLLISION | transport/identity_adapter + transport_creds | BrSec_NoIdentityCollisionInAuthPath | unified_bridge |
 
+## Encryption Lifecycle Checks
+
+| check_id | owner | tla_guard_id | category |
+|----------|-------|-------------|----------|
+| CHK_ENC_KEY_DEP | projection/encrypted::project_encrypted + apply/cascade | InvEncryptedDependsOnMaterializedKey | encryption_lifecycle |
+| CHK_ENC_UNWRAP_RECIPIENT | event_modules/secret_shared::build_projector_context | InvUnwrapOnlyForLocalRecipient | encryption_lifecycle |
+| CHK_ENC_DETERMINISTIC_ID | event_modules/secret_shared::deterministic_secret_key_event_id | InvDeterministicKeyIdFromUnwrap | encryption_lifecycle |
+| CHK_ENC_NO_PHANTOM_KEY | projection/apply/write_exec::MaterializeSecretKey | InvNoPhantomSecretKey | encryption_lifecycle |
+| CHK_ENC_CASCADE_UNBLOCK | projection/apply/cascade::cascade_unblocked | InvBlockedEncryptedUnblocksAfterKey | encryption_lifecycle |
+| CHK_ENC_CONTENT_ENCRYPTED | event_modules/message/commands + reaction/commands + message_deletion/commands | InvContentWritesAreEncrypted | encryption_lifecycle |
+| CHK_ENC_AAD_FILE_SLICE | event_modules/message/commands::encrypt_file_slice | NON_MODELED::aead_metadata_binding | encryption_lifecycle |
+| CHK_ENC_CRYPTO_SHRED | event_modules/message_deletion::project_pure | NON_MODELED::crypto_shred_cascade | encryption_lifecycle |
+| CHK_ENC_ATTACHMENT_KEY_UNIQUE | event_modules/message/commands::send_file_for_peer | NON_MODELED::per_attachment_key_uniqueness | encryption_lifecycle |
+| CHK_ENC_SS_MATERIALIZE | projection/apply/write_exec::MaterializeSecretKey | InvNoPhantomSecretKey | encryption_lifecycle |
+
 ## Replay/Order Checks
 
 | check_id | owner | tla_guard_id | category |
