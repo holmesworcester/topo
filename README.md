@@ -1,8 +1,8 @@
 # 🐭 Topo
 
-A proof-of-concept implementation of the Topo protocol: an event-sourced, end-to-end encrypted, peer-to-peer team chat stack with daemon-first runtime, real QUIC networking, and deterministic projection semantics.
+A proof-of-concept sketch of the (work-in-progress) Topo protocol: an event-sourced, end-to-end encrypted, peer-to-peer stack for building complex applications, such as team chat.
 
-See [Motivations](#Motivation) for more.
+Informed by work on [Quiet](https://github.com/TryQuiet); see [Motivations](#Motivation) below for more detail.
 
 
 ## Start Here
@@ -134,24 +134,13 @@ flowchart TD
 
 ### TLA+ Model
 
-The proof-of-concept models its DAG and bootstrap transport logic in TLA+. 
-
-This was helpful for reasoning complex causal relationships and supporting LLM-driven implementations. 
+The proof-of-concept models its DAG and bootstrap transport logic in TLA+. (This was helpful for reasoning complex causal relationships and supporting LLM-driven implementations.)
 
 Core model files:
 
 - `docs/tla/EventGraphSchema.tla`
 - `docs/tla/TransportCredentialLifecycle.tla`
 - `docs/tla/UnifiedBridge.tla`
-
-Conformance gates (run from repo root):
-
-```bash
-python3 scripts/check_projector_tla_conformance.py
-python3 scripts/check_projector_tla_bijection.py
-python3 scripts/check_bridge_conformance.py
-python3 scripts/check_tcl_conformance.py
-```
 
 Fast TLC checks (uses bundled `docs/tla/tla2tools.jar`):
 
@@ -162,9 +151,6 @@ cd docs/tla
 ./tlc UnifiedBridge unified_bridge_progress_fast.cfg
 ```
 
-Run these whenever you change event schemas, dependency/guard semantics, signer rules, trust/removal behavior, or projector semantics. For deeper validation, use the non-fast configs listed in `docs/tla/`.
-
-
 ## Documentation
 
 - **[docs/DESIGN.md](./docs/DESIGN.md)** - Protocol semantics, runtime invariants, and module ownership boundaries
@@ -172,27 +158,44 @@ Run these whenever you change event schemas, dependency/guard semantics, signer 
 - **[docs/DESIGN_DIAGRAMS.md](./docs/DESIGN_DIAGRAMS.md)** - Code-accurate runtime/data-flow diagrams
 - **[docs/INDEX.md](./docs/INDEX.md)** - Documentation index
 
-## Motivations
+## Motivation
 
-This PoC exists to prove the practicality of a principled approach to local-first/p2p/e2ee messaging adequate for building complex, user-facing applications. 
+A p2p, FOSS Slack alternative would be huge for user privacy, freedom of expression, and online community resilience / independence. But building one is too hard. We know because we've been trying (see: [Quiet](https://tryquiet.org)).
 
-Specifically, it seeks to prove that the following features and princples are practical:
+We think there is a simpler way, one that doesn't:
 
-1. **SQLite-centricity** - All persistance, including files, is in SQLite.
-1. **Event Sourcing** - Canonical events are durable facts. All canonical data is expressed as events, and state can be generated/restored deterministically by replaying events.
-1. **Content Addressing** - All events are identified by the hash of the canonicalized event (the encrypted version if encrypted, the signed plaintext version if not)
-1. **Explicit Semantic Dependency** - Rather than making events depend arbitrarily on prior events (like Automerge, OrbitDB) application developers decide what depencies are important for product needs and make them required event fields pointing to dependency event id's
-1. **Dependency-agnostic Set Reconciliation** - We use a set reconciliation algorithm (Negentropy) that eventually and efficiently syncs all events we don't yet have, without using the dependency graph (as OrbitDB or Git would)
-1. **Topological Sort** - Events block when dependencies are missing, and unblock with topological sort (Khan's algorithm).
-1. **Keys Are Just Dependencies** - There are no special queues for events with missing signer or decryption keys: these are just declared dependencies (key material is stored in events with id's) and block/unblock accordingly.
-1. **Projection** - Events are queued for validation and "projected" (materialized) into SQLite rows in atomic transactions
-1. **Deterministic Query-time Winners** - Rather than applying destructive database updates that can create ordering problems, events updating a single state instead add rows using INSERT OR IGNORE; a single winner is determined at query time.
-1. **Flat, Fixed-length Events** - To simplify secure parsing, all events and fields are fixed-length and canonicalized
-1. **Ephemeral Protocol Messages** - Runtime protocol traffic (sync/intros/holepunch control) is not canonical event data.
-1. **Conventional Networking Primitives** - All networking (including local networking) happens over QUIC with transport layer security provided by mTLS, but transport identity depends on the event-sourced auth layer for checking incoming and outgoing connections, and dropping connections.
-1. **In-band Relay, Discovery, Intro** - Reliable notifications are a requirement, so always-online sync-capable nodes are a requirement, so dedicated STUN/TURN servers and relay servers are inadequate, and we can rely on reachable (non-NAT) peers or cloud nodes to relay data through normal sync operation, and introduce NAT'ed peers by their observed addresses/ports.
-1. **QUIC Holepunching** - Once intro'ed by a mutually reachable peer, peers holepunch with simultaneous QUIC connections
-1. **Convergence Testing** - Tests check that for all relevant scenarios, reverse reorderings of events, or duplicated event replays, yield the same state.
-1. **Real Networking in Tests** - All multi-client tests are realistic as possible: real networking using CLI-controlled daemons with local peer discovery.
-1. **Easy Synchronous Testing Workflows** - CLI workflows remain synchronous enough for imperative command chains (create workspace with user, invite user, join as user, etc.)
-1. **Multitenancy** - Multiple user accounts/workspaces are first-class, with `recorded_by` scoping on shared tables (for example one message table, scoped to many local users). Canonical facts remain event-sourced in `events`; `recorded_events` is a local tenant ingest journal used to decide which canonical events replay for each tenant.
+* lock developers into unrealistically-limited feature sets 
+* require they assemble a bricolage of bleeding-edge tools like libp2p, Automerge, MLS, etc.
+* handle some of the p2p parts but leave developers on their own for middleware, notifications, etc.
+* lead to a nightmare of hard-to-reason-about concurrency problems
+
+This PoC exists to prove the practicality of a principled approach that uses [event sourcing](https://martinfowler.com/eaaDev/EventSourcing.html), [range-based set reconciliation](https://aljoscha-meyer.de/assets/landing/rbsr.pdf),  [topological sort](https://en.wikipedia.org/wiki/Topological_sorting), and [materialization](https://en.wikipedia.org/wiki/Materialized_view) or "projection" of p2p-synced, decrypted events into SQLite tables that can be easily queried by an API.
+
+What I think it proves works:
+
+* **SQLite for everything** - You can simplify state management by using SQLite for everything, even file slices, for GBs of messages/files
+* **Everything can be an event** - You can model all data, even file slices, as events, encrypt them (and store them all in SQLite)
+* **DAG for auth, invites, multi-device, historical key provision** - Complex relationships such as team auth, admin promotion, multi-use Signal-like invite links, signed events, multi-device support, and group key agreement with removal and history-provision can be modeled as events that depend on prior events.
+* **Negentropy sync for everything** - You can use range-based set reconcilation ("Negentropy" is an implementation name) for syncing all events, whether files, messages, auth, whatever.
+* **Topological sort makes order not matter** - We can receive data in any order we want because topological sort over large amounts of SQLite events is fast enough that we can block events with missing dependencies and unblock events when their dependencies come in. 
+* **DAG can be flexible** - Topo sort also lets the dependency graph fit features like "don't display messages until you know their username" or "display messages immediately with a placeholder username"--this can easily changed by devs and is **NOT** baked into the syncing protocol or document store (as with OrtbitDB, Automerge, etc.--an underappreciated weakness with almost all such tools.)
+* **Complex, secure deletion** - It is straightforward to reliably implement things like "delete this message, its attachments, and reactions" or the kind of key purging you'd need for data-layer forward secrecy. 
+* **It works in an iOS NSE** - At least, it works on Linux under the 24MB memory limit imposed by iOS on background-wakeup Notification Service Extensions (coming soon, real proof on iOS!)
+* **We can use conventional networking primitives** - We can control standard QUIC libraries (e.g. quinn in Rust) sufficiently to initiate mTLS sessions based on peer identity established by our event graph, and route to different workspaces on the same endpoint. We can even holepunch!
+* **No separate STUN/TURN required** - If we need to for product reasons (unclear still, as it may make more sense to rely on cloud nodes or user-community-furnished high availability non-NAT nodes) we can holepunch by aiming QUIC attempts at each other after an in-band introduction signal from a mutually available peer, as opposed to separate protocols/infra for ICE/STUN/TURN.
+* **Multitenancy can be built-in** - We can use event sourcing and workspace differentiation via mTLS to make multitenancy a first-class thing, serve many Slack-like workspaces at the same cloud endpoint, and offer multi-account UIs out-of-the-box.
+* **Regular (fixed-length) wire formats** - [Langsec](https://langsec.org/) counsels that parsers can be made much more secure when data type complexity is limited, with regular (fixed-length-field) wire formats being the most tractable for secure parsing and formal verification. We keep our wire formats fixed-length.
+* **Keys can just be dependencies** - There are no special queues for events with missing signer or decryption keys: these are just declared dependencies (key material is stored in events with id's) and block/unblock accordingly.
+* **Realistic testing** - We can run realistic tests locally with deterministic simulation of the event pipeline. Tests can check that for all relevant scenarios, reverse or adversarial reorderings of events and duplicated event replays all will yield the same state.
+
+## Stretch Goal 
+
+A protocol that is simpler than BitTorrent but adequate for building a reliably p2p Slack replacement.
+
+## Status
+
+Not there yet.
+
+## Why "Topo"?
+
+Topo means mouse. We built this as part of research for [Quiet](https://tryquiet.org). Mice are quiet ("quiet as a mouse"). 🐭
