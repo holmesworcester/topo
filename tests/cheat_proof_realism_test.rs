@@ -1,8 +1,13 @@
 //! Cheat-proof realism tests.
 //!
 //! These tests enforce an invite-only, daemon-first workflow:
-//! - require invite-only autodial behavior,
-//! - require daemon CLI invite lifecycle support.
+//! - require invite-only autodial behavior (no manual connect flags),
+//! - require daemon CLI invite lifecycle support (no restart after accept).
+//!
+//! **Boundary**: tests that prove the system works under production-realistic
+//! constraints — daemons autodial from persisted invite state, and the CLI
+//! invite lifecycle works without daemon restarts. For general CLI sync
+//! scenarios, see `cli_test.rs`.
 
 mod cli_harness;
 

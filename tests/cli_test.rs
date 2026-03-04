@@ -1,3 +1,16 @@
+//! CLI black-box integration tests.
+//!
+//! Tests the `topo` binary end-to-end: multi-peer sync flows via invite,
+//! CLI command output formatting (event-tree, event-list, reactions, files,
+//! completions), and workspace management (ban, workspaces, db registry).
+//!
+//! **Boundary**: tests that exercise the CLI binary's user-facing behavior —
+//! command output, multi-peer sync scenarios, and trust policy enforcement.
+//! For RPC protocol mechanics and daemon lifecycle state transitions, see
+//! `rpc_test.rs`. For invite-only autodial realism, see
+//! `cheat_proof_realism_test.rs`. For real multi-process QUIC sync, see
+//! `two_process_test.rs`.
+
 mod cli_harness;
 
 use cli_harness::*;

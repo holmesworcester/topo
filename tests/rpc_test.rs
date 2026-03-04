@@ -1,4 +1,12 @@
-//! RPC tests: protocol roundtrip, daemon+CLI integration, command regression.
+//! RPC protocol and daemon lifecycle tests.
+//!
+//! Tests RPC encode/decode roundtrips, daemon start/stop lifecycle, runtime
+//! state transitions (idle → active), socket routing, service function
+//! correctness, and per-command RPC integration (identity, invite, peers).
+//!
+//! **Boundary**: tests that exercise RPC protocol mechanics, daemon process
+//! lifecycle, and individual RPC method correctness. For multi-peer sync
+//! scenarios and CLI output formatting, see `cli_test.rs`.
 
 mod cli_harness;
 

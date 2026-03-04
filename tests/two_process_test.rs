@@ -1,7 +1,13 @@
-//! Two-process integration test: real QUIC sync between separate daemon invocations.
+//! Two-process integration test: real QUIC sync between separate daemon processes.
 //!
-//! This test validates the full invite + bootstrap sync + ongoing sync flow
-//! using real separate processes, just like a user would run from the command line.
+//! Validates the full invite + bootstrap sync + ongoing sync flow using real
+//! separate daemon processes with QUIC transport, just like a user would run
+//! from the command line.
+//!
+//! **Boundary**: the only test that runs two fully independent daemon processes
+//! with real network transport. Other CLI tests (cli_test.rs) use daemons but
+//! test at the CLI output level; this test validates process-level isolation
+//! and real QUIC connectivity.
 
 mod cli_harness;
 
