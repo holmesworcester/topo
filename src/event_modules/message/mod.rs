@@ -8,8 +8,8 @@ pub mod wire;
 // Re-export stable public API so callers import from `event_modules::message`.
 pub use commands::{
     create, create_deletion, delete_message, delete_message_for_peer, generate_for_peer, send,
-    send_for_peer, CreateMessageCmd, CreateMessageDeletionCmd, DeleteResponse,
-    GenerateFilesResponse, GenerateResponse, generate_files_for_peer,
+    send_for_peer, send_file_for_peer, CreateMessageCmd, CreateMessageDeletionCmd, DeleteResponse,
+    GenerateFilesResponse, GenerateResponse, SendFileResponse, generate_files_for_peer,
 };
 pub use projector::project_pure;
 pub use queries::{count, list, list_deleted_ids, list_rows, resolve, resolve_number, MessageRow};
@@ -43,6 +43,21 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct ReactionSummary {
+    pub emoji: String,
+    pub reactor_name: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AttachmentSummary {
+    pub filename: String,
+    pub mime_type: String,
+    pub blob_bytes: i64,
+    pub total_slices: i64,
+    pub slices_received: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct MessageItem {
     pub id: String,
     pub id_b64: String,
@@ -50,6 +65,8 @@ pub struct MessageItem {
     pub author_name: String,
     pub content: String,
     pub created_at: i64,
+    pub reactions: Vec<ReactionSummary>,
+    pub attachments: Vec<AttachmentSummary>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

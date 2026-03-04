@@ -189,6 +189,16 @@ enum Commands {
         content: String,
     },
 
+    /// Send a message with a file attachment
+    #[command(name = "send-file")]
+    SendFile {
+        /// Message content
+        content: String,
+        /// Path to file to attach (generates a placeholder if omitted)
+        #[arg(long)]
+        file: Option<String>,
+    },
+
     /// Show database status
     Status,
 
@@ -919,6 +929,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             )?;
             let event_id = data["event_id"].as_str().unwrap_or("");
             println!("Sent: {}", data["content"].as_str().unwrap_or(&content));
+            println!("event_id:{}", event_id);
+        }
+
+        Commands::SendFile { content, file } => {
+            let file_path = match file {
+                Some(f) => f,
+                None => {
+                    let tmp = std::env::temp_dir().join("topo-placeholder.txt");
+                    std::fs::write(&tmp, "placeholder file\n")
+                        .map_err(|e| format!("failed to create placeholder: {}", e))?;
+                    tmp.to_string_lossy().to_string()
+                }
+            };
+            let data = rpc_require_daemon(
+                db,
+                socket_override.as_deref(),
+                RpcMethod::SendFile {
+                    content: content.clone(),
+                    file_path,
+                },
+            )?;
+            let event_id = data["event_id"].as_str().unwrap_or("");
+            let filename = data["filename"].as_str().unwrap_or("");
+            let file_size = data["file_size"].as_i64().unwrap_or(0);
+            println!("Sent: {}", data["content"].as_str().unwrap_or(&content));
+            println!("\u{1f4ce} {} ({})", filename, format_byte_size(file_size));
             println!("event_id:{}", event_id);
         }
 
@@ -1793,8 +1829,154 @@ fn show_messages_from_json(_db_path: &str, data: &serde_json::Value) {
             last_author = author_id.to_string();
         }
         println!("    {}. {}", i + 1, content);
+
+        // Reactions: Slack-style grouped counts on one line
+        if let Some(reactions) = msg["reactions"].as_array() {
+            if !reactions.is_empty() {
+                let mut counts: std::collections::BTreeMap<String, usize> =
+                    std::collections::BTreeMap::new();
+                for r in reactions {
+                    let emoji = r["emoji"].as_str().unwrap_or("?").to_string();
+                    *counts.entry(emoji).or_default() += 1;
+                }
+                let parts: Vec<String> = counts
+                    .iter()
+                    .map(|(name, count)| {
+                        let glyph = emoji_shortcode_to_unicode(name);
+                        if *count > 1 {
+                            format!("{} ({})", glyph, count)
+                        } else {
+                            glyph.to_string()
+                        }
+                    })
+                    .collect();
+                println!("        {}", parts.join("  "));
+            }
+        }
+
+        // Attachments: ✅ = complete, 🔄 = syncing
+        if let Some(attachments) = msg["attachments"].as_array() {
+            for att in attachments {
+                let filename = att["filename"].as_str().unwrap_or("file");
+                let blob_bytes = att["blob_bytes"].as_i64().unwrap_or(0);
+                let total = att["total_slices"].as_i64().unwrap_or(0);
+                let received = att["slices_received"].as_i64().unwrap_or(0);
+                let size = format_byte_size(blob_bytes);
+                let status = if total > 0 && received >= total {
+                    "\u{2714}" // ✔
+                } else {
+                    "\u{23f3}" // ⏳
+                };
+                if total > 0 && received < total {
+                    let pct = (received as f64 / total as f64 * 100.0) as u32;
+                    println!(
+                        "        {}  {} ({}, {}%)",
+                        status, filename, size, pct
+                    );
+                } else {
+                    println!("        {}  {} ({})", status, filename, size);
+                }
+            }
+        }
     }
     println!();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_emoji_shortcode_known() {
+        assert_eq!(emoji_shortcode_to_unicode("thumbsup"), "\u{1f44d}");
+        assert_eq!(emoji_shortcode_to_unicode("+1"), "\u{1f44d}");
+        assert_eq!(emoji_shortcode_to_unicode("heart"), "\u{2764}\u{fe0f}");
+        assert_eq!(emoji_shortcode_to_unicode("fire"), "\u{1f525}");
+        assert_eq!(emoji_shortcode_to_unicode("rocket"), "\u{1f680}");
+        assert_eq!(emoji_shortcode_to_unicode("tada"), "\u{1f389}");
+    }
+
+    #[test]
+    fn test_emoji_shortcode_unknown_passthrough() {
+        assert_eq!(emoji_shortcode_to_unicode("zzz_unknown"), "zzz_unknown");
+    }
+
+    #[test]
+    fn test_format_byte_size() {
+        assert_eq!(format_byte_size(0), "0 B");
+        assert_eq!(format_byte_size(512), "512 B");
+        assert_eq!(format_byte_size(1024), "1.0 KiB");
+        assert_eq!(format_byte_size(1536), "1.5 KiB");
+        assert_eq!(format_byte_size(1048576), "1.0 MiB");
+        assert_eq!(format_byte_size(1258291), "1.2 MiB");
+        assert_eq!(format_byte_size(1073741824), "1.0 GiB");
+    }
+}
+
+fn emoji_shortcode_to_unicode(name: &str) -> &str {
+    match name {
+        "thumbsup" | "+1" => "\u{1f44d}",
+        "thumbsdown" | "-1" => "\u{1f44e}",
+        "heart" | "red_heart" => "\u{2764}\u{fe0f}",
+        "laugh" | "joy" => "\u{1f602}",
+        "cry" | "sob" => "\u{1f62d}",
+        "fire" => "\u{1f525}",
+        "rocket" => "\u{1f680}",
+        "eyes" => "\u{1f440}",
+        "tada" | "party" => "\u{1f389}",
+        "100" => "\u{1f4af}",
+        "wave" => "\u{1f44b}",
+        "clap" => "\u{1f44f}",
+        "thinking" | "thinking_face" => "\u{1f914}",
+        "pray" | "folded_hands" => "\u{1f64f}",
+        "ok_hand" => "\u{1f44c}",
+        "raised_hands" => "\u{1f64c}",
+        "star" => "\u{2b50}",
+        "sparkles" => "\u{2728}",
+        "check" | "white_check_mark" => "\u{2705}",
+        "x" | "cross_mark" => "\u{274c}",
+        "warning" => "\u{26a0}\u{fe0f}",
+        "question" => "\u{2753}",
+        "exclamation" => "\u{2757}",
+        "smile" | "smiley" => "\u{1f604}",
+        "wink" => "\u{1f609}",
+        "sunglasses" | "cool" => "\u{1f60e}",
+        "sad" | "disappointed" => "\u{1f61e}",
+        "angry" => "\u{1f620}",
+        "scream" => "\u{1f631}",
+        "skull" => "\u{1f480}",
+        "poop" => "\u{1f4a9}",
+        "muscle" => "\u{1f4aa}",
+        "brain" => "\u{1f9e0}",
+        "bulb" | "light_bulb" => "\u{1f4a1}",
+        "memo" => "\u{1f4dd}",
+        "pin" | "pushpin" => "\u{1f4cc}",
+        "link" => "\u{1f517}",
+        "bug" => "\u{1f41b}",
+        "wrench" => "\u{1f527}",
+        "hammer" => "\u{1f528}",
+        "gear" => "\u{2699}\u{fe0f}",
+        "lock" => "\u{1f512}",
+        "key" => "\u{1f511}",
+        "bell" => "\u{1f514}",
+        "megaphone" | "loudspeaker" => "\u{1f4e3}",
+        _ => name, // pass through unknown shortcodes as-is
+    }
+}
+
+fn format_byte_size(bytes: i64) -> String {
+    const KIB: i64 = 1024;
+    const MIB: i64 = 1024 * 1024;
+    const GIB: i64 = 1024 * 1024 * 1024;
+    if bytes >= GIB {
+        format!("{:.1} GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
 }
 
 fn show_view(data: &serde_json::Value) {

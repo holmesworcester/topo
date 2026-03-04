@@ -1,4 +1,5 @@
 use crate::crypto::{self, b64_to_hex, event_id_from_base64, EventId};
+use crate::event_modules::{message_attachment, reaction};
 use rusqlite::Connection;
 
 pub struct MessageRow {
@@ -105,17 +106,40 @@ pub fn list(
     let rows = list_rows(db, recorded_by, limit)?;
     let total = count(db, recorded_by)?;
 
-    let messages = rows
-        .into_iter()
-        .map(|row| super::MessageItem {
+    let mut messages = Vec::with_capacity(rows.len());
+    for row in rows {
+        let reactions: Vec<super::ReactionSummary> =
+            reaction::list_for_message_with_authors(db, recorded_by, &row.message_id_b64)?
+                .into_iter()
+                .map(|r| super::ReactionSummary {
+                    emoji: r.emoji,
+                    reactor_name: r.reactor_name,
+                })
+                .collect();
+
+        let attachments: Vec<super::AttachmentSummary> =
+            message_attachment::queries::list_for_message(db, recorded_by, &row.message_id_b64)?
+                .into_iter()
+                .map(|a| super::AttachmentSummary {
+                    filename: a.filename,
+                    mime_type: a.mime_type,
+                    blob_bytes: a.blob_bytes,
+                    total_slices: a.total_slices,
+                    slices_received: a.slices_received,
+                })
+                .collect();
+
+        messages.push(super::MessageItem {
             id: row.message_id_hex,
             id_b64: row.message_id_b64,
             author_id: row.author_id,
             author_name: row.author_name,
             content: row.content,
             created_at: row.created_at,
-        })
-        .collect();
+            reactions,
+            attachments,
+        });
+    }
 
     Ok(super::MessagesResponse { messages, total })
 }

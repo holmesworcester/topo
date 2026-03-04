@@ -25,6 +25,10 @@ pub enum RpcMethod {
     Send {
         content: String,
     },
+    SendFile {
+        content: String,
+        file_path: String,
+    },
     Generate {
         count: usize,
     },
