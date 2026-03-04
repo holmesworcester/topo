@@ -1,432 +1,16 @@
-use rusqlite::Connection;
-use std::path::PathBuf;
+mod cli_harness;
+
+use cli_harness::*;
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use topo::testutil::DaemonGuard;
-
-fn bin() -> String {
-    env!("CARGO_BIN_EXE_topo").to_string()
-}
-
-/// Pick a random port in the ephemeral range to avoid conflicts between
-/// parallel test runs and other services.
-fn random_port() -> u16 {
-    // Bind to :0, read the assigned port, close immediately
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().port()
-}
-
-fn socket_path_for_db(db: &str) -> PathBuf {
-    topo::service::socket_path_for_db(db)
-}
-
-fn create_workspace(db: &str) {
-    // Start a temporary daemon so create-workspace can route via RPC.
-    let tmp_daemon = start_daemon_with_options(db, false);
-    let out = Command::new(bin())
-        .args(["create-workspace", "--db", db])
-        .output()
-        .expect("create-workspace");
-    assert!(
-        out.status.success(),
-        "create-workspace failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    // Wait until tenant discovery sees at least one peer before stopping.
-    let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(5) {
-        let peers = Command::new(bin())
-            .args(["--db", db, "tenants"])
-            .output()
-            .expect("peers probe");
-        if peers.status.success() {
-            let stdout = String::from_utf8_lossy(&peers.stdout);
-            if stdout
-                .lines()
-                .any(|line| line.trim_start().starts_with("1."))
-            {
-                break;
-            }
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    // Stop temporary daemon; callers decide daemon lifecycle.
-    let _ = Command::new(bin()).args(["--db", db, "stop"]).output();
-    drop(tmp_daemon);
-    wait_for_daemon_stopped(db, Duration::from_secs(10));
-}
-
-fn start_daemon_with_options(db: &str, disable_placeholder_autodial: bool) -> DaemonGuard {
-    let socket = socket_path_for_db(db);
-    let mut cmd = Command::new(bin());
-    cmd.arg("--db")
-        .arg(db)
-        .arg("start")
-        .arg("--bind")
-        .arg("127.0.0.1:0")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    if disable_placeholder_autodial {
-        cmd.env("P7_DISABLE_PLACEHOLDER_AUTODIAL", "1");
-    }
-
-    let mut child = cmd.spawn().expect("failed to start daemon");
-
-    // Wait for socket to appear, checking that daemon hasn't exited early.
-    let start = std::time::Instant::now();
-    loop {
-        // Check if process already exited (immediate crash / bind failure).
-        if let Some(status) = child.try_wait().expect("failed to check daemon status") {
-            panic!("daemon exited immediately with {} (db={})", status, db);
-        }
-        if socket.exists() {
-            break;
-        }
-        if start.elapsed().as_secs() >= 5 {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    assert!(
-        socket.exists(),
-        "daemon socket did not appear at {} within 5s (db={})",
-        socket.display(),
-        db
-    );
-    wait_for_daemon_ready(db, Duration::from_secs(15));
-
-    // Verify daemon is accepting RPC (socket exists but server may not be listening yet).
-    let rpc_start = std::time::Instant::now();
-    loop {
-        let out = Command::new(bin())
-            .args(["--db", db, "status"])
-            .output()
-            .expect("failed to probe daemon status");
-        if out.status.success() {
-            break;
-        }
-        if rpc_start.elapsed().as_secs() >= 5 {
-            panic!(
-                "daemon socket exists but RPC not responding after 5s (db={}): {}",
-                db,
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-
-    DaemonGuard::new(child)
-}
-
-fn wait_for_daemon_ready(db: &str, timeout: Duration) {
-    let socket = socket_path_for_db(db);
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        if socket.exists() {
-            if let Ok(resp) =
-                topo::rpc::client::rpc_call(&socket, topo::rpc::protocol::RpcMethod::Status)
-            {
-                if resp.ok {
-                    return;
-                }
-            }
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    panic!("daemon did not become ready for RPC within {:?}", timeout);
-}
-
-fn wait_for_daemon_stopped(db: &str, timeout: Duration) {
-    let socket = socket_path_for_db(db);
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        if !socket.exists() {
-            return;
-        }
-
-        let rpc_alive =
-            topo::rpc::client::rpc_call(&socket, topo::rpc::protocol::RpcMethod::Status)
-                .map(|resp| resp.ok)
-                .unwrap_or(false);
-        if !rpc_alive {
-            let _ = std::fs::remove_file(&socket);
-            if !socket.exists() {
-                return;
-            }
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    panic!(
-        "daemon did not stop within {:?} (db={}, socket={})",
-        timeout,
-        db,
-        socket.display()
-    );
-}
-
-fn daemon_listen_addr(db: &str) -> String {
-    let socket = socket_path_for_db(db);
-    let resp = topo::rpc::client::rpc_call(&socket, topo::rpc::protocol::RpcMethod::Status)
-        .expect("status RPC for listen addr");
-    assert!(resp.ok, "status RPC returned error");
-    let data = resp.data.expect("status response missing data");
-    data.get("runtime")
-        .and_then(|r| r.get("listen_addr"))
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .expect("status response missing runtime.listen_addr")
-}
 
 fn cli_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-fn start_daemon(db: &str) -> DaemonGuard {
-    start_daemon_with_options(db, false)
-}
-
-fn first_peer_index(peers_stdout: &str) -> Option<usize> {
-    peers_stdout.lines().find_map(|line| {
-        let trimmed = line.trim_start();
-        let dot_pos = trimmed.find('.')?;
-        let idx = &trimmed[..dot_pos];
-        if idx.chars().all(|c| c.is_ascii_digit()) {
-            idx.parse::<usize>().ok()
-        } else {
-            None
-        }
-    })
-}
-
-fn ensure_active_peer(db: &str, timeout: Duration) {
-    let start = Instant::now();
-    let mut last_active = String::new();
-    let mut last_peers = String::new();
-    let mut last_use_peer_err = String::new();
-
-    while start.elapsed() < timeout {
-        let active = Command::new(bin())
-            .args(["--db", db, "active-tenant"])
-            .output()
-            .expect("failed to run active-peer");
-        if active.status.success() {
-            let active_stdout = String::from_utf8_lossy(&active.stdout).trim().to_string();
-            if !active_stdout.is_empty() && active_stdout != "(no active peer)" {
-                return;
-            }
-            last_active = active_stdout;
-        } else {
-            last_active = format!("error: {}", String::from_utf8_lossy(&active.stderr).trim());
-        }
-
-        let peers = Command::new(bin())
-            .args(["--db", db, "tenants"])
-            .output()
-            .expect("failed to run peers");
-        if peers.status.success() {
-            let peers_stdout = String::from_utf8_lossy(&peers.stdout).to_string();
-            if let Some(index) = first_peer_index(&peers_stdout) {
-                let use_peer = Command::new(bin())
-                    .arg("--db")
-                    .arg(db)
-                    .arg("use-tenant")
-                    .arg(index.to_string())
-                    .output()
-                    .expect("failed to run use-peer");
-                if use_peer.status.success() {
-                    return;
-                }
-                last_use_peer_err = String::from_utf8_lossy(&use_peer.stderr).trim().to_string();
-            }
-            last_peers = peers_stdout;
-        } else {
-            last_peers = format!("error: {}", String::from_utf8_lossy(&peers.stderr).trim());
-        }
-
-        std::thread::sleep(Duration::from_millis(100));
-    }
-
-    panic!(
-        "failed to establish active tenant within {:?} (db={}): active={}, tenants={}, use-tenant-error={}",
-        timeout,
-        db,
-        last_active,
-        last_peers.replace('\n', " | "),
-        last_use_peer_err
-    );
-}
-
-fn send_message(db: &str, content: &str) -> String {
-    ensure_active_peer(db, Duration::from_secs(10));
-    let start = Instant::now();
-    loop {
-        let output = Command::new(bin())
-            .arg("--db")
-            .arg(db)
-            .arg("send")
-            .arg(content)
-            .output()
-            .expect("failed to run send");
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            return stdout
-                .lines()
-                .find_map(|line| line.strip_prefix("event_id:"))
-                .expect("send output missing event_id: line")
-                .to_string();
-        }
-
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        let retryable = stderr.contains("no identity") || stderr.contains("no active tenant");
-        if retryable && start.elapsed() < Duration::from_secs(20) {
-            if stderr.contains("no active tenant") {
-                ensure_active_peer(db, Duration::from_secs(5));
-            }
-            std::thread::sleep(Duration::from_millis(100));
-            continue;
-        }
-        panic!("send failed: {}", stderr);
-    }
-}
-
-fn assert_now(db: &str, predicate: &str) {
-    let output = Command::new(bin())
-        .arg("--db")
-        .arg(db)
-        .arg("assert-now")
-        .arg(predicate)
-        .output()
-        .expect("failed to run assert-now");
-    let text = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        output.status.success(),
-        "assert-now failed: {} ({})",
-        predicate,
-        text.trim()
-    );
-}
-
-fn assert_eventually(db: &str, predicate: &str, timeout_ms: u64) {
-    let output = Command::new(bin())
-        .arg("--db")
-        .arg(db)
-        .arg("assert-eventually")
-        .arg(predicate)
-        .arg("--timeout-ms")
-        .arg(timeout_ms.to_string())
-        .output()
-        .expect("failed to run assert-eventually");
-    let text = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        output.status.success(),
-        "assert-eventually timed out: {} ({})",
-        predicate,
-        text.trim()
-    );
-}
-
-fn get_messages_raw(db: &str) -> String {
-    let output = Command::new(bin())
-        .arg("--db")
-        .arg(db)
-        .arg("messages")
-        .output()
-        .expect("failed to run messages");
-    String::from_utf8_lossy(&output.stdout).to_string()
-}
-
-fn get_messages(db: &str) -> Vec<String> {
-    let text = get_messages_raw(db);
-    // Parse numbered lines like "    1. Hello from Alice"
-    text.lines()
-        .filter_map(|line| {
-            let trimmed = line.trim();
-            // Match "N. content" pattern
-            let dot_pos = trimmed.find(". ")?;
-            let prefix = &trimmed[..dot_pos];
-            if prefix.chars().all(|c| c.is_ascii_digit()) {
-                Some(trimmed[dot_pos + 2..].to_string())
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
-/// Helper: run create-invite CLI command (daemon-only). Returns the invite link printed to stdout.
-fn create_invite(db: &str, bootstrap_addr: &str) -> String {
-    let output = Command::new(bin())
-        .arg("--db")
-        .arg(db)
-        .arg("create-invite")
-        .arg("--public-addr")
-        .arg(bootstrap_addr)
-        .output()
-        .expect("failed to run create-invite");
-    assert!(
-        output.status.success(),
-        "create-invite failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    // Extract the topo:// link line (may have "Created invite #N" prefix line)
-    stdout
-        .lines()
-        .find(|line| line.starts_with("topo://"))
-        .unwrap_or_else(|| stdout.trim())
-        .to_string()
-}
-
-/// Helper: run accept-invite CLI command through daemon RPC.
-fn accept_invite(db: &str, invite_link: &str) {
-    // Start a temporary daemon so accept-invite can route via RPC.
-    let tmp_daemon = start_daemon_with_options(db, false);
-    let output = Command::new(bin())
-        .arg("accept-invite")
-        .arg("--db")
-        .arg(db)
-        .arg("--invite")
-        .arg(invite_link)
-        .output()
-        .expect("failed to run accept-invite");
-    assert!(
-        output.status.success(),
-        "accept-invite failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    // Ensure tenant discovery is persisted before stopping.
-    let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(5) {
-        let peers = Command::new(bin())
-            .args(["--db", db, "tenants"])
-            .output()
-            .expect("peers probe");
-        if peers.status.success() {
-            let stdout = String::from_utf8_lossy(&peers.stdout);
-            if stdout
-                .lines()
-                .any(|line| line.trim_start().starts_with("1."))
-            {
-                break;
-            }
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    // Stop temporary daemon; callers decide daemon lifecycle.
-    let _ = Command::new(bin()).args(["--db", db, "stop"]).output();
-    drop(tmp_daemon);
-    wait_for_daemon_stopped(db, Duration::from_secs(10));
-}
-
-fn count_rows(db: &str, table: &str) -> i64 {
-    let conn = Connection::open(db).expect("failed to open db");
-    let sql = format!("SELECT COUNT(*) FROM {}", table);
-    conn.query_row(&sql, [], |row| row.get(0))
-        .expect("failed to query row count")
 }
 
 /// Functional sync test using invite-based shared workspace flow.
@@ -494,7 +78,6 @@ fn test_cli_bidirectional_sync() {
     assert!(bob_msgs.contains(&"Hello from Alice".to_string()));
     assert!(bob_msgs.contains(&"How are you?".to_string()));
     assert!(bob_msgs.contains(&"Hey Alice!".to_string()));
-
 }
 
 /// Functional sync test using invite-based flow.
@@ -543,7 +126,6 @@ fn test_cli_ongoing_sync() {
         &format!("has_event:{} >= 1", alice_last_eid),
         timeout_ms,
     );
-
 }
 
 /// Two separate local daemons should discover and sync on the same machine
@@ -559,7 +141,13 @@ fn test_cli_local_mdns_discovery_without_placeholder_autodial() {
 
     // Alice creates workspace and starts daemon
     create_workspace(&alice_db);
-    let _alice = start_daemon_with_options(&alice_db, true);
+    let _alice = start_daemon_with_options(
+        &alice_db,
+        &DaemonOptions {
+            disable_placeholder_autodial: true,
+            ..Default::default()
+        },
+    );
 
     // Alice creates invite while daemon is running.
     let invite_link = create_invite(&alice_db, &daemon_listen_addr(&alice_db));
@@ -567,7 +155,13 @@ fn test_cli_local_mdns_discovery_without_placeholder_autodial() {
     // Bob accepts invite and starts daemon with placeholder autodial disabled.
     // With placeholder autodial disabled, Bob discovers Alice via mDNS only.
     accept_invite(&bob_db, &invite_link);
-    let _bob = start_daemon_with_options(&bob_db, true);
+    let _bob = start_daemon_with_options(
+        &bob_db,
+        &DaemonOptions {
+            disable_placeholder_autodial: true,
+            ..Default::default()
+        },
+    );
 
     // Validate bidirectional convergence using messages created after both
     // daemons are running (avoids counting accept-invite bootstrap artifacts).
@@ -584,7 +178,6 @@ fn test_cli_local_mdns_discovery_without_placeholder_autodial() {
         &format!("has_event:{} >= 1", bob_msg_eid),
         timeout_ms,
     );
-
 }
 
 #[test]
@@ -767,7 +360,7 @@ fn test_cli_sync_bootstrap_from_accepted_invite_data() {
 }
 
 // ---------------------------------------------------------------------------
-// New CLI command tests
+// CLI command output tests
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -798,6 +391,7 @@ fn test_cli_completions_zsh() {
 
 #[test]
 fn test_cli_ban_user() {
+    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let db = tmpdir.path().join("ban.db").to_str().unwrap().to_string();
 
@@ -830,6 +424,7 @@ fn test_cli_ban_user() {
 
 #[test]
 fn test_cli_workspaces() {
+    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let db = tmpdir
         .path()
@@ -934,6 +529,7 @@ fn test_cli_db_invalid_numeric_selector_errors() {
 
 #[test]
 fn test_cli_react_by_message_number() {
+    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let db = tmpdir
         .path()
@@ -1013,6 +609,7 @@ fn test_cli_react_by_message_number() {
 
 #[test]
 fn test_cli_messages_include_reactions() {
+    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let db = tmpdir
         .path()
@@ -1061,6 +658,7 @@ fn test_cli_messages_include_reactions() {
 
 #[test]
 fn test_cli_send_file_and_messages_display() {
+    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let db = tmpdir
         .path()
@@ -1118,6 +716,7 @@ fn test_cli_send_file_and_messages_display() {
 
 #[test]
 fn test_cli_generate_files_messages_display() {
+    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let db = tmpdir
         .path()

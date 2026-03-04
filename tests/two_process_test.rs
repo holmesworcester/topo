@@ -3,328 +3,9 @@
 //! This test validates the full invite + bootstrap sync + ongoing sync flow
 //! using real separate processes, just like a user would run from the command line.
 
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::time::Duration;
-use topo::testutil::DaemonGuard;
+mod cli_harness;
 
-fn bin() -> String {
-    env!("CARGO_BIN_EXE_topo").to_string()
-}
-
-fn socket_path_for_db(db: &str) -> PathBuf {
-    topo::service::socket_path_for_db(db)
-}
-
-fn create_workspace(db: &str) {
-    // Start a temporary daemon so create-workspace can route via RPC.
-    let _tmp_daemon = start_daemon(db);
-
-    let out = Command::new(bin())
-        .args(["create-workspace", "--db", db])
-        .output()
-        .expect("create-workspace");
-    assert!(
-        out.status.success(),
-        "create-workspace failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    // Stop temporary daemon; this suite controls daemon start explicitly.
-    let _ = Command::new(bin()).args(["--db", db, "stop"]).output();
-    // _tmp_daemon dropped here — DaemonGuard kills the child.
-    wait_for_daemon_stopped(db, Duration::from_secs(10));
-}
-
-fn wait_for_daemon_ready(db: &str, timeout: Duration) {
-    let socket = socket_path_for_db(db);
-    let start = std::time::Instant::now();
-    while start.elapsed() < timeout {
-        if socket.exists() {
-            if let Ok(resp) =
-                topo::rpc::client::rpc_call(&socket, topo::rpc::protocol::RpcMethod::Status)
-            {
-                if resp.ok {
-                    return;
-                }
-            }
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    panic!("daemon did not become ready for RPC within {:?}", timeout);
-}
-
-fn wait_for_daemon_stopped(db: &str, timeout: Duration) {
-    let socket = socket_path_for_db(db);
-    let start = std::time::Instant::now();
-    while start.elapsed() < timeout {
-        if !socket.exists() {
-            return;
-        }
-
-        let rpc_alive =
-            topo::rpc::client::rpc_call(&socket, topo::rpc::protocol::RpcMethod::Status)
-                .map(|resp| resp.ok)
-                .unwrap_or(false);
-        if !rpc_alive {
-            let _ = std::fs::remove_file(&socket);
-            if !socket.exists() {
-                return;
-            }
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    panic!(
-        "daemon did not stop within {:?} (db={}, socket={})",
-        timeout,
-        db,
-        socket.display()
-    );
-}
-
-fn daemon_listen_addr(db: &str) -> String {
-    let socket = socket_path_for_db(db);
-    let resp = topo::rpc::client::rpc_call(&socket, topo::rpc::protocol::RpcMethod::Status)
-        .expect("status RPC for listen addr");
-    assert!(resp.ok, "status RPC returned error");
-    let data = resp.data.expect("status response missing data");
-    data.get("runtime")
-        .and_then(|r| r.get("listen_addr"))
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .expect("status response missing runtime.listen_addr")
-}
-
-fn daemon_transport_fingerprint(db: &str) -> String {
-    let socket = socket_path_for_db(db);
-    let resp =
-        topo::rpc::client::rpc_call(&socket, topo::rpc::protocol::RpcMethod::TransportIdentity)
-            .expect("transport-identity RPC");
-    assert!(resp.ok, "transport-identity RPC returned error");
-    let data = resp.data.expect("transport-identity response missing data");
-    data.get("fingerprint")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .expect("transport-identity response missing fingerprint")
-}
-
-fn start_daemon(db: &str) -> DaemonGuard {
-    let socket = socket_path_for_db(db);
-    let mut cmd = Command::new(bin());
-    cmd.arg("--db")
-        .arg(db)
-        .arg("start")
-        .arg("--bind")
-        .arg("127.0.0.1:0")
-        .env("RUST_LOG", "topo::event_pipeline=debug,topo::peering::runtime::autodial=debug,topo::projection=debug,topo::sync::session=info,topo=warn")
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-
-    let mut child = cmd.spawn().expect("failed to start daemon");
-
-    let start = std::time::Instant::now();
-    loop {
-        if let Some(status) = child.try_wait().expect("failed to check daemon status") {
-            panic!("daemon exited immediately with {} (db={})", status, db);
-        }
-        if socket.exists() {
-            break;
-        }
-        if start.elapsed().as_secs() >= 5 {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    assert!(
-        socket.exists(),
-        "daemon socket did not appear at {}",
-        socket.display()
-    );
-    wait_for_daemon_ready(db, Duration::from_secs(15));
-
-    DaemonGuard::new(child)
-}
-
-fn first_peer_index(peers_stdout: &str) -> Option<usize> {
-    peers_stdout.lines().find_map(|line| {
-        let trimmed = line.trim_start();
-        let dot_pos = trimmed.find('.')?;
-        let idx = &trimmed[..dot_pos];
-        if idx.chars().all(|c| c.is_ascii_digit()) {
-            idx.parse::<usize>().ok()
-        } else {
-            None
-        }
-    })
-}
-
-fn ensure_active_peer(db: &str, timeout: Duration) {
-    let start = std::time::Instant::now();
-    while start.elapsed() < timeout {
-        let active = Command::new(bin())
-            .args(["--db", db, "active-tenant"])
-            .output()
-            .expect("failed to run active-peer");
-        if active.status.success() {
-            let active_stdout = String::from_utf8_lossy(&active.stdout).trim().to_string();
-            if !active_stdout.is_empty() && active_stdout != "(no active peer)" {
-                return;
-            }
-        }
-
-        let peers = Command::new(bin())
-            .args(["--db", db, "tenants"])
-            .output()
-            .expect("failed to run peers");
-        if peers.status.success() {
-            let peers_stdout = String::from_utf8_lossy(&peers.stdout).to_string();
-            if let Some(index) = first_peer_index(&peers_stdout) {
-                let use_peer = Command::new(bin())
-                    .arg("--db")
-                    .arg(db)
-                    .arg("use-tenant")
-                    .arg(index.to_string())
-                    .output()
-                    .expect("failed to run use-peer");
-                if use_peer.status.success() {
-                    return;
-                }
-            }
-        }
-
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    panic!(
-        "failed to establish active peer within {:?} (db={})",
-        timeout, db
-    );
-}
-
-fn send_message(db: &str, content: &str) -> String {
-    ensure_active_peer(db, Duration::from_secs(10));
-    let start = std::time::Instant::now();
-    loop {
-        let output = Command::new(bin())
-            .arg("--db")
-            .arg(db)
-            .arg("send")
-            .arg(content)
-            .output()
-            .expect("failed to run send");
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            return stdout
-                .lines()
-                .find_map(|line| line.strip_prefix("event_id:"))
-                .expect("send output missing event_id: line")
-                .to_string();
-        }
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        let retryable = stderr.contains("no identity") || stderr.contains("no active tenant");
-        if retryable && start.elapsed() < Duration::from_secs(20) {
-            if stderr.contains("no active tenant") {
-                ensure_active_peer(db, Duration::from_secs(5));
-            }
-            std::thread::sleep(Duration::from_millis(100));
-            continue;
-        }
-        panic!("send failed for db={}: {}", db, stderr);
-    }
-}
-
-fn create_invite(db: &str, bootstrap_addr: &str, public_spki: Option<&str>) -> String {
-    let mut cmd = Command::new(bin());
-    cmd.arg("--db")
-        .arg(db)
-        .arg("create-invite")
-        .arg("--public-addr")
-        .arg(bootstrap_addr);
-    if let Some(spki) = public_spki {
-        cmd.arg("--public-spki").arg(spki);
-    }
-    let output = cmd.output().expect("failed to run create-invite");
-    assert!(
-        output.status.success(),
-        "create-invite failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout
-        .lines()
-        .find(|line| line.starts_with("topo://"))
-        .expect("create-invite output missing topo:// link")
-        .to_string()
-}
-
-fn accept_invite(db: &str, invite_link: &str, username: &str, devicename: &str) {
-    // Start a temporary daemon so accept-invite can route via RPC.
-    let _tmp_daemon = start_daemon(db);
-
-    let output = Command::new(bin())
-        .arg("accept-invite")
-        .arg("--db")
-        .arg(db)
-        .arg("--invite")
-        .arg(invite_link)
-        .arg("--username")
-        .arg(username)
-        .arg("--devicename")
-        .arg(devicename)
-        .output()
-        .expect("failed to run accept-invite");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        output.status.success(),
-        "accept-invite failed:\n  stdout: {}\n  stderr: {}",
-        stdout.trim(),
-        stderr.trim()
-    );
-    // Stop temporary daemon; this suite controls daemon start explicitly.
-    let _ = Command::new(bin()).args(["--db", db, "stop"]).output();
-    // _tmp_daemon dropped here — DaemonGuard kills the child.
-    wait_for_daemon_stopped(db, Duration::from_secs(10));
-}
-
-fn assert_eventually(db: &str, predicate: &str, timeout_ms: u64) {
-    let output = Command::new(bin())
-        .arg("--db")
-        .arg(db)
-        .arg("assert-eventually")
-        .arg(predicate)
-        .arg("--timeout-ms")
-        .arg(timeout_ms.to_string())
-        .output()
-        .expect("failed to run assert-eventually");
-    let text = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        output.status.success(),
-        "assert-eventually timed out: {} ({})",
-        predicate,
-        text.trim()
-    );
-}
-
-fn get_messages(db: &str) -> Vec<String> {
-    let output = Command::new(bin())
-        .arg("--db")
-        .arg(db)
-        .arg("messages")
-        .output()
-        .expect("failed to run messages");
-    let text = String::from_utf8_lossy(&output.stdout);
-    text.lines()
-        .filter_map(|line| {
-            let trimmed = line.trim();
-            let dot_pos = trimmed.find(". ")?;
-            let prefix = &trimmed[..dot_pos];
-            if prefix.chars().all(|c| c.is_ascii_digit()) {
-                Some(trimmed[dot_pos + 2..].to_string())
-            } else {
-                None
-            }
-        })
-        .collect()
-}
+use cli_harness::*;
 
 /// Full two-process invite + bootstrap sync + ongoing sync test.
 ///
@@ -341,10 +22,16 @@ fn test_two_process_invite_and_sync() {
 
     // Step 1: Alice creates workspace and starts daemon.
     create_workspace(&alice_db);
-    let _alice_daemon = start_daemon(&alice_db);
+    let _alice_daemon = start_daemon_with_options(
+        &alice_db,
+        &DaemonOptions {
+            inherit_stdio: true,
+            ..Default::default()
+        },
+    );
 
     // Step 2: Alice creates an invite pointing to her sync address (via daemon RPC).
-    let invite_link = create_invite(
+    let invite_link = create_invite_with_spki(
         &alice_db,
         &daemon_listen_addr(&alice_db),
         Some(&daemon_transport_fingerprint(&alice_db)),
@@ -357,11 +44,17 @@ fn test_two_process_invite_and_sync() {
 
     // Step 3: Bob accepts the invite. This connects to Alice's sync endpoint
     // via real QUIC, fetches prerequisite events, then creates Bob's identity chain.
-    accept_invite(&bob_db, &invite_link, "bob", "laptop");
+    accept_invite_with_identity(&bob_db, &invite_link, "bob", "laptop");
 
     // Bob's daemon handles bootstrap sync via autodial: the runtime discovers
     // bootstrap trust from projected SQL state and dials Alice's sync address.
-    let _bob_daemon = start_daemon(&bob_db);
+    let _bob_daemon = start_daemon_with_options(
+        &bob_db,
+        &DaemonOptions {
+            inherit_stdio: true,
+            ..Default::default()
+        },
+    );
 
     // Step 4: Exchange messages and verify convergence.
     let alice_eid = send_message(&alice_db, "Hello from alice");
@@ -408,5 +101,4 @@ fn test_two_process_invite_and_sync() {
         "Bob should see Alice's message (shared workspace), got: {:?}",
         bob_msgs
     );
-
 }

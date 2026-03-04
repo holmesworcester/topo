@@ -1,118 +1,11 @@
 //! RPC tests: protocol roundtrip, daemon+CLI integration, command regression.
 
-use std::path::PathBuf;
+mod cli_harness;
+
+use cli_harness::*;
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use topo::testutil::DaemonGuard;
-
-fn bin() -> String {
-    env!("CARGO_BIN_EXE_topo").to_string()
-}
-
-fn temp_db() -> (tempfile::TempDir, String) {
-    let dir = tempfile::tempdir().unwrap();
-    let db = dir.path().join("test.db").to_str().unwrap().to_string();
-    (dir, db)
-}
-
-fn socket_path_for_db(db: &str) -> PathBuf {
-    topo::service::socket_path_for_db(db)
-}
-
-fn create_workspace(db: &str) {
-    // Start a temporary daemon so create-workspace can route via RPC.
-    let socket = socket_path_for_db(db);
-    let mut tmp_daemon = DaemonGuard::new(
-        Command::new(bin())
-            .args(["--db", db, "start", "--bind", "127.0.0.1:0"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .unwrap(),
-    );
-    wait_for_socket(&socket);
-    // Wait for RPC readiness.
-    let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(5) {
-        if topo::rpc::client::rpc_call(&socket, topo::rpc::protocol::RpcMethod::Status)
-            .map(|r| r.ok)
-            .unwrap_or(false)
-        {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-
-    let out = Command::new(bin())
-        .args(["create-workspace", "--db", db])
-        .output()
-        .expect("create-workspace");
-    assert!(
-        out.status.success(),
-        "create-workspace failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    stop_daemon(db, &mut tmp_daemon);
-}
-
-fn wait_for_socket(socket: &PathBuf) {
-    let start = Instant::now();
-    while !socket.exists() && start.elapsed().as_secs() < 5 {
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    assert!(
-        socket.exists(),
-        "daemon socket did not appear at {}",
-        socket.display()
-    );
-}
-
-fn status_via_rpc(socket: &PathBuf) -> serde_json::Value {
-    let resp = topo::rpc::client::rpc_call(socket, topo::rpc::protocol::RpcMethod::Status)
-        .expect("status RPC");
-    assert!(resp.ok, "status RPC should succeed: {:?}", resp.error);
-    resp.data.expect("status response missing data")
-}
-
-fn wait_for_runtime_state(
-    socket: &PathBuf,
-    expected: &str,
-    timeout: Duration,
-) -> serde_json::Value {
-    let start = Instant::now();
-    let mut last = serde_json::Value::Null;
-    while start.elapsed() < timeout {
-        let data = status_via_rpc(socket);
-        if data["runtime_state"].as_str() == Some(expected) {
-            return data;
-        }
-        last = data;
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    panic!(
-        "runtime state did not reach {} within {:?}, last status={}",
-        expected, timeout, last
-    );
-}
-
-fn stop_daemon(db: &str, daemon: &mut DaemonGuard) {
-    let _ = Command::new(bin()).args(["--db", db, "stop"]).output();
-    let start = Instant::now();
-    loop {
-        match daemon.child().try_wait() {
-            Ok(Some(_)) => return,
-            Ok(None) => {
-                if start.elapsed().as_secs() >= 5 {
-                    return; // DaemonGuard will kill on drop
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            Err(_) => {
-                return; // DaemonGuard will kill on drop
-            }
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // 1. RPC protocol unit tests
@@ -275,10 +168,8 @@ fn daemon_and_cli_status() {
     let (_dir, db) = temp_db();
     let socket = socket_path_for_db(&db);
 
-    // Create workspace (identity chain) so daemon can start.
     create_workspace(&db);
 
-    // Start daemon in background.
     let _daemon = DaemonGuard::new(
         Command::new(bin())
             .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
@@ -286,14 +177,8 @@ fn daemon_and_cli_status() {
             .unwrap(),
     );
 
-    // Wait for socket to appear.
-    let start = std::time::Instant::now();
-    while !socket.exists() && start.elapsed().as_secs() < 5 {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    assert!(socket.exists(), "daemon socket did not appear");
+    wait_for_socket(&socket);
 
-    // Query status via unified CLI (routes through daemon via RPC).
     let out = Command::new(bin())
         .args(["--db", &db, "status"])
         .output()
@@ -316,10 +201,8 @@ fn daemon_and_cli_send_and_messages() {
     let (_dir, db) = temp_db();
     let socket = socket_path_for_db(&db);
 
-    // Create workspace so daemon can start.
     create_workspace(&db);
 
-    // Start daemon.
     let _daemon = DaemonGuard::new(
         Command::new(bin())
             .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
@@ -332,7 +215,6 @@ fn daemon_and_cli_send_and_messages() {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 
-    // Send a message via unified CLI (routes through daemon via RPC).
     let out = Command::new(bin())
         .args(["--db", &db, "send", "hello from topo"])
         .output()
@@ -347,7 +229,6 @@ fn daemon_and_cli_send_and_messages() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("Sent: hello from topo"));
 
-    // Query messages.
     let out = Command::new(bin())
         .args(["--db", &db, "messages"])
         .output()
@@ -367,10 +248,8 @@ fn daemon_and_cli_assert_now() {
     let (_dir, db) = temp_db();
     let socket = socket_path_for_db(&db);
 
-    // Create workspace so daemon can start.
     create_workspace(&db);
 
-    // Start daemon.
     let _daemon = DaemonGuard::new(
         Command::new(bin())
             .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
@@ -448,10 +327,8 @@ fn daemon_stop_flow_clean_exit_and_socket_removal() {
     let (_dir, db) = temp_db();
     let socket = socket_path_for_db(&db);
 
-    // Create workspace so daemon can start sync.
     create_workspace(&db);
 
-    // Start daemon in background.
     let mut daemon = DaemonGuard::new(
         Command::new(bin())
             .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
@@ -459,14 +336,8 @@ fn daemon_stop_flow_clean_exit_and_socket_removal() {
             .unwrap(),
     );
 
-    // Wait for socket to appear.
-    let start = std::time::Instant::now();
-    while !socket.exists() && start.elapsed().as_secs() < 5 {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    assert!(socket.exists(), "daemon socket did not appear");
+    wait_for_socket(&socket);
 
-    // Stop daemon via `topo stop`.
     let out = Command::new(bin())
         .args(["--db", &db, "stop"])
         .output()
@@ -484,8 +355,6 @@ fn daemon_stop_flow_clean_exit_and_socket_removal() {
     loop {
         match daemon.child().try_wait() {
             Ok(Some(status)) => {
-                // Daemon exited — success regardless of exit code (may be non-zero
-                // because tokio tasks get cancelled on shutdown).
                 let _ = status;
                 break;
             }
@@ -499,7 +368,6 @@ fn daemon_stop_flow_clean_exit_and_socket_removal() {
         }
     }
 
-    // Socket should be cleaned up.
     assert!(!socket.exists(), "socket file should be removed after stop");
 }
 
@@ -508,10 +376,8 @@ fn custom_socket_routing() {
     let (dir, db) = temp_db();
     let custom_socket = dir.path().join("custom.sock");
 
-    // Create workspace so daemon can start sync.
     create_workspace(&db);
 
-    // Start daemon on custom socket.
     let _daemon = DaemonGuard::new(
         Command::new(bin())
             .args([
@@ -527,14 +393,12 @@ fn custom_socket_routing() {
             .unwrap(),
     );
 
-    // Wait for custom socket to appear.
     let start = std::time::Instant::now();
     while !custom_socket.exists() && start.elapsed().as_secs() < 5 {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     assert!(custom_socket.exists(), "custom socket did not appear");
 
-    // Query status via custom socket.
     let out = Command::new(bin())
         .args([
             "--db",
@@ -556,14 +420,12 @@ fn custom_socket_routing() {
         "status output should contain STATUS header"
     );
 
-    // Default socket should NOT exist (daemon is on custom socket).
     let default_socket = socket_path_for_db(&db);
     assert!(
         !default_socket.exists(),
         "default socket should not exist when custom socket is used"
     );
 
-    // Stop daemon via custom socket.
     let out = Command::new(bin())
         .args([
             "--db",
@@ -595,22 +457,13 @@ fn daemon_status_includes_runtime_net_info() {
             .unwrap(),
     );
 
-    let start = std::time::Instant::now();
-    while !socket.exists() && start.elapsed().as_secs() < 5 {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    assert!(socket.exists(), "daemon socket did not appear");
+    wait_for_socket(&socket);
 
     // Give daemon a moment to populate runtime net info.
     std::thread::sleep(std::time::Duration::from_millis(500));
 
-    // Query status via RPC.
-    let resp =
-        topo::rpc::client::rpc_call(&socket, topo::rpc::protocol::RpcMethod::Status).unwrap();
-    assert!(resp.ok, "status RPC should succeed");
-    let data = resp.data.unwrap();
+    let data = status_via_rpc(&socket);
 
-    // runtime.listen_addr should be present and contain a port.
     let runtime = &data["runtime"];
     assert!(
         runtime["listen_addr"].is_string(),
@@ -624,7 +477,6 @@ fn daemon_status_includes_runtime_net_info() {
         listen_addr
     );
 
-    // upnp should be absent (not attempted yet — requires explicit `topo upnp`).
     assert!(
         runtime.get("upnp").is_none() || runtime["upnp"].is_null(),
         "upnp should not be present before running topo upnp"
@@ -645,10 +497,7 @@ fn daemon_cli_status_shows_listen_line() {
             .unwrap(),
     );
 
-    let start = std::time::Instant::now();
-    while !socket.exists() && start.elapsed().as_secs() < 5 {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
+    wait_for_socket(&socket);
 
     std::thread::sleep(std::time::Duration::from_millis(500));
 
@@ -700,7 +549,6 @@ fn create_workspace_on_running_daemon_activates_runtime() {
     let socket = socket_path_for_db(&db);
     assert!(!socket.exists(), "socket should not exist before command");
 
-    // Start daemon on empty DB first (required — no auto-start).
     let mut daemon = DaemonGuard::new(
         Command::new(bin())
             .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
@@ -852,7 +700,6 @@ fn db_scoped_commands_remain_isolated_between_daemons() {
     create_workspace(&db_a);
     create_workspace(&db_b);
 
-    // Start explicit daemons for both DBs.
     let socket_a = socket_path_for_db(&db_a);
     let socket_b = socket_path_for_db(&db_b);
     let mut daemon_a = DaemonGuard::new(
@@ -922,8 +769,6 @@ fn local_signer_secret_events_do_not_pass_shared_egress_gate() {
 
 #[test]
 fn shutdown_handler_does_not_call_process_exit() {
-    // Source-level guard: verify that the RPC server dispatch does NOT contain
-    // process::exit. This is a simple grep-style check to prevent regression.
     let server_source = include_str!("../src/runtime/control/rpc/server.rs");
     assert!(
         !server_source.contains("process::exit"),
@@ -940,10 +785,8 @@ fn rpc_identity_command() {
     let (_dir, db) = temp_db();
     let socket = socket_path_for_db(&db);
 
-    // Create workspace (identity chain) so daemon can start.
     create_workspace(&db);
 
-    // Start daemon in background.
     let _daemon = DaemonGuard::new(
         Command::new(bin())
             .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
@@ -951,12 +794,8 @@ fn rpc_identity_command() {
             .unwrap(),
     );
 
-    let start = std::time::Instant::now();
-    while !socket.exists() && start.elapsed().as_secs() < 5 {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
+    wait_for_socket(&socket);
 
-    // Query identity via CLI
     let out = Command::new(bin())
         .args(["--db", &db, "identity"])
         .output()
@@ -990,12 +829,8 @@ fn rpc_invite_ref_resolution() {
             .unwrap(),
     );
 
-    let start = std::time::Instant::now();
-    while !socket.exists() && start.elapsed().as_secs() < 5 {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
+    wait_for_socket(&socket);
 
-    // Create invite — should get ref #1
     let out = Command::new(bin())
         .args([
             "--db",
@@ -1035,14 +870,12 @@ fn rpc_peers_returns_local_peer_after_create_workspace() {
 
     wait_for_socket(&socket);
 
-    // Query peers via RPC
     let resp =
         topo::rpc::client::rpc_call(&socket, topo::rpc::protocol::RpcMethod::Peers).unwrap();
     assert!(resp.ok, "peers RPC should succeed: {:?}", resp.error);
     let data = resp.data.expect("peers response missing data");
     let items = data.as_array().expect("peers should return an array");
 
-    // After create-workspace, there should be exactly one peer (the local one)
     assert_eq!(
         items.len(),
         1,
@@ -1183,8 +1016,8 @@ fn peers_shows_remote_after_invite_accept() {
     );
     let _ = wait_for_runtime_state(&bob_socket, "Active", Duration::from_secs(10));
 
-    // Wait for sync to propagate identity events (bob should see alice's PeerShared)
-    let start = Instant::now();
+    // Wait for sync to propagate identity events
+    let start = std::time::Instant::now();
     loop {
         let resp =
             topo::rpc::client::rpc_call(&bob_socket, topo::rpc::protocol::RpcMethod::Peers)
@@ -1193,7 +1026,6 @@ fn peers_shows_remote_after_invite_accept() {
             if let Some(data) = &resp.data {
                 if let Some(items) = data.as_array() {
                     if items.len() >= 2 {
-                        // Bob sees both his own peer and alice's peer
                         let local_count = items
                             .iter()
                             .filter(|p| p["local"].as_bool().unwrap_or(false))
@@ -1208,8 +1040,6 @@ fn peers_shows_remote_after_invite_accept() {
                             "bob should see at least one remote peer (alice)"
                         );
 
-                        // Check that at least one remote peer has an endpoint
-                        // (alice's IP:port from bootstrap sync)
                         let has_endpoint = items.iter().any(|p| {
                             !p["local"].as_bool().unwrap_or(false)
                                 && p["endpoint"].is_string()
