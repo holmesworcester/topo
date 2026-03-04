@@ -25,6 +25,12 @@ cargo install --path .
 topo --help
 ```
 
+### Shell Completions
+
+```bash
+eval "$(topo completions bash)"
+```
+
 ### CLI Preview
 
 Alice creates a workspace and invites Bob, who then accepts:
