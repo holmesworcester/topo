@@ -4,6 +4,8 @@ A proof-of-concept sketch of the (work-in-progress) Topo protocol: an event-sour
 
 Informed by work on [Quiet](https://github.com/TryQuiet); see [Motivation](#Motivation) below for more detail.
 
+> **🚨 VIBE-CODED & NOT FOR PRODUCTION USE 🚨**
+
 ## Quick Start
 
 ### Prerequisites
