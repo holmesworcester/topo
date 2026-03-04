@@ -82,16 +82,6 @@ pub enum RpcMethod {
     },
     /// Show combined identity info for the active peer.
     Identity,
-    /// List channels for the active peer.
-    Channels,
-    /// Create a new channel for the active peer.
-    NewChannel {
-        name: String,
-    },
-    /// Switch active channel by number or name.
-    UseChannel {
-        selector: String,
-    },
     Shutdown,
     /// List peers (tenants) in this DB with active marker.
     Peers,
