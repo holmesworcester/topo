@@ -446,9 +446,21 @@ fn validate_request_envelope(v: &serde_json::Value) {
         eprintln!("  Full request format: {{\"version\":1,\"method\":{{\"type\":\"Status\"}}}}");
         std::process::exit(1);
     }
-    if v.get("method").is_none() {
+    if !v["version"].is_number() {
+        eprintln!("error: \"version\" must be a number, got: {}", v["version"]);
+        std::process::exit(1);
+    }
+    if v.get("method").is_none() || v["method"].is_null() {
         eprintln!("error: request JSON must have a \"method\" field");
         eprintln!("  Full request format: {{\"version\":1,\"method\":{{\"type\":\"Status\"}}}}");
+        std::process::exit(1);
+    }
+    // Try to deserialize the method portion for better errors.
+    if let Err(e) = serde_json::from_value::<RpcMethod>(v["method"].clone()) {
+        eprintln!("error: invalid method in request: {}", e);
+        if let Some(type_name) = v["method"].get("type").and_then(|t| t.as_str()) {
+            eprintln!("  Hint: run `topo rpc describe {}` to see required parameters", type_name);
+        }
         std::process::exit(1);
     }
 }
@@ -1590,19 +1602,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 // Parse the input into a JSON value representing a full RpcRequest.
                 let request_value: serde_json::Value = if let Some(mj) = method_json {
                     // method_json: parse as RpcMethod, wrap in request envelope.
-                    let method: serde_json::Value =
-                        serde_json::from_str(&mj).map_err(|e| {
-                            eprintln!("error: invalid method JSON: {}", e);
-                            std::process::exit(1);
-                        }).unwrap();
-                    // Validate the method has a "type" field (serde tag).
-                    if method.get("type").and_then(|t| t.as_str()).is_none() {
-                        eprintln!("error: method JSON must have a \"type\" field (e.g. {{\"type\":\"Status\"}})");
+                    // Pre-validate by deserializing as RpcMethod — gives specific
+                    // serde errors (missing field, wrong type, unknown variant)
+                    // instead of a generic "daemon closed connection" later.
+                    let _method: RpcMethod = serde_json::from_str(&mj).map_err(|e| {
+                        eprintln!("error: invalid method JSON: {}", e);
+                        if let Some(type_name) = serde_json::from_str::<serde_json::Value>(&mj)
+                            .ok()
+                            .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(String::from))
+                        {
+                            eprintln!("  Hint: run `topo rpc describe {}` to see required parameters", type_name);
+                        } else {
+                            eprintln!("  Hint: method JSON must have a \"type\" field (e.g. {{\"type\":\"Status\"}})");
+                        }
                         std::process::exit(1);
-                    }
+                    }).unwrap();
+                    let method_val: serde_json::Value =
+                        serde_json::from_str(&mj).unwrap();
                     serde_json::json!({
                         "version": PROTOCOL_VERSION,
-                        "method": method
+                        "method": method_val
                     })
                 } else if let Some(rj) = request_json {
                     let v: serde_json::Value = serde_json::from_str(&rj).map_err(|e| {
