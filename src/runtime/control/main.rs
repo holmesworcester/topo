@@ -584,7 +584,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Init tracing for commands that need it
     match &cli.command {
-        Commands::Start { .. } | Commands::Intro { .. } | Commands::AcceptInvite { .. } => {
+        Commands::Start { .. } => {
+            let level = match std::env::var("RUST_LOG").ok().as_deref() {
+                Some("trace") => Level::TRACE,
+                Some("debug") => Level::DEBUG,
+                Some("info") => Level::INFO,
+                Some("error") => Level::ERROR,
+                _ => Level::WARN,
+            };
+            let subscriber = FmtSubscriber::builder()
+                .with_max_level(level)
+                .finish();
+            let _ = tracing::subscriber::set_global_default(subscriber);
+        }
+        Commands::Intro { .. } | Commands::AcceptInvite { .. } => {
             let subscriber = FmtSubscriber::builder()
                 .with_max_level(Level::INFO)
                 .finish();
