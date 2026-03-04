@@ -1255,6 +1255,41 @@ fn rpc_call_invalid_json_fails() {
 }
 
 #[test]
+fn rpc_call_method_json_missing_type_fails() {
+    let out = Command::new(bin())
+        .args(["rpc", "call", "--method-json", r#"{"bogus":"field"}"#])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "should fail on missing type");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("\"type\" field"),
+        "should mention type field, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn rpc_call_request_json_missing_version_fails() {
+    let out = Command::new(bin())
+        .args(["rpc", "call", "--request-json", r#"{"type":"Status"}"#])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "should fail on missing version");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("\"version\" field"),
+        "should mention version field, got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("--method-json"),
+        "should hint about --method-json, got: {}",
+        stderr
+    );
+}
+
+#[test]
 fn rpc_call_no_input_fails() {
     let out = Command::new(bin())
         .args(["rpc", "call"])

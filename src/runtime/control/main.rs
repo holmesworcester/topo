@@ -438,6 +438,21 @@ enum DbAction {
 // RPC helpers: auto-start daemon for target DB/socket, then call.
 // ---------------------------------------------------------------------------
 
+/// Validate that a JSON value looks like an RpcRequest envelope before sending.
+fn validate_request_envelope(v: &serde_json::Value) {
+    if v.get("version").is_none() {
+        eprintln!("error: request JSON must have a \"version\" field");
+        eprintln!("  Hint: did you mean --method-json? (auto-wraps in {{\"version\":1,\"method\":...}})");
+        eprintln!("  Full request format: {{\"version\":1,\"method\":{{\"type\":\"Status\"}}}}");
+        std::process::exit(1);
+    }
+    if v.get("method").is_none() {
+        eprintln!("error: request JSON must have a \"method\" field");
+        eprintln!("  Full request format: {{\"version\":1,\"method\":{{\"type\":\"Status\"}}}}");
+        std::process::exit(1);
+    }
+}
+
 fn target_socket_path(db: &str, socket: Option<&str>) -> PathBuf {
     socket
         .map(PathBuf::from)
@@ -1526,7 +1541,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
             }
             RpcAction::Describe { method, json } => {
-                match catalog::describe(&method) {
+                let method = method.trim();
+                match catalog::describe(method) {
                     Some(info) => {
                         if json {
                             println!(
@@ -1547,7 +1563,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                         None => String::new(),
                                     };
                                     println!(
-                                        "    {:<20} {} ({}{})  ",
+                                        "    {:<20} {} ({}{})",
                                         p.name, p.param_type, req, default
                                     );
                                 }
@@ -1579,34 +1595,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             eprintln!("error: invalid method JSON: {}", e);
                             std::process::exit(1);
                         }).unwrap();
+                    // Validate the method has a "type" field (serde tag).
+                    if method.get("type").and_then(|t| t.as_str()).is_none() {
+                        eprintln!("error: method JSON must have a \"type\" field (e.g. {{\"type\":\"Status\"}})");
+                        std::process::exit(1);
+                    }
                     serde_json::json!({
                         "version": PROTOCOL_VERSION,
                         "method": method
                     })
                 } else if let Some(rj) = request_json {
-                    serde_json::from_str(&rj).map_err(|e| {
+                    let v: serde_json::Value = serde_json::from_str(&rj).map_err(|e| {
                         eprintln!("error: invalid request JSON: {}", e);
                         std::process::exit(1);
-                    }).unwrap()
+                    }).unwrap();
+                    validate_request_envelope(&v);
+                    v
                 } else if let Some(path) = file {
                     let contents = std::fs::read_to_string(&path).map_err(|e| {
                         eprintln!("error: cannot read file {:?}: {}", path, e);
                         std::process::exit(1);
                     }).unwrap();
-                    serde_json::from_str(&contents).map_err(|e| {
+                    let v: serde_json::Value = serde_json::from_str(&contents).map_err(|e| {
                         eprintln!("error: invalid JSON in file {:?}: {}", path, e);
                         std::process::exit(1);
-                    }).unwrap()
+                    }).unwrap();
+                    validate_request_envelope(&v);
+                    v
                 } else if stdin {
                     let mut buf = String::new();
                     std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf).map_err(|e| {
                         eprintln!("error: failed to read stdin: {}", e);
                         std::process::exit(1);
                     }).unwrap();
-                    serde_json::from_str(&buf).map_err(|e| {
+                    let v: serde_json::Value = serde_json::from_str(&buf).map_err(|e| {
                         eprintln!("error: invalid JSON from stdin: {}", e);
                         std::process::exit(1);
-                    }).unwrap()
+                    }).unwrap();
+                    validate_request_envelope(&v);
+                    v
                 } else {
                     eprintln!("error: specify one of --method-json, --request-json, --file, or --stdin");
                     std::process::exit(1);
@@ -1627,6 +1654,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             "daemon is not running for {} — start it with: topo --db {} start",
                             db, db
                         );
+                        std::process::exit(1);
+                    }
+                    Err(RpcClientError::Protocol(msg))
+                        if msg.contains("fill whole buffer") || msg.contains("unexpected eof") =>
+                    {
+                        eprintln!("error: daemon closed connection — the request JSON was likely malformed or unrecognized");
+                        eprintln!("  Hint: use --method-json for method-only JSON (auto-wraps in request envelope)");
+                        eprintln!("  Hint: use --request-json for full {{\"version\":1,\"method\":...}} envelopes");
                         std::process::exit(1);
                     }
                     Err(e) => {
