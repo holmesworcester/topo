@@ -82,22 +82,22 @@ scripts/run_perf_serial.sh lowmem
 ## Architecture
 
 ```text
+Cargo.toml              # crate/dependency config; declares `topo` bin path
+src/runtime/control/main.rs  # `topo` CLI + daemon entrypoint
+
 src/
-  runtime/               # Daemon control plane, peering loops, transport boundary
-  event_modules/         # Event-local commands, queries, wire formats, projectors
-  state/                 # SQLite storage, queues, projection apply pipeline
-  shared/                # Shared constants/tuning/runtime helpers
+  lib.rs                 # shared crate surface used by runtime/tests
+  runtime/               # daemon control plane, peering loops, transport boundary
+  event_modules/         # event-local commands, queries, wire formats, projectors
+  state/                 # SQLite storage, queues, projection/apply pipeline
+  shared/                # cross-cutting constants, IDs, crypto helpers
+  testutil/              # deterministic fixtures/helpers used by integration tests
 
 tests/
-  sync_contract_tests/   # Sync correctness and convergence contracts
-  projectors/            # Projector behavior and ordering tests
+  sync_contract_tests/   # sync correctness and convergence contracts
+  projectors/            # projector behavior and ordering tests
   *_test.rs              # CLI/RPC/perf/lowmem/system tests
 
-docs/
-  DESIGN.md              # Normative design and invariants
-  PLAN.md                # Build order and phase gates
-  DESIGN_DIAGRAMS.md     # Runtime topology and flow diagrams
-  PERF.md                # Benchmarks and perf evidence
 ```
 
 ### High Level Data Flow
