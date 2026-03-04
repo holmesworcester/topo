@@ -260,6 +260,9 @@ enum Commands {
     /// List workspaces from projection
     Workspaces,
 
+    /// List all known peers (local + remote) with connection endpoint info
+    Peers,
+
     /// Show event dependency tree
     #[command(name = "event-tree")]
     EventTree,
@@ -1183,6 +1186,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             item["name"].as_str().unwrap_or(""),
                             short_id(item["event_id"].as_str().unwrap_or(""))
                         );
+                    }
+                }
+            } else {
+                println!("  (none)");
+            }
+        }
+
+        Commands::Peers => {
+            let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::Peers)?;
+            println!("PEERS ({}):", db);
+            if let Some(items) = data.as_array() {
+                if items.is_empty() {
+                    println!("  (none)");
+                } else {
+                    for (i, item) in items.iter().enumerate() {
+                        let peer_id = item["peer_id"].as_str().unwrap_or("");
+                        let device_name = item["device_name"].as_str().unwrap_or("");
+                        let username = item["username"].as_str().unwrap_or("");
+                        let is_local = item["local"].as_bool().unwrap_or(false);
+                        let endpoint = item["endpoint"].as_str();
+
+                        let label = if !username.is_empty() && !device_name.is_empty() {
+                            format!("{}@{}", username, device_name)
+                        } else if !username.is_empty() {
+                            username.to_string()
+                        } else if !device_name.is_empty() {
+                            device_name.to_string()
+                        } else {
+                            String::new()
+                        };
+
+                        let location = if is_local {
+                            "local".to_string()
+                        } else if let Some(ep) = endpoint {
+                            ep.to_string()
+                        } else {
+                            "remote".to_string()
+                        };
+
+                        if label.is_empty() {
+                            println!("  {}. {} [{}]", i + 1, short_id(peer_id), location);
+                        } else {
+                            println!(
+                                "  {}. {} ({}) [{}]",
+                                i + 1,
+                                label,
+                                short_id(peer_id),
+                                location
+                            );
+                        }
                     }
                 }
             } else {

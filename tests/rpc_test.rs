@@ -251,6 +251,7 @@ fn rpc_all_methods_serialize() {
             username: "user".into(),
             devicename: "device".into(),
         },
+        RpcMethod::Peers,
         RpcMethod::Upnp,
     ];
 
@@ -1012,4 +1013,229 @@ fn rpc_invite_ref_resolution() {
         "should show invite ref or link, got: {}",
         stdout
     );
+}
+
+// ---------------------------------------------------------------------------
+// 7. Peers command tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rpc_peers_returns_local_peer_after_create_workspace() {
+    let (_dir, db) = temp_db();
+    let socket = socket_path_for_db(&db);
+
+    create_workspace(&db);
+
+    let _daemon = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
+            .spawn()
+            .unwrap(),
+    );
+
+    wait_for_socket(&socket);
+
+    // Query peers via RPC
+    let resp =
+        topo::rpc::client::rpc_call(&socket, topo::rpc::protocol::RpcMethod::Peers).unwrap();
+    assert!(resp.ok, "peers RPC should succeed: {:?}", resp.error);
+    let data = resp.data.expect("peers response missing data");
+    let items = data.as_array().expect("peers should return an array");
+
+    // After create-workspace, there should be exactly one peer (the local one)
+    assert_eq!(
+        items.len(),
+        1,
+        "should have exactly one peer after create-workspace, got: {:?}",
+        items
+    );
+
+    let peer = &items[0];
+    assert!(
+        peer["peer_id"].is_string(),
+        "peer should have peer_id string"
+    );
+    assert!(
+        peer["local"].as_bool().unwrap_or(false),
+        "the only peer after create-workspace should be local"
+    );
+    assert!(
+        peer["device_name"].is_string(),
+        "peer should have device_name"
+    );
+}
+
+#[test]
+fn cli_peers_output_format() {
+    let (_dir, db) = temp_db();
+    let socket = socket_path_for_db(&db);
+
+    create_workspace(&db);
+
+    let _daemon = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
+            .spawn()
+            .unwrap(),
+    );
+
+    wait_for_socket(&socket);
+
+    let out = Command::new(bin())
+        .args(["--db", &db, "peers"])
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "peers command failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("PEERS"),
+        "should contain PEERS header, got: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("[local]"),
+        "local peer should show [local] marker, got: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("1."),
+        "should show numbered list, got: {}",
+        stdout
+    );
+}
+
+#[test]
+fn peers_shows_remote_after_invite_accept() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
+    let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
+
+    let alice_socket = socket_path_for_db(&alice_db);
+    let bob_socket = socket_path_for_db(&bob_db);
+
+    // Alice: start daemon, create workspace.
+    let mut alice_daemon = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--db", &alice_db, "start", "--bind", "127.0.0.1:0"])
+            .spawn()
+            .unwrap(),
+    );
+    wait_for_socket(&alice_socket);
+    let _ = wait_for_runtime_state(&alice_socket, "IdleNoTenants", Duration::from_secs(10));
+    let create = Command::new(bin())
+        .args(["create-workspace", "--db", &alice_db, "--username", "alice"])
+        .output()
+        .unwrap();
+    assert!(create.status.success(), "alice create-workspace failed");
+    let alice_status = wait_for_runtime_state(&alice_socket, "Active", Duration::from_secs(10));
+    let alice_listen = alice_status["runtime"]["listen_addr"]
+        .as_str()
+        .expect("alice runtime.listen_addr")
+        .to_string();
+
+    // Alice creates invite.
+    let invite_out = Command::new(bin())
+        .args([
+            "--db",
+            &alice_db,
+            "create-invite",
+            "--public-addr",
+            &alice_listen,
+        ])
+        .output()
+        .unwrap();
+    assert!(invite_out.status.success(), "create-invite failed");
+    let invite_link = String::from_utf8_lossy(&invite_out.stdout)
+        .lines()
+        .find(|line| line.starts_with("topo://"))
+        .expect("missing invite link")
+        .to_string();
+
+    // Bob: start daemon, accept invite.
+    let mut bob_daemon = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--db", &bob_db, "start", "--bind", "127.0.0.1:0"])
+            .spawn()
+            .unwrap(),
+    );
+    wait_for_socket(&bob_socket);
+    let accept = Command::new(bin())
+        .args([
+            "accept-invite",
+            "--db",
+            &bob_db,
+            "--invite",
+            &invite_link,
+            "--username",
+            "bob",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        accept.status.success(),
+        "accept-invite failed: {}",
+        String::from_utf8_lossy(&accept.stderr)
+    );
+    let _ = wait_for_runtime_state(&bob_socket, "Active", Duration::from_secs(10));
+
+    // Wait for sync to propagate identity events (bob should see alice's PeerShared)
+    let start = Instant::now();
+    loop {
+        let resp =
+            topo::rpc::client::rpc_call(&bob_socket, topo::rpc::protocol::RpcMethod::Peers)
+                .unwrap();
+        if resp.ok {
+            if let Some(data) = &resp.data {
+                if let Some(items) = data.as_array() {
+                    if items.len() >= 2 {
+                        // Bob sees both his own peer and alice's peer
+                        let local_count = items
+                            .iter()
+                            .filter(|p| p["local"].as_bool().unwrap_or(false))
+                            .count();
+                        let remote_count = items
+                            .iter()
+                            .filter(|p| !p["local"].as_bool().unwrap_or(false))
+                            .count();
+                        assert_eq!(local_count, 1, "bob should see exactly one local peer");
+                        assert!(
+                            remote_count >= 1,
+                            "bob should see at least one remote peer (alice)"
+                        );
+
+                        // Check that at least one remote peer has an endpoint
+                        // (alice's IP:port from bootstrap sync)
+                        let has_endpoint = items.iter().any(|p| {
+                            !p["local"].as_bool().unwrap_or(false)
+                                && p["endpoint"].is_string()
+                        });
+                        assert!(
+                            has_endpoint,
+                            "remote peer should have endpoint from sync, got: {:?}",
+                            items
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+        if start.elapsed() > Duration::from_secs(30) {
+            let resp =
+                topo::rpc::client::rpc_call(&bob_socket, topo::rpc::protocol::RpcMethod::Peers)
+                    .unwrap();
+            panic!(
+                "bob did not see 2 peers within 30s, last response: {:?}",
+                resp.data
+            );
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    stop_daemon(&alice_db, &mut alice_daemon);
+    stop_daemon(&bob_db, &mut bob_daemon);
 }

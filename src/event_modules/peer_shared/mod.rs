@@ -6,9 +6,9 @@ pub mod wire;
 pub use projector::project_pure;
 pub use queries::{
     count, first_event_id, identity, list_account_items, list_accounts, list_event_ids,
-    load_local_peer_signer, load_local_peer_signer_required, load_local_user_key,
+    list_peers, load_local_peer_signer, load_local_peer_signer_required, load_local_user_key,
     resolve_event_id_by_transport_fingerprint, resolve_user_event_id, AccountItem, AccountRow,
-    IdentityResponse,
+    IdentityResponse, PeerItem,
 };
 pub use wire::{
     encode_peer_shared_first, encode_peer_shared_ongoing, parse_peer_shared_first,

@@ -219,6 +219,76 @@ pub fn list_account_items(
         .collect())
 }
 
+// ---------------------------------------------------------------------------
+// Peers listing (all known peers with endpoint + local status)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PeerItem {
+    pub peer_id: String,
+    pub device_name: String,
+    pub username: String,
+    pub user_event_id: String,
+    /// True if this peer has local transport credentials (i.e. is a local tenant).
+    pub local: bool,
+    /// Most recently observed endpoint address, if any.
+    pub endpoint: Option<String>,
+}
+
+/// List all known peers with local/remote status and last-observed endpoint.
+///
+/// Joins `peers_shared` → `users` for display names, checks
+/// `local_transport_creds` for local flag, and picks the most recent
+/// non-expired `peer_endpoint_observations` row for endpoint info.
+pub fn list_peers(
+    db: &Connection,
+    recorded_by: &str,
+) -> Result<Vec<PeerItem>, rusqlite::Error> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let mut stmt = db.prepare(
+        "SELECT
+            ps.event_id,
+            COALESCE(ps.device_name, ''),
+            COALESCE(u.username, ''),
+            COALESCE(ps.user_event_id, ''),
+            EXISTS(
+                SELECT 1 FROM local_transport_creds c
+                WHERE c.peer_id = lower(hex(ps.transport_fingerprint))
+            ) AS is_local,
+            (
+                SELECT e.origin_ip || ':' || e.origin_port
+                FROM peer_endpoint_observations e
+                WHERE e.recorded_by = ps.recorded_by
+                  AND e.via_peer_id = lower(hex(ps.transport_fingerprint))
+                  AND e.expires_at > ?2
+                ORDER BY e.observed_at DESC
+                LIMIT 1
+            ) AS endpoint
+         FROM peers_shared ps
+         LEFT JOIN users u
+           ON ps.user_event_id = u.event_id
+          AND ps.recorded_by = u.recorded_by
+         WHERE ps.recorded_by = ?1
+         ORDER BY is_local DESC, ps.event_id",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![recorded_by, now_ms], |row| {
+            Ok(PeerItem {
+                peer_id: row.get(0)?,
+                device_name: row.get(1)?,
+                username: row.get(2)?,
+                user_event_id: row.get(3)?,
+                local: row.get(4)?,
+                endpoint: row.get(5)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct IdentityResponse {
     pub transport_fingerprint: String,
@@ -270,5 +340,134 @@ mod tests {
             resolve_event_id_by_transport_fingerprint(&conn, recorded_by, &transport_fingerprint)
                 .expect("resolve event id");
         assert_eq!(resolved.as_deref(), Some(event_id));
+    }
+
+    #[test]
+    fn list_peers_returns_local_and_remote() {
+        let conn = open_in_memory().expect("open in-memory db");
+        create_tables(&conn).expect("create tables");
+
+        let recorded_by = "tenant-a";
+
+        // Insert a local peer (has local_transport_creds matched via transport_fingerprint)
+        let local_tf: [u8; 32] = [0x11; 32];
+        let local_tf_hex = hex::encode(local_tf);
+        conn.execute(
+            "INSERT INTO peers_shared (recorded_by, event_id, public_key, transport_fingerprint, device_name, user_event_id)
+             VALUES (?1, 'local-peer', X'1111111111111111111111111111111111111111111111111111111111111111', ?2, 'my-laptop', 'user-1')",
+            rusqlite::params![recorded_by, local_tf.as_slice()],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO local_transport_creds (peer_id, cert_der, key_der, created_at, source)
+             VALUES (?1, X'AA', X'BB', 1000, 'random')",
+            rusqlite::params![local_tf_hex],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO users (recorded_by, event_id, public_key, username)
+             VALUES (?1, 'user-1', X'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', 'alice')",
+            rusqlite::params![recorded_by],
+        ).unwrap();
+
+        // Insert a remote peer (no local creds)
+        conn.execute(
+            "INSERT INTO peers_shared (recorded_by, event_id, public_key, device_name, user_event_id)
+             VALUES (?1, 'remote-peer', X'2222222222222222222222222222222222222222222222222222222222222222', 'bobs-phone', 'user-2')",
+            rusqlite::params![recorded_by],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO users (recorded_by, event_id, public_key, username)
+             VALUES (?1, 'user-2', X'BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB', 'bob')",
+            rusqlite::params![recorded_by],
+        ).unwrap();
+
+        let peers = list_peers(&conn, recorded_by).unwrap();
+        assert_eq!(peers.len(), 2);
+
+        // Local peer should come first (ORDER BY is_local DESC)
+        assert_eq!(peers[0].peer_id, "local-peer");
+        assert!(peers[0].local);
+        assert_eq!(peers[0].username, "alice");
+        assert_eq!(peers[0].device_name, "my-laptop");
+        assert!(peers[0].endpoint.is_none());
+
+        assert_eq!(peers[1].peer_id, "remote-peer");
+        assert!(!peers[1].local);
+        assert_eq!(peers[1].username, "bob");
+        assert_eq!(peers[1].device_name, "bobs-phone");
+    }
+
+    #[test]
+    fn list_peers_includes_endpoint_observations() {
+        let conn = open_in_memory().expect("open in-memory db");
+        create_tables(&conn).expect("create tables");
+
+        let recorded_by = "tenant-a";
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        // transport_fingerprint blob whose hex is used as via_peer_id
+        let tf: [u8; 32] = [0x33; 32];
+        let tf_hex = hex::encode(tf);
+
+        conn.execute(
+            "INSERT INTO peers_shared (recorded_by, event_id, public_key, transport_fingerprint, device_name)
+             VALUES (?1, 'peer-x', X'3333333333333333333333333333333333333333333333333333333333333333', ?2, 'device-x')",
+            rusqlite::params![recorded_by, tf.as_slice()],
+        ).unwrap();
+
+        // Endpoint observation uses hex(transport_fingerprint) as via_peer_id
+        conn.execute(
+            "INSERT INTO peer_endpoint_observations
+             (recorded_by, via_peer_id, origin_ip, origin_port, observed_at, expires_at)
+             VALUES (?1, ?2, '10.0.0.5', 4433, ?3, ?4)",
+            rusqlite::params![recorded_by, tf_hex, now_ms - 1000, now_ms + 86400000],
+        ).unwrap();
+
+        let peers = list_peers(&conn, recorded_by).unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].endpoint.as_deref(), Some("10.0.0.5:4433"));
+    }
+
+    #[test]
+    fn list_peers_excludes_expired_endpoints() {
+        let conn = open_in_memory().expect("open in-memory db");
+        create_tables(&conn).expect("create tables");
+
+        let recorded_by = "tenant-a";
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        let tf: [u8; 32] = [0x44; 32];
+        let tf_hex = hex::encode(tf);
+
+        conn.execute(
+            "INSERT INTO peers_shared (recorded_by, event_id, public_key, transport_fingerprint, device_name)
+             VALUES (?1, 'peer-y', X'4444444444444444444444444444444444444444444444444444444444444444', ?2, 'device-y')",
+            rusqlite::params![recorded_by, tf.as_slice()],
+        ).unwrap();
+
+        // Add an expired endpoint observation
+        conn.execute(
+            "INSERT INTO peer_endpoint_observations
+             (recorded_by, via_peer_id, origin_ip, origin_port, observed_at, expires_at)
+             VALUES (?1, ?2, '10.0.0.6', 5555, ?3, ?4)",
+            rusqlite::params![recorded_by, tf_hex, now_ms - 100000, now_ms - 1000],
+        ).unwrap();
+
+        let peers = list_peers(&conn, recorded_by).unwrap();
+        assert_eq!(peers.len(), 1);
+        assert!(peers[0].endpoint.is_none(), "expired endpoint should not appear");
+    }
+
+    #[test]
+    fn list_peers_empty_db() {
+        let conn = open_in_memory().expect("open in-memory db");
+        create_tables(&conn).expect("create tables");
+        let peers = list_peers(&conn, "no-such-tenant").unwrap();
+        assert!(peers.is_empty());
     }
 }

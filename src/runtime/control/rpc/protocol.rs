@@ -100,6 +100,8 @@ pub enum RpcMethod {
         #[serde(default = "default_device_name")]
         device_name: String,
     },
+    /// List all known peers with local/remote status and endpoint info.
+    Peers,
     /// Attempt UPnP port mapping for the QUIC listen port.
     Upnp,
     /// Combined view: sidebar (workspace, users, accounts) + messages with inline reactions.
