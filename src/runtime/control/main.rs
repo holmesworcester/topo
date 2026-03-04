@@ -149,19 +149,19 @@ enum Commands {
     // -------------------------------------------------------------------
     // Daemon-only commands (require a running daemon)
     // -------------------------------------------------------------------
-    /// List peers in this DB with active marker
-    Peers,
+    /// List local tenants (peer identities) in this DB with active marker
+    Tenants,
 
-    /// Switch active peer by number from the peers list
-    #[command(name = "use-peer")]
-    UsePeer {
-        /// Peer number (1-based, from `topo peers`)
+    /// Switch active tenant by number from the tenants list
+    #[command(name = "use-tenant")]
+    UseTenant {
+        /// Tenant number (1-based, from `topo tenants`)
         index: usize,
     },
 
-    /// Show currently active peer
-    #[command(name = "active-peer")]
-    ActivePeer,
+    /// Show currently active tenant
+    #[command(name = "active-tenant")]
+    ActiveTenant,
 
     /// Print local transport identity — SPKI fingerprint from TLS cert
     #[command(name = "transport-identity")]
@@ -830,9 +830,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // ---------------------------------------------------------------
         // Daemon-only commands (require running daemon)
         // ---------------------------------------------------------------
-        Commands::Peers => {
-            let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::Peers)?;
-            println!("PEERS ({}):", db);
+        Commands::Tenants => {
+            let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::Tenants)?;
+            println!("TENANTS ({}):", db);
             if let Some(items) = data.as_array() {
                 if items.is_empty() {
                     println!("  (none)");
@@ -858,23 +858,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         }
 
-        Commands::UsePeer { index } => {
+        Commands::UseTenant { index } => {
             let data =
-                rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::UsePeer { index })?;
+                rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::UseTenant { index })?;
             let peer_id = data["peer_id"].as_str().unwrap_or("");
             let ws_id = data["workspace_id"].as_str().unwrap_or("");
             println!(
-                "Switched to peer {} (workspace: {})",
+                "Switched to tenant {} (workspace: {})",
                 short_id(peer_id),
                 short_id(ws_id)
             );
         }
 
-        Commands::ActivePeer => {
-            let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::ActivePeer)?;
+        Commands::ActiveTenant => {
+            let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::ActiveTenant)?;
             match data["peer_id"].as_str() {
                 Some(peer_id) => println!("{}", peer_id),
-                None => println!("(no active peer)"),
+                None => println!("(no active tenant)"),
             }
         }
 

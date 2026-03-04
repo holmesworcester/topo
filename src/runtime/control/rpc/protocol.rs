@@ -83,14 +83,14 @@ pub enum RpcMethod {
     /// Show combined identity info for the active peer.
     Identity,
     Shutdown,
-    /// List peers (tenants) in this DB with active marker.
-    Peers,
-    /// Switch active peer by 1-based index from peers list.
-    UsePeer {
+    /// List local tenants in this DB with active marker.
+    Tenants,
+    /// Switch active tenant by 1-based index from tenants list.
+    UseTenant {
         index: usize,
     },
-    /// Return the currently active peer.
-    ActivePeer,
+    /// Return the currently active tenant.
+    ActiveTenant,
     /// Create a new workspace + identity chain.
     CreateWorkspace {
         #[serde(default = "default_workspace_name")]
