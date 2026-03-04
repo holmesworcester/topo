@@ -117,7 +117,7 @@ impl DaemonState {
             }
         }
 
-        Err("no active peer — run `topo use-peer <N>`".to_string())
+        Err("no active tenant — run `topo use-tenant <N>`".to_string())
     }
 
     /// Store an invite/link string and return its 1-based reference number.
@@ -146,9 +146,9 @@ impl DaemonState {
 
 }
 
-/// Peer info returned by the Peers command.
+/// Tenant info returned by the Tenants command.
 #[derive(Debug, Serialize)]
-struct PeerItem {
+struct TenantItem {
     index: usize,
     peer_id: String,
     workspace_id: String,
@@ -313,18 +313,18 @@ fn dispatch(
             RpcResponse::success(serde_json::json!({"shutdown": true}))
         }
 
-        // ----- Peer management (daemon state) -----
-        RpcMethod::Peers => {
+        // ----- Tenant management (daemon state) -----
+        RpcMethod::Tenants => {
             match crate::db::open_connection(db_path) {
                 Ok(conn) => {
                     let _ = crate::db::schema::create_tables(&conn);
                     match discover_local_tenants(&conn) {
                         Ok(tenants) => {
                             let active = state.active_peer.read().unwrap().clone();
-                            let mut items: Vec<PeerItem> = tenants
+                            let mut items: Vec<TenantItem> = tenants
                                 .iter()
                                 .enumerate()
-                                .map(|(i, t)| PeerItem {
+                                .map(|(i, t)| TenantItem {
                                     index: i + 1,
                                     peer_id: t.peer_id.clone(),
                                     workspace_id: t.workspace_id.clone(),
@@ -345,7 +345,7 @@ fn dispatch(
             }
         }
 
-        RpcMethod::UsePeer { index } => match crate::db::open_connection(db_path) {
+        RpcMethod::UseTenant { index } => match crate::db::open_connection(db_path) {
             Ok(conn) => {
                 let _ = crate::db::schema::create_tables(&conn);
                 match discover_local_tenants(&conn) {
@@ -353,7 +353,7 @@ fn dispatch(
                         tenants.sort_by(|a, b| a.peer_id.cmp(&b.peer_id));
                         if index == 0 || index > tenants.len() {
                             return RpcResponse::error(format!(
-                                "invalid peer number {}; available: 1-{}",
+                                "invalid tenant number {}; available: 1-{}",
                                 index,
                                 tenants.len()
                             ));
@@ -371,7 +371,7 @@ fn dispatch(
             Err(e) => RpcResponse::error(e.to_string()),
         },
 
-        RpcMethod::ActivePeer => {
+        RpcMethod::ActiveTenant => {
             let active = state.active_peer.read().unwrap().clone();
             match active {
                 Some(peer_id) => RpcResponse::success(serde_json::json!({"peer_id": peer_id})),

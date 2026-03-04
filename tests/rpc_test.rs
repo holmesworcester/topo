@@ -224,9 +224,9 @@ fn rpc_all_methods_serialize() {
             peer: Some("peer1".into()),
         },
         RpcMethod::Shutdown,
-        RpcMethod::Peers,
-        RpcMethod::UsePeer { index: 1 },
-        RpcMethod::ActivePeer,
+        RpcMethod::Tenants,
+        RpcMethod::UseTenant { index: 1 },
+        RpcMethod::ActiveTenant,
         RpcMethod::CreateWorkspace {
             workspace_name: "test".into(),
             username: "user".into(),

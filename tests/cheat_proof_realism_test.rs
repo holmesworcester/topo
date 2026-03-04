@@ -32,7 +32,7 @@ fn is_transient_rpc_startup_error(stderr: &str) -> bool {
     stderr.contains("daemon not running")
         || stderr.contains("Connection reset by peer")
         || stderr.contains("no identity — run `topo create-workspace` first")
-        || stderr.contains("no active peer — run `topo use-peer <N>`")
+        || stderr.contains("no active tenant — run `topo use-tenant <N>`")
 }
 
 fn wait_for_daemon_ready(db: &str, path: &Path, child: &mut Child, timeout: Duration) {
@@ -136,8 +136,8 @@ fn topo_rpc_retry(db: &str, args: &[&str], timeout: Duration) -> Output {
             return out;
         }
         let stderr = String::from_utf8_lossy(&out.stderr);
-        if stderr.contains("no active peer") {
-            let _ = topo_rpc(db, &["use-peer", "1"]);
+        if stderr.contains("no active tenant") {
+            let _ = topo_rpc(db, &["use-tenant", "1"]);
         }
         if start.elapsed() >= timeout || !is_transient_rpc_startup_error(&stderr) {
             return out;
