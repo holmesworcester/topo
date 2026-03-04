@@ -126,7 +126,7 @@ flowchart TD
 
 ### TLA+ Model
 
-The proof-of-concept models its DAG and bootstrap transport logic in TLA+. (This was helpful for reasoning complex causal relationships and supporting LLM-driven implementations.)
+The proof-of-concept models its DAG and bootstrap transport logic in TLA+. (Probably amateurish, but helpful for avoiding dependency cycles and guiding LLM-driven implementation.)
 
 Core model files:
 
@@ -145,7 +145,7 @@ cd docs/tla
 
 ## Documentation
 
-- **[docs/DESIGN.md](./docs/DESIGN.md)** - Protocol semantics, runtime invariants, and module ownership boundaries
+- **[docs/DESIGN.md](./docs/DESIGN.md)** - Protocol semantics, runtime invariants, and module ownership boundaries written for (mostly) robots
 - **[docs/PLAN.md](./docs/PLAN.md)** - Execution phases, acceptance criteria, and test gates
 - **[docs/DESIGN_DIAGRAMS.md](./docs/DESIGN_DIAGRAMS.md)** - Code-accurate runtime/data-flow diagrams
 - **[docs/INDEX.md](./docs/INDEX.md)** - Documentation index
