@@ -1115,7 +1115,7 @@ These are operator ergonomics, not protocol facts; they do not project into cano
 CLI database selection supports a local registry (`~/.topo/db_registry.json`, overridable by `TOPO_REGISTRY_DIR`) with:
 1. alias names,
 2. 1-based numeric selectors,
-3. default DB selection for the implicit `--db server.db` case.
+3. default DB selection for the implicit `--db topo.db` case.
 
 Selectors resolve in priority order: existing path -> alias -> index -> passthrough path.
 

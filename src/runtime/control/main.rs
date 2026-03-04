@@ -29,7 +29,7 @@ struct Cli {
     command: Commands,
 
     /// Database path
-    #[arg(short, long, default_value = "server.db", global = true)]
+    #[arg(short, long, default_value = "topo.db", global = true)]
     db: String,
 
     /// Custom RPC socket path (default: <db>.topo.sock)
@@ -321,22 +321,6 @@ enum Commands {
     /// Show combined identity info (transport + user + peer)
     Identity,
 
-    /// List channels
-    Channels,
-
-    /// Create a new channel
-    #[command(name = "new-channel")]
-    NewChannel {
-        /// Channel name
-        name: String,
-    },
-
-    /// Switch active channel
-    Channel {
-        /// Channel number or name
-        selector: String,
-    },
-
     /// Generate shell completions
     Completions {
         /// Shell to generate completions for
@@ -505,11 +489,11 @@ fn rpc_require_daemon(
 }
 
 /// Resolve the --db argument using the registry:
-/// - If --db is the clap default "server.db" and a registry default exists, use it
+/// - If --db is the clap default "topo.db" and a registry default exists, use it
 /// - Otherwise run selector resolution (existing path → alias → index → passthrough)
 fn resolve_db_arg(raw: &str) -> Result<String, String> {
     let registry = DbRegistry::load();
-    if raw == "server.db" {
+    if raw == "topo.db" {
         if let Some(default_path) = registry.default_path() {
             return Ok(default_path.to_string());
         }
@@ -1364,43 +1348,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 Some(pid) => println!("  Peer:      {}", &pid[..pid.len().min(16)]),
                 None => println!("  Peer:      (none)"),
             }
-        }
-
-        Commands::Channels => {
-            let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::Channels)?;
-            println!("CHANNELS:");
-            if let Some(items) = data.as_array() {
-                for item in items {
-                    let marker = if item["active"].as_bool().unwrap_or(false) {
-                        "*"
-                    } else {
-                        " "
-                    };
-                    let idx = item["index"].as_u64().unwrap_or(0);
-                    let name = item["name"].as_str().unwrap_or("");
-                    println!("  {}{}. #{}", marker, idx, name);
-                }
-            }
-        }
-
-        Commands::NewChannel { name } => {
-            let data = rpc_require_daemon(
-                db,
-                socket_override.as_deref(),
-                RpcMethod::NewChannel { name: name.clone() },
-            )?;
-            let idx = data["index"].as_u64().unwrap_or(0);
-            println!("Created channel #{}: {}", idx, name);
-        }
-
-        Commands::Channel { selector } => {
-            let data = rpc_require_daemon(
-                db,
-                socket_override.as_deref(),
-                RpcMethod::UseChannel { selector },
-            )?;
-            let name = data["name"].as_str().unwrap_or("");
-            println!("Switched to channel #{}", name);
         }
 
         Commands::Completions { shell } => {

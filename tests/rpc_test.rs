@@ -227,13 +227,6 @@ fn rpc_all_methods_serialize() {
         },
         RpcMethod::Ban { target: "1".into() },
         RpcMethod::Identity,
-        RpcMethod::Channels,
-        RpcMethod::NewChannel {
-            name: "general".into(),
-        },
-        RpcMethod::UseChannel {
-            selector: "1".into(),
-        },
         RpcMethod::AcceptInvite {
             invite: "topo://invite/test".into(),
             username: "user".into(),
@@ -407,8 +400,8 @@ fn daemon_and_cli_assert_now() {
 
 #[test]
 fn service_socket_path_derivation() {
-    let path = topo::service::socket_path_for_db("server.db");
-    assert!(path.to_str().unwrap().ends_with("server.topo.sock"));
+    let path = topo::service::socket_path_for_db("topo.db");
+    assert!(path.to_str().unwrap().ends_with("topo.topo.sock"));
 
     let path = topo::service::socket_path_for_db("/tmp/mydb.db");
     assert_eq!(path.to_str().unwrap(), "/tmp/mydb.topo.sock");

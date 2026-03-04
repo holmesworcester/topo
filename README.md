@@ -18,10 +18,11 @@ command 🡪 create event 🡪 sign, encrypt, hash 🡪 peer via QUIC 🡪 check
 
 ### Running the CLI
 
-You can test the proof-of-concept by playing with its CLI either locally, over a LAN (with autodiscovery), or with remote peers.
+Install the `topo` binary, then use it directly:
 
 ```bash
-cargo run --bin topo -- --help
+cargo install --path .
+topo --help
 ```
 
 ### CLI Preview
