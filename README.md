@@ -171,7 +171,7 @@ We think there is a simpler way, one that doesn't:
 
 This PoC exists to prove the practicality of a principled approach that uses [event sourcing](https://martinfowler.com/eaaDev/EventSourcing.html), [range-based set reconciliation](https://aljoscha-meyer.de/assets/landing/rbsr.pdf),  [topological sort](https://en.wikipedia.org/wiki/Topological_sorting), and [materialization](https://en.wikipedia.org/wiki/Materialized_view) or "projection" of p2p-synced, decrypted events into SQLite tables that can be easily queried by an API.
 
-### What it (seeks to) prove practical
+### What it seeks to prove practical
 
 * **SQLite for everything** - You can simplify state management by using SQLite for everything, even file slices, for GBs of messages/files
 * **Everything can be an event** - You can model all data, even file slices, as events, encrypt them (and store them all in SQLite)
