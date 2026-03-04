@@ -1,9 +1,7 @@
-pub mod commands;
 pub mod projector;
 pub mod wire;
 
 // Re-export stable public API so callers import from `event_modules::message_attachment`.
-pub use commands::{generate_files_for_peer, GenerateFilesResponse};
 pub use projector::project_pure;
 pub use wire::{
     attachment_offsets, encode_message_attachment, parse_message_attachment,
