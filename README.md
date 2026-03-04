@@ -16,14 +16,14 @@ peer_id:      9fe0...c12a
 workspace_id: 2f4a...7b91
 
 $ topo --db alice.db create-invite --public-addr 127.0.0.1:7443
-quiet://invite/eyJ2IjoxLCJ3b3Jrc3BhY2VfaWQiOiIyZjRhLi4uN2I5MSIsLi4ufQ==
+topo://invite/eyJ2IjoxLCJ3b3Jrc3BhY2VfaWQiOiIyZjRhLi4uN2I5MSIsLi4ufQ==
 Created invite #1
 
 $ topo --db bob.db start --bind 127.0.0.1:7444
 listen: 127.0.0.1:7444
 🐭 Topo daemon started (db=bob.db, socket=.../bob.db.topo.sock)
 
-$ topo --db bob.db accept-invite --invite "quiet://invite/eyJ2IjoxLCJ3b3Jrc3BhY2VfaWQiOiIyZjRhLi4uN2I5MSIsLi4ufQ==" --username bob --devicename phone
+$ topo --db bob.db accept-invite --invite "topo://invite/eyJ2IjoxLCJ3b3Jrc3BhY2VfaWQiOiIyZjRhLi4uN2I5MSIsLi4ufQ==" --username bob --devicename phone
 Accepted invite
   peer_id: d18b...aa43
   user:    W5De...0OM=

@@ -132,7 +132,7 @@ enum Commands {
     /// Accept a user invite link (bootstrap sync + identity chain creation)
     #[command(name = "accept-invite")]
     AcceptInvite {
-        /// Invite link (quiet://invite/...)
+        /// Invite link (topo://invite/...)
         #[arg(long)]
         invite: String,
         /// Username for the new identity
@@ -304,7 +304,7 @@ enum Commands {
     /// Accept a device link invite
     #[command(name = "accept-link")]
     AcceptLink {
-        /// Device link (quiet://link/...)
+        /// Device link (topo://link/...)
         #[arg(long)]
         invite: String,
         /// Device name for the new identity

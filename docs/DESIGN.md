@@ -1099,7 +1099,7 @@ The CLI/daemon operational shape is primarily for operability, testing, and demo
 
 Daemon RPC state owns local UX/session aliases that are intentionally non-canonical:
 1. active peer selection for multi-tenant DBs,
-2. invite-link numeric references (session-local aliases to full `quiet://...` links),
+2. invite-link numeric references (session-local aliases to full `topo://...` links),
 3. channel aliases + active-channel selection per peer.
 
 These are operator ergonomics, not protocol facts; they do not project into canonical event state.
@@ -1227,7 +1227,7 @@ Use split invite event types:
 We do not use multimodal `invite(mode=...)` type (even though it would be DRY) because it complicates the TLA model.
 
 Implementation uses shared invite helper logic with per-type policy tables.
-Interactive CLI keeps real invite links (`quiet://invite/...`, `quiet://link/...`) in frontend state; session-local invite numbers are aliases to those links.
+Interactive CLI keeps real invite links (`topo://invite/...`, `topo://link/...`) in frontend state; session-local invite numbers are aliases to those links.
 
 ## 9.3 Trust-anchor cascade
 

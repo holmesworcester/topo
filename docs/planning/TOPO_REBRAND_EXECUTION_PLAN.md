@@ -17,7 +17,7 @@ Goal: rename project-facing naming to **Topo** consistently, with light 🐭 bra
 1. Product display name: `Topo`.
 2. CLI command and crate package identifier stay lowercase: `topo`.
 3. Gentle emoji branding: use `🐭 Topo` in user-facing surfaces where it improves recognition (help/about, daemon startup logs).
-4. No protocol-level rename in this task (for example `quiet://` remains unchanged).
+4. No protocol-level rename in this task (for example `topo://` remains unchanged).
 5. No schema/event type rename in this task unless a user-visible string depends on it.
 
 ## Scope

@@ -377,7 +377,7 @@ cargo run --release -- generate --count 50000 --db test.db
 cargo run --release -- sync --bind 127.0.0.1:4433 --db server.db
 cargo run --release -- create-invite --db server.db --bootstrap 127.0.0.1:4433
 # then on client:
-cargo run --release -- accept-invite --db client.db --invite quiet://invite/...
+cargo run --release -- accept-invite --db client.db --invite topo://invite/...
 cargo run --release -- sync --bind 127.0.0.1:4434 --db client.db
 
 # Check status

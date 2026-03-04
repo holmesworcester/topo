@@ -6,8 +6,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use super::identity_ops::{InviteData, InviteType};
 use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
 
-const INVITE_PREFIX: &str = "quiet://invite/";
-const LINK_PREFIX: &str = "quiet://link/";
+const INVITE_PREFIX: &str = "topo://invite/";
+const LINK_PREFIX: &str = "topo://link/";
 const INVITE_LINK_VERSION: u8 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

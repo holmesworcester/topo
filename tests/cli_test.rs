@@ -365,10 +365,10 @@ fn create_invite(db: &str, bootstrap_addr: &str) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    // Extract the quiet:// link line (may have "Created invite #N" prefix line)
+    // Extract the topo:// link line (may have "Created invite #N" prefix line)
     stdout
         .lines()
-        .find(|line| line.starts_with("quiet://"))
+        .find(|line| line.starts_with("topo://"))
         .unwrap_or_else(|| stdout.trim())
         .to_string()
 }

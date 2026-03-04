@@ -1445,7 +1445,7 @@ Goal: establish a test suite where successful P2P bootstrap and sync cannot be f
 
 ### 18.1 Realism contract
 
-1. Out-of-band input is limited to invite links (`quiet://...`) with standard bootstrap data.
+1. Out-of-band input is limited to invite links (`topo://...`) with standard bootstrap data.
 2. Nodes run in non-interactive daemon mode (`topo start`) and are asserted through CLI command results (`topo assert-*`).
 3. Desired steady-state connectivity is invite/discovery-driven autodial, not manual `--connect`.
 4. Multi-network topologies are required (local discovery + internet bootstrap-address mode).

@@ -281,7 +281,7 @@ pub fn accept_invite(
         db_path,
         invite_link_str,
         super::invite_link::InviteLinkKind::User,
-        "Expected a user invite link (quiet://invite/...)",
+        "Expected a user invite link (topo://invite/...)",
     )?;
 
     // Accept the invite: creates identity chain via workspace command API.
@@ -329,7 +329,7 @@ pub fn accept_device_link(
         db_path,
         invite_link_str,
         super::invite_link::InviteLinkKind::DeviceLink,
-        "Expected a device link (quiet://link/...)",
+        "Expected a device link (topo://link/...)",
     )?;
 
     let user_event_id = match invite.invite_type {

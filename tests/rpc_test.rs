@@ -222,7 +222,7 @@ fn rpc_all_methods_serialize() {
             public_spki: None,
         },
         RpcMethod::AcceptLink {
-            invite: "quiet://link/test".into(),
+            invite: "topo://link/test".into(),
             devicename: "device".into(),
         },
         RpcMethod::Ban { target: "1".into() },
@@ -235,7 +235,7 @@ fn rpc_all_methods_serialize() {
             selector: "1".into(),
         },
         RpcMethod::AcceptInvite {
-            invite: "quiet://invite/test".into(),
+            invite: "topo://invite/test".into(),
             username: "user".into(),
             devicename: "device".into(),
         },
@@ -769,7 +769,7 @@ fn accept_invite_on_running_idle_daemon_activates_runtime_without_restart() {
     );
     let invite_link = String::from_utf8_lossy(&invite_out.stdout)
         .lines()
-        .find(|line| line.starts_with("quiet://"))
+        .find(|line| line.starts_with("topo://"))
         .expect("create-invite output missing invite link")
         .to_string();
 
@@ -1040,7 +1040,7 @@ fn rpc_invite_ref_resolution() {
     assert!(out.status.success(), "create-invite failed: {:?}", out);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("#1") || stdout.contains("quiet://"),
+        stdout.contains("#1") || stdout.contains("topo://"),
         "should show invite ref or link, got: {}",
         stdout
     );

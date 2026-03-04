@@ -74,9 +74,9 @@ Add missing frontend affordances:
 
 Invite/link I/O contract (required):
 
-1. `create-invite` and `link` must always emit the full real `quiet://...` link.
+1. `create-invite` and `link` must always emit the full real `topo://...` link.
 2. Alias/number references are optional frontend convenience only and must not replace real-link output.
-3. `accept-link` must accept either a real `quiet://...` link or a daemon invite-ref selector. `accept-invite` is pre-daemon bootstrap and accepts raw links only (daemon state is not available).
+3. `accept-link` must accept either a real `topo://...` link or a daemon invite-ref selector. `accept-invite` is pre-daemon bootstrap and accepts raw links only (daemon state is not available).
 4. Alias resolution for invite selectors always resolves to a stored full link, then parses bootstrap/workspace data from that link.
 5. Invite creation inputs:
    - `--public-addr <host:port>` (published bootstrap endpoint in the link),

@@ -178,8 +178,8 @@ fn topo_create_invite(db: &str, bootstrap_addr: &str) -> String {
     let stdout = String::from_utf8_lossy(&out.stdout);
     stdout
         .lines()
-        .find(|line| line.starts_with("quiet://"))
-        .expect("create-invite output missing quiet:// link")
+        .find(|line| line.starts_with("topo://"))
+        .expect("create-invite output missing topo:// link")
         .to_string()
 }
 

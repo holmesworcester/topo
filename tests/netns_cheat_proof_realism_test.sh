@@ -283,14 +283,14 @@ log "Starting inviter daemon A..."
 PID_A="$(start_daemon "$NS_A" "$DB_A" "$SOCK_A" "$TMPDIR/a.log")"
 
 log "Creating invite links via daemon RPC..."
-INV_B="$(run_topo "$DB_A" "$SOCK_A" create-invite --public-addr "10.11.1.10:4433" | grep '^quiet://')"
-INV_C="$(run_topo "$DB_A" "$SOCK_A" create-invite --public-addr "10.11.1.10:4433" | grep '^quiet://')"
-INV_D="$(run_topo "$DB_A" "$SOCK_A" create-invite --public-addr "10.11.1.10:4433" | grep '^quiet://')"
-INV_E="$(run_topo "$DB_A" "$SOCK_A" create-invite --public-addr "10.11.1.10:4433" | grep '^quiet://')"
-INV_F="$(run_topo "$DB_A" "$SOCK_A" create-invite --public-addr "10.11.1.10:4433" | grep '^quiet://')"
+INV_B="$(run_topo "$DB_A" "$SOCK_A" create-invite --public-addr "10.11.1.10:4433" | grep '^topo://')"
+INV_C="$(run_topo "$DB_A" "$SOCK_A" create-invite --public-addr "10.11.1.10:4433" | grep '^topo://')"
+INV_D="$(run_topo "$DB_A" "$SOCK_A" create-invite --public-addr "10.11.1.10:4433" | grep '^topo://')"
+INV_E="$(run_topo "$DB_A" "$SOCK_A" create-invite --public-addr "10.11.1.10:4433" | grep '^topo://')"
+INV_F="$(run_topo "$DB_A" "$SOCK_A" create-invite --public-addr "10.11.1.10:4433" | grep '^topo://')"
 
-[[ "$INV_B" == quiet://invite/* ]] || fail "invalid invite link format for B"
-[[ "$INV_F" == quiet://invite/* ]] || fail "invalid invite link format for F"
+[[ "$INV_B" == topo://invite/* ]] || fail "invalid invite link format for B"
+[[ "$INV_F" == topo://invite/* ]] || fail "invalid invite link format for F"
 
 log "Accepting invites from segmented peers (internet bootstrap mode)..."
 ip netns exec "$NS_B" "$BIN" accept-invite --db "$DB_B" --invite "$INV_B" --username "b" --devicename "dev-b" >/dev/null

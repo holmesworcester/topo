@@ -245,8 +245,8 @@ fn create_invite(db: &str, bootstrap_addr: &str, public_spki: Option<&str>) -> S
     let stdout = String::from_utf8_lossy(&output.stdout);
     stdout
         .lines()
-        .find(|line| line.starts_with("quiet://"))
-        .expect("create-invite output missing quiet:// link")
+        .find(|line| line.starts_with("topo://"))
+        .expect("create-invite output missing topo:// link")
         .to_string()
 }
 
@@ -341,8 +341,8 @@ fn test_two_process_invite_and_sync() {
         Some(&daemon_transport_fingerprint(&alice_db)),
     );
     assert!(
-        invite_link.starts_with("quiet://invite/"),
-        "Expected quiet://invite/ link, got: {}",
+        invite_link.starts_with("topo://invite/"),
+        "Expected topo://invite/ link, got: {}",
         invite_link
     );
 
