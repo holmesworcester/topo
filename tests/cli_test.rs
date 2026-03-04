@@ -1,8 +1,9 @@
 use rusqlite::Connection;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+use topo::testutil::DaemonGuard;
 
 fn bin() -> String {
     env!("CARGO_BIN_EXE_topo").to_string()
@@ -53,7 +54,7 @@ fn create_workspace(db: &str) {
     wait_for_daemon_stopped(db, Duration::from_secs(10));
 }
 
-fn start_daemon_with_options(db: &str, disable_placeholder_autodial: bool) -> Child {
+fn start_daemon_with_options(db: &str, disable_placeholder_autodial: bool) -> DaemonGuard {
     let socket = socket_path_for_db(db);
     let mut cmd = Command::new(bin());
     cmd.arg("--db")
@@ -112,7 +113,7 @@ fn start_daemon_with_options(db: &str, disable_placeholder_autodial: bool) -> Ch
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    child
+    DaemonGuard::new(child)
 }
 
 fn wait_for_daemon_ready(db: &str, timeout: Duration) {
@@ -181,7 +182,7 @@ fn cli_test_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn start_daemon(db: &str) -> Child {
+fn start_daemon(db: &str) -> DaemonGuard {
     start_daemon_with_options(db, false)
 }
 
@@ -434,7 +435,7 @@ fn test_cli_bidirectional_sync() {
     create_workspace(&alice_db);
 
     // Alice starts daemon (auto-selects single peer)
-    let mut alice = start_daemon(&alice_db);
+    let _alice = start_daemon(&alice_db);
 
     // Alice sends messages via daemon RPC
     send_message(&alice_db, "Hello from Alice");
@@ -447,7 +448,7 @@ fn test_cli_bidirectional_sync() {
     accept_invite(&bob_db, &invite_link);
 
     // Bob starts daemon; invite-seeded autodial reaches Alice.
-    let mut bob = start_daemon(&bob_db);
+    let _bob = start_daemon(&bob_db);
     std::thread::sleep(Duration::from_secs(1));
 
     // Bob sends a message in the shared workspace
@@ -484,11 +485,6 @@ fn test_cli_bidirectional_sync() {
     assert!(bob_msgs.contains(&"How are you?".to_string()));
     assert!(bob_msgs.contains(&"Hey Alice!".to_string()));
 
-    // Cleanup
-    let _ = alice.kill();
-    let _ = bob.kill();
-    let _ = alice.wait();
-    let _ = bob.wait();
 }
 
 /// Functional sync test using invite-based flow.
@@ -503,7 +499,7 @@ fn test_cli_ongoing_sync() {
 
     // Alice creates workspace and starts daemon
     create_workspace(&alice_db);
-    let mut alice = start_daemon(&alice_db);
+    let _alice = start_daemon(&alice_db);
 
     // Alice sends bootstrap message
     let _bootstrap_eid = send_message(&alice_db, "bootstrap");
@@ -514,7 +510,7 @@ fn test_cli_ongoing_sync() {
 
     // Bob accepts invite and starts daemon
     accept_invite(&bob_db, &invite_link);
-    let mut bob = start_daemon(&bob_db);
+    let _bob = start_daemon(&bob_db);
     // Explicit bootstrap readiness gate: avoid racing ongoing-sync assertions
     // before the invite/bootstrap prerequisite sync has converged.
     assert_eventually(&bob_db, "message_count >= 1", timeout_ms);
@@ -538,10 +534,6 @@ fn test_cli_ongoing_sync() {
         timeout_ms,
     );
 
-    let _ = alice.kill();
-    let _ = bob.kill();
-    let _ = alice.wait();
-    let _ = bob.wait();
 }
 
 /// Two separate local daemons should discover and sync on the same machine
@@ -557,7 +549,7 @@ fn test_cli_local_mdns_discovery_without_placeholder_autodial() {
 
     // Alice creates workspace and starts daemon
     create_workspace(&alice_db);
-    let mut alice = start_daemon_with_options(&alice_db, true);
+    let _alice = start_daemon_with_options(&alice_db, true);
 
     // Alice creates invite while daemon is running.
     let invite_link = create_invite(&alice_db, &daemon_listen_addr(&alice_db));
@@ -565,7 +557,7 @@ fn test_cli_local_mdns_discovery_without_placeholder_autodial() {
     // Bob accepts invite and starts daemon with placeholder autodial disabled.
     // With placeholder autodial disabled, Bob discovers Alice via mDNS only.
     accept_invite(&bob_db, &invite_link);
-    let mut bob = start_daemon_with_options(&bob_db, true);
+    let _bob = start_daemon_with_options(&bob_db, true);
 
     // Validate bidirectional convergence using messages created after both
     // daemons are running (avoids counting accept-invite bootstrap artifacts).
@@ -583,10 +575,6 @@ fn test_cli_local_mdns_discovery_without_placeholder_autodial() {
         timeout_ms,
     );
 
-    let _ = alice.kill();
-    let _ = bob.kill();
-    let _ = alice.wait();
-    let _ = bob.wait();
 }
 
 #[test]
@@ -597,7 +585,7 @@ fn test_cli_send_and_messages() {
     let db = tmpdir.path().join("test.db").to_str().unwrap().to_string();
 
     create_workspace(&db);
-    let mut daemon = start_daemon(&db);
+    let _daemon = start_daemon(&db);
 
     let _first_eid = send_message(&db, "First message");
     let second_eid = send_message(&db, "Second message");
@@ -609,9 +597,6 @@ fn test_cli_send_and_messages() {
     assert_eq!(messages.len(), 2);
     assert!(messages.contains(&"First message".to_string()));
     assert!(messages.contains(&"Second message".to_string()));
-
-    let _ = daemon.kill();
-    let _ = daemon.wait();
 }
 
 /// TRUST POLICY TEST: untrusted peer is rejected.
@@ -626,14 +611,14 @@ fn test_cli_unpinned_peer_rejected() {
 
     // Alice creates workspace and starts daemon
     create_workspace(&alice_db);
-    let mut alice = start_daemon(&alice_db);
+    let _alice = start_daemon(&alice_db);
 
     // Alice sends a message
     send_message(&alice_db, "alice bootstrap");
 
     // Bob creates independent workspace (not in Alice's workspace)
     create_workspace(&bob_db);
-    let mut bob = start_daemon(&bob_db);
+    let _bob = start_daemon(&bob_db);
 
     // Bob sends a message
     let bob_eid = send_message(&bob_db, "Should not arrive");
@@ -641,11 +626,6 @@ fn test_cli_unpinned_peer_rejected() {
     std::thread::sleep(Duration::from_secs(3));
 
     assert_now(&alice_db, &format!("has_event:{} == 0", bob_eid));
-
-    let _ = alice.kill();
-    let _ = bob.kill();
-    let _ = alice.wait();
-    let _ = bob.wait();
 }
 
 /// Daemon start on an empty DB should keep control plane up in IdleNoTenants state.
@@ -661,16 +641,18 @@ fn test_cli_start_without_trust_starts_idle_runtime() {
         .to_string();
     let socket = socket_path_for_db(&db);
 
-    let mut daemon = Command::new(bin())
-        .arg("start")
-        .arg("--bind")
-        .arg(format!("127.0.0.1:{}", random_port()))
-        .arg("--db")
-        .arg(&db)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("failed to run start");
+    let _daemon = DaemonGuard::new(
+        Command::new(bin())
+            .arg("start")
+            .arg("--bind")
+            .arg(format!("127.0.0.1:{}", random_port()))
+            .arg("--db")
+            .arg(&db)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to run start"),
+    );
 
     let start = Instant::now();
     while !socket.exists() && start.elapsed().as_secs() < 5 {
@@ -699,8 +681,6 @@ fn test_cli_start_without_trust_starts_idle_runtime() {
         .output()
         .expect("stop command");
     assert!(stop.status.success(), "stop should succeed");
-
-    let _ = daemon.wait();
 }
 
 /// Bootstrap trust test using production create-invite / accept-invite CLI flow.
@@ -730,7 +710,7 @@ fn test_cli_sync_bootstrap_from_accepted_invite_data() {
 
     // Alice creates workspace and starts daemon
     create_workspace(&alice_db);
-    let mut alice = start_daemon(&alice_db);
+    let _alice = start_daemon(&alice_db);
 
     // Alice sends bootstrap message
     send_message(&alice_db, "bootstrap");
@@ -751,7 +731,7 @@ fn test_cli_sync_bootstrap_from_accepted_invite_data() {
     // Bob starts daemon; invite bootstrap trust seeds daemon autodial.
     // Autodial connects to Alice, syncs prerequisite events, identity chain
     // cascades to completion, and messages project.
-    let mut bob = start_daemon(&bob_db);
+    let _bob = start_daemon(&bob_db);
 
     // Wait for Bob's identity chain to complete (message_count >= 1 means
     // Alice's "bootstrap" message has been fully projected on Bob's side,
@@ -774,11 +754,6 @@ fn test_cli_sync_bootstrap_from_accepted_invite_data() {
         &format!("has_event:{} >= 1", bob_eid),
         timeout_ms,
     );
-
-    let _ = alice.kill();
-    let _ = bob.kill();
-    let _ = alice.wait();
-    let _ = bob.wait();
 }
 
 // ---------------------------------------------------------------------------
@@ -817,7 +792,7 @@ fn test_cli_ban_user() {
     let db = tmpdir.path().join("ban.db").to_str().unwrap().to_string();
 
     create_workspace(&db);
-    let mut daemon = start_daemon(&db);
+    let _daemon = start_daemon(&db);
 
     // There should be 1 user (the workspace creator)
     let out = Command::new(bin())
@@ -841,9 +816,6 @@ fn test_cli_ban_user() {
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("Banned"), "should confirm ban");
-
-    let _ = daemon.kill();
-    let _ = daemon.wait();
 }
 
 #[test]
@@ -857,7 +829,7 @@ fn test_cli_workspaces_alias() {
         .to_string();
 
     create_workspace(&db);
-    let mut daemon = start_daemon(&db);
+    let _daemon = start_daemon(&db);
 
     // Test both "networks" and "workspaces" alias
     let out = Command::new(bin())
@@ -881,9 +853,6 @@ fn test_cli_workspaces_alias() {
         stdout.contains("WORKSPACES"),
         "workspaces alias should work"
     );
-
-    let _ = daemon.kill();
-    let _ = daemon.wait();
 }
 
 #[test]
@@ -976,7 +945,7 @@ fn test_cli_react_by_message_number() {
         .to_string();
 
     create_workspace(&db);
-    let mut daemon = start_daemon(&db);
+    let _daemon = start_daemon(&db);
 
     // Send two messages.
     send_message(&db, "first msg");
@@ -1043,6 +1012,4 @@ fn test_cli_react_by_message_number() {
         stderr
     );
 
-    let _ = daemon.kill();
-    let _ = daemon.wait();
 }

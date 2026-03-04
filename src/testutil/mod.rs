@@ -1,8 +1,38 @@
 pub mod bootstrap;
 
 use std::net::SocketAddr;
+use std::process::Child;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// RAII guard that kills a daemon process on drop, preventing leaked processes
+/// when tests panic before reaching manual cleanup.
+pub struct DaemonGuard {
+    child: Option<Child>,
+}
+
+impl DaemonGuard {
+    /// Wrap an already-spawned daemon `Child` process.
+    pub fn new(child: Child) -> Self {
+        Self {
+            child: Some(child),
+        }
+    }
+
+    /// Access the underlying `Child` (e.g. for `try_wait` or `id`).
+    pub fn child(&mut self) -> &mut Child {
+        self.child.as_mut().expect("DaemonGuard already consumed")
+    }
+}
+
+impl Drop for DaemonGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
 
 use crate::crypto::{event_id_to_base64, EventId};
 use crate::db::{open_connection, schema::create_tables, store::insert_recorded_event};

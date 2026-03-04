@@ -4,8 +4,9 @@
 //! using real separate processes, just like a user would run from the command line.
 
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::Duration;
+use topo::testutil::DaemonGuard;
 
 fn bin() -> String {
     env!("CARGO_BIN_EXE_topo").to_string()
@@ -102,7 +103,7 @@ fn daemon_transport_fingerprint(db: &str) -> String {
         .expect("transport-identity response missing fingerprint")
 }
 
-fn start_daemon(db: &str) -> Child {
+fn start_daemon(db: &str) -> DaemonGuard {
     let socket = socket_path_for_db(db);
     let mut cmd = Command::new(bin());
     cmd.arg("--db")
@@ -136,7 +137,7 @@ fn start_daemon(db: &str) -> Child {
     );
     wait_for_daemon_ready(db, Duration::from_secs(15));
 
-    child
+    DaemonGuard::new(child)
 }
 
 fn first_peer_index(peers_stdout: &str) -> Option<usize> {
@@ -332,7 +333,7 @@ fn test_two_process_invite_and_sync() {
 
     // Step 1: Alice creates workspace and starts daemon.
     create_workspace(&alice_db);
-    let mut alice_daemon = start_daemon(&alice_db);
+    let _alice_daemon = start_daemon(&alice_db);
 
     // Step 2: Alice creates an invite pointing to her sync address (via daemon RPC).
     let invite_link = create_invite(
@@ -352,7 +353,7 @@ fn test_two_process_invite_and_sync() {
 
     // Bob's daemon handles bootstrap sync via autodial: the runtime discovers
     // bootstrap trust from projected SQL state and dials Alice's sync address.
-    let mut bob_daemon = start_daemon(&bob_db);
+    let _bob_daemon = start_daemon(&bob_db);
 
     // Step 4: Exchange messages and verify convergence.
     let alice_eid = send_message(&alice_db, "Hello from alice");
@@ -400,9 +401,4 @@ fn test_two_process_invite_and_sync() {
         bob_msgs
     );
 
-    // Cleanup
-    let _ = alice_daemon.kill();
-    let _ = bob_daemon.kill();
-    let _ = alice_daemon.wait();
-    let _ = bob_daemon.wait();
 }

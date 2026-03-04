@@ -217,35 +217,22 @@ fn topo_assert_eventually(db: &str, predicate: &str, timeout_ms: u64) -> Output 
     )
 }
 
-struct Daemon {
-    child: Option<Child>,
-}
+use topo::testutil::DaemonGuard;
 
-impl Daemon {
-    fn start(db: &str, bind_port: u16) -> Self {
-        let socket = socket_path_for_db(db);
-        let mut cmd = Command::new(bin());
-        cmd.arg("--db")
-            .arg(db)
-            .arg("start")
-            .arg("--bind")
-            .arg(format!("127.0.0.1:{}", bind_port))
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+fn start_daemon(db: &str, bind_port: u16) -> DaemonGuard {
+    let socket = socket_path_for_db(db);
+    let mut cmd = Command::new(bin());
+    cmd.arg("--db")
+        .arg(db)
+        .arg("start")
+        .arg("--bind")
+        .arg(format!("127.0.0.1:{}", bind_port))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
 
-        let mut child = cmd.spawn().expect("failed to start topo daemon");
-        wait_for_daemon_ready(db, &socket, &mut child, Duration::from_secs(5));
-        Self { child: Some(child) }
-    }
-}
-
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
+    let mut child = cmd.spawn().expect("failed to start topo daemon");
+    wait_for_daemon_ready(db, &socket, &mut child, Duration::from_secs(5));
+    DaemonGuard::new(child)
 }
 
 fn bootstrap_alice_and_invite(tmpdir: &tempfile::TempDir) -> (String, String, String, u16, u16) {
@@ -262,7 +249,7 @@ fn bootstrap_alice_and_invite(tmpdir: &tempfile::TempDir) -> (String, String, St
     // (Daemon is returned via the test — caller will hold it)
     // We need the daemon running to create invites, so we start it here
     // and return the invite link. Caller will start their own Daemon.
-    let _alice_daemon = Daemon::start(&alice_db, alice_port);
+    let _alice_daemon = start_daemon(&alice_db, alice_port);
 
     // Create invite via daemon RPC
     let invite_link = topo_create_invite(&alice_db, &format!("127.0.0.1:{}", alice_port));
@@ -278,9 +265,9 @@ fn test_invite_only_daemons_should_autodial_without_manual_connect() {
     let tmpdir = tempfile::tempdir().unwrap();
     let (alice_db, bob_db, invite_link, alice_port, bob_port) = bootstrap_alice_and_invite(&tmpdir);
 
-    let _alice = Daemon::start(&alice_db, alice_port);
+    let _alice = start_daemon(&alice_db, alice_port);
     accept_invite(&bob_db, &invite_link);
-    let _bob = Daemon::start(&bob_db, bob_port);
+    let _bob = start_daemon(&bob_db, bob_port);
 
     // Desired behavior: after invite acceptance, daemons should autodial based on
     // persisted bootstrap/discovery state, with no manual connect flag.
@@ -309,7 +296,7 @@ fn test_daemon_cli_invite_lifecycle_works_without_restart() {
 
     // Create workspace for Alice and start her daemon.
     create_workspace(&alice_db);
-    let _alice = Daemon::start(&alice_db, alice_port);
+    let _alice = start_daemon(&alice_db, alice_port);
 
     // Create invite while Alice's daemon is running (via RPC).
     let invite_link = topo_create_invite(&alice_db, &format!("127.0.0.1:{}", alice_port));
@@ -318,7 +305,7 @@ fn test_daemon_cli_invite_lifecycle_works_without_restart() {
     topo_accept_invite(&bob_db, &invite_link);
 
     // Bob starts daemon after accept-invite — auto-selects the shared workspace peer.
-    let _bob = Daemon::start(&bob_db, bob_port);
+    let _bob = start_daemon(&bob_db, bob_port);
 
     // Bob sends a message in the shared workspace via daemon RPC.
     let bob_event_id = topo_send(&bob_db, "runtime-accept-invite-no-restart");

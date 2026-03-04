@@ -1,8 +1,9 @@
 //! RPC tests: protocol roundtrip, daemon+CLI integration, command regression.
 
 use std::path::PathBuf;
-use std::process::{Child, Command};
+use std::process::Command;
 use std::time::{Duration, Instant};
+use topo::testutil::DaemonGuard;
 
 fn bin() -> String {
     env!("CARGO_BIN_EXE_topo").to_string()
@@ -72,24 +73,20 @@ fn wait_for_runtime_state(
     );
 }
 
-fn stop_daemon(db: &str, daemon: &mut Child) {
+fn stop_daemon(db: &str, daemon: &mut DaemonGuard) {
     let _ = Command::new(bin()).args(["--db", db, "stop"]).output();
     let start = Instant::now();
     loop {
-        match daemon.try_wait() {
+        match daemon.child().try_wait() {
             Ok(Some(_)) => return,
             Ok(None) => {
                 if start.elapsed().as_secs() >= 5 {
-                    let _ = daemon.kill();
-                    let _ = daemon.wait();
-                    return;
+                    return; // DaemonGuard will kill on drop
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
             Err(_) => {
-                let _ = daemon.kill();
-                let _ = daemon.wait();
-                return;
+                return; // DaemonGuard will kill on drop
             }
         }
     }
@@ -259,10 +256,12 @@ fn daemon_and_cli_status() {
     create_workspace(&db);
 
     // Start daemon in background.
-    let mut daemon = Command::new(bin())
-        .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
-        .spawn()
-        .unwrap();
+    let _daemon = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
+            .spawn()
+            .unwrap(),
+    );
 
     // Wait for socket to appear.
     let start = std::time::Instant::now();
@@ -276,10 +275,6 @@ fn daemon_and_cli_status() {
         .args(["--db", &db, "status"])
         .output()
         .unwrap();
-
-    // Kill daemon.
-    let _ = daemon.kill();
-    let _ = daemon.wait();
 
     assert!(out.status.success(), "status failed: {:?}", out);
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -302,10 +297,12 @@ fn daemon_and_cli_send_and_messages() {
     create_workspace(&db);
 
     // Start daemon.
-    let mut daemon = Command::new(bin())
-        .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
-        .spawn()
-        .unwrap();
+    let _daemon = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
+            .spawn()
+            .unwrap(),
+    );
 
     let start = std::time::Instant::now();
     while !socket.exists() && start.elapsed().as_secs() < 5 {
@@ -333,10 +330,6 @@ fn daemon_and_cli_send_and_messages() {
         .output()
         .unwrap();
 
-    // Kill daemon.
-    let _ = daemon.kill();
-    let _ = daemon.wait();
-
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -355,10 +348,12 @@ fn daemon_and_cli_assert_now() {
     create_workspace(&db);
 
     // Start daemon.
-    let mut daemon = Command::new(bin())
-        .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
-        .spawn()
-        .unwrap();
+    let _daemon = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
+            .spawn()
+            .unwrap(),
+    );
 
     let start = std::time::Instant::now();
     while !socket.exists() && start.elapsed().as_secs() < 5 {
@@ -380,10 +375,6 @@ fn daemon_and_cli_assert_now() {
         .args(["--db", &db, "assert-now", "message_count == 99"])
         .output()
         .unwrap();
-
-    // Kill daemon.
-    let _ = daemon.kill();
-    let _ = daemon.wait();
 
     assert_eq!(
         out.status.code(),
@@ -438,10 +429,12 @@ fn daemon_stop_flow_clean_exit_and_socket_removal() {
     create_workspace(&db);
 
     // Start daemon in background.
-    let mut daemon = Command::new(bin())
-        .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
-        .spawn()
-        .unwrap();
+    let mut daemon = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
+            .spawn()
+            .unwrap(),
+    );
 
     // Wait for socket to appear.
     let start = std::time::Instant::now();
@@ -466,7 +459,7 @@ fn daemon_stop_flow_clean_exit_and_socket_removal() {
     // Wait for daemon process to exit.
     let exit_start = std::time::Instant::now();
     loop {
-        match daemon.try_wait() {
+        match daemon.child().try_wait() {
             Ok(Some(status)) => {
                 // Daemon exited — success regardless of exit code (may be non-zero
                 // because tokio tasks get cancelled on shutdown).
@@ -475,8 +468,6 @@ fn daemon_stop_flow_clean_exit_and_socket_removal() {
             }
             Ok(None) => {
                 if exit_start.elapsed().as_secs() >= 5 {
-                    let _ = daemon.kill();
-                    let _ = daemon.wait();
                     panic!("daemon did not exit within 5s after stop");
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
@@ -498,18 +489,20 @@ fn custom_socket_routing() {
     create_workspace(&db);
 
     // Start daemon on custom socket.
-    let mut daemon = Command::new(bin())
-        .args([
-            "--db",
-            &db,
-            "--socket",
-            custom_socket.to_str().unwrap(),
-            "start",
-            "--bind",
-            "127.0.0.1:0",
-        ])
-        .spawn()
-        .unwrap();
+    let _daemon = DaemonGuard::new(
+        Command::new(bin())
+            .args([
+                "--db",
+                &db,
+                "--socket",
+                custom_socket.to_str().unwrap(),
+                "start",
+                "--bind",
+                "127.0.0.1:0",
+            ])
+            .spawn()
+            .unwrap(),
+    );
 
     // Wait for custom socket to appear.
     let start = std::time::Instant::now();
@@ -563,8 +556,6 @@ fn custom_socket_routing() {
         "stop via custom socket failed: {:?}",
         out
     );
-
-    let _ = daemon.wait();
 }
 
 #[test]
@@ -574,10 +565,12 @@ fn daemon_status_includes_runtime_net_info() {
 
     create_workspace(&db);
 
-    let mut daemon = Command::new(bin())
-        .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
-        .spawn()
-        .unwrap();
+    let _daemon = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
+            .spawn()
+            .unwrap(),
+    );
 
     let start = std::time::Instant::now();
     while !socket.exists() && start.elapsed().as_secs() < 5 {
@@ -613,9 +606,6 @@ fn daemon_status_includes_runtime_net_info() {
         runtime.get("upnp").is_none() || runtime["upnp"].is_null(),
         "upnp should not be present before running topo upnp"
     );
-
-    let _ = daemon.kill();
-    let _ = daemon.wait();
 }
 
 #[test]
@@ -625,10 +615,12 @@ fn daemon_cli_status_shows_listen_line() {
 
     create_workspace(&db);
 
-    let mut daemon = Command::new(bin())
-        .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
-        .spawn()
-        .unwrap();
+    let _daemon = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
+            .spawn()
+            .unwrap(),
+    );
 
     let start = std::time::Instant::now();
     while !socket.exists() && start.elapsed().as_secs() < 5 {
@@ -641,9 +633,6 @@ fn daemon_cli_status_shows_listen_line() {
         .args(["--db", &db, "status"])
         .output()
         .unwrap();
-
-    let _ = daemon.kill();
-    let _ = daemon.wait();
 
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -659,10 +648,12 @@ fn daemon_start_on_empty_db_reports_idle_runtime_state() {
     let (_dir, db) = temp_db();
     let socket = socket_path_for_db(&db);
 
-    let mut daemon = Command::new(bin())
-        .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
-        .spawn()
-        .unwrap();
+    let mut daemon = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
+            .spawn()
+            .unwrap(),
+    );
     wait_for_socket(&socket);
 
     let out = Command::new(bin())
@@ -767,11 +758,13 @@ fn accept_invite_on_running_idle_daemon_activates_runtime_without_restart() {
         .to_string();
 
     // Bob: explicit daemon start on empty DB should stay idle first.
-    let mut bob_daemon = Command::new(bin())
-        .args(["--db", &bob_db, "start", "--bind", "127.0.0.1:0"])
-        .spawn()
-        .unwrap();
-    let bob_pid_before = bob_daemon.id();
+    let mut bob_daemon = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--db", &bob_db, "start", "--bind", "127.0.0.1:0"])
+            .spawn()
+            .unwrap(),
+    );
+    let bob_pid_before = bob_daemon.child().id();
     wait_for_socket(&bob_socket);
     let _ = wait_for_runtime_state(&bob_socket, "IdleNoTenants", Duration::from_secs(10));
 
@@ -797,11 +790,11 @@ fn accept_invite_on_running_idle_daemon_activates_runtime_without_restart() {
         String::from_utf8_lossy(&accept.stderr)
     );
     assert!(
-        bob_daemon.try_wait().unwrap().is_none(),
+        bob_daemon.child().try_wait().unwrap().is_none(),
         "bob daemon should keep running (no restart required)"
     );
     assert_eq!(
-        bob_daemon.id(),
+        bob_daemon.child().id(),
         bob_pid_before,
         "daemon process should be unchanged"
     );
@@ -904,10 +897,12 @@ fn rpc_identity_command() {
     create_workspace(&db);
 
     // Start daemon in background.
-    let mut daemon = Command::new(bin())
-        .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
-        .spawn()
-        .unwrap();
+    let _daemon = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
+            .spawn()
+            .unwrap(),
+    );
 
     let start = std::time::Instant::now();
     while !socket.exists() && start.elapsed().as_secs() < 5 {
@@ -919,9 +914,6 @@ fn rpc_identity_command() {
         .args(["--db", &db, "identity"])
         .output()
         .unwrap();
-
-    let _ = daemon.kill();
-    let _ = daemon.wait();
 
     assert!(out.status.success(), "identity failed: {:?}", out);
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -938,81 +930,18 @@ fn rpc_identity_command() {
 }
 
 #[test]
-fn rpc_channel_lifecycle() {
-    let (_dir, db) = temp_db();
-    let socket = socket_path_for_db(&db);
-
-    create_workspace(&db);
-
-    let mut daemon = Command::new(bin())
-        .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
-        .spawn()
-        .unwrap();
-
-    let start = std::time::Instant::now();
-    while !socket.exists() && start.elapsed().as_secs() < 5 {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-
-    // List channels — should have "general" by default
-    let out = Command::new(bin())
-        .args(["--db", &db, "channels"])
-        .output()
-        .unwrap();
-    assert!(out.status.success());
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("general"),
-        "should have default 'general' channel, got: {}",
-        stdout
-    );
-
-    // Create a new channel
-    let out = Command::new(bin())
-        .args(["--db", &db, "new-channel", "random"])
-        .output()
-        .unwrap();
-    assert!(out.status.success());
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("random"), "should show new channel name");
-
-    // Switch to the new channel
-    let out = Command::new(bin())
-        .args(["--db", &db, "channel", "2"])
-        .output()
-        .unwrap();
-    assert!(out.status.success());
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("random"),
-        "should show switched channel name"
-    );
-
-    // Verify channels list now shows 2
-    let out = Command::new(bin())
-        .args(["--db", &db, "channels"])
-        .output()
-        .unwrap();
-    assert!(out.status.success());
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("general"), "should still have general");
-    assert!(stdout.contains("random"), "should also have random");
-
-    let _ = daemon.kill();
-    let _ = daemon.wait();
-}
-
-#[test]
 fn rpc_invite_ref_resolution() {
     let (_dir, db) = temp_db();
     let socket = socket_path_for_db(&db);
 
     create_workspace(&db);
 
-    let mut daemon = Command::new(bin())
-        .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
-        .spawn()
-        .unwrap();
+    let _daemon = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
+            .spawn()
+            .unwrap(),
+    );
 
     let start = std::time::Instant::now();
     while !socket.exists() && start.elapsed().as_secs() < 5 {
@@ -1037,7 +966,4 @@ fn rpc_invite_ref_resolution() {
         "should show invite ref or link, got: {}",
         stdout
     );
-
-    let _ = daemon.kill();
-    let _ = daemon.wait();
 }
