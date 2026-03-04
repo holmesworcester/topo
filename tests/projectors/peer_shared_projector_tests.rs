@@ -1,4 +1,4 @@
-//! Pure projector conformance tests for PeerShared (types 16-17).
+//! Pure projector conformance tests for PeerShared (type 16).
 //!
 //! TLA+ guards tested:
 //!   SPEC_PEER_SHARED_TRUST_01 — InvPeerSharedTrustSource (valid insert)
@@ -11,15 +11,15 @@ mod tests {
     use crate::harness::fixtures::*;
     use topo::crypto::spki_fingerprint_from_ed25519_pubkey;
     use topo::event_modules::peer_shared::project_pure;
-    use topo::event_modules::peer_shared::{PeerSharedFirstEvent, PeerSharedOngoingEvent};
+    use topo::event_modules::peer_shared::PeerSharedEvent;
     use topo::event_modules::ParsedEvent;
     use topo::projection::contract::{SqlVal, WriteOp};
 
     const PEER: &str = "peer_alice";
     const EVENT_ID: &str = "ps_event_1";
 
-    fn make_peer_shared_first(public_key: [u8; 32], user_event_id: [u8; 32]) -> ParsedEvent {
-        ParsedEvent::PeerSharedFirst(PeerSharedFirstEvent {
+    fn make_peer_shared(public_key: [u8; 32], user_event_id: [u8; 32]) -> ParsedEvent {
+        ParsedEvent::PeerShared(PeerSharedEvent {
             created_at_ms: 10000,
             public_key,
             user_event_id,
@@ -30,23 +30,11 @@ mod tests {
         })
     }
 
-    fn make_peer_shared_ongoing(public_key: [u8; 32], user_event_id: [u8; 32]) -> ParsedEvent {
-        ParsedEvent::PeerSharedOngoing(PeerSharedOngoingEvent {
-            created_at_ms: 10001,
-            public_key,
-            user_event_id,
-            device_name: "device-2".to_string(),
-            signed_by: [3u8; 32],
-            signer_type: 3,
-            signature: [0u8; 64],
-        })
-    }
-
     // ── SPEC_PEER_SHARED_TRUST_01: pass ──
 
     #[test]
     fn test_peer_shared_writes_row() {
-        let parsed = make_peer_shared_first([5u8; 32], [6u8; 32]);
+        let parsed = make_peer_shared([5u8; 32], [6u8; 32]);
         let ctx = empty_ctx();
 
         let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
@@ -60,7 +48,7 @@ mod tests {
     fn test_peer_shared_writes_correct_fields() {
         let pk = [5u8; 32];
         let user_eid = [6u8; 32];
-        let parsed = make_peer_shared_first(pk, user_eid);
+        let parsed = make_peer_shared(pk, user_eid);
         let ctx = empty_ctx();
 
         let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
@@ -104,22 +92,7 @@ mod tests {
     #[test]
     fn test_peer_shared_consumes_bootstrap_trust() {
         let pk = [5u8; 32];
-        let parsed = make_peer_shared_first(pk, [6u8; 32]);
-        let ctx = empty_ctx();
-
-        let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
-        assert_valid(&result);
-        assert_deletes_from_table(&result, "pending_invite_bootstrap_trust");
-        assert_deletes_from_table(&result, "invite_bootstrap_trust");
-        assert_no_commands(&result);
-    }
-
-    // ── Both variants perform the same bootstrap-trust deletes ──
-
-    #[test]
-    fn test_peer_shared_ongoing_also_consumes_bootstrap_trust() {
-        let pk = [5u8; 32];
-        let parsed = make_peer_shared_ongoing(pk, [6u8; 32]);
+        let parsed = make_peer_shared(pk, [6u8; 32]);
         let ctx = empty_ctx();
 
         let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);

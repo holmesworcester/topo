@@ -385,7 +385,7 @@ Rules:
 2. peer allow/deny policy is based on SQL trust state:
    - PeerShared-derived transport fingerprints from projected `peers_shared.transport_fingerprint` rows (deterministically computed from PeerShared public key at projection time),
    - `invite_bootstrap_trust` rows produced by projection from `InviteAccepted` events + local `bootstrap_context`,
-   - `pending_invite_bootstrap_trust` rows produced by projection from invite events (UserInviteBoot, DeviceInviteFirst) + local `bootstrap_context`,
+   - `pending_invite_bootstrap_trust` rows produced by projection from invite events (UserInvite, DeviceInvite) + local `bootstrap_context`,
    - trust rows are projection-owned state; the service layer writes `bootstrap_context` rows only, not trust rows directly,
 3. no permissive verifier in production mode.
 
@@ -450,7 +450,7 @@ As a placeholder, workspace, user, and device events carry a 64-byte cleartext n
 
 ### 2.3.2 Author dependency
 
-Content events (Message, Reaction, MessageDeletion) declare `author_id` as a dependency field pointing to User events (type 14/15). The dependency system blocks projection until the referenced User event exists, and the projector verifies that the signer's peer_shared `user_event_id` matches the claimed `author_id`. This enables direct `messages.author_id = users.event_id` JOINs for display name resolution.
+Content events (Message, Reaction, MessageDeletion) declare `author_id` as a dependency field pointing to User events (type 14). The dependency system blocks projection until the referenced User event exists, and the projector verifies that the signer's peer_shared `user_event_id` matches the claimed `author_id`. This enables direct `messages.author_id = users.event_id` JOINs for display name resolution.
 
 ## 2.4 NAT traversal and hole punch
 
@@ -547,19 +547,19 @@ Netns runbook notes:
 High-level identity operations are owned by event-module commands (`event_modules/workspace/commands.rs`). They compose low-level event creation primitives (from `event_modules/workspace/identity_ops.rs`) into correct sequences.
 
 **Bootstrap** (`workspace::commands::create_workspace`): creates the identity chain for a new workspace owner:
-Workspace → InviteAccepted (trust anchor) → UserInviteBoot → UserBoot → DeviceInviteFirst → PeerSharedFirst + LocalSignerSecret events (peer_shared, user, workspace) + content key seed.
+Workspace → InviteAccepted (trust anchor) → UserInvite → User → DeviceInvite → PeerShared + LocalSignerSecret events (peer_shared, user, workspace) + content key seed.
 The peer_shared LocalSignerSecret triggers `ApplyTransportIdentityIntent` on projection, installing a PeerShared-derived transport identity.
 Scope rule: `create_workspace` is tenant-scoped. If local transport credentials already exist, `recorded_by` must match a known local tenant peer ID in `local_transport_creds`; unscoped aliases (for example `"bootstrap"`) are rejected. Fresh DB bootstrap (no local creds) is still allowed.
 
-**Invite** (`workspace::commands::create_user_invite`): admin creates a UserInviteBoot event and returns portable invite data (event ID + signing key + workspace ID). Wraps content key for invitee if sender keys are available.
+**Invite** (`workspace::commands::create_user_invite`): admin creates a UserInvite event and returns portable invite data (event ID + signing key + workspace ID). Wraps content key for invitee if sender keys are available.
 
 **Accept** (`workspace::commands::join_workspace_as_new_user`): joiner consumes invite data and creates:
-InviteAccepted (trust anchor) → UserBoot → DeviceInviteFirst → PeerSharedFirst.
-Prerequisite: the joiner's DB must already contain the Workspace and UserInviteBoot events (copied from the inviter before or during sync).
+InviteAccepted (trust anchor) → User → DeviceInvite → PeerShared.
+Prerequisite: the joiner's DB must already contain the Workspace and UserInvite events (copied from the inviter before or during sync).
 The acceptance path also unwraps bootstrap content-key material received via `secret_shared` events (wrapped to the invite public key at creation time) and materializes local `secret_key` events so that encrypted content received during bootstrap sync can be decrypted.
 Signer secrets (LocalSignerSecret events) are NOT emitted here; `persist_join_signer_secrets` is called separately after push-back sync completes.
 
-**Device link** (`workspace::commands::create_device_link_invite` / `add_device_to_workspace`): similar to user invite but creates a shorter chain (PeerSharedFirst only, skipping user/device_invite creation).
+**Device link** (`workspace::commands::create_device_link_invite` / `add_device_to_workspace`): similar to user invite but creates a shorter chain (PeerShared only, skipping user/device_invite creation).
 
 **Retry** (`workspace::commands::retry_pending_invite_content_key_unwraps`): retries content-key unwrap for invites where SecretShared prerequisites arrived late. Triggered via `event_modules::post_drain_hooks` from `state/pipeline/effects.rs` after each projection drain.
 
@@ -1458,7 +1458,7 @@ Self-invite bootstrap stays explicit:
 Guard placement rules:
 1. trust-anchor guard applies to root workspace events only; foreign root ids must not become valid,
 2. `invite_accepted` is a local trust-anchor binding event (no invite-presence dependency gate). In peer scope, it binds anchor from carried `workspace_id` with first-write-wins; a conflicting `workspace_id` for an already anchored peer is rejected,
-3. new user/device/peer identities are still gated by normal signer/dependency validation in the same peer scope (for example `user_boot -> user_invite`, `peer_shared -> device_invite`),
+3. new user/device/peer identities are still gated by normal signer/dependency validation in the same peer scope (for example `user -> user_invite`, `peer_shared -> device_invite`),
 4. bootstrap transport trust is persisted in SQL and queried at connection creation time; projected peer keys are not treated as in-memory-only authority.
 
 This approach makes first-user creation and device linking isomorphic to subsequent-user additions and device linking. Auth graph logic is easy to get wrong, so this simplification is valuable. 

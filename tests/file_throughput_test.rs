@@ -13,9 +13,9 @@ use tempfile::NamedTempFile;
 use topo::crypto::{event_id_to_base64, hash_event, EventId};
 use topo::db::{open_connection, schema::create_tables};
 use topo::event_modules::{
-    self as events, file_slice::FILE_SLICE_CIPHERTEXT_BYTES, DeviceInviteFirstEvent,
+    self as events, file_slice::FILE_SLICE_CIPHERTEXT_BYTES, DeviceInviteEvent,
     FileSliceEvent, InviteAcceptedEvent, MessageAttachmentEvent, MessageEvent, ParsedEvent,
-    PeerSharedFirstEvent, SecretKeyEvent, UserBootEvent, UserInviteBootEvent, WorkspaceEvent,
+    PeerSharedEvent, SecretKeyEvent, UserEvent, UserInviteEvent, WorkspaceEvent,
 };
 use topo::projection::apply::project_one;
 use topo::projection::signer::sign_event_bytes;
@@ -73,8 +73,8 @@ fn sign_blob(key: &SigningKey, blob: &mut Vec<u8>) {
     blob[len - 64..].copy_from_slice(&sig);
 }
 
-/// Bootstrap a full identity chain: Workspace → InviteAccepted → UserInviteBoot →
-/// UserBoot → DeviceInviteFirst → PeerSharedFirst. Returns (peer_shared_eid, signing_key).
+/// Bootstrap a full identity chain: Workspace → InviteAccepted → UserInvite →
+/// User → DeviceInvite → PeerShared. Returns (peer_shared_eid, signing_key).
 fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (EventId, SigningKey, EventId) {
     let mut rng = rand::thread_rng();
 
@@ -99,7 +99,7 @@ fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (EventId, Signin
     project_one(conn, recorded_by, &net_eid).unwrap();
 
     let invite_key = SigningKey::generate(&mut rng);
-    let uib = ParsedEvent::UserInviteBoot(UserInviteBootEvent {
+    let uib = ParsedEvent::UserInvite(UserInviteEvent {
         created_at_ms: now_ms(),
         public_key: invite_key.verifying_key().to_bytes(),
         workspace_id,
@@ -113,7 +113,7 @@ fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (EventId, Signin
     project_one(conn, recorded_by, &uib_eid).unwrap();
 
     let user_key = SigningKey::generate(&mut rng);
-    let ub = ParsedEvent::UserBoot(UserBootEvent {
+    let ub = ParsedEvent::User(UserEvent {
         created_at_ms: now_ms(),
         public_key: user_key.verifying_key().to_bytes(),
         username: "bench-user".to_string(),
@@ -127,7 +127,7 @@ fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (EventId, Signin
     project_one(conn, recorded_by, &ub_eid).unwrap();
 
     let device_invite_key = SigningKey::generate(&mut rng);
-    let dif = ParsedEvent::DeviceInviteFirst(DeviceInviteFirstEvent {
+    let dif = ParsedEvent::DeviceInvite(DeviceInviteEvent {
         created_at_ms: now_ms(),
         public_key: device_invite_key.verifying_key().to_bytes(),
         signed_by: ub_eid,
@@ -140,7 +140,7 @@ fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (EventId, Signin
     project_one(conn, recorded_by, &dif_eid).unwrap();
 
     let peer_shared_key = SigningKey::generate(&mut rng);
-    let psf = ParsedEvent::PeerSharedFirst(PeerSharedFirstEvent {
+    let psf = ParsedEvent::PeerShared(PeerSharedEvent {
         created_at_ms: now_ms(),
         public_key: peer_shared_key.verifying_key().to_bytes(),
         user_event_id: ub_eid,

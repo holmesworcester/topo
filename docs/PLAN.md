@@ -1118,7 +1118,7 @@ Required behavior:
 - `invite_accepted` records trust anchor intent for `workspace_id` (per `recorded_by` peer scope).
 - `invite_accepted` is a local binding step from event-carried `workspace_id` (no invite-presence dep gate).
 - if a different trust anchor already exists for that peer scope, `invite_accepted` is rejected.
-- downstream identity events (`user_boot`, `device_invite`, `peer_shared`) remain dependency/signer-gated in peer scope.
+- downstream identity events (`user`, `device_invite`, `peer_shared`) remain dependency/signer-gated in peer scope.
 - root `workspace` events are not valid until corresponding trust anchor exists and matches the root id.
 - trust-anchor binding must come from validated projector input fields, not pre-projection capture tables.
 - invites are never force-valid; they validate only through signer/dependency chain.

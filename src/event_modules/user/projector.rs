@@ -1,7 +1,7 @@
 use super::super::ParsedEvent;
 use crate::projection::contract::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
 
-/// Pure projector: User (Boot or Ongoing) → users table.
+/// Pure projector: User -> users table.
 pub fn project_pure(
     recorded_by: &str,
     event_id_b64: &str,
@@ -9,8 +9,7 @@ pub fn project_pure(
     _ctx: &ContextSnapshot,
 ) -> ProjectorResult {
     let (public_key, username) = match parsed {
-        ParsedEvent::UserBoot(u) => (&u.public_key, &u.username),
-        ParsedEvent::UserOngoing(u) => (&u.public_key, &u.username),
+        ParsedEvent::User(u) => (&u.public_key, &u.username),
         _ => return ProjectorResult::reject("not a user event".to_string()),
     };
 

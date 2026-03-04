@@ -382,8 +382,8 @@ mod tests {
     use super::*;
     use crate::db::{open_in_memory, schema::create_tables};
     use crate::event_modules::{
-        DeviceInviteFirstEvent, InviteAcceptedEvent, MessageEvent, PeerSharedFirstEvent,
-        ReactionEvent, UserBootEvent, UserInviteBootEvent, WorkspaceEvent,
+        DeviceInviteEvent, InviteAcceptedEvent, MessageEvent, PeerSharedEvent,
+        ReactionEvent, UserEvent, UserInviteEvent, WorkspaceEvent,
     };
     use ed25519_dalek::SigningKey;
 
@@ -435,7 +435,7 @@ mod tests {
         project_one(conn, recorded_by, &net_eid).unwrap();
 
         let invite_key = SigningKey::generate(&mut rng);
-        let uib = ParsedEvent::UserInviteBoot(UserInviteBootEvent {
+        let uib = ParsedEvent::UserInvite(UserInviteEvent {
             created_at_ms: now_ms(),
             public_key: invite_key.verifying_key().to_bytes(),
             workspace_id: net_eid,
@@ -447,7 +447,7 @@ mod tests {
             create_signed_event_synchronous(conn, recorded_by, &uib, &workspace_key).unwrap();
 
         let user_key = SigningKey::generate(&mut rng);
-        let ub = ParsedEvent::UserBoot(UserBootEvent {
+        let ub = ParsedEvent::User(UserEvent {
             created_at_ms: now_ms(),
             public_key: user_key.verifying_key().to_bytes(),
             username: "test-user".to_string(),
@@ -458,7 +458,7 @@ mod tests {
         let ub_eid = create_signed_event_synchronous(conn, recorded_by, &ub, &invite_key).unwrap();
 
         let device_invite_key = SigningKey::generate(&mut rng);
-        let dif = ParsedEvent::DeviceInviteFirst(DeviceInviteFirstEvent {
+        let dif = ParsedEvent::DeviceInvite(DeviceInviteEvent {
             created_at_ms: now_ms(),
             public_key: device_invite_key.verifying_key().to_bytes(),
             signed_by: ub_eid,
@@ -468,7 +468,7 @@ mod tests {
         let dif_eid = create_signed_event_synchronous(conn, recorded_by, &dif, &user_key).unwrap();
 
         let peer_shared_key = SigningKey::generate(&mut rng);
-        let psf = ParsedEvent::PeerSharedFirst(PeerSharedFirstEvent {
+        let psf = ParsedEvent::PeerShared(PeerSharedEvent {
             created_at_ms: now_ms(),
             public_key: peer_shared_key.verifying_key().to_bytes(),
             user_event_id: ub_eid,

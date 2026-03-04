@@ -1,7 +1,7 @@
 use super::super::ParsedEvent;
 use crate::projection::contract::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
 
-/// Pure projector: Admin (Boot or Ongoing) → admins table.
+/// Pure projector: Admin -> admins table.
 pub fn project_pure(
     recorded_by: &str,
     event_id_b64: &str,
@@ -9,8 +9,7 @@ pub fn project_pure(
     _ctx: &ContextSnapshot,
 ) -> ProjectorResult {
     let public_key = match parsed {
-        ParsedEvent::AdminBoot(a) => &a.public_key,
-        ParsedEvent::AdminOngoing(a) => &a.public_key,
+        ParsedEvent::Admin(a) => &a.public_key,
         _ => return ProjectorResult::reject("not an admin event".to_string()),
     };
 

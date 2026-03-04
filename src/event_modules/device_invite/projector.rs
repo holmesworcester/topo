@@ -1,18 +1,17 @@
 use super::super::ParsedEvent;
 use crate::projection::contract::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
 
-/// Pure projector: DeviceInvite (First or Ongoing) → device_invites table.
-/// When bootstrap_context is available (locally-created invite), this is a
-/// First variant, it also writes a pending_invite_bootstrap_trust row.
+/// Pure projector: DeviceInvite -> device_invites table.
+/// When bootstrap_context is available and this event is locally created,
+/// also write pending_invite_bootstrap_trust.
 pub fn project_pure(
     recorded_by: &str,
     event_id_b64: &str,
     parsed: &ParsedEvent,
     ctx: &ContextSnapshot,
 ) -> ProjectorResult {
-    let (public_key, created_at_ms, is_first) = match parsed {
-        ParsedEvent::DeviceInviteFirst(di) => (&di.public_key, di.created_at_ms as i64, true),
-        ParsedEvent::DeviceInviteOngoing(di) => (&di.public_key, di.created_at_ms as i64, false),
+    let (public_key, created_at_ms) = match parsed {
+        ParsedEvent::DeviceInvite(di) => (&di.public_key, di.created_at_ms as i64),
         _ => return ProjectorResult::reject("not a device_invite event".to_string()),
     };
 
@@ -26,7 +25,7 @@ pub fn project_pure(
         ],
     }];
 
-    if is_first && ctx.is_local_create {
+    if ctx.is_local_create {
         if let Some(ref bc) = ctx.bootstrap_context {
             let expected_spki =
                 crate::transport::cert::spki_fingerprint_from_ed25519_pubkey(public_key);
