@@ -231,10 +231,7 @@ Why this appears much faster than 10k:
 
 #### Multi-source catchup: 4 sources, 100k events
 
-Sink connects to all sources as initiator using coordinated round-based assignment.
-All sources are pre-seeded with the same dataset; sink success requires exact ID-set equality with the union of source stores.
-Ingest attribution is recorded in `recorded_events.source` as
-`quic_recv:<peer_id>@<ip:port>` for sink-side per-source accounting.
+Quick note: coordinated sink-driven catchup over pre-seeded identical source datasets with sink-side per-source ingest attribution (`recorded_events.source`).
 
 | Metric | Value |
 |--------|-------|
@@ -256,94 +253,24 @@ Ingest attribution is recorded in `recorded_events.source` as
 | Sink store | 100,000 |
 | Peak RSS | 1,370.3 MiB |
 
-### Multi-Source Large-File Catchup Harness (Implemented)
+### Multi-Source Large-File Catchup
 
-Files dominate transfer volume, so we now keep a dedicated large-file catchup harness in `sync_graph_test.rs`:
-1. Seed source `S0` with signed `message_attachment + file_slice` events.
-2. Clone that exact dataset to all non-sink sources.
-3. Run sink-driven multi-source catchup.
-4. Assert sink `file_slice` event-id set exactly equals the seeded set.
-5. Attribute each received file slice by source from `recorded_events.source` (`quic_recv:<peer_id>@<ip:port>`).
-6. Assert each source contributes a substantial slice share, not just `>0`:
-   at least `min_fair_share_fraction * (total_slices / source_count)`; current smoke config uses `10%` of fair share.
+Validates sink exact `file_slice` convergence and per-source fairness floor in multi-source file catchup using `recorded_events.source` attribution.
 
-Latest large-file multi-source snapshot (2026-03-03, Linux, `--ignored --nocapture --test-threads=1`):
+Latest large-file multi-source snapshot (2026-03-04, Linux, `--ignored --nocapture --test-threads=1`):
 
 | Test | Result | Catchup wall | Events/s | MB/s | Peak RSS |
 |---|---|---:|---:|---:|---:|
-| `catchup_large_file_4x_400_slices` | PASS | `2232 ms` | `179` | `44.8` | `686.4 MiB` |
-| `catchup_large_file_4x_1024_slices` | FAIL (contributor-floor assert) | `2241 ms` | `457` | `114.3` | `686.4 MiB` |
-| `catchup_large_file_8x_1024_slices` | FAIL (contributor-floor assert) | `2443 ms` | `419` | `104.8` | `1186.4 MiB` |
-
-Failure detail observed:
-1. `4x1024`: expected `>= 4` contributing sources, observed `3`.
-2. `8x1024`: expected `>= 8` contributing sources, observed `7`.
-3. Throughput and attribution metrics were still emitted before the fairness assertion fired.
+| `catchup_large_file_4x_400_slices` | PASS | `416 ms` | `962` | `240.5` | `1111.0 MiB` |
+| `catchup_large_file_4x_1024_slices` | PASS | `630 ms` | `1625` | `406.6` | `1111.0 MiB` |
+| `catchup_large_file_8x_1024_slices` | PASS | `833 ms` | `1229` | `307.5` | `1363.4 MiB` |
 
 Run:
-`cargo test --release --test sync_graph_test catchup_large_file_4x_1024_slices -- --ignored --nocapture --test-threads=1`
+`cargo +stable test --release --test sync_graph_test catchup_large_file_ -- --ignored --nocapture --test-threads=1`
 
-### Low-Memory Test Split
+### Low-Memory Coverage
 
-Low-memory coverage is intentionally split into two lanes:
-
-1. **Functional lane (fast, default in `low_mem_test`)**
-   - Goal: quickly prove lowmem-mode sync still works functionally.
-   - Runs by default: `low_mem_ios_functional_smoke_2k`.
-   - Kept but ignored by default (RSS-sampling sanity only):
-     - `low_mem_ios_budget_smoke_10k`
-     - `low_mem_ios_budget_soak_million`
-   - Command:
-     - `cargo test --release --test low_mem_test -- --nocapture`
-
-2. **Realism lane (daemon + Linux memory accounting)**
-   - Goal: approximate constrained-runtime kill behavior with process isolation.
-   - Harness: `scripts/run_lowmem_proxy.sh` (real daemons, `/proc` RSS/smaps).
-   - Hard-cap option: cgroup v2 (`memory.max`, `memory.events`).
-   - This is the memory gate to trust for release decisions, not in-process RSS sampling.
-
-3. **Default lowmem perf command (fast realism matrix)**
-   - Command: `scripts/run_perf_serial.sh lowmem`
-   - Default scenarios:
-     - message delta: `50k baseline + 10k messages`
-     - file delta: `50k baseline + 20 x 1MiB files`
-   - Default enforcement:
-     - `LOWMEM_PROXY_CGROUP_ENFORCE=1`
-     - `LOWMEM_PROXY_CGROUP_LIMIT_KB=22528` (22 MiB Linux receiver hard cap)
-
-4. **Large/slow scenarios (opt-in hardening lane)**
-   - These do not run by default in `run_perf_serial.sh lowmem`.
-   - Enable with:
-     - `PERF_LOWMEM_POC_ENABLE=1`
-     - `PERF_LOWMEM_RUN_LARGE_TARGET=1`
-     - `PERF_LOWMEM_RUN_SMALL_BRACKET=1`
-
-### Lowmem Proof-of-Concept (24 MiB iOS Target, 22 MiB Linux Hard Cap)
-
-<!-- This should get merged with the previous section into a single coherent section-->
-
-Platform note: this POC gate is Linux-only because it depends on `/proc` memory accounting and cgroup v2 `memory.max` / `memory.events`.
-
-Optional lowmem POC scenarios (`scripts/run_perf_serial.sh lowmem` with POC envs enabled):
-1. `Lowmem POC Messages (1M+10k, 24MB gate)`
-2. `Lowmem POC Files Realism (500k+100x1MiB, 24MB gate)`
-3. `Lowmem POC Files Extreme (0+10k x1MiB, 24MB gate)`
-
-Each lowmem proxy summary now includes:
-- `LOWMEM_BUDGET_KB` (default `24576`)
-- `PASS_UNDER_24MB` (`1` pass / `0` fail)
-- `CGROUP_ENFORCED`, `CGROUP_LIMIT_KB`, `CGROUP_OOM`, `CGROUP_OOM_KILL`
-- `MAX_BOB_TOTAL_KB` (receiver peak working-set snapshot from smaps categories)
-
-Hard-cap policy used for Linux realism in lowmem POC:
-1. Receiver daemon (`bob`) is moved into a dedicated cgroup v2 with `memory.max=22 MiB` and `memory.swap.max=0`.
-2. The run fails fast if `memory.events:oom_kill > 0` (kernel-enforced kill).
-3. We gate at 22 MiB on Linux to keep margin for iOS Jetsam differences (`phys_footprint` vs Linux RSS/smaps accounting), while targeting 24 MiB on-device.
-
-Realism notes:
-1. Message POC (`1M + 10k`) is the closest proxy for background-notification catchup with a large already-synced workspace.
-2. File realism POC (`500k + 100x1MiB`) models large baseline plus moderate new file traffic.
-3. File extreme POC (`0 + 10k x1MiB`) is intentionally stress-biased for transfer volume and memory flatness, not day-to-day baseline realism.
+Linux-only constrained-runtime gate for iOS background Notification Service Extension (NSE) targets (`24 MiB` iOS target, `22 MiB` enforced Linux receiver cap to account for iOS overhead). Detailed methodology is in `docs/DESIGN.md`.
 
 Latest cgroup-enforced snapshot (2026-03-03):
 
@@ -352,9 +279,7 @@ Latest cgroup-enforced snapshot (2026-03-03):
 | Message realism: `500,000 + 10,000` | `10,000/10,000` msgs synced | `18,764` KB | PASS | PASS (`CGROUP_OOM_KILL=0`) |
 | File realism: `500,000 + 100 x 1MiB` | `400/400` slices synced | `14,088` KB | PASS | PASS (`CGROUP_OOM_KILL=0`) |
 
-Baseline impact (file realism proxy):
-1. In this harness, receiver peak RSS did not scale up with larger pre-synced baseline at these points.
-2. Transfer size and ingest backpressure knobs (`wanted` watermark + DB-backed `need_queue`) dominated memory shape more than baseline cardinality.
+Receiver peak stayed flat across sampled baselines; transfer size and ingest backpressure (`wanted` watermark + DB-backed `need_queue`) dominated memory shape.
 
 Non-lowmem regression spot checks (2026-03-03):
 1. `cargo +stable test --release --test perf_test perf_sync_10k -- --nocapture --test-threads=1` passed (`Msgs/s: 12315`).

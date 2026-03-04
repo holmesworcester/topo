@@ -1129,6 +1129,48 @@ Low-memory Linux-only note:
 3. RSS-sampling tests in `tests/low_mem_test.rs` are sanity checks (ignored by default for budget assertions),
 4. non-Linux platforms should use functional low-memory tests and device-native profiling instead of the Linux proxy gate.
 
+### Multi-source large-file catchup perf methodology
+
+The dedicated large-file catchup harness in `sync_graph_test.rs` validates both correctness and source-distribution behavior:
+1. seed source `S0` with signed `message_attachment + file_slice` events,
+2. clone that exact dataset to all non-sink sources,
+3. run sink-driven multi-source catchup,
+4. assert sink `file_slice` event-id set exactly equals the seeded set,
+5. attribute each received file slice by source from `recorded_events.source` (`quic_recv:<peer_id>@<ip:port>`),
+6. assert each source contributes a minimum fair-share fraction, not merely `>0`.
+
+Current smoke fairness floor uses `min_fair_share_fraction = 10%` of `(total_slices / source_count)`.
+
+### Low-memory perf methodology
+
+Low-memory coverage is split into two lanes:
+1. **Functional lane** (`tests/low_mem_test.rs`) for fast correctness checks in low-memory mode.
+2. **Realism lane** (`scripts/run_lowmem_proxy.sh`) for process-isolated Linux memory accounting and optional cgroup hard caps.
+
+Functional lane defaults:
+1. runs by default: `low_mem_ios_functional_smoke_2k`,
+2. RSS-sampling budget tests are ignored by default: `low_mem_ios_budget_smoke_10k`, `low_mem_ios_budget_soak_million`.
+
+Realism lane defaults:
+1. driven through `scripts/run_perf_serial.sh lowmem`,
+2. default scenarios: `50k+10k` message delta and `50k+20x1MiB` file delta,
+3. default enforcement: `LOWMEM_PROXY_CGROUP_ENFORCE=1`, `LOWMEM_PROXY_CGROUP_LIMIT_KB=22528`.
+
+Optional low-memory hardening scenarios:
+1. enable with `PERF_LOWMEM_POC_ENABLE=1`,
+2. optionally add `PERF_LOWMEM_RUN_LARGE_TARGET=1` and `PERF_LOWMEM_RUN_SMALL_BRACKET=1`,
+3. available scenarios include `1M+10k` messages, `500k+100x1MiB` realism files, and `0+10k x1MiB` extreme files.
+
+Low-memory proxy output fields used by perf reporting:
+1. `LOWMEM_BUDGET_KB` and `PASS_UNDER_24MB`,
+2. `CGROUP_ENFORCED`, `CGROUP_LIMIT_KB`, `CGROUP_OOM`, `CGROUP_OOM_KILL`,
+3. `MAX_BOB_TOTAL_KB` (receiver working-set peak from smaps categories).
+
+Linux hard-cap policy:
+1. receiver daemon is moved into a dedicated cgroup v2 with `memory.max=22 MiB` and `memory.swap.max=0`,
+2. run fails if `memory.events:oom_kill > 0`,
+3. `22 MiB` Linux cap is used as margin against iOS `24 MiB` Jetsam-accounting differences.
+
 ---
 
 # 9. Identity, Auth, Invites, Trust Anchor, and Removal
