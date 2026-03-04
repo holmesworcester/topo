@@ -382,95 +382,12 @@ fn target_socket_path(db: &str, socket: Option<&str>) -> PathBuf {
         .unwrap_or_else(|| service::socket_path_for_db(db))
 }
 
-fn status_matches_target_db(db: &str, data: Option<&serde_json::Value>) -> bool {
-    data.and_then(|v| v.get("daemon_db_path"))
-        .and_then(|v| v.as_str())
-        .map(|running_db| running_db == db)
-        .unwrap_or(true)
-}
-
-fn ensure_daemon_running(
-    db: &str,
-    socket: Option<&str>,
-) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
-    let sock = target_socket_path(db, socket);
-
-    match rpc_call(&sock, RpcMethod::Status) {
-        Ok(resp) => {
-            if resp.ok && status_matches_target_db(db, resp.data.as_ref()) {
-                return Ok(sock);
-            }
-            if let Some(err) = resp.error {
-                return Err(err.into());
-            }
-            return Err("daemon status probe failed".into());
-        }
-        Err(RpcClientError::DaemonNotRunning(_)) => {}
-        Err(_) => {
-            if sock.exists() {
-                let _ = std::fs::remove_file(&sock);
-            }
-        }
-    }
-
-    let mut cmd = std::process::Command::new(std::env::current_exe()?);
-    cmd.arg("--db").arg(db);
-    if let Some(sock_override) = socket {
-        cmd.arg("--socket").arg(sock_override);
-    }
-    cmd.arg("start")
-        .arg("--bind")
-        .arg("0.0.0.0:0")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    let child = cmd.spawn()?;
-    let _pid = child.id();
-    drop(child);
-
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut last_error = String::from("daemon did not become ready");
-    while Instant::now() < deadline {
-        match rpc_call(&sock, RpcMethod::Status) {
-            Ok(resp) => {
-                if resp.ok && status_matches_target_db(db, resp.data.as_ref()) {
-                    return Ok(sock);
-                }
-                if !status_matches_target_db(db, resp.data.as_ref()) {
-                    return Err(format!(
-                        "daemon socket {} is bound to a different db",
-                        sock.display()
-                    )
-                    .into());
-                }
-                last_error = resp
-                    .error
-                    .unwrap_or_else(|| "status probe failed".to_string());
-            }
-            Err(RpcClientError::DaemonNotRunning(_)) => {
-                last_error = "daemon not running yet".to_string();
-            }
-            Err(e) => {
-                last_error = e.to_string();
-            }
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-
-    Err(format!(
-        "failed to auto-start daemon for {} via {}: {}",
-        db,
-        sock.display(),
-        last_error
-    )
-    .into())
-}
-
 fn rpc_require_daemon(
     db: &str,
     socket: Option<&str>,
     method: RpcMethod,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
-    let sock = ensure_daemon_running(db, socket)?;
+    let sock = target_socket_path(db, socket);
 
     match rpc_call(&sock, method) {
         Ok(resp) => {
@@ -482,9 +399,8 @@ fn rpc_require_daemon(
             Ok(resp.data.unwrap_or(serde_json::Value::Null))
         }
         Err(RpcClientError::DaemonNotRunning(_)) => Err(format!(
-            "daemon failed to start for {} (socket: {})",
-            db,
-            sock.display()
+            "daemon is not running for {} — start it with: topo --db {} start",
+            db, db
         )
         .into()),
         Err(e) => Err(e.to_string().into()),
@@ -832,22 +748,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             public_addr,
         } => {
             let device_name = device_name.unwrap_or_else(system_hostname);
-            let sock = ensure_daemon_running(db, socket_override.as_deref())?;
-            let data = match rpc_call(&sock, RpcMethod::CreateWorkspace {
-                workspace_name,
-                username,
-                device_name,
-            }) {
-                Ok(resp) => {
-                    if !resp.ok {
-                        if let Some(err) = resp.error {
-                            return Err(err.into());
-                        }
-                    }
-                    resp.data.unwrap_or(serde_json::Value::Null)
-                }
-                Err(e) => return Err(e.to_string().into()),
-            };
+            let data = rpc_require_daemon(
+                db,
+                socket_override.as_deref(),
+                RpcMethod::CreateWorkspace {
+                    workspace_name,
+                    username,
+                    device_name,
+                },
+            )?;
             println!(
                 "peer_id:      {}",
                 short_id(data["peer_id"].as_str().unwrap_or(""))
@@ -858,6 +767,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             );
 
             if let Some(addr) = public_addr {
+                let sock = target_socket_path(db, socket_override.as_deref());
                 match rpc_call(&sock, RpcMethod::CreateInvite {
                     public_addr: addr,
                     public_spki: None,

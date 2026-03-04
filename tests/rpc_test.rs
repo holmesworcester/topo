@@ -20,6 +20,29 @@ fn socket_path_for_db(db: &str) -> PathBuf {
 }
 
 fn create_workspace(db: &str) {
+    // Start a temporary daemon so create-workspace can route via RPC.
+    let socket = socket_path_for_db(db);
+    let mut tmp_daemon = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--db", db, "start", "--bind", "127.0.0.1:0"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    wait_for_socket(&socket);
+    // Wait for RPC readiness.
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(5) {
+        if topo::rpc::client::rpc_call(&socket, topo::rpc::protocol::RpcMethod::Status)
+            .map(|r| r.ok)
+            .unwrap_or(false)
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
     let out = Command::new(bin())
         .args(["create-workspace", "--db", db])
         .output()
@@ -29,8 +52,7 @@ fn create_workspace(db: &str) {
         "create-workspace failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    // create-workspace auto-starts the daemon; most tests start it explicitly.
-    let _ = Command::new(bin()).args(["--db", db, "stop"]).output();
+    stop_daemon(db, &mut tmp_daemon);
 }
 
 fn wait_for_socket(socket: &PathBuf) {
@@ -672,10 +694,20 @@ fn daemon_start_on_empty_db_reports_idle_runtime_state() {
 }
 
 #[test]
-fn create_workspace_autostarts_daemon_and_activates_runtime() {
+fn create_workspace_on_running_daemon_activates_runtime() {
     let (_dir, db) = temp_db();
     let socket = socket_path_for_db(&db);
     assert!(!socket.exists(), "socket should not exist before command");
+
+    // Start daemon on empty DB first (required — no auto-start).
+    let mut daemon = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
+            .spawn()
+            .unwrap(),
+    );
+    wait_for_socket(&socket);
+    let _ = wait_for_runtime_state(&socket, "IdleNoTenants", Duration::from_secs(10));
 
     let out = Command::new(bin())
         .args(["create-workspace", "--db", &db])
@@ -698,7 +730,6 @@ fn create_workspace_autostarts_daemon_and_activates_runtime() {
         "missing workspace_id output: {}",
         stdout
     );
-    wait_for_socket(&socket);
 
     let data = wait_for_runtime_state(&socket, "Active", Duration::from_secs(10));
     assert!(
@@ -710,7 +741,7 @@ fn create_workspace_autostarts_daemon_and_activates_runtime() {
         data
     );
 
-    let _ = Command::new(bin()).args(["--db", &db, "stop"]).output();
+    stop_daemon(&db, &mut daemon);
 }
 
 #[test]
@@ -722,13 +753,20 @@ fn accept_invite_on_running_idle_daemon_activates_runtime_without_restart() {
     let alice_socket = socket_path_for_db(&alice_db);
     let bob_socket = socket_path_for_db(&bob_db);
 
-    // Alice: bootstrap via RPC-only create-workspace (auto-starts daemon).
+    // Alice: start daemon, then create workspace.
+    let mut alice_daemon = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--db", &alice_db, "start", "--bind", "127.0.0.1:0"])
+            .spawn()
+            .unwrap(),
+    );
+    wait_for_socket(&alice_socket);
+    let _ = wait_for_runtime_state(&alice_socket, "IdleNoTenants", Duration::from_secs(10));
     let create = Command::new(bin())
         .args(["create-workspace", "--db", &alice_db])
         .output()
         .unwrap();
     assert!(create.status.success(), "alice create-workspace failed");
-    wait_for_socket(&alice_socket);
     let alice_status = wait_for_runtime_state(&alice_socket, "Active", Duration::from_secs(10));
     let alice_listen = alice_status["runtime"]["listen_addr"]
         .as_str()
@@ -800,9 +838,7 @@ fn accept_invite_on_running_idle_daemon_activates_runtime_without_restart() {
     );
     let _ = wait_for_runtime_state(&bob_socket, "Active", Duration::from_secs(10));
 
-    let _ = Command::new(bin())
-        .args(["--db", &alice_db, "stop"])
-        .output();
+    stop_daemon(&alice_db, &mut alice_daemon);
     stop_daemon(&bob_db, &mut bob_daemon);
 }
 
@@ -812,16 +848,26 @@ fn db_scoped_commands_remain_isolated_between_daemons() {
     let db_a = tmpdir.path().join("a.db").to_str().unwrap().to_string();
     let db_b = tmpdir.path().join("b.db").to_str().unwrap().to_string();
 
-    let create_a = Command::new(bin())
-        .args(["create-workspace", "--db", &db_a])
-        .output()
-        .unwrap();
-    assert!(create_a.status.success());
-    let create_b = Command::new(bin())
-        .args(["create-workspace", "--db", &db_b])
-        .output()
-        .unwrap();
-    assert!(create_b.status.success());
+    create_workspace(&db_a);
+    create_workspace(&db_b);
+
+    // Start explicit daemons for both DBs.
+    let socket_a = socket_path_for_db(&db_a);
+    let socket_b = socket_path_for_db(&db_b);
+    let mut daemon_a = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--db", &db_a, "start", "--bind", "127.0.0.1:0"])
+            .spawn()
+            .unwrap(),
+    );
+    let mut daemon_b = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--db", &db_b, "start", "--bind", "127.0.0.1:0"])
+            .spawn()
+            .unwrap(),
+    );
+    wait_for_socket(&socket_a);
+    wait_for_socket(&socket_b);
 
     let send_a = Command::new(bin())
         .args(["--db", &db_a, "send", "db-a-message"])
@@ -833,8 +879,8 @@ fn db_scoped_commands_remain_isolated_between_daemons() {
         String::from_utf8_lossy(&send_a.stderr)
     );
 
-    let status_a = status_via_rpc(&socket_path_for_db(&db_a));
-    let status_b = status_via_rpc(&socket_path_for_db(&db_b));
+    let status_a = status_via_rpc(&socket_a);
+    let status_b = status_via_rpc(&socket_b);
     assert!(
         status_a["messages_count"].as_i64().unwrap_or(0) >= 1,
         "db A should show at least one message: {}",
@@ -847,8 +893,8 @@ fn db_scoped_commands_remain_isolated_between_daemons() {
         status_b
     );
 
-    let _ = Command::new(bin()).args(["--db", &db_a, "stop"]).output();
-    let _ = Command::new(bin()).args(["--db", &db_b, "stop"]).output();
+    stop_daemon(&db_a, &mut daemon_a);
+    stop_daemon(&db_b, &mut daemon_b);
 }
 
 #[test]

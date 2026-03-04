@@ -17,6 +17,9 @@ fn socket_path_for_db(db: &str) -> PathBuf {
 }
 
 fn create_workspace(db: &str) {
+    // Start a temporary daemon so create-workspace can route via RPC.
+    let _tmp_daemon = start_daemon(db);
+
     let out = Command::new(bin())
         .args(["create-workspace", "--db", db])
         .output()
@@ -26,8 +29,9 @@ fn create_workspace(db: &str) {
         "create-workspace failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    // create-workspace auto-starts daemon; this suite controls daemon start explicitly.
+    // Stop temporary daemon; this suite controls daemon start explicitly.
     let _ = Command::new(bin()).args(["--db", db, "stop"]).output();
+    // _tmp_daemon dropped here — DaemonGuard kills the child.
     wait_for_daemon_stopped(db, Duration::from_secs(10));
 }
 
@@ -252,6 +256,9 @@ fn create_invite(db: &str, bootstrap_addr: &str, public_spki: Option<&str>) -> S
 }
 
 fn accept_invite(db: &str, invite_link: &str, username: &str, devicename: &str) {
+    // Start a temporary daemon so accept-invite can route via RPC.
+    let _tmp_daemon = start_daemon(db);
+
     let output = Command::new(bin())
         .arg("accept-invite")
         .arg("--db")
@@ -272,8 +279,9 @@ fn accept_invite(db: &str, invite_link: &str, username: &str, devicename: &str) 
         stdout.trim(),
         stderr.trim()
     );
-    // accept-invite auto-starts daemon; this suite controls daemon start explicitly.
+    // Stop temporary daemon; this suite controls daemon start explicitly.
     let _ = Command::new(bin()).args(["--db", db, "stop"]).output();
+    // _tmp_daemon dropped here — DaemonGuard kills the child.
     wait_for_daemon_stopped(db, Duration::from_secs(10));
 }
 

@@ -83,6 +83,8 @@ fn run_topo(args: &[&str]) -> Output {
 }
 
 fn create_workspace(db: &str) {
+    // Start a temporary daemon so create-workspace can route via RPC.
+    let _tmp_daemon = start_daemon(db, random_port());
     let out = run_topo(&["create-workspace", "--db", db]);
     assert!(
         out.status.success(),
@@ -90,11 +92,12 @@ fn create_workspace(db: &str) {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    // create-workspace auto-starts daemon; tests start daemons explicitly.
-    let _ = run_topo(&["--db", db, "stop"]);
+    // _tmp_daemon dropped here — Daemon::drop kills the child.
 }
 
 fn accept_invite(db: &str, invite_link: &str) {
+    // Start a temporary daemon so accept-invite can route via RPC.
+    let _tmp_daemon = start_daemon(db, random_port());
     let out = run_topo(&[
         "accept-invite",
         "--db",
@@ -112,8 +115,6 @@ fn accept_invite(db: &str, invite_link: &str) {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    // accept-invite auto-starts daemon; tests start daemons explicitly.
-    let _ = run_topo(&["--db", db, "stop"]);
 }
 
 /// Run a topo subcommand that routes through the daemon via RPC (daemon-preferred commands).
@@ -184,6 +185,8 @@ fn topo_create_invite(db: &str, bootstrap_addr: &str) -> String {
 }
 
 fn topo_accept_invite(db: &str, invite_link: &str) {
+    // Start a temporary daemon so accept-invite can route via RPC.
+    let _tmp_daemon = start_daemon(db, random_port());
     let out = run_topo(&[
         "accept-invite",
         "--db",
@@ -201,8 +204,6 @@ fn topo_accept_invite(db: &str, invite_link: &str) {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    // accept-invite auto-starts daemon; tests start daemons explicitly.
-    let _ = run_topo(&["--db", db, "stop"]);
 }
 
 fn topo_assert_eventually(db: &str, predicate: &str, timeout_ms: u64) -> Output {

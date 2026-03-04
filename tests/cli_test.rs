@@ -22,6 +22,8 @@ fn socket_path_for_db(db: &str) -> PathBuf {
 }
 
 fn create_workspace(db: &str) {
+    // Start a temporary daemon so create-workspace can route via RPC.
+    let tmp_daemon = start_daemon_with_options(db, false);
     let out = Command::new(bin())
         .args(["create-workspace", "--db", db])
         .output()
@@ -31,7 +33,7 @@ fn create_workspace(db: &str) {
         "create-workspace failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    // Wait until tenant discovery sees at least one peer before stopping it.
+    // Wait until tenant discovery sees at least one peer before stopping.
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(5) {
         let peers = Command::new(bin())
@@ -49,8 +51,9 @@ fn create_workspace(db: &str) {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    // create-workspace auto-starts the daemon; callers decide daemon lifecycle.
+    // Stop temporary daemon; callers decide daemon lifecycle.
     let _ = Command::new(bin()).args(["--db", db, "stop"]).output();
+    drop(tmp_daemon);
     wait_for_daemon_stopped(db, Duration::from_secs(10));
 }
 
@@ -376,6 +379,8 @@ fn create_invite(db: &str, bootstrap_addr: &str) -> String {
 
 /// Helper: run accept-invite CLI command through daemon RPC.
 fn accept_invite(db: &str, invite_link: &str) {
+    // Start a temporary daemon so accept-invite can route via RPC.
+    let tmp_daemon = start_daemon_with_options(db, false);
     let output = Command::new(bin())
         .arg("accept-invite")
         .arg("--db")
@@ -389,7 +394,7 @@ fn accept_invite(db: &str, invite_link: &str) {
         "accept-invite failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    // Ensure tenant discovery is persisted before stopping the auto-started daemon.
+    // Ensure tenant discovery is persisted before stopping.
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(5) {
         let peers = Command::new(bin())
@@ -407,8 +412,9 @@ fn accept_invite(db: &str, invite_link: &str) {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    // accept-invite auto-starts daemon; callers decide daemon lifecycle.
+    // Stop temporary daemon; callers decide daemon lifecycle.
     let _ = Command::new(bin()).args(["--db", db, "stop"]).output();
+    drop(tmp_daemon);
     wait_for_daemon_stopped(db, Duration::from_secs(10));
 }
 
