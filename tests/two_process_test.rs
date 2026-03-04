@@ -161,7 +161,7 @@ fn ensure_active_peer(db: &str, timeout: Duration) {
     let start = std::time::Instant::now();
     while start.elapsed() < timeout {
         let active = Command::new(bin())
-            .args(["--db", db, "active-peer"])
+            .args(["--db", db, "active-tenant"])
             .output()
             .expect("failed to run active-peer");
         if active.status.success() {
@@ -172,7 +172,7 @@ fn ensure_active_peer(db: &str, timeout: Duration) {
         }
 
         let peers = Command::new(bin())
-            .args(["--db", db, "peers"])
+            .args(["--db", db, "tenants"])
             .output()
             .expect("failed to run peers");
         if peers.status.success() {
@@ -181,7 +181,7 @@ fn ensure_active_peer(db: &str, timeout: Duration) {
                 let use_peer = Command::new(bin())
                     .arg("--db")
                     .arg(db)
-                    .arg("use-peer")
+                    .arg("use-tenant")
                     .arg(index.to_string())
                     .output()
                     .expect("failed to run use-peer");
@@ -219,9 +219,9 @@ fn send_message(db: &str, content: &str) -> String {
                 .to_string();
         }
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        let retryable = stderr.contains("no identity") || stderr.contains("no active peer");
+        let retryable = stderr.contains("no identity") || stderr.contains("no active tenant");
         if retryable && start.elapsed() < Duration::from_secs(20) {
-            if stderr.contains("no active peer") {
+            if stderr.contains("no active tenant") {
                 ensure_active_peer(db, Duration::from_secs(5));
             }
             std::thread::sleep(Duration::from_millis(100));

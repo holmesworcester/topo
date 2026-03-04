@@ -117,7 +117,7 @@ impl DaemonState {
             }
         }
 
-        Err("no active peer — run `topo use-peer <N>`".to_string())
+        Err("no active tenant — run `topo use-tenant <N>`".to_string())
     }
 
     /// Store an invite/link string and return its 1-based reference number.
