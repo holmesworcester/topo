@@ -55,17 +55,41 @@ The design goal is to keep protocol behavior auditable while still supporting re
 3. projection logic is deterministic and convergent,
 4. CLI workflows remain synchronous enough for imperative command chains.
 
-## How?
+## How it Works
 
-We split concerns aggressively:
+**Daemon start.** Every participant begins by starting a daemon (`topo ... start`) with a local database and bind address. That daemon owns the long-running machinery: projection workers, dial/accept peering loops, and sync session handling. Every step that follows is processed by the same runtime process.
 
-1. Canonical events are durable facts.
-2. Runtime protocol traffic (sync/intros/holepunch control) is not canonical event data.
-3. Projection is the only way canonical events affect application state.
-4. Blocking/unblocking is uniform across normal and encrypted events.
-5. Multitenancy is first-class with `recorded_by` scoping on shared tables.
-6. Policy-appropriate blocked rows after sync are normal, not failure.
-7. Freshness and winners are query-time decisions over append-only rows (for example `MAX(observed_at)`, first-write-wins trust anchors), not in-place mutable "current" rows.
+**Workspace creation and first user creation.** A workspace creator starts from an empty store. The create workspace command emits the initial auth event graph (`workspace`, bootstrap `user_invite`, `invite_accepted`, `user`, `device_invite`, `peer_shared`) plus local signer/key material. Tenant identity (`recorded_by`) is pre-derived from the final PeerShared identity before writes begin, so bootstrap rows are already in the same scope used later for normal operation. (There is no "temporary tenant identity" that must be migrated later.)
+
+**Creation and projection share one path.** Local event creation is synchronous at the command boundary, and every event still goes through the same projection pipeline used for replay and wire ingest. So even during initial setup, events are validated, dependency-checked, signer-checked, and materialized by the same projector logic used everywhere else. Their event id is returned to the caller once projected, which is useful for chaining commands. If a dependency is missing, the event blocks; when the dependency appears, the same unblock cascade continues projection. Exceptions to this flow (especially in initial workspace bootstrap or user joining) are highly discouraged.
+
+**Inviting and joining.** After workspace creation, an admin creates a `user_invite` event (which is synced to all existing members, if any) and shares invite data. The joiner accepts via `invite_accepted` and writes the follow-on identity chain (including a signed proof of invitation which all existing members can verify) for that joiner's user/device/peer identity. Normal sync brings missing canonical events, and the blocked rows unblock through the same dependency mechanism. If join prerequisites (such as prior auth events) are not yet present locally, the join path does not fork into ad-hoc recovery logic.
+
+**Auth event graph drives connection policy during the join window.** To avoid a chicken/egg problem, peers need to establish sessions before full steady-state PeerShared trust is present. The design handles this with projection-owned bootstrap trust rows fed by invite bootstrap context. Concretely: `invite_accepted` projection does write accepted bootstrap trust (`invite_bootstrap_trust`) when bootstrap context is present and that SPKI is not already superseded by projected PeerShared trust; inviter-side pending bootstrap trust (`pending_invite_bootstrap_trust`) is written by `user_invite`/`device_invite` projectors on local invite creation. This lets first-contact handshakes happen under strict control of the auth event graph and tenant-scoped trust checks, rather than ad-hoc transport exceptions. Then, once `peer_shared` is projected, matching bootstrap trust is deterministically consumed and removed, and ongoing peering decisions remain on steady-state trust only, based on device/peer public keys, not invite public keys.
+
+**Device linking is the same story.** Linking a second device follows the invite pattern with `device_invite` and acceptance, but extends an existing user instead of creating a new one. The runtime behavior is intentionally isomorphic to user join: bootstrap trust can bridge first contact, sync fills any missing canonical history, and PeerShared-derived trust becomes the long-term authority. Because this reuses the same event/projection/sync loop, multi-device behavior does not require a separate architecture: every subsequent device is recorded and validated in the same way as the first device.
+
+**Peer discovery provides candidates, not authority.** Local networking uses mDNS/DNS-SD to discover candidate endpoints per tenant. Those advertisements are treated as unauthenticated hints. They can influence "who to try dialing" but never "who is trusted." Actual authority remains event-sourced and projection-backed: after QUIC+mTLS handshake identifies the remote transport identity, tenant trust checks decide whether the session is allowed to proceed. We rely on a `public-addr` CLI parameter to discover remote peers; in production we expect always-on cloud or non-NAT nodes to be the discoverable peers.
+
+**Connection establishment and endpoint behavior.** Transport runs over QUIC with mTLS, while canonical event authenticity comes from event signatures and dependency validation. We intentionally force cloud-style multitenancy into the core runtime model: one daemon, one UDP port, many local tenants, each with its own workspace binding and trust state. That same mechanism is what enables a Slack/Discord-like local client to host many accounts/workspaces without spinning up one endpoint per account.
+
+At daemon startup, local tenants are discovered from event-projected identity/trust state plus local transport creds. The runtime then builds a single endpoint with a workspace-aware cert resolver: inbound handshakes use SNI derived from `workspace_id`, and the resolver selects a cert from the local tenant set for that workspace. Outbound dials use tenant-specific client configs, so each local tenant still presents its own transport identity when it initiates sessions.
+
+Handshake admission is union-based and tenant-scoped at the same time. The endpoint allows an incoming peer only if that peer fingerprint is trusted by at least one local tenant (`is_peer_allowed` over PeerShared trust plus bootstrap trust sources). After handshake, the runtime resolves a concrete `recorded_by` tenant for the connection and routes ingest/session processing under that tenant scope. This is the key boundary: one shared socket and one shared accept loop, but tenant-specific trust checks, routing, projection, and query visibility.
+
+This also covers the hard case where multiple local identities on the same endpoint belong to the same workspace. Tenant trust sets may overlap in value, so the same remote peer can be valid for more than one local tenant. A given accepted connection is routed to one tenant scope, but the shared endpoint can concurrently host sessions for many tenant scopes, including multiple identities in the same workspace, without collapsing their state into one identity.
+
+**Sync and convergence.** Once connected, peers reconcile their events over a set reconciliation algorithm that guarantees all peers will eventually have the same event set and (due to deterministic projection of events) the same convergent state for all shared data. Control and data are sent on separate QUIC streams for simplicity and reliability. Data streams carry events; control streams carry completion semantics (`Done`, `DataDone`, `DoneAck`) so each side can tell exactly when a round is complete. 
+
+Negentropy reconciliation exchanges compact set summaries (`NegOpen`/`NegMsg`) over workspace-scoped, time-based `(ts, event_id)` membership and yields `need_ids` without walking the dependency graph directly. Unlike sync algorithms used by OrbitDB, Git, etc., it is important for our design to chose one that does not care about the shape of our data and is ideal for event sets that are always growing. In this way, set reconcilation / syncing can be decoupled from the content of events.
+
+We use the Rust [`negentropy` library](https://crates.io/crates/negentropy) (`negentropy = "0.5"` in this repo), and this is the concrete engine behind our range-based set reconciliation approach ([Aljoscha Meyer, "Range-Based Set Reconciliation"](https://aljoscha-meyer.de/assets/landing/rbsr.pdf)). We modified our Negentropy integration to use a SQLite-backed store (`neg_items` + per-session `session_blocks`) instead of unbounded in-memory item sets, so reconciliation remains memory-bounded at large history sizes. (This is important for doing background sync in a memory-limited context on iOS). 
+
+We also modified the session flow for multi-source catchup: each source runs Negentropy independently, `need_ids` are deterministically split with fallback reassignment for source-unique/small sets, and all sources feed one shared batch writer to avoid duplicate pull storms and SQLite write contention. Inbound events are ingested through the same `project_one` path used by local creation and replay, which is why the system can enforce one convergence contract across source types: `local_create`, `wire_receive`, and replay all converge to the same projected state.
+
+**Steady-state is just the same loop repeating.** After creation/join/linking settles, day-to-day behavior is not a new phase. Peers create events, project them, discover targets, connect where policy allows, reconcile missing sets, and project incoming events. This is how the design gets both operational flexibility (local discovery, hole punch, multi-tenant endpoints) and strict correctness properties (deterministic projection, replay/reorder invariance, auth-gated connectivity) without maintaining multiple competing lifecycles and incurring the resulting state explosion.
+
+**The frontend is given an ergonomic API** Our daemon provides a placeholder RPC API that is capable of serving whatever queries are desired, and accepting commands with the minimal convenient set of parameters needed to execute them. For example, the CLI can request a message list that includes not just message content but user information, reactions, file attachments, download progress, etc, with limits and ranges for lazy loading. Developers benefit from event-module locality: when adding functionality to, say, messages or reactions, everything they need to modify is in the same content-thematic cluster of create, project, and query functions. Queries and commands are strictly scoped by peer, to avoid accidental intermingling of local data in development or testing. Unlike most p2p or local-first frameworks, you aren't on your own to build complex state management layer and deal with state duplication and concurrency problems; there is no middleware and frontends can be maximally simple. Because our "server" is local and only serves one client, frequent polling is a simple-but-effective way to keep frontend and backend state in constant sync. 
 
 ---
 
@@ -1380,14 +1404,10 @@ sync_until_converged(&alice, &bob, || bob.has_event(&sample), timeout).await;
 
 This makes tests resilient to identity chain structure changes while still verifying that the application-level data (messages, reactions, identities) converged correctly.
 
-## 10.2 Narrative walkthrough: invite join to steady-state sync
+## 10.2 Lifecycle narrative reference
 
-1. Inviter creates a `user_invite` event and shares invite data.
-2. Joiner accepts via `invite_accepted`, then writes follow-on identity events (`user`, `device_invite`, `peer_shared`) under pre-derived final `recorded_by`.
-3. Projectors apply deterministic rows and materialize/consume bootstrap trust through normal `WriteOp` rows (`InsertOrIgnore` on invite paths, `Delete` on matching `peer_shared`).
-4. Peering loops read trust state from SQL and establish transport sessions only for allowed peers.
-5. Sync transfers missing canonical events; blocked rows unblock via the same dependency cascade used everywhere else.
-6. Queries read projected rows; replaying the same canonical set converges to the same result.
+The end-to-end narrative now lives in [How it Works](#how-it-works), including workspace creation, first-user bootstrap, device linking, joining, discovery, and steady-state sync.
+Section 10 stays focused on convergence/test invariants derived from that lifecycle.
 
 ---
 
