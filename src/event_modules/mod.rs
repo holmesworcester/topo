@@ -242,9 +242,7 @@ impl ParsedEvent {
             ],
             ParsedEvent::FileSlice(f) => vec![("signed_by", f.signed_by)],
             ParsedEvent::BenchDep(b) => b.dep_ids.iter().map(|id| ("dep_id", *id)).collect(),
-            // Local signer material is local-first and may arrive before the
-            // referenced public signer event projects.
-            ParsedEvent::PeerSecret(_) => vec![],
+            ParsedEvent::PeerSecret(p) => vec![("signer_event_id", p.signer_event_id)],
             ParsedEvent::InviteSecret(k) => vec![("invite_event_id", k.invite_event_id)],
         }
     }

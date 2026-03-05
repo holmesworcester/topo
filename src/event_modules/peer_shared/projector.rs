@@ -1,6 +1,6 @@
 use super::super::ParsedEvent;
 use crate::crypto::event_id_to_base64;
-use crate::projection::contract::{ContextSnapshot, EmitCommand, ProjectorResult, SqlVal, WriteOp};
+use crate::projection::contract::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
 
 /// Pure projector: PeerShared -> peers_shared table.
 /// Also consumes bootstrap trust rows matching this peer's transport fingerprint,
@@ -9,7 +9,7 @@ pub fn project_pure(
     recorded_by: &str,
     event_id_b64: &str,
     parsed: &ParsedEvent,
-    ctx: &ContextSnapshot,
+    _ctx: &ContextSnapshot,
 ) -> ProjectorResult {
     let (public_key, user_event_id, device_name) = match parsed {
         ParsedEvent::PeerShared(p) => (&p.public_key, &p.user_event_id, &p.device_name),
@@ -60,20 +60,5 @@ pub fn project_pure(
         },
     ];
 
-    if ctx.peer_shared_has_local_signer_material == Some(true) {
-        let Some(signer_event_id) = crate::crypto::event_id_from_base64(event_id_b64) else {
-            return ProjectorResult::reject("invalid peer_shared event_id".to_string());
-        };
-        ProjectorResult::valid_with_commands(
-            ops,
-            vec![EmitCommand::ApplyTransportIdentityIntent {
-                intent: crate::contracts::transport_identity_contract::TransportIdentityIntent::InstallPeerSharedIdentityFromSigner {
-                    recorded_by: recorded_by.to_string(),
-                    signer_event_id,
-                },
-            }],
-        )
-    } else {
-        ProjectorResult::valid(ops)
-    }
+    ProjectorResult::valid(ops)
 }

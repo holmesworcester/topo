@@ -1,42 +1,36 @@
-//! Projection command path tests: verify that the local signer projector
-//! emits the correct ApplyTransportIdentityIntent for peer_shared signer kind,
-//! and does NOT emit it for other signer kinds.
+//! Projection command path tests: verify that peer_secret projection
+//! emits the correct ApplyTransportIdentityIntent for peer_shared signer key material.
 
 use topo::contracts::transport_identity_contract::TransportIdentityIntent;
-use topo::event_modules::peer_secret::{
-    PeerSecretEvent, SIGNER_KIND_PEER_SHARED, SIGNER_KIND_USER, SIGNER_KIND_WORKSPACE,
-};
+use topo::event_modules::peer_secret::PeerSecretEvent;
 use topo::event_modules::ParsedEvent;
-use topo::projection::contract::{ContextSnapshot, EmitCommand};
+use topo::projection::contract::EmitCommand;
 
-fn project(
-    recorded_by: &str,
-    event: &ParsedEvent,
-    local_peer_shared_projected: bool,
-) -> Vec<EmitCommand> {
-    let mut ctx = ContextSnapshot::default();
-    ctx.local_signer_peer_shared_projected = Some(local_peer_shared_projected);
-    let result =
-        topo::event_modules::peer_secret::project_pure(recorded_by, "test-event-id", event, &ctx);
+fn project(recorded_by: &str, event: &ParsedEvent) -> Vec<EmitCommand> {
+    let result = topo::event_modules::peer_secret::project_pure(
+        recorded_by,
+        "test-event-id",
+        event,
+        &Default::default(),
+    );
     result.emit_commands
 }
 
 #[test]
-fn peer_shared_signer_emits_install_intent() {
+fn peer_secret_emits_install_intent() {
     let signer_event_id = [5u8; 32];
     let event = ParsedEvent::PeerSecret(PeerSecretEvent {
         created_at_ms: 1000,
         signer_event_id,
-        signer_kind: SIGNER_KIND_PEER_SHARED,
         private_key_bytes: [42u8; 32],
     });
 
-    let cmds = project("test-peer", &event, true);
+    let cmds = project("test-peer", &event);
 
     assert_eq!(
         cmds.len(),
         1,
-        "peer_shared should emit exactly one transport intent"
+        "peer_secret should emit exactly one transport intent"
     );
     let intent = cmds
         .iter()
@@ -55,47 +49,14 @@ fn peer_shared_signer_emits_install_intent() {
 }
 
 #[test]
-fn workspace_signer_does_not_emit_intent() {
-    let event = ParsedEvent::PeerSecret(PeerSecretEvent {
-        created_at_ms: 1000,
-        signer_event_id: [1u8; 32],
-        signer_kind: SIGNER_KIND_WORKSPACE,
-        private_key_bytes: [2u8; 32],
-    });
-
-    let cmds = project("test-peer", &event, false);
-    assert!(
-        cmds.is_empty(),
-        "workspace signer should not emit projector commands"
-    );
-}
-
-#[test]
-fn user_signer_does_not_emit_intent() {
-    let event = ParsedEvent::PeerSecret(PeerSecretEvent {
-        created_at_ms: 1000,
-        signer_event_id: [3u8; 32],
-        signer_kind: SIGNER_KIND_USER,
-        private_key_bytes: [4u8; 32],
-    });
-
-    let cmds = project("test-peer", &event, false);
-    assert!(
-        cmds.is_empty(),
-        "user signer should not emit projector commands"
-    );
-}
-
-#[test]
 fn intent_carries_correct_recorded_by() {
     let event = ParsedEvent::PeerSecret(PeerSecretEvent {
         created_at_ms: 1000,
         signer_event_id: [9u8; 32],
-        signer_kind: SIGNER_KIND_PEER_SHARED,
         private_key_bytes: [10u8; 32],
     });
 
-    let cmds = project("specific-recorded-by-value", &event, true);
+    let cmds = project("specific-recorded-by-value", &event);
     let intent = cmds
         .iter()
         .find_map(|c| match c {
@@ -116,11 +77,10 @@ fn no_duplicate_intents_emitted() {
     let event = ParsedEvent::PeerSecret(PeerSecretEvent {
         created_at_ms: 1000,
         signer_event_id: [7u8; 32],
-        signer_kind: SIGNER_KIND_PEER_SHARED,
         private_key_bytes: [8u8; 32],
     });
 
-    let cmds = project("rb", &event, true);
+    let cmds = project("rb", &event);
     let intent_count = cmds
         .iter()
         .filter(|c| matches!(c, EmitCommand::ApplyTransportIdentityIntent { .. }))

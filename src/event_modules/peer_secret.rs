@@ -1,54 +1,39 @@
 use super::registry::{EventTypeMeta, ShareScope};
 use super::{EventError, ParsedEvent, EVENT_TYPE_PEER_SECRET};
 
-pub const SIGNER_KIND_WORKSPACE: u8 = 1;
-pub const SIGNER_KIND_USER: u8 = 2;
-pub const SIGNER_KIND_PEER_SHARED: u8 = 3;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerSecretEvent {
     pub created_at_ms: u64,
     pub signer_event_id: [u8; 32],
-    pub signer_kind: u8,
     pub private_key_bytes: [u8; 32],
 }
 
 impl super::Describe for PeerSecretEvent {
     fn human_fields(&self) -> Vec<(&'static str, String)> {
-        vec![
-            (
-                "signer_event_id",
-                super::short_id_b64(&self.signer_event_id),
-            ),
-            (
-                "signer_kind",
-                match self.signer_kind {
-                    SIGNER_KIND_WORKSPACE => "workspace".into(),
-                    SIGNER_KIND_USER => "user".into(),
-                    SIGNER_KIND_PEER_SHARED => "peer_shared".into(),
-                    k => format!("unknown({})", k),
-                },
-            ),
-        ]
+        vec![(
+            "signer_event_id",
+            super::short_id_b64(&self.signer_event_id),
+        )]
     }
 }
 
-/// Wire format (74 bytes fixed):
+/// Wire format (73 bytes fixed):
 /// [0]      type_code = 27
 /// [1..9]   created_at_ms (u64 LE)
-/// [9..41]  signer_event_id (32 bytes)
-/// [41]     signer_kind (u8: 1=workspace, 2=user, 3=peer_shared)
-/// [42..74] private_key_bytes (32 bytes)
+/// [9..41]  signer_event_id (32 bytes, dep: peer_shared)
+/// [41..73] private_key_bytes (32 bytes)
+pub const PEER_SECRET_WIRE_SIZE: usize = 73;
+
 pub fn parse_peer_secret(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    if blob.len() < 74 {
+    if blob.len() < PEER_SECRET_WIRE_SIZE {
         return Err(EventError::TooShort {
-            expected: 74,
+            expected: PEER_SECRET_WIRE_SIZE,
             actual: blob.len(),
         });
     }
-    if blob.len() > 74 {
+    if blob.len() > PEER_SECRET_WIRE_SIZE {
         return Err(EventError::TrailingData {
-            expected: 74,
+            expected: PEER_SECRET_WIRE_SIZE,
             actual: blob.len(),
         });
     }
@@ -64,20 +49,12 @@ pub fn parse_peer_secret(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     let mut signer_event_id = [0u8; 32];
     signer_event_id.copy_from_slice(&blob[9..41]);
 
-    let signer_kind = blob[41];
-    if !(1..=3).contains(&signer_kind) {
-        return Err(EventError::InvalidMetadata(
-            "signer_kind must be 1, 2, or 3",
-        ));
-    }
-
     let mut private_key_bytes = [0u8; 32];
-    private_key_bytes.copy_from_slice(&blob[42..74]);
+    private_key_bytes.copy_from_slice(&blob[41..73]);
 
     Ok(ParsedEvent::PeerSecret(PeerSecretEvent {
         created_at_ms,
         signer_event_id,
-        signer_kind,
         private_key_bytes,
     }))
 }
@@ -88,17 +65,10 @@ pub fn encode_peer_secret(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         _ => return Err(EventError::WrongVariant),
     };
 
-    if !(1..=3).contains(&e.signer_kind) {
-        return Err(EventError::InvalidMetadata(
-            "signer_kind must be 1, 2, or 3",
-        ));
-    }
-
-    let mut buf = Vec::with_capacity(74);
+    let mut buf = Vec::with_capacity(PEER_SECRET_WIRE_SIZE);
     buf.push(EVENT_TYPE_PEER_SECRET);
     buf.extend_from_slice(&e.created_at_ms.to_le_bytes());
     buf.extend_from_slice(&e.signer_event_id);
-    buf.push(e.signer_kind);
     buf.extend_from_slice(&e.private_key_bytes);
     Ok(buf)
 }
@@ -113,6 +83,19 @@ use rusqlite::Connection;
 pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "
+        CREATE TABLE IF NOT EXISTS peer_secrets (
+            recorded_by TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            signer_event_id TEXT NOT NULL,
+            private_key BLOB NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (recorded_by, event_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_peer_secrets_signer
+            ON peer_secrets(recorded_by, signer_event_id, created_at DESC, event_id DESC);
+
+        -- Legacy bootstrap-fallback cache table (non-event path).
+        -- Kept for compatibility with existing transport fallback behavior.
         CREATE TABLE IF NOT EXISTS local_signer_material (
             recorded_by TEXT NOT NULL,
             signer_event_id TEXT NOT NULL,
@@ -126,40 +109,13 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-pub fn build_projector_context(
-    conn: &Connection,
-    recorded_by: &str,
-    _event_id_b64: &str,
-    parsed: &ParsedEvent,
-) -> Result<ContextSnapshot, Box<dyn std::error::Error>> {
-    let mut ctx = ContextSnapshot::default();
-    if let ParsedEvent::PeerSecret(e) = parsed {
-        if e.signer_kind == SIGNER_KIND_PEER_SHARED {
-            let signer_b64 = event_id_to_base64(&e.signer_event_id);
-            let projected: bool = conn.query_row(
-                "SELECT EXISTS(
-                     SELECT 1 FROM peers_shared
-                     WHERE recorded_by = ?1 AND event_id = ?2
-                     LIMIT 1
-                 )",
-                rusqlite::params![recorded_by, signer_b64],
-                |row| row.get(0),
-            )?;
-            ctx.local_signer_peer_shared_projected = Some(projected);
-        }
-    }
-    Ok(ctx)
-}
-
-/// Pure projector: PeerSecret -> local_signer_material table.
-/// UPSERT by (recorded_by, signer_event_id): Delete existing + InsertOrIgnore.
-/// Emits ApplyTransportIdentityIntent(InstallPeerSharedIdentityFromSigner) when
-/// signer_kind == SIGNER_KIND_PEER_SHARED.
+/// Pure projector: PeerSecret -> peer_secrets table (one row per event).
+/// Always emits ApplyTransportIdentityIntent(InstallPeerSharedIdentityFromSigner).
 pub fn project_pure(
     recorded_by: &str,
-    _event_id_b64: &str,
+    event_id_b64: &str,
     parsed: &ParsedEvent,
-    ctx: &ContextSnapshot,
+    _ctx: &ContextSnapshot,
 ) -> ProjectorResult {
     let e = match parsed {
         ParsedEvent::PeerSecret(v) => v,
@@ -168,64 +124,47 @@ pub fn project_pure(
 
     let signer_eid_b64 = event_id_to_base64(&e.signer_event_id);
 
-    let ops = vec![
-        WriteOp::Delete {
-            table: "local_signer_material",
-            where_clause: vec![
-                ("recorded_by", SqlVal::Text(recorded_by.to_string())),
-                ("signer_event_id", SqlVal::Text(signer_eid_b64.clone())),
-            ],
-        },
-        WriteOp::InsertOrIgnore {
-            table: "local_signer_material",
+    ProjectorResult::valid_with_commands(
+        vec![WriteOp::InsertOrIgnore {
+            table: "peer_secrets",
             columns: vec![
                 "recorded_by",
+                "event_id",
                 "signer_event_id",
-                "signer_kind",
                 "private_key",
                 "created_at",
             ],
             values: vec![
                 SqlVal::Text(recorded_by.to_string()),
+                SqlVal::Text(event_id_b64.to_string()),
                 SqlVal::Text(signer_eid_b64),
-                SqlVal::Int(e.signer_kind as i64),
                 SqlVal::Blob(e.private_key_bytes.to_vec()),
                 SqlVal::Int(e.created_at_ms as i64),
             ],
-        },
-    ];
-
-    if e.signer_kind == SIGNER_KIND_PEER_SHARED
-        && ctx.local_signer_peer_shared_projected == Some(true)
-    {
-        ProjectorResult::valid_with_commands(
-            ops,
-            vec![EmitCommand::ApplyTransportIdentityIntent {
-                intent: TransportIdentityIntent::InstallPeerSharedIdentityFromSigner {
-                    recorded_by: recorded_by.to_string(),
-                    signer_event_id: e.signer_event_id,
-                },
-            }],
-        )
-    } else {
-        ProjectorResult::valid(ops)
-    }
+        }],
+        vec![EmitCommand::ApplyTransportIdentityIntent {
+            intent: TransportIdentityIntent::InstallPeerSharedIdentityFromSigner {
+                recorded_by: recorded_by.to_string(),
+                signer_event_id: e.signer_event_id,
+            },
+        }],
+    )
 }
 
 pub static PEER_SECRET_META: EventTypeMeta = EventTypeMeta {
     type_code: EVENT_TYPE_PEER_SECRET,
     type_name: "peer_secret",
-    projection_table: "local_signer_material",
+    projection_table: "peer_secrets",
     share_scope: ShareScope::Local,
-    dep_fields: &[],
-    dep_field_type_codes: &[],
+    dep_fields: &["signer_event_id"],
+    dep_field_type_codes: &[&[16]],
     signer_required: false,
     signature_byte_len: 0,
     encryptable: false,
     parse: parse_peer_secret,
     encode: encode_peer_secret,
     projector: project_pure,
-    context_loader: build_projector_context,
+    context_loader: crate::event_modules::registry::load_empty_context,
 };
 
 #[cfg(test)]
@@ -234,65 +173,17 @@ mod tests {
     use crate::event_modules::{encode_event, parse_event};
 
     #[test]
-    fn test_roundtrip_workspace() {
+    fn test_roundtrip_peer_secret() {
         let e = PeerSecretEvent {
             created_at_ms: 1234567890123,
             signer_event_id: [1u8; 32],
-            signer_kind: SIGNER_KIND_WORKSPACE,
             private_key_bytes: [2u8; 32],
         };
         let event = ParsedEvent::PeerSecret(e);
         let blob = encode_event(&event).unwrap();
-        assert_eq!(blob.len(), 74);
+        assert_eq!(blob.len(), PEER_SECRET_WIRE_SIZE);
         let parsed = parse_event(&blob).unwrap();
         assert_eq!(parsed, event);
-    }
-
-    #[test]
-    fn test_roundtrip_user() {
-        let e = PeerSecretEvent {
-            created_at_ms: 9876543210000,
-            signer_event_id: [3u8; 32],
-            signer_kind: SIGNER_KIND_USER,
-            private_key_bytes: [4u8; 32],
-        };
-        let event = ParsedEvent::PeerSecret(e);
-        let blob = encode_event(&event).unwrap();
-        assert_eq!(blob.len(), 74);
-        let parsed = parse_event(&blob).unwrap();
-        assert_eq!(parsed, event);
-    }
-
-    #[test]
-    fn test_roundtrip_peer_shared() {
-        let e = PeerSecretEvent {
-            created_at_ms: 5555555555555,
-            signer_event_id: [5u8; 32],
-            signer_kind: SIGNER_KIND_PEER_SHARED,
-            private_key_bytes: [6u8; 32],
-        };
-        let event = ParsedEvent::PeerSecret(e);
-        let blob = encode_event(&event).unwrap();
-        assert_eq!(blob.len(), 74);
-        let parsed = parse_event(&blob).unwrap();
-        assert_eq!(parsed, event);
-    }
-
-    #[test]
-    fn test_reject_invalid_signer_kind() {
-        let mut blob = vec![EVENT_TYPE_PEER_SECRET];
-        blob.extend_from_slice(&0u64.to_le_bytes());
-        blob.extend_from_slice(&[0u8; 32]); // signer_event_id
-        blob.push(0); // invalid signer_kind
-        blob.extend_from_slice(&[0u8; 32]); // private_key_bytes
-        assert!(parse_event(&blob).is_err());
-
-        let mut blob2 = vec![EVENT_TYPE_PEER_SECRET];
-        blob2.extend_from_slice(&0u64.to_le_bytes());
-        blob2.extend_from_slice(&[0u8; 32]);
-        blob2.push(4); // invalid signer_kind
-        blob2.extend_from_slice(&[0u8; 32]);
-        assert!(parse_event(&blob2).is_err());
     }
 
     #[test]
@@ -300,7 +191,6 @@ mod tests {
         let e = PeerSecretEvent {
             created_at_ms: 100,
             signer_event_id: [0u8; 32],
-            signer_kind: SIGNER_KIND_WORKSPACE,
             private_key_bytes: [0u8; 32],
         };
         let event = ParsedEvent::PeerSecret(e);
@@ -310,8 +200,8 @@ mod tests {
         assert!(matches!(
             err,
             EventError::TrailingData {
-                expected: 74,
-                actual: 75
+                expected: PEER_SECRET_WIRE_SIZE,
+                actual: 74
             }
         ));
     }
@@ -320,6 +210,12 @@ mod tests {
     fn test_reject_short_data() {
         let blob = vec![EVENT_TYPE_PEER_SECRET; 10];
         let err = parse_event(&blob).unwrap_err();
-        assert!(matches!(err, EventError::TooShort { expected: 74, .. }));
+        assert!(matches!(
+            err,
+            EventError::TooShort {
+                expected: PEER_SECRET_WIRE_SIZE,
+                ..
+            }
+        ));
     }
 }

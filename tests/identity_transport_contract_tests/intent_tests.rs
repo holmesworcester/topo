@@ -49,13 +49,13 @@ fn concrete_adapter_install_peer_shared_from_signer() {
     let adapter = ConcreteTransportIdentityAdapter;
     let recorded_by = "test-peer";
 
-    // Store a peer_shared key in local_signer_material
+    // Store a peer_shared key in peer_secrets
     let signer_event_id = [5u8; 32];
     let signer_eid_b64 = topo::crypto::event_id_to_base64(&signer_event_id);
     let private_key = [42u8; 32];
     conn.execute(
-        "INSERT INTO local_signer_material (recorded_by, signer_event_id, signer_kind, private_key, created_at)
-         VALUES (?1, ?2, 3, ?3, 0)",
+        "INSERT INTO peer_secrets (recorded_by, event_id, signer_event_id, private_key, created_at)
+         VALUES (?1, ?2, ?2, ?3, 0)",
         rusqlite::params![recorded_by, signer_eid_b64, private_key.to_vec()],
     )
     .unwrap();
@@ -109,8 +109,8 @@ fn concrete_adapter_invalid_key_material_error() {
 
     // Insert a row with wrong key length (16 bytes instead of 32)
     conn.execute(
-        "INSERT INTO local_signer_material (recorded_by, signer_event_id, signer_kind, private_key, created_at)
-         VALUES (?1, ?2, 3, ?3, 0)",
+        "INSERT INTO peer_secrets (recorded_by, event_id, signer_event_id, private_key, created_at)
+         VALUES (?1, ?2, ?2, ?3, 0)",
         rusqlite::params![recorded_by, signer_eid_b64, vec![0u8; 16]],
     )
     .unwrap();

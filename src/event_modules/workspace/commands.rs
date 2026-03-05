@@ -17,9 +17,8 @@ use rusqlite::Connection;
 use super::identity_ops::{self as ops, InviteBootstrapContext, JoinChain, LinkChain};
 use crate::crypto::EventId;
 use crate::event_modules::{
-    peer_secret::{PeerSecretEvent, SIGNER_KIND_PEER_SHARED},
-    AdminEvent, DeviceInviteEvent, InviteAcceptedEvent, ParsedEvent, PeerSharedEvent, UserEvent,
-    UserInviteEvent, WorkspaceEvent,
+    peer_secret::PeerSecretEvent, AdminEvent, DeviceInviteEvent, InviteAcceptedEvent, ParsedEvent,
+    PeerSharedEvent, UserEvent, UserInviteEvent, WorkspaceEvent,
 };
 use crate::projection::apply::project_one;
 use crate::projection::create::{
@@ -35,18 +34,16 @@ fn now_ms() -> u64 {
 }
 
 /// Emit a peer_secret event for the given signer identity.
-/// The event is projected into `local_signer_material` via the projector.
+/// The event is projected into `peer_secrets` via the projector.
 fn emit_peer_secret(
     db: &Connection,
     recorded_by: &str,
     signer_event_id: &EventId,
-    signer_kind: u8,
     signing_key: &SigningKey,
 ) -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
     let evt = ParsedEvent::PeerSecret(PeerSecretEvent {
         created_at_ms: now_ms(),
         signer_event_id: *signer_event_id,
-        signer_kind,
         private_key_bytes: signing_key.to_bytes(),
     });
     event_id_or_blocked(create_event_synchronous(db, recorded_by, &evt))
@@ -229,13 +226,7 @@ pub fn create_workspace(
 
     // 11. Emit peer_secret for peer_shared signer key only.
     // Transport identity is already installed, so all writes use derived_peer_id.
-    emit_peer_secret(
-        db,
-        &derived_peer_id,
-        &psf_eid,
-        SIGNER_KIND_PEER_SHARED,
-        &peer_shared_key,
-    )?;
+    emit_peer_secret(db, &derived_peer_id, &psf_eid, &peer_shared_key)?;
 
     // 12. Seed deterministic local content-key material.
     let _ = ops::ensure_content_key_for_peer(db, &derived_peer_id)?;
@@ -371,7 +362,6 @@ pub fn persist_join_peer_secret(
         db,
         recorded_by,
         &join.peer_shared_event_id,
-        SIGNER_KIND_PEER_SHARED,
         &join.peer_shared_key,
     )?;
     Ok(())
@@ -445,7 +435,6 @@ pub fn persist_link_peer_secret(
         db,
         recorded_by,
         &link.peer_shared_event_id,
-        SIGNER_KIND_PEER_SHARED,
         &link.peer_shared_key,
     )?;
     Ok(())
@@ -539,38 +528,7 @@ pub fn create_device_link_invite(
     })
 }
 
-// ─── 6. Key loading helpers ───
-
-/// Load workspace signing key from local signer material.
-///
-/// Returns the workspace event ID and signing key, or None if not found.
-pub fn load_workspace_signing_key(
-    db: &Connection,
-    recorded_by: &str,
-) -> Result<Option<(EventId, SigningKey)>, Box<dyn std::error::Error + Send + Sync>> {
-    use rusqlite::OptionalExtension;
-    if let Some((eid_b64, key_bytes)) = db
-        .query_row(
-            "SELECT signer_event_id, private_key FROM local_signer_material
-             WHERE recorded_by = ?1 AND signer_kind = 1
-             LIMIT 1",
-            rusqlite::params![recorded_by],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
-        )
-        .optional()?
-    {
-        let key_arr: [u8; 32] = key_bytes
-            .try_into()
-            .map_err(|_| "bad signing key length in local signer table")?;
-        let signing_key = SigningKey::from_bytes(&key_arr);
-        let eid =
-            crate::crypto::event_id_from_base64(&eid_b64).ok_or("bad workspace signer event_id")?;
-        return Ok(Some((eid, signing_key)));
-    }
-    Ok(None)
-}
-
-// ─── 7. Test-only helpers ───
+// ─── 6. Test-only helpers ───
 
 /// Create a user invite without bootstrap context.
 /// Returns InviteData directly without formatting an invite link.

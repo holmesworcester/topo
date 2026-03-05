@@ -201,13 +201,6 @@ pub fn load_local_peer_signer_pub(
     peer_shared::load_local_peer_signer(db, recorded_by).map_err(|e| ServiceError(e.to_string()))
 }
 
-pub fn load_local_user_key(
-    db: &rusqlite::Connection,
-    recorded_by: &str,
-) -> ServiceResult<Option<(EventId, SigningKey)>> {
-    peer_shared::load_local_user_key(db, recorded_by).map_err(|e| ServiceError(e.to_string()))
-}
-
 // ---------------------------------------------------------------------------
 // Service functions (transport-level, not event-module domain)
 // ---------------------------------------------------------------------------

@@ -12,12 +12,11 @@ use crate::crypto::{event_id_from_base64, EventId};
 fn decode_signing_key(key_bytes: Vec<u8>) -> Result<SigningKey, String> {
     let key_arr: [u8; 32] = key_bytes
         .try_into()
-        .map_err(|_| "bad signing key length in local signer table".to_string())?;
+        .map_err(|_| "bad signing key length in peer_secrets".to_string())?;
     Ok(SigningKey::from_bytes(&key_arr))
 }
 
-/// Load the local peer signer (signer_kind=3) from local_signer_material.
-/// Signer material is local-first and may exist before peer_shared projection.
+/// Load the local peer signer from peer_secrets.
 pub fn load_local_peer_signer(
     db: &Connection,
     recorded_by: &str,
@@ -25,8 +24,9 @@ pub fn load_local_peer_signer(
     if let Some((eid_b64, key_bytes)) = db
         .query_row(
             "SELECT signer_event_id, private_key
-             FROM local_signer_material
-             WHERE recorded_by = ?1 AND signer_kind = 3
+             FROM peer_secrets
+             WHERE recorded_by = ?1
+             ORDER BY created_at DESC, event_id DESC
              LIMIT 1",
             rusqlite::params![recorded_by],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
@@ -90,29 +90,6 @@ pub fn resolve_user_event_id(
     } else {
         Err("signer event is not peer_shared".into())
     }
-}
-
-/// Load the local user key (signer_kind=2) from local_signer_material.
-pub fn load_local_user_key(
-    db: &Connection,
-    recorded_by: &str,
-) -> Result<Option<(EventId, SigningKey)>, Box<dyn std::error::Error + Send + Sync>> {
-    if let Some((eid_b64, key_bytes)) = db
-        .query_row(
-            "SELECT signer_event_id, private_key FROM local_signer_material
-             WHERE recorded_by = ?1 AND signer_kind = 2
-             LIMIT 1",
-            rusqlite::params![recorded_by],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
-        )
-        .optional()?
-    {
-        let signing_key = decode_signing_key(key_bytes)?;
-        let eid = event_id_from_base64(&eid_b64)
-            .ok_or_else(|| "bad local user key event_id".to_string())?;
-        return Ok(Some((eid, signing_key)));
-    }
-    Ok(None)
 }
 
 // ---------------------------------------------------------------------------

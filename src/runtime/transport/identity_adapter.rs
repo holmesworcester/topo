@@ -41,13 +41,14 @@ impl TransportIdentityAdapter for ConcreteTransportIdentityAdapter {
                 recorded_by,
                 signer_event_id,
             } => {
-                // Load peer_shared private key from local_signer_material
+                // Load peer_shared private key from peer_secrets
                 let signer_eid_b64 = crate::crypto::event_id_to_base64(&signer_event_id);
                 let key_bytes: Option<Vec<u8>> = conn
                     .query_row(
-                        "SELECT private_key FROM local_signer_material
-                         WHERE recorded_by = ?1 AND signer_kind = 3
-                         AND signer_event_id = ?2
+                        "SELECT private_key FROM peer_secrets
+                         WHERE recorded_by = ?1
+                           AND signer_event_id = ?2
+                         ORDER BY created_at DESC, event_id DESC
                          LIMIT 1",
                         rusqlite::params![recorded_by, signer_eid_b64],
                         |row| row.get(0),

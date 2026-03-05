@@ -604,9 +604,8 @@ fn wait_for_local_peer_signer(db: &str, timeout: Duration) {
                     .query_row(
                         "SELECT EXISTS(
                              SELECT 1
-                             FROM local_signer_material
+                             FROM peer_secrets
                              WHERE recorded_by = ?1
-                               AND signer_kind = 3
                              LIMIT 1
                          )",
                         rusqlite::params![tenant_id],
@@ -628,7 +627,7 @@ fn wait_for_local_peer_signer(db: &str, timeout: Duration) {
                 .unwrap_or(0);
             let signer_rows: i64 = conn
                 .query_row(
-                    "SELECT COUNT(*) FROM local_signer_material WHERE signer_kind = 3",
+                    "SELECT COUNT(*) FROM peer_secrets",
                     [],
                     |row| row.get(0),
                 )
@@ -657,7 +656,7 @@ fn wait_for_local_peer_signer(db: &str, timeout: Duration) {
                 )
                 .ok();
             format!(
-                "invites_accepted={}, signer_kind3_rows={}, signer_events={}, signer_rejects={}, last_tenant={}",
+                "invites_accepted={}, peer_secret_rows={}, signer_events={}, signer_rejects={}, last_tenant={}",
                 invites,
                 signer_rows,
                 signer_events,
