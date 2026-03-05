@@ -49,6 +49,9 @@ pub enum EmitCommand {
     ApplyTransportIdentityIntent {
         intent: crate::contracts::transport_identity_contract::TransportIdentityIntent,
     },
+    /// Emit a canonical deterministic event blob through the normal event
+    /// pipeline (events + recorded_events + project_one).
+    EmitDeterministicBlob { blob: Vec<u8> },
 }
 
 /// The pure projector contract: everything a projector returns.
@@ -164,6 +167,8 @@ pub struct ContextSnapshot {
 
     /// For SecretShared: whether the recipient has been removed.
     pub recipient_removed: bool,
+    /// For SecretSharedUnwrap: DH-unwrapped key material, if available.
+    pub unwrapped_secret_material: Option<UnwrappedSecretMaterial>,
 
     /// For FileSlice: descriptor info (event_id, signer_event_id) for the file_id.
     /// Empty vec means no descriptor exists yet (guard-block).
@@ -187,6 +192,15 @@ pub struct ContextSnapshot {
     /// Used to avoid writing bootstrap trust rows that are already superseded by
     /// steady-state peer trust.
     pub bootstrap_spki_already_peer_shared: bool,
+}
+
+/// Unwrapped symmetric key material derived from SecretSharedUnwrap.
+#[derive(Debug, Clone)]
+pub struct UnwrappedSecretMaterial {
+    pub key_bytes: [u8; 32],
+    /// If unwrap used pending invite key material, emit a deterministic
+    /// local_signer_secret tombstone for this signer_event_id.
+    pub clear_invite_signer_event_id: Option<[u8; 32]>,
 }
 
 /// Bootstrap context read from the `bootstrap_context` table, passed to

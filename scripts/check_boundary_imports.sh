@@ -239,7 +239,6 @@ check_required 'pub fn join_workspace_as_new_user' src/event_modules/workspace/c
 check_required 'pub fn add_device_to_workspace' src/event_modules/workspace/commands.rs
 check_required 'pub fn create_user_invite' src/event_modules/workspace/commands.rs
 check_required 'pub fn create_device_link_invite' src/event_modules/workspace/commands.rs
-check_required 'pub fn retry_pending_invite_content_key_unwraps' src/event_modules/workspace/commands.rs
 
 # workspace DB-path command wrappers are implemented in commands_api.rs and
 # re-exported from workspace/commands.rs for stable callsites.

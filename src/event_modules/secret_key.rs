@@ -1,6 +1,7 @@
 use super::layout::common::COMMON_HEADER_BYTES;
 use super::registry::{EventTypeMeta, ShareScope};
 use super::{EventError, ParsedEvent, EVENT_TYPE_SECRET_KEY};
+use crate::crypto::EventId;
 
 // ─── Layout (owned by this module) ───
 
@@ -65,6 +66,33 @@ pub fn encode_secret_key(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     buf.extend_from_slice(&sk.created_at_ms.to_le_bytes());
     buf.extend_from_slice(&sk.key_bytes);
     Ok(buf)
+}
+
+/// Deterministic timestamp derivation for key materialized SecretKey events.
+pub fn deterministic_secret_key_created_at_ms(key_bytes: &[u8; 32]) -> u64 {
+    use blake2::digest::consts::U8;
+    use blake2::{Blake2b, Digest};
+
+    let mut hasher = Blake2b::<U8>::new();
+    hasher.update(b"poc7-content-key-created-at-v1");
+    hasher.update(key_bytes);
+    let digest = hasher.finalize();
+    let mut out = [0u8; 8];
+    out.copy_from_slice(&digest[..8]);
+    u64::from_le_bytes(out)
+}
+
+pub fn deterministic_secret_key_event(key_bytes: [u8; 32]) -> ParsedEvent {
+    ParsedEvent::SecretKey(SecretKeyEvent {
+        created_at_ms: deterministic_secret_key_created_at_ms(&key_bytes),
+        key_bytes,
+    })
+}
+
+pub fn deterministic_secret_key_event_id(key_bytes: &[u8; 32]) -> EventId {
+    let event = deterministic_secret_key_event(*key_bytes);
+    let blob = super::encode_event(&event).expect("deterministic secret_key encoding should succeed");
+    crate::crypto::hash_event(&blob)
 }
 
 // === Projector (event-module locality) ===

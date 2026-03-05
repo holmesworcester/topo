@@ -7,14 +7,13 @@
 use ed25519_dalek::SigningKey;
 use rusqlite::Connection;
 
-use crate::crypto::{event_id_from_base64, event_id_to_base64, hash_event, EventId};
+use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
 use crate::event_modules::*;
 use crate::projection::create::{
     create_event_synchronous, create_signed_event_synchronous, project_event,
     store_signed_event_only,
 };
-use crate::projection::encrypted::{unwrap_key_from_sender, wrap_key_for_recipient};
-use crate::projection::signer::{resolve_signer_key, SignerResolution};
+use crate::projection::encrypted::wrap_key_for_recipient;
 use crate::transport::{extract_spki_fingerprint, generate_self_signed_cert_from_signing_key};
 
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -29,48 +28,18 @@ pub(crate) fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-/// Deterministic timestamp derivation for wrapped content keys.
-///
-/// This keeps SecretKey event IDs stable across inviter/invitee when they
-/// materialize the same 32-byte key bytes.
-fn deterministic_content_key_created_at_ms(key_bytes: &[u8; 32]) -> u64 {
-    use blake2::digest::consts::U8;
-    use blake2::{Blake2b, Digest};
-
-    let mut hasher = Blake2b::<U8>::new();
-    hasher.update(b"poc7-content-key-created-at-v1");
-    hasher.update(key_bytes);
-    let digest = hasher.finalize();
-    let mut out = [0u8; 8];
-    out.copy_from_slice(&digest[..8]);
-    u64::from_le_bytes(out)
-}
-
 fn create_deterministic_secret_key_event(
     conn: &Connection,
     recorded_by: &str,
     key_bytes: [u8; 32],
 ) -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
-    let expected = deterministic_secret_key_event_id(&key_bytes)?;
-    let sk_evt = ParsedEvent::SecretKey(SecretKeyEvent {
-        created_at_ms: deterministic_content_key_created_at_ms(&key_bytes),
-        key_bytes,
-    });
+    let expected = crate::event_modules::secret_key::deterministic_secret_key_event_id(&key_bytes);
+    let sk_evt = crate::event_modules::secret_key::deterministic_secret_key_event(key_bytes);
     let created = create_event_synchronous(conn, recorded_by, &sk_evt)?;
     if created != expected {
         return Err("secret_key event_id mismatch for deterministic key material".into());
     }
     Ok(created)
-}
-
-fn deterministic_secret_key_event_id(
-    key_bytes: &[u8; 32],
-) -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
-    let sk_evt = ParsedEvent::SecretKey(SecretKeyEvent {
-        created_at_ms: deterministic_content_key_created_at_ms(&key_bytes),
-        key_bytes: *key_bytes,
-    });
-    Ok(hash_event(&encode_event(&sk_evt)?))
 }
 
 // ---------------------------------------------------------------------------
@@ -201,60 +170,6 @@ pub(crate) fn wrap_content_key_for_invite(
     Ok(())
 }
 
-/// After accepting an invite, look up any SecretShared events targeted at
-/// the invite_event_id, unwrap using the invite private key and the sender's
-/// public key, and create a local SecretKey event for the decrypted content key.
-pub(crate) fn unwrap_content_key_from_invite(
-    conn: &Connection,
-    recorded_by: &str,
-    invite_key: &SigningKey,
-    invite_event_id: &EventId,
-) -> Result<Option<EventId>, Box<dyn std::error::Error + Send + Sync>> {
-    let mut stmt = conn.prepare(
-        "SELECT e.blob FROM events e
-         INNER JOIN recorded_events re ON re.event_id = e.event_id
-         WHERE re.peer_id = ?1 AND e.event_type = ?2",
-    )?;
-    let mut rows = stmt.query(rusqlite::params![recorded_by, "secret_shared"])?;
-
-    while let Some(row) = rows.next()? {
-        let blob: Vec<u8> = row.get(0)?;
-        let parsed = match parse_event(&blob) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        let ss = match parsed {
-            ParsedEvent::SecretShared(ss) => ss,
-            _ => continue,
-        };
-        if ss.recipient_event_id != *invite_event_id {
-            continue;
-        }
-
-        let sender_key = match resolve_signer_key(conn, recorded_by, ss.signer_type, &ss.signed_by)
-        {
-            Ok(SignerResolution::Found(k)) => k,
-            Ok(_) => continue,
-            Err(_) => continue,
-        };
-        let sender_pub = match ed25519_dalek::VerifyingKey::from_bytes(&sender_key) {
-            Ok(vk) => vk,
-            Err(_) => continue,
-        };
-
-        let plaintext_key = unwrap_key_from_sender(invite_key, &sender_pub, &ss.wrapped_key);
-        let expected_key_event_id = deterministic_secret_key_event_id(&plaintext_key)?;
-        if expected_key_event_id != ss.key_event_id {
-            continue;
-        }
-        let local_key_event_id =
-            create_deterministic_secret_key_event(conn, recorded_by, plaintext_key)?;
-        return Ok(Some(local_key_event_id));
-    }
-
-    Ok(None)
-}
-
 /// Persist invite key material so content-key unwrap can be retried after
 /// late-arriving SecretShared prerequisites.
 pub(crate) fn store_pending_invite_unwrap_key(
@@ -268,22 +183,6 @@ pub(crate) fn store_pending_invite_unwrap_key(
         signer_event_id: *invite_event_id,
         signer_kind: SIGNER_KIND_PENDING_INVITE_UNWRAP,
         private_key_bytes: invite_key.to_bytes(),
-    });
-    let _ = create_event_synchronous(conn, recorded_by, &evt)?;
-    Ok(())
-}
-
-pub(crate) fn clear_pending_invite_unwrap_key(
-    conn: &Connection,
-    recorded_by: &str,
-    invite_event_id: &EventId,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // signer_kind=4 with zero key bytes projects as a delete tombstone.
-    let evt = ParsedEvent::LocalSignerSecret(LocalSignerSecretEvent {
-        created_at_ms: now_ms(),
-        signer_event_id: *invite_event_id,
-        signer_kind: SIGNER_KIND_PENDING_INVITE_UNWRAP,
-        private_key_bytes: [0u8; 32],
     });
     let _ = create_event_synchronous(conn, recorded_by, &evt)?;
     Ok(())

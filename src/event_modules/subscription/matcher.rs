@@ -408,6 +408,8 @@ fn parsed_event_type_name(parsed: &ParsedEvent) -> &'static str {
         ParsedEvent::FileSlice(_) => "file_slice",
         ParsedEvent::BenchDep(_) => "bench_dep",
         ParsedEvent::LocalSignerSecret(_) => "local_signer_secret",
+        ParsedEvent::LocalKey(_) => "local_key",
+        ParsedEvent::SecretSharedUnwrap(_) => "secret_shared_unwrap",
     }
 }
 

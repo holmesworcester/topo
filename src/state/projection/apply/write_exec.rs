@@ -139,6 +139,9 @@ pub(crate) fn execute_emit_commands(
                     .apply_intent(conn, intent.clone())
                     .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
             }
+            EmitCommand::EmitDeterministicBlob { blob } => {
+                let _ = crate::projection::emit::emit_deterministic_blob(conn, recorded_by, blob)?;
+            }
         }
     }
     Ok(())

@@ -9,10 +9,9 @@ mod tests {
     use crate::harness::fixtures::*;
     use topo::event_modules::secret_shared::{project_pure, SecretSharedEvent};
     use topo::event_modules::ParsedEvent;
+    use topo::projection::contract::EmitCommand;
 
     const PEER: &str = "peer_alice";
-    const EVENT_ID: &str = "ss_event_1";
-
     fn make_secret_shared() -> ParsedEvent {
         ParsedEvent::SecretShared(SecretSharedEvent {
             created_at_ms: 6000,
@@ -31,11 +30,14 @@ mod tests {
     fn test_secret_shared_valid() {
         let parsed = make_secret_shared();
         let ctx = empty_ctx();
+        let event_id = b64(&[9u8; 32]);
 
-        let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
+        let result = project_pure(PEER, &event_id, &parsed, &ctx);
         assert_valid(&result);
         assert_writes_to_table(&result, "secret_shared");
-        assert_no_commands(&result);
+        assert_emits_command(&result, "EmitDeterministicBlob", |cmd| {
+            matches!(cmd, EmitCommand::EmitDeterministicBlob { .. })
+        });
     }
 
     // ── SPEC_REMOVAL_EXCLUSION_01: break ──
@@ -44,8 +46,9 @@ mod tests {
     fn test_secret_shared_rejects_removed_recipient() {
         let parsed = make_secret_shared();
         let ctx = ctx_with_recipient_removed();
+        let event_id = b64(&[9u8; 32]);
 
-        let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
+        let result = project_pure(PEER, &event_id, &parsed, &ctx);
         assert_reject_contains(&result, "has been removed");
     }
 }

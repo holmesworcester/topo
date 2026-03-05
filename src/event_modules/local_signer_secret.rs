@@ -99,6 +99,28 @@ pub fn encode_local_signer_secret(event: &ParsedEvent) -> Result<Vec<u8>, EventE
     Ok(buf)
 }
 
+fn deterministic_pending_invite_tombstone_created_at_ms(signer_event_id: &[u8; 32]) -> u64 {
+    use blake2::digest::consts::U8;
+    use blake2::{Blake2b, Digest};
+
+    let mut hasher = Blake2b::<U8>::new();
+    hasher.update(b"poc7-pending-invite-tombstone-created-at-v1");
+    hasher.update(signer_event_id);
+    let digest = hasher.finalize();
+    let mut out = [0u8; 8];
+    out.copy_from_slice(&digest[..8]);
+    u64::from_le_bytes(out)
+}
+
+pub fn deterministic_pending_invite_tombstone_event(signer_event_id: [u8; 32]) -> ParsedEvent {
+    ParsedEvent::LocalSignerSecret(LocalSignerSecretEvent {
+        created_at_ms: deterministic_pending_invite_tombstone_created_at_ms(&signer_event_id),
+        signer_event_id,
+        signer_kind: SIGNER_KIND_PENDING_INVITE_UNWRAP,
+        private_key_bytes: [0u8; 32],
+    })
+}
+
 // === Projector (event-module locality) ===
 
 use crate::contracts::transport_identity_contract::TransportIdentityIntent;
@@ -169,18 +191,36 @@ pub fn project_pure(
         });
     }
 
+    let mut commands = Vec::new();
+    if !is_pending_tombstone {
+        let local_key_event =
+            crate::event_modules::local_key::deterministic_local_key_event(e.signer_event_id);
+        let local_key_blob = match crate::event_modules::encode_event(&local_key_event) {
+            Ok(v) => v,
+            Err(err) => {
+                return ProjectorResult::reject(format!(
+                    "failed to encode deterministic local_key event: {}",
+                    err
+                ))
+            }
+        };
+        commands.push(EmitCommand::EmitDeterministicBlob {
+            blob: local_key_blob,
+        });
+    }
     if e.signer_kind == SIGNER_KIND_PEER_SHARED {
-        ProjectorResult::valid_with_commands(
-            ops,
-            vec![EmitCommand::ApplyTransportIdentityIntent {
-                intent: TransportIdentityIntent::InstallPeerSharedIdentityFromSigner {
-                    recorded_by: recorded_by.to_string(),
-                    signer_event_id: e.signer_event_id,
-                },
-            }],
-        )
-    } else {
+        commands.push(EmitCommand::ApplyTransportIdentityIntent {
+            intent: TransportIdentityIntent::InstallPeerSharedIdentityFromSigner {
+                recorded_by: recorded_by.to_string(),
+                signer_event_id: e.signer_event_id,
+            },
+        });
+    }
+
+    if commands.is_empty() {
         ProjectorResult::valid(ops)
+    } else {
+        ProjectorResult::valid_with_commands(ops, commands)
     }
 }
 

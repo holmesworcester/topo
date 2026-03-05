@@ -5,6 +5,7 @@ pub mod encrypted;
 pub mod file_slice;
 pub mod invite_accepted;
 pub mod layout;
+pub mod local_key;
 pub mod local_signer_secret;
 pub mod message;
 pub mod message_attachment;
@@ -15,6 +16,7 @@ pub mod reaction;
 pub mod registry;
 pub mod secret_key;
 pub mod secret_shared;
+pub mod secret_shared_unwrap;
 pub mod user;
 pub mod user_invite;
 pub mod user_removed;
@@ -54,6 +56,7 @@ pub use device_invite::DeviceInviteEvent;
 pub use encrypted::EncryptedEvent;
 pub use file_slice::FileSliceEvent;
 pub use invite_accepted::InviteAcceptedEvent;
+pub use local_key::LocalKeyEvent;
 pub use local_signer_secret::LocalSignerSecretEvent;
 pub use message::MessageEvent;
 pub use message_attachment::MessageAttachmentEvent;
@@ -64,6 +67,7 @@ pub use reaction::ReactionEvent;
 pub use registry::{EventRegistry, EventTypeMeta, ShareScope};
 pub use secret_key::SecretKeyEvent;
 pub use secret_shared::SecretSharedEvent;
+pub use secret_shared_unwrap::SecretSharedUnwrapEvent;
 pub use user::UserEvent;
 pub use user_invite::UserInviteEvent;
 pub use user_removed::UserRemovedEvent;
@@ -88,6 +92,8 @@ pub const EVENT_TYPE_MESSAGE_ATTACHMENT: u8 = 24;
 pub const EVENT_TYPE_FILE_SLICE: u8 = 25;
 pub const EVENT_TYPE_BENCH_DEP: u8 = 26;
 pub const EVENT_TYPE_LOCAL_SIGNER_SECRET: u8 = 27;
+pub const EVENT_TYPE_LOCAL_KEY: u8 = 28;
+pub const EVENT_TYPE_SECRET_SHARED_UNWRAP: u8 = 29;
 
 /// Max event blob size: 1 MiB
 pub const EVENT_MAX_BLOB_BYTES: usize = 1024 * 1024;
@@ -109,6 +115,8 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     secret_key::ensure_schema(conn)?;
     secret_shared::ensure_schema(conn)?;
     local_signer_secret::ensure_schema(conn)?;
+    local_key::ensure_schema(conn)?;
+    secret_shared_unwrap::ensure_schema(conn)?;
     subscription::ensure_schema(conn)?;
     Ok(())
 }
@@ -134,6 +142,8 @@ pub enum ParsedEvent {
     FileSlice(FileSliceEvent),
     BenchDep(BenchDepEvent),
     LocalSignerSecret(LocalSignerSecretEvent),
+    LocalKey(LocalKeyEvent),
+    SecretSharedUnwrap(SecretSharedUnwrapEvent),
 }
 
 impl ParsedEvent {
@@ -158,6 +168,8 @@ impl ParsedEvent {
             ParsedEvent::FileSlice(f) => f.created_at_ms,
             ParsedEvent::BenchDep(b) => b.created_at_ms,
             ParsedEvent::LocalSignerSecret(l) => l.created_at_ms,
+            ParsedEvent::LocalKey(k) => k.created_at_ms,
+            ParsedEvent::SecretSharedUnwrap(s) => s.created_at_ms,
         }
     }
 
@@ -210,6 +222,14 @@ impl ParsedEvent {
                     vec![("signer_event_id", l.signer_event_id)]
                 }
             }
+            ParsedEvent::LocalKey(k) => vec![("recipient_event_id", k.recipient_event_id)],
+            ParsedEvent::SecretSharedUnwrap(s) => vec![
+                ("secret_shared_event_id", s.secret_shared_event_id),
+                (
+                    "local_key_event_id",
+                    local_key::deterministic_local_key_event_id(&s.recipient_event_id),
+                ),
+            ],
         }
     }
 
@@ -234,6 +254,8 @@ impl ParsedEvent {
             ParsedEvent::FileSlice(_) => EVENT_TYPE_FILE_SLICE,
             ParsedEvent::BenchDep(_) => EVENT_TYPE_BENCH_DEP,
             ParsedEvent::LocalSignerSecret(_) => EVENT_TYPE_LOCAL_SIGNER_SECRET,
+            ParsedEvent::LocalKey(_) => EVENT_TYPE_LOCAL_KEY,
+            ParsedEvent::SecretSharedUnwrap(_) => EVENT_TYPE_SECRET_SHARED_UNWRAP,
         }
     }
 
@@ -259,7 +281,9 @@ impl ParsedEvent {
             | ParsedEvent::Workspace(_)
             | ParsedEvent::InviteAccepted(_)
             | ParsedEvent::BenchDep(_)
-            | ParsedEvent::LocalSignerSecret(_) => None,
+            | ParsedEvent::LocalSignerSecret(_)
+            | ParsedEvent::LocalKey(_)
+            | ParsedEvent::SecretSharedUnwrap(_) => None,
         }
     }
 
@@ -370,6 +394,8 @@ pub fn registry() -> &'static EventRegistry {
             &file_slice::FILE_SLICE_META,
             &bench_dep::BENCH_DEP_META,
             &local_signer_secret::LOCAL_SIGNER_SECRET_META,
+            &local_key::LOCAL_KEY_META,
+            &secret_shared_unwrap::SECRET_SHARED_UNWRAP_META,
         ])
     })
 }
@@ -397,10 +423,10 @@ pub fn encode_event(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
 
 /// Generic post-projection-drain hooks.
 pub fn post_drain_hooks(
-    conn: &rusqlite::Connection,
-    recorded_by: &str,
+    _conn: &rusqlite::Connection,
+    _recorded_by: &str,
 ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-    workspace::commands::retry_pending_invite_content_key_unwraps(conn, recorded_by)
+    Ok(0)
 }
 
 #[cfg(test)]
@@ -427,12 +453,12 @@ mod tests {
     #[test]
     fn test_registry_encryptable_coverage() {
         let reg = registry();
-        let encryptable_codes: Vec<u8> = (1..=27u8)
+        let encryptable_codes: Vec<u8> = (1..=29u8)
             .filter(|c| reg.lookup(*c).is_some_and(|m| m.encryptable))
             .collect();
         assert_eq!(encryptable_codes, vec![1, 2, 6, 7, 24, 25]);
 
-        for code in [5, 8, 9, 10, 12, 14, 16, 18, 20, 21, 22, 26, 27] {
+        for code in [5, 8, 9, 10, 12, 14, 16, 18, 20, 21, 22, 26, 27, 28, 29] {
             let meta = reg.lookup(code).unwrap();
             assert!(
                 !meta.encryptable,

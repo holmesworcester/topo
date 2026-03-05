@@ -31,19 +31,26 @@ fn peer_shared_signer_emits_install_intent() {
 
     let cmds = project("test-peer", &event);
 
-    assert_eq!(cmds.len(), 1, "should emit exactly one command");
-    match &cmds[0] {
-        EmitCommand::ApplyTransportIdentityIntent { intent } => {
-            assert_eq!(
-                *intent,
-                TransportIdentityIntent::InstallPeerSharedIdentityFromSigner {
-                    recorded_by: "test-peer".to_string(),
-                    signer_event_id,
-                }
-            );
+    assert_eq!(cmds.len(), 2, "peer_shared should emit local_key + intent");
+    assert!(
+        cmds.iter()
+            .any(|c| matches!(c, EmitCommand::EmitDeterministicBlob { .. })),
+        "missing local_key deterministic emit"
+    );
+    let intent = cmds
+        .iter()
+        .find_map(|c| match c {
+            EmitCommand::ApplyTransportIdentityIntent { intent } => Some(intent),
+            _ => None,
+        })
+        .expect("missing ApplyTransportIdentityIntent");
+    assert_eq!(
+        *intent,
+        TransportIdentityIntent::InstallPeerSharedIdentityFromSigner {
+            recorded_by: "test-peer".to_string(),
+            signer_event_id,
         }
-        other => panic!("expected ApplyTransportIdentityIntent, got {:?}", other),
-    }
+    );
 }
 
 #[test]
@@ -56,7 +63,8 @@ fn workspace_signer_does_not_emit_intent() {
     });
 
     let cmds = project("test-peer", &event);
-    assert!(cmds.is_empty(), "workspace signer should emit no commands");
+    assert_eq!(cmds.len(), 1, "workspace signer should emit local_key only");
+    assert!(matches!(cmds[0], EmitCommand::EmitDeterministicBlob { .. }));
 }
 
 #[test]
@@ -69,7 +77,8 @@ fn user_signer_does_not_emit_intent() {
     });
 
     let cmds = project("test-peer", &event);
-    assert!(cmds.is_empty(), "user signer should emit no commands");
+    assert_eq!(cmds.len(), 1, "user signer should emit local_key only");
+    assert!(matches!(cmds[0], EmitCommand::EmitDeterministicBlob { .. }));
 }
 
 #[test]
@@ -82,17 +91,18 @@ fn intent_carries_correct_recorded_by() {
     });
 
     let cmds = project("specific-recorded-by-value", &event);
-    assert_eq!(cmds.len(), 1);
-    match &cmds[0] {
-        EmitCommand::ApplyTransportIdentityIntent { intent } => match intent {
-            TransportIdentityIntent::InstallPeerSharedIdentityFromSigner {
-                recorded_by, ..
-            } => {
-                assert_eq!(recorded_by, "specific-recorded-by-value");
-            }
-            other => panic!("wrong intent variant: {:?}", other),
-        },
-        other => panic!("wrong command: {:?}", other),
+    let intent = cmds
+        .iter()
+        .find_map(|c| match c {
+            EmitCommand::ApplyTransportIdentityIntent { intent } => Some(intent),
+            _ => None,
+        })
+        .expect("missing ApplyTransportIdentityIntent");
+    match intent {
+        TransportIdentityIntent::InstallPeerSharedIdentityFromSigner { recorded_by, .. } => {
+            assert_eq!(recorded_by, "specific-recorded-by-value");
+        }
+        other => panic!("wrong intent variant: {:?}", other),
     }
 }
 
@@ -106,5 +116,9 @@ fn no_duplicate_intents_emitted() {
     });
 
     let cmds = project("rb", &event);
-    assert_eq!(cmds.len(), 1, "must emit exactly one intent, no duplicates");
+    let intent_count = cmds
+        .iter()
+        .filter(|c| matches!(c, EmitCommand::ApplyTransportIdentityIntent { .. }))
+        .count();
+    assert_eq!(intent_count, 1, "must emit exactly one intent, no duplicates");
 }

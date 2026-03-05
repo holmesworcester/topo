@@ -101,8 +101,8 @@ pub fn encode_secret_shared(event: &ParsedEvent) -> Result<Vec<u8>, EventError> 
 
 // === Projector (event-module locality) ===
 
-use crate::crypto::event_id_to_base64;
-use crate::projection::contract::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
+use crate::crypto::{event_id_from_base64, event_id_to_base64};
+use crate::projection::contract::{ContextSnapshot, EmitCommand, ProjectorResult, SqlVal, WriteOp};
 use rusqlite::Connection;
 
 pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
@@ -183,7 +183,28 @@ pub fn project_pure(
             SqlVal::Blob(ss.wrapped_key.to_vec()),
         ],
     }];
-    ProjectorResult::valid(ops)
+
+    if let Some(secret_shared_event_id) = event_id_from_base64(event_id_b64) {
+        let unwrap_event = crate::event_modules::secret_shared_unwrap::from_secret_shared_event(
+            secret_shared_event_id,
+            ss,
+        );
+        let unwrap_blob = match crate::event_modules::encode_event(&unwrap_event) {
+            Ok(v) => v,
+            Err(err) => {
+                return ProjectorResult::reject(format!(
+                    "failed to encode secret_shared_unwrap emit event: {}",
+                    err
+                ))
+            }
+        };
+        ProjectorResult::valid_with_commands(
+            ops,
+            vec![EmitCommand::EmitDeterministicBlob { blob: unwrap_blob }],
+        )
+    } else {
+        ProjectorResult::valid(ops)
+    }
 }
 
 pub static SECRET_SHARED_META: EventTypeMeta = EventTypeMeta {

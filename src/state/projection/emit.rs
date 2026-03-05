@@ -20,16 +20,29 @@ pub fn emit_deterministic_event(
     event: &ParsedEvent,
 ) -> Result<EventId, Box<dyn std::error::Error>> {
     let blob = events::encode_event(event).map_err(|e| format!("encode error: {}", e))?;
+    emit_deterministic_blob(conn, recorded_by, &blob)
+}
 
-    let event_id = hash_event(&blob);
+/// Emit a deterministic canonical blob through the normal event pipeline.
+pub fn emit_deterministic_blob(
+    conn: &Connection,
+    recorded_by: &str,
+    blob: &[u8],
+) -> Result<EventId, Box<dyn std::error::Error>> {
+    if blob.is_empty() {
+        return Err("deterministic blob cannot be empty".into());
+    }
+    let event_id = hash_event(blob);
     let event_id_b64 = event_id_to_base64(&event_id);
 
-    let type_code = event.event_type_code();
+    let type_code = blob[0];
     let meta = registry()
         .lookup(type_code)
         .ok_or_else(|| format!("unknown type code {}", type_code))?;
 
-    let created_at_ms = event.created_at_ms() as i64;
+    let created_at_ms = events::extract_created_at_ms(blob)
+        .ok_or("deterministic blob too short to contain created_at_ms")?
+        as i64;
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -47,7 +60,7 @@ pub fn emit_deterministic_event(
             conn,
             &event_id,
             meta.type_name,
-            blob.as_slice(),
+            blob,
             meta.share_scope,
             created_at_ms,
             now_ms,
