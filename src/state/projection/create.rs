@@ -415,17 +415,18 @@ mod tests {
         let mut rng = rand::thread_rng();
 
         let peer_key = SigningKey::generate(&mut rng);
-        let peer_evt = ParsedEvent::Peer(PeerEvent {
+        let tenant_evt = ParsedEvent::Tenant(TenantEvent {
             created_at_ms: now_ms(),
             public_key: peer_key.verifying_key().to_bytes(),
         });
-        let peer_eid = create_event_synchronous(conn, recorded_by, &peer_evt).unwrap();
-
-        let tenant_evt = ParsedEvent::Tenant(TenantEvent {
-            created_at_ms: now_ms(),
-            peer_event_id: peer_eid,
-        });
         let tenant_eid = create_event_synchronous(conn, recorded_by, &tenant_evt).unwrap();
+
+        let peer_evt = ParsedEvent::Peer(PeerEvent {
+            created_at_ms: now_ms(),
+            tenant_event_id: tenant_eid,
+            public_key: peer_key.verifying_key().to_bytes(),
+        });
+        let _peer_eid = create_event_synchronous(conn, recorded_by, &peer_evt).unwrap();
 
         let workspace_key = SigningKey::generate(&mut rng);
         let workspace_pub = workspace_key.verifying_key().to_bytes();

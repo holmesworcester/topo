@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::db::{open_in_memory, schema::create_tables};
 

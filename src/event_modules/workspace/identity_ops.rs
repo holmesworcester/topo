@@ -30,25 +30,34 @@ pub(crate) fn now_ms() -> u64 {
 pub(crate) fn ensure_local_peer_event(
     conn: &Connection,
     recorded_by: &str,
+    tenant_event_id: &EventId,
     peer_key: &SigningKey,
 ) -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
-    let existing: Option<String> = conn
+    let existing: Option<(String, String)> = conn
         .query_row(
-            "SELECT event_id
+            "SELECT event_id, tenant_event_id
              FROM peers_local
              WHERE recorded_by = ?1
              ORDER BY created_at ASC, event_id ASC
              LIMIT 1",
             rusqlite::params![recorded_by],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .ok();
-    if let Some(eid_b64) = existing {
-        return event_id_from_base64(&eid_b64).ok_or("invalid peers_local.event_id base64".into());
+    if let Some((eid_b64, tenant_eid_b64)) = existing {
+        let existing_eid =
+            event_id_from_base64(&eid_b64).ok_or("invalid peers_local.event_id base64")?;
+        let existing_tenant_eid =
+            event_id_from_base64(&tenant_eid_b64).ok_or("invalid peers_local.tenant_event_id")?;
+        if existing_tenant_eid != *tenant_event_id {
+            return Err("existing peer event is bound to a different tenant_event_id".into());
+        }
+        return Ok(existing_eid);
     }
 
     let evt = ParsedEvent::Peer(PeerEvent {
         created_at_ms: now_ms(),
+        tenant_event_id: *tenant_event_id,
         public_key: peer_key.verifying_key().to_bytes(),
     });
     Ok(event_id_or_blocked(create_event_synchronous(
@@ -59,7 +68,7 @@ pub(crate) fn ensure_local_peer_event(
 }
 
 /// Ensure a local `tenant` event exists for this tenant and return its event id.
-/// `tenant` is rooted by a local `peer` event.
+/// `tenant` is the local root; `peer` depends on tenant.
 pub(crate) fn ensure_local_tenant_event(
     conn: &Connection,
     recorded_by: &str,
@@ -76,20 +85,18 @@ pub(crate) fn ensure_local_tenant_event(
             |row| row.get(0),
         )
         .ok();
-    if let Some(eid_b64) = existing {
-        return event_id_from_base64(&eid_b64).ok_or("invalid tenants.event_id base64".into());
-    }
+    let tenant_event_id = if let Some(eid_b64) = existing {
+        event_id_from_base64(&eid_b64).ok_or("invalid tenants.event_id base64")?
+    } else {
+        let tenant_evt = ParsedEvent::Tenant(TenantEvent {
+            created_at_ms: now_ms(),
+            public_key: peer_key.verifying_key().to_bytes(),
+        });
+        event_id_or_blocked(create_event_synchronous(conn, recorded_by, &tenant_evt))?
+    };
 
-    let peer_event_id = ensure_local_peer_event(conn, recorded_by, peer_key)?;
-    let tenant_evt = ParsedEvent::Tenant(TenantEvent {
-        created_at_ms: now_ms(),
-        peer_event_id,
-    });
-    Ok(event_id_or_blocked(create_event_synchronous(
-        conn,
-        recorded_by,
-        &tenant_evt,
-    ))?)
+    let _peer_event_id = ensure_local_peer_event(conn, recorded_by, &tenant_event_id, peer_key)?;
+    Ok(tenant_event_id)
 }
 
 fn create_deterministic_secret_key_event(

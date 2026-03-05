@@ -653,6 +653,10 @@ Usually not required at this stage, but useful if blocker behavior gets ambiguou
 - verify multi-blocker convergence and no-lost-unblock behavior,
 - then map those guards directly into projector dependency checks.
 
+TODO (pending model sync after tenant/peer root inversion):
+- update TLA models/spec mappings so `tenant` is root (no deps) and `peer` depends on `tenant_event_id`,
+- re-run TLC configs and refresh `docs/tla/projector_spec.md` mapping notes.
+
 ## 6.6 Phase 6: Shared signer substrate (required before identity)
 
 Implement one signer pipeline for all signed event types:

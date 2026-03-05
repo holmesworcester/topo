@@ -230,8 +230,8 @@ impl ParsedEvent {
                     ("signed_by", s.signed_by),
                 ]
             }
-            ParsedEvent::Peer(_) => vec![],
-            ParsedEvent::Tenant(t) => vec![("peer_event_id", t.peer_event_id)],
+            ParsedEvent::Peer(p) => vec![("tenant_event_id", p.tenant_event_id)],
+            ParsedEvent::Tenant(_) => vec![],
             ParsedEvent::MessageAttachment(a) => vec![
                 ("message_id", a.message_id),
                 ("key_event_id", a.key_event_id),

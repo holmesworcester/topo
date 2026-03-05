@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::crypto::event_id_to_base64;
 use crate::db::{open_in_memory, schema::create_tables};

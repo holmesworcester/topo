@@ -612,18 +612,21 @@ impl Peer {
         }
 
         let peer_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
-        let peer_evt = ParsedEvent::Peer(PeerEvent {
+        let tenant_evt = ParsedEvent::Tenant(TenantEvent {
             created_at_ms: current_timestamp_ms(),
             public_key: peer_key.verifying_key().to_bytes(),
         });
-        let peer_event_id =
-            create_event_synchronous(db, &self.identity, &peer_evt).expect("failed to create peer");
+        let tenant_event_id = create_event_synchronous(db, &self.identity, &tenant_evt)
+            .expect("failed to create tenant");
 
-        let tenant_evt = ParsedEvent::Tenant(TenantEvent {
+        let peer_evt = ParsedEvent::Peer(PeerEvent {
             created_at_ms: current_timestamp_ms(),
-            peer_event_id,
+            tenant_event_id,
+            public_key: peer_key.verifying_key().to_bytes(),
         });
-        create_event_synchronous(db, &self.identity, &tenant_evt).expect("failed to create tenant")
+        let _peer_event_id =
+            create_event_synchronous(db, &self.identity, &peer_evt).expect("failed to create peer");
+        tenant_event_id
     }
 
     /// Create a UserInvite event (signed by workspace key). Returns the event ID.

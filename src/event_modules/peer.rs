@@ -2,17 +2,22 @@ use super::layout::common::COMMON_HEADER_BYTES;
 use super::registry::{EventTypeMeta, ShareScope};
 use super::{EventError, ParsedEvent, EVENT_TYPE_PEER};
 
-pub const PEER_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32;
+pub const PEER_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32 + 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerEvent {
     pub created_at_ms: u64,
+    pub tenant_event_id: [u8; 32],
     pub public_key: [u8; 32],
 }
 
 impl super::Describe for PeerEvent {
     fn human_fields(&self) -> Vec<(&'static str, String)> {
         vec![
+            (
+                "tenant_event_id",
+                super::short_id_b64(&self.tenant_event_id),
+            ),
             ("public_key", super::trunc_hex(&self.public_key, 16)),
             (
                 "peer_id",
@@ -45,11 +50,15 @@ pub fn parse_peer(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     }
 
     let created_at_ms = u64::from_le_bytes(blob[1..9].try_into().unwrap());
+    let mut tenant_event_id = [0u8; 32];
+    tenant_event_id.copy_from_slice(&blob[9..41]);
+
     let mut public_key = [0u8; 32];
-    public_key.copy_from_slice(&blob[9..41]);
+    public_key.copy_from_slice(&blob[41..73]);
 
     Ok(ParsedEvent::Peer(PeerEvent {
         created_at_ms,
+        tenant_event_id,
         public_key,
     }))
 }
@@ -63,10 +72,12 @@ pub fn encode_peer(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     let mut buf = Vec::with_capacity(PEER_WIRE_SIZE);
     buf.push(EVENT_TYPE_PEER);
     buf.extend_from_slice(&e.created_at_ms.to_le_bytes());
+    buf.extend_from_slice(&e.tenant_event_id);
     buf.extend_from_slice(&e.public_key);
     Ok(buf)
 }
 
+use crate::crypto::event_id_to_base64;
 use crate::projection::contract::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
 use rusqlite::Connection;
 
@@ -76,6 +87,7 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
         CREATE TABLE IF NOT EXISTS peers_local (
             recorded_by TEXT NOT NULL,
             event_id TEXT NOT NULL,
+            tenant_event_id TEXT NOT NULL,
             public_key BLOB NOT NULL,
             peer_id TEXT NOT NULL,
             created_at INTEGER NOT NULL,
@@ -106,6 +118,7 @@ pub fn project_pure(
         columns: vec![
             "recorded_by",
             "event_id",
+            "tenant_event_id",
             "public_key",
             "peer_id",
             "created_at",
@@ -113,6 +126,7 @@ pub fn project_pure(
         values: vec![
             SqlVal::Text(recorded_by.to_string()),
             SqlVal::Text(event_id_b64.to_string()),
+            SqlVal::Text(event_id_to_base64(&e.tenant_event_id)),
             SqlVal::Blob(e.public_key.to_vec()),
             SqlVal::Text(peer_id),
             SqlVal::Int(e.created_at_ms as i64),
@@ -125,8 +139,8 @@ pub static PEER_META: EventTypeMeta = EventTypeMeta {
     type_name: "peer",
     projection_table: "peers_local",
     share_scope: ShareScope::Local,
-    dep_fields: &[],
-    dep_field_type_codes: &[],
+    dep_fields: &["tenant_event_id"],
+    dep_field_type_codes: &[&[super::EVENT_TYPE_TENANT]],
     signer_required: false,
     signature_byte_len: 0,
     encryptable: false,
@@ -145,6 +159,7 @@ mod tests {
     fn test_roundtrip_peer() {
         let e = ParsedEvent::Peer(PeerEvent {
             created_at_ms: 12345,
+            tenant_event_id: [8u8; 32],
             public_key: [7u8; 32],
         });
         let blob = encode_event(&e).unwrap();

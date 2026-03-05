@@ -262,7 +262,7 @@ mod tests {
         assert_eq!(INVITE_ACCEPTED_WIRE_SIZE, 105);
         assert_eq!(USER_INVITE_WIRE_SIZE, 170);
         assert_eq!(ADMIN_WIRE_SIZE, 170);
-        assert_eq!(PEER_WIRE_SIZE, 41);
+        assert_eq!(PEER_WIRE_SIZE, 73);
         assert_eq!(TENANT_WIRE_SIZE, 41);
         assert_eq!(SECRET_SHARED_WIRE_SIZE, 234);
         assert_eq!(INVITE_PRIVKEY_WIRE_SIZE, 73);

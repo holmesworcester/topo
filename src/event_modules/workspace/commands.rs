@@ -162,7 +162,7 @@ pub fn create_workspace(
     let ws_eid2 = create_event_staged(db, &derived_peer_id, &ws)?;
     assert_eq!(ws_eid, ws_eid2, "pre-computed workspace event_id mismatch");
 
-    // 4. Ensure tenant root chain exists: peer -> tenant.
+    // 4. Ensure tenant root chain exists: tenant root, peer depends on tenant.
     let tenant_event_id = ops::ensure_local_tenant_event(db, &derived_peer_id, &peer_shared_key)?;
 
     // 5. InviteAccepted (local event — trust anchor already seeded above)

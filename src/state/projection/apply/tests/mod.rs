@@ -119,23 +119,24 @@ fn setup_tenant_event(conn: &Connection, recorded_by: &str) -> EventId {
 
     let mut rng = rand::thread_rng();
     let peer_key = SigningKey::generate(&mut rng);
+    let tenant_event = ParsedEvent::Tenant(TenantEvent {
+        created_at_ms: now_ms(),
+        public_key: peer_key.verifying_key().to_bytes(),
+    });
+    let tenant_blob = events::encode_event(&tenant_event).unwrap();
+    let tenant_eid = insert_event_raw(conn, recorded_by, &tenant_blob);
+    let tenant_decision = project_one(conn, recorded_by, &tenant_eid).unwrap();
+    assert_eq!(tenant_decision, ProjectionDecision::Valid);
+
     let peer_event = ParsedEvent::Peer(PeerEvent {
         created_at_ms: now_ms(),
+        tenant_event_id: tenant_eid,
         public_key: peer_key.verifying_key().to_bytes(),
     });
     let peer_blob = events::encode_event(&peer_event).unwrap();
     let peer_eid = insert_event_raw(conn, recorded_by, &peer_blob);
     let peer_decision = project_one(conn, recorded_by, &peer_eid).unwrap();
     assert_eq!(peer_decision, ProjectionDecision::Valid);
-
-    let tenant_event = ParsedEvent::Tenant(TenantEvent {
-        created_at_ms: now_ms(),
-        peer_event_id: peer_eid,
-    });
-    let tenant_blob = events::encode_event(&tenant_event).unwrap();
-    let tenant_eid = insert_event_raw(conn, recorded_by, &tenant_blob);
-    let tenant_decision = project_one(conn, recorded_by, &tenant_eid).unwrap();
-    assert_eq!(tenant_decision, ProjectionDecision::Valid);
     tenant_eid
 }
 
@@ -146,21 +147,22 @@ fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (EventId, Signin
 
     // 1. Local peer + tenant roots
     let peer_key = SigningKey::generate(&mut rng);
+    let tenant_event = ParsedEvent::Tenant(TenantEvent {
+        created_at_ms: now_ms(),
+        public_key: peer_key.verifying_key().to_bytes(),
+    });
+    let tenant_blob = events::encode_event(&tenant_event).unwrap();
+    let tenant_eid = insert_event_raw(conn, recorded_by, &tenant_blob);
+    project_one(conn, recorded_by, &tenant_eid).unwrap();
+
     let peer_event = ParsedEvent::Peer(PeerEvent {
         created_at_ms: now_ms(),
+        tenant_event_id: tenant_eid,
         public_key: peer_key.verifying_key().to_bytes(),
     });
     let peer_blob = events::encode_event(&peer_event).unwrap();
     let peer_eid = insert_event_raw(conn, recorded_by, &peer_blob);
     project_one(conn, recorded_by, &peer_eid).unwrap();
-
-    let tenant_event = ParsedEvent::Tenant(TenantEvent {
-        created_at_ms: now_ms(),
-        peer_event_id: peer_eid,
-    });
-    let tenant_blob = events::encode_event(&tenant_event).unwrap();
-    let tenant_eid = insert_event_raw(conn, recorded_by, &tenant_blob);
-    project_one(conn, recorded_by, &tenant_eid).unwrap();
 
     // 2. Workspace
     let workspace_key = SigningKey::generate(&mut rng);
@@ -268,19 +270,20 @@ fn build_identity_chain_deferred(
 
     // 1. Local peer + tenant roots
     let peer_key = SigningKey::generate(&mut rng);
+    let tenant_event = ParsedEvent::Tenant(TenantEvent {
+        created_at_ms: now_ms(),
+        public_key: peer_key.verifying_key().to_bytes(),
+    });
+    let tenant_blob = events::encode_event(&tenant_event).unwrap();
+    let tenant_eid = hash_event(&tenant_blob);
+
     let peer_event = ParsedEvent::Peer(PeerEvent {
         created_at_ms: now_ms(),
+        tenant_event_id: tenant_eid,
         public_key: peer_key.verifying_key().to_bytes(),
     });
     let peer_blob = events::encode_event(&peer_event).unwrap();
     let peer_eid = hash_event(&peer_blob);
-
-    let tenant_event = ParsedEvent::Tenant(TenantEvent {
-        created_at_ms: now_ms(),
-        peer_event_id: peer_eid,
-    });
-    let tenant_blob = events::encode_event(&tenant_event).unwrap();
-    let tenant_eid = hash_event(&tenant_blob);
 
     // 2. Workspace
     let workspace_key = SigningKey::generate(&mut rng);
