@@ -10,6 +10,20 @@ pub struct PeerEvent {
     pub public_key: [u8; 32],
 }
 
+impl super::Describe for PeerEvent {
+    fn human_fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("public_key", super::trunc_hex(&self.public_key, 16)),
+            (
+                "peer_id",
+                hex::encode(crate::crypto::spki_fingerprint_from_ed25519_pubkey(
+                    &self.public_key,
+                )),
+            ),
+        ]
+    }
+}
+
 pub fn parse_peer(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if blob.len() < PEER_WIRE_SIZE {
         return Err(EventError::TooShort {

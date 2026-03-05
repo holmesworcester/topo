@@ -21,7 +21,6 @@ impl super::Describe for LocalSignerSecretEvent {
                 SIGNER_KIND_WORKSPACE => "workspace".into(),
                 SIGNER_KIND_USER => "user".into(),
                 SIGNER_KIND_PEER_SHARED => "peer_shared".into(),
-                SIGNER_KIND_PENDING_INVITE_UNWRAP => "pending_invite".into(),
                 k => format!("unknown({})", k),
             }),
         ]

@@ -11,6 +11,15 @@ pub struct InvitePrivkeyEvent {
     pub private_key_bytes: [u8; 32],
 }
 
+impl super::Describe for InvitePrivkeyEvent {
+    fn human_fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("invite_event_id", super::short_id_b64(&self.invite_event_id)),
+            ("private_key", super::trunc_hex(&self.private_key_bytes, 16)),
+        ]
+    }
+}
+
 pub fn parse_invite_privkey(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if blob.len() < INVITE_PRIVKEY_WIRE_SIZE {
         return Err(EventError::TooShort {

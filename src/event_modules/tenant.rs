@@ -10,6 +10,12 @@ pub struct TenantEvent {
     pub peer_event_id: [u8; 32],
 }
 
+impl super::Describe for TenantEvent {
+    fn human_fields(&self) -> Vec<(&'static str, String)> {
+        vec![("peer_event_id", super::short_id_b64(&self.peer_event_id))]
+    }
+}
+
 pub fn parse_tenant(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if blob.len() < TENANT_WIRE_SIZE {
         return Err(EventError::TooShort {

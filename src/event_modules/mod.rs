@@ -322,6 +322,9 @@ impl ParsedEvent {
             ParsedEvent::FileSlice(e) => e.human_fields(),
             ParsedEvent::BenchDep(e) => e.human_fields(),
             ParsedEvent::LocalSignerSecret(e) => e.human_fields(),
+            ParsedEvent::Peer(e) => e.human_fields(),
+            ParsedEvent::Tenant(e) => e.human_fields(),
+            ParsedEvent::InvitePrivkey(e) => e.human_fields(),
         }
     }
 }
