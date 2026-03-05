@@ -35,9 +35,9 @@ impl Drop for DaemonGuard {
 use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
 use crate::db::{open_connection, schema::create_tables, store::insert_recorded_event};
 use crate::event_modules::{
-    AdminEvent, DeviceInviteEvent, FileSliceEvent, InviteAcceptedEvent, MessageAttachmentEvent,
-    MessageDeletionEvent, MessageEvent, ParsedEvent, PeerEvent, PeerRemovedEvent, PeerSharedEvent,
-    ReactionEvent, SecretKeyEvent, SecretSharedEvent, TenantEvent, UserEvent, UserInviteEvent,
+    AdminEvent, DeviceInviteEvent, FileSliceEvent, InviteAcceptedEvent, KeySecretEvent,
+    KeySharedEvent, MessageAttachmentEvent, MessageDeletionEvent, MessageEvent, ParsedEvent,
+    PeerRemovedEvent, PeerSharedEvent, ReactionEvent, TenantEvent, UserEvent, UserInviteEvent,
     UserRemovedEvent, WorkspaceEvent,
 };
 use crate::peering::loops::{
@@ -424,31 +424,31 @@ impl Peer {
             .expect("failed to create reaction")
     }
 
-    /// Create a SecretKey event with the given key bytes.
+    /// Create a KeySecret event with the given key bytes.
     /// Returns the event ID.
-    pub fn create_secret_key(&self, key_bytes: [u8; 32]) -> EventId {
+    pub fn create_key_secret(&self, key_bytes: [u8; 32]) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
-        let sk = ParsedEvent::SecretKey(SecretKeyEvent {
+        let sk = ParsedEvent::KeySecret(KeySecretEvent {
             created_at_ms: current_timestamp_ms(),
             key_bytes,
         });
-        create_event_synchronous(&db, &self.identity, &sk).expect("failed to create secret_key")
+        create_event_synchronous(&db, &self.identity, &sk).expect("failed to create key_secret")
     }
 
-    /// Create a SecretKey event with deterministic key bytes and timestamp.
+    /// Create a KeySecret event with deterministic key bytes and timestamp.
     /// Two peers calling this with the same args produce the same blob -> same event_id.
     /// This is used for PSK materialization in tests where both peers need the same key.
-    pub fn create_secret_key_deterministic(
+    pub fn create_key_secret_deterministic(
         &self,
         key_bytes: [u8; 32],
         created_at_ms: u64,
     ) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
-        let sk = ParsedEvent::SecretKey(SecretKeyEvent {
+        let sk = ParsedEvent::KeySecret(KeySecretEvent {
             created_at_ms,
             key_bytes,
         });
-        create_event_synchronous(&db, &self.identity, &sk).expect("failed to create secret_key")
+        create_event_synchronous(&db, &self.identity, &sk).expect("failed to create key_secret")
     }
 
     /// Create an encrypted message. The inner message is signed with the PeerShared key,
@@ -606,17 +606,7 @@ impl Peer {
             created_at_ms: current_timestamp_ms(),
             public_key: peer_key.verifying_key().to_bytes(),
         });
-        let tenant_event_id = create_event_synchronous(db, &self.identity, &tenant_evt)
-            .expect("failed to create tenant");
-
-        let peer_evt = ParsedEvent::Peer(PeerEvent {
-            created_at_ms: current_timestamp_ms(),
-            tenant_event_id,
-            public_key: peer_key.verifying_key().to_bytes(),
-        });
-        let _peer_event_id =
-            create_event_synchronous(db, &self.identity, &peer_evt).expect("failed to create peer");
-        tenant_event_id
+        create_event_synchronous(db, &self.identity, &tenant_evt).expect("failed to create tenant")
     }
 
     /// Create a UserInvite event (signed by workspace key). Returns the event ID.
@@ -663,18 +653,18 @@ impl Peer {
             .expect("failed to create user_invite")
     }
 
-    /// Create a deterministic local invite_privkey event for an invite.
-    pub fn create_invite_privkey(
+    /// Create a deterministic local invite_secret event for an invite.
+    pub fn create_invite_secret(
         &self,
         invite_event_id: &EventId,
         invite_private_key: [u8; 32],
     ) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
-        let evt = crate::event_modules::invite_privkey::deterministic_invite_privkey_event(
+        let evt = crate::event_modules::invite_secret::deterministic_invite_secret_event(
             *invite_event_id,
             invite_private_key,
         );
-        create_event_staged(&db, &self.identity, &evt).expect("failed to create invite_privkey")
+        create_event_staged(&db, &self.identity, &evt).expect("failed to create invite_secret")
     }
 
     /// Create a User event (signed by UserInvite key). Returns the event ID.
@@ -798,8 +788,8 @@ impl Peer {
             .expect("failed to create peer_removed")
     }
 
-    /// Create a SecretShared event (signed by PeerShared key). Returns the event ID.
-    pub fn create_secret_shared(
+    /// Create a KeyShared event (signed by PeerShared key). Returns the event ID.
+    pub fn create_key_shared(
         &self,
         signing_key: &ed25519_dalek::SigningKey,
         key_event_id: &EventId,
@@ -809,7 +799,7 @@ impl Peer {
         peer_shared_event_id: &EventId,
     ) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
-        let evt = ParsedEvent::SecretShared(SecretSharedEvent {
+        let evt = ParsedEvent::KeyShared(KeySharedEvent {
             created_at_ms: current_timestamp_ms(),
             key_event_id: *key_event_id,
             recipient_event_id: *recipient_event_id,
@@ -820,7 +810,7 @@ impl Peer {
             signature: [0u8; 64],
         });
         create_signed_event_synchronous(&db, &self.identity, &evt, signing_key)
-            .expect("failed to create secret_shared")
+            .expect("failed to create key_shared")
     }
 
     /// Create multiple messages. Uses a transaction for speed at scale.
@@ -846,7 +836,7 @@ impl Peer {
 
     /// Create a file consisting of `total_slices` file slices.
     ///
-    /// Builds all required prerequisites (message, secret_key, attachment
+    /// Builds all required prerequisites (message, key_secret, attachment
     /// descriptor) and then batch-creates the slices. Returns the file_id
     /// used for all slices. Requires identity chain (use new_with_identity).
     pub fn batch_create_file_slices(&self, total_slices: usize) -> [u8; 32] {
@@ -871,12 +861,12 @@ impl Peer {
             .expect("failed to create parent message");
 
         // Secret key for attachment
-        let sk = ParsedEvent::SecretKey(SecretKeyEvent {
+        let sk = ParsedEvent::KeySecret(KeySecretEvent {
             created_at_ms: current_timestamp_ms(),
             key_bytes: [0xBB; 32],
         });
         let sk_eid =
-            create_event_staged(&db, &self.identity, &sk).expect("failed to create secret_key");
+            create_event_staged(&db, &self.identity, &sk).expect("failed to create key_secret");
 
         let file_id: [u8; 32] = {
             use std::hash::{Hash, Hasher};
@@ -1048,11 +1038,11 @@ impl Peer {
         .unwrap_or(0)
     }
 
-    /// Count rows in the secret_keys projection table scoped to this peer.
-    pub fn secret_key_count(&self) -> i64 {
+    /// Count rows in the key_secrets projection table scoped to this peer.
+    pub fn key_secret_count(&self) -> i64 {
         let db = open_connection(&self.db_path).expect("failed to open db");
         db.query_row(
-            "SELECT COUNT(*) FROM secret_keys WHERE recorded_by = ?1",
+            "SELECT COUNT(*) FROM key_secrets WHERE recorded_by = ?1",
             rusqlite::params![&self.identity],
             |row| row.get(0),
         )
@@ -1399,7 +1389,7 @@ const FINGERPRINT_TABLES: &[FingerprintTable] = &[
         order: "ORDER BY event_id",
     },
     FingerprintTable {
-        name: "secret_keys",
+        name: "key_secrets",
         scope: Scope::RecordedBy,
         order: "ORDER BY event_id",
     },
@@ -1460,7 +1450,7 @@ const FINGERPRINT_TABLES: &[FingerprintTable] = &[
         order: "ORDER BY event_id",
     },
     FingerprintTable {
-        name: "secret_shared",
+        name: "key_shared",
         scope: Scope::RecordedBy,
         order: "ORDER BY event_id",
     },
@@ -1633,10 +1623,10 @@ fn clear_projection_tables(db: &rusqlite::Connection, recorded_by: &str) {
     )
     .expect("failed to clear reactions");
     db.execute(
-        "DELETE FROM secret_keys WHERE recorded_by = ?1",
+        "DELETE FROM key_secrets WHERE recorded_by = ?1",
         rusqlite::params![recorded_by],
     )
-    .expect("failed to clear secret_keys");
+    .expect("failed to clear key_secrets");
     db.execute(
         "DELETE FROM deleted_messages WHERE recorded_by = ?1",
         rusqlite::params![recorded_by],
@@ -1689,7 +1679,7 @@ fn clear_projection_tables(db: &rusqlite::Connection, recorded_by: &str) {
     )
     .ok();
     db.execute(
-        "DELETE FROM secret_shared WHERE recorded_by = ?1",
+        "DELETE FROM key_shared WHERE recorded_by = ?1",
         rusqlite::params![recorded_by],
     )
     .ok();
@@ -3287,7 +3277,7 @@ pub fn assert_no_cross_tenant_leakage(db_path: &str, tenant_workspaces: &[(Strin
     }
 
     // Verify no unexpected peer_ids in projection tables
-    for table in &["messages", "reactions", "secret_keys", "deleted_messages"] {
+    for table in &["messages", "reactions", "key_secrets", "deleted_messages"] {
         let query = format!("SELECT DISTINCT recorded_by FROM {}", table);
         let mut stmt = db.prepare(&query).expect("failed to prepare");
         let found_ids: Vec<String> = stmt
@@ -3640,7 +3630,7 @@ mod fingerprint_tests {
         let projection_tables = [
             "messages",
             "reactions",
-            "secret_keys",
+            "key_secrets",
             "deleted_messages",
             "message_attachments",
             "file_slices",
@@ -3652,7 +3642,7 @@ mod fingerprint_tests {
             "peers_shared",
             "admins",
             "removed_entities",
-            "secret_shared",
+            "key_shared",
         ];
         let excluded_tables = [
             "valid_events",

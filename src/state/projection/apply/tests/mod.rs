@@ -6,10 +6,10 @@ use crate::db::{
     store::{insert_event, insert_neg_item_if_shared, insert_recorded_event},
 };
 use crate::event_modules::{
-    self as events, registry, BenchDepEvent, EncryptedEvent, FileSliceEvent,
+    self as events, registry, BenchDepEvent, EncryptedEvent, FileSliceEvent, KeySecretEvent,
     MessageAttachmentEvent, MessageDeletionEvent, MessageEvent, ParsedEvent, ReactionEvent,
-    SecretKeyEvent, WorkspaceEvent, EVENT_TYPE_ENCRYPTED, EVENT_TYPE_FILE_SLICE,
-    EVENT_TYPE_MESSAGE, EVENT_TYPE_MESSAGE_DELETION, EVENT_TYPE_REACTION,
+    WorkspaceEvent, EVENT_TYPE_ENCRYPTED, EVENT_TYPE_FILE_SLICE, EVENT_TYPE_MESSAGE,
+    EVENT_TYPE_MESSAGE_DELETION, EVENT_TYPE_REACTION,
 };
 use crate::projection::decision::ProjectionDecision;
 use crate::projection::encrypted::encrypt_event_blob;
@@ -82,7 +82,7 @@ fn insert_event_raw(conn: &Connection, recorded_by: &str, blob: &[u8]) -> EventI
 }
 
 use crate::event_modules::{
-    DeviceInviteEvent, InviteAcceptedEvent, PeerEvent, PeerSharedEvent, TenantEvent, UserEvent,
+    DeviceInviteEvent, InviteAcceptedEvent, PeerSharedEvent, TenantEvent, UserEvent,
     UserInviteEvent,
 };
 
@@ -127,16 +127,6 @@ fn setup_tenant_event(conn: &Connection, recorded_by: &str) -> EventId {
     let tenant_eid = insert_event_raw(conn, recorded_by, &tenant_blob);
     let tenant_decision = project_one(conn, recorded_by, &tenant_eid).unwrap();
     assert_eq!(tenant_decision, ProjectionDecision::Valid);
-
-    let peer_event = ParsedEvent::Peer(PeerEvent {
-        created_at_ms: now_ms(),
-        tenant_event_id: tenant_eid,
-        public_key: peer_key.verifying_key().to_bytes(),
-    });
-    let peer_blob = events::encode_event(&peer_event).unwrap();
-    let peer_eid = insert_event_raw(conn, recorded_by, &peer_blob);
-    let peer_decision = project_one(conn, recorded_by, &peer_eid).unwrap();
-    assert_eq!(peer_decision, ProjectionDecision::Valid);
     tenant_eid
 }
 
@@ -145,7 +135,7 @@ fn setup_tenant_event(conn: &Connection, recorded_by: &str) -> EventId {
 fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (EventId, SigningKey) {
     let mut rng = rand::thread_rng();
 
-    // 1. Local peer + tenant roots
+    // 1. Local tenant root
     let peer_key = SigningKey::generate(&mut rng);
     let tenant_event = ParsedEvent::Tenant(TenantEvent {
         created_at_ms: now_ms(),
@@ -154,15 +144,6 @@ fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (EventId, Signin
     let tenant_blob = events::encode_event(&tenant_event).unwrap();
     let tenant_eid = insert_event_raw(conn, recorded_by, &tenant_blob);
     project_one(conn, recorded_by, &tenant_eid).unwrap();
-
-    let peer_event = ParsedEvent::Peer(PeerEvent {
-        created_at_ms: now_ms(),
-        tenant_event_id: tenant_eid,
-        public_key: peer_key.verifying_key().to_bytes(),
-    });
-    let peer_blob = events::encode_event(&peer_event).unwrap();
-    let peer_eid = insert_event_raw(conn, recorded_by, &peer_blob);
-    project_one(conn, recorded_by, &peer_eid).unwrap();
 
     // 2. Workspace
     let workspace_key = SigningKey::generate(&mut rng);
@@ -270,7 +251,7 @@ fn build_identity_chain_deferred(
 ) -> (EventId, SigningKey, Vec<(EventId, Vec<u8>)>) {
     let mut rng = rand::thread_rng();
 
-    // 1. Local peer + tenant roots
+    // 1. Local tenant root
     let peer_key = SigningKey::generate(&mut rng);
     let tenant_event = ParsedEvent::Tenant(TenantEvent {
         created_at_ms: now_ms(),
@@ -278,14 +259,6 @@ fn build_identity_chain_deferred(
     });
     let tenant_blob = events::encode_event(&tenant_event).unwrap();
     let tenant_eid = hash_event(&tenant_blob);
-
-    let peer_event = ParsedEvent::Peer(PeerEvent {
-        created_at_ms: now_ms(),
-        tenant_event_id: tenant_eid,
-        public_key: peer_key.verifying_key().to_bytes(),
-    });
-    let peer_blob = events::encode_event(&peer_event).unwrap();
-    let peer_eid = hash_event(&peer_blob);
 
     // 2. Workspace
     let workspace_key = SigningKey::generate(&mut rng);
@@ -378,7 +351,6 @@ fn build_identity_chain_deferred(
 
     // Return blobs in dependency order.
     let chain_blobs = vec![
-        (peer_eid, peer_blob),
         (tenant_eid, tenant_blob),
         (ia_eid, ia_blob),
         (net_eid, net_blob),
@@ -1208,8 +1180,8 @@ fn test_two_tenant_contexts_single_db() {
 
 // ===== Encrypted event helpers =====
 
-fn make_secret_key(key_bytes: [u8; 32]) -> (ParsedEvent, Vec<u8>) {
-    let sk = ParsedEvent::SecretKey(SecretKeyEvent {
+fn make_key_secret(key_bytes: [u8; 32]) -> (ParsedEvent, Vec<u8>) {
+    let sk = ParsedEvent::KeySecret(KeySecretEvent {
         created_at_ms: now_ms(),
         key_bytes,
     });
@@ -1237,21 +1209,21 @@ fn make_encrypted_event(
 }
 
 #[test]
-fn test_project_secret_key_valid() {
+fn test_project_key_secret_valid() {
     let conn = setup();
     let recorded_by = "peer1";
     let key_bytes: [u8; 32] = rand::random();
-    let (_sk, blob) = make_secret_key(key_bytes);
+    let (_sk, blob) = make_key_secret(key_bytes);
     let eid = insert_event_raw(&conn, recorded_by, &blob);
 
     let result = project_one(&conn, recorded_by, &eid).unwrap();
     assert_eq!(result, ProjectionDecision::Valid);
 
-    // Verify in secret_keys table
+    // Verify in key_secrets table
     let eid_b64 = event_id_to_base64(&eid);
     let stored_key: Vec<u8> = conn
         .query_row(
-            "SELECT key_bytes FROM secret_keys WHERE event_id = ?1 AND recorded_by = ?2",
+            "SELECT key_bytes FROM key_secrets WHERE event_id = ?1 AND recorded_by = ?2",
             rusqlite::params![&eid_b64, recorded_by],
             |row| row.get(0),
         )
@@ -1267,7 +1239,7 @@ fn test_encrypted_message_valid() {
     let key_bytes: [u8; 32] = rand::random();
 
     // Create and project secret key
-    let (_sk, sk_blob) = make_secret_key(key_bytes);
+    let (_sk, sk_blob) = make_key_secret(key_bytes);
     let sk_eid = insert_event_raw(&conn, recorded_by, &sk_blob);
     let r = project_one(&conn, recorded_by, &sk_eid).unwrap();
     assert_eq!(r, ProjectionDecision::Valid);
@@ -1304,7 +1276,7 @@ fn test_encrypted_blocks_on_missing_key() {
     let key_bytes: [u8; 32] = rand::random();
 
     // Pre-compute key event_id without inserting
-    let (_sk, sk_blob) = make_secret_key(key_bytes);
+    let (_sk, sk_blob) = make_key_secret(key_bytes);
     let sk_eid = hash_event(&sk_blob);
 
     // Create identity chain for signing the inner message
@@ -1333,7 +1305,7 @@ fn test_encrypted_unblocks_when_key_arrives() {
     let key_bytes: [u8; 32] = rand::random();
 
     // Pre-compute key event_id
-    let (_sk, sk_blob) = make_secret_key(key_bytes);
+    let (_sk, sk_blob) = make_key_secret(key_bytes);
     let sk_eid = hash_event(&sk_blob);
 
     // Create identity chain for signing the inner message
@@ -1386,7 +1358,7 @@ fn test_encrypted_wrong_key_rejects() {
     let key_b: [u8; 32] = rand::random();
 
     // Create and project key B
-    let (_sk_b, sk_b_blob) = make_secret_key(key_b);
+    let (_sk_b, sk_b_blob) = make_key_secret(key_b);
     let sk_b_eid = insert_event_raw(&conn, recorded_by, &sk_b_blob);
     project_one(&conn, recorded_by, &sk_b_eid).unwrap();
 
@@ -1416,7 +1388,7 @@ fn test_encrypted_inner_type_mismatch_rejects() {
     let key_bytes: [u8; 32] = rand::random();
 
     // Create and project key
-    let (_sk, sk_blob) = make_secret_key(key_bytes);
+    let (_sk, sk_blob) = make_key_secret(key_bytes);
     let sk_eid = insert_event_raw(&conn, recorded_by, &sk_blob);
     project_one(&conn, recorded_by, &sk_eid).unwrap();
 
@@ -1463,7 +1435,7 @@ fn test_encrypted_nested_rejects() {
     let key_bytes: [u8; 32] = rand::random();
 
     // Create and project key
-    let (_sk, sk_blob) = make_secret_key(key_bytes);
+    let (_sk, sk_blob) = make_key_secret(key_bytes);
     let sk_eid = insert_event_raw(&conn, recorded_by, &sk_blob);
     project_one(&conn, recorded_by, &sk_eid).unwrap();
 
@@ -1504,7 +1476,7 @@ fn test_encrypted_inner_dep_blocks() {
     let key_bytes: [u8; 32] = rand::random();
 
     // Create and project key
-    let (_sk, sk_blob) = make_secret_key(key_bytes);
+    let (_sk, sk_blob) = make_key_secret(key_bytes);
     let sk_eid = insert_event_raw(&conn, recorded_by, &sk_blob);
     project_one(&conn, recorded_by, &sk_eid).unwrap();
 
@@ -1546,7 +1518,7 @@ fn test_encrypted_inner_dep_unblocks() {
     let key_bytes: [u8; 32] = rand::random();
 
     // Create and project key
-    let (_sk, sk_blob) = make_secret_key(key_bytes);
+    let (_sk, sk_blob) = make_key_secret(key_bytes);
     let sk_eid = insert_event_raw(&conn, recorded_by, &sk_blob);
     project_one(&conn, recorded_by, &sk_eid).unwrap();
 
@@ -1596,7 +1568,7 @@ fn test_encrypted_rejection_recorded_durably() {
     let key_b: [u8; 32] = rand::random();
 
     // Create and project key B
-    let (_sk_b, sk_b_blob) = make_secret_key(key_b);
+    let (_sk_b, sk_b_blob) = make_key_secret(key_b);
     let sk_b_eid = insert_event_raw(&conn, recorded_by, &sk_b_blob);
     project_one(&conn, recorded_by, &sk_b_eid).unwrap();
 
@@ -1632,7 +1604,7 @@ fn test_encrypted_cross_tenant_isolation() {
     let key_bytes: [u8; 32] = rand::random();
 
     // Create and project key for tenant_a only
-    let (_sk, sk_blob) = make_secret_key(key_bytes);
+    let (_sk, sk_blob) = make_key_secret(key_bytes);
     let sk_eid = insert_event_raw(&conn, tenant_a, &sk_blob);
     let r = project_one(&conn, tenant_a, &sk_eid).unwrap();
     assert_eq!(r, ProjectionDecision::Valid);
@@ -1679,7 +1651,7 @@ fn setup_encryption_ctx(
 ) -> (EventId, SigningKey, [u8; 32], EventId) {
     let (signer_eid, signing_key) = make_identity_chain(conn, recorded_by);
     let key_bytes: [u8; 32] = rand::random();
-    let (_sk, sk_blob) = make_secret_key(key_bytes);
+    let (_sk, sk_blob) = make_key_secret(key_bytes);
     let sk_eid = insert_event_raw(conn, recorded_by, &sk_blob);
     let r = project_one(conn, recorded_by, &sk_eid).unwrap();
     assert_eq!(r, ProjectionDecision::Valid);
@@ -2030,7 +2002,7 @@ fn test_encrypted_inner_signer_dep_missing_blocks() {
     let key_bytes: [u8; 32] = rand::random();
 
     // Create and project key
-    let (_sk, sk_blob) = make_secret_key(key_bytes);
+    let (_sk, sk_blob) = make_key_secret(key_bytes);
     let sk_eid = insert_event_raw(&conn, recorded_by, &sk_blob);
     project_one(&conn, recorded_by, &sk_eid).unwrap();
 
@@ -2150,7 +2122,7 @@ fn test_encrypted_identity_event_rejects() {
     let recorded_by = "peer1";
     let key_bytes: [u8; 32] = rand::random();
 
-    let (_sk, sk_blob) = make_secret_key(key_bytes);
+    let (_sk, sk_blob) = make_key_secret(key_bytes);
     let sk_eid = insert_event_raw(&conn, recorded_by, &sk_blob);
     project_one(&conn, recorded_by, &sk_eid).unwrap();
 
@@ -2728,9 +2700,9 @@ fn test_emit_cross_tenant_records_and_projects() {
     )
     .unwrap();
 
-    // Use a SecretKey event (unsigned, no signer_required) for the cross-tenant
+    // Use a KeySecret event (unsigned, no signer_required) for the cross-tenant
     // emit test. This avoids needing to set up identity chains for emit_deterministic_event.
-    let sk = ParsedEvent::SecretKey(SecretKeyEvent {
+    let sk = ParsedEvent::KeySecret(KeySecretEvent {
         created_at_ms: 1000,
         key_bytes: [42u8; 32],
     });
@@ -2778,15 +2750,15 @@ fn test_emit_cross_tenant_records_and_projects() {
         assert!(valid, "tenant {} should have valid_events entry", tenant);
     }
 
-    // secret_keys: 2 rows (one per tenant)
+    // key_secrets: 2 rows (one per tenant)
     let sk_count: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM secret_keys WHERE event_id = ?1",
+            "SELECT COUNT(*) FROM key_secrets WHERE event_id = ?1",
             rusqlite::params![&eid_b64],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(sk_count, 2, "both tenants should have projected secret_key");
+    assert_eq!(sk_count, 2, "both tenants should have projected key_secret");
 }
 
 #[test]
@@ -2796,8 +2768,8 @@ fn test_emit_local_share_scope_no_neg_items() {
     let conn = setup();
     let recorded_by = "peer1";
 
-    // SecretKeyEvent has ShareScope::Local
-    let sk = ParsedEvent::SecretKey(SecretKeyEvent {
+    // KeySecretEvent has ShareScope::Local
+    let sk = ParsedEvent::KeySecret(KeySecretEvent {
         created_at_ms: 2000,
         key_bytes: [42u8; 32],
     });
@@ -2982,7 +2954,7 @@ fn make_message_attachment(
 }
 
 /// Helper: create a MessageAttachment descriptor with a specific file_id and signer,
-/// along with its required deps (Message + SecretKey). Insert and project all of them.
+/// along with its required deps (Message + KeySecret). Insert and project all of them.
 /// Returns the attachment event_id.
 fn setup_descriptor_for_file(
     conn: &Connection,
@@ -2997,8 +2969,8 @@ fn setup_descriptor_for_file(
     let msg_eid = insert_event_raw(conn, recorded_by, &msg_blob);
     project_one(conn, recorded_by, &msg_eid).unwrap();
 
-    // Create SecretKey (dep for attachment)
-    let sk = ParsedEvent::SecretKey(SecretKeyEvent {
+    // Create KeySecret (dep for attachment)
+    let sk = ParsedEvent::KeySecret(KeySecretEvent {
         created_at_ms: now_ms(),
         key_bytes: [0xBB; 32],
     });
@@ -3231,8 +3203,8 @@ fn test_project_attachment_valid() {
     let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
     project_one(&conn, recorded_by, &msg_eid).unwrap();
 
-    // Create SecretKey (dep)
-    let sk = ParsedEvent::SecretKey(SecretKeyEvent {
+    // Create KeySecret (dep)
+    let sk = ParsedEvent::KeySecret(KeySecretEvent {
         created_at_ms: now_ms(),
         key_bytes: [0xAA; 32],
     });
@@ -3263,8 +3235,8 @@ fn test_attachment_blocks_on_missing_message() {
     let conn = setup();
     let recorded_by = "peer1";
 
-    // Create SecretKey but NOT message
-    let sk = ParsedEvent::SecretKey(SecretKeyEvent {
+    // Create KeySecret but NOT message
+    let sk = ParsedEvent::KeySecret(KeySecretEvent {
         created_at_ms: now_ms(),
         key_bytes: [0xAA; 32],
     });
@@ -3339,7 +3311,7 @@ fn test_attachment_cascade_unblock() {
     let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "hello cascade");
     let msg_eid = crate::crypto::hash_event(&msg_blob);
 
-    let sk = ParsedEvent::SecretKey(SecretKeyEvent {
+    let sk = ParsedEvent::KeySecret(KeySecretEvent {
         created_at_ms: now_ms(),
         key_bytes: [0xBB; 32],
     });
@@ -3607,15 +3579,15 @@ fn test_multi_dep_event_projects_only_when_all_resolve() {
     let conn = setup();
     let recorded_by = "peer1";
 
-    // Create two SecretKey events as deps (no deps of their own)
-    let sk_a = ParsedEvent::SecretKey(SecretKeyEvent {
+    // Create two KeySecret events as deps (no deps of their own)
+    let sk_a = ParsedEvent::KeySecret(KeySecretEvent {
         created_at_ms: now_ms(),
         key_bytes: [0xAA; 32],
     });
     let sk_a_blob = events::encode_event(&sk_a).unwrap();
     let sk_a_eid = insert_event_raw(&conn, recorded_by, &sk_a_blob);
 
-    let sk_b = ParsedEvent::SecretKey(SecretKeyEvent {
+    let sk_b = ParsedEvent::KeySecret(KeySecretEvent {
         created_at_ms: now_ms(),
         key_bytes: [0xBB; 32],
     });
@@ -3747,7 +3719,7 @@ fn test_encrypted_inner_dep_cascade_unblock() {
 
     // Create the secret key for encryption
     let key_bytes: [u8; 32] = rand::random();
-    let (_sk, sk_blob) = make_secret_key(key_bytes);
+    let (_sk, sk_blob) = make_key_secret(key_bytes);
     let sk_eid = insert_event_raw(&conn, recorded_by, &sk_blob);
     // DON'T project key yet
 
@@ -3883,8 +3855,8 @@ fn test_file_slice_guard_retry_after_cascaded_attachment() {
     let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "parent msg");
     let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
 
-    // Create SecretKey (dep for attachment) and project it
-    let sk = ParsedEvent::SecretKey(SecretKeyEvent {
+    // Create KeySecret (dep for attachment) and project it
+    let sk = ParsedEvent::KeySecret(KeySecretEvent {
         created_at_ms: now_ms(),
         key_bytes: [0xDD; 32],
     });
@@ -4105,7 +4077,7 @@ fn test_source_isomorphism_encrypted_message() {
     // --- Path A: Direct (key first, then encrypted) ---
     let conn_a = setup();
     let (signer_a, signing_key_a) = make_identity_chain(&conn_a, recorded_by);
-    let (_sk_a, sk_blob_a) = make_secret_key(key_bytes);
+    let (_sk_a, sk_blob_a) = make_key_secret(key_bytes);
     let sk_eid_a = insert_event_raw(&conn_a, recorded_by, &sk_blob_a);
     project_one(&conn_a, recorded_by, &sk_eid_a).unwrap();
 
@@ -4119,7 +4091,7 @@ fn test_source_isomorphism_encrypted_message() {
     // --- Path B: Cascade (encrypted first, blocks; then key unblocks) ---
     let conn_b = setup();
     let (signer_b, signing_key_b) = make_identity_chain(&conn_b, recorded_by);
-    let (_sk_b, sk_blob_b) = make_secret_key(key_bytes);
+    let (_sk_b, sk_blob_b) = make_key_secret(key_bytes);
     let sk_eid_b = insert_event_raw(&conn_b, recorded_by, &sk_blob_b);
 
     let (_msg_b, msg_blob_b) = make_message_signed(&signing_key_b, &signer_b, "enc msg");
@@ -4357,7 +4329,7 @@ fn test_source_isomorphism_encrypted_reaction_three_phase_cascade() {
     let (signer_a, signing_key_a) = make_identity_chain(&conn_a, recorded_by);
 
     // Key
-    let (_sk_a, sk_blob_a) = make_secret_key(key_bytes);
+    let (_sk_a, sk_blob_a) = make_key_secret(key_bytes);
     let sk_eid_a = insert_event_raw(&conn_a, recorded_by, &sk_blob_a);
     project_one(&conn_a, recorded_by, &sk_eid_a).unwrap();
 
@@ -4379,7 +4351,7 @@ fn test_source_isomorphism_encrypted_reaction_three_phase_cascade() {
     let (signer_b, signing_key_b) = make_identity_chain(&conn_b, recorded_by);
 
     // Insert all but don't project content events yet
-    let (_sk_b, sk_blob_b) = make_secret_key(key_bytes);
+    let (_sk_b, sk_blob_b) = make_key_secret(key_bytes);
     let sk_eid_b = insert_event_raw(&conn_b, recorded_by, &sk_blob_b);
 
     let (_msg_b, msg_blob_b) = make_message_signed(&signing_key_b, &signer_b, "enc rxn target");

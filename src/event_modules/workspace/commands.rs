@@ -17,7 +17,7 @@ use rusqlite::Connection;
 use super::identity_ops::{self as ops, InviteBootstrapContext, JoinChain, LinkChain};
 use crate::crypto::EventId;
 use crate::event_modules::{
-    local_signer_secret::{LocalSignerSecretEvent, SIGNER_KIND_PEER_SHARED},
+    peer_secret::{PeerSecretEvent, SIGNER_KIND_PEER_SHARED},
     AdminEvent, DeviceInviteEvent, InviteAcceptedEvent, ParsedEvent, PeerSharedEvent, UserEvent,
     UserInviteEvent, WorkspaceEvent,
 };
@@ -34,23 +34,23 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-/// Emit a local_signer_secret event for the given signer identity.
+/// Emit a peer_secret event for the given signer identity.
 /// The event is projected into `local_signer_material` via the projector.
-fn emit_local_signer_secret(
+fn emit_peer_secret(
     db: &Connection,
     recorded_by: &str,
     signer_event_id: &EventId,
     signer_kind: u8,
     signing_key: &SigningKey,
 ) -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
-    let evt = ParsedEvent::LocalSignerSecret(LocalSignerSecretEvent {
+    let evt = ParsedEvent::PeerSecret(PeerSecretEvent {
         created_at_ms: now_ms(),
         signer_event_id: *signer_event_id,
         signer_kind,
         private_key_bytes: signing_key.to_bytes(),
     });
     event_id_or_blocked(create_event_synchronous(db, recorded_by, &evt))
-        .map_err(|e| format!("emit local_signer_secret failed: {}", e).into())
+        .map_err(|e| format!("emit peer_secret failed: {}", e).into())
 }
 
 // ─── Result types ───
@@ -131,7 +131,7 @@ pub fn create_workspace(
     // Pre-derive peer_id from PeerShared key so all events are written under
     // the correct recorded_by from the start (no finalize_identity needed).
     // Pure crypto derivation — transport cert is installed via projection when
-    // the PeerShared LocalSignerSecret is emitted in step 7.
+    // the PeerShared PeerSecret is emitted in step 7.
     let peer_shared_key = SigningKey::generate(&mut rng);
     let derived_peer_id = hex::encode(crate::crypto::spki_fingerprint_from_ed25519_pubkey(
         &peer_shared_key.verifying_key().to_bytes(),
@@ -227,9 +227,9 @@ pub fn create_workspace(
     });
     let psf_eid = create_signed_event_synchronous(db, &derived_peer_id, &psf, &device_invite_key)?;
 
-    // 11. Emit local_signer_secret for peer_shared signer key only.
+    // 11. Emit peer_secret for peer_shared signer key only.
     // Transport identity is already installed, so all writes use derived_peer_id.
-    emit_local_signer_secret(
+    emit_peer_secret(
         db,
         &derived_peer_id,
         &psf_eid,
@@ -255,7 +255,7 @@ pub fn create_workspace(
 /// unwraps bootstrap content key.
 ///
 /// Returns the JoinChain with keys/ids needed by service for transport setup.
-/// Signer secrets are NOT emitted here — call `persist_join_signer_secrets`
+/// Signer secrets are NOT emitted here — call `persist_join_peer_secret`
 /// after push-back sync completes.
 pub fn join_workspace_as_new_user(
     db: &Connection,
@@ -270,9 +270,9 @@ pub fn join_workspace_as_new_user(
     let mut rng = rand::thread_rng();
     let tenant_event_id = ops::ensure_local_tenant_event(db, recorded_by, &peer_shared_key)?;
 
-    // Persist deterministic invite_privkey material. This is the key event
-    // that secret_shared depends on for unwrap projection.
-    let _ = ops::store_invite_privkey(db, recorded_by, invite_event_id, invite_key)?;
+    // Persist deterministic invite_secret material. This is the key event
+    // that key_shared depends on for unwrap projection.
+    let _ = ops::store_invite_secret(db, recorded_by, invite_event_id, invite_key)?;
 
     // 1. InviteAccepted (local event) — binds accepted workspace, triggers guard cascade
     let ia_evt = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
@@ -337,7 +337,7 @@ pub fn join_workspace_as_new_user(
     ))?;
 
     // 5. Key unwrap is dep-driven via:
-    //    secret_shared --deps on invite_privkey--> deterministic secret emit.
+    //    key_shared --deps on invite_secret--> deterministic secret emit.
     //    No inline unwrap here.
     let content_key_event_id = None;
 
@@ -355,19 +355,19 @@ pub fn join_workspace_as_new_user(
 
 /// Persist signer secrets for a join.
 ///
-/// The peer_shared LocalSignerSecret triggers ApplyTransportIdentityIntent
+/// The peer_shared PeerSecret triggers ApplyTransportIdentityIntent
 /// on projection, which installs the PeerShared-derived transport identity.
 /// Events may block if the identity chain hasn't completed yet; they will
 /// project via cascade when prerequisites arrive.
 ///
 /// With pre-derive, `recorded_by` is already the final PeerShared-derived
 /// identity, so no scoping or load_transport_peer_id is needed.
-pub fn persist_join_signer_secrets(
+pub fn persist_join_peer_secret(
     db: &Connection,
     recorded_by: &str,
     join: &JoinChain,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    emit_local_signer_secret(
+    emit_peer_secret(
         db,
         recorded_by,
         &join.peer_shared_event_id,
@@ -384,7 +384,7 @@ pub fn persist_join_signer_secrets(
 /// Creates: InviteAccepted → PeerShared.
 ///
 /// Returns the LinkChain with keys/ids needed by service for transport setup.
-/// Signer secrets are NOT emitted here — call `persist_link_signer_secrets`
+/// Signer secrets are NOT emitted here — call `persist_link_peer_secret`
 /// separately.
 pub fn add_device_to_workspace(
     db: &Connection,
@@ -436,12 +436,12 @@ pub fn add_device_to_workspace(
 /// Persist signer secrets for a device link.
 ///
 /// Events may block if the identity chain hasn't completed yet.
-pub fn persist_link_signer_secrets(
+pub fn persist_link_peer_secret(
     db: &Connection,
     recorded_by: &str,
     link: &LinkChain,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    emit_local_signer_secret(
+    emit_peer_secret(
         db,
         recorded_by,
         &link.peer_shared_event_id,

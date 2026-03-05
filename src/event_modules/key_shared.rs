@@ -1,28 +1,28 @@
 use super::layout::common::{COMMON_HEADER_BYTES, SIGNATURE_TRAILER_BYTES};
 use super::registry::{EventTypeMeta, ShareScope};
-use super::{EventError, ParsedEvent, EVENT_TYPE_SECRET_SHARED};
+use super::{EventError, ParsedEvent, EVENT_TYPE_KEY_SHARED};
 
 // ─── Layout (owned by this module) ───
 
-/// SecretShared (type 22): type(1) + created_at(8) + key_event_id(32) + recipient_event_id(32)
+/// KeyShared (type 22): type(1) + created_at(8) + key_event_id(32) + recipient_event_id(32)
 ///                        + unwrap_key_event_id(32) + wrapped_key(32) + signed_by(32)
 ///                        + signer_type(1) + signature(64) = 234
-pub const SECRET_SHARED_WIRE_SIZE: usize =
+pub const KEY_SHARED_WIRE_SIZE: usize =
     COMMON_HEADER_BYTES + 32 + 32 + 32 + 32 + SIGNATURE_TRAILER_BYTES;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SecretSharedEvent {
+pub struct KeySharedEvent {
     pub created_at_ms: u64,
     pub key_event_id: [u8; 32],        // dep: Secret event
     pub recipient_event_id: [u8; 32],  // dep: invite event of recipient
-    pub unwrap_key_event_id: [u8; 32], // dep: local InvitePrivkey event (recipient side)
+    pub unwrap_key_event_id: [u8; 32], // dep: local InviteSecret event (recipient side)
     pub wrapped_key: [u8; 32],         // key bytes wrapped for recipient
     pub signed_by: [u8; 32],           // signer event_id (PeerShared event — sender)
     pub signer_type: u8,               // 5 = peer_shared
     pub signature: [u8; 64],
 }
 
-impl super::Describe for SecretSharedEvent {
+impl super::Describe for KeySharedEvent {
     fn human_fields(&self) -> Vec<(&'static str, String)> {
         vec![
             ("key_event_id", super::short_id_b64(&self.key_event_id)),
@@ -41,22 +41,22 @@ impl super::Describe for SecretSharedEvent {
 /// [137..169]   signed_by (32 bytes)
 /// [169]        signer_type (1 byte)
 /// [170..234]   signature (64 bytes)
-pub fn parse_secret_shared(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    if blob.len() < SECRET_SHARED_WIRE_SIZE {
+pub fn parse_key_shared(blob: &[u8]) -> Result<ParsedEvent, EventError> {
+    if blob.len() < KEY_SHARED_WIRE_SIZE {
         return Err(EventError::TooShort {
-            expected: SECRET_SHARED_WIRE_SIZE,
+            expected: KEY_SHARED_WIRE_SIZE,
             actual: blob.len(),
         });
     }
-    if blob.len() > SECRET_SHARED_WIRE_SIZE {
+    if blob.len() > KEY_SHARED_WIRE_SIZE {
         return Err(EventError::TrailingData {
-            expected: SECRET_SHARED_WIRE_SIZE,
+            expected: KEY_SHARED_WIRE_SIZE,
             actual: blob.len(),
         });
     }
-    if blob[0] != EVENT_TYPE_SECRET_SHARED {
+    if blob[0] != EVENT_TYPE_KEY_SHARED {
         return Err(EventError::WrongType {
-            expected: EVENT_TYPE_SECRET_SHARED,
+            expected: EVENT_TYPE_KEY_SHARED,
             actual: blob[0],
         });
     }
@@ -76,7 +76,7 @@ pub fn parse_secret_shared(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     let mut signature = [0u8; 64];
     signature.copy_from_slice(&blob[170..234]);
 
-    Ok(ParsedEvent::SecretShared(SecretSharedEvent {
+    Ok(ParsedEvent::KeyShared(KeySharedEvent {
         created_at_ms,
         key_event_id,
         recipient_event_id,
@@ -88,13 +88,13 @@ pub fn parse_secret_shared(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     }))
 }
 
-pub fn encode_secret_shared(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
+pub fn encode_key_shared(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     let e = match event {
-        ParsedEvent::SecretShared(v) => v,
+        ParsedEvent::KeyShared(v) => v,
         _ => return Err(EventError::WrongVariant),
     };
-    let mut buf = Vec::with_capacity(SECRET_SHARED_WIRE_SIZE);
-    buf.push(EVENT_TYPE_SECRET_SHARED);
+    let mut buf = Vec::with_capacity(KEY_SHARED_WIRE_SIZE);
+    buf.push(EVENT_TYPE_KEY_SHARED);
     buf.extend_from_slice(&e.created_at_ms.to_le_bytes());
     buf.extend_from_slice(&e.key_event_id);
     buf.extend_from_slice(&e.recipient_event_id);
@@ -117,7 +117,7 @@ use rusqlite::Connection;
 pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "
-        CREATE TABLE IF NOT EXISTS secret_shared (
+        CREATE TABLE IF NOT EXISTS key_shared (
             recorded_by TEXT NOT NULL,
             event_id TEXT NOT NULL,
             key_event_id TEXT NOT NULL,
@@ -130,7 +130,7 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// Build projector-local context for SecretShared projection.
+/// Build projector-local context for KeyShared projection.
 pub fn build_projector_context(
     conn: &Connection,
     recorded_by: &str,
@@ -138,8 +138,8 @@ pub fn build_projector_context(
     parsed: &ParsedEvent,
 ) -> Result<ContextSnapshot, Box<dyn std::error::Error>> {
     let ss = match parsed {
-        ParsedEvent::SecretShared(ss) => ss,
-        _ => return Err("secret_shared context loader called for non-secret_shared event".into()),
+        ParsedEvent::KeyShared(ss) => ss,
+        _ => return Err("key_shared context loader called for non-key_shared event".into()),
     };
 
     let recipient_b64 = event_id_to_base64(&ss.recipient_event_id);
@@ -150,10 +150,10 @@ pub fn build_projector_context(
         |row| row.get(0),
     )?;
 
-    let invite_privkey_row: Option<Vec<u8>> = conn
+    let invite_secret_row: Option<Vec<u8>> = conn
         .query_row(
             "SELECT private_key
-             FROM invite_privkeys
+             FROM invite_secrets
              WHERE recorded_by = ?1
                AND event_id = ?2
                AND invite_event_id = ?3
@@ -163,7 +163,7 @@ pub fn build_projector_context(
         )
         .ok();
 
-    let private_key_bytes = match invite_privkey_row {
+    let private_key_bytes = match invite_secret_row {
         Some(v) => v,
         None => {
             return Ok(ContextSnapshot {
@@ -213,7 +213,7 @@ pub fn build_projector_context(
     })
 }
 
-/// Pure projector: SecretShared → secret_shared table.
+/// Pure projector: KeyShared → key_shared table.
 /// Rejects if recipient has been removed (InvRemovalExclusion).
 pub fn project_pure(
     recorded_by: &str,
@@ -222,8 +222,8 @@ pub fn project_pure(
     ctx: &ContextSnapshot,
 ) -> ProjectorResult {
     let ss = match parsed {
-        ParsedEvent::SecretShared(s) => s,
-        _ => return ProjectorResult::reject("not a secret_shared event".to_string()),
+        ParsedEvent::KeyShared(s) => s,
+        _ => return ProjectorResult::reject("not a key_shared event".to_string()),
     };
 
     let key_b64 = event_id_to_base64(&ss.key_event_id);
@@ -234,7 +234,7 @@ pub fn project_pure(
     }
 
     let ops = vec![WriteOp::InsertOrIgnore {
-        table: "secret_shared",
+        table: "key_shared",
         columns: vec![
             "recorded_by",
             "event_id",
@@ -257,7 +257,7 @@ pub fn project_pure(
     };
 
     let secret_event =
-        crate::event_modules::secret_key::deterministic_secret_key_event(material.key_bytes);
+        crate::event_modules::key_secret::deterministic_key_secret_event(material.key_bytes);
     let secret_blob = match crate::event_modules::encode_event(&secret_event) {
         Ok(v) => v,
         Err(err) => {
@@ -280,18 +280,18 @@ pub fn project_pure(
     )
 }
 
-pub static SECRET_SHARED_META: EventTypeMeta = EventTypeMeta {
-    type_code: EVENT_TYPE_SECRET_SHARED,
+pub static KEY_SHARED_META: EventTypeMeta = EventTypeMeta {
+    type_code: EVENT_TYPE_KEY_SHARED,
     type_name: "key_shared",
-    projection_table: "secret_shared",
+    projection_table: "key_shared",
     share_scope: ShareScope::Shared,
     dep_fields: &["recipient_event_id", "unwrap_key_event_id", "signed_by"],
     dep_field_type_codes: &[&[10, 12], &[28], &[]],
     signer_required: true,
     signature_byte_len: 64,
     encryptable: false,
-    parse: parse_secret_shared,
-    encode: encode_secret_shared,
+    parse: parse_key_shared,
+    encode: encode_key_shared,
     projector: project_pure,
     context_loader: build_projector_context,
 };

@@ -554,7 +554,7 @@ fn test_removal_enforcement() {
 }
 
 #[test]
-fn test_secret_shared_key_wrap() {
+fn test_key_shared_key_wrap() {
     use topo::projection::encrypted::wrap_key_for_recipient;
 
     let alice = Peer::new("alice");
@@ -562,24 +562,24 @@ fn test_secret_shared_key_wrap() {
     harness.track(&alice);
     let chain = bootstrap_peer(&alice);
 
-    // Create SecretKey
-    let secret_key_bytes: [u8; 32] = rand::random();
-    let sk_eid = alice.create_secret_key_deterministic(
-        secret_key_bytes,
-        topo::event_modules::secret_key::deterministic_secret_key_created_at_ms(&secret_key_bytes),
+    // Create KeySecret
+    let key_secret_bytes: [u8; 32] = rand::random();
+    let sk_eid = alice.create_key_secret_deterministic(
+        key_secret_bytes,
+        topo::event_modules::key_secret::deterministic_key_secret_created_at_ms(&key_secret_bytes),
     );
 
-    // Create local invite_privkey for the bootstrap invite.
+    // Create local invite_secret for the bootstrap invite.
     let unwrap_key_eid =
-        alice.create_invite_privkey(&chain.user_invite_eid, chain.invite_key.to_bytes());
+        alice.create_invite_secret(&chain.user_invite_eid, chain.invite_key.to_bytes());
 
-    // Create SecretShared wrapping to the bootstrap invite.
+    // Create KeyShared wrapping to the bootstrap invite.
     let wrapped_key = wrap_key_for_recipient(
         &chain.peer_shared_key,
         &chain.invite_key.verifying_key(),
-        &secret_key_bytes,
+        &key_secret_bytes,
     );
-    let ss_eid = alice.create_secret_shared(
+    let ss_eid = alice.create_key_shared(
         &chain.peer_shared_key,
         &sk_eid,
         &chain.user_invite_eid,
@@ -597,25 +597,25 @@ fn test_secret_shared_key_wrap() {
             |row| row.get(0),
         )
         .unwrap();
-    assert!(valid, "secret_shared should be valid");
+    assert!(valid, "key_shared should be valid");
 
     let ss_count: i64 = db
         .query_row(
-            "SELECT COUNT(*) FROM secret_shared WHERE recorded_by = ?1",
+            "SELECT COUNT(*) FROM key_shared WHERE recorded_by = ?1",
             rusqlite::params![&alice.identity],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(ss_count, 1, "secret_shared should be in projection table");
+    assert_eq!(ss_count, 1, "key_shared should be in projection table");
 
     harness.finish();
 }
 
-/// Out-of-order test: SecretShared blocks until the local invite_privkey dep exists,
-/// then unblocks via normal cascade once invite_privkey is projected.
+/// Out-of-order test: KeyShared blocks until the local invite_secret dep exists,
+/// then unblocks via normal cascade once invite_secret is projected.
 #[test]
-fn test_secret_shared_blocks_until_signer_valid() {
-    use topo::event_modules::{ParsedEvent, SecretSharedEvent};
+fn test_key_shared_blocks_until_signer_valid() {
+    use topo::event_modules::{KeySharedEvent, ParsedEvent};
     use topo::projection::create::create_signed_event_staged;
     use topo::projection::encrypted::wrap_key_for_recipient;
 
@@ -627,32 +627,32 @@ fn test_secret_shared_blocks_until_signer_valid() {
     let chain = bootstrap_peer(&alice);
 
     // Alice creates a local content key.
-    let secret_key_bytes: [u8; 32] = rand::random();
-    let sk_eid = alice.create_secret_key_deterministic(
-        secret_key_bytes,
-        topo::event_modules::secret_key::deterministic_secret_key_created_at_ms(&secret_key_bytes),
+    let key_secret_bytes: [u8; 32] = rand::random();
+    let sk_eid = alice.create_key_secret_deterministic(
+        key_secret_bytes,
+        topo::event_modules::key_secret::deterministic_key_secret_created_at_ms(&key_secret_bytes),
     );
 
-    // SecretShared depends on deterministic invite_privkey event id.
-    // Do not emit invite_privkey yet, so this should block.
-    let invite_privkey_eid =
-        topo::event_modules::invite_privkey::deterministic_invite_privkey_event_id(
+    // KeyShared depends on deterministic invite_secret event id.
+    // Do not emit invite_secret yet, so this should block.
+    let invite_secret_eid =
+        topo::event_modules::invite_secret::deterministic_invite_secret_event_id(
             &chain.user_invite_eid,
             &chain.invite_key.to_bytes(),
         );
     let wrapped_key = wrap_key_for_recipient(
         &chain.peer_shared_key,
         &chain.invite_key.verifying_key(),
-        &secret_key_bytes,
+        &key_secret_bytes,
     );
-    let ss_event = ParsedEvent::SecretShared(SecretSharedEvent {
+    let ss_event = ParsedEvent::KeyShared(KeySharedEvent {
         created_at_ms: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64,
         key_event_id: sk_eid,
         recipient_event_id: chain.user_invite_eid,
-        unwrap_key_event_id: invite_privkey_eid,
+        unwrap_key_event_id: invite_secret_eid,
         wrapped_key,
         signed_by: chain.peer_shared_eid,
         signer_type: 5,
@@ -668,7 +668,7 @@ fn test_secret_shared_blocks_until_signer_valid() {
     .expect("staged create should succeed even if blocked");
     let ss_b64 = event_id_to_base64(&ss_eid);
 
-    // SecretShared should be blocked: invite_privkey dep missing.
+    // KeyShared should be blocked: invite_secret dep missing.
     let blocked_count: i64 = alice_db
         .query_row(
             "SELECT COUNT(*) FROM blocked_event_deps WHERE peer_id = ?1 AND event_id = ?2",
@@ -678,13 +678,13 @@ fn test_secret_shared_blocks_until_signer_valid() {
         .unwrap();
     assert!(
         blocked_count >= 1,
-        "SecretShared should block until invite_privkey exists"
+        "KeyShared should block until invite_secret exists"
     );
 
-    // Emit deterministic invite_privkey; normal cascade should unblock secret_shared.
-    let _ = alice.create_invite_privkey(&chain.user_invite_eid, chain.invite_key.to_bytes());
+    // Emit deterministic invite_secret; normal cascade should unblock key_shared.
+    let _ = alice.create_invite_secret(&chain.user_invite_eid, chain.invite_key.to_bytes());
 
-    // After invite_privkey projection + cascade, SecretShared should be valid.
+    // After invite_secret projection + cascade, KeyShared should be valid.
     let ss_valid: bool = alice_db
         .query_row(
             "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
@@ -694,19 +694,19 @@ fn test_secret_shared_blocks_until_signer_valid() {
         .unwrap();
     assert!(
         ss_valid,
-        "SecretShared should be valid after invite_privkey is projected"
+        "KeyShared should be valid after invite_secret is projected"
     );
 
     let ss_projected: i64 = alice_db
         .query_row(
-            "SELECT COUNT(*) FROM secret_shared WHERE recorded_by = ?1",
+            "SELECT COUNT(*) FROM key_shared WHERE recorded_by = ?1",
             rusqlite::params![&alice.identity],
             |row| row.get(0),
         )
         .unwrap();
     assert!(
         ss_projected >= 1,
-        "SecretShared should be in projection table after cascade"
+        "KeyShared should be in projection table after cascade"
     );
 
     harness.finish();
@@ -725,7 +725,7 @@ fn test_encrypted_blocks_then_unblocks_on_key_materialization() {
     // Step 1: Alice creates a key and encrypted message.
     let key_bytes: [u8; 32] = rand::random();
     let fixed_ts = 7_000_000u64;
-    let sk_eid = alice.create_secret_key_deterministic(key_bytes, fixed_ts);
+    let sk_eid = alice.create_key_secret_deterministic(key_bytes, fixed_ts);
     let enc_eid = alice.create_encrypted_message(&sk_eid, "Encrypted before key on bob");
 
     // Verify alice can decrypt her own message
@@ -787,7 +787,7 @@ fn test_encrypted_blocks_then_unblocks_on_key_materialization() {
     );
 
     // Step 3: Materialize the same deterministic key on Bob.
-    let bob_sk_eid = bob.create_secret_key_deterministic(key_bytes, fixed_ts);
+    let bob_sk_eid = bob.create_key_secret_deterministic(key_bytes, fixed_ts);
     assert_eq!(
         bob_sk_eid, sk_eid,
         "Deterministic key event IDs must match across peers"
@@ -817,13 +817,13 @@ fn test_encrypted_blocks_then_unblocks_on_key_materialization() {
 }
 
 /// Deterministic key event ID test: inviter wraps key, invitee unwraps, both see
-/// the same secret_key event ID. This validates the cross-peer key agreement property
+/// the same key_secret event ID. This validates the cross-peer key agreement property
 /// that underpins the invite key wrap/unwrap bootstrap flow.
 #[test]
 fn test_deterministic_key_event_id_matches_across_peers() {
     use ed25519_dalek::SigningKey;
     use topo::crypto::hash_event;
-    use topo::event_modules::{encode_event, ParsedEvent, SecretKeyEvent};
+    use topo::event_modules::{encode_event, KeySecretEvent, ParsedEvent};
     use topo::projection::encrypted::{unwrap_key_from_sender, wrap_key_for_recipient};
 
     let alice = Peer::new_with_identity("alice_det_key");
@@ -846,8 +846,8 @@ fn test_deterministic_key_event_id_matches_across_peers() {
     ts_bytes.copy_from_slice(&digest[..8]);
     let deterministic_ts = u64::from_le_bytes(ts_bytes);
 
-    // Alice creates her local secret_key with deterministic timestamp.
-    let alice_sk_eid = alice.create_secret_key_deterministic(plaintext_key, deterministic_ts);
+    // Alice creates her local key_secret with deterministic timestamp.
+    let alice_sk_eid = alice.create_key_secret_deterministic(plaintext_key, deterministic_ts);
 
     // Simulate invite wrap/unwrap with fresh key pairs (sender wraps for invite key).
     let mut rng = rand::thread_rng();
@@ -862,22 +862,22 @@ fn test_deterministic_key_event_id_matches_across_peers() {
         "Unwrapped key must match original plaintext"
     );
 
-    // Bob materializes the deterministic secret_key from unwrapped bytes.
-    let bob_sk_eid = bob.create_secret_key_deterministic(unwrapped, deterministic_ts);
+    // Bob materializes the deterministic key_secret from unwrapped bytes.
+    let bob_sk_eid = bob.create_key_secret_deterministic(unwrapped, deterministic_ts);
     assert_eq!(
         bob_sk_eid, alice_sk_eid,
         "Deterministic key event ID must match between inviter and invitee"
     );
 
     // Also verify via manual event construction that the event_id matches.
-    let sk_evt = ParsedEvent::SecretKey(SecretKeyEvent {
+    let sk_evt = ParsedEvent::KeySecret(KeySecretEvent {
         created_at_ms: deterministic_ts,
         key_bytes: plaintext_key,
     });
     let expected_eid = hash_event(&encode_event(&sk_evt).unwrap());
     assert_eq!(
         expected_eid, alice_sk_eid,
-        "Manual hash matches create_secret_key_deterministic"
+        "Manual hash matches create_key_secret_deterministic"
     );
 
     harness.finish();
@@ -911,7 +911,7 @@ fn test_wrap_unwrap_encrypted_convergence() {
     ts_bytes.copy_from_slice(&digest[..8]);
     let deterministic_ts = u64::from_le_bytes(ts_bytes);
 
-    let alice_sk_eid = alice.create_secret_key_deterministic(plaintext_key, deterministic_ts);
+    let alice_sk_eid = alice.create_key_secret_deterministic(plaintext_key, deterministic_ts);
 
     // Alice creates an encrypted message.
     let enc_eid = alice.create_encrypted_message(&alice_sk_eid, "Wrapped key convergence test");
@@ -934,7 +934,7 @@ fn test_wrap_unwrap_encrypted_convergence() {
     assert_eq!(unwrapped, plaintext_key);
 
     // Bob materializes the deterministic key.
-    let bob_sk_eid = bob.create_secret_key_deterministic(unwrapped, deterministic_ts);
+    let bob_sk_eid = bob.create_key_secret_deterministic(unwrapped, deterministic_ts);
     assert_eq!(bob_sk_eid, alice_sk_eid, "Key event IDs match after unwrap");
 
     // Copy the encrypted event to Bob's DB (simulating sync).

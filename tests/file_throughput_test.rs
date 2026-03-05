@@ -14,8 +14,8 @@ use topo::crypto::{event_id_to_base64, hash_event, EventId};
 use topo::db::{open_connection, schema::create_tables};
 use topo::event_modules::{
     self as events, file_slice::FILE_SLICE_CIPHERTEXT_BYTES, DeviceInviteEvent, FileSliceEvent,
-    InviteAcceptedEvent, MessageAttachmentEvent, MessageEvent, ParsedEvent, PeerEvent,
-    PeerSharedEvent, SecretKeyEvent, TenantEvent, UserEvent, UserInviteEvent, WorkspaceEvent,
+    InviteAcceptedEvent, KeySecretEvent, MessageAttachmentEvent, MessageEvent, ParsedEvent,
+    PeerSharedEvent, TenantEvent, UserEvent, UserInviteEvent, WorkspaceEvent,
 };
 use topo::projection::apply::project_one;
 use topo::projection::signer::sign_event_bytes;
@@ -86,15 +86,6 @@ fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (EventId, Signin
     let tenant_blob = events::encode_event(&tenant).unwrap();
     let tenant_eid = insert_event_raw(conn, recorded_by, &tenant_blob);
     project_one(conn, recorded_by, &tenant_eid).unwrap();
-
-    let peer = ParsedEvent::Peer(PeerEvent {
-        created_at_ms: now_ms(),
-        tenant_event_id: tenant_eid,
-        public_key: peer_key.verifying_key().to_bytes(),
-    });
-    let peer_blob = events::encode_event(&peer).unwrap();
-    let peer_eid = insert_event_raw(conn, recorded_by, &peer_blob);
-    project_one(conn, recorded_by, &peer_eid).unwrap();
 
     let workspace_key = SigningKey::generate(&mut rng);
     let net = ParsedEvent::Workspace(WorkspaceEvent {
@@ -198,7 +189,7 @@ fn create_prereqs(conn: &Connection, recorded_by: &str) -> (EventId, EventId, Ev
     project_one(conn, recorded_by, &msg_eid).unwrap();
 
     // Secret key (for attachment key_event_id dep)
-    let sk = ParsedEvent::SecretKey(SecretKeyEvent {
+    let sk = ParsedEvent::KeySecret(KeySecretEvent {
         created_at_ms: now_ms(),
         key_bytes: [0xBB; 32],
     });

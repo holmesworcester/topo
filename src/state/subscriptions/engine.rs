@@ -141,14 +141,13 @@ fn parsed_event_type_name(parsed: &ParsedEvent) -> &'static str {
         ParsedEvent::UserRemoved(_) => "user_removed",
         ParsedEvent::PeerRemoved(_) => "peer_removed",
         ParsedEvent::Encrypted(_) => "encrypted",
-        ParsedEvent::SecretKey(_) => "key_secret",
-        ParsedEvent::SecretShared(_) => "key_shared",
-        ParsedEvent::Peer(_) => "peer",
+        ParsedEvent::KeySecret(_) => "key_secret",
+        ParsedEvent::KeyShared(_) => "key_shared",
         ParsedEvent::Tenant(_) => "tenant",
         ParsedEvent::FileSlice(_) => "file_slice",
         ParsedEvent::BenchDep(_) => "bench_dep",
-        ParsedEvent::LocalSignerSecret(_) => "peer_secret",
-        ParsedEvent::InvitePrivkey(_) => "invite_secret",
+        ParsedEvent::PeerSecret(_) => "peer_secret",
+        ParsedEvent::InviteSecret(_) => "invite_secret",
     }
 }
 

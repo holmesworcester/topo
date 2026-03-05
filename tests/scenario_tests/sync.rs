@@ -268,7 +268,7 @@ async fn test_zero_loss_stress() {
     // both sides, stable for 5 consecutive polls at 200ms, before dropping sync.
     // Each peer creates local-scope (non-synced) events during workspace
     // bootstrap/key setup:
-    // InviteAccepted + Secret + 3×LocalSignerSecret (+ optional InvitePrivkey).
+    // InviteAccepted + Secret + 3×PeerSecret (+ optional InviteSecret).
     let local_event_budget = 8;
     let quiesce_needed = 5u32;
     let mut quiesce_streak = 0u32;
@@ -739,13 +739,13 @@ async fn test_local_only_events_not_synced() {
     let harness = ScenarioHarness::new();
     harness.track(&alice);
     harness.track(&bob);
-    let bob_initial_keys = bob.secret_key_count();
+    let bob_initial_keys = bob.key_secret_count();
 
     // Both peers materialize the same PSK locally
     let key_bytes: [u8; 32] = rand::random();
     let fixed_ts = 3000000u64;
-    let sk_eid = alice.create_secret_key_deterministic(key_bytes, fixed_ts);
-    let sk_eid_bob = bob.create_secret_key_deterministic(key_bytes, fixed_ts);
+    let sk_eid = alice.create_key_secret_deterministic(key_bytes, fixed_ts);
+    let sk_eid_bob = bob.create_key_secret_deterministic(key_bytes, fixed_ts);
     assert_eq!(
         sk_eid, sk_eid_bob,
         "deterministic PSK should produce same event_id"
@@ -770,7 +770,7 @@ async fn test_local_only_events_not_synced() {
     drop(sync);
 
     // Bob should NOT have received Alice's SK event -- his store has his own SK
-    assert_eq!(bob.secret_key_count(), bob_initial_keys + 1);
+    assert_eq!(bob.key_secret_count(), bob_initial_keys + 1);
     // Bob: encrypted inner rejected (foreign signer), normal msg blocked (foreign signer)
     assert_eq!(bob.scoped_message_count(), 0);
 
@@ -796,8 +796,8 @@ async fn test_psk_two_set_isolation() {
     // Alice and Bob use DIFFERENT PSKs
     let key_a: [u8; 32] = rand::random();
     let key_b: [u8; 32] = rand::random();
-    let sk_eid_alice = alice.create_secret_key(key_a);
-    let _sk_eid_bob = bob.create_secret_key(key_b);
+    let sk_eid_alice = alice.create_key_secret(key_a);
+    let _sk_eid_bob = bob.create_key_secret(key_b);
 
     // Alice encrypts with her key
     let enc_eid = alice.create_encrypted_message(&sk_eid_alice, "Alice secret");

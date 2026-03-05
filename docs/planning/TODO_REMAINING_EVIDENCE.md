@@ -46,7 +46,7 @@ Maps each TODO section/item to file/test proof of completion.
 |------|----------|
 | Contract definition | `src/contracts/transport_identity_contract.rs`: `TransportIdentityIntent` enum + `TransportIdentityAdapter` trait |
 | Sole materialization point | `src/transport/identity_adapter.rs`: `ConcreteTransportIdentityAdapter` — only code calling raw install functions |
-| Event module usage | `src/event_modules/local_signer_secret.rs:139-144`: emits `ApplyTransportIdentityIntent` |
+| Event module usage | `src/event_modules/peer_secret.rs:139-144`: emits `ApplyTransportIdentityIntent` |
 | Projection routing | `src/projection/apply/write_exec.rs:187-193`: routes through adapter |
 | Service usage | `src/service.rs:1329-1337, 1466-1474`: uses adapter for identity intents, not raw calls |
 | No raw install leaks | `scripts/check_boundary_imports.sh:56-62`: enforces no raw calls in service/event_modules/projection |

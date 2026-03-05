@@ -25,50 +25,8 @@ pub(crate) fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-/// Ensure a local `peer` event exists for this tenant and return its event id.
-/// Uses the provided key material as the peer public identity when creating.
-pub(crate) fn ensure_local_peer_event(
-    conn: &Connection,
-    recorded_by: &str,
-    tenant_event_id: &EventId,
-    peer_key: &SigningKey,
-) -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
-    let existing: Option<(String, String)> = conn
-        .query_row(
-            "SELECT event_id, tenant_event_id
-             FROM peers_local
-             WHERE recorded_by = ?1
-             ORDER BY created_at ASC, event_id ASC
-             LIMIT 1",
-            rusqlite::params![recorded_by],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .ok();
-    if let Some((eid_b64, tenant_eid_b64)) = existing {
-        let existing_eid =
-            event_id_from_base64(&eid_b64).ok_or("invalid peers_local.event_id base64")?;
-        let existing_tenant_eid =
-            event_id_from_base64(&tenant_eid_b64).ok_or("invalid peers_local.tenant_event_id")?;
-        if existing_tenant_eid != *tenant_event_id {
-            return Err("existing peer event is bound to a different tenant_event_id".into());
-        }
-        return Ok(existing_eid);
-    }
-
-    let evt = ParsedEvent::Peer(PeerEvent {
-        created_at_ms: now_ms(),
-        tenant_event_id: *tenant_event_id,
-        public_key: peer_key.verifying_key().to_bytes(),
-    });
-    Ok(event_id_or_blocked(create_event_synchronous(
-        conn,
-        recorded_by,
-        &evt,
-    ))?)
-}
-
 /// Ensure a local `tenant` event exists for this tenant and return its event id.
-/// `tenant` is the local root; `peer` depends on tenant.
+/// `tenant` is the local root for local-only identity events.
 pub(crate) fn ensure_local_tenant_event(
     conn: &Connection,
     recorded_by: &str,
@@ -95,20 +53,19 @@ pub(crate) fn ensure_local_tenant_event(
         event_id_or_blocked(create_event_synchronous(conn, recorded_by, &tenant_evt))?
     };
 
-    let _peer_event_id = ensure_local_peer_event(conn, recorded_by, &tenant_event_id, peer_key)?;
     Ok(tenant_event_id)
 }
 
-fn create_deterministic_secret_key_event(
+fn create_deterministic_key_secret_event(
     conn: &Connection,
     recorded_by: &str,
     key_bytes: [u8; 32],
 ) -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
-    let expected = crate::event_modules::secret_key::deterministic_secret_key_event_id(&key_bytes);
-    let sk_evt = crate::event_modules::secret_key::deterministic_secret_key_event(key_bytes);
+    let expected = crate::event_modules::key_secret::deterministic_key_secret_event_id(&key_bytes);
+    let sk_evt = crate::event_modules::key_secret::deterministic_key_secret_event(key_bytes);
     let created = create_event_synchronous(conn, recorded_by, &sk_evt)?;
     if created != expected {
-        return Err("secret_key event_id mismatch for deterministic key material".into());
+        return Err("key_secret event_id mismatch for deterministic key material".into());
     }
     Ok(created)
 }
@@ -180,13 +137,13 @@ pub(crate) fn ensure_content_key_for_peer(
 ) -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
     let existing: Option<String> = conn
         .query_row(
-            "SELECT event_id FROM secret_keys WHERE recorded_by = ?1 ORDER BY rowid ASC LIMIT 1",
+            "SELECT event_id FROM key_secrets WHERE recorded_by = ?1 ORDER BY rowid ASC LIMIT 1",
             rusqlite::params![recorded_by],
             |row| row.get(0),
         )
         .ok();
     if let Some(eid_b64) = existing {
-        let eid = event_id_from_base64(&eid_b64).ok_or("invalid secret_keys.event_id base64")?;
+        let eid = event_id_from_base64(&eid_b64).ok_or("invalid key_secrets.event_id base64")?;
         return Ok(eid);
     }
     create_content_key(conn, recorded_by)
@@ -194,7 +151,7 @@ pub(crate) fn ensure_content_key_for_peer(
 
 /// Wrap the workspace's content key for an invitee's invite public key.
 /// Looks up the first Secret event for this tenant, wraps it, and creates
-/// a SecretShared event with explicit dep on deterministic invite_privkey.
+/// a KeyShared event with explicit dep on deterministic invite_secret.
 pub(crate) fn wrap_content_key_for_invite(
     conn: &Connection,
     recorded_by: &str,
@@ -206,35 +163,34 @@ pub(crate) fn wrap_content_key_for_invite(
     let key_event_id = ensure_content_key_for_peer(conn, recorded_by)?;
     let key_event_b64 = event_id_to_base64(&key_event_id);
     let key_bytes: Vec<u8> = conn.query_row(
-        "SELECT key_bytes FROM secret_keys WHERE recorded_by = ?1 AND event_id = ?2 LIMIT 1",
+        "SELECT key_bytes FROM key_secrets WHERE recorded_by = ?1 AND event_id = ?2 LIMIT 1",
         rusqlite::params![recorded_by, &key_event_b64],
         |row| row.get(0),
     )?;
     if key_bytes.len() != 32 {
-        return Err("corrupt key_bytes in secret_keys".into());
+        return Err("corrupt key_bytes in key_secrets".into());
     }
 
     let mut plaintext_key = [0u8; 32];
     plaintext_key.copy_from_slice(&key_bytes);
 
     let invite_private = invite_key.to_bytes();
-    let invite_privkey_event_id =
-        crate::event_modules::invite_privkey::deterministic_invite_privkey_event_id(
+    let invite_secret_event_id =
+        crate::event_modules::invite_secret::deterministic_invite_secret_event_id(
             invite_event_id,
             &invite_private,
         );
-    let invite_privkey_evt =
-        crate::event_modules::invite_privkey::deterministic_invite_privkey_event(
-            *invite_event_id,
-            invite_private,
-        );
-    let created_invite_privkey_event_id = event_id_or_blocked(create_event_synchronous(
+    let invite_secret_evt = crate::event_modules::invite_secret::deterministic_invite_secret_event(
+        *invite_event_id,
+        invite_private,
+    );
+    let created_invite_secret_event_id = event_id_or_blocked(create_event_synchronous(
         conn,
         recorded_by,
-        &invite_privkey_evt,
+        &invite_secret_evt,
     ))?;
-    if created_invite_privkey_event_id != invite_privkey_event_id {
-        return Err("invite_privkey event_id mismatch for deterministic key material".into());
+    if created_invite_secret_event_id != invite_secret_event_id {
+        return Err("invite_secret event_id mismatch for deterministic key material".into());
     }
 
     let wrapped = wrap_key_for_recipient(
@@ -243,11 +199,11 @@ pub(crate) fn wrap_content_key_for_invite(
         &plaintext_key,
     );
 
-    let ss_evt = ParsedEvent::SecretShared(SecretSharedEvent {
+    let ss_evt = ParsedEvent::KeyShared(KeySharedEvent {
         created_at_ms: now_ms(),
         key_event_id,
         recipient_event_id: *invite_event_id,
-        unwrap_key_event_id: invite_privkey_event_id,
+        unwrap_key_event_id: invite_secret_event_id,
         wrapped_key: wrapped,
         signed_by: *sender_peer_shared_event_id,
         signer_type: 5,
@@ -263,26 +219,26 @@ pub(crate) fn wrap_content_key_for_invite(
     Ok(())
 }
 
-/// Persist local invite private key material as deterministic invite_privkey.
-/// Returns the deterministic invite_privkey event id.
-pub(crate) fn store_invite_privkey(
+/// Persist local invite private key material as deterministic invite_secret.
+/// Returns the deterministic invite_secret event id.
+pub(crate) fn store_invite_secret(
     conn: &Connection,
     recorded_by: &str,
     invite_event_id: &EventId,
     invite_key: &SigningKey,
 ) -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
     let private_key = invite_key.to_bytes();
-    let expected = crate::event_modules::invite_privkey::deterministic_invite_privkey_event_id(
+    let expected = crate::event_modules::invite_secret::deterministic_invite_secret_event_id(
         invite_event_id,
         &private_key,
     );
-    let evt = crate::event_modules::invite_privkey::deterministic_invite_privkey_event(
+    let evt = crate::event_modules::invite_secret::deterministic_invite_secret_event(
         *invite_event_id,
         private_key,
     );
     let created = event_id_or_blocked(create_event_synchronous(conn, recorded_by, &evt))?;
     if created != expected {
-        return Err("invite_privkey event_id mismatch for deterministic key material".into());
+        return Err("invite_secret event_id mismatch for deterministic key material".into());
     }
     Ok(created)
 }
@@ -476,5 +432,5 @@ fn create_content_key(
     let mut content_key_bytes = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rng, &mut content_key_bytes);
 
-    create_deterministic_secret_key_event(conn, recorded_by, content_key_bytes)
+    create_deterministic_key_secret_event(conn, recorded_by, content_key_bytes)
 }

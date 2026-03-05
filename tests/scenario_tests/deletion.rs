@@ -129,16 +129,16 @@ async fn test_encrypted_deletion() {
     let alice = Peer::new_with_identity("alice");
     let harness = ScenarioHarness::new();
     harness.track(&alice);
-    let initial_keys = alice.secret_key_count();
+    let initial_keys = alice.key_secret_count();
 
     // Create a secret key
     let key_bytes: [u8; 32] = rand::random();
-    let sk_eid = alice.create_secret_key(key_bytes);
+    let sk_eid = alice.create_key_secret(key_bytes);
 
     // Create an encrypted message
     let _enc_msg_eid = alice.create_encrypted_message(&sk_eid, "Encrypted delete me");
 
-    assert_eq!(alice.secret_key_count(), initial_keys + 1);
+    assert_eq!(alice.key_secret_count(), initial_keys + 1);
     assert_eq!(alice.scoped_message_count(), 1); // inner message projected
 
     // Get the inner message's event_id from the messages table

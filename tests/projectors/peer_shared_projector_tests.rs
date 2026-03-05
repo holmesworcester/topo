@@ -105,7 +105,7 @@ mod tests {
 
     #[test]
     fn test_peer_shared_rejects_non_peer_shared_event() {
-        let parsed = ParsedEvent::SecretKey(topo::event_modules::secret_key::SecretKeyEvent {
+        let parsed = ParsedEvent::KeySecret(topo::event_modules::key_secret::KeySecretEvent {
             created_at_ms: 1,
             key_bytes: [1u8; 32],
         });

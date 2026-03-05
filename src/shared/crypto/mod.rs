@@ -154,7 +154,7 @@ fn derive_wrap_key(local_private: &SigningKey, remote_public: &VerifyingKey) -> 
 /// Wrap a 32-byte secret key for a recipient identified by their Ed25519 public key.
 ///
 /// Simplified wrap for POC: XOR plaintext key with a derived wrap key.
-/// Authentication is provided by the SecretShared event signature.
+/// Authentication is provided by the KeyShared event signature.
 pub fn wrap_key_for_recipient(
     sender_private: &SigningKey,
     recipient_public: &VerifyingKey,

@@ -16,18 +16,18 @@ const CANONICAL_EVENT_FILES: &[&str] = &[
     "src/event_modules/message_attachment/wire.rs",
     "src/event_modules/bench_dep.rs",
     "src/event_modules/message_deletion/wire.rs",
-    "src/event_modules/secret_key.rs",
-    "src/event_modules/secret_shared.rs",
+    "src/event_modules/key_secret.rs",
+    "src/event_modules/key_shared.rs",
     "src/event_modules/workspace/wire.rs",
     "src/event_modules/invite_accepted.rs",
-    "src/event_modules/user_invite/wire.rs",
+    "src/event_modules/user_invite_shared/wire.rs",
     "src/event_modules/user/wire.rs",
-    "src/event_modules/device_invite/wire.rs",
+    "src/event_modules/peer_invite_shared/wire.rs",
     "src/event_modules/peer_shared/wire.rs",
     "src/event_modules/admin/wire.rs",
     "src/event_modules/user_removed.rs",
     "src/event_modules/peer_removed.rs",
-    "src/event_modules/invite_privkey.rs",
+    "src/event_modules/invite_secret.rs",
 ];
 
 /// Denied field names that indicate variable-length wire format logic.

@@ -314,15 +314,15 @@ pub fn svc_event_list(
     use std::collections::HashMap;
 
     // Load secret keys for this peer (for decryption attempts).
-    let mut secret_keys: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut key_secrets: HashMap<String, Vec<u8>> = HashMap::new();
     if let Ok(mut stmt) =
-        db.prepare("SELECT event_id, key_bytes FROM secret_keys WHERE recorded_by = ?1")
+        db.prepare("SELECT event_id, key_bytes FROM key_secrets WHERE recorded_by = ?1")
     {
         if let Ok(rows) = stmt.query_map(rusqlite::params![recorded_by], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
         }) {
             for row in rows.flatten() {
-                secret_keys.insert(row.0, row.1);
+                key_secrets.insert(row.0, row.1);
             }
         }
     }
@@ -370,7 +370,7 @@ pub fn svc_event_list(
         // Attempt decryption for encrypted events.
         let decrypted_inner = if let Ok(ParsedEvent::Encrypted(enc)) = &parsed {
             let key_id_b64 = event_id_to_base64(&enc.key_event_id);
-            secret_keys.get(&key_id_b64).and_then(|key_bytes| {
+            key_secrets.get(&key_id_b64).and_then(|key_bytes| {
                 if key_bytes.len() != 32 {
                     return None;
                 }

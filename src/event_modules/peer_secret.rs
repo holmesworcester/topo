@@ -1,19 +1,19 @@
 use super::registry::{EventTypeMeta, ShareScope};
-use super::{EventError, ParsedEvent, EVENT_TYPE_LOCAL_SIGNER_SECRET};
+use super::{EventError, ParsedEvent, EVENT_TYPE_PEER_SECRET};
 
 pub const SIGNER_KIND_WORKSPACE: u8 = 1;
 pub const SIGNER_KIND_USER: u8 = 2;
 pub const SIGNER_KIND_PEER_SHARED: u8 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LocalSignerSecretEvent {
+pub struct PeerSecretEvent {
     pub created_at_ms: u64,
     pub signer_event_id: [u8; 32],
     pub signer_kind: u8,
     pub private_key_bytes: [u8; 32],
 }
 
-impl super::Describe for LocalSignerSecretEvent {
+impl super::Describe for PeerSecretEvent {
     fn human_fields(&self) -> Vec<(&'static str, String)> {
         vec![
             (
@@ -39,7 +39,7 @@ impl super::Describe for LocalSignerSecretEvent {
 /// [9..41]  signer_event_id (32 bytes)
 /// [41]     signer_kind (u8: 1=workspace, 2=user, 3=peer_shared)
 /// [42..74] private_key_bytes (32 bytes)
-pub fn parse_local_signer_secret(blob: &[u8]) -> Result<ParsedEvent, EventError> {
+pub fn parse_peer_secret(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if blob.len() < 74 {
         return Err(EventError::TooShort {
             expected: 74,
@@ -52,9 +52,9 @@ pub fn parse_local_signer_secret(blob: &[u8]) -> Result<ParsedEvent, EventError>
             actual: blob.len(),
         });
     }
-    if blob[0] != EVENT_TYPE_LOCAL_SIGNER_SECRET {
+    if blob[0] != EVENT_TYPE_PEER_SECRET {
         return Err(EventError::WrongType {
-            expected: EVENT_TYPE_LOCAL_SIGNER_SECRET,
+            expected: EVENT_TYPE_PEER_SECRET,
             actual: blob[0],
         });
     }
@@ -74,7 +74,7 @@ pub fn parse_local_signer_secret(blob: &[u8]) -> Result<ParsedEvent, EventError>
     let mut private_key_bytes = [0u8; 32];
     private_key_bytes.copy_from_slice(&blob[42..74]);
 
-    Ok(ParsedEvent::LocalSignerSecret(LocalSignerSecretEvent {
+    Ok(ParsedEvent::PeerSecret(PeerSecretEvent {
         created_at_ms,
         signer_event_id,
         signer_kind,
@@ -82,9 +82,9 @@ pub fn parse_local_signer_secret(blob: &[u8]) -> Result<ParsedEvent, EventError>
     }))
 }
 
-pub fn encode_local_signer_secret(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
+pub fn encode_peer_secret(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     let e = match event {
-        ParsedEvent::LocalSignerSecret(v) => v,
+        ParsedEvent::PeerSecret(v) => v,
         _ => return Err(EventError::WrongVariant),
     };
 
@@ -95,7 +95,7 @@ pub fn encode_local_signer_secret(event: &ParsedEvent) -> Result<Vec<u8>, EventE
     }
 
     let mut buf = Vec::with_capacity(74);
-    buf.push(EVENT_TYPE_LOCAL_SIGNER_SECRET);
+    buf.push(EVENT_TYPE_PEER_SECRET);
     buf.extend_from_slice(&e.created_at_ms.to_le_bytes());
     buf.extend_from_slice(&e.signer_event_id);
     buf.push(e.signer_kind);
@@ -133,7 +133,7 @@ pub fn build_projector_context(
     parsed: &ParsedEvent,
 ) -> Result<ContextSnapshot, Box<dyn std::error::Error>> {
     let mut ctx = ContextSnapshot::default();
-    if let ParsedEvent::LocalSignerSecret(e) = parsed {
+    if let ParsedEvent::PeerSecret(e) = parsed {
         if e.signer_kind == SIGNER_KIND_PEER_SHARED {
             let signer_b64 = event_id_to_base64(&e.signer_event_id);
             let projected: bool = conn.query_row(
@@ -151,7 +151,7 @@ pub fn build_projector_context(
     Ok(ctx)
 }
 
-/// Pure projector: LocalSignerSecret -> local_signer_material table.
+/// Pure projector: PeerSecret -> local_signer_material table.
 /// UPSERT by (recorded_by, signer_event_id): Delete existing + InsertOrIgnore.
 /// Emits ApplyTransportIdentityIntent(InstallPeerSharedIdentityFromSigner) when
 /// signer_kind == SIGNER_KIND_PEER_SHARED.
@@ -162,8 +162,8 @@ pub fn project_pure(
     ctx: &ContextSnapshot,
 ) -> ProjectorResult {
     let e = match parsed {
-        ParsedEvent::LocalSignerSecret(v) => v,
-        _ => return ProjectorResult::reject("not a local_signer_secret event".to_string()),
+        ParsedEvent::PeerSecret(v) => v,
+        _ => return ProjectorResult::reject("not a peer_secret event".to_string()),
     };
 
     let signer_eid_b64 = event_id_to_base64(&e.signer_event_id);
@@ -212,8 +212,8 @@ pub fn project_pure(
     }
 }
 
-pub static LOCAL_SIGNER_SECRET_META: EventTypeMeta = EventTypeMeta {
-    type_code: EVENT_TYPE_LOCAL_SIGNER_SECRET,
+pub static PEER_SECRET_META: EventTypeMeta = EventTypeMeta {
+    type_code: EVENT_TYPE_PEER_SECRET,
     type_name: "peer_secret",
     projection_table: "local_signer_material",
     share_scope: ShareScope::Local,
@@ -222,8 +222,8 @@ pub static LOCAL_SIGNER_SECRET_META: EventTypeMeta = EventTypeMeta {
     signer_required: false,
     signature_byte_len: 0,
     encryptable: false,
-    parse: parse_local_signer_secret,
-    encode: encode_local_signer_secret,
+    parse: parse_peer_secret,
+    encode: encode_peer_secret,
     projector: project_pure,
     context_loader: build_projector_context,
 };
@@ -235,13 +235,13 @@ mod tests {
 
     #[test]
     fn test_roundtrip_workspace() {
-        let e = LocalSignerSecretEvent {
+        let e = PeerSecretEvent {
             created_at_ms: 1234567890123,
             signer_event_id: [1u8; 32],
             signer_kind: SIGNER_KIND_WORKSPACE,
             private_key_bytes: [2u8; 32],
         };
-        let event = ParsedEvent::LocalSignerSecret(e);
+        let event = ParsedEvent::PeerSecret(e);
         let blob = encode_event(&event).unwrap();
         assert_eq!(blob.len(), 74);
         let parsed = parse_event(&blob).unwrap();
@@ -250,13 +250,13 @@ mod tests {
 
     #[test]
     fn test_roundtrip_user() {
-        let e = LocalSignerSecretEvent {
+        let e = PeerSecretEvent {
             created_at_ms: 9876543210000,
             signer_event_id: [3u8; 32],
             signer_kind: SIGNER_KIND_USER,
             private_key_bytes: [4u8; 32],
         };
-        let event = ParsedEvent::LocalSignerSecret(e);
+        let event = ParsedEvent::PeerSecret(e);
         let blob = encode_event(&event).unwrap();
         assert_eq!(blob.len(), 74);
         let parsed = parse_event(&blob).unwrap();
@@ -265,13 +265,13 @@ mod tests {
 
     #[test]
     fn test_roundtrip_peer_shared() {
-        let e = LocalSignerSecretEvent {
+        let e = PeerSecretEvent {
             created_at_ms: 5555555555555,
             signer_event_id: [5u8; 32],
             signer_kind: SIGNER_KIND_PEER_SHARED,
             private_key_bytes: [6u8; 32],
         };
-        let event = ParsedEvent::LocalSignerSecret(e);
+        let event = ParsedEvent::PeerSecret(e);
         let blob = encode_event(&event).unwrap();
         assert_eq!(blob.len(), 74);
         let parsed = parse_event(&blob).unwrap();
@@ -280,14 +280,14 @@ mod tests {
 
     #[test]
     fn test_reject_invalid_signer_kind() {
-        let mut blob = vec![EVENT_TYPE_LOCAL_SIGNER_SECRET];
+        let mut blob = vec![EVENT_TYPE_PEER_SECRET];
         blob.extend_from_slice(&0u64.to_le_bytes());
         blob.extend_from_slice(&[0u8; 32]); // signer_event_id
         blob.push(0); // invalid signer_kind
         blob.extend_from_slice(&[0u8; 32]); // private_key_bytes
         assert!(parse_event(&blob).is_err());
 
-        let mut blob2 = vec![EVENT_TYPE_LOCAL_SIGNER_SECRET];
+        let mut blob2 = vec![EVENT_TYPE_PEER_SECRET];
         blob2.extend_from_slice(&0u64.to_le_bytes());
         blob2.extend_from_slice(&[0u8; 32]);
         blob2.push(4); // invalid signer_kind
@@ -297,13 +297,13 @@ mod tests {
 
     #[test]
     fn test_reject_trailing_data() {
-        let e = LocalSignerSecretEvent {
+        let e = PeerSecretEvent {
             created_at_ms: 100,
             signer_event_id: [0u8; 32],
             signer_kind: SIGNER_KIND_WORKSPACE,
             private_key_bytes: [0u8; 32],
         };
-        let event = ParsedEvent::LocalSignerSecret(e);
+        let event = ParsedEvent::PeerSecret(e);
         let mut blob = encode_event(&event).unwrap();
         blob.push(0xFF);
         let err = parse_event(&blob).unwrap_err();
@@ -318,7 +318,7 @@ mod tests {
 
     #[test]
     fn test_reject_short_data() {
-        let blob = vec![EVENT_TYPE_LOCAL_SIGNER_SECRET; 10];
+        let blob = vec![EVENT_TYPE_PEER_SECRET; 10];
         let err = parse_event(&blob).unwrap_err();
         assert!(matches!(err, EventError::TooShort { expected: 74, .. }));
     }

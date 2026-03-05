@@ -601,7 +601,7 @@ fn test_encrypted_message_triggers_subscription() {
     drop(db);
 
     // Create a secret key and encrypted message
-    let key_eid = alice.create_secret_key([0x42u8; 32]);
+    let key_eid = alice.create_key_secret([0x42u8; 32]);
     let _enc_eid = alice.create_encrypted_message(&key_eid, "secret hello");
 
     let db = open_connection(&alice.db_path).unwrap();

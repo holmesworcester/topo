@@ -1,7 +1,7 @@
 //! Pure projector conformance tests for simple projectors that do straight inserts
 //! with no guards beyond type matching.
 //!
-//! Covers: User, Admin, UserRemoved, PeerRemoved, SecretKey,
+//! Covers: User, Admin, UserRemoved, PeerRemoved, KeySecret,
 //!         MessageAttachment, BenchDep.
 
 #[cfg(test)]
@@ -125,24 +125,24 @@ mod tests {
         assert_no_commands(&result);
     }
 
-    // ── SecretKey ──
+    // ── KeySecret ──
 
     #[test]
-    fn test_secret_key_valid() {
-        use topo::event_modules::secret_key::{project_pure, SecretKeyEvent};
-        let parsed = ParsedEvent::SecretKey(SecretKeyEvent {
+    fn test_key_secret_valid() {
+        use topo::event_modules::key_secret::{project_pure, KeySecretEvent};
+        let parsed = ParsedEvent::KeySecret(KeySecretEvent {
             created_at_ms: 5000,
             key_bytes: [0xAB; 32],
         });
         let result = project_pure(PEER, EVENT_ID, &parsed, &empty_ctx());
         assert_valid(&result);
-        assert_writes_to_table(&result, "secret_keys");
+        assert_writes_to_table(&result, "key_secrets");
         assert_no_commands(&result);
     }
 
     #[test]
-    fn test_secret_key_rejects_non_secret_key_event() {
-        use topo::event_modules::secret_key::project_pure;
+    fn test_key_secret_rejects_non_key_secret_event() {
+        use topo::event_modules::key_secret::project_pure;
         let result = project_pure(PEER, EVENT_ID, &unrelated_event(), &empty_ctx());
         assert_reject(&result);
     }
@@ -207,7 +207,7 @@ mod tests {
         let result = project_pure(
             PEER,
             EVENT_ID,
-            &ParsedEvent::SecretKey(topo::event_modules::secret_key::SecretKeyEvent {
+            &ParsedEvent::KeySecret(topo::event_modules::key_secret::KeySecretEvent {
                 created_at_ms: 1,
                 key_bytes: [9u8; 32],
             }),

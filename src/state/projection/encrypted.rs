@@ -25,9 +25,9 @@ pub fn project_encrypted(
     event_id_b64: &str,
     enc: &EncryptedEvent,
 ) -> Result<(ProjectionDecision, Option<ParsedEvent>), Box<dyn std::error::Error>> {
-    // 1. Resolve key from secret_keys table
+    // 1. Resolve key from key_secrets table
     let key_bytes: Vec<u8> = match conn.query_row(
-        "SELECT key_bytes FROM secret_keys WHERE recorded_by = ?1 AND event_id = ?2",
+        "SELECT key_bytes FROM key_secrets WHERE recorded_by = ?1 AND event_id = ?2",
         rusqlite::params![recorded_by, event_id_to_base64(&enc.key_event_id)],
         |row| row.get(0),
     ) {
@@ -35,7 +35,7 @@ pub fn project_encrypted(
         Err(rusqlite::Error::QueryReturnedNoRows) => {
             return Ok((
                 ProjectionDecision::Reject {
-                    reason: "secret key not found in secret_keys table".to_string(),
+                    reason: "secret key not found in key_secrets table".to_string(),
                 },
                 None,
             ));

@@ -47,20 +47,20 @@ pub const fn encrypted_wire_size(inner_wire_size: usize) -> usize {
 }
 
 /// Look up the fixed wire size for a given inner_type_code.
-/// Returns None for types that cannot be encrypted (encrypted, secret_key, local-only, unknown).
+/// Returns None for types that cannot be encrypted (encrypted, key_secret, local-only, unknown).
 pub fn encrypted_inner_wire_size(inner_type_code: u8) -> Option<usize> {
     use super::super::admin::ADMIN_WIRE_SIZE;
     use super::super::bench_dep::BENCH_DEP_WIRE_SIZE;
-    use super::super::device_invite::DEVICE_INVITE_WIRE_SIZE;
     use super::super::file_slice::FILE_SLICE_WIRE_SIZE;
+    use super::super::key_shared::KEY_SHARED_WIRE_SIZE;
     use super::super::message::wire::MESSAGE_WIRE_SIZE;
     use super::super::message_attachment::MESSAGE_ATTACHMENT_WIRE_SIZE;
     use super::super::message_deletion::MESSAGE_DELETION_WIRE_SIZE;
+    use super::super::peer_invite_shared::DEVICE_INVITE_WIRE_SIZE;
     use super::super::peer_shared::PEER_SHARED_WIRE_SIZE;
     use super::super::reaction::REACTION_WIRE_SIZE;
-    use super::super::secret_shared::SECRET_SHARED_WIRE_SIZE;
     use super::super::user::USER_WIRE_SIZE;
-    use super::super::user_invite::USER_INVITE_WIRE_SIZE;
+    use super::super::user_invite_shared::USER_INVITE_WIRE_SIZE;
     use super::super::workspace::WORKSPACE_WIRE_SIZE;
 
     match inner_type_code {
@@ -75,11 +75,11 @@ pub fn encrypted_inner_wire_size(inner_type_code: u8) -> Option<usize> {
         18 => Some(ADMIN_WIRE_SIZE),                  // Admin
         20 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE), // UserRemoved
         21 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE), // PeerRemoved
-        22 => Some(SECRET_SHARED_WIRE_SIZE),          // SecretShared
+        22 => Some(KEY_SHARED_WIRE_SIZE),             // KeyShared
         24 => Some(MESSAGE_ATTACHMENT_WIRE_SIZE),     // MessageAttachment
         25 => Some(FILE_SLICE_WIRE_SIZE),             // FileSlice
         26 => Some(BENCH_DEP_WIRE_SIZE),              // BenchDep
-        // Cannot encrypt: encrypted(5), secret_key(6), invite_accepted(9)
+        // Cannot encrypt: encrypted(5), key_secret(6), invite_accepted(9)
         _ => None,
     }
 }
@@ -234,21 +234,20 @@ mod tests {
     fn test_per_event_wire_sizes() {
         use super::super::super::admin::ADMIN_WIRE_SIZE;
         use super::super::super::bench_dep::BENCH_DEP_WIRE_SIZE;
-        use super::super::super::device_invite::DEVICE_INVITE_WIRE_SIZE;
         use super::super::super::file_slice::FILE_SLICE_WIRE_SIZE;
         use super::super::super::invite_accepted::INVITE_ACCEPTED_WIRE_SIZE;
-        use super::super::super::invite_privkey::INVITE_PRIVKEY_WIRE_SIZE;
+        use super::super::super::invite_secret::INVITE_SECRET_WIRE_SIZE;
+        use super::super::super::key_secret::KEY_SECRET_WIRE_SIZE;
+        use super::super::super::key_shared::KEY_SHARED_WIRE_SIZE;
         use super::super::super::message::MESSAGE_WIRE_SIZE;
         use super::super::super::message_attachment::MESSAGE_ATTACHMENT_WIRE_SIZE;
         use super::super::super::message_deletion::MESSAGE_DELETION_WIRE_SIZE;
-        use super::super::super::peer::PEER_WIRE_SIZE;
+        use super::super::super::peer_invite_shared::DEVICE_INVITE_WIRE_SIZE;
         use super::super::super::peer_shared::PEER_SHARED_WIRE_SIZE;
         use super::super::super::reaction::REACTION_WIRE_SIZE;
-        use super::super::super::secret_key::SECRET_KEY_WIRE_SIZE;
-        use super::super::super::secret_shared::SECRET_SHARED_WIRE_SIZE;
         use super::super::super::tenant::TENANT_WIRE_SIZE;
         use super::super::super::user::USER_WIRE_SIZE;
-        use super::super::super::user_invite::USER_INVITE_WIRE_SIZE;
+        use super::super::super::user_invite_shared::USER_INVITE_WIRE_SIZE;
         use super::super::super::workspace::WORKSPACE_WIRE_SIZE;
 
         assert_eq!(MESSAGE_WIRE_SIZE, 1194);
@@ -259,16 +258,15 @@ mod tests {
         assert_eq!(WORKSPACE_WIRE_SIZE, 105);
         assert_eq!(USER_WIRE_SIZE, 202);
         assert_eq!(PEER_SHARED_WIRE_SIZE, 234);
-        assert_eq!(SECRET_KEY_WIRE_SIZE, 41);
+        assert_eq!(KEY_SECRET_WIRE_SIZE, 41);
         assert_eq!(MESSAGE_DELETION_WIRE_SIZE, 170);
         assert_eq!(INVITE_ACCEPTED_WIRE_SIZE, 105);
         assert_eq!(USER_INVITE_WIRE_SIZE, 202);
         assert_eq!(DEVICE_INVITE_WIRE_SIZE, 170);
         assert_eq!(ADMIN_WIRE_SIZE, 170);
-        assert_eq!(PEER_WIRE_SIZE, 73);
         assert_eq!(TENANT_WIRE_SIZE, 41);
-        assert_eq!(SECRET_SHARED_WIRE_SIZE, 234);
-        assert_eq!(INVITE_PRIVKEY_WIRE_SIZE, 73);
+        assert_eq!(KEY_SHARED_WIRE_SIZE, 234);
+        assert_eq!(INVITE_SECRET_WIRE_SIZE, 73);
         assert_eq!(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE, 138);
     }
 
@@ -294,7 +292,7 @@ mod tests {
 
     #[test]
     fn test_encrypted_inner_wire_size_rejected() {
-        // Cannot encrypt: encrypted(5), secret_key(6), invite_accepted(9), unknown
+        // Cannot encrypt: encrypted(5), key_secret(6), invite_accepted(9), unknown
         assert_eq!(encrypted_inner_wire_size(5), None);
         assert_eq!(encrypted_inner_wire_size(6), None);
         assert_eq!(encrypted_inner_wire_size(9), None);

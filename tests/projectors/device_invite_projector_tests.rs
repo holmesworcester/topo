@@ -7,8 +7,8 @@
 #[cfg(test)]
 mod tests {
     use crate::harness::fixtures::*;
-    use topo::event_modules::device_invite::project_pure;
-    use topo::event_modules::device_invite::DeviceInviteEvent;
+    use topo::event_modules::peer_invite_shared::project_pure;
+    use topo::event_modules::peer_invite_shared::DeviceInviteEvent;
     use topo::event_modules::ParsedEvent;
 
     const PEER: &str = "peer_inviter";
@@ -53,7 +53,7 @@ mod tests {
 
     #[test]
     fn test_device_invite_rejects_non_device_invite_event() {
-        let parsed = ParsedEvent::SecretKey(topo::event_modules::secret_key::SecretKeyEvent {
+        let parsed = ParsedEvent::KeySecret(topo::event_modules::key_secret::KeySecretEvent {
             created_at_ms: 1,
             key_bytes: [1u8; 32],
         });

@@ -165,9 +165,9 @@ pub struct ContextSnapshot {
     /// included — an unverified intent does not mean the message is deleted.
     pub target_message_deleted: bool,
 
-    /// For SecretShared: whether the recipient has been removed.
+    /// For KeyShared: whether the recipient has been removed.
     pub recipient_removed: bool,
-    /// For SecretShared: DH-unwrapped key material, if available.
+    /// For KeyShared: DH-unwrapped key material, if available.
     pub unwrapped_secret_material: Option<UnwrappedSecretMaterial>,
 
     /// For FileSlice: descriptor info (event_id, signer_event_id) for the file_id.
@@ -185,7 +185,7 @@ pub struct ContextSnapshot {
     /// resolves to an admin event for the same user identity as `signed_by`.
     pub invite_authority_matches_signer: Option<bool>,
 
-    /// For local_signer_secret(peer_shared): whether signer_event_id already
+    /// For peer_secret(peer_shared): whether signer_event_id already
     /// projects as peer_shared for this tenant.
     pub local_signer_peer_shared_projected: Option<bool>,
 
@@ -206,7 +206,7 @@ pub struct ContextSnapshot {
     pub bootstrap_spki_already_peer_shared: bool,
 }
 
-/// Unwrapped symmetric key material derived from SecretShared.
+/// Unwrapped symmetric key material derived from KeyShared.
 #[derive(Debug, Clone)]
 pub struct UnwrappedSecretMaterial {
     pub key_bytes: [u8; 32],

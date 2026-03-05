@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use super::commands::{
     add_device_to_workspace, create_device_link_invite, create_user_invite, create_workspace,
-    join_workspace_as_new_user, load_local_peer_signer, persist_join_signer_secrets,
-    persist_link_signer_secrets,
+    join_workspace_as_new_user, load_local_peer_signer, persist_join_peer_secret,
+    persist_link_peer_secret,
 };
 use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
 use crate::service::{open_db_for_peer, open_db_load};
@@ -364,7 +364,7 @@ pub fn accept_invite(
     let psf_b64 = event_id_to_base64(&join.peer_shared_event_id);
 
     // Persist signer secrets.
-    persist_join_signer_secrets(&db, &derived_peer_id, &join)?;
+    persist_join_peer_secret(&db, &derived_peer_id, &join)?;
 
     Ok(AcceptInviteResponse {
         peer_id: derived_peer_id,
@@ -417,7 +417,7 @@ pub fn accept_device_link(
     let psf_b64 = event_id_to_base64(&link.peer_shared_event_id);
 
     // Persist signer secrets.
-    persist_link_signer_secrets(&db, &derived_peer_id, &link)?;
+    persist_link_peer_secret(&db, &derived_peer_id, &link)?;
 
     Ok(AcceptDeviceLinkResponse {
         peer_id: derived_peer_id,

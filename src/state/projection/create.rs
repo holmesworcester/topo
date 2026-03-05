@@ -282,7 +282,7 @@ pub fn project_event_staged(
 }
 
 /// Create an encrypted event: encode inner event, optionally sign it,
-/// resolve encryption key from secret_keys, encrypt, build EncryptedEvent
+/// resolve encryption key from key_secrets, encrypt, build EncryptedEvent
 /// wrapper, then store and project.
 ///
 /// If `signing_key` is provided, the inner blob is signed before encryption
@@ -311,11 +311,11 @@ pub fn create_encrypted_event_synchronous(
         }
     }
 
-    // 3. Resolve encryption key from secret_keys table
+    // 3. Resolve encryption key from key_secrets table
     let key_b64 = event_id_to_base64(key_event_id);
     let key_bytes: Vec<u8> = conn
         .query_row(
-            "SELECT key_bytes FROM secret_keys WHERE recorded_by = ?1 AND event_id = ?2",
+            "SELECT key_bytes FROM key_secrets WHERE recorded_by = ?1 AND event_id = ?2",
             rusqlite::params![recorded_by, &key_b64],
             |row| row.get(0),
         )
@@ -388,8 +388,8 @@ mod tests {
     use super::*;
     use crate::db::{open_in_memory, schema::create_tables};
     use crate::event_modules::{
-        DeviceInviteEvent, InviteAcceptedEvent, MessageEvent, PeerEvent, PeerSharedEvent,
-        ReactionEvent, TenantEvent, UserEvent, UserInviteEvent, WorkspaceEvent,
+        DeviceInviteEvent, InviteAcceptedEvent, MessageEvent, PeerSharedEvent, ReactionEvent,
+        TenantEvent, UserEvent, UserInviteEvent, WorkspaceEvent,
     };
     use ed25519_dalek::SigningKey;
 
@@ -426,13 +426,6 @@ mod tests {
             public_key: peer_key.verifying_key().to_bytes(),
         });
         let tenant_eid = create_event_synchronous(conn, recorded_by, &tenant_evt).unwrap();
-
-        let peer_evt = ParsedEvent::Peer(PeerEvent {
-            created_at_ms: now_ms(),
-            tenant_event_id: tenant_eid,
-            public_key: peer_key.verifying_key().to_bytes(),
-        });
-        let _peer_eid = create_event_synchronous(conn, recorded_by, &peer_evt).unwrap();
 
         let workspace_key = SigningKey::generate(&mut rng);
         let workspace_pub = workspace_key.verifying_key().to_bytes();

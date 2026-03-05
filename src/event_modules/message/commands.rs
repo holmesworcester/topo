@@ -14,7 +14,7 @@ use super::super::message_deletion::MessageDeletionEvent;
 use super::super::peer_shared;
 use super::super::workspace;
 use super::super::ParsedEvent;
-use super::super::{FileSliceEvent, MessageAttachmentEvent, SecretKeyEvent};
+use super::super::{FileSliceEvent, KeySecretEvent, MessageAttachmentEvent};
 use super::wire::MessageEvent;
 
 fn current_timestamp_ms() -> u64 {
@@ -263,7 +263,7 @@ pub fn generate_for_peer(
 ///
 /// Each generated file creates:
 /// - 1 parent `message`
-/// - 1 `secret_key`
+/// - 1 `key_secret`
 /// - 1 `message_attachment`
 /// - `slices_per_file` `file_slice` events
 pub fn generate_files_for_peer(
@@ -307,13 +307,13 @@ pub fn generate_files_for_peer(
         let key_event_id = create_event_synchronous(
             &db,
             &recorded_by,
-            &ParsedEvent::SecretKey(SecretKeyEvent {
+            &ParsedEvent::KeySecret(KeySecretEvent {
                 created_at_ms: current_timestamp_ms(),
                 key_bytes: rand::random::<[u8; 32]>(),
             }),
         )
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("create secret_key error: {}", e).into()
+            format!("create key_secret error: {}", e).into()
         })?;
 
         let file_id = rand::random::<[u8; 32]>();
@@ -459,7 +459,7 @@ pub fn send_file_for_peer(
     let key_event_id = create_event_synchronous(
         &db,
         &recorded_by,
-        &ParsedEvent::SecretKey(SecretKeyEvent {
+        &ParsedEvent::KeySecret(KeySecretEvent {
             created_at_ms: current_timestamp_ms(),
             key_bytes: rand::random::<[u8; 32]>(),
         }),

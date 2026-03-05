@@ -658,7 +658,7 @@ Usually not required at this stage, but useful if blocker behavior gets ambiguou
 - then map those guards directly into projector dependency checks.
 
 TLA sync status (done):
-- `EventGraphSchema.tla` models `tenant` as root (no deps) and `peer` as dependent on `tenant_event_id`.
+- `EventGraphSchema.tla` models `tenant` as root (no deps); local peer identity material now flows through `peer_secret` (the old standalone `peer` local event is retired).
 - `key_shared` models direct dependency on both recipient invite event and `invite_secret` unwrap event.
 - Re-run TLC configs and refresh `docs/tla/projector_spec.md` mapping notes when dependency semantics change next.
 

@@ -1,25 +1,24 @@
 pub mod admin;
 pub mod bench_dep;
-pub mod device_invite;
 pub mod encrypted;
 pub mod file_slice;
 pub mod invite_accepted;
-pub mod invite_privkey;
+pub mod invite_secret;
+pub mod key_secret;
+pub mod key_shared;
 pub mod layout;
-pub mod local_signer_secret;
 pub mod message;
 pub mod message_attachment;
 pub mod message_deletion;
-pub mod peer;
+pub mod peer_invite_shared;
 pub mod peer_removed;
+pub mod peer_secret;
 pub mod peer_shared;
 pub mod reaction;
 pub mod registry;
-pub mod secret_key;
-pub mod secret_shared;
 pub mod tenant;
 pub mod user;
-pub mod user_invite;
+pub mod user_invite_shared;
 pub mod user_removed;
 pub mod workspace;
 
@@ -52,32 +51,31 @@ pub fn trunc_hex(bytes: &[u8], max_hex_chars: usize) -> String {
 
 pub use admin::AdminEvent;
 pub use bench_dep::BenchDepEvent;
-pub use device_invite::DeviceInviteEvent;
 pub use encrypted::EncryptedEvent;
 pub use file_slice::FileSliceEvent;
 pub use invite_accepted::InviteAcceptedEvent;
-pub use invite_privkey::InvitePrivkeyEvent;
-pub use local_signer_secret::LocalSignerSecretEvent;
+pub use invite_secret::InviteSecretEvent;
+pub use key_secret::KeySecretEvent;
+pub use key_shared::KeySharedEvent;
 pub use message::MessageEvent;
 pub use message_attachment::MessageAttachmentEvent;
 pub use message_deletion::MessageDeletionEvent;
-pub use peer::PeerEvent;
+pub use peer_invite_shared::DeviceInviteEvent;
 pub use peer_removed::PeerRemovedEvent;
+pub use peer_secret::PeerSecretEvent;
 pub use peer_shared::PeerSharedEvent;
 pub use reaction::ReactionEvent;
 pub use registry::{EventRegistry, EventTypeMeta, ShareScope};
-pub use secret_key::SecretKeyEvent;
-pub use secret_shared::SecretSharedEvent;
 pub use tenant::TenantEvent;
 pub use user::UserEvent;
-pub use user_invite::UserInviteEvent;
+pub use user_invite_shared::UserInviteEvent;
 pub use user_removed::UserRemovedEvent;
 pub use workspace::WorkspaceEvent;
 
 pub const EVENT_TYPE_MESSAGE: u8 = 1;
 pub const EVENT_TYPE_REACTION: u8 = 2;
 pub const EVENT_TYPE_ENCRYPTED: u8 = 5;
-pub const EVENT_TYPE_SECRET_KEY: u8 = 6;
+pub const EVENT_TYPE_KEY_SECRET: u8 = 6;
 pub const EVENT_TYPE_MESSAGE_DELETION: u8 = 7;
 pub const EVENT_TYPE_WORKSPACE: u8 = 8;
 pub const EVENT_TYPE_INVITE_ACCEPTED: u8 = 9;
@@ -88,13 +86,13 @@ pub const EVENT_TYPE_PEER_SHARED: u8 = 16;
 pub const EVENT_TYPE_ADMIN: u8 = 18;
 pub const EVENT_TYPE_USER_REMOVED: u8 = 20;
 pub const EVENT_TYPE_PEER_REMOVED: u8 = 21;
-pub const EVENT_TYPE_SECRET_SHARED: u8 = 22;
-pub const EVENT_TYPE_PEER: u8 = 23;
+pub const EVENT_TYPE_KEY_SHARED: u8 = 22;
+pub const EVENT_TYPE_PEER: u8 = 23; // reserved (retired local peer event)
 pub const EVENT_TYPE_MESSAGE_ATTACHMENT: u8 = 24;
 pub const EVENT_TYPE_FILE_SLICE: u8 = 25;
 pub const EVENT_TYPE_BENCH_DEP: u8 = 26;
-pub const EVENT_TYPE_LOCAL_SIGNER_SECRET: u8 = 27;
-pub const EVENT_TYPE_INVITE_PRIVKEY: u8 = 28;
+pub const EVENT_TYPE_PEER_SECRET: u8 = 27;
+pub const EVENT_TYPE_INVITE_SECRET: u8 = 28;
 pub const EVENT_TYPE_TENANT: u8 = 29;
 
 /// Max event blob size: 1 MiB
@@ -103,8 +101,8 @@ pub const EVENT_MAX_BLOB_BYTES: usize = 1024 * 1024;
 pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     workspace::ensure_schema(conn)?;
     invite_accepted::ensure_schema(conn)?;
-    user_invite::ensure_schema(conn)?;
-    device_invite::ensure_schema(conn)?;
+    user_invite_shared::ensure_schema(conn)?;
+    peer_invite_shared::ensure_schema(conn)?;
     user::ensure_schema(conn)?;
     peer_shared::ensure_schema(conn)?;
     admin::ensure_schema(conn)?;
@@ -114,12 +112,11 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     message_deletion::ensure_schema(conn)?;
     message_attachment::ensure_schema(conn)?;
     file_slice::ensure_schema(conn)?;
-    secret_key::ensure_schema(conn)?;
-    secret_shared::ensure_schema(conn)?;
-    peer::ensure_schema(conn)?;
+    key_secret::ensure_schema(conn)?;
+    key_shared::ensure_schema(conn)?;
     tenant::ensure_schema(conn)?;
-    local_signer_secret::ensure_schema(conn)?;
-    invite_privkey::ensure_schema(conn)?;
+    peer_secret::ensure_schema(conn)?;
+    invite_secret::ensure_schema(conn)?;
     crate::state::subscriptions::ensure_schema(conn)?;
     Ok(())
 }
@@ -129,7 +126,7 @@ pub enum ParsedEvent {
     Message(MessageEvent),
     Reaction(ReactionEvent),
     Encrypted(EncryptedEvent),
-    SecretKey(SecretKeyEvent),
+    KeySecret(KeySecretEvent),
     MessageDeletion(MessageDeletionEvent),
     Workspace(WorkspaceEvent),
     InviteAccepted(InviteAcceptedEvent),
@@ -140,14 +137,13 @@ pub enum ParsedEvent {
     Admin(AdminEvent),
     UserRemoved(UserRemovedEvent),
     PeerRemoved(PeerRemovedEvent),
-    SecretShared(SecretSharedEvent),
-    Peer(PeerEvent),
+    KeyShared(KeySharedEvent),
     Tenant(TenantEvent),
     MessageAttachment(MessageAttachmentEvent),
     FileSlice(FileSliceEvent),
     BenchDep(BenchDepEvent),
-    LocalSignerSecret(LocalSignerSecretEvent),
-    InvitePrivkey(InvitePrivkeyEvent),
+    PeerSecret(PeerSecretEvent),
+    InviteSecret(InviteSecretEvent),
 }
 
 impl ParsedEvent {
@@ -156,7 +152,7 @@ impl ParsedEvent {
             ParsedEvent::Message(m) => m.created_at_ms,
             ParsedEvent::Reaction(r) => r.created_at_ms,
             ParsedEvent::Encrypted(e) => e.created_at_ms,
-            ParsedEvent::SecretKey(s) => s.created_at_ms,
+            ParsedEvent::KeySecret(s) => s.created_at_ms,
             ParsedEvent::MessageDeletion(d) => d.created_at_ms,
             ParsedEvent::Workspace(w) => w.created_at_ms,
             ParsedEvent::InviteAccepted(a) => a.created_at_ms,
@@ -167,14 +163,13 @@ impl ParsedEvent {
             ParsedEvent::Admin(a) => a.created_at_ms,
             ParsedEvent::UserRemoved(r) => r.created_at_ms,
             ParsedEvent::PeerRemoved(r) => r.created_at_ms,
-            ParsedEvent::SecretShared(s) => s.created_at_ms,
-            ParsedEvent::Peer(p) => p.created_at_ms,
+            ParsedEvent::KeyShared(s) => s.created_at_ms,
             ParsedEvent::Tenant(t) => t.created_at_ms,
             ParsedEvent::MessageAttachment(a) => a.created_at_ms,
             ParsedEvent::FileSlice(f) => f.created_at_ms,
             ParsedEvent::BenchDep(b) => b.created_at_ms,
-            ParsedEvent::LocalSignerSecret(l) => l.created_at_ms,
-            ParsedEvent::InvitePrivkey(k) => k.created_at_ms,
+            ParsedEvent::PeerSecret(l) => l.created_at_ms,
+            ParsedEvent::InviteSecret(k) => k.created_at_ms,
         }
     }
 
@@ -191,7 +186,7 @@ impl ParsedEvent {
                 ("signed_by", r.signed_by),
             ],
             ParsedEvent::Encrypted(e) => vec![("key_event_id", e.key_event_id)],
-            ParsedEvent::SecretKey(_) => vec![],
+            ParsedEvent::KeySecret(_) => vec![],
             ParsedEvent::MessageDeletion(d) => vec![("signed_by", d.signed_by)],
             ParsedEvent::Workspace(_) => vec![],
             ParsedEvent::InviteAccepted(a) => vec![("tenant_event_id", a.tenant_event_id)],
@@ -232,14 +227,13 @@ impl ParsedEvent {
                     ("signed_by", r.signed_by),
                 ]
             }
-            ParsedEvent::SecretShared(s) => {
+            ParsedEvent::KeyShared(s) => {
                 vec![
                     ("recipient_event_id", s.recipient_event_id),
                     ("unwrap_key_event_id", s.unwrap_key_event_id),
                     ("signed_by", s.signed_by),
                 ]
             }
-            ParsedEvent::Peer(p) => vec![("tenant_event_id", p.tenant_event_id)],
             ParsedEvent::Tenant(_) => vec![],
             ParsedEvent::MessageAttachment(a) => vec![
                 ("message_id", a.message_id),
@@ -250,8 +244,8 @@ impl ParsedEvent {
             ParsedEvent::BenchDep(b) => b.dep_ids.iter().map(|id| ("dep_id", *id)).collect(),
             // Local signer material is local-first and may arrive before the
             // referenced public signer event projects.
-            ParsedEvent::LocalSignerSecret(_) => vec![],
-            ParsedEvent::InvitePrivkey(k) => vec![("invite_event_id", k.invite_event_id)],
+            ParsedEvent::PeerSecret(_) => vec![],
+            ParsedEvent::InviteSecret(k) => vec![("invite_event_id", k.invite_event_id)],
         }
     }
 
@@ -260,7 +254,7 @@ impl ParsedEvent {
             ParsedEvent::Message(_) => EVENT_TYPE_MESSAGE,
             ParsedEvent::Reaction(_) => EVENT_TYPE_REACTION,
             ParsedEvent::Encrypted(_) => EVENT_TYPE_ENCRYPTED,
-            ParsedEvent::SecretKey(_) => EVENT_TYPE_SECRET_KEY,
+            ParsedEvent::KeySecret(_) => EVENT_TYPE_KEY_SECRET,
             ParsedEvent::MessageDeletion(_) => EVENT_TYPE_MESSAGE_DELETION,
             ParsedEvent::Workspace(_) => EVENT_TYPE_WORKSPACE,
             ParsedEvent::InviteAccepted(_) => EVENT_TYPE_INVITE_ACCEPTED,
@@ -271,14 +265,13 @@ impl ParsedEvent {
             ParsedEvent::Admin(_) => EVENT_TYPE_ADMIN,
             ParsedEvent::UserRemoved(_) => EVENT_TYPE_USER_REMOVED,
             ParsedEvent::PeerRemoved(_) => EVENT_TYPE_PEER_REMOVED,
-            ParsedEvent::SecretShared(_) => EVENT_TYPE_SECRET_SHARED,
-            ParsedEvent::Peer(_) => EVENT_TYPE_PEER,
+            ParsedEvent::KeyShared(_) => EVENT_TYPE_KEY_SHARED,
             ParsedEvent::Tenant(_) => EVENT_TYPE_TENANT,
             ParsedEvent::MessageAttachment(_) => EVENT_TYPE_MESSAGE_ATTACHMENT,
             ParsedEvent::FileSlice(_) => EVENT_TYPE_FILE_SLICE,
             ParsedEvent::BenchDep(_) => EVENT_TYPE_BENCH_DEP,
-            ParsedEvent::LocalSignerSecret(_) => EVENT_TYPE_LOCAL_SIGNER_SECRET,
-            ParsedEvent::InvitePrivkey(_) => EVENT_TYPE_INVITE_PRIVKEY,
+            ParsedEvent::PeerSecret(_) => EVENT_TYPE_PEER_SECRET,
+            ParsedEvent::InviteSecret(_) => EVENT_TYPE_INVITE_SECRET,
         }
     }
 
@@ -293,21 +286,20 @@ impl ParsedEvent {
             ParsedEvent::Admin(a) => Some((a.signed_by, a.signer_type)),
             ParsedEvent::UserRemoved(r) => Some((r.signed_by, r.signer_type)),
             ParsedEvent::PeerRemoved(r) => Some((r.signed_by, r.signer_type)),
-            ParsedEvent::SecretShared(s) => Some((s.signed_by, s.signer_type)),
+            ParsedEvent::KeyShared(s) => Some((s.signed_by, s.signer_type)),
             ParsedEvent::FileSlice(f) => Some((f.signed_by, f.signer_type)),
             ParsedEvent::Message(m) => Some((m.signed_by, m.signer_type)),
             ParsedEvent::Reaction(r) => Some((r.signed_by, r.signer_type)),
             ParsedEvent::MessageDeletion(d) => Some((d.signed_by, d.signer_type)),
             ParsedEvent::MessageAttachment(a) => Some((a.signed_by, a.signer_type)),
             ParsedEvent::Encrypted(_)
-            | ParsedEvent::SecretKey(_)
+            | ParsedEvent::KeySecret(_)
             | ParsedEvent::Workspace(_)
             | ParsedEvent::InviteAccepted(_)
-            | ParsedEvent::Peer(_)
             | ParsedEvent::Tenant(_)
             | ParsedEvent::BenchDep(_)
-            | ParsedEvent::LocalSignerSecret(_)
-            | ParsedEvent::InvitePrivkey(_) => None,
+            | ParsedEvent::PeerSecret(_)
+            | ParsedEvent::InviteSecret(_) => None,
         }
     }
 
@@ -317,7 +309,7 @@ impl ParsedEvent {
             ParsedEvent::Message(e) => e.human_fields(),
             ParsedEvent::Reaction(e) => e.human_fields(),
             ParsedEvent::Encrypted(e) => e.human_fields(),
-            ParsedEvent::SecretKey(e) => e.human_fields(),
+            ParsedEvent::KeySecret(e) => e.human_fields(),
             ParsedEvent::MessageDeletion(e) => e.human_fields(),
             ParsedEvent::Workspace(e) => e.human_fields(),
             ParsedEvent::InviteAccepted(e) => e.human_fields(),
@@ -328,14 +320,13 @@ impl ParsedEvent {
             ParsedEvent::Admin(e) => e.human_fields(),
             ParsedEvent::UserRemoved(e) => e.human_fields(),
             ParsedEvent::PeerRemoved(e) => e.human_fields(),
-            ParsedEvent::SecretShared(e) => e.human_fields(),
+            ParsedEvent::KeyShared(e) => e.human_fields(),
             ParsedEvent::MessageAttachment(e) => e.human_fields(),
             ParsedEvent::FileSlice(e) => e.human_fields(),
             ParsedEvent::BenchDep(e) => e.human_fields(),
-            ParsedEvent::LocalSignerSecret(e) => e.human_fields(),
-            ParsedEvent::Peer(e) => e.human_fields(),
+            ParsedEvent::PeerSecret(e) => e.human_fields(),
             ParsedEvent::Tenant(e) => e.human_fields(),
-            ParsedEvent::InvitePrivkey(e) => e.human_fields(),
+            ParsedEvent::InviteSecret(e) => e.human_fields(),
         }
     }
 }
@@ -409,25 +400,24 @@ pub fn registry() -> &'static EventRegistry {
             &message::MESSAGE_META,
             &reaction::REACTION_TYPE_META,
             &encrypted::ENCRYPTED_META,
-            &secret_key::SECRET_KEY_META,
+            &key_secret::KEY_SECRET_META,
             &message_deletion::MESSAGE_DELETION_META,
             &workspace::WORKSPACE_META,
             &invite_accepted::INVITE_ACCEPTED_META,
-            &user_invite::USER_INVITE_META,
-            &device_invite::DEVICE_INVITE_META,
+            &user_invite_shared::USER_INVITE_META,
+            &peer_invite_shared::DEVICE_INVITE_META,
             &user::USER_META,
             &peer_shared::PEER_SHARED_META,
             &admin::ADMIN_META,
             &user_removed::USER_REMOVED_META,
             &peer_removed::PEER_REMOVED_META,
-            &secret_shared::SECRET_SHARED_META,
-            &peer::PEER_META,
+            &key_shared::KEY_SHARED_META,
             &tenant::TENANT_META,
             &message_attachment::MESSAGE_ATTACHMENT_META,
             &file_slice::FILE_SLICE_META,
             &bench_dep::BENCH_DEP_META,
-            &local_signer_secret::LOCAL_SIGNER_SECRET_META,
-            &invite_privkey::INVITE_PRIVKEY_META,
+            &peer_secret::PEER_SECRET_META,
+            &invite_secret::INVITE_SECRET_META,
         ])
     })
 }
@@ -490,7 +480,7 @@ mod tests {
             .collect();
         assert_eq!(encryptable_codes, vec![1, 2, 6, 7, 24, 25]);
 
-        for code in [5, 8, 9, 10, 12, 14, 16, 18, 20, 21, 22, 23, 26, 27, 28, 29] {
+        for code in [5, 8, 9, 10, 12, 14, 16, 18, 20, 21, 22, 26, 27, 28, 29] {
             let meta = reg.lookup(code).unwrap();
             assert!(
                 !meta.encryptable,
@@ -499,7 +489,7 @@ mod tests {
             );
         }
 
-        for removed in [11, 13, 15, 17, 19] {
+        for removed in [11, 13, 15, 17, 19, 23] {
             assert!(reg.lookup(removed).is_none());
         }
     }

@@ -336,8 +336,8 @@ fn test_cli_sync_bootstrap_from_accepted_invite_data() {
 
     // Alice should have emitted content key wrapping during invite creation
     assert!(
-        count_rows(&alice_db, "secret_shared") >= 1,
-        "inviter should emit at least one secret_shared key-wrap during invite creation"
+        count_rows(&alice_db, "key_shared") >= 1,
+        "inviter should emit at least one key_shared key-wrap during invite creation"
     );
 
     // Bob accepts invite: installs deterministic cert, creates identity chain
@@ -354,14 +354,14 @@ fn test_cli_sync_bootstrap_from_accepted_invite_data() {
     // which requires the full identity chain cascade).
     assert_eventually(&bob_db, "message_count >= 1", timeout_ms);
 
-    // After sync, Bob should have Alice's secret_shared event (content key ciphertext).
-    // Note: deferred content key unwrapping (secret_shared → secret_keys) is a
+    // After sync, Bob should have Alice's key_shared event (content key ciphertext).
+    // Note: deferred content key unwrapping (key_shared → key_secrets) is a
     // follow-up feature for the projection-first flow. The old inline bootstrap
     // sync performed this unwrap immediately, but the daemon-driven cascade
     // doesn't yet trigger it automatically.
     assert!(
-        count_rows(&bob_db, "secret_shared") >= 1,
-        "invitee should have inviter's secret_shared event after sync"
+        count_rows(&bob_db, "key_shared") >= 1,
+        "invitee should have inviter's key_shared event after sync"
     );
 
     let bob_eid = send_message(&bob_db, "bootstrap trust from invite data");
