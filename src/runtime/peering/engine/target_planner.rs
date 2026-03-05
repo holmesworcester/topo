@@ -20,7 +20,7 @@ use tracing::warn;
 
 use crate::db::open_connection;
 use crate::db::transport_creds::list_local_peers;
-use crate::db::transport_trust::list_active_invite_bootstrap_addrs;
+use crate::db::transport_trust::list_active_invite_bootstrap_targets;
 use crate::event_modules::workspace::invite_link::parse_bootstrap_address;
 
 // ---------------------------------------------------------------------------
@@ -93,8 +93,8 @@ pub(crate) fn normalize_discovered_addr_for_local_bind(
 // Unified dispatch-keying for bootstrap + discovery ingestion
 // ---------------------------------------------------------------------------
 
-pub(crate) fn bootstrap_dispatch_key(tenant_id: &str) -> String {
-    format!("{}@bootstrap", tenant_id)
+pub(crate) fn bootstrap_dispatch_key(tenant_id: &str, invite_event_id: &str) -> String {
+    format!("{}@bootstrap:{}", tenant_id, invite_event_id)
 }
 
 pub(crate) fn discovery_dispatch_key(tenant_id: &str, peer_id: &str) -> String {
@@ -109,15 +109,16 @@ pub(crate) fn discovery_dispatch_key(tenant_id: &str, peer_id: &str) -> String {
 pub(crate) fn load_bootstrap_targets(
     db_path: &str,
     tenant_ids: &[String],
-) -> Result<Vec<(String, SocketAddr)>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Vec<(String, String, SocketAddr)>, Box<dyn std::error::Error + Send + Sync>> {
     let db = open_connection(db_path)?;
-    let mut seen: HashSet<(String, SocketAddr)> = HashSet::new();
+    let mut seen: HashSet<(String, String, SocketAddr)> = HashSet::new();
     let mut out = Vec::new();
     for tenant_id in tenant_ids {
-        for addr_text in list_active_invite_bootstrap_addrs(&db, tenant_id)? {
+        for target in list_active_invite_bootstrap_targets(&db, tenant_id)? {
+            let addr_text = target.bootstrap_addr;
             match parse_bootstrap_address(&addr_text).and_then(|addr| addr.to_socket_addr()) {
                 Ok(addr) => {
-                    let key = (tenant_id.clone(), addr);
+                    let key = (tenant_id.clone(), target.invite_event_id, addr);
                     if seen.insert(key.clone()) {
                         out.push(key);
                     }
@@ -139,7 +140,7 @@ pub(crate) fn load_bootstrap_targets(
 /// Collect all bootstrap autodial targets across all local tenants.
 pub(crate) fn collect_all_bootstrap_targets(
     db_path: &str,
-) -> Result<Vec<(String, SocketAddr)>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Vec<(String, String, SocketAddr)>, Box<dyn std::error::Error + Send + Sync>> {
     let db = open_connection(db_path)?;
     let tenant_ids = list_local_peers(&db)?;
     drop(db);
@@ -158,9 +159,10 @@ pub(crate) fn collect_all_bootstrap_targets(
 pub(crate) fn dispatch_bootstrap_target(
     dispatcher: &mut PeerDispatcher,
     tenant_id: &str,
+    invite_event_id: &str,
     remote: SocketAddr,
 ) -> bool {
-    let key = bootstrap_dispatch_key(tenant_id);
+    let key = bootstrap_dispatch_key(tenant_id, invite_event_id);
     let (action, _cancel_rx) = dispatcher.dispatch(&key, remote);
     matches!(
         action,
@@ -439,7 +441,8 @@ mod tests {
 
         assert_eq!(targets.len(), 1, "hostname bootstrap should resolve");
         assert_eq!(targets[0].0, recorded_by);
-        assert_eq!(targets[0].1.port(), 4433);
+        assert_eq!(targets[0].1, "inv-host");
+        assert_eq!(targets[0].2.port(), 4433);
     }
 
     // -- Multi-tenant target deduplication tests --
@@ -455,7 +458,7 @@ mod tests {
         let bootstrap_addr = "10.0.0.1:4433";
 
         // Same bootstrap addr for two different tenants → should yield 2 targets
-        // (dedup is per (tenant, addr), not per addr alone)
+        // (dedup is per (tenant, invite_event_id, addr), not per addr alone)
         transport_trust::record_invite_bootstrap_trust(
             &conn,
             "tenant-a",
@@ -496,7 +499,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bootstrap_targets_dedup_same_tenant_same_addr() {
+    fn test_bootstrap_targets_keep_distinct_invites_same_tenant_same_addr() {
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("dedup2.db");
         let conn = open_connection(&db_path).unwrap();
@@ -504,7 +507,8 @@ mod tests {
 
         let bootstrap_addr = "10.0.0.1:4433";
 
-        // Two bootstrap trust rows for same tenant + same addr → only 1 target
+        // Two bootstrap trust rows for same tenant + same addr but different
+        // invite_event_id should produce two targets (invite-specific fallback).
         transport_trust::record_invite_bootstrap_trust(
             &conn,
             "tenant-a",
@@ -530,7 +534,17 @@ mod tests {
         let targets =
             load_bootstrap_targets(db_path.to_str().unwrap(), &["tenant-a".to_string()]).unwrap();
 
-        assert_eq!(targets.len(), 1, "same tenant + same addr = 1 target");
+        assert_eq!(
+            targets.len(),
+            2,
+            "same tenant + same addr + two invites = 2 targets"
+        );
+        let invite_ids: std::collections::HashSet<String> = targets
+            .iter()
+            .map(|(_, invite_id, _)| invite_id.clone())
+            .collect();
+        assert!(invite_ids.contains("inv-1"));
+        assert!(invite_ids.contains("inv-2"));
     }
 
     // -- Bootstrap progression (new targets appearing after projection) --
@@ -586,6 +600,16 @@ mod tests {
             targets.len(),
             2,
             "second target appears after second trust row"
+        );
+    }
+
+    #[test]
+    fn test_bootstrap_dispatch_key_includes_invite_event_id() {
+        let a = bootstrap_dispatch_key("tenant-a", "invite-1");
+        let b = bootstrap_dispatch_key("tenant-a", "invite-2");
+        assert_ne!(
+            a, b,
+            "different invites must produce distinct dispatch keys"
         );
     }
 

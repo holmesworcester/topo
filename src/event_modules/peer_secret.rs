@@ -93,17 +93,6 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_peer_secrets_signer
             ON peer_secrets(recorded_by, signer_event_id, created_at DESC, event_id DESC);
-
-        -- Legacy bootstrap-fallback cache table (non-event path).
-        -- Kept for compatibility with existing transport fallback behavior.
-        CREATE TABLE IF NOT EXISTS local_signer_material (
-            recorded_by TEXT NOT NULL,
-            signer_event_id TEXT NOT NULL,
-            signer_kind INTEGER NOT NULL,
-            private_key BLOB NOT NULL,
-            created_at INTEGER NOT NULL,
-            PRIMARY KEY (recorded_by, signer_event_id)
-        );
         ",
     )?;
     Ok(())

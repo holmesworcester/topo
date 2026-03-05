@@ -164,6 +164,15 @@ pub mod fixtures {
         );
     }
 
+    /// Assert that emit_commands does not contain a command matching predicate.
+    pub fn assert_no_command<F: Fn(&EmitCommand) -> bool>(result: &ProjectorResult, predicate: F) {
+        assert!(
+            !result.emit_commands.iter().any(&predicate),
+            "expected no matching command, got: {:?}",
+            result.emit_commands
+        );
+    }
+
     /// Assert that emit_commands is empty.
     pub fn assert_no_commands(result: &ProjectorResult) {
         assert!(

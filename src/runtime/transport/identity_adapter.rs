@@ -15,6 +15,20 @@ use crate::db::transport_creds::{has_creds_with_source, CRED_SOURCE_PEER_SHARED}
 /// Production adapter backed by `transport::identity` install functions.
 pub struct ConcreteTransportIdentityAdapter;
 
+fn parse_signing_key(
+    key_bytes: Vec<u8>,
+) -> Result<ed25519_dalek::SigningKey, TransportIdentityError> {
+    if key_bytes.len() != 32 {
+        return Err(TransportIdentityError::InvalidKeyMaterial(format!(
+            "expected 32 bytes, got {}",
+            key_bytes.len()
+        )));
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&key_bytes);
+    Ok(ed25519_dalek::SigningKey::from_bytes(&arr))
+}
+
 impl TransportIdentityAdapter for ConcreteTransportIdentityAdapter {
     fn apply_intent(
         &self,
@@ -31,6 +45,43 @@ impl TransportIdentityAdapter for ConcreteTransportIdentityAdapter {
                     return Err(TransportIdentityError::BootstrapAfterPeerSharedDenied);
                 }
                 let signing_key = ed25519_dalek::SigningKey::from_bytes(&invite_private_key);
+                crate::transport::identity::install_invite_bootstrap_transport_identity(
+                    conn,
+                    &signing_key,
+                )
+                .map_err(|e| TransportIdentityError::InstallFailed(e.to_string()))
+            }
+            TransportIdentityIntent::InstallBootstrapIdentityFromInviteSecret {
+                recorded_by,
+                invite_event_id,
+            } => {
+                if has_creds_with_source(conn, CRED_SOURCE_PEER_SHARED)
+                    .map_err(|e| TransportIdentityError::InstallFailed(e.to_string()))?
+                {
+                    return Err(TransportIdentityError::BootstrapAfterPeerSharedDenied);
+                }
+
+                let invite_eid_b64 = crate::crypto::event_id_to_base64(&invite_event_id);
+                let key_bytes: Option<Vec<u8>> = conn
+                    .query_row(
+                        "SELECT private_key FROM invite_secrets
+                         WHERE recorded_by = ?1
+                           AND invite_event_id = ?2
+                         ORDER BY created_at DESC, event_id DESC
+                         LIMIT 1",
+                        rusqlite::params![recorded_by, invite_eid_b64],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|e| TransportIdentityError::InstallFailed(e.to_string()))?
+                    .flatten();
+
+                let key_bytes =
+                    key_bytes.ok_or_else(|| TransportIdentityError::InviteSecretNotFound {
+                        recorded_by: recorded_by.clone(),
+                        invite_event_id: invite_eid_b64.clone(),
+                    })?;
+                let signing_key = parse_signing_key(key_bytes)?;
                 crate::transport::identity::install_invite_bootstrap_transport_identity(
                     conn,
                     &signing_key,
@@ -62,16 +113,7 @@ impl TransportIdentityAdapter for ConcreteTransportIdentityAdapter {
                         recorded_by: recorded_by.clone(),
                     })?;
 
-                if key_bytes.len() != 32 {
-                    return Err(TransportIdentityError::InvalidKeyMaterial(format!(
-                        "expected 32 bytes, got {}",
-                        key_bytes.len()
-                    )));
-                }
-
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&key_bytes);
-                let signing_key = ed25519_dalek::SigningKey::from_bytes(&arr);
+                let signing_key = parse_signing_key(key_bytes)?;
 
                 crate::transport::identity::install_peer_key_transport_identity(conn, &signing_key)
                     .map_err(|e| TransportIdentityError::InstallFailed(e.to_string()))

@@ -528,17 +528,52 @@ pub fn list_active_invite_bootstrap_addrs(
     conn: &Connection,
     recorded_by: &str,
 ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
-    // Supersession is now handled at projection time.
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for target in list_active_invite_bootstrap_targets(conn, recorded_by)? {
+        if seen.insert(target.bootstrap_addr.clone()) {
+            out.push(target.bootstrap_addr);
+        }
+    }
+    Ok(out)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InviteBootstrapTarget {
+    pub invite_event_id: String,
+    pub bootstrap_addr: String,
+}
+
+/// List active invite bootstrap targets for a tenant, keyed by invite_event_id.
+///
+/// The deterministic winner per invite_event_id is the newest accepted row.
+pub fn list_active_invite_bootstrap_targets(
+    conn: &Connection,
+    recorded_by: &str,
+) -> Result<Vec<InviteBootstrapTarget>, Box<dyn std::error::Error + Send + Sync>> {
     let now = now_ms_i64();
     let mut stmt = conn.prepare(
-        "SELECT DISTINCT bootstrap_addr
-           FROM invite_bootstrap_trust
-          WHERE recorded_by = ?1
-            AND expires_at > ?2",
+        "SELECT t.invite_event_id, t.bootstrap_addr
+           FROM invite_bootstrap_trust t
+          WHERE t.recorded_by = ?1
+            AND t.expires_at > ?2
+            AND t.rowid = (
+                SELECT t2.rowid
+                  FROM invite_bootstrap_trust t2
+                 WHERE t2.recorded_by = t.recorded_by
+                   AND t2.invite_event_id = t.invite_event_id
+                   AND t2.expires_at > ?2
+                 ORDER BY t2.accepted_at DESC, t2.invite_accepted_event_id DESC
+                 LIMIT 1
+            )
+          ORDER BY t.accepted_at DESC, t.invite_accepted_event_id DESC",
     )?;
     let rows = stmt
         .query_map(rusqlite::params![recorded_by, now], |row| {
-            row.get::<_, String>(0)
+            Ok(InviteBootstrapTarget {
+                invite_event_id: row.get(0)?,
+                bootstrap_addr: row.get(1)?,
+            })
         })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)

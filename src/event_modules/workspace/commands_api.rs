@@ -256,11 +256,7 @@ fn prepare_invite_acceptance(
     expected_kind: super::invite_link::InviteLinkKind,
     expected_kind_error: &str,
 ) -> Result<PreparedInviteAcceptance, Box<dyn std::error::Error + Send + Sync>> {
-    use crate::contracts::transport_identity_contract::{
-        TransportIdentityAdapter, TransportIdentityIntent,
-    };
     use crate::db::{open_connection, schema::create_tables};
-    use crate::transport::identity_adapter::ConcreteTransportIdentityAdapter;
 
     let invite = super::invite_link::parse_invite_link(invite_link_str).map_err(
         |e| -> Box<dyn std::error::Error + Send + Sync> {
@@ -283,21 +279,11 @@ fn prepare_invite_acceptance(
         &peer_shared_key.verifying_key().to_bytes(),
     ));
 
-    // Install invite-derived bootstrap transport identity for the initial handshake.
+    // Open DB and ensure schema. Bootstrap transport identity is now installed
+    // via invite_accepted projection when local invite_secret material exists.
     let db = {
         let db = open_connection(db_path)?;
         create_tables(&db)?;
-        let adapter = ConcreteTransportIdentityAdapter;
-        adapter
-            .apply_intent(
-                &db,
-                TransportIdentityIntent::InstallBootstrapIdentityFromInviteKey {
-                    invite_private_key: invite_key.to_bytes(),
-                },
-            )
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                format!("Failed to install bootstrap transport identity: {}", e).into()
-            })?;
         db
     };
 

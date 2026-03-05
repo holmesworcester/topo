@@ -26,8 +26,9 @@ use crate::peering::loops::{
 };
 use crate::sync::CoordinationManager;
 use crate::transport::{
-    build_tenant_bootstrap_fallback_client_config_from_db, build_tenant_client_config_from_db,
-    TenantClientConfigs, TransportClientConfig, TransportEndpoint,
+    build_tenant_bootstrap_fallback_client_config_for_invite_from_db,
+    build_tenant_client_config_from_db, TenantClientConfigs, TransportClientConfig,
+    TransportEndpoint,
 };
 use crate::tuning::shared_ingest_cap;
 
@@ -83,13 +84,12 @@ enum WorkerExitDisposition {
 #[derive(Clone)]
 struct TenantDispatchContext {
     client_config: TransportClientConfig,
-    bootstrap_fallback_client_config: Option<TransportClientConfig>,
     coordination_manager: Arc<CoordinationManager>,
 }
 
 #[derive(Clone, Debug)]
 enum TargetIngressSource {
-    Bootstrap,
+    Bootstrap { invite_event_id: String },
     Discovery { peer_id: String },
 }
 
@@ -380,19 +380,6 @@ fn build_tenant_contexts(
             tenant_id.clone(),
             TenantDispatchContext {
                 client_config,
-                bootstrap_fallback_client_config:
-                    match build_tenant_bootstrap_fallback_client_config_from_db(db_path, tenant_id)
-                    {
-                        Ok(cfg) => cfg,
-                        Err(e) => {
-                            warn!(
-                                "Bootstrap fallback config unavailable for tenant {}: {}",
-                                short_peer_id(tenant_id),
-                                e
-                            );
-                            None
-                        }
-                    },
                 coordination_manager: Arc::new(CoordinationManager::new()),
             },
         );
@@ -494,12 +481,12 @@ async fn run_bootstrap_refresher(
 
         match collect_all_bootstrap_targets(&db_path) {
             Ok(targets) => {
-                for (tenant_id, remote) in targets {
+                for (tenant_id, invite_event_id, remote) in targets {
                     if ingress_tx
                         .send(TargetIngressEvent {
                             tenant_id,
                             remote,
-                            source: TargetIngressSource::Bootstrap,
+                            source: TargetIngressSource::Bootstrap { invite_event_id },
                         })
                         .is_err()
                     {
@@ -587,21 +574,25 @@ async fn run_target_dispatcher(
         reap_finished_connect_workers(&mut active_workers, &mut dispatcher).await;
 
         let dispatch_key = match &event.source {
-            TargetIngressSource::Bootstrap => bootstrap_dispatch_key(&event.tenant_id),
+            TargetIngressSource::Bootstrap { invite_event_id } => {
+                bootstrap_dispatch_key(&event.tenant_id, invite_event_id)
+            }
             TargetIngressSource::Discovery { peer_id } => {
                 discovery_dispatch_key(&event.tenant_id, peer_id)
             }
         };
 
         let should_spawn = match &event.source {
-            TargetIngressSource::Bootstrap => {
-                dispatch_bootstrap_target(&mut dispatcher, &event.tenant_id, event.remote)
-            }
+            TargetIngressSource::Bootstrap { invite_event_id } => dispatch_bootstrap_target(
+                &mut dispatcher,
+                &event.tenant_id,
+                invite_event_id,
+                event.remote,
+            ),
             TargetIngressSource::Discovery { peer_id } => {
                 dispatch_discovery_target(&mut dispatcher, &event.tenant_id, peer_id, event.remote)
             }
         };
-        let allow_bootstrap_fallback = matches!(&event.source, TargetIngressSource::Bootstrap);
 
         if !should_spawn {
             continue;
@@ -619,21 +610,6 @@ async fn run_target_dispatcher(
                 Ok(client_config) => {
                     let context = TenantDispatchContext {
                         client_config,
-                        bootstrap_fallback_client_config:
-                            match build_tenant_bootstrap_fallback_client_config_from_db(
-                                &db_path,
-                                &event.tenant_id,
-                            ) {
-                                Ok(cfg) => cfg,
-                                Err(err) => {
-                                    warn!(
-                                        "Bootstrap fallback config unavailable for tenant {}: {}",
-                                        short_peer_id(&event.tenant_id),
-                                        err
-                                    );
-                                    None
-                                }
-                            },
                         coordination_manager: Arc::new(CoordinationManager::new()),
                     };
                     tenant_contexts.insert(event.tenant_id.clone(), context.clone());
@@ -650,6 +626,28 @@ async fn run_target_dispatcher(
             }
         };
 
+        let bootstrap_fallback_client_config = match &event.source {
+            TargetIngressSource::Bootstrap { invite_event_id } => {
+                match build_tenant_bootstrap_fallback_client_config_for_invite_from_db(
+                    &db_path,
+                    &event.tenant_id,
+                    invite_event_id,
+                ) {
+                    Ok(cfg) => cfg,
+                    Err(err) => {
+                        warn!(
+                            "Bootstrap fallback config unavailable for tenant {} invite {}: {}",
+                            short_peer_id(&event.tenant_id),
+                            short_peer_id(invite_event_id),
+                            err
+                        );
+                        None
+                    }
+                }
+            }
+            TargetIngressSource::Discovery { .. } => None,
+        };
+
         let worker_cancel = shutdown.child_token();
         let worker = std::thread::spawn({
             let db_path = db_path.clone();
@@ -657,6 +655,7 @@ async fn run_target_dispatcher(
             let endpoint = endpoint.clone();
             let worker_cancel = worker_cancel.clone();
             let dispatch_key = dispatch_key.clone();
+            let bootstrap_fallback_client_config = bootstrap_fallback_client_config.clone();
             move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -672,7 +671,7 @@ async fn run_target_dispatcher(
                     ingest,
                     worker_cancel,
                     dispatch_key,
-                    allow_bootstrap_fallback,
+                    bootstrap_fallback_client_config,
                 ));
             }
         });
@@ -732,7 +731,7 @@ async fn run_connect_worker(
     ingest: IngestFns,
     shutdown: CancellationToken,
     dispatch_key: String,
-    allow_bootstrap_fallback: bool,
+    bootstrap_fallback_client_config: Option<TransportClientConfig>,
 ) {
     loop {
         if shutdown.is_cancelled() {
@@ -749,11 +748,7 @@ async fn run_connect_worker(
             ingest,
             context.coordination_manager.clone(),
             shutdown.clone(),
-            if allow_bootstrap_fallback {
-                context.bootstrap_fallback_client_config.clone()
-            } else {
-                None
-            },
+            bootstrap_fallback_client_config.clone(),
         )
         .await;
 

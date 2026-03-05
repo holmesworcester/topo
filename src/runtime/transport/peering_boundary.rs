@@ -153,33 +153,11 @@ pub fn build_tenant_client_config_from_db(
     build_tenant_client_config_from_creds(db_path, tenant_id, cert_der, key_der)
 }
 
-/// Build an optional bootstrap-fallback client config for a tenant.
-///
-/// Fallback identity is derived from the latest pending invite unwrap key
-/// (`local_signer_material.signer_kind = 4`) for this tenant. This enables
-/// retrying outbound bootstrap dials when permanent transport identity is
-/// rejected by a peer that has not yet converged peer_shared trust.
-pub fn build_tenant_bootstrap_fallback_client_config_from_db(
+fn build_bootstrap_fallback_config_from_key_bytes(
     db_path: &str,
     tenant_id: &str,
+    key_bytes: Vec<u8>,
 ) -> Result<Option<TransportClientConfig>, Box<dyn std::error::Error + Send + Sync>> {
-    let db = open_connection(db_path)?;
-    let key_bytes: Option<Vec<u8>> = db
-        .query_row(
-            "SELECT private_key
-             FROM local_signer_material
-             WHERE recorded_by = ?1
-               AND signer_kind = 4
-               AND length(private_key) = 32
-             ORDER BY created_at DESC, rowid DESC
-             LIMIT 1",
-            rusqlite::params![tenant_id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let Some(key_bytes) = key_bytes else {
-        return Ok(None);
-    };
     if key_bytes.len() != 32 {
         return Ok(None);
     }
@@ -190,6 +168,80 @@ pub fn build_tenant_bootstrap_fallback_client_config_from_db(
         crate::transport::generate_self_signed_cert_from_signing_key(&signing_key)?;
     let cfg = build_tenant_client_config_from_creds(db_path, tenant_id, cert_der, key_der)?;
     Ok(Some(cfg))
+}
+
+/// Build an optional bootstrap-fallback client config for a tenant + invite.
+///
+/// Fallback identity is derived from projected `invite_secret` key material
+/// that matches this tenant/invite and still has active invite_bootstrap_trust.
+pub fn build_tenant_bootstrap_fallback_client_config_for_invite_from_db(
+    db_path: &str,
+    tenant_id: &str,
+    invite_event_id_b64: &str,
+) -> Result<Option<TransportClientConfig>, Box<dyn std::error::Error + Send + Sync>> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis() as i64;
+    let db = open_connection(db_path)?;
+    let key_bytes: Option<Vec<u8>> = db
+        .query_row(
+            "SELECT private_key
+             FROM invite_secrets s
+             WHERE s.recorded_by = ?1
+               AND s.invite_event_id = ?2
+               AND length(private_key) = 32
+               AND EXISTS (
+                   SELECT 1
+                   FROM invite_bootstrap_trust t
+                   WHERE t.recorded_by = s.recorded_by
+                     AND t.invite_event_id = s.invite_event_id
+                     AND t.expires_at > ?3
+               )
+             ORDER BY s.created_at DESC, s.event_id DESC
+             LIMIT 1",
+            rusqlite::params![tenant_id, invite_event_id_b64, now_ms],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(key_bytes) = key_bytes else {
+        return Ok(None);
+    };
+    build_bootstrap_fallback_config_from_key_bytes(db_path, tenant_id, key_bytes)
+}
+
+/// Build an optional bootstrap-fallback client config for a tenant.
+///
+/// Selects the latest active invite_bootstrap_trust row and resolves matching
+/// invite_secret key material for that invite.
+pub fn build_tenant_bootstrap_fallback_client_config_from_db(
+    db_path: &str,
+    tenant_id: &str,
+) -> Result<Option<TransportClientConfig>, Box<dyn std::error::Error + Send + Sync>> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis() as i64;
+    let db = open_connection(db_path)?;
+    let invite_event_id_b64: Option<String> = db
+        .query_row(
+            "SELECT invite_event_id
+             FROM invite_bootstrap_trust
+            WHERE recorded_by = ?1
+               AND expires_at > ?2
+             ORDER BY accepted_at DESC, invite_accepted_event_id DESC
+             LIMIT 1",
+            rusqlite::params![tenant_id, now_ms],
+            |row| row.get(0),
+        )
+        .optional()?;
+    drop(db);
+    let Some(invite_event_id_b64) = invite_event_id_b64 else {
+        return Ok(None);
+    };
+    build_tenant_bootstrap_fallback_client_config_for_invite_from_db(
+        db_path,
+        tenant_id,
+        &invite_event_id_b64,
+    )
 }
 
 pub fn tenant_trusts_peer(
@@ -421,17 +473,39 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_fallback_client_config_present_when_pending_invite_key_exists() {
+    fn bootstrap_fallback_client_config_present_when_active_invite_secret_exists() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("fallback_cfg.sqlite3");
         let db = open_connection(&db_path).unwrap();
         create_tables(&db).unwrap();
 
         db.execute(
-            "INSERT INTO local_signer_material
-             (recorded_by, signer_event_id, signer_kind, private_key, created_at)
-             VALUES (?1, ?2, 4, ?3, ?4)",
-            rusqlite::params!["tenant-a", "invite-eid", vec![7u8; 32], 12345_i64,],
+            "INSERT INTO invite_secrets
+             (recorded_by, event_id, invite_event_id, private_key, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                "tenant-a",
+                "invite-secret-eid",
+                "invite-a",
+                vec![7u8; 32],
+                12345_i64
+            ],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO invite_bootstrap_trust
+             (recorded_by, invite_accepted_event_id, invite_event_id, workspace_id, bootstrap_addr, bootstrap_spki_fingerprint, accepted_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                "tenant-a",
+                "ia-a",
+                "invite-a",
+                "ws-a",
+                "127.0.0.1:4433",
+                vec![9u8; 32],
+                1_i64,
+                i64::MAX
+            ],
         )
         .unwrap();
         drop(db);
@@ -443,12 +517,12 @@ mod tests {
         .expect("fallback config query should succeed");
         assert!(
             cfg.is_some(),
-            "pending invite key should yield fallback config"
+            "active invite_secret should yield fallback config"
         );
     }
 
     #[test]
-    fn bootstrap_fallback_client_config_absent_without_pending_invite_key() {
+    fn bootstrap_fallback_client_config_absent_without_active_invite_secret() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("fallback_cfg_empty.sqlite3");
         let db = open_connection(&db_path).unwrap();
@@ -462,8 +536,65 @@ mod tests {
         .expect("fallback config query should succeed");
         assert!(
             cfg.is_none(),
-            "no pending invite key means no fallback config"
+            "no active invite_secret means no fallback config"
         );
+    }
+
+    #[test]
+    fn bootstrap_fallback_client_config_for_invite_is_invite_specific() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("fallback_cfg_specific.sqlite3");
+        let db = open_connection(&db_path).unwrap();
+        create_tables(&db).unwrap();
+
+        db.execute(
+            "INSERT INTO invite_secrets
+             (recorded_by, event_id, invite_event_id, private_key, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["tenant-a", "secret-a", "invite-a", vec![7u8; 32], 100_i64],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO invite_secrets
+             (recorded_by, event_id, invite_event_id, private_key, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["tenant-a", "secret-b", "invite-b", vec![8u8; 32], 200_i64],
+        )
+        .unwrap();
+        for (ia, invite) in [("ia-a", "invite-a"), ("ia-b", "invite-b")] {
+            db.execute(
+                "INSERT INTO invite_bootstrap_trust
+                 (recorded_by, invite_accepted_event_id, invite_event_id, workspace_id, bootstrap_addr, bootstrap_spki_fingerprint, accepted_at, expires_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                rusqlite::params![
+                    "tenant-a",
+                    ia,
+                    invite,
+                    "ws-a",
+                    "127.0.0.1:4433",
+                    vec![9u8; 32],
+                    1_i64,
+                    i64::MAX
+                ],
+            )
+            .unwrap();
+        }
+        drop(db);
+
+        let cfg_a = build_tenant_bootstrap_fallback_client_config_for_invite_from_db(
+            db_path.to_str().unwrap(),
+            "tenant-a",
+            "invite-a",
+        )
+        .expect("invite-a fallback should query");
+        let cfg_b = build_tenant_bootstrap_fallback_client_config_for_invite_from_db(
+            db_path.to_str().unwrap(),
+            "tenant-a",
+            "invite-b",
+        )
+        .expect("invite-b fallback should query");
+        assert!(cfg_a.is_some(), "invite-a fallback must resolve");
+        assert!(cfg_b.is_some(), "invite-b fallback must resolve");
     }
 
     #[tokio::test]

@@ -15,6 +15,12 @@ pub enum TransportIdentityIntent {
     /// Install a deterministic transport cert derived from the invite signing
     /// key for invite bootstrap handshakes.
     InstallBootstrapIdentityFromInviteKey { invite_private_key: [u8; 32] },
+    /// Install bootstrap transport identity from locally projected invite_secret
+    /// key material for a specific invite event.
+    InstallBootstrapIdentityFromInviteSecret {
+        recorded_by: String,
+        invite_event_id: [u8; 32],
+    },
     /// Install a deterministic transport cert derived from the PeerShared
     /// signing key, replacing any prior identity (random or invite-derived).
     InstallPeerSharedIdentityFromSigner {
@@ -30,6 +36,13 @@ pub enum TransportIdentityError {
     InstallFailed(String),
     #[error("bootstrap transport identity install denied after peershared identity is active")]
     BootstrapAfterPeerSharedDenied,
+    #[error(
+        "invite secret not found for recorded_by={recorded_by}, invite_event_id={invite_event_id}"
+    )]
+    InviteSecretNotFound {
+        recorded_by: String,
+        invite_event_id: String,
+    },
     #[error("signer key not found for recorded_by={recorded_by}")]
     SignerKeyNotFound { recorded_by: String },
     #[error("invalid key material: {0}")]
