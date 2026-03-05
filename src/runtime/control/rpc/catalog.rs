@@ -42,17 +42,21 @@ static CATALOG: &[MethodInfo] = &[
     MethodInfo {
         name: "Send",
         purpose: "Send a message in the active workspace",
-        params: params!["content", "string", true, None],
-        example_json: r#"{"type":"Send","content":"hello"}"#,
+        params: params![
+            "content", "string", true, None;
+            "client_op_id", "string?", false, None
+        ],
+        example_json: r#"{"type":"Send","content":"hello","client_op_id":"op-123"}"#,
     },
     MethodInfo {
         name: "SendFile",
         purpose: "Send a message with a file attachment",
         params: params![
             "content", "string", true, None;
-            "file_path", "string", true, None
+            "file_path", "string", true, None;
+            "client_op_id", "string?", false, None
         ],
-        example_json: r#"{"type":"SendFile","content":"see attached","file_path":"/tmp/notes.txt"}"#,
+        example_json: r#"{"type":"SendFile","content":"see attached","file_path":"/tmp/notes.txt","client_op_id":"op-456"}"#,
     },
     MethodInfo {
         name: "Generate",
@@ -96,9 +100,10 @@ static CATALOG: &[MethodInfo] = &[
         purpose: "Create a reaction to a message",
         params: params![
             "target", "string", true, None;
-            "emoji", "string", true, None
+            "emoji", "string", true, None;
+            "client_op_id", "string?", false, None
         ],
-        example_json: r#"{"type":"React","target":"1","emoji":"thumbsup"}"#,
+        example_json: r#"{"type":"React","target":"1","emoji":"thumbsup","client_op_id":"op-789"}"#,
     },
     MethodInfo {
         name: "DeleteMessage",

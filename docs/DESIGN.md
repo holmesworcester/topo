@@ -120,7 +120,9 @@ After creation/join/linking settles, day-to-day behavior is not a new phase. Pee
 
 ### Frontend Ergonomic API
 
-Our daemon provides a placeholder RPC API that is capable of serving whatever queries are desired, and accepting commands with the minimal convenient set of parameters needed to execute them. For example, the CLI can request a message list that includes not just message content but user information, reactions, file attachments, download progress, etc, with limits and ranges for lazy loading. Developers benefit from event-module locality: when adding functionality to, say, messages or reactions, everything they need to modify is in the same content-thematic cluster of create, project, and query functions. Queries and commands are strictly scoped by peer, to avoid accidental intermingling of local data in development or testing. Unlike most p2p or local-first frameworks, you aren't on your own to build complex state management layer and deal with state duplication and concurrency problems; there is no middleware and frontends can be maximally simple. Because our "server" is local and only serves one client, frequent polling is a simple-but-effective way to keep frontend and backend state in constant sync. 
+Our daemon provides a placeholder RPC API that is capable of serving whatever queries are desired, and accepting commands with the minimal convenient set of parameters needed to execute them. For example, the CLI can request a message list that includes not just message content but user information, reactions, file attachments, download progress, etc, with limits and ranges for lazy loading. Developers benefit from event-module locality: when adding functionality to, say, messages or reactions, everything they need to modify is in the same content-thematic cluster of create, project, and query functions. Queries and commands are strictly scoped by peer, to avoid accidental intermingling of local data in development or testing. Unlike most p2p or local-first frameworks, you aren't on your own to build complex state management layer and deal with state duplication and concurrency problems; there is no middleware and frontends can be maximally simple. Because our "server" is local and only serves one client, frequent polling is a simple-but-effective way to keep frontend and backend state in constant sync.
+
+For instant optimistic feedback, write commands (`Send`, `React`, `SendFile`) accept an optional `client_op_id` that the frontend generates locally. The daemon stores a local mapping from `client_op_id` to the resulting `event_id`, and annotates view responses with these IDs. The frontend shows an optimistic row immediately on send, then drops it when the polled view contains a canonical item with the matching `client_op_id`. This gives Slack-like latency with no client-side state machine — just a key match on each poll.
 
 ## Adding Event-Layer Functionality
 
@@ -1321,6 +1323,20 @@ Daemon RPC state owns local UX/session aliases that are intentionally non-canoni
 3. channel aliases + active-channel selection per peer.
 
 These are operator ergonomics, not protocol facts; they do not project into canonical event state.
+
+### Local-echo reconciliation (`client_op_id`)
+
+Frontends need instant optimistic feedback on user actions (send, react, attach file) even while the backend is busy with sync or projection. The `client_op_id` mechanism provides this:
+
+1. Frontend generates a unique `client_op_id` string and passes it with the write RPC (`Send`, `React`, `SendFile`).
+2. Frontend immediately shows an optimistic row keyed by `client_op_id` — no server round-trip needed for display.
+3. Daemon creates the event normally and stores a local mapping: `client_op_id → event_id` in the `local_client_ops` table (not replicated).
+4. When building `View` or `Messages` responses, the daemon annotates canonical projected items with their `client_op_id` (via LEFT JOIN on the mapping table).
+5. Frontend polls the view and sees a canonical message tagged with `client_op_id: "abc"` — drops the optimistic row. Done.
+
+The frontend reconciliation is a single selector: `visible = canonical ∪ {o ∈ optimistic | o.client_op_id ∉ canonical.client_op_ids}`. No status machine, no async state tracking, no merge logic. The `client_op_id` is purely optional and backward compatible — commands without it work exactly as before.
+
+The `local_client_ops` table is pruned periodically (entries older than 24h). It is local UX state only.
 
 ### DB registry selector contract
 

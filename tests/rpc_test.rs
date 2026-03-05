@@ -44,13 +44,18 @@ fn rpc_request_send_roundtrip() {
         version: PROTOCOL_VERSION,
         method: RpcMethod::Send {
             content: "hello world".into(),
+            client_op_id: None,
         },
     };
     let frame = encode_frame(&req).unwrap();
     let decoded: RpcRequest = decode_frame(&mut &frame[..]).unwrap();
     match decoded.method {
-        RpcMethod::Send { content } => {
+        RpcMethod::Send {
+            content,
+            client_op_id,
+        } => {
             assert_eq!(content, "hello world");
+            assert!(client_op_id.is_none());
         }
         other => panic!("expected Send, got {:?}", other),
     }
@@ -99,6 +104,7 @@ fn rpc_all_methods_serialize() {
         RpcMethod::Messages { limit: 50 },
         RpcMethod::Send {
             content: "msg".into(),
+            client_op_id: None,
         },
         RpcMethod::Generate { count: 10 },
         RpcMethod::AssertNow {
@@ -113,6 +119,7 @@ fn rpc_all_methods_serialize() {
         RpcMethod::React {
             target: "abc".into(),
             emoji: "thumbs_up".into(),
+            client_op_id: None,
         },
         RpcMethod::DeleteMessage {
             target: "def".into(),
@@ -1334,6 +1341,7 @@ fn catalog_drift_test_method_count_matches_protocol() {
         "IntroAttempts", "CreateInvite", "AcceptInvite", "CreateDeviceLink",
         "AcceptLink", "Ban", "Identity", "Shutdown", "Tenants", "UseTenant",
         "ActiveTenant", "CreateWorkspace", "Peers", "Upnp", "View",
+        "EventList", "Intro",
     ];
 
     for method in &known_methods {

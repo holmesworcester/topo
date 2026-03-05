@@ -186,6 +186,9 @@ enum Commands {
     Send {
         /// Message content
         content: String,
+        /// Client operation ID for local-echo reconciliation
+        #[arg(long)]
+        client_op_id: Option<String>,
     },
 
     /// Send a message with a file attachment
@@ -196,6 +199,9 @@ enum Commands {
         /// Path to file to attach (generates a placeholder if omitted)
         #[arg(long)]
         file: Option<String>,
+        /// Client operation ID for local-echo reconciliation
+        #[arg(long)]
+        client_op_id: Option<String>,
     },
 
     /// Show database status
@@ -243,6 +249,9 @@ enum Commands {
         /// Target: message number (N or #N) or hex event ID
         #[arg(long)]
         target: String,
+        /// Client operation ID for local-echo reconciliation
+        #[arg(long)]
+        client_op_id: Option<String>,
     },
 
     /// Delete a message
@@ -1063,12 +1072,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             show_messages_from_json(db, &data);
         }
 
-        Commands::Send { content } => {
+        Commands::Send {
+            content,
+            client_op_id,
+        } => {
             let data = rpc_require_daemon(
                 db,
                 socket_override.as_deref(),
                 RpcMethod::Send {
                     content: content.clone(),
+                    client_op_id,
                 },
             )?;
             let event_id = data["event_id"].as_str().unwrap_or("");
@@ -1076,7 +1089,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             println!("event_id:{}", event_id);
         }
 
-        Commands::SendFile { content, file } => {
+        Commands::SendFile {
+            content,
+            file,
+            client_op_id,
+        } => {
             let file_path = match file {
                 Some(f) => f,
                 None => {
@@ -1092,6 +1109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 RpcMethod::SendFile {
                     content: content.clone(),
                     file_path,
+                    client_op_id,
                 },
             )?;
             let event_id = data["event_id"].as_str().unwrap_or("");
@@ -1253,13 +1271,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         }
 
-        Commands::React { emoji, target } => {
+        Commands::React {
+            emoji,
+            target,
+            client_op_id,
+        } => {
             let data = rpc_require_daemon(
                 db,
                 socket_override.as_deref(),
                 RpcMethod::React {
                     target,
                     emoji: emoji.clone(),
+                    client_op_id,
                 },
             )?;
             let event_id = data["event_id"].as_str().unwrap_or("");

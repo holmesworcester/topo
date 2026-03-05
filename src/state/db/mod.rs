@@ -1,6 +1,7 @@
 pub mod egress_queue;
 pub mod health;
 pub mod intro;
+pub mod local_client_ops;
 pub mod need_queue;
 pub mod project_queue;
 pub mod queue;
@@ -72,6 +73,7 @@ pub fn ensure_infra_schema(conn: &Connection) -> SqliteResult<()> {
     transport_trust::ensure_schema(conn)?;
     transport_creds::ensure_schema(conn)?;
     need_queue::ensure_schema(conn)?;
+    local_client_ops::ensure_schema(conn)?;
     Ok(())
 }
 

@@ -106,6 +106,10 @@ pub fn list(
     let rows = list_rows(db, recorded_by, limit)?;
     let total = count(db, recorded_by)?;
 
+    // Load client_op_id mappings for annotation
+    let client_ops = crate::db::local_client_ops::all_mappings(db, recorded_by)
+        .unwrap_or_default();
+
     let mut messages = Vec::with_capacity(rows.len());
     for row in rows {
         let reactions: Vec<super::ReactionSummary> =
@@ -129,6 +133,8 @@ pub fn list(
                 })
                 .collect();
 
+        let client_op_id = client_ops.get(&row.message_id_b64).cloned();
+
         messages.push(super::MessageItem {
             id: row.message_id_hex,
             id_b64: row.message_id_b64,
@@ -138,6 +144,7 @@ pub fn list(
             created_at: row.created_at,
             reactions,
             attachments,
+            client_op_id,
         });
     }
 

@@ -67,6 +67,8 @@ pub struct MessageItem {
     pub created_at: i64,
     pub reactions: Vec<ReactionSummary>,
     pub attachments: Vec<AttachmentSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_op_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

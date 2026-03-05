@@ -190,6 +190,8 @@ pub struct ViewMessage {
     pub content: String,
     pub created_at: i64,
     pub reactions: Vec<ViewReaction>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_op_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -237,6 +239,10 @@ pub fn view(
     // Messages with author names
     let msg_resp = message::list(db, recorded_by, limit)?;
 
+    // Load client_op_id mappings for annotation
+    let client_ops = crate::db::local_client_ops::all_mappings(db, recorded_by)
+        .unwrap_or_default();
+
     // Reactions per message
     let mut view_messages = Vec::with_capacity(msg_resp.messages.len());
     for msg in msg_resp.messages {
@@ -249,6 +255,8 @@ pub fn view(
                 })
                 .collect();
 
+        let client_op_id = client_ops.get(&msg.id_b64).cloned();
+
         view_messages.push(ViewMessage {
             id: msg.id_b64,
             author_id: msg.author_id,
@@ -256,6 +264,7 @@ pub fn view(
             content: msg.content,
             created_at: msg.created_at,
             reactions,
+            client_op_id,
         });
     }
 

@@ -298,6 +298,33 @@ fn resolve_bootstrap_from_upnp(
     Ok(std::net::SocketAddr::new(parsed_ip, port).to_string())
 }
 
+/// Best-effort store of client_op_id → event_id mapping. Failures are logged but don't
+/// affect the RPC response since the event was already created successfully.
+fn store_client_op(
+    db_path: &str,
+    peer_id: &str,
+    client_op_id: Option<&str>,
+    event_id_hex: &str,
+    op_kind: &str,
+) {
+    let Some(cop_id) = client_op_id else { return };
+    let Ok(eid_bytes) = hex::decode(event_id_hex) else {
+        warn!("store_client_op: bad hex event_id");
+        return;
+    };
+    if eid_bytes.len() != 32 {
+        return;
+    }
+    let eid: [u8; 32] = eid_bytes.try_into().unwrap();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    if let Ok(conn) = crate::db::open_connection(db_path) {
+        let _ = crate::db::local_client_ops::insert(&conn, peer_id, cop_id, &eid, op_kind, now_ms);
+    }
+}
+
 fn dispatch(
     state: &DaemonState,
     method: RpcMethod,
@@ -404,17 +431,30 @@ fn dispatch(
         }
 
         // ----- Commands that need active peer -----
-        RpcMethod::Send { content } => match state.require_active_peer() {
+        RpcMethod::Send {
+            content,
+            client_op_id,
+        } => match state.require_active_peer() {
             Ok(peer_id) => match message::send_for_peer(db_path, &peer_id, &content) {
-                Ok(data) => RpcResponse::success(data),
+                Ok(data) => {
+                    store_client_op(db_path, &peer_id, client_op_id.as_deref(), &data.event_id, "message");
+                    RpcResponse::success(data)
+                }
                 Err(e) => RpcResponse::error(e.to_string()),
             },
             Err(e) => RpcResponse::error(e),
         },
-        RpcMethod::SendFile { content, file_path } => match state.require_active_peer() {
+        RpcMethod::SendFile {
+            content,
+            file_path,
+            client_op_id,
+        } => match state.require_active_peer() {
             Ok(peer_id) => {
                 match message::send_file_for_peer(db_path, &peer_id, &content, &file_path) {
-                    Ok(data) => RpcResponse::success(data),
+                    Ok(data) => {
+                        store_client_op(db_path, &peer_id, client_op_id.as_deref(), &data.event_id, "attachment");
+                        RpcResponse::success(data)
+                    }
                     Err(e) => RpcResponse::error(e.to_string()),
                 }
             }
@@ -439,9 +479,16 @@ fn dispatch(
             },
             Err(e) => RpcResponse::error(e),
         },
-        RpcMethod::React { target, emoji } => match state.require_active_peer() {
+        RpcMethod::React {
+            target,
+            emoji,
+            client_op_id,
+        } => match state.require_active_peer() {
             Ok(peer_id) => match reaction::react_for_peer(db_path, &peer_id, &target, &emoji) {
-                Ok(data) => RpcResponse::success(data),
+                Ok(data) => {
+                    store_client_op(db_path, &peer_id, client_op_id.as_deref(), &data.event_id, "reaction");
+                    RpcResponse::success(data)
+                }
                 Err(e) => RpcResponse::error(e.to_string()),
             },
             Err(e) => RpcResponse::error(e),

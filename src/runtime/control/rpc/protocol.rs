@@ -24,10 +24,14 @@ pub enum RpcMethod {
     },
     Send {
         content: String,
+        #[serde(default)]
+        client_op_id: Option<String>,
     },
     SendFile {
         content: String,
         file_path: String,
+        #[serde(default)]
+        client_op_id: Option<String>,
     },
     Generate {
         count: usize,
@@ -48,6 +52,8 @@ pub enum RpcMethod {
     React {
         target: String,
         emoji: String,
+        #[serde(default)]
+        client_op_id: Option<String>,
     },
     DeleteMessage {
         target: String,
