@@ -13,7 +13,7 @@ use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use topo::db::transport_creds::discover_local_tenants;
-use topo::db::{open_connection, schema::create_tables};
+use topo::db::{open_connection, schema::create_tables, sync_log};
 use topo::db_registry::DbRegistry;
 use topo::rpc::catalog;
 use topo::rpc::client::{rpc_call, rpc_call_raw, RpcClientError};
@@ -446,6 +446,59 @@ enum Commands {
         /// Subscription ID
         #[arg(long)]
         sub: String,
+    },
+
+    /// Enable persistent sync logging (off by default)
+    #[command(name = "sync-log-enable")]
+    SyncLogEnable {
+        /// Include match-only runs (default stores changed runs only)
+        #[arg(long, default_value_t = false)]
+        all_runs: bool,
+        /// Capture full ID lists in log details (larger DB growth)
+        #[arg(long, default_value_t = false)]
+        capture_full_ids: bool,
+    },
+
+    /// Disable persistent sync logging
+    #[command(name = "sync-log-disable")]
+    SyncLogDisable,
+
+    /// Show sync logging configuration
+    #[command(name = "sync-log-config")]
+    SyncLogConfig,
+
+    /// Show sync log trace history
+    #[command(name = "sync-log")]
+    SyncLog {
+        /// Max runs to show
+        #[arg(long, default_value = "5")]
+        limit: usize,
+        /// Show one specific run id
+        #[arg(long)]
+        run: Option<i64>,
+        /// Filter by peer id prefix
+        #[arg(long)]
+        peer: Option<String>,
+        /// Include runs that matched with no data transfer
+        #[arg(long)]
+        all: bool,
+    },
+
+    /// Show sync history in tree form
+    #[command(name = "sync-log-tree")]
+    SyncLogTree {
+        /// Max runs to show
+        #[arg(long, default_value = "5")]
+        limit: usize,
+        /// Show one specific run id
+        #[arg(long)]
+        run: Option<i64>,
+        /// Filter by peer id prefix
+        #[arg(long)]
+        peer: Option<String>,
+        /// Include runs that matched with no data transfer
+        #[arg(long)]
+        all: bool,
     },
 
     /// Raw RPC demo surface: list methods, describe parameters, submit raw JSON calls
@@ -1840,6 +1893,96 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             println!("Subscription enabled.");
         }
 
+        Commands::SyncLogEnable {
+            all_runs,
+            capture_full_ids,
+        } => {
+            let conn = open_connection(db)?;
+            create_tables(&conn)?;
+            let cfg = sync_log::update_config(
+                &conn,
+                sync_log::SyncLogConfigPatch {
+                    enabled: Some(true),
+                    changed_only: Some(!all_runs),
+                    capture_full_ids: Some(capture_full_ids),
+                    ..Default::default()
+                },
+            )?;
+            print_sync_log_config(&cfg);
+        }
+
+        Commands::SyncLogDisable => {
+            let conn = open_connection(db)?;
+            create_tables(&conn)?;
+            let cfg = sync_log::update_config(
+                &conn,
+                sync_log::SyncLogConfigPatch {
+                    enabled: Some(false),
+                    ..Default::default()
+                },
+            )?;
+            print_sync_log_config(&cfg);
+        }
+
+        Commands::SyncLogConfig => {
+            let conn = open_connection(db)?;
+            create_tables(&conn)?;
+            let cfg = sync_log::load_config(&conn)?;
+            print_sync_log_config(&cfg);
+        }
+
+        Commands::SyncLog {
+            limit,
+            run,
+            peer,
+            all,
+        } => {
+            let conn = open_connection(db)?;
+            create_tables(&conn)?;
+            let runs = sync_log::list_runs(&conn, limit, all, run, peer.as_deref())?;
+            if runs.is_empty() {
+                println!("No sync runs logged.");
+            } else {
+                if !all {
+                    println!("Showing changed/error runs only (use --all for full history).");
+                    println!();
+                }
+                for (idx, r) in runs.iter().enumerate() {
+                    let events = sync_log::list_run_events(&conn, r.run_id)?;
+                    print_sync_trace_run(r, &events);
+                    if idx + 1 < runs.len() {
+                        println!();
+                    }
+                }
+            }
+        }
+
+        Commands::SyncLogTree {
+            limit,
+            run,
+            peer,
+            all,
+        } => {
+            let conn = open_connection(db)?;
+            create_tables(&conn)?;
+            let runs = sync_log::list_runs(&conn, limit, all, run, peer.as_deref())?;
+            if runs.is_empty() {
+                println!("No sync runs logged.");
+            } else {
+                if !all {
+                    println!("Showing changed/error runs only (use --all for full history).");
+                    println!();
+                }
+                let mut run_events = Vec::with_capacity(runs.len());
+                for r in runs {
+                    let events = sync_log::list_run_events(&conn, r.run_id)?;
+                    run_events.push((r, events));
+                }
+                let groups = group_runs_by_peer(run_events);
+                print_sync_tree_groups(&groups);
+            }
+        }
+
         // ---------------------------------------------------------------
         // RPC demo surface
         // ---------------------------------------------------------------
@@ -2256,6 +2399,386 @@ fn print_event_list(events: &[service::EventListItem]) {
         println!();
     }
     println!("{} events. Sorted by insertion order.", events.len());
+}
+
+fn print_sync_log_config(cfg: &sync_log::SyncLogConfig) {
+    println!(
+        "sync-log enabled={} changed_only={} capture_full_ids={} max_runs={} max_age_days={}",
+        cfg.enabled, cfg.changed_only, cfg.capture_full_ids, cfg.max_runs, cfg.max_age_days
+    );
+}
+
+fn short_peer_hex(peer: &str) -> &str {
+    &peer[..peer.len().min(16)]
+}
+
+fn run_status(run: &sync_log::SyncRunRow) -> &'static str {
+    if run.error.is_some() || run.outcome != "ok" {
+        "error"
+    } else if run.changed {
+        "changed"
+    } else {
+        "match"
+    }
+}
+
+fn short_hex_owned(hex: &str) -> String {
+    hex.chars().take(16).collect()
+}
+
+fn event_id_prefix_from_detail_json(detail_json: Option<&str>) -> Option<String> {
+    let raw = detail_json?;
+    let v = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+    let eid = v.get("event_id")?.as_str()?;
+    Some(short_hex_owned(eid))
+}
+
+fn summarize_sync_event_detail(frame_type: &str, detail_json: Option<&str>) -> String {
+    let Some(raw) = detail_json else {
+        return String::new();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return " detail=parse_error".to_string();
+    };
+
+    match frame_type {
+        "NegOpen" | "NegMsg" => {
+            let entries = v["entry_count"].as_u64().unwrap_or(0);
+            let fp = v["fingerprint_count"].as_u64().unwrap_or(0);
+            let idl = v["idlist_count"].as_u64().unwrap_or(0);
+            let skip = v["skip_count"].as_u64().unwrap_or(0);
+            if let Some(err) = v["parse_error"].as_str() {
+                format!(
+                    " detail=neg(entries={} fp={} idlists={} skip={} err={})",
+                    entries, fp, idl, skip, err
+                )
+            } else {
+                format!(
+                    " detail=neg(entries={} fp={} idlists={} skip={})",
+                    entries, fp, idl, skip
+                )
+            }
+        }
+        "HaveList" => {
+            let count = v["id_count"].as_u64().unwrap_or(0);
+            let ids = v["ids"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_str())
+                        .map(|s| short_peer_hex(s).to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .unwrap_or_default();
+            let truncated = v["ids_truncated"].as_bool().unwrap_or(false);
+            if ids.is_empty() {
+                format!(" detail=ids(count={} truncated={})", count, truncated)
+            } else {
+                format!(
+                    " detail=ids(count={} truncated={} sample=[{}])",
+                    count, truncated, ids
+                )
+            }
+        }
+        "Event" => {
+            let eid = v["event_id"].as_str().unwrap_or("");
+            let blob_len = v["blob_len"].as_u64().unwrap_or(0);
+            if eid.is_empty() {
+                format!(" detail=event(blob_len={})", blob_len)
+            } else {
+                format!(
+                    " detail=event(id={} blob_len={})",
+                    short_peer_hex(eid),
+                    blob_len
+                )
+            }
+        }
+        _ => String::new(),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RenderedFrameLine {
+    seq_start: u64,
+    seq_end: u64,
+    dt_start_ms: i64,
+    dt_end_ms: i64,
+    lane: String,
+    direction: String,
+    frame_type: String,
+    len_label: String,
+    detail: String,
+}
+
+impl RenderedFrameLine {
+    fn seq_label(&self) -> String {
+        if self.seq_start == self.seq_end {
+            format!("{:04}", self.seq_start)
+        } else {
+            format!("{:04}-{:04}", self.seq_start, self.seq_end)
+        }
+    }
+
+    fn dt_label(&self) -> String {
+        if self.dt_start_ms == self.dt_end_ms {
+            format!("+{}ms", self.dt_start_ms)
+        } else {
+            format!("+{}..{}ms", self.dt_start_ms, self.dt_end_ms)
+        }
+    }
+}
+
+fn render_frame_lines(
+    run: &sync_log::SyncRunRow,
+    events: &[sync_log::SyncRunEventRow],
+) -> Vec<RenderedFrameLine> {
+    const COLLAPSE_EVENT_BURST_MIN: usize = 3;
+    const EVENT_SAMPLE_IDS: usize = 4;
+
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < events.len() {
+        let ev = &events[i];
+        if ev.frame_type == "Event" {
+            let mut j = i + 1;
+            while j < events.len() {
+                let nxt = &events[j];
+                if nxt.frame_type == "Event" && nxt.lane == ev.lane && nxt.direction == ev.direction
+                {
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+
+            let burst = &events[i..j];
+            if burst.len() >= COLLAPSE_EVENT_BURST_MIN {
+                let first = &burst[0];
+                let last = &burst[burst.len() - 1];
+                let mut total_len: usize = 0;
+                let mut min_len: usize = usize::MAX;
+                let mut max_len: usize = 0;
+                let mut ids: Vec<String> = Vec::new();
+                for item in burst {
+                    total_len = total_len.saturating_add(item.msg_len);
+                    min_len = min_len.min(item.msg_len);
+                    max_len = max_len.max(item.msg_len);
+                    if ids.len() < EVENT_SAMPLE_IDS {
+                        if let Some(id) =
+                            event_id_prefix_from_detail_json(item.detail_json.as_deref())
+                        {
+                            ids.push(id);
+                        }
+                    }
+                }
+                if min_len == usize::MAX {
+                    min_len = 0;
+                }
+                let detail = if ids.is_empty() {
+                    format!(" detail=events(count={})", burst.len())
+                } else {
+                    let more = if burst.len() > ids.len() { ",..." } else { "" };
+                    format!(
+                        " detail=events(count={} sample=[{}{}])",
+                        burst.len(),
+                        ids.join(","),
+                        more
+                    )
+                };
+                out.push(RenderedFrameLine {
+                    seq_start: first.seq,
+                    seq_end: last.seq,
+                    dt_start_ms: first.ts_ms.saturating_sub(run.started_at_ms),
+                    dt_end_ms: last.ts_ms.saturating_sub(run.started_at_ms),
+                    lane: first.lane.clone(),
+                    direction: first.direction.clone(),
+                    frame_type: "Event*".to_string(),
+                    len_label: format!(
+                        "total:{} range:{}-{} count:{}",
+                        total_len,
+                        min_len,
+                        max_len,
+                        burst.len()
+                    ),
+                    detail,
+                });
+                i = j;
+                continue;
+            }
+        }
+
+        out.push(RenderedFrameLine {
+            seq_start: ev.seq,
+            seq_end: ev.seq,
+            dt_start_ms: ev.ts_ms.saturating_sub(run.started_at_ms),
+            dt_end_ms: ev.ts_ms.saturating_sub(run.started_at_ms),
+            lane: ev.lane.clone(),
+            direction: ev.direction.clone(),
+            frame_type: ev.frame_type.clone(),
+            len_label: ev.msg_len.to_string(),
+            detail: summarize_sync_event_detail(&ev.frame_type, ev.detail_json.as_deref()),
+        });
+        i += 1;
+    }
+
+    out
+}
+
+fn print_sync_trace_run(run: &sync_log::SyncRunRow, events: &[sync_log::SyncRunEventRow]) {
+    let status = run_status(run);
+    let dur_ms = run.ended_at_ms.saturating_sub(run.started_at_ms);
+    let frame_lines = render_frame_lines(run, events);
+    println!(
+        "RUN {} [{}] session={} tenant={} peer={} dir={} role={} remote={} start={} end={} dur_ms={} sync_rounds={} sync_events_tx={} sync_events_rx={} bytes_tx={} bytes_rx={} raw_frames={} frame_lines={} outcome={}",
+        run.run_id,
+        status,
+        run.session_id,
+        short_peer_hex(&run.tenant_id),
+        short_peer_hex(&run.peer_id),
+        run.direction,
+        run.role,
+        run.remote_addr,
+        format_absolute(run.started_at_ms),
+        format_absolute(run.ended_at_ms),
+        dur_ms,
+        run.rounds,
+        run.events_sent,
+        run.events_received,
+        run.bytes_sent,
+        run.bytes_received,
+        events.len(),
+        frame_lines.len(),
+        run.outcome,
+    );
+    if let Some(err) = &run.error {
+        println!("  error: {}", err);
+    }
+    if events.is_empty() {
+        println!("  (no frame events)");
+        return;
+    }
+    for line in frame_lines {
+        println!(
+            "  [{}] {:>11} {:7} {:2} {:8} len={}{}",
+            line.seq_label(),
+            line.dt_label(),
+            line.lane,
+            line.direction,
+            line.frame_type,
+            line.len_label,
+            line.detail
+        );
+    }
+}
+
+#[derive(Debug)]
+struct PeerSyncTreeGroup {
+    peer_id: String,
+    runs: Vec<(sync_log::SyncRunRow, Vec<sync_log::SyncRunEventRow>)>,
+}
+
+fn group_runs_by_peer(
+    runs: Vec<(sync_log::SyncRunRow, Vec<sync_log::SyncRunEventRow>)>,
+) -> Vec<PeerSyncTreeGroup> {
+    let mut groups: Vec<PeerSyncTreeGroup> = Vec::new();
+    for (run, events) in runs {
+        if let Some(group) = groups.iter_mut().find(|g| g.peer_id == run.peer_id) {
+            group.runs.push((run, events));
+        } else {
+            groups.push(PeerSyncTreeGroup {
+                peer_id: run.peer_id.clone(),
+                runs: vec![(run, events)],
+            });
+        }
+    }
+    groups
+}
+
+fn print_sync_tree_groups(groups: &[PeerSyncTreeGroup]) {
+    for (peer_idx, group) in groups.iter().enumerate() {
+        let changed = group
+            .runs
+            .iter()
+            .filter(|(run, _)| run_status(run) == "changed")
+            .count();
+        let errors = group
+            .runs
+            .iter()
+            .filter(|(run, _)| run_status(run) == "error")
+            .count();
+        println!(
+            "peer {} runs={} changed={} errors={}",
+            short_peer_hex(&group.peer_id),
+            group.runs.len(),
+            changed,
+            errors
+        );
+
+        for (run_idx, (run, events)) in group.runs.iter().enumerate() {
+            let run_branch = if run_idx + 1 == group.runs.len() {
+                "└─"
+            } else {
+                "├─"
+            };
+            let run_pad = if run_idx + 1 == group.runs.len() {
+                "  "
+            } else {
+                "│ "
+            };
+            let status = run_status(run);
+            let dt = run.ended_at_ms.saturating_sub(run.started_at_ms);
+            let frame_lines = render_frame_lines(run, events);
+            println!(
+                "{} run {} [{}] end={} dir={} role={} sync_rounds={} sync_events_tx={} sync_events_rx={} dur_ms={} raw_frames={} frame_lines={} outcome={}",
+                run_branch,
+                run.run_id,
+                status,
+                format_absolute(run.ended_at_ms),
+                run.direction,
+                run.role,
+                run.rounds,
+                run.events_sent,
+                run.events_received,
+                dt,
+                events.len(),
+                frame_lines.len(),
+                run.outcome
+            );
+            if let Some(err) = &run.error {
+                println!("{}  error: {}", run_pad, err);
+            }
+
+            if events.is_empty() {
+                println!("{}  └─ (no frame events)", run_pad);
+                continue;
+            }
+
+            for (event_idx, line) in frame_lines.iter().enumerate() {
+                let ev_branch = if event_idx + 1 == frame_lines.len() {
+                    "└─"
+                } else {
+                    "├─"
+                };
+                println!(
+                    "{}  {} {} seq={} {} {} {} len={}{}",
+                    run_pad,
+                    ev_branch,
+                    line.dt_label(),
+                    line.seq_label(),
+                    line.lane,
+                    line.direction,
+                    line.frame_type,
+                    line.len_label,
+                    line.detail
+                );
+            }
+        }
+
+        if peer_idx + 1 < groups.len() {
+            println!();
+        }
+    }
 }
 
 fn system_hostname() -> String {
