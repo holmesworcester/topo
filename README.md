@@ -122,6 +122,8 @@ topo rpc describe Send --json
 
 ## Architecture
 
+All CLI commands that read or mutate workspace/peer state go through RPC to the running daemon (`topo start`). The CLI never opens the database directly for queries — this ensures consistent workspace scoping and daemon coordination. See [DESIGN.md](docs/DESIGN.md) section 8 for details.
+
 ```text
 Cargo.toml              # crate/dependency config; declares `topo` bin path
 src/runtime/control/main.rs  # `topo` CLI + daemon entrypoint

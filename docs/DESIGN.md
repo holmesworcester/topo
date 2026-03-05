@@ -240,11 +240,12 @@ If the message does not exist yet, the unfurl event blocks and later unblocks vi
 
 If this feature is externally callable:
 
-1. add RPC method in [protocol.rs](/home/holmes/poc-7/src/runtime/control/rpc/protocol.rs),
-2. route in [server.rs](/home/holmes/poc-7/src/runtime/control/rpc/server.rs),
-3. call event-module command/query APIs.
+1. add RPC method variant in [protocol.rs](/home/holmes/poc-7/src/runtime/control/rpc/protocol.rs),
+2. add catalog entry in [catalog.rs](/home/holmes/poc-7/src/runtime/control/rpc/catalog.rs),
+3. add dispatch handler in [server.rs](/home/holmes/poc-7/src/runtime/control/rpc/server.rs),
+4. add CLI handler in [main.rs](/home/holmes/poc-7/src/runtime/control/main.rs) using `rpc_require_daemon()`.
 
-No event logic belongs in RPC/service routing; those layers orchestrate only.
+The CLI must always go through RPC — never open the database directly for workspace queries. No event logic belongs in RPC/service routing; those layers orchestrate only.
 
 ### 7. Tests You Add In The Same Change
 
@@ -1286,7 +1287,22 @@ The CLI/daemon operational shape is primarily for operability, testing, and demo
 
 1. one daemon per profile/peer (`topo start`),
 2. local RPC control socket,
-3. unified CLI (`topo`) with subcommands that route through daemon when running, fall back to direct DB access otherwise.
+3. unified CLI (`topo`) with subcommands that route through RPC to the daemon.
+
+### CLI-to-RPC principle
+
+All CLI commands that read or mutate workspace state **must** go through RPC to the running daemon. The CLI binary should never open the database directly for queries or operations that the daemon can serve. This ensures:
+
+1. workspace scoping is always applied consistently (via the daemon's active tenant/peer),
+2. the daemon can coordinate side effects (runtime restarts, invite refs, connection management),
+3. there is a single authority for session-local state (active peer, invite aliases).
+
+Exceptions where direct DB access is acceptable:
+- **daemon startup** (`topo start`): the daemon itself opens the DB to initialize schema and discover tenants,
+- **DB registry management** (`topo db add/list/remove`): operates on a local JSON config file, not the SQLite DB,
+- **shell completions** (`topo completions`): pure CLI metadata, no DB involved.
+
+When adding a new CLI command, always add a corresponding `RpcMethod` variant, catalog entry, and server dispatch handler. The CLI handler should call `rpc_require_daemon()` and format the response for display.
 
 RPC and locality flow reference: [DESIGN_DIAGRAMS.md](./DESIGN_DIAGRAMS.md) section `0` ("RPC Dispatch And Event Locality").
 
@@ -1830,8 +1846,9 @@ When adding a new event type:
 3. Add `CreateXxxCmd` + `create()` for command paths.
 4. Add `query_*()` functions for any projection-table queries.
 5. Add response types and service/RPC-facing convenience helpers in the event module.
-6. Wire service call sites directly to the new module command/query APIs where relevant.
+6. Add `RpcMethod` variant in `protocol.rs`, catalog entry in `catalog.rs`, and dispatch handler in `server.rs`.
 7. Wire `src/runtime/control/service.rs` to call the event module functions, mapping errors to `ServiceError`.
+8. Add CLI handler in `main.rs` using `rpc_require_daemon()` — never open the DB directly from CLI.
 
 **Rule**: Event projection semantics MUST live in event modules, not in central projector files. The pipeline must not contain event-type-specific SQL logic; it only orchestrates module-owned context loaders.
 

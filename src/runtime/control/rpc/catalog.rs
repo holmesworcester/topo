@@ -243,6 +243,17 @@ static CATALOG: &[MethodInfo] = &[
         params: PARAM_NONE,
         example_json: r#"{"type":"EventList"}"#,
     },
+    MethodInfo {
+        name: "Intro",
+        purpose: "Run intro: connect two peers via this node",
+        params: params![
+            "peer_a", "string", true, None;
+            "peer_b", "string", true, None;
+            "ttl_ms", "u64", false, Some("30000");
+            "attempt_window_ms", "u32", false, Some("4000")
+        ],
+        example_json: r#"{"type":"Intro","peer_a":"<hex-spki>","peer_b":"<hex-spki>"}"#,
+    },
 ];
 
 /// Return all methods in the catalog.

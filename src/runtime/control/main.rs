@@ -766,12 +766,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .finish();
             let _ = tracing::subscriber::set_global_default(subscriber);
         }
-        Commands::Intro { .. } | Commands::AcceptInvite { .. } => {
-            let subscriber = FmtSubscriber::builder()
-                .with_max_level(Level::INFO)
-                .finish();
-            let _ = tracing::subscriber::set_global_default(subscriber);
-        }
         _ => {}
     }
 
@@ -1451,18 +1445,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             peer_b,
             ttl_ms,
             attempt_window_ms,
-        } => match service::svc_intro(db, &peer_a, &peer_b, ttl_ms, attempt_window_ms).await {
-            Ok(true) => {
+        } => {
+            let data = rpc_require_daemon(
+                db,
+                socket_override.as_deref(),
+                RpcMethod::Intro {
+                    peer_a,
+                    peer_b,
+                    ttl_ms,
+                    attempt_window_ms,
+                },
+            )?;
+            if data.get("sent_to_both").and_then(|v| v.as_bool()).unwrap_or(false) {
                 println!("Intro sent to both peers");
-            }
-            Ok(false) => {
+            } else {
+                eprintln!("Intro failed: {}", data);
                 std::process::exit(1);
             }
-            Err(e) => {
-                eprintln!("Error: {}", e);
-                std::process::exit(1);
-            }
-        },
+        }
 
         Commands::IntroAttempts { peer } => {
             let data = rpc_require_daemon(

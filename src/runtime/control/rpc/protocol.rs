@@ -150,8 +150,23 @@ pub enum RpcMethod {
     },
     /// List all events for the active workspace with parsed fields and decryption.
     EventList,
+    /// Run intro: connect peer_a and peer_b via this node.
+    Intro {
+        peer_a: String,
+        peer_b: String,
+        #[serde(default = "default_intro_ttl_ms")]
+        ttl_ms: u64,
+        #[serde(default = "default_intro_attempt_window_ms")]
+        attempt_window_ms: u32,
+    },
 }
 
+fn default_intro_ttl_ms() -> u64 {
+    30000
+}
+fn default_intro_attempt_window_ms() -> u32 {
+    4000
+}
 fn default_workspace_name() -> String {
     "workspace".to_string()
 }

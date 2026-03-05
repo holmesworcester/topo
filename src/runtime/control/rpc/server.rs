@@ -736,6 +736,32 @@ fn dispatch(
             Err(e) => RpcResponse::error(e),
         },
 
+        RpcMethod::Intro {
+            peer_a,
+            peer_b,
+            ttl_ms,
+            attempt_window_ms,
+        } => {
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    match handle.block_on(service::svc_intro(
+                        db_path,
+                        &peer_a,
+                        &peer_b,
+                        ttl_ms,
+                        attempt_window_ms,
+                    )) {
+                        Ok(true) => {
+                            RpcResponse::success(serde_json::json!({"sent_to_both": true}))
+                        }
+                        Ok(false) => RpcResponse::error("partial send"),
+                        Err(e) => RpcResponse::error(e.to_string()),
+                    }
+                }
+                Err(_) => RpcResponse::error("no tokio runtime available for async intro"),
+            }
+        }
+
         RpcMethod::EventList => match service::open_db_load(db_path) {
             Ok((recorded_by, db)) => match service::svc_event_list(&db, &recorded_by) {
                 Ok(data) => RpcResponse::success(data),
