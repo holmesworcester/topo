@@ -36,14 +36,14 @@ fn bootstrap_peer(peer: &Peer) -> BootstrapChain {
     let workspace_eid = peer.create_workspace(workspace_pubkey);
     let workspace_id = workspace_eid;
 
-    // 2. UserInvite (signed by workspace)
+    // 2. InviteAccepted (local self-bind to workspace root)
+    let invite_accepted_eid = peer.create_invite_accepted(&workspace_eid, workspace_id);
+
+    // 3. UserInvite (signed by workspace)
     let invite_key = SigningKey::generate(&mut rng);
     let invite_pubkey = invite_key.verifying_key().to_bytes();
     let user_invite_eid =
         peer.create_user_invite_with_key(invite_pubkey, &workspace_key, &workspace_eid);
-
-    // 3. InviteAccepted (local, binds trust anchor)
-    let invite_accepted_eid = peer.create_invite_accepted(&user_invite_eid, workspace_id);
 
     // 4. User (signed by user_invite)
     let user_key = SigningKey::generate(&mut rng);
@@ -167,7 +167,7 @@ fn test_bootstrap_sequence() {
     // Verify trust anchor was set correctly
     let anchor: String = db
         .query_row(
-            "SELECT workspace_id FROM trust_anchors WHERE peer_id = ?1",
+            "SELECT workspace_id FROM invites_accepted WHERE recorded_by = ?1 ORDER BY created_at ASC, event_id ASC LIMIT 1",
             rusqlite::params![&alice.identity],
             |row| row.get(0),
         )
@@ -253,7 +253,7 @@ fn test_bootstrap_sequence() {
 
     let ia_count: i64 = db
         .query_row(
-            "SELECT COUNT(*) FROM invite_accepted WHERE recorded_by = ?1",
+            "SELECT COUNT(*) FROM invites_accepted WHERE recorded_by = ?1",
             rusqlite::params![&alice.identity],
             |row| row.get(0),
         )
@@ -1026,7 +1026,7 @@ fn test_invite_accepted_no_prior_invite_required() {
     // Trust anchor should be set from the event's own workspace_id
     let anchor: String = db
         .query_row(
-            "SELECT workspace_id FROM trust_anchors WHERE peer_id = ?1",
+            "SELECT workspace_id FROM invites_accepted WHERE recorded_by = ?1 ORDER BY created_at ASC, event_id ASC LIMIT 1",
             rusqlite::params![&alice.identity],
             |row| row.get(0),
         )
@@ -1040,7 +1040,8 @@ fn test_invite_accepted_no_prior_invite_required() {
     harness.finish();
 }
 
-/// Trust anchor immutability: second invite_accepted with conflicting workspace_id is rejected.
+/// Accepted-workspace winner immutability: additional invite_accepted rows can project,
+/// but winner selection remains earliest (created_at,event_id).
 #[test]
 fn test_trust_anchor_immutability() {
     let alice = Peer::new("alice");
@@ -1070,43 +1071,38 @@ fn test_trust_anchor_immutability() {
         .unwrap();
     assert!(valid1, "first invite_accepted should be valid");
 
-    // Second invite_accepted with different workspace_id should be rejected
-    let result = alice.try_create_invite_accepted(&fake_invite_2, workspace_id_2);
-    match result {
-        Err(ref e) => {
-            let msg = format!("{}", e);
-            assert!(
-                msg.contains("rejected") || msg.contains("conflicts"),
-                "expected rejection for conflicting trust anchor, got: {}",
-                msg
-            );
-        }
-        Ok(eid) => {
-            let eid_b64 = event_id_to_base64(&eid);
-            let rejected: bool = db
-                .query_row(
-                    "SELECT COUNT(*) > 0 FROM rejected_events WHERE peer_id = ?1 AND event_id = ?2",
-                    rusqlite::params![&alice.identity, &eid_b64],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert!(
-                rejected,
-                "conflicting invite_accepted should be in rejected_events"
-            );
-        }
-    }
+    // Second invite_accepted with different workspace_id should still project;
+    // the winner is determined when reading invites_accepted.
+    let ia2_eid = alice.create_invite_accepted(&fake_invite_2, workspace_id_2);
+    let ia2_b64 = event_id_to_base64(&ia2_eid);
+    let valid2: bool = db
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![&alice.identity, &ia2_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(valid2, "second invite_accepted should also be valid");
 
     // Trust anchor should still be the first one
     let anchor: String = db
         .query_row(
-            "SELECT workspace_id FROM trust_anchors WHERE peer_id = ?1",
+            "SELECT workspace_id FROM invites_accepted WHERE recorded_by = ?1 ORDER BY created_at ASC, event_id ASC LIMIT 1",
             rusqlite::params![&alice.identity],
             |row| row.get(0),
         )
         .expect("trust anchor should still exist");
     let expected_nid = event_id_to_base64(&workspace_id_1);
     assert_eq!(anchor, expected_nid, "trust anchor should not have changed");
+
+    let total_rows: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM invites_accepted WHERE recorded_by = ?1",
+            rusqlite::params![&alice.identity],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(total_rows, 2, "both invite_accepted rows should be projected");
 
     harness.finish();
 }
@@ -1148,7 +1144,7 @@ fn test_no_blob_capture_trust_influence() {
     // Trust anchor should be unset
     let anchor_count: i64 = db
         .query_row(
-            "SELECT COUNT(*) FROM trust_anchors WHERE peer_id = ?1",
+            "SELECT COUNT(*) FROM invites_accepted WHERE recorded_by = ?1",
             rusqlite::params![&alice.identity],
             |row| row.get(0),
         )

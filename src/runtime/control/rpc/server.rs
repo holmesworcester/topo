@@ -32,9 +32,9 @@ fn discover_tenant_scopes(
     conn: &rusqlite::Connection,
 ) -> Result<Vec<TenantScope>, rusqlite::Error> {
     let mut stmt = conn.prepare(
-        "SELECT DISTINCT peer_id, workspace_id
-         FROM trust_anchors
-         ORDER BY peer_id",
+        "SELECT DISTINCT recorded_by, workspace_id
+         FROM invites_accepted
+         ORDER BY recorded_by",
     )?;
     let rows = stmt
         .query_map([], |row| {
@@ -109,7 +109,7 @@ impl DaemonState {
     fn require_active_peer(&self) -> Result<String, String> {
         let cached = self.active_peer.read().unwrap().clone();
 
-        // Discover current tenant scopes from trust anchors (event/projection state).
+        // Discover current tenant scopes from invites_accepted projection state.
         // This keeps control-plane tenant selection independent from transport creds.
         let discovered = if let Ok(conn) = crate::db::open_connection(&self.db_path) {
             let _ = crate::db::schema::create_tables(&conn);

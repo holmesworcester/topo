@@ -60,7 +60,7 @@ mod tests {
         let ctx = ctx_with_anchor(&other_anchor);
 
         let result = project_pure(PEER, &ws_id_b64, &parsed, &ctx);
-        assert_reject_contains(&result, "does not match trust anchor");
+        assert_reject_contains(&result, "does not match accepted invite binding");
     }
 
     // ── SPEC_WS_SINGLE_01: pass (InsertOrIgnore ensures at-most-one) ──

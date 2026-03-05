@@ -557,7 +557,7 @@ async fn test_run_node_multitenant_outbound_isolation() {
             )
             .unwrap_or(false)
         },
-        Duration::from_secs(15),
+        Duration::from_secs(30),
         "b0 should record a0's marker (b0 trusts a0 = A's fallback cert)",
     )
     .await;

@@ -32,11 +32,6 @@ async fn test_project_queue_crash_recovery() {
     )
     .unwrap();
     db.execute(
-        "DELETE FROM invite_accepted WHERE recorded_by = ?1",
-        rusqlite::params![&alice.identity],
-    )
-    .unwrap();
-    db.execute(
         "DELETE FROM user_invites WHERE recorded_by = ?1",
         rusqlite::params![&alice.identity],
     )
@@ -57,7 +52,7 @@ async fn test_project_queue_crash_recovery() {
     )
     .unwrap();
     db.execute(
-        "DELETE FROM trust_anchors WHERE peer_id = ?1",
+        "DELETE FROM invites_accepted WHERE recorded_by = ?1",
         rusqlite::params![&alice.identity],
     )
     .unwrap();

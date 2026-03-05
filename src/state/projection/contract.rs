@@ -36,7 +36,7 @@ pub enum WriteOp {
 /// event identity for idempotence.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EmitCommand {
-    /// Re-project a specific workspace event after a trust anchor was set.
+    /// Re-project a specific workspace event after accepted-workspace binding was set.
     /// Emitted by invite_accepted when it knows the workspace_id.
     /// Flows through normal projection + cascade.
     RetryWorkspaceEvent { workspace_id: String },
@@ -136,8 +136,8 @@ pub struct DeletionIntentInfo {
 /// event type requires them.
 #[derive(Debug, Clone, Default)]
 pub struct ContextSnapshot {
-    /// Trust anchor workspace_id for this tenant (from trust_anchors table).
-    pub trust_anchor_workspace_id: Option<String>,
+    /// Accepted workspace_id for this tenant (from invites_accepted projection rows).
+    pub accepted_workspace_id: Option<String>,
 
     /// Semantic signer-user mismatch for content events with `author_id`.
     ///

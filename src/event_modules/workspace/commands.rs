@@ -15,7 +15,7 @@ use ed25519_dalek::SigningKey;
 use rusqlite::Connection;
 
 use super::identity_ops::{self as ops, InviteBootstrapContext, JoinChain, LinkChain};
-use crate::crypto::{event_id_to_base64, EventId};
+use crate::crypto::EventId;
 use crate::event_modules::{
     local_signer_secret::{
         LocalSignerSecretEvent, SIGNER_KIND_PEER_SHARED, SIGNER_KIND_USER, SIGNER_KIND_WORKSPACE,
@@ -68,7 +68,7 @@ pub struct CreateWorkspaceResult {
 
 /// Create a new workspace with a full identity chain.
 ///
-/// Creates: Workspace → InviteAccepted (trust anchor) → UserInvite →
+/// Creates: Workspace → InviteAccepted (workspace binding) → UserInvite →
 /// User → DeviceInvite → PeerShared + local signer secrets +
 /// content key material.
 ///
@@ -89,7 +89,11 @@ pub fn create_workspace(
     if let Some((eid, signing_key)) = load_local_peer_signer(db, recorded_by)? {
         let workspace_id = db
             .query_row(
-                "SELECT workspace_id FROM trust_anchors WHERE peer_id = ?1",
+                "SELECT workspace_id
+                 FROM invites_accepted
+                 WHERE recorded_by = ?1
+                 ORDER BY created_at ASC, event_id ASC
+                 LIMIT 1",
                 rusqlite::params![recorded_by],
                 |row| row.get::<_, String>(0),
             )
@@ -135,10 +139,7 @@ pub fn create_workspace(
         &peer_shared_key.verifying_key().to_bytes(),
     ));
 
-    // 1. Pre-compute workspace event_id so we can seed the trust anchor
-    //    before any events are stored. This ensures lookup_workspace_id()
-    //    returns the correct value for neg_items insertion from the start,
-    //    avoiding empty-workspace_id rows.
+    // 1. Pre-compute workspace event_id for the local self-accept flow.
     let workspace_key = SigningKey::generate(&mut rng);
     let ws = ParsedEvent::Workspace(WorkspaceEvent {
         created_at_ms: now_ms(),
@@ -148,24 +149,15 @@ pub fn create_workspace(
     let ws_blob = crate::event_modules::encode_event(&ws)
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
     let ws_eid = crate::crypto::hash_event(&ws_blob);
-    let ws_eid_b64 = event_id_to_base64(&ws_eid);
 
-    // 2. Seed trust anchor before any event storage. InviteAccepted's
-    //    INSERT OR IGNORE will be a no-op since the row already exists.
-    db.execute(
-        "INSERT OR IGNORE INTO trust_anchors (peer_id, workspace_id) VALUES (?1, ?2)",
-        rusqlite::params![&derived_peer_id, &ws_eid_b64],
-    )
-    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
-
-    // 3. Workspace event (staged — guard may still block, re-projected below)
+    // 2. Workspace event (staged — guard may block until invite_accepted projects)
     let ws_eid2 = create_event_staged(db, &derived_peer_id, &ws)?;
     assert_eq!(ws_eid, ws_eid2, "pre-computed workspace event_id mismatch");
 
-    // 4. Ensure tenant root chain exists: tenant root, peer depends on tenant.
+    // 3. Ensure tenant root chain exists: tenant root, peer depends on tenant.
     let tenant_event_id = ops::ensure_local_tenant_event(db, &derived_peer_id, &peer_shared_key)?;
 
-    // 5. InviteAccepted (local event — trust anchor already seeded above)
+    // 4. InviteAccepted (local event — becomes authoritative workspace binding).
     let ia = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
         created_at_ms: now_ms(),
         tenant_event_id,
@@ -176,7 +168,7 @@ pub fn create_workspace(
     project_one(db, &derived_peer_id, &ws_eid)
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
 
-    // 6. UserInvite (signed by workspace_key)
+    // 5. UserInvite (signed by workspace_key)
     let invite_key = SigningKey::generate(&mut rng);
     let uib = ParsedEvent::UserInvite(UserInviteEvent {
         created_at_ms: now_ms(),
@@ -278,7 +270,7 @@ pub fn join_workspace_as_new_user(
     // that secret_shared depends on for unwrap projection.
     let _ = ops::store_invite_privkey(db, recorded_by, invite_event_id, invite_key)?;
 
-    // 1. InviteAccepted (local event) — binds trust anchor, triggers guard cascade
+    // 1. InviteAccepted (local event) — binds accepted workspace, triggers guard cascade
     let ia_evt = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
         created_at_ms: now_ms(),
         tenant_event_id,
@@ -408,7 +400,7 @@ pub fn add_device_to_workspace(
 ) -> Result<LinkChain, Box<dyn std::error::Error + Send + Sync>> {
     let tenant_event_id = ops::ensure_local_tenant_event(db, recorded_by, &peer_shared_key)?;
 
-    // 1. InviteAccepted (local event) — binds trust anchor, triggers guard cascade
+    // 1. InviteAccepted (local event) — binds accepted workspace, triggers guard cascade
     let ia_evt = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
         created_at_ms: now_ms(),
         tenant_event_id,

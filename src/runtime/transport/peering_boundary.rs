@@ -401,8 +401,10 @@ mod tests {
         )
         .unwrap();
         db.execute(
-            "INSERT INTO trust_anchors (peer_id, workspace_id) VALUES (?1, ?2)",
-            rusqlite::params!["tenant-a", "ws-1"],
+            "INSERT INTO invites_accepted
+             (recorded_by, event_id, tenant_event_id, invite_event_id, workspace_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params!["tenant-a", "ia-a", "tenant-a-eid", "invite-a", "ws-1", 1_i64],
         )
         .unwrap();
         drop(db);

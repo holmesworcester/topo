@@ -96,12 +96,18 @@ fn store_blob_only(
     )
     .map_err(|e| CreateEventError::DbError(e.to_string()))?;
 
-    if let Some(ws_id) = lookup_workspace_id(conn, recorded_by) {
+    let ws_id_for_neg = if meta.type_name == "workspace" {
+        Some(crate::crypto::event_id_to_base64(&event_id))
+    } else {
+        lookup_workspace_id(conn, recorded_by)
+    };
+
+    if let Some(ws_id) = ws_id_for_neg {
         insert_neg_item_if_shared(conn, meta.share_scope, created_at_ms, &event_id, &ws_id)
             .map_err(|e| CreateEventError::DbError(e.to_string()))?;
     } else if meta.share_scope == crate::event_modules::registry::ShareScope::Shared {
         tracing::warn!(
-            "no trust anchor for {}, shared event {} missing from neg_items",
+            "no accepted workspace binding for {}, shared event {} missing from neg_items",
             recorded_by,
             crate::crypto::event_id_to_base64(&event_id)
         );
@@ -349,8 +355,8 @@ pub fn create_encrypted_event_synchronous(
 
 /// Staged create: persist and enqueue an event even if it is Blocked.
 /// Returns the event_id on both Valid and Blocked outcomes.
-/// Use this only for pre-trust-anchor events in bootstrap flows where blocking
-/// is expected and will resolve via guard cascade after the trust anchor arrives.
+/// Use this only for pre-accepted-binding events in bootstrap flows where blocking
+/// is expected and will resolve via guard cascade after invite_accepted projects.
 pub fn create_event_staged(
     conn: &Connection,
     recorded_by: &str,
@@ -361,8 +367,8 @@ pub fn create_event_staged(
 
 /// Staged signed create: persist and enqueue a signed event even if it is Blocked.
 /// Returns the event_id on both Valid and Blocked outcomes.
-/// Use this only for pre-trust-anchor events in bootstrap flows where blocking
-/// is expected and will resolve via guard cascade after the trust anchor arrives.
+/// Use this only for pre-accepted-binding events in bootstrap flows where blocking
+/// is expected and will resolve via guard cascade after invite_accepted projects.
 pub fn create_signed_event_staged(
     conn: &Connection,
     recorded_by: &str,
@@ -435,7 +441,7 @@ mod tests {
             public_key: workspace_pub,
             name: "test-workspace".to_string(),
         });
-        // Workspace may block (needs trust anchor). Use staged API.
+        // Workspace may block (needs accepted-workspace binding). Use staged API.
         let net_eid = create_event_staged(conn, recorded_by, &net_event).unwrap();
 
         let ia_event = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
@@ -446,7 +452,7 @@ mod tests {
         });
         let _ia_eid = create_event_synchronous(conn, recorded_by, &ia_event).unwrap();
 
-        // Re-project workspace now that trust anchor exists
+        // Re-project workspace now that accepted-workspace binding exists
         project_one(conn, recorded_by, &net_eid).unwrap();
 
         let invite_key = SigningKey::generate(&mut rng);

@@ -65,11 +65,16 @@ pub fn emit_deterministic_blob(
             created_at_ms,
             now_ms,
         )?;
-        if let Some(ws_id) = lookup_workspace_id(conn, recorded_by) {
+        let ws_id_for_neg = if meta.type_name == "workspace" {
+            Some(crate::crypto::event_id_to_base64(&event_id))
+        } else {
+            lookup_workspace_id(conn, recorded_by)
+        };
+        if let Some(ws_id) = ws_id_for_neg {
             insert_neg_item_if_shared(conn, meta.share_scope, created_at_ms, &event_id, &ws_id)?;
         } else if meta.share_scope == crate::event_modules::registry::ShareScope::Shared {
             tracing::warn!(
-                "no trust anchor for {}, shared event {} missing from neg_items",
+                "no accepted workspace binding for {}, shared event {} missing from neg_items",
                 recorded_by,
                 crate::crypto::event_id_to_base64(&event_id)
             );

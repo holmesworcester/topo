@@ -4963,27 +4963,30 @@ fn test_invite_accepted_requires_tenant_not_workspace() {
         "invite_accepted must project Valid even without workspace event in DB"
     );
 
-    // Trust anchor must be written
+    // Accepted workspace binding must be written
     let ws_b64 = event_id_to_base64(&fake_workspace_id);
     let anchor: String = conn
         .query_row(
-            "SELECT workspace_id FROM trust_anchors WHERE peer_id = ?1",
+            "SELECT workspace_id FROM invites_accepted WHERE recorded_by = ?1 ORDER BY created_at ASC, event_id ASC LIMIT 1",
             rusqlite::params![recorded_by],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(anchor, ws_b64, "trust anchor must point to workspace_id");
+    assert_eq!(
+        anchor, ws_b64,
+        "accepted workspace binding must point to workspace_id"
+    );
 
-    // invite_accepted projection table must have a row
+    // invites_accepted projection table must have a row
     let ia_b64 = event_id_to_base64(&ia_eid);
     let ia_count: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM invite_accepted WHERE recorded_by = ?1 AND event_id = ?2",
+            "SELECT COUNT(*) FROM invites_accepted WHERE recorded_by = ?1 AND event_id = ?2",
             rusqlite::params![recorded_by, &ia_b64],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(ia_count, 1, "invite_accepted projection row must exist");
+    assert_eq!(ia_count, 1, "invites_accepted projection row must exist");
 }
 
 /// Target semantics 2: Bootstrap trust rows are materialized from projection

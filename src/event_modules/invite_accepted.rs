@@ -124,19 +124,17 @@ fn bootstrap_spki_already_peer_shared(
 pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "
-        CREATE TABLE IF NOT EXISTS invite_accepted (
+        CREATE TABLE IF NOT EXISTS invites_accepted (
             recorded_by TEXT NOT NULL,
             event_id TEXT NOT NULL,
             tenant_event_id TEXT NOT NULL,
             invite_event_id TEXT NOT NULL,
             workspace_id TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
             PRIMARY KEY (recorded_by, event_id)
         );
-
-        CREATE TABLE IF NOT EXISTS trust_anchors (
-            peer_id TEXT NOT NULL PRIMARY KEY,
-            workspace_id TEXT NOT NULL
-        );
+        CREATE INDEX IF NOT EXISTS idx_invites_accepted_scope
+            ON invites_accepted(recorded_by, created_at, event_id);
         ",
     )?;
     Ok(())
@@ -161,16 +159,6 @@ pub fn build_projector_context(
     let mut ctx = ContextSnapshot::default();
     let invite_event_id_b64 = event_id_to_base64(&ia.invite_event_id);
 
-    ctx.trust_anchor_workspace_id = match conn.query_row(
-        "SELECT workspace_id FROM trust_anchors WHERE peer_id = ?1",
-        rusqlite::params![recorded_by],
-        |row| row.get::<_, String>(0),
-    ) {
-        Ok(v) => Some(v),
-        Err(rusqlite::Error::QueryReturnedNoRows) => None,
-        Err(e) => return Err(e.into()),
-    };
-
     if let Some(bc) =
         crate::db::transport_trust::read_bootstrap_context(conn, recorded_by, &invite_event_id_b64)
             .map_err(|e| -> Box<dyn std::error::Error> { e })?
@@ -189,8 +177,9 @@ pub fn build_projector_context(
 
 /// Pure projector: InviteAccepted — local trust-anchor binding.
 ///
-/// Binds directly from InviteAcceptedEvent fields. Uses first-write-wins
-/// (INSERT OR IGNORE) for trust anchor immutability; rejects on mismatch.
+/// Binds directly from InviteAcceptedEvent fields. Winner selection is done
+/// at read time (earliest created_at/event_id), so projection does not inspect
+/// previously-accepted rows.
 /// Emits RetryWorkspaceEvent targeting the specific workspace_id so the
 /// guard-blocked workspace event can unblock through normal projection + cascade.
 /// When bootstrap_context is available (and not already superseded by a
@@ -209,26 +198,17 @@ pub fn project_pure(
     let invite_eid_b64 = event_id_to_base64(&ia.invite_event_id);
     let workspace_id_b64 = event_id_to_base64(&ia.workspace_id);
 
-    // Check existing trust anchor — reject on mismatch.
-    if let Some(ref stored) = ctx.trust_anchor_workspace_id {
-        if stored != &workspace_id_b64 {
-            return ProjectorResult::reject(format!(
-                "invite_accepted workspace_id {} conflicts with existing trust anchor {}",
-                workspace_id_b64, stored
-            ));
-        }
-    }
-
     let mut ops = vec![
         // Projection table
         WriteOp::InsertOrIgnore {
-            table: "invite_accepted",
+            table: "invites_accepted",
             columns: vec![
                 "recorded_by",
                 "event_id",
                 "tenant_event_id",
                 "invite_event_id",
                 "workspace_id",
+                "created_at",
             ],
             values: vec![
                 SqlVal::Text(recorded_by.to_string()),
@@ -236,15 +216,7 @@ pub fn project_pure(
                 SqlVal::Text(event_id_to_base64(&ia.tenant_event_id)),
                 SqlVal::Text(invite_eid_b64.clone()),
                 SqlVal::Text(workspace_id_b64.clone()),
-            ],
-        },
-        // Trust anchor (first-write-wins)
-        WriteOp::InsertOrIgnore {
-            table: "trust_anchors",
-            columns: vec!["peer_id", "workspace_id"],
-            values: vec![
-                SqlVal::Text(recorded_by.to_string()),
-                SqlVal::Text(workspace_id_b64.clone()),
+                SqlVal::Int(ia.created_at_ms as i64),
             ],
         },
     ];
@@ -291,7 +263,7 @@ pub fn project_pure(
 pub static INVITE_ACCEPTED_META: EventTypeMeta = EventTypeMeta {
     type_code: EVENT_TYPE_INVITE_ACCEPTED,
     type_name: "invite_accepted",
-    projection_table: "invite_accepted",
+    projection_table: "invites_accepted",
     share_scope: ShareScope::Local,
     dep_fields: &["tenant_event_id"],
     dep_field_type_codes: &[&[super::EVENT_TYPE_TENANT]],

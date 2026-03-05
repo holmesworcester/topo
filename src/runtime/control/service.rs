@@ -81,7 +81,7 @@ pub fn open_db_load(
     let transport_peer_id = load_transport_peer_id(&conn)?;
 
     let has_scope: bool = conn.query_row(
-        "SELECT COUNT(*) > 0 FROM trust_anchors WHERE peer_id = ?1",
+        "SELECT COUNT(*) > 0 FROM invites_accepted WHERE recorded_by = ?1",
         rusqlite::params![&transport_peer_id],
         |row| row.get(0),
     )?;
@@ -93,7 +93,7 @@ pub fn open_db_load(
     // use it as the event/projection tenant.
     let scoped_peers: Vec<String> = {
         let mut stmt =
-            conn.prepare("SELECT DISTINCT peer_id FROM trust_anchors ORDER BY peer_id")?;
+            conn.prepare("SELECT DISTINCT recorded_by FROM invites_accepted ORDER BY recorded_by")?;
         let peers = stmt
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
@@ -105,7 +105,7 @@ pub fn open_db_load(
     }
     if scoped_peers.is_empty() {
         // Fresh DB / pre-workspace state: allow read paths to boot using
-        // transport identity even before tenant-scoped trust anchors exist.
+        // transport identity even before tenant-scoped accepted bindings exist.
         return Ok((transport_peer_id, conn));
     }
 

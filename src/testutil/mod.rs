@@ -528,8 +528,8 @@ impl Peer {
 
     /// Create a Workspace event. Returns the event ID.
     ///
-    /// Pre-seeds the trust anchor so that neg_items gets the correct
-    /// workspace_id from the start (same pattern as commands::create_workspace).
+    /// Uses staged projection; workspace validity unblocks after invite_accepted
+    /// projects and emits a retry command.
     pub fn create_workspace(&self, public_key: [u8; 32]) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
         let ws = ParsedEvent::Workspace(WorkspaceEvent {
@@ -537,16 +537,10 @@ impl Peer {
             public_key,
             name: "test-workspace".to_string(),
         });
-        // Pre-compute event_id and seed trust anchor before storing
+        // Pre-compute event_id to assert deterministic staged write identity.
         let ws_blob =
             crate::event_modules::encode_event(&ws).expect("failed to encode workspace event");
         let ws_eid = crate::crypto::hash_event(&ws_blob);
-        let ws_eid_b64 = event_id_to_base64(&ws_eid);
-        db.execute(
-            "INSERT OR IGNORE INTO trust_anchors (peer_id, workspace_id) VALUES (?1, ?2)",
-            rusqlite::params![&self.identity, &ws_eid_b64],
-        )
-        .expect("failed to seed trust anchor");
         let ws_eid2 =
             create_event_staged(&db, &self.identity, &ws).expect("failed to create workspace");
         assert_eq!(ws_eid, ws_eid2, "pre-computed workspace event_id mismatch");
@@ -1304,7 +1298,7 @@ impl Peer {
     pub fn invite_accepted_count(&self) -> i64 {
         let db = open_connection(&self.db_path).expect("failed to open db");
         db.query_row(
-            "SELECT COUNT(*) FROM invite_accepted WHERE recorded_by = ?1",
+            "SELECT COUNT(*) FROM invites_accepted WHERE recorded_by = ?1",
             rusqlite::params![&self.identity],
             |row| row.get(0),
         )
@@ -1432,7 +1426,7 @@ const FINGERPRINT_TABLES: &[FingerprintTable] = &[
         order: "ORDER BY event_id",
     },
     FingerprintTable {
-        name: "invite_accepted",
+        name: "invites_accepted",
         scope: Scope::RecordedBy,
         order: "ORDER BY event_id",
     },
@@ -1471,12 +1465,6 @@ const FINGERPRINT_TABLES: &[FingerprintTable] = &[
         scope: Scope::RecordedBy,
         order: "ORDER BY event_id",
     },
-    // Trust anchor (uses peer_id as scope key, written by identity projector)
-    FingerprintTable {
-        name: "trust_anchors",
-        scope: Scope::PeerId,
-        order: "ORDER BY peer_id",
-    },
 ];
 
 struct FingerprintTable {
@@ -1488,7 +1476,6 @@ struct FingerprintTable {
 #[derive(Clone, Copy)]
 enum Scope {
     RecordedBy,
-    PeerId,
 }
 
 /// Per-table fingerprint diagnostic record.
@@ -1563,7 +1550,6 @@ fn compute_projection_fingerprint(
 
         let where_clause = match ft.scope {
             Scope::RecordedBy => "WHERE recorded_by = ?1",
-            Scope::PeerId => "WHERE peer_id = ?1",
         };
         let query = format!("SELECT * FROM {} {} {}", ft.name, where_clause, ft.order);
         let mut row_count: i64 = 0;
@@ -1674,11 +1660,6 @@ fn clear_projection_tables(db: &rusqlite::Connection, recorded_by: &str) {
     )
     .ok();
     db.execute(
-        "DELETE FROM invite_accepted WHERE recorded_by = ?1",
-        rusqlite::params![recorded_by],
-    )
-    .ok();
-    db.execute(
         "DELETE FROM user_invites WHERE recorded_by = ?1",
         rusqlite::params![recorded_by],
     )
@@ -1714,7 +1695,7 @@ fn clear_projection_tables(db: &rusqlite::Connection, recorded_by: &str) {
     )
     .ok();
     db.execute(
-        "DELETE FROM trust_anchors WHERE peer_id = ?1",
+        "DELETE FROM invites_accepted WHERE recorded_by = ?1",
         rusqlite::params![recorded_by],
     )
     .ok();
@@ -2853,7 +2834,7 @@ fn record_shared_db_events_for_tenant(
 ///
 /// Each tenant has its own transport identity but they all use the same DB file.
 /// This mirrors the production `run_node` setup where tenant discovery comes from
-/// the join of `trust_anchors` and `local_transport_creds`.
+/// the join of `invites_accepted` and `local_transport_creds`.
 pub struct SharedDbNode {
     pub db_path: String,
     pub tenants: Vec<Peer>,
@@ -3620,7 +3601,7 @@ mod fingerprint_tests {
             "message_attachments",
             "file_slices",
             "workspaces",
-            "invite_accepted",
+            "invites_accepted",
             "user_invites",
             "device_invites",
             "users",
@@ -3628,7 +3609,6 @@ mod fingerprint_tests {
             "admins",
             "removed_entities",
             "secret_shared",
-            "trust_anchors",
         ];
         let excluded_tables = [
             "valid_events",

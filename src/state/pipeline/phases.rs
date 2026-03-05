@@ -44,17 +44,19 @@ pub(super) fn run_persist_phase(
                 if let Some(meta) = reg.lookup(type_code) {
                     // Only insert into neg_items for shared events (defense-in-depth)
                     if meta.share_scope == ShareScope::Shared {
-                        // Look up workspace_id from cache or trust_anchors table.
-                        // Skip neg_items insert if trust anchor is missing — this
-                        // should not happen after bootstrap.
+                        // Look up workspace_id from cache or invites_accepted projection.
+                        // For shared workspace events themselves, workspace_id is the
+                        // event_id and may exist before invite_accepted projects.
                         let ws_id = if let Some(cached) = workspace_cache.get(recorded_by) {
                             Some(cached.clone())
+                        } else if meta.type_name == "workspace" {
+                            Some(event_id_b64.clone())
                         } else if let Some(ws) = lookup_workspace_id(db, recorded_by) {
                             workspace_cache.insert(recorded_by.clone(), ws.clone());
                             Some(ws)
                         } else {
                             tracing::warn!(
-                                "no trust anchor for {}, skipping neg_items for {}",
+                                "no accepted workspace binding for {}, skipping neg_items for {}",
                                 recorded_by,
                                 event_id_b64
                             );

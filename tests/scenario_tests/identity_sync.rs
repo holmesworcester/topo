@@ -33,14 +33,14 @@ fn bootstrap_peer(peer: &Peer) -> BootstrapChain {
     let workspace_eid = peer.create_workspace(workspace_pubkey);
     let workspace_id = workspace_eid;
 
-    // 2. UserInvite (signed by workspace)
+    // 2. InviteAccepted (local self-bind to workspace root)
+    let invite_accepted_eid = peer.create_invite_accepted(&workspace_eid, workspace_id);
+
+    // 3. UserInvite (signed by workspace)
     let invite_key = SigningKey::generate(&mut rng);
     let invite_pubkey = invite_key.verifying_key().to_bytes();
     let user_invite_eid =
         peer.create_user_invite_with_key(invite_pubkey, &workspace_key, &workspace_eid);
-
-    // 3. InviteAccepted (local, binds trust anchor)
-    let invite_accepted_eid = peer.create_invite_accepted(&user_invite_eid, workspace_id);
 
     // 4. User (signed by user_invite)
     let user_key = SigningKey::generate(&mut rng);

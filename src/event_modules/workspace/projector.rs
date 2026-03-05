@@ -1,8 +1,8 @@
 use crate::event_modules::ParsedEvent;
 use crate::projection::contract::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
 
-/// Pure projector: Workspace guard — trust_anchors must match workspace event_id.
-/// Returns Block if no trust anchor yet, Reject if mismatch.
+/// Pure projector: Workspace guard — accepted-invite binding must match workspace event_id.
+/// Returns Block if no accepted binding yet, Reject if mismatch.
 pub fn project_pure(
     recorded_by: &str,
     event_id_b64: &str,
@@ -16,17 +16,18 @@ pub fn project_pure(
 
     let workspace_id_b64 = event_id_b64.to_string();
 
-    match &ctx.trust_anchor_workspace_id {
+    match &ctx.accepted_workspace_id {
         None => {
-            // Guard-block: no trust anchor yet. Returns Block with empty
-            // missing vec because the blocker is the trust anchor (set by
-            // invite_accepted), not a specific event dep. Recovery:
+            // Guard-block: no accepted-invite workspace binding yet.
+            // Returns Block with empty missing vec because the blocker is the
+            // workspace binding (set by invite_accepted), not a specific event dep.
+            // Recovery:
             // invite_accepted emits RetryWorkspaceEvent { workspace_id }
-            // which re-projects this event after the anchor is written.
+            // which re-projects this event after the binding is written.
             ProjectorResult::block(vec![])
         }
         Some(anchor_wid) if anchor_wid == &workspace_id_b64 => {
-            // Trust anchor matches — project
+            // Accepted workspace binding matches — project
             let ops = vec![WriteOp::InsertOrIgnore {
                 table: "workspaces",
                 columns: vec![
@@ -48,7 +49,7 @@ pub fn project_pure(
         }
         Some(_) => {
             // Foreign workspace — reject
-            ProjectorResult::reject("workspace_id does not match trust anchor".to_string())
+            ProjectorResult::reject("workspace_id does not match accepted invite binding".to_string())
         }
     }
 }

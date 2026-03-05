@@ -93,7 +93,7 @@ where
 
     let ws_id = lookup_workspace_id(&db, recorded_by).ok_or_else(|| {
         format!(
-            "no trust anchor for peer_id={}, cannot start sync",
+            "no accepted workspace binding for peer_id={}, cannot start sync",
             recorded_by
         )
     })?;

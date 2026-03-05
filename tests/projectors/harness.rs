@@ -18,7 +18,7 @@ pub mod fixtures {
     /// ContextSnapshot with trust anchor set to the given workspace_id base64.
     pub fn ctx_with_anchor(workspace_id_b64: &str) -> ContextSnapshot {
         ContextSnapshot {
-            trust_anchor_workspace_id: Some(workspace_id_b64.to_string()),
+            accepted_workspace_id: Some(workspace_id_b64.to_string()),
             ..Default::default()
         }
     }

@@ -147,7 +147,7 @@ pub fn list_local_peers(
     Ok(peers)
 }
 
-/// Tenant discovery: join trust_anchors with local_transport_creds to find
+/// Tenant discovery: join invites_accepted with local_transport_creds to find
 /// all local identities that have both a workspace binding and TLS material.
 pub struct TenantInfo {
     pub peer_id: String,
@@ -160,11 +160,11 @@ pub struct TenantInfo {
 pub fn discover_local_tenants(
     conn: &Connection,
 ) -> Result<Vec<TenantInfo>, Box<dyn std::error::Error + Send + Sync>> {
-    // Normal case: trust anchor and transport identity already converged.
+    // Normal case: accepted-workspace binding and transport identity converged.
     let mut stmt = conn.prepare(
-        "SELECT t.peer_id, t.workspace_id, c.peer_id, c.cert_der, c.key_der
-         FROM trust_anchors t
-         JOIN local_transport_creds c ON t.peer_id = c.peer_id",
+        "SELECT DISTINCT i.recorded_by, i.workspace_id, c.peer_id, c.cert_der, c.key_der
+         FROM invites_accepted i
+         JOIN local_transport_creds c ON i.recorded_by = c.peer_id",
     )?;
     let mut tenants = stmt
         .query_map([], |row| {
@@ -186,15 +186,18 @@ pub fn discover_local_tenants(
     // invite acceptance pre-derives tenant peer_id before bootstrap sync, while
     // the local transport cert may still be invite-derived until projection
     // installs the PeerShared-derived cert.
-    let trust_count: i64 =
-        conn.query_row("SELECT COUNT(*) FROM trust_anchors", [], |row| row.get(0))?;
+    let accepted_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM invites_accepted", [], |row| row.get(0))?;
     let creds_count: i64 =
         conn.query_row("SELECT COUNT(*) FROM local_transport_creds", [], |row| {
             row.get(0)
         })?;
-    if trust_count == 1 && creds_count == 1 {
+    if accepted_count == 1 && creds_count == 1 {
         let (tenant_peer_id, workspace_id): (String, String) = conn.query_row(
-            "SELECT peer_id, workspace_id FROM trust_anchors LIMIT 1",
+            "SELECT recorded_by, workspace_id
+             FROM invites_accepted
+             ORDER BY created_at ASC, event_id ASC
+             LIMIT 1",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
@@ -310,9 +313,10 @@ mod tests {
         // No tenants yet
         assert!(discover_local_tenants(&conn).unwrap().is_empty());
 
-        // Add a trust anchor and matching creds
+        // Add an accepted-workspace binding and matching creds
         conn.execute(
-            "INSERT INTO trust_anchors (peer_id, workspace_id) VALUES ('peer1', 'ws1')",
+            "INSERT INTO invites_accepted (recorded_by, event_id, tenant_event_id, invite_event_id, workspace_id, created_at)
+             VALUES ('peer1', 'ia1', 't1', 'inv1', 'ws1', 1)",
             [],
         )
         .unwrap();
@@ -324,9 +328,10 @@ mod tests {
         assert_eq!(tenants[0].workspace_id, "ws1");
         assert_eq!(tenants[0].transport_peer_id, "peer1");
 
-        // Trust anchor without creds should not appear
+        // Accepted binding without creds should not appear
         conn.execute(
-            "INSERT INTO trust_anchors (peer_id, workspace_id) VALUES ('peer2', 'ws2')",
+            "INSERT INTO invites_accepted (recorded_by, event_id, tenant_event_id, invite_event_id, workspace_id, created_at)
+             VALUES ('peer2', 'ia2', 't2', 'inv2', 'ws2', 2)",
             [],
         )
         .unwrap();
@@ -343,7 +348,8 @@ mod tests {
         create_tables(&conn).unwrap();
 
         conn.execute(
-            "INSERT INTO trust_anchors (peer_id, workspace_id) VALUES ('derived_peer', 'ws1')",
+            "INSERT INTO invites_accepted (recorded_by, event_id, tenant_event_id, invite_event_id, workspace_id, created_at)
+             VALUES ('derived_peer', 'ia3', 't3', 'inv3', 'ws1', 3)",
             [],
         )
         .unwrap();

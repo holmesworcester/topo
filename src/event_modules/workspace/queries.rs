@@ -5,14 +5,18 @@ use crate::crypto::event_id_from_base64;
 use crate::event_modules::{admin, message, peer_shared, reaction, user};
 use crate::service::open_db_for_peer;
 
-/// Look up the workspace_id for a peer from trust_anchors.
+/// Look up the workspace_id for a peer from invites_accepted projection rows.
 pub fn resolve_workspace_for_peer(
     db: &Connection,
     peer_id: &str,
 ) -> Result<[u8; 32], Box<dyn std::error::Error + Send + Sync>> {
     let ws_b64: String = db
         .query_row(
-            "SELECT workspace_id FROM trust_anchors WHERE peer_id = ?1",
+            "SELECT workspace_id
+             FROM invites_accepted
+             WHERE recorded_by = ?1
+             ORDER BY created_at ASC, event_id ASC
+             LIMIT 1",
             rusqlite::params![peer_id],
             |row| row.get(0),
         )
@@ -20,7 +24,7 @@ pub fn resolve_workspace_for_peer(
             format!("no workspace found for peer {}", peer_id).into()
         })?;
     event_id_from_base64(&ws_b64)
-        .ok_or_else(|| format!("invalid workspace_id in trust_anchors: {}", ws_b64).into())
+        .ok_or_else(|| format!("invalid workspace_id in invites_accepted: {}", ws_b64).into())
 }
 
 pub struct WorkspaceRow {

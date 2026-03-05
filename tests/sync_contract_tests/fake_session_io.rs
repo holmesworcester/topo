@@ -502,12 +502,21 @@ pub fn create_test_db(tenant_id: &str) -> (String, tempfile::TempDir) {
     let conn = topo::db::open_connection(&db_path_str).expect("open db");
     topo::db::schema::create_tables(&conn).expect("create tables");
 
-    // Insert a trust anchor so lookup_workspace_id works
+    // Insert an accepted-workspace binding so lookup_workspace_id works.
     conn.execute(
-        "INSERT OR IGNORE INTO trust_anchors (peer_id, workspace_id) VALUES (?1, ?2)",
-        rusqlite::params![tenant_id, format!("ws-{}", tenant_id)],
+        "INSERT OR IGNORE INTO invites_accepted
+         (recorded_by, event_id, tenant_event_id, invite_event_id, workspace_id, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![
+            tenant_id,
+            format!("ia-{}", tenant_id),
+            format!("tenant-{}", tenant_id),
+            format!("invite-{}", tenant_id),
+            format!("ws-{}", tenant_id),
+            0_i64
+        ],
     )
-    .expect("insert trust anchor");
+    .expect("insert accepted workspace binding");
 
     drop(conn);
     (db_path_str, tmpdir)

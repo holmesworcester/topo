@@ -13,8 +13,12 @@ pub fn build_projector_context(
         return Err("workspace context loader called for non-workspace event".into());
     }
 
-    let trust_anchor_workspace_id = match db.query_row(
-        "SELECT workspace_id FROM trust_anchors WHERE peer_id = ?1",
+    let accepted_workspace_id = match db.query_row(
+        "SELECT workspace_id
+         FROM invites_accepted
+         WHERE recorded_by = ?1
+         ORDER BY created_at ASC, event_id ASC
+         LIMIT 1",
         rusqlite::params![recorded_by],
         |row| row.get::<_, String>(0),
     ) {
@@ -24,7 +28,7 @@ pub fn build_projector_context(
     };
 
     Ok(ContextSnapshot {
-        trust_anchor_workspace_id,
+        accepted_workspace_id,
         ..ContextSnapshot::default()
     })
 }
