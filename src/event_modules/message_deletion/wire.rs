@@ -12,6 +12,12 @@ pub struct MessageDeletionEvent {
     pub signature: [u8; 64],
 }
 
+impl super::super::Describe for MessageDeletionEvent {
+    fn human_fields(&self) -> Vec<(&'static str, String)> {
+        vec![("target", super::super::short_id_b64(&self.target_event_id))]
+    }
+}
+
 /// MessageDeletion (type 7): type(1) + created_at(8) + target_event_id(32) + author_id(32)
 ///                          + signed_by(32) + signer_type(1) + signature(64) = 170
 pub const MESSAGE_DELETION_WIRE_SIZE: usize =

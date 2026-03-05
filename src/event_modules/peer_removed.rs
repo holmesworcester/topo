@@ -15,6 +15,12 @@ pub struct PeerRemovedEvent {
     pub signature: [u8; 64],
 }
 
+impl super::Describe for PeerRemovedEvent {
+    fn human_fields(&self) -> Vec<(&'static str, String)> {
+        vec![("target", super::short_id_b64(&self.target_event_id))]
+    }
+}
+
 /// Wire format (138 bytes fixed):
 /// [0]        type_code = 21
 /// [1..9]     created_at_ms (u64 LE)

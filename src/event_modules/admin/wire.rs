@@ -16,6 +16,12 @@ pub struct AdminEvent {
     pub signature: [u8; 64],
 }
 
+impl super::super::Describe for AdminEvent {
+    fn human_fields(&self) -> Vec<(&'static str, String)> {
+        vec![("public_key", super::super::trunc_hex(&self.public_key, 16))]
+    }
+}
+
 pub fn parse_admin(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if blob.len() < ADMIN_WIRE_SIZE {
         return Err(EventError::TooShort {

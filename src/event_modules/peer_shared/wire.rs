@@ -35,6 +35,15 @@ pub struct PeerSharedEvent {
     pub signature: [u8; 64],
 }
 
+impl super::super::Describe for PeerSharedEvent {
+    fn human_fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("device_name", self.device_name.clone()),
+            ("public_key", super::super::trunc_hex(&self.public_key, 16)),
+        ]
+    }
+}
+
 pub fn parse_peer_shared(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if blob.len() < PEER_SHARED_WIRE_SIZE {
         return Err(EventError::TooShort {

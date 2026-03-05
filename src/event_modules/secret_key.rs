@@ -13,6 +13,12 @@ pub struct SecretKeyEvent {
     pub key_bytes: [u8; 32], // AES-256 symmetric key
 }
 
+impl super::Describe for SecretKeyEvent {
+    fn human_fields(&self) -> Vec<(&'static str, String)> {
+        vec![("key_bytes", super::trunc_hex(&self.key_bytes, 16))]
+    }
+}
+
 /// Wire format (41 bytes fixed):
 /// [0]      type_code = 6
 /// [1..9]   created_at_ms (u64 LE)

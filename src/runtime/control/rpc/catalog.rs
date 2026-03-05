@@ -237,6 +237,12 @@ static CATALOG: &[MethodInfo] = &[
         params: params!["limit", "usize", false, Some("50")],
         example_json: r#"{"type":"View","limit":50}"#,
     },
+    MethodInfo {
+        name: "EventList",
+        purpose: "List all events with parsed fields and decryption (workspace-scoped)",
+        params: PARAM_NONE,
+        example_json: r#"{"type":"EventList"}"#,
+    },
 ];
 
 /// Return all methods in the catalog.

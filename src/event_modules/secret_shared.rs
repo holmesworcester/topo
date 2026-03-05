@@ -20,6 +20,15 @@ pub struct SecretSharedEvent {
     pub signature: [u8; 64],
 }
 
+impl super::Describe for SecretSharedEvent {
+    fn human_fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("key_event_id", super::short_id_b64(&self.key_event_id)),
+            ("wrapped_key", super::trunc_hex(&self.wrapped_key, 16)),
+        ]
+    }
+}
+
 /// Wire format (202 bytes fixed):
 /// [0]          type_code = 22
 /// [1..9]       created_at_ms (u64 LE)

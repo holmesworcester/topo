@@ -24,6 +24,30 @@ pub mod workspace;
 use rusqlite::Connection;
 use std::sync::OnceLock;
 
+/// Human-readable field descriptions for CLI display.
+/// Each event struct implements this to describe its "interesting" fields,
+/// skipping IDs already shown as deps, signatures, and created_at.
+pub trait Describe {
+    fn human_fields(&self) -> Vec<(&'static str, String)>;
+}
+
+/// Format a 32-byte ID as short base64 (first 8 chars, parenthesized).
+pub fn short_id_b64(id: &[u8; 32]) -> String {
+    let b64 = crate::crypto::event_id_to_base64(id);
+    let short = &b64[..b64.len().min(8)];
+    format!("({})", short)
+}
+
+/// Truncated hex display for byte arrays.
+pub fn trunc_hex(bytes: &[u8], max_hex_chars: usize) -> String {
+    let h = hex::encode(bytes);
+    if h.len() > max_hex_chars {
+        format!("{}...", &h[..max_hex_chars])
+    } else {
+        h
+    }
+}
+
 pub use admin::AdminEvent;
 pub use bench_dep::BenchDepEvent;
 pub use device_invite::DeviceInviteEvent;
@@ -236,6 +260,31 @@ impl ParsedEvent {
             | ParsedEvent::InviteAccepted(_)
             | ParsedEvent::BenchDep(_)
             | ParsedEvent::LocalSignerSecret(_) => None,
+        }
+    }
+
+    /// Human-readable field descriptions for CLI display.
+    pub fn human_fields(&self) -> Vec<(&'static str, String)> {
+        match self {
+            ParsedEvent::Message(e) => e.human_fields(),
+            ParsedEvent::Reaction(e) => e.human_fields(),
+            ParsedEvent::Encrypted(e) => e.human_fields(),
+            ParsedEvent::SecretKey(e) => e.human_fields(),
+            ParsedEvent::MessageDeletion(e) => e.human_fields(),
+            ParsedEvent::Workspace(e) => e.human_fields(),
+            ParsedEvent::InviteAccepted(e) => e.human_fields(),
+            ParsedEvent::UserInvite(e) => e.human_fields(),
+            ParsedEvent::DeviceInvite(e) => e.human_fields(),
+            ParsedEvent::User(e) => e.human_fields(),
+            ParsedEvent::PeerShared(e) => e.human_fields(),
+            ParsedEvent::Admin(e) => e.human_fields(),
+            ParsedEvent::UserRemoved(e) => e.human_fields(),
+            ParsedEvent::PeerRemoved(e) => e.human_fields(),
+            ParsedEvent::SecretShared(e) => e.human_fields(),
+            ParsedEvent::MessageAttachment(e) => e.human_fields(),
+            ParsedEvent::FileSlice(e) => e.human_fields(),
+            ParsedEvent::BenchDep(e) => e.human_fields(),
+            ParsedEvent::LocalSignerSecret(e) => e.human_fields(),
         }
     }
 }

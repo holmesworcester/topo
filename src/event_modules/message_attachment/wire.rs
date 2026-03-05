@@ -63,6 +63,17 @@ pub struct MessageAttachmentEvent {
     pub signature: [u8; 64],
 }
 
+impl super::super::Describe for MessageAttachmentEvent {
+    fn human_fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("filename", self.filename.clone()),
+            ("mime_type", self.mime_type.clone()),
+            ("file_id", super::super::short_id_b64(&self.file_id)),
+            ("size", format!("{} bytes, {} slices", self.blob_bytes, self.total_slices)),
+        ]
+    }
+}
+
 /// Wire format (633 bytes fixed, signed):
 /// [0]            type=24
 /// [1..9]         created_at_ms (u64 LE)

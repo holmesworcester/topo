@@ -15,6 +15,12 @@ pub struct MessageEvent {
     pub signature: [u8; 64],
 }
 
+impl super::super::Describe for MessageEvent {
+    fn human_fields(&self) -> Vec<(&'static str, String)> {
+        vec![("content", self.content.clone())]
+    }
+}
+
 /// Wire format (1194 bytes fixed, signed):
 /// [0]            type=1
 /// [1..9]         created_at_ms (u64 LE)

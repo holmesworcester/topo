@@ -280,6 +280,138 @@ pub async fn svc_intro(
 }
 
 // ---------------------------------------------------------------------------
+// Event list (workspace-scoped)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EventListItem {
+    pub id: String,
+    pub event_type: String,
+    pub created_at_ms: u64,
+    pub blob_len: usize,
+    pub deps: Vec<(String, String)>,
+    pub fields: Vec<(String, String)>,
+    pub decrypted_inner: Option<EventListDecrypted>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EventListDecrypted {
+    pub inner_type: String,
+    pub fields: Vec<(String, String)>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EventListResponse {
+    pub events: Vec<EventListItem>,
+}
+
+pub fn svc_event_list(
+    db: &rusqlite::Connection,
+    recorded_by: &str,
+) -> ServiceResult<EventListResponse> {
+    use crate::crypto::{decrypt_event_blob, event_id_to_base64};
+    use crate::event_modules::{parse_event, ParsedEvent};
+    use std::collections::HashMap;
+
+    // Load secret keys for this peer (for decryption attempts).
+    let mut secret_keys: HashMap<String, Vec<u8>> = HashMap::new();
+    if let Ok(mut stmt) =
+        db.prepare("SELECT event_id, key_bytes FROM secret_keys WHERE recorded_by = ?1")
+    {
+        if let Ok(rows) = stmt.query_map(rusqlite::params![recorded_by], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        }) {
+            for row in rows.flatten() {
+                secret_keys.insert(row.0, row.1);
+            }
+        }
+    }
+
+    // Load events scoped to this workspace via recorded_events join.
+    let mut stmt = db.prepare(
+        "SELECT e.event_id, e.event_type, e.blob, e.created_at
+         FROM recorded_events re
+         JOIN events e ON e.event_id = re.event_id
+         WHERE re.peer_id = ?1
+         ORDER BY re.id",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![recorded_by], |row| {
+        let id: String = row.get(0)?;
+        let etype: String = row.get(1)?;
+        let blob: Vec<u8> = row.get(2)?;
+        let created_at: i64 = row.get(3)?;
+        Ok((id, etype, blob, created_at as u64))
+    })?;
+
+    let registry = crate::event_modules::registry();
+    let mut events = Vec::new();
+    for row in rows {
+        let (id_b64, event_type, blob, created_at_ms) = row?;
+        let parsed = parse_event(&blob);
+
+        let deps: Vec<(String, String)> = match &parsed {
+            Ok(p) => p
+                .dep_field_values()
+                .into_iter()
+                .map(|(field, raw_id)| (field.to_string(), event_id_to_base64(&raw_id)))
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+
+        let fields: Vec<(String, String)> = match &parsed {
+            Ok(p) => p
+                .human_fields()
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+            Err(e) => vec![("parse_error".into(), format!("{}", e))],
+        };
+
+        // Attempt decryption for encrypted events.
+        let decrypted_inner = if let Ok(ParsedEvent::Encrypted(enc)) = &parsed {
+            let key_id_b64 = event_id_to_base64(&enc.key_event_id);
+            secret_keys.get(&key_id_b64).and_then(|key_bytes| {
+                if key_bytes.len() != 32 {
+                    return None;
+                }
+                let mut key_arr = [0u8; 32];
+                key_arr.copy_from_slice(key_bytes);
+                let plaintext =
+                    decrypt_event_blob(&key_arr, &enc.nonce, &enc.ciphertext, &enc.auth_tag)
+                        .ok()?;
+                let inner_parsed = parse_event(&plaintext).ok()?;
+                let inner_type_name = registry
+                    .lookup(inner_parsed.event_type_code())
+                    .map(|m| m.type_name)
+                    .unwrap_or("unknown");
+                Some(EventListDecrypted {
+                    inner_type: inner_type_name.to_string(),
+                    fields: inner_parsed
+                        .human_fields()
+                        .into_iter()
+                        .map(|(k, v)| (k.to_string(), v))
+                        .collect(),
+                })
+            })
+        } else {
+            None
+        };
+
+        events.push(EventListItem {
+            id: id_b64,
+            event_type,
+            created_at_ms,
+            blob_len: blob.len(),
+            deps,
+            fields,
+            decrypted_inner,
+        });
+    }
+
+    Ok(EventListResponse { events })
+}
+
+// ---------------------------------------------------------------------------
 // Socket path helper
 // ---------------------------------------------------------------------------
 

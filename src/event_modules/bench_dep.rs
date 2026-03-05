@@ -29,6 +29,15 @@ pub struct BenchDepEvent {
     pub payload: [u8; 16],
 }
 
+impl super::Describe for BenchDepEvent {
+    fn human_fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("deps", format!("{} dep(s)", self.dep_ids.len())),
+            ("payload", super::trunc_hex(&self.payload, 16)),
+        ]
+    }
+}
+
 /// Wire format (345 bytes fixed, unsigned):
 /// [0]      type_code = 26
 /// [1..9]   created_at_ms (u64 LE)

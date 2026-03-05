@@ -17,6 +17,15 @@ pub struct UserInviteEvent {
     pub signature: [u8; 64],
 }
 
+impl super::super::Describe for UserInviteEvent {
+    fn human_fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("public_key", super::super::trunc_hex(&self.public_key, 16)),
+            ("workspace_id", super::super::short_id_b64(&self.workspace_id)),
+        ]
+    }
+}
+
 pub fn parse_user_invite(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if blob.len() < USER_INVITE_WIRE_SIZE {
         return Err(EventError::TooShort {

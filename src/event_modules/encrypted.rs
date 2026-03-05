@@ -28,6 +28,20 @@ pub struct EncryptedEvent {
     pub auth_tag: [u8; 16],
 }
 
+impl super::Describe for EncryptedEvent {
+    fn human_fields(&self) -> Vec<(&'static str, String)> {
+        let registry = super::registry();
+        let inner_name = registry
+            .lookup(self.inner_type_code)
+            .map(|m| m.type_name)
+            .unwrap_or("unknown");
+        vec![
+            ("inner_type", inner_name.to_string()),
+            ("ciphertext", super::trunc_hex(&self.ciphertext, 40)),
+        ]
+    }
+}
+
 /// Wire format (fixed size per inner_type_code, unsigned):
 /// [0]             type_code = 5
 /// [1..9]          created_at_ms (u64 LE)

@@ -38,6 +38,12 @@ pub struct ReactionEvent {
     pub signature: [u8; 64],
 }
 
+impl super::super::Describe for ReactionEvent {
+    fn human_fields(&self) -> Vec<(&'static str, String)> {
+        vec![("emoji", self.emoji.clone())]
+    }
+}
+
 pub fn parse_reaction(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if blob.len() < REACTION_WIRE_SIZE {
         return Err(EventError::TooShort {

@@ -32,6 +32,15 @@ pub struct UserEvent {
     pub signature: [u8; 64],
 }
 
+impl super::super::Describe for UserEvent {
+    fn human_fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("username", self.username.clone()),
+            ("public_key", super::super::trunc_hex(&self.public_key, 16)),
+        ]
+    }
+}
+
 pub fn parse_user(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if blob.len() < USER_WIRE_SIZE {
         return Err(EventError::TooShort {

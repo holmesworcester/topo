@@ -41,6 +41,16 @@ pub struct FileSliceEvent {
     pub signature: [u8; 64],
 }
 
+impl super::super::Describe for FileSliceEvent {
+    fn human_fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("file_id", super::super::short_id_b64(&self.file_id)),
+            ("slice_number", self.slice_number.to_string()),
+            ("data", format!("{} bytes", self.ciphertext.len())),
+        ]
+    }
+}
+
 pub fn parse_file_slice(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if blob.len() < FILE_SLICE_WIRE_SIZE {
         return Err(EventError::TooShort {

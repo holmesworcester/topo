@@ -13,6 +13,12 @@ pub struct DeviceInviteEvent {
     pub signature: [u8; 64],
 }
 
+impl super::super::Describe for DeviceInviteEvent {
+    fn human_fields(&self) -> Vec<(&'static str, String)> {
+        vec![("public_key", super::super::trunc_hex(&self.public_key, 16))]
+    }
+}
+
 /// Wire format (138 bytes fixed):
 /// [0]        type_code = 12
 /// [1..9]     created_at_ms (u64 LE)

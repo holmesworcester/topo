@@ -736,6 +736,14 @@ fn dispatch(
             Err(e) => RpcResponse::error(e),
         },
 
+        RpcMethod::EventList => match service::open_db_load(db_path) {
+            Ok((recorded_by, db)) => match service::svc_event_list(&db, &recorded_by) {
+                Ok(data) => RpcResponse::success(data),
+                Err(e) => RpcResponse::error(e.to_string()),
+            },
+            Err(e) => RpcResponse::error(e.to_string()),
+        },
+
         // ----- Subscription commands -----
         RpcMethod::SubCreate {
             name,

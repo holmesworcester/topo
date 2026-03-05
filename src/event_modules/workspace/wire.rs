@@ -25,6 +25,15 @@ pub struct WorkspaceEvent {
     pub name: String,         // Workspace display name (64-byte text slot)
 }
 
+impl super::super::Describe for WorkspaceEvent {
+    fn human_fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("name", self.name.clone()),
+            ("public_key", super::super::trunc_hex(&self.public_key, 16)),
+        ]
+    }
+}
+
 /// Wire format (105 bytes fixed):
 /// [0]      type_code = 8
 /// [1..9]   created_at_ms (u64 LE)

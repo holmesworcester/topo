@@ -148,6 +148,8 @@ pub enum RpcMethod {
     SubState {
         subscription_id: String,
     },
+    /// List all events for the active workspace with parsed fields and decryption.
+    EventList,
 }
 
 fn default_workspace_name() -> String {
