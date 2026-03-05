@@ -989,3 +989,45 @@ fn test_cli_event_tree_cross_refs_shown() {
         stdout
     );
 }
+
+#[test]
+fn test_cli_event_commands_require_daemon() {
+    let _guard = cli_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = tmpdir
+        .path()
+        .join("no_daemon.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let event_list = Command::new(bin())
+        .args(["--db", &db, "event-list"])
+        .output()
+        .expect("event-list command");
+    assert!(
+        !event_list.status.success(),
+        "event-list should fail without daemon"
+    );
+    let list_stderr = String::from_utf8_lossy(&event_list.stderr);
+    assert!(
+        list_stderr.contains("daemon is not running"),
+        "event-list should report daemon requirement, got:\n{}",
+        list_stderr
+    );
+
+    let event_tree = Command::new(bin())
+        .args(["--db", &db, "event-tree"])
+        .output()
+        .expect("event-tree command");
+    assert!(
+        !event_tree.status.success(),
+        "event-tree should fail without daemon"
+    );
+    let tree_stderr = String::from_utf8_lossy(&event_tree.stderr);
+    assert!(
+        tree_stderr.contains("daemon is not running"),
+        "event-tree should report daemon requirement, got:\n{}",
+        tree_stderr
+    );
+}

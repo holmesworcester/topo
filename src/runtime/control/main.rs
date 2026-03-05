@@ -281,11 +281,11 @@ enum Commands {
     /// List all known peers (local + remote) with connection endpoint info
     Peers,
 
-    /// Show event dependency tree
+    /// Show event dependency tree (requires running daemon)
     #[command(name = "event-tree")]
     EventTree,
 
-    /// List all events with their dependencies
+    /// List all events with their dependencies (requires running daemon)
     #[command(name = "event-list")]
     EventList,
 
