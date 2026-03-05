@@ -16,8 +16,8 @@ use crate::contracts::peering_contract::{
 };
 use crate::protocol::Frame;
 use crate::protocol::{encode_frame, parse_frame};
-use crate::sync::session::{run_sync_initiator, run_sync_responder};
 use crate::sync::session::coordinator::PeerCoord;
+use crate::sync::session::{run_sync_initiator, run_sync_responder};
 use crate::transport::connection::ConnectionError;
 use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
 
@@ -93,9 +93,7 @@ fn map_io_error(err: TransportSessionIoError) -> ConnectionError {
 
 #[derive(Clone)]
 pub enum SessionRole {
-    Initiator {
-        coordination: Arc<PeerCoord>,
-    },
+    Initiator { coordination: Arc<PeerCoord> },
     Responder,
 }
 
@@ -117,9 +115,7 @@ impl SyncSessionHandler {
         Self {
             db_path,
             timeout_secs,
-            role: SessionRole::Initiator {
-                coordination,
-            },
+            role: SessionRole::Initiator { coordination },
             shared_ingest,
         }
     }
@@ -195,12 +191,7 @@ impl SessionHandler for SyncSessionHandler {
         }
 
         match (&self.role, meta.direction) {
-            (
-                SessionRole::Initiator {
-                    coordination,
-                },
-                SessionDirection::Outbound,
-            ) => {
+            (SessionRole::Initiator { coordination }, SessionDirection::Outbound) => {
                 let run = run_sync_initiator(
                     conn,
                     &self.db_path,

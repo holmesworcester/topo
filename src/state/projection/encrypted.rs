@@ -33,17 +33,23 @@ pub fn project_encrypted(
     ) {
         Ok(k) => k,
         Err(rusqlite::Error::QueryReturnedNoRows) => {
-            return Ok((ProjectionDecision::Reject {
-                reason: "secret key not found in secret_keys table".to_string(),
-            }, None));
+            return Ok((
+                ProjectionDecision::Reject {
+                    reason: "secret key not found in secret_keys table".to_string(),
+                },
+                None,
+            ));
         }
         Err(e) => return Err(e.into()),
     };
 
     if key_bytes.len() != 32 {
-        return Ok((ProjectionDecision::Reject {
-            reason: format!("secret key has wrong length: {}", key_bytes.len()),
-        }, None));
+        return Ok((
+            ProjectionDecision::Reject {
+                reason: format!("secret key has wrong length: {}", key_bytes.len()),
+            },
+            None,
+        ));
     }
 
     let mut key_arr = [0u8; 32];
@@ -53,9 +59,12 @@ pub fn project_encrypted(
     let plaintext = match decrypt_event_blob(&key_arr, &enc.nonce, &enc.ciphertext, &enc.auth_tag) {
         Ok(pt) => pt,
         Err(_) => {
-            return Ok((ProjectionDecision::Reject {
-                reason: "decryption failed (wrong key or corrupted)".to_string(),
-            }, None));
+            return Ok((
+                ProjectionDecision::Reject {
+                    reason: "decryption failed (wrong key or corrupted)".to_string(),
+                },
+                None,
+            ));
         }
     };
 
@@ -63,28 +72,37 @@ pub fn project_encrypted(
     let inner_parsed = match events::parse_event(&plaintext) {
         Ok(p) => p,
         Err(e) => {
-            return Ok((ProjectionDecision::Reject {
-                reason: format!("inner event parse error: {}", e),
-            }, None));
+            return Ok((
+                ProjectionDecision::Reject {
+                    reason: format!("inner event parse error: {}", e),
+                },
+                None,
+            ));
         }
     };
 
     // 4. Verify inner type matches inner_type_code
     if inner_parsed.event_type_code() != enc.inner_type_code {
-        return Ok((ProjectionDecision::Reject {
-            reason: format!(
-                "inner type mismatch: outer declares {}, inner is {}",
-                enc.inner_type_code,
-                inner_parsed.event_type_code()
-            ),
-        }, None));
+        return Ok((
+            ProjectionDecision::Reject {
+                reason: format!(
+                    "inner type mismatch: outer declares {}, inner is {}",
+                    enc.inner_type_code,
+                    inner_parsed.event_type_code()
+                ),
+            },
+            None,
+        ));
     }
 
     // 5. Reject nested encryption
     if enc.inner_type_code == EVENT_TYPE_ENCRYPTED {
-        return Ok((ProjectionDecision::Reject {
-            reason: "nested encryption not allowed".to_string(),
-        }, None));
+        return Ok((
+            ProjectionDecision::Reject {
+                reason: "nested encryption not allowed".to_string(),
+            },
+            None,
+        ));
     }
 
     // 6. Reject disallowed inner families via registry metadata
@@ -93,12 +111,15 @@ pub fn project_encrypted(
     match inner_meta {
         Some(m) if m.encryptable => {}
         _ => {
-            return Ok((ProjectionDecision::Reject {
-                reason: format!(
-                    "event type {} is not admissible inside encrypted wrappers",
-                    inner_code
-                ),
-            }, None));
+            return Ok((
+                ProjectionDecision::Reject {
+                    reason: format!(
+                        "event type {} is not admissible inside encrypted wrappers",
+                        inner_code
+                    ),
+                },
+                None,
+            ));
         }
     }
 

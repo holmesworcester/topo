@@ -4,14 +4,13 @@ pub mod wire;
 
 pub use projector::project_pure;
 pub use queries::{
-    count, first_event_id, identity, list_account_items, list_accounts, list_event_ids,
-    list_peers, load_local_peer_signer, load_local_peer_signer_required, load_local_user_key,
+    count, first_event_id, identity, list_account_items, list_accounts, list_event_ids, list_peers,
+    load_local_peer_signer, load_local_peer_signer_required, load_local_user_key,
     resolve_event_id_by_transport_fingerprint, resolve_user_event_id, AccountItem, AccountRow,
     IdentityResponse, PeerItem,
 };
 pub use wire::{
-    encode_peer_shared, parse_peer_shared, PeerSharedEvent,
-    PEER_SHARED_META, PEER_SHARED_WIRE_SIZE,
+    encode_peer_shared, parse_peer_shared, PeerSharedEvent, PEER_SHARED_META, PEER_SHARED_WIRE_SIZE,
 };
 
 use rusqlite::Connection;

@@ -1,9 +1,7 @@
 use std::time::Duration;
 use topo::crypto::event_id_to_base64;
 use topo::db::open_connection;
-use topo::testutil::{
-    assert_eventually, start_peers_pinned, Peer, ScenarioHarness,
-};
+use topo::testutil::{assert_eventually, start_peers_pinned, Peer, ScenarioHarness};
 
 /// Integration test: Alice creates a PSK + encrypted message → syncs to Bob → Bob projects.
 #[tokio::test]

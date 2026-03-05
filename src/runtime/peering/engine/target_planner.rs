@@ -402,8 +402,7 @@ mod tests {
             1
         );
 
-        transport_trust::consume_bootstrap_for_peer_shared(&conn, recorded_by, &peer_pub)
-            .unwrap();
+        transport_trust::consume_bootstrap_for_peer_shared(&conn, recorded_by, &peer_pub).unwrap();
 
         assert_eq!(
             transport_trust::list_active_invite_bootstrap_addrs(&conn, recorded_by)

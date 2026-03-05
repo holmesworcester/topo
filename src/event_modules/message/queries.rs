@@ -107,8 +107,7 @@ pub fn list(
     let total = count(db, recorded_by)?;
 
     // Load client_op_id mappings for annotation
-    let client_ops = crate::db::local_client_ops::all_mappings(db, recorded_by)
-        .unwrap_or_default();
+    let client_ops = crate::db::local_client_ops::all_mappings(db, recorded_by).unwrap_or_default();
 
     let mut messages = Vec::with_capacity(rows.len());
     for row in rows {

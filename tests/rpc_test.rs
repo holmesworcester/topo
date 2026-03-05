@@ -910,8 +910,7 @@ fn rpc_peers_returns_local_peer_after_create_workspace() {
 
     wait_for_socket(&socket);
 
-    let resp =
-        topo::rpc::client::rpc_call(&socket, topo::rpc::protocol::RpcMethod::Peers).unwrap();
+    let resp = topo::rpc::client::rpc_call(&socket, topo::rpc::protocol::RpcMethod::Peers).unwrap();
     assert!(resp.ok, "peers RPC should succeed: {:?}", resp.error);
     let data = resp.data.expect("peers response missing data");
     let items = data.as_array().expect("peers should return an array");
@@ -1059,9 +1058,8 @@ fn peers_shows_remote_after_invite_accept() {
     // Wait for sync to propagate identity events
     let start = std::time::Instant::now();
     loop {
-        let resp =
-            topo::rpc::client::rpc_call(&bob_socket, topo::rpc::protocol::RpcMethod::Peers)
-                .unwrap();
+        let resp = topo::rpc::client::rpc_call(&bob_socket, topo::rpc::protocol::RpcMethod::Peers)
+            .unwrap();
         if resp.ok {
             if let Some(data) = &resp.data {
                 if let Some(items) = data.as_array() {
@@ -1081,8 +1079,7 @@ fn peers_shows_remote_after_invite_accept() {
                         );
 
                         let has_endpoint = items.iter().any(|p| {
-                            !p["local"].as_bool().unwrap_or(false)
-                                && p["endpoint"].is_string()
+                            !p["local"].as_bool().unwrap_or(false) && p["endpoint"].is_string()
                         });
                         assert!(
                             has_endpoint,
@@ -1140,7 +1137,11 @@ fn rpc_methods_json_output() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("should be valid JSON");
     let arr = parsed.as_array().expect("should be an array");
-    assert!(arr.len() >= 25, "should list at least 25 methods, got {}", arr.len());
+    assert!(
+        arr.len() >= 25,
+        "should list at least 25 methods, got {}",
+        arr.len()
+    );
     for entry in arr {
         assert!(entry["name"].is_string(), "method should have name");
         assert!(entry["purpose"].is_string(), "method should have purpose");
@@ -1181,7 +1182,10 @@ fn rpc_describe_unknown_method_fails() {
         .unwrap();
     assert!(!out.status.success(), "should fail for unknown method");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("unknown method"), "should mention unknown method");
+    assert!(
+        stderr.contains("unknown method"),
+        "should mention unknown method"
+    );
 }
 
 #[test]
@@ -1190,7 +1194,10 @@ fn rpc_describe_case_insensitive() {
         .args(["rpc", "describe", "status"])
         .output()
         .unwrap();
-    assert!(out.status.success(), "rpc describe should be case-insensitive");
+    assert!(
+        out.status.success(),
+        "rpc describe should be case-insensitive"
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("Status:"), "should show Status header");
 }
@@ -1213,8 +1220,12 @@ fn rpc_call_method_json_status() {
 
     let out = Command::new(bin())
         .args([
-            "--db", &db, "rpc", "call",
-            "--method-json", r#"{"type":"Status"}"#,
+            "--db",
+            &db,
+            "rpc",
+            "call",
+            "--method-json",
+            r#"{"type":"Status"}"#,
         ])
         .output()
         .unwrap();
@@ -1249,8 +1260,12 @@ fn rpc_call_request_json() {
 
     let out = Command::new(bin())
         .args([
-            "--db", &db, "rpc", "call",
-            "--request-json", r#"{"version":1,"method":{"type":"Status"}}"#,
+            "--db",
+            &db,
+            "rpc",
+            "call",
+            "--request-json",
+            r#"{"version":1,"method":{"type":"Status"}}"#,
         ])
         .output()
         .unwrap();
@@ -1270,10 +1285,7 @@ fn rpc_call_invalid_json_fails() {
     let (_dir, db) = temp_db();
 
     let out = Command::new(bin())
-        .args([
-            "--db", &db, "rpc", "call",
-            "--method-json", "not json",
-        ])
+        .args(["--db", &db, "rpc", "call", "--method-json", "not json"])
         .output()
         .unwrap();
 
@@ -1323,10 +1335,7 @@ fn rpc_call_request_json_missing_version_fails() {
 
 #[test]
 fn rpc_call_no_input_fails() {
-    let out = Command::new(bin())
-        .args(["rpc", "call"])
-        .output()
-        .unwrap();
+    let out = Command::new(bin()).args(["rpc", "call"]).output().unwrap();
     assert!(!out.status.success(), "should fail with no input");
 }
 
@@ -1335,13 +1344,38 @@ fn catalog_drift_test_method_count_matches_protocol() {
     let catalog_names = topo::rpc::catalog::method_names();
 
     let known_methods = vec![
-        "Status", "Messages", "Send", "SendFile", "Generate", "GenerateFiles",
-        "AssertNow", "AssertEventually", "TransportIdentity", "React",
-        "DeleteMessage", "Reactions", "Users", "Keys", "Workspaces",
-        "IntroAttempts", "CreateInvite", "AcceptInvite", "CreateDeviceLink",
-        "AcceptLink", "Ban", "Identity", "Shutdown", "Tenants", "UseTenant",
-        "ActiveTenant", "CreateWorkspace", "Peers", "Upnp", "View",
-        "EventList", "Intro",
+        "Status",
+        "Messages",
+        "Send",
+        "SendFile",
+        "Generate",
+        "GenerateFiles",
+        "AssertNow",
+        "AssertEventually",
+        "TransportIdentity",
+        "React",
+        "DeleteMessage",
+        "Reactions",
+        "Users",
+        "Keys",
+        "Workspaces",
+        "IntroAttempts",
+        "CreateInvite",
+        "AcceptInvite",
+        "CreateDeviceLink",
+        "AcceptLink",
+        "Ban",
+        "Identity",
+        "Shutdown",
+        "Tenants",
+        "UseTenant",
+        "ActiveTenant",
+        "CreateWorkspace",
+        "Peers",
+        "Upnp",
+        "View",
+        "EventList",
+        "Intro",
     ];
 
     for method in &known_methods {
@@ -1382,8 +1416,12 @@ fn rpc_call_file_input() {
 
     let out = Command::new(bin())
         .args([
-            "--db", &db, "rpc", "call",
-            "--file", file_path.to_str().unwrap(),
+            "--db",
+            &db,
+            "rpc",
+            "call",
+            "--file",
+            file_path.to_str().unwrap(),
         ])
         .output()
         .unwrap();
@@ -1418,9 +1456,7 @@ fn rpc_call_stdin_input() {
     wait_for_socket(&socket);
 
     let mut child = Command::new(bin())
-        .args([
-            "--db", &db, "rpc", "call", "--stdin",
-        ])
+        .args(["--db", &db, "rpc", "call", "--stdin"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

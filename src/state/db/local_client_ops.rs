@@ -58,9 +58,8 @@ pub fn all_mappings(
     conn: &Connection,
     recorded_by: &str,
 ) -> SqliteResult<std::collections::HashMap<String, String>> {
-    let mut stmt = conn.prepare(
-        "SELECT event_id, client_op_id FROM local_client_ops WHERE recorded_by = ?1",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT event_id, client_op_id FROM local_client_ops WHERE recorded_by = ?1")?;
     let mut map = std::collections::HashMap::new();
     let mut rows = stmt.query(params![recorded_by])?;
     while let Some(row) = rows.next()? {

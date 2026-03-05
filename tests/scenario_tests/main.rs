@@ -1,11 +1,11 @@
-mod sync;
-mod encryption;
-mod queue;
 mod deletion;
+mod encryption;
 mod identity;
 mod identity_sync;
+mod queue;
 mod shared_db;
 mod subscription;
+mod sync;
 mod transport;
 
 #[cfg(feature = "discovery")]
@@ -34,9 +34,9 @@ fn test_scenario_harness_guard() {
         let mut test_fns: Vec<(usize, String)> = Vec::new();
         for (i, line) in lines.iter().enumerate() {
             let trimmed = line.trim();
-            let is_fn_def =
-                (trimmed.starts_with("fn test_") || trimmed.starts_with("async fn test_"))
-                    && trimmed.contains('(');
+            let is_fn_def = (trimmed.starts_with("fn test_")
+                || trimmed.starts_with("async fn test_"))
+                && trimmed.contains('(');
             if !is_fn_def {
                 continue;
             }

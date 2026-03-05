@@ -98,10 +98,8 @@ pub fn list_subscriptions(
     for row in rows {
         let (sub_id, name, enabled, event_type, delivery_str, spec_json, created, updated) =
             row.map_err(|e| e.to_string())?;
-        let delivery_mode =
-            DeliveryMode::from_str(&delivery_str).unwrap_or(DeliveryMode::Full);
-        let spec: SubscriptionSpec =
-            serde_json::from_str(&spec_json).map_err(|e| e.to_string())?;
+        let delivery_mode = DeliveryMode::from_str(&delivery_str).unwrap_or(DeliveryMode::Full);
+        let spec: SubscriptionSpec = serde_json::from_str(&spec_json).map_err(|e| e.to_string())?;
         result.push(SubscriptionDef {
             recorded_by: recorded_by.to_string(),
             subscription_id: sub_id,
@@ -148,10 +146,8 @@ pub fn load_active_subscriptions_for_type(
     for row in rows {
         let (sub_id, name, delivery_str, spec_json, created, updated) =
             row.map_err(|e| e.to_string())?;
-        let delivery_mode =
-            DeliveryMode::from_str(&delivery_str).unwrap_or(DeliveryMode::Full);
-        let spec: SubscriptionSpec =
-            serde_json::from_str(&spec_json).map_err(|e| e.to_string())?;
+        let delivery_mode = DeliveryMode::from_str(&delivery_str).unwrap_or(DeliveryMode::Full);
+        let spec: SubscriptionSpec = serde_json::from_str(&spec_json).map_err(|e| e.to_string())?;
         result.push(SubscriptionDef {
             recorded_by: recorded_by.to_string(),
             subscription_id: sub_id,
@@ -554,10 +550,7 @@ pub fn get_state(
 /// tie-breaking at equal timestamps, so a small timestamp discrepancy may
 /// allow a re-delivery of the cursor event's inner content (harmless since
 /// consumers should be idempotent).
-pub fn resolve_event_created_at(
-    conn: &Connection,
-    event_id_b64: &str,
-) -> Result<u64, String> {
+pub fn resolve_event_created_at(conn: &Connection, event_id_b64: &str) -> Result<u64, String> {
     let blob: Vec<u8> = conn
         .query_row(
             "SELECT blob FROM events WHERE event_id = ?1",
@@ -566,8 +559,8 @@ pub fn resolve_event_created_at(
         )
         .map_err(|e| format!("event not found: {}", e))?;
 
-    let parsed = crate::event_modules::parse_event(&blob)
-        .map_err(|e| format!("parse error: {}", e))?;
+    let parsed =
+        crate::event_modules::parse_event(&blob).map_err(|e| format!("parse error: {}", e))?;
 
     Ok(parsed.created_at_ms())
 }
@@ -636,7 +629,15 @@ mod tests {
     #[test]
     fn test_create_and_list_subscription() {
         let conn = setup_db();
-        let sub = create_subscription(&conn, PEER, "inbox", "message", DeliveryMode::Full, &make_spec()).unwrap();
+        let sub = create_subscription(
+            &conn,
+            PEER,
+            "inbox",
+            "message",
+            DeliveryMode::Full,
+            &make_spec(),
+        )
+        .unwrap();
         assert_eq!(sub.name, "inbox");
         assert_eq!(sub.event_type, "message");
         assert!(sub.enabled);
@@ -659,7 +660,15 @@ mod tests {
     #[test]
     fn test_enable_disable() {
         let conn = setup_db();
-        let sub = create_subscription(&conn, PEER, "test", "message", DeliveryMode::Full, &make_spec()).unwrap();
+        let sub = create_subscription(
+            &conn,
+            PEER,
+            "test",
+            "message",
+            DeliveryMode::Full,
+            &make_spec(),
+        )
+        .unwrap();
 
         set_enabled(&conn, PEER, &sub.subscription_id, false).unwrap();
         let subs = list_subscriptions(&conn, PEER).unwrap();
@@ -673,7 +682,15 @@ mod tests {
     #[test]
     fn test_disable_hides_from_active_query() {
         let conn = setup_db();
-        let sub = create_subscription(&conn, PEER, "test", "message", DeliveryMode::Full, &make_spec()).unwrap();
+        let sub = create_subscription(
+            &conn,
+            PEER,
+            "test",
+            "message",
+            DeliveryMode::Full,
+            &make_spec(),
+        )
+        .unwrap();
         set_enabled(&conn, PEER, &sub.subscription_id, false).unwrap();
 
         let active = load_active_subscriptions_for_type(&conn, PEER, "message").unwrap();
@@ -692,12 +709,26 @@ mod tests {
     #[test]
     fn test_append_feed_item_and_state() {
         let conn = setup_db();
-        let sub = create_subscription(&conn, PEER, "test", "message", DeliveryMode::Full, &make_spec()).unwrap();
+        let sub = create_subscription(
+            &conn,
+            PEER,
+            "test",
+            "message",
+            DeliveryMode::Full,
+            &make_spec(),
+        )
+        .unwrap();
 
         let seq = append_feed_item(
-            &conn, PEER, &sub.subscription_id, "message", "eid_1", 1000,
+            &conn,
+            PEER,
+            &sub.subscription_id,
+            "message",
+            "eid_1",
+            1000,
             &serde_json::json!({"content": "hi"}),
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(seq, 1);
 
         let state = get_state(&conn, PEER, &sub.subscription_id).unwrap();
@@ -710,11 +741,46 @@ mod tests {
     #[test]
     fn test_append_feed_item_sequential_seqs() {
         let conn = setup_db();
-        let sub = create_subscription(&conn, PEER, "test", "message", DeliveryMode::Full, &make_spec()).unwrap();
+        let sub = create_subscription(
+            &conn,
+            PEER,
+            "test",
+            "message",
+            DeliveryMode::Full,
+            &make_spec(),
+        )
+        .unwrap();
 
-        let s1 = append_feed_item(&conn, PEER, &sub.subscription_id, "message", "eid_1", 1000, &serde_json::json!({})).unwrap();
-        let s2 = append_feed_item(&conn, PEER, &sub.subscription_id, "message", "eid_2", 2000, &serde_json::json!({})).unwrap();
-        let s3 = append_feed_item(&conn, PEER, &sub.subscription_id, "message", "eid_3", 3000, &serde_json::json!({})).unwrap();
+        let s1 = append_feed_item(
+            &conn,
+            PEER,
+            &sub.subscription_id,
+            "message",
+            "eid_1",
+            1000,
+            &serde_json::json!({}),
+        )
+        .unwrap();
+        let s2 = append_feed_item(
+            &conn,
+            PEER,
+            &sub.subscription_id,
+            "message",
+            "eid_2",
+            2000,
+            &serde_json::json!({}),
+        )
+        .unwrap();
+        let s3 = append_feed_item(
+            &conn,
+            PEER,
+            &sub.subscription_id,
+            "message",
+            "eid_3",
+            3000,
+            &serde_json::json!({}),
+        )
+        .unwrap();
         assert_eq!(s1, 1);
         assert_eq!(s2, 2);
         assert_eq!(s3, 3);
@@ -729,11 +795,37 @@ mod tests {
     #[test]
     fn test_append_feed_item_idempotent() {
         let conn = setup_db();
-        let sub = create_subscription(&conn, PEER, "test", "message", DeliveryMode::Full, &make_spec()).unwrap();
+        let sub = create_subscription(
+            &conn,
+            PEER,
+            "test",
+            "message",
+            DeliveryMode::Full,
+            &make_spec(),
+        )
+        .unwrap();
 
-        let s1 = append_feed_item(&conn, PEER, &sub.subscription_id, "message", "eid_1", 1000, &serde_json::json!({})).unwrap();
+        let s1 = append_feed_item(
+            &conn,
+            PEER,
+            &sub.subscription_id,
+            "message",
+            "eid_1",
+            1000,
+            &serde_json::json!({}),
+        )
+        .unwrap();
         // Same event_id again — should return existing seq, not create a new row
-        let s1_dup = append_feed_item(&conn, PEER, &sub.subscription_id, "message", "eid_1", 1000, &serde_json::json!({})).unwrap();
+        let s1_dup = append_feed_item(
+            &conn,
+            PEER,
+            &sub.subscription_id,
+            "message",
+            "eid_1",
+            1000,
+            &serde_json::json!({}),
+        )
+        .unwrap();
         assert_eq!(s1, s1_dup);
 
         // pending_count should still be 1, not 2
@@ -746,11 +838,46 @@ mod tests {
     #[test]
     fn test_poll_feed_returns_items_after_seq() {
         let conn = setup_db();
-        let sub = create_subscription(&conn, PEER, "test", "message", DeliveryMode::Full, &make_spec()).unwrap();
+        let sub = create_subscription(
+            &conn,
+            PEER,
+            "test",
+            "message",
+            DeliveryMode::Full,
+            &make_spec(),
+        )
+        .unwrap();
 
-        append_feed_item(&conn, PEER, &sub.subscription_id, "message", "eid_1", 1000, &serde_json::json!({"a":1})).unwrap();
-        append_feed_item(&conn, PEER, &sub.subscription_id, "message", "eid_2", 2000, &serde_json::json!({"a":2})).unwrap();
-        append_feed_item(&conn, PEER, &sub.subscription_id, "message", "eid_3", 3000, &serde_json::json!({"a":3})).unwrap();
+        append_feed_item(
+            &conn,
+            PEER,
+            &sub.subscription_id,
+            "message",
+            "eid_1",
+            1000,
+            &serde_json::json!({"a":1}),
+        )
+        .unwrap();
+        append_feed_item(
+            &conn,
+            PEER,
+            &sub.subscription_id,
+            "message",
+            "eid_2",
+            2000,
+            &serde_json::json!({"a":2}),
+        )
+        .unwrap();
+        append_feed_item(
+            &conn,
+            PEER,
+            &sub.subscription_id,
+            "message",
+            "eid_3",
+            3000,
+            &serde_json::json!({"a":3}),
+        )
+        .unwrap();
 
         // Poll from beginning
         let items = poll_feed(&conn, PEER, &sub.subscription_id, 0, 100).unwrap();
@@ -780,11 +907,46 @@ mod tests {
     #[test]
     fn test_ack_feed_decrements_pending() {
         let conn = setup_db();
-        let sub = create_subscription(&conn, PEER, "test", "message", DeliveryMode::Full, &make_spec()).unwrap();
+        let sub = create_subscription(
+            &conn,
+            PEER,
+            "test",
+            "message",
+            DeliveryMode::Full,
+            &make_spec(),
+        )
+        .unwrap();
 
-        append_feed_item(&conn, PEER, &sub.subscription_id, "message", "eid_1", 1000, &serde_json::json!({})).unwrap();
-        append_feed_item(&conn, PEER, &sub.subscription_id, "message", "eid_2", 2000, &serde_json::json!({})).unwrap();
-        append_feed_item(&conn, PEER, &sub.subscription_id, "message", "eid_3", 3000, &serde_json::json!({})).unwrap();
+        append_feed_item(
+            &conn,
+            PEER,
+            &sub.subscription_id,
+            "message",
+            "eid_1",
+            1000,
+            &serde_json::json!({}),
+        )
+        .unwrap();
+        append_feed_item(
+            &conn,
+            PEER,
+            &sub.subscription_id,
+            "message",
+            "eid_2",
+            2000,
+            &serde_json::json!({}),
+        )
+        .unwrap();
+        append_feed_item(
+            &conn,
+            PEER,
+            &sub.subscription_id,
+            "message",
+            "eid_3",
+            3000,
+            &serde_json::json!({}),
+        )
+        .unwrap();
 
         // Ack through seq 2
         ack_feed(&conn, PEER, &sub.subscription_id, 2).unwrap();
@@ -801,9 +963,26 @@ mod tests {
     #[test]
     fn test_ack_all_clears_dirty() {
         let conn = setup_db();
-        let sub = create_subscription(&conn, PEER, "test", "message", DeliveryMode::Full, &make_spec()).unwrap();
+        let sub = create_subscription(
+            &conn,
+            PEER,
+            "test",
+            "message",
+            DeliveryMode::Full,
+            &make_spec(),
+        )
+        .unwrap();
 
-        append_feed_item(&conn, PEER, &sub.subscription_id, "message", "eid_1", 1000, &serde_json::json!({})).unwrap();
+        append_feed_item(
+            &conn,
+            PEER,
+            &sub.subscription_id,
+            "message",
+            "eid_1",
+            1000,
+            &serde_json::json!({}),
+        )
+        .unwrap();
         ack_feed(&conn, PEER, &sub.subscription_id, 1).unwrap();
 
         let state = get_state(&conn, PEER, &sub.subscription_id).unwrap();
@@ -816,7 +995,15 @@ mod tests {
     #[test]
     fn test_mark_changed_increments_pending() {
         let conn = setup_db();
-        let sub = create_subscription(&conn, PEER, "test", "message", DeliveryMode::HasChanged, &make_spec()).unwrap();
+        let sub = create_subscription(
+            &conn,
+            PEER,
+            "test",
+            "message",
+            DeliveryMode::HasChanged,
+            &make_spec(),
+        )
+        .unwrap();
 
         let p1 = mark_changed(&conn, PEER, &sub.subscription_id, "eid_1", 1000).unwrap();
         assert_eq!(p1, 1);
@@ -832,7 +1019,15 @@ mod tests {
     #[test]
     fn test_ack_has_changed_resets_state() {
         let conn = setup_db();
-        let sub = create_subscription(&conn, PEER, "test", "message", DeliveryMode::HasChanged, &make_spec()).unwrap();
+        let sub = create_subscription(
+            &conn,
+            PEER,
+            "test",
+            "message",
+            DeliveryMode::HasChanged,
+            &make_spec(),
+        )
+        .unwrap();
 
         mark_changed(&conn, PEER, &sub.subscription_id, "eid_1", 1000).unwrap();
         mark_changed(&conn, PEER, &sub.subscription_id, "eid_2", 2000).unwrap();
@@ -849,8 +1044,25 @@ mod tests {
     #[test]
     fn test_delete_subscription() {
         let conn = setup_db();
-        let sub = create_subscription(&conn, PEER, "test", "message", DeliveryMode::Full, &make_spec()).unwrap();
-        append_feed_item(&conn, PEER, &sub.subscription_id, "message", "eid_1", 1000, &serde_json::json!({})).unwrap();
+        let sub = create_subscription(
+            &conn,
+            PEER,
+            "test",
+            "message",
+            DeliveryMode::Full,
+            &make_spec(),
+        )
+        .unwrap();
+        append_feed_item(
+            &conn,
+            PEER,
+            &sub.subscription_id,
+            "message",
+            "eid_1",
+            1000,
+            &serde_json::json!({}),
+        )
+        .unwrap();
 
         delete_subscription(&conn, PEER, &sub.subscription_id).unwrap();
 
@@ -863,8 +1075,24 @@ mod tests {
     #[test]
     fn test_subscriptions_isolated_by_peer() {
         let conn = setup_db();
-        create_subscription(&conn, "alice", "inbox", "message", DeliveryMode::Full, &make_spec()).unwrap();
-        create_subscription(&conn, "bob", "inbox", "message", DeliveryMode::Full, &make_spec()).unwrap();
+        create_subscription(
+            &conn,
+            "alice",
+            "inbox",
+            "message",
+            DeliveryMode::Full,
+            &make_spec(),
+        )
+        .unwrap();
+        create_subscription(
+            &conn,
+            "bob",
+            "inbox",
+            "message",
+            DeliveryMode::Full,
+            &make_spec(),
+        )
+        .unwrap();
 
         let alice_subs = list_subscriptions(&conn, "alice").unwrap();
         let bob_subs = list_subscriptions(&conn, "bob").unwrap();

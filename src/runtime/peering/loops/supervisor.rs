@@ -21,8 +21,8 @@ use crate::db::removal_watch::is_peer_removed;
 use crate::db::schema::create_tables;
 use crate::runtime::memtrace;
 use crate::sync::SyncSessionHandler;
-use crate::tuning::{low_mem_memtrace, low_mem_mode};
 use crate::transport::SessionProvider;
+use crate::tuning::{low_mem_memtrace, low_mem_mode};
 
 use super::{current_timestamp_ms, drain_batch_size, run_session, shared_ingest_cap, SESSION_GAP};
 

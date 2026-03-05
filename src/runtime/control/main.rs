@@ -531,7 +531,9 @@ enum DbAction {
 fn validate_request_envelope(v: &serde_json::Value) {
     if v.get("version").is_none() {
         eprintln!("error: request JSON must have a \"version\" field");
-        eprintln!("  Hint: did you mean --method-json? (auto-wraps in {{\"version\":1,\"method\":...}})");
+        eprintln!(
+            "  Hint: did you mean --method-json? (auto-wraps in {{\"version\":1,\"method\":...}})"
+        );
         eprintln!("  Full request format: {{\"version\":1,\"method\":{{\"type\":\"Status\"}}}}");
         std::process::exit(1);
     }
@@ -548,7 +550,10 @@ fn validate_request_envelope(v: &serde_json::Value) {
     if let Err(e) = serde_json::from_value::<RpcMethod>(v["method"].clone()) {
         eprintln!("error: invalid method in request: {}", e);
         if let Some(type_name) = v["method"].get("type").and_then(|t| t.as_str()) {
-            eprintln!("  Hint: run `topo rpc describe {}` to see required parameters", type_name);
+            eprintln!(
+                "  Hint: run `topo rpc describe {}` to see required parameters",
+                type_name
+            );
         }
         std::process::exit(1);
     }
@@ -770,9 +775,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 Some("error") => Level::ERROR,
                 _ => Level::WARN,
             };
-            let subscriber = FmtSubscriber::builder()
-                .with_max_level(level)
-                .finish();
+            let subscriber = FmtSubscriber::builder().with_max_level(level).finish();
             let _ = tracing::subscriber::set_global_default(subscriber);
         }
         _ => {}
@@ -953,12 +956,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
             if let Some(addr) = public_addr {
                 let sock = target_socket_path(db, socket_override.as_deref());
-                match rpc_call(&sock, RpcMethod::CreateInvite {
-                    public_addr: addr,
-                    public_spki: None,
-                }) {
+                match rpc_call(
+                    &sock,
+                    RpcMethod::CreateInvite {
+                        public_addr: addr,
+                        public_spki: None,
+                    },
+                ) {
                     Ok(resp) if resp.ok => {
-                        if let Some(link) = resp.data.as_ref().and_then(|d| d["invite_link"].as_str()) {
+                        if let Some(link) =
+                            resp.data.as_ref().and_then(|d| d["invite_link"].as_str())
+                        {
                             println!("invite:       {}", link);
                         }
                     }
@@ -1031,8 +1039,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
 
         Commands::UseTenant { index } => {
-            let data =
-                rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::UseTenant { index })?;
+            let data = rpc_require_daemon(
+                db,
+                socket_override.as_deref(),
+                RpcMethod::UseTenant { index },
+            )?;
             let peer_id = data["peer_id"].as_str().unwrap_or("");
             let ws_id = data["workspace_id"].as_str().unwrap_or("");
             println!(
@@ -1444,21 +1455,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
 
         Commands::EventTree => {
-            let data = rpc_require_daemon(
-                db,
-                socket_override.as_deref(),
-                RpcMethod::EventList,
-            )?;
+            let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::EventList)?;
             let resp: service::EventListResponse = serde_json::from_value(data)?;
             print_event_tree(&resp.events);
         }
 
         Commands::EventList => {
-            let data = rpc_require_daemon(
-                db,
-                socket_override.as_deref(),
-                RpcMethod::EventList,
-            )?;
+            let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::EventList)?;
             let resp: service::EventListResponse = serde_json::from_value(data)?;
             print_event_list(&resp.events);
         }
@@ -1479,7 +1482,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     attempt_window_ms,
                 },
             )?;
-            if data.get("sent_to_both").and_then(|v| v.as_bool()).unwrap_or(false) {
+            if data
+                .get("sent_to_both")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
                 println!("Intro sent to both peers");
             } else {
                 eprintln!("Intro failed: {}", data);
@@ -1733,7 +1740,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 },
             )?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&data).unwrap_or_default());
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&data).unwrap_or_default()
+                );
             } else if let Some(items) = data.as_array() {
                 if items.is_empty() {
                     println!("(no new items)");
@@ -1744,9 +1754,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         let eid = item["event_id"].as_str().unwrap_or("?");
                         let payload = &item["payload"];
                         if let Some(content) = payload["content"].as_str() {
-                            println!("  seq={} {} event={} content={:?}", seq, etype, &eid[..eid.len().min(12)], content);
+                            println!(
+                                "  seq={} {} event={} content={:?}",
+                                seq,
+                                etype,
+                                &eid[..eid.len().min(12)],
+                                content
+                            );
                         } else {
-                            println!("  seq={} {} event={}", seq, etype, &eid[..eid.len().min(12)]);
+                            println!(
+                                "  seq={} {} event={}",
+                                seq,
+                                etype,
+                                &eid[..eid.len().min(12)]
+                            );
                         }
                     }
                 }
@@ -1762,7 +1783,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 },
             )?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&data).unwrap_or_default());
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&data).unwrap_or_default()
+                );
             } else {
                 let pending = data["pending_count"].as_i64().unwrap_or(0);
                 let dirty = data["dirty"].as_bool().unwrap_or(false);
@@ -1773,7 +1797,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     pending,
                     dirty,
                     next_seq,
-                    if latest.is_empty() { "(none)" } else { &latest[..latest.len().min(12)] },
+                    if latest.is_empty() {
+                        "(none)"
+                    } else {
+                        &latest[..latest.len().min(12)]
+                    },
                 );
             }
         }
@@ -1819,10 +1847,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             RpcAction::Methods { json } => {
                 let methods = catalog::all_methods();
                 if json {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&methods).unwrap()
-                    );
+                    println!("{}", serde_json::to_string_pretty(&methods).unwrap());
                 } else {
                     println!("RPC METHODS ({}):\n", methods.len());
                     for m in methods {
@@ -1835,10 +1860,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 match catalog::describe(method) {
                     Some(info) => {
                         if json {
-                            println!(
-                                "{}",
-                                serde_json::to_string_pretty(&info).unwrap()
-                            );
+                            println!("{}", serde_json::to_string_pretty(&info).unwrap());
                         } else {
                             println!("{}:", info.name);
                             println!("  {}\n", info.purpose);
@@ -1895,53 +1917,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         }
                         std::process::exit(1);
                     }).unwrap();
-                    let method_val: serde_json::Value =
-                        serde_json::from_str(&mj).unwrap();
+                    let method_val: serde_json::Value = serde_json::from_str(&mj).unwrap();
                     serde_json::json!({
                         "version": PROTOCOL_VERSION,
                         "method": method_val
                     })
                 } else if let Some(rj) = request_json {
-                    let v: serde_json::Value = serde_json::from_str(&rj).map_err(|e| {
-                        eprintln!("error: invalid request JSON: {}", e);
-                        std::process::exit(1);
-                    }).unwrap();
+                    let v: serde_json::Value = serde_json::from_str(&rj)
+                        .map_err(|e| {
+                            eprintln!("error: invalid request JSON: {}", e);
+                            std::process::exit(1);
+                        })
+                        .unwrap();
                     validate_request_envelope(&v);
                     v
                 } else if let Some(path) = file {
-                    let contents = std::fs::read_to_string(&path).map_err(|e| {
-                        eprintln!("error: cannot read file {:?}: {}", path, e);
-                        std::process::exit(1);
-                    }).unwrap();
-                    let v: serde_json::Value = serde_json::from_str(&contents).map_err(|e| {
-                        eprintln!("error: invalid JSON in file {:?}: {}", path, e);
-                        std::process::exit(1);
-                    }).unwrap();
+                    let contents = std::fs::read_to_string(&path)
+                        .map_err(|e| {
+                            eprintln!("error: cannot read file {:?}: {}", path, e);
+                            std::process::exit(1);
+                        })
+                        .unwrap();
+                    let v: serde_json::Value = serde_json::from_str(&contents)
+                        .map_err(|e| {
+                            eprintln!("error: invalid JSON in file {:?}: {}", path, e);
+                            std::process::exit(1);
+                        })
+                        .unwrap();
                     validate_request_envelope(&v);
                     v
                 } else if stdin {
                     let mut buf = String::new();
-                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf).map_err(|e| {
-                        eprintln!("error: failed to read stdin: {}", e);
-                        std::process::exit(1);
-                    }).unwrap();
-                    let v: serde_json::Value = serde_json::from_str(&buf).map_err(|e| {
-                        eprintln!("error: invalid JSON from stdin: {}", e);
-                        std::process::exit(1);
-                    }).unwrap();
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
+                        .map_err(|e| {
+                            eprintln!("error: failed to read stdin: {}", e);
+                            std::process::exit(1);
+                        })
+                        .unwrap();
+                    let v: serde_json::Value = serde_json::from_str(&buf)
+                        .map_err(|e| {
+                            eprintln!("error: invalid JSON from stdin: {}", e);
+                            std::process::exit(1);
+                        })
+                        .unwrap();
                     validate_request_envelope(&v);
                     v
                 } else {
-                    eprintln!("error: specify one of --method-json, --request-json, --file, or --stdin");
+                    eprintln!(
+                        "error: specify one of --method-json, --request-json, --file, or --stdin"
+                    );
                     std::process::exit(1);
                 };
 
                 match rpc_call_raw(&sock, &request_value) {
                     Ok(resp) => {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&resp).unwrap()
-                        );
+                        println!("{}", serde_json::to_string_pretty(&resp).unwrap());
                         if !resp.ok {
                             std::process::exit(1);
                         }
@@ -2128,7 +2158,15 @@ fn print_tree_node(
         };
         for (i, kid) in kids.iter().enumerate() {
             let kid_is_last = i == kids.len() - 1;
-            print_tree_node(kid, &new_prefix, kid_is_last, false, children, event_map, parent_of);
+            print_tree_node(
+                kid,
+                &new_prefix,
+                kid_is_last,
+                false,
+                children,
+                event_map,
+                parent_of,
+            );
         }
     }
 }
@@ -2189,7 +2227,8 @@ fn print_event_list(events: &[service::EventListItem]) {
         let deps_str = if e.deps.is_empty() {
             String::new()
         } else {
-            let d = e.deps
+            let d = e
+                .deps
                 .iter()
                 .map(|(field, dep_id)| format!("{}: ({})", field, short_id(dep_id)))
                 .collect::<Vec<_>>()
@@ -2387,10 +2426,7 @@ fn show_messages_from_json(_db_path: &str, data: &serde_json::Value) {
                 };
                 if total > 0 && received < total {
                     let pct = (received as f64 / total as f64 * 100.0) as u32;
-                    println!(
-                        "        {}  {} ({}, {}%)",
-                        status, filename, size, pct
-                    );
+                    println!("        {}  {} ({}, {}%)", status, filename, size, pct);
                 } else {
                     println!("        {}  {} ({})", status, filename, size);
                 }

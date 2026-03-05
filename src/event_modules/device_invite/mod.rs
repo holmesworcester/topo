@@ -4,8 +4,8 @@ pub mod wire;
 
 pub use projector::project_pure;
 pub use wire::{
-    encode_device_invite, parse_device_invite, DeviceInviteEvent,
-    DEVICE_INVITE_META, DEVICE_INVITE_WIRE_SIZE,
+    encode_device_invite, parse_device_invite, DeviceInviteEvent, DEVICE_INVITE_META,
+    DEVICE_INVITE_WIRE_SIZE,
 };
 
 use rusqlite::Connection;

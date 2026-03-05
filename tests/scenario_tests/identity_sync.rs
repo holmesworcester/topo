@@ -3,9 +3,7 @@
 use std::time::Duration;
 use topo::crypto::event_id_to_base64;
 use topo::db::open_connection;
-use topo::testutil::{
-    assert_eventually, start_peers_pinned, Peer, ScenarioHarness,
-};
+use topo::testutil::{assert_eventually, start_peers_pinned, Peer, ScenarioHarness};
 
 struct BootstrapChain {
     workspace_key: ed25519_dalek::SigningKey,
@@ -52,8 +50,7 @@ fn bootstrap_peer(peer: &Peer) -> BootstrapChain {
     // 5. DeviceInvite (signed by user)
     let device_invite_key = SigningKey::generate(&mut rng);
     let device_invite_pubkey = device_invite_key.verifying_key().to_bytes();
-    let device_invite_eid =
-        peer.create_device_invite(device_invite_pubkey, &user_key, &user_eid);
+    let device_invite_eid = peer.create_device_invite(device_invite_pubkey, &user_key, &user_eid);
 
     // 6. PeerShared (signed by device_invite)
     let peer_shared_key = SigningKey::generate(&mut rng);
@@ -126,8 +123,7 @@ fn join_workspace(joiner: &Peer, alice_chain: &BootstrapChain, alice: &Peer) -> 
     // Joiner creates DeviceInvite (signed by joiner's user key)
     let device_invite_key = SigningKey::generate(&mut rng);
     let device_invite_pubkey = device_invite_key.verifying_key().to_bytes();
-    let device_invite_eid =
-        joiner.create_device_invite(device_invite_pubkey, &user_key, &user_eid);
+    let device_invite_eid = joiner.create_device_invite(device_invite_pubkey, &user_key, &user_eid);
 
     // Joiner creates PeerShared (signed by device invite)
     let peer_shared_key = SigningKey::generate(&mut rng);

@@ -17,9 +17,9 @@ use crate::crypto::{hash_event, EventId};
 use crate::db::{egress_queue::EgressQueue, store::Store};
 use crate::protocol::Frame;
 use crate::runtime::memtrace;
-use crate::tuning::low_mem_memtrace;
 use crate::transport::connection::ConnectionError;
 use crate::transport::{StreamRecv, StreamSend};
+use crate::tuning::low_mem_memtrace;
 
 use super::{egress_claim_count, enqueue_batch, have_chunk};
 

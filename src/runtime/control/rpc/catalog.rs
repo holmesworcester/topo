@@ -273,7 +273,5 @@ pub fn method_names() -> Vec<&'static str> {
 
 /// Look up a method by name (case-insensitive).
 pub fn describe(name: &str) -> Option<&'static MethodInfo> {
-    CATALOG
-        .iter()
-        .find(|m| m.name.eq_ignore_ascii_case(name))
+    CATALOG.iter().find(|m| m.name.eq_ignore_ascii_case(name))
 }

@@ -82,8 +82,8 @@ fn insert_event_raw(conn: &Connection, recorded_by: &str, blob: &[u8]) -> EventI
 }
 
 use crate::event_modules::{
-    DeviceInviteEvent, InviteAcceptedEvent, PeerSharedEvent, UserEvent,
-    UserInviteEvent, PeerEvent, TenantEvent,
+    DeviceInviteEvent, InviteAcceptedEvent, PeerEvent, PeerSharedEvent, TenantEvent, UserEvent,
+    UserInviteEvent,
 };
 
 /// Create a Workspace event, insert it, and mark it valid for this tenant.

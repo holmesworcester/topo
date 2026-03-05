@@ -322,6 +322,9 @@ mod tests {
             recorded_output, &persist_output,
             "effects should receive persist output directly"
         );
-        assert_eq!(*recorded_batch_size, 16, "effects should receive batch size");
+        assert_eq!(
+            *recorded_batch_size, 16,
+            "effects should receive batch size"
+        );
     }
 }

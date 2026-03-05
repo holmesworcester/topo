@@ -87,7 +87,8 @@ fn test_subscription_full_lifecycle() {
 
     // Poll feed
     let db = open_connection(&alice.db_path).unwrap();
-    let items = subscription::poll_feed(&db, &alice.identity, &sub.subscription_id, 0, 100).unwrap();
+    let items =
+        subscription::poll_feed(&db, &alice.identity, &sub.subscription_id, 0, 100).unwrap();
     assert_eq!(items.len(), 3, "expected 3 feed items, got {}", items.len());
     assert_eq!(items[0].seq, 1);
     assert_eq!(items[1].seq, 2);
@@ -110,7 +111,8 @@ fn test_subscription_full_lifecycle() {
     assert_eq!(state.pending_count, 1);
 
     // Only seq 3 remains
-    let items = subscription::poll_feed(&db, &alice.identity, &sub.subscription_id, 0, 100).unwrap();
+    let items =
+        subscription::poll_feed(&db, &alice.identity, &sub.subscription_id, 0, 100).unwrap();
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].seq, 3);
 
@@ -160,8 +162,14 @@ fn test_subscription_since_ms() {
     let _after2 = alice.create_message("after2");
 
     let db = open_connection(&alice.db_path).unwrap();
-    let items = subscription::poll_feed(&db, &alice.identity, &sub.subscription_id, 0, 100).unwrap();
-    assert_eq!(items.len(), 2, "expected 2 items after threshold, got {}", items.len());
+    let items =
+        subscription::poll_feed(&db, &alice.identity, &sub.subscription_id, 0, 100).unwrap();
+    assert_eq!(
+        items.len(),
+        2,
+        "expected 2 items after threshold, got {}",
+        items.len()
+    );
 
     harness.finish();
 }
@@ -201,8 +209,14 @@ fn test_subscription_since_event_id() {
     let _m2 = alice.create_message("after_cursor_2");
 
     let db = open_connection(&alice.db_path).unwrap();
-    let items = subscription::poll_feed(&db, &alice.identity, &sub.subscription_id, 0, 100).unwrap();
-    assert_eq!(items.len(), 2, "expected 2 items after cursor, got {}", items.len());
+    let items =
+        subscription::poll_feed(&db, &alice.identity, &sub.subscription_id, 0, 100).unwrap();
+    assert_eq!(
+        items.len(),
+        2,
+        "expected 2 items after cursor, got {}",
+        items.len()
+    );
 
     harness.finish();
 }
@@ -238,7 +252,8 @@ fn test_subscription_has_changed_mode() {
     let db = open_connection(&alice.db_path).unwrap();
 
     // No feed rows for has_changed mode
-    let items = subscription::poll_feed(&db, &alice.identity, &sub.subscription_id, 0, 100).unwrap();
+    let items =
+        subscription::poll_feed(&db, &alice.identity, &sub.subscription_id, 0, 100).unwrap();
     assert_eq!(items.len(), 0);
 
     // But state should show pending changes
@@ -285,7 +300,8 @@ fn test_subscription_filter_by_author() {
     alice.create_message("from alice");
 
     let db = open_connection(&alice.db_path).unwrap();
-    let items = subscription::poll_feed(&db, &alice.identity, &sub.subscription_id, 0, 100).unwrap();
+    let items =
+        subscription::poll_feed(&db, &alice.identity, &sub.subscription_id, 0, 100).unwrap();
     assert_eq!(items.len(), 1);
 
     harness.finish();
@@ -316,8 +332,13 @@ fn test_subscription_filter_rejects_non_matching_author() {
     alice.create_message("from alice, but sub filters for someone else");
 
     let db = open_connection(&alice.db_path).unwrap();
-    let items = subscription::poll_feed(&db, &alice.identity, &sub.subscription_id, 0, 100).unwrap();
-    assert_eq!(items.len(), 0, "filter should have excluded alice's message");
+    let items =
+        subscription::poll_feed(&db, &alice.identity, &sub.subscription_id, 0, 100).unwrap();
+    assert_eq!(
+        items.len(),
+        0,
+        "filter should have excluded alice's message"
+    );
 
     harness.finish();
 }
@@ -348,7 +369,8 @@ fn test_subscription_id_delivery_mode() {
     alice.create_message("hello");
 
     let db = open_connection(&alice.db_path).unwrap();
-    let items = subscription::poll_feed(&db, &alice.identity, &sub.subscription_id, 0, 100).unwrap();
+    let items =
+        subscription::poll_feed(&db, &alice.identity, &sub.subscription_id, 0, 100).unwrap();
     assert_eq!(items.len(), 1);
 
     // Id mode: has event_id and created_at_ms, but no content
@@ -386,7 +408,8 @@ fn test_disabled_subscription_skipped() {
     alice.create_message("should not be delivered");
 
     let db = open_connection(&alice.db_path).unwrap();
-    let items = subscription::poll_feed(&db, &alice.identity, &sub.subscription_id, 0, 100).unwrap();
+    let items =
+        subscription::poll_feed(&db, &alice.identity, &sub.subscription_id, 0, 100).unwrap();
     assert_eq!(items.len(), 0, "disabled sub should not receive events");
 
     // Re-enable and send another
@@ -396,7 +419,8 @@ fn test_disabled_subscription_skipped() {
     alice.create_message("should be delivered");
 
     let db = open_connection(&alice.db_path).unwrap();
-    let items = subscription::poll_feed(&db, &alice.identity, &sub.subscription_id, 0, 100).unwrap();
+    let items =
+        subscription::poll_feed(&db, &alice.identity, &sub.subscription_id, 0, 100).unwrap();
     assert_eq!(items.len(), 1, "re-enabled sub should receive events");
 
     harness.finish();
@@ -448,19 +472,24 @@ fn test_multiple_subscriptions_independent() {
     let db = open_connection(&alice.db_path).unwrap();
 
     // Full: 1 feed item with content
-    let full_items = subscription::poll_feed(&db, &alice.identity, &sub_full.subscription_id, 0, 100).unwrap();
+    let full_items =
+        subscription::poll_feed(&db, &alice.identity, &sub_full.subscription_id, 0, 100).unwrap();
     assert_eq!(full_items.len(), 1);
     assert!(full_items[0].payload["content"].is_string());
 
     // Id: 1 feed item without content
-    let id_items = subscription::poll_feed(&db, &alice.identity, &sub_id.subscription_id, 0, 100).unwrap();
+    let id_items =
+        subscription::poll_feed(&db, &alice.identity, &sub_id.subscription_id, 0, 100).unwrap();
     assert_eq!(id_items.len(), 1);
     assert!(id_items[0].payload.get("content").is_none());
 
     // HasChanged: no feed items, but state updated
-    let changed_items = subscription::poll_feed(&db, &alice.identity, &sub_changed.subscription_id, 0, 100).unwrap();
+    let changed_items =
+        subscription::poll_feed(&db, &alice.identity, &sub_changed.subscription_id, 0, 100)
+            .unwrap();
     assert_eq!(changed_items.len(), 0);
-    let state = subscription::get_state(&db, &alice.identity, &sub_changed.subscription_id).unwrap();
+    let state =
+        subscription::get_state(&db, &alice.identity, &sub_changed.subscription_id).unwrap();
     assert_eq!(state.pending_count, 1);
 
     harness.finish();
@@ -494,7 +523,8 @@ fn test_feed_ordering_deterministic() {
     }
 
     let db = open_connection(&alice.db_path).unwrap();
-    let items = subscription::poll_feed(&db, &alice.identity, &sub.subscription_id, 0, 100).unwrap();
+    let items =
+        subscription::poll_feed(&db, &alice.identity, &sub.subscription_id, 0, 100).unwrap();
     assert_eq!(items.len(), 10);
 
     // Verify seq is strictly ascending
@@ -539,7 +569,8 @@ fn test_non_message_events_ignored() {
     let _rxn_eid = alice.create_reaction(&msg_eid, "thumbs_up");
 
     let db = open_connection(&alice.db_path).unwrap();
-    let items = subscription::poll_feed(&db, &alice.identity, &sub.subscription_id, 0, 100).unwrap();
+    let items =
+        subscription::poll_feed(&db, &alice.identity, &sub.subscription_id, 0, 100).unwrap();
     assert_eq!(items.len(), 1, "only message should appear, not reaction");
     assert_eq!(items[0].event_type, "message");
 
@@ -574,8 +605,13 @@ fn test_encrypted_message_triggers_subscription() {
     let _enc_eid = alice.create_encrypted_message(&key_eid, "secret hello");
 
     let db = open_connection(&alice.db_path).unwrap();
-    let items = subscription::poll_feed(&db, &alice.identity, &sub.subscription_id, 0, 100).unwrap();
-    assert_eq!(items.len(), 1, "encrypted message should trigger subscription");
+    let items =
+        subscription::poll_feed(&db, &alice.identity, &sub.subscription_id, 0, 100).unwrap();
+    assert_eq!(
+        items.len(),
+        1,
+        "encrypted message should trigger subscription"
+    );
 
     // Payload should contain the decrypted content
     assert_eq!(items[0].payload["content"], "secret hello");
@@ -616,7 +652,8 @@ fn test_subscription_persists_across_db_reopen() {
     assert_eq!(subs.len(), 1);
     assert_eq!(subs[0].name, "persistent");
 
-    let items = subscription::poll_feed(&db, &alice.identity, &sub.subscription_id, 0, 100).unwrap();
+    let items =
+        subscription::poll_feed(&db, &alice.identity, &sub.subscription_id, 0, 100).unwrap();
     assert_eq!(items.len(), 1, "feed should survive DB reopen");
 
     let state = subscription::get_state(&db, &alice.identity, &sub.subscription_id).unwrap();

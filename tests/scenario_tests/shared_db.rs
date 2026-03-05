@@ -1,9 +1,7 @@
 use std::time::Duration;
 use topo::crypto::event_id_to_base64;
 use topo::db::open_connection;
-use topo::testutil::{
-    assert_eventually, start_peers_pinned, Peer, ScenarioHarness, SharedDbNode,
-};
+use topo::testutil::{assert_eventually, start_peers_pinned, Peer, ScenarioHarness, SharedDbNode};
 use topo::transport::extract_spki_fingerprint;
 
 #[tokio::test]

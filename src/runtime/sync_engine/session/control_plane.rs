@@ -14,8 +14,8 @@ use crate::crypto::EventId;
 use crate::db::need_queue::NeedQueue;
 use crate::db::wanted::WantedEvents;
 use crate::protocol::{neg_id_to_event_id, Frame};
-use crate::tuning::{low_mem_mode, low_mem_wanted_high_watermark, low_mem_wanted_low_watermark};
 use crate::transport::StreamConn;
+use crate::tuning::{low_mem_mode, low_mem_wanted_high_watermark, low_mem_wanted_low_watermark};
 
 use super::coordinator::PeerCoord;
 use super::need_chunk;
@@ -129,7 +129,11 @@ where
                 let _ = wanted.insert(event_id);
             }
             let queued_len = queued.len();
-            control.send(&Frame::HaveList { ids: queued.clone() }).await?;
+            control
+                .send(&Frame::HaveList {
+                    ids: queued.clone(),
+                })
+                .await?;
             control.flush().await?;
             let _ = need_queue.remove_many(peer_id, &queued)?;
             queued_dispatched += queued_len;

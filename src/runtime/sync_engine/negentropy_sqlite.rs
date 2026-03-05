@@ -68,9 +68,9 @@ impl<'a> NegentropyStorageSqlite<'a> {
         // before any events are stored, so no empty-workspace_id fallback
         // is needed. This uses the (workspace_id, ts, id) primary key
         // directly — no temp B-tree sort.
-        let mut stmt = self.conn.prepare(
-            "SELECT ts, id FROM neg_items WHERE workspace_id = ?1 ORDER BY ts, id"
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT ts, id FROM neg_items WHERE workspace_id = ?1 ORDER BY ts, id")?;
 
         let mut insert_stmt = self.conn.prepare(
             "INSERT INTO session_blocks (block_idx, ts, id, count) VALUES (?1, ?2, ?3, ?4)",

@@ -1,9 +1,7 @@
 use std::time::Duration;
 use topo::crypto::{event_id_from_base64, event_id_to_base64};
 use topo::db::open_connection;
-use topo::testutil::{
-    assert_eventually, start_peers_pinned, Peer, ScenarioHarness,
-};
+use topo::testutil::{assert_eventually, start_peers_pinned, Peer, ScenarioHarness};
 
 /// Integration test: Alice creates message + reactions, syncs to Bob. Alice deletes message.
 /// Bob syncs again. Verify: Bob has tombstone, no message, no reactions.

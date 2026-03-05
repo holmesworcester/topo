@@ -240,8 +240,7 @@ pub fn view(
     let msg_resp = message::list(db, recorded_by, limit)?;
 
     // Load client_op_id mappings for annotation
-    let client_ops = crate::db::local_client_ops::all_mappings(db, recorded_by)
-        .unwrap_or_default();
+    let client_ops = crate::db::local_client_ops::all_mappings(db, recorded_by).unwrap_or_default();
 
     // Reactions per message
     let mut view_messages = Vec::with_capacity(msg_resp.messages.len());

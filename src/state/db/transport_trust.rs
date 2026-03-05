@@ -544,6 +544,5 @@ pub fn list_active_invite_bootstrap_addrs(
     Ok(rows)
 }
 
-
 #[cfg(test)]
 mod tests;

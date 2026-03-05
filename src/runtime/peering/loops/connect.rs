@@ -397,7 +397,9 @@ fn is_stale_dial_failure(err: &ConnectionLifecycleError) -> bool {
                 || m.contains("unreachable")
         }
         ConnectionLifecycleError::DialTrustRejected(_) => false,
-        ConnectionLifecycleError::Accept(_) | ConnectionLifecycleError::MissingPeerIdentity => false,
+        ConnectionLifecycleError::Accept(_) | ConnectionLifecycleError::MissingPeerIdentity => {
+            false
+        }
     }
 }
 
@@ -480,9 +482,8 @@ mod tests {
 
     #[test]
     fn stale_classifier_marks_timeout_like_dial_errors() {
-        let err = ConnectionLifecycleError::Dial(
-            "handshake to 127.0.0.1:4433: timed out".to_string(),
-        );
+        let err =
+            ConnectionLifecycleError::Dial("handshake to 127.0.0.1:4433: timed out".to_string());
         assert!(is_stale_dial_failure(&err));
     }
 

@@ -4,8 +4,7 @@ use super::super::{EventError, ParsedEvent, EVENT_TYPE_USER_INVITE};
 
 /// UserInvite (type 10): type(1) + created_at(8) + public_key(32) + workspace_id(32)
 /// + signed_by(32) + signer_type(1) + signature(64) = 170
-pub const USER_INVITE_WIRE_SIZE: usize =
-    COMMON_HEADER_BYTES + 32 + 32 + SIGNATURE_TRAILER_BYTES;
+pub const USER_INVITE_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32 + 32 + SIGNATURE_TRAILER_BYTES;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserInviteEvent {
@@ -21,7 +20,10 @@ impl super::super::Describe for UserInviteEvent {
     fn human_fields(&self) -> Vec<(&'static str, String)> {
         vec![
             ("public_key", super::super::trunc_hex(&self.public_key, 16)),
-            ("workspace_id", super::super::short_id_b64(&self.workspace_id)),
+            (
+                "workspace_id",
+                super::super::short_id_b64(&self.workspace_id),
+            ),
         ]
     }
 }

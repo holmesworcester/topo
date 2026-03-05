@@ -25,11 +25,11 @@ use crate::peering::loops::{
     connect_loop_with_coordination_until_cancel_with_fallback, IntroSpawnerFn,
 };
 use crate::sync::CoordinationManager;
-use crate::tuning::shared_ingest_cap;
 use crate::transport::{
     build_tenant_bootstrap_fallback_client_config_from_db, build_tenant_client_config_from_db,
     TenantClientConfigs, TransportClientConfig, TransportEndpoint,
 };
+use crate::tuning::shared_ingest_cap;
 
 use super::target_planner::{
     bootstrap_dispatch_key, collect_all_bootstrap_targets, discovery_dispatch_key,

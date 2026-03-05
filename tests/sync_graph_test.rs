@@ -483,10 +483,7 @@ async fn run_catchup_large_file(
         "floor must be > 0 for meaningful source distribution check"
     );
     // Count how many distinct sources contributed at least floor slices
-    let contributing = source_counts
-        .values()
-        .filter(|&&c| c >= floor)
-        .count();
+    let contributing = source_counts.values().filter(|&&c| c >= floor).count();
     assert!(
         min_contributing_sources >= 1 && min_contributing_sources <= source_count,
         "invalid min_contributing_sources={} for source_count={}",
@@ -595,7 +592,11 @@ async fn catchup_non_uniform_sources() {
 
     // Verify every source's unique events made it to the sink
     for (src_idx, ids) in unique_ids.iter().enumerate() {
-        let missing: Vec<&str> = ids.iter().filter(|id| !sink.has_event(id)).map(|s| s.as_str()).collect();
+        let missing: Vec<&str> = ids
+            .iter()
+            .filter(|id| !sink.has_event(id))
+            .map(|s| s.as_str())
+            .collect();
         assert!(
             missing.is_empty(),
             "source {} has {} unique events missing at sink (first: {:?})",
@@ -606,7 +607,10 @@ async fn catchup_non_uniform_sources() {
     }
 
     eprintln!();
-    eprintln!("=== Non-uniform sources: {} sources, {} shared + {} unique/source ===", source_count, shared_count, unique_per_source);
+    eprintln!(
+        "=== Non-uniform sources: {} sources, {} shared + {} unique/source ===",
+        source_count, shared_count, unique_per_source
+    );
     eprintln!("  Total expected: {}", total_expected);
     eprintln!("  Sink received:  {}", sink.stored_message_event_count());
     eprintln!("  Wall time:      {} ms", wall_ms);
@@ -666,7 +670,10 @@ async fn catchup_dead_peer_dropout() {
     drop(dl_handles);
 
     eprintln!();
-    eprintln!("=== Dead peer dropout: {} sources, source[2] killed, {} events ===", source_count, event_count);
+    eprintln!(
+        "=== Dead peer dropout: {} sources, source[2] killed, {} events ===",
+        source_count, event_count
+    );
     eprintln!("  Expected: {}", expected_count);
     eprintln!("  Sink received: {}", sink.stored_message_event_count());
     eprintln!("  Wall time: {} ms", wall_ms);

@@ -5,10 +5,10 @@
 
 #[cfg(test)]
 pub mod fixtures {
-    use topo::projection::decision::ProjectionDecision;
     use topo::projection::contract::{
         BootstrapContextSnapshot, ContextSnapshot, EmitCommand, ProjectorResult, WriteOp,
     };
+    use topo::projection::decision::ProjectionDecision;
 
     /// Default ContextSnapshot with all fields at their zero/empty/false defaults.
     pub fn empty_ctx() -> ContextSnapshot {

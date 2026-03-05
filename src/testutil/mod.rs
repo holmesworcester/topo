@@ -623,8 +623,7 @@ impl Peer {
             created_at_ms: current_timestamp_ms(),
             peer_event_id,
         });
-        create_event_synchronous(db, &self.identity, &tenant_evt)
-            .expect("failed to create tenant")
+        create_event_synchronous(db, &self.identity, &tenant_evt).expect("failed to create tenant")
     }
 
     /// Create a UserInvite event (signed by workspace key). Returns the event ID.

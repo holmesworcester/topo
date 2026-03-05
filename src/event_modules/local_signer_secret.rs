@@ -16,13 +16,19 @@ pub struct LocalSignerSecretEvent {
 impl super::Describe for LocalSignerSecretEvent {
     fn human_fields(&self) -> Vec<(&'static str, String)> {
         vec![
-            ("signer_event_id", super::short_id_b64(&self.signer_event_id)),
-            ("signer_kind", match self.signer_kind {
-                SIGNER_KIND_WORKSPACE => "workspace".into(),
-                SIGNER_KIND_USER => "user".into(),
-                SIGNER_KIND_PEER_SHARED => "peer_shared".into(),
-                k => format!("unknown({})", k),
-            }),
+            (
+                "signer_event_id",
+                super::short_id_b64(&self.signer_event_id),
+            ),
+            (
+                "signer_kind",
+                match self.signer_kind {
+                    SIGNER_KIND_WORKSPACE => "workspace".into(),
+                    SIGNER_KIND_USER => "user".into(),
+                    SIGNER_KIND_PEER_SHARED => "peer_shared".into(),
+                    k => format!("unknown({})", k),
+                },
+            ),
         ]
     }
 }

@@ -103,7 +103,13 @@ pub fn project_pure(
 
     ProjectorResult::valid(vec![WriteOp::InsertOrIgnore {
         table: "peers_local",
-        columns: vec!["recorded_by", "event_id", "public_key", "peer_id", "created_at"],
+        columns: vec![
+            "recorded_by",
+            "event_id",
+            "public_key",
+            "peer_id",
+            "created_at",
+        ],
         values: vec![
             SqlVal::Text(recorded_by.to_string()),
             SqlVal::Text(event_id_b64.to_string()),

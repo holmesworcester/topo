@@ -240,10 +240,7 @@ pub struct PeerItem {
 /// Joins `peers_shared` → `users` for display names, checks
 /// `local_transport_creds` for local flag, and picks the most recent
 /// non-expired `peer_endpoint_observations` row for endpoint info.
-pub fn list_peers(
-    db: &Connection,
-    recorded_by: &str,
-) -> Result<Vec<PeerItem>, rusqlite::Error> {
+pub fn list_peers(db: &Connection, recorded_by: &str) -> Result<Vec<PeerItem>, rusqlite::Error> {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -361,7 +358,8 @@ mod tests {
             "INSERT INTO local_transport_creds (peer_id, cert_der, key_der, created_at, source)
              VALUES (?1, X'AA', X'BB', 1000, 'random')",
             rusqlite::params![local_tf_hex],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO users (recorded_by, event_id, public_key, username)
              VALUES (?1, 'user-1', X'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', 'alice')",
@@ -423,7 +421,8 @@ mod tests {
              (recorded_by, via_peer_id, origin_ip, origin_port, observed_at, expires_at)
              VALUES (?1, ?2, '10.0.0.5', 4433, ?3, ?4)",
             rusqlite::params![recorded_by, tf_hex, now_ms - 1000, now_ms + 86400000],
-        ).unwrap();
+        )
+        .unwrap();
 
         let peers = list_peers(&conn, recorded_by).unwrap();
         assert_eq!(peers.len(), 1);
@@ -456,11 +455,15 @@ mod tests {
              (recorded_by, via_peer_id, origin_ip, origin_port, observed_at, expires_at)
              VALUES (?1, ?2, '10.0.0.6', 5555, ?3, ?4)",
             rusqlite::params![recorded_by, tf_hex, now_ms - 100000, now_ms - 1000],
-        ).unwrap();
+        )
+        .unwrap();
 
         let peers = list_peers(&conn, recorded_by).unwrap();
         assert_eq!(peers.len(), 1);
-        assert!(peers[0].endpoint.is_none(), "expired endpoint should not appear");
+        assert!(
+            peers[0].endpoint.is_none(),
+            "expired endpoint should not appear"
+        );
     }
 
     #[test]

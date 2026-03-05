@@ -19,7 +19,10 @@ pub struct InviteAcceptedEvent {
 impl super::Describe for InviteAcceptedEvent {
     fn human_fields(&self) -> Vec<(&'static str, String)> {
         vec![
-            ("invite_event_id", super::short_id_b64(&self.invite_event_id)),
+            (
+                "invite_event_id",
+                super::short_id_b64(&self.invite_event_id),
+            ),
             ("workspace_id", super::short_id_b64(&self.workspace_id)),
         ]
     }

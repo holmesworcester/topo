@@ -55,7 +55,8 @@ pub(super) fn run_persist_phase(
                         } else {
                             tracing::warn!(
                                 "no trust anchor for {}, skipping neg_items for {}",
-                                recorded_by, event_id_b64
+                                recorded_by,
+                                event_id_b64
                             );
                             None
                         };
@@ -67,7 +68,11 @@ pub(super) fn run_persist_phase(
                             ]) {
                                 // Non-fatal: neg_items is a reconciliation cache;
                                 // event will be re-added on next sync session.
-                                tracing::warn!("neg_items insert error for {}: {}", event_id_b64, e);
+                                tracing::warn!(
+                                    "neg_items insert error for {}: {}",
+                                    event_id_b64,
+                                    e
+                                );
                             }
                         }
                     }
@@ -106,9 +111,12 @@ pub(super) fn run_persist_phase(
 
                     persist_output.tenants_seen.insert(recorded_by.clone());
                     persist_output.persisted_event_ids.push(*event_id);
-                } else {}
-            } else {}
-        } else {}
+                } else {
+                }
+            } else {
+            }
+        } else {
+        }
     }
 
     persist_output

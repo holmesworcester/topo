@@ -14,7 +14,10 @@ pub struct InvitePrivkeyEvent {
 impl super::Describe for InvitePrivkeyEvent {
     fn human_fields(&self) -> Vec<(&'static str, String)> {
         vec![
-            ("invite_event_id", super::short_id_b64(&self.invite_event_id)),
+            (
+                "invite_event_id",
+                super::short_id_b64(&self.invite_event_id),
+            ),
             ("private_key", super::trunc_hex(&self.private_key_bytes, 16)),
         ]
     }

@@ -102,7 +102,8 @@ mod tests {
             "INSERT INTO file_slices (recorded_by, file_id, slice_number, event_id, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             rusqlite::params!["peer1", "file1", 0, "slice_evt1", 1001],
-        ).unwrap();
+        )
+        .unwrap();
 
         let result = list_for_message(&db, "peer1", "msg1").unwrap();
         assert_eq!(result.len(), 1);
@@ -114,7 +115,8 @@ mod tests {
             "INSERT INTO file_slices (recorded_by, file_id, slice_number, event_id, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             rusqlite::params!["peer1", "file1", 1, "slice_evt2", 1002],
-        ).unwrap();
+        )
+        .unwrap();
 
         let result = list_for_message(&db, "peer1", "msg1").unwrap();
         assert_eq!(result[0].slices_received, 2);

@@ -4,8 +4,7 @@ pub mod wire;
 
 pub use projector::project_pure;
 pub use wire::{
-    encode_user_invite, parse_user_invite, UserInviteEvent, USER_INVITE_META,
-    USER_INVITE_WIRE_SIZE,
+    encode_user_invite, parse_user_invite, UserInviteEvent, USER_INVITE_META, USER_INVITE_WIRE_SIZE,
 };
 
 use rusqlite::Connection;

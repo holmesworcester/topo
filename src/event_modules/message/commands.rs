@@ -3,8 +3,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::crypto::EventId;
 use crate::event_modules::file_slice::FILE_SLICE_CIPHERTEXT_BYTES;
-use crate::projection::create::create_signed_event_synchronous;
 use crate::projection::create::create_event_synchronous;
+use crate::projection::create::create_signed_event_synchronous;
 use crate::service::open_db_for_peer;
 use ed25519_dalek::SigningKey;
 use rusqlite::Connection;
@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use super::super::message_deletion::MessageDeletionEvent;
 use super::super::peer_shared;
 use super::super::workspace;
-use super::super::{FileSliceEvent, MessageAttachmentEvent, SecretKeyEvent};
 use super::super::ParsedEvent;
+use super::super::{FileSliceEvent, MessageAttachmentEvent, SecretKeyEvent};
 use super::wire::MessageEvent;
 
 fn current_timestamp_ms() -> u64 {
@@ -272,13 +272,11 @@ pub fn generate_files_for_peer(
     files: usize,
     file_size_mib: usize,
 ) -> Result<GenerateFilesResponse, Box<dyn std::error::Error + Send + Sync>> {
-    let slices_per_file =
-        slices_for_file_size_mib(file_size_mib).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
-    let total_slices = files
-        .checked_mul(slices_per_file)
-        .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
-            "total_slices overflow".into()
-        })?;
+    let slices_per_file = slices_for_file_size_mib(file_size_mib)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+    let total_slices = files.checked_mul(slices_per_file).ok_or_else(
+        || -> Box<dyn std::error::Error + Send + Sync> { "total_slices overflow".into() },
+    )?;
 
     let (recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
     let (signer_eid, signing_key) =
@@ -424,8 +422,8 @@ pub fn send_file_for_peer(
     file_path: &str,
 ) -> Result<SendFileResponse, Box<dyn std::error::Error + Send + Sync>> {
     let path = Path::new(file_path);
-    let file_data = std::fs::read(path)
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+    let file_data =
+        std::fs::read(path).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
             format!("failed to read {}: {}", file_path, e).into()
         })?;
     let file_size = file_data.len() as u64;

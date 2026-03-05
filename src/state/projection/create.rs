@@ -383,8 +383,7 @@ mod tests {
     use crate::db::{open_in_memory, schema::create_tables};
     use crate::event_modules::{
         DeviceInviteEvent, InviteAcceptedEvent, MessageEvent, PeerEvent, PeerSharedEvent,
-        ReactionEvent, UserEvent, UserInviteEvent, WorkspaceEvent,
-        TenantEvent,
+        ReactionEvent, TenantEvent, UserEvent, UserInviteEvent, WorkspaceEvent,
     };
     use ed25519_dalek::SigningKey;
 

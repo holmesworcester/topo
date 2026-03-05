@@ -134,28 +134,40 @@ pub(crate) fn apply_projection(
         let resolution = resolve_signer_key(conn, recorded_by, signer_type, &signer_event_id)?;
         match resolution {
             SignerResolution::NotFound => {
-                return Ok((ProjectionDecision::Reject {
-                    reason: "signer key not found".to_string(),
-                }, None));
+                return Ok((
+                    ProjectionDecision::Reject {
+                        reason: "signer key not found".to_string(),
+                    },
+                    None,
+                ));
             }
             SignerResolution::Invalid(msg) => {
-                return Ok((ProjectionDecision::Reject {
-                    reason: format!("signer resolution failed: {}", msg),
-                }, None));
+                return Ok((
+                    ProjectionDecision::Reject {
+                        reason: format!("signer resolution failed: {}", msg),
+                    },
+                    None,
+                ));
             }
             SignerResolution::Found(key) => {
                 let sig_len = meta.signature_byte_len;
                 if blob.len() < sig_len {
-                    return Ok((ProjectionDecision::Reject {
-                        reason: "blob too short for signature".to_string(),
-                    }, None));
+                    return Ok((
+                        ProjectionDecision::Reject {
+                            reason: "blob too short for signature".to_string(),
+                        },
+                        None,
+                    ));
                 }
                 let signing_bytes = &blob[..blob.len() - sig_len];
                 let sig_bytes = &blob[blob.len() - sig_len..];
                 if !verify_ed25519_signature(&key, signing_bytes, sig_bytes) {
-                    return Ok((ProjectionDecision::Reject {
-                        reason: "invalid signature".to_string(),
-                    }, None));
+                    return Ok((
+                        ProjectionDecision::Reject {
+                            reason: "invalid signature".to_string(),
+                        },
+                        None,
+                    ));
                 }
             }
         }

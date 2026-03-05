@@ -290,12 +290,12 @@ async fn test_run_node_multitenant_outbound_isolation() {
     use topo::db::transport_trust::{import_cli_pins_to_sql, is_peer_allowed};
     use topo::event_pipeline::batch_writer;
     use topo::peering::loops::accept_loop_with_ingest;
+    use topo::peering::loops::connect_loop;
     use topo::transport::{
         create_single_port_endpoint,
         multi_workspace::{workspace_sni, WorkspaceCertResolver},
         workspace_client_config, DynamicAllowFn,
     };
-    use topo::peering::loops::connect_loop;
 
     // --- Two multi-tenant nodes ---
     let node_a = SharedDbNode::new(2);
