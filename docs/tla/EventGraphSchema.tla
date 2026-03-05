@@ -185,8 +185,8 @@ ASSUME Workspaces \cap FullEventTypes = {}
 RawDeps(e) ==
     IF IsWorkspaceEvent(e) THEN {}
     ELSE
-    CASE e = Peer -> {}
-       [] e = Tenant -> {Peer}
+    CASE e = Peer -> {Tenant}
+       [] e = Tenant -> {}
        [] e = InviteAccepted -> {Tenant}
 
        \* user_invite: no raw deps beyond signer
@@ -215,10 +215,13 @@ RawDeps(e) ==
        [] e = FileSlice -> {}
 
        \* Encryption: secret is local (deterministic event ID from key bytes);
-       \* secret_shared wraps key to invite recipient and depends on invite_privkey.
+       \* secret_shared wraps key to invite recipient and depends on:
+       \*   - recipient invite event (user_invite/device_invite),
+       \*   - local invite_privkey event used to unwrap.
+       \* key_event_id remains a materialization hint, not a hard dep.
        \* encrypted depends on secret.
        [] e = Secret -> {}
-       [] e = SecretShared -> {InvitePrivkey}
+       [] e = SecretShared -> InviteEvents \cup {InvitePrivkey}
        [] e = Encrypted -> {Secret}
 
        \* Removal: depends on the entity being removed

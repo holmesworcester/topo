@@ -653,9 +653,10 @@ Usually not required at this stage, but useful if blocker behavior gets ambiguou
 - verify multi-blocker convergence and no-lost-unblock behavior,
 - then map those guards directly into projector dependency checks.
 
-TODO (pending model sync after tenant/peer root inversion):
-- update TLA models/spec mappings so `tenant` is root (no deps) and `peer` depends on `tenant_event_id`,
-- re-run TLC configs and refresh `docs/tla/projector_spec.md` mapping notes.
+TLA sync status (done):
+- `EventGraphSchema.tla` models `tenant` as root (no deps) and `peer` as dependent on `tenant_event_id`.
+- `secret_shared` models direct dependency on both recipient invite event and `invite_privkey` unwrap event.
+- Re-run TLC configs and refresh `docs/tla/projector_spec.md` mapping notes when dependency semantics change next.
 
 ## 6.6 Phase 6: Shared signer substrate (required before identity)
 
@@ -1132,6 +1133,14 @@ Required behavior:
   - peer_shared projector consumes matching bootstrap trust rows via deterministic `WriteOp::Delete`,
   - trust rows are looked up by sync on each connection/handshake (no in-memory-only trust authority).
   - this follows the same poc-6 cascade pattern where `invite_accepted` projection drives trust-anchor establishment and workspace event unblocking.
+
+TODO (naming and projection simplification):
+- Add an `invites_accepted` projection table owned by the `invite_accepted` projector (event-to-own-table clarity).
+- Migrate trust-anchor reads to `invites_accepted` and retire `trust_anchors` after compatibility transition.
+- Keep gating in both places:
+  - `invite_accepted` projector enforces first-write-wins workspace binding for the tenant scope and emits retry/unblock intent for matching blocked workspace events.
+  - `workspace` projector validates that a matching accepted-invite row already exists in `invites_accepted`.
+- End state: trust-anchor authority derives from `invite_accepted` projection rows only; no separate vague authority table.
 
 Self-invite bootstrap sequence must stay explicit:
 1. create `workspace` event (integrity self-sign only).

@@ -11,28 +11,30 @@ Changes to this document require TLA+ model re-verification.
 | 3 | Retired (code reserved) | Peer (legacy) | — | — | — | — | — | — |
 | 4 | Retired (code reserved) | — | — | — | — | — | — | — |
 | 5 | Encrypted | Encrypted | 70+inner_size | Shared | No | No | 0 | — |
-| 6 | SecretKey | SecretKey | 41B | Local | Yes | No | 0 | — |
+| 6 | Secret | Secret | 41B | Local | Yes | No | 0 | — |
 | 7 | MessageDeletion | MessageDeletion | 170B | Shared | Yes | Yes | 64 | runtime (1..5) |
-| 8 | Workspace | Workspace | 73B | Shared | No | No | 0 | — |
-| 9 | InviteAccepted | InviteAccepted | 73B | Local | No | No | 0 | — |
+| 8 | Workspace | Workspace | 105B | Shared | No | No | 0 | — |
+| 9 | InviteAccepted | InviteAccepted | 105B | Local | No | No | 0 | — |
 | 10 | UserInvite | UserInvite | 170B | Shared | No | Yes | 64 | 1 (workspace) |
 | 11 | Retired (code reserved) | — | — | — | — | — | — | — |
 | 12 | DeviceInvite | DeviceInvite | 138B | Shared | No | Yes | 64 | 4 (user) |
 | 13 | Retired (code reserved) | — | — | — | — | — | — | — |
-| 14 | User | User | 138B | Shared | No | Yes | 64 | 2 (user_invite) |
+| 14 | User | User | 202B | Shared | No | Yes | 64 | 2 (user_invite) |
 | 15 | Retired (code reserved) | — | — | — | — | — | — | — |
-| 16 | PeerShared | PeerShared | 138B | Shared | No | Yes | 64 | 3 (device_invite) |
+| 16 | PeerShared | PeerShared | 234B | Shared | No | Yes | 64 | 3 (device_invite) |
 | 17 | Retired (code reserved) | — | — | — | — | — | — | — |
 | 18 | Admin | Admin | 170B | Shared | No | Yes | 64 | 1 (workspace) |
 | 19 | Retired (code reserved) | — | — | — | — | — | — | — |
 | 20 | UserRemoved | UserRemoved | 138B | Shared | No | Yes | 64 | 5 (peer_shared) |
 | 21 | PeerRemoved | PeerRemoved | 138B | Shared | No | Yes | 64 | 5 (peer_shared) |
-| 22 | SecretShared | SecretShared | 202B | Shared | No | Yes | 64 | 5 (peer_shared) |
-| 23 | Retired (code reserved) | — | — | — | — | — | — | — |
+| 22 | SecretShared | SecretShared | 234B | Shared | No | Yes | 64 | 5 (peer_shared) |
+| 23 | Peer | Peer | 73B | Local | No | No | 0 | — |
 | 24 | MessageAttachment | — | 633B | Shared | Yes | Yes | 64 | runtime (1..5) |
 | 25 | FileSlice | — | 262286B | Shared | Yes | Yes | 64 | runtime (1..5) |
 | 26 | BenchDep | — | 345B | Shared | No | No | 0 | — |
-| 27 | LocalSignerSecret | LocalSignerSecret | 74B | Local | No | No | 0 | — |
+| 27 | LocalSignerSecret | PeerPrivkey | 74B | Local | No | No | 0 | — |
+| 28 | InvitePrivkey | InvitePrivkey | 73B | Local | No | No | 0 | — |
+| 29 | Tenant | Tenant | 41B | Local | No | No | 0 | — |
 
 ## Signer Type Resolution
 
@@ -56,7 +58,7 @@ Changes to this document require TLA+ model re-verification.
 | 6 | {} | [] |
 | 7 | {target_event_id, signed_by} | [target_event_id, signed_by] |
 | 8 | {} | [] |
-| 9 | {} | [] |
+| 9 | {tenant_event_id} | [tenant_event_id] |
 | 10 | {signed_by} | [signed_by] (workspace_id is reference, not dep) |
 | 11 | retired (code reserved) | [] |
 | 12 | {signed_by} | [signed_by] |
@@ -69,12 +71,14 @@ Changes to this document require TLA+ model re-verification.
 | 19 | retired (code reserved) | [] |
 | 20 | {target_event_id, signed_by} | [target_event_id, signed_by] |
 | 21 | {target_event_id, signed_by} | [target_event_id, signed_by] |
-| 22 | {recipient_event_id, signed_by} | [recipient_event_id, signed_by] (key_event_id is a hint, validated at materialization) |
-| 23 | retired (code reserved) | [] |
+| 22 | {recipient_event_id, unwrap_key_event_id, signed_by} | [recipient_event_id, unwrap_key_event_id, signed_by] (key_event_id is a hint, validated at materialization) |
+| 23 | {tenant_event_id} | [tenant_event_id] |
 | 24 | {message_id, key_event_id, signed_by} | [message_id, key_event_id, signed_by] |
 | 25 | {signed_by} | [signed_by] |
 | 26 | {dep_id × 10 slots} | [dep_id × non-zero slots] |
 | 27 | {signer_event_id} | [signer_event_id] |
+| 28 | {invite_event_id} | [invite_event_id] |
+| 29 | {} | [] |
 
 ## Guards (TLA+ Guard → Rust pipeline check)
 
@@ -91,7 +95,7 @@ Changes to this document require TLA+ model re-verification.
 | 3 | retired (peer_key) | — | rejected as unknown type |
 | 4 | retired (type4_legacy) | — | rejected as unknown type |
 | 5 | project_encrypted | (dispatches inner) | decrypt → admissibility check → shared dep/signer/dispatch stages |
-| 6 | project_secret_key | secret_keys | — |
+| 6 | project_secret | secret_keys | — |
 | 7 | project_message_deletion | deleted_messages | author auth + cascade |
 | 8 | project_workspace | workspaces | TrustAnchorMatch guard |
 | 9 | project_invite_accepted | invite_accepted | writes trust_anchors (first-write-wins immutable); emits WriteAcceptedBootstrapTrust |
@@ -107,12 +111,14 @@ Changes to this document require TLA+ model re-verification.
 | 19 | retired (code reserved) | — | rejected as unknown type |
 | 20 | project_user_removed | removed_entities | — |
 | 21 | project_peer_removed | removed_entities | — |
-| 22 | project_secret_shared | secret_shared | bootstrap: wrap to invite key; runtime: wrap to PeerShared key |
-| 23 | retired (code reserved) | — | rejected as unknown type |
+| 22 | project_secret_shared | secret_shared | wraps to invite recipient; emits deterministic local `secret` on successful unwrap |
+| 23 | project_peer | peers_local | local tenant-bound peer identity |
 | 24 | project_message_attachment | message_attachments | — |
 | 25 | project_file_slice | file_slices | signature verification |
 | 26 | (none) | valid_events | dependency benchmark event; no projection table side effects |
-| 27 | project_local_signer_secret | local_signer_material | UPSERT by signer_event_id; emits RefreshTransportCreds for peer_shared |
+| 27 | project_local_signer_secret | local_signer_material | UPSERT by signer_event_id; emits ApplyTransportIdentityIntent for peer_shared signer kind |
+| 28 | project_invite_privkey | invite_privkeys | deterministic local invite unwrap key material |
+| 29 | project_tenant | tenants | local tenant root identity |
 
 ## Shared Pipeline Stages
 
@@ -154,34 +160,38 @@ Block/reject/valid state is always anchored to the outer encrypted event_id.
 
 ## Wire Formats
 
-### 73B fixed (Workspace, InviteAccepted)
+### 105B fixed (Workspace, InviteAccepted)
 ```
-Workspace (8):       type_code(1) | created_at_ms(8) | public_key(32) | workspace_id(32)  = 73B
-InviteAccepted (9):  type_code(1) | created_at_ms(8) | invite_event_id(32) | workspace_id(32)  = 73B
+Workspace (8):       type_code(1) | created_at_ms(8) | public_key(32) | name(64) = 105B
+InviteAccepted (9):  type_code(1) | created_at_ms(8) | tenant_event_id(32) | invite_event_id(32) | workspace_id(32) = 105B
 ```
 
-### 138B signed (DeviceInvite, User, Removal)
+### 138B signed (DeviceInvite, Removal)
 ```
 type_code(1) | created_at_ms(8) | public_key_or_target(32) | signed_by(32) | signer_type(1) | signature(64)  = 138B
 ```
-- Types 12, 14: field at [9..41] is public_key
+- Type 12: field at [9..41] is public_key
 - Types 20-21: field at [9..41] is target_event_id
 
-### 170B signed (UserInvite, PeerShared, Admin)
+### 170B signed (UserInvite, Admin)
 ```
 type_code(1) | created_at_ms(8) | public_key(32) | extra_dep_id(32) | signed_by(32) | signer_type(1) | signature(64)  = 170B
 ```
 - Type 10: extra_dep_id = workspace_id (reference, not a dep)
-- Type 16: extra_dep_id = user_event_id (dep, User)
 - Type 18: extra_dep_id = user_event_id (dep)
 
-### 202B signed (SecretShared)
+### 202B signed (User)
 ```
-type_code(1) | created_at_ms(8) | key_event_id(32) | recipient_event_id(32) | wrapped_key(32) | signed_by(32) | signer_type(1) | signature(64)  = 202B
+type_code(1) | created_at_ms(8) | public_key(32) | username(64) | signed_by(32) | signer_type(1) | signature(64) = 202B
 ```
-- Bootstrap mode: `recipient_event_id` targets an invite-derived key; `wrapped_key` is XOR of content key with X25519 DH + BLAKE2b-256 shared secret.
-- Runtime mode: `recipient_event_id` targets a PeerShared event; same wrap algorithm.
-- Recipients unwrap and materialize local `secret_key` events with deterministic event IDs (BLAKE2b of key bytes → `created_at_ms`), ensuring both parties derive identical `key_event_id` values.
+
+### 234B signed (PeerShared, SecretShared)
+```
+PeerShared (16): type_code(1) | created_at_ms(8) | public_key(32) | user_event_id(32) | device_name(64) | signed_by(32) | signer_type(1) | signature(64) = 234B
+SecretShared (22): type_code(1) | created_at_ms(8) | key_event_id(32) | recipient_event_id(32) | unwrap_key_event_id(32) | wrapped_key(32) | signed_by(32) | signer_type(1) | signature(64) = 234B
+```
+- `SecretShared.key_event_id` is a carried hint; it is verified at unwrap materialization time, not used as a dep field.
+- Recipients unwrap and materialize local `secret` events with deterministic event IDs (BLAKE2b of key bytes → `created_at_ms`), ensuring both parties derive identical `key_event_id` values.
 
 ### 1194B fixed signed (Message)
 ```
@@ -228,25 +238,26 @@ BenchDep (26): type_code(1) | created_at_ms(8) | dep_slots(10 × 32 = 320) | pay
 LocalSignerSecret (27): type_code(1) | created_at_ms(8) | signer_event_id(32) | signer_kind(1) | private_key_bytes(32) = 74B
 ```
 - signer_kind: 1=workspace, 2=user, 3=peer_shared
-- Dep: signer_event_id (types 8, 14, 15, 16, 17)
+- Dep: signer_event_id (types 8, 14, 16)
 - ShareScope: Local (never shared across peers)
 - Projector: UPSERT into local_signer_material (Delete + InsertOrIgnore)
-- EmitCommand: RefreshTransportCreds when signer_kind == 3 (peer_shared)
+- EmitCommand: ApplyTransportIdentityIntent when signer_kind == 3 (peer_shared)
 
 ### Key-wrap dependency model
 
 `secret_shared.key_event_id` is a **hint**, not a hard dependency. The key_event_id
 field is carried in the wire format but excluded from dep_fields. Validation occurs
 at materialization time: when a recipient unwraps the content key, the deterministic
-`secret_key` event ID is computed from the plaintext key bytes and compared against
+`secret` event ID is computed from the plaintext key bytes and compared against
 `key_event_id`. Mismatch causes the unwrap to be skipped (the key material is corrupt
 or tampered).
 
 This means:
-- `encrypted` events hard-dep on `secret_key` (key_event_id in dep_fields)
-- `secret_shared` does NOT hard-dep on `secret_key` (key_event_id is a hint)
+- `encrypted` events hard-dep on `secret` (key_event_id in dep_fields)
+- `secret_shared` hard-deps on `recipient_event_id` and `unwrap_key_event_id`
+- `secret_shared` does NOT hard-dep on `secret` (key_event_id is a hint)
 - Out-of-order arrival is handled: secret_shared can project before the local
-  secret_key exists; encrypted blocks until secret_key is projected
+  secret exists; encrypted blocks until secret is projected
 
 ### Canonical text slot rules
 1. UTF-8 required (reject invalid UTF-8 sequences)
@@ -288,7 +299,7 @@ The following parser-level canonicalization guarantees are enforced in Rust but 
 | InvRemovalAdmin | test_removal_enforcement: removal requires admin context |
 | InvAllValidRequireWorkspace | test_bootstrap_sequence: non-local events require workspace valid |
 | InvMessageWorkspace | Message projection requires workspace (workspace_event_id dep) |
-| InvEncryptedKey | Encrypted content requires valid secret_key dependency |
+| InvEncryptedKey | Encrypted content requires valid secret dependency |
 | InvSecretSharedKey | SecretShared key_event_id is a hint (validated at materialization, not projection) |
 | InvFileSliceAuth | FileSlice and MessageAttachment for the same file must share the same signer |
 | InvRemovalExclusion | project_secret_shared: reject if recipient removed |
@@ -296,7 +307,7 @@ The following parser-level canonicalization guarantees are enforced in Rust but 
 
 ### Bootstrap key materialization
 
-When a joiner accepts an invite, the acceptance path unwraps bootstrap content-key material (from the invite link) and materializes local `secret_key` events with deterministic event IDs. The deterministic ID derivation (BLAKE2b of key bytes → `created_at_ms`) ensures that both inviter and joiner produce matching `key_event_id` values without out-of-band coordination. This enables encrypted events referencing those keys to unblock via normal cascade after key materialization.
+When a joiner accepts an invite, the acceptance path unwraps bootstrap content-key material (from the invite link) and materializes local `secret` events with deterministic event IDs. The deterministic ID derivation (BLAKE2b of key bytes → `created_at_ms`) ensures that both inviter and joiner produce matching `key_event_id` values without out-of-band coordination. This enables encrypted events referencing those keys to unblock via normal cascade after key materialization.
 
 The TLA model does not distinguish bootstrap vs runtime SecretShared structurally — both use the same event type with identical dependency semantics ({PeerShared}). The `key_event_id` field is a hint validated at materialization time, not a hard dependency. The bootstrap/runtime distinction is a key-source detail below the model's abstraction boundary.
 
