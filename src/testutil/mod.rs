@@ -32,13 +32,13 @@ impl Drop for DaemonGuard {
     }
 }
 
-use crate::crypto::{event_id_to_base64, EventId};
+use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
 use crate::db::{open_connection, schema::create_tables, store::insert_recorded_event};
 use crate::event_modules::{
     AdminEvent, DeviceInviteEvent, FileSliceEvent, InviteAcceptedEvent, MessageAttachmentEvent,
-    MessageDeletionEvent, MessageEvent, ParsedEvent, PeerRemovedEvent, PeerSharedEvent,
-    ReactionEvent, SecretKeyEvent, SecretSharedEvent, UserEvent, UserInviteEvent, UserRemovedEvent,
-    WorkspaceEvent,
+    MessageDeletionEvent, MessageEvent, ParsedEvent, PeerEvent, PeerRemovedEvent, PeerSharedEvent,
+    ReactionEvent, SecretKeyEvent, SecretSharedEvent, TenantEvent, UserEvent, UserInviteEvent,
+    UserRemovedEvent, WorkspaceEvent,
 };
 use crate::peering::loops::{
     accept_loop, connect_loop, connect_loop_with_shared_ingest,
@@ -571,8 +571,10 @@ impl Peer {
         workspace_id: [u8; 32],
     ) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
+        let tenant_event_id = self.ensure_local_tenant_event_id(&db);
         let ia = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
             created_at_ms: current_timestamp_ms(),
+            tenant_event_id,
             invite_event_id: *invite_event_id,
             workspace_id,
         });
@@ -587,12 +589,42 @@ impl Peer {
         workspace_id: [u8; 32],
     ) -> Result<EventId, CreateEventError> {
         let db = open_connection(&self.db_path).expect("failed to open db");
+        let tenant_event_id = self.ensure_local_tenant_event_id(&db);
         let ia = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
             created_at_ms: current_timestamp_ms(),
+            tenant_event_id,
             invite_event_id: *invite_event_id,
             workspace_id,
         });
         create_event_synchronous(&db, &self.identity, &ia)
+    }
+
+    fn ensure_local_tenant_event_id(&self, db: &rusqlite::Connection) -> EventId {
+        let existing: Option<String> = db
+            .query_row(
+                "SELECT event_id FROM tenants WHERE recorded_by = ?1 ORDER BY created_at ASC, event_id ASC LIMIT 1",
+                rusqlite::params![&self.identity],
+                |row| row.get(0),
+            )
+            .ok();
+        if let Some(eid_b64) = existing {
+            return event_id_from_base64(&eid_b64).expect("invalid tenants.event_id base64");
+        }
+
+        let peer_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+        let peer_evt = ParsedEvent::Peer(PeerEvent {
+            created_at_ms: current_timestamp_ms(),
+            public_key: peer_key.verifying_key().to_bytes(),
+        });
+        let peer_event_id =
+            create_event_synchronous(db, &self.identity, &peer_evt).expect("failed to create peer");
+
+        let tenant_evt = ParsedEvent::Tenant(TenantEvent {
+            created_at_ms: current_timestamp_ms(),
+            peer_event_id,
+        });
+        create_event_synchronous(db, &self.identity, &tenant_evt)
+            .expect("failed to create tenant")
     }
 
     /// Create a UserInvite event (signed by workspace key). Returns the event ID.

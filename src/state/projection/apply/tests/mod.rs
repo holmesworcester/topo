@@ -1,5 +1,5 @@
 use super::project_one::project_one;
-use crate::crypto::{event_id_to_base64, hash_event, EventId};
+use crate::crypto::{event_id_from_base64, event_id_to_base64, hash_event, EventId};
 use crate::db::{
     open_in_memory,
     schema::create_tables,
@@ -83,7 +83,7 @@ fn insert_event_raw(conn: &Connection, recorded_by: &str, blob: &[u8]) -> EventI
 
 use crate::event_modules::{
     DeviceInviteEvent, InviteAcceptedEvent, PeerSharedEvent, UserEvent,
-    UserInviteEvent,
+    UserInviteEvent, PeerEvent, TenantEvent,
 };
 
 /// Create a Workspace event, insert it, and mark it valid for this tenant.
@@ -105,12 +105,64 @@ fn setup_workspace_event(conn: &Connection, recorded_by: &str) -> EventId {
     eid
 }
 
+fn setup_tenant_event(conn: &Connection, recorded_by: &str) -> EventId {
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT event_id FROM tenants WHERE recorded_by = ?1 ORDER BY created_at ASC, event_id ASC LIMIT 1",
+            rusqlite::params![recorded_by],
+            |row| row.get(0),
+        )
+        .ok();
+    if let Some(eid_b64) = existing {
+        return event_id_from_base64(&eid_b64).expect("invalid tenants.event_id base64");
+    }
+
+    let mut rng = rand::thread_rng();
+    let peer_key = SigningKey::generate(&mut rng);
+    let peer_event = ParsedEvent::Peer(PeerEvent {
+        created_at_ms: now_ms(),
+        public_key: peer_key.verifying_key().to_bytes(),
+    });
+    let peer_blob = events::encode_event(&peer_event).unwrap();
+    let peer_eid = insert_event_raw(conn, recorded_by, &peer_blob);
+    let peer_decision = project_one(conn, recorded_by, &peer_eid).unwrap();
+    assert_eq!(peer_decision, ProjectionDecision::Valid);
+
+    let tenant_event = ParsedEvent::Tenant(TenantEvent {
+        created_at_ms: now_ms(),
+        peer_event_id: peer_eid,
+    });
+    let tenant_blob = events::encode_event(&tenant_event).unwrap();
+    let tenant_eid = insert_event_raw(conn, recorded_by, &tenant_blob);
+    let tenant_decision = project_one(conn, recorded_by, &tenant_eid).unwrap();
+    assert_eq!(tenant_decision, ProjectionDecision::Valid);
+    tenant_eid
+}
+
 /// Create a minimal identity chain and return (peer_shared_event_id, signing_key).
 /// Projects all identity events through the pipeline so the signer is in valid_events.
 fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (EventId, SigningKey) {
     let mut rng = rand::thread_rng();
 
-    // 1. Workspace
+    // 1. Local peer + tenant roots
+    let peer_key = SigningKey::generate(&mut rng);
+    let peer_event = ParsedEvent::Peer(PeerEvent {
+        created_at_ms: now_ms(),
+        public_key: peer_key.verifying_key().to_bytes(),
+    });
+    let peer_blob = events::encode_event(&peer_event).unwrap();
+    let peer_eid = insert_event_raw(conn, recorded_by, &peer_blob);
+    project_one(conn, recorded_by, &peer_eid).unwrap();
+
+    let tenant_event = ParsedEvent::Tenant(TenantEvent {
+        created_at_ms: now_ms(),
+        peer_event_id: peer_eid,
+    });
+    let tenant_blob = events::encode_event(&tenant_event).unwrap();
+    let tenant_eid = insert_event_raw(conn, recorded_by, &tenant_blob);
+    project_one(conn, recorded_by, &tenant_eid).unwrap();
+
+    // 2. Workspace
     let workspace_key = SigningKey::generate(&mut rng);
     let workspace_pub = workspace_key.verifying_key().to_bytes();
     let net_event = ParsedEvent::Workspace(WorkspaceEvent {
@@ -121,9 +173,10 @@ fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (EventId, Signin
     let net_blob = events::encode_event(&net_event).unwrap();
     let net_eid = insert_event_raw(conn, recorded_by, &net_blob);
 
-    // 2. InviteAccepted (local, binds trust anchor)
+    // 3. InviteAccepted (local, binds trust anchor)
     let ia_event = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
         created_at_ms: now_ms(),
+        tenant_event_id: tenant_eid,
         invite_event_id: net_eid,
         workspace_id: net_eid,
     });
@@ -132,7 +185,7 @@ fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (EventId, Signin
     project_one(conn, recorded_by, &ia_eid).unwrap();
     project_one(conn, recorded_by, &net_eid).unwrap();
 
-    // 3. UserInvite (signed by workspace key)
+    // 4. UserInvite (signed by workspace key)
     let invite_key = SigningKey::generate(&mut rng);
     let invite_pub = invite_key.verifying_key().to_bytes();
     let uib = UserInviteEvent {
@@ -149,7 +202,7 @@ fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (EventId, Signin
     let uib_eid = insert_event_raw(conn, recorded_by, &uib_blob);
     project_one(conn, recorded_by, &uib_eid).unwrap();
 
-    // 4. User (signed by invite key)
+    // 5. User (signed by invite key)
     let user_key = SigningKey::generate(&mut rng);
     let user_pub = user_key.verifying_key().to_bytes();
     let ub = UserEvent {
@@ -166,7 +219,7 @@ fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (EventId, Signin
     let ub_eid = insert_event_raw(conn, recorded_by, &ub_blob);
     project_one(conn, recorded_by, &ub_eid).unwrap();
 
-    // 5. DeviceInvite (signed by user key)
+    // 6. DeviceInvite (signed by user key)
     let device_invite_key = SigningKey::generate(&mut rng);
     let device_invite_pub = device_invite_key.verifying_key().to_bytes();
     let dif = DeviceInviteEvent {
@@ -182,7 +235,7 @@ fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (EventId, Signin
     let dif_eid = insert_event_raw(conn, recorded_by, &dif_blob);
     project_one(conn, recorded_by, &dif_eid).unwrap();
 
-    // 6. PeerShared (signed by device_invite key)
+    // 7. PeerShared (signed by device_invite key)
     let peer_shared_key = SigningKey::generate(&mut rng);
     let peer_shared_pub = peer_shared_key.verifying_key().to_bytes();
     let psf = PeerSharedEvent {
@@ -213,7 +266,23 @@ fn build_identity_chain_deferred(
 ) -> (EventId, SigningKey, Vec<(EventId, Vec<u8>)>) {
     let mut rng = rand::thread_rng();
 
-    // 1. Workspace
+    // 1. Local peer + tenant roots
+    let peer_key = SigningKey::generate(&mut rng);
+    let peer_event = ParsedEvent::Peer(PeerEvent {
+        created_at_ms: now_ms(),
+        public_key: peer_key.verifying_key().to_bytes(),
+    });
+    let peer_blob = events::encode_event(&peer_event).unwrap();
+    let peer_eid = hash_event(&peer_blob);
+
+    let tenant_event = ParsedEvent::Tenant(TenantEvent {
+        created_at_ms: now_ms(),
+        peer_event_id: peer_eid,
+    });
+    let tenant_blob = events::encode_event(&tenant_event).unwrap();
+    let tenant_eid = hash_event(&tenant_blob);
+
+    // 2. Workspace
     let workspace_key = SigningKey::generate(&mut rng);
     let workspace_pub = workspace_key.verifying_key().to_bytes();
     let net_event = ParsedEvent::Workspace(WorkspaceEvent {
@@ -224,16 +293,17 @@ fn build_identity_chain_deferred(
     let net_blob = events::encode_event(&net_event).unwrap();
     let net_eid = hash_event(&net_blob);
 
-    // 2. InviteAccepted
+    // 3. InviteAccepted
     let ia_event = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
         created_at_ms: now_ms(),
+        tenant_event_id: tenant_eid,
         invite_event_id: net_eid,
         workspace_id: net_eid,
     });
     let ia_blob = events::encode_event(&ia_event).unwrap();
     let ia_eid = hash_event(&ia_blob);
 
-    // 3. UserInvite (signed by workspace key)
+    // 4. UserInvite (signed by workspace key)
     let invite_key = SigningKey::generate(&mut rng);
     let invite_pub = invite_key.verifying_key().to_bytes();
     let uib = UserInviteEvent {
@@ -249,7 +319,7 @@ fn build_identity_chain_deferred(
     sign_blob(&workspace_key, &mut uib_blob);
     let uib_eid = hash_event(&uib_blob);
 
-    // 4. User (signed by invite key)
+    // 5. User (signed by invite key)
     let user_key = SigningKey::generate(&mut rng);
     let user_pub = user_key.verifying_key().to_bytes();
     let ub = UserEvent {
@@ -265,7 +335,7 @@ fn build_identity_chain_deferred(
     sign_blob(&invite_key, &mut ub_blob);
     let ub_eid = hash_event(&ub_blob);
 
-    // 5. DeviceInvite (signed by user key)
+    // 6. DeviceInvite (signed by user key)
     let device_invite_key = SigningKey::generate(&mut rng);
     let device_invite_pub = device_invite_key.verifying_key().to_bytes();
     let dif = DeviceInviteEvent {
@@ -280,7 +350,7 @@ fn build_identity_chain_deferred(
     sign_blob(&user_key, &mut dif_blob);
     let dif_eid = hash_event(&dif_blob);
 
-    // 6. PeerShared (signed by device_invite key)
+    // 7. PeerShared (signed by device_invite key)
     let peer_shared_key = SigningKey::generate(&mut rng);
     let peer_shared_pub = peer_shared_key.verifying_key().to_bytes();
     let psf = PeerSharedEvent {
@@ -299,9 +369,10 @@ fn build_identity_chain_deferred(
 
     register_signer_user(psf_eid, ub_eid);
 
-    // Return blobs in dependency order: IA first (local trust anchor), then Network,
-    // then the rest in chain order
+    // Return blobs in dependency order.
     let chain_blobs = vec![
+        (peer_eid, peer_blob),
+        (tenant_eid, tenant_blob),
         (ia_eid, ia_blob),
         (net_eid, net_blob),
         (uib_eid, uib_blob),
@@ -3382,6 +3453,7 @@ fn test_file_slice_wrong_signer_rejected() {
     // 2. InviteAccepted
     let ia_event = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
         created_at_ms: now_ms(),
+        tenant_event_id: setup_tenant_event(&conn, recorded_by),
         invite_event_id: net_eid,
         workspace_id: net_eid,
     });
@@ -3758,6 +3830,7 @@ fn test_invite_accepted_guard_retry_on_workspace() {
     // Create and project InviteAccepted — should set trust anchor and trigger guard retry
     let ia_event = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
         created_at_ms: now_ms(),
+        tenant_event_id: setup_tenant_event(&conn, recorded_by),
         invite_event_id: ws_eid,
         workspace_id: ws_eid,
     });
@@ -4856,14 +4929,16 @@ fn test_dep_type_mismatch_rejects() {
 // Stage 1: Bootstrap-projection-peering target semantics tests
 // ══════════════════════════════════════════════════════════════════════
 
-/// Target semantics 1: InviteAccepted is dep-free and projects trust anchor
-/// immediately, even when the workspace event is not yet present in the database.
+/// Target semantics 1: InviteAccepted depends on tenant but not workspace;
+/// it projects trust anchor immediately once tenant root exists, even when
+/// the workspace event is not yet present in the database.
 /// This is the foundation for projection-first accept: the accept path does NOT
 /// require pre-sync workspace presence.
 #[test]
-fn test_invite_accepted_dep_free_no_workspace_required() {
+fn test_invite_accepted_requires_tenant_not_workspace() {
     let conn = setup();
     let recorded_by = "peer1";
+    let tenant_event_id = setup_tenant_event(&conn, recorded_by);
 
     // Create InviteAccepted pointing to a workspace_id that does NOT exist
     // in the events table at all. It should still project Valid.
@@ -4871,6 +4946,7 @@ fn test_invite_accepted_dep_free_no_workspace_required() {
     let fake_invite_eid = [0xCC; 32];
     let ia_event = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
         created_at_ms: now_ms(),
+        tenant_event_id,
         invite_event_id: fake_invite_eid,
         workspace_id: fake_workspace_id,
     });
@@ -4938,6 +5014,7 @@ fn test_invite_accepted_materializes_bootstrap_trust_from_projection() {
     // Create and project InviteAccepted
     let ia_event = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
         created_at_ms: now_ms(),
+        tenant_event_id: setup_tenant_event(&conn, recorded_by),
         invite_event_id: invite_eid,
         workspace_id,
     });
@@ -4995,6 +5072,7 @@ fn test_workspace_unblocks_via_cascade_after_late_arrival() {
     // Project InviteAccepted first (workspace not in DB yet)
     let ia_event = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
         created_at_ms: now_ms(),
+        tenant_event_id: setup_tenant_event(&conn, recorded_by),
         invite_event_id: ws_eid,
         workspace_id: ws_eid,
     });
@@ -5089,6 +5167,7 @@ fn test_full_bootstrap_progression_from_projected_sql_state() {
     // Step 1: Project InviteAccepted (no workspace event in DB)
     let ia_event = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
         created_at_ms: now_ms(),
+        tenant_event_id: setup_tenant_event(&conn, recorded_by),
         invite_event_id: uib_eid,
         workspace_id: ws_eid,
     });
@@ -5243,6 +5322,7 @@ fn test_bootstrap_trust_superseded_by_matching_peer_shared() {
     // Project InviteAccepted → materializes bootstrap trust
     let ia_event = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
         created_at_ms: now_ms(),
+        tenant_event_id: setup_tenant_event(&conn, recorded_by),
         invite_event_id: invite_eid,
         workspace_id,
     });

@@ -60,6 +60,7 @@ VARIABLES recorded, valid, trustAnchor, removed,
 Workspace == "workspace"
 
 \* Identity / bootstrap
+Peer == "peer"
 Tenant == "tenant"
 InviteAccepted == "invite_accepted"
 
@@ -111,6 +112,7 @@ WorkspaceEventId(e) == e
 
 \* Singleton event types (not parameterized by workspace)
 FullEventTypes == {
+    Peer,
     Tenant,
     InviteAccepted,
     UserInvite,
@@ -132,7 +134,7 @@ FullEvents == FullEventTypes \cup AllWorkspaceEvents
 \* Local-only events (no workspace dep, no trust anchor gate).
 \* Encrypted is local because it's a cryptographic wrapper; its workspace
 \* requirement comes from the inner event, not the wrapper itself.
-LocalRoots == {Tenant, InviteAccepted, PeerPrivkey, InvitePrivkey, Secret, Encrypted}
+LocalRoots == {Peer, Tenant, InviteAccepted, PeerPrivkey, InvitePrivkey, Secret, Encrypted}
 
 \* Singleton event types that require workspace to be valid
 WorkspaceGuardedEvents == FullEventTypes \ LocalRoots
@@ -149,6 +151,7 @@ AdminEvents == {Admin}
 PeerSharedSignerEvents == {PeerShared}
 
 IdentityEvents == {
+    Peer,
     Tenant,
     InviteAccepted,
     UserInvite,
@@ -179,7 +182,8 @@ ASSUME Workspaces \cap FullEventTypes = {}
 RawDeps(e) ==
     IF IsWorkspaceEvent(e) THEN {}
     ELSE
-    CASE e = Tenant -> {}
+    CASE e = Peer -> {}
+       [] e = Tenant -> {Peer}
        [] e = InviteAccepted -> {Tenant}
 
        \* user_invite: no raw deps beyond signer
@@ -197,8 +201,8 @@ RawDeps(e) ==
        \* admin: depends on workspace + user
        [] e = Admin -> {Workspace, User}
 
-       [] e = PeerPrivkey -> {Tenant, PeerShared}
-       [] e = InvitePrivkey -> {Tenant, InviteAccepted}
+       [] e = PeerPrivkey -> {PeerShared}
+       [] e = InvitePrivkey -> InviteEvents
 
        \* Content: message depends on workspace; reaction/deletion depend on message
        [] e = Message -> {Workspace}
@@ -210,8 +214,8 @@ RawDeps(e) ==
        \* Encryption: secret is local (deterministic event ID from key bytes);
        \* secret_shared wraps key to invite recipient and depends on invite_privkey.
        \* encrypted depends on secret.
-       [] e = Secret -> {Tenant}
-       [] e = SecretShared -> {UserInvite, InvitePrivkey}
+       [] e = Secret -> {}
+       [] e = SecretShared -> InviteEvents \cup {InvitePrivkey}
        [] e = Encrypted -> {Secret}
 
        \* Removal: depends on the entity being removed
@@ -653,9 +657,10 @@ InvSecretSharedKey ==
 
 \* Invite private key material is tenant-scoped and rooted by invite_accepted.
 InvInvitePrivkeySource ==
-    IF InvitePrivkey \in EVENTS /\ InviteAccepted \in EVENTS /\ Tenant \in EVENTS
+    IF InvitePrivkey \in EVENTS /\ (InviteEvents \cap EVENTS) /= {}
     THEN \A p \in Peers:
-        (InvitePrivkey \in valid[p]) => (InviteAccepted \in valid[p] /\ Tenant \in valid[p])
+        (InvitePrivkey \in valid[p]) =>
+            (\E ie \in (InviteEvents \cap EVENTS): ie \in valid[p])
     ELSE TRUE
 
 \* File slice authorization: if both FileSlice and MessageAttachment are valid,

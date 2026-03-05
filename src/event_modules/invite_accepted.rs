@@ -4,12 +4,14 @@ use super::{EventError, ParsedEvent, EVENT_TYPE_INVITE_ACCEPTED};
 
 // ─── Layout (owned by this module) ───
 
-/// InviteAccepted (type 9): type(1) + created_at(8) + invite_event_id(32) + workspace_id(32) = 73
-pub const INVITE_ACCEPTED_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32 + 32;
+/// InviteAccepted (type 9): type(1) + created_at(8) + tenant_event_id(32) + invite_event_id(32)
+/// + workspace_id(32) = 105
+pub const INVITE_ACCEPTED_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32 + 32 + 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InviteAcceptedEvent {
     pub created_at_ms: u64,
+    pub tenant_event_id: [u8; 32], // dep: local tenant event
     pub invite_event_id: [u8; 32], // the invite event being accepted
     pub workspace_id: [u8; 32],    // workspace being joined
 }
@@ -23,11 +25,12 @@ impl super::Describe for InviteAcceptedEvent {
     }
 }
 
-/// Wire format (73 bytes fixed):
+/// Wire format (105 bytes fixed):
 /// [0]      type_code = 9
 /// [1..9]   created_at_ms (u64 LE)
-/// [9..41]  invite_event_id (32 bytes)
-/// [41..73] workspace_id (32 bytes)
+/// [9..41]  tenant_event_id (32 bytes)
+/// [41..73] invite_event_id (32 bytes)
+/// [73..105] workspace_id (32 bytes)
 pub fn parse_invite_accepted(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if blob.len() < INVITE_ACCEPTED_WIRE_SIZE {
         return Err(EventError::TooShort {
@@ -49,15 +52,18 @@ pub fn parse_invite_accepted(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     }
 
     let created_at_ms = u64::from_le_bytes(blob[1..9].try_into().unwrap());
+    let mut tenant_event_id = [0u8; 32];
+    tenant_event_id.copy_from_slice(&blob[9..41]);
 
     let mut invite_event_id = [0u8; 32];
-    invite_event_id.copy_from_slice(&blob[9..41]);
+    invite_event_id.copy_from_slice(&blob[41..73]);
 
     let mut workspace_id = [0u8; 32];
-    workspace_id.copy_from_slice(&blob[41..73]);
+    workspace_id.copy_from_slice(&blob[73..105]);
 
     Ok(ParsedEvent::InviteAccepted(InviteAcceptedEvent {
         created_at_ms,
+        tenant_event_id,
         invite_event_id,
         workspace_id,
     }))
@@ -72,6 +78,7 @@ pub fn encode_invite_accepted(event: &ParsedEvent) -> Result<Vec<u8>, EventError
     let mut buf = Vec::with_capacity(INVITE_ACCEPTED_WIRE_SIZE);
     buf.push(EVENT_TYPE_INVITE_ACCEPTED);
     buf.extend_from_slice(&ia.created_at_ms.to_le_bytes());
+    buf.extend_from_slice(&ia.tenant_event_id);
     buf.extend_from_slice(&ia.invite_event_id);
     buf.extend_from_slice(&ia.workspace_id);
     Ok(buf)
@@ -117,6 +124,7 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
         CREATE TABLE IF NOT EXISTS invite_accepted (
             recorded_by TEXT NOT NULL,
             event_id TEXT NOT NULL,
+            tenant_event_id TEXT NOT NULL,
             invite_event_id TEXT NOT NULL,
             workspace_id TEXT NOT NULL,
             PRIMARY KEY (recorded_by, event_id)
@@ -212,10 +220,17 @@ pub fn project_pure(
         // Projection table
         WriteOp::InsertOrIgnore {
             table: "invite_accepted",
-            columns: vec!["recorded_by", "event_id", "invite_event_id", "workspace_id"],
+            columns: vec![
+                "recorded_by",
+                "event_id",
+                "tenant_event_id",
+                "invite_event_id",
+                "workspace_id",
+            ],
             values: vec![
                 SqlVal::Text(recorded_by.to_string()),
                 SqlVal::Text(event_id_b64.to_string()),
+                SqlVal::Text(event_id_to_base64(&ia.tenant_event_id)),
                 SqlVal::Text(invite_eid_b64.clone()),
                 SqlVal::Text(workspace_id_b64.clone()),
             ],
@@ -275,8 +290,8 @@ pub static INVITE_ACCEPTED_META: EventTypeMeta = EventTypeMeta {
     type_name: "invite_accepted",
     projection_table: "invite_accepted",
     share_scope: ShareScope::Local,
-    dep_fields: &[],
-    dep_field_type_codes: &[],
+    dep_fields: &["tenant_event_id"],
+    dep_field_type_codes: &[&[super::EVENT_TYPE_TENANT]],
     signer_required: false,
     signature_byte_len: 0,
     encryptable: false,

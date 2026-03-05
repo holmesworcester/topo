@@ -403,9 +403,11 @@ fn parsed_event_type_name(parsed: &ParsedEvent) -> &'static str {
         ParsedEvent::Encrypted(_) => "encrypted",
         ParsedEvent::SecretKey(_) => "secret",
         ParsedEvent::SecretShared(_) => "secret_shared",
+        ParsedEvent::Peer(_) => "peer",
+        ParsedEvent::Tenant(_) => "tenant",
         ParsedEvent::FileSlice(_) => "file_slice",
         ParsedEvent::BenchDep(_) => "bench_dep",
-        ParsedEvent::LocalSignerSecret(_) => "local_signer_secret",
+        ParsedEvent::LocalSignerSecret(_) => "peer_privkey",
         ParsedEvent::InvitePrivkey(_) => "invite_privkey",
     }
 }

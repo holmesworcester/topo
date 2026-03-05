@@ -786,14 +786,14 @@ fn db_scoped_commands_remain_isolated_between_daemons() {
 }
 
 #[test]
-fn local_signer_secret_events_do_not_pass_shared_egress_gate() {
+fn peer_privkey_events_do_not_pass_shared_egress_gate() {
     let (_dir, db) = temp_db();
     create_workspace(&db);
 
     let conn = rusqlite::Connection::open(&db).unwrap();
     let local_event_b64: String = conn
         .query_row(
-            "SELECT event_id FROM events WHERE event_type = 'local_signer_secret' LIMIT 1",
+            "SELECT event_id FROM events WHERE event_type = 'peer_privkey' LIMIT 1",
             [],
             |row| row.get(0),
         )
@@ -803,7 +803,7 @@ fn local_signer_secret_events_do_not_pass_shared_egress_gate() {
     let store = topo::db::store::Store::new(&conn);
     assert!(
         store.get_shared(&local_event_id).unwrap().is_none(),
-        "local_signer_secret must never be returned by shared egress gate"
+        "peer_privkey must never be returned by shared egress gate"
     );
 }
 

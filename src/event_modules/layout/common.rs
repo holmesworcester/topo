@@ -239,10 +239,12 @@ mod tests {
         use super::super::super::message::MESSAGE_WIRE_SIZE;
         use super::super::super::message_attachment::MESSAGE_ATTACHMENT_WIRE_SIZE;
         use super::super::super::message_deletion::MESSAGE_DELETION_WIRE_SIZE;
+        use super::super::super::peer::PEER_WIRE_SIZE;
         use super::super::super::peer_shared::PEER_SHARED_WIRE_SIZE;
         use super::super::super::reaction::REACTION_WIRE_SIZE;
         use super::super::super::secret_key::SECRET_KEY_WIRE_SIZE;
         use super::super::super::secret_shared::SECRET_SHARED_WIRE_SIZE;
+        use super::super::super::tenant::TENANT_WIRE_SIZE;
         use super::super::super::user::USER_WIRE_SIZE;
         use super::super::super::user_invite::USER_INVITE_WIRE_SIZE;
         use super::super::super::workspace::WORKSPACE_WIRE_SIZE;
@@ -257,9 +259,11 @@ mod tests {
         assert_eq!(PEER_SHARED_WIRE_SIZE, 234);
         assert_eq!(SECRET_KEY_WIRE_SIZE, 41);
         assert_eq!(MESSAGE_DELETION_WIRE_SIZE, 170);
-        assert_eq!(INVITE_ACCEPTED_WIRE_SIZE, 73);
+        assert_eq!(INVITE_ACCEPTED_WIRE_SIZE, 105);
         assert_eq!(USER_INVITE_WIRE_SIZE, 170);
         assert_eq!(ADMIN_WIRE_SIZE, 170);
+        assert_eq!(PEER_WIRE_SIZE, 41);
+        assert_eq!(TENANT_WIRE_SIZE, 41);
         assert_eq!(SECRET_SHARED_WIRE_SIZE, 234);
         assert_eq!(INVITE_PRIVKEY_WIRE_SIZE, 73);
         assert_eq!(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE, 138);

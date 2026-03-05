@@ -382,8 +382,9 @@ mod tests {
     use super::*;
     use crate::db::{open_in_memory, schema::create_tables};
     use crate::event_modules::{
-        DeviceInviteEvent, InviteAcceptedEvent, MessageEvent, PeerSharedEvent,
+        DeviceInviteEvent, InviteAcceptedEvent, MessageEvent, PeerEvent, PeerSharedEvent,
         ReactionEvent, UserEvent, UserInviteEvent, WorkspaceEvent,
+        TenantEvent,
     };
     use ed25519_dalek::SigningKey;
 
@@ -414,6 +415,19 @@ mod tests {
     fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (EventId, SigningKey, EventId) {
         let mut rng = rand::thread_rng();
 
+        let peer_key = SigningKey::generate(&mut rng);
+        let peer_evt = ParsedEvent::Peer(PeerEvent {
+            created_at_ms: now_ms(),
+            public_key: peer_key.verifying_key().to_bytes(),
+        });
+        let peer_eid = create_event_synchronous(conn, recorded_by, &peer_evt).unwrap();
+
+        let tenant_evt = ParsedEvent::Tenant(TenantEvent {
+            created_at_ms: now_ms(),
+            peer_event_id: peer_eid,
+        });
+        let tenant_eid = create_event_synchronous(conn, recorded_by, &tenant_evt).unwrap();
+
         let workspace_key = SigningKey::generate(&mut rng);
         let workspace_pub = workspace_key.verifying_key().to_bytes();
         let net_event = ParsedEvent::Workspace(WorkspaceEvent {
@@ -426,6 +440,7 @@ mod tests {
 
         let ia_event = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
             created_at_ms: now_ms(),
+            tenant_event_id: tenant_eid,
             invite_event_id: net_eid,
             workspace_id: net_eid,
         });

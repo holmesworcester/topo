@@ -162,9 +162,13 @@ pub fn create_workspace(
     let ws_eid2 = create_event_staged(db, &derived_peer_id, &ws)?;
     assert_eq!(ws_eid, ws_eid2, "pre-computed workspace event_id mismatch");
 
-    // 4. InviteAccepted (local event — trust anchor already seeded above)
+    // 4. Ensure tenant root chain exists: peer -> tenant.
+    let tenant_event_id = ops::ensure_local_tenant_event(db, &derived_peer_id, &peer_shared_key)?;
+
+    // 5. InviteAccepted (local event — trust anchor already seeded above)
     let ia = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
         created_at_ms: now_ms(),
+        tenant_event_id,
         invite_event_id: ws_eid,
         workspace_id: ws_eid,
     });
@@ -172,7 +176,7 @@ pub fn create_workspace(
     project_one(db, &derived_peer_id, &ws_eid)
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
 
-    // 3. UserInvite (signed by workspace_key)
+    // 6. UserInvite (signed by workspace_key)
     let invite_key = SigningKey::generate(&mut rng);
     let uib = ParsedEvent::UserInvite(UserInviteEvent {
         created_at_ms: now_ms(),
@@ -184,7 +188,7 @@ pub fn create_workspace(
     });
     let uib_eid = create_signed_event_synchronous(db, &derived_peer_id, &uib, &workspace_key)?;
 
-    // 4. User (signed by invite_key)
+    // 7. User (signed by invite_key)
     let user_key = SigningKey::generate(&mut rng);
     let ub = ParsedEvent::User(UserEvent {
         created_at_ms: now_ms(),
@@ -196,7 +200,7 @@ pub fn create_workspace(
     });
     let ub_eid = create_signed_event_synchronous(db, &derived_peer_id, &ub, &invite_key)?;
 
-    // 5. DeviceInvite (signed by user_key)
+    // 8. DeviceInvite (signed by user_key)
     let device_invite_key = SigningKey::generate(&mut rng);
     let dif = ParsedEvent::DeviceInvite(DeviceInviteEvent {
         created_at_ms: now_ms(),
@@ -207,7 +211,7 @@ pub fn create_workspace(
     });
     let dif_eid = create_signed_event_synchronous(db, &derived_peer_id, &dif, &user_key)?;
 
-    // 6. PeerShared (signed by device_invite_key; key pre-generated above)
+    // 9. PeerShared (signed by device_invite_key; key pre-generated above)
     let psf = ParsedEvent::PeerShared(PeerSharedEvent {
         created_at_ms: now_ms(),
         public_key: peer_shared_key.verifying_key().to_bytes(),
@@ -219,7 +223,7 @@ pub fn create_workspace(
     });
     let psf_eid = create_signed_event_synchronous(db, &derived_peer_id, &psf, &device_invite_key)?;
 
-    // 7. Emit local_signer_secret events for all three signing keys.
+    // 10. Emit local_signer_secret events for all three signing keys.
     // Transport identity is already installed, so all writes use derived_peer_id.
     emit_local_signer_secret(
         db,
@@ -237,7 +241,7 @@ pub fn create_workspace(
         &workspace_key,
     )?;
 
-    // 8. Seed deterministic local content-key material.
+    // 11. Seed deterministic local content-key material.
     let _ = ops::ensure_content_key_for_peer(db, &derived_peer_id)?;
 
     Ok(CreateWorkspaceResult {
@@ -268,6 +272,7 @@ pub fn join_workspace_as_new_user(
     peer_shared_key: SigningKey,
 ) -> Result<JoinChain, Box<dyn std::error::Error + Send + Sync>> {
     let mut rng = rand::thread_rng();
+    let tenant_event_id = ops::ensure_local_tenant_event(db, recorded_by, &peer_shared_key)?;
 
     // Persist deterministic invite_privkey material. This is the key event
     // that secret_shared depends on for unwrap projection.
@@ -276,6 +281,7 @@ pub fn join_workspace_as_new_user(
     // 1. InviteAccepted (local event) — binds trust anchor, triggers guard cascade
     let ia_evt = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
         created_at_ms: now_ms(),
+        tenant_event_id,
         invite_event_id: *invite_event_id,
         workspace_id,
     });
@@ -400,9 +406,12 @@ pub fn add_device_to_workspace(
     device_name: &str,
     peer_shared_key: SigningKey,
 ) -> Result<LinkChain, Box<dyn std::error::Error + Send + Sync>> {
+    let tenant_event_id = ops::ensure_local_tenant_event(db, recorded_by, &peer_shared_key)?;
+
     // 1. InviteAccepted (local event) — binds trust anchor, triggers guard cascade
     let ia_evt = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
         created_at_ms: now_ms(),
+        tenant_event_id,
         invite_event_id: *device_invite_event_id,
         workspace_id,
     });

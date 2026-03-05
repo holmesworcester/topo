@@ -18,6 +18,7 @@ mod tests {
     fn make_invite_accepted(invite_id: [u8; 32], workspace_id: [u8; 32]) -> ParsedEvent {
         ParsedEvent::InviteAccepted(InviteAcceptedEvent {
             created_at_ms: 2000,
+            tenant_event_id: [7u8; 32],
             invite_event_id: invite_id,
             workspace_id,
         })

@@ -25,6 +25,73 @@ pub(crate) fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// Ensure a local `peer` event exists for this tenant and return its event id.
+/// Uses the provided key material as the peer public identity when creating.
+pub(crate) fn ensure_local_peer_event(
+    conn: &Connection,
+    recorded_by: &str,
+    peer_key: &SigningKey,
+) -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT event_id
+             FROM peers_local
+             WHERE recorded_by = ?1
+             ORDER BY created_at ASC, event_id ASC
+             LIMIT 1",
+            rusqlite::params![recorded_by],
+            |row| row.get(0),
+        )
+        .ok();
+    if let Some(eid_b64) = existing {
+        return event_id_from_base64(&eid_b64).ok_or("invalid peers_local.event_id base64".into());
+    }
+
+    let evt = ParsedEvent::Peer(PeerEvent {
+        created_at_ms: now_ms(),
+        public_key: peer_key.verifying_key().to_bytes(),
+    });
+    Ok(event_id_or_blocked(create_event_synchronous(
+        conn,
+        recorded_by,
+        &evt,
+    ))?)
+}
+
+/// Ensure a local `tenant` event exists for this tenant and return its event id.
+/// `tenant` is rooted by a local `peer` event.
+pub(crate) fn ensure_local_tenant_event(
+    conn: &Connection,
+    recorded_by: &str,
+    peer_key: &SigningKey,
+) -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT event_id
+             FROM tenants
+             WHERE recorded_by = ?1
+             ORDER BY created_at ASC, event_id ASC
+             LIMIT 1",
+            rusqlite::params![recorded_by],
+            |row| row.get(0),
+        )
+        .ok();
+    if let Some(eid_b64) = existing {
+        return event_id_from_base64(&eid_b64).ok_or("invalid tenants.event_id base64".into());
+    }
+
+    let peer_event_id = ensure_local_peer_event(conn, recorded_by, peer_key)?;
+    let tenant_evt = ParsedEvent::Tenant(TenantEvent {
+        created_at_ms: now_ms(),
+        peer_event_id,
+    });
+    Ok(event_id_or_blocked(create_event_synchronous(
+        conn,
+        recorded_by,
+        &tenant_evt,
+    ))?)
+}
+
 fn create_deterministic_secret_key_event(
     conn: &Connection,
     recorded_by: &str,
