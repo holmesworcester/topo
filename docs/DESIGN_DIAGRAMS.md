@@ -103,11 +103,13 @@ flowchart TD
     TRANS["Transport"]
     SYNC["Sync Engine"]
     PIPE["Event Pipeline"]
+    SUBS["Local Subscriptions"]
     PSTATE["Projection State"]
     PEERS["Peers"]
 
     CTRL --> BOOT
     CTRL --> PIPE
+    CTRL --> SUBS
     BOOT --> RSUP
     BOOT --> TRANS
     BOOT --> PIPE
@@ -115,6 +117,8 @@ flowchart TD
     PEERS --> TRANS
     TRANS --> SYNC
     SYNC --> PIPE
+    PIPE --> SUBS
+    SUBS --> PSTATE
     PIPE --> PSTATE
     PSTATE -->|trust rows| TRANS
 ```
@@ -221,13 +225,16 @@ flowchart TD
       BLOCKED["blocked_events + blocked_event_deps"]
       REJECTED["rejected_events"]
       READS["Projection tables"]
+      SUB_DB["local_subscriptions + local_subscription_state + local_subscription_feed"]
     end
 
     PROJ --> VALID
     PROJ --> BLOCKED
     PROJ --> REJECTED
     PROJ --> READS
+    PROJ --> SUBQ
     PROJ --> TRUST_DB
+    SUBQ --> SUB_DB
 
     TRUST_DB --> LIFE
     SHUT_N --> RSUP
@@ -359,60 +366,6 @@ flowchart LR
     PSF --> LSP["LocalSignerSecret (peer_shared)"]
     IA -. guard-unblock / retry .-> PSF
 ```
-
-## 6) Subscriptions (Before vs After Refactor)
-
-### 6.1 Pre-refactor Flow (historical)
-
-```mermaid
-flowchart TD
-    subgraph CTRL["Control Path (RPC/CLI)"]
-      CLI["CLI: sub-create/sub-enable/sub-disable/sub-poll/..."] --> RPC["rpc/server Sub* handlers"]
-      RPC --> SUBMOD["event_modules/subscription::{create_subscription,set_enabled,poll_feed,ack_feed,get_state,list_subscriptions}"]
-      SUBMOD --> SUBDB[("local_subscriptions + local_subscription_state + local_subscription_feed")]
-    end
-
-    subgraph PROJ["Projection Match Path"]
-      INGEST["local create or wire receive"] --> PROJ1["project_one (Valid path)"]
-      PROJ1 --> HOOK["event_modules/subscription::matcher::on_projected_event"]
-      HOOK --> LOAD["load_active_subscriptions_for_type(recorded_by,event_type)"]
-      LOAD --> MATCH["subscription matcher (currently centralized in matcher.rs)"]
-      MATCH --> WRITE1["append_feed_item (full/id)"]
-      MATCH --> WRITE2["mark_changed (has_changed)"]
-      WRITE1 --> SUBDB
-      WRITE2 --> SUBDB
-    end
-```
-
-### 6.2 Current Refactored Flow (implemented)
-
-```mermaid
-flowchart TD
-    subgraph CTRL2["Control Path (local-only subscription lifecycle)"]
-      CLI2["CLI: SubCreate/SubEnable/SubDisable/SubPoll/..."] --> RPC2["rpc/server Sub* handlers"]
-      RPC2 --> SUBCORE["state/subscriptions/* (engine + storage)"]
-      SUBCORE --> SUBDB2[("local_subscriptions + local_subscription_state + local_subscription_feed")]
-    end
-
-    subgraph PROJ2["Projection Match Path (event-module-owned filters)"]
-      INGEST2["local create or wire receive"] --> PROJ2A["project_one (Valid path)"]
-      PROJ2A --> DISPATCH["subscriptions dispatcher (generic orchestration)"]
-      DISPATCH --> SF_MSG["event_modules/message/subscription_filter.rs"]
-      DISPATCH --> SF_RXN["event_modules/reaction/subscription_filter.rs"]
-      DISPATCH --> SF_ATT["event_modules/message_attachment/subscription_filter.rs"]
-      SF_MSG --> OUT_MSG["matches(spec, parsed) + feed_payload(mode)"]
-      SF_RXN --> OUT_RXN["matches(spec, parsed) + feed_payload(mode)"]
-      SF_ATT --> OUT_ATT["matches(spec, parsed) + feed_payload(mode)"]
-      OUT_MSG --> SUBCORE
-      OUT_RXN --> SUBCORE
-      OUT_ATT --> SUBCORE
-      SUBCORE --> SUBDB2
-    end
-```
-
-Current ownership intent:
-- Event modules own event-specific subscription filter semantics (`subscription_filter` or `subscription_filters` when multiple helpers are needed).
-- Subscription lifecycle/storage/feed mechanics remain local infra (non-replicated), outside event-type modules.
 
 ## Current Data-Flow Facts
 
