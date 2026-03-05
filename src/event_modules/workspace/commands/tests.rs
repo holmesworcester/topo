@@ -12,9 +12,6 @@ fn create_user_invite_materializes_pending_bootstrap_trust_via_projection() {
     let recorded_by = hex::encode(crate::crypto::spki_fingerprint_from_ed25519_pubkey(
         &workspace.peer_shared_key.verifying_key().to_bytes(),
     ));
-    let (_workspace_signer_eid, workspace_key) = load_workspace_signing_key(&conn, &recorded_by)
-        .expect("load workspace key")
-        .expect("workspace key must exist");
 
     // Use a bootstrap SPKI that is not already present in peers_shared so
     // pending bootstrap trust is materialized by projection.
@@ -23,10 +20,9 @@ fn create_user_invite_materializes_pending_bootstrap_trust_via_projection() {
     let invite = create_user_invite(
         &conn,
         &recorded_by,
-        &workspace_key,
-        &workspace.workspace_id,
         &workspace.peer_shared_key,
         &workspace.peer_shared_event_id,
+        &workspace.workspace_id,
         "127.0.0.1:4433",
         &bootstrap_spki,
     )

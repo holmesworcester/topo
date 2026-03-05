@@ -404,7 +404,14 @@ mod tests {
             "INSERT INTO invites_accepted
              (recorded_by, event_id, tenant_event_id, invite_event_id, workspace_id, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params!["tenant-a", "ia-a", "tenant-a-eid", "invite-a", "ws-1", 1_i64],
+            rusqlite::params![
+                "tenant-a",
+                "ia-a",
+                "tenant-a-eid",
+                "invite-a",
+                "ws-1",
+                1_i64
+            ],
         )
         .unwrap();
         drop(db);

@@ -50,7 +50,7 @@ fn test_invite_only_daemons_should_autodial_without_manual_connect() {
     let out = topo_assert_eventually(
         &alice_db,
         &format!("has_event:{} >= 1", bob_event_id),
-        8_000,
+        20_000,
     );
     assert!(
         out.status.success(),

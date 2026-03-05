@@ -187,7 +187,9 @@ pub fn discover_local_tenants(
     // the local transport cert may still be invite-derived until projection
     // installs the PeerShared-derived cert.
     let accepted_count: i64 =
-        conn.query_row("SELECT COUNT(*) FROM invites_accepted", [], |row| row.get(0))?;
+        conn.query_row("SELECT COUNT(*) FROM invites_accepted", [], |row| {
+            row.get(0)
+        })?;
     let creds_count: i64 =
         conn.query_row("SELECT COUNT(*) FROM local_transport_creds", [], |row| {
             row.get(0)

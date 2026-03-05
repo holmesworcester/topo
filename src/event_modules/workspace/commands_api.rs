@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use super::commands::{
     add_device_to_workspace, create_device_link_invite, create_user_invite, create_workspace,
-    join_workspace_as_new_user, load_local_peer_signer, load_workspace_signing_key,
-    persist_join_signer_secrets, persist_link_signer_secrets,
+    join_workspace_as_new_user, load_local_peer_signer, persist_join_signer_secrets,
+    persist_link_signer_secrets,
 };
 use crate::crypto::{event_id_to_base64, EventId};
 use crate::service::{open_db_for_peer, open_db_load};
@@ -33,6 +33,31 @@ pub struct AcceptInviteResponse {
 pub struct AcceptDeviceLinkResponse {
     pub peer_id: String,
     pub peer_shared_event_id: String,
+}
+
+fn signer_is_admin(
+    db: &Connection,
+    recorded_by: &str,
+    signer_event_id: &EventId,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let signer_b64 = event_id_to_base64(signer_event_id);
+    let is_admin: bool = db.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM peers_shared ps
+             JOIN users u
+               ON u.recorded_by = ps.recorded_by
+              AND u.event_id = ps.user_event_id
+             JOIN admins a
+               ON a.recorded_by = u.recorded_by
+              AND a.public_key = u.public_key
+             WHERE ps.recorded_by = ?1
+               AND ps.event_id = ?2
+         )",
+        rusqlite::params![recorded_by, signer_b64],
+        |row| row.get(0),
+    )?;
+    Ok(is_admin)
 }
 
 // DB-path-level command wrappers (moved from service.rs)
@@ -97,15 +122,13 @@ pub fn create_invite_for_db(
         })?;
 
     let ws_eid = super::resolve_workspace_for_peer(&db, &recorded_by)?;
-    let (_ws_signer_eid, workspace_key) = load_workspace_signing_key(&db, &recorded_by)?
-        .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
-            "No workspace signing key found. Only workspace creators can invite.".into()
-        })?;
-
     let (sender_peer_eid, sender_peer_key) = load_local_peer_signer(&db, &recorded_by)?
         .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
             "No local peer signer found for invite creation.".into()
         })?;
+    if !signer_is_admin(&db, &recorded_by, &sender_peer_eid)? {
+        return Err("Local peer signer is not admin for this workspace.".into());
+    }
 
     // Get local SPKI for the bootstrap address
     let spki_bytes = hex::decode(&recorded_by)?;
@@ -115,10 +138,9 @@ pub fn create_invite_for_db(
     let result = create_user_invite(
         &db,
         &recorded_by,
-        &workspace_key,
-        &ws_eid,
         &sender_peer_key,
         &sender_peer_eid,
+        &ws_eid,
         bootstrap_addr,
         &bootstrap_spki,
     )?;
@@ -141,15 +163,13 @@ pub fn create_invite_with_spki(
         })?;
 
     let ws_eid = super::resolve_workspace_for_peer(&db, &recorded_by)?;
-    let (_ws_signer_eid, workspace_key) = load_workspace_signing_key(&db, &recorded_by)?
-        .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
-            "No workspace signing key found.".into()
-        })?;
-
     let (sender_peer_eid, sender_peer_key) = load_local_peer_signer(&db, &recorded_by)?
         .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
             "No local peer signer found.".into()
         })?;
+    if !signer_is_admin(&db, &recorded_by, &sender_peer_eid)? {
+        return Err("Local peer signer is not admin for this workspace.".into());
+    }
 
     let spki_bytes = hex::decode(public_spki_hex)?;
     if spki_bytes.len() != 32 {
@@ -161,10 +181,9 @@ pub fn create_invite_with_spki(
     let result = create_user_invite(
         &db,
         &recorded_by,
-        &workspace_key,
-        &ws_eid,
         &sender_peer_key,
         &sender_peer_eid,
+        &ws_eid,
         public_addr,
         &bootstrap_spki,
     )?;
@@ -369,13 +388,14 @@ pub fn create_device_link_for_peer(
 ) -> Result<CreateInviteResponse, Box<dyn std::error::Error + Send + Sync>> {
     let (_recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
 
-    // Load user key from local_user_keys
-    let (user_event_id, user_key) = crate::event_modules::peer_shared::load_local_user_key(
-        &db, peer_id,
-    )?
-    .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
-        "No local user key found. Only workspace creators/inviters can create device links.".into()
-    })?;
+    let (sender_peer_eid, sender_peer_key) = load_local_peer_signer(&db, peer_id)?.ok_or_else(
+        || -> Box<dyn std::error::Error + Send + Sync> { "No local peer signer found.".into() },
+    )?;
+    if !signer_is_admin(&db, peer_id, &sender_peer_eid)? {
+        return Err("Local peer signer is not admin for this workspace.".into());
+    }
+    let user_event_id =
+        crate::event_modules::peer_shared::resolve_user_event_id(&db, peer_id, &sender_peer_eid)?;
 
     let workspace_id = super::resolve_workspace_for_peer(&db, peer_id)?;
 
@@ -401,7 +421,8 @@ pub fn create_device_link_for_peer(
     let result = create_device_link_invite(
         &db,
         peer_id,
-        &user_key,
+        &sender_peer_key,
+        &sender_peer_eid,
         &user_event_id,
         &workspace_id,
         public_addr,

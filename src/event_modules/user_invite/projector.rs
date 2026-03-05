@@ -10,10 +10,29 @@ pub fn project_pure(
     parsed: &ParsedEvent,
     ctx: &ContextSnapshot,
 ) -> ProjectorResult {
-    let (public_key, created_at_ms) = match parsed {
-        ParsedEvent::UserInvite(ui) => (&ui.public_key, ui.created_at_ms as i64),
+    let (public_key, created_at_ms, signed_by, signer_type, workspace_id) = match parsed {
+        ParsedEvent::UserInvite(ui) => (
+            &ui.public_key,
+            ui.created_at_ms as i64,
+            ui.signed_by,
+            ui.signer_type,
+            ui.workspace_id,
+        ),
         _ => return ProjectorResult::reject("not a user_invite event".to_string()),
     };
+
+    if signer_type == 1 {
+        if signed_by != workspace_id {
+            return ProjectorResult::reject(
+                "bootstrap user_invite must be signed by workspace_id".to_string(),
+            );
+        }
+    } else if signer_type == 5 {
+        // Ongoing invites are peer-signed. Command paths enforce local admin
+        // authorization; wire-level admin dep enforcement is TODO.
+    } else {
+        return ProjectorResult::reject("unsupported user_invite signer_type".to_string());
+    }
 
     let mut ops = vec![WriteOp::InsertOrIgnore {
         table: "user_invites",

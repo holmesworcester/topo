@@ -132,8 +132,6 @@ pub struct Peer {
     pub peer_shared_event_id: Option<EventId>,
     /// PeerShared signing key for signing content events.
     pub peer_shared_signing_key: Option<SigningKey>,
-    /// Workspace signing key (only set for workspace creators).
-    pub workspace_signing_key: Option<SigningKey>,
     _tempdir: tempfile::TempDir,
 }
 
@@ -176,7 +174,6 @@ impl Peer {
             workspace_id: [0u8; 32],
             peer_shared_event_id: None,
             peer_shared_signing_key: None,
-            workspace_signing_key: None,
             _tempdir: tempdir,
         }
     }
@@ -223,15 +220,6 @@ impl Peer {
         }
         self.peer_shared_event_id = Some(result.peer_shared_event_id);
         self.peer_shared_signing_key = Some(result.peer_shared_key);
-        // Load workspace signing key from local signer material
-        if let Ok(Some((_ws_eid, ws_key))) =
-            crate::event_modules::workspace::commands::load_workspace_signing_key(
-                &db,
-                &new_identity,
-            )
-        {
-            self.workspace_signing_key = Some(ws_key);
-        }
     }
 
     /// Create a new peer that joins an existing workspace created by `creator`
@@ -266,14 +254,9 @@ impl Peer {
             workspace_id: [0u8; 32],
             peer_shared_event_id: None,
             peer_shared_signing_key: None,
-            workspace_signing_key: None,
             _tempdir: tempdir,
         };
         let creator_db = open_connection(&creator.db_path).expect("failed to open creator db");
-        let workspace_key = creator
-            .workspace_signing_key
-            .as_ref()
-            .expect("creator has no workspace_signing_key; use new_with_identity()");
         let creator_peer_key = creator
             .peer_shared_signing_key
             .as_ref()
@@ -286,10 +269,9 @@ impl Peer {
         let invite = create_user_invite_raw(
             &creator_db,
             &creator.identity,
-            workspace_key,
+            creator_peer_key,
+            &creator_peer_eid,
             &creator.workspace_id,
-            Some(creator_peer_key),
-            Some(&creator_peer_eid),
         )
         .expect("failed to create user invite");
 
@@ -339,9 +321,6 @@ impl Peer {
         .await
         .expect("failed bootstrap sync");
 
-        // Allow batch_writer to finish draining projection cascade.
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-
         // Clean up sync endpoint
         sync_endpoint.close(0u32.into(), b"bootstrap done");
 
@@ -352,17 +331,20 @@ impl Peer {
         peer.identity = scoped_peer_id.clone();
         peer.workspace_id = creator.workspace_id;
 
-        // Load signing key and user_event_id from DB
-        if let Ok(Some((eid, key))) =
-            crate::service::load_local_peer_signer_pub(&db, &scoped_peer_id)
+        // Deterministically drain projection queue after bootstrap sync so
+        // peer signer materialization is visible in the same call chain.
+        let _ = crate::event_pipeline::drain_project_queue(&peer.db_path, &scoped_peer_id, 1000);
+
+        // Load signing key and user_event_id from DB in a read-your-writes step.
+        let (eid, key) = crate::service::load_local_peer_signer_pub(&db, &scoped_peer_id)
+            .expect("load_local_peer_signer_pub failed")
+            .expect("accept_invite did not materialize local peer signer");
+        peer.peer_shared_event_id = Some(eid);
+        peer.peer_shared_signing_key = Some(key);
+        if let Ok(uid) =
+            crate::service::resolve_user_event_id_for_signer(&db, &scoped_peer_id, &eid)
         {
-            peer.peer_shared_event_id = Some(eid);
-            peer.peer_shared_signing_key = Some(key);
-            if let Ok(uid) =
-                crate::service::resolve_user_event_id_for_signer(&db, &scoped_peer_id, &eid)
-            {
-                peer.author_id = uid;
-            }
+            peer.author_id = uid;
         }
 
         peer
@@ -2938,7 +2920,6 @@ impl SharedDbNode {
             workspace_id: [0u8; 32],
             peer_shared_event_id: None,
             peer_shared_signing_key: None,
-            workspace_signing_key: None,
             _tempdir: dummy_tempdir,
         };
 
@@ -2956,11 +2937,6 @@ impl SharedDbNode {
 
         let creator = &self.tenants[creator_index];
         let workspace_id = creator.workspace_id;
-        let workspace_key = creator
-            .workspace_signing_key
-            .as_ref()
-            .expect("creator has no workspace_signing_key")
-            .clone();
         let creator_peer_key = creator
             .peer_shared_signing_key
             .as_ref()
@@ -2990,10 +2966,9 @@ impl SharedDbNode {
         let invite = create_user_invite_raw(
             &db,
             &creator_identity,
-            &workspace_key,
+            &creator_peer_key,
+            &creator_peer_eid,
             &workspace_id,
-            Some(&creator_peer_key),
-            Some(&creator_peer_eid),
         )
         .expect("failed to create user invite");
 
@@ -3029,7 +3004,6 @@ impl SharedDbNode {
             workspace_id,
             peer_shared_event_id: Some(join.peer_shared_event_id),
             peer_shared_signing_key: Some(join.peer_shared_key),
-            workspace_signing_key: None,
             _tempdir: dummy_tempdir,
         };
 

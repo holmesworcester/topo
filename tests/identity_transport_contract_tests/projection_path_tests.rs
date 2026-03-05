@@ -9,12 +9,18 @@ use topo::event_modules::local_signer_secret::{
 use topo::event_modules::ParsedEvent;
 use topo::projection::contract::{ContextSnapshot, EmitCommand};
 
-fn project(recorded_by: &str, event: &ParsedEvent) -> Vec<EmitCommand> {
+fn project(
+    recorded_by: &str,
+    event: &ParsedEvent,
+    local_peer_shared_projected: bool,
+) -> Vec<EmitCommand> {
+    let mut ctx = ContextSnapshot::default();
+    ctx.local_signer_peer_shared_projected = Some(local_peer_shared_projected);
     let result = topo::event_modules::local_signer_secret::project_pure(
         recorded_by,
         "test-event-id",
         event,
-        &ContextSnapshot::default(),
+        &ctx,
     );
     result.emit_commands
 }
@@ -29,7 +35,7 @@ fn peer_shared_signer_emits_install_intent() {
         private_key_bytes: [42u8; 32],
     });
 
-    let cmds = project("test-peer", &event);
+    let cmds = project("test-peer", &event, true);
 
     assert_eq!(
         cmds.len(),
@@ -61,7 +67,7 @@ fn workspace_signer_does_not_emit_intent() {
         private_key_bytes: [2u8; 32],
     });
 
-    let cmds = project("test-peer", &event);
+    let cmds = project("test-peer", &event, false);
     assert!(
         cmds.is_empty(),
         "workspace signer should not emit projector commands"
@@ -77,7 +83,7 @@ fn user_signer_does_not_emit_intent() {
         private_key_bytes: [4u8; 32],
     });
 
-    let cmds = project("test-peer", &event);
+    let cmds = project("test-peer", &event, false);
     assert!(
         cmds.is_empty(),
         "user signer should not emit projector commands"
@@ -93,7 +99,7 @@ fn intent_carries_correct_recorded_by() {
         private_key_bytes: [10u8; 32],
     });
 
-    let cmds = project("specific-recorded-by-value", &event);
+    let cmds = project("specific-recorded-by-value", &event, true);
     let intent = cmds
         .iter()
         .find_map(|c| match c {
@@ -118,7 +124,7 @@ fn no_duplicate_intents_emitted() {
         private_key_bytes: [8u8; 32],
     });
 
-    let cmds = project("rb", &event);
+    let cmds = project("rb", &event, true);
     let intent_count = cmds
         .iter()
         .filter(|c| matches!(c, EmitCommand::ApplyTransportIdentityIntent { .. }))

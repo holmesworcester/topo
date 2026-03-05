@@ -56,9 +56,9 @@ pub fn parse_user_invite(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     let mut signed_by = [0u8; 32];
     signed_by.copy_from_slice(&blob[73..105]);
     let signer_type = blob[105];
-    if signer_type != 1 {
+    if signer_type != 1 && signer_type != 5 {
         return Err(EventError::InvalidMetadata(
-            "user_invite signer_type must be 1 (workspace)",
+            "user_invite signer_type must be 1 (workspace) or 5 (peer_shared)",
         ));
     }
     let mut signature = [0u8; 64];
@@ -96,7 +96,7 @@ pub static USER_INVITE_META: EventTypeMeta = EventTypeMeta {
     projection_table: "user_invites",
     share_scope: ShareScope::Shared,
     dep_fields: &["signed_by"],
-    dep_field_type_codes: &[&[8]],
+    dep_field_type_codes: &[&[8, 16]],
     signer_required: true,
     signature_byte_len: 64,
     encryptable: false,
@@ -114,7 +114,7 @@ mod tests {
     fn parse_user_invite_rejects_wrong_signer_type() {
         let mut blob = vec![0u8; USER_INVITE_WIRE_SIZE];
         blob[0] = EVENT_TYPE_USER_INVITE;
-        blob[105] = 5;
+        blob[105] = 4;
 
         let err = parse_user_invite(&blob).expect_err("should reject wrong signer type");
         assert!(matches!(err, EventError::InvalidMetadata(_)));

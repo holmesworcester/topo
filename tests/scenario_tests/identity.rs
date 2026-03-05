@@ -1102,7 +1102,10 @@ fn test_trust_anchor_immutability() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(total_rows, 2, "both invite_accepted rows should be projected");
+    assert_eq!(
+        total_rows, 2,
+        "both invite_accepted rows should be projected"
+    );
 
     harness.finish();
 }

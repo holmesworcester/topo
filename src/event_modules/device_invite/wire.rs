@@ -52,9 +52,9 @@ pub fn parse_device_invite(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     let mut signed_by = [0u8; 32];
     signed_by.copy_from_slice(&blob[41..73]);
     let signer_type = blob[73];
-    if signer_type != 4 {
+    if signer_type != 4 && signer_type != 5 {
         return Err(EventError::InvalidMetadata(
-            "device_invite signer_type must be 4 (user)",
+            "device_invite signer_type must be 4 (user) or 5 (peer_shared)",
         ));
     }
     let mut signature = [0u8; 64];
@@ -90,7 +90,7 @@ pub static DEVICE_INVITE_META: EventTypeMeta = EventTypeMeta {
     projection_table: "device_invites",
     share_scope: ShareScope::Shared,
     dep_fields: &["signed_by"],
-    dep_field_type_codes: &[&[14]],
+    dep_field_type_codes: &[&[14, 16]],
     signer_required: true,
     signature_byte_len: 64,
     encryptable: false,
@@ -108,7 +108,7 @@ mod tests {
     fn parse_device_invite_rejects_wrong_signer_type() {
         let mut blob = vec![0u8; IDENTITY_PUBKEY_SIGNED_WIRE_SIZE];
         blob[0] = EVENT_TYPE_DEVICE_INVITE;
-        blob[73] = 5;
+        blob[73] = 1;
 
         let err = parse_device_invite(&blob).expect_err("should reject wrong signer type");
         assert!(matches!(err, EventError::InvalidMetadata(_)));

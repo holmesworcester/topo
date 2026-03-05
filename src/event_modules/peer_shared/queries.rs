@@ -16,19 +16,17 @@ fn decode_signing_key(key_bytes: Vec<u8>) -> Result<SigningKey, String> {
     Ok(SigningKey::from_bytes(&key_arr))
 }
 
-/// Load the local peer signer (signer_kind=3) from local_signer_material,
-/// joined with peers_shared to ensure the signer is projected.
+/// Load the local peer signer (signer_kind=3) from local_signer_material.
+/// Signer material is local-first and may exist before peer_shared projection.
 pub fn load_local_peer_signer(
     db: &Connection,
     recorded_by: &str,
 ) -> Result<Option<(EventId, SigningKey)>, Box<dyn std::error::Error + Send + Sync>> {
     if let Some((eid_b64, key_bytes)) = db
         .query_row(
-            "SELECT l.signer_event_id, l.private_key
-             FROM local_signer_material l
-             INNER JOIN peers_shared p
-               ON p.recorded_by = l.recorded_by AND p.event_id = l.signer_event_id
-             WHERE l.recorded_by = ?1 AND l.signer_kind = 3
+            "SELECT signer_event_id, private_key
+             FROM local_signer_material
+             WHERE recorded_by = ?1 AND signer_kind = 3
              LIMIT 1",
             rusqlite::params![recorded_by],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
@@ -65,16 +63,33 @@ pub fn resolve_user_event_id(
             rusqlite::params![recorded_by, &signer_b64],
             |row| row.get(0),
         )
+        .unwrap_or_default();
+    if !user_eid_b64.is_empty() {
+        return event_id_from_base64(&user_eid_b64)
+            .ok_or_else(|| "invalid user_event_id in peers_shared".into());
+    }
+
+    // Fallback: parse the signer event blob directly. This supports local-first
+    // flows where peer signer material exists before peers_shared projects.
+    let signer_blob: Vec<u8> = db
+        .query_row(
+            "SELECT blob FROM events WHERE event_id = ?1 LIMIT 1",
+            rusqlite::params![&signer_b64],
+            |row| row.get(0),
+        )
         .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
             "no peer_shared entry found for signer — identity chain incomplete".into()
         })?;
-    if user_eid_b64.is_empty() {
-        return Err(
-            "peer_shared entry has no user_event_id (legacy row) — recreate database".into(),
-        );
+    let parsed = crate::event_modules::parse_event(&signer_blob).map_err(
+        |e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("failed to parse signer event blob: {}", e).into()
+        },
+    )?;
+    if let crate::event_modules::ParsedEvent::PeerShared(ps) = parsed {
+        Ok(ps.user_event_id)
+    } else {
+        Err("signer event is not peer_shared".into())
     }
-    event_id_from_base64(&user_eid_b64)
-        .ok_or_else(|| "invalid user_event_id in peers_shared".into())
 }
 
 /// Load the local user key (signer_kind=2) from local_signer_material.
