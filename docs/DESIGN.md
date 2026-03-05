@@ -124,7 +124,7 @@ Our daemon provides a placeholder RPC API that is capable of serving whatever qu
 
 For instant optimistic feedback, write commands (`Send`, `React`, `SendFile`) accept an optional `client_op_id` that the frontend generates locally. The daemon stores a local mapping from `client_op_id` to the resulting `event_id`, and annotates view responses with these IDs. The frontend shows an optimistic row immediately on send, then drops it when the polled view contains a canonical item with the matching `client_op_id`. This gives Slack-like latency with no client-side state machine — just a key match on each poll.
 
-For reactive data flows, the daemon provides a local subscription engine. Frontends create subscriptions filtered by event type (e.g. "message", "reaction") with optional field-level filter clauses. As events are projected, matching items are appended to a per-subscription feed table. Frontends poll feed items with `SubPoll` (sequential, ack-based cursor), check pending counts with `SubState`, and acknowledge consumed items with `SubAck`. Three delivery modes control feed granularity: `full` (render-ready payload), `id` (identifiers only), and `has_changed` (dirty flag + count, no per-item rows). Subscriptions are local to each peer and do not replicate — they are a projection-layer convenience for frontend reactivity, not protocol state.
+For reactive data flows, the daemon provides a local subscription engine. Frontends create subscriptions filtered by event type (e.g. "message", "reaction") with optional field-level filter clauses. As events are projected, matching items are appended to a per-subscription feed table. Frontends poll feed items with `SubPoll` (sequential, ack-based cursor), check pending counts with `SubState`, and acknowledge consumed items with `SubAck`. Three delivery modes control feed granularity: `full` (render-ready payload), `id` (identifiers only), and `has_changed` (dirty flag + count, no per-item rows). Subscriptions are local to each peer and do not replicate — they are a projection-layer convenience for frontend reactivity, not protocol state. Ownership split: lifecycle/storage/feed mechanics live in `src/state/subscriptions/*`, while event-specific filter semantics and payload shaping live in each event module via `subscription_filter.rs` (or `subscription_filters.rs`).
 
 ## Adding Event-Layer Functionality
 
@@ -1737,6 +1737,8 @@ These rules are mandatory. Violations must be fixed before merge.
 
 5. **Module split rule**: When an event module exceeds ~300-400 LOC or mixes 3+ concerns, split into a directory module (see 14.4).
 
+6. **Local reactive infra boundary rule**: Local-only subscription lifecycle/feed state is not an event type and lives in `src/state/subscriptions/*`. Event modules only own event-specific subscription filter semantics (`subscription_filter` / `subscription_filters`), not subscription CRUD/feed storage.
+
 ## 14.2 Layering convention
 
 Event modules (`src/event_modules/<type>/`) own five concerns. During migration,
@@ -1784,7 +1786,7 @@ fn(&Connection, &str, &str, &ParsedEvent) -> Result<ContextSnapshot, Box<dyn Err
 
 ### Service command routing
 
-RPC command handlers (`src/runtime/control/rpc/server.rs`) call event-module command APIs directly. Example flows:
+RPC command handlers (`src/runtime/control/rpc/server.rs`) call owner-module command APIs directly. Example flows:
 
 - `RpcMethod::Send` -> `message::send_for_peer`
 - `RpcMethod::React` -> `reaction::react_for_peer`
@@ -1795,16 +1797,18 @@ RPC command handlers (`src/runtime/control/rpc/server.rs`) call event-module com
 - `RpcMethod::AcceptLink` -> `workspace::commands::accept_device_link`
 - `RpcMethod::CreateInvite` -> `workspace::commands::create_invite_for_db` / `workspace::commands::create_invite_with_spki`
 - `RpcMethod::CreateDeviceLink` -> `workspace::commands::create_device_link_for_peer`
+- `RpcMethod::SubCreate` / `SubEnable` / `SubDisable` -> `state::subscriptions::*` (local infra API)
 
 ### Service query routing
 
-RPC query handlers (`src/runtime/control/rpc/server.rs`) call event-module query APIs directly. Example flows:
+RPC query handlers (`src/runtime/control/rpc/server.rs`) call owner-module query APIs directly. Example flows:
 
 - `RpcMethod::Messages` -> `message::list`
 - `RpcMethod::Reactions` -> `reaction::list`
 - `RpcMethod::Users` -> `user::list_items`
 - `RpcMethod::Workspaces` -> `workspace::list_items`
 - `RpcMethod::Keys` -> `workspace::keys` (which aggregates `user`, `peer_shared`, and `admin` counts)
+- `RpcMethod::SubList` / `SubPoll` / `SubState` / `SubAck` -> `state::subscriptions::*`
 
 ## 14.4 Module split rule
 

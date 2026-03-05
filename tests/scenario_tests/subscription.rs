@@ -6,8 +6,8 @@
 
 use topo::crypto::event_id_to_base64;
 use topo::db::open_connection;
-use topo::event_modules::subscription;
-use topo::event_modules::subscription::types::*;
+use topo::state::subscriptions as subscription;
+use topo::state::subscriptions::types::*;
 use topo::testutil::{Peer, ScenarioHarness};
 
 // ---------------------------------------------------------------------------

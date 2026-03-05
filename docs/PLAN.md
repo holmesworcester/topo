@@ -114,7 +114,7 @@ These are required, not optional:
 
 Every CLI instance is a real peer-to-peer device. All user-facing commands go through daemon RPC to the service layer:
 
-1. **One service layer**: business logic lives in event modules (`src/event_modules/`) for event-specific concerns and `src/runtime/control/service.rs` for orchestration. CLI subcommands are thin UI adapters that call daemon RPC, which dispatches to service functions.
+1. **One service layer**: business logic lives in event modules (`src/event_modules/`) for event-specific concerns, in state-owned local infra modules for non-event facilities (for example `src/state/subscriptions/*`), and in `src/runtime/control/service.rs` for orchestration. CLI subcommands are thin UI adapters that call daemon RPC, which dispatches to those owner modules.
 2. **Real networking**: invite acceptance uses real QUIC bootstrap sync, not in-process event copying. The daemon manages ongoing sync with discovered peers.
 3. **Testing equivalence**: CLI integration tests exercise the full path (CLI binary → RPC → service → DB/sync). No separate interactive surface exists; the daemon-backed CLI is the single command interface.
 4. **No synthetic shortcuts**: no `copy_event_chain`, no direct DB-to-DB event transfers, no bypass of the sync/projection pipeline. Every event flows through the same ingest path it would in production.
@@ -1534,4 +1534,6 @@ Plan-level enforcement remains:
 1. event-type-specific commands/queries/projectors stay in event modules,
 2. `src/runtime/control/service.rs` remains orchestration-only,
 3. projection pipeline remains orchestration-only,
-4. module boundary checks stay automated in CI where available.
+4. local-only subscription lifecycle/feed storage stays in `src/state/subscriptions/*` (not `event_modules/*`),
+5. event-specific subscription matching/payload shaping stays in `event_modules/<type>/subscription_filter.rs` (or `subscription_filters.rs`),
+6. module boundary checks stay automated in CI where available.

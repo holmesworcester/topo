@@ -113,7 +113,7 @@ pub(crate) fn project_one_step(
         // 8. Subscription hook: evaluate active subscriptions for this event.
         //    For encrypted events, use the decrypted inner event for matching.
         let sub_event = inner_parsed.as_ref().unwrap_or(&parsed);
-        crate::event_modules::subscription::matcher::on_projected_event(
+        crate::state::subscriptions::on_projected_event(
             conn,
             recorded_by,
             &event_id_b64,

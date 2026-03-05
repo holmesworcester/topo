@@ -3,6 +3,7 @@ pub mod layout;
 mod projection_context;
 pub mod projector;
 pub mod queries;
+pub mod subscription_filter;
 pub mod wire;
 
 // Re-export stable public API so callers import from `event_modules::message`.

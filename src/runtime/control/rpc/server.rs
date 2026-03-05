@@ -17,6 +17,7 @@ use crate::event_modules::{message, peer_shared, reaction, user, workspace};
 use crate::node::NodeRuntimeNetInfo;
 use crate::rpc::protocol::*;
 use crate::service;
+use crate::state::subscriptions;
 
 /// Maximum concurrent RPC connections the server will handle.
 /// Additional connections block until a slot is freed.
@@ -882,23 +883,21 @@ fn dispatch(
             spec_json,
         } => match state.require_active_peer() {
             Ok(peer_id) => {
-                use crate::event_modules::subscription;
-
                 // P2: Reject unsupported event types early.
-                if !subscription::matcher::is_supported_event_type(&event_type) {
+                if !subscriptions::is_supported_event_type(&event_type) {
                     return RpcResponse::error(format!(
                         "unsupported event type '{}'; supported: {}",
                         event_type,
-                        subscription::matcher::supported_event_types().join(", "),
+                        subscriptions::supported_event_types().join(", "),
                     ));
                 }
 
-                let dm = match subscription::DeliveryMode::from_str(&delivery_mode) {
+                let dm = match subscriptions::DeliveryMode::from_str(&delivery_mode) {
                     Ok(d) => d,
                     Err(e) => return RpcResponse::error(e),
                 };
-                let mut spec: subscription::SubscriptionSpec = if spec_json.is_empty() {
-                    subscription::SubscriptionSpec {
+                let mut spec: subscriptions::SubscriptionSpec = if spec_json.is_empty() {
+                    subscriptions::SubscriptionSpec {
                         event_type: event_type.clone(),
                         since: None,
                         filters: vec![],
@@ -919,7 +918,7 @@ fn dispatch(
                 }
 
                 // P2b: Validate filter fields and operators against the matcher.
-                if let Err(e) = subscription::matcher::validate_spec(&event_type, &spec) {
+                if let Err(e) = subscriptions::validate_spec(&event_type, &spec) {
                     return RpcResponse::error(format!("invalid spec: {}", e));
                 }
 
@@ -943,10 +942,7 @@ fn dispatch(
                     if !since.event_id.is_empty() && since.created_at_ms == 0 {
                         match service::open_db_for_peer(db_path, &peer_id) {
                             Ok((_rb, ref db)) => {
-                                match subscription::queries::resolve_event_created_at(
-                                    db,
-                                    &since.event_id,
-                                ) {
+                                match subscriptions::resolve_event_created_at(db, &since.event_id) {
                                     Ok(ts) => since.created_at_ms = ts,
                                     Err(e) => {
                                         return RpcResponse::error(format!(
@@ -968,7 +964,7 @@ fn dispatch(
 
                 match service::open_db_for_peer(db_path, &peer_id) {
                     Ok((recorded_by, db)) => {
-                        match subscription::create_subscription(
+                        match subscriptions::create_subscription(
                             &db,
                             &recorded_by,
                             &name,
@@ -988,8 +984,7 @@ fn dispatch(
         RpcMethod::SubList => match state.require_active_peer() {
             Ok(peer_id) => match service::open_db_for_peer(db_path, &peer_id) {
                 Ok((recorded_by, db)) => {
-                    use crate::event_modules::subscription;
-                    match subscription::list_subscriptions(&db, &recorded_by) {
+                    match subscriptions::list_subscriptions(&db, &recorded_by) {
                         Ok(subs) => RpcResponse::success(subs),
                         Err(e) => RpcResponse::error(e),
                     }
@@ -1001,8 +996,7 @@ fn dispatch(
         RpcMethod::SubDisable { subscription_id } => match state.require_active_peer() {
             Ok(peer_id) => match service::open_db_for_peer(db_path, &peer_id) {
                 Ok((recorded_by, db)) => {
-                    use crate::event_modules::subscription;
-                    match subscription::set_enabled(&db, &recorded_by, &subscription_id, false) {
+                    match subscriptions::set_enabled(&db, &recorded_by, &subscription_id, false) {
                         Ok(()) => RpcResponse::success(serde_json::json!({"disabled": true})),
                         Err(e) => RpcResponse::error(e),
                     }
@@ -1014,8 +1008,7 @@ fn dispatch(
         RpcMethod::SubEnable { subscription_id } => match state.require_active_peer() {
             Ok(peer_id) => match service::open_db_for_peer(db_path, &peer_id) {
                 Ok((recorded_by, db)) => {
-                    use crate::event_modules::subscription;
-                    match subscription::set_enabled(&db, &recorded_by, &subscription_id, true) {
+                    match subscriptions::set_enabled(&db, &recorded_by, &subscription_id, true) {
                         Ok(()) => RpcResponse::success(serde_json::json!({"enabled": true})),
                         Err(e) => RpcResponse::error(e),
                     }
@@ -1031,8 +1024,7 @@ fn dispatch(
         } => match state.require_active_peer() {
             Ok(peer_id) => match service::open_db_for_peer(db_path, &peer_id) {
                 Ok((recorded_by, db)) => {
-                    use crate::event_modules::subscription;
-                    match subscription::poll_feed(
+                    match subscriptions::poll_feed(
                         &db,
                         &recorded_by,
                         &subscription_id,
@@ -1053,8 +1045,8 @@ fn dispatch(
         } => match state.require_active_peer() {
             Ok(peer_id) => match service::open_db_for_peer(db_path, &peer_id) {
                 Ok((recorded_by, db)) => {
-                    use crate::event_modules::subscription;
-                    match subscription::ack_feed(&db, &recorded_by, &subscription_id, through_seq) {
+                    match subscriptions::ack_feed(&db, &recorded_by, &subscription_id, through_seq)
+                    {
                         Ok(()) => RpcResponse::success(serde_json::json!({"acked": true})),
                         Err(e) => RpcResponse::error(e),
                     }
@@ -1066,8 +1058,7 @@ fn dispatch(
         RpcMethod::SubState { subscription_id } => match state.require_active_peer() {
             Ok(peer_id) => match service::open_db_for_peer(db_path, &peer_id) {
                 Ok((recorded_by, db)) => {
-                    use crate::event_modules::subscription;
-                    match subscription::get_state(&db, &recorded_by, &subscription_id) {
+                    match subscriptions::get_state(&db, &recorded_by, &subscription_id) {
                         Ok(state) => RpcResponse::success(state),
                         Err(e) => RpcResponse::error(e),
                     }

@@ -17,7 +17,6 @@ pub mod reaction;
 pub mod registry;
 pub mod secret_key;
 pub mod secret_shared;
-pub mod subscription;
 pub mod tenant;
 pub mod user;
 pub mod user_invite;
@@ -121,7 +120,7 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     tenant::ensure_schema(conn)?;
     local_signer_secret::ensure_schema(conn)?;
     invite_privkey::ensure_schema(conn)?;
-    subscription::ensure_schema(conn)?;
+    crate::state::subscriptions::ensure_schema(conn)?;
     Ok(())
 }
 
