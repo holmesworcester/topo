@@ -377,7 +377,7 @@ Completion invariants:
 Transport identity is derived from event-layer peer identity:
 
 1. **Transport identity** (mTLS scope): cert/key material, SPKI fingerprints, `peer_id` derived from BLAKE2b-256 of X.509 SPKI. Managed by `src/runtime/transport/identity.rs` via `src/runtime/transport/identity_adapter.rs`.
-2. **Event-graph identity** (identity layer scope): Ed25519 keys, signer chains, trust anchors, and identity events (types 8-22). Owned by event modules (for example `src/event_modules/workspace/*`, `src/event_modules/invite_accepted.rs`, `src/event_modules/peer_shared/*`, `src/event_modules/local_signer_secret.rs`) and executed through the generic projection pipeline (`src/state/projection/apply/*`).
+2. **Event-graph identity** (identity layer scope): Ed25519 keys, signer chains, accepted workspace bindings (`invites_accepted`), and identity events (types 8-22). Owned by event modules (for example `src/event_modules/workspace/*`, `src/event_modules/invite_accepted.rs`, `src/event_modules/peer_shared/*`, `src/event_modules/local_signer_secret.rs`) and executed through the generic projection pipeline (`src/state/projection/apply/*`).
 
 Transport certs are deterministically derived from PeerShared Ed25519 signing keys, so the two identity scopes are unified. All transport trust is derived from PeerShared Ed25519 public keys via `spki_fingerprint_from_ed25519_pubkey()`.
 
@@ -552,14 +552,14 @@ Netns runbook notes:
 High-level identity operations are owned by event-module commands (`event_modules/workspace/commands.rs`). They compose low-level event creation primitives (from `event_modules/workspace/identity_ops.rs`) into correct sequences.
 
 **Bootstrap** (`workspace::commands::create_workspace`): creates the identity chain for a new workspace owner:
-Workspace → InviteAccepted (trust anchor) → UserInvite → User → DeviceInvite → PeerShared + LocalSignerSecret events (peer_shared, user, workspace) + content key seed.
+Workspace → InviteAccepted (accepted workspace binding) → UserInvite → User → DeviceInvite → PeerShared + LocalSignerSecret events (peer_shared, user, workspace) + content key seed.
 The peer_shared LocalSignerSecret triggers `ApplyTransportIdentityIntent` on projection, installing a PeerShared-derived transport identity.
 Scope rule: `create_workspace` is tenant-scoped. If local transport credentials already exist, `recorded_by` must match a known local tenant peer ID in `local_transport_creds`; unscoped aliases (for example `"bootstrap"`) are rejected. Fresh DB bootstrap (no local creds) is still allowed.
 
 **Invite** (`workspace::commands::create_user_invite`): admin creates a UserInvite event and returns portable invite data (event ID + signing key + workspace ID). Wraps content key for invitee if sender keys are available.
 
 **Accept** (`workspace::commands::join_workspace_as_new_user`): joiner consumes invite data and creates:
-InviteAccepted (trust anchor) → User → DeviceInvite → PeerShared.
+InviteAccepted (accepted workspace binding) → User → DeviceInvite → PeerShared.
 Prerequisite: the joiner's DB must already contain the Workspace and UserInvite events (copied from the inviter before or during sync).
 The acceptance path also unwraps bootstrap content-key material received via `secret_shared` events (wrapped to the invite public key at creation time) and materializes local `secret_key` events so that encrypted content received during bootstrap sync can be decrypted.
 Signer secrets (LocalSignerSecret events) are NOT emitted here; `persist_join_signer_secrets` is called separately after push-back sync completes.
@@ -663,12 +663,12 @@ A single node process can host N tenant identities in one shared SQLite database
 The DB is the tenant registry. No explicit tenant registration step is required. The node discovers its tenants by joining two tables:
 
 ```sql
-SELECT t.peer_id, t.workspace_id, c.cert_der, c.key_der
-FROM trust_anchors t
-JOIN local_transport_creds c ON t.peer_id = c.peer_id
+SELECT i.recorded_by, i.workspace_id, c.cert_der, c.key_der
+FROM invites_accepted i
+JOIN local_transport_creds c ON i.recorded_by = c.peer_id
 ``` 
 
-`trust_anchors` is populated by `invite_accepted` (local-only, part of the identity bootstrap). `local_transport_creds` is populated during identity bootstrap: invite acceptance may install an invite-derived bootstrap cert first, then projection installs the PeerShared-derived cert.
+`invites_accepted` is populated by `invite_accepted` (local-only, part of the identity bootstrap). `local_transport_creds` is populated during identity bootstrap: invite acceptance may install an invite-derived bootstrap cert first, then projection installs the PeerShared-derived cert.
 
 Why certs are part of discovery:
 1. event-layer identity establishes who the tenant is,
@@ -696,7 +696,7 @@ The single QUIC endpoint uses a union trust closure that accepts connections tru
 - `invite_bootstrap_trust` rows (accepted invite-link bootstrap, TTL-bounded),
 - `pending_invite_bootstrap_trust` rows (inviter-side pre-handshake, TTL-bounded).
 
-Trust checks are **tenant-scoped** (`recorded_by`-partitioned). Value-level trust-set overlap is allowed (the same SPKI may appear in multiple tenants' trust rows), and the union closure permits the shared endpoint to accept connections for any local tenant. `trust_anchors` is read during startup tenant discovery (to enumerate local tenant/workspace bindings), but per-connection authorization uses `is_peer_allowed` over PeerShared/bootstrap trust tables, not `trust_anchors`.
+Trust checks are **tenant-scoped** (`recorded_by`-partitioned). Value-level trust-set overlap is allowed (the same SPKI may appear in multiple tenants' trust rows), and the union closure permits the shared endpoint to accept connections for any local tenant. `invites_accepted` is read during startup tenant discovery (to enumerate local tenant/workspace bindings), but per-connection authorization uses `is_peer_allowed` over PeerShared/bootstrap trust tables, not `invites_accepted`.
 
 ### Removal-driven session teardown
 
@@ -845,7 +845,7 @@ ProjectorResult {
 
 ### EmitCommand types
 
-1. `RetryWorkspaceEvent { workspace_id }` — re-project the specific workspace event after trust anchor set by invite_accepted.
+1. `RetryWorkspaceEvent { workspace_id }` — re-project the specific workspace event after accepted-workspace binding is written by `invite_accepted`.
 2. `RetryFileSliceGuards { file_id }` — re-project file_slice events after descriptor arrives.
 3. `RecordFileSliceGuardBlock { file_id, event_id }` — record guard-block for pending file_slices; consumed by `RetryFileSliceGuards` after descriptor projection (see section 12.2 file attachment flow and section 5.2 cascade lifecycle).
 4. `ApplyTransportIdentityIntent { intent }` — apply typed transport identity transitions through the `TransportIdentityAdapter` boundary.
@@ -872,7 +872,7 @@ Context ownership rule:
 
 Fields include:
 
-- `trust_anchor_workspace_id` — trust anchor for this tenant
+- `accepted_workspace_id` — accepted workspace binding for this tenant
 - `target_message_author` / `target_tombstone_author` — for deletion auth
 - `deletion_intents` — pre-existing deletion intents (for delete-before-create convergence)
 - `target_message_deleted` — for reaction skip-on-delete
@@ -941,7 +941,7 @@ Deterministic emitted-event rule detail:
 Some behavior stays explicit by design:
 
 1. deletion/tombstone cascades (`message_deletion` and related checks),
-2. trust-anchor handling in `invite_accepted` (first-write-wins anchor write + explicit `RetryWorkspaceEvent` replay trigger),
+2. accepted-workspace binding handling in `invite_accepted` (`invites_accepted` write + explicit `RetryWorkspaceEvent` replay trigger),
 3. identity/removal policy checks from TLA guards.
 
 ### Deletion intent + tombstone lifecycle
@@ -1423,14 +1423,14 @@ Identity phase projector predicates are derived from an explicit TLA causal mode
 Rust projector guards map 1:1 to named model guards.
 
 Required invariants (TLC-checked):
-1. `InvWorkspaceAnchor`: workspace validity requires a matching trust anchor,
+1. `InvWorkspaceAnchor`: workspace validity requires a matching accepted workspace binding,
 2. `InvSingleWorkspace`: at most one workspace row per peer in the workspaces table,
 3. `InvForeignWorkspaceExcluded`: a foreign workspace event can never become valid,
-4. `InvTrustAnchorMatchesCarried`: trust anchor always matches the event-carried `workspace_id`.
+4. `InvTrustAnchorMatchesCarried`: accepted workspace winner always matches an event-carried `workspace_id`.
 
 Workspace binding proof: the invite determines which workspace a peer accepts; only that workspace can project. The guard mechanism checks that a workspace event's id matches the binding, structurally excluding foreign workspace events.
 
-Invite-workspace binding: `invite_accepted` binds the trust anchor directly from its own `workspace_id` field using first-write-wins immutable semantics. No pre-projection capture authority.
+Invite-workspace binding: `invite_accepted` writes `invites_accepted` rows directly from its own `workspace_id` field. Winner selection is read-time deterministic (`ORDER BY created_at, event_id LIMIT 1`). No pre-projection capture authority.
 
 Projector-spec mapping: each Rust projector predicate maps to a named TLA guard. The full mapping is maintained in `docs/tla/projector_spec.md`. Any divergence between projector logic and TLA guards is treated as a spec bug that must be resolved before adding new behavior.
 
@@ -1446,7 +1446,7 @@ Projector-spec mapping: each Rust projector predicate maps to a named TLA guard.
 
 Tests are organized into three layers, each exercising a different scope of the TLA+ conformance contract:
 
-1. **Projector unit** (`tests/projectors/*_projector_tests.rs`) — pure function contract. Each test calls `project_pure(event, ctx)` directly with a hand-built `ContextSnapshot` and asserts decision, write_ops, and emit_commands. Covers event-local predicates (trust anchor, signer mismatch, deletion author, bootstrap trust emission, file slice auth).
+1. **Projector unit** (`tests/projectors/*_projector_tests.rs`) — pure function contract. Each test calls `project_pure(event, ctx)` directly with a hand-built `ContextSnapshot` and asserts decision, write_ops, and emit_commands. Covers event-local predicates (accepted workspace binding, signer mismatch, deletion author, bootstrap trust emission, file slice auth).
 2. **Pipeline integration** (`src/state/projection/apply/tests/`) — shared pipeline stages. Tests exercise `project_one_step` end-to-end through dep presence, dep type checks, signer resolution, encrypted wrapper decrypt/dispatch, and cascade unblock. Uses a real SQLite DB with the full projection pipeline.
 3. **Replay/order conformance** (`src/state/projection/apply/tests/`) — model-critical convergence properties. Source-isomorphism tests replay the same events in different orderings and assert identical terminal state. Covers out-of-order convergence, idempotent replay, stable terminal state, and deletion two-stage convergence.
 
@@ -1465,12 +1465,12 @@ We do not use multimodal `invite(mode=...)` type (even though it would be DRY) b
 Implementation uses shared invite helper logic with per-type policy tables.
 Interactive CLI keeps real invite links (`topo://invite/...`, `topo://link/...`) in frontend state; session-local invite numbers are aliases to those links.
 
-## 9.3 Trust-anchor cascade
+## 9.3 Accepted-workspace cascade
 
-`invite_accepted` records trust-anchor intent for `workspace_id` in tenant scope.
+`invite_accepted` records accepted-workspace binding rows for `workspace_id` in tenant scope (`invites_accepted`).
 
 Required semantics:
-1. workspace is not valid until trust anchor exists,
+1. workspace is not valid until an accepted-workspace binding exists,
 2. invite events and invites are not forced-valid,
 3. normal signer/dependency chain still governs validity,
 4. bootstrap transport trust rows (`invite_bootstrap_trust`, `pending_invite_bootstrap_trust`) are projection-owned state, produced by concrete event projectors:
@@ -1485,13 +1485,13 @@ Required semantics:
 Self-invite bootstrap stays explicit:
 
 1. create `workspace`,
-2. create bootstrap `user_invite`,
-3. locally accept invite (`invite_accepted`),
+2. locally self-bind with `invite_accepted(workspace_id = workspace_event_id)`,
+3. create bootstrap `user_invite`,
 4. cascade unblocks `workspace -> user_invite -> user -> device_invite -> peer_shared`.
 
 Guard placement rules:
-1. trust-anchor guard applies to root workspace events only; foreign root ids must not become valid,
-2. `invite_accepted` is a local trust-anchor binding event (no invite-presence dependency gate). In peer scope, it binds anchor from carried `workspace_id` with first-write-wins; a conflicting `workspace_id` for an already anchored peer is rejected,
+1. accepted-workspace guard applies to root workspace events only; foreign root ids must not become valid,
+2. `invite_accepted` is a local accepted-workspace binding event (no invite-presence dependency gate). It writes its own binding row from carried `workspace_id`; winner selection is deterministic at read time (`created_at,event_id`),
 3. new user/device/peer identities are still gated by normal signer/dependency validation in the same peer scope (for example `user -> user_invite`, `peer_shared -> device_invite`),
 4. bootstrap transport trust is persisted in SQL and queried at connection creation time; projected peer keys are not treated as in-memory-only authority.
 
@@ -1640,7 +1640,7 @@ Retired event type 4 is rejected by unknown-type dispatch in this epoch.
 
 ### Low-memory strategy (`low_mem_ios`)
 
-Trust and key sets use SQL indexed point lookups, not full in-memory loading. The projection tables (`trust_anchors`, identity chain tables, bootstrap trust tables) are queried on demand with indexed `(recorded_by, ...)` keys.
+Trust and key sets use SQL indexed point lookups, not full in-memory loading. The projection tables (`invites_accepted`, identity chain tables, bootstrap trust tables) are queried on demand with indexed `(recorded_by, ...)` keys.
 
 There is no dedicated unbounded in-memory trust/key hot cache; low-memory behavior relies on indexed SQL lookups plus statement caching (`prepare_cached`).
 
@@ -1674,7 +1674,7 @@ Current baseline already includes reactions, message deletion, attachments, and 
 
 1. declaring schema + projection table metadata,
 2. using default **autowrite** where possible (projector returns deterministic `InsertOrIgnore` writes only, no emitted commands),
-3. introducing explicit special projector logic only when policy semantics require it (for example trust-anchor retries, bootstrap trust supersession, deletion intent/tombstone coupling, or guard-block retry flows).
+3. introducing explicit special projector logic only when policy semantics require it (for example accepted-workspace retries, bootstrap trust supersession, deletion intent/tombstone coupling, or guard-block retry flows).
 
 ## 12.2 File attachments and large payload flows
 
@@ -1714,7 +1714,7 @@ After completing all phases in `PLAN.md`, the system is:
 3. one projection/dependency engine for cleartext and encrypted events,
 4. queue-driven operational control with explicit atomic boundaries,
 5. tenant-scoped shared tables,
-6. trust-anchor and identity behavior grounded in TLA guard mappings.
+6. accepted-workspace and identity behavior grounded in TLA guard mappings.
 7. multitenant
 
 The result is a small protocol core with clear upgrade paths instead of a stack of exceptions.
@@ -1851,7 +1851,7 @@ Do not reintroduce a global layout monolith. When adding a new event type, defin
 
 ## 14.6 Explicit workspace guard retry
 
-The `invite_accepted` projector emits `RetryWorkspaceEvent { workspace_id }` after writing the trust anchor. This explicitly targets the known workspace event for re-projection, flowing through normal `project_one` + cascade. The workspace projector guard-blocks when no trust anchor exists and unblocks when retried after the trust anchor is set by `invite_accepted`.
+The `invite_accepted` projector emits `RetryWorkspaceEvent { workspace_id }` after writing `invites_accepted`. This explicitly targets the known workspace event for re-projection, flowing through normal `project_one` + cascade. The workspace projector guard-blocks when no accepted-workspace binding exists and unblocks when retried after the binding is written by `invite_accepted`.
 
 ## 14.7 Adding a new event type
 

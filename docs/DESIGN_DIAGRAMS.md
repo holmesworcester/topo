@@ -325,7 +325,7 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-    INV["UserInvite invite event"] --> IA["InviteAccepted (local trust anchor)"]
+    INV["UserInvite invite event"] --> IA["InviteAccepted (local accepted binding)"]
     INV --> UB["User (signed_by = invite_event_id)"]
     UB --> DIF["DeviceInvite (signed_by = user_event_id)"]
     DIF --> PSF["PeerShared (signed_by = device_invite_event_id)"]
@@ -349,7 +349,7 @@ flowchart LR
 ```mermaid
 flowchart LR
     USER["Existing User"] --> DINV["DeviceInvite link invite"]
-    DINV --> IA["InviteAccepted (local trust anchor)"]
+    DINV --> IA["InviteAccepted (local accepted binding)"]
     DINV --> PSF["PeerShared (new device)"]
     USER --> PSF
     PSF --> LSP["LocalSignerSecret (peer_shared)"]

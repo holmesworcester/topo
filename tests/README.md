@@ -41,7 +41,7 @@ Library-level integration tests using `Peer` + `ScenarioHarness` (no CLI binary)
 | `encryption.rs` | PSK/encrypted event sync, out-of-order key delivery |
 | `queue.rs` | Project queue crash recovery, egress queue lifecycle |
 | `deletion.rs` | Deletion sync, before-target, encrypted deletion |
-| `identity.rs` | Identity chain bootstrap, key wrap/unwrap, trust anchors (pure, no network) |
+| `identity.rs` | Identity chain bootstrap, accepted-workspace binding, key wrap/unwrap (pure, no network) |
 | `identity_sync.rs` | Identity join/cascade/device-link via network sync |
 | `shared_db.rs` | Multi-tenant shared DB isolation and sync |
 | `mdns.rs` | mDNS peer discovery and sync (requires `discovery` feature) |

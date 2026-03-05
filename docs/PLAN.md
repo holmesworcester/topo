@@ -25,7 +25,7 @@ This document is ordered exactly as we should build it.
 9. `Phase 9`: Durable queue architecture (`ingress`, `project`, `egress`) and workers.
 10. `Phase 10`: Non-identity special-case projector logic (deletion/emitted-events).
 11. `Phase 11`: Performance hardening, observability, scaling, and low-memory iOS mode.
-12. `Phase 12`: TLA-first minimal identity layer for trust-anchor cascade, removal, and sender-subjective encryption.
+12. `Phase 12`: TLA-first minimal identity layer for accepted-workspace cascade, removal, and sender-subjective encryption.
 13. `Phase 13`: Functional multitenancy — one node hosting N tenant identities in a shared DB with one shared QUIC endpoint and per-tenant routing/discovery.
 
 Scheduling note:
@@ -63,11 +63,11 @@ For active work:
 - No per-event transit wrapper. QUIC + mTLS secures the channel.
 - Use separate tables for permanent canonical data vs operational queues.
 - Use separate invite event types (`user_invite`, `device_invite`), not one multimodal invite with `mode=*`.
-- `invite_accepted` is local trust-anchor binding:
-  - it binds trust anchor from carried `workspace_id` in peer scope (first-write-wins),
-  - it is not gated by the root-workspace trust-anchor guard itself,
-  - conflicting `workspace_id` for an already anchored peer scope is rejected.
-- Trust-anchor guards apply to root workspace events (foreign root ids must not become valid).
+- `invite_accepted` is local accepted-workspace binding:
+  - it writes `invites_accepted` rows from carried `workspace_id` in peer scope,
+  - it is not gated by the root-workspace accepted-workspace guard itself,
+  - winner selection is deterministic at read time (`created_at,event_id`).
+- Accepted-workspace guards apply to root workspace events (foreign root ids must not become valid).
 - Deterministic emitted event types stay inside the emitted-event rule flow but are unsigned for determinism (`no signed_by/signer_type/signature`).
 
 ## 2.1 Locked design requirements (explicit)
@@ -99,8 +99,8 @@ These are required, not optional:
    - blocked rows that are policy-appropriate for a tenant (for example non-recipient encrypted/key-share events) are expected and must not be treated as sync failure.
 10. Guard-placement requirement.
    - `invite_accepted` is a local anchor-binding event, not a global invite-presence gate.
-   - trust-anchor gating belongs on root workspace event validity.
-   - do not use pre-projection raw-blob capture tables as authority for trust-anchor binding.
+   - accepted-workspace gating belongs on root workspace event validity.
+   - do not use pre-projection raw-blob capture tables as authority for accepted-workspace binding.
 11. Identity pre-derive.
    - `create_workspace`, `accept_invite`, and `accept_device_link` pre-derive the PeerShared key and write events under the final `recorded_by` from first write — no `finalize_identity`.
    - invite acceptance / device link may install invite-derived bootstrap transport certs first, but tenant scope key remains final and projection later installs PeerShared-derived transport identity.
@@ -515,7 +515,7 @@ Deterministic emitted-event exception (still under this rule):
 
 - `message_deletion` uses the two-stage deletion intent + tombstone model (see Phase 10).
 - deterministic emitted-event patterns (for example key material derivations) using the unsigned deterministic exception above.
-- identity-specific exceptions (`invite_accepted` trust-anchor binding via `RetryWorkspaceEvent { workspace_id }`, removal enforcement, transport identity intent application) implemented via explicit projector decisions + `WriteOp`/`EmitCommand` handling.
+- identity-specific exceptions (`invite_accepted` accepted-workspace binding via `RetryWorkspaceEvent { workspace_id }`, removal enforcement, transport identity intent application) implemented via explicit projector decisions + `WriteOp`/`EmitCommand` handling.
 
 ### Deletion intent + tombstone contract (Phase 10)
 
@@ -631,7 +631,7 @@ The codebase provides two create-and-project entry points reflecting distinct ca
 
 1. **`create_event_synchronous`** (strict, PLAN-normative): returns `Ok(event_id)` only when projection reaches `Valid` or `AlreadyProcessed`. Returns `Err(Blocked { event_id, missing })` or `Err(Rejected { event_id, reason })` otherwise. All user-facing service commands (`svc_send`, `svc_react`, `svc_delete_message`, `svc_generate`) use this API.
 
-2. **`create_event_staged`** (lenient, bootstrap-only): wraps `Blocked` errors into `Ok(event_id)` via `event_id_or_blocked`. Used in identity bootstrap command paths (for example `create_workspace`, `join_workspace_as_new_user`, `add_device_to_workspace`) where events like `Workspace` can be created before their trust-anchor dependency exists and are expected to block until the anchor arrives.
+2. **`create_event_staged`** (lenient, bootstrap-only): wraps `Blocked` errors into `Ok(event_id)` via `event_id_or_blocked`. Used in identity bootstrap command paths (for example `create_workspace`, `join_workspace_as_new_user`, `add_device_to_workspace`) where events like `Workspace` can be created before their accepted-workspace dependency exists and are expected to block until the binding arrives.
 
 This split is intentional and correct: it preserves the strict contract for user-facing orchestration while allowing bootstrap chains to store pre-dependency events without aborting.
 
@@ -1078,12 +1078,12 @@ Before writing identity/removal/encryption projectors in Rust:
    - unblocked signer enables signature verification,
    - invalid signature rejects (not block).
 2. Build/update a TLA+ model of causal relationships and guards for this phase.
-3. Model split invite types (`user_invite`, `device_invite`) and trust-anchor semantics.
-4. **Model workspace binding**: workspace events must be parameterized by workspace id, and the trust anchor must bind to a specific workspace. The model must prove that foreign workspace events (for workspaces the peer did not accept an invite for) can never become valid. Without this, the model cannot distinguish between valid and invalid workspace events, making it insufficiently expressive for multi-workspace scenarios. See `InvWorkspaceAnchor`, `InvSingleWorkspace`, `InvForeignWorkspaceExcluded` invariants.
-5. **Model invite-derived trust anchor binding**: the trust anchor must bind deterministically to the workspace referenced by the invite, not by a free nondeterministic choice at `invite_accepted` time. The model captures which workspace an invite references when the first invite is recorded (`inviteCarriedWorkspace` variable); `invite_accepted` then reads `inviteCarriedWorkspace` to set the trust anchor. This ensures the binding mechanism is faithful to the real protocol where the invite blob carries a `workspace_id`. See `InvTrustAnchorMatchesCarried` invariant.
+3. Model split invite types (`user_invite`, `device_invite`) and accepted-workspace semantics.
+4. **Model workspace binding**: workspace events must be parameterized by workspace id, and the accepted binding must resolve to a specific workspace winner. The model must prove that foreign workspace events (for workspaces the peer did not accept an invite for) can never become valid. Without this, the model cannot distinguish between valid and invalid workspace events, making it insufficiently expressive for multi-workspace scenarios. See `InvWorkspaceAnchor`, `InvSingleWorkspace`, `InvForeignWorkspaceExcluded` invariants.
+5. **Model invite-derived accepted-workspace binding**: the accepted workspace winner must derive from event-carried `workspace_id` values, with deterministic winner selection. This ensures the binding mechanism is faithful to the real protocol where accepted rows carry `workspace_id`. See `InvTrustAnchorMatchesCarried` invariant.
 6. **Model guard placement explicitly (poc-6 parity)**:
-   - trust-anchor guard applies to root workspace events,
-   - `invite_accepted` is local anchor binding from carried `workspace_id` (no invite-presence dep gate),
+   - accepted-workspace guard applies to root workspace events,
+   - `invite_accepted` is local binding from carried `workspace_id` (no invite-presence dep gate),
    - downstream identity admission (`user`/`device`/`peer`) still requires signer/dependency chain validity in the same peer scope.
 7. Verify bootstrap/self-invite, join, device-link, and removal safety invariants.
 8. Freeze a projector-spec mapping table: each projector predicate/check maps to a named TLA guard.
@@ -1096,7 +1096,7 @@ Projector implementations should mirror TLA conditions as directly as possible.
 ## 11.2 Minimal identity scope
 
 Only include identity and policy needed for:
-- trust-anchor bootstrap/join cascade
+- accepted-workspace bootstrap/join cascade
 - self-invite bootstrap flow
 - device linking
 - removal enforcement
@@ -1109,7 +1109,7 @@ Only include identity and policy needed for:
 Use separate types:
 - `user_invite` (invites a user identity)
 - `device_invite` (invites/links a peer device to a user)
-- `invite_accepted` (records trust-anchor binding; local SQL also stores accepted invite-link bootstrap metadata)
+- `invite_accepted` (records accepted-workspace binding; local SQL also stores accepted invite-link bootstrap metadata)
 
 Do not use one `invite` type with `mode=user|peer`.
 
@@ -1117,35 +1117,32 @@ Implementation requirement:
 - keep one shared invite projector helper with per-type policy tables (signer/dependency checks).
 - this keeps logical separation for TLA/model checking while avoiding duplicated Rust control flow.
 
-## 11.4 Trust-anchor cascade requirements (from `poc-6`/TLA model)
+## 11.4 Accepted-workspace cascade requirements (from `poc-6`/TLA model)
 
 Required behavior:
-- `invite_accepted` records trust anchor intent for `workspace_id` (per `recorded_by` peer scope).
+- `invite_accepted` records accepted-workspace binding rows for `workspace_id` (per `recorded_by` peer scope).
 - `invite_accepted` is a local binding step from event-carried `workspace_id` (no invite-presence dep gate).
-- if a different trust anchor already exists for that peer scope, `invite_accepted` is rejected.
 - downstream identity events (`user`, `device_invite`, `peer_shared`) remain dependency/signer-gated in peer scope.
-- root `workspace` events are not valid until corresponding trust anchor exists and matches the root id.
-- trust-anchor binding must come from validated projector input fields, not pre-projection capture tables.
+- root `workspace` events are not valid until a corresponding accepted-workspace binding exists and matches the root id.
+- accepted-workspace binding must come from validated projector input fields, not pre-projection capture tables.
 - invites are never force-valid; they validate only through signer/dependency chain.
 - accepted invite links produce bootstrap transport trust tuples in SQL via projection:
   - service layer writes local `bootstrap_context` rows (inviter address + SPKI fingerprint from invite link),
   - invite projectors read `bootstrap_context` and write bootstrap trust rows via deterministic `WriteOp::InsertOrIgnore`,
   - peer_shared projector consumes matching bootstrap trust rows via deterministic `WriteOp::Delete`,
   - trust rows are looked up by sync on each connection/handshake (no in-memory-only trust authority).
-  - this follows the same poc-6 cascade pattern where `invite_accepted` projection drives trust-anchor establishment and workspace event unblocking.
+  - this follows the same poc-6 cascade pattern where `invite_accepted` projection drives accepted-workspace establishment and workspace event unblocking.
 
-TODO (naming and projection simplification):
-- Add an `invites_accepted` projection table owned by the `invite_accepted` projector (event-to-own-table clarity).
-- Migrate trust-anchor reads to `invites_accepted` and retire `trust_anchors` after compatibility transition.
-- Keep gating in both places:
-  - `invite_accepted` projector enforces first-write-wins workspace binding for the tenant scope and emits retry/unblock intent for matching blocked workspace events.
-  - `workspace` projector validates that a matching accepted-invite row already exists in `invites_accepted`.
-- End state: trust-anchor authority derives from `invite_accepted` projection rows only; no separate vague authority table.
+Current state (implemented):
+- `invite_accepted` owns `invites_accepted` projection rows directly (event-to-own-table clarity).
+- Workspace/tenant reads resolve binding from `invites_accepted` winner row (`created_at,event_id`).
+- `workspace` projector validates that a matching accepted-invite winner exists before projection.
+- End state authority is `invite_accepted` projection rows only; there is no separate `trust_anchors` table.
 
 Self-invite bootstrap sequence must stay explicit:
 1. create `workspace` event (integrity self-sign only).
-2. create bootstrap `user_invite` signed by workspace authority.
-3. accept invite locally -> `invite_accepted(workspace_id=...)`.
+2. accept workspace locally -> `invite_accepted(workspace_id=workspace_event_id)`.
+3. create bootstrap `user_invite` signed by workspace authority.
 4. normal cascade unblocks: `workspace -> user_invite -> user -> device_invite -> peer_shared`.
 
 ## 11.4.1 Poc-6-aligned high-level bootstrap migration plan
@@ -1155,7 +1152,7 @@ Use `poc-6` as reference behavior for end-to-end test setup:
 2. Alice creates invite link (contains bootstrap address + inviter SPKI fingerprint + invite event ID + invite private key + workspace ID). Wrapped content-key material is delivered via `secret_shared` events during bootstrap sync, not embedded in the invite link payload.
 3. Bob accepts invite link via high-level accept API:
    - records local `invite_accepted`,
-   - writes trust anchor binding (`workspace_id`),
+   - writes accepted-workspace binding (`workspace_id`),
    - stores accepted-invite bootstrap transport trust tuple in SQL,
    - unwraps bootstrap content-key material using invite private key and inviter public key,
    - materializes local `secret_key` events with deterministic event IDs (matching inviter's key IDs).
@@ -1314,7 +1311,7 @@ TLA-led acceptance:
 2. Rust projector predicates map 1:1 to TLA guard conditions for identity/removal/encryption gate checks.
 
 Behavior tests:
-1. Self-invite bootstrap: trust anchor recorded, then normal cascade to first `peer_shared`.
+1. Self-invite bootstrap: accepted-workspace binding recorded, then normal cascade to first `peer_shared`.
 2. User-join flow via `user_invite` keeps signer/dependency blocking semantics.
 3. Device-link flow via `device_invite` keeps signer/dependency blocking semantics.
 4. No force-valid invites: invite remains blocked until signer path is valid.

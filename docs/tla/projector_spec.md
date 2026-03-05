@@ -84,7 +84,7 @@ Changes to this document require TLA+ model re-verification.
 
 | Guard | TLA+ Definition | Rust Check | Applies To |
 |-------|----------------|------------|------------|
-| TrustAnchorMatch | trustAnchor[p] = WorkspaceEventId(e) | trust_anchors.workspace_id = event.workspace_id; Block if no anchor | type 8 (Workspace) |
+| TrustAnchorMatch | trustAnchor[p] = WorkspaceEventId(e) | winner(`invites_accepted`) = event.workspace_id; Block if no accepted binding | type 8 (Workspace) |
 
 ## Projection Tables
 
@@ -98,7 +98,7 @@ Changes to this document require TLA+ model re-verification.
 | 6 | project_secret | secret_keys | — |
 | 7 | project_message_deletion | deleted_messages | author auth + cascade |
 | 8 | project_workspace | workspaces | TrustAnchorMatch guard |
-| 9 | project_invite_accepted | invite_accepted | writes trust_anchors (first-write-wins immutable); emits WriteAcceptedBootstrapTrust |
+| 9 | project_invite_accepted | invites_accepted | writes accepted-binding row; emits RetryWorkspaceEvent + WriteAcceptedBootstrapTrust |
 | 10 | project_user_invite | user_invites | emits WritePendingBootstrapTrust (gated by is_local_create) |
 | 11 | retired (code reserved) | — | rejected as unknown type |
 | 12 | project_device_invite | device_invites | emits WritePendingBootstrapTrust (gated by is_local_create) |
@@ -281,8 +281,8 @@ The following parser-level canonicalization guarantees are enforced in Rust but 
 | InvSigner | Signer verification in apply_projection |
 | InvWorkspaceAnchor | test_foreign_workspace_excluded: foreign workspace blocked |
 | InvSingleWorkspace | At most one workspace row per peer in workspaces table |
-| InvTrustAnchorImmutable | test_bootstrap_sequence: trust anchor is immutable once set; mismatch rejected |
-| InvTrustAnchorSource | invite_accepted must be valid for trust anchor to be set |
+| InvTrustAnchorImmutable | test_trust_anchor_immutability: accepted-workspace winner remains earliest `(created_at,event_id)` |
+| InvTrustAnchorSource | invite_accepted must be valid for accepted-binding rows to be set |
 | InvBootstrapTrustSource | bootstrap transport trust (`invite_bootstrap_trust`) is derived only from valid `invite_accepted` |
 | InvBootstrapTrustMatchesCarried | bootstrap trust identity matches invite-carried bootstrap identity fields |
 | InvBootstrapTrustConsumedByPeerShared | bootstrap trust is consumed when equivalent PeerShared-derived trust appears |

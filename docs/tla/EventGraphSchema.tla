@@ -23,8 +23,11 @@ EXTENDS Naturals, FiniteSets
 \*
 \* Workspace binding refinement:
 \*   Workspace events are parameterized by workspace id.
-\*   invite_accepted binds trustAnchor directly from its own workspace_id field
-\*   (first-write-wins; conflicting invite_accepted is rejected).
+\*   invite_accepted binds trustAnchor directly from its own workspace_id field.
+\*   Model approximation: trustAnchor is a single first-write-wins value, so
+\*   conflicting invite_accepted cannot change it (modeled as reject/no-op).
+\*   Runtime stores all rows in invites_accepted and resolves winner at read time
+\*   by (created_at, event_id).
 \*   invite_accepted also carries bootstrap transport trust metadata
 \*   (inviter peer identity from invite link), projected to bootstrapTrustPeer.
 \*   Guard checks that a workspace event's id matches the peer's binding.
