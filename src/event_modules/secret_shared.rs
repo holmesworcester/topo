@@ -282,7 +282,7 @@ pub fn project_pure(
 
 pub static SECRET_SHARED_META: EventTypeMeta = EventTypeMeta {
     type_code: EVENT_TYPE_SECRET_SHARED,
-    type_name: "secret_shared",
+    type_name: "key_shared",
     projection_table: "secret_shared",
     share_scope: ShareScope::Shared,
     dep_fields: &["recipient_event_id", "unwrap_key_event_id", "signed_by"],

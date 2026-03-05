@@ -53,6 +53,8 @@ This PoC exists to prove the practicality of a principled approach that uses [ev
 * **Multitenancy can be built-in** - We can use event sourcing and workspace differentiation via mTLS to make multitenancy a first-class thing, serve many Slack-like workspaces at the same cloud endpoint, and offer multi-account UIs out-of-the-box. Tenant creation and removal is event-based and deterministic like everything else.
 * **Regular (fixed-length) wire formats** - [Langsec](https://langsec.org/) counsels that parsers can be made much more secure when data type complexity is limited, with regular (fixed-length-field) wire formats being the most tractable for secure parsing and formal verification. We keep our wire formats fixed-length.
 * **Keys can just be dependencies** - There are no special queues for events with missing signer or decryption keys: these are just declared dependencies (key material is stored in events with id's) and block/unblock accordingly.
+* **Canonical event naming** - For local/shared pairs, use `*_secret` / `*_shared` names (`peer_secret`/`peer_shared`, `invite_secret` + invite shared events, `key_secret`/`key_shared`). Avoid ad-hoc aliases.
+* **Project-to-own-table rule** - Event projectors write to their own event table. They may read dependency-event tables as projection context, but cross-event side effects must flow through emitted events (or explicit runtime intents), not direct ad-hoc writes into other event tables. (Operational non-event tables, such as bootstrap trust bridges, are separate.)
 * **Realistic testing** - We can run realistic tests locally with deterministic simulation of the event pipeline. Tests can check that for all relevant scenarios, reverse or adversarial reorderings of events and duplicated event replays all will yield the same state.
 
 ## Design Goal
@@ -72,7 +74,7 @@ Every participant begins by starting a daemon (`topo ... start`) with a local da
 
 ### Workspace Creation And First User Creation
 
-A workspace creator starts from an empty store. The create workspace command emits the initial auth event graph (`workspace`, bootstrap `user_invite`, `invite_accepted`, `user`, `device_invite`, `peer_shared`) plus local signer/key material. Tenant identity (`recorded_by`) is pre-derived from the final PeerShared identity before writes begin, so bootstrap rows are already in the same scope used later for normal operation. (There is no "temporary tenant identity" that must be migrated later.)
+A workspace creator starts from an empty store. The create workspace command emits the initial auth event graph (`workspace`, bootstrap `user_invite_shared`, `invite_accepted`, `user`, `peer_invite_shared`, `peer_shared`) plus local signer/key material. Tenant identity (`recorded_by`) is pre-derived from the final PeerShared identity before writes begin, so bootstrap rows are already in the same scope used later for normal operation. (There is no "temporary tenant identity" that must be migrated later.)
 
 ### Creation And Projection Share One Path
 
@@ -80,15 +82,15 @@ Local event creation is synchronous at the command boundary, and every event sti
 
 ### Inviting And Joining
 
-After workspace creation, an admin creates a `user_invite` event (which is synced to all existing members, if any) and shares invite data. The joiner accepts via `invite_accepted` and writes the follow-on identity chain (including a signed proof of invitation which all existing members can verify) for that joiner's user/device/peer identity. Normal sync brings missing canonical events, and the blocked rows unblock through the same dependency mechanism. If join prerequisites (such as prior auth events) are not yet present locally, the join path does not fork into ad-hoc recovery logic.
+After workspace creation, an admin creates a `user_invite_shared` event (which is synced to all existing members, if any) and shares invite data. The joiner accepts via `invite_accepted` and writes the follow-on identity chain (including a signed proof of invitation which all existing members can verify) for that joiner's user/device/peer identity. Normal sync brings missing canonical events, and the blocked rows unblock through the same dependency mechanism. If join prerequisites (such as prior auth events) are not yet present locally, the join path does not fork into ad-hoc recovery logic.
 
 ### Auth Event Graph Drives Join-Window Connection Policy
 
-To avoid a chicken/egg problem, peers need to establish sessions before full steady-state PeerShared trust is present. The design handles this with projection-owned bootstrap trust rows fed by invite bootstrap context. Concretely: `invite_accepted` projection does write accepted bootstrap trust (`invite_bootstrap_trust`) when bootstrap context is present and that SPKI is not already superseded by projected PeerShared trust; inviter-side pending bootstrap trust (`pending_invite_bootstrap_trust`) is written by `user_invite`/`device_invite` projectors on local invite creation. This lets first-contact handshakes happen under strict control of the auth event graph and tenant-scoped trust checks, rather than ad-hoc transport exceptions. Then, once `peer_shared` is projected, matching bootstrap trust is deterministically consumed and removed, and ongoing peering decisions remain on steady-state trust only, based on device/peer public keys, not invite public keys.
+To avoid a chicken/egg problem, peers need to establish sessions before full steady-state PeerShared trust is present. The design handles this with projection-owned bootstrap trust rows fed by invite bootstrap context. Concretely: `invite_accepted` projection does write accepted bootstrap trust (`invite_bootstrap_trust`) when bootstrap context is present and that SPKI is not already superseded by projected PeerShared trust; inviter-side pending bootstrap trust (`pending_invite_bootstrap_trust`) is written by `user_invite_shared`/`peer_invite_shared` projectors on local invite creation. This lets first-contact handshakes happen under strict control of the auth event graph and tenant-scoped trust checks, rather than ad-hoc transport exceptions. Then, once `peer_shared` is projected, matching bootstrap trust is deterministically consumed and removed, and ongoing peering decisions remain on steady-state trust only, based on device/peer public keys, not invite public keys.
 
 ### Device Linking Uses The Same Story
 
-Linking a second device follows the invite pattern with `device_invite` and acceptance, but extends an existing user instead of creating a new one. The runtime behavior is intentionally isomorphic to user join: bootstrap trust can bridge first contact, sync fills any missing canonical history, and PeerShared-derived trust becomes the long-term authority. Because this reuses the same event/projection/sync loop, multi-device behavior does not require a separate architecture: every subsequent device is recorded and validated in the same way as the first device.
+Linking a second device follows the invite pattern with `peer_invite_shared` and acceptance, but extends an existing user instead of creating a new one. The runtime behavior is intentionally isomorphic to user join: bootstrap trust can bridge first contact, sync fills any missing canonical history, and PeerShared-derived trust becomes the long-term authority. Because this reuses the same event/projection/sync loop, multi-device behavior does not require a separate architecture: every subsequent device is recorded and validated in the same way as the first device.
 
 ### Peer Discovery Provides Candidates, Not Authority
 
@@ -324,7 +326,7 @@ More details:
 1. canonical event bytes are content-addressed (`event_id` from canonical bytes),
 2. signed events carry canonical signer fields:
    - `signed_by` (event-id reference),
-   - `signer_type` (`workspace | user_invite | device_invite | user | peer_shared`),
+   - `signer_type` (`workspace | user_invite_shared | peer_invite_shared | user | peer_shared`),
    - `signature`,
 3. signature verification resolves signer key by (`signer_type`, `signed_by`) after dependency resolution,
 4. transport security is separate and complementary to event signatures.
@@ -428,7 +430,7 @@ Transport cert/key materialization is isolated behind a typed contract:
 - **`TransportIdentityIntent`** (enum): describes *what* identity change is needed (`InstallBootstrapIdentityFromInviteKey` or `InstallPeerSharedIdentityFromSigner`).
 - **`TransportIdentityAdapter`** (trait): executes the intent against the DB. The sole concrete implementation (`ConcreteTransportIdentityAdapter` in `src/runtime/transport/identity_adapter.rs`) is the **only** code that calls raw install functions (`install_invite_bootstrap_transport_identity`, `install_peer_key_transport_identity`).
 - **Workspace command layer** (`accept_invite` / `accept_device_link`) installs invite-derived bootstrap identity via the adapter intent path (not raw transport calls).
-- **Event modules** emit `ApplyTransportIdentityIntent` commands (e.g., `local_signer_secret` projector for PeerShared signers).
+- **Event modules** emit `ApplyTransportIdentityIntent` commands (e.g., `peer_secret` projector for PeerShared signers).
 - **Projection pipeline** (`write_exec.rs`) routes intents through the adapter.
 - **Downgrade guard**: bootstrap install is rejected once a PeerShared-derived identity has been installed (`BootstrapAfterPeerSharedDenied`), enforcing one-way transition.
 - **Credential source tracking**: `local_transport_creds.source` records `random | bootstrap | peershared` for runtime guard checks and diagnostics.
@@ -561,10 +563,10 @@ Scope rule: `create_workspace` is tenant-scoped. If local transport credentials 
 **Accept** (`workspace::commands::join_workspace_as_new_user`): joiner consumes invite data and creates:
 InviteAccepted (accepted workspace binding) → User → DeviceInvite → PeerShared.
 Prerequisite: the joiner's DB must already contain the Workspace and UserInvite events (copied from the inviter before or during sync).
-The acceptance path also unwraps bootstrap content-key material received via `secret_shared` events (wrapped to the invite public key at creation time) and materializes local `secret_key` events so that encrypted content received during bootstrap sync can be decrypted.
+The acceptance path also unwraps bootstrap content-key material received via `key_shared` events (wrapped to the invite public key at creation time) and materializes local `key_secret` events so that encrypted content received during bootstrap sync can be decrypted.
 Signer secrets (LocalSignerSecret events) are NOT emitted here; `persist_join_signer_secrets` is called separately after push-back sync completes.
 
-**Device link** (`workspace::commands::create_device_link_invite` / `add_device_to_workspace`): similar to user invite but creates a shorter chain (PeerShared only, skipping user/device_invite creation).
+**Device link** (`workspace::commands::create_device_link_invite` / `add_device_to_workspace`): similar to user invite but creates a shorter chain (PeerShared only, skipping user/peer_invite_shared creation).
 
 **Retry** (`workspace::commands::retry_pending_invite_content_key_unwraps`): retries content-key unwrap for invites where SecretShared prerequisites arrived late. Triggered via `event_modules::post_drain_hooks` from `state/pipeline/effects.rs` after each projection drain.
 
@@ -594,7 +596,7 @@ Pre-derive implication:
 Concrete bootstrap-replay example (why pre-derive matters):
 1. joiner pre-derives final `recorded_by = P` from its `peer_shared` public key,
 2. joiner writes `invite_accepted` and follow-on identity events under `P`,
-3. if `workspace`/`user_invite` prerequisites arrive later via sync, those rows are also recorded under `P`,
+3. if `workspace`/`user_invite_shared` prerequisites arrive later via sync, those rows are also recorded under `P`,
 4. blocked dependents unblock through the standard cascade under the same tenant key `P`,
 5. no identity remap/finalize phase is required during replay.
 
@@ -616,7 +618,7 @@ All functions take `&Connection` and `recorded_by`, enabling multi-tenant operat
 ## 2.5 Recording identity semantics
 
 1. `signed_by`: canonical signer event reference used for signature/policy checks.
-2. `signer_type`: signer keyspace discriminator (`workspace | user_invite | device_invite | user | peer_shared`).
+2. `signer_type`: signer keyspace discriminator (`workspace | user_invite_shared | peer_invite_shared | user | peer_shared`).
 3. `recorded_by`: local tenant scope key that recorded/projected the event; in the current implementation this key is the local transport peer fingerprint selected during bootstrap.
 4. `via_peer_id`: authenticated remote transport peer for ingress metadata.
 
@@ -851,7 +853,7 @@ ProjectorResult {
 4. `ApplyTransportIdentityIntent { intent }` — apply typed transport identity transitions through the `TransportIdentityAdapter` boundary.
 
 Bootstrap trust materialization uses projector `WriteOp`s (not `EmitCommand`s):
-1. `user_invite`/`device_invite` projectors write pending bootstrap trust rows when `is_local_create` and `bootstrap_context` are present,
+1. `user_invite_shared`/`peer_invite_shared` projectors write pending bootstrap trust rows when `is_local_create` and `bootstrap_context` are present,
 2. `invite_accepted` projector writes accepted bootstrap trust rows when `bootstrap_context` is present,
 3. `peer_shared` projector consumes matching bootstrap trust rows using deterministic `Delete` write-ops,
 4. trust-check functions (`is_peer_allowed`, `allowed_peers_from_db`) remain read-only.
@@ -1106,8 +1108,8 @@ Decryption is an adapter stage inside the same projection pipeline, not a second
 3. optional short-lived cache can be added later for performance.
 
 Current canonical plaintext families:
-1. identity/auth chain events (`workspace`, `invite_accepted`, `user_invite`, `device_invite`, `user`, `peer_shared`, `admin`, removals),
-2. local identity/support events (`local_signer_secret`, `secret_key`, bootstrap helper events),
+1. identity/auth chain events (`workspace`, `invite_accepted`, `user_invite_shared`, `peer_invite_shared`, `user`, `peer_shared`, `admin`, removals),
+2. local identity/support events (`peer_secret`, `key_secret`, bootstrap helper events),
 3. content metadata events that are intentionally cleartext in this POC (`message_attachment`, `file_slice`, `reaction`, `message_deletion`, `bench_dep`).
 
 Encrypted wrapper events remain canonical but carry ciphertext payloads whose inner event type is validated by `inner_type_code` before inner projection.
@@ -1456,8 +1458,8 @@ Coverage is tracked in `docs/tla/projector_conformance_matrix.md` (spec_id → c
 
 Use split invite event types:
 
-1. `user_invite`,
-2. `device_invite`,
+1. `user_invite_shared`,
+2. `peer_invite_shared`,
 3. `invite_accepted`.
 
 We do not use multimodal `invite(mode=...)` type (even though it would be DRY) because it complicates the TLA model.
@@ -1474,8 +1476,8 @@ Required semantics:
 2. invite events and invites are not forced-valid,
 3. normal signer/dependency chain still governs validity,
 4. bootstrap transport trust rows (`invite_bootstrap_trust`, `pending_invite_bootstrap_trust`) are projection-owned state, produced by concrete event projectors:
-   - `user_invite` projector writes pending bootstrap trust rows (boot variant, local-create gated),
-   - `device_invite` projector writes pending bootstrap trust rows (first variant, local-create gated),
+   - `user_invite_shared` projector writes pending bootstrap trust rows (boot variant, local-create gated),
+   - `peer_invite_shared` projector writes pending bootstrap trust rows (first variant, local-create gated),
    - `invite_accepted` projector writes accepted bootstrap trust rows using local `bootstrap_context`,
    - `peer_shared` projector deletes matching bootstrap trust rows when steady-state trust appears.
    Projectors read local `bootstrap_context`; the service layer writes `bootstrap_context` rows only, never trust rows directly.
@@ -1486,20 +1488,20 @@ Self-invite bootstrap stays explicit:
 
 1. create `workspace`,
 2. locally self-bind with `invite_accepted(workspace_id = workspace_event_id)`,
-3. create bootstrap `user_invite`,
-4. cascade unblocks `workspace -> user_invite -> user -> device_invite -> peer_shared`.
+3. create bootstrap `user_invite_shared`,
+4. cascade unblocks `workspace -> user_invite_shared -> user -> peer_invite_shared -> peer_shared`.
 
 Guard placement rules:
 1. accepted-workspace guard applies to root workspace events only; foreign root ids must not become valid,
 2. `invite_accepted` is a local accepted-workspace binding event (no invite-presence dependency gate). It writes its own binding row from carried `workspace_id`; winner selection is deterministic at read time (`created_at,event_id`),
-3. new user/device/peer identities are still gated by normal signer/dependency validation in the same peer scope (for example `user -> user_invite`, `peer_shared -> device_invite`),
+3. new user/device/peer identities are still gated by normal signer/dependency validation in the same peer scope (for example `user -> user_invite_shared`, `peer_shared -> peer_invite_shared`),
 4. bootstrap transport trust is persisted in SQL and queried at connection creation time; projected peer keys are not treated as in-memory-only authority.
 
 This approach makes first-user creation and device linking isomorphic to subsequent-user additions and device linking. Auth graph logic is easy to get wrong, so this simplification is valuable. 
 
 ### 9.3.1 Bootstrap-to-steady-state trust walkthrough
 
-1. Inviter projects `user_invite`/`device_invite` and writes pending bootstrap trust rows from local `bootstrap_context`.
+1. Inviter projects `user_invite_shared`/`peer_invite_shared` and writes pending bootstrap trust rows from local `bootstrap_context`.
 2. Joiner accepts invite (`invite_accepted`) and writes accepted bootstrap trust rows for its scoped tenant.
 3. Initial sync sessions may authenticate via bootstrap trust rows while full identity events are still converging.
 4. `peer_shared` projection consumes matching bootstrap trust rows with deterministic `Delete` write-ops once steady-state PeerShared trust is present.
@@ -1520,14 +1522,14 @@ Historical re-encryption or key history request/response mechanism is out of sco
 
 ### 9.4.1 Bootstrap key distribution via invite-key wrap/unwrap
 
-Bootstrap key acquisition uses the same `secret_shared` event type and wrap/unwrap logic as runtime sender-keys. The only difference is the recipient: at invite creation the inviter wraps content-key material to the invite public key (X25519-derived from the Ed25519 invite signing key), rather than to a peer's PeerShared public key.
+Bootstrap key acquisition uses the same `key_shared` event type and wrap/unwrap logic as runtime sender-keys. The only difference is the recipient: at invite creation the inviter wraps content-key material to the invite public key (X25519-derived from the Ed25519 invite signing key), rather than to a peer's PeerShared public key.
 
 (In this way we demonstrate that the auth graph is compatible with the goal of sharing key history (access to existing messages) with new users and devices, a potential requirement of a Slack-like workplace messenger.)
 
 Flow:
-1. At invite creation, the inviter wraps current content key(s) to the invite key via `secret_shared` events (delivered during bootstrap sync, not embedded in the invite link payload).
-2. At invite acceptance, the joiner unwraps using the invite private key (carried in the link) and the inviter's public key (from the `secret_shared` event's signer).
-3. The joiner materializes local `secret_key` events with deterministic event IDs (BLAKE2b hash of key bytes → `created_at_ms`), ensuring both inviter and joiner derive identical `key_event_id` values.
+1. At invite creation, the inviter wraps current content key(s) to the invite key via `key_shared` events (delivered during bootstrap sync, not embedded in the invite link payload).
+2. At invite acceptance, the joiner unwraps using the invite private key (carried in the link) and the inviter's public key (from the `key_shared` event's signer).
+3. The joiner materializes local `key_secret` events with deterministic event IDs (BLAKE2b hash of key bytes → `created_at_ms`), ensuring both inviter and joiner derive identical `key_event_id` values.
 4. Encrypted events that depend on those key IDs can then be projected normally through the standard block/unblock cascade.
 
 All key acquisition flows through the same event-backed wrap/unwrap path.

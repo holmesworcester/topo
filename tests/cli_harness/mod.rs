@@ -635,7 +635,7 @@ fn wait_for_local_peer_signer(db: &str, timeout: Duration) {
                 .unwrap_or(0);
             let signer_events: i64 = conn
                 .query_row(
-                    "SELECT COUNT(*) FROM events WHERE type_name = 'peer_privkey'",
+                    "SELECT COUNT(*) FROM events WHERE type_name = 'peer_secret'",
                     [],
                     |row| row.get(0),
                 )
@@ -644,7 +644,7 @@ fn wait_for_local_peer_signer(db: &str, timeout: Duration) {
                 .query_row(
                     "SELECT COUNT(*) FROM rejected_events r
                      JOIN events e ON e.event_id = r.event_id
-                     WHERE e.type_name = 'peer_privkey'",
+                     WHERE e.type_name = 'peer_secret'",
                     [],
                     |row| row.get(0),
                 )

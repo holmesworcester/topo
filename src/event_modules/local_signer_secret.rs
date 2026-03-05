@@ -214,7 +214,7 @@ pub fn project_pure(
 
 pub static LOCAL_SIGNER_SECRET_META: EventTypeMeta = EventTypeMeta {
     type_code: EVENT_TYPE_LOCAL_SIGNER_SECRET,
-    type_name: "peer_privkey",
+    type_name: "peer_secret",
     projection_table: "local_signer_material",
     share_scope: ShareScope::Local,
     dep_fields: &[],

@@ -19,9 +19,9 @@ Changes to this document require TLA+ model re-verification.
 | 11 | Retired (code reserved) | — | — | — | — | — | — | — |
 | 12 | DeviceInvite | DeviceInvite | 170B | Shared | No | Yes | 64 | 4 (user) or 5 (peer_shared) |
 | 13 | Retired (code reserved) | — | — | — | — | — | — | — |
-| 14 | User | User | 202B | Shared | No | Yes | 64 | 2 (user_invite) |
+| 14 | User | User | 202B | Shared | No | Yes | 64 | 2 (user_invite_shared) |
 | 15 | Retired (code reserved) | — | — | — | — | — | — | — |
-| 16 | PeerShared | PeerShared | 234B | Shared | No | Yes | 64 | 3 (device_invite) |
+| 16 | PeerShared | PeerShared | 234B | Shared | No | Yes | 64 | 3 (peer_invite_shared) |
 | 17 | Retired (code reserved) | — | — | — | — | — | — | — |
 | 18 | Admin | Admin | 170B | Shared | No | Yes | 64 | 1 (workspace) |
 | 19 | Retired (code reserved) | — | — | — | — | — | — | — |
@@ -111,7 +111,7 @@ Changes to this document require TLA+ model re-verification.
 | 19 | retired (code reserved) | — | rejected as unknown type |
 | 20 | project_user_removed | removed_entities | — |
 | 21 | project_peer_removed | removed_entities | — |
-| 22 | project_secret_shared | secret_shared | wraps to invite recipient; emits deterministic local `secret` on successful unwrap |
+| 22 | project_secret_shared | secret_shared | wraps to invite recipient; emits deterministic local `key_secret` on successful unwrap |
 | 23 | project_peer | peers_local | local tenant-bound peer identity |
 | 24 | project_message_attachment | message_attachments | — |
 | 25 | project_file_slice | file_slices | signature verification |
@@ -190,8 +190,8 @@ User (14):       type_code(1) | created_at_ms(8) | public_key(32) | username(64)
 PeerShared (16): type_code(1) | created_at_ms(8) | public_key(32) | user_event_id(32) | device_name(64) | signed_by(32) | signer_type(1) | signature(64) = 234B
 SecretShared (22): type_code(1) | created_at_ms(8) | key_event_id(32) | recipient_event_id(32) | unwrap_key_event_id(32) | wrapped_key(32) | signed_by(32) | signer_type(1) | signature(64) = 234B
 ```
-- `SecretShared.key_event_id` is a carried claimed key id; unwrap materialization verifies deterministic local `secret` event id equality.
-- Recipients unwrap and materialize local `secret` events with deterministic event IDs (BLAKE2b of key bytes → `created_at_ms`), ensuring both parties derive identical `key_event_id` values.
+- `SecretShared.key_event_id` is a carried claimed key id; unwrap materialization verifies deterministic local `key_secret` event id equality.
+- Recipients unwrap and materialize local `key_secret` events with deterministic event IDs (BLAKE2b of key bytes -> `created_at_ms`), ensuring both parties derive identical `key_event_id` values.
 
 ### 1194B fixed signed (Message)
 ```
@@ -245,18 +245,18 @@ LocalSignerSecret (27): type_code(1) | created_at_ms(8) | signer_event_id(32) | 
 
 ### Key-wrap dependency model
 
-`secret_shared.key_event_id` is a carried claimed key id, not a hard dependency. The key_event_id
+`key_shared.key_event_id` is a carried claimed key id, not a hard dependency. The key_event_id
 field is carried in the wire format but excluded from dep_fields. Validation occurs
 at materialization time: when a recipient unwraps the content key, the deterministic
-`secret` event ID is computed from the plaintext key bytes and compared against
-`key_event_id`. Mismatch causes projection rejection for that `secret_shared` event.
+`key_secret` event ID is computed from the plaintext key bytes and compared against
+`key_event_id`. Mismatch causes projection rejection for that `key_shared` event.
 
 This means:
-- `encrypted` events hard-dep on `secret` (key_event_id in dep_fields)
-- `secret_shared` hard-deps on `recipient_event_id` and `unwrap_key_event_id`
-- `secret_shared` does NOT hard-dep on `secret` (to avoid a self-materialization cycle)
-- Out-of-order arrival is handled: secret_shared can project before the local
-  secret exists; encrypted blocks until secret is projected
+- `encrypted` events hard-dep on `key_secret` (key_event_id in dep_fields)
+- `key_shared` hard-deps on `recipient_event_id` and `unwrap_key_event_id`
+- `key_shared` does NOT hard-dep on `key_secret` (to avoid a self-materialization cycle)
+- Out-of-order arrival is handled: key_shared can project before the local
+  key_secret exists; encrypted blocks until key_secret is projected
 
 ### Canonical text slot rules
 1. UTF-8 required (reject invalid UTF-8 sequences)
@@ -344,7 +344,7 @@ progress properties over bootstrap/upgrade/fallback behavior.
 | UnifiedBridge invariant/property | Runtime check / implementation owner |
 |----------------------------------|--------------------------------------|
 | BrInv_RowToMaterializedExactness | CHK_BRIDGE_ROW_TO_RUNTIME_TRUST (projection/trust_store + runtime/transport) |
-| BrInv_PendingOnlyOnInviter | CHK_BRIDGE_PENDING_LOCAL_CREATE (user_invite + device_invite projectors) |
+| BrInv_PendingOnlyOnInviter | CHK_BRIDGE_PENDING_LOCAL_CREATE (user_invite_shared + peer_invite_shared projectors) |
 | BrInv_AllowedPeerMatchesAuthDecision | CHK_BRIDGE_ALLOWED_PEER_AUTH (runtime/transport/authz) |
 | BrInv_OngoingPreferred | CHK_BRIDGE_ONGOING_PREFERENCE (runtime/transport/bootstrap_dial_context + connect loop) |
 | BrInv_BootstrapFallbackOnlyWhenNeeded | CHK_BRIDGE_BOOTSTRAP_FALLBACK (runtime/transport/bootstrap_dial_context + connect loop) |

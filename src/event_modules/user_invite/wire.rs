@@ -98,7 +98,7 @@ pub fn encode_user_invite(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
 
 pub static USER_INVITE_META: EventTypeMeta = EventTypeMeta {
     type_code: EVENT_TYPE_USER_INVITE,
-    type_name: "user_invite",
+    type_name: "user_invite_shared",
     projection_table: "user_invites",
     share_scope: ShareScope::Shared,
     dep_fields: &["authority_event_id", "signed_by"],

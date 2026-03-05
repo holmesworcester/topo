@@ -143,7 +143,7 @@ pub fn project_pure(
 
 pub static SECRET_KEY_META: EventTypeMeta = EventTypeMeta {
     type_code: EVENT_TYPE_SECRET_KEY,
-    type_name: "secret",
+    type_name: "key_secret",
     projection_table: "secret_keys",
     share_scope: ShareScope::Local,
     dep_fields: &[],

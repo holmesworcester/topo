@@ -162,7 +162,7 @@ pub fn project_pure(
 
 pub static INVITE_PRIVKEY_META: EventTypeMeta = EventTypeMeta {
     type_code: EVENT_TYPE_INVITE_PRIVKEY,
-    type_name: "invite_privkey",
+    type_name: "invite_secret",
     projection_table: "invite_privkeys",
     share_scope: ShareScope::Local,
     dep_fields: &["invite_event_id"],

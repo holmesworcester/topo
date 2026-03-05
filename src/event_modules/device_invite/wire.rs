@@ -94,7 +94,7 @@ pub fn encode_device_invite(event: &ParsedEvent) -> Result<Vec<u8>, EventError> 
 
 pub static DEVICE_INVITE_META: EventTypeMeta = EventTypeMeta {
     type_code: EVENT_TYPE_DEVICE_INVITE,
-    type_name: "device_invite",
+    type_name: "peer_invite_shared",
     projection_table: "device_invites",
     share_scope: ShareScope::Shared,
     dep_fields: &["authority_event_id", "signed_by"],

@@ -62,7 +62,9 @@ For active work:
   - expected examples include encrypted content for non-recipients and key-share events for non-recipients.
 - No per-event transit wrapper. QUIC + mTLS secures the channel.
 - Use separate tables for permanent canonical data vs operational queues.
-- Use separate invite event types (`user_invite`, `device_invite`), not one multimodal invite with `mode=*`.
+- Use separate invite event types (`user_invite_shared`, `peer_invite_shared`), not one multimodal invite with `mode=*`.
+- Canonical naming for local/shared pairs: `*_secret` / `*_shared` (`peer_secret`/`peer_shared`, `invite_secret` + invite shared events, `key_secret`/`key_shared`).
+- Event projector rule: each event writes to its own table; projectors may read dependency-event tables as context, but cross-event effects should flow through emitted events/commands, not direct ad-hoc writes into other event tables. (Operational non-event tables, e.g. bootstrap trust bridges, are separate.)
 - `invite_accepted` is local accepted-workspace binding:
   - it writes `invites_accepted` rows from carried `workspace_id` in peer scope,
   - it is not gated by the root-workspace accepted-workspace guard itself,
@@ -80,7 +82,7 @@ These are required, not optional:
    - dependency refs come only from schema metadata on flat fields.
    - no per-type ad-hoc dependency checker.
 3. Split invite types with shared implementation core.
-   - keep separate event types (`user_invite`, `device_invite`) for model clarity.
+   - keep separate event types (`user_invite_shared`, `peer_invite_shared`) for model clarity.
    - implement with one shared invite projector helper/spec mapping.
 4. One key-wrap event model across phases.
    - PSK bootstrap phase and identity sender-keys phase use the same key-wrap event/projector path.
@@ -94,7 +96,9 @@ These are required, not optional:
    - subjective/projected rows carry tenant scope and use composite identity (`peer_id`, `event_id`) semantics.
 8. Emitted-event self-projection rule.
    - projector side effects should emit canonical events; each emitted event projects to its own event table via its own projector/autowrite path.
+   - dependency-event tables may be read for context; they are not write targets.
    - direct cross-event table writes are rare operational exceptions only.
+   - outstanding exception debt to retire: `message_deletion` still issues direct `Delete` writes into `messages`/`reactions` (target state should instead derive from deletion events + query joins).
 9. Blocked-is-not-failure requirement.
    - blocked rows that are policy-appropriate for a tenant (for example non-recipient encrypted/key-share events) are expected and must not be treated as sync failure.
 10. Guard-placement requirement.
@@ -655,7 +659,7 @@ Usually not required at this stage, but useful if blocker behavior gets ambiguou
 
 TLA sync status (done):
 - `EventGraphSchema.tla` models `tenant` as root (no deps) and `peer` as dependent on `tenant_event_id`.
-- `secret_shared` models direct dependency on both recipient invite event and `invite_privkey` unwrap event.
+- `key_shared` models direct dependency on both recipient invite event and `invite_secret` unwrap event.
 - Re-run TLC configs and refresh `docs/tla/projector_spec.md` mapping notes when dependency semantics change next.
 
 ## 6.6 Phase 6: Shared signer substrate (required before identity)
@@ -746,17 +750,17 @@ This preserves one blocker model and one projector model.
 
 ## 7.6 Encrypted-event test strategy
 
-Encryption tests use deterministic local key materialization (shared key bytes + deterministic `created_at_ms` from BLAKE2b hash) to set up key state on both sender and recipient sides. This matches the production invite-key wrap/unwrap flow where both parties derive identical `secret_key` event IDs.
+Encryption tests use deterministic local key materialization (shared key bytes + deterministic `created_at_ms` from BLAKE2b hash) to set up key state on both sender and recipient sides. This matches the production invite-key wrap/unwrap flow where both parties derive identical `key_secret` event IDs.
 
 Test harness contract:
-1. Materialize key as a local `secret_key` event in the correct tenant scope (`recorded_by`).
+1. Materialize key as a local `key_secret` event in the correct tenant scope (`recorded_by`).
 2. Run encrypted projection through the standard block/unblock flow:
    - missing key event → `Block`
    - key present + decrypt/auth failure → `Reject`
    - key present + decrypt/auth success → inner dep/signer/dispatch stages
 3. Keep all replay/reorder invariants enabled.
 
-The same `secret_shared` event type and wrap/unwrap projector logic is used for both bootstrap (wrap to invite key) and runtime (wrap to peer key) key distribution. Only the recipient key source differs.
+The same `key_shared` event type and wrap/unwrap projector logic is used for both bootstrap (wrap to invite key) and runtime (wrap to peer key) key distribution. Only the recipient key source differs.
 
 ---
 
@@ -1078,7 +1082,7 @@ Before writing identity/removal/encryption projectors in Rust:
    - unblocked signer enables signature verification,
    - invalid signature rejects (not block).
 2. Build/update a TLA+ model of causal relationships and guards for this phase.
-3. Model split invite types (`user_invite`, `device_invite`) and accepted-workspace semantics.
+3. Model split invite types (`user_invite_shared`, `peer_invite_shared`) and accepted-workspace semantics.
 4. **Model workspace binding**: workspace events must be parameterized by workspace id, and the accepted binding must resolve to a specific workspace winner. The model must prove that foreign workspace events (for workspaces the peer did not accept an invite for) can never become valid. Without this, the model cannot distinguish between valid and invalid workspace events, making it insufficiently expressive for multi-workspace scenarios. See `InvWorkspaceAnchor`, `InvSingleWorkspace`, `InvForeignWorkspaceExcluded` invariants.
 5. **Model invite-derived accepted-workspace binding**: the accepted workspace winner must derive from event-carried `workspace_id` values, with deterministic winner selection. This ensures the binding mechanism is faithful to the real protocol where accepted rows carry `workspace_id`. See `InvTrustAnchorMatchesCarried` invariant.
 6. **Model guard placement explicitly (poc-6 parity)**:
@@ -1107,8 +1111,8 @@ Only include identity and policy needed for:
 ## 11.3 Split invite event types (no mode switch)
 
 Use separate types:
-- `user_invite` (invites a user identity)
-- `device_invite` (invites/links a peer device to a user)
+- `user_invite_shared` (invites a user identity)
+- `peer_invite_shared` (invites/links a peer device to a user)
 - `invite_accepted` (records accepted-workspace binding; local SQL also stores accepted invite-link bootstrap metadata)
 
 Do not use one `invite` type with `mode=user|peer`.
@@ -1122,7 +1126,7 @@ Implementation requirement:
 Required behavior:
 - `invite_accepted` records accepted-workspace binding rows for `workspace_id` (per `recorded_by` peer scope).
 - `invite_accepted` is a local binding step from event-carried `workspace_id` (no invite-presence dep gate).
-- downstream identity events (`user`, `device_invite`, `peer_shared`) remain dependency/signer-gated in peer scope.
+- downstream identity events (`user`, `peer_invite_shared`, `peer_shared`) remain dependency/signer-gated in peer scope.
 - root `workspace` events are not valid until a corresponding accepted-workspace binding exists and matches the root id.
 - accepted-workspace binding must come from validated projector input fields, not pre-projection capture tables.
 - invites are never force-valid; they validate only through signer/dependency chain.
@@ -1142,20 +1146,20 @@ Current state (implemented):
 Self-invite bootstrap sequence must stay explicit:
 1. create `workspace` event (integrity self-sign only).
 2. accept workspace locally -> `invite_accepted(workspace_id=workspace_event_id)`.
-3. create bootstrap `user_invite` signed by workspace authority.
-4. normal cascade unblocks: `workspace -> user_invite -> user -> device_invite -> peer_shared`.
+3. create bootstrap `user_invite_shared` signed by workspace authority.
+4. normal cascade unblocks: `workspace -> user_invite_shared -> user -> peer_invite_shared -> peer_shared`.
 
 ## 11.4.1 Poc-6-aligned high-level bootstrap migration plan
 
 Use `poc-6` as reference behavior for end-to-end test setup:
 1. Alice creates workspace + identity chain via high-level bootstrap API.
-2. Alice creates invite link (contains bootstrap address + inviter SPKI fingerprint + invite event ID + invite private key + workspace ID). Wrapped content-key material is delivered via `secret_shared` events during bootstrap sync, not embedded in the invite link payload.
+2. Alice creates invite link (contains bootstrap address + inviter SPKI fingerprint + invite event ID + invite private key + workspace ID). Wrapped content-key material is delivered via `key_shared` events during bootstrap sync, not embedded in the invite link payload.
 3. Bob accepts invite link via high-level accept API:
    - records local `invite_accepted`,
    - writes accepted-workspace binding (`workspace_id`),
    - stores accepted-invite bootstrap transport trust tuple in SQL,
    - unwraps bootstrap content-key material using invite private key and inviter public key,
-   - materializes local `secret_key` events with deterministic event IDs (matching inviter's key IDs).
+   - materializes local `key_secret` events with deterministic event IDs (matching inviter's key IDs).
 4. Sync bootstrap trust is read from SQL at connection creation (no in-memory-only trust authority).
 5. Encrypted events received during bootstrap sync block until local key materialization (step 3) completes, then unblock via normal cascade.
 6. Connection state follows `poc-6` ordering:
@@ -1172,11 +1176,11 @@ Use `poc-6` as reference behavior for end-to-end test setup:
 
 Use the sender-subjective O(n) baseline ("maximally simple phase-1/phase-4 style key broadcast"):
 - sender creates a fresh local-only `secret` key event per message,
-- sender emits one `secret_shared` key-wrap event per perceived eligible recipient peer pubkey,
+- sender emits one `key_shared` key-wrap event per perceived eligible recipient peer pubkey,
 - encrypted content event references the key event id through normal dependency fields,
 - each sender wraps to all perceived eligible members for each message (intentionally crude).
 
-Bootstrap and runtime wrapping share the same `secret_shared` event type and wrap/unwrap projector path. Bootstrap wraps target the invite public key (X25519-derived from Ed25519 invite signing key); runtime wraps target PeerShared public keys. Recipients materialize local `secret_key` events with deterministic event IDs derived from key bytes (BLAKE2b hash → `created_at_ms`), ensuring inviter and joiner agree on `key_event_id` values.
+Bootstrap and runtime wrapping share the same `key_shared` event type and wrap/unwrap projector path. Bootstrap wraps target the invite public key (X25519-derived from Ed25519 invite signing key); runtime wraps target PeerShared public keys. Recipients materialize local `key_secret` events with deterministic event IDs derived from key bytes (BLAKE2b hash → `created_at_ms`), ensuring inviter and joiner agree on `key_event_id` values.
 
 Key modeling requirements for this phase:
 - All protocol-level key material that projectors depend on must be represented as events and resolved by event-id dependencies (for example sender `secret` keys and recipient key-wrap events). Do not introduce out-of-band key stores for event-graph key dependencies.
@@ -1199,7 +1203,7 @@ Not in scope yet:
 
 - Keep model alignment with `docs/tla/EventGraphSchema.tla` (including `event_graph_schema_bootstrap.cfg`), `docs/tla/TransportCredentialLifecycle.tla`, and `docs/tla/UnifiedBridge.tla`.
 - Treat `BootstrapGraph.tla` as retired/deleted in this epoch; do not add new checks there.
-- Extend/adjust model events for split invites (`user_invite`, `device_invite`).
+- Extend/adjust model events for split invites (`user_invite_shared`, `peer_invite_shared`).
 - For each identity-phase projector, include a referenced guard list in comments/docs.
 - Treat divergence between projector logic and TLA guards as a spec bug that must be resolved before adding behavior.
 
@@ -1312,8 +1316,8 @@ TLA-led acceptance:
 
 Behavior tests:
 1. Self-invite bootstrap: accepted-workspace binding recorded, then normal cascade to first `peer_shared`.
-2. User-join flow via `user_invite` keeps signer/dependency blocking semantics.
-3. Device-link flow via `device_invite` keeps signer/dependency blocking semantics.
+2. User-join flow via `user_invite_shared` keeps signer/dependency blocking semantics.
+3. Device-link flow via `peer_invite_shared` keeps signer/dependency blocking semantics.
 4. No force-valid invites: invite remains blocked until signer path is valid.
 5. Removal enforcement: removed peers stop receiving new key wraps.
 6. Sender-subjective baseline: each sent encrypted message yields wraps for all currently eligible recipients.

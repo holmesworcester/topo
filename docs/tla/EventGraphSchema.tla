@@ -4,12 +4,12 @@ EXTENDS Naturals, FiniteSets
 \* Schema-level, bounded model of the poc-7 event graph.
 \*
 \* Adapts poc-6 to use split invite types:
-\*   user_invite  (was invite(mode=user))
-\*   device_invite (was invite(mode=peer))
+\*   user_invite_shared  (was invite(mode=user))
+\*   peer_invite_shared (was invite(mode=peer))
 \*
 \* Adds sender-subjective encryption modeling:
 \*   secret          — per-message symmetric key (local-only, deterministic event ID from key bytes)
-\*   secret_shared   — key wrap to a specific recipient (invite key for this model)
+\*   key_shared   — key wrap to a specific recipient (invite key for this model)
 \*   encrypted       — encrypted content referencing a secret
 \*
 \* Bootstrap and runtime key wrapping use the same SecretShared event type.
@@ -34,7 +34,7 @@ EXTENDS Naturals, FiniteSets
 \*   This ensures only the invited workspace can become valid; foreign
 \*   workspace events are structurally excluded.
 \*
-\* Key semantic: after a peer observes a removal, new secret_shared events
+\* Key semantic: after a peer observes a removal, new key_shared events
 \*   must NOT wrap to the removed peer (InvRemovalExclusion).
 \*
 \* Ongoing identity variants were removed from protocol state. Legacy
@@ -69,11 +69,11 @@ Peer == "peer"
 Tenant == "tenant"
 InviteAccepted == "invite_accepted"
 
-\* Split invite types (user_invite replaces invite(mode=user))
-UserInvite == "user_invite"
+\* Split invite types (user_invite_shared replaces invite(mode=user))
+UserInvite == "user_invite_shared"
 
-\* Split invite types (device_invite replaces invite(mode=peer))
-DeviceInvite == "device_invite"
+\* Split invite types (peer_invite_shared replaces invite(mode=peer))
+DeviceInvite == "peer_invite_shared"
 
 \* User identity
 User == "user"
@@ -85,8 +85,8 @@ PeerShared == "peer_shared"
 Admin == "admin"
 
 \* Local private key material (never shared)
-PeerPrivkey == "peer_privkey"
-InvitePrivkey == "invite_privkey"
+PeerPrivkey == "peer_secret"
+InvitePrivkey == "invite_secret"
 
 \* Content
 Channel == "channel"
@@ -97,8 +97,8 @@ MessageAttachment == "message_attachment"
 FileSlice == "file_slice"
 
 \* Sender-subjective encryption
-Secret == "secret"
-SecretShared == "secret_shared"
+Secret == "key_secret"
+SecretShared == "key_shared"
 Encrypted == "encrypted"
 
 \* Removal
@@ -192,10 +192,10 @@ RawDeps(e) ==
        [] e = Tenant -> {}
        [] e = InviteAccepted -> {Tenant}
 
-       \* user_invite: authority dep (workspace in bootstrap flow; admin in ongoing flow)
+       \* user_invite_shared: authority dep (workspace in bootstrap flow; admin in ongoing flow)
        [] e = UserInvite -> {Workspace}
 
-       \* device_invite: authority dep (user in bootstrap flow; admin in ongoing flow)
+       \* peer_invite_shared: authority dep (user in bootstrap flow; admin in ongoing flow)
        [] e = DeviceInvite -> {User}
 
        \* user: no raw deps beyond signer
@@ -218,9 +218,9 @@ RawDeps(e) ==
        [] e = FileSlice -> {}
 
        \* Encryption: secret is local (deterministic event ID from key bytes);
-       \* secret_shared wraps key to invite recipient and depends on:
-       \*   - recipient invite event (user_invite/device_invite),
-       \*   - local invite_privkey event used to unwrap.
+       \* key_shared wraps key to invite recipient and depends on:
+       \*   - recipient invite event (user_invite_shared/peer_invite_shared),
+       \*   - local invite_secret event used to unwrap.
        \* key_event_id is a non-dependency integrity claim checked at materialization.
        \* encrypted depends on secret.
        [] e = Secret -> {}
@@ -237,16 +237,16 @@ RawDeps(e) ==
 SignerDep(e) ==
     IF IsWorkspaceEvent(e) THEN {}
     ELSE
-    CASE \* user_invite: signed by workspace
+    CASE \* user_invite_shared: signed by workspace
          e = UserInvite -> {Workspace}
 
-       \* device_invite: signed by user
+       \* peer_invite_shared: signed by user
        [] e = DeviceInvite -> {User}
 
-       \* user: signed by the user_invite key
+       \* user: signed by the user_invite_shared key
        [] e = User -> {UserInvite}
 
-       \* peer_shared: signed by the device_invite key
+       \* peer_shared: signed by the peer_invite_shared key
        [] e = PeerShared -> {DeviceInvite}
 
        \* admin: signed by workspace
@@ -259,7 +259,7 @@ SignerDep(e) ==
        [] e = MessageAttachment -> PeerSharedSignerEvents
        [] e = FileSlice -> PeerSharedSignerEvents
 
-       \* Encryption: secret_shared signed by sender peer
+       \* Encryption: key_shared signed by sender peer
        [] e = SecretShared -> PeerSharedSignerEvents
 
        \* Removal: signed by admin peer
@@ -640,7 +640,7 @@ InvUserInviteChain ==
         (User \in valid[p]) => (UserInvite \in valid[p])
     ELSE TRUE
 
-\* Device invite chain: peer_shared requires its device_invite to be valid.
+\* Device invite chain: peer_shared requires its peer_invite_shared to be valid.
 InvDeviceInviteChain ==
     IF DeviceInvite \in EVENTS
     THEN \A p \in Peers:
@@ -664,7 +664,7 @@ InvRemovalAdmin ==
     ELSE TRUE
 
 \* Sender-subjective key wrap exclusion:
-\* After a peer has projected a removal, secret_shared must not co-exist
+\* After a peer has projected a removal, key_shared must not co-exist
 \* with the removal without the removal being observed first.
 \* Modeled abstractly: if both SecretShared and a removal are valid,
 \* the removal must be valid (the sender saw it).
