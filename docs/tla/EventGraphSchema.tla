@@ -49,6 +49,7 @@ CONSTANTS ActiveEvents, Peers, Workspaces
 VARIABLES recorded, valid, trustAnchor, removed,
           inviteCarriedWorkspace, inviteCarriedBootstrapPeer, bootstrapTrustPeer,
           inviteCarriedPendingPeer, pendingBootstrapTrustPeer,
+          peerPrivkeyCarriedSigner,
           invitePrivkeyCarriedInvite, secretSharedCarriedInvite,
           peerSharedDerivedPeer, peerSharedTrustPeer,
           connState
@@ -150,6 +151,7 @@ DeviceInviteEvents == {DeviceInvite}
 InviteEvents == UserInviteEvents \cup DeviceInviteEvents
 AdminEvents == {Admin}
 PeerSharedSignerEvents == {PeerShared}
+PeerPrivkeySignerEvents == (AllWorkspaceEvents \cap EVENTS) \cup ({User, PeerShared} \cap EVENTS)
 
 IdentityEvents == {
     Peer,
@@ -202,7 +204,7 @@ RawDeps(e) ==
        \* admin: depends on workspace + user
        [] e = Admin -> {Workspace, User}
 
-       [] e = PeerPrivkey -> {PeerShared}
+       [] e = PeerPrivkey -> {}
        [] e = InvitePrivkey -> {}
 
        \* Content: message depends on workspace; reaction/deletion depend on message
@@ -311,6 +313,7 @@ Init ==
     /\ bootstrapTrustPeer = [p \in Peers |-> "none"]
     /\ inviteCarriedPendingPeer = [p \in Peers |-> "none"]
     /\ pendingBootstrapTrustPeer = [p \in Peers |-> "none"]
+    /\ peerPrivkeyCarriedSigner = [p \in Peers |-> "none"]
     /\ invitePrivkeyCarriedInvite = [p \in Peers |-> "none"]
     /\ secretSharedCarriedInvite = [p \in Peers |-> "none"]
     /\ peerSharedDerivedPeer = [p \in Peers |-> "none"]
@@ -339,6 +342,10 @@ Record(p, e) ==
             /\ pendingBootstrapTrustPeer' = [pendingBootstrapTrustPeer EXCEPT ![p] = pp]
        ELSE /\ UNCHANGED inviteCarriedPendingPeer
             /\ UNCHANGED pendingBootstrapTrustPeer
+    /\ IF e = PeerPrivkey /\ peerPrivkeyCarriedSigner[p] = "none"
+       THEN \E s \in PeerPrivkeySignerEvents:
+            peerPrivkeyCarriedSigner' = [peerPrivkeyCarriedSigner EXCEPT ![p] = s]
+       ELSE UNCHANGED peerPrivkeyCarriedSigner
     /\ IF e = InvitePrivkey /\ invitePrivkeyCarriedInvite[p] = "none"
        THEN \E ie \in (InviteEvents \cap EVENTS):
             invitePrivkeyCarriedInvite' = [invitePrivkeyCarriedInvite EXCEPT ![p] = ie]
@@ -362,6 +369,9 @@ Project(p, e) ==
     /\ e \in recorded[p]
     /\ e \notin valid[p]
     /\ PeerDeps(p, e) \subseteq valid[p]
+    /\ IF e = PeerPrivkey
+       THEN peerPrivkeyCarriedSigner[p] \in valid[p]
+       ELSE TRUE
     /\ IF e = InvitePrivkey
        THEN invitePrivkeyCarriedInvite[p] \in valid[p]
        ELSE TRUE
@@ -409,13 +419,15 @@ Project(p, e) ==
         THEN [pendingBootstrapTrustPeer EXCEPT ![p] = "none"]
         ELSE pendingBootstrapTrustPeer
     /\ UNCHANGED <<recorded, inviteCarriedWorkspace, inviteCarriedBootstrapPeer,
-                  inviteCarriedPendingPeer, invitePrivkeyCarriedInvite,
+                  inviteCarriedPendingPeer, peerPrivkeyCarriedSigner,
+                  invitePrivkeyCarriedInvite,
                   secretSharedCarriedInvite, peerSharedDerivedPeer, connState>>
 
 Stutter ==
     UNCHANGED <<recorded, valid, trustAnchor, removed,
                 inviteCarriedWorkspace, inviteCarriedBootstrapPeer, bootstrapTrustPeer,
                 inviteCarriedPendingPeer, pendingBootstrapTrustPeer,
+                peerPrivkeyCarriedSigner,
                 invitePrivkeyCarriedInvite, secretSharedCarriedInvite,
                 peerSharedDerivedPeer, peerSharedTrustPeer,
                 connState>>
@@ -427,12 +439,14 @@ Stutter ==
 allVars == <<recorded, valid, trustAnchor, removed,
              inviteCarriedWorkspace, inviteCarriedBootstrapPeer, bootstrapTrustPeer,
              inviteCarriedPendingPeer, pendingBootstrapTrustPeer,
+             peerPrivkeyCarriedSigner,
              invitePrivkeyCarriedInvite, secretSharedCarriedInvite,
              peerSharedDerivedPeer, peerSharedTrustPeer, connState>>
 
 nonConnVars == <<recorded, valid, trustAnchor, removed,
                  inviteCarriedWorkspace, inviteCarriedBootstrapPeer, bootstrapTrustPeer,
                  inviteCarriedPendingPeer, pendingBootstrapTrustPeer,
+                 peerPrivkeyCarriedSigner,
                  invitePrivkeyCarriedInvite, secretSharedCarriedInvite,
                  peerSharedDerivedPeer, peerSharedTrustPeer>>
 
@@ -489,6 +503,7 @@ TypeOK ==
     /\ bootstrapTrustPeer \in [Peers -> Peers \cup {"none"}]
     /\ inviteCarriedPendingPeer \in [Peers -> Peers \cup {"none"}]
     /\ pendingBootstrapTrustPeer \in [Peers -> Peers \cup {"none"}]
+    /\ peerPrivkeyCarriedSigner \in [Peers -> (Workspaces \cup {User, PeerShared, "none"})]
     /\ invitePrivkeyCarriedInvite \in [Peers -> InviteEvents \cup {"none"}]
     /\ secretSharedCarriedInvite \in [Peers -> InviteEvents \cup {"none"}]
     /\ peerSharedDerivedPeer \in [Peers -> Peers \cup {"none"}]
@@ -677,6 +692,13 @@ InvSecretSharedKey ==
             (PeerShared \in valid[p]
              /\ secretSharedCarriedInvite[p] \in valid[p]
              /\ (IF InvitePrivkey \in EVENTS THEN InvitePrivkey \in valid[p] ELSE TRUE))
+    ELSE TRUE
+
+\* Peer private-key material is rooted by a valid signer lineage event.
+InvPeerPrivkeySource ==
+    IF PeerPrivkey \in EVENTS
+    THEN \A p \in Peers:
+        (PeerPrivkey \in valid[p]) => peerPrivkeyCarriedSigner[p] \in valid[p]
     ELSE TRUE
 
 \* Invite private key material is rooted by a valid invite event.
