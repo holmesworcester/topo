@@ -33,13 +33,8 @@ fn peer_shared_signer_emits_install_intent() {
 
     assert_eq!(
         cmds.len(),
-        2,
-        "peer_shared should emit unwrap_secret + intent"
-    );
-    assert!(
-        cmds.iter()
-            .any(|c| matches!(c, EmitCommand::EmitDeterministicBlob { .. })),
-        "missing unwrap_secret deterministic emit"
+        1,
+        "peer_shared should emit exactly one transport intent"
     );
     let intent = cmds
         .iter()
@@ -69,7 +64,7 @@ fn workspace_signer_does_not_emit_intent() {
     let cmds = project("test-peer", &event);
     assert!(
         cmds.is_empty(),
-        "workspace signer should not emit unwrap_secret markers"
+        "workspace signer should not emit projector commands"
     );
 }
 
@@ -85,7 +80,7 @@ fn user_signer_does_not_emit_intent() {
     let cmds = project("test-peer", &event);
     assert!(
         cmds.is_empty(),
-        "user signer should not emit unwrap_secret markers"
+        "user signer should not emit projector commands"
     );
 }
 

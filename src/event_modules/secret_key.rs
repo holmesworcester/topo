@@ -5,7 +5,7 @@ use crate::crypto::EventId;
 
 // ─── Layout (owned by this module) ───
 
-/// SecretKey (type 6): type(1) + created_at(8) + key_bytes(32) = 41
+/// Secret (type 6): type(1) + created_at(8) + key_bytes(32) = 41
 pub const SECRET_KEY_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,7 +68,7 @@ pub fn encode_secret_key(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     Ok(buf)
 }
 
-/// Deterministic timestamp derivation for key materialized SecretKey events.
+/// Deterministic timestamp derivation for key materialized Secret events.
 pub fn deterministic_secret_key_created_at_ms(key_bytes: &[u8; 32]) -> u64 {
     use blake2::digest::consts::U8;
     use blake2::{Blake2b, Digest};
@@ -91,7 +91,8 @@ pub fn deterministic_secret_key_event(key_bytes: [u8; 32]) -> ParsedEvent {
 
 pub fn deterministic_secret_key_event_id(key_bytes: &[u8; 32]) -> EventId {
     let event = deterministic_secret_key_event(*key_bytes);
-    let blob = super::encode_event(&event).expect("deterministic secret_key encoding should succeed");
+    let blob =
+        super::encode_event(&event).expect("deterministic secret_key encoding should succeed");
     crate::crypto::hash_event(&blob)
 }
 
@@ -115,7 +116,7 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// Pure projector: SecretKey → secret_keys table insert.
+/// Pure projector: Secret -> secret_keys table insert.
 pub fn project_pure(
     recorded_by: &str,
     event_id_b64: &str,
@@ -142,7 +143,7 @@ pub fn project_pure(
 
 pub static SECRET_KEY_META: EventTypeMeta = EventTypeMeta {
     type_code: EVENT_TYPE_SECRET_KEY,
-    type_name: "secret_key",
+    type_name: "secret",
     projection_table: "secret_keys",
     share_scope: ShareScope::Local,
     dep_fields: &[],

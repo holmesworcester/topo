@@ -4,7 +4,6 @@ use super::{EventError, ParsedEvent, EVENT_TYPE_LOCAL_SIGNER_SECRET};
 pub const SIGNER_KIND_WORKSPACE: u8 = 1;
 pub const SIGNER_KIND_USER: u8 = 2;
 pub const SIGNER_KIND_PEER_SHARED: u8 = 3;
-pub const SIGNER_KIND_PENDING_INVITE_UNWRAP: u8 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalSignerSecretEvent {
@@ -33,7 +32,7 @@ impl super::Describe for LocalSignerSecretEvent {
 /// [0]      type_code = 27
 /// [1..9]   created_at_ms (u64 LE)
 /// [9..41]  signer_event_id (32 bytes)
-/// [41]     signer_kind (u8: 1=workspace, 2=user, 3=peer_shared, 4=pending invite unwrap)
+/// [41]     signer_kind (u8: 1=workspace, 2=user, 3=peer_shared)
 /// [42..74] private_key_bytes (32 bytes)
 pub fn parse_local_signer_secret(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if blob.len() < 74 {
@@ -61,9 +60,9 @@ pub fn parse_local_signer_secret(blob: &[u8]) -> Result<ParsedEvent, EventError>
     signer_event_id.copy_from_slice(&blob[9..41]);
 
     let signer_kind = blob[41];
-    if signer_kind < 1 || signer_kind > 4 {
+    if !(1..=3).contains(&signer_kind) {
         return Err(EventError::InvalidMetadata(
-            "signer_kind must be 1, 2, 3, or 4",
+            "signer_kind must be 1, 2, or 3",
         ));
     }
 
@@ -84,9 +83,9 @@ pub fn encode_local_signer_secret(event: &ParsedEvent) -> Result<Vec<u8>, EventE
         _ => return Err(EventError::WrongVariant),
     };
 
-    if e.signer_kind < 1 || e.signer_kind > 4 {
+    if !(1..=3).contains(&e.signer_kind) {
         return Err(EventError::InvalidMetadata(
-            "signer_kind must be 1, 2, 3, or 4",
+            "signer_kind must be 1, 2, or 3",
         ));
     }
 
@@ -97,28 +96,6 @@ pub fn encode_local_signer_secret(event: &ParsedEvent) -> Result<Vec<u8>, EventE
     buf.push(e.signer_kind);
     buf.extend_from_slice(&e.private_key_bytes);
     Ok(buf)
-}
-
-fn deterministic_pending_invite_tombstone_created_at_ms(signer_event_id: &[u8; 32]) -> u64 {
-    use blake2::digest::consts::U8;
-    use blake2::{Blake2b, Digest};
-
-    let mut hasher = Blake2b::<U8>::new();
-    hasher.update(b"poc7-pending-invite-tombstone-created-at-v1");
-    hasher.update(signer_event_id);
-    let digest = hasher.finalize();
-    let mut out = [0u8; 8];
-    out.copy_from_slice(&digest[..8]);
-    u64::from_le_bytes(out)
-}
-
-pub fn deterministic_pending_invite_tombstone_event(signer_event_id: [u8; 32]) -> ParsedEvent {
-    ParsedEvent::LocalSignerSecret(LocalSignerSecretEvent {
-        created_at_ms: deterministic_pending_invite_tombstone_created_at_ms(&signer_event_id),
-        signer_event_id,
-        signer_kind: SIGNER_KIND_PENDING_INVITE_UNWRAP,
-        private_key_bytes: [0u8; 32],
-    })
 }
 
 // === Projector (event-module locality) ===
@@ -144,10 +121,10 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// Pure projector: LocalSignerSecret → local_signer_material table.
+/// Pure projector: LocalSignerSecret -> local_signer_material table.
 /// UPSERT by (recorded_by, signer_event_id): Delete existing + InsertOrIgnore.
-/// Emits `ApplyTransportIdentityIntent(InstallPeerSharedIdentityFromSigner)`
-/// when signer_kind == SIGNER_KIND_PEER_SHARED.
+/// Emits ApplyTransportIdentityIntent(InstallPeerSharedIdentityFromSigner) when
+/// signer_kind == SIGNER_KIND_PEER_SHARED.
 pub fn project_pure(
     recorded_by: &str,
     _event_id_b64: &str,
@@ -161,20 +138,15 @@ pub fn project_pure(
 
     let signer_eid_b64 = event_id_to_base64(&e.signer_event_id);
 
-    let mut ops = vec![WriteOp::Delete {
-        table: "local_signer_material",
-        where_clause: vec![
-            ("recorded_by", SqlVal::Text(recorded_by.to_string())),
-            ("signer_event_id", SqlVal::Text(signer_eid_b64.clone())),
-        ],
-    }];
-    // signer_kind=4 with all-zero key bytes is a delete tombstone.
-    let is_pending_tombstone =
-        e.signer_kind == SIGNER_KIND_PENDING_INVITE_UNWRAP && e.private_key_bytes == [0u8; 32];
-    let supports_unwrap_secret = e.signer_kind == SIGNER_KIND_PEER_SHARED
-        || e.signer_kind == SIGNER_KIND_PENDING_INVITE_UNWRAP;
-    if !is_pending_tombstone {
-        ops.push(WriteOp::InsertOrIgnore {
+    let ops = vec![
+        WriteOp::Delete {
+            table: "local_signer_material",
+            where_clause: vec![
+                ("recorded_by", SqlVal::Text(recorded_by.to_string())),
+                ("signer_event_id", SqlVal::Text(signer_eid_b64.clone())),
+            ],
+        },
+        WriteOp::InsertOrIgnore {
             table: "local_signer_material",
             columns: vec![
                 "recorded_by",
@@ -185,91 +157,26 @@ pub fn project_pure(
             ],
             values: vec![
                 SqlVal::Text(recorded_by.to_string()),
-                SqlVal::Text(signer_eid_b64.clone()),
+                SqlVal::Text(signer_eid_b64),
                 SqlVal::Int(e.signer_kind as i64),
                 SqlVal::Blob(e.private_key_bytes.to_vec()),
                 SqlVal::Int(e.created_at_ms as i64),
             ],
-        });
-        if supports_unwrap_secret {
-            let unwrap_secret_event_id =
-                crate::event_modules::unwrap_secret::deterministic_unwrap_secret_event_id(
-                    &e.signer_event_id,
-                );
-            let unwrap_secret_event_id_b64 = event_id_to_base64(&unwrap_secret_event_id);
-            let unwrap_secret_created_at =
-                crate::event_modules::unwrap_secret::deterministic_unwrap_secret_created_at_ms(
-                    &e.signer_event_id,
-                ) as i64;
-            ops.push(WriteOp::Delete {
-                table: "unwrap_secrets",
-                where_clause: vec![
-                    ("recorded_by", SqlVal::Text(recorded_by.to_string())),
-                    ("recipient_event_id", SqlVal::Text(signer_eid_b64.clone())),
-                ],
-            });
-            ops.push(WriteOp::InsertOrIgnore {
-                table: "unwrap_secrets",
-                columns: vec![
-                    "recorded_by",
-                    "event_id",
-                    "recipient_event_id",
-                    "signer_kind",
-                    "private_key",
-                    "created_at",
-                ],
-                values: vec![
-                    SqlVal::Text(recorded_by.to_string()),
-                    SqlVal::Text(unwrap_secret_event_id_b64),
-                    SqlVal::Text(signer_eid_b64.clone()),
-                    SqlVal::Int(e.signer_kind as i64),
-                    SqlVal::Blob(e.private_key_bytes.to_vec()),
-                    SqlVal::Int(unwrap_secret_created_at),
-                ],
-            });
-        }
-    } else {
-        ops.push(WriteOp::Delete {
-            table: "unwrap_secrets",
-            where_clause: vec![
-                ("recorded_by", SqlVal::Text(recorded_by.to_string())),
-                ("recipient_event_id", SqlVal::Text(signer_eid_b64.clone())),
-            ],
-        });
-    }
+        },
+    ];
 
-    let mut commands = Vec::new();
-    if !is_pending_tombstone && supports_unwrap_secret {
-        let unwrap_secret_event =
-            crate::event_modules::unwrap_secret::deterministic_unwrap_secret_event(
-                e.signer_event_id,
-            );
-        let unwrap_secret_blob = match crate::event_modules::encode_event(&unwrap_secret_event) {
-            Ok(v) => v,
-            Err(err) => {
-                return ProjectorResult::reject(format!(
-                    "failed to encode deterministic unwrap_secret event: {}",
-                    err
-                ))
-            }
-        };
-        commands.push(EmitCommand::EmitDeterministicBlob {
-            blob: unwrap_secret_blob,
-        });
-    }
     if e.signer_kind == SIGNER_KIND_PEER_SHARED {
-        commands.push(EmitCommand::ApplyTransportIdentityIntent {
-            intent: TransportIdentityIntent::InstallPeerSharedIdentityFromSigner {
-                recorded_by: recorded_by.to_string(),
-                signer_event_id: e.signer_event_id,
-            },
-        });
-    }
-
-    if commands.is_empty() {
-        ProjectorResult::valid(ops)
+        ProjectorResult::valid_with_commands(
+            ops,
+            vec![EmitCommand::ApplyTransportIdentityIntent {
+                intent: TransportIdentityIntent::InstallPeerSharedIdentityFromSigner {
+                    recorded_by: recorded_by.to_string(),
+                    signer_event_id: e.signer_event_id,
+                },
+            }],
+        )
     } else {
-        ProjectorResult::valid_with_commands(ops, commands)
+        ProjectorResult::valid(ops)
     }
 }
 
@@ -278,10 +185,8 @@ pub static LOCAL_SIGNER_SECRET_META: EventTypeMeta = EventTypeMeta {
     type_name: "local_signer_secret",
     projection_table: "local_signer_material",
     share_scope: ShareScope::Local,
-    // No static dep gate: pending-invite unwrap keys (signer_kind=4) may refer
-    // to invite event IDs not yet synced locally.
-    dep_fields: &[],
-    dep_field_type_codes: &[],
+    dep_fields: &["signer_event_id"],
+    dep_field_type_codes: &[&[8, 14, 16]],
     signer_required: false,
     signature_byte_len: 0,
     encryptable: false,
@@ -342,21 +247,6 @@ mod tests {
     }
 
     #[test]
-    fn test_roundtrip_pending_invite_unwrap() {
-        let e = LocalSignerSecretEvent {
-            created_at_ms: 6666666666666,
-            signer_event_id: [7u8; 32],
-            signer_kind: SIGNER_KIND_PENDING_INVITE_UNWRAP,
-            private_key_bytes: [8u8; 32],
-        };
-        let event = ParsedEvent::LocalSignerSecret(e);
-        let blob = encode_event(&event).unwrap();
-        assert_eq!(blob.len(), 74);
-        let parsed = parse_event(&blob).unwrap();
-        assert_eq!(parsed, event);
-    }
-
-    #[test]
     fn test_reject_invalid_signer_kind() {
         let mut blob = vec![EVENT_TYPE_LOCAL_SIGNER_SECRET];
         blob.extend_from_slice(&0u64.to_le_bytes());
@@ -368,7 +258,7 @@ mod tests {
         let mut blob2 = vec![EVENT_TYPE_LOCAL_SIGNER_SECRET];
         blob2.extend_from_slice(&0u64.to_le_bytes());
         blob2.extend_from_slice(&[0u8; 32]);
-        blob2.push(5); // invalid signer_kind
+        blob2.push(4); // invalid signer_kind
         blob2.extend_from_slice(&[0u8; 32]);
         assert!(parse_event(&blob2).is_err());
     }

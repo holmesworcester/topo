@@ -238,7 +238,7 @@ pub fn create_workspace(
     )?;
 
     // 8. Seed deterministic local content-key material.
-    let _ = ops::ensure_content_key_for_peer(db, &derived_peer_id, &peer_shared_key, &psf_eid)?;
+    let _ = ops::ensure_content_key_for_peer(db, &derived_peer_id)?;
 
     Ok(CreateWorkspaceResult {
         workspace_id: ws_eid,
@@ -269,9 +269,9 @@ pub fn join_workspace_as_new_user(
 ) -> Result<JoinChain, Box<dyn std::error::Error + Send + Sync>> {
     let mut rng = rand::thread_rng();
 
-    // Persist invite key material so content-key unwrap can be retried after
-    // late-arriving SecretShared prerequisites.
-    ops::store_pending_invite_unwrap_key(db, recorded_by, invite_event_id, invite_key)?;
+    // Persist deterministic invite_privkey material. This is the key event
+    // that secret_shared depends on for unwrap projection.
+    let _ = ops::store_invite_privkey(db, recorded_by, invite_event_id, invite_key)?;
 
     // 1. InviteAccepted (local event) — binds trust anchor, triggers guard cascade
     let ia_evt = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
@@ -334,7 +334,7 @@ pub fn join_workspace_as_new_user(
     ))?;
 
     // 5. Key unwrap is dep-driven via:
-    //    secret_shared --deps on unwrap_secret--> deterministic secret_key emit.
+    //    secret_shared --deps on invite_privkey--> deterministic secret emit.
     //    No inline unwrap here.
     let content_key_event_id = None;
 
@@ -474,8 +474,7 @@ pub fn create_user_invite(
     bootstrap_addr: &str,
     bootstrap_spki: &[u8; 32],
 ) -> Result<InviteResult, Box<dyn std::error::Error + Send + Sync>> {
-    let _ =
-        ops::ensure_content_key_for_peer(db, recorded_by, peer_shared_key, peer_shared_event_id)?;
+    let _ = ops::ensure_content_key_for_peer(db, recorded_by)?;
 
     let ctx = InviteBootstrapContext {
         bootstrap_addr,

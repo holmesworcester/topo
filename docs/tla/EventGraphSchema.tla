@@ -8,12 +8,12 @@ EXTENDS Naturals, FiniteSets
 \*   device_invite (was invite(mode=peer))
 \*
 \* Adds sender-subjective encryption modeling:
-\*   secret_key      — per-message symmetric key (local-only, deterministic event ID from key bytes)
-\*   secret_shared   — key wrap to a specific recipient (PeerShared for runtime, invite key for bootstrap)
-\*   encrypted       — encrypted content referencing a secret_key
+\*   secret          — per-message symmetric key (local-only, deterministic event ID from key bytes)
+\*   secret_shared   — key wrap to a specific recipient (invite key for this model)
+\*   encrypted       — encrypted content referencing a secret
 \*
 \* Bootstrap and runtime key wrapping use the same SecretShared event type.
-\* Bootstrap recipients materialize local secret_key events with deterministic
+\* Bootstrap recipients materialize local secret events with deterministic
 \* event IDs (BLAKE2b of key bytes → created_at_ms), ensuring both parties agree
 \* on key_event_id values without out-of-band coordination.
 \*
@@ -60,6 +60,7 @@ VARIABLES recorded, valid, trustAnchor, removed,
 Workspace == "workspace"
 
 \* Identity / bootstrap
+Tenant == "tenant"
 InviteAccepted == "invite_accepted"
 
 \* Split invite types (user_invite replaces invite(mode=user))
@@ -77,11 +78,9 @@ PeerShared == "peer_shared"
 \* Admin
 Admin == "admin"
 
-\* Local signer secret (never shared)
-LocalSignerSecret == "local_signer_secret"
-
-\* Deterministic local key-availability marker (never shared)
-UnwrapSecret == "unwrap_secret"
+\* Local private key material (never shared)
+PeerPrivkey == "peer_privkey"
+InvitePrivkey == "invite_privkey"
 
 \* Content
 Channel == "channel"
@@ -92,7 +91,7 @@ MessageAttachment == "message_attachment"
 FileSlice == "file_slice"
 
 \* Sender-subjective encryption
-SecretKey == "secret_key"
+Secret == "secret"
 SecretShared == "secret_shared"
 Encrypted == "encrypted"
 
@@ -112,17 +111,18 @@ WorkspaceEventId(e) == e
 
 \* Singleton event types (not parameterized by workspace)
 FullEventTypes == {
+    Tenant,
     InviteAccepted,
     UserInvite,
     DeviceInvite,
     User,
     PeerShared,
     Admin,
-    LocalSignerSecret,
-    UnwrapSecret,
+    PeerPrivkey,
+    InvitePrivkey,
     Channel, Message, MessageReaction, MessageDeletion,
     MessageAttachment, FileSlice,
-    SecretKey, SecretShared, Encrypted,
+    Secret, SecretShared, Encrypted,
     UserRemoved, PeerRemoved
 }
 
@@ -132,7 +132,7 @@ FullEvents == FullEventTypes \cup AllWorkspaceEvents
 \* Local-only events (no workspace dep, no trust anchor gate).
 \* Encrypted is local because it's a cryptographic wrapper; its workspace
 \* requirement comes from the inner event, not the wrapper itself.
-LocalRoots == {InviteAccepted, LocalSignerSecret, UnwrapSecret, SecretKey, Encrypted}
+LocalRoots == {Tenant, InviteAccepted, PeerPrivkey, InvitePrivkey, Secret, Encrypted}
 
 \* Singleton event types that require workspace to be valid
 WorkspaceGuardedEvents == FullEventTypes \ LocalRoots
@@ -149,19 +149,20 @@ AdminEvents == {Admin}
 PeerSharedSignerEvents == {PeerShared}
 
 IdentityEvents == {
+    Tenant,
     InviteAccepted,
     UserInvite,
     DeviceInvite,
     User,
     PeerShared,
     Admin,
-    LocalSignerSecret,
-    UnwrapSecret,
+    PeerPrivkey,
+    InvitePrivkey,
     UserRemoved, PeerRemoved
 } \cup AllWorkspaceEvents
 
 ContentEvents == {Channel, Message, MessageReaction, MessageDeletion, MessageAttachment, FileSlice}
-EncryptionEvents == {SecretKey, SecretShared, Encrypted}
+EncryptionEvents == {Secret, SecretShared, Encrypted}
 
 \* Connection state values (per-peer state machine for invite-based bootstrap).
 ConnStates == {"none", "req", "ack", "invite", "peer"}
@@ -178,7 +179,8 @@ ASSUME Workspaces \cap FullEventTypes = {}
 RawDeps(e) ==
     IF IsWorkspaceEvent(e) THEN {}
     ELSE
-    CASE e = InviteAccepted -> {}
+    CASE e = Tenant -> {}
+       [] e = InviteAccepted -> {Tenant}
 
        \* user_invite: no raw deps beyond signer
        [] e = UserInvite -> {}
@@ -195,23 +197,22 @@ RawDeps(e) ==
        \* admin: depends on workspace + user
        [] e = Admin -> {Workspace, User}
 
-       [] e = LocalSignerSecret -> {}
-       [] e = UnwrapSecret -> {LocalSignerSecret}
+       [] e = PeerPrivkey -> {Tenant, PeerShared}
+       [] e = InvitePrivkey -> {Tenant, InviteAccepted}
 
        \* Content: message depends on workspace; reaction/deletion depend on message
        [] e = Message -> {Workspace}
        [] e = MessageReaction -> {Message}
        [] e = MessageDeletion -> {Message}
-       [] e = MessageAttachment -> {Message, SecretKey}
+       [] e = MessageAttachment -> {Message, Secret}
        [] e = FileSlice -> {}
 
-       \* Encryption: secret_key is local (deterministic event ID from key bytes);
-       \* secret_shared wraps key to recipient (PeerShared for runtime, invite key for bootstrap)
-       \* and directly depends on local key materialization markers.
-       \* encrypted depends on secret_key.
-       [] e = SecretKey -> {}
-       [] e = SecretShared -> {PeerShared, UnwrapSecret}
-       [] e = Encrypted -> {SecretKey}
+       \* Encryption: secret is local (deterministic event ID from key bytes);
+       \* secret_shared wraps key to invite recipient and depends on invite_privkey.
+       \* encrypted depends on secret.
+       [] e = Secret -> {Tenant}
+       [] e = SecretShared -> {UserInvite, InvitePrivkey}
+       [] e = Encrypted -> {Secret}
 
        \* Removal: depends on the entity being removed
        [] e = UserRemoved -> {User}
@@ -635,26 +636,26 @@ InvMessageWorkspace ==
     THEN \A p \in Peers: (Message \in valid[p]) => (\E ne \in AllWorkspaceEvents: ne \in valid[p])
     ELSE TRUE
 
-\* Encrypted content requires secret_key.
+\* Encrypted content requires secret.
 InvEncryptedKey ==
-    IF Encrypted \in EVENTS /\ SecretKey \in EVENTS
-    THEN \A p \in Peers: (Encrypted \in valid[p]) => (SecretKey \in valid[p])
+    IF Encrypted \in EVENTS /\ Secret \in EVENTS
+    THEN \A p \in Peers: (Encrypted \in valid[p]) => (Secret \in valid[p])
     ELSE TRUE
 
-\* SecretShared carries key_event_id as a hint (not a hard dep).
-\* Validation happens at materialization time, not at projection time.
+\* SecretShared requires signer peer context and invite private key material.
 InvSecretSharedKey ==
     IF SecretShared \in EVENTS
     THEN \A p \in Peers:
         (SecretShared \in valid[p]) =>
             (PeerShared \in valid[p]
-             /\ (IF UnwrapSecret \in EVENTS THEN UnwrapSecret \in valid[p] ELSE TRUE))
+             /\ (IF InvitePrivkey \in EVENTS THEN InvitePrivkey \in valid[p] ELSE TRUE))
     ELSE TRUE
 
-\* Unwrap-secret markers require signer secret material.
-InvUnwrapSecretSource ==
-    IF UnwrapSecret \in EVENTS /\ LocalSignerSecret \in EVENTS
-    THEN \A p \in Peers: (UnwrapSecret \in valid[p]) => (LocalSignerSecret \in valid[p])
+\* Invite private key material is tenant-scoped and rooted by invite_accepted.
+InvInvitePrivkeySource ==
+    IF InvitePrivkey \in EVENTS /\ InviteAccepted \in EVENTS /\ Tenant \in EVENTS
+    THEN \A p \in Peers:
+        (InvitePrivkey \in valid[p]) => (InviteAccepted \in valid[p] /\ Tenant \in valid[p])
     ELSE TRUE
 
 \* File slice authorization: if both FileSlice and MessageAttachment are valid,

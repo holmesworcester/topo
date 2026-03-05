@@ -17,6 +17,7 @@ mod tests {
             created_at_ms: 6000,
             key_event_id: [1u8; 32],
             recipient_event_id: [2u8; 32],
+            unwrap_key_event_id: [3u8; 32],
             wrapped_key: [3u8; 32],
             signed_by: [4u8; 32],
             signer_type: 5,
@@ -32,7 +33,6 @@ mod tests {
         let ctx = ContextSnapshot {
             unwrapped_secret_material: Some(UnwrappedSecretMaterial {
                 key_bytes: [42u8; 32],
-                clear_invite_signer_event_id: None,
             }),
             ..Default::default()
         };

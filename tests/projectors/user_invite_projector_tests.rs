@@ -36,12 +36,6 @@ mod tests {
         assert_valid(&result);
         assert_writes_to_table(&result, "user_invites");
         assert_writes_to_table(&result, "pending_invite_bootstrap_trust");
-        assert_emits_command(&result, "EmitDeterministicBlob", |cmd| {
-            matches!(
-                cmd,
-                topo::projection::contract::EmitCommand::EmitDeterministicBlob { .. }
-            )
-        });
     }
 
     // ── SPEC_PENDING_INVITER_01: break (Boot but NOT local create) ──
@@ -55,12 +49,6 @@ mod tests {
         let result = project_pure(PEER, &event_id, &parsed, &ctx);
         assert_valid(&result);
         assert_no_write_to_table(&result, "pending_invite_bootstrap_trust");
-        assert_emits_command(&result, "EmitDeterministicBlob", |cmd| {
-            matches!(
-                cmd,
-                topo::projection::contract::EmitCommand::EmitDeterministicBlob { .. }
-            )
-        });
     }
 
     // ── basic valid projection ──
@@ -74,12 +62,6 @@ mod tests {
         let result = project_pure(PEER, &event_id, &parsed, &ctx);
         assert_valid(&result);
         assert_writes_to_table(&result, "user_invites");
-        assert_emits_command(&result, "EmitDeterministicBlob", |cmd| {
-            matches!(
-                cmd,
-                topo::projection::contract::EmitCommand::EmitDeterministicBlob { .. }
-            )
-        });
     }
 
     #[test]

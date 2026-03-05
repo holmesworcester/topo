@@ -10,16 +10,13 @@ use rusqlite::Connection;
 use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
 use crate::event_modules::*;
 use crate::projection::create::{
-    create_event_synchronous, create_signed_event_synchronous, project_event,
+    create_event_synchronous, create_signed_event_synchronous, event_id_or_blocked, project_event,
     store_signed_event_only,
 };
 use crate::projection::encrypted::wrap_key_for_recipient;
 use crate::transport::{extract_spki_fingerprint, generate_self_signed_cert_from_signing_key};
 
 use std::time::{SystemTime, UNIX_EPOCH};
-
-pub(crate) const SIGNER_KIND_PENDING_INVITE_UNWRAP: u8 =
-    crate::event_modules::local_signer_secret::SIGNER_KIND_PENDING_INVITE_UNWRAP;
 
 pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
@@ -101,13 +98,11 @@ pub(crate) fn expected_invite_bootstrap_spki_from_invite_key(
 // Reusable primitive helpers (pub(crate) for event-module command use)
 // ---------------------------------------------------------------------------
 
-/// Ensure the local tenant has at least one content key + self-wrap materialized.
+/// Ensure the local tenant has at least one content key materialized.
 /// Returns the canonical key_event_id to use in key-wrap and encrypted deps.
 pub(crate) fn ensure_content_key_for_peer(
     conn: &Connection,
     recorded_by: &str,
-    peer_shared_key: &SigningKey,
-    peer_shared_event_id: &EventId,
 ) -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
     let existing: Option<String> = conn
         .query_row(
@@ -120,26 +115,21 @@ pub(crate) fn ensure_content_key_for_peer(
         let eid = event_id_from_base64(&eid_b64).ok_or("invalid secret_keys.event_id base64")?;
         return Ok(eid);
     }
-    create_content_key_and_self_wrap(conn, recorded_by, peer_shared_key, peer_shared_event_id)
+    create_content_key(conn, recorded_by)
 }
 
 /// Wrap the workspace's content key for an invitee's invite public key.
-/// Looks up the first SecretKey event for this tenant, wraps it, and
-/// creates a SecretShared event with recipient_event_id = invite_event_id.
+/// Looks up the first Secret event for this tenant, wraps it, and creates
+/// a SecretShared event with explicit dep on deterministic invite_privkey.
 pub(crate) fn wrap_content_key_for_invite(
     conn: &Connection,
     recorded_by: &str,
     sender_peer_shared_key: &SigningKey,
     sender_peer_shared_event_id: &EventId,
-    invite_public_key: &ed25519_dalek::VerifyingKey,
+    invite_key: &SigningKey,
     invite_event_id: &EventId,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let key_event_id = ensure_content_key_for_peer(
-        conn,
-        recorded_by,
-        sender_peer_shared_key,
-        sender_peer_shared_event_id,
-    )?;
+    let key_event_id = ensure_content_key_for_peer(conn, recorded_by)?;
     let key_event_b64 = event_id_to_base64(&key_event_id);
     let key_bytes: Vec<u8> = conn.query_row(
         "SELECT key_bytes FROM secret_keys WHERE recorded_by = ?1 AND event_id = ?2 LIMIT 1",
@@ -153,39 +143,74 @@ pub(crate) fn wrap_content_key_for_invite(
     let mut plaintext_key = [0u8; 32];
     plaintext_key.copy_from_slice(&key_bytes);
 
-    let wrapped = wrap_key_for_recipient(sender_peer_shared_key, invite_public_key, &plaintext_key);
+    let invite_private = invite_key.to_bytes();
+    let invite_privkey_event_id =
+        crate::event_modules::invite_privkey::deterministic_invite_privkey_event_id(
+            invite_event_id,
+            &invite_private,
+        );
+    let invite_privkey_evt =
+        crate::event_modules::invite_privkey::deterministic_invite_privkey_event(
+            *invite_event_id,
+            invite_private,
+        );
+    let created_invite_privkey_event_id = event_id_or_blocked(create_event_synchronous(
+        conn,
+        recorded_by,
+        &invite_privkey_evt,
+    ))?;
+    if created_invite_privkey_event_id != invite_privkey_event_id {
+        return Err("invite_privkey event_id mismatch for deterministic key material".into());
+    }
+
+    let wrapped = wrap_key_for_recipient(
+        sender_peer_shared_key,
+        &invite_key.verifying_key(),
+        &plaintext_key,
+    );
 
     let ss_evt = ParsedEvent::SecretShared(SecretSharedEvent {
         created_at_ms: now_ms(),
         key_event_id,
         recipient_event_id: *invite_event_id,
+        unwrap_key_event_id: invite_privkey_event_id,
         wrapped_key: wrapped,
         signed_by: *sender_peer_shared_event_id,
         signer_type: 5,
         signature: [0u8; 64],
     });
-    let _ss_event_id =
-        create_signed_event_synchronous(conn, recorded_by, &ss_evt, sender_peer_shared_key)?;
+    let _ss_event_id = event_id_or_blocked(create_signed_event_synchronous(
+        conn,
+        recorded_by,
+        &ss_evt,
+        sender_peer_shared_key,
+    ))?;
 
     Ok(())
 }
 
-/// Persist invite key material so content-key unwrap can be retried after
-/// late-arriving SecretShared prerequisites.
-pub(crate) fn store_pending_invite_unwrap_key(
+/// Persist local invite private key material as deterministic invite_privkey.
+/// Returns the deterministic invite_privkey event id.
+pub(crate) fn store_invite_privkey(
     conn: &Connection,
     recorded_by: &str,
     invite_event_id: &EventId,
     invite_key: &SigningKey,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let evt = ParsedEvent::LocalSignerSecret(LocalSignerSecretEvent {
-        created_at_ms: now_ms(),
-        signer_event_id: *invite_event_id,
-        signer_kind: SIGNER_KIND_PENDING_INVITE_UNWRAP,
-        private_key_bytes: invite_key.to_bytes(),
-    });
-    let _ = create_event_synchronous(conn, recorded_by, &evt)?;
-    Ok(())
+) -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
+    let private_key = invite_key.to_bytes();
+    let expected = crate::event_modules::invite_privkey::deterministic_invite_privkey_event_id(
+        invite_event_id,
+        &private_key,
+    );
+    let evt = crate::event_modules::invite_privkey::deterministic_invite_privkey_event(
+        *invite_event_id,
+        private_key,
+    );
+    let created = event_id_or_blocked(create_event_synchronous(conn, recorded_by, &evt))?;
+    if created != expected {
+        return Err("invite_privkey event_id mismatch for deterministic key material".into());
+    }
+    Ok(created)
 }
 
 fn create_invite_event_with_optional_bootstrap_context(
@@ -257,7 +282,7 @@ pub(crate) fn create_user_invite_events(
             recorded_by,
             ps_key,
             ps_eid,
-            &invite_key.verifying_key(),
+            &invite_key,
             &invite_event_id,
         )?;
     }
@@ -315,38 +340,15 @@ pub(crate) fn create_device_link_invite_events(
 // Private helpers
 // ---------------------------------------------------------------------------
 
-/// Generate a random 32-byte content secret key, create a local SecretKey event,
-/// then wrap it for our own peer_shared public key via SecretShared (self-wrap).
-fn create_content_key_and_self_wrap(
+/// Generate a random 32-byte content secret key and create a local Secret event.
+fn create_content_key(
     conn: &Connection,
     recorded_by: &str,
-    peer_shared_key: &SigningKey,
-    peer_shared_event_id: &EventId,
 ) -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
     let mut rng = rand::thread_rng();
 
     let mut content_key_bytes = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rng, &mut content_key_bytes);
 
-    let key_event_id = create_deterministic_secret_key_event(conn, recorded_by, content_key_bytes)?;
-
-    let wrapped = wrap_key_for_recipient(
-        peer_shared_key,
-        &peer_shared_key.verifying_key(),
-        &content_key_bytes,
-    );
-
-    let ss_evt = ParsedEvent::SecretShared(SecretSharedEvent {
-        created_at_ms: now_ms(),
-        key_event_id: key_event_id,
-        recipient_event_id: *peer_shared_event_id,
-        wrapped_key: wrapped,
-        signed_by: *peer_shared_event_id,
-        signer_type: 5,
-        signature: [0u8; 64],
-    });
-    let _ss_event_id =
-        create_signed_event_synchronous(conn, recorded_by, &ss_evt, peer_shared_key)?;
-
-    Ok(key_event_id)
+    create_deterministic_secret_key_event(conn, recorded_by, content_key_bytes)
 }

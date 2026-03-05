@@ -4,6 +4,7 @@ pub mod device_invite;
 pub mod encrypted;
 pub mod file_slice;
 pub mod invite_accepted;
+pub mod invite_privkey;
 pub mod layout;
 pub mod local_signer_secret;
 pub mod message;
@@ -16,7 +17,6 @@ pub mod registry;
 pub mod secret_key;
 pub mod secret_shared;
 pub mod subscription;
-pub mod unwrap_secret;
 pub mod user;
 pub mod user_invite;
 pub mod user_removed;
@@ -55,6 +55,7 @@ pub use device_invite::DeviceInviteEvent;
 pub use encrypted::EncryptedEvent;
 pub use file_slice::FileSliceEvent;
 pub use invite_accepted::InviteAcceptedEvent;
+pub use invite_privkey::InvitePrivkeyEvent;
 pub use local_signer_secret::LocalSignerSecretEvent;
 pub use message::MessageEvent;
 pub use message_attachment::MessageAttachmentEvent;
@@ -65,7 +66,6 @@ pub use reaction::ReactionEvent;
 pub use registry::{EventRegistry, EventTypeMeta, ShareScope};
 pub use secret_key::SecretKeyEvent;
 pub use secret_shared::SecretSharedEvent;
-pub use unwrap_secret::UnwrapSecretEvent;
 pub use user::UserEvent;
 pub use user_invite::UserInviteEvent;
 pub use user_removed::UserRemovedEvent;
@@ -90,7 +90,7 @@ pub const EVENT_TYPE_MESSAGE_ATTACHMENT: u8 = 24;
 pub const EVENT_TYPE_FILE_SLICE: u8 = 25;
 pub const EVENT_TYPE_BENCH_DEP: u8 = 26;
 pub const EVENT_TYPE_LOCAL_SIGNER_SECRET: u8 = 27;
-pub const EVENT_TYPE_UNWRAP_SECRET: u8 = 28;
+pub const EVENT_TYPE_INVITE_PRIVKEY: u8 = 28;
 // Removed type-code slot: secret_shared_unwrap (29).
 
 /// Max event blob size: 1 MiB
@@ -113,7 +113,7 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     secret_key::ensure_schema(conn)?;
     secret_shared::ensure_schema(conn)?;
     local_signer_secret::ensure_schema(conn)?;
-    unwrap_secret::ensure_schema(conn)?;
+    invite_privkey::ensure_schema(conn)?;
     subscription::ensure_schema(conn)?;
     Ok(())
 }
@@ -139,7 +139,7 @@ pub enum ParsedEvent {
     FileSlice(FileSliceEvent),
     BenchDep(BenchDepEvent),
     LocalSignerSecret(LocalSignerSecretEvent),
-    UnwrapSecret(UnwrapSecretEvent),
+    InvitePrivkey(InvitePrivkeyEvent),
 }
 
 impl ParsedEvent {
@@ -164,7 +164,7 @@ impl ParsedEvent {
             ParsedEvent::FileSlice(f) => f.created_at_ms,
             ParsedEvent::BenchDep(b) => b.created_at_ms,
             ParsedEvent::LocalSignerSecret(l) => l.created_at_ms,
-            ParsedEvent::UnwrapSecret(k) => k.created_at_ms,
+            ParsedEvent::InvitePrivkey(k) => k.created_at_ms,
         }
     }
 
@@ -215,10 +215,7 @@ impl ParsedEvent {
             ParsedEvent::SecretShared(s) => {
                 vec![
                     ("recipient_event_id", s.recipient_event_id),
-                    (
-                        "unwrap_secret_event_id",
-                        unwrap_secret::deterministic_unwrap_secret_event_id(&s.recipient_event_id),
-                    ),
+                    ("unwrap_key_event_id", s.unwrap_key_event_id),
                     ("signed_by", s.signed_by),
                 ]
             }
@@ -229,14 +226,8 @@ impl ParsedEvent {
             ],
             ParsedEvent::FileSlice(f) => vec![("signed_by", f.signed_by)],
             ParsedEvent::BenchDep(b) => b.dep_ids.iter().map(|id| ("dep_id", *id)).collect(),
-            ParsedEvent::LocalSignerSecret(l) => {
-                if l.signer_kind == local_signer_secret::SIGNER_KIND_PENDING_INVITE_UNWRAP {
-                    Vec::new()
-                } else {
-                    vec![("signer_event_id", l.signer_event_id)]
-                }
-            }
-            ParsedEvent::UnwrapSecret(k) => vec![("recipient_event_id", k.recipient_event_id)],
+            ParsedEvent::LocalSignerSecret(l) => vec![("signer_event_id", l.signer_event_id)],
+            ParsedEvent::InvitePrivkey(k) => vec![("invite_event_id", k.invite_event_id)],
         }
     }
 
@@ -261,7 +252,7 @@ impl ParsedEvent {
             ParsedEvent::FileSlice(_) => EVENT_TYPE_FILE_SLICE,
             ParsedEvent::BenchDep(_) => EVENT_TYPE_BENCH_DEP,
             ParsedEvent::LocalSignerSecret(_) => EVENT_TYPE_LOCAL_SIGNER_SECRET,
-            ParsedEvent::UnwrapSecret(_) => EVENT_TYPE_UNWRAP_SECRET,
+            ParsedEvent::InvitePrivkey(_) => EVENT_TYPE_INVITE_PRIVKEY,
         }
     }
 
@@ -288,7 +279,7 @@ impl ParsedEvent {
             | ParsedEvent::InviteAccepted(_)
             | ParsedEvent::BenchDep(_)
             | ParsedEvent::LocalSignerSecret(_)
-            | ParsedEvent::UnwrapSecret(_) => None,
+            | ParsedEvent::InvitePrivkey(_) => None,
         }
     }
 
@@ -403,7 +394,7 @@ pub fn registry() -> &'static EventRegistry {
             &file_slice::FILE_SLICE_META,
             &bench_dep::BENCH_DEP_META,
             &local_signer_secret::LOCAL_SIGNER_SECRET_META,
-            &unwrap_secret::UNWRAP_SECRET_META,
+            &invite_privkey::INVITE_PRIVKEY_META,
         ])
     })
 }

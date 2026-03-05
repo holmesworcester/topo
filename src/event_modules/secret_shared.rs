@@ -5,18 +5,20 @@ use super::{EventError, ParsedEvent, EVENT_TYPE_SECRET_SHARED};
 // ─── Layout (owned by this module) ───
 
 /// SecretShared (type 22): type(1) + created_at(8) + key_event_id(32) + recipient_event_id(32)
-///                        + wrapped_key(32) + signed_by(32) + signer_type(1) + signature(64) = 202
+///                        + unwrap_key_event_id(32) + wrapped_key(32) + signed_by(32)
+///                        + signer_type(1) + signature(64) = 234
 pub const SECRET_SHARED_WIRE_SIZE: usize =
-    COMMON_HEADER_BYTES + 32 + 32 + 32 + SIGNATURE_TRAILER_BYTES;
+    COMMON_HEADER_BYTES + 32 + 32 + 32 + 32 + SIGNATURE_TRAILER_BYTES;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecretSharedEvent {
     pub created_at_ms: u64,
-    pub key_event_id: [u8; 32],       // dep: SecretKey event
-    pub recipient_event_id: [u8; 32], // dep: invite or peer_shared event of recipient
-    pub wrapped_key: [u8; 32],        // key bytes wrapped for recipient
-    pub signed_by: [u8; 32],          // signer event_id (PeerShared event — sender)
-    pub signer_type: u8,              // 5 = peer_shared
+    pub key_event_id: [u8; 32],        // dep: Secret event
+    pub recipient_event_id: [u8; 32],  // dep: invite event of recipient
+    pub unwrap_key_event_id: [u8; 32], // dep: local InvitePrivkey event (recipient side)
+    pub wrapped_key: [u8; 32],         // key bytes wrapped for recipient
+    pub signed_by: [u8; 32],           // signer event_id (PeerShared event — sender)
+    pub signer_type: u8,               // 5 = peer_shared
     pub signature: [u8; 64],
 }
 
@@ -29,15 +31,16 @@ impl super::Describe for SecretSharedEvent {
     }
 }
 
-/// Wire format (202 bytes fixed):
+/// Wire format (234 bytes fixed):
 /// [0]          type_code = 22
 /// [1..9]       created_at_ms (u64 LE)
 /// [9..41]      key_event_id (32 bytes)
 /// [41..73]     recipient_event_id (32 bytes)
-/// [73..105]    wrapped_key (32 bytes)
-/// [105..137]   signed_by (32 bytes)
-/// [137]        signer_type (1 byte)
-/// [138..202]   signature (64 bytes)
+/// [73..105]    unwrap_key_event_id (32 bytes)
+/// [105..137]   wrapped_key (32 bytes)
+/// [137..169]   signed_by (32 bytes)
+/// [169]        signer_type (1 byte)
+/// [170..234]   signature (64 bytes)
 pub fn parse_secret_shared(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if blob.len() < SECRET_SHARED_WIRE_SIZE {
         return Err(EventError::TooShort {
@@ -63,18 +66,21 @@ pub fn parse_secret_shared(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     key_event_id.copy_from_slice(&blob[9..41]);
     let mut recipient_event_id = [0u8; 32];
     recipient_event_id.copy_from_slice(&blob[41..73]);
+    let mut unwrap_key_event_id = [0u8; 32];
+    unwrap_key_event_id.copy_from_slice(&blob[73..105]);
     let mut wrapped_key = [0u8; 32];
-    wrapped_key.copy_from_slice(&blob[73..105]);
+    wrapped_key.copy_from_slice(&blob[105..137]);
     let mut signed_by = [0u8; 32];
-    signed_by.copy_from_slice(&blob[105..137]);
-    let signer_type = blob[137];
+    signed_by.copy_from_slice(&blob[137..169]);
+    let signer_type = blob[169];
     let mut signature = [0u8; 64];
-    signature.copy_from_slice(&blob[138..202]);
+    signature.copy_from_slice(&blob[170..234]);
 
     Ok(ParsedEvent::SecretShared(SecretSharedEvent {
         created_at_ms,
         key_event_id,
         recipient_event_id,
+        unwrap_key_event_id,
         wrapped_key,
         signed_by,
         signer_type,
@@ -92,6 +98,7 @@ pub fn encode_secret_shared(event: &ParsedEvent) -> Result<Vec<u8>, EventError> 
     buf.extend_from_slice(&e.created_at_ms.to_le_bytes());
     buf.extend_from_slice(&e.key_event_id);
     buf.extend_from_slice(&e.recipient_event_id);
+    buf.extend_from_slice(&e.unwrap_key_event_id);
     buf.extend_from_slice(&e.wrapped_key);
     buf.extend_from_slice(&e.signed_by);
     buf.push(e.signer_type);
@@ -136,25 +143,27 @@ pub fn build_projector_context(
     };
 
     let recipient_b64 = event_id_to_base64(&ss.recipient_event_id);
+    let unwrap_key_b64 = event_id_to_base64(&ss.unwrap_key_event_id);
     let recipient_removed = conn.query_row(
         "SELECT COUNT(*) > 0 FROM removed_entities WHERE recorded_by = ?1 AND target_event_id = ?2",
         rusqlite::params![recorded_by, &recipient_b64],
         |row| row.get(0),
     )?;
 
-    let unwrap_secret_row: Option<(Vec<u8>, u8)> = conn
+    let invite_privkey_row: Option<Vec<u8>> = conn
         .query_row(
-            "SELECT private_key, signer_kind
-             FROM unwrap_secrets
+            "SELECT private_key
+             FROM invite_privkeys
              WHERE recorded_by = ?1
-               AND recipient_event_id = ?2
+               AND event_id = ?2
+               AND invite_event_id = ?3
              LIMIT 1",
-            rusqlite::params![recorded_by, &recipient_b64],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            rusqlite::params![recorded_by, &unwrap_key_b64, &recipient_b64],
+            |row| row.get(0),
         )
         .ok();
 
-    let (private_key_bytes, signer_kind) = match unwrap_secret_row {
+    let private_key_bytes = match invite_privkey_row {
         Some(v) => v,
         None => {
             return Ok(ContextSnapshot {
@@ -194,19 +203,11 @@ pub fn build_projector_context(
     };
 
     let plaintext_key = unwrap_key_from_sender(&local_signing_key, &sender_pub, &ss.wrapped_key);
-    let clear_invite = if signer_kind
-        == crate::event_modules::local_signer_secret::SIGNER_KIND_PENDING_INVITE_UNWRAP
-    {
-        Some(ss.recipient_event_id)
-    } else {
-        None
-    };
 
     Ok(ContextSnapshot {
         recipient_removed,
         unwrapped_secret_material: Some(crate::projection::contract::UnwrappedSecretMaterial {
             key_bytes: plaintext_key,
-            clear_invite_signer_event_id: clear_invite,
         }),
         ..ContextSnapshot::default()
     })
@@ -255,38 +256,22 @@ pub fn project_pure(
         None => return ProjectorResult::valid(ops),
     };
 
-    let secret_key_event =
+    let secret_event =
         crate::event_modules::secret_key::deterministic_secret_key_event(material.key_bytes);
-    let secret_blob = match crate::event_modules::encode_event(&secret_key_event) {
+    let secret_blob = match crate::event_modules::encode_event(&secret_event) {
         Ok(v) => v,
         Err(err) => {
             return ProjectorResult::reject(format!(
-                "failed to encode deterministic secret_key event: {}",
+                "failed to encode deterministic secret event: {}",
                 err
             ))
         }
     };
 
-    let mut commands = vec![EmitCommand::EmitDeterministicBlob { blob: secret_blob }];
-
-    if let Some(clear_invite_signer_event_id) = material.clear_invite_signer_event_id {
-        let clear_evt =
-            crate::event_modules::local_signer_secret::deterministic_pending_invite_tombstone_event(
-                clear_invite_signer_event_id,
-            );
-        let clear_blob = match crate::event_modules::encode_event(&clear_evt) {
-            Ok(v) => v,
-            Err(err) => {
-                return ProjectorResult::reject(format!(
-                    "failed to encode invite-key clear tombstone: {}",
-                    err
-                ))
-            }
-        };
-        commands.push(EmitCommand::EmitDeterministicBlob { blob: clear_blob });
-    }
-
-    ProjectorResult::valid_with_commands(ops, commands)
+    ProjectorResult::valid_with_commands(
+        ops,
+        vec![EmitCommand::EmitDeterministicBlob { blob: secret_blob }],
+    )
 }
 
 pub static SECRET_SHARED_META: EventTypeMeta = EventTypeMeta {
@@ -294,8 +279,8 @@ pub static SECRET_SHARED_META: EventTypeMeta = EventTypeMeta {
     type_name: "secret_shared",
     projection_table: "secret_shared",
     share_scope: ShareScope::Shared,
-    dep_fields: &["recipient_event_id", "unwrap_secret_event_id", "signed_by"],
-    dep_field_type_codes: &[&[10, 11, 12, 13, 16, 17], &[28], &[]],
+    dep_fields: &["recipient_event_id", "unwrap_key_event_id", "signed_by"],
+    dep_field_type_codes: &[&[10, 12], &[28], &[]],
     signer_required: true,
     signature_byte_len: 64,
     encryptable: false,

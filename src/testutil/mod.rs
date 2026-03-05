@@ -14,9 +14,7 @@ pub struct DaemonGuard {
 impl DaemonGuard {
     /// Wrap an already-spawned daemon `Child` process.
     pub fn new(child: Child) -> Self {
-        Self {
-            child: Some(child),
-        }
+        Self { child: Some(child) }
     }
 
     /// Access the underlying `Child` (e.g. for `try_wait` or `id`).
@@ -37,10 +35,10 @@ impl Drop for DaemonGuard {
 use crate::crypto::{event_id_to_base64, EventId};
 use crate::db::{open_connection, schema::create_tables, store::insert_recorded_event};
 use crate::event_modules::{
-    AdminEvent, DeviceInviteEvent, FileSliceEvent, InviteAcceptedEvent,
-    MessageAttachmentEvent, MessageDeletionEvent, MessageEvent, ParsedEvent, PeerRemovedEvent,
-    PeerSharedEvent, ReactionEvent, SecretKeyEvent, SecretSharedEvent, UserEvent,
-    UserInviteEvent, UserRemovedEvent, WorkspaceEvent,
+    AdminEvent, DeviceInviteEvent, FileSliceEvent, InviteAcceptedEvent, MessageAttachmentEvent,
+    MessageDeletionEvent, MessageEvent, ParsedEvent, PeerRemovedEvent, PeerSharedEvent,
+    ReactionEvent, SecretKeyEvent, SecretSharedEvent, UserEvent, UserInviteEvent, UserRemovedEvent,
+    WorkspaceEvent,
 };
 use crate::peering::loops::{
     accept_loop, connect_loop, connect_loop_with_shared_ingest,
@@ -639,6 +637,20 @@ impl Peer {
             .expect("failed to create user_invite")
     }
 
+    /// Create a deterministic local invite_privkey event for an invite.
+    pub fn create_invite_privkey(
+        &self,
+        invite_event_id: &EventId,
+        invite_private_key: [u8; 32],
+    ) -> EventId {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        let evt = crate::event_modules::invite_privkey::deterministic_invite_privkey_event(
+            *invite_event_id,
+            invite_private_key,
+        );
+        create_event_staged(&db, &self.identity, &evt).expect("failed to create invite_privkey")
+    }
+
     /// Create a User event (signed by UserInvite key). Returns the event ID.
     pub fn create_user(
         &self,
@@ -765,6 +777,7 @@ impl Peer {
         signing_key: &ed25519_dalek::SigningKey,
         key_event_id: &EventId,
         recipient_event_id: &EventId,
+        unwrap_key_event_id: &EventId,
         wrapped_key: [u8; 32],
         peer_shared_event_id: &EventId,
     ) -> EventId {
@@ -773,6 +786,7 @@ impl Peer {
             created_at_ms: current_timestamp_ms(),
             key_event_id: *key_event_id,
             recipient_event_id: *recipient_event_id,
+            unwrap_key_event_id: *unwrap_key_event_id,
             wrapped_key,
             signed_by: *peer_shared_event_id,
             signer_type: 5,
@@ -826,17 +840,16 @@ impl Peer {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        let msg_eid =
-            create_signed_event_staged(&db, &self.identity, &msg, self.signing_key())
-                .expect("failed to create parent message");
+        let msg_eid = create_signed_event_staged(&db, &self.identity, &msg, self.signing_key())
+            .expect("failed to create parent message");
 
         // Secret key for attachment
         let sk = ParsedEvent::SecretKey(SecretKeyEvent {
             created_at_ms: current_timestamp_ms(),
             key_bytes: [0xBB; 32],
         });
-        let sk_eid = create_event_staged(&db, &self.identity, &sk)
-            .expect("failed to create secret_key");
+        let sk_eid =
+            create_event_staged(&db, &self.identity, &sk).expect("failed to create secret_key");
 
         let file_id: [u8; 32] = {
             use std::hash::{Hash, Hasher};
@@ -869,9 +882,8 @@ impl Peer {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        let att_eid =
-            create_signed_event_staged(&db, &self.identity, &att, self.signing_key())
-                .expect("failed to create message_attachment");
+        let att_eid = create_signed_event_staged(&db, &self.identity, &att, self.signing_key())
+            .expect("failed to create message_attachment");
         project_one(&db, &self.identity, &att_eid).expect("failed to project attachment");
 
         // Batch-create file slices inside a transaction
@@ -894,8 +906,8 @@ impl Peer {
                 signer_type: 5,
                 signature: [0u8; 64],
             });
-            let mut blob = crate::event_modules::encode_event(&fs)
-                .expect("failed to encode file_slice");
+            let mut blob =
+                crate::event_modules::encode_event(&fs).expect("failed to encode file_slice");
             let blob_len = blob.len();
             let sig = sign_event_bytes(&signing_key, &blob[..blob_len - 64]);
             blob[blob_len - 64..].copy_from_slice(&sig);
@@ -915,12 +927,14 @@ impl Peer {
             db.execute(
                 "INSERT OR IGNORE INTO neg_items (workspace_id, ts, id) VALUES (?1, ?2, ?3)",
                 rusqlite::params![&workspace_id, created_at as i64, event_id.as_slice()],
-            ).expect("failed to insert neg_item");
+            )
+            .expect("failed to insert neg_item");
             db.execute(
                 "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
                  VALUES (?1, ?2, ?3, 'local')",
                 rusqlite::params![&self.identity, &event_id_b64, created_at as i64],
-            ).expect("failed to insert recorded_event");
+            )
+            .expect("failed to insert recorded_event");
 
             // Project (validates the signature + authorization chain)
             project_one(&db, &self.identity, &event_id).expect("failed to project file_slice");
@@ -936,10 +950,7 @@ impl Peer {
     /// tables (no projection required). Module-local query helper.
     pub fn file_slice_event_counts_by_source(&self) -> std::collections::HashMap<String, i64> {
         let db = open_connection(&self.db_path).expect("failed to open db");
-        crate::event_modules::file_slice::file_slice_event_counts_by_source(
-            &db,
-            &self.identity,
-        )
+        crate::event_modules::file_slice::file_slice_event_counts_by_source(&db, &self.identity)
     }
 
     /// Count file_slice events received by this peer (no projection required).
@@ -2506,10 +2517,9 @@ pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Jo
     // one source to dominate attribution.
     let ingest_fns = test_ingest_fns();
     let ingest_cap = crate::tuning::shared_ingest_cap();
-    let (shared_tx, shared_rx) =
-        tokio::sync::mpsc::channel::<crate::contracts::event_pipeline_contract::IngestItem>(
-            ingest_cap,
-        );
+    let (shared_tx, shared_rx) = tokio::sync::mpsc::channel::<
+        crate::contracts::event_pipeline_contract::IngestItem,
+    >(ingest_cap);
     let writer_db = sink.db_path.clone();
     let writer_events = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let batch_writer_fn = ingest_fns.batch_writer;
@@ -2525,9 +2535,7 @@ pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Jo
     let peer_coords: Vec<_> = (0..sink_connectors.len())
         .map(|_| coord_manager.register_peer())
         .collect();
-    for ((endpoint, remote), coordination) in
-        sink_connectors.into_iter().zip(peer_coords)
-    {
+    for ((endpoint, remote), coordination) in sink_connectors.into_iter().zip(peer_coords) {
         let sink_db = sink.db_path.clone();
         let sink_identity = sink.identity.clone();
         let sink_ingest = shared_tx.clone();
@@ -2575,10 +2583,7 @@ impl SinkDownloadHandles {
 
 /// Like [`start_sink_download`] but returns [`SinkDownloadHandles`] with
 /// per-source shutdown control for simulating peer dropout.
-pub fn start_sink_download_with_shutdown(
-    sources: &[Peer],
-    sink: &Peer,
-) -> SinkDownloadHandles {
+pub fn start_sink_download_with_shutdown(sources: &[Peer], sink: &Peer) -> SinkDownloadHandles {
     use crate::db::transport_trust::{import_cli_pins_to_sql, is_peer_allowed};
 
     assert!(!sources.is_empty(), "need at least one source");
@@ -2669,10 +2674,9 @@ pub fn start_sink_download_with_shutdown(
     // Shared batch_writer for the sink
     let ingest_fns = test_ingest_fns();
     let ingest_cap = crate::tuning::shared_ingest_cap();
-    let (shared_tx, shared_rx) =
-        tokio::sync::mpsc::channel::<crate::contracts::event_pipeline_contract::IngestItem>(
-            ingest_cap,
-        );
+    let (shared_tx, shared_rx) = tokio::sync::mpsc::channel::<
+        crate::contracts::event_pipeline_contract::IngestItem,
+    >(ingest_cap);
     let writer_db = sink.db_path.clone();
     let writer_events = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let batch_writer_fn = ingest_fns.batch_writer;
@@ -2687,9 +2691,7 @@ pub fn start_sink_download_with_shutdown(
         .collect();
 
     let mut connect_shutdowns = Vec::new();
-    for ((endpoint, remote), coordination) in
-        sink_connectors.into_iter().zip(peer_coords)
-    {
+    for ((endpoint, remote), coordination) in sink_connectors.into_iter().zip(peer_coords) {
         let shutdown = tokio_util::sync::CancellationToken::new();
         connect_shutdowns.push(shutdown.clone());
         let sink_db = sink.db_path.clone();

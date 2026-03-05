@@ -268,7 +268,7 @@ async fn test_zero_loss_stress() {
     // both sides, stable for 5 consecutive polls at 200ms, before dropping sync.
     // Each peer creates local-scope (non-synced) events during workspace
     // bootstrap/key setup:
-    // InviteAccepted + SecretKey + 3×LocalSignerSecret + 3×UnwrapSecret.
+    // InviteAccepted + Secret + 3×LocalSignerSecret (+ optional InvitePrivkey).
     let local_event_budget = 8;
     let quiesce_needed = 5u32;
     let mut quiesce_streak = 0u32;

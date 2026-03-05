@@ -401,12 +401,12 @@ fn parsed_event_type_name(parsed: &ParsedEvent) -> &'static str {
         ParsedEvent::UserRemoved(_) => "user_removed",
         ParsedEvent::PeerRemoved(_) => "peer_removed",
         ParsedEvent::Encrypted(_) => "encrypted",
-        ParsedEvent::SecretKey(_) => "secret_key",
+        ParsedEvent::SecretKey(_) => "secret",
         ParsedEvent::SecretShared(_) => "secret_shared",
         ParsedEvent::FileSlice(_) => "file_slice",
         ParsedEvent::BenchDep(_) => "bench_dep",
         ParsedEvent::LocalSignerSecret(_) => "local_signer_secret",
-        ParsedEvent::UnwrapSecret(_) => "unwrap_secret",
+        ParsedEvent::InvitePrivkey(_) => "invite_privkey",
     }
 }
 

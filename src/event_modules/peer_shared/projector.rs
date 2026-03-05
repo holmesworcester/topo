@@ -1,6 +1,6 @@
 use super::super::ParsedEvent;
-use crate::crypto::{event_id_from_base64, event_id_to_base64};
-use crate::projection::contract::{ContextSnapshot, EmitCommand, ProjectorResult, SqlVal, WriteOp};
+use crate::crypto::event_id_to_base64;
+use crate::projection::contract::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
 
 /// Pure projector: PeerShared -> peers_shared table.
 /// Also consumes bootstrap trust rows matching this peer's transport fingerprint,
@@ -59,24 +59,6 @@ pub fn project_pure(
             ],
         },
     ];
-    if let Some(recipient_event_id) = event_id_from_base64(event_id_b64) {
-        let unwrap_evt = crate::event_modules::unwrap_secret::deterministic_unwrap_secret_event(
-            recipient_event_id,
-        );
-        let unwrap_blob = match crate::event_modules::encode_event(&unwrap_evt) {
-            Ok(v) => v,
-            Err(err) => {
-                return ProjectorResult::reject(format!(
-                    "failed to encode deterministic unwrap_secret event: {}",
-                    err
-                ));
-            }
-        };
-        ProjectorResult::valid_with_commands(
-            ops,
-            vec![EmitCommand::EmitDeterministicBlob { blob: unwrap_blob }],
-        )
-    } else {
-        ProjectorResult::valid(ops)
-    }
+
+    ProjectorResult::valid(ops)
 }

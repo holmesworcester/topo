@@ -169,8 +169,6 @@ pub struct ContextSnapshot {
     pub recipient_removed: bool,
     /// For SecretShared: DH-unwrapped key material, if available.
     pub unwrapped_secret_material: Option<UnwrappedSecretMaterial>,
-    /// For UnwrapSecret: signer private key material to persist in unwrap_secrets.
-    pub unwrap_secret_material: Option<UnwrapSecretMaterial>,
 
     /// For FileSlice: descriptor info (event_id, signer_event_id) for the file_id.
     /// Empty vec means no descriptor exists yet (guard-block).
@@ -200,16 +198,6 @@ pub struct ContextSnapshot {
 #[derive(Debug, Clone)]
 pub struct UnwrappedSecretMaterial {
     pub key_bytes: [u8; 32],
-    /// If unwrap used pending invite key material, emit a deterministic
-    /// local_signer_secret tombstone for this signer_event_id.
-    pub clear_invite_signer_event_id: Option<[u8; 32]>,
-}
-
-/// Local signer material loaded for UnwrapSecret projection.
-#[derive(Debug, Clone)]
-pub struct UnwrapSecretMaterial {
-    pub signer_kind: u8,
-    pub private_key_bytes: [u8; 32],
 }
 
 /// Bootstrap context read from the `bootstrap_context` table, passed to

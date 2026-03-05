@@ -101,12 +101,6 @@ mod tests {
         assert_valid(&result);
         assert_deletes_from_table(&result, "pending_invite_bootstrap_trust");
         assert_deletes_from_table(&result, "invite_bootstrap_trust");
-        assert_emits_command(&result, "EmitDeterministicBlob", |cmd| {
-            matches!(
-                cmd,
-                topo::projection::contract::EmitCommand::EmitDeterministicBlob { .. }
-            )
-        });
     }
 
     #[test]

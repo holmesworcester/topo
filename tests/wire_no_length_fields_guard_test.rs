@@ -27,7 +27,7 @@ const CANONICAL_EVENT_FILES: &[&str] = &[
     "src/event_modules/admin/wire.rs",
     "src/event_modules/user_removed.rs",
     "src/event_modules/peer_removed.rs",
-    "src/event_modules/unwrap_secret.rs",
+    "src/event_modules/invite_privkey.rs",
 ];
 
 /// Denied field names that indicate variable-length wire format logic.

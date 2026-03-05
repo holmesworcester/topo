@@ -1,4 +1,4 @@
-use topo::crypto::{event_id_from_base64, event_id_to_base64};
+use topo::crypto::event_id_to_base64;
 use topo::db::open_connection;
 use topo::testutil::{Peer, ScenarioHarness};
 
@@ -53,8 +53,7 @@ fn bootstrap_peer(peer: &Peer) -> BootstrapChain {
     // 5. DeviceInvite (signed by user)
     let device_invite_key = SigningKey::generate(&mut rng);
     let device_invite_pubkey = device_invite_key.verifying_key().to_bytes();
-    let device_invite_eid =
-        peer.create_device_invite(device_invite_pubkey, &user_key, &user_eid);
+    let device_invite_eid = peer.create_device_invite(device_invite_pubkey, &user_key, &user_eid);
 
     // 6. PeerShared (signed by device_invite)
     let peer_shared_key = SigningKey::generate(&mut rng);
@@ -131,8 +130,7 @@ fn join_workspace(joiner: &Peer, alice_chain: &BootstrapChain, alice: &Peer) -> 
     // Joiner creates DeviceInvite (signed by joiner's user key)
     let device_invite_key = SigningKey::generate(&mut rng);
     let device_invite_pubkey = device_invite_key.verifying_key().to_bytes();
-    let device_invite_eid =
-        joiner.create_device_invite(device_invite_pubkey, &user_key, &user_eid);
+    let device_invite_eid = joiner.create_device_invite(device_invite_pubkey, &user_key, &user_eid);
 
     // Joiner creates PeerShared (signed by device invite)
     let peer_shared_key = SigningKey::generate(&mut rng);
@@ -565,12 +563,17 @@ fn test_secret_shared_key_wrap() {
     let secret_key_bytes: [u8; 32] = rand::random();
     let sk_eid = alice.create_secret_key(secret_key_bytes);
 
-    // Create SecretShared wrapping to Alice's own PeerShared (for simplicity)
+    // Create local invite_privkey for the bootstrap invite.
+    let unwrap_key_eid =
+        alice.create_invite_privkey(&chain.user_invite_eid, chain.invite_key.to_bytes());
+
+    // Create SecretShared wrapping to the bootstrap invite.
     let wrapped_key: [u8; 32] = rand::random(); // in real code this would be encrypted
     let ss_eid = alice.create_secret_shared(
         &chain.peer_shared_key,
         &sk_eid,
-        &chain.peer_shared_eid,
+        &chain.user_invite_eid,
+        &unwrap_key_eid,
         wrapped_key,
         &chain.peer_shared_eid,
     );
@@ -598,31 +601,31 @@ fn test_secret_shared_key_wrap() {
     harness.finish();
 }
 
-/// Out-of-order test: SecretShared event blocks when its recipient dep
-/// (Bob's PeerShared in a shared workspace) is not yet valid on Alice's side,
-/// then unblocks via cascade after Bob's identity chain events are synced in.
+/// Out-of-order test: SecretShared blocks until the local invite_privkey dep exists,
+/// then unblocks via normal cascade once invite_privkey is projected.
 #[test]
 fn test_secret_shared_blocks_until_signer_valid() {
     use topo::event_modules::{ParsedEvent, SecretSharedEvent};
-    use topo::projection::apply::project_one;
     use topo::projection::create::create_signed_event_staged;
 
     let alice = Peer::new("alice");
-    let bob = Peer::new("bob");
     let harness = ScenarioHarness::new();
     harness.track(&alice);
-    harness.track(&bob);
 
-    // Alice bootstraps workspace; Bob joins Alice's workspace via invite.
+    // Alice bootstraps workspace.
     let chain = bootstrap_peer(&alice);
-    let bob_join = join_workspace(&bob, &chain, &alice);
 
     // Alice creates a local content key.
     let secret_key_bytes: [u8; 32] = rand::random();
     let sk_eid = alice.create_secret_key(secret_key_bytes);
 
-    // Alice creates a SecretShared targeting Bob's PeerShared as recipient.
-    // Bob's identity chain exists in Bob's DB, but NOT yet in Alice's DB.
+    // SecretShared depends on deterministic invite_privkey event id.
+    // Do not emit invite_privkey yet, so this should block.
+    let invite_privkey_eid =
+        topo::event_modules::invite_privkey::deterministic_invite_privkey_event_id(
+            &chain.user_invite_eid,
+            &chain.invite_key.to_bytes(),
+        );
     let wrapped_key: [u8; 32] = rand::random();
     let ss_event = ParsedEvent::SecretShared(SecretSharedEvent {
         created_at_ms: std::time::SystemTime::now()
@@ -630,7 +633,8 @@ fn test_secret_shared_blocks_until_signer_valid() {
             .unwrap()
             .as_millis() as u64,
         key_event_id: sk_eid,
-        recipient_event_id: bob_join.peer_shared_eid,
+        recipient_event_id: chain.user_invite_eid,
+        unwrap_key_event_id: invite_privkey_eid,
         wrapped_key,
         signed_by: chain.peer_shared_eid,
         signer_type: 5,
@@ -646,8 +650,7 @@ fn test_secret_shared_blocks_until_signer_valid() {
     .expect("staged create should succeed even if blocked");
     let ss_b64 = event_id_to_base64(&ss_eid);
 
-    // SecretShared should be blocked: recipient_event_id (Bob's PeerShared) is not
-    // valid in Alice's DB yet.
+    // SecretShared should be blocked: invite_privkey dep missing.
     let blocked_count: i64 = alice_db
         .query_row(
             "SELECT COUNT(*) FROM blocked_event_deps WHERE peer_id = ?1 AND event_id = ?2",
@@ -657,53 +660,13 @@ fn test_secret_shared_blocks_until_signer_valid() {
         .unwrap();
     assert!(
         blocked_count >= 1,
-        "SecretShared should block — Bob's PeerShared not yet valid in Alice's DB"
+        "SecretShared should block until invite_privkey exists"
     );
 
-    // Now simulate sync: copy Bob's shared events to Alice's DB and project them.
-    let bob_db = open_connection(&bob.db_path).unwrap();
-    let bob_events: Vec<(String, Vec<u8>)> = {
-        let mut stmt = bob_db
-            .prepare(
-                "SELECT e.event_id, e.blob FROM events e
-             INNER JOIN recorded_events re ON e.event_id = re.event_id
-             WHERE re.peer_id = ?1
-             ORDER BY e.created_at ASC",
-            )
-            .unwrap();
-        stmt.query_map(rusqlite::params![&bob.identity], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-        })
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap()
-    };
+    // Emit deterministic invite_privkey; normal cascade should unblock secret_shared.
+    let _ = alice.create_invite_privkey(&chain.user_invite_eid, chain.invite_key.to_bytes());
 
-    use topo::event_modules::registry;
-    let reg = registry();
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-    for (eid_b64, blob) in &bob_events {
-        let meta = reg.lookup(blob[0]).unwrap();
-        if meta.share_scope.as_str() == "local" {
-            continue;
-        }
-        alice_db.execute(
-            "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![eid_b64, meta.type_name, blob, meta.share_scope.as_str(), now_ms as i64, now_ms as i64],
-        ).unwrap();
-        alice_db.execute(
-            "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source) VALUES (?1, ?2, ?3, 'test')",
-            rusqlite::params![&alice.identity, eid_b64, now_ms as i64],
-        ).unwrap();
-        let eid = event_id_from_base64(eid_b64).unwrap();
-        project_one(&alice_db, &alice.identity, &eid).unwrap();
-    }
-
-    // After Bob's chain arrives and cascades, SecretShared should now be valid.
+    // After invite_privkey projection + cascade, SecretShared should be valid.
     let ss_valid: bool = alice_db
         .query_row(
             "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
@@ -713,7 +676,7 @@ fn test_secret_shared_blocks_until_signer_valid() {
         .unwrap();
     assert!(
         ss_valid,
-        "SecretShared should be valid after Bob's identity chain arrived via cascade"
+        "SecretShared should be valid after invite_privkey is projected"
     );
 
     let ss_projected: i64 = alice_db
