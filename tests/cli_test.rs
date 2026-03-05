@@ -768,6 +768,7 @@ fn test_cli_generate_files_messages_display() {
 
 #[test]
 fn test_cli_event_tree_shows_structure() {
+    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let db = tmpdir
         .path()
@@ -779,7 +780,9 @@ fn test_cli_event_tree_shows_structure() {
     // create-workspace populates the db with identity chain events.
     create_workspace(&db);
 
-    // event-tree is a local command — no daemon needed.
+    // event-tree is served via daemon RPC.
+    let _daemon = start_daemon(&db);
+
     let out = Command::new(bin())
         .args(["--db", &db, "event-tree"])
         .output()
@@ -825,6 +828,7 @@ fn test_cli_event_tree_shows_structure() {
 
 #[test]
 fn test_cli_event_list_shows_all_events() {
+    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let db = tmpdir
         .path()
@@ -834,6 +838,7 @@ fn test_cli_event_list_shows_all_events() {
         .to_string();
 
     create_workspace(&db);
+    let _daemon = start_daemon(&db);
 
     let out = Command::new(bin())
         .args(["--db", &db, "event-list"])
@@ -846,10 +851,10 @@ fn test_cli_event_list_shows_all_events() {
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
 
-    // Should show the column header.
+    // Should show the event-list footer.
     assert!(
-        stdout.contains("ID") && stdout.contains("TYPE") && stdout.contains("DEPS"),
-        "event-list should show column headers, got:\n{}",
+        stdout.contains("events. Sorted by insertion order."),
+        "event-list should show event count footer, got:\n{}",
         stdout
     );
     // Should contain workspace event type.
@@ -874,6 +879,7 @@ fn test_cli_event_list_shows_all_events() {
 
 #[test]
 fn test_cli_event_tree_empty_db() {
+    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let db = tmpdir
         .path()
@@ -882,7 +888,18 @@ fn test_cli_event_tree_empty_db() {
         .unwrap()
         .to_string();
 
-    // Don't create workspace — just ensure the db/tables exist.
+    // event-tree is served via daemon RPC (even for an empty db).
+    let _daemon = start_daemon(&db);
+    let id_out = Command::new(bin())
+        .args(["--db", &db, "transport-identity"])
+        .output()
+        .expect("transport-identity command");
+    assert!(
+        id_out.status.success(),
+        "transport-identity failed: {}",
+        String::from_utf8_lossy(&id_out.stderr)
+    );
+
     let out = Command::new(bin())
         .args(["--db", &db, "event-tree"])
         .output()
@@ -902,6 +919,7 @@ fn test_cli_event_tree_empty_db() {
 
 #[test]
 fn test_cli_event_list_empty_db() {
+    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let db = tmpdir
         .path()
@@ -909,6 +927,18 @@ fn test_cli_event_list_empty_db() {
         .to_str()
         .unwrap()
         .to_string();
+
+    // event-list is served via daemon RPC (even for an empty db).
+    let _daemon = start_daemon(&db);
+    let id_out = Command::new(bin())
+        .args(["--db", &db, "transport-identity"])
+        .output()
+        .expect("transport-identity command");
+    assert!(
+        id_out.status.success(),
+        "transport-identity failed: {}",
+        String::from_utf8_lossy(&id_out.stderr)
+    );
 
     let out = Command::new(bin())
         .args(["--db", &db, "event-list"])
@@ -929,6 +959,7 @@ fn test_cli_event_list_empty_db() {
 
 #[test]
 fn test_cli_event_tree_cross_refs_shown() {
+    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let db = tmpdir
         .path()
@@ -938,6 +969,7 @@ fn test_cli_event_tree_cross_refs_shown() {
         .to_string();
 
     create_workspace(&db);
+    let _daemon = start_daemon(&db);
 
     let out = Command::new(bin())
         .args(["--db", &db, "event-tree"])

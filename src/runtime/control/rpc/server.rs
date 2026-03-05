@@ -502,9 +502,17 @@ fn dispatch(
         },
 
         // ----- Read-only commands (call event modules directly) -----
-        RpcMethod::TransportIdentity => match service::open_db_load(db_path) {
-            Ok((fingerprint, _db)) => {
-                RpcResponse::success(service::TransportIdentityResponse { fingerprint })
+        RpcMethod::TransportIdentity => match crate::db::open_connection(db_path) {
+            Ok(db) => {
+                if let Err(e) = crate::db::schema::create_tables(&db) {
+                    return RpcResponse::error(e.to_string());
+                }
+                match crate::transport::identity::ensure_transport_peer_id(&db) {
+                    Ok(fingerprint) => {
+                        RpcResponse::success(service::TransportIdentityResponse { fingerprint })
+                    }
+                    Err(e) => RpcResponse::error(e.to_string()),
+                }
             }
             Err(e) => RpcResponse::error(e.to_string()),
         },
