@@ -81,10 +81,7 @@ Admin == "admin"
 LocalSignerSecret == "local_signer_secret"
 
 \* Deterministic local key-availability marker (never shared)
-LocalKey == "local_key"
-
-\* Deterministic local unwrap work item (never shared)
-SecretSharedUnwrap == "secret_shared_unwrap"
+UnwrapSecret == "unwrap_secret"
 
 \* Content
 Channel == "channel"
@@ -122,8 +119,7 @@ FullEventTypes == {
     PeerShared,
     Admin,
     LocalSignerSecret,
-    LocalKey,
-    SecretSharedUnwrap,
+    UnwrapSecret,
     Channel, Message, MessageReaction, MessageDeletion,
     MessageAttachment, FileSlice,
     SecretKey, SecretShared, Encrypted,
@@ -136,7 +132,7 @@ FullEvents == FullEventTypes \cup AllWorkspaceEvents
 \* Local-only events (no workspace dep, no trust anchor gate).
 \* Encrypted is local because it's a cryptographic wrapper; its workspace
 \* requirement comes from the inner event, not the wrapper itself.
-LocalRoots == {InviteAccepted, LocalSignerSecret, LocalKey, SecretSharedUnwrap, SecretKey, Encrypted}
+LocalRoots == {InviteAccepted, LocalSignerSecret, UnwrapSecret, SecretKey, Encrypted}
 
 \* Singleton event types that require workspace to be valid
 WorkspaceGuardedEvents == FullEventTypes \ LocalRoots
@@ -160,12 +156,12 @@ IdentityEvents == {
     PeerShared,
     Admin,
     LocalSignerSecret,
-    LocalKey,
+    UnwrapSecret,
     UserRemoved, PeerRemoved
 } \cup AllWorkspaceEvents
 
 ContentEvents == {Channel, Message, MessageReaction, MessageDeletion, MessageAttachment, FileSlice}
-EncryptionEvents == {SecretKey, SecretShared, SecretSharedUnwrap, Encrypted}
+EncryptionEvents == {SecretKey, SecretShared, Encrypted}
 
 \* Connection state values (per-peer state machine for invite-based bootstrap).
 ConnStates == {"none", "req", "ack", "invite", "peer"}
@@ -200,7 +196,7 @@ RawDeps(e) ==
        [] e = Admin -> {Workspace, User}
 
        [] e = LocalSignerSecret -> {}
-       [] e = LocalKey -> {LocalSignerSecret}
+       [] e = UnwrapSecret -> {LocalSignerSecret}
 
        \* Content: message depends on workspace; reaction/deletion depend on message
        [] e = Message -> {Workspace}
@@ -210,12 +206,11 @@ RawDeps(e) ==
        [] e = FileSlice -> {}
 
        \* Encryption: secret_key is local (deterministic event ID from key bytes);
-       \* secret_shared wraps key to recipient (PeerShared for runtime, invite key for bootstrap);
-       \* secret_shared_unwrap is local and blocks on key materialization markers.
-       \* encrypted depends on secret_key
+       \* secret_shared wraps key to recipient (PeerShared for runtime, invite key for bootstrap)
+       \* and directly depends on local key materialization markers.
+       \* encrypted depends on secret_key.
        [] e = SecretKey -> {}
-       [] e = SecretShared -> {PeerShared}
-       [] e = SecretSharedUnwrap -> {SecretShared, LocalKey}
+       [] e = SecretShared -> {PeerShared, UnwrapSecret}
        [] e = Encrypted -> {SecretKey}
 
        \* Removal: depends on the entity being removed
@@ -650,21 +645,16 @@ InvEncryptedKey ==
 \* Validation happens at materialization time, not at projection time.
 InvSecretSharedKey ==
     IF SecretShared \in EVENTS
-    THEN \A p \in Peers: (SecretShared \in valid[p]) => (PeerShared \in valid[p])
-    ELSE TRUE
-
-\* Local key markers require signer secret material.
-InvLocalKeySource ==
-    IF LocalKey \in EVENTS /\ LocalSignerSecret \in EVENTS
-    THEN \A p \in Peers: (LocalKey \in valid[p]) => (LocalSignerSecret \in valid[p])
-    ELSE TRUE
-
-\* Local unwrap work items require both wrap event and local key marker.
-InvSecretSharedUnwrapDeps ==
-    IF SecretSharedUnwrap \in EVENTS
     THEN \A p \in Peers:
-        (SecretSharedUnwrap \in valid[p]) =>
-            (SecretShared \in valid[p] /\ LocalKey \in valid[p])
+        (SecretShared \in valid[p]) =>
+            (PeerShared \in valid[p]
+             /\ (IF UnwrapSecret \in EVENTS THEN UnwrapSecret \in valid[p] ELSE TRUE))
+    ELSE TRUE
+
+\* Unwrap-secret markers require signer secret material.
+InvUnwrapSecretSource ==
+    IF UnwrapSecret \in EVENTS /\ LocalSignerSecret \in EVENTS
+    THEN \A p \in Peers: (UnwrapSecret \in valid[p]) => (LocalSignerSecret \in valid[p])
     ELSE TRUE
 
 \* File slice authorization: if both FileSlice and MessageAttachment are valid,

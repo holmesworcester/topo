@@ -31,11 +31,15 @@ fn peer_shared_signer_emits_install_intent() {
 
     let cmds = project("test-peer", &event);
 
-    assert_eq!(cmds.len(), 2, "peer_shared should emit local_key + intent");
+    assert_eq!(
+        cmds.len(),
+        2,
+        "peer_shared should emit unwrap_secret + intent"
+    );
     assert!(
         cmds.iter()
             .any(|c| matches!(c, EmitCommand::EmitDeterministicBlob { .. })),
-        "missing local_key deterministic emit"
+        "missing unwrap_secret deterministic emit"
     );
     let intent = cmds
         .iter()
@@ -63,8 +67,10 @@ fn workspace_signer_does_not_emit_intent() {
     });
 
     let cmds = project("test-peer", &event);
-    assert_eq!(cmds.len(), 1, "workspace signer should emit local_key only");
-    assert!(matches!(cmds[0], EmitCommand::EmitDeterministicBlob { .. }));
+    assert!(
+        cmds.is_empty(),
+        "workspace signer should not emit unwrap_secret markers"
+    );
 }
 
 #[test]
@@ -77,8 +83,10 @@ fn user_signer_does_not_emit_intent() {
     });
 
     let cmds = project("test-peer", &event);
-    assert_eq!(cmds.len(), 1, "user signer should emit local_key only");
-    assert!(matches!(cmds[0], EmitCommand::EmitDeterministicBlob { .. }));
+    assert!(
+        cmds.is_empty(),
+        "user signer should not emit unwrap_secret markers"
+    );
 }
 
 #[test]
@@ -120,5 +128,8 @@ fn no_duplicate_intents_emitted() {
         .iter()
         .filter(|c| matches!(c, EmitCommand::ApplyTransportIdentityIntent { .. }))
         .count();
-    assert_eq!(intent_count, 1, "must emit exactly one intent, no duplicates");
+    assert_eq!(
+        intent_count, 1,
+        "must emit exactly one intent, no duplicates"
+    );
 }

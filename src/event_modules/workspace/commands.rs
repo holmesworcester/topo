@@ -14,9 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use ed25519_dalek::SigningKey;
 use rusqlite::Connection;
 
-use super::identity_ops::{
-    self as ops, InviteBootstrapContext, JoinChain, LinkChain,
-};
+use super::identity_ops::{self as ops, InviteBootstrapContext, JoinChain, LinkChain};
 use crate::crypto::{event_id_to_base64, EventId};
 use crate::event_modules::{
     local_signer_secret::{
@@ -336,8 +334,7 @@ pub fn join_workspace_as_new_user(
     ))?;
 
     // 5. Key unwrap is dep-driven via:
-    //    secret_shared -> secret_shared_unwrap (local deterministic emit) ->
-    //    local_key dep unblock -> deterministic secret_key emit.
+    //    secret_shared --deps on unwrap_secret--> deterministic secret_key emit.
     //    No inline unwrap here.
     let content_key_event_id = None;
 
@@ -631,7 +628,6 @@ pub use super::commands_api::{
     create_invite_with_spki, create_workspace_for_db, AcceptDeviceLinkResponse,
     AcceptInviteResponse, CreateInviteResponse, CreateWorkspaceResponse,
 };
-
 
 #[cfg(test)]
 mod tests;

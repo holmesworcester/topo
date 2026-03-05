@@ -27,8 +27,7 @@ const CANONICAL_EVENT_FILES: &[&str] = &[
     "src/event_modules/admin/wire.rs",
     "src/event_modules/user_removed.rs",
     "src/event_modules/peer_removed.rs",
-    "src/event_modules/local_key.rs",
-    "src/event_modules/secret_shared_unwrap.rs",
+    "src/event_modules/unwrap_secret.rs",
 ];
 
 /// Denied field names that indicate variable-length wire format logic.
@@ -126,7 +125,7 @@ fn all_registered_types_have_fixed_wire_size() {
     // and encoding produces a deterministic-length blob.
     let reg = registry();
     for code in 1u8..=29 {
-        if matches!(code, 3 | 4 | 11 | 13 | 15 | 17 | 19 | 23) {
+        if matches!(code, 3 | 4 | 11 | 13 | 15 | 17 | 19 | 23 | 29) {
             continue; // removed/unused gaps in type code allocation
         }
         let meta = reg.lookup(code);

@@ -12,7 +12,6 @@ mod tests {
     use topo::event_modules::ParsedEvent;
 
     const PEER: &str = "peer_inviter";
-    const EVENT_ID: &str = "ui_event_1";
 
     fn make_user_invite(public_key: [u8; 32]) -> ParsedEvent {
         ParsedEvent::UserInvite(UserInviteEvent {
@@ -31,12 +30,18 @@ mod tests {
     fn test_user_invite_writes_pending_trust() {
         let parsed = make_user_invite([5u8; 32]);
         let ctx = ctx_with_bootstrap("ws_1", true); // is_local_create = true
+        let event_id = b64(&[1u8; 32]);
 
-        let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
+        let result = project_pure(PEER, &event_id, &parsed, &ctx);
         assert_valid(&result);
         assert_writes_to_table(&result, "user_invites");
         assert_writes_to_table(&result, "pending_invite_bootstrap_trust");
-        assert_no_commands(&result);
+        assert_emits_command(&result, "EmitDeterministicBlob", |cmd| {
+            matches!(
+                cmd,
+                topo::projection::contract::EmitCommand::EmitDeterministicBlob { .. }
+            )
+        });
     }
 
     // ── SPEC_PENDING_INVITER_01: break (Boot but NOT local create) ──
@@ -45,11 +50,17 @@ mod tests {
     fn test_user_invite_no_pending_when_not_local() {
         let parsed = make_user_invite([5u8; 32]);
         let ctx = ctx_with_bootstrap("ws_1", false); // is_local_create = false
+        let event_id = b64(&[2u8; 32]);
 
-        let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
+        let result = project_pure(PEER, &event_id, &parsed, &ctx);
         assert_valid(&result);
         assert_no_write_to_table(&result, "pending_invite_bootstrap_trust");
-        assert_no_commands(&result);
+        assert_emits_command(&result, "EmitDeterministicBlob", |cmd| {
+            matches!(
+                cmd,
+                topo::projection::contract::EmitCommand::EmitDeterministicBlob { .. }
+            )
+        });
     }
 
     // ── basic valid projection ──
@@ -58,11 +69,17 @@ mod tests {
     fn test_user_invite_basic_valid() {
         let parsed = make_user_invite([5u8; 32]);
         let ctx = empty_ctx();
+        let event_id = b64(&[3u8; 32]);
 
-        let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
+        let result = project_pure(PEER, &event_id, &parsed, &ctx);
         assert_valid(&result);
         assert_writes_to_table(&result, "user_invites");
-        assert_no_commands(&result);
+        assert_emits_command(&result, "EmitDeterministicBlob", |cmd| {
+            matches!(
+                cmd,
+                topo::projection::contract::EmitCommand::EmitDeterministicBlob { .. }
+            )
+        });
     }
 
     #[test]
@@ -71,7 +88,8 @@ mod tests {
             created_at_ms: 1,
             key_bytes: [1u8; 32],
         });
-        let result = project_pure(PEER, EVENT_ID, &parsed, &empty_ctx());
+        let event_id = b64(&[4u8; 32]);
+        let result = project_pure(PEER, &event_id, &parsed, &empty_ctx());
         assert_reject(&result);
     }
 }

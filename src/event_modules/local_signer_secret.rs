@@ -171,6 +171,8 @@ pub fn project_pure(
     // signer_kind=4 with all-zero key bytes is a delete tombstone.
     let is_pending_tombstone =
         e.signer_kind == SIGNER_KIND_PENDING_INVITE_UNWRAP && e.private_key_bytes == [0u8; 32];
+    let supports_unwrap_secret = e.signer_kind == SIGNER_KIND_PEER_SHARED
+        || e.signer_kind == SIGNER_KIND_PENDING_INVITE_UNWRAP;
     if !is_pending_tombstone {
         ops.push(WriteOp::InsertOrIgnore {
             table: "local_signer_material",
@@ -183,29 +185,76 @@ pub fn project_pure(
             ],
             values: vec![
                 SqlVal::Text(recorded_by.to_string()),
-                SqlVal::Text(signer_eid_b64),
+                SqlVal::Text(signer_eid_b64.clone()),
                 SqlVal::Int(e.signer_kind as i64),
                 SqlVal::Blob(e.private_key_bytes.to_vec()),
                 SqlVal::Int(e.created_at_ms as i64),
             ],
         });
+        if supports_unwrap_secret {
+            let unwrap_secret_event_id =
+                crate::event_modules::unwrap_secret::deterministic_unwrap_secret_event_id(
+                    &e.signer_event_id,
+                );
+            let unwrap_secret_event_id_b64 = event_id_to_base64(&unwrap_secret_event_id);
+            let unwrap_secret_created_at =
+                crate::event_modules::unwrap_secret::deterministic_unwrap_secret_created_at_ms(
+                    &e.signer_event_id,
+                ) as i64;
+            ops.push(WriteOp::Delete {
+                table: "unwrap_secrets",
+                where_clause: vec![
+                    ("recorded_by", SqlVal::Text(recorded_by.to_string())),
+                    ("recipient_event_id", SqlVal::Text(signer_eid_b64.clone())),
+                ],
+            });
+            ops.push(WriteOp::InsertOrIgnore {
+                table: "unwrap_secrets",
+                columns: vec![
+                    "recorded_by",
+                    "event_id",
+                    "recipient_event_id",
+                    "signer_kind",
+                    "private_key",
+                    "created_at",
+                ],
+                values: vec![
+                    SqlVal::Text(recorded_by.to_string()),
+                    SqlVal::Text(unwrap_secret_event_id_b64),
+                    SqlVal::Text(signer_eid_b64.clone()),
+                    SqlVal::Int(e.signer_kind as i64),
+                    SqlVal::Blob(e.private_key_bytes.to_vec()),
+                    SqlVal::Int(unwrap_secret_created_at),
+                ],
+            });
+        }
+    } else {
+        ops.push(WriteOp::Delete {
+            table: "unwrap_secrets",
+            where_clause: vec![
+                ("recorded_by", SqlVal::Text(recorded_by.to_string())),
+                ("recipient_event_id", SqlVal::Text(signer_eid_b64.clone())),
+            ],
+        });
     }
 
     let mut commands = Vec::new();
-    if !is_pending_tombstone {
-        let local_key_event =
-            crate::event_modules::local_key::deterministic_local_key_event(e.signer_event_id);
-        let local_key_blob = match crate::event_modules::encode_event(&local_key_event) {
+    if !is_pending_tombstone && supports_unwrap_secret {
+        let unwrap_secret_event =
+            crate::event_modules::unwrap_secret::deterministic_unwrap_secret_event(
+                e.signer_event_id,
+            );
+        let unwrap_secret_blob = match crate::event_modules::encode_event(&unwrap_secret_event) {
             Ok(v) => v,
             Err(err) => {
                 return ProjectorResult::reject(format!(
-                    "failed to encode deterministic local_key event: {}",
+                    "failed to encode deterministic unwrap_secret event: {}",
                     err
                 ))
             }
         };
         commands.push(EmitCommand::EmitDeterministicBlob {
-            blob: local_key_blob,
+            blob: unwrap_secret_blob,
         });
     }
     if e.signer_kind == SIGNER_KIND_PEER_SHARED {

@@ -101,8 +101,10 @@ pub fn encode_secret_shared(event: &ParsedEvent) -> Result<Vec<u8>, EventError> 
 
 // === Projector (event-module locality) ===
 
-use crate::crypto::{event_id_from_base64, event_id_to_base64};
+use crate::crypto::event_id_to_base64;
 use crate::projection::contract::{ContextSnapshot, EmitCommand, ProjectorResult, SqlVal, WriteOp};
+use crate::projection::encrypted::unwrap_key_from_sender;
+use crate::projection::signer::{resolve_signer_key, SignerResolution};
 use rusqlite::Connection;
 
 pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
@@ -140,8 +142,72 @@ pub fn build_projector_context(
         |row| row.get(0),
     )?;
 
+    let unwrap_secret_row: Option<(Vec<u8>, u8)> = conn
+        .query_row(
+            "SELECT private_key, signer_kind
+             FROM unwrap_secrets
+             WHERE recorded_by = ?1
+               AND recipient_event_id = ?2
+             LIMIT 1",
+            rusqlite::params![recorded_by, &recipient_b64],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .ok();
+
+    let (private_key_bytes, signer_kind) = match unwrap_secret_row {
+        Some(v) => v,
+        None => {
+            return Ok(ContextSnapshot {
+                recipient_removed,
+                ..ContextSnapshot::default()
+            });
+        }
+    };
+    if private_key_bytes.len() != 32 {
+        return Ok(ContextSnapshot {
+            recipient_removed,
+            ..ContextSnapshot::default()
+        });
+    }
+
+    let mut key_arr = [0u8; 32];
+    key_arr.copy_from_slice(&private_key_bytes);
+    let local_signing_key = ed25519_dalek::SigningKey::from_bytes(&key_arr);
+
+    let sender_key = match resolve_signer_key(conn, recorded_by, ss.signer_type, &ss.signed_by) {
+        Ok(SignerResolution::Found(k)) => k,
+        _ => {
+            return Ok(ContextSnapshot {
+                recipient_removed,
+                ..ContextSnapshot::default()
+            });
+        }
+    };
+    let sender_pub = match ed25519_dalek::VerifyingKey::from_bytes(&sender_key) {
+        Ok(vk) => vk,
+        Err(_) => {
+            return Ok(ContextSnapshot {
+                recipient_removed,
+                ..ContextSnapshot::default()
+            });
+        }
+    };
+
+    let plaintext_key = unwrap_key_from_sender(&local_signing_key, &sender_pub, &ss.wrapped_key);
+    let clear_invite = if signer_kind
+        == crate::event_modules::local_signer_secret::SIGNER_KIND_PENDING_INVITE_UNWRAP
+    {
+        Some(ss.recipient_event_id)
+    } else {
+        None
+    };
+
     Ok(ContextSnapshot {
         recipient_removed,
+        unwrapped_secret_material: Some(crate::projection::contract::UnwrappedSecretMaterial {
+            key_bytes: plaintext_key,
+            clear_invite_signer_event_id: clear_invite,
+        }),
         ..ContextSnapshot::default()
     })
 }
@@ -184,27 +250,43 @@ pub fn project_pure(
         ],
     }];
 
-    if let Some(secret_shared_event_id) = event_id_from_base64(event_id_b64) {
-        let unwrap_event = crate::event_modules::secret_shared_unwrap::from_secret_shared_event(
-            secret_shared_event_id,
-            ss,
-        );
-        let unwrap_blob = match crate::event_modules::encode_event(&unwrap_event) {
+    let material = match &ctx.unwrapped_secret_material {
+        Some(v) => v,
+        None => return ProjectorResult::valid(ops),
+    };
+
+    let secret_key_event =
+        crate::event_modules::secret_key::deterministic_secret_key_event(material.key_bytes);
+    let secret_blob = match crate::event_modules::encode_event(&secret_key_event) {
+        Ok(v) => v,
+        Err(err) => {
+            return ProjectorResult::reject(format!(
+                "failed to encode deterministic secret_key event: {}",
+                err
+            ))
+        }
+    };
+
+    let mut commands = vec![EmitCommand::EmitDeterministicBlob { blob: secret_blob }];
+
+    if let Some(clear_invite_signer_event_id) = material.clear_invite_signer_event_id {
+        let clear_evt =
+            crate::event_modules::local_signer_secret::deterministic_pending_invite_tombstone_event(
+                clear_invite_signer_event_id,
+            );
+        let clear_blob = match crate::event_modules::encode_event(&clear_evt) {
             Ok(v) => v,
             Err(err) => {
                 return ProjectorResult::reject(format!(
-                    "failed to encode secret_shared_unwrap emit event: {}",
+                    "failed to encode invite-key clear tombstone: {}",
                     err
                 ))
             }
         };
-        ProjectorResult::valid_with_commands(
-            ops,
-            vec![EmitCommand::EmitDeterministicBlob { blob: unwrap_blob }],
-        )
-    } else {
-        ProjectorResult::valid(ops)
+        commands.push(EmitCommand::EmitDeterministicBlob { blob: clear_blob });
     }
+
+    ProjectorResult::valid_with_commands(ops, commands)
 }
 
 pub static SECRET_SHARED_META: EventTypeMeta = EventTypeMeta {
@@ -212,8 +294,8 @@ pub static SECRET_SHARED_META: EventTypeMeta = EventTypeMeta {
     type_name: "secret_shared",
     projection_table: "secret_shared",
     share_scope: ShareScope::Shared,
-    dep_fields: &["recipient_event_id", "signed_by"],
-    dep_field_type_codes: &[&[10, 11, 12, 13, 16, 17], &[]],
+    dep_fields: &["recipient_event_id", "unwrap_secret_event_id", "signed_by"],
+    dep_field_type_codes: &[&[10, 11, 12, 13, 16, 17], &[28], &[]],
     signer_required: true,
     signature_byte_len: 64,
     encryptable: false,

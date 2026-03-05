@@ -16,7 +16,6 @@ mod tests {
     use topo::projection::contract::{SqlVal, WriteOp};
 
     const PEER: &str = "peer_alice";
-    const EVENT_ID: &str = "ps_event_1";
 
     fn make_peer_shared(public_key: [u8; 32], user_event_id: [u8; 32]) -> ParsedEvent {
         ParsedEvent::PeerShared(PeerSharedEvent {
@@ -36,8 +35,9 @@ mod tests {
     fn test_peer_shared_writes_row() {
         let parsed = make_peer_shared([5u8; 32], [6u8; 32]);
         let ctx = empty_ctx();
+        let event_id = b64(&[21u8; 32]);
 
-        let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
+        let result = project_pure(PEER, &event_id, &parsed, &ctx);
         assert_valid(&result);
         assert_writes_to_table(&result, "peers_shared");
     }
@@ -50,8 +50,9 @@ mod tests {
         let user_eid = [6u8; 32];
         let parsed = make_peer_shared(pk, user_eid);
         let ctx = empty_ctx();
+        let event_id = b64(&[22u8; 32]);
 
-        let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
+        let result = project_pure(PEER, &event_id, &parsed, &ctx);
         assert_valid(&result);
 
         let insert = result.write_ops.iter().find(|op| {
@@ -94,12 +95,18 @@ mod tests {
         let pk = [5u8; 32];
         let parsed = make_peer_shared(pk, [6u8; 32]);
         let ctx = empty_ctx();
+        let event_id = b64(&[23u8; 32]);
 
-        let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
+        let result = project_pure(PEER, &event_id, &parsed, &ctx);
         assert_valid(&result);
         assert_deletes_from_table(&result, "pending_invite_bootstrap_trust");
         assert_deletes_from_table(&result, "invite_bootstrap_trust");
-        assert_no_commands(&result);
+        assert_emits_command(&result, "EmitDeterministicBlob", |cmd| {
+            matches!(
+                cmd,
+                topo::projection::contract::EmitCommand::EmitDeterministicBlob { .. }
+            )
+        });
     }
 
     #[test]
@@ -108,7 +115,8 @@ mod tests {
             created_at_ms: 1,
             key_bytes: [1u8; 32],
         });
-        let result = project_pure(PEER, EVENT_ID, &parsed, &empty_ctx());
+        let event_id = b64(&[24u8; 32]);
+        let result = project_pure(PEER, &event_id, &parsed, &empty_ctx());
         assert_reject(&result);
     }
 }

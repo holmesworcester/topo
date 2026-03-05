@@ -67,11 +67,11 @@ pub fn encrypted_inner_wire_size(inner_type_code: u8) -> Option<usize> {
         2 => Some(REACTION_WIRE_SIZE),                // Reaction
         7 => Some(MESSAGE_DELETION_WIRE_SIZE),        // MessageDeletion
         8 => Some(WORKSPACE_WIRE_SIZE),               // Workspace
-        10 => Some(USER_INVITE_WIRE_SIZE),       // UserInvite
+        10 => Some(USER_INVITE_WIRE_SIZE),            // UserInvite
         12 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE), // DeviceInvite
         14 => Some(USER_WIRE_SIZE),                   // User
         16 => Some(PEER_SHARED_WIRE_SIZE),            // PeerShared
-        18 => Some(ADMIN_WIRE_SIZE),             // Admin
+        18 => Some(ADMIN_WIRE_SIZE),                  // Admin
         20 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE), // UserRemoved
         21 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE), // PeerRemoved
         22 => Some(SECRET_SHARED_WIRE_SIZE),          // SecretShared
@@ -235,7 +235,6 @@ mod tests {
         use super::super::super::bench_dep::BENCH_DEP_WIRE_SIZE;
         use super::super::super::file_slice::FILE_SLICE_WIRE_SIZE;
         use super::super::super::invite_accepted::INVITE_ACCEPTED_WIRE_SIZE;
-        use super::super::super::local_key::LOCAL_KEY_WIRE_SIZE;
         use super::super::super::message::MESSAGE_WIRE_SIZE;
         use super::super::super::message_attachment::MESSAGE_ATTACHMENT_WIRE_SIZE;
         use super::super::super::message_deletion::MESSAGE_DELETION_WIRE_SIZE;
@@ -243,7 +242,7 @@ mod tests {
         use super::super::super::reaction::REACTION_WIRE_SIZE;
         use super::super::super::secret_key::SECRET_KEY_WIRE_SIZE;
         use super::super::super::secret_shared::SECRET_SHARED_WIRE_SIZE;
-        use super::super::super::secret_shared_unwrap::SECRET_SHARED_UNWRAP_WIRE_SIZE;
+        use super::super::super::unwrap_secret::UNWRAP_SECRET_WIRE_SIZE;
         use super::super::super::user::USER_WIRE_SIZE;
         use super::super::super::user_invite::USER_INVITE_WIRE_SIZE;
         use super::super::super::workspace::WORKSPACE_WIRE_SIZE;
@@ -262,8 +261,7 @@ mod tests {
         assert_eq!(USER_INVITE_WIRE_SIZE, 170);
         assert_eq!(ADMIN_WIRE_SIZE, 170);
         assert_eq!(SECRET_SHARED_WIRE_SIZE, 202);
-        assert_eq!(LOCAL_KEY_WIRE_SIZE, 41);
-        assert_eq!(SECRET_SHARED_UNWRAP_WIRE_SIZE, 138);
+        assert_eq!(UNWRAP_SECRET_WIRE_SIZE, 41);
         assert_eq!(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE, 138);
     }
 

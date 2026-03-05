@@ -8,7 +8,6 @@ mod message_projector_tests;
 mod peer_shared_projector_tests;
 mod reaction_projector_tests;
 mod secret_shared_projector_tests;
-mod secret_shared_unwrap_projector_tests;
 mod simple_projector_tests;
 mod user_invite_projector_tests;
 mod workspace_projector_tests;

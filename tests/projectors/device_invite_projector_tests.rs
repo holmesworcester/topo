@@ -12,7 +12,6 @@ mod tests {
     use topo::event_modules::ParsedEvent;
 
     const PEER: &str = "peer_inviter";
-    const EVENT_ID: &str = "di_event_1";
 
     fn make_device_invite(public_key: [u8; 32]) -> ParsedEvent {
         ParsedEvent::DeviceInvite(DeviceInviteEvent {
@@ -30,12 +29,18 @@ mod tests {
     fn test_device_invite_writes_pending_trust() {
         let parsed = make_device_invite([5u8; 32]);
         let ctx = ctx_with_bootstrap("ws_1", true);
+        let event_id = b64(&[11u8; 32]);
 
-        let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
+        let result = project_pure(PEER, &event_id, &parsed, &ctx);
         assert_valid(&result);
         assert_writes_to_table(&result, "device_invites");
         assert_writes_to_table(&result, "pending_invite_bootstrap_trust");
-        assert_no_commands(&result);
+        assert_emits_command(&result, "EmitDeterministicBlob", |cmd| {
+            matches!(
+                cmd,
+                topo::projection::contract::EmitCommand::EmitDeterministicBlob { .. }
+            )
+        });
     }
 
     // ── SPEC_PENDING_INVITER_02: break (First but NOT local create) ──
@@ -44,11 +49,17 @@ mod tests {
     fn test_device_invite_no_pending_when_not_local() {
         let parsed = make_device_invite([5u8; 32]);
         let ctx = ctx_with_bootstrap("ws_1", false); // not local
+        let event_id = b64(&[12u8; 32]);
 
-        let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
+        let result = project_pure(PEER, &event_id, &parsed, &ctx);
         assert_valid(&result);
         assert_no_write_to_table(&result, "pending_invite_bootstrap_trust");
-        assert_no_commands(&result);
+        assert_emits_command(&result, "EmitDeterministicBlob", |cmd| {
+            matches!(
+                cmd,
+                topo::projection::contract::EmitCommand::EmitDeterministicBlob { .. }
+            )
+        });
     }
 
     #[test]
@@ -57,7 +68,8 @@ mod tests {
             created_at_ms: 1,
             key_bytes: [1u8; 32],
         });
-        let result = project_pure(PEER, EVENT_ID, &parsed, &empty_ctx());
+        let event_id = b64(&[13u8; 32]);
+        let result = project_pure(PEER, &event_id, &parsed, &empty_ctx());
         assert_reject(&result);
     }
 }

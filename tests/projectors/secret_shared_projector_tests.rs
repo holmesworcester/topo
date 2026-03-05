@@ -9,7 +9,7 @@ mod tests {
     use crate::harness::fixtures::*;
     use topo::event_modules::secret_shared::{project_pure, SecretSharedEvent};
     use topo::event_modules::ParsedEvent;
-    use topo::projection::contract::EmitCommand;
+    use topo::projection::contract::{ContextSnapshot, EmitCommand, UnwrappedSecretMaterial};
 
     const PEER: &str = "peer_alice";
     fn make_secret_shared() -> ParsedEvent {
@@ -29,7 +29,13 @@ mod tests {
     #[test]
     fn test_secret_shared_valid() {
         let parsed = make_secret_shared();
-        let ctx = empty_ctx();
+        let ctx = ContextSnapshot {
+            unwrapped_secret_material: Some(UnwrappedSecretMaterial {
+                key_bytes: [42u8; 32],
+                clear_invite_signer_event_id: None,
+            }),
+            ..Default::default()
+        };
         let event_id = b64(&[9u8; 32]);
 
         let result = project_pure(PEER, &event_id, &parsed, &ctx);

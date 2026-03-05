@@ -82,8 +82,7 @@ fn cmp_op<T: Ord>(a: T, op: FilterOp, b: T) -> bool {
 pub struct EventMatcher {
     pub event_type_name: &'static str,
     pub allowed_fields: &'static [AllowedField],
-    pub feed_payload:
-        fn(&ParsedEvent, &str, DeliveryMode) -> serde_json::Value,
+    pub feed_payload: fn(&ParsedEvent, &str, DeliveryMode) -> serde_json::Value,
 }
 
 /// Check if a parsed event matches a subscription's filters.
@@ -229,9 +228,9 @@ fn matcher_for_type(event_type: &str) -> Option<&'static EventMatcher> {
 
 fn extract_message_author_id(parsed: &ParsedEvent, _eid: &str) -> Option<FieldValue> {
     match parsed {
-        ParsedEvent::Message(m) => {
-            Some(FieldValue::Str(crate::crypto::event_id_to_base64(&m.author_id)))
-        }
+        ParsedEvent::Message(m) => Some(FieldValue::Str(crate::crypto::event_id_to_base64(
+            &m.author_id,
+        ))),
         _ => None,
     }
 }
@@ -245,9 +244,9 @@ fn extract_message_created_at_ms(parsed: &ParsedEvent, _eid: &str) -> Option<Fie
 
 fn extract_message_workspace_id(parsed: &ParsedEvent, _eid: &str) -> Option<FieldValue> {
     match parsed {
-        ParsedEvent::Message(m) => {
-            Some(FieldValue::Str(crate::crypto::event_id_to_base64(&m.workspace_id)))
-        }
+        ParsedEvent::Message(m) => Some(FieldValue::Str(crate::crypto::event_id_to_base64(
+            &m.workspace_id,
+        ))),
         _ => None,
     }
 }
@@ -321,8 +320,7 @@ pub fn on_projected_event(
         None => return Ok(()), // no subscriptions for this event type
     };
 
-    let subs =
-        queries::load_active_subscriptions_for_type(conn, recorded_by, event_type_name)?;
+    let subs = queries::load_active_subscriptions_for_type(conn, recorded_by, event_type_name)?;
 
     if subs.is_empty() {
         return Ok(());
@@ -408,8 +406,7 @@ fn parsed_event_type_name(parsed: &ParsedEvent) -> &'static str {
         ParsedEvent::FileSlice(_) => "file_slice",
         ParsedEvent::BenchDep(_) => "bench_dep",
         ParsedEvent::LocalSignerSecret(_) => "local_signer_secret",
-        ParsedEvent::LocalKey(_) => "local_key",
-        ParsedEvent::SecretSharedUnwrap(_) => "secret_shared_unwrap",
+        ParsedEvent::UnwrapSecret(_) => "unwrap_secret",
     }
 }
 
@@ -553,7 +550,13 @@ mod tests {
                 value: serde_json::Value::String(b64(&[99u8; 32])),
             }],
         };
-        assert!(!event_matches(message_matcher(), &spec, &msg, "eid_1", 1000));
+        assert!(!event_matches(
+            message_matcher(),
+            &spec,
+            &msg,
+            "eid_1",
+            1000
+        ));
     }
 
     #[test]
@@ -598,7 +601,13 @@ mod tests {
                 value: serde_json::json!(5000u64),
             }],
         };
-        assert!(!event_matches(message_matcher(), &spec, &msg, "eid_1", 5000));
+        assert!(!event_matches(
+            message_matcher(),
+            &spec,
+            &msg,
+            "eid_1",
+            5000
+        ));
     }
 
     #[test]
@@ -613,7 +622,13 @@ mod tests {
                 value: serde_json::json!("x"),
             }],
         };
-        assert!(!event_matches(message_matcher(), &spec, &msg, "eid_1", 1000));
+        assert!(!event_matches(
+            message_matcher(),
+            &spec,
+            &msg,
+            "eid_1",
+            1000
+        ));
     }
 
     #[test]
@@ -659,7 +674,13 @@ mod tests {
                 },
             ],
         };
-        assert!(!event_matches(message_matcher(), &spec, &msg, "eid_1", 1000));
+        assert!(!event_matches(
+            message_matcher(),
+            &spec,
+            &msg,
+            "eid_1",
+            1000
+        ));
     }
 
     // ── event_matches: non-message events don't match message matcher ──
