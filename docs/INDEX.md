@@ -11,6 +11,7 @@ These are current specs, plans, and reference material.
 | [CURRENT_RUNTIME_DIAGRAM.md](CURRENT_RUNTIME_DIAGRAM.md) | Engineer-facing runtime diagrams (node, sync session, ingest/projection flow) |
 | [../TODO.md](../TODO.md) | Current discrepancy/remediation backlog and execution ordering |
 | [PERF.md](PERF.md) | Benchmark results and testing guide |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Local developer setup (git hooks, formatting gate) |
 | [tla/projector_spec.md](tla/projector_spec.md) | Runtime-to-model mapping for projector semantics |
 | [planning/DISCREPANCY-MATRIX.md](planning/DISCREPANCY-MATRIX.md) | Current design/plan/code discrepancy matrix |
 | [planning/IDENTITY_TRANSPORT_BOUNDARY_EXECUTION_PLAN.md](planning/IDENTITY_TRANSPORT_BOUNDARY_EXECUTION_PLAN.md) | Active boundary plan for identity workflow vs transport materialization |

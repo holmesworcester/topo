@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Keep formatting drift out of commits.
+cargo fmt --all -- --check
