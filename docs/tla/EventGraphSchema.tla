@@ -192,11 +192,11 @@ RawDeps(e) ==
        [] e = Tenant -> {}
        [] e = InviteAccepted -> {Tenant}
 
-       \* user_invite: no raw deps beyond signer
-       [] e = UserInvite -> {}
+       \* user_invite: authority dep (workspace in bootstrap flow; admin in ongoing flow)
+       [] e = UserInvite -> {Workspace}
 
-       \* device_invite: no raw deps beyond signer
-       [] e = DeviceInvite -> {}
+       \* device_invite: authority dep (user in bootstrap flow; admin in ongoing flow)
+       [] e = DeviceInvite -> {User}
 
        \* user: no raw deps beyond signer
        [] e = User -> {}
@@ -221,7 +221,7 @@ RawDeps(e) ==
        \* secret_shared wraps key to invite recipient and depends on:
        \*   - recipient invite event (user_invite/device_invite),
        \*   - local invite_privkey event used to unwrap.
-       \* key_event_id remains a materialization hint, not a hard dep.
+       \* key_event_id is a non-dependency integrity claim checked at materialization.
        \* encrypted depends on secret.
        [] e = Secret -> {}
        [] e = SecretShared -> InviteEvents \cup {InvitePrivkey}

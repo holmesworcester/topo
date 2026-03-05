@@ -379,6 +379,7 @@ async fn test_device_link_via_sync() {
             .unwrap()
             .as_millis() as u64,
         public_key: laptop_di_pubkey,
+        authority_event_id: phone_chain.user_eid,
         signed_by: phone_chain.user_eid,
         signer_type: 4,
         signature: [0u8; 64],

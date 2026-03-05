@@ -49,7 +49,9 @@ pub fn project_pure(
         }
         Some(_) => {
             // Foreign workspace — reject
-            ProjectorResult::reject("workspace_id does not match accepted invite binding".to_string())
+            ProjectorResult::reject(
+                "workspace_id does not match accepted invite binding".to_string(),
+            )
         }
     }
 }

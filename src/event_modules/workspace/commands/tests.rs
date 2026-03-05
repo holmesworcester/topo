@@ -1,5 +1,5 @@
 use super::*;
-use crate::crypto::event_id_to_base64;
+use crate::crypto::{event_id_to_base64, EventId};
 use crate::db::{open_in_memory, schema::create_tables};
 
 #[test]
@@ -12,21 +12,27 @@ fn create_user_invite_materializes_pending_bootstrap_trust_via_projection() {
     let recorded_by = hex::encode(crate::crypto::spki_fingerprint_from_ed25519_pubkey(
         &workspace.peer_shared_key.verifying_key().to_bytes(),
     ));
-    let (_workspace_signer_eid, workspace_key) = load_workspace_signing_key(&conn, &recorded_by)
-        .expect("load workspace key")
-        .expect("workspace key must exist");
 
     // Use a bootstrap SPKI that is not already present in peers_shared so
     // pending bootstrap trust is materialized by projection.
     let bootstrap_spki = [0xAB; 32];
+    let admin_event_id: EventId = conn
+        .query_row(
+            "SELECT event_id FROM admins WHERE recorded_by = ?1 ORDER BY event_id ASC LIMIT 1",
+            rusqlite::params![&recorded_by],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|b64| crate::crypto::event_id_from_base64(&b64))
+        .expect("workspace bootstrap must create an admin event");
 
     let invite = create_user_invite(
         &conn,
         &recorded_by,
-        &workspace_key,
-        &workspace.workspace_id,
         &workspace.peer_shared_key,
         &workspace.peer_shared_event_id,
+        &admin_event_id,
+        &workspace.workspace_id,
         "127.0.0.1:4433",
         &bootstrap_spki,
     )

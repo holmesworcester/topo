@@ -125,7 +125,7 @@ pub static PEER_SHARED_META: EventTypeMeta = EventTypeMeta {
     parse: parse_peer_shared,
     encode: encode_peer_shared,
     projector: super::projector::project_pure,
-    context_loader: crate::event_modules::registry::load_empty_context,
+    context_loader: super::projection_context::build_projector_context,
 };
 
 #[cfg(test)]

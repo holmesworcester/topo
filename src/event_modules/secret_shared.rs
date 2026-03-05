@@ -267,6 +267,12 @@ pub fn project_pure(
             ))
         }
     };
+    let derived_key_event_id = crate::crypto::hash_event(&secret_blob);
+    if derived_key_event_id != ss.key_event_id {
+        return ProjectorResult::reject(
+            "unwrapped key material does not match claimed key_event_id".to_string(),
+        );
+    }
 
     ProjectorResult::valid_with_commands(
         ops,

@@ -196,8 +196,18 @@ impl ParsedEvent {
             ParsedEvent::MessageDeletion(d) => vec![("signed_by", d.signed_by)],
             ParsedEvent::Workspace(_) => vec![],
             ParsedEvent::InviteAccepted(a) => vec![("tenant_event_id", a.tenant_event_id)],
-            ParsedEvent::UserInvite(u) => vec![("signed_by", u.signed_by)],
-            ParsedEvent::DeviceInvite(d) => vec![("signed_by", d.signed_by)],
+            ParsedEvent::UserInvite(u) => {
+                vec![
+                    ("authority_event_id", u.authority_event_id),
+                    ("signed_by", u.signed_by),
+                ]
+            }
+            ParsedEvent::DeviceInvite(d) => {
+                vec![
+                    ("authority_event_id", d.authority_event_id),
+                    ("signed_by", d.signed_by),
+                ]
+            }
             ParsedEvent::User(u) => vec![("signed_by", u.signed_by)],
             ParsedEvent::PeerShared(p) => {
                 vec![
@@ -239,7 +249,9 @@ impl ParsedEvent {
             ],
             ParsedEvent::FileSlice(f) => vec![("signed_by", f.signed_by)],
             ParsedEvent::BenchDep(b) => b.dep_ids.iter().map(|id| ("dep_id", *id)).collect(),
-            ParsedEvent::LocalSignerSecret(l) => vec![("signer_event_id", l.signer_event_id)],
+            // Local signer material is local-first and may arrive before the
+            // referenced public signer event projects.
+            ParsedEvent::LocalSignerSecret(_) => vec![],
             ParsedEvent::InvitePrivkey(k) => vec![("invite_event_id", k.invite_event_id)],
         }
     }

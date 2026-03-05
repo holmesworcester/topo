@@ -17,10 +17,8 @@ use rusqlite::Connection;
 use super::identity_ops::{self as ops, InviteBootstrapContext, JoinChain, LinkChain};
 use crate::crypto::EventId;
 use crate::event_modules::{
-    local_signer_secret::{
-        LocalSignerSecretEvent, SIGNER_KIND_PEER_SHARED, SIGNER_KIND_USER, SIGNER_KIND_WORKSPACE,
-    },
-    DeviceInviteEvent, InviteAcceptedEvent, ParsedEvent, PeerSharedEvent, UserEvent,
+    local_signer_secret::{LocalSignerSecretEvent, SIGNER_KIND_PEER_SHARED},
+    AdminEvent, DeviceInviteEvent, InviteAcceptedEvent, ParsedEvent, PeerSharedEvent, UserEvent,
     UserInviteEvent, WorkspaceEvent,
 };
 use crate::projection::apply::project_one;
@@ -69,7 +67,7 @@ pub struct CreateWorkspaceResult {
 /// Create a new workspace with a full identity chain.
 ///
 /// Creates: Workspace → InviteAccepted (workspace binding) → UserInvite →
-/// User → DeviceInvite → PeerShared + local signer secrets +
+/// User → Admin → DeviceInvite → PeerShared + local signer secret +
 /// content key material.
 ///
 /// Returns the peer_shared event ID and signing key needed for transport
@@ -174,6 +172,7 @@ pub fn create_workspace(
         created_at_ms: now_ms(),
         public_key: invite_key.verifying_key().to_bytes(),
         workspace_id: ws_eid,
+        authority_event_id: ws_eid,
         signed_by: ws_eid,
         signer_type: 1,
         signature: [0u8; 64],
@@ -192,18 +191,31 @@ pub fn create_workspace(
     });
     let ub_eid = create_signed_event_synchronous(db, &derived_peer_id, &ub, &invite_key)?;
 
-    // 8. DeviceInvite (signed by user_key)
+    // 8. Admin (bootstrap grant for creator user; signed by workspace_key)
+    let admin_evt = ParsedEvent::Admin(AdminEvent {
+        created_at_ms: now_ms(),
+        public_key: user_key.verifying_key().to_bytes(),
+        user_event_id: ub_eid,
+        signed_by: ws_eid,
+        signer_type: 1,
+        signature: [0u8; 64],
+    });
+    let _admin_eid =
+        create_signed_event_synchronous(db, &derived_peer_id, &admin_evt, &workspace_key)?;
+
+    // 9. DeviceInvite (signed by user_key)
     let device_invite_key = SigningKey::generate(&mut rng);
     let dif = ParsedEvent::DeviceInvite(DeviceInviteEvent {
         created_at_ms: now_ms(),
         public_key: device_invite_key.verifying_key().to_bytes(),
+        authority_event_id: ub_eid,
         signed_by: ub_eid,
         signer_type: 4,
         signature: [0u8; 64],
     });
     let dif_eid = create_signed_event_synchronous(db, &derived_peer_id, &dif, &user_key)?;
 
-    // 9. PeerShared (signed by device_invite_key; key pre-generated above)
+    // 10. PeerShared (signed by device_invite_key; key pre-generated above)
     let psf = ParsedEvent::PeerShared(PeerSharedEvent {
         created_at_ms: now_ms(),
         public_key: peer_shared_key.verifying_key().to_bytes(),
@@ -215,7 +227,7 @@ pub fn create_workspace(
     });
     let psf_eid = create_signed_event_synchronous(db, &derived_peer_id, &psf, &device_invite_key)?;
 
-    // 10. Emit local_signer_secret events for all three signing keys.
+    // 11. Emit local_signer_secret for peer_shared signer key only.
     // Transport identity is already installed, so all writes use derived_peer_id.
     emit_local_signer_secret(
         db,
@@ -224,16 +236,8 @@ pub fn create_workspace(
         SIGNER_KIND_PEER_SHARED,
         &peer_shared_key,
     )?;
-    emit_local_signer_secret(db, &derived_peer_id, &ub_eid, SIGNER_KIND_USER, &user_key)?;
-    emit_local_signer_secret(
-        db,
-        &derived_peer_id,
-        &ws_eid,
-        SIGNER_KIND_WORKSPACE,
-        &workspace_key,
-    )?;
 
-    // 11. Seed deterministic local content-key material.
+    // 12. Seed deterministic local content-key material.
     let _ = ops::ensure_content_key_for_peer(db, &derived_peer_id)?;
 
     Ok(CreateWorkspaceResult {
@@ -303,6 +307,7 @@ pub fn join_workspace_as_new_user(
     let dif_evt = ParsedEvent::DeviceInvite(DeviceInviteEvent {
         created_at_ms: now_ms(),
         public_key: device_invite_key.verifying_key().to_bytes(),
+        authority_event_id: user_event_id,
         signed_by: user_event_id,
         signer_type: 4,
         signature: [0u8; 64],
@@ -368,13 +373,6 @@ pub fn persist_join_signer_secrets(
         &join.peer_shared_event_id,
         SIGNER_KIND_PEER_SHARED,
         &join.peer_shared_key,
-    )?;
-    emit_local_signer_secret(
-        db,
-        recorded_by,
-        &join.user_event_id,
-        SIGNER_KIND_USER,
-        &join.user_key,
     )?;
     Ok(())
 }
@@ -468,10 +466,10 @@ pub struct InviteResult {
 pub fn create_user_invite(
     db: &Connection,
     recorded_by: &str,
-    workspace_key: &SigningKey,
+    admin_peer_shared_key: &SigningKey,
+    admin_peer_shared_event_id: &EventId,
+    admin_event_id: &EventId,
     workspace_id: &EventId,
-    peer_shared_key: &SigningKey,
-    peer_shared_event_id: &EventId,
     bootstrap_addr: &str,
     bootstrap_spki: &[u8; 32],
 ) -> Result<InviteResult, Box<dyn std::error::Error + Send + Sync>> {
@@ -481,13 +479,13 @@ pub fn create_user_invite(
         bootstrap_addr,
         bootstrap_spki,
     };
-    let invite = ops::create_user_invite_events(
+    let invite = ops::create_user_invite_events_as_admin(
         db,
         recorded_by,
-        workspace_key,
+        admin_peer_shared_key,
+        admin_peer_shared_event_id,
+        admin_event_id,
         workspace_id,
-        Some(peer_shared_key),
-        Some(peer_shared_event_id),
         Some(&ctx),
     )?;
 
@@ -509,7 +507,9 @@ pub fn create_user_invite(
 pub fn create_device_link_invite(
     db: &Connection,
     recorded_by: &str,
-    user_key: &SigningKey,
+    admin_peer_shared_key: &SigningKey,
+    admin_peer_shared_event_id: &EventId,
+    admin_event_id: &EventId,
     user_event_id: &EventId,
     workspace_id: &EventId,
     bootstrap_addr: &str,
@@ -519,10 +519,12 @@ pub fn create_device_link_invite(
         bootstrap_addr,
         bootstrap_spki,
     };
-    let invite = ops::create_device_link_invite_events(
+    let invite = ops::create_device_link_invite_events_as_admin(
         db,
         recorded_by,
-        user_key,
+        admin_peer_shared_key,
+        admin_peer_shared_event_id,
+        admin_event_id,
         user_event_id,
         workspace_id,
         Some(&ctx),
@@ -576,18 +578,18 @@ pub fn load_workspace_signing_key(
 pub fn create_user_invite_raw(
     db: &Connection,
     recorded_by: &str,
-    workspace_key: &SigningKey,
+    admin_peer_shared_key: &SigningKey,
+    admin_peer_shared_event_id: &EventId,
+    admin_event_id: &EventId,
     workspace_id: &EventId,
-    sender_peer_shared_key: Option<&SigningKey>,
-    sender_peer_shared_event_id: Option<&EventId>,
 ) -> Result<super::identity_ops::InviteData, Box<dyn std::error::Error + Send + Sync>> {
-    ops::create_user_invite_events(
+    ops::create_user_invite_events_as_admin(
         db,
         recorded_by,
-        workspace_key,
+        admin_peer_shared_key,
+        admin_peer_shared_event_id,
+        admin_event_id,
         workspace_id,
-        sender_peer_shared_key,
-        sender_peer_shared_event_id,
         None,
     )
 }
@@ -598,14 +600,18 @@ pub fn create_user_invite_raw(
 pub fn create_device_link_invite_raw(
     db: &Connection,
     recorded_by: &str,
-    user_key: &SigningKey,
+    admin_peer_shared_key: &SigningKey,
+    admin_peer_shared_event_id: &EventId,
+    admin_event_id: &EventId,
     user_event_id: &EventId,
     workspace_id: &EventId,
 ) -> Result<super::identity_ops::InviteData, Box<dyn std::error::Error + Send + Sync>> {
-    ops::create_device_link_invite_events(
+    ops::create_device_link_invite_events_as_admin(
         db,
         recorded_by,
-        user_key,
+        admin_peer_shared_key,
+        admin_peer_shared_event_id,
+        admin_event_id,
         user_event_id,
         workspace_id,
         None,

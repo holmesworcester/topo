@@ -483,7 +483,9 @@ pub fn send_message(db: &str, content: &str) -> String {
         }
 
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        let retryable = stderr.contains("no identity") || stderr.contains("no active tenant");
+        let retryable = stderr.contains("no identity")
+            || stderr.contains("no active tenant")
+            || stderr.contains("blocked on");
         if retryable && start.elapsed() < Duration::from_secs(20) {
             if stderr.contains("no active tenant") {
                 ensure_active_peer(db, Duration::from_secs(5));
@@ -576,10 +578,98 @@ pub fn accept_invite_with_identity(db: &str, invite_link: &str, username: &str, 
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+    wait_for_local_peer_signer(db, Duration::from_secs(20));
     // Stop temporary daemon; callers decide daemon lifecycle.
     let _ = Command::new(bin()).args(["--db", db, "stop"]).output();
     drop(tmp_daemon);
     wait_for_daemon_stopped(db, Duration::from_secs(10));
+}
+
+fn wait_for_local_peer_signer(db: &str, timeout: Duration) {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if let Ok(conn) = topo::db::open_connection(db) {
+            let tenant_id: Option<String> = conn
+                .query_row(
+                    "SELECT recorded_by
+                     FROM invites_accepted
+                     ORDER BY created_at DESC, event_id DESC
+                     LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .ok();
+            if let Some(tenant_id) = tenant_id {
+                let has_signer: bool = conn
+                    .query_row(
+                        "SELECT EXISTS(
+                             SELECT 1
+                             FROM local_signer_material
+                             WHERE recorded_by = ?1
+                               AND signer_kind = 3
+                             LIMIT 1
+                         )",
+                        rusqlite::params![tenant_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(false);
+                if has_signer {
+                    return;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let debug = topo::db::open_connection(db)
+        .ok()
+        .map(|conn| {
+            let invites: i64 = conn
+                .query_row("SELECT COUNT(*) FROM invites_accepted", [], |row| row.get(0))
+                .unwrap_or(0);
+            let signer_rows: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM local_signer_material WHERE signer_kind = 3",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            let signer_events: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE type_name = 'peer_privkey'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            let signer_rejects: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM rejected_events r
+                     JOIN events e ON e.event_id = r.event_id
+                     WHERE e.type_name = 'peer_privkey'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            let last_tenant: Option<String> = conn
+                .query_row(
+                    "SELECT recorded_by FROM invites_accepted ORDER BY created_at DESC, event_id DESC LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .ok();
+            format!(
+                "invites_accepted={}, signer_kind3_rows={}, signer_events={}, signer_rejects={}, last_tenant={}",
+                invites,
+                signer_rows,
+                signer_events,
+                signer_rejects,
+                last_tenant.unwrap_or_else(|| "<none>".to_string())
+            )
+        })
+        .unwrap_or_else(|| "db-open-failed".to_string());
+    panic!(
+        "local peer signer not materialized within {:?} (db={}): {}",
+        timeout, db, debug
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -678,6 +768,7 @@ pub fn is_transient_rpc_startup_error(stderr: &str) -> bool {
         || stderr.contains("Connection reset by peer")
         || stderr.contains("no identity — run `topo create-workspace` first")
         || stderr.contains("no active tenant — run `topo use-tenant <N>`")
+        || stderr.contains("blocked on")
 }
 
 /// Run a topo RPC command with automatic retry on transient errors.
@@ -704,7 +795,7 @@ pub fn topo_rpc_retry(db: &str, args: &[&str], timeout: Duration) -> Output {
 
 /// Send a message via RPC with retry. Returns the event ID.
 pub fn topo_send_retry(db: &str, content: &str) -> String {
-    let out = topo_rpc_retry(db, &["send", content], Duration::from_secs(4));
+    let out = topo_rpc_retry(db, &["send", content], Duration::from_secs(60));
     assert!(
         out.status.success(),
         "topo send failed: stdout={} stderr={}",
@@ -740,27 +831,10 @@ pub fn topo_create_invite_retry(db: &str, bootstrap_addr: &str) -> String {
         .to_string()
 }
 
-/// Accept an invite via a temporary daemon (lightweight version for cheat-proof tests).
-/// Does not wait for tenant discovery — drops the daemon immediately after accept.
+/// Accept an invite via a temporary daemon.
+/// Uses the same readiness gates as `accept_invite_with_identity`.
 pub fn accept_invite_lightweight(db: &str, invite_link: &str) {
-    let _tmp_daemon = start_daemon(db);
-    let out = run_topo(&[
-        "accept-invite",
-        "--db",
-        db,
-        "--invite",
-        invite_link,
-        "--username",
-        "user",
-        "--devicename",
-        "device",
-    ]);
-    assert!(
-        out.status.success(),
-        "accept-invite failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
+    accept_invite_with_identity(db, invite_link, "user", "device");
 }
 
 /// Return `topo assert-eventually` output without asserting success.

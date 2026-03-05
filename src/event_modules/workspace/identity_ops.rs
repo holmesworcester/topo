@@ -317,12 +317,37 @@ fn create_invite_event_with_optional_bootstrap_context(
     }
 }
 
-/// Create a user invite event and wrap content key for invitee.
-/// This is the core event-creation primitive for user invites.
-pub(crate) fn create_user_invite_events(
+/// Create an ongoing user invite signed by an admin peer_shared signer.
+pub(crate) fn create_user_invite_events_as_admin(
     conn: &Connection,
     recorded_by: &str,
-    workspace_key: &SigningKey,
+    admin_peer_shared_key: &SigningKey,
+    admin_peer_shared_event_id: &EventId,
+    admin_event_id: &EventId,
+    workspace_id: &EventId,
+    bootstrap_ctx: Option<&InviteBootstrapContext<'_>>,
+) -> Result<InviteData, Box<dyn std::error::Error + Send + Sync>> {
+    create_user_invite_events_with_signer(
+        conn,
+        recorded_by,
+        admin_peer_shared_key,
+        admin_peer_shared_event_id,
+        admin_event_id,
+        5,
+        workspace_id,
+        Some(admin_peer_shared_key),
+        Some(admin_peer_shared_event_id),
+        bootstrap_ctx,
+    )
+}
+
+fn create_user_invite_events_with_signer(
+    conn: &Connection,
+    recorded_by: &str,
+    signer_key: &SigningKey,
+    signer_event_id: &EventId,
+    authority_event_id: &EventId,
+    signer_type: u8,
     workspace_id: &EventId,
     sender_peer_shared_key: Option<&SigningKey>,
     sender_peer_shared_event_id: Option<&EventId>,
@@ -336,8 +361,9 @@ pub(crate) fn create_user_invite_events(
         created_at_ms: now_ms(),
         public_key: invite_pub,
         workspace_id: *workspace_id,
-        signed_by: *workspace_id,
-        signer_type: 1,
+        authority_event_id: *authority_event_id,
+        signed_by: *signer_event_id,
+        signer_type,
         signature: [0u8; 64],
     });
 
@@ -345,7 +371,7 @@ pub(crate) fn create_user_invite_events(
         conn,
         recorded_by,
         &evt,
-        workspace_key,
+        signer_key,
         workspace_id,
         bootstrap_ctx,
     )?;
@@ -369,12 +395,37 @@ pub(crate) fn create_user_invite_events(
     })
 }
 
-/// Create a device link invite event.
-/// This is the core event-creation primitive for device-link invites.
-pub(crate) fn create_device_link_invite_events(
+/// Create an ongoing device-link invite signed by an admin peer_shared signer.
+pub(crate) fn create_device_link_invite_events_as_admin(
     conn: &Connection,
     recorded_by: &str,
-    user_key: &SigningKey,
+    admin_peer_shared_key: &SigningKey,
+    admin_peer_shared_event_id: &EventId,
+    admin_event_id: &EventId,
+    user_event_id: &EventId,
+    workspace_id: &EventId,
+    bootstrap_ctx: Option<&InviteBootstrapContext<'_>>,
+) -> Result<InviteData, Box<dyn std::error::Error + Send + Sync>> {
+    create_device_link_invite_events_with_signer(
+        conn,
+        recorded_by,
+        admin_peer_shared_key,
+        admin_peer_shared_event_id,
+        admin_event_id,
+        5,
+        user_event_id,
+        workspace_id,
+        bootstrap_ctx,
+    )
+}
+
+fn create_device_link_invite_events_with_signer(
+    conn: &Connection,
+    recorded_by: &str,
+    signer_key: &SigningKey,
+    signer_event_id: &EventId,
+    authority_event_id: &EventId,
+    signer_type: u8,
     user_event_id: &EventId,
     workspace_id: &EventId,
     bootstrap_ctx: Option<&InviteBootstrapContext<'_>>,
@@ -386,8 +437,9 @@ pub(crate) fn create_device_link_invite_events(
     let evt = ParsedEvent::DeviceInvite(DeviceInviteEvent {
         created_at_ms: now_ms(),
         public_key: device_invite_pub,
-        signed_by: *user_event_id,
-        signer_type: 4,
+        authority_event_id: *authority_event_id,
+        signed_by: *signer_event_id,
+        signer_type,
         signature: [0u8; 64],
     });
 
@@ -395,7 +447,7 @@ pub(crate) fn create_device_link_invite_events(
         conn,
         recorded_by,
         &evt,
-        user_key,
+        signer_key,
         workspace_id,
         bootstrap_ctx,
     )?;

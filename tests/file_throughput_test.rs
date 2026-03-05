@@ -122,6 +122,7 @@ fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (EventId, Signin
         created_at_ms: now_ms(),
         public_key: invite_key.verifying_key().to_bytes(),
         workspace_id,
+        authority_event_id: workspace_id,
         signed_by: net_eid,
         signer_type: 1,
         signature: [0u8; 64],
@@ -149,6 +150,7 @@ fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (EventId, Signin
     let dif = ParsedEvent::DeviceInvite(DeviceInviteEvent {
         created_at_ms: now_ms(),
         public_key: device_invite_key.verifying_key().to_bytes(),
+        authority_event_id: ub_eid,
         signed_by: ub_eid,
         signer_type: 4,
         signature: [0u8; 64],

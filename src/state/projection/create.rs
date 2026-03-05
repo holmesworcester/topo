@@ -460,6 +460,7 @@ mod tests {
             created_at_ms: now_ms(),
             public_key: invite_key.verifying_key().to_bytes(),
             workspace_id: net_eid,
+            authority_event_id: net_eid,
             signed_by: net_eid,
             signer_type: 1,
             signature: [0u8; 64],
@@ -482,6 +483,7 @@ mod tests {
         let dif = ParsedEvent::DeviceInvite(DeviceInviteEvent {
             created_at_ms: now_ms(),
             public_key: device_invite_key.verifying_key().to_bytes(),
+            authority_event_id: ub_eid,
             signed_by: ub_eid,
             signer_type: 4,
             signature: [0u8; 64],

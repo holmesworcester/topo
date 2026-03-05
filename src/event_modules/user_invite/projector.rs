@@ -10,10 +10,35 @@ pub fn project_pure(
     parsed: &ParsedEvent,
     ctx: &ContextSnapshot,
 ) -> ProjectorResult {
-    let (public_key, created_at_ms) = match parsed {
-        ParsedEvent::UserInvite(ui) => (&ui.public_key, ui.created_at_ms as i64),
-        _ => return ProjectorResult::reject("not a user_invite event".to_string()),
-    };
+    let (public_key, created_at_ms, signed_by, signer_type, workspace_id, authority_event_id) =
+        match parsed {
+            ParsedEvent::UserInvite(ui) => (
+                &ui.public_key,
+                ui.created_at_ms as i64,
+                ui.signed_by,
+                ui.signer_type,
+                ui.workspace_id,
+                ui.authority_event_id,
+            ),
+            _ => return ProjectorResult::reject("not a user_invite event".to_string()),
+        };
+
+    if signer_type == 1 {
+        if signed_by != workspace_id || authority_event_id != workspace_id {
+            return ProjectorResult::reject(
+                "bootstrap user_invite must use workspace as signer and authority".to_string(),
+            );
+        }
+    } else if signer_type == 5 {
+        if ctx.invite_authority_matches_signer != Some(true) {
+            return ProjectorResult::reject(
+                "peer-signed user_invite authority does not match signer admin identity"
+                    .to_string(),
+            );
+        }
+    } else {
+        return ProjectorResult::reject("unsupported user_invite signer_type".to_string());
+    }
 
     let mut ops = vec![WriteOp::InsertOrIgnore {
         table: "user_invites",
