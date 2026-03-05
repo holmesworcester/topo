@@ -299,16 +299,16 @@ The following parser-level canonicalization guarantees are enforced in Rust but 
 | InvAllValidRequireWorkspace | test_bootstrap_sequence: non-local events require workspace valid |
 | InvMessageWorkspace | Message projection requires workspace (workspace_event_id dep) |
 | InvEncryptedKey | Encrypted content requires valid secret dependency |
-| InvSecretSharedKey | SecretShared key_event_id must match deterministic unwrapped secret event id |
+| InvSecretSharedKey | SecretShared key_event_id must match deterministic unwrapped key_secret event id |
 | InvFileSliceAuth | FileSlice and MessageAttachment for the same file must share the same signer |
 | InvRemovalExclusion | project_secret_shared: reject if recipient removed |
 | InvUserRemovalTransitiveDeny | user_removed transitively denies all peers linked via peers_shared.user_event_id |
 
 ### Bootstrap key materialization
 
-When a joiner accepts an invite, the acceptance path unwraps bootstrap content-key material (from the invite link) and materializes local `secret` events with deterministic event IDs. The deterministic ID derivation (BLAKE2b of key bytes → `created_at_ms`) ensures that both inviter and joiner produce matching `key_event_id` values without out-of-band coordination. This enables encrypted events referencing those keys to unblock via normal cascade after key materialization.
+When a joiner accepts an invite, the acceptance path unwraps bootstrap content-key material (from the invite link) and materializes local `key_secret` events with deterministic event IDs. The deterministic ID derivation (BLAKE2b of key bytes -> `created_at_ms`) ensures that both inviter and joiner produce matching `key_event_id` values without out-of-band coordination. This enables encrypted events referencing those keys to unblock via normal cascade after key materialization.
 
-The TLA model does not distinguish bootstrap vs runtime SecretShared structurally — both use the same event type with identical dependency semantics ({PeerShared}). The `key_event_id` field is a non-dependency integrity claim validated at materialization time. The bootstrap/runtime distinction is a key-source detail below the model's abstraction boundary.
+The TLA model does not distinguish bootstrap vs runtime SecretShared structurally — both use the same event type with identical dependency semantics (`recipient_event_id` + `unwrap_key_event_id` raw deps, plus `peer_shared` signer). The `key_event_id` field is a non-dependency integrity claim validated at materialization time. The bootstrap/runtime distinction is a key-source detail below the model's abstraction boundary.
 
 ## Transport Credential Lifecycle (TransportCredentialLifecycle.tla)
 
