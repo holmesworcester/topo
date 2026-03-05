@@ -17,6 +17,7 @@ use crate::contracts::peering_contract::{
 use crate::protocol::Frame;
 use crate::protocol::{encode_frame, parse_frame};
 use crate::sync::session::coordinator::PeerCoord;
+use crate::sync::session::logging::{LogDir, LogLane, SessionRunLogger, SyncRunCapture};
 use crate::sync::session::{run_sync_initiator, run_sync_responder};
 use crate::transport::connection::ConnectionError;
 use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
@@ -28,12 +29,16 @@ use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
 
 struct ControlAdapter {
     inner: Box<dyn ControlIo>,
+    capture: Option<SyncRunCapture>,
 }
 
 #[async_trait]
 impl StreamConn for ControlAdapter {
     async fn send(&mut self, msg: &Frame) -> Result<(), ConnectionError> {
         let frame = encode_frame(msg);
+        if let Some(c) = &self.capture {
+            c.record_frame(LogLane::Control, LogDir::Tx, msg, frame.len());
+        }
         self.inner.send(&frame).await.map_err(|e| map_io_error(e))
     }
 
@@ -44,18 +49,25 @@ impl StreamConn for ControlAdapter {
     async fn recv(&mut self) -> Result<Frame, ConnectionError> {
         let frame = self.inner.recv().await.map_err(|e| map_io_error(e))?;
         let (msg, _) = parse_frame(&frame).map_err(|e| ConnectionError::Parse(e))?;
+        if let Some(c) = &self.capture {
+            c.record_frame(LogLane::Control, LogDir::Rx, &msg, frame.len());
+        }
         Ok(msg)
     }
 }
 
 struct DataSendAdapter {
     inner: Box<dyn DataSendIo>,
+    capture: Option<SyncRunCapture>,
 }
 
 #[async_trait]
 impl StreamSend for DataSendAdapter {
     async fn send(&mut self, msg: &Frame) -> Result<(), ConnectionError> {
         let frame = encode_frame(msg);
+        if let Some(c) = &self.capture {
+            c.record_frame(LogLane::Data, LogDir::Tx, msg, frame.len());
+        }
         self.inner.send(&frame).await.map_err(|e| map_io_error(e))
     }
 
@@ -66,6 +78,7 @@ impl StreamSend for DataSendAdapter {
 
 struct DataRecvAdapter {
     inner: Box<dyn DataRecvIo>,
+    capture: Option<SyncRunCapture>,
 }
 
 #[async_trait]
@@ -73,6 +86,9 @@ impl StreamRecv for DataRecvAdapter {
     async fn recv(&mut self) -> Result<Frame, ConnectionError> {
         let frame = self.inner.recv().await.map_err(|e| map_io_error(e))?;
         let (msg, _) = parse_frame(&frame).map_err(|e| ConnectionError::Parse(e))?;
+        if let Some(c) = &self.capture {
+            c.record_frame(LogLane::Data, LogDir::Rx, &msg, frame.len());
+        }
         Ok(msg)
     }
 }
@@ -152,17 +168,27 @@ impl SessionHandler for SyncSessionHandler {
         // Split the abstract TransportSessionIo into independent control/data handles,
         // then wrap them as StreamConn/StreamSend/StreamRecv adapters so the
         // existing session functions work without QUIC-specific types.
+        let role_name = match &self.role {
+            SessionRole::Initiator { .. } => "initiator",
+            SessionRole::Responder => "responder",
+        };
+        let run_logger = SessionRunLogger::maybe_new(&self.db_path, &meta, role_name);
+        let capture = run_logger.as_ref().and_then(|l| l.capture());
+
         let parts = io.split();
         let mut conn: DualConnection<ControlAdapter, DataSendAdapter, DataRecvAdapter> =
             DualConnection {
                 control: ControlAdapter {
                     inner: parts.control,
+                    capture: capture.clone(),
                 },
                 data_send: DataSendAdapter {
                     inner: parts.data_send,
+                    capture: capture.clone(),
                 },
                 data_recv: DataRecvAdapter {
                     inner: parts.data_recv,
+                    capture,
                 },
             };
 
@@ -190,7 +216,8 @@ impl SessionHandler for SyncSessionHandler {
                 .map_err(|e| format!("failed to flush data marker: {e}"))?;
         }
 
-        match (&self.role, meta.direction) {
+        let mut stats: Option<crate::runtime::SyncStats> = None;
+        let result = match (&self.role, meta.direction) {
             (SessionRole::Initiator { coordination }, SessionDirection::Outbound) => {
                 let run = run_sync_initiator(
                     conn,
@@ -203,15 +230,19 @@ impl SessionHandler for SyncSessionHandler {
                     self.shared_ingest.clone(),
                 );
                 tokio::pin!(run);
-                let result = tokio::select! {
+                let run_result: Result<crate::runtime::SyncStats, String> = tokio::select! {
                     _ = cancel.cancelled() => Err(format!("session {} cancelled", meta.session_id)),
                     result = &mut run => {
-                        result
-                            .map(|_| ())
-                            .map_err(|e| format!("initiator sync failed: {e}"))
+                        result.map_err(|e| format!("initiator sync failed: {e}"))
                     },
                 };
-                result
+                match run_result {
+                    Ok(s) => {
+                        stats = Some(s);
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                }
             }
             (SessionRole::Responder, SessionDirection::Inbound) => {
                 let run = run_sync_responder(
@@ -224,11 +255,17 @@ impl SessionHandler for SyncSessionHandler {
                     self.shared_ingest.clone(),
                 );
                 tokio::pin!(run);
-                tokio::select! {
+                let run_result: Result<crate::runtime::SyncStats, String> = tokio::select! {
                     _ = cancel.cancelled() => Err(format!("session {} cancelled", meta.session_id)),
                     result = &mut run => result
-                        .map(|_| ())
                         .map_err(|e| format!("responder sync failed: {e}")),
+                };
+                match run_result {
+                    Ok(s) => {
+                        stats = Some(s);
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
                 }
             }
             (SessionRole::Initiator { .. }, SessionDirection::Inbound) => {
@@ -237,6 +274,13 @@ impl SessionHandler for SyncSessionHandler {
             (SessionRole::Responder, SessionDirection::Outbound) => {
                 Err("responder handler cannot run outbound sessions".to_string())
             }
+        };
+
+        let error_msg = result.as_ref().err().cloned();
+        if let Some(logger) = run_logger {
+            let outcome = if error_msg.is_some() { "error" } else { "ok" };
+            let _ = logger.finalize(stats.as_ref(), outcome, error_msg);
         }
+        result
     }
 }

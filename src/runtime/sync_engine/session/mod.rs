@@ -14,6 +14,7 @@ pub mod control_plane;
 pub mod coordinator;
 pub mod data_plane;
 pub mod initiator;
+pub mod logging;
 pub mod responder;
 
 use std::time::Duration;

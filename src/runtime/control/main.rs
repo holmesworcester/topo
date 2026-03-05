@@ -13,7 +13,7 @@ use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use topo::db::transport_creds::discover_local_tenants;
-use topo::db::{open_connection, schema::create_tables};
+use topo::db::{open_connection, schema::create_tables, sync_log};
 use topo::db_registry::DbRegistry;
 use topo::rpc::catalog;
 use topo::rpc::client::{rpc_call, rpc_call_raw, RpcClientError};
@@ -446,6 +446,59 @@ enum Commands {
         /// Subscription ID
         #[arg(long)]
         sub: String,
+    },
+
+    /// Enable persistent sync logging (off by default)
+    #[command(name = "sync-log-enable")]
+    SyncLogEnable {
+        /// Include match-only runs (default stores changed runs only)
+        #[arg(long, default_value_t = false)]
+        all_runs: bool,
+        /// Capture full ID lists in log details (larger DB growth)
+        #[arg(long, default_value_t = false)]
+        capture_full_ids: bool,
+    },
+
+    /// Disable persistent sync logging
+    #[command(name = "sync-log-disable")]
+    SyncLogDisable,
+
+    /// Show sync logging configuration
+    #[command(name = "sync-log-config")]
+    SyncLogConfig,
+
+    /// Show sync log trace history
+    #[command(name = "sync-log")]
+    SyncLog {
+        /// Max runs to show
+        #[arg(long, default_value = "5")]
+        limit: usize,
+        /// Show one specific run id
+        #[arg(long)]
+        run: Option<i64>,
+        /// Filter by peer id prefix
+        #[arg(long)]
+        peer: Option<String>,
+        /// Include runs that matched with no data transfer
+        #[arg(long)]
+        all: bool,
+    },
+
+    /// Show sync history in tree form
+    #[command(name = "sync-log-tree")]
+    SyncLogTree {
+        /// Max runs to show
+        #[arg(long, default_value = "5")]
+        limit: usize,
+        /// Show one specific run id
+        #[arg(long)]
+        run: Option<i64>,
+        /// Filter by peer id prefix
+        #[arg(long)]
+        peer: Option<String>,
+        /// Include runs that matched with no data transfer
+        #[arg(long)]
+        all: bool,
     },
 
     /// Raw RPC demo surface: list methods, describe parameters, submit raw JSON calls
@@ -1840,6 +1893,88 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             println!("Subscription enabled.");
         }
 
+        Commands::SyncLogEnable {
+            all_runs,
+            capture_full_ids,
+        } => {
+            let conn = open_connection(db)?;
+            create_tables(&conn)?;
+            let cfg = sync_log::update_config(
+                &conn,
+                sync_log::SyncLogConfigPatch {
+                    enabled: Some(true),
+                    changed_only: Some(!all_runs),
+                    capture_full_ids: Some(capture_full_ids),
+                    ..Default::default()
+                },
+            )?;
+            print_sync_log_config(&cfg);
+        }
+
+        Commands::SyncLogDisable => {
+            let conn = open_connection(db)?;
+            create_tables(&conn)?;
+            let cfg = sync_log::update_config(
+                &conn,
+                sync_log::SyncLogConfigPatch {
+                    enabled: Some(false),
+                    ..Default::default()
+                },
+            )?;
+            print_sync_log_config(&cfg);
+        }
+
+        Commands::SyncLogConfig => {
+            let conn = open_connection(db)?;
+            create_tables(&conn)?;
+            let cfg = sync_log::load_config(&conn)?;
+            print_sync_log_config(&cfg);
+        }
+
+        Commands::SyncLog {
+            limit,
+            run,
+            peer,
+            all,
+        } => {
+            let conn = open_connection(db)?;
+            create_tables(&conn)?;
+            let runs = sync_log::list_runs(&conn, limit, all, run, peer.as_deref())?;
+            if runs.is_empty() {
+                println!("No sync runs logged.");
+            } else {
+                for (idx, r) in runs.iter().enumerate() {
+                    let events = sync_log::list_run_events(&conn, r.run_id)?;
+                    print_sync_trace_run(r, &events);
+                    if idx + 1 < runs.len() {
+                        println!();
+                    }
+                }
+            }
+        }
+
+        Commands::SyncLogTree {
+            limit,
+            run,
+            peer,
+            all,
+        } => {
+            let conn = open_connection(db)?;
+            create_tables(&conn)?;
+            let runs = sync_log::list_runs(&conn, limit, all, run, peer.as_deref())?;
+            if runs.is_empty() {
+                println!("No sync runs logged.");
+            } else {
+                for (idx, r) in runs.iter().enumerate() {
+                    let events = sync_log::list_run_events(&conn, r.run_id)?;
+                    print_sync_tree_run(r, &events);
+                    if idx + 1 < runs.len() {
+                        println!();
+                    }
+                }
+            }
+        }
+
         // ---------------------------------------------------------------
         // RPC demo surface
         // ---------------------------------------------------------------
@@ -2256,6 +2391,152 @@ fn print_event_list(events: &[service::EventListItem]) {
         println!();
     }
     println!("{} events. Sorted by insertion order.", events.len());
+}
+
+fn print_sync_log_config(cfg: &sync_log::SyncLogConfig) {
+    println!(
+        "sync-log enabled={} changed_only={} capture_full_ids={} max_runs={} max_age_days={}",
+        cfg.enabled, cfg.changed_only, cfg.capture_full_ids, cfg.max_runs, cfg.max_age_days
+    );
+}
+
+fn short_peer_hex(peer: &str) -> &str {
+    &peer[..peer.len().min(16)]
+}
+
+fn summarize_sync_event_detail(frame_type: &str, detail_json: Option<&str>) -> String {
+    let Some(raw) = detail_json else {
+        return String::new();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return " detail=parse_error".to_string();
+    };
+
+    match frame_type {
+        "NegOpen" | "NegMsg" => {
+            let entries = v["entry_count"].as_u64().unwrap_or(0);
+            let fp = v["fingerprint_count"].as_u64().unwrap_or(0);
+            let idl = v["idlist_count"].as_u64().unwrap_or(0);
+            let skip = v["skip_count"].as_u64().unwrap_or(0);
+            if let Some(err) = v["parse_error"].as_str() {
+                format!(
+                    " detail=neg(entries={} fp={} idlists={} skip={} err={})",
+                    entries, fp, idl, skip, err
+                )
+            } else {
+                format!(
+                    " detail=neg(entries={} fp={} idlists={} skip={})",
+                    entries, fp, idl, skip
+                )
+            }
+        }
+        "HaveList" => {
+            let count = v["id_count"].as_u64().unwrap_or(0);
+            let ids = v["ids"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_str())
+                        .map(|s| short_peer_hex(s).to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .unwrap_or_default();
+            let truncated = v["ids_truncated"].as_bool().unwrap_or(false);
+            if ids.is_empty() {
+                format!(" detail=ids(count={} truncated={})", count, truncated)
+            } else {
+                format!(
+                    " detail=ids(count={} truncated={} sample=[{}])",
+                    count, truncated, ids
+                )
+            }
+        }
+        "Event" => {
+            let eid = v["event_id"].as_str().unwrap_or("");
+            let blob_len = v["blob_len"].as_u64().unwrap_or(0);
+            if eid.is_empty() {
+                format!(" detail=event(blob_len={})", blob_len)
+            } else {
+                format!(
+                    " detail=event(id={} blob_len={})",
+                    short_peer_hex(eid),
+                    blob_len
+                )
+            }
+        }
+        _ => String::new(),
+    }
+}
+
+fn print_sync_trace_run(run: &sync_log::SyncRunRow, events: &[sync_log::SyncRunEventRow]) {
+    let changed = if run.changed { "changed" } else { "match" };
+    println!(
+        "RUN {} [{}] session={} tenant={} peer={} dir={} role={} start={} end={} rounds={} sent={} recv={} bytes_tx={} bytes_rx={} outcome={}",
+        run.run_id,
+        changed,
+        run.session_id,
+        short_peer_hex(&run.tenant_id),
+        short_peer_hex(&run.peer_id),
+        run.direction,
+        run.role,
+        format_absolute(run.started_at_ms),
+        format_absolute(run.ended_at_ms),
+        run.rounds,
+        run.events_sent,
+        run.events_received,
+        run.bytes_sent,
+        run.bytes_received,
+        run.outcome,
+    );
+    if let Some(err) = &run.error {
+        println!("  error: {}", err);
+    }
+    if events.is_empty() {
+        println!("  (no frame events)");
+        return;
+    }
+    for ev in events {
+        let dt = ev.ts_ms.saturating_sub(run.started_at_ms);
+        let detail = summarize_sync_event_detail(&ev.frame_type, ev.detail_json.as_deref());
+        println!(
+            "  [{:04}] +{}ms {:7} {:2} {:8} len={}{}",
+            ev.seq, dt, ev.lane, ev.direction, ev.frame_type, ev.msg_len, detail
+        );
+    }
+}
+
+fn print_sync_tree_run(run: &sync_log::SyncRunRow, events: &[sync_log::SyncRunEventRow]) {
+    let changed = if run.changed { "changed" } else { "match" };
+    println!(
+        "run {} [{}] peer={} dir={} role={} rounds={} sent={} recv={} outcome={}",
+        run.run_id,
+        changed,
+        short_peer_hex(&run.peer_id),
+        run.direction,
+        run.role,
+        run.rounds,
+        run.events_sent,
+        run.events_received,
+        run.outcome,
+    );
+    if events.is_empty() {
+        println!("└─ (no frame events)");
+        return;
+    }
+    for (idx, ev) in events.iter().enumerate() {
+        let branch = if idx + 1 == events.len() {
+            "└─"
+        } else {
+            "├─"
+        };
+        let dt = ev.ts_ms.saturating_sub(run.started_at_ms);
+        let detail = summarize_sync_event_detail(&ev.frame_type, ev.detail_json.as_deref());
+        println!(
+            "{} +{}ms {} {} {} len={}{}",
+            branch, dt, ev.lane, ev.direction, ev.frame_type, ev.msg_len, detail
+        );
+    }
 }
 
 fn system_hostname() -> String {
