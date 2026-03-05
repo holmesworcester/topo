@@ -10,10 +10,33 @@ pub fn project_pure(
     parsed: &ParsedEvent,
     ctx: &ContextSnapshot,
 ) -> ProjectorResult {
-    let (public_key, created_at_ms) = match parsed {
-        ParsedEvent::DeviceInvite(di) => (&di.public_key, di.created_at_ms as i64),
+    let (public_key, created_at_ms, signer_type, signed_by, authority_event_id) = match parsed {
+        ParsedEvent::DeviceInvite(di) => (
+            &di.public_key,
+            di.created_at_ms as i64,
+            di.signer_type,
+            di.signed_by,
+            di.authority_event_id,
+        ),
         _ => return ProjectorResult::reject("not a device_invite event".to_string()),
     };
+
+    if signer_type == 4 {
+        if authority_event_id != signed_by {
+            return ProjectorResult::reject(
+                "bootstrap device_invite authority must match signer user event".to_string(),
+            );
+        }
+    } else if signer_type == 5 {
+        if ctx.invite_authority_matches_signer != Some(true) {
+            return ProjectorResult::reject(
+                "peer-signed device_invite authority does not match signer admin identity"
+                    .to_string(),
+            );
+        }
+    } else {
+        return ProjectorResult::reject("unsupported device_invite signer_type".to_string());
+    }
 
     let mut ops = vec![WriteOp::InsertOrIgnore {
         table: "device_invites",

@@ -272,11 +272,11 @@ async fn test_tenant_scoped_outbound_trust_rejects_untrusted_server() {
 /// Integration test: two multi-tenant nodes exercise run_node's per-tenant outbound
 /// config pipeline (discover_local_tenants -> workspace_client_config -> connect_loop).
 ///
-/// Setup: Node A (2 tenants: a0, a1) accepts connections. Node B (2 tenants: b0, b1)
-/// connects with per-tenant configs. Trust seeded so b0 trusts a0 (the fallback cert)
-/// and b1 trusts a1 only. Since A presents a0 as its fallback cert, b0's TLS handshake
-/// succeeds and sync proceeds, while b1's per-tenant trust verifier correctly rejects
-/// a0's cert and no sync occurs.
+/// Setup: Node A (2 tenants) accepts connections. Node B (2 tenants) connects with
+/// per-tenant configs. Trust is seeded so b0 trusts Node A's actual fallback cert
+/// identity (the first tenant returned by discover_local_tenants), and b1 trusts only
+/// A's other tenant cert. Since A presents the fallback cert on outbound/inbound
+/// default paths, b0 succeeds while b1's per-tenant trust verifier rejects the cert.
 ///
 /// Proves: run_node's workspace_client_config correctly scopes outbound trust per-tenant.
 #[tokio::test]
@@ -315,50 +315,58 @@ async fn test_run_node_multitenant_outbound_isolation() {
         hex::decode(&peer.identity).unwrap().try_into().unwrap()
     };
 
-    // --- Seed cross-trust via CLI pins (SQL trust rows) ---
-    // a0 trusts b0, a1 trusts b1 (inbound: A accepts both)
-    {
-        let db = open_connection(&node_a.db_path).unwrap();
-        import_cli_pins_to_sql(
-            &db,
-            &a0.identity,
-            &AllowedPeers::from_fingerprints(vec![fp(b0)]),
-        )
-        .unwrap();
-        import_cli_pins_to_sql(
-            &db,
-            &a1.identity,
-            &AllowedPeers::from_fingerprints(vec![fp(b1)]),
-        )
-        .unwrap();
-    }
-    // b0 trusts a0, b1 trusts a1 (outbound: per-tenant client trust)
-    {
-        let db = open_connection(&node_b.db_path).unwrap();
-        import_cli_pins_to_sql(
-            &db,
-            &b0.identity,
-            &AllowedPeers::from_fingerprints(vec![fp(a0)]),
-        )
-        .unwrap();
-        import_cli_pins_to_sql(
-            &db,
-            &b1.identity,
-            &AllowedPeers::from_fingerprints(vec![fp(a1)]),
-        )
-        .unwrap();
-    }
-
-    // Create marker events on a0 (to be synced to b0 if connection succeeds)
-    let a0_marker = a0.create_message("a0-isolation-marker");
-    let a0_marker_b64 = event_id_to_base64(&a0_marker);
-
     // --- Build Node A endpoint (same as run_node) ---
     let tenants_a = {
         let db = open_connection(&node_a.db_path).unwrap();
         discover_local_tenants(&db).unwrap()
     };
     assert_eq!(tenants_a.len(), 2, "node A should have 2 tenants");
+
+    // Fallback cert identity is whichever tenant discover_local_tenants returns first.
+    let fallback_a_id = tenants_a[0].peer_id.clone();
+    let (fallback_a, nonfallback_a) = if fallback_a_id == a0.identity {
+        (a0, a1)
+    } else {
+        (a1, a0)
+    };
+
+    // --- Seed cross-trust via CLI pins (SQL trust rows) ---
+    // A inbound trust: fallback tenant trusts b0; non-fallback trusts b1.
+    {
+        let db = open_connection(&node_a.db_path).unwrap();
+        import_cli_pins_to_sql(
+            &db,
+            &fallback_a.identity,
+            &AllowedPeers::from_fingerprints(vec![fp(b0)]),
+        )
+        .unwrap();
+        import_cli_pins_to_sql(
+            &db,
+            &nonfallback_a.identity,
+            &AllowedPeers::from_fingerprints(vec![fp(b1)]),
+        )
+        .unwrap();
+    }
+    // B outbound trust: b0 trusts A fallback cert; b1 trusts only non-fallback cert.
+    {
+        let db = open_connection(&node_b.db_path).unwrap();
+        import_cli_pins_to_sql(
+            &db,
+            &b0.identity,
+            &AllowedPeers::from_fingerprints(vec![fp(fallback_a)]),
+        )
+        .unwrap();
+        import_cli_pins_to_sql(
+            &db,
+            &b1.identity,
+            &AllowedPeers::from_fingerprints(vec![fp(nonfallback_a)]),
+        )
+        .unwrap();
+    }
+
+    // Create marker event on A fallback identity (should sync to b0 only).
+    let fallback_marker = fallback_a.create_message("fallback-isolation-marker");
+    let fallback_marker_b64 = event_id_to_base64(&fallback_marker);
 
     let provider = rustls::crypto::ring::default_provider();
     let mut cert_resolver_a = WorkspaceCertResolver::new();
@@ -496,7 +504,7 @@ async fn test_run_node_multitenant_outbound_isolation() {
     .unwrap();
 
     // --- Spawn connect_loops for each B tenant (same as run_node) ---
-    // b0's config trusts a0 (= A's fallback cert) → should succeed
+    // b0's config trusts A's fallback cert identity → should succeed
     let b0_cfg = b_configs.get(&b0.identity).unwrap().clone();
     let ep_b0 = endpoint_b.clone();
     let b0_db = node_b.db_path.clone();
@@ -520,7 +528,7 @@ async fn test_run_node_multitenant_outbound_isolation() {
         });
     });
 
-    // b1's config trusts a1 only (NOT a0 = A's fallback cert) → TLS should fail
+    // b1's config trusts only A's non-fallback identity → TLS should fail
     let b1_cfg = b_configs.get(&b1.identity).unwrap().clone();
     let ep_b1 = endpoint_b.clone();
     let b1_db = node_b.db_path.clone();
@@ -552,32 +560,32 @@ async fn test_run_node_multitenant_outbound_isolation() {
             let db = open_connection(&node_b.db_path).unwrap();
             db.query_row(
                 "SELECT COUNT(*) > 0 FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
-                rusqlite::params![&b0.identity, &a0_marker_b64],
+                rusqlite::params![&b0.identity, &fallback_marker_b64],
                 |row| row.get::<_, bool>(0),
             )
             .unwrap_or(false)
         },
         Duration::from_secs(30),
-        "b0 should record a0's marker (b0 trusts a0 = A's fallback cert)",
+        "b0 should record fallback marker (b0 trusts A fallback cert)",
     )
     .await;
 
-    // b1 should NOT have recorded a0's marker. b1's per-tenant workspace_client_config
-    // only trusts a1's cert, but A presents a0 as its fallback — TLS fails, no sync.
+    // b1 should NOT have recorded fallback marker. b1 trusts non-fallback cert only,
+    // while A presents fallback cert on this path.
     tokio::time::sleep(Duration::from_secs(2)).await;
     let b1_has_marker: bool = {
         let db = open_connection(&node_b.db_path).unwrap();
         db.query_row(
             "SELECT COUNT(*) > 0 FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![&b1.identity, &a0_marker_b64],
+            rusqlite::params![&b1.identity, &fallback_marker_b64],
             |row| row.get::<_, bool>(0),
         )
         .unwrap_or(false)
     };
     assert!(
         !b1_has_marker,
-        "b1 should NOT have recorded a0's marker: b1's per-tenant config only trusts a1, \
-         but A presents a0 as its fallback cert. Per-tenant outbound isolation prevents \
+        "b1 should NOT have recorded fallback marker: b1 trusts only non-fallback cert, \
+         but A presents fallback cert. Per-tenant outbound isolation prevents \
          b1 from establishing a TLS connection."
     );
 

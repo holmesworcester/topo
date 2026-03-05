@@ -132,8 +132,6 @@ pub struct Peer {
     pub peer_shared_event_id: Option<EventId>,
     /// PeerShared signing key for signing content events.
     pub peer_shared_signing_key: Option<SigningKey>,
-    /// Workspace signing key (only set for workspace creators).
-    pub workspace_signing_key: Option<SigningKey>,
     _tempdir: tempfile::TempDir,
 }
 
@@ -176,7 +174,6 @@ impl Peer {
             workspace_id: [0u8; 32],
             peer_shared_event_id: None,
             peer_shared_signing_key: None,
-            workspace_signing_key: None,
             _tempdir: tempdir,
         }
     }
@@ -223,15 +220,6 @@ impl Peer {
         }
         self.peer_shared_event_id = Some(result.peer_shared_event_id);
         self.peer_shared_signing_key = Some(result.peer_shared_key);
-        // Load workspace signing key from local signer material
-        if let Ok(Some((_ws_eid, ws_key))) =
-            crate::event_modules::workspace::commands::load_workspace_signing_key(
-                &db,
-                &new_identity,
-            )
-        {
-            self.workspace_signing_key = Some(ws_key);
-        }
     }
 
     /// Create a new peer that joins an existing workspace created by `creator`
@@ -266,14 +254,9 @@ impl Peer {
             workspace_id: [0u8; 32],
             peer_shared_event_id: None,
             peer_shared_signing_key: None,
-            workspace_signing_key: None,
             _tempdir: tempdir,
         };
         let creator_db = open_connection(&creator.db_path).expect("failed to open creator db");
-        let workspace_key = creator
-            .workspace_signing_key
-            .as_ref()
-            .expect("creator has no workspace_signing_key; use new_with_identity()");
         let creator_peer_key = creator
             .peer_shared_signing_key
             .as_ref()
@@ -281,15 +264,28 @@ impl Peer {
         let creator_peer_eid = creator
             .peer_shared_event_id
             .expect("creator has no peer_shared_event_id; use new_with_identity()");
+        let creator_admin_eid: EventId = creator_db
+            .query_row(
+                "SELECT event_id
+                 FROM admins
+                 WHERE recorded_by = ?1
+                 ORDER BY event_id ASC
+                 LIMIT 1",
+                rusqlite::params![&creator.identity],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|b64| event_id_from_base64(&b64))
+            .expect("creator has no admin event; use new_with_identity()");
 
         // Creator issues an invite via workspace::commands API
         let invite = create_user_invite_raw(
             &creator_db,
             &creator.identity,
-            workspace_key,
+            creator_peer_key,
+            &creator_peer_eid,
+            &creator_admin_eid,
             &creator.workspace_id,
-            Some(creator_peer_key),
-            Some(&creator_peer_eid),
         )
         .expect("failed to create user invite");
 
@@ -339,9 +335,6 @@ impl Peer {
         .await
         .expect("failed bootstrap sync");
 
-        // Allow batch_writer to finish draining projection cascade.
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-
         // Clean up sync endpoint
         sync_endpoint.close(0u32.into(), b"bootstrap done");
 
@@ -352,17 +345,20 @@ impl Peer {
         peer.identity = scoped_peer_id.clone();
         peer.workspace_id = creator.workspace_id;
 
-        // Load signing key and user_event_id from DB
-        if let Ok(Some((eid, key))) =
-            crate::service::load_local_peer_signer_pub(&db, &scoped_peer_id)
+        // Deterministically drain projection queue after bootstrap sync so
+        // peer signer materialization is visible in the same call chain.
+        let _ = crate::event_pipeline::drain_project_queue(&peer.db_path, &scoped_peer_id, 1000);
+
+        // Load signing key and user_event_id from DB in a read-your-writes step.
+        let (eid, key) = crate::service::load_local_peer_signer_pub(&db, &scoped_peer_id)
+            .expect("load_local_peer_signer_pub failed")
+            .expect("accept_invite did not materialize local peer signer");
+        peer.peer_shared_event_id = Some(eid);
+        peer.peer_shared_signing_key = Some(key);
+        if let Ok(uid) =
+            crate::service::resolve_user_event_id_for_signer(&db, &scoped_peer_id, &eid)
         {
-            peer.peer_shared_event_id = Some(eid);
-            peer.peer_shared_signing_key = Some(key);
-            if let Ok(uid) =
-                crate::service::resolve_user_event_id_for_signer(&db, &scoped_peer_id, &eid)
-            {
-                peer.author_id = uid;
-            }
+            peer.author_id = uid;
         }
 
         peer
@@ -637,6 +633,7 @@ impl Peer {
             created_at_ms: current_timestamp_ms(),
             public_key,
             workspace_id: *workspace_id,
+            authority_event_id: *workspace_id,
             signed_by: *workspace_id,
             signer_type: 1,
             signature: [0u8; 64],
@@ -657,6 +654,7 @@ impl Peer {
             created_at_ms: current_timestamp_ms(),
             public_key: invite_public_key,
             workspace_id: *workspace_id,
+            authority_event_id: *workspace_id,
             signed_by: *workspace_id,
             signer_type: 1,
             signature: [0u8; 64],
@@ -710,6 +708,7 @@ impl Peer {
         let evt = ParsedEvent::DeviceInvite(DeviceInviteEvent {
             created_at_ms: current_timestamp_ms(),
             public_key: device_invite_public_key,
+            authority_event_id: *user_event_id,
             signed_by: *user_event_id,
             signer_type: 4,
             signature: [0u8; 64],
@@ -2938,7 +2937,6 @@ impl SharedDbNode {
             workspace_id: [0u8; 32],
             peer_shared_event_id: None,
             peer_shared_signing_key: None,
-            workspace_signing_key: None,
             _tempdir: dummy_tempdir,
         };
 
@@ -2956,11 +2954,6 @@ impl SharedDbNode {
 
         let creator = &self.tenants[creator_index];
         let workspace_id = creator.workspace_id;
-        let workspace_key = creator
-            .workspace_signing_key
-            .as_ref()
-            .expect("creator has no workspace_signing_key")
-            .clone();
         let creator_peer_key = creator
             .peer_shared_signing_key
             .as_ref()
@@ -2978,6 +2971,19 @@ impl SharedDbNode {
         let tenant_identity = hex::encode(fp);
 
         let db = open_connection(&self.db_path).expect("failed to open db");
+        let creator_admin_eid: EventId = db
+            .query_row(
+                "SELECT event_id
+                 FROM admins
+                 WHERE recorded_by = ?1
+                 ORDER BY event_id ASC
+                 LIMIT 1",
+                rusqlite::params![&creator_identity],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|b64| event_id_from_base64(&b64))
+            .expect("creator has no admin event");
         crate::db::transport_creds::store_local_creds(
             &db,
             &tenant_identity,
@@ -2990,19 +2996,58 @@ impl SharedDbNode {
         let invite = create_user_invite_raw(
             &db,
             &creator_identity,
-            &workspace_key,
+            &creator_peer_key,
+            &creator_peer_eid,
+            &creator_admin_eid,
             &workspace_id,
-            Some(&creator_peer_key),
-            Some(&creator_peer_eid),
         )
         .expect("failed to create user invite");
 
-        // The Workspace and UserInvite events already exist in the shared DB.
-        // Record them for this new tenant and project (white-box shared-DB prerequisite).
+        // Mirror creator identity prerequisites needed to validate peer-signed invites
+        // under the new tenant scope (workspace + signer/admin lineage + invite).
+        let creator_peer_b64 = event_id_to_base64(&creator_peer_eid);
+        let creator_peer_blob: Vec<u8> = db
+            .query_row(
+                "SELECT blob FROM events WHERE event_id = ?1",
+                rusqlite::params![&creator_peer_b64],
+                |row| row.get(0),
+            )
+            .expect("failed to load creator peer_shared blob");
+        let creator_device_invite_eid = match crate::event_modules::parse_event(&creator_peer_blob)
+            .expect("failed to parse creator peer_shared")
+        {
+            ParsedEvent::PeerShared(ps) => ps.signed_by,
+            _ => panic!("creator peer_shared event has unexpected type"),
+        };
+
+        let creator_user_b64 = event_id_to_base64(&creator.author_id);
+        let creator_user_blob: Vec<u8> = db
+            .query_row(
+                "SELECT blob FROM events WHERE event_id = ?1",
+                rusqlite::params![&creator_user_b64],
+                |row| row.get(0),
+            )
+            .expect("failed to load creator user blob");
+        let creator_user_invite_eid = match crate::event_modules::parse_event(&creator_user_blob)
+            .expect("failed to parse creator user")
+        {
+            ParsedEvent::User(u) => u.signed_by,
+            _ => panic!("creator user event has unexpected type"),
+        };
+
+        // Record prerequisites for this new tenant and project (white-box shared-DB prerequisite).
         record_shared_db_events_for_tenant(
             &db,
             &tenant_identity,
-            &[workspace_id, invite.invite_event_id],
+            &[
+                workspace_id,
+                creator_user_invite_eid,
+                creator.author_id,
+                creator_device_invite_eid,
+                creator_peer_eid,
+                creator_admin_eid,
+                invite.invite_event_id,
+            ],
         );
 
         // Accept the invite (production flow via workspace commands)
@@ -3029,7 +3074,6 @@ impl SharedDbNode {
             workspace_id,
             peer_shared_event_id: Some(join.peer_shared_event_id),
             peer_shared_signing_key: Some(join.peer_shared_key),
-            workspace_signing_key: None,
             _tempdir: dummy_tempdir,
         };
 

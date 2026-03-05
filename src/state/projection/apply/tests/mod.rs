@@ -194,6 +194,7 @@ fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (EventId, Signin
         created_at_ms: now_ms(),
         public_key: invite_pub,
         workspace_id: net_eid,
+        authority_event_id: net_eid,
         signed_by: net_eid,
         signer_type: 1,
         signature: [0u8; 64],
@@ -227,6 +228,7 @@ fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (EventId, Signin
     let dif = DeviceInviteEvent {
         created_at_ms: now_ms(),
         public_key: device_invite_pub,
+        authority_event_id: ub_eid,
         signed_by: ub_eid,
         signer_type: 4,
         signature: [0u8; 64],
@@ -313,6 +315,7 @@ fn build_identity_chain_deferred(
         created_at_ms: now_ms(),
         public_key: invite_pub,
         workspace_id: net_eid,
+        authority_event_id: net_eid,
         signed_by: net_eid,
         signer_type: 1,
         signature: [0u8; 64],
@@ -344,6 +347,7 @@ fn build_identity_chain_deferred(
     let dif = DeviceInviteEvent {
         created_at_ms: now_ms(),
         public_key: device_invite_pub,
+        authority_event_id: ub_eid,
         signed_by: ub_eid,
         signer_type: 4,
         signature: [0u8; 64],
@@ -3472,6 +3476,7 @@ fn test_file_slice_wrong_signer_rejected() {
         created_at_ms: now_ms(),
         public_key: invite_pub,
         workspace_id: net_eid,
+        authority_event_id: net_eid,
         signed_by: net_eid,
         signer_type: 1,
         signature: [0u8; 64],
@@ -3505,6 +3510,7 @@ fn test_file_slice_wrong_signer_rejected() {
     let dif_a = DeviceInviteEvent {
         created_at_ms: now_ms(),
         public_key: device_invite_pub_a,
+        authority_event_id: ub_eid,
         signed_by: ub_eid,
         signer_type: 4,
         signature: [0u8; 64],
@@ -3540,6 +3546,7 @@ fn test_file_slice_wrong_signer_rejected() {
     let dif_b = DeviceInviteEvent {
         created_at_ms: now_ms(),
         public_key: device_invite_pub_b,
+        authority_event_id: ub_eid,
         signed_by: ub_eid,
         signer_type: 4,
         signature: [0u8; 64],
@@ -5146,6 +5153,7 @@ fn test_full_bootstrap_progression_from_projected_sql_state() {
         created_at_ms: now_ms(),
         public_key: invite_pub,
         workspace_id: ws_eid,
+        authority_event_id: ws_eid,
         signed_by: ws_eid,
         signer_type: 1,
         signature: [0u8; 64],
@@ -5236,6 +5244,7 @@ fn test_full_bootstrap_progression_from_projected_sql_state() {
     let dif = DeviceInviteEvent {
         created_at_ms: now_ms(),
         public_key: device_invite_pub,
+        authority_event_id: ub_eid,
         signed_by: ub_eid,
         signer_type: 4,
         signature: [0u8; 64],

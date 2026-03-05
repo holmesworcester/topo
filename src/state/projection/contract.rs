@@ -181,6 +181,18 @@ pub struct ContextSnapshot {
     /// table so projectors can emit trust writes without the service layer.
     pub bootstrap_context: Option<BootstrapContextSnapshot>,
 
+    /// For invite events signed by peer_shared: whether `authority_event_id`
+    /// resolves to an admin event for the same user identity as `signed_by`.
+    pub invite_authority_matches_signer: Option<bool>,
+
+    /// For local_signer_secret(peer_shared): whether signer_event_id already
+    /// projects as peer_shared for this tenant.
+    pub local_signer_peer_shared_projected: Option<bool>,
+
+    /// For peer_shared: whether local signer material already exists for this
+    /// peer_shared event_id.
+    pub peer_shared_has_local_signer_material: Option<bool>,
+
     /// Whether this event was locally created (source = 'local' in recorded_events).
     /// Used to gate pending bootstrap trust writes: only locally-created invite
     /// events should write pending trust rows. Synced invite events on the

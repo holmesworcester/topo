@@ -310,6 +310,7 @@ fn test_out_of_order_identity() {
         created_at_ms: now_ms + 1,
         public_key: invite_pubkey,
         workspace_id,
+        authority_event_id: workspace_eid,
         signed_by: workspace_eid,
         signer_type: 1,
         signature: [0u8; 64],
@@ -554,6 +555,8 @@ fn test_removal_enforcement() {
 
 #[test]
 fn test_secret_shared_key_wrap() {
+    use topo::projection::encrypted::wrap_key_for_recipient;
+
     let alice = Peer::new("alice");
     let harness = ScenarioHarness::new();
     harness.track(&alice);
@@ -561,14 +564,21 @@ fn test_secret_shared_key_wrap() {
 
     // Create SecretKey
     let secret_key_bytes: [u8; 32] = rand::random();
-    let sk_eid = alice.create_secret_key(secret_key_bytes);
+    let sk_eid = alice.create_secret_key_deterministic(
+        secret_key_bytes,
+        topo::event_modules::secret_key::deterministic_secret_key_created_at_ms(&secret_key_bytes),
+    );
 
     // Create local invite_privkey for the bootstrap invite.
     let unwrap_key_eid =
         alice.create_invite_privkey(&chain.user_invite_eid, chain.invite_key.to_bytes());
 
     // Create SecretShared wrapping to the bootstrap invite.
-    let wrapped_key: [u8; 32] = rand::random(); // in real code this would be encrypted
+    let wrapped_key = wrap_key_for_recipient(
+        &chain.peer_shared_key,
+        &chain.invite_key.verifying_key(),
+        &secret_key_bytes,
+    );
     let ss_eid = alice.create_secret_shared(
         &chain.peer_shared_key,
         &sk_eid,
@@ -607,6 +617,7 @@ fn test_secret_shared_key_wrap() {
 fn test_secret_shared_blocks_until_signer_valid() {
     use topo::event_modules::{ParsedEvent, SecretSharedEvent};
     use topo::projection::create::create_signed_event_staged;
+    use topo::projection::encrypted::wrap_key_for_recipient;
 
     let alice = Peer::new("alice");
     let harness = ScenarioHarness::new();
@@ -617,7 +628,10 @@ fn test_secret_shared_blocks_until_signer_valid() {
 
     // Alice creates a local content key.
     let secret_key_bytes: [u8; 32] = rand::random();
-    let sk_eid = alice.create_secret_key(secret_key_bytes);
+    let sk_eid = alice.create_secret_key_deterministic(
+        secret_key_bytes,
+        topo::event_modules::secret_key::deterministic_secret_key_created_at_ms(&secret_key_bytes),
+    );
 
     // SecretShared depends on deterministic invite_privkey event id.
     // Do not emit invite_privkey yet, so this should block.
@@ -626,7 +640,11 @@ fn test_secret_shared_blocks_until_signer_valid() {
             &chain.user_invite_eid,
             &chain.invite_key.to_bytes(),
         );
-    let wrapped_key: [u8; 32] = rand::random();
+    let wrapped_key = wrap_key_for_recipient(
+        &chain.peer_shared_key,
+        &chain.invite_key.verifying_key(),
+        &secret_key_bytes,
+    );
     let ss_event = ParsedEvent::SecretShared(SecretSharedEvent {
         created_at_ms: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

@@ -126,6 +126,31 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+pub fn build_projector_context(
+    conn: &Connection,
+    recorded_by: &str,
+    _event_id_b64: &str,
+    parsed: &ParsedEvent,
+) -> Result<ContextSnapshot, Box<dyn std::error::Error>> {
+    let mut ctx = ContextSnapshot::default();
+    if let ParsedEvent::LocalSignerSecret(e) = parsed {
+        if e.signer_kind == SIGNER_KIND_PEER_SHARED {
+            let signer_b64 = event_id_to_base64(&e.signer_event_id);
+            let projected: bool = conn.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM peers_shared
+                     WHERE recorded_by = ?1 AND event_id = ?2
+                     LIMIT 1
+                 )",
+                rusqlite::params![recorded_by, signer_b64],
+                |row| row.get(0),
+            )?;
+            ctx.local_signer_peer_shared_projected = Some(projected);
+        }
+    }
+    Ok(ctx)
+}
+
 /// Pure projector: LocalSignerSecret -> local_signer_material table.
 /// UPSERT by (recorded_by, signer_event_id): Delete existing + InsertOrIgnore.
 /// Emits ApplyTransportIdentityIntent(InstallPeerSharedIdentityFromSigner) when
@@ -134,7 +159,7 @@ pub fn project_pure(
     recorded_by: &str,
     _event_id_b64: &str,
     parsed: &ParsedEvent,
-    _ctx: &ContextSnapshot,
+    ctx: &ContextSnapshot,
 ) -> ProjectorResult {
     let e = match parsed {
         ParsedEvent::LocalSignerSecret(v) => v,
@@ -170,7 +195,9 @@ pub fn project_pure(
         },
     ];
 
-    if e.signer_kind == SIGNER_KIND_PEER_SHARED {
+    if e.signer_kind == SIGNER_KIND_PEER_SHARED
+        && ctx.local_signer_peer_shared_projected == Some(true)
+    {
         ProjectorResult::valid_with_commands(
             ops,
             vec![EmitCommand::ApplyTransportIdentityIntent {
@@ -190,15 +217,15 @@ pub static LOCAL_SIGNER_SECRET_META: EventTypeMeta = EventTypeMeta {
     type_name: "peer_privkey",
     projection_table: "local_signer_material",
     share_scope: ShareScope::Local,
-    dep_fields: &["signer_event_id"],
-    dep_field_type_codes: &[&[8, 14, 16]],
+    dep_fields: &[],
+    dep_field_type_codes: &[],
     signer_required: false,
     signature_byte_len: 0,
     encryptable: false,
     parse: parse_local_signer_secret,
     encode: encode_local_signer_secret,
     projector: project_pure,
-    context_loader: crate::event_modules::registry::load_empty_context,
+    context_loader: build_projector_context,
 };
 
 #[cfg(test)]
