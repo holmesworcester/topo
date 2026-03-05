@@ -13,7 +13,6 @@ use serde::Serialize;
 use tokio::sync::Notify;
 use tracing::{info, warn};
 
-use crate::db::transport_creds::discover_local_tenants;
 use crate::event_modules::{message, peer_shared, reaction, user, workspace};
 use crate::node::NodeRuntimeNetInfo;
 use crate::rpc::protocol::*;
@@ -22,6 +21,31 @@ use crate::service;
 /// Maximum concurrent RPC connections the server will handle.
 /// Additional connections block until a slot is freed.
 const MAX_CONCURRENT_CONNECTIONS: usize = 64;
+
+#[derive(Debug, Clone)]
+struct TenantScope {
+    peer_id: String,
+    workspace_id: String,
+}
+
+fn discover_tenant_scopes(
+    conn: &rusqlite::Connection,
+) -> Result<Vec<TenantScope>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT peer_id, workspace_id
+         FROM trust_anchors
+         ORDER BY peer_id",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(TenantScope {
+                peer_id: row.get(0)?,
+                workspace_id: row.get(1)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
 
 /// Daemon-wide shared state: tracks active peer and invite refs.
 pub struct DaemonState {
@@ -59,7 +83,7 @@ impl DaemonState {
         let active = match crate::db::open_connection(db_path) {
             Ok(conn) => {
                 let _ = crate::db::schema::create_tables(&conn);
-                match discover_local_tenants(&conn) {
+                match discover_tenant_scopes(&conn) {
                     Ok(tenants) if tenants.len() == 1 => Some(tenants[0].peer_id.clone()),
                     Ok(_) => None,
                     Err(_) => None,
@@ -85,11 +109,11 @@ impl DaemonState {
     fn require_active_peer(&self) -> Result<String, String> {
         let cached = self.active_peer.read().unwrap().clone();
 
-        // Discover current tenant set so we can reject stale cached peers after
-        // identity finalization (old peer_id -> new peer_id transition).
+        // Discover current tenant scopes from trust anchors (event/projection state).
+        // This keeps control-plane tenant selection independent from transport creds.
         let discovered = if let Ok(conn) = crate::db::open_connection(&self.db_path) {
             let _ = crate::db::schema::create_tables(&conn);
-            discover_local_tenants(&conn).ok()
+            discover_tenant_scopes(&conn).ok()
         } else {
             None
         };
@@ -143,7 +167,6 @@ impl DaemonState {
         // Passthrough: treat as a raw invite link
         Ok(selector.to_string())
     }
-
 }
 
 /// Tenant info returned by the Tenants command.
@@ -345,10 +368,10 @@ fn dispatch(
             match crate::db::open_connection(db_path) {
                 Ok(conn) => {
                     let _ = crate::db::schema::create_tables(&conn);
-                    match discover_local_tenants(&conn) {
-                        Ok(tenants) => {
+                    match discover_tenant_scopes(&conn) {
+                        Ok(scopes) => {
                             let active = state.active_peer.read().unwrap().clone();
-                            let mut items: Vec<TenantItem> = tenants
+                            let mut items: Vec<TenantItem> = scopes
                                 .iter()
                                 .enumerate()
                                 .map(|(i, t)| TenantItem {
@@ -375,17 +398,16 @@ fn dispatch(
         RpcMethod::UseTenant { index } => match crate::db::open_connection(db_path) {
             Ok(conn) => {
                 let _ = crate::db::schema::create_tables(&conn);
-                match discover_local_tenants(&conn) {
-                    Ok(mut tenants) => {
-                        tenants.sort_by(|a, b| a.peer_id.cmp(&b.peer_id));
-                        if index == 0 || index > tenants.len() {
+                match discover_tenant_scopes(&conn) {
+                    Ok(scopes) => {
+                        if index == 0 || index > scopes.len() {
                             return RpcResponse::error(format!(
                                 "invalid tenant number {}; available: 1-{}",
                                 index,
-                                tenants.len()
+                                scopes.len()
                             ));
                         }
-                        let tenant = &tenants[index - 1];
+                        let tenant = &scopes[index - 1];
                         *state.active_peer.write().unwrap() = Some(tenant.peer_id.clone());
                         RpcResponse::success(serde_json::json!({
                             "peer_id": tenant.peer_id,
@@ -437,7 +459,13 @@ fn dispatch(
         } => match state.require_active_peer() {
             Ok(peer_id) => match message::send_for_peer(db_path, &peer_id, &content) {
                 Ok(data) => {
-                    store_client_op(db_path, &peer_id, client_op_id.as_deref(), &data.event_id, "message");
+                    store_client_op(
+                        db_path,
+                        &peer_id,
+                        client_op_id.as_deref(),
+                        &data.event_id,
+                        "message",
+                    );
                     RpcResponse::success(data)
                 }
                 Err(e) => RpcResponse::error(e.to_string()),
@@ -452,7 +480,13 @@ fn dispatch(
             Ok(peer_id) => {
                 match message::send_file_for_peer(db_path, &peer_id, &content, &file_path) {
                     Ok(data) => {
-                        store_client_op(db_path, &peer_id, client_op_id.as_deref(), &data.event_id, "attachment");
+                        store_client_op(
+                            db_path,
+                            &peer_id,
+                            client_op_id.as_deref(),
+                            &data.event_id,
+                            "attachment",
+                        );
                         RpcResponse::success(data)
                     }
                     Err(e) => RpcResponse::error(e.to_string()),
@@ -468,15 +502,12 @@ fn dispatch(
             Err(e) => RpcResponse::error(e),
         },
         RpcMethod::GenerateFiles { count, size_mib } => match state.require_active_peer() {
-            Ok(peer_id) => match message::generate_files_for_peer(
-                db_path,
-                &peer_id,
-                count,
-                size_mib,
-            ) {
-                Ok(data) => RpcResponse::success(data),
-                Err(e) => RpcResponse::error(e.to_string()),
-            },
+            Ok(peer_id) => {
+                match message::generate_files_for_peer(db_path, &peer_id, count, size_mib) {
+                    Ok(data) => RpcResponse::success(data),
+                    Err(e) => RpcResponse::error(e.to_string()),
+                }
+            }
             Err(e) => RpcResponse::error(e),
         },
         RpcMethod::React {
@@ -486,7 +517,13 @@ fn dispatch(
         } => match state.require_active_peer() {
             Ok(peer_id) => match reaction::react_for_peer(db_path, &peer_id, &target, &emoji) {
                 Ok(data) => {
-                    store_client_op(db_path, &peer_id, client_op_id.as_deref(), &data.event_id, "reaction");
+                    store_client_op(
+                        db_path,
+                        &peer_id,
+                        client_op_id.as_deref(),
+                        &data.event_id,
+                        "reaction",
+                    );
                     RpcResponse::success(data)
                 }
                 Err(e) => RpcResponse::error(e.to_string()),
@@ -796,32 +833,44 @@ fn dispatch(
             peer_b,
             ttl_ms,
             attempt_window_ms,
-        } => {
-            match tokio::runtime::Handle::try_current() {
-                Ok(handle) => {
-                    match handle.block_on(service::svc_intro(
-                        db_path,
-                        &peer_a,
-                        &peer_b,
-                        ttl_ms,
-                        attempt_window_ms,
-                    )) {
-                        Ok(true) => {
-                            RpcResponse::success(serde_json::json!({"sent_to_both": true}))
-                        }
-                        Ok(false) => RpcResponse::error("partial send"),
-                        Err(e) => RpcResponse::error(e.to_string()),
-                    }
+        } => match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                match handle.block_on(service::svc_intro(
+                    db_path,
+                    &peer_a,
+                    &peer_b,
+                    ttl_ms,
+                    attempt_window_ms,
+                )) {
+                    Ok(true) => RpcResponse::success(serde_json::json!({"sent_to_both": true})),
+                    Ok(false) => RpcResponse::error("partial send"),
+                    Err(e) => RpcResponse::error(e.to_string()),
                 }
-                Err(_) => RpcResponse::error("no tokio runtime available for async intro"),
             }
-        }
+            Err(_) => RpcResponse::error("no tokio runtime available for async intro"),
+        },
 
-        RpcMethod::EventList => match service::open_db_load(db_path) {
-            Ok((recorded_by, db)) => match service::svc_event_list(&db, &recorded_by) {
-                Ok(data) => RpcResponse::success(data),
-                Err(e) => RpcResponse::error(e.to_string()),
-            },
+        RpcMethod::EventList => match crate::db::open_connection(db_path) {
+            Ok(db) => {
+                if let Err(e) = crate::db::schema::create_tables(&db) {
+                    return RpcResponse::error(e.to_string());
+                }
+                let scopes = match discover_tenant_scopes(&db) {
+                    Ok(s) => s,
+                    Err(e) => return RpcResponse::error(e.to_string()),
+                };
+                if scopes.is_empty() {
+                    return RpcResponse::success(service::EventListResponse { events: vec![] });
+                }
+                let recorded_by = match state.require_active_peer() {
+                    Ok(peer_id) => peer_id,
+                    Err(e) => return RpcResponse::error(e),
+                };
+                match service::svc_event_list(&db, &recorded_by) {
+                    Ok(data) => RpcResponse::success(data),
+                    Err(e) => RpcResponse::error(e.to_string()),
+                }
+            }
             Err(e) => RpcResponse::error(e.to_string()),
         },
 
@@ -879,7 +928,9 @@ fn dispatch(
                 if let Some(ref mut since) = spec.since {
                     if !since.event_id.is_empty() {
                         // If it looks like hex (64 hex chars = 32 bytes), convert to base64.
-                        if since.event_id.len() == 64 && since.event_id.chars().all(|c| c.is_ascii_hexdigit()) {
+                        if since.event_id.len() == 64
+                            && since.event_id.chars().all(|c| c.is_ascii_hexdigit())
+                        {
                             if let Some(eid) = crate::crypto::event_id_from_hex(&since.event_id) {
                                 since.event_id = crate::crypto::event_id_to_base64(&eid);
                             }

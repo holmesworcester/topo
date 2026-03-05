@@ -640,14 +640,22 @@ fn test_cli_messages_include_reactions() {
         .args(["--db", &db, "react", "--target", "1", "thumbsup"])
         .output()
         .expect("react");
-    assert!(out.status.success(), "react failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "react failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     // Add a second different reaction to the same message.
     let out = Command::new(bin())
         .args(["--db", &db, "react", "--target", "1", "fire"])
         .output()
         .expect("react fire");
-    assert!(out.status.success(), "react fire failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "react fire failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     // `topo messages` output should contain both reactions as real emoji.
     let raw = get_messages_raw(&db);
@@ -705,7 +713,11 @@ fn test_cli_send_file_and_messages_display() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("notes.txt"), "send-file output should show filename, got: {}", stdout);
+    assert!(
+        stdout.contains("notes.txt"),
+        "send-file output should show filename, got: {}",
+        stdout
+    );
 
     // `topo messages` should show the message and the attachment.
     let raw = get_messages_raw(&db);
@@ -743,7 +755,15 @@ fn test_cli_generate_files_messages_display() {
 
     // generate-files creates synthetic message + attachment
     let out = Command::new(bin())
-        .args(["--db", &db, "generate-files", "--count", "1", "--size-mib", "1"])
+        .args([
+            "--db",
+            &db,
+            "generate-files",
+            "--count",
+            "1",
+            "--size-mib",
+            "1",
+        ])
         .output()
         .expect("generate-files");
     assert!(
@@ -881,24 +901,10 @@ fn test_cli_event_list_shows_all_events() {
 fn test_cli_event_tree_empty_db() {
     let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
-    let db = tmpdir
-        .path()
-        .join("empty.db")
-        .to_str()
-        .unwrap()
-        .to_string();
+    let db = tmpdir.path().join("empty.db").to_str().unwrap().to_string();
 
     // event-tree is served via daemon RPC (even for an empty db).
     let _daemon = start_daemon(&db);
-    let id_out = Command::new(bin())
-        .args(["--db", &db, "transport-identity"])
-        .output()
-        .expect("transport-identity command");
-    assert!(
-        id_out.status.success(),
-        "transport-identity failed: {}",
-        String::from_utf8_lossy(&id_out.stderr)
-    );
 
     let out = Command::new(bin())
         .args(["--db", &db, "event-tree"])
@@ -930,15 +936,6 @@ fn test_cli_event_list_empty_db() {
 
     // event-list is served via daemon RPC (even for an empty db).
     let _daemon = start_daemon(&db);
-    let id_out = Command::new(bin())
-        .args(["--db", &db, "transport-identity"])
-        .output()
-        .expect("transport-identity command");
-    assert!(
-        id_out.status.success(),
-        "transport-identity failed: {}",
-        String::from_utf8_lossy(&id_out.stderr)
-    );
 
     let out = Command::new(bin())
         .args(["--db", &db, "event-list"])
