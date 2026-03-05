@@ -124,6 +124,8 @@ Our daemon provides a placeholder RPC API that is capable of serving whatever qu
 
 For instant optimistic feedback, write commands (`Send`, `React`, `SendFile`) accept an optional `client_op_id` that the frontend generates locally. The daemon stores a local mapping from `client_op_id` to the resulting `event_id`, and annotates view responses with these IDs. The frontend shows an optimistic row immediately on send, then drops it when the polled view contains a canonical item with the matching `client_op_id`. This gives Slack-like latency with no client-side state machine — just a key match on each poll.
 
+For reactive data flows, the daemon provides a local subscription engine. Frontends create subscriptions filtered by event type (e.g. "message", "reaction") with optional field-level filter clauses. As events are projected, matching items are appended to a per-subscription feed table. Frontends poll feed items with `SubPoll` (sequential, ack-based cursor), check pending counts with `SubState`, and acknowledge consumed items with `SubAck`. Three delivery modes control feed granularity: `full` (render-ready payload), `id` (identifiers only), and `has_changed` (dirty flag + count, no per-item rows). Subscriptions are local to each peer and do not replicate — they are a projection-layer convenience for frontend reactivity, not protocol state.
+
 ## Adding Event-Layer Functionality
 
 This is the concrete workflow for adding a user-facing feature as event-layer functionality, using a new multi-valued message attachment type (`message_unfurl`) as the example. The same flow applies to `message_reply` (or any other "many per message" relation): one canonical event per attachment item, all keyed by `message_id`.
