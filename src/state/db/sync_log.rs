@@ -417,7 +417,7 @@ pub fn list_runs(
                         remote_addr, role, rounds, events_sent, events_received, bytes_sent, bytes_received,
                         changed, outcome, error
                  FROM sync_runs
-                 WHERE changed = 1 AND run_id = ?1
+                 WHERE (changed = 1 OR outcome <> 'ok' OR error IS NOT NULL) AND run_id = ?1
                  ORDER BY ended_at_ms DESC, run_id DESC"
             };
             let mut stmt = conn.prepare(sql)?;
@@ -441,7 +441,7 @@ pub fn list_runs(
                         remote_addr, role, rounds, events_sent, events_received, bytes_sent, bytes_received,
                         changed, outcome, error
                  FROM sync_runs
-                 WHERE changed = 1 AND peer_id LIKE ?1
+                 WHERE (changed = 1 OR outcome <> 'ok' OR error IS NOT NULL) AND peer_id LIKE ?1
                  ORDER BY ended_at_ms DESC, run_id DESC
                  LIMIT ?2"
             };
@@ -464,7 +464,7 @@ pub fn list_runs(
                         remote_addr, role, rounds, events_sent, events_received, bytes_sent, bytes_received,
                         changed, outcome, error
                  FROM sync_runs
-                 WHERE changed = 1
+                 WHERE (changed = 1 OR outcome <> 'ok' OR error IS NOT NULL)
                  ORDER BY ended_at_ms DESC, run_id DESC
                  LIMIT ?1"
             };
@@ -635,5 +635,45 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].session_id, 4);
         assert_eq!(rows[1].session_id, 3);
+    }
+
+    #[test]
+    fn sync_log_default_view_keeps_error_runs() {
+        let conn = crate::db::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let cfg = update_config(
+            &conn,
+            SyncLogConfigPatch {
+                enabled: Some(true),
+                changed_only: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let run = NewSyncRun {
+            started_at_ms: now_ms() - 5,
+            ended_at_ms: now_ms(),
+            session_id: 99,
+            tenant_id: "tenant-a".to_string(),
+            peer_id: "peer-a".to_string(),
+            direction: "outbound".to_string(),
+            remote_addr: "127.0.0.1:4433".to_string(),
+            role: "initiator".to_string(),
+            rounds: 1,
+            events_sent: 0,
+            events_received: 0,
+            bytes_sent: 0,
+            bytes_received: 0,
+            changed: false,
+            outcome: "error".to_string(),
+            error: Some("timeout".to_string()),
+        };
+        append_run_with_events(&conn, &run, &[], &cfg).unwrap();
+
+        let rows = list_runs(&conn, 10, false, None, None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_id, 99);
+        assert_eq!(rows[0].outcome, "error");
     }
 }

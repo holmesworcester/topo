@@ -1943,6 +1943,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             if runs.is_empty() {
                 println!("No sync runs logged.");
             } else {
+                if !all {
+                    println!("Showing changed/error runs only (use --all for full history).");
+                    println!();
+                }
                 for (idx, r) in runs.iter().enumerate() {
                     let events = sync_log::list_run_events(&conn, r.run_id)?;
                     print_sync_trace_run(r, &events);
@@ -1965,13 +1969,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             if runs.is_empty() {
                 println!("No sync runs logged.");
             } else {
-                for (idx, r) in runs.iter().enumerate() {
-                    let events = sync_log::list_run_events(&conn, r.run_id)?;
-                    print_sync_tree_run(r, &events);
-                    if idx + 1 < runs.len() {
-                        println!();
-                    }
+                if !all {
+                    println!("Showing changed/error runs only (use --all for full history).");
+                    println!();
                 }
+                let mut run_events = Vec::with_capacity(runs.len());
+                for r in runs {
+                    let events = sync_log::list_run_events(&conn, r.run_id)?;
+                    run_events.push((r, events));
+                }
+                let groups = group_runs_by_peer(run_events);
+                print_sync_tree_groups(&groups);
             }
         }
 
@@ -2404,6 +2412,16 @@ fn short_peer_hex(peer: &str) -> &str {
     &peer[..peer.len().min(16)]
 }
 
+fn run_status(run: &sync_log::SyncRunRow) -> &'static str {
+    if run.error.is_some() || run.outcome != "ok" {
+        "error"
+    } else if run.changed {
+        "changed"
+    } else {
+        "match"
+    }
+}
+
 fn summarize_sync_event_detail(frame_type: &str, detail_json: Option<&str>) -> String {
     let Some(raw) = detail_json else {
         return String::new();
@@ -2470,18 +2488,21 @@ fn summarize_sync_event_detail(frame_type: &str, detail_json: Option<&str>) -> S
 }
 
 fn print_sync_trace_run(run: &sync_log::SyncRunRow, events: &[sync_log::SyncRunEventRow]) {
-    let changed = if run.changed { "changed" } else { "match" };
+    let status = run_status(run);
+    let dur_ms = run.ended_at_ms.saturating_sub(run.started_at_ms);
     println!(
-        "RUN {} [{}] session={} tenant={} peer={} dir={} role={} start={} end={} rounds={} sent={} recv={} bytes_tx={} bytes_rx={} outcome={}",
+        "RUN {} [{}] session={} tenant={} peer={} dir={} role={} remote={} start={} end={} dur_ms={} rounds={} sent={} recv={} bytes_tx={} bytes_rx={} outcome={}",
         run.run_id,
-        changed,
+        status,
         run.session_id,
         short_peer_hex(&run.tenant_id),
         short_peer_hex(&run.peer_id),
         run.direction,
         run.role,
+        run.remote_addr,
         format_absolute(run.started_at_ms),
         format_absolute(run.ended_at_ms),
+        dur_ms,
         run.rounds,
         run.events_sent,
         run.events_received,
@@ -2506,36 +2527,110 @@ fn print_sync_trace_run(run: &sync_log::SyncRunRow, events: &[sync_log::SyncRunE
     }
 }
 
-fn print_sync_tree_run(run: &sync_log::SyncRunRow, events: &[sync_log::SyncRunEventRow]) {
-    let changed = if run.changed { "changed" } else { "match" };
-    println!(
-        "run {} [{}] peer={} dir={} role={} rounds={} sent={} recv={} outcome={}",
-        run.run_id,
-        changed,
-        short_peer_hex(&run.peer_id),
-        run.direction,
-        run.role,
-        run.rounds,
-        run.events_sent,
-        run.events_received,
-        run.outcome,
-    );
-    if events.is_empty() {
-        println!("└─ (no frame events)");
-        return;
-    }
-    for (idx, ev) in events.iter().enumerate() {
-        let branch = if idx + 1 == events.len() {
-            "└─"
+#[derive(Debug)]
+struct PeerSyncTreeGroup {
+    peer_id: String,
+    runs: Vec<(sync_log::SyncRunRow, Vec<sync_log::SyncRunEventRow>)>,
+}
+
+fn group_runs_by_peer(
+    runs: Vec<(sync_log::SyncRunRow, Vec<sync_log::SyncRunEventRow>)>,
+) -> Vec<PeerSyncTreeGroup> {
+    let mut groups: Vec<PeerSyncTreeGroup> = Vec::new();
+    for (run, events) in runs {
+        if let Some(group) = groups.iter_mut().find(|g| g.peer_id == run.peer_id) {
+            group.runs.push((run, events));
         } else {
-            "├─"
-        };
-        let dt = ev.ts_ms.saturating_sub(run.started_at_ms);
-        let detail = summarize_sync_event_detail(&ev.frame_type, ev.detail_json.as_deref());
+            groups.push(PeerSyncTreeGroup {
+                peer_id: run.peer_id.clone(),
+                runs: vec![(run, events)],
+            });
+        }
+    }
+    groups
+}
+
+fn print_sync_tree_groups(groups: &[PeerSyncTreeGroup]) {
+    for (peer_idx, group) in groups.iter().enumerate() {
+        let changed = group
+            .runs
+            .iter()
+            .filter(|(run, _)| run_status(run) == "changed")
+            .count();
+        let errors = group
+            .runs
+            .iter()
+            .filter(|(run, _)| run_status(run) == "error")
+            .count();
         println!(
-            "{} +{}ms {} {} {} len={}{}",
-            branch, dt, ev.lane, ev.direction, ev.frame_type, ev.msg_len, detail
+            "peer {} runs={} changed={} errors={}",
+            short_peer_hex(&group.peer_id),
+            group.runs.len(),
+            changed,
+            errors
         );
+
+        for (run_idx, (run, events)) in group.runs.iter().enumerate() {
+            let run_branch = if run_idx + 1 == group.runs.len() {
+                "└─"
+            } else {
+                "├─"
+            };
+            let run_pad = if run_idx + 1 == group.runs.len() {
+                "  "
+            } else {
+                "│ "
+            };
+            let status = run_status(run);
+            let dt = run.ended_at_ms.saturating_sub(run.started_at_ms);
+            println!(
+                "{} run {} [{}] end={} dir={} role={} rounds={} sent={} recv={} dur_ms={} outcome={}",
+                run_branch,
+                run.run_id,
+                status,
+                format_absolute(run.ended_at_ms),
+                run.direction,
+                run.role,
+                run.rounds,
+                run.events_sent,
+                run.events_received,
+                dt,
+                run.outcome
+            );
+            if let Some(err) = &run.error {
+                println!("{}  error: {}", run_pad, err);
+            }
+
+            if events.is_empty() {
+                println!("{}  └─ (no frame events)", run_pad);
+                continue;
+            }
+
+            for (event_idx, ev) in events.iter().enumerate() {
+                let ev_branch = if event_idx + 1 == events.len() {
+                    "└─"
+                } else {
+                    "├─"
+                };
+                let ev_dt = ev.ts_ms.saturating_sub(run.started_at_ms);
+                let detail = summarize_sync_event_detail(&ev.frame_type, ev.detail_json.as_deref());
+                println!(
+                    "{}  {} +{}ms {} {} {} len={}{}",
+                    run_pad,
+                    ev_branch,
+                    ev_dt,
+                    ev.lane,
+                    ev.direction,
+                    ev.frame_type,
+                    ev.msg_len,
+                    detail
+                );
+            }
+        }
+
+        if peer_idx + 1 < groups.len() {
+            println!();
+        }
     }
 }
 
